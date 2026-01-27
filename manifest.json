@@ -2,7 +2,7 @@
     "name": "Vibe",
     "short_name": "Vibe",
     "description": "Secure End-to-End Encrypted Messenger",
-    "start_url": "/",
+    "start_url": "/Vibe/",
     "display": "standalone",
     "background_color": "#0f0f0f",
     "theme_color": "#00d9ff",
