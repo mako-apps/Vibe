@@ -1,0 +1,9 @@
+{
+    "version": 1,
+    "updatedAt": 1769489041000,
+    "bootstrapUrls": [
+        "https://gist.githubusercontent.com/mohammadshayani/e70fc86ce3445ffdd47942cae8db5496/raw/servers.json"
+    ],
+    "servers": [],
+    "note": "Auto-configured on 2026-01-27 08:44"
+}
