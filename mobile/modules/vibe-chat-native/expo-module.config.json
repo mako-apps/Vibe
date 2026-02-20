@@ -1,0 +1,22 @@
+{
+  "platforms": [
+    "apple",
+    "android"
+  ],
+  "apple": {
+    "modules": [
+      "ChatNativeCoreModule",
+      "ChatNativeListModule",
+      "ChatNativeGifModule",
+      "LiquidGlassModule"
+    ],
+    "podspecPath": "ChatNative.podspec"
+  },
+  "android": {
+    "modules": [
+      "expo.modules.vibechatnative.ChatNativeCoreModule",
+      "expo.modules.vibechatnative.ChatNativeListModule",
+      "expo.modules.vibechatnative.ChatNativeGifModule"
+    ]
+  }
+}

@@ -1,0 +1,106 @@
+defmodule VibeWeb.Endpoint do
+  use Phoenix.Endpoint, otp_app: :vibe
+
+  @parser_length (case Integer.parse(System.get_env("MAX_REQUEST_BYTES") || "120000000") do
+                   {value, _} when value > 0 -> value
+                   _ -> 120_000_000
+                 end)
+
+  # The session will be stored in the cookie and signed,
+  # this means its contents can be read but not tampered with.
+  # Set :encryption_salt if you would also like to encrypt it.
+  @session_options [
+    store: :cookie,
+    key: "_vibe_key",
+    signing_salt: "VA520x4+"
+  ]
+
+  socket "/socket", VibeWeb.UserSocket,
+    websocket: [check_origin: Application.get_env(:vibe, VibeWeb.Endpoint)[:check_origin] || false],
+    longpoll: false
+
+  socket "/live", Phoenix.LiveView.Socket, websocket: [connect_info: [session: @session_options]]
+
+  # Serve at "/" the static files from "priv/static" directory.
+  #
+  # You should set gzip to true if you are running phx.digest
+  # when deploying your static files in production.
+  if code_reloading? do
+    socket "/phoenix/live_reload/socket", Phoenix.LiveReloader.Socket
+    plug Phoenix.LiveReloader
+    plug Phoenix.CodeReloader
+    plug Phoenix.Ecto.CheckRepoStatus, otp_app: :vibe
+  end
+
+  plug Plug.Static,
+    at: "/",
+    from: if(code_reloading?, do: :vibe, else: "priv/static"),
+    gzip: false,
+    only: VibeWeb.static_paths()
+
+  # Serve uploaded files
+  plug Plug.Static,
+    at: "/uploads",
+    from: "/app/uploads",
+    gzip: false
+
+
+
+  plug Phoenix.LiveDashboard.RequestLogger,
+    param_key: "request_logger",
+    cookie_key: "request_logger"
+
+  plug Plug.RequestId
+  plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint]
+
+  plug Plug.Parsers,
+    parsers: [:urlencoded, :multipart, :json],
+    pass: ["*/*"],
+    length: @parser_length,
+    json_decoder: Phoenix.json_library(),
+    body_reader: {VibeWeb.Plugs.RawBodyReader, :read_body, []}
+
+  plug Plug.MethodOverride
+  plug Plug.Head
+  plug Plug.Session, @session_options
+
+  # CORS Plug
+  cors_origins =
+    case System.get_env("CORS_ORIGINS") do
+      nil ->
+        [
+          "http://localhost:3000",
+          "http://localhost:5173",
+          "https://localhost:5173",
+          "https://vibe-io-nine.vercel.app",
+          ~r/https?:\/\/.*railway\.app$/,
+          ~r/https?:\/\/.*ngrok\.io$/,
+          ~r/https?:\/\/.*ngrok-free\.app$/
+        ]
+
+      raw ->
+        raw
+        |> String.split(",", trim: true)
+        |> Enum.map(&String.trim/1)
+        |> Enum.reject(&(&1 == ""))
+    end
+
+  plug CORSPlug,
+    origin: cors_origins,
+    headers: [
+      "Authorization",
+      "Content-Type",
+      "Accept",
+      "Origin",
+      "User-Agent",
+      "DNT",
+      "Cache-Control",
+      "X-Mx-ReqToken",
+      "Keep-Alive",
+      "X-Requested-With",
+      "If-Modified-Since",
+      "ngrok-skip-browser-warning"
+    ]
+
+  plug VibeWeb.Router
+end

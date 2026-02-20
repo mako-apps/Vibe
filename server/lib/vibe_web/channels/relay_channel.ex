@@ -1,0 +1,241 @@
+defmodule VibeWeb.RelayChannel do
+  @moduledoc """
+  Phoenix Channel for the VibeNet relay network.
+
+  Handles:
+  - Relay node registration and signaling
+  - Peer discovery and connection brokering
+  - Public relay directory
+  - Data forwarding between peers and relays
+
+  Channel topics:
+  - "relay:<relay_id>"  — Relay node's signaling channel
+  - "relay:lookup"      — Find a relay by invite code
+  - "relay:directory"   — Browse public relays
+  """
+
+  use VibeWeb, :channel
+
+  # In-memory relay registry (in production, use ETS or a GenServer)
+  # For now, we use the process dictionary of the channel,
+  # but broadcast to PubSub for cross-node communication
+
+  @impl true
+  def join("relay:directory", _payload, socket) do
+    # Anyone can browse the directory
+    relays = Vibe.RelayRegistry.list_public_relays()
+    {:ok, %{relays: relays}, socket}
+  end
+
+  def join("relay:lookup", %{"invite_code" => code}, socket) do
+    case Vibe.RelayRegistry.find_by_invite_code(code) do
+      {:ok, relay} ->
+        {:ok, relay, socket}
+      :not_found ->
+        {:error, %{reason: "relay_not_found"}}
+    end
+  end
+
+  def join("relay:" <> relay_id, %{"role" => "client"} = _payload, socket) do
+    # A client (filtered user) joining to connect to a relay
+    # Don't broadcast peer_connect here — the client will push it explicitly after joining
+    socket = assign(socket, :relay_id, relay_id)
+    socket = assign(socket, :role, "client")
+    {:ok, socket}
+  end
+
+  def join("relay:" <> relay_id, payload, socket) do
+    # A relay node registering itself
+    invite_code = payload["invite_code"]
+    invite_key = payload["invite_key"]
+    is_public = payload["is_public"] || false
+    name = payload["name"] || "Unnamed Relay"
+    max_peers = payload["max_peers"] || 5
+    region = payload["region"] || detect_region(socket)
+
+    # Register the relay
+    Vibe.RelayRegistry.register_relay(%{
+      relay_id: relay_id,
+      user_id: socket.assigns.user_id,
+      invite_code: invite_code,
+      invite_key: invite_key,
+      is_public: is_public,
+      name: name,
+      max_peers: max_peers,
+      current_peers: 0,
+      region: region,
+      started_at: System.system_time(:second)
+    })
+
+    # If public, broadcast to directory subscribers
+    if is_public do
+      VibeWeb.Endpoint.broadcast!("relay:directory", "relay_added", %{
+        relay_id: relay_id,
+        name: name,
+        max_peers: max_peers,
+        current_peers: 0,
+        region: region,
+        invite_code: invite_code,
+        invite_key: invite_key
+      })
+    end
+
+    socket = assign(socket, :relay_id, relay_id)
+    socket = assign(socket, :role, "relay")
+    {:ok, socket}
+  end
+
+  # ─── Peer signaling (client pushes these to reach the relay host) ─────
+
+  @impl true
+  def handle_in("peer_connect", %{"shared_secret" => shared_secret}, socket) do
+    # Client is requesting connection to the relay — forward to all other subscribers (the relay host)
+    broadcast_from!(socket, "peer_connect", %{
+      peer_id: socket.assigns.user_id,
+      shared_secret: shared_secret
+    })
+    {:noreply, socket}
+  end
+
+  def handle_in("peer_connect", payload, socket) do
+    # Fallback: forward as-is
+    broadcast_from!(socket, "peer_connect", payload)
+    {:noreply, socket}
+  end
+
+  def handle_in("peer_disconnect", payload, socket) do
+    broadcast_from!(socket, "peer_disconnect", payload)
+    {:noreply, socket}
+  end
+
+  # ─── Data forwarding ─────────────────────────────────────────────
+
+  def handle_in("peer_data", %{"peer_id" => peer_id, "data" => data}, socket) do
+    # Forward encrypted data between relay and client
+    # The server CANNOT read this data — it's just a message broker
+    relay_id = socket.assigns.relay_id
+
+    broadcast_from!(socket, "peer_data", %{
+      peer_id: peer_id,
+      data: data
+    })
+
+    {:noreply, socket}
+  end
+
+  def handle_in("peer_data", %{"data" => data}, socket) do
+    # Client sending data (no peer_id — it goes to the relay)
+    relay_id = socket.assigns.relay_id
+
+    broadcast_from!(socket, "peer_data", %{
+      peer_id: socket.assigns.user_id,
+      data: data
+    })
+
+    {:noreply, socket}
+  end
+
+  def handle_in("peer_accepted", %{"peer_id" => peer_id} = payload, socket) do
+    # Relay accepted a peer connection
+    broadcast!(socket, "peer_accepted", payload)
+
+    # Update peer count
+    Vibe.RelayRegistry.update_relay(socket.assigns.relay_id, %{
+      current_peers: (payload["current_peers"] || 0) + 1
+    })
+
+    {:noreply, socket}
+  end
+
+  def handle_in("peer_rejected", payload, socket) do
+    broadcast!(socket, "peer_rejected", payload)
+    {:noreply, socket}
+  end
+
+  def handle_in("peer_kicked", payload, socket) do
+    broadcast!(socket, "peer_disconnect", payload)
+    {:noreply, socket}
+  end
+
+  def handle_in("announce", payload, socket) do
+    relay_id = socket.assigns.relay_id
+    region = payload["region"] || detect_region(socket)
+
+    # Update registry with public flag and metadata
+    Vibe.RelayRegistry.update_relay(relay_id, %{
+      is_public: true,
+      current_peers: payload["current_peers"] || 0,
+      name: payload["name"],
+      max_peers: payload["max_peers"],
+      invite_code: payload["invite_code"],
+      invite_key: payload["invite_key"],
+      region: region
+    })
+
+    # Broadcast as relay_added so directory clients pick it up
+    VibeWeb.Endpoint.broadcast!("relay:directory", "relay_added", %{
+      relay_id: relay_id,
+      name: payload["name"] || "Relay Node",
+      max_peers: payload["max_peers"] || 5,
+      current_peers: payload["current_peers"] || 0,
+      region: region,
+      invite_code: payload["invite_code"],
+      invite_key: payload["invite_key"]
+    })
+
+    {:reply, :ok, socket}
+  end
+
+  def handle_in("update_status", payload, socket) do
+    relay_id = socket.assigns.relay_id
+
+    # Build updates map from string-keyed payload
+    updates =
+      payload
+      |> Enum.reduce(%{}, fn
+        {"current_peers", v}, acc -> Map.put(acc, :current_peers, v)
+        {"name", v}, acc when is_binary(v) -> Map.put(acc, :name, v)
+        {"max_peers", v}, acc -> Map.put(acc, :max_peers, v)
+        _, acc -> acc
+      end)
+
+    Vibe.RelayRegistry.update_relay(relay_id, updates)
+
+    VibeWeb.Endpoint.broadcast!("relay:directory", "relay_updated", %{
+      relay_id: relay_id,
+      current_peers: payload["current_peers"] || 0
+    })
+
+    {:reply, :ok, socket}
+  end
+
+  def handle_in("ping_relay", %{"relay_id" => target_relay_id}, socket) do
+    # Ping a relay to test latency (just reply immediately)
+    {:reply, :ok, socket}
+  end
+
+  @impl true
+  def terminate(_reason, socket) do
+    if socket.assigns[:role] == "relay" do
+      relay_id = socket.assigns[:relay_id]
+      if relay_id do
+        # Remove from directory
+        Vibe.RelayRegistry.unregister_relay(relay_id)
+
+        VibeWeb.Endpoint.broadcast!("relay:directory", "relay_removed", %{
+          relay_id: relay_id
+        })
+
+        # Notify all connected clients
+        VibeWeb.Endpoint.broadcast!("relay:#{relay_id}", "relay_closed", %{})
+      end
+    end
+
+    :ok
+  end
+
+  # Simple region detection based on connection metadata
+  defp detect_region(_socket) do
+    "unknown"
+  end
+end

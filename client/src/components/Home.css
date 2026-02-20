@@ -1,0 +1,235 @@
+/* Home.css - Refactored Home View Styles */
+
+.home-view-container {
+    width: 100%;
+    height: 100%;
+    position: relative;
+    background: var(--bg-primary);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+.home-header-fixed {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 50;
+    /* Height is determined by content, usually around 100px with safe area */
+    pointer-events: none;
+    /* Allow clicks to pass through transparent areas if any */
+}
+
+.home-header-fixed>* {
+    pointer-events: auto;
+}
+
+/* The scrollable area for chat cards */
+.home-scroll-container {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    overflow-y: auto;
+    padding-top: calc(70px + env(safe-area-inset-top));
+    padding-bottom: 20px;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-y: contain;
+    touch-action: pan-y;
+    /* Prevent pull-to-refresh if not needed */
+}
+
+/* Chat Row Styling */
+.chat-row-wrapper {
+    position: relative;
+    margin-bottom: 2px;
+    overflow: hidden;
+    /* For swipe bg */
+    width: 100%;
+    touch-action: pan-y;
+    /* Important for vertical scroll */
+}
+
+.chat-row-bg-actions {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0 24px;
+    z-index: 0;
+    font-weight: 600;
+}
+
+.chat-row-card {
+    position: relative;
+    z-index: 10;
+    width: 100%;
+    display: flex;
+    align-items: center;
+    padding: 12px 16px;
+    background: var(--bg-primary);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+    cursor: pointer;
+    transition: background-color 0.2s;
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+.chat-row-card:active {
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.avatar-container {
+    position: relative;
+    margin-right: 14px;
+}
+
+.avatar {
+    width: 52px;
+    height: 52px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--accent) 0%, #a855f7 100%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 20px;
+    font-weight: 600;
+    color: white;
+}
+
+.online-badge {
+    position: absolute;
+    bottom: 2px;
+    right: 2px;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: #22c55e;
+    border: 2px solid var(--bg-primary);
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.2);
+}
+
+.chat-row-content {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 4px;
+    min-width: 0;
+    /* Text truncation fix */
+}
+
+.chat-name-text {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.chat-status-text {
+    font-size: 14px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: flex;
+    align-items: center;
+}
+
+.chat-row-meta-col {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 6px;
+    margin-left: 8px;
+    min-width: 20px;
+}
+
+.unread-badge {
+    background: var(--accent);
+    color: white;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 10px;
+    min-width: 20px;
+    text-align: center;
+}
+
+.typing-shine {
+    background: linear-gradient(90deg, var(--accent) 0%, #fff 50%, var(--accent) 100%);
+    background-size: 200% auto;
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    animation: shine 2s linear infinite;
+    font-weight: 600;
+}
+
+@keyframes shine {
+    to {
+        background-position: 200% center;
+    }
+}
+
+/* Empty State */
+.empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    text-align: center;
+    padding: 60px 40px;
+    opacity: 0;
+    animation: fadeIn 0.4s ease-out forwards;
+}
+
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+        transform: translateY(10px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.id-display-card-mini {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+    padding: 10px 16px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+    user-select: none;
+    font-family: monospace;
+    font-weight: 500;
+    color: var(--text-secondary);
+}
+
+.id-display-card-mini:hover {
+    background: rgba(255, 255, 255, 0.1);
+    transform: scale(0.92);
+}
+
+.id-display-card-mini:active {
+    transform: scale(0.9);
+}
+
+.id-value {
+    color: var(--text-primary);
+    font-weight: 600;
+}

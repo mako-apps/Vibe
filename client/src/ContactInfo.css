@@ -1,0 +1,299 @@
+.ci-container {
+    position: relative;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background: var(--bg-primary);
+}
+
+.ci-header {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 60px;
+    z-index: 50;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 4px;
+    pointer-events: none;
+    /* Let clicks pass through if needed, buttons have auto */
+}
+
+/* Glass background that fades in */
+.ci-header-bg {
+    position: absolute;
+    inset: 0;
+    background: rgba(24, 24, 27, 0.8);
+    backdrop-filter: blur(12px);
+    opacity: 0;
+    transition: opacity 0.3s ease;
+    z-index: -1;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.ci-header.scrolled .ci-header-bg {
+    opacity: 1;
+}
+
+.ci-icon-btn {
+    pointer-events: auto;
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.2);
+    backdrop-filter: blur(4px);
+    border: none;
+    color: white;
+    margin: 0 12px;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+
+.ci-icon-btn:active {
+    background: rgba(0, 0, 0, 0.4);
+}
+
+.ci-scroll-view {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    position: relative;
+    z-index: 1;
+}
+
+.ci-banner-wrapper {
+    position: relative;
+    width: 100%;
+    height: 60vh;
+    min-height: 300px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    transition: all 0.5s cubic-bezier(0.25, 0.8, 0.25, 1);
+}
+
+/* Background "Blur" for Avatar Mode - Optional */
+.ci-banner-bg {
+    position: absolute;
+    inset: 0;
+    background-size: cover;
+    background-position: center;
+    filter: blur(40px) brightness(0.4);
+    opacity: 0;
+    transition: opacity 0.5s ease;
+    z-index: 0;
+}
+
+.ci-banner-wrapper.avatar-mode .ci-banner-bg {
+    opacity: 0;
+}
+
+/* The Main Image */
+.ci-main-image {
+    position: relative;
+    z-index: 1;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    transition: all 0.5s cubic-bezier(0.25, 0.8, 0.25, 1);
+    box-shadow: none;
+    border-radius: 0;
+}
+
+/* Avatar State */
+.ci-banner-wrapper.avatar-mode .ci-main-image {
+    width: 120px;
+    height: 120px;
+    border-radius: 50%;
+    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+    /* "Center of wrapper" is handled by flexbox of parent */
+}
+
+/* Gradient Overlay in Full Mode */
+.ci-gradient-overlay {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 120px;
+    background: linear-gradient(to top, var(--bg-primary), transparent);
+    opacity: 1;
+    transition: opacity 0.3s;
+    z-index: 2;
+}
+
+.ci-banner-wrapper.avatar-mode .ci-gradient-overlay {
+    opacity: 0;
+}
+
+/* Content Body */
+.ci-content {
+    position: relative;
+    background: var(--bg-primary);
+    min-height: 500px;
+    /* Ensure scroll */
+    z-index: 10;
+    padding: 0 24px 100px 24px;
+}
+
+.ci-name-header {
+    text-align: center;
+    margin-top: 16px;
+    margin-bottom: 32px;
+}
+
+.ci-name {
+    font-size: 24px;
+    font-weight: 700;
+    margin-bottom: 4px;
+}
+
+.ci-status {
+    font-size: 14px;
+    color: var(--text-secondary);
+}
+
+/* Actions Grid (Reusing/Refining) */
+.ci-actions-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    margin-bottom: 32px;
+}
+
+.ci-action-btn {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    background: none;
+    border: none;
+    cursor: pointer;
+}
+
+.ci-action-icon {
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    background: var(--bg-card);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-primary);
+    transition: filter 0.2s;
+}
+
+.ci-action-btn:active .ci-action-icon {
+    filter: brightness(1.2);
+}
+
+.ci-action-btn.active .ci-action-icon {
+    background: rgba(var(--accent-rgb), 0.2);
+    color: var(--accent);
+}
+
+.ci-action-label {
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+/* Cards */
+.ci-card {
+    background: var(--bg-card);
+    border-radius: 16px;
+    overflow: hidden;
+    margin-bottom: 24px;
+}
+
+.ci-row {
+    padding: 16px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    cursor: pointer;
+}
+
+.ci-row:last-child {
+    border-bottom: none;
+}
+
+.ci-row:active {
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.ci-label {
+    font-size: 14px;
+    font-weight: 500;
+}
+
+.ci-value {
+    font-size: 14px;
+    color: var(--text-secondary);
+}
+
+.ci-row.danger .ci-label {
+    color: #ef4444;
+}
+
+.ci-section-title {
+    font-size: 13px;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+    margin-bottom: 8px;
+    margin-left: 8px;
+    font-weight: 600;
+}
+
+.ci-menu-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+}
+
+.ci-menu-backdrop {
+    position: absolute;
+    inset: 0;
+}
+
+.ci-menu {
+    position: absolute;
+    top: 60px;
+    right: 16px;
+    background: #27272a;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 12px;
+    padding: 6px;
+    min-width: 180px;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+}
+
+.ci-menu-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 12px;
+    background: none;
+    border: none;
+    color: var(--text-primary);
+    font-size: 14px;
+    text-align: left;
+    border-radius: 8px;
+    cursor: pointer;
+}
+
+.ci-menu-item:hover {
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.ci-menu-item.danger {
+    color: #ef4444;
+}

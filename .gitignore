@@ -1,0 +1,60 @@
+# Dependencies
+node_modules/
+.pnp/
+.pnp.js
+
+# Build outputs
+dist/
+build/
+
+# Environment and Secrets
+.env
+.env.local
+.env.*.local
+server/.env
+ngrok_token.txt
+ngrok_domain.txt
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Database
+*.db
+*.sqlite
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Tunnel logs and temporary files
+tunnel_logs/
+server/servers.json
+# NOTE: bootstrap-servers.json is NOT ignored - it's required for deployment
+
+# Uploads (user data)
+server/uploads/*.enc
+server/uploads/*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test
+coverage/
+
+# Misc
+*.tgz

@@ -1,0 +1,2947 @@
+import { create } from 'zustand';
+import { createJSONStorage, persist } from 'zustand/middleware';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { Socket as PhxSocket, Channel } from 'phoenix';
+import { Buffer } from 'buffer';
+import ProxyManager from './ProxyManager';
+import AuthManager from './AuthManager';
+import { Chat, Message } from './types';
+import { importPublicKey, encryptFileData, encryptFileChunked } from './crypto';
+import { decryptMessagesBatch, encryptMessageNativeFirst } from '../native/chat/core';
+import * as Crypto from 'expo-crypto';
+import * as FileSystem from 'expo-file-system/legacy';
+import SoundManager from './SoundManager';
+import { uploadMedia } from './api-client';
+import { useEncryptedMediaStore } from './stores/encrypted-media-store';
+import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
+
+const CHATSTORE_DEBUG = false;
+const chatStoreLog = (...args: any[]) => {
+    if (CHATSTORE_DEBUG) console.log(...args);
+};
+
+// --- Obfuscation Helpers (Match Web Client) ---
+const generateNoise = (len = 32) => {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    let result = '';
+    for (let i = 0; i < len; i++) result += chars.charAt(Math.floor(Math.random() * chars.length));
+    return result;
+};
+
+// Simplified obfuscation for Phoenix as well
+const obfuscatePayload = (data: any) => {
+    // For now, we'll send raw JSON to Phoenix to keep it simple during migration
+    // If you want to keep obfuscation, you'd need to match the Elixir deobfuscator
+    // But since `deobfuscatePayload` on server was specific to the Node implementation,
+    // we will start with clear JSON for reliability, or implement a matching Elixir plug.
+
+    // Assuming the Elixir backend currently accepts raw JSON or standard params in channels.
+    return data;
+};
+
+const deobfuscatePayload = (wrapped: any) => {
+    try {
+        if (wrapped && wrapped.d) {
+            // Decode base64 to string using Buffer which is more reliable in RN
+            const decoded = Buffer.from(wrapped.d, 'base64').toString('utf-8');
+            return JSON.parse(decoded);
+        }
+    } catch (e) {
+        console.error('[ChatStore] Deobfuscate failed:', e);
+    }
+    return wrapped;
+};
+
+// Helper to parse decrypted content which might be JSON (new format) or string (legacy)
+const parseDecryptedContent = (decrypted: string): Partial<Message> => {
+    try {
+        if (decrypted.trim().startsWith('{')) {
+            const parsed = JSON.parse(decrypted);
+            // Check if it's our metadata payload
+            if (parsed.text !== undefined || parsed.mediaUrl !== undefined || parsed.contact !== undefined) {
+                return {
+                    plaintext: parsed.text,
+                    mediaUrl: parsed.mediaUrl,
+                    mediaKey: parsed.mediaKey, // AES key!
+                    fileName: parsed.fileName,
+                    fileSize: parsed.fileSize,
+                    latitude: parsed.latitude,
+                    longitude: parsed.longitude,
+                    duration: parsed.duration,
+                    replyToId: parsed.replyToId,
+                    contact: parsed.contact,
+                    caption: parsed.caption,
+                    viewOnce: parsed.viewOnce,
+                    isVideoNote: parsed.isVideoNote,
+                    isEdited: parsed.isEdited === true,
+                    editedAt: typeof parsed.editedAt === 'number' ? parsed.editedAt : undefined,
+                    extra: {
+                        width: parsed.width,
+                        height: parsed.height,
+                        thumbnailBase64: parsed.thumbnailBase64,
+                        waveform: parsed.waveform,
+                    },
+                };
+            }
+        }
+    } catch (e) {
+        // Not JSON, fall through to string
+    }
+    return { plaintext: decrypted };
+};
+
+const normalizeMessage = (m: any): Message => {
+    let content = m.plaintext || m._senderPlaintext || m.sender_plaintext;
+    let extra: Partial<Message> = {};
+
+    // Detect if content is a JSON string (e.g. {"text":"..."})
+    if (typeof content === 'string' && content.trim().startsWith('{')) {
+        const parsed = parseDecryptedContent(content);
+        if (parsed.plaintext !== undefined) {
+            content = parsed.plaintext;
+            extra = parsed;
+        }
+    }
+
+    return {
+        id: m.id || m.message_id,
+        fromId: m.fromId || m.from_id,
+        chatId: m.chatId || m.chat_id,
+        encryptedContent: m.encryptedContent || m.encrypted_content,
+        type: m.type || 'text',
+        timestamp: typeof m.timestamp === 'string' ? new Date(m.timestamp).getTime() : (m.timestamp || Date.now()),
+        plaintext: content,
+        status: m.status || 'sent',
+        readBy: m.readBy || m.read_by || [],
+        mediaUrl: extra.mediaUrl || m.mediaUrl || m.media_url,
+        mediaKey: extra.mediaKey, // Pass through key
+        fileName: extra.fileName || m.fileName || m.file_name,
+        fileSize: extra.fileSize || m.fileSize || m.file_size,
+        latitude: extra.latitude || m.latitude,
+        longitude: extra.longitude || m.longitude,
+        duration: extra.duration || m.duration,
+        replyToId: extra.replyToId || m.replyToId || m.reply_to_id,
+        contact: extra.contact || m.contact,
+        caption: extra.caption || m.caption,
+        viewOnce: extra.viewOnce || m.viewOnce,
+        viewedBy: m.viewedBy || [],
+        isVideoNote: extra.isVideoNote || m.isVideoNote,
+        isEdited: extra.isEdited || m.isEdited || m.edited === true,
+        editedAt: extra.editedAt || m.editedAt || m.edited_at,
+        extra: extra.extra || m.extra,
+    };
+};
+
+const decryptMessageContent = async (
+    privateKey: string,
+    encryptedContent: string,
+    isFromMe: boolean,
+): Promise<string> => {
+    try {
+        const result = await decryptMessagesBatch({
+            privateKey,
+            items: [
+                {
+                    id: 'single',
+                    encryptedContent,
+                    isFromMe,
+                },
+            ],
+        });
+        return result.messages.single || '';
+    } catch {
+        return '';
+    }
+};
+
+interface ChatState {
+    chats: Chat[];
+    isConnected: boolean;
+    isLoading: boolean;
+    activeChatId: string | null;
+    typingUsers: Set<string>;
+    recordingUsers: Set<string>;
+    onlineUsers: Set<string>;
+    offlineQueue: Message[]; // Queue for offline messages
+    socket: PhxSocket | null;
+    uploadProgress: Record<string, number>; // messageId -> 0..1 progress
+    lastChatsLoad: number;
+
+    // Actions
+    disconnect: () => void;
+    initSocket: () => void;
+    loadChats: () => Promise<void>;
+    startChat: (friendId: string, friendInfo?: { username?: string, profileImage?: string, publicKey?: string }) => Promise<string>; // Returns chatId
+    sendMessage: (chatId: string, text: string, type?: Message['type'], metadata?: any, existingId?: string) => Promise<void>;
+    editMessage: (chatId: string, messageId: string, text: string) => Promise<boolean>;
+
+    setActiveChat: (id: string | null) => void;
+    loadMessages: (chatId: string) => Promise<void>;
+    updateMessageDecryption: (chatId: string, messageId: string, plaintext: string) => void;
+    batchUpdateDecryption: (chatId: string, updates: Record<string, string>) => void;
+    sendTyping: (chatId: string) => void;
+    sendStopTyping: (chatId: string) => void;
+    deleteChat: (chatId: string) => void;
+    pinChat: (chatId: string) => void;
+    toggleMuteChat: (chatId: string) => void;
+    toggleMarkUnread: (chatId: string, forceStatus?: boolean) => void;
+    updateChatFriendInfoByFriendId: (friendId: string, info: { friendName?: string; friendImage?: string }) => void;
+
+    // Groups & Channels
+    createGroup: (name: string, memberIds: string[]) => Promise<string | null>;
+    createChannel: (name: string, description?: string) => Promise<string | null>;
+    joinChannel: (channelId: string) => Promise<boolean>;
+    leaveChannel: (channelId: string) => Promise<boolean>;
+    sendRecording: (chatId: string) => void;
+    sendStopRecording: (chatId: string) => void;
+    sendReadReceipt: (chatId: string, messageId: string) => void;
+    sendDeliveryReceipt: (chatId: string, messageId: string) => void;
+    setUploadProgress: (messageId: string, progress: number) => void;
+    clearUploadProgress: (messageId: string) => void;
+    cancelUpload: (chatId: string, messageId: string) => void;
+    markViewOnceViewed: (chatId: string, messageId: string) => void;
+    retryMessage: (chatId: string, messageId: string) => void;
+    deleteFailedMessage: (chatId: string, messageId: string) => void;
+}
+
+// Module-level flag to ensure socket is only initialized once
+let socketInitialized = false;
+
+// Module-level socket and channel variables (not persisted)
+let socket: PhxSocket | null = null;
+let userChannel: Channel | null = null;
+let chatChannels: Map<string, Channel> = new Map();
+let loadChatsDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+let channelResyncTimer: ReturnType<typeof setTimeout> | null = null;
+const pendingRetryFlushTimers = new Map<string, ReturnType<typeof setTimeout>>();
+// Dedup set to prevent processing the same message multiple times from concurrent broadcasts
+const recentlyProcessedMsgIds = new Set<string>();
+// AbortControllers for cancellable media uploads
+const uploadAbortControllers = new Map<string, AbortController>();
+// Dedup startChat calls per friendId to prevent duplicate chats on the backend
+const startChatInFlight = new Map<string, Promise<string>>();
+// Dedup public-key fetches per friend to avoid first-send stalls and duplicate requests
+const friendKeyFetchInFlight = new Map<string, Promise<string | null>>();
+const historyLoadInFlight = new Map<string, Promise<void>>();
+
+const resolveAuthBearerToken = (session?: { loginToken?: string; userId?: string } | null): string | null => {
+    if (session?.loginToken) return session.loginToken;
+    if (session?.userId) return session.userId;
+
+    try {
+        const { useAuthStore } = require('./stores/auth-store');
+        const user = useAuthStore.getState().user;
+        if (user?.loginToken) return user.loginToken;
+        if ((user as any)?.token) return (user as any).token;
+        if (user?.userId) return user.userId;
+    } catch {
+        // noop - auth store may not be available in some runtime contexts
+    }
+
+    return null;
+};
+
+const buildAuthHeaders = (
+    session?: { loginToken?: string; userId?: string } | null,
+    base: Record<string, string> = {},
+): Record<string, string> => {
+    const token = resolveAuthBearerToken(session);
+    if (!token) return base;
+    return {
+        ...base,
+        Authorization: `Bearer ${token}`,
+    };
+};
+
+const extractPublicKey = (data: any): string | null => {
+    if (!data) return null;
+    return data.publicKey || data.friendKey || data.friendPublicKey || data.public_key || null;
+};
+
+const isValidBinaryId = (value?: string | null): boolean => {
+    if (!value || typeof value !== 'string') return false;
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+};
+
+const scheduleChatRetryFlush = (chatId: string, get: any, delayMs = 900) => {
+    const existing = pendingRetryFlushTimers.get(chatId);
+    if (existing) {
+        clearTimeout(existing);
+    }
+
+    const timer = setTimeout(() => {
+        pendingRetryFlushTimers.delete(chatId);
+        const state = get();
+        const chat = state.chats.find((c: Chat) => c.chatId === chatId);
+        if (!chat) return;
+
+        const toRetry = chat.messages.filter((m: Message) => {
+            const status = m.status;
+            return status === 'pending' || status === 'error' || status === 'sending';
+        });
+
+        if (toRetry.length > 0) {
+            chatStoreLog('[ChatStore] Retry flush:', chatId, toRetry.length);
+            toRetry.forEach((m: Message) => state.retryMessage(chatId, m.id));
+        }
+    }, delayMs);
+
+    pendingRetryFlushTimers.set(chatId, timer);
+};
+
+const scheduleChannelResync = (get: any, delayMs = 220) => {
+    if (channelResyncTimer) return;
+    channelResyncTimer = setTimeout(() => {
+        channelResyncTimer = null;
+        Promise.resolve(get().loadChats()).catch(() => { });
+    }, delayMs);
+};
+
+const removeMessageFromChatList = (chats: Chat[], chatId: string, messageId: string): Chat[] => {
+    const idx = chats.findIndex(c => c.chatId === chatId);
+    if (idx === -1) return chats;
+
+    const chat = chats[idx];
+    if (!chat.messages.some(m => m.id === messageId)) return chats;
+
+    const nextMessages = chat.messages.filter(m => m.id !== messageId);
+    const nextLast = nextMessages.length > 0 ? nextMessages[nextMessages.length - 1] : undefined;
+    const nextChats = [...chats];
+    nextChats[idx] = {
+        ...chat,
+        messages: nextMessages,
+        lastMessage: nextLast,
+    };
+    return nextChats;
+};
+
+const applyReadUpToMessageInChat = (
+    chats: Chat[],
+    chatId: string,
+    messageId: string,
+    myUserId?: string | null
+): Chat[] => {
+    const chatIdx = chats.findIndex(c => c.chatId === chatId);
+    if (chatIdx === -1) return chats;
+
+    const currentChat = chats[chatIdx];
+    const targetIdx = currentChat.messages.findIndex(m => m.id === messageId);
+    if (targetIdx === -1) return chats;
+
+    const targetTs = currentChat.messages[targetIdx]?.timestamp || 0;
+    const myId = (myUserId || '').toUpperCase();
+    let changed = false;
+
+    const nextMessages = currentChat.messages.map((m) => {
+        const fromMe = myId && (m.fromId || '').toUpperCase() === myId;
+        if (!fromMe) return m;
+        if ((m.timestamp || 0) > targetTs) return m;
+
+        const status = m.status;
+        if (status === 'read') return m;
+        if (status === 'error') return m;
+        if (
+            status === 'sent' ||
+            status === 'delivered' ||
+            status === 'sending' ||
+            status === 'pending' ||
+            status === undefined
+        ) {
+            changed = true;
+            return { ...m, status: 'read' as const };
+        }
+        return m;
+    });
+
+    if (!changed) return chats;
+
+    const nextChats = [...chats];
+    nextChats[chatIdx] = {
+        ...currentChat,
+        messages: nextMessages,
+        lastMessage: currentChat.lastMessage
+            ? (nextMessages.find((m) => m.id === currentChat.lastMessage?.id) || currentChat.lastMessage)
+            : currentChat.lastMessage,
+    };
+    return nextChats;
+};
+
+const statusRank = (status?: Message['status']): number => {
+    switch (status) {
+        case 'read':
+            return 5;
+        case 'delivered':
+            return 4;
+        case 'sent':
+            return 3;
+        case 'sending':
+            return 2;
+        case 'pending':
+            return 1;
+        case 'error':
+        default:
+            return 0;
+    }
+};
+
+const chooseMostAdvancedStatus = (
+    localStatus?: Message['status'],
+    serverStatus?: Message['status']
+): Message['status'] => {
+    return statusRank(serverStatus) > statusRank(localStatus)
+        ? (serverStatus || 'sent')
+        : (localStatus || serverStatus || 'sent');
+};
+
+const applyMessageEditedInChats = (
+    chats: Chat[],
+    chatId: string,
+    messageId: string,
+    patch: Partial<Message>
+): Chat[] => {
+    const chatIdx = chats.findIndex(c => c.chatId === chatId);
+    if (chatIdx === -1) return chats;
+    const msgIdx = chats[chatIdx].messages.findIndex(m => m.id === messageId);
+    if (msgIdx === -1) return chats;
+
+    const nextChats = [...chats];
+    const nextMessages = [...nextChats[chatIdx].messages];
+    const current = nextMessages[msgIdx];
+    nextMessages[msgIdx] = {
+        ...current,
+        ...patch,
+        extra: {
+            ...(current.extra || {}),
+            ...(patch.extra || {}),
+        },
+    };
+    nextChats[chatIdx] = {
+        ...nextChats[chatIdx],
+        messages: nextMessages,
+        lastMessage: nextChats[chatIdx].lastMessage?.id === messageId
+            ? nextMessages[msgIdx]
+            : nextChats[chatIdx].lastMessage,
+    };
+    return nextChats;
+};
+
+const handleMessageEditedPayload = async (
+    chatId: string,
+    payload: any,
+    set: any,
+    get: any,
+) => {
+    const messageId = payload?.messageId || payload?.message_id;
+    const encryptedContent = payload?.encryptedContent || payload?.encrypted_content;
+    if (!messageId || !encryptedContent) return;
+
+    const editedAtRaw = payload?.editedAt || payload?.edited_at;
+    const editedAt = typeof editedAtRaw === 'number' ? editedAtRaw : Date.now();
+
+    const currentChats = get().chats as Chat[];
+    const chat = currentChats.find(c => c.chatId === chatId);
+    const existingMsg = chat?.messages.find(m => m.id === messageId);
+
+    let parsedPatch: Partial<Message> = {};
+    const auth = AuthManager.getInstance().getSession();
+    if (auth?.keyPair?.privateKey && existingMsg) {
+        try {
+            const isFromMe = (existingMsg.fromId || '').toUpperCase() === (auth.userId || '').toUpperCase();
+            const decrypted = await decryptMessageContent(auth.keyPair.privateKey, encryptedContent, isFromMe);
+            if (decrypted) {
+                parsedPatch = parseDecryptedContent(decrypted);
+            }
+        } catch (e) {
+            console.warn('[ChatStore] Realtime edit decrypt failed', e);
+        }
+    }
+
+    const nextChats = applyMessageEditedInChats(currentChats, chatId, messageId, {
+        ...parsedPatch,
+        encryptedContent,
+        isEdited: true,
+        editedAt,
+        extra: {
+            ...(parsedPatch.extra || {}),
+            isEdited: true,
+            editedAt,
+        },
+    });
+
+    if (nextChats !== currentChats) {
+        set({ chats: nextChats });
+    }
+};
+
+const warmFriendPublicKey = async (
+    chatId: string,
+    friendId: string,
+    set: any,
+    get: any
+): Promise<string | null> => {
+    const normalizedFriendId = (friendId || '').toUpperCase();
+    if (!normalizedFriendId) return null;
+
+    // Use cached key first.
+    const existingChat = get().chats.find((c: any) => c.chatId === chatId || (c.friendId || '').toUpperCase() === normalizedFriendId);
+    const cached = extractPublicKey(existingChat);
+    if (cached) return cached;
+
+    const inFlight = friendKeyFetchInFlight.get(normalizedFriendId);
+    if (inFlight) return inFlight;
+
+    const promise = (async () => {
+        const proxy = ProxyManager.getInstance();
+        const baseUrl = proxy.getBestUrl();
+        const auth = AuthManager.getInstance().getSession();
+        try {
+            const res = await fetch(`${baseUrl}/api/user/${friendId}`, {
+                headers: {
+                    'ngrok-skip-browser-warning': 'true',
+                    ...buildAuthHeaders(auth),
+                }
+            });
+            if (!res.ok) return null;
+
+            const userData = await res.json();
+            const key = extractPublicKey(userData);
+            if (!key) return null;
+
+            // Persist key into all chats for this friend so first reply is instant as well.
+            const { chats } = get();
+            let changed = false;
+            const updated = chats.map((c: any) => {
+                if ((c.friendId || '').toUpperCase() !== normalizedFriendId) return c;
+                if (c.friendKey) return c;
+                changed = true;
+                return { ...c, friendKey: key };
+            });
+            if (changed) set({ chats: updated });
+
+            return key;
+        } catch (e) {
+            console.warn('[ChatStore] Failed to warm friend key:', e);
+            return null;
+        } finally {
+            friendKeyFetchInFlight.delete(normalizedFriendId);
+        }
+    })();
+
+    friendKeyFetchInFlight.set(normalizedFriendId, promise);
+    return promise;
+};
+
+// Export a getter so relay/other modules can access the live Phoenix socket
+export const getPhoenixSocket = (): PhxSocket | null => socket;
+
+// Export a getter for the joined user channel (used by call signaling)
+export const getUserChannel = (): Channel | null => userChannel;
+
+// Export a function to reset socket (for development/hot-reload issues)
+export const resetSocketConnection = () => {
+    // console.log('[ChatStore] Resetting socket connection...');
+
+    // Leave all chat channels
+    chatChannels.forEach((channel, chatId) => {
+        try {
+            channel.leave();
+        } catch (e) {
+            console.warn('[ChatStore] Error leaving channel:', chatId, e);
+        }
+    });
+    chatChannels.clear();
+
+    // Leave user channel
+    if (userChannel) {
+        try {
+            userChannel.leave();
+        } catch (e) {
+            console.warn('[ChatStore] Error leaving user channel:', e);
+        }
+        userChannel = null;
+    }
+
+    // Disconnect socket
+    if (socket) {
+        try {
+            socket.disconnect();
+        } catch (e) {
+            console.warn('[ChatStore] Error disconnecting socket:', e);
+        }
+        socket = null;
+    }
+
+    if (loadChatsDebounceTimer) {
+        clearTimeout(loadChatsDebounceTimer);
+        loadChatsDebounceTimer = null;
+    }
+    if (channelResyncTimer) {
+        clearTimeout(channelResyncTimer);
+        channelResyncTimer = null;
+    }
+    pendingRetryFlushTimers.forEach((timer) => clearTimeout(timer));
+    pendingRetryFlushTimers.clear();
+
+    // Reset flag so socket can be re-initialized
+    socketInitialized = false;
+
+    // console.log('[ChatStore] Socket reset complete');
+};
+
+export const useChatStore = create<ChatState>()(
+    persist(
+        (set, get) => ({
+            chats: [],
+            isConnected: false,
+            isLoading: false,
+            activeChatId: null,
+            typingUsers: new Set(),
+            recordingUsers: new Set(),
+            onlineUsers: new Set(),
+            offlineQueue: [],
+            socket: null,
+            uploadProgress: {},
+            lastChatsLoad: 0,
+
+            disconnect: () => {
+                resetSocketConnection();
+                set({ isConnected: false, socket: null });
+            },
+
+            initSocket: () => {
+                // Module-level singleton check - prevents any re-initialization
+                if (socketInitialized) {
+                    // console.log('[ChatStore] Socket already initialized, skipping');
+                    return;
+                }
+                socketInitialized = true;
+
+                const proxy = ProxyManager.getInstance();
+                const baseUrl = proxy.getBestUrl();
+                // Convert http(s) to ws(s)
+                const socketUrl = baseUrl.replace(/^http/, 'ws') + '/socket';
+
+                const auth = AuthManager.getInstance().getSession();
+                if (!auth) {
+                    // console.log('[ChatStore] No auth session for socket init');
+                    socketInitialized = false; // Reset so it can try again later
+                    return;
+                }
+
+                // console.log('[ChatStore] Init Phoenix socket to:', socketUrl);
+                // console.log('[ChatStore] Auth token available:', !!auth.loginToken, 'userId:', auth.userId);
+
+                socket = new PhxSocket(socketUrl, {
+                    params: { token: auth.loginToken || auth.userId },
+                    // Disable automatic reconnection to prevent spam when server is unavailable
+                    reconnectAfterMs: () => 10000, // Wait 10 seconds between reconnect attempts
+                });
+
+                socket.connect();
+                set({ socket }); // Update store state with socket instance
+
+                const scheduleLoadChats = (delayMs = 180) => {
+                    if (loadChatsDebounceTimer) return;
+                    loadChatsDebounceTimer = setTimeout(() => {
+                        loadChatsDebounceTimer = null;
+                        get().loadChats();
+                    }, delayMs);
+                };
+
+                const queueRecoverableMessages = () => {
+                    const { chats: currentChats, offlineQueue } = get();
+                    const recovered: Message[] = [];
+                    let chatsChanged = false;
+
+                    const updatedChats = currentChats.map((chat) => {
+                        let changed = false;
+                        const nextMessages = chat.messages.map((msg) => {
+                            if (msg.status === 'sending') {
+                                changed = true;
+                                chatsChanged = true;
+                                const pendingMsg = { ...msg, status: 'pending' as const };
+                                recovered.push(pendingMsg);
+                                return pendingMsg;
+                            }
+                            if (msg.status === 'pending' || msg.status === 'error') {
+                                recovered.push(msg);
+                            }
+                            return msg;
+                        });
+                        return changed ? { ...chat, messages: nextMessages } : chat;
+                    });
+
+                    const queueMap = new Map<string, Message>();
+                    for (const msg of offlineQueue) queueMap.set(msg.id, msg);
+                    for (const msg of recovered) queueMap.set(msg.id, msg);
+
+                    const nextQueue = Array.from(queueMap.values());
+                    const queueChanged =
+                        nextQueue.length !== offlineQueue.length ||
+                        nextQueue.some((msg, index) => offlineQueue[index]?.id !== msg.id);
+
+                    const patch: Partial<ChatState> = {};
+                    if (chatsChanged) patch.chats = updatedChats;
+                    if (queueChanged) patch.offlineQueue = nextQueue;
+                    if (Object.keys(patch).length > 0) set(patch as any);
+                };
+
+                socket.onOpen(() => {
+                    // console.log('[ChatStore] Phoenix Socket Connected');
+                    set({ isConnected: true });
+
+                    // Re-sync push token on every reconnect so server always has it
+                    try {
+                        const { useNotificationStore } = require('./stores/notification-store');
+                        useNotificationStore.getState().initNotifications();
+                    } catch (e) { /* ignore if notification store not ready */ }
+
+                    // Process Offline Queue — also recover any unsent messages stuck in chats
+                    const { offlineQueue, chats: currentChats } = get();
+                    const pendingMessages: Message[] = [];
+                    for (const chat of currentChats) {
+                        for (const msg of chat.messages) {
+                            if (msg.status === 'pending' || msg.status === 'error' || msg.status === 'sending') {
+                                pendingMessages.push(msg);
+                            }
+                        }
+                    }
+
+                    // Combine offline queue + stuck pending/error messages (dedup by id)
+                    const seenIds = new Set<string>();
+                    const toRetry: Message[] = [];
+                    for (const msg of [...offlineQueue, ...pendingMessages]) {
+                        if (msg.id && !seenIds.has(msg.id)) {
+                            seenIds.add(msg.id);
+                            toRetry.push(msg);
+                        }
+                    }
+
+                    if (toRetry.length > 0) {
+                        chatStoreLog('[ChatStore] Retrying', toRetry.length, 'queued/pending messages');
+                        // Small delay to let channels rejoin first
+                        setTimeout(() => {
+                            toRetry.forEach(msg => {
+                                if (msg.chatId) {
+                                    get().retryMessage(msg.chatId, msg.id);
+                                }
+                            });
+                        }, 1500);
+                    }
+                    set({ offlineQueue: [] });
+
+                    // IMPORTANT: Clear all channel references on reconnect
+                    // This ensures we re-join with fresh handlers
+                    chatChannels.forEach((channel) => {
+                        try { channel.leave(); } catch (e) { /* ignore */ }
+                    });
+                    chatChannels.clear();
+                    // console.log('[ChatStore] Cleared old channels, will re-join');
+
+                    // Small delay to ensure socket is fully ready before joining channels.
+                    // Debounced so reconnect/new_message bursts don't block JS with repeated reloads.
+                    // Rate limit: Don't reload if we just loaded < 15s ago (prevents reconnect loops)
+                    const { lastChatsLoad } = get();
+                    if (!lastChatsLoad || Date.now() - lastChatsLoad > 15000) {
+                        scheduleLoadChats(100);
+                    } else {
+                        // console.log('[ChatStore] Skipping loadChats on reconnect (rate limited)');
+                    }
+
+                    // Join User Channel for signaling/status.
+                    // Recreate it on reconnect if an old instance is stuck in a non-joined state.
+                    const userChannelState = (userChannel as any)?.state;
+                    const needsUserChannelJoin =
+                        !userChannel ||
+                        (userChannelState !== 'joined' && userChannelState !== 'joining');
+
+                    if (needsUserChannelJoin) {
+                        if (userChannel) {
+                            try { userChannel.leave(); } catch (e) { /* ignore */ }
+                            userChannel = null;
+                        }
+
+                        userChannel = socket!.channel(`user:${auth.userId}`, {});
+                        userChannel.join()
+                            .receive("ok", resp => { /* console.log("Joined user channel", resp) */ })
+                            .receive("error", resp => { /* console.log("Unable to join user channel", resp) */ });
+
+                        userChannel.on('initial-presence', (resp: any) => {
+                            // console.log('[ChatStore] Initial presence:', resp);
+                            const userIds = resp.onlineFriendIds || [];
+                            set({ onlineUsers: new Set(userIds.map((id: string) => id.toUpperCase())) });
+                        });
+
+                        // Listen for presence changes (user came online/offline)
+                        userChannel.on('presence-diff', (resp: any) => {
+                            // console.log('[ChatStore] Presence diff:', resp);
+                            const { onlineUsers } = get();
+                            const newSet = new Set(onlineUsers);
+
+                            // Phoenix Presence format: { joins: { "userId": {...} }, leaves: { "userId": {...} } }
+                            // Add users who came online
+                            if (resp.joins && typeof resp.joins === 'object') {
+                                Object.keys(resp.joins).forEach((id: string) => newSet.add(id.toUpperCase()));
+                            }
+                            // Remove users who went offline
+                            if (resp.leaves && typeof resp.leaves === 'object') {
+                                Object.keys(resp.leaves).forEach((id: string) => newSet.delete(id.toUpperCase()));
+                            }
+
+                            set({ onlineUsers: newSet });
+                        });
+
+                        // Also listen for friend-online and friend-offline events
+                        userChannel.on('friend-online', (resp: any) => {
+                            // console.log('[ChatStore] Friend online:', resp);
+                            const { onlineUsers } = get();
+                            // robust check for keys
+                            const rawId = resp.userId || resp.user_id || resp.id;
+                            const userId = (rawId || '').toUpperCase();
+
+                            if (userId) {
+                                const newSet = new Set(onlineUsers);
+                                newSet.add(userId);
+                                set({ onlineUsers: newSet });
+                            }
+                        });
+
+                        userChannel.on('friend-offline', (resp: any) => {
+                            // console.log('[ChatStore] Friend offline:', resp);
+                            const { onlineUsers } = get();
+                            // robust check for keys
+                            const rawId = resp.userId || resp.user_id || resp.id;
+                            const userId = (rawId || '').toUpperCase();
+
+                            if (userId) {
+                                const newSet = new Set(onlineUsers);
+                                newSet.delete(userId);
+                                set({ onlineUsers: newSet });
+                            }
+                        });
+
+                        // Phoenix Presence state (initial list of online users)
+                        userChannel.on('presence_state', (state: any) => {
+                            // console.log('[ChatStore] Presence state:', Object.keys(state));
+                            const userIds = Object.keys(state).map(id => id.toUpperCase());
+                            set({ onlineUsers: new Set(userIds) });
+                        });
+
+                        // Phoenix Presence diff (users joining/leaving)
+                        userChannel.on('presence_diff', (diff: any) => {
+                            // console.log('[ChatStore] Presence diff:', diff);
+                            const { onlineUsers } = get();
+                            const newSet = new Set(onlineUsers);
+
+                            // Add users who came online
+                            Object.keys(diff.joins || {}).forEach(id => newSet.add(id.toUpperCase()));
+                            // Remove users who went offline
+                            Object.keys(diff.leaves || {}).forEach(id => newSet.delete(id.toUpperCase()));
+
+                            set({ onlineUsers: newSet });
+                        });
+
+                        // Listen for new chat creation (e.g., first message from a new contact)
+                        userChannel.on('new_chat', (payload: any) => {
+                            // console.log('[ChatStore] New chat received:', payload);
+                            // Reload chats to get the new chat
+                            scheduleLoadChats(250);
+                        });
+
+                        // Listen for new message notification (for chats we might not have yet or deleted)
+                        userChannel.on('new_message', (payload: any) => {
+                            const msgId = payload.message_id || payload.messageId;
+                            if (msgId && recentlyProcessedMsgIds.has(msgId)) return;
+                            // console.log('[ChatStore] New message notification:', payload);
+                            const { chats } = get();
+                            const chatId = payload.chatId || payload.chat_id;
+
+                            // Check if we have this chat and are subscribed to its channel
+                            const existingChat = chats.find(c => c.chatId === chatId);
+                            const isSubscribed = chatChannels.has(chatId);
+
+                            if (!existingChat || !isSubscribed) {
+                                // Chat doesn't exist in our list OR we're not subscribed
+                                // This happens when:
+                                // 1. New chat we never had
+                                // 2. Chat we deleted (but someone messaged us)
+                                // console.log('[ChatStore] Reloading chats due to new_message notification');
+                                scheduleLoadChats(250);
+                            }
+                        });
+
+                        // ==============================================
+                        // CALL SIGNALING HANDLERS
+                        // ==============================================
+
+                        // Handle incoming call request
+                        userChannel.on('call-start', (payload: any) => {
+                            // console.log('[ChatStore] Incoming call:', payload);
+                            try {
+                                // Dynamic import to avoid crashes if CallStore fails to load
+                                const { useCallStore } = require('./stores/CallStore');
+                                const callStore = useCallStore.getState();
+
+                                // Get caller info from our chats
+                                const { chats } = get();
+                                const callerChat = chats.find(c =>
+                                    c.friendId?.toUpperCase() === (payload.fromUserId || '').toUpperCase()
+                                );
+
+                                callStore.handleIncomingCall({
+                                    fromUserId: payload.fromUserId,
+                                    fromUserName: callerChat?.friendName || payload.fromUserId?.slice(0, 8) || 'Unknown',
+                                    fromUserImage: callerChat?.friendImage,
+                                    callType: payload.callType || 'voice',
+                                    callId: payload.callId,
+                                });
+                            } catch (e) {
+                                console.warn('[ChatStore] Call handling failed (WebRTC not available?):', e);
+                            }
+                        });
+
+                        // Handle call accepted by remote party
+                        userChannel.on('call-accepted', (payload: any) => {
+                            // console.log('[ChatStore] Call accepted:', payload);
+                            try {
+                                const { useCallStore } = require('./stores/CallStore');
+                                useCallStore.getState().handleCallAccepted();
+                            } catch (e) {
+                                console.warn('[ChatStore] Call accepted handling failed:', e);
+                            }
+                        });
+
+                        // Handle call ended by remote party
+                        userChannel.on('call-end', (payload: any) => {
+                            // console.log('[ChatStore] Call ended:', payload);
+                            try {
+                                const { useCallStore } = require('./stores/CallStore');
+                                useCallStore.getState().handleCallEnded();
+                            } catch (e) {
+                                console.warn('[ChatStore] Call end handling failed:', e);
+                            }
+                        });
+
+                        // Handle WebRTC signaling (SDP offer/answer, ICE candidates)
+                        userChannel.on('webrtc-signal', (payload: any) => {
+                            // console.log('[ChatStore] WebRTC signal:', payload.type);
+                            try {
+                                const { useCallStore } = require('./stores/CallStore');
+                                useCallStore.getState().handleWebRTCSignal(payload);
+                            } catch (e) {
+                                console.warn('[ChatStore] WebRTC signal handling failed:', e);
+                            }
+                        });
+                    }
+                });
+
+                socket.onClose((e) => {
+                    // console.log('[ChatStore] Phoenix Socket Disconnected', e);
+                    queueRecoverableMessages();
+                    // Clear channel references so they get re-joined on reconnect
+                    // This ensures fresh handlers are attached
+                    chatChannels.clear();
+                    userChannel = null;
+                    set({ isConnected: false });
+                });
+
+                socket.onError((e) => {
+                    // console.log('[ChatStore] Phoenix Socket Error', e);
+                    queueRecoverableMessages();
+                    // Don't clear channels here - let onClose handle it
+                    // Just update connection status
+                    set({ isConnected: false });
+                });
+            },
+
+            loadChats: async () => {
+                // console.log('[ChatStore] loadChats called');
+                let auth = AuthManager.getInstance().getSession();
+                if (!auth) {
+                    // console.log('[ChatStore] No auth session found');
+                    auth = await AuthManager.getInstance().init();
+                    if (!auth) {
+                        // console.log('[ChatStore] Auth init failed');
+                        return;
+                    }
+                }
+
+                set({ isLoading: true, lastChatsLoad: Date.now() });
+
+                try {
+                    // Fetch chats via API
+                    const { apiClient } = require('./api-client');
+                    const data = await apiClient.getChats(auth.userId);
+                    // console.log('[ChatStore] Fetched API. Chats count:', data ? data.length : 'null');
+
+                    // Process chats
+                    // Process chats with merge logic - PRESERVE local plaintext!
+                    const currentChats = get().chats;
+                    let processedChats: Chat[] = [];
+
+                    processedChats = await Promise.all(data.map(async (c: any) => {
+                        const existing = currentChats.find(ec => ec.chatId === c.chatId);
+
+                        // Normalize server messages to ensure camelCase keys (encryptedContent, etc.)
+                        const serverMessagesRaw = c.messages || [];
+                        const serverMessages = serverMessagesRaw.map(normalizeMessage);
+
+                        const localMessages = existing?.messages || [];
+
+                        // IMPORTANT: Always prefer local messages if they exist
+                        // because local messages have plaintext
+                        let mergedMessages = localMessages;
+
+                        // Only add server messages that we don't have locally
+                        for (const serverMsg of serverMessages) {
+                            const existsLocally = localMessages.some(lm => lm.id === serverMsg.id);
+                            if (!existsLocally) {
+                                mergedMessages = [...mergedMessages, serverMsg];
+                            }
+                        }
+
+                        // DECRYPT LAST MESSAGE FOR PREVIEW if needed
+                        const lastMsg = mergedMessages[mergedMessages.length - 1];
+                        if (lastMsg && !lastMsg.plaintext && lastMsg.encryptedContent) {
+                            try {
+                                if (auth?.keyPair?.privateKey) {
+                                    const isFromMe = (lastMsg.fromId || '').toUpperCase() === (auth.userId || '').toUpperCase();
+                                    const decrypted = await decryptMessageContent(auth.keyPair.privateKey, lastMsg.encryptedContent, isFromMe);
+                                    if (decrypted) {
+                                        const parsed = parseDecryptedContent(decrypted);
+                                        Object.assign(lastMsg, parsed);
+                                    }
+                                }
+                            } catch (e) {
+                                // console.warn('[ChatStore] Preview decrypt failed', e);
+                            }
+                        }
+
+                        return {
+                            chatId: c.chatId,
+                            type: c.type || 'dm',
+                            name: c.name || null,
+                            description: c.description || null,
+                            avatarUrl: c.avatarUrl || null,
+                            creatorId: c.creatorId || null,
+                            memberCount: c.memberCount || null,
+                            role: c.role || 'member',
+                            friendId: c.friendId,
+                            friendName: c.friendName || c.name || c.friendId,
+                            friendImage: c.friendImage || c.avatarUrl || null,
+                            friendKey: extractPublicKey(c) || extractPublicKey(existing),
+                            messages: mergedMessages,
+                            lastMessage: lastMsg || serverMessages[0] || null,
+                            unreadCount: c.unreadCount || 0,
+                            pinned: c.pinned || false,
+                            muted: c.muted || false,
+                            markedUnread: c.markedUnread || false
+                        };
+                    }));
+
+                    // Join chat channels for real-time updates
+                    // Check socket exists and is connected
+                    const isSocketReady = socket && socket.isConnected();
+                    // console.log('[ChatStore] Socket ready for channels:', isSocketReady, 'Chats to join:', processedChats.length);
+
+                    if (isSocketReady) {
+                        for (const chat of processedChats) {
+                            const topic = `chat:${chat.chatId}`;
+
+                            // Always re-join if not in our map (handles reconnection)
+                            if (!chatChannels.has(chat.chatId)) {
+                                chatStoreLog('[ChatStore] Joining channel:', topic);
+                                const channel = socket!.channel(topic, {});
+
+                                // Store reference immediately to prevent duplicate joins
+                                chatChannels.set(chat.chatId, channel);
+
+                                channel.join()
+                                    .receive("ok", () => {
+                                        scheduleChatRetryFlush(chat.chatId, get, 260);
+                                    })
+                                    .receive("error", (err: any) => {
+                                        // console.log(`[ChatStore] Failed to join chat ${chat.chatId}:`, err);
+                                        // Remove from map so we can retry
+                                        chatChannels.delete(chat.chatId);
+                                    });
+
+                                channel.on("message", async (payload: any) => {
+                                    // console.log(`[ChatStore] Received message on ${topic}:`, payload.id);
+
+                                    // Ignore current user's own messages (we handle them optimistically)
+                                    // UNLESS it's a confirmation/echo with updated server ID (not implemented yet)
+                                    // For now we rely on dedup logic
+                                    if (recentlyProcessedMsgIds.has(payload.id)) return;
+
+                                    // Add to store
+                                    const newMsg = normalizeMessage(payload);
+
+                                    // Try to decrypt immediately if we have key
+                                    const currentAuth = AuthManager.getInstance().getSession();
+                                    if (currentAuth?.keyPair?.privateKey && newMsg.encryptedContent) {
+                                        try {
+                                            const isFromMe = (newMsg.fromId || '').toUpperCase() === (currentAuth.userId || '').toUpperCase();
+                                            const decrypted = await decryptMessageContent(currentAuth.keyPair.privateKey, newMsg.encryptedContent, isFromMe);
+                                            if (decrypted) {
+                                                const parsed = parseDecryptedContent(decrypted);
+                                                Object.assign(newMsg, parsed);
+                                            }
+                                        } catch (e) {
+                                            console.warn('[ChatStore] Realtime decrypt failed', e);
+                                        }
+                                    }
+
+                                    // Send Delivery Receipt (if not from me)
+                                    // REUSE currentAuth from above
+                                    if (newMsg.fromId !== currentAuth?.userId) {
+                                        get().sendDeliveryReceipt(chat.chatId, newMsg.id);
+                                    }
+
+                                    const { chats: currentChats } = get();
+                                    const idx = currentChats.findIndex(c => c.chatId === chat.chatId);
+
+                                    if (idx > -1) {
+                                        // Check duplicate
+                                        if (currentChats[idx].messages.some(m => m.id === newMsg.id)) return;
+
+                                        const updated = [...currentChats];
+                                        updated[idx] = {
+                                            ...updated[idx],
+                                            messages: [...updated[idx].messages, newMsg],
+                                            lastMessage: newMsg,
+                                            unreadCount: (updated[idx].unreadCount || 0) + 1
+                                        };
+                                        // Move to top
+                                        updated.sort((a, b) => {
+                                            if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+                                            return (b.lastMessage?.timestamp || 0) - (a.lastMessage?.timestamp || 0);
+                                        });
+
+                                        set({ chats: updated });
+                                        if (newMsg.fromId !== currentAuth?.userId && !extractPublicKey(updated[idx])) {
+                                            warmFriendPublicKey(chat.chatId, updated[idx].friendId, set, get).catch(() => { });
+                                        }
+                                        // Determine sound
+                                        const isMe = newMsg.fromId === currentAuth?.userId;
+                                        if (isMe) {
+                                            SoundManager.play('sent'); // Confirmation from server
+                                        } else if (!updated[idx].muted) {
+                                            SoundManager.play('received');
+                                        }
+                                    }
+                                });
+
+                                // Listen for typing events
+                                channel.on("typing", (payload: any) => {
+                                    // console.log('[ChatStore] Typing event:', payload);
+                                    const { typingUsers } = get();
+                                    const auth = AuthManager.getInstance().getSession();
+                                    const myUserId = auth?.userId?.toUpperCase() || '';
+                                    let userId = (payload.userId || payload.fromId || '').toUpperCase();
+
+                                    // Skip our own typing events (don't show ourselves as "typing")
+                                    if (userId === 'ME' || userId === myUserId || userId === '') {
+                                        chatStoreLog('[ChatStore] Skipping own typing event');
+                                        return;
+                                    }
+
+                                    chatStoreLog('[ChatStore] Adding to typingUsers:', userId);
+                                    const newSet = new Set(typingUsers);
+                                    newSet.add(userId);
+                                    set({ typingUsers: newSet });
+                                });
+
+                                channel.on("stop-typing", (payload: any) => {
+                                    // console.log('[ChatStore] Stop-typing event:', payload);
+                                    const { typingUsers } = get();
+                                    const auth = AuthManager.getInstance().getSession();
+                                    const myUserId = auth?.userId?.toUpperCase() || '';
+                                    let userId = (payload.userId || payload.fromId || '').toUpperCase();
+
+                                    // Skip our own stop-typing events
+                                    if (userId === 'ME' || userId === myUserId || userId === '') {
+                                        chatStoreLog('[ChatStore] Skipping own stop-typing event');
+                                        return;
+                                    }
+
+                                    chatStoreLog('[ChatStore] Removing from typingUsers:', userId);
+                                    const newSet = new Set(typingUsers);
+                                    newSet.delete(userId);
+                                    set({ typingUsers: newSet });
+                                });
+
+                                channel.on("recording", (payload: any) => {
+                                    // console.log('[ChatStore] Recording event:', payload);
+                                    const { recordingUsers } = get();
+                                    const auth = AuthManager.getInstance().getSession();
+                                    const myUserId = auth?.userId?.toUpperCase() || '';
+                                    let userId = (payload.userId || payload.fromId || '').toUpperCase();
+
+                                    if (userId === 'ME' || userId === myUserId || userId === '') return;
+
+                                    const newSet = new Set(recordingUsers);
+                                    newSet.add(userId);
+                                    set({ recordingUsers: newSet });
+                                });
+
+                                channel.on("stop-recording", (payload: any) => {
+                                    // console.log('[ChatStore] Stop-recording event:', payload);
+                                    const { recordingUsers } = get();
+                                    const auth = AuthManager.getInstance().getSession();
+                                    const myUserId = auth?.userId?.toUpperCase() || '';
+                                    let userId = (payload.userId || payload.fromId || '').toUpperCase();
+
+                                    if (userId === 'ME' || userId === myUserId || userId === '') return;
+
+                                    const newSet = new Set(recordingUsers);
+                                    newSet.delete(userId);
+                                    set({ recordingUsers: newSet });
+                                });
+
+                                // Listen for message delivered events (when recipient receives message)
+                                channel.on("message-delivered", (payload: any) => {
+                                    // console.log('[ChatStore] Message delivered event:', payload);
+                                    const messageId = payload.messageId || payload.message_id;
+                                    if (!messageId) return;
+
+                                    const { chats: currentChats } = get();
+                                    const chatIdx = currentChats.findIndex(c => c.chatId === chat.chatId);
+                                    if (chatIdx === -1) return;
+
+                                    const msgIdx = currentChats[chatIdx].messages.findIndex(m => m.id === messageId);
+                                    if (msgIdx === -1) return;
+
+                                    // Pending can happen after reconnect/timeouts; delivery should still advance it.
+                                    const currentStatus = currentChats[chatIdx].messages[msgIdx].status;
+                                    if (
+                                        currentStatus === 'sent' ||
+                                        currentStatus === 'sending' ||
+                                        currentStatus === 'pending'
+                                    ) {
+                                        const updated = [...currentChats];
+                                        const updatedMessages = [...updated[chatIdx].messages];
+                                        updatedMessages[msgIdx] = { ...updatedMessages[msgIdx], status: 'delivered' };
+                                        updated[chatIdx] = { ...updated[chatIdx], messages: updatedMessages };
+                                        set({ chats: updated });
+                                        chatStoreLog('[ChatStore] Updated message status to delivered:', messageId);
+                                    }
+                                });
+
+                                // Listen for message read events (when recipient reads message)
+                                channel.on("message-read", (payload: any) => {
+                                    // console.log('[ChatStore] Message read event:', payload);
+                                    const messageId = payload.messageId || payload.message_id;
+                                    if (!messageId) return;
+
+                                    const { chats: currentChats } = get();
+                                    const auth = AuthManager.getInstance().getSession();
+                                    const nextChats = applyReadUpToMessageInChat(
+                                        currentChats,
+                                        chat.chatId,
+                                        messageId,
+                                        auth?.userId || null
+                                    );
+                                    if (nextChats !== currentChats) {
+                                        set({ chats: nextChats });
+                                        chatStoreLog('[ChatStore] Updated message status to read (up to):', messageId);
+                                    }
+                                });
+
+                                channel.on("message-deleted", (payload: any) => {
+                                    const messageId = payload.messageId || payload.message_id;
+                                    if (!messageId) return;
+                                    const currentChats = get().chats;
+                                    const nextChats = removeMessageFromChatList(currentChats, chat.chatId, messageId);
+                                    if (nextChats !== currentChats) {
+                                        set({ chats: nextChats });
+                                        const { offlineQueue } = get();
+                                        if (offlineQueue.some((m) => m.id === messageId)) {
+                                            set({ offlineQueue: offlineQueue.filter((m) => m.id !== messageId) });
+                                        }
+                                    }
+                                });
+
+                                channel.on("message-edited", (payload: any) => {
+                                    void handleMessageEditedPayload(chat.chatId, payload, set, get);
+                                });
+                            }
+                        }
+                    } else {
+                        chatStoreLog('[ChatStore] Socket not ready, channels will be joined on connect');
+                    }
+
+                    // Sort chats: Pinned first, then by last message timestamp (newest first)
+                    processedChats.sort((a, b) => {
+                        if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+                        const aTime = a.lastMessage?.timestamp || 0;
+                        const bTime = b.lastMessage?.timestamp || 0;
+                        return bTime - aTime;
+                    });
+
+                    const existingChatsSnapshot = get().chats;
+                    const chatsUnchanged =
+                        existingChatsSnapshot.length === processedChats.length &&
+                        existingChatsSnapshot.every((existing, index) => {
+                            const next = processedChats[index];
+                            if (!next) return false;
+                            const existingLastId = existing.lastMessage?.id || '';
+                            const nextLastId = next.lastMessage?.id || '';
+                            return (
+                                existing.chatId === next.chatId &&
+                                existing.messages.length === next.messages.length &&
+                                existingLastId === nextLastId &&
+                                existing.unreadCount === next.unreadCount &&
+                                existing.pinned === next.pinned
+                            );
+                        });
+
+                    if (chatsUnchanged) {
+                        set({ isLoading: false });
+                        chatStoreLog('[ChatStore] Chats unchanged, skipped chats state update');
+                    } else {
+                        set({ chats: processedChats, isLoading: false });
+                        chatStoreLog('[ChatStore] State updated with chats:', processedChats.length);
+                    }
+
+                    // Warm friend public keys for startup-sensitive chats (active + unread),
+                    // so first send/reply does not wait on key fetch.
+                    const currentActive = get().activeChatId;
+                    const warmCandidates = processedChats
+                        .filter(c =>
+                            !!c.friendId &&
+                            !extractPublicKey(c) &&
+                            (c.chatId === currentActive || (c.unreadCount || 0) > 0)
+                        )
+                        .slice(0, 4);
+
+                    warmCandidates.forEach((c) => {
+                        warmFriendPublicKey(c.chatId, c.friendId, set, get).catch(() => { });
+                    });
+
+                } catch (e) {
+                    console.error('[ChatStore] Load chats failed:', e);
+                    set({ isLoading: false });
+                }
+            },
+
+            startChat: async (friendId, friendInfo) => {
+                const friendKey = (friendId || '').toUpperCase();
+                if (!friendKey) throw new Error('Missing friendId');
+
+                // If we already have a DM with this user, reuse it.
+                const existingByFriend = get().chats.find(c => (c.friendId || '').toUpperCase() === friendKey);
+                if (existingByFriend?.chatId) {
+                    if (!extractPublicKey(existingByFriend)) {
+                        warmFriendPublicKey(existingByFriend.chatId, friendId, set, get).catch(() => { });
+                    }
+                    return existingByFriend.chatId;
+                }
+
+                // Dedupe concurrent calls to prevent duplicate chats
+                const existingInFlight = startChatInFlight.get(friendKey);
+                if (existingInFlight) return existingInFlight;
+
+                const promise = (async () => {
+                    const proxy = ProxyManager.getInstance();
+                    const baseUrl = proxy.getBestUrl();
+                    const auth = AuthManager.getInstance().getSession();
+                    if (!auth) throw new Error('Not authenticated');
+
+                    const res = await fetch(`${baseUrl}/api/chat`, {
+                        method: 'POST',
+                        headers: buildAuthHeaders(auth, {
+                            'Content-Type': 'application/json',
+                        }),
+                        body: JSON.stringify({ myId: auth.userId, friendId })
+                    });
+
+                    console.log('[ChatStore] startChat response status:', res.status);
+
+                    if (!res.ok) {
+                        const text = await res.text();
+                        console.error('[ChatStore] startChat failed:', text);
+                        throw new Error(text || `HTTP ${res.status}`);
+                    }
+
+                    const data = await res.json();
+                    const chatId = data.chatId;
+
+                    // Add new chat to local state immediately so it appears in the list
+                    const { chats } = get();
+                    const existingChat = chats.find(c => c.chatId === chatId);
+                    if (!existingChat) {
+                        const newChat: Chat = {
+                            chatId: chatId,
+                            friendId: friendId,
+                            friendName: friendInfo?.username || friendId,
+                            friendImage: friendInfo?.profileImage || undefined,
+                            friendKey: extractPublicKey(friendInfo) || undefined,
+                            messages: data.messages || [],
+                            lastMessage: undefined,
+                            unreadCount: 0,
+                            pinned: false,
+                            muted: false,
+                            markedUnread: false
+                        };
+                        set({ chats: [newChat, ...chats] });
+
+                        if (!newChat.friendKey) {
+                            warmFriendPublicKey(chatId, friendId, set, get).catch(() => { });
+                        }
+
+                        // Also join the chat channel for real-time updates
+                        if (socket && socket.isConnected()) {
+                            const topic = `chat:${chatId}`;
+                            if (!chatChannels.has(chatId)) {
+                                const channel = socket.channel(topic, {});
+                                chatChannels.set(chatId, channel); // Store immediately
+
+                                // Register event handlers BEFORE join so no messages are missed.
+                                // Phoenix channels queue pushes until joined, so sendMessage
+                                // can push immediately — it will be delivered once join completes.
+
+                                // Add message handler for this new channel with pre-decryption
+                                channel.on("message", (payload: any) => {
+                                    const deobfuscated = deobfuscatePayload(payload);
+                                    const serverMsg = deobfuscated.encryptedContent ? deobfuscated : payload;
+
+                                    if (!serverMsg.id || !serverMsg.fromId) return;
+
+                                    // Synchronous dedup check
+                                    if (recentlyProcessedMsgIds.has(serverMsg.id)) return;
+                                    recentlyProcessedMsgIds.add(serverMsg.id);
+                                    setTimeout(() => recentlyProcessedMsgIds.delete(serverMsg.id), 10000);
+
+                                    (async () => {
+                                        console.log('[ChatStore] New Message in new chat:', serverMsg.id);
+                                        const currentChats = get().chats;
+                                        const existingChatIdx = currentChats.find(c => c.chatId === chatId);
+                                        if (existingChatIdx?.messages.some(m => m.id === serverMsg.id)) return;
+
+                                        // PRE-DECRYPT the message
+                                        let plaintext: string | undefined = undefined;
+                                        try {
+                                            const sess = AuthManager.getInstance().getSession();
+                                            if (sess?.keyPair?.privateKey && serverMsg.encryptedContent) {
+                                                const isFromMe = serverMsg.fromId === sess.userId;
+                                                plaintext = await decryptMessageContent(sess.keyPair.privateKey, serverMsg.encryptedContent, isFromMe);
+                                            }
+                                        } catch (e) {
+                                            console.warn('[ChatStore] Pre-decrypt failed in startChat:', e);
+                                        }
+
+                                        const msg: Message = {
+                                            id: serverMsg.id,
+                                            fromId: serverMsg.fromId,
+                                            chatId: chatId,
+                                            encryptedContent: serverMsg.encryptedContent,
+                                            type: serverMsg.type || 'text',
+                                            timestamp: serverMsg.timestamp || Date.now(),
+                                            plaintext: plaintext, // Already decrypted
+                                            status: 'delivered'
+                                        };
+
+                                        const idx = currentChats.findIndex(c => c.chatId === chatId);
+                                        if (idx > -1) {
+                                            const updated = [...currentChats];
+                                            updated[idx] = {
+                                                ...updated[idx],
+                                                messages: [...updated[idx].messages, msg],
+                                                lastMessage: msg
+                                            };
+                                            set({ chats: updated });
+                                            if (msg.fromId !== auth.userId && !extractPublicKey(updated[idx])) {
+                                                warmFriendPublicKey(chatId, updated[idx].friendId, set, get).catch(() => { });
+                                            }
+                                        }
+                                    })();
+                                });
+
+                                // Add typing handlers
+                                channel.on("typing", (payload: any) => {
+                                    const { typingUsers } = get();
+                                    const auth = AuthManager.getInstance().getSession();
+                                    const myUserId = auth?.userId?.toUpperCase() || '';
+                                    let userId = (payload.userId || payload.fromId || '').toUpperCase();
+                                    if (userId === 'ME' || userId === myUserId || userId === '') return;
+                                    const newSet = new Set(typingUsers);
+                                    newSet.add(userId);
+                                    set({ typingUsers: newSet });
+                                });
+
+                                channel.on("stop-typing", (payload: any) => {
+                                    const { typingUsers } = get();
+                                    const auth = AuthManager.getInstance().getSession();
+                                    const myUserId = auth?.userId?.toUpperCase() || '';
+                                    let userId = (payload.userId || payload.fromId || '').toUpperCase();
+                                    if (userId === 'ME' || userId === myUserId || userId === '') return;
+                                    const newSet = new Set(typingUsers);
+                                    newSet.delete(userId);
+                                    set({ typingUsers: newSet });
+                                });
+
+                                // Listen for message delivered events
+                                channel.on("message-delivered", (payload: any) => {
+                                    console.log('[ChatStore] Message delivered (startChat):', payload);
+                                    const messageId = payload.messageId || payload.message_id;
+                                    if (!messageId) return;
+
+                                    const { chats: currentChats } = get();
+                                    const chatIdx = currentChats.findIndex(c => c.chatId === chatId);
+                                    if (chatIdx === -1) return;
+
+                                    const msgIdx = currentChats[chatIdx].messages.findIndex(m => m.id === messageId);
+                                    if (msgIdx === -1) return;
+
+                                    const currentStatus = currentChats[chatIdx].messages[msgIdx].status;
+                                    if (
+                                        currentStatus === 'sent' ||
+                                        currentStatus === 'sending' ||
+                                        currentStatus === 'pending'
+                                    ) {
+                                        const updated = [...currentChats];
+                                        const updatedMessages = [...updated[chatIdx].messages];
+                                        updatedMessages[msgIdx] = { ...updatedMessages[msgIdx], status: 'delivered' };
+                                        updated[chatIdx] = { ...updated[chatIdx], messages: updatedMessages };
+                                        set({ chats: updated });
+                                    }
+                                });
+
+                                // Listen for message read events
+                                channel.on("message-read", (payload: any) => {
+                                    console.log('[ChatStore] Message read (startChat):', payload);
+                                    const messageId = payload.messageId || payload.message_id;
+                                    if (!messageId) return;
+
+                                    const { chats: currentChats } = get();
+                                    const auth = AuthManager.getInstance().getSession();
+                                    const nextChats = applyReadUpToMessageInChat(
+                                        currentChats,
+                                        chatId,
+                                        messageId,
+                                        auth?.userId || null
+                                    );
+                                    if (nextChats !== currentChats) {
+                                        set({ chats: nextChats });
+                                    }
+                                });
+
+                                channel.on("message-deleted", (payload: any) => {
+                                    const messageId = payload.messageId || payload.message_id;
+                                    if (!messageId) return;
+                                    const currentChats = get().chats;
+                                    const nextChats = removeMessageFromChatList(currentChats, chatId, messageId);
+                                    if (nextChats !== currentChats) {
+                                        set({ chats: nextChats });
+                                        const { offlineQueue } = get();
+                                        if (offlineQueue.some((m) => m.id === messageId)) {
+                                            set({ offlineQueue: offlineQueue.filter((m) => m.id !== messageId) });
+                                        }
+                                    }
+                                });
+
+                                channel.on("message-edited", (payload: any) => {
+                                    void handleMessageEditedPayload(chatId, payload, set, get);
+                                });
+
+                                // Join channel in background (don't await — Phoenix queues pushes until joined)
+                                channel.join()
+                                    .receive("ok", () => {
+                                        console.log(`[ChatStore] Joined new chat ${chatId}`);
+                                        scheduleChatRetryFlush(chatId, get, 260);
+                                    })
+                                    .receive("error", () => {
+                                        console.log(`[ChatStore] Failed to join new chat ${chatId}`);
+                                        chatChannels.delete(chatId);
+                                    })
+                                    .receive("timeout", () => {
+                                        console.log(`[ChatStore] Timeout joining new chat ${chatId}`);
+                                    });
+                            }
+                        }
+                    }
+
+                    return chatId;
+                })();
+
+                startChatInFlight.set(friendKey, promise);
+                try {
+                    return await promise;
+                } finally {
+                    startChatInFlight.delete(friendKey);
+                }
+            },
+
+            setUploadProgress: (messageId, progress) => {
+                const { uploadProgress } = get();
+                set({ uploadProgress: { ...uploadProgress, [messageId]: progress } });
+            },
+
+            clearUploadProgress: (messageId) => {
+                const { uploadProgress } = get();
+                const updated = { ...uploadProgress };
+                delete updated[messageId];
+                set({ uploadProgress: updated });
+                uploadAbortControllers.delete(messageId);
+            },
+
+            cancelUpload: (chatId, messageId) => {
+                // Abort the in-flight upload
+                const controller = uploadAbortControllers.get(messageId);
+                if (controller) {
+                    controller.abort();
+                    uploadAbortControllers.delete(messageId);
+                }
+                // Clear progress
+                get().clearUploadProgress(messageId);
+                // Remove the message from chat
+                const { chats } = get();
+                set({
+                    chats: chats.map(c => {
+                        if (c.chatId !== chatId) return c;
+                        const msgs = c.messages.filter(m => m.id !== messageId);
+                        return { ...c, messages: msgs, lastMessage: msgs[msgs.length - 1] || c.lastMessage };
+                    })
+                });
+            },
+
+            markViewOnceViewed: (chatId, messageId) => {
+                const { chats } = get();
+                set({
+                    chats: chats.map(c => {
+                        if (c.chatId !== chatId) return c;
+                        return {
+                            ...c,
+                            messages: (c.messages || []).map(m => {
+                                if (m.id !== messageId) return m;
+                                const viewed = m.viewedBy || [];
+                                if (viewed.includes('self')) return m;
+                                return { ...m, viewedBy: [...viewed, 'self'] };
+                            }),
+                        };
+                    }),
+                });
+            },
+
+            retryMessage: async (chatId, messageId) => {
+                const { chats } = get();
+                const chat = chats.find(c => c.chatId === chatId);
+                if (!chat) return;
+                const msg = chat.messages.find(m => m.id === messageId);
+                if (!msg || (msg.status !== 'error' && msg.status !== 'pending' && msg.status !== 'sending')) return;
+
+                const existingId = isValidBinaryId(msg.id) ? msg.id : undefined;
+                if (!existingId) {
+                    // Remove stale non-UUID message IDs before retrying to avoid backend cast errors.
+                    const updatedChats = chats.map((c) => {
+                        if (c.chatId !== chatId) return c;
+                        const nextMessages = c.messages.filter((m) => m.id !== messageId);
+                        return {
+                            ...c,
+                            messages: nextMessages,
+                            lastMessage: nextMessages[nextMessages.length - 1] || c.lastMessage,
+                        };
+                    });
+                    set({ chats: updatedChats });
+                }
+
+                // Recover text from encrypted payload when persisted pending messages lost plaintext.
+                let recoveredText = msg.plaintext || '';
+                if (msg.type === 'text' && !recoveredText.trim() && msg.encryptedContent) {
+                    try {
+                        const sess = AuthManager.getInstance().getSession();
+                        if (sess?.keyPair?.privateKey) {
+                            const isFromMe = (msg.fromId || '').toUpperCase() === (sess.userId || '').toUpperCase();
+                            const decrypted = await decryptMessageContent(sess.keyPair.privateKey, msg.encryptedContent, isFromMe);
+                            const parsed = parseDecryptedContent(decrypted || '');
+                            if (typeof parsed.plaintext === 'string') {
+                                recoveredText = parsed.plaintext;
+                            } else if (typeof decrypted === 'string') {
+                                recoveredText = decrypted;
+                            }
+
+                            if (recoveredText !== (msg.plaintext || '')) {
+                                const latestChats = get().chats;
+                                const idx = latestChats.findIndex((c) => c.chatId === chatId);
+                                if (idx > -1) {
+                                    const updated = [...latestChats];
+                                    updated[idx] = {
+                                        ...updated[idx],
+                                        messages: updated[idx].messages.map((m) => (
+                                            m.id === messageId ? { ...m, plaintext: recoveredText } : m
+                                        )),
+                                    };
+                                    set({ chats: updated });
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        console.warn('[ChatStore] retryMessage plaintext recovery failed:', e);
+                    }
+                }
+
+                if (msg.type === 'text' && !recoveredText.trim()) {
+                    const latestChats = get().chats;
+                    const idx = latestChats.findIndex((c) => c.chatId === chatId);
+                    if (idx > -1) {
+                        const updated = [...latestChats];
+                        updated[idx] = {
+                            ...updated[idx],
+                            messages: updated[idx].messages.map((m) => (
+                                m.id === messageId
+                                    ? { ...m, status: 'error' as const, errorMessage: 'Could not recover message text for retry' }
+                                    : m
+                            )),
+                        };
+                        set({ chats: updated });
+                    }
+                    return;
+                }
+
+                // Re-send using recovered plaintext and existing metadata.
+                void get().sendMessage(chatId, recoveredText, msg.type, {
+                    mediaUrl: msg.mediaUrl,
+                    fileName: msg.fileName,
+                    fileSize: msg.fileSize,
+                    latitude: msg.latitude,
+                    longitude: msg.longitude,
+                    duration: msg.duration,
+                    contact: msg.contact,
+                    replyToId: msg.replyToId,
+                    caption: msg.caption,
+                    viewOnce: msg.viewOnce,
+                    isVideoNote: msg.isVideoNote,
+                    width: msg.extra?.width,
+                    height: msg.extra?.height,
+                    waveform: msg.extra?.waveform,
+                }, existingId);
+            },
+
+            deleteFailedMessage: (chatId, messageId) => {
+                const { chats } = get();
+                const chatIdx = chats.findIndex(c => c.chatId === chatId);
+                if (chatIdx === -1) return;
+                const msg = chats[chatIdx].messages.find(m => m.id === messageId);
+                if (!msg || (msg.status !== 'error' && msg.status !== 'pending')) return;
+
+                const updated = [...chats];
+                const filteredMessages = updated[chatIdx].messages.filter(m => m.id !== messageId);
+                updated[chatIdx] = {
+                    ...updated[chatIdx],
+                    messages: filteredMessages,
+                    lastMessage: filteredMessages.length > 0 ? filteredMessages[filteredMessages.length - 1] : undefined,
+                };
+                set({ chats: updated });
+            },
+
+            editMessage: async (chatId, messageId, text) => {
+                const auth = AuthManager.getInstance().getSession();
+                if (!auth?.keyPair?.publicKey || !auth?.keyPair?.privateKey) return false;
+                if (!isValidBinaryId(messageId)) return false;
+
+                const nextText = text.trim();
+                if (!nextText) return false;
+                if (__DEV__) {
+                    console.log('[ChatStore] editMessage start', { chatId, messageId, textLength: nextText.length });
+                }
+
+                const { chats } = get();
+                const chat = chats.find(c => c.chatId === chatId);
+                if (!chat) return false;
+                const existing = chat.messages.find(m => m.id === messageId);
+                if (!existing || existing.type !== 'text') return false;
+                if ((existing.fromId || '').toUpperCase() !== auth.userId.toUpperCase()) return false;
+                if ((existing.plaintext || '').trim() === nextText) return true;
+
+                const channel = chatChannels.get(chatId);
+                if (!channel) return false;
+
+                const friendPublicKey = extractPublicKey(chat) || await warmFriendPublicKey(chatId, chat.friendId, set, get);
+                if (!friendPublicKey) return false;
+
+                const editedAt = Date.now();
+
+                try {
+                    const fullPayload = JSON.stringify({
+                        text: nextText,
+                        mediaUrl: existing.mediaUrl,
+                        mediaKey: existing.mediaKey,
+                        fileName: existing.fileName,
+                        fileSize: existing.fileSize,
+                        latitude: existing.latitude,
+                        longitude: existing.longitude,
+                        duration: existing.duration,
+                        width: existing.extra?.width,
+                        height: existing.extra?.height,
+                        replyToId: existing.replyToId,
+                        contact: existing.contact,
+                        caption: existing.caption,
+                        thumbnailBase64: existing.extra?.thumbnailBase64,
+                        viewOnce: existing.viewOnce || undefined,
+                        isVideoNote: existing.isVideoNote || undefined,
+                        waveform: existing.extra?.waveform || undefined,
+                        isEdited: true,
+                        editedAt,
+                    });
+
+                    const importedKey = await importPublicKey(friendPublicKey);
+                    const encrypted = await encryptMessageNativeFirst({
+                        recipientPublicKey: importedKey,
+                        message: fullPayload,
+                        myPublicKey: auth.keyPair.publicKey,
+                    });
+
+                    const optimisticPatch: Partial<Message> = {
+                        plaintext: nextText,
+                        encryptedContent: encrypted,
+                        isEdited: true,
+                        editedAt,
+                        extra: {
+                            ...(existing.extra || {}),
+                            isEdited: true,
+                            editedAt,
+                        },
+                    };
+                    const optimisticChats = applyMessageEditedInChats(get().chats, chatId, messageId, optimisticPatch);
+                    if (optimisticChats !== get().chats) {
+                        set({ chats: optimisticChats });
+                        if (__DEV__) {
+                            console.log('[ChatStore] editMessage optimistic patch applied', { chatId, messageId, editedAt });
+                        }
+                    }
+
+                    channel.push("edit-message", {
+                        messageId,
+                        encryptedContent: encrypted,
+                        editedAt,
+                    }).receive("error", (err: any) => {
+                        console.warn('[ChatStore] edit-message failed:', err);
+                    }).receive("timeout", () => {
+                        console.warn('[ChatStore] edit-message timeout:', messageId);
+                    });
+                    if (__DEV__) {
+                        console.log('[ChatStore] editMessage push sent', { chatId, messageId });
+                    }
+
+                    return true;
+                } catch (e) {
+                    console.error('[ChatStore] editMessage failed:', e);
+                    return false;
+                }
+            },
+
+            sendMessage: async (chatId, text, type: Message['type'] = 'text', metadata: any = {}, existingId?: string) => {
+                console.log('[ChatStore] sendMessage called', {
+                    chatId,
+                    textLength: text.length,
+                    type,
+                    existingId,
+                    existingIdType: typeof existingId,
+                });
+                const auth = AuthManager.getInstance().getSession();
+                if (!auth) {
+                    console.warn('[ChatStore] sendMessage - no auth session');
+                    return;
+                }
+
+                const normalizedExistingId = isValidBinaryId(existingId) ? existingId : undefined;
+                const msgId = normalizedExistingId || Crypto.randomUUID();
+                const staleExistingId = existingId && existingId !== msgId ? existingId : undefined;
+                const now = Date.now();
+                console.log('[ChatStore] sendMessage ID resolution', {
+                    existingId,
+                    isValidBinaryId: !!normalizedExistingId,
+                    normalizedExistingId,
+                    msgId,
+                });
+
+                // Check Connection
+                const { isConnected } = get();
+
+                // 1. IMMEDIATE Optimistic Update - show message before encryption
+                const optimisticMsg: Message = {
+                    id: msgId,
+                    fromId: auth.userId,
+                    chatId: chatId,
+                    encryptedContent: '',
+                    type: type,
+                    timestamp: now,
+                    plaintext: text,
+                    mediaUrl: metadata.mediaUrl,
+                    fileName: metadata.fileName,
+                    fileSize: metadata.fileSize,
+                    latitude: metadata.latitude,
+                    longitude: metadata.longitude,
+                    duration: metadata.duration,
+                    contact: metadata.contact,
+                    replyToId: metadata.replyToId,
+                    caption: metadata.caption,
+                    viewOnce: metadata.viewOnce,
+                    viewedBy: [],
+                    isVideoNote: metadata.isVideoNote,
+                    extra: {
+                        width: metadata.width,
+                        height: metadata.height,
+                        waveform: metadata.waveform,
+                    },
+                    status: isConnected ? 'sending' : 'pending'
+                };
+
+                // Add to chats state immediately
+                const { chats } = get();
+                const chatIndex = chats.findIndex(c => c.chatId === chatId);
+                if (chatIndex > -1) {
+                    const updatedChats = [...chats];
+                    // Handle potential duplicate/retry by filtering
+                    const msgs = updatedChats[chatIndex].messages.filter(m => m.id !== msgId && m.id !== staleExistingId);
+
+                    updatedChats[chatIndex] = {
+                        ...updatedChats[chatIndex],
+                        messages: [...msgs, optimisticMsg],
+                        lastMessage: optimisticMsg
+                    };
+                    // Sort chats to bring this one to top
+                    updatedChats.sort((a, b) => {
+                        if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+                        return (b.lastMessage?.timestamp || 0) - (a.lastMessage?.timestamp || 0);
+                    });
+                    set({ chats: updatedChats });
+                }
+
+                if (!isConnected) {
+                    console.log('[ChatStore] Offline, queuing message:', msgId);
+                    const { offlineQueue } = get();
+                    const nextQueueMap = new Map<string, Message>();
+                    offlineQueue.forEach((m) => nextQueueMap.set(m.id, m));
+                    nextQueueMap.set(msgId, optimisticMsg);
+                    set({ offlineQueue: Array.from(nextQueueMap.values()) });
+                    return;
+                }
+
+                // 1.5 UPLOAD MEDIA if this is a media message with a local file URI
+                let resolvedMediaUrl = metadata.mediaUrl;
+                let mediaKey: string | undefined; // AES key for file-level encryption
+                const isLocalFile = resolvedMediaUrl && (resolvedMediaUrl.startsWith('file://') || resolvedMediaUrl.startsWith('/'));
+                const isMediaType = ['image', 'video', 'voice', 'music', 'file'].includes(type) || metadata.mediaUrl;
+
+                // 1.6 START KEY FETCH IN PARALLEL with media processing (HD speed optimization)
+                const chat = chats.find(c => c.chatId === chatId);
+                if (!chat) throw new Error('Chat not found');
+                let friendPublicKey: string | null = extractPublicKey(chat);
+
+                const keyFetchPromise = friendPublicKey
+                    ? Promise.resolve(friendPublicKey)
+                    : warmFriendPublicKey(chatId, chat.friendId, set, get);
+
+                if (isLocalFile && isMediaType) {
+                    // Create an AbortController so this upload can be cancelled
+                    const abortController = new AbortController();
+                    uploadAbortControllers.set(msgId, abortController);
+                    const uploadSignal = abortController.signal;
+
+                    try {
+                        console.log('[ChatStore] Encrypting & uploading media:', resolvedMediaUrl);
+                        const mediaCategory = type === 'image' ? 'image' : type === 'video' ? 'video' : type === 'voice' || type === 'music' ? 'audio' : 'file';
+
+                        // Step 0: Set initial progress to show activity
+                        get().setUploadProgress(msgId, 0.05);
+
+                        let fileUri = resolvedMediaUrl.startsWith('file://') ? resolvedMediaUrl : `file://${resolvedMediaUrl}`;
+
+                        // Check file size to decide encryption strategy
+                        const fileInfo = await FileSystem.getInfoAsync(fileUri);
+                        const fileSizeBytes = (fileInfo as any).size || 0;
+                        const fileSizeMB = fileSizeBytes / (1024 * 1024);
+
+                        // For large files (>15MB), use chunked encryption to avoid OOM crash.
+                        // Reads file in 1MB chunks through streaming AES cipher instead of
+                        // loading entire file into a single base64 JS string.
+                        const useLargeFileMode = fileSizeMB > 15;
+
+                        if (useLargeFileMode) {
+                            console.log(`[ChatStore] Large file (${Math.round(fileSizeMB)}MB), using chunked encryption`);
+                            get().setUploadProgress(msgId, 0.05);
+
+                            const ext = resolvedMediaUrl.split('.').pop()?.toLowerCase() || 'bin';
+                            const tempPath = `${FileSystem.cacheDirectory}encrypted_${Date.now()}.${ext}.enc`;
+
+                            const result = await encryptFileChunked(
+                                fileUri,
+                                tempPath,
+                                (fraction) => {
+                                    // Map encrypt progress 0-1 to 0.05-0.30
+                                    get().setUploadProgress(msgId, 0.05 + (fraction * 0.25));
+                                }
+                            );
+
+                            if (result) {
+                                mediaKey = result.keyBase64;
+                                console.log('[ChatStore] Large file chunked-encrypted, key length:', mediaKey.length);
+                                get().setUploadProgress(msgId, 0.30);
+
+                                const uploadedUrl = await uploadMedia(
+                                    tempPath,
+                                    auth.userId,
+                                    mediaCategory as 'image' | 'audio' | 'video' | 'file',
+                                    (progress) => {
+                                        const activeProgress = 0.3 + (progress * 0.7);
+                                        get().setUploadProgress(msgId, activeProgress);
+                                    },
+                                    uploadSignal,
+                                );
+
+                                FileSystem.deleteAsync(tempPath, { idempotent: true }).catch(() => { });
+
+                                if (uploadedUrl) {
+                                    resolvedMediaUrl = uploadedUrl;
+                                    const originalUri = metadata.mediaUrl?.startsWith('file://') ? metadata.mediaUrl : `file://${metadata.mediaUrl}`;
+                                    useEncryptedMediaStore.getState().manuallyCacheFile(uploadedUrl, originalUri);
+                                    console.log('[ChatStore] Large media encrypted & uploaded, URL:', resolvedMediaUrl);
+                                } else {
+                                    console.warn('[ChatStore] Media upload failed, sending with local URI');
+                                    mediaKey = undefined;
+                                }
+                            } else {
+                                // Chunked encryption not available (e.g. Expo Go), upload directly
+                                console.log('[ChatStore] Chunked encrypt unavailable, uploading directly');
+                                const uploadedUrl = await uploadMedia(
+                                    fileUri,
+                                    auth.userId,
+                                    mediaCategory as 'image' | 'audio' | 'video' | 'file',
+                                    (progress) => {
+                                        get().setUploadProgress(msgId, 0.1 + (progress * 0.9));
+                                    },
+                                    uploadSignal,
+                                );
+                                if (uploadedUrl) {
+                                    resolvedMediaUrl = uploadedUrl;
+                                    const originalUri = metadata.mediaUrl?.startsWith('file://') ? metadata.mediaUrl : `file://${metadata.mediaUrl}`;
+                                    useEncryptedMediaStore.getState().manuallyCacheFile(uploadedUrl, originalUri);
+                                }
+                            }
+                        } else {
+                            // Small files: encrypt in memory (safe for <15MB)
+
+                            // Step 0.5: HD thumbnail generation + SD compression (run in parallel where possible)
+                            if (type === 'image' && metadata.hdMode) {
+                                // HD mode: generate tiny thumbnail for instant preview on receiver
+                                try {
+                                    const thumb = await manipulateAsync(
+                                        fileUri,
+                                        [{ resize: { width: 400 } }],
+                                        { compress: 0.6, format: SaveFormat.JPEG }
+                                    );
+                                    const thumbBase64 = await FileSystem.readAsStringAsync(thumb.uri, {
+                                        encoding: FileSystem.EncodingType.Base64,
+                                    });
+                                    metadata.thumbnailBase64 = thumbBase64;
+                                    FileSystem.deleteAsync(thumb.uri, { idempotent: true }).catch(() => { });
+                                    console.log('[ChatStore] HD thumbnail generated:', Math.round(thumbBase64.length * 0.75 / 1024), 'KB');
+                                } catch (thumbErr) {
+                                    console.warn('[ChatStore] Thumbnail generation failed:', thumbErr);
+                                }
+                            } else if (type === 'image' && !metadata.hdMode) {
+                                // SD mode: compress oversized images
+                                try {
+                                    const fileSizeKB = fileSizeBytes / 1024;
+                                    if (fileSizeKB > 1024) {
+                                        const maxDim = 2048;
+                                        const compressed = await manipulateAsync(
+                                            fileUri,
+                                            [{ resize: { width: maxDim } }],
+                                            { compress: 0.85, format: SaveFormat.JPEG }
+                                        );
+                                        console.log('[ChatStore] Image optimized:', Math.round(fileSizeKB), 'KB ->', compressed.uri);
+                                        fileUri = compressed.uri;
+                                    }
+                                } catch (compErr) {
+                                    console.warn('[ChatStore] Image optimization failed, using original:', compErr);
+                                }
+                            }
+
+                            // Step 1: Read file as base64
+                            const fileBase64 = await FileSystem.readAsStringAsync(fileUri, {
+                                encoding: FileSystem.EncodingType.Base64,
+                            });
+                            console.log('[ChatStore] File read, size:', Math.round(fileBase64.length * 0.75 / 1024), 'KB');
+                            get().setUploadProgress(msgId, 0.15); // 15%
+
+                            // Step 2: Encrypt the file data with AES-256-GCM (native QuickCrypto is fast)
+                            const encResult = await encryptFileData(fileBase64);
+                            mediaKey = encResult.keyBase64;
+                            console.log('[ChatStore] File encrypted, key length:', mediaKey.length);
+                            get().setUploadProgress(msgId, 0.25); // 25%
+
+                            // Step 3: Write encrypted data to a temp file
+                            const ext = type === 'image' ? 'jpg' : (resolvedMediaUrl.split('.').pop()?.toLowerCase() || 'bin');
+                            const tempPath = `${FileSystem.cacheDirectory}encrypted_${Date.now()}.${ext}.enc`;
+                            await FileSystem.writeAsStringAsync(tempPath, encResult.encryptedBase64, {
+                                encoding: FileSystem.EncodingType.Base64,
+                            });
+                            get().setUploadProgress(msgId, 0.30); // 30% - Ready to upload
+
+                            // Step 4: Upload the encrypted file
+                            const uploadedUrl = await uploadMedia(
+                                tempPath,
+                                auth.userId,
+                                mediaCategory as 'image' | 'audio' | 'video' | 'file',
+                                (progress) => {
+                                    // Map 0-1 to 0.3-1.0
+                                    const activeProgress = 0.3 + (progress * 0.7);
+                                    get().setUploadProgress(msgId, activeProgress);
+                                },
+                                uploadSignal,
+                            );
+
+                            // Clean up temp file
+                            FileSystem.deleteAsync(tempPath, { idempotent: true }).catch(() => { });
+
+                            if (uploadedUrl) {
+                                resolvedMediaUrl = uploadedUrl;
+
+                                // Optimization: Map encrypted URL to original local file for sender display
+                                const originalUri = metadata.mediaUrl?.startsWith('file://') ? metadata.mediaUrl : `file://${metadata.mediaUrl}`;
+                                useEncryptedMediaStore.getState().manuallyCacheFile(uploadedUrl, originalUri);
+
+                                console.log('[ChatStore] Encrypted media uploaded, URL:', resolvedMediaUrl);
+                            } else {
+                                console.warn('[ChatStore] Media upload failed, sending with local URI');
+                                mediaKey = undefined; // Can't use encryption if upload failed
+                            }
+                        }
+
+                    } catch (uploadErr) {
+                        console.error('[ChatStore] Media encrypt/upload error:', uploadErr);
+                        mediaKey = undefined;
+                        // Continue sending with local URI as fallback
+                    }
+                }
+
+                // 2. Background: Encrypt and send
+                try {
+                    const startTotal = Date.now();
+                    chatStoreLog('[Timing] Background Send Process Start:', startTotal);
+
+                    // Await the key fetch that was started in parallel with media processing
+                    friendPublicKey = await keyFetchPromise;
+                    if (friendPublicKey) {
+                        chatStoreLog('[Timing] Public key ready (parallel fetch complete)');
+                    }
+
+                    if (!friendPublicKey) {
+                        throw new Error('Could not get encryption key');
+                    }
+
+                    const startEncrypt = Date.now();
+                    chatStoreLog('[Timing] Encrypt Start:', startEncrypt);
+
+                    // Create full payload with metadata to encrypt
+                    // Use the resolved (uploaded) URL, not the local file URI
+                    // Include mediaKey so recipient can decrypt the file-level encryption
+                    const fullPayload = JSON.stringify({
+                        text: text,
+                        mediaUrl: resolvedMediaUrl,
+                        mediaKey: mediaKey, // AES-256-GCM key for file decryption (only present if file was encrypted)
+                        fileName: metadata.fileName,
+                        fileSize: metadata.fileSize,
+                        latitude: metadata.latitude,
+                        longitude: metadata.longitude,
+                        duration: metadata.duration,
+                        width: metadata.width,
+                        height: metadata.height,
+                        replyToId: metadata.replyToId,
+                        contact: metadata.contact,
+                        caption: metadata.caption,
+                        thumbnailBase64: metadata.thumbnailBase64,
+                        viewOnce: metadata.viewOnce || undefined,
+                        isVideoNote: metadata.isVideoNote || undefined,
+                        waveform: metadata.waveform || undefined,
+                    });
+
+                    // Import and encrypt
+                    const importedKey = await importPublicKey(friendPublicKey);
+                    const encrypted = await encryptMessageNativeFirst({
+                        recipientPublicKey: importedKey,
+                        message: fullPayload,
+                        myPublicKey: auth.keyPair?.publicKey,
+                    });
+
+                    const endEncrypt = Date.now();
+                    chatStoreLog('[Timing] Encrypt Done:', endEncrypt, 'Duration:', endEncrypt - startEncrypt, 'ms');
+
+                    // Update message with encrypted content
+                    const currentChats = get().chats;
+                    const updatedIndex = currentChats.findIndex(c => c.chatId === chatId);
+                    if (updatedIndex > -1) {
+                        const newChats = [...currentChats];
+                        newChats[updatedIndex] = {
+                            ...newChats[updatedIndex],
+                            messages: newChats[updatedIndex].messages.map(m =>
+                                m.id === msgId
+                                    ? {
+                                        ...m,
+                                        encryptedContent: encrypted,
+                                        status: (m.status === 'pending' ? 'pending' : 'sending') as Message['status'],
+                                    }
+                                    : m
+                            )
+                        };
+                        set({ chats: newChats });
+                    }
+
+                    // Send via Channel
+                    const channel = chatChannels.get(chatId);
+                    console.log('[ChatStore] Channel lookup', {
+                        chatId,
+                        hasChannel: !!channel,
+                        channelsCount: chatChannels.size,
+                    });
+                    if (channel) {
+                        const payload = {
+                            id: msgId,
+                            fromId: auth.userId,
+                            encryptedContent: encrypted,
+                            timestamp: now,
+                            type: type,
+                            // SECURITY: Don't send metadata in plaintext! (Keep inside encryptedContent)
+                            // We send null to server to avoid leaking it in DB
+                            mediaUrl: null,
+                            fileName: null,
+                            latitude: null,
+                            longitude: null
+                        };
+                        console.log('[ChatStore] Sending message via Channel', {
+                            msgId,
+                            chatId,
+                            type,
+                            encryptedContentLength: encrypted.length,
+                        });
+                        chatStoreLog('[ChatStore] Sending message payload meta:', {
+                            id: payload.id,
+                            type: payload.type,
+                            timestamp: payload.timestamp,
+                        });
+                        const startPush = Date.now();
+
+                        // Pre-register msgId in dedup set so server echo is ignored
+                        recentlyProcessedMsgIds.add(msgId);
+                        setTimeout(() => recentlyProcessedMsgIds.delete(msgId), 10000);
+
+                        // Play sent sound immediately (optimistic)
+                        SoundManager.play('sent');
+
+                        channel.push("message", payload).receive("ok", () => {
+                            console.log('[ChatStore] Channel push OK received', {
+                                msgId,
+                                chatId,
+                                latency: Date.now() - startPush,
+                            });
+                            get().clearUploadProgress(msgId);
+                            const ackTime = Date.now();
+                            chatStoreLog('[Timing] Channel Ack received:', ackTime, 'Latency:', ackTime - startPush, 'ms');
+                            const { offlineQueue } = get();
+                            if (offlineQueue.some((m) => m.id === msgId)) {
+                                set({ offlineQueue: offlineQueue.filter((m) => m.id !== msgId) });
+                            }
+
+                            // Update status to SENT (Single Check)
+                            const latestChats = get().chats;
+                            const idx = latestChats.findIndex(c => c.chatId === chatId);
+                            if (idx > -1) {
+                                const updated = [...latestChats];
+                                updated[idx] = {
+                                    ...updated[idx],
+                                    messages: updated[idx].messages.map(m =>
+                                        m.id === msgId ? { ...m, status: 'sent' as const } : m
+                                    )
+                                };
+                                set({ chats: updated });
+                            }
+                        }).receive("error", (err: any) => {
+                            console.error('[ChatStore] Channel push ERROR', {
+                                msgId,
+                                chatId,
+                                error: String(err),
+                                reason: err?.reason,
+                                latency: Date.now() - startPush,
+                            });
+                            get().clearUploadProgress(msgId);
+                            console.error('[ChatStore] Message send failed:', err);
+                            const transient = !get().isConnected || !!(err && (err.reason === 'closed' || err.reason === 'timeout' || err.reason === 'transport_close'));
+                            // Keep transient transport failures pending for auto-retry.
+                            const latestChats = get().chats;
+                            const idx = latestChats.findIndex(c => c.chatId === chatId);
+                            if (idx > -1) {
+                                const updated = [...latestChats];
+                                const nextStatus = transient ? 'pending' : 'error';
+                                updated[idx] = {
+                                    ...updated[idx],
+                                    messages: updated[idx].messages.map(m =>
+                                        m.id === msgId ? { ...m, status: nextStatus } : m
+                                    )
+                                };
+                                set({ chats: updated });
+                            }
+                            if (transient) {
+                                const { offlineQueue } = get();
+                                const retryMessage = get().chats
+                                    .find(c => c.chatId === chatId)
+                                    ?.messages.find(m => m.id === msgId);
+                                if (retryMessage) {
+                                    const queueMap = new Map<string, Message>();
+                                    offlineQueue.forEach((m) => queueMap.set(m.id, m));
+                                    queueMap.set(msgId, { ...retryMessage, status: 'pending' });
+                                    set({ offlineQueue: Array.from(queueMap.values()) });
+                                }
+                                if (get().isConnected) {
+                                    scheduleChannelResync(get, 180);
+                                    scheduleChatRetryFlush(chatId, get, 1200);
+                                }
+                            }
+                        }).receive("timeout", () => {
+                            get().clearUploadProgress(msgId);
+                            console.error('[ChatStore] Message send timed out:', msgId);
+                            // Timeout is treated as transient network/channel failure.
+                            const latestChats = get().chats;
+                            const idx = latestChats.findIndex(c => c.chatId === chatId);
+                            if (idx > -1) {
+                                const updated = [...latestChats];
+                                updated[idx] = {
+                                    ...updated[idx],
+                                    messages: updated[idx].messages.map(m =>
+                                        m.id === msgId ? { ...m, status: 'pending' as const } : m
+                                    )
+                                };
+                                set({ chats: updated });
+                            }
+                            const retryMessage = get().chats
+                                .find(c => c.chatId === chatId)
+                                ?.messages.find(m => m.id === msgId);
+                            if (retryMessage) {
+                                const { offlineQueue } = get();
+                                const queueMap = new Map<string, Message>();
+                                offlineQueue.forEach((m) => queueMap.set(m.id, m));
+                                queueMap.set(msgId, { ...retryMessage, status: 'pending' });
+                                set({ offlineQueue: Array.from(queueMap.values()) });
+                            }
+                            if (get().isConnected) {
+                                scheduleChannelResync(get, 180);
+                                scheduleChatRetryFlush(chatId, get, 1200);
+                            }
+                        });
+                    } else {
+                        chatStoreLog('[ChatStore] No channel for chat:', chatId);
+                        // No channel available — queue as pending for reconnect auto-retry.
+                        const latestChats = get().chats;
+                        const idx = latestChats.findIndex(c => c.chatId === chatId);
+                        if (idx > -1) {
+                            const updated = [...latestChats];
+                            updated[idx] = {
+                                ...updated[idx],
+                                messages: updated[idx].messages.map(m =>
+                                    m.id === msgId ? { ...m, status: 'pending' as const } : m
+                                )
+                            };
+                            set({ chats: updated });
+                        }
+                        const retryMessage = get().chats
+                            .find(c => c.chatId === chatId)
+                            ?.messages.find(m => m.id === msgId);
+                        if (retryMessage) {
+                            const { offlineQueue } = get();
+                            const queueMap = new Map<string, Message>();
+                            offlineQueue.forEach((m) => queueMap.set(m.id, m));
+                            queueMap.set(msgId, { ...retryMessage, status: 'pending' });
+                            set({ offlineQueue: Array.from(queueMap.values()) });
+                        }
+                        if (get().isConnected) {
+                            scheduleChannelResync(get, 160);
+                            scheduleChatRetryFlush(chatId, get, 1100);
+                        }
+                    }
+                } catch (e: any) {
+                    get().clearUploadProgress(msgId);
+                    // If user cancelled, the message was already removed by cancelUpload — skip error marking
+                    if (e?.message === 'Upload cancelled') {
+                        console.log('[ChatStore] Upload cancelled by user:', msgId);
+                        return;
+                    }
+                    console.error('[ChatStore] sendMessage error:', e);
+                    const transient = !get().isConnected;
+                    // Update message status based on failure type
+                    const currentChats = get().chats;
+                    const idx = currentChats.findIndex(c => c.chatId === chatId);
+                    if (idx > -1) {
+                        const newChats = [...currentChats];
+                        const nextStatus = transient ? 'pending' : 'error';
+                        newChats[idx] = {
+                            ...newChats[idx],
+                            messages: newChats[idx].messages.map(m =>
+                                m.id === msgId ? { ...m, status: nextStatus } : m
+                            )
+                        };
+                        set({ chats: newChats });
+                    }
+                    if (transient) {
+                        const retryMessage = get().chats
+                            .find(c => c.chatId === chatId)
+                            ?.messages.find(m => m.id === msgId);
+                        if (retryMessage) {
+                            const { offlineQueue } = get();
+                            const queueMap = new Map<string, Message>();
+                            offlineQueue.forEach((m) => queueMap.set(m.id, m));
+                            queueMap.set(msgId, { ...retryMessage, status: 'pending' });
+                            set({ offlineQueue: Array.from(queueMap.values()) });
+                        }
+                        if (get().isConnected) {
+                            scheduleChannelResync(get, 180);
+                            scheduleChatRetryFlush(chatId, get, 1200);
+                        }
+                    }
+                }
+            },
+
+            setActiveChat: (id) => set({ activeChatId: id }),
+
+            loadMessages: async (chatId) => {
+                const inFlight = historyLoadInFlight.get(chatId);
+                if (inFlight) {
+                    await inFlight;
+                    return;
+                }
+
+                const cachedChat = get().chats.find((c) => c.chatId === chatId);
+                const cachedCount = Array.isArray(cachedChat?.messages) ? cachedChat!.messages.length : 0;
+                if (cachedCount > 0) {
+                    if (__DEV__) {
+                        console.log('[ChatStore][HistoryDebug] loadMessages skipped (cache-first)', {
+                            chatId,
+                            cachedCount,
+                        });
+                    }
+                    return;
+                }
+
+                const run = (async () => {
+                    const proxy = ProxyManager.getInstance();
+                    const baseUrl = proxy.getBestUrl();
+                    const auth = AuthManager.getInstance().getSession();
+
+                    try {
+                        const res = await fetch(`${baseUrl}/api/chat/${chatId}/messages`, {
+                            headers: {
+                                'ngrok-skip-browser-warning': 'true',
+                                ...buildAuthHeaders(auth),
+                            }
+                        });
+
+                        if (!res.ok) {
+                            const body = await res.text().catch(() => '');
+                            throw new Error(`HTTP ${res.status}${body ? `: ${body.slice(0, 180)}` : ''}`);
+                        }
+                        const messages = await res.json();
+                        if (!Array.isArray(messages)) {
+                            console.warn('[ChatStore][HistoryDebug] loadMessages returned non-array payload', {
+                                chatId,
+                                payloadType: typeof messages,
+                            });
+                            return;
+                        }
+
+                        if (__DEV__) {
+                            const unresolvedTextCount = messages.filter((m: any) => {
+                                const type = (m?.type || 'text');
+                                if (type !== 'text') return false;
+                                const text = m?.plaintext || m?.content || m?.text || '';
+                                return !(typeof text === 'string' && text.trim().length > 0);
+                            }).length;
+                            const encryptedCount = messages.filter((m: any) => !!(m?.encryptedContent || m?.encrypted_content)).length;
+                            console.log('[ChatStore][HistoryDebug] loadMessages fetched from API', {
+                                chatId,
+                                fetchedCount: messages.length,
+                                encryptedCount,
+                                unresolvedTextCount,
+                                sample: messages.slice(0, 6).map((m: any) => ({
+                                    id: m?.id,
+                                    type: m?.type,
+                                    status: m?.status,
+                                    hasEncryptedContent: !!(m?.encryptedContent || m?.encrypted_content),
+                                    hasPlaintext: typeof m?.plaintext === 'string' && m.plaintext.trim().length > 0,
+                                    hasContentField: typeof m?.content === 'string' && m.content.trim().length > 0,
+                                    hasTextField: typeof m?.text === 'string' && m.text.trim().length > 0,
+                                })),
+                            });
+                        }
+
+                        // MERGE messages: keep local messages that aren't on server, add server messages
+                        const { chats } = get();
+                        const chatIndex = chats.findIndex(c => c.chatId === chatId);
+                        if (chatIndex > -1) {
+                            const existingMessages = chats[chatIndex].messages;
+                            const serverMsgMap = new Map<string, any>();
+
+                            // Map server messages by ID
+                            messages.forEach((m: any) => {
+                                serverMsgMap.set(m.id, {
+                                    id: m.id,
+                                    fromId: m.fromId || m.from_id,
+                                    chatId: chatId,
+                                    encryptedContent: m.encryptedContent || m.encrypted_content,
+                                    type: m.type || 'text',
+                                    timestamp: m.timestamp,
+                                    plaintext: undefined,
+                                    status: m.status || 'delivered'
+                                });
+                            });
+
+                            // Merge: prioritize local messages (they may have plaintext), add new server messages
+                            const mergedMessages: Message[] = [];
+                            const seenIds = new Set<string>();
+
+                            // First, add all existing local messages (preserves plaintext decryption)
+                            existingMessages.forEach(msg => {
+                                const serverMsg = serverMsgMap.get(msg.id);
+                                if (serverMsg) {
+                                    mergedMessages.push({
+                                        ...serverMsg,
+                                        ...msg,
+                                        status: chooseMostAdvancedStatus(msg.status, serverMsg.status),
+                                        timestamp: msg.timestamp ?? serverMsg.timestamp,
+                                    });
+                                } else {
+                                    mergedMessages.push(msg);
+                                }
+                                seenIds.add(msg.id);
+                            });
+
+                            // Then add server messages that don't exist locally
+                            serverMsgMap.forEach((msg, id) => {
+                                if (!seenIds.has(id)) {
+                                    mergedMessages.push(msg);
+                                }
+                            });
+
+                            // Sort by timestamp
+                            mergedMessages.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+
+                            const updatedChats = [...chats];
+                            updatedChats[chatIndex] = {
+                                ...updatedChats[chatIndex],
+                                messages: mergedMessages
+                            };
+                            if (__DEV__) {
+                                const mergedUnresolvedTextCount = mergedMessages.filter((m: any) => {
+                                    const type = (m?.type || 'text');
+                                    if (type !== 'text') return false;
+                                    const text = m?.plaintext || m?.content || m?.text || '';
+                                    return !(typeof text === 'string' && text.trim().length > 0);
+                                }).length;
+                                console.log('[ChatStore][HistoryDebug] loadMessages merged into store', {
+                                    chatId,
+                                    localCountBeforeMerge: existingMessages.length,
+                                    serverCount: messages.length,
+                                    mergedCount: mergedMessages.length,
+                                    mergedUnresolvedTextCount,
+                                    mergedSample: mergedMessages.slice(0, 6).map((m: any) => ({
+                                        id: m?.id,
+                                        type: m?.type,
+                                        status: m?.status,
+                                        hasEncryptedContent: !!m?.encryptedContent,
+                                        hasPlaintext: typeof m?.plaintext === 'string' && m.plaintext.trim().length > 0,
+                                    })),
+                                });
+                            }
+                            set({ chats: updatedChats });
+                        }
+                    } catch (e) {
+                        console.error('[ChatStore] Load messages failed:', e);
+                    }
+                })();
+
+                historyLoadInFlight.set(chatId, run);
+                try {
+                    await run;
+                } finally {
+                    historyLoadInFlight.delete(chatId);
+                }
+            },
+
+            updateMessageDecryption: (chatId, messageId, plaintext) => {
+                const { chats } = get();
+                const chatIndex = chats.findIndex(c => c.chatId === chatId);
+                if (chatIndex === -1) return;
+
+                const msgIndex = chats[chatIndex].messages.findIndex(m => m.id === messageId);
+                if (msgIndex === -1) return;
+
+                // Create new array references to trigger re-render
+                const updatedChats = [...chats];
+                const updatedMessages = [...updatedChats[chatIndex].messages];
+
+                // Parse plaintext which might be JSON
+                const parsed = parseDecryptedContent(plaintext);
+
+                updatedMessages[msgIndex] = {
+                    ...updatedMessages[msgIndex],
+                    ...parsed
+                };
+                updatedChats[chatIndex] = {
+                    ...updatedChats[chatIndex],
+                    messages: updatedMessages
+                };
+
+                set({ chats: updatedChats });
+            },
+
+            batchUpdateDecryption: (chatId, updates) => {
+                const { chats } = get();
+                const chatIndex = chats.findIndex(c => c.chatId === chatId);
+                if (chatIndex === -1) return;
+
+                // Update all messages in a single state update
+                const updatedChats = [...chats];
+                const updatedMessages = chats[chatIndex].messages.map(m => {
+                    if (Object.prototype.hasOwnProperty.call(updates, m.id)) {
+                        const decrypted = updates[m.id];
+                        const parsed = parseDecryptedContent(decrypted);
+                        return { ...m, ...parsed };
+                    }
+                    return m;
+                });
+
+                updatedChats[chatIndex] = {
+                    ...updatedChats[chatIndex],
+                    messages: updatedMessages
+                };
+
+                set({ chats: updatedChats });
+            },
+            sendTyping: (chatId) => {
+                const auth = AuthManager.getInstance().getSession();
+                chatChannels.get(chatId)?.push("typing", { userId: auth?.userId || "me" });
+            },
+            sendStopTyping: (chatId: string) => {
+                // Check local chat exists first?
+                if (chatChannels.has(chatId)) {
+                    const auth = AuthManager.getInstance().getSession();
+                    const channel = chatChannels.get(chatId);
+                    chatStoreLog('[ChatStore] Sending stop-typing for:', auth?.userId);
+                    channel?.push("stop-typing", { userId: auth?.userId || "me" });
+                }
+            },
+
+            sendRecording: (chatId: string) => {
+                if (chatChannels.has(chatId)) {
+                    const auth = AuthManager.getInstance().getSession();
+                    const channel = chatChannels.get(chatId);
+                    chatStoreLog('[ChatStore] Sending recording for:', auth?.userId);
+                    channel?.push("recording", { userId: auth?.userId || "me" });
+                }
+            },
+
+            sendStopRecording: (chatId: string) => {
+                if (chatChannels.has(chatId)) {
+                    const auth = AuthManager.getInstance().getSession();
+                    const channel = chatChannels.get(chatId);
+                    chatStoreLog('[ChatStore] Sending stop-recording for:', auth?.userId);
+                    channel?.push("stop-recording", { userId: auth?.userId || "me" });
+                }
+            },
+
+            sendReadReceipt: (chatId, messageId) => {
+                if (!isValidBinaryId(messageId)) return;
+                const channel = chatChannels.get(chatId);
+                if (channel) {
+                    channel.push("read-receipt", { messageId });
+                }
+
+                // Update local status immediately to prevent duplicate requests
+                const { chats } = get();
+                const chatIdx = chats.findIndex(c => c.chatId === chatId);
+                if (chatIdx > -1) {
+                    const messages = chats[chatIdx].messages;
+                    const msgIdx = messages.findIndex(m => m.id === messageId);
+
+                    if (msgIdx > -1 && messages[msgIdx].status !== 'read') {
+                        const updatedChats = [...chats];
+                        const updatedMessages = [...messages];
+
+                        updatedMessages[msgIdx] = {
+                            ...updatedMessages[msgIdx],
+                            status: 'read'
+                        };
+
+                        updatedChats[chatIdx] = {
+                            ...updatedChats[chatIdx],
+                            messages: updatedMessages,
+                            // Decrement unread count if > 0
+                            unreadCount: Math.max(0, (updatedChats[chatIdx].unreadCount || 0) - 1)
+                        };
+
+                        set({ chats: updatedChats });
+                    }
+                }
+            },
+
+            sendDeliveryReceipt: (chatId, messageId) => {
+                if (!isValidBinaryId(messageId)) return;
+                const channel = chatChannels.get(chatId);
+                if (channel) {
+                    channel.push("delivery-receipt", { messageId });
+                }
+            },
+
+            deleteChat: async (chatId) => {
+                const { chats } = get();
+
+                // Leave the channel first
+                const channel = chatChannels.get(chatId);
+                if (channel) {
+                    channel.leave();
+                    chatChannels.delete(chatId);
+                }
+
+                // Remove from local state immediately (optimistic update)
+                set({ chats: chats.filter(c => c.chatId !== chatId) });
+
+                // Also delete from server
+                try {
+                    const auth = AuthManager.getInstance().getSession();
+                    if (auth) {
+                        const proxy = ProxyManager.getInstance();
+                        const baseUrl = proxy.getBestUrl();
+                        await fetch(`${baseUrl}/api/chats/${chatId}`, {
+                            method: 'DELETE',
+                            headers: buildAuthHeaders(auth, {
+                                'Content-Type': 'application/json',
+                            }),
+                        });
+                        console.log('[ChatStore] Chat deleted from server:', chatId);
+                    }
+                } catch (e) {
+                    console.warn('[ChatStore] Failed to delete chat from server:', e);
+                    // The local delete already happened, server sync will happen on next load
+                }
+            },
+
+            pinChat: async (chatId) => {
+                const { chats } = get();
+                const chat = chats.find(c => c.chatId === chatId);
+                if (!chat) return;
+
+                const newPinnedStatus = !chat.pinned;
+
+                // Update locally first (optimistic)
+                const updatedChats = chats.map(c =>
+                    c.chatId === chatId ? { ...c, pinned: newPinnedStatus } : c
+                );
+                // Sort: pinned chats first, then by last message time
+                updatedChats.sort((a, b) => {
+                    if (a.pinned && !b.pinned) return -1;
+                    if (!a.pinned && b.pinned) return 1;
+                    return (b.lastMessage?.timestamp || 0) - (a.lastMessage?.timestamp || 0);
+                });
+                set({ chats: updatedChats });
+
+                // Persist to server
+                try {
+                    const auth = AuthManager.getInstance().getSession();
+                    if (auth) {
+                        const proxy = ProxyManager.getInstance();
+                        const baseUrl = proxy.getBestUrl();
+                        await fetch(`${baseUrl}/api/chat/${chatId}/pin`, {
+                            method: 'POST',
+                            headers: buildAuthHeaders(auth, {
+                                'Content-Type': 'application/json',
+                            }),
+                            body: JSON.stringify({ userId: auth.userId, pinned: newPinnedStatus })
+                        });
+                    }
+                } catch (e) {
+                    console.warn('[ChatStore] Failed to pin chat on server:', e);
+                }
+            },
+
+            toggleMuteChat: async (chatId) => {
+                const { chats } = get();
+                const chat = chats.find(c => c.chatId === chatId);
+                if (!chat) return;
+
+                const newMutedStatus = !chat.muted;
+
+                // Update locally
+                set({
+                    chats: chats.map(c =>
+                        c.chatId === chatId ? { ...c, muted: newMutedStatus } : c
+                    )
+                });
+
+                // Persist to server
+                try {
+                    const auth = AuthManager.getInstance().getSession();
+                    if (auth) {
+                        const proxy = ProxyManager.getInstance();
+                        const baseUrl = proxy.getBestUrl();
+                        await fetch(`${baseUrl}/api/chat/${chatId}/mute`, {
+                            method: 'POST',
+                            headers: buildAuthHeaders(auth, {
+                                'Content-Type': 'application/json',
+                            }),
+                            body: JSON.stringify({ userId: auth.userId, muted: newMutedStatus })
+                        });
+                    }
+                } catch (e) {
+                    console.warn('[ChatStore] Failed to mute chat on server:', e);
+                }
+            },
+
+            toggleMarkUnread: (chatId, forceStatus) => {
+                const { chats } = get();
+                set({
+                    chats: chats.map(c =>
+                        c.chatId === chatId
+                            ? { ...c, markedUnread: forceStatus !== undefined ? forceStatus : !c.markedUnread }
+                            : c
+                    )
+                });
+            },
+
+            updateChatFriendInfoByFriendId: (friendId, info) => {
+                const normalizedFriendId = (friendId || '').toUpperCase();
+                set((state) => {
+                    let changed = false;
+                    const updated = state.chats.map((c) => {
+                        if (!c.friendId) return c;
+                        if ((c.friendId || '').toUpperCase() !== normalizedFriendId) return c;
+
+                        const next = {
+                            ...c,
+                            friendName: info.friendName ?? c.friendName,
+                            friendImage: info.friendImage ?? c.friendImage,
+                        };
+                        if (next.friendName !== c.friendName || next.friendImage !== c.friendImage) changed = true;
+                        return next;
+                    });
+                    return changed ? { ...state, chats: updated } : state;
+                });
+            },
+
+            // ── Groups & Channels ────────────────────────────
+
+            createGroup: async (name, memberIds) => {
+                const auth = AuthManager.getInstance().getSession();
+                if (!auth) return null;
+
+                try {
+                    const { apiClient } = await import('./api-client');
+                    const result = await apiClient.createGroup(auth.userId, name, memberIds);
+                    if (result.chatId) {
+                        await get().loadChats();
+                        return result.chatId;
+                    }
+                    return null;
+                } catch (e) {
+                    console.error('[ChatStore] createGroup failed:', e);
+                    return null;
+                }
+            },
+
+            createChannel: async (name, description) => {
+                const auth = AuthManager.getInstance().getSession();
+                if (!auth) return null;
+
+                try {
+                    const { apiClient } = await import('./api-client');
+                    const result = await apiClient.createChannel(auth.userId, name, description);
+                    if (result.chatId) {
+                        await get().loadChats();
+                        return result.chatId;
+                    }
+                    return null;
+                } catch (e) {
+                    console.error('[ChatStore] createChannel failed:', e);
+                    return null;
+                }
+            },
+
+            joinChannel: async (channelId) => {
+                const auth = AuthManager.getInstance().getSession();
+                if (!auth) return false;
+
+                try {
+                    const { apiClient } = await import('./api-client');
+                    const result = await apiClient.joinChannel(channelId, auth.userId);
+                    if (result.success) {
+                        await get().loadChats();
+                        return true;
+                    }
+                    return false;
+                } catch (e) {
+                    console.error('[ChatStore] joinChannel failed:', e);
+                    return false;
+                }
+            },
+
+            leaveChannel: async (channelId) => {
+                const auth = AuthManager.getInstance().getSession();
+                if (!auth) return false;
+
+                try {
+                    const { apiClient } = await import('./api-client');
+                    const result = await apiClient.leaveChannel(channelId, auth.userId);
+                    if (result.success) {
+                        set({ chats: get().chats.filter(c => c.chatId !== channelId) });
+                        return true;
+                    }
+                    return false;
+                } catch (e) {
+                    console.error('[ChatStore] leaveChannel failed:', e);
+                    return false;
+                }
+            },
+
+
+        }),
+        {
+            name: 'vibe-chat-store',
+            storage: createJSONStorage(() => AsyncStorage),
+            // Only persist chats and activeChatId, exclude transient state
+            partialize: (state) => ({
+                chats: state.chats,
+                activeChatId: state.activeChatId,
+            }),
+            // Merge persisted state with initial state
+            merge: (persistedState, currentState) => ({
+                ...currentState,
+                ...(persistedState as Partial<ChatState>),
+            }),
+            // Called when store is rehydrated from storage
+            onRehydrateStorage: () => {
+                console.log('[ChatStore] Starting hydration from storage...');
+                return (state, error) => {
+                    if (error) {
+                        console.error('[ChatStore] Hydration error:', error);
+                    } else {
+                        console.log('[ChatStore] Hydration complete. Chats:', state?.chats?.length || 0);
+                        // Messages have encryptedContent but no plaintext after hydration
+                        // The UI will handle decryption when messages are rendered
+                    }
+                };
+            },
+        }
+    )
+);
+
+// Debug subscription - log when chats change
+if (__DEV__ && CHATSTORE_DEBUG) {
+    useChatStore.subscribe(
+        (state, prevState) => {
+            if (state.chats !== prevState.chats) {
+                const chatId = state.activeChatId;
+                const chat = chatId ? state.chats.find(c => c.chatId === chatId) : null;
+                console.log('[ChatStore] State changed! Active chat messages:', chat?.messages?.length || 0);
+            }
+        }
+    );
+}

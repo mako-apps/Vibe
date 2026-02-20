@@ -1,0 +1,302 @@
+/* Luxurious Liquid Glass Theme */
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap');
+
+.auth-container {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    background: var(--bg-primary);
+    padding: 20px;
+    position: relative;
+    overflow: hidden;
+    font-family: 'Outfit', sans-serif;
+}
+
+
+
+@keyframes rotateBackground {
+    0% {
+        transform: rotate(0deg);
+    }
+
+    100% {
+        transform: rotate(360deg);
+    }
+}
+
+.auth-card {
+    width: 100%;
+    max-width: 400px;
+    padding: 20px;
+    /* Removed card styling to match mobile clean look */
+    position: relative;
+    z-index: 1;
+}
+
+/* Auth Content Wrapper - Transparent/Clean */
+.auth-content-wrapper {
+    width: 100%;
+}
+
+/* Liquid Glass Effect - Only for Inputs/Buttons/Success */
+.liquid-glass {
+    background: rgba(255, 255, 255, 0.03);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.auth-header {
+    margin-bottom: 32px;
+    text-align: left;
+}
+
+.auth-header-centered {
+    margin-bottom: 32px;
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.auth-title {
+    font-size: 20px;
+    font-weight: 600;
+    margin: 0 0 8px 0;
+    color: #fff;
+    letter-spacing: -0.5px;
+}
+
+.auth-subtitle {
+    font-size: 16px;
+    color: rgba(255, 255, 255, 0.6);
+    margin: 0;
+    font-weight: 400;
+    line-height: 1.5;
+}
+
+/* Form Styles */
+.auth-form {
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+}
+
+.input-group {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.input-group label {
+    font-size: 14px;
+    font-weight: 600;
+    color: #fff;
+    margin-left: 4px;
+}
+
+.liquid-input-container {
+    display: flex;
+    align-items: center;
+    background: rgba(255, 255, 255, 0.05);
+    /* colors.card */
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 16px;
+    padding: 0 16px;
+    height: 56px;
+    gap: 12px;
+    transition: all 0.2s ease;
+}
+
+.liquid-input-container:focus-within {
+    border-color: var(--bubble-me);
+    background: rgba(255, 255, 255, 0.08);
+}
+
+.input-icon {
+    color: rgba(255, 255, 255, 0.5);
+    /* textSecondary */
+    min-width: 20px;
+}
+
+.liquid-input-container input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    color: #fff;
+    font-size: 16px;
+    font-family: 'Outfit', sans-serif;
+    outline: none;
+    width: 100%;
+    height: 100%;
+}
+
+.liquid-input-container input::placeholder {
+    color: rgba(255, 255, 255, 0.4);
+}
+
+/* Buttons */
+.liquid-button {
+    width: 100%;
+    height: 56px;
+    border-radius: 28px;
+    border: none;
+    font-size: 16px;
+    font-weight: 500;
+    color: #fff;
+    cursor: pointer;
+    transition: all 0.2s;
+    background: rgba(255, 255, 255, 0.1);
+    backdrop-filter: blur(10px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-top: 10px;
+}
+
+.liquid-button.primary {
+    background: var(--accent);
+    /* Fallback or variable */
+    /* Add gradient or keep flat accent */
+}
+
+.liquid-button:hover {
+    opacity: 0.9;
+    transform: translateY(-1px);
+}
+
+.liquid-button:active {
+    transform: scale(0.98);
+}
+
+.liquid-button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: none;
+}
+
+/* Switch Link */
+.switch-auth-container {
+    margin-top: 24px;
+    text-align: center;
+    font-size: 14px;
+    color: rgba(255, 255, 255, 0.6);
+}
+
+.switch-link {
+    background: none;
+    border: none;
+    color: var(--accent);
+    font-weight: 700;
+    cursor: pointer;
+    padding: 0;
+    margin-left: 4px;
+    font-size: 14px;
+}
+
+.switch-link:hover {
+    text-decoration: underline;
+}
+
+/* Success View */
+.success-icon-circle {
+    width: 80px;
+    height: 80px;
+    border-radius: 50%;
+    background: rgba(94, 177, 178, 0.2);
+    /* Primary + opacity */
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 24px;
+}
+
+.success-icon {
+    color: var(--accent);
+}
+
+.secret-key-display-container {
+    background: rgba(255, 255, 255, 0.05);
+    /* card color */
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 16px;
+    padding: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 24px;
+    gap: 16px;
+}
+
+.secret-key-text {
+    font-family: 'Outfit', monospace;
+    /* or monospace fallback */
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--accent);
+    letter-spacing: 1px;
+    word-break: break-all;
+}
+
+.copy-btn {
+    background: rgba(255, 255, 255, 0.1);
+    border: none;
+    border-radius: 8px;
+    padding: 8px;
+    color: rgba(255, 255, 255, 0.6);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+}
+
+.copy-btn:hover {
+    background: rgba(255, 255, 255, 0.2);
+    color: #fff;
+}
+
+.warning-text {
+    font-size: 14px;
+    color: #ef4444;
+    text-align: center;
+    margin-bottom: 30px;
+    line-height: 1.5;
+}
+
+.spinner {
+    animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+    from {
+        transform: rotate(0deg);
+    }
+
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.auth-error {
+    margin-top: 20px;
+    padding: 12px;
+    background: rgba(239, 68, 68, 0.1);
+    color: #ef4444;
+    border-radius: 12px;
+    font-size: 14px;
+    text-align: center;
+}
+
+.blur-text {
+    filter: blur(8px);
+    user-select: none;
+    opacity: 0.7;
+    transition: all 0.3s ease;
+}
+
+.blur-text:hover {
+    filter: blur(4px);
+    opacity: 1;
+}
