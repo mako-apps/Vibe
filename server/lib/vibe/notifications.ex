@@ -98,6 +98,7 @@ defmodule Vibe.Notifications do
       sender_name_raw = (sender && (sender.name || sender.username)) || @default_message_title
       sender_name = truncate_text(sender_name_raw, 64)
       sender_image = normalize_push_image(sender && sender.profile_image, from_user_id)
+      mutable_content_enabled = is_binary(sender_image) and sender_image != ""
       message_type = payload["type"] || "text"
       message_body = resolve_message_body(payload, message_type)
 
@@ -145,7 +146,7 @@ defmodule Vibe.Notifications do
         )
 
       Logger.info(
-        "[Notifications] Sending message push to_user=#{to_user_id} chat_id=#{data.chatId} message_id=#{data.messageId} from_user=#{from_user_id}"
+        "[Notifications] Sending message push to_user=#{to_user_id} chat_id=#{data.chatId} message_id=#{data.messageId} from_user=#{from_user_id} mutable_content=#{mutable_content_enabled} image_present=#{mutable_content_enabled}"
       )
 
       case Finch.request(request, Vibe.Finch, receive_timeout: 7_000) do
@@ -222,21 +223,28 @@ defmodule Vibe.Notifications do
 
     cond do
       trimmed == "" ->
+        Logger.info("[Notifications] push image skipped empty from_user=#{from_user_id}")
         nil
 
       String.starts_with?(String.downcase(trimmed), ["http://", "https://"]) ->
         if String.length(trimmed) <= 1024 do
+          Logger.info("[Notifications] push image using remote URL from_user=#{from_user_id}")
           trimmed
         else
+          Logger.warning("[Notifications] push image URL too long from_user=#{from_user_id} length=#{String.length(trimmed)}")
           nil
         end
 
       true ->
+        Logger.info("[Notifications] push image using proxy URL from_user=#{from_user_id}")
         avatar_proxy_url(from_user_id)
     end
   end
 
-  defp normalize_push_image(_value, from_user_id), do: avatar_proxy_url(from_user_id)
+  defp normalize_push_image(_value, from_user_id) do
+    Logger.info("[Notifications] push image non-binary value, using proxy URL from_user=#{from_user_id}")
+    avatar_proxy_url(from_user_id)
+  end
 
   defp avatar_proxy_url(user_id) when is_binary(user_id) and user_id != "" do
     base_url = String.trim_trailing(VibeWeb.Endpoint.url(), "/")

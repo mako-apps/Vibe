@@ -2,12 +2,15 @@ defmodule VibeWeb.PushAvatarController do
   use VibeWeb, :controller
 
   alias Vibe.Accounts
+  require Logger
 
   @max_avatar_bytes 3_000_000
 
   def show(conn, %{"user_id" => user_id}) do
+    Logger.info("[PushAvatar] request user_id=#{user_id}")
     case Accounts.get_user(user_id) do
       nil ->
+        Logger.warning("[PushAvatar] user not found user_id=#{user_id}")
         send_resp(conn, 404, "")
 
       user ->
@@ -20,9 +23,11 @@ defmodule VibeWeb.PushAvatarController do
 
     cond do
       source == "" ->
+        Logger.info("[PushAvatar] empty profile image")
         send_resp(conn, 404, "")
 
       String.starts_with?(String.downcase(source), ["http://", "https://"]) ->
+        Logger.info("[PushAvatar] redirecting to remote avatar url")
         conn
         |> put_resp_header("cache-control", "public, max-age=300")
         |> redirect(external: source)
@@ -30,15 +35,18 @@ defmodule VibeWeb.PushAvatarController do
       true ->
         case decode_inline_image(source) do
           {:ok, mime, data} when byte_size(data) <= @max_avatar_bytes ->
+            Logger.info("[PushAvatar] serving inline avatar mime=#{mime} bytes=#{byte_size(data)}")
             conn
             |> put_resp_content_type(mime)
             |> put_resp_header("cache-control", "public, max-age=300")
             |> send_resp(200, data)
 
           {:ok, _mime, _data} ->
+            Logger.warning("[PushAvatar] inline avatar too large bytes_over_limit")
             send_resp(conn, 413, "")
 
           :error ->
+            Logger.warning("[PushAvatar] inline avatar decode failed")
             send_resp(conn, 404, "")
         end
     end
