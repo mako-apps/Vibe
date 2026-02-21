@@ -247,14 +247,35 @@ defmodule Vibe.Notifications do
   end
 
   defp avatar_proxy_url(user_id) when is_binary(user_id) and user_id != "" do
-    base_url = String.trim_trailing(VibeWeb.Endpoint.url(), "/")
-    encoded_user_id = URI.encode_www_form(user_id)
-    "#{base_url}/api/push/avatar/#{encoded_user_id}"
+    with base_url when is_binary(base_url) <- sanitized_endpoint_url(),
+         true <- base_url != "" do
+      encoded_user_id = URI.encode_www_form(user_id)
+      "#{base_url}/api/push/avatar/#{encoded_user_id}"
+    else
+      _ -> nil
+    end
   rescue
     _ -> nil
   end
 
   defp avatar_proxy_url(_), do: nil
+
+  defp sanitized_endpoint_url do
+    VibeWeb.Endpoint.url()
+    |> to_string()
+    |> String.trim()
+    |> String.trim_leading("[")
+    |> String.trim_trailing("]")
+    |> String.replace(~r/\[(https?:\/\/)/i, "\\1")
+    |> String.replace(~r/\](?=\/|$)/, "")
+    |> String.replace(~r/^(https?:\/\/)+/i, fn prefix ->
+      case Regex.run(~r/https?:\/\//i, prefix) do
+        [single | _] -> String.downcase(single)
+        _ -> "https://"
+      end
+    end)
+    |> String.trim_trailing("/")
+  end
 
   defp log_expo_push_result(kind, to_user_id, body) do
     with {:ok, decoded} <- Jason.decode(body || ""),
