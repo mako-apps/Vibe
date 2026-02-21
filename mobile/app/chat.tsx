@@ -88,6 +88,13 @@ const getParamString = (value: unknown): string | null => {
     return null;
 };
 
+const normalizeChatType = (value: unknown): 'dm' | 'group' | 'channel' => {
+    const raw = String(value || '').trim().toLowerCase();
+    if (raw === 'group') return 'group';
+    if (raw === 'channel') return 'channel';
+    return 'dm';
+};
+
 const pickLatestTimestamp = (...values: Array<number | undefined>): number | undefined => {
     let latest: number | undefined;
     values.forEach((value) => {
@@ -175,10 +182,13 @@ export default function ChatScreen() {
     const friendNameFromParams = getParamString((params as any)?.friendName);
     const friendImageFromParams = getParamString((params as any)?.friendImage);
     const friendPublicKeyFromParams = getParamString((params as any)?.friendPublicKey);
+    const chatTypeFromParams = getParamString((params as any)?.chatType);
     const openSearchParam = getParamString((params as any)?.openSearch);
     const initialSearchParam = getParamString((params as any)?.search);
     const effectiveChatId = chatIdFromParams || activeChatId || chats[0]?.chatId || null;
     const activeChat = chats.find(c => c.chatId === effectiveChatId);
+    const effectiveChatType = normalizeChatType(activeChat?.type ?? chatTypeFromParams);
+    const isDirectChat = effectiveChatType === 'dm';
     const [isResolvingRouteChat, setIsResolvingRouteChat] = useState(false);
     const [chatSearchOpen, setChatSearchOpen] = useState(openSearchParam === '1' || openSearchParam === 'true');
     const [chatSearchQuery, setChatSearchQuery] = useState(initialSearchParam || '');
@@ -270,7 +280,7 @@ export default function ChatScreen() {
         router,
     ]);
 
-    const friendIdUpper = (activeChat?.friendId || '').toUpperCase();
+    const friendIdUpper = isDirectChat ? (activeChat?.friendId || '').toUpperCase() : '';
     const isFriendTyping = !!friendIdUpper && typingUsers.has(friendIdUpper);
 
     useEffect(() => {
@@ -316,6 +326,10 @@ export default function ChatScreen() {
 
     useEffect(() => {
         let cancelled = false;
+        if (!isDirectChat) {
+            setFriendApiPresence(null);
+            return;
+        }
         const friendId = activeChat?.friendId;
         if (!friendId) {
             setFriendApiPresence(null);
@@ -341,9 +355,17 @@ export default function ChatScreen() {
         return () => {
             cancelled = true;
         };
-    }, [activeChat?.friendId]);
+    }, [activeChat?.friendId, isDirectChat]);
 
     const subtitle = useMemo(() => {
+        if (effectiveChatType === 'channel') {
+            const memberCount = Number(activeChat?.memberCount || 0);
+            return memberCount > 0 ? `${memberCount} subscribers` : 'Channel';
+        }
+        if (effectiveChatType === 'group') {
+            const memberCount = Number(activeChat?.memberCount || 0);
+            return memberCount > 0 ? `${memberCount} members` : 'Group';
+        }
         if (isResolvingRouteChat && friendIdFromParams) return 'Opening chat...';
         if (!effectiveChatId) return 'No chat selected';
         if (isFriendTyping) return 'typing...';
@@ -353,7 +375,7 @@ export default function ChatScreen() {
         if (isFriendOnline) return 'online';
         const lastSeenMs = pickLatestTimestamp(friendApiPresence?.lastSeenMs, fallbackLastSeenMs);
         return formatLastSeen(lastSeenMs);
-    }, [isResolvingRouteChat, friendIdFromParams, effectiveChatId, friendApiPresence?.lastSeenMs, friendApiPresence?.online, fallbackLastSeenMs, friendIdUpper, isFriendTyping, onlineUsers]);
+    }, [effectiveChatType, activeChat?.memberCount, isResolvingRouteChat, friendIdFromParams, effectiveChatId, friendApiPresence?.lastSeenMs, friendApiPresence?.online, fallbackLastSeenMs, friendIdUpper, isFriendTyping, onlineUsers]);
 
     const resolvedTheme = useMemo(() => {
         const theme = resolveThemeVariant(activeTheme, effectiveTheme === 'dark');
@@ -425,7 +447,8 @@ export default function ChatScreen() {
         });
     }, []);
 
-    const headerIsOnline = (!!friendIdUpper && onlineUsers.has(friendIdUpper)) || friendApiPresence?.online === true;
+    const headerIsOnline =
+        isDirectChat && (((!!friendIdUpper && onlineUsers.has(friendIdUpper)) || friendApiPresence?.online === true));
     const headerShiftStyle = useAnimatedStyle(() => ({
         transform: [{ translateY: withTiming(chatSearchOpen ? -(insets.top + 86) : 0, { duration: 230 }) }],
     }), [chatSearchOpen, insets.top]);
@@ -454,6 +477,26 @@ export default function ChatScreen() {
                     wallpaperGradient={resolvedTheme.backgroundGradient || [colors.background, colors.background]}
                     bubbleTheme={bubbleTheme}
                     onPressAvatar={() => {
+                        if (activeChat?.chatId && effectiveChatType === 'channel') {
+                            router.push({
+                                pathname: '/channel-info',
+                                params: {
+                                    channelId: activeChat.chatId,
+                                }
+                            });
+                            return;
+                        }
+
+                        if (activeChat?.chatId && effectiveChatType === 'group') {
+                            router.push({
+                                pathname: '/group-info',
+                                params: {
+                                    groupId: activeChat.chatId,
+                                }
+                            });
+                            return;
+                        }
+
                         if (activeChat?.friendId) {
                             router.push({
                                 pathname: '/user-profile',

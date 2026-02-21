@@ -1472,8 +1472,9 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
       let endFrame = info[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect
     else { return }
 
-    let screenHeight = UIScreen.main.bounds.height
-    let kbHeight = max(0, screenHeight - endFrame.origin.y)
+    let endFrameInView = convert(endFrame, from: nil)
+    let intersection = bounds.intersection(endFrameInView)
+    let kbHeight = max(0, intersection.height)
     let duration =
       (info[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?.doubleValue ?? 0.25
     let curveRaw =
@@ -1511,6 +1512,8 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
     let w = bounds.width
     let h = bounds.height
     guard w > 0, h > 0 else { return }
+    let distanceBeforeInsetChange = currentDistanceFromBottom()
+    let wasNearBottom = distanceBeforeInsetChange <= listBottomThreshold
 
     // When GIF panel is shown, the input bar itself owns the keyboard-sized
     // area and we must not also offset by keyboardHeight.
@@ -1541,6 +1544,12 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
     if abs(baseInsets.bottom - totalBottomPadding) > 0.5 {
       contentPaddingBottom = totalBottomPadding
       updateBottomAnchorInset()
+      if wasNearBottom {
+        scrollToBottom(animated: false)
+      } else {
+        restoreStationaryDistance(distanceBeforeInsetChange)
+      }
+      emitViewport(force: true)
     }
 
     // Keep transition overlay host above everything

@@ -664,6 +664,10 @@ final class ChatInputBar: UIView {
   private var isVideoRecordingActive = false
   private var pendingVideoStopShouldSend = true
   private var suppressNextMicTap = false
+  private var isCancelZoneActive = false
+
+  private var lastMeasuredTextHeight: CGFloat = -1
+
   private weak var videoNoteRecorderController: VideoNoteRecorderViewController?
   private let feedback = UIImpactFeedbackGenerator(style: .medium)
   private let notificationFeedback = UINotificationFeedbackGenerator()
@@ -1002,7 +1006,7 @@ final class ChatInputBar: UIView {
     let sourceContentSnapshotView: UIView?
   }
 
-  private func makeTextContentSnapshot() -> UIImageView? {
+  private func makeTextContentSnapshot() -> UIView? {
     let textBounds = textView.bounds
     guard textBounds.width > 1.0, textBounds.height > 1.0 else { return nil }
     let previousTint = textView.tintColor
@@ -1010,55 +1014,19 @@ final class ChatInputBar: UIView {
     defer {
       textView.tintColor = previousTint
     }
-
-    let format = UIGraphicsImageRendererFormat()
-    format.opaque = false
-    format.scale = UIScreen.main.scale
-    let renderer = UIGraphicsImageRenderer(size: textBounds.size, format: format)
-    let image = renderer.image { context in
-      if !self.textView.drawHierarchy(in: self.textView.bounds, afterScreenUpdates: false) {
-        self.textView.layer.render(in: context.cgContext)
-      }
+    guard let snapshot = textView.snapshotView(afterScreenUpdates: true) else {
+      return nil
     }
-    return UIImageView(image: image)
+    return snapshot
   }
 
-  private func makeBackgroundSnapshot(captureRect: CGRect) -> UIImageView? {
+  private func makeBackgroundSnapshot(captureRect: CGRect) -> UIView? {
     guard captureRect.width > 1.0, captureRect.height > 1.0 else { return nil }
-
-    let hiddenStates = pillContainer.subviews.map { ($0, $0.isHidden) }
-    CATransaction.begin()
-    CATransaction.setDisableActions(true)
-    for subview in pillContainer.subviews where subview !== pillGlass {
-      subview.isHidden = true
-    }
-    pillContainer.layoutIfNeeded()
-    CATransaction.commit()
-    defer {
-      CATransaction.begin()
-      CATransaction.setDisableActions(true)
-      for (subview, wasHidden) in hiddenStates {
-        subview.isHidden = wasHidden
-      }
-      pillContainer.layoutIfNeeded()
-      CATransaction.commit()
-    }
-
-    let format = UIGraphicsImageRendererFormat()
-    format.opaque = false
-    format.scale = UIScreen.main.scale
-    let renderer = UIGraphicsImageRenderer(size: captureRect.size, format: format)
-    let image = renderer.image { context in
-      context.cgContext.translateBy(x: -captureRect.minX, y: -captureRect.minY)
-      if !self.pillContainer.drawHierarchy(in: self.pillContainer.bounds, afterScreenUpdates: true) {
-        self.pillContainer.layer.render(in: context.cgContext)
-      }
-    }
-    let imageView = UIImageView(image: image)
-    imageView.backgroundColor = .clear
-    imageView.isOpaque = false
-    imageView.clipsToBounds = false
-    return imageView
+    let emptyView = UIView(frame: captureRect)
+    emptyView.backgroundColor = .clear  // Native transparent pill snapshot just like Telegram!
+    emptyView.isOpaque = false
+    emptyView.clipsToBounds = false
+    return emptyView
   }
 
   /// Captures Telegram-style transition inputs in one call:
@@ -1077,8 +1045,7 @@ final class ChatInputBar: UIView {
       return nil
     }
 
-    // Keep full vertical extent so the start bubble doesn't look top-clipped.
-    let containerBounds = pillContainer.bounds.insetBy(dx: 1, dy: 0)
+    let containerBounds = pillContainer.bounds.insetBy(dx: 1, dy: 1)
     var backgroundRect = containerBounds
     if !sendButton.isHidden, sendButton.alpha > 0.01 {
       let maxX = max(backgroundRect.minX + 1.0, sendButton.frame.minX - 2.0)
@@ -2339,16 +2306,21 @@ extension ChatInputBar: UITextViewDelegate {
     applyPlaceholder()
     updateButtonStates(animated: true)
     delegate?.inputBarTextDidChange(text: tv.text ?? "")
-    // Animate pill height change when text wraps to new lines
-    UIView.animate(
-      withDuration: 0.25, delay: 0,
-      options: [.curveEaseOut, .allowUserInteraction, .beginFromCurrentState]
-    ) {
-      self.setNeedsLayout()
-      self.layoutIfNeeded()
-      // Also animate parent (ChatListView) to adjust collection view inset
-      self.superview?.setNeedsLayout()
-      self.superview?.layoutIfNeeded()
+
+    let newHeight = tv.contentSize.height
+    if abs(newHeight - lastMeasuredTextHeight) > 1.0 {
+      lastMeasuredTextHeight = newHeight
+      // Animate pill height change when text wraps to new lines
+      UIView.animate(
+        withDuration: 0.25, delay: 0,
+        options: [.curveEaseOut, .allowUserInteraction, .beginFromCurrentState]
+      ) {
+        self.setNeedsLayout()
+        self.layoutIfNeeded()
+        // Also animate parent (ChatListView) to adjust collection view inset
+        self.superview?.setNeedsLayout()
+        self.superview?.layoutIfNeeded()
+      }
     }
   }
 

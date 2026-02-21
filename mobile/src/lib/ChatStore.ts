@@ -3075,8 +3075,20 @@ export const useChatStore = create<ChatState>()(
                 if (!auth) return null;
 
                 try {
+                    const normalizedCreatorId = (auth.userId || '').trim().toUpperCase();
+                    const normalizedMemberIds = Array.from(
+                        new Set(
+                            (memberIds || [])
+                                .map((memberId) => (memberId || '').trim())
+                                .filter((memberId) => memberId.length > 0 && memberId.toUpperCase() !== normalizedCreatorId)
+                        )
+                    );
+                    if (normalizedMemberIds.length === 0) {
+                        return null;
+                    }
+
                     const { apiClient } = await import('./api-client');
-                    const result = await apiClient.createGroup(auth.userId, name, memberIds);
+                    const result = await apiClient.createGroup(auth.userId, name, normalizedMemberIds);
                     if (result.chatId) {
                         await get().loadChats();
                         return result.chatId;

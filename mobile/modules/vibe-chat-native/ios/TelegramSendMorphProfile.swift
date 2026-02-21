@@ -15,22 +15,18 @@ public enum TelegramSendMorphProfile {
     Float(0.27920937042459737), Float(0.91025390625)
   )
 
-  // Keep destination bubble partially visible early to avoid a dark "shadow ghost".
-  static let bubbleFadeFrom: Float = 0.22
+  static let bubbleFadeFrom: Float = 1.0
   static let bubbleFadeDelay: CFTimeInterval = 0.0
-  static let bubbleFadeDuration: CFTimeInterval = 0.18
+  static let bubbleFadeDuration: CFTimeInterval = 0.15
 
-  // Text should enter during movement (mid-transition), not only at the end.
-  static let bubbleContentFadeDelay: CFTimeInterval = 0.05
-  static let bubbleContentFadeDuration: CFTimeInterval = 0.18
-  static let bubbleContentMoveDuration: CFTimeInterval = 0.24
+  static let bubbleContentFadeDelay: CFTimeInterval = 0.0
+  static let bubbleContentFadeDuration: CFTimeInterval = 0.12
 
-  static let sourceBackgroundStartOpacity: Float = 0.84
   static let sourceBackgroundFadeDelay: CFTimeInterval = 0.0
-  static let sourceBackgroundFadeDuration: CFTimeInterval = 0.14
+  static let sourceBackgroundFadeDuration: CFTimeInterval = 0.15
 
-  static let sourceTextFadeDelay: CFTimeInterval = 0.05
-  static let sourceTextFadeDuration: CFTimeInterval = 0.16
+  static let sourceTextFadeDelay: CFTimeInterval = 0.0
+  static let sourceTextFadeDuration: CFTimeInterval = 0.10
 }
 
 final class SendTransitionState: NSObject {
@@ -166,19 +162,10 @@ final class SendTransitionState: NSObject {
     overlayContainer.layer.add(animY, forKey: "sendTransitionY")
 
     // Morph the clipping envelope
-    let clipStartCorner = min(sourceBackgroundStartFrame.height * 0.5, 22.0)
-    let clipEndCorner = min(sourceBackgroundEndFrame.height * 0.5, 18.0)
-    clippingView.layer.cornerCurve = .continuous
-    clippingView.layer.cornerRadius = clipEndCorner
     clippingView.frame = sourceBackgroundEndFrame
     addFrameAnimation(
       layer: clippingView.layer, from: sourceBackgroundStartFrame, to: sourceBackgroundEndFrame,
       keyPrefix: "clipEnvelope")
-    addScalarAnimation(
-      layer: clippingView.layer, keyPath: "cornerRadius", from: clipStartCorner, to: clipEndCorner,
-      duration: TelegramSendMorphProfile.duration,
-      timing: TelegramSendMorphProfile.verticalTiming,
-      key: "clipEnvelope.cornerRadius")
 
     // Morph background views inside clipping envelope
     let startBounds = CGRect(origin: .zero, size: sourceBackgroundStartFrame.size)
@@ -214,9 +201,9 @@ final class SendTransitionState: NSObject {
     bubbleBackgroundSnapshot.layer.opacity = 1.0
 
     // Source background crossfade out
-    sourceBackgroundSnapshot.layer.opacity = TelegramSendMorphProfile.sourceBackgroundStartOpacity
+    sourceBackgroundSnapshot.layer.opacity = 1.0
     let sourceBgFade = CABasicAnimation(keyPath: "opacity")
-    sourceBgFade.fromValue = TelegramSendMorphProfile.sourceBackgroundStartOpacity
+    sourceBgFade.fromValue = 1.0
     sourceBgFade.toValue = 0.0
     sourceBgFade.beginTime =
       CACurrentMediaTime() + TelegramSendMorphProfile.sourceBackgroundFadeDelay
@@ -231,18 +218,6 @@ final class SendTransitionState: NSObject {
     if let sourceTextSnapshot {
       sourceTextSnapshot.frame = sourceContentStartFrame
       sourceTextSnapshot.layer.opacity = 1.0
-      let textDeltaX = destinationContentFrame.minX - sourceContentStartFrame.minX
-      let textDeltaY = destinationContentFrame.minY - sourceContentStartFrame.minY
-      addScalarAnimation(
-        layer: sourceTextSnapshot.layer, keyPath: "position.x", from: 0.0, to: textDeltaX,
-        duration: TelegramSendMorphProfile.bubbleContentMoveDuration,
-        timing: TelegramSendMorphProfile.horizontalTiming, key: "sourceText.positionX",
-        additive: true)
-      addScalarAnimation(
-        layer: sourceTextSnapshot.layer, keyPath: "position.y", from: 0.0, to: textDeltaY,
-        duration: TelegramSendMorphProfile.bubbleContentMoveDuration,
-        timing: TelegramSendMorphProfile.verticalTiming, key: "sourceText.positionY",
-        additive: true)
       let textFadeOut = CABasicAnimation(keyPath: "opacity")
       textFadeOut.fromValue = 1.0
       textFadeOut.toValue = 0.0
@@ -259,21 +234,18 @@ final class SendTransitionState: NSObject {
     destinationContentSnapshot.layer.opacity = 0.0
 
     let widthDifference = sourceBackgroundEndFrame.width - sourceBackgroundStartFrame.width
-    let rawOffsetX =
+    let offsetX =
       (sourceContentStartFrame.minX - destinationContentFrame.minX) - (widthDifference * 0.22)
-    let rawOffsetY = (sourceContentStartFrame.minY - destinationContentFrame.minY) - sourceScrollOffset
-    let offsetX = max(-180.0, min(180.0, rawOffsetX))
-    let offsetY = max(-120.0, min(120.0, rawOffsetY))
+    let offsetY = (sourceContentStartFrame.minY - destinationContentFrame.minY) - sourceScrollOffset
 
     addScalarAnimation(
       layer: destinationContentSnapshot.layer, keyPath: "position.x", from: offsetX, to: 0.0,
-      duration: TelegramSendMorphProfile.bubbleContentMoveDuration,
+      duration: TelegramSendMorphProfile.duration,
       timing: TelegramSendMorphProfile.horizontalTiming, key: "destContent.positionX",
       additive: true)
     addScalarAnimation(
       layer: destinationContentSnapshot.layer, keyPath: "position.y", from: offsetY, to: 0.0,
-      duration: TelegramSendMorphProfile.bubbleContentMoveDuration,
-      timing: TelegramSendMorphProfile.verticalTiming,
+      duration: TelegramSendMorphProfile.duration, timing: TelegramSendMorphProfile.verticalTiming,
       key: "destContent.positionY", additive: true)
 
     let contentFadeIn = CABasicAnimation(keyPath: "opacity")
@@ -543,8 +515,6 @@ enum SendTransitionOverlayFactory {
     let clippingView = UIView(frame: sourceBackgroundStartFrame)
     clippingView.clipsToBounds = true
     clippingView.isUserInteractionEnabled = false
-    clippingView.layer.cornerCurve = .continuous
-    clippingView.layer.cornerRadius = min(sourceBackgroundStartFrame.height * 0.5, 22.0)
 
     bubbleBackgroundSnapshot.layer.opacity = 0.0
 

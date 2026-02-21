@@ -54,11 +54,46 @@ const withAlpha = (color: string, alpha: number): string => {
 type ChildView = 'menu' | 'newChat' | 'newGroup' | 'newChannel'
 
 interface FoundUser {
-    id: string
-    userId: string
-    username: string
+    id?: string
+    userId?: string
+    username?: string
     profileImage?: string
     phoneNumber?: string
+}
+
+const resolveFoundUserId = (user: Partial<FoundUser> | null | undefined): string => {
+    const rawId = user?.userId ?? user?.id
+    return typeof rawId === 'string' ? rawId.trim() : String(rawId || '').trim()
+}
+
+const normalizeFoundUser = (value: any): FoundUser | null => {
+    if (!value || typeof value !== 'object') return null
+
+    const resolvedId = resolveFoundUserId(value)
+    if (!resolvedId) return null
+
+    const username = (typeof value.username === 'string' ? value.username.trim() : '') || resolvedId
+    return {
+        ...value,
+        id: resolvedId,
+        userId: resolvedId,
+        username,
+    }
+}
+
+const normalizeFoundUsers = (value: any): FoundUser[] => {
+    const source = Array.isArray(value) ? value : [value]
+    const uniqueById = new Map<string, FoundUser>()
+
+    source.forEach((entry) => {
+        const normalized = normalizeFoundUser(entry)
+        if (!normalized) return
+        const id = resolveFoundUserId(normalized)
+        if (!id || uniqueById.has(id)) return
+        uniqueById.set(id, normalized)
+    })
+
+    return Array.from(uniqueById.values())
 }
 
 interface MainMenuModalProps {
@@ -105,7 +140,7 @@ export default function MainMenuModal({ visible, onClose, parentScale }: MainMen
     const [groupName, setGroupName] = useState('')
     const [searchQuery, setSearchQuery] = useState('')
     const [selectedMembers, setSelectedMembers] = useState<{ id: string; name: string }[]>([])
-    const [searchResults, setSearchResults] = useState<any[]>([])
+    const [searchResults, setSearchResults] = useState<FoundUser[]>([])
     const [isSearching, setIsSearching] = useState(false)
     const [isCreating, setIsCreating] = useState(false)
 
@@ -280,11 +315,11 @@ export default function MainMenuModal({ visible, onClose, parentScale }: MainMen
             setIsSearching(true)
             try {
                 const result = await apiClient.findUserByName(searchQuery)
-                if (result && result.id !== user?.userId) {
-                    setSearchResults([result])
-                } else {
-                    setSearchResults([])
-                }
+                const currentUserId = (user?.userId || '').trim().toUpperCase()
+                const normalizedResults = normalizeFoundUsers(result).filter(
+                    (entry) => resolveFoundUserId(entry).toUpperCase() !== currentUserId
+                )
+                setSearchResults(normalizedResults)
             } catch (e) {
                 setSearchResults([])
             }
@@ -296,9 +331,13 @@ export default function MainMenuModal({ visible, onClose, parentScale }: MainMen
 
     const toggleMember = (member: { id: string; name: string }) => {
         setSelectedMembers(prev => {
-            const exists = prev.find(m => m.id === member.id)
-            if (exists) return prev.filter(m => m.id !== member.id)
-            return [...prev, member]
+            const normalizedId = member.id.trim()
+            if (!normalizedId) return prev
+
+            const nextMember = { ...member, id: normalizedId, name: member.name || normalizedId }
+            const exists = prev.find(m => m.id === normalizedId)
+            if (exists) return prev.filter(m => m.id !== normalizedId)
+            return [...prev, nextMember]
         })
     }
 
@@ -313,7 +352,14 @@ export default function MainMenuModal({ visible, onClose, parentScale }: MainMen
         }
 
         setIsCreating(true)
-        const chatId = await createGroup(groupName.trim(), selectedMembers.map(m => m.id))
+        const memberIds = Array.from(new Set(selectedMembers.map(m => m.id.trim()).filter(Boolean)))
+        if (memberIds.length === 0) {
+            setIsCreating(false)
+            Alert.alert('Error', 'Please add at least one valid member')
+            return
+        }
+
+        const chatId = await createGroup(groupName.trim(), memberIds)
         setIsCreating(false)
 
         if (chatId) {
@@ -430,16 +476,20 @@ export default function MainMenuModal({ visible, onClose, parentScale }: MainMen
                         <View style={[styles.iosSection, { backgroundColor: isLight ? '#ffffff' : colors.card, marginTop: 16, maxHeight: 320 }]}>
                             <FlatList
                                 data={searchResults}
-                                keyExtractor={item => item.id}
+                                keyExtractor={(item, index) => {
+                                    const id = resolveFoundUserId(item)
+                                    return id ? `search-user-${id}` : `search-user-fallback-${index}`
+                                }}
                                 keyboardShouldPersistTaps="handled"
                                 ItemSeparatorComponent={() => (
                                     <View style={[styles.iosDivider, { backgroundColor: withAlpha(colors.text, 0.05) }]} />
                                 )}
                                 renderItem={({ item }) => {
-                                    const isSelected = selectedMembers.some(m => m.id === item.id)
+                                    const memberId = resolveFoundUserId(item)
+                                    const isSelected = selectedMembers.some(m => m.id === memberId)
                                     return (
                                         <TouchableOpacity
-                                            onPress={() => toggleMember({ id: item.id, name: item.username })}
+                                            onPress={() => toggleMember({ id: memberId, name: item.username || memberId })}
                                             activeOpacity={0.85}
                                             style={[styles.iosRow, { backgroundColor: isSelected ? withAlpha(colors.primary, 0.06) : 'transparent' }]}
                                         >

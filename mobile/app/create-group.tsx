@@ -11,6 +11,49 @@ import { useChatStore } from '../src/lib/ChatStore';
 import { useAuthStore } from '../src/lib/stores/auth-store';
 import { apiClient } from '../src/lib/api-client';
 
+interface FoundUser {
+    id?: string;
+    userId?: string;
+    username?: string;
+    profileImage?: string;
+    phoneNumber?: string;
+}
+
+const resolveFoundUserId = (user: Partial<FoundUser> | null | undefined): string => {
+    const rawId = user?.userId ?? user?.id;
+    return typeof rawId === 'string' ? rawId.trim() : String(rawId || '').trim();
+};
+
+const normalizeFoundUser = (value: any): FoundUser | null => {
+    if (!value || typeof value !== 'object') return null;
+
+    const resolvedId = resolveFoundUserId(value);
+    if (!resolvedId) return null;
+
+    const username = (typeof value.username === 'string' ? value.username.trim() : '') || resolvedId;
+    return {
+        ...value,
+        id: resolvedId,
+        userId: resolvedId,
+        username,
+    };
+};
+
+const normalizeFoundUsers = (value: any): FoundUser[] => {
+    const source = Array.isArray(value) ? value : [value];
+    const uniqueById = new Map<string, FoundUser>();
+
+    source.forEach((entry) => {
+        const normalized = normalizeFoundUser(entry);
+        if (!normalized) return;
+        const id = resolveFoundUserId(normalized);
+        if (!id || uniqueById.has(id)) return;
+        uniqueById.set(id, normalized);
+    });
+
+    return Array.from(uniqueById.values());
+};
+
 export default function CreateGroupScreen() {
     const router = useRouter();
     const insets = useSafeAreaInsets();
@@ -21,7 +64,7 @@ export default function CreateGroupScreen() {
     const [groupName, setGroupName] = useState('');
     const [searchQuery, setSearchQuery] = useState('');
     const [selectedMembers, setSelectedMembers] = useState<{ id: string; name: string }[]>([]);
-    const [searchResults, setSearchResults] = useState<any[]>([]);
+    const [searchResults, setSearchResults] = useState<FoundUser[]>([]);
     const [isCreating, setIsCreating] = useState(false);
     const [isSearching, setIsSearching] = useState(false);
 
@@ -35,11 +78,11 @@ export default function CreateGroupScreen() {
             setIsSearching(true);
             try {
                 const result = await apiClient.findUserByName(searchQuery);
-                if (result && result.id !== user?.userId) {
-                    setSearchResults([result]);
-                } else {
-                    setSearchResults([]);
-                }
+                const currentUserId = (user?.userId || '').trim().toUpperCase();
+                const normalizedResults = normalizeFoundUsers(result).filter(
+                    (entry) => resolveFoundUserId(entry).toUpperCase() !== currentUserId
+                );
+                setSearchResults(normalizedResults);
             } catch (e) {
                 setSearchResults([]);
             }
@@ -51,9 +94,13 @@ export default function CreateGroupScreen() {
 
     const toggleMember = (member: { id: string; name: string }) => {
         setSelectedMembers(prev => {
-            const exists = prev.find(m => m.id === member.id);
-            if (exists) return prev.filter(m => m.id !== member.id);
-            return [...prev, member];
+            const normalizedId = member.id.trim();
+            if (!normalizedId) return prev;
+
+            const nextMember = { ...member, id: normalizedId, name: member.name || normalizedId };
+            const exists = prev.find(m => m.id === normalizedId);
+            if (exists) return prev.filter(m => m.id !== normalizedId);
+            return [...prev, nextMember];
         });
     };
 
@@ -68,7 +115,14 @@ export default function CreateGroupScreen() {
         }
 
         setIsCreating(true);
-        const chatId = await createGroup(groupName.trim(), selectedMembers.map(m => m.id));
+        const memberIds = Array.from(new Set(selectedMembers.map(m => m.id.trim()).filter(Boolean)));
+        if (memberIds.length === 0) {
+            setIsCreating(false);
+            Alert.alert('Error', 'Please add at least one valid member');
+            return;
+        }
+
+        const chatId = await createGroup(groupName.trim(), memberIds);
         setIsCreating(false);
 
         if (chatId) {
@@ -150,12 +204,16 @@ export default function CreateGroupScreen() {
             {isSearching && <ActivityIndicator style={{ marginTop: 16 }} color={colors.primary} />}
             <FlatList
                 data={searchResults}
-                keyExtractor={item => item.id}
+                keyExtractor={(item, index) => {
+                    const id = resolveFoundUserId(item);
+                    return id ? `search-user-${id}` : `search-user-fallback-${index}`;
+                }}
                 renderItem={({ item }) => {
-                    const isSelected = selectedMembers.some(m => m.id === item.id);
+                    const memberId = resolveFoundUserId(item);
+                    const isSelected = selectedMembers.some(m => m.id === memberId);
                     return (
                         <TouchableOpacity
-                            onPress={() => toggleMember({ id: item.id, name: item.username })}
+                            onPress={() => toggleMember({ id: memberId, name: item.username || memberId })}
                             style={[styles.userRow, { backgroundColor: isSelected ? colors.primary + '10' : 'transparent' }]}
                         >
                             <View style={[styles.avatar, { backgroundColor: colors.primary + '30' }]}>

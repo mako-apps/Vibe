@@ -1364,18 +1364,39 @@ export default function ChatListScreen({
     }, [deletingMessageIds]);
 
     useEffect(() => {
+        const syncNativeListForKeyboard = () => {
+            if (!shouldUseNativeList) return;
+            const { contentHeight, layoutHeight, offsetY } = listMetricsRef.current;
+            const distanceFromBottom = Math.max(0, contentHeight - (offsetY + layoutHeight));
+            const shouldFollowBottom = distanceFromBottom <= Math.max(56, LIST_BOTTOM_THRESHOLD * 2);
+            if (!shouldFollowBottom) return;
+            requestAnimationFrame(() => {
+                void nativeSurfaceRef.current?.scrollToBottom(false);
+            });
+        };
+
         const showSub = Keyboard.addListener('keyboardDidShow', () => {
             keyboardVisibleRef.current = true;
+            syncNativeListForKeyboard();
         });
         const hideSub = Keyboard.addListener('keyboardDidHide', () => {
             keyboardVisibleRef.current = false;
+            syncNativeListForKeyboard();
+        });
+        const frameSub = Keyboard.addListener('keyboardWillChangeFrame', (event) => {
+            const endHeight = event?.endCoordinates?.height;
+            if (typeof endHeight === 'number') {
+                keyboardVisibleRef.current = endHeight > 0.5;
+            }
+            syncNativeListForKeyboard();
         });
 
         return () => {
             showSub.remove();
             hideSub.remove();
+            frameSub.remove();
         };
-    }, []);
+    }, [shouldUseNativeList]);
 
     useEffect(() => {
         setDeletingMessageIds({});

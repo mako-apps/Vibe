@@ -46,51 +46,13 @@ final class ChatCollectionFlowLayout: UICollectionViewFlowLayout {
   }
 }
 
-private struct BubbleSurfaceStyle {
-  let showsBlur: Bool
-  let blurStyle: UIBlurEffect.Style
-  let blurAlpha: CGFloat
-  let gradientColors: [CGColor]
-  let gradientOpacity: Float
-  let fillColor: CGColor
-}
-
-private func bubbleSurfaceStyle(isMe: Bool, appearance: ChatListAppearance) -> BubbleSurfaceStyle {
-  let gradientColors =
-    appearance.bubbleMeGradient.isEmpty
-    ? [appearance.bubbleThemColor.cgColor, appearance.bubbleThemColor.cgColor]
-    : appearance.bubbleMeGradient.map(\.cgColor)
-
-  if isMe {
-    let fallbackMe =
-      appearance.bubbleMeGradient.first
-      ?? appearance.bubbleThemColor
-    return BubbleSurfaceStyle(
-      showsBlur: false,
-      blurStyle: .systemThinMaterialDark,
-      blurAlpha: 0.0,
-      gradientColors: gradientColors,
-      gradientOpacity: 1.0,
-      fillColor: fallbackMe.withAlphaComponent(1.0).cgColor
-    )
-  }
-
-  return BubbleSurfaceStyle(
-    showsBlur: false,
-    blurStyle: .systemMaterialDark,
-    blurAlpha: 0.0,
-    gradientColors: gradientColors,
-    gradientOpacity: 0.0,
-    fillColor: appearance.bubbleThemColor.withAlphaComponent(1.0).cgColor
-  )
-}
-
 final class BubbleBackgroundView: UIView {
   private let blurView = UIVisualEffectView(
     effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
   private let gradientLayer = CAGradientLayer()
   private let fillLayer = CAShapeLayer()
   private let bubbleMaskLayer = CAShapeLayer()
+  private var appearance = ChatListAppearance.fallback
   private var shape = BubbleShape(
     isMe: false, showTail: false, borderTopLeftRadius: 18, borderTopRightRadius: 18,
     borderBottomLeftRadius: 18, borderBottomRightRadius: 18)
@@ -111,8 +73,8 @@ final class BubbleBackgroundView: UIView {
 
   func configure(isMe: Bool, shape: BubbleShape, hidden: Bool, appearance: ChatListAppearance) {
     let previousShape = self.shape
+    self.appearance = appearance
     self.shape = shape
-    let style = bubbleSurfaceStyle(isMe: isMe, appearance: appearance)
 
     // Check if only the corner radii changed (sequence boundary update).
     let shapeOnlyChange =
@@ -127,15 +89,16 @@ final class BubbleBackgroundView: UIView {
     CATransaction.begin()
     CATransaction.setDisableActions(true)
     isHidden = hidden
-    blurView.isHidden = hidden || !style.showsBlur || style.blurAlpha <= 0.001
-    if !blurView.isHidden {
-      blurView.effect = UIBlurEffect(style: style.blurStyle)
-    }
-    blurView.alpha = style.blurAlpha
-    gradientLayer.isHidden = style.gradientOpacity <= 0.001
-    gradientLayer.colors = style.gradientColors
-    gradientLayer.opacity = style.gradientOpacity
-    fillLayer.fillColor = style.fillColor
+    blurView.isHidden = hidden
+    blurView.effect = UIBlurEffect(style: isMe ? .systemThinMaterialDark : .systemMaterialDark)
+    blurView.alpha = isMe ? 0.4 : 0.5
+    gradientLayer.isHidden = !isMe
+    gradientLayer.colors = appearance.bubbleMeGradient.map(\.cgColor)
+    gradientLayer.opacity = isMe ? 0.85 : 0.0
+    fillLayer.fillColor =
+      isMe
+      ? UIColor.clear.cgColor
+      : appearance.bubbleThemColor.withAlphaComponent(0.82).cgColor
     CATransaction.commit()
 
     if shapeOnlyChange {
@@ -1742,21 +1705,22 @@ final class BubbleTailView: UIView {
 
   func configure(isMe: Bool, visible: Bool, appearance: ChatListAppearance) {
     currentIsMe = isMe
-    let style = bubbleSurfaceStyle(isMe: isMe, appearance: appearance)
     CATransaction.begin()
     CATransaction.setDisableActions(true)
     isHidden = !visible
 
     // MUST match BubbleBackgroundView.configure exactly so tail+bubble look identical.
-    blurView.isHidden = !visible || !style.showsBlur || style.blurAlpha <= 0.001
-    if !blurView.isHidden {
-      blurView.effect = UIBlurEffect(style: style.blurStyle)
-    }
-    blurView.alpha = style.blurAlpha
-    gradientLayer.isHidden = style.gradientOpacity <= 0.001
-    gradientLayer.colors = style.gradientColors
-    gradientLayer.opacity = style.gradientOpacity
-    fillLayer.fillColor = style.fillColor
+    // Bubble uses:  blur .systemThinMaterialDark α0.4  + gradient 0.85  (me)
+    //               blur .systemMaterialDark     α0.5  + fill    0.82   (them)
+    blurView.effect = UIBlurEffect(style: isMe ? .systemThinMaterialDark : .systemMaterialDark)
+    blurView.alpha = isMe ? 0.4 : 0.5
+    gradientLayer.isHidden = !isMe
+    gradientLayer.colors = appearance.bubbleMeGradient.map(\.cgColor)
+    gradientLayer.opacity = isMe ? 0.85 : 0.0
+    fillLayer.fillColor =
+      isMe
+      ? UIColor.clear.cgColor
+      : appearance.bubbleThemColor.withAlphaComponent(0.82).cgColor
 
     // For 'me': rotate CW 25° (tail curves right at bottom-right of bubble)
     // For 'them': flip horizontally + rotate CCW 25° (tail curves left at bottom-left)

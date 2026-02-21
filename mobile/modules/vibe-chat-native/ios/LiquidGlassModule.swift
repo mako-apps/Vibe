@@ -6,6 +6,8 @@ class LiquidGlassView: ExpoView {
   private var currentBlurStyle: UIBlurEffect.Style?
   private var glassStyle: String = "clear"
   private var glassInteractive: Bool = false
+  private var pressFeedbackEnabled: Bool = true
+  private var isPressFeedbackActive: Bool = false
   private var glassTintColor: UIColor?
   private var glassTint: String?
   private var glassCornerRadius: CGFloat?
@@ -13,14 +15,15 @@ class LiquidGlassView: ExpoView {
   required init(appContext: AppContext? = nil) {
     visualEffectView = UIVisualEffectView(effect: nil)
     currentBlurStyle = .systemUltraThinMaterial
-    
+
     super.init(appContext: appContext)
-    
+
     visualEffectView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
     visualEffectView.isUserInteractionEnabled = false
     visualEffectView.backgroundColor = .clear
     backgroundColor = .clear
     addSubview(visualEffectView)
+    sendSubviewToBack(visualEffectView)
     layer.cornerCurve = .continuous
     applyCornerStyling()
     applyCurrentEffect()
@@ -29,7 +32,14 @@ class LiquidGlassView: ExpoView {
   override func layoutSubviews() {
     super.layoutSubviews()
     visualEffectView.frame = bounds
+    ensureEffectViewBehindContent()
     applyCornerStyling()
+  }
+
+  override func didAddSubview(_ subview: UIView) {
+    super.didAddSubview(subview)
+    guard subview !== visualEffectView else { return }
+    ensureEffectViewBehindContent()
   }
 
   override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
@@ -70,12 +80,10 @@ class LiquidGlassView: ExpoView {
 
   private func applyCornerStyling() {
     if #available(iOS 26.0, *) {
-      clipsToBounds = false
-      visualEffectView.clipsToBounds = false
-
-      let explicitRadius = max(0, Double(glassCornerRadius ?? 0))
-      let fallbackRadius = max(0, Double(min(bounds.width, bounds.height) / 2))
-      let radius = explicitRadius > 0 ? explicitRadius : fallbackRadius
+      let radius = max(0, Double(glassCornerRadius ?? 0))
+      let shouldClip = radius > 0
+      clipsToBounds = shouldClip
+      visualEffectView.clipsToBounds = shouldClip
       visualEffectView.cornerConfiguration = .uniformCorners(radius: .fixed(radius))
       return
     }
@@ -85,6 +93,66 @@ class LiquidGlassView: ExpoView {
     visualEffectView.layer.cornerRadius = radius
     clipsToBounds = radius > 0
     visualEffectView.clipsToBounds = radius > 0
+  }
+
+  private func ensureEffectViewBehindContent() {
+    if visualEffectView.superview === self {
+      sendSubviewToBack(visualEffectView)
+    }
+  }
+
+  private func animatePressFeedback(isPressed: Bool) {
+    guard pressFeedbackEnabled else { return }
+    guard isPressFeedbackActive != isPressed else { return }
+    isPressFeedbackActive = isPressed
+
+    let scale: CGFloat = isPressed ? 0.94 : 1.0
+    let duration: TimeInterval = isPressed ? 0.1 : 0.22
+    let damping: CGFloat = isPressed ? 1.0 : 0.72
+
+    UIView.animate(
+      withDuration: duration,
+      delay: 0,
+      usingSpringWithDamping: damping,
+      initialSpringVelocity: 0.25,
+      options: [.curveEaseOut, .allowUserInteraction, .beginFromCurrentState]
+    ) {
+      self.transform = CGAffineTransform(scaleX: scale, y: scale)
+      self.alpha = isPressed ? 0.7 : 1.0
+      self.visualEffectView.contentView.backgroundColor =
+        isPressed
+        ? UIColor.white.withAlphaComponent(0.08)
+        : .clear
+    }
+  }
+
+  private func resetPressFeedbackAppearance() {
+    isPressFeedbackActive = false
+    transform = .identity
+    alpha = 1.0
+    visualEffectView.contentView.backgroundColor = .clear
+  }
+
+  override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+    super.touchesBegan(touches, with: event)
+    animatePressFeedback(isPressed: true)
+  }
+
+  override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+    super.touchesMoved(touches, with: event)
+    guard let touch = touches.first else { return }
+    let isInside = bounds.contains(touch.location(in: self))
+    animatePressFeedback(isPressed: isInside)
+  }
+
+  override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+    super.touchesEnded(touches, with: event)
+    animatePressFeedback(isPressed: false)
+  }
+
+  override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+    super.touchesCancelled(touches, with: event)
+    animatePressFeedback(isPressed: false)
   }
 
   private func resolvedGlassTintColor() -> UIColor? {
@@ -133,14 +201,14 @@ class LiquidGlassView: ExpoView {
     }
 
     let style: UIBlurEffect.Style
-    
+
     // Map intensity (0-100) to appropriate UIBlurEffectStyles
     if intensity <= 0 {
-        currentBlurStyle = nil
-        visualEffectView.effect = nil
-        return
+      currentBlurStyle = nil
+      visualEffectView.effect = nil
+      return
     }
-    
+
     if intensity < 8 {
       style = .systemUltraThinMaterial
     } else if intensity < 15 {
@@ -150,14 +218,25 @@ class LiquidGlassView: ExpoView {
     } else if intensity < 40 {
       style = .systemThickMaterial
     } else {
-      style = .systemChromeMaterial // Strongest standard material
+      style = .systemChromeMaterial  // Strongest standard material
     }
     applyBlurStyle(style)
   }
 
   func setInteractive(_ interactive: Bool?) {
-    glassInteractive = interactive ?? false
+    let resolvedInteractive = interactive ?? false
+    glassInteractive = resolvedInteractive
+    if !resolvedInteractive {
+      resetPressFeedbackAppearance()
+    }
     applyCurrentEffect()
+  }
+
+  func setPressFeedbackEnabled(_ enabled: Bool?) {
+    pressFeedbackEnabled = enabled ?? true
+    if !pressFeedbackEnabled {
+      resetPressFeedbackAppearance()
+    }
   }
 
   func setEffect(_ effect: String?) {
@@ -169,37 +248,37 @@ class LiquidGlassView: ExpoView {
     glassTintColor = tintColor
     applyCurrentEffect()
   }
-  
-  func setTint(_ tint: String?) {
-      glassTint = tint
-      if #available(iOS 26.0, *) {
-          applyCurrentEffect()
-          return
-      }
 
-      guard let tint = tint else { return }
-      
-      switch tint {
-      case "dark":
-          applyBlurStyle(.systemThinMaterialDark)
-      case "light":
-          applyBlurStyle(.systemThinMaterialLight)
-      case "extraLight":
-           // Fallback or specific mapping
-           if currentBlurStyle == .systemUltraThinMaterial {
-               // No direct "SystemUltraThinMaterialLight", but light can often imply just light mode
-               // We might rely on system behavior or force light interface style if needed
-               // For now, let's map explicit tints to the available styles
-               applyBlurStyle(.systemChromeMaterialLight)
-           } else {
-               applyBlurStyle(.light)
-           }
-      case "default":
-           // Reset to adaptive
-           applyBlurStyle(.systemThinMaterial)
-      default:
-          break
+  func setTint(_ tint: String?) {
+    glassTint = tint
+    if #available(iOS 26.0, *) {
+      applyCurrentEffect()
+      return
+    }
+
+    guard let tint = tint else { return }
+
+    switch tint {
+    case "dark":
+      applyBlurStyle(.systemThinMaterialDark)
+    case "light":
+      applyBlurStyle(.systemThinMaterialLight)
+    case "extraLight":
+      // Fallback or specific mapping
+      if currentBlurStyle == .systemUltraThinMaterial {
+        // No direct "SystemUltraThinMaterialLight", but light can often imply just light mode
+        // We might rely on system behavior or force light interface style if needed
+        // For now, let's map explicit tints to the available styles
+        applyBlurStyle(.systemChromeMaterialLight)
+      } else {
+        applyBlurStyle(.light)
       }
+    case "default":
+      // Reset to adaptive
+      applyBlurStyle(.systemThinMaterial)
+    default:
+      break
+    }
   }
 
   func setCornerRadius(_ cornerRadius: Double?) {
@@ -220,13 +299,17 @@ public class LiquidGlassModule: Module {
       Prop("blurIntensity") { (view: LiquidGlassView, intensity: Double) in
         view.setBlurIntensity(intensity)
       }
-      
+
       Prop("tint") { (view: LiquidGlassView, tint: String?) in
         view.setTint(tint)
       }
 
       Prop("interactive") { (view: LiquidGlassView, interactive: Bool?) in
         view.setInteractive(interactive)
+      }
+
+      Prop("pressFeedbackEnabled") { (view: LiquidGlassView, enabled: Bool?) in
+        view.setPressFeedbackEnabled(enabled)
       }
 
       Prop("effect") { (view: LiquidGlassView, effect: String?) in

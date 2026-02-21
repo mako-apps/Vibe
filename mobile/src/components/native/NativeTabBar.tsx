@@ -1,5 +1,6 @@
 import React from 'react';
 import {
+    Image,
     NativeSyntheticEvent,
     Platform,
     StyleSheet,
@@ -27,6 +28,7 @@ interface NativeTabViewItem {
     key: string;
     title: string;
     sfSymbol?: string;
+    iconUri?: string;
     badge?: string;
     isVibe?: boolean;
 }
@@ -127,12 +129,14 @@ export default function NativeTabBar({
             key: tab.key,
             title: tab.title,
             sfSymbol: tab.sfSymbol || tab.unfocusedSfSymbol || (isVibeTab(tab) ? 'sparkles' : 'circle'),
+            iconUri: tab.iconSource ? Image.resolveAssetSource(tab.iconSource)?.uri : undefined,
             badge: tab.badge,
             isVibe: isVibeTab(tab),
         }));
 
         const handleNativeIndexChange = (event: NativeSyntheticEvent<NativeTabPressPayload>) => {
-            const index = event?.nativeEvent?.index;
+            const payload: any = event?.nativeEvent ?? event;
+            const index = payload?.index;
             if (typeof index !== 'number') {
                 return;
             }

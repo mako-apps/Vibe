@@ -139,6 +139,13 @@ const getChatSortTimestamp = (chat: any): number => {
     return 0
 }
 
+const normalizeChatType = (value: unknown): 'dm' | 'group' | 'channel' => {
+    const raw = String(value || '').trim().toLowerCase()
+    if (raw === 'group') return 'group'
+    if (raw === 'channel') return 'channel'
+    return 'dm'
+}
+
 interface HomeScreenProps {
     onChatSelect?: (chatId: string) => void;
     onOpenStoryCamera?: () => void;
@@ -737,9 +744,16 @@ export default function HomeScreen({ onChatSelect, onOpenStoryCamera }: HomeScre
                 router.push('/saved-messages');
                 return;
             }
+            const chatType = normalizeChatType(item?.type)
             console.log('[HomeScreen] Navigating to /chat:', item.chatId);
             setActiveChat(item.chatId)
-            router.push((`/chat?id=${encodeURIComponent(item.chatId)}`) as any);
+            router.push({
+                pathname: '/chat',
+                params: {
+                    id: item.chatId,
+                    chatType,
+                },
+            });
         });
     }, [isEditing, router, setActiveChat, safePress])
 

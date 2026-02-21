@@ -5,6 +5,7 @@ private struct ChatNativeTabItem {
   let key: String
   let title: String
   let sfSymbol: String?
+  let iconUri: String?
   let badge: String?
   let isVibe: Bool
 }
@@ -101,7 +102,7 @@ private final class ChatNativeTabButton: UIControl {
   override var isHighlighted: Bool {
     didSet {
       let isPressed = isHighlighted
-      let scale: CGFloat = isPressed ? 0.88 : 1.0
+      let scale: CGFloat = isPressed ? 0.94 : 1.0
       let duration: TimeInterval = isPressed ? 0.1 : 0.22
       let damping: CGFloat = isPressed ? 1.0 : 0.72
 
@@ -148,6 +149,7 @@ private final class ChatNativeTabButton: UIControl {
 private final class ChatNativeVibeButton: UIControl {
   private let glassView = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterial))
   private let iconView = UIImageView()
+  private let glassPressedOverlayColor = UIColor(white: 1.0, alpha: 0.08)
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -183,18 +185,19 @@ private final class ChatNativeVibeButton: UIControl {
     NSLayoutConstraint.activate([
       iconView.centerXAnchor.constraint(equalTo: glassView.contentView.centerXAnchor),
       iconView.centerYAnchor.constraint(equalTo: glassView.contentView.centerYAnchor),
-      iconView.widthAnchor.constraint(equalToConstant: 26),
-      iconView.heightAnchor.constraint(equalToConstant: 26),
+      iconView.widthAnchor.constraint(equalToConstant: 30),
+      iconView.heightAnchor.constraint(equalToConstant: 30),
     ])
+
+    refreshGlass()
   }
 
   override var isHighlighted: Bool {
     didSet {
       let isPressed = isHighlighted
-      let scale: CGFloat = isPressed ? 0.88 : 1.0
+      let scale: CGFloat = isPressed ? 0.94 : 1.0
       let duration: TimeInterval = isPressed ? 0.1 : 0.22
       let damping: CGFloat = isPressed ? 1.0 : 0.72
-      let glassPressedOverlayColor = UIColor(white: 1.0, alpha: 0.08)
 
       UIView.animate(
         withDuration: duration,
@@ -204,7 +207,7 @@ private final class ChatNativeVibeButton: UIControl {
         options: [.curveEaseOut, .allowUserInteraction, .beginFromCurrentState]
       ) {
         self.iconView.transform = CGAffineTransform(scaleX: scale, y: scale)
-        self.glassView.contentView.backgroundColor = isPressed ? glassPressedOverlayColor : .clear
+        self.glassView.contentView.backgroundColor = isPressed ? self.glassPressedOverlayColor : .clear
       }
     }
   }
@@ -220,12 +223,80 @@ private final class ChatNativeVibeButton: UIControl {
     activeTintColor: UIColor,
     isDark: Bool
   ) {
+    refreshGlass()
+
+    if let logo = resolveLogoImage(from: item) {
+      iconView.image = logo.withRenderingMode(.alwaysOriginal)
+      iconView.tintColor = nil
+      iconView.alpha = focused ? 1.0 : 0.82
+      return
+    }
+
     let iconName = item.sfSymbol ?? "sparkles"
     iconView.image = UIImage(systemName: iconName)
     iconView.tintColor =
       focused
       ? activeTintColor
       : (isDark ? UIColor.white.withAlphaComponent(0.86) : UIColor.black.withAlphaComponent(0.78))
+    iconView.alpha = 1.0
+  }
+
+  private func refreshGlass() {
+    if #available(iOS 26.0, *) {
+      let effect = UIGlassEffect()
+      effect.isInteractive = true
+      glassView.effect = effect
+      glassView.backgroundColor = .clear
+    } else {
+      glassView.effect = UIBlurEffect(style: .systemMaterial)
+      glassView.backgroundColor = .clear
+    }
+  }
+
+  private func resolveLogoImage(from item: ChatNativeTabItem) -> UIImage? {
+    if let iconUri = item.iconUri, let image = imageFromURI(iconUri) {
+      return image
+    }
+    if let named = UIImage(named: "logotransparent") {
+      return named
+    }
+    if let path = Bundle.main.path(forResource: "logotransparent", ofType: "png"),
+      let image = UIImage(contentsOfFile: path)
+    {
+      return image
+    }
+    return nil
+  }
+
+  private func imageFromURI(_ uriString: String) -> UIImage? {
+    guard !uriString.isEmpty else { return nil }
+
+    if let url = URL(string: uriString) {
+      if url.isFileURL {
+        let image = UIImage(contentsOfFile: url.path)
+        if image != nil { return image }
+      }
+
+      let filename = url.lastPathComponent
+      let base = (filename as NSString).deletingPathExtension
+      let ext = (filename as NSString).pathExtension
+      if !base.isEmpty, let path = Bundle.main.path(forResource: base, ofType: ext.isEmpty ? nil : ext) {
+        return UIImage(contentsOfFile: path)
+      }
+    }
+
+    if uriString.hasPrefix("/") {
+      let image = UIImage(contentsOfFile: uriString)
+      if image != nil { return image }
+    }
+
+    let localFilename = (uriString as NSString).lastPathComponent
+    let localBase = (localFilename as NSString).deletingPathExtension
+    if !localBase.isEmpty, let named = UIImage(named: localBase) {
+      return named
+    }
+
+    return UIImage(named: uriString)
   }
 }
 
@@ -248,6 +319,7 @@ public final class ChatNativeTabBarView: ExpoView {
   private var activeTintColor = UIColor.systemBlue
   private var inactiveTintColor = UIColor.systemGray
   private var isDark = false
+  private let tabControlSide: CGFloat = 64
 
   required init(appContext: AppContext? = nil) {
     super.init(appContext: appContext)
@@ -260,11 +332,13 @@ public final class ChatNativeTabBarView: ExpoView {
 
   private func setupView() {
     backgroundColor = .clear
+    isOpaque = false
 
     containerStack.axis = .horizontal
     containerStack.alignment = .center
     containerStack.distribution = .fill
     containerStack.spacing = 8
+    containerStack.backgroundColor = .clear
     containerStack.translatesAutoresizingMaskIntoConstraints = false
     addSubview(containerStack)
 
@@ -276,18 +350,21 @@ public final class ChatNativeTabBarView: ExpoView {
     ])
 
     backgroundBlur.translatesAutoresizingMaskIntoConstraints = false
-    backgroundBlur.layer.cornerRadius = 30
+    backgroundBlur.layer.cornerRadius = tabControlSide / 2
     backgroundBlur.layer.cornerCurve = .continuous
     backgroundBlur.clipsToBounds = true
+    backgroundBlur.isUserInteractionEnabled = true
 
     stack.axis = .horizontal
     stack.alignment = .fill
     stack.distribution = .fillEqually
     stack.spacing = 0
     stack.translatesAutoresizingMaskIntoConstraints = false
+    stack.isUserInteractionEnabled = true
     backgroundBlur.contentView.addSubview(stack)
 
     NSLayoutConstraint.activate([
+      backgroundBlur.heightAnchor.constraint(equalToConstant: tabControlSide),
       stack.topAnchor.constraint(equalTo: backgroundBlur.contentView.topAnchor, constant: 4),
       stack.bottomAnchor.constraint(equalTo: backgroundBlur.contentView.bottomAnchor, constant: -4),
       stack.leadingAnchor.constraint(
@@ -297,11 +374,14 @@ public final class ChatNativeTabBarView: ExpoView {
     ])
 
     vibeButton.translatesAutoresizingMaskIntoConstraints = false
+    vibeButton.setContentHuggingPriority(.required, for: .horizontal)
+    vibeButton.setContentCompressionResistancePriority(.required, for: .horizontal)
     NSLayoutConstraint.activate([
-      vibeButton.widthAnchor.constraint(equalToConstant: 58),
-      vibeButton.heightAnchor.constraint(equalToConstant: 58),
+      vibeButton.widthAnchor.constraint(equalToConstant: tabControlSide),
+      vibeButton.heightAnchor.constraint(equalToConstant: tabControlSide),
     ])
     vibeButton.addTarget(self, action: #selector(vibeTapped), for: .touchUpInside)
+    vibeButton.addTarget(self, action: #selector(vibeTapped), for: .primaryActionTriggered)
 
     containerStack.addArrangedSubview(backgroundBlur)
     containerStack.addArrangedSubview(vibeButton)
@@ -316,11 +396,12 @@ public final class ChatNativeTabBarView: ExpoView {
       let key = (raw["key"] as? String) ?? UUID().uuidString
       let title = (raw["title"] as? String) ?? key
       let sfSymbol = raw["sfSymbol"] as? String
+      let iconUri = raw["iconUri"] as? String
       let badgeValue = raw["badge"]
       let badge = badgeValue.map { String(describing: $0) }
       let isVibe = (raw["isVibe"] as? Bool) ?? false
       return ChatNativeTabItem(
-        key: key, title: title, sfSymbol: sfSymbol, badge: badge, isVibe: isVibe)
+        key: key, title: title, sfSymbol: sfSymbol, iconUri: iconUri, badge: badge, isVibe: isVibe)
     }
 
     if let vibeIndex = tabs.firstIndex(where: { $0.isVibe }) {
@@ -363,8 +444,9 @@ public final class ChatNativeTabBarView: ExpoView {
     applySelection()
   }
 
-  @objc private func mainTabTapped(_ sender: ChatNativeTabButton) {
-    onIndexChange(["index": sender.tabIndex])
+  @objc private func mainTabTapped(_ sender: UIControl) {
+    guard let button = sender as? ChatNativeTabButton else { return }
+    onIndexChange(["index": button.tabIndex])
   }
 
   @objc private func vibeTapped() {
@@ -382,7 +464,9 @@ public final class ChatNativeTabBarView: ExpoView {
     if !mainTabs.isEmpty {
       for i in 0..<mainTabs.count {
         let button = ChatNativeTabButton()
+        button.isUserInteractionEnabled = true
         button.addTarget(self, action: #selector(mainTabTapped(_:)), for: .touchUpInside)
+        button.addTarget(self, action: #selector(mainTabTapped(_:)), for: .primaryActionTriggered)
         let item = mainTabs[i]
         let tabIndex = mainTabIndexes[i]
         button.apply(
@@ -432,6 +516,15 @@ public final class ChatNativeTabBarView: ExpoView {
   }
 
   private func applyChrome() {
+    if #available(iOS 26.0, *) {
+      let effect = UIGlassEffect()
+      effect.isInteractive = true
+      backgroundBlur.effect = effect
+      backgroundBlur.backgroundColor = .clear
+    } else {
+      backgroundBlur.effect = UIBlurEffect(style: .systemThinMaterial)
+      backgroundBlur.backgroundColor = .clear
+    }
     backgroundBlur.contentView.backgroundColor = .clear
     backgroundBlur.layer.borderWidth = 0.7
     backgroundBlur.layer.borderColor =
