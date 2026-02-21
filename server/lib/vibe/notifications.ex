@@ -137,8 +137,8 @@ defmodule Vibe.Notifications do
 
   defp log_expo_push_result(kind, to_user_id, body) do
     with {:ok, decoded} <- Jason.decode(body || ""),
-         data when is_list(data) <- Map.get(decoded, "data"),
-         [ticket | _] <- data do
+         data <- Map.get(decoded, "data"),
+         ticket when is_map(ticket) <- normalize_expo_ticket(data) do
       case ticket["status"] do
         "ok" ->
           ticket_id = ticket["id"]
@@ -168,6 +168,17 @@ defmodule Vibe.Notifications do
         )
     end
   end
+
+  defp normalize_expo_ticket(data) when is_map(data), do: data
+
+  defp normalize_expo_ticket(data) when is_list(data) do
+    case data do
+      [ticket | _] when is_map(ticket) -> ticket
+      _ -> nil
+    end
+  end
+
+  defp normalize_expo_ticket(_), do: nil
 
   defp schedule_expo_receipt_check(kind, to_user_id, ticket_id) do
     Task.start(fn ->
