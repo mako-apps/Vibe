@@ -173,7 +173,9 @@ export default function RootLayout() {
         }
         // Register for Push Notifications even if socket is already connected.
         // This guarantees iOS permission/token sync on cold starts.
-        useNotificationStore.getState().initNotifications();
+        useNotificationStore.getState().initNotifications({
+          reason: 'app_boot',
+        });
         // Check WebRTC availability for calls (safe in Expo Go - will just report false)
         useCallStore.getState().checkWebRTCAvailability().then(available => {
           console.log('[Layout] WebRTC available for calls:', available);

@@ -1186,7 +1186,10 @@ export const useChatStore = create<ChatState>()(
                     // Re-sync push token on every reconnect so server always has it
                     try {
                         const { useNotificationStore } = require('./stores/notification-store');
-                        useNotificationStore.getState().initNotifications();
+                        useNotificationStore.getState().initNotifications({
+                            forceSync: true,
+                            reason: 'socket_open',
+                        });
                     } catch (e) { /* ignore if notification store not ready */ }
 
                     // Process Offline Queue — also recover any unsent messages stuck in chats
