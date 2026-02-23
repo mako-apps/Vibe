@@ -3,6 +3,7 @@ import { persist, createJSONStorage } from 'zustand/middleware';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { requestPermissionsAndGetToken } from '../NotificationManager';
 import { useAuthStore } from './auth-store';
+import { getNativeCallModule } from '../../native/call/runtime';
 
 interface NotificationState {
     notificationsEnabled: boolean;
@@ -135,14 +136,22 @@ export const useNotificationStore = create<NotificationState>()(
                         if (!user || !updateProfileInfo) {
                             console.log('[NotificationStore] Cannot sync token yet (missing user or updateProfileInfo)');
                         } else {
+                            const nativeCallModule = getNativeCallModule();
+                            const nativePushTokens = nativeCallModule?.getPushTokens?.() ?? null;
+                            const serializedPushToken = JSON.stringify({
+                                expo: token,
+                                ...(typeof nativePushTokens?.fcm === 'string' && nativePushTokens.fcm ? { fcm: nativePushTokens.fcm } : {}),
+                                ...(typeof nativePushTokens?.apns === 'string' && nativePushTokens.apns ? { apns: nativePushTokens.apns } : {}),
+                                ...(typeof nativePushTokens?.voip === 'string' && nativePushTokens.voip ? { apns_voip: nativePushTokens.voip } : {}),
+                            });
                             const { lastSyncedToken, lastSyncedUserId, lastSyncedAt } = get();
                             const now = Date.now();
                             const syncExpired = !lastSyncedAt || (now - lastSyncedAt) > PUSH_TOKEN_RESYNC_INTERVAL_MS;
                             const reasons: string[] = [];
 
                             if (forceSync) reasons.push('forceSync');
-                            if (user.pushToken !== token) reasons.push('authStoreMismatch');
-                            if (lastSyncedToken !== token) reasons.push('lastSyncedTokenMismatch');
+                            if (user.pushToken !== serializedPushToken && user.pushToken !== token) reasons.push('authStoreMismatch');
+                            if (lastSyncedToken !== serializedPushToken && lastSyncedToken !== token) reasons.push('lastSyncedTokenMismatch');
                             if (lastSyncedUserId !== user.userId) reasons.push('lastSyncedUserMismatch');
                             if (syncExpired) reasons.push('syncExpired');
 
@@ -152,10 +161,15 @@ export const useNotificationStore = create<NotificationState>()(
                                     hadToken: !!user.pushToken,
                                     reason,
                                     reasons,
+                                    nativeTokens: {
+                                        fcm: !!nativePushTokens?.fcm,
+                                        apns: !!nativePushTokens?.apns,
+                                        voip: !!nativePushTokens?.voip,
+                                    },
                                 });
-                                await updateProfileInfo({ pushToken: token });
+                                await updateProfileInfo({ pushToken: serializedPushToken });
                                 set({
-                                    lastSyncedToken: token,
+                                    lastSyncedToken: serializedPushToken,
                                     lastSyncedUserId: user.userId,
                                     lastSyncedAt: now,
                                 });

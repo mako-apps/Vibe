@@ -3,7 +3,7 @@ import '../src/lib/i18n';
 import { Stack, useRouter, useSegments } from 'expo-router'
 import { StatusBar } from 'expo-status-bar'
 import { GestureHandlerRootView } from 'react-native-gesture-handler'
-import { View, Appearance, Platform } from 'react-native'
+import { View, Appearance, Platform, AppState } from 'react-native'
 import { KeyboardProvider } from 'react-native-keyboard-controller'
 import * as NavigationBar from 'expo-navigation-bar';
 import { useFonts, SpaceGrotesk_400Regular, SpaceGrotesk_700Bold } from '@expo-google-fonts/space-grotesk'
@@ -24,6 +24,7 @@ import IncomingCallModal from '../src/components/call/IncomingCallModal';
 import ActiveCallScreen from '../src/components/call/ActiveCallScreen';
 import { useCallStore } from '../src/lib/stores/CallStore';
 import SessionExpiredBanner from '../src/components/shared/SessionExpiredBanner';
+import { getNativeCallModule } from '../src/native/call/runtime';
 
 SplashScreen.preventAutoHideAsync()
 
@@ -71,6 +72,50 @@ export default function RootLayout() {
   const notificationListener = useRef<Notifications.EventSubscription | null>(null);
   const responseListener = useRef<Notifications.EventSubscription | null>(null);
   const handledNotificationIdsRef = useRef<Set<string>>(new Set());
+  const nativeCallDrainInFlightRef = useRef(false);
+  const deferredNativeCallEventsRef = useRef<any[]>([]);
+
+  const drainNativeCallEvents = async () => {
+    if (nativeCallDrainInFlightRef.current) return;
+    const nativeCall = getNativeCallModule();
+    if (!nativeCall?.drainPendingEvents) return;
+    nativeCallDrainInFlightRef.current = true;
+    try {
+      const events = [...deferredNativeCallEventsRef.current, ...(nativeCall.drainPendingEvents() || [])];
+      deferredNativeCallEventsRef.current = [];
+      for (const raw of events) {
+        const event = raw as any;
+        const type = typeof event?.type === 'string' ? event.type : '';
+        const payload = event?.payload as Record<string, unknown> | undefined;
+        if (!payload || typeof payload !== 'object') continue;
+
+        if (type === 'incomingCall') {
+          useCallStore.getState().handleIncomingCallPayload(payload);
+          continue;
+        }
+
+        if (type === 'callAction') {
+          const action = typeof (payload as any).action === 'string' ? ((payload as any).action as string).toLowerCase() : '';
+          useCallStore.getState().handleIncomingCallPayload(payload);
+          if (action === 'answer') {
+            const accepted = await useCallStore.getState().acceptCall(undefined as any);
+            if (accepted) {
+              nativeCall.clearIncomingCallUi?.(payload);
+            } else {
+              deferredNativeCallEventsRef.current.push(raw);
+            }
+          } else if (action === 'decline') {
+            useCallStore.getState().declineCall(undefined as any);
+            nativeCall.clearIncomingCallUi?.(payload);
+          }
+        }
+      }
+    } catch (error) {
+      console.warn('[NativeCall] Failed to drain pending events', error);
+    } finally {
+      nativeCallDrainInFlightRef.current = false;
+    }
+  };
 
   const handleNotificationData = (data: Record<string, unknown> | undefined): boolean => {
     const handled = useCallStore.getState().handleIncomingCallPayload(data);
@@ -86,6 +131,21 @@ export default function RootLayout() {
     }
     return handled;
   };
+
+  useEffect(() => {
+    void drainNativeCallEvents();
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') {
+        void drainNativeCallEvents();
+      }
+    });
+    return () => sub.remove();
+  }, []);
+
+  useEffect(() => {
+    if (!hasHydrated || !isAuthenticated) return;
+    void drainNativeCallEvents();
+  }, [hasHydrated, isAuthenticated]);
 
   useEffect(() => {
     Notifications.getPermissionsAsync()
@@ -123,6 +183,7 @@ export default function RootLayout() {
         data,
       });
       if (handleNotificationData(data)) {
+        void drainNativeCallEvents();
         return;
       }
       // If we're already in the chat that sent this notification, suppress it
@@ -145,6 +206,7 @@ export default function RootLayout() {
       const data = response.notification.request.content.data as Record<string, unknown> | undefined;
       console.log('[Notifications] Tapped:', data);
       if (handleNotificationData(data)) {
+        void drainNativeCallEvents();
         return;
       }
       const chatId = typeof data?.chatId === 'string' ? data.chatId : null;
@@ -169,6 +231,7 @@ export default function RootLayout() {
         const data = response.notification.request.content.data as Record<string, unknown> | undefined;
         console.log('[Notifications] Last response:', data);
         if (handleNotificationData(data)) {
+          void drainNativeCallEvents();
           try {
             await (Notifications as any).clearLastNotificationResponseAsync?.();
           } catch { }

@@ -42,6 +42,17 @@ class VibeFirebaseMessagingDelegate(context: Context) : FirebaseMessagingDelegat
   override fun onMessageReceived(remoteMessage: RemoteMessage) {
     DebugLogging.logRemoteMessage("VibeFirebaseMessagingDelegate.onMessageReceived: message", remoteMessage)
     logIncomingPayload(remoteMessage)
+    if (VibeIncomingCallNotification.isIncomingCallPayload(remoteMessage.data)) {
+      val payload = VibeIncomingCallNotification.normalizePayload(remoteMessage.data)
+      Log.d(VIBE_NOTIF_TAG, "incoming call push intercepted callId=${payload["callId"]} caller=${payload["fromUserId"]}")
+      VibeNativeCallStore.enqueueIncomingCall(context, payload)
+      VibeIncomingCallNotification.showIncomingCall(context, payload)
+      FirebaseMessagingDelegate.runTaskManagerTasks(
+        context.applicationContext,
+        RemoteMessageSerializer.toBundle(remoteMessage),
+      )
+      return
+    }
     val prepared = createNotificationWithMediaGuard(remoteMessage)
     val notification = prepared.notification
     DebugLogging.logNotification("VibeFirebaseMessagingDelegate.onMessageReceived: notification", notification)

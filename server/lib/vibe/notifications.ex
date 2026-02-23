@@ -11,7 +11,8 @@ defmodule Vibe.Notifications do
 
   def send_incoming_call_push(to_user_id, payload) when is_binary(to_user_id) and is_map(payload) do
     with to_user when not is_nil(to_user) <- Accounts.get_user(to_user_id),
-         push_token when is_binary(push_token) <- normalized_push_token(to_user.push_token),
+         push_targets when is_map(push_targets) <- normalized_push_targets(to_user.push_token),
+         push_token when is_binary(push_token) <- push_targets.expo,
          true <- push_token != "" do
       call_type = normalize_call_type(payload["callType"] || payload["call_type"])
       from_user_id = payload["fromUserId"] || payload["from_user_id"]
@@ -23,11 +24,13 @@ defmodule Vibe.Notifications do
         )
 
       base_data = %{
+        event: "call-start",
         type: "call-start",
         callId: payload["callId"] || payload["call_id"],
         callType: call_type,
         fromUserId: from_user_id,
-        fromUserName: caller_name
+        fromUserName: caller_name,
+        nativeCall: true
       }
 
       data =
@@ -82,7 +85,7 @@ defmodule Vibe.Notifications do
       end
     else
       _ ->
-        Logger.info("[Notifications] Incoming call push skipped: missing target user/push token to_user=#{to_user_id}")
+        Logger.info("[Notifications] Incoming call push skipped: missing target user/Expo push token to_user=#{to_user_id}")
         :noop
     end
   end
@@ -91,7 +94,8 @@ defmodule Vibe.Notifications do
 
   def send_message_push(to_user_id, payload) when is_binary(to_user_id) and is_map(payload) do
     with to_user when not is_nil(to_user) <- Accounts.get_user(to_user_id),
-         push_token when is_binary(push_token) <- normalized_push_token(to_user.push_token),
+         push_targets when is_map(push_targets) <- normalized_push_targets(to_user.push_token),
+         push_token when is_binary(push_token) <- push_targets.expo,
          true <- push_token != "" do
       from_user_id = payload["fromUserId"] || payload["from_user_id"] || payload["from_id"]
       sender = if is_binary(from_user_id), do: Accounts.get_user(from_user_id), else: nil
@@ -198,8 +202,42 @@ defmodule Vibe.Notifications do
 
   def send_message_push(_to_user_id, _payload), do: :noop
 
-  defp normalized_push_token(token) when is_binary(token), do: String.trim(token)
-  defp normalized_push_token(_), do: nil
+  defp normalized_push_targets(token) when is_binary(token) do
+    trimmed = String.trim(token)
+
+    cond do
+      trimmed == "" ->
+        nil
+
+      String.starts_with?(trimmed, "ExponentPushToken[") ->
+        %{expo: trimmed, fcm: nil, apns: nil, apns_voip: nil}
+
+      true ->
+        case Jason.decode(trimmed) do
+          {:ok, value} when is_map(value) ->
+            %{
+              expo: normalize_token_value(value["expo"] || value["expoPushToken"]),
+              fcm: normalize_token_value(value["fcm"] || value["fcmPushToken"]),
+              apns: normalize_token_value(value["apns"] || value["apnsToken"]),
+              apns_voip: normalize_token_value(value["apns_voip"] || value["voip"] || value["voipPushToken"])
+            }
+
+          _ ->
+            %{expo: trimmed, fcm: nil, apns: nil, apns_voip: nil}
+        end
+    end
+  end
+
+  defp normalized_push_targets(_), do: nil
+
+  defp normalize_token_value(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp normalize_token_value(_), do: nil
 
   defp normalize_call_type(value) when is_binary(value) do
     if String.downcase(value) == "video", do: "video", else: "voice"

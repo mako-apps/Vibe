@@ -62,20 +62,13 @@ defmodule VibeWeb.UserController do
       conn |> put_status(:forbidden) |> json(%{error: "Forbidden"})
     else
       with {:ok, phone_attrs} <- normalize_phone_update(params) do
+        push_token_update = resolve_push_token_update(params)
+
         # Filter allowed params
         update_attrs =
           %{}
           |> Map.merge(if params["profileImage"], do: %{profile_image: params["profileImage"]}, else: %{})
-          |> Map.merge(
-            if Map.has_key?(params, "pushToken"),
-              do: %{push_token: params["pushToken"]},
-              else: %{}
-          )
-          |> Map.merge(
-            if Map.has_key?(params, "push_token"),
-              do: %{push_token: params["push_token"]},
-              else: %{}
-          )
+          |> Map.merge(if is_binary(push_token_update), do: %{push_token: push_token_update}, else: %{})
           |> Map.merge(phone_attrs)
           |> Map.merge(if params["name"], do: %{name: params["name"]}, else: %{})
           |> Map.merge(if params["username"], do: %{username: params["username"]}, else: %{})
@@ -133,6 +126,91 @@ defmodule VibeWeb.UserController do
       end
     end
   end
+
+  defp resolve_push_token_update(params) when is_map(params) do
+    explicit =
+      cond do
+        Map.has_key?(params, "pushToken") -> params["pushToken"]
+        Map.has_key?(params, "push_token") -> params["push_token"]
+        true -> nil
+      end
+
+    token_map =
+      %{}
+      |> merge_push_token_bundle(params["pushTokens"] || params["push_tokens"])
+      |> maybe_put_token("expo", params["expoPushToken"] || params["expo_push_token"])
+      |> maybe_put_token("fcm", params["fcmPushToken"] || params["fcm_push_token"])
+      |> maybe_put_token("apns", params["apnsPushToken"] || params["apns_push_token"])
+      |> maybe_put_token("apns_voip", params["voipPushToken"] || params["voip_push_token"])
+      |> merge_explicit_push_token(explicit)
+
+    cond do
+      map_size(token_map) > 0 ->
+        Jason.encode!(token_map)
+
+      is_binary(explicit) ->
+        explicit
+
+      true ->
+        nil
+    end
+  end
+
+  defp resolve_push_token_update(_), do: nil
+
+  defp merge_push_token_bundle(acc, value) when is_map(value) do
+    acc
+    |> maybe_put_token("expo", value["expo"] || value["expoPushToken"])
+    |> maybe_put_token("fcm", value["fcm"] || value["fcmPushToken"])
+    |> maybe_put_token("apns", value["apns"] || value["apnsToken"])
+    |> maybe_put_token("apns_voip", value["apns_voip"] || value["voip"] || value["voipPushToken"])
+  end
+
+  defp merge_push_token_bundle(acc, value) when is_binary(value) do
+    trimmed = String.trim(value)
+
+    cond do
+      trimmed == "" ->
+        acc
+
+      String.starts_with?(trimmed, "{") ->
+        case Jason.decode(trimmed) do
+          {:ok, decoded} when is_map(decoded) -> merge_push_token_bundle(acc, decoded)
+          _ -> acc
+        end
+
+      true ->
+        acc
+    end
+  end
+
+  defp merge_push_token_bundle(acc, _), do: acc
+
+  defp merge_explicit_push_token(acc, value) when is_binary(value) do
+    trimmed = String.trim(value)
+
+    cond do
+      trimmed == "" ->
+        acc
+
+      String.starts_with?(trimmed, "{") ->
+        merge_push_token_bundle(acc, trimmed)
+
+      true ->
+        maybe_put_token(acc, "expo", trimmed)
+    end
+  end
+
+  defp merge_explicit_push_token(acc, _), do: acc
+
+  defp maybe_put_token(acc, _key, nil), do: acc
+
+  defp maybe_put_token(acc, key, value) when is_binary(value) do
+    trimmed = String.trim(value)
+    if trimmed == "", do: acc, else: Map.put(acc, key, trimmed)
+  end
+
+  defp maybe_put_token(acc, _key, _value), do: acc
 
   def delete(conn, _params) do
     id = conn.assigns.current_user.id

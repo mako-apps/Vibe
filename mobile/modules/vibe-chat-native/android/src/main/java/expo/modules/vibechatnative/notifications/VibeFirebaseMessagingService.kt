@@ -7,4 +7,9 @@ class VibeFirebaseMessagingService : ExpoFirebaseMessagingService() {
   override val firebaseMessagingDelegate: FirebaseMessagingDelegate by lazy {
     VibeFirebaseMessagingDelegate(this)
   }
+
+  override fun onNewToken(token: String) {
+    super.onNewToken(token)
+    VibeNativeCallStore.setFcmToken(this, token)
+  }
 }

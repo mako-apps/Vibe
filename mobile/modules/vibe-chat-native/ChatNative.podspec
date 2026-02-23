@@ -16,7 +16,9 @@ Pod::Spec.new do |s|
 
   s.dependency 'ExpoModulesCore'
   s.dependency 'Giphy'
+  s.frameworks = ['CallKit', 'PushKit', 'AVFoundation']
 
   s.source_files = 'ios/**/*.{swift,h,m,mm}'
+  s.resources = ['ios/Resources/**/*']
   s.swift_version = '5.7'
 end
