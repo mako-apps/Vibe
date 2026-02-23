@@ -119,15 +119,12 @@ defmodule VibeWeb.UserChannel do
     VibeWeb.Endpoint.broadcast!("user:#{to_user_id}", "call-start", enriched_payload)
 
     recipient_online = map_size(VibeWeb.Presence.list("user:#{to_user_id}")) > 0
-    if recipient_online do
-      Logger.info(
-        "[UserChannel] call push skipped (recipient online) to_user=#{to_user_id} call_id=#{call_id}"
-      )
-    else
-      Task.start(fn ->
-        _ = Notifications.send_incoming_call_push(to_user_id, enriched_payload)
-      end)
-    end
+    Logger.info(
+      "[UserChannel] call push dispatch to_user=#{to_user_id} call_id=#{call_id} recipient_online=#{recipient_online}"
+    )
+    Task.start(fn ->
+      _ = Notifications.send_incoming_call_push(to_user_id, enriched_payload)
+    end)
 
     {:reply,
      {:ok,

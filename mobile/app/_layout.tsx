@@ -57,6 +57,9 @@ export default function RootLayout() {
   const GestureHandlerRootViewAny = GestureHandlerRootView as any
   const nativeCallUiRuntimeInfo = getNativeCallModule()
   const supportsNativeInAppCallUi = !!nativeCallUiRuntimeInfo?.supportsInAppUi?.()
+  const enableNativeInAppCallUi = supportsNativeInAppCallUi
+  const showIncomingCallOverlay = !enableNativeInAppCallUi
+  const showActiveCallOverlay = !enableNativeInAppCallUi
 
   const callUiSnapshot = useCallStore(
     useShallow((s) => ({
@@ -156,7 +159,7 @@ export default function RootLayout() {
   };
 
   useEffect(() => {
-    if (!supportsNativeInAppCallUi) return;
+    if (!enableNativeInAppCallUi) return;
     const sub = addNativeCallUiListener(async (event) => {
       const type = event?.type;
       // console.log('[NativeCallUI][JS] onCallUiEvent', event);
@@ -189,10 +192,10 @@ export default function RootLayout() {
       }
     });
     return () => sub?.remove();
-  }, [supportsNativeInAppCallUi]);
+  }, [enableNativeInAppCallUi]);
 
   useEffect(() => {
-    if (!supportsNativeInAppCallUi) return;
+    if (!enableNativeInAppCallUi) return;
     const nativeCall = getNativeCallModule();
     if (!nativeCall?.setCallUiState) return;
 
@@ -263,7 +266,7 @@ export default function RootLayout() {
       callDuration: callUiSnapshot.callDuration,
       isDark: effectiveTheme === 'dark',
     });
-  }, [supportsNativeInAppCallUi, callUiSnapshot, effectiveTheme]);
+  }, [enableNativeInAppCallUi, callUiSnapshot, effectiveTheme]);
 
   useEffect(() => {
     void drainNativeCallEvents();
@@ -534,8 +537,8 @@ export default function RootLayout() {
           />
 
           {/* Global Call Overlays */}
-          {!supportsNativeInAppCallUi && <IncomingCallModal />}
-          {!supportsNativeInAppCallUi && <ActiveCallScreen />}
+          {showIncomingCallOverlay && <IncomingCallModal />}
+          {showActiveCallOverlay && <ActiveCallScreen />}
         </View>
       </KeyboardProvider>
     </GestureHandlerRootViewAny>

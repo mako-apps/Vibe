@@ -610,6 +610,7 @@ export const useCallStore = create<CallState & CallActions>()(
                     if (incomingCallData && channel && typeof channel.push === 'function') {
                         channel.push('call-end', {
                             toUserId: incomingCallData.fromUserId,
+                            callId,
                             reason: 'declined',
                         });
                     }
