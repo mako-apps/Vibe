@@ -5,6 +5,9 @@ defmodule Vibe.Application do
 
   use Application
 
+  @apns_prod "https://api.push.apple.com"
+  @apns_sandbox "https://api.sandbox.push.apple.com"
+
   @impl true
   def start(_type, _args) do
     # Create ETS table for rate limiting before starting the endpoint
@@ -22,6 +25,14 @@ defmodule Vibe.Application do
       VibeWeb.Presence,
       # Start Finch HTTP client for AI APIs
       {Finch, name: Vibe.Finch},
+      # APNs requires HTTP/2; keep a dedicated Finch instance so other outbound HTTP is unaffected
+      {Finch,
+       name: Vibe.APNsFinch,
+       pools: %{
+         @apns_prod => [protocols: [:http2]],
+         @apns_sandbox => [protocols: [:http2]],
+         default: [protocols: [:http2]]
+       }},
       # Start the Endpoint (http/https)
       VibeWeb.Endpoint,
       # Start the Relay Registry (VibeNet peer relay network)
@@ -46,4 +57,5 @@ defmodule Vibe.Application do
     VibeWeb.Endpoint.config_change(changed, removed)
     :ok
   end
+
 end

@@ -270,7 +270,7 @@ defmodule Vibe.Notifications do
 
       request = Finch.build(:post, url, headers, body)
 
-      case Finch.request(request, Vibe.Finch, receive_timeout: 7_000) do
+      case Finch.request(request, Vibe.APNsFinch, receive_timeout: 7_000) do
         {:ok, %Finch.Response{status: 200}} ->
           Logger.info(
             "[Notifications] APNs VoIP push accepted to_user=#{to_user_id} call_type=#{call_type} topic=#{config.topic} base_url=#{config.base_url}"
