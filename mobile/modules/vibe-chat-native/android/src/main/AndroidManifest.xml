@@ -20,5 +20,14 @@
     <receiver
       android:name="expo.modules.vibechatnative.notifications.VibeIncomingCallActionReceiver"
       android:exported="false" />
+
+    <activity
+      android:name="expo.modules.vibechatnative.notifications.VibeNativeCallUiActivity"
+      android:exported="false"
+      android:excludeFromRecents="true"
+      android:launchMode="singleTask"
+      android:showWhenLocked="true"
+      android:turnScreenOn="true"
+      android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
   </application>
 </manifest>

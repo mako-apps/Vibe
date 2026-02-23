@@ -23,8 +23,9 @@ import { useTransientAgentStore } from '../src/lib/stores/transient-agent-store'
 import IncomingCallModal from '../src/components/call/IncomingCallModal';
 import ActiveCallScreen from '../src/components/call/ActiveCallScreen';
 import { useCallStore } from '../src/lib/stores/CallStore';
+import { getUserChannel } from '../src/lib/ChatStore';
 import SessionExpiredBanner from '../src/components/shared/SessionExpiredBanner';
-import { getNativeCallModule } from '../src/native/call/runtime';
+import { addNativeCallUiListener, getNativeCallModule } from '../src/native/call/runtime';
 
 SplashScreen.preventAutoHideAsync()
 
@@ -53,6 +54,22 @@ export default function RootLayout() {
   const segments = useSegments()
   const router = useRouter()
   const GestureHandlerRootViewAny = GestureHandlerRootView as any
+  const nativeCallUiRuntimeInfo = getNativeCallModule()
+  const supportsNativeInAppCallUi = !!nativeCallUiRuntimeInfo?.supportsInAppUi?.()
+
+  const callUiSnapshot = useCallStore((s) => ({
+    callId: s.callId,
+    callType: s.callType,
+    callStatus: s.callStatus,
+    callDirection: s.callDirection,
+    remoteUser: s.remoteUser,
+    isMuted: s.isMuted,
+    isSpeakerOn: s.isSpeakerOn,
+    isVideoEnabled: s.isVideoEnabled,
+    callDuration: s.callDuration,
+    isFrontCamera: s.isFrontCamera,
+    incomingCallData: s.incomingCallData,
+  }))
 
   // Transient Agent Store for @vibe queries (global)
   const { pendingResponse, clearPending, promoteToPersistent } = useTransientAgentStore()
@@ -131,6 +148,85 @@ export default function RootLayout() {
     }
     return handled;
   };
+
+  useEffect(() => {
+    if (!supportsNativeInAppCallUi) return;
+    const sub = addNativeCallUiListener(async (event) => {
+      const type = event?.type;
+      switch (type) {
+        case 'accept':
+          await useCallStore.getState().acceptCall(getUserChannel());
+          break;
+        case 'decline':
+          useCallStore.getState().declineCall(getUserChannel());
+          break;
+        case 'end':
+          useCallStore.getState().endCall(getUserChannel());
+          break;
+        case 'toggleMute':
+          useCallStore.getState().toggleMute();
+          break;
+        case 'toggleSpeaker':
+          useCallStore.getState().toggleSpeaker();
+          break;
+        case 'toggleVideo':
+          useCallStore.getState().toggleVideo();
+          break;
+        case 'flipCamera':
+          useCallStore.getState().flipCamera();
+          break;
+        case 'message':
+        case 'remind':
+          // Keep JS modal for these advanced actions for now; native UI emits and JS can extend later.
+          break;
+      }
+    });
+    return () => sub?.remove();
+  }, [supportsNativeInAppCallUi]);
+
+  useEffect(() => {
+    if (!supportsNativeInAppCallUi) return;
+    const nativeCall = getNativeCallModule();
+    if (!nativeCall?.setCallUiState) return;
+
+    const isInCallLike =
+      callUiSnapshot.callStatus !== 'idle' &&
+      callUiSnapshot.callStatus !== 'ended';
+    const isIncoming =
+      callUiSnapshot.callDirection === 'incoming' &&
+      callUiSnapshot.callStatus === 'ringing' &&
+      !!callUiSnapshot.incomingCallData;
+
+    const mode = !isInCallLike ? 'hidden' : (isIncoming ? 'incoming' : 'active');
+    const remoteName =
+      callUiSnapshot.incomingCallData?.fromUserName ||
+      callUiSnapshot.remoteUser?.userName ||
+      undefined;
+    const remoteImage =
+      callUiSnapshot.incomingCallData?.fromUserImage ||
+      callUiSnapshot.remoteUser?.userImage ||
+      undefined;
+    const callType =
+      callUiSnapshot.incomingCallData?.callType ||
+      callUiSnapshot.callType ||
+      'voice';
+
+    nativeCall.setCallUiState({
+      visible: mode !== 'hidden',
+      mode,
+      callId: callUiSnapshot.callId || callUiSnapshot.incomingCallData?.callId || undefined,
+      callType,
+      callStatus: callUiSnapshot.callStatus,
+      remoteUserName: remoteName,
+      remoteUserImage: remoteImage,
+      isMuted: callUiSnapshot.isMuted,
+      isSpeakerOn: callUiSnapshot.isSpeakerOn,
+      isVideoEnabled: callUiSnapshot.isVideoEnabled,
+      canFlipCamera: callType === 'video',
+      callDuration: callUiSnapshot.callDuration,
+      isDark: effectiveTheme === 'dark',
+    });
+  }, [supportsNativeInAppCallUi, callUiSnapshot, effectiveTheme]);
 
   useEffect(() => {
     void drainNativeCallEvents();
@@ -395,8 +491,8 @@ export default function RootLayout() {
           />
 
           {/* Global Call Overlays */}
-          <IncomingCallModal />
-          <ActiveCallScreen />
+          {!supportsNativeInAppCallUi && <IncomingCallModal />}
+          {!supportsNativeInAppCallUi && <ActiveCallScreen />}
         </View>
       </KeyboardProvider>
     </GestureHandlerRootViewAny>

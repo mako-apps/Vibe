@@ -1,4 +1,4 @@
-import type { NativeCallModule } from './types';
+import type { NativeCallModule, NativeCallUiEvent } from './types';
 
 const MODULE_NAME = 'VibeNativeCall';
 
@@ -38,3 +38,19 @@ export const getNativeCallModule = (): NativeCallModule | null => {
   return resolved ?? null;
 };
 
+type NativeCallUiSubscription = { remove: () => void };
+
+export const addNativeCallUiListener = (
+  listener: (event: NativeCallUiEvent) => void,
+): NativeCallUiSubscription | null => {
+  const nativeModule = getNativeCallModule();
+  if (!nativeModule) return null;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { EventEmitter } = require('expo-modules-core');
+    const emitter = new EventEmitter(nativeModule);
+    return emitter.addListener('onCallUiEvent', listener);
+  } catch {
+    return null;
+  }
+};

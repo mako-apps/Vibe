@@ -13,8 +13,24 @@ export type NativeCallPushTokens = {
 
 export interface NativeCallModule {
   isSupported?: () => boolean;
+  supportsInAppUi?: () => boolean;
   drainPendingEvents?: () => NativeCallPendingEvent[];
   getPushTokens?: () => NativeCallPushTokens | null;
   clearIncomingCallUi?: (payload: Record<string, unknown>) => void;
+  setCallUiState?: (payload: Record<string, unknown>) => void;
+  hideCallUi?: () => void;
 }
 
+export type NativeCallUiEvent = {
+  type:
+    | 'accept'
+    | 'decline'
+    | 'end'
+    | 'toggleMute'
+    | 'toggleSpeaker'
+    | 'toggleVideo'
+    | 'flipCamera'
+    | 'message'
+    | 'remind'
+    | string;
+};
