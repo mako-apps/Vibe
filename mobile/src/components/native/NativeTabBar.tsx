@@ -49,7 +49,7 @@ let nativeTabsAvailable = false;
 
 try {
     const isExpoGo = Constants.appOwnership === 'expo';
-    if (Platform.OS === 'ios' && !isExpoGo) {
+    if ((Platform.OS === 'ios' || Platform.OS === 'android') && !isExpoGo) {
         NativeChatTabsView = requireNativeViewManager<NativeChatTabsViewProps>('ChatNativeTabs');
         nativeTabsAvailable = !!NativeChatTabsView;
         console.log('[NativeTabBar] Native tabs available', { platform: Platform.OS });
@@ -94,7 +94,7 @@ function isVibeTab(tab: TabConfig): boolean {
 }
 
 export function isNativeTabBarAvailable(): boolean {
-    return Platform.OS === 'ios' && nativeTabsAvailable;
+    return (Platform.OS === 'ios' || Platform.OS === 'android') && nativeTabsAvailable;
 }
 
 export default function NativeTabBar({
@@ -124,11 +124,12 @@ export default function NativeTabBar({
     };
 
     const shouldUseNativeTabs =
-        Platform.OS === 'ios' &&
+        (Platform.OS === 'ios' || Platform.OS === 'android') &&
         nativeTabsAvailable &&
         NativeChatTabsView &&
         tabs.length > 0;
     if (shouldUseNativeTabs) {
+        const NativeTabsComponent = NativeChatTabsView as React.ComponentType<NativeChatTabsViewProps>;
         const normalizedIndex = Math.max(0, Math.min(currentIndex, tabs.length - 1));
 
         const nativeTabs = tabs.map((tab) => {
@@ -168,7 +169,7 @@ export default function NativeTabBar({
 
         return (
             <View pointerEvents="box-none" style={styles.nativeTabsDock}>
-                <NativeChatTabsView
+                <NativeTabsComponent
                     style={styles.nativeTabsBar}
                     tabs={nativeTabs}
                     currentIndex={normalizedIndex}

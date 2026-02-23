@@ -11,6 +11,7 @@ import { decryptMessagesBatch, encryptMessageNativeFirst } from '../native/chat/
 import * as Crypto from 'expo-crypto';
 import * as FileSystem from 'expo-file-system/legacy';
 import SoundManager from './SoundManager';
+import AppSoundService from './services/AppSoundService';
 import { uploadMedia } from './api-client';
 import { useEncryptedMediaStore } from './stores/encrypted-media-store';
 import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
@@ -1272,7 +1273,9 @@ export const useChatStore = create<ChatState>()(
 
                         userChannel = socket!.channel(`user:${auth.userId}`, {});
                         userChannel.join()
-                            .receive("ok", resp => { })
+                            .receive("ok", resp => {
+                                void AppSoundService.playSocketReadyCue();
+                            })
                             .receive("error", resp => { });
 
                         userChannel.on('initial-presence', (resp: any) => {

@@ -7,6 +7,7 @@
 
 import { create } from 'zustand';
 import WebRTCService from '../services/WebRTCService';
+import AppSoundService from '../services/AppSoundService';
 import ProxyManager from '../ProxyManager';
 
 // Detect if we're behind strict network filtering and should force TURN relay
@@ -22,6 +23,15 @@ const shouldForceRelay = (): boolean => {
 export type CallType = 'voice' | 'video';
 export type CallDirection = 'incoming' | 'outgoing';
 export type CallStatus = 'idle' | 'ringing' | 'connecting' | 'active' | 'ended' | 'failed' | 'reconnecting';
+export type CallConnectionPhase =
+    | 'idle'
+    | 'ringing'
+    | 'signaling'
+    | 'peer-connecting'
+    | 'waiting-remote-media'
+    | 'stabilizing'
+    | 'stable'
+    | 'reconnecting';
 
 export interface CallHistoryRecord {
     id: string;
@@ -182,6 +192,9 @@ interface CallState {
     // Streams (stored as opaque refs, actual MediaStream handled by service)
     hasLocalStream: boolean;
     hasRemoteStream: boolean;
+    isPeerConnected: boolean;
+    rtcConnectionState: string | null;
+    connectionPhase: CallConnectionPhase;
 
     // Timing
     callStartTime: number | null;
@@ -257,6 +270,9 @@ const initialState: CallState = {
     isFrontCamera: true,
     hasLocalStream: false,
     hasRemoteStream: false,
+    isPeerConnected: false,
+    rtcConnectionState: null,
+    connectionPhase: 'idle',
     callStartTime: null,
     callDuration: 0,
     incomingCallData: null,
@@ -288,12 +304,59 @@ export const useCallStore = create<CallState & CallActions>()(
 
             const markCallFailed = () => {
                 clearWatchdog();
+                void AppSoundService.stopIncomingRingLoop();
                 set({ callStatus: 'failed' });
                 setTimeout(() => {
                     if (get().callStatus === 'failed') {
                         get().resetCall();
                     }
                 }, 2500);
+            };
+
+            const setConnectionPhaseIfChanged = (phase: CallConnectionPhase) => {
+                const current = get();
+                if (current.connectionPhase !== phase) {
+                    set({ connectionPhase: phase });
+                }
+            };
+
+            const syncStableCallState = () => {
+                const current = get();
+                if (current.callStatus === 'idle' || current.callStatus === 'ended' || current.callStatus === 'failed') {
+                    return;
+                }
+
+                if (current.isPeerConnected && current.hasRemoteStream) {
+                    clearWatchdog();
+                    const patch: Partial<CallState> = {
+                        connectionPhase: 'stable',
+                    };
+                    if (current.callStatus !== 'active') {
+                        patch.callStatus = 'active';
+                    }
+                    if (!current.callStartTime) {
+                        patch.callStartTime = Date.now();
+                    }
+                    set(patch as Partial<CallState>);
+                    void AppSoundService.stopIncomingRingLoop();
+                    WebRTCService.startBandwidthMonitor();
+                    return;
+                }
+
+                if (current.callStatus === 'reconnecting') {
+                    setConnectionPhaseIfChanged('reconnecting');
+                    return;
+                }
+
+                if (current.callStatus === 'connecting') {
+                    if (current.isPeerConnected && !current.hasRemoteStream) {
+                        setConnectionPhaseIfChanged('waiting-remote-media');
+                    } else if (!current.isPeerConnected && current.hasRemoteStream) {
+                        setConnectionPhaseIfChanged('stabilizing');
+                    } else {
+                        setConnectionPhaseIfChanged('peer-connecting');
+                    }
+                }
             };
 
             const pushWebRTCSignal = (signalType: 'offer' | 'answer' | 'ice-candidate', payload: Record<string, any>) => {
@@ -333,28 +396,31 @@ export const useCallStore = create<CallState & CallActions>()(
                     if (current.callStatus === 'idle' || current.callStatus === 'ended') return;
                     set({
                         hasRemoteStream: true,
-                        callStatus: 'active',
-                        callStartTime: current.callStartTime || Date.now(),
                     });
-                    WebRTCService.startBandwidthMonitor();
+                    syncStableCallState();
                 };
 
                 WebRTCService.onConnectionStateChange = (state: string) => {
-                    if (state === 'connected') {
-                        clearWatchdog();
+                    set({ rtcConnectionState: state || null });
+
+                    if (state === 'connecting') {
                         const current = get();
-                        if (current.callStatus !== 'active') {
-                            set({
-                                callStatus: 'active',
-                                callStartTime: current.callStartTime || Date.now(),
-                            });
-                            WebRTCService.startBandwidthMonitor();
+                        if (current.callStatus === 'connecting') {
+                            setConnectionPhaseIfChanged('peer-connecting');
                         }
+                        return;
+                    }
+
+                    if (state === 'connected' || state === 'completed') {
+                        clearWatchdog();
+                        set({ isPeerConnected: true });
+                        syncStableCallState();
                         return;
                     }
 
                     if (state === 'disconnected') {
                         const current = get();
+                        set({ isPeerConnected: false, connectionPhase: 'reconnecting' });
                         if (current.callStatus === 'active' || current.callStatus === 'connecting') {
                             set({ callStatus: 'reconnecting' });
                             startWatchdog(25000, 'reconnecting');
@@ -363,6 +429,7 @@ export const useCallStore = create<CallState & CallActions>()(
                     }
 
                     if (state === 'failed' || state === 'closed') {
+                        set({ isPeerConnected: false });
                         clearWatchdog();
                         const current = get();
                         if (current.callStatus !== 'idle' && current.callStatus !== 'ended') {
@@ -452,6 +519,10 @@ export const useCallStore = create<CallState & CallActions>()(
                         callType: type,
                         callDirection: 'outgoing',
                         callStatus: 'ringing',
+                        connectionPhase: 'ringing',
+                        rtcConnectionState: null,
+                        isPeerConnected: false,
+                        hasRemoteStream: false,
                         remoteUser,
                         isVideoEnabled: type === 'video',
                         signalingChannel: channel,
@@ -554,6 +625,10 @@ export const useCallStore = create<CallState & CallActions>()(
                     set({
                         incomingCallData: normalized,
                         callStatus: 'ringing',
+                        connectionPhase: 'ringing',
+                        rtcConnectionState: null,
+                        isPeerConnected: false,
+                        hasRemoteStream: false,
                         callDirection: 'incoming',
                         callId: normalized.callId,
                         callType: normalized.callType,
@@ -563,6 +638,7 @@ export const useCallStore = create<CallState & CallActions>()(
                             userImage: normalized.fromUserImage,
                         },
                     });
+                    void AppSoundService.startIncomingRingLoop();
                 },
 
                 acceptCall: async (socket) => {
@@ -574,7 +650,15 @@ export const useCallStore = create<CallState & CallActions>()(
                         return false;
                     }
 
-                    set({ callStatus: 'connecting', signalingChannel: channel });
+                    void AppSoundService.stopIncomingRingLoop();
+                    set({
+                        callStatus: 'connecting',
+                        connectionPhase: 'signaling',
+                        signalingChannel: channel,
+                        rtcConnectionState: null,
+                        isPeerConnected: false,
+                        hasRemoteStream: false,
+                    });
 
                     try {
                         // Pre-fetch TURN credentials in parallel with media init
@@ -594,6 +678,7 @@ export const useCallStore = create<CallState & CallActions>()(
                             callId: incomingCallData.callId,
                         });
 
+                        set({ connectionPhase: 'peer-connecting' });
                         startWatchdog(20000, 'accept-connecting');
 
                         return true;
@@ -604,6 +689,7 @@ export const useCallStore = create<CallState & CallActions>()(
                 },
 
                 declineCall: (socket) => {
+                    void AppSoundService.stopIncomingRingLoop();
                     const { incomingCallData, callId, remoteUser, callType, callDirection, signalingChannel } = get();
                     const channel = resolveSignalingChannel(socket || signalingChannel);
 
@@ -645,11 +731,19 @@ export const useCallStore = create<CallState & CallActions>()(
                         return;
                     }
 
-                    set({ callStatus: 'connecting', signalingChannel: channel });
+                    set({
+                        callStatus: 'connecting',
+                        connectionPhase: 'signaling',
+                        signalingChannel: channel,
+                        rtcConnectionState: null,
+                        isPeerConnected: false,
+                        hasRemoteStream: false,
+                    });
                     startWatchdog(20000, 'handle-call-accepted-connecting');
 
                     try {
                         bindSignalingCallbacks(channel);
+                        set({ connectionPhase: 'peer-connecting' });
                         const forceRelay = shouldForceRelay();
                         const offer = await WebRTCService.createOffer(forceRelay);
                         if (!offer) throw new Error('Failed to create offer');
@@ -697,6 +791,7 @@ export const useCallStore = create<CallState & CallActions>()(
                 },
 
                 handleCallEnded: (payload) => {
+                    void AppSoundService.stopIncomingRingLoop();
                     const { callId, remoteUser, callType, callDirection, callStatus, callDuration } = get();
                     const endedCallId = asNonEmptyString(payload?.callId) || asNonEmptyString(payload?.call_id);
                     if (endedCallId && callId && endedCallId !== callId) {
@@ -725,6 +820,7 @@ export const useCallStore = create<CallState & CallActions>()(
                 },
 
                 endCall: (socket) => {
+                    void AppSoundService.stopIncomingRingLoop();
                     const { remoteUser, callId, callType, callDirection, callStatus, callDuration, signalingChannel } = get();
                     const channel = resolveSignalingChannel(socket || signalingChannel);
 
@@ -833,6 +929,7 @@ export const useCallStore = create<CallState & CallActions>()(
 
                 resetCall: () => {
                     clearWatchdog();
+                    void AppSoundService.stopIncomingRingLoop();
                     WebRTCService.cleanup();
                     WebRTCService.onIceCandidate = null;
                     WebRTCService.onOffer = null;

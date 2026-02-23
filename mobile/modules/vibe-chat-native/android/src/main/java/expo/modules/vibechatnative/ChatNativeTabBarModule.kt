@@ -9,6 +9,7 @@ import android.net.Uri
 import android.text.TextUtils
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.MotionEvent
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -285,6 +286,7 @@ class ChatNativeTabsView(
       inner,
       FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT),
     )
+    installPressFeedback(container, inner, container)
     return container
   }
 
@@ -323,7 +325,46 @@ class ChatNativeTabsView(
       iconView,
       FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT, Gravity.CENTER),
     )
+    installPressFeedback(container, iconView, container)
     return container
+  }
+
+  private fun installPressFeedback(
+    touchTarget: FrameLayout,
+    scaleTarget: android.view.View,
+    alphaTarget: android.view.View = touchTarget,
+  ) {
+    val restAlpha = alphaTarget.alpha
+    val restScaleX = scaleTarget.scaleX
+    val restScaleY = scaleTarget.scaleY
+    touchTarget.setOnTouchListener { _, event ->
+      when (event.actionMasked) {
+        MotionEvent.ACTION_DOWN -> {
+          scaleTarget.animate()
+            .scaleX(0.965f)
+            .scaleY(0.965f)
+            .setDuration(90L)
+            .start()
+          alphaTarget.animate()
+            .alpha(0.72f)
+            .setDuration(90L)
+            .start()
+        }
+        MotionEvent.ACTION_UP,
+        MotionEvent.ACTION_CANCEL -> {
+          scaleTarget.animate()
+            .scaleX(restScaleX)
+            .scaleY(restScaleY)
+            .setDuration(180L)
+            .start()
+          alphaTarget.animate()
+            .alpha(restAlpha)
+            .setDuration(180L)
+            .start()
+        }
+      }
+      false
+    }
   }
 
   private fun resolveGlyph(tab: AndroidNativeTabItem, fallback: String? = null): String {

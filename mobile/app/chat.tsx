@@ -445,9 +445,6 @@ export default function ChatScreen() {
             params: {
                 userId: activeChat.friendId,
                 chatId: activeChat.chatId,
-                username: activeChat.friendName || displayName,
-                profileImage: activeChat.friendImage || '',
-                isOnline: headerIsOnline ? '1' : '0',
             }
         });
         requestAnimationFrame(() => {

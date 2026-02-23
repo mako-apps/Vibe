@@ -1101,31 +1101,35 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
       }
     }
 
-    let particleCount = 11
-    for index in 0..<particleCount {
-      let dotSize = CGFloat.random(in: 3.4...6.2)
-      let dot = UIView(frame: CGRect(x: 0, y: 0, width: dotSize, height: dotSize))
-      dot.layer.cornerRadius = dotSize * 0.5
-      dot.backgroundColor = tintColor.withAlphaComponent(CGFloat.random(in: 0.72...0.95))
-      dot.center = point
-      container.addSubview(dot)
+    let pulseDotSize: CGFloat = 10
+    let pulseDot = UIView(frame: CGRect(x: 0, y: 0, width: pulseDotSize, height: pulseDotSize))
+    pulseDot.layer.cornerRadius = pulseDotSize * 0.5
+    pulseDot.backgroundColor = tintColor.withAlphaComponent(0.9)
+    pulseDot.center = point
+    pulseDot.alpha = 0.85
+    container.addSubview(pulseDot)
 
-      let angle = (CGFloat(index) / CGFloat(max(1, particleCount))) * (.pi * 2.0)
-      let radial = CGFloat.random(in: 24.0...58.0)
-      let dx = cos(angle) * radial
-      let dy = (sin(angle) * radial * 0.72) - CGFloat.random(in: 14.0...26.0)
+    let pulseRingSize: CGFloat = 16
+    let pulseRing = UIView(frame: CGRect(x: 0, y: 0, width: pulseRingSize, height: pulseRingSize))
+    pulseRing.layer.cornerRadius = pulseRingSize * 0.5
+    pulseRing.layer.borderWidth = 2
+    pulseRing.layer.borderColor = tintColor.withAlphaComponent(0.9).cgColor
+    pulseRing.center = point
+    pulseRing.alpha = 0.85
+    container.addSubview(pulseRing)
 
-      UIView.animate(
-        withDuration: 0.44,
-        delay: Double(index % 4) * 0.015,
-        options: [.curveEaseOut, .beginFromCurrentState]
-      ) {
-        dot.center = CGPoint(x: point.x + dx, y: point.y + dy)
-        dot.alpha = 0.0
-        dot.transform = CGAffineTransform(scaleX: 0.35, y: 0.35)
-      } completion: { _ in
-        dot.removeFromSuperview()
-      }
+    UIView.animate(
+      withDuration: 0.46,
+      delay: 0.02,
+      options: [.curveEaseOut, .beginFromCurrentState]
+    ) {
+      pulseDot.alpha = 0.0
+      pulseDot.transform = CGAffineTransform(scaleX: 1.9, y: 1.9)
+      pulseRing.alpha = 0.0
+      pulseRing.transform = CGAffineTransform(scaleX: 2.6, y: 2.6)
+    } completion: { _ in
+      pulseDot.removeFromSuperview()
+      pulseRing.removeFromSuperview()
     }
 
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.62) {

@@ -114,6 +114,7 @@ export default function ActiveCallScreen() {
         callDuration,
         hasLocalStream,
         hasRemoteStream,
+        connectionPhase,
         toggleMute,
         toggleSpeaker,
         toggleVideo,
@@ -238,6 +239,23 @@ export default function ActiveCallScreen() {
     } as const;
     const baseControlColor = palette.text;
     const activeControlIconColor = colors.background;
+    const isStabilizingPhase =
+        callStatus !== 'active' &&
+        (connectionPhase === 'waiting-remote-media' || connectionPhase === 'stabilizing');
+    const topStatusText =
+        callStatus === 'connecting'
+            ? (isStabilizingPhase ? 'Stabilizing...' : 'Connecting...')
+            : callStatus === 'reconnecting'
+                ? 'Connectivity Issue...'
+                : callStatus === 'ringing'
+                    ? 'Ringing...'
+                    : 'Vibe Audio';
+    const durationStatusText =
+        callStatus === 'connecting'
+            ? (isStabilizingPhase ? 'Stabilizing...' : 'Connecting...')
+            : callStatus === 'reconnecting'
+                ? 'Connectivity Issue...'
+                : formatDuration(callDuration);
 
     const clearVideoChromeTimer = () => {
         if (videoChromeHideTimerRef.current) {
@@ -447,7 +465,7 @@ export default function ActiveCallScreen() {
                                 </Text>
                                 <View style={{ width: 4, height: 4, borderRadius: 2, backgroundColor: palette.textSubtle }} />
                                 <Text style={{ color: palette.textDim, fontSize: 14 }}>
-                                    {callStatus === 'connecting' ? 'Connecting...' : callStatus === 'reconnecting' ? 'Reconnecting...' : formatDuration(callDuration)}
+                                    {durationStatusText}
                                 </Text>
                             </SafeLiquidGlass>
                         </View>
@@ -569,7 +587,7 @@ export default function ActiveCallScreen() {
             {/* Header - Static */}
             <View style={{ paddingTop: insets.top + 32, alignItems: 'center' }}>
                 <Text style={{ color: palette.textSubtle, fontSize: 16, fontWeight: '500', marginBottom: 8 }}>
-                    {callStatus === 'connecting' ? 'Connecting...' : callStatus === 'reconnecting' ? 'Connectivity Issue...' : callStatus === 'ringing' ? 'Ringing...' : 'Vibe Audio'}
+                    {topStatusText}
                 </Text>
             </View>
 

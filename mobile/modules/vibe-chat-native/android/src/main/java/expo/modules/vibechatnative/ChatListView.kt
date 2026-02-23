@@ -3125,39 +3125,59 @@ private class ReactionBurstOverlayView(context: Context) : FrameLayout(context) 
       }
       .start()
 
-    val particleCount = 11
-    for (index in 0 until particleCount) {
-      val size = dpF(3.2f + ((index % 4) * 0.9f))
-      val dot =
-        View(context).apply {
-          alpha = 0.94f
-          background =
-            GradientDrawable().apply {
-              shape = GradientDrawable.OVAL
-              setColor(withAlpha(color, 0.94f - ((index % 3) * 0.08f)))
-            }
-        }
-      addView(dot, LayoutParams(size.roundToInt().coerceAtLeast(2), size.roundToInt().coerceAtLeast(2)))
-      dot.x = x - (size * 0.5f)
-      dot.y = y - (size * 0.5f)
+    val dotSize = dpF(10f)
+    val pulseDot =
+      View(context).apply {
+        alpha = 0.85f
+        background =
+          GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(withAlpha(color, 0.92f))
+          }
+      }
+    addView(
+      pulseDot,
+      LayoutParams(dotSize.roundToInt().coerceAtLeast(2), dotSize.roundToInt().coerceAtLeast(2)),
+    )
+    pulseDot.x = x - (dotSize * 0.5f)
+    pulseDot.y = y - (dotSize * 0.5f)
 
-      val angle = ((Math.PI * 2.0 * index) / particleCount.toDouble()).toFloat()
-      val radial = dpF(24f + ((index % 5) * 6f))
-      val dx = (cos(angle.toDouble()) * radial).toFloat()
-      val dy = ((sin(angle.toDouble()) * radial * 0.72) - dpF(14f + ((index % 4) * 3f))).toFloat()
+    val ringSize = dpF(16f)
+    val pulseRing =
+      View(context).apply {
+        alpha = 0.85f
+        background =
+          GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(Color.TRANSPARENT)
+            setStroke(dp(2), withAlpha(color, 0.9f))
+          }
+      }
+    addView(
+      pulseRing,
+      LayoutParams(ringSize.roundToInt().coerceAtLeast(2), ringSize.roundToInt().coerceAtLeast(2)),
+    )
+    pulseRing.x = x - (ringSize * 0.5f)
+    pulseRing.y = y - (ringSize * 0.5f)
 
-      dot.animate()
-        .translationXBy(dx)
-        .translationYBy(dy)
-        .alpha(0f)
-        .scaleX(0.35f)
-        .scaleY(0.35f)
-        .setStartDelay((index % 4) * 14L)
-        .setDuration(430L)
-        .setInterpolator(verticalInterpolator)
-        .withEndAction { removeView(dot) }
-        .start()
-    }
+    pulseDot.animate()
+      .alpha(0f)
+      .scaleX(1.9f)
+      .scaleY(1.9f)
+      .setDuration(460L)
+      .setInterpolator(verticalInterpolator)
+      .withEndAction { removeView(pulseDot) }
+      .start()
+
+    pulseRing.animate()
+      .alpha(0f)
+      .scaleX(2.6f)
+      .scaleY(2.6f)
+      .setDuration(460L)
+      .setStartDelay(20L)
+      .setInterpolator(verticalInterpolator)
+      .withEndAction { removeView(pulseRing) }
+      .start()
 
     postDelayed({
       onDone()
@@ -3168,6 +3188,8 @@ private class ReactionBurstOverlayView(context: Context) : FrameLayout(context) 
     val a = (alpha.coerceIn(0f, 1f) * 255f).roundToInt()
     return Color.argb(a, Color.red(color), Color.green(color), Color.blue(color))
   }
+
+  private fun dp(value: Int): Int = dpF(value.toFloat()).roundToInt()
 
   private fun dpF(value: Float): Float =
     TypedValue.applyDimension(
