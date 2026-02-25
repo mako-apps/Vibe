@@ -2242,7 +2242,7 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
 
   // MARK: - Native Send (synchronous, no bridge delay)
 
-  private func handleNativeSend(text: String) {
+  private func handleNativeSend(text: String, agentMention: Bool = false, agentText: String? = nil) {
     let messageId = UUID().uuidString.lowercased()
     let now = Date()
     let timestampMs = now.timeIntervalSince1970 * 1000
@@ -2346,7 +2346,7 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
         setNativeOutgoingMessageStatus(messageId, status: "error")
         return
       }
-      let sendPayload: [String: Any] = [
+      var sendPayload: [String: Any] = [
         "chatId": chatId,
         "messageId": messageId,
         "type": "text",
@@ -2356,6 +2356,10 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
         "myUserId": myUserId,
         "peerUserId": peerUserId,
       ]
+      if agentMention, let agentText {
+        sendPayload["agentMention"] = true
+        sendPayload["agentText"] = agentText
+      }
       DispatchQueue.global(qos: .userInitiated).async { [weak self] in
         let result = ChatEngine.shared.sendMessage(sendPayload)
         let accepted = (result["accepted"] as? Bool) == true
@@ -2429,6 +2433,10 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
 extension ChatListView: ChatInputBarDelegate {
   func inputBarDidSend(text: String) {
     handleNativeSend(text: text)
+  }
+
+  func inputBarDidSendWithAgentMention(text: String, agentText: String) {
+    handleNativeSend(text: text, agentMention: true, agentText: agentText)
   }
 
   func inputBarDidTapAttachment() {

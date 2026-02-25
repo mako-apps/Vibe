@@ -17,6 +17,7 @@ import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
+import android.graphics.Typeface
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
@@ -96,6 +97,9 @@ private data class NativeRowItem(
   val mediaUrl: String?,
   val duration: Double?,
   val waveform: List<Float>?,
+  val isAgentMessage: Boolean = false,
+  val agentName: String? = null,
+  val plainContent: String? = null,
 )
 
 private data class SendTransitionPayload(
@@ -123,6 +127,7 @@ private class NativeRowViewHolder(
   val timeView: TextView,
   val statusView: BubbleStatusIndicatorView,
   val dayLabel: TextView,
+  val agentSenderLabel: TextView,
 ) : RecyclerView.ViewHolder(container)
 
 private class BubbleTailView(context: Context) : View(context) {
@@ -850,6 +855,15 @@ private class NativeRowsAdapter(
       visibility = View.GONE
     }
 
+    val agentSender = TextView(context).apply {
+      setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+      setTextColor(Color.argb(255, 125, 92, 225))
+      setTypeface(Typeface.DEFAULT_BOLD)
+      includeFontPadding = false
+      visibility = View.GONE
+      maxLines = 1
+    }
+
     val text = TextView(context).apply {
       setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
       setTextColor(Color.WHITE)
@@ -903,6 +917,13 @@ private class NativeRowsAdapter(
       visibility = View.GONE
     }
 
+    bubble.addView(
+      agentSender,
+      FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams.WRAP_CONTENT,
+        FrameLayout.LayoutParams.WRAP_CONTENT,
+      ),
+    )
     bubble.addView(
       text,
       FrameLayout.LayoutParams(
@@ -967,7 +988,7 @@ private class NativeRowsAdapter(
       ),
     )
 
-    return NativeRowViewHolder(root, bubble, tail, text, voiceContainer, voiceButton, voiceWave, voiceDuration, time, status, day)
+    return NativeRowViewHolder(root, bubble, tail, text, voiceContainer, voiceButton, voiceWave, voiceDuration, time, status, day, agentSender)
   }
 
   override fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int) {
@@ -1020,6 +1041,7 @@ private class NativeRowsAdapter(
       holder.voiceWaveView.updatePlayback(0f, 0f, false)
       holder.voiceWaveView.setWaveform(null)
       holder.voiceButton.text = "▶"
+      holder.agentSenderLabel.visibility = View.GONE
     } else if (holder is TypingRowViewHolder) {
       holder.shimmerView.stopShimmer()
     }
@@ -1053,6 +1075,7 @@ private class NativeRowsAdapter(
       bubbleContainer.visibility = View.GONE
       tailView.visibility = View.GONE
       statusView.visibility = View.GONE
+      agentSenderLabel.visibility = View.GONE
       voiceWaveView.setWaveform(null)
       container.setOnLongClickListener(null)
       return
@@ -1063,22 +1086,33 @@ private class NativeRowsAdapter(
     bubbleContainer.alpha = if (hidden) 0f else 1f
 
     val isVoice = item.messageType == "voice" || item.messageType == "music"
-    textView.text = item.text
+
+    // Agent message rendering
+    if (item.isAgentMessage) {
+      agentSenderLabel.text = "✦ ${item.agentName ?: "Vibe AI"}"
+      agentSenderLabel.visibility = if (hidden) View.GONE else View.VISIBLE
+      textView.text = item.plainContent ?: item.text
+    } else {
+      agentSenderLabel.visibility = View.GONE
+      textView.text = item.text
+    }
     timeView.text = item.timestamp
-    textView.setTextColor(if (item.isMe) appearance.textColorMe else appearance.textColorThem)
-    timeView.setTextColor(if (item.isMe) appearance.timeColorMe else appearance.timeColorThem)
+    // Agent messages use "them" styling (not isMe)
+    val effectiveIsMe = if (item.isAgentMessage) false else item.isMe
+    textView.setTextColor(if (effectiveIsMe) appearance.textColorMe else appearance.textColorThem)
+    timeView.setTextColor(if (effectiveIsMe) appearance.timeColorMe else appearance.timeColorThem)
     voiceDurationView.text = formatDuration(item.duration)
     voiceWaveView.setWaveform(item.waveform)
 
     val lp = bubbleContainer.layoutParams as FrameLayout.LayoutParams
-    lp.gravity = if (item.isMe) Gravity.END else Gravity.START
+    lp.gravity = if (effectiveIsMe) Gravity.END else Gravity.START
     bubbleContainer.layoutParams = lp
 
     val bubbleThemFill = appearance.bubbleThemColor
-    val metaBaseColor = if (item.isMe) appearance.timeColorMe else appearance.timeColorThem
+    val metaBaseColor = if (effectiveIsMe) appearance.timeColorMe else appearance.timeColorThem
     val displayStatus = statusResolver?.invoke(item) ?: item.status
     statusView.bind(displayStatus, metaBaseColor)
-    val showStatus = item.isMe && when (displayStatus?.lowercase()) {
+    val showStatus = effectiveIsMe && when (displayStatus?.lowercase()) {
       "pending", "sent", "delivered", "read", "error" -> true
       else -> false
     }
@@ -1096,7 +1130,7 @@ private class NativeRowsAdapter(
     timeLp.bottomMargin = 0
     timeView.layoutParams = timeLp
 
-    val drawable = if (item.isMe) {
+    val drawable = if (effectiveIsMe) {
       GradientDrawable(
         GradientDrawable.Orientation.TL_BR,
         appearance.bubbleMeGradient,
@@ -1112,22 +1146,37 @@ private class NativeRowsAdapter(
     )
     bubbleContainer.background = drawable
 
+    // Position agent sender label above the text content
+    if (item.isAgentMessage && agentSenderLabel.visibility == View.VISIBLE) {
+      val agentLp = agentSenderLabel.layoutParams as FrameLayout.LayoutParams
+      agentLp.gravity = Gravity.START or Gravity.TOP
+      agentLp.topMargin = 0
+      agentSenderLabel.layoutParams = agentLp
+      val textLpAgent = textView.layoutParams as FrameLayout.LayoutParams
+      textLpAgent.topMargin = dp(18)
+      textView.layoutParams = textLpAgent
+    } else {
+      val textLpAgent = textView.layoutParams as FrameLayout.LayoutParams
+      textLpAgent.topMargin = 0
+      textView.layoutParams = textLpAgent
+    }
+
     if (isVoice) {
       bubbleContainer.setPadding(dp(10), dp(7), dp(10), dp(17))
       textView.visibility = View.GONE
       voiceContainer.visibility = View.VISIBLE
       bubbleContainer.minimumWidth = dp(220)
-      val voiceAccent = if (item.isMe) withAlpha(appearance.textColorMe, 0.20f) else withAlpha(appearance.textColorThem, 0.13f)
-      val voiceIconTint = if (item.isMe) appearance.textColorMe else appearance.textColorThem
+      val voiceAccent = if (effectiveIsMe) withAlpha(appearance.textColorMe, 0.20f) else withAlpha(appearance.textColorThem, 0.13f)
+      val voiceIconTint = if (effectiveIsMe) appearance.textColorMe else appearance.textColorThem
       voiceButton.background = GradientDrawable().apply {
         shape = GradientDrawable.OVAL
         setColor(voiceAccent)
       }
       voiceButton.setTextColor(voiceIconTint)
-      voiceDurationView.setTextColor(if (item.isMe) withAlpha(appearance.textColorMe, 0.82f) else withAlpha(appearance.textColorThem, 0.78f))
+      voiceDurationView.setTextColor(if (effectiveIsMe) withAlpha(appearance.textColorMe, 0.82f) else withAlpha(appearance.textColorThem, 0.78f))
       voiceWaveView.setColors(
         activeColor = withAlpha(voiceIconTint, 0.96f),
-        inactiveColor = withAlpha(voiceIconTint, if (item.isMe) 0.34f else 0.26f),
+        inactiveColor = withAlpha(voiceIconTint, if (effectiveIsMe) 0.34f else 0.26f),
       )
       voiceButton.setOnClickListener {
         voicePlayback.toggle(this, item)
@@ -1175,16 +1224,16 @@ private class NativeRowsAdapter(
 
     if (!hidden && item.shape.showTail) {
       tailView.configure(
-        isMe = item.isMe,
+        isMe = effectiveIsMe,
         visible = true,
-        color = if (item.isMe) appearance.bubbleMeGradient.lastOrNull() ?: Color.WHITE else bubbleThemFill,
+        color = if (effectiveIsMe) appearance.bubbleMeGradient.lastOrNull() ?: Color.WHITE else bubbleThemFill,
       )
       val tailLp = tailView.layoutParams as FrameLayout.LayoutParams
-      tailLp.gravity = if (item.isMe) Gravity.END or Gravity.BOTTOM else Gravity.START or Gravity.BOTTOM
+      tailLp.gravity = if (effectiveIsMe) Gravity.END or Gravity.BOTTOM else Gravity.START or Gravity.BOTTOM
       tailLp.marginStart = 0
       tailLp.marginEnd = 0
       tailLp.bottomMargin = 0
-      if (item.isMe) tailLp.marginEnd = dp(-28) else tailLp.marginStart = dp(-28)
+      if (effectiveIsMe) tailLp.marginEnd = dp(-28) else tailLp.marginStart = dp(-28)
       tailView.layoutParams = tailLp
     } else {
       tailView.visibility = View.GONE
@@ -2537,6 +2586,53 @@ class ChatListView(
         emitNativeEvent(mapOf("type" to "sendMessage", "text" to trimmed, "messageId" to messageId))
       }
 
+      override fun onSendTextWithAgentMention(text: String, agentText: String, messageId: String) {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return
+        Log.i(
+          "ChatListView",
+          "onSendTextWithAgentMention textLen=${trimmed.length} agentTextLen=${agentText.length} messageId=$messageId nativeSendEnabled=$nativeSendEnabled chatId=${engineChatId.trim()}",
+        )
+        if (nativeSendEnabled) {
+          val chatId = engineChatId.trim()
+          val myUserId = engineMyUserId.trim()
+          val peerUserId = enginePeerUserId.trim()
+          if (chatId.isEmpty()) {
+            Log.w("ChatListView", "native ChatEngine agent send blocked: empty chatId messageId=$messageId")
+            return
+          }
+          diffExecutor.execute {
+            val result = ChatEngine.sendMessage(
+              mapOf(
+                "chatId" to chatId,
+                "messageId" to messageId,
+                "type" to "text",
+                "text" to trimmed,
+                "myUserId" to myUserId,
+                "peerUserId" to peerUserId,
+                "agentMention" to true,
+                "agentText" to agentText,
+              ),
+            )
+            val accepted = (result["accepted"] as? Boolean) == true
+            Log.i(
+              "ChatListView",
+              "native ChatEngine sendMessage(agentMention) accepted=$accepted chatId=$chatId messageId=$messageId",
+            )
+          }
+          return
+        }
+        emitNativeEvent(
+          mapOf(
+            "type" to "sendMessage",
+            "text" to trimmed,
+            "messageId" to messageId,
+            "agentMention" to true,
+            "agentText" to agentText,
+          ),
+        )
+      }
+
       override fun onRecordingState(isRecording: Boolean, isLocked: Boolean) {
         if (nativeSendEnabled) {
           val chatId = engineChatId.trim()
@@ -3282,6 +3378,10 @@ class ChatListView(
         bottomLeft = ((shapeMap?.get("borderBottomLeftRadius") as? Number)?.toFloat() ?: 18f),
       )
 
+      val rawIsAgentMessage = (message["isAgentMessage"] as? Boolean) ?: false
+      val rawAgentName = (message["agentName"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
+      val rawPlainContent = (message["plainContent"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
+
       output.add(
         NativeRowItem(
           kind = "message",
@@ -3296,6 +3396,9 @@ class ChatListView(
           mediaUrl = mediaUrl,
           duration = duration,
           waveform = waveform,
+          isAgentMessage = rawIsAgentMessage,
+          agentName = rawAgentName,
+          plainContent = rawPlainContent,
         ),
       )
 
