@@ -100,11 +100,60 @@ export default function ChatScreen() {
     [effectiveChatId],
   );
 
-  const displayName = activeChat?.friendName || activeChat?.name || 'Chat';
+  const isGroupOrChannel = activeChat?.type === 'group' || activeChat?.type === 'channel';
+  const displayName = isGroupOrChannel
+    ? (activeChat?.name || 'Group')
+    : (activeChat?.friendName || activeChat?.name || 'Chat');
   const friendIdUpper = (activeChat?.friendId || '').trim().toUpperCase();
-  const isTyping = !!friendIdUpper && typingUsers.has(friendIdUpper);
-  const isOnline = !!friendIdUpper && onlineUsers.has(friendIdUpper);
-  const subtitle = isTyping ? 'typing...' : (isOnline ? 'online' : 'last seen recently');
+  const isTyping = !isGroupOrChannel && !!friendIdUpper && typingUsers.has(friendIdUpper);
+  const isOnline = !isGroupOrChannel && !!friendIdUpper && onlineUsers.has(friendIdUpper);
+  const groupMembers = useMemo(() => {
+    if (!isGroupOrChannel) return [] as Array<{ userId: string; name?: string }>;
+    const byId = new Map<string, { userId: string; name?: string }>();
+    const addMember = (rawId: unknown, rawName?: unknown) => {
+      if (typeof rawId !== 'string') return;
+      const id = rawId.trim();
+      if (!id) return;
+      const normalized = id.toUpperCase();
+      const name =
+        typeof rawName === 'string' && rawName.trim().length > 0
+          ? rawName.trim()
+          : undefined;
+      if (!byId.has(normalized)) {
+        byId.set(normalized, { userId: normalized, name });
+        return;
+      }
+      if (name && !byId.get(normalized)?.name) {
+        byId.set(normalized, { userId: normalized, name });
+      }
+    };
+
+    const explicitMembers = (activeChat as any)?.members;
+    if (Array.isArray(explicitMembers)) {
+      explicitMembers.forEach((member: any) => {
+        addMember(member?.userId ?? member?.id ?? member?.memberId, member?.name ?? member?.username ?? member?.label);
+      });
+    }
+
+    if (Array.isArray(activeChat?.messages)) {
+      activeChat.messages.forEach((message: any) => {
+        addMember(message?.fromId, message?.fromName ?? message?.username);
+      });
+    }
+
+    addMember(activeChat?.friendId, activeChat?.friendName);
+    addMember(user?.userId, 'You');
+
+    return Array.from(byId.values());
+  }, [activeChat, isGroupOrChannel, user?.userId]);
+  const groupMemberCount = useMemo(() => {
+    const raw = (activeChat as any)?.memberCount;
+    if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) return raw;
+    return groupMembers.length > 0 ? groupMembers.length : undefined;
+  }, [activeChat, groupMembers.length]);
+  const subtitle = isGroupOrChannel
+    ? (groupMemberCount ? `${groupMemberCount} members` : 'group chat')
+    : (isTyping ? 'typing...' : (isOnline ? 'online' : 'last seen recently'));
   const resolvedWallpaperTheme = useMemo(() => {
     const resolved = resolveThemeVariant(activeWallpaperTheme, effectiveTheme === 'dark');
     const bg = Array.isArray(resolved.backgroundGradient) ? resolved.backgroundGradient : [];
@@ -471,7 +520,7 @@ export default function ChatScreen() {
         engineSurfaceId={surfaceId}
         chatId={effectiveChatId}
         myUserId={user?.userId || undefined}
-        peerUserId={activeChat?.friendId || undefined}
+        peerUserId={isGroupOrChannel ? undefined : (activeChat?.friendId || undefined)}
         statusAuthorityEnabled
         appearance={{
           backgroundMode: 'gradient',
@@ -498,14 +547,25 @@ export default function ChatScreen() {
         headerSubtitle={subtitle}
         profileName={displayName}
         profileHandle={
-          activeChat?.friendName
-            ? `@${activeChat.friendName}`
-            : (activeChat?.friendId ? `id: ${activeChat.friendId}` : subtitle)
+          isGroupOrChannel
+            ? (groupMemberCount ? `${groupMemberCount} members` : subtitle)
+            : (
+                activeChat?.friendName
+                  ? `@${activeChat.friendName}`
+                  : (activeChat?.friendId ? `id: ${activeChat.friendId}` : subtitle)
+              )
         }
         profileBio={activeChat?.description || ''}
-        avatarUri={activeChat?.friendImage || undefined}
+        avatarUri={
+          isGroupOrChannel
+            ? (((activeChat as any)?.avatarUrl as string | undefined) || undefined)
+            : (activeChat?.friendImage || undefined)
+        }
         isOnline={isOnline}
         isChatMuted={activeChat?.muted === true}
+        isGroupOrChannel={isGroupOrChannel}
+        groupMembers={groupMembers}
+        groupMemberCount={groupMemberCount}
         onNativeEvent={handleNativeEvent}
         onNativeError={(error, context) => {
           console.warn('[chat/native-main]', context, error);

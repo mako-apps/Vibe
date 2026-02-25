@@ -138,6 +138,18 @@ class ChatNativeMainModule : Module() {
         view.setIsChatMuted(value ?: false)
       }
 
+      Prop("isGroupOrChannel") { view: ChatMainView, value: Boolean? ->
+        view.setIsGroupOrChannel(value ?: false)
+      }
+
+      Prop("groupMembers") { view: ChatMainView, value: List<Map<String, Any?>>? ->
+        view.setGroupMembers(value ?: emptyList())
+      }
+
+      Prop("groupMemberCount") { view: ChatMainView, value: Int? ->
+        view.setGroupMemberCount(value)
+      }
+
       Prop("page") { view: ChatMainView, value: String? ->
         // Do not coerce null/undefined to "chat". When JS omits the prop,
         // forcing "chat" here fights native page transitions (e.g. avatar -> profile).

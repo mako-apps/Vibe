@@ -5,6 +5,7 @@ import { getNativeChatMainModule, isNativeChatEnabled } from './runtime';
 import type {
   NativeChatAgentConfig,
   NativeChatAppearance,
+  NativeChatGroupMember,
   NativeChatRow,
   NativeReactionFxPayload,
   NativeSendTransitionPayload,
@@ -63,6 +64,8 @@ interface NativeChatMainSurfaceProps {
   isOnline?: boolean;
   isChatMuted?: boolean;
   isGroupOrChannel?: boolean;
+  groupMembers?: NativeChatGroupMember[];
+  groupMemberCount?: number;
   agentConfig?: NativeChatAgentConfig | null;
   page?: NativeChatMainPage;
   onViewportChanged?: (event: { nativeEvent: Record<string, unknown> }) => void;
@@ -97,6 +100,8 @@ export const NativeChatMainSurface = forwardRef<NativeChatMainSurfaceRef, Native
     isOnline,
     isChatMuted,
     isGroupOrChannel,
+    groupMembers,
+    groupMemberCount,
     agentConfig,
     page,
     onViewportChanged,
@@ -207,6 +212,8 @@ export const NativeChatMainSurface = forwardRef<NativeChatMainSurfaceRef, Native
         isOnline={isOnline}
         isChatMuted={isChatMuted}
         isGroupOrChannel={isGroupOrChannel}
+        groupMembers={groupMembers}
+        groupMemberCount={groupMemberCount}
         agentConfig={agentConfig}
         page={page}
         onViewportChanged={(event: any) => {

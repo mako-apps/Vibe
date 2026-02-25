@@ -251,6 +251,7 @@ internal object ChatEngine {
   private val pendingOutboundDraftsByMessageId = linkedMapOf<String, Map<String, Any?>>()
   private val pendingOutboundQueueByChat = linkedMapOf<String, MutableList<String>>()
   private val nativeTypingStateByChatId = linkedMapOf<String, Boolean>()
+  private val peerTypingUserIdsByChatId = linkedMapOf<String, MutableSet<String>>()
   private val nativeRecordingStateByChatId = linkedMapOf<String, Boolean>()
   private val historyRowsByChat = linkedMapOf<String, MutableList<Map<String, Any?>>>()
   private val historyLoadingChats = linkedSetOf<String>()
@@ -496,6 +497,7 @@ internal object ChatEngine {
         pendingOutboundDraftsByMessageId.clear()
         pendingOutboundQueueByChat.clear()
         nativeTypingStateByChatId.clear()
+        peerTypingUserIdsByChatId.clear()
         nativeRecordingStateByChatId.clear()
         historyLoadingChats.clear()
         liveMessageRowsByChat.clear()
@@ -555,6 +557,7 @@ internal object ChatEngine {
       pendingOutboundDraftsByMessageId.clear()
       pendingOutboundQueueByChat.clear()
       nativeTypingStateByChatId.clear()
+      peerTypingUserIdsByChatId.clear()
       nativeRecordingStateByChatId.clear()
       historyRowsByChat.clear()
       historyLoadingChats.clear()
@@ -633,6 +636,7 @@ internal object ChatEngine {
           current <= 1 -> {
             openChatChannels.remove(chatId)
             nativeJoinedChatIds.remove(chatId)
+            peerTypingUserIdsByChatId.remove(chatId)
             phoenixClient?.leave(chatTopic(chatId))
           }
           else -> openChatChannels[chatId] = current - 1
@@ -1362,6 +1366,7 @@ internal object ChatEngine {
         localStatusIndex.remove(chatId)
         pendingOutboundQueueByChat.remove(chatId)
         nativeTypingStateByChatId.remove(chatId)
+        peerTypingUserIdsByChatId.remove(chatId)
         nativeRecordingStateByChatId.remove(chatId)
         chatPeerUserIdsByChatId.remove(chatId)
         openChatChannels.remove(chatId)
@@ -1588,10 +1593,17 @@ internal object ChatEngine {
     }
   }
 
+  fun typingUserIds(chatId: String?): List<String> {
+    val normalizedChatId = normalized(chatId) ?: return emptyList()
+    synchronized(lock) {
+      return peerTypingUserIdsByChatId[normalizedChatId]?.toList()?.sorted() ?: emptyList()
+    }
+  }
+
   fun isTyping(payload: Map<String, Any?>): Boolean {
     val chatId = normalized(payload["chatId"] ?: payload["chat_id"]) ?: return false
     synchronized(lock) {
-      return nativeTypingStateByChatId[chatId] == true
+      return peerTypingUserIdsByChatId[chatId]?.isNotEmpty() == true
     }
   }
 
@@ -2589,6 +2601,7 @@ internal object ChatEngine {
       nativePendingEditPushRefs.clear()
       nativePendingDeletePushRefs.clear()
       nativeTypingStateByChatId.clear()
+      peerTypingUserIdsByChatId.clear()
       nativeRecordingStateByChatId.clear()
       historyLoadingChats.clear()
       liveMessageRowsByChat.clear()
@@ -2615,6 +2628,7 @@ internal object ChatEngine {
       nativePendingEditPushRefs.clear()
       nativePendingDeletePushRefs.clear()
       nativeTypingStateByChatId.clear()
+      peerTypingUserIdsByChatId.clear()
       nativeRecordingStateByChatId.clear()
       historyLoadingChats.clear()
       liveMessageRowsByChat.clear()
@@ -2726,7 +2740,25 @@ internal object ChatEngine {
       if (topic.startsWith("chat:")) {
         val chatId = topic.removePrefix("chat:")
         if (event == "typing" || event == "stop-typing") {
-          emitChangeLocked("peerTyping", chatId, if (event == "typing") "true" else "false")
+          val isTypingEvent = event == "typing"
+          val payloadUserId = normalizedUpper(payload["userId"] ?: payload["user_id"] ?: payload["id"])
+          val myUserId = normalizedUpper(getConfigValueLocked("userId"))
+          if (payloadUserId != null && payloadUserId != myUserId) {
+            val typingUsers = peerTypingUserIdsByChatId.getOrPut(chatId) { linkedSetOf() }
+            if (isTypingEvent) {
+              typingUsers.add(payloadUserId)
+            } else {
+              typingUsers.remove(payloadUserId)
+            }
+            if (typingUsers.isEmpty()) {
+              peerTypingUserIdsByChatId.remove(chatId)
+            }
+          } else if (!isTypingEvent) {
+            peerTypingUserIdsByChatId.remove(chatId)
+          }
+          val isAnyTyping =
+            peerTypingUserIdsByChatId[chatId]?.isNotEmpty() == true || (isTypingEvent && payloadUserId == null)
+          emitChangeLocked("peerTyping", chatId, if (isAnyTyping) "true" else "false")
           return
         }
         if (event == "message") {
@@ -2932,6 +2964,8 @@ internal object ChatEngine {
     out["nativeJoinedChatCount"] = nativeJoinedChatIds.size
     out["outboundDraftCount"] = pendingOutboundDraftsByMessageId.size
     out["outboundQueuedCount"] = pendingOutboundQueueByChat.values.sumOf { it.size }
+    out["typingChatCount"] = peerTypingUserIdsByChatId.size
+    out["typingUserCount"] = peerTypingUserIdsByChatId.values.sumOf { it.size }
     out["journalCount"] = if (ctx != null) ChatEngineStore.getJournal(ctx).size else 0
     return out
   }

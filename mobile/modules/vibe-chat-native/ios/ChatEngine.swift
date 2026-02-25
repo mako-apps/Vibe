@@ -324,6 +324,7 @@ final class ChatEngine {
   private var pendingOutboundDraftsByMessageId: [String: [String: Any]] = [:]
   private var pendingOutboundQueueByChat: [String: [String]] = [:]
   private var nativeTypingStateByChatId: [String: Bool] = [:]
+  private var peerTypingUserIdsByChatId: [String: Set<String>] = [:]
   private var nativeRecordingStateByChatId: [String: Bool] = [:]
   private var historyRowsByChat: [String: [[String: Any]]] = [:]
   private var historyLoadingChats = Set<String>()
@@ -576,6 +577,7 @@ final class ChatEngine {
       pendingOutboundDraftsByMessageId.removeAll()
       pendingOutboundQueueByChat.removeAll()
       nativeTypingStateByChatId.removeAll()
+      peerTypingUserIdsByChatId.removeAll()
       nativeRecordingStateByChatId.removeAll()
       liveMessageRowsByChat.removeAll()
       deletedMessageIdsByChat.removeAll()
@@ -674,6 +676,7 @@ final class ChatEngine {
         if current <= 1 {
           openChatChannels.removeValue(forKey: chatId)
           nativeJoinedChatIds.remove(chatId)
+          peerTypingUserIdsByChatId.removeValue(forKey: chatId)
           if let client = phoenixClient as? ChatPhoenixClient {
             client.leave(topic: chatTopic(for: chatId))
           }
@@ -1584,20 +1587,18 @@ final class ChatEngine {
           "messageId": messageId,
           "ref": ref,
         ])
-      var result: [String: Any] = ["accepted": true, "transport": "native", "ref": ref]
-      if (result["accepted"] as? Bool) == true {
-        _ = applyNativeChatMutationEventLocked(
-          chatId: chatId,
-          event: "message-edited",
-          payload: [
-            "messageId": messageId,
-            "encryptedContent": encryptedContent,
-            "editedAt": editedAt,
-          ]
-        )
-        postChangeLocked(
-          reason: "chatMessageEdited", userInfo: ["chatId": chatId, "messageId": messageId])
-      }
+      let result: [String: Any] = ["accepted": true, "transport": "native", "ref": ref]
+      _ = applyNativeChatMutationEventLocked(
+        chatId: chatId,
+        event: "message-edited",
+        payload: [
+          "messageId": messageId,
+          "encryptedContent": encryptedContent,
+          "editedAt": editedAt,
+        ]
+      )
+      postChangeLocked(
+        reason: "chatMessageEdited", userInfo: ["chatId": chatId, "messageId": messageId])
       return result
     }
   }
@@ -1735,6 +1736,7 @@ final class ChatEngine {
       localStatusIndex.removeValue(forKey: chatId)
       pendingOutboundQueueByChat.removeValue(forKey: chatId)
       nativeTypingStateByChatId.removeValue(forKey: chatId)
+      peerTypingUserIdsByChatId.removeValue(forKey: chatId)
       nativeRecordingStateByChatId.removeValue(forKey: chatId)
       chatPeerUserIdsByChatId.removeValue(forKey: chatId)
       openChatChannels.removeValue(forKey: chatId)
@@ -1964,6 +1966,13 @@ final class ChatEngine {
     }
   }
 
+  func typingUserIds(chatId: String?) -> [String] {
+    guard let chatId = normalizedString(chatId), !chatId.isEmpty else { return [] }
+    return queue.sync {
+      Array(peerTypingUserIdsByChatId[chatId] ?? []).sorted()
+    }
+  }
+
   /// Returns true only if native chat history has been successfully fetched
   /// from the server for this chatId. Used by ChatListView to decide whether
   /// native rows can fully replace JS rows.
@@ -1977,7 +1986,7 @@ final class ChatEngine {
     let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"])
     guard let chatId else { return false }
     return queue.sync {
-      nativeTypingStateByChatId[chatId] == true
+      !(peerTypingUserIdsByChatId[chatId]?.isEmpty ?? true)
     }
   }
 
@@ -2216,6 +2225,8 @@ final class ChatEngine {
     snapshot["nativeJoinedChatCount"] = nativeJoinedChatIds.count
     snapshot["outboundDraftCount"] = pendingOutboundDraftsByMessageId.count
     snapshot["outboundQueuedCount"] = pendingOutboundQueueByChat.values.reduce(0) { $0 + $1.count }
+    snapshot["typingChatCount"] = peerTypingUserIdsByChatId.count
+    snapshot["typingUserCount"] = peerTypingUserIdsByChatId.values.reduce(0) { $0 + $1.count }
     snapshot["journalCount"] = store.getJournal(limit: nil).count
     return snapshot
   }
@@ -2278,6 +2289,7 @@ final class ChatEngine {
         pendingOutboundDraftsByMessageId.removeAll()
         pendingOutboundQueueByChat.removeAll()
         nativeTypingStateByChatId.removeAll()
+        peerTypingUserIdsByChatId.removeAll()
         nativeRecordingStateByChatId.removeAll()
         historyLoadingChats.removeAll()
         liveMessageRowsByChat.removeAll()
@@ -2328,6 +2340,7 @@ final class ChatEngine {
       self.nativePendingEditPushRefs.removeAll()
       self.nativePendingDeletePushRefs.removeAll()
       self.nativeTypingStateByChatId.removeAll()
+      self.peerTypingUserIdsByChatId.removeAll()
       self.nativeRecordingStateByChatId.removeAll()
       self.historyLoadingChats.removeAll()
       self.liveMessageRowsByChat.removeAll()
@@ -2364,6 +2377,7 @@ final class ChatEngine {
       self.nativePendingEditPushRefs.removeAll()
       self.nativePendingDeletePushRefs.removeAll()
       self.nativeTypingStateByChatId.removeAll()
+      self.peerTypingUserIdsByChatId.removeAll()
       self.nativeRecordingStateByChatId.removeAll()
       self.historyLoadingChats.removeAll()
       self.liveMessageRowsByChat.removeAll()
@@ -2517,11 +2531,34 @@ final class ChatEngine {
       if frame.topic.hasPrefix("chat:") {
         let chatId = String(frame.topic.dropFirst(5))
         if frame.event == "typing" || frame.event == "stop-typing" {
+          let typing = frame.event == "typing"
+          let payloadUserId = self.normalizedUpper(
+            frame.payload["userId"] ?? frame.payload["user_id"] ?? frame.payload["id"])
+          let myUserId = self.normalizedUpper(self.getConfigValueLocked("userId"))
+          var typingUsers = self.peerTypingUserIdsByChatId[chatId] ?? Set<String>()
+          if let payloadUserId, payloadUserId != myUserId {
+            if typing {
+              typingUsers.insert(payloadUserId)
+            } else {
+              typingUsers.remove(payloadUserId)
+            }
+            if typingUsers.isEmpty {
+              self.peerTypingUserIdsByChatId.removeValue(forKey: chatId)
+            } else {
+              self.peerTypingUserIdsByChatId[chatId] = typingUsers
+            }
+          } else if !typing {
+            self.peerTypingUserIdsByChatId.removeValue(forKey: chatId)
+            typingUsers.removeAll()
+          }
+          let typingUserIds = Array(typingUsers).sorted()
+          let isAnyTyping = !typingUserIds.isEmpty || (typing && payloadUserId == nil)
           self.postChangeLocked(
             reason: "peerTyping",
             userInfo: [
               "chatId": chatId,
-              "messageId": frame.event == "typing" ? "true" : "false",  // We pass true/false as messageId so both platforms use the same extraction path below.
+              "messageId": isAnyTyping ? "true" : "false",  // Kept for ChatListView compatibility.
+              "typingUserIds": typingUserIds,
             ]
           )
           return
@@ -2625,16 +2662,13 @@ final class ChatEngine {
       }
       return false
     case "presence_state":
-      if let map = payload as? [String: Any] {
-        let ids = map.keys.compactMap { normalizedUpper($0) }
-        onlineUsers = Set(ids)
-        for userId in ids {
-          lastSeenByUserId.removeValue(forKey: userId)
-        }
-        appendJournalLocked(event: "native-presence-state", payload: ["count": ids.count])
-        return true
+      let ids = payload.keys.compactMap { normalizedUpper($0) }
+      onlineUsers = Set(ids)
+      for userId in ids {
+        lastSeenByUserId.removeValue(forKey: userId)
       }
-      return false
+      appendJournalLocked(event: "native-presence-state", payload: ["count": ids.count])
+      return true
     case "presence_diff", "presence-diff":
       let joins = payload["joins"] as? [String: Any] ?? [:]
       let leaves = payload["leaves"] as? [String: Any] ?? [:]

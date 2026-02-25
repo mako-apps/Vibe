@@ -169,6 +169,10 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
   private var profileNameText: String = "User"
   private var profileHandleText: String = ""
   private var profileBioText: String = ""
+  private var groupMemberDisplayNameByUserId: [String: String] = [:]
+  private var groupMemberOrder: [String] = []
+  private var groupMemberCount: Int?
+  private var groupTypingUserIds: [String] = []
   private var avatarUri: String = ""
   private var isChatMuted = false
   private var engineChatId: String = ""
@@ -259,6 +263,7 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
   func setEngineChatId(_ value: String) {
     engineChatId = value.trimmingCharacters(in: .whitespacesAndNewlines)
     chatListView.setEngineChatId(value)
+    refreshTypingStateFromEngine(force: true)
     refreshProfileSummaryFromEngine(force: true)
   }
 
@@ -276,6 +281,7 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
       return
     }
     refreshPresenceStateFromEngine(force: true)
+    refreshTypingStateFromEngine(force: true)
   }
 
   func setStatusAuthorityEnabled(_ enabled: Bool) {
@@ -364,6 +370,45 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
 
   func setProfileBio(_ value: String) {
     profileBioText = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    updateProfileTexts()
+  }
+
+  func setGroupMembers(_ rawMembers: [[String: Any]]) {
+    var nextNamesByUserId: [String: String] = [:]
+    var nextOrder: [String] = []
+    for raw in rawMembers {
+      let rawId =
+        (raw["userId"] as? String)
+        ?? (raw["id"] as? String)
+        ?? (raw["memberId"] as? String)
+      let trimmedId = rawId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      guard !trimmedId.isEmpty else { continue }
+      let normalizedId = trimmedId.uppercased()
+      let rawName =
+        (raw["name"] as? String)
+        ?? (raw["username"] as? String)
+        ?? (raw["label"] as? String)
+        ?? trimmedId
+      let displayName = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+      if nextNamesByUserId[normalizedId] == nil {
+        nextOrder.append(normalizedId)
+      }
+      nextNamesByUserId[normalizedId] = displayName.isEmpty ? trimmedId : displayName
+    }
+    groupMemberDisplayNameByUserId = nextNamesByUserId
+    groupMemberOrder = nextOrder
+    refreshTypingStateFromEngine(force: true)
+    updateHeaderTexts()
+    updateProfileTexts()
+  }
+
+  func setGroupMemberCount(_ value: Int?) {
+    if let value {
+      groupMemberCount = max(0, value)
+    } else {
+      groupMemberCount = nil
+    }
+    updateHeaderTexts()
     updateProfileTexts()
   }
 
@@ -663,6 +708,7 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
       return
     }
     refreshPresenceStateFromEngine()
+    refreshTypingStateFromEngine()
     guard !engineChatId.isEmpty else { return }
     if let changedChatIdRaw = notification.userInfo?["chatId"] as? String,
       !changedChatIdRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -682,6 +728,29 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
     else { return }
     isOnline = nextOnline
     engineLastSeenTimestampMs = nextLastSeen
+    updateHeaderTexts()
+    updateProfileTexts()
+  }
+
+  private func refreshTypingStateFromEngine(force: Bool = false) {
+    guard isGroupOrChannel else {
+      guard force || !groupTypingUserIds.isEmpty else { return }
+      groupTypingUserIds = []
+      updateHeaderTexts()
+      updateProfileTexts()
+      return
+    }
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !chatId.isEmpty else {
+      guard force || !groupTypingUserIds.isEmpty else { return }
+      groupTypingUserIds = []
+      updateHeaderTexts()
+      updateProfileTexts()
+      return
+    }
+    let next = ChatEngine.shared.typingUserIds(chatId: chatId)
+    guard force || next != groupTypingUserIds else { return }
+    groupTypingUserIds = next
     updateHeaderTexts()
     updateProfileTexts()
   }
@@ -1489,8 +1558,9 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
     profileUsernameRow.frame = CGRect(
       x: 0.0, y: 0.0, width: profileIdentityCard.bounds.width, height: 62.0)
 
-    let hasBioRow = !profileBioText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    if hasBioRow {
+    let showsSecondaryIdentityRow =
+      isGroupOrChannel || !profileBioText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    if showsSecondaryIdentityRow {
       profileBioRow.isHidden = false
       profileBioRow.frame = CGRect(
         x: 0.0, y: profileUsernameRow.frame.maxY, width: profileIdentityCard.bounds.width,
@@ -1650,11 +1720,12 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
     let accentColor =
       appearance.bubbleMeGradient.first ?? UIColor(red: 0.49, green: 0.36, blue: 0.88, alpha: 1.0)
     profileAgentPromptNode.applyTheme(
-      textColor: primaryText,
-      secondaryTextColor: secondaryText,
+      textColor: text,
+      secondaryTextColor: secondary,
       surfaceColor: cardBg,
       accentColor: accentColor
     )
+  }
 
   private func applyProfileWallpaperAppearance() {
     profileWallpaperLayer.colors = appearance.wallpaperGradient.map(\.cgColor)
@@ -1742,11 +1813,14 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
 
   private func updateHeaderTexts() {
     let resolvedTitle = chatTitleText.isEmpty ? "Chat" : chatTitleText
+    let groupTypingSubtitle = resolvedGroupTypingSubtitle()
     let engineSubtitle = resolvedEnginePresenceSubtitle()
     let trimmedSubtitle = chatSubtitleText.trimmingCharacters(in: .whitespacesAndNewlines)
     let subtitleLower = trimmedSubtitle.lowercased()
     let resolvedSubtitle: String
-    if let engineSubtitle {
+    if let groupTypingSubtitle {
+      resolvedSubtitle = groupTypingSubtitle
+    } else if let engineSubtitle {
       resolvedSubtitle = engineSubtitle
     } else if isOnline
       && (trimmedSubtitle.isEmpty || subtitleLower.hasPrefix("last seen")
@@ -1759,9 +1833,9 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
     chatTitleLabel.text = resolvedTitle
     chatSubtitleLabel.text = resolvedSubtitle
     profileTitleLabel.text = profileNameText.isEmpty ? resolvedTitle : profileNameText
-    profileSubtitleLabel.text = "Profile"
+    profileSubtitleLabel.text = isGroupOrChannel ? "Group Profile" : "Profile"
     chatSubtitleLabel.textColor =
-      isOnline
+      (groupTypingSubtitle != nil || isOnline)
       ? UIColor(red: 83.0 / 255.0, green: 224.0 / 255.0, blue: 138.0 / 255.0, alpha: 1.0)
       : appearance.timeColorThem.withAlphaComponent(0.85)
   }
@@ -1769,41 +1843,118 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
   private func updateProfileTexts() {
     let resolvedTitle = chatTitleText.isEmpty ? "Chat" : chatTitleText
     profileNameLabel.text = profileNameText.isEmpty ? resolvedTitle : profileNameText
-    let fallbackHandle = resolvedEnginePresenceSubtitle() ?? (isOnline ? "online" : "offline")
-    profileHandleLabel.text =
-      profileHandleText.isEmpty ? fallbackHandle : profileHandleText
+    if isGroupOrChannel {
+      let fallbackGroupHandle: String = {
+        let count = resolvedGroupMemberCount()
+        if count > 0 { return "\(count) members" }
+        return "group chat"
+      }()
+      profileHandleLabel.text = profileHandleText.isEmpty ? fallbackGroupHandle : profileHandleText
+    } else {
+      let fallbackHandle = resolvedEnginePresenceSubtitle() ?? (isOnline ? "online" : "offline")
+      profileHandleLabel.text =
+        profileHandleText.isEmpty ? fallbackHandle : profileHandleText
+    }
     profileBioLabel.text = profileBioText
     profileBioLabel.isHidden =
       profileBioText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     profileMuteButton.setTitle(isChatMuted ? "Unmute" : "Mute")
 
-    let usernameRowSubtitle: String
-    if profileHandleText.isEmpty {
-      usernameRowSubtitle = "@\(resolvedTitle.replacingOccurrences(of: " ", with: "").lowercased())"
-    } else if profileHandleText.lowercased().hasPrefix("id:") {
-      usernameRowSubtitle = profileHandleText
-    } else if profileHandleText.hasPrefix("@") {
-      usernameRowSubtitle = profileHandleText
+    if isGroupOrChannel {
+      profileUsernameRow.configure(
+        title: "Members",
+        subtitle: resolvedGroupMembersRowSubtitle(),
+        titleColor: appearance.bubbleMeGradient.last ?? appearance.textColorMe,
+        showsSeparator: true
+      )
+      profileBioRow.configure(
+        title: "Typing",
+        subtitle: resolvedGroupTypingSubtitle() ?? "No one typing right now",
+        titleColor: nil,
+        showsSeparator: false
+      )
     } else {
-      usernameRowSubtitle = "@\(profileHandleText)"
+      let usernameRowSubtitle: String
+      if profileHandleText.isEmpty {
+        usernameRowSubtitle = "@\(resolvedTitle.replacingOccurrences(of: " ", with: "").lowercased())"
+      } else if profileHandleText.lowercased().hasPrefix("id:") {
+        usernameRowSubtitle = profileHandleText
+      } else if profileHandleText.hasPrefix("@") {
+        usernameRowSubtitle = profileHandleText
+      } else {
+        usernameRowSubtitle = "@\(profileHandleText)"
+      }
+      let hasBioRow = !profileBioText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      profileUsernameRow.configure(
+        title: "Username",
+        subtitle: usernameRowSubtitle,
+        titleColor: appearance.bubbleMeGradient.last ?? appearance.textColorMe,
+        showsSeparator: hasBioRow
+      )
+      profileBioRow.configure(
+        title: "Bio",
+        subtitle: hasBioRow ? profileBioText : "No bio",
+        titleColor: nil,
+        showsSeparator: false
+      )
     }
-    let hasBioRow = !profileBioText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    profileUsernameRow.configure(
-      title: "Username",
-      subtitle: usernameRowSubtitle,
-      titleColor: appearance.bubbleMeGradient.last ?? appearance.textColorMe,
-      showsSeparator: hasBioRow
-    )
-    profileBioRow.configure(
-      title: "Bio",
-      subtitle: hasBioRow ? profileBioText : "No bio",
-      titleColor: nil,
-      showsSeparator: false
-    )
 
     rebuildProfileTabs()
     profileTabContentNeedsReload = true
     setNeedsLayout()
+  }
+
+  private func resolvedGroupMemberCount() -> Int {
+    if let groupMemberCount, groupMemberCount > 0 { return groupMemberCount }
+    return Set(groupMemberOrder + groupTypingUserIds.map { $0.uppercased() }).count
+  }
+
+  private func resolvedGroupMemberDisplayName(_ normalizedUserId: String) -> String {
+    if let explicit = groupMemberDisplayNameByUserId[normalizedUserId],
+      !explicit.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    {
+      return explicit
+    }
+    if !enginePeerUserId.isEmpty, normalizedUserId == enginePeerUserId, !profileNameText.isEmpty {
+      return profileNameText
+    }
+    if normalizedUserId.count > 8 {
+      return String(normalizedUserId.prefix(8))
+    }
+    return normalizedUserId
+  }
+
+  private func resolvedGroupTypingSubtitle() -> String? {
+    let normalizedTypingUsers = Array(Set(groupTypingUserIds.map { $0.uppercased() })).sorted()
+    guard !normalizedTypingUsers.isEmpty else { return nil }
+    let names = normalizedTypingUsers.map { resolvedGroupMemberDisplayName($0) }
+    if names.count == 1 {
+      return "\(names[0]) typing..."
+    }
+    if names.count == 2 {
+      return "\(names[0]) and \(names[1]) typing..."
+    }
+    let head = names.prefix(2).joined(separator: ", ")
+    return "\(head) +\(names.count - 2) typing..."
+  }
+
+  private func resolvedGroupMembersRowSubtitle() -> String {
+    var seen = Set<String>()
+    var orderedUserIds: [String] = []
+    for rawId in groupMemberOrder {
+      let normalized = rawId.uppercased()
+      if seen.insert(normalized).inserted {
+        orderedUserIds.append(normalized)
+      }
+    }
+    let labels = orderedUserIds.map { resolvedGroupMemberDisplayName($0) }
+    let totalCount = max(resolvedGroupMemberCount(), labels.count)
+    guard !labels.isEmpty else {
+      return totalCount > 0 ? "\(totalCount) members" : "No members"
+    }
+    let shown = labels.prefix(5)
+    let suffix = labels.count > shown.count ? " +\(labels.count - shown.count)" : ""
+    return "\(totalCount) members: \(shown.joined(separator: ", "))\(suffix)"
   }
 
   private func resolvedEnginePresenceSubtitle() -> String? {
@@ -1992,6 +2143,9 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
   func setIsGroupOrChannel(_ value: Bool) {
     isGroupOrChannel = value
     refreshAgentCardVisibility()
+    refreshTypingStateFromEngine(force: true)
+    updateHeaderTexts()
+    updateProfileTexts()
   }
 
   func setAgentConfig(_ config: [String: Any]?) {

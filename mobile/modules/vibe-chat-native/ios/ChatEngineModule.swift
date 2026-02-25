@@ -123,7 +123,7 @@ public final class ChatEngineModule: Module {
     // Shadow-mode bridge until native Phoenix transport is enabled.
     Function("setPresenceSnapshot") { (payload: [String: Any]) in
       let userIds = (payload["userIds"] as? [String]) ?? []
-      ChatEngine.shared.setPresenceSnapshot(userIds: userIds)
+      _ = ChatEngine.shared.setPresenceSnapshot(userIds: userIds)
     }
   }
 }

@@ -78,6 +78,11 @@ class ChatMainView(
   private var profileName: String = "User"
   private var profileHandle: String = ""
   private var profileBio: String = ""
+  private var isGroupOrChannel: Boolean = false
+  private var groupMemberDisplayNameByUserId: LinkedHashMap<String, String> = linkedMapOf()
+  private var groupMemberOrder: MutableList<String> = mutableListOf()
+  private var groupMemberCount: Int? = null
+  private var groupTypingUserIds: List<String> = emptyList()
   private var avatarUri: String = ""
   private var isOnline: Boolean = false
   private var isChatMuted: Boolean = false
@@ -126,6 +131,7 @@ class ChatMainView(
     super.onAttachedToWindow()
     registerChatEngineListener()
     refreshPresenceFromEngine(force = true)
+    refreshTypingStateFromEngine(force = true)
   }
 
   fun setSurfaceId(value: String) {
@@ -153,6 +159,7 @@ class ChatMainView(
     engineChatId = value.trim()
     chatListView.setEngineChatId(value)
     registerChatEngineListener()
+    refreshTypingStateFromEngine(force = true)
     refreshProfileSummaryFromEngine(force = true)
   }
 
@@ -171,6 +178,7 @@ class ChatMainView(
     }
     registerChatEngineListener()
     refreshPresenceFromEngine(force = true)
+    refreshTypingStateFromEngine(force = true)
   }
 
   fun setStatusAuthorityEnabled(enabled: Boolean) {
@@ -236,6 +244,46 @@ class ChatMainView(
 
   fun setProfileBio(value: String) {
     profileBio = value.trim()
+    updateProfileTexts()
+  }
+
+  fun setIsGroupOrChannel(value: Boolean) {
+    isGroupOrChannel = value
+    refreshTypingStateFromEngine(force = true)
+    updateHeaderTexts()
+    updateProfileTexts()
+  }
+
+  fun setGroupMembers(rawMembers: List<Map<String, Any?>>) {
+    val nextNamesByUserId = linkedMapOf<String, String>()
+    val nextOrder = mutableListOf<String>()
+    rawMembers.forEach { raw ->
+      val rawId =
+        normalized(raw["userId"] ?: raw["id"] ?: raw["memberId"])
+          ?.trim()
+          ?.takeIf { it.isNotEmpty() }
+          ?: return@forEach
+      val normalizedId = rawId.uppercase(Locale.ROOT)
+      val displayName =
+        normalized(raw["name"] ?: raw["username"] ?: raw["label"])
+          ?.trim()
+          ?.takeIf { it.isNotEmpty() }
+          ?: rawId
+      if (!nextNamesByUserId.containsKey(normalizedId)) {
+        nextOrder.add(normalizedId)
+      }
+      nextNamesByUserId[normalizedId] = displayName
+    }
+    groupMemberDisplayNameByUserId = nextNamesByUserId
+    groupMemberOrder = nextOrder
+    refreshTypingStateFromEngine(force = true)
+    updateHeaderTexts()
+    updateProfileTexts()
+  }
+
+  fun setGroupMemberCount(value: Int?) {
+    groupMemberCount = value?.coerceAtLeast(0)
+    updateHeaderTexts()
     updateProfileTexts()
   }
 
@@ -321,6 +369,7 @@ class ChatMainView(
     ChatEngine.setListener(engineListenerId) { _, _, _ ->
       post {
         refreshPresenceFromEngine()
+        refreshTypingStateFromEngine()
         refreshProfileSummaryFromEngine()
       }
     }
@@ -335,6 +384,29 @@ class ChatMainView(
     }
     isOnline = nextOnline
     engineLastSeenTimestampMs = nextLastSeen
+    updateHeaderTexts()
+    updateProfileTexts()
+  }
+
+  private fun refreshTypingStateFromEngine(force: Boolean = false) {
+    if (!isGroupOrChannel) {
+      if (!force && groupTypingUserIds.isEmpty()) return
+      groupTypingUserIds = emptyList()
+      updateHeaderTexts()
+      updateProfileTexts()
+      return
+    }
+    val chatId = engineChatId.trim()
+    if (chatId.isBlank()) {
+      if (!force && groupTypingUserIds.isEmpty()) return
+      groupTypingUserIds = emptyList()
+      updateHeaderTexts()
+      updateProfileTexts()
+      return
+    }
+    val next = ChatEngine.typingUserIds(chatId)
+    if (!force && next == groupTypingUserIds) return
+    groupTypingUserIds = next
     updateHeaderTexts()
     updateProfileTexts()
   }
@@ -744,6 +816,8 @@ class ChatMainView(
   }
 
   private fun applyTheme() {
+    val hasGroupTyping = isGroupOrChannel && groupTypingUserIds.isNotEmpty()
+    val shouldHighlightStatus = hasGroupTyping || isOnline
     chatHeader.setBackgroundColor(withAlpha(headerBackgroundColor, 0.95f))
     profileHeader.background = roundedShape(withAlpha(surfaceColor, 0.84f), dp(20))
     profilePage.setBackgroundColor(profileBackgroundColor)
@@ -758,12 +832,14 @@ class ChatMainView(
     chatMenuButton.setColorFilter(textColor)
     profileBackButton.setTextColor(textColor)
     chatTitleView.setTextColor(textColor)
-    chatSubtitleView.setTextColor(if (isOnline) Color.parseColor("#53E08A") else secondaryTextColor)
+    chatSubtitleView.setTextColor(if (shouldHighlightStatus) Color.parseColor("#53E08A") else secondaryTextColor)
     profileHeaderTitle.setTextColor(textColor)
     chatAvatarFallback.setTextColor(textColor)
     profileAvatarFallback.setTextColor(textColor)
     profileNameView.setTextColor(textColor)
-    profileHandleView.setTextColor(if (isOnline) Color.parseColor("#53E08A") else secondaryTextColor)
+    profileHandleView.setTextColor(
+      if (hasGroupTyping || (!isGroupOrChannel && isOnline)) Color.parseColor("#53E08A")
+      else secondaryTextColor)
     profileBioView.setTextColor(secondaryTextColor)
     profileInfoTitle.setTextColor(textColor)
     profileInfoSubtitle.setTextColor(secondaryTextColor)
@@ -771,15 +847,24 @@ class ChatMainView(
 
   private fun updateHeaderTexts() {
     val resolvedTitle = if (headerTitle.isBlank()) "Chat" else headerTitle
+    val groupTypingSubtitle = resolvedGroupTypingSubtitle()
     val engineSubtitle = resolveEnginePresenceSubtitle()
     val jsSubtitle = headerSubtitle.trim()
     val jsSubtitleLower = jsSubtitle.lowercase(Locale.ROOT)
+    val groupFallbackSubtitle =
+      if (isGroupOrChannel && jsSubtitle.isBlank()) {
+        val count = resolvedGroupMemberCount()
+        if (count > 0) "$count members" else "group chat"
+      } else {
+        jsSubtitle
+      }
     val resolvedSubtitle =
-      engineSubtitle
+      groupTypingSubtitle
+        ?: engineSubtitle
         ?: if (isOnline && (jsSubtitle.isBlank() || jsSubtitleLower.startsWith("last seen") || jsSubtitleLower == "offline")) {
           "online"
         } else {
-          jsSubtitle
+          groupFallbackSubtitle
         }
     chatTitleView.text = resolvedTitle
     chatSubtitleView.text = resolvedSubtitle
@@ -789,26 +874,100 @@ class ChatMainView(
   private fun updateProfileTexts() {
     val resolvedTitle = if (profileName.isBlank()) if (headerTitle.isBlank()) "User" else headerTitle else profileName
     profileNameView.text = resolvedTitle
-    val fallbackHandle = resolveEnginePresenceSubtitle() ?: if (isOnline) "online" else "offline"
-    profileHandleView.text = if (profileHandle.isBlank()) fallbackHandle else profileHandle
+    if (isGroupOrChannel) {
+      val count = resolvedGroupMemberCount()
+      val fallbackHandle = if (count > 0) "$count members" else "group chat"
+      profileHandleView.text = if (profileHandle.isBlank()) fallbackHandle else profileHandle
+    } else {
+      val fallbackHandle = resolveEnginePresenceSubtitle() ?: if (isOnline) "online" else "offline"
+      profileHandleView.text = if (profileHandle.isBlank()) fallbackHandle else profileHandle
+    }
     profileBioView.text =
       if (profileBio.isBlank()) "Shared media, links and pinned messages will appear here." else profileBio
     val initial = resolvedTitle.trim().firstOrNull()?.uppercase() ?: "U"
     chatAvatarFallback.text = initial
     profileAvatarFallback.text = initial
-    profileInfoTitle.text = "Shared Content"
-    profileInfoSubtitle.text =
-      if (profileSummaryHistoryLoaded) {
-        val base =
-          "Media $profileSummaryMediaCount • Files $profileSummaryFileCount • Links $profileSummaryLinkCount\n$profileSummaryMessageCount cached messages available natively."
-        if (profileSummaryRecentFiles.isNotEmpty()) {
-          "$base\nRecent files: ${profileSummaryRecentFiles.joinToString(", ")}"
+    if (isGroupOrChannel) {
+      profileInfoTitle.text = "Members"
+      val members = resolvedGroupMembersSubtitle()
+      val typing = resolvedGroupTypingSubtitle() ?: "No one typing right now"
+      profileInfoSubtitle.text = "$members\n$typing"
+    } else {
+      profileInfoTitle.text = "Shared Content"
+      profileInfoSubtitle.text =
+        if (profileSummaryHistoryLoaded) {
+          val base =
+            "Media $profileSummaryMediaCount • Files $profileSummaryFileCount • Links $profileSummaryLinkCount\n$profileSummaryMessageCount cached messages available natively."
+          if (profileSummaryRecentFiles.isNotEmpty()) {
+            "$base\nRecent files: ${profileSummaryRecentFiles.joinToString(", ")}"
+          } else {
+            base
+          }
         } else {
-          base
+          "Loading shared media and files from native encrypted cache..."
         }
-      } else {
-        "Loading shared media and files from native encrypted cache..."
+    }
+  }
+
+  private fun resolvedGroupMemberCount(): Int {
+    val explicit = groupMemberCount ?: 0
+    return if (explicit > 0) explicit else groupMemberOrder.toSet().size
+  }
+
+  private fun resolvedGroupMemberDisplayName(normalizedUserId: String): String {
+    val explicit = groupMemberDisplayNameByUserId[normalizedUserId]
+      ?.trim()
+      ?.takeIf { it.isNotEmpty() }
+    if (explicit != null) return explicit
+    if (enginePeerUserId.isNotBlank() && enginePeerUserId == normalizedUserId && profileName.isNotBlank()) {
+      return profileName
+    }
+    return if (normalizedUserId.length > 8) normalizedUserId.take(8) else normalizedUserId
+  }
+
+  private fun resolvedGroupTypingSubtitle(): String? {
+    val normalizedUsers =
+      groupTypingUserIds
+        .map { it.uppercase(Locale.ROOT) }
+        .distinct()
+    if (normalizedUsers.isEmpty()) return null
+    val names = normalizedUsers.map { resolvedGroupMemberDisplayName(it) }
+    return when (names.size) {
+      1 -> "${names[0]} typing..."
+      2 -> "${names[0]} and ${names[1]} typing..."
+      else -> "${names[0]}, ${names[1]} +${names.size - 2} typing..."
+    }
+  }
+
+  private fun resolvedGroupMembersSubtitle(): String {
+    val seen = linkedSetOf<String>()
+    val orderedUserIds = mutableListOf<String>()
+    groupMemberOrder.forEach { rawId ->
+      val normalized = rawId.uppercase(Locale.ROOT)
+      if (seen.add(normalized)) {
+        orderedUserIds.add(normalized)
       }
+    }
+    val labels =
+      orderedUserIds
+        .map { resolvedGroupMemberDisplayName(it) }
+        .filter { it.isNotBlank() }
+    val totalCount = max(resolvedGroupMemberCount(), labels.size)
+    if (labels.isEmpty()) {
+      return if (totalCount > 0) "$totalCount members" else "No members"
+    }
+    val shown = labels.take(5)
+    val suffix = if (labels.size > shown.size) " +${labels.size - shown.size}" else ""
+    return "$totalCount members: ${shown.joinToString(", ")}$suffix"
+  }
+
+  private fun normalized(value: Any?): String? {
+    return when (value) {
+      is String -> value
+      is Number -> value.toString()
+      is Boolean -> value.toString()
+      else -> null
+    }
   }
 
   private fun resolveEnginePresenceSubtitle(): String? {

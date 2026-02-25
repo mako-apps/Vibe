@@ -150,6 +150,14 @@ public class ChatNativeMainModule: Module {
         view.setIsGroupOrChannel(value ?? false)
       }
 
+      Prop("groupMembers") { (view: ChatMainView, value: [[String: Any]]?) in
+        view.setGroupMembers(value ?? [])
+      }
+
+      Prop("groupMemberCount") { (view: ChatMainView, value: Int?) in
+        view.setGroupMemberCount(value)
+      }
+
       Prop("agentConfig") { (view: ChatMainView, value: [String: Any]?) in
         view.setAgentConfig(value)
       }

@@ -147,6 +147,11 @@ export interface NativeChatAgentConfig {
   avatar_url?: string;
 }
 
+export interface NativeChatGroupMember {
+  userId: string;
+  name?: string;
+}
+
 export interface NativeChatMainModule {
   isSupported?: () => boolean;
   supportsNativeMain?: () => boolean;
