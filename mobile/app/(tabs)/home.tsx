@@ -22,7 +22,6 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { BlurView } from 'expo-blur'
 import { Animated as RNAnimated } from 'react-native'
 import Animated, { cancelAnimation, useAnimatedStyle, useSharedValue, withTiming, withSpring, interpolate, Easing, withRepeat, withSequence, FadeIn, FadeOut, useAnimatedScrollHandler, useAnimatedReaction, Extrapolate, useDerivedValue, runOnJS, LinearTransition } from 'react-native-reanimated'
-import ThemeBackground from '../../src/components/ThemeBackground'
 import MainMenuModal from '../../src/components/chat/MainMenuModal'
 import ConnectionModal, { ConnectionModalRef } from '../../src/components/settings/ConnectionModal'
 import ChatPreviewModal from '../../src/components/chat/ChatPreviewModal'
@@ -850,7 +849,7 @@ export default function HomeScreen({ onChatSelect, onOpenStoryCamera }: HomeScre
     }))
 
     return (
-        <View style={[styles.container, { backgroundColor: '#000' }]}>
+        <View style={[styles.container, { backgroundColor: 'transparent' }]}>
             <Stack.Screen options={{ headerShown: false }} />
 
             {/* Main Content Layer (Scales/Translates) */}

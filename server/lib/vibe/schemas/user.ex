@@ -69,6 +69,7 @@ defmodule Vibe.Accounts.User do
       :profile_image, :push_token, :signed_pre_key_id, :signed_pre_key, :signed_pre_key_signature,
       :supports_advanced, :phone_number, :tier, :referral_code, :referral_count,
       :business_profile_enabled, :auto_reply_enabled, :auto_reply_message,
+      :last_seen,
       :business_hours_start, :business_hours_end, :show_last_seen, :show_online_status,
       :bio, :auto_delete_timer, :privacy_forward, :privacy_calls,
       :privacy_phone_number, :privacy_profile_photos, :privacy_bio, :privacy_gifts, :privacy_birthday,

@@ -10,173 +10,6 @@ private struct ChatNativeTabItem {
   let isVibe: Bool
 }
 
-private final class ChatNativeTabButton: UIControl {
-  private let pressedOverlayView = UIView()
-  private let contentStack = UIStackView()
-  private let iconContainer = UIView()
-  private let iconView = UIImageView()
-  private let badgeContainer = UIView()
-  private let badgeLabel = UILabel()
-  private let titleLabelView = UILabel()
-  private let pressedOverlayColor = UIColor(white: 1.0, alpha: 0.08)
-
-  private(set) var tabIndex: Int = 0
-
-  override init(frame: CGRect) {
-    super.init(frame: frame)
-    setup()
-  }
-
-  required init?(coder: NSCoder) {
-    super.init(coder: coder)
-    setup()
-  }
-
-  private func setup() {
-    backgroundColor = .clear
-    translatesAutoresizingMaskIntoConstraints = false
-
-    pressedOverlayView.translatesAutoresizingMaskIntoConstraints = false
-    pressedOverlayView.backgroundColor = pressedOverlayColor
-    pressedOverlayView.layer.cornerCurve = .continuous
-    pressedOverlayView.layer.cornerRadius = 14
-    pressedOverlayView.alpha = 0
-    pressedOverlayView.isUserInteractionEnabled = false
-    addSubview(pressedOverlayView)
-
-    NSLayoutConstraint.activate([
-      pressedOverlayView.topAnchor.constraint(equalTo: topAnchor, constant: 2),
-      pressedOverlayView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -2),
-      pressedOverlayView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2),
-      pressedOverlayView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -2),
-    ])
-
-    contentStack.axis = .vertical
-    contentStack.alignment = .center
-    contentStack.distribution = .fill
-    contentStack.spacing = 3
-    contentStack.isUserInteractionEnabled = false
-    contentStack.translatesAutoresizingMaskIntoConstraints = false
-    addSubview(contentStack)
-
-    NSLayoutConstraint.activate([
-      contentStack.topAnchor.constraint(equalTo: topAnchor, constant: 6),
-      contentStack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -6),
-      contentStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
-      contentStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
-    ])
-
-    iconContainer.translatesAutoresizingMaskIntoConstraints = false
-    iconContainer.isUserInteractionEnabled = false
-    NSLayoutConstraint.activate([
-      iconContainer.widthAnchor.constraint(equalToConstant: 30),
-      iconContainer.heightAnchor.constraint(equalToConstant: 30),
-    ])
-    contentStack.addArrangedSubview(iconContainer)
-
-    iconView.translatesAutoresizingMaskIntoConstraints = false
-    iconView.isUserInteractionEnabled = false
-    iconView.contentMode = .scaleAspectFit
-    iconView.preferredSymbolConfiguration = UIImage.SymbolConfiguration(
-      pointSize: 22, weight: .semibold)
-    iconContainer.addSubview(iconView)
-    NSLayoutConstraint.activate([
-      iconView.centerXAnchor.constraint(equalTo: iconContainer.centerXAnchor),
-      iconView.centerYAnchor.constraint(equalTo: iconContainer.centerYAnchor),
-      iconView.widthAnchor.constraint(equalToConstant: 24),
-      iconView.heightAnchor.constraint(equalToConstant: 24),
-    ])
-
-    badgeContainer.translatesAutoresizingMaskIntoConstraints = false
-    badgeContainer.isUserInteractionEnabled = false
-    badgeContainer.backgroundColor = UIColor(red: 0.94, green: 0.27, blue: 0.27, alpha: 1.0)
-    badgeContainer.layer.cornerRadius = 9
-    badgeContainer.layer.masksToBounds = true
-    iconContainer.addSubview(badgeContainer)
-    NSLayoutConstraint.activate([
-      badgeContainer.leadingAnchor.constraint(greaterThanOrEqualTo: iconContainer.centerXAnchor),
-      badgeContainer.centerYAnchor.constraint(equalTo: iconContainer.topAnchor, constant: 4),
-      badgeContainer.heightAnchor.constraint(equalToConstant: 18),
-      badgeContainer.widthAnchor.constraint(greaterThanOrEqualToConstant: 18),
-    ])
-
-    badgeLabel.translatesAutoresizingMaskIntoConstraints = false
-    badgeLabel.isUserInteractionEnabled = false
-    badgeLabel.font = UIFont.systemFont(ofSize: 10, weight: .bold)
-    badgeLabel.textColor = .white
-    badgeLabel.textAlignment = .center
-    badgeContainer.addSubview(badgeLabel)
-    NSLayoutConstraint.activate([
-      badgeLabel.leadingAnchor.constraint(equalTo: badgeContainer.leadingAnchor, constant: 4),
-      badgeLabel.trailingAnchor.constraint(equalTo: badgeContainer.trailingAnchor, constant: -4),
-      badgeLabel.topAnchor.constraint(equalTo: badgeContainer.topAnchor, constant: 1),
-      badgeLabel.bottomAnchor.constraint(equalTo: badgeContainer.bottomAnchor, constant: -1),
-    ])
-
-    titleLabelView.font = UIFont.systemFont(ofSize: 11, weight: .semibold)
-    titleLabelView.textAlignment = .center
-    titleLabelView.numberOfLines = 1
-    titleLabelView.isUserInteractionEnabled = false
-    contentStack.addArrangedSubview(titleLabelView)
-
-    badgeContainer.isHidden = true
-  }
-
-  override var isHighlighted: Bool {
-    didSet {
-      let isPressed = isHighlighted
-      let scale: CGFloat = isPressed ? 0.96 : 1.0
-      let duration: TimeInterval = isPressed ? 0.1 : 0.22
-      let damping: CGFloat = isPressed ? 1.0 : 0.72
-
-      UIView.animate(
-        withDuration: duration,
-        delay: 0,
-        usingSpringWithDamping: damping,
-        initialSpringVelocity: 0.25,
-        options: [.curveEaseOut, .allowUserInteraction, .beginFromCurrentState]
-      ) {
-        self.iconView.transform = CGAffineTransform(scaleX: scale, y: scale)
-        self.alpha = isPressed ? 0.7 : 1.0
-        self.pressedOverlayView.alpha = isPressed ? 1.0 : 0
-      }
-    }
-  }
-
-  func apply(
-    item: ChatNativeTabItem,
-    index: Int,
-    focused: Bool,
-    resolvedIcon: UIImage?,
-    activeTintColor: UIColor,
-    inactiveTintColor: UIColor
-  ) {
-    tabIndex = index
-
-    if let resolvedIcon {
-      iconView.image = resolvedIcon.withRenderingMode(.alwaysTemplate)
-      iconView.tintColor = focused ? activeTintColor : inactiveTintColor
-      iconView.alpha = 1.0
-    } else {
-      let iconName = item.sfSymbol ?? "circle"
-      iconView.image = UIImage(systemName: iconName)
-      iconView.tintColor = focused ? activeTintColor : inactiveTintColor
-      iconView.alpha = 1.0
-    }
-
-    titleLabelView.text = item.title
-    titleLabelView.textColor = focused ? activeTintColor : inactiveTintColor
-
-    if let badgeText = item.badge, !badgeText.isEmpty {
-      badgeContainer.isHidden = false
-      badgeLabel.text = badgeText
-    } else {
-      badgeContainer.isHidden = true
-      badgeLabel.text = nil
-    }
-  }
-}
-
 private final class ChatNativeVibeButton: UIControl {
   private let glassView = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterial))
   private let iconView = UIImageView()
@@ -341,12 +174,9 @@ public final class ChatNativeTabBarView: ExpoView {
 
   private let backgroundBlur = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterial))
   private let containerStack = UIStackView()
-  private let stack = UIStackView()
 
-  // The animated active tab pill (plain tinted capsule; no extra blur view)
-  private let activePillView = UIView()
-  private var activePillCenterXConstraint: NSLayoutConstraint?
-  private var activePillWidthConstraint: NSLayoutConstraint?
+  // System segmented control — replaces custom pill + buttons
+  private let segmentedControl = UISegmentedControl()
 
   private let vibeButton = ChatNativeVibeButton()
 
@@ -355,7 +185,6 @@ public final class ChatNativeTabBarView: ExpoView {
   private var mainTabIndexes: [Int] = []
   private var vibeTab: ChatNativeTabItem?
   private var vibeTabIndex: Int?
-  private var buttons: [ChatNativeTabButton] = []
 
   private var currentIndex = 0
   private var activeTintColor = UIColor.systemBlue
@@ -363,9 +192,6 @@ public final class ChatNativeTabBarView: ExpoView {
   private var isDark = false
   private let tabControlSide: CGFloat = 64
   private let horizontalOuterPadding: CGFloat = 18
-  private let horizontalInnerPadding: CGFloat = 10
-  private let segmentVerticalInset: CGFloat = 4
-  private let activePillHorizontalInset: CGFloat = 2
   private let selectionFeedback = UISelectionFeedbackGenerator()
   private var remoteIconCache: [String: UIImage] = [:]
   private var remoteIconRequests: Set<String> = []
@@ -400,50 +226,29 @@ public final class ChatNativeTabBarView: ExpoView {
         equalTo: trailingAnchor, constant: -horizontalOuterPadding),
     ])
 
+    // Glass background behind the segmented control
     backgroundBlur.translatesAutoresizingMaskIntoConstraints = false
     backgroundBlur.layer.cornerRadius = tabControlSide / 2
     backgroundBlur.layer.cornerCurve = .continuous
     backgroundBlur.clipsToBounds = true
     backgroundBlur.isUserInteractionEnabled = true
 
-    activePillView.translatesAutoresizingMaskIntoConstraints = false
-    activePillView.isUserInteractionEnabled = false
-    activePillView.clipsToBounds = true
-    activePillView.layer.cornerCurve = .continuous
-    activePillView.backgroundColor = .clear
-    backgroundBlur.contentView.addSubview(activePillView)
-
-    stack.axis = .horizontal
-    stack.alignment = .fill
-    stack.distribution = .fillEqually
-    stack.spacing = 0
-    stack.translatesAutoresizingMaskIntoConstraints = false
-    stack.isUserInteractionEnabled = true
-    backgroundBlur.contentView.addSubview(stack)
+    // Segmented control setup
+    segmentedControl.translatesAutoresizingMaskIntoConstraints = false
+    segmentedControl.addTarget(self, action: #selector(segmentChanged(_:)), for: .valueChanged)
+    backgroundBlur.contentView.addSubview(segmentedControl)
 
     NSLayoutConstraint.activate([
       backgroundBlur.heightAnchor.constraint(equalToConstant: tabControlSide),
-      stack.topAnchor.constraint(
-        equalTo: backgroundBlur.contentView.topAnchor, constant: segmentVerticalInset),
-      stack.bottomAnchor.constraint(
-        equalTo: backgroundBlur.contentView.bottomAnchor, constant: -segmentVerticalInset),
-      stack.leadingAnchor.constraint(
-        equalTo: backgroundBlur.contentView.leadingAnchor, constant: horizontalInnerPadding),
-      stack.trailingAnchor.constraint(
-        equalTo: backgroundBlur.contentView.trailingAnchor, constant: -horizontalInnerPadding),
-
-      activePillView.topAnchor.constraint(
-        equalTo: backgroundBlur.contentView.topAnchor, constant: segmentVerticalInset),
-      activePillView.bottomAnchor.constraint(
-        equalTo: backgroundBlur.contentView.bottomAnchor, constant: -segmentVerticalInset),
+      segmentedControl.topAnchor.constraint(
+        equalTo: backgroundBlur.contentView.topAnchor, constant: 8),
+      segmentedControl.bottomAnchor.constraint(
+        equalTo: backgroundBlur.contentView.bottomAnchor, constant: -8),
+      segmentedControl.leadingAnchor.constraint(
+        equalTo: backgroundBlur.contentView.leadingAnchor, constant: 10),
+      segmentedControl.trailingAnchor.constraint(
+        equalTo: backgroundBlur.contentView.trailingAnchor, constant: -10),
     ])
-
-    // Initial dummy constraints for pill width/X
-    activePillWidthConstraint = activePillView.widthAnchor.constraint(equalToConstant: 0)
-    activePillCenterXConstraint = activePillView.centerXAnchor.constraint(
-      equalTo: backgroundBlur.contentView.leadingAnchor)
-    activePillWidthConstraint?.isActive = true
-    activePillCenterXConstraint?.isActive = true
 
     vibeButton.translatesAutoresizingMaskIntoConstraints = false
     vibeButton.setContentHuggingPriority(.required, for: .horizontal)
@@ -489,7 +294,7 @@ public final class ChatNativeTabBarView: ExpoView {
     mainTabs = filtered.map(\.element)
     mainTabIndexes = filtered.map(\.offset)
 
-    rebuildButtons()
+    rebuildSegments()
   }
 
   func setCurrentIndex(_ value: Int) {
@@ -517,13 +322,15 @@ public final class ChatNativeTabBarView: ExpoView {
     applySelection()
   }
 
-  @objc private func mainTabTapped(_ sender: UIControl) {
-    guard let button = sender as? ChatNativeTabButton else { return }
-    if button.tabIndex != currentIndex {
+  @objc private func segmentChanged(_ sender: UISegmentedControl) {
+    let segmentIndex = sender.selectedSegmentIndex
+    guard segmentIndex >= 0, segmentIndex < mainTabIndexes.count else { return }
+    let tabIndex = mainTabIndexes[segmentIndex]
+    if tabIndex != currentIndex {
       selectionFeedback.selectionChanged()
       selectionFeedback.prepare()
     }
-    onIndexChange(["index": button.tabIndex])
+    onIndexChange(["index": tabIndex])
   }
 
   @objc private func vibeTapped() {
@@ -535,31 +342,21 @@ public final class ChatNativeTabBarView: ExpoView {
     onIndexChange(["index": vibeTabIndex])
   }
 
-  private func rebuildButtons() {
-    buttons.removeAll()
-    stack.arrangedSubviews.forEach { view in
-      stack.removeArrangedSubview(view)
-      view.removeFromSuperview()
-    }
+  private func rebuildSegments() {
+    segmentedControl.removeAllSegments()
 
-    if !mainTabs.isEmpty {
-      for i in 0..<mainTabs.count {
-        let button = ChatNativeTabButton()
-        button.isUserInteractionEnabled = true
-        button.addTarget(self, action: #selector(mainTabTapped(_:)), for: .touchUpInside)
-        button.addTarget(self, action: #selector(mainTabTapped(_:)), for: .primaryActionTriggered)
-        let item = mainTabs[i]
-        let tabIndex = mainTabIndexes[i]
-        button.apply(
-          item: item,
-          index: tabIndex,
-          focused: tabIndex == currentIndex,
-          resolvedIcon: resolvedIcon(for: item),
-          activeTintColor: activeTintColor,
-          inactiveTintColor: inactiveTintColor
-        )
-        buttons.append(button)
-        stack.addArrangedSubview(button)
+    for i in 0..<mainTabs.count {
+      let item = mainTabs[i]
+      // Try to use SF Symbol image, falling back to title only
+      if let resolvedIcon = resolvedIcon(for: item) {
+        let tinted = resolvedIcon.withRenderingMode(.alwaysTemplate)
+        segmentedControl.insertSegment(with: tinted, at: i, animated: false)
+      } else if let sfSymbol = item.sfSymbol,
+        let img = UIImage(systemName: sfSymbol)
+      {
+        segmentedControl.insertSegment(with: img, at: i, animated: false)
+      } else {
+        segmentedControl.insertSegment(withTitle: item.title, at: i, animated: false)
       }
     }
 
@@ -574,17 +371,14 @@ public final class ChatNativeTabBarView: ExpoView {
       currentIndex = normalized
     }
 
-    for button in buttons {
-      let index = button.tabIndex
-      guard index >= 0, index < tabs.count else { continue }
-      button.apply(
-        item: tabs[index],
-        index: index,
-        focused: index == currentIndex,
-        resolvedIcon: resolvedIcon(for: tabs[index]),
-        activeTintColor: isDark ? .white : .black,
-        inactiveTintColor: inactiveTintColor
-      )
+    // Figure out which segment corresponds to the current tab index
+    if let segIndex = mainTabIndexes.firstIndex(of: currentIndex) {
+      if segmentedControl.selectedSegmentIndex != segIndex {
+        segmentedControl.selectedSegmentIndex = segIndex
+      }
+    } else {
+      // Current tab is the vibe tab — deselect the segmented control
+      segmentedControl.selectedSegmentIndex = UISegmentedControl.noSegment
     }
 
     if let vibeTab {
@@ -595,47 +389,6 @@ public final class ChatNativeTabBarView: ExpoView {
         activeTintColor: isDark ? .white : .black,
         isDark: isDark
       )
-    }
-
-    animatePillToActiveTab()
-  }
-
-  private func animatePillToActiveTab() {
-    layoutIfNeeded()
-    guard let targetButton = buttons.first(where: { $0.tabIndex == currentIndex }) else {
-      activePillView.alpha = 0
-      return
-    }
-
-    activePillView.alpha = 1
-    let buttonCenter = targetButton.convert(
-      CGPoint(x: targetButton.bounds.midX, y: targetButton.bounds.midY),
-      to: backgroundBlur.contentView)
-
-    // Leave a slight inset so the selected segment reads like UISegmentedControl.
-    activePillWidthConstraint?.constant = max(
-      0, targetButton.bounds.width - (activePillHorizontalInset * 2))
-    activePillCenterXConstraint?.isActive = false
-    activePillCenterXConstraint = activePillView.centerXAnchor.constraint(
-      equalTo: backgroundBlur.contentView.leadingAnchor, constant: buttonCenter.x)
-    activePillCenterXConstraint?.isActive = true
-
-    // Animate the pill constraint change
-    UIView.animate(
-      withDuration: 0.22,
-      delay: 0,
-      options: [.curveEaseInOut, .beginFromCurrentState]
-    ) {
-      self.layoutIfNeeded()
-    }
-  }
-
-  public override func layoutSubviews() {
-    super.layoutSubviews()
-    let radius = activePillView.bounds.height / 2
-    activePillView.layer.cornerRadius = radius
-    if #available(iOS 26.0, *) {
-      activePillView.cornerConfiguration = .uniformCorners(radius: .fixed(Double(radius)))
     }
   }
 
@@ -672,7 +425,7 @@ public final class ChatNativeTabBarView: ExpoView {
         self.remoteIconRequests.remove(cacheKey)
         guard let data, let image = UIImage(data: data) else { return }
         self.remoteIconCache[cacheKey] = image
-        self.applySelection()
+        self.rebuildSegments()
       }
     }.resume()
   }
@@ -715,29 +468,36 @@ public final class ChatNativeTabBarView: ExpoView {
       let effect = UIGlassEffect()
       effect.isInteractive = true
       backgroundBlur.effect = effect
-
-      // Match UISegmentedControl selectedSegmentTintColor more closely:
-      // plain tinted capsule over the glass container (no extra glass inside the pill).
-      activePillView.backgroundColor =
-        isDark
-        ? UIColor.white.withAlphaComponent(0.16)
-        : UIColor.black.withAlphaComponent(0.10)
     } else {
       backgroundBlur.effect = UIBlurEffect(style: .systemThinMaterial)
-
-      activePillView.backgroundColor =
-        isDark
-        ? UIColor.white.withAlphaComponent(0.16)
-        : UIColor.black.withAlphaComponent(0.10)
     }
     backgroundBlur.backgroundColor = .clear
-    // Keep the root view and the blur host transparent; only the active pill paints.
     backgroundBlur.contentView.backgroundColor = .clear
     backgroundBlur.layer.borderWidth = 0.7
     backgroundBlur.layer.borderColor =
       isDark
       ? UIColor.white.withAlphaComponent(0.08).cgColor
       : UIColor.black.withAlphaComponent(0.06).cgColor
+
+    // Style the segmented control
+    segmentedControl.backgroundColor = .clear
+    segmentedControl.selectedSegmentTintColor =
+      isDark
+      ? UIColor.white.withAlphaComponent(0.16)
+      : UIColor.black.withAlphaComponent(0.10)
+
+    let normalAttrs: [NSAttributedString.Key: Any] = [
+      .foregroundColor: isDark
+        ? UIColor.white.withAlphaComponent(0.6)
+        : UIColor.black.withAlphaComponent(0.5),
+      .font: UIFont.systemFont(ofSize: 12, weight: .semibold),
+    ]
+    let selectedAttrs: [NSAttributedString.Key: Any] = [
+      .foregroundColor: isDark ? UIColor.white : UIColor.black,
+      .font: UIFont.systemFont(ofSize: 12, weight: .semibold),
+    ]
+    segmentedControl.setTitleTextAttributes(normalAttrs, for: .normal)
+    segmentedControl.setTitleTextAttributes(selectedAttrs, for: .selected)
   }
 }
 

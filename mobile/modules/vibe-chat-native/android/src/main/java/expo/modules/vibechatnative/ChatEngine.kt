@@ -1,22 +1,33 @@
 package expo.modules.vibechatnative
 
 import android.content.Context
+import android.net.Uri
+import android.provider.OpenableColumns
 import android.util.Base64
 import android.util.Log
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody
+import okhttp3.RequestBody.Companion.asRequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.io.IOException
 import java.nio.charset.StandardCharsets
 import java.security.KeyFactory
 import java.security.PrivateKey
+import java.security.PublicKey
+import java.security.SecureRandom
 import java.security.spec.MGF1ParameterSpec
 import java.security.spec.PKCS8EncodedKeySpec
+import java.security.spec.X509EncodedKeySpec
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -46,7 +57,51 @@ private fun chatEngineDecodePem(pem: String): ByteArray {
 
 private fun chatEngineLoadPrivateKeyFromPem(privateKeyPem: String): PrivateKey {
   val keyFactory = KeyFactory.getInstance("RSA")
-  return keyFactory.generatePrivate(PKCS8EncodedKeySpec(chatEngineDecodePem(privateKeyPem)))
+  val der = chatEngineDecodePem(privateKeyPem)
+
+  // Try PKCS#8 first ("BEGIN PRIVATE KEY")
+  try {
+    return keyFactory.generatePrivate(PKCS8EncodedKeySpec(der))
+  } catch (_: Throwable) { /* fall through */ }
+
+  // Wrap PKCS#1 ("BEGIN RSA PRIVATE KEY") DER inside a PKCS#8 envelope.
+  // PKCS#8 = SEQUENCE { version(0), AlgorithmIdentifier(rsaEncryption, NULL), OCTET STRING(pkcs1) }
+  val rsaOidHeader = byteArrayOf(
+    0x30, 0x0d,                             // SEQUENCE (13 bytes) — AlgorithmIdentifier
+    0x06, 0x09, 0x2a, 0x86.toByte(), 0x48, 0x86.toByte(),
+    0xf7.toByte(), 0x0d, 0x01, 0x01, 0x01, // OID 1.2.840.113549.1.1.1 (rsaEncryption)
+    0x05, 0x00                              // NULL
+  )
+  val versionBytes = byteArrayOf(0x02, 0x01, 0x00) // INTEGER 0
+  val octetTag = byteArrayOf(0x04)
+  val octetLen = derEncodeLength(der.size)
+  val innerLen = versionBytes.size + rsaOidHeader.size + octetTag.size + octetLen.size + der.size
+  val seqTag = byteArrayOf(0x30)
+  val seqLen = derEncodeLength(innerLen)
+  val pkcs8 = seqTag + seqLen + versionBytes + rsaOidHeader + octetTag + octetLen + der
+  try {
+    return keyFactory.generatePrivate(PKCS8EncodedKeySpec(pkcs8))
+  } catch (e: Throwable) {
+    Log.e("ChatEngine", "chatEngineLoadPrivateKeyFromPem FAILED derLen=${der.size}", e)
+    throw e
+  }
+}
+
+/** Encode an ASN.1 DER length field. */
+private fun derEncodeLength(length: Int): ByteArray {
+  if (length < 0x80) return byteArrayOf(length.toByte())
+  val lenBytes = mutableListOf<Byte>()
+  var remaining = length
+  while (remaining > 0) {
+    lenBytes.add(0, (remaining and 0xFF).toByte())
+    remaining = remaining shr 8
+  }
+  return byteArrayOf((0x80 or lenBytes.size).toByte()) + lenBytes.toByteArray()
+}
+
+private fun chatEngineLoadPublicKeyFromPem(publicKeyPem: String): PublicKey {
+  val keyFactory = KeyFactory.getInstance("RSA")
+  return keyFactory.generatePublic(X509EncodedKeySpec(chatEngineDecodePem(publicKeyPem)))
 }
 
 private fun chatEngineRsaDecryptOAEP(privateKey: PrivateKey, encrypted: ByteArray): ByteArray? {
@@ -57,6 +112,12 @@ private fun chatEngineRsaDecryptOAEP(privateKey: PrivateKey, encrypted: ByteArra
   } catch (_: Throwable) {
     null
   }
+}
+
+private fun chatEngineRsaEncryptOAEP(publicKey: PublicKey, plain: ByteArray): ByteArray {
+  val cipher = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding")
+  cipher.init(Cipher.ENCRYPT_MODE, publicKey, chatEngineOaepSpec)
+  return cipher.doFinal(plain)
 }
 
 private fun chatEngineDecryptHybridMessage(
@@ -109,6 +170,48 @@ private fun chatEngineDecryptHybridMessage(
   }
 }
 
+private fun chatEngineEncryptHybridMessage(
+  recipientPublicKeyPem: String,
+  message: String,
+  myPublicKeyPem: String?,
+): String {
+  val secureRandom = SecureRandom()
+  val aesKey = ByteArray(32).also { secureRandom.nextBytes(it) }
+  val iv = ByteArray(12).also { secureRandom.nextBytes(it) }
+
+  val aesCipher = Cipher.getInstance("AES/GCM/NoPadding")
+  aesCipher.init(
+    Cipher.ENCRYPT_MODE,
+    SecretKeySpec(aesKey, "AES"),
+    GCMParameterSpec(128, iv),
+  )
+  val encryptedWithTag = aesCipher.doFinal(message.toByteArray(StandardCharsets.UTF_8))
+
+  val recipientPublicKey = chatEngineLoadPublicKeyFromPem(recipientPublicKeyPem)
+  val encryptedRecipientKey = chatEngineRsaEncryptOAEP(recipientPublicKey, aesKey)
+
+  var senderEncryptedKeyB64: String? = null
+  if (!myPublicKeyPem.isNullOrBlank()) {
+    try {
+      val senderPublicKey = chatEngineLoadPublicKeyFromPem(myPublicKeyPem)
+      senderEncryptedKeyB64 = Base64.encodeToString(
+        chatEngineRsaEncryptOAEP(senderPublicKey, aesKey),
+        Base64.NO_WRAP,
+      )
+    } catch (_: Throwable) {
+      // Keep payload valid if sender-key branch fails.
+    }
+  }
+
+  return JSONObject().apply {
+    put("v", 1)
+    put("iv", Base64.encodeToString(iv, Base64.NO_WRAP))
+    put("c", Base64.encodeToString(encryptedWithTag, Base64.NO_WRAP))
+    put("k", Base64.encodeToString(encryptedRecipientKey, Base64.NO_WRAP))
+    if (senderEncryptedKeyB64 != null) put("s", senderEncryptedKeyB64)
+  }.toString()
+}
+
 internal object ChatEngine {
   private data class SurfaceBinding(
     val surfaceId: String,
@@ -128,6 +231,7 @@ internal object ChatEngine {
     ),
   )
   private val onlineUsers = linkedSetOf<String>()
+  private val lastSeenByUserId = linkedMapOf<String, Long>()
   private val surfaceBindings = linkedMapOf<String, SurfaceBinding>()
   private val openChatChannels = linkedMapOf<String, Int>()
   private val receiptIndex = linkedMapOf<String, MutableMap<String, String>>() // chatId -> messageId -> status
@@ -143,10 +247,16 @@ internal object ChatEngine {
   private val nativePendingMessagePushRefs = linkedMapOf<String, Pair<String, String>>() // ref -> (chatId,messageId)
   private val nativePendingEditPushRefs = linkedMapOf<String, Pair<String, String>>() // ref -> (chatId,messageId)
   private val nativePendingDeletePushRefs = linkedMapOf<String, Pair<String, String>>() // ref -> (chatId,messageId)
+  private val pendingOutboundDraftsByMessageId = linkedMapOf<String, Map<String, Any?>>()
+  private val pendingOutboundQueueByChat = linkedMapOf<String, MutableList<String>>()
+  private val nativeTypingStateByChatId = linkedMapOf<String, Boolean>()
+  private val nativeRecordingStateByChatId = linkedMapOf<String, Boolean>()
   private val historyRowsByChat = linkedMapOf<String, MutableList<Map<String, Any?>>>()
   private val historyLoadingChats = linkedSetOf<String>()
   private val liveMessageRowsByChat = linkedMapOf<String, MutableMap<String, Map<String, Any?>>>()
   private val deletedMessageIdsByChat = linkedMapOf<String, MutableSet<String>>()
+  private val chatPeerUserIdsByChatId = linkedMapOf<String, String>()
+  private val friendPublicKeysByUserId = linkedMapOf<String, String>()
   private var cachedDecryptPrivateKeyPem: String? = null
   private var cachedDecryptPrivateKey: PrivateKey? = null
   private var cachedDecryptKeyTimestampMs: Long = 0L
@@ -176,6 +286,18 @@ internal object ChatEngine {
 
   fun getStatus(): Map<String, Any?> =
     synchronized(lock) { statusSnapshotLocked() }
+
+  fun isUserOnline(userId: String?): Boolean =
+    synchronized(lock) {
+      val normalized = normalizedUpper(userId) ?: return@synchronized false
+      onlineUsers.contains(normalized)
+    }
+
+  fun lastSeenTimestampMs(userId: String?): Long? =
+    synchronized(lock) {
+      val normalized = normalizedUpper(userId) ?: return@synchronized null
+      lastSeenByUserId[normalized]
+    }
 
   fun connect(): Map<String, Any?> {
     val ctx = appContextRef
@@ -231,6 +353,10 @@ internal object ChatEngine {
         nativePendingMessagePushRefs.clear()
         nativePendingEditPushRefs.clear()
         nativePendingDeletePushRefs.clear()
+        pendingOutboundDraftsByMessageId.clear()
+        pendingOutboundQueueByChat.clear()
+        nativeTypingStateByChatId.clear()
+        nativeRecordingStateByChatId.clear()
         historyLoadingChats.clear()
         liveMessageRowsByChat.clear()
         deletedMessageIdsByChat.clear()
@@ -286,6 +412,10 @@ internal object ChatEngine {
       nativePendingMessagePushRefs.clear()
       nativePendingEditPushRefs.clear()
       nativePendingDeletePushRefs.clear()
+      pendingOutboundDraftsByMessageId.clear()
+      pendingOutboundQueueByChat.clear()
+      nativeTypingStateByChatId.clear()
+      nativeRecordingStateByChatId.clear()
       historyRowsByChat.clear()
       historyLoadingChats.clear()
       liveMessageRowsByChat.clear()
@@ -376,6 +506,408 @@ internal object ChatEngine {
 
   fun sendReadReceipt(payload: Map<String, Any?>): Map<String, Any?> =
     sendReceipt(payload, "read", "read-receipt", "read-receipt")
+
+  fun sendTypingState(payload: Map<String, Any?>): Map<String, Any?> {
+    val chatId = normalized(payload["chatId"] ?: payload["chat_id"])
+      ?: return mapOf("accepted" to false, "reason" to "invalid_chat")
+    val typing = when (val raw = payload["typing"]) {
+      is Boolean -> raw
+      is Number -> raw.toInt() != 0
+      is String -> raw.equals("true", ignoreCase = true) || raw == "1" || raw.equals("yes", ignoreCase = true) || raw.equals("on", ignoreCase = true)
+      else -> false
+    }
+    return synchronized(lock) {
+      if (nativeTypingStateByChatId[chatId] == typing) {
+        return@synchronized mapOf("accepted" to true, "transport" to "native", "deduped" to true, "typing" to typing)
+      }
+      nativeTypingStateByChatId[chatId] = typing
+      val client = phoenixClient ?: return@synchronized mapOf("accepted" to false, "reason" to "no_native_socket", "typing" to typing)
+      if (!nativeJoinedChatIds.contains(chatId) || state["connected"] != true) {
+        joinNativeChatTopicIfNeededLocked(chatId)
+        return@synchronized mapOf("accepted" to false, "reason" to "chat_not_joined", "typing" to typing)
+      }
+      val userId = normalized(getConfigValueLocked("userId")) ?: "me"
+      val event = if (typing) "typing" else "stop-typing"
+      val ref = client.push(chatTopic(chatId), event, mapOf("userId" to userId))
+      appendJournalLocked("native-$event", mapOf("chatId" to chatId, "ref" to ref, "typing" to typing))
+      state["updatedAt"] = System.currentTimeMillis()
+      emitChangeLocked("typingStateSent", chatId, null)
+      mapOf("accepted" to true, "transport" to "native", "ref" to ref, "typing" to typing)
+    }
+  }
+
+  fun sendRecordingState(payload: Map<String, Any?>): Map<String, Any?> {
+    val chatId = normalized(payload["chatId"] ?: payload["chat_id"])
+      ?: return mapOf("accepted" to false, "reason" to "invalid_chat")
+    val isRecording = when (val raw = payload["isRecording"] ?: payload["recording"]) {
+      is Boolean -> raw
+      is Number -> raw.toInt() != 0
+      is String -> raw.equals("true", ignoreCase = true) || raw == "1" || raw.equals("yes", ignoreCase = true) || raw.equals("on", ignoreCase = true)
+      else -> false
+    }
+    val isLocked = when (val raw = payload["isLocked"] ?: payload["locked"]) {
+      is Boolean -> raw
+      is Number -> raw.toInt() != 0
+      is String -> raw.equals("true", ignoreCase = true) || raw == "1" || raw.equals("yes", ignoreCase = true) || raw.equals("on", ignoreCase = true)
+      else -> false
+    }
+    val mode = normalized(payload["mode"]) ?: "voice"
+    return synchronized(lock) {
+      if (nativeRecordingStateByChatId[chatId] == isRecording) {
+        return@synchronized mapOf("accepted" to true, "transport" to "native", "deduped" to true, "isRecording" to isRecording)
+      }
+      nativeRecordingStateByChatId[chatId] = isRecording
+      val client = phoenixClient ?: return@synchronized mapOf("accepted" to false, "reason" to "no_native_socket", "isRecording" to isRecording)
+      if (!nativeJoinedChatIds.contains(chatId) || state["connected"] != true) {
+        joinNativeChatTopicIfNeededLocked(chatId)
+        return@synchronized mapOf("accepted" to false, "reason" to "chat_not_joined", "isRecording" to isRecording)
+      }
+      val userId = normalized(getConfigValueLocked("userId")) ?: "me"
+      val event = if (isRecording) "recording" else "stop-recording"
+      val wirePayload = linkedMapOf<String, Any?>("userId" to userId)
+      if (isRecording) {
+        wirePayload["mode"] = mode
+        wirePayload["isLocked"] = isLocked
+        if (payload["vad"] != null) wirePayload["vad"] = payload["vad"]
+      }
+      val ref = client.push(chatTopic(chatId), event, wirePayload)
+      appendJournalLocked(
+        "native-$event",
+        mapOf("chatId" to chatId, "ref" to ref, "isRecording" to isRecording, "isLocked" to isLocked, "mode" to mode),
+      )
+      state["updatedAt"] = System.currentTimeMillis()
+      emitChangeLocked("recordingStateSent", chatId, null)
+      mapOf("accepted" to true, "transport" to "native", "ref" to ref, "isRecording" to isRecording)
+    }
+  }
+
+  fun retryOutgoingMessage(payload: Map<String, Any?>): Map<String, Any?> {
+    val messageId = normalized(payload["messageId"] ?: payload["message_id"])
+      ?: return mapOf("accepted" to false, "reason" to "invalid_message")
+    return synchronized(lock) {
+      val draft = pendingOutboundDraftsByMessageId[messageId]
+        ?: return@synchronized mapOf("accepted" to false, "reason" to "missing_draft", "messageId" to messageId)
+      val chatId =
+        normalized(payload["chatId"] ?: payload["chat_id"])
+          ?: normalized(draft["chatId"] ?: draft["chat_id"])
+          ?: return@synchronized mapOf("accepted" to false, "reason" to "invalid_chat", "messageId" to messageId)
+      queueOutboundDraftLocked(chatId, messageId, draft, "manual_retry")
+      scheduleReplayQueuedOutboundLocked(chatId, "manual_retry")
+      mapOf("accepted" to true, "queued" to true, "messageId" to messageId, "state" to "pending")
+    }
+  }
+
+  fun cancelOutgoingMessage(payload: Map<String, Any?>): Map<String, Any?> {
+    val messageId = normalized(payload["messageId"] ?: payload["message_id"])
+      ?: return mapOf("accepted" to false, "reason" to "invalid_message")
+    return synchronized(lock) {
+      val draft = pendingOutboundDraftsByMessageId[messageId]
+      val chatId =
+        normalized(payload["chatId"] ?: payload["chat_id"])
+          ?: normalized(draft?.get("chatId") ?: draft?.get("chat_id"))
+          ?: return@synchronized mapOf("accepted" to false, "reason" to "invalid_chat", "messageId" to messageId)
+      removeQueuedOutboundDraftLocked(chatId, messageId, dropDraft = true)
+      upsertLocalStatusLocked(chatId, messageId, "error")
+      appendJournalLocked("native-outgoing-cancel", mapOf("chatId" to chatId, "messageId" to messageId))
+      emitChangeLocked("outgoingMessageCanceled", chatId, messageId)
+      emitChangeLocked("messageStatusChanged", chatId, messageId)
+      mapOf("accepted" to true, "messageId" to messageId, "state" to "canceled")
+    }
+  }
+
+  fun sendMessage(payload: Map<String, Any?>): Map<String, Any?> {
+    val chatId = normalized(payload["chatId"] ?: payload["chat_id"])
+      ?: return mapOf("accepted" to false, "reason" to "invalid_chat")
+    val type = (normalized(payload["type"]) ?: "text").lowercase()
+    val text = normalized(payload["text"]) ?: ""
+    val supportedTypes = setOf("text", "image", "gif", "file", "voice", "video", "music", "location", "contact")
+    if (!supportedTypes.contains(type)) return mapOf("accepted" to false, "reason" to "unsupported_type", "type" to type)
+    val metadata = payload["metadata"] as? Map<*, *> ?: emptyMap<String, Any?>()
+    fun meta(key: String, vararg aliases: String): Any? {
+      payload[key]?.let { return it }
+      aliases.forEach { alias -> payload[alias]?.let { return it } }
+      metadata[key]?.let { return it }
+      aliases.forEach { alias -> metadata[alias]?.let { return it } }
+      return null
+    }
+    var mediaUrl = normalized(meta("mediaUrl", "media_url", "previewUrl", "preview_url"))
+    val localPlaybackMediaUrl = mediaUrl?.takeIf { isLocalMediaUri(it) }
+    var fileName = normalized(meta("fileName", "file_name"))
+    var fileSize = parseLongValue(meta("fileSize", "file_size"))
+    val latitude = parseDoubleValue(meta("latitude"))
+    val longitude = parseDoubleValue(meta("longitude"))
+    val duration = parseDoubleValue(meta("duration"))
+    val width = parseLongValue(meta("width"))
+    val height = parseLongValue(meta("height"))
+    val caption = normalized(meta("caption"))
+    val thumbnailBase64 = normalized(meta("thumbnailBase64", "thumbnail_base64"))
+    val mediaKey = normalized(meta("mediaKey", "media_key"))
+    val contact = meta("contact")
+    val viewOnce = meta("viewOnce", "view_once")
+    val isVideoNote = meta("isVideoNote", "is_video_note")
+    val waveform = meta("waveform")
+    if (type == "text" && text.isBlank()) return mapOf("accepted" to false, "reason" to "empty_text")
+    if (setOf("image", "gif", "file", "voice", "video", "music").contains(type)) {
+      if (mediaUrl.isNullOrBlank()) return mapOf("accepted" to false, "reason" to "missing_media_url", "type" to type)
+    }
+    if (type == "location" && (latitude == null || longitude == null)) {
+      return mapOf("accepted" to false, "reason" to "invalid_location")
+    }
+    if (type == "contact" && contact == null) {
+      return mapOf("accepted" to false, "reason" to "missing_contact")
+    }
+    val messageId = normalized(payload["messageId"] ?: payload["message_id"]) ?: java.util.UUID.randomUUID().toString().lowercase()
+    val timestampMs =
+      parseLongValue(payload["timestampMs"] ?: payload["timestamp"] ?: payload["timestamp_ms"])
+        ?: System.currentTimeMillis()
+    val replyToId =
+      normalized(payload["replyToId"] ?: payload["reply_to_id"])
+        ?: normalized(metadata["replyToId"] ?: metadata["reply_to_id"])
+    val peerUserIdHint = normalizedUpper(payload["peerUserId"] ?: payload["peer_user_id"])
+
+    return synchronized(lock) {
+      val effectivePayload = LinkedHashMap(payload)
+      val peerUserId = peerUserIdHint ?: chatPeerUserIdsByChatId[chatId]
+      val friendPublicKey = resolveFriendPublicKeyLocked(chatId, peerUserId)
+        ?: run {
+          pendingOutboundDraftsByMessageId[messageId] = LinkedHashMap(effectivePayload)
+          upsertLocalStatusLocked(chatId, messageId, "pending")
+          queueOutboundDraftLocked(chatId, messageId, effectivePayload, "missing_friend_key")
+          emitChangeLocked("messageStatusChanged", chatId, messageId)
+          return@synchronized mapOf(
+            "accepted" to true,
+            "queued" to true,
+            "reason" to "missing_friend_key",
+            "messageId" to messageId,
+            "state" to "pending",
+          )
+        }
+
+      val decryptedFields = linkedMapOf<String, Any?>("text" to text)
+      if (!mediaUrl.isNullOrBlank()) decryptedFields["mediaUrl"] = mediaUrl
+      if (!localPlaybackMediaUrl.isNullOrBlank()) {
+        decryptedFields["localMediaUrl"] = localPlaybackMediaUrl
+      }
+      if (!fileName.isNullOrBlank()) decryptedFields["fileName"] = fileName
+      if (fileSize != null) decryptedFields["fileSize"] = fileSize
+      if (latitude != null) decryptedFields["latitude"] = latitude
+      if (longitude != null) decryptedFields["longitude"] = longitude
+      if (duration != null) decryptedFields["duration"] = duration
+      if (width != null) decryptedFields["width"] = width
+      if (height != null) decryptedFields["height"] = height
+      if (!replyToId.isNullOrBlank()) decryptedFields["replyToId"] = replyToId
+      if (contact != null) decryptedFields["contact"] = contact
+      if (!caption.isNullOrBlank()) decryptedFields["caption"] = caption
+      if (!thumbnailBase64.isNullOrBlank()) decryptedFields["thumbnailBase64"] = thumbnailBase64
+      if (viewOnce != null) decryptedFields["viewOnce"] = viewOnce
+      if (isVideoNote != null) decryptedFields["isVideoNote"] = isVideoNote
+      if (waveform != null) decryptedFields["waveform"] = waveform
+      val optimisticRow = buildLiveRowPayloadLocked(
+        chatId = chatId,
+        messageId = messageId,
+        fromId = normalized(getConfigValueLocked("userId")),
+        type = type,
+        timestampMs = timestampMs,
+        encryptedContent = null,
+        decryptedFields = decryptedFields,
+      ).toMutableMap()
+      val optimisticMessage = (optimisticRow["message"] as? Map<String, Any?>)?.toMutableMap() ?: linkedMapOf()
+      optimisticMessage["status"] = "sending"
+      if (!replyToId.isNullOrBlank()) optimisticMessage["replyToId"] = replyToId
+      optimisticRow["message"] = optimisticMessage
+      upsertLiveMessageRowLocked(chatId, messageId, optimisticRow)
+      upsertLocalStatusLocked(chatId, messageId, "sending")
+      emitChangeLocked("chatMessageInserted", chatId, messageId)
+      emitChangeLocked("messageStatusChanged", chatId, messageId)
+
+      val needsUpload =
+        setOf("image", "gif", "file", "voice", "video", "music").contains(type) &&
+          !mediaUrl.isNullOrBlank() &&
+          isLocalMediaUri(mediaUrl!!)
+      if (needsUpload) {
+        val apiBaseUrl = apiBaseUrlLocked()
+        val token = authHeaderTokenLocked()
+        val userId = normalized(getConfigValueLocked("userId"))
+        if (apiBaseUrl.isNullOrBlank() || token.isNullOrBlank() || userId.isNullOrBlank()) {
+          upsertLocalStatusLocked(chatId, messageId, "pending")
+          queueOutboundDraftLocked(chatId, messageId, effectivePayload, "missing_upload_config")
+          appendJournalLocked(
+            "native-media-upload-error",
+            mapOf("chatId" to chatId, "messageId" to messageId, "reason" to "missing_upload_config"),
+          )
+          emitChangeLocked("messageStatusChanged", chatId, messageId)
+          return@synchronized mapOf(
+            "accepted" to true,
+            "queued" to true,
+            "reason" to "missing_upload_config",
+            "messageId" to messageId,
+            "state" to "pending",
+          )
+        }
+        appendJournalLocked(
+          "native-media-upload-start",
+          mapOf("chatId" to chatId, "messageId" to messageId, "type" to type),
+        )
+        when (val uploadResult = uploadLocalMediaLocked(mediaUrl!!, type, fileName, userId, token, apiBaseUrl)) {
+          is LocalMediaUploadOutcome.Success -> {
+            mediaUrl = uploadResult.value.remoteUrl
+            if (fileName.isNullOrBlank()) fileName = uploadResult.value.fileName
+            if (fileSize == null) fileSize = uploadResult.value.fileSize
+            val nextMetadata = linkedMapOf<String, Any?>()
+            val existingMetadata = payload["metadata"] as? Map<*, *> ?: emptyMap<String, Any?>()
+            existingMetadata.forEach { (k, v) -> if (k != null) nextMetadata[k.toString()] = v }
+            nextMetadata["mediaUrl"] = mediaUrl
+            if (!localPlaybackMediaUrl.isNullOrBlank()) {
+              nextMetadata["localMediaUrl"] = localPlaybackMediaUrl
+            }
+            if (!fileName.isNullOrBlank()) nextMetadata["fileName"] = fileName
+            if (fileSize != null) nextMetadata["fileSize"] = fileSize
+            effectivePayload["metadata"] = nextMetadata
+            effectivePayload["chatId"] = chatId
+            effectivePayload["messageId"] = messageId
+            effectivePayload["type"] = type
+            effectivePayload["text"] = text
+            optimisticMessage["mediaUrl"] = mediaUrl
+            if (!localPlaybackMediaUrl.isNullOrBlank()) {
+              optimisticMessage["localMediaUrl"] = localPlaybackMediaUrl
+            }
+            if (!fileName.isNullOrBlank()) optimisticMessage["fileName"] = fileName
+            if (fileSize != null) optimisticMessage["fileSize"] = fileSize
+            optimisticRow["message"] = optimisticMessage
+            upsertLiveMessageRowLocked(chatId, messageId, optimisticRow)
+            appendJournalLocked(
+              "native-media-upload-ok",
+              mapOf("chatId" to chatId, "messageId" to messageId, "url" to mediaUrl),
+            )
+            Log.d(
+              "ChatEngine",
+              "voice upload complete chatId=$chatId messageId=$messageId remoteUrl=${mediaUrl?.take(120)} localPlayback=${localPlaybackMediaUrl?.take(120)} type=$type",
+            )
+          }
+          is LocalMediaUploadOutcome.Failure -> {
+            val reason = uploadResult.reason
+            val shouldQueue = setOf("upload_failed", "upload_timeout", "missing_upload_config").contains(reason)
+            upsertLocalStatusLocked(chatId, messageId, if (shouldQueue) "pending" else "error")
+            appendJournalLocked(
+              "native-media-upload-error",
+              mapOf("chatId" to chatId, "messageId" to messageId, "reason" to reason),
+            )
+            emitChangeLocked("messageStatusChanged", chatId, messageId)
+            if (shouldQueue) {
+              queueOutboundDraftLocked(chatId, messageId, effectivePayload, reason)
+              return@synchronized mapOf(
+                "accepted" to true,
+                "queued" to true,
+                "reason" to reason,
+                "messageId" to messageId,
+                "state" to "pending",
+              )
+            }
+            return@synchronized mapOf("accepted" to false, "reason" to reason, "messageId" to messageId)
+          }
+        }
+      }
+
+      val fullPayload = linkedMapOf<String, Any?>("text" to text)
+      if (!mediaUrl.isNullOrBlank()) fullPayload["mediaUrl"] = mediaUrl
+      if (!mediaKey.isNullOrBlank()) fullPayload["mediaKey"] = mediaKey
+      if (!fileName.isNullOrBlank()) fullPayload["fileName"] = fileName
+      if (fileSize != null) fullPayload["fileSize"] = fileSize
+      if (latitude != null) fullPayload["latitude"] = latitude
+      if (longitude != null) fullPayload["longitude"] = longitude
+      if (duration != null) fullPayload["duration"] = duration
+      if (width != null) fullPayload["width"] = width
+      if (height != null) fullPayload["height"] = height
+      if (!replyToId.isNullOrBlank()) fullPayload["replyToId"] = replyToId
+      if (contact != null) fullPayload["contact"] = contact
+      if (!caption.isNullOrBlank()) fullPayload["caption"] = caption
+      if (!thumbnailBase64.isNullOrBlank()) fullPayload["thumbnailBase64"] = thumbnailBase64
+      if (viewOnce != null) fullPayload["viewOnce"] = viewOnce
+      if (isVideoNote != null) fullPayload["isVideoNote"] = isVideoNote
+      if (waveform != null) fullPayload["waveform"] = waveform
+      val fullPayloadString = JSONObject(fullPayload).toString()
+      val myPublicKeyPem = normalized(getConfigValueLocked("publicKeyPem") ?: getConfigValueLocked("publicKey"))
+
+      val encryptedContent = try {
+        chatEngineEncryptHybridMessage(friendPublicKey, fullPayloadString, myPublicKeyPem)
+      } catch (e: Throwable) {
+        upsertLocalStatusLocked(chatId, messageId, "error")
+        appendJournalLocked(
+          "native-send-message-error",
+          mapOf("chatId" to chatId, "messageId" to messageId, "reason" to "encrypt_failed", "error" to (e.message ?: "encrypt_failed")),
+        )
+        emitChangeLocked("messageStatusChanged", chatId, messageId)
+        return@synchronized mapOf("accepted" to false, "reason" to "encrypt_failed", "messageId" to messageId)
+      }
+
+      optimisticMessage["encryptedContent"] = encryptedContent
+      optimisticRow["message"] = optimisticMessage
+      upsertLiveMessageRowLocked(chatId, messageId, optimisticRow)
+      pendingOutboundDraftsByMessageId[messageId] = LinkedHashMap(effectivePayload)
+
+      val pushPreview = text.trim().let { trimmed ->
+        if (trimmed.isNotEmpty()) {
+          if (trimmed.length <= 160) trimmed else trimmed.take(159) + "…"
+        } else {
+          when (type) {
+            "image" -> "Photo"
+            "video" -> "Video"
+            "voice" -> "Voice message"
+            "music" -> "Audio"
+            "file" -> "File"
+            "location" -> "Location"
+            "contact" -> "Contact"
+            "gif" -> "GIF"
+            else -> ""
+          }
+        }
+      }
+      val wirePayload = linkedMapOf<String, Any?>(
+        "id" to messageId,
+        "fromId" to normalized(getConfigValueLocked("userId")),
+        "encryptedContent" to encryptedContent,
+        "timestamp" to timestampMs,
+        "type" to type,
+        "pushPreview" to pushPreview,
+        "mediaUrl" to null,
+        "fileName" to null,
+        "latitude" to null,
+        "longitude" to null,
+      )
+
+      val client = phoenixClient
+      if (client == null) {
+        upsertLocalStatusLocked(chatId, messageId, "pending")
+        queueOutboundDraftLocked(chatId, messageId, effectivePayload, "no_native_socket")
+        emitChangeLocked("messageStatusChanged", chatId, messageId)
+        return@synchronized mapOf(
+          "accepted" to true,
+          "queued" to true,
+          "reason" to "no_native_socket",
+          "messageId" to messageId,
+          "state" to "pending",
+        )
+      }
+      if (!nativeJoinedChatIds.contains(chatId)) {
+        joinNativeChatTopicIfNeededLocked(chatId)
+        upsertLocalStatusLocked(chatId, messageId, "pending")
+        queueOutboundDraftLocked(chatId, messageId, effectivePayload, "chat_not_joined")
+        emitChangeLocked("messageStatusChanged", chatId, messageId)
+        return@synchronized mapOf(
+          "accepted" to true,
+          "queued" to true,
+          "reason" to "chat_not_joined",
+          "messageId" to messageId,
+          "state" to "pending",
+        )
+      }
+      val ref = client.push(chatTopic(chatId), "message", wirePayload)
+      nativePendingMessagePushRefs[ref] = chatId to messageId
+      appendJournalLocked("native-send-message", mapOf("chatId" to chatId, "messageId" to messageId, "ref" to ref))
+      emitChangeLocked("messageStatusChanged", chatId, messageId)
+      mapOf("accepted" to true, "transport" to "native", "ref" to ref, "messageId" to messageId, "state" to "sending")
+    }
+  }
 
   fun upsertLocalMessageStatus(payload: Map<String, Any?>): Map<String, Any?> {
     val chatId = normalized(payload["chatId"] ?: payload["chat_id"]) ?: return getStatus()
@@ -483,6 +1015,86 @@ internal object ChatEngine {
     }
   }
 
+  fun editMessage(payload: Map<String, Any?>): Map<String, Any?> {
+    val chatId = normalized(payload["chatId"] ?: payload["chat_id"])
+      ?: return mapOf("accepted" to false, "reason" to "invalid_chat")
+    val messageId = normalized(payload["messageId"] ?: payload["message_id"])
+      ?: return mapOf("accepted" to false, "reason" to "invalid_message")
+    val nextText = normalized(payload["text"])?.trim()
+      ?: return mapOf("accepted" to false, "reason" to "invalid_payload")
+    if (nextText.isEmpty()) return mapOf("accepted" to false, "reason" to "empty_text")
+
+    return synchronized(lock) {
+      val existingMessage = findMessagePayloadLocked(chatId, messageId)
+        ?: return@synchronized mapOf("accepted" to false, "reason" to "message_not_found")
+      val peerUserId = normalizedUpper(payload["peerUserId"] ?: payload["peer_user_id"]) ?: chatPeerUserIdsByChatId[chatId]
+      val friendPublicKey = resolveFriendPublicKeyLocked(chatId, peerUserId)
+        ?: return@synchronized mapOf("accepted" to false, "reason" to "missing_friend_key")
+
+      val editedAt = System.currentTimeMillis()
+      val fullPayload = linkedMapOf<String, Any?>(
+        "text" to nextText,
+        "isEdited" to true,
+        "editedAt" to editedAt,
+      )
+      normalized(existingMessage["mediaUrl"])?.let { fullPayload["mediaUrl"] = it }
+      normalized(existingMessage["fileName"])?.let { fullPayload["fileName"] = it }
+      parseDoubleValue(existingMessage["duration"])?.let { fullPayload["duration"] = it }
+      normalized(existingMessage["replyToId"])?.let { fullPayload["replyToId"] = it }
+      ((existingMessage["metadata"] as? Map<*, *>) ?: emptyMap<Any?, Any?>()).let { metadata ->
+        metadata["width"]?.let { fullPayload["width"] = it }
+        metadata["height"]?.let { fullPayload["height"] = it }
+        metadata["thumbnailBase64"]?.let { fullPayload["thumbnailBase64"] = it }
+        metadata["isVideoNote"]?.let { fullPayload["isVideoNote"] = it }
+        metadata["waveform"]?.let { fullPayload["waveform"] = it }
+      }
+
+      val payloadString = try {
+        JSONObject(fullPayload).toString()
+      } catch (_: Throwable) {
+        return@synchronized mapOf("accepted" to false, "reason" to "payload_encode_failed")
+      }
+      val myPublicKeyPem = normalized(getConfigValueLocked("publicKeyPem") ?: getConfigValueLocked("publicKey"))
+      val encryptedContent = try {
+        chatEngineEncryptHybridMessage(friendPublicKey, payloadString, myPublicKeyPem)
+      } catch (e: Throwable) {
+        appendJournalLocked(
+          "native-edit-message-error",
+          mapOf("chatId" to chatId, "messageId" to messageId, "reason" to "encrypt_failed", "error" to (e.message ?: "encrypt_failed")),
+        )
+        return@synchronized mapOf("accepted" to false, "reason" to "encrypt_failed")
+      }
+
+      val client = phoenixClient
+        ?: return@synchronized mapOf("accepted" to false, "reason" to "no_native_socket")
+      if (!nativeJoinedChatIds.contains(chatId)) {
+        joinNativeChatTopicIfNeededLocked(chatId)
+        return@synchronized mapOf("accepted" to false, "reason" to "chat_not_joined")
+      }
+      val ref = client.push(
+        chatTopic(chatId),
+        "edit-message",
+        linkedMapOf<String, Any?>(
+          "messageId" to messageId,
+          "encryptedContent" to encryptedContent,
+          "editedAt" to editedAt,
+        ),
+      )
+      nativePendingEditPushRefs[ref] = chatId to messageId
+      appendJournalLocked("native-send-edit-message", mapOf("chatId" to chatId, "messageId" to messageId, "ref" to ref))
+      applyNativeChatMutationEventLocked(
+        chatId,
+        "message-edited",
+        mapOf("messageId" to messageId, "encryptedContent" to encryptedContent, "editedAt" to editedAt),
+      )
+      emitChangeLocked("chatMessageEdited", chatId, messageId)
+      mapOf("accepted" to true, "transport" to "native", "ref" to ref)
+    }
+  }
+
+  fun deleteMessage(payload: Map<String, Any?>): Map<String, Any?> =
+    sendDeleteMessage(payload)
+
   fun getJournal(): List<Map<String, Any?>> {
     val ctx = appContextRef ?: return emptyList()
     return ChatEngineStore.getJournal(ctx)
@@ -512,6 +1124,20 @@ internal object ChatEngine {
     }
   }
 
+  fun isChatHistoryLoaded(payload: Map<String, Any?>): Boolean {
+    val chatId = normalized(payload["chatId"] ?: payload["chat_id"]) ?: return false
+    synchronized(lock) {
+      return historyRowsByChat.containsKey(chatId)
+    }
+  }
+
+  fun isTyping(payload: Map<String, Any?>): Boolean {
+    val chatId = normalized(payload["chatId"] ?: payload["chat_id"]) ?: return false
+    synchronized(lock) {
+      return nativeTypingStateByChatId[chatId] == true
+    }
+  }
+
   fun isLiveMessageDeleted(payload: Map<String, Any?>): Boolean {
     val chatId = normalized(payload["chatId"] ?: payload["chat_id"]) ?: return false
     val messageId = normalized(payload["messageId"] ?: payload["message_id"]) ?: return false
@@ -530,6 +1156,7 @@ internal object ChatEngine {
       }
       onlineUsers.clear()
       userIds.mapNotNullTo(onlineUsers) { normalizedUpper(it) }
+      onlineUsers.forEach { userId -> lastSeenByUserId.remove(userId) }
       state["updatedAt"] = System.currentTimeMillis()
       appendJournalLocked("set-presence-snapshot", mapOf("count" to onlineUsers.size))
       state["presenceSource"] = "shadow"
@@ -694,6 +1321,66 @@ internal object ChatEngine {
     return ChatEngineStore.getConfig(ctx)[key]
   }
 
+  fun isJsEmergencyFallbackEnabled(): Boolean =
+    synchronized(lock) {
+      when (val raw = getConfigValueLocked("chatNativeJsFallbackEnabled")) {
+        is Boolean -> raw
+        is Number -> raw.toInt() != 0
+        is String -> raw.trim().lowercase() in setOf("1", "true", "yes", "on")
+        else -> false
+      }
+    }
+
+  private fun extractPublicKeyValue(map: Map<String, Any?>): String? =
+    normalized(map["publicKey"] ?: map["friendKey"] ?: map["friendPublicKey"] ?: map["public_key"])
+
+  private fun cacheChatPeerInfoLocked(chatId: String, chat: JSONObject) {
+    val friendId = normalizedUpper(chat.opt("friendId") ?: chat.opt("friend_id"))
+    if (!friendId.isNullOrBlank()) {
+      chatPeerUserIdsByChatId[chatId] = friendId
+      val key = normalized(chat.opt("publicKey") ?: chat.opt("friendKey") ?: chat.opt("friendPublicKey") ?: chat.opt("public_key"))
+      if (!key.isNullOrBlank()) {
+        friendPublicKeysByUserId[friendId] = key
+      }
+    }
+  }
+
+  private fun resolveFriendPublicKeyLocked(chatId: String, peerUserIdHint: String?): String? {
+    val peerId = (peerUserIdHint ?: chatPeerUserIdsByChatId[chatId])?.trim()?.uppercase() ?: return null
+    friendPublicKeysByUserId[peerId]?.let { return it }
+    val apiBaseUrl = apiBaseUrlLocked() ?: return null
+    val token = authHeaderTokenLocked() ?: return null
+    val request = Request.Builder()
+      .url("$apiBaseUrl/api/user/$peerId")
+      .get()
+      .header("Accept", "application/json")
+      .header("ngrok-skip-browser-warning", "true")
+      .header("Authorization", "Bearer $token")
+      .build()
+    val response = try {
+      historyHttpClient.newCall(request).execute()
+    } catch (_: Throwable) {
+      return null
+    }
+    response.use { res ->
+      if (!res.isSuccessful) return null
+      val body = try { res.body?.string() } catch (_: Throwable) { null } ?: return null
+      return try {
+        val json = JSONObject(body)
+        val map = linkedMapOf<String, Any?>()
+        json.keys().forEach { key -> map[key] = json.opt(key) }
+        val key = extractPublicKeyValue(map)
+        if (!key.isNullOrBlank()) {
+          friendPublicKeysByUserId[peerId] = key
+          chatPeerUserIdsByChatId[chatId] = peerId
+        }
+        key
+      } catch (_: Throwable) {
+        null
+      }
+    }
+  }
+
   private fun apiBaseUrlLocked(): String? {
     val explicit = normalized(getConfigValueLocked("apiBaseUrl") ?: getConfigValueLocked("baseUrl"))
     if (!explicit.isNullOrBlank()) return explicit
@@ -778,7 +1465,16 @@ internal object ChatEngine {
       val out = linkedMapOf<String, Any?>()
       if (json.has("text")) out["text"] = json.optString("text", "")
       if (json.has("mediaUrl")) out["mediaUrl"] = json.opt("mediaUrl")
+      if (json.has("mediaKey")) out["mediaKey"] = json.opt("mediaKey")
+      if (json.has("fileName")) out["fileName"] = json.opt("fileName")
+      if (json.has("fileSize")) out["fileSize"] = json.opt("fileSize")
+      if (json.has("latitude")) out["latitude"] = json.opt("latitude")
+      if (json.has("longitude")) out["longitude"] = json.opt("longitude")
       if (json.has("duration")) out["duration"] = json.opt("duration")
+      if (json.has("replyToId")) out["replyToId"] = json.opt("replyToId")
+      if (json.has("contact")) out["contact"] = json.opt("contact")
+      if (json.has("caption")) out["caption"] = json.opt("caption")
+      if (json.has("viewOnce")) out["viewOnce"] = json.opt("viewOnce")
       if (json.has("isEdited")) out["isEdited"] = json.optBoolean("isEdited", false)
       if (json.has("editedAt")) out["editedAt"] = json.opt("editedAt")
       if (json.has("waveform")) out["waveform"] = json.opt("waveform")
@@ -814,6 +1510,23 @@ internal object ChatEngine {
     deletedMessageIdsByChat.getOrPut(chatId) { linkedSetOf() }.add(messageId)
   }
 
+  private fun findMessagePayloadLocked(chatId: String, messageId: String): Map<String, Any?>? {
+    liveMessageRowsByChat[chatId]?.get(messageId)?.get("message")?.let { message ->
+      @Suppress("UNCHECKED_CAST")
+      return message as? Map<String, Any?>
+    }
+    val historyRows = historyRowsByChat[chatId] ?: return null
+    for (row in historyRows) {
+      if (normalized(row["kind"]) != "message") continue
+      val message = row["message"] as? Map<*, *> ?: continue
+      if (normalized(message["id"]) == messageId) {
+        @Suppress("UNCHECKED_CAST")
+        return message as? Map<String, Any?>
+      }
+    }
+    return null
+  }
+
   private fun buildLiveRowPayloadLocked(
     chatId: String,
     messageId: String,
@@ -829,7 +1542,15 @@ internal object ChatEngine {
     val isMe = normalizedUpper(fromId) != null && normalizedUpper(fromId) == currentUserIdLocked()
     val text = normalized(decryptedFields["text"]) ?: ""
     val mediaUrl = normalized(decryptedFields["mediaUrl"])
+    val localMediaUrl =
+      normalized(decryptedFields["localMediaUrl"] ?: decryptedFields["local_media_url"])
+    val fileName = normalized(decryptedFields["fileName"])
+    val fileSize = parseLongValue(decryptedFields["fileSize"])
+    val latitude = parseDoubleValue(decryptedFields["latitude"])
+    val longitude = parseDoubleValue(decryptedFields["longitude"])
     val duration = parseDoubleValue(decryptedFields["duration"])
+    val replyToId = normalized(decryptedFields["replyToId"])
+    val caption = normalized(decryptedFields["caption"])
     val waveform = parseWaveformArray(decryptedFields["waveform"])
     val isEdited = forceEdited || ((decryptedFields["isEdited"] as? Boolean) == true)
     val editedAt = forceEditedAt ?: decryptedFields["editedAt"]
@@ -840,6 +1561,14 @@ internal object ChatEngine {
     if (decryptedFields["height"] != null) metadata["height"] = decryptedFields["height"]
     if (decryptedFields["thumbnailBase64"] != null) metadata["thumbnailBase64"] = decryptedFields["thumbnailBase64"]
     if (decryptedFields["isVideoNote"] != null) metadata["isVideoNote"] = decryptedFields["isVideoNote"]
+    if (fileSize != null) metadata["fileSize"] = fileSize
+    if (latitude != null) metadata["latitude"] = latitude
+    if (longitude != null) metadata["longitude"] = longitude
+    if (decryptedFields["viewOnce"] != null) metadata["viewOnce"] = decryptedFields["viewOnce"]
+    if (decryptedFields["contact"] != null) metadata["contact"] = decryptedFields["contact"]
+    if (caption != null) metadata["caption"] = caption
+    if (decryptedFields["mediaKey"] != null) metadata["mediaKey"] = decryptedFields["mediaKey"]
+    if (!localMediaUrl.isNullOrBlank()) metadata["localMediaUrl"] = localMediaUrl
 
     val message = linkedMapOf<String, Any?>(
       "id" to messageId,
@@ -855,7 +1584,12 @@ internal object ChatEngine {
       "editedAt" to editedAt,
       "encryptedContent" to encryptedContent,
       "mediaUrl" to mediaUrl,
+      "localMediaUrl" to localMediaUrl,
+      "fileName" to fileName,
       "duration" to duration,
+      "replyToId" to replyToId,
+      "caption" to caption,
+      "contact" to decryptedFields["contact"],
       "metadata" to metadata.takeIf { it.isNotEmpty() },
       "bubbleShape" to mapOf(
         "showTail" to true,
@@ -891,7 +1625,7 @@ internal object ChatEngine {
     }
     val decryptionFailed = hadEncryptedContent && decryptedText.isEmpty()
     val decryptedFields = parseDecryptedMessagePayload(decryptedText)
-    val row = buildLiveRowPayloadLocked(
+    var row = buildLiveRowPayloadLocked(
       chatId = chatId,
       messageId = messageId,
       fromId = fromId,
@@ -906,6 +1640,17 @@ internal object ChatEngine {
       val message = (row["message"] as? MutableMap<String, Any?>) ?: mutableMapOf()
       message["decryptionFailed"] = true
       (row as? MutableMap<String, Any?>)?.put("message", message)
+    }
+    if ((type.equals("voice", ignoreCase = true) || type.equals("music", ignoreCase = true)) && isMe) {
+      val existingMessage = findMessagePayloadLocked(chatId, messageId)
+      val localPlaybackUrl = extractLocalPlaybackMediaUrlFromMessage(existingMessage)
+      if (!localPlaybackUrl.isNullOrBlank()) {
+        Log.d(
+          "ChatEngine",
+          "preserve local voice url on incoming echo chatId=$chatId messageId=$messageId local=${localPlaybackUrl.take(120)}",
+        )
+        row = mergeLocalPlaybackMediaUrlIntoRow(row, localPlaybackUrl)
+      }
     }
     upsertLiveMessageRowLocked(chatId, messageId, row)
     appendJournalLocked("native-message-row-upsert", mapOf("chatId" to chatId, "messageId" to messageId, "type" to type))
@@ -925,7 +1670,269 @@ internal object ChatEngine {
     appendJournalLocked("native-chat-join-start", mapOf("chatId" to chatId, "ref" to ref))
   }
 
+  private fun queueOutboundDraftLocked(
+    chatId: String,
+    messageId: String,
+    payload: Map<String, Any?>,
+    reason: String,
+  ) {
+    pendingOutboundDraftsByMessageId[messageId] = LinkedHashMap(payload)
+    val ids = pendingOutboundQueueByChat.getOrPut(chatId) { mutableListOf() }
+    if (ids.contains(messageId)) return
+    ids.add(messageId)
+    appendJournalLocked("native-outgoing-queued", mapOf("chatId" to chatId, "messageId" to messageId, "reason" to reason))
+    emitChangeLocked("outgoingMessageQueued", chatId, messageId)
+  }
+
+  private fun removeQueuedOutboundDraftLocked(chatId: String, messageId: String, dropDraft: Boolean) {
+    pendingOutboundQueueByChat[chatId]?.let { ids ->
+      ids.removeAll { it == messageId }
+      if (ids.isEmpty()) pendingOutboundQueueByChat.remove(chatId)
+    }
+    if (dropDraft) pendingOutboundDraftsByMessageId.remove(messageId)
+  }
+
+  private fun scheduleReplayQueuedOutboundLocked(chatId: String, trigger: String) {
+    val ids = pendingOutboundQueueByChat[chatId]?.toList().orEmpty()
+    if (ids.isEmpty()) return
+    val inFlight = nativePendingMessagePushRefs.values.toSet()
+    val drafts = ids.mapNotNull { messageId ->
+      if (inFlight.contains(chatId to messageId)) return@mapNotNull null
+      pendingOutboundDraftsByMessageId[messageId]
+    }
+    if (drafts.isEmpty()) return
+    appendJournalLocked("native-outgoing-replay-scheduled", mapOf("chatId" to chatId, "count" to drafts.size, "trigger" to trigger))
+    Thread {
+      drafts.forEach { draft ->
+        try {
+          sendMessage(draft)
+        } catch (_: Throwable) {
+        }
+      }
+    }.start()
+  }
+
   private fun chatTopic(chatId: String): String = "chat:$chatId"
+
+  private data class LocalMediaUploadResult(
+    val remoteUrl: String,
+    val fileName: String?,
+    val fileSize: Long?,
+  )
+
+  private sealed class LocalMediaUploadOutcome {
+    data class Success(val value: LocalMediaUploadResult) : LocalMediaUploadOutcome()
+    data class Failure(val reason: String) : LocalMediaUploadOutcome()
+  }
+
+  private data class LocalMediaSource(
+    val body: RequestBody,
+    val fileName: String,
+    val fileSize: Long?,
+  )
+
+  private fun isLocalMediaUri(uri: String): Boolean =
+    uri.startsWith("file://") || uri.startsWith("/") || uri.startsWith("content://")
+
+  private fun extractLocalPlaybackMediaUrlFromMessage(message: Map<*, *>?): String? {
+    if (message == null) return null
+    val metadata = message["metadata"] as? Map<*, *>
+    val candidates = listOf(
+      message["localMediaUrl"],
+      message["local_media_url"],
+      metadata?.get("localMediaUrl"),
+      metadata?.get("local_media_url"),
+      message["mediaUrl"],
+      message["media_url"],
+      metadata?.get("mediaUrl"),
+      metadata?.get("media_url"),
+      message["uri"],
+      metadata?.get("uri"),
+      message["audioUrl"],
+      message["audio_url"],
+      metadata?.get("audioUrl"),
+      metadata?.get("audio_url"),
+    )
+    for (raw in candidates) {
+      val value = normalized(raw) ?: continue
+      if (isLocalMediaUri(value)) return value
+    }
+    return null
+  }
+
+  private fun mergeLocalPlaybackMediaUrlIntoRow(
+    row: Map<String, Any?>,
+    localUrl: String,
+  ): Map<String, Any?> {
+    val mutableRow = LinkedHashMap(row)
+    val messageRaw = mutableRow["message"] as? Map<*, *> ?: return mutableRow
+    val mutableMessage = linkedMapOf<String, Any?>()
+    messageRaw.forEach { (k, v) -> if (k != null) mutableMessage[k.toString()] = v }
+    mutableMessage["localMediaUrl"] = localUrl
+    val metadataRaw = mutableMessage["metadata"] as? Map<*, *>
+    val mutableMetadata = linkedMapOf<String, Any?>()
+    metadataRaw?.forEach { (k, v) -> if (k != null) mutableMetadata[k.toString()] = v }
+    mutableMetadata["localMediaUrl"] = localUrl
+    mutableMessage["metadata"] = mutableMetadata
+    mutableRow["message"] = mutableMessage
+    return mutableRow
+  }
+
+  private fun uploadCategoryForMessageType(messageType: String): String =
+    when (messageType) {
+      "image", "gif" -> "image"
+      "voice", "music" -> "audio"
+      "video" -> "video"
+      else -> "file"
+    }
+
+  private fun resolveUploadUrl(apiBaseUrl: String): String? {
+    val trimmed = apiBaseUrl.trim().trimEnd('/')
+    if (trimmed.isBlank()) return null
+    val serverBase = if (trimmed.endsWith("/api", ignoreCase = true)) {
+      trimmed.dropLast(4).trimEnd('/')
+    } else {
+      trimmed
+    }
+    return if (serverBase.isBlank()) null else "$serverBase/api/media/upload"
+  }
+
+  private fun inferMimeType(fileName: String, fallbackType: String): String {
+    val ext = fileName.substringAfterLast('.', "").lowercase()
+    if (ext.isNotBlank()) {
+      return when (ext) {
+        "jpg", "jpeg" -> "image/jpeg"
+        "png" -> "image/png"
+        "gif" -> "image/gif"
+        "webp" -> "image/webp"
+        "heic" -> "image/heic"
+        "m4a" -> "audio/mp4"
+        "mp3" -> "audio/mpeg"
+        "wav" -> "audio/wav"
+        "aac" -> "audio/aac"
+        "mp4" -> "video/mp4"
+        "mov" -> "video/quicktime"
+        else -> "application/octet-stream"
+      }
+    }
+    return when (fallbackType) {
+      "image", "gif" -> "image/jpeg"
+      "voice", "music" -> "audio/mp4"
+      "video" -> "video/mp4"
+      else -> "application/octet-stream"
+    }
+  }
+
+  private fun displayNameForContentUri(uri: Uri): String? {
+    val ctx = appContextRef ?: return null
+    return try {
+      ctx.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+        val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+        if (index >= 0 && cursor.moveToFirst()) cursor.getString(index) else null
+      }
+    } catch (_: Throwable) {
+      null
+    }
+  }
+
+  private fun fileSizeForContentUri(uri: Uri): Long? {
+    val ctx = appContextRef ?: return null
+    return try {
+      ctx.contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { cursor ->
+        val index = cursor.getColumnIndex(OpenableColumns.SIZE)
+        if (index >= 0 && cursor.moveToFirst()) cursor.getLong(index) else null
+      }
+    } catch (_: Throwable) {
+      null
+    }
+  }
+
+  private fun resolveLocalMediaSource(
+    localUri: String,
+    fileNameHint: String?,
+    messageType: String,
+  ): LocalMediaSource? {
+    val ctx = appContextRef ?: return null
+    val parsed = try { Uri.parse(localUri) } catch (_: Throwable) { null }
+    if (parsed != null && parsed.scheme.equals("content", ignoreCase = true)) {
+      val input = try { ctx.contentResolver.openInputStream(parsed) } catch (_: Throwable) { null } ?: return null
+      input.use { stream ->
+        val bytes = try { stream.readBytes() } catch (_: Throwable) { return null }
+        val resolvedName = fileNameHint
+          ?: displayNameForContentUri(parsed)
+          ?: "upload_${System.currentTimeMillis()}"
+        val resolvedMime = ctx.contentResolver.getType(parsed)
+          ?: inferMimeType(resolvedName, messageType)
+        val body = bytes.toRequestBody(resolvedMime.toMediaTypeOrNull())
+        val size = fileSizeForContentUri(parsed) ?: bytes.size.toLong()
+        return LocalMediaSource(body = body, fileName = resolvedName, fileSize = size)
+      }
+    }
+
+    val file = try {
+      when {
+        localUri.startsWith("file://") -> File(Uri.parse(localUri).path ?: "")
+        localUri.startsWith("/") -> File(localUri)
+        else -> File(localUri)
+      }
+    } catch (_: Throwable) {
+      return null
+    }
+    if (!file.exists() || !file.isFile) return null
+    val resolvedName = fileNameHint
+      ?: file.name.takeIf { it.isNotBlank() }
+      ?: "upload_${System.currentTimeMillis()}"
+    val resolvedMime = inferMimeType(resolvedName, messageType)
+    val body = file.asRequestBody(resolvedMime.toMediaTypeOrNull())
+    return LocalMediaSource(body = body, fileName = resolvedName, fileSize = file.length())
+  }
+
+  private fun uploadLocalMediaLocked(
+    localUri: String,
+    messageType: String,
+    fileNameHint: String?,
+    userId: String,
+    token: String,
+    apiBaseUrl: String,
+  ): LocalMediaUploadOutcome {
+    val uploadUrl = resolveUploadUrl(apiBaseUrl) ?: return LocalMediaUploadOutcome.Failure("invalid_upload_url")
+    val source = resolveLocalMediaSource(localUri, fileNameHint, messageType)
+      ?: return LocalMediaUploadOutcome.Failure("media_file_missing")
+    val multipart = MultipartBody.Builder()
+      .setType(MultipartBody.FORM)
+      .addFormDataPart("file", source.fileName, source.body)
+      .addFormDataPart("user_id", userId)
+      .addFormDataPart("type", uploadCategoryForMessageType(messageType))
+      .build()
+    val request = Request.Builder()
+      .url(uploadUrl)
+      .post(multipart)
+      .header("ngrok-skip-browser-warning", "true")
+      .header("Authorization", "Bearer $token")
+      .build()
+    val response = try {
+      historyHttpClient.newCall(request).execute()
+    } catch (_: Throwable) {
+      return LocalMediaUploadOutcome.Failure("upload_failed")
+    }
+    response.use { res ->
+      if (!res.isSuccessful) return LocalMediaUploadOutcome.Failure("upload_failed")
+      val body = try { res.body?.string() } catch (_: Throwable) { null } ?: return LocalMediaUploadOutcome.Failure("upload_failed")
+      val remoteUrl = try {
+        val json = JSONObject(body)
+        normalized(json.opt("url") ?: json.opt("mediaUrl") ?: json.opt("media_url"))
+      } catch (_: Throwable) {
+        null
+      } ?: return LocalMediaUploadOutcome.Failure("invalid_upload_response")
+      return LocalMediaUploadOutcome.Success(
+        LocalMediaUploadResult(
+          remoteUrl = remoteUrl,
+          fileName = source.fileName,
+          fileSize = source.fileSize,
+        ),
+      )
+    }
+  }
 
   private fun loadChatHistoryIfNeededLocked(chatId: String, force: Boolean = false) {
     if (chatId.isBlank()) return
@@ -944,7 +1951,7 @@ internal object ChatEngine {
     appendJournalLocked("native-chat-history-load-start", mapOf("chatId" to chatId))
 
     val requestBuilder = Request.Builder()
-      .url("$apiBaseUrl/chats/$userId")
+      .url("$apiBaseUrl/api/chats/$userId")
       .get()
       .header("Accept", "application/json")
       .header("ngrok-skip-browser-warning", "true")
@@ -994,6 +2001,7 @@ internal object ChatEngine {
           break
         }
       }
+      targetChat?.let { cacheChatPeerInfoLocked(chatId, it) }
       val messages = targetChat?.optJSONArray("messages") ?: JSONArray()
       val rows = buildHistoryRowsLocked(chatId, messages)
       historyRowsByChat[chatId] = rows.toMutableList()
@@ -1094,6 +2102,8 @@ internal object ChatEngine {
       nativePendingMessagePushRefs.clear()
       nativePendingEditPushRefs.clear()
       nativePendingDeletePushRefs.clear()
+      nativeTypingStateByChatId.clear()
+      nativeRecordingStateByChatId.clear()
       historyLoadingChats.clear()
       liveMessageRowsByChat.clear()
       deletedMessageIdsByChat.clear()
@@ -1104,6 +2114,13 @@ internal object ChatEngine {
 
   private fun onNativeSocketClosed(code: Int, reason: String?) {
     synchronized(lock) {
+      val inFlightMessages = nativePendingMessagePushRefs.values.toList()
+      inFlightMessages.forEach { (chatId, messageId) ->
+        upsertLocalStatusLocked(chatId, messageId, "pending")
+        pendingOutboundDraftsByMessageId[messageId]?.let { draft ->
+          queueOutboundDraftLocked(chatId, messageId, draft, "socket_closed")
+        }
+      }
       nativePresenceActive = false
       nativeUserJoinRef = null
       nativeChatJoinRefsByRef.clear()
@@ -1111,6 +2128,8 @@ internal object ChatEngine {
       nativePendingMessagePushRefs.clear()
       nativePendingEditPushRefs.clear()
       nativePendingDeletePushRefs.clear()
+      nativeTypingStateByChatId.clear()
+      nativeRecordingStateByChatId.clear()
       historyLoadingChats.clear()
       liveMessageRowsByChat.clear()
       deletedMessageIdsByChat.clear()
@@ -1165,6 +2184,7 @@ internal object ChatEngine {
           if (status == "ok") {
             nativeJoinedChatIds.add(joinedChatId)
             appendJournalLocked("native-chat-joined", mapOf("chatId" to joinedChatId))
+            scheduleReplayQueuedOutboundLocked(joinedChatId, "chat_joined")
           } else {
             appendJournalLocked("native-chat-join-error", mapOf("chatId" to joinedChatId, "status" to status))
           }
@@ -1178,6 +2198,9 @@ internal object ChatEngine {
           val (chatId, messageId) = pending
           val status = normalized(payload["status"])?.lowercase().orEmpty()
           val nextStatus = if (status == "ok") "sent" else "error"
+          if (status == "ok") {
+            removeQueuedOutboundDraftLocked(chatId, messageId, dropDraft = true)
+          }
           upsertLocalStatusLocked(chatId, messageId, nextStatus)
           appendJournalLocked(
             "native-message-push-reply",
@@ -1216,6 +2239,10 @@ internal object ChatEngine {
       }
       if (topic.startsWith("chat:")) {
         val chatId = topic.removePrefix("chat:")
+        if (event == "typing" || event == "stop-typing") {
+          emitChangeLocked("peerTyping", chatId, if (event == "typing") "true" else "false")
+          return
+        }
         if (event == "message") {
           val insertedMessageId = applyNativeIncomingMessageEventLocked(chatId, payload)
           if (!insertedMessageId.isNullOrBlank()) {
@@ -1254,6 +2281,7 @@ internal object ChatEngine {
         onlineUsers.clear()
         ((payload["onlineFriendIds"] as? List<*>) ?: emptyList<Any?>())
           .mapNotNullTo(onlineUsers) { normalizedUpper(it) }
+        onlineUsers.forEach { userId -> lastSeenByUserId.remove(userId) }
         appendJournalLocked("native-presence-initial", mapOf("count" to onlineUsers.size))
         true
       }
@@ -1261,6 +2289,7 @@ internal object ChatEngine {
       "friend-online" -> {
         val userId = normalizedUpper(payload["userId"] ?: payload["user_id"] ?: payload["id"]) ?: return false
         onlineUsers.add(userId)
+        lastSeenByUserId.remove(userId)
         appendJournalLocked("native-presence-online", mapOf("userId" to userId))
         true
       }
@@ -1268,13 +2297,19 @@ internal object ChatEngine {
       "friend-offline" -> {
         val userId = normalizedUpper(payload["userId"] ?: payload["user_id"] ?: payload["id"]) ?: return false
         onlineUsers.remove(userId)
-        appendJournalLocked("native-presence-offline", mapOf("userId" to userId))
+        val lastSeen =
+          parseLongValue(
+            payload["lastSeenMs"] ?: payload["last_seen_ms"] ?: payload["lastSeen"] ?: payload["last_seen"],
+          ) ?: System.currentTimeMillis()
+        lastSeenByUserId[userId] = lastSeen
+        appendJournalLocked("native-presence-offline", mapOf("userId" to userId, "lastSeenMs" to lastSeen))
         true
       }
 
       "presence_state" -> {
         onlineUsers.clear()
         payload.keys.mapNotNullTo(onlineUsers) { normalizedUpper(it) }
+        onlineUsers.forEach { userId -> lastSeenByUserId.remove(userId) }
         appendJournalLocked("native-presence-state", mapOf("count" to onlineUsers.size))
         true
       }
@@ -1283,10 +2318,16 @@ internal object ChatEngine {
         val joins = (payload["joins"] as? Map<*, *>) ?: emptyMap<String, Any?>()
         val leaves = (payload["leaves"] as? Map<*, *>) ?: emptyMap<String, Any?>()
         joins.keys.forEach { key ->
-          normalizedUpper(key)?.let { onlineUsers.add(it) }
+          normalizedUpper(key)?.let {
+            onlineUsers.add(it)
+            lastSeenByUserId.remove(it)
+          }
         }
         leaves.keys.forEach { key ->
-          normalizedUpper(key)?.let { onlineUsers.remove(it) }
+          normalizedUpper(key)?.let {
+            onlineUsers.remove(it)
+            lastSeenByUserId[it] = System.currentTimeMillis()
+          }
         }
         appendJournalLocked(
           "native-presence-diff",
@@ -1394,6 +2435,8 @@ internal object ChatEngine {
     val ctx = appContextRef
     val out = LinkedHashMap<String, Any?>(state)
     out["onlineUserCount"] = onlineUsers.size
+    out["onlineUserIds"] = onlineUsers.toList().sorted()
+    out["lastSeenUserCount"] = lastSeenByUserId.size
     out["boundSurfaceCount"] = surfaceBindings.size
     out["boundChatCount"] = surfaceBindings.values.mapNotNull { it.chatId }.toSet().size
     out["openChatChannelCount"] = openChatChannels.size
@@ -1401,6 +2444,8 @@ internal object ChatEngine {
     out["receiptCount"] = receiptIndex.values.sumOf { it.size }
     out["localStatusCount"] = localStatusIndex.values.sumOf { it.size }
     out["nativeJoinedChatCount"] = nativeJoinedChatIds.size
+    out["outboundDraftCount"] = pendingOutboundDraftsByMessageId.size
+    out["outboundQueuedCount"] = pendingOutboundQueueByChat.values.sumOf { it.size }
     out["journalCount"] = if (ctx != null) ChatEngineStore.getJournal(ctx).size else 0
     return out
   }

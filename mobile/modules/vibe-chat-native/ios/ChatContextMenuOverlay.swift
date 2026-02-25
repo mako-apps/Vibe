@@ -96,9 +96,12 @@ public final class ChatContextMenuOverlay: UIView {
     self.backgroundGlassView.contentView.addSubview(colorOverlay)
     NSLayoutConstraint.activate([
       colorOverlay.topAnchor.constraint(equalTo: self.backgroundGlassView.contentView.topAnchor),
-      colorOverlay.bottomAnchor.constraint(equalTo: self.backgroundGlassView.contentView.bottomAnchor),
-      colorOverlay.leadingAnchor.constraint(equalTo: self.backgroundGlassView.contentView.leadingAnchor),
-      colorOverlay.trailingAnchor.constraint(equalTo: self.backgroundGlassView.contentView.trailingAnchor),
+      colorOverlay.bottomAnchor.constraint(
+        equalTo: self.backgroundGlassView.contentView.bottomAnchor),
+      colorOverlay.leadingAnchor.constraint(
+        equalTo: self.backgroundGlassView.contentView.leadingAnchor),
+      colorOverlay.trailingAnchor.constraint(
+        equalTo: self.backgroundGlassView.contentView.trailingAnchor),
     ])
 
     self.reactionPicker = ReactionPickerView(appearance: appearance, messageId: messageId)
@@ -139,7 +142,7 @@ public final class ChatContextMenuOverlay: UIView {
     // 4. Context menu (below or above bubble)
     contextMenu.alpha = 0
     contextMenu.delegate = self
-    contextMenu.frame = CGRect(x: 0, y: 0, width: 250, height: 1)
+    contextMenu.frame = CGRect(x: 0, y: 0, width: 220, height: 1)
     addSubview(contextMenu)
   }
 
@@ -155,6 +158,23 @@ public final class ChatContextMenuOverlay: UIView {
 
   // MARK: - Layout
 
+  private func keyboardHostFrameInScreen(for window: UIWindow) -> CGRect? {
+    func walk(_ view: UIView) -> CGRect? {
+      let className = NSStringFromClass(type(of: view))
+      if className.contains("UIInputSetHostView") || className.contains("UIInputSetContainerView") {
+        return view.convert(view.bounds, to: nil)
+      }
+      // Traverse from top-most subviews first.
+      for child in view.subviews.reversed() {
+        if let frame = walk(child) {
+          return frame
+        }
+      }
+      return nil
+    }
+    return walk(window)
+  }
+
   private func keyboardTopInOverlaySpace() -> CGFloat? {
     guard #available(iOS 13.0, *) else { return nil }
     let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
@@ -169,8 +189,8 @@ public final class ChatContextMenuOverlay: UIView {
         || className.contains("UITextEffectsWindow")
       guard looksLikeKeyboard else { continue }
 
-      let frameInScreen = candidate.convert(candidate.bounds, to: nil)
-      let frameInOverlay = convert(frameInScreen, from: nil)
+      guard let frameInScreen = keyboardHostFrameInScreen(for: candidate) else { continue }
+      let frameInOverlay = self.convert(frameInScreen, from: nil)
       let intersection = bounds.intersection(frameInOverlay)
       guard !intersection.isNull, intersection.height > 0 else { continue }
       top = min(top ?? intersection.minY, intersection.minY)
@@ -191,8 +211,8 @@ public final class ChatContextMenuOverlay: UIView {
     if safeBottom <= safeTop + 40 {
       safeBottom = bounds.height - safeAreaInsets.bottom - 10
     }
-    let safeLeft: CGFloat = 12
-    let safeRight = bounds.width - 12
+    let safeLeft: CGFloat = 16
+    let safeRight = bounds.width - 16
 
     // Measure reaction picker
     let pickerSize = reactionPicker.intrinsicContentSize
@@ -200,7 +220,7 @@ public final class ChatContextMenuOverlay: UIView {
     let pickerGap: CGFloat = 8
 
     // Measure context menu
-    let menuWidth: CGFloat = min(250, bounds.width - 24)
+    let menuWidth: CGFloat = min(220, bounds.width - 32)
     let menuHeight = contextMenu.systemLayoutSizeFitting(
       CGSize(width: menuWidth, height: UIView.layoutFittingCompressedSize.height)
     ).height
@@ -301,31 +321,29 @@ public final class ChatContextMenuOverlay: UIView {
       self.backgroundGlassView.alpha = 1
     }
 
-    // --- Bubble: Telegram-like hold scale on bubble itself (translation kept independent) ---
+    // --- Bubble: Telegram-style quick extracted hold + settle ---
     let startCenter = CGPoint(x: originalBubbleFrame.midX, y: originalBubbleFrame.midY)
     let endCenter = CGPoint(x: finalBubbleFrame.midX, y: finalBubbleFrame.midY)
     bubbleSnapshot.bounds = CGRect(origin: .zero, size: originalBubbleFrame.size)
     bubbleSnapshot.center = startCenter
     bubbleSnapshot.transform = .identity
 
-    // Telegram uses target content width; for compact bubbles clamp the side so hold-scale
-    // doesn't over-shrink tiny messages.
-    let scaleSide = max(finalBubbleFrame.width, 180.0)
-    let heldScale = max(0.90, (scaleSide - 15.0) / scaleSide)
     UIView.animate(
-      withDuration: 0.22,
-      delay: 0,
+      withDuration: 0.20,
+      delay: 0.0,
       options: [.curveEaseOut, .beginFromCurrentState]
     ) {
+      self.bubbleSnapshot.transform = .identity
       self.bubbleSnapshot.center = endCenter
-      self.bubbleSnapshot.transform = CGAffineTransform(scaleX: heldScale, y: heldScale)
     }
 
     // --- Reaction picker: directional clip reveal (left/right based on bubble side) ---
     reactionPicker.frame = pickerFinalFrame
     setAnchorPoint(CGPoint(x: isRightAligned ? 1.0 : 0.0, y: 0.5), for: reactionPicker)
     reactionPicker.alpha = 0
-    reactionPicker.transform = CGAffineTransform(translationX: isRightAligned ? 6 : -6, y: 0)
+    reactionPicker.transform =
+      CGAffineTransform(translationX: isRightAligned ? 8 : -8, y: 0)
+      .scaledBy(x: 0.92, y: 0.92)
 
     let pickerMask = CALayer()
     pickerMask.backgroundColor = UIColor.black.cgColor
@@ -338,14 +356,27 @@ public final class ChatContextMenuOverlay: UIView {
     reactionPicker.layer.mask = pickerMask
     reactionMaskLayer = pickerMask
 
+    let revealDelay: TimeInterval = 0.0
+    let revealDuration: TimeInterval = 0.42
     UIView.animate(
-      withDuration: 0.42, delay: 0.02, options: [.curveEaseOut, .beginFromCurrentState]
+      withDuration: 0.2,
+      delay: revealDelay,
+      options: [.curveEaseOut, .beginFromCurrentState]
+    ) {
+      self.reactionPicker.alpha = 1
+    }
+    UIView.animate(
+      withDuration: revealDuration,
+      delay: revealDelay,
+      usingSpringWithDamping: 0.82,
+      initialSpringVelocity: 0.0,
+      options: [.beginFromCurrentState, .curveEaseOut]
     ) {
       self.reactionPicker.alpha = 1
       self.reactionPicker.transform = .identity
     }
     CATransaction.begin()
-    CATransaction.setAnimationDuration(0.42)
+    CATransaction.setAnimationDuration(revealDuration)
     CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
     pickerMask.frame = CGRect(
       x: 0,
@@ -358,7 +389,7 @@ public final class ChatContextMenuOverlay: UIView {
     // --- Context menu: height reveal (no pop-in scale) ---
     contextMenu.frame = menuFinalFrame
     setAnchorPoint(CGPoint(x: isRightAligned ? 1.0 : 0.0, y: 0.0), for: contextMenu)
-    contextMenu.transform = CGAffineTransform(translationX: 0, y: -2)
+    contextMenu.transform = CGAffineTransform(translationX: 0, y: -4).scaledBy(x: 0.92, y: 0.92)
     contextMenu.alpha = 0
 
     let menuMask = CALayer()
@@ -368,13 +399,24 @@ public final class ChatContextMenuOverlay: UIView {
     contextMenuMaskLayer = menuMask
 
     UIView.animate(
-      withDuration: 0.42, delay: 0.02, options: [.curveEaseOut, .beginFromCurrentState]
+      withDuration: 0.2,
+      delay: revealDelay,
+      options: [.curveEaseOut, .beginFromCurrentState]
+    ) {
+      self.contextMenu.alpha = 1
+    }
+    UIView.animate(
+      withDuration: revealDuration,
+      delay: revealDelay,
+      usingSpringWithDamping: 0.82,
+      initialSpringVelocity: 0.0,
+      options: [.beginFromCurrentState, .curveEaseOut]
     ) {
       self.contextMenu.alpha = 1
       self.contextMenu.transform = .identity
     }
     CATransaction.begin()
-    CATransaction.setAnimationDuration(0.42)
+    CATransaction.setAnimationDuration(revealDuration)
     CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
     menuMask.frame = CGRect(x: 0, y: 0, width: menuFinalFrame.width, height: menuFinalFrame.height)
     CATransaction.commit()
@@ -647,7 +689,8 @@ final class ContextMenuView: UIView {
         line.translatesAutoresizingMaskIntoConstraints = false
         sepContainer.addSubview(line)
 
-        let sepHeight = sepContainer.heightAnchor.constraint(equalToConstant: 1.0 / UIScreen.main.scale)
+        let sepHeight = sepContainer.heightAnchor.constraint(
+          equalToConstant: 1.0 / UIScreen.main.scale)
         sepHeight.priority = .defaultHigh
         let lineLeading = line.leadingAnchor.constraint(
           greaterThanOrEqualTo: sepContainer.leadingAnchor,
@@ -705,7 +748,7 @@ final class ContextMenuRow: UIControl {
     titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
     titleLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
-    let config = UIImage.SymbolConfiguration(pointSize: 19, weight: .regular)
+    let config = UIImage.SymbolConfiguration(pointSize: 18, weight: .regular)
     if let image = UIImage(systemName: action.iconName, withConfiguration: config) {
       iconView.image = image
       iconView.tintColor = action.isDestructive ? .systemRed : .label
@@ -718,30 +761,20 @@ final class ContextMenuRow: UIControl {
     titleLabel.translatesAutoresizingMaskIntoConstraints = false
     iconView.translatesAutoresizingMaskIntoConstraints = false
 
-    let rowHeight = heightAnchor.constraint(equalToConstant: 52)
+    let rowHeight = heightAnchor.constraint(equalToConstant: 44)
     rowHeight.priority = .defaultHigh
-    let labelLeading = titleLabel.leadingAnchor.constraint(
-      greaterThanOrEqualTo: iconView.trailingAnchor,
-      constant: 16
-    )
-    labelLeading.priority = .defaultHigh
-    let labelTrailing = titleLabel.trailingAnchor.constraint(
-      lessThanOrEqualTo: trailingAnchor,
-      constant: -18
-    )
-    labelTrailing.priority = .defaultLow
 
     NSLayoutConstraint.activate([
       rowHeight,
 
-      iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 18),
+      iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
       iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
-      iconView.widthAnchor.constraint(equalToConstant: 24),
-      iconView.heightAnchor.constraint(equalToConstant: 24),
+      iconView.widthAnchor.constraint(equalToConstant: 22),
+      iconView.heightAnchor.constraint(equalToConstant: 22),
 
-      labelLeading,
+      titleLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 12),
+      titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -16),
       titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
-      labelTrailing,
     ])
   }
 

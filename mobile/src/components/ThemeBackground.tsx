@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { StyleSheet, useWindowDimensions, ViewStyle } from 'react-native'
+import { StyleSheet, useWindowDimensions, StyleProp, ViewStyle } from 'react-native'
 import {
     Path,
     Circle,
@@ -21,7 +21,7 @@ export type BackgroundPattern = 'geometric' | 'fluid' | 'bubbles' | 'particles' 
 interface ThemeBackgroundProps {
     pattern?: BackgroundPattern
     opacity?: number
-    style?: ViewStyle
+    style?: StyleProp<ViewStyle>
 }
 
 export default function ThemeBackground({ pattern = 'fluid', opacity, style }: ThemeBackgroundProps) {

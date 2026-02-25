@@ -87,24 +87,24 @@ private func extractPKCS1FromPKCS8(_ data: Data) -> Data? {
 
 private func decodePEM(_ pem: String) -> PEMDecodeResult {
   let hadEscapedNewlines = pem.contains("\\n") || pem.contains("\\r")
-  let normalized = pem
+  let normalized =
+    pem
     .replacingOccurrences(of: "\\r\\n", with: "\n")
     .replacingOccurrences(of: "\\n", with: "\n")
     .replacingOccurrences(of: "\\r", with: "\n")
     .trimmingCharacters(in: .whitespacesAndNewlines)
   let label = pemLabel(from: normalized)
 
-  let withoutHeaders = normalized
+  let withoutHeaders =
+    normalized
     .replacingOccurrences(of: "-----BEGIN [^-]+-----", with: "", options: .regularExpression)
     .replacingOccurrences(of: "-----END [^-]+-----", with: "", options: .regularExpression)
-  let sanitized = withoutHeaders.replacingOccurrences(
-    of: "\\s+",
-    with: "",
-    options: .regularExpression
-  )
+  let sanitized = withoutHeaders
 
+  // Use .ignoreUnknownCharacters so whitespace/newlines in the base64 body
+  // are silently skipped — Data(base64Encoded:) rejects them by default.
   return PEMDecodeResult(
-    data: Data(base64Encoded: sanitized),
+    data: Data(base64Encoded: sanitized, options: .ignoreUnknownCharacters),
     label: label,
     hadEscapedNewlines: hadEscapedNewlines,
     inputLength: pem.count,
@@ -116,7 +116,7 @@ private func decodePEM(_ pem: String) -> PEMDecodeResult {
 private func secKeyFromData(_ keyData: Data, keyClass: CFString) -> (SecKey?, String?) {
   let attrs: [String: Any] = [
     kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
-    kSecAttrKeyClass as String: keyClass
+    kSecAttrKeyClass as String: keyClass,
   ]
   var error: Unmanaged<CFError>?
   let key = SecKeyCreateWithData(keyData as CFData, attrs as CFDictionary, &error)
@@ -135,7 +135,8 @@ private func describeKeyFailure(
   importError: String?
 ) -> String {
   let errorText = importError ?? "unknown"
-  return "label=\(label), escapedNewlines=\(hadEscapedNewlines), input=\(inputLength), normalized=\(normalizedLength), base64=\(base64Length), der=\(derLength), step=\(failureStep), error=\(errorText)"
+  return
+    "label=\(label), escapedNewlines=\(hadEscapedNewlines), input=\(inputLength), normalized=\(normalizedLength), base64=\(base64Length), der=\(derLength), step=\(failureStep), error=\(errorText)"
 }
 
 private func privateSecKey(from pem: String) -> (key: SecKey?, failureDetails: String?) {
@@ -191,7 +192,8 @@ private func privateSecKey(from pem: String) -> (key: SecKey?, failureDetails: S
       normalizedLength: decoded.normalizedLength,
       base64Length: decoded.base64Length,
       derLength: keyData.count,
-      failureStep: decoded.label == "PRIVATE KEY" ? "extractPKCS1FromPKCS8" : "SecKeyCreateWithData",
+      failureStep: decoded.label == "PRIVATE KEY"
+        ? "extractPKCS1FromPKCS8" : "SecKeyCreateWithData",
       importError: directResult.1
     )
   )
@@ -207,12 +209,13 @@ private func publicSecKey(from pem: String) -> SecKey? {
 
 private func rsaDecryptOAEP(privateKey: SecKey, encrypted: Data) -> Data? {
   var error: Unmanaged<CFError>?
-  let decrypted = SecKeyCreateDecryptedData(
-    privateKey,
-    .rsaEncryptionOAEPSHA256,
-    encrypted as CFData,
-    &error
-  ) as Data?
+  let decrypted =
+    SecKeyCreateDecryptedData(
+      privateKey,
+      .rsaEncryptionOAEPSHA256,
+      encrypted as CFData,
+      &error
+    ) as Data?
   if decrypted != nil {
     return decrypted
   }
@@ -222,12 +225,13 @@ private func rsaDecryptOAEP(privateKey: SecKey, encrypted: Data) -> Data? {
 
 private func rsaEncryptOAEP(publicKey: SecKey, plain: Data) -> Data? {
   var error: Unmanaged<CFError>?
-  let encrypted = SecKeyCreateEncryptedData(
-    publicKey,
-    .rsaEncryptionOAEPSHA256,
-    plain as CFData,
-    &error
-  ) as Data?
+  let encrypted =
+    SecKeyCreateEncryptedData(
+      publicKey,
+      .rsaEncryptionOAEPSHA256,
+      plain as CFData,
+      &error
+    ) as Data?
   if encrypted != nil {
     return encrypted
   }
@@ -371,7 +375,7 @@ private func encryptHybridMessage(
     "v": 1,
     "iv": iv.base64EncodedString(),
     "c": combinedCipher.base64EncodedString(),
-    "k": encryptedKeyRecipient.base64EncodedString()
+    "k": encryptedKeyRecipient.base64EncodedString(),
   ]
   if let senderEncryptedKeyBase64 {
     json["s"] = senderEncryptedKeyBase64
@@ -457,7 +461,7 @@ public class ChatNativeCoreModule: Module {
     AsyncFunction("normalizeRowsBatch") { (input: [String: Any]) -> [String: Any] in
       return [
         "rows": input["rows"] ?? [],
-        "changed": false
+        "changed": false,
       ]
     }
 
@@ -465,7 +469,8 @@ public class ChatNativeCoreModule: Module {
 
     AsyncFunction("deriveKey") { (input: [String: Any]) throws -> String in
       guard let passphrase = input["passphrase"] as? String,
-            let salt = input["salt"] as? String else {
+        let salt = input["salt"] as? String
+      else {
         throw NSError(
           domain: "ChatNativeCore",
           code: 30,
@@ -511,7 +516,8 @@ public class ChatNativeCoreModule: Module {
 
     AsyncFunction("encryptFileData") { (input: [String: Any]) throws -> [String: String] in
       guard let dataBase64 = input["data"] as? String,
-            let fileData = Data(base64Encoded: dataBase64) else {
+        let fileData = Data(base64Encoded: dataBase64)
+      else {
         throw NSError(
           domain: "ChatNativeCore",
           code: 40,
@@ -538,10 +544,11 @@ public class ChatNativeCoreModule: Module {
 
     AsyncFunction("decryptFileData") { (input: [String: Any]) throws -> String in
       guard let encryptedBase64 = input["encryptedBase64"] as? String,
-            let keyBase64 = input["keyBase64"] as? String,
-            let combined = Data(base64Encoded: encryptedBase64),
-            let aesKey = Data(base64Encoded: keyBase64),
-            combined.count > 28 else {
+        let keyBase64 = input["keyBase64"] as? String,
+        let combined = Data(base64Encoded: encryptedBase64),
+        let aesKey = Data(base64Encoded: keyBase64),
+        combined.count > 28
+      else {
         throw NSError(
           domain: "ChatNativeCore",
           code: 50,

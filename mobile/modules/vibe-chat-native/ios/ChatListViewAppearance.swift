@@ -32,7 +32,7 @@ struct ChatListAppearance {
     backgroundMode: "transparent",
     wallpaperGradient: [
       UIColor(red: 0.10, green: 0.10, blue: 0.18, alpha: 1.0),
-      UIColor(red: 0.07, green: 0.07, blue: 0.16, alpha: 1.0)
+      UIColor(red: 0.07, green: 0.07, blue: 0.16, alpha: 1.0),
     ],
     wallpaperOpacity: 1.0,
     wallpaperPatternGradient: [],
@@ -41,7 +41,7 @@ struct ChatListAppearance {
     wallpaperMaskKey: nil,
     bubbleMeGradient: [
       UIColor(red: 0.49, green: 0.36, blue: 0.88, alpha: 1.0),
-      UIColor(red: 0.42, green: 0.31, blue: 0.81, alpha: 1.0)
+      UIColor(red: 0.42, green: 0.31, blue: 0.81, alpha: 1.0),
     ],
     bubbleThemColor: UIColor(red: 0.17, green: 0.17, blue: 0.29, alpha: 1.0),
     textColorMe: .white,
@@ -80,7 +80,8 @@ struct ChatListAppearance {
       wallpaperOpacity: CGFloat((raw["wallpaperOpacity"] as? NSNumber)?.doubleValue ?? 1.0),
       wallpaperPatternGradient: wallpaperPatternGradient,
       wallpaperPatternLocations: parseNumberArray(raw["wallpaperPatternLocations"]),
-      wallpaperPatternOpacity: CGFloat((raw["wallpaperPatternOpacity"] as? NSNumber)?.doubleValue ?? 0.0),
+      wallpaperPatternOpacity: CGFloat(
+        (raw["wallpaperPatternOpacity"] as? NSNumber)?.doubleValue ?? 0.0),
       wallpaperMaskKey: normalizedString(raw["wallpaperMaskKey"]),
       bubbleMeGradient: bubbleMeGradient,
       bubbleThemColor: parseColor(raw["bubbleThemColor"] as? String) ?? fallback.bubbleThemColor,
@@ -89,9 +90,11 @@ struct ChatListAppearance {
       timeColorMe: parseColor(raw["timeColorMe"] as? String) ?? fallback.timeColorMe,
       timeColorThem: parseColor(raw["timeColorThem"] as? String) ?? fallback.timeColorThem,
       dayTextColor: parseColor(raw["dayTextColor"] as? String) ?? fallback.dayTextColor,
-      dayBackgroundColor: parseColor(raw["dayBackgroundColor"] as? String) ?? fallback.dayBackgroundColor,
+      dayBackgroundColor: parseColor(raw["dayBackgroundColor"] as? String)
+        ?? fallback.dayBackgroundColor,
       dayBorderColor: parseColor(raw["dayBorderColor"] as? String) ?? fallback.dayBorderColor,
-      insertionAnimationMode: (raw["insertionAnimationMode"] as? NSNumber)?.intValue ?? fallback.insertionAnimationMode
+      insertionAnimationMode: (raw["insertionAnimationMode"] as? NSNumber)?.intValue
+        ?? fallback.insertionAnimationMode
     )
   }
 
@@ -99,7 +102,8 @@ struct ChatListAppearance {
     let wallpaperKey = wallpaperGradient.map(colorKey).joined(separator: ",")
     let wallpaperPatternKey = wallpaperPatternGradient.map(colorKey).joined(separator: ",")
     let wallpaperPatternLocationsKey =
-      wallpaperPatternLocations?.map { String(format: "%.4f", $0.doubleValue) }.joined(separator: ",")
+      wallpaperPatternLocations?.map { String(format: "%.4f", $0.doubleValue) }.joined(
+        separator: ",")
       ?? ""
     let meKey = bubbleMeGradient.map(colorKey).joined(separator: ",")
     return [
@@ -118,8 +122,23 @@ struct ChatListAppearance {
       colorKey(timeColorThem),
       colorKey(dayTextColor),
       colorKey(dayBackgroundColor),
-      colorKey(dayBorderColor)
+      colorKey(dayBorderColor),
     ].joined(separator: "|")
+  }
+
+  /// Derives whether this appearance is "dark" by inspecting
+  /// the luminance of the primary wallpaper gradient colour.
+  var isDark: Bool {
+    guard let firstColor = wallpaperGradient.first else { return true }
+    var r: CGFloat = 0
+    var g: CGFloat = 0
+    var b: CGFloat = 0
+    var a: CGFloat = 0
+    if firstColor.getRed(&r, green: &g, blue: &b, alpha: &a) {
+      let luminance = 0.299 * r + 0.587 * g + 0.114 * b
+      return luminance < 0.5
+    }
+    return true
   }
 }
 
@@ -156,7 +175,8 @@ private func nativePresetAppearance(
   let isDark = parseBool(raw["nativeThemeIsDark"]) ?? true
   let mode = (raw["backgroundMode"] as? String) ?? fallback.backgroundMode
   let wallpaperOpacity = CGFloat((raw["wallpaperOpacity"] as? NSNumber)?.doubleValue ?? 1.0)
-  let insertionAnimationMode = (raw["insertionAnimationMode"] as? NSNumber)?.intValue ?? fallback.insertionAnimationMode
+  let insertionAnimationMode =
+    (raw["insertionAnimationMode"] as? NSNumber)?.intValue ?? fallback.insertionAnimationMode
 
   let variant = isDark ? preset.dark : preset.light
   let resolvedBackgroundGradient: [String]
@@ -174,10 +194,14 @@ private func nativePresetAppearance(
     resolvedPatternOpacity = 0.04
   }
 
-  let wallpaperGradient = parseGradient(resolvedBackgroundGradient, fallback: fallback.wallpaperGradient)
+  let wallpaperGradient = parseGradient(
+    resolvedBackgroundGradient, fallback: fallback.wallpaperGradient)
   let patternGradient = parseGradient(resolvedPatternGradientColors, fallback: [])
-  let bubbleMeGradient = parseGradient(variant.bubbleMeGradient, fallback: fallback.bubbleMeGradient)
-  let bubbleThemColor = parseColor(variant.bubbleThemGradient.first) ?? parseColor(variant.bubbleThem) ?? fallback.bubbleThemColor
+  let bubbleMeGradient = parseGradient(
+    variant.bubbleMeGradient, fallback: fallback.bubbleMeGradient)
+  let bubbleThemColor =
+    parseColor(variant.bubbleThemGradient.first) ?? parseColor(variant.bubbleThem)
+    ?? fallback.bubbleThemColor
   let textColorMe = parseColor(variant.textColorMe) ?? fallback.textColorMe
   let textColorThem = parseColor(variant.textColorThem) ?? fallback.textColorThem
   let dayBackgroundBase = wallpaperGradient.first ?? fallback.wallpaperGradient.first ?? .black
@@ -436,8 +460,10 @@ private func colorWithAlpha(_ color: UIColor, _ alpha: CGFloat) -> UIColor {
   if color.getRed(&r, green: &g, blue: &b, alpha: &currentAlpha) {
     return UIColor(red: r, green: g, blue: b, alpha: max(0.0, min(1.0, alpha)))
   }
-  if let converted = color.cgColor.converted(to: CGColorSpaceCreateDeviceRGB(), intent: .defaultIntent, options: nil),
-     let components = converted.components {
+  if let converted = color.cgColor.converted(
+    to: CGColorSpaceCreateDeviceRGB(), intent: .defaultIntent, options: nil),
+    let components = converted.components
+  {
     if components.count >= 3 {
       let r = components[0]
       let g = components.count > 1 ? components[1] : components[0]
@@ -456,8 +482,10 @@ private func colorKey(_ color: UIColor) -> String {
   if color.getRed(&r, green: &g, blue: &b, alpha: &a) {
     return String(format: "%.4f,%.4f,%.4f,%.4f", r, g, b, a)
   }
-  if let converted = color.cgColor.converted(to: CGColorSpaceCreateDeviceRGB(), intent: .defaultIntent, options: nil),
-     let components = converted.components {
+  if let converted = color.cgColor.converted(
+    to: CGColorSpaceCreateDeviceRGB(), intent: .defaultIntent, options: nil),
+    let components = converted.components
+  {
     let cr: CGFloat
     let cg: CGFloat
     let cb: CGFloat
@@ -534,15 +562,16 @@ private func parseHexColor(_ value: String) -> UIColor? {
     return UIColor(red: r, green: g, blue: b, alpha: 1.0)
   }
 
-  let r = CGFloat((rgba & 0xFF000000) >> 24) / 255.0
-  let g = CGFloat((rgba & 0x00FF0000) >> 16) / 255.0
-  let b = CGFloat((rgba & 0x0000FF00) >> 8) / 255.0
-  let a = CGFloat(rgba & 0x000000FF) / 255.0
+  let r = CGFloat((rgba & 0xFF00_0000) >> 24) / 255.0
+  let g = CGFloat((rgba & 0x00FF_0000) >> 16) / 255.0
+  let b = CGFloat((rgba & 0x0000_FF00) >> 8) / 255.0
+  let a = CGFloat(rgba & 0x0000_00FF) / 255.0
   return UIColor(red: r, green: g, blue: b, alpha: a)
 }
 
 private func parseRgbColor(_ value: String) -> UIColor? {
-  guard let open = value.firstIndex(of: "("), let close = value.lastIndex(of: ")"), open < close else {
+  guard let open = value.firstIndex(of: "("), let close = value.lastIndex(of: ")"), open < close
+  else {
     return nil
   }
   let args = value[value.index(after: open)..<close].split(separator: ",").map {

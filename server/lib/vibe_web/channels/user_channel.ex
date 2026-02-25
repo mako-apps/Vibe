@@ -62,18 +62,32 @@ defmodule VibeWeb.UserChannel do
   @impl true
   def terminate(_reason, socket) do
     user_id = socket.assigns.user_id
+    user = Accounts.get_user(user_id)
+    last_seen = DateTime.utc_now()
+
+    if user do
+      _ = Accounts.update_user(user, %{last_seen: last_seen})
+    end
 
     # Notify friends I am offline
     # We must re-fetch friends or cache them. Re-fetching is safer.
     chats = Chat.list_chats(user_id)
     friend_ids = Enum.map(chats, fn c -> c[:friendId] end) |> Enum.reject(&is_nil/1)
 
-    Enum.each(friend_ids, fn fid ->
-       VibeWeb.Endpoint.broadcast("user:#{fid}", "friend-offline", %{
-         userId: user_id,
-         user_id: user_id
-       })
-    end)
+    if user && user.show_online_status do
+      Enum.each(friend_ids, fn fid ->
+        VibeWeb.Endpoint.broadcast("user:#{fid}", "friend-offline", %{
+          userId: user_id,
+          user_id: user_id,
+          lastSeen: if(user.show_last_seen, do: last_seen, else: nil),
+          last_seen: if(user.show_last_seen, do: last_seen, else: nil),
+          lastSeenMs:
+            if(user.show_last_seen, do: DateTime.to_unix(last_seen, :millisecond), else: nil),
+          last_seen_ms:
+            if(user.show_last_seen, do: DateTime.to_unix(last_seen, :millisecond), else: nil)
+        })
+      end)
+    end
     :ok
   end
 

@@ -112,6 +112,36 @@ struct ChatListRow {
     }
   }
 
+  static func typingIndicator() -> ChatListRow {
+    if let row = ChatListRow(raw: [
+      "kind": "message",
+      "key": "peer-typing-indicator",
+      "message": [
+        "id": "peer-typing-indicator",
+        "text": "Typing...",
+        "timestamp": "",
+        "isMe": false,
+        "type": "typing",
+        "bubbleShape": [
+          "showTail": false,
+          "borderTopLeftRadius": 18,
+          "borderTopRightRadius": 18,
+          "borderBottomLeftRadius": 4,
+          "borderBottomRightRadius": 18,
+        ],
+      ],
+    ]) {
+      return row
+    }
+
+    // Guaranteed fallback for malformed payloads.
+    return ChatListRow(raw: [
+      "kind": "day",
+      "key": "peer-typing-indicator-fallback",
+      "label": "",
+    ])!
+  }
+
   var shouldShowUploadOverlay: Bool {
     guard isMe else {
       return false
@@ -169,6 +199,10 @@ struct ChatListRow {
     shape = BubbleShape.from(raw: message["bubbleShape"] as? [String: Any], isMe: isMe)
 
     let metadata = message["metadata"] as? [String: Any]
+    let localMediaUrl1 = message["localMediaUrl"] as? String
+    let localMediaUrl2 = message["local_media_url"] as? String
+    let metaLocalMediaUrl1 = metadata?["localMediaUrl"] as? String
+    let metaLocalMediaUrl2 = metadata?["local_media_url"] as? String
     let mediaUrl1 = message["mediaUrl"] as? String
     let mediaUrl2 = message["media_url"] as? String
     let mediaUrl3 = message["uri"] as? String
@@ -180,10 +214,17 @@ struct ChatListRow {
     let metaUrl4 = metadata?["audioUrl"] as? String
     let metaUrl5 = metadata?["audio_url"] as? String
 
-    let mediaUrlCandidates: [String?] = [
+    let isVoiceLike = messageType == "voice" || messageType == "music"
+    var mediaUrlCandidates: [String?] = []
+    if isVoiceLike {
+      mediaUrlCandidates.append(contentsOf: [
+        localMediaUrl1, localMediaUrl2, metaLocalMediaUrl1, metaLocalMediaUrl2,
+      ])
+    }
+    mediaUrlCandidates.append(contentsOf: [
       mediaUrl1, mediaUrl2, mediaUrl3, mediaUrl4, mediaUrl5,
       metaUrl1, metaUrl2, metaUrl3, metaUrl4, metaUrl5,
-    ]
+    ])
     mediaUrl =
       mediaUrlCandidates.compactMap { value in
         guard let value, !value.isEmpty else { return nil }

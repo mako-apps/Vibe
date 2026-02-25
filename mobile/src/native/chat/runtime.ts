@@ -4,16 +4,19 @@ import type {
   NativeChatCoreModule,
   NativeChatEngineModule,
   NativeChatListModule,
+  NativeChatMainModule,
   NativeChatRuntimeInfo,
 } from './types';
 
 const CORE_MODULE_NAME = 'ChatNativeCore';
 const LIST_MODULE_NAME = 'ChatNativeList';
+const MAIN_MODULE_NAME = 'ChatNativeMain';
 const ENGINE_MODULE_NAME = 'ChatEngine';
 const ENGINE_MODULE_NAME_LEGACY = 'ChatNativeEngine';
 
 let cachedCoreModule: NativeChatCoreModule | null | undefined;
 let cachedListModule: NativeChatListModule | null | undefined;
+let cachedMainModule: NativeChatMainModule | null | undefined;
 let cachedEngineModule: NativeChatEngineModule | null | undefined;
 
 const resolveRemoteFlag = (): boolean => {
@@ -80,6 +83,7 @@ export const getNativeChatCoreModule = (): NativeChatCoreModule | null => {
 export const clearNativeChatModuleCache = (): void => {
   cachedCoreModule = undefined;
   cachedListModule = undefined;
+  cachedMainModule = undefined;
   cachedEngineModule = undefined;
 };
 
@@ -100,6 +104,15 @@ export const getNativeChatListModule = (): NativeChatListModule | null => {
   const resolved = loadOptionalNativeModule<NativeChatListModule>(LIST_MODULE_NAME);
   if (resolved || !__DEV__) {
     cachedListModule = resolved;
+  }
+  return resolved ?? null;
+};
+
+export const getNativeChatMainModule = (): NativeChatMainModule | null => {
+  if (cachedMainModule) return cachedMainModule;
+  const resolved = loadOptionalNativeModule<NativeChatMainModule>(MAIN_MODULE_NAME);
+  if (resolved || !__DEV__) {
+    cachedMainModule = resolved;
   }
   return resolved ?? null;
 };
@@ -132,3 +145,14 @@ export const getNativeChatRuntimeInfo = (): NativeChatRuntimeInfo => {
 };
 
 export const isNativeChatEnabled = (): boolean => getNativeChatRuntimeInfo().enabled;
+
+export const isNativeChatJsFallbackEnabled = (): boolean => {
+  const envFlag = process.env.EXPO_PUBLIC_CHAT_NATIVE_JS_FALLBACK;
+  if (envFlag === '1' || envFlag === 'true') return true;
+  if (envFlag === '0' || envFlag === 'false') return false;
+
+  const extra = (Constants.expoConfig?.extra || Constants.manifest2?.extra || {}) as {
+    nativeChat?: { jsFallbackEnabled?: boolean };
+  };
+  return extra?.nativeChat?.jsFallbackEnabled === true;
+};

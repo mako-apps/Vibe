@@ -26,8 +26,8 @@ final class ChatPhoenixClient: NSObject, URLSessionWebSocketDelegate, URLSession
   /// Generate with: openssl x509 -in cert.pem -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256 -binary | base64
   /// Set to empty to disable pinning (e.g. during development).
   static var pinnedSPKIHashes: Set<String> = [
-    "u6dScLDuE2TrAks7ct4HDBekXo9byFES6oApqW/pAjQ=",
-    "AlSQhgtJirc8ahLyekmtX+Iw+v46yPYRLJt9Cq1GlB0=",
+    // "u6dScLDuE2TrAks7ct4HDBekXo9byFES6oApqW/pAjQ=",
+    // "AlSQhgtJirc8ahLyekmtX+Iw+v46yPYRLJt9Cq1GlB0=",
   ]
 
   /// Whether certificate pinning is enforced. Disabled when no hashes are configured.
@@ -66,9 +66,9 @@ final class ChatPhoenixClient: NSObject, URLSessionWebSocketDelegate, URLSession
       config.tlsMinimumSupportedProtocolVersion = .TLSv12
       let session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
 
-      // Use a URLRequest so we can attach the Authorization header
-      // instead of leaking the token in the URL query string.
       var request = URLRequest(url: url)
+      // Also send as Authorization header for any reverse-proxy / middleware
+      // that may inspect it (the primary auth is the ?token= query param).
       if let token = self.authToken, !token.isEmpty {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
       }
@@ -127,10 +127,22 @@ final class ChatPhoenixClient: NSObject, URLSessionWebSocketDelegate, URLSession
     guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
       return nil
     }
+    // Ensure the path ends with /websocket for Phoenix long-poll fallback compat.
+    if !components.path.hasSuffix("/websocket") {
+      components.path = components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+      components.path = "/" + components.path + "/websocket"
+    }
     var items = components.queryItems ?? []
     for (key, value) in params where !key.isEmpty {
       items.removeAll { $0.name == key }
       items.append(URLQueryItem(name: key, value: value))
+    }
+    // Phoenix's UserSocket expects the auth token as a "token" query param.
+    // The Authorization header is NOT forwarded by Phoenix's :x_headers connect_info
+    // (only headers prefixed x- are forwarded), so we must pass via query param.
+    if let token = authToken, !token.isEmpty {
+      items.removeAll { $0.name == "token" }
+      items.append(URLQueryItem(name: "token", value: token))
     }
     components.queryItems = items.isEmpty ? nil : items
     return components.url
@@ -145,13 +157,15 @@ final class ChatPhoenixClient: NSObject, URLSessionWebSocketDelegate, URLSession
   ) {
     queue.async {
       guard let task = self.task else { return }
-      let frame: [Any] = [
-        joinRef ?? NSNull(),
-        ref ?? NSNull(),
-        topic,
-        event,
-        payload,
+      // Phoenix V1 JSON Serializer expects a JSON **object** (map),
+      // NOT the V2 array wire format.
+      var frame: [String: Any] = [
+        "topic": topic,
+        "event": event,
+        "payload": payload,
       ]
+      if let joinRef { frame["join_ref"] = joinRef }
+      if let ref { frame["ref"] = ref }
       guard JSONSerialization.isValidJSONObject(frame),
         let data = try? JSONSerialization.data(withJSONObject: frame),
         let text = String(data: data, encoding: .utf8)
@@ -195,25 +209,42 @@ final class ChatPhoenixClient: NSObject, URLSessionWebSocketDelegate, URLSession
     @unknown default:
       data = nil
     }
+    guard let data else { return }
 
-    guard let data,
-      let raw = try? JSONSerialization.jsonObject(with: data) as? [Any],
-      raw.count >= 5
-    else { return }
+    let parsed = try? JSONSerialization.jsonObject(with: data)
 
-    let topic = raw[2] as? String ?? ""
-    let event = raw[3] as? String ?? ""
-    guard !topic.isEmpty, !event.isEmpty else { return }
+    // Phoenix V1 JSON format: {"topic":..., "event":..., "ref":..., "join_ref":..., "payload":...}
+    if let map = parsed as? [String: Any] {
+      let topic = map["topic"] as? String ?? ""
+      let event = map["event"] as? String ?? ""
+      guard !topic.isEmpty, !event.isEmpty else { return }
+      let payload = (map["payload"] as? [String: Any]) ?? [:]
+      let frame = EventFrame(
+        joinRef: map["join_ref"] as? String,
+        ref: map["ref"] as? String,
+        topic: topic,
+        event: event,
+        payload: payload
+      )
+      callbacks.onEvent(frame)
+      return
+    }
 
-    let payload = (raw[4] as? [String: Any]) ?? [:]
-    let frame = EventFrame(
-      joinRef: raw[0] is NSNull ? nil : (raw[0] as? String),
-      ref: raw[1] is NSNull ? nil : (raw[1] as? String),
-      topic: topic,
-      event: event,
-      payload: payload
-    )
-    callbacks.onEvent(frame)
+    // Fallback: Phoenix V2 array format [joinRef, ref, topic, event, payload]
+    if let raw = parsed as? [Any], raw.count >= 5 {
+      let topic = raw[2] as? String ?? ""
+      let event = raw[3] as? String ?? ""
+      guard !topic.isEmpty, !event.isEmpty else { return }
+      let payload = (raw[4] as? [String: Any]) ?? [:]
+      let frame = EventFrame(
+        joinRef: raw[0] is NSNull ? nil : (raw[0] as? String),
+        ref: raw[1] is NSNull ? nil : (raw[1] as? String),
+        topic: topic,
+        event: event,
+        payload: payload
+      )
+      callbacks.onEvent(frame)
+    }
   }
 
   private func startHeartbeatLocked() {

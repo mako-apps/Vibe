@@ -135,6 +135,22 @@ export interface NativeChatListModule {
   playReactionFx?: (surfaceId: string, payload: NativeReactionFxPayload) => Promise<void>;
 }
 
+export interface NativeChatMainModule {
+  isSupported?: () => boolean;
+  supportsNativeMain?: () => boolean;
+  setPage?: (surfaceId: string, page: 'chat' | 'profile', animated?: boolean) => Promise<void>;
+  applyTransactions?: (surfaceId: string, transactions: Record<string, unknown>[]) => Promise<void>;
+  scrollToBottom?: (surfaceId: string, animated: boolean) => Promise<void>;
+  scrollToMessage?: (
+    surfaceId: string,
+    messageId: string,
+    animated: boolean,
+    viewPosition?: number,
+  ) => Promise<void>;
+  startSendTransition?: (surfaceId: string, payload: NativeSendTransitionPayload) => Promise<void>;
+  playReactionFx?: (surfaceId: string, payload: NativeReactionFxPayload) => Promise<void>;
+}
+
 export interface NativeChatEngineModule {
   isSupported?: () => boolean;
   setChatEngineConfig?: (payload: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>;
@@ -149,6 +165,13 @@ export interface NativeChatEngineModule {
   sendReadReceipt?: (payload: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>;
   upsertLocalMessageStatus?: (payload: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>;
   sendEncryptedMessage?: (payload: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>;
+  sendMessage?: (payload: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>;
+  retryOutgoingMessage?: (payload: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>;
+  cancelOutgoingMessage?: (payload: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>;
+  editMessage?: (payload: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>;
+  deleteMessage?: (payload: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>;
+  sendTypingState?: (payload: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>;
+  sendRecordingState?: (payload: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>;
   sendEditMessage?: (payload: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>;
   sendDeleteMessage?: (payload: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>;
   getChatJournal?: () => Promise<Record<string, unknown>[]> | Record<string, unknown>[];

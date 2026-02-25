@@ -7,6 +7,8 @@
     "modules": [
       "ChatNativeCoreModule",
       "ChatNativeListModule",
+      "ChatNativeMainModule",
+      "ChatEngineModule",
       "ChatNativeGifModule",
       "VibeNativeCallModule",
       "LiquidGlassModule",
@@ -18,6 +20,8 @@
     "modules": [
       "expo.modules.vibechatnative.ChatNativeCoreModule",
       "expo.modules.vibechatnative.ChatNativeListModule",
+      "expo.modules.vibechatnative.ChatNativeMainModule",
+      "expo.modules.vibechatnative.ChatEngineModule",
       "expo.modules.vibechatnative.ChatNativeGifModule",
       "expo.modules.vibechatnative.VibeNativeCallModule",
       "expo.modules.vibechatnative.LiquidGlassModule",

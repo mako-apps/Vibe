@@ -16,7 +16,6 @@ import { Gesture, GestureDetector, GestureHandlerRootView } from 'react-native-g
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useRouter } from 'expo-router'
 import { useTranslation } from 'react-i18next'
-import { LinearGradient } from 'expo-linear-gradient'
 import { useThemeStore } from '../../src/lib/stores/theme-store'
 import { useUIStore } from '../../src/lib/stores/ui-store'
 import SafeLiquidGlass from '../../src/components/native/SafeLiquidGlass'
@@ -330,7 +329,7 @@ export default function TabLayout() {
     // ────────────────────────────────────────────────────────────────────────
     if (nativeTabsAvailable) {
         return (
-            <View style={{ flex: 1, backgroundColor: colors.background }}>
+            <View style={{ flex: 1, backgroundColor: 'transparent' }}>
                 {/* Story Camera Overlay (Global) */}
                 {isStoryCameraOpen && (
                     <AnimatedView style={[StyleSheet.absoluteFill, { zIndex: 100 }, storyUnderlayStyle]}>
@@ -469,34 +468,6 @@ export default function TabLayout() {
                             bottomBarFadeStyle,
                         ]}
                     >
-                        {Platform.OS === 'android' && (
-                            <View pointerEvents="none" style={styles.bottomBarBackdropMask}>
-                                <MaskedView
-                                    style={StyleSheet.absoluteFill}
-                                    maskElement={
-                                        <LinearGradient
-                                            colors={['rgba(0,0,0,0)', 'rgba(0,0,0,0.75)', 'rgba(0,0,0,1)']}
-                                            locations={[0, 0.48, 1]}
-                                            start={{ x: 0.5, y: 0 }}
-                                            end={{ x: 0.5, y: 1 }}
-                                            style={StyleSheet.absoluteFill}
-                                        />
-                                    }
-                                >
-                                    <LinearGradient
-                                        colors={
-                                            isDark
-                                                ? ['rgba(0,0,0,0)', 'rgba(0,0,0,0.18)', 'rgba(0,0,0,0.28)']
-                                                : ['rgba(255,255,255,0)', 'rgba(255,255,255,0.14)', 'rgba(255,255,255,0.22)']
-                                        }
-                                        locations={[0, 0.6, 1]}
-                                        start={{ x: 0.5, y: 0 }}
-                                        end={{ x: 0.5, y: 1 }}
-                                        style={StyleSheet.absoluteFill}
-                                    />
-                                </MaskedView>
-                            </View>
-                        )}
                         {/* Main Tab Bar - Fallback mode */}
                         {Platform.OS === 'android' ? (
                             <AndroidBottomTabBar
@@ -702,7 +673,7 @@ const styles = StyleSheet.create({
         flex: 1,
     },
     nativePageContainerWithTabs: {
-        paddingBottom: Platform.OS === 'ios' ? 104 : 98,
+        paddingBottom: 0,
     },
     nativeBottomBarWrapper: {
         position: 'absolute',
@@ -730,15 +701,6 @@ const styles = StyleSheet.create({
         alignItems: 'stretch',
         gap: 0,
         paddingHorizontal: 10,
-    },
-    bottomBarBackdropMask: {
-        position: 'absolute',
-        left: 10,
-        right: 10,
-        top: -14,
-        bottom: -2,
-        borderRadius: 26,
-        overflow: 'hidden',
     },
     badge: {
         position: 'absolute',

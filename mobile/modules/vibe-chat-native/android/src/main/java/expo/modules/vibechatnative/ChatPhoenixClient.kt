@@ -40,10 +40,10 @@ internal class ChatPhoenixClient(
     /// Generate with: openssl x509 -in cert.pem -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256 -binary | base64
     /// Set to empty to disable pinning (e.g. during development).
     var pinnedSPKIHashes: Map<String, List<String>> = mapOf(
-      "modest-recreation-production-8329.up.railway.app" to listOf(
-        "u6dScLDuE2TrAks7ct4HDBekXo9byFES6oApqW/pAjQ=",
-        "AlSQhgtJirc8ahLyekmtX+Iw+v46yPYRLJt9Cq1GlB0="
-      )
+      // "modest-recreation-production-8329.up.railway.app" to listOf(
+      //   "u6dScLDuE2TrAks7ct4HDBekXo9byFES6oApqW/pAjQ=",
+      //   "AlSQhgtJirc8ahLyekmtX+Iw+v46yPYRLJt9Cq1GlB0="
+      // )
     )
 
     /// Build a pinned OkHttpClient for reuse (e.g. chat history HTTP requests).
@@ -147,14 +147,24 @@ internal class ChatPhoenixClient(
   private fun nextRef(): String = refCounter.getAndIncrement().toString()
 
   private fun buildUrl() =
-    socketUrl.toHttpUrlOrNull()?.newBuilder()?.apply {
+    socketUrl.toHttpUrlOrNull()?.let { baseUrl ->
+      baseUrl.newBuilder().apply {
+      val segments = baseUrl.pathSegments
+      if (segments.isEmpty() || segments.last() != "websocket") {
+        addPathSegment("websocket")
+      }
       params.forEach { (key, value) ->
         if (key.isNotBlank()) {
           removeAllQueryParameters(key)
           addQueryParameter(key, value)
         }
       }
-    }?.build()
+      if (!authToken.isNullOrBlank()) {
+        removeAllQueryParameters("token")
+        addQueryParameter("token", authToken)
+      }
+    }.build()
+    }
 
   private fun startHeartbeat() {
     stopHeartbeat()
@@ -188,13 +198,13 @@ internal class ChatPhoenixClient(
     payload: Map<String, Any?>,
   ) {
     val ws = webSocket ?: return
-    val array = JSONArray()
-    array.put(joinRef ?: JSONObject.NULL)
-    array.put(ref ?: JSONObject.NULL)
-    array.put(topic)
-    array.put(event)
-    array.put(anyToJson(payload))
-    val ok = ws.send(array.toString())
+    val obj = JSONObject()
+    obj.put("topic", topic)
+    obj.put("event", event)
+    obj.put("payload", anyToJson(payload))
+    if (joinRef != null) obj.put("join_ref", joinRef)
+    if (ref != null) obj.put("ref", ref)
+    val ok = ws.send(obj.toString())
     if (!ok) {
       callbacks.onError("send_failed:$event")
     }
@@ -202,6 +212,20 @@ internal class ChatPhoenixClient(
 
   private fun handleMessage(text: String) {
     try {
+      if (text.startsWith("{")) {
+        val obj = JSONObject(text)
+        val topic = obj.optString("topic", "")
+        val event = obj.optString("event", "")
+        if (topic.isBlank() || event.isBlank()) return
+        val payload = (jsonToAny(obj.opt("payload")) as? Map<*, *>)?.entries?.associate { (k, v) ->
+          k?.toString().orEmpty() to v
+        }?.filterKeys { it.isNotBlank() } ?: emptyMap()
+        val joinRef = if (!obj.isNull("join_ref")) obj.optString("join_ref") else null
+        val ref = if (!obj.isNull("ref")) obj.optString("ref") else null
+        callbacks.onEvent(topic, event, payload, ref, joinRef)
+        return
+      }
+
       val arr = JSONArray(text)
       if (arr.length() < 5) return
       val topic = arr.optString(2)

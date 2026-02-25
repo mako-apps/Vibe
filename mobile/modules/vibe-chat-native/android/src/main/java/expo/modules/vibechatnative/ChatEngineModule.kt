@@ -60,6 +60,34 @@ class ChatEngineModule : Module() {
       ChatEngine.sendEncryptedMessage(payload)
     }
 
+    Function("sendMessage") { payload: Map<String, Any?> ->
+      ChatEngine.sendMessage(payload)
+    }
+
+    Function("retryOutgoingMessage") { payload: Map<String, Any?> ->
+      ChatEngine.retryOutgoingMessage(payload)
+    }
+
+    Function("cancelOutgoingMessage") { payload: Map<String, Any?> ->
+      ChatEngine.cancelOutgoingMessage(payload)
+    }
+
+    Function("editMessage") { payload: Map<String, Any?> ->
+      ChatEngine.editMessage(payload)
+    }
+
+    Function("deleteMessage") { payload: Map<String, Any?> ->
+      ChatEngine.deleteMessage(payload)
+    }
+
+    Function("sendTypingState") { payload: Map<String, Any?> ->
+      ChatEngine.sendTypingState(payload)
+    }
+
+    Function("sendRecordingState") { payload: Map<String, Any?> ->
+      ChatEngine.sendRecordingState(payload)
+    }
+
     Function("sendEditMessage") { payload: Map<String, Any?> ->
       ChatEngine.sendEditMessage(payload)
     }

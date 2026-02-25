@@ -1,6 +1,7 @@
 defmodule VibeWeb.UserController do
   use VibeWeb, :controller
   alias Vibe.Accounts
+  alias VibeWeb.Presence
   require Logger
   @max_contact_match_numbers 500
 
@@ -264,6 +265,7 @@ defmodule VibeWeb.UserController do
 
   defp render_user(conn, user, viewer) do
     is_self = viewer && viewer.id == user.id
+    is_online = user.show_online_status and user_online?(user.id)
 
     phone_number =
       cond do
@@ -280,7 +282,7 @@ defmodule VibeWeb.UserController do
       publicKey: user.public_key,
       identityKey: user.identity_key,
       profileImage: user.profile_image,
-      online: if(user.show_online_status, do: user.is_online, else: false),
+      online: if(user.show_online_status, do: is_online, else: false),
       lastSeen: if(user.show_last_seen, do: user.last_seen, else: nil),
       showLastSeen: user.show_last_seen,
       showOnlineStatus: user.show_online_status,
@@ -297,6 +299,12 @@ defmodule VibeWeb.UserController do
       dateOfBirth: user.date_of_birth
     })
   end
+
+  defp user_online?(user_id) when is_binary(user_id) do
+    map_size(Presence.list("user:#{user_id}")) > 0
+  end
+
+  defp user_online?(_), do: false
 
   defp render_contact_match(user, _viewer) do
     %{

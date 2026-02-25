@@ -56,6 +56,34 @@ public final class ChatEngineModule: Module {
       ChatEngine.shared.sendEncryptedMessage(payload)
     }
 
+    Function("sendMessage") { (payload: [String: Any]) in
+      ChatEngine.shared.sendMessage(payload)
+    }
+
+    Function("retryOutgoingMessage") { (payload: [String: Any]) in
+      ChatEngine.shared.retryOutgoingMessage(payload)
+    }
+
+    Function("cancelOutgoingMessage") { (payload: [String: Any]) in
+      ChatEngine.shared.cancelOutgoingMessage(payload)
+    }
+
+    Function("editMessage") { (payload: [String: Any]) in
+      ChatEngine.shared.editMessage(payload)
+    }
+
+    Function("deleteMessage") { (payload: [String: Any]) in
+      ChatEngine.shared.deleteMessage(payload)
+    }
+
+    Function("sendTypingState") { (payload: [String: Any]) in
+      ChatEngine.shared.sendTypingState(payload)
+    }
+
+    Function("sendRecordingState") { (payload: [String: Any]) in
+      ChatEngine.shared.sendRecordingState(payload)
+    }
+
     Function("sendEditMessage") { (payload: [String: Any]) in
       ChatEngine.shared.sendEditMessage(payload)
     }
@@ -70,6 +98,10 @@ public final class ChatEngineModule: Module {
 
     Function("clearChatJournal") {
       ChatEngine.shared.clearJournal()
+    }
+
+    Function("isTyping") { (payload: [String: Any]) in
+      ChatEngine.shared.isTyping(payload)
     }
 
     // Shadow-mode bridge until native Phoenix transport is enabled.

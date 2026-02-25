@@ -1145,6 +1145,8 @@ const tryNativeChatEngineReceiptPush = async (
 
 const configureChatEngineShadowTransport = (apiBaseUrl: string, socketUrl: string, auth: any) => {
     if (!socketUrl || !auth?.userId) return;
+    const jsFallbackEnv = process.env.EXPO_PUBLIC_CHAT_NATIVE_JS_FALLBACK;
+    const chatNativeJsFallbackEnabled = jsFallbackEnv === '1' || jsFallbackEnv === 'true';
     fireAndForgetChatEngineShadowCall('setChatEngineConfig', {
         apiBaseUrl,
         socketUrl,
@@ -1152,6 +1154,8 @@ const configureChatEngineShadowTransport = (apiBaseUrl: string, socketUrl: strin
         userId: auth.userId,
         userChannelTopic: `user:${auth.userId}`,
         privateKeyPem: auth?.keyPair?.privateKey,
+        publicKeyPem: auth?.keyPair?.publicKey,
+        chatNativeJsFallbackEnabled,
     });
 };
 

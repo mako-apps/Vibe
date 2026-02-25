@@ -7,6 +7,7 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.LinearGradient
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PorterDuff
@@ -16,6 +17,7 @@ import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
+import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.KeyEvent
@@ -432,11 +434,16 @@ private class VoiceWaveformView(context: Context) : View(context) {
   }
 }
 
+private class TypingRowViewHolder(val container: FrameLayout, val shimmerView: ShimmerTextView) : RecyclerView.ViewHolder(container)
+
+private const val VIEW_TYPE_MESSAGE = 0
+private const val VIEW_TYPE_TYPING = 1
+
 private class NativeRowsAdapter(
   private val context: Context,
   private val appContext: AppContext? = null,
   private val emitNativeEvent: (Map<String, Any>) -> Unit,
-) : RecyclerView.Adapter<NativeRowViewHolder>() {
+) : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
   private val rows = mutableListOf<NativeRowItem>()
   private val pendingBottomInsertKeys = LinkedHashSet<String>()
   private var hiddenMessageId: String? = null
@@ -486,21 +493,36 @@ private class NativeRowsAdapter(
     }
 
     fun toggle(holder: NativeRowViewHolder, item: NativeRowItem) {
-      val messageId = item.messageId?.takeIf { it.isNotBlank() } ?: return
-      val mediaUrl = item.mediaUrl?.takeIf { it.isNotBlank() } ?: return
+      val messageId = item.messageId?.takeIf { it.isNotBlank() }
+      val mediaUrl = item.mediaUrl?.takeIf { it.isNotBlank() }
+      Log.d(
+        "ChatListView",
+        "voice tap messageId=${messageId ?: "-"} status=${item.status ?: "-"} type=${item.messageType} mediaUrl=${shortMediaUrl(mediaUrl)}",
+      )
+      if (messageId.isNullOrBlank()) {
+        Log.w("ChatListView", "voice tap ignored: missing messageId")
+        return
+      }
+      if (mediaUrl.isNullOrBlank()) {
+        Log.w("ChatListView", "voice tap ignored: missing mediaUrl messageId=$messageId")
+        return
+      }
 
       if (activeMessageId == messageId) {
         val player = mediaPlayer ?: return
         if (!isPrepared) {
+          Log.d("ChatListView", "voice tap ignored: player preparing messageId=$messageId")
           return
         }
         if (player.isPlaying) {
           player.pause()
           isPlaying = false
+          Log.d("ChatListView", "voice pause messageId=$messageId progress=${"%.3f".format(progress)}")
           applyState(holder, false, progress, level)
         } else {
           player.start()
           isPlaying = true
+          Log.d("ChatListView", "voice resume messageId=$messageId progress=${"%.3f".format(progress)}")
         }
         return
       }
@@ -511,11 +533,18 @@ private class NativeRowsAdapter(
       try {
         if (mediaUrl.startsWith("content://")) {
           val uri = Uri.parse(mediaUrl)
+          Log.d("ChatListView", "voice setDataSource(content) messageId=$messageId uri=${shortMediaUrl(mediaUrl)}")
           player.setDataSource(context, uri)
         } else {
+          Log.d("ChatListView", "voice setDataSource(raw) messageId=$messageId uri=${shortMediaUrl(mediaUrl)}")
           player.setDataSource(mediaUrl)
         }
-      } catch (_: Throwable) {
+      } catch (error: Throwable) {
+        Log.e(
+          "ChatListView",
+          "voice setDataSource failed messageId=$messageId uri=${shortMediaUrl(mediaUrl)} error=${error.message}",
+          error,
+        )
         player.release()
         return
       }
@@ -531,17 +560,27 @@ private class NativeRowsAdapter(
 
       player.setOnPreparedListener {
         isPrepared = true
+        Log.d(
+          "ChatListView",
+          "voice prepared messageId=$messageId durationMs=${runCatching { it.duration }.getOrDefault(-1)}",
+        )
         it.start()
         isPlaying = true
         startTicker()
       }
       player.setOnCompletionListener {
+        Log.d("ChatListView", "voice completed messageId=$messageId")
         stop(resetProgress = true)
       }
-      player.setOnErrorListener { _, _, _ ->
+      player.setOnErrorListener { _, what, extra ->
+        Log.e(
+          "ChatListView",
+          "voice player error messageId=$messageId what=$what extra=$extra uri=${shortMediaUrl(mediaUrl)}",
+        )
         stop(resetProgress = true)
         true
       }
+      Log.d("ChatListView", "voice prepareAsync messageId=$messageId uri=${shortMediaUrl(mediaUrl)}")
       player.prepareAsync()
     }
 
@@ -618,6 +657,11 @@ private class NativeRowsAdapter(
       activeHolder?.let { applyState(it, false, progress, level) }
       activeHolder = null
       activeMessageId = null
+    }
+
+    private fun shortMediaUrl(value: String?): String {
+      if (value.isNullOrBlank()) return "-"
+      return if (value.length <= 120) value else value.take(117) + "..."
     }
   }
 
@@ -756,7 +800,30 @@ private class NativeRowsAdapter(
     return rows[position].key.hashCode().toLong()
   }
 
-  override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): NativeRowViewHolder {
+  override fun getItemViewType(position: Int): Int {
+    if (rows[position].messageType == "typing") return VIEW_TYPE_TYPING
+    return VIEW_TYPE_MESSAGE
+  }
+
+  override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder {
+    if (viewType == VIEW_TYPE_TYPING) {
+      val root = FrameLayout(context).apply {
+        layoutParams = RecyclerView.LayoutParams(
+          RecyclerView.LayoutParams.MATCH_PARENT,
+          RecyclerView.LayoutParams.WRAP_CONTENT,
+        )
+        clipChildren = false
+        clipToPadding = false
+        setPadding(dp(8), dp(4), dp(8), dp(4))
+      }
+      val shimmerView = ShimmerTextView(context)
+      shimmerView.text = "Typing..."
+      root.addView(shimmerView, FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT).apply {
+        leftMargin = dp(4)
+      })
+      return TypingRowViewHolder(root, shimmerView)
+    }
+
     val root = FrameLayout(context).apply {
       layoutParams = RecyclerView.LayoutParams(
         RecyclerView.LayoutParams.MATCH_PARENT,
@@ -903,34 +970,73 @@ private class NativeRowsAdapter(
     return NativeRowViewHolder(root, bubble, tail, text, voiceContainer, voiceButton, voiceWave, voiceDuration, time, status, day)
   }
 
-  override fun onBindViewHolder(holder: NativeRowViewHolder, position: Int) {
+  override fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int) {
     val item = rows[position]
-    holder.bind(item, hiddenMessageId == item.messageId)
-    if (pendingBottomInsertKeys.remove(item.key)) {
-      holder.container.clearAnimation()
-      holder.container.alpha = 0f
-      holder.container.translationY = dpF(18f)
-      holder.container.animate()
-        .alpha(1f)
-        .translationY(0f)
-        .setDuration(220L)
-        .setInterpolator(PathInterpolator(0.2f, 0f, 0f, 1f))
-        .start()
-    } else {
-      holder.container.alpha = 1f
-      holder.container.translationY = 0f
+    
+    if (holder is TypingRowViewHolder) {
+      if (pendingBottomInsertKeys.remove(item.key)) {
+        holder.container.clearAnimation()
+        holder.container.alpha = 0f
+        holder.container.translationY = dpF(18f)
+        holder.container.animate()
+          .alpha(1f)
+          .translationY(0f)
+          .setDuration(220L)
+          .setInterpolator(PathInterpolator(0.2f, 0f, 0f, 1f))
+          .start()
+      } else {
+        holder.container.alpha = 1f
+        holder.container.translationY = 0f
+      }
+      return
+    }
+
+    if (holder is NativeRowViewHolder) {
+      holder.bind(item, hiddenMessageId == item.messageId)
+      if (pendingBottomInsertKeys.remove(item.key)) {
+        holder.container.clearAnimation()
+        holder.container.alpha = 0f
+        holder.container.translationY = dpF(18f)
+        holder.container.animate()
+          .alpha(1f)
+          .translationY(0f)
+          .setDuration(220L)
+          .setInterpolator(PathInterpolator(0.2f, 0f, 0f, 1f))
+          .start()
+      } else {
+        holder.container.alpha = 1f
+        holder.container.translationY = 0f
+      }
     }
   }
 
   override fun getItemCount(): Int = rows.size
 
-  override fun onViewRecycled(holder: NativeRowViewHolder) {
+  override fun onViewRecycled(holder: RecyclerView.ViewHolder) {
     super.onViewRecycled(holder)
-    holder.container.setOnLongClickListener(null)
-    voicePlayback.detach(holder)
-    holder.voiceWaveView.updatePlayback(0f, 0f, false)
-    holder.voiceWaveView.setWaveform(null)
-    holder.voiceButton.text = "▶"
+    if (holder is NativeRowViewHolder) {
+      holder.container.setOnLongClickListener(null)
+      voicePlayback.detach(holder)
+      holder.voiceWaveView.updatePlayback(0f, 0f, false)
+      holder.voiceWaveView.setWaveform(null)
+      holder.voiceButton.text = "▶"
+    } else if (holder is TypingRowViewHolder) {
+      holder.shimmerView.stopShimmer()
+    }
+  }
+
+  override fun onViewAttachedToWindow(holder: RecyclerView.ViewHolder) {
+    super.onViewAttachedToWindow(holder)
+    if (holder is TypingRowViewHolder) {
+      holder.shimmerView.startShimmer()
+    }
+  }
+
+  override fun onViewDetachedFromWindow(holder: RecyclerView.ViewHolder) {
+    super.onViewDetachedFromWindow(holder)
+    if (holder is TypingRowViewHolder) {
+      holder.shimmerView.stopShimmer()
+    }
   }
 
   private fun NativeRowViewHolder.bind(item: NativeRowItem, hidden: Boolean) {
@@ -2193,6 +2299,8 @@ class ChatListView(
 ) : ExpoView(context, appContext) {
   private val onViewportChanged by EventDispatcher<Map<String, Any>>()
   private val onNativeEvent by EventDispatcher<Map<String, Any>>()
+  internal var nativeEventListener: ((Map<String, Any>) -> Unit)? = null
+  internal var viewportChangedListener: ((Map<String, Any>) -> Unit)? = null
 
   private val contentFrame = FrameLayout(context)
   val recyclerView = RecyclerView(context)
@@ -2201,7 +2309,7 @@ class ChatListView(
   private val overlayHost = FrameLayout(context)
   private val inputBar = ChatNativeInputBar(context, appContext)
   private val layoutManager = LinearLayoutManager(context)
-  private val adapter = NativeRowsAdapter(context, appContext) { payload -> onNativeEvent(payload) }
+  private val adapter = NativeRowsAdapter(context, appContext) { payload -> emitNativeEvent(payload) }
   private var appearance = ChatListAppearance()
   private var queuedAppearanceAfterSendTransition: ChatListAppearance? = null
   private val baseHorizontalPadding = dp(16)
@@ -2219,6 +2327,10 @@ class ChatListView(
   private var skipNextTransitionScrollCorrection = false
   private var pendingSendTransition: SendTransitionPayload? = null
   private var activeTransition: ActiveTransition? = null
+
+  private val peerTypingContainer = FrameLayout(context)
+  private val peerTypingLabel = ShimmerTextView(context)
+  private var isPeerTyping = false
 
   private var surfaceId: String = ""
   private var engineSurfaceId: String = ""
@@ -2330,6 +2442,8 @@ class ChatListView(
       FrameLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT),
     )
 
+
+
     inputBar.layoutParams = LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT)
     inputBar.visibility = View.GONE
     inputBar.setPlaceholder(inputPlaceholder)
@@ -2337,27 +2451,94 @@ class ChatListView(
     inputBar.applyAppearance(appearance, Color.luminance(initBg) < 0.42f, initBg)
     inputBar.listener = object : ChatNativeInputBar.Listener {
       override fun onTextChanged(text: String) {
-        onNativeEvent(mapOf("type" to "textChanged", "text" to text))
+        if (nativeSendEnabled) {
+          val chatId = engineChatId.trim()
+          if (chatId.isNotEmpty()) {
+            val isTyping = text.trim().isNotEmpty()
+            diffExecutor.execute {
+              ChatEngine.sendTypingState(
+                mapOf(
+                  "chatId" to chatId,
+                  "typing" to isTyping,
+                ),
+              )
+            }
+          }
+        }
+        emitNativeEvent(mapOf("type" to "textChanged", "text" to text))
       }
 
       override fun onAttachmentPressed() {
-        onNativeEvent(mapOf("type" to "attachmentPressed"))
+        emitNativeEvent(mapOf("type" to "attachmentPressed"))
       }
 
       override fun onSendText(text: String, messageId: String) {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return
-        onNativeEvent(
-          mapOf(
-            "type" to "sendMessage",
-            "text" to trimmed,
-            "messageId" to messageId,
-          ),
-        )
+        if (nativeSendEnabled) {
+          val chatId = engineChatId.trim()
+          val myUserId = engineMyUserId.trim()
+          val peerUserId = enginePeerUserId.trim()
+          if (chatId.isEmpty()) {
+            Log.w(
+              "ChatListView",
+              "native ChatEngine send blocked: empty chatId messageId=$messageId myUserId=$myUserId peerUserId=$peerUserId",
+            )
+            return
+          }
+          diffExecutor.execute {
+            val result = ChatEngine.sendMessage(
+              mapOf(
+                "chatId" to chatId,
+                "messageId" to messageId,
+                "type" to "text",
+                "text" to trimmed,
+                "myUserId" to myUserId,
+                "peerUserId" to peerUserId,
+              ),
+            )
+            val accepted = (result["accepted"] as? Boolean) == true
+            if (!accepted) {
+              val statusSnapshot = ChatEngine.getStatus()
+              val journalTail = ChatEngine.getJournal().takeLast(6)
+              Log.w(
+                "ChatListView",
+                "native ChatEngine sendMessage rejected: result=$result status=$statusSnapshot journalTail=$journalTail",
+              )
+              return@execute
+            }
+
+            val state = (result["state"] as? String)?.trim()?.lowercase()
+            if (state == "pending" || state == "error") {
+              val statusSnapshot = ChatEngine.getStatus()
+              Log.i(
+                "ChatListView",
+                "native ChatEngine sendMessage state=$state messageId=$messageId chatId=$chatId status=$statusSnapshot",
+              )
+            }
+          }
+          return
+        }
+        emitNativeEvent(mapOf("type" to "sendMessage", "text" to trimmed, "messageId" to messageId))
       }
 
       override fun onRecordingState(isRecording: Boolean, isLocked: Boolean) {
-        onNativeEvent(
+        if (nativeSendEnabled) {
+          val chatId = engineChatId.trim()
+          if (chatId.isNotEmpty()) {
+            diffExecutor.execute {
+              ChatEngine.sendRecordingState(
+                mapOf(
+                  "chatId" to chatId,
+                  "isRecording" to isRecording,
+                  "isLocked" to isLocked,
+                  "mode" to "voice",
+                ),
+              )
+            }
+          }
+        }
+        emitNativeEvent(
           mapOf(
             "type" to "recordingState",
             "isRecording" to isRecording,
@@ -2368,7 +2549,7 @@ class ChatListView(
       }
 
       override fun onRecordingVad(level: Float) {
-        onNativeEvent(
+        emitNativeEvent(
           mapOf(
             "type" to "recordingVad",
             "level" to level.toDouble(),
@@ -2377,11 +2558,26 @@ class ChatListView(
       }
 
       override fun onRecordingCanceled() {
-        onNativeEvent(mapOf("type" to "recordingCanceled"))
+        if (nativeSendEnabled) {
+          val chatId = engineChatId.trim()
+          if (chatId.isNotEmpty()) {
+            diffExecutor.execute {
+              ChatEngine.sendRecordingState(
+                mapOf(
+                  "chatId" to chatId,
+                  "isRecording" to false,
+                  "isLocked" to false,
+                  "mode" to "voice",
+                ),
+              )
+            }
+          }
+        }
+        emitNativeEvent(mapOf("type" to "recordingCanceled"))
       }
 
       override fun onVoiceRecorded(uri: String, durationSeconds: Double, waveform: List<Float>) {
-        onNativeEvent(
+        emitNativeEvent(
           mapOf(
             "type" to "attachmentVoice",
             "uri" to uri,
@@ -2412,6 +2608,16 @@ class ChatListView(
       emitViewport()
       maybeStartPendingTransition()
     }
+  }
+
+  private fun emitNativeEvent(payload: Map<String, Any>) {
+    onNativeEvent(payload)
+    nativeEventListener?.invoke(payload)
+  }
+
+  private fun emitViewportChanged(payload: Map<String, Any>) {
+    onViewportChanged(payload)
+    viewportChangedListener?.invoke(payload)
   }
 
   override fun onAttachedToWindow() {
@@ -2546,6 +2752,10 @@ class ChatListView(
       if (chatId != null && chatId.isNotBlank() && engineChatId.isNotBlank() && chatId != engineChatId) {
         return@setListener
       }
+      if (reason == "peerTyping") {
+        post { setPeerTyping(messageId == "true") }
+        return@setListener
+      }
       if (
         reason == "chatMessageInserted" ||
           reason == "chatMessageEdited" ||
@@ -2662,7 +2872,7 @@ class ChatListView(
   }
 
   fun applyTransactions(transactions: List<Map<String, Any?>>) {
-    onNativeEvent(
+    emitNativeEvent(
       mapOf(
         "type" to "transactionsApplied",
         "count" to transactions.size,
@@ -2772,8 +2982,17 @@ class ChatListView(
 
   private fun mergedRowsPayload(baseRows: List<Map<String, Any?>>): List<Map<String, Any?>> {
     val effectiveBaseRows: List<Map<String, Any?>> = if (statusAuthorityEnabled && engineChatId.isNotBlank()) {
-      val nativeRows = ChatEngine.getChatRows(mapOf("chatId" to engineChatId))
-      if (nativeRows.isNotEmpty() || baseRows.isEmpty()) nativeRows else baseRows
+      val historyLoaded = ChatEngine.isChatHistoryLoaded(mapOf("chatId" to engineChatId))
+      if (historyLoaded) {
+        val nativeRows = ChatEngine.getChatRows(mapOf("chatId" to engineChatId))
+        if ((nativeRows.isNotEmpty() && nativeRows.size >= baseRows.size) || baseRows.isEmpty()) {
+          nativeRows
+        } else {
+          baseRows
+        }
+      } else {
+        baseRows
+      }
     } else {
       baseRows
     }
@@ -2809,18 +3028,26 @@ class ChatListView(
       merged.add(row)
     }
 
+    // Pre-clean: remove native outgoing copies whose server-confirmed version
+    // is already present in the base rows.
     val nextOrder = ArrayList<String>(nativeEngineOrder.size)
     for (messageId in nativeEngineOrder) {
-      val overlay = nativeEngineRowsById[messageId] ?: continue
-      if (baseMessageIds.contains(messageId)) {
-        nextOrder.add(messageId)
+      if (nativeEngineRowsById[messageId] == null) {
         continue
       }
-      merged.add(overlay)
+      if (baseMessageIds.contains(messageId)) {
+        nativeEngineRowsById.remove(messageId)
+        continue
+      }
       nextOrder.add(messageId)
     }
     nativeEngineOrder.clear()
     nativeEngineOrder.addAll(nextOrder)
+
+    for (messageId in nativeEngineOrder) {
+      val overlay = nativeEngineRowsById[messageId] ?: continue
+      merged.add(overlay)
+    }
     return merged
   }
 
@@ -2888,17 +3115,34 @@ class ChatListView(
       val messageId = message["id"] as? String
       val messageType = ((message["type"] as? String) ?: "text").lowercase()
       val metadata = message["metadata"] as? Map<*, *>
+      val localMediaUrl1 = message["localMediaUrl"] as? String
+      val localMediaUrl2 = message["local_media_url"] as? String
+      val metaLocalMediaUrl1 = metadata?.get("localMediaUrl") as? String
+      val metaLocalMediaUrl2 = metadata?.get("local_media_url") as? String
       val mediaUrl =
-        (message["mediaUrl"] as? String)
-          ?: (message["media_url"] as? String)
-          ?: (message["uri"] as? String)
-          ?: (message["audioUrl"] as? String)
-          ?: (message["audio_url"] as? String)
-          ?: (metadata?.get("mediaUrl") as? String)
-          ?: (metadata?.get("media_url") as? String)
-          ?: (metadata?.get("uri") as? String)
-          ?: (metadata?.get("audioUrl") as? String)
-          ?: (metadata?.get("audio_url") as? String)
+        run {
+          val isVoiceLike = messageType == "voice" || messageType == "music"
+          val orderedCandidates = ArrayList<String?>(12)
+          if (isVoiceLike) {
+            orderedCandidates.add(localMediaUrl1)
+            orderedCandidates.add(localMediaUrl2)
+            orderedCandidates.add(metaLocalMediaUrl1)
+            orderedCandidates.add(metaLocalMediaUrl2)
+          }
+          orderedCandidates.add(message["mediaUrl"] as? String)
+          orderedCandidates.add(message["media_url"] as? String)
+          orderedCandidates.add(message["uri"] as? String)
+          orderedCandidates.add(message["audioUrl"] as? String)
+          orderedCandidates.add(message["audio_url"] as? String)
+          orderedCandidates.add(metadata?.get("mediaUrl") as? String)
+          orderedCandidates.add(metadata?.get("media_url") as? String)
+          orderedCandidates.add(metadata?.get("uri") as? String)
+          orderedCandidates.add(metadata?.get("audioUrl") as? String)
+          orderedCandidates.add(metadata?.get("audio_url") as? String)
+          orderedCandidates.firstOrNull { candidate ->
+            !candidate.isNullOrBlank()
+          }
+        }
       val duration =
         parseDouble(message["duration"])
           ?: parseDouble(metadata?.get("duration"))
@@ -2930,9 +3174,42 @@ class ChatListView(
           waveform = waveform,
         ),
       )
+
+      if (messageType == "voice" || messageType == "music") {
+        val isLocalMedia = mediaUrl?.let(::isLikelyLocalMediaUrl) == true
+        if (mediaUrl.isNullOrBlank() || !isLocalMedia) {
+          Log.d(
+            "ChatListView",
+            "voice row parse messageId=${messageId ?: "-"} status=${status ?: "-"} mediaUrl=${mediaUrl?.take(120) ?: "-"} localCandidate=$isLocalMedia",
+          )
+        }
+      }
+    }
+
+    if (isPeerTyping) {
+      output.add(
+        NativeRowItem(
+          kind = "message",
+          key = "peer-typing-indicator",
+          text = "Typing...",
+          timestamp = "",
+          status = null,
+          isMe = false,
+          messageId = "peer-typing-indicator",
+          shape = NativeBubbleShape(false, 18f, 18f, 18f, 4f),
+          messageType = "typing",
+          mediaUrl = null,
+          duration = null,
+          waveform = null,
+        )
+      )
     }
 
     return output
+  }
+
+  private fun isLikelyLocalMediaUrl(raw: String): Boolean {
+    return raw.startsWith("file://") || raw.startsWith("content://") || raw.startsWith("/")
   }
 
   private fun parseSendPayload(payload: Map<String, Any?>): SendTransitionPayload? {
@@ -3073,7 +3350,7 @@ class ChatListView(
       animator = animator,
     )
 
-    onNativeEvent(
+    emitNativeEvent(
       mapOf(
         "type" to "sendTransitionStarted",
         "messageId" to payload.messageId,
@@ -3117,12 +3394,22 @@ class ChatListView(
     val running = activeTransition ?: return
     running.animator.removeAllListeners()
     running.animator.cancel()
-    overlayHost.removeView(running.overlay)
+    
+    val overlay = running.overlay
+    overlay.animate()
+      .alpha(0f)
+      .setDuration(150L)
+      .setInterpolator(android.view.animation.DecelerateInterpolator())
+      .withEndAction {
+        overlayHost.removeView(overlay)
+      }
+      .start()
+
     activeTransition = null
     adapter.setHiddenMessageId(null)
     flushQueuedAppearanceAfterTransitionIfNeeded()
 
-    onNativeEvent(
+    emitNativeEvent(
       mapOf(
         "type" to "sendTransitionCompleted",
         "messageId" to running.payload.messageId,
@@ -3162,7 +3449,7 @@ class ChatListView(
     val offsetY = recyclerView.computeVerticalScrollOffset().toDouble().coerceAtLeast(0.0)
     val distanceFromBottom = (contentHeight - (offsetY + layoutHeight)).coerceAtLeast(0.0)
 
-    onViewportChanged(
+    emitViewportChanged(
       mapOf(
         "contentHeight" to contentHeight,
         "layoutHeight" to layoutHeight,
@@ -3171,19 +3458,25 @@ class ChatListView(
         "atBottom" to (distanceFromBottom <= LIST_BOTTOM_THRESHOLD),
       ),
     )
+    positionPeerTypingIndicator()
+  }
+
+  private fun positionPeerTypingIndicator() {
+    // Typing overlay may be disabled in some builds; keep this a safe no-op.
   }
 
   private fun applyBottomAnchorPadding() {
-    val targetTop = computeBottomAnchoredTopPadding()
+    val targetBottom = contentPaddingBottom
+    val targetTop = computeBottomAnchoredTopPadding(targetBottom)
     if (
       recyclerView.paddingTop == targetTop &&
-      recyclerView.paddingBottom == contentPaddingBottom &&
+      recyclerView.paddingBottom == targetBottom &&
       recyclerView.paddingLeft == baseHorizontalPadding &&
       recyclerView.paddingRight == baseHorizontalPadding
     ) {
       return
     }
-    recyclerView.setPadding(baseHorizontalPadding, targetTop, baseHorizontalPadding, contentPaddingBottom)
+    recyclerView.setPadding(baseHorizontalPadding, targetTop, baseHorizontalPadding, targetBottom)
   }
 
   private fun applyAppearanceToView() {
@@ -3268,7 +3561,7 @@ class ChatListView(
     }
   }
 
-  private fun computeBottomAnchoredTopPadding(): Int {
+  private fun computeBottomAnchoredTopPadding(targetBottom: Int): Int {
     val itemCount = adapter.itemCount
     if (itemCount <= 0 || recyclerView.height <= 0) {
       return contentPaddingTop
@@ -3281,7 +3574,7 @@ class ChatListView(
     val firstView = layoutManager.findViewByPosition(firstPos) ?: return contentPaddingTop
     val lastView = layoutManager.findViewByPosition(lastPos) ?: return contentPaddingTop
     val contentHeight = max(0, lastView.bottom - firstView.top)
-    val available = recyclerView.height - contentPaddingBottom
+    val available = recyclerView.height - targetBottom
     return max(contentPaddingTop, available - contentHeight)
   }
 
@@ -3341,8 +3634,98 @@ class ChatListView(
     return out.ifEmpty { null }
   }
 
+  private fun setPeerTyping(typing: Boolean) {
+    if (isPeerTyping == typing) return
+    isPeerTyping = typing
+    
+    val previousDistanceFromBottom = currentDistanceFromBottom()
+    val wasNearBottom = previousDistanceFromBottom <= LIST_BOTTOM_THRESHOLD || shouldAutoScroll
+    
+    val generation = ++parseGeneration
+    diffExecutor.execute {
+      val next = parseRows(mergedRowsPayload(sourceRowsPayload))
+      mainHandler.post {
+        if (generation != parseGeneration) return@post
+        rows.clear()
+        rows.addAll(next)
+        adapter.setRows(next)
+        recyclerView.post {
+          applyBottomAnchorPadding()
+          if (wasNearBottom) {
+            scrollToBottom(false)
+          } else {
+            restoreStationaryDistance(previousDistanceFromBottom)
+          }
+        }
+      }
+    }
+  }
+
   private fun lerp(a: Float, b: Float, t: Float): Float = a + ((b - a) * t)
 }
+
+private class ShimmerTextView(context: Context) : androidx.appcompat.widget.AppCompatTextView(context) {
+  private var shimmerAnimator: ValueAnimator? = null
+  private var shimmerFraction = -0.5f
+  private val shimmerPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+  private var shimmerGradient: LinearGradient? = null
+  private val gradientMatrix = Matrix()
+
+  init {
+    setTextColor(Color.parseColor("#99FFFFFF")) // Darker base color
+    textSize = 13f
+  }
+
+  override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+    super.onSizeChanged(w, h, oldw, oldh)
+    if (w > 0 && h > 0) {
+      val baseColor = currentTextColor
+      val highlightColor = Color.WHITE
+      shimmerGradient = LinearGradient(
+        0f, 0f, w.toFloat() * 0.5f, 0f, // Gradient is half the width
+        intArrayOf(baseColor, highlightColor, baseColor),
+        floatArrayOf(0f, 0.5f, 1f),
+        Shader.TileMode.CLAMP
+      )
+      paint.shader = shimmerGradient
+    }
+  }
+
+  override fun onDraw(canvas: Canvas) {
+    if (shimmerAnimator?.isRunning == true && shimmerGradient != null) {
+      // Move gradient from left (-width) to right (2*width) to ensure full sweep
+      gradientMatrix.setTranslate(shimmerFraction * width * 2f - width / 2f, 0f)
+      shimmerGradient?.setLocalMatrix(gradientMatrix)
+    } else {
+      paint.shader = null
+    }
+    super.onDraw(canvas)
+  }
+
+  fun startShimmer() {
+    if (shimmerAnimator?.isRunning == true) return
+    
+    // Animate from 0.0 to 1.0 to move fraction
+    shimmerAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+      duration = 1500L
+      repeatCount = ValueAnimator.INFINITE
+      interpolator = android.view.animation.LinearInterpolator()
+      addUpdateListener { anim ->
+        shimmerFraction = anim.animatedValue as Float
+        invalidate()
+      }
+      start()
+    }
+  }
+
+  fun stopShimmer() {
+    shimmerAnimator?.cancel()
+    shimmerAnimator = null
+    paint.shader = null
+    invalidate()
+  }
+}
+
 
 private class ReactionBurstOverlayView(context: Context) : FrameLayout(context) {
   init {
