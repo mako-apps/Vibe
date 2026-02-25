@@ -22,7 +22,8 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
 
     let longPress = UILongPressGestureRecognizer(
       target: self, action: #selector(handleLongPress(_:)))
-    longPress.minimumPressDuration = 0.25
+    // Telegram-style activation cadence.
+    longPress.minimumPressDuration = 0.12
     collectionView.addGestureRecognizer(longPress)
   }
 
@@ -52,7 +53,8 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
     _ gestureRecognizer: UIGestureRecognizer,
     shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
   ) -> Bool {
-    guard gestureRecognizer === swipeReplyPanGesture || otherGestureRecognizer === swipeReplyPanGesture
+    guard
+      gestureRecognizer === swipeReplyPanGesture || otherGestureRecognizer === swipeReplyPanGesture
     else { return false }
     // Avoid pan competition; once swipe-reply begins we want real-time horizontal feedback.
     return false
@@ -166,6 +168,7 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
 
   @objc private func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
     guard gesture.state == .began else { return }
+    guard customContextMenuOverlay == nil else { return }
     let point = gesture.location(in: collectionView)
     guard let indexPath = collectionView.indexPathForItem(at: point),
       let cell = collectionView.cellForItem(at: indexPath) as? ChatListCell
@@ -177,11 +180,14 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
     guard indexPath.item < rows.count else { return }
     let row = rows[indexPath.item]
     guard row.kind == .message, let messageId = row.messageId else { return }
+    let isMe = row.isMe
+    let showResendAction = row.isMe && (row.status?.lowercased() == "error")
 
     guard let window = window else { return }
 
     // Snapshot only the bubble+tail (not the full cell row).
     // bubbleSnapshotView already sets the snapshot's frame in window coordinates.
+    // It captures at full scale to ensure tail bounding boxes remain mathematically identical.
     guard let bubbleSnapshot = cell.bubbleSnapshotView(in: window) else { return }
     let bubbleFrame = bubbleSnapshot.frame
 
@@ -189,22 +195,60 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
       messageId: messageId,
       bubbleSnapshot: bubbleSnapshot,
       bubbleFrame: bubbleFrame,
-      appearance: resolvedAppearance(),
-      showResendAction: row.isMe && (row.status?.lowercased() == "error")
+      bubbleIsMe: isMe,
+      appearance: self.resolvedAppearance(),
+      showResendAction: showResendAction
     )
     overlay.delegate = self
-    window.addSubview(overlay)
-    customContextMenuOverlay = overlay
+
+    if let windowScene = window.windowScene {
+      let contextWindow = UIWindow(windowScene: windowScene)
+      // Keep overlay above all current scene windows (including keyboard-level windows).
+      let existingLevels = windowScene.windows.filter { !$0.isHidden }.map { $0.windowLevel.rawValue }
+      let maxExistingLevel = existingLevels.max() ?? window.windowLevel.rawValue
+      let targetLevel = max(maxExistingLevel + 1.0, UIWindow.Level.alert.rawValue + 1.0)
+      contextWindow.windowLevel = UIWindow.Level(rawValue: targetLevel)
+      contextWindow.backgroundColor = .clear
+      contextWindow.frame = windowScene.coordinateSpace.bounds
+
+      let rootVC = UIViewController()
+      rootVC.view.backgroundColor = .clear
+      rootVC.view.frame = contextWindow.bounds
+      rootVC.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+
+      overlay.frame = rootVC.view.bounds
+      overlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+      rootVC.view.addSubview(overlay)
+      contextWindow.rootViewController = rootVC
+
+      contextWindow.isHidden = false
+      let windowDebug = windowScene.windows
+        .map { win in
+          "\(NSStringFromClass(type(of: win)))@\(String(format: "%.1f", win.windowLevel.rawValue)) hidden=\(win.isHidden)"
+        }
+        .joined(separator: " | ")
+      NSLog(
+        "[ChatListView] contextMenu windowLevel target=%.1f maxExisting=%.1f windows=%@",
+        targetLevel,
+        maxExistingLevel,
+        windowDebug
+      )
+      self.customContextMenuWindow = contextWindow
+    } else {
+      window.addSubview(overlay)
+    }
+
+    self.customContextMenuOverlay = overlay
 
     // Animate In
     overlay.animateIn()
 
     // Hide only the original bubble layer while extracted overlay is visible.
     cell.setContextMenuExtracted(true)
-    contextMenuHostCell = cell
-    contextMenuHostCellOriginalTransform = cell.transform
+    self.contextMenuHostCell = cell
+    self.contextMenuHostCellOriginalTransform = cell.transform
 
-    onNativeEvent(["type": "contextMenuOpened", "messageId": messageId])
+    self.onNativeEvent(["type": "contextMenuOpened", "messageId": messageId])
   }
 
   @available(iOS 13.0, *)
@@ -225,6 +269,9 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
     }
     contextMenuHostCell = nil
     customContextMenuOverlay = nil
+
+    customContextMenuWindow?.isHidden = true
+    customContextMenuWindow = nil
   }
 
   public func contextMenuDidSelectReaction(
