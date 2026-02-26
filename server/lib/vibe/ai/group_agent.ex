@@ -21,6 +21,8 @@ defmodule Vibe.AI.GroupAgent do
   @compaction_threshold 50
   @keep_recent_count 10
   @context_message_limit 30
+  @uploads_dir "/app/uploads"
+  @agent_docs_dir "agent-docs"
 
   @default_system_prompt """
   You are Vibe AI, a helpful assistant in this group chat.
@@ -68,7 +70,7 @@ defmodule Vibe.AI.GroupAgent do
     %{
       name: "create_document",
       description:
-        "Create a formatted document draft from user instructions. Supports markdown, plain_text, html, and json.",
+        "Create a formatted document OR editable spreadsheet file from user instructions. For spreadsheet requests, use format csv (Excel/Google Sheets compatible) and include columns/rows.",
       input_schema: %{
         type: "object",
         properties: %{
@@ -76,13 +78,39 @@ defmodule Vibe.AI.GroupAgent do
           body: %{type: "string", description: "Document main content"},
           format: %{
             type: "string",
-            enum: ["markdown", "plain_text", "html", "json"],
-            description: "Output document format"
+            enum: [
+              "markdown",
+              "plain_text",
+              "html",
+              "json",
+              "csv",
+              "excel",
+              "xlsx",
+              "spreadsheet",
+              "google_sheet"
+            ],
+            description: "Output document format. Use csv/excel/spreadsheet/google_sheet for editable table files."
           },
           sections: %{
             type: "array",
             items: %{type: "string"},
             description: "Optional section headings to structure the document"
+          },
+          columns: %{
+            type: "array",
+            items: %{type: "string"},
+            description: "For spreadsheet output: ordered column headers."
+          },
+          rows: %{
+            type: "array",
+            items: %{
+              oneOf: [
+                %{type: "array", items: %{type: "string"}},
+                %{type: "object"}
+              ]
+            },
+            description:
+              "For spreadsheet output: row data. Can be arrays aligned to columns, or objects keyed by column name."
           }
         },
         required: ["title", "body"]
@@ -189,7 +217,9 @@ defmodule Vibe.AI.GroupAgent do
 
     # 4. Call Claude
     case call_claude(messages, system_prompt, user_id, enabled_tools) do
-      {:ok, response} ->
+      {:ok, response_text} ->
+        response = maybe_attach_spreadsheet_fallback(user_message, response_text, enabled_tools)
+
         # 5. Store in memory
         attachment_summary = summarize_attachments_for_memory(metadata)
         stored_user_content =
@@ -243,6 +273,8 @@ defmodule Vibe.AI.GroupAgent do
     - You are #{agent_config.name}, an AI assistant in this group chat.
     - Keep responses concise and relevant — this is mobile chat.
     - When using tools, call them IMMEDIATELY without intro text.
+    - If user asks for Excel/sheet/spreadsheet/table with rows/columns, call create_document with format csv.
+    - When a tool returns file_url, include that URL in your final message.
     - You can reference previous conversations from your memory.
     - Address users naturally, referring to the group context.
     - Only use tools that are enabled for this group.
@@ -467,13 +499,7 @@ defmodule Vibe.AI.GroupAgent do
     format =
       input
       |> tool_input_value("format")
-      |> String.downcase()
-      |> case do
-        "plain_text" -> "plain_text"
-        "html" -> "html"
-        "json" -> "json"
-        _ -> "markdown"
-      end
+      |> normalize_document_format()
 
     sections =
       case input do
@@ -493,32 +519,290 @@ defmodule Vibe.AI.GroupAgent do
         body <> "\n\n" <> headings
       end
 
-    content =
-      case format do
-        "plain_text" ->
-          "#{title}\n\n#{structured_body}"
+    case format do
+      "csv" ->
+        build_spreadsheet_document(input, title, body, sections)
 
-        "html" ->
-          "<h1>#{escape_html(title)}</h1>\n<p>#{escape_html(structured_body)}</p>"
+      _ ->
+        content =
+          case format do
+            "plain_text" ->
+              "#{title}\n\n#{structured_body}"
 
-        "json" ->
-          Jason.encode!(%{
-            title: title,
-            content: structured_body,
-            sections: sections
-          })
+            "html" ->
+              "<h1>#{escape_html(title)}</h1>\n<p>#{escape_html(structured_body)}</p>"
 
-        _ ->
-          "# #{title}\n\n#{structured_body}"
-      end
+            "json" ->
+              Jason.encode!(%{
+                title: title,
+                content: structured_body,
+                sections: sections
+              })
 
-    %{
-      ok: true,
-      title: title,
-      format: format,
-      content: content,
-      note: "Document draft generated. You can send or refine it in chat."
-    }
+            _ ->
+              "# #{title}\n\n#{structured_body}"
+          end
+
+        %{
+          ok: true,
+          title: title,
+          format: format,
+          content: content,
+          note: "Document draft generated. You can send or refine it in chat."
+        }
+    end
+  end
+
+  defp build_spreadsheet_document(input, title, body, sections) do
+    columns = spreadsheet_columns(input, sections)
+    rows = spreadsheet_rows(input, columns, body)
+    csv_content = csv_from_rows(columns, rows)
+
+    case write_agent_document_file(title, csv_content, "csv") do
+      {:ok, %{relative_url: relative_url, file_url: file_url}} ->
+        %{
+          ok: true,
+          title: title,
+          format: "csv",
+          columns: columns,
+          rows: rows,
+          row_count: length(rows),
+          content: csv_content,
+          download_path: relative_url,
+          file_url: file_url,
+          note:
+            "Spreadsheet file generated. This CSV is editable and opens in Excel or Google Sheets."
+        }
+
+      {:error, reason} ->
+        Logger.error("[GroupAgent] Failed to write spreadsheet document: #{inspect(reason)}")
+
+        %{
+          ok: false,
+          error: "Failed to generate spreadsheet file",
+          reason: inspect(reason),
+          format: "csv",
+          title: title
+        }
+    end
+  end
+
+  defp normalize_document_format(raw_format) do
+    raw_format
+    |> to_string()
+    |> String.trim()
+    |> String.downcase()
+    |> case do
+      "plain_text" -> "plain_text"
+      "text" -> "plain_text"
+      "html" -> "html"
+      "json" -> "json"
+      "csv" -> "csv"
+      "xlsx" -> "csv"
+      "excel" -> "csv"
+      "spreadsheet" -> "csv"
+      "google_sheet" -> "csv"
+      "google_sheets" -> "csv"
+      _ -> "markdown"
+    end
+  end
+
+  defp spreadsheet_columns(input, sections) do
+    columns =
+      input
+      |> tool_input_raw("columns")
+      |> normalize_string_list()
+
+    cond do
+      columns != [] ->
+        columns
+
+      sections != [] ->
+        sections
+
+      true ->
+        ["Item", "Value"]
+    end
+  end
+
+  defp spreadsheet_rows(input, columns, body) do
+    normalized_rows =
+      input
+      |> tool_input_raw("rows")
+      |> normalize_spreadsheet_rows(columns)
+
+    if normalized_rows == [] do
+      [default_spreadsheet_row(columns, body)]
+    else
+      normalized_rows
+    end
+  end
+
+  defp normalize_spreadsheet_rows(raw_rows, columns) when is_list(raw_rows) do
+    raw_rows
+    |> Enum.map(&normalize_single_spreadsheet_row(&1, columns))
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp normalize_spreadsheet_rows(_, _), do: []
+
+  defp normalize_single_spreadsheet_row(raw_row, columns) when is_list(raw_row) do
+    raw_row
+    |> Enum.map(&to_string(&1 || ""))
+    |> fit_row_to_column_count(length(columns))
+  end
+
+  defp normalize_single_spreadsheet_row(raw_row, columns) when is_map(raw_row) do
+    normalized_lookup =
+      raw_row
+      |> Enum.map(fn {k, v} -> {String.downcase(to_string(k)), to_string(v || "")} end)
+      |> Map.new()
+
+    columns
+    |> Enum.map(fn col -> Map.get(normalized_lookup, String.downcase(col), "") end)
+    |> fit_row_to_column_count(length(columns))
+  end
+
+  defp normalize_single_spreadsheet_row(raw_row, columns) when is_binary(raw_row) do
+    raw_row
+    |> String.split(~r/\s*,\s*/, trim: true)
+    |> fit_row_to_column_count(length(columns))
+  end
+
+  defp normalize_single_spreadsheet_row(_, _), do: nil
+
+  defp fit_row_to_column_count(values, column_count) when is_list(values) and column_count >= 0 do
+    trimmed =
+      values
+      |> Enum.map(&to_string(&1 || ""))
+      |> Enum.take(column_count)
+
+    padding_count = max(column_count - length(trimmed), 0)
+    trimmed ++ List.duplicate("", padding_count)
+  end
+
+  defp default_spreadsheet_row(columns, body) do
+    first_cell =
+      body
+      |> to_string()
+      |> String.replace(~r/\s+/, " ")
+      |> String.trim()
+      |> default_if_blank("Sample row")
+      |> String.slice(0, 120)
+
+    [first_cell]
+    |> fit_row_to_column_count(length(columns))
+  end
+
+  defp csv_from_rows(columns, rows) do
+    lines = [
+      Enum.map_join(columns, ",", &csv_escape_cell/1)
+      | Enum.map(rows, fn row -> Enum.map_join(row, ",", &csv_escape_cell/1) end)
+    ]
+
+    Enum.join(lines, "\n") <> "\n"
+  end
+
+  defp csv_escape_cell(value) do
+    text = to_string(value || "")
+    escaped = String.replace(text, "\"", "\"\"")
+
+    if String.contains?(escaped, ",") or String.contains?(escaped, "\"") or
+         String.contains?(escaped, "\n") or String.contains?(escaped, "\r") do
+      "\"#{escaped}\""
+    else
+      escaped
+    end
+  end
+
+  defp write_agent_document_file(title, content, extension) do
+    docs_dir = Path.join(@uploads_dir, @agent_docs_dir)
+    filename = build_agent_document_filename(title, extension)
+    full_path = Path.join(docs_dir, filename)
+    relative_url = "/uploads/#{@agent_docs_dir}/#{filename}"
+
+    with :ok <- File.mkdir_p(docs_dir),
+         :ok <- File.write(full_path, content) do
+      {:ok,
+       %{
+         relative_url: relative_url,
+         file_url: public_upload_url(relative_url)
+       }}
+    else
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp build_agent_document_filename(title, extension) do
+    ts = DateTime.utc_now() |> DateTime.to_unix(:millisecond)
+    suffix = :crypto.strong_rand_bytes(4) |> Base.encode16(case: :lower)
+    slug = sanitize_filename_token(title)
+    "#{ts}-#{slug}-#{suffix}.#{extension}"
+  end
+
+  defp sanitize_filename_token(text) do
+    text
+    |> to_string()
+    |> String.downcase()
+    |> String.replace(~r/[^a-z0-9]+/u, "-")
+    |> String.trim("-")
+    |> default_if_blank("document")
+    |> String.slice(0, 60)
+  end
+
+  defp public_upload_url(relative_url) do
+    base_url =
+      System.get_env("PUBLIC_BASE_URL") ||
+        System.get_env("API_BASE_URL") ||
+        endpoint_url()
+
+    if is_binary(base_url) and String.trim(base_url) != "" do
+      String.trim_trailing(base_url, "/") <> relative_url
+    else
+      relative_url
+    end
+  end
+
+  defp endpoint_url do
+    try do
+      VibeWeb.Endpoint.url()
+    rescue
+      _ -> ""
+    end
+  end
+
+  defp normalize_string_list(value) when is_list(value) do
+    value
+    |> Enum.map(&to_string/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+  end
+
+  defp normalize_string_list(value) when is_binary(value) do
+    value
+    |> String.split(~r/[\n,|]/, trim: true)
+    |> normalize_string_list()
+  end
+
+  defp normalize_string_list(_), do: []
+
+  defp tool_input_raw(input, key) do
+    case input do
+      %{^key => value} ->
+        value
+
+      %{} ->
+        try do
+          Map.get(input, String.to_existing_atom(key))
+        rescue
+          _ -> nil
+        end
+
+      _ ->
+        nil
+    end
   end
 
   defp tool_input_value(input, key) do
@@ -559,6 +843,101 @@ defmodule Vibe.AI.GroupAgent do
   defp default_if_blank(text, fallback) do
     trimmed = text |> to_string() |> String.trim()
     if trimmed == "", do: fallback, else: trimmed
+  end
+
+  defp maybe_attach_spreadsheet_fallback(user_message, response, enabled_tools) do
+    if should_auto_generate_spreadsheet?(user_message, response, enabled_tools) do
+      title = infer_spreadsheet_title(user_message)
+
+      case create_document_tool(%{
+             "title" => title,
+             "body" => user_message,
+             "format" => "csv"
+           }) do
+        %{ok: true, file_url: file_url, row_count: row_count} = result ->
+          Logger.info(
+            "[GroupAgent] Auto-generated spreadsheet fallback title=#{title} rows=#{row_count}"
+          )
+
+          fallback_message = spreadsheet_fallback_message(file_url, row_count, result[:columns] || [])
+
+          if refusal_language?(response) do
+            fallback_message
+          else
+            response <> "\n\n" <> fallback_message
+          end
+
+        _ ->
+          response
+      end
+    else
+      response
+    end
+  end
+
+  defp should_auto_generate_spreadsheet?(user_message, response, enabled_tools) do
+    "create_document" in enabled_tools and spreadsheet_intent?(user_message) and
+      not response_contains_download_link?(response)
+  end
+
+  defp spreadsheet_intent?(message) do
+    down = message |> to_string() |> String.downcase()
+
+    spreadsheet_terms = [
+      "excel",
+      "xlsx",
+      "spreadsheet",
+      "google sheet",
+      "google sheets",
+      "csv",
+      "rows",
+      "columns"
+    ]
+
+    action_terms = ["create", "make", "generate", "build", "export", "prepare"]
+
+    Enum.any?(spreadsheet_terms, &String.contains?(down, &1)) and
+      Enum.any?(action_terms, &String.contains?(down, &1))
+  end
+
+  defp response_contains_download_link?(response) do
+    text = response |> to_string() |> String.downcase()
+
+    String.contains?(text, "/uploads/") or
+      Regex.match?(~r/https?:\/\/\S+\.(csv|xlsx?)(\?\S*)?/i, text) or
+      Regex.match?(~r/https?:\/\/\S+\/agent-docs\/\S+/i, text)
+  end
+
+  defp refusal_language?(response) do
+    down = response |> to_string() |> String.downcase()
+
+    refusal_markers = [
+      "i can't",
+      "i cannot",
+      "not able",
+      "unable to",
+      "can't directly",
+      "cannot directly"
+    ]
+
+    Enum.any?(refusal_markers, &String.contains?(down, &1))
+  end
+
+  defp infer_spreadsheet_title(message) do
+    summary =
+      message
+      |> to_string()
+      |> String.replace(~r/\s+/, " ")
+      |> String.trim()
+      |> String.slice(0, 40)
+
+    "Spreadsheet - " <> default_if_blank(summary, "Data")
+  end
+
+  defp spreadsheet_fallback_message(file_url, row_count, columns) do
+    col_count = length(columns)
+
+    "Created editable spreadsheet file (CSV): #{file_url}\nColumns: #{col_count}, Rows: #{row_count}\nYou can open this in Excel or Google Sheets."
   end
 
   defp extract_text(content) when is_list(content) do
