@@ -91,6 +91,19 @@ defmodule Vibe.Chat do
       %{}
     end
 
+    group_members =
+      if group_channel_ids != [] do
+        from(p in Participant,
+          where: p.chat_id in ^group_channel_ids,
+          preload: [:user],
+          order_by: [asc: p.inserted_at]
+        )
+        |> Repo.all()
+        |> Enum.group_by(& &1.chat_id)
+      else
+        %{}
+      end
+
     Enum.map(results, fn {chat_id, my_settings} ->
       room = Map.get(rooms, chat_id)
       friend_p = List.first(Map.get(friend_participants, chat_id, []))
@@ -107,6 +120,19 @@ defmodule Vibe.Chat do
       end
 
       room_type = if(room, do: room.type, else: "dm")
+      members =
+        if room_type in ["group", "channel"] do
+          Map.get(group_members, chat_id, [])
+          |> Enum.map(fn member ->
+            %{
+              userId: member.user_id,
+              name: if(member.user, do: member.user.username, else: nil),
+              role: member.role || "member"
+            }
+          end)
+        else
+          nil
+        end
 
       %{
         chatId: chat_id,
@@ -120,6 +146,7 @@ defmodule Vibe.Chat do
         friendId: if(friend_p, do: friend_p.user_id, else: nil),
         friendName: if(friend_p && friend_p.user, do: friend_p.user.username, else: nil),
         friendImage: if(friend_p && friend_p.user, do: friend_p.user.profile_image, else: nil),
+        members: members,
         messages: if(last_msg, do: [last_msg], else: []),
         unreadCount: 0,
         pinned: my_settings.pinned,
@@ -162,6 +189,17 @@ defmodule Vibe.Chat do
     %Message{}
     |> Message.changeset(attrs)
     |> Repo.insert()
+  end
+
+  def get_message(chat_id, message_id) do
+    with {:ok, message_uuid} <- Ecto.UUID.cast(message_id) do
+      Repo.one(
+        from m in Message,
+          where: m.chat_id == ^chat_id and m.id == ^message_uuid
+      )
+    else
+      _ -> nil
+    end
   end
 
   def get_messages(chat_id) do

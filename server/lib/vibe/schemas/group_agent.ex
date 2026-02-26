@@ -8,6 +8,9 @@ defmodule Vibe.Chat.GroupAgent do
   import Ecto.Query
   alias Vibe.Repo
 
+  @allowed_tools ["search_google", "analyze_image", "analyze_document", "create_document"]
+  @default_enabled_tools @allowed_tools
+
   @primary_key {:id, :binary_id, autogenerate: true}
   @foreign_key_type :binary_id
 
@@ -17,6 +20,7 @@ defmodule Vibe.Chat.GroupAgent do
     field :name, :string, default: "Vibe AI"
     field :system_prompt, :string
     field :avatar_url, :string
+    field :enabled_tools, {:array, :string}, default: @default_enabled_tools
     field :created_by, :binary_id
 
     timestamps()
@@ -24,11 +28,51 @@ defmodule Vibe.Chat.GroupAgent do
 
   def changeset(agent, attrs) do
     agent
-    |> cast(attrs, [:chat_id, :enabled, :name, :system_prompt, :avatar_url, :created_by])
+    |> cast(attrs, [
+      :chat_id,
+      :enabled,
+      :name,
+      :system_prompt,
+      :avatar_url,
+      :enabled_tools,
+      :created_by,
+    ])
     |> validate_required([:chat_id, :system_prompt])
     |> validate_length(:name, max: 50)
     |> validate_length(:system_prompt, max: 4000)
+    |> normalize_enabled_tools()
+    |> validate_enabled_tools()
     |> unique_constraint(:chat_id)
+  end
+
+  defp normalize_enabled_tools(changeset) do
+    raw_tools = get_field(changeset, :enabled_tools) || @default_enabled_tools
+
+    normalized =
+      raw_tools
+      |> List.wrap()
+      |> Enum.map(&to_string/1)
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.uniq()
+
+    final_tools = if normalized == [], do: @default_enabled_tools, else: normalized
+    put_change(changeset, :enabled_tools, final_tools)
+  end
+
+  defp validate_enabled_tools(changeset) do
+    tools = get_field(changeset, :enabled_tools) || []
+    invalid_tools = Enum.reject(tools, &(&1 in @allowed_tools))
+
+    if invalid_tools == [] do
+      changeset
+    else
+      add_error(
+        changeset,
+        :enabled_tools,
+        "contains unsupported tools: #{Enum.join(invalid_tools, ", ")}"
+      )
+    end
   end
 
   # ── CRUD ──

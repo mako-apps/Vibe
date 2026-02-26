@@ -2,6 +2,7 @@ defmodule VibeWeb.GroupAgentController do
   use VibeWeb, :controller
   alias Vibe.Chat
   alias Vibe.Chat.GroupAgent
+  alias Vibe.AI.GroupAgent, as: AIGroupAgent
 
   # POST /api/group/:id/agent — Create/configure agent (owner/admin only)
   def create(conn, %{"id" => chat_id} = params) do
@@ -15,23 +16,20 @@ defmodule VibeWeb.GroupAgentController do
             attrs = %{
               chat_id: chat_id,
               name: params["name"] || "Vibe AI",
-              system_prompt: params["systemPrompt"] || params["system_prompt"],
+              system_prompt:
+                params["systemPrompt"] || params["system_prompt"] || AIGroupAgent.default_system_prompt(),
               avatar_url: params["avatarUrl"] || params["avatar_url"],
+              enabled_tools:
+                AIGroupAgent.normalize_enabled_tools(
+                  params["enabledTools"] || params["enabled_tools"]
+                ),
               enabled: Map.get(params, "enabled", true),
               created_by: user_id
             }
 
             case GroupAgent.create(attrs) do
               {:ok, agent} ->
-                json(conn, %{
-                  id: agent.id,
-                  chatId: agent.chat_id,
-                  name: agent.name,
-                  systemPrompt: agent.system_prompt,
-                  avatarUrl: agent.avatar_url,
-                  enabled: agent.enabled,
-                  createdBy: agent.created_by
-                })
+                json(conn, agent_payload(agent, can_manage: true))
 
               {:error, changeset} ->
                 conn |> put_status(422) |> json(%{error: format_errors(changeset)})
@@ -53,20 +51,14 @@ defmodule VibeWeb.GroupAgentController do
     unless Chat.is_participant?(chat_id, user_id) do
       conn |> put_status(:forbidden) |> json(%{error: "Not a participant"})
     else
+      can_manage = user_can_manage?(chat_id, user_id)
+
       case GroupAgent.get_by_chat(chat_id) do
         nil ->
           conn |> put_status(404) |> json(%{error: "No agent configured"})
 
         agent ->
-          json(conn, %{
-            id: agent.id,
-            chatId: agent.chat_id,
-            name: agent.name,
-            systemPrompt: agent.system_prompt,
-            avatarUrl: agent.avatar_url,
-            enabled: agent.enabled,
-            createdBy: agent.created_by
-          })
+          json(conn, agent_payload(agent, can_manage: can_manage))
       end
     end
   end
@@ -94,6 +86,18 @@ defmodule VibeWeb.GroupAgentController do
             else
               attrs
             end
+            attrs =
+              if params["enabledTools"] || params["enabled_tools"] do
+                Map.put(
+                  attrs,
+                  :enabled_tools,
+                  AIGroupAgent.normalize_enabled_tools(
+                    params["enabledTools"] || params["enabled_tools"]
+                  )
+                )
+              else
+                attrs
+              end
             attrs = if Map.has_key?(params, "enabled") do
               Map.put(attrs, :enabled, params["enabled"])
             else
@@ -102,15 +106,7 @@ defmodule VibeWeb.GroupAgentController do
 
             case GroupAgent.update(agent, attrs) do
               {:ok, updated} ->
-                json(conn, %{
-                  id: updated.id,
-                  chatId: updated.chat_id,
-                  name: updated.name,
-                  systemPrompt: updated.system_prompt,
-                  avatarUrl: updated.avatar_url,
-                  enabled: updated.enabled,
-                  createdBy: updated.created_by
-                })
+                json(conn, agent_payload(updated, can_manage: true))
 
               {:error, changeset} ->
                 conn |> put_status(422) |> json(%{error: format_errors(changeset)})
@@ -149,6 +145,41 @@ defmodule VibeWeb.GroupAgentController do
     end
   end
 
+  # POST /api/group/:id/agent/generate_prompt — Generate system prompt text from short admin input
+  def generate_prompt(conn, %{"id" => chat_id} = params) do
+    user_id = conn.assigns.current_user.id
+
+    case authorize_admin(chat_id, user_id) do
+      :ok ->
+        input =
+          params["input"] || params["description"] || params["prompt"] || params["goal"] || ""
+
+        enabled_tools =
+          AIGroupAgent.normalize_enabled_tools(params["enabledTools"] || params["enabled_tools"])
+
+        case AIGroupAgent.generate_system_prompt(input, enabled_tools) do
+          {:ok, generated_prompt} ->
+            json(conn, %{
+              systemPrompt: generated_prompt,
+              enabledTools: enabled_tools
+            })
+
+          {:error, :empty_input} ->
+            conn
+            |> put_status(422)
+            |> json(%{error: "Prompt description is required"})
+
+          {:error, reason} ->
+            conn
+            |> put_status(500)
+            |> json(%{error: "Failed to generate prompt", details: inspect(reason)})
+        end
+
+      {:error, reason} ->
+        conn |> put_status(:forbidden) |> json(%{error: reason})
+    end
+  end
+
   # ── Helpers ──
 
   defp authorize_admin(chat_id, user_id) do
@@ -159,6 +190,27 @@ defmodule VibeWeb.GroupAgentController do
     else
       {:error, "Not authorized. Only group owner or admin can manage the agent."}
     end
+  end
+
+  defp user_can_manage?(chat_id, user_id) do
+    settings = Chat.get_participant_settings(chat_id, user_id)
+    settings && settings.role in ["owner", "admin"]
+  end
+
+  defp agent_payload(agent, opts \\ []) do
+    can_manage = Keyword.get(opts, :can_manage, false)
+
+    %{
+      id: agent.id,
+      chatId: agent.chat_id,
+      name: agent.name,
+      systemPrompt: agent.system_prompt,
+      avatarUrl: agent.avatar_url,
+      enabled: agent.enabled,
+      enabledTools: AIGroupAgent.normalize_enabled_tools(agent.enabled_tools),
+      createdBy: agent.created_by,
+      canManage: can_manage
+    }
   end
 
   defp format_errors(%Ecto.Changeset{} = changeset) do

@@ -125,6 +125,7 @@ defmodule VibeWeb.Router do
     get "/group/:id/agent", GroupAgentController, :show
     put "/group/:id/agent", GroupAgentController, :update
     delete "/group/:id/agent", GroupAgentController, :delete
+    post "/group/:id/agent/generate_prompt", GroupAgentController, :generate_prompt
 
     # Channels
     post "/channel", ChannelController, :create
