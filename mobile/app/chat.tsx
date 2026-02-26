@@ -54,6 +54,15 @@ const toTimestampMs = (value: unknown): number => {
   return Date.now();
 };
 
+const normalizeOpenFileUrl = (value: string): string => {
+  let normalized = value.trim();
+  normalized = normalized.replace(/^https?:\/\/\[(https?:\/\/[^\]]+)\](\/.*)?$/i, '$1$2');
+  normalized = normalized.replace(/^\[(https?:\/\/[^\]]+)\](\/.*)?$/i, '$1$2');
+  normalized = normalized.replace(/^https:\/\/https:\/\//i, 'https://');
+  normalized = normalized.replace(/^http:\/\/http:\/\//i, 'http://');
+  return normalized;
+};
+
 export default function ChatScreen() {
   const params = useLocalSearchParams();
   const router = useRouter();
@@ -270,7 +279,8 @@ export default function ChatScreen() {
     }
 
     if (type === 'openFile') {
-      const url = typeof payload.url === 'string' ? payload.url.trim() : '';
+      const rawUrl = typeof payload.url === 'string' ? payload.url : '';
+      const url = rawUrl ? normalizeOpenFileUrl(rawUrl) : '';
       if (url) {
         Linking.openURL(url).catch((error) => {
           console.warn('[chat/native-main] failed to open file url', { url, error });

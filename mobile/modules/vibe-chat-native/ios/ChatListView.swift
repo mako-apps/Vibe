@@ -1,6 +1,5 @@
 import ExpoModulesCore
 import QuickLook
-import SafariServices
 import UIKit
 
 private final class ChatListDocumentPreviewDataSource: NSObject, QLPreviewControllerDataSource {
@@ -84,6 +83,8 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
     )?
   private let viewportEmitMinInterval: CFTimeInterval = 1.0 / 30.0
   private var documentPreviewDataSource: ChatListDocumentPreviewDataSource?
+  private var documentPreviewCacheByRemoteURL: [String: URL] = [:]
+  private var documentPreviewInFlightURLs = Set<String>()
 
   private var hiddenMessageId: String?
   private var pendingSendTransition: SendTransitionPayload?
@@ -121,6 +122,12 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
   private static var wallpaperMaskImageCache: [String: CGImage] = [:]
   private static let cachedThemeIdDefaultsKey = "vibe.chat.native.themeId.v1"
   private static let cachedThemeIsDarkDefaultsKey = "vibe.chat.native.themeIsDark.v1"
+  private static let documentPreviewSession: URLSession = {
+    if #available(iOS 13.0, *) {
+      return ChatPhoenixClient.makePinnedURLSession()
+    }
+    return URLSession.shared
+  }()
 
   private var isPeerTyping: Bool = false
 
@@ -2487,49 +2494,142 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
   private func openDocumentInApp(urlString: String) {
     let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return }
-    guard let presenter = topPresentingViewController() else {
-      onNativeEvent([
-        "type": "openFile",
-        "url": trimmed,
-      ])
-      return
-    }
-
-    if let remoteURL = URL(string: trimmed), let scheme = remoteURL.scheme?.lowercased(),
+    let resolved = ChatEngine.shared.resolveURLForOpen(trimmed) ?? trimmed
+    if let remoteURL = URL(string: resolved), let scheme = remoteURL.scheme?.lowercased(),
       scheme == "http" || scheme == "https"
     {
-      let safari = SFSafariViewController(url: remoteURL)
-      safari.dismissButtonStyle = .close
-      presenter.present(safari, animated: true)
+      openRemoteDocumentInPreview(remoteURL: remoteURL, fallbackURL: resolved)
       return
     }
 
     let resolvedLocalURL: URL? = {
-      if let parsed = URL(string: trimmed), parsed.isFileURL {
+      if let parsed = URL(string: resolved), parsed.isFileURL {
         return parsed
       }
-      if trimmed.hasPrefix("/") {
-        return URL(fileURLWithPath: trimmed)
+      if resolved.hasPrefix("/") {
+        return URL(fileURLWithPath: resolved)
       }
-      if let decoded = trimmed.removingPercentEncoding, decoded.hasPrefix("/") {
+      if let decoded = resolved.removingPercentEncoding, decoded.hasPrefix("/") {
         return URL(fileURLWithPath: decoded)
       }
       return nil
     }()
 
     if let localURL = resolvedLocalURL {
-      let preview = QLPreviewController()
-      let dataSource = ChatListDocumentPreviewDataSource(previewURL: localURL)
-      documentPreviewDataSource = dataSource
-      preview.dataSource = dataSource
-      presenter.present(preview, animated: true)
+      presentDocumentPreview(localURL: localURL)
       return
     }
 
     onNativeEvent([
       "type": "openFile",
-      "url": trimmed,
+      "url": resolved,
     ])
+  }
+
+  private func presentDocumentPreview(localURL: URL) {
+    guard let presenter = topPresentingViewController() else {
+      onNativeEvent([
+        "type": "openFile",
+        "url": localURL.path,
+      ])
+      return
+    }
+    let preview = QLPreviewController()
+    let dataSource = ChatListDocumentPreviewDataSource(previewURL: localURL)
+    documentPreviewDataSource = dataSource
+    preview.dataSource = dataSource
+    presenter.present(preview, animated: true)
+  }
+
+  private func openRemoteDocumentInPreview(remoteURL: URL, fallbackURL: String) {
+    guard topPresentingViewController() != nil else {
+      onNativeEvent([
+        "type": "openFile",
+        "url": fallbackURL,
+      ])
+      return
+    }
+
+    let remoteKey = remoteURL.absoluteString
+    if let cachedURL = documentPreviewCacheByRemoteURL[remoteKey],
+      FileManager.default.fileExists(atPath: cachedURL.path)
+    {
+      presentDocumentPreview(localURL: cachedURL)
+      return
+    }
+
+    guard !documentPreviewInFlightURLs.contains(remoteKey) else { return }
+    documentPreviewInFlightURLs.insert(remoteKey)
+
+    var request = URLRequest(url: remoteURL)
+    request.timeoutInterval = 60
+    let task = Self.documentPreviewSession.downloadTask(with: request) { [weak self] tempURL, response, error in
+      guard let self else { return }
+      let localURL = self.persistDownloadedDocument(
+        tempURL: tempURL,
+        remoteURL: remoteURL,
+        response: response,
+        error: error
+      )
+      DispatchQueue.main.async {
+        self.documentPreviewInFlightURLs.remove(remoteKey)
+        if let localURL {
+          self.documentPreviewCacheByRemoteURL[remoteKey] = localURL
+          self.presentDocumentPreview(localURL: localURL)
+          return
+        }
+        self.onNativeEvent([
+          "type": "openFile",
+          "url": fallbackURL,
+        ])
+      }
+    }
+    task.resume()
+  }
+
+  private func persistDownloadedDocument(
+    tempURL: URL?,
+    remoteURL: URL,
+    response: URLResponse?,
+    error: Error?
+  ) -> URL? {
+    guard error == nil, let tempURL else { return nil }
+    if let statusCode = (response as? HTTPURLResponse)?.statusCode, !(200...299).contains(statusCode) {
+      return nil
+    }
+
+    let fileManager = FileManager.default
+    let previewDir = fileManager.temporaryDirectory
+      .appendingPathComponent("vibe-chat-preview-docs", isDirectory: true)
+    do {
+      try fileManager.createDirectory(at: previewDir, withIntermediateDirectories: true)
+    } catch {
+      return nil
+    }
+
+    let remoteFileName = remoteURL.deletingPathExtension().lastPathComponent
+    let safeBase =
+      (remoteFileName.isEmpty ? "document" : remoteFileName)
+      .replacingOccurrences(of: "[^A-Za-z0-9_-]+", with: "-", options: .regularExpression)
+    let extensionValue = remoteURL.pathExtension.isEmpty ? tempURL.pathExtension : remoteURL.pathExtension
+    let destinationName =
+      "\(safeBase)-\(UUID().uuidString)\(extensionValue.isEmpty ? "" : ".\(extensionValue)")"
+    let destinationURL = previewDir.appendingPathComponent(destinationName, isDirectory: false)
+
+    do {
+      if fileManager.fileExists(atPath: destinationURL.path) {
+        try fileManager.removeItem(at: destinationURL)
+      }
+      try fileManager.moveItem(at: tempURL, to: destinationURL)
+      return destinationURL
+    } catch {
+      do {
+        try fileManager.copyItem(at: tempURL, to: destinationURL)
+        return destinationURL
+      } catch {
+        return nil
+      }
+    }
   }
 }
 

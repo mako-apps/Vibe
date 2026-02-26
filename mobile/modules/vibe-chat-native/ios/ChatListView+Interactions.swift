@@ -393,32 +393,48 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
   }
 
   @objc private func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
-    guard gesture.state == .began else { return }
-    guard customContextMenuOverlay == nil else { return }
+    switch gesture.state {
+    case .began:
+      guard customContextMenuOverlay == nil else { return }
 
-    // Cancel any in-progress swipe reply immediately to avoid residual X offset.
-    resetSwipeReplyTransform(animated: false)
-    clearSwipeReplyState()
+      // Cancel any in-progress swipe reply immediately to avoid residual X offset.
+      resetSwipeReplyTransform(animated: false)
+      clearSwipeReplyState()
 
-    let point = gesture.location(in: collectionView)
-    guard let indexPath = collectionView.indexPathForItem(at: point),
-      let cell = collectionView.cellForItem(at: indexPath) as? ChatListCell
-    else { return }
+      let point = gesture.location(in: collectionView)
+      guard let indexPath = collectionView.indexPathForItem(at: point),
+        let cell = collectionView.cellForItem(at: indexPath) as? ChatListCell
+      else { return }
 
-    // Reset any stale contentView transform the pan may have left behind.
-    cell.contentView.transform = .identity
+      // Make sure the cell's contentView has no stale swipe-reply translation.
+      cell.contentView.transform = .identity
 
-    // Immediate visual hold feedback on the real bubble (before extraction/menu animation).
-    cell.setContextMenuHeld(true, animated: true)
-    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+      // Fire haptic immediately, then animate the bubble scale-down via CALayer.
+      // Opening the menu right after ensures the extraction (alpha → 0) happens
+      // in the SAME run-loop iteration as the hold-scale, so there is no flicker.
+      UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+      cell.setContextMenuHeld(true, animated: true)
+      openContextMenu(at: point)
 
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self, weak cell] in
-      guard let self else { return }
-      guard self.customContextMenuOverlay == nil else { return }
-      self.openContextMenu(at: point)
-      if self.customContextMenuOverlay == nil {
-        cell?.setContextMenuHeld(false, animated: true)
+      // If the menu failed to open (e.g. not a message row), release the hold.
+      if customContextMenuOverlay == nil {
+        cell.setContextMenuHeld(false, animated: true)
       }
+
+    case .ended, .cancelled, .failed:
+      // Belt-and-suspenders: if the overlay never opened, release the hold.
+      // (Normally dismiss happens through contextMenuDidDismiss.)
+      if customContextMenuOverlay == nil {
+        let point = gesture.location(in: collectionView)
+        if let indexPath = collectionView.indexPathForItem(at: point),
+          let cell = collectionView.cellForItem(at: indexPath) as? ChatListCell
+        {
+          cell.setContextMenuHeld(false, animated: true)
+        }
+      }
+
+    default:
+      break
     }
   }
 

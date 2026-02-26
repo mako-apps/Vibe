@@ -1485,7 +1485,11 @@ final class ChatListCell: UICollectionViewCell {
     applyContextMenuHoldIfNeeded(animated: false)
     contentView.alpha = 1.0
     contentView.transform = .identity
-    // Strip any residual UIKit animations from the previous lifecycle.
+    // Clear any residual hold-scale layer animations from the previous lifecycle.
+    for v in [bubbleView, tailView, agentSenderLabel] as [UIView] {
+      v.layer.removeAnimation(forKey: "holdScale")
+      v.layer.transform = CATransform3DIdentity
+    }
     layer.removeAllAnimations()
     contentView.layer.removeAllAnimations()
     stopTypingShimmer()
@@ -1953,7 +1957,9 @@ final class ChatListCell: UICollectionViewCell {
   }
 
   func hitTestInlineAttachment(at pointInCell: CGPoint) -> Bool {
-    guard let row, hasInlineFileAttachment(row), !inlineAttachmentView.isHidden else { return false }
+    guard let row, hasInlineFileAttachment(row), !inlineAttachmentView.isHidden else {
+      return false
+    }
     let local = contentView.convert(pointInCell, from: self)
     return inlineAttachmentView.frame.contains(local)
   }
@@ -2108,50 +2114,48 @@ final class ChatListCell: UICollectionViewCell {
     reactionPillView.alpha = alpha
   }
 
+  // MARK: - Hold effect (scales bubbleView + tailView only via CALayer — never touches contentView.transform)
+
   private func applyContextMenuHoldIfNeeded(animated: Bool) {
-    let target: CGAffineTransform
+    let scale: CGFloat = isContextMenuHeld ? 0.95 : 1.0
+    let scaleTransform = CATransform3DMakeScale(scale, scale, 1.0)
+
+    let views: [UIView] = [bubbleView, tailView, agentSenderLabel]
+    if !animated {
+      CATransaction.begin()
+      CATransaction.setDisableActions(true)
+      for v in views { v.layer.transform = scaleTransform }
+      CATransaction.commit()
+      return
+    }
+
+    // Use CASpringAnimation so the hold compresses and the release bounces naturally.
+    // This runs entirely on the render server — no contentView.transform involved,
+    // so it cannot conflict with the swipe-reply pan or the extraction alpha.
+    let anim = CASpringAnimation(keyPath: "transform")
+    anim.fromValue = views.first?.layer.presentation()?.transform ?? scaleTransform
+    anim.toValue = scaleTransform
     if isContextMenuHeld {
-      let scale: CGFloat = 0.95
-      let cx = contentView.bounds.midX
-      let cy = contentView.bounds.midY
-      let px = bubbleView.center.x
-      let py = bubbleView.center.y
-      // Counteract the shift caused by scaling around the contentView's center
-      let tx = (px - cx) * (1.0 - scale)
-      let ty = (py - cy) * (1.0 - scale)
-      target = CGAffineTransform(translationX: tx, y: ty).scaledBy(x: scale, y: scale)
+      // Quick, firm press-in — overdamped so no bounce on the way down
+      anim.mass = 1.0
+      anim.stiffness = 280
+      anim.damping = 28
+      anim.initialVelocity = 0
     } else {
-      target = .identity
+      // Satisfying bounce on release
+      anim.mass = 1.0
+      anim.stiffness = 220
+      anim.damping = 18
+      anim.initialVelocity = 0
     }
+    anim.duration = anim.settlingDuration
+    anim.fillMode = .forwards
+    anim.isRemovedOnCompletion = false
 
-    let apply = {
-      self.contentView.transform = target
-    }
-
-    if animated {
-      if isContextMenuHeld {
-        UIView.animate(
-          withDuration: 0.35,
-          delay: 0.0,
-          usingSpringWithDamping: 1.0,
-          initialSpringVelocity: 0.0,
-          options: [.curveEaseOut, .beginFromCurrentState, .allowUserInteraction]
-        ) {
-          apply()
-        }
-      } else {
-        UIView.animate(
-          withDuration: 0.55,
-          delay: 0.0,
-          usingSpringWithDamping: 0.72,
-          initialSpringVelocity: 0.0,
-          options: [.curveEaseOut, .beginFromCurrentState, .allowUserInteraction]
-        ) {
-          apply()
-        }
-      }
-    } else {
-      apply()
+    for v in views {
+      v.layer.removeAnimation(forKey: "holdScale")
+      v.layer.add(anim, forKey: "holdScale")
+      v.layer.transform = scaleTransform  // also set model layer so it stays after animation
     }
   }
 

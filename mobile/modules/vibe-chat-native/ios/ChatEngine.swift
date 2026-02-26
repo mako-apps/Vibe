@@ -610,6 +610,10 @@ final class ChatEngine {
     syncOnQueue { statusSnapshotLocked() }
   }
 
+  func resolveURLForOpen(_ raw: String?) -> String? {
+    syncOnQueue { resolveURLForOpenLocked(raw) }
+  }
+
   func isUserOnline(userId: String?) -> Bool {
     syncOnQueue {
       guard let normalized = normalizedUpper(userId), !normalized.isEmpty else { return false }
@@ -3877,6 +3881,62 @@ final class ChatEngine {
       components.path = String(components.path.dropLast("/socket".count))
     }
     return components.url
+  }
+
+  private func originString(from base: URL) -> String? {
+    guard var components = URLComponents(url: base, resolvingAgainstBaseURL: false) else { return nil }
+    components.path = ""
+    components.query = nil
+    components.fragment = nil
+    guard let url = components.url else { return nil }
+    return url.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+  }
+
+  private func sanitizeOpenURLString(_ raw: String) -> String {
+    let trimmed =
+      raw
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+
+    return trimmed
+      .replacingOccurrences(
+        of: #"^https?:\/\/\[(https?:\/\/[^\]]+)\](\/.*)?$"#,
+        with: "$1$2",
+        options: .regularExpression
+      )
+      .replacingOccurrences(
+        of: #"^\[(https?:\/\/[^\]]+)\](\/.*)?$"#,
+        with: "$1$2",
+        options: .regularExpression
+      )
+      .replacingOccurrences(of: "https://https://", with: "https://")
+      .replacingOccurrences(of: "http://http://", with: "http://")
+  }
+
+  private func resolveURLForOpenLocked(_ raw: String?) -> String? {
+    guard let raw = normalizedString(raw), !raw.isEmpty else { return nil }
+    let sanitized = sanitizeOpenURLString(raw)
+    guard !sanitized.isEmpty else { return nil }
+
+    if let url = URL(string: sanitized), let scheme = url.scheme?.lowercased(),
+      scheme == "http" || scheme == "https" || scheme == "file"
+    {
+      return url.absoluteString
+    }
+
+    if sanitized.hasPrefix("/uploads/") || sanitized.hasPrefix("uploads/"),
+      let base = apiBaseURLLocked(),
+      let origin = originString(from: base)
+    {
+      let path = sanitized.hasPrefix("/") ? sanitized : "/" + sanitized
+      return origin + path
+    }
+
+    if sanitized.hasPrefix("/"), let base = apiBaseURLLocked(), let origin = originString(from: base) {
+      return origin + sanitized
+    }
+
+    return sanitized
   }
 
   private func authHeaderTokenLocked() -> String? {

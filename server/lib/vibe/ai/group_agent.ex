@@ -1293,12 +1293,47 @@ defmodule Vibe.AI.GroupAgent do
         System.get_env("API_BASE_URL") ||
         endpoint_url()
 
-    if is_binary(base_url) and String.trim(base_url) != "" do
-      String.trim_trailing(base_url, "/") <> relative_url
+    normalized_base = normalize_public_base_url(base_url)
+
+    if is_binary(normalized_base) and normalized_base != "" do
+      String.trim_trailing(normalized_base, "/") <> relative_url
     else
       relative_url
     end
   end
+
+  defp normalize_public_base_url(raw) when is_binary(raw) do
+    cleaned =
+      raw
+      |> String.trim()
+      |> String.trim_leading("\"")
+      |> String.trim_trailing("\"")
+      |> String.trim_leading("'")
+      |> String.trim_trailing("'")
+
+    fixed_bracketed =
+      case Regex.run(~r/^https?:\/\/\[(https?:\/\/[^\]]+)\](\/.*)?$/i, cleaned) do
+        [_, inner, path] when is_binary(path) -> inner <> path
+        [_, inner, nil] -> inner
+        [_, inner] -> inner
+        _ ->
+          case Regex.run(~r/^\[(https?:\/\/[^\]]+)\](\/.*)?$/i, cleaned) do
+            [_, inner, path] when is_binary(path) -> inner <> path
+            [_, inner, nil] -> inner
+            [_, inner] -> inner
+            _ -> cleaned
+          end
+      end
+
+    fixed_double_scheme =
+      fixed_bracketed
+      |> String.replace_prefix("https://https://", "https://")
+      |> String.replace_prefix("http://http://", "http://")
+
+    fixed_double_scheme
+  end
+
+  defp normalize_public_base_url(_), do: ""
 
   defp endpoint_url do
     try do

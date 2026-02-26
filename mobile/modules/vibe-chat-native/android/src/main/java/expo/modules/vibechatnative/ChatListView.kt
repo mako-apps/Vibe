@@ -1160,7 +1160,7 @@ private class NativeRowsAdapter(
   }
 
   private fun openDocumentInApp(rawUrl: String) {
-    val trimmed = rawUrl.trim()
+    val trimmed = sanitizeOpenUrl(rawUrl)
     if (trimmed.isEmpty()) return
     val uri = Uri.parse(trimmed)
     try {
@@ -1179,6 +1179,21 @@ private class NativeRowsAdapter(
         ),
       )
     }
+  }
+
+  private fun sanitizeOpenUrl(rawUrl: String): String {
+    var value = rawUrl.trim()
+    value = value.replace(
+      Regex("^https?://\\[(https?://[^\\]]+)](/.*)?$", RegexOption.IGNORE_CASE),
+      "$1$2",
+    )
+    value = value.replace(
+      Regex("^\\[(https?://[^\\]]+)](/.*)?$", RegexOption.IGNORE_CASE),
+      "$1$2",
+    )
+    value = value.replaceFirst("https://https://", "https://")
+    value = value.replaceFirst("http://http://", "http://")
+    return value
   }
 
   private fun NativeRowViewHolder.bind(item: NativeRowItem, hidden: Boolean) {
