@@ -11,7 +11,7 @@ defmodule Vibe.Chat.GroupAgent do
 
   @allowed_tools [
     "search_google", "analyze_image", "analyze_document", "create_document",
-    "find_rows", "edit_rows", "delete_rows", "export_rows"
+    "find_rows", "edit_rows", "delete_rows", "export_rows", "delete_document"
   ]
   @default_enabled_tools @allowed_tools
 
