@@ -77,8 +77,11 @@ final class ChatMainProfileTabNode: UIControl {
 }
 
 final class ChatMainProfileListRowNode: UIControl {
+  private let iconContainer = UIView()
+  private let iconImageView = UIImageView()
   private let titleLabel = UILabel()
   private let subtitleLabel = UILabel()
+  private let chevronImageView = UIImageView()
   private let separatorView = UIView()
   private let pressedOverlay = UIView()
 
@@ -101,13 +104,29 @@ final class ChatMainProfileListRowNode: UIControl {
   private func setup() {
     clipsToBounds = true
 
-    titleLabel.font = UIFont.systemFont(ofSize: 16, weight: .medium)
+    iconContainer.layer.cornerRadius = 10.0
+    iconContainer.layer.cornerCurve = .continuous
+    iconContainer.backgroundColor = UIColor(white: 1.0, alpha: 0.06)
+    iconContainer.isHidden = true
+    addSubview(iconContainer)
+
+    iconImageView.contentMode = .scaleAspectFit
+    iconImageView.tintColor = .white
+    iconContainer.addSubview(iconImageView)
+
+    titleLabel.font = UIFont.systemFont(ofSize: 16, weight: .semibold)
     titleLabel.numberOfLines = 1
     addSubview(titleLabel)
 
     subtitleLabel.font = UIFont.systemFont(ofSize: 14, weight: .regular)
     subtitleLabel.numberOfLines = 2
     addSubview(subtitleLabel)
+
+    let chevronConfig = UIImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
+    chevronImageView.image = UIImage(systemName: "chevron.right", withConfiguration: chevronConfig)
+    chevronImageView.tintColor = UIColor(white: 1.0, alpha: 0.2)
+    chevronImageView.contentMode = .center
+    addSubview(chevronImageView)
 
     separatorView.backgroundColor = separatorColor
     addSubview(separatorView)
@@ -120,20 +139,38 @@ final class ChatMainProfileListRowNode: UIControl {
 
   override func layoutSubviews() {
     super.layoutSubviews()
-    let insetX: CGFloat = 18.0
+    let hasIcon = !iconContainer.isHidden
+    let insetX: CGFloat = hasIcon ? 64.0 : 20.0
+
+    if hasIcon {
+      iconContainer.frame = CGRect(
+        x: 16.0, y: (bounds.height - 36.0) / 2.0, width: 36.0, height: 36.0)
+      iconImageView.frame = iconContainer.bounds.insetBy(dx: 8.0, dy: 8.0)
+    }
+
+    let chevronWidth: CGFloat = 20.0
+    chevronImageView.frame = CGRect(
+      x: bounds.width - 16.0 - chevronWidth,
+      y: (bounds.height - chevronWidth) / 2.0,
+      width: chevronWidth,
+      height: chevronWidth
+    )
+
+    let textWidth = bounds.width - insetX - chevronWidth - 12.0
+
     titleLabel.frame = CGRect(
-      x: insetX, y: 11.0, width: bounds.width - (insetX * 2.0), height: 22.0)
-    let subtitleHeight = max(0.0, bounds.height - titleLabel.frame.maxY - 11.0)
+      x: insetX, y: 12.0, width: textWidth, height: 22.0)
+    let subtitleHeight = max(0.0, bounds.height - titleLabel.frame.maxY - 12.0)
     subtitleLabel.frame = CGRect(
       x: insetX,
-      y: titleLabel.frame.maxY + 1.0,
-      width: bounds.width - (insetX * 2.0),
+      y: titleLabel.frame.maxY,
+      width: textWidth,
       height: subtitleHeight
     )
     separatorView.frame = CGRect(
       x: insetX,
       y: bounds.height - (1.0 / UIScreen.main.scale),
-      width: max(0.0, bounds.width - (insetX * 2.0)),
+      width: max(0.0, bounds.width - insetX),
       height: 1.0 / UIScreen.main.scale
     )
     pressedOverlay.frame = bounds
@@ -155,7 +192,10 @@ final class ChatMainProfileListRowNode: UIControl {
     title: String,
     subtitle: String,
     titleColor: UIColor? = nil,
-    showsSeparator: Bool
+    showsSeparator: Bool,
+    iconName: String? = nil,
+    iconTintColor: UIColor? = nil,
+    iconBackgroundColor: UIColor? = nil
   ) {
     titleLabel.text = title
     subtitleLabel.text = subtitle
@@ -163,6 +203,19 @@ final class ChatMainProfileListRowNode: UIControl {
     separatorView.isHidden = !showsSeparator
     titleLabel.textColor = titleColor ?? defaultTitleColor
     subtitleLabel.textColor = subtitleColor
+
+    if let iconName {
+      iconContainer.isHidden = false
+      iconImageView.image = UIImage(systemName: iconName)
+      if let tintColor = iconTintColor {
+        iconImageView.tintColor = tintColor
+      }
+      if let bgColor = iconBackgroundColor {
+        iconContainer.backgroundColor = bgColor
+      }
+    } else {
+      iconContainer.isHidden = true
+    }
   }
 
   func applyTheme(
@@ -332,14 +385,17 @@ final class ChatMainProfileAgentPromptNode: UIView {
   private let promptPreviewCard = UIView()
   private let promptPreviewTitleLabel = UILabel()
   private let promptPreviewLabel = UILabel()
+  
+  private let documentsTitleLabel = UILabel()
+  private let documentsContainer = UIStackView()
 
-  private let buttonStack = UIStackView()
   private let editButton = UIButton(type: .system)
   private let deleteButton = UIButton(type: .system)
 
   private var chatId: String = ""
   private var currentConfig: [String: Any] = [:]
   private var hasPersistedConfig = false
+  private var currentDocuments: [(id: String, name: String)] = []
 
   private let defaultAccent = UIColor(red: 0.49, green: 0.36, blue: 0.88, alpha: 1.0)
   private var textColor: UIColor = .white
@@ -377,7 +433,7 @@ final class ChatMainProfileAgentPromptNode: UIView {
     headerBar.addSubview(headerTitleLabel)
 
     headerSubtitleLabel.font = UIFont.systemFont(ofSize: 12, weight: .medium)
-    headerSubtitleLabel.text = "Single native model backend"
+    headerSubtitleLabel.text = "Single model backend"
     headerBar.addSubview(headerSubtitleLabel)
 
     headerToggle.transform = CGAffineTransform(scaleX: 0.82, y: 0.82)
@@ -397,28 +453,32 @@ final class ChatMainProfileAgentPromptNode: UIView {
     promptPreviewLabel.font = UIFont.systemFont(ofSize: 14, weight: .regular)
     promptPreviewLabel.numberOfLines = 4
     promptPreviewCard.addSubview(promptPreviewLabel)
+    
+    documentsTitleLabel.font = UIFont.systemFont(ofSize: 11, weight: .semibold)
+    documentsTitleLabel.text = "AGENT DOCUMENTS"
+    addSubview(documentsTitleLabel)
+    
+    documentsContainer.axis = .vertical
+    documentsContainer.spacing = 8.0
+    documentsContainer.distribution = .equalSpacing
+    addSubview(documentsContainer)
 
-    buttonStack.axis = .horizontal
-    buttonStack.spacing = 10.0
-    buttonStack.distribution = .fillEqually
-    addSubview(buttonStack)
-
-    editButton.setTitle("Edit Agent", for: .normal)
-    editButton.titleLabel?.font = UIFont.systemFont(ofSize: 14, weight: .semibold)
-    editButton.layer.cornerRadius = 14.0
+    let editIconConfig = UIImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
+    editButton.setImage(UIImage(systemName: "pencil", withConfiguration: editIconConfig), for: .normal)
+    editButton.layer.cornerRadius = 16.0
     editButton.layer.cornerCurve = .continuous
     editButton.clipsToBounds = true
     editButton.addTarget(self, action: #selector(handleEditTapped), for: .touchUpInside)
-    buttonStack.addArrangedSubview(editButton)
+    addSubview(editButton)
 
-    deleteButton.setTitle("Remove Agent", for: .normal)
-    deleteButton.titleLabel?.font = UIFont.systemFont(ofSize: 14, weight: .semibold)
-    deleteButton.layer.cornerRadius = 14.0
+    let deleteIconConfig = UIImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
+    deleteButton.setImage(UIImage(systemName: "trash", withConfiguration: deleteIconConfig), for: .normal)
+    deleteButton.layer.cornerRadius = 16.0
     deleteButton.layer.cornerCurve = .continuous
     deleteButton.layer.borderWidth = 1.0 / UIScreen.main.scale
     deleteButton.clipsToBounds = true
     deleteButton.addTarget(self, action: #selector(handleDeleteTapped), for: .touchUpInside)
-    buttonStack.addArrangedSubview(deleteButton)
+    addSubview(deleteButton)
 
     applyTheme(
       textColor: textColor,
@@ -429,9 +489,19 @@ final class ChatMainProfileAgentPromptNode: UIView {
     refreshViewState()
   }
 
-  func configure(chatId: String, config: [String: Any]?) {
+  func configure(chatId: String, config: [String: Any]?, documents: [(id: String, name: String)]) {
     self.chatId = chatId
     hasPersistedConfig = config != nil
+    
+    var uniqueDocs = [(id: String, name: String)]()
+    var seenNames = Set<String>()
+    for doc in documents {
+      if !seenNames.contains(doc.name) {
+        seenNames.insert(doc.name)
+        uniqueDocs.append(doc)
+      }
+    }
+    self.currentDocuments = uniqueDocs
 
     if let config {
       var nextConfig: [String: Any] = [:]
@@ -452,8 +522,47 @@ final class ChatMainProfileAgentPromptNode: UIView {
       ]
     }
 
+    rebuildDocumentsUI()
     refreshViewState()
     setNeedsLayout()
+  }
+  
+  private func rebuildDocumentsUI() {
+    documentsContainer.arrangedSubviews.forEach { $0.removeFromSuperview() }
+    for doc in currentDocuments {
+      let row = UIView()
+      row.layer.cornerRadius = 10.0
+      row.layer.cornerCurve = .continuous
+      row.backgroundColor = fieldBgColor
+      row.translatesAutoresizingMaskIntoConstraints = false
+      row.heightAnchor.constraint(equalToConstant: 40).isActive = true
+      
+      let icon = UIImageView(image: UIImage(systemName: "doc.text.fill"))
+      icon.tintColor = secondaryTextColor
+      icon.contentMode = .scaleAspectFit
+      icon.translatesAutoresizingMaskIntoConstraints = false
+      row.addSubview(icon)
+      
+      let label = UILabel()
+      label.text = doc.name
+      label.font = UIFont.systemFont(ofSize: 13, weight: .medium)
+      label.textColor = textColor
+      label.translatesAutoresizingMaskIntoConstraints = false
+      row.addSubview(label)
+      
+      NSLayoutConstraint.activate([
+        icon.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 12),
+        icon.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+        icon.widthAnchor.constraint(equalToConstant: 16),
+        icon.heightAnchor.constraint(equalToConstant: 16),
+        
+        label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 8),
+        label.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -12),
+        label.centerYAnchor.constraint(equalTo: row.centerYAnchor)
+      ])
+      
+      documentsContainer.addArrangedSubview(row)
+    }
   }
 
   func applyTheme(
@@ -477,27 +586,43 @@ final class ChatMainProfileAgentPromptNode: UIView {
     promptPreviewCard.backgroundColor = fieldBgColor
     promptPreviewTitleLabel.textColor = secondaryTextColor
     promptPreviewLabel.textColor = textColor
+    
+    documentsTitleLabel.textColor = secondaryTextColor
+    
+    for subview in documentsContainer.arrangedSubviews {
+      subview.backgroundColor = fieldBgColor
+      if let label = subview.subviews.compactMap({ $0 as? UILabel }).first {
+        label.textColor = textColor
+      }
+      if let icon = subview.subviews.compactMap({ $0 as? UIImageView }).first {
+        icon.tintColor = secondaryTextColor
+      }
+    }
 
     editButton.backgroundColor = accentColor
-    editButton.setTitleColor(.white, for: .normal)
+    editButton.tintColor = .white
 
     deleteButton.backgroundColor = fieldBgColor
-    deleteButton.setTitleColor(.systemRed, for: .normal)
+    deleteButton.tintColor = .systemRed
     deleteButton.layer.borderColor = secondaryTextColor.withAlphaComponent(0.35).cgColor
   }
 
   func preferredHeight(for width: CGFloat) -> CGFloat {
     let headerHeight: CGFloat = 58.0
     let pad: CGFloat = 16.0
-    let buttonHeight: CGFloat = 44.0
-    var total = headerHeight + 10.0
+    var total = headerHeight + 5.0
 
     if shouldShowPromptPreview {
-      total += promptCardHeight(for: width) + 10.0
+      total += promptCardHeight(for: width) + 12.0
+    }
+    
+    if !currentDocuments.isEmpty {
+      total += 14.0 + 8.0 // Title
+      total += CGFloat(currentDocuments.count) * 40.0 + CGFloat(max(0, currentDocuments.count - 1)) * 8.0
+      total += 12.0
     }
 
-    total += buttonHeight + pad
-    return total
+    return total + pad
   }
 
   override func layoutSubviews() {
@@ -508,9 +633,11 @@ final class ChatMainProfileAgentPromptNode: UIView {
 
     headerBar.frame = CGRect(x: 0.0, y: 0.0, width: width, height: headerHeight)
     headerIcon.frame = CGRect(x: pad, y: 12.0, width: 20.0, height: 20.0)
-    headerTitleLabel.frame = CGRect(x: pad + 28.0, y: 8.0, width: width - 140.0, height: 22.0)
+    
+    let actionsWidth: CGFloat = 80.0
+    headerTitleLabel.frame = CGRect(x: pad + 28.0, y: 8.0, width: width - 120.0 - actionsWidth, height: 22.0)
     headerSubtitleLabel.frame = CGRect(
-      x: pad + 28.0, y: headerTitleLabel.frame.maxY - 1.0, width: width - 140.0, height: 18.0)
+      x: pad + 28.0, y: headerTitleLabel.frame.maxY - 1.0, width: width - 120.0 - actionsWidth, height: 18.0)
 
     let toggleSize = headerToggle.intrinsicContentSize
     let scaledToggleWidth = toggleSize.width * 0.82
@@ -521,8 +648,22 @@ final class ChatMainProfileAgentPromptNode: UIView {
       width: toggleSize.width,
       height: toggleSize.height
     )
+    
+    let btnSize: CGFloat = 32.0
+    editButton.frame = CGRect(
+      x: headerToggle.frame.minX - btnSize - 12.0,
+      y: (headerHeight - btnSize) * 0.5,
+      width: btnSize,
+      height: btnSize
+    )
+    deleteButton.frame = CGRect(
+      x: editButton.frame.minX - btnSize - 8.0,
+      y: (headerHeight - btnSize) * 0.5,
+      width: btnSize,
+      height: btnSize
+    )
 
-    var y = headerBar.frame.maxY + 6.0
+    var y = headerBar.frame.maxY + 5.0
     if shouldShowPromptPreview {
       let promptCardHeight = promptCardHeight(for: width)
       promptPreviewCard.frame = CGRect(
@@ -534,16 +675,28 @@ final class ChatMainProfileAgentPromptNode: UIView {
       promptPreviewTitleLabel.frame = CGRect(
         x: 12.0, y: 10.0, width: promptPreviewCard.bounds.width - 24.0, height: 14.0)
       promptPreviewLabel.frame = CGRect(
-        x: 12.0, y: 28.0, width: promptPreviewCard.bounds.width - 24.0, height: promptCardHeight - 40.0)
-      y = promptPreviewCard.frame.maxY + 10.0
+        x: 12.0, y: 28.0, width: promptPreviewCard.bounds.width - 24.0,
+        height: promptCardHeight - 40.0)
+      y = promptPreviewCard.frame.maxY + 12.0
     } else {
       promptPreviewCard.frame = .zero
       promptPreviewTitleLabel.frame = .zero
       promptPreviewLabel.frame = .zero
     }
 
-    buttonStack.frame = CGRect(
-      x: pad, y: y, width: width - (pad * 2.0), height: 44.0)
+    if !currentDocuments.isEmpty {
+      documentsTitleLabel.isHidden = false
+      documentsContainer.isHidden = false
+      documentsTitleLabel.frame = CGRect(x: pad + 2.0, y: y, width: width - (pad * 2.0), height: 14.0)
+      y += 14.0 + 8.0
+      
+      let docsHeight = CGFloat(currentDocuments.count) * 40.0 + CGFloat(max(0, currentDocuments.count - 1)) * 8.0
+      documentsContainer.frame = CGRect(x: pad, y: y, width: width - (pad * 2.0), height: docsHeight)
+      y += docsHeight + 12.0
+    } else {
+      documentsTitleLabel.isHidden = true
+      documentsContainer.isHidden = true
+    }
   }
 
   @objc private func handleToggleChanged() {
@@ -576,7 +729,7 @@ final class ChatMainProfileAgentPromptNode: UIView {
 
     headerToggle.isOn = isEnabled
     headerTitleLabel.text = "✦ \(name)"
-    headerSubtitleLabel.text = isEnabled ? "Single native model backend" : "Agent is paused"
+    headerSubtitleLabel.text = isEnabled ? "Single model backend" : "Agent is paused"
 
     promptPreviewLabel.text = prompt
     promptPreviewCard.isHidden = !shouldShowPromptPreview

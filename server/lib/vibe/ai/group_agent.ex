@@ -122,6 +122,82 @@ defmodule Vibe.AI.GroupAgent do
         },
         required: ["title", "body"]
       }
+    },
+    %{
+      name: "find_rows",
+      description:
+        "Search the current spreadsheet for rows matching a query. Returns matching rows with their 1-based index. Use this before edit_rows or delete_rows to locate specific rows.",
+      input_schema: %{
+        type: "object",
+        properties: %{
+          query: %{type: "string", description: "Text to search for across row values (case-insensitive)"},
+          column: %{type: "string", description: "Optional: restrict search to a specific column name"},
+          limit: %{type: "integer", description: "Max rows to return (default 20)"}
+        },
+        required: ["query"]
+      }
+    },
+    %{
+      name: "edit_rows",
+      description:
+        "Edit specific rows in the current spreadsheet by row index. Use find_rows first to get the correct indices. Only send the columns you want to change.",
+      input_schema: %{
+        type: "object",
+        properties: %{
+          edits: %{
+            type: "array",
+            items: %{
+              type: "object",
+              properties: %{
+                row_index: %{type: "integer", description: "1-based row index (from find_rows results)"},
+                values: %{type: "object", description: "Column name → new value for each cell to change"}
+              },
+              required: ["row_index", "values"]
+            },
+            description: "List of row edits to apply"
+          }
+        },
+        required: ["edits"]
+      }
+    },
+    %{
+      name: "delete_rows",
+      description:
+        "Delete specific rows from the current spreadsheet by their 1-based index. Use find_rows first to locate rows.",
+      input_schema: %{
+        type: "object",
+        properties: %{
+          row_indices: %{
+            type: "array",
+            items: %{type: "integer"},
+            description: "1-based row indices to delete"
+          }
+        },
+        required: ["row_indices"]
+      }
+    },
+    %{
+      name: "export_rows",
+      description:
+        "Export rows from the current spreadsheet as a styled PDF (default) or PNG file. Can filter by search query or specific row indices. Use this when the user wants to send, share, or print specific records.",
+      input_schema: %{
+        type: "object",
+        properties: %{
+          title: %{type: "string", description: "Title for the exported document"},
+          query: %{type: "string", description: "Optional: search text to filter rows"},
+          row_indices: %{
+            type: "array",
+            items: %{type: "integer"},
+            description: "Optional: specific 1-based row indices to export"
+          },
+          format: %{
+            type: "string",
+            enum: ["pdf", "png"],
+            description: "Export format. Default is pdf."
+          }
+        },
+        required: ["title"]
+      }
     }
   ]
 
@@ -323,15 +399,27 @@ defmodule Vibe.AI.GroupAgent do
     - For document/file requests, generate professional outputs with clean structure and naming.
     - When a tool creates/updates a file, respond naturally and state that the file is attached (do not paste raw URLs).
     - Never claim you cannot create/edit spreadsheet files when create_document is enabled.
-    - The generated XLSX files already have styled headers (bold white on blue), borders, RTL layout, and fixed column widths — do NOT add formatting hints or decorators in cell text.
-    - Spreadsheet behavior is stateful per group chat.
-    - Default behavior is to edit the current spreadsheet for this chat.
+    - The generated XLSX files already have styled headers (bold white on blue), borders, RTL layout, and column widths — do NOT add formatting hints or decorators in cell text.
+    - Spreadsheet behavior is stateful per group chat. Default: edit the current spreadsheet.
     - Use operation=create_new only when user explicitly asks for a NEW file/from-scratch sheet.
     - For adding data, prefer operation=append_rows.
     - For corrections, prefer operation=edit_current or replace_rows.
     - If user asks to undo/revert, use operation=revert_last.
     - If user asks for Excel/sheet/spreadsheet/table with rows/columns, call create_document with format xlsx unless user explicitly asks for csv.
-    - Spreadsheet quality:
+
+    ROW-LEVEL EDITING:
+    - For targeted edits (changing a few cells or rows), use find_rows to locate the row first, then edit_rows with the row index. Do NOT resend all rows via create_document for small changes.
+    - For bulk replacements or new files, continue using create_document.
+    - Use delete_rows to remove specific rows by index. Always use find_rows first to confirm the correct row.
+    - When the user says "change X to Y", "fix row N", or "update the amount for John", use find_rows + edit_rows.
+
+    EXPORTING & SHARING:
+    - When the user asks to "send", "export", "share", or "print" specific data (e.g. "send me John's invoices"), use export_rows to generate a styled PDF (default) or PNG.
+    - export_rows can filter by search query or specific row indices.
+    - Default export format is PDF unless the user explicitly asks for an image/PNG.
+    - Do not send the raw XLSX/CSV file when the user wants to share a specific subset of data — use export_rows instead.
+
+    SPREADSHEET QUALITY:
       * Use clear, professional column headers in a stable order.
       * Keep every row aligned to the column count (no missing/extra cells).
       * Normalize noisy values (trim spaces, remove filler text, keep wording consistent).
@@ -362,9 +450,10 @@ defmodule Vibe.AI.GroupAgent do
         "No active spreadsheet file for this group yet."
 
       current ->
+        column_list = List.wrap(current.columns)
+
         columns =
-          current.columns
-          |> List.wrap()
+          column_list
           |> Enum.join(", ")
           |> default_if_blank("(none)")
 
@@ -376,6 +465,23 @@ defmodule Vibe.AI.GroupAgent do
           end)
           |> default_if_blank("- none")
 
+        row_preview =
+          case read_agent_document_file(current) do
+            {:ok, csv} ->
+              {_cols, rows} = parse_csv_content(csv)
+
+              rows
+              |> Enum.with_index(1)
+              |> Enum.take(5)
+              |> Enum.map_join("\n", fn {row, idx} ->
+                "  #{idx}: #{Enum.join(row, " | ")}"
+              end)
+              |> default_if_blank("  (empty)")
+
+            _ ->
+              "  (unavailable)"
+          end
+
         """
         Current file:
         - version: #{current.version}
@@ -384,6 +490,8 @@ defmodule Vibe.AI.GroupAgent do
         - rows: #{current.row_count}
         - columns: #{columns}
         - file_url: #{current.file_url}
+        - preview (first 5 rows):
+        #{row_preview}
 
         Recent versions:
         #{recent_versions}
@@ -599,6 +707,10 @@ defmodule Vibe.AI.GroupAgent do
           "analyze_image" -> Vibe.AI.Tools.Vision.analyze(input)
           "analyze_document" -> Vibe.AI.Tools.Document.analyze(input)
           "create_document" -> create_document_tool(chat_id, input, user_id)
+          "find_rows" -> find_rows_tool(chat_id, input)
+          "edit_rows" -> edit_rows_tool(chat_id, input, user_id)
+          "delete_rows" -> delete_rows_tool(chat_id, input, user_id)
+          "export_rows" -> export_rows_tool(chat_id, input, user_id)
           _ -> %{error: "Unknown tool: #{name}"}
         end
 
@@ -1218,6 +1330,329 @@ defmodule Vibe.AI.GroupAgent do
     }
   end
 
+  # ── Row-level tools ──
+
+  @doc_renderer_url "http://127.0.0.1:5050"
+
+  defp find_rows_tool(chat_id, input) do
+    query = tool_input_value(input, "query") |> String.downcase()
+    column_filter = tool_input_value(input, "column")
+    limit = tool_input_int(input, "limit", 20)
+
+    with {:ok, document} <- get_current_document(chat_id),
+         {:ok, csv} <- read_agent_document_file(document) do
+      {columns, rows} = parse_csv_content(csv)
+
+      col_index =
+        if column_filter != "" do
+          Enum.find_index(columns, fn c -> String.downcase(c) == String.downcase(column_filter) end)
+        else
+          nil
+        end
+
+      matches =
+        rows
+        |> Enum.with_index(1)
+        |> Enum.filter(fn {row, _idx} ->
+          if col_index do
+            cell = Enum.at(row, col_index, "")
+            String.contains?(String.downcase(cell), query)
+          else
+            Enum.any?(row, fn cell -> String.contains?(String.downcase(cell), query) end)
+          end
+        end)
+        |> Enum.take(limit)
+        |> Enum.map(fn {row, idx} ->
+          values =
+            columns
+            |> Enum.zip(row)
+            |> Map.new()
+
+          %{index: idx, values: values}
+        end)
+
+      total =
+        rows
+        |> Enum.count(fn row ->
+          if col_index do
+            String.contains?(String.downcase(Enum.at(row, col_index, "")), query)
+          else
+            Enum.any?(row, fn cell -> String.contains?(String.downcase(cell), query) end)
+          end
+        end)
+
+      %{ok: true, columns: columns, rows: matches, total_matches: total, showing: length(matches)}
+    else
+      {:error, :no_document} -> %{error: "No active spreadsheet for this group."}
+      {:error, reason} -> %{error: "Failed to read spreadsheet: #{inspect(reason)}"}
+    end
+  end
+
+  defp edit_rows_tool(chat_id, input, user_id) do
+    raw_edits = tool_input_raw(input, "edits") || []
+
+    edits =
+      raw_edits
+      |> List.wrap()
+      |> Enum.map(fn edit ->
+        idx = tool_input_int(edit, "row_index", 0)
+        values = tool_input_raw(edit, "values") || %{}
+        {idx, values}
+      end)
+      |> Enum.reject(fn {idx, _} -> idx < 1 end)
+
+    if edits == [] do
+      %{error: "No valid edits provided. Each edit needs row_index (>= 1) and values."}
+    else
+      with {:ok, document} <- get_current_document(chat_id),
+           {:ok, csv} <- read_agent_document_file(document) do
+        {columns, rows} = parse_csv_content(csv)
+        max_idx = length(rows)
+
+        col_lookup =
+          columns
+          |> Enum.with_index()
+          |> Enum.map(fn {c, i} -> {String.downcase(c), i} end)
+          |> Map.new()
+
+        {updated_rows, update_count} =
+          Enum.reduce(edits, {rows, 0}, fn {row_idx, values}, {acc_rows, count} ->
+            if row_idx > max_idx do
+              {acc_rows, count}
+            else
+              updated_row =
+                Enum.reduce(values, Enum.at(acc_rows, row_idx - 1), fn {col_name, new_val}, row ->
+                  case Map.get(col_lookup, String.downcase(to_string(col_name))) do
+                    nil -> row
+                    col_idx -> List.replace_at(row, col_idx, to_string(new_val))
+                  end
+                end)
+
+              {List.replace_at(acc_rows, row_idx - 1, updated_row), count + 1}
+            end
+          end)
+
+        title = document.title || "Spreadsheet"
+        output_format = if document.format == "csv", do: "csv", else: "xlsx"
+
+        with {:ok, storage, csv_content} <- write_spreadsheet_document_file(title, columns, updated_rows, output_format),
+             {:ok, doc} <-
+               persist_document_version(
+                 chat_id,
+                 title,
+                 output_format,
+                 storage.relative_url,
+                 storage.file_url,
+                 columns,
+                 length(updated_rows),
+                 merge_document_metadata(
+                   build_spreadsheet_metadata("edit_rows", document.version, ""),
+                   storage.metadata
+                 ),
+                 "edit",
+                 user_id
+               ) do
+          %{ok: true, updated_count: update_count, row_count: length(updated_rows),
+            file_url: doc.file_url, version: doc.version}
+        else
+          {:error, reason} -> %{error: "Failed to save edits: #{inspect(reason)}"}
+        end
+      else
+        {:error, :no_document} -> %{error: "No active spreadsheet for this group."}
+        {:error, reason} -> %{error: "Failed to read spreadsheet: #{inspect(reason)}"}
+      end
+    end
+  end
+
+  defp delete_rows_tool(chat_id, input, user_id) do
+    raw_indices = tool_input_raw(input, "row_indices") || []
+
+    indices =
+      raw_indices
+      |> List.wrap()
+      |> Enum.map(fn i -> if is_integer(i), do: i, else: String.to_integer(to_string(i)) end)
+      |> Enum.filter(&(&1 >= 1))
+      |> Enum.uniq()
+      |> Enum.sort(:desc)
+
+    if indices == [] do
+      %{error: "No valid row indices provided."}
+    else
+      with {:ok, document} <- get_current_document(chat_id),
+           {:ok, csv} <- read_agent_document_file(document) do
+        {columns, rows} = parse_csv_content(csv)
+        max_idx = length(rows)
+
+        valid_indices = Enum.filter(indices, &(&1 <= max_idx))
+
+        if valid_indices == [] do
+          %{error: "All indices out of range. Sheet has #{max_idx} rows."}
+        else
+          remaining_rows =
+            Enum.reduce(valid_indices, rows, fn idx, acc ->
+              List.delete_at(acc, idx - 1)
+            end)
+
+          title = document.title || "Spreadsheet"
+          output_format = if document.format == "csv", do: "csv", else: "xlsx"
+
+          with {:ok, storage, _csv_content} <- write_spreadsheet_document_file(title, columns, remaining_rows, output_format),
+               {:ok, doc} <-
+                 persist_document_version(
+                   chat_id,
+                   title,
+                   output_format,
+                   storage.relative_url,
+                   storage.file_url,
+                   columns,
+                   length(remaining_rows),
+                   merge_document_metadata(
+                     build_spreadsheet_metadata("delete_rows", document.version, ""),
+                     storage.metadata
+                   ),
+                   "edit",
+                   user_id
+                 ) do
+            %{ok: true, deleted_count: length(valid_indices), remaining_rows: length(remaining_rows),
+              file_url: doc.file_url, version: doc.version}
+          else
+            {:error, reason} -> %{error: "Failed to save after delete: #{inspect(reason)}"}
+          end
+        end
+      else
+        {:error, :no_document} -> %{error: "No active spreadsheet for this group."}
+        {:error, reason} -> %{error: "Failed to read spreadsheet: #{inspect(reason)}"}
+      end
+    end
+  end
+
+  defp export_rows_tool(chat_id, input, user_id) do
+    title = tool_input_value(input, "title") |> default_if_blank("Export")
+    query = tool_input_value(input, "query")
+    raw_indices = tool_input_raw(input, "row_indices")
+    format = tool_input_value(input, "format") |> default_if_blank("pdf")
+
+    with {:ok, document} <- get_current_document(chat_id),
+         {:ok, csv} <- read_agent_document_file(document) do
+      {columns, rows} = parse_csv_content(csv)
+
+      selected_rows =
+        cond do
+          is_list(raw_indices) and raw_indices != [] ->
+            indices = Enum.map(raw_indices, fn i ->
+              if is_integer(i), do: i, else: String.to_integer(to_string(i))
+            end)
+            Enum.filter(rows |> Enum.with_index(1), fn {_row, idx} -> idx in indices end)
+            |> Enum.map(fn {row, _idx} -> row end)
+
+          query != "" ->
+            q = String.downcase(query)
+            Enum.filter(rows, fn row ->
+              Enum.any?(row, fn cell -> String.contains?(String.downcase(cell), q) end)
+            end)
+
+          true ->
+            rows
+        end
+
+      if selected_rows == [] do
+        %{error: "No rows matched the filter."}
+      else
+        render_payload = %{
+          "title" => title,
+          "columns" => columns,
+          "rows" => selected_rows,
+          "format" => format,
+          "meta" => "#{length(selected_rows)} rows from #{document.title || "spreadsheet"}"
+        }
+
+        case call_doc_renderer("/render", render_payload) do
+          {:ok, binary_content, content_type} ->
+            extension = if format == "png", do: "png", else: "pdf"
+
+            with {:ok, storage} <- write_agent_document_binary_file(title, binary_content, extension),
+                 {:ok, doc} <-
+                   persist_document_version(
+                     chat_id,
+                     title,
+                     extension,
+                     storage.relative_url,
+                     storage.file_url,
+                     [],
+                     length(selected_rows),
+                     merge_document_metadata(
+                       %{"operation" => "export_rows", "source_format" => document.format,
+                         "export_format" => format},
+                       storage.metadata
+                     ),
+                     "create",
+                     user_id
+                   ) do
+              %{ok: true, title: title, format: format, row_count: length(selected_rows),
+                file_url: doc.file_url, note: "Exported #{length(selected_rows)} rows as #{String.upcase(format)}."}
+            else
+              {:error, reason} -> %{error: "Failed to save export: #{inspect(reason)}"}
+            end
+
+          {:error, reason} ->
+            Logger.error("[GroupAgent] Doc renderer failed: #{inspect(reason)}")
+            %{error: "Export rendering failed. The document renderer may not be available."}
+        end
+      end
+    else
+      {:error, :no_document} -> %{error: "No active spreadsheet for this group."}
+      {:error, reason} -> %{error: "Failed to read spreadsheet: #{inspect(reason)}"}
+    end
+  end
+
+  defp get_current_document(chat_id) do
+    case GroupAgentDocument.get_current(chat_id) do
+      nil -> {:error, :no_document}
+      doc -> {:ok, doc}
+    end
+  end
+
+  defp call_doc_renderer(path, payload) do
+    url = @doc_renderer_url <> path
+    body = Jason.encode!(payload)
+    headers = [{"content-type", "application/json"}]
+
+    case :httpc.request(
+           :post,
+           {String.to_charlist(url), Enum.map(headers, fn {k, v} -> {String.to_charlist(k), String.to_charlist(v)} end), ~c"application/json", body},
+           [{:timeout, 30_000}, {:connect_timeout, 5_000}],
+           [body_format: :binary]
+         ) do
+      {:ok, {{_, status, _}, resp_headers, resp_body}} when status in 200..299 ->
+        content_type =
+          resp_headers
+          |> Enum.find_value("application/octet-stream", fn
+            {~c"content-type", ct} -> List.to_string(ct)
+            _ -> nil
+          end)
+
+        {:ok, resp_body, content_type}
+
+      {:ok, {{_, status, _}, _headers, resp_body}} ->
+        {:error, {:renderer_http_error, status, resp_body}}
+
+      {:error, reason} ->
+        {:error, {:renderer_connection_error, reason}}
+    end
+  end
+
+  defp tool_input_int(input, key, default) do
+    case tool_input_raw(input, key) do
+      nil -> default
+      val when is_integer(val) -> val
+      val ->
+        case Integer.parse(to_string(val)) do
+          {int, _} -> int
+          :error -> default
+        end
+    end
+  end
+
   defp file_extension_for_document_format(format) do
     case format do
       "plain_text" -> "txt"
@@ -1391,7 +1826,9 @@ defmodule Vibe.AI.GroupAgent do
         end
 
       _ ->
-        with {:ok, xlsx_binary} <- xlsx_from_rows(columns, rows),
+        xlsx_result = generate_xlsx_binary(title, columns, rows)
+
+        with {:ok, xlsx_binary} <- xlsx_result,
              {:ok, storage} <-
                write_agent_document_binary_file(
                  title,
@@ -1404,6 +1841,21 @@ defmodule Vibe.AI.GroupAgent do
                ) do
           {:ok, storage, csv_content}
         end
+    end
+  end
+
+  defp generate_xlsx_binary(title, columns, rows) do
+    # Try Python renderer first (openpyxl — better styling), fall back to built-in XML
+    payload = %{"title" => title, "columns" => columns, "rows" => rows, "rtl" => true}
+
+    case call_doc_renderer("/xlsx", payload) do
+      {:ok, binary, _content_type} ->
+        Logger.info("[GroupAgent] XLSX generated via Python renderer")
+        {:ok, binary}
+
+      {:error, reason} ->
+        Logger.warning("[GroupAgent] Python renderer unavailable (#{inspect(reason)}), falling back to built-in XLSX")
+        xlsx_from_rows(columns, rows)
     end
   end
 

@@ -34,6 +34,7 @@ final class ChatNativeMainRegistry {
 private enum ChatMainPage: String {
   case chat
   case profile
+  case agent
 }
 
 private enum ChatMainProfileTab: String, CaseIterable {
@@ -71,8 +72,9 @@ private struct ChatMainProfilePinnedItem: Equatable {
   let subtitle: String
 }
 
-public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegate,
-  UIGestureRecognizerDelegate
+public final class ChatMainView: ExpoView,
+  UIGestureRecognizerDelegate,
+  ChatMainProfileAgentPromptNodeDelegate
 {
   public var onViewportChanged = EventDispatcher() {
     didSet { syncListDispatchers() }
@@ -146,6 +148,10 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
   private let pagesHost = UIView()
   private let chatPage = UIView()
   private let profilePage = UIView()
+  private let agentPage = UIView()
+  private let agentScrollView = UIScrollView()
+  private let agentContentView = UIView()
+  private let agentPromptNode = ChatMainProfileAgentPromptNode()
   private let profileWallpaperLayer = CAGradientLayer()
   private let profileWallpaperPatternLayer = CAGradientLayer()
   private let profileWallpaperPatternMaskLayer = CALayer()
@@ -173,7 +179,7 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
   private let profileTabContentContainer = UIView()
   private let profileTabPlaceholderLabel = UILabel()
 
-  private let profileAgentPromptNode = ChatMainProfileAgentPromptNode()
+  private let profileAgentRow = ChatMainProfileListRowNode()
   private var agentConfig: [String: Any]?
   private var isGroupOrChannel = false
 
@@ -286,6 +292,7 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
     layoutChrome()
     layoutPages()
     layoutProfileContent()
+    layoutAgentContent()
     applyPageState(animated: false, emitEvent: false)
   }
 
@@ -483,7 +490,19 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
 
   func setPage(_ value: String, animated: Bool) {
     let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    let nextPage: ChatMainPage = normalized == "profile" ? .profile : .chat
+    var nextPage: ChatMainPage = {
+      switch normalized {
+      case "profile":
+        return .profile
+      case "agent":
+        return .agent
+      default:
+        return .chat
+      }
+    }()
+    if nextPage == .agent && !isGroupOrChannel {
+      nextPage = .profile
+    }
 
     let now = CACurrentMediaTime()
     if let pendingTarget = pendingNativePageTarget, now < pendingNativePageLockUntil,
@@ -525,6 +544,16 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
     profileWallpaperPatternMaskLayer.contentsScale = UIScreen.main.scale
     profilePage.layer.insertSublayer(profileWallpaperLayer, at: 0)
     profilePage.layer.insertSublayer(profileWallpaperPatternLayer, above: profileWallpaperLayer)
+
+    pagesHost.addSubview(agentPage)
+    agentPage.addSubview(agentScrollView)
+    agentScrollView.addSubview(agentContentView)
+    agentContentView.addSubview(agentPromptNode)
+    agentPage.isHidden = true
+    agentPage.alpha = 0.0
+    agentScrollView.showsVerticalScrollIndicator = false
+    agentScrollView.alwaysBounceVertical = true
+    agentPromptNode.delegate = self
 
     profilePage.addSubview(profileHeaderContainer)
     profileHeaderContainer.clipsToBounds = false
@@ -727,8 +756,8 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
     profileContentView.addSubview(profileTabContentContainer)
     profileTabContentContainer.addSubview(profileTabPlaceholderLabel)
 
-    profileContentView.addSubview(profileAgentPromptNode)
-    profileAgentPromptNode.delegate = self
+    profileContentView.addSubview(profileAgentRow)
+    profileAgentRow.addTarget(self, action: #selector(handleAgentRowTapped), for: .touchUpInside)
 
     profileAvatarView.clipsToBounds = true
     profileAvatarImageView.clipsToBounds = true
@@ -782,7 +811,7 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
     profileTabPlaceholderLabel.text =
       "Loading shared media and files from native encrypted cache..."
 
-    profileAgentPromptNode.isHidden = true
+    profileAgentRow.isHidden = true
 
     rebuildProfileTabs()
     configureHeaderPressFeedback()
@@ -992,7 +1021,9 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
       if let url = firstDetectedURL(from: text) ?? firstDetectedURL(from: caption)
         ?? firstDetectedURL(from: mediaUrl)
       {
-        if !seenLinks.contains(url) {
+        let isAgentDoc =
+          url.contains("/api/agent/document/") || url.contains("/uploads/agent-docs/")
+        if !isAgentDoc && !seenLinks.contains(url) {
           seenLinks.insert(url)
           linkItems.append(
             ChatMainProfileLinkItem(
@@ -1669,6 +1700,13 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
     profileScrollView.frame = CGRect(
       x: 0.0, y: headerHeight,
       width: pageWidth, height: pageHeight)
+
+    agentPage.frame = CGRect(
+      x: 0.0, y: -headerHeight,
+      width: pageWidth, height: pageHeight + headerHeight)
+    agentScrollView.frame = CGRect(
+      x: 0.0, y: headerHeight,
+      width: pageWidth, height: pageHeight)
   }
 
   private func layoutProfileContent() {
@@ -1793,23 +1831,39 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
     let sectionPad: CGFloat = 18.0
     let contentWidth = width
 
-    if !profileAgentPromptNode.isHidden {
+    if !profileAgentRow.isHidden {
       let promptNodeWidth = contentWidth - (hPad * 2)
-      let promptNodeHeight = profileAgentPromptNode.preferredHeight(for: promptNodeWidth)
-      profileAgentPromptNode.frame = CGRect(
+      let promptNodeHeight: CGFloat = 62.0
+      profileAgentRow.frame = CGRect(
         x: hPad,
         y: bottomAnchor + sectionPad,
         width: promptNodeWidth,
         height: promptNodeHeight
       )
-      bottomAnchor = profileAgentPromptNode.frame.maxY
+      bottomAnchor = profileAgentRow.frame.maxY
     } else {
-      profileAgentPromptNode.frame = .zero
+      profileAgentRow.frame = .zero
     }
 
     let totalHeight = bottomAnchor + 36.0
     profileContentView.frame = CGRect(x: 0.0, y: 0.0, width: width, height: totalHeight)
     profileScrollView.contentSize = CGSize(width: width, height: totalHeight)
+  }
+
+  private func layoutAgentContent() {
+    let width = max(1.0, agentScrollView.bounds.width)
+    let sideInset: CGFloat = 16.0
+    let cardWidth = width - (sideInset * 2.0)
+    let cardHeight = agentPromptNode.preferredHeight(for: cardWidth)
+
+    agentContentView.frame = CGRect(x: 0.0, y: 0.0, width: width, height: cardHeight + 36.0)
+    agentPromptNode.frame = CGRect(
+      x: sideInset,
+      y: 18.0,
+      width: cardWidth,
+      height: cardHeight
+    )
+    agentScrollView.contentSize = CGSize(width: width, height: agentContentView.bounds.height)
   }
 
   private func applyTheme() {
@@ -1863,6 +1917,9 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
     profilePage.backgroundColor = profileBackground
     profileScrollView.backgroundColor = profileBackground
     profileContentView.backgroundColor = profileBackground
+    agentPage.backgroundColor = profileBackground
+    agentScrollView.backgroundColor = profileBackground
+    agentContentView.backgroundColor = profileBackground
     applyProfileWallpaperAppearance()
     profileAvatarView.backgroundColor = profileCardBg
     profileAvatarFallbackIconView.tintColor = text
@@ -1902,9 +1959,16 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
     applyProfileTabTheme()
     profileTabContentNeedsReload = true
 
+    profileAgentRow.applyTheme(
+      titleColor: text,
+      subtitleColor: secondary,
+      separatorColor: rowSeparatorColor,
+      highlightedColor: rowHighlightColor
+    )
+
     let accentColor =
       appearance.bubbleMeGradient.first ?? UIColor(red: 0.49, green: 0.36, blue: 0.88, alpha: 1.0)
-    profileAgentPromptNode.applyTheme(
+    agentPromptNode.applyTheme(
       textColor: text,
       secondaryTextColor: secondary,
       surfaceColor: profileCardBg,
@@ -1996,8 +2060,14 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
     }
     chatTitleLabel.text = resolvedTitle
     chatSubtitleLabel.text = resolvedSubtitle
-    profileTitleLabel.text = profileNameText.isEmpty ? resolvedTitle : profileNameText
-    profileSubtitleLabel.text = isGroupOrChannel ? "Group Profile" : "Profile"
+    if currentPage == .agent {
+      let enabled = normalizedAgentEnabledValue(agentConfig?["enabled"], defaultValue: false)
+      profileTitleLabel.text = "AI Agent"
+      profileSubtitleLabel.text = enabled ? "Enabled" : "Disabled"
+    } else {
+      profileTitleLabel.text = profileNameText.isEmpty ? resolvedTitle : profileNameText
+      profileSubtitleLabel.text = isGroupOrChannel ? "Group Profile" : "Profile"
+    }
     chatSubtitleLabel.textColor =
       {
         if groupTypingSubtitle != nil || (connectionSubtitle == nil && isOnline) {
@@ -2043,6 +2113,23 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
         titleColor: nil,
         showsSeparator: false
       )
+
+      let agentName = normalizedAgentString(agentConfig?["name"]) ?? "Vibe AI"
+      let enabled = normalizedAgentEnabledValue(agentConfig?["enabled"], defaultValue: false)
+      let docsCount = getAgentDocuments().count
+      let docsLabel = docsCount == 1 ? "1 file" : "\(docsCount) files"
+      let stateLabel = enabled ? "Enabled" : "Disabled"
+      let accentColor =
+        appearance.bubbleMeGradient.first ?? UIColor(red: 0.49, green: 0.36, blue: 0.88, alpha: 1.0)
+      profileAgentRow.configure(
+        title: "AI Agent",
+        subtitle: "\(stateLabel) • \(agentName) • \(docsLabel)",
+        titleColor: accentColor,
+        showsSeparator: false,
+        iconName: "sparkles",
+        iconTintColor: accentColor,
+        iconBackgroundColor: accentColor.withAlphaComponent(0.16)
+      )
     } else {
       let usernameRowSubtitle: String
       if profileHandleText.isEmpty {
@@ -2068,7 +2155,20 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
         titleColor: nil,
         showsSeparator: false
       )
+
+      profileAgentRow.configure(
+        title: "AI Agent",
+        subtitle: "Group-only feature",
+        titleColor: nil,
+        showsSeparator: false,
+        iconName: "sparkles",
+        iconTintColor: appearance.timeColorThem.withAlphaComponent(0.85),
+        iconBackgroundColor: appearance.timeColorThem.withAlphaComponent(0.16)
+      )
     }
+
+    let agentDocs = getAgentDocuments().map { (id: $0.id, name: $0.name) }
+    agentPromptNode.configure(chatId: engineChatId, config: agentConfig, documents: agentDocs)
 
     rebuildProfileTabs()
     profileTabContentNeedsReload = true
@@ -2239,31 +2339,52 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
   }
 
   private func applyPageState(animated: Bool, emitEvent: Bool) {
+    updateHeaderTexts()
+
     let width = pagesHost.bounds.width
-    let profileOffscreen = CGAffineTransform(translationX: width, y: 0.0)
-    let profileOnscreen = CGAffineTransform.identity
-    let chatHeaderAlpha: CGFloat = currentPage == .chat ? 1.0 : 0.0
-    let profileHeaderAlpha: CGFloat = currentPage == .profile ? 1.0 : 0.0
-    let avatarAlpha: CGFloat = currentPage == .chat ? 1.0 : 0.0
+    let profileOffscreenRight = CGAffineTransform(translationX: width, y: 0.0)
+    let profileOffscreenLeft = CGAffineTransform(translationX: -width, y: 0.0)
+    let agentOffscreenRight = CGAffineTransform(translationX: width, y: 0.0)
+
+    let isChat = currentPage == .chat
+    let isProfile = currentPage == .profile
+    let isAgent = currentPage == .agent
+
+    let chatHeaderAlpha: CGFloat = isChat ? 1.0 : 0.0
+    let profileHeaderAlpha: CGFloat = isChat ? 0.0 : 1.0
+    let avatarAlpha: CGFloat = isChat ? 1.0 : 0.0
     let chatHeaderTransform =
-      currentPage == .chat
+      isChat
       ? CGAffineTransform.identity : CGAffineTransform(translationX: -14.0, y: 0.0)
     let profileHeaderTransform =
-      currentPage == .profile
-      ? CGAffineTransform.identity : CGAffineTransform(translationX: 14.0, y: 0.0)
+      isChat
+      ? CGAffineTransform(translationX: 14.0, y: 0.0) : CGAffineTransform.identity
 
-    let openingProfile = currentPage == .profile
-    if openingProfile && profilePage.isHidden {
-      profilePage.transform = profileOffscreen
+    if !isChat && profilePage.isHidden {
+      profilePage.transform = isAgent ? profileOffscreenLeft : profileOffscreenRight
       profilePage.alpha = 1.0
       profilePage.isHidden = false
       profileHeaderContainer.isHidden = false
     }
-    headerContainer.isUserInteractionEnabled = !openingProfile
-    profileHeaderContainer.isUserInteractionEnabled = openingProfile
+    if isAgent && agentPage.isHidden {
+      agentPage.transform = agentOffscreenRight
+      agentPage.alpha = 1.0
+      agentPage.isHidden = false
+      profileHeaderContainer.isHidden = false
+    }
+
+    headerContainer.isUserInteractionEnabled = isChat
+    profileHeaderContainer.isUserInteractionEnabled = !isChat
+
+    let profileTargetTransform =
+      isChat
+      ? profileOffscreenRight
+      : (isProfile ? CGAffineTransform.identity : profileOffscreenLeft)
+    let agentTargetTransform = isAgent ? CGAffineTransform.identity : agentOffscreenRight
 
     let apply = {
-      self.profilePage.transform = openingProfile ? profileOnscreen : profileOffscreen
+      self.profilePage.transform = profileTargetTransform
+      self.agentPage.transform = agentTargetTransform
       self.headerContainer.alpha = chatHeaderAlpha
       self.profileHeaderContainer.alpha = profileHeaderAlpha
       self.chatHeaderStack.alpha = 1.0
@@ -2272,6 +2393,7 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
       self.profileHeaderStack.transform = profileHeaderTransform
       self.avatarButton.alpha = avatarAlpha
       self.menuButton.alpha = 0.0
+      self.profileMenuButton.alpha = isProfile ? 1.0 : 0.0
     }
 
     if animated {
@@ -2283,21 +2405,47 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
         options: [.curveEaseInOut, .beginFromCurrentState, .allowUserInteraction],
         animations: apply
       ) { _ in
-        if !openingProfile {
+        if isChat {
           self.profilePage.isHidden = true
           self.profilePage.alpha = 0
+          self.agentPage.isHidden = true
+          self.agentPage.alpha = 0
           self.profileHeaderContainer.isHidden = true
-        } else {
+        } else if isProfile {
           self.profilePage.isHidden = false
           self.profilePage.alpha = 1.0
+          self.agentPage.isHidden = true
+          self.agentPage.alpha = 0.0
+          self.profileHeaderContainer.isHidden = false
+        } else {
+          self.profilePage.isHidden = true
+          self.profilePage.alpha = 0.0
+          self.agentPage.isHidden = false
+          self.agentPage.alpha = 1.0
           self.profileHeaderContainer.isHidden = false
         }
       }
     } else {
       apply()
-      profilePage.isHidden = !openingProfile
-      profilePage.alpha = openingProfile ? 1.0 : 0.0
-      profileHeaderContainer.isHidden = !openingProfile
+      if isChat {
+        profilePage.isHidden = true
+        profilePage.alpha = 0.0
+        agentPage.isHidden = true
+        agentPage.alpha = 0.0
+        profileHeaderContainer.isHidden = true
+      } else if isProfile {
+        profilePage.isHidden = false
+        profilePage.alpha = 1.0
+        agentPage.isHidden = true
+        agentPage.alpha = 0.0
+        profileHeaderContainer.isHidden = false
+      } else {
+        profilePage.isHidden = true
+        profilePage.alpha = 0.0
+        agentPage.isHidden = false
+        agentPage.alpha = 1.0
+        profileHeaderContainer.isHidden = false
+      }
     }
 
     if emitEvent {
@@ -2361,6 +2509,12 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
   }
 
   @objc private func handleBackPressed() {
+    if currentPage == .agent {
+      markPendingNativePageChange(.profile)
+      currentPage = .profile
+      applyPageState(animated: true, emitEvent: true)
+      return
+    }
     if currentPage == .profile {
       markPendingNativePageChange(.chat)
       currentPage = .chat
@@ -2434,7 +2588,28 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
     onNativeEvent(["type": "headerVideoCallPressed"])
   }
 
+  @objc private func handleAgentRowTapped() {
+    guard isGroupOrChannel else { return }
+    markPendingNativePageChange(.agent)
+    currentPage = .agent
+    applyPageState(animated: true, emitEvent: true)
+  }
+
   // MARK: - Agent Config
+
+  func agentPromptNode(
+    _ node: ChatMainProfileAgentPromptNode, didUpdateConfig config: [String: Any]
+  ) {
+    applyAgentConfigUpdate(config)
+  }
+
+  func agentPromptNodeDidRequestDelete(_ node: ChatMainProfileAgentPromptNode) {
+    applyAgentConfigDeletion()
+  }
+
+  func agentPromptNodeDidRequestFullEditor(_ node: ChatMainProfileAgentPromptNode) {
+    // Agent config is now a dedicated page in ChatMainView; keep interaction in-page.
+  }
 
   func setIsGroupOrChannel(_ value: Bool) {
     isGroupOrChannel = value
@@ -2444,73 +2619,31 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
     updateProfileTexts()
   }
 
+  private func getAgentDocuments() -> [(id: String, name: String, url: String)] {
+    return profileFileItems.compactMap { item in
+      let url = item.mediaUrl ?? ""
+      if url.contains("/agent/document/") || url.contains("/agent-docs/") {
+        return (id: item.messageId, name: item.fileName, url: url)
+      }
+      return nil
+    }
+  }
+
   func setAgentConfig(_ config: [String: Any]?) {
     let normalized = normalizedAgentConfig(config, fallbackChatId: engineChatId)
     agentConfig = normalized
     refreshAgentCardVisibility()
-    profileAgentPromptNode.configure(chatId: engineChatId, config: normalized)
   }
 
   private func refreshAgentCardVisibility() {
     let shouldShow = isGroupOrChannel
-    if profileAgentPromptNode.isHidden == !shouldShow { return }
-    profileAgentPromptNode.isHidden = !shouldShow
+    if !shouldShow && currentPage == .agent {
+      currentPage = .profile
+      applyPageState(animated: false, emitEvent: false)
+    }
+    if profileAgentRow.isHidden == !shouldShow { return }
+    profileAgentRow.isHidden = !shouldShow
     setNeedsLayout()
-  }
-
-  func agentPromptNode(
-    _ node: ChatMainProfileAgentPromptNode, didUpdateConfig config: [String: Any]
-  ) {
-    applyAgentConfigUpdate(config)
-  }
-
-  func agentPromptNodeDidRequestDelete(_ node: ChatMainProfileAgentPromptNode) {
-    let alert = UIAlertController(
-      title: "Remove AI Agent",
-      message: "This will remove the agent and clear its memory. This action cannot be undone.",
-      preferredStyle: .alert)
-    alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-    alert.addAction(
-      UIAlertAction(title: "Remove", style: .destructive) { [weak self] _ in
-        guard let self else { return }
-        self.applyAgentConfigDeletion()
-      })
-
-    if let presenter = topMostViewController() {
-      presenter.present(alert, animated: true)
-    }
-  }
-
-  func agentPromptNodeDidRequestFullEditor(_ node: ChatMainProfileAgentPromptNode) {
-    guard !engineChatId.isEmpty, let presenter = topMostViewController() else { return }
-
-    let editor = ChatAgentConfigViewController()
-    editor.chatId = engineChatId
-    editor.agentConfig = agentConfig
-    editor.onSave = { [weak self] config in
-      self?.applyAgentConfigUpdate(config)
-    }
-    editor.onDelete = { [weak self] in
-      self?.applyAgentConfigDeletion()
-    }
-
-    let navigation = UINavigationController(rootViewController: editor)
-    navigation.modalPresentationStyle = .pageSheet
-    if let sheet = navigation.sheetPresentationController {
-      if #available(iOS 16.0, *) {
-        let custom = UISheetPresentationController.Detent.custom(identifier: .init("agent-config"))
-        {
-          context in context.maximumDetentValue * 0.94
-        }
-        sheet.detents = [custom]
-      } else {
-        sheet.detents = [.large()]
-      }
-      sheet.prefersGrabberVisible = true
-      sheet.prefersScrollingExpandsWhenScrolledToEdge = false
-      sheet.preferredCornerRadius = 30.0
-    }
-    presenter.present(navigation, animated: true)
   }
 
   private func fetchAgentConfigForCurrentChat() {
@@ -2520,7 +2653,7 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
       guard let self = self, self.engineChatId == currentId else { return }
       let normalized = self.normalizedAgentConfig(config, fallbackChatId: currentId)
       self.agentConfig = normalized
-      self.profileAgentPromptNode.configure(chatId: self.engineChatId, config: normalized)
+      self.updateProfileTexts()
       self.setNeedsLayout()
     }
   }
@@ -2535,7 +2668,7 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
       guard let self = self, self.engineChatId == currentId else { return }
       if success {
         self.agentConfig = normalized
-        self.profileAgentPromptNode.configure(chatId: self.engineChatId, config: normalized)
+        self.updateProfileTexts()
         self.setNeedsLayout()
         self.fetchAgentConfigForCurrentChat()
       } else {
@@ -2550,7 +2683,7 @@ public final class ChatMainView: ExpoView, ChatMainProfileAgentPromptNodeDelegat
       guard let self = self, self.engineChatId == currentId else { return }
       if success {
         self.agentConfig = nil
-        self.profileAgentPromptNode.configure(chatId: self.engineChatId, config: nil)
+        self.updateProfileTexts()
         self.setNeedsLayout()
       } else {
         print("[ChatMainView] Failed to delete agent config natively")

@@ -9,7 +9,10 @@ defmodule Vibe.Chat.GroupAgent do
   alias Vibe.Repo
   alias Vibe.RepoRLS
 
-  @allowed_tools ["search_google", "analyze_image", "analyze_document", "create_document"]
+  @allowed_tools [
+    "search_google", "analyze_image", "analyze_document", "create_document",
+    "find_rows", "edit_rows", "delete_rows", "export_rows"
+  ]
   @default_enabled_tools @allowed_tools
 
   @primary_key {:id, :binary_id, autogenerate: true}

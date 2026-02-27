@@ -3,6 +3,7 @@ import UIKit
 final class ChatAgentConfigViewController: UIViewController {
   var chatId: String = ""
   var agentConfig: [String: Any]?
+  var documents: [(id: String, name: String, url: String)] = []
   var onSave: (([String: Any]) -> Void)?
   var onDelete: (() -> Void)?
 
@@ -11,6 +12,10 @@ final class ChatAgentConfigViewController: UIViewController {
 
   private let titleLabel = UILabel()
   private let subtitleLabel = UILabel()
+  
+  private let documentsLabel = UILabel()
+  private let documentsStack = UIStackView()
+
   private let modelCard = UIView()
   private let modelLabel = UILabel()
 
@@ -129,6 +134,21 @@ final class ChatAgentConfigViewController: UIViewController {
     }
     y = toolsCard.frame.maxY + 14.0
 
+    if !documents.isEmpty {
+      documentsLabel.frame = CGRect(x: sideInset, y: y, width: contentWidth, height: 20.0)
+      documentsLabel.isHidden = false
+      y = documentsLabel.frame.maxY + 8.0
+      
+      let docHeight: CGFloat = 48.0
+      let docsTotalHeight = CGFloat(documents.count) * docHeight + CGFloat(max(0, documents.count - 1)) * 10.0
+      documentsStack.frame = CGRect(x: sideInset, y: y, width: contentWidth, height: docsTotalHeight)
+      documentsStack.isHidden = false
+      y = documentsStack.frame.maxY + 24.0
+    } else {
+      documentsLabel.isHidden = true
+      documentsStack.isHidden = true
+    }
+
     enabledLabel.frame = CGRect(x: sideInset, y: y, width: contentWidth - 80.0, height: 30.0)
     let toggleSize = enabledToggle.intrinsicContentSize
     enabledToggle.frame = CGRect(
@@ -155,8 +175,7 @@ final class ChatAgentConfigViewController: UIViewController {
 
   private func configureNavigation() {
     navigationItem.title = agentConfig == nil ? "Add AI Agent" : "Edit AI Agent"
-    navigationItem.leftBarButtonItem = UIBarButtonItem(
-      barButtonSystemItem: .cancel, target: self, action: #selector(handleCancel))
+
     let saveTitle = agentConfig == nil ? "Create" : "Save"
     let saveItem = UIBarButtonItem(
       title: saveTitle, style: .done, target: self, action: #selector(handleSave))
@@ -288,7 +307,56 @@ final class ChatAgentConfigViewController: UIViewController {
       toolTogglesById[option.id] = toggle
     }
 
-    enabledLabel.font = UIFont.systemFont(ofSize: 16.0, weight: .medium)
+    documentsLabel.font = UIFont.systemFont(ofSize: 13.0, weight: .semibold)
+    documentsLabel.textColor = .secondaryLabel
+    documentsLabel.text = "AGENT DOCUMENTS"
+    contentView.addSubview(documentsLabel)
+    
+    documentsStack.axis = .vertical
+    documentsStack.spacing = 10.0
+    documentsStack.distribution = .equalSpacing
+    contentView.addSubview(documentsStack)
+    
+    for (index, doc) in documents.enumerated() {
+      let row = UIControl()
+      row.backgroundColor = .clear // will set explicitly below
+      row.layer.cornerRadius = 12.0
+      row.layer.cornerCurve = .continuous
+      row.layer.borderWidth = 1.0 / UIScreen.main.scale
+      row.layer.borderColor = UIColor.secondaryLabel.withAlphaComponent(0.2).cgColor
+      row.translatesAutoresizingMaskIntoConstraints = false
+      row.heightAnchor.constraint(equalToConstant: 48).isActive = true
+      row.tag = index
+      row.addTarget(self, action: #selector(handleDocumentTapped(_:)), for: .touchUpInside)
+      
+      let icon = UIImageView(image: UIImage(systemName: "doc.text.fill"))
+      icon.tintColor = accentColor
+      icon.contentMode = .scaleAspectFit
+      icon.translatesAutoresizingMaskIntoConstraints = false
+      row.addSubview(icon)
+      
+      let label = UILabel()
+      label.text = doc.name
+      label.font = UIFont.systemFont(ofSize: 14, weight: .medium)
+      label.textColor = .label
+      label.translatesAutoresizingMaskIntoConstraints = false
+      row.addSubview(label)
+      
+      NSLayoutConstraint.activate([
+        icon.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 14),
+        icon.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+        icon.widthAnchor.constraint(equalToConstant: 20),
+        icon.heightAnchor.constraint(equalToConstant: 20),
+        
+        label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 12),
+        label.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -14),
+        label.centerYAnchor.constraint(equalTo: row.centerYAnchor)
+      ])
+      
+      documentsStack.addArrangedSubview(row)
+    }
+
+    enabledLabel.font =  UIFont.systemFont(ofSize: 16.0, weight: .medium)
     enabledLabel.textColor = .label
     enabledLabel.text = "Enabled"
     contentView.addSubview(enabledLabel)
@@ -323,7 +391,11 @@ final class ChatAgentConfigViewController: UIViewController {
   }
 
   @objc private func handleCancel() {
-    dismiss(animated: true)
+    if let nav = navigationController, nav.viewControllers.count > 1 {
+      nav.popViewController(animated: true)
+    } else {
+      dismiss(animated: true)
+    }
   }
 
   @objc private func handleSave() {
@@ -360,7 +432,11 @@ final class ChatAgentConfigViewController: UIViewController {
     }
 
     onSave?(config)
-    dismiss(animated: true)
+    if let nav = navigationController, nav.viewControllers.count > 1 {
+      nav.popViewController(animated: true)
+    } else {
+      dismiss(animated: true)
+    }
   }
 
   @objc private func handleDelete() {
@@ -482,6 +558,57 @@ final class ChatAgentConfigViewController: UIViewController {
     return normalized.isEmpty ? nil : normalized
   }
 
+  @objc private func handleDocumentTapped(_ sender: UIControl) {
+    let index = sender.tag
+    guard index >= 0, index < documents.count else { return }
+    let doc = documents[index]
+    
+    let isText = doc.name.lowercased().hasSuffix(".csv") || doc.name.lowercased().hasSuffix(".md") || doc.name.lowercased().hasSuffix(".txt") || doc.name.lowercased().hasSuffix(".json")
+    guard isText else {
+       if let url = URL(string: doc.url) {
+           UIApplication.shared.open(url)
+       }
+       return
+    }
+    
+    let overlay = UIView(frame: view.bounds)
+    overlay.backgroundColor = UIColor.black.withAlphaComponent(0.4)
+    overlay.alpha = 0.0
+    view.addSubview(overlay)
+    
+    let indicator = UIActivityIndicatorView(style: .large)
+    indicator.center = view.center
+    indicator.startAnimating()
+    overlay.addSubview(indicator)
+    
+    UIView.animate(withDuration: 0.2) { overlay.alpha = 1.0 }
+    
+    let cleanUrlString = doc.url.replacingOccurrences(of: "vibe://", with: "https://") 
+    guard let url = URL(string: cleanUrlString) else {
+      UIView.animate(withDuration: 0.2, animations: { overlay.alpha = 0.0 }) { _ in overlay.removeFromSuperview() }
+      return
+    }
+    
+    var request = URLRequest(url: url)
+    if let authHeader = ChatEngine.shared.authorizationHeaderForAPI() {
+       request.setValue(authHeader, forHTTPHeaderField: "Authorization")
+    }
+    
+    let task = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+       DispatchQueue.main.async {
+          UIView.animate(withDuration: 0.2, animations: { overlay.alpha = 0.0 }) { _ in overlay.removeFromSuperview() }
+          guard let self = self, let data = data, let text = String(data: data, encoding: .utf8) else {
+             self?.presentSimpleAlert(title: "Error", message: "Failed to load document content.")
+             return
+          }
+          let preview = AgentDocumentPreviewController(title: doc.name, text: text)
+          let nav = UINavigationController(rootViewController: preview)
+          self.present(nav, animated: true)
+       }
+    }
+    task.resume()
+  }
+
   private func presentSimpleAlert(title: String, message: String) {
     let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
     alert.addAction(UIAlertAction(title: "OK", style: .default))
@@ -493,4 +620,44 @@ extension ChatAgentConfigViewController: UITextViewDelegate {
   func textViewDidChange(_ textView: UITextView) {
     refreshPromptHintVisibility()
   }
+}
+
+
+private final class AgentDocumentPreviewController: UIViewController {
+  private let previewTitle: String
+  private let textContent: String
+  private let textView = UITextView()
+
+  init(title: String, text: String) {
+    self.previewTitle = title
+    self.textContent = text
+    super.init(nibName: nil, bundle: nil)
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    view.backgroundColor = .systemBackground
+    title = previewTitle
+    navigationItem.rightBarButtonItem = UIBarButtonItem(title: "Done", style: .done, target: self, action: #selector(handleDone))
+
+    textView.translatesAutoresizingMaskIntoConstraints = false
+    textView.isEditable = false
+    textView.alwaysBounceVertical = true
+    textView.textContainerInset = UIEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
+    textView.font = .monospacedSystemFont(ofSize: 14, weight: .regular)
+    textView.text = textContent
+
+    view.addSubview(textView)
+    NSLayoutConstraint.activate([
+      textView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      textView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      textView.topAnchor.constraint(equalTo: view.topAnchor),
+      textView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+    ])
+  }
+  @objc private func handleDone() { dismiss(animated: true) }
 }

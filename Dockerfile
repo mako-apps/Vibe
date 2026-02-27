@@ -42,9 +42,10 @@ RUN mix release
 # Stage 3: Runtime
 FROM alpine:3.18
 
-# Runtime dependencies + yt-dlp for music extraction
+# Runtime dependencies + yt-dlp for music extraction + doc renderer
 RUN apk add --no-cache libstdc++ openssl ncurses-libs python3 py3-pip ffmpeg curl \
-  && pip3 install --break-system-packages yt-dlp \
+  pango cairo gdk-pixbuf font-noto font-noto-arabic font-noto-extra \
+  && pip3 install --break-system-packages yt-dlp flask==3.1.* weasyprint==63.* openpyxl==3.1.* \
   && yt-dlp --version
 
 WORKDIR /app
@@ -55,6 +56,9 @@ ENV MIX_ENV="prod"
 
 # Copy the Elixir release
 COPY --from=elixir-build --chown=nobody:root /app/_build/prod/rel/vibe ./
+
+# Copy Python doc renderer
+COPY --chown=nobody:root server/priv/python/ /app/python/
 
 # Copy startup script
 COPY --chmod=755 start.sh /app/start.sh

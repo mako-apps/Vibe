@@ -2055,10 +2055,25 @@ final class ChatEngine {
           }
         }
 
-        if containsLinkCandidate(text) || containsLinkCandidate(caption)
+        let hasLink =
+          containsLinkCandidate(text) || containsLinkCandidate(caption)
           || containsLinkCandidate(mediaUrl)
-        {
-          linkCount += 1
+        if hasLink {
+          let agentRegex = try? NSRegularExpression(
+            pattern: "(/api/agent/document/|/uploads/agent-docs/)", options: [])
+          let isAgentDoc =
+            agentRegex?.firstMatch(
+              in: text, options: [], range: NSRange(location: 0, length: text.utf16.count)) != nil
+            || agentRegex?.firstMatch(
+              in: caption, options: [], range: NSRange(location: 0, length: caption.utf16.count))
+              != nil
+            || agentRegex?.firstMatch(
+              in: mediaUrl ?? "", options: [],
+              range: NSRange(location: 0, length: (mediaUrl ?? "").utf16.count)) != nil
+
+          if !isAgentDoc {
+            linkCount += 1
+          }
         }
       }
 
@@ -3942,7 +3957,9 @@ final class ChatEngine {
   }
 
   private func originString(from base: URL) -> String? {
-    guard var components = URLComponents(url: base, resolvingAgainstBaseURL: false) else { return nil }
+    guard var components = URLComponents(url: base, resolvingAgainstBaseURL: false) else {
+      return nil
+    }
     components.path = ""
     components.query = nil
     components.fragment = nil
@@ -3956,7 +3973,8 @@ final class ChatEngine {
       .trimmingCharacters(in: .whitespacesAndNewlines)
       .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
 
-    return trimmed
+    return
+      trimmed
       .replacingOccurrences(
         of: #"^https?:\/\/\[(https?:\/\/[^\]]+)\](\/.*)?$"#,
         with: "$1$2",
@@ -3990,7 +4008,9 @@ final class ChatEngine {
       return origin + path
     }
 
-    if sanitized.hasPrefix("/"), let base = apiBaseURLLocked(), let origin = originString(from: base) {
+    if sanitized.hasPrefix("/"), let base = apiBaseURLLocked(),
+      let origin = originString(from: base)
+    {
       return origin + sanitized
     }
 
@@ -4177,7 +4197,8 @@ final class ChatEngine {
         return plaintextFallback.isEmpty ? [:] : ["text": plaintextFallback]
       }()
       var enrichedFields = decryptedFields
-      if let rawMediaUrl, !rawMediaUrl.isEmpty, normalizedString(enrichedFields["mediaUrl"]) == nil {
+      if let rawMediaUrl, !rawMediaUrl.isEmpty, normalizedString(enrichedFields["mediaUrl"]) == nil
+      {
         enrichedFields["mediaUrl"] = rawMediaUrl
       }
       let fileNameForRow =
@@ -4383,7 +4404,9 @@ final class ChatEngine {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
-        if !token.isEmpty { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        if !token.isEmpty {
+          request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
         request.httpBody = payload
         return request
       }
