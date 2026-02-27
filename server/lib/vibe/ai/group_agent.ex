@@ -1170,6 +1170,9 @@ defmodule Vibe.AI.GroupAgent do
     end
     Logger.info("[GroupAgent] create_new_spreadsheet cols=#{inspect(columns)} row_count=#{length(rows)}")
 
+    # Post-process: strip unwanted columns, recalculate math
+    {columns, rows} = sanitize_spreadsheet_data(columns, rows)
+
     with {:ok, storage, csv_content} <-
            write_spreadsheet_document_file(title, columns, rows, output_format),
          {:ok, doc} <-
@@ -1251,6 +1254,9 @@ defmodule Vibe.AI.GroupAgent do
               if incoming_rows == [], do: existing_rows_aligned, else: incoming_rows
           end
           |> ensure_non_empty_rows(columns, body)
+
+        # Post-process: strip unwanted columns, recalculate math
+        {columns, final_rows} = sanitize_spreadsheet_data(columns, final_rows)
 
         with {:ok, storage, csv_content} <-
                write_spreadsheet_document_file(title, columns, final_rows, output_format),
@@ -2009,6 +2015,177 @@ defmodule Vibe.AI.GroupAgent do
     storage = if is_map(storage_metadata), do: storage_metadata, else: %{}
     Map.merge(base, storage)
   end
+
+  # ── Spreadsheet data sanitizer ──────────────────────────────────────────
+  # This is the AGENTIC math layer: code verifies and recalculates all
+  # numbers instead of trusting the LLM's arithmetic.
+  defp sanitize_spreadsheet_data(columns, rows) when is_list(columns) and is_list(rows) do
+    {columns, rows}
+    |> strip_unwanted_columns()
+    |> recalculate_totals()
+  end
+
+  # Step 1: Remove columns the user didn't ask for (e.g. "جمع به حروف")
+  defp strip_unwanted_columns({columns, rows}) do
+    banned_patterns = ["جمع به حروف", "مبلغ به حروف", "amount in words", "به حروف"]
+
+    indices_to_remove =
+      columns
+      |> Enum.with_index()
+      |> Enum.filter(fn {col, _idx} ->
+        col_down = col |> to_string() |> String.downcase()
+        Enum.any?(banned_patterns, &String.contains?(col_down, &1))
+      end)
+      |> Enum.map(fn {_col, idx} -> idx end)
+      |> MapSet.new()
+
+    if MapSet.size(indices_to_remove) == 0 do
+      {columns, rows}
+    else
+      Logger.info("[GroupAgent] Sanitizer: stripping #{MapSet.size(indices_to_remove)} unwanted columns")
+      new_columns =
+        columns
+        |> Enum.with_index()
+        |> Enum.reject(fn {_col, idx} -> MapSet.member?(indices_to_remove, idx) end)
+        |> Enum.map(fn {col, _idx} -> col end)
+
+      new_rows =
+        Enum.map(rows, fn row ->
+          row
+          |> Enum.with_index()
+          |> Enum.reject(fn {_val, idx} -> MapSet.member?(indices_to_remove, idx) end)
+          |> Enum.map(fn {val, _idx} -> val end)
+        end)
+
+      {new_columns, new_rows}
+    end
+  end
+
+  # Step 2: Detect weight/price/total columns and recalculate
+  defp recalculate_totals({columns, rows}) do
+    col_lower = Enum.map(columns, &(to_string(&1) |> String.downcase()))
+
+    weight_idx = find_column_index(col_lower, ["وزن", "weight", "مقدار", "تعداد", "کیلو"])
+    price_idx = find_column_index(col_lower, ["قیمت واحد", "فی", "price", "unit price", "قیمت"])
+    total_idx = find_column_index(col_lower, ["جمع", "total", "مبلغ کل", "مبلغ", "جمع کل"])
+
+    # Keywords that identify a summary/total row
+    total_row_keywords = ["مجموع", "جمع کل", "مجموع کل", "total", "sum"]
+
+    if weight_idx && price_idx && total_idx do
+      Logger.info("[GroupAgent] Sanitizer: found weight(#{weight_idx}), price(#{price_idx}), total(#{total_idx}) columns — recalculating")
+
+      recalculated_rows =
+        Enum.map(rows, fn row ->
+          # Check if this is a summary/total row
+          is_summary = Enum.any?(row, fn cell ->
+            cell_str = cell |> to_string() |> String.trim() |> String.downcase()
+            Enum.any?(total_row_keywords, &(cell_str == &1 or String.starts_with?(cell_str, &1)))
+          end)
+
+          if is_summary do
+            # Don't recalculate individual cell — we'll fix the sum below
+            row
+          else
+            weight_val = parse_numeric(Enum.at(row, weight_idx))
+            price_val = parse_numeric(Enum.at(row, price_idx))
+
+            if weight_val > 0 and price_val > 0 do
+              computed_total = round(weight_val * price_val)
+              List.replace_at(row, total_idx, format_number(computed_total))
+            else
+              row
+            end
+          end
+        end)
+
+      # Now recalculate the total/summary row
+      final_rows = recalculate_summary_row(recalculated_rows, weight_idx, total_idx, total_row_keywords)
+      {columns, final_rows}
+    else
+      {columns, rows}
+    end
+  end
+
+  defp find_column_index(col_lower_list, keywords) do
+    Enum.find_index(col_lower_list, fn col ->
+      Enum.any?(keywords, &String.contains?(col, &1))
+    end)
+  end
+
+  defp recalculate_summary_row(rows, weight_idx, total_idx, total_row_keywords) do
+    Enum.map(rows, fn row ->
+      is_summary = Enum.any?(row, fn cell ->
+        cell_str = cell |> to_string() |> String.trim() |> String.downcase()
+        Enum.any?(total_row_keywords, &(cell_str == &1 or String.starts_with?(cell_str, &1)))
+      end)
+
+      if is_summary do
+        # Sum all non-summary rows for weight and total columns
+        {weight_sum, total_sum} =
+          Enum.reduce(rows, {0.0, 0.0}, fn r, {w_acc, t_acc} ->
+            r_is_summary = Enum.any?(r, fn cell ->
+              cell_str = cell |> to_string() |> String.trim() |> String.downcase()
+              Enum.any?(total_row_keywords, &(cell_str == &1 or String.starts_with?(cell_str, &1)))
+            end)
+            if r_is_summary do
+              {w_acc, t_acc}
+            else
+              w = parse_numeric(Enum.at(r, weight_idx))
+              t = parse_numeric(Enum.at(r, total_idx))
+              {w_acc + w, t_acc + t}
+            end
+          end)
+
+        row
+        |> List.replace_at(weight_idx, format_number(round(weight_sum)))
+        |> List.replace_at(total_idx, format_number(round(total_sum)))
+      else
+        row
+      end
+    end)
+  end
+
+  # Parse a cell value to a number, handling commas, Persian digits, slash notation
+  defp parse_numeric(nil), do: 0.0
+  defp parse_numeric(val) when is_number(val), do: val / 1
+  defp parse_numeric(val) do
+    cleaned =
+      val
+      |> to_string()
+      |> String.trim()
+      # Replace Persian/Arabic digits
+      |> String.replace(~r/[۰٠]/, "0")
+      |> String.replace(~r/[۱١]/, "1")
+      |> String.replace(~r/[۲٢]/, "2")
+      |> String.replace(~r/[۳٣]/, "3")
+      |> String.replace(~r/[۴٤]/, "4")
+      |> String.replace(~r/[۵٥]/, "5")
+      |> String.replace(~r/[۶٦]/, "6")
+      |> String.replace(~r/[۷٧]/, "7")
+      |> String.replace(~r/[۸٨]/, "8")
+      |> String.replace(~r/[۹٩]/, "9")
+      # Remove commas and thousand separators
+      |> String.replace(",", "")
+      |> String.replace("/", "")
+      # Remove any non-numeric characters except dots and minus
+      |> String.replace(~r/[^\d.\-]/, "")
+
+    case Float.parse(cleaned) do
+      {num, _} -> num
+      :error -> 0.0
+    end
+  end
+
+  defp format_number(num) when is_float(num), do: format_number(round(num))
+  defp format_number(num) when is_integer(num) do
+    num
+    |> Integer.to_string()
+    |> String.reverse()
+    |> String.replace(~r/(\d{3})(?=\d)/, "\\1,")
+    |> String.reverse()
+  end
+  defp format_number(val), do: to_string(val)
 
   defp write_spreadsheet_document_file(title, columns, rows, output_format) do
     csv_content = csv_from_rows(columns, rows)
