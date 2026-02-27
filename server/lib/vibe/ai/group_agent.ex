@@ -198,6 +198,18 @@ defmodule Vibe.AI.GroupAgent do
         },
         required: ["title"]
       }
+    },
+    %{
+      name: "delete_document",
+      description:
+        "Delete/remove the current spreadsheet or document from this group chat. Use when the user asks to delete, remove, or clear the current file.",
+      input_schema: %{
+        type: "object",
+        properties: %{
+          confirm: %{type: "boolean", description: "Must be true to confirm deletion"}
+        },
+        required: ["confirm"]
+      }
     }
   ]
 
@@ -410,6 +422,10 @@ defmodule Vibe.AI.GroupAgent do
     - If user asks for Excel/sheet/spreadsheet/table with rows/columns, call create_document with format xlsx unless user explicitly asks for csv.
     - CRITICAL: When the user asks to "update the design", "reorder columns", "change the layout", "restructure", "remove a column" (ستون/رديف حذف كن), "merge columns" (ادغام كن), or any structural change to the spreadsheet, use create_document with operation=replace_rows. Read the current data from the document context, restructure it, and send the updated columns + rows. Do NOT just reply with text — you MUST call the tool.
     - MANDATORY: When the user asks ANY request that modifies the spreadsheet (edit, add, remove, restructure, merge, update), you MUST call a tool (create_document, edit_rows, delete_rows, etc.). NEVER respond with just a text message saying "done" or "I will do it" without actually calling a tool. If you cannot determine the exact change, ask a clarifying question.
+
+    DELETING DOCUMENTS:
+    - When the user says "delete the file", "remove the document", "فایل رو حذف کن", "پاک کن", or "clear the spreadsheet", use the delete_document tool with confirm=true.
+    - After deletion, confirm to the user that the file has been removed.
 
     ROW-LEVEL EDITING:
     - For targeted edits (changing a few cells or rows), use find_rows to locate the row first, then edit_rows with the row index. Do NOT resend all rows via create_document for small changes.
@@ -713,6 +729,18 @@ defmodule Vibe.AI.GroupAgent do
       broadcast_agent_progress(chat_id, progress_label, name, "running")
       start_time = System.monotonic_time(:millisecond)
 
+      # Log raw tool input for debugging
+      if name == "create_document" do
+        raw_cols = tool_input_value(input, "columns")
+        raw_rows = case input do
+          %{"rows" => r} when is_list(r) -> length(r)
+          _ -> "none"
+        end
+        raw_op = tool_input_value(input, "operation")
+        raw_body = tool_input_value(input, "body") |> String.slice(0..200)
+        Logger.info("[GroupAgent] create_document RAW INPUT: op=#{raw_op} cols=#{inspect(raw_cols)} rows_count=#{raw_rows} body=#{raw_body}")
+      end
+
       result =
         case name do
           "search_google" -> Vibe.AI.Tools.Search.google(input)
@@ -723,6 +751,7 @@ defmodule Vibe.AI.GroupAgent do
           "edit_rows" -> edit_rows_tool(chat_id, input, user_id)
           "delete_rows" -> delete_rows_tool(chat_id, input, user_id)
           "export_rows" -> export_rows_tool(chat_id, input, user_id)
+          "delete_document" -> delete_document_tool(chat_id, input, user_id)
           _ -> %{error: "Unknown tool: #{name}"}
         end
 
@@ -783,13 +812,16 @@ defmodule Vibe.AI.GroupAgent do
       "delete_rows" ->
         "Deleting rows..."
 
-      "export_rows" ->
+      \"export_rows\" ->
         format =
           input
           |> tool_input_value("format")
           |> String.downcase()
 
         if format == "png", do: "Exporting image...", else: "Exporting document..."
+
+      "delete_document" ->
+        "Deleting document..."
 
       _ ->
         "Working..."
@@ -1635,6 +1667,32 @@ defmodule Vibe.AI.GroupAgent do
       else
         {:error, :no_document} -> %{error: "No active spreadsheet for this group."}
         {:error, reason} -> %{error: "Failed to read spreadsheet: #{inspect(reason)}"}
+      end
+    end
+  end
+
+  defp delete_document_tool(chat_id, input, _user_id) do
+    confirm = case input do
+      %{"confirm" => true} -> true
+      %{confirm: true} -> true
+      _ -> false
+    end
+
+    if !confirm do
+      %{error: "Deletion not confirmed. Set confirm=true to delete."}
+    else
+      current = GroupAgentDocument.get_current(chat_id)
+
+      if current do
+        {deleted_count, _} = GroupAgentDocument.clear_by_chat(chat_id)
+        Logger.info("[GroupAgent] delete_document: cleared #{deleted_count} document versions for chat #{chat_id}")
+        %{
+          status: "deleted",
+          message: "Document '#{current.title}' and all its versions have been removed.",
+          deleted_versions: deleted_count
+        }
+      else
+        %{status: "no_document", message: "No document found in this group to delete."}
       end
     end
   end
