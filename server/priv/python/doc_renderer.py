@@ -14,7 +14,7 @@ import sys
 from flask import Flask, request, jsonify, send_file
 from weasyprint import HTML
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
+from openpyxl.styles import Font, PatternFill, Border, Side, Alignment, numbers
 from openpyxl.utils import get_column_letter
 
 app = Flask(__name__)
@@ -22,19 +22,38 @@ logging.basicConfig(stream=sys.stderr, level=logging.INFO,
                     format="[DocRenderer] %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Shared styles ──
+# ── Modern XLSX Styles ──
 
-HEADER_FONT = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-HEADER_FILL = PatternFill(start_color="2B5797", end_color="2B5797", fill_type="solid")
-DATA_FONT = Font(name="Calibri", size=11)
-THIN_BORDER = Border(
-    left=Side(style="thin"),
-    right=Side(style="thin"),
-    top=Side(style="thin"),
-    bottom=Side(style="thin"),
+# Header style — dark indigo gradient look
+HEADER_FONT = Font(name="Calibri", size=12, bold=True, color="FFFFFF")
+HEADER_FILL = PatternFill(start_color="1B3A5C", end_color="1B3A5C", fill_type="solid")
+HEADER_BORDER = Border(
+    left=Side(style="thin", color="0F2640"),
+    right=Side(style="thin", color="0F2640"),
+    top=Side(style="thin", color="0F2640"),
+    bottom=Side(style="medium", color="0F2640"),
 )
 HEADER_ALIGN = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+# Data rows — clean modern look
+DATA_FONT = Font(name="Calibri", size=11, color="1A1A2E")
+DATA_FONT_ALT = Font(name="Calibri", size=11, color="1A1A2E")
+DATA_BORDER = Border(
+    left=Side(style="thin", color="D0D5DD"),
+    right=Side(style="thin", color="D0D5DD"),
+    top=Side(style="thin", color="D0D5DD"),
+    bottom=Side(style="thin", color="D0D5DD"),
+)
 DATA_ALIGN = Alignment(vertical="center", wrap_text=True)
+DATA_ALIGN_CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+# Alternating row fills for readability
+EVEN_ROW_FILL = PatternFill(start_color="F8F9FC", end_color="F8F9FC", fill_type="solid")
+ODD_ROW_FILL = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
+
+# Title row style (for optional title row above headers)
+TITLE_FONT = Font(name="Calibri", size=14, bold=True, color="1B3A5C")
+TITLE_ALIGN = Alignment(horizontal="center", vertical="center")
 
 # ── HTML template for PDF/PNG export ──
 
@@ -56,10 +75,10 @@ body {{
 h1 {{
   font-size: 20px;
   font-weight: 700;
-  color: #2B5797;
+  color: #1B3A5C;
   margin-bottom: 12px;
   padding-bottom: 8px;
-  border-bottom: 2px solid #2B5797;
+  border-bottom: 2px solid #1B3A5C;
 }}
 .meta {{
   font-size: 11px;
@@ -72,21 +91,21 @@ table {{
   margin-top: 10px;
 }}
 th {{
-  background: #2B5797;
+  background: #1B3A5C;
   color: #fff;
   font-weight: 600;
   padding: 8px 10px;
   text-align: right;
-  border: 1px solid #1e3f6f;
+  border: 1px solid #0F2640;
   white-space: nowrap;
 }}
 td {{
   padding: 6px 10px;
-  border: 1px solid #d0d0d0;
+  border: 1px solid #d0d5dd;
   text-align: right;
   vertical-align: top;
 }}
-tr:nth-child(even) td {{ background: #f5f7fa; }}
+tr:nth-child(even) td {{ background: #f8f9fc; }}
 </style>
 </head>
 <body>
@@ -121,6 +140,19 @@ def _build_export_html(title, columns, rows, meta=""):
         header_cells=header_cells,
         body_rows=body_rows,
     )
+
+
+# ── Column width auto-sizing heuristic ──
+
+def _auto_column_width(col_name, col_values, min_width=12, max_width=40):
+    """Calculate a reasonable column width based on content."""
+    header_len = len(str(col_name))
+    # Sample up to 50 values for width estimation
+    sample = col_values[:50]
+    max_content = max((len(str(v)) for v in sample), default=0) if sample else 0
+    # Use the wider of header or content, with some padding
+    width = max(header_len, max_content) + 4
+    return max(min_width, min(width, max_width))
 
 
 # ── Routes ──
@@ -171,7 +203,7 @@ def render():
 
 @app.route("/xlsx", methods=["POST"])
 def xlsx():
-    """Generate a styled XLSX file from columns + rows."""
+    """Generate a professionally styled XLSX file from columns + rows."""
     data = request.get_json(force=True)
     columns = data.get("columns", [])
     rows = data.get("rows", [])
@@ -184,37 +216,69 @@ def xlsx():
     try:
         wb = Workbook()
         ws = wb.active
-        ws.title = "Sheet1"
+        ws.title = title[:31] if len(title) <= 31 else title[:31]  # Excel sheet name limit
         ws.sheet_view.rightToLeft = sheet_rtl
 
-        # Column widths
+        num_cols = len(columns)
+
+        # ── Auto-size column widths ──
         for i, col in enumerate(columns, 1):
             letter = get_column_letter(i)
-            ws.column_dimensions[letter].width = max(len(str(col)) + 6, 18)
+            col_values = [row[i - 1] if i - 1 < len(row) else "" for row in rows]
+            ws.column_dimensions[letter].width = _auto_column_width(col, col_values)
 
-        # Header row
+        # ── Set default row height ──
+        ws.sheet_properties.defaultRowHeight = 22
+
+        # ── Header row ──
+        header_row_num = 1
+        ws.row_dimensions[header_row_num].height = 32
+
         for col_idx, col_name in enumerate(columns, 1):
-            cell = ws.cell(row=1, column=col_idx, value=str(col_name))
+            cell = ws.cell(row=header_row_num, column=col_idx, value=str(col_name))
             cell.font = HEADER_FONT
             cell.fill = HEADER_FILL
-            cell.border = THIN_BORDER
+            cell.border = HEADER_BORDER
             cell.alignment = HEADER_ALIGN
 
-        # Data rows
+        # ── Data rows with alternating colors ──
         for row_idx, row_data in enumerate(rows, 2):
+            is_even = (row_idx % 2 == 0)
+            row_fill = EVEN_ROW_FILL if is_even else ODD_ROW_FILL
+
+            ws.row_dimensions[row_idx].height = 24
+
             for col_idx, value in enumerate(row_data, 1):
-                if col_idx > len(columns):
+                if col_idx > num_cols:
                     break
                 cell = ws.cell(row=row_idx, column=col_idx, value=str(value))
                 cell.font = DATA_FONT
-                cell.border = THIN_BORDER
+                cell.border = DATA_BORDER
                 cell.alignment = DATA_ALIGN
+                cell.fill = row_fill
 
-            # Fill empty cells with border
-            for col_idx in range(len(row_data) + 1, len(columns) + 1):
+            # Fill empty trailing cells
+            for col_idx in range(len(row_data) + 1, num_cols + 1):
                 cell = ws.cell(row=row_idx, column=col_idx, value="")
-                cell.border = THIN_BORDER
+                cell.border = DATA_BORDER
                 cell.alignment = DATA_ALIGN
+                cell.fill = row_fill
+
+        # ── Freeze header row for scrolling ──
+        ws.freeze_panes = "A2"
+
+        # ── Auto-filter on all columns ──
+        if rows:
+            last_col_letter = get_column_letter(num_cols)
+            last_row = len(rows) + 1
+            ws.auto_filter.ref = f"A1:{last_col_letter}{last_row}"
+
+        # ── Print settings ──
+        ws.page_setup.orientation = "landscape"
+        ws.page_setup.fitToPage = True
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
 
         buf = io.BytesIO()
         wb.save(buf)

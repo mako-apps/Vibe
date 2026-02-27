@@ -399,17 +399,18 @@ defmodule Vibe.AI.GroupAgent do
     - For document/file requests, generate professional outputs with clean structure and naming.
     - When a tool creates/updates a file, respond naturally and state that the file is attached (do not paste raw URLs).
     - Never claim you cannot create/edit spreadsheet files when create_document is enabled.
-    - The generated XLSX files already have styled headers (bold white on blue), borders, RTL layout, and column widths — do NOT add formatting hints or decorators in cell text.
+    - The generated XLSX files already have professional styling (dark headers, alternating row colors, auto-sized columns, frozen header, auto-filters, RTL layout) — do NOT add any formatting hints, borders, colors, or decorators in cell text values. Keep cell data clean and plain.
     - Spreadsheet behavior is stateful per group chat. Default: edit the current spreadsheet.
-    - Use operation=create_new only when user explicitly asks for a NEW file/from-scratch sheet.
+    - Use operation=create_new ONLY when user explicitly asks for a completely NEW file/from-scratch sheet.
     - For adding data, prefer operation=append_rows.
     - For corrections, prefer operation=edit_current or replace_rows.
     - If user asks to undo/revert, use operation=revert_last.
     - If user asks for Excel/sheet/spreadsheet/table with rows/columns, call create_document with format xlsx unless user explicitly asks for csv.
+    - CRITICAL: When the user asks to "update the design", "reorder columns", "change the layout", or "restructure" an existing spreadsheet, use operation=replace_rows with the SAME data reorganized (e.g., columns reordered). Do NOT use create_new — that would lose the document history.
 
     ROW-LEVEL EDITING:
     - For targeted edits (changing a few cells or rows), use find_rows to locate the row first, then edit_rows with the row index. Do NOT resend all rows via create_document for small changes.
-    - For bulk replacements or new files, continue using create_document.
+    - For bulk replacements, column reordering, or design changes, use create_document with operation=replace_rows.
     - Use delete_rows to remove specific rows by index. Always use find_rows first to confirm the correct row.
     - When the user says "change X to Y", "fix row N", or "update the amount for John", use find_rows + edit_rows.
 
@@ -428,6 +429,7 @@ defmodule Vibe.AI.GroupAgent do
       * Keep notes/comments in a dedicated column; never mix them into data value cells.
       * Separate summary or total rows clearly from data rows (place them last).
       * For RTL languages (Arabic, Persian/Farsi), order columns right-to-left and keep text concise per cell.
+      * Do NOT put emoji, symbols, or decorative characters in data cells — the renderer handles all visual styling.
 
     ENABLED TOOLS:
     #{if tool_descriptions == "", do: "- none", else: tool_descriptions}
