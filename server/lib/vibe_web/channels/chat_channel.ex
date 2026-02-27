@@ -222,43 +222,78 @@ defmodule VibeWeb.ChatChannel do
 
     agent_mention = data["agentMention"] || false
     agent_text = data["agentText"]
+    reply_to_id = data["replyToId"] || data["reply_to_id"]
 
-    if agent_mention && is_binary(agent_text) && agent_text != "" do
-      attachment_context = extract_agent_attachment_context(chat_id, data, user_id)
+    # Check if this is a direct @mention
+    is_direct_mention = agent_mention && is_binary(agent_text) && agent_text != ""
 
-      metadata = %{
-        "image_urls" => attachment_context.image_urls,
-        "document_urls" => attachment_context.document_urls,
-        "reply_to_id" => data["replyToId"],
-        "message_id" => data["id"]
-      }
+    # Check if this is a reply to an agent message (follow-up without @mention)
+    is_reply_to_agent =
+      if !is_direct_mention && is_binary(reply_to_id) && reply_to_id != "" do
+        case Chat.get_message(chat_id, reply_to_id, user_id) do
+          %{from_id: from_id} ->
+            normalized_from = from_id |> to_string() |> String.downcase() |> String.trim()
+            normalized_agent = GroupAgent.agent_user_id() |> String.downcase() |> String.trim()
+            normalized_from == normalized_agent
 
-      Task.start(fn ->
-        Logger.info("[ChatChannel] Dispatching agent for chat #{chat_id} agent_text=#{String.slice(agent_text, 0..100)}")
+          _ ->
+            false
+        end
+      else
+        false
+      end
 
-        # Broadcast typing indicator from agent
-        VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "typing", %{
-          "userId" => GroupAgent.agent_user_id(),
-          "isAgent" => true
-        })
-
-        case GroupAgent.handle_mention(chat_id, agent_text, user_id, metadata) do
-          {:ok, _response} ->
-            Logger.info("[ChatChannel] Agent responded in chat #{chat_id}")
-
-          {:error, :no_agent} ->
-            Logger.debug("[ChatChannel] No agent configured for chat #{chat_id}")
-
-          {:error, reason} ->
-            Logger.error("[ChatChannel] Agent dispatch failed for chat #{chat_id}: #{inspect(reason)}")
+    if is_direct_mention || is_reply_to_agent do
+      # For reply-to-agent, use the plain text from the message since there's no agentText
+      dispatch_text =
+        if is_direct_mention do
+          agent_text
+        else
+          # Extract text from the message payload for reply-to-agent
+          data["agentText"] || data["pushPreview"] || data["textPreview"] || data["text"] || ""
         end
 
-        # Stop typing indicator
-        VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "stop-typing", %{
-          "userId" => GroupAgent.agent_user_id(),
-          "isAgent" => true
-        })
-      end)
+      if is_binary(dispatch_text) && String.trim(dispatch_text) != "" do
+        trigger_type = if is_direct_mention, do: "mention", else: "reply"
+        attachment_context = extract_agent_attachment_context(chat_id, data, user_id)
+
+        metadata = %{
+          "image_urls" => attachment_context.image_urls,
+          "document_urls" => attachment_context.document_urls,
+          "reply_to_id" => data["id"],
+          "message_id" => data["id"],
+          "trigger_type" => trigger_type
+        }
+
+        Task.start(fn ->
+          Logger.info("[ChatChannel] Dispatching agent (#{trigger_type}) for chat #{chat_id} text=#{String.slice(dispatch_text, 0..100)}")
+
+          # Broadcast typing indicator from agent
+          VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "typing", %{
+            "userId" => GroupAgent.agent_user_id(),
+            "isAgent" => true
+          })
+
+          case GroupAgent.handle_mention(chat_id, dispatch_text, user_id, metadata) do
+            {:ok, _response} ->
+              Logger.info("[ChatChannel] Agent responded in chat #{chat_id}")
+
+            {:error, :no_agent} ->
+              Logger.debug("[ChatChannel] No agent configured for chat #{chat_id}")
+
+            {:error, reason} ->
+              Logger.error("[ChatChannel] Agent dispatch failed for chat #{chat_id}: #{inspect(reason)}")
+          end
+
+          # Stop typing indicator
+          VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "stop-typing", %{
+            "userId" => GroupAgent.agent_user_id(),
+            "isAgent" => true
+          })
+        end)
+      else
+        Logger.info("[ChatChannel] Reply to agent but empty text for chat #{chat_id}")
+      end
     else
       Logger.info("[ChatChannel] No agent mention detected for chat #{chat_id}")
     end

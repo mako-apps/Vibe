@@ -1395,6 +1395,9 @@ final class ChatEngine {
         "latitude": NSNull(),
         "longitude": NSNull(),
       ]
+      if let replyToId, !replyToId.isEmpty {
+        wirePayload["replyToId"] = replyToId
+      }
       if let fromId = normalizedString(getConfigValueLocked("userId")) {
         wirePayload["fromId"] = fromId
       }
