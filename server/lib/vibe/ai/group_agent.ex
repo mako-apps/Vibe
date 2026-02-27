@@ -3410,9 +3410,7 @@ defmodule Vibe.AI.GroupAgent do
     message_id = Ecto.UUID.generate()
     timestamp = :os.system_time(:millisecond)
     reply_to_id = Map.get(metadata, "reply_to_id")
-    attachment =
-      normalize_explicit_attachment(explicit_attachment) ||
-        extract_agent_document_attachment(chat_id, text)
+    attachment = normalize_explicit_attachment(explicit_attachment)
     plain_text = sanitize_agent_plain_text(text, attachment)
     message_type = if attachment, do: "file", else: "text"
 
@@ -3558,16 +3556,6 @@ defmodule Vibe.AI.GroupAgent do
     error -> {:error, error}
   end
 
-  defp extract_agent_document_attachment(chat_id, text) do
-    with {:ok, url} <- extract_agent_document_url(text, chat_id),
-         file_name <- derive_file_name_from_url(url),
-         true <- not is_nil(file_name) do
-      %{url: url, file_name: file_name}
-    else
-      _ -> nil
-    end
-  end
-
   defp normalize_explicit_attachment(%{url: url, file_name: file_name}) do
     with normalized_url when is_binary(normalized_url) <- normalize_attachment_url(url),
          true <- normalized_url != "" do
@@ -3587,61 +3575,6 @@ defmodule Vibe.AI.GroupAgent do
   end
 
   defp normalize_explicit_attachment(_), do: nil
-
-  defp extract_agent_document_url(text, _chat_id) do
-    normalized_text = text |> to_string()
-
-    absolute =
-      Regex.scan(~r/https?:\/\/[^\s)]+/i, normalized_text)
-      |> List.flatten()
-      |> Enum.find(fn url ->
-        String.contains?(url, "/uploads/#{@agent_docs_dir}/")
-          || String.contains?(url, "/api/agent/document/")
-      end)
-
-    relative =
-      Regex.scan(~r/(?:\/uploads\/agent-docs\/[^\s)]+|\/api\/agent\/document\/[^\s)]+)/i, normalized_text)
-      |> List.flatten()
-      |> List.first()
-
-    cond do
-      is_binary(absolute) and absolute != "" ->
-        {:ok, absolute}
-
-      is_binary(relative) and relative != "" ->
-        {:ok, public_upload_url(relative)}
-
-      true ->
-        {:error, :not_found}
-    end
-  end
-
-  defp current_document_url(%GroupAgentDocument{} = document) do
-    metadata = if is_map(document.metadata), do: document.metadata, else: %{}
-    blob_key = metadata["blob_key"] || metadata[:blob_key]
-    download_name = metadata["download_name"] || metadata[:download_name]
-
-    cond do
-      is_binary(blob_key) and String.trim(blob_key) != "" ->
-        key = String.trim(blob_key)
-        name =
-          download_name
-          |> to_string()
-          |> String.trim()
-          |> default_if_blank("document")
-
-        public_upload_url("/api/agent/document/#{key}/#{name}")
-
-      is_binary(document.relative_url) and document.relative_url != "" ->
-        normalize_attachment_url(document.relative_url)
-
-      is_binary(document.file_url) and document.file_url != "" ->
-        normalize_attachment_url(document.file_url)
-
-      true ->
-        nil
-    end
-  end
 
   defp derive_file_name_from_url(url) when is_binary(url) do
     url
