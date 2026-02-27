@@ -1332,8 +1332,6 @@ defmodule Vibe.AI.GroupAgent do
 
   # ── Row-level tools ──
 
-  @doc_renderer_url "http://127.0.0.1:5050"
-
   defp find_rows_tool(chat_id, input) do
     query = tool_input_value(input, "query") |> String.downcase()
     column_filter = tool_input_value(input, "column")
@@ -1613,7 +1611,7 @@ defmodule Vibe.AI.GroupAgent do
   end
 
   defp call_doc_renderer(path, payload) do
-    url = @doc_renderer_url <> path
+    url = doc_renderer_url() <> path
     body = Jason.encode!(payload)
     headers = [{"content-type", "application/json"}]
 
@@ -1639,6 +1637,12 @@ defmodule Vibe.AI.GroupAgent do
       {:error, reason} ->
         {:error, {:renderer_connection_error, reason}}
     end
+  end
+
+  defp doc_renderer_url do
+    # Priority: DOC_RENDERER_URL > localhost fallback
+    # The renderer runs in the same container, so localhost is correct for Docker deployments
+    System.get_env("DOC_RENDERER_URL") || "http://127.0.0.1:5050"
   end
 
   defp tool_input_int(input, key, default) do
