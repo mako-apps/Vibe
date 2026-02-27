@@ -3588,7 +3588,7 @@ defmodule Vibe.AI.GroupAgent do
 
   defp normalize_explicit_attachment(_), do: nil
 
-  defp extract_agent_document_url(text, chat_id) do
+  defp extract_agent_document_url(text, _chat_id) do
     normalized_text = text |> to_string()
 
     absolute =
@@ -3612,20 +3612,7 @@ defmodule Vibe.AI.GroupAgent do
         {:ok, public_upload_url(relative)}
 
       true ->
-        if document_intent_in_response?(normalized_text) do
-          case GroupAgentDocument.get_current(chat_id) do
-            %GroupAgentDocument{} = document ->
-              case current_document_url(document) do
-                url when is_binary(url) and url != "" -> {:ok, url}
-                _ -> {:error, :not_found}
-              end
-
-            _ ->
-              {:error, :not_found}
-          end
-        else
-          {:error, :not_found}
-        end
+        {:error, :not_found}
     end
   end
 
@@ -3710,15 +3697,6 @@ defmodule Vibe.AI.GroupAgent do
   end
 
   defp maybe_strip_remaining_links(text, _attachment), do: text
-
-  defp document_intent_in_response?(text) do
-    down = text |> to_string() |> String.downcase()
-
-    Enum.any?(
-      ["spreadsheet", "excel", "csv", "document", "file", "attached", "download"],
-      &String.contains?(down, &1)
-    )
-  end
 
   # ── Memory Compaction ──
 
