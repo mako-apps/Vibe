@@ -169,6 +169,15 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
   }()
 
   private var isPeerTyping: Bool = false
+  private var isGroupOrChannel: Bool = false
+
+  private struct AgentProgressState: Equatable {
+    let label: String
+    let tool: String?
+    let status: String
+  }
+
+  private var activeAgentProgress: AgentProgressState?
 
   required init(appContext: AppContext? = nil) {
     NSLog("[ChatListView] init START")
@@ -308,7 +317,11 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
 
     let mergedRows = mergedRowsPayload(from: nextRows)
     var parsed = mergedRows.compactMap(ChatListRow.init)
-    if isPeerTyping {
+    if let progress = activeAgentProgress {
+      parsed.append(
+        .agentProgressIndicator(label: progress.label, tool: progress.tool, status: progress.status)
+      )
+    } else if isPeerTyping && !isGroupOrChannel {
       parsed.append(.typingIndicator())
     }
     NSLog("[ChatListView] setRows parsed: %d, previous: %d", parsed.count, rows.count)
@@ -765,11 +778,14 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
     let next = value.trimmingCharacters(in: .whitespacesAndNewlines)
     if engineChatId == next { return }
     engineChatId = next
+    isPeerTyping = false
+    activeAgentProgress = nil
     nativeEngineRowsById.removeAll()
     nativeEngineOrder.removeAll()
     nativeDeletedMessageIds.removeAll()
     updateChatEngineBinding()
     updateChatEngineChannelBinding()
+    refreshAgentProgressFromEngine()
     refreshVisibleStatuses(reason: "chatId")
   }
 
@@ -791,7 +807,20 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
   func setStatusAuthorityEnabled(_ enabled: Bool) {
     if statusAuthorityEnabled == enabled { return }
     statusAuthorityEnabled = enabled
+    if statusAuthorityEnabled {
+      refreshAgentProgressFromEngine()
+    } else {
+      isPeerTyping = false
+      activeAgentProgress = nil
+      setRows(sourceRowsPayload)
+    }
     refreshVisibleStatuses(reason: "statusAuthorityEnabled")
+  }
+
+  func setIsGroupOrChannel(_ value: Bool) {
+    if isGroupOrChannel == value { return }
+    isGroupOrChannel = value
+    setRows(sourceRowsPayload)
   }
 
   func setAppearance(_ rawAppearance: [String: Any]) {
@@ -1119,6 +1148,10 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
       setPeerTyping(isTyping)
       return
     }
+    if reason == "agentProgress" {
+      setAgentProgress(from: note.userInfo)
+      return
+    }
     if reason == "chatMessageInserted"
       || reason == "chatMessageEdited"
       || reason == "chatMessageDeleted"
@@ -1174,6 +1207,74 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
     if let desiredChatId, engineOpenedChatId != desiredChatId {
       _ = ChatEngine.shared.openChatChannel(["chatId": desiredChatId])
       engineOpenedChatId = desiredChatId
+    }
+  }
+
+  private func refreshAgentProgressFromEngine() {
+    guard statusAuthorityEnabled else {
+      setAgentProgress(from: nil)
+      return
+    }
+    let payload = ChatEngine.shared.agentProgress(chatId: engineChatId)
+    setAgentProgress(from: payload)
+  }
+
+  private func setAgentProgress(from payload: [AnyHashable: Any]?) {
+    let next = resolvedAgentProgress(from: payload)
+    guard next != activeAgentProgress else { return }
+    activeAgentProgress = next
+    setRows(sourceRowsPayload)
+  }
+
+  private func resolvedAgentProgress(from payload: [AnyHashable: Any]?) -> AgentProgressState? {
+    guard let payload else { return nil }
+    let rawStatus =
+      (payload["status"] as? String)?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased()
+      ?? "running"
+
+    let shouldClear = Set([
+      "done", "complete", "completed", "idle", "stopped", "stop", "error", "failed",
+    ]).contains(rawStatus)
+    if shouldClear || (payload["isActive"] as? Bool == false) {
+      return nil
+    }
+
+    let rawLabel =
+      (payload["label"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let rawTool = (payload["tool"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let normalizedTool: String?
+    if let rawTool, !rawTool.isEmpty {
+      normalizedTool = rawTool
+    } else {
+      normalizedTool = nil
+    }
+    let label = rawLabel.isEmpty ? fallbackAgentProgressLabel(tool: normalizedTool) : rawLabel
+    return AgentProgressState(label: label, tool: normalizedTool, status: rawStatus)
+  }
+
+  private func fallbackAgentProgressLabel(tool: String?) -> String {
+    guard let tool else { return "Working..." }
+    switch tool {
+    case "analyze_document":
+      return "Reading document..."
+    case "create_document":
+      return "Creating document..."
+    case "edit_rows":
+      return "Editing rows..."
+    case "delete_rows":
+      return "Deleting rows..."
+    case "export_rows":
+      return "Exporting file..."
+    case "find_rows":
+      return "Finding rows..."
+    case "search_google":
+      return "Searching web..."
+    case "analyze_image":
+      return "Analyzing image..."
+    default:
+      return "Working..."
     }
   }
 
@@ -1621,6 +1722,17 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
       }
       merged.append(row)
     }
+
+    // Sort the final merged array chronologically by timestamp
+    // to prevent outgoing messages from jumping below newly arrived server messages.
+    merged.sort { lhs, rhs in
+      let lMsg = lhs["message"] as? [String: Any]
+      let rMsg = rhs["message"] as? [String: Any]
+      let lTime = (lMsg?["timestamp"] as? Int64) ?? (lMsg?["timestampMs"] as? Int64) ?? 0
+      let rTime = (rMsg?["timestamp"] as? Int64) ?? (rMsg?["timestampMs"] as? Int64) ?? 0
+      return lTime < rTime
+    }
+
     return merged
   }
 
