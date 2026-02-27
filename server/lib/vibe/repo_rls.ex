@@ -6,6 +6,7 @@ defmodule Vibe.RepoRLS do
   enforce per-user row access.
   """
 
+  require Logger
   alias Vibe.Repo
 
   @spec with_user(String.t() | nil, (() -> any())) :: any()
@@ -24,7 +25,7 @@ defmodule Vibe.RepoRLS do
   def with_user(_user_id, fun) when is_function(fun, 0), do: fun.()
 
   defp run_with_user(user_id, fun) do
-    if Repo.in_transaction() do
+    if Repo.in_transaction?() do
       set_local_user(user_id)
       fun.()
     else
@@ -33,7 +34,9 @@ defmodule Vibe.RepoRLS do
              fun.()
            end) do
         {:ok, result} -> result
-        {:error, reason} -> {:error, reason}
+        {:error, reason} ->
+          Logger.error("[RepoRLS] with_user transaction failed user_id=#{user_id}: #{inspect(reason)}")
+          {:error, reason}
       end
     end
   end

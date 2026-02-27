@@ -140,7 +140,12 @@ defmodule VibeWeb.ChatController do
     if user_id != current_id do
       conn |> put_status(:forbidden) |> json(%{error: "Forbidden"})
     else
-      chats = Chat.list_chats(current_id)
+      chats =
+        case Chat.list_chats(current_id) do
+          list when is_list(list) -> list
+          _ -> []
+        end
+
       json(conn, chats)
     end
   end

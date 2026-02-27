@@ -1,5 +1,6 @@
 defmodule Vibe.Chat do
   import Ecto.Query, warn: false
+  require Logger
   alias Vibe.Repo
   alias Vibe.RepoRLS
   alias Vibe.Chat.{
@@ -52,7 +53,8 @@ defmodule Vibe.Chat do
   end
 
   def list_chats(user_id) do
-    RepoRLS.with_user(user_id, fn ->
+    result =
+      RepoRLS.with_user(user_id, fn ->
       # Find all chats user is participating in (excluding deleted ones)
       user_chats_query =
         from p in Participant,
@@ -177,6 +179,19 @@ defmodule Vibe.Chat do
         }
       end)
     end)
+
+    case result do
+      chats when is_list(chats) ->
+        chats
+
+      {:error, reason} ->
+        Logger.error("[Chat] list_chats failed user_id=#{user_id}: #{inspect(reason)}")
+        []
+
+      other ->
+        Logger.error("[Chat] list_chats unexpected result user_id=#{user_id}: #{inspect(other)}")
+        []
+    end
   end
 
   def find_chat_between_users(u1, u2) do
