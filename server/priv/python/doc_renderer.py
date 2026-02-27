@@ -235,4 +235,12 @@ def xlsx():
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 5050
     log.info(f"Starting doc renderer on port {port}")
-    app.run(host="127.0.0.1", port=port, debug=False)
+
+    # Use waitress for production-grade WSGI server
+    try:
+        from waitress import serve
+        log.info("Using waitress WSGI server")
+        serve(app, host="127.0.0.1", port=port, threads=4, channel_timeout=120)
+    except ImportError:
+        log.warning("waitress not available, falling back to Flask dev server")
+        app.run(host="127.0.0.1", port=port, debug=False)
