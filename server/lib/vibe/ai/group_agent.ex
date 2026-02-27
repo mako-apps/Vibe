@@ -812,7 +812,7 @@ defmodule Vibe.AI.GroupAgent do
       "delete_rows" ->
         "Deleting rows..."
 
-      \"export_rows\" ->
+      "export_rows" ->
         format =
           input
           |> tool_input_value("format")
