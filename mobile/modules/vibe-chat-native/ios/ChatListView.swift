@@ -2264,8 +2264,8 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
     }
     bar.bottomSafeAreaInset = safeBottom
 
-    // Size the bar
-    bar.frame = CGRect(x: 0, y: 0, width: w, height: 200)  // temporary width for layout calc
+    // Size the bar by updating its width (avoiding y-origin jumps during UIView animations)
+    bar.frame = CGRect(x: 0, y: bar.frame.minY, width: w, height: bar.frame.height)
     bar.layoutIfNeeded()
     let barH = bar.barHeight
 

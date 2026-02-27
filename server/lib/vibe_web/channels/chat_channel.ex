@@ -36,10 +36,11 @@ defmodule VibeWeb.ChatChannel do
       {:reply, {:error, %{reason: "not_allowed", message: "You cannot send messages here"}}, socket}
     else
       data = deobfuscate(payload)
+      broadcast_payload = enforce_sender_identity(data, user_id)
 
       message_attrs = %{
         chat_id: chat_id,
-        from_id: data["fromId"] || user_id,
+        from_id: user_id,
         id: data["id"],
         encrypted_content: data["encryptedContent"],
         type: data["type"] || "text",
@@ -49,14 +50,14 @@ defmodule VibeWeb.ChatChannel do
       }
 
       # BROADCAST IMMEDIATELY for instant message delivery
-      broadcast!(socket, "message", payload)
+      broadcast!(socket, "message", broadcast_payload)
 
       # Check for @vibe agent mention and dispatch to group agent
       maybe_dispatch_agent(chat_id, data, user_id)
 
       # Persist to database asynchronously (don't block message delivery)
       Task.start(fn ->
-        case Chat.add_message(message_attrs) do
+        case Chat.add_message(message_attrs, acting_user_id: user_id) do
           {:ok, _msg} ->
             # Batch-fetch all participants with settings in ONE query (no N+1)
             participants = Chat.get_all_participant_settings(chat_id)
@@ -144,7 +145,7 @@ defmodule VibeWeb.ChatChannel do
 
   @impl true
   def handle_in("delivery-receipt", %{"messageId" => msg_id} = payload, socket) do
-    Vibe.Chat.mark_delivered(msg_id)
+    Vibe.Chat.mark_delivered(msg_id, socket.assigns.user_id)
     broadcast_from!(socket, "message-delivered", payload)
     {:noreply, socket}
   end
@@ -223,7 +224,7 @@ defmodule VibeWeb.ChatChannel do
     agent_text = data["agentText"]
 
     if agent_mention && is_binary(agent_text) && agent_text != "" do
-      attachment_context = extract_agent_attachment_context(chat_id, data)
+      attachment_context = extract_agent_attachment_context(chat_id, data, user_id)
 
       metadata = %{
         "image_urls" => attachment_context.image_urls,
@@ -263,7 +264,7 @@ defmodule VibeWeb.ChatChannel do
     end
   end
 
-  defp extract_agent_attachment_context(chat_id, data) do
+  defp extract_agent_attachment_context(chat_id, data, user_id) do
     seeded_images = normalize_urls(data["agentImageUrls"] || data["agent_image_urls"])
     seeded_documents = normalize_urls(data["agentDocumentUrls"] || data["agent_document_urls"])
 
@@ -276,7 +277,7 @@ defmodule VibeWeb.ChatChannel do
     reply_media =
       case data["replyToId"] || data["reply_to_id"] do
         reply_id when is_binary(reply_id) and reply_id != "" ->
-          case Chat.get_message(chat_id, reply_id) do
+          case Chat.get_message(chat_id, reply_id, user_id) do
             nil -> nil
             message -> classify_attachment(message.type, message.media_url)
           end
@@ -361,6 +362,12 @@ defmodule VibeWeb.ChatChannel do
   defp document_url?(url) when is_binary(url) do
     lower = String.downcase(url)
     Enum.any?([".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".txt", ".rtf", ".md"], &String.contains?(lower, &1))
+  end
+
+  defp enforce_sender_identity(payload, user_id) when is_map(payload) do
+    payload
+    |> Map.put("fromId", user_id)
+    |> Map.put("from_id", user_id)
   end
 
   defp deobfuscate(%{"d" => encoded}) do

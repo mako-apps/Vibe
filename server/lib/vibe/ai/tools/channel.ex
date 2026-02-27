@@ -78,7 +78,7 @@ defmodule Vibe.AI.Tools.Channel do
     # Verify user has access
     case Chat.get_user_role(channel_id, user_id) do
       role when role in ["owner", "admin"] ->
-        analytics = Chat.get_channel_analytics(channel_id)
+        analytics = Chat.get_channel_analytics(channel_id, user_id)
         %{success: true, analytics: analytics}
 
       _ ->

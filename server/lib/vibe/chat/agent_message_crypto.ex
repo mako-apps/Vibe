@@ -86,9 +86,9 @@ defmodule Vibe.Chat.AgentMessageCrypto do
     seed =
       System.get_env("AGENT_MESSAGE_ENCRYPTION_KEY")
       || System.get_env("SECRET_KEY_BASE")
-      || "vibe-agent-dev-default-key"
+      || Application.get_env(:vibe, VibeWeb.Endpoint, [])[:secret_key_base]
+      || raise "Missing encryption seed for agent message crypto"
 
     :crypto.hash(:sha256, seed)
   end
 end
-

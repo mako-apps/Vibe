@@ -43,7 +43,15 @@ defmodule VibeWeb.ChannelController do
   end
 
   def analytics(conn, %{"id" => channel_id}) do
-    analytics = Chat.get_channel_analytics(channel_id)
-    json(conn, analytics)
+    user_id = conn.assigns.current_user.id
+
+    case Chat.get_user_role(channel_id, user_id) do
+      role when role in ["owner", "admin"] ->
+        analytics = Chat.get_channel_analytics(channel_id, user_id)
+        json(conn, analytics)
+
+      _ ->
+        conn |> put_status(:forbidden) |> json(%{error: "Not allowed"})
+    end
   end
 end

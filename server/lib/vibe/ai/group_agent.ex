@@ -198,7 +198,7 @@ defmodule Vibe.AI.GroupAgent do
   def handle_mention(chat_id, user_message, user_id, metadata \\ %{}) do
     Logger.info("[GroupAgent] handle_mention called chat_id=#{chat_id} user_id=#{user_id} msg_len=#{String.length(user_message)}")
 
-    case GroupAgent.get_enabled_by_chat(chat_id) do
+    case GroupAgent.get_enabled_by_chat(chat_id, acting_user_id: user_id) do
       nil ->
         Logger.info("[GroupAgent] No enabled agent for chat #{chat_id}")
         {:error, :no_agent}
@@ -212,7 +212,7 @@ defmodule Vibe.AI.GroupAgent do
     enabled_tools = normalize_enabled_tools(Map.get(agent_config, :enabled_tools))
 
     # 1. Load memory
-    {:ok, memory} = GroupAgentMemory.get_or_create(chat_id)
+    {:ok, memory} = GroupAgentMemory.get_or_create(chat_id, acting_user_id: user_id)
     Logger.info("[GroupAgent] Memory loaded for #{chat_id}: #{length(memory.messages)} messages, summary=#{if memory.summary, do: "yes", else: "no"}")
 
     # 2. Build system prompt with memory + current group document context
@@ -246,25 +246,31 @@ defmodule Vibe.AI.GroupAgent do
           "role" => "user",
           "content" => stored_user_content,
           "user_id" => user_id
-        })
+        }, acting_user_id: user_id)
 
         GroupAgentMemory.append_message(chat_id, %{
           "role" => "assistant",
           "content" => response
-        })
+        }, acting_user_id: user_id)
 
         # 6. Check if compaction needed
-        maybe_compact(chat_id)
+        maybe_compact(chat_id, user_id)
 
         # 7. Broadcast agent response as a chat message
-        broadcast_agent_message(chat_id, agent_config, response, metadata)
+        broadcast_agent_message(chat_id, agent_config, response, user_id, metadata)
 
         {:ok, response}
 
       {:error, reason} ->
         Logger.error("[GroupAgent] Claude error for chat #{chat_id}: #{inspect(reason)}")
         # Broadcast an error message so users know something went wrong
-        broadcast_agent_message(chat_id, agent_config, "Sorry, I encountered an error processing your request. Please try again.", metadata)
+        broadcast_agent_message(
+          chat_id,
+          agent_config,
+          "Sorry, I encountered an error processing your request. Please try again.",
+          user_id,
+          metadata
+        )
         {:error, reason}
     end
   end
@@ -1749,7 +1755,7 @@ defmodule Vibe.AI.GroupAgent do
     end
   end
 
-  defp broadcast_agent_message(chat_id, agent_config, text, metadata) do
+  defp broadcast_agent_message(chat_id, agent_config, text, user_id, metadata) do
     Logger.info(
       "[GroupAgent] Broadcasting agent message chat_id=#{chat_id} len=#{String.length(text || "")}"
     )
@@ -1809,7 +1815,7 @@ defmodule Vibe.AI.GroupAgent do
               _ -> message_attrs_base
             end
 
-          case Vibe.Chat.add_message(message_attrs) do
+          case Vibe.Chat.add_message(message_attrs, acting_user_id: user_id) do
             {:ok, _msg} ->
               Logger.info(
                 "[GroupAgent] Agent message persisted chat_id=#{chat_id} message_id=#{message_id}"
@@ -1978,18 +1984,18 @@ defmodule Vibe.AI.GroupAgent do
 
   # ── Memory Compaction ──
 
-  defp maybe_compact(chat_id) do
+  defp maybe_compact(chat_id, user_id) do
     Task.start(fn ->
-      case GroupAgentMemory.get_or_create(chat_id) do
+      case GroupAgentMemory.get_or_create(chat_id, acting_user_id: user_id) do
         {:ok, memory} when length(memory.messages) > @compaction_threshold ->
-          compact_memory(memory)
+          compact_memory(memory, user_id)
         _ ->
           :ok
       end
     end)
   end
 
-  defp compact_memory(memory) do
+  defp compact_memory(memory, user_id) do
     messages = memory.messages
     to_compact = Enum.take(messages, length(messages) - @keep_recent_count)
     to_keep = Enum.take(messages, -@keep_recent_count)
@@ -2016,7 +2022,12 @@ defmodule Vibe.AI.GroupAgent do
 
     case Vibe.AI.Agent.quick_completion(prompt) do
       {:ok, summary} ->
-        GroupAgentMemory.update_after_compaction(memory, String.trim(summary), to_keep)
+        GroupAgentMemory.update_after_compaction(
+          memory,
+          String.trim(summary),
+          to_keep,
+          acting_user_id: user_id
+        )
         Logger.info("[GroupAgent] Memory compacted for chat #{memory.chat_id}: #{length(to_compact)} messages summarized")
 
       {:error, reason} ->

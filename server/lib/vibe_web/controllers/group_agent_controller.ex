@@ -12,7 +12,7 @@ defmodule VibeWeb.GroupAgentController do
     case authorize_admin(chat_id, user_id) do
       :ok ->
         # Check if agent already exists
-        case GroupAgent.get_by_chat(chat_id) do
+        case GroupAgent.get_by_chat(chat_id, acting_user_id: user_id) do
           nil ->
             attrs = %{
               chat_id: chat_id,
@@ -28,7 +28,7 @@ defmodule VibeWeb.GroupAgentController do
               created_by: user_id
             }
 
-            case GroupAgent.create(attrs) do
+            case GroupAgent.create(attrs, acting_user_id: user_id) do
               {:ok, agent} ->
                 json(conn, agent_payload(agent, can_manage: true))
 
@@ -54,7 +54,7 @@ defmodule VibeWeb.GroupAgentController do
     else
       can_manage = user_can_manage?(chat_id, user_id)
 
-      case GroupAgent.get_by_chat(chat_id) do
+      case GroupAgent.get_by_chat(chat_id, acting_user_id: user_id) do
         nil ->
           conn |> put_status(404) |> json(%{error: "No agent configured"})
 
@@ -70,7 +70,7 @@ defmodule VibeWeb.GroupAgentController do
 
     case authorize_admin(chat_id, user_id) do
       :ok ->
-        case GroupAgent.get_by_chat(chat_id) do
+        case GroupAgent.get_by_chat(chat_id, acting_user_id: user_id) do
           nil ->
             conn |> put_status(404) |> json(%{error: "No agent configured"})
 
@@ -105,7 +105,7 @@ defmodule VibeWeb.GroupAgentController do
               attrs
             end
 
-            case GroupAgent.update(agent, attrs) do
+            case GroupAgent.update(agent, attrs, acting_user_id: user_id) do
               {:ok, updated} ->
                 json(conn, agent_payload(updated, can_manage: true))
 
@@ -125,15 +125,15 @@ defmodule VibeWeb.GroupAgentController do
 
     case authorize_admin(chat_id, user_id) do
       :ok ->
-        case GroupAgent.get_by_chat(chat_id) do
+        case GroupAgent.get_by_chat(chat_id, acting_user_id: user_id) do
           nil ->
             conn |> put_status(404) |> json(%{error: "No agent configured"})
 
           agent ->
-            case GroupAgent.delete(agent) do
+            case GroupAgent.delete(agent, acting_user_id: user_id) do
               {:ok, _} ->
                 # Also clear the agent's memory
-                Vibe.Chat.GroupAgentMemory.delete_by_chat(chat_id)
+                Vibe.Chat.GroupAgentMemory.delete_by_chat(chat_id, acting_user_id: user_id)
                 Vibe.Chat.GroupAgentDocument.clear_by_chat(chat_id)
                 json(conn, %{success: true})
 

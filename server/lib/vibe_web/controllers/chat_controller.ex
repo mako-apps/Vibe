@@ -20,7 +20,7 @@ defmodule VibeWeb.ChatController do
             json(conn, %{chatId: id, messages: []})
           :not_deleted ->
             # Chat exists and wasn't deleted - return existing messages
-            messages = Chat.get_messages(id)
+            messages = Chat.get_messages(id, my_id)
             json(conn, %{chatId: id, messages: messages})
         end
 
@@ -43,7 +43,7 @@ defmodule VibeWeb.ChatController do
         rescue
           Ecto.ConstraintError ->
             # Another request created the chat first; return the existing chat id.
-            messages = Chat.get_messages(chat_id)
+            messages = Chat.get_messages(chat_id, my_id)
             json(conn, %{chatId: chat_id, messages: messages})
         end
     end

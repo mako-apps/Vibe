@@ -7,6 +7,7 @@ defmodule Vibe.Chat.GroupAgent do
   import Ecto.Changeset
   import Ecto.Query
   alias Vibe.Repo
+  alias Vibe.RepoRLS
 
   @allowed_tools ["search_google", "analyze_image", "analyze_document", "create_document"]
   @default_enabled_tools @allowed_tools
@@ -77,32 +78,56 @@ defmodule Vibe.Chat.GroupAgent do
 
   # ── CRUD ──
 
-  def create(attrs) do
-    %__MODULE__{}
-    |> changeset(attrs)
-    |> Repo.insert()
+  def create(attrs, opts \\ []) do
+    acting_user_id = Keyword.get(opts, :acting_user_id) || attrs[:created_by] || attrs["created_by"]
+
+    RepoRLS.with_user(acting_user_id, fn ->
+      %__MODULE__{}
+      |> changeset(attrs)
+      |> Repo.insert()
+    end)
   end
 
-  def get_by_chat(chat_id) do
-    Repo.one(from a in __MODULE__, where: a.chat_id == ^chat_id)
+  def get_by_chat(chat_id, opts \\ []) do
+    acting_user_id = Keyword.get(opts, :acting_user_id)
+
+    RepoRLS.with_user(acting_user_id, fn ->
+      Repo.one(from a in __MODULE__, where: a.chat_id == ^chat_id)
+    end)
   end
 
-  def get_enabled_by_chat(chat_id) do
-    Repo.one(from a in __MODULE__, where: a.chat_id == ^chat_id and a.enabled == true)
+  def get_enabled_by_chat(chat_id, opts \\ []) do
+    acting_user_id = Keyword.get(opts, :acting_user_id)
+
+    RepoRLS.with_user(acting_user_id, fn ->
+      Repo.one(from a in __MODULE__, where: a.chat_id == ^chat_id and a.enabled == true)
+    end)
   end
 
-  def update(agent, attrs) do
-    agent
-    |> changeset(attrs)
-    |> Repo.update()
+  def update(agent, attrs, opts \\ []) do
+    acting_user_id = Keyword.get(opts, :acting_user_id) || attrs[:created_by] || attrs["created_by"]
+
+    RepoRLS.with_user(acting_user_id, fn ->
+      agent
+      |> changeset(attrs)
+      |> Repo.update()
+    end)
   end
 
-  def delete(agent) do
-    Repo.delete(agent)
+  def delete(agent, opts \\ []) do
+    acting_user_id = Keyword.get(opts, :acting_user_id)
+
+    RepoRLS.with_user(acting_user_id, fn ->
+      Repo.delete(agent)
+    end)
   end
 
-  def delete_by_chat(chat_id) do
-    from(a in __MODULE__, where: a.chat_id == ^chat_id)
-    |> Repo.delete_all()
+  def delete_by_chat(chat_id, opts \\ []) do
+    acting_user_id = Keyword.get(opts, :acting_user_id)
+
+    RepoRLS.with_user(acting_user_id, fn ->
+      from(a in __MODULE__, where: a.chat_id == ^chat_id)
+      |> Repo.delete_all()
+    end)
   end
 end
