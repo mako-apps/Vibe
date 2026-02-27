@@ -154,6 +154,37 @@ def _build_export_html(title, columns, rows, meta=""):
     )
 
 
+def _pdf_first_page_to_png(pdf_bytes, scale=2.0):
+    """Rasterize first PDF page to PNG bytes (WeasyPrint 63+ PNG fallback)."""
+    try:
+        import pypdfium2 as pdfium
+    except Exception as e:
+        raise RuntimeError("PNG export requires pypdfium2 to be installed") from e
+
+    doc = pdfium.PdfDocument(pdf_bytes)
+    try:
+        if len(doc) < 1:
+            raise RuntimeError("Cannot export PNG from an empty PDF document")
+
+        page = doc[0]
+        try:
+            bitmap = page.render(scale=scale)
+            image = bitmap.to_pil()
+            out = io.BytesIO()
+            image.save(out, format="PNG")
+            return out.getvalue()
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+
+
 # ── Column width auto-sizing heuristic ──
 
 def _display_width(text):
@@ -216,7 +247,15 @@ def render():
         buf = io.BytesIO()
 
         if fmt == "png":
-            html_obj.write_png(buf)
+            if hasattr(html_obj, "write_png"):
+                # Backward-compatible path for older WeasyPrint versions.
+                html_obj.write_png(buf)
+            else:
+                # WeasyPrint 63+ removed HTML.write_png; render PDF then rasterize.
+                pdf_buf = io.BytesIO()
+                html_obj.write_pdf(pdf_buf)
+                png_bytes = _pdf_first_page_to_png(pdf_buf.getvalue())
+                buf.write(png_bytes)
             mimetype = "image/png"
             ext = "png"
         else:

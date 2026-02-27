@@ -45,7 +45,7 @@ FROM alpine:3.18
 # Runtime dependencies + yt-dlp for music extraction + doc renderer
 RUN apk add --no-cache libstdc++ openssl ncurses-libs python3 py3-pip ffmpeg curl \
   pango cairo gdk-pixbuf font-noto font-noto-arabic font-noto-extra \
-  && pip3 install --break-system-packages yt-dlp flask==3.1.* waitress==3.0.* weasyprint==63.* openpyxl==3.1.* \
+  && pip3 install --break-system-packages yt-dlp flask==3.1.* waitress==3.0.* weasyprint==63.* openpyxl==3.1.* pypdfium2==4.* \
   && yt-dlp --version
 
 WORKDIR /app
