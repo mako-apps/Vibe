@@ -34,7 +34,7 @@ HEADER_BORDER = Border(
     top=Side(style="thin", color="0F2640"),
     bottom=Side(style="medium", color="0F2640"),
 )
-HEADER_ALIGN = Alignment(horizontal="center", vertical="center", wrap_text=True)
+HEADER_ALIGN = Alignment(horizontal="center", vertical="center", wrap_text=True, readingOrder=2)
 
 # Data rows — clean modern look
 DATA_FONT = Font(name="Calibri", size=11, color="1A1A2E")
@@ -45,8 +45,8 @@ DATA_BORDER = Border(
     top=Side(style="thin", color="D0D5DD"),
     bottom=Side(style="thin", color="D0D5DD"),
 )
-DATA_ALIGN = Alignment(vertical="center", wrap_text=True)
-DATA_ALIGN_CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
+DATA_ALIGN = Alignment(horizontal="right", vertical="center", wrap_text=True, readingOrder=2)
+DATA_ALIGN_CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True, readingOrder=2)
 
 # Alternating row fills for readability
 EVEN_ROW_FILL = PatternFill(start_color="F8F9FC", end_color="F8F9FC", fill_type="solid")
