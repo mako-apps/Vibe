@@ -8,6 +8,7 @@ Endpoints:
 """
 
 import io
+import unicodedata
 import json
 import logging
 import sys
@@ -144,14 +145,34 @@ def _build_export_html(title, columns, rows, meta=""):
 
 # ── Column width auto-sizing heuristic ──
 
-def _auto_column_width(col_name, col_values, min_width=12, max_width=40):
-    """Calculate a reasonable column width based on content."""
-    header_len = len(str(col_name))
-    # Sample up to 50 values for width estimation
-    sample = col_values[:50]
-    max_content = max((len(str(v)) for v in sample), default=0) if sample else 0
-    # Use the wider of header or content, with some padding
-    width = max(header_len, max_content) + 4
+def _display_width(text):
+    """Estimate display width: Arabic/Persian/CJK chars count as ~1.8, Latin as 1."""
+    w = 0
+    for ch in str(text):
+        cat = unicodedata.category(ch)
+        if unicodedata.east_asian_width(ch) in ('W', 'F'):
+            w += 2.0  # CJK wide chars
+        elif '\u0600' <= ch <= '\u06FF' or '\u0750' <= ch <= '\u077F' or '\uFB50' <= ch <= '\uFDFF' or '\uFE70' <= ch <= '\uFEFF':
+            w += 1.6  # Arabic/Persian script
+        else:
+            w += 1.0
+    return w
+
+
+def _auto_column_width(col_name, col_values, min_width=10, max_width=26):
+    """Calculate a compact column width based on content."""
+    header_w = _display_width(col_name)
+    # Sample up to 30 values for width estimation
+    sample = col_values[:30]
+    if sample:
+        # Use the 80th percentile content width (not max) to avoid outlier stretching
+        widths = sorted([_display_width(v) for v in sample])
+        p80_idx = min(int(len(widths) * 0.8), len(widths) - 1)
+        content_w = widths[p80_idx]
+    else:
+        content_w = 0
+    # Use the wider of header or content, with small padding
+    width = max(header_w, content_w) + 2
     return max(min_width, min(width, max_width))
 
 

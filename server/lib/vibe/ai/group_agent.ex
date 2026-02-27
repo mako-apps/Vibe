@@ -431,6 +431,9 @@ defmodule Vibe.AI.GroupAgent do
       * Separate summary or total rows clearly from data rows (place them last).
       * For RTL languages (Arabic, Persian/Farsi), order columns right-to-left and keep text concise per cell.
       * Do NOT put emoji, symbols, or decorative characters in data cells — the renderer handles all visual styling.
+      * NEVER put greeting text or any religious/greeting phrases as a data row. If the user includes such text, put it in the document title instead.
+      * NEVER duplicate the column headers as the first data row. The renderer already adds a styled header row — do NOT repeat it in the rows array.
+      * Keep column count reasonable (5-8 columns max). Merge or omit columns with mostly empty values to keep the table compact and readable.
 
     ENABLED TOOLS:
     #{if tool_descriptions == "", do: "- none", else: tool_descriptions}
