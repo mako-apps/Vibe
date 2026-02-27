@@ -24,6 +24,8 @@ defmodule Vibe.AI.GroupAgent do
   @uploads_dir "/app/uploads"
   @agent_docs_dir "agent-docs"
   @max_agent_document_bytes 1_000_000
+  @max_claude_tool_depth 8
+  @max_tool_attempts 3
 
   @default_system_prompt """
   You are Vibe AI, a helpful assistant in this group chat.
@@ -309,6 +311,7 @@ defmodule Vibe.AI.GroupAgent do
 
     # 3. Build message history from memory + current message
     messages = build_messages(memory, user_message, metadata)
+    broadcast_agent_progress(chat_id, "Understanding the task and planning changes...", "react_plan", "running")
     Logger.info("[GroupAgent] Calling Claude for #{chat_id}: #{length(messages)} messages, system_prompt_len=#{String.length(system_prompt)}")
 
     # 4. Call Claude
@@ -349,6 +352,7 @@ defmodule Vibe.AI.GroupAgent do
         maybe_compact(chat_id, user_id)
 
         # 7. Broadcast agent response as a chat message
+        broadcast_agent_progress(chat_id, "Task completed and verified.", "react_plan", "complete")
         broadcast_agent_message(
           chat_id,
           agent_config,
@@ -362,6 +366,7 @@ defmodule Vibe.AI.GroupAgent do
 
       {:error, reason} ->
         Logger.error("[GroupAgent] Claude error for chat #{chat_id}: #{inspect(reason)}")
+        broadcast_agent_progress(chat_id, "Task failed after retries.", "react_plan", "error")
         # Broadcast an error message so users know something went wrong
         broadcast_agent_message(
           chat_id,
@@ -397,10 +402,20 @@ defmodule Vibe.AI.GroupAgent do
     - ALWAYS reply in the same language the user wrote in. If they write in Persian, reply in Persian. If Arabic, reply in Arabic. Match their language exactly.
     - Address users naturally, referring to the group context.
     - You can reference previous conversations from your memory.
-    - When using tools, call them IMMEDIATELY without intro text.
+    - Use a direct ReAct workflow for every request: understand task -> inspect state -> execute -> verify -> respond.
+    - You may send a short status sentence before tool calls when useful (example: "Let me check the current rows first.").
     - Only use tools that are enabled for this group.
     - If attachments are provided in the current message context, use them.
     - CRITICAL: The user's LATEST message is the highest priority. If the user specifies column order, column names, or layout structure, follow their request EXACTLY — do NOT copy column structure from previous documents in the conversation history. Always obey the latest instruction.
+
+    REACT EXECUTION LOOP (MANDATORY):
+    - Step 1 (Task Check): Before any action, identify the exact task and what must change.
+    - Step 2 (Inspect): For updates/deletes, inspect current state first (find_rows and/or current document context).
+    - Step 3 (Execute): Apply the smallest safe tool action that performs the requested change.
+    - Step 4 (Recover): If a tool fails or returns no-op, diagnose why, adjust input, and retry.
+    - Step 5 (Verify): Re-check affected rows/state before final response.
+    - Use up to 3 recovery cycles. If still blocked, ask one concise clarifying question.
+    - Never claim "done" without verification evidence.
 
     DATA INTERPRETATION:
     - When a user describes data in natural language, carefully parse their intent and extract structured values.
@@ -468,6 +483,12 @@ defmodule Vibe.AI.GroupAgent do
       * NEVER put greeting text or any religious/greeting phrases as a data row. If the user includes such text, put it in the document title instead.
       * NEVER duplicate the column headers as the first data row. The renderer already adds a styled header row — do NOT repeat it in the rows array.
       * Keep column count reasonable (5-7 columns max). Merge related info into single columns (e.g., "گیرنده/تماس" instead of separate "گیرنده" and "شماره تماس" columns) to keep the table compact.
+
+    COMPLETION RESPONSE:
+    - After successful execution, confirm completion explicitly and end with "Done."
+    - For updates, include what changed and before -> after values when tool output provides them.
+    - Include one verification line (example: "You can confirm by checking the updated file.").
+    - Avoid rigid canned templates; keep the response natural and task-specific.
 
     ENABLED TOOLS:
     #{if tool_descriptions == "", do: "- none", else: tool_descriptions}
@@ -608,8 +629,8 @@ defmodule Vibe.AI.GroupAgent do
          chat_id,
          pending_attachment
        ) do
-    if depth > 3 do
-      {:error, "Max tool depth reached"}
+    if depth > @max_claude_tool_depth do
+      {:error, "Max tool depth reached (#{@max_claude_tool_depth})"}
     else
       body = Jason.encode!(%{
         model: @claude_model,
@@ -740,7 +761,7 @@ defmodule Vibe.AI.GroupAgent do
   defp execute_tool(name, input, user_id, enabled_tools, chat_id) do
     if name in enabled_tools do
       progress_label = tool_progress_label(name, input)
-      broadcast_agent_progress(chat_id, progress_label, name, "running")
+      broadcast_agent_progress(chat_id, progress_label, name, "running", %{"attempt" => 1})
       start_time = System.monotonic_time(:millisecond)
 
       # Log raw tool input for debugging
@@ -755,31 +776,112 @@ defmodule Vibe.AI.GroupAgent do
         Logger.info("[GroupAgent] create_document RAW INPUT: op=#{raw_op} cols=#{inspect(raw_cols)} rows_count=#{raw_rows} body=#{raw_body}")
       end
 
-      result =
-        case name do
-          "search_google" -> Vibe.AI.Tools.Search.google(input)
-          "analyze_image" -> Vibe.AI.Tools.Vision.analyze(input)
-          "analyze_document" -> Vibe.AI.Tools.Document.analyze(input)
-          "create_document" -> create_document_tool(chat_id, input, user_id)
-          "find_rows" -> find_rows_tool(chat_id, input)
-          "edit_rows" -> edit_rows_tool(chat_id, input, user_id)
-          "delete_rows" -> delete_rows_tool(chat_id, input, user_id)
-          "export_rows" -> export_rows_tool(chat_id, input, user_id)
-          "delete_document" -> delete_document_tool(chat_id, input, user_id)
-          _ -> %{error: "Unknown tool: #{name}"}
-        end
+      result = execute_tool_with_recovery(name, input, user_id, chat_id, 1)
+      attempts_used = tool_attempt_count(result)
 
       duration_ms = System.monotonic_time(:millisecond) - start_time
-      Logger.info("[GroupAgent] Tool #{name} completed in #{duration_ms}ms")
+      Logger.info("[GroupAgent] Tool #{name} completed in #{duration_ms}ms attempts=#{attempts_used}")
       status = if tool_result_error?(result), do: "error", else: "complete"
-      broadcast_agent_progress(chat_id, progress_label, name, status, %{"durationMs" => duration_ms})
-      result
+      broadcast_agent_progress(chat_id, progress_label, name, status, %{"durationMs" => duration_ms, "attempts" => attempts_used})
+      add_tool_runtime_metadata(result, name, duration_ms)
     else
       Logger.warning("[GroupAgent] Blocked disabled tool call #{name}")
       broadcast_agent_progress(chat_id, "Tool #{name} is disabled for this group.", name, "error")
       %{error: "Tool '#{name}' is disabled for this group."}
     end
   end
+
+  defp execute_tool_with_recovery(name, input, user_id, chat_id, attempt) do
+    result = execute_tool_once(name, input, user_id, chat_id)
+
+    cond do
+      tool_result_error?(result) and attempt < @max_tool_attempts and recoverable_tool_error?(name, result) ->
+        next_attempt = attempt + 1
+        error_message = tool_error_message(result)
+
+        Logger.warning(
+          "[GroupAgent] Tool #{name} failed on attempt #{attempt}, retrying (#{next_attempt}/#{@max_tool_attempts}) error=#{error_message}"
+        )
+
+        broadcast_agent_progress(
+          chat_id,
+          "Recovering from #{name} error (retry #{next_attempt}/#{@max_tool_attempts})...",
+          name,
+          "running",
+          %{"attempt" => next_attempt}
+        )
+
+        execute_tool_with_recovery(name, input, user_id, chat_id, next_attempt)
+
+      true ->
+        annotate_tool_result(result, name, attempt)
+    end
+  end
+
+  defp execute_tool_once(name, input, user_id, chat_id) do
+    case name do
+      "search_google" -> Vibe.AI.Tools.Search.google(input)
+      "analyze_image" -> Vibe.AI.Tools.Vision.analyze(input)
+      "analyze_document" -> Vibe.AI.Tools.Document.analyze(input)
+      "create_document" -> create_document_tool(chat_id, input, user_id)
+      "find_rows" -> find_rows_tool(chat_id, input)
+      "edit_rows" -> edit_rows_tool(chat_id, input, user_id)
+      "delete_rows" -> delete_rows_tool(chat_id, input, user_id)
+      "export_rows" -> export_rows_tool(chat_id, input, user_id)
+      "delete_document" -> delete_document_tool(chat_id, input, user_id)
+      _ -> %{error: "Unknown tool: #{name}"}
+    end
+  end
+
+  defp annotate_tool_result(result, name, attempt) when is_map(result) do
+    normalized =
+      result
+      |> Map.put_new(:tool, name)
+      |> Map.put_new(:attempts_used, attempt)
+
+    if tool_result_error?(normalized) do
+      Map.put_new(normalized, :recovery_hint, tool_recovery_hint(name, normalized))
+    else
+      normalized
+    end
+  end
+
+  defp annotate_tool_result(result, name, attempt) do
+    %{
+      ok: false,
+      tool: name,
+      attempts_used: attempt,
+      error: "Tool returned non-map result",
+      raw_result: inspect(result)
+    }
+  end
+
+  defp add_tool_runtime_metadata(result, name, duration_ms) when is_map(result) do
+    result
+    |> Map.put_new(:tool, name)
+    |> Map.put_new(:duration_ms, duration_ms)
+  end
+
+  defp add_tool_runtime_metadata(result, name, duration_ms) do
+    %{
+      ok: false,
+      tool: name,
+      duration_ms: duration_ms,
+      error: "Tool returned non-map result",
+      raw_result: inspect(result)
+    }
+  end
+
+  defp tool_attempt_count(result) when is_map(result) do
+    attempts =
+      Map.get(result, :attempts_used) ||
+        Map.get(result, "attempts_used") ||
+        1
+
+    if is_integer(attempts) and attempts > 0, do: attempts, else: 1
+  end
+
+  defp tool_attempt_count(_), do: 1
 
   defp tool_result_error?(result) when is_map(result) do
     has_error =
@@ -790,6 +892,62 @@ defmodule Vibe.AI.GroupAgent do
   end
 
   defp tool_result_error?(_), do: false
+
+  defp recoverable_tool_error?(name, result) do
+    error_text = tool_error_message(result)
+
+    transient? =
+      String.contains?(error_text, "timeout") or
+        String.contains?(error_text, "connection") or
+        String.contains?(error_text, "temporar") or
+        String.contains?(error_text, "rate limit") or
+        String.contains?(error_text, "api error") or
+        String.contains?(error_text, "429")
+
+    renderer_retry? =
+      name == "export_rows" and
+        (String.contains?(error_text, "renderer") or String.contains?(error_text, "http_error"))
+
+    transient? or renderer_retry?
+  end
+
+  defp tool_error_message(result) when is_map(result) do
+    result
+    |> Map.get(:error, Map.get(result, "error"))
+    |> case do
+      nil -> Map.get(result, :reason, Map.get(result, "reason"))
+      value -> value
+    end
+    |> to_string()
+    |> String.downcase()
+  end
+
+  defp tool_error_message(_), do: ""
+
+  defp tool_recovery_hint(name, result) do
+    error_text = tool_error_message(result)
+
+    case name do
+      "find_rows" ->
+        "Retry find_rows with a narrower query or with the exact column name."
+
+      "edit_rows" ->
+        "Run find_rows first to confirm row_index, then retry edit_rows using exact column names from the sheet."
+
+      "delete_rows" ->
+        "Run find_rows first, confirm row indices are in range, then retry delete_rows."
+
+      "create_document" ->
+        "Retry create_document with explicit operation, columns, and rows aligned to the schema."
+
+      "export_rows" ->
+        "Retry export_rows with valid row filters and a supported format (pdf or png)."
+
+      _ ->
+        "Diagnose the tool error, adjust inputs, and retry the correct tool."
+    end <>
+      if(error_text != "", do: " Last error: #{String.slice(error_text, 0, 220)}", else: "")
+  end
 
   defp tool_progress_label(name, input) do
     case name do
@@ -818,7 +976,7 @@ defmodule Vibe.AI.GroupAgent do
         end
 
       "find_rows" ->
-        "Finding rows..."
+        "Inspecting current rows..."
 
       "edit_rows" ->
         "Editing rows..."
@@ -1096,14 +1254,6 @@ defmodule Vibe.AI.GroupAgent do
       |> tool_input_value("operation")
       |> String.downcase()
 
-    hint_text =
-      [
-        tool_input_value(input, "body"),
-        tool_input_value(input, "title")
-      ]
-      |> Enum.join(" ")
-      |> String.downcase()
-
     case raw_operation do
       op when op in ["create_new", "new"] ->
         :create_new
@@ -1118,35 +1268,8 @@ defmodule Vibe.AI.GroupAgent do
       "undo" -> :revert_last
       "rollback" -> :revert_last
       _ ->
-        cond do
-          undo_intent?(hint_text) ->
-            :revert_last
-
-          current_document && new_file_request?(hint_text) ->
-            :create_new
-
-          current_document && append_request?(hint_text) ->
-            :append_rows
-
-          current_document ->
-            :edit_current
-
-          true ->
-            :create_new
-        end
+        if current_document, do: :edit_current, else: :create_new
     end
-  end
-
-  defp explicit_new_request_in_input?(input) do
-    hint =
-      [
-        tool_input_value(input, "body"),
-        tool_input_value(input, "title")
-      ]
-      |> Enum.join(" ")
-      |> String.downcase()
-
-    new_file_request?(hint)
   end
 
   defp create_new_spreadsheet_document(
@@ -1584,47 +1707,92 @@ defmodule Vibe.AI.GroupAgent do
           |> Enum.map(fn {c, i} -> {String.downcase(c), i} end)
           |> Map.new()
 
-        {updated_rows, update_count} =
-          Enum.reduce(edits, {rows, 0}, fn {row_idx, values}, {acc_rows, count} ->
+        {updated_rows, change_log, skipped_indices} =
+          Enum.reduce(edits, {rows, [], []}, fn {row_idx, values}, {acc_rows, changes, skipped} ->
             if row_idx > max_idx do
-              {acc_rows, count}
+              {acc_rows, changes, [row_idx | skipped]}
             else
-              updated_row =
-                Enum.reduce(values, Enum.at(acc_rows, row_idx - 1), fn {col_name, new_val}, row ->
+              current_row = Enum.at(acc_rows, row_idx - 1)
+
+              {updated_row, before_values, after_values} =
+                Enum.reduce(values, {current_row, %{}, %{}}, fn {col_name, new_val},
+                                                                 {row_acc, before_acc, after_acc} ->
                   case Map.get(col_lookup, String.downcase(to_string(col_name))) do
-                    nil -> row
-                    col_idx -> List.replace_at(row, col_idx, to_string(new_val))
+                    nil ->
+                      {row_acc, before_acc, after_acc}
+
+                    col_idx ->
+                      old_value = Enum.at(row_acc, col_idx, "")
+                      new_value = to_string(new_val)
+
+                      if old_value == new_value do
+                        {row_acc, before_acc, after_acc}
+                      else
+                        column_name = Enum.at(columns, col_idx) || to_string(col_name)
+
+                        {
+                          List.replace_at(row_acc, col_idx, new_value),
+                          Map.put(before_acc, column_name, old_value),
+                          Map.put(after_acc, column_name, new_value)
+                        }
+                      end
                   end
                 end)
 
-              {List.replace_at(acc_rows, row_idx - 1, updated_row), count + 1}
+              if map_size(after_values) == 0 do
+                {acc_rows, changes, skipped}
+              else
+                change_entry = %{row_index: row_idx, before: before_values, after: after_values}
+                {List.replace_at(acc_rows, row_idx - 1, updated_row), [change_entry | changes], skipped}
+              end
             end
           end)
+
+        changes = Enum.reverse(change_log)
+        skipped_row_indices = skipped_indices |> Enum.reverse() |> Enum.uniq()
 
         title = document.title || "Spreadsheet"
         output_format = if document.format == "csv", do: "csv", else: "xlsx"
 
-        with {:ok, storage, csv_content} <- write_spreadsheet_document_file(title, columns, updated_rows, output_format),
-             {:ok, doc} <-
-               persist_document_version(
-                 chat_id,
-                 title,
-                 output_format,
-                 storage.relative_url,
-                 storage.file_url,
-                 columns,
-                 length(updated_rows),
-                 merge_document_metadata(
-                   build_spreadsheet_metadata("edit_rows", document.version, ""),
-                   storage.metadata
-                 ),
-                 "edit",
-                 user_id
-               ) do
-          %{ok: true, updated_count: update_count, row_count: length(updated_rows),
-            file_url: doc.file_url, version: doc.version}
+        if changes == [] do
+          %{
+            ok: true,
+            updated_count: 0,
+            row_count: length(rows),
+            skipped_row_indices: skipped_row_indices,
+            note: "No cell values changed. Verify row index and column names."
+          }
         else
-          {:error, reason} -> %{error: "Failed to save edits: #{inspect(reason)}"}
+          with {:ok, storage, csv_content} <- write_spreadsheet_document_file(title, columns, updated_rows, output_format),
+               {:ok, doc} <-
+                 persist_document_version(
+                   chat_id,
+                   title,
+                   output_format,
+                   storage.relative_url,
+                   storage.file_url,
+                   columns,
+                   length(updated_rows),
+                   merge_document_metadata(
+                     build_spreadsheet_metadata("edit_rows", document.version, ""),
+                     storage.metadata
+                   ),
+                   "edit",
+                   user_id
+                 ) do
+            %{
+              ok: true,
+              updated_count: length(changes),
+              row_count: length(updated_rows),
+              changes: changes,
+              skipped_row_indices: skipped_row_indices,
+              content: csv_content,
+              file_url: doc.file_url,
+              version: doc.version
+            }
+          else
+            {:error, reason} -> %{error: "Failed to save edits: #{inspect(reason)}"}
+          end
         end
       else
         {:error, :no_document} -> %{error: "No active spreadsheet for this group."}
@@ -2935,225 +3103,14 @@ defmodule Vibe.AI.GroupAgent do
   end
 
   defp maybe_attach_spreadsheet_fallback(
-         chat_id,
-         user_message,
+         _chat_id,
+         _user_message,
          response,
-         enabled_tools,
-         user_id,
+         _enabled_tools,
+         _user_id,
          existing_attachment \\ nil
        ) do
-    cond do
-      existing_attachment ->
-        %{text: response, attachment: existing_attachment}
-
-      should_auto_generate_spreadsheet?(chat_id, user_message, response, enabled_tools) ->
-        title = infer_spreadsheet_title(user_message)
-        operation = infer_fallback_spreadsheet_operation(user_message, chat_id)
-
-        case create_document_tool(chat_id, %{
-               "title" => title,
-               "body" => user_message,
-               "format" => "xlsx",
-               "operation" => operation
-             }, user_id) do
-          %{ok: true, row_count: row_count} = result ->
-            Logger.info(
-              "[GroupAgent] Auto-generated spreadsheet fallback title=#{title} rows=#{row_count} operation=#{operation}"
-            )
-
-            fallback_message =
-              spreadsheet_fallback_message(
-                result[:file_url] || result["file_url"],
-                row_count,
-                result[:columns] || result["columns"] || []
-              )
-
-            resolved_text =
-              if refusal_language?(response) do
-                fallback_message
-              else
-                response <> "\n\n" <> fallback_message
-              end
-
-            %{text: resolved_text, attachment: attachment_from_document_result(result)}
-
-          _ ->
-            %{text: response, attachment: nil}
-        end
-
-      true ->
-        %{text: response, attachment: nil}
-    end
-  end
-
-  defp should_auto_generate_spreadsheet?(chat_id, user_message, response, enabled_tools) do
-    has_current = not is_nil(GroupAgentDocument.get_current(chat_id))
-    trigger = spreadsheet_intent?(user_message) or (has_current and undo_intent?(user_message)) or (has_current and resend_or_fix_intent?(user_message))
-
-    "create_document" in enabled_tools and trigger and not response_contains_download_link?(response)
-  end
-
-  defp undo_intent?(message) do
-    down = message |> to_string() |> String.downcase()
-    String.contains?(down, "undo") or String.contains?(down, "revert")
-  end
-
-  defp infer_fallback_spreadsheet_operation(user_message, chat_id) do
-    message = user_message |> to_string() |> String.downcase()
-    has_current = not is_nil(GroupAgentDocument.get_current(chat_id))
-
-    cond do
-      String.contains?(message, "revert") or String.contains?(message, "undo") ->
-        "revert_last"
-
-      has_current and new_file_request?(message) ->
-        "create_new"
-
-      has_current and append_request?(message) ->
-        "append_rows"
-
-      has_current ->
-        "edit_current"
-
-      true ->
-        "create_new"
-    end
-  end
-
-  defp new_file_request?(message) do
-    Enum.any?(
-      [
-        "new file",
-        "new sheet",
-        "new spreadsheet",
-        "from scratch",
-        "start over",
-        "another file",
-        "خام",
-        "خالی",
-        "جدید",
-        "فایل جدید",
-        "blank",
-        "empty",
-        "template"
-      ],
-      &String.contains?(message, &1)
-    )
-  end
-
-  defp append_request?(message) do
-    Enum.any?(
-      ["add row", "append", "add this row", "insert row", "add rows"],
-      &String.contains?(message, &1)
-    )
-  end
-
-  defp spreadsheet_intent?(message) do
-    down = message |> to_string() |> String.downcase()
-
-    spreadsheet_terms = [
-      "excel",
-      "xlsx",
-      "spreadsheet",
-      "google sheet",
-      "google sheets",
-      "csv",
-      "rows",
-      "columns",
-      # Persian terms
-      "فایل",
-      "فايل",
-      "جدول",
-      "اکسل",
-      "صفحه"
-    ]
-
-    action_terms = [
-      "create",
-      "make",
-      "generate",
-      "build",
-      "export",
-      "prepare",
-      "edit",
-      "update",
-      "add",
-      "append",
-      "revert",
-      "undo",
-      # Persian action terms
-      "بساز",
-      "بفرست",
-      "درست",
-      "اصلاح",
-      "ویرایش",
-      "اضافه",
-      "حذف",
-      "دوباره",
-      "مجدد"
-    ]
-
-    Enum.any?(spreadsheet_terms, &String.contains?(down, &1)) and
-      Enum.any?(action_terms, &String.contains?(down, &1))
-  end
-
-  defp resend_or_fix_intent?(message) do
-    down = message |> to_string() |> String.downcase()
-
-    resend_terms = [
-      "بفرست",
-      "دوباره",
-      "مجدد",
-      "resend",
-      "send again",
-      "درست کن",
-      "اصلاح",
-      "fix",
-      "correct"
-    ]
-
-    Enum.any?(resend_terms, &String.contains?(down, &1))
-  end
-
-  defp response_contains_download_link?(response) do
-    text = response |> to_string() |> String.downcase()
-
-    String.contains?(text, "/uploads/") or
-      String.contains?(text, "/api/agent/document/") or
-      Regex.match?(~r/https?:\/\/\S+\.(csv|xlsx?)(\?\S*)?/i, text) or
-      Regex.match?(~r/https?:\/\/\S+\/agent-docs\/\S+/i, text)
-  end
-
-  defp refusal_language?(response) do
-    down = response |> to_string() |> String.downcase()
-
-    refusal_markers = [
-      "i can't",
-      "i cannot",
-      "not able",
-      "unable to",
-      "can't directly",
-      "cannot directly"
-    ]
-
-    Enum.any?(refusal_markers, &String.contains?(down, &1))
-  end
-
-  defp infer_spreadsheet_title(message) do
-    summary =
-      message
-      |> to_string()
-      |> String.replace(~r/\s+/, " ")
-      |> String.trim()
-      |> String.slice(0, 40)
-
-    "Spreadsheet - " <> default_if_blank(summary, "Data")
-  end
-
-  defp spreadsheet_fallback_message(_file_url, row_count, columns) do
-    col_count = length(columns)
-
-    "Created editable spreadsheet file (Excel .xlsx) and attached it.\nColumns: #{col_count}, Rows: #{row_count}\nYou can open it in Excel, Numbers, or Google Sheets."
+    %{text: response, attachment: existing_attachment}
   end
 
   defp extract_tool_attachment("create_document", result), do: attachment_from_document_result(result)
