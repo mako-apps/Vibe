@@ -3408,14 +3408,96 @@ defmodule Vibe.AI.GroupAgent do
   end
 
   defp maybe_attach_spreadsheet_fallback(
-         _chat_id,
+         chat_id,
          _user_message,
          response,
          _enabled_tools,
          _user_id,
          existing_attachment \\ nil
        ) do
-    %{text: response, attachment: existing_attachment}
+    cond do
+      is_map(existing_attachment) ->
+        %{text: response, attachment: existing_attachment}
+
+      response_claims_attachment?(response) ->
+        case resolve_latest_group_document_attachment(chat_id) do
+          {:ok, attachment} ->
+            Logger.info(
+              "[GroupAgent] Applied attachment fallback chat_id=#{chat_id} file=#{attachment.file_name}"
+            )
+
+            %{text: response, attachment: attachment}
+
+          :error ->
+            %{
+              text:
+                "I couldn't attach a file to that response. Please ask me to regenerate and resend the file.",
+              attachment: nil
+            }
+        end
+
+      true ->
+        %{text: response, attachment: nil}
+    end
+  end
+
+  defp response_claims_attachment?(response) do
+    text =
+      response
+      |> to_string()
+      |> String.trim()
+      |> String.downcase()
+
+    english_claim? =
+      String.contains?(text, "attached") or
+        String.contains?(text, "attachment") or
+        String.contains?(text, "here is the file") or
+        String.contains?(text, "here's the file") or
+        String.contains?(text, "file is ready") or
+        String.contains?(text, "sent the file") or
+        String.contains?(text, "i sent the file")
+
+    persian_claim? =
+      String.contains?(text, "فایل") and
+        (String.contains?(text, "پیوست") or
+           String.contains?(text, "ضمیمه") or
+           String.contains?(text, "ارسال شد") or
+           String.contains?(text, "فرستادم"))
+
+    text != "" and (english_claim? or persian_claim?)
+  end
+
+  defp resolve_latest_group_document_attachment(chat_id) do
+    case GroupAgentDocument.get_current(chat_id) do
+      nil ->
+        :error
+
+      document ->
+        raw_url =
+          document.file_url
+          |> default_if_blank(document.relative_url)
+
+        with normalized_url when is_binary(normalized_url) <- normalize_attachment_url(raw_url),
+             true <- normalized_url != "" do
+          file_name =
+            document.metadata
+            |> case do
+              %{"download_name" => name} when is_binary(name) and name != "" -> name
+              %{download_name: name} when is_binary(name) and name != "" -> name
+              _ -> nil
+            end
+            |> case do
+              nil -> derive_file_name_from_url(normalized_url) || "document"
+              name -> name
+            end
+
+          {:ok, %{url: normalized_url, file_name: file_name}}
+        else
+          _ -> :error
+        end
+    end
+  rescue
+    _ -> :error
   end
 
   defp extract_tool_attachment("create_document", result), do: attachment_from_document_result(result)
