@@ -3409,7 +3409,7 @@ defmodule Vibe.AI.GroupAgent do
 
   defp maybe_attach_spreadsheet_fallback(
          chat_id,
-         _user_message,
+         user_message,
          response,
          _enabled_tools,
          _user_id,
@@ -3419,7 +3419,7 @@ defmodule Vibe.AI.GroupAgent do
       is_map(existing_attachment) ->
         %{text: response, attachment: existing_attachment}
 
-      response_claims_attachment?(response) ->
+      response_claims_attachment?(response) or user_requested_file_delivery?(user_message, response) ->
         case resolve_latest_group_document_attachment(chat_id) do
           {:ok, attachment} ->
             Logger.info(
@@ -3455,16 +3455,73 @@ defmodule Vibe.AI.GroupAgent do
         String.contains?(text, "here's the file") or
         String.contains?(text, "file is ready") or
         String.contains?(text, "sent the file") or
-        String.contains?(text, "i sent the file")
+        String.contains?(text, "i sent the file") or
+        String.contains?(text, "image attached") or
+        String.contains?(text, "exported as png") or
+        String.contains?(text, "exported as pdf")
 
     persian_claim? =
-      String.contains?(text, "فایل") and
-        (String.contains?(text, "پیوست") or
-           String.contains?(text, "ضمیمه") or
-           String.contains?(text, "ارسال شد") or
-           String.contains?(text, "فرستادم"))
+      String.contains?(text, "پیوست") or
+        String.contains?(text, "ضمیمه") or
+        String.contains?(text, "ارسال شد") or
+        String.contains?(text, "ارسال کردم") or
+        String.contains?(text, "فرستادم")
 
     text != "" and (english_claim? or persian_claim?)
+  end
+
+  defp user_requested_file_delivery?(user_message, response) do
+    request_text =
+      user_message
+      |> to_string()
+      |> String.trim()
+      |> String.downcase()
+
+    response_text =
+      response
+      |> to_string()
+      |> String.trim()
+      |> String.downcase()
+
+    wants_delivery? =
+      request_text != "" and
+        (
+          String.contains?(request_text, "send") or
+            String.contains?(request_text, "resend") or
+            String.contains?(request_text, "export") or
+            String.contains?(request_text, "attach") or
+            String.contains?(request_text, "file") or
+            String.contains?(request_text, "xlsx") or
+            String.contains?(request_text, "excel") or
+            String.contains?(request_text, "csv") or
+            String.contains?(request_text, "pdf") or
+            String.contains?(request_text, "png") or
+            String.contains?(request_text, "image") or
+            String.contains?(request_text, "فایل") or
+            String.contains?(request_text, "ضمیمه") or
+            String.contains?(request_text, "پیوست") or
+            String.contains?(request_text, "بفرست") or
+            String.contains?(request_text, "ارسال") or
+            String.contains?(request_text, "خروجی") or
+            String.contains?(request_text, "اکسل") or
+            String.contains?(request_text, "تصویر")
+        )
+
+    destructive_request? =
+      String.contains?(request_text, "delete") or
+        String.contains?(request_text, "remove") or
+        String.contains?(request_text, "clear") or
+        String.contains?(request_text, "حذف") or
+        String.contains?(request_text, "پاک")
+
+    response_errorish? =
+      String.contains?(response_text, "error") or
+        String.contains?(response_text, "failed") or
+        String.contains?(response_text, "couldn't") or
+        String.contains?(response_text, "خطا") or
+        String.contains?(response_text, "مشکل")
+
+    wants_delivery? and not destructive_request? and not response_errorish?
   end
 
   defp resolve_latest_group_document_attachment(chat_id) do
