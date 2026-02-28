@@ -3420,13 +3420,24 @@ defmodule Vibe.AI.GroupAgent do
         %{text: response, attachment: existing_attachment}
 
       response_claims_attachment?(response) or user_requested_file_delivery?(user_message, response) ->
-        case resolve_latest_group_document_attachment(chat_id) do
+        preferred_format = preferred_attachment_format(user_message, response)
+
+        case resolve_latest_group_document_attachment(chat_id, preferred_format) do
           {:ok, attachment} ->
             Logger.info(
               "[GroupAgent] Applied attachment fallback chat_id=#{chat_id} file=#{attachment.file_name}"
             )
 
             %{text: response, attachment: attachment}
+
+          {:error, :preferred_format_not_found} ->
+            format_label = if is_binary(preferred_format), do: String.upcase(preferred_format), else: "requested"
+
+            %{
+              text:
+                "I couldn't attach a #{format_label} file for that response. Please ask me to regenerate and resend it.",
+              attachment: nil
+            }
 
           :error ->
             %{
@@ -3524,37 +3535,130 @@ defmodule Vibe.AI.GroupAgent do
     wants_delivery? and not destructive_request? and not response_errorish?
   end
 
-  defp resolve_latest_group_document_attachment(chat_id) do
-    case GroupAgentDocument.get_current(chat_id) do
-      nil ->
+  defp preferred_attachment_format(user_message, response) do
+    text =
+      [user_message, response]
+      |> Enum.map(&to_string/1)
+      |> Enum.join(" ")
+      |> String.downcase()
+
+    cond do
+      String.contains?(text, "png") or String.contains?(text, "image") or
+          String.contains?(text, "تصویر") or String.contains?(text, "عکس") ->
+        "png"
+
+      String.contains?(text, "pdf") ->
+        "pdf"
+
+      String.contains?(text, "xlsx") or String.contains?(text, "excel") or
+          String.contains?(text, "اکسل") ->
+        "xlsx"
+
+      String.contains?(text, "csv") ->
+        "csv"
+
+      true ->
+        nil
+    end
+  end
+
+  defp resolve_latest_group_document_attachment(chat_id, preferred_format \\ nil) do
+    recent_documents =
+      chat_id
+      |> GroupAgentDocument.list_recent(20)
+      |> List.wrap()
+
+    preferred =
+      case preferred_format do
+        format when is_binary(format) and format != "" ->
+          Enum.find(recent_documents, &document_matches_preferred_format?(&1, format))
+
+        _ ->
+          nil
+      end
+
+    selected_document =
+      cond do
+        preferred != nil ->
+          preferred
+
+        recent_documents != [] ->
+          hd(recent_documents)
+
+        true ->
+          nil
+      end
+
+    cond do
+      selected_document == nil ->
         :error
 
-      document ->
-        raw_url =
-          document.file_url
-          |> default_if_blank(document.relative_url)
+      preferred_format != nil and preferred == nil ->
+        {:error, :preferred_format_not_found}
 
-        with normalized_url when is_binary(normalized_url) <- normalize_attachment_url(raw_url),
-             true <- normalized_url != "" do
-          file_name =
-            document.metadata
-            |> case do
-              %{"download_name" => name} when is_binary(name) and name != "" -> name
-              %{download_name: name} when is_binary(name) and name != "" -> name
-              _ -> nil
-            end
-            |> case do
-              nil -> derive_file_name_from_url(normalized_url) || "document"
-              name -> name
-            end
-
-          {:ok, %{url: normalized_url, file_name: file_name}}
-        else
-          _ -> :error
-        end
+      true ->
+        build_attachment_from_document(selected_document)
     end
   rescue
     _ -> :error
+  end
+
+  defp document_matches_preferred_format?(document, preferred_format) do
+    preferred = preferred_format |> to_string() |> String.trim() |> String.downcase()
+    doc_format = document.format |> to_string() |> String.trim() |> String.downcase()
+
+    export_format =
+      document.metadata
+      |> case do
+        %{"export_format" => value} -> value
+        %{export_format: value} -> value
+        _ -> nil
+      end
+      |> to_string()
+      |> String.trim()
+      |> String.downcase()
+
+    url_source =
+      document.file_url
+      |> default_if_blank(document.relative_url)
+      |> to_string()
+      |> String.downcase()
+
+    extension_match? =
+      case preferred do
+        "png" -> String.contains?(url_source, ".png")
+        "pdf" -> String.contains?(url_source, ".pdf")
+        "xlsx" -> String.contains?(url_source, ".xlsx") or String.contains?(url_source, ".xls")
+        "csv" -> String.contains?(url_source, ".csv")
+        _ -> false
+      end
+
+    doc_format == preferred or export_format == preferred or extension_match?
+  end
+
+  defp build_attachment_from_document(document) do
+    raw_url =
+      document.file_url
+      |> default_if_blank(document.relative_url)
+
+    with normalized_url when is_binary(normalized_url) <- normalize_attachment_url(raw_url),
+         true <- normalized_url != "" do
+      file_name =
+        document.metadata
+        |> case do
+          %{"download_name" => name} when is_binary(name) and name != "" -> name
+          %{download_name: name} when is_binary(name) and name != "" -> name
+          _ -> nil
+        end
+        |> case do
+          nil -> derive_file_name_from_url(normalized_url) || "document"
+          name -> name
+        end
+
+      {:ok, %{url: normalized_url, file_name: file_name}}
+    else
+      _ -> :error
+    end
   end
 
   defp extract_tool_attachment("create_document", result), do: attachment_from_document_result(result)
