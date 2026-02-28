@@ -452,6 +452,8 @@ defmodule Vibe.AI.GroupAgent do
     - Step 5 (Verify): Re-check affected rows/state before final response.
     - Use up to 3 recovery cycles. If still blocked, ask one concise clarifying question.
     - Never claim "done" without verification evidence.
+    - FINAL TOOL-EVIDENCE GATE (MANDATORY): before final response, verify whether this turn has a successful file-producing tool result (`ok=true` and `file_url`/`download_path`).
+    - If the user requested send/resend/export/attach and the gate fails, you MUST keep using tools (or report explicit failure) and you MUST NOT claim attachment.
 
     DATA INTERPRETATION:
     - When a user describes data in natural language, carefully parse their intent and extract structured values.
@@ -480,6 +482,7 @@ defmodule Vibe.AI.GroupAgent do
     - If no tool result contains a file URL, NEVER say "attached", "sent", "ضمیمه", or "پیوست".
     - For send/resend/export requests, do not finish with text-only output. You MUST call the appropriate file-producing tool first, then respond.
     - If the tool fails or returns without file_url, retry with corrected inputs. If still no file URL, explicitly say attachment failed and ask for retry; do not claim success.
+    - Do NOT treat previous-turn files as newly attached. Only the current turn's successful tool output counts.
     - Never claim you cannot create/edit spreadsheet files when create_document is enabled.
     - The generated XLSX files already have professional styling (dark headers, alternating row colors, auto-sized columns, frozen header, auto-filters, RTL layout) — do NOT add any formatting hints, borders, colors, or decorators in cell text values. Keep cell data clean and plain.
     - Spreadsheet behavior is stateful per group chat. Default: edit the current spreadsheet.
@@ -495,6 +498,7 @@ defmodule Vibe.AI.GroupAgent do
       * xlsx/csv requests -> create_document
       * png/pdf/image requests -> export_rows
       Then verify `file_url` exists before final reply.
+    - If send/resend request has no successful file-producing tool result, final response must explicitly state failure to attach and request retry; never claim "sent/attached".
 
     DELETING DOCUMENTS:
     - When the user says "delete the file", "remove the document", "فایل رو حذف کن", "پاک کن", or "clear the spreadsheet", use the delete_document tool with confirm=true.
@@ -540,6 +544,7 @@ defmodule Vibe.AI.GroupAgent do
     - For updates, include what changed and before -> after values when tool output provides them.
     - Include one verification line (example: "You can confirm by checking the updated file.").
     - Avoid rigid canned templates; keep the response natural and task-specific.
+    - NEVER include attachment wording unless the final turn contains successful file tool evidence.
 
     ENABLED TOOLS:
     #{if tool_descriptions == "", do: "- none", else: tool_descriptions}
