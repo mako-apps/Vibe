@@ -355,6 +355,8 @@ final class ChatEngine {
   private var peerTypingUserIdsByChatId: [String: Set<String>] = [:]
   private var agentProgressByChatId: [String: AgentProgressState] = [:]
   private var nativeRecordingStateByChatId: [String: Bool] = [:]
+  private var pinnedMessagesByChatId: [String: [[String: Any]]] = [:]
+  private var pinnedFetchInFlightChatIds = Set<String>()
   private var historyRowsByChat: [String: [[String: Any]]] = [:]
   private var historyLoadingChats = Set<String>()
   private var liveMessageRowsByChat: [String: [String: [String: Any]]] = [:]
@@ -707,6 +709,8 @@ final class ChatEngine {
       peerTypingUserIdsByChatId.removeAll()
       agentProgressByChatId.removeAll()
       nativeRecordingStateByChatId.removeAll()
+      pinnedMessagesByChatId.removeAll()
+      pinnedFetchInFlightChatIds.removeAll()
       liveMessageRowsByChat.removeAll()
       deletedMessageIdsByChat.removeAll()
       historyRowsByChat.removeAll()
@@ -1966,6 +1970,8 @@ final class ChatEngine {
       peerTypingUserIdsByChatId.removeValue(forKey: chatId)
       agentProgressByChatId.removeValue(forKey: chatId)
       nativeRecordingStateByChatId.removeValue(forKey: chatId)
+      pinnedMessagesByChatId.removeValue(forKey: chatId)
+      pinnedFetchInFlightChatIds.remove(chatId)
       chatPeerUserIdsByChatId.removeValue(forKey: chatId)
       openChatChannels.removeValue(forKey: chatId)
 
@@ -2100,6 +2106,150 @@ final class ChatEngine {
     }.resume()
 
     return ["accepted": true, "queued": true, "blockedUserId": blockedUserId]
+  }
+
+  func getPinnedMessages(_ payload: [String: Any]) -> [String: Any] {
+    let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"]) ?? ""
+    let shouldRefresh = parseBooleanLike(payload["refresh"]) ?? false
+    guard !chatId.isEmpty else {
+      NSLog("[ChatEngine][Pin] getPinnedMessages ignored: empty chatId")
+      return ["chatId": "", "loading": false, "data": []]
+    }
+
+    return syncOnQueue {
+      let hasCache = pinnedMessagesByChatId[chatId] != nil
+      if !hasCache {
+        pinnedMessagesByChatId[chatId] = []
+      }
+      if (shouldRefresh || !hasCache) && !pinnedFetchInFlightChatIds.contains(chatId) {
+        fetchPinnedMessagesLocked(chatId: chatId, trigger: "on_demand")
+      }
+      let cachedPins = pinnedMessagesByChatId[chatId] ?? []
+      NSLog(
+        "[ChatEngine][Pin] getPinnedMessages chatId=%@ refresh=%@ hasCache=%@ loading=%@ count=%@",
+        chatId,
+        shouldRefresh ? "true" : "false",
+        hasCache ? "true" : "false",
+        pinnedFetchInFlightChatIds.contains(chatId) ? "true" : "false",
+        String(cachedPins.count)
+      )
+      return [
+        "chatId": chatId,
+        "loading": pinnedFetchInFlightChatIds.contains(chatId),
+        "data": cachedPins,
+      ]
+    }
+  }
+
+  func pinMessage(_ payload: [String: Any]) -> [String: Any] {
+    let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"])
+    let messageId = normalizedString(payload["messageId"] ?? payload["message_id"])
+    let pinned = parseBooleanLike(payload["pinned"]) ?? true
+    NSLog(
+      "[ChatEngine][Pin] pinMessage request chatId=%@ messageId=%@ pinned=%@",
+      chatId ?? "(nil)",
+      messageId ?? "(nil)",
+      pinned ? "true" : "false"
+    )
+    guard let chatId, !chatId.isEmpty else {
+      return ["accepted": false, "reason": "invalid_chat"]
+    }
+    guard let messageId, !messageId.isEmpty else {
+      return ["accepted": false, "reason": "invalid_message"]
+    }
+
+    let requestContext: (URL, String)?
+    requestContext = syncOnQueue {
+      guard let apiBase = apiBaseURLLocked() else { return nil }
+      let token = authHeaderTokenLocked() ?? ""
+      applyPinnedUpdateLocked(
+        chatId: chatId,
+        messageId: messageId,
+        pinned: pinned,
+        payload: [
+          "messageId": messageId,
+          "chatId": chatId,
+          "timestamp": nowMs(),
+        ],
+        trigger: "local_pin_request",
+        refreshRemote: false
+      )
+      state["updatedAt"] = nowMs()
+      postChangeLocked(
+        reason: "chatPinnedUpdated",
+        userInfo: ["chatId": chatId, "messageId": messageId, "pinned": pinned]
+      )
+      return (apiBase, token)
+    }
+
+    guard let (apiBase, token) = requestContext else {
+      NSLog(
+        "[ChatEngine][Pin] pinMessage missing config chatId=%@ messageId=%@",
+        chatId,
+        messageId
+      )
+      return ["accepted": false, "reason": "missing_config", "chatId": chatId]
+    }
+
+    var request = URLRequest(
+      url: apiBase.appendingPathComponent("api").appendingPathComponent("chat")
+        .appendingPathComponent(chatId).appendingPathComponent("messages")
+        .appendingPathComponent(messageId).appendingPathComponent("pin"))
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
+    if !token.isEmpty {
+      request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    }
+    request.httpBody = try? JSONSerialization.data(withJSONObject: ["pinned": pinned], options: [])
+
+    let session = ChatPhoenixClient.makePinnedURLSession()
+    session.dataTask(with: request) { [weak self] _, response, error in
+      guard let self else { return }
+      self.queue.async {
+        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
+        if let error {
+          NSLog(
+            "[ChatEngine][Pin] pinMessage network error chatId=%@ messageId=%@ pinned=%@ error=%@",
+            chatId,
+            messageId,
+            pinned ? "true" : "false",
+            error.localizedDescription
+          )
+          self.appendJournalLocked(
+            event: "native-pin-message-error",
+            payload: [
+              "chatId": chatId,
+              "messageId": messageId,
+              "pinned": pinned,
+              "error": error.localizedDescription,
+            ])
+          self.fetchPinnedMessagesLocked(chatId: chatId, trigger: "pin_error_reconcile")
+          return
+        }
+        let success = (200...299).contains(statusCode)
+        NSLog(
+          "[ChatEngine][Pin] pinMessage response chatId=%@ messageId=%@ pinned=%@ status=%@ success=%@",
+          chatId,
+          messageId,
+          pinned ? "true" : "false",
+          String(statusCode),
+          success ? "true" : "false"
+        )
+        self.appendJournalLocked(
+          event: success ? "native-pin-message-ok" : "native-pin-message-error",
+          payload: [
+            "chatId": chatId,
+            "messageId": messageId,
+            "pinned": pinned,
+            "status": statusCode,
+          ])
+        self.fetchPinnedMessagesLocked(chatId: chatId, trigger: "pin_request_complete")
+      }
+    }.resume()
+
+    return ["accepted": true, "queued": true, "chatId": chatId, "messageId": messageId, "pinned": pinned]
   }
 
   func getChatProfileSummary(_ payload: [String: Any]) -> [String: Any] {
@@ -2594,6 +2744,8 @@ final class ChatEngine {
     snapshot["typingChatCount"] = peerTypingUserIdsByChatId.count
     snapshot["typingUserCount"] = peerTypingUserIdsByChatId.values.reduce(0) { $0 + $1.count }
     snapshot["agentProgressChatCount"] = agentProgressByChatId.count
+    snapshot["pinnedChatCount"] = pinnedMessagesByChatId.count
+    snapshot["pinnedMessageCount"] = pinnedMessagesByChatId.values.reduce(0) { $0 + $1.count }
     snapshot["journalCount"] = store.getJournal(limit: nil).count
     return snapshot
   }
@@ -2661,6 +2813,8 @@ final class ChatEngine {
         peerTypingUserIdsByChatId.removeAll()
         agentProgressByChatId.removeAll()
         nativeRecordingStateByChatId.removeAll()
+        pinnedMessagesByChatId.removeAll()
+        pinnedFetchInFlightChatIds.removeAll()
         historyLoadingChats.removeAll()
         liveMessageRowsByChat.removeAll()
         deletedMessageIdsByChat.removeAll()
@@ -2716,6 +2870,8 @@ final class ChatEngine {
       self.peerTypingUserIdsByChatId.removeAll()
       self.agentProgressByChatId.removeAll()
       self.nativeRecordingStateByChatId.removeAll()
+      self.pinnedMessagesByChatId.removeAll()
+      self.pinnedFetchInFlightChatIds.removeAll()
       self.historyLoadingChats.removeAll()
       self.liveMessageRowsByChat.removeAll()
       self.deletedMessageIdsByChat.removeAll()
@@ -2754,6 +2910,8 @@ final class ChatEngine {
       self.peerTypingUserIdsByChatId.removeAll()
       self.agentProgressByChatId.removeAll()
       self.nativeRecordingStateByChatId.removeAll()
+      self.pinnedMessagesByChatId.removeAll()
+      self.pinnedFetchInFlightChatIds.removeAll()
       self.historyLoadingChats.removeAll()
       self.liveMessageRowsByChat.removeAll()
       self.deletedMessageIdsByChat.removeAll()
@@ -2802,6 +2960,8 @@ final class ChatEngine {
         self.peerTypingUserIdsByChatId.removeAll()
         self.agentProgressByChatId.removeAll()
         self.nativeRecordingStateByChatId.removeAll()
+        self.pinnedMessagesByChatId.removeAll()
+        self.pinnedFetchInFlightChatIds.removeAll()
         self.state["connected"] = false
         self.state["state"] = "native-socket-error"
         self.state["presenceSource"] = "shadow"
@@ -2988,6 +3148,38 @@ final class ChatEngine {
               "chatId": chatId,
               "messageId": isAnyTyping ? "true" : "false",  // Kept for ChatListView compatibility.
               "typingUserIds": typingUserIds,
+            ]
+          )
+          return
+        }
+        if frame.event == "pinned-updated" {
+          guard
+            let messageId = self.normalizedString(frame.payload["messageId"] ?? frame.payload["message_id"])
+          else { return }
+          let pinned = self.parseBooleanLike(frame.payload["pinned"]) ?? true
+          NSLog(
+            "[ChatEngine][Pin] socket pinned-updated chatId=%@ messageId=%@ pinned=%@ payloadKeys=%@",
+            chatId,
+            messageId,
+            pinned ? "true" : "false",
+            Array(frame.payload.keys).sorted().joined(separator: ",")
+          )
+          self.applyPinnedUpdateLocked(
+            chatId: chatId,
+            messageId: messageId,
+            pinned: pinned,
+            payload: frame.payload,
+            trigger: "socket_pinned_updated",
+            refreshRemote: true
+          )
+          let snapshot = self.statusSnapshotLocked()
+          self.postChangeLocked(
+            reason: "chatPinnedUpdated",
+            userInfo: [
+              "chatId": chatId,
+              "messageId": messageId,
+              "pinned": pinned,
+              "state": snapshot,
             ]
           )
           return
@@ -3841,6 +4033,14 @@ final class ChatEngine {
     case "message-deleted":
       removeMessageIndicesLocked(chatId: chatId, messageId: messageId)
       markLiveMessageDeletedLocked(chatId: chatId, messageId: messageId)
+      applyPinnedUpdateLocked(
+        chatId: chatId,
+        messageId: messageId,
+        pinned: false,
+        payload: [:],
+        trigger: "message_deleted",
+        refreshRemote: false
+      )
       appendJournalLocked(
         event: "native-message-deleted",
         payload: [
@@ -3889,6 +4089,267 @@ final class ChatEngine {
       return (messageId, "read")
     default:
       return nil
+    }
+  }
+
+  private func fetchPinnedMessagesLocked(chatId: String, trigger: String) {
+    guard !chatId.isEmpty else { return }
+    guard !pinnedFetchInFlightChatIds.contains(chatId) else {
+      NSLog(
+        "[ChatEngine][Pin] fetchPinnedMessages skipped (in-flight) chatId=%@ trigger=%@",
+        chatId,
+        trigger
+      )
+      return
+    }
+    guard let apiBase = apiBaseURLLocked() else {
+      NSLog(
+        "[ChatEngine][Pin] fetchPinnedMessages skipped (missing apiBase) chatId=%@ trigger=%@",
+        chatId,
+        trigger
+      )
+      return
+    }
+    let token = authHeaderTokenLocked() ?? ""
+
+    pinnedFetchInFlightChatIds.insert(chatId)
+    NSLog(
+      "[ChatEngine][Pin] fetchPinnedMessages start chatId=%@ trigger=%@ tokenPresent=%@",
+      chatId,
+      trigger,
+      token.isEmpty ? "false" : "true"
+    )
+    appendJournalLocked(
+      event: "native-pinned-load-start",
+      payload: ["chatId": chatId, "trigger": trigger]
+    )
+
+    var request = URLRequest(
+      url: apiBase.appendingPathComponent("api").appendingPathComponent("chat")
+        .appendingPathComponent(chatId).appendingPathComponent("pinned_messages"))
+    request.httpMethod = "GET"
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
+    if !token.isEmpty {
+      request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    }
+
+    let session = ChatPhoenixClient.makePinnedURLSession()
+    session.dataTask(with: request) { [weak self] data, response, error in
+      guard let self else { return }
+      self.queue.async {
+        self.pinnedFetchInFlightChatIds.remove(chatId)
+        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
+
+        if let error {
+          NSLog(
+            "[ChatEngine][Pin] fetchPinnedMessages network error chatId=%@ trigger=%@ error=%@",
+            chatId,
+            trigger,
+            error.localizedDescription
+          )
+          self.appendJournalLocked(
+            event: "native-pinned-load-error",
+            payload: [
+              "chatId": chatId,
+              "trigger": trigger,
+              "error": error.localizedDescription,
+            ])
+          self.postChangeLocked(
+            reason: "chatPinnedUpdated",
+            userInfo: ["chatId": chatId, "loading": false]
+          )
+          return
+        }
+
+        guard (200...299).contains(statusCode), let data else {
+          NSLog(
+            "[ChatEngine][Pin] fetchPinnedMessages http error chatId=%@ trigger=%@ status=%@",
+            chatId,
+            trigger,
+            String(statusCode)
+          )
+          self.appendJournalLocked(
+            event: "native-pinned-load-error",
+            payload: [
+              "chatId": chatId,
+              "trigger": trigger,
+              "status": statusCode,
+            ])
+          self.postChangeLocked(
+            reason: "chatPinnedUpdated",
+            userInfo: ["chatId": chatId, "loading": false]
+          )
+          return
+        }
+
+        let nextPins = self.parsePinnedMessagesResponse(data: data, chatId: chatId)
+        let nextPinIds = nextPins.compactMap {
+          self.normalizedString($0["messageId"] ?? $0["message_id"])
+        }
+        NSLog(
+          "[ChatEngine][Pin] fetchPinnedMessages ok chatId=%@ trigger=%@ status=%@ count=%@ ids=%@",
+          chatId,
+          trigger,
+          String(statusCode),
+          String(nextPins.count),
+          nextPinIds.joined(separator: ",")
+        )
+        let previousPins = self.pinnedMessagesByChatId[chatId] ?? []
+        let previousIds = Set(previousPins.compactMap { self.normalizedString($0["messageId"] ?? $0["message_id"]) })
+        let nextIds = Set(nextPins.compactMap { self.normalizedString($0["messageId"] ?? $0["message_id"]) })
+        let allIds = previousIds.union(nextIds)
+        for messageId in allIds {
+          self.setMessagePinnedStateLocked(
+            chatId: chatId,
+            messageId: messageId,
+            pinned: nextIds.contains(messageId)
+          )
+        }
+
+        self.pinnedMessagesByChatId[chatId] = nextPins
+        self.state["updatedAt"] = self.nowMs()
+        self.appendJournalLocked(
+          event: "native-pinned-load-ok",
+          payload: [
+            "chatId": chatId,
+            "trigger": trigger,
+            "count": nextPins.count,
+            "status": statusCode,
+          ])
+        let snapshot = self.statusSnapshotLocked()
+        self.postChangeLocked(
+          reason: "chatPinnedUpdated",
+          userInfo: [
+            "chatId": chatId,
+            "loading": false,
+            "count": nextPins.count,
+            "state": snapshot,
+          ]
+        )
+      }
+    }.resume()
+  }
+
+  private func parsePinnedMessagesResponse(data: Data, chatId: String) -> [[String: Any]] {
+    guard
+      let object = try? JSONSerialization.jsonObject(with: data),
+      let response = object as? [String: Any]
+    else {
+      return []
+    }
+
+    let rawItems = (response["data"] as? [Any]) ?? []
+    return rawItems.compactMap { rawItem in
+      guard let raw = rawItem as? [String: Any] else { return nil }
+      return normalizePinnedEntry(raw, chatId: chatId)
+    }
+  }
+
+  private func normalizePinnedEntry(
+    _ raw: [String: Any],
+    chatId: String,
+    fallbackMessageId: String? = nil
+  ) -> [String: Any]? {
+    let messageId =
+      normalizedString(raw["messageId"] ?? raw["message_id"] ?? raw["id"] ?? fallbackMessageId)
+    guard let messageId, !messageId.isEmpty else { return nil }
+
+    var entry: [String: Any] = [
+      "messageId": messageId,
+      "chatId": chatId,
+    ]
+    if let pinnedAt = raw["pinnedAt"] ?? raw["pinned_at"] {
+      entry["pinnedAt"] = pinnedAt
+    } else {
+      entry["pinnedAt"] = nowMs()
+    }
+    if let timestamp = raw["timestamp"] ?? raw["messageTimestamp"] ?? raw["message_timestamp"] {
+      entry["timestamp"] = timestamp
+    }
+    if let type = normalizedString(raw["type"] ?? raw["messageType"] ?? raw["message_type"]) {
+      entry["type"] = type
+    }
+    if let mediaURL = normalizedString(raw["mediaUrl"] ?? raw["media_url"]) {
+      entry["mediaUrl"] = mediaURL
+    }
+    if let fileName = normalizedString(raw["fileName"] ?? raw["file_name"]) {
+      entry["fileName"] = fileName
+    }
+    if let text = normalizedString(raw["text"] ?? raw["plainContent"] ?? raw["plain_content"]) {
+      entry["text"] = text
+    }
+    return entry
+  }
+
+  private func applyPinnedUpdateLocked(
+    chatId: String,
+    messageId: String,
+    pinned: Bool,
+    payload: [String: Any],
+    trigger: String,
+    refreshRemote: Bool
+  ) {
+    setMessagePinnedStateLocked(chatId: chatId, messageId: messageId, pinned: pinned)
+
+    var pins = pinnedMessagesByChatId[chatId] ?? []
+    pins.removeAll {
+      normalizedString($0["messageId"] ?? $0["message_id"]) == messageId
+    }
+    if pinned {
+      let entry =
+        normalizePinnedEntry(payload, chatId: chatId, fallbackMessageId: messageId)
+        ?? [
+          "messageId": messageId,
+          "chatId": chatId,
+          "pinnedAt": nowMs(),
+        ]
+      pins.insert(entry, at: 0)
+    }
+    pinnedMessagesByChatId[chatId] = pins
+    NSLog(
+      "[ChatEngine][Pin] applyPinnedUpdate chatId=%@ messageId=%@ pinned=%@ trigger=%@ pinCount=%@",
+      chatId,
+      messageId,
+      pinned ? "true" : "false",
+      trigger,
+      String(pins.count)
+    )
+    state["updatedAt"] = nowMs()
+    appendJournalLocked(
+      event: "native-pinned-updated",
+      payload: [
+        "chatId": chatId,
+        "messageId": messageId,
+        "pinned": pinned,
+        "trigger": trigger,
+      ])
+    if refreshRemote {
+      fetchPinnedMessagesLocked(chatId: chatId, trigger: trigger)
+    }
+  }
+
+  private func setMessagePinnedStateLocked(chatId: String, messageId: String, pinned: Bool) {
+    mutateLiveMessagePayloadLocked(chatId: chatId, messageId: messageId) { message in
+      message["isPinned"] = pinned
+      message["pinned"] = pinned
+    }
+
+    guard var rows = historyRowsByChat[chatId] else { return }
+    var changed = false
+    for index in rows.indices {
+      guard normalizedString(rows[index]["kind"]) == "message" else { continue }
+      guard var message = rows[index]["message"] as? [String: Any] else { continue }
+      guard normalizedString(message["id"]) == messageId else { continue }
+      message["isPinned"] = pinned
+      message["pinned"] = pinned
+      var row = rows[index]
+      row["message"] = message
+      rows[index] = row
+      changed = true
+    }
+    if changed {
+      historyRowsByChat[chatId] = rows
     }
   }
 

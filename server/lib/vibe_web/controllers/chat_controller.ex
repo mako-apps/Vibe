@@ -2,6 +2,7 @@ defmodule VibeWeb.ChatController do
   use VibeWeb, :controller
   alias Vibe.Chat
   alias Vibe.Accounts
+  require Logger
 
   def create(conn, %{"friendId" => friend_id}) do
     my_id = conn.assigns.current_user.id
@@ -98,8 +99,14 @@ defmodule VibeWeb.ChatController do
 
     if Chat.is_participant?(chat_id, user_id) do
       pins = Chat.list_pinned_messages(chat_id, user_id)
+      Logger.info(
+        "[ChatController] list_pinned_messages chat_id=#{chat_id} user_id=#{user_id} count=#{length(pins)}"
+      )
       json(conn, %{data: pins})
     else
+      Logger.warning(
+        "[ChatController] list_pinned_messages forbidden chat_id=#{chat_id} user_id=#{user_id}"
+      )
       conn |> put_status(:forbidden) |> json(%{error: "Not a participant"})
     end
   end
@@ -113,23 +120,45 @@ defmodule VibeWeb.ChatController do
         _ -> false
       end
 
+    Logger.info(
+      "[ChatController] pin_message request chat_id=#{chat_id} user_id=#{user_id} message_id=#{message_id} pinned=#{pinned}"
+    )
+
     case Chat.set_message_pin(chat_id, message_id, user_id, pinned) do
       {:ok, :unpinned} ->
+        Logger.info(
+          "[ChatController] pin_message ok chat_id=#{chat_id} user_id=#{user_id} message_id=#{message_id} pinned=false"
+        )
         json(conn, %{success: true, pinned: false, messageId: message_id})
 
       {:ok, _pin} ->
+        Logger.info(
+          "[ChatController] pin_message ok chat_id=#{chat_id} user_id=#{user_id} message_id=#{message_id} pinned=true"
+        )
         json(conn, %{success: true, pinned: true, messageId: message_id})
 
       {:error, :invalid_id} ->
+        Logger.warning(
+          "[ChatController] pin_message invalid_id chat_id=#{chat_id} user_id=#{user_id} message_id=#{message_id}"
+        )
         conn |> put_status(:bad_request) |> json(%{error: "Invalid message id"})
 
       {:error, :forbidden} ->
+        Logger.warning(
+          "[ChatController] pin_message forbidden chat_id=#{chat_id} user_id=#{user_id} message_id=#{message_id}"
+        )
         conn |> put_status(:forbidden) |> json(%{error: "Not allowed"})
 
       {:error, :not_found} ->
+        Logger.warning(
+          "[ChatController] pin_message not_found chat_id=#{chat_id} user_id=#{user_id} message_id=#{message_id}"
+        )
         conn |> put_status(:not_found) |> json(%{error: "Message not found"})
 
       {:error, reason} ->
+        Logger.warning(
+          "[ChatController] pin_message error chat_id=#{chat_id} user_id=#{user_id} message_id=#{message_id} reason=#{inspect(reason)}"
+        )
         conn |> put_status(:bad_request) |> json(%{error: inspect(reason)})
     end
   end

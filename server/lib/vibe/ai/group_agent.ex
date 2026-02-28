@@ -2006,12 +2006,20 @@ defmodule Vibe.AI.GroupAgent do
 
     pinned = tool_input_bool(input, "pinned", true)
 
+    Logger.info(
+      "[GroupAgent] pin_message_tool start chat_id=#{chat_id} user_id=#{user_id} target=#{target} explicit_message_id=#{if(explicit_message_id == "", do: "(none)", else: explicit_message_id)} pinned=#{pinned}"
+    )
+
     with {:ok, message} <- resolve_pin_target_message(chat_id, user_id, explicit_message_id, target),
          {:ok, _} <- Vibe.Chat.set_message_pin(chat_id, message.id, user_id, pinned) do
       broadcast_pinned_updated(chat_id, message.id, pinned, %{
         "userId" => user_id,
         "target" => target
       })
+
+      Logger.info(
+        "[GroupAgent] pin_message_tool ok chat_id=#{chat_id} user_id=#{user_id} message_id=#{message.id} message_type=#{message.type} pinned=#{pinned}"
+      )
 
       %{
         ok: true,
@@ -2029,18 +2037,33 @@ defmodule Vibe.AI.GroupAgent do
       }
     else
       {:error, :no_target_message} ->
+        Logger.warning(
+          "[GroupAgent] pin_message_tool no_target_message chat_id=#{chat_id} user_id=#{user_id} target=#{target}"
+        )
         %{error: "No message found to pin for target '#{target}'."}
 
       {:error, :not_found} ->
+        Logger.warning(
+          "[GroupAgent] pin_message_tool message_not_found chat_id=#{chat_id} user_id=#{user_id} explicit_message_id=#{if(explicit_message_id == "", do: "(none)", else: explicit_message_id)}"
+        )
         %{error: "Message not found for pinning."}
 
       {:error, :invalid_id} ->
+        Logger.warning(
+          "[GroupAgent] pin_message_tool invalid_message_id chat_id=#{chat_id} user_id=#{user_id} explicit_message_id=#{if(explicit_message_id == "", do: "(none)", else: explicit_message_id)}"
+        )
         %{error: "Invalid message_id format for pinning."}
 
       {:error, :forbidden} ->
+        Logger.warning(
+          "[GroupAgent] pin_message_tool forbidden chat_id=#{chat_id} user_id=#{user_id}"
+        )
         %{error: "Not allowed to pin messages in this chat."}
 
       {:error, reason} ->
+        Logger.warning(
+          "[GroupAgent] pin_message_tool error chat_id=#{chat_id} user_id=#{user_id} reason=#{inspect(reason)}"
+        )
         %{error: "Failed to update pin: #{inspect(reason)}"}
     end
   end
@@ -2148,6 +2171,9 @@ defmodule Vibe.AI.GroupAgent do
       |> Map.merge(if(is_map(extra), do: extra, else: %{}))
 
     if normalized_chat_id != "" and normalized_message_id != "" do
+      Logger.info(
+        "[GroupAgent] broadcast pinned-updated chat_id=#{normalized_chat_id} message_id=#{normalized_message_id} pinned=#{pinned} extra_keys=#{inspect(Map.keys(extra || %{}))}"
+      )
       VibeWeb.Endpoint.broadcast!("chat:#{normalized_chat_id}", "pinned-updated", payload)
     end
 

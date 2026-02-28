@@ -147,6 +147,7 @@ public final class ChatMainView: ExpoView,
   private let rootWallpaperLayer = CAGradientLayer()
   private let pagesHost = UIView()
   private let chatPage = UIView()
+  private let pinnedBannerView = ChatPinnedBannerView()
   private let profilePage = UIView()
   private let agentPage = UIView()
   private let agentScrollView = UIScrollView()
@@ -197,6 +198,8 @@ public final class ChatMainView: ExpoView,
   private var groupTypingUserIds: [String] = []
   private var directPeerTypingActive = false
   private var agentProgressSubtitle: String?
+  private var pinnedBannerMessageId: String?
+  private var pinnedBannerBody: String?
   private var avatarUri: String = ""
   private var isChatMuted = false
   private var engineChatId: String = ""
@@ -311,9 +314,11 @@ public final class ChatMainView: ExpoView,
 
   func setEngineChatId(_ value: String) {
     engineChatId = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    NSLog("[ChatMainView][Pin] setEngineChatId=%@", engineChatId)
     chatListView.setEngineChatId(value)
     refreshTypingStateFromEngine(force: true)
     refreshAgentProgressFromEngine(force: true)
+    refreshPinnedBannerFromEngine(force: true)
     refreshProfileSummaryFromEngine(force: true)
     fetchAgentConfigForCurrentChat()
   }
@@ -574,6 +579,11 @@ public final class ChatMainView: ExpoView,
 
     pagesHost.addSubview(chatPage)
     chatPage.addSubview(chatListView)
+    chatPage.addSubview(pinnedBannerView)
+    pinnedBannerView.isHidden = true
+    pinnedBannerView.alpha = 0.0
+    pinnedBannerView.addTarget(
+      self, action: #selector(handlePinnedBannerPressed), for: .touchUpInside)
 
     pagesHost.addSubview(profilePage)
     profilePage.addSubview(profileScrollView)
@@ -881,6 +891,18 @@ public final class ChatMainView: ExpoView,
       }
       return
     }
+    let changeReason = (notification.userInfo?["reason"] as? String) ?? "(unknown)"
+    let changedChatId = (notification.userInfo?["chatId"] as? String) ?? ""
+    if changeReason == "chatPinnedUpdated" || changeReason == "chatRowsReloaded"
+      || changeReason == "chatMessageInserted" || changeReason == "chatMessageChanged"
+    {
+      NSLog(
+        "[ChatMainView][Pin] engineDidChange reason=%@ changedChatId=%@ engineChatId=%@",
+        changeReason,
+        changedChatId,
+        engineChatId
+      )
+    }
     refreshPresenceStateFromEngine()
     refreshTypingStateFromEngine()
     refreshAgentProgressFromEngine()
@@ -891,6 +913,7 @@ public final class ChatMainView: ExpoView,
     {
       return
     }
+    refreshPinnedBannerFromEngine()
     refreshProfileSummaryFromEngine()
   }
 
@@ -964,6 +987,149 @@ public final class ChatMainView: ExpoView,
     guard force || nextLabel != agentProgressSubtitle else { return }
     agentProgressSubtitle = nextLabel
     updateHeaderTexts()
+  }
+
+  private func refreshPinnedBannerFromEngine(force: Bool = false) {
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !chatId.isEmpty else {
+      guard force || pinnedBannerMessageId != nil || pinnedBannerBody != nil || !pinnedBannerView.isHidden else { return }
+      NSLog("[ChatMainView][Pin] clear banner: empty engineChatId force=%@", force ? "true" : "false")
+      pinnedBannerMessageId = nil
+      pinnedBannerBody = nil
+      pinnedBannerView.isHidden = true
+      pinnedBannerView.alpha = 0.0
+      return
+    }
+
+    let payload = ChatEngine.shared.getPinnedMessages(["chatId": chatId])
+    let pins = (payload["data"] as? [[String: Any]]) ?? []
+    let topPin = pins.first
+    let nextMessageId = pinnedMessageId(from: topPin)
+    let nextBody = resolvePinnedBody(chatId: chatId, pin: topPin)
+
+    let shouldHide = nextBody == nil
+    let bannerChanged =
+      nextMessageId != pinnedBannerMessageId
+      || nextBody != pinnedBannerBody
+      || pinnedBannerView.isHidden != shouldHide
+    NSLog(
+      "[ChatMainView][Pin] refresh chatId=%@ force=%@ pins=%@ topMessageId=%@ nextBody=%@ currentHidden=%@ shouldHide=%@ changed=%@ loading=%@",
+      chatId,
+      force ? "true" : "false",
+      String(pins.count),
+      nextMessageId ?? "(nil)",
+      nextBody ?? "(nil)",
+      pinnedBannerView.isHidden ? "true" : "false",
+      shouldHide ? "true" : "false",
+      bannerChanged ? "true" : "false",
+      ((payload["loading"] as? Bool) == true) ? "true" : "false"
+    )
+    guard force || bannerChanged else { return }
+
+    pinnedBannerMessageId = nextMessageId
+    pinnedBannerBody = nextBody
+
+    if let nextBody {
+      pinnedBannerView.configure(title: "Pinned Message", body: nextBody)
+      if pinnedBannerView.isHidden {
+        NSLog(
+          "[ChatMainView][Pin] show banner messageId=%@ alphaTarget=%@",
+          nextMessageId ?? "(nil)",
+          currentPage == .chat ? "1.0" : "0.0"
+        )
+        pinnedBannerView.alpha = 0.0
+        pinnedBannerView.isHidden = false
+        UIView.animate(withDuration: 0.2) {
+          self.pinnedBannerView.alpha = self.currentPage == .chat ? 1.0 : 0.0
+        }
+      } else {
+        NSLog(
+          "[ChatMainView][Pin] update banner messageId=%@ alpha=%@",
+          nextMessageId ?? "(nil)",
+          currentPage == .chat ? "1.0" : "0.0"
+        )
+        pinnedBannerView.alpha = currentPage == .chat ? 1.0 : 0.0
+      }
+      setNeedsLayout()
+    } else {
+      if pinnedBannerView.isHidden {
+        pinnedBannerView.alpha = 0.0
+      } else {
+        NSLog("[ChatMainView][Pin] hide banner (no body)")
+        UIView.animate(
+          withDuration: 0.18,
+          animations: {
+            self.pinnedBannerView.alpha = 0.0
+          },
+          completion: { _ in
+            self.pinnedBannerView.isHidden = true
+          }
+        )
+      }
+    }
+  }
+
+  private func pinnedMessageId(from pin: [String: Any]?) -> String? {
+    guard let pin else { return nil }
+    let raw = pin["messageId"] ?? pin["message_id"] ?? pin["id"]
+    if let value = raw as? String {
+      let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+      return trimmed.isEmpty ? nil : trimmed
+    }
+    if let value = raw as? NSNumber {
+      return value.stringValue
+    }
+    return nil
+  }
+
+  private func resolvePinnedBody(chatId: String, pin: [String: Any]?) -> String? {
+    guard let pin else { return nil }
+
+    func normalizeString(_ value: Any?) -> String? {
+      if let str = value as? String {
+        let trimmed = str.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+      }
+      if let num = value as? NSNumber {
+        return num.stringValue
+      }
+      return nil
+    }
+
+    if let text = normalizeString(pin["text"] ?? pin["plainContent"] ?? pin["plain_content"]) {
+      return text
+    }
+    if let fileName = normalizeString(pin["fileName"] ?? pin["file_name"]) {
+      return "File: \(fileName)"
+    }
+
+    guard let messageId = pinnedMessageId(from: pin) else { return "Pinned message" }
+    let rows = ChatEngine.shared.getChatRows(["chatId": chatId])
+    for row in rows.reversed() {
+      guard (row["kind"] as? String) == "message" else { continue }
+      guard let message = row["message"] as? [String: Any] else { continue }
+      guard normalizeString(message["id"]) == messageId else { continue }
+
+      if let text = normalizeString(message["text"] ?? message["plainContent"] ?? message["plain_content"]) {
+        return text
+      }
+      if let caption = normalizeString(message["caption"]) {
+        return caption
+      }
+      let type = normalizeString(message["type"])?.lowercased() ?? "text"
+      if type == "file" {
+        if let name = normalizeString(message["fileName"] ?? message["file_name"]) {
+          return "File: \(name)"
+        }
+        return "Pinned file"
+      }
+      if let mediaURL = normalizeString(message["mediaUrl"] ?? message["media_url"]) {
+        return mediaURL
+      }
+      return "Pinned message"
+    }
+
+    return "Pinned message"
   }
 
   private func refreshProfileSummaryFromEngine(force: Bool = false) {
@@ -1538,6 +1704,16 @@ public final class ChatMainView: ExpoView,
     ])
   }
 
+  @objc private func handlePinnedBannerPressed() {
+    guard currentPage == .chat else { return }
+    guard let messageId = pinnedBannerMessageId, !messageId.isEmpty else { return }
+    chatListView.scrollToMessage(messageId: messageId, animated: true, viewPosition: 0.2)
+    onNativeEvent([
+      "type": "pinnedBannerPressed",
+      "messageId": messageId,
+    ])
+  }
+
   private func refreshHeaderGlass() {
     if #available(iOS 26.0, *) {
       let backEffect = UIGlassEffect()
@@ -1763,6 +1939,14 @@ public final class ChatMainView: ExpoView,
       x: 0.0, y: -headerHeight,
       width: pageWidth, height: pageHeight + headerHeight)
     chatListView.frame = chatPage.bounds
+    let bannerWidth = max(0.0, pageWidth - 32.0)
+    pinnedBannerView.frame = CGRect(
+      x: 16.0,
+      y: headerHeight + 8.0,
+      width: bannerWidth,
+      height: ChatPinnedBannerView.preferredHeight
+    )
+    chatPage.bringSubviewToFront(pinnedBannerView)
 
     profilePage.frame = CGRect(
       x: 0.0, y: -headerHeight,
@@ -1978,6 +2162,11 @@ public final class ChatMainView: ExpoView,
     chatSubtitleLabel.textColor = secondary
     profileSubtitleLabel.textColor = secondary
     avatarFallbackIconView.tintColor = text
+    pinnedBannerView.applyTheme(
+      textColor: text,
+      surfaceColor: chatBackground,
+      isDark: isDarkTheme
+    )
 
     profilePage.backgroundColor = profileBackground
     profileScrollView.backgroundColor = profileBackground
@@ -2456,6 +2645,7 @@ public final class ChatMainView: ExpoView,
       self.chatHeaderStack.transform = chatHeaderTransform
       self.profileHeaderStack.transform = profileHeaderTransform
       self.avatarButton.alpha = avatarAlpha
+      self.pinnedBannerView.alpha = (isChat && !self.pinnedBannerView.isHidden) ? 1.0 : 0.0
       self.menuButton.alpha = 0.0
       self.profileMenuButton.alpha = isProfile ? 1.0 : 0.0
     }
