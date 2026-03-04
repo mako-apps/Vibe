@@ -10,6 +10,7 @@ private let chatMediaNaturalSizeCache = NSCache<NSString, NSValue>()
 // MARK: - Disk-backed image cache
 
 private let chatMediaDiskCacheQueue = DispatchQueue(label: "chat.media.disk-cache", qos: .utility)
+private var chatMediaFailedURLs = Set<String>()
 
 private func chatMediaDiskCacheDir() -> URL {
   let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
@@ -2307,6 +2308,8 @@ final class ChatListCell: UICollectionViewCell {
           chatMediaImageCache.setObject(diskImage, forKey: urlStr as NSString)
           mediaImageView.image = diskImage
           reportNaturalMediaSizeIfNeeded(for: row, mediaURL: urlStr, image: diskImage)
+        } else if chatMediaFailedURLs.contains(urlStr) {
+          NSLog("[ChatMediaLoad] skipping previously failed url=%@", shortUrl)
         } else {
           NSLog(
             "[ChatMediaLoad] network fetch START msgId=%@ url=%@", row.messageId ?? "-", shortUrl)
@@ -2316,6 +2319,7 @@ final class ChatListCell: UICollectionViewCell {
               NSLog(
                 "[ChatMediaLoad] network fetch FAIL msgId=%@ error=%@", row.messageId ?? "-",
                 error.localizedDescription)
+              chatMediaFailedURLs.insert(urlStr)
               return
             }
             guard let self = self, let data = data, let image = UIImage(data: data)
@@ -2326,6 +2330,7 @@ final class ChatListCell: UICollectionViewCell {
                 "[ChatMediaLoad] network fetch NO_IMAGE msgId=%@ dataLen=%d status=%d url=%@ body=%@",
                 row.messageId ?? "-",
                 data?.count ?? 0, statusCode, urlStr, String(bodyPreview.prefix(200)))
+              chatMediaFailedURLs.insert(urlStr)
               return
             }
             NSLog(
