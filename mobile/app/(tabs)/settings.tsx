@@ -107,6 +107,7 @@ export default function SettingsScreen() {
     const HERO_TOP_OFFSET = 80; // pushes the avatar slightly down if it feels too high
     const HERO_TOP = Math.max(0, insets.top - HERO_ISLAND_ANCHOR - HERO_TOP_ADJUST) + HERO_TOP_OFFSET;
     const HERO_NATIVE_COLLAPSE_THRESHOLD = Math.max(44, HERO_MIX_DISTANCE * 0.58);
+    const HERO_NATIVE_COLLAPSED_TOP = Math.max(6, insets.top - 18);
 
     // Navigation State
     const [activeView, setActiveView] = useState<ViewState>('main');
@@ -550,7 +551,9 @@ export default function SettingsScreen() {
                                         fallbackText={user?.name || user?.username || 'U'}
                                         collapsed={isAvatarCollapsed}
                                         expandedSize={100}
+                                        collapsedSize={32}
                                         expandedTopInset={HERO_TOP}
+                                        collapsedTopInset={HERO_NATIVE_COLLAPSED_TOP}
                                     />
 
                                     <View

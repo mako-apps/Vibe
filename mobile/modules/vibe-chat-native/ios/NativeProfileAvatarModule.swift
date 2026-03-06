@@ -114,15 +114,28 @@ private struct NativeProfileAvatarContentView: View {
 private struct NativeProfileAvatarGlassMorphView: View {
   @ObservedObject var model: NativeProfileAvatarModel
   @Namespace private var namespace
-  @State private var showAvatar: Bool = true
+  @State private var showExpanded: Bool = true
 
   var body: some View {
-    GlassEffectContainer(spacing: 40.0) {
+    GlassEffectContainer(spacing: 200.0) {
       ZStack(alignment: .top) {
         Color.clear
           .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-        if showAvatar {
+        // Anchor glass near Dynamic Island — always present, morph target
+        NativeProfileAvatarImageView(
+          image: model.loadedImage,
+          fallbackText: model.fallbackText
+        )
+        .frame(width: model.collapsedSize, height: model.collapsedSize)
+        .clipShape(Circle())
+        .glassEffect()
+        .glassEffectID("avatar-anchor", in: namespace)
+        .frame(maxWidth: .infinity, alignment: .center)
+        .padding(.top, model.collapsedTopInset)
+
+        // Expanded avatar — conditionally shown, morphs into anchor
+        if showExpanded {
           NativeProfileAvatarImageView(
             image: model.loadedImage,
             fallbackText: model.fallbackText
@@ -130,8 +143,8 @@ private struct NativeProfileAvatarGlassMorphView: View {
           .frame(width: model.expandedSize, height: model.expandedSize)
           .clipShape(Circle())
           .glassEffect()
-          .glassEffectID("profile-avatar", in: namespace)
-          .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+          .glassEffectID("avatar-main", in: namespace)
+          .frame(maxWidth: .infinity, alignment: .center)
           .padding(.top, model.expandedTopInset)
         }
       }
@@ -140,7 +153,7 @@ private struct NativeProfileAvatarGlassMorphView: View {
     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     .onChange(of: model.collapsed) { _, isCollapsed in
       withAnimation(.bouncy) {
-        showAvatar = !isCollapsed
+        showExpanded = !isCollapsed
       }
     }
   }
