@@ -118,9 +118,10 @@ private struct NativeProfileAvatarGlassMorphView: View {
 
   var body: some View {
     GlassEffectContainer(spacing: 200.0) {
-      ZStack(alignment: .top) {
-        Color.clear
-          .frame(maxWidth: .infinity, maxHeight: .infinity)
+      // Use VStack so layout positions the glass shapes — no modifiers after glassEffectID
+      VStack(spacing: 0) {
+        Spacer()
+          .frame(height: model.collapsedTopInset)
 
         // Anchor glass near Dynamic Island — always present, morph target
         NativeProfileAvatarImageView(
@@ -131,11 +132,12 @@ private struct NativeProfileAvatarGlassMorphView: View {
         .clipShape(Circle())
         .glassEffect()
         .glassEffectID("avatar-anchor", in: namespace)
-        .frame(maxWidth: .infinity, alignment: .center)
-        .padding(.top, model.collapsedTopInset)
 
-        // Expanded avatar — conditionally shown, morphs into anchor
         if showExpanded {
+          Spacer()
+            .frame(height: max(0, model.expandedTopInset - model.collapsedTopInset - model.collapsedSize))
+
+          // Expanded avatar — morphs into anchor on collapse
           NativeProfileAvatarImageView(
             image: model.loadedImage,
             fallbackText: model.fallbackText
@@ -144,13 +146,13 @@ private struct NativeProfileAvatarGlassMorphView: View {
           .clipShape(Circle())
           .glassEffect()
           .glassEffectID("avatar-main", in: namespace)
-          .frame(maxWidth: .infinity, alignment: .center)
-          .padding(.top, model.expandedTopInset)
         }
+
+        Spacer()
       }
-      .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+      .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
-    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
     .onChange(of: model.collapsed) { _, isCollapsed in
       withAnimation(.bouncy) {
         showExpanded = !isCollapsed

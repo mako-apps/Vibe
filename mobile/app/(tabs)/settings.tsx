@@ -363,13 +363,16 @@ export default function SettingsScreen() {
     });
 
     // Parent Scaling Animation
+    // overflow must be 'visible' by default so the native glass morph animation
+    // is not clipped by the parent CALayer (clipsToBounds). Only clip when the
+    // edit-menu scales the view down and needs rounded corners.
     const animatedParentStyle = useAnimatedStyle(() => ({
         transform: [
             { scale: parentScale.value },
             { translateY: interpolate(editMenuProgress.value, [0, 1], [0, -30], Extrapolate.CLAMP) }
         ],
         borderRadius: interpolate(parentScale.value, [1, 0.92], [0, 24], Extrapolate.CLAMP),
-        overflow: 'hidden',
+        overflow: parentScale.value < 1 ? 'hidden' as const : 'visible' as const,
         flex: 1,
         backgroundColor: colors.background
     }));
