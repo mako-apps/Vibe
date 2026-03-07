@@ -9,13 +9,10 @@ import MaskedView from '@react-native-masked-view/masked-view';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Search, Phone, Video, PhoneIncoming, PhoneOutgoing, PhoneMissed, X, Trash2, Minus } from 'lucide-react-native';
 import Animated, {
-    useAnimatedScrollHandler,
     useSharedValue,
     useAnimatedStyle,
     interpolate,
     Extrapolate,
-    FadeIn,
-    FadeOut,
     withTiming,
     Easing,
     runOnJS,
@@ -75,6 +72,8 @@ const callRecordKey = (record: CallHistoryRecord, index: number): string => {
     return `call_${remoteId}_${ts}_${index}`;
 };
 
+const CALL_ROW_HEIGHT = 76;
+
 interface CallRowProps {
     record: CallHistoryRecord;
     colors: any;
@@ -84,10 +83,12 @@ interface CallRowProps {
 }
 
 const CallRow = React.memo(({ record, colors, theme, isEditing, onDelete }: CallRowProps) => {
-    const shiftX = useSharedValue(0);
+    const shiftX = useSharedValue(isEditing ? 44 : 0);
 
     useEffect(() => {
-        shiftX.value = withTiming(isEditing ? 44 : 0, {
+        const nextValue = isEditing ? 44 : 0;
+        if (shiftX.value === nextValue) return;
+        shiftX.value = withTiming(nextValue, {
             duration: 250,
             easing: Easing.bezier(0.33, 1, 0.68, 1)
         });
@@ -178,11 +179,8 @@ export default function CallsScreen() {
     const [isSearchActive, setIsSearchActive] = useState(false);
     const [isEditing, setIsEditing] = useState(false);
 
-    const scrollY = useSharedValue(0);
     const searchFocusProgress = useSharedValue(0);
     const searchInputRef = useRef<TextInput>(null);
-
-    const scrollHandler = useAnimatedScrollHandler((e) => { scrollY.value = e.contentOffset.y; });
 
     const stableCallHistory = useMemo(() => dedupeCallHistory(callHistory), [callHistory]);
 
@@ -217,7 +215,6 @@ export default function CallsScreen() {
 
     const searchOverlayStyle = useAnimatedStyle(() => ({
         opacity: searchFocusProgress.value,
-        pointerEvents: isSearchActive ? 'auto' : 'none',
     }));
 
     const headerContentStyle = useAnimatedStyle(() => ({
@@ -225,41 +222,96 @@ export default function CallsScreen() {
         transform: [{ translateY: interpolate(searchFocusProgress.value, [0, 1], [0, -10], Extrapolate.CLAMP) }]
     }));
 
+    const renderCallRow = useCallback(
+        ({ item }: { item: CallHistoryRecord }) => (
+            <CallRow
+                record={item}
+                colors={colors}
+                theme={effectiveTheme}
+                isEditing={isEditing}
+                onDelete={deleteCallRecord}
+            />
+        ),
+        [colors, deleteCallRecord, effectiveTheme, isEditing]
+    );
+
+    const renderSearchCallRow = useCallback(
+        ({ item }: { item: CallHistoryRecord }) => (
+            <CallRow
+                record={item}
+                colors={colors}
+                theme={effectiveTheme}
+                isEditing={false}
+                onDelete={deleteCallRecord}
+            />
+        ),
+        [colors, deleteCallRecord, effectiveTheme]
+    );
+
+    const keyExtractor = useCallback((item: CallHistoryRecord, index: number) => callRecordKey(item, index), []);
+
+    const getItemLayout = useCallback(
+        (_: ArrayLike<CallHistoryRecord> | null | undefined, index: number) => ({
+            length: CALL_ROW_HEIGHT,
+            offset: CALL_ROW_HEIGHT * index,
+            index,
+        }),
+        []
+    );
+
+    const listContentContainerStyle = useMemo(
+        () => [
+            styles.listContentContainer,
+            {
+                paddingTop: insets.top + 64,
+                paddingBottom: 100,
+            },
+            stableCallHistory.length === 0 && styles.listContentContainerEmpty,
+        ],
+        [insets.top, stableCallHistory.length]
+    );
+
     return (
         <View style={[styles.container, { backgroundColor: colors.background }]}>
             <Stack.Screen options={{ headerShown: false }} />
 
             {/* Search Overlay Result List */}
-            <Animated.View style={[StyleSheet.absoluteFill, { backgroundColor: colors.background, zIndex: 3000 }, searchOverlayStyle]}>
-                <View style={{ flex: 1, paddingTop: insets.top + 70 }}>
-                    {searchQuery === '' && stableCallHistory.length > 0 && (
-                        <View style={{ paddingHorizontal: 20, marginBottom: 15 }}>
-                            <Text style={{ color: colors.textSecondary, fontSize: 13, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 10 }}>Recent Calls</Text>
-                            <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-                                {stableCallHistory.slice(0, 5).map((c, index) => (
-                                    <TouchableOpacity key={callRecordKey(c, index)} style={{ marginRight: 15, alignItems: 'center' }}>
-                                        <SafeLiquidGlass style={{ width: 50, height: 50, borderRadius: 25, overflow: 'hidden' }} blurIntensity={10} tint={effectiveTheme === 'dark' ? 'dark' : 'light'}>
-                                            {c.remoteUser.userImage ? <Image source={{ uri: c.remoteUser.userImage }} style={{ width: 50, height: 50 }} /> :
-                                                <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: withAlpha(colors.text, 0.05) }}><Text style={{ color: colors.text }}>{(c.remoteUser.userName || '?').substring(0, 1).toUpperCase()}</Text></View>}
-                                        </SafeLiquidGlass>
-                                        <Text style={{ color: colors.text, fontSize: 11, marginTop: 4, maxWidth: 60 }} numberOfLines={1}>{c.remoteUser.userName}</Text>
-                                    </TouchableOpacity>
-                                ))}
-                            </ScrollView>
-                        </View>
-                    )}
-                    <FlatList
-                        data={filteredCalls}
-                        keyExtractor={(item, index) => callRecordKey(item, index)}
-                        renderItem={({ item }) => <CallRow record={item} colors={colors} theme={effectiveTheme} isEditing={false} onDelete={deleteCallRecord} />}
-                        contentContainerStyle={{ paddingBottom: 100 }}
-                        keyboardShouldPersistTaps="handled"
-                    />
-                </View>
-            </Animated.View>
+            {isSearchActive && (
+                <Animated.View style={[StyleSheet.absoluteFill, { backgroundColor: colors.background, zIndex: 3000 }, searchOverlayStyle]}>
+                    <View style={{ flex: 1, paddingTop: insets.top + 70 }}>
+                        {searchQuery === '' && stableCallHistory.length > 0 && (
+                            <View style={{ paddingHorizontal: 20, marginBottom: 15 }}>
+                                <Text style={{ color: colors.textSecondary, fontSize: 13, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 10 }}>Recent Calls</Text>
+                                <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                                    {stableCallHistory.slice(0, 5).map((c, index) => (
+                                        <TouchableOpacity key={callRecordKey(c, index)} style={{ marginRight: 15, alignItems: 'center' }}>
+                                            <SafeLiquidGlass style={{ width: 50, height: 50, borderRadius: 25, overflow: 'hidden' }} blurIntensity={10} tint={effectiveTheme === 'dark' ? 'dark' : 'light'}>
+                                                {c.remoteUser.userImage ? <Image source={{ uri: c.remoteUser.userImage }} style={{ width: 50, height: 50 }} /> :
+                                                    <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: withAlpha(colors.text, 0.05) }}><Text style={{ color: colors.text }}>{(c.remoteUser.userName || '?').substring(0, 1).toUpperCase()}</Text></View>}
+                                            </SafeLiquidGlass>
+                                            <Text style={{ color: colors.text, fontSize: 11, marginTop: 4, maxWidth: 60 }} numberOfLines={1}>{c.remoteUser.userName}</Text>
+                                        </TouchableOpacity>
+                                    ))}
+                                </ScrollView>
+                            </View>
+                        )}
+                        <FlatList
+                            data={filteredCalls}
+                            keyExtractor={keyExtractor}
+                            renderItem={renderSearchCallRow}
+                            contentContainerStyle={{ paddingBottom: 100 }}
+                            keyboardShouldPersistTaps="handled"
+                            removeClippedSubviews
+                            initialNumToRender={10}
+                            maxToRenderPerBatch={8}
+                            windowSize={6}
+                        />
+                    </View>
+                </Animated.View>
+            )}
 
             {/* Fixed Search Input Overlay */}
-            <Animated.View style={searchInputOverlayStyle}>
+            <Animated.View pointerEvents={isSearchActive ? 'auto' : 'none'} style={searchInputOverlayStyle}>
                 <View style={{ flexDirection: 'row', alignItems: 'center', height: 44 }}>
                     <SafeLiquidGlass style={[styles.searchBar, { flex: 1 }]} blurIntensity={15} tint={effectiveTheme === 'dark' ? 'dark' : 'light'}>
                         <Search size={18} color={colors.textSecondary} style={{ marginLeft: 12 }} />
@@ -296,19 +348,28 @@ export default function CallsScreen() {
                 ) : <View style={{ width: 60 }} />}
             </Animated.View>
 
-            <Animated.ScrollView onScroll={scrollHandler} scrollEventThrottle={16} contentContainerStyle={{ paddingTop: insets.top + 60, paddingBottom: 100 }} showsVerticalScrollIndicator={false}>
-                {stableCallHistory.length > 0 ? (
-                    <View style={styles.listContainer}>
-                        {stableCallHistory.map((record, index) => <CallRow key={callRecordKey(record, index)} record={record} colors={colors} theme={effectiveTheme} isEditing={isEditing} onDelete={deleteCallRecord} />)}
-                    </View>
-                ) : (
+            <FlatList
+                data={stableCallHistory}
+                keyExtractor={keyExtractor}
+                renderItem={renderCallRow}
+                contentContainerStyle={listContentContainerStyle}
+                showsVerticalScrollIndicator={false}
+                keyboardShouldPersistTaps="handled"
+                removeClippedSubviews
+                initialNumToRender={12}
+                maxToRenderPerBatch={8}
+                updateCellsBatchingPeriod={32}
+                windowSize={8}
+                getItemLayout={getItemLayout}
+                ListEmptyComponent={
                     <View style={styles.emptyContainer}>
                         <LottieView source={require('../../src/lottie/Potato.json')} autoPlay loop style={styles.lottiePotato} />
                         <Text style={[styles.emptyTitle, { color: colors.text }]}>No Recent Calls</Text>
                         <Text style={[styles.emptySubtitle, { color: colors.textSecondary }]}>Your call history will appear here</Text>
                     </View>
-                )}
-            </Animated.ScrollView>
+                }
+                extraData={isEditing}
+            />
         </View>
     );
 }
@@ -326,7 +387,8 @@ const styles = StyleSheet.create({
     headerTextBtn: { fontSize: 15, fontWeight: '600' },
     searchBar: { flexDirection: 'row', alignItems: 'center', height: 44, borderRadius: 18, backgroundColor: 'rgba(127,127,127,0.1)', overflow: 'hidden' },
     searchInput: { flex: 1, height: '100%', paddingHorizontal: 10, justifyContent: 'center', fontSize: 16 },
-    listContainer: { marginTop: 4 },
+    listContentContainer: { paddingTop: 0 },
+    listContentContainerEmpty: { flexGrow: 1 },
     callRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 12, paddingHorizontal: 16 },
     avatarContainer: { marginRight: 12 },
     avatarGlass: { width: 50, height: 50, borderRadius: 25, overflow: 'hidden' },

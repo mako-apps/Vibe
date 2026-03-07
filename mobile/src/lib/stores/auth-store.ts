@@ -62,6 +62,21 @@ interface AuthState {
     }) => Promise<void>
 }
 
+function pickProfileImage(value: any): string | undefined {
+    if (!value || typeof value !== 'object') return undefined
+    const candidates = [
+        value.profileImage,
+        value.profile_image,
+        value.avatarUrl,
+        value.avatar_url,
+        value.user?.profileImage,
+        value.user?.profile_image,
+        value.user?.avatarUrl,
+        value.user?.avatar_url,
+    ]
+    return candidates.find((item): item is string => typeof item === 'string' && item.trim().length > 0)
+}
+
 export const useAuthStore = create<AuthState>()(
     persist(
         (set, get) => ({
@@ -119,8 +134,24 @@ export const useAuthStore = create<AuthState>()(
                 if (!user) return;
                 try {
                     const { apiClient } = require('../api-client');
-                    await apiClient.updateProfile({ userId: user.userId, profileImage: base64Image });
-                    set({ user: { ...user, profileImage: base64Image } });
+                    const updateResponse = await apiClient.updateProfile({
+                        userId: user.userId,
+                        profileImage: base64Image,
+                    });
+                    const refreshedUser = await apiClient.getUser(user.userId);
+                    const resolvedProfileImage =
+                        pickProfileImage(refreshedUser)
+                        ?? pickProfileImage(updateResponse)
+                        ?? base64Image;
+
+                    set({
+                        user: {
+                            ...user,
+                            ...(updateResponse && typeof updateResponse === 'object' ? updateResponse : {}),
+                            ...(refreshedUser && typeof refreshedUser === 'object' ? refreshedUser : {}),
+                            profileImage: resolvedProfileImage,
+                        },
+                    });
                 } catch (error) {
                     console.error('Failed to update profile image:', error);
                     throw error;

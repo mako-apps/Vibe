@@ -14,12 +14,13 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as ImagePicker from 'expo-image-picker';
 import Animated, { useAnimatedScrollHandler, useSharedValue, useAnimatedStyle, useAnimatedReaction, interpolate, Extrapolate, withTiming, withSpring, runOnJS } from 'react-native-reanimated';
 
-import SafeLiquidGlass, {
-    isNativeLiquidGlassAvailable,
-    type LiquidGlassNativeControlsConfig,
-} from '../../src/components/native/SafeLiquidGlass';
+import SafeLiquidGlass from '../../src/components/native/SafeLiquidGlass';
 import AnimatedGlassButton from '../../src/components/native/AnimatedGlassButton';
 import NativeProfileAvatar, { isNativeProfileAvatarAvailable } from '../../src/components/native/NativeProfileAvatar';
+import NativeSettingsMain, {
+    isNativeSettingsMainAvailable,
+    type NativeSettingsMainSection,
+} from '../../src/components/native/NativeSettingsMain';
 import ConnectionModal from '../../src/components/settings/ConnectionModal';
 import SubscriptionModal from '../../src/components/settings/SubscriptionModal';
 import ReferralModal from '../../src/components/settings/ReferralModal';
@@ -153,7 +154,6 @@ export default function SettingsScreen() {
     const qrProgress = useSharedValue(0);
     const [isQrOpen, setIsQrOpen] = useState(false);
     const qrRef = React.useRef<any>(null);
-    const useNativeGlassButtons = Platform.OS === 'ios' && isNativeLiquidGlassAvailable();
     const useNativeProfileAvatar = Platform.OS === 'ios' && isNativeProfileAvatarAvailable();
     const springConfig = { damping: 25, stiffness: 350, mass: 0.6 };
 
@@ -208,24 +208,6 @@ export default function SettingsScreen() {
         });
     };
 
-    const qrHeaderButton = useMemo<LiquidGlassNativeControlsConfig>(() => ({
-        kind: 'buttons',
-        items: [{ key: 'qr', title: '', sfSymbol: 'qrcode' }],
-        contentInsets: { top: 0, right: 0, bottom: 0, left: 0 },
-        onPress: openQr,
-    }), []);
-
-    const editHeaderButton = useMemo<LiquidGlassNativeControlsConfig>(() => ({
-        kind: 'buttons',
-        items: [{
-            key: 'edit',
-            title: t('settings.edit'),
-            foregroundColor: colors.text,
-        }],
-        contentInsets: { top: 0, right: 10, bottom: 0, left: 10 },
-        onPress: openEditMenu,
-    }), [colors.text, openEditMenu, t]);
-
     const shareQr = async () => {
         if (!user?.userId) return;
         const inst = qrRef.current;
@@ -274,6 +256,215 @@ export default function SettingsScreen() {
             }
         }
     };
+
+    const handleNotificationsToggle = useCallback(async (val?: boolean) => {
+        const enabling = val !== false;
+        if (enabling) {
+            const { status } = await Notifications.getPermissionsAsync();
+            if (status === 'denied') {
+                Alert.alert(
+                    'Notifications Disabled',
+                    'Push notifications are blocked at the system level. Please enable them in your device Settings.',
+                    [
+                        { text: 'Cancel', style: 'cancel' },
+                        { text: 'Open Settings', onPress: () => Linking.openSettings() },
+                    ]
+                );
+                return;
+            }
+        }
+        await setNotificationsEnabled(enabling);
+    }, [setNotificationsEnabled]);
+
+    const nativeSettingsSections = useMemo<NativeSettingsMainSection[]>(() => {
+        const sections: NativeSettingsMainSection[] = [
+            {
+                title: t('settings.account'),
+                rows: [
+                    {
+                        id: 'edit-profile',
+                        icon: 'person.fill',
+                        label: t('settings.editProfile'),
+                        value: user?.name ? 'Manage' : 'Set up',
+                        color: colors.text,
+                    },
+                    {
+                        id: 'saved-messages',
+                        icon: 'bookmark.fill',
+                        label: t('settings.savedMessages'),
+                        color: '#f59e0b',
+                    },
+                    {
+                        id: 'your-qr',
+                        icon: 'qrcode',
+                        label: t('settings.yourQr'),
+                        value: 'Show',
+                        color: '#10b981',
+                    },
+                    {
+                        id: 'connection-manager',
+                        icon: 'server.rack',
+                        label: t('settings.connectionManager'),
+                        value: 'Automatic',
+                        color: '#3b82f6',
+                        divider: false,
+                    },
+                ],
+            },
+            {
+                title: t('settings.privacySecurity'),
+                rows: [
+                    {
+                        id: 'privacy',
+                        icon: 'shield.fill',
+                        label: t('settings.privacy'),
+                        value: 'Manage',
+                        color: '#10b981',
+                    },
+                    {
+                        id: 'secret-key',
+                        icon: 'key.fill',
+                        label: t('settings.secretKey'),
+                        color: '#8b5cf6',
+                        divider: false,
+                    },
+                ],
+            },
+            {
+                title: t('settings.notifications'),
+                rows: [
+                    {
+                        id: 'push-notifications',
+                        icon: 'bell.fill',
+                        label: 'Push Notifications',
+                        type: 'switch',
+                        value: notificationsEnabled,
+                        color: '#ef4444',
+                        divider: false,
+                    },
+                ],
+            },
+            {
+                title: 'APPEARANCE',
+                rows: [
+                    {
+                        id: 'appearance',
+                        icon: 'moon.fill',
+                        label: 'Appearance',
+                        value: theme === 'dark' ? 'Dark' : 'Light',
+                        color: colors.text,
+                        divider: false,
+                    },
+                ],
+            },
+            {
+                title: 'MEDIA & STORAGE',
+                rows: [
+                    {
+                        id: 'media-cache',
+                        icon: 'internaldrive.fill',
+                        label: 'Media Cache',
+                        value: 'Manage',
+                        color: '#ec4899',
+                        divider: false,
+                    },
+                ],
+            },
+            {
+                title: 'SUBSCRIPTION',
+                rows: [
+                    {
+                        id: 'your-plan',
+                        icon: 'crown.fill',
+                        label: 'Your Plan',
+                        value: getTierInfo(userTier).label,
+                        color: '#FFD700',
+                    },
+                    {
+                        id: 'invite-friends',
+                        icon: 'person.2.fill',
+                        label: 'Invite Friends',
+                        value: `${stats?.verifiedCount || 0}/4000`,
+                        color: '#CD7F32',
+                        divider: userTier === 'silver' || userTier === 'gold',
+                    },
+                ],
+            },
+        ];
+
+        if (userTier === 'silver' || userTier === 'gold') {
+            sections[sections.length - 1].rows.push({
+                id: 'business-settings',
+                icon: 'briefcase.fill',
+                label: 'Business Settings',
+                color: '#3b82f6',
+                divider: false,
+            });
+        }
+
+        return sections;
+    }, [colors.text, notificationsEnabled, stats?.verifiedCount, t, theme, user?.name, userTier]);
+
+    const useNativeSettingsMain = Platform.OS === 'ios' && activeView === 'main' && isNativeSettingsMainAvailable();
+
+    const handleNativeSettingsEvent = useCallback(async (event: { type?: string; rowId?: string; value?: boolean }) => {
+        switch (event.type) {
+            case 'headerQr':
+                openQr();
+                return;
+            case 'headerEdit':
+                openEditMenu();
+                return;
+            case 'avatarEdit':
+                await pickImage();
+                return;
+            case 'rowToggle':
+                if (event.rowId === 'push-notifications') {
+                    await handleNotificationsToggle(event.value);
+                }
+                return;
+            case 'rowPress':
+                switch (event.rowId) {
+                    case 'edit-profile':
+                        router.push('/profile');
+                        return;
+                    case 'saved-messages':
+                        router.push('/saved-messages');
+                        return;
+                    case 'your-qr':
+                        openQr();
+                        return;
+                    case 'connection-manager':
+                        setShowConnectionModal(true);
+                        return;
+                    case 'privacy':
+                        router.push('/settings/privacy');
+                        return;
+                    case 'secret-key':
+                        router.push('/settings/secret-key');
+                        return;
+                    case 'appearance':
+                        router.push('/settings/appearance');
+                        return;
+                    case 'media-cache':
+                        router.push('/media-cache');
+                        return;
+                    case 'your-plan':
+                        setShowSubscriptionModal(true);
+                        return;
+                    case 'invite-friends':
+                        setShowReferralModal(true);
+                        return;
+                    case 'business-settings':
+                        setShowBusinessModal(true);
+                        return;
+                    default:
+                        return;
+                }
+            default:
+                return;
+        }
+    }, [handleNotificationsToggle, openEditMenu, openQr, pickImage, router]);
 
 
 
@@ -436,6 +627,278 @@ export default function SettingsScreen() {
         };
     });
 
+    if (useNativeSettingsMain) {
+        return (
+            <View style={{ flex: 1, backgroundColor: '#000' }} >
+                <Animated.View style={animatedParentStyle}>
+                    <NativeSettingsMain
+                        style={{ flex: 1 }}
+                        isDark={isDark}
+                        backgroundColor={colors.background}
+                        cardColor={colors.card}
+                        textColor={colors.text}
+                        textSecondaryColor={colors.textSecondary}
+                        primaryColor={colors.primary}
+                        displayName={user?.name || user?.username || 'Guest'}
+                        subtitle={`${user?.phoneNumber ? `${user.phoneNumber} • ` : ''}@${user?.username || 'unknown'}`}
+                        editLabel={t('settings.edit')}
+                        footerText="Vibe Mobile v1.0.3"
+                        imageUri={user?.profileImage}
+                        fallbackText={user?.name || user?.username || 'U'}
+                        avatarLoading={isUploading}
+                        badgeTier={userTier}
+                        sections={nativeSettingsSections}
+                        onNativeEvent={({ nativeEvent }) => {
+                            void handleNativeSettingsEvent(nativeEvent);
+                        }}
+                    />
+                </Animated.View>
+
+                <Animated.View
+                    pointerEvents={isEditMenuOpen ? 'auto' : 'none'}
+                    style={[StyleSheet.absoluteFill, { zIndex: 5000 }, editBackdropStyle]}
+                >
+                    <TouchableOpacity
+                        activeOpacity={1}
+                        onPress={closeEditMenu}
+                        style={[StyleSheet.absoluteFill, { backgroundColor: 'rgba(0,0,0,0.35)' }]}
+                    />
+
+                    <Animated.View
+                        style={[
+                            {
+                                position: 'absolute',
+                                left: 16,
+                                right: 16,
+                                top: insets.top + 70,
+                            },
+                            editSheetStyle
+                        ]}
+                    >
+                        <View style={[styles.sectionContainer, { backgroundColor: colors.card, borderRadius: 26, overflow: 'hidden' }]}>
+                            <TouchableOpacity
+                                onPress={() => { closeEditMenu(); router.push('/profile'); }}
+                                activeOpacity={0.8}
+                                style={styles.settingRow}
+                            >
+                                <View style={styles.settingLabelWrap}>
+                                    <Text style={[styles.settingLabel, { color: colors.text }]} numberOfLines={1}>Edit Profile</Text>
+                                </View>
+                                <ChevronRight size={16} color={colors.textSecondary} style={{ opacity: 0.5 }} />
+                            </TouchableOpacity>
+                            <View style={[styles.divider, { backgroundColor: withAlpha(colors.text, 0.05) }]} />
+                            <TouchableOpacity
+                                onPress={async () => {
+                                    closeEditMenu();
+                                    if (user?.userId) await Clipboard.setStringAsync(user.userId);
+                                }}
+                                activeOpacity={0.8}
+                                style={styles.settingRow}
+                            >
+                                <View style={styles.settingLabelWrap}>
+                                    <Text style={[styles.settingLabel, { color: colors.text }]} numberOfLines={1}>Copy User ID</Text>
+                                </View>
+                            </TouchableOpacity>
+                            <View style={[styles.divider, { backgroundColor: withAlpha(colors.text, 0.05) }]} />
+                            <TouchableOpacity
+                                onPress={() => { closeEditMenu(); router.push('/settings/privacy'); }}
+                                activeOpacity={0.8}
+                                style={styles.settingRow}
+                            >
+                                <View style={styles.settingLabelWrap}>
+                                    <Text style={[styles.settingLabel, { color: colors.text }]} numberOfLines={1}>Privacy</Text>
+                                </View>
+                                <ChevronRight size={16} color={colors.textSecondary} style={{ opacity: 0.5 }} />
+                            </TouchableOpacity>
+                        </View>
+                    </Animated.View>
+                </Animated.View>
+
+                <Modal
+                    visible={isQrOpen}
+                    transparent
+                    animationType="none"
+                    statusBarTranslucent
+                    onRequestClose={closeQr}
+                >
+                    <View style={{ flex: 1, backgroundColor: '#000' }}>
+                        <View style={[StyleSheet.absoluteFill, { backgroundColor: colors.background }]}>
+                            <WallpaperComp theme={qrTheme} width={windowWidth} height={windowHeight} />
+                        </View>
+
+                        <Animated.View style={[StyleSheet.absoluteFill, qrSheetStyle]}>
+                            <View style={{ position: 'absolute', top: insets.top + 10, left: 16, zIndex: 20 }}>
+                                <SafeLiquidGlass
+                                    style={styles.glassBtnCircle}
+                                    blurIntensity={18}
+                                    tint={effectiveTheme === 'dark' ? 'dark' : 'light'}
+                                    onStartShouldSetResponder={() => true}
+                                    onResponderRelease={closeQr}
+                                >
+                                    <ArrowLeft size={22} color={colors.text} />
+                                </SafeLiquidGlass>
+                            </View>
+
+                            <View style={{ flex: 1, paddingTop: insets.top + 60, paddingHorizontal: 16, paddingBottom: insets.bottom + 200 }}>
+                                <View style={{ flex: 1, justifyContent: 'center' }}>
+                                    <View style={{ alignSelf: 'center', width: '100%', maxWidth: 420 }}>
+                                        <View style={{ alignItems: 'center' }}>
+                                            <View
+                                                style={{
+                                                    position: 'absolute',
+                                                    top: -34,
+                                                    width: 68,
+                                                    height: 68,
+                                                    borderRadius: 34,
+                                                    backgroundColor: '#fff',
+                                                    alignItems: 'center',
+                                                    justifyContent: 'center',
+                                                    zIndex: 10,
+                                                    shadowColor: '#000',
+                                                    shadowOpacity: 0.18,
+                                                    shadowRadius: 16,
+                                                    shadowOffset: { width: 0, height: 10 },
+                                                    elevation: 10,
+                                                }}
+                                            >
+                                                <View style={{ width: 60, height: 60, borderRadius: 30, overflow: 'hidden', backgroundColor: withAlpha(colors.text, 0.08), alignItems: 'center', justifyContent: 'center' }}>
+                                                    {!!user?.profileImage ? (
+                                                        <Image source={{ uri: user.profileImage }} style={{ width: '100%', height: '100%' }} />
+                                                    ) : (
+                                                        <Text style={{ fontSize: 22, fontWeight: '900', color: colors.text }}>
+                                                            {(user?.name?.[0] || user?.username?.[0] || 'V').toUpperCase()}
+                                                        </Text>
+                                                    )}
+                                                </View>
+                                            </View>
+
+                                            <View style={{ width: '100%', maxWidth: Math.min(380, windowWidth - 48) }}>
+                                                <LinearGradient
+                                                    colors={qrGradient}
+                                                    start={{ x: 0, y: 0 }}
+                                                    end={{ x: 1, y: 1 }}
+                                                    style={{ borderRadius: 36, padding: 2 }}
+                                                >
+                                                    <View
+                                                        style={{
+                                                            backgroundColor: '#fff',
+                                                            borderRadius: 34,
+                                                            overflow: 'hidden',
+                                                            width: '100%',
+                                                            aspectRatio: 1,
+                                                            alignItems: 'center',
+                                                            justifyContent: 'center',
+                                                            paddingTop: 22,
+                                                        }}
+                                                    >
+                                                        <QRCode
+                                                            value={`vibe:${user?.userId || ''}`}
+                                                            size={QR_SIZE}
+                                                            color={qrAccent}
+                                                            backgroundColor="#fff"
+                                                            logo={VIBE_QR_LOGO}
+                                                            logoSize={56}
+                                                            logoBorderRadius={14}
+                                                            logoBackgroundColor="#fff"
+                                                            getRef={(c) => { qrRef.current = c; }}
+                                                        />
+                                                    </View>
+                                                </LinearGradient>
+                                            </View>
+
+                                            <View style={{ marginTop: 14, width: 96, height: 10, borderRadius: 5, overflow: 'hidden' }}>
+                                                <LinearGradient colors={qrGradient} start={{ x: 0, y: 0 }} end={{ x: 1, y: 0 }} style={StyleSheet.absoluteFill} />
+                                            </View>
+                                        </View>
+                                    </View>
+                                </View>
+                            </View>
+
+                            <View style={{ position: 'absolute', left: 0, right: 0, bottom: 0 }}>
+                                <SafeLiquidGlass
+                                    style={{ borderTopLeftRadius: 28, borderTopRightRadius: 28, overflow: 'hidden', paddingTop: 14, paddingBottom: insets.bottom + 18 }}
+                                    blurIntensity={18}
+                                    tint={effectiveTheme === 'dark' ? 'dark' : 'light'}
+                                >
+                                    <View style={{ paddingHorizontal: 16 }}>
+                                        <Text style={{ color: colors.text, fontSize: 17, fontWeight: '900', textAlign: 'center' }}>QR Code</Text>
+                                    </View>
+
+                                    <View style={{ height: 12 }} />
+
+                                    <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ paddingHorizontal: 16, gap: 12 }}>
+                                        {PRESET_THEMES.slice(0, 8).map((t) => {
+                                            const isActive = (selectedPattern === t.id);
+                                            const thumbTheme = resolveThemeVariant(t, isDark);
+                                            const ThumbComp = WallpaperComponents[thumbTheme.patternType || 'doodles'] || TelegramDoodleWallpaper;
+                                            return (
+                                                <TouchableOpacity
+                                                    key={t.id}
+                                                    activeOpacity={0.85}
+                                                    onPress={() => setPatternTheme(t.id)}
+                                                    style={{ width: 74, height: 98, borderRadius: 18, overflow: 'hidden', borderWidth: 2, borderColor: isActive ? colors.primary : 'transparent' }}
+                                                >
+                                                    <ThumbComp theme={thumbTheme} width={74} height={98} />
+                                                </TouchableOpacity>
+                                            );
+                                        })}
+                                    </ScrollView>
+
+                                    <View style={{ height: 14 }} />
+
+                                    <View style={{ paddingHorizontal: 16 }}>
+                                        <TouchableOpacity
+                                            onPress={shareQr}
+                                            activeOpacity={0.9}
+                                            style={{ height: 52, borderRadius: 20, backgroundColor: colors.primary, alignItems: 'center', justifyContent: 'center' }}
+                                        >
+                                            <Text style={{ color: '#fff', fontWeight: '900', fontSize: 16 }}>Share QR Code</Text>
+                                        </TouchableOpacity>
+
+                                        <TouchableOpacity
+                                            onPress={() => { closeQr(); router.push('/qr-scan'); }}
+                                            activeOpacity={0.85}
+                                            style={{ height: 52, borderRadius: 20, marginTop: 10, alignItems: 'center', justifyContent: 'center' }}
+                                        >
+                                            <Text style={{ color: colors.primary, fontWeight: '900', fontSize: 16 }}>Scan QR Code</Text>
+                                        </TouchableOpacity>
+                                    </View>
+                                </SafeLiquidGlass>
+                            </View>
+                        </Animated.View>
+                    </View>
+                </Modal>
+
+                <ConnectionModal
+                    visible={showConnectionModal}
+                    onClose={() => setShowConnectionModal(false)}
+                    parentScale={parentScale}
+                />
+
+                <SubscriptionModal
+                    visible={showSubscriptionModal}
+                    onClose={() => setShowSubscriptionModal(false)}
+                    parentScale={parentScale}
+                    userId={user?.userId || ''}
+                />
+
+                <ReferralModal
+                    visible={showReferralModal}
+                    onClose={() => setShowReferralModal(false)}
+                    parentScale={parentScale}
+                    userId={user?.userId || ''}
+                />
+
+                <BusinessSettingsModal
+                    visible={showBusinessModal}
+                    onClose={() => setShowBusinessModal(false)}
+                    parentScale={parentScale}
+                    userId={user?.userId || ''}
+                />
+            </View >
+        );
+    }
+
     return (
         <View style={{ flex: 1, backgroundColor: '#000' }} >
             <Animated.View style={animatedParentStyle}>
@@ -480,20 +943,15 @@ export default function SettingsScreen() {
                                 />
                             </Animated.View>
                         ) : (
-                            useNativeGlassButtons ? (
-                                <SafeLiquidGlass
-                                    style={styles.glassBtnCircle}
-                                    blurIntensity={15}
-                                    tint={effectiveTheme === 'dark' ? 'dark' : 'light'}
-                                    nativeControls={qrHeaderButton}
-                                />
-                            ) : (
-                                <SafeLiquidGlass style={styles.glassBtnCircle} blurIntensity={15} tint={effectiveTheme === 'dark' ? 'dark' : 'light'}>
-                                    <TouchableOpacity onPress={openQr} style={styles.iconBtnCircle}>
-                                        <QrCode size={20} color={colors.text} />
-                                    </TouchableOpacity>
-                                </SafeLiquidGlass>
-                            )
+                            <SafeLiquidGlass
+                                style={styles.glassBtnCircle}
+                                blurIntensity={15}
+                                tint={effectiveTheme === 'dark' ? 'dark' : 'light'}
+                                onStartShouldSetResponder={() => true}
+                                onResponderRelease={openQr}
+                            >
+                                <QrCode size={20} color={colors.text} />
+                            </SafeLiquidGlass>
                         )}
                     </View>
 
@@ -507,22 +965,17 @@ export default function SettingsScreen() {
                     </View>
 
                     {/* Right: Edit Button or Spacer */}
-                    <View style={[styles.headerBtnWrapper, activeView === 'main' && useNativeGlassButtons ? styles.headerTextBtnWrapper : null]}>
+                    <View style={[styles.headerBtnWrapper, activeView === 'main' ? styles.headerTextBtnWrapper : null]}>
                         {activeView === 'main' ? (
-                            useNativeGlassButtons ? (
-                                <SafeLiquidGlass
-                                    style={styles.glassBtnText}
-                                    blurIntensity={15}
-                                    tint={effectiveTheme === 'dark' ? 'dark' : 'light'}
-                                    nativeControls={editHeaderButton}
-                                />
-                            ) : (
-                                <SafeLiquidGlass style={styles.glassBtnCircle} blurIntensity={15} tint={effectiveTheme === 'dark' ? 'dark' : 'light'}>
-                                    <TouchableOpacity onPress={openEditMenu} style={styles.iconBtnCircle}>
-                                        <Text style={{ color: colors.text, fontSize: 13, fontWeight: '600' }}>{t('settings.edit')}</Text>
-                                    </TouchableOpacity>
-                                </SafeLiquidGlass>
-                            )
+                            <SafeLiquidGlass
+                                style={styles.glassBtnText}
+                                blurIntensity={15}
+                                tint={effectiveTheme === 'dark' ? 'dark' : 'light'}
+                                onStartShouldSetResponder={() => true}
+                                onResponderRelease={openEditMenu}
+                            >
+                                <Text style={{ color: colors.text, fontSize: 13, fontWeight: '600' }}>{t('settings.edit')}</Text>
+                            </SafeLiquidGlass>
                         ) : (
                             <View style={{ width: 44 }} />
                         )}
@@ -571,15 +1024,15 @@ export default function SettingsScreen() {
                                         }}
                                     >
                                         <Animated.View style={penButtonStyle}>
-                                            <TouchableOpacity onPress={pickImage}>
-                                                <SafeLiquidGlass
-                                                    style={{ padding: 8, borderRadius: 20 }}
-                                                    blurIntensity={15}
-                                                    tint={effectiveTheme === 'dark' ? 'dark' : 'light'}
-                                                >
-                                                    <Edit2 size={16} color={colors.text} />
-                                                </SafeLiquidGlass>
-                                            </TouchableOpacity>
+                                            <SafeLiquidGlass
+                                                style={{ padding: 8, borderRadius: 20 }}
+                                                blurIntensity={15}
+                                                tint={effectiveTheme === 'dark' ? 'dark' : 'light'}
+                                                onStartShouldSetResponder={() => true}
+                                                onResponderRelease={pickImage}
+                                            >
+                                                <Edit2 size={16} color={colors.text} />
+                                            </SafeLiquidGlass>
                                         </Animated.View>
                                     </View>
                                 </>
@@ -626,15 +1079,15 @@ export default function SettingsScreen() {
                                         },
                                         penButtonStyle
                                     ]}>
-                                        <TouchableOpacity onPress={pickImage}>
-                                            <SafeLiquidGlass
-                                                style={{ padding: 8, borderRadius: 20 }}
-                                                blurIntensity={15}
-                                                tint={effectiveTheme === 'dark' ? 'dark' : 'light'}
-                                            >
-                                                <Edit2 size={16} color={colors.text} />
-                                            </SafeLiquidGlass>
-                                        </TouchableOpacity>
+                                        <SafeLiquidGlass
+                                            style={{ padding: 8, borderRadius: 20 }}
+                                            blurIntensity={15}
+                                            tint={effectiveTheme === 'dark' ? 'dark' : 'light'}
+                                            onStartShouldSetResponder={() => true}
+                                            onResponderRelease={pickImage}
+                                        >
+                                            <Edit2 size={16} color={colors.text} />
+                                        </SafeLiquidGlass>
                                     </Animated.View>
                                 </Animated.View>
                             )}
@@ -727,25 +1180,7 @@ export default function SettingsScreen() {
                                         label="Push Notifications"
                                         type="switch"
                                         value={notificationsEnabled}
-                                        onPress={async (val) => {
-                                            const enabling = val !== false;
-                                            if (enabling) {
-                                                // Check OS-level permission first
-                                                const { status } = await Notifications.getPermissionsAsync();
-                                                if (status === 'denied') {
-                                                    Alert.alert(
-                                                        'Notifications Disabled',
-                                                        'Push notifications are blocked at the system level. Please enable them in your device Settings.',
-                                                        [
-                                                            { text: 'Cancel', style: 'cancel' },
-                                                            { text: 'Open Settings', onPress: () => Linking.openSettings() },
-                                                        ]
-                                                    );
-                                                    return;
-                                                }
-                                            }
-                                            await setNotificationsEnabled(enabling);
-                                        }}
+                                        onPress={handleNotificationsToggle}
                                         color="#ef4444"
                                         divider={false}
                                     />
@@ -926,10 +1361,14 @@ export default function SettingsScreen() {
                     <Animated.View style={[StyleSheet.absoluteFill, qrSheetStyle]}>
                         {/* Top-left close */}
                         <View style={{ position: 'absolute', top: insets.top + 10, left: 16, zIndex: 20 }}>
-                            <SafeLiquidGlass style={styles.glassBtnCircle} blurIntensity={18} tint={effectiveTheme === 'dark' ? 'dark' : 'light'}>
-                                <TouchableOpacity onPress={closeQr} style={styles.iconBtnCircle} activeOpacity={0.85}>
-                                    <ArrowLeft size={22} color={colors.text} />
-                                </TouchableOpacity>
+                            <SafeLiquidGlass
+                                style={styles.glassBtnCircle}
+                                blurIntensity={18}
+                                tint={effectiveTheme === 'dark' ? 'dark' : 'light'}
+                                onStartShouldSetResponder={() => true}
+                                onResponderRelease={closeQr}
+                            >
+                                <ArrowLeft size={22} color={colors.text} />
                             </SafeLiquidGlass>
                         </View>
 

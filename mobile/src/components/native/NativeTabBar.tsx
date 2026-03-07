@@ -133,10 +133,10 @@ export default function NativeTabBar({
     if (shouldUseNativeTabs) {
         const NativeTabsComponent = NativeChatTabsView as React.ComponentType<NativeChatTabsViewProps>;
         const normalizedIndex = Math.max(0, Math.min(currentIndex, tabs.length - 1));
-        const nativeActiveTintColor = processColor(activeTintColor) ?? null;
-        const nativeInactiveTintColor = processColor(inactiveTintColor) ?? null;
+        const nativeActiveTintColor = React.useMemo(() => (processColor(activeTintColor) ?? null) as number | null, [activeTintColor]);
+        const nativeInactiveTintColor = React.useMemo(() => (processColor(inactiveTintColor) ?? null) as number | null, [inactiveTintColor]);
 
-        const nativeTabs = tabs.map((tab) => {
+        const nativeTabs = React.useMemo(() => tabs.map((tab) => {
             const source = tab.iconSource;
             let resolvedIconUri: string | undefined;
             if (source && typeof source === 'object' && 'uri' in source && typeof (source as any).uri === 'string') {
@@ -153,9 +153,9 @@ export default function NativeTabBar({
                 badge: tab.badge,
                 isVibe: isVibeTab(tab),
             };
-        });
+        }), [tabs]);
 
-        const handleNativeIndexChange = (event: NativeSyntheticEvent<NativeTabPressPayload>) => {
+        const handleNativeIndexChange = React.useCallback((event: NativeSyntheticEvent<NativeTabPressPayload>) => {
             const payload: any = event?.nativeEvent ?? event;
             const rawIndex = payload?.index ?? payload?.payload?.index;
             const parsedIndex = typeof rawIndex === 'number' ? rawIndex : Number(rawIndex);
@@ -169,7 +169,7 @@ export default function NativeTabBar({
                 return;
             }
             onIndexChange(next);
-        };
+        }, [tabs, handleSeparateVibePress, onIndexChange]);
 
         return (
             <View pointerEvents="box-none" style={styles.nativeTabsDock}>
@@ -239,18 +239,25 @@ function FallbackTabBar({
     const vibeTab = vibeIndex >= 0 ? tabs[vibeIndex] : undefined;
     const mainTabs = vibeIndex >= 0 ? tabs.filter((_, index) => index !== vibeIndex) : tabs;
     const mainTabCount = mainTabs.length;
+    const isVibeFocused = vibeIndex >= 0 && currentIndex === vibeIndex;
     const shiftedCurrentIndex = vibeIndex >= 0 && currentIndex > vibeIndex
         ? currentIndex - 1
         : currentIndex;
-    const hasFocusedMainTab = shiftedCurrentIndex >= 0 && shiftedCurrentIndex < mainTabCount;
+    const hasFocusedMainTab = !isVibeFocused && shiftedCurrentIndex >= 0 && shiftedCurrentIndex < mainTabCount;
     const focusedMainIndex = hasFocusedMainTab ? shiftedCurrentIndex : 0;
 
     const indicatorStyle = useAnimatedStyle(() => {
         if (mainTabCount <= 0) {
-            return { transform: [{ translateX: 0 }] };
+            return { opacity: 0, transform: [{ translateX: 0 }] };
+        }
+        if (isVibeFocused) {
+            return {
+                opacity: 0,
+                transform: [{ translateX: focusedMainIndex * tabWidth }],
+            };
         }
         if (!translateX) {
-            return { transform: [{ translateX: focusedMainIndex * tabWidth }] };
+            return { opacity: 1, transform: [{ translateX: focusedMainIndex * tabWidth }] };
         }
 
         const inputRange = Array.from({ length: mainTabCount }, (_, i) => i * screenWidth);
@@ -264,9 +271,10 @@ function FallbackTabBar({
         );
 
         return {
+            opacity: 1,
             transform: [{ translateX: index * tabWidth }],
         };
-    }, [focusedMainIndex, mainTabCount, screenWidth, tabWidth, translateX]);
+    }, [focusedMainIndex, isVibeFocused, mainTabCount, screenWidth, tabWidth, translateX]);
 
     const handleVibePress = () => {
         if (onVibePress) {
@@ -560,86 +568,110 @@ function FallbackTabBar({
                     style={fallbackStyles.vibeButtonContainer}
                     onPress={handleVibePress}
                 >
-                    {isAndroid ? (
-                        <View
-                            style={[
-                                fallbackStyles.vibeButtonPill,
-                                fallbackStyles.androidVibePill,
-                                {
-                                    backgroundColor: isDark ? 'rgba(20,24,32,0.92)' : 'rgba(248,251,255,0.95)',
-                                    borderColor: isDark ? 'rgba(255,255,255,0.12)' : 'rgba(22,30,46,0.08)',
-                                    borderWidth: 1,
-                                },
-                            ]}
-                        >
-                            <LinearGradient
-                                pointerEvents="none"
-                                colors={
-                                    isDark
-                                        ? ['rgba(255,255,255,0.07)', 'rgba(255,255,255,0.01)', 'rgba(0,0,0,0.10)']
-                                        : ['rgba(255,255,255,0.96)', 'rgba(255,255,255,0.7)', 'rgba(226,238,255,0.42)']
-                                }
-                                start={{ x: 0.1, y: 0 }}
-                                end={{ x: 0.9, y: 1 }}
-                                style={[StyleSheet.absoluteFillObject, fallbackStyles.androidSurfaceGradient]}
-                            />
-                            {vibeTab.renderIcon
-                                ? vibeTab.renderIcon({
-                                    focused: false,
-                                    color: isDark ? '#f6f8ff' : '#121826',
-                                    size: 24,
-                                })
-                                : (
-                                    <Text style={[fallbackStyles.vibeText, { color: isDark ? '#fff' : '#000' }]}>
-                                        {vibeTab.title || 'Vibe'}
-                                    </Text>
-                                )}
-                        </View>
-                    ) : (
-                        <SafeLiquidGlass
-                            style={[
-                                fallbackStyles.vibeButtonPill,
-                                {
-                                    backgroundColor: isDark ? 'rgba(18,20,28,0.6)' : 'rgba(244,248,255,0.66)',
-                                    borderColor: isDark ? 'rgba(255,255,255,0.13)' : 'rgba(10,18,32,0.11)',
-                                    borderWidth: 1,
-                                },
-                            ]}
-                            blurIntensity={18}
-                            tint={isDark ? 'dark' : 'light'}
-                        >
-                            {vibeTab.renderIcon
-                                ? vibeTab.renderIcon({
-                                    focused: false,
-                                    color: isDark ? '#fff' : '#000',
-                                    size: 24,
-                                })
-                                : (
-                                    <Text style={[fallbackStyles.vibeText, { color: isDark ? '#fff' : '#000' }]}>
-                                        {vibeTab.title || 'Vibe'}
-                                    </Text>
-                                )}
-                        </SafeLiquidGlass>
-                    )}
+                    {(() => {
+                        const vibeFocused = isVibeFocused;
+                        const vibeColor = vibeFocused
+                            ? (activeTintColor || (isDark ? '#fff' : '#000'))
+                            : (inactiveTintColor || (isDark ? '#fff' : '#000'));
+
+                        if (isAndroid) {
+                            return (
+                                <View
+                                    style={[
+                                        fallbackStyles.vibeButtonPill,
+                                        fallbackStyles.androidVibePill,
+                                        {
+                                            backgroundColor: vibeFocused
+                                                ? (isDark ? 'rgba(255,255,255,0.14)' : 'rgba(255,255,255,0.98)')
+                                                : (isDark ? 'rgba(20,24,32,0.92)' : 'rgba(248,251,255,0.95)'),
+                                            borderColor: vibeFocused
+                                                ? (isDark ? 'rgba(255,255,255,0.18)' : 'rgba(22,30,46,0.12)')
+                                                : (isDark ? 'rgba(255,255,255,0.12)' : 'rgba(22,30,46,0.08)'),
+                                            borderWidth: 1,
+                                            transform: [{ scale: vibeFocused ? 1.02 : 1 }],
+                                        },
+                                    ]}
+                                >
+                                    <LinearGradient
+                                        pointerEvents="none"
+                                        colors={
+                                            isDark
+                                                ? (vibeFocused
+                                                    ? ['rgba(255,255,255,0.12)', 'rgba(255,255,255,0.03)', 'rgba(0,0,0,0.12)']
+                                                    : ['rgba(255,255,255,0.07)', 'rgba(255,255,255,0.01)', 'rgba(0,0,0,0.10)'])
+                                                : (vibeFocused
+                                                    ? ['rgba(255,255,255,1)', 'rgba(255,255,255,0.82)', 'rgba(226,238,255,0.5)']
+                                                    : ['rgba(255,255,255,0.96)', 'rgba(255,255,255,0.7)', 'rgba(226,238,255,0.42)'])
+                                        }
+                                        start={{ x: 0.1, y: 0 }}
+                                        end={{ x: 0.9, y: 1 }}
+                                        style={[StyleSheet.absoluteFillObject, fallbackStyles.androidSurfaceGradient]}
+                                    />
+                                    {vibeTab.renderIcon
+                                        ? vibeTab.renderIcon({
+                                            focused: vibeFocused,
+                                            color: vibeColor,
+                                            size: 24,
+                                        })
+                                        : (
+                                            <Text style={[fallbackStyles.vibeText, { color: vibeColor }]}>
+                                                {vibeTab.title || 'Vibe'}
+                                            </Text>
+                                        )}
+                                </View>
+                            );
+                        }
+
+                        return (
+                            <SafeLiquidGlass
+                                style={[
+                                    fallbackStyles.vibeButtonPill,
+                                    {
+                                        backgroundColor: vibeFocused
+                                            ? (isDark ? 'rgba(255,255,255,0.12)' : 'rgba(255,255,255,0.98)')
+                                            : (isDark ? 'rgba(18,20,28,0.6)' : 'rgba(244,248,255,0.66)'),
+                                        borderColor: vibeFocused
+                                            ? (isDark ? 'rgba(255,255,255,0.18)' : 'rgba(10,18,32,0.12)')
+                                            : (isDark ? 'rgba(255,255,255,0.13)' : 'rgba(10,18,32,0.11)'),
+                                        borderWidth: 1,
+                                        transform: [{ scale: vibeFocused ? 1.02 : 1 }],
+                                    },
+                                ]}
+                                blurIntensity={18}
+                                tint={isDark ? 'dark' : 'light'}
+                            >
+                                {vibeTab.renderIcon
+                                    ? vibeTab.renderIcon({
+                                        focused: vibeFocused,
+                                        color: vibeColor,
+                                        size: 24,
+                                    })
+                                    : (
+                                        <Text style={[fallbackStyles.vibeText, { color: vibeColor }]}>
+                                            {vibeTab.title || 'Vibe'}
+                                        </Text>
+                                    )}
+                            </SafeLiquidGlass>
+                        );
+                    })()}
                 </TouchableOpacity>
             )}
         </View>
     );
 }
-
 const styles = StyleSheet.create({
     nativeTabsDock: {
         width: '100%',
         paddingBottom: Platform.OS === 'ios' ? 10 : 8,
         paddingTop: 2,
-        paddingHorizontal: 14,
+        paddingHorizontal: 10,
         alignItems: 'stretch',
         justifyContent: 'flex-end',
         backgroundColor: 'transparent',
     },
     nativeTabsBar: {
         width: '100%',
-        height: 96,
+        height: 64,
         backgroundColor: 'transparent',
     },
 });

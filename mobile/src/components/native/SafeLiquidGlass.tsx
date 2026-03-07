@@ -1,57 +1,72 @@
+/**
+ * Safe Liquid Glass Wrapper - Advanced Clean Implementation
+ *
+ * Optimized for Samsung and Android devices to achieve iOS-like liquid glass
+ * - No extra borders or layered colors that cause artifacts
+ * - Uses expo-blur with dimezisBlurView for real blur on Android
+ * - Preserves container styles (flex, padding, etc.) without interference
+ * - Clean, minimal approach matching One UI / iOS liquid glass aesthetic
+ */
+
 import React from 'react'
-import {
-  Platform,
-  processColor,
-  StyleSheet,
-  View,
-  useColorScheme,
-  type ColorValue,
-  type ViewProps,
-} from 'react-native'
-import Constants from 'expo-constants'
+import { Platform, StyleSheet, useColorScheme } from 'react-native'
+import type { ViewStyle } from 'react-native'
 import { BlurView } from 'expo-blur'
-import { GlassView as ExpoGlassView, isGlassEffectAPIAvailable } from 'expo-glass-effect'
-import { requireNativeViewManager } from 'expo-modules-core'
 
-interface NativeLiquidGlassProps extends ViewProps {
-  blurIntensity?: number
-  blurReductionFactor?: number
-  tint?: 'default' | 'light' | 'dark' | 'extraLight' | 'regular' | 'prominent'
-  interactive?: boolean
-  effect?: 'clear' | 'regular'
-  tintColor?: ColorValue
-  cornerRadius?: number
-  pressFeedbackEnabled?: boolean
-}
-
-let NativeLiquidGlassView: React.ComponentType<NativeLiquidGlassProps> | null = null
-let nativeLiquidGlassAvailable = false
+// Optional: Try to import native liquid glass for iOS 26+
+let LiquidGlassView: React.ComponentType<any> | null = null
+let liquidGlassAvailable = false
 
 if (Platform.OS === 'ios') {
   try {
-    const isExpoGo = Constants.appOwnership === 'expo'
-    if (!isExpoGo) {
-      NativeLiquidGlassView = requireNativeViewManager<NativeLiquidGlassProps>('LiquidGlass')
-      nativeLiquidGlassAvailable = !!NativeLiquidGlassView
+    const liquidGlass = require('@callstack/liquid-glass')
+    if (liquidGlass?.LiquidGlassView) {
+      LiquidGlassView = liquidGlass.LiquidGlassView
+      liquidGlassAvailable = true
     }
   } catch {
-    nativeLiquidGlassAvailable = false
+    liquidGlassAvailable = false
   }
 }
 
-interface SafeLiquidGlassProps extends ViewProps {
+interface SafeLiquidGlassProps {
   children?: React.ReactNode
   interactive?: boolean
   effect?: 'clear' | 'regular'
-  tintColor?: ColorValue
+  tintColor?: string
   colorScheme?: 'light' | 'dark' | 'system'
   style?: any
+  /**
+   * Blur intensity for Android (1-100)
+   * Lower values = more subtle/clean glass effect
+   * Recommended: 8-15 for liquid glass look
+   * @default 10
+   */
   blurIntensity?: number
+  /**
+   * Blur reduction factor for Android
+   * Higher values = less blur
+   * @default 4
+   */
   blurReductionFactor?: number
+  /**
+   * Tint style for the blur
+   * For cleanest glass on Samsung, use 'default' or match your theme
+   */
   tint?: 'default' | 'light' | 'dark' | 'extraLight' | 'regular' | 'prominent'
-  pressFeedbackEnabled?: boolean
+  [key: string]: any // Allow other View props
 }
 
+/**
+ * SafeLiquidGlass - Clean liquid glass effect for all platforms
+ *
+ * Key principles for Samsung/Android:
+ * - Uses expo-blur with experimentalBlurMethod="dimezisBlurView"
+ * - Low intensity (8-15) for subtle, clean glass
+ * - No additional borders, shadows, or color overlays
+ * - BlurView positioned absolutely so it doesn't affect layout
+ * - Children rendered on top naturally
+ */
 export default function SafeLiquidGlass({
   children,
   style,
@@ -62,67 +77,59 @@ export default function SafeLiquidGlass({
   blurIntensity = 10,
   blurReductionFactor = 4,
   tint,
-  pressFeedbackEnabled,
   ...props
 }: SafeLiquidGlassProps) {
   const systemColorScheme = useColorScheme()
   const effectiveColorScheme =
     colorScheme === 'system' || !colorScheme ? systemColorScheme : colorScheme
   const isDark = effectiveColorScheme === 'dark'
-  const blurTint = tint || (isDark ? 'dark' : 'light')
-  const isExpoGo = Constants.appOwnership === 'expo'
   const flattenedStyle = StyleSheet.flatten(style) || {}
+  const styleBackgroundColor = (flattenedStyle as Record<string, any>).backgroundColor
 
-  if (Platform.OS === 'ios' && nativeLiquidGlassAvailable && NativeLiquidGlassView) {
-    const cornerRadius =
-      typeof flattenedStyle.borderRadius === 'number' ? flattenedStyle.borderRadius : undefined
-    const nativeTintColor =
-      Platform.OS === 'android' && tintColor != null ? processColor(tintColor) : tintColor
+  // Determine blur tint based on theme
+  const blurTint = tint || (isDark ? 'dark' : 'light')
 
-    return (
-      <NativeLiquidGlassView
-        style={style}
-        blurIntensity={blurIntensity}
-        blurReductionFactor={blurReductionFactor}
-        tint={tint}
-        interactive={interactive}
-        effect={effect}
-        tintColor={nativeTintColor}
-        cornerRadius={cornerRadius}
-        pressFeedbackEnabled={pressFeedbackEnabled}
-        {...props}
-      >
-        {children}
-      </NativeLiquidGlassView>
-    )
-  }
+  // ═══════════════════════════════════════════════════════════════
+  // iOS: Native Liquid Glass (iOS 26+)
+  // ═══════════════════════════════════════════════════════════════
+  if (
+    Platform.OS === 'ios' &&
+    liquidGlassAvailable &&
+    LiquidGlassView
+  ) {
+    try {
+      const styleWithoutPaint = { ...(flattenedStyle as Record<string, any>) }
+      delete styleWithoutPaint.backgroundColor
+      delete styleWithoutPaint.borderColor
+      delete styleWithoutPaint.borderWidth
+      delete styleWithoutPaint.overflow
 
-  if (Platform.OS === 'ios') {
-    const canUseExpoGlass = isExpoGo && isGlassEffectAPIAvailable()
-    const expoGlassTintColor = typeof tintColor === 'string' ? tintColor : undefined
-    const expoGlassColorScheme =
-      effectiveColorScheme === 'dark' ? 'dark' : effectiveColorScheme === 'light' ? 'light' : 'auto'
-
-    if (canUseExpoGlass) {
       return (
-        <ExpoGlassView
-          style={[style, { overflow: 'hidden' }]}
-          glassEffectStyle={effect}
-          tintColor={expoGlassTintColor}
-          isInteractive={interactive}
-          colorScheme={expoGlassColorScheme}
+        <LiquidGlassView
+          style={styleWithoutPaint}
+          interactive={interactive}
+          effect={effect}
+          tintColor={tintColor ?? styleBackgroundColor}
+          colorScheme={colorScheme}
           {...props}
         >
           {children}
-        </ExpoGlassView>
+        </LiquidGlassView>
       )
+    } catch {
+      console.warn('[SafeLiquidGlass] Native liquid glass failed, using fallback')
     }
+  }
 
+  // ═══════════════════════════════════════════════════════════════
+  // iOS Final Fallback: expo-blur
+  // ═══════════════════════════════════════════════════════════════
+  if (Platform.OS === 'ios') {
     return (
       <BlurView
         intensity={blurIntensity * 2}
         tint={blurTint}
-        style={[style, { overflow: 'hidden' }]}
+        style={style}
         shouldRasterizeIOS={true}
         {...props}
       >
@@ -131,82 +138,81 @@ export default function SafeLiquidGlass({
     )
   }
 
-  const styleBg = flattenedStyle.backgroundColor
-  const hasExplicitOpaqueBg = typeof styleBg === 'string' && styleBg.trim().toLowerCase() !== 'transparent'
-  const glassBg =
-    tint === 'light' || !isDark ? 'rgba(255, 255, 255, 0.92)' : 'rgba(20, 20, 20, 0.9)'
-  const glassBorder =
-    tint === 'light' || !isDark ? 'rgba(255, 255, 255, 0.38)' : 'rgba(255, 255, 255, 0.12)'
-  const overlayBg = hasExplicitOpaqueBg ? styleBg : glassBg
-  const styleBorderColor = (flattenedStyle as Record<string, any>).borderColor
-  const styleBorderWidth = (flattenedStyle as Record<string, any>).borderWidth
-  const styleWithoutPaint = { ...(flattenedStyle as Record<string, any>) }
-  delete styleWithoutPaint.backgroundColor
-  delete styleWithoutPaint.borderColor
-  delete styleWithoutPaint.borderWidth
-  // Android blur is visually stronger than iOS for the same intensity value.
-  // Keep it softer to avoid color shifts in the composer and floating controls.
-  const androidBlurIntensity = Math.max(10, Math.min(48, Math.round(blurIntensity * 1.15 + 4)))
+  // ═══════════════════════════════════════════════════════════════
+  // Android: Clean Liquid Glass using expo-blur
+  // ═══════════════════════════════════════════════════════════════
+  //
+  // IMPORTANT: expo-blur's BlurView on Android blurs the content
+  // BEHIND the component (what's underneath in z-order), not its children.
+  // Children rendered inside BlurView appear on top of the blur.
+  //
+  // If children are getting blurred, it means they're somehow being
+  // rendered behind the blur layer. The fix is to ensure children
+  // are direct children of BlurView so they render ON TOP of the blur effect.
 
+  // IMPORTANT: renderToHardwareTextureAndroid and removeClippedSubviews prevent
+  // the blur from disappearing when parent animated views change (e.g., keyboard animations).
   return (
-    <View
-      style={[
-        {
-          backgroundColor: 'transparent',
-          borderColor: styleBorderColor ?? glassBorder,
-          borderWidth: typeof styleBorderWidth === 'number' ? styleBorderWidth : 1,
-          overflow: 'hidden',
-        },
-        styleWithoutPaint,
-      ]}
+    <BlurView
+      intensity={blurIntensity}
+      tint={blurTint}
+      experimentalBlurMethod="dimezisBlurView"
+      blurReductionFactor={blurReductionFactor}
+      style={[style, { overflow: 'hidden' }]}
+      renderToHardwareTextureAndroid={true}
+      removeClippedSubviews={false}
       {...props}
     >
-      <BlurView
-        intensity={androidBlurIntensity}
-        tint={blurTint}
-        experimentalBlurMethod="dimezisBlurView"
-        style={StyleSheet.absoluteFill}
-        pointerEvents="none"
-      />
-      <View
-        pointerEvents="none"
-        style={[StyleSheet.absoluteFill, { backgroundColor: overlayBg as any }]}
-      />
       {children}
-    </View>
+    </BlurView>
   )
 }
 
+/**
+ * Check if native liquid glass is available (iOS 26+)
+ */
 export function isNativeLiquidGlassAvailable(): boolean {
-  return Platform.OS === 'ios' && nativeLiquidGlassAvailable
+  return Platform.OS === 'ios' && liquidGlassAvailable
 }
 
+/**
+ * Check if real blur is available on current platform
+ */
 export function isRealBlurAvailable(): boolean {
   return Platform.OS === 'ios' || Platform.OS === 'android'
 }
 
+/**
+ * Preset configurations for common use cases
+ */
 export const LiquidGlassPresets = {
+  /** Very subtle glass - almost transparent with minimal blur */
   subtle: {
     blurIntensity: 5,
     blurReductionFactor: 6,
   },
+  /** Default clean glass - balanced blur and transparency */
   default: {
     blurIntensity: 10,
     blurReductionFactor: 4,
   },
+  /** More visible glass - slightly more blur */
   medium: {
     blurIntensity: 15,
     blurReductionFactor: 4,
   },
+  /** Frosted glass - more opaque, stronger blur */
   frosted: {
     blurIntensity: 25,
     blurReductionFactor: 3,
   },
+  /** Samsung One UI 8 style - clean with thin appearance */
   samsungOneUI: {
     blurIntensity: 8,
     blurReductionFactor: 5,
     tint: 'default' as const,
   },
+  /** iOS-like liquid glass approximation */
   iOSStyle: {
     blurIntensity: 12,
     blurReductionFactor: 4,

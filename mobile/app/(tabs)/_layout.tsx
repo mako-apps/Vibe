@@ -28,6 +28,7 @@ import SettingsScreen from './settings'
 import ContactsScreen from './contacts'
 import CallsScreen from './calls'
 import { StoryCamera } from '../story-camera'
+import { AgentChatScreen } from '../../src/components/agent'
 import { BlurView } from 'expo-blur'
 import { Image } from 'react-native'
 import MaskedView from '@react-native-masked-view/masked-view'
@@ -47,6 +48,7 @@ const PAGES = {
     calls: 1,
     home: 2,
     settings: 3,
+    vibe: 4,
 } as const;
 
 type PageName = keyof typeof PAGES;
@@ -114,6 +116,93 @@ const VibeButton = ({ onPress, isDark }: { onPress: () => void, isDark: boolean 
     );
 };
 
+const PAGE_NAMES: PageName[] = ['contacts', 'calls', 'home', 'settings', 'vibe'];
+
+const NativeTabsMemo = React.memo(function NativeTabsMemo({
+    currentTab,
+    handleTabPress,
+    totalUnread,
+    settingsIconSource,
+    activeTintColor,
+    inactiveTintColor,
+    isDark,
+    safeRouterPush,
+    bottomBarFadeStyle,
+    t,
+}: {
+    currentTab: PageName;
+    handleTabPress: (page: PageName) => void;
+    totalUnread: number;
+    settingsIconSource: any;
+    activeTintColor: string;
+    inactiveTintColor: string;
+    isDark: boolean;
+    safeRouterPush: (path: string, source: string) => void;
+    bottomBarFadeStyle: any;
+    t: (key: string) => string;
+}) {
+    const nativeOnIndexChange = useCallback((index: number) => {
+        const page = PAGE_NAMES[index];
+        if (!page) return;
+        handleTabPress(page);
+    }, [handleTabPress]);
+
+    const nativeOnVibePress = useCallback(() => {
+        handleTabPress('vibe');
+    }, [handleTabPress]);
+
+    const nativeTabs = useMemo(() => [
+        {
+            key: 'contacts',
+            title: t('tabs.contacts'),
+            sfSymbol: 'person.2.fill',
+            unfocusedSfSymbol: 'person.2',
+        },
+        {
+            key: 'calls',
+            title: t('tabs.calls'),
+            sfSymbol: 'phone.fill',
+            unfocusedSfSymbol: 'phone',
+        },
+        {
+            key: 'home',
+            title: t('tabs.chats'),
+            sfSymbol: 'bubble.left.and.bubble.right.fill',
+            unfocusedSfSymbol: 'bubble.left.and.bubble.right',
+            badge: totalUnread > 0 ? (totalUnread > 99 ? '99+' : String(totalUnread)) : undefined,
+        },
+        {
+            key: 'settings',
+            title: t('tabs.settings'),
+            sfSymbol: 'person.crop.circle.fill',
+            unfocusedSfSymbol: 'person.crop.circle',
+            iconSource: settingsIconSource,
+            unfocusedIconSource: settingsIconSource,
+        },
+        {
+            key: 'vibe',
+            title: 'Vibe',
+            iconSource: require('../../assets/logos/logotransparent.png'),
+            unfocusedIconSource: require('../../assets/logos/logotransparent.png'),
+            preventsDefault: true,
+        },
+    ], [t, totalUnread, settingsIconSource]);
+
+    return (
+        <AnimatedView style={[styles.nativeBottomBarWrapper, bottomBarFadeStyle, { zIndex: 10 }]}>
+            <NativeTabBar
+                currentIndex={PAGES[currentTab]}
+                onIndexChange={nativeOnIndexChange}
+                tabs={nativeTabs}
+                activeTintColor={activeTintColor}
+                inactiveTintColor={inactiveTintColor}
+                isDark={isDark}
+                onVibePress={nativeOnVibePress}
+            />
+        </AnimatedView>
+    );
+});
+
 export default function TabLayout() {
     const { colors, effectiveTheme } = useThemeStore()
     const { user } = useAuthStore()
@@ -155,6 +244,7 @@ export default function TabLayout() {
         calls: false,
         home: true,  // initial tab
         settings: false,
+        vibe: false,
     })
 
     // Story camera reveal (behind tabs)
@@ -266,6 +356,29 @@ export default function TabLayout() {
         return Math.max(50, Math.min(70, Math.floor(available / FALLBACK_TAB_COUNT)))
     }, [])
 
+    const animatedPageStyles = {
+        contacts: useAnimatedStyle(() => ({
+            opacity: withTiming(pageIndex.value === PAGES.contacts ? 1 : 0, { duration: 250, easing: Easing.out(Easing.cubic) }),
+            zIndex: pageIndex.value === PAGES.contacts ? 1 : 0,
+        })),
+        calls: useAnimatedStyle(() => ({
+            opacity: withTiming(pageIndex.value === PAGES.calls ? 1 : 0, { duration: 250, easing: Easing.out(Easing.cubic) }),
+            zIndex: pageIndex.value === PAGES.calls ? 1 : 0,
+        })),
+        home: useAnimatedStyle(() => ({
+            opacity: withTiming(pageIndex.value === PAGES.home ? 1 : 0, { duration: 250, easing: Easing.out(Easing.cubic) }),
+            zIndex: pageIndex.value === PAGES.home ? 1 : 0,
+        })),
+        settings: useAnimatedStyle(() => ({
+            opacity: withTiming(pageIndex.value === PAGES.settings ? 1 : 0, { duration: 250, easing: Easing.out(Easing.cubic) }),
+            zIndex: pageIndex.value === PAGES.settings ? 1 : 0,
+        })),
+        vibe: useAnimatedStyle(() => ({
+            opacity: withTiming(pageIndex.value === PAGES.vibe ? 1 : 0, { duration: 250, easing: Easing.out(Easing.cubic) }),
+            zIndex: pageIndex.value === PAGES.vibe ? 1 : 0,
+        })),
+    }
+
     // ────────────────────────────────────────────────────────────────────────
     // MAIN LAYOUT (Supports both Native Tabs and Fallback Tabs)
     // ────────────────────────────────────────────────────────────────────────
@@ -293,89 +406,65 @@ export default function TabLayout() {
             >
                 {/* Pages — lazy mounted, display:none when inactive */}
                 {mountedPages.contacts && (
-                    <View style={[StyleSheet.absoluteFill, currentTab !== 'contacts' && { display: 'none' }]}>
+                    <AnimatedView
+                        pointerEvents={currentTab === 'contacts' ? 'auto' : 'none'}
+                        style={[StyleSheet.absoluteFill, animatedPageStyles.contacts]}
+                    >
                         <ContactsScreen />
-                    </View>
+                    </AnimatedView>
                 )}
                 {mountedPages.calls && (
-                    <View style={[StyleSheet.absoluteFill, currentTab !== 'calls' && { display: 'none' }]}>
+                    <AnimatedView
+                        pointerEvents={currentTab === 'calls' ? 'auto' : 'none'}
+                        style={[StyleSheet.absoluteFill, animatedPageStyles.calls]}
+                    >
                         <CallsScreen />
-                    </View>
+                    </AnimatedView>
                 )}
                 {mountedPages.home && (
-                    <View style={[StyleSheet.absoluteFill, currentTab !== 'home' && { display: 'none' }]}>
+                    <AnimatedView
+                        pointerEvents={currentTab === 'home' ? 'auto' : 'none'}
+                        style={[StyleSheet.absoluteFill, animatedPageStyles.home]}
+                    >
                         <HomeScreen
                             onChatSelect={(id) => setActiveChat(id)}
                             onOpenStoryCamera={openStoryCamera}
                         />
-                    </View>
+                    </AnimatedView>
                 )}
                 {mountedPages.settings && (
-                    <View style={[StyleSheet.absoluteFill, currentTab !== 'settings' && { display: 'none' }]}>
+                    <AnimatedView
+                        pointerEvents={currentTab === 'settings' ? 'auto' : 'none'}
+                        style={[StyleSheet.absoluteFill, animatedPageStyles.settings]}
+                    >
                         <SettingsScreen />
-                    </View>
+                    </AnimatedView>
+                )}
+                {mountedPages.vibe && (
+                    <AnimatedView
+                        pointerEvents={currentTab === 'vibe' ? 'auto' : 'none'}
+                        style={[StyleSheet.absoluteFill, animatedPageStyles.vibe]}
+                    >
+                        <AgentChatScreen onBack={() => handleTabPress('home')} />
+                    </AnimatedView>
                 )}
 
                 {/* Bottom Navigation */}
                 {showBottomBar && (
                     <>
                         {nativeTabsAvailable ? (
-                            <AnimatedView style={[styles.nativeBottomBarWrapper, bottomBarFadeStyle, { zIndex: 10 }]}>
-                                <NativeTabBar
-                                    currentIndex={PAGES[currentTab]}
-                                    onIndexChange={(index) => {
-                                        try {
-                                            const pageNames: PageName[] = ['contacts', 'calls', 'home', 'settings'];
-                                            const page = pageNames[index];
-                                            if (!page) return;
-                                            console.log('[TabsLayout] native tab index change', index, page);
-                                            handleTabPress(page);
-                                        } catch (error) {
-                                            console.error('[TabsLayout] native tab index change failed', error);
-                                        }
-                                    }}
-                                    tabs={[
-                                        {
-                                            key: 'contacts',
-                                            title: t('tabs.contacts'),
-                                            sfSymbol: 'person.2.fill',
-                                            unfocusedSfSymbol: 'person.2',
-                                        },
-                                        {
-                                            key: 'calls',
-                                            title: t('tabs.calls'),
-                                            sfSymbol: 'phone.fill',
-                                            unfocusedSfSymbol: 'phone',
-                                        },
-                                        {
-                                            key: 'home',
-                                            title: t('tabs.chats'),
-                                            sfSymbol: 'bubble.left.and.bubble.right.fill',
-                                            unfocusedSfSymbol: 'bubble.left.and.bubble.right',
-                                            badge: totalUnread > 0 ? (totalUnread > 99 ? '99+' : String(totalUnread)) : undefined,
-                                        },
-                                        {
-                                            key: 'settings',
-                                            title: t('tabs.settings'),
-                                            sfSymbol: 'person.crop.circle.fill',
-                                            unfocusedSfSymbol: 'person.crop.circle',
-                                            iconSource: settingsIconSource,
-                                            unfocusedIconSource: settingsIconSource,
-                                        },
-                                        {
-                                            key: 'vibe',
-                                            title: 'Vibe',
-                                            iconSource: require('../../assets/logos/logotransparent.png'),
-                                            unfocusedIconSource: require('../../assets/logos/logotransparent.png'),
-                                            preventsDefault: true,
-                                        },
-                                    ]}
-                                    activeTintColor={colors.primary || (isDark ? '#e5e5e5' : '#007AFF')}
-                                    inactiveTintColor={isDark ? 'rgba(229,229,229,0.6)' : 'rgba(0,0,0,0.4)'}
-                                    isDark={isDark}
-                                    onVibePress={() => safeRouterPush('/agent', 'native-vibe-tab')}
-                                />
-                            </AnimatedView>
+                            <NativeTabsMemo
+                                currentTab={currentTab}
+                                handleTabPress={handleTabPress}
+                                totalUnread={totalUnread}
+                                settingsIconSource={settingsIconSource}
+                                activeTintColor={colors.primary || (isDark ? '#e5e5e5' : '#007AFF')}
+                                inactiveTintColor={isDark ? 'rgba(229,229,229,0.6)' : 'rgba(0,0,0,0.4)'}
+                                isDark={isDark}
+                                safeRouterPush={safeRouterPush}
+                                bottomBarFadeStyle={bottomBarFadeStyle}
+                                t={t}
+                            />
                         ) : (
                             <AnimatedView
                                 style={[
@@ -558,12 +647,12 @@ export default function TabLayout() {
                                         translateX={translateX}
                                         screenWidth={SCREEN_WIDTH}
                                         fallbackTabWidth={fallbackTabWidth}
-                                        onVibePress={() => safeRouterPush('/agent', 'fallback-vibe-tab')}
+                                        onVibePress={() => handleTabPress('vibe')}
                                     />
                                 )}
                                 {Platform.OS !== 'android' && (
                                     <VibeButton
-                                        onPress={() => safeRouterPush('/agent', 'fallback-vibe-button')}
+                                        onPress={() => handleTabPress('vibe')}
                                         isDark={isDark}
                                     />
                                 )}

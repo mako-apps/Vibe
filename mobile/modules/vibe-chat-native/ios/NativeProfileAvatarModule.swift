@@ -11,6 +11,7 @@ private final class NativeProfileAvatarModel: ObservableObject {
   @Published var collapsedSize: CGFloat = 40.0
   @Published var expandedTopInset: CGFloat = 0.0
   @Published var collapsedTopInset: CGFloat = 0.0
+  @Published var scrollOffset: CGFloat = 0.0
 
   private var imageUri: String?
   private var imageTask: Task<Void, Never>?
@@ -103,98 +104,115 @@ private struct NativeProfileAvatarContentView: View {
 
   var body: some View {
     if #available(iOS 26.0, *) {
-      let _ = print("[ProfileAvatar] ContentView: using GlassMorph path (iOS 26+)")
       NativeProfileAvatarGlassMorphView(model: model)
     } else {
-      let _ = print("[ProfileAvatar] ContentView: using Legacy path (< iOS 26)")
       NativeProfileAvatarLegacyView(model: model)
     }
+  }
+}
+
+private struct NativeProfileAvatarInnerContent: View {
+  let image: UIImage?
+  let fallbackText: String
+  let size: CGFloat
+
+  private var inset: CGFloat {
+    max(2.0, size * 0.06)
+  }
+
+  var body: some View {
+    ZStack {
+      Color.clear
+
+      Group {
+        if let image {
+          Image(uiImage: image)
+            .resizable()
+            .scaledToFill()
+        } else {
+          Circle()
+            .fill(Color.white.opacity(0.16))
+
+          Text(String(fallbackText.prefix(1)).uppercased())
+            .font(.system(size: max(14.0, size * 0.34), weight: .semibold))
+            .foregroundStyle(.white)
+        }
+      }
+      .padding(inset)
+      .clipShape(Circle())
+    }
+    .frame(width: size, height: size)
+    .clipShape(Circle())
   }
 }
 
 @available(iOS 26.0, *)
 private struct NativeProfileAvatarGlassMorphView: View {
   @ObservedObject var model: NativeProfileAvatarModel
-  @Namespace private var namespace
-  @State private var showExpanded: Bool = true
+
+  /// Scroll progress 0…1 from fully expanded to fully collapsed.
+  private var progress: CGFloat {
+    let travel = max(1, model.expandedTopInset - model.collapsedTopInset)
+    return max(0, min(1, model.scrollOffset / travel))
+  }
+
+  /// Single circle shrinks from expandedSize → collapsedSize.
+  private var currentSize: CGFloat {
+    model.expandedSize + (model.collapsedSize - model.expandedSize) * progress
+  }
+
+  /// Single circle moves from expandedTopInset → collapsedTopInset.
+  private var currentTop: CGFloat {
+    model.expandedTopInset + (model.collapsedTopInset - model.expandedTopInset) * progress
+  }
 
   var body: some View {
-    let _ = print("[ProfileAvatar] GlassMorph body: showExpanded=\(showExpanded) collapsed=\(model.collapsed) collapsedSize=\(model.collapsedSize) expandedSize=\(model.expandedSize) collapsedTopInset=\(model.collapsedTopInset) expandedTopInset=\(model.expandedTopInset) spacerHeight=\(max(0, model.expandedTopInset - model.collapsedTopInset - model.collapsedSize))")
-    GlassEffectContainer(spacing: 200.0) {
-      // Use VStack so layout positions the glass shapes — no modifiers after glassEffectID
-      VStack(spacing: 0) {
-        Spacer()
-          .frame(height: model.collapsedTopInset)
+    ZStack {
+      Color.black
 
-        // Anchor glass near Dynamic Island — always present, morph target
-        NativeProfileAvatarImageView(
-          image: model.loadedImage,
-          fallbackText: model.fallbackText
-        )
-        .frame(width: model.collapsedSize, height: model.collapsedSize)
-        .clipShape(Circle())
-        .glassEffect()
-        .glassEffectID("avatar-anchor", in: namespace)
-
-        if showExpanded {
-          Spacer()
-            .frame(height: max(0, model.expandedTopInset - model.collapsedTopInset - model.collapsedSize))
-
-          // Expanded avatar — morphs into anchor on collapse
-          NativeProfileAvatarImageView(
-            image: model.loadedImage,
-            fallbackText: model.fallbackText
-          )
-          .frame(width: model.expandedSize, height: model.expandedSize)
-          .clipShape(Circle())
-          .glassEffect()
-          .glassEffectID("avatar-main", in: namespace)
-        }
-
-        Spacer()
-      }
-      .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-    .frame(maxWidth: .infinity, maxHeight: .infinity)
-    .onChange(of: model.collapsed) { _, isCollapsed in
-      print("[ProfileAvatar] onChange: collapsed=\(isCollapsed) -> showExpanded=\(!isCollapsed)")
-      withAnimation(.bouncy) {
-        showExpanded = !isCollapsed
+      if let image = model.loadedImage {
+        Image(uiImage: image)
+          .resizable()
+          .scaledToFill()
+          .opacity(max(0, 1.0 - progress * 1.5))
+      } else {
+        Text(String(model.fallbackText.prefix(1)).uppercased())
+          .font(.system(size: max(14.0, currentSize * 0.34), weight: .semibold))
+          .foregroundStyle(.white)
+          .opacity(max(0, 1.0 - progress * 1.5))
       }
     }
+    .frame(width: currentSize, height: currentSize)
+    .clipShape(Circle())
+    .glassEffect()
+    .padding(.top, currentTop)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
   }
 }
 
 private struct NativeProfileAvatarLegacyView: View {
   @ObservedObject var model: NativeProfileAvatarModel
 
-  var body: some View {
-    NativeProfileAvatarImageView(image: model.loadedImage, fallbackText: model.fallbackText)
-      .frame(width: model.expandedSize, height: model.expandedSize)
-      .clipShape(Circle())
+  private var currentSize: CGFloat {
+    let travelDistance = max(1.0, model.expandedTopInset - model.collapsedTopInset)
+    let progress = max(0.0, min(1.0, model.scrollOffset / travelDistance))
+    return model.expandedSize + ((model.collapsedSize - model.expandedSize) * progress)
   }
-}
 
-private struct NativeProfileAvatarImageView: View {
-  let image: UIImage?
-  let fallbackText: String
+  private var currentTopInset: CGFloat {
+    let travelDistance = max(1.0, model.expandedTopInset - model.collapsedTopInset)
+    let progress = max(0.0, min(1.0, model.scrollOffset / travelDistance))
+    return model.expandedTopInset + ((model.collapsedTopInset - model.expandedTopInset) * progress)
+  }
 
   var body: some View {
-    ZStack {
-      if let image {
-        Image(uiImage: image)
-          .resizable()
-          .scaledToFill()
-      } else {
-        Circle()
-          .fill(Color.white.opacity(0.16))
-
-        Text(String(fallbackText.prefix(1)).uppercased())
-          .font(.system(size: 34, weight: .semibold))
-          .foregroundStyle(.white)
-      }
-    }
-    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    NativeProfileAvatarInnerContent(
+      image: model.loadedImage,
+      fallbackText: model.fallbackText,
+      size: currentSize
+    )
+    .padding(.top, currentTopInset)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
   }
 }
 
@@ -237,15 +255,11 @@ final class NativeProfileAvatarView: ExpoView {
         parentVC.addChild(hostingController)
         hostingController.didMove(toParent: parentVC)
         isHostingControllerAttached = true
-        print("[ProfileAvatar] VC attached to parent: \(type(of: parentVC))")
-      } else {
-        print("[ProfileAvatar] VC attach FAILED — no parent VC found in responder chain")
       }
     } else if window == nil, isHostingControllerAttached {
       hostingController.willMove(toParent: nil)
       hostingController.removeFromParent()
       isHostingControllerAttached = false
-      print("[ProfileAvatar] VC detached (window=nil)")
     }
   }
 
@@ -258,11 +272,6 @@ final class NativeProfileAvatarView: ExpoView {
       responder = next
     }
     return nil
-  }
-
-  override func layoutSubviews() {
-    super.layoutSubviews()
-    print("[ProfileAvatar] layoutSubviews frame=\(frame) clipsToBounds=\(clipsToBounds) superview.clipsToBounds=\(superview?.clipsToBounds ?? false)")
   }
 
   func setImageUri(_ value: String?) {
@@ -280,36 +289,37 @@ final class NativeProfileAvatarView: ExpoView {
   func setCollapsed(_ value: Bool?) {
     let resolved = value ?? false
     guard model.collapsed != resolved else { return }
-    print("[ProfileAvatar] setCollapsed: \(resolved)")
     model.collapsed = resolved
   }
 
   func setExpandedSize(_ value: CGFloat?) {
     let resolved = max(1.0, value ?? 100.0)
     guard model.expandedSize != resolved else { return }
-    print("[ProfileAvatar] setExpandedSize: \(resolved)")
     model.expandedSize = resolved
   }
 
   func setCollapsedSize(_ value: CGFloat?) {
     let resolved = max(1.0, value ?? 40.0)
     guard model.collapsedSize != resolved else { return }
-    print("[ProfileAvatar] setCollapsedSize: \(resolved)")
     model.collapsedSize = resolved
   }
 
   func setExpandedTopInset(_ value: CGFloat?) {
     let resolved = max(0.0, value ?? 0.0)
     guard model.expandedTopInset != resolved else { return }
-    print("[ProfileAvatar] setExpandedTopInset: \(resolved)")
     model.expandedTopInset = resolved
   }
 
   func setCollapsedTopInset(_ value: CGFloat?) {
     let resolved = max(0.0, value ?? 0.0)
     guard model.collapsedTopInset != resolved else { return }
-    print("[ProfileAvatar] setCollapsedTopInset: \(resolved)")
     model.collapsedTopInset = resolved
+  }
+
+  func setScrollOffset(_ value: CGFloat?) {
+    let resolved = max(0.0, value ?? 0.0)
+    guard model.scrollOffset != resolved else { return }
+    model.scrollOffset = resolved
   }
 }
 
@@ -344,6 +354,10 @@ public final class NativeProfileAvatarModule: Module {
 
       Prop("collapsedTopInset") { (view: NativeProfileAvatarView, value: Double?) in
         view.setCollapsedTopInset(value.map { CGFloat($0) })
+      }
+
+      Prop("scrollOffset") { (view: NativeProfileAvatarView, value: Double?) in
+        view.setScrollOffset(value.map { CGFloat($0) })
       }
     }
   }

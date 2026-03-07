@@ -13,6 +13,8 @@
       "ChatNativeGifModule",
       "VibeNativeCallModule",
       "LiquidGlassModule",
+      "NativeProfileAvatarModule",
+      "NativeSettingsMainModule",
       "ChatNativeTabBarModule",
       "ChatNativeHomeModule",
       "ChatNativeHomeListModule"

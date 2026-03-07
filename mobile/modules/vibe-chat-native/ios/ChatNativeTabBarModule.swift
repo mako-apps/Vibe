@@ -1,7 +1,8 @@
 import ExpoModulesCore
 import UIKit
 
-private struct ChatNativeTabItem {
+private struct ChatNativeTabItem: Equatable {
+  let index: Int
   let key: String
   let title: String
   let sfSymbol: String?
@@ -10,14 +11,21 @@ private struct ChatNativeTabItem {
   let isVibe: Bool
 }
 
-public final class ChatNativeTabBarView: ExpoView {
+public final class ChatNativeTabBarView: ExpoView, UITabBarDelegate {
   public var onIndexChange = EventDispatcher()
 
-  private let backgroundBlur = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterial))
-  private let containerStack = UIStackView()
+  // Custom TabBar that ignores safe-area
+  private class FloatingTabBar: UITabBar {
+    override var safeAreaInsets: UIEdgeInsets { .zero }
+  }
 
-  // System segmented control — replaces custom pill + buttons
-  private let segmentedControl = UISegmentedControl()
+  // Main Tab Bar (natively applies its own glass)
+  private let tabBar = FloatingTabBar()
+
+  // Vibe Button
+  private let vibeChromeView = UIVisualEffectView(effect: nil)
+  private let vibeIconView = UIImageView()
+  private let vibeButton = UIButton(type: .system)
 
   private var tabs: [ChatNativeTabItem] = []
 
@@ -25,8 +33,7 @@ public final class ChatNativeTabBarView: ExpoView {
   private var activeTintColor = UIColor.systemBlue
   private var inactiveTintColor = UIColor.systemGray
   private var isDark = false
-  private let tabControlSide: CGFloat = 72
-  private let horizontalOuterPadding: CGFloat = 18
+
   private let selectionFeedback = UISelectionFeedbackGenerator()
   private var remoteIconCache: [String: UIImage] = [:]
   private var remoteIconRequests: Set<String> = []
@@ -37,72 +44,71 @@ public final class ChatNativeTabBarView: ExpoView {
   }
 
   public override var intrinsicContentSize: CGSize {
-    CGSize(width: UIView.noIntrinsicMetric, height: 96)
-  }
-
-  public override func layoutSubviews() {
-    super.layoutSubviews()
-    // Hide the default segmented-control background wrapper to avoid a double
-    // glass layer while keeping native segmented interactions.
-    if #available(iOS 13.0, *) {
-      segmentedControl.subviews.first?.alpha = 0
-    }
+    CGSize(width: UIView.noIntrinsicMetric, height: 64)
   }
 
   private func setupView() {
     backgroundColor = .clear
     isOpaque = false
+    clipsToBounds = false
 
-    containerStack.axis = .horizontal
-    containerStack.alignment = .center
-    containerStack.distribution = .fill
-    containerStack.spacing = 8
-    containerStack.backgroundColor = .clear
-    containerStack.translatesAutoresizingMaskIntoConstraints = false
-    addSubview(containerStack)
+    // ── Tab Bar ──
+    tabBar.translatesAutoresizingMaskIntoConstraints = false
+    tabBar.delegate = self
+    // We strictly do NOT clip or round tabBar. Apple handles the inner floating pill.
+    addSubview(tabBar)
 
+    // ── Vibe Chrome ──
+    vibeChromeView.translatesAutoresizingMaskIntoConstraints = false
+    vibeChromeView.layer.cornerRadius = 30
+    vibeChromeView.layer.cornerCurve = .continuous
+    vibeChromeView.clipsToBounds = true
+    addSubview(vibeChromeView)
+
+    // Vibe icon centered
+    vibeIconView.translatesAutoresizingMaskIntoConstraints = false
+    vibeIconView.contentMode = .scaleAspectFit
+    vibeChromeView.contentView.addSubview(vibeIconView)
+
+    // Touch target
+    vibeButton.translatesAutoresizingMaskIntoConstraints = false
+    vibeButton.addTarget(self, action: #selector(handleVibePress), for: .touchUpInside)
+    vibeChromeView.contentView.addSubview(vibeButton)
+
+    // ── Direct Constraints ──
     NSLayoutConstraint.activate([
-      containerStack.topAnchor.constraint(equalTo: topAnchor, constant: 18),
-      containerStack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -6),
-      containerStack.leadingAnchor.constraint(
-        equalTo: leadingAnchor, constant: horizontalOuterPadding),
-      containerStack.trailingAnchor.constraint(
-        equalTo: trailingAnchor, constant: -horizontalOuterPadding),
+      // Shift the bounding box outward by 16pt on leading and 8pt on trailing to translate the invisible box leftward.
+      // This mathematically balances Apple's inner padding so the visible glass pill aligns perfectly with the 10pt JS container padding.
+      tabBar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: -16),
+      tabBar.trailingAnchor.constraint(equalTo: vibeChromeView.leadingAnchor, constant: 8),
+      tabBar.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+      // Vibe chrome explicitly sized to ~60pt to exactly match Apple's iOS 18 floating pill limits
+      vibeChromeView.trailingAnchor.constraint(equalTo: trailingAnchor),
+      vibeChromeView.topAnchor.constraint(equalTo: tabBar.topAnchor),
+      vibeChromeView.heightAnchor.constraint(equalToConstant: 60),
+      vibeChromeView.widthAnchor.constraint(equalToConstant: 60),
+
+      // Icon inside vibe
+      vibeIconView.centerXAnchor.constraint(equalTo: vibeChromeView.contentView.centerXAnchor),
+      vibeIconView.centerYAnchor.constraint(equalTo: vibeChromeView.contentView.centerYAnchor),
+      vibeIconView.widthAnchor.constraint(equalToConstant: 24),
+      vibeIconView.heightAnchor.constraint(equalToConstant: 24),
+
+      // Tap area fills vibe
+      vibeButton.leadingAnchor.constraint(equalTo: vibeChromeView.contentView.leadingAnchor),
+      vibeButton.trailingAnchor.constraint(equalTo: vibeChromeView.contentView.trailingAnchor),
+      vibeButton.topAnchor.constraint(equalTo: vibeChromeView.contentView.topAnchor),
+      vibeButton.bottomAnchor.constraint(equalTo: vibeChromeView.contentView.bottomAnchor),
     ])
 
-    // Glass background behind the segmented control
-    backgroundBlur.translatesAutoresizingMaskIntoConstraints = false
-    backgroundBlur.layer.cornerRadius = tabControlSide / 2
-    backgroundBlur.layer.cornerCurve = .continuous
-    backgroundBlur.clipsToBounds = true
-    backgroundBlur.isUserInteractionEnabled = true
-
-    // Segmented control setup
-    segmentedControl.translatesAutoresizingMaskIntoConstraints = false
-    segmentedControl.addTarget(self, action: #selector(segmentChanged(_:)), for: .valueChanged)
-    backgroundBlur.contentView.addSubview(segmentedControl)
-
-    NSLayoutConstraint.activate([
-      backgroundBlur.heightAnchor.constraint(equalToConstant: tabControlSide),
-      segmentedControl.topAnchor.constraint(
-        equalTo: backgroundBlur.contentView.topAnchor, constant: 8),
-      segmentedControl.bottomAnchor.constraint(
-        equalTo: backgroundBlur.contentView.bottomAnchor, constant: -8),
-      segmentedControl.leadingAnchor.constraint(
-        equalTo: backgroundBlur.contentView.leadingAnchor, constant: 10),
-      segmentedControl.trailingAnchor.constraint(
-        equalTo: backgroundBlur.contentView.trailingAnchor, constant: -10),
-    ])
-
-    containerStack.addArrangedSubview(backgroundBlur)
-
+    tabBar.itemPositioning = .automatic
     selectionFeedback.prepare()
-
     applyChrome()
   }
 
   func setTabs(_ rawTabs: [[String: Any]]) {
-    tabs = rawTabs.map { raw in
+    let newTabs: [ChatNativeTabItem] = rawTabs.enumerated().map { index, raw in
       let key = (raw["key"] as? String) ?? UUID().uuidString
       let title = (raw["title"] as? String) ?? key
       let sfSymbol = raw["sfSymbol"] as? String
@@ -111,87 +117,243 @@ public final class ChatNativeTabBarView: ExpoView {
       let badge = badgeValue.map { String(describing: $0) }
       let isVibe = (raw["isVibe"] as? Bool) ?? false
       return ChatNativeTabItem(
-        key: key, title: title, sfSymbol: sfSymbol, iconUri: iconUri, badge: badge, isVibe: isVibe)
+        index: index, key: key, title: title,
+        sfSymbol: sfSymbol, iconUri: iconUri,
+        badge: badge, isVibe: isVibe)
     }
 
-    rebuildSegments()
+    if tabs == newTabs { return }
+
+    let itemsChanged =
+      tabs.count != newTabs.count || zip(tabs, newTabs).contains { a, b in a.key != b.key }
+    tabs = newTabs
+
+    if itemsChanged {
+      rebuildSegments()
+    } else {
+      updateExistingSegments()
+    }
   }
 
   func setCurrentIndex(_ value: Int) {
+    guard value != currentIndex else { return }
     currentIndex = value
     applySelection()
   }
 
   func setActiveTintColor(_ value: UIColor?) {
-    if let value {
+    if let value, activeTintColor != value {
       activeTintColor = value
+      applyChrome()
       applySelection()
     }
   }
 
   func setInactiveTintColor(_ value: UIColor?) {
-    if let value {
+    if let value, inactiveTintColor != value {
       inactiveTintColor = value
+      applyChrome()
       applySelection()
     }
   }
 
   func setIsDark(_ value: Bool) {
+    guard value != isDark else { return }
     isDark = value
     applyChrome()
     applySelection()
   }
 
-  @objc private func segmentChanged(_ sender: UISegmentedControl) {
-    let tabIndex = sender.selectedSegmentIndex
+  public func tabBar(_ tabBar: UITabBar, didSelect item: UITabBarItem) {
+    let tabIndex = item.tag
     guard tabIndex >= 0, tabIndex < tabs.count else { return }
     if tabIndex != currentIndex {
       selectionFeedback.selectionChanged()
       selectionFeedback.prepare()
     }
     currentIndex = tabIndex
-    applySelection()
     onIndexChange(["index": tabIndex])
   }
 
-  private func rebuildSegments() {
-    segmentedControl.removeAllSegments()
-    for i in 0..<tabs.count {
-      // Insert with a placeholder title; actual image is set in rebuildAndApplySegmentImages
-      segmentedControl.insertSegment(withTitle: tabs[i].title, at: i, animated: false)
+  private func updateExistingSegments() {
+    let mainTabs = tabs.filter { !$0.isVibe }
+    let vibeTab = tabs.first(where: \.isVibe)
+
+    guard let items = tabBar.items, items.count == mainTabs.count else {
+      rebuildSegments()
+      return
     }
-    rebuildAndApplySegmentImages()
+
+    for (index, tab) in mainTabs.enumerated() {
+      let item = items[index]
+      item.title = tab.title
+      item.badgeValue = tab.badge
+    }
+
+    updateVibeButton(for: vibeTab)
     applySelection()
   }
 
-  // MARK: - Segment image rendering
+  private func rebuildSegments() {
+    let mainTabs = tabs.filter { !$0.isVibe }
+    let vibeTab = tabs.first(where: \.isVibe)
+    var tabBarItems: [UITabBarItem] = []
+    tabBar.isHidden = mainTabs.isEmpty
 
-  private var segmentNormalImages: [UIImage] = []
-  private var segmentSelectedImages: [UIImage] = []
+    for tab in mainTabs {
+      let symbol = tab.sfSymbol ?? fallbackSymbol(tab.key)
 
-  private func rebuildAndApplySegmentImages() {
-    let normalColor = inactiveTintColor.withAlphaComponent(isDark ? 0.78 : 0.72)
-    let selectedColor = activeTintColor
-    segmentNormalImages = tabs.map {
-      makeSegmentImage(
-        symbol: $0.sfSymbol ?? fallbackSymbol($0.key),
-        title: $0.title, color: normalColor, isVibe: $0.isVibe) ?? UIImage()
+      var normalImage: UIImage?
+      var selectedImage: UIImage?
+
+      let item = UITabBarItem(title: tab.title, image: nil, tag: tab.index)
+
+      if let customIcon = resolvedIcon(for: tab) {
+        // We resize the avatar image to 24x24 so it aligns perfectly with the standard 24x24 SF Symbols
+        let cgSize = CGSize(width: 24, height: 24)
+        if let resized = resizeImage(image: customIcon, targetSize: cgSize) {
+          let originalImage = resized.withRenderingMode(.alwaysOriginal)
+          let finalImage = withRoundedCorners(image: originalImage, radius: 12) ?? originalImage
+          item.image = finalImage
+          item.selectedImage = finalImage
+
+          // Push the custom image down slightly to align its baseline with the SF Symbols!
+          item.imageInsets = UIEdgeInsets(top: 2, left: 0, bottom: -2, right: 0)
+        }
+      } else {
+        let iconCfg = UIImage.SymbolConfiguration(pointSize: 19, weight: .regular)
+        normalImage = UIImage(systemName: symbol, withConfiguration: iconCfg)
+        let selectedCfg = UIImage.SymbolConfiguration(pointSize: 19, weight: .medium)
+        selectedImage =
+          UIImage(systemName: symbol + ".fill", withConfiguration: selectedCfg)
+          ?? UIImage(systemName: symbol, withConfiguration: selectedCfg)
+
+        item.image = normalImage
+        item.selectedImage = selectedImage
+      }
+
+      item.badgeValue = tab.badge
+      tabBarItems.append(item)
     }
-    segmentSelectedImages = tabs.map {
-      makeSegmentImage(
-        symbol: $0.sfSymbol ?? fallbackSymbol($0.key),
-        title: $0.title, color: selectedColor, isVibe: $0.isVibe) ?? UIImage()
-    }
-    swapSegmentImages(selectedIndex: segmentedControl.selectedSegmentIndex)
+
+    tabBar.items = tabBarItems
+    updateVibeButton(for: vibeTab)
+    applySelection()
   }
 
-  private func swapSegmentImages(selectedIndex: Int) {
-    for i in 0..<tabs.count {
-      guard i < segmentNormalImages.count, i < segmentSelectedImages.count else { continue }
-      let img = (i == selectedIndex) ? segmentSelectedImages[i] : segmentNormalImages[i]
-      segmentedControl.setImage(img.withRenderingMode(.alwaysOriginal), forSegmentAt: i)
+  private func applySelection() {
+    guard !tabs.isEmpty else { return }
+    let normalized = max(0, min(currentIndex, tabs.count - 1))
+    if normalized != currentIndex { currentIndex = normalized }
+
+    tabBar.tintColor = activeTintColor
+    tabBar.unselectedItemTintColor = inactiveTintColor
+    updateVibeButton(for: tabs.first(where: \.isVibe))
+
+    if let items = tabBar.items {
+      tabBar.selectedItem = items.first(where: { $0.tag == currentIndex })
     }
   }
+
+  private func applyChrome() {
+    let blurStyle: UIBlurEffect.Style =
+      isDark ? .systemChromeMaterialDark : .systemChromeMaterialLight
+    let matchingGlassColor =
+      isDark ? UIColor.white.withAlphaComponent(0.16) : UIColor.black.withAlphaComponent(0.20)
+
+    // ── 1. UITabBar natively draws its own glass ──
+    let appearance = UITabBarAppearance()
+    appearance.configureWithDefaultBackground()
+    appearance.shadowColor = .clear
+
+    // We STRICTLY do not set appearance.backgroundColor here.
+    // Doing so would color the invisible bounding box and create the giant outer dark shadow you saw!
+
+    if #available(iOS 26.0, *) {
+      // If we are injecting a native glass effect internally into the UITabBar background
+      // Note: UIGlassEffect belongs to UIVisualEffectView. UITabBarAppearance uses UIBlurEffect.
+      appearance.backgroundEffect = UIBlurEffect(style: blurStyle)
+    } else {
+      appearance.backgroundEffect = UIBlurEffect(style: blurStyle)
+    }
+
+    // Using UITabBar's internal layout allows it to naturally sort out the text/icon
+    // so they do not overlap when we override standard dimensions.
+    let itemAppearance = appearance.stackedLayoutAppearance
+    itemAppearance.normal.iconColor = inactiveTintColor
+    itemAppearance.normal.titleTextAttributes = [.foregroundColor: inactiveTintColor]
+
+    // Let UITabBar naturally center it, don't force adjustments
+    itemAppearance.normal.titlePositionAdjustment = .zero
+    itemAppearance.selected.iconColor = activeTintColor
+    itemAppearance.selected.titleTextAttributes = [.foregroundColor: activeTintColor]
+    itemAppearance.selected.titlePositionAdjustment = .zero
+
+    appearance.stackedLayoutAppearance = itemAppearance
+    appearance.inlineLayoutAppearance = itemAppearance
+    appearance.compactInlineLayoutAppearance = itemAppearance
+
+    tabBar.standardAppearance = appearance
+    if #available(iOS 15.0, *) {
+      tabBar.scrollEdgeAppearance = appearance
+    }
+
+    // ── 3. Vibe Button explicitly matches the exact material and tint ──
+    if #available(iOS 26.0, *) {
+      let vibeEffect = UIGlassEffect()
+      vibeEffect.isInteractive = true
+      vibeChromeView.effect = vibeEffect
+    } else {
+      vibeChromeView.effect = UIBlurEffect(style: blurStyle)
+    }
+  }
+
+  private func updateVibeButton(for tab: ChatNativeTabItem?) {
+    guard let tab else {
+      vibeChromeView.isHidden = true
+      return
+    }
+
+    vibeChromeView.isHidden = false
+
+    let isActive = currentIndex == tab.index
+    let foregroundColor = isActive ? activeTintColor : inactiveTintColor
+
+    // Try to load the image they passed from JS first (e.g. logotransparent.png)
+    var image: UIImage? = nil
+    if let customIcon = resolvedIcon(for: tab) {
+      print("[VibeTabBar] Successfully resolved JS image for vibe tab: \(customIcon)")
+      image = resizeImage(image: customIcon, targetSize: CGSize(width: 26, height: 26))?
+        .withRenderingMode(.alwaysTemplate)
+    }
+
+    // Fall back to the SVG drawing if no image was fetched
+    if image == nil {
+      print("[VibeTabBar] Falling back to SVG path for vibe logo")
+      image = resolveLogoImage(targetSize: CGSize(width: 26, height: 26))?.withRenderingMode(
+        .alwaysTemplate)
+    }
+
+    vibeIconView.image = image
+    vibeIconView.tintColor = foregroundColor
+
+    vibeButton.setTitle(nil, for: .normal)
+    vibeButton.setImage(nil, for: .normal)
+  }
+
+  @objc
+  private func handleVibePress() {
+    guard let vibeTab = tabs.first(where: \.isVibe) else { return }
+    if vibeTab.index != currentIndex {
+      selectionFeedback.selectionChanged()
+      selectionFeedback.prepare()
+    }
+    currentIndex = vibeTab.index
+    applySelection()
+    onIndexChange(["index": vibeTab.index])
+  }
+
+  // MARK: - Utilities
 
   private func fallbackSymbol(_ key: String) -> String {
     switch key.lowercased() {
@@ -204,116 +366,118 @@ public final class ChatNativeTabBarView: ExpoView {
     }
   }
 
-  private func resolveLogoImage() -> UIImage? {
-    if let named = UIImage(named: "logotransparent") {
-      return named
+  private func resolveLogoImage(targetSize: CGSize) -> UIImage? {
+    let canvasSize = CGSize(width: 699, height: 699)
+    let format = UIGraphicsImageRendererFormat.default()
+    format.scale = UIScreen.main.scale
+    format.opaque = false
+
+    let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
+    return renderer.image { context in
+      let cgContext = context.cgContext
+      let sizeScale = min(
+        targetSize.width / canvasSize.width, targetSize.height / canvasSize.height)
+      let scaledWidth = canvasSize.width * sizeScale
+      let scaledHeight = canvasSize.height * sizeScale
+      let offsetX = (targetSize.width - scaledWidth) * 0.5
+      let offsetY = (targetSize.height - scaledHeight) * 0.5
+      cgContext.translateBy(x: offsetX, y: offsetY)
+      cgContext.scaleBy(x: sizeScale, y: sizeScale)
+      UIColor.black.setFill()
+
+      let path1 = UIBezierPath()
+      path1.move(to: CGPoint(x: 79, y: 136))
+      path1.addLine(to: CGPoint(x: 230, y: 156))
+      path1.addLine(to: CGPoint(x: 291, y: 286))
+      path1.addLine(to: CGPoint(x: 176, y: 199))
+      path1.close()
+      path1.fill()
+
+      let path2 = UIBezierPath()
+      path2.move(to: CGPoint(x: 327, y: 174))
+      path2.addLine(to: CGPoint(x: 540, y: 199))
+      path2.addLine(to: CGPoint(x: 503, y: 321))
+      path2.close()
+      path2.fill()
+
+      let path3 = UIBezierPath()
+      path3.move(to: CGPoint(x: 215, y: 103))
+      path3.addLine(to: CGPoint(x: 284, y: 239))
+      path3.addLine(to: CGPoint(x: 328, y: 352))
+      path3.addLine(to: CGPoint(x: 368, y: 492))
+      path3.addLine(to: CGPoint(x: 398, y: 644))
+      path3.addLine(to: CGPoint(x: 498, y: 338))
+      path3.close()
+      path3.fill()
     }
-    if let path = Bundle.main.path(forResource: "logotransparent", ofType: "png"),
-      let image = UIImage(contentsOfFile: path)
-    {
-      return image
-    }
-    return nil
   }
 
-  /// Renders an SF Symbol or image above a text label into one UIImage for use as a
-  /// segment image. This gives icon + label with per-state colour control
-  /// while keeping `selectedSegmentTintColor` pill rendering intact.
-  private func makeSegmentImage(symbol: String, title: String, color: UIColor, isVibe: Bool)
-    -> UIImage?
-  {
-    let fontSize: CGFloat = 11
-    let gap: CGFloat = 3
-    let font = UIFont.systemFont(ofSize: fontSize, weight: .semibold)
-    let textAttrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
-    let textSize = (title as NSString).size(withAttributes: textAttrs)
+  private func resizeImage(image: UIImage, targetSize: CGSize) -> UIImage? {
+    let size = image.size
+    let widthRatio = targetSize.width / size.width
+    let heightRatio = targetSize.height / size.height
+    let ratio = min(widthRatio, heightRatio)
+    let newSize = CGSize(width: size.width * ratio, height: size.height * ratio)
+    let rect = CGRect(origin: .zero, size: newSize)
 
-    let iconSize: CGSize
-    let iconImgToDraw: UIImage?
+    let format = UIGraphicsImageRendererFormat.default()
+    format.scale = UIScreen.main.scale
+    format.opaque = false
+    let renderer = UIGraphicsImageRenderer(size: newSize, format: format)
+    return renderer.image { _ in image.draw(in: rect) }
+  }
 
-    if isVibe, let logo = resolveLogoImage() {
-      // Use the logo image instead of a symbol
-      iconSize = CGSize(width: 22, height: 22)
-      iconImgToDraw = logo.withRenderingMode(.alwaysOriginal)
-    } else {
-      let iconPt: CGFloat = 18
-      let iconCfg = UIImage.SymbolConfiguration(pointSize: iconPt, weight: .semibold)
-      if let icon = UIImage(systemName: symbol, withConfiguration: iconCfg) {
-        iconSize = icon.size
-        iconImgToDraw = icon.withTintColor(color, renderingMode: .alwaysOriginal)
-      } else {
-        iconSize = .zero
-        iconImgToDraw = nil
-      }
-    }
+  private func withRoundedCorners(image: UIImage, radius: CGFloat) -> UIImage? {
+    let rect = CGRect(origin: .zero, size: image.size)
+    let format = UIGraphicsImageRendererFormat.default()
+    format.scale = image.scale
+    format.opaque = false
 
-    let canvasW = max(iconSize.width, textSize.width) + 20
-    let canvasH = iconSize.height + gap + ceil(textSize.height) + 2
-    let renderer = UIGraphicsImageRenderer(size: CGSize(width: canvasW, height: canvasH))
+    let renderer = UIGraphicsImageRenderer(size: image.size, format: format)
     return renderer.image { _ in
-      let iconX = (canvasW - iconSize.width) / 2
-      if let img = iconImgToDraw {
-        var alpha: CGFloat = 1.0
-        color.getRed(nil, green: nil, blue: nil, alpha: &alpha)
-        img.draw(
-          in: CGRect(x: iconX, y: 1, width: iconSize.width, height: iconSize.height),
-          blendMode: .normal, alpha: alpha)
-      }
-      let textX = (canvasW - textSize.width) / 2
-      (title as NSString).draw(
-        at: CGPoint(x: textX, y: 1 + iconSize.height + gap),
-        withAttributes: textAttrs)
+      UIBezierPath(roundedRect: rect, cornerRadius: radius).addClip()
+      image.draw(in: rect)
     }
   }
 
-  private func applySelection() {
-    guard !tabs.isEmpty else { return }
-    let normalized = max(0, min(currentIndex, tabs.count - 1))
-    if normalized != currentIndex { currentIndex = normalized }
-
-    if segmentedControl.selectedSegmentIndex != currentIndex {
-      segmentedControl.selectedSegmentIndex = currentIndex
-    }
-
-    segmentedControl.selectedSegmentTintColor =
-      activeTintColor.withAlphaComponent(isDark ? 0.30 : 0.18)
-
-    // Swap icon tint to reflect selected/unselected state
-    swapSegmentImages(selectedIndex: currentIndex)
-  }
+  // MARK: - Icons
 
   private func resolvedIcon(for item: ChatNativeTabItem) -> UIImage? {
-    guard let iconUri = item.iconUri, !iconUri.isEmpty else {
-      return nil
-    }
-
+    guard let iconUri = item.iconUri, !iconUri.isEmpty else { return nil }
+    print("[VibeTabBar] resolving icon for: \(item.key) with uri: \(iconUri)")
     if let cachedRemote = remoteIconCache[iconUri] {
+      print("[VibeTabBar] Found in remote cache: \(iconUri)")
       return cachedRemote
     }
-
     if let localImage = localImageFromURI(iconUri) {
+      print("[VibeTabBar] Found local image: \(iconUri)")
       return localImage
     }
-
     guard let url = URL(string: iconUri), let scheme = url.scheme?.lowercased(),
       scheme == "http" || scheme == "https"
     else {
+      print("[VibeTabBar] Invalid remote URL or scheme for: \(iconUri)")
       return nil
     }
-
+    print("[VibeTabBar] Requesting remote icon: \(iconUri)")
     requestRemoteIcon(from: url, cacheKey: iconUri)
     return nil
   }
 
   private func requestRemoteIcon(from url: URL, cacheKey: String) {
     guard !remoteIconRequests.contains(cacheKey) else { return }
+    print("[VibeTabBar] Downloading remote image: \(url)")
     remoteIconRequests.insert(cacheKey)
 
     URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
       DispatchQueue.main.async {
         guard let self else { return }
         self.remoteIconRequests.remove(cacheKey)
-        guard let data, let image = UIImage(data: data) else { return }
+        guard let data, let image = UIImage(data: data) else {
+          print("[VibeTabBar] Failed to create UIImage from downloaded data for: \(url)")
+          return
+        }
+        print("[VibeTabBar] Successfully downloaded & decoded image: \(url)")
         self.remoteIconCache[cacheKey] = image
         self.rebuildSegments()
       }
@@ -322,85 +486,62 @@ public final class ChatNativeTabBarView: ExpoView {
 
   private func localImageFromURI(_ uriString: String) -> UIImage? {
     guard !uriString.isEmpty else { return nil }
+    print("[VibeTabBar] Attempting to load local image from: \(uriString)")
 
     if let url = URL(string: uriString) {
       if url.isFileURL {
-        let image = UIImage(contentsOfFile: url.path)
-        if image != nil { return image }
+        if let image = UIImage(contentsOfFile: url.path) {
+          print("[VibeTabBar] Found local file URL image: \(url.path)")
+          return image
+        }
       }
-
       let filename = url.lastPathComponent
       let base = (filename as NSString).deletingPathExtension
       let ext = (filename as NSString).pathExtension
       if !base.isEmpty,
         let path = Bundle.main.path(forResource: base, ofType: ext.isEmpty ? nil : ext)
       {
+        print("[VibeTabBar] Found image in Main Bundle: \(path)")
         return UIImage(contentsOfFile: path)
       }
     }
-
     if uriString.hasPrefix("/") {
-      let image = UIImage(contentsOfFile: uriString)
-      if image != nil { return image }
+      if let image = UIImage(contentsOfFile: uriString) {
+        print("[VibeTabBar] Found absolute path image: \(uriString)")
+        return image
+      }
     }
-
     let localFilename = (uriString as NSString).lastPathComponent
     let localBase = (localFilename as NSString).deletingPathExtension
     if !localBase.isEmpty, let named = UIImage(named: localBase) {
+      print("[VibeTabBar] Found named image: \(localBase)")
       return named
     }
 
-    return UIImage(named: uriString)
-  }
-
-  private func applyChrome() {
-    if #available(iOS 26.0, *) {
-      let effect = UIGlassEffect()
-      effect.isInteractive = true
-      backgroundBlur.effect = effect
-    } else {
-      backgroundBlur.effect = UIBlurEffect(style: .systemThinMaterial)
+    if let named = UIImage(named: uriString) {
+      print("[VibeTabBar] Found exactly named image: \(uriString)")
+      return named
     }
-    backgroundBlur.backgroundColor = .clear
-    backgroundBlur.contentView.backgroundColor = .clear
-    backgroundBlur.layer.borderWidth = 0.7
-    backgroundBlur.layer.borderColor =
-      isDark
-      ? UIColor.white.withAlphaComponent(0.08).cgColor
-      : UIColor.black.withAlphaComponent(0.06).cgColor
 
-    segmentedControl.backgroundColor = .clear
-
-    // Rebuild rendered icon+text images with the current colour scheme.
-    rebuildAndApplySegmentImages()
+    print("[VibeTabBar] Could not find any local image for: \(uriString)")
+    return nil
   }
 }
 
 public class ChatNativeTabBarModule: Module {
   public func definition() -> ModuleDefinition {
     Name("ChatNativeTabs")
-
     View(ChatNativeTabBarView.self) {
-      Prop("tabs") { (view: ChatNativeTabBarView, tabs: [[String: Any]]) in
-        view.setTabs(tabs)
+      Prop("tabs") { (view: ChatNativeTabBarView, tabs: [[String: Any]]) in view.setTabs(tabs) }
+      Prop("currentIndex") { (view: ChatNativeTabBarView, index: Int) in view.setCurrentIndex(index)
       }
-
-      Prop("currentIndex") { (view: ChatNativeTabBarView, index: Int) in
-        view.setCurrentIndex(index)
-      }
-
       Prop("activeTintColor") { (view: ChatNativeTabBarView, color: UIColor?) in
         view.setActiveTintColor(color)
       }
-
       Prop("inactiveTintColor") { (view: ChatNativeTabBarView, color: UIColor?) in
         view.setInactiveTintColor(color)
       }
-
-      Prop("isDark") { (view: ChatNativeTabBarView, isDark: Bool) in
-        view.setIsDark(isDark)
-      }
-
+      Prop("isDark") { (view: ChatNativeTabBarView, isDark: Bool) in view.setIsDark(isDark) }
       Events("onIndexChange")
     }
   }

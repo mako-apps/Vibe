@@ -1,10 +1,10 @@
 
 import React, { useState } from 'react'
-import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator, Alert, KeyboardAvoidingView, Platform, ScrollView, I18nManager } from 'react-native'
+import { View, Text, StyleSheet, ActivityIndicator, Alert, KeyboardAvoidingView, Platform, ScrollView, I18nManager } from 'react-native'
 import { useRouter } from 'expo-router'
 import { useTranslation } from 'react-i18next'
 
-import { ChevronLeft, ArrowRight } from 'lucide-react-native'
+import { ChevronLeft } from 'lucide-react-native'
 import SafeLiquidGlass from '../../src/components/native/SafeLiquidGlass'
 import { useAuthStore } from '../../src/lib/stores/auth-store'
 import { apiClient } from '../../src/lib/api-client'
@@ -13,20 +13,11 @@ import * as Crypto from 'expo-crypto'
 import { generateKeyPair, deriveKeyFromPassphraseAsync, encryptPrivateKey } from '../../src/lib/crypto'
 import AuthManager from '../../src/lib/AuthManager'
 import FloatInput from '../../src/components/ui/FloatInput'
-import { EdgeGlowBackground } from '../../src/components/auth/EdgeGlowBackground'
+import { AuthFlowBackground, AUTH_SIGNUP_CYAN, AUTH_SIGNUP_GLOW } from '../../src/components/auth/AuthFlowBackground'
 import { sanitizeInput, validateUsername } from '../../src/lib/utils/security'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { Logo } from '../../src/components/ui/Logo'
-import { LinearGradient } from 'expo-linear-gradient'
-import Animated, { useSharedValue, useAnimatedStyle, withRepeat, withTiming, interpolate, Easing } from 'react-native-reanimated'
-import MaskedView from '@react-native-masked-view/masked-view'
 import { ModernLoader } from '../../src/components/ui/ModernLoader'
-
-const withAlpha = (color: string, opacity: number) => {
-    const _opacity = Math.round(Math.min(Math.max(opacity || 1, 0), 1) * 255);
-    if (color.startsWith('#')) return color + _opacity.toString(16).toUpperCase().padStart(2, '0');
-    return color; // Fallback
-};
 
 export default function SignUpScreen() {
     const [username, setUsername] = useState('')
@@ -34,31 +25,14 @@ export default function SignUpScreen() {
     const [statusText, setStatusText] = useState('')
     const [usernameError, setUsernameError] = useState<string | undefined>(undefined)
 
-    // Shine animation
-    const shineProgress = useSharedValue(-1)
-
-    React.useEffect(() => {
-        if (loading) {
-            shineProgress.value = withRepeat(
-                withTiming(1, { duration: 1500, easing: Easing.bezier(0.4, 0, 0.2, 1) }),
-                -1,
-                false
-            )
-        } else {
-            shineProgress.value = -1
-        }
-    }, [loading])
-
-    const shineStyle = useAnimatedStyle(() => ({
-        transform: [{ translateX: interpolate(shineProgress.value, [-1, 1], [-200, 200]) }]
-    }))
-
     const { login } = useAuthStore()
     const { t } = useTranslation()
     const { colors, effectiveTheme } = useThemeStore()
     const router = useRouter()
     const insets = useSafeAreaInsets()
     const isDark = effectiveTheme === 'dark'
+    const isFormValid = username.length > 2 && !usernameError;
+    const buttonBackgroundColor = isFormValid ? colors.button.background : colors.input
 
     const handleUsernameChange = (text: string) => {
         const sanitized = sanitizeInput(text);
@@ -67,8 +41,6 @@ export default function SignUpScreen() {
         }
         if (usernameError) setUsernameError(undefined);
     }
-
-    const isFormValid = username.length > 2 && !usernameError;
 
     const handleSignUp = async () => {
         const validation = validateUsername(username);
@@ -150,22 +122,35 @@ export default function SignUpScreen() {
         }
     }
 
-
-
     return (
         <View style={[styles.container, { backgroundColor: colors.background }]}>
-            <EdgeGlowBackground
-                glowColor={colors.primary}
-                cyanColor="#2DD4BF"
+            <AuthFlowBackground
+                baseColor={colors.background}
+                glowColor={AUTH_SIGNUP_GLOW}
+                cyanColor={AUTH_SIGNUP_CYAN}
+                intensity={0.74}
+                contrast={0.74}
+                grainAmount={0.3}
+                darken={0.06}
+                anchor={[0.14, 0.86]}
+                veilAnchor={[0.2, 0.92]}
+                blobScale={[0.92, 1.18]}
+                veilScale={[0.84, 1.42]}
+                rotation={-0.46}
+                verticalMaskStart={0.54}
+                verticalMaskEnd={0.8}
             />
 
             <View style={[styles.navbar, { paddingTop: insets.top + 10, direction: 'ltr', flexDirection: 'row' }]}>
-                <TouchableOpacity onPress={() => router.back()} style={styles.navAction}>
-                    <SafeLiquidGlass style={styles.glassCircle} blurIntensity={15} tint={isDark ? 'dark' : 'light'} pointerEvents="none" />
-                    <View pointerEvents="none" style={styles.navIconOverlay}>
-                        <ChevronLeft size={20} color={colors.text} />
-                    </View>
-                </TouchableOpacity>
+                <SafeLiquidGlass
+                    style={styles.glassCircle}
+                    blurIntensity={15}
+                    tint={isDark ? 'dark' : 'light'}
+                    onStartShouldSetResponder={() => true}
+                    onResponderRelease={() => router.back()}
+                >
+                    <ChevronLeft size={20} color={colors.text} />
+                </SafeLiquidGlass>
                 <Logo size={22} />
                 <View style={{ width: 44 }} />
             </View>
@@ -199,37 +184,27 @@ export default function SignUpScreen() {
                             containerStyle={styles.inputSpacing}
                         />
 
-                        <View style={{ marginTop: 8, height: 52, borderRadius: 22, overflow: 'hidden' }}>
+                        <View style={[styles.buttonWrapper, { marginTop: 8 }]}>
                             <SafeLiquidGlass
-                                style={[StyleSheet.absoluteFill, { borderRadius: 22 }]}
-                                blurIntensity={20}
+                                style={[styles.nativeButtonGlass, { backgroundColor: buttonBackgroundColor }]}
+                                blurIntensity={18}
+                                tintColor={Platform.OS === 'ios' ? buttonBackgroundColor : undefined}
                                 tint={isDark ? 'dark' : 'light'}
-                                pointerEvents="none"
-                            />
-                            <View
-                                pointerEvents="none"
-                                style={[
-                                    StyleSheet.absoluteFill,
-                                    {
-                                        backgroundColor: isFormValid ? withAlpha(colors.primary, 0.8) : withAlpha(colors.card, 0.5),
-                                        borderRadius: 22,
-                                    },
-                                ]}
-                            />
-                            <TouchableOpacity
-                                onPress={handleSignUp}
-                                disabled={loading || !isFormValid}
-                                activeOpacity={0.8}
-                                style={[styles.buttonTouchArea, { borderRadius: 22 }]}
+                                onStartShouldSetResponder={() => !loading && isFormValid}
+                                onResponderRelease={() => {
+                                    if (!loading && isFormValid) {
+                                        handleSignUp()
+                                    }
+                                }}
                             >
                                 {loading ? (
                                     <ModernLoader size={48} color="#fff" type="dots" />
                                 ) : (
-                                    <Text style={[styles.buttonLabel, { color: isFormValid ? '#fff' : colors.textSecondary }]}>
+                                    <Text style={[styles.buttonLabel, { color: isFormValid ? colors.button.text : colors.textSecondary }]}>
                                         {t('auth.signUp')}
                                     </Text>
                                 )}
-                            </TouchableOpacity>
+                            </SafeLiquidGlass>
                         </View>
 
                         <View style={styles.switchLink}>
@@ -263,18 +238,10 @@ const styles = StyleSheet.create({
         paddingHorizontal: 20,
         zIndex: 50,
     },
-    navAction: {
-        width: 44,
-        height: 44,
-        position: 'relative',
-    },
     glassCircle: {
         width: 44,
         height: 44,
         borderRadius: 22,
-    },
-    navIconOverlay: {
-        ...StyleSheet.absoluteFillObject,
         alignItems: 'center',
         justifyContent: 'center',
     },
@@ -312,23 +279,14 @@ const styles = StyleSheet.create({
     buttonWrapper: {
         borderRadius: 22,
         overflow: 'hidden',
+        height: 54,
     },
-    buttonTouchArea: {
-        flex: 1,
-        width: '100%',
+    nativeButtonGlass: {
+        height: 54,
+        borderRadius: 22,
+        overflow: 'hidden',
         justifyContent: 'center',
         alignItems: 'center',
-    },
-    buttonInner: {
-        flexDirection: 'row',
-        alignItems: 'center',
-        justifyContent: 'center',
-        width: '100%',
-        paddingHorizontal: 20,
-    },
-    arrowContainer: {
-        position: 'absolute',
-        right: 20,
     },
     buttonLabel: {
         fontSize: 16,

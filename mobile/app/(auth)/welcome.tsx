@@ -3,13 +3,15 @@ import { View, Text, StyleSheet, Pressable, Platform } from 'react-native'
 import { useRouter } from 'expo-router'
 import { StatusBar } from 'expo-status-bar'
 import { LinearGradient } from 'expo-linear-gradient'
-import { BlurMask, Canvas, LinearGradient as SkiaLinearGradient, Path, Rect, Skia, vec, Group } from '@shopify/react-native-skia'
+import { BlurMask, Canvas, LinearGradient as SkiaLinearGradient, Path, Rect, Group, Mask, vec, Skia } from '@shopify/react-native-skia'
 import Animated, {
     Extrapolation,
     Easing,
     interpolate,
+    interpolateColor,
     type SharedValue,
     useAnimatedStyle,
+    useDerivedValue,
     useSharedValue,
     withDelay,
     withRepeat,
@@ -22,60 +24,71 @@ import SafeLiquidGlass from '../../src/components/native/SafeLiquidGlass'
 
 const SLIDE_HOLD = 3200
 const SLIDE_TRANSITION = 1600
-const BACKGROUND_BASE = '#05070A'
 
 const SLIDES = [
     {
-        eyebrow: 'LOCAL IDENTITY',
-        left: 'Keys stay',
-        right: 'on-device',
-        detail: 'A 2048-bit RSA pair is created locally, then the private key is stored encrypted for recovery.',
+        header: 'Unbreakable Privacy',
+        detail: 'Your conversations are mathematically locked. No one else can ever read them.',
     },
     {
-        eyebrow: 'SECRET KEY RECOVERY',
-        left: 'Secret Key',
-        right: 'restores access',
-        detail: 'Your Secret Key derives the unlock material that decrypts the saved private key and rebuilds the session.',
+        header: 'Unstoppable Access',
+        detail: 'Engineered to bypass network blocks. When other apps go dark, you stay connected.',
     },
     {
-        eyebrow: 'PRIVATE RELAY ROUTING',
-        left: 'Relays carry',
-        right: 'ciphertext only',
-        detail: 'Traffic can route through private or public relays, but they only forward encrypted frames.',
+        header: 'Brilliant AI Built-in',
+        detail: 'Your personal intelligent assistant is ready to help you draft, summarize, and translate.',
     },
 ]
 
-const withAlpha = (hex: string, alpha: number) => {
-    const clamped = Math.round(Math.min(Math.max(alpha, 0), 1) * 255)
-    return `${hex.slice(0, 7)}${clamped.toString(16).padStart(2, '0')}`
+function hexToRgba(color: string, alpha: number): string {
+    'worklet';
+    if (!color) return `rgba(127, 127, 127, ${alpha})`
+    if (color.startsWith('#')) {
+        const hex = color.replace('#', '')
+        const r = parseInt(hex.substring(0, 2), 16)
+        const g = parseInt(hex.substring(2, 4), 16)
+        const b = parseInt(hex.substring(4, 6), 16)
+        return `rgba(${r}, ${g}, ${b}, ${alpha})`
+    }
+    if (color.startsWith('rgba')) {
+        return color.replace(/[\d\.]+\)$/g, `${alpha})`)
+    }
+    return color
 }
 
-const mixHexColors = (from: string, to: string, amount: number) => {
-    const clamped = Math.min(Math.max(amount, 0), 1)
-    const fromR = parseInt(from.slice(1, 3), 16)
-    const fromG = parseInt(from.slice(3, 5), 16)
-    const fromB = parseInt(from.slice(5, 7), 16)
-    const toR = parseInt(to.slice(1, 3), 16)
-    const toG = parseInt(to.slice(3, 5), 16)
-    const toB = parseInt(to.slice(5, 7), 16)
+const getP = (val: number) => {
+    'worklet';
+    let p = val % 3;
+    if (p < 0) p += 3;
+    return p;
+};
 
-    const r = Math.round(fromR + (toR - fromR) * clamped)
-    const g = Math.round(fromG + (toG - fromG) * clamped)
-    const b = Math.round(fromB + (toB - fromB) * clamped)
+const getInterpolatedColor = (p: number, arr: string[]) => {
+    'worklet';
+    if (p < 1) return interpolateColor(p, [0, 1], [arr[0], arr[1]], 'RGB');
+    if (p < 2) return interpolateColor(p - 1, [0, 1], [arr[1], arr[2]], 'RGB');
+    return interpolateColor(p - 2, [0, 1], [arr[2], arr[0]], 'RGB');
+};
 
-    return `#${[r, g, b].map((value) => value.toString(16).padStart(2, '0')).join('')}`
-}
-
-function InsetBeamWord({
-    word,
-    color,
-    textColor,
+function HeaderLightBeam({
+    accents,
+    outerHalo,
+    innerHalo,
+    outerCore,
+    innerCore,
+    progress,
+    introProgress,
+    size
 }: {
-    word: string
-    color: string
-    textColor: string
+    accents: string[]
+    outerHalo: string[]
+    innerHalo: string[]
+    outerCore: string[]
+    innerCore: string[]
+    progress: SharedValue<number>
+    introProgress?: SharedValue<number>
+    size: { width: number, height: number }
 }) {
-    const [size, setSize] = useState({ width: 0, height: 0 })
     const pulse = useSharedValue(0.78)
 
     useEffect(() => {
@@ -87,262 +100,526 @@ function InsetBeamWord({
     }, [pulse])
 
     const lightStyle = useAnimatedStyle(() => ({
-        opacity: interpolate(pulse.value, [0.78, 1], [0.76, 1]),
+        opacity: interpolate(pulse.value, [0.78, 1], [0.94, 1]),
     }))
+
+    const activeColor = useDerivedValue(() => getInterpolatedColor(getP(progress.value), accents));
+    const haloColors = useDerivedValue(() => [
+        getInterpolatedColor(getP(progress.value), outerHalo),
+        getInterpolatedColor(getP(progress.value), innerHalo),
+        'transparent'
+    ]);
+    const coreColors = useDerivedValue(() => [
+        getInterpolatedColor(getP(progress.value), outerCore),
+        getInterpolatedColor(getP(progress.value), innerCore),
+        'transparent'
+    ]);
+
+    const introStyle = useAnimatedStyle(() => {
+        if (!introProgress) return {};
+        return {
+            opacity: interpolate(introProgress.value, [0.15, 0.45], [0, 1], Extrapolation.CLAMP)
+        }
+    });
 
     const width = Math.max(size.width, 1)
     const height = Math.max(size.height, 1)
-
-    const dormantTextColor = mixHexColors(BACKGROUND_BASE, color, 0.48)
-    const activeTextColor = mixHexColors(textColor, color, 0.14)
-    const exitTextColor = mixHexColors(BACKGROUND_BASE, color, 0.34)
-    const dormantGlowColor = mixHexColors(BACKGROUND_BASE, color, 0.72)
-    const activeGlowColor = mixHexColors(textColor, color, 0.28)
-    const exitGlowColor = mixHexColors(BACKGROUND_BASE, color, 0.56)
-
-    // Extends the Canvas bounds so the blur doesn't get clipped
-    const GLOW_OVERFLOW = 50;
-
-
-
-
+    const GLOW_OVERFLOW = 64;
 
     const corePath = Skia.Path.MakeFromSVGString(
         `M 4 ${height * 0.18}
-         L ${Math.max(width * 0.22, 18)} ${height * 0.06}
-         L ${width - 2} ${height * 0.28}
-         L ${width - 2} ${height * 0.72}
-         L ${Math.max(width * 0.22, 18)} ${height * 0.94}
+         L ${Math.min(width * 0.15, 30)} ${height * 0.06}
+         L ${width + 10} ${height * 0.28}
+         L ${width + 10} ${height * 0.72}
+         L ${Math.min(width * 0.15, 30)} ${height * 0.94}
          L 4 ${height * 0.82} Z`
     )
     const haloPath = Skia.Path.MakeFromSVGString(
         `M 0 ${height * 0.10}
-         L ${Math.max(width * 0.16, 14)} ${height * 0.01}
-         L ${width} ${height * 0.20}
-         L ${width} ${height * 0.80}
-         L ${Math.max(width * 0.16, 14)} ${height * 0.99}
+         L ${Math.max(width * 0.12, 10)} ${height * 0.01}
+         L ${width + 20} ${height * 0.20}
+         L ${width + 20} ${height * 0.80}
+         L ${Math.max(width * 0.12, 10)} ${height * 0.99}
          L 0 ${height * 0.90} Z`
     )
 
     return (
-        <View
-            style={styles.beamWord}
-            onLayout={(event) => {
-                const { width: nextWidth, height: nextHeight } = event.nativeEvent.layout
-                if (nextWidth !== size.width || nextHeight !== size.height) {
-                    setSize({ width: nextWidth, height: nextHeight })
-                }
-            }}
+        <Animated.View
+            pointerEvents="none"
+            style={[
+                { position: 'absolute', top: -GLOW_OVERFLOW, left: -GLOW_OVERFLOW, right: -GLOW_OVERFLOW, bottom: -GLOW_OVERFLOW },
+                lightStyle,
+                introStyle
+            ]}
         >
-            <Animated.View
-                pointerEvents="none"
-                style={[
-                    { position: 'absolute', top: -GLOW_OVERFLOW, left: -GLOW_OVERFLOW, right: -GLOW_OVERFLOW, bottom: -GLOW_OVERFLOW },
-                    lightStyle
-                ]}
-            >
-                <Canvas style={StyleSheet.absoluteFill}>
-                    <Group transform={[{ translateX: GLOW_OVERFLOW }, { translateY: GLOW_OVERFLOW }]}>
-                        {haloPath && (
-                            <Path path={haloPath}>
-                                <SkiaLinearGradient
-                                    start={vec(0, height * 0.5)}
-                                    end={vec(width, height * 0.5)}
-                                    colors={[withAlpha(color, 0.4), withAlpha(color, 0.1), 'transparent']}
-                                />
-                                <BlurMask blur={35} style="normal" />
-                            </Path>
-                        )}
-                        {corePath && (
-                            <Path path={corePath}>
-                                <SkiaLinearGradient
-                                    start={vec(0, height * 0.5)}
-                                    end={vec(width + 40, height * 0.5)}
-                                    colors={[withAlpha(color, 0.6), withAlpha(color, 0.15), 'transparent']}
-                                />
-                                <BlurMask blur={15} style="normal" />
-                            </Path>
-                        )}
-                        <Rect
-                            x={0}
-                            y={height * 0.16}
-                            width={5}
-                            height={height * 0.68}
-                            color={color}
-                        >
-                            <BlurMask blur={8} style="normal" />
-                        </Rect>
-                        <Rect
-                            x={1}
-                            y={height * 0.18}
-                            width={2}
-                            height={height * 0.64}
-                            color="#FFFFFF"
-                        >
-                            <BlurMask blur={2} style="normal" />
-                        </Rect>
-                    </Group>
-                </Canvas>
-            </Animated.View>
-
-            <Text
-                style={[
-                    styles.rightText,
-                    {
-                        color: withAlpha(textColor, 0.5),
-                        textShadowColor: withAlpha(color, 0.3),
-                    }
-                ]}
-            >
-                {word}
-            </Text>
-        </View>
+            <Canvas style={StyleSheet.absoluteFill}>
+                <Group transform={[{ translateX: GLOW_OVERFLOW }, { translateY: GLOW_OVERFLOW }]}>
+                    {haloPath && (
+                        <Path path={haloPath}>
+                            <SkiaLinearGradient
+                                start={vec(0, height * 0.5)}
+                                end={vec(width, height * 0.5)}
+                                colors={haloColors}
+                            />
+                            <BlurMask blur={32} style="normal" />
+                        </Path>
+                    )}
+                    {corePath && (
+                        <Path path={corePath}>
+                            <SkiaLinearGradient
+                                start={vec(0, height * 0.5)}
+                                end={vec(width + 40, height * 0.5)}
+                                colors={coreColors}
+                            />
+                            <BlurMask blur={16} style="normal" />
+                        </Path>
+                    )}
+                </Group>
+                <Group transform={[{ translateX: GLOW_OVERFLOW }, { translateY: GLOW_OVERFLOW }]}>
+                    <Rect
+                        x={0}
+                        y={height * 0.12}
+                        width={8}
+                        height={height * 0.76}
+                        color={hexToRgba('#FFF6F1', 0.4)}
+                    >
+                        <BlurMask blur={8} style="normal" />
+                    </Rect>
+                    <Rect
+                        x={1}
+                        y={height * 0.14}
+                        width={4.5}
+                        height={height * 0.72}
+                        color={activeColor}
+                    >
+                        <BlurMask blur={4} style="normal" />
+                    </Rect>
+                    <Rect
+                        x={2}
+                        y={height * 0.16}
+                        width={2.4}
+                        height={height * 0.68}
+                        color="#FFFFFF"
+                    >
+                        <BlurMask blur={1} style="normal" />
+                    </Rect>
+                </Group>
+            </Canvas>
+        </Animated.View>
     )
 }
+
+const AnimatedDetailWord = React.memo(({
+    word,
+    wordIndex,
+    totalWords,
+    progress,
+    index,
+    introProgress,
+    isFirst,
+    textStyle,
+}: any) => {
+    const wordStyle = useAnimatedStyle(() => {
+        let diff = progress.value - index;
+        if (diff > 1.5) diff -= 3;
+        if (diff < -1.5) diff += 3;
+
+        const introStagger = wordIndex * 0.02;
+        const outroStagger = wordIndex * 0.01;
+
+        const opacitySlide = interpolate(
+            diff,
+            [-0.75 + introStagger, -0.25 + introStagger, 0.2 + outroStagger, 0.6 + outroStagger],
+            [0, 1, 1, 0],
+            Extrapolation.CLAMP
+        );
+
+        const translateXSlide = interpolate(
+            diff,
+            [-0.75 + introStagger, -0.25 + introStagger, 0.2 + outroStagger, 0.6 + outroStagger],
+            [-16, 0, 0, 16],
+            Extrapolation.CLAMP
+        );
+
+        let introOpacity = 1;
+        let introTx = 0;
+        if (isFirst && introProgress) {
+            const introInitStagger = wordIndex * 0.03;
+            introOpacity = interpolate(
+                introProgress.value,
+                [0.35 + introInitStagger, 0.55 + introInitStagger],
+                [0, 1],
+                Extrapolation.CLAMP
+            );
+            introTx = interpolate(
+                introProgress.value,
+                [0.35 + introInitStagger, 0.55 + introInitStagger],
+                [-16, 0],
+                Extrapolation.CLAMP
+            );
+        }
+
+        return {
+            opacity: isFirst ? (opacitySlide * introOpacity) : opacitySlide,
+            transform: [{ translateX: isFirst ? (translateXSlide + introTx) : translateXSlide }],
+        };
+    });
+
+    return (
+        <Animated.Text style={[textStyle, wordStyle]}>
+            {word}{wordIndex < totalWords - 1 ? ' ' : ''}
+        </Animated.Text>
+    );
+});
+
+function AnimatedLetters({ text, progress, index, introProgress, isFirst, textStyle }: any) {
+    const words = text.split(' ');
+
+    return (
+        <View style={{ flexDirection: 'row', flexWrap: 'wrap' }}>
+            {words.map((word: string, wIndex: number) => {
+                return (
+                    <AnimatedDetailWord
+                        key={`detail-word-${wIndex}`}
+                        word={word}
+                        wordIndex={wIndex}
+                        totalWords={words.length}
+                        progress={progress}
+                        index={index}
+                        introProgress={introProgress}
+                        isFirst={isFirst}
+                        textStyle={textStyle}
+                    />
+                );
+            })}
+        </View>
+    );
+}
+
+const AnimatedHeaderWord = React.memo(({
+    word,
+    wordIndex,
+    totalWords,
+    progress,
+    index,
+    introProgress,
+    isFirst,
+    textStyle,
+}: any) => {
+    const wordStyle = useAnimatedStyle(() => {
+        let diff = progress.value - index;
+        if (diff > 1.5) diff -= 3;
+        if (diff < -1.5) diff += 3;
+
+        const introStagger = wordIndex * 0.05;
+        const outroStagger = wordIndex * 0.03;
+
+        const opacitySlide = interpolate(
+            diff,
+            [-0.5 + introStagger, -0.15 + introStagger, 0.2 + outroStagger, 0.45 + outroStagger],
+            [0, 1, 1, 0],
+            Extrapolation.CLAMP
+        );
+
+        const translateXSlide = interpolate(
+            diff,
+            [-0.5 + introStagger, -0.15 + introStagger, 0.2 + outroStagger, 0.45 + outroStagger],
+            [-24, 0, 0, 24],
+            Extrapolation.CLAMP
+        );
+
+        let introOpacity = 1;
+        let introTx = 0;
+        if (isFirst && introProgress) {
+            const introInitStagger = wordIndex * 0.05;
+            introOpacity = interpolate(
+                introProgress.value,
+                [0.35 + introInitStagger, 0.55 + introInitStagger],
+                [0, 1],
+                Extrapolation.CLAMP
+            );
+            introTx = interpolate(
+                introProgress.value,
+                [0.35 + introInitStagger, 0.55 + introInitStagger],
+                [-24, 0],
+                Extrapolation.CLAMP
+            );
+        }
+
+        const mergedOpacity = isFirst ? (opacitySlide * introOpacity) : opacitySlide;
+        const mergedTx = isFirst ? (translateXSlide + introTx) : translateXSlide;
+
+        return {
+            opacity: mergedOpacity,
+            transform: [{ translateX: mergedTx }],
+        };
+    });
+
+    return (
+        <Animated.Text style={[textStyle, wordStyle]}>
+            {word}{wordIndex < totalWords - 1 ? ' ' : ''}
+        </Animated.Text>
+    );
+});
+
+const AnimatedHeaderLetters = React.memo(({ text, progress, index, introProgress, isFirst, textStyle }: any) => {
+    const words = text.split(' ');
+
+    return (
+        <View style={{ flexDirection: 'row', flexWrap: 'wrap' }}>
+            {words.map((word: string, wIndex: number) => {
+                return (
+                    <AnimatedHeaderWord
+                        key={`word-${wIndex}`}
+                        word={word}
+                        wordIndex={wIndex}
+                        totalWords={words.length}
+                        progress={progress}
+                        index={index}
+                        introProgress={introProgress}
+                        isFirst={isFirst}
+                        textStyle={textStyle}
+                    />
+                );
+            })}
+        </View>
+    );
+});
 
 function FeatureSlide({
     slide,
     index,
     progress,
-    accent,
     textColor,
     mutedColor,
+    introProgress,
+    onHeaderLayout,
 }: {
     slide: (typeof SLIDES)[number]
     index: number
     progress: SharedValue<number>
-    accent: string
     textColor: string
     mutedColor: string
+    introProgress: SharedValue<number>
+    onHeaderLayout?: (size: { width: number, height: number }) => void
 }) {
-    const slideStyle = useAnimatedStyle(() => {
-        const diff = progress.value - index
-        // Dramatic reveal instead of sliding
-        const translateY = interpolate(diff, [-0.72, 0, 0.72], [10, 0, -10], Extrapolation.CLAMP)
-        const scale = interpolate(diff, [-0.72, 0, 0.72], [0.95, 1, 1.05], Extrapolation.CLAMP)
-        const opacity = interpolate(diff, [-0.6, -0.4, 0.4, 0.6], [0, 1, 1, 0], Extrapolation.CLAMP)
+    const isFirst = index === 0;
 
-        return {
-            opacity,
-            transform: [
-                { translateY },
-                { scale }
-            ] as any,
-        }
-    })
+    const opacStyle = useAnimatedStyle(() => {
+        let diff = progress.value - index;
+        if (diff > 1.5) diff -= 3;
+        if (diff < -1.5) diff += 3;
+        const op = interpolate(diff, [-0.85, -0.2, 0.2, 0.7], [0, 1, 1, 0], Extrapolation.CLAMP)
+        return { opacity: op };
+    });
 
-    // Subtitle transitions softly out of focus
-    const detailStyle = useAnimatedStyle(() => {
-        const diff = progress.value - index
-        const opacity = interpolate(diff, [-0.4, 0, 0.4], [0, 1, 0], Extrapolation.CLAMP)
-        const translateY = interpolate(diff, [-0.5, 0, 0.5], [8, 0, -8], Extrapolation.CLAMP)
-
-        return {
-            opacity,
-            transform: [{ translateY }]
-        }
+    const introWordReveal = useAnimatedStyle(() => {
+        if (!isFirst || !introProgress) return {};
+        const op = interpolate(introProgress.value, [0.50, 0.70], [0, 1], Extrapolation.CLAMP);
+        return { opacity: op };
     })
 
     return (
-        <Animated.View style={[styles.slideFrame, slideStyle]} pointerEvents="none">
-            <View style={styles.headlineRow}>
-                <Text style={[styles.leftText, { color: textColor }]}>{slide.left}</Text>
-                <InsetBeamWord
-                    word={slide.right}
-                    color={accent}
-                    textColor={textColor}
+        <Animated.View style={[styles.slideFrame, opacStyle]} pointerEvents="none">
+            <View
+                style={styles.beamWord}
+                onLayout={(event) => {
+                    if (!isFirst || !onHeaderLayout) return
+                    const { width, height } = event.nativeEvent.layout
+                    const adjustedHeight = Platform.OS === 'ios'
+                        ? Math.max(28, height - 6)
+                        : Math.max(24, height - 8)
+                    onHeaderLayout({ width, height: adjustedHeight })
+                }}
+            >
+                <AnimatedHeaderLetters
+                    text={slide.header}
+                    progress={progress}
+                    index={index}
+                    introProgress={introProgress}
+                    isFirst={isFirst}
+                    textStyle={[
+                        styles.headerText,
+                        { color: hexToRgba(textColor, 0.9) }
+                    ]}
                 />
             </View>
 
-            <Animated.Text style={[styles.detailText, { color: mutedColor }, detailStyle]}>
-                {slide.detail}
-            </Animated.Text>
+            <View style={{ paddingLeft: 10, marginTop: 12 }}>
+                <AnimatedLetters
+                    text={slide.detail}
+                    progress={progress}
+                    index={index}
+                    introProgress={introProgress}
+                    isFirst={isFirst}
+                    textStyle={[styles.detailText, { color: mutedColor }]}
+                />
+            </View>
         </Animated.View>
     )
 }
 
 export default function WelcomeScreen() {
-    const { colors } = useThemeStore()
+    const { colors, effectiveTheme } = useThemeStore()
     const router = useRouter()
     const slideProgress = useSharedValue(0)
+    const introProgress = useSharedValue(0)
+    const [headerSize, setHeaderSize] = useState({ width: 300, height: 50 })
+    const isDark = effectiveTheme === 'dark'
 
     useEffect(() => {
-        const ease = Easing.inOut(Easing.quad) // Smoother easing
-        slideProgress.value = withRepeat(
-            withSequence(
-                withDelay(SLIDE_HOLD, withTiming(1, { duration: SLIDE_TRANSITION, easing: ease })),
-                withDelay(SLIDE_HOLD, withTiming(2, { duration: SLIDE_TRANSITION, easing: ease })),
-                withDelay(SLIDE_HOLD, withTiming(3, { duration: SLIDE_TRANSITION, easing: ease })),
-                withTiming(0, { duration: 0 })
-            ),
-            -1,
-            false
-        )
-    }, [slideProgress])
+        introProgress.value = withTiming(1, { duration: 2500, easing: Easing.out(Easing.cubic) })
 
-    const slideAccents = [colors.palette.orange, colors.primary, colors.palette.sky]
+        const ease = Easing.inOut(Easing.quad)
+
+        const timeout = setTimeout(() => {
+            slideProgress.value = withRepeat(
+                withSequence(
+                    withDelay(SLIDE_HOLD, withTiming(1, { duration: SLIDE_TRANSITION, easing: ease })),
+                    withDelay(SLIDE_HOLD, withTiming(2, { duration: SLIDE_TRANSITION, easing: ease })),
+                    withDelay(SLIDE_HOLD, withTiming(3, { duration: SLIDE_TRANSITION, easing: ease })),
+                    withTiming(0, { duration: 0 })
+                ),
+                -1,
+                false
+            )
+        }, 2800)
+        return () => clearTimeout(timeout)
+    }, [slideProgress, introProgress])
+
+    const backgroundBase = colors.background
+    const shaderGlow = isDark ? '#B9826B' : colors.palette.orange
+    const shaderCyan = isDark ? '#2E5D8A' : colors.palette.sky
+    const primaryTextColor = colors.text
+    const mutedTextColor = hexToRgba(colors.text, isDark ? 0.6 : 0.72)
+    const buttonGlassColor = hexToRgba(colors.button.background, isDark ? 0.18 : 0.7)
+    const buttonWashStrong = hexToRgba(colors.button.background, isDark ? 0.28 : 0.26)
+    const buttonWashSoft = hexToRgba(colors.button.background, isDark ? 0.12 : 0.14)
+    const slideAccents = [
+        isDark ? colors.palette.orange : colors.palette.rose,
+        colors.primary,
+        isDark ? colors.palette.sky : colors.palette.blue,
+    ]
+
+    const outerHalo = slideAccents.map(c => hexToRgba(c, 0.78));
+    const innerHalo = slideAccents.map(c => hexToRgba(c, 0.34));
+    const outerCore = slideAccents.map(c => hexToRgba(c, 0.98));
+    const innerCore = slideAccents.map(c => hexToRgba(c, 0.52));
+
+    const pageIntroStyle = useAnimatedStyle(() => {
+        const ty = interpolate(introProgress.value, [0, 1], [60, 0], Extrapolation.CLAMP);
+        return { transform: [{ translateY: ty }] };
+    })
+
+    const bottomIntroStyle = useAnimatedStyle(() => {
+        const ty = interpolate(introProgress.value, [0, 1], [60, 0], Extrapolation.CLAMP);
+        const op = interpolate(introProgress.value, [0, 0.5], [0, 1], Extrapolation.CLAMP);
+        return { opacity: op, transform: [{ translateY: ty }] };
+    })
 
     return (
-        <View style={[styles.container, { backgroundColor: BACKGROUND_BASE }]}> 
-            <StatusBar style="light" />
+        <View style={[styles.container, { backgroundColor: backgroundBase }]}>
+            <StatusBar style={isDark ? 'light' : 'dark'} />
 
             <SkiaAnimatedBackground
-                baseColor={BACKGROUND_BASE}
-                glowColor="#B9826B"
-                cyanColor="#2E5D8A"
+                baseColor={backgroundBase}
+                glowColor={shaderGlow}
+                cyanColor={shaderCyan}
                 slideProgress={slideProgress}
-                intensity={0.56}
-                contrast={0.6}
-                grainAmount={0.32}
-                darken={0.14}
+                introProgress={introProgress}
+                intensity={isDark ? 0.56 : 0.38}
+                contrast={isDark ? 0.6 : 0.5}
+                grainAmount={isDark ? 0.32 : 0.18}
+                darken={isDark ? 0.14 : 0.03}
             />
 
-            {/* Gradient overlays to ensure text remains perfectly readable and cinematic */}
             <View pointerEvents="none" style={StyleSheet.absoluteFill}>
                 <LinearGradient
-                    colors={['transparent', withAlpha(BACKGROUND_BASE, 0.6), BACKGROUND_BASE]}
+                    colors={['transparent', hexToRgba(backgroundBase, isDark ? 0.6 : 0.7), backgroundBase]}
                     locations={[0, 0.6, 1]}
                     style={StyleSheet.absoluteFill}
                 />
             </View>
 
-            <View style={styles.mainContent}>
+            <Animated.View style={[styles.mainContent, pageIntroStyle]}>
                 <View style={styles.textContainer}>
+                    <View
+                        style={[
+                            styles.beamWordBackgroundTracker,
+                            {
+                                width: headerSize.width,
+                                height: headerSize.height,
+                            },
+                        ]}
+                        pointerEvents="none"
+                    >
+                        <HeaderLightBeam
+                            size={headerSize}
+                            accents={slideAccents}
+                            outerHalo={outerHalo}
+                            innerHalo={innerHalo}
+                            outerCore={outerCore}
+                            innerCore={innerCore}
+                            progress={slideProgress}
+                            introProgress={introProgress}
+                        />
+                    </View>
+
                     {SLIDES.map((slide, index) => (
                         <FeatureSlide
                             key={index}
                             slide={slide}
                             index={index}
                             progress={slideProgress}
-                            accent={slideAccents[index]}
-                            textColor={'#FFFFFF'}
-                            mutedColor={withAlpha('#FFFFFF', 0.6)}
+                            introProgress={introProgress}
+                            textColor={primaryTextColor}
+                            mutedColor={mutedTextColor}
+                            onHeaderLayout={(nextSize) => {
+                                if (index !== 0) return
+                                if (nextSize.width !== headerSize.width || nextSize.height !== headerSize.height) {
+                                    setHeaderSize(nextSize)
+                                }
+                            }}
                         />
                     ))}
                 </View>
-            </View>
+            </Animated.View>
 
-            <View style={styles.bottomArea}>
-                <View style={styles.buttonWrapper}>
-                    <SafeLiquidGlass style={[StyleSheet.absoluteFill, { borderRadius: 30 }]} blurIntensity={20} pointerEvents="none" />
+            <Animated.View style={[styles.bottomArea, bottomIntroStyle]}>
+                <SafeLiquidGlass
+                    style={[
+                        styles.buttonWrapper,
+                        { backgroundColor: buttonGlassColor },
+                    ]}
+                    blurIntensity={20}
+                    tint={isDark ? 'dark' : 'light'}
+                    tintColor={buttonGlassColor}
+                >
                     <Pressable
                         onPress={() => router.push('/(auth)/signup')}
                         style={({ pressed }) => [
                             styles.mainButton,
-                            { backgroundColor: colors.button.background },
-                            { opacity: pressed ? 0.85 : 1 }
+                            { backgroundColor: buttonWashSoft },
+                            { opacity: pressed ? 0.78 : 1 }
                         ]}
                     >
+                        <LinearGradient
+                            pointerEvents="none"
+                            colors={[buttonWashStrong, buttonWashSoft]}
+                            start={{ x: 0.08, y: 0 }}
+                            end={{ x: 0.92, y: 1 }}
+                            style={StyleSheet.absoluteFill}
+                        />
                         <Text style={[styles.mainButtonText, { color: colors.button.text }]}>Create account</Text>
                     </Pressable>
-                </View>
+                </SafeLiquidGlass>
 
                 <Pressable onPress={() => router.push('/(auth)/signin')} style={{ paddingVertical: 12 }}>
-                    <Text style={[styles.signInTextBase, { color: withAlpha(colors.text, 0.6) }]}> 
+                    <Text style={[styles.signInTextBase, { color: hexToRgba(colors.text, 0.6) }]}>
                         Already have an account? <Text style={[styles.signInTextHighlight, { color: colors.primary }]}>Sign in</Text>
                     </Text>
                 </Pressable>
-            </View>
+            </Animated.View>
         </View>
     )
 }
@@ -353,62 +630,52 @@ const styles = StyleSheet.create({
     },
     mainContent: {
         flex: 1,
-        justifyContent: 'center',
+        justifyContent: 'flex-end',
         alignItems: 'flex-start',
         paddingHorizontal: 24,
-        marginTop: 60, // Push it down slightly into the rich gradient
+        paddingBottom: Platform.OS === 'ios' ? 220 : 196,
     },
     textContainer: {
         width: '100%',
-        minHeight: 200,
-        justifyContent: 'center',
-        alignItems: 'flex-start',
+        minHeight: 152,
+        position: 'relative',
+    },
+    beamWordBackgroundTracker: {
+        position: 'absolute',
+        top: 0,
+        left: 0,
+        zIndex: 2,
     },
     slideFrame: {
         position: 'absolute',
         width: '100%',
         alignItems: 'flex-start',
-    },
-    headlineRow: {
-        flexDirection: 'row',
-        alignItems: 'center',
-        justifyContent: 'flex-start',
-        flexWrap: 'wrap', // Allow wrapping on small screens
-        width: '100%',
-        paddingRight: 20,
-    },
-    leftText: {
-        fontSize: Platform.OS === 'ios' ? 44 : 38,
-        lineHeight: Platform.OS === 'ios' ? 52 : 46,
-        fontFamily: 'SpaceGrotesk-Regular',
-        fontWeight: '300', // Thinner, larger, more elegant
-        letterSpacing: -1.8,
+        zIndex: 3,
     },
     beamWord: {
-        minHeight: 52,
-        marginLeft: 8,
-        paddingLeft: 18,
-        paddingRight: 8,
-        justifyContent: 'center',
+        alignSelf: 'flex-start',
+        height: Platform.OS === 'ios' ? 32 : 28,
+        paddingLeft: 10,
+        paddingTop: 0,
+        paddingBottom: 0,
+        justifyContent: 'flex-start',
     },
-    rightText: {
-        fontSize: Platform.OS === 'ios' ? 44 : 38,
-        lineHeight: Platform.OS === 'ios' ? 52 : 46,
-        fontFamily: 'SpaceGrotesk-Regular',
-        fontWeight: '300',
-        letterSpacing: -1.8,
-        textShadowOffset: { width: 0, height: 0 },
-        textShadowRadius: 24, // Softer text shadow bleed
+    headerText: {
+        fontSize: Platform.OS === 'ios' ? 26 : 22,
+        lineHeight: Platform.OS === 'ios' ? 32 : 28,
+        fontFamily: 'SpaceGrotesk-Bold',
+        fontWeight: '700',
+        letterSpacing: -0.8,
+        includeFontPadding: false,
     },
     detailText: {
-        marginTop: 24,
-        maxWidth: 340, // Narrow column for easier reading
+        maxWidth: 340,
         textAlign: 'left',
         fontSize: 16,
-        lineHeight: 24,
+        lineHeight: 23,
         fontFamily: 'SpaceGrotesk-Regular',
         fontWeight: '400',
-        letterSpacing: 0,
+        letterSpacing: -0.2,
     },
     bottomArea: {
         position: 'absolute',

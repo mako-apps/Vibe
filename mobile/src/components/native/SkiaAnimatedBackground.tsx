@@ -11,6 +11,7 @@ uniform vec3 baseColor;
 uniform vec3 glowColor;
 uniform vec3 cyanColor;
 uniform float slideProgress;
+uniform float introProgress;
 uniform float intensity;
 uniform float contrast;
 uniform float grainAmount;
@@ -35,9 +36,9 @@ half4 main(float2 fragCoord) {
     float t = iTime * 0.02;
     float sp = mod(abs(slideProgress), 3.0);
 
-    // Completely lock the shape in the center of the screen
-    // It will NEVER drift left, right, up, or down across slides.
-    vec2 basePos = vec2(0.5, 0.42);
+    // Completely lock the shape in the screen
+    // Intro animates from top (-0.3) to center (0.42) like a tree growing downwards
+    vec2 basePos = vec2(0.5, mix(-0.3, 0.42, pow(introProgress, 0.8)));
     
     // Gentle hovering ambient motion
     basePos.x += sin(t * 0.4) * 0.06;
@@ -69,10 +70,11 @@ half4 main(float2 fragCoord) {
     float angle = atan(d.y, d.x);
     dist -= sin(angle * 5.0 + t * 2.0) * 0.15;
 
-    // Remove the hardcoded size hopping based on slide progress (sp <= 1.0 vs 2.0) 
-    // which caused size skipping on loop reset.
-    // Instead we drive a seamless gentle breathing using iTime
+    // We drive a seamless gentle breathing using iTime
     float currentSize = 0.55 + sin(t * 1.5) * 0.05;
+    
+    // Intro animation: scale width slightly while rising to complete tree effect
+    currentSize *= mix(0.2, 1.0, introProgress);
 
     float blob = smoothstep(currentSize, 0.0, dist);
     
@@ -125,6 +127,8 @@ interface SkiaAnimatedBackgroundProps {
     backgroundColor?: string;
     /** 0→2 for welcome slides, omit for settled state */
     slideProgress?: SharedValue<number>;
+    /** 0→1 for intro growth */
+    introProgress?: SharedValue<number>;
     intensity?: number;
     contrast?: number;
     grainAmount?: number;
@@ -137,6 +141,7 @@ export const SkiaAnimatedBackground = ({
     cyanColor = '#06b6d4',
     backgroundColor = '#000000',
     slideProgress,
+    introProgress,
     intensity = 1,
     contrast = 1,
     grainAmount = 1,
@@ -168,11 +173,12 @@ export const SkiaAnimatedBackground = ({
         glowColor: glow.value,
         cyanColor: cyan.value,
         slideProgress: slideProgress ? slideProgress.value : 2.0,
+        introProgress: introProgress ? introProgress.value : 1.0,
         intensity,
         contrast,
         grainAmount,
         darken,
-    }), [width, height, pixelRatio, time, base, glow, cyan, slideProgress, intensity, contrast, grainAmount, darken]);
+    }), [width, height, pixelRatio, time, base, glow, cyan, slideProgress, introProgress, intensity, contrast, grainAmount, darken]);
 
     if (!runtimeEffect) {
         return <View style={[StyleSheet.absoluteFill, { backgroundColor }]} />;
