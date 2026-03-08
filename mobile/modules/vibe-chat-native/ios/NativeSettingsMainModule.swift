@@ -958,7 +958,7 @@ final class NativeSettingsMainView: ExpoView, UIScrollViewDelegate {
 
   private func applyTheme() {
     backgroundView.backgroundColor = theme.background
-    headerTintView.backgroundColor = theme.background
+    headerTintView.backgroundColor = theme.background.withAlphaComponent(0.7)
     nameLabel.textColor = theme.text
     subtitleLabel.textColor = theme.secondaryText
     footerLabel.textColor = theme.secondaryText
@@ -970,7 +970,7 @@ final class NativeSettingsMainView: ExpoView, UIScrollViewDelegate {
     editButton.setGlassTheme(isDark: theme.isDark)
     penButton.setGlassTheme(isDark: theme.isDark)
     headerBlurView.effect = UIBlurEffect(
-      style: theme.isDark ? .systemUltraThinMaterialDark : .systemUltraThinMaterialLight)
+      style: theme.isDark ? .systemThinMaterialDark : .systemThinMaterialLight)
     badgeView.configure(tier: currentBadgeTier)
     rebuildSections()
   }

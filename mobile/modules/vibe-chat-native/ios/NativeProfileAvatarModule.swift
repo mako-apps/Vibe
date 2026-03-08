@@ -198,6 +198,7 @@ private struct NativeProfileAvatarGlassMorphView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
       }
       .environment(\.colorScheme, .dark)
+      .background(Color.black.opacity(0.3))  // Darken the glass effect
 
       // ── 2. ISLAND COVER ──
       // Capsule matching page background color sits permanently over
