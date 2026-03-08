@@ -8,7 +8,7 @@ import { useChatStore } from '../../src/lib/ChatStore'
 import { useCallStore } from '../../src/lib/stores/CallStore'
 import { useUIStore } from '../../src/lib/stores/ui-store'
 import { Copy, Check, Pin, VolumeX, Trash2, Pencil, Settings, User, Search, Circle, CheckCircle, Smartphone, Plus, X, Shield, Bookmark } from 'lucide-react-native'
-import { PlusCircleVibeIcon, AnimatedShieldIcon, EditChatVibeIcon } from '../../src/components/Icons'
+import { PlusCircleVibeIcon, AnimatedShieldIcon, EditChatVibeIcon, VibeLogoIcon, VibeAgentLogo } from '../../src/components/Icons'
 import * as Clipboard from 'expo-clipboard'
 import * as Haptics from 'expo-haptics'
 import { useRouter, Stack } from 'expo-router'
@@ -1182,14 +1182,39 @@ export default function HomeScreen({ onChatSelect, onOpenStoryCamera }: HomeScre
                     />
                 </View>
             </View>
-            <Text style={[styles.emptyDescription, { color: withAlpha(colors.text, 0.6), marginTop: 20, marginBottom: 30 }]}>
-                Waiting for a friend?
+            <Text style={[styles.emptyDescription, { color: colors.text, marginTop: 10, marginBottom: 8, fontSize: 24, fontWeight: '600', letterSpacing: -0.5 }]}>
+                No messages yet
             </Text>
-            <TouchableOpacity onPress={() => safePress('openMainMenuSearch', () => setShowMainMenu(true))} activeOpacity={0.8}>
-                <View style={[styles.actionButton, { backgroundColor: colors.button?.background || colors.primary }]}>
-                    <Text style={{ color: colors.button?.text || '#ffffff', fontSize: 14, fontWeight: '500' }}>Start Vibing</Text>
-                </View>
-            </TouchableOpacity>
+            <Text style={[{ color: withAlpha(colors.text, 0.6), marginBottom: 30, fontSize: 16 }]}>
+                Start a conversation to catch the vibe.
+            </Text>
+            <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 12, paddingHorizontal: 20, width: '100%', maxWidth: 360 }}>
+                <TouchableOpacity onPress={() => safePress('openAgent', () => router.push('/agent'))} activeOpacity={0.8} style={{ flex: 1 }}>
+                    <SafeLiquidGlass
+                        style={{ paddingVertical: 12, borderRadius: 24, borderWidth: 1, borderColor: withAlpha(colors.text, 0.1), alignItems: 'center' }}
+                        blurIntensity={15}
+                        tint={effectiveTheme === 'dark' ? 'dark' : 'light'}
+                    >
+                        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                            <VibeAgentLogo color={colors.text} size={18} />
+                            <Text style={{ color: colors.text, fontSize: 14, fontWeight: '600' }}>Talk to Vibe</Text>
+                        </View>
+                    </SafeLiquidGlass>
+                </TouchableOpacity>
+                <TouchableOpacity onPress={() => safePress('openMainMenuSearch', () => setShowMainMenu(true))} activeOpacity={0.8} style={{ flex: 1 }}>
+                    <SafeLiquidGlass
+                        style={{ paddingVertical: 12, borderRadius: 24, alignItems: 'center' }}
+                        blurIntensity={15}
+                        tint={effectiveTheme === 'dark' ? 'dark' : 'light'}
+                        tintColor={withAlpha(colors.primary, 0.15)}
+                    >
+                        <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 4 }}>
+                            <Plus color={colors.primary} size={18} strokeWidth={1.5} />
+                            <Text style={{ color: colors.primary, fontSize: 14, fontWeight: '600' }}>New Chat</Text>
+                        </View>
+                    </SafeLiquidGlass>
+                </TouchableOpacity>
+            </View>
         </Animated.View>
     )
 
