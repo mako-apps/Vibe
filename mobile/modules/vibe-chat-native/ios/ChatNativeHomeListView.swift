@@ -37,8 +37,23 @@ public final class ChatNativeHomeListView: ExpoView, UITableViewDataSource, UITa
   }
 
   func setRows(_ rawRows: [[String: Any]]) {
+    let previousChatIds = Set(rows.map(\.chatId))
     rows = rawRows.compactMap(ChatNativeHomeListRow.parse)
     tableView.reloadData()
+    // Pre-fetch chat histories for visible chats so messages are ready
+    // before the user taps into a chat. Only trigger on first load or
+    // when the chat list changes to avoid redundant requests.
+    let currentChatIds = Set(rows.map(\.chatId))
+    if previousChatIds != currentChatIds {
+      prefetchTopChatHistories()
+    }
+  }
+
+  private func prefetchTopChatHistories() {
+    // Preload the top chats so opening them is instant.
+    let chatIds = rows.prefix(8).map(\.chatId)
+    guard !chatIds.isEmpty else { return }
+    ChatEngine.shared.prefetchChatHistories(chatIds: chatIds)
   }
 
   func setRefreshing(_ refreshing: Bool) {

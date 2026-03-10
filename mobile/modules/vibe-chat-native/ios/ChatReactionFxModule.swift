@@ -26,7 +26,7 @@ final class ChatReactionFxModule {
     completion: @escaping () -> Void
   ) {
     let style = style(for: emoji, tintOverride: nil)
-    let duration: TimeInterval = 0.40
+    let duration: TimeInterval = 0.55
 
     let container = UIView(frame: hostView.bounds)
     container.backgroundColor = .clear
@@ -47,7 +47,7 @@ final class ChatReactionFxModule {
 
     let dx = targetPoint.x - sourcePoint.x
     let dy = targetPoint.y - sourcePoint.y
-    let arcLift = max(26.0, min(70.0, abs(dx) * 0.22 + abs(dy) * 0.10))
+    let arcLift = max(34.0, min(100.0, abs(dx) * 0.35 + abs(dy) * 0.25))
     let control = CGPoint(
       x: sourcePoint.x + (dx * 0.5),
       y: min(sourcePoint.y, targetPoint.y) - arcLift
@@ -165,9 +165,11 @@ final class ChatReactionFxModule {
 
     let ringRadius: CGFloat = 8.0
     let ringLayer = CAShapeLayer()
-    ringLayer.path = UIBezierPath(
-      ovalIn: CGRect(x: -ringRadius, y: -ringRadius, width: ringRadius * 2.0, height: ringRadius * 2.0)
-    ).cgPath
+    ringLayer.path =
+      UIBezierPath(
+        ovalIn: CGRect(
+          x: -ringRadius, y: -ringRadius, width: ringRadius * 2.0, height: ringRadius * 2.0)
+      ).cgPath
     ringLayer.position = point
     ringLayer.fillColor = UIColor.clear.cgColor
     ringLayer.strokeColor = style.ring.cgColor

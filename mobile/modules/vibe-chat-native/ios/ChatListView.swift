@@ -95,6 +95,7 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
   private var skipNextTransitionScrollCorrection = false
   private var lastKnownViewportWidth: CGFloat = 0.0
   private var lastKnownViewportHeight: CGFloat = 0.0
+  private var contentPaddingTop: CGFloat = sectionTopInset
   private var contentPaddingBottom: CGFloat = sectionBottomInset
   private var isApplyingRowsUpdate = false
   private var _setRowsGeneration: UInt = 0
@@ -1171,6 +1172,16 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
     emitViewport(force: true)
   }
 
+  func setContentPaddingTop(_ value: Double) {
+    let next = max(sectionTopInset, CGFloat(value))
+    if abs(next - contentPaddingTop) <= 0.5 {
+      return
+    }
+    contentPaddingTop = next
+    updateBottomAnchorInset()
+    emitViewport(force: true)
+  }
+
   func setVoicePlayback(_ payload: [String: Any]) {
     let nextMessageId = payload["messageId"] as? String
     let nextIsPlaying = (payload["isPlaying"] as? Bool) ?? false
@@ -1565,7 +1576,7 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
     defer { isUpdatingBottomInset = false }
 
     let baseInsets = UIEdgeInsets(
-      top: sectionTopInset, left: messageHorizontalInset,
+      top: contentPaddingTop, left: messageHorizontalInset,
       bottom: contentPaddingBottom,
       right: messageHorizontalInset)
     let currentInsets = flowLayout.sectionInset
@@ -1743,6 +1754,7 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
     var sourcePatched = false
     var outgoingPatched = false
     var enginePatched = false
+    var patchedSourceRow: [String: Any]?
 
     if !sourceRowsPayload.isEmpty {
       let patched = sourceRowsPayload.map { row -> [String: Any] in
@@ -1751,6 +1763,7 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
         if result.changed {
           didPatch = true
           sourcePatched = true
+          patchedSourceRow = result.row
         }
         return result.row
       }
@@ -1769,6 +1782,11 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
       nativeEngineRowsById[targetMessageId] = result.row
       didPatch = didPatch || result.changed
       enginePatched = result.changed
+    } else if let patchedRow = patchedSourceRow {
+      // Store reaction overlay so it survives mergedRowsPayload when engine
+      // rows replace sourceRowsPayload as the effective base.
+      nativeEngineRowsById[targetMessageId] = patchedRow
+      enginePatched = true
     }
 
     reactionDebugLog(
@@ -1809,11 +1827,11 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
       let listMinY = collectionView.frame.minY
       if inputBarEnabled, let bar = inputBar {
         let barMinYInHost = bar.frame.minY
-        return max(listMinY + sectionTopInset, barMinYInHost - metrics.bubbleHeight - 2.0)
+        return max(listMinY + contentPaddingTop, barMinYInHost - metrics.bubbleHeight - 2.0)
       }
       let listVisibleBottom = listMinY + collectionView.bounds.height
       return max(
-        listMinY + sectionTopInset,
+        listMinY + contentPaddingTop,
         listVisibleBottom - contentPaddingBottom - metrics.bubbleHeight)
     }()
 
@@ -2954,6 +2972,15 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
     collectionView.performBatchUpdates(nil)
   }
 
+  private func resolvedImageEditorHeaderTitle() -> String {
+    let peerUserId = enginePeerUserId.trimmingCharacters(in: .whitespacesAndNewlines)
+    let myUserId = engineMyUserId.trimmingCharacters(in: .whitespacesAndNewlines)
+    if peerUserId.isEmpty || (!myUserId.isEmpty && peerUserId.caseInsensitiveCompare(myUserId) == .orderedSame) {
+      return "Saved Messages"
+    }
+    return peerUserId
+  }
+
   private func presentImageEditView(for row: ChatListRow, mediaURL: String, seedImage: UIImage?) {
     guard let presenter = topPresentingViewController() else { return }
     ChatImageEditModule.presentEditor(
@@ -2961,7 +2988,8 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
       messageId: row.messageId,
       mediaURL: mediaURL,
       initialImage: seedImage,
-      initialCaption: row.text
+      initialCaption: row.text,
+      headerTitle: resolvedImageEditorHeaderTitle()
     ) { [weak self] payload in
       guard let self else { return }
       var event: [String: Any] = [
@@ -3412,6 +3440,26 @@ extension ChatListView: ChatInputBarDelegate {
       "width": width,
       "height": height,
     ])
+  }
+
+  func inputBarDidSelectSticker(
+    stickerId: String,
+    packId: String,
+    bundleFileName: String?,
+    emoji: String?,
+    width: Int,
+    height: Int
+  ) {
+    var payload: [String: Any] = [
+      "type": "attachmentSticker",
+      "stickerId": stickerId,
+      "packId": packId,
+      "width": width,
+      "height": height,
+    ]
+    if let bundleFileName { payload["bundleFileName"] = bundleFileName }
+    if let emoji { payload["emoji"] = emoji }
+    onNativeEvent(payload)
   }
 
   func inputBarDidSelectFile(uri: String, name: String) {

@@ -11,7 +11,6 @@ import com.google.android.material.bottomsheet.BottomSheetBehavior
 import com.google.android.material.bottomsheet.BottomSheetDialog
 import kotlin.math.max
 
-private const val DEFAULT_GIPHY_API_KEY = "dc6zaTOxFJmzC"
 private const val GIF_PANEL_TAG = "chat_native_gif_panel"
 
 data class ChatGifSelection(
@@ -24,7 +23,7 @@ data class ChatGifSelection(
 
 object ChatGifPanelConfig {
   @Volatile
-  private var storedApiKey: String = DEFAULT_GIPHY_API_KEY
+  private var storedApiKey: String = ""
 
   val apiKey: String
     get() = storedApiKey
@@ -53,7 +52,12 @@ class ChatGifPanel(
       return
     }
 
-    Giphy.configure(context.applicationContext, ChatGifPanelConfig.apiKey)
+    val apiKey = ChatGifPanelConfig.apiKey.trim()
+    if (apiKey.isEmpty()) {
+      return
+    }
+
+    Giphy.configure(context.applicationContext, apiKey)
 
     val settings = GPHSettings().apply {
       showConfirmationScreen = false

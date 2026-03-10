@@ -26,6 +26,7 @@ import { useCallStore } from '../src/lib/stores/CallStore';
 import { getUserChannel } from '../src/lib/ChatStore';
 import SessionExpiredBanner from '../src/components/shared/SessionExpiredBanner';
 import { addNativeCallUiListener, getNativeCallModule } from '../src/native/call/runtime';
+import { configureNativeGifApiKey } from '../src/native/gif/runtime';
 
 SplashScreen.preventAutoHideAsync()
 
@@ -101,6 +102,10 @@ export default function RootLayout() {
   const deferredNativeCallEventsRef = useRef<any[]>([]);
   const nativeCallUiDebugKeyRef = useRef<string>('');
   const resolvedCallWallpaperTheme = resolveThemeVariant(activeWallpaperTheme, effectiveTheme === 'dark')
+
+  useEffect(() => {
+    configureNativeGifApiKey();
+  }, []);
 
   const waitForCallSignalingChannel = async (timeoutMs = 12000) => {
     const { useChatStore } = require('../src/lib/ChatStore');

@@ -37,14 +37,21 @@ export const fetchHomeChatsNativeFirst = async (
   }
 
   try {
+    const tokenLen = input.authToken?.length ?? 0;
+    const tokenPrefix = input.authToken ? input.authToken.substring(0, 8) : 'NONE';
+    console.log(`[NativeHome] fetchChats INPUT userId=${input.userId?.substring(0, 12)}... apiBaseUrl=${input.apiBaseUrl} tokenLen=${tokenLen} tokenPrefix=${tokenPrefix}`);
     const nativeResult = await nativeHomeModule!.fetchChats!(input);
+    console.log('[NativeHome] fetchChats RAW nativeResult keys:', nativeResult ? Object.keys(nativeResult) : 'null', 'type:', typeof nativeResult);
     const parsed = parseChatsResult(nativeResult);
     if (parsed) {
       console.log('[NativeHome] native fetchChats succeeded, count:', parsed.length);
+      if (parsed.length === 0) {
+        console.warn('[NativeHome] fetchChats returned EMPTY array — raw body:', JSON.stringify(nativeResult).substring(0, 300));
+      }
       return parsed;
     }
 
-    console.warn('[NativeHome] fetchChats returned invalid payload:', nativeResult);
+    console.warn('[NativeHome] fetchChats returned invalid payload:', JSON.stringify(nativeResult).substring(0, 300));
     return [];
   } catch (error) {
     console.error('[NativeHome] native fetchChats threw an error:', error);

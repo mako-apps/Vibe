@@ -87,6 +87,7 @@ final class ChatImageEditViewController: UIViewController, UITextViewDelegate,
   private let mediaURL: String
   private let initialImage: UIImage?
   private let initialCaption: String
+  private let headerTitleText: String
   private var captionText: String
 
   var onAction: ((ChatImageEditActionPayload) -> Void)?
@@ -98,28 +99,32 @@ final class ChatImageEditViewController: UIViewController, UITextViewDelegate,
   private let drawingView = ChatImageDrawingCanvasView()
 
   private let topContainer = UIView()
-  private let backButton = UIButton(type: .system)
-  private let titlePill = UIView()
+  private let backGlassView = UIVisualEffectView(effect: nil)
+  private let backButton = UIButton(type: .custom)
+  private let titleRow = UIView()
+  private let titleIconView = UIImageView()
   private let titleLabel = UILabel()
-  private let menuButton = UIButton(type: .system)
+  private let editGlassView = UIVisualEffectView(effect: nil)
+  private let editToggleButton = UIButton(type: .custom)
+  private let menuGlassView = UIVisualEffectView(effect: nil)
+  private let menuButton = UIButton(type: .custom)
 
   private let bottomContainer = UIView()
   private let captionBlurContainer = UIVisualEffectView(
-    effect: UIBlurEffect(style: .systemThinMaterialDark))
+    effect: UIBlurEffect(style: .systemChromeMaterialDark))
   private let captionTextView = UITextView()
   private let captionPlaceholderLabel = UILabel()
 
   private let bottomToolbar = UIView()
-  private let replyButton = UIButton(type: .system)
-  private let toolsPill = UIView()
-  private let toolsStack = UIStackView()
-  private let editToggleButton = UIButton(type: .system)
+  private let editToolsContainer = UIView()
+  private let editToolsStack = UIStackView()
   private let textButton = UIButton(type: .system)
   private let drawButton = UIButton(type: .system)
   private let cropButton = UIButton(type: .system)
   private let undoButton = UIButton(type: .system)
-  private let sendButton = UIButton(type: .system)
-  private let qualityButton = UIButton(type: .system)
+  private let qualityButton = UIButton(type: .custom)
+  private let sendGlassView = UIVisualEffectView(effect: nil)
+  private let sendButton = UIButton(type: .custom)
 
   private let backgroundTapGesture = UITapGestureRecognizer()
 
@@ -136,7 +141,8 @@ final class ChatImageEditViewController: UIViewController, UITextViewDelegate,
     messageId: String?,
     mediaURL: String,
     initialImage: UIImage?,
-    initialCaption: String?
+    initialCaption: String?,
+    headerTitle: String?
   ) {
     self.messageId = messageId
     self.mediaURL = mediaURL
@@ -144,6 +150,8 @@ final class ChatImageEditViewController: UIViewController, UITextViewDelegate,
     let normalizedCaption = initialCaption?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     self.initialCaption = normalizedCaption
     self.captionText = normalizedCaption
+    let normalizedHeaderTitle = headerTitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    self.headerTitleText = normalizedHeaderTitle.isEmpty ? "Saved Messages" : normalizedHeaderTitle
     super.init(nibName: nil, bundle: nil)
     modalPresentationStyle = .overFullScreen
     modalTransitionStyle = .crossDissolve
@@ -182,33 +190,72 @@ final class ChatImageEditViewController: UIViewController, UITextViewDelegate,
     topContainer.backgroundColor = .clear
     view.addSubview(topContainer)
 
-    configureCircleButton(backButton, symbol: "chevron.backward", weight: .semibold, pointSize: 20)
+    [backGlassView, editGlassView, menuGlassView].forEach {
+      configureGlassView($0)
+      topContainer.addSubview($0)
+    }
+    [backButton, editToggleButton, menuButton].forEach { button in
+      button.backgroundColor = .clear
+      button.tintColor = .white
+      button.contentHorizontalAlignment = .center
+      button.contentVerticalAlignment = .center
+      button.clipsToBounds = true
+    }
+
+    configureCircleButton(backButton, symbol: "chevron.left", weight: .medium, pointSize: 15)
     backButton.addTarget(self, action: #selector(handleClose), for: .touchUpInside)
-    topContainer.addSubview(backButton)
+    backGlassView.contentView.addSubview(backButton)
 
-    configureGlassPill(titlePill, cornerRadius: 16.0)
-    topContainer.addSubview(titlePill)
+    titleRow.backgroundColor = .clear
+    topContainer.addSubview(titleRow)
 
-    titleLabel.text = "Photo"
-    titleLabel.textColor = .white
-    titleLabel.font = .systemFont(ofSize: 14, weight: .semibold)
+    titleIconView.image = UIImage(
+      systemName: "arrow.up.left",
+      withConfiguration: UIImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
+    )
+    titleIconView.tintColor = UIColor.white.withAlphaComponent(0.72)
+    titleIconView.contentMode = .scaleAspectFit
+    titleRow.addSubview(titleIconView)
+
+    titleLabel.text = headerTitleText
+    titleLabel.textColor = UIColor.white.withAlphaComponent(0.72)
+    titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
     titleLabel.textAlignment = .center
-    titlePill.addSubview(titleLabel)
+    titleLabel.numberOfLines = 1
+    titleLabel.lineBreakMode = .byTruncatingMiddle
+    titleRow.addSubview(titleLabel)
 
-    configureCircleButton(menuButton, symbol: "ellipsis", weight: .regular, pointSize: 20)
+    configureCircleButton(editToggleButton, symbol: "pencil", weight: .medium, pointSize: 17)
+    editToggleButton.addTarget(self, action: #selector(handleEditToggle), for: .touchUpInside)
+    editGlassView.contentView.addSubview(editToggleButton)
+
+    configureCircleButton(menuButton, symbol: "ellipsis", weight: .medium, pointSize: 17)
+    menuButton.configuration = nil
+    menuButton.adjustsImageWhenHighlighted = false
     if #available(iOS 14.0, *) {
       menuButton.showsMenuAsPrimaryAction = true
     } else {
       menuButton.addTarget(self, action: #selector(handleLegacyMenuPressed), for: .touchUpInside)
     }
-    topContainer.addSubview(menuButton)
+    menuGlassView.contentView.addSubview(menuButton)
+
+    editToolsContainer.backgroundColor = .clear
+    editToolsContainer.alpha = 0.0
+    editToolsContainer.isHidden = true
+    editToolsContainer.isUserInteractionEnabled = false
+
+    editToolsStack.axis = .horizontal
+    editToolsStack.alignment = .center
+    editToolsStack.distribution = .fillEqually
+    editToolsStack.spacing = 12.0
+    editToolsContainer.addSubview(editToolsStack)
 
     bottomContainer.backgroundColor = .clear
     view.addSubview(bottomContainer)
 
+    configureGlassView(captionBlurContainer)
     captionBlurContainer.clipsToBounds = true
-    captionBlurContainer.layer.cornerRadius = 20.0
-    captionBlurContainer.layer.cornerCurve = .continuous
+    captionBlurContainer.layer.cornerRadius = 22.0
     bottomContainer.addSubview(captionBlurContainer)
 
     captionTextView.backgroundColor = .clear
@@ -234,59 +281,49 @@ final class ChatImageEditViewController: UIViewController, UITextViewDelegate,
 
     bottomContainer.addSubview(bottomToolbar)
 
-    configureCircleButton(
-      replyButton, symbol: "arrowshape.turn.up.left", weight: .medium, pointSize: 20)
-    replyButton.addTarget(self, action: #selector(handleReply), for: .touchUpInside)
-    bottomToolbar.addSubview(replyButton)
-    configureGlassPill(toolsPill, cornerRadius: 22.0)
-    bottomToolbar.addSubview(toolsPill)
+    bottomToolbar.addSubview(editToolsContainer)
 
-    toolsStack.axis = .horizontal
-    toolsStack.distribution = .equalSpacing
-    toolsStack.alignment = .center
-    toolsStack.spacing = 0
-    toolsPill.addSubview(toolsStack)
-
-    configureToolButton(editToggleButton, symbol: "pencil")
-    editToggleButton.addTarget(self, action: #selector(handleEditToggle), for: .touchUpInside)
-    toolsStack.addArrangedSubview(editToggleButton)
-
-    configureToolButton(textButton, symbol: "t.square")
+    configureToolButton(textButton, symbol: "textformat")
     textButton.addTarget(self, action: #selector(handleText), for: .touchUpInside)
-    toolsStack.addArrangedSubview(textButton)
+    editToolsStack.addArrangedSubview(textButton)
 
-    configureToolButton(drawButton, symbol: "pencil.tip")
+    configureToolButton(drawButton, symbol: "pencil.and.scribble")
     drawButton.addTarget(self, action: #selector(handleDraw), for: .touchUpInside)
-    toolsStack.addArrangedSubview(drawButton)
+    editToolsStack.addArrangedSubview(drawButton)
 
-    configureToolButton(cropButton, symbol: "crop")
+    configureToolButton(cropButton, symbol: "crop.rotate")
     cropButton.addTarget(self, action: #selector(handleCrop), for: .touchUpInside)
-    toolsStack.addArrangedSubview(cropButton)
+    editToolsStack.addArrangedSubview(cropButton)
 
     configureToolButton(undoButton, symbol: "arrow.uturn.backward")
     undoButton.addTarget(self, action: #selector(handleUndo), for: .touchUpInside)
-    toolsStack.addArrangedSubview(undoButton)
+    editToolsStack.addArrangedSubview(undoButton)
 
-    configureCircleButton(sendButton, symbol: "arrow.up", weight: .semibold, pointSize: 19)
-    sendButton.backgroundColor = .systemBlue
-    sendButton.layer.borderWidth = 0.0
-    sendButton.addTarget(self, action: #selector(handleSend), for: .touchUpInside)
-    bottomToolbar.addSubview(sendButton)
-
-    qualityButton.titleLabel?.font = .systemFont(ofSize: 14, weight: .bold)
     qualityButton.setTitle("SD", for: .normal)
     qualityButton.setTitleColor(.white, for: .normal)
-    qualityButton.backgroundColor = UIColor(white: 0.14, alpha: 0.76)
+    qualityButton.titleLabel?.font = .systemFont(ofSize: 13, weight: .bold)
+    qualityButton.backgroundColor = .clear
+    qualityButton.layer.cornerRadius = 12.0
     qualityButton.layer.cornerCurve = .continuous
-    qualityButton.layer.borderWidth = 0.8
-    qualityButton.layer.borderColor = UIColor.white.withAlphaComponent(0.14).cgColor
-    qualityButton.clipsToBounds = true
+    qualityButton.layer.borderWidth = 1.3
+    qualityButton.layer.borderColor = UIColor.white.withAlphaComponent(0.88).cgColor
+    qualityButton.contentEdgeInsets = UIEdgeInsets(top: 0.0, left: 12.0, bottom: 0.0, right: 12.0)
+    qualityButton.alpha = 0.0
+    qualityButton.isHidden = true
+    qualityButton.isUserInteractionEnabled = false
     qualityButton.addTarget(self, action: #selector(handleQualityToggle), for: .touchUpInside)
     bottomToolbar.addSubview(qualityButton)
 
+    configureGlassView(sendGlassView)
+    bottomToolbar.addSubview(sendGlassView)
+    configureCircleButton(sendButton, symbol: "arrow.up", weight: .semibold, pointSize: 18)
+    sendButton.addTarget(self, action: #selector(handleSend), for: .touchUpInside)
+    sendGlassView.contentView.addSubview(sendButton)
+
+    refreshGlassEffects()
+    updateChromeAppearance()
     refreshCaptionInputState()
     loadImage()
-    isToolMenuExpanded = true
     setToolMenuExpanded(false, animated: false)
     rebuildTopMenu()
 
@@ -303,13 +340,10 @@ final class ChatImageEditViewController: UIViewController, UITextViewDelegate,
     )
   }
 
-  private func configureGlassPill(_ target: UIView, cornerRadius: CGFloat) {
-    target.backgroundColor = UIColor(white: 0.14, alpha: 0.76)
-    target.layer.cornerCurve = .continuous
-    target.layer.cornerRadius = cornerRadius
-    target.layer.borderWidth = 0.8
-    target.layer.borderColor = UIColor.white.withAlphaComponent(0.14).cgColor
-    target.clipsToBounds = true
+  private func configureGlassView(_ glassView: UIVisualEffectView) {
+    glassView.clipsToBounds = true
+    glassView.layer.cornerCurve = .continuous
+    glassView.contentView.backgroundColor = .clear
   }
 
   private func configureCircleButton(
@@ -321,18 +355,66 @@ final class ChatImageEditViewController: UIViewController, UITextViewDelegate,
     let config = UIImage.SymbolConfiguration(pointSize: pointSize, weight: weight)
     button.setImage(UIImage(systemName: symbol, withConfiguration: config), for: .normal)
     button.tintColor = .white
-    button.backgroundColor = UIColor(white: 0.14, alpha: 0.76)
-    button.layer.cornerCurve = .continuous
-    button.layer.borderWidth = 0.8
-    button.layer.borderColor = UIColor.white.withAlphaComponent(0.14).cgColor
+    button.backgroundColor = .clear
     button.clipsToBounds = true
   }
 
   private func configureToolButton(_ button: UIButton, symbol: String) {
-    let config = UIImage.SymbolConfiguration(pointSize: 20, weight: .regular)
+    let config = UIImage.SymbolConfiguration(pointSize: 18, weight: .medium)
     button.setImage(UIImage(systemName: symbol, withConfiguration: config), for: .normal)
     button.tintColor = .white
     button.backgroundColor = .clear
+    button.contentHorizontalAlignment = .center
+    button.contentVerticalAlignment = .center
+  }
+
+  private func refreshGlassEffects() {
+    let allGlassViews = [
+      backGlassView,
+      editGlassView,
+      menuGlassView,
+      sendGlassView,
+    ]
+
+    if #available(iOS 26.0, *) {
+      for glassView in allGlassViews {
+        let effect = UIGlassEffect()
+        effect.isInteractive = true
+        glassView.effect = effect
+      }
+    } else {
+      for glassView in allGlassViews {
+        glassView.effect = UIBlurEffect(style: .systemMaterial)
+      }
+    }
+  }
+
+  private func updateChromeAppearance() {
+    let neutralFill = UIColor.black.withAlphaComponent(0.16)
+    let accentFill = UIColor.systemBlue.withAlphaComponent(0.28)
+
+    backGlassView.contentView.backgroundColor = neutralFill
+    editGlassView.contentView.backgroundColor = neutralFill
+    menuGlassView.contentView.backgroundColor = neutralFill
+    sendGlassView.contentView.backgroundColor = accentFill
+
+    let editSymbol = isToolMenuExpanded ? "xmark" : "pencil"
+    let editPointSize: CGFloat = isToolMenuExpanded ? 16.0 : 17.0
+    let editConfig = UIImage.SymbolConfiguration(pointSize: editPointSize, weight: .semibold)
+    editToggleButton.setImage(
+      UIImage(systemName: editSymbol, withConfiguration: editConfig), for: .normal)
+    editToggleButton.tintColor = isToolMenuExpanded ? .systemBlue : .white
+
+    qualityButton.setTitle(isHighQuality ? "HD" : "SD", for: .normal)
+    qualityButton.backgroundColor =
+      isHighQuality ? UIColor.systemBlue.withAlphaComponent(0.22) : .clear
+    qualityButton.layer.borderColor =
+      (isHighQuality ? UIColor.systemBlue : UIColor.white.withAlphaComponent(0.88)).cgColor
+    qualityButton.alpha = isToolMenuExpanded ? 1.0 : 0.0
+
+    drawButton.tintColor = drawingView.drawingEnabled ? .systemBlue : .white
+    undoButton.isEnabled = hasVisualEdits
+    undoButton.alpha = hasVisualEdits ? 1.0 : 0.46
   }
 
   @objc private func keyboardWillChangeFrame(_ notification: Notification) {
@@ -359,28 +441,75 @@ final class ChatImageEditViewController: UIViewController, UITextViewDelegate,
     super.viewDidLayoutSubviews()
     let safe = view.safeAreaInsets
 
-    topContainer.frame = CGRect(x: 0.0, y: safe.top + 6.0, width: view.bounds.width, height: 54.0)
-    let topButtonSize: CGFloat = 44.0
-    backButton.frame = CGRect(x: 16.0, y: 5.0, width: topButtonSize, height: topButtonSize)
-    backButton.layer.cornerRadius = topButtonSize * 0.5
+    let topRowHeight: CGFloat = 40.0
+    let topButtonSize: CGFloat = 40.0
+    let topSpacing: CGFloat = 8.0
+    topContainer.frame = CGRect(
+      x: 16.0,
+      y: safe.top + 8.0,
+      width: max(0.0, view.bounds.width - 32.0),
+      height: topRowHeight
+    )
 
-    menuButton.frame = CGRect(
-      x: view.bounds.width - 16.0 - topButtonSize,
-      y: 5.0,
+    backGlassView.frame = CGRect(x: 0.0, y: 0.0, width: topButtonSize, height: topButtonSize)
+    menuGlassView.frame = CGRect(
+      x: max(0.0, topContainer.bounds.width - topButtonSize),
+      y: 0.0,
       width: topButtonSize,
       height: topButtonSize
     )
-    menuButton.layer.cornerRadius = topButtonSize * 0.5
+    editGlassView.frame = CGRect(
+      x: max(0.0, menuGlassView.frame.minX - topSpacing - topButtonSize),
+      y: 0.0,
+      width: topButtonSize,
+      height: topButtonSize
+    )
 
     titleLabel.sizeToFit()
-    let titleWidth = max(132.0, titleLabel.bounds.width + 34.0)
-    titlePill.frame = CGRect(
-      x: (view.bounds.width - titleWidth) * 0.5,
-      y: 8.0,
+    let titleMinX = backGlassView.frame.maxX + 14.0
+    let titleMaxX = editGlassView.frame.minX - 12.0
+    let titleAvailableWidth = max(0.0, titleMaxX - titleMinX)
+    let titleWidth =
+      titleAvailableWidth > 0.0
+      ? min(titleAvailableWidth, max(132.0, titleLabel.bounds.width + 26.0))
+      : 0.0
+    titleRow.frame = CGRect(
+      x: titleMinX + (titleAvailableWidth - titleWidth) * 0.5,
+      y: 0.0,
       width: titleWidth,
-      height: 38.0
+      height: topButtonSize
     )
-    titleLabel.frame = titlePill.bounds.insetBy(dx: 12.0, dy: 0.0)
+
+    backButton.frame = backGlassView.bounds
+    editToggleButton.frame = editGlassView.bounds
+    menuButton.frame = menuGlassView.bounds
+
+    let titleIconSize: CGFloat = 13.0
+    let titleSpacing: CGFloat = 6.0
+    let titleContentWidth = min(
+      titleRow.bounds.width,
+      titleIconSize + titleSpacing + titleLabel.intrinsicContentSize.width
+    )
+    let titleContentX = (titleRow.bounds.width - titleContentWidth) * 0.5
+    titleIconView.frame = CGRect(
+      x: titleContentX,
+      y: (titleRow.bounds.height - titleIconSize) * 0.5,
+      width: titleIconSize,
+      height: titleIconSize
+    )
+    titleLabel.frame = CGRect(
+      x: titleIconView.frame.maxX + titleSpacing,
+      y: 0.0,
+      width: max(0.0, titleRow.bounds.width - (titleIconView.frame.maxX + titleSpacing)),
+      height: titleRow.bounds.height
+    )
+
+    [backGlassView, editGlassView, menuGlassView].forEach {
+      $0.layer.cornerRadius = $0.bounds.height * 0.5
+    }
+    [backButton, editToggleButton, menuButton].forEach { button in
+      button.layer.cornerRadius = button.bounds.height * 0.5
+    }
 
     let maxCaptionWidth = view.bounds.width - 32.0
     let captionSize = captionTextView.sizeThatFits(
@@ -417,35 +546,30 @@ final class ChatImageEditViewController: UIViewController, UITextViewDelegate,
       height: toolbarHeight
     )
 
-    let circleSize: CGFloat = 46.0
-    replyButton.frame = CGRect(x: 16.0, y: 0.0, width: circleSize, height: circleSize)
-    replyButton.layer.cornerRadius = circleSize * 0.5
-
-    sendButton.frame = CGRect(
-      x: view.bounds.width - 16.0 - circleSize,
+    let actionSize: CGFloat = 46.0
+    sendGlassView.frame = CGRect(
+      x: view.bounds.width - 16.0 - actionSize,
       y: 0.0,
-      width: circleSize,
-      height: circleSize
+      width: actionSize,
+      height: actionSize
     )
-    sendButton.layer.cornerRadius = circleSize * 0.5
+    sendButton.frame = sendGlassView.bounds
 
-    let qualitySize: CGFloat = 36.0
+    let qualityWidth: CGFloat = 52.0
+    let qualityHeight: CGFloat = 36.0
     qualityButton.frame = CGRect(
-      x: sendButton.frame.minX - 12.0 - qualitySize,
-      y: (circleSize - qualitySize) * 0.5,
-      width: qualitySize,
-      height: qualitySize
+      x: sendGlassView.frame.minX - 12.0 - qualityWidth,
+      y: (toolbarHeight - qualityHeight) * 0.5,
+      width: qualityWidth,
+      height: qualityHeight
     )
-    qualityButton.layer.cornerRadius = qualitySize * 0.5
 
-    let toolsWidth: CGFloat = isToolMenuExpanded ? 220.0 : 58.0
-    toolsPill.frame = CGRect(
-      x: (view.bounds.width - toolsWidth) * 0.5,
-      y: 0.0,
-      width: toolsWidth,
-      height: circleSize
-    )
-    toolsStack.frame = toolsPill.bounds.insetBy(dx: 4.0, dy: 4.0)
+    let toolsWidth = max(0.0, qualityButton.frame.minX - 24.0)
+    editToolsContainer.frame = CGRect(x: 12.0, y: 0.0, width: toolsWidth, height: toolbarHeight)
+    editToolsStack.frame = editToolsContainer.bounds
+
+    sendGlassView.layer.cornerRadius = sendGlassView.bounds.height * 0.5
+    sendButton.layer.cornerRadius = sendButton.bounds.height * 0.5
 
     stageView.frame = view.bounds
     if let imageSize = imageView.image?.size, imageSize.width > 0.0, imageSize.height > 0.0 {
@@ -491,7 +615,7 @@ final class ChatImageEditViewController: UIViewController, UITextViewDelegate,
     guard let remoteURL = URL(string: trimmed) else { return }
 
     // Check disk cache first (shared with ChatListViewCells)
-    if let diskImage = chatMediaDiskCacheLoad(trimmed) {
+    if let diskData = chatMediaDiskCacheLoad(trimmed), let diskImage = UIImage(data: diskData) {
       originalImage = diskImage
       imageView.image = diskImage
       view.setNeedsLayout()
@@ -502,7 +626,7 @@ final class ChatImageEditViewController: UIViewController, UITextViewDelegate,
     remoteImageTask = URLSession.shared.dataTask(with: remoteURL) { [weak self] data, _, _ in
       guard let self, let data, let image = UIImage(data: data) else { return }
       // Persist to shared disk cache so it's available everywhere
-      chatMediaDiskCacheSave(image, forKey: trimmed)
+      chatMediaDiskCacheSave(data, forKey: trimmed)
       DispatchQueue.main.async {
         self.originalImage = image
         self.imageView.image = image
@@ -568,10 +692,7 @@ final class ChatImageEditViewController: UIViewController, UITextViewDelegate,
 
   @objc private func handleQualityToggle() {
     isHighQuality.toggle()
-    qualityButton.setTitle(isHighQuality ? "HD" : "SD", for: .normal)
-    qualityButton.backgroundColor = isHighQuality ? .systemBlue : UIColor(white: 0.14, alpha: 0.76)
-    qualityButton.layer.borderColor =
-      isHighQuality ? UIColor.clear.cgColor : UIColor.white.withAlphaComponent(0.14).cgColor
+    updateChromeAppearance()
   }
 
   private func emit(_ eventType: ChatImageEditEventType) {
@@ -600,6 +721,7 @@ final class ChatImageEditViewController: UIViewController, UITextViewDelegate,
   private func updateHasVisualEditsState() {
     hasVisualEdits =
       imageWasCropped || drawingView.hasStrokeContent || !textOverlayView.subviews.isEmpty
+    updateChromeAppearance()
     rebuildTopMenu()
   }
 
@@ -614,7 +736,6 @@ final class ChatImageEditViewController: UIViewController, UITextViewDelegate,
     }
     imageWasCropped = false
     drawingView.setDrawingEnabled(false)
-    drawButton.tintColor = .white
     updateHasVisualEditsState()
   }
 
@@ -622,44 +743,41 @@ final class ChatImageEditViewController: UIViewController, UITextViewDelegate,
     guard isToolMenuExpanded != expanded else { return }
     isToolMenuExpanded = expanded
 
-    let secondaryButtons = [textButton, drawButton, cropButton, undoButton]
     if expanded {
-      for button in secondaryButtons {
-        button.isHidden = false
-        button.alpha = 0.0
-        button.transform = CGAffineTransform(translationX: 8.0, y: 0.0)
-        button.isUserInteractionEnabled = true
-      }
+      editToolsContainer.isHidden = false
+      qualityButton.isHidden = false
+      editToolsContainer.alpha = 0.0
+      qualityButton.alpha = 0.0
+      editToolsContainer.transform = CGAffineTransform(translationX: 0.0, y: 6.0)
+      qualityButton.transform = CGAffineTransform(translationX: 0.0, y: 6.0)
+      editToolsContainer.isUserInteractionEnabled = true
+      qualityButton.isUserInteractionEnabled = true
     }
 
     if !expanded {
       drawingView.setDrawingEnabled(false)
-      drawButton.tintColor = .white
     }
 
     let applyState = {
-      let toggleSymbol = expanded ? "xmark" : "pencil"
-      let toggleConfig = UIImage.SymbolConfiguration(pointSize: 20, weight: .semibold)
-      self.editToggleButton.setImage(
-        UIImage(systemName: toggleSymbol, withConfiguration: toggleConfig), for: .normal)
-      self.editToggleButton.tintColor = expanded ? .systemBlue : .white
-
-      for button in secondaryButtons {
-        button.alpha = expanded ? 1.0 : 0.0
-        button.transform = expanded ? .identity : CGAffineTransform(translationX: 8.0, y: 0.0)
-      }
-
+      self.editToolsContainer.alpha = expanded ? 1.0 : 0.0
+      self.qualityButton.alpha = expanded ? 1.0 : 0.0
+      self.editToolsContainer.transform =
+        expanded ? .identity : CGAffineTransform(translationX: 0.0, y: 6.0)
+      self.qualityButton.transform =
+        expanded ? .identity : CGAffineTransform(translationX: 0.0, y: 6.0)
+      self.updateChromeAppearance()
       self.view.setNeedsLayout()
       self.view.layoutIfNeeded()
     }
 
     let completion: (Bool) -> Void = { _ in
       if !expanded {
-        for button in secondaryButtons {
-          button.isHidden = true
-          button.isUserInteractionEnabled = false
-        }
+        self.editToolsContainer.isHidden = true
+        self.qualityButton.isHidden = true
+        self.editToolsContainer.isUserInteractionEnabled = false
+        self.qualityButton.isUserInteractionEnabled = false
       }
+      self.updateChromeAppearance()
       self.rebuildTopMenu()
     }
 
@@ -683,7 +801,7 @@ final class ChatImageEditViewController: UIViewController, UITextViewDelegate,
     let editActionTitle = isToolMenuExpanded ? "Close Tools" : "Open Tools"
     let toggleAction = UIAction(
       title: editActionTitle,
-      image: UIImage(systemName: "pencil")
+      image: UIImage(systemName: isToolMenuExpanded ? "xmark" : "pencil")
     ) { [weak self] _ in
       guard let self else { return }
       self.setToolMenuExpanded(!self.isToolMenuExpanded, animated: true)
@@ -792,10 +910,12 @@ final class ChatImageEditViewController: UIViewController, UITextViewDelegate,
 
     let next = !drawingView.drawingEnabled
     drawingView.setDrawingEnabled(next)
-    drawButton.tintColor = next ? .systemBlue : .white
     if next {
       hasVisualEdits = true
+      updateChromeAppearance()
       rebuildTopMenu()
+    } else {
+      updateHasVisualEditsState()
     }
   }
 
@@ -823,7 +943,6 @@ final class ChatImageEditViewController: UIViewController, UITextViewDelegate,
 
     imageWasCropped = true
     drawingView.setDrawingEnabled(false)
-    drawButton.tintColor = .white
     updateHasVisualEditsState()
     view.setNeedsLayout()
   }

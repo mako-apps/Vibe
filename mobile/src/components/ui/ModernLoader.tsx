@@ -1,5 +1,5 @@
 import React, { useEffect } from 'react';
-import { View, StyleSheet } from 'react-native';
+import { Platform, StyleSheet, useColorScheme, View } from 'react-native';
 import Animated, {
     useSharedValue,
     useAnimatedStyle,
@@ -73,10 +73,11 @@ const SpinnerLoader: React.FC<{ size: number; color: string }> = ({ size, color 
 const DotsLoader: React.FC<{ size: number; color: string }> = ({ size, color }) => {
     // 3 dots
     const dots = [0, 1, 2];
-    const dotSize = size / 4; // Scale dots based on container size
+    // Luxurious feel often comes from smaller, more delicate elements
+    const dotSize = Math.max(3.5, size / 9);
 
     return (
-        <View style={[styles.dotsContainer, { height: size, gap: dotSize / 2 }]}>
+        <View style={[styles.dotsContainer, { height: size, gap: dotSize * 1.5 }]}>
             {dots.map((i) => (
                 <Dot key={i} index={i} size={dotSize} color={color} />
             ))}
@@ -85,40 +86,44 @@ const DotsLoader: React.FC<{ size: number; color: string }> = ({ size, color }) 
 };
 
 const Dot: React.FC<{ index: number; size: number; color: string }> = ({ index, size, color }) => {
-    const opacity = useSharedValue(0.3);
-    const scale = useSharedValue(1);
+    const opacity = useSharedValue(0.2);
+    const translateY = useSharedValue(0);
 
     useEffect(() => {
-        const delay = index * 150;
+        const delay = index * 120;
+        const duration = 500;
+        const ease = Easing.bezier(0.25, 0.1, 0.25, 1);
 
         opacity.value = withDelay(
             delay,
             withRepeat(
                 withSequence(
-                    withTiming(1, { duration: 400, easing: Easing.ease }),
-                    withTiming(0.3, { duration: 400, easing: Easing.ease })
+                    withTiming(1, { duration: duration * 0.6, easing: ease }),
+                    withTiming(0.2, { duration: duration * 0.8, easing: ease }),
+                    withTiming(0.2, { duration: duration * 0.4, easing: Easing.linear })
                 ),
                 -1,
-                true
+                false
             )
         );
 
-        scale.value = withDelay(
+        translateY.value = withDelay(
             delay,
             withRepeat(
                 withSequence(
-                    withTiming(1.2, { duration: 400, easing: Easing.ease }),
-                    withTiming(1, { duration: 400, easing: Easing.ease })
+                    withTiming(-size * 0.6, { duration: duration * 0.6, easing: ease }),
+                    withTiming(0, { duration: duration * 0.8, easing: ease }),
+                    withTiming(0, { duration: duration * 0.4, easing: Easing.linear })
                 ),
                 -1,
-                true
+                false
             )
         );
     }, []);
 
     const animatedStyle = useAnimatedStyle(() => ({
         opacity: opacity.value,
-        transform: [{ scale: scale.value }]
+        transform: [{ translateY: translateY.value }]
     }));
 
     return (

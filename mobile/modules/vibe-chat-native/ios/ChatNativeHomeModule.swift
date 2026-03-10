@@ -101,6 +101,7 @@ public class ChatNativeHomeModule: Module {
 
     AsyncFunction("fetchChats") { (payload: [String: Any]) async throws -> [String: Any] in
       guard let userId = chatNativeHomeNormalizedString(payload["userId"]) else {
+        print("[ChatNativeHome] fetchChats ERROR: userId is nil or empty")
         throw NSError(
           domain: "ChatNativeHome",
           code: 400,
@@ -112,6 +113,7 @@ public class ChatNativeHomeModule: Module {
         chatNativeHomeNormalizedString(payload["apiBaseUrl"])
         ?? Self.fallbackApiBaseURL
       guard let url = chatNativeHomeBuildChatsURL(apiBaseUrl: apiBaseUrl, userId: userId) else {
+        print("[ChatNativeHome] fetchChats ERROR: invalid apiBaseUrl=\(apiBaseUrl)")
         throw NSError(
           domain: "ChatNativeHome",
           code: 400,
@@ -120,6 +122,10 @@ public class ChatNativeHomeModule: Module {
       }
 
       let authToken = chatNativeHomeNormalizedString(payload["authToken"])
+      let tokenPrefix = authToken.map { String($0.prefix(8)) } ?? "nil"
+      print(
+        "[ChatNativeHome] fetchChats url=\(url.absoluteString) userId=\(userId.prefix(12))... tokenLen=\(authToken?.count ?? 0) tokenPrefix=\(tokenPrefix)"
+      )
 
       var request = URLRequest(url: url)
       request.httpMethod = "GET"
@@ -129,8 +135,26 @@ public class ChatNativeHomeModule: Module {
         request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
       }
 
-      let data = try await chatNativeHomeFetchData(request: request)
+      let (data, response) = try await URLSession.shared.data(for: request)
+
+      let httpResponse = response as? HTTPURLResponse
+      let statusCode = httpResponse?.statusCode ?? -1
+      let bodyPreview = String(data: data.prefix(500), encoding: .utf8) ?? "<binary>"
+      print(
+        "[ChatNativeHome] fetchChats response status=\(statusCode) bytes=\(data.count) body=\(bodyPreview)"
+      )
+
+      guard let httpResponse, (200...299).contains(statusCode) else {
+        print("[ChatNativeHome] fetchChats ERROR: HTTP \(statusCode)")
+        throw NSError(
+          domain: "ChatNativeHome",
+          code: statusCode,
+          userInfo: [NSLocalizedDescriptionKey: "fetchChats failed with status \(statusCode)"]
+        )
+      }
+
       let chats = try chatNativeHomeParseChats(data)
+      print("[ChatNativeHome] fetchChats parsed \(chats.count) chats")
       return ["chats": chats]
     }
 

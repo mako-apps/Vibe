@@ -59,10 +59,8 @@ interface ThemeColors {
         2: string
         6: string
     }
-    button: {
-        background: string
-        text: string
-    }
+    button: string
+    buttonText: string
 }
 
 interface ThemeState {
@@ -109,7 +107,8 @@ const mapThemeToColors = (t: typeof appTheme.dark): ThemeColors => ({
     surface: t.surface || t.bg.card,
     palette: t.palette,
     lime: t.lime,
-    button: t.button || { background: '#ffffff', text: '#000000' },
+    button: t.button?.background || '#ffffff',
+    buttonText: t.button?.text || '#000000',
 })
 
 export const useThemeStore = create<ThemeState>((set, get) => ({

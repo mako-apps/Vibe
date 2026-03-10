@@ -190,23 +190,23 @@ public final class ChatContextMenuOverlay: UIView {
     animateOut(reason: "backgroundTap")
   }
 
-  private func reactionLandingPointInOverlay() -> CGPoint {
-    let frame = bubbleSnapshot.layer.presentation()?.frame ?? bubbleSnapshot.frame
+  private func reactionLandingPointInWindow() -> CGPoint {
+    guard let window = self.window else { return .zero }
+    let frame = originalBubbleFrame
     let badgeSize = CGSize(width: 34.0, height: 24.0)
     let insetLeft: CGFloat = 8.0
     let insetBottom: CGFloat = 6.0
-    // Snapshot frame may include bubble tail bounds. Incoming tails extend on the
-    // left, so shift the target start area right to keep landing inside bubble body.
     let incomingTailInset: CGFloat = bubbleIsMe ? 0.0 : 24.0
     let bodyMinX = frame.minX + incomingTailInset
     let badgeX = min(
       max(bodyMinX + insetLeft, bodyMinX + 2.0),
       frame.maxX - badgeSize.width - 4.0
     )
-    return CGPoint(
+    let pointInOverlay = CGPoint(
       x: badgeX + (badgeSize.width * 0.5),
       y: frame.maxY - insetBottom - (badgeSize.height * 0.5)
     )
+    return self.convert(pointInOverlay, to: window)
   }
 
   // MARK: - Layout
@@ -543,30 +543,33 @@ extension ChatContextMenuOverlay: ChatContextMenuOverlayDelegate {
       x: reactionPicker.frame.midX,
       y: reactionPicker.frame.minY + (reactionPicker.frame.height * 0.4)
     )
-    let sourceInOverlay =
-      sourcePoint.flatMap { self.convert($0, from: nil) }
-      ?? fallbackSource
-    let targetInOverlay = reactionLandingPointInOverlay()
+    let sourcePointInView = sourcePoint ?? fallbackSource
+    let sourceInWindow = self.convert(sourcePointInView, to: nil)
+    let targetInWindow = reactionLandingPointInWindow()
 
-    ChatReactionFxModule.shared.animateReactionFlight(
-      emoji: reaction,
-      from: sourceInOverlay,
-      to: targetInOverlay,
-      in: self,
-      bubbleView: bubbleSnapshot
-    ) { [weak self] in
-      guard let self else { return }
-      guard !self.isDismissing else {
-        self.isSelectingReaction = false
-        return
+    // Immediately dismiss the menu UI and snap cell back
+    self.animateOut(reason: "reactionSelected")
+
+    if let window = self.window {
+      let captureMessageId = self.messageId
+      ChatReactionFxModule.shared.animateReactionFlight(
+        emoji: reaction,
+        from: sourceInWindow,
+        to: targetInWindow,
+        in: window,
+        bubbleView: nil
+      ) { [weak self] in
+        self?.isSelectingReaction = false
+        self?.delegate?.contextMenuDidSelectReaction(
+          reaction,
+          messageId: captureMessageId,
+          sourcePoint: targetInWindow
+        )
       }
-      self.isSelectingReaction = false
-      let pointForEvent = self.convert(targetInOverlay, to: nil)
-      self.delegate?.contextMenuDidSelectReaction(
-        reaction,
-        messageId: self.messageId,
-        sourcePoint: pointForEvent
-      )
+    } else {
+      isSelectingReaction = false
+      delegate?.contextMenuDidSelectReaction(
+        reaction, messageId: self.messageId, sourcePoint: targetInWindow)
     }
   }
 

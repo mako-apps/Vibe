@@ -790,7 +790,10 @@ internal object ChatEngine {
       }
     val type = (normalized(payload["type"]) ?: "text").lowercase()
     val text = normalized(payload["text"]) ?: ""
-    val supportedTypes = setOf("text", "image", "gif", "file", "voice", "video", "music", "location", "contact")
+    val supportedTypes = setOf(
+      "text", "image", "gif", "file", "voice", "video", "music", "location", "contact",
+      "sticker",
+    )
     if (!supportedTypes.contains(type)) {
       Log.w("ChatEngine", "sendMessage rejected reason=unsupported_type chatId=$chatId type=$type")
       return mapOf("accepted" to false, "reason" to "unsupported_type", "type" to type)
@@ -819,6 +822,12 @@ internal object ChatEngine {
     val viewOnce = meta("viewOnce", "view_once")
     val isVideoNote = meta("isVideoNote", "is_video_note")
     val waveform = meta("waveform")
+    val stickerId = normalized(meta("stickerId"))
+    val stickerPackId = normalized(meta("stickerPackId", "packId", "pack_id"))
+    val stickerBundleFileName = normalized(
+      meta("stickerBundleFileName", "bundleFileName", "bundle_file_name"),
+    )
+    val stickerEmoji = normalized(meta("emoji"))
     if (type == "text" && text.isBlank()) {
       Log.w("ChatEngine", "sendMessage rejected reason=empty_text chatId=$chatId")
       return mapOf("accepted" to false, "reason" to "empty_text")
@@ -884,6 +893,12 @@ internal object ChatEngine {
       if (viewOnce != null) decryptedFields["viewOnce"] = viewOnce
       if (isVideoNote != null) decryptedFields["isVideoNote"] = isVideoNote
       if (waveform != null) decryptedFields["waveform"] = waveform
+      if (!stickerId.isNullOrBlank()) decryptedFields["stickerId"] = stickerId
+      if (!stickerPackId.isNullOrBlank()) decryptedFields["stickerPackId"] = stickerPackId
+      if (!stickerBundleFileName.isNullOrBlank()) {
+        decryptedFields["stickerBundleFileName"] = stickerBundleFileName
+      }
+      if (!stickerEmoji.isNullOrBlank()) decryptedFields["emoji"] = stickerEmoji
       val optimisticRow = buildLiveRowPayloadLocked(
         chatId = chatId,
         messageId = messageId,
@@ -1039,6 +1054,12 @@ internal object ChatEngine {
         if (viewOnce != null) fullPayload["viewOnce"] = viewOnce
         if (isVideoNote != null) fullPayload["isVideoNote"] = isVideoNote
         if (waveform != null) fullPayload["waveform"] = waveform
+        if (!stickerId.isNullOrBlank()) fullPayload["stickerId"] = stickerId
+        if (!stickerPackId.isNullOrBlank()) fullPayload["stickerPackId"] = stickerPackId
+        if (!stickerBundleFileName.isNullOrBlank()) {
+          fullPayload["stickerBundleFileName"] = stickerBundleFileName
+        }
+        if (!stickerEmoji.isNullOrBlank()) fullPayload["emoji"] = stickerEmoji
         val fullPayloadString = JSONObject(fullPayload).toString()
 
         val recipientPublicKey = if (!isGroup) {
@@ -1089,6 +1110,7 @@ internal object ChatEngine {
               "location" -> "Location"
               "contact" -> "Contact"
               "gif" -> "GIF"
+              "sticker" -> "Sticker"
               else -> ""
             }
           }
@@ -1679,6 +1701,18 @@ internal object ChatEngine {
       decryptedFields["waveform"]?.let { normalizedMessage["waveform"] = it }
       decryptedFields["isVideoNote"]?.let { normalizedMessage["isVideoNote"] = it }
       decryptedFields["contact"]?.let { normalizedMessage["contact"] = it }
+      normalized(decryptedFields["stickerId"])?.let { normalizedMessage["stickerId"] = it }
+      normalized(decryptedFields["stickerPackId"] ?: decryptedFields["packId"])?.let {
+        normalizedMessage["stickerPackId"] = it
+        normalizedMessage["packId"] = it
+      }
+      normalized(
+        decryptedFields["stickerBundleFileName"] ?: decryptedFields["bundleFileName"],
+      )?.let {
+        normalizedMessage["stickerBundleFileName"] = it
+        normalizedMessage["bundleFileName"] = it
+      }
+      normalized(decryptedFields["emoji"])?.let { normalizedMessage["emoji"] = it }
       normalizedMessage
     }
   }
@@ -1768,6 +1802,15 @@ internal object ChatEngine {
     val replyToId = normalized(metadata["replyToId"] ?: metadata["reply_to_id"] ?: payload["replyToId"])
     val contact = metadata["contact"] ?: payload["contact"]
     val isVideoNote = metadata["isVideoNote"] ?: payload["isVideoNote"]
+    val stickerId = normalized(metadata["stickerId"] ?: payload["stickerId"])
+    val stickerPackId = normalized(
+      metadata["stickerPackId"] ?: metadata["packId"] ?: payload["stickerPackId"] ?: payload["packId"],
+    )
+    val stickerBundleFileName = normalized(
+      metadata["stickerBundleFileName"] ?: metadata["bundleFileName"]
+        ?: payload["stickerBundleFileName"] ?: payload["bundleFileName"],
+    )
+    val stickerEmoji = normalized(metadata["emoji"] ?: payload["emoji"])
 
     val uploadableTypes = setOf("image", "voice", "video", "file", "sticker", "music")
     val currentMediaUrl = mediaUrl
@@ -1789,9 +1832,9 @@ internal object ChatEngine {
           )
         }
         is LocalMediaUploadOutcome.Success -> {
-          mediaUrl = uploadOutcome.result.remoteUrl
-          if (fileName.isNullOrBlank()) fileName = uploadOutcome.result.fileName
-          if (fileSize == null) fileSize = uploadOutcome.result.fileSize
+          mediaUrl = uploadOutcome.value.remoteUrl
+          if (fileName.isNullOrBlank()) fileName = uploadOutcome.value.fileName
+          if (fileSize == null) fileSize = uploadOutcome.value.fileSize
         }
       }
     }
@@ -1810,6 +1853,12 @@ internal object ChatEngine {
       if (!replyToId.isNullOrBlank()) encryptedPayload["replyToId"] = replyToId
       if (contact != null) encryptedPayload["contact"] = contact
       if (isVideoNote != null) encryptedPayload["isVideoNote"] = isVideoNote
+      if (!stickerId.isNullOrBlank()) encryptedPayload["stickerId"] = stickerId
+      if (!stickerPackId.isNullOrBlank()) encryptedPayload["stickerPackId"] = stickerPackId
+      if (!stickerBundleFileName.isNullOrBlank()) {
+        encryptedPayload["stickerBundleFileName"] = stickerBundleFileName
+      }
+      if (!stickerEmoji.isNullOrBlank()) encryptedPayload["emoji"] = stickerEmoji
       encryptedContent = try {
         chatEngineEncryptHybridMessage(
           recipientPublicKeyPem = myPublicKeyPem,
@@ -1831,6 +1880,16 @@ internal object ChatEngine {
     if (duration != null) extraPayload["duration"] = duration
     if (!replyToId.isNullOrBlank()) extraPayload["replyToId"] = replyToId
     if (isVideoNote != null) extraPayload["isVideoNote"] = isVideoNote
+    if (!stickerId.isNullOrBlank()) extraPayload["stickerId"] = stickerId
+    if (!stickerPackId.isNullOrBlank()) {
+      extraPayload["stickerPackId"] = stickerPackId
+      extraPayload["packId"] = stickerPackId
+    }
+    if (!stickerBundleFileName.isNullOrBlank()) {
+      extraPayload["stickerBundleFileName"] = stickerBundleFileName
+      extraPayload["bundleFileName"] = stickerBundleFileName
+    }
+    if (!stickerEmoji.isNullOrBlank()) extraPayload["emoji"] = stickerEmoji
 
     val requestBody = JSONObject(
       linkedMapOf<String, Any?>(
@@ -2716,6 +2775,20 @@ internal object ChatEngine {
       if (json.has("width")) out["width"] = json.opt("width")
       if (json.has("height")) out["height"] = json.opt("height")
       if (json.has("thumbnailBase64")) out["thumbnailBase64"] = json.opt("thumbnailBase64")
+      if (json.has("stickerId")) out["stickerId"] = json.opt("stickerId")
+      if (json.has("stickerPackId") || json.has("packId")) {
+        out["stickerPackId"] =
+          if (json.has("stickerPackId")) json.opt("stickerPackId") else json.opt("packId")
+      }
+      if (json.has("stickerBundleFileName") || json.has("bundleFileName")) {
+        out["stickerBundleFileName"] =
+          if (json.has("stickerBundleFileName")) {
+            json.opt("stickerBundleFileName")
+          } else {
+            json.opt("bundleFileName")
+          }
+      }
+      if (json.has("emoji")) out["emoji"] = json.opt("emoji")
       out
     } catch (_: Throwable) {
       mapOf("text" to raw)
@@ -2869,6 +2942,18 @@ internal object ChatEngine {
     if (caption != null) metadata["caption"] = caption
     if (decryptedFields["mediaKey"] != null) metadata["mediaKey"] = decryptedFields["mediaKey"]
     if (!localMediaUrl.isNullOrBlank()) metadata["localMediaUrl"] = localMediaUrl
+    normalized(decryptedFields["stickerId"])?.let { metadata["stickerId"] = it }
+    normalized(decryptedFields["stickerPackId"] ?: decryptedFields["packId"])?.let {
+      metadata["stickerPackId"] = it
+      metadata["packId"] = it
+    }
+    normalized(
+      decryptedFields["stickerBundleFileName"] ?: decryptedFields["bundleFileName"],
+    )?.let {
+      metadata["stickerBundleFileName"] = it
+      metadata["bundleFileName"] = it
+    }
+    normalized(decryptedFields["emoji"])?.let { metadata["emoji"] = it }
 
     val message = linkedMapOf<String, Any?>(
       "id" to messageId,

@@ -551,8 +551,6 @@ final class NativeSettingsMainView: ExpoView, UIScrollViewDelegate {
   private let scrollContentView = UIView()
   private let contentStack = UIStackView()
   private let headerMaskContainer = UIView()
-  private let headerBlurView = UIVisualEffectView(effect: nil)
-  private let headerTintView = UIView()
   private let headerMaskLayer = CAGradientLayer()
   private let qrButton = NativeSettingsGlassButton()
   private let editButton = NativeSettingsGlassButton()
@@ -713,39 +711,34 @@ final class NativeSettingsMainView: ExpoView, UIScrollViewDelegate {
 
     headerMaskContainer.translatesAutoresizingMaskIntoConstraints = false
     headerMaskContainer.isUserInteractionEnabled = false
+    headerMaskContainer.layer.zPosition = 10
     addSubview(headerMaskContainer)
 
-    headerBlurView.translatesAutoresizingMaskIntoConstraints = false
-    headerMaskContainer.addSubview(headerBlurView)
-
-    headerTintView.translatesAutoresizingMaskIntoConstraints = false
-    headerMaskContainer.addSubview(headerTintView)
-
-    headerMaskLayer.colors = [
-      UIColor.black.cgColor,
-      UIColor.black.withAlphaComponent(0).cgColor,
-    ]
-    headerMaskLayer.locations = [0.6, 1.0]
+    headerMaskLayer.locations = [0.0, 0.7, 1.0]
     headerMaskLayer.startPoint = CGPoint(x: 0.5, y: 0)
     headerMaskLayer.endPoint = CGPoint(x: 0.5, y: 1)
-    headerMaskContainer.layer.mask = headerMaskLayer
+    headerMaskContainer.layer.addSublayer(headerMaskLayer)
 
     qrButton.setIcon(systemName: "qrcode", pointSize: 20)
     qrButton.setButtonSize(width: 44)
     qrButton.addTarget(self, action: #selector(handleHeaderQrPress), for: .touchUpInside)
+    qrButton.layer.zPosition = 40
     addSubview(qrButton)
 
     editButton.setTitle("Edit")
     editButton.setButtonSize(width: nil)
     editButton.addTarget(self, action: #selector(handleHeaderEditPress), for: .touchUpInside)
+    editButton.layer.zPosition = 40
     addSubview(editButton)
 
     avatarView.translatesAutoresizingMaskIntoConstraints = false
     avatarView.clipsToBounds = false
+    avatarView.layer.zPosition = 30
     addSubview(avatarView)
 
     avatarActionHost.translatesAutoresizingMaskIntoConstraints = false
     avatarActionHost.isUserInteractionEnabled = true
+    avatarActionHost.layer.zPosition = 50
     addSubview(avatarActionHost)
 
     penButton.setIcon(systemName: "pencil", pointSize: 16)
@@ -812,16 +805,6 @@ final class NativeSettingsMainView: ExpoView, UIScrollViewDelegate {
       headerMaskContainer.trailingAnchor.constraint(equalTo: trailingAnchor),
       headerMaskContainer.topAnchor.constraint(equalTo: topAnchor),
 
-      headerBlurView.leadingAnchor.constraint(equalTo: headerMaskContainer.leadingAnchor),
-      headerBlurView.trailingAnchor.constraint(equalTo: headerMaskContainer.trailingAnchor),
-      headerBlurView.topAnchor.constraint(equalTo: headerMaskContainer.topAnchor),
-      headerBlurView.bottomAnchor.constraint(equalTo: headerMaskContainer.bottomAnchor),
-
-      headerTintView.leadingAnchor.constraint(equalTo: headerMaskContainer.leadingAnchor),
-      headerTintView.trailingAnchor.constraint(equalTo: headerMaskContainer.trailingAnchor),
-      headerTintView.topAnchor.constraint(equalTo: headerMaskContainer.topAnchor),
-      headerTintView.bottomAnchor.constraint(equalTo: headerMaskContainer.bottomAnchor),
-
       qrButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
       editButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
 
@@ -862,7 +845,6 @@ final class NativeSettingsMainView: ExpoView, UIScrollViewDelegate {
     heroSpacerHeightConstraint = heroSpacerView.heightAnchor.constraint(equalToConstant: 220)
     heroSpacerHeightConstraint?.isActive = true
 
-    bringSubviewToFront(headerMaskContainer)
     bringSubviewToFront(avatarView)
     bringSubviewToFront(qrButton)
     bringSubviewToFront(editButton)
@@ -958,7 +940,11 @@ final class NativeSettingsMainView: ExpoView, UIScrollViewDelegate {
 
   private func applyTheme() {
     backgroundView.backgroundColor = theme.background
-    headerTintView.backgroundColor = theme.background.withAlphaComponent(0.7)
+    headerMaskLayer.colors = [
+      theme.background.withAlphaComponent(theme.isDark ? 0.16 : 0.10).cgColor,
+      theme.background.withAlphaComponent(theme.isDark ? 0.05 : 0.03).cgColor,
+      UIColor.clear.cgColor,
+    ]
     nameLabel.textColor = theme.text
     subtitleLabel.textColor = theme.secondaryText
     footerLabel.textColor = theme.secondaryText
@@ -969,8 +955,6 @@ final class NativeSettingsMainView: ExpoView, UIScrollViewDelegate {
     qrButton.setGlassTheme(isDark: theme.isDark)
     editButton.setGlassTheme(isDark: theme.isDark)
     penButton.setGlassTheme(isDark: theme.isDark)
-    headerBlurView.effect = UIBlurEffect(
-      style: theme.isDark ? .systemThinMaterialDark : .systemThinMaterialLight)
     badgeView.configure(tier: currentBadgeTier)
     rebuildSections()
   }

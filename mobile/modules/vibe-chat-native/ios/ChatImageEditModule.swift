@@ -22,13 +22,15 @@ enum ChatImageEditModule {
     mediaURL: String,
     initialImage: UIImage?,
     initialCaption: String?,
+    headerTitle: String? = nil,
     onAction: @escaping (ChatImageEditActionPayload) -> Void
   ) {
     let controller = ChatImageEditViewController(
       messageId: messageId,
       mediaURL: mediaURL,
       initialImage: initialImage,
-      initialCaption: initialCaption
+      initialCaption: initialCaption,
+      headerTitle: headerTitle
     )
     controller.modalPresentationStyle = .fullScreen
     controller.onAction = onAction

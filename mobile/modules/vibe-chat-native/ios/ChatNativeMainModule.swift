@@ -86,6 +86,10 @@ public class ChatNativeMainModule: Module {
         view.setAppearance(appearance)
       }
 
+      Prop("contentPaddingTop") { (view: ChatMainView, value: Double) in
+        view.setContentPaddingTop(value)
+      }
+
       Prop("contentPaddingBottom") { (view: ChatMainView, value: Double) in
         view.setContentPaddingBottom(value)
       }

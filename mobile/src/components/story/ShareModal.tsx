@@ -510,20 +510,20 @@ export const ShareModal = ({ visible, onClose, onPost, onSaveDraft, parentScale 
                                     </TouchableOpacity>
 
                                     <TouchableOpacity
-                                        style={[styles.postButton, { flex: 1, backgroundColor: colors.button.background }]}
+                                        style={[styles.postButton, { flex: 1, backgroundColor: colors.button }]}
                                         onPress={handlePost}
                                         activeOpacity={0.8}
                                     >
-                                        <Text style={[styles.postButtonText, { color: colors.button.text }]}>Post Story</Text>
+                                        <Text style={[styles.postButtonText, { color: colors.buttonText }]}>Post Story</Text>
                                     </TouchableOpacity>
                                 </View>
                             ) : (
                                 <TouchableOpacity
-                                    style={[styles.postButton, { backgroundColor: colors.button.background }]}
+                                    style={[styles.postButton, { backgroundColor: colors.button }]}
                                     onPress={() => setView('main')}
                                     activeOpacity={0.8}
                                 >
-                                    <Text style={[styles.postButtonText, { color: colors.button.text }]}>Done</Text>
+                                    <Text style={[styles.postButtonText, { color: colors.buttonText }]}>Done</Text>
                                 </TouchableOpacity>
                             )}
                         </View>

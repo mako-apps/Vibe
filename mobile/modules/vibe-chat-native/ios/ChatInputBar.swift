@@ -22,6 +22,14 @@ protocol ChatInputBarDelegate: AnyObject {
     width: Int,
     height: Int
   )
+  func inputBarDidSelectSticker(
+    stickerId: String,
+    packId: String,
+    bundleFileName: String?,
+    emoji: String?,
+    width: Int,
+    height: Int
+  )
   func inputBarDidSelectFile(uri: String, name: String)
   func inputBarDidSelectLocation(latitude: Double, longitude: Double)
   // Recording
@@ -1114,6 +1122,9 @@ final class ChatInputBar: UIView {
     contentRow.addSubview(micGlass)
 
     gifPanel.delegate = self
+    gifPanel.onPreferredHeightChange = { [weak self] in
+      self?.handleGifPanelPreferredHeightChange()
+    }
     gifPanel.isHidden = true
     gifPanel.alpha = 0
     addSubview(gifPanel)
@@ -1743,13 +1754,29 @@ final class ChatInputBar: UIView {
 
   private func preferredGifPanelHeight() -> CGFloat {
     let safeBottom = max(0, bottomSafeAreaInset)
+    let expansion = gifPanel.preferredHeightExpansion
     if keyboardHeightForPanels > 0 {
-      return max(220, keyboardHeightForPanels - safeBottom)
+      return min(560, max(220, keyboardHeightForPanels - safeBottom) + expansion)
     }
     if lastKnownKeyboardHeight > 0 {
-      return max(220, lastKnownKeyboardHeight - safeBottom)
+      return min(560, max(220, lastKnownKeyboardHeight - safeBottom) + expansion)
     }
-    return defaultGifPanelHeight
+    return min(560, defaultGifPanelHeight + expansion)
+  }
+
+  private func handleGifPanelPreferredHeightChange() {
+    guard gifPanelVisible else { return }
+    UIView.animate(
+      withDuration: 0.24,
+      delay: 0,
+      options: [.curveEaseInOut, .allowUserInteraction, .beginFromCurrentState],
+      animations: {
+        self.setNeedsLayout()
+        self.layoutIfNeeded()
+        self.superview?.setNeedsLayout()
+        self.superview?.layoutIfNeeded()
+      }
+    )
   }
 
   private func maybePrepareGifPanel() {
@@ -1762,13 +1789,6 @@ final class ChatInputBar: UIView {
 
   private func setGifPanelVisible(_ visible: Bool, animated: Bool) {
     guard visible != gifPanelVisible else { return }
-    if visible {
-      maybePrepareGifPanel()
-      gifPanel.setPanelVisible(true)
-    } else {
-      gifPanel.setPanelVisible(false)
-    }
-
     gifPanelVisible = visible
     if visible, textView.isFirstResponder {
       textView.resignFirstResponder()
@@ -1780,6 +1800,15 @@ final class ChatInputBar: UIView {
       self.layoutIfNeeded()
       self.superview?.setNeedsLayout()
       self.superview?.layoutIfNeeded()
+    }
+
+    if visible {
+      applyChanges()
+      maybePrepareGifPanel()
+      gifPanel.setPanelVisible(true)
+      return
+    } else {
+      gifPanel.setPanelVisible(false)
     }
 
     // Keyboard hide animation already drives the transition when opening GIF.
@@ -2713,6 +2742,42 @@ extension ChatInputBar: ChatGifPanelViewDelegate {
       height: gif.height
     )
     setGifPanelVisible(false, animated: true)
+  }
+
+  func chatGifPanel(_ panel: ChatGifPanelView, didSelectSticker sticker: ChatStickerSelection) {
+    delegate?.inputBarDidSelectSticker(
+      stickerId: sticker.stickerId,
+      packId: sticker.packId,
+      bundleFileName: sticker.bundleFileName,
+      emoji: sticker.emoji,
+      width: sticker.width,
+      height: sticker.height
+    )
+    setGifPanelVisible(false, animated: true)
+  }
+
+  func chatGifPanel(_ panel: ChatGifPanelView, didSelectEmoji emoji: String) {
+    let currentText = textView.text ?? ""
+    let selectedRange = textView.selectedRange
+
+    if let range = Range(selectedRange, in: currentText) {
+      let updated = currentText.replacingCharacters(in: range, with: emoji)
+      textView.text = updated
+      let cursorLocation = selectedRange.location + (emoji as NSString).length
+      textView.selectedRange = NSRange(location: cursorLocation, length: 0)
+    } else {
+      textView.text = currentText + emoji
+      textView.selectedRange = NSRange(
+        location: (textView.text as NSString?)?.length ?? 0,
+        length: 0
+      )
+    }
+
+    textViewDidChange(textView)
+    setNeedsLayout()
+    layoutIfNeeded()
+    superview?.setNeedsLayout()
+    superview?.layoutIfNeeded()
   }
 
   func chatGifPanelDidRequestClose(_ panel: ChatGifPanelView) {

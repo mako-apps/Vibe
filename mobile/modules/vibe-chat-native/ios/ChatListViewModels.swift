@@ -71,6 +71,7 @@ struct ChatListRow {
     case video
     case videoNote
     case media
+    case sticker
   }
 
   let kind: Kind
@@ -94,6 +95,11 @@ struct ChatListRow {
   let uploadProgress: Double?
   let mediaWidth: Double?
   let mediaHeight: Double?
+
+  // Sticker pack fields
+  let stickerId: String?
+  let stickerPackId: String?
+  let stickerBundleFileName: String?
 
   // Agent message fields
   let isAgentMessage: Bool
@@ -125,8 +131,10 @@ struct ChatListRow {
       return .voice
     case "video":
       return .video
-    case "image", "gif", "sticker":
+    case "image", "gif":
       return .media
+    case "sticker":
+      return .sticker
     case "file":
       return isAgentMessage ? .text : .media
     default:
@@ -258,6 +266,9 @@ struct ChatListRow {
       uploadProgress = nil
       mediaWidth = nil
       mediaHeight = nil
+      stickerId = nil
+      stickerPackId = nil
+      stickerBundleFileName = nil
       isAgentMessage = false
       agentName = nil
       plainContent = nil
@@ -341,6 +352,19 @@ struct ChatListRow {
     mediaHeight =
       parseDouble(message["height"]) ?? parseDouble(metadata?["height"])
       ?? parseDouble(extra?["height"])
+
+    // Sticker pack fields
+    stickerId =
+      (message["stickerId"] as? String)
+      ?? (metadata?["stickerId"] as? String)
+    stickerPackId =
+      (message["stickerPackId"] as? String)
+      ?? (metadata?["stickerPackId"] as? String)
+      ?? (metadata?["packId"] as? String)
+    stickerBundleFileName =
+      (message["stickerBundleFileName"] as? String)
+      ?? (metadata?["stickerBundleFileName"] as? String)
+      ?? (metadata?["bundleFileName"] as? String)
 
     // Agent message fields
     isAgentMessage = (message["isAgentMessage"] as? Bool) ?? false
@@ -463,6 +487,9 @@ func chatListRowContentEqual(_ lhs: ChatListRow, _ rhs: ChatListRow) -> Bool {
     && optionalWaveformEqual(lhs.waveform, rhs.waveform)
     && optionalDoubleEqual(lhs.uploadProgress, rhs.uploadProgress)
     && bubbleShapeEqual(lhs.shape, rhs.shape)
+    && lhs.stickerId == rhs.stickerId
+    && lhs.stickerPackId == rhs.stickerPackId
+    && lhs.stickerBundleFileName == rhs.stickerBundleFileName
     && lhs.isAgentMessage == rhs.isAgentMessage
     && lhs.agentName == rhs.agentName
     && lhs.plainContent == rhs.plainContent

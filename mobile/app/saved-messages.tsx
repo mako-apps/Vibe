@@ -132,9 +132,9 @@ export default function SavedMessagesScreen() {
         && !!nativeEngineModule?.sendSavedMessage
         && !!nativeEngineModule?.deleteSavedMessage;
     const nativeSurfaceRef = useRef<NativeChatMainSurfaceRef>(null);
-    const [nativeSavedMessages, setNativeSavedMessages] = useState<any[]>([]);
+    const [nativeSavedMessages, setNativeSavedMessages] = useState<any[]>(() => [...(savedMessages || [])]);
     const [nativeSavedLoading, setNativeSavedLoading] = useState(false);
-    const [nativeSavedLoaded, setNativeSavedLoaded] = useState(false);
+    const [nativeSavedLoaded, setNativeSavedLoaded] = useState(() => (savedMessages?.length || 0) > 0);
 
     const resolvedTheme = useMemo(() => {
         return resolveThemeVariant(activeTheme, effectiveTheme === 'dark');
@@ -223,6 +223,18 @@ export default function SavedMessagesScreen() {
         const extra: Record<string, unknown> = {};
         if (toNumber(metadata.width) != null) extra.width = toNumber(metadata.width) as number;
         if (toNumber(metadata.height) != null) extra.height = toNumber(metadata.height) as number;
+        if (typeof metadata.stickerId === 'string') extra.stickerId = metadata.stickerId;
+        if (typeof metadata.stickerPackId === 'string') extra.stickerPackId = metadata.stickerPackId;
+        if (typeof metadata.packId === 'string' && extra.stickerPackId == null) {
+            extra.stickerPackId = metadata.packId;
+        }
+        if (typeof metadata.stickerBundleFileName === 'string') {
+            extra.stickerBundleFileName = metadata.stickerBundleFileName;
+        }
+        if (typeof metadata.bundleFileName === 'string' && extra.stickerBundleFileName == null) {
+            extra.stickerBundleFileName = metadata.bundleFileName;
+        }
+        if (typeof metadata.emoji === 'string') extra.emoji = metadata.emoji;
         if (Array.isArray(metadata.waveform)) {
             extra.waveform = metadata.waveform.filter((value): value is number => typeof value === 'number');
         }
@@ -620,6 +632,36 @@ export default function SavedMessagesScreen() {
             return;
         }
 
+        if (type === 'attachmentSticker') {
+            const stickerId =
+                typeof payload.stickerId === 'string' ? payload.stickerId.trim() : '';
+            const packId =
+                typeof payload.packId === 'string' ? payload.packId.trim() : '';
+            const bundleFileName =
+                typeof payload.bundleFileName === 'string' ? payload.bundleFileName.trim() : '';
+            if (!stickerId || !packId) return;
+            const metadata = {
+                stickerId,
+                stickerPackId: packId,
+                packId,
+                stickerBundleFileName: bundleFileName || undefined,
+                bundleFileName: bundleFileName || undefined,
+                emoji: typeof payload.emoji === 'string' ? payload.emoji : undefined,
+                width: toNumber(payload.width),
+                height: toNumber(payload.height),
+            };
+            if (nativeSavedMessagesEnabled) {
+                void submitNativeSavedMessage({
+                    type: 'sticker',
+                    text: '',
+                    metadata,
+                });
+            } else {
+                void sendMessage('', 'sticker', metadata).finally(scheduleNativeScrollToBottom);
+            }
+            return;
+        }
+
         if (type === 'attachmentFile') {
             const uri = typeof payload.uri === 'string' ? payload.uri.trim() : '';
             if (!uri) return;
@@ -806,7 +848,7 @@ export default function SavedMessagesScreen() {
                         textColorThem: resolvedTheme.textColorThem || colors.text,
                         timeColorThem: colors.textSecondary,
                     }}
-                    contentPaddingTop={0}
+                    contentPaddingTop={16}
                     contentPaddingBottom={Math.max(14, insets.bottom + 8)}
                     inputBarEnabled
                     inputPlaceholder="Saved Message"

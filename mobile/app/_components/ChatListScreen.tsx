@@ -2208,6 +2208,27 @@ export default function ChatListScreen({
             return;
         }
 
+        if (type === 'attachmentSticker') {
+            const stickerIdRaw = typeof nativeEvent.stickerId === 'string' ? nativeEvent.stickerId.trim() : '';
+            const packIdRaw = typeof nativeEvent.packId === 'string' ? nativeEvent.packId.trim() : '';
+            const bundleFileNameRaw = typeof nativeEvent.bundleFileName === 'string' ? nativeEvent.bundleFileName.trim() : '';
+            const emojiRaw = typeof nativeEvent.emoji === 'string' ? nativeEvent.emoji : undefined;
+            const widthRaw = typeof nativeEvent.width === 'number' ? nativeEvent.width : undefined;
+            const heightRaw = typeof nativeEvent.height === 'number' ? nativeEvent.height : undefined;
+            if (!effectiveChatId || !stickerIdRaw || !packIdRaw) return;
+            void sendAttachmentMessage('sticker', '', {
+                stickerId: stickerIdRaw,
+                stickerPackId: packIdRaw,
+                packId: packIdRaw,
+                stickerBundleFileName: bundleFileNameRaw || undefined,
+                bundleFileName: bundleFileNameRaw || undefined,
+                emoji: emojiRaw,
+                width: widthRaw,
+                height: heightRaw,
+            });
+            return;
+        }
+
         if (type === 'attachmentFile') {
             const uriRaw = nativeEvent.uri;
             const nameRaw = nativeEvent.name;
@@ -2712,7 +2733,7 @@ export default function ChatListScreen({
                 const canUseNativeNow =
                     type === 'location'
                     || type === 'contact'
-                    || (['gif', 'image', 'file', 'voice', 'video', 'music'].includes(type) && isRemoteMediaUrl);
+                    || (['gif', 'image', 'file', 'voice', 'video', 'music', 'sticker'].includes(type) && isRemoteMediaUrl);
                 if (canUseNativeNow) {
                     const nativeChatEngine = getNativeChatEngineModule();
                     const nativeSend = nativeChatEngine?.sendMessage;

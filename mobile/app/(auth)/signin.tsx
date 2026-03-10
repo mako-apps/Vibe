@@ -29,7 +29,9 @@ export default function SignInScreen() {
     const insets = useSafeAreaInsets()
     const isDark = effectiveTheme === 'dark'
     const isFormValid = secretKey.length > 5;
-    const buttonBackgroundColor = isFormValid ? colors.button.background : colors.input
+    const buttonBackgroundColor = isFormValid
+        ? colors.button
+        : (Platform.OS === 'android' ? (isDark ? '#222222' : '#E0DED7') : colors.input);
 
     const handleLogin = async () => {
         if (!secretKey.trim()) {
@@ -137,15 +139,25 @@ export default function SignInScreen() {
             />
 
             <View style={[styles.navbar, { paddingTop: insets.top + 10, direction: 'ltr', flexDirection: 'row' }]}>
-                <SafeLiquidGlass
-                    style={styles.glassCircle}
-                    blurIntensity={15}
-                    tint={isDark ? 'dark' : 'light'}
-                    onStartShouldSetResponder={() => true}
-                    onResponderRelease={() => router.back()}
-                >
-                    <ChevronLeft size={20} color={colors.text} />
-                </SafeLiquidGlass>
+                {Platform.OS === 'android' ? (
+                    <View
+                        style={[styles.glassCircle, { backgroundColor: isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.05)' }]}
+                        onStartShouldSetResponder={() => true}
+                        onResponderRelease={() => router.back()}
+                    >
+                        <ChevronLeft size={20} color={colors.text} />
+                    </View>
+                ) : (
+                    <SafeLiquidGlass
+                        style={styles.glassCircle}
+                        blurIntensity={15}
+                        tint={isDark ? 'dark' : 'light'}
+                        onStartShouldSetResponder={() => true}
+                        onResponderRelease={() => router.back()}
+                    >
+                        <ChevronLeft size={20} color={colors.text} />
+                    </SafeLiquidGlass>
+                )}
                 <Logo size={22} />
                 <View style={{ width: 44 }} />
             </View>
@@ -179,33 +191,52 @@ export default function SignInScreen() {
                         />
 
                         <View style={[styles.buttonWrapper, { marginTop: 8 }]}>
-                            <SafeLiquidGlass
-                                style={[styles.nativeButtonGlass, { backgroundColor: buttonBackgroundColor }]}
-                                blurIntensity={18}
-                                tintColor={Platform.OS === 'ios' ? buttonBackgroundColor : undefined}
-                                tint={isDark ? 'dark' : 'light'}
-                                onStartShouldSetResponder={() => !loading && isFormValid}
-                                onResponderRelease={() => {
-                                    if (!loading && isFormValid) {
-                                        handleLogin()
-                                    }
-                                }}
-                            >
-                                {loading ? (
-                                    <ModernLoader size={48} color="#fff" type="dots" />
-                                ) : (
-                                    <Text style={[styles.buttonLabel, { color: isFormValid ? colors.button.text : colors.textSecondary }]}>
-                                        {t('auth.signIn')}
-                                    </Text>
-                                )}
-                            </SafeLiquidGlass>
+                            {Platform.OS === 'android' ? (
+                                <View style={[styles.nativeButtonGlass, { backgroundColor: buttonBackgroundColor }]}>
+                                    {loading ? (
+                                        <ModernLoader size={48} color="#fff" type="dots" />
+                                    ) : (
+                                        <Text
+                                            onPress={() => {
+                                                if (!loading && isFormValid) {
+                                                    handleLogin()
+                                                }
+                                            }}
+                                            style={[styles.buttonLabel, { color: isFormValid ? colors.buttonText : colors.textSecondary }]}
+                                        >
+                                            {t('auth.signIn')}
+                                        </Text>
+                                    )}
+                                </View>
+                            ) : (
+                                <SafeLiquidGlass
+                                    style={[styles.nativeButtonGlass, { backgroundColor: buttonBackgroundColor }]}
+                                    blurIntensity={18}
+                                    tintColor={Platform.OS === 'ios' ? buttonBackgroundColor : undefined}
+                                    tint={isDark ? 'dark' : 'light'}
+                                    onStartShouldSetResponder={() => !loading && isFormValid}
+                                    onResponderRelease={() => {
+                                        if (!loading && isFormValid) {
+                                            handleLogin()
+                                        }
+                                    }}
+                                >
+                                    {loading ? (
+                                        <ModernLoader size={48} color="#fff" type="dots" />
+                                    ) : (
+                                        <Text style={[styles.buttonLabel, { color: isFormValid ? colors.buttonText : colors.textSecondary }]}>
+                                            {t('auth.signIn')}
+                                        </Text>
+                                    )}
+                                </SafeLiquidGlass>
+                            )}
                         </View>
 
                         <View style={styles.switchLink}>
                             <Text style={[styles.switchLinkText, { color: colors.textSecondary }]}>
                                 {t('auth.noAccount')}{' '}
                                 <Text
-                                    onPress={() => router.push('/(auth)/signup')}
+                                    onPress={() => router.replace('/(auth)/signup')}
                                     style={{ color: colors.primary, fontWeight: '700' }}
                                 >
                                     {t('auth.createOne')}

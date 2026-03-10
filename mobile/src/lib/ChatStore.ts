@@ -277,6 +277,10 @@ const parseDecryptedContent = (decrypted: string): Partial<Message> => {
                         height: parsed.height,
                         thumbnailBase64: parsed.thumbnailBase64,
                         waveform: parsed.waveform,
+                        stickerId: parsed.stickerId,
+                        stickerPackId: parsed.stickerPackId || parsed.packId,
+                        stickerBundleFileName: parsed.stickerBundleFileName || parsed.bundleFileName,
+                        emoji: parsed.emoji,
                     },
                 };
             }
@@ -413,6 +417,10 @@ let userChannel: Channel | null = null;
 let chatChannels: Map<string, Channel> = new Map();
 let loadChatsDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 let channelResyncTimer: ReturnType<typeof setTimeout> | null = null;
+let emptyChatsRetryCount = 0;
+let emptyChatsRetryTimer: ReturnType<typeof setTimeout> | null = null;
+const EMPTY_CHATS_MAX_RETRIES = 3;
+const EMPTY_CHATS_RETRY_DELAYS = [800, 2000, 4000];
 const pendingRetryFlushTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const pendingRetryPumpRunning = new Set<string>();
 const pendingRetryPumpNeedsAnotherPass = new Set<string>();
@@ -748,6 +756,23 @@ const doesOutgoingPayloadMatchMessage = (
         existingDuration == null || metadataDuration == null
             ? true
             : Math.abs(existingDuration - metadataDuration) <= 0.35;
+
+    if (type === 'sticker') {
+        const existingExtra = (existing.extra && typeof existing.extra === 'object')
+            ? existing.extra as Record<string, unknown>
+            : {};
+        const existingStickerId = typeof existingExtra.stickerId === 'string' ? existingExtra.stickerId : '';
+        const metadataStickerId = typeof metadata?.stickerId === 'string' ? metadata.stickerId : '';
+        const existingBundle = typeof existingExtra.stickerBundleFileName === 'string'
+            ? existingExtra.stickerBundleFileName
+            : '';
+        const metadataBundle = typeof metadata?.stickerBundleFileName === 'string'
+            ? metadata.stickerBundleFileName
+            : (typeof metadata?.bundleFileName === 'string' ? metadata.bundleFileName : '');
+        const sameStickerId = !existingStickerId || !metadataStickerId || existingStickerId === metadataStickerId;
+        const sameBundle = !existingBundle || !metadataBundle || existingBundle === metadataBundle;
+        return sameText && sameStickerId && sameBundle;
+    }
 
     return sameText && sameMedia && sameFileName && sameDuration;
 };
@@ -1282,6 +1307,11 @@ export const resetSocketConnection = () => {
         clearTimeout(channelResyncTimer);
         channelResyncTimer = null;
     }
+    if (emptyChatsRetryTimer) {
+        clearTimeout(emptyChatsRetryTimer);
+        emptyChatsRetryTimer = null;
+    }
+    emptyChatsRetryCount = 0;
     pendingRetryFlushTimers.forEach((timer) => clearTimeout(timer));
     pendingRetryFlushTimers.clear();
     pendingRetryPumpRunning.clear();
@@ -1768,14 +1798,21 @@ export const useChatStore = create<ChatState>()(
                     }
                 }
 
-                set({ isLoading: true, lastChatsLoad: Date.now() });
+                const wasEmpty = get().chats.length === 0;
+                if (wasEmpty && emptyChatsRetryCount === 0) {
+                    set({ isLoading: true });
+                }
+                set({ lastChatsLoad: Date.now() });
 
                 try {
                     // Fetch chats via native module (pure native, no JS fallback).
+                    const apiBaseUrl = ProxyManager.getInstance().getBestUrl();
+                    const authToken = auth.loginToken || (auth as any)?.token || '';
+                    console.log(`[ChatStore] loadChats DEBUG auth.userId=${auth.userId?.substring(0, 12)}... loginToken.len=${authToken.length} apiBaseUrl=${apiBaseUrl} retryCount=${emptyChatsRetryCount}`);
                     const data = await fetchHomeChatsNativeFirst({
                         userId: auth.userId,
-                        apiBaseUrl: ProxyManager.getInstance().getBestUrl(),
-                        authToken: auth.loginToken || (auth as any)?.token || '',
+                        apiBaseUrl,
+                        authToken,
                     });
 
                     // Process chats
@@ -2932,6 +2969,10 @@ export const useChatStore = create<ChatState>()(
                             width: metadata.width,
                             height: metadata.height,
                             waveform: metadata.waveform,
+                            stickerId: metadata.stickerId,
+                            stickerPackId: metadata.stickerPackId || metadata.packId,
+                            stickerBundleFileName: metadata.stickerBundleFileName || metadata.bundleFileName,
+                            emoji: metadata.emoji,
                         },
                         status: isConnected ? 'sending' : 'pending'
                     };
@@ -3338,6 +3379,10 @@ export const useChatStore = create<ChatState>()(
                         viewOnce: metadata.viewOnce || undefined,
                         isVideoNote: metadata.isVideoNote || undefined,
                         waveform: metadata.waveform || undefined,
+                        stickerId: metadata.stickerId || undefined,
+                        stickerPackId: metadata.stickerPackId || metadata.packId || undefined,
+                        stickerBundleFileName: metadata.stickerBundleFileName || metadata.bundleFileName || undefined,
+                        emoji: metadata.emoji || undefined,
                     });
 
                     // Import and encrypt
@@ -3413,6 +3458,8 @@ export const useChatStore = create<ChatState>()(
                                         return 'Contact';
                                     case 'gif':
                                         return 'GIF';
+                                    case 'sticker':
+                                        return 'Sticker';
                                     default:
                                         return '';
                                 }

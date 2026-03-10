@@ -629,7 +629,7 @@ export default function SettingsScreen() {
 
     if (useNativeSettingsMain) {
         return (
-            <View style={{ flex: 1, backgroundColor: '#000' }} >
+            <View style={{ flex: 1, backgroundColor: colors.background }} >
                 <Animated.View style={animatedParentStyle}>
                     <NativeSettingsMain
                         style={{ flex: 1 }}
@@ -721,7 +721,7 @@ export default function SettingsScreen() {
                     statusBarTranslucent
                     onRequestClose={closeQr}
                 >
-                    <View style={{ flex: 1, backgroundColor: '#000' }}>
+                    <View style={{ flex: 1, backgroundColor: colors.background }}>
                         <View style={[StyleSheet.absoluteFill, { backgroundColor: colors.background }]}>
                             <WallpaperComp theme={qrTheme} width={windowWidth} height={windowHeight} />
                         </View>
@@ -900,7 +900,7 @@ export default function SettingsScreen() {
     }
 
     return (
-        <View style={{ flex: 1, backgroundColor: '#000' }} >
+        <View style={{ flex: 1, backgroundColor: colors.background }} >
             <Animated.View style={animatedParentStyle}>
 
                 {/* MASKED HEADER */}
@@ -913,13 +913,13 @@ export default function SettingsScreen() {
                         style={StyleSheet.absoluteFill}
                         maskElement={
                             <LinearGradient
-                                colors={['rgba(0,0,0,1)', 'rgba(0,0,0,0)']}
-                                locations={[0.6, 1]}
+                                colors={['rgba(0,0,0,0.45)', 'rgba(0,0,0,0.12)', 'rgba(0,0,0,0)']}
+                                locations={[0, 0.72, 1]}
                                 style={StyleSheet.absoluteFill}
                             />
                         }
                     >
-                        <BlurView intensity={25} tint={effectiveTheme === 'dark' ? 'dark' : 'light'} style={[StyleSheet.absoluteFill, { backgroundColor: withAlpha(colors.background, 0.7) }]} />
+                        <BlurView intensity={22} tint={effectiveTheme === 'dark' ? 'dark' : 'light'} style={[StyleSheet.absoluteFill, { backgroundColor: withAlpha(colors.background, 0.24) }]} />
                     </MaskedViewAny>
                 </Animated.View>
 
@@ -1354,7 +1354,7 @@ export default function SettingsScreen() {
                 statusBarTranslucent
                 onRequestClose={closeQr}
             >
-                <View style={{ flex: 1, backgroundColor: '#000' }}>
+                <View style={{ flex: 1, backgroundColor: colors.background }}>
                     <View style={[StyleSheet.absoluteFill, { backgroundColor: colors.background }]}>
                         <WallpaperComp theme={qrTheme} width={windowWidth} height={windowHeight} />
                     </View>

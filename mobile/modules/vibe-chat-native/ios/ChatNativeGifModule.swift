@@ -15,10 +15,12 @@ public class ChatNativeGifModule: Module {
     Function("setApiKey") { (apiKey: String) in
       let trimmed = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
       guard !trimmed.isEmpty else { return }
+      print("[NativeGif][iOS] setApiKey length=\(trimmed.count)")
       ChatGifPanelConfig.shared.apiKey = trimmed
     }
 
     Function("getApiKey") {
+      print("[NativeGif][iOS] getApiKey length=\(ChatGifPanelConfig.shared.apiKey.count)")
       ChatGifPanelConfig.shared.apiKey
     }
   }

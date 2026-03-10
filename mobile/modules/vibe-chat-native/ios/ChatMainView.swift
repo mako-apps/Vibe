@@ -131,6 +131,7 @@ public final class ChatMainView: ExpoView,
   private let avatarImageView = UIImageView()
   private let avatarFallbackIconView = UIImageView()
   private let menuGlassView = UIVisualEffectView(effect: nil)
+  private let savedSearchCancelGlassView = UIVisualEffectView(effect: nil)
   private let menuButton = UIButton(type: .system)
   private let savedSearchField = UITextField()
   private let savedSearchCancelButton = UIButton(type: .system)
@@ -374,6 +375,10 @@ public final class ChatMainView: ExpoView,
 
   func setContentPaddingBottom(_ value: Double) {
     chatListView.setContentPaddingBottom(value)
+  }
+
+  func setContentPaddingTop(_ value: Double) {
+    chatListView.setContentPaddingTop(value)
   }
 
   func setVoicePlayback(_ payload: [String: Any]) {
@@ -702,12 +707,13 @@ public final class ChatMainView: ExpoView,
     headerContentView.addSubview(titleGlassView)
     headerContentView.addSubview(avatarGlassView)
     headerContentView.addSubview(menuGlassView)
+    headerContentView.addSubview(savedSearchCancelGlassView)
     backGlassView.contentView.addSubview(backButton)
     titleGlassView.contentView.addSubview(titleButton)
     avatarGlassView.contentView.addSubview(avatarButton)
     menuGlassView.contentView.addSubview(menuButton)
     menuGlassView.contentView.addSubview(savedSearchField)
-    menuGlassView.contentView.addSubview(savedSearchCancelButton)
+    savedSearchCancelGlassView.contentView.addSubview(savedSearchCancelButton)
 
     profileHeaderContentView.addSubview(profileBackGlassView)
     profileHeaderContentView.addSubview(profileMenuGlassView)
@@ -726,7 +732,7 @@ public final class ChatMainView: ExpoView,
 
     [
       backGlassView, titleGlassView, avatarGlassView, menuGlassView, profileBackGlassView,
-      profileMenuGlassView,
+      savedSearchCancelGlassView, profileMenuGlassView,
     ].forEach { glassView in
       glassView.clipsToBounds = true
       glassView.layer.cornerCurve = .continuous
@@ -740,6 +746,7 @@ public final class ChatMainView: ExpoView,
     menuButton.addTarget(self, action: #selector(handleMenuPressed), for: .touchUpInside)
     menuButton.isHidden = true
     menuGlassView.isHidden = true
+    savedSearchCancelGlassView.isHidden = true
     savedSearchField.borderStyle = .none
     savedSearchField.backgroundColor = .clear
     savedSearchField.alpha = 0.0
@@ -750,14 +757,20 @@ public final class ChatMainView: ExpoView,
     savedSearchField.autocapitalizationType = .none
     savedSearchField.autocorrectionType = .no
     savedSearchField.spellCheckingType = .no
+    savedSearchField.clipsToBounds = false
     savedSearchField.delegate = self
     savedSearchField.addTarget(
       self,
       action: #selector(handleSavedSearchTextChanged),
       for: .editingChanged
     )
-    savedSearchCancelButton.setTitle("Cancel", for: .normal)
-    savedSearchCancelButton.titleLabel?.font = UIFont.systemFont(ofSize: 15, weight: .semibold)
+    savedSearchCancelButton.setTitle(nil, for: .normal)
+    savedSearchCancelButton.setImage(UIImage(systemName: "xmark"), for: .normal)
+    savedSearchCancelButton.setPreferredSymbolConfiguration(
+      UIImage.SymbolConfiguration(pointSize: 13, weight: .semibold),
+      forImageIn: .normal
+    )
+    savedSearchCancelButton.accessibilityLabel = "Close search"
     savedSearchCancelButton.alpha = 0.0
     savedSearchCancelButton.addTarget(
       self,
@@ -776,7 +789,7 @@ public final class ChatMainView: ExpoView,
 
     let backSymbolConfig = UIImage.SymbolConfiguration(pointSize: 18, weight: .semibold)
     backButton.setPreferredSymbolConfiguration(backSymbolConfig, forImageIn: .normal)
-    let menuSymbolConfig = UIImage.SymbolConfiguration(pointSize: 18, weight: .semibold)
+    let menuSymbolConfig = UIImage.SymbolConfiguration(pointSize: 17, weight: .medium)
     menuButton.setPreferredSymbolConfiguration(menuSymbolConfig, forImageIn: .normal)
     profileBackButton.setPreferredSymbolConfiguration(backSymbolConfig, forImageIn: .normal)
     if profileMenuButton.configuration == nil {
@@ -961,8 +974,15 @@ public final class ChatMainView: ExpoView,
     titleButton.isUserInteractionEnabled = !usesSavedMessagesHeader
     menuButton.isHidden = !usesSavedMessagesHeader
     menuGlassView.isHidden = !usesSavedMessagesHeader
+    savedSearchCancelGlassView.isHidden = !usesSavedMessagesHeader
     menuButton.setImage(
-      UIImage(systemName: usesSavedMessagesHeader ? "magnifyingglass" : "ellipsis"),
+      UIImage(
+        systemName: usesSavedMessagesHeader ? "magnifyingglass" : "ellipsis",
+        withConfiguration: UIImage.SymbolConfiguration(
+          pointSize: usesSavedMessagesHeader ? 16.0 : 17.0,
+          weight: usesSavedMessagesHeader ? .medium : .semibold
+        )
+      ),
       for: .normal
     )
     applySavedMessagesSearchPresentation()
@@ -1963,6 +1983,9 @@ public final class ChatMainView: ExpoView,
       let menuEffect = UIGlassEffect()
       menuEffect.isInteractive = true
       menuGlassView.effect = menuEffect
+      let searchCancelEffect = UIGlassEffect()
+      searchCancelEffect.isInteractive = true
+      savedSearchCancelGlassView.effect = searchCancelEffect
       let profileBackEffect = UIGlassEffect()
       profileBackEffect.isInteractive = true
       profileBackGlassView.effect = profileBackEffect
@@ -1974,6 +1997,7 @@ public final class ChatMainView: ExpoView,
       titleGlassView.effect = UIBlurEffect(style: .systemMaterial)
       avatarGlassView.effect = UIBlurEffect(style: .systemMaterial)
       menuGlassView.effect = UIBlurEffect(style: .systemMaterial)
+      savedSearchCancelGlassView.effect = UIBlurEffect(style: .systemMaterial)
       profileBackGlassView.effect = UIBlurEffect(style: .systemMaterial)
       profileMenuGlassView.effect = UIBlurEffect(style: .systemMaterial)
     }
@@ -2020,16 +2044,32 @@ public final class ChatMainView: ExpoView,
       x: max(0.0, headerContentView.bounds.width - 44.0), y: 0.0, width: 44.0, height: 44.0)
     if headerMode == .savedMessages {
       avatarGlassView.frame = .zero
-      let searchWidth = savedSearchExpanded ? headerContentView.bounds.width : 44.0
+      let cancelSpacing: CGFloat = savedSearchExpanded ? 8.0 : 0.0
+      let cancelWidth: CGFloat = savedSearchExpanded ? 44.0 : 0.0
+      let searchWidth = savedSearchExpanded
+        ? max(44.0, headerContentView.bounds.width - cancelWidth - cancelSpacing)
+        : 44.0
       menuGlassView.frame = CGRect(
-        x: max(0.0, headerContentView.bounds.width - searchWidth),
+        x: max(0.0, headerContentView.bounds.width - searchWidth - cancelWidth - cancelSpacing),
         y: 0.0,
         width: searchWidth,
         height: 44.0
       )
+      savedSearchCancelGlassView.frame = savedSearchExpanded
+        ? CGRect(
+          x: min(
+            headerContentView.bounds.width - cancelWidth,
+            menuGlassView.frame.maxX + cancelSpacing
+          ),
+          y: 0.0,
+          width: cancelWidth,
+          height: 44.0
+        )
+        : .zero
     } else {
       avatarGlassView.frame = trailingHeaderFrame
       menuGlassView.frame = .zero
+      savedSearchCancelGlassView.frame = .zero
     }
 
     let maxCenterWidth = max(0.0, headerContentView.bounds.width * 0.65)
@@ -2050,17 +2090,11 @@ public final class ChatMainView: ExpoView,
     avatarButton.frame = avatarGlassView.bounds
     if headerMode == .savedMessages {
       menuButton.frame = savedSearchExpanded
-        ? CGRect(x: 6.0, y: 0.0, width: 38.0, height: 44.0)
+        ? CGRect(x: 10.0, y: 0.0, width: 20.0, height: 44.0)
         : CGRect(x: 0.0, y: 0.0, width: 44.0, height: 44.0)
-      let cancelWidth: CGFloat = 64.0
-      savedSearchCancelButton.frame = CGRect(
-        x: max(0.0, menuGlassView.bounds.width - cancelWidth),
-        y: 0.0,
-        width: cancelWidth,
-        height: 44.0
-      )
-      let fieldMinX: CGFloat = 38.0
-      let fieldMaxX = max(fieldMinX, savedSearchCancelButton.frame.minX - 8.0)
+      savedSearchCancelButton.frame = savedSearchCancelGlassView.bounds
+      let fieldMinX: CGFloat = 36.0
+      let fieldMaxX = max(fieldMinX, menuGlassView.bounds.width - 12.0)
       savedSearchField.frame = CGRect(
         x: fieldMinX,
         y: 0.0,
@@ -2073,10 +2107,10 @@ public final class ChatMainView: ExpoView,
       savedSearchCancelButton.frame = .zero
     }
 
-    [backButton, avatarButton, titleButton, menuButton].forEach { control in
+    [backButton, avatarButton, titleButton, menuButton, savedSearchCancelButton].forEach { control in
       control.layer.cornerRadius = control.bounds.height / 2.0
     }
-    [backGlassView, avatarGlassView, titleGlassView, menuGlassView]
+    [backGlassView, avatarGlassView, titleGlassView, menuGlassView, savedSearchCancelGlassView]
       .forEach { view in
       view.layer.cornerRadius = view.bounds.height / 2.0
     }
@@ -2084,7 +2118,10 @@ public final class ChatMainView: ExpoView,
     avatarImageView.frame = avatarButton.bounds
     avatarFallbackIconView.frame = avatarButton.bounds.insetBy(dx: 12.0, dy: 12.0)
 
-    let titleBounds = titleButton.bounds.insetBy(dx: 12.0, dy: 4.0)
+    let titleBounds =
+      headerMode == .savedMessages
+      ? titleButton.bounds.insetBy(dx: 12.0, dy: 0.0)
+      : titleButton.bounds.insetBy(dx: 12.0, dy: 4.0)
     chatHeaderStack.frame = titleBounds
     applySavedMessagesSearchPresentation()
 
@@ -2127,24 +2164,23 @@ public final class ChatMainView: ExpoView,
   private func applySavedMessagesSearchPresentation() {
     let usesSavedMessagesSearch = headerMode == .savedMessages && currentPage == .chat
     let controlsAlpha: CGFloat = usesSavedMessagesSearch && savedSearchExpanded ? 0.0 : 1.0
-    let controlsTransform =
-      usesSavedMessagesSearch && savedSearchExpanded
-      ? CGAffineTransform(translationX: -28.0, y: 0.0).scaledBy(x: 0.94, y: 0.94)
-      : .identity
 
     backGlassView.alpha = controlsAlpha
     titleGlassView.alpha = controlsAlpha
-    backGlassView.transform = controlsTransform
-    titleGlassView.transform = controlsTransform
+    backGlassView.transform = .identity
+    titleGlassView.transform = .identity
     chatHeaderStack.alpha = controlsAlpha
-    chatHeaderStack.transform = usesSavedMessagesSearch && savedSearchExpanded
-      ? CGAffineTransform(translationX: 0.0, y: -8.0)
-      : .identity
+    chatHeaderStack.transform = .identity
     savedSearchField.alpha = usesSavedMessagesSearch && savedSearchExpanded ? 1.0 : 0.0
+    savedSearchCancelGlassView.alpha = usesSavedMessagesSearch && savedSearchExpanded ? 1.0 : 0.0
     savedSearchCancelButton.alpha = usesSavedMessagesSearch && savedSearchExpanded ? 1.0 : 0.0
     savedSearchField.isUserInteractionEnabled = usesSavedMessagesSearch && savedSearchExpanded
     savedSearchCancelButton.isUserInteractionEnabled = usesSavedMessagesSearch && savedSearchExpanded
-    menuButton.contentHorizontalAlignment = savedSearchExpanded ? .left : .center
+    savedSearchCancelGlassView.isUserInteractionEnabled =
+      usesSavedMessagesSearch && savedSearchExpanded
+    savedSearchCancelGlassView.transform = usesSavedMessagesSearch && savedSearchExpanded
+      ? .identity
+      : CGAffineTransform(translationX: 16.0, y: 0.0)
   }
 
   private func setSavedMessagesSearchExpanded(
@@ -2433,6 +2469,7 @@ public final class ChatMainView: ExpoView,
     titleGlassView.contentView.backgroundColor = chatBackground.withAlphaComponent(0.10)
     avatarGlassView.contentView.backgroundColor = appearance.bubbleThemColor.withAlphaComponent(0.22)
     menuGlassView.contentView.backgroundColor = chatBackground.withAlphaComponent(0.10)
+    savedSearchCancelGlassView.contentView.backgroundColor = chatBackground.withAlphaComponent(0.10)
     refreshHeaderGlass()
 
     profileHeaderContainer.backgroundColor = .clear
@@ -2444,14 +2481,17 @@ public final class ChatMainView: ExpoView,
     profileMenuGlassView.contentView.backgroundColor = profileCardBg.withAlphaComponent(0.68)
 
     backButton.tintColor = text
-    menuButton.tintColor = text
+    menuButton.tintColor =
+      headerMode == .savedMessages
+      ? secondary.withAlphaComponent(0.74)
+      : text
     savedSearchField.textColor = text
     savedSearchField.tintColor = text
     savedSearchField.attributedPlaceholder = NSAttributedString(
       string: "Search messages...",
-      attributes: [.foregroundColor: secondary.withAlphaComponent(0.7)]
+      attributes: [.foregroundColor: secondary.withAlphaComponent(0.58)]
     )
-    savedSearchCancelButton.tintColor = appearance.bubbleMeGradient.first ?? text
+    savedSearchCancelButton.tintColor = text.withAlphaComponent(0.84)
     profileBackButton.tintColor = text
     profileMenuButton.tintColor = text
     chatTitleLabel.textColor = text
@@ -2625,8 +2665,12 @@ public final class ChatMainView: ExpoView,
     }
     chatTitleLabel.text = resolvedTitle
     chatSubtitleLabel.text = resolvedSubtitle
+    chatSubtitleLabel.isHidden = resolvedSubtitle.isEmpty
+    chatHeaderStack.spacing = resolvedSubtitle.isEmpty ? 0.0 : -1.0
     profileTitleLabel.text = profileNameText.isEmpty ? resolvedTitle : profileNameText
     profileSubtitleLabel.text = isGroupOrChannel ? "Group Profile" : "Profile"
+    profileSubtitleLabel.isHidden =
+      profileSubtitleLabel.text?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? false
     chatSubtitleLabel.textColor =
       {
         if headerMode == .savedMessages {
@@ -3014,6 +3058,8 @@ public final class ChatMainView: ExpoView,
       self.profileHeaderStack.transform = profileHeaderTransform
       self.avatarGlassView.alpha = avatarAlpha
       self.menuGlassView.alpha = menuAlpha
+      self.savedSearchCancelGlassView.alpha =
+        (isChat && self.headerMode == .savedMessages && self.savedSearchExpanded) ? 1.0 : 0.0
       self.pinnedBannerView.alpha = (isChat && !self.pinnedBannerView.isHidden) ? 1.0 : 0.0
       self.profileMenuGlassView.alpha = isProfile ? 1.0 : 0.0
       self.applyHeaderGlassMorph(chatFactor: isChat ? 1.0 : 0.0)
@@ -3119,6 +3165,7 @@ public final class ChatMainView: ExpoView,
     profileHeaderStack.transform = CGAffineTransform(translationX: 14.0 * clamped, y: 0.0)
     avatarGlassView.alpha = clamped
     menuGlassView.alpha = 0.0
+    savedSearchCancelGlassView.alpha = 0.0
     headerContainer.isUserInteractionEnabled = false
     profileHeaderContainer.isUserInteractionEnabled = false
     applyHeaderGlassMorph(chatFactor: clamped)
@@ -3129,6 +3176,7 @@ public final class ChatMainView: ExpoView,
     titleGlassView.transform = .identity
     avatarGlassView.transform = .identity
     menuGlassView.transform = .identity
+    savedSearchCancelGlassView.transform = .identity
     profileBackGlassView.transform = .identity
     profileMenuGlassView.transform = .identity
   }

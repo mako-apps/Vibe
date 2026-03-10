@@ -627,9 +627,12 @@ export default function HomeScreen({ onChatSelect, onOpenStoryCamera }: HomeScre
         },
         [hasStories, chats.length, homeSavedMessages.length]
     )
+    const nativeListTopOffset = insets.top + (Platform.OS === 'android' ? 64 : 50)
+    const nativeHomeContentTopInset = nativeListTopOffset + estimatedNativeHeaderHeight
 
     const loadSavedMessagesPreview = useCallback(async () => {
         if (!user?.userId) {
+            console.log('[home/savedPreview] no userId, clearing')
             setNativeSavedMessages([])
             setUsesNativeSavedMessagesPreview(false)
             setSavedMessagesPreviewLoaded(false)
@@ -638,9 +641,11 @@ export default function HomeScreen({ onChatSelect, onOpenStoryCamera }: HomeScre
 
         if (nativeSavedMessagesEnabled && nativeEngineModule?.fetchSavedMessages) {
             try {
+                console.log('[home/savedPreview] fetching via native engine...')
                 const result = await Promise.resolve(nativeEngineModule.fetchSavedMessages({ userId: user.userId }))
                 const nextMessages = extractNativeSavedMessages(result)
                     .sort((a, b) => getSavedMessageSortTimestamp(b) - getSavedMessageSortTimestamp(a))
+                console.log(`[home/savedPreview] native engine returned ${nextMessages.length} messages`)
                 setNativeSavedMessages(nextMessages)
                 setUsesNativeSavedMessagesPreview(true)
                 setSavedMessagesPreviewLoaded(true)
@@ -651,6 +656,7 @@ export default function HomeScreen({ onChatSelect, onOpenStoryCamera }: HomeScre
         }
 
         try {
+            console.log('[home/savedPreview] fetching via JS sync...')
             setUsesNativeSavedMessagesPreview(false)
             await Promise.resolve(syncSavedMessages())
         } catch (error) {
@@ -694,7 +700,9 @@ export default function HomeScreen({ onChatSelect, onOpenStoryCamera }: HomeScre
                 list.push(savedChat);
             }
         }
-        return list.sort((a: any, b: any) => getChatSortTimestamp(b) - getChatSortTimestamp(a));
+        const sorted = list.sort((a: any, b: any) => getChatSortTimestamp(b) - getChatSortTimestamp(a));
+        console.log(`[home/allChats] chats=${chats.length} homeSaved=${homeSavedMessages.length} final=${sorted.length}`);
+        return sorted;
     }, [chats, homeSavedMessages, user?.userId, typingUsers]);
 
     const filteredChats = useMemo(() => {
@@ -1026,6 +1034,15 @@ export default function HomeScreen({ onChatSelect, onOpenStoryCamera }: HomeScre
             }
         }
     }, [user?.userId])
+
+    // Retry loadChats when socket connects and we still have no chats.
+    // This handles the race where the initial loadChats fires before the
+    // server has fully established the session (returns 0 chats).
+    useEffect(() => {
+        if (isConnected && chats.length === 0 && user?.userId && !isLoading) {
+            loadChats()
+        }
+    }, [isConnected])
 
     // App State / Connection Recovery with debounce
     const lastReloadRef = useRef<number>(0);
@@ -1442,14 +1459,14 @@ export default function HomeScreen({ onChatSelect, onOpenStoryCamera }: HomeScre
 
                     {/* Chat List */}
                     {shouldUseNativeHomeList ? (
-                        <View style={{ flex: 1, paddingTop: insets.top + (Platform.OS === 'android' ? 64 : 50) }}>
+                        <View style={{ flex: 1 }}>
                             <View style={{ flex: 1 }}>
                                 <NativeHomeListSurface
                                     rows={nativeHomeRows}
                                     refreshing={isPullRefreshing}
                                     isDark={effectiveTheme === 'dark'}
                                     previewAppearance={nativePreviewAppearance}
-                                    contentTopInset={estimatedNativeHeaderHeight}
+                                    contentTopInset={nativeHomeContentTopInset}
                                     contentBottomInset={100 + (Platform.OS === 'android' ? insets.bottom : 0)}
                                     onNativeEvent={handleNativeHomeEvent}
                                 />
@@ -1458,7 +1475,7 @@ export default function HomeScreen({ onChatSelect, onOpenStoryCamera }: HomeScre
                                     style={[
                                         {
                                             position: 'absolute',
-                                            top: 0,
+                                            top: nativeListTopOffset,
                                             left: 0,
                                             right: 0,
                                             zIndex: 10,

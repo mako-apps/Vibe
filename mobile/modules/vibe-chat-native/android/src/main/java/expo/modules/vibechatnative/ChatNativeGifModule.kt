@@ -21,15 +21,18 @@ class ChatNativeGifModule : Module() {
     }
 
     Function("setApiKey") { apiKey: String ->
+      println("[NativeGif][Android] setApiKey length=${apiKey.trim().length}")
       ChatGifPanelConfig.setApiKey(apiKey)
       gifPanel?.setApiKey(apiKey)
     }
 
     Function("getApiKey") {
+      println("[NativeGif][Android] getApiKey length=${ChatGifPanelConfig.apiKey.length}")
       ChatGifPanelConfig.apiKey
     }
 
     AsyncFunction("openPanel") { keyboardHeight: Double? ->
+      println("[NativeGif][Android] openPanel keyboardHeight=${keyboardHeight?.toInt()} hasKey=${ChatGifPanelConfig.apiKey.isNotBlank()}")
       val activity = appContext.currentActivity as? FragmentActivity
         ?: throw IllegalStateException("A FragmentActivity is required to open the GIF panel")
 

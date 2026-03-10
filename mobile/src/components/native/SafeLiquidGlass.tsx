@@ -9,7 +9,7 @@
  */
 
 import React from 'react'
-import { Platform, StyleSheet, useColorScheme } from 'react-native'
+import { Platform, StyleSheet, useColorScheme, View } from 'react-native'
 import type { ViewStyle } from 'react-native'
 import { BlurView } from 'expo-blur'
 
@@ -150,21 +150,21 @@ export default function SafeLiquidGlass({
   // rendered behind the blur layer. The fix is to ensure children
   // are direct children of BlurView so they render ON TOP of the blur effect.
 
-  // IMPORTANT: renderToHardwareTextureAndroid and removeClippedSubviews prevent
-  // the blur from disappearing when parent animated views change (e.g., keyboard animations).
+  // IMPORTANT: On Android, we must render the BlurView as a background 
+  // layer to avoid blurring the children (text, etc.) and remove 
+  // hardware texture rendering which causes shadows/artifacts.
   return (
-    <BlurView
-      intensity={blurIntensity}
-      tint={blurTint}
-      experimentalBlurMethod="dimezisBlurView"
-      blurReductionFactor={blurReductionFactor}
-      style={[style, { overflow: 'hidden' }]}
-      renderToHardwareTextureAndroid={true}
-      removeClippedSubviews={false}
-      {...props}
-    >
+    <View style={[style, { overflow: 'hidden' }]} {...props}>
+      <BlurView
+        intensity={blurIntensity}
+        tint={blurTint}
+        experimentalBlurMethod="dimezisBlurView"
+        blurReductionFactor={blurReductionFactor}
+        style={[StyleSheet.absoluteFill, { backgroundColor: 'transparent' }]}
+        removeClippedSubviews={false}
+      />
       {children}
-    </BlurView>
+    </View>
   )
 }
 

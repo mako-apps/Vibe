@@ -114,7 +114,14 @@ export const useSavedMessagesStore = create<SavedMessagesState>()(
                         latitude: metadata.latitude,
                         longitude: metadata.longitude,
                         replyToId: metadata.replyToId,
-                        extra: { width: metadata.width, height: metadata.height },
+                        extra: {
+                            width: metadata.width,
+                            height: metadata.height,
+                            stickerId: metadata.stickerId,
+                            stickerPackId: metadata.stickerPackId || metadata.packId,
+                            stickerBundleFileName: metadata.stickerBundleFileName || metadata.bundleFileName,
+                            emoji: metadata.emoji,
+                        },
                         status: 'sending' // Start as sending to show spinner
                     };
 
@@ -176,7 +183,11 @@ export const useSavedMessagesStore = create<SavedMessagesState>()(
                             longitude: metadata.longitude,
                             width: metadata.width,
                             height: metadata.height,
-                            replyToId: metadata.replyToId
+                            replyToId: metadata.replyToId,
+                            stickerId: metadata.stickerId,
+                            stickerPackId: metadata.stickerPackId || metadata.packId,
+                            stickerBundleFileName: metadata.stickerBundleFileName || metadata.bundleFileName,
+                            emoji: metadata.emoji,
                         });
                         const myPubKey = await importPublicKey(auth.keyPair.publicKey);
                         // Encrypt for self
@@ -191,7 +202,14 @@ export const useSavedMessagesStore = create<SavedMessagesState>()(
                             mediaUrl: finalMediaUrl,
                             mediaKey: mediaKey,
                             encryptedContent,
-                            extra: { width: metadata.width, height: metadata.height }
+                            extra: {
+                                width: metadata.width,
+                                height: metadata.height,
+                                stickerId: metadata.stickerId,
+                                stickerPackId: metadata.stickerPackId || metadata.packId,
+                                stickerBundleFileName: metadata.stickerBundleFileName || metadata.bundleFileName,
+                                emoji: metadata.emoji,
+                            }
                         } : m)
                     }));
 
@@ -213,7 +231,11 @@ export const useSavedMessagesStore = create<SavedMessagesState>()(
                             longitude: metadata.longitude,
                             width: metadata.width,
                             height: metadata.height,
-                            replyToId: metadata.replyToId
+                            replyToId: metadata.replyToId,
+                            stickerId: metadata.stickerId,
+                            stickerPackId: metadata.stickerPackId || metadata.packId,
+                            stickerBundleFileName: metadata.stickerBundleFileName || metadata.bundleFileName,
+                            emoji: metadata.emoji,
                         })
                     });
                 } catch (e) {

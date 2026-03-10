@@ -348,6 +348,7 @@ final class ChatEngine {
   private var pinnedFetchInFlightChatIds = Set<String>()
   private var historyRowsByChat: [String: [[String: Any]]] = [:]
   private var historyFullyLoadedChats = Set<String>()
+  private var cachedSavedMessagesResponse: [[String: Any]]?
   private var historyLoadingChats = Set<String>()
   private var liveMessageRowsByChat: [String: [String: [String: Any]]] = [:]
   private var deletedMessageIdsByChat: [String: Set<String>] = [:]
@@ -869,6 +870,18 @@ final class ChatEngine {
     }
   }
 
+  /// Triggers background history loading for a list of chat IDs so messages
+  /// are cached before the user taps into a chat.
+  func prefetchChatHistories(chatIds: [String]) {
+    queue.async { [weak self] in
+      guard let self else { return }
+      for rawChatId in chatIds {
+        guard let chatId = self.normalizedString(rawChatId), !chatId.isEmpty else { continue }
+        self.loadChatHistoryIfNeededLocked(chatId: chatId)
+      }
+    }
+  }
+
   /// Seeds chat histories right from the Home API fetch payload, preventing N+1 fetch requests
   /// and avoiding network timeouts or delays when clicking into a chat.
   func seedChatHistories(_ payload: [String: Any]) -> [String: Any] {
@@ -1121,6 +1134,7 @@ final class ChatEngine {
     }
     let supportedTypes: Set<String> = [
       "text", "image", "gif", "file", "voice", "video", "music", "location", "contact",
+      "sticker",
     ]
     guard supportedTypes.contains(type) else {
       return ["accepted": false, "reason": "unsupported_type", "type": type]
@@ -1155,6 +1169,11 @@ final class ChatEngine {
     let viewOnce = metadataValue("viewOnce", ["view_once"])
     let isVideoNote = metadataValue("isVideoNote", ["is_video_note"])
     let waveform = metadataValue("waveform", [])
+    let stickerId = normalizedString(metadataValue("stickerId", []))
+    let stickerPackId = normalizedString(metadataValue("stickerPackId", ["packId", "pack_id"]))
+    let stickerBundleFileName = normalizedString(
+      metadataValue("stickerBundleFileName", ["bundleFileName", "bundle_file_name"]))
+    let stickerEmoji = normalizedString(metadataValue("emoji", []))
     let hasText = !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     if type == "text" && !hasText {
       return ["accepted": false, "reason": "empty_text"]
@@ -1212,6 +1231,10 @@ final class ChatEngine {
       if let viewOnce { decryptedFields["viewOnce"] = viewOnce }
       if let isVideoNote { decryptedFields["isVideoNote"] = isVideoNote }
       if let waveform { decryptedFields["waveform"] = waveform }
+      if let stickerId { decryptedFields["stickerId"] = stickerId }
+      if let stickerPackId { decryptedFields["stickerPackId"] = stickerPackId }
+      if let stickerBundleFileName { decryptedFields["stickerBundleFileName"] = stickerBundleFileName }
+      if let stickerEmoji { decryptedFields["emoji"] = stickerEmoji }
       var optimisticRow = buildLiveRowPayloadLocked(
         chatId: chatId,
         messageId: messageId,
@@ -1491,6 +1514,12 @@ final class ChatEngine {
         if let viewOnce { fullPayloadBase["viewOnce"] = viewOnce }
         if let isVideoNote { fullPayloadBase["isVideoNote"] = isVideoNote }
         if let waveform { fullPayloadBase["waveform"] = waveform }
+        if let stickerId { fullPayloadBase["stickerId"] = stickerId }
+        if let stickerPackId { fullPayloadBase["stickerPackId"] = stickerPackId }
+        if let stickerBundleFileName {
+          fullPayloadBase["stickerBundleFileName"] = stickerBundleFileName
+        }
+        if let stickerEmoji { fullPayloadBase["emoji"] = stickerEmoji }
         let fullPayload = makeJSONSafeMap(fullPayloadBase)
         guard
           let fullPayloadData = try? JSONSerialization.data(
@@ -1547,6 +1576,7 @@ final class ChatEngine {
           case "location": return "Location"
           case "contact": return "Contact"
           case "gif": return "GIF"
+          case "sticker": return "Sticker"
           default: return ""
           }
         }()
@@ -2080,6 +2110,9 @@ final class ChatEngine {
       let token = authHeaderTokenLocked() ?? ""
 
       historyRowsByChat.removeValue(forKey: chatId)
+      if chatId == "saved_messages" {
+        self.cachedSavedMessagesResponse = nil
+      }
       historyLoadingChats.remove(chatId)
       liveMessageRowsByChat.removeValue(forKey: chatId)
       deletedMessageIdsByChat.removeValue(forKey: chatId)
@@ -3771,6 +3804,14 @@ final class ChatEngine {
     if let width = json["width"] { out["width"] = width }
     if let height = json["height"] { out["height"] = height }
     if let thumbnailBase64 = json["thumbnailBase64"] { out["thumbnailBase64"] = thumbnailBase64 }
+    if let stickerId = json["stickerId"] { out["stickerId"] = stickerId }
+    if let stickerPackId = json["stickerPackId"] ?? json["packId"] {
+      out["stickerPackId"] = stickerPackId
+    }
+    if let stickerBundleFileName = json["stickerBundleFileName"] ?? json["bundleFileName"] {
+      out["stickerBundleFileName"] = stickerBundleFileName
+    }
+    if let emoji = json["emoji"] { out["emoji"] = emoji }
     if out["text"] == nil {
       out["text"] = raw
     }
@@ -3923,6 +3964,24 @@ final class ChatEngine {
     if let caption { metadata["caption"] = caption }
     if let mediaKey = decryptedFields["mediaKey"] { metadata["mediaKey"] = mediaKey }
     if let localMediaUrl { metadata["localMediaUrl"] = localMediaUrl }
+    if let stickerId = normalizedString(decryptedFields["stickerId"]) {
+      metadata["stickerId"] = stickerId
+    }
+    if let stickerPackId = normalizedString(
+      decryptedFields["stickerPackId"] ?? decryptedFields["packId"])
+    {
+      metadata["stickerPackId"] = stickerPackId
+      metadata["packId"] = stickerPackId
+    }
+    if let stickerBundleFileName = normalizedString(
+      decryptedFields["stickerBundleFileName"] ?? decryptedFields["bundleFileName"])
+    {
+      metadata["stickerBundleFileName"] = stickerBundleFileName
+      metadata["bundleFileName"] = stickerBundleFileName
+    }
+    if let emoji = normalizedString(decryptedFields["emoji"]) {
+      metadata["emoji"] = emoji
+    }
 
     var message: [String: Any] = [
       "id": messageId,
@@ -4923,13 +4982,22 @@ final class ChatEngine {
       return
     }
 
+    // saved_messages uses a different API endpoint: /api/saved_messages/{userId}
+    let isSavedMessages = chatId == "saved_messages"
+
     historyLoadingChats.insert(chatId)
     let token = authHeaderTokenLocked()
-    let baseMessageUrl = apiBase.appendingPathComponent("api").appendingPathComponent("chat")
-      .appendingPathComponent(chatId).appendingPathComponent("messages")
-    var urlComponents = URLComponents(url: baseMessageUrl, resolvingAgainstBaseURL: false)
-    urlComponents?.queryItems = [URLQueryItem(name: "limit", value: "15")]
-    let finalUrl = urlComponents?.url ?? baseMessageUrl
+    let finalUrl: URL
+    if isSavedMessages {
+      finalUrl = apiBase.appendingPathComponent("api").appendingPathComponent("saved_messages")
+        .appendingPathComponent(userId)
+    } else {
+      let baseMessageUrl = apiBase.appendingPathComponent("api").appendingPathComponent("chat")
+        .appendingPathComponent(chatId).appendingPathComponent("messages")
+      var urlComponents = URLComponents(url: baseMessageUrl, resolvingAgainstBaseURL: false)
+      urlComponents?.queryItems = [URLQueryItem(name: "limit", value: "15")]
+      finalUrl = urlComponents?.url ?? baseMessageUrl
+    }
     var request = URLRequest(url: finalUrl)
     request.httpMethod = "GET"
     request.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -4995,7 +5063,11 @@ final class ChatEngine {
           "[ChatEngine] loadChatHistory OK chatId=%@ duration=%lldms bytes=%d",
           String(chatId.prefix(12)),
           durationMs, data.count)
-        self.applyChatHistoryResponseLocked(chatId: chatId, data: data)
+        if isSavedMessages {
+          self.applySavedMessagesHistoryResponseLocked(data: data)
+        } else {
+          self.applyChatHistoryResponseLocked(chatId: chatId, data: data)
+        }
       }
     }.resume()
   }
@@ -5036,6 +5108,43 @@ final class ChatEngine {
         "chatId": chatId,
         "rows": rows.count,
         "messages": messagesArray.count,
+      ])
+    scheduleReplayQueuedOutboundLocked(chatId: chatId, trigger: "history_loaded")
+    let snapshot = statusSnapshotLocked()
+    postChangeLocked(reason: "chatRowsReloaded", userInfo: ["chatId": chatId, "state": snapshot])
+  }
+
+  private func applySavedMessagesHistoryResponseLocked(data: Data) {
+    let chatId = "saved_messages"
+    let rawItems = parseSavedMessagesServerItems(data)
+    guard !rawItems.isEmpty else {
+      appendJournalLocked(
+        event: "native-chat-history-load-error",
+        payload: [
+          "chatId": chatId,
+          "error": "empty_saved_messages_response",
+        ])
+      historyFullyLoadedChats.insert(chatId)
+      if historyRowsByChat[chatId] == nil {
+        historyRowsByChat[chatId] = []
+      }
+      cachedSavedMessagesResponse = []
+      let snapshot = statusSnapshotLocked()
+      postChangeLocked(reason: "chatRowsReloaded", userInfo: ["chatId": chatId, "state": snapshot])
+      return
+    }
+    let normalized = normalizeSavedMessagesLocked(rawItems)
+    cachedSavedMessagesResponse = normalized
+    let rows = buildHistoryRowsLocked(chatId: chatId, rawMessages: normalized)
+    historyRowsByChat[chatId] = rows
+    historyFullyLoadedChats.insert(chatId)
+    state["updatedAt"] = nowMs()
+    appendJournalLocked(
+      event: "native-chat-history-load-ok",
+      payload: [
+        "chatId": chatId,
+        "rows": rows.count,
+        "messages": rawItems.count,
       ])
     scheduleReplayQueuedOutboundLocked(chatId: chatId, trigger: "history_loaded")
     let snapshot = statusSnapshotLocked()
@@ -5275,7 +5384,8 @@ final class ChatEngine {
 
   private func parseJSONObjectString(_ raw: Any?) -> [String: Any] {
     guard let text = normalizedString(raw), let data = text.data(using: .utf8) else { return [:] }
-    guard let json = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
+    guard let json = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+    else {
       return [:]
     }
     return json as? [String: Any] ?? [:]
@@ -5340,7 +5450,8 @@ final class ChatEngine {
       let resolvedLatitude = parseDoubleValue(decryptedFields["latitude"])
       let resolvedLongitude = parseDoubleValue(decryptedFields["longitude"])
       let resolvedDuration = parseDoubleValue(decryptedFields["duration"])
-      let resolvedEditedAt = parseLongValue(decryptedFields["editedAt"] ?? raw["edited_at"] ?? raw["editedAt"])
+      let resolvedEditedAt = parseLongValue(
+        decryptedFields["editedAt"] ?? raw["edited_at"] ?? raw["editedAt"])
 
       var normalized: [String: Any] = [
         "id": messageId,
@@ -5383,6 +5494,24 @@ final class ChatEngine {
       if let contact = decryptedFields["contact"] {
         normalized["contact"] = contact
       }
+      if let stickerId = normalizedString(decryptedFields["stickerId"]) {
+        normalized["stickerId"] = stickerId
+      }
+      if let stickerPackId = normalizedString(
+        decryptedFields["stickerPackId"] ?? decryptedFields["packId"])
+      {
+        normalized["stickerPackId"] = stickerPackId
+        normalized["packId"] = stickerPackId
+      }
+      if let stickerBundleFileName = normalizedString(
+        decryptedFields["stickerBundleFileName"] ?? decryptedFields["bundleFileName"])
+      {
+        normalized["stickerBundleFileName"] = stickerBundleFileName
+        normalized["bundleFileName"] = stickerBundleFileName
+      }
+      if let emoji = normalizedString(decryptedFields["emoji"]) {
+        normalized["emoji"] = emoji
+      }
       return normalized
     }
   }
@@ -5390,18 +5519,29 @@ final class ChatEngine {
   func fetchSavedMessages(_ payload: [String: Any], completion: @escaping ([String: Any]) -> Void) {
     queue.async { [weak self] in
       guard let self else { return }
-      guard let (apiBase, token) = self.requestContext else {
+      let hasCache = self.cachedSavedMessagesResponse != nil
+      if let cached = self.cachedSavedMessagesResponse {
         DispatchQueue.main.async {
-          completion(["success": false, "reason": "missing_config", "messages": []])
+          completion(["success": true, "messages": cached])
+        }
+      }
+      guard let (apiBase, token) = self.requestContext else {
+        if !hasCache {
+          DispatchQueue.main.async {
+            completion(["success": false, "reason": "missing_config", "messages": []])
+          }
         }
         return
       }
       guard
         let userId =
-          normalizedString(payload["userId"] ?? payload["user_id"] ?? getConfigValueLocked("userId"))
+          normalizedString(
+            payload["userId"] ?? payload["user_id"] ?? getConfigValueLocked("userId"))
       else {
-        DispatchQueue.main.async {
-          completion(["success": false, "reason": "missing_user_id", "messages": []])
+        if !hasCache {
+          DispatchQueue.main.async {
+            completion(["success": false, "reason": "missing_user_id", "messages": []])
+          }
         }
         return
       }
@@ -5419,19 +5559,27 @@ final class ChatEngine {
         guard let self else { return }
         let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
         guard let data, error == nil, (200...299).contains(statusCode) else {
-          DispatchQueue.main.async {
-            completion([
-              "success": false,
-              "reason": "http_\(statusCode)",
-              "messages": [],
-            ])
+          if !hasCache {
+            DispatchQueue.main.async {
+              completion([
+                "success": false,
+                "reason": "http_\(statusCode)",
+                "messages": [],
+              ])
+            }
           }
           return
         }
         let rawItems = self.syncOnQueue { self.parseSavedMessagesServerItems(data) }
-        let messages = self.syncOnQueue { self.normalizeSavedMessagesLocked(rawItems) }
-        DispatchQueue.main.async {
-          completion(["success": true, "messages": messages])
+        let messages = self.syncOnQueue {
+          let normalized = self.normalizeSavedMessagesLocked(rawItems)
+          self.cachedSavedMessagesResponse = normalized
+          return normalized
+        }
+        if !hasCache {
+          DispatchQueue.main.async {
+            completion(["success": true, "messages": messages])
+          }
         }
       }.resume()
     }
@@ -5457,10 +5605,12 @@ final class ChatEngine {
       let metadata = (payload["metadata"] as? [String: Any]) ?? [:]
       var mediaUrl =
         normalizedString(
-          metadata["mediaUrl"] ?? metadata["media_url"] ?? payload["mediaUrl"] ?? payload["media_url"])
+          metadata["mediaUrl"] ?? metadata["media_url"] ?? payload["mediaUrl"]
+            ?? payload["media_url"])
       var fileName =
         normalizedString(metadata["fileName"] ?? metadata["file_name"] ?? payload["fileName"])
-      var fileSize = parseLongValue(metadata["fileSize"] ?? metadata["file_size"] ?? payload["fileSize"])
+      var fileSize = parseLongValue(
+        metadata["fileSize"] ?? metadata["file_size"] ?? payload["fileSize"])
       let latitude = parseDoubleValue(metadata["latitude"] ?? payload["latitude"])
       let longitude = parseDoubleValue(metadata["longitude"] ?? payload["longitude"])
       let duration = parseDoubleValue(metadata["duration"] ?? payload["duration"])
@@ -5470,6 +5620,14 @@ final class ChatEngine {
         normalizedString(metadata["replyToId"] ?? metadata["reply_to_id"] ?? payload["replyToId"])
       let contact = metadata["contact"] ?? payload["contact"]
       let isVideoNote = metadata["isVideoNote"] ?? payload["isVideoNote"]
+      let stickerId = normalizedString(metadata["stickerId"] ?? payload["stickerId"])
+      let stickerPackId = normalizedString(
+        metadata["stickerPackId"] ?? metadata["packId"] ?? payload["stickerPackId"]
+          ?? payload["packId"])
+      let stickerBundleFileName = normalizedString(
+        metadata["stickerBundleFileName"] ?? metadata["bundleFileName"]
+          ?? payload["stickerBundleFileName"] ?? payload["bundleFileName"])
+      let stickerEmoji = normalizedString(metadata["emoji"] ?? payload["emoji"])
       let myPublicKeyPem = normalizedString(
         getConfigValueLocked("publicKeyPem") ?? getConfigValueLocked("publicKey"))
 
@@ -5479,7 +5637,9 @@ final class ChatEngine {
       }
 
       let uploadableTypes: Set<String> = ["image", "voice", "video", "file", "sticker", "music"]
-      if let currentMediaUrl = mediaUrl, uploadableTypes.contains(type), isLocalMediaURI(currentMediaUrl) {
+      if let currentMediaUrl = mediaUrl, uploadableTypes.contains(type),
+        isLocalMediaURI(currentMediaUrl)
+      {
         let uploadOutcome = uploadLocalMediaLocked(
           localUri: currentMediaUrl,
           messageType: type,
@@ -5517,6 +5677,12 @@ final class ChatEngine {
         if let replyToId { encryptedPayload["replyToId"] = replyToId }
         if let contact { encryptedPayload["contact"] = contact }
         if let isVideoNote { encryptedPayload["isVideoNote"] = isVideoNote }
+        if let stickerId { encryptedPayload["stickerId"] = stickerId }
+        if let stickerPackId { encryptedPayload["stickerPackId"] = stickerPackId }
+        if let stickerBundleFileName {
+          encryptedPayload["stickerBundleFileName"] = stickerBundleFileName
+        }
+        if let stickerEmoji { encryptedPayload["emoji"] = stickerEmoji }
         if let payloadString = try? JSONSerialization.data(
           withJSONObject: makeJSONSafeMap(encryptedPayload), options: []),
           let messageString = String(data: payloadString, encoding: .utf8),
@@ -5540,6 +5706,16 @@ final class ChatEngine {
       if let duration { extraPayload["duration"] = duration }
       if let replyToId { extraPayload["replyToId"] = replyToId }
       if let isVideoNote { extraPayload["isVideoNote"] = isVideoNote }
+      if let stickerId { extraPayload["stickerId"] = stickerId }
+      if let stickerPackId {
+        extraPayload["stickerPackId"] = stickerPackId
+        extraPayload["packId"] = stickerPackId
+      }
+      if let stickerBundleFileName {
+        extraPayload["stickerBundleFileName"] = stickerBundleFileName
+        extraPayload["bundleFileName"] = stickerBundleFileName
+      }
+      if let stickerEmoji { extraPayload["emoji"] = stickerEmoji }
 
       let requestBody = makeJSONSafeMap([
         "user_id": userId,
@@ -5552,7 +5728,8 @@ final class ChatEngine {
         "media_url": NSNull(),
         "timestamp": Int64(nowMs()),
         "extra": String(
-          data: (try? JSONSerialization.data(withJSONObject: extraPayload, options: [])) ?? Data("{}".utf8),
+          data: (try? JSONSerialization.data(withJSONObject: extraPayload, options: []))
+            ?? Data("{}".utf8),
           encoding: .utf8
         ) ?? "{}",
       ])
@@ -5590,7 +5767,8 @@ final class ChatEngine {
       }
       guard
         let userId =
-          normalizedString(payload["userId"] ?? payload["user_id"] ?? getConfigValueLocked("userId"))
+          normalizedString(
+            payload["userId"] ?? payload["user_id"] ?? getConfigValueLocked("userId"))
       else {
         DispatchQueue.main.async { completion(["success": false, "reason": "missing_user_id"]) }
         return
