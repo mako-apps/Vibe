@@ -8,6 +8,7 @@ internal object ChatEngineStore {
   private const val PREFS = "vibe_chat_engine"
   private const val KEY_CONFIG = "config_v1"
   private const val KEY_JOURNAL = "journal_v1"
+  private const val KEY_OUTBOUND = "outbound_v1"
   private const val MAX_JOURNAL = 300
 
   private fun prefs(context: Context) =
@@ -58,6 +59,23 @@ internal object ChatEngineStore {
     prefs(context).edit().remove(KEY_JOURNAL).apply()
   }
 
+  fun setOutboundState(context: Context, payload: Map<String, Any?>) {
+    prefs(context).edit().putString(KEY_OUTBOUND, JSONObject(payload).toString()).apply()
+  }
+
+  fun getOutboundState(context: Context): Map<String, Any?> {
+    val raw = prefs(context).getString(KEY_OUTBOUND, null) ?: return emptyMap()
+    return try {
+      jsonObjectToMap(JSONObject(raw))
+    } catch (_: Throwable) {
+      emptyMap()
+    }
+  }
+
+  fun clearOutboundState(context: Context) {
+    prefs(context).edit().remove(KEY_OUTBOUND).apply()
+  }
+
   private fun jsonObjectToMap(obj: JSONObject): Map<String, Any?> {
     val out = linkedMapOf<String, Any?>()
     val keys = obj.keys()
@@ -84,4 +102,3 @@ internal object ChatEngineStore {
       else -> value
     }
 }
-

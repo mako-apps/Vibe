@@ -163,6 +163,19 @@ defmodule VibeWeb.Router do
     post "/ai/edit_image", AIController, :edit_image
   end
 
+  scope "/bridge/v1", VibeWeb do
+    pipe_through [:api, :api_authenticated]
+
+    get "/bundle", BridgeController, :bundle
+    post "/session/open", BridgeController, :open_session
+    post "/text/send", BridgeController, :send
+    post "/text/poll", BridgeController, :poll
+    post "/text/ack", BridgeController, :ack
+    post "/home/snapshot", BridgeController, :home_snapshot
+    post "/chat/history", BridgeController, :chat_history
+    post "/keys/peer", BridgeController, :peer_key
+  end
+
   # Webhooks (no auth required)
   scope "/api", VibeWeb do
     pipe_through :api

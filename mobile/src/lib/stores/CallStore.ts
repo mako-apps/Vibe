@@ -9,12 +9,21 @@ import { create } from 'zustand';
 import WebRTCService from '../services/WebRTCService';
 import SoundManager from '../SoundManager';
 import ProxyManager from '../ProxyManager';
+import { resolveNativeTransportConfig } from '../nativeTransportConfig';
 import { useAuthStore } from './auth-store';
 
 // Detect if we're behind strict network filtering and should force TURN relay
 const shouldForceRelay = (): boolean => {
     try {
         return ProxyManager.getInstance().getConnectionMode() === 'relay';
+    } catch {
+        return false;
+    }
+};
+
+const callsDisabledByTransport = (): boolean => {
+    try {
+        return resolveNativeTransportConfig().disableCalls === true;
     } catch {
         return false;
     }
@@ -557,6 +566,11 @@ export const useCallStore = create<CallState & CallActions>()(
                         canPush: !!channel && typeof channel.push === 'function',
                     });
 
+                    if (callsDisabledByTransport()) {
+                        console.warn('[CallStore] Calls disabled by active transport mode');
+                        return false;
+                    }
+
                     if (!isWebRTCAvailable) {
                         console.warn('[CallStore] WebRTC not available, cannot start call');
                         return false;
@@ -794,6 +808,10 @@ export const useCallStore = create<CallState & CallActions>()(
                         });
                     } catch { }
                     if (!incomingCallData) return false;
+                    if (callsDisabledByTransport()) {
+                        console.warn('[CallStore] Calls disabled by active transport mode');
+                        return false;
+                    }
                     const effectiveCallType: CallType =
                         incomingCallData.callType === 'video' ? 'video' : 'voice';
                     let isWebRTCAvailable = get().isWebRTCAvailable;

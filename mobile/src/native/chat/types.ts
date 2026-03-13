@@ -183,6 +183,7 @@ export interface NativeChatEngineModule {
   isSupported?: () => boolean;
   setChatEngineConfig?: (payload: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>;
   getChatEngineStatus?: () => Promise<Record<string, unknown>> | Record<string, unknown>;
+  getTransportStatus?: () => Promise<Record<string, unknown>> | Record<string, unknown>;
   connectChatEngine?: () => Promise<Record<string, unknown>> | Record<string, unknown>;
   disconnectChatEngine?: () => Promise<Record<string, unknown>> | Record<string, unknown>;
   bindChatSurface?: (payload: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>;

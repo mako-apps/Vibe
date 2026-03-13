@@ -242,11 +242,24 @@ final class ChatNativeNewChatViewController: UIViewController,
     super.viewDidLoad()
     configureLayout()
     configureAppearance()
+    if ((ChatEngine.shared.getTransportStatus()["transportMode"] as? String) ?? "direct")
+      == "bridge_text"
+    {
+      searchBar.isUserInteractionEnabled = false
+      searchBar.searchTextField.isEnabled = false
+      updateStatus("Search is disabled in blackout mode")
+      return
+    }
     updateStatus("Find by username, phone, or user ID")
   }
 
   override func viewDidAppear(_ animated: Bool) {
     super.viewDidAppear(animated)
+    if ((ChatEngine.shared.getTransportStatus()["transportMode"] as? String) ?? "direct")
+      == "bridge_text"
+    {
+      return
+    }
     searchBar.becomeFirstResponder()
   }
 

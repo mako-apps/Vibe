@@ -16,6 +16,16 @@ import { uploadMedia } from './api-client';
 import { useEncryptedMediaStore } from './stores/encrypted-media-store';
 import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
 import { fetchHomeChatsNativeFirst } from '../native/home/api';
+import { resolveNativeTransportConfig } from './nativeTransportConfig';
+import {
+    ensureBlackoutControlReady,
+    recordBridgeTransportConnected,
+    recordBridgeTransportConnecting,
+    recordBridgeTransportFailure,
+    recordDirectTransportFailure,
+    recordDirectTransportSuccess,
+    subscribeBlackoutState,
+} from './transport/BlackoutState';
 
 const CHATSTORE_DEBUG = false;
 const chatStoreLog = (...args: any[]) => {
@@ -385,6 +395,7 @@ interface ChatState {
     sendTyping: (chatId: string) => void;
     sendStopTyping: (chatId: string) => void;
     deleteChat: (chatId: string) => void;
+    clearChat: (chatId: string) => void;
     pinChat: (chatId: string) => void;
     toggleMuteChat: (chatId: string) => void;
     toggleMarkUnread: (chatId: string, forceStatus?: boolean) => void;
@@ -433,6 +444,65 @@ const startChatInFlight = new Map<string, Promise<string>>();
 // Dedup public-key fetches per friend to avoid first-send stalls and duplicate requests
 const friendKeyFetchInFlight = new Map<string, Promise<string | null>>();
 const historyLoadInFlight = new Map<string, Promise<void>>();
+let transportControlReadyPromise: Promise<void> | null = null;
+let blackoutStateSubscription: (() => void) | null = null;
+let nativeTransportStatusTimer: ReturnType<typeof setTimeout> | null = null;
+let suppressNextSocketFailure = false;
+let transportPolicySignature: string | null = null;
+
+const ensureTransportControlReady = (): Promise<void> => {
+    if (!transportControlReadyPromise) {
+        transportControlReadyPromise = Promise.resolve(ensureBlackoutControlReady())
+            .then(() => {
+                if (!blackoutStateSubscription) {
+                    blackoutStateSubscription = subscribeBlackoutState(() => {
+                        applyTransportPolicy('blackout_state_changed');
+                    });
+                }
+            })
+            .finally(() => {
+                transportControlReadyPromise = null;
+            });
+    }
+    return transportControlReadyPromise;
+};
+
+const clearNativeTransportStatusTimer = () => {
+    if (nativeTransportStatusTimer) {
+        clearTimeout(nativeTransportStatusTimer);
+        nativeTransportStatusTimer = null;
+    }
+};
+
+const probeNativeTransportStatus = (attempt = 0) => {
+    clearNativeTransportStatusTimer();
+    nativeTransportStatusTimer = setTimeout(async () => {
+        try {
+            const { getNativeChatEngineModule } = require('../native/chat/runtime');
+            const module = getNativeChatEngineModule?.();
+            const status = await Promise.resolve(module?.getTransportStatus?.());
+            const transportMode = typeof status?.transportMode === 'string' ? status.transportMode : 'direct';
+            if (transportMode === 'bridge_text') {
+                if (status?.bridgeReachable === true || status?.connected === true) {
+                    await recordBridgeTransportConnected(
+                        typeof status?.activeBridgeId === 'string' ? status.activeBridgeId : undefined,
+                    );
+                    return;
+                }
+                if (attempt >= 4) {
+                    await recordBridgeTransportFailure(
+                        'native_bridge_unreachable',
+                        typeof status?.lastBridgeError === 'string' ? status.lastBridgeError : undefined,
+                    );
+                    return;
+                }
+                probeNativeTransportStatus(attempt + 1);
+            }
+        } catch {
+            if (attempt < 4) probeNativeTransportStatus(attempt + 1);
+        }
+    }, attempt === 0 ? 1200 : 2400);
+};
 
 const resolveAuthBearerToken = (session?: { loginToken?: string; userId?: string } | null): string | null => {
     if (session?.loginToken) return session.loginToken;
@@ -1242,9 +1312,10 @@ const tryNativeChatEngineReceiptPush = async (
 };
 
 const configureChatEngineShadowTransport = (apiBaseUrl: string, socketUrl: string, auth: any) => {
-    if (!socketUrl || !auth?.userId) return;
+    if (!auth?.userId) return;
     const jsFallbackEnv = process.env.EXPO_PUBLIC_CHAT_NATIVE_JS_FALLBACK;
     const chatNativeJsFallbackEnabled = jsFallbackEnv === '1' || jsFallbackEnv === 'true';
+    const transportConfig = resolveNativeTransportConfig();
     fireAndForgetChatEngineShadowCall('setChatEngineConfig', {
         apiBaseUrl,
         socketUrl,
@@ -1254,6 +1325,7 @@ const configureChatEngineShadowTransport = (apiBaseUrl: string, socketUrl: strin
         privateKeyPem: auth?.keyPair?.privateKey,
         publicKeyPem: auth?.keyPair?.publicKey,
         chatNativeJsFallbackEnabled,
+        ...transportConfig,
     });
 };
 
@@ -1265,11 +1337,7 @@ const disconnectChatEngineShadowTransport = () => {
     fireAndForgetChatEngineShadowCall('disconnectChatEngine');
 };
 
-// Export a function to reset socket (for development/hot-reload issues)
-export const resetSocketConnection = () => {
-
-
-    // Leave all chat channels
+const clearDirectSocketState = ({ disconnectNative = true }: { disconnectNative?: boolean } = {}) => {
     chatChannels.forEach((channel, chatId) => {
         try {
             channel.leave();
@@ -1279,7 +1347,6 @@ export const resetSocketConnection = () => {
     });
     chatChannels.clear();
 
-    // Leave user channel
     if (userChannel) {
         try {
             userChannel.leave();
@@ -1289,7 +1356,6 @@ export const resetSocketConnection = () => {
         userChannel = null;
     }
 
-    // Disconnect socket
     if (socket) {
         try {
             socket.disconnect();
@@ -1316,16 +1382,57 @@ export const resetSocketConnection = () => {
     pendingRetryFlushTimers.clear();
     pendingRetryPumpRunning.clear();
     pendingRetryPumpNeedsAnotherPass.clear();
+    clearNativeTransportStatusTimer();
 
-    // Remove foreground reconnect listener
     appStateSubscription?.remove();
     appStateSubscription = null;
-
-    // Reset flag so socket can be re-initialized
     socketInitialized = false;
-    disconnectChatEngineShadowTransport();
 
+    if (disconnectNative) {
+        disconnectChatEngineShadowTransport();
+    }
+};
 
+const applyTransportPolicy = (reason: string) => {
+    const auth = AuthManager.getInstance().getSession();
+    if (!auth?.userId) return;
+
+    const proxy = ProxyManager.getInstance();
+    const baseUrl = proxy.getBestUrl();
+    const socketUrl = baseUrl.replace(/^http/, 'ws') + '/socket';
+    const transportConfig = resolveNativeTransportConfig();
+    const nextSignature = [
+        transportConfig.transportMode,
+        transportConfig.bridgeBaseUrl || '',
+        transportConfig.activeBridgeId || '',
+        transportConfig.disableRealtime ? 'rt-off' : 'rt-on',
+    ].join('|');
+
+    if (transportPolicySignature === nextSignature) return;
+    transportPolicySignature = nextSignature;
+    configureChatEngineShadowTransport(baseUrl, socketUrl, auth);
+
+    if (transportConfig.transportMode !== 'direct' || transportConfig.disableRealtime) {
+        suppressNextSocketFailure = true;
+        clearDirectSocketState({ disconnectNative: false });
+        useChatStore.setState({ socket: null, isConnected: false });
+        void recordBridgeTransportConnecting();
+        connectChatEngineShadowTransport();
+        probeNativeTransportStatus();
+        return;
+    }
+
+    suppressNextSocketFailure = true;
+    clearDirectSocketState({ disconnectNative: true });
+    useChatStore.setState({ socket: null, isConnected: false });
+    useChatStore.getState().initSocket();
+    chatStoreLog('[ChatStore] Applied transport policy', { reason, mode: transportConfig.transportMode });
+};
+
+// Export a function to reset socket (for development/hot-reload issues)
+export const resetSocketConnection = () => {
+    suppressNextSocketFailure = true;
+    clearDirectSocketState({ disconnectNative: true });
 };
 
 export const useChatStore = create<ChatState>()(
@@ -1356,92 +1463,116 @@ export const useChatStore = create<ChatState>()(
                 }
                 socketInitialized = true;
 
-                const proxy = ProxyManager.getInstance();
-                const baseUrl = proxy.getBestUrl();
-                // Convert http(s) to ws(s)
-                const socketUrl = baseUrl.replace(/^http/, 'ws') + '/socket';
+                void Promise.resolve(ensureTransportControlReady())
+                    .then(() => {
+                        const proxy = ProxyManager.getInstance();
+                        const baseUrl = proxy.getBestUrl();
+                        // Convert http(s) to ws(s)
+                        const socketUrl = baseUrl.replace(/^http/, 'ws') + '/socket';
+                        const transportConfig = resolveNativeTransportConfig();
 
-                const auth = AuthManager.getInstance().getSession();
-                if (!auth) {
+                        const auth = AuthManager.getInstance().getSession();
+                        if (!auth) {
 
-                    socketInitialized = false; // Reset so it can try again later
-                    return;
-                }
+                            socketInitialized = false; // Reset so it can try again later
+                            return;
+                        }
 
-                configureChatEngineShadowTransport(baseUrl, socketUrl, auth);
+                        transportPolicySignature = null;
+                        configureChatEngineShadowTransport(baseUrl, socketUrl, auth);
 
+                        if (transportConfig.transportMode !== 'direct' || transportConfig.disableRealtime) {
+                            transportPolicySignature = [
+                                transportConfig.transportMode,
+                                transportConfig.bridgeBaseUrl || '',
+                                transportConfig.activeBridgeId || '',
+                                transportConfig.disableRealtime ? 'rt-off' : 'rt-on',
+                            ].join('|');
+                            set({ socket: null, isConnected: false });
+                            void recordBridgeTransportConnecting();
+                            connectChatEngineShadowTransport();
+                            probeNativeTransportStatus();
+                            return;
+                        }
 
-
-                socket = new PhxSocket(socketUrl, {
-                    params: { token: auth.loginToken || auth.userId },
-                    // Fail fast if connection drops, check more frequently
-                    heartbeatIntervalMs: 10000,
-                    // Use backoff: 1s, 2s, 5s, 10s max
-                    reconnectAfterMs: (tries) => [1000, 2000, 5000, 10000][tries - 1] || 10000,
-                });
-
-                socket.connect();
-                set({ socket }); // Update store state with socket instance
-
-                const scheduleLoadChats = (delayMs = 180) => {
-                    if (loadChatsDebounceTimer) return;
-                    loadChatsDebounceTimer = setTimeout(() => {
-                        loadChatsDebounceTimer = null;
-                        get().loadChats();
-                    }, delayMs);
-                };
-
-                const queueRecoverableMessages = () => {
-                    const { chats: currentChats, offlineQueue } = get();
-                    const recovered: Message[] = [];
-                    let chatsChanged = false;
-
-                    const updatedChats = currentChats.map((chat) => {
-                        let changed = false;
-                        const nextMessages = chat.messages.map((msg) => {
-                            if (msg.status === 'sending') {
-                                changed = true;
-                                chatsChanged = true;
-                                const pendingMsg = { ...msg, status: 'pending' as const };
-                                recovered.push(pendingMsg);
-                                return pendingMsg;
-                            }
-                            if (msg.status === 'pending' || msg.status === 'error') {
-                                recovered.push(msg);
-                            }
-                            return msg;
+                        socket = new PhxSocket(socketUrl, {
+                            params: { token: auth.loginToken || auth.userId },
+                            // Fail fast if connection drops, check more frequently
+                            heartbeatIntervalMs: 10000,
+                            // Use backoff: 1s, 2s, 5s, 10s max
+                            reconnectAfterMs: (tries) => [1000, 2000, 5000, 10000][tries - 1] || 10000,
                         });
-                        return changed ? { ...chat, messages: nextMessages } : chat;
-                    });
 
-                    const queueMap = new Map<string, Message>();
-                    for (const msg of offlineQueue) queueMap.set(msg.id, msg);
-                    for (const msg of recovered) queueMap.set(msg.id, msg);
+                        socket.connect();
+                        set({ socket }); // Update store state with socket instance
 
-                    const nextQueue = Array.from(queueMap.values());
-                    const queueChanged =
-                        nextQueue.length !== offlineQueue.length ||
-                        nextQueue.some((msg, index) => offlineQueue[index]?.id !== msg.id);
+                        const scheduleLoadChats = (delayMs = 180) => {
+                            if (loadChatsDebounceTimer) return;
+                            loadChatsDebounceTimer = setTimeout(() => {
+                                loadChatsDebounceTimer = null;
+                                get().loadChats();
+                            }, delayMs);
+                        };
 
-                    const patch: Partial<ChatState> = {};
-                    if (chatsChanged) patch.chats = updatedChats;
-                    if (queueChanged) patch.offlineQueue = nextQueue;
-                    if (Object.keys(patch).length > 0) set(patch as any);
-                };
+                        const queueRecoverableMessages = () => {
+                            const { chats: currentChats, offlineQueue } = get();
+                            const recovered: Message[] = [];
+                            let chatsChanged = false;
 
-                socket.onOpen(() => {
-                    connectChatEngineShadowTransport();
+                            const updatedChats = currentChats.map((chat) => {
+                                let changed = false;
+                                const nextMessages = chat.messages.map((msg) => {
+                                    if (msg.status === 'sending') {
+                                        changed = true;
+                                        chatsChanged = true;
+                                        const pendingMsg = { ...msg, status: 'pending' as const };
+                                        recovered.push(pendingMsg);
+                                        return pendingMsg;
+                                    }
+                                    if (msg.status === 'pending' || msg.status === 'error') {
+                                        recovered.push(msg);
+                                    }
+                                    return msg;
+                                });
+                                return changed ? { ...chat, messages: nextMessages } : chat;
+                            });
 
-                    set({ isConnected: true });
+                            const queueMap = new Map<string, Message>();
+                            for (const msg of offlineQueue) queueMap.set(msg.id, msg);
+                            for (const msg of recovered) queueMap.set(msg.id, msg);
 
-                    // Re-sync push token on every reconnect so server always has it
-                    try {
-                        const { useNotificationStore } = require('./stores/notification-store');
-                        useNotificationStore.getState().initNotifications({
-                            forceSync: true,
-                            reason: 'socket_open',
-                        });
-                    } catch (e) { /* ignore if notification store not ready */ }
+                            const nextQueue = Array.from(queueMap.values());
+                            const queueChanged =
+                                nextQueue.length !== offlineQueue.length ||
+                                nextQueue.some((msg, index) => offlineQueue[index]?.id !== msg.id);
+
+                            const patch: Partial<ChatState> = {};
+                            if (chatsChanged) patch.chats = updatedChats;
+                            if (queueChanged) patch.offlineQueue = nextQueue;
+                            if (Object.keys(patch).length > 0) set(patch as any);
+                        };
+
+                        socket.onOpen(() => {
+                            transportPolicySignature = [
+                                transportConfig.transportMode,
+                                transportConfig.bridgeBaseUrl || '',
+                                transportConfig.activeBridgeId || '',
+                                transportConfig.disableRealtime ? 'rt-off' : 'rt-on',
+                            ].join('|');
+                            suppressNextSocketFailure = false;
+                            void recordDirectTransportSuccess('phoenix_socket_open');
+                            connectChatEngineShadowTransport();
+
+                            set({ isConnected: true });
+
+                            // Re-sync push token on every reconnect so server always has it
+                            try {
+                                const { useNotificationStore } = require('./stores/notification-store');
+                                useNotificationStore.getState().initNotifications({
+                                    forceSync: true,
+                                    reason: 'socket_open',
+                                });
+                            } catch (e) { /* ignore if notification store not ready */ }
 
                     // Process Offline Queue — also recover any unsent messages stuck in chats
                     const { offlineQueue, chats: currentChats } = get();
@@ -1745,35 +1876,59 @@ export const useChatStore = create<ChatState>()(
                     }
                 });
 
-                socket.onClose((e) => {
-                    // console.log('[ChatStore] Phoenix Socket Disconnected', e);
-                    disconnectChatEngineShadowTransport();
-                    queueRecoverableMessages();
-                    // Clear channel references so they get re-joined on reconnect
-                    // This ensures fresh handlers are attached
-                    chatChannels.clear();
-                    userChannel = null;
-                    set({ isConnected: false });
-                });
+                        socket.onClose((e) => {
+                            // console.log('[ChatStore] Phoenix Socket Disconnected', e);
+                            if (suppressNextSocketFailure) {
+                                suppressNextSocketFailure = false;
+                                queueRecoverableMessages();
+                                chatChannels.clear();
+                                userChannel = null;
+                                set({ isConnected: false });
+                                return;
+                            }
+                            disconnectChatEngineShadowTransport();
+                            queueRecoverableMessages();
+                            // Clear channel references so they get re-joined on reconnect
+                            // This ensures fresh handlers are attached
+                            chatChannels.clear();
+                            userChannel = null;
+                            set({ isConnected: false });
+                            const message = typeof (e as any)?.reason === 'string' ? (e as any).reason : 'phoenix_socket_closed';
+                            void recordDirectTransportFailure('phoenix_socket_close', message)
+                                .then(() => {
+                                    applyTransportPolicy('phoenix_socket_close');
+                                });
+                        });
 
-                socket.onError((e) => {
-                    disconnectChatEngineShadowTransport();
-                    queueRecoverableMessages();
-                    // Don't clear channels here - let onClose handle it
-                    // Just update connection status
-                    set({ isConnected: false });
-                });
+                        socket.onError((e) => {
+                            if (suppressNextSocketFailure) {
+                                suppressNextSocketFailure = false;
+                                queueRecoverableMessages();
+                                set({ isConnected: false });
+                                return;
+                            }
+                            disconnectChatEngineShadowTransport();
+                            queueRecoverableMessages();
+                            // Don't clear channels here - let onClose handle it
+                            // Just update connection status
+                            set({ isConnected: false });
+                            const message = typeof (e as any)?.message === 'string' ? (e as any).message : 'phoenix_socket_error';
+                            void recordDirectTransportFailure('phoenix_socket_error', message)
+                                .then(() => {
+                                    applyTransportPolicy('phoenix_socket_error');
+                                });
+                        });
 
                 // Reconnect immediately when the app returns to the foreground.
                 // Without this, the Phoenix heartbeat timeout (10s) plus reconnect
                 // backoff (1-10s) can delay reconnection by 10-13s.
-                appStateSubscription?.remove();
-                let lastAppState: AppStateStatus = AppState.currentState;
-                appStateSubscription = AppState.addEventListener('change', (nextState: AppStateStatus) => {
-                    if (lastAppState.match(/inactive|background/) && nextState === 'active') {
-                        if (socket && !get().isConnected) {
-                            chatStoreLog('[ChatStore] App foregrounded — forcing socket reconnect');
-                            try {
+                        appStateSubscription?.remove();
+                        let lastAppState: AppStateStatus = AppState.currentState;
+                        appStateSubscription = AppState.addEventListener('change', (nextState: AppStateStatus) => {
+                            if (lastAppState.match(/inactive|background/) && nextState === 'active') {
+                                if (socket && !get().isConnected) {
+                                    chatStoreLog('[ChatStore] App foregrounded — forcing socket reconnect');
+                                    try {
                                 // Disconnect then reconnect to reset Phoenix internal state
                                 // and bypass the backoff timer.
                                 socket.disconnect(() => {
@@ -1784,12 +1939,18 @@ export const useChatStore = create<ChatState>()(
                                 try { socket?.connect(); } catch (_) { /* ignore */ }
                             }
                         }
-                    }
-                    lastAppState = nextState;
-                });
+                                }
+                                lastAppState = nextState;
+                            });
+                    })
+                    .catch((error) => {
+                        socketInitialized = false;
+                        console.warn('[ChatStore] Failed to initialize transport control', error);
+                    });
             },
 
             loadChats: async () => {
+                await ensureTransportControlReady();
                 let auth = AuthManager.getInstance().getSession();
                 if (!auth) {
                     auth = await AuthManager.getInstance().init();
@@ -1808,11 +1969,13 @@ export const useChatStore = create<ChatState>()(
                     // Fetch chats via native module (pure native, no JS fallback).
                     const apiBaseUrl = ProxyManager.getInstance().getBestUrl();
                     const authToken = auth.loginToken || (auth as any)?.token || '';
+                    const transportConfig = resolveNativeTransportConfig();
                     console.log(`[ChatStore] loadChats DEBUG auth.userId=${auth.userId?.substring(0, 12)}... loginToken.len=${authToken.length} apiBaseUrl=${apiBaseUrl} retryCount=${emptyChatsRetryCount}`);
                     const data = await fetchHomeChatsNativeFirst({
                         userId: auth.userId,
                         apiBaseUrl,
                         authToken,
+                        ...transportConfig,
                     });
 
                     // Process chats
@@ -2384,7 +2547,8 @@ export const useChatStore = create<ChatState>()(
                             unreadCount: 0,
                             pinned: false,
                             muted: false,
-                            markedUnread: false
+                            markedUnread: false,
+                            type: 'dm',
                         };
                         set({ chats: [newChat, ...chats] });
 
@@ -4098,6 +4262,20 @@ export const useChatStore = create<ChatState>()(
                 // Remove from local state immediately (optimistic update)
                 set({ chats: chats.filter(c => c.chatId !== chatId) });
 
+                const { getNativeChatEngineModule } = require('../native/chat/runtime');
+                const nativeEngineModule = getNativeChatEngineModule();
+                if (nativeEngineModule && typeof nativeEngineModule.clearChat === 'function') {
+                    try {
+                        const user = AuthManager.getInstance().getSession();
+                        await Promise.resolve(nativeEngineModule.clearChat({
+                            chatId,
+                            userId: user?.userId
+                        }));
+                    } catch (e) {
+                        console.warn('[ChatStore] native clearChat failed', e);
+                    }
+                }
+
                 // Also delete from server
                 try {
                     const auth = AuthManager.getInstance().getSession();
@@ -4115,6 +4293,58 @@ export const useChatStore = create<ChatState>()(
                 } catch (e) {
                     console.warn('[ChatStore] Failed to delete chat from server:', e);
                     // The local delete already happened, server sync will happen on next load
+                }
+            },
+
+            clearChat: async (chatId) => {
+                const { chats } = get();
+                const chat = chats.find(c => c.chatId === chatId);
+                if (!chat) return;
+
+                set({
+                    chats: chats.map(c =>
+                        c.chatId === chatId
+                            ? {
+                                ...c,
+                                messages: [],
+                                lastMessage: undefined,
+                                previewLastMessage: '',
+                                unreadCount: 0,
+                                markedUnread: false,
+                            }
+                            : c
+                    )
+                });
+
+                const { getNativeChatEngineModule } = require('../native/chat/runtime');
+                const nativeEngineModule = getNativeChatEngineModule();
+                if (nativeEngineModule && typeof nativeEngineModule.clearChat === 'function') {
+                    try {
+                        const user = AuthManager.getInstance().getSession();
+                        await Promise.resolve(nativeEngineModule.clearChat({
+                            chatId,
+                            userId: user?.userId
+                        }));
+                        return;
+                    } catch (e) {
+                        console.warn('[ChatStore] native clearChat failed', e);
+                    }
+                }
+
+                try {
+                    const auth = AuthManager.getInstance().getSession();
+                    if (auth) {
+                        const proxy = ProxyManager.getInstance();
+                        const baseUrl = proxy.getBestUrl();
+                        await fetch(`${baseUrl}/api/chats/${chatId}`, {
+                            method: 'DELETE',
+                            headers: buildAuthHeaders(auth, {
+                                'Content-Type': 'application/json',
+                            }),
+                        });
+                    }
+                } catch (e) {
+                    console.warn('[ChatStore] Failed to clear chat on server:', e);
                 }
             },
 

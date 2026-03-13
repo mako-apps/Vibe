@@ -213,6 +213,17 @@ internal class ChatNativeHomeCardView(context: Context) : FrameLayout(context) {
   }
 
   private fun loadAvatar(avatarUri: String?) {
+    val transportStatus = ChatEngine.getTransportStatus()
+    val transportMode = (transportStatus["transportMode"] as? String) ?: "direct"
+    val disableRemoteAvatars = (transportStatus["disableRemoteAvatars"] as? Boolean) ?: false
+    if (transportMode == "bridge_text" || disableRemoteAvatars) {
+      avatarLoadCall?.cancel()
+      avatarLoadCall = null
+      avatarImage.setImageDrawable(null)
+      avatarImage.visibility = GONE
+      avatarFallbackIcon.visibility = VISIBLE
+      return
+    }
     avatarLoadCall?.cancel()
     avatarLoadCall = null
     avatarLoadToken += 1

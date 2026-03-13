@@ -16,6 +16,10 @@ public final class ChatEngineModule: Module {
       ChatEngine.shared.getStatus()
     }
 
+    Function("getTransportStatus") {
+      ChatEngine.shared.getTransportStatus()
+    }
+
     Function("connectChatEngine") {
       ChatEngine.shared.connect()
     }

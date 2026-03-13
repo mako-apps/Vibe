@@ -1,7 +1,18 @@
+import type { BlackoutCapabilities, BridgeBundle } from '../../lib/transport/types';
+
 export interface NativeHomeFetchInput {
   userId: string;
   apiBaseUrl?: string;
   authToken?: string;
+  transportMode?: 'direct' | 'bridge_text' | 'offline';
+  bridgeBaseUrl?: string;
+  bridgeBundle?: BridgeBundle;
+  activeBridgeId?: string;
+  blackoutCapabilities?: BlackoutCapabilities;
+  disableRealtime?: boolean;
+  disableMedia?: boolean;
+  disableCalls?: boolean;
+  disableRemoteAvatars?: boolean;
 }
 
 export interface NativeHomeFetchResult {

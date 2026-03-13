@@ -7,6 +7,7 @@ final class ChatEngineStore {
   private let queue = DispatchQueue(label: "vibe.chat.engine.store")
   private let configKey = "vibe.chat.engine.config.v1"
   private let journalKey = "vibe.chat.engine.journal.v1"
+  private let outboundKey = "vibe.chat.engine.outbound.v1"
   private let maxJournalCount = 300
 
   private init() {}
@@ -60,6 +61,30 @@ final class ChatEngineStore {
     }
   }
 
+  func setOutboundState(_ payload: [String: Any]) {
+    queue.async {
+      guard JSONSerialization.isValidJSONObject(payload),
+            let data = try? JSONSerialization.data(withJSONObject: payload)
+      else { return }
+      self.defaults.set(data, forKey: self.outboundKey)
+    }
+  }
+
+  func getOutboundState() -> [String: Any] {
+    queue.sync {
+      guard let data = defaults.data(forKey: outboundKey),
+            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+      else { return [:] }
+      return obj
+    }
+  }
+
+  func clearOutboundState() {
+    queue.async {
+      self.defaults.removeObject(forKey: self.outboundKey)
+    }
+  }
+
   private func loadJournalLocked() -> [[String: Any]] {
     guard let data = defaults.data(forKey: journalKey),
           let obj = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
@@ -74,4 +99,3 @@ final class ChatEngineStore {
     defaults.set(data, forKey: journalKey)
   }
 }
-

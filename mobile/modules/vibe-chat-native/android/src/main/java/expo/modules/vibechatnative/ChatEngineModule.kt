@@ -20,6 +20,10 @@ class ChatEngineModule : Module() {
       ChatEngine.getStatus()
     }
 
+    Function("getTransportStatus") {
+      ChatEngine.getTransportStatus()
+    }
+
     Function("connectChatEngine") {
       ChatEngine.connect()
     }

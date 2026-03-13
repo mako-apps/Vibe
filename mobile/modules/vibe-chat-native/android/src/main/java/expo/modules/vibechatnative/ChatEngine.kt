@@ -241,7 +241,7 @@ internal object ChatEngine {
   private val receiptIndex = linkedMapOf<String, MutableMap<String, String>>() // chatId -> messageId -> status
   private val localStatusIndex = linkedMapOf<String, MutableMap<String, String>>() // chatId -> messageId -> status
   private val listeners = linkedMapOf<String, (String, String?, String?) -> Unit>()
-  private var phoenixClient: ChatPhoenixClient? = null
+  private var phoenixClient: ChatRealtimeTransport? = null
   private var nativePresenceActive = false
   private var nativeUserTopic: String? = null
   private var nativeUserJoinRef: String? = null
@@ -264,6 +264,7 @@ internal object ChatEngine {
   private val deletedMessageIdsByChat = linkedMapOf<String, MutableSet<String>>()
   private val chatPeerUserIdsByChatId = linkedMapOf<String, String>()
   private val friendPublicKeysByUserId = linkedMapOf<String, String>()
+  private var configuredUserId: String? = null
   private var cachedDecryptPrivateKeyPem: String? = null
   private var cachedDecryptPrivateKey: PrivateKey? = null
   private var cachedDecryptKeyTimestampMs: Long = 0L
@@ -276,12 +277,76 @@ internal object ChatEngine {
   private const val fallbackApiBaseURL = "https://modest-recreation-production-8329.up.railway.app"
   private const val AGENT_USER_ID = "00000000-0000-0000-0000-000000000001"
 
+  private fun currentOutboundUserIdLocked(): String? =
+    appContextRef?.let(ChatEngineStore::getConfig)?.let { normalized(it["userId"]) }
+
+  private fun persistOutboundStateLocked() {
+    val ctx = appContextRef ?: return
+    val userId = currentOutboundUserIdLocked() ?: return
+    if (pendingOutboundDraftsByMessageId.isEmpty() && pendingOutboundQueueByChat.isEmpty()) {
+      ChatEngineStore.clearOutboundState(ctx)
+      return
+    }
+    ChatEngineStore.setOutboundState(
+      ctx,
+      mapOf(
+        "userId" to userId,
+        "updatedAt" to System.currentTimeMillis(),
+        "draftsByMessageId" to pendingOutboundDraftsByMessageId,
+        "queueByChat" to pendingOutboundQueueByChat,
+      ),
+    )
+  }
+
+  private fun restoreOutboundStateLocked() {
+    if (pendingOutboundDraftsByMessageId.isNotEmpty() || pendingOutboundQueueByChat.isNotEmpty()) return
+    val ctx = appContextRef ?: return
+    val payload = ChatEngineStore.getOutboundState(ctx)
+    if (payload.isEmpty()) return
+    val storedUserId = normalized(payload["userId"]) ?: return
+    val currentUserId = currentOutboundUserIdLocked()
+    if (currentUserId == null || currentUserId != storedUserId) {
+      ChatEngineStore.clearOutboundState(ctx)
+      return
+    }
+
+    val rawDrafts = payload["draftsByMessageId"] as? Map<*, *> ?: emptyMap<Any?, Any?>()
+    rawDrafts.forEach { (messageIdRaw, value) ->
+      val messageId = normalized(messageIdRaw) ?: return@forEach
+      val draft = value as? Map<String, Any?> ?: return@forEach
+      pendingOutboundDraftsByMessageId[messageId] = LinkedHashMap(draft)
+    }
+
+    val rawQueues = payload["queueByChat"] as? Map<*, *> ?: emptyMap<Any?, Any?>()
+    rawQueues.forEach { (chatIdRaw, value) ->
+      val chatId = normalized(chatIdRaw) ?: return@forEach
+      val ids = (value as? List<*>)?.mapNotNull { normalized(it) }.orEmpty()
+      if (ids.isNotEmpty()) {
+        pendingOutboundQueueByChat[chatId] = ids.toMutableList()
+      }
+    }
+
+    if (pendingOutboundDraftsByMessageId.isNotEmpty() || pendingOutboundQueueByChat.isNotEmpty()) {
+      appendJournalLocked(
+        "native-outgoing-restored",
+        mapOf("drafts" to pendingOutboundDraftsByMessageId.size, "chats" to pendingOutboundQueueByChat.size),
+      )
+    }
+  }
+
   private fun hasNativeSocketConfigLocked(): Boolean {
     val ctx = appContextRef ?: return false
     val config = ChatEngineStore.getConfig(ctx)
+    val transportMode = transportModeLocked(config)
     val socketUrl = normalized(config["socketUrl"] ?: config["url"])
     val userId = normalized(config["userId"])
     val token = normalized(config["authToken"] ?: config["token"])
+    if (transportMode == "offline") {
+      return userId != null && token != null
+    }
+    if (transportMode == "bridge_text") {
+      return bridgeBaseUrlLocked(config) != null && userId != null && token != null
+    }
     return socketUrl != null && userId != null && token != null
   }
 
@@ -391,6 +456,8 @@ internal object ChatEngine {
       val currentState = normalized(state["state"])?.lowercase().orEmpty()
       if (connected || currentState == "connecting-native-presence" || currentState == "native-socket-open") {
         false
+      } else if (transportModeLocked() == "offline") {
+        false
       } else {
         bootstrapConfigFromNativeSessionIfNeededLocked(trigger)
       }
@@ -413,6 +480,14 @@ internal object ChatEngine {
     appContextRef = context.applicationContext
     ChatEngineStore.setConfig(context, payload)
     val snapshot = synchronized(lock) {
+      val nextUserId = normalized(payload["userId"])
+      if (configuredUserId != null && configuredUserId != nextUserId) {
+        pendingOutboundDraftsByMessageId.clear()
+        pendingOutboundQueueByChat.clear()
+        ChatEngineStore.clearOutboundState(context)
+      }
+      configuredUserId = nextUserId
+      restoreOutboundStateLocked()
       state["state"] = "configured"
       state["updatedAt"] = System.currentTimeMillis()
       state["configuredAt"] = state["updatedAt"]
@@ -431,6 +506,66 @@ internal object ChatEngine {
 
   fun getStatus(): Map<String, Any?> =
     synchronized(lock) { statusSnapshotLocked() }
+
+  fun getTransportStatus(): Map<String, Any?> =
+    synchronized(lock) { statusSnapshotLocked() }
+
+  private fun transportModeLocked(config: Map<String, Any?>? = null): String {
+    val resolved = config ?: appContextRef?.let(ChatEngineStore::getConfig).orEmpty()
+    return when (normalized(resolved["transportMode"])?.lowercase()) {
+      "bridge_text", "offline" -> normalized(resolved["transportMode"])!!.lowercase()
+      else -> "direct"
+    }
+  }
+
+  private fun isBridgeTextModeLocked(config: Map<String, Any?>? = null): Boolean =
+    transportModeLocked(config) == "bridge_text"
+
+  private fun disableMediaLocked(config: Map<String, Any?>? = null): Boolean {
+    val resolved = config ?: appContextRef?.let(ChatEngineStore::getConfig).orEmpty()
+    return parseBooleanValue(resolved["disableMedia"]) ?: isBridgeTextModeLocked(resolved)
+  }
+
+  private fun disableCallsLocked(config: Map<String, Any?>? = null): Boolean {
+    val resolved = config ?: appContextRef?.let(ChatEngineStore::getConfig).orEmpty()
+    return parseBooleanValue(resolved["disableCalls"]) ?: isBridgeTextModeLocked(resolved)
+  }
+
+  private fun disableRemoteAvatarsLocked(config: Map<String, Any?>? = null): Boolean {
+    val resolved = config ?: appContextRef?.let(ChatEngineStore::getConfig).orEmpty()
+    return parseBooleanValue(resolved["disableRemoteAvatars"]) ?: isBridgeTextModeLocked(resolved)
+  }
+
+  private fun bridgeBaseUrlLocked(config: Map<String, Any?>? = null): String? {
+    val resolved = config ?: appContextRef?.let(ChatEngineStore::getConfig).orEmpty()
+    normalized(resolved["bridgeBaseUrl"])?.let { return it.trimEnd('/') }
+    val activeBridgeId = normalized(resolved["activeBridgeId"])
+    val bundle = resolved["bridgeBundle"] as? Map<*, *> ?: return null
+    val descriptors = bundle["descriptors"] as? List<*> ?: return null
+    val preferred = descriptors.mapNotNull { it as? Map<*, *> }.firstOrNull {
+      normalized(it["id"]) == activeBridgeId
+    } ?: descriptors.mapNotNull { it as? Map<*, *> }.sortedBy {
+      (it["priority"] as? Number)?.toInt() ?: 999
+    }.firstOrNull()
+    preferred ?: return null
+    normalized(preferred["baseUrl"])?.let { return it.trimEnd('/') }
+    val host = normalized(preferred["host"]) ?: return null
+    val scheme = if (normalized(preferred["transport"]) == "http") "http" else "https"
+    val port = (preferred["port"] as? Number)?.toInt()?.let { ":$it" }.orEmpty()
+    val pathPrefix = normalized(preferred["pathPrefix"])?.trim('/')?.takeIf { it.isNotEmpty() }
+    return buildString {
+      append("$scheme://$host$port")
+      if (!pathPrefix.isNullOrBlank()) {
+        append("/")
+        append(pathPrefix)
+      }
+    }
+  }
+
+  private fun bridgeUrlLocked(path: String, config: Map<String, Any?>? = null): String? {
+    val base = bridgeBaseUrlLocked(config) ?: return null
+    return base.trimEnd('/') + "/" + path.trimStart('/')
+  }
 
   fun isUserOnline(userId: String?): Boolean =
     synchronized(lock) {
@@ -462,22 +597,23 @@ internal object ChatEngine {
       bootstrapConfigFromNativeSessionIfNeededLocked("connect_native_presence")
     }
     val config = ChatEngineStore.getConfig(ctx)
+    val transportMode = transportModeLocked(config)
     val socketUrl = normalized(config["socketUrl"] ?: config["url"])
+    val bridgeBaseUrl = bridgeBaseUrlLocked(config)
     val authToken = normalized(config["authToken"] ?: config["token"])
     val userId = normalized(config["userId"])
     val userTopic = normalized(config["userChannelTopic"]) ?: userId?.let { "user:$it" }
-    if (socketUrl == null || userTopic == null) {
+    if (transportMode == "offline") {
       synchronized(lock) {
-        state["state"] = "native-config-missing"
+        state["state"] = "offline"
         state["connected"] = false
         state["updatedAt"] = System.currentTimeMillis()
-        state["note"] = "ChatEngine native presence missing socketUrl/userTopic config"
+        state["transportMode"] = transportMode
+        state["note"] = "ChatEngine realtime transport disabled"
         appendJournalLocked(
-          "connect-native-missing-config",
+          "connect-native-offline",
           mapOf(
-            "hasSocketUrl" to (socketUrl != null),
             "hasUserTopic" to (userTopic != null),
-            "hasAuthToken" to (authToken != null),
           ),
         )
         val result = statusSnapshotLocked()
@@ -486,9 +622,38 @@ internal object ChatEngine {
       }
     }
 
-    val signature = "$socketUrl|${authToken ?: ""}|$userTopic"
-    var clientToDisconnect: ChatPhoenixClient? = null
-    var clientToConnect: ChatPhoenixClient? = null
+    val resolvedTarget = if (transportMode == "bridge_text") bridgeBaseUrl else socketUrl
+    if (resolvedTarget == null || userTopic == null) {
+      synchronized(lock) {
+        state["state"] = "native-config-missing"
+        state["connected"] = false
+        state["updatedAt"] = System.currentTimeMillis()
+        state["transportMode"] = transportMode
+        state["note"] =
+          if (transportMode == "bridge_text") {
+            "ChatEngine blackout bridge missing bridgeBaseUrl/userTopic config"
+          } else {
+            "ChatEngine native presence missing socketUrl/userTopic config"
+          }
+        appendJournalLocked(
+          "connect-native-missing-config",
+          mapOf(
+            "hasSocketUrl" to (socketUrl != null),
+            "hasBridgeBaseUrl" to (bridgeBaseUrl != null),
+            "hasUserTopic" to (userTopic != null),
+            "hasAuthToken" to (authToken != null),
+            "transportMode" to transportMode,
+          ),
+        )
+        val result = statusSnapshotLocked()
+        emitChangeLocked("connectionStateChanged", null, null)
+        return result
+      }
+    }
+
+    val signature = "$transportMode|$resolvedTarget|${authToken ?: ""}|$userTopic"
+    var clientToDisconnect: ChatRealtimeTransport? = null
+    var clientToConnect: ChatRealtimeTransport? = null
     synchronized(lock) {
       if (phoenixClient != null && nativeSocketSignature != signature) {
         clientToDisconnect = phoenixClient
@@ -513,34 +678,50 @@ internal object ChatEngine {
         deletedMessageIdsByChat.clear()
       }
       if (phoenixClient == null) {
-        // Pass auth token separately so it goes in the Authorization header,
-        // not as a URL query parameter (prevents token leakage in logs/proxies).
-        phoenixClient = ChatPhoenixClient(
-          socketUrl = socketUrl,
-          params = emptyMap(),
-          authToken = authToken,
-          callbacks = object : ChatPhoenixClient.Callbacks {
-            override fun onOpen() = onNativeSocketOpen(userTopic)
-            override fun onClosed(code: Int, reason: String?) = onNativeSocketClosed(code, reason)
-            override fun onError(error: String) = onNativeSocketError(error)
-            override fun onEvent(
-              topic: String,
-              event: String,
-              payload: Map<String, Any?>,
-              ref: String?,
-              joinRef: String?,
-            ) = onNativeSocketEvent(topic, event, payload, ref, joinRef)
-          },
-        )
+        val callbacks = object : ChatTransportCallbacks {
+          override fun onOpen() = onNativeSocketOpen(userTopic)
+          override fun onClosed(code: Int, reason: String?) = onNativeSocketClosed(code, reason)
+          override fun onError(error: String) = onNativeSocketError(error)
+          override fun onEvent(frame: ChatTransportEvent) = onNativeSocketEvent(frame)
+        }
+        phoenixClient =
+          if (transportMode == "bridge_text" && !bridgeBaseUrl.isNullOrBlank()) {
+            BlackoutChatTransport(
+              bridgeBaseUrl = bridgeBaseUrl,
+              authToken = authToken,
+              userId = userId ?: userTopic.removePrefix("user:"),
+              activeBridgeId = normalized(config["activeBridgeId"]),
+              bridgeBundle = config["bridgeBundle"] as? Map<String, Any?>,
+              callbacks = callbacks,
+            )
+          } else {
+            ChatPhoenixClient(
+              socketUrl = socketUrl!!,
+              params = emptyMap(),
+              authToken = authToken,
+              callbacks = callbacks,
+            )
+          }
         nativeSocketSignature = signature
       }
       nativeUserTopic = userTopic
       state["connected"] = false
       state["state"] = "connecting-native-presence"
       state["updatedAt"] = System.currentTimeMillis()
-      state["note"] = "ChatEngine native Phoenix presence connecting"
+      state["transportMode"] = transportMode
+      state["activeBridgeId"] = normalized(config["activeBridgeId"])
+      state["bridgeBaseUrl"] = bridgeBaseUrl
+      state["note"] =
+        if (transportMode == "bridge_text") {
+          "ChatEngine blackout bridge connecting"
+        } else {
+          "ChatEngine native Phoenix presence connecting"
+        }
       state["presenceSource"] = if (nativePresenceActive) "native" else "shadow"
-      appendJournalLocked("connect-native", mapOf("topic" to userTopic))
+      appendJournalLocked(
+        "connect-native",
+        mapOf("topic" to userTopic, "transportMode" to transportMode, "bridgeBaseUrl" to bridgeBaseUrl),
+      )
       val result = statusSnapshotLocked()
       emitChangeLocked("connectionStateChanged", null, null)
       clientToConnect = phoenixClient
@@ -551,7 +732,7 @@ internal object ChatEngine {
   }
 
   fun disconnect(): Map<String, Any?> {
-    val clientToDisconnect: ChatPhoenixClient?
+    val clientToDisconnect: ChatRealtimeTransport?
     val result = synchronized(lock) {
       clientToDisconnect = phoenixClient
       phoenixClient = null
@@ -676,6 +857,9 @@ internal object ChatEngine {
       else -> false
     }
     return synchronized(lock) {
+      if (isBridgeTextModeLocked()) {
+        return@synchronized mapOf("accepted" to false, "reason" to "typing_disabled_in_blackout", "typing" to typing)
+      }
       if (nativeTypingStateByChatId[chatId] == typing) {
         return@synchronized mapOf("accepted" to true, "transport" to "native", "deduped" to true, "typing" to typing)
       }
@@ -716,6 +900,13 @@ internal object ChatEngine {
     }
     val mode = normalized(payload["mode"]) ?: "voice"
     return synchronized(lock) {
+      if (isBridgeTextModeLocked()) {
+        return@synchronized mapOf(
+          "accepted" to false,
+          "reason" to "recording_disabled_in_blackout",
+          "isRecording" to isRecording,
+        )
+      }
       if (nativeRecordingStateByChatId[chatId] == isRecording) {
         return@synchronized mapOf("accepted" to true, "transport" to "native", "deduped" to true, "isRecording" to isRecording)
       }
@@ -797,6 +988,9 @@ internal object ChatEngine {
     if (!supportedTypes.contains(type)) {
       Log.w("ChatEngine", "sendMessage rejected reason=unsupported_type chatId=$chatId type=$type")
       return mapOf("accepted" to false, "reason" to "unsupported_type", "type" to type)
+    }
+    if (synchronized(lock) { isBridgeTextModeLocked() && type != "text" }) {
+      return mapOf("accepted" to false, "reason" to "media_disabled_in_blackout", "type" to type)
     }
     val metadata = payload["metadata"] as? Map<*, *> ?: emptyMap<String, Any?>()
     fun meta(key: String, vararg aliases: String): Any? {
@@ -1241,6 +1435,9 @@ internal object ChatEngine {
       ?: return mapOf("accepted" to false, "reason" to "invalid_message")
     val encryptedContent = normalized(payload["encryptedContent"] ?: payload["encrypted_content"])
       ?: return mapOf("accepted" to false, "reason" to "invalid_payload")
+    if (synchronized(lock) { isBridgeTextModeLocked() }) {
+      return mapOf("accepted" to false, "reason" to "edit_disabled_in_blackout")
+    }
     val editedAt = payload["editedAt"] ?: payload["edited_at"]
     return synchronized(lock) {
       val client = phoenixClient
@@ -1276,6 +1473,9 @@ internal object ChatEngine {
       is Number -> raw.toInt() != 0
       is String -> raw.equals("true", ignoreCase = true) || raw == "1" || raw.equals("yes", ignoreCase = true)
       else -> true
+    }
+    if (synchronized(lock) { isBridgeTextModeLocked() }) {
+      return mapOf("accepted" to false, "reason" to "delete_disabled_in_blackout")
     }
     return synchronized(lock) {
       val client = phoenixClient
@@ -2627,15 +2827,31 @@ internal object ChatEngine {
   private fun resolveFriendPublicKeyLocked(chatId: String, peerUserIdHint: String?): String? {
     val peerId = (peerUserIdHint ?: chatPeerUserIdsByChatId[chatId])?.trim()?.uppercase() ?: return null
     friendPublicKeysByUserId[peerId]?.let { return it }
-    val apiBaseUrl = apiBaseUrlLocked() ?: return null
+    val isBridgeText = isBridgeTextModeLocked()
+    val requestUrl =
+      if (isBridgeText) {
+        bridgeUrlLocked("/bridge/v1/keys/peer")
+      } else {
+        apiBaseUrlLocked()?.let { "$it/api/user/$peerId" }
+      } ?: return null
     val token = authHeaderTokenLocked() ?: return null
-    val request = Request.Builder()
-      .url("$apiBaseUrl/api/user/$peerId")
-      .get()
+    val requestBuilder = Request.Builder()
+      .url(requestUrl)
       .header("Accept", "application/json")
       .header("ngrok-skip-browser-warning", "true")
       .header("Authorization", "Bearer $token")
-      .build()
+    if (isBridgeText) {
+      requestBuilder
+        .post(
+          JSONObject(mapOf("peerUserId" to peerId, "chatId" to chatId)).toString().toRequestBody(
+            "application/json".toMediaTypeOrNull(),
+          ),
+        )
+        .header("Content-Type", "application/json")
+    } else {
+      requestBuilder.get()
+    }
+    val request = requestBuilder.build()
     val response = try {
       historyHttpClient.newCall(request).execute()
     } catch (_: Throwable) {
@@ -2648,7 +2864,8 @@ internal object ChatEngine {
         val json = JSONObject(body)
         val map = linkedMapOf<String, Any?>()
         json.keys().forEach { key -> map[key] = json.opt(key) }
-        val key = extractPublicKeyValue(map)
+        val nested = map["data"] as? Map<String, Any?>
+        val key = extractPublicKeyValue(map) ?: nested?.let(::extractPublicKeyValue)
         if (!key.isNullOrBlank()) {
           friendPublicKeysByUserId[peerId] = key
           chatPeerUserIdsByChatId[chatId] = peerId
@@ -3115,6 +3332,7 @@ internal object ChatEngine {
     if (ids.contains(messageId)) return
     ids.add(messageId)
     appendJournalLocked("native-outgoing-queued", mapOf("chatId" to chatId, "messageId" to messageId, "reason" to reason))
+    persistOutboundStateLocked()
     emitChangeLocked("outgoingMessageQueued", chatId, messageId)
   }
 
@@ -3124,6 +3342,7 @@ internal object ChatEngine {
       if (ids.isEmpty()) pendingOutboundQueueByChat.remove(chatId)
     }
     if (dropDraft) pendingOutboundDraftsByMessageId.remove(messageId)
+    persistOutboundStateLocked()
   }
 
   private fun scheduleReplayQueuedOutboundLocked(chatId: String, trigger: String) {
@@ -3398,9 +3617,11 @@ internal object ChatEngine {
     if (chatId.isBlank()) return
     if (historyLoadingChats.contains(chatId)) return
     if (!force && historyRowsByChat.containsKey(chatId)) return
+    val isBridgeText = isBridgeTextModeLocked()
     val apiBaseUrl = apiBaseUrlLocked()
+    val bridgeUrl = bridgeUrlLocked("/bridge/v1/chat/history")
     val userId = normalized(getConfigValueLocked("userId"))
-    if (apiBaseUrl.isNullOrBlank() || userId.isNullOrBlank()) {
+    if ((if (isBridgeText) bridgeUrl.isNullOrBlank() else apiBaseUrl.isNullOrBlank()) || userId.isNullOrBlank()) {
       appendJournalLocked(
         "native-chat-history-skip",
         mapOf("chatId" to chatId, "reason" to "missing_config"),
@@ -3411,10 +3632,24 @@ internal object ChatEngine {
     appendJournalLocked("native-chat-history-load-start", mapOf("chatId" to chatId))
 
     val requestBuilder = Request.Builder()
-      .url("$apiBaseUrl/api/chat/$chatId/messages")
-      .get()
+      .url(if (isBridgeText) bridgeUrl!! else "$apiBaseUrl/api/chat/$chatId/messages")
       .header("Accept", "application/json")
       .header("ngrok-skip-browser-warning", "true")
+    if (isBridgeText) {
+      requestBuilder
+        .post(
+          JSONObject(
+            mapOf(
+              "chatId" to chatId,
+              "userId" to userId,
+              "limit" to 15,
+            ),
+          ).toString().toRequestBody("application/json".toMediaTypeOrNull()),
+        )
+        .header("Content-Type", "application/json")
+    } else {
+      requestBuilder.get()
+    }
     authHeaderTokenLocked()?.takeIf { it.isNotBlank() }?.let {
       requestBuilder.header("Authorization", "Bearer $it")
     }
@@ -3451,7 +3686,12 @@ internal object ChatEngine {
 
   private fun applyChatHistoryResponseLocked(chatId: String, bodyString: String) {
     try {
-      val messages = JSONArray(bodyString)
+      val messages = if (bodyString.trimStart().startsWith("[")) {
+        JSONArray(bodyString)
+      } else {
+        val json = JSONObject(bodyString)
+        (json.optJSONArray("messages") ?: json.optJSONArray("data") ?: JSONArray())
+      }
       val rows = buildHistoryRowsLocked(chatId, messages)
       historyRowsByChat[chatId] = rows.toMutableList()
       state["updatedAt"] = System.currentTimeMillis()
@@ -3662,13 +3902,12 @@ internal object ChatEngine {
     }
   }
 
-  private fun onNativeSocketEvent(
-    topic: String,
-    event: String,
-    payload: Map<String, Any?>,
-    ref: String?,
-    joinRef: String?,
-  ) {
+  private fun onNativeSocketEvent(frame: ChatTransportEvent) {
+    val topic = frame.topic
+    val event = frame.event
+    val payload = frame.payload
+    val ref = frame.ref
+    val joinRef = frame.joinRef
     synchronized(lock) {
       if (
         event == "phx_reply" &&
@@ -4190,6 +4429,13 @@ internal object ChatEngine {
   private fun statusSnapshotLocked(): Map<String, Any?> {
     val ctx = appContextRef
     val out = LinkedHashMap<String, Any?>(state)
+    out["transportMode"] = transportModeLocked()
+    out["activeBridgeId"] = normalized(getConfigValueLocked("activeBridgeId"))
+    out["bridgeBaseUrl"] = bridgeBaseUrlLocked()
+    out["bridgeReachable"] = if (transportModeLocked() == "bridge_text") state["connected"] == true else false
+    out["disableCalls"] = disableCallsLocked()
+    out["disableMedia"] = disableMediaLocked()
+    out["disableRemoteAvatars"] = disableRemoteAvatarsLocked()
     out["onlineUserCount"] = onlineUsers.size
     out["onlineUserIds"] = onlineUsers.toList().sorted()
     out["lastSeenUserCount"] = lastSeenByUserId.size

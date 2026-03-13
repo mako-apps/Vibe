@@ -328,7 +328,7 @@ final class ChatEngine {
   // chatId -> messageId -> "delivered" | "read"
   private var receiptIndex: [String: [String: String]] = [:]
   private var localStatusIndex: [String: [String: String]] = [:]
-  private var phoenixClient: AnyObject?
+  private var phoenixClient: ChatRealtimeTransport?
   private var nativePresenceActive = false
   private var nativeUserTopic: String?
   private var nativeUserJoinRef: String?
@@ -357,6 +357,7 @@ final class ChatEngine {
   private var pendingFriendKeyChatIdsByUserId: [String: Set<String>] = [:]
   private var friendKeyFetchInFlightUserIds = Set<String>()
   private var friendKeyRetryWorkItemsByUserId: [String: DispatchWorkItem] = [:]
+  private var configuredUserId: String?
   private var reconnectWorkItem: DispatchWorkItem?
   private var reconnectAttempt: Int = 0
   private var autoReconnectEnabled = true
@@ -389,11 +390,68 @@ final class ChatEngine {
     ) { [weak self] _ in
       self?.reconnectOnForeground()
     }
+    queue.async { [weak self] in
+      self?.restoreOutboundStateLocked()
+    }
     // Native-owned transport bootstrap:
     // if config already exists (or can be reconstructed from native session),
     // connect without waiting for any JS route lifecycle.
     DispatchQueue.global(qos: .utility).async { [weak self] in
       self?.ensureNativeTransport(trigger: "engine_init")
+    }
+  }
+
+  private func currentOutboundUserIdLocked() -> String? {
+    normalizedString(store.getConfig()["userId"])
+  }
+
+  private func persistOutboundStateLocked() {
+    guard let userId = currentOutboundUserIdLocked() else { return }
+    if pendingOutboundDraftsByMessageId.isEmpty && pendingOutboundQueueByChat.isEmpty {
+      store.clearOutboundState()
+      return
+    }
+    store.setOutboundState([
+      "userId": userId,
+      "updatedAt": nowMs(),
+      "draftsByMessageId": pendingOutboundDraftsByMessageId,
+      "queueByChat": pendingOutboundQueueByChat,
+    ])
+  }
+
+  private func restoreOutboundStateLocked() {
+    guard pendingOutboundDraftsByMessageId.isEmpty, pendingOutboundQueueByChat.isEmpty else { return }
+    let payload = store.getOutboundState()
+    guard !payload.isEmpty else { return }
+    guard let storedUserId = normalizedString(payload["userId"]) else { return }
+    guard let currentUserId = currentOutboundUserIdLocked(), currentUserId == storedUserId else {
+      store.clearOutboundState()
+      return
+    }
+
+    let rawDrafts = payload["draftsByMessageId"] as? [String: Any] ?? [:]
+    var restoredDrafts: [String: [String: Any]] = [:]
+    for (messageId, value) in rawDrafts {
+      if let draft = value as? [String: Any] {
+        restoredDrafts[messageId] = draft
+      }
+    }
+
+    let rawQueues = payload["queueByChat"] as? [String: Any] ?? [:]
+    var restoredQueues: [String: [String]] = [:]
+    for (chatId, value) in rawQueues {
+      if let ids = value as? [String], !ids.isEmpty {
+        restoredQueues[chatId] = ids
+      }
+    }
+
+    pendingOutboundDraftsByMessageId = restoredDrafts
+    pendingOutboundQueueByChat = restoredQueues
+    if !restoredDrafts.isEmpty || !restoredQueues.isEmpty {
+      appendJournalLocked(
+        event: "native-outgoing-restored",
+        payload: ["drafts": restoredDrafts.count, "chats": restoredQueues.count]
+      )
     }
   }
 
@@ -466,9 +524,16 @@ final class ChatEngine {
 
   private func hasNativeSocketConfigLocked() -> Bool {
     let config = store.getConfig()
+    let transportMode = transportModeLocked(config: config)
     let socketUrl = normalizedString(config["socketUrl"] ?? config["url"])
     let userId = normalizedString(config["userId"])
     let token = normalizedString(config["authToken"] ?? config["token"])
+    if transportMode == "offline" {
+      return userId != nil && token != nil
+    }
+    if transportMode == "bridge_text" {
+      return bridgeBaseURLLocked(config: config) != nil && userId != nil && token != nil
+    }
     return socketUrl != nil && userId != nil && token != nil
   }
 
@@ -557,6 +622,9 @@ final class ChatEngine {
       {
         return false
       }
+      if transportModeLocked() == "offline" {
+        return false
+      }
       return bootstrapConfigFromNativeSessionIfNeededLocked(trigger: trigger)
     }
     guard shouldConnect else { return }
@@ -640,6 +708,14 @@ final class ChatEngine {
     store.setConfig(payload)
     let now = nowMs()
     let snapshot = queue.sync {
+      let nextUserId = normalizedString(payload["userId"])
+      if configuredUserId != nil, configuredUserId != nextUserId {
+        pendingOutboundDraftsByMessageId.removeAll()
+        pendingOutboundQueueByChat.removeAll()
+        store.clearOutboundState()
+      }
+      configuredUserId = nextUserId
+      restoreOutboundStateLocked()
       state["state"] = "configured"
       state["updatedAt"] = now
       state["configuredAt"] = now
@@ -657,6 +733,10 @@ final class ChatEngine {
   }
 
   func getStatus() -> [String: Any] {
+    syncOnQueue { statusSnapshotLocked() }
+  }
+
+  func getTransportStatus() -> [String: Any] {
     syncOnQueue { statusSnapshotLocked() }
   }
 
@@ -707,7 +787,7 @@ final class ChatEngine {
   }
 
   func disconnect() -> [String: Any] {
-    let clientToClose: AnyObject? = queue.sync {
+    let clientToClose: ChatRealtimeTransport? = queue.sync {
       let now = nowMs()
       autoReconnectEnabled = false
       cancelReconnectLocked()
@@ -753,8 +833,8 @@ final class ChatEngine {
       postChangeLocked(reason: "connectionStateChanged", userInfo: ["state": snapshot])
       return client
     }
-    if #available(iOS 13.0, *), let client = clientToClose as? ChatPhoenixClient {
-      client.disconnect()
+    if #available(iOS 13.0, *) {
+      clientToClose?.disconnect()
     }
     return getStatus()
   }
@@ -851,7 +931,7 @@ final class ChatEngine {
           nativeJoinedChatIds.remove(chatId)
           peerTypingUserIdsByChatId.removeValue(forKey: chatId)
           agentProgressByChatId.removeValue(forKey: chatId)
-          if let client = phoenixClient as? ChatPhoenixClient {
+          if let client = phoenixClient {
             client.leave(topic: chatTopic(for: chatId))
           }
         } else {
@@ -949,11 +1029,14 @@ final class ChatEngine {
       }
     }()
     return queue.sync {
+      if isBridgeTextModeLocked() {
+        return ["accepted": false, "reason": "typing_disabled_in_blackout", "typing": typing]
+      }
       if nativeTypingStateByChatId[chatId] == typing {
         return ["accepted": true, "transport": "native", "deduped": true, "typing": typing]
       }
       nativeTypingStateByChatId[chatId] = typing
-      guard let client = phoenixClient as? ChatPhoenixClient else {
+      guard let client = phoenixClient else {
         DispatchQueue.global(qos: .utility).async { [weak self] in
           self?.ensureNativeTransport(trigger: "typing_no_socket")
         }
@@ -1007,13 +1090,20 @@ final class ChatEngine {
     }()
     let mode = normalizedString(payload["mode"]) ?? "voice"
     return queue.sync {
+      if isBridgeTextModeLocked() {
+        return [
+          "accepted": false,
+          "reason": "recording_disabled_in_blackout",
+          "isRecording": isRecording,
+        ]
+      }
       if nativeRecordingStateByChatId[chatId] == isRecording {
         return [
           "accepted": true, "transport": "native", "deduped": true, "isRecording": isRecording,
         ]
       }
       nativeRecordingStateByChatId[chatId] = isRecording
-      guard let client = phoenixClient as? ChatPhoenixClient else {
+      guard let client = phoenixClient else {
         DispatchQueue.global(qos: .utility).async { [weak self] in
           self?.ensureNativeTransport(trigger: "recording_no_socket")
         }
@@ -1139,6 +1229,9 @@ final class ChatEngine {
     guard supportedTypes.contains(type) else {
       return ["accepted": false, "reason": "unsupported_type", "type": type]
     }
+    if syncOnQueue({ isBridgeTextModeLocked() && type != "text" }) {
+      return ["accepted": false, "reason": "media_disabled_in_blackout", "type": type]
+    }
 
     let metadataValue: (String, [String]) -> Any? = { key, aliases in
       if let value = payload[key] { return value }
@@ -1233,7 +1326,9 @@ final class ChatEngine {
       if let waveform { decryptedFields["waveform"] = waveform }
       if let stickerId { decryptedFields["stickerId"] = stickerId }
       if let stickerPackId { decryptedFields["stickerPackId"] = stickerPackId }
-      if let stickerBundleFileName { decryptedFields["stickerBundleFileName"] = stickerBundleFileName }
+      if let stickerBundleFileName {
+        decryptedFields["stickerBundleFileName"] = stickerBundleFileName
+      }
       if let stickerEmoji { decryptedFields["emoji"] = stickerEmoji }
       var optimisticRow = buildLiveRowPayloadLocked(
         chatId: chatId,
@@ -1618,7 +1713,7 @@ final class ChatEngine {
             chatId: chatId, messageId: messageId, row: threadOptimisticRow)
           self.pendingOutboundDraftsByMessageId[messageId] = threadEffectivePayload
 
-          guard let client = self.phoenixClient as? ChatPhoenixClient else {
+          guard let client = self.phoenixClient else {
             self.upsertLocalStatusLocked(chatId: chatId, messageId: messageId, status: "pending")
             self.queueOutboundDraftLocked(
               chatId: chatId, messageId: messageId, payload: threadEffectivePayload,
@@ -1709,7 +1804,7 @@ final class ChatEngine {
     }
 
     return queue.sync {
-      guard let client = phoenixClient as? ChatPhoenixClient else {
+      guard let client = phoenixClient else {
         return [
           "accepted": false,
           "reason": "no_native_socket",
@@ -1775,9 +1870,12 @@ final class ChatEngine {
     guard let chatId, let messageId, let encryptedContent else {
       return ["accepted": false, "reason": "invalid_payload"]
     }
+    if syncOnQueue({ isBridgeTextModeLocked() }) {
+      return ["accepted": false, "reason": "edit_disabled_in_blackout"]
+    }
 
     return queue.sync {
-      guard let client = phoenixClient as? ChatPhoenixClient else {
+      guard let client = phoenixClient else {
         return ["accepted": false, "reason": "no_native_socket"]
       }
       guard nativeJoinedChatIds.contains(chatId) else {
@@ -1813,6 +1911,9 @@ final class ChatEngine {
     guard let chatId, let messageId else {
       return ["accepted": false, "reason": "invalid_payload"]
     }
+    if syncOnQueue({ isBridgeTextModeLocked() }) {
+      return ["accepted": false, "reason": "delete_disabled_in_blackout"]
+    }
 
     let forEveryone: Bool = {
       switch payload["forEveryone"] ?? payload["for_everyone"] {
@@ -1828,7 +1929,7 @@ final class ChatEngine {
     }()
 
     return queue.sync {
-      guard let client = phoenixClient as? ChatPhoenixClient else {
+      guard let client = phoenixClient else {
         return ["accepted": false, "reason": "no_native_socket"]
       }
       guard nativeJoinedChatIds.contains(chatId) else {
@@ -1945,7 +2046,7 @@ final class ChatEngine {
         return ["accepted": false, "reason": "encrypt_failed"]
       }
 
-      guard let client = phoenixClient as? ChatPhoenixClient else {
+      guard let client = phoenixClient else {
         return ["accepted": false, "reason": "no_native_socket"]
       }
       guard nativeJoinedChatIds.contains(chatId) else {
@@ -2137,7 +2238,7 @@ final class ChatEngine {
 
       if nativeJoinedChatIds.contains(chatId) {
         nativeJoinedChatIds.remove(chatId)
-        if let client = phoenixClient as? ChatPhoenixClient {
+        if let client = phoenixClient {
           client.leave(topic: chatTopic(for: chatId))
         }
       }
@@ -2679,7 +2780,7 @@ final class ChatEngine {
 
       var accepted = false
       var ref: String?
-      if let client = phoenixClient as? ChatPhoenixClient,
+      if let client = phoenixClient,
         nativeJoinedChatIds.contains(chatId),
         (state["connected"] as? Bool) == true
       {
@@ -2888,6 +2989,14 @@ final class ChatEngine {
 
   private func statusSnapshotLocked() -> [String: Any] {
     var snapshot = state
+    snapshot["transportMode"] = transportModeLocked()
+    snapshot["activeBridgeId"] = normalizedString(getConfigValueLocked("activeBridgeId"))
+    snapshot["bridgeBaseUrl"] = bridgeBaseURLLocked()?.absoluteString
+    snapshot["bridgeReachable"] =
+      transportModeLocked() == "bridge_text" ? ((state["connected"] as? Bool) == true) : false
+    snapshot["disableCalls"] = disableCallsLocked()
+    snapshot["disableMedia"] = disableMediaLocked()
+    snapshot["disableRemoteAvatars"] = disableRemoteAvatarsLocked()
     snapshot["onlineUserCount"] = onlineUsers.count
     snapshot["onlineUserIds"] = Array(onlineUsers).sorted()
     snapshot["lastSeenUserCount"] = lastSeenByUserId.count
@@ -2915,25 +3024,28 @@ final class ChatEngine {
       bootstrapConfigFromNativeSessionIfNeededLocked(trigger: "connect_native_presence")
     }
     let config = store.getConfig()
+    let transportMode = transportModeLocked(config: config)
     let socketUrlString = normalizedString(config["socketUrl"]) ?? normalizedString(config["url"])
+    let socketURL = socketUrlString.flatMap(URL.init(string:))
+    let bridgeBaseURL = bridgeBaseURLLocked(config: config)
     let authToken = normalizedString(config["authToken"]) ?? normalizedString(config["token"])
     let userId = normalizedString(config["userId"])
     let userTopic =
       normalizedString(config["userChannelTopic"])
       ?? (userId != nil ? "user:\(userId!)" : nil)
 
-    guard let socketUrlString, let socketURL = URL(string: socketUrlString), let userTopic else {
+    if transportMode == "offline" {
       return queue.sync {
-        state["state"] = "native-config-missing"
+        state["state"] = "offline"
         state["connected"] = false
         state["updatedAt"] = nowMs()
-        state["note"] = "ChatEngine native presence missing socketUrl/userTopic config"
+        state["note"] = "ChatEngine realtime transport disabled"
+        state["transportMode"] = transportMode
+        state["presenceSource"] = "shadow"
         appendJournalLocked(
-          event: "connect-native-missing-config",
+          event: "connect-native-offline",
           payload: [
-            "hasSocketUrl": socketUrlString != nil,
             "hasUserTopic": userTopic != nil,
-            "hasAuthToken": authToken != nil,
           ])
         let snapshot = statusSnapshotLocked()
         postChangeLocked(reason: "connectionStateChanged", userInfo: ["state": snapshot])
@@ -2941,8 +3053,35 @@ final class ChatEngine {
       }
     }
 
-    let signature = "\(socketUrlString)|\(authToken ?? "")|\(userTopic)"
-    let callbacks = ChatPhoenixClient.Callbacks(
+    let resolvedTarget =
+      transportMode == "bridge_text" ? bridgeBaseURL?.absoluteString : socketUrlString
+    guard resolvedTarget != nil, let userTopic else {
+      return queue.sync {
+        state["state"] = "native-config-missing"
+        state["connected"] = false
+        state["updatedAt"] = nowMs()
+        state["transportMode"] = transportMode
+        state["note"] =
+          transportMode == "bridge_text"
+          ? "ChatEngine blackout bridge missing bridgeBaseUrl/userTopic config"
+          : "ChatEngine native presence missing socketUrl/userTopic config"
+        appendJournalLocked(
+          event: "connect-native-missing-config",
+          payload: [
+            "hasSocketUrl": socketUrlString != nil,
+            "hasBridgeBaseUrl": bridgeBaseURL != nil,
+            "hasUserTopic": userTopic != nil,
+            "hasAuthToken": authToken != nil,
+            "transportMode": transportMode,
+          ])
+        let snapshot = statusSnapshotLocked()
+        postChangeLocked(reason: "connectionStateChanged", userInfo: ["state": snapshot])
+        return snapshot
+      }
+    }
+
+    let signature = "\(transportMode)|\(resolvedTarget ?? "")|\(authToken ?? "")|\(userTopic)"
+    let callbacks = ChatTransportCallbacks(
       onOpen: { [weak self] in self?.handleNativeSocketOpened(userTopic: userTopic) },
       onClose: { [weak self] code, reason in
         self?.handleNativeSocketClosed(code: code, reason: reason)
@@ -2951,11 +3090,11 @@ final class ChatEngine {
       onEvent: { [weak self] frame in self?.handleNativeSocketFrame(frame) }
     )
 
-    let clientToReplace: ChatPhoenixClient? = queue.sync {
+    let clientToReplace: ChatRealtimeTransport? = queue.sync {
       autoReconnectEnabled = true
       cancelReconnectLocked()
-      var clientToReplace: ChatPhoenixClient?
-      if let existing = phoenixClient as? ChatPhoenixClient, nativeSocketSignature != signature {
+      var clientToReplace: ChatRealtimeTransport?
+      if let existing = phoenixClient, nativeSocketSignature != signature {
         clientToReplace = existing
         phoenixClient = nil
         nativePresenceActive = false
@@ -2979,37 +3118,62 @@ final class ChatEngine {
         deletedMessageIdsByChat.removeAll()
       }
       if phoenixClient == nil {
-        // Pass auth token separately so it goes in the Authorization header,
-        // not as a URL query parameter (prevents token leakage in logs/proxies).
-        let client = ChatPhoenixClient(
-          baseURL: socketURL,
-          params: [:],
-          authToken: authToken,
-          callbacks: callbacks
-        )
-        phoenixClient = client
+        if transportMode == "bridge_text", let bridgeBaseURL {
+          let client = ChatBlackoutTransport(
+            baseURL: bridgeBaseURL,
+            authToken: authToken,
+            userId: userId ?? userTopic.replacingOccurrences(of: "user:", with: ""),
+            activeBridgeId: normalizedString(config["activeBridgeId"]),
+            bridgeBundle: config["bridgeBundle"] as? [String: Any],
+            callbacks: callbacks
+          )
+          phoenixClient = client
+        } else if let socketURL {
+          // Pass auth token separately so it goes in the Authorization header,
+          // not as a URL query parameter (prevents token leakage in logs/proxies).
+          let client = ChatPhoenixClient(
+            baseURL: socketURL,
+            params: [:],
+            authToken: authToken,
+            callbacks: callbacks
+          )
+          phoenixClient = client
+        }
         nativeSocketSignature = signature
       }
       nativeUserTopic = userTopic
       state["connected"] = false
       state["state"] = "connecting-native-presence"
       state["updatedAt"] = nowMs()
-      state["note"] = "ChatEngine native Phoenix presence connecting"
+      state["transportMode"] = transportMode
+      state["activeBridgeId"] = normalizedString(config["activeBridgeId"])
+      state["bridgeBaseUrl"] = bridgeBaseURL?.absoluteString
+      state["note"] =
+        transportMode == "bridge_text"
+        ? "ChatEngine blackout bridge connecting"
+        : "ChatEngine native Phoenix presence connecting"
       state["presenceSource"] = nativePresenceActive ? "native" : "shadow"
-      appendJournalLocked(event: "connect-native", payload: ["topic": userTopic])
+      var connectPayload: [String: Any] = [
+        "topic": userTopic,
+        "transportMode": transportMode,
+      ]
+      if let bridgeBaseURL {
+        connectPayload["bridgeBaseUrl"] = bridgeBaseURL.absoluteString
+      }
+      appendJournalLocked(event: "connect-native", payload: connectPayload)
       let snapshot = statusSnapshotLocked()
       postChangeLocked(reason: "connectionStateChanged", userInfo: ["state": snapshot])
       return clientToReplace
     }
 
     clientToReplace?.disconnect()
-    (queue.sync { phoenixClient as? ChatPhoenixClient })?.connect()
+    (queue.sync { phoenixClient })?.connect()
     return getStatus()
   }
 
   private func handleNativeSocketOpened(userTopic: String) {
     queue.async {
-      guard let client = self.phoenixClient as? ChatPhoenixClient else { return }
+      guard let client = self.phoenixClient else { return }
       self.cancelReconnectLocked()
       self.reconnectAttempt = 0
       self.state["connected"] = true
@@ -3137,7 +3301,7 @@ final class ChatEngine {
   }
 
   @available(iOS 13.0, *)
-  private func handleNativeSocketFrame(_ frame: ChatPhoenixClient.EventFrame) {
+  private func handleNativeSocketFrame(_ frame: ChatTransportFrame) {
     queue.async {
       if frame.event == "phx_reply",
         frame.topic == self.nativeUserTopic,
@@ -3512,6 +3676,76 @@ final class ChatEngine {
     store.getConfig()[key]
   }
 
+  private func transportModeLocked(config: [String: Any]? = nil) -> String {
+    let resolvedConfig = config ?? store.getConfig()
+    let mode =
+      normalizedString(resolvedConfig["transportMode"])?.trimmingCharacters(
+        in: .whitespacesAndNewlines
+      ).lowercased()
+    switch mode {
+    case "bridge_text", "offline":
+      return mode ?? "direct"
+    default:
+      return "direct"
+    }
+  }
+
+  private func isBridgeTextModeLocked(config: [String: Any]? = nil) -> Bool {
+    transportModeLocked(config: config) == "bridge_text"
+  }
+
+  private func disableMediaLocked(config: [String: Any]? = nil) -> Bool {
+    let resolvedConfig = config ?? store.getConfig()
+    return parseBooleanLike(resolvedConfig["disableMedia"])
+      ?? isBridgeTextModeLocked(config: resolvedConfig)
+  }
+
+  private func disableCallsLocked(config: [String: Any]? = nil) -> Bool {
+    let resolvedConfig = config ?? store.getConfig()
+    return parseBooleanLike(resolvedConfig["disableCalls"])
+      ?? isBridgeTextModeLocked(config: resolvedConfig)
+  }
+
+  private func disableRemoteAvatarsLocked(config: [String: Any]? = nil) -> Bool {
+    let resolvedConfig = config ?? store.getConfig()
+    return parseBooleanLike(resolvedConfig["disableRemoteAvatars"])
+      ?? isBridgeTextModeLocked(config: resolvedConfig)
+  }
+
+  private func bridgeBaseURLLocked(config: [String: Any]? = nil) -> URL? {
+    let resolvedConfig = config ?? store.getConfig()
+    if let explicit = normalizedString(resolvedConfig["bridgeBaseUrl"]), let url = URL(string: explicit) {
+      return url
+    }
+    let activeBridgeId = normalizedString(resolvedConfig["activeBridgeId"])
+    let bundle = resolvedConfig["bridgeBundle"] as? [String: Any]
+    let descriptors = bundle?["descriptors"] as? [[String: Any]] ?? []
+    let preferred =
+      descriptors.first(where: { normalizedString($0["id"]) == activeBridgeId })
+      ?? descriptors.sorted { left, right in
+        let leftPriority = parseLongValue(left["priority"]) ?? 999
+        let rightPriority = parseLongValue(right["priority"]) ?? 999
+        return leftPriority < rightPriority
+      }.first
+    guard let preferred else { return nil }
+    if let baseUrl = normalizedString(preferred["baseUrl"]), let url = URL(string: baseUrl) {
+      return url
+    }
+    guard let host = normalizedString(preferred["host"]) else { return nil }
+    let transport = normalizedString(preferred["transport"]) == "http" ? "http" : "https"
+    let port = parseLongValue(preferred["port"]).map { ":\($0)" } ?? ""
+    let pathPrefix =
+      normalizedString(preferred["pathPrefix"])?.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    let suffix = (pathPrefix?.isEmpty == false) ? "/\(pathPrefix!)" : ""
+    return URL(string: "\(transport)://\(host)\(port)\(suffix)")
+  }
+
+  private func bridgeURLLocked(_ path: String, config: [String: Any]? = nil) -> URL? {
+    guard let base = bridgeBaseURLLocked(config: config) else { return nil }
+    let trimmed = path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    return base.appendingPathComponent(trimmed)
+  }
+
   func isJsEmergencyFallbackEnabled() -> Bool {
     queue.sync {
       switch getConfigValueLocked("chatNativeJsFallbackEnabled") {
@@ -3603,23 +3837,32 @@ final class ChatEngine {
     pendingFriendKeyChatIdsByUserId[peerId] = pendingChats
 
     guard !friendKeyFetchInFlightUserIds.contains(peerId) else { return }
-    guard
-      let apiBase = apiBaseURLLocked(),
-      let token = authHeaderTokenLocked()
-    else { return }
+    let isBridgeText = isBridgeTextModeLocked()
+    guard let token = authHeaderTokenLocked() else { return }
+    let requestURL: URL? =
+      isBridgeText
+      ? bridgeURLLocked("/bridge/v1/keys/peer")
+      : apiBaseURLLocked()?.appendingPathComponent("api").appendingPathComponent("user")
+        .appendingPathComponent(peerId)
+    guard let requestURL else { return }
 
     friendKeyRetryWorkItemsByUserId[peerId]?.cancel()
     friendKeyRetryWorkItemsByUserId.removeValue(forKey: peerId)
     friendKeyFetchInFlightUserIds.insert(peerId)
 
-    let url = apiBase.appendingPathComponent("api").appendingPathComponent("user")
-      .appendingPathComponent(peerId)
-    var request = URLRequest(url: url)
-    request.httpMethod = "GET"
+    var request = URLRequest(url: requestURL)
+    request.httpMethod = isBridgeText ? "POST" : "GET"
     request.setValue("application/json", forHTTPHeaderField: "Accept")
+    if isBridgeText {
+      request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    }
     request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
     request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
     request.timeoutInterval = 8.0
+    if isBridgeText {
+      request.httpBody = try? JSONSerialization.data(
+        withJSONObject: ["peerUserId": peerId, "chatId": chatId], options: [])
+    }
     appendJournalLocked(
       event: "friend-key-fetch-start",
       payload: ["peerUserId": peerId, "chatId": chatId, "trigger": trigger]
@@ -3643,6 +3886,7 @@ final class ChatEngine {
             ?? self.normalizedString(obj["friendKey"])
             ?? self.normalizedString(obj["friendPublicKey"])
             ?? self.normalizedString(obj["public_key"])
+            ?? ((obj["data"] as? [String: Any]).flatMap(self.extractPublicKeyValue(from:)))
         }()
 
         let waitingChatIds = Array(self.pendingFriendKeyChatIdsByUserId[peerId] ?? [])
@@ -4557,7 +4801,7 @@ final class ChatEngine {
     // Always start HTTP history fetch immediately — do NOT gate behind socket state.
     // This ensures messages load fast even before WebSocket is connected.
     loadChatHistoryIfNeededLocked(chatId: chatId)
-    guard let client = phoenixClient as? ChatPhoenixClient else {
+    guard let client = phoenixClient else {
       scheduleReconnectLocked(reason: "join_chat_no_socket")
       DispatchQueue.global(qos: .utility).async { [weak self] in
         self?.ensureNativeTransport(trigger: "join_chat_no_socket")
@@ -4593,6 +4837,7 @@ final class ChatEngine {
         "messageId": messageId,
         "reason": reason,
       ])
+    persistOutboundStateLocked()
     postChangeLocked(
       reason: "outgoingMessageQueued",
       userInfo: [
@@ -4614,6 +4859,7 @@ final class ChatEngine {
     if dropDraft {
       pendingOutboundDraftsByMessageId.removeValue(forKey: messageId)
     }
+    persistOutboundStateLocked()
   }
 
   private func scheduleReplayQueuedOutboundLocked(chatId: String, trigger: String) {
@@ -4966,9 +5212,11 @@ final class ChatEngine {
     guard !chatId.isEmpty else { return }
     if historyLoadingChats.contains(chatId) { return }
     if !force, historyFullyLoadedChats.contains(chatId) { return }
-    guard
-      let apiBase = apiBaseURLLocked(),
-      let userId = normalizedString(getConfigValueLocked("userId"))
+    let isBridgeText = isBridgeTextModeLocked()
+    let apiBase = apiBaseURLLocked()
+    let bridgeURL = bridgeURLLocked("/bridge/v1/chat/history")
+    guard let userId = normalizedString(getConfigValueLocked("userId")),
+      (isBridgeText ? bridgeURL != nil : apiBase != nil)
     else {
       NSLog(
         "[ChatEngine] loadChatHistory SKIP chatId=%@ reason=missing_config",
@@ -4988,18 +5236,38 @@ final class ChatEngine {
     historyLoadingChats.insert(chatId)
     let token = authHeaderTokenLocked()
     let finalUrl: URL
-    if isSavedMessages {
+    var request: URLRequest
+    if isBridgeText, let bridgeURL {
+      finalUrl = bridgeURL
+      request = URLRequest(url: finalUrl)
+      request.httpMethod = "POST"
+      request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+      request.httpBody = try? JSONSerialization.data(
+        withJSONObject: [
+          "chatId": chatId,
+          "userId": userId,
+          "limit": 15,
+          "savedMessages": isSavedMessages,
+        ],
+        options: []
+      )
+    } else if isSavedMessages, let apiBase {
       finalUrl = apiBase.appendingPathComponent("api").appendingPathComponent("saved_messages")
         .appendingPathComponent(userId)
-    } else {
+      request = URLRequest(url: finalUrl)
+      request.httpMethod = "GET"
+    } else if let apiBase {
       let baseMessageUrl = apiBase.appendingPathComponent("api").appendingPathComponent("chat")
         .appendingPathComponent(chatId).appendingPathComponent("messages")
       var urlComponents = URLComponents(url: baseMessageUrl, resolvingAgainstBaseURL: false)
       urlComponents?.queryItems = [URLQueryItem(name: "limit", value: "15")]
       finalUrl = urlComponents?.url ?? baseMessageUrl
+      request = URLRequest(url: finalUrl)
+      request.httpMethod = "GET"
+    } else {
+      historyLoadingChats.remove(chatId)
+      return
     }
-    var request = URLRequest(url: finalUrl)
-    request.httpMethod = "GET"
     request.setValue("application/json", forHTTPHeaderField: "Accept")
     request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
     if let token, !token.isEmpty {
@@ -5088,6 +5356,9 @@ final class ChatEngine {
       messagesArray = array
     } else if let dict = object as? [String: Any], let array = dict["data"] as? [[String: Any]] {
       messagesArray = array
+    } else if let dict = object as? [String: Any], let array = dict["messages"] as? [[String: Any]]
+    {
+      messagesArray = array
     } else {
       appendJournalLocked(
         event: "native-chat-history-load-error",
@@ -5174,6 +5445,7 @@ final class ChatEngine {
       let rawMediaUrl = normalizedString(raw["mediaUrl"] ?? raw["media_url"])
       let rawFileName = normalizedString(raw["fileName"] ?? raw["file_name"])
       let derivedFileName = deriveFileNameFromURL(rawMediaUrl)
+
       let isMe = normalizedUpper(fromId) != nil && normalizedUpper(fromId) == currentUserIdLocked()
       let encryptedLooksHybrid = isLikelyHybridCiphertext(encryptedContent)
       let historyIsAgent =

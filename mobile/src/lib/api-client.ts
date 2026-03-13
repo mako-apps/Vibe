@@ -1,4 +1,10 @@
 import { Platform } from 'react-native'
+import { resolveNativeTransportConfig } from './nativeTransportConfig';
+import {
+    ensureBlackoutControlReady,
+    recordDirectTransportFailure,
+    recordDirectTransportSuccess,
+} from './transport/BlackoutState';
 
 // Connection priority order:
 // 1. Railway (direct) - fastest for users with unrestricted access
@@ -15,6 +21,36 @@ const HEADERS = {
     'Content-Type': 'application/json',
     'ngrok-skip-browser-warning': 'true',
 }
+
+const BLACKOUT_ALLOWED_PATTERNS = [
+    /^\/login$/,
+    /^\/register$/,
+    /^\/ping$/,
+    /^\/health$/,
+    /^\/info$/,
+    /^\/vapid-key$/,
+    /^\/bridge\/v1\//,
+];
+
+const getRequestPath = (endpoint: string): string => {
+    if (!endpoint.startsWith('http')) return endpoint;
+    try {
+        return new URL(endpoint).pathname;
+    } catch {
+        return endpoint;
+    }
+};
+
+const isBlackoutAllowedEndpoint = (endpoint: string): boolean => {
+    const path = getRequestPath(endpoint);
+    return BLACKOUT_ALLOWED_PATTERNS.some((pattern) => pattern.test(path));
+};
+
+const buildBaseHeaders = (useBlackoutHeaders: boolean) => (
+    useBlackoutHeaders
+        ? { 'Content-Type': 'application/json' }
+        : HEADERS
+);
 
 const getLoginToken = (): string | null => {
     try {
@@ -62,6 +98,13 @@ const isNetworkErrorLike = (error: unknown) => {
 };
 
 const fetchWithRetry = async (endpoint: string, options: RequestInit = {}) => {
+    await ensureBlackoutControlReady();
+    const transportConfig = resolveNativeTransportConfig();
+    const blackoutMode = transportConfig.transportMode !== 'direct';
+    if (blackoutMode && !isBlackoutAllowedEndpoint(endpoint)) {
+        throw new Error(`blackout_mode_request_blocked:${getRequestPath(endpoint)}`);
+    }
+
     let lastError;
 
     for (const url of getOrderedBaseUrls()) {
@@ -71,8 +114,17 @@ const fetchWithRetry = async (endpoint: string, options: RequestInit = {}) => {
             if (endpoint.startsWith('http')) {
                 // If it's a full URL, don't use the loop prefix
                 // console.log(`[API] Fetching Full URL: ${endpoint}`);
-                const res = await fetch(endpoint, options);
+                const res = await fetch(endpoint, {
+                    ...options,
+                    headers: {
+                        ...buildBaseHeaders(blackoutMode),
+                        ...(options.headers || {}),
+                    },
+                });
                 clearTimeout(timeoutId);
+                if (!blackoutMode) {
+                    void recordDirectTransportSuccess('api_fetch_absolute');
+                }
                 return res;
             }
 
@@ -83,6 +135,9 @@ const fetchWithRetry = async (endpoint: string, options: RequestInit = {}) => {
             const pm = ProxyManager.getInstance();
 
             let res;
+            if (blackoutMode && pm.isRelayActive()) {
+                throw new Error('legacy_relay_disabled_in_blackout');
+            }
             if (pm.isRelayActive()) {
                 // If relay is active, we skip the loop and just use the relay
                 // The relay client handles the connection to the target server
@@ -93,7 +148,7 @@ const fetchWithRetry = async (endpoint: string, options: RequestInit = {}) => {
                 res = await pm.relayFetch(endpoint, {
                     ...options,
                     headers: {
-                        ...HEADERS,
+                        ...buildBaseHeaders(false),
                         ...optHeaders,
                         ...(token && !optHeaders.Authorization && !optHeaders.authorization ? { Authorization: `Bearer ${token}` } : {}),
                     },
@@ -111,7 +166,7 @@ const fetchWithRetry = async (endpoint: string, options: RequestInit = {}) => {
                 ...options,
                 signal: controller.signal,
                 headers: {
-                    ...HEADERS,
+                    ...buildBaseHeaders(blackoutMode),
                     ...optHeaders,
                     ...(token && !optHeaders.Authorization && !optHeaders.authorization ? { Authorization: `Bearer ${token}` } : {}),
                 },
@@ -140,6 +195,9 @@ const fetchWithRetry = async (endpoint: string, options: RequestInit = {}) => {
 
             // Mark this URL as active/working
             activeBaseUrl = url;
+            if (!blackoutMode) {
+                void recordDirectTransportSuccess('api_fetch');
+            }
 
             // Check for session expiration (401)
             if (res.status === 401 && !endpoint.includes('login') && !endpoint.includes('register')) {
@@ -156,6 +214,9 @@ const fetchWithRetry = async (endpoint: string, options: RequestInit = {}) => {
             clearTimeout(timeoutId);
             // console.log(`[API] Connection failed to ${url}`, e.message);
             lastError = e;
+            if (!blackoutMode && isNetworkErrorLike(e)) {
+                void recordDirectTransportFailure('api_fetch', e?.message || 'network_error');
+            }
             // Continue to next URL
         }
     }
@@ -175,6 +236,11 @@ export const uploadMedia = async (
     onProgress?: (progress: number) => void,
     signal?: AbortSignal,
 ): Promise<string | null> => {
+    await ensureBlackoutControlReady();
+    const transportConfig = resolveNativeTransportConfig();
+    if (transportConfig.transportMode !== 'direct') {
+        throw new Error('media_upload_disabled_in_blackout');
+    }
     // Determine filename and mime type from URI
     const uriParts = fileUri.split('/');
     const fileName = uriParts[uriParts.length - 1] || `upload_${Date.now()}`;

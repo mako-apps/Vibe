@@ -25,8 +25,24 @@ private func chatNativeHomeBuildChatsURL(apiBaseUrl: String, userId: String) -> 
   return URL(string: "\(pathBase)/chats/\(encodedUserId)")
 }
 
+private func chatNativeHomeBuildBridgeURL(bridgeBaseUrl: String, path: String) -> URL? {
+  var base = bridgeBaseUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+  while base.hasSuffix("/") {
+    base.removeLast()
+  }
+  let trimmedPath = path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+  guard !base.isEmpty else { return nil }
+  return URL(string: "\(base)/\(trimmedPath)")
+}
+
 private func chatNativeHomeFetchData(request: URLRequest) async throws -> Data {
-  let (data, response) = try await URLSession.shared.data(for: request)
+  let session: URLSession = {
+    if #available(iOS 13.0, *) {
+      return ChatPhoenixClient.makePinnedURLSession()
+    }
+    return URLSession.shared
+  }()
+  let (data, response) = try await session.data(for: request)
 
   guard let httpResponse = response as? HTTPURLResponse else {
     throw NSError(
@@ -109,9 +125,16 @@ public class ChatNativeHomeModule: Module {
         )
       }
 
+      let transportMode =
+        chatNativeHomeNormalizedString(payload["transportMode"])
+        ?? (ChatEngine.shared.getTransportStatus()["transportMode"] as? String)
+        ?? "direct"
       let apiBaseUrl =
         chatNativeHomeNormalizedString(payload["apiBaseUrl"])
         ?? Self.fallbackApiBaseURL
+      let bridgeBaseUrl =
+        chatNativeHomeNormalizedString(payload["bridgeBaseUrl"])
+        ?? (ChatEngine.shared.getTransportStatus()["bridgeBaseUrl"] as? String)
       guard let url = chatNativeHomeBuildChatsURL(apiBaseUrl: apiBaseUrl, userId: userId) else {
         print("[ChatNativeHome] fetchChats ERROR: invalid apiBaseUrl=\(apiBaseUrl)")
         throw NSError(
@@ -127,31 +150,36 @@ public class ChatNativeHomeModule: Module {
         "[ChatNativeHome] fetchChats url=\(url.absoluteString) userId=\(userId.prefix(12))... tokenLen=\(authToken?.count ?? 0) tokenPrefix=\(tokenPrefix)"
       )
 
-      var request = URLRequest(url: url)
-      request.httpMethod = "GET"
+      var request: URLRequest
+      if transportMode == "bridge_text",
+        let bridgeBaseUrl,
+        let bridgeURL = chatNativeHomeBuildBridgeURL(
+          bridgeBaseUrl: bridgeBaseUrl,
+          path: "/bridge/v1/home/snapshot"
+        )
+      {
+        request = URLRequest(url: bridgeURL)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(
+          withJSONObject: ["userId": userId],
+          options: []
+        )
+      } else {
+        request = URLRequest(url: url)
+        request.httpMethod = "GET"
+      }
       request.setValue("application/json", forHTTPHeaderField: "Accept")
       request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
       if let authToken, !authToken.isEmpty {
         request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
       }
 
-      let (data, response) = try await URLSession.shared.data(for: request)
-
-      let httpResponse = response as? HTTPURLResponse
-      let statusCode = httpResponse?.statusCode ?? -1
+      let data = try await chatNativeHomeFetchData(request: request)
       let bodyPreview = String(data: data.prefix(500), encoding: .utf8) ?? "<binary>"
       print(
-        "[ChatNativeHome] fetchChats response status=\(statusCode) bytes=\(data.count) body=\(bodyPreview)"
+        "[ChatNativeHome] fetchChats response bytes=\(data.count) body=\(bodyPreview)"
       )
-
-      guard let httpResponse, (200...299).contains(statusCode) else {
-        print("[ChatNativeHome] fetchChats ERROR: HTTP \(statusCode)")
-        throw NSError(
-          domain: "ChatNativeHome",
-          code: statusCode,
-          userInfo: [NSLocalizedDescriptionKey: "fetchChats failed with status \(statusCode)"]
-        )
-      }
 
       let chats = try chatNativeHomeParseChats(data)
       print("[ChatNativeHome] fetchChats parsed \(chats.count) chats")
@@ -191,6 +219,18 @@ public class ChatNativeHomeModule: Module {
     let apiBaseUrl =
       chatNativeHomeNormalizedString(payload["apiBaseUrl"])
       ?? Self.fallbackApiBaseURL
+    let transportMode =
+      chatNativeHomeNormalizedString(payload["transportMode"])
+      ?? (ChatEngine.shared.getTransportStatus()["transportMode"] as? String)
+      ?? "direct"
+
+    if transportMode == "bridge_text" {
+      promise.resolve([
+        "action": "error",
+        "error": "New chat search is disabled in blackout mode",
+      ])
+      return
+    }
 
     let controller = ChatNativeNewChatViewController(
       apiBaseUrl: apiBaseUrl,
