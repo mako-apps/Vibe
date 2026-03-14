@@ -1,8 +1,10 @@
 defmodule Vibe.Chat do
   import Ecto.Query, warn: false
   require Logger
+  alias Vibe.ChatHomeCache
   alias Vibe.Repo
   alias Vibe.RepoRLS
+  alias Vibe.SupabaseStorage
   alias Vibe.Chat.{
     Room,
     Message,
@@ -15,6 +17,9 @@ defmodule Vibe.Chat do
   }
 
   @agent_user_id "00000000-0000-0000-0000-000000000001"
+  @home_preview_message_limit 1
+  @history_default_limit 30
+  @history_max_limit 100
 
   def save_message(attrs) do
     %SavedMessage{}
@@ -31,6 +36,7 @@ defmodule Vibe.Chat do
     Repo.all(from sm in SavedMessage,
              where: sm.user_id == ^user_id,
              order_by: [desc: sm.timestamp])
+    |> Enum.map(&to_client_saved_message/1)
   end
 
   def is_participant?(chat_id, user_id) do
@@ -53,6 +59,16 @@ defmodule Vibe.Chat do
   end
 
   def list_chats(user_id) do
+    loader = fn -> list_chats_uncached(user_id) end
+
+    if is_binary(user_id) and String.trim(user_id) != "" do
+      ChatHomeCache.fetch(user_id, loader)
+    else
+      loader.()
+    end
+  end
+
+  defp list_chats_uncached(user_id) do
     result =
       RepoRLS.with_user(user_id, fn ->
       # Find all chats user is participating in (excluding deleted ones)
@@ -93,7 +109,7 @@ defmodule Vibe.Chat do
           []
         else
           Repo.all(ranked_query)
-          |> Enum.filter(&(&1.rnk <= 15))
+          |> Enum.filter(&(&1.rnk <= @home_preview_message_limit))
           |> Enum.map(& &1.id)
         end
 
@@ -233,7 +249,8 @@ defmodule Vibe.Chat do
   end
 
   def create_chat(id, user_ids) do
-    Repo.transaction(fn ->
+    result =
+      Repo.transaction(fn ->
       room = Repo.insert!(%Room{id: id, is_group: length(user_ids) > 2})
 
       Enum.each(user_ids, fn uid ->
@@ -242,6 +259,15 @@ defmodule Vibe.Chat do
 
       room
     end)
+
+    case result do
+      {:ok, room} ->
+        ChatHomeCache.invalidate_users(user_ids)
+        {:ok, room}
+
+      other ->
+        other
+    end
   end
 
   def add_message(attrs, opts \\ []) do
@@ -258,11 +284,21 @@ defmodule Vibe.Chat do
         {:error, :forbidden_sender}
 
       true ->
-        RepoRLS.with_user(acting_user_id || from_id, fn ->
+        result =
+          RepoRLS.with_user(acting_user_id || from_id, fn ->
           %Message{}
           |> Message.changeset(attrs)
           |> Repo.insert()
         end)
+
+        case result do
+          {:ok, %Message{} = message} ->
+            invalidate_chat_home_cache(message.chat_id)
+            {:ok, message}
+
+          other ->
+            other
+        end
     end
   end
 
@@ -284,8 +320,7 @@ defmodule Vibe.Chat do
       Repo.all(
         from m in Message,
           where: m.chat_id == ^chat_id,
-          order_by: [asc: m.timestamp],
-          preload: [:reads]
+          order_by: [asc: m.timestamp]
       )
       |> Enum.map(&to_client_message/1)
     end)
@@ -304,8 +339,7 @@ defmodule Vibe.Chat do
       query =
         from m in Message,
           where: m.chat_id == ^chat_id,
-          order_by: [asc: m.timestamp],
-          preload: [:reads]
+          order_by: [asc: m.timestamp]
 
       query =
         if participant do
@@ -324,8 +358,90 @@ defmodule Vibe.Chat do
     end)
   end
 
+  def get_messages_for_user_page(chat_id, user_id, opts \\ []) do
+    limit = normalize_history_limit(Keyword.get(opts, :limit))
+    before = decode_history_cursor(Keyword.get(opts, :before))
+
+    result =
+      RepoRLS.with_user(user_id, fn ->
+        participant =
+          Repo.one(
+            from p in Participant,
+              where: p.chat_id == ^chat_id and p.user_id == ^user_id,
+              select: p.messages_cleared_at
+          )
+
+        query =
+          from m in Message,
+            where: m.chat_id == ^chat_id
+
+        query =
+          if participant do
+            cleared_at_ms =
+              participant
+              |> DateTime.from_naive!("Etc/UTC")
+              |> DateTime.to_unix(:millisecond)
+
+            from m in query, where: m.timestamp > ^cleared_at_ms
+          else
+            query
+          end
+
+        query =
+          case before do
+            %{timestamp: timestamp, id: id} ->
+              from m in query,
+                where: m.timestamp < ^timestamp or (m.timestamp == ^timestamp and m.id < ^id)
+
+            _ ->
+              query
+          end
+
+        Repo.all(
+          from m in query,
+            order_by: [desc: m.timestamp, desc: m.id],
+            limit: ^(limit + 1)
+        )
+      end)
+
+    case result do
+      messages when is_list(messages) ->
+        has_more = length(messages) > limit
+        page_desc = Enum.take(messages, limit)
+        next_cursor =
+          if has_more do
+            page_desc
+            |> List.last()
+            |> encode_history_cursor()
+          else
+            nil
+          end
+
+        %{
+          messages: page_desc |> Enum.reverse() |> Enum.map(&to_client_message/1),
+          next_cursor: next_cursor,
+          has_more: has_more
+        }
+
+      {:error, reason} ->
+        Logger.error(
+          "[Chat] get_messages_for_user_page failed chat_id=#{chat_id} user_id=#{user_id}: #{inspect(reason)}"
+        )
+
+        %{messages: [], next_cursor: nil, has_more: false}
+
+      other ->
+        Logger.error(
+          "[Chat] get_messages_for_user_page unexpected result chat_id=#{chat_id} user_id=#{user_id}: #{inspect(other)}"
+        )
+
+        %{messages: [], next_cursor: nil, has_more: false}
+    end
+  end
+
   def mark_read(message_id, reader_id) do
-    RepoRLS.with_user(reader_id, fn ->
+    result =
+      RepoRLS.with_user(reader_id, fn ->
       # 1. Record the read receipt
       %MessageRead{}
       |> MessageRead.changeset(%{message_id: message_id, reader_id: reader_id})
@@ -335,14 +451,21 @@ defmodule Vibe.Chat do
       from(m in Message, where: m.id == ^message_id)
       |> Repo.update_all(set: [status: "read"])
     end)
+
+    invalidate_home_cache_for_message(message_id)
+    result
   end
 
   def mark_delivered(message_id, user_id \\ nil) do
-    RepoRLS.with_user(user_id, fn ->
+    result =
+      RepoRLS.with_user(user_id, fn ->
       # Only update if status is 'sent' (don't overwrite 'read')
       from(m in Message, where: m.id == ^message_id and m.status == "sent")
       |> Repo.update_all(set: [status: "delivered"])
     end)
+
+    invalidate_home_cache_for_message(message_id)
+    result
   end
 
   def can_delete_message_for_everyone?(chat_id, user_id, from_id) do
@@ -357,7 +480,8 @@ defmodule Vibe.Chat do
   end
 
   def delete_message(chat_id, message_id, user_id, for_everyone \\ true) do
-    RepoRLS.with_user(user_id, fn ->
+    result =
+      RepoRLS.with_user(user_id, fn ->
       if not is_participant?(chat_id, user_id) do
         {:error, :forbidden}
       else
@@ -386,10 +510,20 @@ defmodule Vibe.Chat do
         end
       end
     end)
+
+    case result do
+      {:ok, %Message{} = message} ->
+        invalidate_chat_home_cache(chat_id)
+        {:ok, message}
+
+      other ->
+        other
+    end
   end
 
   def edit_message(chat_id, message_id, user_id, encrypted_content, edited_at \\ nil) do
-    RepoRLS.with_user(user_id, fn ->
+    result =
+      RepoRLS.with_user(user_id, fn ->
       if not is_participant?(chat_id, user_id) do
         {:error, :forbidden}
       else
@@ -423,6 +557,15 @@ defmodule Vibe.Chat do
         end
       end
     end)
+
+    case result do
+      {:ok, %Message{} = message} ->
+        invalidate_chat_home_cache(chat_id)
+        {:ok, message}
+
+      other ->
+        other
+    end
   end
 
   def list_pinned_messages(chat_id, user_id) do
@@ -444,7 +587,8 @@ defmodule Vibe.Chat do
   end
 
   def set_message_pin(chat_id, message_id, user_id, pinned \\ true) do
-    RepoRLS.with_user(user_id, fn ->
+    result =
+      RepoRLS.with_user(user_id, fn ->
       if not is_participant?(chat_id, user_id) do
         {:error, :forbidden}
       else
@@ -489,6 +633,15 @@ defmodule Vibe.Chat do
         end
       end
     end)
+
+    case result do
+      {:ok, value} ->
+        ChatHomeCache.invalidate_user(user_id)
+        {:ok, value}
+
+      other ->
+        other
+    end
   end
 
   @doc """
@@ -553,18 +706,30 @@ defmodule Vibe.Chat do
   end
 
   def set_muted(chat_id, user_id, muted) do
-    from(p in Participant, where: p.chat_id == ^chat_id and p.user_id == ^user_id)
-    |> Repo.update_all(set: [muted: muted])
+    result =
+      from(p in Participant, where: p.chat_id == ^chat_id and p.user_id == ^user_id)
+      |> Repo.update_all(set: [muted: muted])
+
+    ChatHomeCache.invalidate_user(user_id)
+    result
   end
 
   def set_pinned(chat_id, user_id, pinned) do
-    from(p in Participant, where: p.chat_id == ^chat_id and p.user_id == ^user_id)
-    |> Repo.update_all(set: [pinned: pinned])
+    result =
+      from(p in Participant, where: p.chat_id == ^chat_id and p.user_id == ^user_id)
+      |> Repo.update_all(set: [pinned: pinned])
+
+    ChatHomeCache.invalidate_user(user_id)
+    result
   end
 
   def set_marked_unread(chat_id, user_id, marked) do
-    from(p in Participant, where: p.chat_id == ^chat_id and p.user_id == ^user_id)
-    |> Repo.update_all(set: [marked_unread: marked])
+    result =
+      from(p in Participant, where: p.chat_id == ^chat_id and p.user_id == ^user_id)
+      |> Repo.update_all(set: [marked_unread: marked])
+
+    ChatHomeCache.invalidate_user(user_id)
+    result
   end
 
   def delete_chat(chat_id, user_id) do
@@ -572,7 +737,10 @@ defmodule Vibe.Chat do
     # This way the other user can still see the chat
     case from(p in Participant, where: p.chat_id == ^chat_id and p.user_id == ^user_id)
          |> Repo.update_all(set: [deleted: true, messages_cleared_at: NaiveDateTime.utc_now()]) do
-      {1, _} -> {:ok, :deleted}
+      {1, _} ->
+        ChatHomeCache.invalidate_user(user_id)
+        {:ok, :deleted}
+
       {0, _} -> {:error, "Chat not found"}
       _ -> {:error, "Failed to delete"}
     end
@@ -591,6 +759,7 @@ defmodule Vibe.Chat do
         # Was deleted - restore it
         from(p in Participant, where: p.chat_id == ^chat_id and p.user_id == ^user_id)
         |> Repo.update_all(set: [deleted: false])
+        ChatHomeCache.invalidate_user(user_id)
         :restored
       true ->
         # Not deleted
@@ -604,7 +773,8 @@ defmodule Vibe.Chat do
     id = Ecto.UUID.generate() |> String.slice(0, 12)
     all_member_ids = Enum.uniq([creator_id | member_ids])
 
-    Repo.transaction(fn ->
+    result =
+      Repo.transaction(fn ->
       room = Repo.insert!(%Room{
         id: id,
         is_group: true,
@@ -620,17 +790,36 @@ defmodule Vibe.Chat do
 
       room
     end)
+
+    case result do
+      {:ok, room} ->
+        ChatHomeCache.invalidate_users(all_member_ids)
+        {:ok, room}
+
+      other ->
+        other
+    end
   end
 
   def add_member(chat_id, user_id, role \\ "member") do
-    %Participant{}
-    |> Participant.changeset(%{chat_id: chat_id, user_id: user_id, role: role})
-    |> Repo.insert(on_conflict: :nothing)
+    result =
+      %Participant{}
+      |> Participant.changeset(%{chat_id: chat_id, user_id: user_id, role: role})
+      |> Repo.insert(on_conflict: :nothing)
+
+    invalidate_chat_home_cache(chat_id)
+    ChatHomeCache.invalidate_user(user_id)
+    result
   end
 
   def remove_member(chat_id, user_id) do
-    from(p in Participant, where: p.chat_id == ^chat_id and p.user_id == ^user_id)
-    |> Repo.delete_all()
+    result =
+      from(p in Participant, where: p.chat_id == ^chat_id and p.user_id == ^user_id)
+      |> Repo.delete_all()
+
+    invalidate_chat_home_cache(chat_id)
+    ChatHomeCache.invalidate_user(user_id)
+    result
   end
 
   # ── Channels ────────────────────────────────────────────────────
@@ -638,7 +827,8 @@ defmodule Vibe.Chat do
   def create_channel(creator_id, name, description \\ nil) do
     id = Ecto.UUID.generate() |> String.slice(0, 12)
 
-    Repo.transaction(fn ->
+    result =
+      Repo.transaction(fn ->
       room = Repo.insert!(%Room{
         id: id,
         is_group: false,
@@ -652,15 +842,29 @@ defmodule Vibe.Chat do
 
       room
     end)
+
+    case result do
+      {:ok, room} ->
+        ChatHomeCache.invalidate_user(creator_id)
+        {:ok, room}
+
+      other ->
+        other
+    end
   end
 
   def join_channel(channel_id, user_id) do
     # Verify it's a channel
     case Repo.get(Room, channel_id) do
       %Room{type: "channel"} ->
-        %Participant{}
-        |> Participant.changeset(%{chat_id: channel_id, user_id: user_id, role: "subscriber"})
-        |> Repo.insert(on_conflict: :nothing)
+        result =
+          %Participant{}
+          |> Participant.changeset(%{chat_id: channel_id, user_id: user_id, role: "subscriber"})
+          |> Repo.insert(on_conflict: :nothing)
+
+        invalidate_chat_home_cache(channel_id)
+        ChatHomeCache.invalidate_user(user_id)
+        result
 
       _ ->
         {:error, "Not a channel"}
@@ -675,7 +879,10 @@ defmodule Vibe.Chat do
         {:error, "Owner cannot leave channel"}
 
       %Participant{} = participant ->
-        Repo.delete(participant)
+        result = Repo.delete(participant)
+        invalidate_chat_home_cache(channel_id)
+        ChatHomeCache.invalidate_user(user_id)
+        result
 
       nil ->
         {:error, "Not a member"}
@@ -851,11 +1058,28 @@ defmodule Vibe.Chat do
         agent_name: "Vibe AI"
       })
     else
-      message
+      base_message_map(message)
     end
   end
 
   defp to_client_message(other), do: other
+
+  defp to_client_saved_message(%SavedMessage{} = message) do
+    %{
+      id: message.id,
+      user_id: message.user_id,
+      original_message_id: message.original_message_id,
+      chat_id: message.chat_id,
+      from_id: message.from_id,
+      encrypted_content: message.encrypted_content,
+      content: message.content,
+      type: message.type,
+      media_url: rewrite_media_url(message.media_url),
+      timestamp: message.timestamp,
+      extra: message.extra,
+      inserted_at: message.inserted_at
+    }
+  end
 
   defp is_agent_message?(%Message{from_id: from_id}) do
     case {Ecto.UUID.cast(from_id), Ecto.UUID.cast(@agent_user_id)} do
@@ -873,8 +1097,79 @@ defmodule Vibe.Chat do
       type: message.type,
       encrypted_content: message.encrypted_content,
       status: message.status,
-      media_url: message.media_url,
+      media_url: rewrite_media_url(message.media_url),
       reply_to_id: message.reply_to_id
     }
   end
+
+  defp rewrite_media_url(url), do: SupabaseStorage.rewrite_public_url(url)
+
+  defp invalidate_chat_home_cache(chat_id) when is_binary(chat_id) do
+    participant_ids =
+      Repo.all(
+        from p in Participant,
+          where: p.chat_id == ^chat_id,
+          select: p.user_id
+      )
+
+    ChatHomeCache.invalidate_users(participant_ids)
+    :ok
+  end
+
+  defp invalidate_chat_home_cache(_chat_id), do: :ok
+
+  defp invalidate_home_cache_for_message(message_id) when is_binary(message_id) do
+    case Repo.one(from m in Message, where: m.id == ^message_id, select: m.chat_id) do
+      chat_id when is_binary(chat_id) -> invalidate_chat_home_cache(chat_id)
+      _ -> :ok
+    end
+  end
+
+  defp invalidate_home_cache_for_message(_message_id), do: :ok
+
+  defp normalize_history_limit(limit) when is_integer(limit),
+    do: limit |> max(1) |> min(@history_max_limit)
+
+  defp normalize_history_limit(limit) when is_binary(limit) do
+    case Integer.parse(String.trim(limit)) do
+      {parsed, _rest} -> normalize_history_limit(parsed)
+      :error -> @history_default_limit
+    end
+  end
+
+  defp normalize_history_limit(_limit), do: @history_default_limit
+
+  defp encode_history_cursor(%Message{} = message) do
+    Jason.encode!(%{timestamp: message.timestamp || 0, id: message.id})
+    |> Base.url_encode64(padding: false)
+  end
+
+  defp encode_history_cursor(_message), do: nil
+
+  defp decode_history_cursor(nil), do: nil
+  defp decode_history_cursor(""), do: nil
+
+  defp decode_history_cursor(cursor) when is_binary(cursor) do
+    with {:ok, raw} <- Base.url_decode64(cursor, padding: false),
+         {:ok, %{"timestamp" => timestamp, "id" => id}} <- Jason.decode(raw),
+         ts when is_integer(ts) <- normalize_cursor_timestamp(timestamp),
+         {:ok, uuid} <- Ecto.UUID.cast(id) do
+      %{timestamp: ts, id: uuid}
+    else
+      _ -> nil
+    end
+  end
+
+  defp decode_history_cursor(_cursor), do: nil
+
+  defp normalize_cursor_timestamp(value) when is_integer(value), do: value
+
+  defp normalize_cursor_timestamp(value) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {parsed, _rest} -> parsed
+      :error -> nil
+    end
+  end
+
+  defp normalize_cursor_timestamp(_value), do: nil
 end

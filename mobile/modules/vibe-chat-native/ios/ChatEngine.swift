@@ -962,15 +962,14 @@ final class ChatEngine {
     }
   }
 
-  /// Seeds chat histories right from the Home API fetch payload, preventing N+1 fetch requests
-  /// and avoiding network timeouts or delays when clicking into a chat.
+  /// Seeds lightweight preview rows from the Home API payload without triggering
+  /// background full-history fetches for every chat.
   func seedChatHistories(_ payload: [String: Any]) -> [String: Any] {
     guard let histories = payload["chatHistories"] as? [String: [[String: Any]]] else {
       return ["seeded": 0]
     }
 
     var triggered = 0
-    var chatIdsToPreload: [String] = []
     queue.sync {
       for (rawChatId, messagesArray) in histories {
         guard let chatId = normalizedString(rawChatId), !chatId.isEmpty else { continue }
@@ -978,20 +977,13 @@ final class ChatEngine {
         if !historyFullyLoadedChats.contains(chatId) {
           let rows = buildHistoryRowsLocked(chatId: chatId, rawMessages: messagesArray)
           historyRowsByChat[chatId] = rows
-          chatIdsToPreload.append(chatId)
           triggered += 1
         }
-      }
-      // Now kick off the full 15-message history fetch in the background
-      // for every seeded chat so messages are ready before the user taps in.
-      for chatId in chatIdsToPreload {
-        loadChatHistoryIfNeededLocked(chatId: chatId)
       }
     }
 
     NSLog(
-      "[ChatEngine] seedChatHistories injected %d chats, preloading %d", triggered,
-      chatIdsToPreload.count)
+      "[ChatEngine] seedChatHistories injected %d chats without eager history fetch", triggered)
     return ["seeded": triggered]
   }
 

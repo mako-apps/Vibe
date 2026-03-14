@@ -64,6 +64,8 @@ export interface Chat {
     unreadCount?: number;
     friendImage?: string;
     previewLastMessage?: string; // Cache
+    historyNextCursor?: string | null;
+    historyHasMore?: boolean;
     pinned?: boolean;
     muted?: boolean;
     markedUnread?: boolean;

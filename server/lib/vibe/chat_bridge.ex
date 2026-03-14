@@ -10,10 +10,12 @@ defmodule Vibe.ChatBridge do
   alias Vibe.Chat.MessageRead
   alias Vibe.Repo
   alias Vibe.RepoRLS
+  alias Vibe.SupabaseStorage
 
   @poll_limit 200
   @long_poll_timeout_ms 25_000
   @poll_sleep_ms 1_000
+  @history_default_limit 30
 
   def open_session(%User{} = user, attrs) when is_map(attrs) do
     with :ok <- ensure_body_user_matches(user, attrs) do
@@ -123,25 +125,41 @@ defmodule Vibe.ChatBridge do
         chat_id == "saved_messages"
 
     limit = normalize_limit(attrs["limit"] || attrs[:limit])
+    before = parse_history_cursor(attrs["before"] || attrs[:before])
 
     cond do
       saved_messages? ->
-        messages =
+        page =
           user.id
           |> Chat.list_saved_messages()
           |> Enum.sort_by(&saved_message_sort_key/1)
-          |> maybe_take_last(limit)
+          |> paginate_saved_messages(limit || @history_default_limit, before)
 
-        {:ok, %{messages: messages, data: messages}}
+        {:ok,
+         %{
+           messages: page.messages,
+           data: page.messages,
+           nextCursor: page.next_cursor,
+           hasMore: page.has_more
+         }}
 
       is_binary(chat_id) and chat_id != "" ->
         with :ok <- ensure_participant(chat_id, user.id) do
-          messages =
-            chat_id
-            |> Chat.get_messages_for_user(user.id)
-            |> maybe_take_last(limit)
+          page =
+            Chat.get_messages_for_user_page(
+              chat_id,
+              user.id,
+              limit: limit || @history_default_limit,
+              before: attrs["before"] || attrs[:before]
+            )
 
-          {:ok, %{messages: messages, data: messages}}
+          {:ok,
+           %{
+             messages: page.messages,
+             data: page.messages,
+             nextCursor: page.next_cursor,
+             hasMore: page.has_more
+           }}
         end
 
       true ->
@@ -228,6 +246,7 @@ defmodule Vibe.ChatBridge do
         nil ->
           case Chat.add_message(message_attrs, acting_user_id: user.id) do
             {:ok, %Message{} = message} ->
+              broadcast_bridge_message(message)
               {:ok, send_message_response(message)}
 
             {:error, _changeset} ->
@@ -259,6 +278,12 @@ defmodule Vibe.ChatBridge do
          :ok <- ensure_participant(chat_id, user.id),
          {:ok, _message} <-
            Chat.edit_message(chat_id, message_id, user.id, encrypted_content, edited_at) do
+      broadcast_bridge_event("chat:#{chat_id}", "message-edited", %{
+        chatId: chat_id,
+        messageId: message_id,
+        encryptedContent: encrypted_content,
+        editedAt: edited_at
+      })
       {:ok,
        %{
          accepted: true,
@@ -293,6 +318,12 @@ defmodule Vibe.ChatBridge do
          {:ok, message_id} <- require_message_id(message_id),
          :ok <- ensure_participant(chat_id, user.id),
          {:ok, _message} <- Chat.delete_message(chat_id, message_id, user.id, for_everyone) do
+      broadcast_bridge_event("chat:#{chat_id}", "message-deleted", %{
+        chatId: chat_id,
+        messageId: message_id,
+        deletedBy: user.id,
+        forEveryone: for_everyone
+      })
       {:ok,
        %{
          accepted: true,
@@ -328,6 +359,43 @@ defmodule Vibe.ChatBridge do
       status: message.status || "sent",
       events: [message_frame(message)]
     }
+  end
+
+  defp broadcast_bridge_message(%Message{} = message) do
+    payload = %{
+      id: message.id,
+      messageId: message.id,
+      chatId: message.chat_id,
+      fromId: message.from_id,
+      timestamp: message.timestamp,
+      type: message.type,
+      encryptedContent: message.encrypted_content,
+      status: message.status,
+      mediaUrl: rewrite_media_url(message.media_url),
+      replyToId: message.reply_to_id
+    }
+
+    VibeWeb.Endpoint.broadcast("chat:#{message.chat_id}", "message", payload)
+
+    participant_ids = Chat.get_participant_ids(message.chat_id) || []
+
+    Enum.each(participant_ids, fn pid ->
+      if pid != message.from_id do
+        VibeWeb.Endpoint.broadcast("user:#{pid}", "new_message", %{
+          chatId: message.chat_id,
+          fromId: message.from_id,
+          messageId: message.id
+        })
+      end
+    end)
+  rescue
+    _ -> :ok
+  end
+
+  defp broadcast_bridge_event(topic, event, payload) do
+    VibeWeb.Endpoint.broadcast(topic, event, payload)
+  rescue
+    _ -> :ok
   end
 
   defp wait_for_events(user_id, chat_ids, cursor, started_ms) do
@@ -475,7 +543,7 @@ defmodule Vibe.ChatBridge do
         type: message.type,
         encryptedContent: message.encrypted_content,
         status: message.status,
-        mediaUrl: message.media_url,
+        mediaUrl: rewrite_media_url(message.media_url),
         replyToId: message.reply_to_id
       }
     }
@@ -661,20 +729,83 @@ defmodule Vibe.ChatBridge do
 
   defp normalize_limit(value) do
     case normalize_integer(value) do
-      int when is_integer(int) and int > 0 -> min(int, @poll_limit)
+      int when is_integer(int) and int > 0 -> min(int, 100)
       _ -> nil
     end
   end
 
+  defp parse_history_cursor(nil), do: nil
+  defp parse_history_cursor(""), do: nil
+
+  defp parse_history_cursor(cursor) when is_binary(cursor) do
+    with {:ok, raw} <- Base.url_decode64(cursor, padding: false),
+         {:ok, %{"timestamp" => timestamp, "id" => id}} <- Jason.decode(raw),
+         ts when is_integer(ts) <- normalize_integer(timestamp),
+         normalized_id when is_binary(normalized_id) <- normalize_string(id) do
+      %{timestamp: ts, id: normalized_id}
+    else
+      _ -> nil
+    end
+  end
+
+  defp parse_history_cursor(_cursor), do: nil
+
   defp ensure_list(value) when is_list(value), do: value
   defp ensure_list(_value), do: []
 
-  defp maybe_take_last(list, nil), do: list
-  defp maybe_take_last(list, limit), do: Enum.take(list, -limit)
+  defp paginate_saved_messages(messages, limit, before) when is_list(messages) do
+    filtered =
+      case before do
+        %{timestamp: timestamp, id: id} ->
+          Enum.filter(messages, fn message ->
+            message_timestamp = saved_message_sort_key(message)
+            message_id = normalize_string(Map.get(message, :id) || Map.get(message, "id")) || ""
+            message_timestamp < timestamp or (message_timestamp == timestamp and message_id < id)
+          end)
+
+        _ ->
+          messages
+      end
+
+    filtered_desc = Enum.reverse(filtered)
+    has_more = length(filtered_desc) > limit
+    page_desc = Enum.take(filtered_desc, limit)
+
+    next_cursor =
+      if has_more do
+        page_desc
+        |> List.last()
+        |> encode_saved_message_cursor()
+      else
+        nil
+      end
+
+    %{
+      messages: Enum.reverse(page_desc),
+      next_cursor: next_cursor,
+      has_more: has_more
+    }
+  end
+
+  defp encode_saved_message_cursor(message) do
+    id =
+      normalize_string(Map.get(message, :id) || Map.get(message, "id"))
+
+    timestamp = saved_message_sort_key(message)
+
+    if is_binary(id) do
+      Jason.encode!(%{timestamp: timestamp, id: id})
+      |> Base.url_encode64(padding: false)
+    else
+      nil
+    end
+  end
 
   defp saved_message_sort_key(message) do
     normalize_integer(Map.get(message, :timestamp) || Map.get(message, "timestamp")) || 0
   end
+
+  defp rewrite_media_url(url), do: SupabaseStorage.rewrite_public_url(url)
 
   defp ms_to_naive(ms) when is_integer(ms) do
     ms

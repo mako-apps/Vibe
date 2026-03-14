@@ -12,7 +12,8 @@ defmodule Vibe.Application do
   def start(_type, _args) do
     # Create ETS table for rate limiting before starting the endpoint
     # This must happen before any requests can hit the RateLimiter plug
-    :ets.new(:rate_limiter, [:set, :public, :named_table, {:read_concurrency, true}])
+    ensure_ets_table(:rate_limiter)
+    ensure_ets_table(:chat_home_cache)
 
     children = [
       # Start the Telemetry supervisor
@@ -56,6 +57,16 @@ defmodule Vibe.Application do
   def config_change(changed, _new, removed) do
     VibeWeb.Endpoint.config_change(changed, removed)
     :ok
+  end
+
+  defp ensure_ets_table(name) do
+    case :ets.whereis(name) do
+      :undefined ->
+        :ets.new(name, [:set, :public, :named_table, {:read_concurrency, true}])
+
+      _tid ->
+        :ok
+    end
   end
 
 end

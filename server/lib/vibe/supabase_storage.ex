@@ -9,6 +9,7 @@ defmodule Vibe.SupabaseStorage do
 
   @default_music_bucket "music-cache"
   @default_media_bucket "chat-media"
+  @public_object_marker "/storage/v1/object/public/"
 
   defp sanitize_token(nil), do: nil
 
@@ -162,7 +163,8 @@ defmodule Vibe.SupabaseStorage do
   end
 
   @doc """
-  Get the public URL for a file.
+  Get the public client URL for a file. When MEDIA_CDN_BASE_URL is configured,
+  this points to the CDN hostname instead of the raw Supabase public object URL.
   """
   def get_public_url(remote_path) do
     config = get_config()
@@ -172,19 +174,100 @@ defmodule Vibe.SupabaseStorage do
 
   def get_public_url(remote_path, bucket) when is_binary(bucket) do
     config = get_config()
-    "#{config.url}/storage/v1/object/public/#{bucket}/#{remote_path}"
+    raw_public_url(remote_path, bucket, config) |> rewrite_public_url()
   end
+
+  @doc """
+  Get the raw Supabase public object URL for a file.
+  """
+  def get_origin_public_url(remote_path) do
+    config = get_config()
+    bucket = resolve_bucket(config, :music)
+    raw_public_url(remote_path, bucket, config)
+  end
+
+  def get_origin_public_url(remote_path, bucket) when is_binary(bucket) do
+    raw_public_url(remote_path, bucket, get_config())
+  end
+
+  @doc """
+  Rewrite a historical/raw Supabase public object URL to the configured CDN URL.
+  If MEDIA_CDN_BASE_URL is unset or the URL cannot be recognized, the input is returned.
+  """
+  def rewrite_public_url(nil), do: nil
+
+  def rewrite_public_url(url) when is_binary(url) do
+    config = get_config()
+
+    with cdn_base when is_binary(cdn_base) <- normalize_base_url(config.media_cdn_base_url),
+         {:ok, bucket, object_path, suffix} <- extract_public_object_components(url) do
+      "#{cdn_base}/#{bucket}/#{object_path}#{suffix}"
+    else
+      _ -> url
+    end
+  end
+
+  def rewrite_public_url(other), do: other
 
   defp get_config do
     config = Application.get_env(:vibe, :supabase, [])
     %{
-      url: config[:url],
-      key: config[:key],
-      service_key: config[:service_key],
-      bucket: config[:bucket],
-      media_bucket: config[:media_bucket],
-      music_bucket: config[:music_bucket]
+      url: config[:url] || System.get_env("SUPABASE_URL"),
+      key: config[:key] || System.get_env("SUPABASE_KEY"),
+      service_key: config[:service_key] || System.get_env("SUPABASE_SERVICE_KEY"),
+      media_cdn_base_url: config[:media_cdn_base_url] || System.get_env("MEDIA_CDN_BASE_URL"),
+      bucket: config[:bucket] || System.get_env("SUPABASE_BUCKET"),
+      media_bucket: config[:media_bucket] || System.get_env("SUPABASE_MEDIA_BUCKET"),
+      music_bucket: config[:music_bucket] || System.get_env("SUPABASE_MUSIC_BUCKET")
     }
+  end
+
+  defp raw_public_url(remote_path, bucket, config) do
+    "#{config.url}/storage/v1/object/public/#{bucket}/#{remote_path}"
+  end
+
+  defp extract_public_object_components(url) when is_binary(url) do
+    case URI.parse(url) do
+      %URI{path: path} = uri when is_binary(path) ->
+        case String.split(path, @public_object_marker, parts: 2) do
+          [_prefix, suffix] ->
+            parts = suffix |> String.split("/", trim: true)
+
+            case parts do
+              [bucket | rest] when rest != [] ->
+                normalized_rest =
+                  case rest do
+                    [^bucket | tail] when tail != [] -> tail
+                    _ -> rest
+                  end
+
+                object_path = Enum.join(normalized_rest, "/")
+                query = if is_binary(uri.query), do: "?#{uri.query}", else: ""
+                fragment = if is_binary(uri.fragment), do: "##{uri.fragment}", else: ""
+                {:ok, bucket, object_path, query <> fragment}
+
+              _ ->
+                :error
+            end
+
+          _ ->
+            :error
+        end
+
+      _ ->
+        :error
+    end
+  end
+
+  defp normalize_base_url(nil), do: nil
+
+  defp normalize_base_url(value) when is_binary(value) do
+    trimmed = String.trim(value)
+
+    cond do
+      trimmed == "" -> nil
+      true -> String.trim_trailing(trimmed, "/")
+    end
   end
 
   defp get_content_type(path) do

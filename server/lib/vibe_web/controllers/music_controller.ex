@@ -112,7 +112,7 @@ defmodule VibeWeb.MusicController do
     case MusicCache.get_by_video_id(video_id) do
       %MusicCache{cached_file_path: url} when not is_nil(url) and url != "" ->
         # cached_file_path stores the Supabase public URL
-        {:ok, url}
+        {:ok, SupabaseStorage.rewrite_public_url(url)}
 
       _ ->
         :not_cached

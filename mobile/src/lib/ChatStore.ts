@@ -2444,27 +2444,6 @@ export const useChatStore = create<ChatState>()(
                         chatStoreLog('[ChatStore] State updated with chats:', processedChats.length);
                     }
 
-                    // Pre-load native chat histories for all chats so opening any
-                    // chat renders messages instantly (no 5-second network wait).
-                    if (useNativeFastPath) {
-                        try {
-                            const { getNativeChatEngineModule } = require('../native/chat/runtime');
-                            const engineModule = getNativeChatEngineModule();
-                            if (engineModule?.seedChatHistories) {
-                                const seedData: Record<string, any[]> = {};
-                                data.forEach((c: any) => {
-                                    if (c.chatId && Array.isArray(c.messages) && c.messages.length > 0) {
-                                        seedData[c.chatId] = c.messages;
-                                    }
-                                });
-                                engineModule.seedChatHistories({ chatHistories: seedData });
-                                console.log(`[ChatStore] seedChatHistories triggered for ${Object.keys(seedData).length} chats directly from home payload`);
-                            }
-                        } catch (e) {
-                            // Non-critical — chats will load on-demand when opened
-                        }
-                    }
-
                     // Warm friend public keys for startup-sensitive chats (active + unread),
                     // so first send/reply does not wait on key fetch.
                     const currentActive = get().activeChatId;
@@ -2543,6 +2522,8 @@ export const useChatStore = create<ChatState>()(
                             friendImage: friendInfo?.profileImage || undefined,
                             friendKey: extractPublicKey(friendInfo) || undefined,
                             messages: data.messages || [],
+                            historyNextCursor: typeof data.nextCursor === 'string' ? data.nextCursor : null,
+                            historyHasMore: data.hasMore === true,
                             lastMessage: undefined,
                             unreadCount: 0,
                             pinned: false,
@@ -3909,7 +3890,9 @@ export const useChatStore = create<ChatState>()(
 
                     try {
                         const fetchStartTs = Date.now();
-                        const res = await fetch(`${baseUrl}/api/chat/${chatId}/messages`, {
+                        const historyUrl = `${baseUrl}/api/chat/${chatId}/messages?limit=30`;
+
+                        const res = await fetch(historyUrl, {
                             headers: {
                                 'ngrok-skip-browser-warning': 'true',
                                 ...buildAuthHeaders(auth),
@@ -3927,10 +3910,23 @@ export const useChatStore = create<ChatState>()(
                             throw new Error(`HTTP ${res.status}${body ? `: ${body.slice(0, 180)}` : ''}`);
                         }
                         const jsonStartTs = Date.now();
-                        const messages = await res.json();
+                        const payload = await res.json();
+                        const messages = Array.isArray(payload)
+                            ? payload
+                            : Array.isArray((payload as any)?.messages)
+                                ? (payload as any).messages
+                                : Array.isArray((payload as any)?.data)
+                                    ? (payload as any).data
+                                    : [];
+                        const nextCursor =
+                            !Array.isArray(payload) && typeof (payload as any)?.nextCursor === 'string'
+                                ? (payload as any).nextCursor
+                                : null;
+                        const hasMore =
+                            !Array.isArray(payload) && (payload as any)?.hasMore === true;
                         chatStoreHistoryPerfLog('loadMessages:json:done', {
                             chatId,
-                            count: Array.isArray(messages) ? messages.length : -1,
+                            count: messages.length,
                             jsonDt: Date.now() - jsonStartTs,
                             totalDt: Date.now() - runStartTs,
                         });
@@ -4060,7 +4056,9 @@ export const useChatStore = create<ChatState>()(
                             const updatedChats = [...chats];
                             updatedChats[chatIndex] = {
                                 ...updatedChats[chatIndex],
-                                messages: mergedMessages
+                                messages: mergedMessages,
+                                historyNextCursor: nextCursor,
+                                historyHasMore: hasMore,
                             };
                             if (__DEV__) {
                                 const mergedUnresolvedTextCount = mergedMessages.filter((m: any) => {

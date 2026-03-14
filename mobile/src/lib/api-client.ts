@@ -531,7 +531,7 @@ export const apiClient = {
     },
 
     getChatMessages: async (chatId: string) => {
-        const res = await fetchWithRetry(`/chat/${chatId}/messages`)
+        const res = await fetchWithRetry(`/chat/${chatId}/messages?limit=30`)
         const text = await res.text()
         let json;
         try {
@@ -542,6 +542,7 @@ export const apiClient = {
         }
         if (!res.ok) throw new Error(json?.errors?.detail || json?.error || `HTTP ${res.status}`)
         if (!Array.isArray(json)) {
+            if (json?.messages && Array.isArray(json.messages)) return json.messages;
             if (json?.data && Array.isArray(json.data)) return json.data;
             throw new Error(json?.errors?.detail || 'Invalid response format');
         }

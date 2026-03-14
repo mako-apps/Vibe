@@ -18,11 +18,11 @@ defmodule VibeWeb.ChatController do
         case Chat.restore_if_deleted(id, my_id) do
           :restored ->
             # Chat was deleted, now restored - return empty messages (fresh start)
-            json(conn, %{chatId: id, messages: []})
+            json(conn, %{chatId: id, messages: [], nextCursor: nil, hasMore: false})
           :not_deleted ->
-            # Chat exists and wasn't deleted - return existing messages
-            messages = Chat.get_messages(id, my_id)
-            json(conn, %{chatId: id, messages: messages})
+            # Chat exists and wasn't deleted - return only the latest page
+            page = Chat.get_messages_for_user_page(id, my_id, limit: 30)
+            json(conn, %{chatId: id, messages: page.messages, nextCursor: page.next_cursor, hasMore: page.has_more})
         end
 
       nil ->
@@ -36,7 +36,7 @@ defmodule VibeWeb.ChatController do
         try do
           case Chat.create_chat(chat_id, [my_id, friend_id]) do
             {:ok, _chat} ->
-              json(conn, %{chatId: chat_id, messages: []})
+              json(conn, %{chatId: chat_id, messages: [], nextCursor: nil, hasMore: false})
 
             _ ->
               conn |> put_status(500) |> json(%{error: "Failed to create chat"})
@@ -44,8 +44,8 @@ defmodule VibeWeb.ChatController do
         rescue
           Ecto.ConstraintError ->
             # Another request created the chat first; return the existing chat id.
-            messages = Chat.get_messages(chat_id, my_id)
-            json(conn, %{chatId: chat_id, messages: messages})
+            page = Chat.get_messages_for_user_page(chat_id, my_id, limit: 30)
+            json(conn, %{chatId: chat_id, messages: page.messages, nextCursor: page.next_cursor, hasMore: page.has_more})
         end
     end
     end
@@ -55,8 +55,19 @@ defmodule VibeWeb.ChatController do
     user_id = conn.assigns.current_user.id
 
     if Chat.is_participant?(chat_id, user_id) do
-      messages = Chat.get_messages_for_user(chat_id, user_id)
-      json(conn, messages) # Use json directly instead of render for pure API parity
+      page =
+        Chat.get_messages_for_user_page(
+          chat_id,
+          user_id,
+          limit: parse_limit(conn.params["limit"]),
+          before: conn.params["before"]
+        )
+
+      json(conn, %{
+        messages: page.messages,
+        nextCursor: page.next_cursor,
+        hasMore: page.has_more
+      })
     else
       conn |> put_status(:forbidden) |> json(%{error: "Not a participant"})
     end
@@ -224,4 +235,16 @@ defmodule VibeWeb.ChatController do
       conn |> put_status(:forbidden) |> json(%{error: "Not a participant"})
     end
   end
+
+  defp parse_limit(nil), do: nil
+
+  defp parse_limit(limit) when is_binary(limit) do
+    case Integer.parse(String.trim(limit)) do
+      {parsed, _rest} -> parsed
+      :error -> nil
+    end
+  end
+
+  defp parse_limit(limit) when is_integer(limit), do: limit
+  defp parse_limit(_limit), do: nil
 end

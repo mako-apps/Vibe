@@ -3631,8 +3631,9 @@ internal object ChatEngine {
     historyLoadingChats.add(chatId)
     appendJournalLocked("native-chat-history-load-start", mapOf("chatId" to chatId))
 
+    val directHistoryUrl = "$apiBaseUrl/api/chat/$chatId/messages?limit=15"
     val requestBuilder = Request.Builder()
-      .url(if (isBridgeText) bridgeUrl!! else "$apiBaseUrl/api/chat/$chatId/messages")
+      .url(if (isBridgeText) bridgeUrl!! else directHistoryUrl)
       .header("Accept", "application/json")
       .header("ngrok-skip-browser-warning", "true")
     if (isBridgeText) {

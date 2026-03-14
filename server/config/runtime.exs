@@ -45,6 +45,7 @@ if config_env() == :prod do
     url: System.get_env("SUPABASE_URL"),
     key: System.get_env("SUPABASE_KEY"),
     service_key: System.get_env("SUPABASE_SERVICE_KEY"),
+    media_cdn_base_url: System.get_env("MEDIA_CDN_BASE_URL"),
     # Optional: allow different buckets per use-case.
     # If unset, code falls back to its default bucket.
     bucket: System.get_env("SUPABASE_BUCKET"),

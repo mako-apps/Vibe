@@ -1458,17 +1458,24 @@ export default function ChatComponent() {
 
       // Only fetch messages if we don't have enough cached and NOT pending
       if (!hasEnoughMessages && !chat.chatId.startsWith('pending_')) {
-        const mRes = await fetch(`${getApiUrl()}/api/chat/${chat.chatId}/messages`, {
+        const mRes = await fetch(`${getApiUrl()}/api/chat/${chat.chatId}/messages?limit=30`, {
           headers: { 'ngrok-skip-browser-warning': 'true' }
         });
 
         let msgs: Message[] = [];
         if (mRes.ok) {
           const msgsRaw = await mRes.json();
-          msgs = Array.isArray(msgsRaw) ? msgsRaw.map((m: any) => ({
+          const msgItems = Array.isArray(msgsRaw)
+            ? msgsRaw
+            : Array.isArray(msgsRaw?.messages)
+              ? msgsRaw.messages
+              : Array.isArray(msgsRaw?.data)
+                ? msgsRaw.data
+                : [];
+          msgs = msgItems.map((m: any) => ({
             ...m,
             plaintext: m._senderPlaintext || m.senderPlaintext || m.sender_plaintext || m.plaintext
-          })) : [];
+          }));
         }
 
         // Mark Read on Server
