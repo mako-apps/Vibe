@@ -368,7 +368,10 @@ defmodule VibeWeb.ChatChannel do
       end
 
     case value do
-      text when is_binary(text) and String.trim(text) != "" -> String.trim(text)
+      text when is_binary(text) ->
+        trimmed = String.trim(text)
+        if trimmed == "", do: nil, else: trimmed
+
       _ -> nil
     end
   end

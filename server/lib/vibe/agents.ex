@@ -249,17 +249,21 @@ defmodule Vibe.Agents do
 
         {:ok, invocation}
 
-      {:error, %Ecto.Changeset{errors: [event_id: _ | _]}} ->
-        event_id = Map.get(attrs, :event_id) || Map.get(attrs, "event_id")
+      {:error, %Ecto.Changeset{} = changeset} ->
+        if event_id_conflict?(changeset) do
+          event_id = Map.get(attrs, :event_id) || Map.get(attrs, "event_id")
 
-        Repo.one(
-          from i in AgentInvocation,
-            where: i.agent_id == ^agent.id and i.event_id == ^event_id,
-            limit: 1
-        )
-        |> case do
-          nil -> result
-          invocation -> {:ok, invocation}
+          Repo.one(
+            from i in AgentInvocation,
+              where: i.agent_id == ^agent.id and i.event_id == ^event_id,
+              limit: 1
+          )
+          |> case do
+            nil -> result
+            invocation -> {:ok, invocation}
+          end
+        else
+          result
         end
 
       _ ->
@@ -526,8 +530,12 @@ defmodule Vibe.Agents do
     requested = Map.get(attrs, "username") || Map.get(attrs, :username)
 
     case requested do
-      value when is_binary(value) and String.trim(value) != "" ->
-        ensure_valid_username!(value)
+      value when is_binary(value) ->
+        if String.trim(value) == "" do
+          generate_available_username(display_name)
+        else
+          ensure_valid_username!(value)
+        end
 
       _ ->
         generate_available_username(display_name)
@@ -709,6 +717,13 @@ defmodule Vibe.Agents do
       "archived" -> "archived"
       _ -> agent.status
     end
+  end
+
+  defp event_id_conflict?(%Ecto.Changeset{errors: errors}) do
+    Enum.any?(errors, fn
+      {:event_id, _details} -> true
+      _ -> false
+    end)
   end
 
   defp maybe_put(map, _key, nil), do: map

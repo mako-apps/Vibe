@@ -7,7 +7,9 @@ defmodule Vibe.AI.TTS do
 
   @openai_tts_api "https://api.openai.com/v1/audio/speech"
 
-  def synthesize(text, opts \\ []) when is_binary(text) do
+  def synthesize(text, opts \\ [])
+
+  def synthesize(text, opts) when is_binary(text) do
     api_key = System.get_env("OPENAI_API_KEY")
     voice = Keyword.get(opts, :voice, "alloy")
 

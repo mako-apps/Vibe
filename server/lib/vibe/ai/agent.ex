@@ -483,17 +483,35 @@ defmodule Vibe.AI.Agent do
       # Execute the tool
       start_time = System.monotonic_time(:millisecond)
 
-      result = case tool_name do
-        "search_music" -> Vibe.AI.Tools.Music.search(tool["input"])
-        "search_google" -> Vibe.AI.Tools.Search.google(tool["input"])
-        "analyze_image" -> Vibe.AI.Tools.Vision.analyze(tool["input"])
-        "analyze_document" -> Vibe.AI.Tools.Document.analyze(tool["input"])
-        name when name in GroupAgent.standalone_tool_names() -> GroupAgent.execute_standalone_tool(name, tool["input"], user_id, chat_id)
-        "post_to_channel" -> Vibe.AI.Tools.Channel.post_to_channel(tool["input"], user_id)
-        "get_channel_analytics" -> Vibe.AI.Tools.Channel.get_analytics(tool["input"], user_id)
-        "schedule_channel_post" -> Vibe.AI.Tools.Channel.schedule_post(tool["input"], user_id)
-        _ -> %{error: "Unknown tool"}
-      end
+      result =
+        cond do
+          tool_name == "search_music" ->
+            Vibe.AI.Tools.Music.search(tool["input"])
+
+          tool_name == "search_google" ->
+            Vibe.AI.Tools.Search.google(tool["input"])
+
+          tool_name == "analyze_image" ->
+            Vibe.AI.Tools.Vision.analyze(tool["input"])
+
+          tool_name == "analyze_document" ->
+            Vibe.AI.Tools.Document.analyze(tool["input"])
+
+          tool_name in GroupAgent.standalone_tool_names() ->
+            GroupAgent.execute_standalone_tool(tool_name, tool["input"], user_id, chat_id)
+
+          tool_name == "post_to_channel" ->
+            Vibe.AI.Tools.Channel.post_to_channel(tool["input"], user_id)
+
+          tool_name == "get_channel_analytics" ->
+            Vibe.AI.Tools.Channel.get_analytics(tool["input"], user_id)
+
+          tool_name == "schedule_channel_post" ->
+            Vibe.AI.Tools.Channel.schedule_post(tool["input"], user_id)
+
+          true ->
+            %{error: "Unknown tool"}
+        end
 
       duration_ms = System.monotonic_time(:millisecond) - start_time
       Logger.info("[Agent] Tool #{tool_name} completed in #{duration_ms}ms")
