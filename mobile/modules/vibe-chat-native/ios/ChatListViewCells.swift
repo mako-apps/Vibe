@@ -491,6 +491,34 @@ private func measuredTextWidth(_ text: String, font: UIFont) -> CGFloat {
   ceil((text as NSString).size(withAttributes: [.font: font]).width)
 }
 
+private func colorLuminance(_ color: UIColor) -> CGFloat {
+  var red: CGFloat = 0.0
+  var green: CGFloat = 0.0
+  var blue: CGFloat = 0.0
+  var alpha: CGFloat = 0.0
+  if color.getRed(&red, green: &green, blue: &blue, alpha: &alpha) {
+    return (0.299 * red) + (0.587 * green) + (0.114 * blue)
+  }
+
+  var white: CGFloat = 0.0
+  if color.getWhite(&white, alpha: &alpha) {
+    return white
+  }
+
+  return 0.5
+}
+
+private func resolvedIncomingVoiceButtonStyle(for appearance: ChatListAppearance)
+  -> (fill: UIColor, accent: UIColor)
+{
+  let accent = appearance.bubbleThemColor.withAlphaComponent(0.98)
+  let fill: UIColor =
+    colorLuminance(appearance.bubbleThemColor) > 0.72
+    ? UIColor(white: 0.08, alpha: 0.16)
+    : UIColor(white: 1.0, alpha: 0.90)
+  return (fill, accent)
+}
+
 private func formatBubbleDuration(seconds: Double?) -> String {
   guard let seconds, seconds.isFinite, seconds > 0 else {
     return "0:00"
@@ -740,155 +768,7 @@ private func bubbleDisplayAttributedString(
   return parseAgentMarkdown(text: t, font: font, textColor: textColor)
 }
 
-private final class AgentStreamingLabel: UILabel {
-  private static let revealInterval: CFTimeInterval = 0.01
-  private static let tokenRegex = try! NSRegularExpression(pattern: "\\S+|\\s+")
-
-  private var fullAttributedValue: NSAttributedString?
-  private var tokenRanges: [NSRange] = []
-  private var revealedTokenCount = 0
-  private var displayLink: CADisplayLink?
-  private var nextRevealTime: CFTimeInterval = 0
-
-  required init?(coder: NSCoder) {
-    return nil
-  }
-
-  override init(frame: CGRect) {
-    super.init(frame: frame)
-  }
-
-  deinit {
-    stopStreamingAnimation()
-  }
-
-  func applyAgentText(_ attributedText: NSAttributedString, isStreaming: Bool) {
-    let previousFullText = fullAttributedValue?.string ?? ""
-    let nextFullText = attributedText.string
-    let shouldContinueExistingAnimation =
-      isStreaming
-      && !previousFullText.isEmpty
-      && nextFullText.hasPrefix(previousFullText)
-
-    fullAttributedValue = attributedText
-    tokenRanges = Self.tokenize(nextFullText)
-
-    if !shouldContinueExistingAnimation {
-      revealedTokenCount = isStreaming ? 0 : tokenRanges.count
-      nextRevealTime = 0
-    }
-
-    revealedTokenCount = min(revealedTokenCount, tokenRanges.count)
-    applyVisibleTokenState()
-
-    if isStreaming {
-      startStreamingAnimation()
-    } else {
-      stopStreamingAnimation()
-    }
-  }
-
-  func resetStreamingState() {
-    stopStreamingAnimation()
-    fullAttributedValue = nil
-    tokenRanges = []
-    revealedTokenCount = 0
-    super.attributedText = nil
-  }
-
-  private func startStreamingAnimation() {
-    guard !tokenRanges.isEmpty else { return }
-    guard revealedTokenCount < tokenRanges.count else {
-      stopStreamingAnimation()
-      return
-    }
-    guard displayLink == nil else { return }
-    let link = CADisplayLink(target: self, selector: #selector(handleDisplayLink))
-    link.add(to: .main, forMode: .common)
-    displayLink = link
-  }
-
-  private func stopStreamingAnimation() {
-    displayLink?.invalidate()
-    displayLink = nil
-    nextRevealTime = 0
-  }
-
-  @objc private func handleDisplayLink() {
-    guard !tokenRanges.isEmpty else {
-      stopStreamingAnimation()
-      return
-    }
-
-    let now = CACurrentMediaTime()
-    if nextRevealTime <= 0 {
-      nextRevealTime = now
-    }
-
-    var didReveal = false
-    while revealedTokenCount < tokenRanges.count, now >= nextRevealTime {
-      revealedTokenCount += 1
-      nextRevealTime += Self.revealInterval
-      didReveal = true
-    }
-
-    if didReveal {
-      applyVisibleTokenState()
-    }
-
-    if revealedTokenCount >= tokenRanges.count {
-      stopStreamingAnimation()
-    }
-  }
-
-  private func applyVisibleTokenState() {
-    guard let fullAttributedValue else {
-      super.attributedText = nil
-      return
-    }
-
-    guard revealedTokenCount < tokenRanges.count else {
-      super.attributedText = fullAttributedValue
-      return
-    }
-
-    let mutable = NSMutableAttributedString(attributedString: fullAttributedValue)
-    for index in revealedTokenCount..<tokenRanges.count {
-      let range = tokenRanges[index]
-      guard range.location != NSNotFound, range.length > 0, range.location < mutable.length else {
-        continue
-      }
-
-      var appliedForeground = false
-      mutable.enumerateAttribute(.foregroundColor, in: range, options: []) { value, subrange, _ in
-        let baseColor = (value as? UIColor) ?? self.textColor ?? .white
-        mutable.addAttribute(
-          .foregroundColor,
-          value: baseColor.withAlphaComponent(0.0),
-          range: subrange
-        )
-        appliedForeground = true
-      }
-
-      if !appliedForeground {
-        let fallbackColor = (textColor ?? .white).withAlphaComponent(0.0)
-        mutable.addAttribute(.foregroundColor, value: fallbackColor, range: range)
-      }
-    }
-    super.attributedText = mutable
-  }
-
-  private static func tokenize(_ string: String) -> [NSRange] {
-    guard !string.isEmpty else { return [] }
-    let nsString = string as NSString
-    let fullRange = NSRange(location: 0, length: nsString.length)
-    let matches = tokenRegex.matches(in: string, range: fullRange).map(\.range)
-    if matches.isEmpty {
-      return [fullRange]
-    }
-    return matches
-  }
-}
+private typealias AgentStreamingLabel = ChatNativeStreamingTextLabel
 
 func measureMessageBubbleLayout(row: ChatListRow, rowWidth: CGFloat)
   -> ChatMessageBubbleLayoutMetrics
@@ -907,7 +787,7 @@ func measureMessageBubbleLayout(row: ChatListRow, rowWidth: CGFloat)
       let frac = CGFloat((Double(dur) - log(Double(max(2.0, dur)))) / 15.0)
       let minW = 100.0 + meta.total
       targetWidth = minW + max(0.0, min(1.0, frac)) * (maxContentWidth - minW)
-      mediaHeight = 50.0
+      mediaHeight = 60.0
     case .videoNote:
       targetWidth = 200.0
       mediaHeight = 200.0
@@ -962,11 +842,11 @@ func measureMessageBubbleLayout(row: ChatListRow, rowWidth: CGFloat)
         ? max(bubbleMinWidth, contentWidth)
         : max(bubbleMinWidth, contentWidth + (bubbleHorizontalPadding * 2.0))
       let topPad = isVoice ? 2.0 : bubbleTopPadding
-      let bottomPad = isVoice ? 4.0 : bubbleBottomPadding
+      let bottomPad = isVoice ? 7.0 : bubbleBottomPadding
       bubbleHeight =
         isFullBleed
         ? max(56.0, bodyHeight + reactionHeightOffset)
-        : max(48.0, bodyHeight + topPad + bottomPad + reactionHeightOffset)
+        : max(isVoice ? 66.0 : 48.0, bodyHeight + topPad + bottomPad + reactionHeightOffset)
     }
     return ChatMessageBubbleLayoutMetrics(
       bubbleWidth: bubbleWidth,
@@ -1105,6 +985,12 @@ final class BubbleUploadProgressView: UIView {
   private let trackLayer = CAShapeLayer()
   private let progressLayer = CAShapeLayer()
   private let iconView = UIImageView()
+  private let uploadProgressAnimationKey = "media.upload.progress"
+  private let uploadSpinAnimationKey = "media.upload.spin"
+  private let minimumUploadProgress: CGFloat = 0.027
+  private var isUploading = false
+  private var uploadProgress: CGFloat?
+  private var lastResolvedUploadProgress: CGFloat?
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -1155,13 +1041,71 @@ final class BubbleUploadProgressView: UIView {
     )
   }
 
-  func setProgress(_ progress: Double?) {
-    guard let progress, progress.isFinite else {
+  func setUploadState(isUploading: Bool, progress: Double?) {
+    let resolvedProgress: CGFloat?
+    if isUploading {
+      if let progress, progress.isFinite {
+        let normalizedProgress = max(minimumUploadProgress, min(1.0, progress))
+        lastResolvedUploadProgress = normalizedProgress
+        resolvedProgress = normalizedProgress
+      } else if let lastResolvedUploadProgress {
+        resolvedProgress = lastResolvedUploadProgress
+      } else {
+        lastResolvedUploadProgress = minimumUploadProgress
+        resolvedProgress = minimumUploadProgress
+      }
+    } else {
+      resolvedProgress = nil
+      lastResolvedUploadProgress = nil
+    }
+
+    if self.isUploading == isUploading, self.uploadProgress == resolvedProgress {
+      return
+    }
+
+    self.isUploading = isUploading
+    self.uploadProgress = resolvedProgress
+    updateUploadRingVisual()
+  }
+
+  private func updateUploadRingVisual() {
+    guard isUploading else {
+      progressLayer.removeAnimation(forKey: uploadProgressAnimationKey)
+      progressLayer.removeAnimation(forKey: uploadSpinAnimationKey)
+      progressLayer.strokeStart = 0.0
       progressLayer.strokeEnd = 0.0
       return
     }
-    let clamped = max(0.02, min(1.0, progress))
-    progressLayer.strokeEnd = CGFloat(clamped)
+
+    let targetProgress = max(
+      minimumUploadProgress,
+      min(1.0, uploadProgress ?? minimumUploadProgress)
+    )
+    let currentProgress = progressLayer.presentation()?.strokeEnd ?? progressLayer.strokeEnd
+
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    progressLayer.strokeStart = 0.0
+    progressLayer.strokeEnd = targetProgress
+    CATransaction.commit()
+
+    let progressAnimation = CABasicAnimation(keyPath: "strokeEnd")
+    progressAnimation.fromValue = currentProgress
+    progressAnimation.toValue = targetProgress
+    progressAnimation.duration = 0.2
+    progressAnimation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+    progressLayer.add(progressAnimation, forKey: uploadProgressAnimationKey)
+
+    if progressLayer.animation(forKey: uploadSpinAnimationKey) == nil {
+      let spin = CABasicAnimation(keyPath: "transform.rotation.z")
+      spin.fromValue = 0.0
+      spin.toValue = (2.0 * CGFloat.pi)
+      spin.duration = 1.57
+      spin.repeatCount = .infinity
+      spin.timingFunction = CAMediaTimingFunction(name: .linear)
+      spin.isRemovedOnCompletion = true
+      progressLayer.add(spin, forKey: uploadSpinAnimationKey)
+    }
   }
 }
 
@@ -1170,10 +1114,13 @@ final class VoicePlayProgressView: UIView {
   private let fillView = UIView()
   private let iconView = UIImageView()
   private let ringProgressLayer = CAShapeLayer()
+  private let uploadProgressAnimationKey = "voice.upload.progress"
   private var iconTintColor = UIColor.systemBlue
   private var isUploading = false
   private var uploadProgress: CGFloat?
+  private var lastResolvedUploadProgress: CGFloat?
   private let uploadSpinAnimationKey = "voice.upload.spin"
+  private let minimumUploadProgress: CGFloat = 0.027
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -1231,10 +1178,10 @@ final class VoicePlayProgressView: UIView {
     ringProgressLayer.path = ringPath.cgPath
 
     iconView.frame = CGRect(
-      x: floor((bounds.width - 18.0) * 0.5),
-      y: floor((bounds.height - 18.0) * 0.5),
-      width: 18.0,
-      height: 18.0
+      x: floor((bounds.width - 20.0) * 0.5),
+      y: floor((bounds.height - 20.0) * 0.5),
+      width: 20.0,
+      height: 20.0
     )
   }
 
@@ -1251,11 +1198,12 @@ final class VoicePlayProgressView: UIView {
 
   func setPlaybackState(isPlaying: Bool, progress: CGFloat, level: CGFloat = 0.0) {
     guard !isUploading else { return }
+    ringProgressLayer.removeAnimation(forKey: uploadProgressAnimationKey)
     ringProgressLayer.removeAnimation(forKey: uploadSpinAnimationKey)
     ringProgressLayer.strokeStart = 0.0
     ringProgressLayer.strokeEnd = 0.0 // Never show ring for playback
     let symbol = isPlaying ? "pause.fill" : "play.fill"
-    let config = UIImage.SymbolConfiguration(pointSize: 17, weight: .bold)
+    let config = UIImage.SymbolConfiguration(pointSize: 18, weight: .bold)
     iconView.image = UIImage(systemName: symbol, withConfiguration: config)
     iconView.tintColor = iconTintColor
 
@@ -1268,59 +1216,63 @@ final class VoicePlayProgressView: UIView {
   }
 
   func setUploadState(isUploading: Bool, progress: CGFloat?) {
-    let normalizedProgress: CGFloat?
-    if let progress, progress.isFinite {
-      normalizedProgress = max(0.0, min(1.0, progress))
+    let resolvedProgress: CGFloat?
+    if isUploading {
+      if let progress, progress.isFinite {
+        let normalizedProgress = max(minimumUploadProgress, min(1.0, progress))
+        lastResolvedUploadProgress = normalizedProgress
+        resolvedProgress = normalizedProgress
+      } else if let lastResolvedUploadProgress {
+        resolvedProgress = lastResolvedUploadProgress
+      } else {
+        lastResolvedUploadProgress = minimumUploadProgress
+        resolvedProgress = minimumUploadProgress
+      }
     } else {
-      normalizedProgress = nil
+      resolvedProgress = nil
+      lastResolvedUploadProgress = nil
     }
-    if self.isUploading == isUploading, self.uploadProgress == normalizedProgress {
+    if self.isUploading == isUploading, self.uploadProgress == resolvedProgress {
       return
     }
     self.isUploading = isUploading
-    self.uploadProgress = normalizedProgress
+    self.uploadProgress = resolvedProgress
     updateUploadRingVisual()
   }
 
   private func updateUploadRingVisual() {
     guard isUploading else {
+      ringProgressLayer.removeAnimation(forKey: uploadProgressAnimationKey)
       ringProgressLayer.removeAnimation(forKey: uploadSpinAnimationKey)
       ringProgressLayer.strokeStart = 0.0
       ringProgressLayer.strokeEnd = 0.0
       return
     }
-    let config = UIImage.SymbolConfiguration(pointSize: 15, weight: .bold)
+    let config = UIImage.SymbolConfiguration(pointSize: 16, weight: .bold)
     iconView.image = UIImage(systemName: "xmark", withConfiguration: config)
     iconView.tintColor = iconTintColor
 
-    if let uploadProgress {
-      ringProgressLayer.removeAnimation(forKey: uploadSpinAnimationKey)
-      // Smooth determinate progress
-      let targetProgress = max(0.04, uploadProgress)
-      let currentProgress = ringProgressLayer.presentation()?.strokeEnd ?? ringProgressLayer.strokeEnd
+    let targetProgress = max(minimumUploadProgress, min(1.0, uploadProgress ?? minimumUploadProgress))
+    let currentProgress = ringProgressLayer.presentation()?.strokeEnd ?? ringProgressLayer.strokeEnd
 
-      CATransaction.begin()
-      CATransaction.setDisableActions(true)
-      ringProgressLayer.strokeStart = 0.0
-      ringProgressLayer.strokeEnd = targetProgress
-      CATransaction.commit()
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    ringProgressLayer.strokeStart = 0.0
+    ringProgressLayer.strokeEnd = targetProgress
+    CATransaction.commit()
 
-      let anim = CABasicAnimation(keyPath: "strokeEnd")
-      anim.fromValue = currentProgress
-      anim.toValue = targetProgress
-      anim.duration = 0.15
-      ringProgressLayer.add(anim, forKey: "stroke_fill")
-      return
-    }
+    let progressAnimation = CABasicAnimation(keyPath: "strokeEnd")
+    progressAnimation.fromValue = currentProgress
+    progressAnimation.toValue = targetProgress
+    progressAnimation.duration = 0.2
+    progressAnimation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+    ringProgressLayer.add(progressAnimation, forKey: uploadProgressAnimationKey)
 
-    // Indeterminate ring until concrete upload progress exists.
-    ringProgressLayer.strokeStart = 0.08
-    ringProgressLayer.strokeEnd = 0.34
     if ringProgressLayer.animation(forKey: uploadSpinAnimationKey) == nil {
       let spin = CABasicAnimation(keyPath: "transform.rotation.z")
       spin.fromValue = 0.0
       spin.toValue = (2.0 * CGFloat.pi)
-      spin.duration = 0.95
+      spin.duration = 1.57
       spin.repeatCount = .infinity
       spin.timingFunction = CAMediaTimingFunction(name: .linear)
       spin.isRemovedOnCompletion = true
@@ -2049,6 +2001,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
     mediaProgressSpinner.color = UIColor(white: 1.0, alpha: 0.85)
     mediaProgressSpinner.hidesWhenStopped = true
+    mediaProgressSpinner.isHidden = true
 
     inlineAttachmentView.layer.cornerCurve = .continuous
     inlineAttachmentView.layer.cornerRadius = 12.0
@@ -2137,14 +2090,22 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     dayLabel.layer.borderWidth = 0.5
     dayLabel.layer.cornerRadius = 12.0
     dayLabel.clipsToBounds = true
+    let isCurrentRowMe = row?.isMe == true
+    let currentTextColor = isCurrentRowMe ? appearance.textColorMe : appearance.textColorThem
+    let incomingVoiceStyle = resolvedIncomingVoiceButtonStyle(for: appearance)
     mediaWaveformView.applyColors(
-      active: appearance.textColorThem.withAlphaComponent(0.95),
-      inactive: appearance.textColorThem.withAlphaComponent(0.26)
+      active: currentTextColor.withAlphaComponent(0.95),
+      inactive: currentTextColor.withAlphaComponent(0.34)
     )
     mediaVoiceButtonView.applyStyle(
-      fillColor: UIColor(white: 1.0, alpha: 0.96),
-      iconTint: appearance.bubbleMeGradient.first ?? UIColor.systemBlue,
-      ringTint: appearance.textColorThem.withAlphaComponent(0.68))
+      fillColor: isCurrentRowMe ? UIColor(white: 1.0, alpha: 0.96) : incomingVoiceStyle.fill,
+      iconTint: isCurrentRowMe
+        ? (appearance.bubbleMeGradient.first ?? UIColor.systemBlue)
+        : incomingVoiceStyle.accent,
+      ringTint: isCurrentRowMe
+        ? currentTextColor.withAlphaComponent(0.74)
+        : incomingVoiceStyle.accent.withAlphaComponent(0.74)
+    )
     setNeedsLayout()
   }
 
@@ -2191,7 +2152,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       let resolveTextColor = row.isMe ? appearance.textColorMe : appearance.textColorThem
       let displayText = bubbleDisplayAttributedString(
         for: row, font: messageFont, textColor: resolveTextColor)
-      messageLabel.applyAgentText(
+      messageLabel.applyStreamingText(
         displayText,
         isStreaming: row.isAgentMessage && row.isStreamingText && row.messageType != "typing"
       )
@@ -2317,7 +2278,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     isGhostHidden = false
     mediaProgressSpinner.stopAnimating()
     mediaProgressOverlayView.isHidden = true
-    mediaProgressRingView.setProgress(nil)
+    mediaProgressRingView.setUploadState(isUploading: false, progress: nil)
     reactionPillView.isHidden = true
     externalVoiceMessageId = nil
     externalVoiceIsPlaying = false
@@ -2468,10 +2429,13 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
             height: metrics.mediaHeight
           ))
       } else {
+        let mediaTopInset: CGFloat = row.visualKind == .voice ? 2.0 : bubbleTopPadding
+        let mediaLeftInset: CGFloat =
+          row.visualKind == .voice ? max(6.0, bubbleHorizontalPadding - 2.0) : bubbleHorizontalPadding
         mediaFrame = pixelAlignedRect(
           CGRect(
-            x: bubbleFrame.minX + bubbleHorizontalPadding,
-            y: bubbleFrame.minY + bubbleTopPadding,
+            x: bubbleFrame.minX + mediaLeftInset,
+            y: bubbleFrame.minY + mediaTopInset,
             width: metrics.contentWidth,
             height: metrics.mediaHeight
           ))
@@ -2501,7 +2465,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       if isFullBleed {
         metaY = bubbleFrame.maxY - bubbleMetaHeight - 8
       } else if row.visualKind == .voice {
-        metaY = mediaFrame.maxY - bubbleMetaHeight + 2.0
+        metaY = bubbleFrame.maxY - bubbleMetaHeight - 3.0
       } else {
         metaY = mediaFrame.maxY + metaTopSpacing
       }
@@ -2695,7 +2659,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
     guard row.visualKind != .text else {
       mediaProgressOverlayView.isHidden = true
-      mediaProgressRingView.setProgress(nil)
+      mediaProgressRingView.setUploadState(isUploading: false, progress: nil)
       mediaProgressSpinner.stopAnimating()
       return
     }
@@ -2715,12 +2679,15 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         active: textColor.withAlphaComponent(0.95),
         inactive: textColor.withAlphaComponent(0.34)
       )
+      let incomingVoiceStyle = resolvedIncomingVoiceButtonStyle(for: appearance)
       mediaVoiceButtonView.applyStyle(
-        fillColor: UIColor(white: 1.0, alpha: row.isMe ? 0.96 : 0.90),
+        fillColor: row.isMe ? UIColor(white: 1.0, alpha: 0.96) : incomingVoiceStyle.fill,
         iconTint: row.isMe
           ? (appearance.bubbleMeGradient.first ?? UIColor.systemBlue)
-          : textColor.withAlphaComponent(0.95),
-        ringTint: textColor.withAlphaComponent(0.74)
+          : incomingVoiceStyle.accent,
+        ringTint: row.isMe
+          ? textColor.withAlphaComponent(0.74)
+          : incomingVoiceStyle.accent.withAlphaComponent(0.74)
       )
       let uploadProgress: CGFloat?
       if let value = row.uploadProgress, value.isFinite {
@@ -2936,26 +2903,19 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
     if row.visualKind == .voice {
       mediaProgressOverlayView.isHidden = true
-      mediaProgressRingView.setProgress(nil)
+      mediaProgressRingView.setUploadState(isUploading: false, progress: nil)
       mediaProgressSpinner.stopAnimating()
       return
     }
 
     if row.shouldShowUploadOverlay {
       mediaProgressOverlayView.isHidden = false
-      let progress = row.uploadProgress
-      if let progress, progress > 0.001 {
-        mediaProgressRingView.isHidden = false
-        mediaProgressRingView.setProgress(progress)
-        mediaProgressSpinner.stopAnimating()
-      } else {
-        mediaProgressRingView.isHidden = true
-        mediaProgressRingView.setProgress(nil)
-        mediaProgressSpinner.startAnimating()
-      }
+      mediaProgressRingView.isHidden = false
+      mediaProgressRingView.setUploadState(isUploading: true, progress: row.uploadProgress)
+      mediaProgressSpinner.stopAnimating()
     } else {
       mediaProgressOverlayView.isHidden = true
-      mediaProgressRingView.setProgress(nil)
+      mediaProgressRingView.setUploadState(isUploading: false, progress: nil)
       mediaProgressSpinner.stopAnimating()
     }
 
@@ -3037,8 +2997,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
     switch row.visualKind {
     case .voice:
-      let insetX: CGFloat = 6.0
-      let buttonSize: CGFloat = 50.0  // Button view size, inner rendered symbol will be smaller
+      let insetX: CGFloat = 2.0
+      let buttonSize: CGFloat = 52.0  // Button view size, inner rendered symbol will be smaller
       mediaVoiceButtonView.frame = CGRect(
         x: insetX,
         y: floor((height - buttonSize) * 0.5),
@@ -3047,7 +3007,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       )
       let textStartX = mediaVoiceButtonView.frame.maxX + 4.0
       let rightInset: CGFloat = 8.0
-      let waveY: CGFloat = 7.0
+      let waveY: CGFloat = 10.0
       let waveHeight: CGFloat = 20.0
       mediaDetailLabel.frame = CGRect(
         x: textStartX,

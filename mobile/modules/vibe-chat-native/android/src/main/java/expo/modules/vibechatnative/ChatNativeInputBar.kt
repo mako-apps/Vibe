@@ -44,7 +44,6 @@ import expo.modules.vibechatnative.R
 import java.io.File
 import java.util.UUID
 import kotlin.math.abs
-import kotlin.math.log10
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
@@ -945,7 +944,7 @@ internal class ChatNativeInputBar(
 
   private fun supportsBuilderSlashCommands(): Boolean {
     val hint = input.hint?.toString()?.lowercase().orEmpty()
-    return hint.contains("@vibeagent")
+    return hint.contains("@vibeagent") || hint.contains("/command") || hint.contains("type /")
   }
 
   private fun resolveReadyBannerAction(text: String): ReadyBannerAction {
@@ -1282,7 +1281,7 @@ internal class ChatNativeInputBar(
         val blinkOn = (elapsedMs / 500L) % 2L == 0L
         recordingDot.alpha = if (blinkOn) 1f else 0.24f
 
-        uiHandler.postDelayed(this, 50L)
+        uiHandler.postDelayed(this, 100L)
       }
     }
     vadTicker = ticker
@@ -1348,7 +1347,7 @@ internal class ChatNativeInputBar(
       listener?.onVoiceRecorded(
         Uri.fromFile(outputFile).toString(),
         durationMs.toDouble() / 1000.0,
-        buildWaveform(recordingAmplitudes, 28),
+        buildWaveform(recordingAmplitudes, 100),
       )
     } else {
       outputFile?.delete()
@@ -1365,74 +1364,45 @@ internal class ChatNativeInputBar(
 
   private fun buildWaveform(samples: List<Int>, bins: Int): List<Float> {
     if (samples.isEmpty() || bins <= 0) return emptyList()
-    val normalized =
+    val silenceThreshold = 0.02f
+    val sanitized =
       samples
         .map(::normalizeRecordingAmplitude)
         .filter { it.isFinite() }
-    if (normalized.isEmpty()) return List(bins) { 0.18f }
-
-    val stretched = stretchWaveform(normalized)
-    if (stretched.size == bins) {
-      return smoothWaveform(stretched)
-    }
-
-    val bucketSize = stretched.size.toFloat() / bins.toFloat()
-    val out = ArrayList<Float>(bins)
-    for (index in 0 until bins) {
-      val start = kotlin.math.floor(index * bucketSize).toInt()
-      val clampedStart = start.coerceIn(0, stretched.lastIndex)
-      val end =
-        min(
-          stretched.size,
-          kotlin.math.floor((index + 1) * bucketSize).toInt().coerceAtLeast(clampedStart + 1),
-        )
-      if (start < end) {
-        var sum = 0f
-        var peak = 0f
-        for (i in start until end) {
-          val value = stretched[i]
-          sum += value
-          if (value > peak) peak = value
+        .map { sample ->
+          if (sample <= silenceThreshold) {
+            0f
+          } else {
+            ((sample - silenceThreshold) / (1f - silenceThreshold)).coerceIn(0f, 1f)
+          }
         }
-        val avg = sum / (end - start).toFloat()
-        out.add(max(0.12f, ((avg * 0.72f) + (peak * 0.28f)).coerceIn(0f, 1f)))
-      } else {
-        out.add(max(0.12f, stretched[clampedStart]))
-      }
+    if (sanitized.isEmpty()) return List(bins) { 0f }
+
+    val peakSamples = FloatArray(bins)
+    val sourceCount = sanitized.size
+    for (index in sanitized.indices) {
+      val bucketIndex = min(bins - 1, (index * bins) / max(1, sourceCount))
+      peakSamples[bucketIndex] = max(peakSamples[bucketIndex], sanitized[index])
     }
-    return smoothWaveform(out)
+
+    val averagePeak = peakSamples.sum() / bins.toFloat()
+    val normalizationPeak = max(0.04f, averagePeak * 1.8f)
+    val result =
+      peakSamples.map { sample ->
+        (min(sample, normalizationPeak) / normalizationPeak).coerceIn(0f, 1f)
+      }
+    return if (result.all { it <= 0.003f }) {
+      List(bins) { 0f }
+    } else {
+      result
+    }
   }
 
   private fun normalizeRecordingAmplitude(amplitude: Int): Float {
-    val clampedAmplitude = amplitude.coerceAtLeast(1)
-    val ratio = (clampedAmplitude / 32767f).coerceIn(1f / 32767f, 1f)
-    val minDb = -45.0
-    val db = 20.0 * log10(ratio.toDouble())
-    return (((db - minDb) / -minDb).toFloat()).coerceIn(0f, 1f)
-  }
-
-  private fun stretchWaveform(values: List<Float>): List<Float> {
-    if (values.isEmpty()) return emptyList()
-    val sorted = values.sorted()
-    val lowIndex = ((sorted.lastIndex) * 0.12f).roundToInt().coerceIn(0, sorted.lastIndex)
-    val highIndex = ((sorted.lastIndex) * 0.92f).roundToInt().coerceIn(lowIndex, sorted.lastIndex)
-    val floor = sorted[lowIndex]
-    val ceiling = max(sorted[highIndex], floor + 0.08f)
-    val range = ceiling - floor
-    return values.map { value ->
-      val normalized = ((value - floor) / range).coerceIn(0f, 1f)
-      max(0.12f, normalized.pow(0.82f))
-    }
-  }
-
-  private fun smoothWaveform(values: List<Float>): List<Float> {
-    if (values.size <= 2) return values.map { it.coerceIn(0.12f, 1f) }
-    return values.indices.map { index ->
-      val left = values[max(0, index - 1)]
-      val center = values[index]
-      val right = values[min(values.size - 1, index + 1)]
-      ((left * 0.2f) + (center * 0.6f) + (right * 0.2f)).coerceIn(0.12f, 1f)
-    }
+    val ratio = (amplitude.coerceAtLeast(0) / 32767f).coerceIn(0f, 1f)
+    val silenceFloor = 0.015f
+    val normalized = ((ratio - silenceFloor) / (1f - silenceFloor)).coerceIn(0f, 1f)
+    return normalized.pow(0.72f)
   }
 
   private fun circleDrawable(

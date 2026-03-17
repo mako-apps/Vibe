@@ -2225,7 +2225,10 @@ final class ChatInputBar: UIView {
   }
 
   private var supportsBuilderSlashCommands: Bool {
-    placeholder.lowercased().contains("@vibeagent")
+    let normalizedPlaceholder = placeholder.lowercased()
+    return normalizedPlaceholder.contains("@vibeagent")
+      || normalizedPlaceholder.contains("/command")
+      || normalizedPlaceholder.contains("type /")
   }
 
   private func updateMentionBorderGlow(pillFrame: CGRect) {

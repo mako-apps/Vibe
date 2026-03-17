@@ -51,6 +51,9 @@ private val chatEngineOaepSpec = OAEPParameterSpec(
   MGF1ParameterSpec.SHA256,
   PSource.PSpecified.DEFAULT,
 )
+private const val minimumNativeUploadProgress = 0.027f
+private const val uploadProgressFrameIntervalMs = 33L
+private const val uploadProgressStep = 0.01f
 
 private fun chatEngineDecodePem(pem: String): ByteArray {
   val sanitized = pem
@@ -1311,7 +1314,7 @@ internal object ChatEngine {
               "native-media-upload-start",
               mapOf("chatId" to chatId, "messageId" to messageId, "type" to type),
             )
-            setLiveMessageUploadProgressLocked(chatId, messageId, 0.08f)
+            setLiveMessageUploadProgressLocked(chatId, messageId, minimumNativeUploadProgress)
           }
 
           val uploadResult = uploadLocalMediaLocked(
@@ -1325,7 +1328,11 @@ internal object ChatEngine {
           ) { p ->
             synchronized(lock) {
               if (canceledOutboundMessageIds.contains(messageId)) return@synchronized
-              setLiveMessageUploadProgressLocked(chatId, messageId, p * 0.90f)
+              setLiveMessageUploadProgressLocked(
+                chatId,
+                messageId,
+                p.coerceIn(minimumNativeUploadProgress, 1f),
+              )
             }
           }
 
@@ -1365,7 +1372,7 @@ internal object ChatEngine {
                 if (finalFileSize != null) optimisticMessage["fileSize"] = finalFileSize
                 optimisticRow["message"] = optimisticMessage
                 upsertLiveMessageRowLocked(chatId, messageId, optimisticRow)
-                setLiveMessageUploadProgressLocked(chatId, messageId, 0.96f)
+                setLiveMessageUploadProgressLocked(chatId, messageId, 1.0f)
                 appendJournalLocked(
                   "native-media-upload-ok",
                   mapOf("chatId" to chatId, "messageId" to messageId, "url" to finalMediaUrl),
@@ -3178,14 +3185,7 @@ internal object ChatEngine {
     }
 
   private fun parseWaveformArray(value: Any?): List<Double>? {
-    val rawList: List<*> = when (value) {
-      is JSONArray -> (0 until value.length()).map { value.opt(it) }
-      is List<*> -> value
-      else -> return null
-    }
-    val mapped = rawList.mapNotNull { parseDoubleValue(it) }
-      .map { it.coerceIn(0.0, 1.0) }
-    return mapped.ifEmpty { null }
+    return parseNormalizedWaveform(value)?.map(Float::toDouble)
   }
 
   private fun parseDecryptedMessagePayload(raw: String): Map<String, Any?> {
@@ -3312,18 +3312,41 @@ internal object ChatEngine {
     liveMessageRowsByChat[chatId]?.put(messageId, nextRow)
   }
 
-  private fun setLiveMessageUploadProgressLocked(chatId: String, messageId: String, progress: Float?) {
-    val row = liveMessageRowsByChat[chatId]?.get(messageId) ?: return
+  private fun setLiveMessageUploadProgressLocked(chatId: String, messageId: String, progress: Float?): Boolean {
+    val row = liveMessageRowsByChat[chatId]?.get(messageId) ?: return false
     val nextRow = LinkedHashMap(row)
-    val msg = (nextRow["message"] as? Map<*, *>)?.let { LinkedHashMap(it) } ?: return
-    if (progress != null && progress.isFinite()) {
-      msg["uploadProgress"] = progress.coerceIn(0f, 1f)
+    val msg = (nextRow["message"] as? Map<*, *>)?.let { LinkedHashMap(it) } ?: return false
+    val previousProgress =
+      when (val existing = msg["uploadProgress"]) {
+        is Number -> existing.toFloat().coerceIn(0f, 1f)
+        is String -> existing.toFloatOrNull()?.coerceIn(0f, 1f)
+        else -> null
+      }
+    val normalizedProgress =
+      if (progress != null && progress.isFinite()) {
+        progress.coerceIn(0f, 1f)
+      } else {
+        null
+      }
+    if (previousProgress == null && normalizedProgress == null) {
+      return false
+    }
+    if (
+      previousProgress != null &&
+        normalizedProgress != null &&
+        kotlin.math.abs(previousProgress - normalizedProgress) < 0.001f
+    ) {
+      return false
+    }
+    if (normalizedProgress != null) {
+      msg["uploadProgress"] = normalizedProgress
     } else {
       msg.remove("uploadProgress")
     }
     nextRow["message"] = msg
     liveMessageRowsByChat[chatId]?.put(messageId, nextRow)
     emitChangeLocked("chatMessageChanged", chatId, messageId)
+    return true
   }
 
   private fun markLiveMessageDeletedLocked(chatId: String, messageId: String) {
@@ -3859,13 +3882,22 @@ internal object ChatEngine {
           private var bytesWritten = 0L
           private val totalLength = contentLength()
           private var lastEmitMs = 0L
+          private var lastEmitProgress = 0f
           override fun write(source: okio.Buffer, byteCount: Long) {
             super.write(source, byteCount)
             bytesWritten += byteCount
-            val now = System.currentTimeMillis()
-            if (totalLength > 0 && now - lastEmitMs > 50) {
-              lastEmitMs = now
-              onProgress?.invoke(bytesWritten.toFloat() / totalLength.toFloat())
+            if (totalLength > 0) {
+              val progress = (bytesWritten.toFloat() / totalLength.toFloat()).coerceIn(0f, 1f)
+              val now = System.currentTimeMillis()
+              if (
+                progress >= 1f ||
+                  (progress - lastEmitProgress) >= uploadProgressStep ||
+                  (now - lastEmitMs) >= uploadProgressFrameIntervalMs
+              ) {
+                lastEmitMs = now
+                lastEmitProgress = progress
+                onProgress?.invoke(progress)
+              }
             }
           }
         }

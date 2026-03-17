@@ -1459,20 +1459,26 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
       !(row.fileName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
     let isFileLikeType = row.messageType == "file"
     let isVoiceVisual = row.visualKind == .voice
+    let isUploadCancelableVisual =
+      row.visualKind == .voice
+      || row.visualKind == .media
+      || row.visualKind == .video
+      || row.visualKind == .videoNote
+      || row.visualKind == .sticker
     let lowerMediaURL = mediaURL.lowercased()
     let isAgentDocURL =
       lowerMediaURL.contains("/uploads/agent-docs/")
       || lowerMediaURL.contains("/api/agent/document/")
-    if isVoiceVisual {
-      if row.shouldShowUploadOverlay {
-        if let messageId = row.messageId, !messageId.isEmpty {
-          onNativeEvent([
-            "type": "cancelOutgoingUpload",
-            "messageId": messageId,
-          ])
-        }
-        return
+    if isUploadCancelableVisual, row.shouldShowUploadOverlay {
+      if let messageId = row.messageId, !messageId.isEmpty {
+        onNativeEvent([
+          "type": "cancelOutgoingUpload",
+          "messageId": messageId,
+        ])
       }
+      return
+    }
+    if isVoiceVisual {
       if let cell = collectionView.cellForItem(at: indexPath) as? ChatListCell {
         VoiceBubblePlaybackCoordinator.shared.toggle(
           cell: cell, messageId: row.messageId, mediaURL: mediaURL

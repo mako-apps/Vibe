@@ -1494,7 +1494,7 @@ final class ChatEngine {
                 "type": type,
               ])
             self.setLiveMessageUploadProgressLocked(
-              chatId: chatId, messageId: messageId, progress: 0.08)
+              chatId: chatId, messageId: messageId, progress: 0.027)
             self.postChangeLocked(
               reason: "chatMessageChanged",
               userInfo: ["chatId": chatId, "messageId": messageId, "action": "updated"]
@@ -1510,14 +1510,18 @@ final class ChatEngine {
             apiBase: apiBase,
             messageId: messageId
           ) { progress in
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self.queue.async { [weak self] in
               guard let self else { return }
-              self.queue.sync {
-                if self.canceledOutboundMessageIds.contains(messageId) { return }
-                self.setLiveMessageUploadProgressLocked(
-                  chatId: chatId,
-                  messageId: messageId,
-                  progress: CGFloat(progress * 0.90)
+              if self.canceledOutboundMessageIds.contains(messageId) { return }
+              let scaledProgress = max(0.027, min(1.0, Double(progress)))
+              if self.setLiveMessageUploadProgressLocked(
+                chatId: chatId,
+                messageId: messageId,
+                progress: scaledProgress
+              ) {
+                self.postChangeLocked(
+                  reason: "chatMessageChanged",
+                  userInfo: ["chatId": chatId, "messageId": messageId, "action": "updated"]
                 )
               }
             }
@@ -1562,7 +1566,7 @@ final class ChatEngine {
                 type
               )
               self.setLiveMessageUploadProgressLocked(
-                chatId: chatId, messageId: messageId, progress: 0.96)
+                chatId: chatId, messageId: messageId, progress: 1.0)
               self.postChangeLocked(
                 reason: "chatMessageChanged",
                 userInfo: ["chatId": chatId, "messageId": messageId, "action": "updated"]
@@ -4177,14 +4181,46 @@ final class ChatEngine {
     }
   }
 
+  @discardableResult
   private func setLiveMessageUploadProgressLocked(
     chatId: String,
     messageId: String,
     progress: Double?
-  ) {
+  ) -> Bool {
+    let normalizedProgress: Double?
+    if let progress, progress.isFinite {
+      normalizedProgress = max(0.0, min(1.0, progress))
+    } else {
+      normalizedProgress = nil
+    }
+
+    let existingProgress: Double? = {
+      guard let perChat = liveMessageRowsByChat[chatId],
+        let row = perChat[messageId],
+        let message = row["message"] as? [String: Any]
+      else {
+        return nil
+      }
+      return parseDoubleValue(message["uploadProgress"])
+        ?? parseDoubleValue((message["metadata"] as? [String: Any])?["uploadProgress"])
+    }()
+
+    let isUnchanged: Bool = {
+      switch (existingProgress, normalizedProgress) {
+      case (nil, nil):
+        return true
+      case let (lhs?, rhs?):
+        return abs(lhs - rhs) < 0.004
+      default:
+        return false
+      }
+    }()
+    if isUnchanged {
+      return false
+    }
+
     mutateLiveMessagePayloadLocked(chatId: chatId, messageId: messageId) { message in
-      if let progress, progress.isFinite {
-        let clamped = max(0.0, min(1.0, progress))
+      if let clamped = normalizedProgress {
         message["uploadProgress"] = clamped
         var metadata = (message["metadata"] as? [String: Any]) ?? [:]
         metadata["uploadProgress"] = clamped
@@ -4201,6 +4237,7 @@ final class ChatEngine {
         }
       }
     }
+    return true
   }
 
   private func markLiveMessageDeletedLocked(chatId: String, messageId: String) {
@@ -5076,16 +5113,24 @@ final class ChatEngine {
     var onCompletion: ((Data?, HTTPURLResponse?, Error?) -> Void)?
     var responseData = Data()
     private var lastEmitTime: TimeInterval = 0
+    private var lastEmittedProgress: Float = 0
 
     func urlSession(
       _ session: URLSession, task: URLSessionTask, didSendBodyData bytesSent: Int64,
       totalBytesSent: Int64, totalBytesExpectedToSend: Int64
     ) {
       guard totalBytesExpectedToSend > 0 else { return }
+      let progress = Float(totalBytesSent) / Float(totalBytesExpectedToSend)
       let now = CACurrentMediaTime()
-      if now - lastEmitTime > 0.05 {
+      let shouldEmit =
+        progress >= 0.999
+        || progress <= 0.0
+        || (progress - lastEmittedProgress) >= 0.01
+        || (now - lastEmitTime) >= (1.0 / 30.0)
+      if shouldEmit {
         lastEmitTime = now
-        onProgress?(Float(totalBytesSent) / Float(totalBytesExpectedToSend))
+        lastEmittedProgress = progress
+        onProgress?(progress)
       }
     }
 

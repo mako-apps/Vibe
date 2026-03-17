@@ -232,127 +232,21 @@ private final class ChatProfileListRowCell: UITableViewCell {
   }
 }
 
-private final class ChatProfileFilterButton: UIControl {
-  private let chromeView = UIVisualEffectView(effect: nil)
-  private let highlightView = UIView()
-  private let titleLabel = UILabel()
-
-  private var isDark = false
-  var isActive: Bool = false {
-    didSet {
-      applyAppearance(animated: true)
-    }
-  }
-
-  override init(frame: CGRect) {
-    super.init(frame: frame)
-    setupView()
-  }
-
-  required init?(coder: NSCoder) {
-    super.init(coder: coder)
-    setupView()
-  }
-
-  override var isHighlighted: Bool {
-    didSet {
-      UIView.animate(withDuration: 0.16) {
-        self.transform = self.isHighlighted ? CGAffineTransform(scaleX: 0.985, y: 0.985) : .identity
-        self.highlightView.alpha = self.isHighlighted ? 1.0 : 0.0
-      }
-    }
-  }
-
-  func setTitle(_ title: String) {
-    titleLabel.text = title
-  }
-
-  func applyTheme(isDark: Bool) {
-    self.isDark = isDark
-    let blurStyle: UIBlurEffect.Style =
-      isDark ? .systemChromeMaterialDark : .systemChromeMaterialLight
-    chromeView.effect = UIBlurEffect(style: blurStyle)
-    applyAppearance(animated: false)
-  }
-
-  private func setupView() {
-    chromeView.translatesAutoresizingMaskIntoConstraints = false
-    chromeView.layer.cornerRadius = 22.0
-    chromeView.layer.cornerCurve = .continuous
-    chromeView.layer.masksToBounds = true
-    addSubview(chromeView)
-
-    highlightView.translatesAutoresizingMaskIntoConstraints = false
-    highlightView.alpha = 0.0
-    highlightView.isUserInteractionEnabled = false
-    chromeView.contentView.addSubview(highlightView)
-
-    titleLabel.translatesAutoresizingMaskIntoConstraints = false
-    titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
-    titleLabel.textAlignment = .center
-    titleLabel.adjustsFontSizeToFitWidth = true
-    titleLabel.minimumScaleFactor = 0.84
-    chromeView.contentView.addSubview(titleLabel)
-
-    NSLayoutConstraint.activate([
-      chromeView.leadingAnchor.constraint(equalTo: leadingAnchor),
-      chromeView.trailingAnchor.constraint(equalTo: trailingAnchor),
-      chromeView.topAnchor.constraint(equalTo: topAnchor),
-      chromeView.bottomAnchor.constraint(equalTo: bottomAnchor),
-
-      highlightView.leadingAnchor.constraint(equalTo: chromeView.contentView.leadingAnchor),
-      highlightView.trailingAnchor.constraint(equalTo: chromeView.contentView.trailingAnchor),
-      highlightView.topAnchor.constraint(equalTo: chromeView.contentView.topAnchor),
-      highlightView.bottomAnchor.constraint(equalTo: chromeView.contentView.bottomAnchor),
-
-      titleLabel.leadingAnchor.constraint(
-        equalTo: chromeView.contentView.leadingAnchor, constant: 14),
-      titleLabel.trailingAnchor.constraint(
-        equalTo: chromeView.contentView.trailingAnchor, constant: -14),
-      titleLabel.centerYAnchor.constraint(equalTo: chromeView.contentView.centerYAnchor),
-    ])
-  }
-
-  private func applyAppearance(animated: Bool) {
-    let activeTextColor =
-      isDark ? UIColor.white : UIColor(red: 22 / 255, green: 28 / 255, blue: 36 / 255, alpha: 1.0)
-    let inactiveTextColor = activeTextColor.withAlphaComponent(isDark ? 0.58 : 0.48)
-    let inactiveFill =
-      isDark ? UIColor.white.withAlphaComponent(0.06) : UIColor.white.withAlphaComponent(0.56)
-    let activeFill =
-      isDark ? UIColor.white.withAlphaComponent(0.12) : UIColor.white.withAlphaComponent(0.82)
-    let inactiveBorder =
-      isDark ? UIColor.white.withAlphaComponent(0.12) : UIColor.black.withAlphaComponent(0.06)
-    let activeBorder =
-      isDark ? UIColor.white.withAlphaComponent(0.18) : UIColor.black.withAlphaComponent(0.10)
-    let highlightColor =
-      isDark ? UIColor.white.withAlphaComponent(0.08) : UIColor.black.withAlphaComponent(0.04)
-
-    let updates = {
-      self.chromeView.contentView.backgroundColor = self.isActive ? activeFill : inactiveFill
-      self.chromeView.layer.borderWidth = 1.0
-      self.chromeView.layer.borderColor = (self.isActive ? activeBorder : inactiveBorder).cgColor
-      self.highlightView.backgroundColor = highlightColor
-      self.titleLabel.textColor = self.isActive ? activeTextColor : inactiveTextColor
-    }
-
-    if animated {
-      UIView.animate(withDuration: 0.2, animations: updates)
-    } else {
-      updates()
-    }
-  }
-}
-
 private final class ChatProfileTabStripView: UIView {
+  static let preferredHeight: CGFloat = 48.0
+
   var onSelect: ((ChatProfileTab) -> Void)?
 
+  private let chromeView = UIVisualEffectView(effect: nil)
+  private let chromeOverlayView = UIView()
   private let scrollView = UIScrollView()
   private let stackView = UIStackView()
-  private var buttons: [ChatProfileTab: ChatProfileFilterButton] = [:]
+  private let selectionView = UIView()
   private var currentTabs: [ChatProfileTab] = []
   private var activeTab: ChatProfileTab = .media
+  private var buttonsByTab: [ChatProfileTab: UIButton] = [:]
   private var isDark = false
+  private let selectionFeedback = UISelectionFeedbackGenerator()
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -366,24 +260,51 @@ private final class ChatProfileTabStripView: UIView {
 
   private func setup() {
     backgroundColor = .clear
+    clipsToBounds = false
 
-    scrollView.showsHorizontalScrollIndicator = false
-    scrollView.alwaysBounceHorizontal = true
+    chromeView.translatesAutoresizingMaskIntoConstraints = false
+    chromeView.clipsToBounds = true
+    chromeView.layer.cornerCurve = .continuous
+    addSubview(chromeView)
+
+    chromeOverlayView.translatesAutoresizingMaskIntoConstraints = false
+    chromeOverlayView.isUserInteractionEnabled = false
+    chromeView.contentView.addSubview(chromeOverlayView)
+
     scrollView.translatesAutoresizingMaskIntoConstraints = false
-    addSubview(scrollView)
+    scrollView.backgroundColor = .clear
+    scrollView.showsHorizontalScrollIndicator = false
+    scrollView.alwaysBounceHorizontal = false
+    scrollView.delaysContentTouches = false
+    scrollView.canCancelContentTouches = true
+    chromeView.contentView.addSubview(scrollView)
 
+    selectionView.isUserInteractionEnabled = false
+    selectionView.layer.cornerCurve = .continuous
+    scrollView.addSubview(selectionView)
+
+    stackView.translatesAutoresizingMaskIntoConstraints = false
     stackView.axis = .horizontal
-    stackView.spacing = 8.0
     stackView.alignment = .fill
     stackView.distribution = .fill
-    stackView.translatesAutoresizingMaskIntoConstraints = false
+    stackView.spacing = 6.0
     scrollView.addSubview(stackView)
 
     NSLayoutConstraint.activate([
-      scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
-      scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
-      scrollView.topAnchor.constraint(equalTo: topAnchor),
-      scrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
+      chromeView.leadingAnchor.constraint(equalTo: leadingAnchor),
+      chromeView.trailingAnchor.constraint(equalTo: trailingAnchor),
+      chromeView.topAnchor.constraint(equalTo: topAnchor),
+      chromeView.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+      chromeOverlayView.leadingAnchor.constraint(equalTo: chromeView.contentView.leadingAnchor),
+      chromeOverlayView.trailingAnchor.constraint(equalTo: chromeView.contentView.trailingAnchor),
+      chromeOverlayView.topAnchor.constraint(equalTo: chromeView.contentView.topAnchor),
+      chromeOverlayView.bottomAnchor.constraint(equalTo: chromeView.contentView.bottomAnchor),
+
+      scrollView.leadingAnchor.constraint(equalTo: chromeView.contentView.leadingAnchor, constant: 4.0),
+      scrollView.trailingAnchor.constraint(equalTo: chromeView.contentView.trailingAnchor, constant: -4.0),
+      scrollView.topAnchor.constraint(equalTo: chromeView.contentView.topAnchor, constant: 4.0),
+      scrollView.bottomAnchor.constraint(equalTo: chromeView.contentView.bottomAnchor, constant: -4.0),
 
       stackView.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor),
       stackView.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor),
@@ -391,11 +312,38 @@ private final class ChatProfileTabStripView: UIView {
       stackView.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor),
       stackView.heightAnchor.constraint(equalTo: scrollView.frameLayoutGuide.heightAnchor),
     ])
+
+    selectionFeedback.prepare()
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    chromeView.layer.cornerRadius = bounds.height * 0.5
+    updateSelectionFrame(animated: false)
   }
 
   func applyTheme(isDark: Bool) {
     self.isDark = isDark
-    buttons.values.forEach { $0.applyTheme(isDark: isDark) }
+    applyChrome()
+  }
+
+  private func applyChrome() {
+    let blurStyle: UIBlurEffect.Style =
+      isDark ? .systemChromeMaterialDark : .systemChromeMaterialLight
+
+    let primary = isDark ? UIColor(white: 0.95, alpha: 0.96) : UIColor(white: 0.12, alpha: 0.96)
+    let secondary = isDark ? UIColor(white: 0.84, alpha: 0.62) : UIColor(white: 0.12, alpha: 0.42)
+    chromeView.effect = UIBlurEffect(style: blurStyle)
+    chromeOverlayView.backgroundColor =
+      (isDark ? UIColor.black : UIColor.white).withAlphaComponent(isDark ? 0.10 : 0.08)
+    selectionView.backgroundColor =
+      isDark ? UIColor.white.withAlphaComponent(0.16) : UIColor.black.withAlphaComponent(0.06)
+
+    for (tab, button) in buttonsByTab {
+      let selected = tab == activeTab
+      button.setTitleColor(selected ? primary : secondary, for: .normal)
+      button.alpha = selected ? 1.0 : 0.94
+    }
   }
 
   func configure(
@@ -403,67 +351,96 @@ private final class ChatProfileTabStripView: UIView {
     activeTab: ChatProfileTab,
     titleProvider: (ChatProfileTab) -> String
   ) {
-    if currentTabs != tabs {
-      currentTabs = tabs
-      rebuildButtons(titleProvider: titleProvider)
-    } else {
-      for tab in tabs {
-        buttons[tab]?.setTitle(titleProvider(tab))
-      }
-    }
-
+    let tabsChanged = currentTabs != tabs
+    let previousTab = self.activeTab
     self.activeTab = activeTab
-    updateSelection(animated: false)
-    scrollActiveButtonIntoView(animated: false)
-  }
 
-  private func rebuildButtons(titleProvider: (ChatProfileTab) -> String) {
-    buttons.removeAll()
-    stackView.arrangedSubviews.forEach { view in
-      stackView.removeArrangedSubview(view)
-      view.removeFromSuperview()
-    }
-
-    for tab in currentTabs {
-      let button = ChatProfileFilterButton()
-      button.translatesAutoresizingMaskIntoConstraints = false
-      button.heightAnchor.constraint(equalToConstant: 44.0).isActive = true
-      button.widthAnchor.constraint(greaterThanOrEqualToConstant: 92.0).isActive = true
-      button.setTitle(titleProvider(tab))
-      button.applyTheme(isDark: isDark)
-      button.addTarget(self, action: #selector(handleButtonPress(_:)), for: .touchUpInside)
-      button.tag = currentTabs.firstIndex(of: tab) ?? 0
-      stackView.addArrangedSubview(button)
-      buttons[tab] = button
-    }
-  }
-
-  private func updateSelection(animated: Bool) {
-    let apply = {
-      for (tab, button) in self.buttons {
-        button.isActive = tab == self.activeTab
-      }
-    }
-
-    if animated {
-      UIView.animate(withDuration: 0.18, animations: apply)
+    if tabsChanged {
+      currentTabs = tabs
+      rebuildItems(titleProvider: titleProvider)
     } else {
-      apply()
+      updateTitles(titleProvider: titleProvider)
+    }
+
+    applyChrome()
+    updateSelectionFrame(animated: previousTab != activeTab && !tabsChanged)
+    scrollSelectedTabIntoView(animated: previousTab != activeTab)
+  }
+
+  private func rebuildItems(titleProvider: (ChatProfileTab) -> String) {
+    for arrangedSubview in stackView.arrangedSubviews {
+      stackView.removeArrangedSubview(arrangedSubview)
+      arrangedSubview.removeFromSuperview()
+    }
+
+    buttonsByTab.removeAll()
+    selectionView.alpha = 0.0
+
+    for (index, tab) in currentTabs.enumerated() {
+      let button = UIButton(type: .system)
+      button.translatesAutoresizingMaskIntoConstraints = false
+      button.tag = index
+      button.contentEdgeInsets = UIEdgeInsets(top: 0.0, left: 16.0, bottom: 0.0, right: 16.0)
+      button.titleLabel?.font = UIFont.systemFont(ofSize: 14.0, weight: .semibold)
+      button.titleLabel?.lineBreakMode = .byTruncatingTail
+      button.setTitle(titleProvider(tab), for: .normal)
+      button.addTarget(self, action: #selector(handleTabButtonPressed(_:)), for: .touchUpInside)
+      stackView.addArrangedSubview(button)
+      buttonsByTab[tab] = button
+    }
+
+    setNeedsLayout()
+  }
+
+  private func updateTitles(titleProvider: (ChatProfileTab) -> String) {
+    for tab in currentTabs {
+      buttonsByTab[tab]?.setTitle(titleProvider(tab), for: .normal)
     }
   }
 
-  private func scrollActiveButtonIntoView(animated: Bool) {
-    guard let button = buttons[activeTab] else { return }
-    let rect = scrollView.convert(button.frame, from: stackView).insetBy(dx: -18.0, dy: 0.0)
-    scrollView.scrollRectToVisible(rect, animated: animated)
+  private func updateSelectionFrame(animated: Bool) {
+    guard let button = buttonsByTab[activeTab] else {
+      selectionView.alpha = 0.0
+      return
+    }
+
+    let targetFrame = button.convert(button.bounds, to: scrollView)
+    let applySelection = {
+      self.selectionView.frame = targetFrame
+      self.selectionView.layer.cornerRadius = targetFrame.height * 0.5
+      self.selectionView.alpha = 1.0
+    }
+
+    guard animated, window != nil else {
+      applySelection()
+      return
+    }
+
+    UIView.animate(
+      withDuration: 0.26,
+      delay: 0.0,
+      options: [.beginFromCurrentState, .curveEaseInOut, .allowUserInteraction]
+    ) {
+      applySelection()
+    }
   }
 
-  @objc private func handleButtonPress(_ sender: ChatProfileFilterButton) {
+  private func scrollSelectedTabIntoView(animated: Bool) {
+    guard let button = buttonsByTab[activeTab] else { return }
+    let targetFrame = button.convert(button.bounds, to: scrollView).insetBy(dx: -18.0, dy: 0.0)
+    scrollView.scrollRectToVisible(targetFrame, animated: animated)
+  }
+
+  @objc private func handleTabButtonPressed(_ sender: UIButton) {
     guard currentTabs.indices.contains(sender.tag) else { return }
     let tab = currentTabs[sender.tag]
+    guard tab != activeTab else { return }
+
+    selectionFeedback.selectionChanged()
     onSelect?(tab)
   }
 }
+
 
 private final class ChatProfileTabStripCell: UITableViewCell {
   static let reuseIdentifier = "ChatProfileTabStripCell"
@@ -484,7 +461,7 @@ private final class ChatProfileTabStripCell: UITableViewCell {
 
   override func layoutSubviews() {
     super.layoutSubviews()
-    tabsView.frame = contentView.bounds.insetBy(dx: 16.0, dy: 8.0)
+    tabsView.frame = contentView.bounds.insetBy(dx: 12.0, dy: 6.0)
   }
 }
 
@@ -726,6 +703,7 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
   private var availableTabs: [ChatProfileTab] = []
   private var activeTab: ChatProfileTab = .media
   private weak var inlineTabsCell: ChatProfileTabStripCell?
+  private var contentTransitionOverlayView: UIView?
 
   private var profileName = "User"
   private var profileHandle = ""
@@ -819,9 +797,9 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
       top: headerHeight, left: 0.0, bottom: 0.0, right: 0.0)
     stickyTabsContainer.frame = CGRect(
       x: 12.0,
-      y: headerHeight + 6.0,
+      y: headerHeight + 8.0,
       width: max(0.0, bounds.width - 24.0),
-      height: availableTabs.isEmpty ? 0.0 : 60.0
+      height: availableTabs.isEmpty ? 0.0 : ChatProfileTabStripView.preferredHeight
     )
     stickyTabsView.frame = stickyTabsContainer.bounds
 
@@ -848,7 +826,7 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
   func setRows(_ rows: [[String: Any]]) {
     self.rows = rows.compactMap(ChatProfileRow.parse)
     rebuildDerivedContent()
-    tableView.reloadData()
+    reloadDataKeepingSelection()
   }
 
   func setEngineSurfaceId(_ value: String) {
@@ -891,6 +869,7 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
   func setHeaderTitle(_ value: String) {
     headerTitle = value.trimmingCharacters(in: .whitespacesAndNewlines)
     reloadHeaderText()
+    refreshHeroContent()
   }
 
   func setHeaderSubtitle(_ value: String) {
@@ -1029,6 +1008,9 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
       forCellReuseIdentifier: ChatProfileVoiceContentCell.reuseIdentifier)
     tableView.separatorInset = UIEdgeInsets(top: 0.0, left: 16.0, bottom: 0.0, right: 16.0)
     tableView.contentInsetAdjustmentBehavior = .never
+    tableView.estimatedRowHeight = 0.0
+    tableView.estimatedSectionHeaderHeight = 0.0
+    tableView.estimatedSectionFooterHeight = 0.0
     if #available(iOS 15.0, *) {
       tableView.sectionHeaderTopPadding = 0.0
     }
@@ -1072,6 +1054,7 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
     heroBannerView.addSubview(heroNameLabel)
 
     heroHandleButton.titleLabel?.font = UIFont.systemFont(ofSize: 18.0, weight: .medium)
+    heroHandleButton.titleLabel?.lineBreakMode = .byTruncatingTail
     heroHandleButton.contentHorizontalAlignment = .center
     heroHandleButton.addTarget(
       self, action: #selector(handleIdentifierPressed), for: .touchUpInside)
@@ -1216,7 +1199,7 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
     backgroundColor = background
     headerContainer.backgroundColor = .clear
     headerMaskContainer.backgroundColor = .clear
-    headerMaskBlurView.effect = {
+    headerMaskBlurView.effect = { () -> UIVisualEffect? in
       if #available(iOS 26.0, *) {
         let effect = UIGlassEffect(style: .regular)
         effect.isInteractive = true
@@ -1273,20 +1256,37 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
     reloadDataKeepingSelection()
   }
 
-  private func reloadHeaderText() {
-    titleLabel.text =
-      profileName.isEmpty ? (headerTitle.isEmpty ? "Profile" : headerTitle) : profileName
-
+  private func resolvedDefaultSubtitleText() -> String {
     if isOnline {
-      subtitleLabel.text = "Online"
-      return
+      return "Online"
     }
 
     if !headerSubtitle.isEmpty {
-      subtitleLabel.text = headerSubtitle
-    } else {
-      subtitleLabel.text = isGroupOrChannel ? "Group Profile" : "Profile"
+      return headerSubtitle
     }
+
+    return isGroupOrChannel ? "Group Profile" : "Profile"
+  }
+
+  private func resolvedActiveTabSubtitleText() -> String? {
+    guard !availableTabs.isEmpty else { return nil }
+    return "\(sharedCount(for: activeTab)) \(sharedTitle(for: activeTab))"
+  }
+
+  private func resolvedHeroSubheaderText() -> String {
+    return resolvedActiveTabSubtitleText() ?? resolvedIdentifierText()
+  }
+
+  private func reloadHeaderText() {
+    titleLabel.text =
+      profileName.isEmpty ? (headerTitle.isEmpty ? "Profile" : headerTitle) : profileName
+    subtitleLabel.text = resolvedActiveTabSubtitleText() ?? resolvedDefaultSubtitleText()
+  }
+
+  private func refreshHeroSubheader() {
+    let subheader = resolvedHeroSubheaderText()
+    heroHandleButton.setTitle(subheader, for: .normal)
+    heroHandleButton.isHidden = subheader.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
   }
 
   private func refreshHeroContent() {
@@ -1295,9 +1295,7 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
     heroNameLabel.text = resolvedName
     floatingAvatarView.setFallbackText(resolvedAvatarFallbackText())
 
-    let identifier = resolvedIdentifierText()
-    heroHandleButton.setTitle(identifier, for: .normal)
-    heroHandleButton.isHidden = identifier.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    refreshHeroSubheader()
 
     let bio = profileBio.trimmingCharacters(in: .whitespacesAndNewlines)
     heroBioLabel.text = bio
@@ -1416,6 +1414,8 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
     if !availableTabs.contains(activeTab), let first = availableTabs.first {
       activeTab = first
     }
+    reloadHeaderText()
+    refreshHeroSubheader()
     syncTabViews()
   }
 
@@ -1575,7 +1575,7 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
   }
 
   private func tabButtonTitle(_ tab: ChatProfileTab) -> String {
-    "\(sharedTitle(for: tab)) \(sharedCount(for: tab))"
+    sharedTitle(for: tab)
   }
 
   private func currentContentCount() -> Int {
@@ -1657,24 +1657,93 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
     }
   }
 
+  private func reloadContentSectionWithoutAnimation() {
+    guard tableView.numberOfSections > Section.content.rawValue else { return }
+
+    UIView.performWithoutAnimation {
+      tableView.reloadSections(IndexSet(integer: Section.content.rawValue), with: .none)
+      tableView.layoutIfNeeded()
+    }
+  }
+
+  private func animateContentTransition(direction: CGFloat) {
+    contentTransitionOverlayView?.removeFromSuperview()
+    contentTransitionOverlayView = nil
+
+    guard tableView.numberOfSections > Section.content.rawValue else { return }
+
+    let visibleRect = CGRect(origin: tableView.contentOffset, size: tableView.bounds.size)
+    let sectionRect = tableView.rect(forSection: Section.content.rawValue)
+    let snapshotRect = visibleRect.intersection(sectionRect)
+    let overlayView: UIView? = {
+      guard !snapshotRect.isNull, snapshotRect.width > 0.0, snapshotRect.height > 0.0 else {
+        return nil
+      }
+
+      let snapshot = tableView.resizableSnapshotView(
+        from: snapshotRect,
+        afterScreenUpdates: false,
+        withCapInsets: .zero
+      )
+      snapshot?.frame = tableView.convert(snapshotRect, to: self)
+      if let snapshot {
+        addSubview(snapshot)
+        contentTransitionOverlayView = snapshot
+        bringSubviewToFront(headerMaskContainer)
+        bringSubviewToFront(stickyTabsContainer)
+        bringSubviewToFront(floatingAvatarView)
+        bringSubviewToFront(headerContainer)
+      }
+      return snapshot
+    }()
+
+    reloadContentSectionWithoutAnimation()
+
+    let visibleContentCells = tableView.visibleCells.filter { cell in
+      guard let indexPath = tableView.indexPath(for: cell) else { return false }
+      return indexPath.section == Section.content.rawValue
+    }
+    let travel = min(max(bounds.width * 0.16, 28.0), 64.0)
+    let incomingOffset = direction > 0.0 ? travel : -travel
+    let outgoingOffset = -incomingOffset
+
+    for cell in visibleContentCells {
+      cell.transform = CGAffineTransform(translationX: incomingOffset, y: 0.0)
+      cell.alpha = 0.0
+    }
+
+    let animator = UIViewPropertyAnimator(duration: 0.30, dampingRatio: 0.96) {
+      overlayView?.transform = CGAffineTransform(translationX: outgoingOffset, y: 0.0)
+      overlayView?.alpha = 0.0
+      for cell in visibleContentCells {
+        cell.transform = .identity
+        cell.alpha = 1.0
+      }
+    }
+
+    animator.addCompletion { [weak self] _ in
+      overlayView?.removeFromSuperview()
+      self?.contentTransitionOverlayView = nil
+    }
+    animator.startAnimation()
+  }
+
   private func switchToTab(_ nextTab: ChatProfileTab, animated: Bool) {
-    guard availableTabs.contains(nextTab) else { return }
+    guard availableTabs.contains(nextTab), nextTab != activeTab else { return }
     let previousIndex = availableTabs.firstIndex(of: activeTab) ?? 0
     let nextIndex = availableTabs.firstIndex(of: nextTab) ?? previousIndex
     activeTab = nextTab
+    reloadHeaderText()
+    refreshHeroSubheader()
     syncTabViews()
-    scrollTabsIntoView(animated: animated)
+    scrollTabsIntoView(animated: false)
 
     guard tableView.numberOfSections > Section.content.rawValue else { return }
     if animated {
-      let transition = CATransition()
-      transition.type = .push
-      transition.subtype = nextIndex >= previousIndex ? .fromRight : .fromLeft
-      transition.duration = 0.24
-      transition.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-      tableView.layer.add(transition, forKey: "profileTabSlide")
+      animateContentTransition(direction: nextIndex > previousIndex ? 1.0 : -1.0)
+      return
     }
-    tableView.reloadSections(IndexSet(integer: Section.content.rawValue), with: .none)
+    reloadContentSectionWithoutAnimation()
   }
 
   private func scrollTabsIntoView(animated: Bool) {
@@ -1686,6 +1755,11 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
 
     let headerHeight = safeAreaInsets.top + 60.0
     let targetRect = tableView.rectForRow(at: indexPath)
+    let stickyTop = headerHeight + 8.0
+    let convertedRect = tableView.convert(targetRect, to: self)
+    if convertedRect.minY >= stickyTop - 4.0 && convertedRect.minY <= stickyTop + 12.0 {
+      return
+    }
     let targetY = max(0.0, targetRect.minY - headerHeight - 8.0)
     if abs(tableView.contentOffset.y - targetY) > 1.0 {
       tableView.setContentOffset(CGPoint(x: 0.0, y: targetY), animated: animated)
@@ -1727,7 +1801,7 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
     }
 
     let convertedRect = tableView.convert(tableView.rectForRow(at: tabsIndexPath), to: self)
-    let stickyTop = safeAreaInsets.top + 60.0 + 6.0
+    let stickyTop = safeAreaInsets.top + 60.0 + 8.0
     let progress = max(0.0, min(1.0, (stickyTop - convertedRect.minY) / 28.0))
     stickyTabsContainer.isHidden = progress <= 0.0
     stickyTabsContainer.alpha = progress
@@ -1859,6 +1933,11 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
   }
 
   @objc private func handleIdentifierPressed() {
+    if !availableTabs.isEmpty {
+      scrollTabsIntoView(animated: true)
+      return
+    }
+
     let raw = resolvedIdentifierRawValue()
     guard !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
     UIPasteboard.general.string = raw
@@ -1866,6 +1945,8 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
   }
 
   private func reloadDataKeepingSelection() {
+    contentTransitionOverlayView?.removeFromSuperview()
+    contentTransitionOverlayView = nil
     tableView.reloadData()
     layoutHeroHeaderViewIfNeeded(force: true)
     syncTabViews()
@@ -1937,7 +2018,7 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
         return 68.0
       }
     case .tabs:
-      return 60.0
+      return ChatProfileTabStripView.preferredHeight + 12.0
     case .content:
       switch activeTab {
       case .voice, .media, .gifs:

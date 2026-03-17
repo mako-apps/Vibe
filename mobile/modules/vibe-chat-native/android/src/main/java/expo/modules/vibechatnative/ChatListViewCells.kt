@@ -1,5 +1,6 @@
 package expo.modules.vibechatnative
 
+import android.animation.ValueAnimator
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
@@ -8,17 +9,18 @@ import android.graphics.Path
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.os.SystemClock
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
+import android.view.animation.AccelerateDecelerateInterpolator
+import android.view.animation.LinearInterpolator
 import android.widget.FrameLayout
 import android.widget.TextView
 import androidx.recyclerview.widget.RecyclerView
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.pow
 import kotlin.math.roundToInt
-import kotlin.math.sqrt
 
 internal class NativeRowViewHolder(
   val container: FrameLayout,
@@ -128,36 +130,44 @@ internal class BubbleStatusIndicatorView(context: Context) : android.widget.Imag
 
 internal class VoicePlayProgressView(context: Context) : View(context) {
   companion object {
-    private const val BUTTON_SIZE_DP = 44f
-    private const val PLAYBACK_ICON_SIZE_DP = 20f
+    private const val BUTTON_SIZE_DP = 52f
+    private const val PLAYBACK_ICON_SIZE_DP = 18f
     private const val UPLOAD_ICON_SIZE_DP = 16f
+    private const val MINIMUM_UPLOAD_PROGRESS = 0.027f
+    private const val UPLOAD_PROGRESS_DURATION_MS = 200L
+    private const val UPLOAD_ROTATION_DURATION_MS = 1570L
   }
 
   private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
     style = Paint.Style.FILL
     color = Color.argb(245, 255, 255, 255)
   }
-  private val ringTrackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-    style = Paint.Style.STROKE
-    strokeCap = Paint.Cap.ROUND
-    strokeWidth = dpF(2.2f)
-    color = Color.argb(72, 255, 255, 255)
-  }
   private val ringProgressPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
     style = Paint.Style.STROKE
     strokeCap = Paint.Cap.ROUND
-    strokeWidth = dpF(2.2f)
+    strokeWidth = dpF(2.4f)
     color = Color.WHITE
   }
+  private val fluidPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    style = Paint.Style.FILL
+    color = Color.argb(64, 255, 255, 255)
+  }
   private var iconTintColor: Int = Color.BLUE
+  private var fluidColor: Int = Color.argb(64, 255, 255, 255)
   private val playDrawable = context.getDrawable(R.drawable.ic_voice_play)?.mutate()
   private val pauseDrawable = context.getDrawable(R.drawable.ic_voice_pause)?.mutate()
   private val cancelDrawable = context.getDrawable(R.drawable.ic_voice_cancel)?.mutate()
   private val arcRect = RectF()
   private var isPlaying = false
-  private var playbackProgress = 0f
   private var isUploading = false
   private var uploadProgress: Float? = null
+  private var lastResolvedUploadProgress: Float? = null
+  private var displayedUploadProgress = 0f
+  private var uploadRotationDegrees = 0f
+  private var playbackLevel = 0f
+  private var playbackStartedAtMs = 0L
+  private var progressAnimator: ValueAnimator? = null
+  private var rotationAnimator: ValueAnimator? = null
 
   init {
     isClickable = true
@@ -165,49 +175,47 @@ internal class VoicePlayProgressView(context: Context) : View(context) {
   }
 
   fun applyStyle(fillColor: Int, iconTint: Int, ringTint: Int) {
-    val ringAlpha = Color.alpha(ringTint)
-    val trackAlpha =
-      if (ringAlpha == 0) {
-        0
-      } else {
-        (ringAlpha * 0.38f).roundToInt().coerceIn(18, 255)
-      }
     fillPaint.color = fillColor
     iconTintColor = iconTint
-    ringTrackPaint.color =
-      Color.argb(trackAlpha, Color.red(ringTint), Color.green(ringTint), Color.blue(ringTint))
     ringProgressPaint.color = ringTint
+    fluidColor = withAlpha(ringTint, 0.35f)
     invalidate()
   }
 
-  fun setPlaybackState(isPlaying: Boolean, progress: Float) {
+  fun setPlaybackState(isPlaying: Boolean, progress: Float, level: Float = 0f) {
     if (isUploading) return
-    val clampedProgress = progress.coerceIn(0f, 1f)
-    if (this.isPlaying == isPlaying && kotlin.math.abs(playbackProgress - clampedProgress) < 0.001f)
-      return
+    val normalizedLevel = level.coerceIn(0f, 1f)
+    val levelChanged = kotlin.math.abs(playbackLevel - normalizedLevel) > 0.01f
+    if (this.isPlaying == isPlaying && !levelChanged) return
+    if (isPlaying && !this.isPlaying) {
+      playbackStartedAtMs = SystemClock.uptimeMillis()
+    } else if (!isPlaying) {
+      playbackStartedAtMs = 0L
+    }
     this.isPlaying = isPlaying
-    playbackProgress = clampedProgress
+    playbackLevel = if (isPlaying) normalizedLevel else 0f
     invalidate()
   }
 
   fun setUploadState(isUploading: Boolean, progress: Float?) {
-    val normalizedProgress =
-      progress
-        ?.takeIf { it.isFinite() }
-        ?.coerceIn(0f, 1f)
-    val previousProgress = uploadProgress
-    val progressChanged =
-      if (previousProgress == null && normalizedProgress == null) {
-        false
-      } else if (previousProgress != null && normalizedProgress != null) {
-        kotlin.math.abs(previousProgress - normalizedProgress) > 0.001f
+    val resolvedProgress =
+      if (isUploading) {
+        when {
+          progress != null && progress.isFinite() -> {
+            progress.coerceIn(MINIMUM_UPLOAD_PROGRESS, 1f).also { lastResolvedUploadProgress = it }
+          }
+          lastResolvedUploadProgress != null -> lastResolvedUploadProgress
+          else -> MINIMUM_UPLOAD_PROGRESS.also { lastResolvedUploadProgress = it }
+        }
       } else {
-        true
+        lastResolvedUploadProgress = null
+        null
       }
-    if (this.isUploading == isUploading && !progressChanged) return
+
+    if (this.isUploading == isUploading && uploadProgress == resolvedProgress) return
     this.isUploading = isUploading
-    uploadProgress = normalizedProgress
-    invalidate()
+    uploadProgress = resolvedProgress
+    updateUploadVisualState()
   }
 
   fun preferredButtonSizePx(): Int = dpF(BUTTON_SIZE_DP).roundToInt()
@@ -225,25 +233,29 @@ internal class VoicePlayProgressView(context: Context) : View(context) {
     val cx = width * 0.5f
     val cy = height * 0.5f
     val outerRadius = kotlin.math.min(cx, cy)
-    val fillInset = dpF(2.5f)
+    val fillInset = dpF(3f)
     val fillRadius = (outerRadius - fillInset).coerceAtLeast(kotlin.math.min(dpF(14f), outerRadius))
+
+    if (!isUploading && (isPlaying || playbackLevel > 0.01f)) {
+      drawFluidVisualizer(canvas, cx, cy, outerRadius)
+      postInvalidateOnAnimation()
+    }
+
     canvas.drawCircle(cx, cy, fillRadius, fillPaint)
 
-    val showRing = isUploading || (Color.alpha(ringProgressPaint.color) > 0 && playbackProgress > 0.001f)
-    if (showRing) {
+    if (isUploading) {
       val ringRadius = kotlin.math.max(dpF(4f), fillRadius + dpF(1.8f))
-      if (Color.alpha(ringTrackPaint.color) > 0) {
-        canvas.drawCircle(cx, cy, ringRadius, ringTrackPaint)
-      }
       arcRect.set(cx - ringRadius, cy - ringRadius, cx + ringRadius, cy + ringRadius)
-      val sweepProgress =
-        if (isUploading) {
-          kotlin.math.max(0.05f, uploadProgress ?: 0.08f)
-        } else {
-          playbackProgress.coerceIn(0f, 1f)
-        }
-      val sweep = sweepProgress * 360f
-      canvas.drawArc(arcRect, -90f, sweep, false, ringProgressPaint)
+      canvas.save()
+      canvas.rotate(uploadRotationDegrees, cx, cy)
+      canvas.drawArc(
+        arcRect,
+        -90f,
+        displayedUploadProgress.coerceIn(MINIMUM_UPLOAD_PROGRESS, 1f) * 360f,
+        false,
+        ringProgressPaint,
+      )
+      canvas.restore()
     }
 
     val icon =
@@ -261,12 +273,7 @@ internal class VoicePlayProgressView(context: Context) : View(context) {
             else -> dpF(PLAYBACK_ICON_SIZE_DP)
           },
         )
-      val leftShift =
-        when {
-          isUploading || isPlaying -> 0f
-          else -> dpF(0.8f)
-        }
-      val left = (((width - iconSize) * 0.5f) + leftShift).roundToInt()
+      val left = ((width - iconSize) * 0.5f).roundToInt()
       val top = ((height - iconSize) * 0.5f).roundToInt()
       val right = (left + iconSize).roundToInt()
       val bottom = (top + iconSize).roundToInt()
@@ -274,6 +281,94 @@ internal class VoicePlayProgressView(context: Context) : View(context) {
       icon.setTint(iconTintColor)
       icon.draw(canvas)
     }
+  }
+
+  override fun onDetachedFromWindow() {
+    stopUploadAnimations(resetProgress = true)
+    super.onDetachedFromWindow()
+  }
+
+  private fun updateUploadVisualState() {
+    if (!isUploading) {
+      stopUploadAnimations(resetProgress = true)
+      invalidate()
+      return
+    }
+    ensureRotationAnimator()
+    animateUploadProgressTo(uploadProgress ?: MINIMUM_UPLOAD_PROGRESS)
+  }
+
+  private fun animateUploadProgressTo(target: Float) {
+    val clampedTarget = target.coerceIn(MINIMUM_UPLOAD_PROGRESS, 1f)
+    progressAnimator?.cancel()
+    val start = displayedUploadProgress.takeIf { it > 0f } ?: clampedTarget
+    progressAnimator =
+      ValueAnimator.ofFloat(start, clampedTarget).apply {
+        duration = UPLOAD_PROGRESS_DURATION_MS
+        interpolator = AccelerateDecelerateInterpolator()
+        addUpdateListener { animator ->
+          displayedUploadProgress = (animator.animatedValue as Float).coerceIn(MINIMUM_UPLOAD_PROGRESS, 1f)
+          invalidate()
+        }
+        start()
+      }
+  }
+
+  private fun ensureRotationAnimator() {
+    if (rotationAnimator?.isRunning == true) return
+    rotationAnimator =
+      ValueAnimator.ofFloat(0f, 360f).apply {
+        duration = UPLOAD_ROTATION_DURATION_MS
+        repeatCount = ValueAnimator.INFINITE
+        interpolator = LinearInterpolator()
+        addUpdateListener { animator ->
+          uploadRotationDegrees = animator.animatedValue as Float
+          invalidate()
+        }
+        start()
+      }
+  }
+
+  private fun stopUploadAnimations(resetProgress: Boolean) {
+    progressAnimator?.cancel()
+    progressAnimator = null
+    rotationAnimator?.cancel()
+    rotationAnimator = null
+    uploadRotationDegrees = 0f
+    playbackLevel = 0f
+    playbackStartedAtMs = 0L
+    if (resetProgress) {
+      displayedUploadProgress = 0f
+    }
+  }
+
+  private fun drawFluidVisualizer(canvas: Canvas, cx: Float, cy: Float, baseRadius: Float) {
+    val elapsedSeconds =
+      if (playbackStartedAtMs > 0L) {
+        (SystemClock.uptimeMillis() - playbackStartedAtMs) / 1000f
+      } else {
+        0f
+      }
+
+    for (index in 0 until 3) {
+      val layerIndex = (index + 1).toFloat()
+      val idlePulse = (kotlin.math.sin((elapsedSeconds * 2f) + (index * 2f)) * 0.04f).toFloat()
+      val activePush = playbackLevel * 0.4f * layerIndex
+      val scale = (1f + idlePulse + activePush).coerceAtLeast(0.92f)
+      val opacity = ((1f - ((scale - 1f) * 1.5f)).coerceIn(0f, 1f)) * 0.6f
+      fluidPaint.color = withMultipliedAlpha(fluidColor, opacity)
+      canvas.drawCircle(cx, cy, baseRadius * scale, fluidPaint)
+    }
+  }
+
+  private fun withMultipliedAlpha(color: Int, factor: Float): Int {
+    val alpha = (Color.alpha(color) * factor.coerceIn(0f, 1f)).roundToInt().coerceIn(0, 255)
+    return Color.argb(alpha, Color.red(color), Color.green(color), Color.blue(color))
+  }
+
+  private fun withAlpha(color: Int, alpha: Float): Int {
+    val resolvedAlpha = (alpha.coerceIn(0f, 1f) * 255f).roundToInt().coerceIn(0, 255)
+    return Color.argb(resolvedAlpha, Color.red(color), Color.green(color), Color.blue(color))
   }
 
   private fun dpF(value: Float): Float =
@@ -320,10 +415,9 @@ internal class VoiceUploadProgressView(context: Context) : View(context) {
 
 internal class VoiceWaveformView(context: Context) : View(context) {
   companion object {
-    private const val BAR_COUNT = 52
     private const val BAR_WIDTH_DP = 2f
-    private const val BAR_SPACING_DP = 1f
-    private const val WAVE_HEIGHT_DP = 16f
+    private const val BAR_SPACING_DP = 2f
+    private const val WAVE_HEIGHT_DP = 20f
   }
 
   private val activePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -337,11 +431,10 @@ internal class VoiceWaveformView(context: Context) : View(context) {
   private val blendedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
     style = Paint.Style.FILL
   }
-  private var barCount = BAR_COUNT
+  private var barCount = 40
   private var barEnvelope: FloatArray = makeDefaultEnvelope(barCount)
+  private var rawSamples: List<Float>? = null
   private var playbackProgress = 0f
-  private var level = 0f
-  private var isPlaying = false
 
   override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
     val desiredHeight = dpF(WAVE_HEIGHT_DP).roundToInt()
@@ -352,75 +445,27 @@ internal class VoiceWaveformView(context: Context) : View(context) {
   }
 
   fun updatePlayback(progress: Float, level: Float, isPlaying: Boolean) {
-    val clampedProgress = progress.coerceIn(0f, 1f)
-    playbackProgress =
-      if (isPlaying) {
-        playbackProgress + ((clampedProgress - playbackProgress) * 0.22f)
-      } else {
-        clampedProgress
-      }
-    this.level = level.coerceIn(0f, 1f)
-    this.isPlaying = isPlaying
+    playbackProgress = progress.coerceIn(0f, 1f)
     invalidate()
   }
 
   fun setWaveform(samples: List<Float>?, duration: Double? = null) {
-    val normalized =
+    rawSamples =
       samples
         ?.filter { it.isFinite() }
         ?.map { it.coerceIn(0f, 1f) }
-        .orEmpty()
-
-    if (normalized.isEmpty()) {
-      barEnvelope = makeDefaultEnvelope(barCount)
-      invalidate()
-      requestLayout()
-      return
-    }
-
-    if (normalized.size == barCount) {
-      barEnvelope = shapeEnvelope(smoothEnvelope(smoothEnvelope(normalized.toFloatArray())))
-      invalidate()
-      requestLayout()
-      return
-    }
-
-    val bucketSize = normalized.size.toFloat() / barCount.toFloat()
-    val next = FloatArray(barCount)
-    for (index in 0 until barCount) {
-      val start = kotlin.math.floor(index * bucketSize).toInt()
-      val clampedStart = start.coerceIn(0, normalized.size - 1)
-      val clampedEnd =
-        kotlin.math.min(
-          normalized.size,
-          kotlin.math.floor((index + 1) * bucketSize).toInt().coerceAtLeast(clampedStart + 1),
-        )
-      if (start < clampedEnd) {
-        var maxPeak = 0f
-        var sumSquares = 0f
-        for (i in start until clampedEnd) {
-          val value = normalized[i]
-          if (value > maxPeak) maxPeak = value
-          sumSquares += value * value
-        }
-        val sliceCount = (clampedEnd - start).coerceAtLeast(1)
-        val rms = sqrt(sumSquares / sliceCount.toFloat())
-        val energy = kotlin.math.max(maxPeak * 0.82f, rms * 0.72f)
-        next[index] = energy.pow(0.9f).coerceIn(0f, 1f)
-      } else {
-        next[index] = normalized[clampedStart]
-      }
-    }
-    barEnvelope = shapeEnvelope(smoothEnvelope(smoothEnvelope(next)))
+        ?.takeIf { it.isNotEmpty() }
+    rebuildEnvelope()
     invalidate()
     requestLayout()
   }
 
   fun preferredContentWidth(maxWidthPx: Int? = null): Int {
+    if (maxWidthPx != null) return maxWidthPx.coerceAtLeast(1)
     val desired =
       ((barCount * dpF(BAR_WIDTH_DP)) + ((barCount - 1).coerceAtLeast(0) * dpF(BAR_SPACING_DP)))
         .roundToInt()
-    return maxWidthPx?.let { min(it, desired) } ?: desired
+    return desired.coerceAtLeast(1)
   }
 
   fun preferredContentHeightPx(): Int = dpF(WAVE_HEIGHT_DP).roundToInt()
@@ -435,22 +480,30 @@ internal class VoiceWaveformView(context: Context) : View(context) {
   override fun onDraw(canvas: Canvas) {
     super.onDraw(canvas)
     if (width <= 0 || height <= 0) return
-    val spacing = dpF(BAR_SPACING_DP)
-    val totalSpacing = spacing * (barCount - 1)
-    val barWidth = kotlin.math.max(dpF(1f), kotlin.math.floor((width - totalSpacing) / barCount.toFloat()))
-    val minHeight = kotlin.math.max(dpF(2f), kotlin.math.floor(height * 0.2f))
-    val maxHeight = kotlin.math.max(minHeight + 1f, kotlin.math.floor(height * 0.88f))
-    val dynamicGain = if (isPlaying) 1f + (level * 0.16f) else 1f
+    val expectedBarWidth = dpF(BAR_WIDTH_DP)
+    val expectedSpacing = dpF(BAR_SPACING_DP)
+    val newCount =
+      kotlin.math.max(1, (width.toFloat() / (expectedBarWidth + expectedSpacing)).toInt())
+    if (newCount != barCount) {
+      barCount = newCount
+      rebuildEnvelope()
+    }
+
+    val barWidth = expectedBarWidth
+    val spacing = expectedSpacing
+    val minHeight = dpF(2f)
+    val peakHeight = kotlin.math.max(minHeight, kotlin.math.min(height.toFloat(), dpF(18f)))
     val progressX = playbackProgress.coerceIn(0f, 1f) * width.toFloat()
     var x = 0f
     for (index in 0 until barCount) {
-      val amplitude = (barEnvelope[index] * dynamicGain).coerceIn(0.10f, 1f)
-      val barHeight = minHeight + ((maxHeight - minHeight) * amplitude)
-      val y = kotlin.math.floor((height - barHeight) * 0.5f)
+      val amplitude = barEnvelope.getOrElse(index) { 0f }.coerceIn(0f, 1f)
+      val barHeight = kotlin.math.max(minHeight, peakHeight * amplitude)
       val barStart = x
       val barEnd = x + barWidth
       val fillFraction =
         ((progressX - barStart) / kotlin.math.max(1f, barEnd - barStart)).coerceIn(0f, 1f)
+      val renderedHeight = kotlin.math.max(1f, kotlin.math.floor(barHeight))
+      val y = kotlin.math.floor(height - renderedHeight)
       val paint =
         when {
           fillFraction <= 0f -> inactivePaint
@@ -459,33 +512,49 @@ internal class VoiceWaveformView(context: Context) : View(context) {
             color = blend(inactivePaint.color, activePaint.color, fillFraction)
           }
         }
-      val r = kotlin.math.min(barWidth * 0.5f, dpF(1f))
-      canvas.drawRoundRect(x, y, x + barWidth, y + barHeight, r, r, paint)
+      canvas.drawRoundRect(
+        x,
+        y,
+        x + barWidth,
+        y + renderedHeight,
+        barWidth * 0.5f,
+        barWidth * 0.5f,
+        paint,
+      )
       x += barWidth + spacing
     }
   }
 
-  private fun smoothEnvelope(values: FloatArray): FloatArray {
-    if (values.size <= 2) return values
-    val out = FloatArray(values.size)
-    for (i in values.indices) {
-      val left = values[max(0, i - 1)]
-      val center = values[i]
-      val right = values[min(values.size - 1, i + 1)]
-      out[i] = ((left * 0.2f) + (center * 0.6f) + (right * 0.2f)).coerceIn(0.14f, 1f)
+  private fun rebuildEnvelope() {
+    if (barCount <= 0) return
+    val normalized = rawSamples.orEmpty()
+    if (normalized.isEmpty()) {
+      barEnvelope = makeDefaultEnvelope(barCount)
+      return
     }
-    return out
-  }
 
-  private fun shapeEnvelope(values: FloatArray): FloatArray {
-    if (values.isEmpty()) return values
-    val out = FloatArray(values.size)
-    val lastIndex = max(1, values.size - 1)
-    for (i in values.indices) {
-      val edgeAttenuation = 1f - (kotlin.math.abs((i.toFloat() / lastIndex.toFloat()) - 0.5f) * 0.12f)
-      out[i] = (values[i].pow(0.9f) * edgeAttenuation).coerceIn(0.10f, 1f)
+    val resampled = FloatArray(barCount)
+    for (index in normalized.indices) {
+      val bucketIndex = kotlin.math.min(barCount - 1, (index * barCount) / kotlin.math.max(1, normalized.size))
+      resampled[bucketIndex] = kotlin.math.max(resampled[bucketIndex], normalized[index])
     }
-    return out
+
+    val maxSample = resampled.maxOrNull() ?: 0f
+    if (maxSample <= 0.0001f) {
+      barEnvelope = FloatArray(barCount)
+      return
+    }
+
+    for (index in resampled.indices) {
+      resampled[index] = (resampled[index] / maxSample).coerceIn(0f, 1f)
+    }
+
+    if (resampled.all { it <= 0.001f }) {
+      barEnvelope = FloatArray(barCount)
+      return
+    }
+
+    barEnvelope = resampled
   }
 
   private fun makeDefaultEnvelope(count: Int): FloatArray {
