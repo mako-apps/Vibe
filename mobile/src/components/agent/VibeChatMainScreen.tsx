@@ -328,7 +328,13 @@ export default function VibeChatMainScreen({
             resolvedWallpaperTheme.bubbleMe,
             resolvedWallpaperTheme.bubbleMe,
           ],
-          bubbleThemColor: resolvedWallpaperTheme.bubbleThem || colors.card,
+          bubbleThemGradient:
+            resolvedWallpaperTheme.bubbleThemGradient
+            || [resolvedWallpaperTheme.bubbleThem, resolvedWallpaperTheme.bubbleThem],
+          bubbleThemColor:
+            resolvedWallpaperTheme.bubbleThemGradient?.[0]
+            || resolvedWallpaperTheme.bubbleThem
+            || colors.card,
           textColorMe: resolvedWallpaperTheme.textColorMe || colors.text,
           textColorThem: resolvedWallpaperTheme.textColorThem || colors.text,
           timeColorThem: colors.textSecondary,

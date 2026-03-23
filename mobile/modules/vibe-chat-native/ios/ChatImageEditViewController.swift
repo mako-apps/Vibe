@@ -88,6 +88,7 @@ final class ChatImageEditViewController: UIViewController, UITextViewDelegate,
   private let initialImage: UIImage?
   private let initialCaption: String
   private let headerTitleText: String
+  private let dismissPresenterOnSend: Bool
   private var captionText: String
 
   var onAction: ((ChatImageEditActionPayload) -> Void)?
@@ -142,7 +143,8 @@ final class ChatImageEditViewController: UIViewController, UITextViewDelegate,
     mediaURL: String,
     initialImage: UIImage?,
     initialCaption: String?,
-    headerTitle: String?
+    headerTitle: String?,
+    dismissPresenterOnSend: Bool
   ) {
     self.messageId = messageId
     self.mediaURL = mediaURL
@@ -152,6 +154,7 @@ final class ChatImageEditViewController: UIViewController, UITextViewDelegate,
     self.captionText = normalizedCaption
     let normalizedHeaderTitle = headerTitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     self.headerTitleText = normalizedHeaderTitle.isEmpty ? "Saved Messages" : normalizedHeaderTitle
+    self.dismissPresenterOnSend = dismissPresenterOnSend
     super.init(nibName: nil, bundle: nil)
     modalPresentationStyle = .overFullScreen
     modalTransitionStyle = .crossDissolve
@@ -715,7 +718,9 @@ final class ChatImageEditViewController: UIViewController, UITextViewDelegate,
         editedImageURL: editedImageURL
       )
     )
-    dismiss(animated: true)
+    let shouldDismissPresenter = dismissPresenterOnSend && eventType == .sendNew
+    let dismissTarget = shouldDismissPresenter ? (presentingViewController ?? self) : self
+    dismissTarget.dismiss(animated: true)
   }
 
   private func updateHasVisualEditsState() {

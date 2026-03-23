@@ -71,6 +71,7 @@ final class ChatNativeStreamingTextLabel: UILabel {
   private static let tokenRegex = try! NSRegularExpression(pattern: "\\S+|\\s+")
 
   private var fullAttributedValue: NSAttributedString?
+  private var rawTextValue: String?
   private var tokenRanges: [NSRange] = []
   private var revealedTokenCount = 0
   private var displayLink: CADisplayLink?
@@ -88,16 +89,16 @@ final class ChatNativeStreamingTextLabel: UILabel {
     stopStreamingAnimation()
   }
 
-  func applyStreamingText(_ attributedText: NSAttributedString, isStreaming: Bool) {
-    let previousFullText = fullAttributedValue?.string ?? ""
-    let nextFullText = attributedText.string
+  func applyStreamingText(_ attributedText: NSAttributedString, rawText: String, isStreaming: Bool) {
+    let previousRawText = rawTextValue ?? ""
     let shouldContinueExistingAnimation =
       isStreaming
-      && !previousFullText.isEmpty
-      && nextFullText.hasPrefix(previousFullText)
+      && !previousRawText.isEmpty
+      && rawText.hasPrefix(previousRawText)
 
     fullAttributedValue = attributedText
-    tokenRanges = Self.tokenize(nextFullText)
+    rawTextValue = rawText
+    tokenRanges = Self.tokenize(attributedText.string)
 
     if !shouldContinueExistingAnimation {
       revealedTokenCount = isStreaming ? 0 : tokenRanges.count
@@ -117,6 +118,7 @@ final class ChatNativeStreamingTextLabel: UILabel {
   func resetStreamingState() {
     stopStreamingAnimation()
     fullAttributedValue = nil
+    rawTextValue = nil
     tokenRanges = []
     revealedTokenCount = 0
     super.attributedText = nil

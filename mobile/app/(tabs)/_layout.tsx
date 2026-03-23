@@ -1,6 +1,6 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { View, Text, TouchableOpacity, StyleSheet, Platform, Dimensions, Keyboard, BackHandler, ActivityIndicator } from 'react-native'
+import { View, Text, TouchableOpacity, StyleSheet, Platform, Dimensions, Keyboard, BackHandler, ActivityIndicator, DeviceEventEmitter, InteractionManager } from 'react-native'
 import Animated, {
     useSharedValue,
     useAnimatedStyle,
@@ -13,7 +13,6 @@ import Animated, {
 import { GestureHandlerRootView } from 'react-native-gesture-handler'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useTranslation } from 'react-i18next'
-import { useRouter } from 'expo-router'
 import { useThemeStore } from '../../src/lib/stores/theme-store'
 import { useUIStore } from '../../src/lib/stores/ui-store'
 import { resolveThemeVariant, useWallpaperStore } from '../../src/lib/stores/wallpaper-store'
@@ -28,7 +27,8 @@ import SettingsScreen from './settings'
 import ContactsScreen from './contacts'
 import CallsScreen from './calls'
 import { StoryCamera } from '../story-camera'
-import { VibeChatMainScreen } from '../../src/components/agent'
+import { AgentChatScreen } from '../../src/components/agent'
+import { useAgentStore } from '../../src/lib/agent/AgentStore'
 import { KeyboardStickyView } from 'react-native-keyboard-controller'
 import { BlurView } from 'expo-blur'
 import { File as ExpoFile, Paths } from 'expo-file-system'
@@ -230,7 +230,6 @@ const NativeTabsMemo = React.memo(function NativeTabsMemo({
 });
 
 export default function TabLayout() {
-    const router = useRouter()
     const { colors, effectiveTheme } = useThemeStore()
     const activeWallpaperTheme = useWallpaperStore(s => s.activeTheme)
     const { user } = useAuthStore()
@@ -353,8 +352,34 @@ export default function TabLayout() {
         }
     }, [activeWallpaperTheme, colors.background, effectiveTheme])
 
-    // Bottom bar stays mounted so edit actions can replace the main tabs in place.
-    const showBottomBar = currentTab !== 'vibe'
+    const handleVibeSubmit = useCallback((text: string) => {
+        const trimmed = text.trim()
+        if (!trimmed) return
+
+        try {
+            const store = useAgentStore.getState()
+            if (!store.activeConversationId) {
+                store.createConversation(trimmed.substring(0, 20))
+            }
+            store.sendMessage(trimmed)
+            DeviceEventEmitter.emit('onVibeSubmit', trimmed)
+        } catch (error) {
+            console.error('[TabsLayout] Vibe send error', error)
+        }
+    }, [])
+
+    useEffect(() => {
+        const preloadTask = InteractionManager.runAfterInteractions(() => {
+            setMountedPages(prev => prev.vibe ? prev : { ...prev, vibe: true })
+        })
+
+        return () => {
+            preloadTask.cancel()
+        }
+    }, [])
+
+    // Bottom bar stays mounted so the native Vibe input can expand on the tab.
+    const showBottomBar = !isHomeEditing
 
     // Tab Press Handler — instant switch with lazy mount
     const handleTabPress = useCallback((page: PageName) => {
@@ -535,11 +560,7 @@ export default function TabLayout() {
                         pointerEvents={currentTab === 'vibe' ? 'auto' : 'none'}
                         style={[StyleSheet.absoluteFill, currentTab === 'vibe' ? styles.pageVisible : styles.pageHidden]}
                     >
-                        <VibeChatMainScreen
-                            onBack={() => handleTabPress('home')}
-                            onOpenBuilder={() => router.push('/agent?mode=builder')}
-                            onOpenSettings={() => router.push('/agent-settings')}
-                        />
+                        <AgentChatScreen onBack={() => handleTabPress('home')} />
                     </AnimatedView>
                 )}
 
@@ -558,8 +579,8 @@ export default function TabLayout() {
                                 activeTintColor={colors.primary || (isDark ? '#e5e5e5' : '#007AFF')}
                                 inactiveTintColor={isDark ? 'rgba(229,229,229,0.6)' : 'rgba(0,0,0,0.4)'}
                                 isDark={isDark}
-                                isVibeExpanded={false}
-                                onVibeSubmit={() => {}}
+                                isVibeExpanded={currentTab === 'vibe'}
+                                onVibeSubmit={handleVibeSubmit}
                                 bottomBarFadeStyle={bottomBarFadeStyle}
                                 t={t}
                                 editMode={homeEditMode}

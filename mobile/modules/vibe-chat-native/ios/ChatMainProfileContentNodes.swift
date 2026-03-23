@@ -1,4 +1,5 @@
 import UIKit
+import AVFoundation
 
 final class ChatMainProfileTabNode: UIControl {
   private let titleLabel = UILabel()
@@ -355,7 +356,7 @@ final class ChatMainProfileMediaCellNode: UIControl {
     }
   }
 
-  func configure(urlString: String?, isVideo: Bool) {
+  func configure(urlString: String?, isVideo: Bool, thumbnailBase64: String? = nil) {
     videoBadge.isHidden = !isVideo
     imageLoadTask?.cancel()
     imageLoadTask = nil
@@ -363,6 +364,15 @@ final class ChatMainProfileMediaCellNode: UIControl {
     imageView.isHidden = true
     placeholderIcon.isHidden = false
     imageURLString = nil
+
+    if let thumbnailBase64,
+       let data = Data(base64Encoded: thumbnailBase64),
+       let image = UIImage(data: data) {
+      imageView.image = image
+      imageView.isHidden = false
+      placeholderIcon.isHidden = true
+      return
+    }
 
     guard let urlString, !urlString.isEmpty else { return }
     imageURLString = urlString
@@ -375,6 +385,30 @@ final class ChatMainProfileMediaCellNode: UIControl {
     }
 
     guard let url = URL(string: urlString) else { return }
+
+    if isVideo {
+      DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        let asset = AVURLAsset(url: url)
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 320, height: 320)
+        do {
+          let cgImage = try generator.copyCGImage(at: .zero, actualTime: nil)
+          let image = UIImage(cgImage: cgImage)
+          Self.imageCache.setObject(image, forKey: urlString as NSString)
+          DispatchQueue.main.async {
+            guard let self, self.imageURLString == urlString else { return }
+            self.imageView.image = image
+            self.imageView.isHidden = false
+            self.placeholderIcon.isHidden = true
+          }
+        } catch {
+          // ignore
+        }
+      }
+      return
+    }
+
     if url.isFileURL, let image = UIImage(contentsOfFile: url.path) {
       Self.imageCache.setObject(image, forKey: urlString as NSString)
       imageView.image = image

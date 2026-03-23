@@ -10,6 +10,7 @@ struct ChatListAppearance {
   let wallpaperMaskKey: String?
 
   let bubbleMeGradient: [UIColor]
+  let bubbleThemGradient: [UIColor]
   let bubbleThemColor: UIColor
 
   let textColorMe: UIColor
@@ -43,6 +44,10 @@ struct ChatListAppearance {
       UIColor(red: 0.49, green: 0.36, blue: 0.88, alpha: 1.0),
       UIColor(red: 0.42, green: 0.31, blue: 0.81, alpha: 1.0),
     ],
+    bubbleThemGradient: [
+      UIColor(red: 0.17, green: 0.17, blue: 0.29, alpha: 1.0),
+      UIColor(red: 0.17, green: 0.17, blue: 0.29, alpha: 1.0),
+    ],
     bubbleThemColor: UIColor(red: 0.17, green: 0.17, blue: 0.29, alpha: 1.0),
     textColorMe: .white,
     textColorThem: UIColor(white: 0.87, alpha: 1.0),
@@ -68,19 +73,25 @@ struct ChatListAppearance {
     let gradientStrings = raw["wallpaperGradient"] as? [String]
     let patternGradientStrings = raw["wallpaperPatternGradient"] as? [String]
     let meGradientStrings = raw["bubbleMeGradient"] as? [String]
+    let themGradientStrings = raw["bubbleThemGradient"] as? [String]
 
+    let bubbleThemColor = parseColor(raw["bubbleThemColor"] as? String) ?? fallback.bubbleThemColor
     let wallpaperGradient = parseGradient(gradientStrings, fallback: fallback.wallpaperGradient)
     let wallpaperPatternGradient = parseGradient(
       patternGradientStrings, fallback: fallback.wallpaperPatternGradient)
     let bubbleMeGradient = parseGradient(meGradientStrings, fallback: fallback.bubbleMeGradient)
-    let isDarkApprox = isDarkColor(wallpaperGradient.first ?? fallback.wallpaperGradient.first ?? .black)
-    let softenedPalette = softenedBubblePalette(
-      bubbleMeGradient: bubbleMeGradient,
-      bubbleThemColor: parseColor(raw["bubbleThemColor"] as? String) ?? fallback.bubbleThemColor,
-      wallpaperGradient: wallpaperGradient,
-      isDark: isDarkApprox
+    let bubbleThemGradient = parseGradient(
+      themGradientStrings,
+      fallback: [bubbleThemColor, bubbleThemColor]
     )
-
+    let textColorMe = parseColor(raw["textColorMe"] as? String) ?? fallback.textColorMe
+    let textColorThem = parseColor(raw["textColorThem"] as? String) ?? fallback.textColorThem
+    let isDark = isDarkColor(wallpaperGradient.first ?? fallback.wallpaperGradient.first ?? .black)
+    let dayPlateBase = resolvedDayPlateBase(
+      bubbleThemColor: bubbleThemColor,
+      wallpaperGradient: wallpaperGradient,
+      isDark: isDark
+    )
     return ChatListAppearance(
       backgroundMode: mode,
       wallpaperGradient: wallpaperGradient,
@@ -90,16 +101,20 @@ struct ChatListAppearance {
       wallpaperPatternOpacity: CGFloat(
         (raw["wallpaperPatternOpacity"] as? NSNumber)?.doubleValue ?? 0.0),
       wallpaperMaskKey: normalizedString(raw["wallpaperMaskKey"]),
-      bubbleMeGradient: softenedPalette.me,
-      bubbleThemColor: softenedPalette.them,
-      textColorMe: parseColor(raw["textColorMe"] as? String) ?? fallback.textColorMe,
-      textColorThem: parseColor(raw["textColorThem"] as? String) ?? fallback.textColorThem,
+      bubbleMeGradient: bubbleMeGradient,
+      bubbleThemGradient: bubbleThemGradient,
+      bubbleThemColor: bubbleThemColor,
+      textColorMe: textColorMe,
+      textColorThem: textColorThem,
       timeColorMe: parseColor(raw["timeColorMe"] as? String) ?? fallback.timeColorMe,
-      timeColorThem: parseColor(raw["timeColorThem"] as? String) ?? fallback.timeColorThem,
-      dayTextColor: parseColor(raw["dayTextColor"] as? String) ?? fallback.dayTextColor,
+      timeColorThem: parseColor(raw["timeColorThem"] as? String)
+        ?? colorWithAlpha(textColorThem, isDark ? 0.62 : 0.56),
+      dayTextColor: parseColor(raw["dayTextColor"] as? String)
+        ?? colorWithAlpha(textColorThem, isDark ? 0.90 : 0.84),
       dayBackgroundColor: parseColor(raw["dayBackgroundColor"] as? String)
-        ?? fallback.dayBackgroundColor,
-      dayBorderColor: parseColor(raw["dayBorderColor"] as? String) ?? fallback.dayBorderColor,
+        ?? colorWithAlpha(dayPlateBase, isDark ? 0.84 : 0.76),
+      dayBorderColor: parseColor(raw["dayBorderColor"] as? String)
+        ?? colorWithAlpha(textColorThem, isDark ? 0.08 : 0.10),
       insertionAnimationMode: (raw["insertionAnimationMode"] as? NSNumber)?.intValue
         ?? fallback.insertionAnimationMode
     )
@@ -113,6 +128,7 @@ struct ChatListAppearance {
         separator: ",")
       ?? ""
     let meKey = bubbleMeGradient.map(colorKey).joined(separator: ",")
+    let themKey = bubbleThemGradient.map(colorKey).joined(separator: ",")
     return [
       backgroundMode,
       String(format: "%.4f", wallpaperOpacity),
@@ -122,6 +138,7 @@ struct ChatListAppearance {
       String(format: "%.4f", wallpaperPatternOpacity),
       wallpaperMaskKey ?? "",
       meKey,
+      themKey,
       colorKey(bubbleThemColor),
       colorKey(textColorMe),
       colorKey(textColorThem),
@@ -146,6 +163,153 @@ struct ChatListAppearance {
       return luminance < 0.5
     }
     return true
+  }
+
+  var hasPatternWallpaper: Bool {
+    backgroundMode != "transparent"
+      && wallpaperPatternGradient.count >= 2
+      && wallpaperPatternOpacity > 0.001
+      && (wallpaperMaskKey?.isEmpty == false)
+  }
+
+  var wallpaperAnchorColor: UIColor {
+    let wallFirst = wallpaperGradient.first ?? (isDark ? UIColor.black : UIColor.white)
+    let wallLast = wallpaperGradient.last ?? wallFirst
+    return blendColor(wallFirst, with: wallLast, amount: 0.42)
+  }
+
+  var incomingBasePlateColor: UIColor {
+    blendColor(
+      bubbleThemGradient.first ?? bubbleThemColor,
+      with: bubbleThemGradient.last ?? bubbleThemColor,
+      amount: 0.5
+    )
+  }
+
+  var outgoingBasePlateColor: UIColor {
+    blendColor(
+      bubbleMeGradient.first ?? bubbleThemColor,
+      with: bubbleMeGradient.last ?? bubbleThemColor,
+      amount: 0.5
+    )
+  }
+
+  var incomingWallpaperSampleOpacity: CGFloat {
+    guard backgroundMode != "transparent" else { return 0.0 }
+    if hasPatternWallpaper {
+      return isDark ? 0.10 : 0.08
+    }
+    return isDark ? 0.04 : 0.03
+  }
+
+  var outgoingWallpaperSampleOpacity: CGFloat {
+    guard backgroundMode != "transparent" else { return 0.0 }
+    if hasPatternWallpaper {
+      return isDark ? 0.06 : 0.05
+    }
+    return isDark ? 0.03 : 0.02
+  }
+
+  var incomingPlateFillOpacity: CGFloat {
+    if hasPatternWallpaper {
+      return isDark ? 0.985 : 0.98
+    }
+    if backgroundMode != "transparent" {
+      return isDark ? 0.985 : 0.98
+    }
+    return isDark ? 0.90 : 0.94
+  }
+
+  var outgoingPlateFillOpacity: CGFloat {
+    if hasPatternWallpaper {
+      return isDark ? 0.985 : 0.98
+    }
+    if backgroundMode != "transparent" {
+      return isDark ? 0.99 : 0.985
+    }
+    return 0.0
+  }
+
+  private var wallpaperToneSamplingData: (colors: [UIColor], locations: [CGFloat]) {
+    if hasPatternWallpaper, wallpaperPatternGradient.count >= 2 {
+      return normalizedGradientSamplingData(
+        colors: wallpaperPatternGradient,
+        locations: wallpaperPatternLocations
+      )
+    }
+    return normalizedGradientSamplingData(colors: wallpaperGradient, locations: nil)
+  }
+
+  func wallpaperPlateColor(
+    isMe: Bool,
+    sampleRect: CGRect,
+    containerSize: CGSize
+  ) -> UIColor {
+    let baseColor = isMe ? outgoingBasePlateColor : incomingBasePlateColor
+    guard backgroundMode != "transparent" else {
+      return baseColor
+    }
+
+    let samplePoint = CGPoint(x: sampleRect.midX, y: sampleRect.midY)
+    let wallpaperColor = wallpaperToneColor(at: samplePoint, containerSize: containerSize)
+    if isMe {
+      let tinted = blendColor(
+        baseColor,
+        with: wallpaperColor,
+        amount: hasPatternWallpaper ? (isDark ? 0.18 : 0.14) : (isDark ? 0.08 : 0.05)
+      )
+      return blendColor(
+        tinted,
+        with: UIColor.black,
+        amount: hasPatternWallpaper ? (isDark ? 0.12 : 0.06) : (isDark ? 0.08 : 0.03)
+      )
+    }
+
+    let darkerIncomingReference = blendColor(
+      bubbleThemGradient.first ?? bubbleThemColor,
+      with: bubbleThemGradient.last ?? bubbleThemColor,
+      amount: 0.82
+    )
+    let isolatedIncomingBase = blendColor(
+      baseColor,
+      with: darkerIncomingReference,
+      amount: hasPatternWallpaper ? 0.76 : 0.58
+    )
+    let anchoredIncomingWallpaper = blendColor(
+      wallpaperColor,
+      with: wallpaperAnchorColor,
+      amount: hasPatternWallpaper ? 0.68 : 0.80
+    )
+    let tinted = blendColor(
+      isolatedIncomingBase,
+      with: anchoredIncomingWallpaper,
+      amount: hasPatternWallpaper ? (isDark ? 0.13 : 0.10) : (isDark ? 0.06 : 0.04)
+    )
+    let harmonized = blendColor(
+      tinted,
+      with: darkerIncomingReference,
+      amount: hasPatternWallpaper ? 0.18 : 0.10
+    )
+    return blendColor(
+      harmonized,
+      with: UIColor.black,
+      amount: hasPatternWallpaper ? (isDark ? 0.26 : 0.15) : (isDark ? 0.15 : 0.08)
+    )
+  }
+
+  private func wallpaperToneColor(at point: CGPoint, containerSize: CGSize) -> UIColor {
+    guard containerSize.width > 1.0, containerSize.height > 1.0 else {
+      return wallpaperAnchorColor
+    }
+    let normalizedX = clampUnit(point.x / containerSize.width)
+    let normalizedY = clampUnit(point.y / containerSize.height)
+    let diagonalProgress = clampUnit((normalizedX * 0.38) + (normalizedY * 0.62))
+    let samplingData = wallpaperToneSamplingData
+    return interpolatedGradientColor(
+      colors: samplingData.colors,
+      locations: samplingData.locations,
+      at: diagonalProgress
+    )
   }
 }
 
@@ -202,40 +366,56 @@ private func nativePresetAppearance(
   }
 
   let wallpaperGradient = parseGradient(
-    resolvedBackgroundGradient, fallback: fallback.wallpaperGradient)
-  let patternGradient = parseGradient(resolvedPatternGradientColors, fallback: [])
+    (raw["wallpaperGradient"] as? [String]) ?? resolvedBackgroundGradient,
+    fallback: fallback.wallpaperGradient)
+  let patternGradient = parseGradient(
+    (raw["wallpaperPatternGradient"] as? [String]) ?? resolvedPatternGradientColors,
+    fallback: [])
   let bubbleMeGradient = parseGradient(
-    variant.bubbleMeGradient, fallback: fallback.bubbleMeGradient)
+    (raw["bubbleMeGradient"] as? [String]) ?? variant.bubbleMeGradient,
+    fallback: fallback.bubbleMeGradient)
   let rawBubbleThemColor =
-    parseColor(variant.bubbleThemGradient.first) ?? parseColor(variant.bubbleThem)
+    parseColor(raw["bubbleThemColor"] as? String)
+    ?? parseColor(variant.bubbleThemGradient.first)
+    ?? parseColor(variant.bubbleThem)
     ?? fallback.bubbleThemColor
-  let textColorMe = parseColor(variant.textColorMe) ?? fallback.textColorMe
-  let textColorThem = parseColor(variant.textColorThem) ?? fallback.textColorThem
-  let dayBackgroundBase = wallpaperGradient.first ?? fallback.wallpaperGradient.first ?? .black
-  let softenedPalette = softenedBubblePalette(
-    bubbleMeGradient: bubbleMeGradient,
+  let textColorMe = parseColor(raw["textColorMe"] as? String) ?? parseColor(variant.textColorMe)
+    ?? fallback.textColorMe
+  let textColorThem =
+    parseColor(raw["textColorThem"] as? String) ?? parseColor(variant.textColorThem)
+    ?? fallback.textColorThem
+  let dayPlateBase = resolvedDayPlateBase(
     bubbleThemColor: rawBubbleThemColor,
     wallpaperGradient: wallpaperGradient,
     isDark: isDark
   )
-
   return ChatListAppearance(
     backgroundMode: mode,
     wallpaperGradient: wallpaperGradient,
     wallpaperOpacity: wallpaperOpacity,
     wallpaperPatternGradient: patternGradient,
-    wallpaperPatternLocations: variant.patternGradientLocations.map { NSNumber(value: $0) },
-    wallpaperPatternOpacity: CGFloat(resolvedPatternOpacity),
-    wallpaperMaskKey: preset.maskedImage,
-    bubbleMeGradient: softenedPalette.me,
-    bubbleThemColor: softenedPalette.them,
+    wallpaperPatternLocations: parseNumberArray(raw["wallpaperPatternLocations"])
+      ?? variant.patternGradientLocations.map { NSNumber(value: $0) },
+    wallpaperPatternOpacity: CGFloat(
+      (raw["wallpaperPatternOpacity"] as? NSNumber)?.doubleValue ?? resolvedPatternOpacity),
+    wallpaperMaskKey: normalizedString(raw["wallpaperMaskKey"]) ?? preset.maskedImage,
+    bubbleMeGradient: bubbleMeGradient,
+    bubbleThemGradient: parseGradient(
+      raw["bubbleThemGradient"] as? [String],
+      fallback: variant.bubbleThemGradient.compactMap(parseColor)
+    ),
+    bubbleThemColor: rawBubbleThemColor,
     textColorMe: textColorMe,
     textColorThem: textColorThem,
-    timeColorMe: colorWithAlpha(textColorMe, 0.72),
-    timeColorThem: colorWithAlpha(textColorThem, 0.5),
-    dayTextColor: colorWithAlpha(textColorThem, 0.82),
-    dayBackgroundColor: colorWithAlpha(dayBackgroundBase, 0.42),
-    dayBorderColor: colorWithAlpha(.white, 0.16),
+    timeColorMe: parseColor(raw["timeColorMe"] as? String) ?? colorWithAlpha(textColorMe, 0.72),
+    timeColorThem: parseColor(raw["timeColorThem"] as? String)
+      ?? colorWithAlpha(textColorThem, isDark ? 0.62 : 0.56),
+    dayTextColor: parseColor(raw["dayTextColor"] as? String)
+      ?? colorWithAlpha(textColorThem, isDark ? 0.90 : 0.84),
+    dayBackgroundColor: parseColor(raw["dayBackgroundColor"] as? String)
+      ?? colorWithAlpha(dayPlateBase, isDark ? 0.84 : 0.76),
+    dayBorderColor: parseColor(raw["dayBorderColor"] as? String)
+      ?? colorWithAlpha(textColorThem, isDark ? 0.08 : 0.10),
     insertionAnimationMode: insertionAnimationMode
   )
 }
@@ -465,6 +645,17 @@ private func parseNumberArray(_ raw: Any?) -> [NSNumber]? {
   return nil
 }
 
+private func resolvedDayPlateBase(
+  bubbleThemColor: UIColor,
+  wallpaperGradient: [UIColor],
+  isDark: Bool
+) -> UIColor {
+  let wallFirst = wallpaperGradient.first ?? (isDark ? UIColor.black : UIColor.white)
+  let wallLast = wallpaperGradient.last ?? wallFirst
+  let wallpaperAnchor = blendColor(wallFirst, with: wallLast, amount: 0.38)
+  return blendColor(bubbleThemColor, with: wallpaperAnchor, amount: isDark ? 0.14 : 0.08)
+}
+
 private func softenedBubblePalette(
   bubbleMeGradient: [UIColor],
   bubbleThemColor: UIColor,
@@ -516,6 +707,138 @@ private func blendColor(_ from: UIColor, with to: UIColor, amount: CGFloat) -> U
     blue: (fb * inv) + (tb * t),
     alpha: (fa * inv) + (ta * t)
   )
+}
+
+private func clampUnit(_ value: CGFloat) -> CGFloat {
+  min(1.0, max(0.0, value))
+}
+
+private func normalizedGradientSamplingData(
+  colors: [UIColor],
+  locations: [NSNumber]?
+) -> (colors: [UIColor], locations: [CGFloat]) {
+  guard !colors.isEmpty else {
+    return ([.black], [0.0])
+  }
+
+  if colors.count == 1 {
+    return (colors, [0.0])
+  }
+
+  let resolvedLocations: [CGFloat] = {
+    if let locations, locations.count == colors.count {
+      var lastValue: CGFloat = 0.0
+      return locations.enumerated().map { index, value in
+        let clamped = clampUnit(CGFloat(truncating: value))
+        let monotonic = index == 0 ? clamped : max(lastValue, clamped)
+        lastValue = monotonic
+        return monotonic
+      }
+    }
+
+    return (0..<colors.count).map { index in
+      CGFloat(index) / CGFloat(max(colors.count - 1, 1))
+    }
+  }()
+
+  switch colors.count {
+  case 2:
+    let start = resolvedLocations[0]
+    let end = resolvedLocations[1]
+    return (
+      [
+        colors[0],
+        blendColor(colors[0], with: colors[1], amount: 0.25),
+        blendColor(colors[0], with: colors[1], amount: 0.50),
+        blendColor(colors[0], with: colors[1], amount: 0.75),
+        colors[1],
+      ],
+      [
+        start,
+        start + ((end - start) * 0.25),
+        start + ((end - start) * 0.50),
+        start + ((end - start) * 0.75),
+        end,
+      ]
+    )
+  case 3:
+    let start = resolvedLocations[0]
+    let middle = resolvedLocations[1]
+    let end = resolvedLocations[2]
+    return (
+      [
+        colors[0],
+        blendColor(colors[0], with: colors[1], amount: 0.5),
+        colors[1],
+        blendColor(colors[1], with: colors[2], amount: 0.5),
+        colors[2],
+      ],
+      [
+        start,
+        start + ((middle - start) * 0.5),
+        middle,
+        middle + ((end - middle) * 0.5),
+        end,
+      ]
+    )
+  case 4:
+    let middleLocation = resolvedLocations[1] + ((resolvedLocations[2] - resolvedLocations[1]) * 0.5)
+    return (
+      [
+        colors[0],
+        colors[1],
+        blendColor(colors[1], with: colors[2], amount: 0.5),
+        colors[2],
+        colors[3],
+      ],
+      [
+        resolvedLocations[0],
+        resolvedLocations[1],
+        middleLocation,
+        resolvedLocations[2],
+        resolvedLocations[3],
+      ]
+    )
+  default:
+    return (colors, resolvedLocations)
+  }
+}
+
+private func interpolatedGradientColor(
+  colors: [UIColor],
+  locations: [CGFloat]? = nil,
+  at progress: CGFloat
+) -> UIColor {
+  guard !colors.isEmpty else { return .black }
+  if colors.count == 1 { return colors[0] }
+
+  let clamped = clampUnit(progress)
+  let resolvedLocations: [CGFloat] = {
+    if let locations, locations.count == colors.count {
+      return locations
+    }
+    return (0..<colors.count).map { index in
+      CGFloat(index) / CGFloat(max(colors.count - 1, 1))
+    }
+  }()
+
+  if clamped <= resolvedLocations[0] {
+    return colors[0]
+  }
+  if clamped >= resolvedLocations[colors.count - 1] {
+    return colors[colors.count - 1]
+  }
+
+  for index in 0..<(colors.count - 1) {
+    let start = resolvedLocations[index]
+    let end = resolvedLocations[index + 1]
+    guard clamped >= start, clamped <= end else { continue }
+    let distance = max(end - start, 0.0001)
+    let localT = clampUnit((clamped - start) / distance)
+    return blendColor(colors[index], with: colors[index + 1], amount: localT)
+  }
+
+  return colors[colors.count - 1]
 }
 
 private func isDarkColor(_ color: UIColor) -> Bool {

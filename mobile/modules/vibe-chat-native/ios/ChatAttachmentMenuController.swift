@@ -8,7 +8,7 @@ import UniformTypeIdentifiers
 // MARK: - ChatAttachmentMenuController
 
 final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate {
-  var onSelectImage: ((String, String?) -> Void)?
+  var onSelectImage: ((String, String?, ChatAttachmentTransitionCapture?) -> Void)?
   var onSelectFile: ((String, String) -> Void)?
   var onSelectLocation: ((Double, Double) -> Void)?
 
@@ -856,7 +856,7 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
     guard !isSelectingAsset else { return }
     isSelectingAsset = true
     if asset.mediaType == .video {
-      sendVideo(asset)
+      sendVideo(asset, skipEditor: skipEditor)
       return
     }
     let options = PHImageRequestOptions()
@@ -881,7 +881,9 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
         DispatchQueue.main.async {
           self.isSelectingAsset = false
           if skipEditor {
-            self.finishAndDismiss { self.onSelectImage?(url.absoluteString, self.currentCaption()) }
+            self.finishAndDismiss {
+              self.onSelectImage?(url.absoluteString, self.currentCaption(), nil)
+            }
           } else {
             self.presentEditor(for: url, initialImage: UIImage(data: data))
           }
@@ -893,50 +895,232 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
   }
 
   private func presentEditor(for url: URL, initialImage: UIImage?) {
+    let onSelectImage = self.onSelectImage
     ChatImageEditModule.presentEditor(
       from: self, messageId: nil, mediaURL: url.absoluteString,
-      initialImage: initialImage, initialCaption: currentCaption()
+      initialImage: initialImage,
+      initialCaption: currentCaption(),
+      dismissPresenterOnSend: true
     ) { [weak self] payload in
       if payload.eventType == .sendNew {
         let finalURL = payload.editedImageURL ?? url
         let caption = payload.caption ?? self?.currentCaption()
-        self?.finishAndDismiss { self?.onSelectImage?(finalURL.absoluteString, caption) }
+        if let self = self {
+          self.finishAndDismiss {
+            onSelectImage?(finalURL.absoluteString, caption, nil)
+          }
+        } else {
+          onSelectImage?(finalURL.absoluteString, caption, nil)
+        }
       }
     }
   }
 
-  private func sendVideo(_ asset: PHAsset) {
+  private func sendVideo(_ asset: PHAsset, skipEditor: Bool = false) {
     let opts = PHVideoRequestOptions()
     opts.isNetworkAccessAllowed = true
     opts.deliveryMode = .highQualityFormat
     PHImageManager.default().requestAVAsset(forVideo: asset, options: opts) {
       [weak self] avAsset, _, _ in
-      guard let self, let urlAsset = avAsset as? AVURLAsset else {
+      guard let self, let avAsset else {
         DispatchQueue.main.async { self?.isSelectingAsset = false }
         return
       }
-      let ext = urlAsset.url.pathExtension.isEmpty ? "mov" : urlAsset.url.pathExtension
-      let url = FileManager.default.temporaryDirectory
-        .appendingPathComponent("gallery-video-\(UUID().uuidString)")
-        .appendingPathExtension(ext)
-      do {
-        if FileManager.default.fileExists(atPath: url.path) {
-          try FileManager.default.removeItem(at: url)
-        }
-        try FileManager.default.copyItem(at: urlAsset.url, to: url)
-        DispatchQueue.main.async {
+      DispatchQueue.main.async {
+        if skipEditor {
+          self.persistSelectedVideoAsset(avAsset)
+        } else {
           self.isSelectingAsset = false
-          self.finishAndDismiss { self.onSelectImage?(url.absoluteString, self.currentCaption()) }
+          self.presentVideoEditor(for: avAsset)
         }
-      } catch {
-        DispatchQueue.main.async { self.isSelectingAsset = false }
       }
     }
   }
 
-  private func finishAndDismiss(_ action: () -> Void) {
-    action()
-    dismiss(animated: true)
+  private func presentVideoEditor(for asset: AVAsset) {
+    let onSelectImage = self.onSelectImage
+    ChatVideoEditModule.presentEditor(
+      from: self,
+      asset: asset,
+      initialCaption: currentCaption()
+    ) { [weak self] payload in
+      if let self = self {
+        self.finishAndDismiss {
+          onSelectImage?(
+            payload.videoURL.absoluteString,
+            payload.caption,
+            payload.transitionCapture
+          )
+        }
+      } else {
+        onSelectImage?(
+          payload.videoURL.absoluteString,
+          payload.caption,
+          payload.transitionCapture
+        )
+      }
+    }
+  }
+
+  private func persistSelectedVideoAsset(_ asset: AVAsset) {
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      guard let self else { return }
+      
+      let exportPresets = AVAssetExportSession.exportPresets(compatibleWith: asset)
+      let preferredPresets = [
+        AVAssetExportPreset1280x720,
+        AVAssetExportPreset960x540,
+        AVAssetExportPresetMediumQuality,
+      ]
+
+      if let presetName = preferredPresets.first(where: { exportPresets.contains($0) }),
+        let exportSession = AVAssetExportSession(asset: asset, presetName: presetName),
+        let outputFileType =
+          ([AVFileType.mov, .mp4].first { exportSession.supportedFileTypes.contains($0) })
+          ?? exportSession.supportedFileTypes.first
+      {
+        let outputExtension = outputFileType == .mov ? "mov" : "mp4"
+        let outputURL = FileManager.default.temporaryDirectory
+          .appendingPathComponent("gallery-video-\(UUID().uuidString)")
+          .appendingPathExtension(outputExtension)
+
+        if FileManager.default.fileExists(atPath: outputURL.path) {
+          try? FileManager.default.removeItem(at: outputURL)
+        }
+
+        exportSession.outputURL = outputURL
+        exportSession.outputFileType = outputFileType
+        exportSession.shouldOptimizeForNetworkUse = true
+        NSLog(
+          "[ChatAttachmentVideoExport] start preset=%@ fileType=%@ output=%@",
+          presetName,
+          outputFileType.rawValue,
+          outputURL.lastPathComponent
+        )
+        exportSession.exportAsynchronously { [weak self] in
+          DispatchQueue.main.async {
+            guard let self else { return }
+            if exportSession.status == .completed,
+              self.isUsableExportedVideo(outputURL, logContext: "gallery_export")
+            {
+              self.isSelectingAsset = false
+              self.finishAndDismiss {
+                self.onSelectImage?(outputURL.absoluteString, self.currentCaption(), nil)
+              }
+              return
+            }
+
+            if let urlAsset = asset as? AVURLAsset,
+              let fallbackURL = try? self.copyVideoToTemporaryURL(from: urlAsset.url)
+            {
+              self.isSelectingAsset = false
+              self.finishAndDismiss {
+                self.onSelectImage?(fallbackURL.absoluteString, self.currentCaption(), nil)
+              }
+              return
+            }
+
+            self.isSelectingAsset = false
+          }
+        }
+        return
+      }
+
+      if let urlAsset = asset as? AVURLAsset {
+        do {
+          let url = try self.copyVideoToTemporaryURL(from: urlAsset.url)
+          DispatchQueue.main.async {
+            self.isSelectingAsset = false
+            self.finishAndDismiss { self.onSelectImage?(url.absoluteString, self.currentCaption(), nil) }
+          }
+        } catch {
+          DispatchQueue.main.async { self.isSelectingAsset = false }
+        }
+        return
+      }
+
+      DispatchQueue.main.async {
+        self.isSelectingAsset = false
+      }
+    }
+  }
+
+  private func isUsableExportedVideo(_ url: URL, logContext: String) -> Bool {
+    let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+    let byteSize = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+    guard byteSize > 0 else {
+      NSLog("[ChatAttachmentVideoExport] %@ invalid empty path=%@", logContext, url.path)
+      return false
+    }
+    let asset = AVURLAsset(url: url)
+    let videoTracks = asset.tracks(withMediaType: .video)
+    if asset.isPlayable && !videoTracks.isEmpty {
+      NSLog(
+        "[ChatAttachmentVideoExport] %@ validated path=%@ bytes=%lld tracks=%d",
+        logContext,
+        url.path,
+        byteSize,
+        videoTracks.count
+      )
+      return true
+    }
+    let generator = AVAssetImageGenerator(asset: asset)
+    generator.appliesPreferredTrackTransform = true
+    generator.maximumSize = CGSize(width: 640.0, height: 640.0)
+    let probeTimes: [Double] = [0.0, 0.05, 0.12, 0.25, 0.5]
+    var lastErrorDescription = "unknown"
+    for seconds in probeTimes {
+      do {
+        _ = try generator.copyCGImage(
+          at: CMTime(seconds: seconds, preferredTimescale: 600),
+          actualTime: nil
+        )
+        NSLog(
+          "[ChatAttachmentVideoExport] %@ validated by frame path=%@ bytes=%lld frame=%.2f",
+          logContext,
+          url.path,
+          byteSize,
+          seconds
+        )
+        return true
+      } catch {
+        lastErrorDescription = error.localizedDescription
+      }
+    }
+    NSLog(
+      "[ChatAttachmentVideoExport] %@ invalid path=%@ bytes=%lld tracks=%d playable=%@ error=%@",
+      logContext,
+      url.path,
+      byteSize,
+      videoTracks.count,
+      asset.isPlayable ? "Y" : "N",
+      lastErrorDescription
+    )
+    return false
+  }
+
+  private func copyVideoToTemporaryURL(from sourceURL: URL) throws -> URL {
+    let ext = sourceURL.pathExtension.isEmpty ? "mov" : sourceURL.pathExtension
+    let destinationURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("gallery-video-\(UUID().uuidString)")
+      .appendingPathExtension(ext)
+    if FileManager.default.fileExists(atPath: destinationURL.path) {
+      try FileManager.default.removeItem(at: destinationURL)
+    }
+    try FileManager.default.copyItem(at: sourceURL, to: destinationURL)
+    return destinationURL
+  }
+
+  private func finishAndDismiss(_ action: @escaping () -> Void) {
+    if let presenter = presentingViewController {
+      presenter.dismiss(animated: true) {
+        action()
+      }
+    } else {
+      dismiss(animated: true) {
+        action()
+      }
+    }
   }
 
   // MARK: - Actions
@@ -1148,6 +1332,7 @@ extension ChatAttachmentMenuController:
     let asset = galleryAssets[assetIdx]
     cell.representedAssetId = asset.localIdentifier
     cell.imageView.image = nil
+    cell.configureVideoBadge(isVideo: asset.mediaType == .video, duration: asset.duration)
     cell.onSelectToggle = { [weak self] in
       self?.handleSelectToggle(assetIndex: assetIdx)
     }
@@ -1217,10 +1402,11 @@ extension ChatAttachmentMenuController: UIImagePickerControllerDelegate,
           "camera-\(UUID().uuidString).jpg")
         if let data = image.jpegData(compressionQuality: 0.9) {
           try? data.write(to: tempURL)
-          self?.finishAndDismiss { self?.onSelectImage?(tempURL.absoluteString, nil) }
+          self?.finishAndDismiss { self?.onSelectImage?(tempURL.absoluteString, nil, nil) }
         }
-      } else if let videoURL = info[.mediaURL] as? URL {
-        self?.finishAndDismiss { self?.onSelectImage?(videoURL.absoluteString, nil) }
+      } else if let videoURL = info[.mediaURL] as? URL, let self {
+        let stableURL = (try? self.copyVideoToTemporaryURL(from: videoURL)) ?? videoURL
+        self.presentVideoEditor(for: AVURLAsset(url: stableURL))
       }
     }
   }
@@ -1266,6 +1452,9 @@ private final class ChatAttachmentAssetCell: UICollectionViewCell {
 
   // Selection toggle button at top-right
   private let toggleButton = UIButton(type: .system)
+  private let videoBadgeView = UIView()
+  private let videoBadgeIconView = UIImageView()
+  private let videoBadgeLabel = UILabel()
   private var isChecked = false
 
   override init(frame: CGRect) {
@@ -1292,6 +1481,25 @@ private final class ChatAttachmentAssetCell: UICollectionViewCell {
     // Large hit area
     toggleButton.contentEdgeInsets = UIEdgeInsets(top: 4, left: 4, bottom: 4, right: 4)
     contentView.addSubview(toggleButton)
+
+    videoBadgeView.backgroundColor = UIColor(white: 0.0, alpha: 0.64)
+    videoBadgeView.layer.cornerRadius = 8
+    videoBadgeView.layer.cornerCurve = .continuous
+    videoBadgeView.isHidden = true
+    contentView.addSubview(videoBadgeView)
+
+    videoBadgeIconView.image = UIImage(
+      systemName: "video.fill",
+      withConfiguration: UIImage.SymbolConfiguration(pointSize: 10, weight: .semibold))
+    videoBadgeIconView.tintColor = .white
+    videoBadgeIconView.contentMode = .scaleAspectFit
+    videoBadgeIconView.isHidden = true
+    videoBadgeView.addSubview(videoBadgeIconView)
+
+    videoBadgeLabel.font = .systemFont(ofSize: 11, weight: .semibold)
+    videoBadgeLabel.textColor = .white
+    videoBadgeLabel.textAlignment = .center
+    videoBadgeView.addSubview(videoBadgeLabel)
   }
 
   required init?(coder: NSCoder) { nil }
@@ -1302,6 +1510,23 @@ private final class ChatAttachmentAssetCell: UICollectionViewCell {
     toggleButton.frame = CGRect(
       x: bounds.width - size - 4, y: 4, width: size, height: size
     )
+
+    let badgeText = videoBadgeLabel.text ?? ""
+    let labelWidth = ceil((badgeText as NSString).size(withAttributes: [.font: videoBadgeLabel.font as Any]).width)
+    let badgeWidth = max(34.0, labelWidth + 16.0)
+    let badgeHeight: CGFloat = 20.0
+    videoBadgeView.frame = CGRect(
+      x: bounds.width - badgeWidth - 6.0,
+      y: bounds.height - badgeHeight - 6.0,
+      width: badgeWidth,
+      height: badgeHeight
+    )
+    videoBadgeLabel.frame = CGRect(
+      x: 8.0,
+      y: 2.0,
+      width: max(1.0, badgeWidth - 16.0),
+      height: badgeHeight - 4.0
+    )
   }
 
   override func prepareForReuse() {
@@ -1309,6 +1534,8 @@ private final class ChatAttachmentAssetCell: UICollectionViewCell {
     representedAssetId = ""
     imageView.image = nil
     onSelectToggle = nil
+    videoBadgeView.isHidden = true
+    videoBadgeLabel.text = nil
     setChecked(false, animated: false)
   }
 
@@ -1334,6 +1561,28 @@ private final class ChatAttachmentAssetCell: UICollectionViewCell {
       toggleButton.setImage(image, for: .normal)
       toggleButton.tintColor = tint
     }
+  }
+
+  func configureVideoBadge(isVideo: Bool, duration: TimeInterval) {
+    guard isVideo else {
+      videoBadgeView.isHidden = true
+      videoBadgeLabel.text = nil
+      return
+    }
+    videoBadgeLabel.text = Self.formattedDuration(duration)
+    videoBadgeView.isHidden = false
+    setNeedsLayout()
+  }
+
+  private static func formattedDuration(_ duration: TimeInterval) -> String {
+    let totalSeconds = max(0, Int(duration.rounded()))
+    let hours = totalSeconds / 3600
+    let minutes = (totalSeconds % 3600) / 60
+    let seconds = totalSeconds % 60
+    if hours > 0 {
+      return String(format: "%d:%02d:%02d", hours, minutes, seconds)
+    }
+    return String(format: "%d:%02d", minutes, seconds)
   }
 }
 
@@ -1431,13 +1680,11 @@ extension ChatAttachmentMenuController: PHPickerViewControllerDelegate {
       itemProvider.loadFileRepresentation(forTypeIdentifier: UTType.movie.identifier) {
         [weak self] url, _ in
         guard let url = url else { return }
-        let ext = url.pathExtension.isEmpty ? "mov" : url.pathExtension
-        let finalUrl = FileManager.default.temporaryDirectory
-          .appendingPathComponent("gallery-video-\(UUID().uuidString)")
-          .appendingPathExtension(ext)
-        try? FileManager.default.copyItem(at: url, to: finalUrl)
+        guard let self else { return }
+        let stableURL = (try? self.copyVideoToTemporaryURL(from: url)) ?? url
         DispatchQueue.main.async {
-          self?.finishAndDismiss { self?.onSelectImage?(finalUrl.absoluteString, nil) }
+          self.isSelectingAsset = false
+          self.presentVideoEditor(for: AVURLAsset(url: stableURL))
         }
       }
     } else if itemProvider.canLoadObject(ofClass: UIImage.self) {
@@ -1448,7 +1695,7 @@ extension ChatAttachmentMenuController: PHPickerViewControllerDelegate {
           .appendingPathComponent("gallery-\(UUID().uuidString).jpg")
         try? data.write(to: url)
         DispatchQueue.main.async {
-          self?.finishAndDismiss { self?.onSelectImage?(url.absoluteString, nil) }
+          self?.finishAndDismiss { self?.onSelectImage?(url.absoluteString, nil, nil) }
         }
       }
     }

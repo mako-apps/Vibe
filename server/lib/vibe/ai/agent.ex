@@ -263,7 +263,7 @@ defmodule Vibe.AI.Agent do
          messages,
          callback,
          depth \\ 0,
-         _buffered_text \\ "",
+         accumulated_text \\ "",
          user_id \\ nil,
          system_prompt \\ @system_prompt,
          tools \\ nil,
@@ -295,12 +295,12 @@ defmodule Vibe.AI.Agent do
           {"anthropic-version", "2023-06-01"}
         ]
 
-        # Always defer streaming until tools complete - no intro text should be shown
-        # We only stream the FINAL response after all tool calls are done
-        stream_text = false
+        # The prompt already instructs Claude to call tools without any intro text,
+        # so the chat can safely stream deltas as soon as they arrive.
+        stream_text = true
 
         case stream_claude_response(body, headers, callback, stream_text: stream_text) do
-          {:tool_use, tool_calls, partial_response} ->
+          {:tool_use, tool_calls, partial_response, partial_text} ->
             # Execute tools first (this emits progress + tool_result events)
             tool_results = execute_tools(tool_calls, callback, user_id, chat_id)
 
@@ -310,13 +310,19 @@ defmodule Vibe.AI.Agent do
               %{role: "user", content: tool_results}
             ]
 
-            # Recurse to get final response - don't pass any buffered intro text
-            call_claude_with_tools(new_messages, callback, depth + 1, "", user_id, system_prompt, tools, chat_id)
+            call_claude_with_tools(
+              new_messages,
+              callback,
+              depth + 1,
+              accumulated_text <> partial_text,
+              user_id,
+              system_prompt,
+              tools,
+              chat_id
+            )
 
           {:ok, response} ->
-            # Final turn - stream the complete response now
-            callback.(%{type: :text, content: response})
-            {:ok, response}
+            {:ok, accumulated_text <> response}
 
           {:error, reason} ->
             {:error, reason}
@@ -338,7 +344,11 @@ defmodule Vibe.AI.Agent do
     # Using Finch for streaming HTTP
     request = Finch.build(:post, @claude_api, headers, body)
 
-    result = Finch.stream(request, Vibe.Finch, %{text: "", tool_calls: [], current_tool_index: -1, stop_reason: nil}, fn
+    result = Finch.stream(
+      request,
+      Vibe.Finch,
+      %{text: "", tool_calls: [], current_tool_index: -1, stop_reason: nil, buffer: ""},
+      fn
       {:status, status}, acc ->
         Map.put(acc, :status, status)
 
@@ -346,8 +356,8 @@ defmodule Vibe.AI.Agent do
         Map.put(acc, :headers, resp_headers)
 
       {:data, data}, acc ->
-        # Parse SSE events
-        events = parse_sse_events(data)
+        {events, buffer} = parse_sse_events((acc.buffer || "") <> data)
+        acc = Map.put(acc, :buffer, buffer)
 
         Enum.reduce(events, acc, fn event, inner_acc ->
           case event do
@@ -385,25 +395,32 @@ defmodule Vibe.AI.Agent do
               inner_acc
           end
         end)
-    end)
+      end
+    )
 
     case result do
       {:ok, final_acc} ->
-        case final_acc.stop_reason do
-          "tool_use" ->
-            # Parse inputs for each tool
-            tools_with_input = Enum.map(final_acc.tool_calls, fn tool ->
-              input = case Jason.decode(tool["input_json"] || "{}") do
-                {:ok, parsed} -> parsed
-                _ -> %{}
-              end
-              Map.put(tool, "input", input)
-            end)
-
-            {:tool_use, tools_with_input, build_content_blocks(final_acc)}
+        case final_acc.status do
+          status when is_integer(status) and status != 200 ->
+            {:error, "API error: #{status}"}
 
           _ ->
-            {:ok, final_acc.text}
+            case final_acc.stop_reason do
+              "tool_use" ->
+                # Parse inputs for each tool
+                tools_with_input = Enum.map(final_acc.tool_calls, fn tool ->
+                  input = case Jason.decode(tool["input_json"] || "{}") do
+                    {:ok, parsed} -> parsed
+                    _ -> %{}
+                  end
+                  Map.put(tool, "input", input)
+                end)
+
+                {:tool_use, tools_with_input, build_content_blocks(final_acc), final_acc.text}
+
+              _ ->
+                {:ok, final_acc.text}
+            end
         end
 
       {:error, reason} ->
@@ -412,19 +429,56 @@ defmodule Vibe.AI.Agent do
   end
 
   defp parse_sse_events(data) do
-    data
-    |> String.split("\n")
-    |> Enum.filter(&String.starts_with?(&1, "data: "))
-    |> Enum.map(fn line ->
-      line
-      |> String.replace_prefix("data: ", "")
-      |> Jason.decode()
-      |> case do
-        {:ok, parsed} -> parsed
-        _ -> nil
+    data =
+      data
+      |> to_string()
+      |> String.replace("\r\n", "\n")
+
+    chunks = String.split(data, "\n\n", trim: false)
+
+    {complete_chunks, remaining} =
+      if String.ends_with?(data, "\n\n") do
+        {Enum.reject(chunks, &(&1 == "")), ""}
+      else
+        case Enum.split(chunks, max(length(chunks) - 1, 0)) do
+          {complete, [tail]} -> {Enum.reject(complete, &(&1 == "")), tail}
+          {complete, []} -> {Enum.reject(complete, &(&1 == "")), ""}
+        end
       end
-    end)
-    |> Enum.reject(&is_nil/1)
+
+    events =
+      complete_chunks
+      |> Enum.map(&parse_sse_event_block/1)
+      |> Enum.reject(&is_nil/1)
+
+    {events, remaining}
+  end
+
+  defp parse_sse_event_block(chunk) do
+    payload =
+      chunk
+      |> String.split("\n", trim: false)
+      |> Enum.filter(&String.starts_with?(&1, "data:"))
+      |> Enum.map(fn line ->
+        line
+        |> String.replace_prefix("data:", "")
+        |> String.trim_leading()
+      end)
+      |> Enum.join("\n")
+
+    cond do
+      payload == "" ->
+        nil
+
+      payload == "[DONE]" ->
+        nil
+
+      true ->
+        case Jason.decode(payload) do
+          {:ok, parsed} -> parsed
+          _ -> nil
+        end
+    end
   end
 
   defp build_content_blocks(acc) do

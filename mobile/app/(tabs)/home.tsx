@@ -1123,7 +1123,13 @@ export default function HomeScreen({ onChatSelect, onOpenStoryCamera, onOpenVibe
         wallpaperPatternOpacity: resolvedWallpaperTheme.patternOpacity || 0,
         wallpaperMaskKey: resolvedWallpaperTheme.maskedImage || resolvedWallpaperTheme.patternType || undefined,
         bubbleMeGradient: resolvedWallpaperTheme.bubbleMeGradient || [resolvedWallpaperTheme.bubbleMe, resolvedWallpaperTheme.bubbleMe],
-        bubbleThemColor: resolvedWallpaperTheme.bubbleThem || colors.card,
+        bubbleThemGradient:
+          resolvedWallpaperTheme.bubbleThemGradient
+          || [resolvedWallpaperTheme.bubbleThem, resolvedWallpaperTheme.bubbleThem],
+        bubbleThemColor:
+          resolvedWallpaperTheme.bubbleThemGradient?.[0]
+          || resolvedWallpaperTheme.bubbleThem
+          || colors.card,
         textColorMe: resolvedWallpaperTheme.textColorMe || colors.text,
         textColorThem: resolvedWallpaperTheme.textColorThem || colors.text,
         timeColorThem: colors.textSecondary,

@@ -38,6 +38,7 @@ interface NativeChatSurfaceProps {
   chatId?: string;
   myUserId?: string;
   peerUserId?: string;
+  peerDisplayName?: string;
   statusAuthorityEnabled?: boolean;
   appearance?: NativeChatAppearance;
   contentPaddingTop?: number;
@@ -63,9 +64,10 @@ interface NativeChatSurfaceProps {
 }
 
 export const NativeChatSurface = forwardRef<NativeChatSurfaceRef, NativeChatSurfaceProps>(
-  ({ surfaceId, rows, forceRender, engineSurfaceId, chatId, myUserId, peerUserId, statusAuthorityEnabled, appearance, contentPaddingTop, contentPaddingBottom, voicePlayback, inputBarEnabled, inputPlaceholder, nativeSendEnabled, debugAnimationPanel, holdStrategy, onViewportChanged, onNativeEvent, onNativeError }, ref) => {
+  ({ surfaceId, rows, forceRender, engineSurfaceId, chatId, myUserId, peerUserId, peerDisplayName, statusAuthorityEnabled, appearance, contentPaddingTop, contentPaddingBottom, voicePlayback, inputBarEnabled, inputPlaceholder, nativeSendEnabled, debugAnimationPanel, holdStrategy, onViewportChanged, onNativeEvent, onNativeError }, ref) => {
     const nativeListModule = useMemo(() => getNativeChatListModule(), []);
     const debugNativeEvents = __DEV__ && (globalThis as any).__VIBE_NATIVE_CHAT_DEBUG === true;
+    const contentPaddingBottomProp = inputBarEnabled ? undefined : contentPaddingBottom;
     const reportNativeError = (error: unknown, context: string) => {
       console.error(`[NativeChatSurface] ${context} failed`, error);
       onNativeError?.(error, context);
@@ -127,10 +129,11 @@ export const NativeChatSurface = forwardRef<NativeChatSurfaceRef, NativeChatSurf
         chatId={chatId}
         myUserId={myUserId}
         peerUserId={peerUserId}
+        peerDisplayName={peerDisplayName}
         statusAuthorityEnabled={statusAuthorityEnabled}
         appearance={appearance}
         contentPaddingTop={contentPaddingTop}
-        contentPaddingBottom={contentPaddingBottom}
+        contentPaddingBottom={contentPaddingBottomProp}
         voicePlayback={voicePlayback}
         inputBarEnabled={inputBarEnabled}
         inputPlaceholder={inputPlaceholder}

@@ -36,6 +36,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.text.Editable
 import android.text.TextWatcher
+import android.webkit.MimeTypeMap
 import android.widget.FrameLayout
 import android.widget.EditText
 import android.widget.ImageView
@@ -45,6 +46,8 @@ import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.ViewConfiguration
 import java.io.File
+import java.net.URLConnection
+import androidx.core.content.FileProvider
 import java.util.UUID
 import java.util.concurrent.Executors
 import androidx.recyclerview.widget.DiffUtil
@@ -87,6 +90,7 @@ private data class NativeRowItem(
   val kind: String,
   val key: String,
   val text: String,
+  val caption: String,
   val timestamp: String,
   val status: String?,
   val isMe: Boolean,
@@ -94,9 +98,15 @@ private data class NativeRowItem(
   val shape: NativeBubbleShape,
   val messageType: String,
   val mediaUrl: String?,
+  val localMediaUrl: String?,
+  val mediaKey: String?,
   val fileName: String?,
+  val thumbnailBase64: String?,
+  val mediaWidthPx: Int?,
+  val mediaHeightPx: Int?,
   val duration: Double?,
   val waveform: List<Float>?,
+  val fileSize: Long? = null,
   val isAgentMessage: Boolean = false,
   val agentName: String? = null,
   val plainContent: String? = null,
@@ -111,6 +121,60 @@ private data class NativeRowItem(
       }
     }
 }
+
+private fun normalizedMediaExtension(value: String?): String? {
+  val trimmed = value?.trim().orEmpty()
+  if (trimmed.isEmpty()) return null
+  val parsed = runCatching { Uri.parse(trimmed) }.getOrNull()
+  val fromUri = parsed?.lastPathSegment?.substringAfterLast('.', "")?.trim().orEmpty()
+  val fromRaw = trimmed.substringBefore('?').substringBefore('#').substringAfterLast('.', "").trim()
+  val resolved = if (fromUri.isNotEmpty()) fromUri else fromRaw
+  return resolved.lowercase().takeIf { it.isNotEmpty() }
+}
+
+private fun nativeRowRepresentsVideo(item: NativeRowItem): Boolean {
+  if (item.messageType == "video") return true
+  return normalizedMediaExtension(item.fileName) in setOf("mp4", "mov", "m4v", "webm", "mkv")
+    || normalizedMediaExtension(item.mediaUrl) in setOf("mp4", "mov", "m4v", "webm", "mkv")
+    || normalizedMediaExtension(item.localMediaUrl) in setOf("mp4", "mov", "m4v", "webm", "mkv")
+}
+
+private fun nativeRowRepresentsImage(item: NativeRowItem): Boolean {
+  if (item.messageType in setOf("image", "gif")) return true
+  return normalizedMediaExtension(item.fileName) in setOf("jpg", "jpeg", "png", "webp", "heic", "heif", "gif")
+    || normalizedMediaExtension(item.mediaUrl) in setOf("jpg", "jpeg", "png", "webp", "heic", "heif", "gif")
+    || normalizedMediaExtension(item.localMediaUrl) in setOf("jpg", "jpeg", "png", "webp", "heic", "heif", "gif")
+}
+
+private fun nativeRowRepresentsAudio(item: NativeRowItem): Boolean {
+  if (item.messageType in setOf("voice", "music")) return true
+  return normalizedMediaExtension(item.fileName) in setOf("mp3", "m4a", "aac", "wav", "aiff", "flac", "ogg", "oga", "opus", "caf", "alac")
+    || normalizedMediaExtension(item.mediaUrl) in setOf("mp3", "m4a", "aac", "wav", "aiff", "flac", "ogg", "oga", "opus", "caf", "alac")
+    || normalizedMediaExtension(item.localMediaUrl) in setOf("mp3", "m4a", "aac", "wav", "aiff", "flac", "ogg", "oga", "opus", "caf", "alac")
+}
+
+private fun nativeRowDisplayCaption(item: NativeRowItem): String {
+  val caption = item.caption.trim()
+  if (caption.isNotEmpty()) return caption
+  val text = item.text.trim()
+  return if (nativeRowRepresentsImage(item) || nativeRowRepresentsVideo(item)) text else ""
+}
+
+private fun hasMediaCaptionLayout(item: NativeRowItem): Boolean {
+  if (!nativeRowRepresentsImage(item) && !nativeRowRepresentsVideo(item)) return false
+  return nativeRowDisplayCaption(item).isNotBlank()
+}
+
+private fun usesFullBleedMediaLayout(item: NativeRowItem): Boolean {
+  if (hasMediaCaptionLayout(item)) return false
+  return (nativeRowRepresentsImage(item) && item.messageType != "file") || nativeRowRepresentsVideo(item)
+}
+
+private data class NativeMediaTransferState(
+  val needsDownload: Boolean = false,
+  val isDownloading: Boolean = false,
+  val progress: Float? = null,
+)
 
 private data class SendTransitionPayload(
   val messageId: String,
@@ -133,6 +197,10 @@ private const val VIEW_TYPE_TYPING = 1
 private class NativeRowsAdapter(
   private val context: Context,
   private val emitNativeEvent: (Map<String, Any>) -> Unit,
+  private val onOpenMediaPreview: (NativeRowItem) -> Unit,
+  private val resolveMediaPreviewUrl: (NativeRowItem) -> String?,
+  private val resolveMediaTransferState: (NativeRowItem) -> NativeMediaTransferState,
+  private val onMediaTransferTap: (NativeRowItem, NativeMediaTransferState) -> Unit,
 ) : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
   private val rows = mutableListOf<NativeRowItem>()
   private val pendingBottomInsertKeys = LinkedHashSet<String>()
@@ -151,6 +219,7 @@ private class NativeRowsAdapter(
 
   private inner class VoicePlaybackCoordinator {
     private var activeMessageId: String? = null
+    private var activeMediaUrl: String? = null
     private var activeHolder: NativeRowViewHolder? = null
     private var mediaPlayer: MediaPlayer? = null
     private var isPrepared = false
@@ -160,13 +229,21 @@ private class NativeRowsAdapter(
     private var level = 0f
     private var isPlaying = false
     private var activeDownloadCall: okhttp3.Call? = null
+    private var downloadProgress: Float? = null
+    private var activeMediaKey: String? = null
+    private var activeFileName: String? = null
 
     fun bind(holder: NativeRowViewHolder, item: NativeRowItem) {
-      if (activeMessageId == item.messageId) {
+      val messageId = item.messageId?.takeIf { it.isNotBlank() }
+      if (messageId != null && activeMessageId == messageId && activeDownloadCall != null) {
         activeHolder = holder
+        applyDownloadState(holder, isDownloading = true, progress = downloadProgress)
+      } else if (messageId != null && activeMessageId == messageId) {
+        activeHolder = holder
+        holder.voiceButton.setDownloadState(needsDownload = false, isDownloading = false, progress = null)
         applyState(holder, isPlaying, progress, level)
       } else {
-        applyState(holder, false, 0f, 0f)
+        applyIdleState(holder, item)
       }
     }
 
@@ -220,23 +297,23 @@ private class NativeRowsAdapter(
 
       stop(resetProgress = true)
 
-      if (mediaUrl.startsWith("http://") || mediaUrl.startsWith("https://")) {
-        playRemoteUrl(mediaUrl, messageId, holder)
+      if (requiresDownload(mediaUrl, item.fileName)) {
+        playRemoteUrl(mediaUrl, messageId, holder, item.mediaKey, item.fileName)
         return
       }
 
-      playLocalUrl(mediaUrl, messageId, holder)
+      val playbackSource = resolvePlayableVoiceSource(mediaUrl, item.fileName) ?: mediaUrl
+      playLocalUrl(playbackSource, messageId, holder)
     }
 
-    private fun playRemoteUrl(rawUrl: String, messageId: String, holder: NativeRowViewHolder) {
-      val cacheDir = java.io.File(context.cacheDir, "voice-cache")
-      if (!cacheDir.exists()) {
-        cacheDir.mkdirs()
-      }
-
-      // Hash the absolute URL string for filename to allow caching
-      val filename = String.format("%016x", rawUrl.hashCode().toLong() and 0xFFFFFFFFL) + ".m4a"
-      val localFile = java.io.File(cacheDir, filename)
+    private fun playRemoteUrl(
+      rawUrl: String,
+      messageId: String,
+      holder: NativeRowViewHolder,
+      mediaKey: String?,
+      fileName: String?,
+    ) {
+      val localFile = resolveVoiceCacheFile(rawUrl, fileName)
 
       if (localFile.exists()) {
         playLocalUrl(localFile.absolutePath, messageId, holder)
@@ -244,17 +321,28 @@ private class NativeRowsAdapter(
       }
 
       activeMessageId = messageId
+      activeMediaUrl = rawUrl
+      activeMediaKey = mediaKey
+      activeFileName = fileName
       activeHolder = holder
-      applyState(holder, false, 0f, 0f)
+      downloadProgress = null
+      applyDownloadState(holder, isDownloading = true, progress = null)
 
-      val request = okhttp3.Request.Builder().url(rawUrl).build()
-      val call = okhttp3.OkHttpClient().newCall(request)
+      val request =
+        okhttp3.Request.Builder()
+          .url(rawUrl)
+          .apply {
+            header("ngrok-skip-browser-warning", "true")
+            ChatEngine.authorizationHeaderForApi()?.let { header("Authorization", it) }
+          }
+          .build()
+      val call = ChatPhoenixClient.buildPinnedHttpClient().newCall(request)
       activeDownloadCall = call
       
       call.enqueue(object : okhttp3.Callback {
         override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
           Log.e("ChatListView", "voice download failed url=$rawUrl error=${e.message}", e)
-          handler.post {
+          mainHandler.post {
             if (activeMessageId == messageId) {
               stop(resetProgress = true)
             }
@@ -272,15 +360,57 @@ private class NativeRowsAdapter(
             return
           }
           try {
-            val sink = localFile.sink().buffer()
-            sink.writeAll(response.body!!.source())
-            sink.close()
+            val body = response.body ?: throw java.io.IOException("missing response body")
+            localFile.parentFile?.mkdirs()
+            val totalLength = body.contentLength()
+            val downloadedChunks = ArrayList<ByteArray>()
+            var totalBytesCopied = 0
+            body.byteStream().use { input ->
+              val buffer = ByteArray(8192)
+              var bytesRead: Int
+              while (true) {
+                bytesRead = input.read(buffer)
+                if (bytesRead <= 0) break
+                downloadedChunks.add(buffer.copyOf(bytesRead))
+                totalBytesCopied += bytesRead
+                if (call.isCanceled()) {
+                  throw java.io.IOException("download canceled")
+                }
+                if (totalLength > 0) {
+                  val nextProgress = (totalBytesCopied.toFloat() / totalLength.toFloat()).coerceIn(0f, 1f)
+                  handler.post {
+                    if (activeMessageId == messageId) {
+                      downloadProgress = nextProgress
+                      activeHolder?.let { active ->
+                        applyDownloadState(active, isDownloading = true, progress = nextProgress)
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            val combinedBytes = ByteArray(totalBytesCopied)
+            var offset = 0
+            downloadedChunks.forEach { chunk ->
+              System.arraycopy(chunk, 0, combinedBytes, offset, chunk.size)
+              offset += chunk.size
+            }
+            val finalBytes =
+              mediaKey?.takeIf { it.isNotBlank() }?.let { key ->
+                chatEngineDecryptMediaBytes(combinedBytes, key)
+                  ?: throw java.io.IOException("voice decrypt failed")
+              } ?: combinedBytes
+            localFile.outputStream().use { output ->
+              output.write(finalBytes)
+              output.flush()
+            }
             handler.post {
               if (activeMessageId == messageId) {
-                playLocalUrl(localFile.absolutePath, messageId, holder)
+                finishDownload(messageId, localFile.absolutePath)
               }
             }
           } catch (e: Exception) {
+            localFile.delete()
             Log.e("ChatListView", "voice move failed error=${e.message}", e)
             handler.post {
               if (activeMessageId == messageId) {
@@ -314,12 +444,17 @@ private class NativeRowsAdapter(
       }
 
       activeMessageId = messageId
+      activeMediaUrl = mediaUrl
+      activeMediaKey = null
+      activeFileName = null
       activeHolder = holder
+      downloadProgress = null
       mediaPlayer = player
       isPrepared = false
       progress = 0f
       level = 0f
       isPlaying = false
+      holder.voiceButton.setDownloadState(needsDownload = false, isDownloading = false, progress = null)
       applyState(holder, false, 0f, 0f)
 
       player.setOnPreparedListener {
@@ -399,7 +534,53 @@ private class NativeRowsAdapter(
       holder.voiceWaveView.updatePlayback(progress, level, isPlaying)
     }
 
+    private fun applyDownloadState(holder: NativeRowViewHolder, isDownloading: Boolean, progress: Float?) {
+      holder.voiceButton.setDownloadState(needsDownload = true, isDownloading = isDownloading, progress = progress)
+      holder.voiceWaveView.updatePlayback(progress ?: 0f, 0f, false)
+    }
+
+    private fun applyIdleState(holder: NativeRowViewHolder, item: NativeRowItem) {
+      applyIdleState(holder, item.messageId, item.mediaUrl, item.fileName)
+    }
+
+    private fun applyIdleState(
+      holder: NativeRowViewHolder,
+      messageId: String?,
+      mediaUrl: String?,
+      fileName: String? = null,
+    ) {
+      val unresolvedUrl = mediaUrl?.takeIf { it.isNotBlank() }
+      val shouldDownload =
+        !messageId.isNullOrBlank() &&
+          unresolvedUrl != null &&
+          requiresDownload(unresolvedUrl, fileName)
+      holder.voiceButton.setDownloadState(
+        needsDownload = shouldDownload,
+        isDownloading = false,
+        progress = null,
+      )
+      holder.voiceButton.setPlaybackState(isPlaying = false, progress = 0f, level = 0f)
+      holder.voiceWaveView.updatePlayback(0f, 0f, false)
+    }
+
+    private fun finishDownload(messageId: String, localMediaUrl: String) {
+      activeDownloadCall = null
+      downloadProgress = null
+      if (activeMessageId != messageId) return
+      activeHolder?.let { holder ->
+        applyIdleState(holder, messageId, localMediaUrl)
+      }
+      activeMessageId = null
+      activeMediaUrl = null
+      activeMediaKey = null
+      activeFileName = null
+      activeHolder = null
+    }
+
     private fun stop(resetProgress: Boolean) {
+      val previousHolder = activeHolder
+      val previousMessageId = activeMessageId
+      val previousMediaUrl = activeMediaUrl
       activeDownloadCall?.cancel()
       activeDownloadCall = null
       ticker?.let { handler.removeCallbacks(it) }
@@ -420,14 +601,65 @@ private class NativeRowsAdapter(
         progress = 0f
         level = 0f
       }
-      activeHolder?.let { applyState(it, false, progress, level) }
+      downloadProgress = null
+      previousHolder?.let { holder ->
+        applyIdleState(holder, previousMessageId, previousMediaUrl)
+      }
       activeHolder = null
       activeMessageId = null
+      activeMediaUrl = null
+      activeMediaKey = null
+      activeFileName = null
     }
 
     private fun shortMediaUrl(value: String?): String {
       if (value.isNullOrBlank()) return "-"
       return if (value.length <= 120) value else value.take(117) + "..."
+    }
+
+    private fun requiresDownload(rawUrl: String?, fileName: String? = null): Boolean {
+      if (rawUrl.isNullOrBlank()) return false
+      if (!rawUrl.startsWith("http://") && !rawUrl.startsWith("https://")) return false
+      return !resolveVoiceCacheFile(rawUrl, fileName).exists()
+    }
+
+    private fun resolvePlayableVoiceSource(rawUrl: String?, fileName: String? = null): String? {
+      if (rawUrl.isNullOrBlank()) return null
+      if (rawUrl.startsWith("http://") || rawUrl.startsWith("https://")) {
+        val localFile = resolveVoiceCacheFile(rawUrl, fileName)
+        if (localFile.exists()) {
+          return localFile.absolutePath
+        }
+      }
+      return rawUrl
+    }
+
+    private fun resolveVoiceCacheFile(rawUrl: String, fileName: String? = null): File {
+      val cacheDir = File(context.cacheDir, "voice-cache")
+      if (!cacheDir.exists()) {
+        cacheDir.mkdirs()
+      }
+      val parsed = runCatching { Uri.parse(rawUrl) }.getOrNull()
+      val preferredExtension =
+        fileName
+          ?.substringAfterLast('.', "")
+          ?.lowercase()
+          ?.takeIf { it.isNotBlank() }
+      val extension =
+        preferredExtension
+          ?: (
+        parsed?.lastPathSegment
+          ?.substringAfterLast('.', "")
+          ?.lowercase()
+          ?.takeIf { it.isNotBlank() }
+          ?.takeUnless { it == "enc" }
+          ?: "m4a"
+        )
+      val hash = String.format("%016x", rawUrl.hashCode().toLong() and 0xFFFFFFFFL)
+      val preferred = File(cacheDir, "$hash.$extension")
+      if (preferred.exists()) return preferred
+      val legacy = File(cacheDir, "$hash.m4a")
+      return if (legacy.exists()) legacy else preferred
     }
   }
 
@@ -641,9 +873,20 @@ private class NativeRowsAdapter(
       holder.container.setOnLongClickListener(null)
       holder.inlineAttachmentView.setOnClickListener(null)
       holder.inlineAttachmentView.visibility = View.GONE
+      holder.mediaPreviewView.setOnClickListener(null)
+      holder.mediaPreviewView.isClickable = false
+      holder.mediaPreviewView.isFocusable = false
+      holder.mediaTransferOverlayView.setOnClickListener(null)
+      holder.mediaTransferOverlayView.visibility = View.GONE
+      holder.mediaTransferRingView.setUploadState(isUploading = false, progress = null)
+      holder.mediaTransferRingView.setDownloadState(needsDownload = false, isDownloading = false, progress = null)
+      holder.mediaTransferSizeView.visibility = View.GONE
+      holder.mediaTransferSizeView.text = null
       voicePlayback.detach(holder)
       holder.voiceWaveView.updatePlayback(0f, 0f, false)
       holder.voiceWaveView.setWaveform(null, null)
+      holder.voiceButton.setUploadState(isUploading = false, progress = null)
+      holder.voiceButton.setDownloadState(needsDownload = false, isDownloading = false, progress = null)
       holder.voiceButton.setPlaybackState(isPlaying = false, progress = 0f, level = 0f)
       holder.agentSenderLabel.visibility = View.GONE
     } else if (holder is TypingRowViewHolder) {
@@ -665,6 +908,128 @@ private class NativeRowsAdapter(
     }
   }
 
+  fun applyInlineMediaTransferState(holder: NativeRowViewHolder, item: NativeRowItem) {
+    val state = resolveMediaTransferState(item)
+    val isMediaPreviewRow = nativeRowRepresentsImage(item) || nativeRowRepresentsVideo(item)
+    val uploadProgress = item.uploadProgress?.takeIf { it.isFinite() }?.coerceIn(0f, 1f)
+    val isUploading = item.shouldShowUploadOverlay
+    val hasActiveTransfer = isUploading || state.isDownloading
+    val badgeInset = dp(if (item.messageType == "videoNote") 10 else 8)
+    val previewHeight =
+      (holder.inlineAttachmentView.layoutParams as? FrameLayout.LayoutParams)
+        ?.height
+        ?.takeIf { it > 0 }
+        ?: holder.mediaTransferOverlayView.height
+    val uploadRingSize = dp(44)
+    val downloadRingSize = dp(18)
+
+    if (!isMediaPreviewRow) {
+      holder.mediaTransferOverlayView.setOnClickListener(null)
+      holder.mediaTransferOverlayView.visibility = View.GONE
+      holder.mediaTransferRingView.setUploadState(isUploading = false, progress = null)
+      holder.mediaTransferRingView.setDownloadState(needsDownload = false, isDownloading = false, progress = null)
+      holder.mediaTransferSizeView.visibility = View.GONE
+      holder.mediaTransferSizeView.text = null
+      return
+    }
+
+    if (nativeRowRepresentsVideo(item)) {
+      holder.mediaPlayBadgeView.visibility =
+        if (!hasActiveTransfer) View.VISIBLE else View.GONE
+      holder.mediaDurationBadgeView.visibility =
+        if (!hasActiveTransfer && item.duration != null && item.duration > 0.0) View.VISIBLE else View.GONE
+    }
+
+    holder.mediaTransferOverlayView.visibility = if (hasActiveTransfer) View.VISIBLE else View.GONE
+    holder.mediaTransferRingView.setUploadState(isUploading = isUploading, progress = uploadProgress)
+    holder.mediaTransferRingView.setDownloadState(
+      needsDownload = state.needsDownload,
+      isDownloading = state.isDownloading,
+      progress = state.progress,
+    )
+
+    val sizeLabel =
+      when {
+        isUploading && item.fileSize != null && item.fileSize > 0L && uploadProgress != null -> {
+          val sentBytes = (item.fileSize.toFloat() * uploadProgress).roundToInt().toLong()
+          "${formatMediaByteSize(sentBytes)} / ${formatMediaByteSize(item.fileSize)}"
+        }
+        isUploading -> "Processing"
+        state.isDownloading && item.fileSize != null && item.fileSize > 0L && state.progress != null -> {
+          val receivedBytes = (item.fileSize.toFloat() * state.progress).roundToInt().toLong()
+          "${formatMediaByteSize(receivedBytes)} / ${formatMediaByteSize(item.fileSize)}"
+        }
+        state.isDownloading -> "Downloading"
+        else -> null
+      }
+    holder.mediaTransferSizeView.text = sizeLabel
+    holder.mediaTransferSizeView.visibility = if (sizeLabel != null && hasActiveTransfer) View.VISIBLE else View.GONE
+
+    (holder.mediaTransferRingView.layoutParams as? FrameLayout.LayoutParams)?.let { ringLp ->
+      if (isUploading) {
+        ringLp.width = uploadRingSize
+        ringLp.height = uploadRingSize
+        ringLp.gravity = Gravity.CENTER
+        ringLp.leftMargin = 0
+        ringLp.topMargin = 0
+        ringLp.bottomMargin = 0
+      } else {
+        ringLp.width = downloadRingSize
+        ringLp.height = downloadRingSize
+        ringLp.gravity = Gravity.START or Gravity.TOP
+        ringLp.leftMargin = badgeInset
+        ringLp.topMargin = badgeInset
+        ringLp.bottomMargin = 0
+      }
+      holder.mediaTransferRingView.layoutParams = ringLp
+    }
+    (holder.mediaTransferSizeView.layoutParams as? FrameLayout.LayoutParams)?.let { labelLp ->
+      if (isUploading) {
+        val ringTop = (((previewHeight - uploadRingSize).coerceAtLeast(0)) * 0.5f).roundToInt()
+        labelLp.gravity = Gravity.CENTER_HORIZONTAL or Gravity.TOP
+        labelLp.leftMargin = 0
+        labelLp.topMargin = ringTop + uploadRingSize + dp(8)
+        labelLp.bottomMargin = 0
+      } else {
+        labelLp.gravity = Gravity.START or Gravity.TOP
+        labelLp.leftMargin = badgeInset + downloadRingSize + dp(6)
+        labelLp.topMargin = badgeInset
+        labelLp.bottomMargin = 0
+      }
+      holder.mediaTransferSizeView.layoutParams = labelLp
+    }
+
+    if (hasActiveTransfer) {
+      holder.mediaTransferOverlayView.isClickable = true
+      holder.mediaTransferOverlayView.isFocusable = true
+      holder.mediaTransferOverlayView.setOnClickListener {
+        onMediaTransferTap(item, state)
+      }
+    } else {
+      holder.mediaTransferOverlayView.setOnClickListener(null)
+      holder.mediaTransferOverlayView.isClickable = false
+      holder.mediaTransferOverlayView.isFocusable = false
+    }
+  }
+
+  private fun formatMediaByteSize(bytes: Long): String {
+    if (bytes <= 0L) return "0 B"
+    val kib = 1024.0
+    val mib = kib * 1024.0
+    return when {
+      bytes >= mib -> String.format("%.1f MB", bytes / mib)
+      bytes >= kib -> String.format("%.1f KB", bytes / kib)
+      else -> "$bytes B"
+    }
+  }
+
+  private fun dp(value: Int): Int =
+    TypedValue.applyDimension(
+      TypedValue.COMPLEX_UNIT_DIP,
+      value.toFloat(),
+      context.resources.displayMetrics,
+    ).toInt()
+
   private fun resolveFileName(fileName: String?, mediaUrl: String?): String {
     if (!fileName.isNullOrBlank()) return fileName
     val parsed = mediaUrl?.trim().orEmpty()
@@ -674,16 +1039,38 @@ private class NativeRowsAdapter(
     return if (candidate.isNotEmpty()) candidate else "Document"
   }
 
-  private fun openDocumentInApp(rawUrl: String) {
+  private fun openDocumentInApp(item: NativeRowItem) {
+    val preferredLocal =
+      item.localMediaUrl
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+        ?.takeIf { candidate ->
+          candidate.startsWith("file://") || candidate.startsWith("content://") || candidate.startsWith("/")
+        }
+        ?.takeIf { candidate ->
+          if (candidate.startsWith("content://")) {
+            return@takeIf true
+          }
+          val file = if (candidate.startsWith("file://")) {
+            File(Uri.parse(candidate).path ?: "")
+          } else {
+            File(candidate)
+          }
+          file.exists()
+        }
+    openDocumentInApp(preferredLocal ?: item.mediaUrl.orEmpty(), item.mediaKey, item.fileName)
+  }
+
+  private fun openDocumentInApp(rawUrl: String, mediaKey: String? = null, fileName: String? = null) {
     val trimmed = sanitizeOpenUrl(rawUrl)
     if (trimmed.isEmpty()) return
-    val uri = Uri.parse(trimmed)
+    if (!mediaKey.isNullOrBlank() && (trimmed.startsWith("http://") || trimmed.startsWith("https://"))) {
+      downloadAndOpenEncryptedDocument(trimmed, mediaKey, fileName)
+      return
+    }
     try {
-      val intent = Intent(Intent.ACTION_VIEW).apply {
-        setData(uri)
-        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-      }
+      val uri = resolveDocumentUri(trimmed)
+      val intent = buildDocumentViewIntent(uri, fileName)
       context.startActivity(intent)
     } catch (error: Throwable) {
       Log.w("ChatListView", "openDocumentInApp failed url=${trimmed.take(120)} error=${error.message}")
@@ -694,6 +1081,127 @@ private class NativeRowsAdapter(
         ),
       )
     }
+  }
+
+  private fun resolveDocumentUri(rawUrl: String): Uri {
+    if (rawUrl.startsWith("content://")) {
+      return Uri.parse(rawUrl)
+    }
+    val localFile =
+      when {
+        rawUrl.startsWith("file://") -> File(Uri.parse(rawUrl).path ?: "")
+        rawUrl.startsWith("/") -> File(rawUrl)
+        else -> null
+      }
+    if (localFile != null && localFile.exists()) {
+      return FileProvider.getUriForFile(
+        context,
+        "${context.packageName}.vibechatnative.fileprovider",
+        localFile,
+      )
+    }
+    return Uri.parse(rawUrl)
+  }
+
+  private fun buildDocumentViewIntent(uri: Uri, fileName: String?): Intent {
+    val extension =
+      fileName
+        ?.substringAfterLast('.', "")
+        ?.lowercase()
+        ?.takeIf { it.isNotBlank() }
+        ?: MimeTypeMap.getFileExtensionFromUrl(uri.toString()).orEmpty().lowercase()
+    val mimeType =
+      if (extension.isNotEmpty()) {
+        MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension)
+      } else {
+        null
+      } ?: "*/*"
+    return Intent(Intent.ACTION_VIEW).apply {
+      setDataAndType(uri, mimeType)
+      addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+  }
+
+  private fun downloadAndOpenEncryptedDocument(rawUrl: String, mediaKey: String, fileName: String?) {
+    Thread {
+      val request =
+        okhttp3.Request.Builder()
+          .url(rawUrl)
+          .apply {
+            header("ngrok-skip-browser-warning", "true")
+            ChatEngine.authorizationHeaderForApi()?.let { header("Authorization", it) }
+          }
+          .build()
+      try {
+        ChatPhoenixClient.buildPinnedHttpClient().newCall(request).execute().use { response ->
+          if (!response.isSuccessful) {
+            throw java.io.IOException("http ${response.code}")
+          }
+          val encryptedBytes = response.body?.bytes() ?: throw java.io.IOException("missing response body")
+          val decryptedBytes =
+            chatEngineDecryptMediaBytes(encryptedBytes, mediaKey)
+              ?: throw java.io.IOException("decrypt failed")
+          val localFile = persistEncryptedDocument(rawUrl, fileName, decryptedBytes)
+          val localUri = FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.vibechatnative.fileprovider",
+            localFile,
+          )
+          mainHandler.post {
+            try {
+              context.startActivity(buildDocumentViewIntent(localUri, fileName))
+            } catch (error: Throwable) {
+              Log.w("ChatListView", "openDocumentInApp failed url=${rawUrl.take(120)} error=${error.message}")
+              emitNativeEvent(
+                mapOf(
+                  "type" to "fileOpenFailed",
+                  "url" to rawUrl,
+                ),
+              )
+            }
+          }
+        }
+      } catch (error: Throwable) {
+        Log.w("ChatListView", "encrypted document open failed url=${rawUrl.take(120)} error=${error.message}")
+        mainHandler.post {
+          emitNativeEvent(
+            mapOf(
+              "type" to "fileOpenFailed",
+              "url" to rawUrl,
+            ),
+          )
+        }
+      }
+    }.start()
+  }
+
+  private fun persistEncryptedDocument(rawUrl: String, fileName: String?, bytes: ByteArray): File {
+    val cacheDir = File(context.cacheDir, "encrypted-documents")
+    if (!cacheDir.exists()) {
+      cacheDir.mkdirs()
+    }
+    val inferredExt =
+      fileName
+        ?.substringAfterLast('.', "")
+        ?.lowercase()
+        ?.takeIf { it.isNotBlank() }
+        ?: runCatching { Uri.parse(rawUrl).lastPathSegment }
+          .getOrNull()
+          ?.substringAfterLast('.', "")
+          ?.lowercase()
+          ?.takeUnless { it == "enc" }
+          ?: "bin"
+    val baseName =
+      (fileName?.substringBeforeLast('.', fileName).orEmpty().ifBlank { "document" })
+        .replace(Regex("[^A-Za-z0-9_-]+"), "-")
+    val fileHash = java.lang.Long.toHexString(rawUrl.hashCode().toLong() and 0xffffffffL)
+    val file = File(cacheDir, "${baseName}_${fileHash}.$inferredExt")
+    file.outputStream().use { output ->
+      output.write(bytes)
+      output.flush()
+    }
+    return file
   }
 
   private fun sanitizeOpenUrl(rawUrl: String): String {
@@ -736,20 +1244,27 @@ private class NativeRowsAdapter(
     bubbleContainer.visibility = View.VISIBLE
     bubbleContainer.alpha = if (hidden) 0f else 1f
 
-    val isVoice = item.messageType == "voice" || item.messageType == "music"
+    val isVideoMedia = nativeRowRepresentsVideo(item)
+    val isAudioMedia = !isVideoMedia && nativeRowRepresentsAudio(item)
+    val isVoice = item.messageType == "voice" || item.messageType == "music" || isAudioMedia
+    val isImageMedia = !isVideoMedia && nativeRowRepresentsImage(item)
+    val hasMediaPreview = isVideoMedia || isImageMedia
+    val mediaTransferState = resolveMediaTransferState(item)
     val hasInlineAttachment =
-      item.isAgentMessage &&
+      !hasMediaPreview &&
+        item.isAgentMessage &&
         item.messageType == "file" &&
         !item.mediaUrl.isNullOrBlank()
+    val displayCaption = nativeRowDisplayCaption(item)
 
     // Agent message rendering
     if (item.isAgentMessage) {
       agentSenderLabel.text = "✦ ${item.agentName ?: "Vibe AI"}"
       agentSenderLabel.visibility = if (hidden) View.GONE else View.VISIBLE
-      textView.text = item.plainContent ?: item.text
+      textView.text = if (hasMediaPreview) displayCaption else (item.plainContent ?: item.text)
     } else {
       agentSenderLabel.visibility = View.GONE
-      textView.text = item.text
+      textView.text = if (hasMediaPreview) displayCaption else item.text
     }
     timeView.text = item.timestamp
     // Agent messages use "them" styling (not isMe)
@@ -825,7 +1340,7 @@ private class NativeRowsAdapter(
       agentLp.topMargin = 0
       agentSenderLabel.layoutParams = agentLp
       val textLpAgent = textView.layoutParams as FrameLayout.LayoutParams
-      textLpAgent.topMargin = dp(18)
+      textLpAgent.topMargin = if (hasMediaPreview) 0 else dp(18)
       textView.layoutParams = textLpAgent
     } else {
       val textLpAgent = textView.layoutParams as FrameLayout.LayoutParams
@@ -838,6 +1353,7 @@ private class NativeRowsAdapter(
       textView.visibility = View.GONE
       inlineAttachmentView.visibility = View.GONE
       inlineAttachmentView.setOnClickListener(null)
+      applyInlineMediaTransferState(this, item)
       voiceContainer.visibility = View.VISIBLE
       bubbleContainer.minimumHeight = dp(66)
       bubbleContainer.minimumWidth = dp(26)
@@ -958,6 +1474,7 @@ private class NativeRowsAdapter(
       voiceButton.setUploadState(isUploading = isUploading, progress = uploadProgress)
       if (isUploading) {
         voiceUploadProgressView.visibility = View.GONE
+        voiceButton.setDownloadState(needsDownload = false, isDownloading = false, progress = null)
         voicePlayback.detach(this)
         voiceWaveView.updatePlayback(uploadProgress ?: 0f, 0f, false)
         voiceButton.setOnClickListener {
@@ -980,6 +1497,7 @@ private class NativeRowsAdapter(
             externalVoiceMessageId == item.messageId
         if (isExternallyActive) {
           voicePlayback.detach(this)
+          voiceButton.setDownloadState(needsDownload = false, isDownloading = false, progress = null)
           voiceWaveView.updatePlayback(externalVoiceProgress, if (externalVoiceIsPlaying) 0.2f else 0f, externalVoiceIsPlaying)
           voiceButton.setPlaybackState(
             isPlaying = externalVoiceIsPlaying,
@@ -991,14 +1509,13 @@ private class NativeRowsAdapter(
         }
       }
     } else {
-      bubbleContainer.setPadding(dp(10), dp(7), dp(10), if (hasInlineAttachment) dp(7) else dp(7))
-      textView.visibility = View.VISIBLE
       voiceContainer.visibility = View.GONE
       voiceUploadProgressView.visibility = View.GONE
       bubbleContainer.minimumHeight = 0
       bubbleContainer.minimumWidth = dp(26)
       voiceButton.setOnClickListener(null)
       voiceButton.setUploadState(isUploading = false, progress = null)
+      voiceButton.setDownloadState(needsDownload = false, isDownloading = false, progress = null)
       voiceButton.setPlaybackState(isPlaying = false, progress = 0f, level = 0f)
       voicePlayback.detach(this)
       voiceWaveView.updatePlayback(0f, 0f, false)
@@ -1007,30 +1524,216 @@ private class NativeRowsAdapter(
       val timeWidth = kotlin.math.ceil(timeView.paint.measureText(item.timestamp ?: "")).toInt()
       val statusReserve = if (showStatus) dp(16 + 3) else 0
       val metaReserve = dp(6) + timeWidth + statusReserve
-      val maxBubbleWidth = (context.resources.displayMetrics.widthPixels * 0.85f).toInt()
-      textView.maxWidth = (maxBubbleWidth - dp(20) - metaReserve).coerceAtLeast(dp(24))
       val textLp = textView.layoutParams as FrameLayout.LayoutParams
-      textLp.gravity = Gravity.START or Gravity.TOP
-      textLp.rightMargin = if (hasInlineAttachment) 0 else metaReserve
-      textLp.bottomMargin = if (hasInlineAttachment) dp(48 + 8 + 17) else 0
-      textView.layoutParams = textLp
+      val attachmentLp = inlineAttachmentView.layoutParams as FrameLayout.LayoutParams
 
-      if (hasInlineAttachment) {
+      if (hasMediaPreview) {
+        val captionVisible = displayCaption.isNotBlank()
+        val isFullBleedMedia = usesFullBleedMediaLayout(item)
+        val bubbleHorizontalPaddingPx = dp(10)
+        val bubbleTopPaddingPx = dp(7)
+        val bubbleBottomPaddingPx = dp(7)
+        val mediaMetaReservePx = dp(17)
+        val mediaBadgeInsetPx = dp(if (item.messageType == "videoNote") 10 else 8)
+        val maxBubbleWidth = kotlin.math.floor(context.resources.displayMetrics.widthPixels * 0.85f).toInt()
+        val maxContentWidthPx = (maxBubbleWidth - (bubbleHorizontalPaddingPx * 2)).coerceAtLeast(dp(1))
+        val naturalWidth = item.mediaWidthPx?.takeIf { it > 1 }?.toFloat()
+        val naturalHeight = item.mediaHeightPx?.takeIf { it > 1 }?.toFloat()
+        val mediaSize =
+          if (naturalWidth != null && naturalHeight != null) {
+            val ratio = (naturalHeight / naturalWidth).coerceIn(0.2f, 5.0f)
+            var targetWidth = kotlin.math.max(dpF(120f), kotlin.math.min(maxContentWidthPx.toFloat(), naturalWidth))
+            var targetHeight = kotlin.math.max(dpF(84f), targetWidth * ratio)
+            val heightLimit = dpF(380f)
+            if (targetHeight > heightLimit) {
+              targetHeight = heightLimit
+              targetWidth = targetHeight / ratio
+            }
+            Pair(targetWidth.roundToInt(), targetHeight.roundToInt())
+          } else {
+            val fallback = kotlin.math.max(dp(120), maxContentWidthPx)
+            Pair(fallback, fallback)
+          }
+        val mediaWidth = mediaSize.first.coerceAtMost(maxContentWidthPx).coerceAtLeast(dp(120))
+        val mediaHeight = mediaSize.second.coerceAtLeast(dp(84))
+
+        bubbleContainer.setPadding(
+          if (isFullBleedMedia) 0 else bubbleHorizontalPaddingPx,
+          if (isFullBleedMedia) 0 else bubbleTopPaddingPx,
+          if (isFullBleedMedia) 0 else bubbleHorizontalPaddingPx,
+          if (isFullBleedMedia) 0 else bubbleBottomPaddingPx,
+        )
         inlineAttachmentView.visibility = View.VISIBLE
+        mediaPreviewView.visibility = View.VISIBLE
+        inlineAttachmentTitleView.visibility = View.GONE
+        inlineAttachmentSubtitleView.visibility = View.GONE
+        inlineAttachmentView.background = null
+        inlineAttachmentView.setPadding(0, 0, 0, 0)
+        inlineAttachmentView.minimumWidth = 0
+        attachmentLp.width = mediaWidth
+        attachmentLp.height = mediaHeight
+        attachmentLp.gravity = Gravity.START or Gravity.TOP
+        attachmentLp.topMargin = if (item.isAgentMessage && agentSenderLabel.visibility == View.VISIBLE) dp(18) else 0
+        attachmentLp.rightMargin = 0
+        attachmentLp.leftMargin = 0
+        attachmentLp.bottomMargin = if (!isFullBleedMedia && !captionVisible) mediaMetaReservePx else 0
+        inlineAttachmentView.layoutParams = attachmentLp
+        (mediaPreviewView.layoutParams as? FrameLayout.LayoutParams)?.let { mediaLp ->
+          mediaLp.width = FrameLayout.LayoutParams.MATCH_PARENT
+          mediaLp.height = FrameLayout.LayoutParams.MATCH_PARENT
+          mediaLp.gravity = Gravity.CENTER
+          mediaPreviewView.layoutParams = mediaLp
+        }
+        val previewBackground = GradientDrawable().apply {
+          setColor(
+            when {
+              isVideoMedia -> Color.argb(89, 0, 0, 0)
+              isFullBleedMedia -> Color.argb(71, 0, 0, 0)
+              else -> Color.argb(41, 0, 0, 0)
+            },
+          )
+          if (isFullBleedMedia) {
+            cornerRadii =
+              floatArrayOf(
+                dpF(item.shape.topLeft), dpF(item.shape.topLeft),
+                dpF(item.shape.topRight), dpF(item.shape.topRight),
+                dpF(item.shape.bottomRight), dpF(item.shape.bottomRight),
+                dpF(item.shape.bottomLeft), dpF(item.shape.bottomLeft),
+              )
+          } else {
+            cornerRadius = dpF(12f)
+          }
+          if (isVideoMedia) {
+            val bubbleColor = if (effectiveIsMe) bubbleMeGradient.firstOrNull() ?: Color.WHITE else bubbleThemFill
+            setStroke(
+              kotlin.math.max(1, dp(1)),
+              withAlpha(bubbleColor, if (isDarkPalette) 0.38f else 0.32f),
+            )
+          }
+        }
+        mediaPreviewView.background = previewBackground
+        bubbleContainer.background =
+          if (isFullBleedMedia) {
+            GradientDrawable().apply { setColor(Color.TRANSPARENT) }
+          } else {
+            drawable
+          }
+        statusLp.rightMargin = if (isFullBleedMedia) dp(10) else 0
+        statusLp.bottomMargin = if (isFullBleedMedia) dp(8) else 0
+        statusView.layoutParams = statusLp
+        timeLp.rightMargin =
+          if (isFullBleedMedia) {
+            dp(10) + if (showStatus) dp(baseStatusWidth + 3) else 0
+          } else {
+            if (showStatus) dp(baseStatusWidth + 3) else 0
+          }
+        timeLp.bottomMargin = if (isFullBleedMedia) dp(8) else 0
+        timeView.layoutParams = timeLp
+        mediaPlayBadgeView.visibility =
+          if (isVideoMedia && !item.shouldShowUploadOverlay && !mediaTransferState.isDownloading) View.VISIBLE else View.GONE
+        mediaDurationBadgeView.visibility =
+          if (isVideoMedia && item.duration != null && item.duration > 0.0) View.VISIBLE else View.GONE
+        mediaDurationBadgeView.text = formatDuration(item.duration)
+        (mediaDurationBadgeView.layoutParams as? FrameLayout.LayoutParams)?.let { badgeLp ->
+          badgeLp.gravity = Gravity.START or Gravity.TOP
+          badgeLp.leftMargin = mediaBadgeInsetPx
+          badgeLp.topMargin = mediaBadgeInsetPx
+          mediaDurationBadgeView.layoutParams = badgeLp
+        }
+        val preferredPreviewUrl = resolveMediaPreviewUrl(item)
+        ChatMediaBitmapLoader.loadInto(
+          context = context,
+          imageView = mediaImageView,
+          primaryUrl = preferredPreviewUrl,
+          thumbnailBase64 = item.thumbnailBase64,
+          isVideo = isVideoMedia,
+          authorizationHeaderProvider = { ChatEngine.authorizationHeaderForApi() ?: "" },
+        )
+        inlineAttachmentView.setOnClickListener(null)
+        mediaPreviewView.isClickable = true
+        mediaPreviewView.isFocusable = true
+        mediaPreviewView.setOnClickListener {
+          onOpenMediaPreview(item)
+        }
+        applyInlineMediaTransferState(this, item)
+        textView.visibility = if (captionVisible) View.VISIBLE else View.GONE
+        textView.maxWidth = mediaWidth.coerceAtLeast(dp(24))
+        textLp.gravity = Gravity.START or Gravity.TOP
+        textLp.topMargin = attachmentLp.topMargin + mediaHeight + if (captionVisible) dp(8) else 0
+        textLp.rightMargin = 0
+        textLp.bottomMargin = if (captionVisible && !isFullBleedMedia) mediaMetaReservePx else 0
+        textView.layoutParams = textLp
+      } else if (hasInlineAttachment) {
+        bubbleContainer.setPadding(dp(10), dp(7), dp(10), dp(7))
+        bubbleContainer.background = drawable
+        statusLp.rightMargin = 0
+        statusLp.bottomMargin = 0
+        statusView.layoutParams = statusLp
+        timeLp.rightMargin = if (showStatus) dp(baseStatusWidth + 3) else 0
+        timeLp.bottomMargin = 0
+        timeView.layoutParams = timeLp
+        textView.visibility = View.VISIBLE
+        mediaPreviewView.visibility = View.GONE
+        mediaPreviewView.setOnClickListener(null)
+        mediaPreviewView.isClickable = false
+        mediaPreviewView.isFocusable = false
+        applyInlineMediaTransferState(this, item)
+        inlineAttachmentTitleView.visibility = View.VISIBLE
+        inlineAttachmentSubtitleView.visibility = View.VISIBLE
+        inlineAttachmentView.background = GradientDrawable().apply {
+          cornerRadius = dpF(12f)
+          setColor(Color.argb(52, 0, 0, 0))
+        }
+        inlineAttachmentView.setPadding(dp(12), dp(8), dp(12), dp(8))
+        inlineAttachmentView.minimumWidth = dp(170)
+        attachmentLp.width = FrameLayout.LayoutParams.WRAP_CONTENT
+        attachmentLp.height = dp(48)
         inlineAttachmentTitleView.text = resolveFileName(item.fileName, item.mediaUrl)
-        val attachmentLp = inlineAttachmentView.layoutParams as FrameLayout.LayoutParams
         attachmentLp.gravity = Gravity.START or Gravity.BOTTOM
         attachmentLp.topMargin = 0
         attachmentLp.rightMargin = 0
         attachmentLp.leftMargin = 0
         attachmentLp.bottomMargin = dp(17)
         inlineAttachmentView.layoutParams = attachmentLp
+        val maxBubbleWidth = (context.resources.displayMetrics.widthPixels * 0.85f).toInt()
+        textView.maxWidth = (maxBubbleWidth - dp(20) - metaReserve).coerceAtLeast(dp(24))
+        textLp.gravity = Gravity.START or Gravity.TOP
+        textLp.rightMargin = 0
+        textLp.bottomMargin = dp(48 + 8 + 17)
+        textView.layoutParams = textLp
         inlineAttachmentView.setOnClickListener {
-          val url = item.mediaUrl ?: return@setOnClickListener
-          openDocumentInApp(url)
+          openDocumentInApp(item)
         }
       } else {
+        bubbleContainer.setPadding(dp(10), dp(7), dp(10), dp(7))
+        bubbleContainer.background = drawable
+        statusLp.rightMargin = 0
+        statusLp.bottomMargin = 0
+        statusView.layoutParams = statusLp
+        timeLp.rightMargin = if (showStatus) dp(baseStatusWidth + 3) else 0
+        timeLp.bottomMargin = 0
+        timeView.layoutParams = timeLp
+        textView.visibility = View.VISIBLE
         inlineAttachmentView.visibility = View.GONE
+        mediaPreviewView.visibility = View.GONE
+        mediaPreviewView.setOnClickListener(null)
+        mediaPreviewView.isClickable = false
+        mediaPreviewView.isFocusable = false
+        applyInlineMediaTransferState(this, item)
+        inlineAttachmentTitleView.visibility = View.VISIBLE
+        inlineAttachmentSubtitleView.visibility = View.VISIBLE
+        inlineAttachmentView.background = GradientDrawable().apply {
+          cornerRadius = dpF(12f)
+          setColor(Color.argb(52, 0, 0, 0))
+        }
+        inlineAttachmentView.setPadding(dp(12), dp(8), dp(12), dp(8))
+        inlineAttachmentView.minimumWidth = dp(170)
+        val maxBubbleWidth = (context.resources.displayMetrics.widthPixels * 0.85f).toInt()
+        textView.maxWidth = (maxBubbleWidth - dp(20) - metaReserve).coerceAtLeast(dp(24))
+        textLp.gravity = Gravity.START or Gravity.TOP
+        textLp.rightMargin = metaReserve
+        textLp.bottomMargin = 0
+        textView.layoutParams = textLp
         inlineAttachmentView.setOnClickListener(null)
       }
     }
@@ -1049,7 +1752,7 @@ private class NativeRowsAdapter(
       true
     }
 
-    if (!hidden && item.shape.showTail) {
+    if (!hidden && item.shape.showTail && !hasMediaPreview) {
       tailView.configure(
         isMe = effectiveIsMe,
         visible = true,
@@ -1097,8 +1800,9 @@ private class NativeRowsAdapter(
     animateHold: Boolean = false,
   ) {
     val actions = ArrayList<Pair<String, String>>()
+    val contextText = nativeRowDisplayCaption(item).ifBlank { item.text.trim() }
     actions.add("reply" to "Reply")
-    if (item.text.isNotBlank()) actions.add("copy" to "Copy")
+    if (contextText.isNotBlank()) actions.add("copy" to "Copy")
     if (item.isMe && item.text.isNotBlank()) actions.add("edit" to "Edit")
     actions.add("pin" to "Pin")
     if (item.isMe && item.status?.lowercase() == "error") actions.add("resend" to "Resend")
@@ -1298,7 +2002,22 @@ class ChatListView(
   private val overlayHost = FrameLayout(context)
   private val inputBar = ChatNativeInputBar(context, appContext)
   private val layoutManager = LinearLayoutManager(context)
-  private val adapter = NativeRowsAdapter(context) { payload -> emitNativeEvent(payload) }
+  private val adapter =
+    NativeRowsAdapter(
+      context = context,
+      emitNativeEvent = { payload -> emitNativeEvent(payload) },
+      onOpenMediaPreview = { item -> openMediaPreview(item) },
+      resolveMediaPreviewUrl = { item -> resolvedInlineMediaPreviewUrl(item) },
+      resolveMediaTransferState = { item -> remoteMediaDownloadState(item) },
+      onMediaTransferTap = { item, state -> handleInlineMediaTransferTap(item, state) },
+    )
+  private val mediaPreviewOverlay by lazy {
+    ChatMediaPreviewOverlay(
+      context = context,
+      hostView = overlayHost,
+      authorizationHeaderProvider = { ChatEngine.authorizationHeaderForApi() ?: "" },
+    )
+  }
   private var appearance = ChatListAppearance()
   private var queuedAppearanceAfterSendTransition: ChatListAppearance? = null
   private val baseHorizontalPadding = dp(16)
@@ -1334,6 +2053,10 @@ class ChatListView(
   private val nativeEngineRowsById = linkedMapOf<String, Map<String, Any?>>()
   private val nativeEngineOrder = mutableListOf<String>()
   private val nativeDeletedMessageIds = linkedSetOf<String>()
+  private val inlineMediaCacheByRemoteKey = linkedMapOf<String, File>()
+  private val inlineMediaDownloadCalls = linkedMapOf<String, okhttp3.Call>()
+  private val inlineMediaDownloadProgress = linkedMapOf<String, Float>()
+  private var visibleAutoDownloadWorkItem: Runnable? = null
   private var mergedRowsLogCount = 0
   private var lastMergedRowsUseNative: Boolean? = null
 
@@ -1392,12 +2115,14 @@ class ChatListView(
         }
         shouldAutoScroll = currentDistanceFromBottom() <= LIST_BOTTOM_THRESHOLD
         emitViewport()
+        scheduleVisibleAutoDownloads()
       }
     })
 
     recyclerView.addOnChildAttachStateChangeListener(object : RecyclerView.OnChildAttachStateChangeListener {
       override fun onChildViewAttachedToWindow(view: View) {
         maybeStartPendingTransition()
+        scheduleVisibleAutoDownloads()
       }
 
       override fun onChildViewDetachedFromWindow(view: View) = Unit
@@ -1471,6 +2196,10 @@ class ChatListView(
       override fun onAttachmentImage(uri: String, caption: String?) {
         val normalized = uri.trim()
         if (normalized.isEmpty()) return
+        if (openAttachmentEditor(normalized, caption)) {
+          Log.i("ChatListView", "onAttachmentImage editor uri=$normalized")
+          return
+        }
         val payload = mutableMapOf<String, Any>(
           "type" to "attachmentImage",
           "uri" to normalized,
@@ -1488,6 +2217,13 @@ class ChatListView(
         if (normalized.isEmpty()) return
         val resolvedName = name.trim().ifBlank { "File" }
         val captionText = caption?.trim().orEmpty()
+        if (openAttachmentEditor(normalized, captionText, resolvedName, mimeType)) {
+          Log.i(
+            "ChatListView",
+            "onAttachmentFile editor uri=$normalized name=$resolvedName mimeType=${mimeType.orEmpty()}",
+          )
+          return
+        }
         Log.i(
           "ChatListView",
           "onAttachmentFile uri=$normalized name=$resolvedName size=${size ?: -1L} mimeType=${mimeType.orEmpty()} captionLen=${captionText.length}",
@@ -1888,6 +2624,8 @@ class ChatListView(
   }
 
   override fun onDetachedFromWindow() {
+    mediaPreviewOverlay.dismiss(animated = false)
+    resetInlineMediaDownloadState(cancelInFlight = true)
     updateChatEngineChannelBinding(forceDetach = true)
     ChatEngine.setListener(engineListenerId, null)
     if (engineSurfaceId.isNotBlank()) {
@@ -1917,6 +2655,7 @@ class ChatListView(
     if (engineChatId == next) return
     engineChatId = next
     Log.i("ChatListView", "setEngineChatId chatId=$engineChatId")
+    resetInlineMediaDownloadState(cancelInFlight = true)
     nativeEngineRowsById.clear()
     nativeEngineOrder.clear()
     nativeDeletedMessageIds.clear()
@@ -2011,6 +2750,7 @@ class ChatListView(
           } else {
             restoreStationaryDistance(previousDistanceFromBottom)
           }
+          scheduleVisibleAutoDownloads()
           prevScrollOffset = recyclerView.computeVerticalScrollOffset()
           emitViewport()
           maybeStartPendingTransition()
@@ -2513,6 +3253,7 @@ class ChatListView(
             kind = "day",
             key = key,
             text = label,
+            caption = "",
             timestamp = "",
             status = null,
             isMe = false,
@@ -2520,9 +3261,15 @@ class ChatListView(
             shape = NativeBubbleShape(showTail = false, topLeft = 18f, topRight = 18f, bottomRight = 18f, bottomLeft = 18f),
             messageType = "text",
             mediaUrl = null,
+            localMediaUrl = null,
+            mediaKey = null,
             fileName = null,
+            thumbnailBase64 = null,
+            mediaWidthPx = null,
+            mediaHeightPx = null,
             duration = null,
             waveform = null,
+            fileSize = null,
           ),
         )
         continue
@@ -2530,6 +3277,10 @@ class ChatListView(
 
       val message = raw["message"] as? Map<*, *> ?: continue
       val text = (message["text"] as? String) ?: ""
+      val metadata = message["metadata"] as? Map<*, *>
+      val caption =
+        (message["caption"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
+          ?: (metadata?.get("caption") as? String)?.trim()?.takeIf { it.isNotEmpty() }
       val timestamp = (message["timestamp"] as? String) ?: ""
       val status = (message["status"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
       val isMe = (message["isMe"] as? Boolean) ?: false
@@ -2538,11 +3289,13 @@ class ChatListView(
       if (messageType == "typing") {
         continue
       }
-      val metadata = message["metadata"] as? Map<*, *>
       val localMediaUrl1 = message["localMediaUrl"] as? String
       val localMediaUrl2 = message["local_media_url"] as? String
       val metaLocalMediaUrl1 = metadata?.get("localMediaUrl") as? String
       val metaLocalMediaUrl2 = metadata?.get("local_media_url") as? String
+      val localMediaUrl =
+        listOf(localMediaUrl1, localMediaUrl2, metaLocalMediaUrl1, metaLocalMediaUrl2)
+          .firstOrNull { !it.isNullOrBlank() }
       val mediaUrl =
         run {
           val isVoiceLike = messageType == "voice" || messageType == "music"
@@ -2567,14 +3320,35 @@ class ChatListView(
             !candidate.isNullOrBlank()
           }
         }
+      val mediaKey =
+        (message["mediaKey"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
+          ?: (message["media_key"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
+          ?: (metadata?.get("mediaKey") as? String)?.trim()?.takeIf { it.isNotEmpty() }
+          ?: (metadata?.get("media_key") as? String)?.trim()?.takeIf { it.isNotEmpty() }
       val fileName =
         (message["fileName"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
           ?: (message["file_name"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
           ?: (metadata?.get("fileName") as? String)?.trim()?.takeIf { it.isNotEmpty() }
           ?: (metadata?.get("file_name") as? String)?.trim()?.takeIf { it.isNotEmpty() }
+      val thumbnailBase64 =
+        (message["thumbnailBase64"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
+          ?: (message["thumbnail_base64"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
+          ?: (metadata?.get("thumbnailBase64") as? String)?.trim()?.takeIf { it.isNotEmpty() }
+          ?: (metadata?.get("thumbnail_base64") as? String)?.trim()?.takeIf { it.isNotEmpty() }
+      val mediaWidthPx =
+        parseDouble(message["width"])
+          ?: parseDouble(metadata?.get("width"))
+      val mediaHeightPx =
+        parseDouble(message["height"])
+          ?: parseDouble(metadata?.get("height"))
       val duration =
         parseDouble(message["duration"])
           ?: parseDouble(metadata?.get("duration"))
+      val fileSize =
+        (message["fileSize"] as? Number)?.toLong()
+          ?: (message["file_size"] as? Number)?.toLong()
+          ?: (metadata?.get("fileSize") as? Number)?.toLong()
+          ?: (metadata?.get("file_size") as? Number)?.toLong()
       val waveform =
         parseWaveform(message["waveform"])
           ?: parseWaveform(metadata?.get("waveform"))
@@ -2597,6 +3371,7 @@ class ChatListView(
           kind = "message",
           key = key,
           text = text,
+          caption = caption.orEmpty(),
           timestamp = timestamp,
           status = status,
           isMe = isMe,
@@ -2604,9 +3379,15 @@ class ChatListView(
           shape = shape,
           messageType = messageType,
           mediaUrl = mediaUrl,
+          localMediaUrl = localMediaUrl,
+          mediaKey = mediaKey,
           fileName = fileName,
+          thumbnailBase64 = thumbnailBase64,
+          mediaWidthPx = mediaWidthPx?.roundToInt(),
+          mediaHeightPx = mediaHeightPx?.roundToInt(),
           duration = duration,
           waveform = waveform,
+          fileSize = fileSize,
           isAgentMessage = rawIsAgentMessage,
           agentName = rawAgentName,
           plainContent = rawPlainContent,
@@ -2630,6 +3411,519 @@ class ChatListView(
 
   private fun isLikelyLocalMediaUrl(raw: String): Boolean {
     return raw.startsWith("file://") || raw.startsWith("content://") || raw.startsWith("/")
+  }
+
+  private fun sanitizeMediaPreviewUrl(rawUrl: String?): String? {
+    val raw = rawUrl?.trim().orEmpty()
+    if (raw.isEmpty()) return null
+    var value = raw
+    value = value.replace(
+      Regex("^https?://\\[(https?://[^\\]]+)](/.*)?$", RegexOption.IGNORE_CASE),
+      "$1$2",
+    )
+    value = value.replace(
+      Regex("^\\[(https?://[^\\]]+)](/.*)?$", RegexOption.IGNORE_CASE),
+      "$1$2",
+    )
+    value = value.replaceFirst("https://https://", "https://")
+    value = value.replaceFirst("http://http://", "http://")
+    return value
+  }
+
+  private fun resolvedMediaKey(item: NativeRowItem): String? =
+    item.mediaKey?.trim()?.takeIf { it.isNotEmpty() }
+
+  private fun isRemoteMediaUrl(rawUrl: String?): Boolean {
+    val sanitized = sanitizeMediaPreviewUrl(rawUrl) ?: return false
+    return sanitized.startsWith("http://") || sanitized.startsWith("https://")
+  }
+
+  private fun mediaRequiresLocalDownload(item: NativeRowItem): Boolean =
+    !resolvedMediaKey(item).isNullOrEmpty()
+
+  private fun shouldAutoDownloadRemoteMedia(item: NativeRowItem): Boolean {
+    if (nativeRowRepresentsVideo(item)) return true
+    if (nativeRowRepresentsImage(item)) return item.messageType != "file"
+    return false
+  }
+
+  private fun remoteMediaCacheKey(remoteUrl: String, mediaKey: String?): String =
+    remoteUrl + "|" + (mediaKey?.trim().orEmpty())
+
+  private fun inlineMediaCacheDir(): File {
+    val dir = File(context.cacheDir, "inline-media-cache")
+    if (!dir.exists()) {
+      dir.mkdirs()
+    }
+    return dir
+  }
+
+  private fun persistedInlineMediaFile(
+    item: NativeRowItem,
+    remoteUrl: String,
+    mediaKey: String?,
+  ): File {
+    val preferredName =
+      item.fileName?.trim()?.takeIf { it.isNotEmpty() }
+        ?: runCatching { Uri.parse(remoteUrl) }.getOrNull()?.lastPathSegment?.trim()
+        ?: "media"
+    val baseName = preferredName.substringBeforeLast('.', preferredName).ifBlank { "media" }
+    val safeBase = baseName.replace(Regex("[^A-Za-z0-9_-]+"), "-").ifBlank { "media" }
+    val extension =
+      item.fileName
+        ?.substringAfterLast('.', "")
+        ?.trim()
+        ?.lowercase()
+        ?.takeIf { it.isNotEmpty() }
+        ?: runCatching { Uri.parse(remoteUrl) }.getOrNull()
+          ?.lastPathSegment
+          ?.substringAfterLast('.', "")
+          ?.trim()
+          ?.lowercase()
+          ?.takeIf { it.isNotEmpty() && it != "enc" }
+        ?: if (nativeRowRepresentsVideo(item)) "mp4" else if (nativeRowRepresentsImage(item)) "jpg" else "bin"
+    val hash = String.format("%016x", remoteMediaCacheKey(remoteUrl, mediaKey).hashCode().toLong() and 0xFFFFFFFFL)
+    return File(inlineMediaCacheDir(), "${safeBase}_$hash.$extension")
+  }
+
+  private fun resolvedExistingLocalMediaUrl(rawUrl: String?): String? {
+    val sanitized = sanitizeMediaPreviewUrl(rawUrl) ?: return null
+    return when {
+      sanitized.startsWith("content://") -> sanitized
+      sanitized.startsWith("file://") -> {
+        val file = File(Uri.parse(sanitized).path ?: "")
+        sanitized.takeIf { file.exists() && file.length() > 0L }
+      }
+      sanitized.startsWith("/") -> {
+        val file = File(sanitized)
+        sanitized.takeIf { file.exists() && file.length() > 0L }
+      }
+      else -> null
+    }
+  }
+
+  private fun isUsableCachedInlineMedia(item: NativeRowItem, file: File): Boolean {
+    if (!file.exists() || file.length() <= 0L) return false
+    return when {
+      nativeRowRepresentsVideo(item) -> file.length() > 1024L
+      nativeRowRepresentsImage(item) -> BitmapFactory.decodeFile(file.absolutePath) != null
+      else -> false
+    }
+  }
+
+  private fun cachedInlineMediaFile(item: NativeRowItem): File? {
+    val remoteUrl = sanitizeMediaPreviewUrl(item.mediaUrl) ?: return null
+    if (!isRemoteMediaUrl(remoteUrl)) return null
+    val mediaKey = resolvedMediaKey(item)
+    val remoteKey = remoteMediaCacheKey(remoteUrl, mediaKey)
+    inlineMediaCacheByRemoteKey[remoteKey]?.let { cached ->
+      if (isUsableCachedInlineMedia(item, cached)) {
+        return cached
+      }
+      inlineMediaCacheByRemoteKey.remove(remoteKey)
+      cached.delete()
+    }
+    val persisted = persistedInlineMediaFile(item, remoteUrl, mediaKey)
+    if (isUsableCachedInlineMedia(item, persisted)) {
+      inlineMediaCacheByRemoteKey[remoteKey] = persisted
+      return persisted
+    }
+    return null
+  }
+
+  private fun resolvedInlineMediaPreviewUrl(item: NativeRowItem): String? {
+    resolvedExistingLocalMediaUrl(item.localMediaUrl)?.let { return it }
+    cachedInlineMediaFile(item)?.absolutePath?.let { return it }
+    val remoteUrl = sanitizeMediaPreviewUrl(item.mediaUrl) ?: return null
+    if (!isRemoteMediaUrl(remoteUrl)) return null
+    val mediaKey = resolvedMediaKey(item)
+    return when {
+      nativeRowRepresentsImage(item) && mediaKey.isNullOrEmpty() -> remoteUrl
+      else -> null
+    }
+  }
+
+  private fun remoteMediaDownloadState(item: NativeRowItem): NativeMediaTransferState {
+    if (!nativeRowRepresentsImage(item) && !nativeRowRepresentsVideo(item)) {
+      return NativeMediaTransferState()
+    }
+    val remoteUrl = sanitizeMediaPreviewUrl(item.mediaUrl) ?: return NativeMediaTransferState()
+    if (!isRemoteMediaUrl(remoteUrl)) return NativeMediaTransferState()
+    if (!mediaRequiresLocalDownload(item) && !shouldAutoDownloadRemoteMedia(item)) {
+      return NativeMediaTransferState()
+    }
+    if (resolvedExistingLocalMediaUrl(item.localMediaUrl) != null) {
+      return NativeMediaTransferState()
+    }
+    if (cachedInlineMediaFile(item) != null) {
+      return NativeMediaTransferState()
+    }
+    val remoteKey = remoteMediaCacheKey(remoteUrl, resolvedMediaKey(item))
+    return NativeMediaTransferState(
+      needsDownload = true,
+      isDownloading = inlineMediaDownloadCalls.containsKey(remoteKey),
+      progress = inlineMediaDownloadProgress[remoteKey],
+    )
+  }
+
+  private fun scheduleVisibleAutoDownloads() {
+    visibleAutoDownloadWorkItem?.let { mainHandler.removeCallbacks(it) }
+    val runnable =
+      Runnable {
+        visibleAutoDownloadWorkItem = null
+        runVisibleAutoDownloads()
+      }
+    visibleAutoDownloadWorkItem = runnable
+    mainHandler.postDelayed(runnable, 100L)
+  }
+
+  private fun runVisibleAutoDownloads() {
+    val firstVisible = layoutManager.findFirstVisibleItemPosition()
+    val lastVisible = layoutManager.findLastVisibleItemPosition()
+    if (firstVisible == RecyclerView.NO_POSITION || lastVisible == RecyclerView.NO_POSITION) return
+    for (index in firstVisible..lastVisible) {
+      val item = rows.getOrNull(index) ?: continue
+      val state = remoteMediaDownloadState(item)
+      if (!state.needsDownload || state.isDownloading) continue
+      startRemoteMediaDownload(item)
+    }
+  }
+
+  private fun visiblePositionsFor(item: NativeRowItem): List<Int> {
+    return rows.indices.filter { index ->
+      val candidate = rows[index]
+      when {
+        !item.messageId.isNullOrBlank() -> candidate.messageId == item.messageId
+        candidate.key == item.key -> true
+        !item.mediaUrl.isNullOrBlank() -> candidate.mediaUrl == item.mediaUrl
+        else -> false
+      }
+    }
+  }
+
+  private fun updateVisibleMediaTransferState(item: NativeRowItem, reloadCell: Boolean = false) {
+    val positions = visiblePositionsFor(item)
+    if (positions.isEmpty()) return
+    positions.forEach { position ->
+      if (reloadCell) {
+        adapter.notifyItemChanged(position)
+      } else {
+        val holder =
+          recyclerView.findViewHolderForAdapterPosition(position) as? NativeRowViewHolder
+            ?: return@forEach
+        val boundItem = rows.getOrNull(position) ?: item
+        adapter.applyInlineMediaTransferState(holder, boundItem)
+      }
+    }
+  }
+
+  private fun handleInlineMediaTransferTap(item: NativeRowItem, state: NativeMediaTransferState) {
+    when {
+      item.shouldShowUploadOverlay -> {
+        val messageId = item.messageId?.takeIf { it.isNotBlank() } ?: return
+        emitNativeEvent(
+          mapOf(
+            "type" to "cancelOutgoingUpload",
+            "messageId" to messageId,
+          ),
+        )
+      }
+      state.isDownloading -> cancelRemoteMediaDownload(item)
+      state.needsDownload -> startRemoteMediaDownload(item)
+    }
+  }
+
+  private fun cancelRemoteMediaDownload(item: NativeRowItem) {
+    val remoteUrl = sanitizeMediaPreviewUrl(item.mediaUrl) ?: return
+    val remoteKey = remoteMediaCacheKey(remoteUrl, resolvedMediaKey(item))
+    inlineMediaDownloadCalls.remove(remoteKey)?.cancel()
+    inlineMediaDownloadProgress.remove(remoteKey)
+    updateVisibleMediaTransferState(item)
+  }
+
+  private fun startRemoteMediaDownload(item: NativeRowItem) {
+    val remoteUrl = sanitizeMediaPreviewUrl(item.mediaUrl) ?: return
+    if (!isRemoteMediaUrl(remoteUrl)) return
+    val mediaKey = resolvedMediaKey(item)
+    val remoteKey = remoteMediaCacheKey(remoteUrl, mediaKey)
+    cachedInlineMediaFile(item)?.let {
+      updateVisibleMediaTransferState(item, reloadCell = true)
+      return
+    }
+    if (inlineMediaDownloadCalls.containsKey(remoteKey)) return
+
+    inlineMediaDownloadProgress[remoteKey] = 0.027f
+    updateVisibleMediaTransferState(item)
+
+    val request =
+      okhttp3.Request.Builder()
+        .url(remoteUrl)
+        .header("ngrok-skip-browser-warning", "true")
+        .apply {
+          ChatEngine.authorizationHeaderForApi()?.takeIf { it.isNotBlank() }?.let {
+            header("Authorization", it)
+          }
+        }
+        .build()
+    val call = ChatPhoenixClient.buildPinnedHttpClient().newCall(request)
+    inlineMediaDownloadCalls[remoteKey] = call
+
+    call.enqueue(object : okhttp3.Callback {
+      override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
+        mainHandler.post {
+          inlineMediaDownloadCalls.remove(remoteKey)
+          inlineMediaDownloadProgress.remove(remoteKey)
+          updateVisibleMediaTransferState(item)
+        }
+      }
+
+      override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+        val destination = persistedInlineMediaFile(item, remoteUrl, mediaKey)
+        val tempFile = File(destination.absolutePath + ".part")
+        try {
+          if (!response.isSuccessful) {
+            throw java.io.IOException("http ${response.code}")
+          }
+          val body = response.body ?: throw java.io.IOException("missing body")
+          tempFile.parentFile?.mkdirs()
+          val totalLength = body.contentLength().takeIf { it > 0L } ?: -1L
+          val decryptedBytes: ByteArray? =
+            if (!mediaKey.isNullOrBlank()) {
+              val chunks = ArrayList<ByteArray>()
+              var totalBytesCopied = 0
+              body.byteStream().use { input ->
+                val buffer = ByteArray(8192)
+                while (true) {
+                  val bytesRead = input.read(buffer)
+                  if (bytesRead <= 0) break
+                  chunks.add(buffer.copyOf(bytesRead))
+                  totalBytesCopied += bytesRead
+                  if (call.isCanceled()) {
+                    throw java.io.IOException("download canceled")
+                  }
+                  if (totalLength > 0L) {
+                    val progress = (totalBytesCopied.toFloat() / totalLength.toFloat()).coerceIn(0f, 1f)
+                    mainHandler.post {
+                      val previous = inlineMediaDownloadProgress[remoteKey] ?: 0f
+                      if (kotlin.math.abs(previous - progress) >= 0.01f) {
+                        inlineMediaDownloadProgress[remoteKey] = progress.coerceAtLeast(0.027f)
+                        updateVisibleMediaTransferState(item)
+                      }
+                    }
+                  }
+                }
+              }
+              val encrypted = ByteArray(totalBytesCopied)
+              var offset = 0
+              chunks.forEach { chunk ->
+                System.arraycopy(chunk, 0, encrypted, offset, chunk.size)
+                offset += chunk.size
+              }
+              chatEngineDecryptMediaBytes(encrypted, mediaKey)
+                ?: throw java.io.IOException("decrypt failed")
+            } else {
+              tempFile.outputStream().use { output ->
+                body.byteStream().use { input ->
+                  val buffer = ByteArray(8192)
+                  var copied = 0L
+                  while (true) {
+                    val bytesRead = input.read(buffer)
+                    if (bytesRead <= 0) break
+                    output.write(buffer, 0, bytesRead)
+                    copied += bytesRead.toLong()
+                    if (call.isCanceled()) {
+                      throw java.io.IOException("download canceled")
+                    }
+                    if (totalLength > 0L) {
+                      val progress = (copied.toFloat() / totalLength.toFloat()).coerceIn(0f, 1f)
+                      mainHandler.post {
+                        val previous = inlineMediaDownloadProgress[remoteKey] ?: 0f
+                        if (kotlin.math.abs(previous - progress) >= 0.01f) {
+                          inlineMediaDownloadProgress[remoteKey] = progress.coerceAtLeast(0.027f)
+                          updateVisibleMediaTransferState(item)
+                        }
+                      }
+                    }
+                  }
+                  output.flush()
+                }
+              }
+              null
+            }
+
+          if (decryptedBytes != null) {
+            destination.outputStream().use { output ->
+              output.write(decryptedBytes)
+              output.flush()
+            }
+          } else {
+            if (destination.exists()) destination.delete()
+            if (!tempFile.renameTo(destination)) {
+              val copiedBytes = tempFile.readBytes()
+              destination.outputStream().use { output ->
+                output.write(copiedBytes)
+                output.flush()
+              }
+              tempFile.delete()
+            }
+          }
+
+          if (!isUsableCachedInlineMedia(item, destination)) {
+            throw java.io.IOException("downloaded file unusable")
+          }
+
+          mainHandler.post {
+            inlineMediaDownloadCalls.remove(remoteKey)
+            inlineMediaDownloadProgress.remove(remoteKey)
+            inlineMediaCacheByRemoteKey[remoteKey] = destination
+            updateVisibleMediaTransferState(item, reloadCell = true)
+          }
+        } catch (error: Throwable) {
+          tempFile.delete()
+          destination.delete()
+          mainHandler.post {
+            inlineMediaDownloadCalls.remove(remoteKey)
+            inlineMediaDownloadProgress.remove(remoteKey)
+            updateVisibleMediaTransferState(item)
+          }
+        } finally {
+          response.close()
+        }
+      }
+    })
+  }
+
+  private fun resetInlineMediaDownloadState(cancelInFlight: Boolean) {
+    visibleAutoDownloadWorkItem?.let { mainHandler.removeCallbacks(it) }
+    visibleAutoDownloadWorkItem = null
+    if (cancelInFlight) {
+      inlineMediaDownloadCalls.values.forEach { it.cancel() }
+    }
+    inlineMediaDownloadCalls.clear()
+    inlineMediaDownloadProgress.clear()
+  }
+
+  private fun resolveMediaPreviewHeaderTitle(item: NativeRowItem): String {
+    val chatId = engineChatId.trim()
+    if (chatId == "saved_messages") return "You"
+    if (item.isMe) return "You"
+    val peerUser = enginePeerUserId.trim()
+    val myUser = engineMyUserId.trim()
+    if (peerUser.isNotEmpty() && !peerUser.equals(myUser, ignoreCase = true)) {
+      return peerUser
+    }
+    return if (nativeRowRepresentsVideo(item)) "Video" else "Photo"
+  }
+
+  private fun openMediaPreview(item: NativeRowItem) {
+    if (!nativeRowRepresentsImage(item) && !nativeRowRepresentsVideo(item)) return
+    val localUrl =
+      resolvedExistingLocalMediaUrl(item.localMediaUrl)
+        ?: cachedInlineMediaFile(item)?.absolutePath
+    val remoteUrl =
+      sanitizeMediaPreviewUrl(item.mediaUrl)
+        ?.takeIf { it.startsWith("http://") || it.startsWith("https://") }
+    val sourceUrl = localUrl ?: resolvedInlineMediaPreviewUrl(item) ?: remoteUrl
+    if (sourceUrl == null && item.thumbnailBase64.isNullOrBlank()) {
+      return
+    }
+    mediaPreviewOverlay.show(
+      ChatMediaPreviewRequest(
+        title = resolveMediaPreviewHeaderTitle(item),
+        caption = nativeRowDisplayCaption(item),
+        sourceUrl = sourceUrl,
+        remoteUrl = remoteUrl,
+        localUrl = localUrl,
+        mediaKey = item.mediaKey,
+        fileName = item.fileName,
+        thumbnailBase64 = item.thumbnailBase64,
+        isVideo = nativeRowRepresentsVideo(item),
+      ),
+    )
+  }
+
+  private fun resolveAttachmentDisplayName(rawUri: String, fallback: String? = null): String? {
+    fallback?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+    val parsed = runCatching { Uri.parse(rawUri) }.getOrNull() ?: return null
+    if (parsed.scheme?.equals("content", ignoreCase = true) == true) {
+      runCatching {
+        context.contentResolver.query(parsed, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)
+      }.getOrNull()?.use { cursor ->
+        val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+        if (nameIndex >= 0 && cursor.moveToFirst()) {
+          cursor.getString(nameIndex)?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+        }
+      }
+    }
+    return parsed.lastPathSegment?.substringAfterLast('/')?.trim()?.takeIf { it.isNotEmpty() }
+  }
+
+  private fun resolveAttachmentMimeType(rawUri: String, fileName: String?, explicitMimeType: String?): String? {
+    explicitMimeType?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+    val parsed = runCatching { Uri.parse(rawUri) }.getOrNull()
+    if (parsed?.scheme?.equals("content", ignoreCase = true) == true) {
+      context.contentResolver.getType(parsed)?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+    }
+    val candidate = fileName?.trim().takeUnless { it.isNullOrEmpty() } ?: rawUri
+    return URLConnection.guessContentTypeFromName(candidate)
+  }
+
+  private fun attachmentRepresentsVideo(rawUri: String, fileName: String?, mimeType: String?): Boolean {
+    if (mimeType?.trim()?.lowercase()?.startsWith("video/") == true) return true
+    return normalizedMediaExtension(fileName) in setOf("mp4", "mov", "m4v", "avi", "mkv", "webm")
+      || normalizedMediaExtension(rawUri) in setOf("mp4", "mov", "m4v", "avi", "mkv", "webm")
+  }
+
+  private fun attachmentRepresentsImage(rawUri: String, fileName: String?, mimeType: String?): Boolean {
+    if (mimeType?.trim()?.lowercase()?.startsWith("image/") == true) return true
+    return normalizedMediaExtension(fileName) in setOf("jpg", "jpeg", "png", "webp", "heic", "heif", "gif")
+      || normalizedMediaExtension(rawUri) in setOf("jpg", "jpeg", "png", "webp", "heic", "heif", "gif")
+  }
+
+  private fun openAttachmentEditor(
+    rawUri: String,
+    initialCaption: String?,
+    fileName: String? = null,
+    mimeType: String? = null,
+  ): Boolean {
+    val normalized = sanitizeMediaPreviewUrl(rawUri) ?: return false
+    val resolvedName = resolveAttachmentDisplayName(normalized, fileName)
+    val resolvedMimeType = resolveAttachmentMimeType(normalized, resolvedName, mimeType)
+    val isVideo = attachmentRepresentsVideo(normalized, resolvedName, resolvedMimeType)
+    val isImage = !isVideo && attachmentRepresentsImage(normalized, resolvedName, resolvedMimeType)
+    if (!isVideo && !isImage) return false
+    mediaPreviewOverlay.show(
+      ChatMediaPreviewRequest(
+        title = if (isVideo) "Video" else "Photo",
+        caption = initialCaption?.trim().orEmpty(),
+        sourceUrl = normalized,
+        remoteUrl = null,
+        localUrl = normalized,
+        mediaKey = null,
+        fileName = resolvedName,
+        thumbnailBase64 = null,
+        isVideo = isVideo,
+        editable = true,
+        mimeType = resolvedMimeType,
+        actionLabel = "Send",
+        onCommit = { result ->
+          val payload = mutableMapOf<String, Any>(
+            "type" to "attachmentImage",
+            "uri" to result.mediaUrl,
+          )
+          result.caption?.let { payload["caption"] = it }
+          result.fileName?.let { payload["name"] = it }
+          result.mimeType?.let { payload["mimeType"] = it }
+          if (result.isVideo) {
+            payload["isVideo"] = true
+            result.durationSeconds?.let { payload["duration"] = it }
+            result.thumbnailBase64?.let { payload["thumbnailBase64"] = it }
+          }
+          emitNativeEvent(payload)
+        },
+      ),
+    )
+    return true
   }
 
   private fun parseSendPayload(payload: Map<String, Any?>): SendTransitionPayload? {
@@ -3072,6 +4366,7 @@ class ChatListView(
           } else {
             restoreStationaryDistance(previousDistanceFromBottom)
           }
+          scheduleVisibleAutoDownloads()
         }
       }
     }

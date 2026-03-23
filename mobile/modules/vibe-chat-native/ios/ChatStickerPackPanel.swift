@@ -189,6 +189,7 @@ final class ChatStickerPackPanel: UIView {
   private let emptyLabel = UILabel()
   private let selectionFeedback = UISelectionFeedbackGenerator()
   private var searchQuery: String = ""
+  private var packStripHeightConstraint: NSLayoutConstraint?
 
   var contentScrollView: UIScrollView { collectionView }
 
@@ -202,6 +203,7 @@ final class ChatStickerPackPanel: UIView {
     super.init(frame: frame)
     setupUI()
     rebuildPackStrip()
+    updatePackStripVisibility()
     reloadDisplayedStickers()
   }
 
@@ -251,6 +253,7 @@ final class ChatStickerPackPanel: UIView {
     addSubview(emptyLabel)
 
     let packStripHeightConstraint = packStripScrollView.heightAnchor.constraint(equalToConstant: 0)
+    self.packStripHeightConstraint = packStripHeightConstraint
 
     NSLayoutConstraint.activate([
       packStripScrollView.topAnchor.constraint(equalTo: topAnchor),
@@ -267,7 +270,7 @@ final class ChatStickerPackPanel: UIView {
       packStripStack.bottomAnchor.constraint(
         equalTo: packStripScrollView.contentLayoutGuide.bottomAnchor),
       packStripStack.heightAnchor.constraint(
-        equalTo: packStripScrollView.frameLayoutGuide.heightAnchor),
+        greaterThanOrEqualTo: packStripScrollView.frameLayoutGuide.heightAnchor),
 
       collectionView.topAnchor.constraint(equalTo: packStripScrollView.bottomAnchor),
       collectionView.leadingAnchor.constraint(equalTo: leadingAnchor),
@@ -308,6 +311,13 @@ final class ChatStickerPackPanel: UIView {
       btn.addTarget(self, action: #selector(packTapped(_:)), for: .touchUpInside)
       packStripStack.addArrangedSubview(btn)
     }
+    updatePackStripVisibility()
+  }
+
+  private func updatePackStripVisibility() {
+    let shouldShow = false
+    packStripScrollView.isHidden = !shouldShow
+    packStripHeightConstraint?.constant = shouldShow ? 36 : 0
   }
 
   private func makePackButton(title: String, selected: Bool, tag: Int) -> UIButton {

@@ -15,6 +15,7 @@ import MaskedView from '@react-native-masked-view/masked-view';
 import { BlurView } from 'expo-blur';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, { useSharedValue, useAnimatedStyle, withSpring, withTiming, withRepeat, withSequence, Easing, runOnJS, interpolate } from 'react-native-reanimated';
+import NativeGlobalMusicPlayer, { isNativeGlobalMusicPlayerAvailable } from '../native/NativeGlobalMusicPlayer';
 
 const MaskedViewAny = MaskedView as any;
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
@@ -117,7 +118,7 @@ const MiniVisualizer = ({ isPlaying, color }: { isPlaying: boolean; color: strin
     );
 };
 
-export const GlobalMusicPlayer = () => {
+const GlobalMusicPlayerLegacy = () => {
     const { currentTrack, isPlaying, setIsPlaying, isExpanded, setIsExpanded, playNext, playPrev, queue, setTrack, reset, setProgress: setStoreProgress, setDuration: setStoreDuration, playbackRate, setPlaybackRate } = useMusicPlayerStore();
     const { downloadTrack, downloadingTracks, getTrack, cacheTrack, removeTrack } = useMediaCacheStore();
     const { colors, effectiveTheme } = useThemeStore();
@@ -807,6 +808,27 @@ export const GlobalMusicPlayer = () => {
             {renderFullModal()}
         </React.Fragment>
     );
+};
+
+export const GlobalMusicPlayer = () => {
+    const { colors, effectiveTheme } = useThemeStore();
+    const insets = useSafeAreaInsets();
+    const canRenderNative = React.useMemo(() => isNativeGlobalMusicPlayerAvailable(), []);
+
+    if (canRenderNative) {
+        return (
+            <NativeGlobalMusicPlayer
+                isDark={effectiveTheme === 'dark'}
+                surfaceColor={colors.surface}
+                textColor={colors.text}
+                textSecondaryColor={colors.textSecondary}
+                primaryColor={colors.primary}
+                topInset={insets.top}
+            />
+        );
+    }
+
+    return <GlobalMusicPlayerLegacy />;
 };
 
 const styles = StyleSheet.create({

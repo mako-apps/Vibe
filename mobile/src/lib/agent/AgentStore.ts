@@ -127,7 +127,7 @@ export const useAgentStore = create<AgentState>()(
                         // Handle streaming text chunks
                         agentChannel.on('chunk', (payload: { text: string }) => {
                             const { streamingContent, activeConversationId, conversations } = get();
-                            const newContent = streamingContent + payload.text;
+                            const newContent = streamingContent + (payload.text || '');
                             set({ streamingContent: newContent, isStreaming: true });
 
                             // Update the assistant message in real-time
@@ -661,10 +661,7 @@ export const useAgentStore = create<AgentState>()(
                     images: images || [],
                     conversation_id: convId,
                     truncate_at_id: truncateAtId
-                })
-                    .receive('ok', () => console.log('[AgentStore] Push OK'))
-                    .receive('error', (reasons: any) => console.log('[AgentStore] Push failed', reasons))
-                    .receive('timeout', () => console.log('[AgentStore] Push timeout'));
+                });
 
                 // 5. Set timeout to prevent stuck loading (30 seconds)
                 if (streamingTimeoutId) clearTimeout(streamingTimeoutId);

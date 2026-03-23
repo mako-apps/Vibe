@@ -595,22 +595,45 @@ export default function SavedMessagesScreen() {
             const uri = typeof payload.uri === 'string' ? payload.uri.trim() : '';
             if (!uri) return;
             const caption = typeof payload.caption === 'string' ? payload.caption.trim() : '';
+            const mimeType = typeof payload.mimeType === 'string' ? payload.mimeType.trim() : '';
+            const explicitVideo = payload.isVideo === true || /^video\//i.test(mimeType);
+            const attachmentType: 'video' | 'image' =
+                explicitVideo || /\.(mp4|mov|m4v|avi|mkv|webm)(?:$|[?#])/i.test(uri) ? 'video' : 'image';
+            const fallbackText = attachmentType === 'video' ? 'Video' : 'Image';
+            const metadata: Record<string, any> = {
+                mediaUrl: uri,
+                width: toNumber(payload.width),
+                height: toNumber(payload.height),
+            };
+            if (mimeType) {
+                metadata.mimeType = mimeType;
+            }
+            if (attachmentType === 'video') {
+                const duration = toNumber(payload.duration);
+                if (typeof duration === 'number' && Number.isFinite(duration) && duration > 0) {
+                    metadata.duration = duration;
+                }
+                const fileName =
+                    typeof payload.name === 'string' ? payload.name.trim()
+                        : typeof payload.fileName === 'string' ? payload.fileName.trim()
+                            : '';
+                if (fileName) {
+                    metadata.fileName = fileName;
+                }
+                const thumbnailBase64 =
+                    typeof payload.thumbnailBase64 === 'string' ? payload.thumbnailBase64.trim() : '';
+                if (thumbnailBase64) {
+                    metadata.thumbnailBase64 = thumbnailBase64;
+                }
+            }
             if (nativeSavedMessagesEnabled) {
                 void submitNativeSavedMessage({
-                    type: 'image',
-                    text: caption || 'Image',
-                    metadata: {
-                        mediaUrl: uri,
-                        width: toNumber(payload.width),
-                        height: toNumber(payload.height),
-                    },
+                    type: attachmentType,
+                    text: caption || fallbackText,
+                    metadata,
                 });
             } else {
-                void sendMessage(caption || 'Image', 'image', {
-                    mediaUrl: uri,
-                    width: toNumber(payload.width),
-                    height: toNumber(payload.height),
-                }).finally(scheduleNativeScrollToBottom);
+                void sendMessage(caption || fallbackText, attachmentType, metadata).finally(scheduleNativeScrollToBottom);
             }
             return;
         }
@@ -851,7 +874,13 @@ export default function SavedMessagesScreen() {
                         wallpaperPatternOpacity: resolvedTheme.patternOpacity || 0,
                         wallpaperMaskKey: resolvedTheme.maskedImage || resolvedTheme.patternType || undefined,
                         bubbleMeGradient: resolvedTheme.bubbleMeGradient || [resolvedTheme.bubbleMe, resolvedTheme.bubbleMe],
-                        bubbleThemColor: resolvedTheme.bubbleThem || colors.card,
+                        bubbleThemGradient:
+                            resolvedTheme.bubbleThemGradient
+                            || [resolvedTheme.bubbleThem, resolvedTheme.bubbleThem],
+                        bubbleThemColor:
+                            resolvedTheme.bubbleThemGradient?.[0]
+                            || resolvedTheme.bubbleThem
+                            || colors.card,
                         textColorMe: resolvedTheme.textColorMe || colors.text,
                         textColorThem: resolvedTheme.textColorThem || colors.text,
                         timeColorThem: colors.textSecondary,
@@ -860,7 +889,7 @@ export default function SavedMessagesScreen() {
                     contentPaddingBottom={Math.max(14, insets.bottom + 8)}
                     inputBarEnabled
                     inputPlaceholder="Saved Message"
-                    nativeSendEnabled={false}
+                    nativeSendEnabled
                     onNativeEvent={handleNativeEvent}
                     onNativeError={(error, context) => {
                         console.warn('[saved-messages/native-main]', context, error);

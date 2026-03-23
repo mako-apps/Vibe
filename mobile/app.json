@@ -23,7 +23,12 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.mohammadshayani.vibegram",
-      "bitcode": false
+      "bitcode": false,
+      "infoPlist": {
+        "UIBackgroundModes": [
+          "audio"
+        ]
+      }
     },
     "android": {
       "adaptiveIcon": {

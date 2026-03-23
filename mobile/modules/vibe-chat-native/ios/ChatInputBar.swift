@@ -60,6 +60,7 @@ final class FluidVADVisualizer: UIView {
   private var displayLink: CADisplayLink?
   private var time: CGFloat = 0
   var level: CGFloat = 0
+  var activePushMultiplier: CGFloat = 0.4
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -106,7 +107,7 @@ final class FluidVADVisualizer: UIView {
       let idx = CGFloat(i + 1)
 
       let idlePulse = sin(time * 2.0 + CGFloat(i * 2)) * 0.04
-      let activePush = level * 0.4 * idx
+      let activePush = level * activePushMultiplier * idx
       let finalScale = 1.0 + idlePulse + activePush
 
       l.transform = CATransform3DMakeScale(finalScale, finalScale, 1.0)

@@ -1,0 +1,634 @@
+import AVFoundation
+import Foundation
+
+extension Notification.Name {
+  static let nativeMusicPlayerStateDidChange = Notification.Name(
+    "NativeMusicPlayerStateDidChange")
+}
+
+final class NativeMusicPlayerEngine: NSObject {
+  static let shared = NativeMusicPlayerEngine()
+
+  private let store = NativeMusicPlayerStore.shared
+  private let authHeadersProvider = NativeMusicPlayerAuthHeadersProvider()
+  private lazy var downloadSession: URLSession = {
+    let configuration = URLSessionConfiguration.default
+    configuration.timeoutIntervalForRequest = 120
+    configuration.timeoutIntervalForResource = 600
+    return URLSession(configuration: configuration)
+  }()
+
+  private var queueTrackIds: [String] = []
+  private var currentTrackId: String?
+  private var isPlaying = false
+  private var isExpanded = false
+  private var playbackRate: Double = 1.0
+  private var currentPositionMs: Double = 0.0
+  private var currentDurationMs: Double = 0.0
+  private var currentSourceURLKey: String?
+
+  private var player: AVPlayer?
+  private var playerItemStatusObservation: NSKeyValueObservation?
+  private var playerTimeObserver: Any?
+  private var playbackEndObserver: NSObjectProtocol?
+
+  private var downloadTasks: [String: URLSessionDownloadTask] = [:]
+  private var downloadObservations: [String: NSKeyValueObservation] = [:]
+  private var pendingDownloadCompletions: [String: [([String: Any]) -> Void]] = [:]
+
+  private override init() {
+    super.init()
+    publishState()
+  }
+
+  deinit {
+    cleanupPlayer()
+  }
+
+  func getStatePayload() -> [String: Any] {
+    let currentTrackPayload = currentTrack?.toPayload()
+    let queuePayload = queueTrackIds.compactMap { store.getTrack(trackId: $0)?.toPayload() }
+    return [
+      "currentTrack": currentTrackPayload ?? NSNull(),
+      "queue": queuePayload,
+      "isPlaying": isPlaying,
+      "isExpanded": isExpanded,
+      "progress": currentPositionMs,
+      "duration": currentDurationMs,
+      "playbackRate": playbackRate,
+      "tracks": store.allTracksPayload(),
+      "downloadingTracks": store.downloadingTracksPayload(),
+    ]
+  }
+
+  func setQueue(_ rawTracks: [[String: Any]]) {
+    DispatchQueue.main.async {
+      let nextIds = rawTracks.compactMap { payload -> String? in
+        guard let track = self.store.cacheTrack(payload: payload) else { return nil }
+        return track.trackId
+      }
+      self.queueTrackIds = Self.deduplicated(ids: nextIds)
+      if let currentTrackId = self.currentTrackId, !self.queueTrackIds.contains(currentTrackId) {
+        self.queueTrackIds.insert(currentTrackId, at: 0)
+      }
+      self.publishState()
+    }
+  }
+
+  func setTrack(_ payload: [String: Any]) {
+    DispatchQueue.main.async {
+      guard let track = self.store.cacheTrack(payload: payload) else { return }
+      self.ensureTrackInQueue(track.trackId)
+      let isSameTrack = self.currentTrackId == track.trackId
+      self.currentTrackId = track.trackId
+      self.isPlaying = true
+      if isSameTrack, self.currentSourceURLKey != nil {
+        self.playCurrentIfReady()
+        self.publishState()
+        return
+      }
+      self.preparePlaybackForCurrentTrack()
+    }
+  }
+
+  func setIsPlaying(_ value: Bool) {
+    DispatchQueue.main.async {
+      self.isPlaying = value
+      if value {
+        self.playCurrentIfReady()
+      } else {
+        self.player?.pause()
+      }
+      self.publishState()
+    }
+  }
+
+  func setIsExpanded(_ value: Bool) {
+    DispatchQueue.main.async {
+      guard self.isExpanded != value else { return }
+      self.isExpanded = value
+      self.publishState()
+    }
+  }
+
+  func setPlaybackRate(_ value: Double) {
+    DispatchQueue.main.async {
+      let normalized = max(0.5, min(3.0, value))
+      self.playbackRate = normalized
+      if self.isPlaying {
+        self.player?.rate = Float(normalized)
+      }
+      self.publishState()
+    }
+  }
+
+  func playNext() {
+    DispatchQueue.main.async {
+      guard let currentTrackId = self.currentTrackId else { return }
+      guard let idx = self.queueTrackIds.firstIndex(of: currentTrackId), idx < self.queueTrackIds.count - 1
+      else { return }
+      let nextId = self.queueTrackIds[idx + 1]
+      guard let track = self.store.getTrack(trackId: nextId) else { return }
+      self.currentTrackId = track.trackId
+      self.isPlaying = true
+      self.preparePlaybackForCurrentTrack()
+    }
+  }
+
+  func playPrev() {
+    DispatchQueue.main.async {
+      guard let currentTrackId = self.currentTrackId else { return }
+      guard let idx = self.queueTrackIds.firstIndex(of: currentTrackId), idx > 0 else { return }
+      let prevId = self.queueTrackIds[idx - 1]
+      guard let track = self.store.getTrack(trackId: prevId) else { return }
+      self.currentTrackId = track.trackId
+      self.isPlaying = true
+      self.preparePlaybackForCurrentTrack()
+    }
+  }
+
+  func seek(toMilliseconds milliseconds: Double) {
+    DispatchQueue.main.async {
+      guard let player = self.player else { return }
+      let clamped = max(0.0, min(milliseconds, max(self.currentDurationMs, milliseconds)))
+      let seconds = clamped / 1000.0
+      let time = CMTime(seconds: seconds, preferredTimescale: 600)
+      player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { _ in
+        self.currentPositionMs = clamped
+        self.publishState()
+      }
+    }
+  }
+
+  func reset() {
+    DispatchQueue.main.async {
+      self.isPlaying = false
+      self.isExpanded = false
+      self.currentTrackId = nil
+      self.queueTrackIds = []
+      self.currentPositionMs = 0.0
+      self.currentDurationMs = 0.0
+      self.currentSourceURLKey = nil
+      self.cleanupPlayer()
+      self.publishState()
+    }
+  }
+
+  func cacheTrack(_ payload: [String: Any]) -> [String: Any]? {
+    return readOnMain {
+      let result = self.store.cacheTrack(payload: payload)?.toPayload()
+      self.publishState()
+      return result
+    }
+  }
+
+  func getTrack(_ trackId: String) -> [String: Any]? {
+    readOnMain {
+      self.store.getTrack(trackId: trackId)?.toPayload()
+    }
+  }
+
+  func removeTrack(_ trackId: String) {
+    DispatchQueue.main.async {
+      self.cancelDownload(for: trackId)
+      if self.currentTrackId == trackId {
+        self.reset()
+      } else {
+        self.store.removeTrack(trackId: trackId)
+        self.queueTrackIds.removeAll { $0 == trackId }
+        self.publishState()
+      }
+    }
+  }
+
+  func downloadTrack(_ payload: [String: Any], completion: (([String: Any]) -> Void)? = nil) {
+    DispatchQueue.main.async {
+      guard let track = self.store.cacheTrack(payload: payload) else {
+        completion?(["success": false, "error": "invalid_track"])
+        return
+      }
+
+      if let localURL = self.store.resolvedCachedFileURL(for: track) {
+        completion?([
+          "success": true,
+          "localUri": localURL.absoluteString,
+          "track": self.store.getTrack(trackId: track.trackId)?.toPayload() ?? NSNull(),
+        ])
+        self.publishState()
+        return
+      }
+
+      if let existingTask = self.downloadTasks[track.trackId] {
+        if let completion {
+          self.pendingDownloadCompletions[track.trackId, default: []].append(completion)
+        }
+        if existingTask.state == .running {
+          self.publishState()
+          return
+        }
+      }
+
+      guard let remoteURL = self.resolveRemoteDownloadURL(for: track) else {
+        completion?(["success": false, "error": "missing_remote_url"])
+        return
+      }
+
+      if let completion {
+        self.pendingDownloadCompletions[track.trackId, default: []].append(completion)
+      }
+      self.startDownload(track: track, remoteURL: remoteURL)
+    }
+  }
+
+  var currentTrack: NativeMusicPlayerTrack? {
+    guard let currentTrackId else { return nil }
+    return store.getTrack(trackId: currentTrackId)
+  }
+
+  private func ensureTrackInQueue(_ trackId: String) {
+    if queueTrackIds.contains(trackId) { return }
+    queueTrackIds.insert(trackId, at: 0)
+  }
+
+  private func preparePlaybackForCurrentTrack() {
+    guard let track = currentTrack else {
+      cleanupPlayer()
+      publishState()
+      return
+    }
+
+    guard let resolvedURL = resolvePlaybackURL(for: track) else {
+      isPlaying = false
+      publishState()
+      return
+    }
+
+    let sourceKey = resolvedURL.absoluteString
+    if currentSourceURLKey == sourceKey, player != nil {
+      playCurrentIfReady()
+      publishState()
+      return
+    }
+
+    currentSourceURLKey = sourceKey
+    currentPositionMs = 0.0
+    currentDurationMs = (track.durationSeconds ?? 0.0) * 1000.0
+    configureAudioSessionIfNeeded()
+    cleanupPlayer()
+
+    let item = AVPlayerItem(url: resolvedURL)
+    let player = AVPlayer(playerItem: item)
+    player.automaticallyWaitsToMinimizeStalling = true
+    self.player = player
+
+    playerItemStatusObservation = item.observe(\.status, options: [.new, .initial]) { [weak self] item, _ in
+      guard let self else { return }
+      DispatchQueue.main.async {
+        switch item.status {
+        case .readyToPlay:
+          if item.duration.seconds.isFinite && item.duration.seconds > 0 {
+            self.currentDurationMs = item.duration.seconds * 1000.0
+          }
+          self.playCurrentIfReady()
+          self.publishState()
+        case .failed:
+          self.isPlaying = false
+          self.publishState()
+        default:
+          break
+        }
+      }
+    }
+
+    playerTimeObserver = player.addPeriodicTimeObserver(
+      forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
+      queue: .main
+    ) { [weak self] time in
+      guard let self else { return }
+      self.currentPositionMs = max(0.0, time.seconds * 1000.0)
+      if let duration = self.player?.currentItem?.duration,
+        duration.seconds.isFinite,
+        duration.seconds > 0
+      {
+        self.currentDurationMs = duration.seconds * 1000.0
+      }
+      self.publishState()
+    }
+
+    playbackEndObserver = NotificationCenter.default.addObserver(
+      forName: .AVPlayerItemDidPlayToEndTime,
+      object: item,
+      queue: .main
+    ) { [weak self] _ in
+      self?.handlePlaybackDidFinish()
+    }
+
+    if shouldAutoDownload(track) {
+      if let remoteURL = resolveRemoteDownloadURL(for: track) {
+        startDownload(track: track, remoteURL: remoteURL)
+      }
+    }
+
+    publishState()
+  }
+
+  private func playCurrentIfReady() {
+    guard isPlaying else {
+      player?.pause()
+      return
+    }
+    guard let player else { return }
+    let status = player.currentItem?.status ?? .unknown
+    guard status == .readyToPlay else { return }
+    if player.currentItem?.currentTime() == player.currentItem?.duration {
+      player.seek(to: .zero)
+    }
+    player.playImmediately(atRate: Float(playbackRate))
+    if let currentTrackId {
+      _ = store.recordPlay(trackId: currentTrackId)
+    }
+  }
+
+  private func handlePlaybackDidFinish() {
+    currentPositionMs = currentDurationMs
+    let shouldResetOnly = {
+      guard let track = currentTrack else { return false }
+      return track.source == "chat-voice" || track.title == "Voice Message"
+    }()
+
+    if shouldResetOnly {
+      isPlaying = false
+      player?.seek(to: .zero)
+      currentPositionMs = 0.0
+      publishState()
+      return
+    }
+
+    if let currentTrackId,
+      let idx = queueTrackIds.firstIndex(of: currentTrackId),
+      idx < queueTrackIds.count - 1
+    {
+      let nextId = queueTrackIds[idx + 1]
+      self.currentTrackId = nextId
+      isPlaying = true
+      preparePlaybackForCurrentTrack()
+      return
+    }
+
+    isPlaying = false
+    publishState()
+  }
+
+  private func cleanupPlayer() {
+    if let timeObserver = playerTimeObserver {
+      player?.removeTimeObserver(timeObserver)
+      playerTimeObserver = nil
+    }
+    if let playbackEndObserver {
+      NotificationCenter.default.removeObserver(playbackEndObserver)
+      self.playbackEndObserver = nil
+    }
+    playerItemStatusObservation?.invalidate()
+    playerItemStatusObservation = nil
+    player?.pause()
+    player = nil
+  }
+
+  private func publishState() {
+    let payload = getStatePayload()
+    NotificationCenter.default.post(
+      name: .nativeMusicPlayerStateDidChange,
+      object: self,
+      userInfo: ["payload": payload]
+    )
+  }
+
+  private func shouldAutoDownload(_ track: NativeMusicPlayerTrack) -> Bool {
+    if track.source == "chat-voice" { return false }
+    if store.resolvedCachedFileURL(for: track) != nil { return false }
+    if downloadTasks[track.trackId] != nil { return false }
+    return resolveRemoteDownloadURL(for: track) != nil
+  }
+
+  private func resolvePlaybackURL(for track: NativeMusicPlayerTrack) -> URL? {
+    if let localURL = store.resolvedCachedFileURL(for: track) {
+      return localURL
+    }
+    if let localURI = track.localURI, let fileURL = Self.resolveFileURL(from: localURI),
+      FileManager.default.fileExists(atPath: fileURL.path)
+    {
+      return fileURL
+    }
+    if let remoteURL = resolveRemoteDownloadURL(for: track) {
+      return remoteURL
+    }
+    if let fallback = resolveBackendStreamURL(for: track) {
+      return fallback
+    }
+    return nil
+  }
+
+  private func resolveRemoteDownloadURL(for track: NativeMusicPlayerTrack) -> URL? {
+    if let previewURL = resolveNetworkURL(from: track.previewURL) {
+      return previewURL
+    }
+    if let streamURL = resolveNetworkURL(from: track.streamURL) {
+      return streamURL
+    }
+    return nil
+  }
+
+  private func resolveBackendStreamURL(for track: NativeMusicPlayerTrack) -> URL? {
+    let candidate = track.videoId ?? track.id
+    guard let value = candidate?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+      return nil
+    }
+    return URL(
+      string: "https://modest-recreation-production-8329.up.railway.app/api/music/stream/\(value)")
+  }
+
+  private func resolveNetworkURL(from value: String?) -> URL? {
+    guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+      return nil
+    }
+    guard !trimmed.hasPrefix("file://"), !trimmed.hasPrefix("/") else { return nil }
+    return URL(string: trimmed)
+  }
+
+  private func startDownload(track: NativeMusicPlayerTrack, remoteURL: URL) {
+    if downloadTasks[track.trackId] != nil { return }
+    let destinationURL = store.cacheDestinationURL(for: track, remoteURL: remoteURL)
+    var request = URLRequest(url: remoteURL)
+    for (key, value) in authHeadersProvider.headers() {
+      request.setValue(value, forHTTPHeaderField: key)
+    }
+
+    let task = downloadSession.downloadTask(with: request) { [weak self] tempURL, response, error in
+      guard let self else { return }
+      DispatchQueue.main.async {
+        self.finishDownload(
+          trackId: track.trackId,
+          remoteURL: remoteURL,
+          tempURL: tempURL,
+          destinationURL: destinationURL,
+          response: response,
+          error: error
+        )
+      }
+    }
+    downloadTasks[track.trackId] = task
+    store.setDownloadProgress(trackId: track.trackId, progress: 0.0)
+    downloadObservations[track.trackId] = task.progress.observe(\.fractionCompleted, options: [.new]) {
+      [weak self] progress, _ in
+      guard let self else { return }
+      DispatchQueue.main.async {
+        self.store.setDownloadProgress(trackId: track.trackId, progress: progress.fractionCompleted)
+        self.publishState()
+      }
+    }
+    task.resume()
+    publishState()
+  }
+
+  private func finishDownload(
+    trackId: String,
+    remoteURL: URL,
+    tempURL: URL?,
+    destinationURL: URL,
+    response: URLResponse?,
+    error: Error?
+  ) {
+    defer {
+      downloadTasks[trackId] = nil
+      downloadObservations[trackId]?.invalidate()
+      downloadObservations[trackId] = nil
+    }
+
+    if let error {
+      store.setDownloadProgress(trackId: trackId, progress: nil)
+      resolvePendingDownloadCompletions(trackId: trackId, payload: [
+        "success": false,
+        "error": error.localizedDescription,
+      ])
+      publishState()
+      return
+    }
+
+    guard let tempURL else {
+      store.setDownloadProgress(trackId: trackId, progress: nil)
+      resolvePendingDownloadCompletions(trackId: trackId, payload: [
+        "success": false,
+        "error": "missing_temp_file",
+      ])
+      publishState()
+      return
+    }
+
+    do {
+      try? FileManager.default.removeItem(at: destinationURL)
+      try FileManager.default.moveItem(at: tempURL, to: destinationURL)
+      let updatedTrack = store.updateLocalURI(trackId: trackId, localURI: destinationURL.absoluteString)
+      store.setDownloadProgress(trackId: trackId, progress: nil)
+      resolvePendingDownloadCompletions(trackId: trackId, payload: [
+        "success": true,
+        "localUri": destinationURL.absoluteString,
+        "remoteUrl": remoteURL.absoluteString,
+        "statusCode": (response as? HTTPURLResponse)?.statusCode as Any,
+        "track": updatedTrack?.toPayload() ?? NSNull(),
+      ])
+      publishState()
+    } catch {
+      store.setDownloadProgress(trackId: trackId, progress: nil)
+      resolvePendingDownloadCompletions(trackId: trackId, payload: [
+        "success": false,
+        "error": error.localizedDescription,
+      ])
+      publishState()
+    }
+  }
+
+  private func resolvePendingDownloadCompletions(trackId: String, payload: [String: Any]) {
+    let completions = pendingDownloadCompletions.removeValue(forKey: trackId) ?? []
+    for completion in completions {
+      completion(payload)
+    }
+  }
+
+  private func cancelDownload(for trackId: String) {
+    downloadTasks[trackId]?.cancel()
+    downloadTasks[trackId] = nil
+    downloadObservations[trackId]?.invalidate()
+    downloadObservations[trackId] = nil
+    pendingDownloadCompletions.removeValue(forKey: trackId)
+    store.setDownloadProgress(trackId: trackId, progress: nil)
+  }
+
+  private func configureAudioSessionIfNeeded() {
+    do {
+      try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+      try AVAudioSession.sharedInstance().setActive(true)
+    } catch {
+      // Keep playback best-effort; UI state still updates.
+    }
+  }
+
+  private func readOnMain<T>(_ block: () -> T) -> T {
+    if Thread.isMainThread {
+      return block()
+    }
+    return DispatchQueue.main.sync(execute: block)
+  }
+
+  private static func resolveFileURL(from value: String) -> URL? {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+    if let url = URL(string: trimmed), url.isFileURL {
+      return url
+    }
+    if trimmed.hasPrefix("/") {
+      return URL(fileURLWithPath: trimmed)
+    }
+    return nil
+  }
+
+  private static func deduplicated(ids: [String]) -> [String] {
+    var result: [String] = []
+    var seen = Set<String>()
+    for id in ids where !id.isEmpty {
+      if seen.insert(id).inserted {
+        result.append(id)
+      }
+    }
+    return result
+  }
+}
+
+private final class NativeMusicPlayerAuthHeadersProvider {
+  func headers() -> [String: String] {
+    var values: [String: String] = ["ngrok-skip-browser-warning": "true"]
+    guard let loginToken = currentLoginToken(), !loginToken.isEmpty else { return values }
+    values["Authorization"] = "Bearer \(loginToken)"
+    return values
+  }
+
+  private func currentLoginToken() -> String? {
+    guard
+      let authManagerClass = NSClassFromString("AuthManager") as? NSObject.Type,
+      authManagerClass.responds(to: NSSelectorFromString("getInstance"))
+    else {
+      return nil
+    }
+    let managerSelector = NSSelectorFromString("getInstance")
+    guard let unmanagedManager = authManagerClass.perform(managerSelector) else { return nil }
+    guard let manager = unmanagedManager.takeUnretainedValue() as? NSObject else { return nil }
+    let sessionSelector = NSSelectorFromString("getSession")
+    guard manager.responds(to: sessionSelector),
+      let unmanagedSession = manager.perform(sessionSelector)
+    else {
+      return nil
+    }
+    guard let session = unmanagedSession.takeUnretainedValue() as? NSObject else { return nil }
+    return (session.value(forKey: "loginToken") as? String)
+      ?? (session.value(forKey: "token") as? String)
+  }
+}

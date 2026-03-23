@@ -292,6 +292,40 @@ private func chatEngineDecryptHybridMessage(
   }
 }
 
+private func chatEngineEncryptMediaData(_ plainData: Data) throws -> (encryptedData: Data, keyBase64: String) {
+  let aesKey = try chatEngineRandomBytes(count: 32)
+  let iv = try chatEngineRandomBytes(count: 12)
+  let nonce = try AES.GCM.Nonce(data: iv)
+  let sealed = try AES.GCM.seal(plainData, using: SymmetricKey(data: aesKey), nonce: nonce)
+
+  var combined = Data()
+  combined.append(iv)
+  combined.append(sealed.ciphertext)
+  combined.append(sealed.tag)
+
+  return (combined, aesKey.base64EncodedString())
+}
+
+private func chatEngineDecryptMediaData(_ encryptedData: Data, keyBase64: String) throws -> Data {
+  guard
+    let aesKey = Data(base64Encoded: keyBase64),
+    encryptedData.count > 28
+  else {
+    throw NSError(
+      domain: "ChatEngine",
+      code: 40,
+      userInfo: [NSLocalizedDescriptionKey: "Invalid encrypted media payload"]
+    )
+  }
+
+  let iv = encryptedData.prefix(12)
+  let ciphertext = encryptedData.dropFirst(12).dropLast(16)
+  let tag = encryptedData.suffix(16)
+  let nonce = try AES.GCM.Nonce(data: iv)
+  let sealed = try AES.GCM.SealedBox(nonce: nonce, ciphertext: ciphertext, tag: tag)
+  return try AES.GCM.open(sealed, using: SymmetricKey(data: aesKey))
+}
+
 final class ChatEngine {
   static let shared = ChatEngine()
   static let didChangeNotification = Notification.Name("Vibe.ChatEngine.didChange")
@@ -751,6 +785,12 @@ final class ChatEngine {
       guard let token = authHeaderTokenLocked(), !token.isEmpty else { return nil }
       return "Bearer \(token)"
     }
+  }
+
+  func decryptMediaDataIfNeeded(_ data: Data, mediaKey: String?) -> Data? {
+    let trimmedKey = mediaKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard !trimmedKey.isEmpty else { return data }
+    return try? chatEngineDecryptMediaData(data, keyBase64: trimmedKey)
   }
 
   func isUserOnline(userId: String?) -> Bool {
@@ -1277,7 +1317,7 @@ final class ChatEngine {
     let height = parseLongValue(metadataValue("height", []))
     let caption = normalizedString(metadataValue("caption", []))
     let thumbnailBase64 = normalizedString(metadataValue("thumbnailBase64", ["thumbnail_base64"]))
-    let mediaKey = normalizedString(metadataValue("mediaKey", ["media_key"]))
+    var mediaKey = normalizedString(metadataValue("mediaKey", ["media_key"]))
     let contact = metadataValue("contact", [])
     let viewOnce = metadataValue("viewOnce", ["view_once"])
     let isVideoNote = metadataValue("isVideoNote", ["is_video_note"])
@@ -1342,6 +1382,7 @@ final class ChatEngine {
       if let contact { decryptedFields["contact"] = contact }
       if let caption { decryptedFields["caption"] = caption }
       if let thumbnailBase64 { decryptedFields["thumbnailBase64"] = thumbnailBase64 }
+      if let mediaKey { decryptedFields["mediaKey"] = mediaKey }
       if let viewOnce { decryptedFields["viewOnce"] = viewOnce }
       if let isVideoNote { decryptedFields["isVideoNote"] = isVideoNote }
       if let waveform { decryptedFields["waveform"] = waveform }
@@ -1379,8 +1420,9 @@ final class ChatEngine {
 
       // ── Now resolve friend public key (may do synchronous HTTP — no longer blocks UI) ──
       let keyResolveStartMs = nowMs()
+      let isSavedMessagesChat = chatId == "saved_messages"
       let friendPublicKey: String?
-      if isGroup {
+      if isGroup || isSavedMessagesChat {
         friendPublicKey = nil
       } else {
         guard
@@ -1441,6 +1483,19 @@ final class ChatEngine {
       var uploadTargetUrl: String? = nil
       if needsUpload {
         uploadTargetUrl = mediaUrl
+        // Eagerly compute file size from the local file so the UI can display
+        // real-time progress (e.g. "1.2 MB / 16 MB") from the very first frame.
+        if fileSize == nil, let localUri = mediaUrl, let localURL = localFileURL(from: localUri) {
+          let attrs = try? FileManager.default.attributesOfItem(atPath: localURL.path)
+          if let size = attrs?[.size] as? Int64, size > 0 {
+            mutateLiveMessagePayloadLocked(chatId: chatId, messageId: messageId) { message in
+              message["fileSize"] = size
+              var meta = (message["metadata"] as? [String: Any]) ?? [:]
+              meta["fileSize"] = size
+              message["metadata"] = meta
+            }
+          }
+        }
         setLiveMessageUploadProgressLocked(chatId: chatId, messageId: messageId, progress: 0.02)
         postChangeLocked(
           reason: "chatMessageChanged",
@@ -1455,6 +1510,7 @@ final class ChatEngine {
         var finalMediaUrl = mediaUrl
         var finalFileName = fileName
         var finalFileSize = fileSize
+        var finalMediaKey = mediaKey
         var localEffectivePayload = effectivePayload
         var localOptimisticRow = optimisticRow
 
@@ -1531,12 +1587,14 @@ final class ChatEngine {
             finalMediaUrl = uploadResult.remoteUrl
             if finalFileName == nil { finalFileName = uploadResult.fileName }
             if finalFileSize == nil { finalFileSize = uploadResult.fileSize }
+            if finalMediaKey == nil { finalMediaKey = uploadResult.mediaKey }
 
             var nextMetadata = (localEffectivePayload["metadata"] as? [String: Any]) ?? [:]
             nextMetadata["mediaUrl"] = uploadResult.remoteUrl
             if let localPlaybackMediaUrl { nextMetadata["localMediaUrl"] = localPlaybackMediaUrl }
             if let finalFileName { nextMetadata["fileName"] = finalFileName }
             if let finalFileSize { nextMetadata["fileSize"] = finalFileSize }
+            if let finalMediaKey { nextMetadata["mediaKey"] = finalMediaKey }
 
             localEffectivePayload["metadata"] = nextMetadata
             localEffectivePayload["chatId"] = chatId
@@ -1549,6 +1607,11 @@ final class ChatEngine {
               if let localPlaybackMediaUrl { message["localMediaUrl"] = localPlaybackMediaUrl }
               if let finalFileName { message["fileName"] = finalFileName }
               if let finalFileSize { message["fileSize"] = finalFileSize }
+              if let finalMediaKey { message["mediaKey"] = finalMediaKey }
+              var metadata = (message["metadata"] as? [String: Any]) ?? [:]
+              if let finalMediaKey { metadata["mediaKey"] = finalMediaKey }
+              if let localPlaybackMediaUrl { metadata["localMediaUrl"] = localPlaybackMediaUrl }
+              message["metadata"] = metadata
               localOptimisticRow["message"] = message
             }
 
@@ -1637,9 +1700,85 @@ final class ChatEngine {
           return
         }
 
+        if isSavedMessagesChat {
+          localEffectivePayload["chatId"] = chatId
+          localEffectivePayload["messageId"] = messageId
+          localEffectivePayload["type"] = type
+          localEffectivePayload["text"] = text
+
+          self.queue.async {
+            self.removeQueuedOutboundDraftLocked(
+              chatId: chatId, messageId: messageId, dropDraft: false)
+            self.pendingOutboundDraftsByMessageId[messageId] = localEffectivePayload
+            self.appendJournalLocked(
+              event: "native-send-saved-message-start",
+              payload: [
+                "chatId": chatId,
+                "messageId": messageId,
+                "type": type,
+              ])
+            NSLog(
+              "[ChatEngine] sendMessage saved_messages direct chatId=%@ messageId=%@ type=%@",
+              chatId, messageId, type)
+          }
+
+          self.sendSavedMessage(localEffectivePayload) { result in
+            self.queue.async { [weak self] in
+              guard let self else { return }
+              let success = (result["success"] as? Bool) == true
+              let statusCode = result["status"] as? Int ?? -1
+              let failureReason =
+                normalizedString(result["reason"])
+                ?? normalizedString(result["error"])
+                ?? "saved_message_send_failed"
+              self.setLiveMessageUploadProgressLocked(
+                chatId: chatId, messageId: messageId, progress: nil)
+              if success {
+                self.removeQueuedOutboundDraftLocked(
+                  chatId: chatId, messageId: messageId, dropDraft: true)
+              } else {
+                self.removeQueuedOutboundDraftLocked(
+                  chatId: chatId, messageId: messageId, dropDraft: false)
+              }
+              self.upsertLocalStatusLocked(
+                chatId: chatId,
+                messageId: messageId,
+                status: success ? "sent" : "error"
+              )
+              self.appendJournalLocked(
+                event: success ? "native-send-saved-message-ok" : "native-send-saved-message-error",
+                payload: [
+                  "chatId": chatId,
+                  "messageId": messageId,
+                  "status": statusCode,
+                  "reason": success ? "ok" : failureReason,
+                ])
+              NSLog(
+                "[ChatEngine] sendMessage saved_messages %@ chatId=%@ messageId=%@ status=%d reason=%@",
+                success ? "OK" : "FAIL",
+                chatId,
+                messageId,
+                statusCode,
+                success ? "ok" : failureReason)
+              self.postChangeLocked(
+                reason: "chatMessageChanged",
+                userInfo: ["chatId": chatId, "messageId": messageId, "action": "updated"]
+              )
+              self.postChangeLocked(
+                reason: "messageStatusChanged",
+                userInfo: [
+                  "chatId": chatId,
+                  "messageId": messageId,
+                  "status": success ? "sent" : "error",
+                ])
+            }
+          }
+          return
+        }
+
         var fullPayloadBase: [String: Any] = ["text": text]
         if let finalMediaUrl { fullPayloadBase["mediaUrl"] = finalMediaUrl }
-        if let mediaKey { fullPayloadBase["mediaKey"] = mediaKey }
+        if let finalMediaKey { fullPayloadBase["mediaKey"] = finalMediaKey }
         if let finalFileName { fullPayloadBase["fileName"] = finalFileName }
         if let finalFileSize { fullPayloadBase["fileSize"] = finalFileSize }
         if let latitude { fullPayloadBase["latitude"] = latitude }
@@ -4388,6 +4527,7 @@ final class ChatEngine {
     let isMe = normalizedUpper(fromId) != nil && normalizedUpper(fromId) == currentUserIdLocked()
     let rawMediaUrl = normalizedString(payload["mediaUrl"] ?? payload["media_url"])
     let rawFileName = normalizedString(payload["fileName"] ?? payload["file_name"])
+    let rawMediaKey = normalizedString(payload["mediaKey"] ?? payload["media_key"])
     let derivedFileName = deriveFileNameFromURL(rawMediaUrl)
     let encryptedLooksHybrid = isLikelyHybridCiphertext(encryptedContent)
 
@@ -4423,6 +4563,9 @@ final class ChatEngine {
     if let rawMediaUrl, !rawMediaUrl.isEmpty, normalizedString(decryptedFields["mediaUrl"]) == nil {
       decryptedFields["mediaUrl"] = rawMediaUrl
     }
+    if let rawMediaKey, !rawMediaKey.isEmpty, normalizedString(decryptedFields["mediaKey"]) == nil {
+      decryptedFields["mediaKey"] = rawMediaKey
+    }
     let fileNameForRow =
       rawFileName
       ?? ((normalizedString(type)?.lowercased() == "file") ? derivedFileName : nil)
@@ -4456,12 +4599,12 @@ final class ChatEngine {
       message["decryptionFailed"] = true
       row["message"] = message
     }
-    if type == "voice" || type == "music", isMe,
+    if ["image", "gif", "file", "voice", "video", "music", "sticker"].contains(type.lowercased()), isMe,
       let existingMessage = findMessagePayloadLocked(chatId: chatId, messageId: messageId),
       let localPlaybackUrl = extractLocalPlaybackMediaURLFromMessage(existingMessage)
     {
       NSLog(
-        "[ChatEngine] preserve local voice url on incoming echo chatId=%@ messageId=%@ local=%@",
+        "[ChatEngine] preserve local media url on incoming echo chatId=%@ messageId=%@ local=%@",
         chatId,
         messageId,
         localPlaybackUrl
@@ -4536,6 +4679,7 @@ final class ChatEngine {
         payload["encryptedContent"] ?? payload["encrypted_content"])
       let existingRow = liveMessageRowsByChat[chatId]?[messageId]
       let existingMessage = existingRow?["message"] as? [String: Any]
+      let existingMetadata = existingMessage?["metadata"] as? [String: Any]
       let fromId = normalizedString(existingMessage?["fromId"])
       let type = normalizedString(existingMessage?["type"]) ?? "text"
       let timestampMs =
@@ -4557,6 +4701,27 @@ final class ChatEngine {
         )
         return parseDecryptedMessagePayload(decrypted)
       }()
+      var hydratedFields = decryptedFields
+      if normalizedString(hydratedFields["mediaUrl"]) == nil {
+        hydratedFields["mediaUrl"] =
+          existingMessage?["mediaUrl"] ?? existingMessage?["media_url"]
+          ?? existingMetadata?["mediaUrl"] ?? existingMetadata?["media_url"]
+      }
+      if normalizedString(hydratedFields["fileName"]) == nil {
+        hydratedFields["fileName"] =
+          existingMessage?["fileName"] ?? existingMessage?["file_name"]
+          ?? existingMetadata?["fileName"] ?? existingMetadata?["file_name"]
+      }
+      if normalizedString(hydratedFields["mediaKey"]) == nil {
+        hydratedFields["mediaKey"] =
+          existingMessage?["mediaKey"] ?? existingMessage?["media_key"]
+          ?? existingMetadata?["mediaKey"] ?? existingMetadata?["media_key"]
+      }
+      if hydratedFields["thumbnailBase64"] == nil {
+        hydratedFields["thumbnailBase64"] =
+          existingMessage?["thumbnailBase64"] ?? existingMessage?["thumbnail_base64"]
+          ?? existingMetadata?["thumbnailBase64"] ?? existingMetadata?["thumbnail_base64"]
+      }
       let row = buildLiveRowPayloadLocked(
         chatId: chatId,
         messageId: messageId,
@@ -4565,7 +4730,7 @@ final class ChatEngine {
         timestampMs: timestampMs,
         encryptedContent: encryptedContent
           ?? normalizedString(existingMessage?["encryptedContent"]),
-        decryptedFields: decryptedFields,
+        decryptedFields: hydratedFields,
         forceEdited: true,
         forceEditedAt: editedAtValue
       )
@@ -5011,6 +5176,7 @@ final class ChatEngine {
     let remoteUrl: String
     let fileName: String?
     let fileSize: Int64?
+    let mediaKey: String?
   }
 
   private struct LocalMediaUploadOutcome {
@@ -5032,6 +5198,15 @@ final class ChatEngine {
       return "video"
     default:
       return "file"
+    }
+  }
+
+  private func shouldEncryptUploadedMediaType(_ messageType: String) -> Bool {
+    switch messageType {
+    case "image", "gif", "voice", "music", "video", "file", "sticker":
+      return true
+    default:
+      return false
     }
   }
 
@@ -5167,11 +5342,26 @@ final class ChatEngine {
     } catch {
       return LocalMediaUploadOutcome(result: nil, reason: "media_file_read_failed")
     }
+    let originalFileSize = Int64(fileData.count)
     let resolvedFileName = fileNameHint ?? normalizedURL.lastPathComponent
     let resolvedMimeType = mediaMimeType(fileName: resolvedFileName, fallbackType: messageType)
     let uploadType = uploadCategory(for: messageType)
     guard let uploadURL = resolveUploadURL(apiBase: apiBase) else {
       return LocalMediaUploadOutcome(result: nil, reason: "invalid_upload_url")
+    }
+    let uploadFileData: Data
+    let mediaKey: String?
+    if shouldEncryptUploadedMediaType(messageType) {
+      do {
+        let encrypted = try chatEngineEncryptMediaData(fileData)
+        uploadFileData = encrypted.encryptedData
+        mediaKey = encrypted.keyBase64
+      } catch {
+        return LocalMediaUploadOutcome(result: nil, reason: "media_encrypt_failed")
+      }
+    } else {
+      uploadFileData = fileData
+      mediaKey = nil
     }
 
     let boundary = "----VibeChatBoundary\(UUID().uuidString)"
@@ -5191,7 +5381,7 @@ final class ChatEngine {
       "Content-Disposition: form-data; name=\"file\"; filename=\"\(resolvedFileName)\"\r\n".data(
         using: .utf8) ?? Data())
     body.append("Content-Type: \(resolvedMimeType)\r\n\r\n".data(using: .utf8) ?? Data())
-    body.append(fileData)
+    body.append(uploadFileData)
     body.append("\r\n".data(using: .utf8) ?? Data())
     body.append("--\(boundary)--\r\n".data(using: .utf8) ?? Data())
     let delegate = UploadSessionDelegate()
@@ -5257,12 +5447,12 @@ final class ChatEngine {
     else {
       return LocalMediaUploadOutcome(result: nil, reason: "invalid_upload_response")
     }
-    let fileSize =
-      (try? FileManager.default.attributesOfItem(atPath: normalizedURL.path)[.size] as? NSNumber)?
-      .int64Value
     return LocalMediaUploadOutcome(
       result: LocalMediaUploadResult(
-        remoteUrl: remoteUrl, fileName: resolvedFileName, fileSize: fileSize),
+        remoteUrl: remoteUrl,
+        fileName: resolvedFileName,
+        fileSize: originalFileSize,
+        mediaKey: mediaKey),
       reason: nil
     )
   }
@@ -5588,6 +5778,7 @@ final class ChatEngine {
       let editedAt = raw["editedAt"] ?? raw["edited_at"]
       let rawMediaUrl = normalizedString(raw["mediaUrl"] ?? raw["media_url"])
       let rawFileName = normalizedString(raw["fileName"] ?? raw["file_name"])
+      let rawMediaKey = normalizedString(raw["mediaKey"] ?? raw["media_key"])
       let derivedFileName = deriveFileNameFromURL(rawMediaUrl)
 
       let isMe = normalizedUpper(fromId) != nil && normalizedUpper(fromId) == currentUserIdLocked()
@@ -5637,6 +5828,9 @@ final class ChatEngine {
       if let rawMediaUrl, !rawMediaUrl.isEmpty, normalizedString(enrichedFields["mediaUrl"]) == nil
       {
         enrichedFields["mediaUrl"] = rawMediaUrl
+      }
+      if let rawMediaKey, !rawMediaKey.isEmpty, normalizedString(enrichedFields["mediaKey"]) == nil {
+        enrichedFields["mediaKey"] = rawMediaKey
       }
       let fileNameForRow =
         rawFileName
@@ -5862,7 +6056,8 @@ final class ChatEngine {
       let resolvedFileName =
         normalizedString(
           decryptedFields["fileName"] ?? raw["file_name"] ?? raw["fileName"])
-      let resolvedMediaKey = normalizedString(decryptedFields["mediaKey"])
+      let resolvedMediaKey = normalizedString(
+        decryptedFields["mediaKey"] ?? raw["media_key"] ?? raw["mediaKey"])
       let resolvedLatitude = parseDoubleValue(decryptedFields["latitude"])
       let resolvedLongitude = parseDoubleValue(decryptedFields["longitude"])
       let resolvedDuration = parseDoubleValue(decryptedFields["duration"])
@@ -6018,6 +6213,11 @@ final class ChatEngine {
       let messageId =
         normalizedString(payload["messageId"] ?? payload["message_id"] ?? payload["id"])
         ?? UUID().uuidString.lowercased()
+      NSLog(
+        "[ChatEngine] sendSavedMessage START messageId=%@ type=%@ hasText=%@",
+        messageId,
+        type,
+        text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "false" : "true")
       let metadata = (payload["metadata"] as? [String: Any]) ?? [:]
       var mediaUrl =
         normalizedString(
@@ -6032,6 +6232,7 @@ final class ChatEngine {
       let duration = parseDoubleValue(metadata["duration"] ?? payload["duration"])
       let width = parseLongValue(metadata["width"] ?? payload["width"])
       let height = parseLongValue(metadata["height"] ?? payload["height"])
+      var mediaKey = normalizedString(metadata["mediaKey"] ?? metadata["media_key"] ?? payload["mediaKey"])
       let replyToId =
         normalizedString(metadata["replyToId"] ?? metadata["reply_to_id"] ?? payload["replyToId"])
       let contact = metadata["contact"] ?? payload["contact"]
@@ -6077,12 +6278,14 @@ final class ChatEngine {
         mediaUrl = uploadResult.remoteUrl
         if fileName == nil { fileName = uploadResult.fileName }
         if fileSize == nil { fileSize = uploadResult.fileSize }
+        if mediaKey == nil { mediaKey = uploadResult.mediaKey }
       }
 
       var encryptedContent = ""
       if let myPublicKeyPem, !myPublicKeyPem.isEmpty {
         var encryptedPayload: [String: Any] = ["text": text]
         if let mediaUrl { encryptedPayload["mediaUrl"] = mediaUrl }
+        if let mediaKey { encryptedPayload["mediaKey"] = mediaKey }
         if let fileName { encryptedPayload["fileName"] = fileName }
         if let fileSize { encryptedPayload["fileSize"] = fileSize }
         if let latitude { encryptedPayload["latitude"] = latitude }
@@ -6163,11 +6366,24 @@ final class ChatEngine {
       session.dataTask(with: request) { data, response, error in
         let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
         let success = error == nil && (200...299).contains(statusCode)
+        let responseBody = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        let errorText = error?.localizedDescription ?? ""
+        NSLog(
+          "[ChatEngine] sendSavedMessage %@ messageId=%@ status=%d error=%@ body=%@",
+          success ? "OK" : "FAIL",
+          messageId,
+          statusCode,
+          errorText.isEmpty ? "-" : errorText,
+          responseBody.isEmpty ? "-" : responseBody
+        )
         DispatchQueue.main.async {
           completion([
             "success": success,
             "status": statusCode,
             "messageId": messageId,
+            "reason": success ? "ok" : "request_failed",
+            "error": errorText,
+            "body": responseBody,
           ])
         }
       }.resume()

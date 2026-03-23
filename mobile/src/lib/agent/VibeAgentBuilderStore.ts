@@ -48,6 +48,10 @@ interface BuilderSessionPayload {
     latestSecret?: string | null;
 }
 
+interface BuilderStreamDonePayload extends BuilderSessionPayload {
+    reply?: string | null;
+}
+
 interface VibeAgentBuilderState {
     agents: VibeStandaloneAgent[];
     quota: VibeAgentQuota | null;
@@ -83,30 +87,6 @@ const defaultSuggestions = [
 const createLocalMessageId = (prefix: 'user' | 'assistant') => {
     return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 };
-
-const chunkReplyText = (value: string) => {
-    const tokens = value.split(/(\s+)/).filter(Boolean);
-    const chunks: string[] = [];
-    let current = '';
-
-    for (const token of tokens) {
-        const nextValue = `${current}${token}`;
-        if (nextValue.length > 42 && current.trim().length > 0) {
-            chunks.push(current);
-            current = token;
-        } else {
-            current = nextValue;
-        }
-    }
-
-    if (current.length > 0) {
-        chunks.push(current);
-    }
-
-    return chunks.length > 0 ? chunks : [value];
-};
-
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const resolveAuthToken = async (): Promise<string | null> => {
     const existing = AuthManager.getInstance().getSession();
@@ -162,6 +142,138 @@ const applySession = (payload: BuilderSessionPayload) => ({
         ? payload.suggestions
         : defaultSuggestions,
 });
+
+const parseSSEBuffer = (buffer: string): { events: Array<{ type: string; data: any }>, remaining: string } => {
+    buffer = buffer.replace(/\r\n/g, '\n');
+    const events: Array<{ type: string; data: any }> = [];
+    const eventChunks = buffer.split('\n\n');
+    const hasCompleteTail = buffer.endsWith('\n\n');
+    const completeChunks = hasCompleteTail ? eventChunks.filter(Boolean) : eventChunks.slice(0, -1).filter(Boolean);
+    const remaining = hasCompleteTail ? '' : (eventChunks[eventChunks.length - 1] || '');
+
+    for (const chunk of completeChunks) {
+        let eventType = 'message';
+        const dataLines: string[] = [];
+
+        for (const line of chunk.split('\n')) {
+            if (line.startsWith('event:')) {
+                eventType = line.slice(6).trim();
+            } else if (line.startsWith('data:')) {
+                dataLines.push(line.slice(5).trim());
+            }
+        }
+
+        const rawData = dataLines.join('\n');
+        if (!rawData || rawData === '[DONE]') {
+            continue;
+        }
+
+        try {
+            events.push({ type: eventType, data: JSON.parse(rawData) });
+        } catch {
+            // Ignore malformed partial chunks and keep parsing.
+        }
+    }
+
+    return { events, remaining };
+};
+
+const streamBuilderChat = async (
+    message: string,
+    conversationId: string | null,
+    activeAgentId: string | null,
+    handlers: {
+        onChunk: (chunk: string) => void;
+        onDone: (payload: BuilderStreamDonePayload) => void;
+    },
+) => {
+    const token = await resolveAuthToken();
+    if (!token) throw new Error('Not authenticated');
+
+    const proxy = ProxyManager.getInstance();
+    const response = await proxy.relayFetch('/api/vibeagent/chat/stream', {
+        method: 'POST',
+        headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+            Accept: 'text/event-stream',
+        },
+        body: JSON.stringify({
+            conversationId,
+            message,
+            activeAgentId,
+        }),
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text();
+        let message = errorText || `HTTP ${response.status}`;
+
+        try {
+            const parsed = errorText ? JSON.parse(errorText) : {};
+            message = parsed?.error || parsed?.message || message;
+        } catch { }
+
+        throw new Error(message);
+    }
+
+    let completedPayload: BuilderStreamDonePayload | null = null;
+
+    const processEvent = (eventType: string, data: any) => {
+        if (eventType === 'chunk') {
+            handlers.onChunk(typeof data?.text === 'string' ? data.text : '');
+            return;
+        }
+
+        if (eventType === 'done') {
+            completedPayload = (data || {}) as BuilderStreamDonePayload;
+            handlers.onDone(completedPayload);
+            return;
+        }
+
+        if (eventType === 'error') {
+            throw new Error(data?.message || 'Builder stream failed');
+        }
+    };
+
+    // @ts-ignore React Native fetch may expose a stream reader at runtime.
+    const reader = response.body?.getReader ? response.body.getReader() : null;
+
+    if (reader) {
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const parsed = parseSSEBuffer(buffer);
+            buffer = parsed.remaining;
+
+            for (const event of parsed.events) {
+                processEvent(event.type, event.data);
+            }
+        }
+
+        if (buffer.trim()) {
+            const parsed = parseSSEBuffer(`${buffer}\n\n`);
+            for (const event of parsed.events) {
+                processEvent(event.type, event.data);
+            }
+        }
+    } else {
+        const text = await response.text();
+        const parsed = parseSSEBuffer(text.endsWith('\n\n') ? text : `${text}\n\n`);
+        for (const event of parsed.events) {
+            processEvent(event.type, event.data);
+        }
+    }
+
+    if (!completedPayload) {
+        throw new Error('Builder stream ended without a completion payload');
+    }
+};
 
 export const useVibeAgentBuilderStore = create<VibeAgentBuilderState>((set, get) => ({
     agents: [],
@@ -241,65 +353,61 @@ export const useVibeAgentBuilderStore = create<VibeAgentBuilderState>((set, get)
         }));
 
         try {
-            const payload = await apiRequest('/api/vibeagent/chat', {
-                method: 'POST',
-                body: JSON.stringify({
-                    conversationId,
-                    message: trimmed,
-                    activeAgentId,
-                }),
+            let streamedReply = '';
+            let completionPayload: BuilderStreamDonePayload | null = null;
+
+            await streamBuilderChat(trimmed, conversationId, activeAgentId, {
+                onChunk: (chunk) => {
+                    if (!chunk) return;
+
+                    streamedReply += chunk;
+
+                    set((state) => ({
+                        messages: state.messages.map((entry) => (
+                            entry.id === assistantMessageId
+                                ? {
+                                    ...entry,
+                                    content: streamedReply,
+                                    isStreaming: true,
+                                }
+                                : entry
+                        )),
+                    }));
+                },
+                onDone: (payload) => {
+                    completionPayload = payload;
+                },
             });
 
-            await get().refreshAgents();
+            void get().refreshAgents().catch((error) => {
+                console.warn('[VibeAgentBuilderStore] Failed to refresh agents after stream', error);
+            });
 
-            const reply = typeof payload?.reply === 'string' && payload.reply.trim().length > 0
-                ? payload.reply.trim()
-                : 'Configured.';
-            const chunks = chunkReplyText(reply);
+            const reply = typeof completionPayload?.reply === 'string' && completionPayload.reply.trim().length > 0
+                ? completionPayload.reply.trim()
+                : (streamedReply.trim().length > 0 ? streamedReply : 'Configured.');
 
             set((state) => ({
-                conversationId: payload?.conversationId || state.conversationId,
-                activeAgentId: payload?.activeAgentId || state.activeAgentId,
-                draftPatch: payload?.draftPatch || {},
-                agent: payload?.agent || state.agent,
-                latestSecret: typeof payload?.latestSecret === 'string' ? payload.latestSecret : state.latestSecret,
-                suggestions: Array.isArray(payload?.suggestions) && payload.suggestions.length > 0
-                    ? payload.suggestions
+                conversationId: completionPayload?.conversationId || state.conversationId,
+                activeAgentId: completionPayload?.activeAgentId || state.activeAgentId,
+                draftPatch: completionPayload?.draftPatch || {},
+                agent: completionPayload?.agent || state.agent,
+                latestSecret: typeof completionPayload?.latestSecret === 'string' ? completionPayload.latestSecret : state.latestSecret,
+                suggestions: Array.isArray(completionPayload?.suggestions) && completionPayload.suggestions.length > 0
+                    ? completionPayload.suggestions
                     : state.suggestions,
                 isSending: false,
                 messages: state.messages.map((entry) => (
                     entry.id === assistantMessageId
                         ? {
                             ...entry,
-                            content: '',
+                            content: reply,
                             timestamp: Date.now(),
-                            isStreaming: true,
+                            isStreaming: false,
                         }
                         : entry
                 )),
             }));
-
-            let streamed = '';
-            for (let index = 0; index < chunks.length; index += 1) {
-                streamed += chunks[index];
-                const isLast = index === chunks.length - 1;
-
-                set((state) => ({
-                    messages: state.messages.map((entry) => (
-                        entry.id === assistantMessageId
-                            ? {
-                                ...entry,
-                                content: streamed,
-                                isStreaming: !isLast,
-                            }
-                            : entry
-                    )),
-                }));
-
-                if (!isLast) {
-                    await sleep(index === 0 ? 70 : 26);
-                }
-            }
         } catch (error: any) {
             set({
                 isSending: false,

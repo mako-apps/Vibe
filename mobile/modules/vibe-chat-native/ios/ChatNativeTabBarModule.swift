@@ -662,8 +662,6 @@ public final class ChatNativeTabBarView: ExpoView, UITabBarDelegate, UITextField
   private func applyChrome() {
     let blurStyle: UIBlurEffect.Style =
       isDark ? .systemChromeMaterialDark : .systemChromeMaterialLight
-    let matchingGlassColor =
-      isDark ? UIColor.white.withAlphaComponent(0.16) : UIColor.black.withAlphaComponent(0.20)
 
     // ── 1. UITabBar natively draws its own glass ──
     let appearance = UITabBarAppearance()
@@ -720,9 +718,6 @@ public final class ChatNativeTabBarView: ExpoView, UITabBarDelegate, UITextField
     }
 
     vibeChromeView.isHidden = false
-
-    let isActive = currentIndex == tab.index
-    let foregroundColor = isActive ? activeTintColor : inactiveTintColor
 
     // Exclusively rely on the optimized Native SVG path.
     // This allows it to scale crisply when it transforms into a send button!

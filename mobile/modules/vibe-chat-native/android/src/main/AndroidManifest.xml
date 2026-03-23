@@ -29,5 +29,15 @@
       android:showWhenLocked="true"
       android:turnScreenOn="true"
       android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
+
+    <provider
+      android:name="androidx.core.content.FileProvider"
+      android:authorities="${applicationId}.vibechatnative.fileprovider"
+      android:exported="false"
+      android:grantUriPermissions="true">
+      <meta-data
+        android:name="android.support.FILE_PROVIDER_PATHS"
+        android:resource="@xml/vibe_chat_file_paths" />
+    </provider>
   </application>
 </manifest>

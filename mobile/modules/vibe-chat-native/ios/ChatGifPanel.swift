@@ -183,13 +183,15 @@ final class ChatGifPanelView: UIView {
     private(set) var preferredHeightExpansion: CGFloat = 0
     private(set) var preferredHeightScaleBoost: CGFloat = 0
 
-    private let bottomFloatingInset: CGFloat = 72
+    private let bottomFloatingInset: CGFloat = 52
+    private let bottomFloatingControlHeight: CGFloat = 38
+    private let bottomFloatingEdgeInset: CGFloat = 0
     private let topControlsSpacing: CGFloat = 4
     private let stripHeight: CGFloat = 34
     private let searchHeight: CGFloat = 38
     // Total header zone: strip + gap + search + bottom gap
     private var headerZoneHeight: CGFloat {
-        8 + stripHeight + topControlsSpacing + searchHeight + 6
+        8 + stripHeight + topControlsSpacing + searchHeight + 2
     }
 
     private var panelVisible = false
@@ -239,9 +241,6 @@ final class ChatGifPanelView: UIView {
     // Bottom gradient mask (fades into tab bar)
     private let bottomMaskView = UIView()
     private let bottomMaskGradient = CAGradientLayer()
-    private weak var hostedHeaderScrollView: UIScrollView?
-    private var hostedHeaderBaseContentInset: UIEdgeInsets = .zero
-    private var hostedHeaderBaseIndicatorInsets: UIEdgeInsets = .zero
     // Bottom floating controls
     private let bottomTabBarContainer = UIView()
     private let bottomTabBar = FloatingTabBar()
@@ -282,7 +281,7 @@ final class ChatGifPanelView: UIView {
         glassBackground.layer.cornerRadius = panelCornerRadius
         glassBackground.layer.cornerCurve = .continuous
         glassBackground.layer.maskedCorners = topCorners
-        closeChromeView.layer.cornerRadius = 24
+        closeChromeView.layer.cornerRadius = 19
         closeChromeView.layer.cornerCurve = .continuous
         applyFrameLayout()
     }
@@ -324,7 +323,6 @@ final class ChatGifPanelView: UIView {
 
         searchField.resignFirstResponder()
         setSearchExpanded(false)
-        restoreHostedHeaderIfNeeded()
         removeEmbeddedPicker()
         loadingSpinner.stopAnimating()
         loadingView.isHidden = true
@@ -505,9 +503,9 @@ final class ChatGifPanelView: UIView {
 
         NSLayoutConstraint.activate([
             bottomTabBarContainer.centerXAnchor.constraint(equalTo: centerXAnchor),
-            bottomTabBarContainer.bottomAnchor.constraint(equalTo: safeAreaLayoutGuide.bottomAnchor, constant: -8),
+            bottomTabBarContainer.bottomAnchor.constraint(equalTo: safeAreaLayoutGuide.bottomAnchor, constant: -bottomFloatingEdgeInset),
             bottomTabBarContainer.widthAnchor.constraint(equalToConstant: 220),
-            bottomTabBarContainer.heightAnchor.constraint(equalToConstant: 48),
+            bottomTabBarContainer.heightAnchor.constraint(equalToConstant: bottomFloatingControlHeight),
 
             bottomTabBar.leadingAnchor.constraint(
                 equalTo: bottomTabBarContainer.leadingAnchor, constant: -16),
@@ -516,9 +514,9 @@ final class ChatGifPanelView: UIView {
             bottomTabBar.centerYAnchor.constraint(equalTo: bottomTabBarContainer.centerYAnchor),
 
             closeChromeView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            closeChromeView.bottomAnchor.constraint(equalTo: safeAreaLayoutGuide.bottomAnchor, constant: -8),
-            closeChromeView.widthAnchor.constraint(equalToConstant: 48),
-            closeChromeView.heightAnchor.constraint(equalToConstant: 48),
+            closeChromeView.bottomAnchor.constraint(equalTo: safeAreaLayoutGuide.bottomAnchor, constant: -bottomFloatingEdgeInset),
+            closeChromeView.widthAnchor.constraint(equalToConstant: bottomFloatingControlHeight),
+            closeChromeView.heightAnchor.constraint(equalToConstant: bottomFloatingControlHeight),
 
             closeButton.leadingAnchor.constraint(
                 equalTo: closeChromeView.contentView.leadingAnchor),
@@ -535,12 +533,34 @@ final class ChatGifPanelView: UIView {
         bottomTabBar.items = items
         bottomTabBar.selectedItem = items.first
 
+        let closeConfig = UIImage.SymbolConfiguration(pointSize: 20, weight: .bold)
+        closeButton.setImage(
+            UIImage(systemName: "xmark.circle.fill", withConfiguration: closeConfig),
+            for: .normal
+        )
+        closeButton.tintColor = secondaryTextColor
+
         selectionFeedback.prepare()
         refreshChrome()
         rebuildSearchChrome()
         rebuildTopStripButtons()
         rebuildEmojiSections()
+        updateContentInsets()
         applyActiveTabState(animated: false)
+    }
+
+    private func updateContentInsets() {
+        let insets = UIEdgeInsets(top: headerZoneHeight, left: 0, bottom: bottomFloatingInset, right: 0)
+        emojiCollectionView.contentInset = insets
+        emojiCollectionView.scrollIndicatorInsets = insets
+        stickerPackPanel.contentScrollView.contentInset = insets
+        stickerPackPanel.contentScrollView.scrollIndicatorInsets = insets
+        #if canImport(GiphyUISDK)
+        if let pickerView = pickerViewController?.view, let sv = findScrollView(in: pickerView) {
+            sv.contentInset = insets
+            sv.scrollIndicatorInsets = insets
+        }
+        #endif
     }
 
     /// Frame-based layout — called from layoutSubviews.
@@ -553,9 +573,8 @@ final class ChatGifPanelView: UIView {
         let hInset: CGFloat = 10
         let stripTop: CGFloat = 8
 
-        // Header is hosted inside the active scroll view so it scrolls away
-        // with the content instead of behaving like a static overlay.
-        headerView.frame = CGRect(x: 0, y: -headerZoneHeight, width: w, height: headerZoneHeight)
+        // Header is fixed at the top
+        headerView.frame = CGRect(x: 0, y: 0, width: w, height: headerZoneHeight)
         let stripFrame = CGRect(x: hInset, y: stripTop, width: w - hInset * 2, height: stripHeight)
         topStripScrollView.frame = stripFrame
         let searchY = stripFrame.maxY + topControlsSpacing
@@ -573,8 +592,6 @@ final class ChatGifPanelView: UIView {
         stickerPackPanel.frame = CGRect(
             x: 0, y: 0, width: w, height: h)
 
-        hostHeaderIfNeeded(in: activeContentScrollView())
-
         stateLabel.frame = bounds
         loadingView.frame = bounds
         loadingSpinner.center = CGPoint(x: w * 0.5, y: h * 0.5 - 18)
@@ -587,11 +604,11 @@ final class ChatGifPanelView: UIView {
         bottomMaskGradient.frame = bottomMaskView.bounds
         CATransaction.commit()
 
-        // Z-order: content → bottom mask → floating controls
+        // Z-order: content → bottom mask → floating controls → fixed header
         bringSubviewToFront(bottomMaskView)
         bringSubviewToFront(bottomTabBarContainer)
         bringSubviewToFront(closeChromeView)
-        hostedHeaderScrollView?.bringSubviewToFront(headerView)
+        bringSubviewToFront(headerView)
     }
 
     private func refreshChrome() {
@@ -752,7 +769,7 @@ final class ChatGifPanelView: UIView {
         )
         button.backgroundColor = selected ? selectedChipColor : .clear
         if activeTab == .emoji {
-            button.alpha = selected ? 1.0 : 0.4
+            button.alpha = 1.0
             button.transform = selected ? CGAffineTransform(scaleX: 1.2, y: 1.2) : .identity
         }
 
@@ -792,8 +809,6 @@ final class ChatGifPanelView: UIView {
         rebuildSearchChrome()
         rebuildTopStripButtons()
 
-        restoreHostedHeaderIfNeeded()
-
         switch activeTab {
         case .emoji:
             mediaContainerView.isHidden = true
@@ -802,7 +817,6 @@ final class ChatGifPanelView: UIView {
             loadingSpinner.stopAnimating()
             loadingView.isHidden = true
             rebuildEmojiSections()
-            hostHeaderIfNeeded(in: emojiCollectionView)
         case .stickers:
             emojiCollectionView.isHidden = true
             mediaContainerView.isHidden = true
@@ -811,7 +825,6 @@ final class ChatGifPanelView: UIView {
             loadingSpinner.stopAnimating()
             loadingView.isHidden = true
             applyStickerPanelState()
-            hostHeaderIfNeeded(in: stickerPackPanel.contentScrollView)
         case .gifs:
             emojiCollectionView.isHidden = true
             stickerPackPanel.isHidden = true
@@ -821,11 +834,6 @@ final class ChatGifPanelView: UIView {
                 installEmbeddedPickerIfNeeded()
             }
             updateEmbeddedPickerContent(showLoading: animated && pickerViewController == nil)
-            #if canImport(GiphyUISDK)
-                if let pickerView = pickerViewController?.view {
-                    hostHeaderIfNeeded(in: findScrollView(in: pickerView))
-                }
-            #endif
         }
         setNeedsLayout()
     }
@@ -855,71 +863,6 @@ final class ChatGifPanelView: UIView {
             #endif
             return nil
         }
-    }
-
-    private func hostHeaderIfNeeded(in scrollView: UIScrollView?) {
-        guard let scrollView else {
-            restoreHostedHeaderIfNeeded()
-            return
-        }
-
-        if hostedHeaderScrollView !== scrollView {
-            restoreHostedHeaderIfNeeded()
-            hostedHeaderScrollView = scrollView
-            hostedHeaderBaseContentInset = scrollView.contentInset
-            hostedHeaderBaseIndicatorInsets = scrollView.scrollIndicatorInsets
-            headerView.removeFromSuperview()
-            scrollView.addSubview(headerView)
-        } else if headerView.superview !== scrollView {
-            headerView.removeFromSuperview()
-            scrollView.addSubview(headerView)
-        }
-
-        let desiredContentInset = UIEdgeInsets(
-            top: hostedHeaderBaseContentInset.top + headerZoneHeight,
-            left: hostedHeaderBaseContentInset.left,
-            bottom: hostedHeaderBaseContentInset.bottom + bottomFloatingInset,
-            right: hostedHeaderBaseContentInset.right
-        )
-        let desiredIndicatorInset = UIEdgeInsets(
-            top: hostedHeaderBaseIndicatorInsets.top + headerZoneHeight,
-            left: hostedHeaderBaseIndicatorInsets.left,
-            bottom: hostedHeaderBaseIndicatorInsets.bottom + bottomFloatingInset,
-            right: hostedHeaderBaseIndicatorInsets.right
-        )
-        let topDelta = desiredContentInset.top - scrollView.contentInset.top
-
-        scrollView.contentInset = desiredContentInset
-        scrollView.scrollIndicatorInsets = desiredIndicatorInset
-        if abs(topDelta) > 0.5 {
-            scrollView.contentOffset.y -= topDelta
-        }
-
-        headerView.frame = CGRect(
-            x: 0,
-            y: -headerZoneHeight,
-            width: scrollView.bounds.width,
-            height: headerZoneHeight
-        )
-        scrollView.bringSubviewToFront(headerView)
-    }
-
-    private func restoreHostedHeaderIfNeeded() {
-        guard let scrollView = hostedHeaderScrollView else { return }
-
-        let topDelta = scrollView.contentInset.top - hostedHeaderBaseContentInset.top
-        scrollView.contentInset = hostedHeaderBaseContentInset
-        scrollView.scrollIndicatorInsets = hostedHeaderBaseIndicatorInsets
-        if abs(topDelta) > 0.5 {
-            scrollView.contentOffset.y += topDelta
-        }
-
-        headerView.removeFromSuperview()
-        addSubview(headerView)
-        headerView.frame = .zero
-        hostedHeaderScrollView = nil
-        hostedHeaderBaseContentInset = .zero
-        hostedHeaderBaseIndicatorInsets = .zero
     }
 
     private func findScrollView(in view: UIView) -> UIScrollView? {
@@ -1248,7 +1191,7 @@ final class ChatGifPanelView: UIView {
             pickerViewController = picker
             stateLabel.isHidden = true
             updateEmbeddedPickerContent(showLoading: panelVisible)
-            hostHeaderIfNeeded(in: findScrollView(in: picker.view))
+            updateContentInsets()
         #else
             showStateLabel("Install the Giphy native SDK to enable GIF search.")
         #endif

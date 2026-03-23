@@ -23,6 +23,7 @@ enum ChatImageEditModule {
     initialImage: UIImage?,
     initialCaption: String?,
     headerTitle: String? = nil,
+    dismissPresenterOnSend: Bool = false,
     onAction: @escaping (ChatImageEditActionPayload) -> Void
   ) {
     let controller = ChatImageEditViewController(
@@ -30,9 +31,10 @@ enum ChatImageEditModule {
       mediaURL: mediaURL,
       initialImage: initialImage,
       initialCaption: initialCaption,
-      headerTitle: headerTitle
+      headerTitle: headerTitle,
+      dismissPresenterOnSend: dismissPresenterOnSend
     )
-    controller.modalPresentationStyle = .fullScreen
+    controller.modalPresentationStyle = .overFullScreen
     controller.onAction = onAction
     presenter.present(controller, animated: true)
   }

@@ -34,6 +34,17 @@ struct BubbleShape {
   let borderBottomLeftRadius: CGFloat
   let borderBottomRightRadius: CGFloat
 
+  private static func parseRadius(_ value: Any?, fallback: CGFloat = 18.0) -> CGFloat {
+    if let num = value as? NSNumber { return CGFloat(num.doubleValue) }
+    if let dbl = value as? Double { return CGFloat(dbl) }
+    if let int = value as? Int { return CGFloat(int) }
+    if let str = value as? String {
+      let clean = str.replacingOccurrences(of: "px", with: "").trimmingCharacters(in: .whitespaces)
+      if let d = Double(clean) { return CGFloat(d) }
+    }
+    return fallback
+  }
+
   static func from(raw: [String: Any]?, isMe: Bool) -> BubbleShape {
     let fallback =
       isMe
@@ -49,12 +60,10 @@ struct BubbleShape {
     return BubbleShape(
       isMe: isMe,
       showTail: (raw["showTail"] as? Bool) ?? true,
-      borderTopLeftRadius: CGFloat((raw["borderTopLeftRadius"] as? NSNumber)?.doubleValue ?? 18),
-      borderTopRightRadius: CGFloat((raw["borderTopRightRadius"] as? NSNumber)?.doubleValue ?? 18),
-      borderBottomLeftRadius: CGFloat(
-        (raw["borderBottomLeftRadius"] as? NSNumber)?.doubleValue ?? 18),
-      borderBottomRightRadius: CGFloat(
-        (raw["borderBottomRightRadius"] as? NSNumber)?.doubleValue ?? 18)
+      borderTopLeftRadius: parseRadius(raw["borderTopLeftRadius"]),
+      borderTopRightRadius: parseRadius(raw["borderTopRightRadius"]),
+      borderBottomLeftRadius: parseRadius(raw["borderBottomLeftRadius"]),
+      borderBottomRightRadius: parseRadius(raw["borderBottomRightRadius"])
     )
   }
 }
@@ -88,11 +97,15 @@ struct ChatListRow {
   let shape: BubbleShape
   let messageType: String
   let mediaUrl: String?
+  let localMediaUrl: String?
+  let mediaKey: String?
+  let thumbnailBase64: String?
   let fileName: String?
   let duration: Double?
   let waveform: [CGFloat]?
   let isVideoNote: Bool
   let uploadProgress: Double?
+  let fileSize: Int64?
   let mediaWidth: Double?
   let mediaHeight: Double?
 
@@ -126,18 +139,42 @@ struct ChatListRow {
     if isVideoNote {
       return .videoNote
     }
+    let inferredVideo = isVideoMediaReference(mediaUrl: mediaUrl, fileName: fileName)
+    let inferredImage = isImageMediaReference(mediaUrl: mediaUrl, fileName: fileName)
+    let inferredAudio = isAudioMediaReference(mediaUrl: mediaUrl, fileName: fileName)
     switch messageType {
     case "voice", "music":
       return .voice
     case "video":
       return .video
     case "image", "gif":
+      if inferredVideo {
+        return .video
+      }
       return .media
     case "sticker":
       return .sticker
     case "file":
+      if inferredVideo {
+        return .video
+      }
+      if inferredImage {
+        return .media
+      }
+      if inferredAudio {
+        return .voice
+      }
       return isAgentMessage ? .text : .media
     default:
+      if inferredVideo {
+        return .video
+      }
+      if inferredImage {
+        return .media
+      }
+      if inferredAudio {
+        return .voice
+      }
       return .text
     }
   }
@@ -259,11 +296,15 @@ struct ChatListRow {
         borderBottomLeftRadius: 18, borderBottomRightRadius: 18)
       messageType = "text"
       mediaUrl = nil
+      localMediaUrl = nil
+      mediaKey = nil
+      thumbnailBase64 = nil
       fileName = nil
       duration = nil
       waveform = nil
       isVideoNote = false
       uploadProgress = nil
+      fileSize = nil
       mediaWidth = nil
       mediaHeight = nil
       stickerId = nil
@@ -281,7 +322,15 @@ struct ChatListRow {
     }
     kind = .message
     label = ""
-    text = (message["text"] as? String) ?? ""
+    let metadata = message["metadata"] as? [String: Any]
+    let extra = message["extra"] as? [String: Any]
+    let primaryText = (message["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let captionText =
+      parseNonEmptyString(message["caption"])
+      ?? parseNonEmptyString(metadata?["caption"])
+      ?? parseNonEmptyString(extra?["caption"])
+      ?? ""
+    text = primaryText.isEmpty ? captionText : primaryText
     timestamp = (message["timestamp"] as? String) ?? ""
     isMe = (message["isMe"] as? Bool) ?? false
     status = message["status"] as? String
@@ -292,11 +341,16 @@ struct ChatListRow {
     messageType = ((message["type"] as? String) ?? "text").lowercased()
     shape = BubbleShape.from(raw: message["bubbleShape"] as? [String: Any], isMe: isMe)
 
-    let metadata = message["metadata"] as? [String: Any]
     let localMediaUrl1 = message["localMediaUrl"] as? String
     let localMediaUrl2 = message["local_media_url"] as? String
     let metaLocalMediaUrl1 = metadata?["localMediaUrl"] as? String
     let metaLocalMediaUrl2 = metadata?["local_media_url"] as? String
+    localMediaUrl =
+      [localMediaUrl1, localMediaUrl2, metaLocalMediaUrl1, metaLocalMediaUrl2]
+      .compactMap { value in
+        guard let value, !value.isEmpty else { return nil }
+        return value
+      }.first
     let mediaUrl1 = message["mediaUrl"] as? String
     let mediaUrl2 = message["media_url"] as? String
     let mediaUrl3 = message["uri"] as? String
@@ -324,6 +378,18 @@ struct ChatListRow {
         guard let value, !value.isEmpty else { return nil }
         return value
       }.first
+    mediaKey =
+      parseNonEmptyString(message["mediaKey"])
+      ?? parseNonEmptyString(message["media_key"])
+      ?? parseNonEmptyString(metadata?["mediaKey"])
+      ?? parseNonEmptyString(metadata?["media_key"])
+    thumbnailBase64 =
+      parseNonEmptyString(message["thumbnailBase64"])
+      ?? parseNonEmptyString(message["thumbnail_base64"])
+      ?? parseNonEmptyString(metadata?["thumbnailBase64"])
+      ?? parseNonEmptyString(metadata?["thumbnail_base64"])
+      ?? parseNonEmptyString(extra?["thumbnailBase64"])
+      ?? parseNonEmptyString(extra?["thumbnail_base64"])
     fileName =
       (message["fileName"] as? String)
       ?? (message["file_name"] as? String)
@@ -344,8 +410,15 @@ struct ChatListRow {
       ?? parseDouble(message["upload_progress"])
       ?? parseDouble(metadata?["uploadProgress"])
       ?? parseDouble(metadata?["upload_progress"])
+    fileSize = {
+      let raw =
+        parseLong(message["fileSize"])
+        ?? parseLong(message["file_size"])
+        ?? parseLong(metadata?["fileSize"])
+        ?? parseLong(metadata?["file_size"])
+      return raw
+    }()
 
-    let extra = message["extra"] as? [String: Any]
     let stickerContainers: [[String: Any]?] = [message, metadata, extra]
     mediaWidth =
       parseDouble(message["width"]) ?? parseDouble(metadata?["width"])
@@ -403,6 +476,15 @@ private func bubbleShapeEqual(_ lhs: BubbleShape, _ rhs: BubbleShape) -> Bool {
     && abs(lhs.borderBottomRightRadius - rhs.borderBottomRightRadius) <= epsilon
 }
 
+private func parseLong(_ raw: Any?) -> Int64? {
+  if let value = raw as? NSNumber { return value.int64Value }
+  if let value = raw as? Int64 { return value }
+  if let value = raw as? Int { return Int64(value) }
+  if let value = raw as? Double, value.isFinite { return Int64(value) }
+  if let value = raw as? String { return Int64(value) }
+  return nil
+}
+
 private func parseDouble(_ raw: Any?) -> Double? {
   if let value = raw as? NSNumber {
     return value.doubleValue
@@ -434,6 +516,54 @@ private func parseNonEmptyString(_ raw: Any?) -> String? {
     return String(value)
   }
   return nil
+}
+
+private func normalizedMediaExtension(_ value: String?) -> String? {
+  guard let value else { return nil }
+  let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+  guard !trimmed.isEmpty else { return nil }
+  let pathExtension: String
+  if let url = URL(string: trimmed), !url.pathExtension.isEmpty {
+    pathExtension = url.pathExtension
+  } else {
+    pathExtension = (trimmed as NSString).pathExtension
+  }
+  let normalized = pathExtension.replacingOccurrences(of: ".", with: "").lowercased()
+  return normalized.isEmpty ? nil : normalized
+}
+
+private func isVideoMediaReference(mediaUrl: String?, fileName: String?) -> Bool {
+  let extensions = [
+    normalizedMediaExtension(fileName),
+    normalizedMediaExtension(mediaUrl),
+  ]
+  return extensions.contains(where: { ext in
+    guard let ext else { return false }
+    return ["mp4", "mov", "m4v", "avi", "mkv", "webm"].contains(ext)
+  })
+}
+
+private func isImageMediaReference(mediaUrl: String?, fileName: String?) -> Bool {
+  let extensions = [
+    normalizedMediaExtension(fileName),
+    normalizedMediaExtension(mediaUrl),
+  ]
+  return extensions.contains(where: { ext in
+    guard let ext else { return false }
+    return ["jpg", "jpeg", "png", "gif", "webp", "heic", "heif", "bmp"].contains(ext)
+  })
+}
+
+private func isAudioMediaReference(mediaUrl: String?, fileName: String?) -> Bool {
+  let extensions = [
+    normalizedMediaExtension(fileName),
+    normalizedMediaExtension(mediaUrl),
+  ]
+  return extensions.contains(where: { ext in
+    guard let ext else { return false }
+    return ["mp3", "m4a", "aac", "wav", "aiff", "flac", "ogg", "oga", "opus", "caf", "alac"]
+      .contains(ext)
+  })
 }
 
 private func firstNonEmptyString(
@@ -601,10 +731,12 @@ func chatListRowContentEqual(_ lhs: ChatListRow, _ rhs: ChatListRow) -> Bool {
     && lhs.isEdited == rhs.isEdited && lhs.isPinned == rhs.isPinned
     && lhs.messageId == rhs.messageId && lhs.reactionEmoji == rhs.reactionEmoji
     && lhs.messageType == rhs.messageType
-    && lhs.mediaUrl == rhs.mediaUrl && lhs.fileName == rhs.fileName
+    && lhs.mediaUrl == rhs.mediaUrl && lhs.localMediaUrl == rhs.localMediaUrl
+    && lhs.mediaKey == rhs.mediaKey && lhs.fileName == rhs.fileName
     && optionalDoubleEqual(lhs.duration, rhs.duration) && lhs.isVideoNote == rhs.isVideoNote
     && optionalWaveformEqual(lhs.waveform, rhs.waveform)
     && optionalDoubleEqual(lhs.uploadProgress, rhs.uploadProgress)
+    && lhs.fileSize == rhs.fileSize
     && bubbleShapeEqual(lhs.shape, rhs.shape)
     && lhs.stickerId == rhs.stickerId
     && lhs.stickerPackId == rhs.stickerPackId
@@ -833,4 +965,10 @@ struct SendTransitionPayload {
     self.sourceBackgroundSnapshotView = nil
     self.sourceContentSnapshotView = nil
   }
+}
+
+struct ChatAttachmentTransitionCapture {
+  let sourceContainerFrameInWindow: CGRect
+  var sourceBackgroundSnapshotView: UIView?
+  var sourceContentSnapshotView: UIView?
 }

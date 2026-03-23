@@ -123,9 +123,12 @@ export const NativeChatMainSurface = forwardRef<NativeChatMainSurfaceRef, Native
         ? contentPaddingBottom
         : undefined;
     // Android ChatMainView currently crashes while applying this prop in some builds.
-    // Keep the list stable by skipping only this prop on Android.
+    // Native input mode owns the bottom inset, so don't pass any external
+    // bottom padding while the native composer is active.
     const contentPaddingBottomProp =
-      Platform.OS === 'android' ? undefined : normalizedContentPaddingBottom;
+      Platform.OS === 'android' || inputBarEnabled
+        ? undefined
+        : normalizedContentPaddingBottom;
     const reportNativeError = (error: unknown, context: string) => {
       console.error(`[NativeChatMainSurface] ${context} failed`, error);
       onNativeError?.(error, context);

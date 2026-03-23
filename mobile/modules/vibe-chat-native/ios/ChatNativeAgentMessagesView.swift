@@ -56,7 +56,7 @@ private final class ChatNativeAgentPlainTextView: UIView {
     )
 
     label.textColor = textColor
-    label.applyStreamingText(attributed, isStreaming: row.isStreamingText && !isProgress)
+    label.applyStreamingText(attributed, rawText: text, isStreaming: row.isStreamingText && !isProgress)
     cachedFrame = CGRect(
       x: leftPadding,
       y: topPadding,

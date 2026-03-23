@@ -222,6 +222,51 @@ private fun chatEngineEncryptHybridMessage(
   }.toString()
 }
 
+internal fun chatEngineEncryptMediaBytes(plainData: ByteArray): Pair<ByteArray, String> {
+  val secureRandom = SecureRandom()
+  val aesKey = ByteArray(32).also { secureRandom.nextBytes(it) }
+  val iv = ByteArray(12).also { secureRandom.nextBytes(it) }
+
+  val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+  cipher.init(
+    Cipher.ENCRYPT_MODE,
+    SecretKeySpec(aesKey, "AES"),
+    GCMParameterSpec(128, iv),
+  )
+  val encryptedWithTag = cipher.doFinal(plainData)
+  val combined = ByteArray(iv.size + encryptedWithTag.size)
+  System.arraycopy(iv, 0, combined, 0, iv.size)
+  System.arraycopy(encryptedWithTag, 0, combined, iv.size, encryptedWithTag.size)
+  return combined to Base64.encodeToString(aesKey, Base64.NO_WRAP)
+}
+
+internal fun chatEngineDecryptMediaBytes(
+  encryptedData: ByteArray,
+  keyBase64: String,
+): ByteArray? {
+  return try {
+    val aesKey = Base64.decode(keyBase64, Base64.DEFAULT)
+    if (encryptedData.size <= 28) return null
+    val iv = encryptedData.copyOfRange(0, 12)
+    val cipherBytes = encryptedData.copyOfRange(12, encryptedData.size)
+    val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+    cipher.init(
+      Cipher.DECRYPT_MODE,
+      SecretKeySpec(aesKey, "AES"),
+      GCMParameterSpec(128, iv),
+    )
+    cipher.doFinal(cipherBytes)
+  } catch (_: Throwable) {
+    null
+  }
+}
+
+internal fun chatEngineShouldEncryptUploadedMediaType(messageType: String): Boolean =
+  when (messageType.lowercase(Locale.ROOT)) {
+    "image", "gif", "voice", "music", "video", "file", "sticker" -> true
+    else -> false
+  }
+
 internal object ChatEngine {
   private const val NATIVE_CONNECT_STALE_TIMEOUT_MS = 5_000L
 
@@ -570,6 +615,11 @@ internal object ChatEngine {
 
   fun getTransportStatus(): Map<String, Any?> =
     synchronized(lock) { statusSnapshotLocked() }
+
+  fun authorizationHeaderForApi(): String? =
+    synchronized(lock) {
+      authHeaderTokenLocked()?.takeIf { it.isNotBlank() }?.let { "Bearer $it" }
+    }
 
   private fun transportDebugStateLocked(chatId: String? = null): String {
     val connected = (state["connected"] as? Boolean) == true
@@ -1145,7 +1195,7 @@ internal object ChatEngine {
     val height = parseLongValue(meta("height"))
     val caption = normalized(meta("caption"))
     val thumbnailBase64 = normalized(meta("thumbnailBase64", "thumbnail_base64"))
-    val mediaKey = normalized(meta("mediaKey", "media_key"))
+    var mediaKey = normalized(meta("mediaKey", "media_key"))
     val contact = meta("contact")
     val viewOnce = meta("viewOnce", "view_once")
     val isVideoNote = meta("isVideoNote", "is_video_note")
@@ -1219,6 +1269,7 @@ internal object ChatEngine {
       if (contact != null) decryptedFields["contact"] = contact
       if (!caption.isNullOrBlank()) decryptedFields["caption"] = caption
       if (!thumbnailBase64.isNullOrBlank()) decryptedFields["thumbnailBase64"] = thumbnailBase64
+      if (!mediaKey.isNullOrBlank()) decryptedFields["mediaKey"] = mediaKey
       if (viewOnce != null) decryptedFields["viewOnce"] = viewOnce
       if (isVideoNote != null) decryptedFields["isVideoNote"] = isVideoNote
       if (waveform != null) decryptedFields["waveform"] = waveform
@@ -1290,6 +1341,7 @@ internal object ChatEngine {
         var finalMediaUrl = mediaUrl
         var finalFileName = fileName
         var finalFileSize = fileSize
+        var finalMediaKey = mediaKey
 
         if (needsUpload) {
           if (apiBaseUrl.isNullOrBlank() || token.isNullOrBlank() || userId.isNullOrBlank()) {
@@ -1350,6 +1402,7 @@ internal object ChatEngine {
                 finalMediaUrl = uploadResult.value.remoteUrl
                 if (finalFileName.isNullOrBlank()) finalFileName = uploadResult.value.fileName
                 if (finalFileSize == null) finalFileSize = uploadResult.value.fileSize
+                if (finalMediaKey.isNullOrBlank()) finalMediaKey = uploadResult.value.mediaKey
                 val nextMetadata = linkedMapOf<String, Any?>()
                 val existingMetadata = payload["metadata"] as? Map<*, *> ?: emptyMap<String, Any?>()
                 existingMetadata.forEach { (k, v) -> if (k != null) nextMetadata[k.toString()] = v }
@@ -1359,6 +1412,7 @@ internal object ChatEngine {
                 }
                 if (!finalFileName.isNullOrBlank()) nextMetadata["fileName"] = finalFileName
                 if (finalFileSize != null) nextMetadata["fileSize"] = finalFileSize
+                if (!finalMediaKey.isNullOrBlank()) nextMetadata["mediaKey"] = finalMediaKey
                 effectivePayload["metadata"] = nextMetadata
                 effectivePayload["chatId"] = chatId
                 effectivePayload["messageId"] = messageId
@@ -1370,6 +1424,14 @@ internal object ChatEngine {
                 }
                 if (!finalFileName.isNullOrBlank()) optimisticMessage["fileName"] = finalFileName
                 if (finalFileSize != null) optimisticMessage["fileSize"] = finalFileSize
+                if (!finalMediaKey.isNullOrBlank()) optimisticMessage["mediaKey"] = finalMediaKey
+                val optimisticMetadata =
+                  (optimisticMessage["metadata"] as? MutableMap<String, Any?>) ?: linkedMapOf()
+                if (!finalMediaKey.isNullOrBlank()) optimisticMetadata["mediaKey"] = finalMediaKey
+                if (!localPlaybackMediaUrl.isNullOrBlank()) {
+                  optimisticMetadata["localMediaUrl"] = localPlaybackMediaUrl
+                }
+                optimisticMessage["metadata"] = optimisticMetadata
                 optimisticRow["message"] = optimisticMessage
                 upsertLiveMessageRowLocked(chatId, messageId, optimisticRow)
                 setLiveMessageUploadProgressLocked(chatId, messageId, 1.0f)
@@ -1420,7 +1482,7 @@ internal object ChatEngine {
         val encryptStartMs = System.currentTimeMillis()
         val fullPayload = linkedMapOf<String, Any?>("text" to text)
         if (!finalMediaUrl.isNullOrBlank()) fullPayload["mediaUrl"] = finalMediaUrl
-        if (!mediaKey.isNullOrBlank()) fullPayload["mediaKey"] = mediaKey
+        if (!finalMediaKey.isNullOrBlank()) fullPayload["mediaKey"] = finalMediaKey
         if (!finalFileName.isNullOrBlank()) fullPayload["fileName"] = finalFileName
         if (finalFileSize != null) fullPayload["fileSize"] = finalFileSize
         if (latitude != null) fullPayload["latitude"] = latitude
@@ -2219,6 +2281,7 @@ internal object ChatEngine {
     val duration = parseDoubleValue(metadata["duration"] ?: payload["duration"])
     val width = parseLongValue(metadata["width"] ?: payload["width"])
     val height = parseLongValue(metadata["height"] ?: payload["height"])
+    var mediaKey = normalized(metadata["mediaKey"] ?: metadata["media_key"] ?: payload["mediaKey"])
     val replyToId = normalized(metadata["replyToId"] ?: metadata["reply_to_id"] ?: payload["replyToId"])
     val contact = metadata["contact"] ?: payload["contact"]
     val isVideoNote = metadata["isVideoNote"] ?: payload["isVideoNote"]
@@ -2256,6 +2319,7 @@ internal object ChatEngine {
           mediaUrl = uploadOutcome.value.remoteUrl
           if (fileName.isNullOrBlank()) fileName = uploadOutcome.value.fileName
           if (fileSize == null) fileSize = uploadOutcome.value.fileSize
+          if (mediaKey.isNullOrBlank()) mediaKey = uploadOutcome.value.mediaKey
         }
       }
     }
@@ -2264,6 +2328,7 @@ internal object ChatEngine {
     if (!myPublicKeyPem.isNullOrBlank()) {
       val encryptedPayload = linkedMapOf<String, Any?>("text" to text)
       if (!mediaUrl.isNullOrBlank()) encryptedPayload["mediaUrl"] = mediaUrl
+      if (!mediaKey.isNullOrBlank()) encryptedPayload["mediaKey"] = mediaKey
       if (!fileName.isNullOrBlank()) encryptedPayload["fileName"] = fileName
       if (fileSize != null) encryptedPayload["fileSize"] = fileSize
       if (latitude != null) encryptedPayload["latitude"] = latitude
@@ -3543,14 +3608,14 @@ internal object ChatEngine {
       message["decryptionFailed"] = true
       (row as? MutableMap<String, Any?>)?.put("message", message)
     }
-    if ((type.equals("voice", ignoreCase = true) || type.equals("music", ignoreCase = true)) && isMe) {
+    if (setOf("image", "gif", "file", "voice", "video", "music", "sticker").contains(type.lowercase(Locale.ROOT)) && isMe) {
       val existingMessage = findMessagePayloadLocked(chatId, messageId)
       val localPlaybackUrl = extractLocalPlaybackMediaUrlFromMessage(existingMessage)
       val localWaveform = extractWaveformFromMessage(existingMessage)
       if (!localPlaybackUrl.isNullOrBlank()) {
         Log.d(
           "ChatEngine",
-          "preserve local voice url on incoming echo chatId=$chatId messageId=$messageId local=${localPlaybackUrl.take(120)}",
+          "preserve local media url on incoming echo chatId=$chatId messageId=$messageId local=${localPlaybackUrl.take(120)}",
         )
         row = mergeLocalPlaybackMediaUrlIntoRow(row, localPlaybackUrl)
       }
@@ -3654,6 +3719,7 @@ internal object ChatEngine {
     val remoteUrl: String,
     val fileName: String?,
     val fileSize: Long?,
+    val mediaKey: String?,
   )
 
   private sealed class LocalMediaUploadOutcome {
@@ -3662,7 +3728,7 @@ internal object ChatEngine {
   }
 
   private data class LocalMediaSource(
-    val body: RequestBody,
+    val bytes: ByteArray,
     val fileName: String,
     val fileSize: Long?,
   )
@@ -3824,11 +3890,8 @@ internal object ChatEngine {
         val resolvedName = fileNameHint
           ?: displayNameForContentUri(parsed)
           ?: "upload_${System.currentTimeMillis()}"
-        val resolvedMime = ctx.contentResolver.getType(parsed)
-          ?: inferMimeType(resolvedName, messageType)
-        val body = bytes.toRequestBody(resolvedMime.toMediaTypeOrNull())
         val size = fileSizeForContentUri(parsed) ?: bytes.size.toLong()
-        return LocalMediaSource(body = body, fileName = resolvedName, fileSize = size)
+        return LocalMediaSource(bytes = bytes, fileName = resolvedName, fileSize = size)
       }
     }
 
@@ -3845,9 +3908,12 @@ internal object ChatEngine {
     val resolvedName = fileNameHint
       ?: file.name.takeIf { it.isNotBlank() }
       ?: "upload_${System.currentTimeMillis()}"
-    val resolvedMime = inferMimeType(resolvedName, messageType)
-    val body = file.asRequestBody(resolvedMime.toMediaTypeOrNull())
-    return LocalMediaSource(body = body, fileName = resolvedName, fileSize = file.length())
+    val bytes = try {
+      file.readBytes()
+    } catch (_: Throwable) {
+      return null
+    }
+    return LocalMediaSource(bytes = bytes, fileName = resolvedName, fileSize = file.length())
   }
 
   private fun uploadLocalMediaLocked(
@@ -3863,13 +3929,35 @@ internal object ChatEngine {
     val uploadUrl = resolveUploadUrl(apiBaseUrl) ?: return LocalMediaUploadOutcome.Failure("invalid_upload_url")
     val source = resolveLocalMediaSource(localUri, fileNameHint, messageType)
       ?: return LocalMediaUploadOutcome.Failure("media_file_missing")
+    val originalFileSize = source.fileSize ?: source.bytes.size.toLong()
+    val uploadBytes: ByteArray
+    val mediaKey: String?
+    if (chatEngineShouldEncryptUploadedMediaType(messageType)) {
+      try {
+        val encrypted = chatEngineEncryptMediaBytes(source.bytes)
+        uploadBytes = encrypted.first
+        mediaKey = encrypted.second
+      } catch (t: Throwable) {
+        Log.w(
+          "ChatEngine",
+          "uploadLocalMedia encryptFailure type=$messageType fileName=${source.fileName} error=${t.message ?: t.javaClass.simpleName}",
+          t,
+        )
+        return LocalMediaUploadOutcome.Failure("media_encrypt_failed")
+      }
+    } else {
+      uploadBytes = source.bytes
+      mediaKey = null
+    }
+    val resolvedMime = inferMimeType(source.fileName, messageType)
+    val uploadBody = uploadBytes.toRequestBody(resolvedMime.toMediaTypeOrNull())
     Log.d(
       "ChatEngine",
       "uploadLocalMedia start type=$messageType fileName=${source.fileName} fileSize=${source.fileSize ?: -1} localUri=${localUri.take(160)} url=${uploadUrl.take(160)}",
     )
     val multipart = MultipartBody.Builder()
       .setType(MultipartBody.FORM)
-      .addFormDataPart("file", source.fileName, source.body)
+      .addFormDataPart("file", source.fileName, uploadBody)
       .addFormDataPart("user_id", userId)
       .addFormDataPart("type", uploadCategoryForMessageType(messageType))
       .build()
@@ -3974,7 +4062,8 @@ internal object ChatEngine {
         LocalMediaUploadResult(
           remoteUrl = remoteUrl,
           fileName = source.fileName,
-          fileSize = source.fileSize,
+          fileSize = originalFileSize,
+          mediaKey = mediaKey,
         ),
       )
     }

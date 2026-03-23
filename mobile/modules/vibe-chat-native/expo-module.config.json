@@ -18,7 +18,8 @@
       "ChatNativeTabBarModule",
       "ChatNativeHomeModule",
       "ChatNativeHomeListModule",
-      "ChatNativeAgentModule"
+      "ChatNativeAgentModule",
+      "NativeGlobalMusicPlayerModule"
     ],
     "podspecPath": "ChatNative.podspec"
   },

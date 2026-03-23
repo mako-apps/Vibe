@@ -384,6 +384,11 @@ public final class ChatMainView: ExpoView,
   }
 
   func setContentPaddingTop(_ value: Double) {
+    // The native layoutPages() already calculates the correct top padding
+    // based on safeAreaInsets + header height. Ignore trivially small JS values
+    // (e.g. 0) that would reset the padding and cause the list to render
+    // behind the header.
+    guard value > 10.0 else { return }
     chatListView.setContentPaddingTop(value)
   }
 
@@ -1122,6 +1127,7 @@ public final class ChatMainView: ExpoView,
       pinnedBannerIsFile = false
       pinnedBannerView.isHidden = true
       pinnedBannerView.alpha = 0.0
+      setNeedsLayout()
       return
     }
 
@@ -1208,6 +1214,7 @@ public final class ChatMainView: ExpoView,
           },
           completion: { _ in
             self.pinnedBannerView.isHidden = true
+            self.setNeedsLayout()
           }
         )
       }
@@ -2240,6 +2247,11 @@ public final class ChatMainView: ExpoView,
   private func layoutPages() {
     let safeTop = safeAreaInsets.top
     let headerHeight = safeTop + 60.0
+    let pinnedBannerInset: CGFloat =
+      pinnedBannerView.isHidden || pinnedBannerView.alpha <= 0.01
+      ? 0.0
+      : (ChatPinnedBannerView.preferredHeight + 12.0)
+    chatListView.setContentPaddingTop(Double(headerHeight + 8.0 + pinnedBannerInset))
     pagesHost.frame = CGRect(
       x: 0.0,
       y: headerHeight,

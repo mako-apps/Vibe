@@ -233,11 +233,37 @@ export default function ChatListRoute() {
       const uri = typeof payload.uri === 'string' ? payload.uri.trim() : '';
       const caption = typeof payload.caption === 'string' ? payload.caption : '';
       if (uri) {
+        const mimeType = typeof payload.mimeType === 'string' ? payload.mimeType.trim() : '';
+        const explicitVideo = payload.isVideo === true || /^video\//i.test(mimeType);
+        const attachmentType: 'video' | 'image' =
+          explicitVideo || /\.(mp4|mov|m4v|avi|mkv|webm)(?:$|[?#])/i.test(uri) ? 'video' : 'image';
+        const metadata: Record<string, any> = { mediaUrl: uri };
+        if (mimeType) {
+          metadata.mimeType = mimeType;
+        }
+        if (attachmentType === 'video') {
+          const duration = toNumber(payload.duration);
+          if (typeof duration === 'number' && Number.isFinite(duration) && duration > 0) {
+            metadata.duration = duration;
+          }
+          const fileName =
+            typeof payload.name === 'string' ? payload.name.trim()
+              : typeof payload.fileName === 'string' ? payload.fileName.trim()
+                : '';
+          if (fileName) {
+            metadata.fileName = fileName;
+          }
+          const thumbnailBase64 =
+            typeof payload.thumbnailBase64 === 'string' ? payload.thumbnailBase64.trim() : '';
+          if (thumbnailBase64) {
+            metadata.thumbnailBase64 = thumbnailBase64;
+          }
+        }
         void callNativeEngine('sendMessage', {
           ...basePayload,
-          type: 'image',
+          type: attachmentType,
           text: caption,
-          metadata: { mediaUrl: uri },
+          metadata,
         });
       }
       return;

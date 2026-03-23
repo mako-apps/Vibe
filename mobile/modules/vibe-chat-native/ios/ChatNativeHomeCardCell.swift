@@ -1119,6 +1119,10 @@ private final class ChatNativeHomeSwipeActionTileView: UIView {
   private let stackView = UIStackView()
   private let iconView = UIImageView()
   private let titleLabel = UILabel()
+  private var stackLeadingConstraint: NSLayoutConstraint?
+  private var stackTrailingConstraint: NSLayoutConstraint?
+  private var iconWidthConstraint: NSLayoutConstraint?
+  private var iconHeightConstraint: NSLayoutConstraint?
   private var spec: ChatNativeHomeSwipeActionSpec?
   private var edge: ChatNativeHomeSwipeEdge = .trailing
 
@@ -1146,13 +1150,28 @@ private final class ChatNativeHomeSwipeActionTileView: UIView {
 
     addSubview(stackView)
 
+    let stackLeadingConstraint = stackView.leadingAnchor.constraint(
+      greaterThanOrEqualTo: leadingAnchor,
+      constant: 8
+    )
+    let stackTrailingConstraint = stackView.trailingAnchor.constraint(
+      lessThanOrEqualTo: trailingAnchor,
+      constant: -8
+    )
+    let iconWidthConstraint = iconView.widthAnchor.constraint(equalToConstant: 30)
+    let iconHeightConstraint = iconView.heightAnchor.constraint(equalToConstant: 30)
+    self.stackLeadingConstraint = stackLeadingConstraint
+    self.stackTrailingConstraint = stackTrailingConstraint
+    self.iconWidthConstraint = iconWidthConstraint
+    self.iconHeightConstraint = iconHeightConstraint
+
     NSLayoutConstraint.activate([
       stackView.centerXAnchor.constraint(equalTo: centerXAnchor),
       stackView.centerYAnchor.constraint(equalTo: centerYAnchor, constant: 1),
-      stackView.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 8),
-      stackView.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -8),
-      iconView.widthAnchor.constraint(equalToConstant: 30),
-      iconView.heightAnchor.constraint(equalToConstant: 30),
+      stackLeadingConstraint,
+      stackTrailingConstraint,
+      iconWidthConstraint,
+      iconHeightConstraint,
     ])
   }
 
@@ -1175,14 +1194,23 @@ private final class ChatNativeHomeSwipeActionTileView: UIView {
   }
 
   func updateRevealWidth(_ width: CGFloat, expansionProgress: CGFloat) {
+    let clampedWidth = max(0.0, width)
+    let horizontalInset = min(8.0, floor(clampedWidth * 0.25))
+    stackLeadingConstraint?.constant = horizontalInset
+    stackTrailingConstraint?.constant = -horizontalInset
+    let iconSide = min(30.0, max(0.0, clampedWidth - (horizontalInset * 2.0)))
+    iconWidthConstraint?.constant = iconSide
+    iconHeightConstraint?.constant = iconSide
+
     let titleProgress = clamp((width - 42) / 16)
 
     stackView.spacing = 5
-    stackView.alpha = width > 0.5 ? 1 : 0
+    stackView.alpha = clampedWidth > 0.5 ? 1 : 0
     stackView.transform = .identity
+    titleLabel.isHidden = titleProgress <= 0.01
     titleLabel.alpha = titleProgress
     titleLabel.transform = .identity
-    iconView.alpha = 1
+    iconView.alpha = iconSide > 0.5 ? 1 : 0
     iconView.transform = .identity
   }
 

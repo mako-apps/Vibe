@@ -2208,6 +2208,7 @@ export default function ChatListScreen({
                     error: String(error),
                 });
             }
+            removeMessageLocally(effectiveChatId, messageId);
             cancelUpload(effectiveChatId, messageId);
             return;
         }
@@ -2221,7 +2222,32 @@ export default function ChatListScreen({
             const uriRaw = nativeEvent.uri;
             const captionRaw = nativeEvent.caption;
             if (typeof uriRaw !== 'string' || !effectiveChatId) return;
-            void sendAttachmentMessageRef.current?.('image', typeof captionRaw === 'string' ? captionRaw : '', { mediaUrl: uriRaw });
+            const mimeTypeRaw = typeof nativeEvent.mimeType === 'string' ? nativeEvent.mimeType.trim() : '';
+            const explicitVideo = nativeEvent.isVideo === true || /^video\//i.test(mimeTypeRaw);
+            const attachmentType: 'video' | 'image' =
+                explicitVideo || /\.(mp4|mov|m4v|avi|mkv|webm)(?:$|[?#])/i.test(uriRaw) ? 'video' : 'image';
+            const metadata: Record<string, any> = { mediaUrl: uriRaw };
+            if (mimeTypeRaw) {
+                metadata.mimeType = mimeTypeRaw;
+            }
+            if (attachmentType === 'video') {
+                const durationRaw = typeof nativeEvent.duration === 'number' ? nativeEvent.duration : undefined;
+                if (typeof durationRaw === 'number' && Number.isFinite(durationRaw) && durationRaw > 0) {
+                    metadata.duration = durationRaw;
+                }
+                const nameRaw =
+                    typeof nativeEvent.name === 'string' ? nativeEvent.name.trim()
+                        : typeof nativeEvent.fileName === 'string' ? nativeEvent.fileName.trim()
+                            : '';
+                if (nameRaw) {
+                    metadata.fileName = nameRaw;
+                }
+                const thumbnailBase64Raw = typeof nativeEvent.thumbnailBase64 === 'string' ? nativeEvent.thumbnailBase64.trim() : '';
+                if (thumbnailBase64Raw) {
+                    metadata.thumbnailBase64 = thumbnailBase64Raw;
+                }
+            }
+            void sendAttachmentMessageRef.current?.(attachmentType, typeof captionRaw === 'string' ? captionRaw : '', metadata);
             return;
         }
 
@@ -3114,6 +3140,7 @@ export default function ChatListScreen({
                         chatId={effectiveChatId || undefined}
                         myUserId={user?.userId || undefined}
                         peerUserId={activeChat?.friendId || undefined}
+                        peerDisplayName={activeChat?.friendName || activeChat?.name || undefined}
                         statusAuthorityEnabled
                         appearance={nativeAppearance}
                         contentPaddingTop={nativeListTopPadding}

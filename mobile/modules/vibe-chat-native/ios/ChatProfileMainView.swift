@@ -1,28 +1,66 @@
 import ExpoModulesCore
 import UIKit
+import AVFoundation
 
 private struct ChatProfileRow {
   let messageId: String
   let type: String
   let text: String
   let mediaUrl: String?
+  let localMediaUrl: String?
+  let mediaKey: String?
   let fileName: String?
   let fileSize: Int64?
   let timestampMs: Int64?
   let isPinned: Bool
   let duration: CGFloat?
   let waveform: [CGFloat]?
+  let thumbnailBase64: String?
 
   static func parse(_ raw: [String: Any]) -> ChatProfileRow? {
     let message = raw["message"] as? [String: Any] ?? raw
+    let metadata = message["metadata"] as? [String: Any]
     let messageId =
       (message["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
       ?? (raw["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
       ?? UUID().uuidString
     let type = ((message["type"] as? String) ?? (raw["type"] as? String) ?? "text").lowercased()
     let text = (message["text"] as? String) ?? (raw["text"] as? String) ?? ""
-    let mediaUrl = (message["mediaUrl"] as? String) ?? (raw["mediaUrl"] as? String)
-    let fileName = (message["fileName"] as? String) ?? (raw["fileName"] as? String)
+    let localMediaUrl =
+      (message["localMediaUrl"] as? String)
+      ?? (message["local_media_url"] as? String)
+      ?? (metadata?["localMediaUrl"] as? String)
+      ?? (metadata?["local_media_url"] as? String)
+    let resolvedLocalMediaUrl =
+      localMediaUrl?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let hasUsableLocalMedia: Bool = {
+      guard let resolvedLocalMediaUrl, !resolvedLocalMediaUrl.isEmpty else { return false }
+      let localPath: String
+      if let parsed = URL(string: resolvedLocalMediaUrl), parsed.isFileURL {
+        localPath = parsed.path
+      } else {
+        localPath = resolvedLocalMediaUrl
+      }
+      return FileManager.default.fileExists(atPath: localPath)
+    }()
+    let remoteMediaUrl =
+      (message["mediaUrl"] as? String)
+      ?? (message["media_url"] as? String)
+      ?? (metadata?["mediaUrl"] as? String)
+      ?? (metadata?["media_url"] as? String)
+      ?? (raw["mediaUrl"] as? String)
+    let mediaUrl = hasUsableLocalMedia ? resolvedLocalMediaUrl : remoteMediaUrl
+    let mediaKey =
+      (message["mediaKey"] as? String)
+      ?? (message["media_key"] as? String)
+      ?? (metadata?["mediaKey"] as? String)
+      ?? (metadata?["media_key"] as? String)
+    let fileName =
+      (message["fileName"] as? String)
+      ?? (message["file_name"] as? String)
+      ?? (metadata?["fileName"] as? String)
+      ?? (metadata?["file_name"] as? String)
+      ?? (raw["fileName"] as? String)
 
     let messageFileSizeNumber = message["fileSize"] as? NSNumber
     let rawFileSizeNumber = raw["fileSize"] as? NSNumber
@@ -59,18 +97,28 @@ private struct ChatProfileRow {
     }()
 
     let waveform = parseChatProfileWaveform(message["waveform"] ?? raw["waveform"])
+    
+    let thumbnailBase64 = 
+      (message["thumbnailBase64"] as? String)
+      ?? (message["thumbnail_base64"] as? String)
+      ?? (metadata?["thumbnailBase64"] as? String)
+      ?? (metadata?["thumbnail_base64"] as? String)
+      ?? (raw["thumbnailBase64"] as? String)
 
     return ChatProfileRow(
       messageId: messageId,
       type: type,
       text: text,
       mediaUrl: mediaUrl,
+      localMediaUrl: localMediaUrl,
+      mediaKey: mediaKey,
       fileName: fileName,
       fileSize: fileSize,
       timestampMs: timestampMs,
       isPinned: isPinned,
       duration: duration,
-      waveform: waveform
+      waveform: waveform,
+      thumbnailBase64: thumbnailBase64
     )
   }
 }
@@ -233,7 +281,7 @@ private final class ChatProfileListRowCell: UITableViewCell {
 }
 
 private final class ChatProfileTabStripView: UIView {
-  static let preferredHeight: CGFloat = 48.0
+  static let preferredHeight: CGFloat = 34.0
 
   var onSelect: ((ChatProfileTab) -> Void)?
 
@@ -301,10 +349,10 @@ private final class ChatProfileTabStripView: UIView {
       chromeOverlayView.topAnchor.constraint(equalTo: chromeView.contentView.topAnchor),
       chromeOverlayView.bottomAnchor.constraint(equalTo: chromeView.contentView.bottomAnchor),
 
-      scrollView.leadingAnchor.constraint(equalTo: chromeView.contentView.leadingAnchor, constant: 4.0),
-      scrollView.trailingAnchor.constraint(equalTo: chromeView.contentView.trailingAnchor, constant: -4.0),
-      scrollView.topAnchor.constraint(equalTo: chromeView.contentView.topAnchor, constant: 4.0),
-      scrollView.bottomAnchor.constraint(equalTo: chromeView.contentView.bottomAnchor, constant: -4.0),
+      scrollView.leadingAnchor.constraint(equalTo: chromeView.contentView.leadingAnchor),
+      scrollView.trailingAnchor.constraint(equalTo: chromeView.contentView.trailingAnchor),
+      scrollView.topAnchor.constraint(equalTo: chromeView.contentView.topAnchor),
+      scrollView.bottomAnchor.constraint(equalTo: chromeView.contentView.bottomAnchor),
 
       stackView.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor),
       stackView.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor),
@@ -337,7 +385,7 @@ private final class ChatProfileTabStripView: UIView {
     chromeOverlayView.backgroundColor =
       (isDark ? UIColor.black : UIColor.white).withAlphaComponent(isDark ? 0.10 : 0.08)
     selectionView.backgroundColor =
-      isDark ? UIColor.white.withAlphaComponent(0.16) : UIColor.black.withAlphaComponent(0.06)
+      isDark ? UIColor.white.withAlphaComponent(0.18) : UIColor.black.withAlphaComponent(0.10)
 
     for (tab, button) in buttonsByTab {
       let selected = tab == activeTab
@@ -380,8 +428,8 @@ private final class ChatProfileTabStripView: UIView {
       let button = UIButton(type: .system)
       button.translatesAutoresizingMaskIntoConstraints = false
       button.tag = index
-      button.contentEdgeInsets = UIEdgeInsets(top: 0.0, left: 16.0, bottom: 0.0, right: 16.0)
-      button.titleLabel?.font = UIFont.systemFont(ofSize: 14.0, weight: .semibold)
+      button.contentEdgeInsets = UIEdgeInsets(top: 0.0, left: 10.0, bottom: 0.0, right: 10.0)
+      button.titleLabel?.font = UIFont.systemFont(ofSize: 15.0, weight: .semibold)
       button.titleLabel?.lineBreakMode = .byTruncatingTail
       button.setTitle(titleProvider(tab), for: .normal)
       button.addTarget(self, action: #selector(handleTabButtonPressed(_:)), for: .touchUpInside)
@@ -620,6 +668,13 @@ private final class ChatProfileVoiceContentCell: UITableViewCell, VoicePlayableC
     }
   }
 
+  override func prepareForReuse() {
+    super.prepareForReuse()
+    VoiceBubblePlaybackCoordinator.shared.unbind(cell: self)
+    voiceButtonView.setDownloadState(needsDownload: false, isDownloading: false, progress: nil)
+    voiceButtonView.setPlaybackState(isPlaying: false, progress: 0.0, level: 0.0)
+  }
+
   func configure(
     title: String,
     subtitle: String,
@@ -654,6 +709,14 @@ private final class ChatProfileVoiceContentCell: UITableViewCell, VoicePlayableC
 
   func applyVoicePlaybackState(isPlaying: Bool, progress: CGFloat, level: CGFloat) {
     voiceButtonView.setPlaybackState(isPlaying: isPlaying, progress: progress, level: level)
+  }
+
+  func applyVoiceDownloadState(needsDownload: Bool, isDownloading: Bool, progress: CGFloat?) {
+    voiceButtonView.setDownloadState(
+      needsDownload: needsDownload,
+      isDownloading: isDownloading,
+      progress: progress
+    )
   }
 }
 
@@ -703,7 +766,7 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
   private var availableTabs: [ChatProfileTab] = []
   private var activeTab: ChatProfileTab = .media
   private weak var inlineTabsCell: ChatProfileTabStripCell?
-  private var contentTransitionOverlayView: UIView?
+
 
   private var profileName = "User"
   private var profileHandle = ""
@@ -1006,6 +1069,9 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
     tableView.register(
       ChatProfileVoiceContentCell.self,
       forCellReuseIdentifier: ChatProfileVoiceContentCell.reuseIdentifier)
+    tableView.register(
+      ChatProfileMediaGridRowCell.self,
+      forCellReuseIdentifier: ChatProfileMediaGridRowCell.reuseIdentifier)
     tableView.separatorInset = UIEdgeInsets(top: 0.0, left: 16.0, bottom: 0.0, right: 16.0)
     tableView.contentInsetAdjustmentBehavior = .never
     tableView.estimatedRowHeight = 0.0
@@ -1581,7 +1647,7 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
   private func currentContentCount() -> Int {
     switch activeTab {
     case .media:
-      return mediaRows.count
+      return Int(ceil(Double(mediaRows.count) / 3.0))
     case .voice:
       return voiceRows.count
     case .gifs:
@@ -1666,84 +1732,21 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
     }
   }
 
-  private func animateContentTransition(direction: CGFloat) {
-    contentTransitionOverlayView?.removeFromSuperview()
-    contentTransitionOverlayView = nil
-
-    guard tableView.numberOfSections > Section.content.rawValue else { return }
-
-    let visibleRect = CGRect(origin: tableView.contentOffset, size: tableView.bounds.size)
-    let sectionRect = tableView.rect(forSection: Section.content.rawValue)
-    let snapshotRect = visibleRect.intersection(sectionRect)
-    let overlayView: UIView? = {
-      guard !snapshotRect.isNull, snapshotRect.width > 0.0, snapshotRect.height > 0.0 else {
-        return nil
-      }
-
-      let snapshot = tableView.resizableSnapshotView(
-        from: snapshotRect,
-        afterScreenUpdates: false,
-        withCapInsets: .zero
-      )
-      snapshot?.frame = tableView.convert(snapshotRect, to: self)
-      if let snapshot {
-        addSubview(snapshot)
-        contentTransitionOverlayView = snapshot
-        bringSubviewToFront(headerMaskContainer)
-        bringSubviewToFront(stickyTabsContainer)
-        bringSubviewToFront(floatingAvatarView)
-        bringSubviewToFront(headerContainer)
-      }
-      return snapshot
-    }()
-
-    reloadContentSectionWithoutAnimation()
-
-    let visibleContentCells = tableView.visibleCells.filter { cell in
-      guard let indexPath = tableView.indexPath(for: cell) else { return false }
-      return indexPath.section == Section.content.rawValue
-    }
-    let travel = min(max(bounds.width * 0.16, 28.0), 64.0)
-    let incomingOffset = direction > 0.0 ? travel : -travel
-    let outgoingOffset = -incomingOffset
-
-    for cell in visibleContentCells {
-      cell.transform = CGAffineTransform(translationX: incomingOffset, y: 0.0)
-      cell.alpha = 0.0
-    }
-
-    let animator = UIViewPropertyAnimator(duration: 0.30, dampingRatio: 0.96) {
-      overlayView?.transform = CGAffineTransform(translationX: outgoingOffset, y: 0.0)
-      overlayView?.alpha = 0.0
-      for cell in visibleContentCells {
-        cell.transform = .identity
-        cell.alpha = 1.0
-      }
-    }
-
-    animator.addCompletion { [weak self] _ in
-      overlayView?.removeFromSuperview()
-      self?.contentTransitionOverlayView = nil
-    }
-    animator.startAnimation()
-  }
-
   private func switchToTab(_ nextTab: ChatProfileTab, animated: Bool) {
     guard availableTabs.contains(nextTab), nextTab != activeTab else { return }
-    let previousIndex = availableTabs.firstIndex(of: activeTab) ?? 0
-    let nextIndex = availableTabs.firstIndex(of: nextTab) ?? previousIndex
     activeTab = nextTab
     reloadHeaderText()
     refreshHeroSubheader()
     syncTabViews()
-    scrollTabsIntoView(animated: false)
 
-    guard tableView.numberOfSections > Section.content.rawValue else { return }
-    if animated {
-      animateContentTransition(direction: nextIndex > previousIndex ? 1.0 : -1.0)
-      return
-    }
+    // Reload content in-place without any overlay or cross-fade.
     reloadContentSectionWithoutAnimation()
+
+    // Scroll just enough so the inline tabs row sits right below the
+    // header (at the sticky position). Content items appear directly
+    // below the tabs — no over-scrolling past the tabs.
+    guard animated else { return }
+    scrollTabsIntoView(animated: true)
   }
 
   private func scrollTabsIntoView(animated: Bool) {
@@ -1945,8 +1948,6 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
   }
 
   private func reloadDataKeepingSelection() {
-    contentTransitionOverlayView?.removeFromSuperview()
-    contentTransitionOverlayView = nil
     tableView.reloadData()
     layoutHeroHeaderViewIfNeeded(force: true)
     syncTabViews()
@@ -2021,7 +2022,14 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
       return ChatProfileTabStripView.preferredHeight + 12.0
     case .content:
       switch activeTab {
-      case .voice, .media, .gifs:
+      case .media:
+        let cols: CGFloat = 3.0
+        let padding: CGFloat = 16.0
+        let gap: CGFloat = 2.0
+        let avail = max(0.0, tableView.bounds.width - padding * 2.0 - gap * (cols - 1))
+        let itemHeight = floor(avail / cols)
+        return itemHeight + gap
+      case .voice, .gifs:
         return 72.0
       default:
         return 68.0
@@ -2054,11 +2062,47 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
         subtitleColor: currentSecondaryTextColor,
         accentColor: currentRowAccentColor
       )
-      VoiceBubblePlaybackCoordinator.shared.bind(cell: cell, messageId: row.messageId)
+      VoiceBubblePlaybackCoordinator.shared.bind(
+        cell: cell,
+        messageId: row.messageId,
+        mediaURL: row.mediaUrl,
+        mediaKey: row.mediaKey,
+        fileName: row.fileName
+      )
       return cell
     }
 
-    if activeTab == .media || activeTab == .gifs {
+    if activeTab == .media {
+      guard
+        let cell = tableView.dequeueReusableCell(
+          withIdentifier: ChatProfileMediaGridRowCell.reuseIdentifier,
+          for: indexPath
+        ) as? ChatProfileMediaGridRowCell
+      else {
+        return UITableViewCell(style: .default, reuseIdentifier: nil)
+      }
+      var items: [(url: String?, isVideo: Bool, thumbnailBase64: String?)] = []
+      let startIndex = indexPath.row * 3
+      for i in 0..<3 {
+        let absIndex = startIndex + i
+        if absIndex < mediaRows.count {
+          let r = mediaRows[absIndex]
+          items.append((url: r.mediaUrl, isVideo: r.type == "video", thumbnailBase64: r.thumbnailBase64))
+        }
+      }
+      cell.configure(
+        items: items,
+        startIndex: startIndex,
+        placeholderTintColor: currentTextColor.withAlphaComponent(0.72),
+        placeholderBackgroundColor: currentRowCardColor
+      )
+      cell.onMediaTapped = { [weak self] index in
+        self?.handleMediaGridTapped(at: index)
+      }
+      return cell
+    }
+
+    if activeTab == .gifs {
       guard
         let cell = tableView.dequeueReusableCell(
           withIdentifier: ChatProfileMediaContentCell.reuseIdentifier,
@@ -2242,9 +2286,17 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
       if activeTab == .voice {
         if let cell = tableView.cellForRow(at: indexPath) as? VoicePlayableCell {
           VoiceBubblePlaybackCoordinator.shared.toggle(
-            cell: cell, messageId: row.messageId, mediaURL: row.mediaUrl
+            cell: cell,
+            messageId: row.messageId,
+            mediaURL: row.mediaUrl,
+            mediaKey: row.mediaKey,
+            fileName: row.fileName
           )
         }
+        return
+      }
+
+      if activeTab == .media {
         return
       }
 
@@ -2262,6 +2314,42 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
 
       onNativeEvent(payload)
     }
+  }
+
+  private func handleMediaGridTapped(at index: Int) {
+    guard activeTab == .media, index >= 0, index < mediaRows.count else { return }
+    let row = mediaRows[index]
+
+    if row.type == "video", let mediaUrl = row.mediaUrl, !mediaUrl.isEmpty {
+      let resolvedUrlStr = ChatEngine.shared.resolveURLForOpen(mediaUrl) ?? mediaUrl
+      guard let url = URL(string: resolvedUrlStr) else { return }
+      
+      var options: [String: Any]? = nil
+      if url.scheme?.lowercased() == "http" || url.scheme?.lowercased() == "https",
+         let authHeader = ChatEngine.shared.authorizationHeaderForAPI() {
+        options = ["AVURLAssetHTTPHeaderFieldsKey": ["Authorization": authHeader]]
+      }
+      
+      let asset = AVURLAsset(url: url, options: options)
+      let controller = ChatVideoEditViewController(
+        asset: asset,
+        initialCaption: row.text,
+        headerTitle: "Video",
+        previewOnly: true
+      )
+      
+      if let presenter = topMostViewController() {
+        presenter.present(controller, animated: true)
+      }
+      return
+    }
+
+    onNativeEvent([
+      "type": "profileContentPressed",
+      "tab": activeTab.rawValue,
+      "messageId": row.messageId,
+      "url": row.mediaUrl ?? ""
+    ])
   }
 
   // MARK: Agent Config

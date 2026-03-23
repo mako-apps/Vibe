@@ -13,9 +13,11 @@ import android.os.SystemClock
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
+import android.view.ViewOutlineProvider
 import android.view.animation.AccelerateDecelerateInterpolator
 import android.view.animation.LinearInterpolator
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.TextView
 import androidx.recyclerview.widget.RecyclerView
 import kotlin.math.max
@@ -28,6 +30,13 @@ internal class NativeRowViewHolder(
   val tailView: BubbleTailView,
   val textView: TextView,
   val inlineAttachmentView: FrameLayout,
+  val mediaPreviewView: FrameLayout,
+  val mediaImageView: ImageView,
+  val mediaPlayBadgeView: TextView,
+  val mediaDurationBadgeView: TextView,
+  val mediaTransferOverlayView: FrameLayout,
+  val mediaTransferRingView: BubbleUploadProgressView,
+  val mediaTransferSizeView: TextView,
   val inlineAttachmentTitleView: TextView,
   val inlineAttachmentSubtitleView: TextView,
   val voiceContainer: FrameLayout,
@@ -132,6 +141,7 @@ internal class VoicePlayProgressView(context: Context) : View(context) {
   companion object {
     private const val BUTTON_SIZE_DP = 52f
     private const val PLAYBACK_ICON_SIZE_DP = 18f
+    private const val DOWNLOAD_ICON_SIZE_DP = 18f
     private const val UPLOAD_ICON_SIZE_DP = 16f
     private const val MINIMUM_UPLOAD_PROGRESS = 0.027f
     private const val UPLOAD_PROGRESS_DURATION_MS = 200L
@@ -157,11 +167,16 @@ internal class VoicePlayProgressView(context: Context) : View(context) {
   private val playDrawable = context.getDrawable(R.drawable.ic_voice_play)?.mutate()
   private val pauseDrawable = context.getDrawable(R.drawable.ic_voice_pause)?.mutate()
   private val cancelDrawable = context.getDrawable(R.drawable.ic_voice_cancel)?.mutate()
+  private val downloadDrawable = context.getDrawable(R.drawable.ic_voice_download)?.mutate()
   private val arcRect = RectF()
   private var isPlaying = false
   private var isUploading = false
+  private var needsDownload = false
+  private var isDownloading = false
   private var uploadProgress: Float? = null
   private var lastResolvedUploadProgress: Float? = null
+  private var downloadProgress: Float? = null
+  private var lastResolvedDownloadProgress: Float? = null
   private var displayedUploadProgress = 0f
   private var uploadRotationDegrees = 0f
   private var playbackLevel = 0f
@@ -183,7 +198,7 @@ internal class VoicePlayProgressView(context: Context) : View(context) {
   }
 
   fun setPlaybackState(isPlaying: Boolean, progress: Float, level: Float = 0f) {
-    if (isUploading) return
+    if (isUploading || isDownloading || needsDownload) return
     val normalizedLevel = level.coerceIn(0f, 1f)
     val levelChanged = kotlin.math.abs(playbackLevel - normalizedLevel) > 0.01f
     if (this.isPlaying == isPlaying && !levelChanged) return
@@ -198,6 +213,12 @@ internal class VoicePlayProgressView(context: Context) : View(context) {
   }
 
   fun setUploadState(isUploading: Boolean, progress: Float?) {
+    if (isUploading) {
+      needsDownload = false
+      isDownloading = false
+      downloadProgress = null
+      lastResolvedDownloadProgress = null
+    }
     val resolvedProgress =
       if (isUploading) {
         when {
@@ -218,6 +239,47 @@ internal class VoicePlayProgressView(context: Context) : View(context) {
     updateUploadVisualState()
   }
 
+  fun setDownloadState(needsDownload: Boolean, isDownloading: Boolean, progress: Float?) {
+    if (isUploading) return
+
+    val resolvedProgress =
+      if (isDownloading) {
+        when {
+          progress != null && progress.isFinite() -> {
+            progress.coerceIn(MINIMUM_UPLOAD_PROGRESS, 1f).also { lastResolvedDownloadProgress = it }
+          }
+          lastResolvedDownloadProgress != null -> lastResolvedDownloadProgress
+          else -> MINIMUM_UPLOAD_PROGRESS.also { lastResolvedDownloadProgress = it }
+        }
+      } else {
+        lastResolvedDownloadProgress = null
+        null
+      }
+
+    if (
+      this.needsDownload == needsDownload &&
+        this.isDownloading == isDownloading &&
+        downloadProgress == resolvedProgress
+    ) {
+      return
+    }
+
+    this.needsDownload = needsDownload
+    this.isDownloading = isDownloading
+    downloadProgress = resolvedProgress
+    if (!needsDownload && !isDownloading) {
+      stopUploadAnimations(resetProgress = true)
+      invalidate()
+      return
+    }
+    if (isDownloading) {
+      updateUploadVisualState()
+    } else {
+      stopUploadAnimations(resetProgress = true)
+      invalidate()
+    }
+  }
+
   fun preferredButtonSizePx(): Int = dpF(BUTTON_SIZE_DP).roundToInt()
 
   override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
@@ -236,14 +298,14 @@ internal class VoicePlayProgressView(context: Context) : View(context) {
     val fillInset = dpF(3f)
     val fillRadius = (outerRadius - fillInset).coerceAtLeast(kotlin.math.min(dpF(14f), outerRadius))
 
-    if (!isUploading && (isPlaying || playbackLevel > 0.01f)) {
+    if (!isUploading && !isDownloading && !needsDownload && (isPlaying || playbackLevel > 0.01f)) {
       drawFluidVisualizer(canvas, cx, cy, outerRadius)
       postInvalidateOnAnimation()
     }
 
     canvas.drawCircle(cx, cy, fillRadius, fillPaint)
 
-    if (isUploading) {
+    if (isUploading || isDownloading) {
       val ringRadius = kotlin.math.max(dpF(4f), fillRadius + dpF(1.8f))
       arcRect.set(cx - ringRadius, cy - ringRadius, cx + ringRadius, cy + ringRadius)
       canvas.save()
@@ -260,7 +322,8 @@ internal class VoicePlayProgressView(context: Context) : View(context) {
 
     val icon =
       when {
-        isUploading -> cancelDrawable
+        isUploading || isDownloading -> cancelDrawable
+        needsDownload -> downloadDrawable
         isPlaying -> pauseDrawable
         else -> playDrawable
       }
@@ -269,7 +332,8 @@ internal class VoicePlayProgressView(context: Context) : View(context) {
         kotlin.math.min(
           (fillRadius * 2f) - dpF(9f),
           when {
-            isUploading -> dpF(UPLOAD_ICON_SIZE_DP)
+            isUploading || isDownloading -> dpF(UPLOAD_ICON_SIZE_DP)
+            needsDownload -> dpF(DOWNLOAD_ICON_SIZE_DP)
             else -> dpF(PLAYBACK_ICON_SIZE_DP)
           },
         )
@@ -289,13 +353,18 @@ internal class VoicePlayProgressView(context: Context) : View(context) {
   }
 
   private fun updateUploadVisualState() {
-    if (!isUploading) {
+    if (!isUploading && !isDownloading) {
       stopUploadAnimations(resetProgress = true)
       invalidate()
       return
     }
     ensureRotationAnimator()
-    animateUploadProgressTo(uploadProgress ?: MINIMUM_UPLOAD_PROGRESS)
+    animateUploadProgressTo(
+      when {
+        isUploading -> uploadProgress ?: MINIMUM_UPLOAD_PROGRESS
+        else -> downloadProgress ?: MINIMUM_UPLOAD_PROGRESS
+      },
+    )
   }
 
   private fun animateUploadProgressTo(target: Float) {
@@ -369,6 +438,204 @@ internal class VoicePlayProgressView(context: Context) : View(context) {
   private fun withAlpha(color: Int, alpha: Float): Int {
     val resolvedAlpha = (alpha.coerceIn(0f, 1f) * 255f).roundToInt().coerceIn(0, 255)
     return Color.argb(resolvedAlpha, Color.red(color), Color.green(color), Color.blue(color))
+  }
+
+  private fun dpF(value: Float): Float =
+    TypedValue.applyDimension(
+      TypedValue.COMPLEX_UNIT_DIP,
+      value,
+      context.resources.displayMetrics,
+    )
+}
+
+internal class BubbleUploadProgressView(context: Context) : View(context) {
+  companion object {
+    private const val MINIMUM_UPLOAD_PROGRESS = 0.027f
+    private const val PROGRESS_DURATION_MS = 200L
+    private const val ROTATION_DURATION_MS = 1570L
+  }
+
+  private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    style = Paint.Style.FILL
+    color = Color.argb(148, 0, 0, 0)
+  }
+  private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    style = Paint.Style.STROKE
+    strokeCap = Paint.Cap.ROUND
+    strokeWidth = dpF(3f)
+    color = Color.argb(72, 255, 255, 255)
+  }
+  private val progressPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    style = Paint.Style.STROKE
+    strokeCap = Paint.Cap.ROUND
+    strokeWidth = dpF(3f)
+    color = Color.WHITE
+  }
+  private val cancelDrawable = context.getDrawable(R.drawable.ic_voice_cancel)?.mutate()
+  private val arcRect = RectF()
+  private var isUploading = false
+  private var needsDownload = false
+  private var isDownloading = false
+  private var uploadProgress: Float? = null
+  private var lastResolvedUploadProgress: Float? = null
+  private var downloadProgress: Float? = null
+  private var lastResolvedDownloadProgress: Float? = null
+  private var displayedProgress = 0f
+  private var rotationDegrees = 0f
+  private var progressAnimator: ValueAnimator? = null
+  private var rotationAnimator: ValueAnimator? = null
+
+  fun setUploadState(isUploading: Boolean, progress: Float?) {
+    if (isUploading) {
+      needsDownload = false
+      isDownloading = false
+      downloadProgress = null
+      lastResolvedDownloadProgress = null
+    }
+    val resolvedProgress =
+      if (isUploading) {
+        when {
+          progress != null && progress.isFinite() -> {
+            progress.coerceIn(MINIMUM_UPLOAD_PROGRESS, 1f).also { lastResolvedUploadProgress = it }
+          }
+          lastResolvedUploadProgress != null -> lastResolvedUploadProgress
+          else -> MINIMUM_UPLOAD_PROGRESS.also { lastResolvedUploadProgress = it }
+        }
+      } else {
+        lastResolvedUploadProgress = null
+        null
+      }
+    if (this.isUploading == isUploading && uploadProgress == resolvedProgress) return
+    this.isUploading = isUploading
+    uploadProgress = resolvedProgress
+    updateVisualState()
+  }
+
+  fun setDownloadState(needsDownload: Boolean, isDownloading: Boolean, progress: Float?) {
+    if (isUploading) return
+    val resolvedProgress =
+      if (isDownloading) {
+        when {
+          progress != null && progress.isFinite() -> {
+            progress.coerceIn(MINIMUM_UPLOAD_PROGRESS, 1f).also { lastResolvedDownloadProgress = it }
+          }
+          lastResolvedDownloadProgress != null -> lastResolvedDownloadProgress
+          else -> MINIMUM_UPLOAD_PROGRESS.also { lastResolvedDownloadProgress = it }
+        }
+      } else {
+        lastResolvedDownloadProgress = null
+        null
+      }
+    if (
+      this.needsDownload == needsDownload &&
+        this.isDownloading == isDownloading &&
+        downloadProgress == resolvedProgress
+    ) {
+      return
+    }
+    this.needsDownload = needsDownload
+    this.isDownloading = isDownloading
+    downloadProgress = resolvedProgress
+    updateVisualState()
+  }
+
+  override fun onDetachedFromWindow() {
+    stopAnimations(resetProgress = true)
+    super.onDetachedFromWindow()
+  }
+
+  override fun onDraw(canvas: Canvas) {
+    super.onDraw(canvas)
+    val shouldDrawDownload = needsDownload && isDownloading
+    if ((!isUploading && !shouldDrawDownload) || width <= 0 || height <= 0) return
+
+    val cx = width * 0.5f
+    val cy = height * 0.5f
+    val outerRadius = kotlin.math.min(cx, cy)
+    val fillRadius = (outerRadius - dpF(5f)).coerceAtLeast(dpF(8f))
+    canvas.drawCircle(cx, cy, fillRadius, fillPaint)
+
+    val ringRadius = kotlin.math.max(dpF(6f), fillRadius + dpF(2f))
+    arcRect.set(cx - ringRadius, cy - ringRadius, cx + ringRadius, cy + ringRadius)
+    canvas.drawArc(arcRect, 0f, 360f, false, trackPaint)
+    canvas.save()
+    canvas.rotate(rotationDegrees, cx, cy)
+    canvas.drawArc(
+      arcRect,
+      -90f,
+      displayedProgress.coerceIn(MINIMUM_UPLOAD_PROGRESS, 1f) * 360f,
+      false,
+      progressPaint,
+    )
+    canvas.restore()
+
+    if (isUploading) {
+      val icon = cancelDrawable ?: return
+      val iconSize = kotlin.math.min(dpF(16f), fillRadius * 1.2f)
+      val left = ((width - iconSize) * 0.5f).roundToInt()
+      val top = ((height - iconSize) * 0.5f).roundToInt()
+      icon.setBounds(left, top, (left + iconSize).roundToInt(), (top + iconSize).roundToInt())
+      icon.setTint(Color.WHITE)
+      icon.draw(canvas)
+    }
+  }
+
+  private fun updateVisualState() {
+    val shouldAnimate = isUploading || (needsDownload && isDownloading)
+    if (!shouldAnimate) {
+      stopAnimations(resetProgress = true)
+      invalidate()
+      return
+    }
+    ensureRotationAnimator()
+    animateProgressTo(
+      when {
+        isUploading -> uploadProgress ?: MINIMUM_UPLOAD_PROGRESS
+        else -> downloadProgress ?: MINIMUM_UPLOAD_PROGRESS
+      },
+    )
+  }
+
+  private fun animateProgressTo(target: Float) {
+    val clampedTarget = target.coerceIn(MINIMUM_UPLOAD_PROGRESS, 1f)
+    progressAnimator?.cancel()
+    val start = displayedProgress.takeIf { it > 0f } ?: clampedTarget
+    progressAnimator =
+      ValueAnimator.ofFloat(start, clampedTarget).apply {
+        duration = PROGRESS_DURATION_MS
+        interpolator = AccelerateDecelerateInterpolator()
+        addUpdateListener { animator ->
+          displayedProgress = (animator.animatedValue as Float).coerceIn(MINIMUM_UPLOAD_PROGRESS, 1f)
+          invalidate()
+        }
+        start()
+      }
+  }
+
+  private fun ensureRotationAnimator() {
+    if (rotationAnimator?.isRunning == true) return
+    rotationAnimator =
+      ValueAnimator.ofFloat(0f, 360f).apply {
+        duration = ROTATION_DURATION_MS
+        repeatCount = ValueAnimator.INFINITE
+        interpolator = LinearInterpolator()
+        addUpdateListener { animator ->
+          rotationDegrees = animator.animatedValue as Float
+          invalidate()
+        }
+        start()
+      }
+  }
+
+  private fun stopAnimations(resetProgress: Boolean) {
+    progressAnimator?.cancel()
+    progressAnimator = null
+    rotationAnimator?.cancel()
+    rotationAnimator = null
+    rotationDegrees = 0f
+    if (resetProgress) {
+      displayedProgress = 0f
+    }
   }
 
   private fun dpF(value: Float): Float =
@@ -655,6 +922,68 @@ internal fun createNativeMessageRowViewHolder(context: Context): NativeRowViewHo
     isClickable = true
     isFocusable = true
   }
+  val mediaPreview = FrameLayout(context).apply {
+    visibility = View.GONE
+    clipChildren = true
+    clipToPadding = true
+    background = GradientDrawable().apply {
+      cornerRadius = dpF(12f)
+      setColor(Color.argb(32, 0, 0, 0))
+    }
+    outlineProvider = ViewOutlineProvider.BACKGROUND
+    clipToOutline = true
+  }
+  val mediaImage = ImageView(context).apply {
+    scaleType = ImageView.ScaleType.CENTER_CROP
+    adjustViewBounds = false
+    setBackgroundColor(Color.argb(42, 0, 0, 0))
+  }
+  val mediaPlayBadge = TextView(context).apply {
+    this.text = "\u25B6"
+    setTextColor(Color.WHITE)
+    setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
+    gravity = Gravity.CENTER
+    background = GradientDrawable().apply {
+      shape = GradientDrawable.OVAL
+      setColor(Color.argb(71, 0, 0, 0))
+    }
+    visibility = View.GONE
+  }
+  val mediaDurationBadge = TextView(context).apply {
+    setTextColor(Color.WHITE)
+    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+    setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
+    includeFontPadding = false
+    gravity = Gravity.CENTER
+    setPadding(dp(8), dp(4), dp(8), dp(4))
+    background = GradientDrawable().apply {
+      cornerRadius = dpF(11f)
+      setColor(Color.argb(143, 0, 0, 0))
+    }
+    visibility = View.GONE
+  }
+  val mediaTransferOverlay = FrameLayout(context).apply {
+    visibility = View.GONE
+    clipChildren = false
+    clipToPadding = false
+    setBackgroundColor(Color.TRANSPARENT)
+    isClickable = true
+    isFocusable = true
+  }
+  val mediaTransferRing = BubbleUploadProgressView(context)
+  val mediaTransferSize = TextView(context).apply {
+    setTextColor(Color.WHITE)
+    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+    setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
+    includeFontPadding = false
+    gravity = Gravity.CENTER
+    setPadding(dp(8), dp(4), dp(8), dp(4))
+    background = GradientDrawable().apply {
+      cornerRadius = dpF(10f)
+      setColor(Color.argb(124, 10, 14, 20))
+    }
+    visibility = View.GONE
+  }
   val inlineAttachmentIcon = TextView(context).apply {
     setText("\uD83D\uDCC4")
     setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
@@ -672,6 +1001,56 @@ internal fun createNativeMessageRowViewHolder(context: Context): NativeRowViewHo
     setText("Tap to open")
     maxLines = 1
   }
+  inlineAttachment.addView(
+    mediaPreview,
+    FrameLayout.LayoutParams(
+      FrameLayout.LayoutParams.MATCH_PARENT,
+      FrameLayout.LayoutParams.MATCH_PARENT,
+    ),
+  )
+  mediaPreview.addView(
+    mediaImage,
+    FrameLayout.LayoutParams(
+      FrameLayout.LayoutParams.MATCH_PARENT,
+      FrameLayout.LayoutParams.MATCH_PARENT,
+    ),
+  )
+  mediaPreview.addView(
+    mediaPlayBadge,
+    FrameLayout.LayoutParams(dp(44), dp(44), Gravity.CENTER),
+  )
+  mediaPreview.addView(
+    mediaDurationBadge,
+    FrameLayout.LayoutParams(
+      FrameLayout.LayoutParams.WRAP_CONTENT,
+      FrameLayout.LayoutParams.WRAP_CONTENT,
+      Gravity.TOP or Gravity.START,
+    ).apply {
+      leftMargin = dp(8)
+      topMargin = dp(8)
+    },
+  )
+  mediaPreview.addView(
+    mediaTransferOverlay,
+    FrameLayout.LayoutParams(
+      FrameLayout.LayoutParams.MATCH_PARENT,
+      FrameLayout.LayoutParams.MATCH_PARENT,
+    ),
+  )
+  mediaTransferOverlay.addView(
+    mediaTransferRing,
+    FrameLayout.LayoutParams(dp(44), dp(44), Gravity.CENTER),
+  )
+  mediaTransferOverlay.addView(
+    mediaTransferSize,
+    FrameLayout.LayoutParams(
+      FrameLayout.LayoutParams.WRAP_CONTENT,
+      FrameLayout.LayoutParams.WRAP_CONTENT,
+      Gravity.CENTER_HORIZONTAL or Gravity.BOTTOM,
+    ).apply {
+      bottomMargin = dp(12)
+    },
+  )
   inlineAttachment.addView(
     inlineAttachmentIcon,
     FrameLayout.LayoutParams(
@@ -849,6 +1228,13 @@ internal fun createNativeMessageRowViewHolder(context: Context): NativeRowViewHo
     tail,
     text,
     inlineAttachment,
+    mediaPreview,
+    mediaImage,
+    mediaPlayBadge,
+    mediaDurationBadge,
+    mediaTransferOverlay,
+    mediaTransferRing,
+    mediaTransferSize,
     inlineAttachmentTitle,
     inlineAttachmentSubtitle,
     voiceContainer,

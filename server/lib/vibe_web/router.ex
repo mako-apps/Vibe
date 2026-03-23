@@ -122,6 +122,7 @@ defmodule VibeWeb.Router do
     # Builder
     get "/vibeagent/session", VibeagentController, :session
     post "/vibeagent/chat", VibeagentController, :chat
+    post "/vibeagent/chat/stream", VibeagentController, :chat_stream
 
     # Stories
     post "/stories", StoryController, :create

@@ -72,6 +72,10 @@ public class ChatNativeListModule: Module {
         view.setEnginePeerUserId(value ?? "")
       }
 
+      Prop("peerDisplayName") { (view: ChatListView, value: String?) in
+        view.setEnginePeerDisplayName(value ?? "")
+      }
+
       Prop("statusAuthorityEnabled") { (view: ChatListView, enabled: Bool) in
         view.setStatusAuthorityEnabled(enabled)
       }

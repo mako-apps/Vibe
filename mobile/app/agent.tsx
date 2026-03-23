@@ -1,26 +1,36 @@
 import React, { useEffect } from 'react';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useAgentStore } from '../src/lib/agent/AgentStore';
-import VibeChatMainScreen from '../src/components/agent/VibeChatMainScreen';
+import { AgentChatScreen, VibeChatMainScreen } from '../src/components/agent';
 
 export default function AgentScreen() {
     const router = useRouter();
     const { setActiveConversation } = useAgentStore();
     const params = useLocalSearchParams<{ conversationId?: string; mode?: string }>();
+    const isBuilderMode = params.mode === 'builder';
 
     // Handle conversationId from navigation (e.g., from @vibe toast)
     useEffect(() => {
-        if (params.mode !== 'builder' && params.conversationId) {
+        if (!isBuilderMode && params.conversationId) {
             setActiveConversation(params.conversationId);
         }
-    }, [params.conversationId, params.mode, setActiveConversation]);
+    }, [isBuilderMode, params.conversationId, setActiveConversation]);
+
+    if (isBuilderMode) {
+        return (
+            <VibeChatMainScreen
+                mode="builder"
+                onBack={() => router.back()}
+                onOpenBuilder={() => router.replace('/agent?mode=builder')}
+                onOpenSettings={() => router.push('/agent-settings')}
+            />
+        );
+    }
 
     return (
-        <VibeChatMainScreen
-            mode={params.mode === 'builder' ? 'builder' : 'default'}
+        <AgentChatScreen
             onBack={() => router.back()}
-            onOpenBuilder={() => router.replace('/agent?mode=builder')}
-            onOpenSettings={() => router.push('/agent-settings')}
+            onSettings={() => router.push('/agent-settings')}
         />
     );
 }
