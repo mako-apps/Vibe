@@ -117,6 +117,13 @@ defmodule VibeWeb.Router do
     post "/agents/:id/publish", AgentsController, :publish
     post "/agents/:id/secret/rotate", AgentsController, :rotate_secret
     get "/agents/:id/deliveries", AgentsController, :deliveries
+    get "/agents/:id/integrations", AgentsController, :integrations
+    post "/agents/:id/integrations", AgentsController, :create_integration
+    put "/agents/:id/integrations/:integration_id", AgentsController, :update_integration
+    get "/agents/:id/threads", AgentsController, :threads
+    get "/agents/:id/threads/:thread_id", AgentsController, :thread
+    post "/agents/:id/approval_tasks/:task_id/approve", AgentsController, :approve_task
+    post "/agents/:id/approval_tasks/:task_id/reject", AgentsController, :reject_task
     delete "/agents/:id", AgentsController, :delete
 
     # Builder
@@ -186,6 +193,7 @@ defmodule VibeWeb.Router do
     pipe_through [:strict_rate_limited, :api]
 
     post "/agents/:identifier/invoke", AgentsController, :invoke
+    post "/agents/:identifier/events", AgentsController, :ingest_event
   end
 
   scope "/bridge/v1", VibeWeb do

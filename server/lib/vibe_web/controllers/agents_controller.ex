@@ -2,6 +2,7 @@ defmodule VibeWeb.AgentsController do
   use VibeWeb, :controller
 
   alias Vibe.Agents
+  alias Vibe.AI.AgentEventRuntime
   alias Vibe.AI.StandaloneAgent
 
   def index(conn, _params) do
@@ -131,6 +132,138 @@ defmodule VibeWeb.AgentsController do
 
       {:error, :chat_not_attached} ->
         conn |> put_status(:forbidden) |> json(%{error: "Agent not attached to target chat"})
+
+      {:error, reason} ->
+        conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
+    end
+  end
+
+  def integrations(conn, %{"id" => id}) do
+    owner_id = conn.assigns.current_user.id
+
+    case Agents.get_agent(id, owner_id) do
+      nil ->
+        conn |> put_status(:not_found) |> json(%{error: "Agent not found"})
+
+      agent ->
+        items =
+          agent
+          |> Agents.list_integrations()
+          |> Enum.map(&Agents.integration_payload/1)
+
+        json(conn, %{items: items})
+    end
+  end
+
+  def create_integration(conn, %{"id" => id} = params) do
+    owner_id = conn.assigns.current_user.id
+
+    with %{} = agent <- Agents.get_agent(id, owner_id),
+         {:ok, integration, secret} <- Agents.create_integration(agent, Map.drop(params, ["id"]), owner_id) do
+      json(conn, %{integration: Agents.integration_payload(integration, latest_secret: secret), secret: secret})
+    else
+      nil -> conn |> put_status(:not_found) |> json(%{error: "Agent not found"})
+      {:error, reason} -> conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
+    end
+  end
+
+  def update_integration(conn, %{"id" => id, "integration_id" => integration_id} = params) do
+    owner_id = conn.assigns.current_user.id
+
+    with %{} = agent <- Agents.get_agent(id, owner_id),
+         %{} = integration <- Agents.get_integration(agent, integration_id),
+         {:ok, updated} <- Agents.update_integration(integration, Map.drop(params, ["id", "integration_id"]), owner_id) do
+      json(conn, %{integration: Agents.integration_payload(updated)})
+    else
+      nil -> conn |> put_status(:not_found) |> json(%{error: "Integration not found"})
+      {:error, reason} -> conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
+    end
+  end
+
+  def threads(conn, %{"id" => id}) do
+    owner_id = conn.assigns.current_user.id
+
+    case Agents.get_agent(id, owner_id) do
+      nil ->
+        conn |> put_status(:not_found) |> json(%{error: "Agent not found"})
+
+      agent ->
+        items =
+          agent
+          |> Agents.list_threads()
+          |> Enum.map(&Agents.thread_payload/1)
+
+        json(conn, %{items: items})
+    end
+  end
+
+  def thread(conn, %{"id" => id, "thread_id" => thread_id}) do
+    owner_id = conn.assigns.current_user.id
+
+    with %{} = agent <- Agents.get_agent(id, owner_id),
+         %{} = thread <- Agents.get_thread(agent, thread_id) do
+      json(conn, %{thread: Agents.thread_payload(thread, details: true)})
+    else
+      nil -> conn |> put_status(:not_found) |> json(%{error: "Thread not found"})
+    end
+  end
+
+  def approve_task(conn, %{"id" => id, "task_id" => task_id} = params) do
+    owner_id = conn.assigns.current_user.id
+    note = params["note"]
+
+    with %{} = agent <- Agents.get_agent(id, owner_id),
+         {:ok, task} <- Agents.approve_task(agent, task_id, owner_id, note),
+         {:ok, execution} <- AgentEventRuntime.execute_approved_task(agent, task) do
+      json(conn, %{task: Agents.approval_task_payload(task), execution: execution})
+    else
+      nil -> conn |> put_status(:not_found) |> json(%{error: "Task not found"})
+      {:error, :already_decided} -> conn |> put_status(:unprocessable_entity) |> json(%{error: "Task already decided"})
+      {:error, reason} -> conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
+    end
+  end
+
+  def reject_task(conn, %{"id" => id, "task_id" => task_id} = params) do
+    owner_id = conn.assigns.current_user.id
+    note = params["note"]
+
+    with %{} = agent <- Agents.get_agent(id, owner_id),
+         {:ok, task} <- Agents.reject_task(agent, task_id, owner_id, note) do
+      json(conn, %{task: Agents.approval_task_payload(task)})
+    else
+      nil -> conn |> put_status(:not_found) |> json(%{error: "Task not found"})
+      {:error, :already_decided} -> conn |> put_status(:unprocessable_entity) |> json(%{error: "Task already decided"})
+      {:error, reason} -> conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
+    end
+  end
+
+  def ingest_event(conn, %{"identifier" => identifier} = params) do
+    secret =
+      List.first(get_req_header(conn, "x-vibe-agent-secret"))
+      || List.first(get_req_header(conn, "x-vibe-integration-secret"))
+
+    with %{} = agent <- Agents.get_invoke_target(identifier),
+         :ok <- ensure_agent_published(agent),
+         {:ok, result} <- AgentEventRuntime.ingest(agent, Map.drop(params, ["identifier"]), secret: secret) do
+      json(conn, result)
+    else
+      nil ->
+        conn |> put_status(:not_found) |> json(%{error: "Agent not found"})
+
+      {:error, :agent_unavailable} ->
+        conn |> put_status(:forbidden) |> json(%{error: "Agent unavailable"})
+
+      {:error, :invalid_secret} ->
+        conn |> put_status(:unauthorized) |> json(%{error: "Invalid secret"})
+
+      {:error, :chat_not_attached} ->
+        conn |> put_status(:forbidden) |> json(%{error: "Agent not attached to target chat"})
+
+      {:error, :missing_destination_chat} ->
+        conn |> put_status(:unprocessable_entity) |> json(%{error: "Missing destination chat"})
+
+      {:error, :missing_event_type} ->
+        conn |> put_status(:unprocessable_entity) |> json(%{error: "eventType is required"})
 
       {:error, reason} ->
         conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})

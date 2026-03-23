@@ -4,6 +4,7 @@ defmodule Vibe.Agent do
 
   @statuses ~w[draft published disabled archived]
   @output_modes ~w[text media voice]
+  @autonomy_modes ~w[draft_first safe_auto full_auto]
 
   @primary_key {:id, :binary_id, autogenerate: true}
   @foreign_key_type :binary_id
@@ -20,6 +21,13 @@ defmodule Vibe.Agent do
     field :voice_provider, :string
     field :voice_profile, :string
     field :callback_url, :string
+    field :autonomy_mode, :string, default: "safe_auto"
+    field :default_destination_chat_id, :string
+    field :event_types_enabled, {:array, :string}, default: []
+    field :cost_budget_daily, :integer
+    field :cost_budget_monthly, :integer
+    field :approval_rules, :map, default: %{}
+    field :runbook_ids, {:array, :binary_id}, default: []
     field :webhook_secret_hash, :string
     field :webhook_secret_encrypted, :string
     field :secret_hint, :string
@@ -48,6 +56,13 @@ defmodule Vibe.Agent do
       :voice_provider,
       :voice_profile,
       :callback_url,
+      :autonomy_mode,
+      :default_destination_chat_id,
+      :event_types_enabled,
+      :cost_budget_daily,
+      :cost_budget_monthly,
+      :approval_rules,
+      :runbook_ids,
       :webhook_secret_hash,
       :webhook_secret_encrypted,
       :secret_hint,
@@ -64,6 +79,7 @@ defmodule Vibe.Agent do
     ])
     |> validate_length(:display_name, min: 1, max: 80)
     |> validate_inclusion(:status, @statuses)
+    |> validate_inclusion(:autonomy_mode, @autonomy_modes)
     |> validate_change(:output_modes, fn :output_modes, modes ->
       invalid = Enum.reject(List.wrap(modes), &(&1 in @output_modes))
       if invalid == [], do: [], else: [output_modes: "contains invalid modes: #{Enum.join(invalid, ", ")}"]

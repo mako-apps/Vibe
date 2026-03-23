@@ -6,9 +6,15 @@ defmodule Vibe.Agents do
   alias Vibe.Accounts
   alias Vibe.Accounts.User
   alias Vibe.Agent
+  alias Vibe.AgentApprovalTask
   alias Vibe.AgentConversation
   alias Vibe.AgentDeliveryEvent
+  alias Vibe.AgentEvent
+  alias Vibe.AgentEventThread
+  alias Vibe.AgentIntegration
   alias Vibe.AgentInvocation
+  alias Vibe.AgentRun
+  alias Vibe.AgentRunbook
   alias Vibe.Chat.Participant
   alias Vibe.Chat.Room
   alias Vibe.Subscriptions
@@ -100,6 +106,12 @@ defmodule Vibe.Agents do
              voice_provider: string_attr(attrs, "voice_provider"),
              voice_profile: string_attr(attrs, "voice_profile") || "alloy",
              callback_url: normalize_callback_url(attrs["callback_url"] || attrs[:callback_url]),
+             autonomy_mode: normalize_autonomy_mode(attrs["autonomy_mode"] || attrs[:autonomy_mode]),
+             default_destination_chat_id: string_attr(attrs, "default_destination_chat_id"),
+             event_types_enabled: normalize_optional_string_list(attrs["event_types_enabled"] || attrs[:event_types_enabled]),
+             cost_budget_daily: integer_attr(attrs, "cost_budget_daily"),
+             cost_budget_monthly: integer_attr(attrs, "cost_budget_monthly"),
+             approval_rules: map_attr(attrs, "approval_rules", %{}),
              webhook_secret_hash: secret_tuple.hash,
              webhook_secret_encrypted: secret_tuple.encrypted,
              secret_hint: secret_tuple.hint
@@ -128,6 +140,12 @@ defmodule Vibe.Agents do
           voice_provider: map_get(attrs, "voice_provider", agent.voice_provider),
           voice_profile: map_get(attrs, "voice_profile", agent.voice_profile),
           callback_url: normalize_callback_url(Map.get(attrs, "callback_url", Map.get(attrs, :callback_url, agent.callback_url))),
+          autonomy_mode: normalize_autonomy_mode(Map.get(attrs, "autonomy_mode", Map.get(attrs, :autonomy_mode, agent.autonomy_mode))),
+          default_destination_chat_id: string_or_existing(agent.default_destination_chat_id, attrs, "default_destination_chat_id"),
+          event_types_enabled: normalize_optional_string_list(Map.get(attrs, "event_types_enabled", Map.get(attrs, :event_types_enabled, agent.event_types_enabled))),
+          cost_budget_daily: integer_or_existing(agent.cost_budget_daily, attrs, "cost_budget_daily"),
+          cost_budget_monthly: integer_or_existing(agent.cost_budget_monthly, attrs, "cost_budget_monthly"),
+          approval_rules: map_or_existing(agent.approval_rules || %{}, attrs, "approval_rules"),
           status: normalize_status_update(agent, attrs)
         })
         |> Repo.update!()
@@ -357,6 +375,196 @@ defmodule Vibe.Agents do
     |> Repo.update()
   end
 
+  def list_integrations(%Agent{} = agent) do
+    Repo.all(
+      from i in AgentIntegration,
+        where: i.agent_id == ^agent.id,
+        order_by: [asc: i.inserted_at]
+    )
+  end
+
+  def get_integration(%Agent{} = agent, integration_id) when is_binary(integration_id) do
+    Repo.one(
+      from i in AgentIntegration,
+        where: i.agent_id == ^agent.id and i.id == ^integration_id
+    )
+  end
+
+  def find_integration_by_secret(%Agent{} = agent, secret) when is_binary(secret) do
+    list_integrations(agent)
+    |> Enum.find(&secure_compare(hash_secret(secret), &1.secret_hash || ""))
+  end
+
+  def find_integration_by_secret(_agent, _secret), do: nil
+
+  def create_integration(%Agent{} = agent, attrs, owner_user_id) do
+    if agent.owner_user_id != owner_user_id do
+      {:error, :forbidden}
+    else
+      Repo.transaction(fn ->
+        {:ok, secret_tuple} = generate_secret_tuple()
+
+        integration =
+          %AgentIntegration{}
+          |> AgentIntegration.changeset(%{
+            agent_id: agent.id,
+            name: string_attr(attrs, "name") || build_default_integration_name(attrs),
+            source_type: string_attr(attrs, "source_type") || "custom",
+            default_destination_chat_id:
+              string_attr(attrs, "default_destination_chat_id") || agent.default_destination_chat_id,
+            autonomy_mode:
+              normalize_autonomy_mode(
+                Map.get(attrs, "autonomy_mode", Map.get(attrs, :autonomy_mode, agent.autonomy_mode))
+              ),
+            event_types_enabled:
+              normalize_optional_string_list(
+                Map.get(attrs, "event_types_enabled", Map.get(attrs, :event_types_enabled, []))
+              ),
+            routing_rules: map_attr(attrs, "routing_rules", %{}),
+            approval_rules: map_attr(attrs, "approval_rules", agent.approval_rules || %{}),
+            cost_budget_daily:
+              integer_attr(attrs, "cost_budget_daily") || agent.cost_budget_daily,
+            cost_budget_monthly:
+              integer_attr(attrs, "cost_budget_monthly") || agent.cost_budget_monthly,
+            enabled: boolean_attr(attrs, "enabled", true),
+            secret_hash: secret_tuple.hash,
+            secret_encrypted: secret_tuple.encrypted,
+            secret_hint: secret_tuple.hint
+          })
+          |> Repo.insert!()
+
+        sync_runbooks_for_integration!(agent, integration, attrs)
+        refresh_agent_runbook_ids!(agent.id)
+
+        {integration, secret_tuple.secret}
+      end)
+      |> case do
+        {:ok, {integration, secret}} -> {:ok, integration, secret}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
+  def update_integration(%AgentIntegration{} = integration, attrs, owner_user_id) do
+    agent = get_agent(integration.agent_id, owner_user_id)
+
+    if is_nil(agent) do
+      {:error, :forbidden}
+    else
+      Repo.transaction(fn ->
+        updated =
+          integration
+          |> AgentIntegration.changeset(%{
+            name: string_or_existing(integration.name, attrs, "name"),
+            source_type: string_or_existing(integration.source_type, attrs, "source_type"),
+            default_destination_chat_id:
+              string_or_existing(integration.default_destination_chat_id, attrs, "default_destination_chat_id"),
+            autonomy_mode:
+              normalize_autonomy_mode(
+                Map.get(attrs, "autonomy_mode", Map.get(attrs, :autonomy_mode, integration.autonomy_mode))
+              ),
+            event_types_enabled:
+              normalize_optional_string_list(
+                Map.get(attrs, "event_types_enabled", Map.get(attrs, :event_types_enabled, integration.event_types_enabled))
+              ),
+            routing_rules: map_or_existing(integration.routing_rules || %{}, attrs, "routing_rules"),
+            approval_rules: map_or_existing(integration.approval_rules || %{}, attrs, "approval_rules"),
+            cost_budget_daily: integer_or_existing(integration.cost_budget_daily, attrs, "cost_budget_daily"),
+            cost_budget_monthly: integer_or_existing(integration.cost_budget_monthly, attrs, "cost_budget_monthly"),
+            enabled: boolean_or_existing(integration.enabled, attrs, "enabled")
+          })
+          |> Repo.update!()
+
+        sync_runbooks_for_integration!(agent, updated, attrs)
+        refresh_agent_runbook_ids!(agent.id)
+
+        updated
+      end)
+      |> case do
+        {:ok, updated} -> {:ok, updated}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
+  def list_threads(%Agent{} = agent) do
+    Repo.all(
+      from t in AgentEventThread,
+        where: t.agent_id == ^agent.id,
+        order_by: [desc: t.latest_event_at, desc: t.updated_at]
+    )
+  end
+
+  def get_thread(%Agent{} = agent, thread_id) when is_binary(thread_id) do
+    Repo.one(
+      from t in AgentEventThread,
+        where: t.agent_id == ^agent.id and t.id == ^thread_id,
+        preload: [
+          events: ^from(e in AgentEvent, order_by: [asc: e.occurred_at, asc: e.inserted_at]),
+          approval_tasks:
+            ^from(a in AgentApprovalTask, order_by: [desc: a.inserted_at], preload: [:approved_by]),
+          integration: [],
+          root_message: []
+        ]
+    )
+  end
+
+  def get_approval_task(%Agent{} = agent, task_id) when is_binary(task_id) do
+    Repo.one(
+      from t in AgentApprovalTask,
+        where: t.agent_id == ^agent.id and t.id == ^task_id,
+        preload: [:event, :thread, :runbook]
+    )
+  end
+
+  def approve_task(%Agent{} = agent, task_id, owner_user_id, note \\ nil) do
+    if agent.owner_user_id != owner_user_id do
+      {:error, :forbidden}
+    else
+      case get_approval_task(agent, task_id) do
+        nil ->
+          {:error, :not_found}
+
+        %AgentApprovalTask{status: status} when status != "pending" ->
+          {:error, :already_decided}
+
+        %AgentApprovalTask{} = task ->
+          task
+          |> AgentApprovalTask.changeset(%{
+            status: "approved",
+            approved_by_user_id: owner_user_id,
+            decision_note: normalize_optional_string(note),
+            decided_at: DateTime.utc_now()
+          })
+          |> Repo.update()
+      end
+    end
+  end
+
+  def reject_task(%Agent{} = agent, task_id, owner_user_id, note \\ nil) do
+    if agent.owner_user_id != owner_user_id do
+      {:error, :forbidden}
+    else
+      case get_approval_task(agent, task_id) do
+        nil ->
+          {:error, :not_found}
+
+        %AgentApprovalTask{status: status} when status != "pending" ->
+          {:error, :already_decided}
+
+        %AgentApprovalTask{} = task ->
+          task
+          |> AgentApprovalTask.changeset(%{
+            status: "rejected",
+            approved_by_user_id: owner_user_id,
+            decision_note: normalize_optional_string(note),
+            decided_at: DateTime.utc_now()
+          })
+          |> Repo.update()
+      end
+    end
+  end
+
   def get_or_create_builder_session(user_id) do
     query =
       from c in AgentConversation,
@@ -406,13 +614,21 @@ defmodule Vibe.Agents do
       welcomeMessage: agent.welcome_message,
       enabledTools: agent.enabled_tools || [],
       outputModes: agent.output_modes || [],
+      autonomyMode: agent.autonomy_mode,
+      defaultDestinationChatId: agent.default_destination_chat_id,
+      eventTypesEnabled: agent.event_types_enabled || [],
+      costBudgetDaily: agent.cost_budget_daily,
+      costBudgetMonthly: agent.cost_budget_monthly,
+      approvalRules: agent.approval_rules || %{},
+      runbookIds: agent.runbook_ids || [],
       voiceProvider: agent.voice_provider,
       voiceProfile: agent.voice_profile,
       callbackUrl: agent.callback_url,
       secretHint: agent.secret_hint,
       publishedAt: agent.published_at,
       lastInvokedAt: agent.last_invoked_at,
-      attachedChats: attached_chats(agent)
+      attachedChats: attached_chats(agent),
+      integrations: Enum.map(list_integrations(agent), &integration_payload/1)
     }
 
     if quota, do: Map.put(payload, :quota, quota), else: payload
@@ -469,6 +685,126 @@ defmodule Vibe.Agents do
       [] -> @default_output_modes
       modes -> modes
     end
+  end
+
+  def normalize_autonomy_mode(value) do
+    case normalize_optional_string(value) do
+      "draft_first" -> "draft_first"
+      "full_auto" -> "full_auto"
+      _ -> "safe_auto"
+    end
+  end
+
+  def integration_payload(%AgentIntegration{} = integration, opts \\ []) do
+    latest_secret = Keyword.get(opts, :latest_secret)
+
+    %{
+      id: integration.id,
+      agentId: integration.agent_id,
+      name: integration.name,
+      sourceType: integration.source_type,
+      defaultDestinationChatId: integration.default_destination_chat_id,
+      autonomyMode: integration.autonomy_mode,
+      eventTypesEnabled: integration.event_types_enabled || [],
+      routingRules: integration.routing_rules || %{},
+      approvalRules: integration.approval_rules || %{},
+      costBudgetDaily: integration.cost_budget_daily,
+      costBudgetMonthly: integration.cost_budget_monthly,
+      enabled: integration.enabled,
+      secretHint: integration.secret_hint,
+      latestSecret: latest_secret,
+      lastEventAt: integration.last_event_at,
+      runbooks: list_runbooks_for_integration(integration)
+    }
+  end
+
+  def thread_payload(%AgentEventThread{} = thread, opts \\ []) do
+    include_details = Keyword.get(opts, :details, false)
+
+    base = %{
+      id: thread.id,
+      agentId: thread.agent_id,
+      integrationId: thread.integration_id,
+      chatId: thread.chat_id,
+      source: thread.source,
+      threadKey: thread.thread_key,
+      title: thread.title,
+      summary: thread.summary,
+      currentState: thread.current_state || %{},
+      priority: thread.priority,
+      status: thread.status,
+      lastDecision: thread.last_decision,
+      latestEventAt: thread.latest_event_at,
+      rootMessageId: thread.root_message_id
+    }
+
+    if include_details do
+      Map.merge(base, %{
+        events:
+          Enum.map(thread.events || [], fn event ->
+            %{
+              id: event.id,
+              eventId: event.event_id,
+              eventType: event.event_type,
+              source: event.source,
+              title: event.title,
+              text: event.text,
+              attachments: normalize_attachments_payload(event.attachments),
+              payload: event.payload || %{},
+              occurredAt: event.occurred_at,
+              status: event.status,
+              decision: event.decision,
+              decisionReason: event.decision_reason,
+              messageId: event.message_id
+            }
+          end),
+        approvalTasks: Enum.map(thread.approval_tasks || [], &approval_task_payload/1)
+      })
+    else
+      base
+    end
+  end
+
+  def approval_task_payload(%AgentApprovalTask{} = task) do
+    %{
+      id: task.id,
+      agentId: task.agent_id,
+      threadId: task.thread_id,
+      eventId: task.event_id,
+      runbookId: task.runbook_id,
+      chatId: task.chat_id,
+      requestedAction: task.requested_action || %{},
+      rationale: task.rationale,
+      status: task.status,
+      decisionNote: task.decision_note,
+      decidedAt: task.decided_at,
+      approvedByUserId: task.approved_by_user_id
+    }
+  end
+
+  def run_payload(%AgentRun{} = run) do
+    %{
+      id: run.id,
+      agentId: run.agent_id,
+      integrationId: run.integration_id,
+      threadId: run.thread_id,
+      eventId: run.event_id,
+      runbookId: run.runbook_id,
+      trigger: run.trigger,
+      mode: run.mode,
+      model: run.model,
+      promptVersion: run.prompt_version,
+      decision: run.decision,
+      auditSummary: run.audit_summary,
+      toolCalls: run.tool_calls || %{},
+      result: run.result || %{},
+      status: run.status,
+      error: run.error,
+      costUsd: run.cost_usd,
+      promptTokens: run.prompt_tokens,
+      completionTokens: run.completion_tokens,
+      insertedAt: run.inserted_at
+    }
   end
 
   defp ensure_quota(owner_user_id) do
@@ -671,14 +1007,26 @@ defmodule Vibe.Agents do
   end
 
   defp map_get(map, key, fallback) do
-    cond do
-      Map.has_key?(map, key) -> Map.get(map, key)
-      is_binary(key) and Map.has_key?(map, String.to_existing_atom(key)) -> Map.get(map, String.to_existing_atom(key))
-      true -> fallback
-    end
-  rescue
-    ArgumentError ->
-      fallback
+    key
+    |> key_variants()
+    |> Enum.find_value(fallback, fn variant ->
+      cond do
+        Map.has_key?(map, variant) ->
+          Map.get(map, variant)
+
+        is_binary(variant) ->
+          case safe_existing_atom(variant) do
+            nil ->
+              nil
+
+            atom_key ->
+              if Map.has_key?(map, atom_key), do: Map.get(map, atom_key), else: nil
+          end
+
+        true ->
+          nil
+      end
+    end)
   end
 
   defp string_attr(map, key) do
@@ -691,6 +1039,213 @@ defmodule Vibe.Agents do
         nil
     end
   end
+
+  defp integer_attr(map, key) do
+    case map_get(map, key, nil) do
+      value when is_integer(value) -> value
+      value when is_binary(value) ->
+        case Integer.parse(String.trim(value)) do
+          {parsed, _} -> parsed
+          :error -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp boolean_attr(map, key, fallback \\ nil) do
+    case map_get(map, key, fallback) do
+      value when value in [true, false] -> value
+      value when value in ["true", "1", 1] -> true
+      value when value in ["false", "0", 0] -> false
+      _ -> fallback
+    end
+  end
+
+  defp map_attr(map, key, fallback) do
+    case map_get(map, key, fallback) do
+      value when is_map(value) -> value
+      _ -> fallback
+    end
+  end
+
+  defp integer_or_existing(existing, attrs, key) do
+    if map_has_key?(attrs, key), do: integer_attr(attrs, key), else: existing
+  end
+
+  defp string_or_existing(existing, attrs, key) do
+    if map_has_key?(attrs, key), do: string_attr(attrs, key), else: existing
+  end
+
+  defp boolean_or_existing(existing, attrs, key) do
+    if map_has_key?(attrs, key), do: boolean_attr(attrs, key, existing), else: existing
+  end
+
+  defp map_or_existing(existing, attrs, key) do
+    if map_has_key?(attrs, key), do: map_attr(attrs, key, existing), else: existing
+  end
+
+  defp normalize_optional_string(value) when is_binary(value) do
+    trimmed = String.trim(value)
+    if trimmed == "", do: nil, else: trimmed
+  end
+
+  defp normalize_optional_string(value) when is_atom(value), do: value |> Atom.to_string() |> normalize_optional_string()
+  defp normalize_optional_string(_), do: nil
+
+  defp normalize_optional_string_list(values) do
+    values
+    |> List.wrap()
+    |> Enum.map(&normalize_optional_string/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+  end
+
+  defp build_default_integration_name(attrs) do
+    string_attr(attrs, "source_type")
+    |> case do
+      nil -> "Custom Integration"
+      source -> source |> String.replace("_", " ") |> String.capitalize()
+    end
+  end
+
+  defp list_runbooks_for_integration(%AgentIntegration{} = integration) do
+    Repo.all(
+      from r in AgentRunbook,
+        where: r.integration_id == ^integration.id,
+        order_by: [asc: r.inserted_at]
+    )
+    |> Enum.map(fn runbook ->
+      %{
+        id: runbook.id,
+        name: runbook.name,
+        eventTypesEnabled: runbook.event_types_enabled || [],
+        riskLevel: runbook.risk_level,
+        actionType: runbook.action_type,
+        instructions: runbook.instructions,
+        conditions: runbook.conditions || %{},
+        actionConfig: runbook.action_config || %{},
+        enabled: runbook.enabled
+      }
+    end)
+  end
+
+  defp sync_runbooks_for_integration!(%Agent{} = agent, %AgentIntegration{} = integration, attrs) do
+    raw_runbooks = Map.get(attrs, "runbooks", Map.get(attrs, :runbooks))
+
+    if is_list(raw_runbooks) do
+      existing =
+        Repo.all(from r in AgentRunbook, where: r.integration_id == ^integration.id)
+        |> Map.new(fn runbook -> {runbook.id, runbook} end)
+
+      kept_ids =
+        Enum.map(raw_runbooks, fn raw ->
+          existing_runbook =
+            case Map.get(raw, "id") || Map.get(raw, :id) do
+              nil -> %AgentRunbook{}
+              runbook_id -> Map.get(existing, runbook_id, %AgentRunbook{})
+            end
+
+          runbook =
+            existing_runbook
+            |> AgentRunbook.changeset(%{
+              agent_id: agent.id,
+              integration_id: integration.id,
+              name: string_attr(raw, "name") || "Runbook",
+              event_types_enabled:
+                normalize_optional_string_list(
+                  Map.get(raw, "event_types_enabled", Map.get(raw, :event_types_enabled, []))
+                ),
+              risk_level:
+                normalize_optional_string(Map.get(raw, "risk_level", Map.get(raw, :risk_level))) || "low",
+              action_type:
+                string_attr(raw, "action_type")
+                || string_attr(raw, "actionType")
+                || "post_message",
+              instructions:
+                string_attr(raw, "instructions")
+                || string_attr(raw, "message")
+                || string_attr(raw, "text"),
+              conditions: map_attr(raw, "conditions", %{}),
+              action_config:
+                map_attr(raw, "action_config", %{})
+                |> maybe_put("message", string_attr(raw, "message"))
+                |> maybe_put("title", string_attr(raw, "title")),
+              enabled: boolean_attr(raw, "enabled", true)
+            })
+            |> Repo.insert_or_update!()
+
+          runbook.id
+        end)
+
+      existing
+      |> Map.keys()
+      |> Enum.reject(&(&1 in kept_ids))
+      |> Enum.each(fn stale_id ->
+        from(r in AgentRunbook, where: r.id == ^stale_id) |> Repo.delete_all()
+      end)
+    end
+  end
+
+  defp refresh_agent_runbook_ids!(agent_id) do
+    runbook_ids =
+      Repo.all(
+        from r in AgentRunbook,
+          where: r.agent_id == ^agent_id,
+          select: r.id
+      )
+
+    from(a in Agent, where: a.id == ^agent_id)
+    |> Repo.update_all(set: [runbook_ids: runbook_ids])
+  end
+
+  defp map_has_key?(map, key) when is_map(map) do
+    key
+    |> key_variants()
+    |> Enum.any?(fn variant ->
+      Map.has_key?(map, variant) ||
+        case variant do
+          value when is_binary(value) ->
+            case safe_existing_atom(value) do
+              nil -> false
+              atom_key -> Map.has_key?(map, atom_key)
+            end
+
+          _ ->
+            false
+        end
+    end)
+  end
+
+  defp key_variants(key) when is_binary(key) do
+    camel = camelize_lower(key)
+
+    [key, camel]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+  end
+
+  defp key_variants(key), do: [key]
+
+  defp camelize_lower(value) when is_binary(value) do
+    camelized = Macro.camelize(value)
+
+    case camelized do
+      "" -> nil
+      <<first::utf8, rest::binary>> -> String.downcase(<<first::utf8>>) <> rest
+    end
+  end
+
+  defp safe_existing_atom(value) when is_binary(value) do
+    String.to_existing_atom(value)
+  rescue
+    ArgumentError -> nil
+  end
+
+  defp normalize_attachments_payload(%{"items" => items}) when is_list(items), do: items
+  defp normalize_attachments_payload(%{items: items}) when is_list(items), do: items
+  defp normalize_attachments_payload(_), do: []
 
   defp normalize_callback_url(nil), do: nil
 

@@ -23,6 +23,13 @@ export interface VibeStandaloneAgent {
     welcomeMessage?: string | null;
     enabledTools?: string[];
     outputModes?: string[];
+    autonomyMode?: string | null;
+    defaultDestinationChatId?: string | null;
+    eventTypesEnabled?: string[];
+    costBudgetDaily?: number | null;
+    costBudgetMonthly?: number | null;
+    approvalRules?: Record<string, unknown> | null;
+    runbookIds?: string[];
     voiceProvider?: string | null;
     voiceProfile?: string | null;
     callbackUrl?: string | null;
@@ -30,6 +37,7 @@ export interface VibeStandaloneAgent {
     publishedAt?: string | null;
     lastInvokedAt?: string | null;
     attachedChats?: Array<Record<string, unknown>>;
+    integrations?: Array<Record<string, unknown>>;
 }
 
 interface VibeAgentQuota {

@@ -749,7 +749,8 @@ defmodule Vibe.AI.AgentBuilder do
     - Before answering setup or integration questions, call get_builder_context or get_integration_details.
     - When the user describes how the agent should behave, create or update the agent and generate a polished production system prompt.
     - When the user asks about prompt quality, explain that you can read, edit, or generate the prompt and then act with tools.
-    - When the user asks how to integrate from code, give exact values from tools: agent_id, user_id, @username, invoke URL, X-Vibe-Agent-Secret usage, responseMode guidance, vibeChatId values, callback headers, and signature format.
+    - When the user asks how to integrate from code, give exact values from tools: agent_id, user_id, @username, invoke URL, events URL, X-Vibe-Agent-Secret usage, responseMode guidance, vibeChatId values, callback headers, and signature format.
+    - When the user asks for the Vibe chat link or chat id, prefer attached_chat_ids, attached_chat_links, and default_destination_chat. Do not present a friendId DM link as if it were an attached chatId.
     - Do not tell the user to use slash commands unless they explicitly ask for slash syntax. Focus on doing the work and explaining outcomes.
     - If the current secret is not available anymore, tell the user to rotate it.
     - Keep replies concise, practical, and step-by-step when integration is involved.
@@ -881,11 +882,14 @@ defmodule Vibe.AI.AgentBuilder do
 
   defp builder_agent_context(agent, latest_secret) do
     payload = Agents.agent_payload(agent)
+    attached_chat_links = build_attached_chat_links(payload.attachedChats || [])
+    default_chat = resolve_default_chat(payload.defaultDestinationChatId, attached_chat_links)
 
     %{
       "agent" => payload,
       "prompt_status" => prompt_status_line(agent),
-      "open_link" => "vibe://chat?friendId=#{payload.userId}",
+      "open_link" => default_chat && default_chat["open_link"],
+      "agent_dm_link" => build_agent_dm_link(payload.userId),
       "builder_link" => @builder_deep_link,
       "integration" => integration_payload(agent, latest_secret)
     }
@@ -893,6 +897,8 @@ defmodule Vibe.AI.AgentBuilder do
 
   defp integration_payload(agent, latest_secret) do
     payload = Agents.agent_payload(agent)
+    attached_chat_links = build_attached_chat_links(payload.attachedChats || [])
+    default_chat = resolve_default_chat(payload.defaultDestinationChatId, attached_chat_links)
 
     %{
       "agent_id" => payload.id,
@@ -900,9 +906,11 @@ defmodule Vibe.AI.AgentBuilder do
       "username" => payload.username,
       "display_name" => payload.displayName,
       "status" => payload.status,
-      "open_link" => "vibe://chat?friendId=#{payload.userId}",
+      "open_link" => default_chat && default_chat["open_link"],
+      "agent_dm_link" => build_agent_dm_link(payload.userId),
       "builder_link" => @builder_deep_link,
       "invoke_url" => build_invoke_url(agent),
+      "events_url" => build_events_url(agent),
       "secret_hint" => payload.secretHint,
       "latest_secret" => latest_secret,
       "secret_note" =>
@@ -919,10 +927,27 @@ defmodule Vibe.AI.AgentBuilder do
           "vibeChatId" => "<attached_chat_id>",
           "message" => "Hello",
           "responseMode" => "send"
+        },
+        "event" => %{
+          "eventId" => "evt_123",
+          "eventType" => "order.created",
+          "threadKey" => "order_123",
+          "source" => "shopify",
+          "destinationChatId" => "<attached_chat_id>",
+          "title" => "New order paid",
+          "text" => "Sara paid $240 for 3 items",
+          "data" => %{
+            "orderId" => "123",
+            "amount" => 240,
+            "currency" => "USD",
+            "status" => "paid"
+          }
         }
       },
+      "default_destination_chat" => default_chat,
       "attached_chats" => payload.attachedChats || [],
-      "attached_chat_ids" => Enum.map(payload.attachedChats || [], &extract_chat_id/1),
+      "attached_chat_ids" => Enum.map(attached_chat_links, & &1["chat_id"]),
+      "attached_chat_links" => attached_chat_links,
       "callback_url" => payload.callbackUrl,
       "callback_headers" => [
         "X-Vibe-Agent-Signature-Timestamp",
@@ -932,6 +957,8 @@ defmodule Vibe.AI.AgentBuilder do
       "notes" => [
         "Use responseMode=reply for stateless replies returned directly to your backend.",
         "Use responseMode=send only when the agent is already attached to the target Vibe chat.",
+        "Use the events_url when you want structured event threads like orders, trades, tickets, and alerts inside Vibe chats.",
+        "Use attached_chat_links and attached_chat_ids for real Vibe destinations. The agent_dm_link only opens a DM and is not the same as an attached chatId.",
         "To get a vibeChatId, DM the agent or invite it into a group/channel first."
       ]
     }
@@ -943,9 +970,68 @@ defmodule Vibe.AI.AgentBuilder do
 
   defp extract_chat_id(_chat), do: nil
 
+  defp build_attached_chat_links(chats) do
+    chats
+    |> Enum.map(fn chat ->
+      chat_id = extract_chat_id(chat)
+
+      if is_binary(chat_id) do
+        %{
+          "chat_id" => chat_id,
+          "name" => chat[:name] || chat["name"],
+          "type" => chat[:type] || chat["type"],
+          "open_link" => build_chat_link(chat_id)
+        }
+      end
+    end)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp resolve_default_chat(default_chat_id, attached_chat_links) do
+    desired_id = normalize_optional_string(default_chat_id)
+
+    cond do
+      is_binary(desired_id) ->
+        Enum.find(attached_chat_links, fn chat -> chat["chat_id"] == desired_id end) ||
+          %{
+            "chat_id" => desired_id,
+            "open_link" => build_chat_link(desired_id)
+          }
+
+      attached_chat_links != [] ->
+        List.first(attached_chat_links)
+
+      true ->
+        nil
+    end
+  end
+
+  defp build_chat_link(chat_id) when is_binary(chat_id) do
+    "vibe://chat?chatId=#{chat_id}"
+  end
+
+  defp build_chat_link(_chat_id), do: nil
+
+  defp build_agent_dm_link(user_id) when is_binary(user_id) do
+    "vibe://chat?friendId=#{user_id}"
+  end
+
+  defp build_agent_dm_link(_user_id), do: nil
+
   defp build_invoke_url(agent) do
     base = public_base_url()
     path = "/api/agents/#{agent.id}/invoke"
+
+    if base == "" do
+      path
+    else
+      String.trim_trailing(base, "/") <> path
+    end
+  end
+
+  defp build_events_url(agent) do
+    base = public_base_url()
+    path = "/api/agents/#{agent.id}/events"
 
     if base == "" do
       path
