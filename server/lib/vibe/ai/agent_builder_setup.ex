@@ -46,6 +46,37 @@ defmodule Vibe.AI.AgentBuilderSetup do
     username
     welcome_message
   ]
+  @identity_question_fields ~w[
+    display_name
+    username
+    persona
+    tone
+    language
+    welcome_message
+    system_prompt
+  ]
+  @question_priority %{
+    "business_summary" => 120,
+    "primary_jobs" => 115,
+    "enabled_tools" => 110,
+    "suggested_integrations" => 105,
+    "do_list" => 100,
+    "success_criteria" => 96,
+    "audience" => 92,
+    "blocked_actions" => 90,
+    "escalation_policy" => 88,
+    "autonomy_mode" => 84,
+    "default_destination_chat_id" => 80,
+    "output_modes" => 74,
+    "business_type" => 70,
+    "display_name" => 22,
+    "username" => 18,
+    "persona" => 14,
+    "tone" => 10,
+    "language" => 8,
+    "welcome_message" => 6,
+    "system_prompt" => 4
+  }
   @status_values ~w[idle discovering clarifying assembling review_ready draft_created]
   @legacy_keywords [
     "invoke",
@@ -236,9 +267,7 @@ defmodule Vibe.AI.AgentBuilderSetup do
               callback
             )
 
-          reply =
-            normalize_optional_string(clarifier_result["assistantReply"]) ||
-              "I have the direction. I just need a couple of details before I finish the draft."
+          reply = nil
 
           next_spec = put_string_path(spec, ["status"], "clarifying")
           setup_state = build_setup_state(next_spec, "clarifying")
@@ -1025,18 +1054,33 @@ defmodule Vibe.AI.AgentBuilderSetup do
            """
            You are Clarifier for Vibe's guided agent builder.
            Inspect the setup spec and decide whether the user must answer more questions before a publish-ready draft can be reviewed.
-           Only ask when the missing information materially affects the agent's behavior, tools, or safety.
+           Only ask when the missing information materially affects the agent's real behavior, required data, tool selection, integrations, destination, or safety.
+           Treat branding and polish fields such as display name, username, persona, tone, language, welcome copy, and prompt wording as non-blocking unless the user explicitly asked for them.
+           Prioritize high-information operational questions in this order:
+           1. What the agent must actually do.
+           2. What business data, pricing, catalog, documents, orders, trades, or integrations it needs.
+           3. What actions it may take automatically versus what needs approval or handoff.
+           4. Who it serves and where outputs should land when that changes runtime behavior.
+           Avoid subjective questions like tone unless they are clearly necessary.
            Ask for at most 3 fields.
            """,
            Jason.encode!(spec),
            schema
          ) do
       {:ok, result} ->
+        missing_fields = material_missing_fields(spec, result["missingCriticalFields"])
+        question_goals =
+          prioritize_question_goals(
+            spec,
+            result["questionGoals"],
+            missing_fields
+          )
+
         %{
-          "shouldAskUser" => result["shouldAskUser"] == true,
-          "missingCriticalFields" => normalize_string_list(result["missingCriticalFields"]),
+          "shouldAskUser" => result["shouldAskUser"] == true and question_goals != [],
+          "missingCriticalFields" => missing_fields,
           "assistantReply" => normalize_optional_string(result["assistantReply"]),
-          "questionGoals" => normalize_question_goals(result["questionGoals"])
+          "questionGoals" => question_goals
         }
 
       {:error, reason} ->
@@ -1101,6 +1145,10 @@ defmodule Vibe.AI.AgentBuilderSetup do
         Use only supported field keys from allowed_field_keys.
         Keep it to at most 3 fields.
         Prefer selects over text when practical.
+        Make the sheet feel operational and concrete.
+        Use labels that ask for business-critical inputs such as required tasks, business data, source documents, pricing context, integrations, approvals, and destination chats.
+        Do not ask about tone, persona, naming, or other polish unless the field is explicitly present in question_goals.
+        The sheet is the primary UI for this turn, so keep the description brief and avoid repeating a long assistant message.
         For chat selection use type=chat_picker.
         """,
         Jason.encode!(payload),
@@ -1240,6 +1288,7 @@ defmodule Vibe.AI.AgentBuilderSetup do
            You are Validator for Vibe's guided agent builder.
            Review the assembled spec and decide whether it is ready for the user to create a draft.
            Focus on missing behavior, unclear capabilities, unsafe autonomy, and weak test coverage.
+           Do not block readiness on optional identity polish such as name, persona, tone, language, welcome copy, or prompt wording unless the user explicitly requested those details.
            """,
            Jason.encode!(spec),
            schema
@@ -1890,25 +1939,57 @@ defmodule Vibe.AI.AgentBuilderSetup do
   end
 
   defp fallback_clarifier(spec) do
-    missing =
+    summary =
+      [
+        get_in_string(spec, ["intent", "rawRequest"]),
+        get_in_string(spec, ["intent", "businessSummary"]),
+        Enum.join(get_in_string(spec, ["intent", "primaryJobs"]) || [], " "),
+        Enum.join(get_in_string(spec, ["capabilities", "suggestedIntegrations"]) || [], " ")
+      ]
+      |> Enum.reject(&blank?/1)
+      |> Enum.join(" ")
+      |> String.downcase()
+
+    missing_candidates =
       []
       |> maybe_append_missing(get_in_string(spec, ["intent", "primaryJobs"]) in [nil, []], "primary_jobs")
       |> maybe_append_missing(blank?(get_in_string(spec, ["intent", "businessSummary"])), "business_summary")
-      |> maybe_append_missing(blank?(get_in_string(spec, ["capabilities", "defaultDestinationChatId"])), "default_destination_chat_id")
+      |> maybe_append_missing(
+        suggested_integrations_missing?(spec, summary),
+        "suggested_integrations"
+      )
+      |> maybe_append_missing(
+        enabled_tools_missing?(spec, summary),
+        "enabled_tools"
+      )
+      |> maybe_append_missing(
+        blocked_actions_missing?(spec, summary),
+        "blocked_actions"
+      )
+      |> maybe_append_missing(
+        requires_destination_chat?(spec),
+        "default_destination_chat_id"
+      )
+
+    missing = material_missing_fields(spec, missing_candidates)
+
+    question_goals =
+      missing
+      |> Enum.map(fn field ->
+        %{
+          "fieldKey" => field,
+          "label" => humanize_field_key(field),
+          "reason" => "Needed to finish the draft",
+          "preferredType" => preferred_field_type(field)
+        }
+      end)
+      |> prioritize_question_goals(spec, missing)
 
     %{
       "shouldAskUser" => missing != [],
       "missingCriticalFields" => missing,
       "assistantReply" => nil,
-      "questionGoals" =>
-        Enum.map(Enum.take(missing, 3), fn field ->
-          %{
-            "fieldKey" => field,
-            "label" => humanize_field_key(field),
-            "reason" => "Needed to finish the draft",
-            "preferredType" => preferred_field_type(field)
-          }
-        end)
+      "questionGoals" => question_goals
     }
   end
 
@@ -1983,6 +2064,68 @@ defmodule Vibe.AI.AgentBuilderSetup do
       "chips",
       true,
       get_in_string(spec, ["intent", "audience"])
+    )
+  end
+
+  defp build_fallback_field("enabled_tools", spec) do
+    multi_select_field(
+      "enabled_tools",
+      "What should this agent be able to do?",
+      true,
+      Enum.map(ToolRegistry.tools(), fn tool ->
+        %{"id" => tool.id, "label" => tool.name, "hint" => tool.description}
+      end),
+      "chips",
+      true,
+      get_in_string(spec, ["capabilities", "enabledTools"])
+    )
+  end
+
+  defp build_fallback_field("suggested_integrations", spec) do
+    multi_select_field(
+      "suggested_integrations",
+      "What business data should it use?",
+      false,
+      generic_integration_options(get_in_string(spec, ["capabilities", "suggestedIntegrations"])),
+      "chips",
+      true,
+      get_in_string(spec, ["capabilities", "suggestedIntegrations"])
+    )
+  end
+
+  defp build_fallback_field("blocked_actions", spec) do
+    long_text_field(
+      "blocked_actions",
+      "What must always need approval?",
+      false,
+      get_in_string(spec, ["autonomy", "blockedActions"])
+    )
+  end
+
+  defp build_fallback_field("success_criteria", spec) do
+    long_text_field(
+      "success_criteria",
+      "What should success look like?",
+      false,
+      get_in_string(spec, ["intent", "successCriteria"])
+    )
+  end
+
+  defp build_fallback_field("do_list", spec) do
+    long_text_field(
+      "do_list",
+      "What should the agent definitely handle?",
+      false,
+      get_in_string(spec, ["behavior", "doList"])
+    )
+  end
+
+  defp build_fallback_field("escalation_policy", spec) do
+    long_text_field(
+      "escalation_policy",
+      "When should it hand off to a person?",
+      false,
+      get_in_string(spec, ["behavior", "escalationPolicy"])
     )
   end
 
@@ -2412,6 +2555,220 @@ defmodule Vibe.AI.AgentBuilderSetup do
     end)
     |> Enum.reject(&is_nil/1)
     |> Enum.take(3)
+  end
+
+  defp prioritize_question_goals(spec, goals, missing_fields) do
+    allowed_missing = MapSet.new(material_missing_fields(spec, missing_fields))
+    allow_identity_questions = explicit_identity_request?(spec)
+
+    goals
+    |> normalize_question_goals()
+    |> Enum.concat(
+      Enum.map(material_missing_fields(spec, missing_fields), fn field ->
+        %{
+          "fieldKey" => field,
+          "label" => humanize_field_key(field),
+          "reason" => "Needed to finish the draft",
+          "preferredType" => preferred_field_type(field)
+        }
+      end)
+    )
+    |> Enum.uniq_by(& &1["fieldKey"])
+    |> Enum.filter(fn goal ->
+      field_key = goal["fieldKey"]
+
+      MapSet.member?(allowed_missing, field_key) or
+        question_goal_allowed?(field_key, spec, allow_identity_questions)
+    end)
+    |> Enum.sort_by(fn goal ->
+      question_priority(goal["fieldKey"], spec, allow_identity_questions)
+    end, :desc)
+    |> Enum.take(3)
+  end
+
+  defp material_missing_fields(spec, fields) do
+    allow_identity_questions = explicit_identity_request?(spec)
+
+    fields
+    |> normalize_string_list()
+    |> Enum.filter(&question_goal_allowed?(&1, spec, allow_identity_questions))
+  end
+
+  defp question_goal_allowed?(field_key, _spec, true) when field_key in @identity_question_fields,
+    do: true
+
+  defp question_goal_allowed?(field_key, _spec, false) when field_key in @identity_question_fields,
+    do: false
+
+  defp question_goal_allowed?("default_destination_chat_id", spec, _allow_identity_questions),
+    do: requires_destination_chat?(spec)
+
+  defp question_goal_allowed?(field_key, _spec, _allow_identity_questions) when is_binary(field_key),
+    do: field_key in @field_keys
+
+  defp question_goal_allowed?(_field_key, _spec, _allow_identity_questions), do: false
+
+  defp question_priority(field_key, spec, allow_identity_questions) do
+    base = Map.get(@question_priority, field_key, 50)
+
+    cond do
+      field_key == "default_destination_chat_id" and requires_destination_chat?(spec) -> base + 12
+      field_key == "suggested_integrations" and integration_context?(spec) -> base + 10
+      field_key == "enabled_tools" and tooling_context?(spec) -> base + 10
+      field_key in @identity_question_fields and allow_identity_questions -> base + 40
+      true -> base
+    end
+  end
+
+  defp explicit_identity_request?(spec) do
+    context =
+      [
+        get_in_string(spec, ["intent", "rawRequest"]),
+        get_in_string(spec, ["intent", "businessSummary"])
+      ]
+      |> Enum.reject(&blank?/1)
+      |> Enum.join(" ")
+      |> String.downcase()
+
+    Enum.any?(
+      [
+        "tone",
+        "brand voice",
+        "persona",
+        "name this agent",
+        "agent name",
+        "username",
+        "welcome message"
+      ],
+      &String.contains?(context, &1)
+    )
+  end
+
+  defp requires_destination_chat?(spec) do
+    missing_destination = blank?(get_in_string(spec, ["capabilities", "defaultDestinationChatId"]))
+
+    missing_destination and
+      (integration_context?(spec) or
+         Enum.any?(get_in_string(spec, ["intent", "primaryJobs"]) || [], fn job ->
+           String.contains?(String.downcase(to_string(job)), "update")
+         end))
+  end
+
+  defp integration_context?(spec) do
+    haystack =
+      [
+        get_in_string(spec, ["intent", "rawRequest"]),
+        get_in_string(spec, ["intent", "businessSummary"]),
+        Enum.join(get_in_string(spec, ["intent", "primaryJobs"]) || [], " "),
+        Enum.join(get_in_string(spec, ["capabilities", "suggestedIntegrations"]) || [], " ")
+      ]
+      |> Enum.reject(&blank?/1)
+      |> Enum.join(" ")
+      |> String.downcase()
+
+    Enum.any?(
+      [
+        "order",
+        "trade",
+        "ticket",
+        "shipment",
+        "alert",
+        "event",
+        "webhook",
+        "integration",
+        "notification",
+        "update"
+      ],
+      &String.contains?(haystack, &1)
+    )
+  end
+
+  defp tooling_context?(spec) do
+    haystack =
+      [
+        get_in_string(spec, ["intent", "rawRequest"]),
+        get_in_string(spec, ["intent", "businessSummary"]),
+        Enum.join(get_in_string(spec, ["intent", "primaryJobs"]) || [], " "),
+        Enum.join(get_in_string(spec, ["intent", "successCriteria"]) || [], " ")
+      ]
+      |> Enum.reject(&blank?/1)
+      |> Enum.join(" ")
+      |> String.downcase()
+
+    Enum.any?(
+      [
+        "tool",
+        "document",
+        "doc",
+        "pdf",
+        "pricing",
+        "price",
+        "catalog",
+        "inventory",
+        "analysis",
+        "analyze",
+        "event",
+        "crm",
+        "order",
+        "trade"
+      ],
+      &String.contains?(haystack, &1)
+    )
+  end
+
+  defp suggested_integrations_missing?(spec, summary) do
+    (get_in_string(spec, ["capabilities", "suggestedIntegrations"]) || []) == [] and
+      Enum.any?(
+        [
+          "order",
+          "trade",
+          "ticket",
+          "shipment",
+          "alert",
+          "document",
+          "pricing",
+          "catalog",
+          "inventory",
+          "crm"
+        ],
+        &String.contains?(summary, &1)
+      )
+  end
+
+  defp enabled_tools_missing?(spec, summary) do
+    (get_in_string(spec, ["capabilities", "enabledTools"]) || []) == [] and
+      Enum.any?(
+        [
+          "create",
+          "document",
+          "analysis",
+          "analyze",
+          "summarize",
+          "image",
+          "voice",
+          "event",
+          "order",
+          "trade"
+        ],
+        &String.contains?(summary, &1)
+      )
+  end
+
+  defp blocked_actions_missing?(spec, summary) do
+    (get_in_string(spec, ["autonomy", "blockedActions"]) || []) == [] and
+      Enum.any?(
+        [
+          "refund",
+          "cancel",
+          "purchase",
+          "approve",
+          "message customers",
+          "send messages",
+          "trade",
+          "order"
+        ],
+        &String.contains?(summary, &1)
+      )
   end
 
   defp preferred_field_type("default_destination_chat_id"), do: "chat_picker"
