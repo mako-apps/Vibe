@@ -2278,11 +2278,7 @@ defmodule Vibe.AI.AgentBuilderSetup do
         nil
 
       true ->
-        type =
-          case normalize_optional_string(normalized["type"]) do
-            value when value in ["single_select", "multi_select", "text", "long_text", "chat_picker"] -> value
-            _ -> preferred_field_type(key)
-          end
+        type = normalize_ui_field_type(key, normalized["type"], normalized["options"])
 
         field_payload = %{
           "key" => key,
@@ -2420,6 +2416,7 @@ defmodule Vibe.AI.AgentBuilderSetup do
 
   defp preferred_field_type("default_destination_chat_id"), do: "chat_picker"
   defp preferred_field_type("business_summary"), do: "long_text"
+  defp preferred_field_type("business_type"), do: "single_select"
   defp preferred_field_type("system_prompt"), do: "long_text"
   defp preferred_field_type("welcome_message"), do: "long_text"
   defp preferred_field_type("blocked_actions"), do: "long_text"
@@ -2627,15 +2624,36 @@ defmodule Vibe.AI.AgentBuilderSetup do
   defp normalize_confidence(value) when is_integer(value), do: normalize_confidence(value / 100)
   defp normalize_confidence(_value), do: 0.0
 
+  defp normalize_optional_string(nil), do: nil
+
   defp normalize_optional_string(value) when is_binary(value) do
     case String.trim(value) do
       "" -> nil
+      "nil" -> nil
+      "null" -> nil
       trimmed -> trimmed
     end
   end
 
   defp normalize_optional_string(value) when is_atom(value), do: value |> Atom.to_string() |> normalize_optional_string()
   defp normalize_optional_string(_value), do: nil
+
+  defp normalize_ui_field_type(key, raw_type, options) do
+    preferred = preferred_field_type(key)
+    raw_type = normalize_optional_string(raw_type)
+    has_options = List.wrap(options) != []
+
+    cond do
+      has_options and preferred in ["single_select", "multi_select"] ->
+        preferred
+
+      raw_type in ["single_select", "multi_select", "text", "long_text", "chat_picker"] ->
+        raw_type
+
+      true ->
+        preferred
+    end
+  end
 
   defp blank?(value), do: is_nil(normalize_optional_string(value))
 
