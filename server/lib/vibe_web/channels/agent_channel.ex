@@ -100,6 +100,11 @@ defmodule VibeWeb.AgentChannel do
       end
 
       case Agent.stream_response(text, callback, history: history, images: images, user_id: user_id) do
+        {:ok, full_response, _runtime_state} ->
+          # Update the assistant message in database
+          send(channel_pid, {:finalize_message, conv_id, full_response})
+          send(channel_pid, {:push, "done", %{success: true, conversation_id: conv_id}})
+
         {:ok, full_response} ->
           # Update the assistant message in database
           send(channel_pid, {:finalize_message, conv_id, full_response})
