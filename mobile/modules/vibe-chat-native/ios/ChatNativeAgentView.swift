@@ -426,7 +426,7 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
 
     streamingConversationId = conversationId
     currentToolLabel = nil
-    updateSpacerForSend(conversationId: conversationId)
+    currentSpacerHeight = 0.0
     persistState()
     refreshHistoryList()
     rebuildChatRows(scrollToBottom: true, animated: true)
@@ -795,6 +795,8 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
         (frame.payload["label"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
       currentToolLabel = label.isEmpty ? "Thinking..." : label
       rebuildChatRows(scrollToBottom: false, animated: false)
+    case "subagent":
+      handleSubagentEvent(frame.payload)
     case "ack":
       if let conversationId = frame.payload["conversation_id"] as? String {
         applyAcknowledgedConversationId(conversationId)
@@ -823,6 +825,28 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
     default:
       break
     }
+  }
+
+  private func handleSubagentEvent(_ payload: [String: Any]) {
+    let label = Self.normalizedString(payload["label"]) ?? "Specialist"
+    let event = Self.normalizedString(payload["event"]) ?? ""
+    let detail = Self.normalizedString(payload["detail"])
+    let status = Self.normalizedString(payload["status"]) ?? ""
+
+    let nextLabel: String?
+    switch event {
+    case "started":
+      nextLabel = "Starting \(label)..."
+    case "progress":
+      nextLabel = detail ?? "\(label) is working..."
+    case "finished":
+      nextLabel = status == "error" ? "\(label) failed." : "\(label) completed."
+    default:
+      nextLabel = detail ?? currentToolLabel
+    }
+
+    currentToolLabel = nextLabel
+    rebuildChatRows(scrollToBottom: false, animated: false)
   }
 
   private func syncConversations() {
@@ -1251,10 +1275,7 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
   }
 
   private func updateSpacerForSend(conversationId: String) {
-    guard let conversation = conversation(for: conversationId) else { return }
-    let userMessageCount = conversation.messages.filter { $0.role == .user }.count
-    let pageHeight = max(1.0, bounds.height)
-    currentSpacerHeight = userMessageCount <= 1 ? 0 : pageHeight * 0.65
+    currentSpacerHeight = 0.0
   }
 
   private func applyPersistedState() {

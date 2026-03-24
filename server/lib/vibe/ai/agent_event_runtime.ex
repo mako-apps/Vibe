@@ -428,7 +428,8 @@ defmodule Vibe.AI.AgentEventRuntime do
       runbook.action_type in @safe_action_types &&
       case autonomy do
         "full_auto" -> runbook.risk_level in ["low", "medium"]
-        _ -> runbook.risk_level == "low"
+        "safe_auto" -> runbook.risk_level == "low"
+        _ -> false
       end
   end
 

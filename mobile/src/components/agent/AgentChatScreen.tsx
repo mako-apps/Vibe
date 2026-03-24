@@ -4,6 +4,7 @@ import {
     Text,
     StyleSheet,
     Dimensions,
+    Platform,
     ScrollView,
     Alert,
     TouchableOpacity,
@@ -32,6 +33,8 @@ import { BlurView } from 'expo-blur'
 import { useThemeStore } from '../../lib/stores/theme-store'
 import { useWallpaperStore, resolveThemeVariant } from '../../lib/stores/wallpaper-store'
 import { useAgentStore } from '../../lib/agent/AgentStore'
+import AuthManager from '../../lib/AuthManager'
+import ProxyManager from '../../lib/ProxyManager'
 import ChatInput from '../../components/shared/ChatInput'
 import { isNativeTabBarAvailable } from '../native/NativeTabBar'
 import StreamingText from '../../components/shared/StreamingText'
@@ -44,6 +47,8 @@ import { DocumentIcon, RefreshIcon, ThumbUpIcon, ThumbDownIcon, HistoryIcon, Plu
 import * as Clipboard from 'expo-clipboard'
 import { MessageContextMenu, GlassToast } from '../../components/chat/ChatOverlays'
 import { ArrowLeft, Settings, Plus, Trash2, MessageSquare, Clock } from 'lucide-react-native'
+import { NativeAgentChatSurface, getNativeChatAgentModule, type NativeAgentChatSurfaceRef } from '../../native/chat'
+import { getNativeCallModule } from '../../native/call/runtime'
 
 import { MusicBubble } from './MusicBubble'
 import { MessageBubbleBody } from '../../components/chat/bubbles'
@@ -267,17 +272,158 @@ const HistoryPanel = ({
 
 const EMPTY_MESSAGES: Message[] = []
 
-export default function ChatScreen({
-    keyboardProgress,
-    keyboardHeight,
-    onSettings,
-    onBack
-}: {
+type AgentChatScreenProps = {
     keyboardProgress?: any,
     keyboardHeight?: any,
     onSettings?: () => void,
     onBack?: () => void
-}) {
+}
+
+const createNativeAgentSurfaceId = () => `native-agent-${Math.random().toString(36).slice(2, 10)}`
+
+function NativeBackedAgentChatScreen({
+    keyboardProgress,
+    onBack,
+}: AgentChatScreenProps) {
+    const insets = useSafeAreaInsets()
+    const { colors, effectiveTheme } = useThemeStore()
+    const { activeTheme } = useWallpaperStore()
+    const haptic = useHaptics()
+    const nativeSurfaceRef = useRef<NativeAgentChatSurfaceRef | null>(null)
+    const surfaceIdRef = useRef(createNativeAgentSurfaceId())
+    const [inputText, setInputText] = useState('')
+
+    const resolvedTheme = useMemo(() => {
+        return resolveThemeVariant(activeTheme, effectiveTheme === 'dark')
+    }, [activeTheme, effectiveTheme])
+
+    const appearance = useMemo(() => ({
+        nativeThemeIsDark: effectiveTheme === 'dark',
+        wallpaperGradient: resolvedTheme.backgroundGradient?.length
+            ? resolvedTheme.backgroundGradient
+            : [colors.background, colors.background],
+        bubbleMeGradient: resolvedTheme.bubbleMeGradient?.length
+            ? resolvedTheme.bubbleMeGradient
+            : [resolvedTheme.bubbleMe, resolvedTheme.bubbleMe],
+        bubbleThemColor: resolvedTheme.bubbleThem,
+        textColorMe: '#FFFFFF',
+        textColorThem: colors.text,
+        timeColorMe: withAlpha('#FFFFFF', 0.72),
+        timeColorThem: withAlpha(colors.text, 0.58),
+        dayTextColor: withAlpha(colors.text, 0.7),
+        dayBackgroundColor: withAlpha(colors.text, 0.08),
+        dayBorderColor: withAlpha(colors.text, 0.14),
+    }), [colors.background, colors.text, effectiveTheme, resolvedTheme])
+
+    useEffect(() => {
+        let cancelled = false
+
+        const configureNativeTransport = async () => {
+            try {
+                const nativeCallModule = getNativeCallModule()
+                if (!nativeCallModule?.setNativeEngineConfig) return
+
+                const authManager = AuthManager.getInstance()
+                const auth = authManager.getSession() || await authManager.init()
+                if (cancelled || !auth?.userId) return
+
+                const baseUrl = ProxyManager.getInstance().getBestUrl()
+                const socketUrl = baseUrl.replace(/^http/, 'ws') + '/socket'
+
+                await Promise.resolve(nativeCallModule.setNativeEngineConfig({
+                    apiBaseUrl: baseUrl,
+                    baseUrl,
+                    socketUrl,
+                    authToken: auth.loginToken || auth.userId,
+                    userId: auth.userId,
+                }))
+            } catch (error) {
+                console.warn('[AgentChatScreen] Failed to configure native agent transport', error)
+            }
+        }
+
+        void configureNativeTransport()
+
+        return () => {
+            cancelled = true
+        }
+    }, [])
+
+    const handleSend = async () => {
+        const text = inputText.trim()
+        if (!text) return
+
+        setInputText('')
+        haptic.selection()
+
+        try {
+            await nativeSurfaceRef.current?.submitText(text)
+        } catch (error) {
+            console.error('[AgentChatScreen] Native submit failed', error)
+            setInputText(text)
+        }
+    }
+
+    return (
+        <View style={{ flex: 1, backgroundColor: appearance.wallpaperGradient[0] || colors.background }}>
+            <NativeAgentChatSurface
+                ref={nativeSurfaceRef}
+                surfaceId={surfaceIdRef.current}
+                appearance={appearance}
+                forceRender={true}
+                onNativeEvent={(event) => {
+                    const type = typeof event?.nativeEvent?.type === 'string'
+                        ? event.nativeEvent.type
+                        : ''
+
+                    if (type === 'headerBack') {
+                        onBack?.()
+                    }
+                }}
+            />
+
+            <KeyboardStickyView
+                style={{
+                    position: 'absolute',
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    paddingBottom: Math.max(insets.bottom, 8),
+                }}
+            >
+                <ChatInput
+                    value={inputText}
+                    onChangeText={setInputText}
+                    onSend={handleSend}
+                    placeholder="Message Vibe..."
+                    keyboardProgress={keyboardProgress}
+                    onAttachPress={() => { }}
+                />
+            </KeyboardStickyView>
+        </View>
+    )
+}
+
+export default function AgentChatScreen(props: AgentChatScreenProps) {
+    const nativeAgentModule = useMemo(() => getNativeChatAgentModule(), [])
+    const canUseNative =
+        Platform.OS === 'ios'
+        && !!nativeAgentModule
+        && (nativeAgentModule.isSupported?.() ?? true)
+
+    if (canUseNative) {
+        return <NativeBackedAgentChatScreen {...props} />
+    }
+
+    return <LegacyAgentChatScreen {...props} />
+}
+
+function LegacyAgentChatScreen({
+    keyboardProgress,
+    keyboardHeight,
+    onSettings,
+    onBack
+}: AgentChatScreenProps) {
     const insets = useSafeAreaInsets()
     const { colors, effectiveTheme } = useThemeStore()
     const { activeTheme } = useWallpaperStore()

@@ -15,7 +15,7 @@ import {
 import { CameraView, CameraType, FlashMode, useCameraPermissions } from 'expo-camera'
 import * as ImagePicker from 'expo-image-picker'
 import * as MediaLibrary from 'expo-media-library'
-import { useRouter } from 'expo-router'
+import { useLocalSearchParams, useRouter } from 'expo-router'
 import * as FileSystem from 'expo-file-system/legacy'
 import { Audio } from 'expo-av'
 import {
@@ -42,6 +42,7 @@ import * as Haptics from 'expo-haptics'
 
 import { theme } from '../src/lib/theme'
 import SafeLiquidGlass from '../src/components/native/SafeLiquidGlass'
+import NativeStoryCamera, { isNativeStoryCameraAvailable, type NativeStoryCameraEventPayload } from '../src/components/native/NativeStoryCamera'
 import { useStoryStore } from '../src/lib/stores/story-store'
 import { useAuthStore } from '../src/lib/stores/auth-store'
 import { RefreshIcon, ImageIcon } from '../src/components/Icons'
@@ -69,8 +70,6 @@ type StoryCameraProps = {
     deferCameraMountMs?: number;
 };
 
-import { useLocalSearchParams } from 'expo-router'
-
 // ...
 
 export function StoryCamera({ onRequestClose, deferCameraMountMs = 0 }: StoryCameraProps) {
@@ -79,6 +78,7 @@ export function StoryCamera({ onRequestClose, deferCameraMountMs = 0 }: StoryCam
     const requestClose = onRequestClose ?? (() => router.back())
     const { createStory, saveDraft } = useStoryStore()
     const { user } = useAuthStore()
+    const useNativeStoryCamera = Platform.OS === 'ios' && isNativeStoryCameraAvailable()
 
     // Permissions
     const [permission, requestPermission] = useCameraPermissions()
@@ -201,6 +201,7 @@ export function StoryCamera({ onRequestClose, deferCameraMountMs = 0 }: StoryCam
     }))
 
     useEffect(() => {
+        if (useNativeStoryCamera) return
         if (!permission?.granted) requestPermission()
         if (!audioPermission?.granted) requestAudioPermission()
         if (!mediaLibraryPermission?.granted) requestMediaLibraryPermission()
@@ -218,7 +219,7 @@ export function StoryCamera({ onRequestClose, deferCameraMountMs = 0 }: StoryCam
                 }
             })
         }
-    }, [mediaLibraryPermission])
+    }, [mediaLibraryPermission, useNativeStoryCamera])
 
     useEffect(() => {
         if (deferCameraMountMs <= 0) return
@@ -228,7 +229,7 @@ export function StoryCamera({ onRequestClose, deferCameraMountMs = 0 }: StoryCam
         return () => clearTimeout(t)
     }, [deferCameraMountMs])
 
-    if (!permission?.granted) {
+    if (!useNativeStoryCamera && !permission?.granted) {
         return (
             <View style={[styles.container, { backgroundColor: colors.bg.primary, justifyContent: 'center', alignItems: 'center' }]}>
                 <Text style={{ color: colors.text.primary, marginBottom: 20 }}>Camera permission required</Text>
@@ -428,6 +429,29 @@ export function StoryCamera({ onRequestClose, deferCameraMountMs = 0 }: StoryCam
         requestClose()
     }
 
+    const handleNativeCameraEvent = ({ nativeEvent }: { nativeEvent: NativeStoryCameraEventPayload }) => {
+        switch (nativeEvent.type) {
+            case 'capture':
+                setCapturedMedia({
+                    uri: nativeEvent.uri,
+                    type: nativeEvent.mediaType,
+                    mirrored: !!nativeEvent.mirrored,
+                })
+                setOriginalMedia(null)
+                setEditError(null)
+                setEditRateLimitSeconds(null)
+                return
+            case 'openDrafts':
+                router.push('/story-drafts')
+                return
+            case 'close':
+                requestClose()
+                return
+            case 'error':
+                Alert.alert('Error', nativeEvent.message || 'Failed to use the native camera.')
+                return
+        }
+    }
 
 
 
@@ -471,6 +495,18 @@ export function StoryCamera({ onRequestClose, deferCameraMountMs = 0 }: StoryCam
         )
     }
 
+    if (useNativeStoryCamera) {
+        return (
+            <View style={[styles.container, { backgroundColor: colors.bg.primary }]}>
+                <StatusBar barStyle="light-content" />
+                <NativeStoryCamera
+                    deferMountMs={deferCameraMountMs}
+                    onNativeEvent={handleNativeCameraEvent}
+                    style={styles.nativeCamera}
+                />
+            </View>
+        )
+    }
 
     return (
         <GestureDetector gesture={composedGestures}>
@@ -609,6 +645,7 @@ export default function StoryCameraScreen() {
 
 const styles = StyleSheet.create({
     container: { flex: 1 },
+    nativeCamera: { flex: 1 },
     fullScreen: { flex: 1 },
     cardWrapper: {
         height: SCREEN_HEIGHT * 0.85,

@@ -815,6 +815,13 @@ private func usesAudioMetadataVoiceLayout(_ row: ChatListRow) -> Bool {
   row.visualKind == .voice && row.messageType.lowercased() != "voice"
 }
 
+private func normalizedChatAudioId(_ value: String?) -> String? {
+  guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+    return nil
+  }
+  return trimmed
+}
+
 private func resolvedAudioVoiceTitle(_ row: ChatListRow) -> String {
   let rawTitle =
     row.fileName?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2185,8 +2192,123 @@ protocol VoicePlayableCell: AnyObject {
   func applyVoiceDownloadState(needsDownload: Bool, isDownloading: Bool, progress: CGFloat?)
 }
 
+fileprivate struct ChatAudioQueueItem {
+  let chatId: String
+  let messageId: String
+  let mediaURL: String
+  let mediaKey: String?
+  let fileName: String?
+  let title: String
+  let subtitle: String
+  let artwork: UIImage?
+  let duration: Double
+  let track: NativeMusicPlayerTrack
+}
+
+final class ChatAudioQueueRegistry {
+  static let shared = ChatAudioQueueRegistry()
+
+  private var itemsByChatId: [String: [ChatAudioQueueItem]] = [:]
+
+  private init() {}
+
+  func setRows(_ rows: [ChatListRow], for chatId: String) {
+    let trimmedChatId = chatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmedChatId.isEmpty else { return }
+
+    var nextItems: [ChatAudioQueueItem] = []
+    var seenMessageIds = Set<String>()
+    nextItems.reserveCapacity(rows.count)
+
+    for row in rows {
+      guard let item = makeItem(from: row, fallbackChatId: trimmedChatId) else { continue }
+      if seenMessageIds.insert(item.messageId).inserted {
+        nextItems.append(item)
+        _ = NativeMusicPlayerStore.shared.cacheTrack(payload: item.track.toPayload())
+      }
+    }
+
+    itemsByChatId[trimmedChatId] = nextItems
+  }
+
+  func tracks(for chatId: String?) -> [NativeMusicPlayerTrack] {
+    items(for: chatId).map(\.track)
+  }
+
+  fileprivate func items(for chatId: String?) -> [ChatAudioQueueItem] {
+    let trimmedChatId = chatId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard !trimmedChatId.isEmpty else { return [] }
+    return itemsByChatId[trimmedChatId] ?? []
+  }
+
+  fileprivate func item(trackId: String, in chatId: String?) -> ChatAudioQueueItem? {
+    items(for: chatId).first { $0.track.trackId == trackId }
+  }
+
+  private func makeItem(from row: ChatListRow, fallbackChatId: String) -> ChatAudioQueueItem? {
+    guard usesAudioMetadataVoiceLayout(row) else { return nil }
+    guard let messageId = normalizedChatAudioId(row.messageId) else { return nil }
+
+    let localMedia = row.localMediaUrl?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let remoteMedia = row.mediaUrl?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let resolvedMediaURL: String?
+    if let localMedia, !localMedia.isEmpty {
+      resolvedMediaURL = localMedia
+    } else if let remoteMedia, !remoteMedia.isEmpty {
+      resolvedMediaURL = remoteMedia
+    } else {
+      resolvedMediaURL = nil
+    }
+    guard let mediaURL = resolvedMediaURL else { return nil }
+
+    let title = resolvedAudioVoiceTitle(row)
+    let subtitle = resolvedAudioVoiceStaticDetail(row)
+    let artwork = chatMediaImage(fromBase64: row.thumbnailBase64)
+    let duration = max(0.0, row.duration ?? 0.0)
+    let localURI = localMedia?.isEmpty == false ? localMedia : nil
+    let remoteURI: String? = {
+      guard let remoteMedia, !remoteMedia.isEmpty else { return nil }
+      guard !(remoteMedia.hasPrefix("file://") || remoteMedia.hasPrefix("/")) else { return nil }
+      return remoteMedia
+    }()
+    let resolvedChatId = normalizedChatAudioId(row.chatId) ?? fallbackChatId
+    let track = NativeMusicPlayerTrack(
+      trackId: messageId,
+      videoId: nil,
+      id: messageId,
+      source: "chat-music",
+      title: title,
+      artist: subtitle,
+      album: nil,
+      duration: formatBubbleDuration(seconds: duration),
+      durationSeconds: duration > 0.0 ? duration : nil,
+      cover: nil,
+      previewURL: remoteURI,
+      streamURL: remoteURI,
+      localURI: localURI,
+      cachedAt: nil,
+      playCount: 0,
+      lastPlayedAt: nil,
+      links: ["chat_id": resolvedChatId]
+    )
+    return ChatAudioQueueItem(
+      chatId: resolvedChatId,
+      messageId: messageId,
+      mediaURL: mediaURL,
+      mediaKey: row.mediaKey,
+      fileName: row.fileName,
+      title: title,
+      subtitle: subtitle,
+      artwork: artwork,
+      duration: duration,
+      track: track
+    )
+  }
+}
+
 struct VoiceBubblePlaybackSnapshot {
   let messageId: String?
+  let chatId: String?
   let isPlaying: Bool
   let progress: CGFloat
   let duration: Double
@@ -2199,6 +2321,7 @@ struct VoiceBubblePlaybackSnapshot {
 
   static let empty = VoiceBubblePlaybackSnapshot(
     messageId: nil,
+    chatId: nil,
     isPlaying: false,
     progress: 0.0,
     duration: 0.0,
@@ -2221,8 +2344,13 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
 
   private weak var activeCell: VoicePlayableCell?
   private var activeMessageId: String?
+  private var activeChatId: String?
   private var activeMediaURL: String?
   private var player: AVAudioPlayer?
+  private var streamingPlayer: AVPlayer?
+  private var streamingPlayerStatusObservation: NSKeyValueObservation?
+  private var streamingTimeObserver: Any?
+  private var streamingEndObserver: NSObjectProtocol?
   private var displayLink: CADisplayLink?
   private var playbackProgress: CGFloat = 0.0
   private var level: CGFloat = 0.0
@@ -2258,6 +2386,7 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     }
     displayLink?.invalidate()
     player?.stop()
+    cleanupStreamingPlayer()
   }
 
   private func configureSystemPlaybackIntegration() {
@@ -2347,18 +2476,73 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
   }
 
   private func configurePlaybackSession() throws {
-    try AVAudioSession.sharedInstance().setCategory(
-      .playback,
-      mode: .default,
-      options: [.duckOthers, .allowAirPlay, .allowBluetoothA2DP]
-    )
-    try AVAudioSession.sharedInstance().setActive(true)
+    let session = AVAudioSession.sharedInstance()
+    do {
+      // Keep voice/audio-file playback aligned with the native global player engine.
+      // The broader option set was intermittently failing on cached remote MP3 playback.
+      try session.setCategory(.playback, mode: .default)
+    } catch {
+      NSLog(
+        "[ChatListView] voice audio session category failed error=%@",
+        String(describing: error)
+      )
+      throw error
+    }
+    do {
+      try session.setActive(true)
+    } catch {
+      NSLog(
+        "[ChatListView] voice audio session activation failed error=%@",
+        String(describing: error)
+      )
+      throw error
+    }
+  }
+
+  private var hasActivePlaybackEngine: Bool {
+    player != nil || streamingPlayer != nil
+  }
+
+  private func currentPlaybackDuration() -> Double {
+    if let player {
+      return max(player.duration, activeDuration)
+    }
+    if let seconds = streamingPlayer?.currentItem?.duration.seconds,
+      seconds.isFinite,
+      seconds > 0.0
+    {
+      return max(seconds, activeDuration)
+    }
+    return activeDuration
+  }
+
+  private func currentPlaybackTime() -> Double {
+    if let player {
+      return max(0.0, min(player.currentTime, currentPlaybackDuration()))
+    }
+    if let seconds = streamingPlayer?.currentTime().seconds,
+      seconds.isFinite,
+      seconds >= 0.0
+    {
+      return max(0.0, min(seconds, currentPlaybackDuration()))
+    }
+    return max(0.0, min(Double(playbackProgress) * currentPlaybackDuration(), currentPlaybackDuration()))
+  }
+
+  private func isPlaybackCurrentlyPlaying() -> Bool {
+    if let player {
+      return player.isPlaying
+    }
+    if let streamingPlayer {
+      return streamingPlayer.timeControlStatus == .playing
+    }
+    return false
   }
 
   private func syncRemoteCommandAvailability() {
     let commandCenter = MPRemoteCommandCenter.shared()
-    let hasPlayer = player != nil
-    let canSeek = hasPlayer && max(player?.duration ?? 0.0, activeDuration) > 0.0
+    let hasPlayer = hasActivePlaybackEngine
+    let canSeek = hasPlayer && currentPlaybackDuration() > 0.0
 
     commandCenter.togglePlayPauseCommand.isEnabled = hasPlayer
     commandCenter.playCommand.isEnabled = hasPlayer && !isPlaying
@@ -2386,6 +2570,11 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
   }
 
   private func resolvedSystemPlaybackSubtitle() -> String? {
+    if activeDownloadTask != nil {
+      let progress = max(0.0, min(1.0, activeDownloadProgress ?? 0.0))
+      let percent = Int((progress * 100.0).rounded())
+      return percent > 0 ? "Downloading \(percent)%" : "Downloading"
+    }
     if let activeSubtitle {
       let trimmed = activeSubtitle.trimmingCharacters(in: .whitespacesAndNewlines)
       if !trimmed.isEmpty {
@@ -2396,15 +2585,15 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
   }
 
   private func updateNowPlayingInfo(force: Bool = false) {
-    guard let player, activeMessageId != nil else {
+    guard hasActivePlaybackEngine, activeMessageId != nil else {
       clearNowPlayingInfo()
       return
     }
 
     let title = resolvedSystemPlaybackTitle()
     let subtitle = resolvedSystemPlaybackSubtitle()
-    let duration = max(player.duration, activeDuration)
-    let elapsed = max(0.0, min(duration > 0.0 ? duration : player.currentTime, player.currentTime))
+    let duration = currentPlaybackDuration()
+    let elapsed = currentPlaybackTime()
     let signature = [
       activeMessageId ?? "-",
       title,
@@ -2460,7 +2649,7 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
 
   private func syncSystemPlaybackState(forceNowPlaying: Bool) {
     syncRemoteCommandAvailability()
-    if player == nil {
+    if !hasActivePlaybackEngine {
       clearNowPlayingInfo()
       return
     }
@@ -2469,7 +2658,6 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
 
   @discardableResult
   private func resumePlayback(updateCell: Bool = true) -> Bool {
-    guard let player else { return false }
     do {
       try configurePlaybackSession()
     } catch {
@@ -2478,10 +2666,19 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
         String(describing: error)
       )
     }
-    let accepted = player.play()
+    let accepted: Bool
+    if let player {
+      accepted = player.play()
+    } else if let streamingPlayer {
+      streamingPlayer.playImmediately(atRate: 1.0)
+      accepted = true
+    } else {
+      return false
+    }
     isPlaying = accepted
     ensureDisplayLink()
     if updateCell {
+      activeCell?.applyVoiceDownloadState(needsDownload: false, isDownloading: false, progress: nil)
       activeCell?.applyVoicePlaybackState(
         isPlaying: accepted,
         progress: playbackProgress,
@@ -2493,11 +2690,13 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
   }
 
   private func pausePlayback(updateCell: Bool = true) {
-    guard let player else { return }
-    player.pause()
+    guard hasActivePlaybackEngine else { return }
+    player?.pause()
+    streamingPlayer?.pause()
     isPlaying = false
     level = 0.0
     if updateCell {
+      activeCell?.applyVoiceDownloadState(needsDownload: false, isDownloading: false, progress: nil)
       activeCell?.applyVoicePlaybackState(
         isPlaying: false,
         progress: playbackProgress,
@@ -2508,19 +2707,19 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
   }
 
   private func handleRemotePlayCommand() -> MPRemoteCommandHandlerStatus {
-    guard player != nil else { return .noActionableNowPlayingItem }
+    guard hasActivePlaybackEngine else { return .noActionableNowPlayingItem }
     return resumePlayback(updateCell: true) ? .success : .commandFailed
   }
 
   private func handleRemotePauseCommand() -> MPRemoteCommandHandlerStatus {
-    guard player != nil else { return .noActionableNowPlayingItem }
+    guard hasActivePlaybackEngine else { return .noActionableNowPlayingItem }
     pausePlayback(updateCell: true)
     return .success
   }
 
   private func handleRemoteTogglePlayPauseCommand() -> MPRemoteCommandHandlerStatus {
-    guard let player else { return .noActionableNowPlayingItem }
-    if player.isPlaying {
+    guard hasActivePlaybackEngine else { return .noActionableNowPlayingItem }
+    if isPlaybackCurrentlyPlaying() {
       pausePlayback(updateCell: true)
       return .success
     }
@@ -2528,7 +2727,7 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
   }
 
   private func handleRemoteStopCommand() -> MPRemoteCommandHandlerStatus {
-    guard player != nil || activeDownloadTask != nil else { return .noActionableNowPlayingItem }
+    guard hasActivePlaybackEngine || activeDownloadTask != nil else { return .noActionableNowPlayingItem }
     stopActivePlayback(resetProgress: true)
     return .success
   }
@@ -2536,16 +2735,27 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
   private func handleRemoteChangePlaybackPositionCommand(
     _ event: MPChangePlaybackPositionCommandEvent
   ) -> MPRemoteCommandHandlerStatus {
-    guard let player else { return .noActionableNowPlayingItem }
-    let duration = max(player.duration, activeDuration)
+    guard hasActivePlaybackEngine else { return .noActionableNowPlayingItem }
+    let duration = currentPlaybackDuration()
     let targetTime = max(0.0, min(duration > 0.0 ? duration : event.positionTime, event.positionTime))
-    player.currentTime = targetTime
-    playbackProgress = duration > 0.0 ? CGFloat(targetTime / duration) : 0.0
-    activeCell?.applyVoicePlaybackState(
-      isPlaying: player.isPlaying,
-      progress: playbackProgress,
-      level: player.isPlaying ? max(level, 0.18) : 0.0
-    )
+    if let player {
+      player.currentTime = targetTime
+      playbackProgress = duration > 0.0 ? CGFloat(targetTime / duration) : 0.0
+      activeCell?.applyVoicePlaybackState(
+        isPlaying: player.isPlaying,
+        progress: playbackProgress,
+        level: player.isPlaying ? max(level, 0.18) : 0.0
+      )
+    } else if let streamingPlayer {
+      let cmTime = CMTime(seconds: targetTime, preferredTimescale: 600)
+      streamingPlayer.seek(to: cmTime, toleranceBefore: .zero, toleranceAfter: .zero)
+      playbackProgress = duration > 0.0 ? CGFloat(targetTime / duration) : 0.0
+      activeCell?.applyVoicePlaybackState(
+        isPlaying: streamingPlayer.timeControlStatus == .playing,
+        progress: playbackProgress,
+        level: streamingPlayer.timeControlStatus == .playing ? max(level, 0.18) : 0.0
+      )
+    }
     publishSnapshot(forceNowPlaying: true)
     return .success
   }
@@ -2560,7 +2770,7 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
 
     switch type {
     case .began:
-      shouldResumeAfterInterruption = player?.isPlaying == true
+      shouldResumeAfterInterruption = isPlaybackCurrentlyPlaying()
       if shouldResumeAfterInterruption {
         pausePlayback(updateCell: true)
       } else {
@@ -2588,7 +2798,7 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
       return
     }
 
-    if reason == .oldDeviceUnavailable, player?.isPlaying == true {
+    if reason == .oldDeviceUnavailable, isPlaybackCurrentlyPlaying() {
       pausePlayback(updateCell: true)
     }
   }
@@ -2611,6 +2821,14 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     guard let messageId, !messageId.isEmpty else {
       cell.applyVoiceDownloadState(needsDownload: false, isDownloading: false, progress: nil)
       cell.applyVoicePlaybackState(isPlaying: false, progress: 0.0, level: 0.0)
+      return
+    }
+    if activeMessageId == messageId, hasActivePlaybackEngine {
+      activeCell = cell
+      cell.applyVoiceDownloadState(needsDownload: false, isDownloading: false, progress: nil)
+      cell.applyVoicePlaybackState(
+        isPlaying: isPlaying, progress: playbackProgress, level: level
+      )
       return
     }
     if activeMessageId == messageId, activeDownloadTask != nil {
@@ -2667,6 +2885,7 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
   func toggle(
     cell: VoicePlayableCell?,
     messageId: String?,
+    chatId: String? = nil,
     mediaURL: String?,
     mediaKey: String? = nil,
     fileName: String? = nil,
@@ -2689,8 +2908,8 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     }
 
     if activeMessageId == messageId {
-      if let player {
-        if player.isPlaying {
+      if hasActivePlaybackEngine {
+        if isPlaybackCurrentlyPlaying() {
           pausePlayback(updateCell: true)
           NSLog(
             "[ChatListView] voice pause messageId=%@ progress=%.3f", messageId, playbackProgress)
@@ -2708,6 +2927,7 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     }
 
     stopActivePlayback(resetProgress: true)
+    activeChatId = presentsGlobalPlayer ? normalizedChatAudioId(chatId) : nil
     activeMediaURL = mediaURL
     activeMediaKey = mediaKey
     activeFileName = fileName
@@ -2748,8 +2968,8 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
   }
 
   func toggleCurrentPlayback() {
-    if let player {
-      if player.isPlaying {
+    if hasActivePlaybackEngine {
+      if isPlaybackCurrentlyPlaying() {
         pausePlayback(updateCell: true)
       } else {
         isPlaying = resumePlayback(updateCell: true)
@@ -2766,6 +2986,96 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     stopActivePlayback(resetProgress: true)
   }
 
+  func playNextTrack() {
+    guard let nextItem = adjacentQueueItem(step: 1) else { return }
+    startQueueItem(nextItem, cell: nil)
+  }
+
+  func playPreviousTrack() {
+    guard let previousItem = adjacentQueueItem(step: -1) else { return }
+    startQueueItem(previousItem, cell: nil)
+  }
+
+  func selectQueuedTrack(_ trackId: String) {
+    let trimmedTrackId = trackId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmedTrackId.isEmpty else { return }
+    if activeMessageId == trimmedTrackId {
+      if hasActivePlaybackEngine, !isPlaybackCurrentlyPlaying() {
+        _ = resumePlayback(updateCell: true)
+      }
+      return
+    }
+    guard let item = ChatAudioQueueRegistry.shared.item(trackId: trimmedTrackId, in: activeChatId) else {
+      return
+    }
+    startQueueItem(item, cell: nil)
+  }
+
+  func seek(toSeconds seconds: Double) {
+    let clamped = max(0.0, seconds)
+    let duration = currentPlaybackDuration()
+    let targetTime = max(0.0, min(duration > 0.0 ? duration : clamped, clamped))
+    if let player {
+      player.currentTime = targetTime
+      playbackProgress = duration > 0.0 ? CGFloat(targetTime / duration) : 0.0
+      activeCell?.applyVoicePlaybackState(
+        isPlaying: player.isPlaying,
+        progress: playbackProgress,
+        level: player.isPlaying ? max(level, 0.18) : 0.0
+      )
+    } else if let streamingPlayer {
+      let cmTime = CMTime(seconds: targetTime, preferredTimescale: 600)
+      streamingPlayer.seek(to: cmTime, toleranceBefore: .zero, toleranceAfter: .zero)
+      playbackProgress = duration > 0.0 ? CGFloat(targetTime / duration) : 0.0
+      activeCell?.applyVoicePlaybackState(
+        isPlaying: streamingPlayer.timeControlStatus == .playing,
+        progress: playbackProgress,
+        level: streamingPlayer.timeControlStatus == .playing ? max(level, 0.18) : 0.0
+      )
+    }
+    publishSnapshot(forceNowPlaying: true)
+  }
+
+  func refreshCurrentSnapshotIfNeeded(forChatId chatId: String) {
+    let trimmedChatId = chatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmedChatId.isEmpty, activeChatId == trimmedChatId else { return }
+    publishSnapshot(forceNowPlaying: true)
+  }
+
+  private func startQueueItem(_ item: ChatAudioQueueItem, cell: VoicePlayableCell?) {
+    toggle(
+      cell: cell,
+      messageId: item.messageId,
+      chatId: item.chatId,
+      mediaURL: item.mediaURL,
+      mediaKey: item.mediaKey,
+      fileName: item.fileName,
+      title: item.title,
+      subtitle: item.subtitle,
+      artwork: item.artwork,
+      duration: item.duration,
+      presentsGlobalPlayer: true
+    )
+  }
+
+  private func adjacentQueueItem(step: Int) -> ChatAudioQueueItem? {
+    guard step != 0 else { return nil }
+    guard let activeMessageId else { return nil }
+    let items = ChatAudioQueueRegistry.shared.items(for: activeChatId)
+    guard let currentIndex = items.firstIndex(where: { $0.messageId == activeMessageId }) else {
+      return nil
+    }
+    let nextIndex = currentIndex + step
+    guard items.indices.contains(nextIndex) else { return nil }
+    return items[nextIndex]
+  }
+
+  private func advanceToNextQueuedTrackIfAvailable() -> Bool {
+    guard let nextItem = adjacentQueueItem(step: 1) else { return false }
+    startQueueItem(nextItem, cell: nil)
+    return true
+  }
+
   private func playRemoteURL(
     _ url: URL,
     messageId: String,
@@ -2780,6 +3090,19 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
       return
     }
 
+    let trimmedMediaKey = mediaKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if trimmedMediaKey.isEmpty {
+      startStreamingRemotePlayback(url, messageId: messageId, cell: cell)
+      beginRemoteDownloadTask(
+        url,
+        messageId: messageId,
+        mediaKey: nil,
+        fileName: fileName,
+        autoPlayWhenFinished: false
+      )
+      return
+    }
+
     activeMessageId = messageId
     activeMediaURL = url.absoluteString
     activeMediaKey = mediaKey
@@ -2790,21 +3113,129 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     cell?.applyVoicePlaybackState(isPlaying: false, progress: 0.0, level: 0.0)
     ensureDisplayLink()
     publishSnapshot()
+    beginRemoteDownloadTask(
+      url,
+      messageId: messageId,
+      mediaKey: mediaKey,
+      fileName: fileName,
+      autoPlayWhenFinished: true
+    )
+  }
 
+  private func startStreamingRemotePlayback(
+    _ url: URL,
+    messageId: String,
+    cell: VoicePlayableCell?
+  ) {
+    cleanupStreamingPlayer()
+    activeMessageId = messageId
+    activeMediaURL = url.absoluteString
+    activeCell = cell
+    activeDownloadProgress = nil
+    playbackProgress = 0.0
+    level = 0.0
+    isPlaying = false
+
+    do {
+      try configurePlaybackSession()
+    } catch {
+      NSLog(
+        "[ChatListView] voice stream session failed messageId=%@ error=%@",
+        messageId,
+        String(describing: error)
+      )
+    }
+
+    let item = AVPlayerItem(url: url)
+    let nextPlayer = AVPlayer(playerItem: item)
+    nextPlayer.automaticallyWaitsToMinimizeStalling = true
+    streamingPlayer = nextPlayer
+
+    streamingPlayerStatusObservation = item.observe(\.status, options: [.initial, .new]) {
+      [weak self] item, _ in
+      guard let self else { return }
+      DispatchQueue.main.async {
+        switch item.status {
+        case .readyToPlay:
+          if item.duration.seconds.isFinite, item.duration.seconds > 0.0 {
+            self.activeDuration = max(self.activeDuration, item.duration.seconds)
+          }
+          _ = self.resumePlayback(updateCell: true)
+        case .failed:
+          NSLog(
+            "[ChatListView] voice stream failed messageId=%@ error=%@",
+            messageId,
+            String(describing: item.error)
+          )
+          self.stopActivePlayback(resetProgress: true)
+        default:
+          break
+        }
+      }
+    }
+
+    streamingTimeObserver = nextPlayer.addPeriodicTimeObserver(
+      forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
+      queue: .main
+    ) { [weak self] _ in
+      guard let self else { return }
+      let duration = self.currentPlaybackDuration()
+      let currentTime = self.currentPlaybackTime()
+      self.playbackProgress = duration > 0.0 ? CGFloat(currentTime / duration) : 0.0
+      self.level = self.isPlaybackCurrentlyPlaying() ? 0.18 : 0.0
+      self.isPlaying = self.isPlaybackCurrentlyPlaying()
+      self.activeCell?.applyVoiceDownloadState(needsDownload: false, isDownloading: false, progress: nil)
+      self.activeCell?.applyVoicePlaybackState(
+        isPlaying: self.isPlaying,
+        progress: self.playbackProgress,
+        level: self.level
+      )
+      self.publishSnapshot()
+    }
+
+    streamingEndObserver = NotificationCenter.default.addObserver(
+      forName: .AVPlayerItemDidPlayToEndTime,
+      object: item,
+      queue: .main
+    ) { [weak self] _ in
+      guard let self else { return }
+      if !self.advanceToNextQueuedTrackIfAvailable() {
+        self.stopActivePlayback(resetProgress: true)
+      }
+    }
+
+    cell?.applyVoiceDownloadState(needsDownload: false, isDownloading: false, progress: nil)
+    cell?.applyVoicePlaybackState(isPlaying: false, progress: 0.0, level: 0.0)
+    ensureDisplayLink()
+    publishSnapshot(forceNowPlaying: true)
+  }
+
+  private func beginRemoteDownloadTask(
+    _ url: URL,
+    messageId: String,
+    mediaKey: String?,
+    fileName: String?,
+    autoPlayWhenFinished: Bool
+  ) {
+    let localURL = cachedRemoteVoiceURL(for: url, fileName: fileName)
     let task = URLSession.shared.downloadTask(with: url) { [weak self] tempURL, response, error in
-      guard let tempURL = tempURL, error == nil else {
+      guard let self, let tempURL = tempURL, error == nil else {
         NSLog(
           "[ChatListView] voice download failed url=%@ error=%@", url.absoluteString,
           String(describing: error))
         DispatchQueue.main.async {
-          if self?.activeMessageId == messageId {
+          guard self?.activeMessageId == messageId else { return }
+          if self?.hasActivePlaybackEngine == true {
+            self?.activeDownloadTask = nil
+            self?.activeDownloadProgress = nil
+            self?.publishSnapshot(forceNowPlaying: true)
+          } else {
             self?.stopActivePlayback(resetProgress: true)
           }
         }
         return
       }
 
-      // Validate HTTP response — Supabase may return HTML error pages
       if let httpResponse = response as? HTTPURLResponse {
         let statusCode = httpResponse.statusCode
         let contentType = httpResponse.value(forHTTPHeaderField: "Content-Type") ?? ""
@@ -2822,13 +3253,17 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
             statusCode
           )
           DispatchQueue.main.async {
-            if self?.activeMessageId == messageId {
-              self?.stopActivePlayback(resetProgress: true)
+            guard self.activeMessageId == messageId else { return }
+            if self.hasActivePlaybackEngine {
+              self.activeDownloadTask = nil
+              self.activeDownloadProgress = nil
+              self.publishSnapshot(forceNowPlaying: true)
+            } else {
+              self.stopActivePlayback(resetProgress: true)
             }
           }
           return
         }
-        // Reject HTML/JSON responses (error pages from storage providers)
         let lowerCT = contentType.lowercased()
         if lowerCT.contains("text/html") || lowerCT.contains("application/json") {
           NSLog(
@@ -2837,15 +3272,19 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
             contentType
           )
           DispatchQueue.main.async {
-            if self?.activeMessageId == messageId {
-              self?.stopActivePlayback(resetProgress: true)
+            guard self.activeMessageId == messageId else { return }
+            if self.hasActivePlaybackEngine {
+              self.activeDownloadTask = nil
+              self.activeDownloadProgress = nil
+              self.publishSnapshot(forceNowPlaying: true)
+            } else {
+              self.stopActivePlayback(resetProgress: true)
             }
           }
           return
         }
       }
 
-      // Validate file size — audio should be at least a few hundred bytes
       let fileSize =
         (try? FileManager.default.attributesOfItem(atPath: tempURL.path)[.size] as? Int64) ?? 0
       if fileSize < 100 {
@@ -2855,8 +3294,13 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
           fileSize
         )
         DispatchQueue.main.async {
-          if self?.activeMessageId == messageId {
-            self?.stopActivePlayback(resetProgress: true)
+          guard self.activeMessageId == messageId else { return }
+          if self.hasActivePlaybackEngine {
+            self.activeDownloadTask = nil
+            self.activeDownloadProgress = nil
+            self.publishSnapshot(forceNowPlaying: true)
+          } else {
+            self.stopActivePlayback(resetProgress: true)
           }
         }
         return
@@ -2884,15 +3328,23 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
           destinationURL = localURL
         }
         DispatchQueue.main.async {
-          if self?.activeMessageId == messageId {
-            self?.finishDownload(messageId: messageId, localMediaURL: destinationURL.absoluteString)
-          }
+          guard self.activeMessageId == messageId else { return }
+          self.finishDownload(
+            messageId: messageId,
+            localMediaURL: destinationURL.absoluteString,
+            autoPlayWhenFinished: autoPlayWhenFinished
+          )
         }
       } catch {
         NSLog("[ChatListView] voice move failed error=%@", String(describing: error))
         DispatchQueue.main.async {
-          if self?.activeMessageId == messageId {
-            self?.stopActivePlayback(resetProgress: true)
+          guard self.activeMessageId == messageId else { return }
+          if self.hasActivePlaybackEngine {
+            self.activeDownloadTask = nil
+            self.activeDownloadProgress = nil
+            self.publishSnapshot(forceNowPlaying: true)
+          } else {
+            self.stopActivePlayback(resetProgress: true)
           }
         }
       }
@@ -2917,6 +3369,7 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
       playbackProgress = 0.0
       level = 0.0
       activeDuration = max(activeDuration, nextPlayer.duration)
+      _ = NativeMusicPlayerStore.shared.updateLocalURI(trackId: messageId, localURI: url.absoluteString)
       isPlaying = nextPlayer.play()
       NSLog(
         "[ChatListView] voice play start messageId=%@ accepted=%@ duration=%.2f",
@@ -2940,7 +3393,9 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
 
   func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
     NSLog("[ChatListView] voice completed success=%@", flag.description)
-    stopActivePlayback(resetProgress: true)
+    if !advanceToNextQueuedTrackIfAvailable() {
+      stopActivePlayback(resetProgress: true)
+    }
   }
 
   func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
@@ -2958,7 +3413,7 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
   }
 
   @objc private func handleDisplayTick() {
-    if let activeDownloadTask, player == nil {
+    if let activeDownloadTask, player == nil, streamingPlayer == nil {
       let progress = activeDownloadTask.progress
       if progress.totalUnitCount > 0 {
         activeDownloadProgress = max(0.0, min(1.0, CGFloat(progress.fractionCompleted)))
@@ -2971,6 +3426,32 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
         progress: activeDownloadProgress
       )
       activeCell?.applyVoicePlaybackState(isPlaying: false, progress: 0.0, level: 0.0)
+      publishSnapshot()
+      return
+    }
+    if let streamingPlayer {
+      let duration = currentPlaybackDuration()
+      let currentTime = currentPlaybackTime()
+      playbackProgress = duration > 0.0 ? CGFloat(currentTime / duration) : 0.0
+      playbackProgress = max(0.0, min(1.0, playbackProgress))
+      level = streamingPlayer.timeControlStatus == .playing ? 0.18 : 0.0
+      isPlaying = streamingPlayer.timeControlStatus == .playing
+      activeCell?.applyVoiceDownloadState(needsDownload: false, isDownloading: false, progress: nil)
+      activeCell?.applyVoicePlaybackState(
+        isPlaying: isPlaying,
+        progress: playbackProgress,
+        level: level
+      )
+      if streamingPlayer.currentItem?.status == .failed {
+        stopActivePlayback(resetProgress: true)
+        return
+      }
+      if !isPlaying && playbackProgress >= 0.999 {
+        if !advanceToNextQueuedTrackIfAvailable() {
+          stopActivePlayback(resetProgress: true)
+        }
+        return
+      }
       publishSnapshot()
       return
     }
@@ -2991,7 +3472,9 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     level = max(0.0, min(1.0, CGFloat(normalized)))
     isPlaying = player.isPlaying
     if !player.isPlaying && playbackProgress >= 0.999 {
-      stopActivePlayback(resetProgress: true)
+      if !advanceToNextQueuedTrackIfAvailable() {
+        stopActivePlayback(resetProgress: true)
+      }
       return
     }
     activeCell?.applyVoicePlaybackState(
@@ -3000,10 +3483,19 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     publishSnapshot()
   }
 
-  private func finishDownload(messageId: String, localMediaURL: String) {
+  private func finishDownload(
+    messageId: String,
+    localMediaURL: String,
+    autoPlayWhenFinished: Bool = true
+  ) {
     activeDownloadTask = nil
     activeDownloadProgress = nil
+    _ = NativeMusicPlayerStore.shared.updateLocalURI(trackId: messageId, localURI: localMediaURL)
     guard activeMessageId == messageId else { return }
+    if streamingPlayer != nil && !autoPlayWhenFinished {
+      publishSnapshot(forceNowPlaying: true)
+      return
+    }
     let localURL: URL
     if let parsedURL = URL(string: localMediaURL), parsedURL.isFileURL {
       localURL = parsedURL
@@ -3023,6 +3515,7 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     activeDownloadProgress = nil
     player?.stop()
     player = nil
+    cleanupStreamingPlayer()
     try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
     isPlaying = false
     displayLink?.invalidate()
@@ -3041,6 +3534,7 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
       )
     }
     activeMessageId = nil
+    activeChatId = nil
     activeMediaURL = nil
     activeMediaKey = nil
     activeFileName = nil
@@ -3051,6 +3545,21 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     presentsGlobalPlayer = false
     activeCell = nil
     publishSnapshot(forceNowPlaying: true)
+  }
+
+  private func cleanupStreamingPlayer() {
+    if let timeObserver = streamingTimeObserver {
+      streamingPlayer?.removeTimeObserver(timeObserver)
+      streamingTimeObserver = nil
+    }
+    if let streamingEndObserver {
+      NotificationCenter.default.removeObserver(streamingEndObserver)
+      self.streamingEndObserver = nil
+    }
+    streamingPlayerStatusObservation?.invalidate()
+    streamingPlayerStatusObservation = nil
+    streamingPlayer?.pause()
+    streamingPlayer = nil
   }
 
   private func mediaURLRequiresDownload(
@@ -3227,12 +3736,10 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
   private func publishSnapshot(forceNowPlaying: Bool = false) {
     let snapshot: VoiceBubblePlaybackSnapshot
     if let activeMessageId {
-      let duration =
-        (player?.duration ?? 0.0) > 0.0
-        ? player!.duration
-        : activeDuration
+      let duration = currentPlaybackDuration()
       snapshot = VoiceBubblePlaybackSnapshot(
         messageId: activeMessageId,
+        chatId: activeChatId,
         isPlaying: isPlaying,
         progress: playbackProgress,
         duration: duration,
@@ -5543,6 +6050,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     VoiceBubblePlaybackCoordinator.shared.toggle(
       cell: self,
       messageId: row.messageId,
+      chatId: row.chatId,
       mediaURL: resolvedVoicePlaybackURL(for: row),
       mediaKey: row.mediaKey,
       fileName: row.fileName,

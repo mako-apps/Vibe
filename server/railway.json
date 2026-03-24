@@ -4,7 +4,16 @@
         "dockerfilePath": "Dockerfile"
     },
     "deploy": {
-        "startCommand": "/app/bin/vibe eval 'Vibe.Release.migrate' && /app/bin/vibe start",
+        "preDeployCommand": [
+            "/app/bin/vibe",
+            "eval",
+            "Vibe.Release.migrate"
+        ],
+        "startCommand": "/app/bin/vibe start",
+        "healthcheckPath": "/api/health",
+        "healthcheckTimeout": 60,
+        "overlapSeconds": 30,
+        "drainingSeconds": 30,
         "restartPolicyType": "ON_FAILURE",
         "restartPolicyMaxRetries": 10
     }

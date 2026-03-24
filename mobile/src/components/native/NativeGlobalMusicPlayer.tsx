@@ -44,5 +44,7 @@ const styles = StyleSheet.create({
   fill: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: 'transparent',
+    zIndex: 1000,
+    elevation: 1000,
   },
 })

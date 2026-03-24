@@ -13,6 +13,7 @@ final class NativeGlobalMusicPlayerView: ExpoView {
   private var textSecondaryColor = UIColor(white: 1.0, alpha: 0.68)
   private var primaryColor = UIColor.systemBlue
   private var topInset: CGFloat = 0.0
+  private var voiceIsExpanded = false
 
   required init(appContext: AppContext? = nil) {
     super.init(appContext: appContext)
@@ -32,21 +33,35 @@ final class NativeGlobalMusicPlayerView: ExpoView {
     bannerView.onClose = { [weak self] in
       guard let self else { return }
       if self.shouldRenderVoiceSnapshot {
+        self.voiceIsExpanded = false
         VoiceBubblePlaybackCoordinator.shared.stopCurrentPlayback()
         return
       }
       NativeMusicPlayerEngine.shared.reset()
     }
     bannerView.onSetExpanded = { [weak self] expanded in
-      guard let self, !self.shouldRenderVoiceSnapshot else { return }
+      guard let self else { return }
+      if self.shouldRenderVoiceSnapshot {
+        self.voiceIsExpanded = expanded
+        self.applyResolvedState()
+        return
+      }
       NativeMusicPlayerEngine.shared.setIsExpanded(expanded)
     }
     bannerView.onPlayNext = { [weak self] in
-      guard let self, !self.shouldRenderVoiceSnapshot else { return }
+      guard let self else { return }
+      if self.shouldRenderVoiceSnapshot {
+        VoiceBubblePlaybackCoordinator.shared.playNextTrack()
+        return
+      }
       NativeMusicPlayerEngine.shared.playNext()
     }
     bannerView.onPlayPrev = { [weak self] in
-      guard let self, !self.shouldRenderVoiceSnapshot else { return }
+      guard let self else { return }
+      if self.shouldRenderVoiceSnapshot {
+        VoiceBubblePlaybackCoordinator.shared.playPreviousTrack()
+        return
+      }
       NativeMusicPlayerEngine.shared.playPrev()
     }
     bannerView.onPlaybackRateToggle = { [weak self] in
@@ -61,13 +76,20 @@ final class NativeGlobalMusicPlayerView: ExpoView {
       NativeMusicPlayerEngine.shared.setPlaybackRate(next)
     }
     bannerView.onSeek = { [weak self] value in
-      guard let self, !self.shouldRenderVoiceSnapshot else { return }
+      guard let self else { return }
+      if self.shouldRenderVoiceSnapshot {
+        VoiceBubblePlaybackCoordinator.shared.seek(toSeconds: value / 1000.0)
+        return
+      }
       NativeMusicPlayerEngine.shared.seek(toMilliseconds: value)
     }
     bannerView.onSelectTrack = { [weak self] trackId in
-      guard let self, !self.shouldRenderVoiceSnapshot else { return }
-      guard let payload = NativeMusicPlayerEngine.shared.getTrack(trackId) else { return }
-      NativeMusicPlayerEngine.shared.setTrack(payload)
+      guard let self else { return }
+      if self.shouldRenderVoiceSnapshot {
+        VoiceBubblePlaybackCoordinator.shared.selectQueuedTrack(trackId)
+        return
+      }
+      NativeMusicPlayerEngine.shared.selectTrack(trackId)
     }
 
     stateObserver = NotificationCenter.default.addObserver(
@@ -85,8 +107,12 @@ final class NativeGlobalMusicPlayerView: ExpoView {
       object: VoiceBubblePlaybackCoordinator.shared,
       queue: .main
     ) { [weak self] _ in
-      self?.voiceSnapshot = VoiceBubblePlaybackCoordinator.shared.currentSnapshot
-      self?.applyResolvedState()
+      guard let self else { return }
+      self.voiceSnapshot = VoiceBubblePlaybackCoordinator.shared.currentSnapshot
+      if !(self.voiceSnapshot.presentsGlobalPlayer && self.voiceSnapshot.messageId != nil) {
+        self.voiceIsExpanded = false
+      }
+      self.applyResolvedState()
     }
 
     applyTheme()
@@ -171,7 +197,7 @@ final class NativeGlobalMusicPlayerView: ExpoView {
 
   private func applyResolvedState() {
     if shouldRenderVoiceSnapshot {
-      bannerView.applyVoiceSnapshot(voiceSnapshot)
+      bannerView.applyVoiceSnapshot(voiceSnapshot, isExpanded: voiceIsExpanded)
     } else {
       bannerView.applyStatePayload(enginePayload)
     }

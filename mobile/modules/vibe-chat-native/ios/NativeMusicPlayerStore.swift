@@ -60,6 +60,7 @@ struct NativeMusicPlayerTrack: Codable, Equatable {
 
   static func resolveTrackId(from payload: [String: Any]) -> String? {
     let candidates: [Any?] = [
+      payload["track_id"],
       payload["video_id"],
       payload["id"],
       payload["preview_url"],
@@ -201,6 +202,10 @@ final class NativeMusicPlayerStore {
     downloadingTracks
   }
 
+  func libraryTracksPayload() -> [[String: Any]] {
+    libraryTracks().map { $0.toPayload() }
+  }
+
   func cacheTrack(payload: [String: Any]) -> NativeMusicPlayerTrack? {
     guard var nextTrack = NativeMusicPlayerTrack(payload: payload) else { return nil }
     if let existing = tracks[nextTrack.trackId] {
@@ -282,6 +287,10 @@ final class NativeMusicPlayerStore {
     return cacheDirectory.appendingPathComponent("\(digest).\(ext)", isDirectory: false)
   }
 
+  func hasLocalPlaybackFile(for track: NativeMusicPlayerTrack) -> Bool {
+    resolvedPlayableLocalURL(for: track) != nil
+  }
+
   private func loadTracks() -> [String: NativeMusicPlayerTrack] {
     guard let data = defaults.data(forKey: tracksDefaultsKey) else { return [:] }
     guard let decoded = try? JSONDecoder().decode([String: NativeMusicPlayerTrack].self, from: data)
@@ -294,6 +303,39 @@ final class NativeMusicPlayerStore {
   private func persistTracks() {
     guard let data = try? JSONEncoder().encode(tracks) else { return }
     defaults.set(data, forKey: tracksDefaultsKey)
+  }
+
+  private func libraryTracks() -> [NativeMusicPlayerTrack] {
+    tracks.values
+      .filter { track in
+        guard track.source != "chat-voice" else { return false }
+        return hasLocalPlaybackFile(for: track)
+      }
+      .sorted { lhs, rhs in
+        let lhsLastPlayed = lhs.lastPlayedAt ?? 0.0
+        let rhsLastPlayed = rhs.lastPlayedAt ?? 0.0
+        if lhsLastPlayed != rhsLastPlayed {
+          return lhsLastPlayed > rhsLastPlayed
+        }
+
+        let lhsCachedAt = lhs.cachedAt ?? 0.0
+        let rhsCachedAt = rhs.cachedAt ?? 0.0
+        if lhsCachedAt != rhsCachedAt {
+          return lhsCachedAt > rhsCachedAt
+        }
+
+        return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+      }
+  }
+
+  private func resolvedPlayableLocalURL(for track: NativeMusicPlayerTrack) -> URL? {
+    if let localURI = track.localURI,
+      let url = resolvedLocalURL(from: localURI),
+      FileManager.default.fileExists(atPath: url.path)
+    {
+      return url
+    }
+    return nil
   }
 
   private func deleteFileIfNeeded(localURI: String) {

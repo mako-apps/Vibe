@@ -86,6 +86,9 @@ defmodule VibeWeb.AgentChannel do
             status: payload[:status] || "running"
           }})
 
+        %{type: :subagent} = payload ->
+          send(channel_pid, {:push, "subagent", Map.delete(payload, :type)})
+
         %{type: :tool_result, tool: tool, result: result} = payload ->
           send(channel_pid, {:push, "tool_result", %{
             tool: tool,

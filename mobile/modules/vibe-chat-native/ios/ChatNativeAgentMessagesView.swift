@@ -366,14 +366,17 @@ final class ChatNativeAgentMessagesView: UIView {
   }
 
   func scrollToBottom(animated: Bool) {
-    layoutIfNeeded()
-    let minOffset = -scrollView.adjustedContentInset.top
-    let targetY = max(
-      minOffset,
-      scrollView.contentSize.height - scrollView.bounds.height
-        + scrollView.adjustedContentInset.bottom
-    )
-    scrollView.setContentOffset(CGPoint(x: 0.0, y: targetY), animated: animated)
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else { return }
+      self.layoutIfNeeded()
+      let minOffset = -self.scrollView.adjustedContentInset.top
+      let targetY = max(
+        minOffset,
+        self.scrollView.contentSize.height - self.scrollView.bounds.height
+          + self.scrollView.adjustedContentInset.bottom
+      )
+      self.scrollView.setContentOffset(CGPoint(x: 0.0, y: targetY), animated: animated)
+    }
   }
 
   private func rebuildRows(

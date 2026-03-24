@@ -93,6 +93,7 @@ struct ChatListRow {
   let isEdited: Bool
   let isPinned: Bool
   let messageId: String?
+  let chatId: String?
   let reactionEmoji: String?
   let shape: BubbleShape
   let messageType: String
@@ -290,6 +291,7 @@ struct ChatListRow {
       isEdited = false
       isPinned = false
       messageId = nil
+      chatId = nil
       reactionEmoji = nil
       shape = BubbleShape(
         isMe: false, showTail: false, borderTopLeftRadius: 18, borderTopRightRadius: 18,
@@ -337,6 +339,11 @@ struct ChatListRow {
     isEdited = (message["isEdited"] as? Bool) ?? false
     isPinned = (message["isPinned"] as? Bool) ?? false
     messageId = parseNonEmptyString(message["id"])
+    chatId =
+      parseNonEmptyString(message["chatId"])
+      ?? parseNonEmptyString(message["chat_id"])
+      ?? parseNonEmptyString(metadata?["chatId"])
+      ?? parseNonEmptyString(metadata?["chat_id"])
     reactionEmoji = message["reactionEmoji"] as? String
     messageType = ((message["type"] as? String) ?? "text").lowercased()
     shape = BubbleShape.from(raw: message["bubbleShape"] as? [String: Any], isMe: isMe)

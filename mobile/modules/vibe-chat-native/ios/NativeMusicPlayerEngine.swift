@@ -51,6 +51,7 @@ final class NativeMusicPlayerEngine: NSObject {
     return [
       "currentTrack": currentTrackPayload ?? NSNull(),
       "queue": queuePayload,
+      "library": store.libraryTracksPayload(),
       "isPlaying": isPlaying,
       "isExpanded": isExpanded,
       "progress": currentPositionMs,
@@ -245,6 +246,37 @@ final class NativeMusicPlayerEngine: NSObject {
     return store.getTrack(trackId: currentTrackId)
   }
 
+  func selectTrack(_ trackId: String) {
+    DispatchQueue.main.async {
+      guard let track = self.store.getTrack(trackId: trackId) else { return }
+      self.ensureTrackInQueue(track.trackId)
+      self.currentTrackId = track.trackId
+      self.currentPositionMs = 0.0
+      self.currentDurationMs = (track.durationSeconds ?? 0.0) * 1000.0
+
+      if self.store.hasLocalPlaybackFile(for: track) || self.resolveRemoteDownloadURL(for: track) == nil {
+        self.isPlaying = true
+        self.preparePlaybackForCurrentTrack()
+        return
+      }
+
+      self.isPlaying = false
+      self.publishState()
+      self.downloadTrack(track.toPayload()) { [weak self] result in
+        guard let self else { return }
+        DispatchQueue.main.async {
+          guard (result["success"] as? Bool) == true else {
+            self.publishState()
+            return
+          }
+          guard self.currentTrackId == track.trackId else { return }
+          self.isPlaying = true
+          self.preparePlaybackForCurrentTrack()
+        }
+      }
+    }
+  }
+
   private func ensureTrackInQueue(_ trackId: String) {
     if queueTrackIds.contains(trackId) { return }
     queueTrackIds.insert(trackId, at: 0)
@@ -329,6 +361,8 @@ final class NativeMusicPlayerEngine: NSObject {
       }
     }
 
+    prefetchUpcomingTrackIfNeeded()
+
     publishState()
   }
 
@@ -408,6 +442,18 @@ final class NativeMusicPlayerEngine: NSObject {
     if store.resolvedCachedFileURL(for: track) != nil { return false }
     if downloadTasks[track.trackId] != nil { return false }
     return resolveRemoteDownloadURL(for: track) != nil
+  }
+
+  private func prefetchUpcomingTrackIfNeeded() {
+    guard let currentTrackId,
+      let idx = queueTrackIds.firstIndex(of: currentTrackId),
+      idx < queueTrackIds.count - 1
+    else { return }
+
+    let nextId = queueTrackIds[idx + 1]
+    guard let nextTrack = store.getTrack(trackId: nextId), shouldAutoDownload(nextTrack) else { return }
+    guard let remoteURL = resolveRemoteDownloadURL(for: nextTrack) else { return }
+    startDownload(track: nextTrack, remoteURL: remoteURL)
   }
 
   private func resolvePlaybackURL(for track: NativeMusicPlayerTrack) -> URL? {

@@ -719,7 +719,6 @@ export default function RootLayout() {
       <KeyboardProvider>
         <View style={{ flex: 1 }}>
           <ThemeBackground pattern="fluid" />
-          <GlobalMusicPlayer />
           <StatusBar style={effectiveTheme === 'dark' ? 'light' : 'dark'} />
           <Stack
             screenOptions={{
@@ -749,6 +748,7 @@ export default function RootLayout() {
             />
             <Stack.Screen name="modal" options={{ presentation: 'modal', headerShown: false }} />
           </Stack>
+          <GlobalMusicPlayer />
           <GlassToast />
           <SessionExpiredBanner />
 

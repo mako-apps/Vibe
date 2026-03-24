@@ -712,7 +712,7 @@ public final class ChatNativeTabBarView: ExpoView, UITabBarDelegate, UITextField
   }
 
   private func updateVibeButton(for tab: ChatNativeTabItem?) {
-    guard let tab else {
+    guard tab != nil else {
       vibeChromeView.isHidden = true
       return
     }

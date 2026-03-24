@@ -4,7 +4,7 @@ defmodule Vibe.Agent do
 
   @statuses ~w[draft published disabled archived]
   @output_modes ~w[text media voice]
-  @autonomy_modes ~w[draft_first safe_auto full_auto]
+  @autonomy_modes ~w[draft_first manual safe_auto approval_required full_auto]
 
   @primary_key {:id, :binary_id, autogenerate: true}
   @foreign_key_type :binary_id

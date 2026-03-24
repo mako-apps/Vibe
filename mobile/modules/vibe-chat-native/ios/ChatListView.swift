@@ -898,7 +898,26 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
     }()
 
     let applyDataSource = { [weak self] in
-      self?.rows = parsed
+      guard let self else { return }
+      self.rows = parsed
+      let engineChatId = self.engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+      let resolvedChatId: String
+      if !engineChatId.isEmpty {
+        resolvedChatId = engineChatId
+      } else {
+        resolvedChatId =
+          parsed.first(where: { row in
+            if let chatId = row.chatId?.trimmingCharacters(in: .whitespacesAndNewlines) {
+              return !chatId.isEmpty
+            }
+            return false
+          })?.chatId?.trimmingCharacters(in: .whitespacesAndNewlines)
+          ?? ""
+      }
+      if !resolvedChatId.isEmpty {
+        ChatAudioQueueRegistry.shared.setRows(parsed, for: resolvedChatId)
+        VoiceBubblePlaybackCoordinator.shared.refreshCurrentSnapshotIfNeeded(forChatId: resolvedChatId)
+      }
     }
 
     let finalize = { [weak self] (animated: Bool) in

@@ -11,6 +11,7 @@ struct NativeMusicPlayerTheme {
 private struct NativeMusicPlayerViewState {
   let currentTrack: NativeMusicPlayerTrack?
   let queue: [NativeMusicPlayerTrack]
+  let library: [NativeMusicPlayerTrack]
   let isPlaying: Bool
   let isExpanded: Bool
   let progressMs: Double
@@ -23,6 +24,7 @@ private struct NativeMusicPlayerViewState {
   static let empty = NativeMusicPlayerViewState(
     currentTrack: nil,
     queue: [],
+    library: [],
     isPlaying: false,
     isExpanded: false,
     progressMs: 0.0,
@@ -36,11 +38,13 @@ private struct NativeMusicPlayerViewState {
   static func from(payload: [String: Any]) -> NativeMusicPlayerViewState {
     let currentTrack = (payload["currentTrack"] as? [String: Any]).flatMap(NativeMusicPlayerTrack.init)
     let queue = (payload["queue"] as? [[String: Any]] ?? []).compactMap(NativeMusicPlayerTrack.init)
+    let library = (payload["library"] as? [[String: Any]] ?? []).compactMap(NativeMusicPlayerTrack.init)
     let downloadingTracks = payload["downloadingTracks"] as? [String: Double] ?? [:]
     let currentTrackId = currentTrack?.trackId
     return NativeMusicPlayerViewState(
       currentTrack: currentTrack,
       queue: queue,
+      library: library,
       isPlaying: (payload["isPlaying"] as? Bool) ?? false,
       isExpanded: (payload["isExpanded"] as? Bool) ?? false,
       progressMs: (payload["progress"] as? NSNumber)?.doubleValue ?? (payload["progress"] as? Double) ?? 0.0,
@@ -54,40 +58,47 @@ private struct NativeMusicPlayerViewState {
     )
   }
 
-  static func from(voiceSnapshot: VoiceBubblePlaybackSnapshot) -> NativeMusicPlayerViewState {
+  static func from(
+    voiceSnapshot: VoiceBubblePlaybackSnapshot,
+    isExpanded: Bool = false
+  ) -> NativeMusicPlayerViewState {
     guard let messageId = voiceSnapshot.messageId else { return .empty }
     let durationMs = max(0.0, voiceSnapshot.duration * 1000.0)
     let progressMs = durationMs * max(0.0, min(1.0, Double(voiceSnapshot.progress)))
-    let track = NativeMusicPlayerTrack(
-      trackId: messageId,
-      videoId: nil,
-      id: nil,
-      source: "chat-voice",
-      title: voiceSnapshot.title ?? "Audio",
-      artist: voiceSnapshot.subtitle ?? "Vibegram",
-      album: nil,
-      duration: nil,
-      durationSeconds: voiceSnapshot.duration > 0.0 ? voiceSnapshot.duration : nil,
-      cover: nil,
-      previewURL: nil,
-      streamURL: nil,
-      localURI: nil,
-      cachedAt: nil,
-      playCount: 0,
-      lastPlayedAt: nil,
-      links: [:]
-    )
+    let queue = ChatAudioQueueRegistry.shared.tracks(for: voiceSnapshot.chatId)
+    let track =
+      queue.first(where: { $0.trackId == messageId })
+      ?? NativeMusicPlayerTrack(
+        trackId: messageId,
+        videoId: nil,
+        id: messageId,
+        source: "chat-music",
+        title: voiceSnapshot.title ?? "Audio",
+        artist: voiceSnapshot.subtitle ?? "Vibegram",
+        album: nil,
+        duration: nil,
+        durationSeconds: voiceSnapshot.duration > 0.0 ? voiceSnapshot.duration : nil,
+        cover: nil,
+        previewURL: nil,
+        streamURL: nil,
+        localURI: nil,
+        cachedAt: nil,
+        playCount: 0,
+        lastPlayedAt: nil,
+        links: [:]
+      )
     return NativeMusicPlayerViewState(
       currentTrack: track,
-      queue: [],
+      queue: queue,
+      library: [],
       isPlaying: voiceSnapshot.isPlaying,
-      isExpanded: false,
+      isExpanded: isExpanded,
       progressMs: progressMs,
       durationMs: durationMs,
       playbackRate: 1.0,
       currentDownloadProgress: voiceSnapshot.isDownloading ? Double(voiceSnapshot.downloadProgress ?? 0.0) : nil,
       artworkImage: voiceSnapshot.artwork,
-      allowsExpansion: false
+      allowsExpansion: voiceSnapshot.presentsGlobalPlayer
     )
   }
 }
@@ -97,8 +108,10 @@ private final class NativeMusicPlayerQueueRowView: UIControl {
   private let artworkFallbackView = UIImageView()
   private let titleLabel = UILabel()
   private let subtitleLabel = UILabel()
+  private let durationLabel = UILabel()
   private let activeIndicator = UIView()
   private let textStack = UIStackView()
+  private var theme = NativeMusicPlayerTheme()
   private var trackId: String?
   private var imageTask: URLSessionDataTask?
 
@@ -124,6 +137,10 @@ private final class NativeMusicPlayerQueueRowView: UIControl {
     subtitleLabel.font = .systemFont(ofSize: 12, weight: .medium)
     subtitleLabel.numberOfLines = 1
 
+    durationLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+    durationLabel.textAlignment = .right
+    addSubview(durationLabel)
+
     textStack.axis = .vertical
     textStack.alignment = .fill
     textStack.spacing = 2.0
@@ -132,7 +149,8 @@ private final class NativeMusicPlayerQueueRowView: UIControl {
     addSubview(textStack)
 
     activeIndicator.layer.cornerCurve = .continuous
-    activeIndicator.layer.cornerRadius = 4.0
+    activeIndicator.layer.cornerRadius = 3.0
+    activeIndicator.alpha = 0.0
     addSubview(activeIndicator)
 
     addTarget(self, action: #selector(handleTap), for: .touchUpInside)
@@ -143,8 +161,10 @@ private final class NativeMusicPlayerQueueRowView: UIControl {
   }
 
   func applyTheme(_ theme: NativeMusicPlayerTheme) {
+    self.theme = theme
     titleLabel.textColor = theme.text
     subtitleLabel.textColor = theme.secondaryText
+    durationLabel.textColor = theme.secondaryText
     artworkFallbackView.tintColor = theme.secondaryText
     activeIndicator.backgroundColor = theme.primary
   }
@@ -153,10 +173,11 @@ private final class NativeMusicPlayerQueueRowView: UIControl {
     trackId = track.trackId
     titleLabel.text = track.title
     subtitleLabel.text = track.artist
-    activeIndicator.isHidden = !isActive
+    durationLabel.text = track.duration
+    activeIndicator.alpha = isActive ? 1.0 : 0.0
     backgroundColor = isActive
-      ? UIColor.black.withAlphaComponent(0.12)
-      : UIColor.black.withAlphaComponent(0.04)
+      ? theme.primary.withAlphaComponent(0.08)
+      : theme.text.withAlphaComponent(0.03)
     loadImage(urlString: track.cover)
   }
 
@@ -167,16 +188,22 @@ private final class NativeMusicPlayerQueueRowView: UIControl {
     artworkView.frame = CGRect(x: inset, y: inset, width: artworkSide, height: artworkSide)
     artworkFallbackView.frame = artworkView.frame.insetBy(dx: 9.0, dy: 9.0)
     activeIndicator.frame = CGRect(
-      x: bounds.width - inset - 8.0,
-      y: floor((bounds.height - 8.0) * 0.5),
-      width: 8.0,
-      height: 8.0
+      x: bounds.width - inset - 6.0,
+      y: floor((bounds.height - 6.0) * 0.5),
+      width: 6.0,
+      height: 6.0
     )
     let textX = artworkView.frame.maxX + 12.0
+    durationLabel.frame = CGRect(
+      x: bounds.width - inset - 54.0,
+      y: floor((bounds.height - 14.0) * 0.5),
+      width: 44.0,
+      height: 14.0
+    )
     textStack.frame = CGRect(
       x: textX,
       y: floor((bounds.height - 34.0) * 0.5),
-      width: max(0.0, activeIndicator.frame.minX - 12.0 - textX),
+      width: max(0.0, durationLabel.frame.minX - 12.0 - textX),
       height: 34.0
     )
   }
@@ -207,8 +234,8 @@ private final class NativeMusicPlayerQueueRowView: UIControl {
   }
 }
 
-final class NativeMusicPlayerBannerView: UIView {
-  static let miniHeight: CGFloat = 52.0
+final class NativeMusicPlayerBannerView: UIView, UIGestureRecognizerDelegate {
+  static let miniHeight: CGFloat = 44.0
 
   private let dimView = UIView()
   private let expandedBlurView = UIVisualEffectView(effect: nil)
@@ -236,7 +263,12 @@ final class NativeMusicPlayerBannerView: UIView {
   private let miniArtworkFallbackView = UIImageView()
   private let miniTitleLabel = UILabel()
   private let miniSubtitleLabel = UILabel()
-  private let miniPlayButton = VoicePlayProgressView()
+  private let miniProgressTrackView = UIView()
+  private let miniProgressFillView = UIView()
+  private let miniProgressImageView = UIImageView()
+  private let miniProgressBlurView = UIVisualEffectView(effect: nil)
+  private let miniProgressTintView = UIView()
+  private let miniPlayButton = UIButton(type: .system)
   private let miniCloseButton = UIButton(type: .system)
   private let miniTextTapTarget = UIControl()
 
@@ -246,6 +278,16 @@ final class NativeMusicPlayerBannerView: UIView {
   private var coverImageTask: URLSessionDataTask?
   private var queueRowViews: [NativeMusicPlayerQueueRowView] = []
   private var pendingSeekValue: Float?
+  private var miniDragOffset = CGPoint.zero
+  private var miniDragStartOffset = CGPoint.zero
+  private var renderedExpandedState = false
+  private var hasAppliedPresentationState = false
+  private lazy var miniPanGesture: UIPanGestureRecognizer = {
+    let gesture = UIPanGestureRecognizer(target: self, action: #selector(handleMiniPan(_:)))
+    gesture.cancelsTouchesInView = false
+    gesture.delegate = self
+    return gesture
+  }()
 
   var onTogglePlayback: (() -> Void)?
   var onClose: (() -> Void)?
@@ -345,6 +387,7 @@ final class NativeMusicPlayerBannerView: UIView {
     expandedContentView.addSubview(queueTitleLabel)
 
     queueScrollView.showsVerticalScrollIndicator = false
+    queueScrollView.delegate = self
     expandedContentView.addSubview(queueScrollView)
 
     queueStackView.axis = .vertical
@@ -366,6 +409,26 @@ final class NativeMusicPlayerBannerView: UIView {
     miniArtworkFallbackView.image = UIImage(systemName: "music.note")
     addSubview(miniArtworkFallbackView)
 
+    miniProgressTrackView.layer.cornerCurve = .continuous
+    miniProgressTrackView.layer.cornerRadius = Self.miniHeight / 2.0
+    miniProgressTrackView.clipsToBounds = true
+    miniBlurView.contentView.addSubview(miniProgressTrackView)
+
+    miniProgressImageView.contentMode = .scaleAspectFill
+    miniProgressImageView.clipsToBounds = true
+    miniProgressFillView.addSubview(miniProgressImageView)
+
+    miniProgressBlurView.isUserInteractionEnabled = false
+    miniProgressFillView.addSubview(miniProgressBlurView)
+
+    miniProgressTintView.isUserInteractionEnabled = false
+    miniProgressFillView.addSubview(miniProgressTintView)
+
+    miniProgressFillView.layer.cornerCurve = .continuous
+    miniProgressFillView.layer.cornerRadius = Self.miniHeight / 2.0
+    miniProgressFillView.clipsToBounds = true
+    miniProgressTrackView.addSubview(miniProgressFillView)
+
     miniTitleLabel.font = .systemFont(ofSize: 14, weight: .semibold)
     miniTitleLabel.numberOfLines = 1
     addSubview(miniTitleLabel)
@@ -374,9 +437,11 @@ final class NativeMusicPlayerBannerView: UIView {
     miniSubtitleLabel.numberOfLines = 1
     addSubview(miniSubtitleLabel)
 
-    miniPlayButton.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(handleTogglePlayback)))
+    miniPlayButton.tintColor = .white
+    miniPlayButton.addTarget(self, action: #selector(handleTogglePlayback), for: .touchUpInside)
     addSubview(miniPlayButton)
 
+    miniCloseButton.configuration = .plain()
     miniCloseButton.setImage(
       UIImage(systemName: "xmark")?.withConfiguration(
         UIImage.SymbolConfiguration(pointSize: 14, weight: .bold)),
@@ -386,6 +451,7 @@ final class NativeMusicPlayerBannerView: UIView {
     addSubview(miniCloseButton)
 
     miniTextTapTarget.addTarget(self, action: #selector(handleExpand), for: .touchUpInside)
+    miniTextTapTarget.addGestureRecognizer(miniPanGesture)
     addSubview(miniTextTapTarget)
 
     isHidden = true
@@ -396,14 +462,36 @@ final class NativeMusicPlayerBannerView: UIView {
     return nil
   }
 
+  private func applyGlassMaterial(to blurView: UIVisualEffectView, interactive: Bool) {
+    if #available(iOS 26.0, *) {
+      let glass = UIGlassEffect()
+      glass.isInteractive = interactive
+      blurView.effect = glass
+    } else {
+      blurView.effect = UIBlurEffect(style: .systemMaterial)
+    }
+  }
+
+  private func applyMiniControlButtonStyle(button: UIButton, systemName: String) {
+    button.configuration = nil
+    button.backgroundColor = .clear
+    button.setImage(
+      UIImage(
+        systemName: systemName,
+        withConfiguration: UIImage.SymbolConfiguration(pointSize: 18, weight: .bold)
+      ),
+      for: .normal
+    )
+    button.tintColor = theme.text
+  }
+
   func applyTheme(_ theme: NativeMusicPlayerTheme) {
     self.theme = theme
-    let blurStyle: UIBlurEffect.Style = theme.isDark ? .systemChromeMaterialDark : .systemChromeMaterialLight
-    let miniBlurStyle: UIBlurEffect.Style = theme.isDark ? .systemUltraThinMaterialDark : .systemUltraThinMaterialLight
-    expandedBlurView.effect = UIBlurEffect(style: blurStyle)
-    miniBlurView.effect = UIBlurEffect(style: miniBlurStyle)
-    expandedBlurView.contentView.backgroundColor = theme.surface.withAlphaComponent(theme.isDark ? 0.16 : 0.08)
-    miniBlurView.contentView.backgroundColor = theme.surface.withAlphaComponent(theme.isDark ? 0.18 : 0.10)
+    applyGlassMaterial(to: expandedBlurView, interactive: true)
+    applyGlassMaterial(to: miniBlurView, interactive: true)
+    expandedBlurView.contentView.backgroundColor = theme.surface.withAlphaComponent(theme.isDark ? 0.16 : 0.10)
+    miniBlurView.contentView.backgroundColor = theme.surface.withAlphaComponent(theme.isDark ? 0.10 : 0.08)
+    miniBlurView.alpha = theme.isDark ? 0.98 : 0.94
 
     let secondaryAlpha: CGFloat = theme.isDark ? 0.72 : 0.62
     headerButton.tintColor = theme.text
@@ -421,13 +509,18 @@ final class NativeMusicPlayerBannerView: UIView {
     rateButton.backgroundColor = theme.text.withAlphaComponent(theme.isDark ? 0.10 : 0.08)
     queueTitleLabel.textColor = theme.text
 
-    miniBlurView.layer.borderWidth = 0.75
-    miniBlurView.layer.borderColor = theme.text.withAlphaComponent(theme.isDark ? 0.14 : 0.08).cgColor
     miniArtworkView.backgroundColor = coverView.backgroundColor
     miniArtworkFallbackView.tintColor = theme.secondaryText
     miniTitleLabel.textColor = theme.text
     miniSubtitleLabel.textColor = theme.text.withAlphaComponent(secondaryAlpha)
+    miniProgressTrackView.backgroundColor = .clear
+    miniProgressFillView.backgroundColor = .clear
+    applyGlassMaterial(to: miniProgressBlurView, interactive: false)
+    miniProgressTintView.backgroundColor = theme.primary.withAlphaComponent(theme.isDark ? 0.38 : 0.32)
+    miniPlayButton.tintColor = theme.text
     miniCloseButton.tintColor = theme.secondaryText
+    applyMiniControlButtonStyle(button: miniPlayButton, systemName: state.isPlaying ? "pause.fill" : "play.fill")
+    applyMiniControlButtonStyle(button: miniCloseButton, systemName: "xmark")
 
     progressSlider.minimumTrackTintColor = theme.primary
     progressSlider.maximumTrackTintColor = theme.text.withAlphaComponent(theme.isDark ? 0.16 : 0.10)
@@ -435,13 +528,8 @@ final class NativeMusicPlayerBannerView: UIView {
     progressSlider.setThumbImage(thumbImage, for: .normal)
     progressSlider.setThumbImage(thumbImage, for: .highlighted)
 
-    miniPlayButton.applyStyle(
-      fillColor: UIColor(white: 1.0, alpha: 0.96),
-      iconTint: theme.primary,
-      ringTint: theme.primary.withAlphaComponent(0.82)
-    )
     playButton.applyStyle(
-      fillColor: UIColor(white: 1.0, alpha: 0.96),
+      fillColor: theme.primary.withAlphaComponent(0.12),
       iconTint: theme.primary,
       ringTint: theme.primary.withAlphaComponent(0.82)
     )
@@ -459,8 +547,8 @@ final class NativeMusicPlayerBannerView: UIView {
     applyState(NativeMusicPlayerViewState.from(payload: payload))
   }
 
-  func applyVoiceSnapshot(_ snapshot: VoiceBubblePlaybackSnapshot) {
-    applyState(NativeMusicPlayerViewState.from(voiceSnapshot: snapshot))
+  func applyVoiceSnapshot(_ snapshot: VoiceBubblePlaybackSnapshot, isExpanded: Bool = false) {
+    applyState(NativeMusicPlayerViewState.from(voiceSnapshot: snapshot, isExpanded: isExpanded))
   }
 
   func containsInteractivePoint(_ point: CGPoint) -> Bool {
@@ -473,29 +561,28 @@ final class NativeMusicPlayerBannerView: UIView {
   }
 
   private func applyState(_ nextState: NativeMusicPlayerViewState) {
+    let previousExpandedState = renderedExpandedState
     state = nextState
     let shouldShow = nextState.currentTrack != nil
     isHidden = !shouldShow
     guard shouldShow, let track = nextState.currentTrack else { return }
+    let availableTracks = mergedAvailableTracks(for: nextState)
 
     miniTitleLabel.text = track.title
     expandedTitleLabel.text = track.title
-    miniSubtitleLabel.text = miniSubtitle(for: nextState, track: track)
-    expandedArtistLabel.text = track.artist
+    let detailText = playbackDetailText(for: nextState, track: track)
+    miniSubtitleLabel.text = detailText
+    expandedArtistLabel.text = detailText
     currentTimeLabel.text = Self.format(milliseconds: nextState.progressMs)
     durationLabel.text = Self.format(milliseconds: max(nextState.durationMs, (track.durationSeconds ?? 0.0) * 1000.0))
     rateButton.setTitle(Self.rateTitle(nextState.playbackRate), for: .normal)
-    queueTitleLabel.text = nextState.queue.isEmpty ? nil : "Up Next"
-    queueTitleLabel.isHidden = nextState.queue.isEmpty
+    queueTitleLabel.text = queueHeaderTitle(for: nextState, availableTracks: availableTracks)
+    queueTitleLabel.isHidden = availableTracks.isEmpty
 
     updateCoverImage(urlString: track.cover, directImage: nextState.artworkImage)
     applyPlaybackButtons(for: nextState)
-    downloadLabel.isHidden = nextState.currentDownloadProgress == nil
-    if let progress = nextState.currentDownloadProgress {
-      downloadLabel.text = progress > 0.0 ? "Downloading \(Int(progress * 100.0))%" : "Downloading"
-    } else {
-      downloadLabel.text = nil
-    }
+    downloadLabel.isHidden = true
+    downloadLabel.text = nil
 
     let durationMs = max(nextState.durationMs, 1.0)
     if !progressSlider.isTracking {
@@ -503,60 +590,174 @@ final class NativeMusicPlayerBannerView: UIView {
     }
 
     let isExpanded = nextState.allowsExpansion && nextState.isExpanded
-    if isExpanded {
-      dimView.alpha = 1.0
-      expandedBlurView.alpha = 1.0
-      miniBlurView.alpha = 0.0
-      miniArtworkView.alpha = 0.0
-      miniArtworkFallbackView.alpha = 0.0
-      miniTitleLabel.alpha = 0.0
-      miniSubtitleLabel.alpha = 0.0
-      miniPlayButton.alpha = 0.0
-      miniCloseButton.alpha = 0.0
-      miniTextTapTarget.isUserInteractionEnabled = false
-    } else {
-      dimView.alpha = 0.0
-      expandedBlurView.alpha = 0.0
-      miniBlurView.alpha = 1.0
-      miniArtworkView.alpha = 1.0
-      miniArtworkFallbackView.alpha = 1.0
-      miniTitleLabel.alpha = 1.0
-      miniSubtitleLabel.alpha = 1.0
-      miniPlayButton.alpha = 1.0
-      miniCloseButton.alpha = 1.0
-      miniTextTapTarget.isUserInteractionEnabled = nextState.allowsExpansion
-    }
+    applyExpandedPresentation(
+      isExpanded: isExpanded,
+      animated: hasAppliedPresentationState && previousExpandedState != isExpanded
+    )
 
     rebuildQueueRows()
     setNeedsLayout()
   }
 
+  private func miniPresentationViews() -> [UIView] {
+    [
+      miniBlurView,
+      miniArtworkView,
+      miniArtworkFallbackView,
+      miniTitleLabel,
+      miniSubtitleLabel,
+      miniPlayButton,
+      miniCloseButton,
+      miniTextTapTarget,
+    ]
+  }
+
+  private func applyExpandedPresentation(isExpanded: Bool, animated: Bool) {
+    renderedExpandedState = isExpanded
+    let expandedHiddenTransform = CGAffineTransform(translationX: 0.0, y: bounds.height)
+    let miniHiddenTransform = CGAffineTransform(translationX: 0.0, y: -10.0)
+    let miniVisibleAlpha = theme.isDark ? 0.98 : 0.94
+    let miniViews = miniPresentationViews()
+
+    let applyFinalState = {
+      self.dimView.alpha = isExpanded ? 1.0 : 0.0
+      self.dimView.isUserInteractionEnabled = isExpanded
+      self.expandedBlurView.alpha = isExpanded ? 1.0 : 0.0
+      self.expandedBlurView.transform = isExpanded ? .identity : expandedHiddenTransform
+      self.expandedBlurView.isUserInteractionEnabled = isExpanded
+      
+      // Modal corner radius for 90% view
+      self.expandedBlurView.layer.cornerRadius = isExpanded ? 32.0 : 0.0
+      self.expandedBlurView.layer.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+
+      self.miniBlurView.alpha = isExpanded ? 0.0 : miniVisibleAlpha
+      for view in miniViews where view !== self.miniBlurView {
+        view.alpha = isExpanded ? 0.0 : 1.0
+      }
+      for view in miniViews {
+        view.transform = isExpanded ? miniHiddenTransform : .identity
+      }
+      self.miniTextTapTarget.isUserInteractionEnabled = !isExpanded
+    }
+
+    guard animated else {
+      applyFinalState()
+      hasAppliedPresentationState = true
+      return
+    }
+
+    if isExpanded {
+      expandedBlurView.alpha = 0.0
+      expandedBlurView.transform = expandedHiddenTransform
+      expandedBlurView.isUserInteractionEnabled = true
+      dimView.alpha = 0.0
+      dimView.isUserInteractionEnabled = true
+    } else {
+      miniBlurView.alpha = 0.0
+      for view in miniViews where view !== miniBlurView {
+        view.alpha = 0.0
+      }
+      for view in miniViews {
+        view.transform = miniHiddenTransform
+      }
+      miniTextTapTarget.isUserInteractionEnabled = true
+    }
+
+    UIView.animate(
+      withDuration: 0.46,
+      delay: 0.0,
+      usingSpringWithDamping: 0.88,
+      initialSpringVelocity: 0.16,
+      options: [.beginFromCurrentState, .curveEaseInOut, .allowUserInteraction]
+    ) {
+      applyFinalState()
+    }
+
+    hasAppliedPresentationState = true
+  }
+
   override func layoutSubviews() {
     super.layoutSubviews()
     dimView.frame = bounds
-    expandedBlurView.frame = bounds
-    expandedContentView.frame = bounds
+    
+    // 90% Height Modal Layout
+    let expandedH = bounds.height * 0.90
+    expandedBlurView.frame = CGRect(x: 0, y: bounds.height - expandedH, width: bounds.width, height: expandedH)
+    expandedContentView.frame = expandedBlurView.bounds
 
-    let collapsedY = max(8.0, topInset + 8.0)
+    let collapsedY = max(24.0, topInset + 60.0)
     let collapsedInset: CGFloat = 20.0
     let collapsedWidth = max(0.0, bounds.width - (collapsedInset * 2.0))
-    let miniFrame = CGRect(
+    let baseMiniFrame = CGRect(
       x: collapsedInset,
       y: collapsedY,
       width: collapsedWidth,
       height: Self.miniHeight
     )
+    miniDragOffset = clampedMiniOffset(miniDragOffset, for: baseMiniFrame)
+    let miniFrame = resolvedMiniFrame(from: baseMiniFrame)
 
     miniBlurView.frame = miniFrame
-    let artworkSide: CGFloat = 30.0
-    miniArtworkView.frame = CGRect(x: miniFrame.minX + 11.0, y: miniFrame.minY + 11.0, width: artworkSide, height: artworkSide)
-    miniArtworkFallbackView.frame = miniArtworkView.frame.insetBy(dx: 8.0, dy: 8.0)
-    miniCloseButton.frame = CGRect(x: miniFrame.maxX - 36.0, y: miniFrame.minY + 10.0, width: 24.0, height: 24.0)
-    miniPlayButton.frame = CGRect(x: miniCloseButton.frame.minX - 40.0, y: miniFrame.minY + 10.0, width: 32.0, height: 32.0)
+    miniProgressTrackView.frame = miniBlurView.bounds
+    let miniProgressWidth = miniProgressTrackView.bounds.width * resolvedMiniProgress(for: state)
+    let targetFillFrame = CGRect(
+      x: 0.0,
+      y: 0.0,
+      width: max(0.0, min(miniProgressTrackView.bounds.width, miniProgressWidth)),
+      height: miniProgressTrackView.bounds.height
+    )
+    if miniProgressFillView.frame != targetFillFrame {
+      let fromFrame = miniProgressFillView.layer.presentation()?.frame ?? miniProgressFillView.frame
+      miniProgressFillView.frame = targetFillFrame
+      if abs(fromFrame.width - targetFillFrame.width) > 0.5 {
+        let animation = CABasicAnimation(keyPath: "bounds.size.width")
+        animation.fromValue = fromFrame.width
+        animation.toValue = targetFillFrame.width
+        animation.duration = 0.24
+        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        miniProgressFillView.layer.add(animation, forKey: "miniFluidWidth")
+      }
+    }
+    miniProgressImageView.frame = miniProgressFillView.bounds
+    miniProgressBlurView.frame = miniProgressFillView.bounds
+    miniProgressTintView.frame = miniProgressFillView.bounds
+
+    let artworkSide: CGFloat = 24.0
+    miniArtworkView.frame = CGRect(
+      x: miniFrame.minX + 12.0,
+      y: miniFrame.minY + floor((miniFrame.height - artworkSide) * 0.5) - 1.0,
+      width: artworkSide,
+      height: artworkSide
+    )
+    miniArtworkFallbackView.frame = miniArtworkView.frame.insetBy(dx: 6.5, dy: 6.5)
+
+    let controlSide: CGFloat = 24.0
+    miniCloseButton.frame = CGRect(
+      x: miniFrame.maxX - 10.0 - controlSide,
+      y: miniFrame.midY - (controlSide * 0.5),
+      width: controlSide,
+      height: controlSide
+    )
+    miniPlayButton.frame = CGRect(
+      x: miniCloseButton.frame.minX - 30.0,
+      y: miniFrame.midY - (controlSide * 0.5),
+      width: controlSide,
+      height: controlSide
+    )
     let textX = miniArtworkView.frame.maxX + 10.0
     let textRight = miniPlayButton.frame.minX - 10.0
-    miniTitleLabel.frame = CGRect(x: textX, y: miniFrame.minY + 9.0, width: max(0.0, textRight - textX), height: 17.0)
-    miniSubtitleLabel.frame = CGRect(x: textX, y: miniTitleLabel.frame.maxY + 2.0, width: miniTitleLabel.frame.width, height: 15.0)
+    miniTitleLabel.frame = CGRect(
+      x: textX,
+      y: miniFrame.minY + 7.0,
+      width: max(0.0, textRight - textX),
+      height: 15.0
+    )
+    miniSubtitleLabel.frame = CGRect(
+      x: textX,
+      y: miniTitleLabel.frame.maxY + 1.0,
+      width: miniTitleLabel.frame.width,
+      height: 13.0
+    )
     miniTextTapTarget.frame = CGRect(
       x: miniFrame.minX,
       y: miniFrame.minY,
@@ -568,15 +769,22 @@ final class NativeMusicPlayerBannerView: UIView {
     headerButton.frame = CGRect(x: 16.0, y: safeTop, width: 36.0, height: 36.0)
     expandedDismissButton.frame = CGRect(x: bounds.width - 52.0, y: safeTop, width: 36.0, height: 36.0)
 
+    let scrollOffset = queueScrollView.contentOffset.y
+    let scrollScale = max(0.4, 1.0 - (max(0, scrollOffset) / 300.0))
+    let scrollAlpha = max(0.0, 1.0 - (max(0, scrollOffset) / 200.0))
+
     let horizontalInset: CGFloat = 32.0
-    let coverWidth = min(bounds.width - (horizontalInset * 2.0), 320.0)
+    let baseCoverWidth = min(bounds.width - (horizontalInset * 2.0), 320.0)
+    let coverWidth = baseCoverWidth * scrollScale
     coverView.frame = CGRect(
       x: floor((bounds.width - coverWidth) * 0.5),
-      y: safeTop + 52.0,
+      y: max(safeTop + 10.0, (safeTop + 52.0) - (scrollOffset * 0.5)),
       width: coverWidth,
       height: coverWidth
     )
-    coverFallbackView.frame = coverView.frame.insetBy(dx: 72.0, dy: 72.0)
+    coverView.alpha = scrollAlpha
+    coverFallbackView.frame = coverView.frame.insetBy(dx: 72.0 * scrollScale, dy: 72.0 * scrollScale)
+    coverFallbackView.alpha = scrollAlpha
 
     expandedTitleLabel.frame = CGRect(
       x: horizontalInset,
@@ -584,12 +792,14 @@ final class NativeMusicPlayerBannerView: UIView {
       width: bounds.width - (horizontalInset * 2.0),
       height: 64.0
     )
+    expandedTitleLabel.alpha = scrollAlpha
     expandedArtistLabel.frame = CGRect(
       x: horizontalInset,
       y: expandedTitleLabel.frame.maxY + 2.0,
       width: expandedTitleLabel.frame.width,
       height: 44.0
     )
+    expandedArtistLabel.alpha = scrollAlpha
 
     currentTimeLabel.frame = CGRect(x: horizontalInset, y: expandedArtistLabel.frame.maxY + 18.0, width: 56.0, height: 16.0)
     durationLabel.frame = CGRect(x: bounds.width - horizontalInset - 56.0, y: currentTimeLabel.frame.minY, width: 56.0, height: 16.0)
@@ -599,18 +809,21 @@ final class NativeMusicPlayerBannerView: UIView {
       width: bounds.width - (horizontalInset * 2.0),
       height: 28.0
     )
-    downloadLabel.frame = CGRect(
-      x: horizontalInset,
-      y: progressSlider.frame.maxY + 6.0,
-      width: bounds.width - (horizontalInset * 2.0),
-      height: 18.0
-    )
+    progressSlider.alpha = scrollAlpha
+    
+    downloadLabel.frame = .zero
+    downloadLabel.isHidden = true
 
-    let controlsY = downloadLabel.frame.maxY + 22.0
+    let controlsY = progressSlider.frame.maxY + 12.0
     prevButton.frame = CGRect(x: bounds.midX - 108.0, y: controlsY, width: 40.0, height: 40.0)
     playButton.frame = CGRect(x: bounds.midX - 26.0, y: controlsY - 6.0, width: 52.0, height: 52.0)
     nextButton.frame = CGRect(x: bounds.midX + 68.0, y: controlsY, width: 40.0, height: 40.0)
     rateButton.frame = CGRect(x: bounds.midX - 28.0, y: playButton.frame.maxY + 16.0, width: 56.0, height: 30.0)
+    
+    prevButton.alpha = scrollAlpha
+    playButton.alpha = scrollAlpha
+    nextButton.alpha = scrollAlpha
+    rateButton.alpha = scrollAlpha
 
     queueTitleLabel.frame = CGRect(
       x: horizontalInset,
@@ -635,41 +848,69 @@ final class NativeMusicPlayerBannerView: UIView {
     queueScrollView.contentSize = CGSize(width: queueScrollView.bounds.width, height: rowY)
   }
 
-  private func miniSubtitle(for state: NativeMusicPlayerViewState, track: NativeMusicPlayerTrack) -> String {
-    if let progress = state.currentDownloadProgress {
-      return progress > 0.0 ? "Downloading \(Int(progress * 100.0))%" : "Downloading"
-    }
+  private func playbackDetailText(for state: NativeMusicPlayerViewState, track: NativeMusicPlayerTrack) -> String {
     let effectiveDuration = max(state.durationMs, (track.durationSeconds ?? 0.0) * 1000.0)
     if effectiveDuration > 0.0 {
-      return "\(Self.format(milliseconds: state.progressMs)) / \(Self.format(milliseconds: effectiveDuration))"
+      if state.isPlaying || state.progressMs > 0.0 {
+        return "\(Self.format(milliseconds: state.progressMs)) / \(Self.format(milliseconds: effectiveDuration))"
+      }
+      return Self.format(milliseconds: effectiveDuration)
     }
     return track.artist
   }
 
-  private func applyPlaybackButtons(for state: NativeMusicPlayerViewState) {
-    if let progress = state.currentDownloadProgress {
-      miniPlayButton.setUploadState(isUploading: false, progress: nil)
-      playButton.setUploadState(isUploading: false, progress: nil)
-      miniPlayButton.setDownloadState(needsDownload: true, isDownloading: true, progress: progress)
-      playButton.setDownloadState(needsDownload: true, isDownloading: true, progress: progress)
-      return
+  private func mergedAvailableTracks(for state: NativeMusicPlayerViewState) -> [NativeMusicPlayerTrack] {
+    var seen = Set<String>()
+    var tracks: [NativeMusicPlayerTrack] = []
+    for track in state.queue + state.library {
+      if seen.insert(track.trackId).inserted {
+        tracks.append(track)
+      }
     }
+    return tracks
+  }
 
-    miniPlayButton.setDownloadState(needsDownload: false, isDownloading: false, progress: nil)
+  private func queueHeaderTitle(
+    for state: NativeMusicPlayerViewState,
+    availableTracks: [NativeMusicPlayerTrack]
+  ) -> String? {
+    guard !availableTracks.isEmpty else { return nil }
+    if !state.queue.isEmpty && !state.library.isEmpty {
+      return "Queue & Local Music"
+    }
+    if !state.queue.isEmpty {
+      return "Up Next"
+    }
+    return "Local Music & MP3"
+  }
+
+  private func applyPlaybackButtons(for state: NativeMusicPlayerViewState) {
+    let miniSymbolName: String
     playButton.setDownloadState(needsDownload: false, isDownloading: false, progress: nil)
 
     let effectiveDuration = max(state.durationMs, 1.0)
     let progress = CGFloat(max(0.0, min(1.0, state.progressMs / effectiveDuration)))
-    miniPlayButton.setPlaybackState(isPlaying: state.isPlaying, progress: progress, level: state.isPlaying ? 0.20 : 0.0)
-    playButton.setPlaybackState(isPlaying: state.isPlaying, progress: progress, level: state.isPlaying ? 0.20 : 0.0)
+    playButton.setPlaybackState(
+      isPlaying: state.isPlaying,
+      progress: progress,
+      level: state.isPlaying ? 0.20 : 0.0
+    )
+    miniSymbolName = state.isPlaying ? "pause.fill" : "play.fill"
+
+    applyMiniControlButtonStyle(button: miniPlayButton, systemName: miniSymbolName)
+  }
+
+  private func resolvedMiniProgress(for state: NativeMusicPlayerViewState) -> CGFloat {
+    let duration = max(state.durationMs, (state.currentTrack?.durationSeconds ?? 0.0) * 1000.0, 1.0)
+    return CGFloat(max(0.0, min(1.0, state.progressMs / duration)))
   }
 
   private func rebuildQueueRows() {
     queueRowViews.forEach { $0.removeFromSuperview() }
     queueRowViews.removeAll()
 
-    guard !state.queue.isEmpty, let currentTrackId = state.currentTrack?.trackId else { return }
-    for track in state.queue {
+    guard let currentTrackId = state.currentTrack?.trackId else { return }
+    for track in mergedAvailableTracks(for: state) {
       let row = NativeMusicPlayerQueueRowView()
       row.applyTheme(theme)
       row.configure(track: track, isActive: track.trackId == currentTrackId)
@@ -685,11 +926,13 @@ final class NativeMusicPlayerBannerView: UIView {
     coverImageTask?.cancel()
     coverView.image = nil
     miniArtworkView.image = nil
+    miniProgressImageView.image = nil
     coverFallbackView.isHidden = false
     miniArtworkFallbackView.isHidden = false
     if let directImage {
       coverView.image = directImage
       miniArtworkView.image = directImage
+      miniProgressImageView.image = directImage
       coverFallbackView.isHidden = true
       miniArtworkFallbackView.isHidden = true
       return
@@ -705,6 +948,7 @@ final class NativeMusicPlayerBannerView: UIView {
       DispatchQueue.main.async {
         self.coverView.image = image
         self.miniArtworkView.image = image
+        self.miniProgressImageView.image = image
         self.coverFallbackView.isHidden = true
         self.miniArtworkFallbackView.isHidden = true
       }
@@ -742,12 +986,32 @@ final class NativeMusicPlayerBannerView: UIView {
     }
   }
 
+  private func resolvedMiniFrame(from baseFrame: CGRect) -> CGRect {
+    let clampedOffset = clampedMiniOffset(miniDragOffset, for: baseFrame)
+    return baseFrame.offsetBy(dx: clampedOffset.x, dy: clampedOffset.y)
+  }
+
+  private func clampedMiniOffset(_ proposedOffset: CGPoint, for baseFrame: CGRect) -> CGPoint {
+    let minX = -baseFrame.minX + 12.0
+    let maxX = bounds.width - baseFrame.maxX - 12.0
+    let minY = -baseFrame.minY + max(12.0, topInset + 10.0)
+    let maxY = bounds.height - baseFrame.maxY - 24.0
+    return CGPoint(
+      x: min(max(proposedOffset.x, minX), maxX),
+      y: min(max(proposedOffset.y, minY), maxY)
+    )
+  }
+
   @objc private func handleTogglePlayback() {
     onTogglePlayback?()
   }
 
   @objc private func handleClose() {
-    onClose?()
+    if state.isExpanded {
+      onSetExpanded?(false)
+    } else {
+      onClose?()
+    }
   }
 
   @objc private func handleExpand() {
@@ -783,5 +1047,48 @@ final class NativeMusicPlayerBannerView: UIView {
     pendingSeekValue = nil
     let duration = max(state.durationMs, 1.0)
     onSeek?(Double(value) * duration)
+  }
+
+  @objc private func handleMiniPan(_ gesture: UIPanGestureRecognizer) {
+    guard !state.isExpanded, !isHidden else { return }
+    let collapsedY = max(24.0, topInset + 60.0)
+    let collapsedInset: CGFloat = 20.0
+    let collapsedWidth = max(0.0, bounds.width - (collapsedInset * 2.0))
+    let baseMiniFrame = CGRect(
+      x: collapsedInset,
+      y: collapsedY,
+      width: collapsedWidth,
+      height: Self.miniHeight
+    )
+
+    switch gesture.state {
+    case .began:
+      miniDragStartOffset = miniDragOffset
+    case .changed, .ended:
+      let translation = gesture.translation(in: self)
+      miniDragOffset = clampedMiniOffset(
+        CGPoint(
+          x: miniDragStartOffset.x + translation.x,
+          y: miniDragStartOffset.y + translation.y
+        ),
+        for: baseMiniFrame
+      )
+      setNeedsLayout()
+    default:
+      break
+    }
+  }
+
+  override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+    guard gestureRecognizer === miniPanGesture else { return true }
+    return !state.isExpanded && !isHidden
+  }
+}
+
+extension NativeMusicPlayerBannerView: UIScrollViewDelegate {
+  func scrollViewDidScroll(_ scrollView: UIScrollView) {
+    if state.isExpanded {
+      setNeedsLayout()
+    }
   }
 }

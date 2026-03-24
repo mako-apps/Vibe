@@ -69,13 +69,7 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
   // ── Camera ──
   private var cameraPreviewAvailable = false
   private weak var cameraPreviewHostView: UIView?
-  private let cameraSession = AVCaptureSession()
-  private let cameraPreviewLayer = AVCaptureVideoPreviewLayer()
-  private let cameraSessionQueue = DispatchQueue(
-    label: "chat.attachment.menu.camera.session",
-    qos: .userInitiated
-  )
-  private var isCameraConfigured = false
+  private var isCameraLoading = true
 
   private let selectionFeedback = UISelectionFeedbackGenerator()
 
@@ -143,7 +137,6 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
     super.viewDidLoad()
     view.backgroundColor = modalBgColor
     view.clipsToBounds = true
-    cameraPreviewLayer.videoGravity = .resizeAspectFill
 
     configureSheet()
     setupContent()  // content first (behind everything)
@@ -1155,13 +1148,13 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
   }
 
   // MARK: - Camera
-
+  
   private func bindCameraPreview(to hostView: UIView) {
     cameraPreviewHostView = hostView
-    cameraPreviewLayer.session = cameraSession
-    if cameraPreviewLayer.superlayer !== hostView.layer {
-      cameraPreviewLayer.removeFromSuperlayer()
-      hostView.layer.insertSublayer(cameraPreviewLayer, at: 0)
+    let layer = ChatAttachmentMenuCameraManager.shared.previewLayer
+    if layer.superlayer !== hostView.layer {
+      layer.removeFromSuperlayer()
+      hostView.layer.insertSublayer(layer, at: 0)
     }
     updateCameraPreviewFrame()
   }
@@ -1170,7 +1163,7 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
     guard let host = cameraPreviewHostView else { return }
     CATransaction.begin()
     CATransaction.setDisableActions(true)
-    cameraPreviewLayer.frame = host.bounds
+    ChatAttachmentMenuCameraManager.shared.previewLayer.frame = host.bounds
     CATransaction.commit()
   }
 
@@ -1182,61 +1175,22 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
   }
 
   private func startCameraPreview() {
-    let status = AVCaptureDevice.authorizationStatus(for: .video)
-    switch status {
-    case .authorized: configureAndStartCameraSession()
-    case .notDetermined:
-      AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
-        DispatchQueue.main.async {
-          self?.cameraPreviewAvailable = granted
-          self?.reloadCameraTile()
-        }
-        if granted { self?.configureAndStartCameraSession() }
-      }
-    default:
-      cameraPreviewAvailable = false
-      reloadCameraTile()
-    }
-  }
-
-  private func configureAndStartCameraSession() {
-    cameraSessionQueue.async { [weak self] in
-      guard let self else { return }
-      if !self.isCameraConfigured {
-        self.cameraSession.beginConfiguration()
-        self.cameraSession.sessionPreset = .photo
-        self.cameraSession.inputs.forEach { self.cameraSession.removeInput($0) }
-        let cam =
-          AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front)
-          ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
-        guard let cam, let input = try? AVCaptureDeviceInput(device: cam),
-          self.cameraSession.canAddInput(input)
-        else {
-          self.cameraSession.commitConfiguration()
-          DispatchQueue.main.async {
-            self.cameraPreviewAvailable = false
-            self.reloadCameraTile()
-          }
-          return
-        }
-        self.cameraSession.addInput(input)
-        self.cameraSession.commitConfiguration()
-        self.isCameraConfigured = true
-      }
-      guard !self.cameraSession.isRunning else { return }
-      self.cameraSession.startRunning()
-      DispatchQueue.main.async {
-        self.cameraPreviewAvailable = true
-        self.reloadCameraTile()
+    isCameraLoading = true
+    reloadCameraTile()
+    ChatAttachmentMenuCameraManager.shared.requestStart { [weak self] success in
+      self?.cameraPreviewAvailable = success
+      // Small delay to ensure the first frame is actually visible before removing blur
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+        self?.isCameraLoading = false
+        self?.reloadCameraTile()
       }
     }
   }
 
   private func stopCameraPreview() {
-    cameraPreviewLayer.session = nil
+    ChatAttachmentMenuCameraManager.shared.previewLayer.removeFromSuperlayer()
     cameraPreviewHostView = nil
-    let session = cameraSession
-    cameraSessionQueue.async { if session.isRunning { session.stopRunning() } }
+    ChatAttachmentMenuCameraManager.shared.requestStop()
   }
 
   // MARK: - Helpers
@@ -1318,6 +1272,7 @@ extension ChatAttachmentMenuController:
         ) as? ChatAttachmentCameraCell
       else { return UICollectionViewCell() }
       cell.setCameraAvailable(cameraPreviewAvailable)
+      cell.setLoading(isCameraLoading)
       bindCameraPreview(to: cell.previewView)
       return cell
     }
@@ -1595,6 +1550,8 @@ private final class ChatAttachmentCameraCell: UICollectionViewCell {
   private let unavailableOverlay = UIView()
   private let unavailableIcon = UIImageView()
   private let unavailableLabel = UILabel()
+  private let loadingBlurView = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
+  private let loadingIndicator = UIActivityIndicatorView(style: .medium)
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -1633,6 +1590,15 @@ private final class ChatAttachmentCameraCell: UICollectionViewCell {
     unavailableLabel.textColor = UIColor.white.withAlphaComponent(0.92)
     unavailableLabel.textAlignment = .center
     unavailableOverlay.addSubview(unavailableLabel)
+    
+    loadingBlurView.frame = bounds
+    loadingBlurView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    contentView.addSubview(loadingBlurView)
+    
+    loadingIndicator.color = .white
+    loadingIndicator.startAnimating()
+    loadingIndicator.autoresizingMask = [.flexibleTopMargin, .flexibleBottomMargin, .flexibleLeftMargin, .flexibleRightMargin]
+    loadingBlurView.contentView.addSubview(loadingIndicator)
   }
 
   required init?(coder: NSCoder) { nil }
@@ -1643,6 +1609,8 @@ private final class ChatAttachmentCameraCell: UICollectionViewCell {
     unavailableIcon.frame = CGRect(x: (bounds.width - 20) * 0.5, y: cy - 16, width: 20, height: 20)
     unavailableLabel.frame = CGRect(
       x: 6, y: unavailableIcon.frame.maxY + 2, width: bounds.width - 12, height: 14)
+      
+    loadingIndicator.center = CGPoint(x: bounds.midX, y: bounds.midY)
 
     let b = previewView.bounds
     let path = UIBezierPath()
@@ -1664,6 +1632,16 @@ private final class ChatAttachmentCameraCell: UICollectionViewCell {
 
   func setCameraAvailable(_ available: Bool) {
     unavailableOverlay.isHidden = available
+  }
+  
+  func setLoading(_ isLoading: Bool) {
+    if isLoading {
+      loadingBlurView.alpha = 1
+    } else {
+      UIView.animate(withDuration: 0.25) {
+        self.loadingBlurView.alpha = 0
+      }
+    }
   }
 }
 
@@ -1788,6 +1766,81 @@ private final class AttachmentRowView: UIControl {
   override var isHighlighted: Bool {
     didSet {
       backgroundColor = isHighlighted ? UIColor(white: 0.5, alpha: 0.1) : .clear
+    }
+  }
+}
+
+// MARK: - Shared Camera Manager
+
+private final class ChatAttachmentMenuCameraManager {
+  static let shared = ChatAttachmentMenuCameraManager()
+  
+  let session = AVCaptureSession()
+  let previewLayer = AVCaptureVideoPreviewLayer()
+  private let queue = DispatchQueue(label: "chat.attachment.menu.camera.session", qos: .userInitiated)
+  private var isConfigured = false
+  private(set) var isAvailable = false
+  
+  private init() {
+    previewLayer.session = session
+    previewLayer.videoGravity = .resizeAspectFill
+  }
+  
+  func requestStart(completion: @escaping (Bool) -> Void) {
+    let status = AVCaptureDevice.authorizationStatus(for: .video)
+    switch status {
+    case .authorized:
+      configureAndStart(completion)
+    case .notDetermined:
+      AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
+        if granted {
+          self?.configureAndStart(completion)
+        } else {
+          DispatchQueue.main.async { completion(false) }
+        }
+      }
+    default:
+      DispatchQueue.main.async { completion(false) }
+    }
+  }
+  
+  private func configureAndStart(_ completion: @escaping (Bool) -> Void) {
+    queue.async { [weak self] in
+      guard let self else { return }
+      
+      let notify: (Bool) -> Void = { success in
+        DispatchQueue.main.async {
+          self.isAvailable = success
+          completion(success)
+        }
+      }
+      
+      if !self.isConfigured {
+        self.session.beginConfiguration()
+        self.session.sessionPreset = .photo
+        self.session.inputs.forEach { self.session.removeInput($0) }
+        let cam = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front) ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+        guard let cam, let input = try? AVCaptureDeviceInput(device: cam), self.session.canAddInput(input) else {
+          self.session.commitConfiguration()
+          notify(false)
+          return
+        }
+        self.session.addInput(input)
+        self.session.commitConfiguration()
+        self.isConfigured = true
+      }
+      if !self.session.isRunning {
+        self.session.startRunning()
+      }
+      notify(true)
+    }
+  }
+  
+  func requestStop() {
+    queue.async { [weak self] in
+      if self?.session.isRunning == true {
+        self?.session.stopRunning()
+      }
     }
   }
 }
