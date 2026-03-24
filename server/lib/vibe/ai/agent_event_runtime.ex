@@ -906,12 +906,19 @@ defmodule Vibe.AI.AgentEventRuntime do
   defp matching_runbook(agent, integration, event_type) do
     integration_id = integration && integration.id
 
-    Repo.all(
+    query =
       from r in AgentRunbook,
         where: r.agent_id == ^agent.id and r.enabled == true,
-        where: is_nil(r.integration_id) or r.integration_id == ^integration_id,
         order_by: [desc: r.integration_id, asc: r.inserted_at]
-    )
+
+    query =
+      if is_binary(integration_id) do
+        from r in query, where: is_nil(r.integration_id) or r.integration_id == ^integration_id
+      else
+        from r in query, where: is_nil(r.integration_id)
+      end
+
+    Repo.all(query)
     |> Enum.find(fn runbook ->
       types = List.wrap(runbook.event_types_enabled)
       types == [] or event_type in types
