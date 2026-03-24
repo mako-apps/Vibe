@@ -83,14 +83,14 @@ defmodule Vibe.AI.StandaloneAgent do
 
     try do
       with {:ok, final_text} <-
-             ChatAgent.stream_response(
+             stream_agent_text(
                message,
                callback,
-               images: image_urls,
-               chat_id: vibe_chat_id,
-               user_id: agent.owner_user_id,
-               system_prompt: system_prompt,
-               enabled_tools: agent.enabled_tools || []
+               image_urls,
+               vibe_chat_id,
+               agent.owner_user_id,
+               system_prompt,
+               agent.enabled_tools || []
              ) do
         accumulated = Elixir.Agent.get(collected, & &1)
         outputs = finalize_outputs(agent, final_text, accumulated.outputs, requested_output_mode)
@@ -227,6 +227,27 @@ defmodule Vibe.AI.StandaloneAgent do
   end
 
   defp normalize_string(_), do: nil
+
+  defp stream_agent_text(message, callback, image_urls, vibe_chat_id, user_id, system_prompt, enabled_tools) do
+    case ChatAgent.stream_response(
+           message,
+           callback,
+           images: image_urls,
+           chat_id: vibe_chat_id,
+           user_id: user_id,
+           system_prompt: system_prompt,
+           enabled_tools: enabled_tools
+         ) do
+      {:ok, final_text} ->
+        {:ok, final_text}
+
+      {:ok, final_text, _state} ->
+        {:ok, final_text}
+
+      other ->
+        other
+    end
+  end
 
   defp finalize_outputs(agent, final_text, tool_outputs, requested_output_mode) do
     base_outputs =

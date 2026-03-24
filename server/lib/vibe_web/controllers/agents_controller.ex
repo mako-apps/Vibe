@@ -1,5 +1,6 @@
 defmodule VibeWeb.AgentsController do
   use VibeWeb, :controller
+  require Logger
 
   alias Vibe.Agents
   alias Vibe.AI.AgentEventRuntime
@@ -101,6 +102,13 @@ defmodule VibeWeb.AgentsController do
   def invoke(conn, %{"identifier" => identifier} = params) do
     secret = List.first(get_req_header(conn, "x-vibe-agent-secret"))
 
+    Logger.info(
+      "[AgentsController] invoke start " <>
+        "identifier=#{identifier} method=#{conn.method} path=#{conn.request_path} " <>
+        "content_type=#{List.first(get_req_header(conn, "content-type")) || "unknown"} " <>
+        "secret_present=#{is_binary(secret)} params_keys=#{inspect(Map.keys(params) |> Enum.sort())}"
+    )
+
     with %{} = agent <- Agents.get_invoke_target(identifier),
          :ok <- ensure_agent_published(agent),
          :ok <- ensure_secret(agent, secret),
@@ -113,8 +121,14 @@ defmodule VibeWeb.AgentsController do
              external_user_id: params["externalUserId"] || params["external_user_id"],
              request_payload: Map.drop(params, ["identifier"]),
              response_payload: result,
-             status: "completed"
+           status: "completed"
            }) do
+      Logger.info(
+        "[AgentsController] invoke success " <>
+          "identifier=#{identifier} agent_id=#{agent.id} invocation_id=#{invocation.id} " <>
+          "outputs=#{length(Map.get(result, :outputs, Map.get(result, "outputs", [])) || [])}"
+      )
+
       if is_binary(agent.callback_url) and String.trim(agent.callback_url) != "" do
         _ = Agents.create_delivery_event(agent, invocation, "agent.invocation.completed", result)
       end
@@ -122,18 +136,23 @@ defmodule VibeWeb.AgentsController do
       json(conn, result |> Map.put(:success, true) |> Map.put(:invocationId, invocation.id))
     else
       nil ->
+        Logger.warning("[AgentsController] invoke missing agent identifier=#{identifier}")
         conn |> put_status(:not_found) |> json(%{error: "Agent not found"})
 
       {:error, :agent_unavailable} ->
+        Logger.warning("[AgentsController] invoke unavailable identifier=#{identifier}")
         conn |> put_status(:forbidden) |> json(%{error: "Agent unavailable"})
 
       {:error, :invalid_secret} ->
+        Logger.warning("[AgentsController] invoke invalid secret identifier=#{identifier}")
         conn |> put_status(:unauthorized) |> json(%{error: "Invalid secret"})
 
       {:error, :chat_not_attached} ->
+        Logger.warning("[AgentsController] invoke chat not attached identifier=#{identifier}")
         conn |> put_status(:forbidden) |> json(%{error: "Agent not attached to target chat"})
 
       {:error, reason} ->
+        Logger.error("[AgentsController] invoke failed identifier=#{identifier} reason=#{inspect(reason)}")
         conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
     end
   end
@@ -242,30 +261,50 @@ defmodule VibeWeb.AgentsController do
       List.first(get_req_header(conn, "x-vibe-agent-secret"))
       || List.first(get_req_header(conn, "x-vibe-integration-secret"))
 
+    Logger.info(
+      "[AgentsController] ingest_event start " <>
+        "identifier=#{identifier} method=#{conn.method} path=#{conn.request_path} " <>
+        "content_type=#{List.first(get_req_header(conn, "content-type")) || "unknown"} " <>
+        "secret_present=#{is_binary(secret)} raw_body_bytes=#{byte_size(conn.assigns[:raw_body] || "")} " <>
+        "params_keys=#{inspect(Map.keys(params) |> Enum.sort())}"
+    )
+
     with %{} = agent <- Agents.get_invoke_target(identifier),
          :ok <- ensure_agent_published(agent),
          {:ok, result} <- AgentEventRuntime.ingest(agent, Map.drop(params, ["identifier"]), secret: secret) do
+      Logger.info(
+        "[AgentsController] ingest_event success " <>
+          "identifier=#{identifier} agent_id=#{agent.id} result=#{inspect(result)}"
+      )
+
       json(conn, result)
     else
       nil ->
+        Logger.warning("[AgentsController] ingest_event missing agent identifier=#{identifier}")
         conn |> put_status(:not_found) |> json(%{error: "Agent not found"})
 
       {:error, :agent_unavailable} ->
+        Logger.warning("[AgentsController] ingest_event unavailable identifier=#{identifier}")
         conn |> put_status(:forbidden) |> json(%{error: "Agent unavailable"})
 
       {:error, :invalid_secret} ->
+        Logger.warning("[AgentsController] ingest_event invalid secret identifier=#{identifier}")
         conn |> put_status(:unauthorized) |> json(%{error: "Invalid secret"})
 
       {:error, :chat_not_attached} ->
+        Logger.warning("[AgentsController] ingest_event chat not attached identifier=#{identifier}")
         conn |> put_status(:forbidden) |> json(%{error: "Agent not attached to target chat"})
 
       {:error, :missing_destination_chat} ->
+        Logger.warning("[AgentsController] ingest_event missing destination chat identifier=#{identifier}")
         conn |> put_status(:unprocessable_entity) |> json(%{error: "Missing destination chat"})
 
       {:error, :missing_event_type} ->
+        Logger.warning("[AgentsController] ingest_event missing event type identifier=#{identifier}")
         conn |> put_status(:unprocessable_entity) |> json(%{error: "eventType is required"})
 
       {:error, reason} ->
+        Logger.error("[AgentsController] ingest_event failed identifier=#{identifier} reason=#{inspect(reason)}")
         conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
     end
   end
