@@ -986,7 +986,12 @@ defmodule Vibe.AI.AgentEventRuntime do
 
   defp normalize_string(value) when is_binary(value) do
     trimmed = String.trim(value)
-    if trimmed == "", do: nil, else: trimmed
+
+    if trimmed == "" or trimmed in ["nil", "null", "undefined"] do
+      nil
+    else
+      trimmed
+    end
   end
 
   defp normalize_string(value) when is_atom(value), do: value |> Atom.to_string() |> normalize_string()
