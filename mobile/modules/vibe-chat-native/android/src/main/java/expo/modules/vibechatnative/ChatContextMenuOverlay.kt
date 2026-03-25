@@ -127,8 +127,9 @@ internal class ChatContextMenuOverlay(
     }
 
     current.closing = true
-    val returnTx = current.anchorStartRect.left - current.bubbleRect.left
-    val returnTy = current.anchorStartRect.top - current.bubbleRect.top
+    val targetScale = HOLD_SCALE
+    val returnTx = current.anchorStartRect.left - current.bubbleRect.left - ((1f - targetScale) * current.bubbleRect.width()) / 2f
+    val returnTy = current.anchorStartRect.top - current.bubbleRect.top - ((1f - targetScale) * current.bubbleRect.height()) / 2f
 
     current.backdrop.animate()
       .alpha(0f)
@@ -417,12 +418,20 @@ internal class ChatContextMenuOverlay(
     setFrame(reactionCard, layout.reactionRect)
     setFrame(actionsCard, layout.actionsRect)
 
-    val startTx = captureRect.left - bubbleSnapshotRect.left
-    val startTy = captureRect.top - bubbleSnapshotRect.top
+    val startScale = if (animateHold) HOLD_SCALE else 1f
+    // Compensate for center-based scaling so the visual content aligns with the
+    // capture rect. When a view is scaled about its center the visible content
+    // shifts by (1 - scale) * size / 2 — subtract that offset from the start
+    // translation to keep the animation stable.
+    val startTx = captureRect.left - bubbleSnapshotRect.left - ((1f - startScale) * bubbleSnapshotRect.width()) / 2f
+    val startTy = captureRect.top - bubbleSnapshotRect.top - ((1f - startScale) * bubbleSnapshotRect.height()) / 2f
+    // Use the computed snapshot rect for pivot so scaling occurs about center.
+    bubbleSnapshot.pivotX = bubbleSnapshotRect.width() / 2f
+    bubbleSnapshot.pivotY = bubbleSnapshotRect.height() / 2f
     bubbleSnapshot.translationX = startTx
     bubbleSnapshot.translationY = startTy
-    bubbleSnapshot.scaleX = if (animateHold) 0.965f else 1f
-    bubbleSnapshot.scaleY = if (animateHold) 0.965f else 1f
+    bubbleSnapshot.scaleX = startScale
+    bubbleSnapshot.scaleY = startScale
     bubbleSnapshot.alpha = 1f
     bubbleSnapshot.elevation = dpF(16f)
 
