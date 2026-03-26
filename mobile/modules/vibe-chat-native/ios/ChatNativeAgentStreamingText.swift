@@ -11,7 +11,7 @@ protocol ChatNativeStreamingTextLabelDelegate: AnyObject {
 /// Block type emitted by ChatNativeAgentTextRenderer.parseBlocks.
 enum AgentParsedBlock: Equatable {
   case text(String)
-  case code(String)
+  case code(String, String?) // code + optional language
 }
 
 enum ChatNativeAgentTextRenderer {
@@ -55,20 +55,26 @@ enum ChatNativeAgentTextRenderer {
     var normalLines: [String] = []
     var codeLines: [String] = []
     var inCodeBlock = false
+    var currentLang: String? = nil
     for line in text.components(separatedBy: "\n") {
       if line.hasPrefix("```") {
+        let fenceInfo = String(line.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
         if inCodeBlock {
           let code = codeLines.joined(separator: "\n")
           if !code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            blocks.append(.code(code))
+            blocks.append(.code(code, currentLang))
           }
-          codeLines = []; inCodeBlock = false
+          codeLines = []
+          currentLang = nil
+          inCodeBlock = false
         } else {
           let normal = normalLines.joined(separator: "\n")
           if !normal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             blocks.append(.text(normal))
           }
-          normalLines = []; inCodeBlock = true
+          normalLines = []
+          inCodeBlock = true
+          currentLang = fenceInfo.isEmpty ? nil : fenceInfo
         }
       } else if inCodeBlock {
         codeLines.append(line)
@@ -77,7 +83,7 @@ enum ChatNativeAgentTextRenderer {
       }
     }
     if inCodeBlock, !codeLines.isEmpty {
-      blocks.append(.code(codeLines.joined(separator: "\n")))
+      blocks.append(.code(codeLines.joined(separator: "\n"), currentLang))
     } else if !normalLines.isEmpty {
       let t = normalLines.joined(separator: "\n")
       if !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { blocks.append(.text(t)) }
