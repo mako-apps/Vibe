@@ -1,6 +1,8 @@
 import UIKit
 
 private let chatNativeAgentBoldRegex = try! NSRegularExpression(pattern: "\\*\\*(.+?)\\*\\*")
+private let chatNativeAgentMarkdownLinkRegex = try! NSRegularExpression(pattern: "\\[([^\\]]+)\\]\\((https?://[^)]+)\\)")
+private let chatNativeAgentInlineCodeRegex = try! NSRegularExpression(pattern: "`([^`]+)`")
 
 enum ChatNativeAgentTextRenderer {
   static func isRTL(_ text: String) -> Bool {
@@ -31,15 +33,38 @@ enum ChatNativeAgentTextRenderer {
     if let lineHeight {
       attrs[.baselineOffset] = (lineHeight - font.lineHeight) * 0.25
     }
-
     let mutable = NSMutableAttributedString(string: text, attributes: attrs)
-    let matches = chatNativeAgentBoldRegex.matches(
-      in: text,
-      range: NSRange(text.startIndex..., in: text)
+
+    // 1) Parse Markdown links [label](https://...) first so indices remain valid.
+    let linkMatches = chatNativeAgentMarkdownLinkRegex.matches(
+      in: mutable.string,
+      range: NSRange(mutable.string.startIndex..., in: mutable.string)
     )
-    for match in matches.reversed() {
-      guard let range = Range(match.range(at: 1), in: text) else { continue }
-      let boldText = String(text[range])
+    for match in linkMatches.reversed() {
+      guard
+        let labelRange = Range(match.range(at: 1), in: mutable.string),
+        let urlRange = Range(match.range(at: 2), in: mutable.string)
+      else { continue }
+      let label = String(mutable.string[labelRange])
+      let urlString = String(mutable.string[urlRange])
+      let replacement = NSAttributedString(string: label, attributes: attrs)
+      mutable.replaceCharacters(in: match.range, with: replacement)
+      let replacedRange = NSRange(location: match.range.location, length: (label as NSString).length)
+      if let url = URL(string: urlString) {
+        mutable.addAttribute(.link, value: url, range: replacedRange)
+        mutable.addAttribute(.foregroundColor, value: UIColor.systemBlue, range: replacedRange)
+        mutable.addAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, range: replacedRange)
+      }
+    }
+
+    // 2) Bold **text**
+    let boldMatches = chatNativeAgentBoldRegex.matches(
+      in: mutable.string,
+      range: NSRange(mutable.string.startIndex..., in: mutable.string)
+    )
+    for match in boldMatches.reversed() {
+      guard let range = Range(match.range(at: 1), in: mutable.string) else { continue }
+      let boldText = String(mutable.string[range])
       var boldAttrs = attrs
       if let descriptor = font.fontDescriptor.withSymbolicTraits(.traitBold) {
         boldAttrs[.font] = UIFont(descriptor: descriptor, size: font.pointSize)
@@ -49,6 +74,43 @@ enum ChatNativeAgentTextRenderer {
       let replacement = NSAttributedString(string: boldText, attributes: boldAttrs)
       mutable.replaceCharacters(in: match.range, with: replacement)
     }
+
+    // 3) Inline code `code`
+    let codeMatches = chatNativeAgentInlineCodeRegex.matches(
+      in: mutable.string,
+      range: NSRange(mutable.string.startIndex..., in: mutable.string)
+    )
+    for match in codeMatches.reversed() {
+      guard let range = Range(match.range(at: 1), in: mutable.string) else { continue }
+      let codeText = String(mutable.string[range])
+      var codeAttrs = attrs
+      codeAttrs[.font] = UIFont.monospacedSystemFont(ofSize: font.pointSize, weight: .regular)
+      codeAttrs[.backgroundColor] = UIColor(white: 0.95, alpha: 1.0)
+      let replacement = NSAttributedString(string: codeText, attributes: codeAttrs)
+      mutable.replaceCharacters(in: match.range, with: replacement)
+    }
+
+    // 4) Auto-detect bare URLs (e.g. https://...) and style them if not already linked.
+    if let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) {
+      let urlMatches = detector.matches(
+        in: mutable.string,
+        options: [],
+        range: NSRange(mutable.string.startIndex..., in: mutable.string)
+      )
+      for m in urlMatches {
+        guard let url = m.url else { continue }
+        var hasLink = false
+        mutable.enumerateAttribute(.link, in: m.range, options: []) { value, _, stop in
+          if value != nil { hasLink = true; stop.pointee = true }
+        }
+        if !hasLink {
+          mutable.addAttribute(.link, value: url, range: m.range)
+          mutable.addAttribute(.foregroundColor, value: UIColor.systemBlue, range: m.range)
+          mutable.addAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, range: m.range)
+        }
+      }
+    }
+
     return mutable
   }
 
