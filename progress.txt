@@ -1,0 +1,10 @@
+2026-03-26
+
+Completed:
+- Fixed the native agent card tap path by disabling interaction on the decorative inner card container so the parent `UIControl` receives the press.
+- Adjusted assistant row assembly so agent cards stay hidden until streamed text exists or streaming finishes, and action buttons render after the final assistant entry. The visible order is now `loading/streaming -> text -> card -> actions`.
+- Deferred `agent_cards` channel events until the first streamed text chunk or finalization so the client no longer receives card events ahead of post-tool text.
+
+Remaining:
+- Validate the iOS flow on device or simulator, especially card taps opening the config panel and builder/subagent turns that emit cards before text.
+- `mix test` cannot run in `server/` because `server/config/test.exs` is missing.

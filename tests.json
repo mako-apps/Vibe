@@ -1,0 +1,17 @@
+{
+  "updated_at": "2026-03-26",
+  "checks": {
+    "server_mix_test": {
+      "status": "failed",
+      "details": "Command failed because server/config/test.exs is missing."
+    },
+    "server_mix_compile": {
+      "status": "passed",
+      "details": "Compiled successfully after the AgentChannel change; only pre-existing warnings were reported."
+    },
+    "ios_native_validation": {
+      "status": "not_run",
+      "details": "No iOS build/test command was run from this workspace."
+    }
+  }
+}

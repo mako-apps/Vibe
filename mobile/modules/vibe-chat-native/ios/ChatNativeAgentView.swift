@@ -140,6 +140,7 @@ private enum ChatNativeAgentPendingSend {
 
 private struct ChatNativeAgentRenderEntry {
   let id: String
+  let messageId: String
   let role: ChatNativeAgentRole
   let text: String
   let timestampMs: Int64
@@ -1853,6 +1854,7 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
 
       let previous = index > 0 ? renderEntries[index - 1] : nil
       let next = index + 1 < renderEntries.count ? renderEntries[index + 1] : nil
+      let isLastEntryForMessage = next?.messageId != entry.messageId
       let isSequenceStart = previous?.role != entry.role
       let isSequenceEnd = next?.role != entry.role
       let shape = Self.makeBubbleShape(
@@ -1882,10 +1884,10 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
         if let agentCard = entry.agentCard {
           metadata["agentCard"] = agentCard.rawValue
         }
-        if let actionSourceMessageId = entry.actionSourceMessageId {
+        if entry.messageType == "text", let actionSourceMessageId = entry.actionSourceMessageId {
           metadata["sourceMessageId"] = actionSourceMessageId
         }
-        if let actionSourceText = entry.actionSourceText {
+        if entry.messageType == "text", let actionSourceText = entry.actionSourceText {
           metadata["sourceText"] = actionSourceText
         }
         if !metadata.isEmpty {
@@ -1902,16 +1904,18 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
         "message": message,
       ])
 
-      let trimmedText = entry.text.trimmingCharacters(in: .whitespacesAndNewlines)
+      let actionSourceText = entry.actionSourceText ?? entry.text
+      let trimmedActionSourceText =
+        actionSourceText.trimmingCharacters(in: .whitespacesAndNewlines)
       if entry.isAgentMessage,
-        entry.messageType == "text",
         !entry.isStreaming,
-        !trimmedText.isEmpty,
+        isLastEntryForMessage,
+        !trimmedActionSourceText.isEmpty,
         let actionSourceMessageId = entry.actionSourceMessageId
       {
         var actionMetadata: [String: Any] = [
           "sourceMessageId": actionSourceMessageId,
-          "sourceText": entry.actionSourceText ?? entry.text,
+          "sourceText": actionSourceText,
         ]
         if let regeneratePrompt = regeneratePromptByAssistantId[actionSourceMessageId],
           !regeneratePrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -1970,18 +1974,22 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
       }
 
       if message.role == .assistant && hasRenderableSegments {
+        let entryCountBeforeAppend = entries.count
         appendSegmentedEntries(
           from: message,
           isStreaming: isActiveStreaming,
           into: &entries
         )
-        continue
+        if entries.count > entryCountBeforeAppend {
+          continue
+        }
       }
 
       if isActiveStreaming && trimmedContent.isEmpty {
         entries.append(
           ChatNativeAgentRenderEntry(
             id: "\(message.id)-thinking",
+            messageId: message.id,
             role: .assistant,
             text: "Thinking...",
             timestampMs: max(message.timestampMs, Self.nowMs()),
@@ -2004,6 +2012,7 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
       entries.append(
         ChatNativeAgentRenderEntry(
           id: message.id,
+          messageId: message.id,
           role: message.role,
           text: message.content,
           timestampMs: message.timestampMs,
@@ -2028,6 +2037,16 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
   ) {
     var pendingProgressSegments: [ChatNativeAgentStreamSegment] = []
     var deferredCardEntries: [ChatNativeAgentRenderEntry] = []
+    let lastRenderableSegmentIndex = message.streamSegments.lastIndex(where: {
+      switch $0 {
+      case .text(let text):
+        return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      case .cards(_, let cards):
+        return !cards.isEmpty
+      case .progress:
+        return false
+      }
+    })
     let lastTextSegmentIndex = message.streamSegments.lastIndex(where: {
       if case .text(let text) = $0 {
         return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -2044,6 +2063,7 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
       entries.append(
         ChatNativeAgentRenderEntry(
           id: "\(message.id)-progress-\(position)",
+          messageId: message.id,
           role: .assistant,
           text: (progressNodes.first?["label"] as? String) ?? "Working...",
           timestampMs: max(message.timestampMs, Self.nowMs()),
@@ -2073,9 +2093,11 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
         pendingProgressSegments.removeAll()
 
         let isLastTextSegment = index == lastTextSegmentIndex
+        let isLastRenderableSegment = index == lastRenderableSegmentIndex
         entries.append(
           ChatNativeAgentRenderEntry(
             id: "\(message.id)-text-\(index)",
+            messageId: message.id,
             role: .assistant,
             text: text,
             timestampMs: message.timestampMs,
@@ -2085,17 +2107,21 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
             showTail: isLastTextSegment,
             progressNodes: nil,
             agentCard: nil,
-            actionSourceMessageId: isStreaming ? nil : (isLastTextSegment ? message.id : nil),
-            actionSourceText: isStreaming ? nil : (isLastTextSegment ? message.content : nil)
+            actionSourceMessageId:
+              isStreaming ? nil : (isLastRenderableSegment ? message.id : nil),
+            actionSourceText:
+              isStreaming ? nil : (isLastRenderableSegment ? message.content : nil)
           ))
 
       case .cards(let groupId, let cards):
         // Defer card entries to render after all text content
         pendingProgressSegments.removeAll()
+        let shouldAttachActions = !isStreaming && index == lastRenderableSegmentIndex
         for (cardIndex, card) in cards.enumerated() {
           deferredCardEntries.append(
             ChatNativeAgentRenderEntry(
               id: "\(message.id)-card-\(groupId)-\(cardIndex)",
+              messageId: message.id,
               role: .assistant,
               text: card.displayName,
               timestampMs: message.timestampMs,
@@ -2105,8 +2131,10 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
               showTail: false,
               progressNodes: nil,
               agentCard: card,
-              actionSourceMessageId: nil,
-              actionSourceText: nil
+              actionSourceMessageId:
+                shouldAttachActions && cardIndex == cards.count - 1 ? message.id : nil,
+              actionSourceText:
+                shouldAttachActions && cardIndex == cards.count - 1 ? message.content : nil
             ))
         }
       }
@@ -2121,6 +2149,7 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
       entries.append(
         ChatNativeAgentRenderEntry(
           id: message.id,
+          messageId: message.id,
           role: .assistant,
           text: text,
           timestampMs: message.timestampMs,
@@ -2135,8 +2164,9 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
         ))
     }
 
-    // Append deferred card entries after all text content
-    entries.append(contentsOf: deferredCardEntries)
+    if !deferredCardEntries.isEmpty, !isStreaming || lastTextSegmentIndex != nil {
+      entries.append(contentsOf: deferredCardEntries)
+    }
   }
 
   private func buildProgressNodes(from segments: [ChatNativeAgentStreamSegment]) -> [[String: Any]] {

@@ -23,6 +23,7 @@ defmodule VibeWeb.AgentChannel do
       socket = socket
         |> assign(:conversation_history, [])
         |> assign(:active_conversation_id, conversation_id)
+        |> reset_stream_ui_state()
 
       {:ok, socket}
     else
@@ -49,7 +50,10 @@ defmodule VibeWeb.AgentChannel do
 
 
     # Store conversation ID in socket
-    socket = assign(socket, :active_conversation_id, conv_id)
+    socket =
+      socket
+      |> assign(:active_conversation_id, conv_id)
+      |> reset_stream_ui_state()
 
     # Acknowledge receipt with conversation ID
     push(socket, "ack", %{status: "processing", conversation_id: conv_id})
@@ -102,7 +106,10 @@ defmodule VibeWeb.AgentChannel do
     active_agent_id = normalize_optional_string(params["active_agent_id"])
 
     with {:ok, conv_id} <- ensure_existing_conversation(user_id, conversation_id) do
-      socket = assign(socket, :active_conversation_id, conv_id)
+      socket =
+        socket
+        |> assign(:active_conversation_id, conv_id)
+        |> reset_stream_ui_state()
       push(socket, "ack", %{status: "processing", conversation_id: conv_id})
 
       if is_binary(summary) do
@@ -232,6 +239,41 @@ defmodule VibeWeb.AgentChannel do
   end
 
   # Handle push messages from the async task
+  def handle_info({:push, "chunk", payload}, socket) do
+    push(socket, "chunk", payload)
+
+    text =
+      payload[:text] ||
+        payload["text"] ||
+        ""
+
+    socket =
+      if is_binary(text) and text != "" and not (socket.assigns[:has_streamed_text] || false) do
+        socket
+        |> assign(:has_streamed_text, true)
+        |> flush_pending_agent_cards()
+      else
+        socket
+      end
+
+    {:noreply, socket}
+  end
+
+  def handle_info({:push, "agent_cards", payload}, socket) do
+    if socket.assigns[:has_streamed_text] || false do
+      push(socket, "agent_cards", payload)
+      {:noreply, socket}
+    else
+      pending = socket.assigns[:pending_agent_cards] || []
+      {:noreply, assign(socket, :pending_agent_cards, pending ++ [payload])}
+    end
+  end
+
+  def handle_info({:push, "error", payload}, socket) do
+    push(socket, "error", payload)
+    {:noreply, reset_stream_ui_state(socket)}
+  end
+
   def handle_info({:push, event, payload}, socket) do
     push(socket, event, payload)
     {:noreply, socket}
@@ -248,6 +290,7 @@ defmodule VibeWeb.AgentChannel do
   end
 
   def handle_info({:finalize_message, conv_id, full_response}, socket) do
+    socket = flush_pending_agent_cards(socket)
     tool_results = socket.assigns[:tool_results] || []
 
     # Update the last message in the database
@@ -258,9 +301,7 @@ defmodule VibeWeb.AgentChannel do
     })
 
     # Reset streaming state
-    socket = socket
-      |> assign(:streaming_content, "")
-      |> assign(:tool_results, [])
+    socket = reset_stream_ui_state(socket)
 
     {:noreply, socket}
   end
@@ -391,6 +432,24 @@ defmodule VibeWeb.AgentChannel do
   end
 
   defp normalize_optional_string(value), do: value |> to_string() |> normalize_optional_string()
+
+  defp reset_stream_ui_state(socket) do
+    socket
+    |> assign(:streaming_content, "")
+    |> assign(:tool_results, [])
+    |> assign(:pending_agent_cards, [])
+    |> assign(:has_streamed_text, false)
+  end
+
+  defp flush_pending_agent_cards(socket) do
+    pending = socket.assigns[:pending_agent_cards] || []
+
+    Enum.each(pending, fn payload ->
+      push(socket, "agent_cards", payload)
+    end)
+
+    assign(socket, :pending_agent_cards, [])
+  end
 
   # Generate a short, descriptive title using AI
   defp generate_title_async(conv_id, message) do

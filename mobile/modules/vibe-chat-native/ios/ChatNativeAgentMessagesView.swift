@@ -830,6 +830,7 @@ private final class ChatNativeAgentCardView: UIControl {
 
     cardView.layer.cornerCurve = .continuous
     cardView.layer.cornerRadius = 14.0
+    cardView.isUserInteractionEnabled = false
     addSubview(cardView)
 
     iconView.contentMode = .scaleAspectFit
