@@ -85,7 +85,7 @@ final class InAppBrowserViewController: UIViewController, WKNavigationDelegate {
   // MARK: - presentation helper
   static func present(url: URL) {
     DispatchQueue.main.async {
-      guard let top = UIApplication.topMostViewController() else { return }
+      guard let top = UIApplication.shared.topMostViewController() else { return }
       let vc = InAppBrowserViewController(url: url)
       let nav = UINavigationController(rootViewController: vc)
       nav.modalPresentationStyle = .pageSheet
@@ -96,17 +96,44 @@ final class InAppBrowserViewController: UIViewController, WKNavigationDelegate {
 
 extension UIApplication {
   func topMostViewController() -> UIViewController? {
-    var rootVC = keyWindow?.rootViewController
-    if rootVC == nil {
-      rootVC = windows.first { $0.isKeyWindow }?.rootViewController
+    if #available(iOS 13.0, *) {
+      // Prefer the foreground active scene's key window when available.
+      let scenes = connectedScenes.compactMap { $0 as? UIWindowScene }
+      if let activeScene = scenes.first(where: { $0.activationState == .foregroundActive }) {
+        if let window = activeScene.windows.first(where: { $0.isKeyWindow }) {
+          var top = window.rootViewController
+          while let presented = top?.presentedViewController {
+            top = presented
+          }
+          if let nav = top as? UINavigationController, let visible = nav.visibleViewController {
+            return visible
+          }
+          return top
+        }
+      }
+      // Fallback: search any scene's key window
+      for scene in scenes {
+        if let window = scene.windows.first(where: { $0.isKeyWindow }) {
+          var top = window.rootViewController
+          while let presented = top?.presentedViewController {
+            top = presented
+          }
+          if let nav = top as? UINavigationController, let visible = nav.visibleViewController {
+            return visible
+          }
+          return top
+        }
+      }
+      return nil
+    } else {
+      guard var top = keyWindow?.rootViewController else { return nil }
+      while let presented = top.presentedViewController {
+        top = presented
+      }
+      if let nav = top as? UINavigationController, let visible = nav.visibleViewController {
+        top = visible
+      }
+      return top
     }
-    guard var top = rootVC else { return nil }
-    while let presented = top.presentedViewController {
-      top = presented
-    }
-    if let nav = top as? UINavigationController, let visible = nav.visibleViewController {
-      top = visible
-    }
-    return top
   }
 }
