@@ -3337,35 +3337,20 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
       return
     }
 
+    // For all remote files: start streaming immediately for rapid first-byte playback.
+    // Download runs concurrently in background:
+    //   - no mediaKey: caches a clean copy for future plays.
+    //   - mediaKey (encrypted): download+decrypt gives a seekable local file; if the
+    //     remote URL actually serves plaintext audio the stream plays fine, otherwise
+    //     streaming fails gracefully and finishDownload auto-plays the decrypted file.
     let trimmedMediaKey = mediaKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    if trimmedMediaKey.isEmpty {
-      startStreamingRemotePlayback(url, messageId: messageId, cell: cell)
-      beginRemoteDownloadTask(
-        url,
-        messageId: messageId,
-        mediaKey: nil,
-        fileName: fileName,
-        autoPlayWhenFinished: false
-      )
-      return
-    }
-
-    activeMessageId = messageId
-    activeMediaURL = url.absoluteString
-    activeMediaKey = mediaKey
-    activeFileName = fileName
-    activeCell = cell
-    activeDownloadProgress = nil
-    cell?.applyVoiceDownloadState(needsDownload: true, isDownloading: true, progress: nil)
-    cell?.applyVoicePlaybackState(isPlaying: false, progress: 0.0, level: 0.0)
-    ensureDisplayLink()
-    publishSnapshot()
+    startStreamingRemotePlayback(url, messageId: messageId, cell: cell)
     beginRemoteDownloadTask(
       url,
       messageId: messageId,
-      mediaKey: mediaKey,
+      mediaKey: trimmedMediaKey.isEmpty ? nil : mediaKey,
       fileName: fileName,
-      autoPlayWhenFinished: true
+      autoPlayWhenFinished: !trimmedMediaKey.isEmpty
     )
   }
 
@@ -3417,7 +3402,28 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
             messageId,
             String(describing: item.error)
           )
-          self.stopActivePlayback(resetProgress: true)
+          if self.activeDownloadTask != nil {
+            // A background download is already running (encrypted/fallback path).
+            // Just tear down the non-working AVPlayer; finishDownload will play
+            // the decrypted local file once the download completes.
+            NSLog(
+              "[ChatListView] voice stream failed – keeping download alive messageId=%@",
+              messageId
+            )
+            self.cleanupStreamingPlayer()
+            self.isPlaying = false
+            self.level = 0.0
+            self.activeCell?.applyVoiceDownloadState(
+              needsDownload: true, isDownloading: true,
+              progress: self.activeDownloadProgress
+            )
+            self.activeCell?.applyVoicePlaybackState(
+              isPlaying: false, progress: 0.0, level: 0.0
+            )
+            self.publishSnapshot(forceNowPlaying: true)
+          } else {
+            self.stopActivePlayback(resetProgress: true)
+          }
         default:
           break
         }
@@ -3778,9 +3784,17 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     activeDownloadProgress = nil
     _ = NativeMusicPlayerStore.shared.updateLocalURI(trackId: messageId, localURI: localMediaURL)
     guard activeMessageId == messageId else { return }
-    if streamingPlayer != nil && !autoPlayWhenFinished {
+    // If a streaming player is alive and playing (or buffering), the user already
+    // has audio; just cache the decrypted file without interrupting playback.
+    if let sp = streamingPlayer,
+      sp.timeControlStatus == .playing || sp.timeControlStatus == .waitingToPlayAtSpecifiedRate
+    {
       publishSnapshot(forceNowPlaying: true)
       return
+    }
+    // Streaming is gone or stalled – fall through and play the local file.
+    if streamingPlayer != nil {
+      cleanupStreamingPlayer()
     }
     let localURL: URL
     if let parsedURL = URL(string: localMediaURL), parsedURL.isFileURL {
