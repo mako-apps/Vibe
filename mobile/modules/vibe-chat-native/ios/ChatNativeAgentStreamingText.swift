@@ -348,7 +348,7 @@ final class AgentCodeBlockView: UIView {
   required init?(coder: NSCoder) { return nil }
 
   @discardableResult
-  func configure(code: String, textColor: UIColor, baseFont: UIFont, availableWidth: CGFloat) -> CGFloat {
+  func configure(code: String, language: String? = nil, textColor: UIColor, baseFont: UIFont, availableWidth: CGFloat) -> CGFloat {
     codeContent = code
     let monoFont = UIFont.monospacedSystemFont(ofSize: max(12.5, baseFont.pointSize - 2.5), weight: .regular)
     let outerH: CGFloat = 6.0
@@ -358,12 +358,10 @@ final class AgentCodeBlockView: UIView {
     let copyW: CGFloat = 30.0
     let cardWidth = max(1.0, availableWidth - outerH * 2)
     let labelWidth = max(1.0, cardWidth - hPad * 2)
-    let codeAttrs: [NSAttributedString.Key: Any] = [
-      .font: monoFont,
-      .foregroundColor: textColor.withAlphaComponent(0.88),
-    ]
-    let attributed = NSAttributedString(string: code, attributes: codeAttrs)
+
+    let attributed = highlightedAttributedCode(code: code, language: language, font: monoFont, baseColor: textColor)
     codeLabel.attributedText = attributed
+
     let textHeight = ceil(attributed.boundingRect(
       with: CGSize(width: labelWidth, height: .greatestFiniteMagnitude),
       options: [.usesLineFragmentOrigin, .usesFontLeading], context: nil
@@ -381,6 +379,39 @@ final class AgentCodeBlockView: UIView {
     )
     codeLabel.frame = CGRect(x: hPad, y: barH + vPad, width: labelWidth, height: bodyH)
     return outerH + cardH + 8.0
+  }
+
+  private func highlightedAttributedCode(code: String, language: String?, font: UIFont, baseColor: UIColor) -> NSAttributedString {
+    let ns = code as NSString
+    let mutable = NSMutableAttributedString(string: code, attributes: [
+      .font: font,
+      .foregroundColor: baseColor.withAlphaComponent(0.88)
+    ])
+    let fullRange = NSRange(location: 0, length: ns.length)
+
+    // Basic keyword set (multi-language common tokens)
+    let keywords = ["func","let","var","if","else","for","while","return","class","struct","enum","import","extension","guard","in","where","as","try","catch","throw","switch","case","default","public","private","protocol","static","const","function","new","this","super","await","async","yield","package","interface","implements","override","final","val","def","namespace","using"]
+    let keywordPattern = "\\b(" + keywords.joined(separator: "|") + ")\\b"
+    if let re = try? NSRegularExpression(pattern: keywordPattern, options: .caseInsensitive) {
+      for m in re.matches(in: code, options: [], range: fullRange) { mutable.addAttribute(.foregroundColor, value: UIColor.systemPurple, range: m.range) }
+    }
+
+    // Numbers
+    if let re = try? NSRegularExpression(pattern: "\\b\\d+(?:\\.\\d+)?\\b") {
+      for m in re.matches(in: code, options: [], range: fullRange) { mutable.addAttribute(.foregroundColor, value: UIColor.systemOrange, range: m.range) }
+    }
+
+    // Strings (single and double quoted)
+    if let re = try? NSRegularExpression(pattern: "\"(\\\\.|[^\"\\\\])*\"|'(\\\\.|[^'\\\\])*'") {
+      for m in re.matches(in: code, options: [], range: fullRange) { mutable.addAttribute(.foregroundColor, value: UIColor.systemGreen, range: m.range) }
+    }
+
+    // Comments (single-line // and block /* */)
+    if let re = try? NSRegularExpression(pattern: "//.*|/\\*[\\s\\S]*?\\*/", options: [.dotMatchesLineSeparators, .anchorsMatchLines]) {
+      for m in re.matches(in: code, options: [], range: fullRange) { mutable.addAttribute(.foregroundColor, value: UIColor(white: 0.7, alpha: 1.0), range: m.range) }
+    }
+
+    return mutable
   }
 
   @objc private func handleCopy() {

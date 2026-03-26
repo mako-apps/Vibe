@@ -534,11 +534,13 @@ private final class ChatNativeAgentPlainTextView: UIView {
           blockFrames.append(frame)
           yOffset += h + 6.0
 
-        case .code(let content):
+        case .code(let content, let lang):
           let card = view as! AgentCodeBlockView
+          // Allow code cards to use the full horizontal area (reduce right padding)
+          let cardAvailableWidth = max(1.0, availableWidth - leftPadding)
           let cardHeight = card.configure(
-            code: content, textColor: textColor, baseFont: font, availableWidth: labelWidth)
-          let frame = CGRect(x: leftPadding, y: yOffset, width: labelWidth, height: cardHeight)
+            code: content, language: lang, textColor: textColor, baseFont: font, availableWidth: cardAvailableWidth)
+          let frame = CGRect(x: leftPadding, y: yOffset, width: cardAvailableWidth, height: cardHeight)
           blockFrames.append(frame)
           yOffset += cardHeight + 6.0
         }
