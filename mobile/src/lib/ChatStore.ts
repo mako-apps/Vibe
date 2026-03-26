@@ -462,8 +462,11 @@ let loadChatsDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 let channelResyncTimer: ReturnType<typeof setTimeout> | null = null;
 let emptyChatsRetryCount = 0;
 let emptyChatsRetryTimer: ReturnType<typeof setTimeout> | null = null;
+let cachedChatsBackgroundReloadTimer: ReturnType<typeof setTimeout> | null = null;
+let lastRemoteChatsReloadAt = 0;
 const EMPTY_CHATS_MAX_RETRIES = 3;
 const EMPTY_CHATS_RETRY_DELAYS = [800, 2000, 4000];
+const CACHED_CHATS_BACKGROUND_RELOAD_COOLDOWN_MS = 15_000;
 const pendingRetryFlushTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const pendingRetryPumpRunning = new Set<string>();
 const pendingRetryPumpNeedsAnotherPass = new Set<string>();
@@ -505,6 +508,13 @@ const ensureTransportControlReady = (): Promise<void> => {
             });
     }
     return transportControlReadyPromise;
+};
+
+const clearCachedChatsBackgroundReloadTimer = () => {
+    if (cachedChatsBackgroundReloadTimer) {
+        clearTimeout(cachedChatsBackgroundReloadTimer);
+        cachedChatsBackgroundReloadTimer = null;
+    }
 };
 
 const clearNativeTransportStatusTimer = () => {
@@ -1526,6 +1536,8 @@ export const useChatStore = create<ChatState>()(
 
             disconnect: () => {
                 resetSocketConnection();
+                clearCachedChatsBackgroundReloadTimer();
+                lastRemoteChatsReloadAt = 0;
                 set({ isConnected: false, socket: null });
             },
 
@@ -1539,6 +1551,8 @@ export const useChatStore = create<ChatState>()(
                 startChatInFlight.clear();
                 friendKeyFetchInFlight.clear();
                 recentlyProcessedMsgIds.clear();
+                clearCachedChatsBackgroundReloadTimer();
+                lastRemoteChatsReloadAt = 0;
 
                 try {
                     await AsyncStorage.removeItem(CHAT_STORE_STORAGE_KEY);
@@ -2113,11 +2127,31 @@ export const useChatStore = create<ChatState>()(
                 // If hydrated and not empty, delay the network fetch by a bit
                 // to avoid slamming the DB on developer reload loops.
                 if (!wasEmpty && !forceRemote) {
-                     console.log(`[ChatStore] loadChats using offline cached data (${get().chats.length} chats) — deferring background sync`);
-                     // Let the UI finish rendering from local AsyncStorage before background syncing.
-                     // The background sync could happen via Phoenix auto-sync or delayed retry.
-                     return;
+                    const now = Date.now();
+                    if (
+                        !cachedChatsBackgroundReloadTimer &&
+                        now - lastRemoteChatsReloadAt > CACHED_CHATS_BACKGROUND_RELOAD_COOLDOWN_MS
+                    ) {
+                        console.log(
+                            `[ChatStore] scheduling background remote chat reconciliation in 350ms (cached=${get().chats.length})`,
+                        );
+                        cachedChatsBackgroundReloadTimer = setTimeout(() => {
+                            cachedChatsBackgroundReloadTimer = null;
+                            console.log('[ChatStore] background remote chat reconciliation firing');
+                            Promise.resolve(get().loadChats({ forceRemote: true })).catch((error) => {
+                                console.warn('[ChatStore] background remote chat reconciliation failed:', error);
+                            });
+                        }, 350);
+                    }
+                    console.log(`[ChatStore] loadChats using offline cached data (${get().chats.length} chats) — deferring background sync`);
+                    // Let the UI finish rendering from local AsyncStorage before background syncing.
+                    // The background sync could happen via Phoenix auto-sync or delayed retry.
+                    return;
                 }
+
+                clearCachedChatsBackgroundReloadTimer();
+                lastRemoteChatsReloadAt = Date.now();
+
                 if (!wasEmpty && forceRemote) {
                     console.log(
                         `[ChatStore] loadChats bypassing cached path and fetching remote chats (cached=${get().chats.length})`,

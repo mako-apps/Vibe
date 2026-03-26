@@ -52,6 +52,10 @@
     "mobile_chatstore_realtime_reload_logging": {
       "status": "passed",
       "details": "Added unconditional ChatStore logs for `user:new_chat`, `user:new_message`, forced `scheduleLoadChats`, and `loadChats(forceRemote)` cache-bypass decisions so the next device run will show whether realtime is triggering the remote `/chats` refresh path."
+    },
+    "mobile_chatstore_cached_start_reconcile": {
+      "status": "passed",
+      "details": "When cached chats already exist, `loadChats()` now schedules one short background remote reconciliation instead of only returning the hydrated list forever. Starting any real remote reload clears the pending timer and refresh cooldown to avoid duplicate fetches. `git diff --check -- mobile/src/lib/ChatStore.ts` passed, and `./node_modules/.bin/tsc --noEmit -p tsconfig.json --pretty false` still fails only with pre-existing repo-wide errors outside `ChatStore.ts`."
     }
   }
 }
