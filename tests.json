@@ -7,7 +7,11 @@
     },
     "server_mix_compile": {
       "status": "passed",
-      "details": "Compiled successfully after adding the authenticated agent secret endpoint; only pre-existing warnings were reported."
+      "details": "Compiled successfully after adding the builder destination-chat tool and shared DM ensure helper; only pre-existing warnings were reported."
+    },
+    "server_builder_destination_chat_tool": {
+      "status": "passed",
+      "details": "Added builder tool `ensure_destination_chat`, shared `Chat.ensure_dm_chat/2`, and DM-only chat resolution so the standalone agent can create/reuse a real attached DM chat and return its chat id."
     },
     "server_builder_struct_sanitization": {
       "status": "passed",

@@ -26,43 +26,25 @@ defmodule VibeWeb.ChatController do
   end
 
   defp do_create_chat(conn, my_id, friend_id) do
-    # Check if chat already exists
-    case Chat.find_chat_between_users(my_id, friend_id) do
-      id when not is_nil(id) ->
-        # Check if user previously deleted this chat
-        case Chat.restore_if_deleted(id, my_id) do
-          :restored ->
-            # Chat was deleted, now restored - return empty messages (fresh start)
-            json(conn, %{chatId: id, messages: [], nextCursor: nil, hasMore: false})
+    case Chat.ensure_dm_chat(my_id, friend_id) do
+      {:ok, chat_id, "created"} ->
+        json(conn, %{chatId: chat_id, messages: [], nextCursor: nil, hasMore: false})
 
-          :not_deleted ->
-            # Chat exists and wasn't deleted - return only the latest page
-            page = Chat.get_messages_for_user_page(id, my_id, limit: 30)
-            json(conn, %{chatId: id, messages: page.messages, nextCursor: page.next_cursor, hasMore: page.has_more})
-        end
+      {:ok, chat_id, "restored"} ->
+        json(conn, %{chatId: chat_id, messages: [], nextCursor: nil, hasMore: false})
 
-      nil ->
-        # Deterministic chat id to make chat creation idempotent and avoid duplicates on concurrent requests.
-        # Uses first 12 hex chars of SHA256(sort([my_id, friend_id])).
-        chat_id =
-          :crypto.hash(:sha256, Enum.sort([my_id, friend_id]) |> Enum.join("|"))
-          |> Base.encode16(case: :lower)
-          |> binary_part(0, 12)
+      {:ok, chat_id, _status} ->
+        page = Chat.get_messages_for_user_page(chat_id, my_id, limit: 30)
 
-        try do
-          case Chat.create_chat(chat_id, [my_id, friend_id]) do
-            {:ok, _chat} ->
-              json(conn, %{chatId: chat_id, messages: [], nextCursor: nil, hasMore: false})
+        json(conn, %{
+          chatId: chat_id,
+          messages: page.messages,
+          nextCursor: page.next_cursor,
+          hasMore: page.has_more
+        })
 
-            _ ->
-              conn |> put_status(500) |> json(%{error: "Failed to create chat"})
-          end
-        rescue
-          Ecto.ConstraintError ->
-            # Another request created the chat first; return the existing chat id.
-            page = Chat.get_messages_for_user_page(chat_id, my_id, limit: 30)
-            json(conn, %{chatId: chat_id, messages: page.messages, nextCursor: page.next_cursor, hasMore: page.has_more})
-        end
+      _ ->
+        conn |> put_status(500) |> json(%{error: "Failed to create chat"})
     end
   end
 
@@ -90,6 +72,7 @@ defmodule VibeWeb.ChatController do
 
   def delete_message(conn, %{"chat_id" => chat_id, "message_id" => message_id} = params) do
     user_id = conn.assigns.current_user.id
+
     for_everyone =
       case Map.get(params, "for_everyone", true) do
         v when v in [true, "true", "1", 1] -> true
@@ -125,14 +108,17 @@ defmodule VibeWeb.ChatController do
 
     if Chat.is_participant?(chat_id, user_id) do
       pins = Chat.list_pinned_messages(chat_id, user_id)
+
       Logger.info(
         "[ChatController] list_pinned_messages chat_id=#{chat_id} user_id=#{user_id} count=#{length(pins)}"
       )
+
       json(conn, %{data: pins})
     else
       Logger.warning(
         "[ChatController] list_pinned_messages forbidden chat_id=#{chat_id} user_id=#{user_id}"
       )
+
       conn |> put_status(:forbidden) |> json(%{error: "Not a participant"})
     end
   end
@@ -155,36 +141,42 @@ defmodule VibeWeb.ChatController do
         Logger.info(
           "[ChatController] pin_message ok chat_id=#{chat_id} user_id=#{user_id} message_id=#{message_id} pinned=false"
         )
+
         json(conn, %{success: true, pinned: false, messageId: message_id})
 
       {:ok, _pin} ->
         Logger.info(
           "[ChatController] pin_message ok chat_id=#{chat_id} user_id=#{user_id} message_id=#{message_id} pinned=true"
         )
+
         json(conn, %{success: true, pinned: true, messageId: message_id})
 
       {:error, :invalid_id} ->
         Logger.warning(
           "[ChatController] pin_message invalid_id chat_id=#{chat_id} user_id=#{user_id} message_id=#{message_id}"
         )
+
         conn |> put_status(:bad_request) |> json(%{error: "Invalid message id"})
 
       {:error, :forbidden} ->
         Logger.warning(
           "[ChatController] pin_message forbidden chat_id=#{chat_id} user_id=#{user_id} message_id=#{message_id}"
         )
+
         conn |> put_status(:forbidden) |> json(%{error: "Not allowed"})
 
       {:error, :not_found} ->
         Logger.warning(
           "[ChatController] pin_message not_found chat_id=#{chat_id} user_id=#{user_id} message_id=#{message_id}"
         )
+
         conn |> put_status(:not_found) |> json(%{error: "Message not found"})
 
       {:error, reason} ->
         Logger.warning(
           "[ChatController] pin_message error chat_id=#{chat_id} user_id=#{user_id} message_id=#{message_id} reason=#{inspect(reason)}"
         )
+
         conn |> put_status(:bad_request) |> json(%{error: inspect(reason)})
     end
   end

@@ -6,6 +6,7 @@ defmodule Vibe.AI.AgentBuilder do
   alias Vibe.AI.AgentRuntime
   alias Vibe.AI.AgentBuilderSetup
   alias Vibe.AI.GroupAgent
+  alias Vibe.Chat
   alias Vibe.AI.ToolRegistry
 
   @builder_deep_link "vibe://agent?mode=builder"
@@ -22,7 +23,8 @@ defmodule Vibe.AI.AgentBuilder do
         properties: %{
           identifier: %{
             type: "string",
-            description: "Optional agent id or @username to inspect instead of the currently selected draft."
+            description:
+              "Optional agent id or @username to inspect instead of the currently selected draft."
           }
         }
       }
@@ -34,16 +36,26 @@ defmodule Vibe.AI.AgentBuilder do
       input_schema: %{
         type: "object",
         properties: %{
-          display_name: %{type: "string", description: "Human-readable display name for the draft."},
+          display_name: %{
+            type: "string",
+            description: "Human-readable display name for the draft."
+          },
           username: %{type: "string", description: "Optional public username without @."},
           description: %{
             type: "string",
             description:
               "Optional natural-language description of how the agent should behave. If provided, this tool should generate a system prompt for the new draft."
           },
-          system_prompt: %{type: "string", description: "Optional final system prompt to save immediately."},
+          system_prompt: %{
+            type: "string",
+            description: "Optional final system prompt to save immediately."
+          },
           persona: %{type: "string", description: "Optional persona or character summary."},
-          callback_url: %{type: "string", description: "Optional callback URL. Use 'off' only when updating an existing agent, not during creation."},
+          callback_url: %{
+            type: "string",
+            description:
+              "Optional callback URL. Use 'off' only when updating an existing agent, not during creation."
+          },
           enabled_tools: %{
             type: "array",
             items: %{type: "string"},
@@ -54,7 +66,10 @@ defmodule Vibe.AI.AgentBuilder do
             items: %{type: "string"},
             description: "Optional output modes from text, media, voice."
           },
-          voice_profile: %{type: "string", description: "Optional voice profile, for example alloy."}
+          voice_profile: %{
+            type: "string",
+            description: "Optional voice profile, for example alloy."
+          }
         }
       }
     },
@@ -77,7 +92,10 @@ defmodule Vibe.AI.AgentBuilder do
       input_schema: %{
         type: "object",
         properties: %{
-          identifier: %{type: "string", description: "Optional target agent id or @username. Defaults to the selected draft."},
+          identifier: %{
+            type: "string",
+            description: "Optional target agent id or @username. Defaults to the selected draft."
+          },
           display_name: %{type: "string", description: "Updated display name."},
           username: %{type: "string", description: "Updated public username without @."},
           description: %{
@@ -102,7 +120,10 @@ defmodule Vibe.AI.AgentBuilder do
             description: "Output modes from text, media, voice."
           },
           voice_profile: %{type: "string", description: "Voice profile like alloy."},
-          welcome_message: %{type: "string", description: "Optional welcome message for the agent."}
+          welcome_message: %{
+            type: "string",
+            description: "Optional welcome message for the agent."
+          }
         }
       }
     },
@@ -113,7 +134,10 @@ defmodule Vibe.AI.AgentBuilder do
       input_schema: %{
         type: "object",
         properties: %{
-          description: %{type: "string", description: "What the agent should do and how it should behave."},
+          description: %{
+            type: "string",
+            description: "What the agent should do and how it should behave."
+          },
           enabled_tools: %{
             type: "array",
             items: %{type: "string"},
@@ -125,12 +149,14 @@ defmodule Vibe.AI.AgentBuilder do
     },
     %{
       name: "publish_agent",
-      description:
-        "Publish the selected agent or a specific agent when it is ready for use.",
+      description: "Publish the selected agent or a specific agent when it is ready for use.",
       input_schema: %{
         type: "object",
         properties: %{
-          identifier: %{type: "string", description: "Optional agent id or @username. Defaults to the selected draft."}
+          identifier: %{
+            type: "string",
+            description: "Optional agent id or @username. Defaults to the selected draft."
+          }
         }
       }
     },
@@ -141,8 +167,15 @@ defmodule Vibe.AI.AgentBuilder do
       input_schema: %{
         type: "object",
         properties: %{
-          identifier: %{type: "string", description: "Optional agent id or @username. Defaults to the selected draft."},
-          status: %{type: "string", enum: ["draft", "published", "disabled"], description: "New agent status."}
+          identifier: %{
+            type: "string",
+            description: "Optional agent id or @username. Defaults to the selected draft."
+          },
+          status: %{
+            type: "string",
+            enum: ["draft", "published", "disabled"],
+            description: "New agent status."
+          }
         },
         required: ["status"]
       }
@@ -154,7 +187,10 @@ defmodule Vibe.AI.AgentBuilder do
       input_schema: %{
         type: "object",
         properties: %{
-          identifier: %{type: "string", description: "Optional agent id or @username. Defaults to the selected draft."}
+          identifier: %{
+            type: "string",
+            description: "Optional agent id or @username. Defaults to the selected draft."
+          }
         }
       }
     },
@@ -165,7 +201,10 @@ defmodule Vibe.AI.AgentBuilder do
       input_schema: %{
         type: "object",
         properties: %{
-          identifier: %{type: "string", description: "Optional agent id or @username. Defaults to the selected draft."}
+          identifier: %{
+            type: "string",
+            description: "Optional agent id or @username. Defaults to the selected draft."
+          }
         }
       }
     },
@@ -176,7 +215,29 @@ defmodule Vibe.AI.AgentBuilder do
       input_schema: %{
         type: "object",
         properties: %{
-          identifier: %{type: "string", description: "Optional agent id or @username. Defaults to the selected draft."}
+          identifier: %{
+            type: "string",
+            description: "Optional agent id or @username. Defaults to the selected draft."
+          }
+        }
+      }
+    },
+    %{
+      name: "ensure_destination_chat",
+      description:
+        "Create or reuse a real Vibe DM between the owner and the selected agent, return the attached chat id, and set it as the default destination when helpful. Use this when the owner asks for the chat id or wants the easiest event destination.",
+      input_schema: %{
+        type: "object",
+        properties: %{
+          identifier: %{
+            type: "string",
+            description: "Optional agent id or @username. Defaults to the selected draft."
+          },
+          set_as_default: %{
+            type: "boolean",
+            description:
+              "Optional. When true, save this chat as the agent's default destination. When omitted, it is set automatically only if the agent has no default destination yet."
+          }
         }
       }
     }
@@ -193,7 +254,9 @@ defmodule Vibe.AI.AgentBuilder do
     active_agent_id = Keyword.get(opts, :active_agent_id)
     ui_response = Keyword.get(opts, :ui_response)
 
-    process_message(user_id, message, active_agent_id, ui_response, callback, subagent_mode: false)
+    process_message(user_id, message, active_agent_id, ui_response, callback,
+      subagent_mode: false
+    )
   end
 
   def delegate_task(user_id, message, opts \\ []) do
@@ -217,7 +280,10 @@ defmodule Vibe.AI.AgentBuilder do
       latest_secret = result[:latest_secret] || result[:latestSecret]
       selected_agent = resolve_owned_agent(user_id, nil, selected_agent_id)
       selected_agent_payload = if selected_agent, do: Agents.agent_payload(selected_agent)
-      reply = normalize_optional_string(result[:reply] || result["reply"]) || fallback_reply(selected_agent)
+
+      reply =
+        normalize_optional_string(result[:reply] || result["reply"]) ||
+          fallback_reply(selected_agent)
 
       {:ok,
        %{
@@ -280,7 +346,9 @@ defmodule Vibe.AI.AgentBuilder do
   def session_payload(user_id) do
     with {:ok, session} <- Agents.get_or_create_builder_session(user_id) do
       active_agent_id = session.metadata && session.metadata["active_agent_id"]
-      active_agent = if is_binary(active_agent_id), do: Agents.get_agent(active_agent_id, user_id), else: nil
+
+      active_agent =
+        if is_binary(active_agent_id), do: Agents.get_agent(active_agent_id, user_id), else: nil
 
       {:ok,
        %{
@@ -342,6 +410,7 @@ defmodule Vibe.AI.AgentBuilder do
 
   defp run_builder_agent(user_id, history, message, active_agent_id, callback, subagent_mode) do
     messages = build_builder_messages(history, message)
+
     state = %{
       user_id: user_id,
       active_agent_id: active_agent_id,
@@ -428,8 +497,10 @@ defmodule Vibe.AI.AgentBuilder do
 
     {builder_context_payload(user_id, agent, state.latest_secret)
      |> Map.put("_ui_group_id", "builder:agents:list")
-     |> Map.put("_ui_cards", build_agent_cards_payloads(agents, agent && agent.id, state.latest_secret)),
-     state}
+     |> Map.put(
+       "_ui_cards",
+       build_agent_cards_payloads(agents, agent && agent.id, state.latest_secret)
+     ), state}
   end
 
   defp execute_builder_tool("create_agent", input, state) do
@@ -511,7 +582,9 @@ defmodule Vibe.AI.AgentBuilder do
 
   defp execute_builder_tool("generate_system_prompt", input, state) do
     description = normalize_optional_string(Map.get(input, "description"))
-    enabled_tools = normalize_string_list(Map.get(input, "enabled_tools")) || Agents.default_enabled_tools()
+
+    enabled_tools =
+      normalize_string_list(Map.get(input, "enabled_tools")) || Agents.default_enabled_tools()
 
     if is_nil(description) do
       {%{"ok" => false, "error" => "description is required"}, state}
@@ -651,6 +724,40 @@ defmodule Vibe.AI.AgentBuilder do
     end
   end
 
+  defp execute_builder_tool("ensure_destination_chat", input, state) do
+    user_id = state.user_id
+    identifier = normalize_optional_string(Map.get(input, "identifier"))
+    requested_default = Map.get(input, "set_as_default")
+
+    case resolve_owned_agent(user_id, identifier, state.active_agent_id) do
+      %{} = agent ->
+        with {:ok, chat_id, chat_status} <- Chat.ensure_dm_chat(user_id, agent.agent_user_id),
+             {:ok, updated_agent, default_status} <-
+               maybe_set_default_destination_chat(agent, user_id, chat_id, requested_default) do
+          result = %{
+            "ok" => true,
+            "message" => destination_chat_message(chat_id, chat_status, default_status),
+            "destination_chat_id" => chat_id,
+            "destination_chat_status" => chat_status,
+            "default_destination_status" => default_status,
+            "destination_chat_open_link" => build_chat_link(chat_id),
+            "integration" => integration_payload(updated_agent, state.latest_secret),
+            "agent" => builder_agent_context(updated_agent, state.latest_secret),
+            "_ui_group_id" => "builder:agent:#{updated_agent.id}",
+            "_ui_cards" => [agent_card_payload(updated_agent, state.latest_secret, "config")]
+          }
+
+          {result, %{state | active_agent_id: updated_agent.id}}
+        else
+          {:error, reason} ->
+            {%{"ok" => false, "error" => format_reason(reason)}, state}
+        end
+
+      nil ->
+        {%{"ok" => false, "error" => "Create or select an agent first."}, state}
+    end
+  end
+
   defp execute_builder_tool("archive_agent", input, state) do
     user_id = state.user_id
     identifier = normalize_optional_string(Map.get(input, "identifier"))
@@ -713,6 +820,7 @@ defmodule Vibe.AI.AgentBuilder do
     - Never claim an agent was created, updated, published, disabled, or rotated unless a tool result confirms it.
     - Use tools whenever you need agent state, ids, URLs, prompts, secrets, attached vibeChatId values, or integration guidance.
     - Before answering setup or integration questions, call get_builder_context or get_integration_details.
+    - When the user asks for a chat id or the easiest delivery destination and no attached/default chat is ready yet, call ensure_destination_chat so you can create or reuse the real DM and return its chatId instead of sending the user on a manual lookup flow.
     - When the user describes how the agent should behave, create or update the agent and generate a polished production system prompt.
     - When the user asks about prompt quality, explain that you can read, edit, or generate the prompt and then act with tools.
     - When the user asks how to integrate from code, give exact values from tools: agent_id, user_id, @username, invoke URL, events URL, X-Vibe-Agent-Secret usage, responseMode guidance, vibeChatId values, callback headers, and signature format.
@@ -768,12 +876,18 @@ defmodule Vibe.AI.AgentBuilder do
   defp builder_tool_progress_label("get_integration_details", _input),
     do: "Reading the agent integration details..."
 
+  defp builder_tool_progress_label("ensure_destination_chat", _input),
+    do: "Preparing a real Vibe destination chat..."
+
   defp builder_tool_progress_label(_tool_name, _input),
     do: "Working on the agent setup..."
 
   defp build_create_attrs(input) do
     %{}
-    |> maybe_put("display_name", normalize_optional_string(Map.get(input, "display_name")) || "New Agent")
+    |> maybe_put(
+      "display_name",
+      normalize_optional_string(Map.get(input, "display_name")) || "New Agent"
+    )
     |> maybe_put("username", normalize_optional_string(Map.get(input, "username")))
     |> maybe_put("system_prompt", normalize_optional_string(Map.get(input, "system_prompt")))
     |> maybe_put("persona", normalize_optional_string(Map.get(input, "persona")))
@@ -911,8 +1025,25 @@ defmodule Vibe.AI.AgentBuilder do
     base_url = public_base_url()
     chat_id_optional = not is_nil(default_chat)
     destination_chat_env_value = if(default_chat, do: nil, else: "<set_if_no_default_chat>")
-    env_export_lines = build_env_export_lines(payload, base_url, latest_secret, destination_chat_env_value, chat_id_optional)
-    integration_pack_text = build_integration_pack_text(agent, payload, base_url, env_export_lines, chat_id_optional, default_chat)
+
+    env_export_lines =
+      build_env_export_lines(
+        payload,
+        base_url,
+        latest_secret,
+        destination_chat_env_value,
+        chat_id_optional
+      )
+
+    integration_pack_text =
+      build_integration_pack_text(
+        agent,
+        payload,
+        base_url,
+        env_export_lines,
+        chat_id_optional,
+        default_chat
+      )
 
     %{
       "agent_id" => payload.id,
@@ -929,7 +1060,11 @@ defmodule Vibe.AI.AgentBuilder do
       "secret_hint" => payload.secretHint,
       "latest_secret" => latest_secret,
       "secret_note" =>
-        if(is_binary(latest_secret), do: "Use the latest_secret value below.", else: "The full secret is only shown right after creation or rotation. Rotate it if you need a new copy."),
+        if(is_binary(latest_secret),
+          do: "Use the latest_secret value below.",
+          else:
+            "The full secret is only shown right after creation or rotation. Rotate it if you need a new copy."
+        ),
       "auth_header" => %{"X-Vibe-Agent-Secret" => latest_secret || "<rotate_secret_to_reveal>"},
       "env_vars" => %{
         "VIBE_API_BASE_URL" => base_url,
@@ -944,7 +1079,8 @@ defmodule Vibe.AI.AgentBuilder do
         "VIBE_DESTINATION_CHAT_ID" =>
           if(chat_id_optional,
             do: "Optional because this agent already has a default destination chat in Vibe.",
-            else: "Optional only after you attach or configure a default destination chat in Vibe."
+            else:
+              "Optional only after you attach or configure a default destination chat in Vibe."
           )
       },
       "recommended_endpoint" => build_events_url(agent),
@@ -991,8 +1127,10 @@ defmodule Vibe.AI.AgentBuilder do
         "    \"data\": {\"symbol\": \"EURUSD\", \"side\": \"buy\", \"entry\": 1.0850}",
         "}",
         if(chat_id_optional,
-          do: "# destinationChatId is optional because the agent already has a default Vibe destination chat.",
-          else: "# Add destinationChatId only if you have not set a default destination chat in Vibe yet."
+          do:
+            "# destinationChatId is optional because the agent already has a default Vibe destination chat.",
+          else:
+            "# Add destinationChatId only if you have not set a default destination chat in Vibe yet."
         ),
         "response = requests.post(url, json=payload, headers=headers, timeout=float(os.getenv(\"VIBE_TIMEOUT_SECONDS\", \"10\")))",
         "response.raise_for_status()"
@@ -1014,8 +1152,10 @@ defmodule Vibe.AI.AgentBuilder do
         "Use responseMode=send only when the agent is already attached to the target Vibe chat.",
         "Use the events_url when you want structured event threads like orders, trades, tickets, and alerts inside Vibe chats.",
         if(chat_id_optional,
-          do: "This agent already has a default destination chat, so destinationChatId is optional for event ingestion.",
-          else: "If no default destination chat is configured yet, you must attach the agent to a Vibe chat or pass destinationChatId until you do."
+          do:
+            "This agent already has a default destination chat, so destinationChatId is optional for event ingestion.",
+          else:
+            "If no default destination chat is configured yet, you must attach the agent to a Vibe chat or pass destinationChatId until you do."
         ),
         "Use attached_chat_links and attached_chat_ids for real Vibe destinations. The agent_dm_link only opens a DM and is not the same as an attached chatId.",
         "To get a vibeChatId, DM the agent or invite it into a group/channel first."
@@ -1023,7 +1163,13 @@ defmodule Vibe.AI.AgentBuilder do
     }
   end
 
-  defp build_env_export_lines(payload, base_url, latest_secret, destination_chat_env_value, chat_id_optional) do
+  defp build_env_export_lines(
+         payload,
+         base_url,
+         latest_secret,
+         destination_chat_env_value,
+         chat_id_optional
+       ) do
     base_lines = [
       "VIBE_API_BASE_URL=#{base_url}",
       "VIBE_AGENT_IDENTIFIER=#{payload.username || payload.id}",
@@ -1042,8 +1188,16 @@ defmodule Vibe.AI.AgentBuilder do
     base_lines ++ [destination_line]
   end
 
-  defp build_integration_pack_text(agent, payload, base_url, env_export_lines, chat_id_optional, default_chat) do
+  defp build_integration_pack_text(
+         agent,
+         payload,
+         base_url,
+         env_export_lines,
+         chat_id_optional,
+         default_chat
+       ) do
     identifier = payload.username || payload.id
+
     destination_line =
       if chat_id_optional do
         "Default destination chat: configured#{if(default_chat && default_chat["chat_id"], do: " (#{default_chat["chat_id"]})", else: "")}"
@@ -1110,6 +1264,47 @@ defmodule Vibe.AI.AgentBuilder do
   end
 
   defp build_chat_link(_chat_id), do: nil
+
+  defp maybe_set_default_destination_chat(agent, user_id, chat_id, requested_default) do
+    should_set_default =
+      case requested_default do
+        true -> true
+        false -> false
+        _ -> not is_binary(normalize_optional_string(agent.default_destination_chat_id))
+      end
+
+    cond do
+      not should_set_default ->
+        {:ok, agent, "unchanged"}
+
+      normalize_optional_string(agent.default_destination_chat_id) == chat_id ->
+        {:ok, agent, "already_set"}
+
+      true ->
+        case Agents.update_agent(agent, %{"default_destination_chat_id" => chat_id}, user_id) do
+          {:ok, updated_agent} -> {:ok, updated_agent, "updated"}
+          {:error, reason} -> {:error, reason}
+        end
+    end
+  end
+
+  defp destination_chat_message(chat_id, chat_status, default_status) do
+    base =
+      case chat_status do
+        "created" -> "Created a Vibe DM and collected its chat id: #{chat_id}."
+        "restored" -> "Restored the Vibe DM and collected its chat id: #{chat_id}."
+        _ -> "Found the existing Vibe chat id: #{chat_id}."
+      end
+
+    suffix =
+      case default_status do
+        "updated" -> " I also set it as the default destination for events."
+        "already_set" -> " It was already the default destination."
+        _ -> ""
+      end
+
+    base <> suffix
+  end
 
   defp build_agent_dm_link(user_id) when is_binary(user_id) do
     "vibe://chat?friendId=#{user_id}"

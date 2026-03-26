@@ -5,6 +5,7 @@ defmodule Vibe.Chat do
   alias Vibe.Repo
   alias Vibe.RepoRLS
   alias Vibe.SupabaseStorage
+
   alias Vibe.Chat.{
     Room,
     Message,
@@ -28,34 +29,45 @@ defmodule Vibe.Chat do
   end
 
   def unsave_message(user_id, original_message_id) do
-    from(sm in SavedMessage, where: sm.user_id == ^user_id and sm.original_message_id == ^original_message_id)
+    from(sm in SavedMessage,
+      where: sm.user_id == ^user_id and sm.original_message_id == ^original_message_id
+    )
     |> Repo.delete_all()
   end
 
   def list_saved_messages(user_id) do
-    Repo.all(from sm in SavedMessage,
-             where: sm.user_id == ^user_id,
-             order_by: [desc: sm.timestamp])
+    Repo.all(
+      from(sm in SavedMessage,
+        where: sm.user_id == ^user_id,
+        order_by: [desc: sm.timestamp]
+      )
+    )
     |> Enum.map(&to_client_saved_message/1)
   end
 
   def is_participant?(chat_id, user_id) do
-    Repo.exists?(from p in Participant,
-                 where: p.chat_id == ^chat_id and p.user_id == ^user_id)
+    Repo.exists?(
+      from(p in Participant,
+        where: p.chat_id == ^chat_id and p.user_id == ^user_id
+      )
+    )
   end
 
   def get_participant_ids(chat_id) do
-    Repo.all(from p in Participant,
-             where: p.chat_id == ^chat_id,
-             select: p.user_id)
+    Repo.all(
+      from(p in Participant,
+        where: p.chat_id == ^chat_id,
+        select: p.user_id
+      )
+    )
   end
 
   def get_participant_settings(chat_id, user_id) do
-    Repo.one(from p in Participant, where: p.chat_id == ^chat_id and p.user_id == ^user_id)
+    Repo.one(from(p in Participant, where: p.chat_id == ^chat_id and p.user_id == ^user_id))
   end
 
   def get_all_participant_settings(chat_id) do
-    Repo.all(from p in Participant, where: p.chat_id == ^chat_id)
+    Repo.all(from(p in Participant, where: p.chat_id == ^chat_id))
   end
 
   def list_chats(user_id) do
@@ -71,150 +83,153 @@ defmodule Vibe.Chat do
   defp list_chats_uncached(user_id) do
     result =
       RepoRLS.with_user(user_id, fn ->
-      # Find all chats user is participating in (excluding deleted ones)
-      user_chats_query =
-        from p in Participant,
-          where: p.user_id == ^user_id and (is_nil(p.deleted) or p.deleted == false),
-          select: {p.chat_id, p}
+        # Find all chats user is participating in (excluding deleted ones)
+        user_chats_query =
+          from(p in Participant,
+            where: p.user_id == ^user_id and (is_nil(p.deleted) or p.deleted == false),
+            select: {p.chat_id, p}
+          )
 
-      results = Repo.all(user_chats_query)
-      chat_ids = Enum.map(results, fn {chat_id, _} -> chat_id end)
+        results = Repo.all(user_chats_query)
+        chat_ids = Enum.map(results, fn {chat_id, _} -> chat_id end)
 
-      # Batch-fetch all rooms in one query
-      rooms =
-        from(r in Room, where: r.id in ^chat_ids)
-        |> Repo.all()
-        |> Map.new(fn r -> {r.id, r} end)
+        # Batch-fetch all rooms in one query
+        rooms =
+          from(r in Room, where: r.id in ^chat_ids)
+          |> Repo.all()
+          |> Map.new(fn r -> {r.id, r} end)
 
-      # Batch-fetch all friend participants with users preloaded in one query
-      friend_participants =
-        from(p in Participant,
-          where: p.chat_id in ^chat_ids and p.user_id != ^user_id,
-          preload: [:user]
-        )
-        |> Repo.all()
-        |> Enum.group_by(& &1.chat_id)
+        # Batch-fetch all friend participants with users preloaded in one query
+        friend_participants =
+          from(p in Participant,
+            where: p.chat_id in ^chat_ids and p.user_id != ^user_id,
+            preload: [:user]
+          )
+          |> Repo.all()
+          |> Enum.group_by(& &1.chat_id)
 
-      # Batch-fetch latest 15 messages per chat using a window function
-      ranked_query =
-        from m in Message,
-          where: m.chat_id in ^chat_ids,
-          select: %{
-            id: m.id,
-            rnk: row_number() |> over(partition_by: m.chat_id, order_by: [desc: m.timestamp])
-          }
-
-      top_message_ids =
-        if chat_ids == [] do
-          []
-        else
-          Repo.all(ranked_query)
-          |> Enum.filter(&(&1.rnk <= @home_preview_message_limit))
-          |> Enum.map(& &1.id)
-        end
-
-      last_messages_by_chat =
-        if top_message_ids == [] do
-          %{}
-        else
+        # Batch-fetch latest 15 messages per chat using a window function
+        ranked_query =
           from(m in Message,
-            where: m.id in ^top_message_ids,
-            order_by: [asc: m.timestamp]
+            where: m.chat_id in ^chat_ids,
+            select: %{
+              id: m.id,
+              rnk: row_number() |> over(partition_by: m.chat_id, order_by: [desc: m.timestamp])
+            }
           )
-          |> Repo.all()
-          |> Enum.group_by(& &1.chat_id)
-        end
 
-      # Batch-fetch member counts for group/channel chats
-      group_channel_ids =
-        Enum.filter(chat_ids, fn id ->
-          room = Map.get(rooms, id)
-          room && room.type in ["group", "channel"]
+        top_message_ids =
+          if chat_ids == [] do
+            []
+          else
+            Repo.all(ranked_query)
+            |> Enum.filter(&(&1.rnk <= @home_preview_message_limit))
+            |> Enum.map(& &1.id)
+          end
+
+        last_messages_by_chat =
+          if top_message_ids == [] do
+            %{}
+          else
+            from(m in Message,
+              where: m.id in ^top_message_ids,
+              order_by: [asc: m.timestamp]
+            )
+            |> Repo.all()
+            |> Enum.group_by(& &1.chat_id)
+          end
+
+        # Batch-fetch member counts for group/channel chats
+        group_channel_ids =
+          Enum.filter(chat_ids, fn id ->
+            room = Map.get(rooms, id)
+            room && room.type in ["group", "channel"]
+          end)
+
+        member_counts =
+          if group_channel_ids != [] do
+            from(p in Participant,
+              where: p.chat_id in ^group_channel_ids,
+              group_by: p.chat_id,
+              select: {p.chat_id, count(p.id)}
+            )
+            |> Repo.all()
+            |> Map.new()
+          else
+            %{}
+          end
+
+        group_members =
+          if group_channel_ids != [] do
+            from(p in Participant,
+              where: p.chat_id in ^group_channel_ids,
+              preload: [:user],
+              order_by: [asc: p.inserted_at]
+            )
+            |> Repo.all()
+            |> Enum.group_by(& &1.chat_id)
+          else
+            %{}
+          end
+
+        Enum.map(results, fn {chat_id, my_settings} ->
+          room = Map.get(rooms, chat_id)
+          friend_p = List.first(Map.get(friend_participants, chat_id, []))
+
+          # Filter last message by cleared_at if applicable
+          chat_messages = Map.get(last_messages_by_chat, chat_id, [])
+
+          chat_messages =
+            if my_settings.messages_cleared_at do
+              cleared_at_ms =
+                my_settings.messages_cleared_at
+                |> DateTime.from_naive!("Etc/UTC")
+                |> DateTime.to_unix(:millisecond)
+
+              Enum.filter(chat_messages, &(&1.timestamp > cleared_at_ms))
+            else
+              chat_messages
+            end
+
+          room_type = if(room, do: room.type, else: "dm")
+
+          members =
+            if room_type in ["group", "channel"] do
+              Map.get(group_members, chat_id, [])
+              |> Enum.map(fn member ->
+                %{
+                  userId: member.user_id,
+                  name: if(member.user, do: member.user.username, else: nil),
+                  role: member.role || "member"
+                }
+              end)
+            else
+              nil
+            end
+
+          messages_for_client = Enum.map(chat_messages, &to_client_message/1)
+
+          %{
+            chatId: chat_id,
+            type: room_type,
+            name: if(room, do: room.name, else: nil),
+            description: if(room, do: room.description, else: nil),
+            avatarUrl: if(room, do: room.avatar_url, else: nil),
+            creatorId: if(room, do: room.creator_id, else: nil),
+            memberCount: Map.get(member_counts, chat_id),
+            role: my_settings.role,
+            friendId: if(friend_p, do: friend_p.user_id, else: nil),
+            friendName: if(friend_p && friend_p.user, do: friend_p.user.username, else: nil),
+            friendImage:
+              if(friend_p && friend_p.user, do: friend_p.user.profile_image, else: nil),
+            members: members,
+            messages: messages_for_client,
+            unreadCount: 0,
+            pinned: my_settings.pinned,
+            muted: my_settings.muted
+          }
         end)
-
-      member_counts =
-        if group_channel_ids != [] do
-          from(p in Participant,
-            where: p.chat_id in ^group_channel_ids,
-            group_by: p.chat_id,
-            select: {p.chat_id, count(p.id)}
-          )
-          |> Repo.all()
-          |> Map.new()
-        else
-          %{}
-        end
-
-      group_members =
-        if group_channel_ids != [] do
-          from(p in Participant,
-            where: p.chat_id in ^group_channel_ids,
-            preload: [:user],
-            order_by: [asc: p.inserted_at]
-          )
-          |> Repo.all()
-          |> Enum.group_by(& &1.chat_id)
-        else
-          %{}
-        end
-
-      Enum.map(results, fn {chat_id, my_settings} ->
-        room = Map.get(rooms, chat_id)
-        friend_p = List.first(Map.get(friend_participants, chat_id, []))
-
-        # Filter last message by cleared_at if applicable
-        chat_messages = Map.get(last_messages_by_chat, chat_id, [])
-
-        chat_messages =
-          if my_settings.messages_cleared_at do
-            cleared_at_ms =
-              my_settings.messages_cleared_at
-              |> DateTime.from_naive!("Etc/UTC")
-              |> DateTime.to_unix(:millisecond)
-
-            Enum.filter(chat_messages, &(&1.timestamp > cleared_at_ms))
-          else
-            chat_messages
-          end
-
-        room_type = if(room, do: room.type, else: "dm")
-
-        members =
-          if room_type in ["group", "channel"] do
-            Map.get(group_members, chat_id, [])
-            |> Enum.map(fn member ->
-              %{
-                userId: member.user_id,
-                name: if(member.user, do: member.user.username, else: nil),
-                role: member.role || "member"
-              }
-            end)
-          else
-            nil
-          end
-
-        messages_for_client = Enum.map(chat_messages, &to_client_message/1)
-
-        %{
-          chatId: chat_id,
-          type: room_type,
-          name: if(room, do: room.name, else: nil),
-          description: if(room, do: room.description, else: nil),
-          avatarUrl: if(room, do: room.avatar_url, else: nil),
-          creatorId: if(room, do: room.creator_id, else: nil),
-          memberCount: Map.get(member_counts, chat_id),
-          role: my_settings.role,
-          friendId: if(friend_p, do: friend_p.user_id, else: nil),
-          friendName: if(friend_p && friend_p.user, do: friend_p.user.username, else: nil),
-          friendImage: if(friend_p && friend_p.user, do: friend_p.user.profile_image, else: nil),
-          members: members,
-          messages: messages_for_client,
-          unreadCount: 0,
-          pinned: my_settings.pinned,
-          muted: my_settings.muted
-        }
       end)
-    end)
 
     case result do
       chats when is_list(chats) ->
@@ -231,17 +246,56 @@ defmodule Vibe.Chat do
   end
 
   def find_chat_between_users(u1, u2) do
-    # Find a chat ID that has both participants
-    # This is a bit tricky in pure Ecto without subqueries or direct SQL if schema is normalized strictly
-    # Simpler: Get u1 chats, check if u2 is in them.
-
-    query = from p1 in Participant,
-            join: p2 in Participant, on: p1.chat_id == p2.chat_id,
-            where: p1.user_id == ^u1 and p2.user_id == ^u2,
-            select: p1.chat_id,
-            limit: 1
+    query =
+      from(r in Room,
+        join: p1 in Participant,
+        on: p1.chat_id == r.id,
+        join: p2 in Participant,
+        on: p2.chat_id == r.id,
+        where: r.type == "dm" and p1.user_id == ^u1 and p2.user_id == ^u2,
+        select: r.id,
+        limit: 1
+      )
 
     Repo.one(query)
+  end
+
+  def ensure_dm_chat(user_id, peer_user_id) when is_binary(user_id) and is_binary(peer_user_id) do
+    case find_chat_between_users(user_id, peer_user_id) do
+      chat_id when is_binary(chat_id) ->
+        status =
+          case restore_if_deleted(chat_id, user_id) do
+            :restored -> "restored"
+            _ -> "existing"
+          end
+
+        {:ok, chat_id, status}
+
+      nil ->
+        chat_id = deterministic_dm_chat_id(user_id, peer_user_id)
+
+        try do
+          case create_chat(chat_id, [user_id, peer_user_id]) do
+            {:ok, _room} ->
+              {:ok, chat_id, "created"}
+
+            {:error, reason} ->
+              {:error, reason}
+
+            other ->
+              {:error, other}
+          end
+        rescue
+          Ecto.ConstraintError ->
+            status =
+              case restore_if_deleted(chat_id, user_id) do
+                :restored -> "restored"
+                _ -> "existing"
+              end
+
+            {:ok, chat_id, status}
+        end
+    end
   end
 
   def get_chat(id) do
@@ -251,14 +305,14 @@ defmodule Vibe.Chat do
   def create_chat(id, user_ids) do
     result =
       Repo.transaction(fn ->
-      room = Repo.insert!(%Room{id: id, is_group: length(user_ids) > 2})
+        room = Repo.insert!(%Room{id: id, is_group: length(user_ids) > 2})
 
-      Enum.each(user_ids, fn uid ->
-        Repo.insert!(%Participant{chat_id: id, user_id: uid})
+        Enum.each(user_ids, fn uid ->
+          Repo.insert!(%Participant{chat_id: id, user_id: uid})
+        end)
+
+        room
       end)
-
-      room
-    end)
 
     case result do
       {:ok, room} ->
@@ -270,11 +324,15 @@ defmodule Vibe.Chat do
     end
   end
 
+  defp deterministic_dm_chat_id(u1, u2) do
+    :crypto.hash(:sha256, Enum.sort([u1, u2]) |> Enum.join("|"))
+    |> Base.encode16(case: :lower)
+    |> binary_part(0, 12)
+  end
+
   def add_message(attrs, opts \\ []) do
     acting_user_id =
-      normalize_actor_id(
-        Keyword.get(opts, :acting_user_id) || extract_from_id(attrs)
-      )
+      normalize_actor_id(Keyword.get(opts, :acting_user_id) || extract_from_id(attrs))
 
     from_id = normalize_actor_id(extract_from_id(attrs))
 
@@ -286,10 +344,10 @@ defmodule Vibe.Chat do
       true ->
         result =
           RepoRLS.with_user(acting_user_id || from_id, fn ->
-          %Message{}
-          |> Message.changeset(attrs)
-          |> Repo.insert()
-        end)
+            %Message{}
+            |> Message.changeset(attrs)
+            |> Repo.insert()
+          end)
 
         case result do
           {:ok, %Message{} = message} ->
@@ -306,8 +364,9 @@ defmodule Vibe.Chat do
     RepoRLS.with_user(user_id, fn ->
       with {:ok, message_uuid} <- Ecto.UUID.cast(message_id) do
         Repo.one(
-          from m in Message,
+          from(m in Message,
             where: m.chat_id == ^chat_id and m.id == ^message_uuid
+          )
         )
       else
         _ -> nil
@@ -318,9 +377,10 @@ defmodule Vibe.Chat do
   def get_messages(chat_id, user_id \\ nil) do
     RepoRLS.with_user(user_id, fn ->
       Repo.all(
-        from m in Message,
+        from(m in Message,
           where: m.chat_id == ^chat_id,
           order_by: [asc: m.timestamp]
+        )
       )
       |> Enum.map(&to_client_message/1)
     end)
@@ -331,15 +391,17 @@ defmodule Vibe.Chat do
       # Get user's cleared_at timestamp
       participant =
         Repo.one(
-          from p in Participant,
+          from(p in Participant,
             where: p.chat_id == ^chat_id and p.user_id == ^user_id,
             select: p.messages_cleared_at
+          )
         )
 
       query =
-        from m in Message,
+        from(m in Message,
           where: m.chat_id == ^chat_id,
           order_by: [asc: m.timestamp]
+        )
 
       query =
         if participant do
@@ -348,7 +410,7 @@ defmodule Vibe.Chat do
             |> DateTime.from_naive!("Etc/UTC")
             |> DateTime.to_unix(:millisecond)
 
-          from m in query, where: m.timestamp > ^cleared_at_ms
+          from(m in query, where: m.timestamp > ^cleared_at_ms)
         else
           query
         end
@@ -366,14 +428,16 @@ defmodule Vibe.Chat do
       RepoRLS.with_user(user_id, fn ->
         participant =
           Repo.one(
-            from p in Participant,
+            from(p in Participant,
               where: p.chat_id == ^chat_id and p.user_id == ^user_id,
               select: p.messages_cleared_at
+            )
           )
 
         query =
-          from m in Message,
+          from(m in Message,
             where: m.chat_id == ^chat_id
+          )
 
         query =
           if participant do
@@ -382,7 +446,7 @@ defmodule Vibe.Chat do
               |> DateTime.from_naive!("Etc/UTC")
               |> DateTime.to_unix(:millisecond)
 
-            from m in query, where: m.timestamp > ^cleared_at_ms
+            from(m in query, where: m.timestamp > ^cleared_at_ms)
           else
             query
           end
@@ -390,17 +454,19 @@ defmodule Vibe.Chat do
         query =
           case before do
             %{timestamp: timestamp, id: id} ->
-              from m in query,
+              from(m in query,
                 where: m.timestamp < ^timestamp or (m.timestamp == ^timestamp and m.id < ^id)
+              )
 
             _ ->
               query
           end
 
         Repo.all(
-          from m in query,
+          from(m in query,
             order_by: [desc: m.timestamp, desc: m.id],
             limit: ^(limit + 1)
+          )
         )
       end)
 
@@ -408,6 +474,7 @@ defmodule Vibe.Chat do
       messages when is_list(messages) ->
         has_more = length(messages) > limit
         page_desc = Enum.take(messages, limit)
+
         next_cursor =
           if has_more do
             page_desc
@@ -442,15 +509,15 @@ defmodule Vibe.Chat do
   def mark_read(message_id, reader_id) do
     result =
       RepoRLS.with_user(reader_id, fn ->
-      # 1. Record the read receipt
-      %MessageRead{}
-      |> MessageRead.changeset(%{message_id: message_id, reader_id: reader_id})
-      |> Repo.insert(on_conflict: :nothing)
+        # 1. Record the read receipt
+        %MessageRead{}
+        |> MessageRead.changeset(%{message_id: message_id, reader_id: reader_id})
+        |> Repo.insert(on_conflict: :nothing)
 
-      # 2. Update message status to 'read'
-      from(m in Message, where: m.id == ^message_id)
-      |> Repo.update_all(set: [status: "read"])
-    end)
+        # 2. Update message status to 'read'
+        from(m in Message, where: m.id == ^message_id)
+        |> Repo.update_all(set: [status: "read"])
+      end)
 
     invalidate_home_cache_for_message(message_id)
     result
@@ -459,10 +526,10 @@ defmodule Vibe.Chat do
   def mark_delivered(message_id, user_id \\ nil) do
     result =
       RepoRLS.with_user(user_id, fn ->
-      # Only update if status is 'sent' (don't overwrite 'read')
-      from(m in Message, where: m.id == ^message_id and m.status == "sent")
-      |> Repo.update_all(set: [status: "delivered"])
-    end)
+        # Only update if status is 'sent' (don't overwrite 'read')
+        from(m in Message, where: m.id == ^message_id and m.status == "sent")
+        |> Repo.update_all(set: [status: "delivered"])
+      end)
 
     invalidate_home_cache_for_message(message_id)
     result
@@ -471,45 +538,50 @@ defmodule Vibe.Chat do
   def can_delete_message_for_everyone?(chat_id, user_id, from_id) do
     from_id == user_id ||
       Repo.exists?(
-        from p in Participant,
+        from(p in Participant,
           where:
             p.chat_id == ^chat_id and
               p.user_id == ^user_id and
               p.role in ["owner", "admin"]
+        )
       )
   end
 
   def delete_message(chat_id, message_id, user_id, for_everyone \\ true) do
     result =
       RepoRLS.with_user(user_id, fn ->
-      if not is_participant?(chat_id, user_id) do
-        {:error, :forbidden}
-      else
-        case Ecto.UUID.cast(message_id) do
-          :error ->
-            {:error, :invalid_id}
+        if not is_participant?(chat_id, user_id) do
+          {:error, :forbidden}
+        else
+          case Ecto.UUID.cast(message_id) do
+            :error ->
+              {:error, :invalid_id}
 
-          {:ok, uuid} ->
-            case Repo.one(from m in Message, where: m.id == ^uuid and m.chat_id == ^chat_id) do
-              nil ->
-                {:error, :not_found}
+            {:ok, uuid} ->
+              case Repo.one(from(m in Message, where: m.id == ^uuid and m.chat_id == ^chat_id)) do
+                nil ->
+                  {:error, :not_found}
 
-              %Message{} = message ->
-                if for_everyone && not can_delete_message_for_everyone?(chat_id, user_id, message.from_id) do
-                  {:error, :forbidden}
-                else
-                  Repo.transaction(fn ->
-                    from(r in MessageRead, where: r.message_id == ^uuid) |> Repo.delete_all()
-                    from(pm in PinnedMessage, where: pm.message_id == ^uuid) |> Repo.delete_all()
-                    Repo.delete!(message)
-                  end)
+                %Message{} = message ->
+                  if for_everyone &&
+                       not can_delete_message_for_everyone?(chat_id, user_id, message.from_id) do
+                    {:error, :forbidden}
+                  else
+                    Repo.transaction(fn ->
+                      from(r in MessageRead, where: r.message_id == ^uuid) |> Repo.delete_all()
 
-                  {:ok, message}
-                end
-            end
+                      from(pm in PinnedMessage, where: pm.message_id == ^uuid)
+                      |> Repo.delete_all()
+
+                      Repo.delete!(message)
+                    end)
+
+                    {:ok, message}
+                  end
+              end
+          end
         end
-      end
-    end)
+      end)
 
     case result do
       {:ok, %Message{} = message} ->
@@ -524,39 +596,42 @@ defmodule Vibe.Chat do
   def edit_message(chat_id, message_id, user_id, encrypted_content, edited_at \\ nil) do
     result =
       RepoRLS.with_user(user_id, fn ->
-      if not is_participant?(chat_id, user_id) do
-        {:error, :forbidden}
-      else
-        case Ecto.UUID.cast(message_id) do
-          :error ->
-            {:error, :invalid_id}
+        if not is_participant?(chat_id, user_id) do
+          {:error, :forbidden}
+        else
+          case Ecto.UUID.cast(message_id) do
+            :error ->
+              {:error, :invalid_id}
 
-          {:ok, uuid} ->
-            case Repo.one(from m in Message, where: m.id == ^uuid and m.chat_id == ^chat_id) do
-              nil ->
-                {:error, :not_found}
+            {:ok, uuid} ->
+              case Repo.one(from(m in Message, where: m.id == ^uuid and m.chat_id == ^chat_id)) do
+                nil ->
+                  {:error, :not_found}
 
-              %Message{} = message ->
-                if message.from_id != user_id do
-                  {:error, :forbidden}
-                else
-                  next_timestamp =
-                    cond do
-                      is_integer(edited_at) and edited_at > 0 -> max(message.timestamp || 0, edited_at)
-                      true -> message.timestamp
-                    end
+                %Message{} = message ->
+                  if message.from_id != user_id do
+                    {:error, :forbidden}
+                  else
+                    next_timestamp =
+                      cond do
+                        is_integer(edited_at) and edited_at > 0 ->
+                          max(message.timestamp || 0, edited_at)
 
-                  message
-                  |> Ecto.Changeset.change(
-                    encrypted_content: encrypted_content,
-                    timestamp: next_timestamp
-                  )
-                  |> Repo.update()
-                end
-            end
+                        true ->
+                          message.timestamp
+                      end
+
+                    message
+                    |> Ecto.Changeset.change(
+                      encrypted_content: encrypted_content,
+                      timestamp: next_timestamp
+                    )
+                    |> Repo.update()
+                  end
+              end
+          end
         end
-      end
-    end)
+      end)
 
     case result do
       {:ok, %Message{} = message} ->
@@ -571,7 +646,7 @@ defmodule Vibe.Chat do
   def list_pinned_messages(chat_id, user_id) do
     RepoRLS.with_user(user_id, fn ->
       Repo.all(
-        from pm in PinnedMessage,
+        from(pm in PinnedMessage,
           join: m in Message,
           on: pm.message_id == m.id,
           where: pm.chat_id == ^chat_id and pm.user_id == ^user_id,
@@ -582,6 +657,7 @@ defmodule Vibe.Chat do
             pinnedAt: pm.inserted_at,
             timestamp: m.timestamp
           }
+        )
       )
     end)
   end
@@ -589,50 +665,51 @@ defmodule Vibe.Chat do
   def set_message_pin(chat_id, message_id, user_id, pinned \\ true) do
     result =
       RepoRLS.with_user(user_id, fn ->
-      if not is_participant?(chat_id, user_id) do
-        {:error, :forbidden}
-      else
-        case Ecto.UUID.cast(message_id) do
-          :error ->
-            {:error, :invalid_id}
+        if not is_participant?(chat_id, user_id) do
+          {:error, :forbidden}
+        else
+          case Ecto.UUID.cast(message_id) do
+            :error ->
+              {:error, :invalid_id}
 
-          {:ok, uuid} ->
-            if pinned do
-              case Repo.one(from m in Message, where: m.id == ^uuid and m.chat_id == ^chat_id) do
-                nil ->
-                  {:error, :not_found}
+            {:ok, uuid} ->
+              if pinned do
+                case Repo.one(from(m in Message, where: m.id == ^uuid and m.chat_id == ^chat_id)) do
+                  nil ->
+                    {:error, :not_found}
 
-                _message ->
-                  changeset =
-                    %PinnedMessage{}
-                    |> PinnedMessage.changeset(%{
-                      user_id: user_id,
-                      chat_id: chat_id,
-                      message_id: uuid
-                    })
+                  _message ->
+                    changeset =
+                      %PinnedMessage{}
+                      |> PinnedMessage.changeset(%{
+                        user_id: user_id,
+                        chat_id: chat_id,
+                        message_id: uuid
+                      })
 
-                  case Repo.insert(changeset,
-                         on_conflict: :nothing,
-                         conflict_target: [:user_id, :chat_id, :message_id]
-                       ) do
-                    {:ok, pin} ->
-                      {:ok, pin}
+                    case Repo.insert(changeset,
+                           on_conflict: :nothing,
+                           conflict_target: [:user_id, :chat_id, :message_id]
+                         ) do
+                      {:ok, pin} ->
+                        {:ok, pin}
 
-                    {:error, changeset} ->
-                      {:error, changeset}
-                  end
+                      {:error, changeset} ->
+                        {:error, changeset}
+                    end
+                end
+              else
+                from(pm in PinnedMessage,
+                  where:
+                    pm.user_id == ^user_id and pm.chat_id == ^chat_id and pm.message_id == ^uuid
+                )
+                |> Repo.delete_all()
+
+                {:ok, :unpinned}
               end
-            else
-              from(pm in PinnedMessage,
-                where: pm.user_id == ^user_id and pm.chat_id == ^chat_id and pm.message_id == ^uuid
-              )
-              |> Repo.delete_all()
-
-              {:ok, :unpinned}
-            end
+          end
         end
-      end
-    end)
+      end)
 
     case result do
       {:ok, value} ->
@@ -653,7 +730,7 @@ defmodule Vibe.Chat do
       Repo.transaction(fn ->
         pinned_user_ids =
           Repo.all(
-            from pm in PinnedMessage,
+            from(pm in PinnedMessage,
               join: m in Message,
               on: m.id == pm.message_id,
               where:
@@ -663,6 +740,7 @@ defmodule Vibe.Chat do
                   m.type == "file",
               select: pm.user_id,
               distinct: true
+            )
           )
 
         if pinned_user_ids == [] do
@@ -741,26 +819,36 @@ defmodule Vibe.Chat do
         ChatHomeCache.invalidate_user(user_id)
         {:ok, :deleted}
 
-      {0, _} -> {:error, "Chat not found"}
-      _ -> {:error, "Failed to delete"}
+      {0, _} ->
+        {:error, "Chat not found"}
+
+      _ ->
+        {:error, "Failed to delete"}
     end
   end
 
   def restore_if_deleted(chat_id, user_id) do
     # Check if this user has deleted the chat
-    participant = Repo.one(from p in Participant,
-                           where: p.chat_id == ^chat_id and p.user_id == ^user_id)
+    participant =
+      Repo.one(
+        from(p in Participant,
+          where: p.chat_id == ^chat_id and p.user_id == ^user_id
+        )
+      )
 
     cond do
       is_nil(participant) ->
         # No participant record - shouldn't happen but treat as not deleted
         :not_deleted
+
       participant.deleted == true ->
         # Was deleted - restore it
         from(p in Participant, where: p.chat_id == ^chat_id and p.user_id == ^user_id)
         |> Repo.update_all(set: [deleted: false])
+
         ChatHomeCache.invalidate_user(user_id)
         :restored
+
       true ->
         # Not deleted
         :not_deleted
@@ -775,21 +863,22 @@ defmodule Vibe.Chat do
 
     result =
       Repo.transaction(fn ->
-      room = Repo.insert!(%Room{
-        id: id,
-        is_group: true,
-        type: "group",
-        name: name,
-        creator_id: creator_id
-      })
+        room =
+          Repo.insert!(%Room{
+            id: id,
+            is_group: true,
+            type: "group",
+            name: name,
+            creator_id: creator_id
+          })
 
-      Enum.each(all_member_ids, fn uid ->
-        role = if uid == creator_id, do: "owner", else: "member"
-        Repo.insert!(%Participant{chat_id: id, user_id: uid, role: role})
+        Enum.each(all_member_ids, fn uid ->
+          role = if uid == creator_id, do: "owner", else: "member"
+          Repo.insert!(%Participant{chat_id: id, user_id: uid, role: role})
+        end)
+
+        room
       end)
-
-      room
-    end)
 
     case result do
       {:ok, room} ->
@@ -829,19 +918,20 @@ defmodule Vibe.Chat do
 
     result =
       Repo.transaction(fn ->
-      room = Repo.insert!(%Room{
-        id: id,
-        is_group: false,
-        type: "channel",
-        name: name,
-        description: description,
-        creator_id: creator_id
-      })
+        room =
+          Repo.insert!(%Room{
+            id: id,
+            is_group: false,
+            type: "channel",
+            name: name,
+            description: description,
+            creator_id: creator_id
+          })
 
-      Repo.insert!(%Participant{chat_id: id, user_id: creator_id, role: "owner"})
+        Repo.insert!(%Participant{chat_id: id, user_id: creator_id, role: "owner"})
 
-      room
-    end)
+        room
+      end)
 
     case result do
       {:ok, room} ->
@@ -873,8 +963,11 @@ defmodule Vibe.Chat do
 
   def leave_channel(channel_id, user_id) do
     # Don't allow owner to leave
-    case Repo.one(from p in Participant,
-                   where: p.chat_id == ^channel_id and p.user_id == ^user_id) do
+    case Repo.one(
+           from(p in Participant,
+             where: p.chat_id == ^channel_id and p.user_id == ^user_id
+           )
+         ) do
       %Participant{role: "owner"} ->
         {:error, "Owner cannot leave channel"}
 
@@ -891,16 +984,18 @@ defmodule Vibe.Chat do
 
   def list_channels do
     Repo.all(
-      from r in Room,
+      from(r in Room,
         where: r.type == "channel",
         order_by: [desc: r.inserted_at],
         preload: [:creator]
+      )
     )
     |> Enum.map(fn room ->
-      subscriber_count = Repo.aggregate(
-        from(p in Participant, where: p.chat_id == ^room.id),
-        :count
-      )
+      subscriber_count =
+        Repo.aggregate(
+          from(p in Participant, where: p.chat_id == ^room.id),
+          :count
+        )
 
       %{
         id: room.id,
@@ -955,9 +1050,11 @@ defmodule Vibe.Chat do
       %Room{type: "channel"} ->
         # Only owner/admin can send in channels
         Repo.exists?(
-          from p in Participant,
-            where: p.chat_id == ^chat_id and p.user_id == ^user_id
-              and p.role in ["owner", "admin"]
+          from(p in Participant,
+            where:
+              p.chat_id == ^chat_id and p.user_id == ^user_id and
+                p.role in ["owner", "admin"]
+          )
         )
 
       %Room{type: type} when type in ["dm", "group"] ->
@@ -971,22 +1068,25 @@ defmodule Vibe.Chat do
 
   def get_user_role(chat_id, user_id) do
     Repo.one(
-      from p in Participant,
+      from(p in Participant,
         where: p.chat_id == ^chat_id and p.user_id == ^user_id,
         select: p.role
+      )
     )
   end
 
   def get_room_type(chat_id) do
-    Repo.one(from r in Room, where: r.id == ^chat_id, select: r.type)
+    Repo.one(from(r in Room, where: r.id == ^chat_id, select: r.type))
   end
 
   def get_user_channels(user_id) do
     Repo.all(
-      from p in Participant,
-        join: r in Room, on: r.id == p.chat_id,
+      from(p in Participant,
+        join: r in Room,
+        on: r.id == p.chat_id,
         where: p.user_id == ^user_id and r.type == "channel" and p.role == "owner",
         select: %{id: r.id, name: r.name}
+      )
     )
   end
 
@@ -1000,9 +1100,10 @@ defmodule Vibe.Chat do
 
   def list_scheduled_posts(channel_id) do
     Repo.all(
-      from sp in ScheduledPost,
+      from(sp in ScheduledPost,
         where: sp.channel_id == ^channel_id and sp.status == "pending",
         order_by: [asc: sp.scheduled_at]
+      )
     )
   end
 
@@ -1129,9 +1230,10 @@ defmodule Vibe.Chat do
   defp invalidate_chat_home_cache(chat_id) when is_binary(chat_id) do
     participant_ids =
       Repo.all(
-        from p in Participant,
+        from(p in Participant,
           where: p.chat_id == ^chat_id,
           select: p.user_id
+        )
       )
 
     ChatHomeCache.invalidate_users(participant_ids)
@@ -1141,7 +1243,7 @@ defmodule Vibe.Chat do
   defp invalidate_chat_home_cache(_chat_id), do: :ok
 
   defp invalidate_home_cache_for_message(message_id) when is_binary(message_id) do
-    case Repo.one(from m in Message, where: m.id == ^message_id, select: m.chat_id) do
+    case Repo.one(from(m in Message, where: m.id == ^message_id, select: m.chat_id)) do
       chat_id when is_binary(chat_id) -> invalidate_chat_home_cache(chat_id)
       _ -> :ok
     end

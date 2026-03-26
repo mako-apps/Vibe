@@ -1,6 +1,10 @@
 2026-03-26
 
 Completed:
+- Added an agentic destination-chat flow for standalone agents: the builder can now create or reuse the real owner<->agent DM, return the actual `chat_id`, and optionally set it as the agent's default destination chat instead of forcing a manual lookup step.
+- Tightened DM resolution in `Vibe.Chat.find_chat_between_users/2` to only return `dm` rooms, then added `Vibe.Chat.ensure_dm_chat/2` so chat creation/reuse/restoration is consistent for builder and normal chat creation.
+- Updated the normal chat controller to reuse `Chat.ensure_dm_chat/2`, preserving the restore/create/existing behavior while sharing the same deterministic DM logic.
+- Added the new builder tool `ensure_destination_chat` and prompt guidance so when the owner asks for the chat id or easiest event destination, the agent can prepare the destination chat and return the real attached/default chat info directly in the inline config card.
 - Fixed the native agent card tap path by disabling interaction on the decorative inner card container so the parent `UIControl` receives the press.
 - Adjusted assistant row assembly so agent cards stay hidden until streamed text exists or streaming finishes, and action buttons render after the final assistant entry. The visible order is now `loading/streaming -> text -> card -> actions`.
 - Deferred `agent_cards` channel events until the first streamed text chunk or finalization so the client no longer receives card events ahead of post-tool text.
@@ -17,6 +21,8 @@ Completed:
 - Added detached top and bottom gradient masks to the config panel, matching the attachment sheet pattern so the sheet header/body transition no longer shows hard edges.
 
 Remaining:
+- Live-validate the new `ensure_destination_chat` builder flow in the app: ask the standalone agent for the chat id, confirm it creates or reuses the DM, updates the inline config card, and copies the returned default/attached chat id from the native config panel.
+- Decide whether `get_integration_details` should stay read-only or automatically invoke `ensure_destination_chat` when the user clearly asks for the easiest setup path.
 - Validate the iOS flow on device or simulator, especially card taps opening the config panel, cached secret reuse after agent creation, copy before rotate, secret reveal/copy/rotate, the detached glass overlay appearance, the masked header edge treatment, builder/subagent turns that emit cards before text, and the stop-streaming state in the Vibe tab bar.
 - `mix test` cannot run in `server/` because `server/config/test.exs` is missing.
 - The full mobile TypeScript check still fails with existing repo-wide errors outside the touched native agent files; `git diff --check` passed for the changed files, but no simulator/device build was run.
