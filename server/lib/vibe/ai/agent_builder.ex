@@ -1293,6 +1293,13 @@ defmodule Vibe.AI.AgentBuilder do
 
   defp builder_tool_model_result(result), do: result
 
+  defp sanitize_builder_payload(%DateTime{} = value), do: DateTime.to_iso8601(value)
+  defp sanitize_builder_payload(%NaiveDateTime{} = value), do: NaiveDateTime.to_iso8601(value)
+  defp sanitize_builder_payload(%Date{} = value), do: Date.to_iso8601(value)
+  defp sanitize_builder_payload(%Time{} = value), do: Time.to_iso8601(value)
+  defp sanitize_builder_payload(%Decimal{} = value), do: Decimal.to_string(value)
+  defp sanitize_builder_payload(value) when is_struct(value), do: inspect(value)
+
   defp sanitize_builder_payload(value) when is_map(value) do
     Enum.reduce(value, %{}, fn {key, inner_value}, acc ->
       key_string = to_string(key)

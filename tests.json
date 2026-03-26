@@ -7,7 +7,11 @@
     },
     "server_mix_compile": {
       "status": "passed",
-      "details": "Compiled successfully after the AgentChannel change; only pre-existing warnings were reported."
+      "details": "Compiled successfully after the AgentChannel and AgentBuilder fixes; only pre-existing warnings were reported."
+    },
+    "server_builder_struct_sanitization": {
+      "status": "passed",
+      "details": "Builder payload sanitization now compiles with explicit handling for DateTime, NaiveDateTime, Date, Time, Decimal, and fallback structs."
     },
     "ios_native_validation": {
       "status": "not_run",
