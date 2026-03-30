@@ -3,6 +3,7 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import Chat from './components/Chat';
 import Home from './pages/Home';
 import AgentDocs from './pages/AgentDocs';
+import AgentConfigDocs from './pages/AgentConfigDocs';
 
 // App Wrapper to handle PWA vs Landing logic
 const App = () => {
@@ -23,6 +24,7 @@ const App = () => {
       <Routes>
         <Route path="/" element={<Home />} />
         <Route path="/docs/agents" element={<AgentDocs />} />
+        <Route path="/docs/agents/config" element={<AgentConfigDocs />} />
         <Route path="/app" element={<Chat />} />
         {/* Catch-all redirect to Home or App depending on preference, default to Home for now */}
         <Route path="*" element={<Navigate to="/" replace />} />

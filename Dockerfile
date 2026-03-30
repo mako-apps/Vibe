@@ -2,6 +2,17 @@
 # Multi-stage build for Vibe (Elixir Backend + React Client)
 # ===========================================
 
+# Stage 1: Build React client
+FROM node:20-alpine AS client-build
+
+WORKDIR /app/client
+
+COPY client/package.json client/package-lock.json ./
+RUN npm ci
+
+COPY client/ ./
+RUN npm run build
+
 # Stage 2: Build Elixir Release
 FROM hexpm/elixir:1.15.7-erlang-26.2.1-alpine-3.18.4 AS elixir-build
 
@@ -29,6 +40,7 @@ COPY server/config/ config/
 # Compile the release
 COPY server/lib/ lib/
 COPY server/priv/ priv/
+COPY --from=client-build /app/client/dist/ priv/static/
 
 # Compile the project
 RUN mix compile

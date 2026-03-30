@@ -85,6 +85,14 @@
       "status": "passed",
       "details": "Extended agent cards with `event_inbox_mode` / `summary_window_hours`, surfaced an `Inbox Mode` row in `ChatNativeAgentConfigPanel.swift`, and wired it to `PUT /api/agents/:id` with `approval_rules[\"event_inbox\"]` choices for event bubbles, 4h batch summaries, and daily summaries. `xcrun swiftc -parse mobile/modules/vibe-chat-native/ios/ChatListViewModels.swift mobile/modules/vibe-chat-native/ios/ChatNativeAgentConfigPanel.swift mobile/modules/vibe-chat-native/ios/ChatNativeAgentView.swift` passed, and `mix compile` passed."
     },
+    "web_agent_config_docs_route": {
+      "status": "passed",
+      "details": "Added a dedicated web doc page at `client/src/pages/AgentConfigDocs.tsx`, routed it through `client/src/App.tsx` at `/docs/agents/config`, updated the shared docs header to handle config-doc anchors, and linked the main agent docs page into the new config reference."
+    },
+    "web_client_bundle_for_phoenix_root": {
+      "status": "passed",
+      "details": "Updated the root `Dockerfile` to build the React client in a Node stage and copy `client/dist` into `server/priv/static` before the Phoenix release build. Also ran `npm run build -- --outDir ../server/priv/static` from `client/`, which successfully generated `server/priv/static/index.html` and hashed assets for the landing/docs bundle."
+    },
     "mobile_chatstore_realtime_reload_logging": {
       "status": "passed",
       "details": "Added unconditional ChatStore logs for `user:new_chat`, `user:new_message`, forced `scheduleLoadChats`, and `loadChats(forceRemote)` cache-bypass decisions so the next device run will show whether realtime is triggering the remote `/chats` refresh path."

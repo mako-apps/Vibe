@@ -7,14 +7,22 @@ export const Header = () => {
     const location = useLocation();
     const [mobileMenuOpen, setMobileMenuOpen] = React.useState(false);
     const isDocsPage = location.pathname.startsWith('/docs');
+    const isAgentConfigDocs = location.pathname.startsWith('/docs/agents/config');
 
     const navLinks = isDocsPage
-        ? [
-            { label: 'Overview', href: '#overview' },
-            { label: 'Integrate', href: '#integrate' },
-            { label: 'Customize', href: '#customize' },
-            { label: 'Callbacks', href: '#callbacks' },
-        ]
+        ? isAgentConfigDocs
+            ? [
+                { label: 'Overview', href: '#overview' },
+                { label: 'Identity', href: '#identity' },
+                { label: 'Delivery', href: '#delivery' },
+                { label: 'Automation', href: '#automation' },
+            ]
+            : [
+                { label: 'Overview', href: '#overview' },
+                { label: 'Integrate', href: '#integrate' },
+                { label: 'Customize', href: '#customize' },
+                { label: 'Callbacks', href: '#callbacks' },
+            ]
         : [
             { label: 'Features', href: '#features' },
             { label: 'Network', href: '#network' },
@@ -30,7 +38,7 @@ export const Header = () => {
             return;
         }
 
-        const pageRoot = isDocsPage ? '/docs/agents' : '/';
+        const pageRoot = isAgentConfigDocs ? '/docs/agents/config' : isDocsPage ? '/docs/agents' : '/';
 
         if (location.pathname !== pageRoot) {
             navigate(`${pageRoot}${href}`);

@@ -93,6 +93,9 @@ const AgentDocs = () => {
                             >
                                 API Guide
                             </button>
+                            <button className="luxe-button-secondary" onClick={() => navigate('/docs/agents/config')}>
+                                Config Reference
+                            </button>
                         </div>
                     </FadeIn>
                 </div>
@@ -141,6 +144,27 @@ const AgentDocs = () => {
                         <p>Control persona, system prompt, tools, callback URL, and voice output without BotFather-style setup friction.</p>
                     </article>
                 </FadeIn>
+            </section>
+
+            <section className="docs-section docs-alt" id="reference">
+                <div className="docs-section-head">
+                    <span className="section-label">CONFIG_REFERENCE</span>
+                    <h2 className="section-title">Need every field the native agent panel exposes?</h2>
+                    <p className="section-desc">
+                        The detailed config reference covers identity fields, prompt and tool settings, delivery targets, inbox batching modes,
+                        callback settings, secrets, and owner operations exactly as they surface in the current agent config UI.
+                    </p>
+                </div>
+
+                <div className="docs-config-cta-card">
+                    <div>
+                        <h3>Open the full agent config document</h3>
+                        <p>Includes `display_name`, `username`, `default_destination_chat`, `attached_chats`, `approval_rules.event_inbox`, `output_modes`, `callback_url`, secret behavior, and live owner operations.</p>
+                    </div>
+                    <button className="luxe-button-primary" onClick={() => navigate('/docs/agents/config')}>
+                        View Config Reference
+                    </button>
+                </div>
             </section>
 
             <section className="docs-section" id="integrate">
