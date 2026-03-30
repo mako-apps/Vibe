@@ -4,11 +4,18 @@ defmodule Vibe.AI.Agent do
   Tools: Music Search, Google Search, Image/Document Analysis
   """
 
+  import Ecto.Query, warn: false
+
   require Logger
 
+  alias Vibe.Agent, as: AgentSchema
+  alias Vibe.AgentEvent
+  alias Vibe.AgentEventThread
+  alias Vibe.Agents
   alias Vibe.AI.AgentRuntime
   alias Vibe.AI.GroupAgent
   alias Vibe.AI.SubagentRegistry
+  alias Vibe.Repo
 
   @claude_api "https://api.anthropic.com/v1/messages"
   @claude_model "claude-haiku-4-5-20251001"
@@ -104,6 +111,48 @@ defmodule Vibe.AI.Agent do
       }
     },
     %{
+      name: "query_event_inbox",
+      description:
+        "Look up the agent's received notification/event inbox for a live timeframe such as today, yesterday, last 4h, daily, or a recent period. Use this before answering questions about past notifications, counts, times, or related received items.",
+      input_schema: %{
+        type: "object",
+        properties: %{
+          timeframe: %{
+            type: "string",
+            description: "Time window to inspect, such as today, yesterday, last 4h, last 24h, or last 7d"
+          },
+          source: %{type: "string", description: "Optional source filter, such as tradeai"},
+          event_type: %{type: "string", description: "Optional event type filter"},
+          limit: %{type: "integer", description: "Maximum matching events to return, default 25"},
+          query: %{
+            type: "string",
+            description: "Optional free-form intent note for the lookup, such as trades opened yesterday"
+          }
+        }
+      }
+    },
+    %{
+      name: "configure_event_inbox",
+      description:
+        "Configure how incoming external events are surfaced in chat. Use this when the user asks for normal per-event delivery or batched summaries like every 4h or daily.",
+      input_schema: %{
+        type: "object",
+        properties: %{
+          mode: %{
+            type: "string",
+            enum: ["per_event", "batched_summary"],
+            description: "per_event posts each event as it arrives; batched_summary stores events and posts summaries on the chosen cadence."
+          },
+          cadence: %{
+            type: "string",
+            enum: ["4h", "daily"],
+            description: "Summary cadence when mode is batched_summary."
+          }
+        },
+        required: ["mode"]
+      }
+    },
+    %{
       name: "delegate_to_subagent",
       description:
         "Delegate a task to one of Vibe AI's internal subagents when the request is about agent setup, existing agents, integrations, prompts, publication state, agent deletion, or needs a specialized worker. This tool gives you access to those specialist capabilities; do not claim you lack access before using it.",
@@ -175,7 +224,23 @@ defmodule Vibe.AI.Agent do
      - Convert natural language times to ISO8601 (e.g., "6pm today" → appropriate datetime).
      - Confirm the scheduled time after scheduling.
 
-  9. delegate_to_subagent: Use when the request is better handled by an internal specialist.
+  9. query_event_inbox: Use for questions about the agent's received notifications or past events.
+     - Use this BEFORE answering questions like:
+       * "How many trades did I have yesterday?"
+       * "When were they opened?"
+       * "Summarize the last 4 hours of notifications"
+       * "Show me related messages from that inbox"
+     - If you are not certain about past events, counts, timing, or related notifications, look them up first instead of guessing from memory.
+
+  10. configure_event_inbox: Use when the user wants notification mode changes.
+      - Use this for requests like:
+        * "Don't reply to every event"
+        * "Summarize these daily"
+        * "Switch back to normal event bubbles"
+      - `per_event` means each event posts as a chat bubble.
+      - `batched_summary` means events are stored and summarized on the selected cadence.
+
+  11. delegate_to_subagent: Use when the request is better handled by an internal specialist.
      - builder_assistant: creating, editing, deleting, publishing, or configuring Vibe agents.
      - integration_advisor: invoke URLs, events URLs, secrets, attached vibe chat ids, and backend integration questions.
      - music_specialist: focused music help when the request is mostly about discovery/playback.
@@ -192,6 +257,7 @@ defmodule Vibe.AI.Agent do
   IMPORTANT:
   - NEVER write text before a tool call.
   - For music results: NEVER include URLs, track names, or album names in your response text.
+  - If a user asks for live agent configuration, current inbox mode, or historical notification facts, use the live lookup/config tools first.
   - For simple greetings, respond naturally WITHOUT tools.
   - Keep responses VERY short (1-2 sentences max) - this is mobile chat.
   """
@@ -203,7 +269,9 @@ defmodule Vibe.AI.Agent do
     conversation_history = Keyword.get(opts, :history, [])
     image_urls = Keyword.get(opts, :images, [])
     user_id = Keyword.get(opts, :user_id, nil)
+    requester_user_id = Keyword.get(opts, :requester_user_id, nil)
     chat_id = Keyword.get(opts, :chat_id, nil)
+    agent_id = Keyword.get(opts, :agent_id, nil)
     system_prompt = Keyword.get(opts, :system_prompt, @system_prompt)
     enabled_tools = Keyword.get(opts, :enabled_tools, available_tool_names())
     max_tokens = Keyword.get(opts, :max_tokens, 4096)
@@ -220,7 +288,7 @@ defmodule Vibe.AI.Agent do
         max_depth: max_depth,
         system_prompt: system_prompt,
         tools: tools,
-        state: %{user_id: user_id, chat_id: chat_id},
+        state: %{user_id: user_id, requester_user_id: requester_user_id, chat_id: chat_id, agent_id: agent_id},
         callback: callback,
         stream_text?: true,
         execute_tools: &execute_tools_runtime/3,
@@ -312,11 +380,13 @@ defmodule Vibe.AI.Agent do
 
   defp execute_tools_runtime(tool_calls, state, callback) do
     user_id = Map.get(state, :user_id)
+    requester_user_id = Map.get(state, :requester_user_id)
     chat_id = Map.get(state, :chat_id)
-    {execute_tools(tool_calls, callback, user_id, chat_id), state}
+    agent_id = Map.get(state, :agent_id)
+    {execute_tools(tool_calls, callback, user_id, requester_user_id, chat_id, agent_id), state}
   end
 
-  defp execute_tools(tool_calls, callback, user_id, chat_id) do
+  defp execute_tools(tool_calls, callback, user_id, requester_user_id, chat_id, agent_id) do
     # Send all progress labels immediately so the UI shows activity
     Enum.each(tool_calls, fn tool ->
       tool_name = tool["name"]
@@ -338,6 +408,8 @@ defmodule Vibe.AI.Agent do
         "post_to_channel" -> "Posting to channel..."
         "get_channel_analytics" -> "Fetching channel analytics..."
         "schedule_channel_post" -> "Scheduling post..."
+        "query_event_inbox" -> "Reviewing the inbox..."
+        "configure_event_inbox" -> "Updating inbox mode..."
         "delegate_to_subagent" ->
           SubagentRegistry.progress_label(
             tool_input["subagent_id"] || "",
@@ -352,7 +424,7 @@ defmodule Vibe.AI.Agent do
     tasks =
       Enum.map(tool_calls, fn tool ->
         Task.async(fn ->
-          execute_single_tool(tool, callback, user_id, chat_id)
+          execute_single_tool(tool, callback, user_id, requester_user_id, chat_id, agent_id)
         end)
       end)
 
@@ -367,7 +439,7 @@ defmodule Vibe.AI.Agent do
     end)
   end
 
-  defp execute_single_tool(tool, callback, user_id, chat_id) do
+  defp execute_single_tool(tool, callback, user_id, requester_user_id, chat_id, agent_id) do
     tool_name = tool["name"]
     tool_input = tool["input"] || %{}
     start_time = System.monotonic_time(:millisecond)
@@ -397,6 +469,12 @@ defmodule Vibe.AI.Agent do
 
         tool_name == "schedule_channel_post" ->
           Vibe.AI.Tools.Channel.schedule_post(tool["input"], user_id)
+
+        tool_name == "query_event_inbox" ->
+          query_event_inbox(tool_input, agent_id, requester_user_id)
+
+        tool_name == "configure_event_inbox" ->
+          configure_event_inbox(tool_input, agent_id, requester_user_id)
 
         tool_name == "delegate_to_subagent" ->
           case SubagentRegistry.run(
@@ -432,6 +510,326 @@ defmodule Vibe.AI.Agent do
       content: Jason.encode!(result)
     }
   end
+
+  defp query_event_inbox(input, agent_id, requester_user_id) do
+    with {:ok, agent} <- resolve_owned_agent(agent_id, requester_user_id) do
+      timeframe = resolve_event_timeframe(input["timeframe"] || input["window"] || input["period"])
+      source_filter = normalize_tool_string(input["source"])
+      event_type_filter = normalize_tool_string(input["event_type"] || input["eventType"])
+      limit = normalize_limit(input["limit"], 25, 60)
+
+      query =
+        from e in AgentEvent,
+          join: t in AgentEventThread,
+          on: t.id == e.thread_id,
+          where:
+            e.agent_id == ^agent.id and
+              e.occurred_at >= ^timeframe.since and
+              e.occurred_at <= ^timeframe.until,
+          order_by: [desc: e.occurred_at, desc: e.inserted_at]
+
+      query =
+        if is_binary(source_filter) do
+          from [e, _t] in query, where: e.source == ^source_filter
+        else
+          query
+        end
+
+      query =
+        if is_binary(event_type_filter) do
+          from [e, _t] in query, where: e.event_type == ^event_type_filter
+        else
+          query
+        end
+
+      events =
+        query
+        |> limit(^limit)
+        |> select([e, t], %{
+          id: e.id,
+          message_id: e.message_id,
+          occurred_at: e.occurred_at,
+          source: e.source,
+          event_type: e.event_type,
+          title: e.title,
+          text: e.text,
+          payload: e.payload,
+          thread_id: t.id,
+          thread_key: t.thread_key,
+          thread_title: t.title
+        })
+        |> Repo.all()
+      related_message_ids = events |> Enum.map(& &1.message_id) |> Enum.filter(&is_binary/1) |> Enum.uniq()
+
+      %{
+        "ok" => true,
+        "timeframe" => %{
+          "label" => timeframe.label,
+          "since" => DateTime.to_iso8601(timeframe.since),
+          "until" => DateTime.to_iso8601(timeframe.until)
+        },
+        "mode" => current_event_inbox_mode(agent),
+        "summary_window_hours" => current_event_inbox_window_hours(agent),
+        "total_events" => length(events),
+        "source_counts" => count_by(events, & &1.source),
+        "event_type_counts" => count_by(events, & &1.event_type),
+        "events" =>
+          Enum.map(events, fn event ->
+            %{
+              "id" => event.id,
+              "message_id" => event.message_id,
+              "occurred_at" => DateTime.to_iso8601(event.occurred_at),
+              "source" => event.source,
+              "event_type" => event.event_type,
+              "title" => event.title,
+              "text" => event.text,
+              "thread_id" => event.thread_id,
+              "thread_key" => event.thread_key,
+              "thread_title" => event.thread_title,
+              "payload" => condensed_payload(event.payload)
+            }
+          end),
+        "summary" => build_event_inbox_summary(events, timeframe.label, source_filter, event_type_filter),
+        "related_message_ids" => related_message_ids,
+        "related_title" => related_messages_title(length(related_message_ids)),
+        "related_subtitle" =>
+          if(related_message_ids == [], do: nil, else: "Tap to review the underlying messages")
+      }
+    else
+      {:error, reason} ->
+        %{"ok" => false, "error" => inbox_error_message(reason)}
+    end
+  end
+
+  defp configure_event_inbox(input, agent_id, requester_user_id) do
+    with {:ok, agent} <- resolve_owned_agent(agent_id, requester_user_id),
+         mode <- normalize_event_inbox_mode(input["mode"]),
+         {:ok, next_rules} <- updated_event_inbox_rules(agent.approval_rules || %{}, mode, input["cadence"]) do
+      case Agents.update_agent(agent, %{"approval_rules" => next_rules}, requester_user_id) do
+        {:ok, updated_agent} ->
+          %{
+            "ok" => true,
+            "mode" => current_event_inbox_mode(updated_agent),
+            "summary_window_hours" => current_event_inbox_window_hours(updated_agent),
+            "summary" => event_inbox_config_summary(updated_agent)
+          }
+
+        {:error, reason} ->
+          %{"ok" => false, "error" => inspect(reason)}
+      end
+    else
+      {:error, reason} ->
+        %{"ok" => false, "error" => inbox_error_message(reason)}
+    end
+  end
+
+  defp resolve_owned_agent(agent_id, requester_user_id) when is_binary(agent_id) and is_binary(requester_user_id) do
+    case Agents.get_agent(agent_id, requester_user_id) do
+      %AgentSchema{} = agent -> {:ok, agent}
+      nil -> {:error, :agent_not_available}
+    end
+  end
+
+  defp resolve_owned_agent(_agent_id, _requester_user_id), do: {:error, :owner_lookup_required}
+
+  defp resolve_event_timeframe(raw) do
+    now = DateTime.utc_now()
+    normalized = normalize_tool_string(raw) || "last 24h"
+
+    case normalized do
+      "today" ->
+        date = Date.utc_today()
+        %{label: "today", since: DateTime.new!(date, ~T[00:00:00], "Etc/UTC"), until: now}
+
+      "yesterday" ->
+        date = Date.add(Date.utc_today(), -1)
+
+        %{
+          label: "yesterday",
+          since: DateTime.new!(date, ~T[00:00:00], "Etc/UTC"),
+          until: DateTime.new!(date, ~T[23:59:59], "Etc/UTC")
+        }
+
+      "daily" ->
+        %{label: "last 24h", since: DateTime.add(now, -24 * 3600, :second), until: now}
+
+      "last 4h" ->
+        %{label: "last 4h", since: DateTime.add(now, -4 * 3600, :second), until: now}
+
+      "last 24h" ->
+        %{label: "last 24h", since: DateTime.add(now, -24 * 3600, :second), until: now}
+
+      "last 7d" ->
+        %{label: "last 7d", since: DateTime.add(now, -7 * 24 * 3600, :second), until: now}
+
+      other ->
+        case Regex.run(~r/^last\s+(\d+)\s*(h|hr|hrs|hour|hours|d|day|days)$/u, other) do
+          [_, amount_raw, unit] ->
+            amount = String.to_integer(amount_raw)
+
+            seconds =
+              case unit do
+                unit when unit in ["d", "day", "days"] -> amount * 24 * 3600
+                _ -> amount * 3600
+              end
+
+            %{label: other, since: DateTime.add(now, -seconds, :second), until: now}
+
+          _ ->
+            %{label: "last 24h", since: DateTime.add(now, -24 * 3600, :second), until: now}
+        end
+    end
+  end
+
+  defp build_event_inbox_summary(events, timeframe_label, source_filter, event_type_filter) do
+    headline =
+      "Found #{length(events)} event#{if length(events) == 1, do: "", else: "s"} in #{timeframe_label}."
+
+    filters =
+      [
+        if(source_filter, do: "Source: #{source_filter}.", else: nil),
+        if(event_type_filter, do: "Type: #{event_type_filter}.", else: nil)
+      ]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.join(" ")
+
+    timeline =
+      events
+      |> Enum.take(5)
+      |> Enum.reverse()
+      |> Enum.map(fn event ->
+        "#{format_event_time(event.occurred_at)} #{event.title || event.event_type}"
+      end)
+      |> case do
+        [] -> nil
+        lines -> "Latest: " <> Enum.join(lines, " | ")
+      end
+
+    [headline, filters, timeline]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join(" ")
+  end
+
+  defp format_event_time(%DateTime{} = value) do
+    Calendar.strftime(value, "%b %d %H:%M")
+  rescue
+    _ -> DateTime.to_iso8601(value)
+  end
+
+  defp condensed_payload(payload) when is_map(payload) do
+    payload
+    |> Enum.into(%{}, fn {key, value} -> {to_string(key), value} end)
+    |> Enum.take(10)
+    |> Enum.into(%{})
+  end
+
+  defp condensed_payload(_), do: %{}
+
+  defp count_by(events, mapper) when is_list(events) do
+    events
+    |> Enum.reduce(%{}, fn event, acc ->
+      key = mapper.(event)
+
+      if is_binary(key) and key != "" do
+        Map.update(acc, key, 1, &(&1 + 1))
+      else
+        acc
+      end
+    end)
+  end
+
+  defp current_event_inbox_mode(%AgentSchema{} = agent) do
+    agent.approval_rules
+    |> Map.get("event_inbox", %{})
+    |> Map.get("mode")
+    |> normalize_event_inbox_mode()
+  end
+
+  defp current_event_inbox_window_hours(%AgentSchema{} = agent) do
+    agent.approval_rules
+    |> Map.get("event_inbox", %{})
+    |> Map.get("summary_window_hours")
+    |> normalize_summary_window_hours()
+  end
+
+  defp updated_event_inbox_rules(rules, "per_event", _cadence) do
+    {:ok, Map.put(rules, "event_inbox", %{"mode" => "per_event", "summary_window_hours" => 24})}
+  end
+
+  defp updated_event_inbox_rules(rules, "batched_summary", cadence) do
+    {:ok,
+     Map.put(rules, "event_inbox", %{
+       "mode" => "batched_summary",
+       "summary_window_hours" => normalize_summary_window_hours(cadence)
+     })}
+  end
+
+  defp updated_event_inbox_rules(_rules, _mode, _cadence), do: {:error, :invalid_mode}
+
+  defp event_inbox_config_summary(%AgentSchema{} = agent) do
+    case current_event_inbox_mode(agent) do
+      "batched_summary" -> "Inbox mode is batched_summary every #{current_event_inbox_window_hours(agent)}h."
+      _ -> "Inbox mode is per_event."
+    end
+  end
+
+  defp normalize_event_inbox_mode(value) do
+    case normalize_tool_string(value) do
+      "batched_summary" -> "batched_summary"
+      "batched" -> "batched_summary"
+      "batch" -> "batched_summary"
+      "summary" -> "batched_summary"
+      "per_event" -> "per_event"
+      "default" -> "per_event"
+      "live" -> "per_event"
+      _ -> "per_event"
+    end
+  end
+
+  defp normalize_summary_window_hours(value) do
+    case normalize_tool_string(value) do
+      "4h" -> 4
+      "4" -> 4
+      "daily" -> 24
+      "24h" -> 24
+      "24" -> 24
+      _ ->
+        case normalize_limit(value, 24, 168) do
+          hours when is_integer(hours) and hours > 0 -> hours
+          _ -> 24
+        end
+    end
+  end
+
+  defp normalize_limit(value, _default, max_limit) when is_integer(value) do
+    min(max(value, 1), max_limit)
+  end
+
+  defp normalize_limit(value, default, max_limit) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {parsed, _} -> normalize_limit(parsed, default, max_limit)
+      :error -> default
+    end
+  end
+
+  defp normalize_limit(_value, default, _max_limit), do: default
+
+  defp normalize_tool_string(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> String.downcase(trimmed)
+    end
+  end
+
+  defp normalize_tool_string(_), do: nil
+
+  defp related_messages_title(count) when count <= 1, do: "Related message"
+  defp related_messages_title(count), do: "#{count} related messages"
+
+  defp inbox_error_message(:owner_lookup_required), do: "Owner lookup is required for inbox tools."
+  defp inbox_error_message(:agent_not_available), do: "This inbox is not available in the current chat."
+  defp inbox_error_message(:invalid_mode), do: "That inbox mode is not supported."
+  defp inbox_error_message(reason), do: inspect(reason)
 
   defp filter_tools(enabled_tools) do
     allowed = MapSet.new(List.wrap(enabled_tools) |> Enum.map(&to_string/1))

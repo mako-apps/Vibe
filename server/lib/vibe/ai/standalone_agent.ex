@@ -17,6 +17,7 @@ defmodule Vibe.AI.StandaloneAgent do
     attachments = normalize_attachments(params["attachments"])
     requested_output_mode = normalize_string(params["outputMode"] || params["output_mode"])
     reply_to_id = normalize_string(params["replyToId"] || params["reply_to_id"])
+    requester_user_id = normalize_string(params["requesterUserId"] || params["requester_user_id"])
 
     cond do
       agent.status != "published" ->
@@ -32,7 +33,15 @@ defmodule Vibe.AI.StandaloneAgent do
         {:error, :chat_not_attached}
 
       true ->
-        with {:ok, outputs} <- generate_outputs(agent, message, attachments, requested_output_mode, vibe_chat_id),
+        with {:ok, outputs} <-
+               generate_outputs(
+                 agent,
+                 message,
+                 attachments,
+                 requested_output_mode,
+                 vibe_chat_id,
+                 requester_user_id
+               ),
              {:ok, deliveries} <- maybe_deliver(agent, vibe_chat_id, outputs, response_mode, reply_to_id) do
           {:ok, %{outputs: outputs, vibe_deliveries: deliveries}}
         end
@@ -46,13 +55,14 @@ defmodule Vibe.AI.StandaloneAgent do
       "vibeChatId" => chat_id,
       "outputMode" => Keyword.get(opts, :output_mode),
       "replyToId" => Keyword.get(opts, :reply_to_id),
-      "attachments" => Keyword.get(opts, :attachments, [])
+      "attachments" => Keyword.get(opts, :attachments, []),
+      "requesterUserId" => Keyword.get(opts, :requester_user_id)
     }
 
     invoke(agent, params)
   end
 
-  defp generate_outputs(agent, message, attachments, requested_output_mode, vibe_chat_id) do
+  defp generate_outputs(agent, message, attachments, requested_output_mode, vibe_chat_id, requester_user_id) do
     image_urls =
       attachments
       |> Enum.filter(&(&1.type == "image"))
@@ -60,22 +70,26 @@ defmodule Vibe.AI.StandaloneAgent do
 
     system_prompt = build_system_prompt(agent)
 
-    {:ok, collected} = Elixir.Agent.start_link(fn -> %{text: "", outputs: []} end)
+    {:ok, collected} = Elixir.Agent.start_link(fn -> %{text: "", outputs: [], text_metadata: %{}} end)
 
     callback = fn
       %{type: :text, content: chunk} ->
         Elixir.Agent.update(collected, fn acc -> %{acc | text: acc.text <> chunk} end)
 
       %{type: :tool_result, tool: tool_name, result: result} ->
-        case tool_output_from_result(tool_name, result) do
-          nil ->
-            :ok
+        Elixir.Agent.update(collected, fn acc ->
+          next_outputs =
+            case tool_output_from_result(tool_name, result) do
+              nil -> acc.outputs
+              output -> merge_outputs(acc.outputs, [output])
+            end
 
-          output ->
-            Elixir.Agent.update(collected, fn acc ->
-              %{acc | outputs: merge_outputs(acc.outputs, [output])}
-            end)
-        end
+          next_text_metadata =
+            acc.text_metadata
+            |> Map.merge(text_metadata_from_result(tool_name, result))
+
+          %{acc | outputs: next_outputs, text_metadata: next_text_metadata}
+        end)
 
       _ ->
         :ok
@@ -89,11 +103,20 @@ defmodule Vibe.AI.StandaloneAgent do
                image_urls,
                vibe_chat_id,
                agent.owner_user_id,
+               requester_user_id,
+               agent.id,
                system_prompt,
                agent.enabled_tools || []
              ) do
         accumulated = Elixir.Agent.get(collected, & &1)
-        outputs = finalize_outputs(agent, final_text, accumulated.outputs, requested_output_mode)
+        outputs =
+          finalize_outputs(
+            agent,
+            final_text,
+            accumulated.outputs,
+            accumulated.text_metadata,
+            requested_output_mode
+          )
         {:ok, outputs}
       end
     after
@@ -101,7 +124,7 @@ defmodule Vibe.AI.StandaloneAgent do
     end
   end
 
-  defp maybe_deliver(_agent, _chat_id, outputs, "reply", _reply_to_id), do: {:ok, []}
+  defp maybe_deliver(_agent, _chat_id, _outputs, "reply", _reply_to_id), do: {:ok, []}
 
   defp maybe_deliver(agent, chat_id, outputs, "send", reply_to_id) do
     deliveries =
@@ -194,6 +217,8 @@ defmodule Vibe.AI.StandaloneAgent do
     [
       "You are #{agent.display_name}, a custom AI agent inside the Vibe app.",
       "Respond clearly and practically.",
+      "If the user asks about received notifications, past event counts, times, related messages, or inbox mode, use the live inbox tools before answering.",
+      "If the user wants to switch between normal event bubbles and batched summaries, use the inbox configuration tool instead of guessing.",
       if(agent.persona, do: "Persona: #{agent.persona}", else: nil),
       if(agent.welcome_message, do: "Welcome message: #{agent.welcome_message}", else: nil),
       agent.system_prompt
@@ -228,13 +253,25 @@ defmodule Vibe.AI.StandaloneAgent do
 
   defp normalize_string(_), do: nil
 
-  defp stream_agent_text(message, callback, image_urls, vibe_chat_id, user_id, system_prompt, enabled_tools) do
+  defp stream_agent_text(
+         message,
+         callback,
+         image_urls,
+         vibe_chat_id,
+         user_id,
+         requester_user_id,
+         agent_id,
+         system_prompt,
+         enabled_tools
+       ) do
     case ChatAgent.stream_response(
            message,
            callback,
            images: image_urls,
            chat_id: vibe_chat_id,
            user_id: user_id,
+           requester_user_id: requester_user_id,
+           agent_id: agent_id,
            system_prompt: system_prompt,
            enabled_tools: enabled_tools
          ) do
@@ -249,7 +286,7 @@ defmodule Vibe.AI.StandaloneAgent do
     end
   end
 
-  defp finalize_outputs(agent, final_text, tool_outputs, requested_output_mode) do
+  defp finalize_outputs(agent, final_text, tool_outputs, text_metadata, requested_output_mode) do
     base_outputs =
       tool_outputs
       |> List.wrap()
@@ -277,22 +314,22 @@ defmodule Vibe.AI.StandaloneAgent do
 
             {:error, reason} ->
               Logger.warning("[StandaloneAgent] TTS failed, falling back to text: #{inspect(reason)}")
-              maybe_append_text_output(base_outputs, normalized_text)
+              maybe_append_text_output(base_outputs, normalized_text, text_metadata)
           end
         else
-          maybe_append_text_output(base_outputs, normalized_text)
+          maybe_append_text_output(base_outputs, normalized_text, text_metadata)
         end
 
       _ ->
-        maybe_append_text_output(base_outputs, normalized_text)
+        maybe_append_text_output(base_outputs, normalized_text, text_metadata)
     end
   end
 
-  defp maybe_append_text_output(outputs, ""), do: outputs
-  defp maybe_append_text_output(outputs, nil), do: outputs
+  defp maybe_append_text_output(outputs, "", _metadata), do: outputs
+  defp maybe_append_text_output(outputs, nil, _metadata), do: outputs
 
-  defp maybe_append_text_output(outputs, text) do
-    outputs ++ [%{type: "text", text: text, metadata: %{}}]
+  defp maybe_append_text_output(outputs, text, metadata) do
+    outputs ++ [%{type: "text", text: text, metadata: metadata || %{}}]
   end
 
   defp tool_output_from_result(tool_name, result)
@@ -321,6 +358,27 @@ defmodule Vibe.AI.StandaloneAgent do
   end
 
   defp tool_output_from_result(_tool_name, _result), do: nil
+
+  defp text_metadata_from_result("query_event_inbox", result) when is_map(result) do
+    related_message_ids =
+      Map.get(result, "related_message_ids") ||
+        Map.get(result, :related_message_ids) ||
+        []
+
+    if is_list(related_message_ids) and related_message_ids != [] do
+      %{
+        "relatedMessageIds" => Enum.filter(related_message_ids, &is_binary/1),
+        "relatedMessagesTitle" =>
+          Map.get(result, "related_title") || Map.get(result, :related_title) || "Related messages",
+        "relatedMessagesSubtitle" =>
+          Map.get(result, "related_subtitle") || Map.get(result, :related_subtitle) || "Tap to review"
+      }
+    else
+      %{}
+    end
+  end
+
+  defp text_metadata_from_result(_tool_name, _result), do: %{}
 
   defp merge_outputs(existing, new_outputs) do
     (List.wrap(existing) ++ List.wrap(new_outputs))

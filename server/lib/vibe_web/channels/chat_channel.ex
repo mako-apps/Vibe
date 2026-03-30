@@ -290,7 +290,15 @@ defmodule VibeWeb.ChatChannel do
             reply_message -> "reply"
             true -> "dm"
           end
-        spawn_standalone_dispatch(chat_id, standalone_agent, dispatch_text, data, attachment_context, trigger_type)
+        spawn_standalone_dispatch(
+          chat_id,
+          standalone_agent,
+          dispatch_text,
+          data,
+          attachment_context,
+          trigger_type,
+          user_id
+        )
 
       group_trigger? && is_binary(dispatch_text) ->
         trigger_type = if agent_mention, do: "mention", else: "reply"
@@ -309,7 +317,15 @@ defmodule VibeWeb.ChatChannel do
     end
   end
 
-  defp spawn_standalone_dispatch(chat_id, agent, dispatch_text, data, attachment_context, trigger_type) do
+  defp spawn_standalone_dispatch(
+         chat_id,
+         agent,
+         dispatch_text,
+         data,
+         attachment_context,
+         _trigger_type,
+         requester_user_id
+       ) do
     Task.start(fn ->
       broadcast_agent_activity(chat_id, agent.agent_user_id, "Thinking...", "running")
 
@@ -322,7 +338,8 @@ defmodule VibeWeb.ChatChannel do
                chat_id,
                dispatch_text,
                attachments: attachments,
-               reply_to_id: data["id"]
+               reply_to_id: data["id"],
+               requester_user_id: requester_user_id
              ) do
           {:ok, _response} ->
             Logger.info("[ChatChannel] Standalone agent responded chat_id=#{chat_id} agent_id=#{agent.id}")

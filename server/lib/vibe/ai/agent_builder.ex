@@ -1911,6 +1911,10 @@ defmodule Vibe.AI.AgentBuilder do
       "agent_dm_link" => integration["agent_dm_link"],
       "default_destination_chat" => integration["default_destination_chat"],
       "attached_chats" => integration["attached_chat_links"] || [],
+      "event_inbox_mode" =>
+        get_in(payload.approvalRules || %{}, ["event_inbox", "mode"]) || "per_event",
+      "summary_window_hours" =>
+        get_in(payload.approvalRules || %{}, ["event_inbox", "summary_window_hours"]) || 24,
       "secret_hint" => payload.secretHint,
       "latest_secret" => latest_secret,
       "can_delete" => true

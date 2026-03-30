@@ -91,6 +91,7 @@ defmodule Vibe.AI.AgentEventRuntime do
           last_event = latest_thread_event(thread.id)
           runbook = matching_runbook(agent, integration, normalized.event_type)
           policy = evaluate_policy(agent, integration, normalized, last_event, runbook)
+          inbox_config = event_inbox_config(agent, integration)
 
           event =
             %AgentEvent{}
@@ -115,29 +116,37 @@ defmodule Vibe.AI.AgentEventRuntime do
           {thread, event, message_payload} =
             case policy.post_event_message? do
               true ->
-                {:ok, message_payload} = post_event_message(agent, thread, event, normalized, policy)
-                updated_event =
-                  event
-                  |> AgentEvent.changeset(%{message_id: message_payload.message_id})
-                  |> Repo.update!()
-
-                updated_thread =
-                  if is_nil(thread.root_message_id) do
-                    thread
-                    |> AgentEventThread.changeset(%{root_message_id: message_payload.message_id})
+                if post_individual_event_message?(policy, inbox_config) do
+                  {:ok, message_payload} = post_event_message(agent, thread, event, normalized, policy)
+                  updated_event =
+                    event
+                    |> AgentEvent.changeset(%{message_id: message_payload.message_id})
                     |> Repo.update!()
-                  else
-                    thread
-                  end
 
-                {updated_thread, updated_event, message_payload}
+                  updated_thread =
+                    if is_nil(thread.root_message_id) do
+                      thread
+                      |> AgentEventThread.changeset(%{root_message_id: message_payload.message_id})
+                      |> Repo.update!()
+                    else
+                      thread
+                    end
+
+                  {updated_thread, updated_event, message_payload}
+                else
+                  {thread, event, nil}
+                end
 
               false ->
                 {thread, event, nil}
             end
 
           summary = build_summary(thread.summary, normalized, policy)
-          current_state = next_thread_state(thread.current_state || %{}, normalized, policy)
+          {current_state, batch_summary_since} =
+            thread.current_state
+            |> Kernel.||(%{})
+            |> next_thread_state(normalized, policy)
+            |> apply_event_inbox_state(normalized.occurred_at, policy, inbox_config)
 
           updated_thread =
             thread
@@ -150,6 +159,18 @@ defmodule Vibe.AI.AgentEventRuntime do
               latest_event_at: normalized.occurred_at
             })
             |> Repo.update!()
+
+          {updated_thread, batch_summary_payload} =
+            case maybe_post_batched_summary(
+                   agent,
+                   updated_thread,
+                   batch_summary_since,
+                   normalized.occurred_at,
+                   inbox_config
+                 ) do
+              {:ok, next_thread, summary_payload} -> {next_thread, summary_payload}
+              {:error, reason} -> Repo.rollback(reason)
+            end
 
           result =
             case policy.mode do
@@ -164,7 +185,7 @@ defmodule Vibe.AI.AgentEventRuntime do
                  %{
                    status: initial_event_status(policy.mode),
                    run: create_run!(agent, integration, updated_thread, event, runbook, policy, %{}),
-                   message: message_payload
+                   message: batch_summary_payload || message_payload
                  }}
             end
 
@@ -180,7 +201,7 @@ defmodule Vibe.AI.AgentEventRuntime do
                 decision: policy.mode,
                 priority: policy.priority,
                 status: details.status || initial_event_status(policy.mode),
-                messagePosted: message_payload != nil,
+                messagePosted: message_payload != nil or batch_summary_payload != nil,
                 rootMessageId: updated_thread.root_message_id,
                 runId: details.run && details.run.id,
                 approvalTaskId: details[:approval_task] && details.approval_task.id
@@ -233,8 +254,8 @@ defmodule Vibe.AI.AgentEventRuntime do
   defp normalize_event(%Agent{} = agent, integration, params) do
     event_type = normalize_string(params["eventType"] || params["event_type"])
     source = normalize_string(params["source"]) || (integration && integration.source_type) || "internal"
-    title = normalize_string(params["title"])
-    text = normalize_string(params["text"] || params["message"])
+    title = normalize_rich_text(params["title"])
+    text = normalize_rich_text(params["text"] || params["message"])
     payload = normalize_payload(params["data"] || params["payload"])
     occurred_at = parse_datetime(params["timestamp"]) || DateTime.utc_now()
 
@@ -526,6 +547,229 @@ defmodule Vibe.AI.AgentEventRuntime do
     |> Map.put("last_event_title", normalized.title)
     |> Map.put("last_event_at", DateTime.to_iso8601(normalized.occurred_at))
     |> Map.put("priority", policy.priority)
+  end
+
+  defp event_inbox_config(%Agent{} = agent, %AgentIntegration{} = integration) do
+    merged =
+      get_in(integration.routing_rules || %{}, ["event_inbox"]) ||
+        get_in(agent.approval_rules || %{}, ["event_inbox"]) || %{}
+
+    %{
+      mode: normalize_event_inbox_mode(merged["mode"] || merged[:mode]),
+      summary_window_hours:
+        normalize_summary_window_hours(
+          merged["summary_window_hours"] || merged[:summary_window_hours] || merged["cadence"] ||
+            merged[:cadence]
+        )
+    }
+  end
+
+  defp event_inbox_config(%Agent{} = agent, _integration) do
+    merged = get_in(agent.approval_rules || %{}, ["event_inbox"]) || %{}
+
+    %{
+      mode: normalize_event_inbox_mode(merged["mode"] || merged[:mode]),
+      summary_window_hours:
+        normalize_summary_window_hours(
+          merged["summary_window_hours"] || merged[:summary_window_hours] || merged["cadence"] ||
+            merged[:cadence]
+        )
+    }
+  end
+
+  defp normalize_event_inbox_mode(value) do
+    case normalize_string(value) do
+      "batched" -> "batched_summary"
+      "batch" -> "batched_summary"
+      "batched_summary" -> "batched_summary"
+      "summary" -> "batched_summary"
+      "per_event" -> "per_event"
+      "default" -> "per_event"
+      "live" -> "per_event"
+      _ -> "per_event"
+    end
+  end
+
+  defp normalize_summary_window_hours(value) do
+    case normalize_string(value) do
+      "4h" -> 4
+      "4" -> 4
+      "daily" -> 24
+      "24h" -> 24
+      "24" -> 24
+      _ ->
+        case normalize_integer(value) do
+          hours when is_integer(hours) and hours > 0 -> hours
+          _ -> 24
+        end
+    end
+  end
+
+  defp post_individual_event_message?(policy, inbox_config) do
+    policy.mode != "summarize" or inbox_config.mode != "batched_summary"
+  end
+
+  defp apply_event_inbox_state(current_state, occurred_at, policy, inbox_config) do
+    cond do
+      policy.mode == "summarize" and inbox_config.mode == "batched_summary" ->
+        pending_started_at =
+          parse_datetime(current_state["pending_summary_started_at"]) || occurred_at
+
+        due? =
+          DateTime.diff(occurred_at, pending_started_at, :second) >=
+            inbox_config.summary_window_hours * 3600
+
+        next_state =
+          current_state
+          |> Map.put("event_inbox_mode", inbox_config.mode)
+          |> Map.put("summary_window_hours", inbox_config.summary_window_hours)
+          |> Map.put("pending_summary_started_at", DateTime.to_iso8601(pending_started_at))
+
+        {next_state, if(due?, do: pending_started_at, else: nil)}
+
+      true ->
+        next_state =
+          current_state
+          |> Map.put("event_inbox_mode", inbox_config.mode)
+          |> Map.put("summary_window_hours", inbox_config.summary_window_hours)
+          |> Map.delete("pending_summary_started_at")
+
+        {next_state, nil}
+    end
+  end
+
+  defp maybe_post_batched_summary(_agent, thread, nil, _occurred_at, _inbox_config),
+    do: {:ok, thread, nil}
+
+  defp maybe_post_batched_summary(agent, thread, pending_since, occurred_at, inbox_config) do
+    events = pending_summary_events(thread.id, pending_since, occurred_at)
+
+    if events == [] do
+      {:ok, thread, nil}
+    else
+      related_message_ids =
+        events
+        |> Enum.map(& &1.message_id)
+        |> Enum.filter(&is_binary/1)
+        |> Enum.uniq()
+
+      metadata =
+        %{
+          "eventThread" => true,
+          "eventInboxSummary" => true,
+          "eventThreadId" => thread.id,
+          "threadKey" => thread.thread_key,
+          "source" => thread.source,
+          "summaryWindowHours" => inbox_config.summary_window_hours,
+          "summaryStartAt" => DateTime.to_iso8601(pending_since),
+          "summaryEndAt" => DateTime.to_iso8601(occurred_at),
+          "eventIds" => Enum.map(events, & &1.id)
+        }
+        |> maybe_put("relatedMessageIds", if(related_message_ids == [], do: nil, else: related_message_ids))
+        |> maybe_put(
+          "relatedMessagesTitle",
+          if(related_message_ids == [], do: nil, else: related_messages_title(length(related_message_ids)))
+        )
+        |> maybe_put(
+          "relatedMessagesSubtitle",
+          if(related_message_ids == [], do: nil, else: "Tap to review")
+        )
+
+      with {:ok, summary_payload} <-
+             post_chat_message(
+               agent,
+               thread.chat_id,
+               build_batch_summary_body(thread, events, pending_since, occurred_at, inbox_config),
+               metadata,
+               thread.root_message_id
+             ) do
+        next_state =
+          (thread.current_state || %{})
+          |> Map.put("last_summary_at", DateTime.to_iso8601(occurred_at))
+          |> Map.delete("pending_summary_started_at")
+
+        updated_thread =
+          thread
+          |> AgentEventThread.changeset(%{
+            current_state: next_state,
+            root_message_id: thread.root_message_id || summary_payload.message_id
+          })
+          |> Repo.update!()
+
+        {:ok, updated_thread, summary_payload}
+      end
+    end
+  end
+
+  defp pending_summary_events(thread_id, pending_since, occurred_at) do
+    Repo.all(
+      from e in AgentEvent,
+        where:
+          e.thread_id == ^thread_id and
+            e.occurred_at >= ^pending_since and
+            e.occurred_at <= ^occurred_at,
+        order_by: [asc: e.occurred_at, asc: e.inserted_at]
+    )
+  end
+
+  defp build_batch_summary_body(thread, events, pending_since, occurred_at, inbox_config) do
+    window_label =
+      case inbox_config.summary_window_hours do
+        24 -> "Daily summary"
+        hours -> "#{hours}h summary"
+      end
+
+    count = length(events)
+    preview_events = Enum.take(events, -4)
+    omitted_count = max(count - length(preview_events), 0)
+
+    lines =
+      preview_events
+      |> Enum.map(fn event ->
+        line_body =
+          [event.title || humanize_event_type(event.event_type), normalize_string(event.text)]
+          |> Enum.reject(&is_nil/1)
+          |> Enum.join(" - ")
+          |> truncate_line(140)
+
+        "#{summary_timestamp(event.occurred_at)} #{line_body}"
+      end)
+
+    omitted_line =
+      if omitted_count > 0 do
+        ["+#{omitted_count} earlier event#{if omitted_count == 1, do: "", else: "s"}"]
+      else
+        []
+      end
+
+    [
+      "#{window_label}: #{count} event#{if count == 1, do: "", else: "s"}",
+      "Thread: #{thread.title || thread.thread_key}",
+      "Window: #{summary_timestamp(pending_since)} to #{summary_timestamp(occurred_at)}"
+    ] ++ omitted_line ++ lines
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
+  end
+
+  defp summary_timestamp(%DateTime{} = value) do
+    Calendar.strftime(value, "%b %d %H:%M")
+  rescue
+    _ -> DateTime.to_iso8601(value)
+  end
+
+  defp related_messages_title(count) when count <= 1, do: "Related message"
+  defp related_messages_title(count), do: "#{count} related messages"
+
+  defp truncate_line(nil, _limit), do: nil
+
+  defp truncate_line(text, limit) when is_binary(text) and is_integer(limit) and limit > 3 do
+    normalized = String.trim(text)
+
+    if String.length(normalized) <= limit do
+      normalized
+    else
+      String.slice(normalized, 0, limit - 3) <> "..."
+    end
   end
 
   defp execute_runbook(agent, integration, thread, event, runbook, normalized, policy) do
@@ -981,7 +1225,8 @@ defmodule Vibe.AI.AgentEventRuntime do
             normalize_string(
               item["mimeType"] || item[:mimeType] || item["mime_type"] || item[:mime_type]
             ),
-          "caption" => normalize_string(item["caption"] || item[:caption]),
+          "caption" => normalize_rich_text(item["caption"] || item[:caption]),
+          "text" => normalize_rich_text(item["text"] || item[:text]),
           "duration" => normalize_number(item["duration"] || item[:duration]),
           "fileSize" =>
             normalize_integer(
@@ -1005,6 +1250,57 @@ defmodule Vibe.AI.AgentEventRuntime do
 
   defp normalize_attachments_payload(%{"items" => items}) when is_list(items), do: items
   defp normalize_attachments_payload(_), do: []
+
+  defp normalize_rich_text(value) do
+    value
+    |> normalize_string()
+    |> case do
+      nil ->
+        nil
+
+      text ->
+        text
+        |> String.replace(~r/<\s*br\s*\/?\s*>/iu, "\n")
+        |> String.replace(~r/<\s*\/\s*(p|div|li|ul|ol|tr|table|h[1-6]|blockquote)\s*>/iu, "\n")
+        |> String.replace(~r/<\s*li\b[^>]*>/iu, "- ")
+        |> String.replace(~r/<[^>]+>/u, "")
+        |> decode_html_entities()
+        |> String.replace("\u{00A0}", " ")
+        |> String.replace("\r\n", "\n")
+        |> String.replace("\r", "\n")
+        |> String.replace(~r/[ \t]+\n/u, "\n")
+        |> String.replace(~r/\n{3,}/u, "\n\n")
+        |> String.trim()
+        |> normalize_string()
+    end
+  end
+
+  defp decode_html_entities(text) when is_binary(text) do
+    text
+    |> String.replace("&nbsp;", " ")
+    |> String.replace("&amp;", "&")
+    |> String.replace("&lt;", "<")
+    |> String.replace("&gt;", ">")
+    |> String.replace("&quot;", "\"")
+    |> String.replace("&apos;", "'")
+    |> String.replace("&#39;", "'")
+    |> Regex.replace(~r/&#x([0-9a-fA-F]+);/u, fn _, hex -> decode_codepoint(hex, 16) end)
+    |> Regex.replace(~r/&#([0-9]+);/u, fn _, digits -> decode_codepoint(digits, 10) end)
+  end
+
+  defp decode_codepoint(raw, base) do
+    case Integer.parse(raw, base) do
+      {codepoint, ""} when codepoint >= 0 and codepoint <= 0x10FFFF ->
+        try do
+          <<codepoint::utf8>>
+        rescue
+          _ -> ""
+        end
+
+      _ ->
+        ""
+    end
+  end
 
   defp normalize_string(value) when is_binary(value) do
     trimmed = String.trim(value)

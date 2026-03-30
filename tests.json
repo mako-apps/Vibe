@@ -1,6 +1,18 @@
 {
-  "updated_at": "2026-03-26",
+  "updated_at": "2026-03-30",
   "checks": {
+    "server_event_html_normalization": {
+      "status": "passed",
+      "details": "Patched `server/lib/vibe/ai/agent_event_runtime.ex` so event titles, texts, and attachment captions normalize HTML-like markup (`<B>`, `<br>`, closing block tags, common entities, and numeric entities) into plain text before persistence and posting. `mix compile` passed after the change."
+    },
+    "server_event_inbox_tools_and_batch_mode": {
+      "status": "passed",
+      "details": "Added owner-only standalone-agent tools `query_event_inbox` and `configure_event_inbox`, passed `agent_id`/`requester_user_id` through the standalone chat runtime, and added batched summary posting backed by `approval_rules[\"event_inbox\"]` / integration routing rules in `AgentEventRuntime`. `mix compile` passed after the change."
+    },
+    "mobile_native_related_message_navigation": {
+      "status": "passed",
+      "details": "Parsed related-message metadata into `ChatListRow`, rendered a native inline related-messages card, emitted a `relatedMessagesPressed` event from `ChatListView`, and reused the existing global banner/jump path in `ChatListScreen.tsx`. `xcrun swiftc -parse mobile/modules/vibe-chat-native/ios/ChatListViewModels.swift mobile/modules/vibe-chat-native/ios/ChatListViewCells.swift mobile/modules/vibe-chat-native/ios/ChatListView.swift` passed, and `git diff --check` passed."
+    },
     "external_trade_runtime_vibe_notifications": {
       "status": "passed",
       "details": "Patched `/Users/mohammadshayani/tradeai/trading_robot/config/settings.py` to include `vibe` in `notification_channels`, and patched `/Users/mohammadshayani/tradeai/trading_robot/utils/notifications.py` so `VibeNotifier` defaults to `https://api.vibegram.io`, normalizes a full `/api/agents/...` URL back to the API base, and sends the same `User-Agent` and JSON headers as the working smoke test. `PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m py_compile ...` passed."
@@ -68,6 +80,10 @@
     "ios_native_agent_config_rename": {
       "status": "passed",
       "details": "The native standalone agent config panel now exposes a `Name` row that opens a native rename alert and saves through `PUT /api/agents/:id`. `xcrun swiftc -parse mobile/modules/vibe-chat-native/ios/ChatNativeAgentConfigPanel.swift mobile/modules/vibe-chat-native/ios/ChatListViewModels.swift` passed."
+    },
+    "ios_native_agent_inbox_mode_control": {
+      "status": "passed",
+      "details": "Extended agent cards with `event_inbox_mode` / `summary_window_hours`, surfaced an `Inbox Mode` row in `ChatNativeAgentConfigPanel.swift`, and wired it to `PUT /api/agents/:id` with `approval_rules[\"event_inbox\"]` choices for event bubbles, 4h batch summaries, and daily summaries. `xcrun swiftc -parse mobile/modules/vibe-chat-native/ios/ChatListViewModels.swift mobile/modules/vibe-chat-native/ios/ChatNativeAgentConfigPanel.swift mobile/modules/vibe-chat-native/ios/ChatNativeAgentView.swift` passed, and `mix compile` passed."
     },
     "mobile_chatstore_realtime_reload_logging": {
       "status": "passed",

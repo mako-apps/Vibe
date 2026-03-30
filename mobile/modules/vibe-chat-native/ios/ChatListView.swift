@@ -2002,7 +2002,17 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
     cell.setInlineVideoPlaybackActive(currentlyVisible)
     cell.onInlineAttachmentTap = { [weak self] row in
       guard let self else { return }
-      self.openDocumentInApp(row: row)
+      if !row.relatedMessageIds.isEmpty {
+        self.onNativeEvent([
+          "type": "relatedMessagesPressed",
+          "messageId": row.messageId ?? "",
+          "relatedMessageIds": row.relatedMessageIds,
+          "title": row.relatedMessagesTitle ?? "",
+          "subtitle": row.relatedMessagesSubtitle ?? "",
+        ])
+      } else {
+        self.openDocumentInApp(row: row)
+      }
     }
     cell.onMediaNaturalSizeResolved = { [weak self] messageId, mediaURL, size in
       self?.handleResolvedMediaSize(messageId: messageId, mediaURL: mediaURL, size: size)

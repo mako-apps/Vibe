@@ -1376,6 +1376,8 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
         latestSecret: cachedSecret,
         defaultDestinationChat: card.defaultDestinationChat,
         attachedChats: card.attachedChats,
+        eventInboxMode: card.eventInboxMode,
+        summaryWindowHours: card.summaryWindowHours,
         canDelete: card.canDelete
       )
     }
@@ -1415,6 +1417,8 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
       latestSecret: latestSecret,
       defaultDestinationChat: card.defaultDestinationChat,
       attachedChats: card.attachedChats,
+      eventInboxMode: card.eventInboxMode,
+      summaryWindowHours: card.summaryWindowHours,
       canDelete: card.canDelete
     )
   }

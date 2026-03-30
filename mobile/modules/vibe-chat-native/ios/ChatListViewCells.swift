@@ -920,6 +920,41 @@ private func hasInlineFileAttachment(_ row: ChatListRow) -> Bool {
   return row.isAgentMessage && (row.messageType == "file" || hasFileNameHint)
 }
 
+private func hasInlineRelatedMessages(_ row: ChatListRow) -> Bool {
+  !row.relatedMessageIds.isEmpty
+}
+
+private func hasInlineAttachment(_ row: ChatListRow) -> Bool {
+  hasInlineRelatedMessages(row) || hasInlineFileAttachment(row)
+}
+
+private func inlineAttachmentTitle(for row: ChatListRow) -> String {
+  if hasInlineRelatedMessages(row) {
+    if let title = row.relatedMessagesTitle, !title.isEmpty {
+      return title
+    }
+    return row.relatedMessageIds.count == 1 ? "Related message" : "\(row.relatedMessageIds.count) related messages"
+  }
+  if let fileName = row.fileName, !fileName.isEmpty {
+    return fileName
+  }
+  return "Document"
+}
+
+private func inlineAttachmentSubtitle(for row: ChatListRow) -> String {
+  if hasInlineRelatedMessages(row) {
+    if let subtitle = row.relatedMessagesSubtitle, !subtitle.isEmpty {
+      return subtitle
+    }
+    return "Tap to review"
+  }
+  return "Tap to open"
+}
+
+private func inlineAttachmentIconName(for row: ChatListRow) -> String {
+  hasInlineRelatedMessages(row) ? "list.bullet.rectangle.portrait.fill" : "doc.text.fill"
+}
+
 private func isRTL(_ text: String) -> Bool {
   return text.range(of: "[\\u0600-\\u06FF]", options: .regularExpression) != nil
 }
@@ -1316,9 +1351,9 @@ func measureMessageBubbleLayout(row: ChatListRow, rowWidth: CGFloat)
     break
   }
 
-  let hasInlineAttachment = hasInlineFileAttachment(row)
+  let showsInlineAttachment = hasInlineAttachment(row)
   let textMaxWidth =
-    hasInlineAttachment
+    showsInlineAttachment
     ? maxContentWidth
     : max(1.0, maxContentWidth - meta.total - bubbleMetaInlineSpacing)
   let font =
@@ -1332,10 +1367,10 @@ func measureMessageBubbleLayout(row: ChatListRow, rowWidth: CGFloat)
   )
   let textWidth = min(textMaxWidth, ceil(textRect.width))
   let textHeight = ceil(textRect.height)
-  let attachmentBodyHeight: CGFloat = hasInlineAttachment ? inlineAttachmentHeight : 0.0
+  let attachmentBodyHeight: CGFloat = showsInlineAttachment ? inlineAttachmentHeight : 0.0
   let desiredContentWidth: CGFloat
-  if hasInlineAttachment {
-    let attachmentTitle = row.fileName?.isEmpty == false ? row.fileName! : "Document"
+  if showsInlineAttachment {
+    let attachmentTitle = inlineAttachmentTitle(for: row)
     let attachmentWidth =
       min(
         maxContentWidth,
@@ -1350,11 +1385,11 @@ func measureMessageBubbleLayout(row: ChatListRow, rowWidth: CGFloat)
   }
   let contentWidth = max(meta.total, min(maxContentWidth, desiredContentWidth))
   let messageWidth =
-    hasInlineAttachment
+    showsInlineAttachment
     ? contentWidth
     : max(1.0, contentWidth - meta.total - bubbleMetaInlineSpacing)
   let bodyHeight =
-    hasInlineAttachment
+    showsInlineAttachment
     ? max(textHeight, 0.0) + inlineAttachmentSpacing + attachmentBodyHeight + bubbleMetaTopSpacing
       + bubbleMetaHeight
     : max(textHeight, bubbleMetaHeight)
@@ -1374,7 +1409,7 @@ func measureMessageBubbleLayout(row: ChatListRow, rowWidth: CGFloat)
     mediaHeight: 0.0,
     isMediaLayout: false,
     inlineAttachmentHeight: attachmentBodyHeight,
-    hasInlineAttachment: hasInlineAttachment
+    hasInlineAttachment: showsInlineAttachment
   )
 }
 
@@ -4500,7 +4535,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         messageLabel.font = bubbleMessageFont
       }
       mediaContainerView.isHidden = isGhostHidden || row.visualKind == .text
-      inlineAttachmentView.isHidden = isGhostHidden || !hasInlineFileAttachment(row)
+      inlineAttachmentView.isHidden = isGhostHidden || !hasInlineAttachment(row)
       metaContainerView.isHidden = isGhostHidden || usesTransparentAgentStreaming
 
       // Agent/Mention labeling
@@ -4605,9 +4640,11 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       configureMediaPresentation(for: row, textColor: textColor, metaColor: metaColor)
       if !inlineAttachmentView.isHidden {
         inlineAttachmentView.backgroundColor = UIColor(white: 0.0, alpha: 0.20)
-        inlineAttachmentTitleLabel.text = row.fileName?.isEmpty == false ? row.fileName : "Document"
-        inlineAttachmentSubtitleLabel.text = "Tap to open"
+        inlineAttachmentIconView.image = UIImage(systemName: inlineAttachmentIconName(for: row))
+        inlineAttachmentTitleLabel.text = inlineAttachmentTitle(for: row)
+        inlineAttachmentSubtitleLabel.text = inlineAttachmentSubtitle(for: row)
       } else {
+        inlineAttachmentIconView.image = UIImage(systemName: "doc.text.fill")
         inlineAttachmentTitleLabel.text = nil
         inlineAttachmentSubtitleLabel.text = nil
       }
@@ -6370,12 +6407,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   }
 
   @objc private func handleInlineAttachmentTap() {
-    guard let row, hasInlineFileAttachment(row) else { return }
+    guard let row, hasInlineAttachment(row) else { return }
     onInlineAttachmentTap?(row)
   }
 
   func hitTestInlineAttachment(at pointInCell: CGPoint) -> Bool {
-    guard let row, hasInlineFileAttachment(row), !inlineAttachmentView.isHidden else {
+    guard let row, hasInlineAttachment(row), !inlineAttachmentView.isHidden else {
       return false
     }
     let local = contentView.convert(pointInCell, from: self)

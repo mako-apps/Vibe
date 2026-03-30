@@ -125,6 +125,8 @@ struct ChatListRow {
     let latestSecret: String?
     let defaultDestinationChat: AgentCardDestination?
     let attachedChats: [AgentCardDestination]
+    let eventInboxMode: String
+    let summaryWindowHours: Int
     let canDelete: Bool
 
     static func parse(_ raw: [String: Any]) -> AgentCard? {
@@ -142,6 +144,7 @@ struct ChatListRow {
         .flatMap(AgentCardDestination.parse)
       let attachedChats =
         (raw["attached_chats"] as? [[String: Any]] ?? []).compactMap(AgentCardDestination.parse)
+      let (eventInboxMode, summaryWindowHours) = parseAgentCardEventInbox(raw)
 
       return AgentCard(
         id: id,
@@ -170,6 +173,8 @@ struct ChatListRow {
               ?? raw["invokeSecret"]),
         defaultDestinationChat: defaultDestinationChat,
         attachedChats: attachedChats,
+        eventInboxMode: eventInboxMode,
+        summaryWindowHours: summaryWindowHours,
         canDelete:
           (raw["can_delete"] as? Bool)
           ?? ((raw["canDelete"] as? Bool) ?? true)
@@ -203,6 +208,8 @@ struct ChatListRow {
       if let secretHint { raw["secret_hint"] = secretHint }
       if let latestSecret { raw["latest_secret"] = latestSecret }
       if let defaultDestinationChat { raw["default_destination_chat"] = defaultDestinationChat.rawValue }
+      raw["event_inbox_mode"] = eventInboxMode
+      raw["summary_window_hours"] = summaryWindowHours
       return raw
     }
 
@@ -270,6 +277,9 @@ struct ChatListRow {
   let agentActionSourceText: String?
   let agentRegeneratePrompt: String?
   let agentCard: AgentCard?
+  let relatedMessageIds: [String]
+  let relatedMessagesTitle: String?
+  let relatedMessagesSubtitle: String?
 
   var isAgentMention: Bool {
     return isMe && text.lowercased().contains("@vibe")
@@ -471,6 +481,9 @@ struct ChatListRow {
       agentActionSourceText = nil
       agentRegeneratePrompt = nil
       agentCard = nil
+      relatedMessageIds = []
+      relatedMessagesTitle = nil
+      relatedMessagesSubtitle = nil
       return
     }
 
@@ -644,6 +657,22 @@ struct ChatListRow {
     agentCard =
       AgentCard.parse(message["agentCard"] as? [String: Any] ?? [:])
       ?? AgentCard.parse(metadata?["agentCard"] as? [String: Any] ?? [:])
+    relatedMessageIds = uniqueStrings(
+      parseStringArray(metadata?["relatedMessageIds"])
+        + parseStringArray(metadata?["related_message_ids"])
+        + parseStringArray(message["relatedMessageIds"])
+        + parseStringArray(message["related_message_ids"])
+    )
+    relatedMessagesTitle =
+      parseNonEmptyString(metadata?["relatedMessagesTitle"])
+      ?? parseNonEmptyString(metadata?["related_messages_title"])
+      ?? parseNonEmptyString(message["relatedMessagesTitle"])
+      ?? parseNonEmptyString(message["related_messages_title"])
+    relatedMessagesSubtitle =
+      parseNonEmptyString(metadata?["relatedMessagesSubtitle"])
+      ?? parseNonEmptyString(metadata?["related_messages_subtitle"])
+      ?? parseNonEmptyString(message["relatedMessagesSubtitle"])
+      ?? parseNonEmptyString(message["related_messages_subtitle"])
   }
 }
 
@@ -930,6 +959,9 @@ func chatListRowContentEqual(_ lhs: ChatListRow, _ rhs: ChatListRow) -> Bool {
     && lhs.agentActionSourceText == rhs.agentActionSourceText
     && lhs.agentRegeneratePrompt == rhs.agentRegeneratePrompt
     && lhs.agentCard == rhs.agentCard
+    && lhs.relatedMessageIds == rhs.relatedMessageIds
+    && lhs.relatedMessagesTitle == rhs.relatedMessagesTitle
+    && lhs.relatedMessagesSubtitle == rhs.relatedMessagesSubtitle
 }
 
 private func parseAgentProgressNodes(_ raw: Any?) -> [ChatListRow.AgentProgressNode] {
@@ -967,6 +999,85 @@ private func parseStringArray(_ raw: Any?) -> [String] {
   }
 
   return []
+}
+
+private func parseAgentCardEventInbox(_ raw: [String: Any]) -> (mode: String, summaryWindowHours: Int) {
+  let directMode =
+    parseNonEmptyString(raw["event_inbox_mode"])
+    ?? parseNonEmptyString(raw["eventInboxMode"])
+
+  let directHours =
+    parseAgentSummaryWindowHours(raw["summary_window_hours"])
+    ?? parseAgentSummaryWindowHours(raw["summaryWindowHours"])
+
+  let approvalRules =
+    (raw["approval_rules"] as? [String: Any])
+    ?? (raw["approvalRules"] as? [String: Any])
+  let eventInbox =
+    (approvalRules?["event_inbox"] as? [String: Any])
+    ?? (approvalRules?["eventInbox"] as? [String: Any])
+
+  let nestedMode =
+    parseNonEmptyString(eventInbox?["mode"])
+    ?? parseNonEmptyString(eventInbox?["event_inbox_mode"])
+    ?? parseNonEmptyString(eventInbox?["eventInboxMode"])
+  let nestedHours =
+    parseAgentSummaryWindowHours(eventInbox?["summary_window_hours"])
+    ?? parseAgentSummaryWindowHours(eventInbox?["summaryWindowHours"])
+    ?? parseAgentSummaryWindowHours(eventInbox?["cadence"])
+
+  let normalizedMode =
+    normalizeAgentEventInboxMode(directMode ?? nestedMode)
+  let normalizedHours =
+    normalizeAgentSummaryWindowHours(directHours ?? nestedHours)
+
+  return (normalizedMode, normalizedHours)
+}
+
+private func normalizeAgentEventInboxMode(_ raw: String?) -> String {
+  switch raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+  case "batched_summary", "batched", "batch", "summary":
+    return "batched_summary"
+  default:
+    return "per_event"
+  }
+}
+
+private func parseAgentSummaryWindowHours(_ raw: Any?) -> Int64? {
+  if let value = parseLong(raw) {
+    return value
+  }
+
+  switch parseNonEmptyString(raw)?.lowercased() {
+  case "4h":
+    return 4
+  case "daily", "24h":
+    return 24
+  default:
+    return nil
+  }
+}
+
+private func normalizeAgentSummaryWindowHours(_ raw: Int64?) -> Int {
+  switch Int(raw ?? 24) {
+  case 1...4:
+    return 4
+  default:
+    return 24
+  }
+}
+
+private func uniqueStrings(_ values: [String]) -> [String] {
+  var seen = Set<String>()
+  var ordered: [String] = []
+
+  for value in values {
+    if seen.insert(value).inserted {
+      ordered.append(value)
+    }
+  }
+
+  return ordered
 }
 
 struct SendTransitionPayload {

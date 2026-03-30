@@ -60,6 +60,59 @@ private func chatNativeAgentMaskedSecret(_ hint: String?) -> String {
   return "vas_\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\(normalizedSuffix)"
 }
 
+private func chatNativeAgentNormalizeEventInboxMode(_ value: String?) -> String {
+  switch value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+  case "batched_summary", "batched", "batch", "summary":
+    return "batched_summary"
+  default:
+    return "per_event"
+  }
+}
+
+private func chatNativeAgentNormalizeSummaryWindowHours(_ value: Int?) -> Int {
+  switch value ?? 24 {
+  case ...4:
+    return 4
+  default:
+    return 24
+  }
+}
+
+private func chatNativeAgentEventInboxTitle(mode: String, summaryWindowHours: Int) -> String {
+  let normalizedMode = chatNativeAgentNormalizeEventInboxMode(mode)
+  let normalizedHours = chatNativeAgentNormalizeSummaryWindowHours(summaryWindowHours)
+
+  if normalizedMode == "batched_summary" {
+    return normalizedHours <= 4 ? "Batch summary every 4h" : "Daily batch summary"
+  }
+
+  return "Event bubbles"
+}
+
+private func chatNativeAgentInteger(_ value: Any?) -> Int? {
+  if let number = value as? NSNumber {
+    return number.intValue
+  }
+  if let number = value as? Int {
+    return number
+  }
+  if let number = value as? Double, number.isFinite {
+    return Int(number)
+  }
+  if let string = value as? String {
+    let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    switch trimmed {
+    case "4h":
+      return 4
+    case "daily", "24h":
+      return 24
+    default:
+      return Int(trimmed)
+    }
+  }
+  return nil
+}
+
 struct ChatNativeAgentConfigAPIContext {
   let apiBaseURL: URL
   let token: String
@@ -981,6 +1034,21 @@ final class ChatNativeAgentConfigPanelController: UIViewController {
           symbolName: "person.2.circle"
         ))
     }
+    let inboxModeRow = ChatNativeAgentConfigRow(
+      title: "Inbox Mode",
+      value: chatNativeAgentEventInboxTitle(
+        mode: card.eventInboxMode,
+        summaryWindowHours: card.summaryWindowHours
+      ),
+      theme: theme,
+      symbolName: "tray.full",
+      showsChevron: true,
+      showsDivider: false
+    )
+    inboxModeRow.onTap = { [weak self] in
+      self?.promptEventInboxMode()
+    }
+    deliverySection.contentStack.addArrangedSubview(inboxModeRow)
     stackView.addArrangedSubview(deliverySection)
 
     let behaviorSection = ChatNativeAgentConfigSectionView(title: "Behavior", theme: theme)
@@ -1137,7 +1205,9 @@ final class ChatNativeAgentConfigPanelController: UIViewController {
   private func updateCard(
     displayName: String? = nil,
     secret: String? = nil,
-    secretHint: String? = nil
+    secretHint: String? = nil,
+    eventInboxMode: String? = nil,
+    summaryWindowHours: Int? = nil
   ) {
     card = ChatListRow.AgentCard(
       id: card.id,
@@ -1163,6 +1233,10 @@ final class ChatNativeAgentConfigPanelController: UIViewController {
       latestSecret: secret ?? card.latestSecret,
       defaultDestinationChat: card.defaultDestinationChat,
       attachedChats: card.attachedChats,
+      eventInboxMode:
+        chatNativeAgentNormalizeEventInboxMode(eventInboxMode ?? card.eventInboxMode),
+      summaryWindowHours:
+        chatNativeAgentNormalizeSummaryWindowHours(summaryWindowHours ?? card.summaryWindowHours),
       canDelete: card.canDelete
     )
   }
@@ -1237,6 +1311,117 @@ final class ChatNativeAgentConfigPanelController: UIViewController {
         self.rebuildContent()
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
         self.onToast?("Renamed agent")
+      }
+    }
+
+    task.resume()
+  }
+
+  private func promptEventInboxMode() {
+    let alert = UIAlertController(
+      title: "Inbox Mode",
+      message: "Choose how external notifications are shown in this chat.",
+      preferredStyle: .actionSheet
+    )
+
+    alert.addAction(UIAlertAction(title: "Event bubbles", style: .default) { [weak self] _ in
+      self?.updateEventInboxMode(mode: "per_event", summaryWindowHours: 24)
+    })
+    alert.addAction(UIAlertAction(title: "Batch summary every 4h", style: .default) { [weak self] _ in
+      self?.updateEventInboxMode(mode: "batched_summary", summaryWindowHours: 4)
+    })
+    alert.addAction(UIAlertAction(title: "Daily batch summary", style: .default) { [weak self] _ in
+      self?.updateEventInboxMode(mode: "batched_summary", summaryWindowHours: 24)
+    })
+    alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+
+    if let popover = alert.popoverPresentationController {
+      popover.sourceView = view
+      popover.sourceRect = CGRect(
+        x: view.bounds.midX,
+        y: view.bounds.midY,
+        width: 1.0,
+        height: 1.0
+      )
+    }
+
+    present(alert, animated: true)
+  }
+
+  private func updateEventInboxMode(mode: String, summaryWindowHours: Int) {
+    let normalizedMode = chatNativeAgentNormalizeEventInboxMode(mode)
+    let normalizedHours = chatNativeAgentNormalizeSummaryWindowHours(summaryWindowHours)
+
+    guard
+      normalizedMode != card.eventInboxMode || normalizedHours != card.summaryWindowHours
+    else {
+      onToast?("Inbox mode unchanged")
+      return
+    }
+
+    guard let url = apiRequestURL(path: "/api/agents/{agent_id}") else {
+      onToast?("Missing API session")
+      return
+    }
+
+    let payload: [String: Any] = [
+      "approval_rules": [
+        "event_inbox": [
+          "mode": normalizedMode,
+          "summary_window_hours": normalizedHours,
+        ]
+      ]
+    ]
+
+    var request = URLRequest(url: url)
+    request.httpMethod = "PUT"
+    apiHeaders(&request)
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+
+    let task = ChatPhoenixClient.makePinnedURLSession().dataTask(with: request) {
+      [weak self] data, response, error in
+      DispatchQueue.main.async {
+        guard let self else { return }
+
+        if let error {
+          NSLog("[ChatNativeAgentConfig] update inbox mode failed %@", error.localizedDescription)
+          self.onToast?("Could not update inbox mode")
+          return
+        }
+
+        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200..<300).contains(statusCode), let data else {
+          self.onToast?("Could not update inbox mode")
+          return
+        }
+
+        let responsePayload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        let approvalRules =
+          (responsePayload?["approvalRules"] as? [String: Any])
+          ?? (responsePayload?["approval_rules"] as? [String: Any])
+        let eventInbox =
+          (approvalRules?["event_inbox"] as? [String: Any])
+          ?? (approvalRules?["eventInbox"] as? [String: Any])
+
+        let resolvedMode =
+          chatNativeAgentNormalizeEventInboxMode(
+            chatNativeAgentNormalizedString(eventInbox?["mode"])
+              ?? chatNativeAgentNormalizedString(eventInbox?["event_inbox_mode"])
+              ?? normalizedMode
+          )
+        let resolvedHours =
+          chatNativeAgentNormalizeSummaryWindowHours(
+            chatNativeAgentInteger(eventInbox?["summary_window_hours"])
+              ?? chatNativeAgentInteger(eventInbox?["summaryWindowHours"])
+              ?? chatNativeAgentInteger(eventInbox?["cadence"])
+              ?? normalizedHours
+          )
+
+        self.updateCard(eventInboxMode: resolvedMode, summaryWindowHours: resolvedHours)
+        self.rebuildContent()
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        self.onToast?("Updated inbox mode")
       }
     }
 

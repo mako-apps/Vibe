@@ -1290,6 +1290,9 @@ export default function ChatListScreen({
     const [editTarget, setEditTarget] = useState<EditInfo | null>(null);
     const [pinnedMessageIds, setPinnedMessageIds] = useState<string[]>([]);
     const [activePinnedIndex, setActivePinnedIndex] = useState(0);
+    const [relatedMessageIds, setRelatedMessageIds] = useState<string[]>([]);
+    const [activeRelatedIndex, setActiveRelatedIndex] = useState(0);
+    const [relatedBannerTitle, setRelatedBannerTitle] = useState('Related Messages');
     const [highlightedPinnedMessageId, setHighlightedPinnedMessageId] = useState<string | null>(null);
     const [activeMenuId, setActiveMenuId] = useState<string | null>(null);
     const [reactionFxList, setReactionFxList] = useState<EmojiReactionFx[]>([]);
@@ -2218,6 +2221,31 @@ export default function ChatListScreen({
             return;
         }
 
+        if (type === 'relatedMessagesPressed') {
+            const rawIds = Array.isArray(nativeEvent.relatedMessageIds) ? nativeEvent.relatedMessageIds : [];
+            const nextIds = rawIds.filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+            if (nextIds.length === 0) {
+                showToast('No related messages are available yet', 'info');
+                return;
+            }
+            const titleRaw = typeof nativeEvent.title === 'string' ? nativeEvent.title.trim() : '';
+            setRelatedBannerTitle(titleRaw || 'Related Messages');
+            setRelatedMessageIds(nextIds);
+            setActiveRelatedIndex(0);
+            (async () => {
+                try {
+                    await nativeSurfaceRef.current?.scrollToMessage(nextIds[0], true, 0.46);
+                } catch (error) {
+                    console.error('[ChatList] related scrollToMessage failed', error);
+                }
+            })();
+            setHighlightedPinnedMessageId(nextIds[0]);
+            setTimeout(() => {
+                setHighlightedPinnedMessageId((current) => (current === nextIds[0] ? null : current));
+            }, 1500);
+            return;
+        }
+
         if (type === 'attachmentImage') {
             const uriRaw = nativeEvent.uri;
             const captionRaw = nativeEvent.caption;
@@ -2522,6 +2550,10 @@ export default function ChatListScreen({
     }, [messages]);
 
     useEffect(() => {
+        setRelatedMessageIds((prev) => prev.filter((id) => messages.some((msg) => msg.id === id)));
+    }, [messages]);
+
+    useEffect(() => {
         if (pinnedMessageIds.length <= 1) return;
         const timer = setInterval(() => {
             setActivePinnedIndex((current) => (current + 1) % pinnedMessageIds.length);
@@ -2533,6 +2565,24 @@ export default function ChatListScreen({
         if (activePinnedIndex < pinnedMessageIds.length) return;
         setActivePinnedIndex(0);
     }, [activePinnedIndex, pinnedMessageIds.length]);
+
+    useEffect(() => {
+        if (relatedMessageIds.length <= 1) return;
+        const timer = setInterval(() => {
+            setActiveRelatedIndex((current) => (current + 1) % relatedMessageIds.length);
+        }, 3200);
+        return () => clearInterval(timer);
+    }, [relatedMessageIds.length]);
+
+    useEffect(() => {
+        if (activeRelatedIndex < relatedMessageIds.length) return;
+        setActiveRelatedIndex(0);
+    }, [activeRelatedIndex, relatedMessageIds.length]);
+
+    useEffect(() => {
+        setRelatedMessageIds([]);
+        setActiveRelatedIndex(0);
+    }, [effectiveChatId]);
 
     // Called when the hidden real bubble measures itself
     const onBubbleLayout = useCallback((id: string, x: number, y: number, w: number, h: number, shape: BubbleShape) => {
@@ -2996,8 +3046,11 @@ export default function ChatListScreen({
         }
     }, [shouldUseNativeList, onlineUsers]);
 
-    const currentPinnedMessageId = pinnedMessageIds.length > 0
-        ? pinnedMessageIds[Math.min(activePinnedIndex, pinnedMessageIds.length - 1)]
+    const activeBannerMessageIds = relatedMessageIds.length > 0 ? relatedMessageIds : pinnedMessageIds;
+    const activeBannerIndex = relatedMessageIds.length > 0 ? activeRelatedIndex : activePinnedIndex;
+    const activeBannerTitle = relatedMessageIds.length > 0 ? relatedBannerTitle : 'Pinned Message';
+    const currentPinnedMessageId = activeBannerMessageIds.length > 0
+        ? activeBannerMessageIds[Math.min(activeBannerIndex, activeBannerMessageIds.length - 1)]
         : null;
     const currentPinnedMessage = currentPinnedMessageId
         ? messages.find((entry) => entry.id === currentPinnedMessageId)
@@ -3121,12 +3174,13 @@ export default function ChatListScreen({
         <View style={styles.container}>
             {/* Header handled by parent ChatScreen */}
 
-            {!shouldUseNativeList && !searchActive && currentPinnedMessage && (
+            {!searchActive && currentPinnedMessage && (
                 <GlobalPinnedBanner
+                    title={activeBannerTitle}
                     onPress={() => jumpToPinnedMessage(currentPinnedMessageId)}
                     body={currentPinnedMessage.text?.trim() || (currentPinnedMessage.type === 'text' ? 'Message' : currentPinnedMessage.type)}
-                    dotIds={pinnedMessageIds}
-                    activeDotIndex={activePinnedIndex}
+                    dotIds={activeBannerMessageIds}
+                    activeDotIndex={activeBannerIndex}
                 />
             )}
 
