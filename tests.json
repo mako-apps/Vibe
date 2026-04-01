@@ -1,6 +1,14 @@
 {
-  "updated_at": "2026-03-30",
+  "updated_at": "2026-04-01",
   "checks": {
+    "server_standalone_agent_safe_text_delivery": {
+      "status": "passed",
+      "details": "Patched `server/lib/vibe/ai/standalone_agent.ex` so standalone-agent chat delivery no longer dereferences `output.mediaUrl` directly on plain text outputs. The DM delivery path now resolves output fields defensively and `mix compile` passed after the change."
+    },
+    "server_standalone_agent_dm_context_history": {
+      "status": "passed",
+      "details": "Patched `server/lib/vibe_web/channels/chat_channel.ex` to persist an encrypted `agentInputCiphertext` preview only for standalone-agent DMs, and patched `server/lib/vibe/ai/standalone_agent.ex` to reconstruct recent DM context from prior agent plaintext plus decrypted agent-input previews before calling `ChatAgent.stream_response/3`. The standalone system prompt now uses `welcome_message` only for first contact and explicitly avoids repeated self-introductions. `mix compile` passed after the change."
+    },
     "mobile_agent_history_plaintext_merge": {
       "status": "passed",
       "details": "Patched `mobile/src/lib/ChatStore.ts` so `loadMessages()` normalizes full server message payloads before merge instead of rebuilding a stripped shape that dropped `plaintext`, `plainContent`, `isAgentMessage`, `agentName`, and `agentId`. `git diff --check` passed for the touched files."
@@ -128,6 +136,14 @@
     "ios_native_chat_timestamp_parser_scroll_polish": {
       "status": "passed",
       "details": "Patched `mobile/src/native/chat/mapper.ts` to normalize native row timestamps back to `HH:mm`, updated `ChatListViewCells.swift` to use `ChatNativeAgentTextRenderer` for agent and mention bubble text, softened the main header blur/mask in `ChatMainView.swift`, forced bottom scroll for pending sends plus resize-safe inset ordering in `ChatListView.swift`, and skipped redundant inset rewrites in `ChatNativeHomeListView.swift`. `xcrun swiftc -parse` passed for the touched Swift files, `get_errors` reported no file-level errors, and `git diff --check` passed for the touched files."
+    },
+    "ios_native_chat_block_renderer_link_preview": {
+      "status": "passed",
+      "details": "Patched `mobile/modules/vibe-chat-native/ios/ChatListViewCells.swift`, `ChatListView.swift`, `ChatNativeAgentStreamingText.swift`, and `ChatNativeAgentMessagesView.swift` so main-chat agent bubbles now render fenced code blocks with `AgentCodeBlockView`, default text bubbles use the shared markdown/link renderer, external text links render a cached fixed-height native preview card via `LPMetadataProvider`, and code-block expansion invalidates the list layout while preserving scroll position. `xcrun swiftc -parse` passed for the touched Swift files and `get_errors` reported no file-level errors."
+    },
+    "ios_native_agent_code_block_storage_key_collision": {
+      "status": "passed",
+      "details": "Fixed `AgentCodeBlockView.isExpanded(...)` in `mobile/modules/vibe-chat-native/ios/ChatNativeAgentStreamingText.swift` by qualifying the static helper call as `Self.storageKey(...)` so the `storageKey` parameter no longer shadows the helper and triggers `Cannot call value of non-function type 'String?'`. `xcrun swiftc -parse` passed and `get_errors` reported no file-level errors after the patch."
     }
   }
 }

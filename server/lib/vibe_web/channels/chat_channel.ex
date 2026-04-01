@@ -2,6 +2,7 @@ defmodule VibeWeb.ChatChannel do
   use VibeWeb, :channel
   alias Vibe.Agents
   alias Vibe.Chat
+  alias Vibe.Chat.AgentMessageCrypto
   alias Vibe.Notifications
   alias Vibe.AI.GroupAgent
   alias Vibe.AI.StandaloneAgent
@@ -15,6 +16,7 @@ defmodule VibeWeb.ChatChannel do
     case Chat.get_user_role(chat_id, user_id) do
       nil ->
         {:error, %{reason: "unauthorized"}}
+
       role ->
         room_type = Chat.get_room_type(chat_id) || "dm"
         socket = assign(socket, :room_type, room_type)
@@ -29,13 +31,16 @@ defmodule VibeWeb.ChatChannel do
     user_id = socket.assigns.user_id
 
     # Check send permission using cached socket assigns (no DB hit)
-    can_send = case socket.assigns.room_type do
-      "channel" -> socket.assigns.user_role in ["owner", "admin"]
-      _ -> true  # Already verified as participant on join
-    end
+    can_send =
+      case socket.assigns.room_type do
+        "channel" -> socket.assigns.user_role in ["owner", "admin"]
+        # Already verified as participant on join
+        _ -> true
+      end
 
     if not can_send do
-      {:reply, {:error, %{reason: "not_allowed", message: "You cannot send messages here"}}, socket}
+      {:reply, {:error, %{reason: "not_allowed", message: "You cannot send messages here"}},
+       socket}
     else
       standalone_agent =
         case socket.assigns.room_type do
@@ -50,83 +55,89 @@ defmodule VibeWeb.ChatChannel do
         end
 
       if standalone_agent && !Agents.incoming_chat_enabled?(standalone_agent) do
-        {:reply, {:error, %{reason: "agent_chat_disabled", message: "Incoming chat is disabled for this agent"}}, socket}
+        {:reply,
+         {:error,
+          %{reason: "agent_chat_disabled", message: "Incoming chat is disabled for this agent"}},
+         socket}
       else
-      data = deobfuscate(payload)
-      broadcast_payload = enforce_sender_identity(data, user_id)
+        data = deobfuscate(payload)
+        broadcast_payload = enforce_sender_identity(data, user_id)
+        message_metadata = message_metadata_for_persistence(data, standalone_agent)
 
-      message_attrs = %{
-        chat_id: chat_id,
-        from_id: user_id,
-        id: data["id"],
-        encrypted_content: data["encryptedContent"],
-        type: data["type"] || "text",
-        timestamp: data["timestamp"] || :os.system_time(:millisecond),
-        reply_to_id: data["replyToId"],
-        media_url: data["mediaUrl"],
-        metadata: data["metadata"] || %{}
-      }
+        message_attrs = %{
+          chat_id: chat_id,
+          from_id: user_id,
+          id: data["id"],
+          encrypted_content: data["encryptedContent"],
+          type: data["type"] || "text",
+          timestamp: data["timestamp"] || :os.system_time(:millisecond),
+          reply_to_id: data["replyToId"],
+          media_url: data["mediaUrl"],
+          metadata: message_metadata
+        }
 
-      # BROADCAST IMMEDIATELY for instant message delivery
-      broadcast!(socket, "message", broadcast_payload)
+        # BROADCAST IMMEDIATELY for instant message delivery
+        broadcast!(socket, "message", broadcast_payload)
 
-      # Check for @vibe agent mention and dispatch to group agent
-      maybe_dispatch_agent(chat_id, data, user_id)
+        # Check for @vibe agent mention and dispatch to group agent
+        maybe_dispatch_agent(chat_id, data, user_id)
 
-      # Persist to database asynchronously (don't block message delivery)
-      Task.start(fn ->
-        case Chat.add_message(message_attrs, acting_user_id: user_id) do
-          {:ok, _msg} ->
-            # Batch-fetch all participants with settings in ONE query (no N+1)
-            participants = Chat.get_all_participant_settings(chat_id)
-            Logger.info(
-              "[ChatChannel] message persisted chat_id=#{chat_id} sender=#{user_id} participants=#{length(participants)} message_id=#{data["id"]}"
-            )
+        # Persist to database asynchronously (don't block message delivery)
+        Task.start(fn ->
+          case Chat.add_message(message_attrs, acting_user_id: user_id) do
+            {:ok, _msg} ->
+              # Batch-fetch all participants with settings in ONE query (no N+1)
+              participants = Chat.get_all_participant_settings(chat_id)
 
-            Enum.each(participants, fn p ->
-              if p.user_id != user_id do
-                if p.deleted, do: Chat.restore_if_deleted(chat_id, p.user_id)
+              Logger.info(
+                "[ChatChannel] message persisted chat_id=#{chat_id} sender=#{user_id} participants=#{length(participants)} message_id=#{data["id"]}"
+              )
 
-                VibeWeb.Endpoint.broadcast!("user:#{p.user_id}", "new_message", %{
-                  chat_id: chat_id,
-                  from_id: user_id,
-                  message_id: data["id"],
-                  timestamp: data["timestamp"],
-                  muted: p.muted || false
-                })
+              Enum.each(participants, fn p ->
+                if p.user_id != user_id do
+                  if p.deleted, do: Chat.restore_if_deleted(chat_id, p.user_id)
 
-                if p.muted do
-                  Logger.info(
-                    "[ChatChannel] push skipped (muted chat) recipient=#{p.user_id} chat_id=#{chat_id} message_id=#{data["id"]}"
-                  )
-                else
-                  push_body =
-                    case data["pushPreview"] || data["push_preview"] || data["textPreview"] || data["text_preview"] do
-                      value when is_binary(value) and value != "" -> value
-                      _ -> nil
-                    end
+                  VibeWeb.Endpoint.broadcast!("user:#{p.user_id}", "new_message", %{
+                    chat_id: chat_id,
+                    from_id: user_id,
+                    message_id: data["id"],
+                    timestamp: data["timestamp"],
+                    muted: p.muted || false
+                  })
 
-                  _ =
-                    Notifications.send_message_push(p.user_id, %{
-                      "chat_id" => chat_id,
-                      "message_id" => data["id"],
-                      "from_id" => user_id,
-                      "type" => data["type"],
-                      "body" => push_body,
-                      "media_url" => data["mediaUrl"] || data["media_url"]
-                    })
+                  if p.muted do
+                    Logger.info(
+                      "[ChatChannel] push skipped (muted chat) recipient=#{p.user_id} chat_id=#{chat_id} message_id=#{data["id"]}"
+                    )
+                  else
+                    push_body =
+                      case data["pushPreview"] || data["push_preview"] || data["textPreview"] ||
+                             data["text_preview"] do
+                        value when is_binary(value) and value != "" -> value
+                        _ -> nil
+                      end
+
+                    _ =
+                      Notifications.send_message_push(p.user_id, %{
+                        "chat_id" => chat_id,
+                        "message_id" => data["id"],
+                        "from_id" => user_id,
+                        "type" => data["type"],
+                        "body" => push_body,
+                        "media_url" => data["mediaUrl"] || data["media_url"]
+                      })
+                  end
                 end
-              end
-            end)
+              end)
 
-          {:error, changeset} ->
-            # Log persistence failure but don't crash
-            Logger.error("Message persistence failed: #{inspect(changeset)}")
-        end
-      end)
+            {:error, changeset} ->
+              # Log persistence failure but don't crash
+              Logger.error("Message persistence failed: #{inspect(changeset)}")
+          end
+        end)
 
-      # Reply immediately - don't wait for DB
-      {:reply, :ok, socket}
+        # Reply immediately - don't wait for DB
+        {:reply, :ok, socket}
       end
     end
   end
@@ -173,6 +184,7 @@ defmodule VibeWeb.ChatChannel do
   def handle_in("delete-message", %{"messageId" => msg_id} = payload, socket) do
     "chat:" <> chat_id = socket.topic
     user_id = socket.assigns.user_id
+
     for_everyone =
       case Map.get(payload, "forEveryone", true) do
         v when v in [true, "true", "1", 1] -> true
@@ -204,7 +216,11 @@ defmodule VibeWeb.ChatChannel do
   end
 
   @impl true
-  def handle_in("edit-message", %{"messageId" => msg_id, "encryptedContent" => encrypted_content} = payload, socket) do
+  def handle_in(
+        "edit-message",
+        %{"messageId" => msg_id, "encryptedContent" => encrypted_content} = payload,
+        socket
+      ) do
     "chat:" <> chat_id = socket.topic
     user_id = socket.assigns.user_id
     edited_at = Map.get(payload, "editedAt")
@@ -237,13 +253,16 @@ defmodule VibeWeb.ChatChannel do
   # ── Agent Dispatch ──
 
   defp maybe_dispatch_agent(chat_id, data, user_id) do
-    Logger.info("[ChatChannel] maybe_dispatch_agent chat_id=#{chat_id} keys=#{inspect(Map.keys(data))} agentMention=#{inspect(data["agentMention"])} mentionedAgentId=#{inspect(data["mentionedAgentId"] || data["mentioned_agent_id"])}")
+    Logger.info(
+      "[ChatChannel] maybe_dispatch_agent chat_id=#{chat_id} keys=#{inspect(Map.keys(data))} agentMention=#{inspect(data["agentMention"])} mentionedAgentId=#{inspect(data["mentionedAgentId"] || data["mentioned_agent_id"])}"
+    )
 
     agent_mention = data["agentMention"] || false
     mentioned_agent_id = data["mentionedAgentId"] || data["mentioned_agent_id"]
     mentioned_agent_username = data["mentionedAgentUsername"] || data["mentioned_agent_username"]
     agent_text = data["agentText"]
     reply_to_id = data["replyToId"] || data["reply_to_id"]
+
     reply_message =
       case reply_to_id do
         value when is_binary(value) and value != "" -> Chat.get_message(chat_id, value, user_id)
@@ -306,6 +325,7 @@ defmodule VibeWeb.ChatChannel do
             reply_message -> "reply"
             true -> "dm"
           end
+
         spawn_standalone_dispatch(
           chat_id,
           standalone_agent,
@@ -318,6 +338,7 @@ defmodule VibeWeb.ChatChannel do
 
       group_trigger? && is_binary(dispatch_text) ->
         trigger_type = if agent_mention, do: "mention", else: "reply"
+
         metadata = %{
           "image_urls" => attachment_context.image_urls,
           "document_urls" => attachment_context.document_urls,
@@ -358,10 +379,14 @@ defmodule VibeWeb.ChatChannel do
                requester_user_id: requester_user_id
              ) do
           {:ok, _response} ->
-            Logger.info("[ChatChannel] Standalone agent responded chat_id=#{chat_id} agent_id=#{agent.id}")
+            Logger.info(
+              "[ChatChannel] Standalone agent responded chat_id=#{chat_id} agent_id=#{agent.id}"
+            )
 
           {:error, reason} ->
-            Logger.error("[ChatChannel] Standalone agent dispatch failed chat_id=#{chat_id} agent_id=#{agent.id} reason=#{inspect(reason)}")
+            Logger.error(
+              "[ChatChannel] Standalone agent dispatch failed chat_id=#{chat_id} agent_id=#{agent.id} reason=#{inspect(reason)}"
+            )
         end
       after
         stop_agent_activity(chat_id, agent.agent_user_id)
@@ -382,7 +407,9 @@ defmodule VibeWeb.ChatChannel do
             Logger.debug("[ChatChannel] No agent configured for chat #{chat_id}")
 
           {:error, reason} ->
-            Logger.error("[ChatChannel] Agent dispatch failed for chat #{chat_id}: #{inspect(reason)}")
+            Logger.error(
+              "[ChatChannel] Agent dispatch failed for chat #{chat_id}: #{inspect(reason)}"
+            )
         end
       after
         stop_agent_activity(chat_id, GroupAgent.agent_user_id())
@@ -405,7 +432,32 @@ defmodule VibeWeb.ChatChannel do
         trimmed = String.trim(text)
         if trimmed == "", do: nil, else: trimmed
 
-      _ -> nil
+      _ ->
+        nil
+    end
+  end
+
+  defp message_metadata_for_persistence(data, standalone_agent) do
+    base_metadata =
+      case data["metadata"] do
+        value when is_map(value) -> value
+        _ -> %{}
+      end
+
+    if standalone_agent do
+      case normalize_dispatch_text(data["agentText"], data) do
+        text when is_binary(text) ->
+          Map.put(
+            base_metadata,
+            "agentInputCiphertext",
+            AgentMessageCrypto.encrypt_for_storage(text)
+          )
+
+        _ ->
+          base_metadata
+      end
+    else
+      base_metadata
     end
   end
 
@@ -534,12 +586,20 @@ defmodule VibeWeb.ChatChannel do
 
   defp image_url?(url) when is_binary(url) do
     lower = String.downcase(url)
-    Enum.any?([".png", ".jpg", ".jpeg", ".webp", ".gif", ".heic", ".bmp"], &String.contains?(lower, &1))
+
+    Enum.any?(
+      [".png", ".jpg", ".jpeg", ".webp", ".gif", ".heic", ".bmp"],
+      &String.contains?(lower, &1)
+    )
   end
 
   defp document_url?(url) when is_binary(url) do
     lower = String.downcase(url)
-    Enum.any?([".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".txt", ".rtf", ".md"], &String.contains?(lower, &1))
+
+    Enum.any?(
+      [".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".txt", ".rtf", ".md"],
+      &String.contains?(lower, &1)
+    )
   end
 
   defp enforce_sender_identity(payload, user_id) when is_map(payload) do
@@ -553,5 +613,7 @@ defmodule VibeWeb.ChatChannel do
     |> Base.decode64!(ignore: :whitespace)
     |> Jason.decode!()
   end
-  defp deobfuscate(map), do: map # Fallback if not obfuscated
+
+  # Fallback if not obfuscated
+  defp deobfuscate(map), do: map
 end

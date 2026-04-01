@@ -10,6 +10,8 @@ defmodule Vibe.AI.StandaloneAgent do
   alias Vibe.AI.TTS
   alias Vibe.Chat.AgentMessageCrypto
 
+  @conversation_history_limit 12
+
   def invoke(%AgentSchema{} = agent, params) when is_map(params) do
     response_mode = normalize_response_mode(params["responseMode"] || params["response_mode"])
     message = normalize_string(params["message"])
@@ -42,7 +44,8 @@ defmodule Vibe.AI.StandaloneAgent do
                  vibe_chat_id,
                  requester_user_id
                ),
-             {:ok, deliveries} <- maybe_deliver(agent, vibe_chat_id, outputs, response_mode, reply_to_id) do
+             {:ok, deliveries} <-
+               maybe_deliver(agent, vibe_chat_id, outputs, response_mode, reply_to_id) do
           {:ok, %{outputs: outputs, vibe_deliveries: deliveries}}
         end
     end
@@ -62,15 +65,27 @@ defmodule Vibe.AI.StandaloneAgent do
     invoke(agent, params)
   end
 
-  defp generate_outputs(agent, message, attachments, requested_output_mode, vibe_chat_id, requester_user_id) do
+  defp generate_outputs(
+         agent,
+         message,
+         attachments,
+         requested_output_mode,
+         vibe_chat_id,
+         requester_user_id
+       ) do
     image_urls =
       attachments
       |> Enum.filter(&(&1.type == "image"))
       |> Enum.map(& &1.url)
 
-    system_prompt = build_system_prompt(agent)
+    conversation_history =
+      recent_chat_history(vibe_chat_id, requester_user_id, agent.agent_user_id)
 
-    {:ok, collected} = Elixir.Agent.start_link(fn -> %{text: "", outputs: [], text_metadata: %{}} end)
+    has_prior_messages = chat_has_prior_messages?(vibe_chat_id, requester_user_id)
+    system_prompt = build_system_prompt(agent, has_prior_messages)
+
+    {:ok, collected} =
+      Elixir.Agent.start_link(fn -> %{text: "", outputs: [], text_metadata: %{}} end)
 
     callback = fn
       %{type: :text, content: chunk} ->
@@ -106,9 +121,11 @@ defmodule Vibe.AI.StandaloneAgent do
                requester_user_id,
                agent.id,
                system_prompt,
-               agent.enabled_tools || []
+               agent.enabled_tools || [],
+               conversation_history
              ) do
         accumulated = Elixir.Agent.get(collected, & &1)
+
         outputs =
           finalize_outputs(
             agent,
@@ -117,6 +134,7 @@ defmodule Vibe.AI.StandaloneAgent do
             accumulated.text_metadata,
             requested_output_mode
           )
+
         {:ok, outputs}
       end
     after
@@ -142,10 +160,12 @@ defmodule Vibe.AI.StandaloneAgent do
   defp deliver_output_to_chat(agent, chat_id, output, reply_to_id) do
     message_id = Ecto.UUID.generate()
     timestamp = :os.system_time(:millisecond)
-    message_type = output.type || "text"
-    plain_text = normalize_string(output.text) || ""
+    message_type = output_type(output)
+    plain_text = output_text(output)
+    media_url = output_media_url(output)
+
     metadata =
-      output.metadata || %{}
+      output_metadata(output)
       |> Map.put("replyToId", reply_to_id)
       |> Map.put("isAgentMessage", true)
       |> Map.put("agentId", agent.id)
@@ -165,7 +185,7 @@ defmodule Vibe.AI.StandaloneAgent do
         "isAgentMessage" => true,
         "agentName" => agent.display_name,
         "agentId" => agent.id,
-        "mediaUrl" => output.mediaUrl,
+        "mediaUrl" => media_url,
         "metadata" => metadata,
         "replyToId" => reply_to_id
       }
@@ -179,7 +199,7 @@ defmodule Vibe.AI.StandaloneAgent do
         from_id: agent.agent_user_id,
         encrypted_content: AgentMessageCrypto.encrypt_for_storage(plain_text),
         type: message_type,
-        media_url: output.mediaUrl,
+        media_url: media_url,
         metadata: metadata,
         reply_to_id: reply_to_id,
         timestamp: timestamp
@@ -201,26 +221,31 @@ defmodule Vibe.AI.StandaloneAgent do
                 "from_id" => agent.agent_user_id,
                 "type" => message_type,
                 "body" => plain_text,
-                "media_url" => output.mediaUrl
+                "media_url" => media_url
               })
           end
         end)
 
-        {:ok, %{messageId: message_id, type: message_type, mediaUrl: output.mediaUrl}}
+        {:ok, %{messageId: message_id, type: message_type, mediaUrl: media_url}}
 
       error ->
         error
     end
   end
 
-  defp build_system_prompt(agent) do
+  defp build_system_prompt(agent, has_prior_messages) do
     [
       "You are #{agent.display_name}, a custom AI agent inside the Vibe app.",
       "Respond clearly and practically.",
+      "Do not introduce yourself again, restate your capabilities, or repeat onboarding copy in an ongoing chat unless the user explicitly asks for it.",
       "If the user asks about received notifications, past event counts, times, related messages, or inbox mode, use the live inbox tools before answering.",
       "If the user wants to switch between normal event bubbles and batched summaries, use the inbox configuration tool instead of guessing.",
       if(agent.persona, do: "Persona: #{agent.persona}", else: nil),
-      if(agent.welcome_message, do: "Welcome message: #{agent.welcome_message}", else: nil),
+      if(agent.welcome_message && !has_prior_messages,
+        do:
+          "First-contact welcome guidance: #{agent.welcome_message}. Use it only for the first reply in a new DM or when the user explicitly asks what you do.",
+        else: nil
+      ),
       agent.system_prompt
     ]
     |> Enum.reject(&is_nil/1)
@@ -262,11 +287,13 @@ defmodule Vibe.AI.StandaloneAgent do
          requester_user_id,
          agent_id,
          system_prompt,
-         enabled_tools
+         enabled_tools,
+         conversation_history
        ) do
     case ChatAgent.stream_response(
            message,
            callback,
+           history: conversation_history,
            images: image_urls,
            chat_id: vibe_chat_id,
            user_id: user_id,
@@ -313,7 +340,10 @@ defmodule Vibe.AI.StandaloneAgent do
                 ]
 
             {:error, reason} ->
-              Logger.warning("[StandaloneAgent] TTS failed, falling back to text: #{inspect(reason)}")
+              Logger.warning(
+                "[StandaloneAgent] TTS failed, falling back to text: #{inspect(reason)}"
+              )
+
               maybe_append_text_output(base_outputs, normalized_text, text_metadata)
           end
         else
@@ -333,7 +363,8 @@ defmodule Vibe.AI.StandaloneAgent do
   end
 
   defp tool_output_from_result(tool_name, result)
-       when tool_name in ["create_document", "edit_rows", "delete_rows", "export_rows"] and is_map(result) do
+       when tool_name in ["create_document", "edit_rows", "delete_rows", "export_rows"] and
+              is_map(result) do
     ok? = Map.get(result, :ok) || Map.get(result, "ok")
 
     file_url =
@@ -369,9 +400,11 @@ defmodule Vibe.AI.StandaloneAgent do
       %{
         "relatedMessageIds" => Enum.filter(related_message_ids, &is_binary/1),
         "relatedMessagesTitle" =>
-          Map.get(result, "related_title") || Map.get(result, :related_title) || "Related messages",
+          Map.get(result, "related_title") || Map.get(result, :related_title) ||
+            "Related messages",
         "relatedMessagesSubtitle" =>
-          Map.get(result, "related_subtitle") || Map.get(result, :related_subtitle) || "Tap to review"
+          Map.get(result, "related_subtitle") || Map.get(result, :related_subtitle) ||
+            "Tap to review"
       }
     else
       %{}
@@ -382,8 +415,121 @@ defmodule Vibe.AI.StandaloneAgent do
 
   defp merge_outputs(existing, new_outputs) do
     (List.wrap(existing) ++ List.wrap(new_outputs))
-    |> Enum.uniq_by(fn output -> {output.type, output.mediaUrl, output.text} end)
+    |> Enum.uniq_by(fn output ->
+      {output_type(output), output_media_url(output), output_text(output)}
+    end)
   end
+
+  defp recent_chat_history(chat_id, requester_user_id, agent_user_id)
+       when is_binary(chat_id) and is_binary(requester_user_id) and is_binary(agent_user_id) do
+    chat_id
+    |> Chat.get_messages_for_user(requester_user_id)
+    |> Enum.map(&history_entry_from_message(&1, agent_user_id))
+    |> Enum.reject(&is_nil/1)
+    |> Enum.take(-@conversation_history_limit)
+  end
+
+  defp recent_chat_history(_, _, _), do: []
+
+  defp chat_has_prior_messages?(chat_id, requester_user_id)
+       when is_binary(chat_id) and is_binary(requester_user_id) do
+    case Chat.get_messages_for_user(chat_id, requester_user_id) do
+      [] -> false
+      [_ | _] -> true
+      _ -> false
+    end
+  end
+
+  defp chat_has_prior_messages?(_, _), do: false
+
+  defp history_entry_from_message(message, agent_user_id) when is_map(message) do
+    from_id = Map.get(message, :from_id) || Map.get(message, "from_id")
+
+    cond do
+      from_id == agent_user_id ->
+        case message_text_for_history(message, true) do
+          nil -> nil
+          content -> %{role: "assistant", content: content}
+        end
+
+      true ->
+        case message_text_for_history(message, false) do
+          nil -> nil
+          content -> %{role: "user", content: content}
+        end
+    end
+  end
+
+  defp history_entry_from_message(_, _), do: nil
+
+  defp message_text_for_history(message, agent_message?) do
+    metadata =
+      case Map.get(message, :metadata) || Map.get(message, "metadata") do
+        value when is_map(value) -> value
+        _ -> %{}
+      end
+
+    value =
+      cond do
+        agent_message? ->
+          Map.get(message, :plaintext) ||
+            Map.get(message, "plaintext") ||
+            Map.get(message, :plain_content) ||
+            Map.get(message, "plain_content") ||
+            Map.get(message, :plainContent) ||
+            Map.get(message, "plainContent")
+
+        true ->
+          Map.get(metadata, "agentInputCiphertext") ||
+            Map.get(metadata, :agentInputCiphertext) ||
+            Map.get(metadata, "agent_input_ciphertext") ||
+            Map.get(metadata, :agent_input_ciphertext)
+      end
+
+    value
+    |> maybe_decrypt_history_text(agent_message?)
+    |> normalize_string()
+  end
+
+  defp maybe_decrypt_history_text(value, true), do: value
+
+  defp maybe_decrypt_history_text(value, false) when is_binary(value) do
+    AgentMessageCrypto.decrypt_from_storage(value)
+  end
+
+  defp maybe_decrypt_history_text(value, _), do: value
+
+  defp output_type(output) when is_map(output) do
+    normalize_string(Map.get(output, :type) || Map.get(output, "type")) || "text"
+  end
+
+  defp output_type(_), do: "text"
+
+  defp output_text(output) when is_map(output) do
+    normalize_string(Map.get(output, :text) || Map.get(output, "text")) || ""
+  end
+
+  defp output_text(_), do: ""
+
+  defp output_media_url(output) when is_map(output) do
+    normalize_string(
+      Map.get(output, :mediaUrl) ||
+        Map.get(output, "mediaUrl") ||
+        Map.get(output, :media_url) ||
+        Map.get(output, "media_url")
+    )
+  end
+
+  defp output_media_url(_), do: nil
+
+  defp output_metadata(output) when is_map(output) do
+    case Map.get(output, :metadata) || Map.get(output, "metadata") do
+      value when is_map(value) -> value
+      _ -> %{}
+    end
+  end
+
+  defp output_metadata(_), do: %{}
 
   defp image_output?(url, mime_type) do
     mime_type in ["image/png", "image/jpeg", "image/webp", "image/gif"] or
@@ -394,14 +540,29 @@ defmodule Vibe.AI.StandaloneAgent do
     lowered = String.downcase(url)
 
     cond do
-      String.match?(lowered, ~r/\.png(\?|$)/) -> "image/png"
-      String.match?(lowered, ~r/\.jpe?g(\?|$)/) -> "image/jpeg"
-      String.match?(lowered, ~r/\.webp(\?|$)/) -> "image/webp"
-      String.match?(lowered, ~r/\.gif(\?|$)/) -> "image/gif"
-      String.match?(lowered, ~r/\.pdf(\?|$)/) -> "application/pdf"
-      String.match?(lowered, ~r/\.xlsx?(\?|$)/) -> "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-      String.match?(lowered, ~r/\.csv(\?|$)/) -> "text/csv"
-      true -> "application/octet-stream"
+      String.match?(lowered, ~r/\.png(\?|$)/) ->
+        "image/png"
+
+      String.match?(lowered, ~r/\.jpe?g(\?|$)/) ->
+        "image/jpeg"
+
+      String.match?(lowered, ~r/\.webp(\?|$)/) ->
+        "image/webp"
+
+      String.match?(lowered, ~r/\.gif(\?|$)/) ->
+        "image/gif"
+
+      String.match?(lowered, ~r/\.pdf(\?|$)/) ->
+        "application/pdf"
+
+      String.match?(lowered, ~r/\.xlsx?(\?|$)/) ->
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+      String.match?(lowered, ~r/\.csv(\?|$)/) ->
+        "text/csv"
+
+      true ->
+        "application/octet-stream"
     end
   end
 
@@ -410,7 +571,9 @@ defmodule Vibe.AI.StandaloneAgent do
     |> URI.parse()
     |> Map.get(:path)
     |> case do
-      nil -> "document"
+      nil ->
+        "document"
+
       path ->
         case Path.basename(path) do
           "" -> "document"
