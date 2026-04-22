@@ -182,6 +182,7 @@ defmodule VibeWeb.Router do
     post "/media/upload", MediaController, :upload
 
     # Relay → Bridge registration
+    get "/packet/bootstrap", BridgeController, :packet_bootstrap
     post "/relay/register-bridge", BridgeController, :register_relay
     get "/relay/resolve-bridge", BridgeController, :resolve_relay_bridge
   end

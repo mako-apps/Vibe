@@ -2,6 +2,7 @@ defmodule VibeWeb.BridgeController do
   use VibeWeb, :controller
 
   alias Vibe.ChatBridge
+  alias Vibe.PacketBootstrap
   alias Vibe.RelayRegistry
 
   def bundle(conn, _params) do
@@ -75,6 +76,24 @@ defmodule VibeWeb.BridgeController do
     end
   end
 
+  def packet_bootstrap(conn, _params) do
+    case PacketBootstrap.issue_for_user(conn.assigns.current_user) do
+      {:ok, payload} ->
+        conn
+        |> put_resp_header("cache-control", "no-store")
+        |> json(payload)
+
+      {:error, :packet_server_url_missing} ->
+        conn |> put_status(:service_unavailable) |> json(%{error: "packet_server_url_missing"})
+
+      {:error, :packet_signing_secret_missing} ->
+        conn |> put_status(:service_unavailable) |> json(%{error: "packet_signing_secret_missing"})
+
+      {:error, reason} ->
+        conn |> put_status(:unprocessable_entity) |> json(%{error: to_string(reason)})
+    end
+  end
+
   def register_relay(conn, params) do
     user = conn.assigns.current_user
 
@@ -85,90 +104,76 @@ defmodule VibeWeb.BridgeController do
     name = normalize_string(params["name"]) || "Relay"
     invite_code = normalize_string(params["inviteCode"] || params["invite_code"])
 
-    # Extract the caller's external IP from the connection
-    external_ip = extract_client_ip(conn)
+    with {:ok, descriptor} <- normalize_relay_descriptor(relay_id, params) do
+      share_data =
+        descriptor
+        |> Jason.encode!()
+        |> Base.url_encode64(padding: false)
 
-    # Build a bridge URL pointing to the Vibe backend via this relay.
-    # For now, the relay user's app acts as the bridge itself,
-    # so we return their IP. In the future, this could be a dedicated
-    # bridge service running on the relay device.
-    bridge_url =
-      if external_ip, do: "https://#{external_ip}", else: nil
+      share_link = "vibe://bridge?d=#{share_data}"
 
-    # Build the share link descriptor
-    descriptor = %{
-      id: relay_id,
-      host: external_ip,
-      port: 443,
-      transport: "https",
-      origin: "community",
-      priority: 50,
-      weight: 100,
-      baseUrl: bridge_url
-    }
+      relay_updates = %{
+        invite_code: invite_code,
+        name: name,
+        user_id: user.id,
+        external_ip: descriptor[:host],
+        bridge_url: descriptor[:baseUrl],
+        share_link: share_link,
+        bridge_descriptor: descriptor,
+        capabilities: descriptor[:capabilities] || []
+      }
 
-    share_data =
-      descriptor
-      |> Jason.encode!()
-      |> Base.url_encode64(padding: false)
+      case RelayRegistry.update_relay(relay_id, relay_updates) do
+        :ok ->
+          :ok
 
-    share_link = "vibe://bridge?d=#{share_data}"
+        :not_found ->
+          RelayRegistry.register_relay(%{
+            relay_id: relay_id,
+            user_id: user.id,
+            invite_code: invite_code,
+            invite_key: nil,
+            is_public: false,
+            name: name,
+            max_peers: 5,
+            current_peers: 0,
+            region: "unknown",
+            started_at: System.system_time(:second),
+            last_heartbeat_at: System.system_time(:second),
+            capabilities: descriptor[:capabilities] || [],
+            external_ip: descriptor[:host],
+            bridge_url: descriptor[:baseUrl],
+            share_link: share_link,
+            bridge_descriptor: descriptor
+          })
+      end
 
-    relay_updates = %{
-      invite_code: invite_code,
-      name: name,
-      user_id: user.id,
-      external_ip: external_ip,
-      bridge_url: bridge_url,
-      share_link: share_link,
-      bridge_descriptor: descriptor
-    }
+      VibeWeb.Endpoint.broadcast!("relay:directory", "relay_updated", %{
+        relay_id: relay_id,
+        name: name,
+        current_peers: 0,
+        invite_code: invite_code,
+        external_ip: descriptor[:host],
+        bridge_url: descriptor[:baseUrl],
+        share_link: share_link,
+        bridge_descriptor: descriptor
+      })
 
-    case RelayRegistry.update_relay(relay_id, relay_updates) do
-      :ok ->
-        :ok
-
-      :not_found ->
-        RelayRegistry.register_relay(%{
-          relay_id: relay_id,
-          user_id: user.id,
-          invite_code: invite_code,
-          invite_key: nil,
-          is_public: false,
-          name: name,
-          max_peers: 5,
-          current_peers: 0,
-          region: "unknown",
-          started_at: System.system_time(:second),
-          external_ip: external_ip,
-          bridge_url: bridge_url,
-          share_link: share_link,
-          bridge_descriptor: descriptor
-        })
+      json(conn, %{
+        relayId: relay_id,
+        userId: user.id,
+        externalIp: descriptor[:host],
+        bridgeUrl: descriptor[:baseUrl],
+        shareLink: share_link,
+        shareData: share_data,
+        descriptor: descriptor,
+        name: name,
+        inviteCode: invite_code
+      })
+    else
+      {:error, reason} ->
+        conn |> put_status(:unprocessable_entity) |> json(%{error: to_string(reason)})
     end
-
-    VibeWeb.Endpoint.broadcast!("relay:directory", "relay_updated", %{
-      relay_id: relay_id,
-      name: name,
-      current_peers: 0,
-      invite_code: invite_code,
-      external_ip: external_ip,
-      bridge_url: bridge_url,
-      share_link: share_link,
-      bridge_descriptor: descriptor
-    })
-
-    json(conn, %{
-      relayId: relay_id,
-      userId: user.id,
-      externalIp: external_ip,
-      bridgeUrl: bridge_url,
-      shareLink: share_link,
-      shareData: share_data,
-      descriptor: descriptor,
-      name: name,
-      inviteCode: invite_code
-    })
   end
 
   def resolve_relay_bridge(conn, params) do
@@ -199,27 +204,97 @@ defmodule VibeWeb.BridgeController do
     end
   end
 
-  defp extract_client_ip(conn) do
-    # Check X-Forwarded-For first (common behind proxies/load balancers)
-    forwarded =
-      conn
-      |> Plug.Conn.get_req_header("x-forwarded-for")
-      |> List.first()
+  defp normalize_relay_descriptor(relay_id, params) do
+    now_ms = System.system_time(:millisecond)
 
-    ip =
-      case forwarded do
-        nil ->
-          conn.remote_ip |> :inet.ntoa() |> to_string()
+    raw =
+      params["descriptor"] ||
+        params["bridgeDescriptor"] ||
+        params["bridge_descriptor"] ||
+        params["packetDescriptor"] ||
+        params["packet_descriptor"]
 
-        value ->
-          value
-          |> String.split(",")
-          |> List.first()
-          |> String.trim()
-      end
-
-    if ip in ["127.0.0.1", "::1", "0.0.0.0"], do: nil, else: ip
+    with descriptor when is_map(descriptor) <- decode_descriptor(raw),
+         base_url when is_binary(base_url) <- normalize_string(descriptor["baseUrl"] || descriptor["base_url"]),
+         true <- String.starts_with?(String.downcase(base_url), "https://"),
+         {:ok, uri} <- validate_public_https_uri(base_url),
+         pins when is_list(pins) and pins != [] <- normalize_pin_list(descriptor["spkiPins"] || descriptor["spki_pins"]),
+         expires_at when is_integer(expires_at) <-
+           normalize_integer(descriptor["expiresAt"] || descriptor["expires_at"]),
+         :ok <- validate_future_expiry(expires_at, now_ms) do
+      {:ok,
+       %{
+         id: normalize_string(descriptor["id"]) || relay_id,
+         host: uri.host,
+         port: uri.port || 443,
+         transport: "https",
+         origin: "community",
+         priority: normalize_integer(descriptor["priority"]) || 50,
+         weight: normalize_integer(descriptor["weight"]) || 100,
+         baseUrl: base_url,
+         spkiPins: pins,
+         expiresAt: expires_at,
+         capabilities: normalize_string_list(descriptor["capabilities"]) || ["packet_mesh"]
+       }}
+    else
+      nil -> {:error, :bridge_descriptor_missing}
+      false -> {:error, :bridge_descriptor_must_use_https}
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :bridge_descriptor_invalid}
+    end
   end
+
+  defp decode_descriptor(nil), do: nil
+
+  defp decode_descriptor(value) when is_binary(value) do
+    case Jason.decode(value) do
+      {:ok, decoded} when is_map(decoded) -> decoded
+      _ -> nil
+    end
+  end
+
+  defp decode_descriptor(value) when is_map(value), do: value
+  defp decode_descriptor(_value), do: nil
+
+  defp validate_public_https_uri(base_url) do
+    uri = URI.parse(base_url)
+
+    cond do
+      is_nil(uri.host) -> {:error, :bridge_descriptor_host_missing}
+      uri.host in ["127.0.0.1", "0.0.0.0", "::1", "localhost"] -> {:error, :bridge_descriptor_host_invalid}
+      true -> {:ok, uri}
+    end
+  end
+
+  defp normalize_integer(value) when is_integer(value), do: value
+
+  defp normalize_integer(value) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {parsed, ""} -> parsed
+      _ -> nil
+    end
+  end
+
+  defp normalize_integer(_value), do: nil
+
+  defp validate_future_expiry(expires_at, now_ms) when expires_at > now_ms, do: :ok
+  defp validate_future_expiry(_expires_at, _now_ms), do: {:error, :bridge_descriptor_expired}
+
+  defp normalize_pin_list(value) when is_list(value) do
+    value
+    |> Enum.map(&normalize_string/1)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp normalize_pin_list(_value), do: []
+
+  defp normalize_string_list(value) when is_list(value) do
+    value
+    |> Enum.map(&normalize_string/1)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp normalize_string_list(_value), do: nil
 
   defp normalize_string(value) when is_binary(value) do
     trimmed = String.trim(value)

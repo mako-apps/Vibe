@@ -64,7 +64,9 @@ defmodule VibeWeb.RelayChannel do
       max_peers: max_peers,
       current_peers: 0,
       region: region,
-      started_at: System.system_time(:second)
+      started_at: System.system_time(:second),
+      last_heartbeat_at: System.system_time(:second),
+      capabilities: payload["capabilities"] || []
     })
 
     # If public, broadcast to directory subscribers
@@ -75,8 +77,7 @@ defmodule VibeWeb.RelayChannel do
         max_peers: max_peers,
         current_peers: 0,
         region: region,
-        invite_code: invite_code,
-        invite_key: invite_key
+        invite_code: invite_code
       })
     end
 
@@ -89,10 +90,13 @@ defmodule VibeWeb.RelayChannel do
 
   @impl true
   def handle_in("peer_connect", %{"shared_secret" => shared_secret}, socket) do
-    # Client is requesting connection to the relay — forward to all other subscribers (the relay host)
+    # The legacy JS relay path must never leak the raw shared secret through the public relay directory.
+    # Packet bootstrap/tickets are the real data path now.
+    _ = shared_secret
     broadcast_from!(socket, "peer_connect", %{
       peer_id: socket.assigns.user_id,
-      shared_secret: shared_secret
+      transport: "packet_mesh",
+      shared_secret_redacted: true
     })
     {:noreply, socket}
   end
@@ -113,8 +117,6 @@ defmodule VibeWeb.RelayChannel do
   def handle_in("peer_data", %{"peer_id" => peer_id, "data" => data}, socket) do
     # Forward encrypted data between relay and client
     # The server CANNOT read this data — it's just a message broker
-    relay_id = socket.assigns.relay_id
-
     broadcast_from!(socket, "peer_data", %{
       peer_id: peer_id,
       data: data
@@ -125,8 +127,6 @@ defmodule VibeWeb.RelayChannel do
 
   def handle_in("peer_data", %{"data" => data}, socket) do
     # Client sending data (no peer_id — it goes to the relay)
-    relay_id = socket.assigns.relay_id
-
     broadcast_from!(socket, "peer_data", %{
       peer_id: socket.assigns.user_id,
       data: data
@@ -135,7 +135,7 @@ defmodule VibeWeb.RelayChannel do
     {:noreply, socket}
   end
 
-  def handle_in("peer_accepted", %{"peer_id" => peer_id} = payload, socket) do
+  def handle_in("peer_accepted", payload, socket) do
     # Relay accepted a peer connection
     broadcast!(socket, "peer_accepted", payload)
 
@@ -169,7 +169,9 @@ defmodule VibeWeb.RelayChannel do
       max_peers: payload["max_peers"],
       invite_code: payload["invite_code"],
       invite_key: payload["invite_key"],
-      region: region
+      region: region,
+      capabilities: payload["capabilities"] || [],
+      last_heartbeat_at: System.system_time(:second)
     })
 
     # Broadcast as relay_added so directory clients pick it up
@@ -179,11 +181,42 @@ defmodule VibeWeb.RelayChannel do
       max_peers: payload["max_peers"] || 5,
       current_peers: payload["current_peers"] || 0,
       region: region,
-      invite_code: payload["invite_code"],
-      invite_key: payload["invite_key"]
+      invite_code: payload["invite_code"]
     })
 
     {:reply, :ok, socket}
+  end
+
+  def handle_in("heartbeat", payload, socket) do
+    relay_id = socket.assigns.relay_id
+
+    Vibe.RelayRegistry.update_relay(relay_id, %{
+      current_peers: payload["current_peers"] || 0,
+      capabilities: payload["capabilities"] || [],
+      last_heartbeat_at: System.system_time(:second)
+    })
+
+    {:reply, :ok, socket}
+  end
+
+  def handle_in("mesh_fragment", payload, socket) do
+    case Vibe.MeshAssembler.submit_fragment(payload) do
+      {:ok, reconstructed_payload} ->
+        # Fragment set complete — deliver the reassembled message
+        broadcast!(socket, "mesh_assembled", %{
+          set_id: payload["set_id"],
+          payload: Base.encode64(reconstructed_payload),
+          from_relay: socket.assigns.relay_id
+        })
+        {:reply, :ok, socket}
+
+      :pending ->
+        # More fragments needed
+        {:reply, {:ok, %{status: "pending"}}, socket}
+
+      {:error, reason} ->
+        {:reply, {:error, %{reason: to_string(reason)}}, socket}
+    end
   end
 
   def handle_in("update_status", payload, socket) do
@@ -209,9 +242,9 @@ defmodule VibeWeb.RelayChannel do
     {:reply, :ok, socket}
   end
 
-  def handle_in("ping_relay", %{"relay_id" => target_relay_id}, socket) do
+  def handle_in("ping_relay", %{"relay_id" => relay_id}, socket) do
     # Ping a relay to test latency (just reply immediately)
-    {:reply, :ok, socket}
+    {:reply, {:ok, %{relay_id: relay_id, pong_at: System.system_time(:millisecond)}}, socket}
   end
 
   @impl true

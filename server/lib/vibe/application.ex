@@ -38,6 +38,8 @@ defmodule Vibe.Application do
       VibeWeb.Endpoint,
       # Start the Relay Registry (VibeNet peer relay network)
       Vibe.RelayRegistry,
+      # Start the Mesh Fragment Assembler (k-of-n reconstruction)
+      Vibe.MeshAssembler,
       # Start the scheduled post scheduler
       # Start the scheduled post scheduler
       Vibe.Scheduler,
