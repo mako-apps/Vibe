@@ -8,23 +8,12 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
   ) -> Bool {
-    let navigationController = UINavigationController(
-      rootViewController: initialViewController()
-    )
-    navigationController.navigationBar.prefersLargeTitles = true
-
     let window = UIWindow(frame: UIScreen.main.bounds)
-    window.rootViewController = navigationController
+    window.rootViewController = AppRootControllerFactory.makeInitialController()
+    AppAppearanceController.applyStoredPreference(to: window)
     window.makeKeyAndVisible()
 
     self.window = window
     return true
-  }
-
-  private func initialViewController() -> UIViewController {
-    if AppSessionConfig.current != nil {
-      return ChatHomeViewController()
-    }
-    return WelcomeViewController()
   }
 }

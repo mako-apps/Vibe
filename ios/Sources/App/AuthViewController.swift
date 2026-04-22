@@ -71,7 +71,7 @@ final class AuthViewController: UIHostingController<NativeAuthSheetView> {
   override func viewDidLoad() {
     super.viewDidLoad()
     configureSheet()
-    view.backgroundColor = NativeAuthSheetTheme.sheetBackgroundUIColor
+    view.backgroundColor = NativeAuthSheetTheme.pageBackgroundUIColor
   }
 
   private func configureSheet() {
@@ -87,7 +87,6 @@ final class AuthViewController: UIHostingController<NativeAuthSheetView> {
 struct AuthSheetAlert: Identifiable {
   enum Kind {
     case error
-    case recovery(secret: String)
   }
 
   let id = UUID()
@@ -150,18 +149,6 @@ final class NativeAuthSheetViewModel: ObservableObject {
           self.activeAlert = nil
         }
       )
-    case let .recovery(secret):
-      return Alert(
-        title: Text(alert.title),
-        message: Text(alert.message),
-        primaryButton: .default(Text("Copy & Continue")) {
-          UIPasteboard.general.string = secret
-          self.finishAuthenticatedFlow()
-        },
-        secondaryButton: .default(Text("Continue")) {
-          self.finishAuthenticatedFlow()
-        }
-      )
     }
   }
 
@@ -198,7 +185,11 @@ final class NativeAuthSheetViewModel: ObservableObject {
           transportMode: transportMode
         )
         await MainActor.run {
-          self.persist(result.config, recoverySecret: nil)
+          self.persist(
+            result.config,
+            storedSecret: normalizedSecret,
+            shouldShowSecretSavedToast: false
+          )
         }
       } catch {
         await MainActor.run {
@@ -231,7 +222,11 @@ final class NativeAuthSheetViewModel: ObservableObject {
           transportMode: transportMode
         )
         await MainActor.run {
-          self.persist(result.config, recoverySecret: result.recoverySecret)
+          self.persist(
+            result.config,
+            storedSecret: result.recoverySecret,
+            shouldShowSecretSavedToast: true
+          )
         }
       } catch {
         await MainActor.run {
@@ -246,23 +241,23 @@ final class NativeAuthSheetViewModel: ObservableObject {
     statusText = status
   }
 
-  private func persist(_ config: AppSessionConfig, recoverySecret: String?) {
+  private func persist(
+    _ config: AppSessionConfig,
+    storedSecret: String?,
+    shouldShowSecretSavedToast: Bool
+  ) {
+    if let storedSecret, !storedSecret.isEmpty {
+      _ = SecureKeyStore.shared.storeSecret(key: "loginSecret", value: storedSecret)
+    }
     AppSessionConfig.store(config)
+    AppProfileController.shared.reset()
     Task.detached {
       await PacketBootstrapService.prefetchIfNeeded(config: config)
     }
-
-    guard let recoverySecret else {
-      finishAuthenticatedFlow()
-      return
+    if shouldShowSecretSavedToast {
+      AppToastController.shared.show("Secret key saved in Settings > Secret Key.")
     }
-
-    setLoading(false, status: nil)
-    activeAlert = AuthSheetAlert(
-      title: "Secret Key",
-      message: recoverySecret,
-      kind: .recovery(secret: recoverySecret)
-    )
+    finishAuthenticatedFlow()
   }
 
   private func finishAuthenticatedFlow() {
@@ -284,10 +279,10 @@ struct NativeAuthSheetView: View {
   @ObservedObject var model: NativeAuthSheetViewModel
 
   var body: some View {
-    NavigationView {
+    NavigationStack {
       VStack(spacing: 0) {
         ScrollView(showsIndicators: false) {
-          VStack(spacing: 24) {
+          VStack(spacing: 20) {
             VStack(alignment: .leading, spacing: 8) {
               Text(model.mode.titleText)
                 .font(.system(size: 28, weight: .bold))
@@ -322,26 +317,23 @@ struct NativeAuthSheetView: View {
               }
             }
 
-            VStack {
-              if let statusText = model.statusText {
-                HStack(spacing: 10) {
-                  if model.isLoading {
-                    ProgressView()
-                      .tint(NativeAuthSheetTheme.text)
-                      .scaleEffect(0.9)
-                  }
-                  Text(statusText)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(NativeAuthSheetTheme.muted)
-                  Spacer()
+            if let statusText = model.statusText {
+              HStack(spacing: 10) {
+                if model.isLoading {
+                  ProgressView()
+                    .tint(NativeAuthSheetTheme.text)
+                    .scaleEffect(0.9)
                 }
-                .padding(12)
-                .background(NativeAuthSheetTheme.statusFill)
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                Text(statusText)
+                  .font(.system(size: 13, weight: .medium))
+                  .foregroundStyle(NativeAuthSheetTheme.muted)
+                Spacer()
               }
+              .padding(12)
+              .background(NativeAuthSheetTheme.statusFill)
+              .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+              .transition(.opacity.combined(with: .move(edge: .top)))
             }
-            .frame(height: 48)
-            .animation(.spring(response: 0.3, dampingFraction: 0.7), value: model.statusText)
 
             Button(action: model.submit) {
               HStack(spacing: 10) {
@@ -366,20 +358,18 @@ struct NativeAuthSheetView: View {
       .navigationTitle(model.mode.titleText)
       .navigationBarTitleDisplayMode(.inline)
       .toolbar {
-        ToolbarItem(placement: .navigationBarTrailing) {
+        ToolbarItem(placement: .topBarLeading) {
           Button {
             model.handleClose()
           } label: {
             Image(systemName: "xmark")
               .font(.system(size: 14, weight: .bold))
           }
-          .buttonStyle(NativeAuthDismissButtonStyle())
+          .buttonStyle(.plain)
           .disabled(model.isLoading)
         }
       }
-      .modifier(NativeAuthNavigationChrome())
     }
-    .navigationViewStyle(.stack)
     .interactiveDismissDisabled(model.isLoading)
     .alert(item: $model.activeAlert) { alert in
       model.handleAlert(alert)
@@ -500,40 +490,13 @@ private struct NativeAuthPrimaryButtonStyle: ButtonStyle {
   }
 }
 
-private struct NativeAuthDismissButtonStyle: ButtonStyle {
-  func makeBody(configuration: Configuration) -> some View {
-    configuration.label
-      .foregroundStyle(NativeAuthSheetTheme.text)
-      .frame(width: 32, height: 32)
-      .background(Color.clear)
-      .clipShape(Circle())
-      .opacity(configuration.isPressed ? 0.72 : 1.0)
-      .scaleEffect(configuration.isPressed ? 0.92 : 1.0)
-      .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
-  }
-}
-
-private struct NativeAuthNavigationChrome: ViewModifier {
-  func body(content: Content) -> some View {
-    if #available(iOS 16.0, *) {
-      content
-        .toolbarBackground(NativeAuthSheetTheme.sheetBackground, for: .navigationBar)
-        .toolbarBackground(.visible, for: .navigationBar)
-    } else {
-      content
-    }
-  }
-}
-
 private enum NativeAuthSheetTheme {
   static let controlHeight: CGFloat = 52
   static let controlCornerRadius: CGFloat = 26
 
   static let pageBackgroundUIColor = dynamicUIColor(light: hex(0xFFFFFF), dark: hex(0x1E1E1E))
-  static let sheetBackgroundUIColor = dynamicUIColor(light: hex(0xFFFFFF), dark: hex(0x1C1C1E))
 
   static var pageBackground: Color { Color(uiColor: pageBackgroundUIColor) }
-  static var sheetBackground: Color { Color(uiColor: sheetBackgroundUIColor) }
   static var text: Color { dynamicColor(light: hex(0x000000), dark: hex(0xF5F5F7)) }
   static var muted: Color { dynamicColor(light: hex(0x8E8E93), dark: hex(0x8E8E93)) }
   static var fieldText: Color { dynamicColor(light: hex(0x000000), dark: hex(0xF5F5F7)) }

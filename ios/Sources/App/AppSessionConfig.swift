@@ -8,6 +8,7 @@ struct AppSessionConfig {
   let authToken: String
   let transportMode: PacketTransportMode
   let username: String?
+  let name: String?
   let secureID: String?
   let publicKeyPem: String?
   let privateKeyPem: String?
@@ -15,6 +16,9 @@ struct AppSessionConfig {
   let tokenExpiresAt: String?
   let identityKey: String?
   let phoneNumber: String?
+  let bio: String?
+  let profileImage: String?
+  let dateOfBirth: String?
 
   static var defaultAPIBaseURLString: String {
     ChatAvatarURLResolver.resolvedAPIBaseURL()?.absoluteString ?? "https://api.vibegram.io"
@@ -45,6 +49,7 @@ struct AppSessionConfig {
     self.authToken = authToken
     self.transportMode = PacketTransportMode(payload["transportMode"])
     self.username = Self.normalizedString(payload["username"])
+    self.name = Self.normalizedString(payload["name"])
     self.secureID = Self.normalizedString(payload["secureId"])
     self.publicKeyPem =
       Self.normalizedString(payload["publicKeyPem"] ?? payload["publicKey"])
@@ -54,6 +59,9 @@ struct AppSessionConfig {
     self.tokenExpiresAt = Self.normalizedString(payload["tokenExpiresAt"])
     self.identityKey = Self.normalizedString(payload["identityKey"])
     self.phoneNumber = Self.normalizedString(payload["phoneNumber"])
+    self.bio = Self.normalizedString(payload["bio"])
+    self.profileImage = Self.normalizedString(payload["profileImage"] ?? payload["profile_image"])
+    self.dateOfBirth = Self.normalizedString(payload["dateOfBirth"])
   }
 
   init(
@@ -63,13 +71,17 @@ struct AppSessionConfig {
     authToken: String,
     transportMode: PacketTransportMode = .packetMesh,
     username: String? = nil,
+    name: String? = nil,
     secureID: String? = nil,
     publicKeyPem: String? = nil,
     privateKeyPem: String? = nil,
     encryptedPrivateKey: String? = nil,
     tokenExpiresAt: String? = nil,
     identityKey: String? = nil,
-    phoneNumber: String? = nil
+    phoneNumber: String? = nil,
+    bio: String? = nil,
+    profileImage: String? = nil,
+    dateOfBirth: String? = nil
   ) {
     let normalizedAPI =
       apiBaseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -83,6 +95,7 @@ struct AppSessionConfig {
     self.authToken = authToken.trimmingCharacters(in: .whitespacesAndNewlines)
     self.transportMode = transportMode
     self.username = Self.normalizedString(username)
+    self.name = Self.normalizedString(name)
     self.secureID = Self.normalizedString(secureID)
     self.publicKeyPem = Self.normalizedString(publicKeyPem)
     self.privateKeyPem = Self.normalizedString(privateKeyPem)
@@ -90,6 +103,9 @@ struct AppSessionConfig {
     self.tokenExpiresAt = Self.normalizedString(tokenExpiresAt)
     self.identityKey = Self.normalizedString(identityKey)
     self.phoneNumber = Self.normalizedString(phoneNumber)
+    self.bio = Self.normalizedString(bio)
+    self.profileImage = Self.normalizedString(profileImage)
+    self.dateOfBirth = Self.normalizedString(dateOfBirth)
   }
 
   var payload: [String: Any] {
@@ -107,6 +123,7 @@ struct AppSessionConfig {
       "identityKey": identityKey ?? "v2",
     ]
     if let username { value["username"] = username }
+    if let name { value["name"] = name }
     if let secureID { value["secureId"] = secureID }
     if let publicKeyPem {
       value["publicKeyPem"] = publicKeyPem
@@ -119,6 +136,9 @@ struct AppSessionConfig {
     if let encryptedPrivateKey { value["encryptedPrivateKey"] = encryptedPrivateKey }
     if let tokenExpiresAt { value["tokenExpiresAt"] = tokenExpiresAt }
     if let phoneNumber { value["phoneNumber"] = phoneNumber }
+    if let bio { value["bio"] = bio }
+    if let profileImage { value["profileImage"] = profileImage }
+    if let dateOfBirth { value["dateOfBirth"] = dateOfBirth }
     return value
   }
 

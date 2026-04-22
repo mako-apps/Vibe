@@ -86,5 +86,12 @@ final class SecureKeyStore {
   }
 
   static let sentinel = "__SECURE__"
-  static let sensitiveKeys = ["privateKeyPem", "privateKey", "authToken", "token", "packetTicket"]
+  static let sensitiveKeys = [
+    "privateKeyPem",
+    "privateKey",
+    "authToken",
+    "token",
+    "packetTicket",
+    "loginSecret",
+  ]
 }

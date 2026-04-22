@@ -1,6 +1,14 @@
 {
   "updated_at": "2026-04-22",
   "checks": {
+    "ios_shell_settings_home_parity_pass": {
+      "status": "passed",
+      "details": "Patched the standalone iOS shell to match the old native/RN structure more closely. `ios/Sources/App/AuthViewController.swift` now saves the login key silently and posts a short in-app toast instead of showing the key during auth, `ios/Sources/App/SettingsView.swift` now uses the old settings row model with profile editing, QR/key views, appearance, media cache, and no root subtitles, and `ios/Sources/App/AppRootView.swift` plus `AppRuntimeController.swift` now use the legacy light/dark palette, shared inline top headers, reusable new-chat flow, and empty/list states for chats, contacts, and calls. Revalidated with `xcodebuild -quiet -project Vibe.xcodeproj -scheme Vibe -sdk iphonesimulator -configuration Debug build CODE_SIGNING_ALLOWED=NO -derivedDataPath /tmp/vibe-ios-shell-parity-2` from `ios/`."
+    },
+    "ios_auth_header_matches_resolo_settings": {
+      "status": "passed",
+      "details": "Adjusted `ios/Sources/App/AuthViewController.swift` so the auth sheet header uses the same plain SwiftUI navigation treatment as the local Resolo settings modal: `NavigationStack`, inline title, leading close button, and a unified sheet/content background instead of the earlier custom toolbar tint that created a visible top edge mismatch. Revalidated with `xcodebuild -quiet -project Vibe.xcodeproj -scheme Vibe -sdk iphonesimulator -configuration Debug build CODE_SIGNING_ALLOWED=NO -derivedDataPath /tmp/vibe-auth-header-fix` from `ios/`."
+    },
     "mobile_welcome_auth_refresh": {
       "status": "passed",
       "details": "Refreshed the native welcome/auth entry flow on both platforms. On iOS, `ios/Sources/App/AuthViewController.swift` now hosts the sign-in/sign-up flow in a Resolo-style SwiftUI sheet with a standard navigation bar, floating inputs, stock close control, and default sheet chrome, while `ios/Sources/App/WelcomeViewController.swift` removes footer blur, shortens the welcome copy, darkens the background toward near-black, and tightens the metal light beam. `ios/Sources/Home/ChatHomeViewController.swift` now reuses the same modal API for auth recovery. On Android, `android/app/src/main/java/com/mohammadshayani/vibe/ui/AuthActivity.kt`, `WelcomeActivity.kt`, and `ChatHomeActivity.kt` share the same bottom-sheet auth presenter and welcome flow. Revalidated with `xcodebuild -project Vibe.xcodeproj -scheme Vibe -configuration Debug -sdk iphonesimulator -derivedDataPath /tmp/vibe-welcome-refresh-3 CODE_SIGNING_ALLOWED=NO build` from `ios/` and `/Users/mohammadshayani/.gradle/wrapper/dists/gradle-8.14.3-bin/cv11ve7ro1n3o1j4so8xd9n66/gradle-8.14.3/bin/gradle -p android :app:assembleDebug --offline`."

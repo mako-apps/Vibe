@@ -189,7 +189,7 @@ final class WelcomeViewController: UIViewController {
   private func presentAuth(mode: AuthViewController.Mode) {
     AuthViewController.present(from: self, mode: mode) { [weak self] in
       self?.navigationController?.setNavigationBarHidden(false, animated: false)
-      self?.navigationController?.setViewControllers([ChatHomeViewController()], animated: true)
+      AppRootControllerFactory.showAuthenticatedRoot()
     }
   }
 }
