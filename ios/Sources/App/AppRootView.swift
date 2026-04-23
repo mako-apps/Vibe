@@ -149,7 +149,7 @@ struct AppRootView: View {
   }
 
   var body: some View {
-    NavigationStack {
+    ZStack {
       TabView(selection: $coordinator.selectedTab) {
         ContactsRootView()
           .tabItem {
@@ -178,36 +178,43 @@ struct AppRootView: View {
       .tint(palette.accent)
       .background(palette.background.ignoresSafeArea())
       .toolbarBackground(.hidden, for: .tabBar)
-      .toolbar(.hidden, for: .navigationBar)
-      .navigationDestination(item: $coordinator.presentedChat) { presented in
-        ChatConversationScreen(route: presented.route) {
-          coordinator.closePresentedChat(requestID: presented.requestID)
+      .allowsHitTesting(coordinator.presentedChat == nil)
+      .zIndex(0)
+
+      if let presented = coordinator.presentedChat {
+        ZStack {
+          palette.background.ignoresSafeArea()
+          ChatConversationScreen(route: presented.route) {
+            coordinator.closePresentedChat(requestID: presented.requestID)
+          }
+          .ignoresSafeArea()
         }
-        .toolbar(.hidden, for: .navigationBar)
-        .toolbar(.hidden, for: .tabBar)
-        .ignoresSafeArea()
-      }
-      .onChange(of: coordinator.presentedChat?.requestID) { previousRequestID, _ in
-        if let presented = coordinator.presentedChat {
-          appShellRouteLog(
-            "AppRootView presentedChat changed requestId=\(presented.requestID) chatId=\(presented.route.chatId) title=\(presented.route.title)")
-        } else {
-          appShellRouteLog(
-            "AppRootView presentedChat cleared lastRequestId=\(previousRequestID.map(String.init) ?? "nil")")
-        }
-      }
-      .onAppear {
-        AppAppearanceController.applyStoredPreference()
-      }
-      .overlay(alignment: .bottom) {
-        if let message = toastController.message {
-          AppToastBanner(message: message, palette: palette)
-            .padding(.horizontal, 20)
-            .padding(.bottom, 30)
-            .transition(.move(edge: .bottom).combined(with: .opacity))
-        }
+        .id(presented.requestID)
+        .zIndex(1)
+        .transition(.move(edge: .trailing).combined(with: .opacity))
       }
     }
+    .onChange(of: coordinator.presentedChat?.requestID) { previousRequestID, _ in
+      if let presented = coordinator.presentedChat {
+        appShellRouteLog(
+          "AppRootView presentedChat changed requestId=\(presented.requestID) chatId=\(presented.route.chatId) title=\(presented.route.title)")
+      } else {
+        appShellRouteLog(
+          "AppRootView presentedChat cleared lastRequestId=\(previousRequestID.map(String.init) ?? "nil")")
+      }
+    }
+    .onAppear {
+      AppAppearanceController.applyStoredPreference()
+    }
+    .overlay(alignment: .bottom) {
+      if let message = toastController.message {
+        AppToastBanner(message: message, palette: palette)
+          .padding(.horizontal, 20)
+          .padding(.bottom, 30)
+          .transition(.move(edge: .bottom).combined(with: .opacity))
+      }
+    }
+    .animation(.easeInOut(duration: 0.22), value: coordinator.presentedChat?.requestID)
     .animation(.spring(response: 0.3, dampingFraction: 0.82), value: toastController.message)
     .environmentObject(coordinator)
   }
