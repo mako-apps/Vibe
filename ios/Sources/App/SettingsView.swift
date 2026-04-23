@@ -334,8 +334,14 @@ struct SettingsView: View {
   }
 
   private func openSavedMessages() {
+    let cachedRows = ChatEngine.shared.getChatRows(["chatId": "saved_messages"])
+    NSLog(
+      "[AppShellRoute] SettingsView openSavedMessages cachedRows=%d currentTab=%@",
+      cachedRows.count,
+      String(describing: coordinator.selectedTab)
+    )
     coordinator.openChat(
-      .savedMessages(initialRows: ChatEngine.shared.getChatRows(["chatId": "saved_messages"]))
+      .savedMessages(initialRows: cachedRows)
     )
   }
 }

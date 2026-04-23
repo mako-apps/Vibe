@@ -990,6 +990,13 @@ final class ChatEngine {
         }
         let nextCount = (openChatChannels[chatId] ?? 0) + 1
         openChatChannels[chatId] = nextCount
+        NSLog(
+          "[ChatEngine][Route] openChatChannel chatId=%@ peerUserId=%@ count=%d savedMessages=%@",
+          chatId,
+          peerUserIdHint ?? "",
+          nextCount,
+          chatId == "saved_messages" ? "Y" : "N"
+        )
         joinNativeChatTopicIfNeededLocked(chatId: chatId)
         // Eagerly fetch history so messages appear instantly when the chat view renders.
         loadChatHistoryIfNeededLocked(chatId: chatId)
@@ -5234,8 +5241,12 @@ final class ChatEngine {
     // Always start HTTP history fetch immediately — do NOT gate behind socket state.
     // This ensures messages load fast even before WebSocket is connected.
     loadChatHistoryIfNeededLocked(chatId: chatId)
-    guard chatId != "saved_messages" else { return }
+    guard chatId != "saved_messages" else {
+      NSLog("[ChatEngine][Route] skip realtime join for saved_messages")
+      return
+    }
     guard let client = phoenixClient else {
+      NSLog("[ChatEngine][Route] joinNativeChatTopic deferred chatId=%@ reason=no_socket", chatId)
       scheduleReconnectLocked(reason: "join_chat_no_socket")
       DispatchQueue.global(qos: .utility).async { [weak self] in
         self?.ensureNativeTransport(trigger: "join_chat_no_socket")
@@ -5243,6 +5254,7 @@ final class ChatEngine {
       return
     }
     guard state["connected"] as? Bool == true else {
+      NSLog("[ChatEngine][Route] joinNativeChatTopic deferred chatId=%@ reason=not_connected", chatId)
       scheduleReconnectLocked(reason: "join_chat_not_connected")
       DispatchQueue.global(qos: .utility).async { [weak self] in
         self?.ensureNativeTransport(trigger: "join_chat_not_connected")
@@ -5251,6 +5263,7 @@ final class ChatEngine {
     }
     if nativeJoinedChatIds.contains(chatId) { return }
     if nativeChatJoinRefsByRef.values.contains(chatId) { return }
+    NSLog("[ChatEngine][Route] joinNativeChatTopic start chatId=%@", chatId)
     let ref = client.join(topic: chatTopic(for: chatId), payload: [:])
     nativeChatJoinRefsByRef[ref] = chatId
     appendJournalLocked(event: "native-chat-join-start", payload: ["chatId": chatId, "ref": ref])

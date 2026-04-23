@@ -1,6 +1,10 @@
 import SwiftUI
 import UIKit
 
+private func appShellRouteLog(_ message: String) {
+  NSLog("[AppShellRoute] %@", message)
+}
+
 enum AppShellTab: Hashable {
   case contacts
   case calls
@@ -70,8 +74,12 @@ struct ChatRoute: Identifiable, Hashable {
 final class AppShellCoordinator: ObservableObject {
   @Published var selectedTab: AppShellTab = .chats
   @Published var pendingChatRoute: ChatRoute?
+  @Published var pendingChatRequestID: Int = 0
 
   func openChat(_ route: ChatRoute) {
+    pendingChatRequestID &+= 1
+    appShellRouteLog(
+      "openChat requested requestId=\(pendingChatRequestID) chatId=\(route.chatId) title=\(route.title) fromTab=\(selectedTab)")
     selectedTab = .chats
     pendingChatRoute = route
   }
@@ -326,9 +334,13 @@ private struct ChatsRootView: View {
       .task {
         await model.loadIfNeeded()
       }
-      .onChange(of: coordinator.pendingChatRoute?.chatId) {
+      .onChange(of: coordinator.pendingChatRequestID) {
         guard let route = coordinator.pendingChatRoute else { return }
+        appShellRouteLog(
+          "ChatsRootView pending route observed requestId=\(coordinator.pendingChatRequestID) chatId=\(route.chatId) title=\(route.title) existingPathCount=\(path.count)")
         path = [route]
+        appShellRouteLog(
+          "ChatsRootView path replaced requestId=\(coordinator.pendingChatRequestID) chatId=\(route.chatId) newPathCount=\(path.count)")
         coordinator.pendingChatRoute = nil
         Task {
           await model.refresh()
@@ -596,10 +608,14 @@ private struct ChatConversationScreen: UIViewControllerRepresentable {
   let route: ChatRoute
 
   func makeUIViewController(context: Context) -> ChatConversationController {
-    ChatConversationController(route: route, isDark: colorScheme == .dark)
+    appShellRouteLog(
+      "makeUIViewController chatId=\(route.chatId) title=\(route.title) dark=\(colorScheme == .dark)")
+    return ChatConversationController(route: route, isDark: colorScheme == .dark)
   }
 
   func updateUIViewController(_ uiViewController: ChatConversationController, context: Context) {
+    appShellRouteLog(
+      "updateUIViewController chatId=\(route.chatId) title=\(route.title) dark=\(colorScheme == .dark)")
     uiViewController.update(route: route, isDark: colorScheme == .dark)
   }
 }
@@ -621,6 +637,8 @@ private final class ChatConversationController: UIViewController {
   init(route: ChatRoute, isDark: Bool) {
     self.route = route
     self.isDark = isDark
+    appShellRouteLog(
+      "ChatConversationController init chatId=\(route.chatId) title=\(route.title) dark=\(isDark)")
     super.init(nibName: nil, bundle: nil)
   }
 
@@ -631,6 +649,7 @@ private final class ChatConversationController: UIViewController {
   override func viewDidLoad() {
     super.viewDidLoad()
     view.backgroundColor = .clear
+    logLifecycle("viewDidLoad")
 
     mainView.translatesAutoresizingMaskIntoConstraints = false
     view.addSubview(mainView)
@@ -657,9 +676,11 @@ private final class ChatConversationController: UIViewController {
 
   override func viewDidAppear(_ animated: Bool) {
     super.viewDidAppear(animated)
+    logLifecycle("viewDidAppear")
     guard !didInitialScroll else { return }
     didInitialScroll = true
     DispatchQueue.main.async { [weak self] in
+      self?.logLifecycle("initialScrollToBottom")
       self?.mainView.scrollToBottom(animated: false)
     }
   }
@@ -676,6 +697,8 @@ private final class ChatConversationController: UIViewController {
   func update(route: ChatRoute, isDark: Bool) {
     let chatChanged = self.route.chatId != route.chatId
     let themeChanged = self.isDark != isDark
+    appShellRouteLog(
+      "ChatConversationController update oldChatId=\(self.route.chatId) newChatId=\(route.chatId) chatChanged=\(chatChanged) themeChanged=\(themeChanged)")
     self.route = route
     self.isDark = isDark
     applyRoute(forceChannelRefresh: chatChanged)
@@ -687,6 +710,8 @@ private final class ChatConversationController: UIViewController {
   private func applyRoute(forceChannelRefresh: Bool) {
     view.backgroundColor = Self.backgroundColor(isDark: isDark)
     currentPage = .chat
+    appShellRouteLog(
+      "ChatConversationController applyRoute chatId=\(route.chatId) title=\(route.title) forceRefresh=\(forceChannelRefresh) initialRows=\(route.initialRows.count)")
 
     let surfaceId = "native_chat_\(route.chatId)"
     mainView.surfaceId = surfaceId
@@ -724,6 +749,8 @@ private final class ChatConversationController: UIViewController {
 
   private func openChatChannelIfNeeded() {
     guard openedChatId != route.chatId else { return }
+    appShellRouteLog(
+      "ChatConversationController openChatChannel chatId=\(route.chatId) peerUserId=\(route.peerUserId ?? "")")
     _ = ChatEngine.shared.openChatChannel([
       "chatId": route.chatId,
       "peerUserId": route.peerUserId ?? "",
@@ -733,12 +760,16 @@ private final class ChatConversationController: UIViewController {
 
   private func closeOpenedChatChannel() {
     guard let openedChatId else { return }
+    appShellRouteLog("ChatConversationController closeChatChannel chatId=\(openedChatId)")
     _ = ChatEngine.shared.closeChatChannel(["chatId": openedChatId])
     self.openedChatId = nil
   }
 
   private func refreshRows() {
-    mainView.setRows(Self.resolvedRows(for: route))
+    let rows = Self.resolvedRows(for: route)
+    appShellRouteLog(
+      "ChatConversationController refreshRows chatId=\(route.chatId) rows=\(rows.count)")
+    mainView.setRows(rows)
   }
 
   private func refreshHeaderState() {
@@ -749,6 +780,8 @@ private final class ChatConversationController: UIViewController {
 
   private func handleNativeEvent(_ payload: [String: Any]) {
     let type = Self.normalizedString(payload["type"]) ?? ""
+    appShellRouteLog(
+      "ChatConversationController nativeEvent chatId=\(route.chatId) type=\(type) payloadKeys=\(payload.keys.sorted())")
     switch type {
     case "headerBack":
       switch currentPage {
@@ -786,6 +819,8 @@ private final class ChatConversationController: UIViewController {
 
     let changedChatId = Self.normalizedString(notification.userInfo?["chatId"])
     guard changedChatId == route.chatId || changedChatId == nil else { return }
+    appShellRouteLog(
+      "ChatConversationController engineChanged routeChatId=\(route.chatId) changedChatId=\(changedChatId ?? "nil") reason=\(Self.normalizedString(notification.userInfo?["reason"]) ?? "unknown")")
 
     refreshHeaderState()
 
@@ -830,6 +865,18 @@ private final class ChatConversationController: UIViewController {
       return label
     }
     return route.peerUserId == nil ? "" : "last seen recently"
+  }
+
+  private func logLifecycle(_ event: String) {
+    let navCount = navigationController?.viewControllers.count ?? 0
+    let navTypes =
+      navigationController?.viewControllers.map { String(describing: type(of: $0)) }
+      .joined(separator: " > ") ?? "nil"
+    let rootType = view.window?.rootViewController.map { String(describing: type(of: $0)) } ?? "nil"
+    let parentType = parent.map { String(describing: type(of: $0)) } ?? "nil"
+    let presentedType = presentingViewController.map { String(describing: type(of: $0)) } ?? "nil"
+    appShellRouteLog(
+      "ChatConversationController \(event) chatId=\(route.chatId) navCount=\(navCount) nav=\(navTypes) parent=\(parentType) root=\(rootType) presentedBy=\(presentedType)")
   }
 
   private static func profileHandle(for route: ChatRoute) -> String {

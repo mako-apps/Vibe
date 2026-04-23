@@ -1,6 +1,10 @@
 {
   "updated_at": "2026-04-23",
   "checks": {
+    "ios_saved_messages_route_logging": {
+      "status": "passed",
+      "details": "Added targeted Xcode-console route logging for the still-broken standalone iOS `Saved Messages` path. `ios/Sources/App/AppRootView.swift` now logs coordinator open requests, route request ids, chats-path replacement, `ChatConversationScreen` creation/update, and `ChatConversationController` lifecycle/apply/native-event/engine-change flow with navigation/root-controller context. `ios/Sources/App/SettingsView.swift` logs the settings-row tap, and `ios/ChatModule/ChatEngine.swift` logs chat-channel open/join behavior including the `saved_messages` realtime-skip path. The pass also changes the pending-route trigger from `chatId` to a monotonically increasing request id so reopening the same chat id cannot be dropped. Revalidated with `xcodebuild -quiet -project Vibe.xcodeproj -scheme Vibe -sdk iphonesimulator -configuration Debug build CODE_SIGNING_ALLOWED=NO -derivedDataPath /tmp/vibe-saved-messages-route-logs` from `ios/`."
+    },
     "ios_saved_messages_realtime_and_safe_area_followup": {
       "status": "passed",
       "details": "Fixed the next standalone iOS follow-up where `Saved Messages` was still being treated like a realtime Phoenix chat. `ios/ChatModule/ChatEngine.swift` now refuses to create realtime demand or join a native chat topic for `saved_messages`, keeping that path HTTP-only, while `ios/ChatModule/ChatListView.swift` sharply reduces the top/bottom wallpaper edge overlays and disables the extra blur that was reading as safe-area bands. `ios/Sources/App/AppRootView.swift` also hides the tab bar background again and `ios/Sources/App/SettingsView.swift` now lets the native settings host extend through the container safe areas. Revalidated with `xcodebuild -quiet -project Vibe.xcodeproj -scheme Vibe -sdk iphonesimulator -configuration Debug build CODE_SIGNING_ALLOWED=NO -derivedDataPath /tmp/vibe-saved-messages-safe-area-fix` from `ios/`."
