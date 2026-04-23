@@ -70,18 +70,34 @@ struct ChatRoute: Identifiable, Hashable {
   }
 }
 
+struct PresentedChatRoute: Identifiable {
+  let requestID: Int
+  let route: ChatRoute
+
+  var id: Int { requestID }
+}
+
 @MainActor
 final class AppShellCoordinator: ObservableObject {
   @Published var selectedTab: AppShellTab = .chats
-  @Published var pendingChatRoute: ChatRoute?
-  @Published var pendingChatRequestID: Int = 0
+  @Published var presentedChat: PresentedChatRoute?
+  @Published var chatOpenRequestID: Int = 0
 
   func openChat(_ route: ChatRoute) {
-    pendingChatRequestID &+= 1
+    chatOpenRequestID &+= 1
     appShellRouteLog(
-      "openChat requested requestId=\(pendingChatRequestID) chatId=\(route.chatId) title=\(route.title) fromTab=\(selectedTab)")
-    selectedTab = .chats
-    pendingChatRoute = route
+      "openChat requested requestId=\(chatOpenRequestID) chatId=\(route.chatId) title=\(route.title) fromTab=\(selectedTab)")
+    presentedChat = PresentedChatRoute(requestID: chatOpenRequestID, route: route)
+  }
+
+  func closePresentedChat(requestID: Int? = nil) {
+    guard let presentedChat else { return }
+    if let requestID, presentedChat.requestID != requestID {
+      return
+    }
+    appShellRouteLog(
+      "closeChat requested requestId=\(presentedChat.requestID) chatId=\(presentedChat.route.chatId) title=\(presentedChat.route.title)")
+    self.presentedChat = nil
   }
 }
 
@@ -133,47 +149,67 @@ struct AppRootView: View {
   }
 
   var body: some View {
-    TabView(selection: $coordinator.selectedTab) {
-      ContactsRootView()
-        .tabItem {
-          Label("Contacts", systemImage: "person.2")
-        }
-        .tag(AppShellTab.contacts)
+    NavigationStack {
+      TabView(selection: $coordinator.selectedTab) {
+        ContactsRootView()
+          .tabItem {
+            Label("Contacts", systemImage: "person.2")
+          }
+          .tag(AppShellTab.contacts)
 
-      CallsRootView()
-        .tabItem {
-          Label("Calls", systemImage: "phone")
-        }
-        .tag(AppShellTab.calls)
+        CallsRootView()
+          .tabItem {
+            Label("Calls", systemImage: "phone")
+          }
+          .tag(AppShellTab.calls)
 
-      ChatsRootView()
-        .tabItem {
-          Label("Chats", systemImage: "message")
-        }
-        .tag(AppShellTab.chats)
+        ChatsRootView()
+          .tabItem {
+            Label("Chats", systemImage: "message")
+          }
+          .tag(AppShellTab.chats)
 
-      SettingsRootView()
-        .tabItem {
-          Label("Settings", systemImage: "gearshape")
+        SettingsRootView()
+          .tabItem {
+            Label("Settings", systemImage: "gearshape")
+          }
+          .tag(AppShellTab.settings)
+      }
+      .tint(palette.accent)
+      .background(palette.background.ignoresSafeArea())
+      .toolbarBackground(.hidden, for: .tabBar)
+      .toolbar(.hidden, for: .navigationBar)
+      .navigationDestination(item: $coordinator.presentedChat) { presented in
+        ChatConversationScreen(route: presented.route) {
+          coordinator.closePresentedChat(requestID: presented.requestID)
         }
-        .tag(AppShellTab.settings)
-    }
-    .tint(palette.accent)
-    .background(palette.background.ignoresSafeArea())
-    .toolbarBackground(.hidden, for: .tabBar)
-    .environmentObject(coordinator)
-    .onAppear {
-      AppAppearanceController.applyStoredPreference()
-    }
-    .overlay(alignment: .bottom) {
-      if let message = toastController.message {
-        AppToastBanner(message: message, palette: palette)
-          .padding(.horizontal, 20)
-          .padding(.bottom, 30)
-          .transition(.move(edge: .bottom).combined(with: .opacity))
+        .toolbar(.hidden, for: .navigationBar)
+        .toolbar(.hidden, for: .tabBar)
+        .ignoresSafeArea()
+      }
+      .onChange(of: coordinator.presentedChat?.requestID) { previousRequestID, _ in
+        if let presented = coordinator.presentedChat {
+          appShellRouteLog(
+            "AppRootView presentedChat changed requestId=\(presented.requestID) chatId=\(presented.route.chatId) title=\(presented.route.title)")
+        } else {
+          appShellRouteLog(
+            "AppRootView presentedChat cleared lastRequestId=\(previousRequestID.map(String.init) ?? "nil")")
+        }
+      }
+      .onAppear {
+        AppAppearanceController.applyStoredPreference()
+      }
+      .overlay(alignment: .bottom) {
+        if let message = toastController.message {
+          AppToastBanner(message: message, palette: palette)
+            .padding(.horizontal, 20)
+            .padding(.bottom, 30)
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
       }
     }
     .animation(.spring(response: 0.3, dampingFraction: 0.82), value: toastController.message)
+    .environmentObject(coordinator)
   }
 }
 
@@ -234,7 +270,6 @@ private struct ChatsRootView: View {
   @EnvironmentObject private var coordinator: AppShellCoordinator
   @Environment(\.colorScheme) private var colorScheme
   @StateObject private var model = ChatsViewModel()
-  @State private var path: [ChatRoute] = []
   @State private var isShowingSearch = false
   @State private var isShowingStorySheet = false
   @State private var isStartingChat = false
@@ -264,7 +299,7 @@ private struct ChatsRootView: View {
   }
 
   var body: some View {
-    NavigationStack(path: $path) {
+    NavigationStack {
       Group {
         if model.rows.isEmpty && model.isLoading {
           ProgressView()
@@ -283,9 +318,12 @@ private struct ChatsRootView: View {
         } else {
           List {
             ForEach(model.rows, id: \.chatId) { row in
-              NavigationLink(value: ChatRoute(row: row)) {
+              Button {
+                coordinator.openChat(ChatRoute(row: row))
+              } label: {
                 ChatHomeRowView(row: row, palette: palette)
               }
+              .buttonStyle(.plain)
               .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
               .listRowSeparator(.hidden)
               .listRowBackground(Color.clear)
@@ -299,11 +337,6 @@ private struct ChatsRootView: View {
       .background(palette.background.ignoresSafeArea())
       .navigationBarTitleDisplayMode(.inline)
       .toolbarBackground(.hidden, for: .navigationBar)
-      .navigationDestination(for: ChatRoute.self) { route in
-        ChatConversationScreen(route: route)
-          .toolbar(.hidden, for: .navigationBar)
-          .toolbar(.hidden, for: .tabBar)
-      }
       .toolbar {
         ToolbarItem(placement: .topBarLeading) {
           EditButton()
@@ -333,18 +366,6 @@ private struct ChatsRootView: View {
       }
       .task {
         await model.loadIfNeeded()
-      }
-      .onChange(of: coordinator.pendingChatRequestID) {
-        guard let route = coordinator.pendingChatRoute else { return }
-        appShellRouteLog(
-          "ChatsRootView pending route observed requestId=\(coordinator.pendingChatRequestID) chatId=\(route.chatId) title=\(route.title) existingPathCount=\(path.count)")
-        path = [route]
-        appShellRouteLog(
-          "ChatsRootView path replaced requestId=\(coordinator.pendingChatRequestID) chatId=\(route.chatId) newPathCount=\(path.count)")
-        coordinator.pendingChatRoute = nil
-        Task {
-          await model.refresh()
-        }
       }
       .sheet(isPresented: $isShowingSearch) {
         if let config = AppSessionConfig.current {
@@ -401,7 +422,7 @@ private struct ChatsRootView: View {
 
     do {
       let result = try await ChatDirectMessageService.startChat(config: config, friendID: user.userID)
-      path = [
+      coordinator.openChat(
         ChatRoute(
           chatId: result.chatID,
           title: user.username,
@@ -415,7 +436,7 @@ private struct ChatsRootView: View {
           isGroup: false,
           initialRows: result.messages
         )
-      ]
+      )
       await model.refresh()
     } catch {
       errorMessage = error.localizedDescription
@@ -606,17 +627,18 @@ private struct CallsPageView: View {
 private struct ChatConversationScreen: UIViewControllerRepresentable {
   @Environment(\.colorScheme) private var colorScheme
   let route: ChatRoute
+  var onClose: (() -> Void)?
 
   func makeUIViewController(context: Context) -> ChatConversationController {
     appShellRouteLog(
       "makeUIViewController chatId=\(route.chatId) title=\(route.title) dark=\(colorScheme == .dark)")
-    return ChatConversationController(route: route, isDark: colorScheme == .dark)
+    return ChatConversationController(route: route, isDark: colorScheme == .dark, onClose: onClose)
   }
 
   func updateUIViewController(_ uiViewController: ChatConversationController, context: Context) {
     appShellRouteLog(
       "updateUIViewController chatId=\(route.chatId) title=\(route.title) dark=\(colorScheme == .dark)")
-    uiViewController.update(route: route, isDark: colorScheme == .dark)
+    uiViewController.update(route: route, isDark: colorScheme == .dark, onClose: onClose)
   }
 }
 
@@ -630,13 +652,15 @@ private final class ChatConversationController: UIViewController {
   private let mainView = ChatMainView()
   private var route: ChatRoute
   private var isDark: Bool
+  private var onClose: (() -> Void)?
   private var currentPage: ChatConversationPage = .chat
   private var openedChatId: String?
   private var didInitialScroll = false
 
-  init(route: ChatRoute, isDark: Bool) {
+  init(route: ChatRoute, isDark: Bool, onClose: (() -> Void)?) {
     self.route = route
     self.isDark = isDark
+    self.onClose = onClose
     appShellRouteLog(
       "ChatConversationController init chatId=\(route.chatId) title=\(route.title) dark=\(isDark)")
     super.init(nibName: nil, bundle: nil)
@@ -694,13 +718,14 @@ private final class ChatConversationController: UIViewController {
     closeOpenedChatChannel()
   }
 
-  func update(route: ChatRoute, isDark: Bool) {
+  func update(route: ChatRoute, isDark: Bool, onClose: (() -> Void)?) {
     let chatChanged = self.route.chatId != route.chatId
     let themeChanged = self.isDark != isDark
     appShellRouteLog(
       "ChatConversationController update oldChatId=\(self.route.chatId) newChatId=\(route.chatId) chatChanged=\(chatChanged) themeChanged=\(themeChanged)")
     self.route = route
     self.isDark = isDark
+    self.onClose = onClose
     applyRoute(forceChannelRefresh: chatChanged)
     if themeChanged {
       mainView.setAppearance(Self.resolvedAppearance(isDark: isDark))
@@ -786,7 +811,12 @@ private final class ChatConversationController: UIViewController {
     case "headerBack":
       switch currentPage {
       case .chat:
-        navigationController?.popViewController(animated: true)
+        if let onClose {
+          appShellRouteLog("ChatConversationController dismissPresented chatId=\(route.chatId)")
+          onClose()
+        } else if let navigationController {
+          navigationController.popViewController(animated: true)
+        }
       case .profile:
         currentPage = .chat
         mainView.setPage(ChatConversationPage.chat.rawValue, animated: true)
