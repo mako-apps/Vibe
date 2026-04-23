@@ -75,7 +75,7 @@ class WelcomeActivity : AppCompatActivity() {
     val titleView = TextView(this).apply {
       text = "Vibe"
       setTextColor(palette.primaryTextColor)
-      setTextSize(TypedValue.COMPLEX_UNIT_SP, 58f)
+      setTextSize(TypedValue.COMPLEX_UNIT_SP, 60f)
       typeface = android.graphics.Typeface.create("sans-serif-black", android.graphics.Typeface.NORMAL)
       gravity = Gravity.START
     }
@@ -88,7 +88,7 @@ class WelcomeActivity : AppCompatActivity() {
     )
 
     val subtitleView = TextView(this).apply {
-      text = "Private chat, clear focus."
+      text = "Private chat, lit with focus."
       setTextColor(palette.primaryTextColor)
       setTextSize(TypedValue.COMPLEX_UNIT_SP, 30f)
       typeface = android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL)
@@ -106,7 +106,7 @@ class WelcomeActivity : AppCompatActivity() {
     )
 
     val detailsView = TextView(this).apply {
-      text = "Use your secret key to return, or create a new identity in seconds."
+      text = "Return with your secret key or start a new identity."
       setTextColor(palette.secondaryTextColor)
       setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
       typeface = android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL)

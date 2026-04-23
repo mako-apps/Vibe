@@ -195,9 +195,9 @@ internal object AuthSheetPresenter {
       TextView(activity).apply {
         text =
           if (mode == AuthActivity.Mode.SIGN_IN) {
-            "Enter your secret key to unlock the identity you already trust."
+            "Use your secret key to unlock your identity."
           } else {
-            "Choose a username and we will generate a private secret key for you."
+            "Choose a username and create a private identity."
           }
         textSize = 15f
         setTextColor(palette.secondaryTextColor)
@@ -233,9 +233,9 @@ internal object AuthSheetPresenter {
       }
     inputLayout.addView(
       inputField,
-      ViewGroup.LayoutParams(
-        ViewGroup.LayoutParams.MATCH_PARENT,
-        ViewGroup.LayoutParams.WRAP_CONTENT,
+      LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT,
+        LinearLayout.LayoutParams.WRAP_CONTENT,
       ),
     )
     stack.addView(inputLayout)
@@ -327,7 +327,7 @@ internal object AuthSheetPresenter {
           return@setOnClickListener
         }
         inputLayout.error = null
-        setLoading(true, "Generating key")
+        setLoading(true, "Generating Keys")
         Thread {
           runCatching {
             NativeAuthService.signUp(activity.applicationContext, username)
