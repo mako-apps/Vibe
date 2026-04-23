@@ -1,6 +1,14 @@
 {
   "updated_at": "2026-04-23",
   "checks": {
+    "ios_root_level_chat_route": {
+      "status": "passed",
+      "details": "Fixed the remaining standalone iOS app-shell chat presentation regression exposed by `Saved Messages` from `Settings`. `ios/Sources/App/AppRootView.swift` still avoids the crashing root `NavigationStack(path:)` approach, but it now presents `ChatConversationScreen` from the app root via `fullScreenCover(item:)` instead of the inline `ZStack` overlay, records the source tab on `PresentedChatRoute`, switches the underlying tab to `Chats` while opening, and restores the original tab when the chat closes. `ChatsRootView` rows and the settings `Saved Messages` row both still reuse `coordinator.openChat(...)`, so the route no longer depends on the settings host remaining visible during presentation. Revalidated with `xcodebuild -quiet -project Vibe.xcodeproj -scheme Vibe -destination 'generic/platform=iOS' -configuration Debug build CODE_SIGNING_ALLOWED=NO -derivedDataPath /tmp/vibe-saved-messages-cover-fix` from `ios/`."
+    },
+    "native_app_icon_assets": {
+      "status": "passed",
+      "details": "Added a real iOS `AppIcon` asset catalog under `ios/App/Assets.xcassets/AppIcon.appiconset`, registered it in `ios/Vibe.xcodeproj/project.pbxproj`, generated Android launcher icons from `ios/App/logo.PNG` into `android/app/src/main/res/mipmap-*`, and updated `android/app/src/main/AndroidManifest.xml` to use `@mipmap/ic_launcher` plus `@mipmap/ic_launcher_round`. Revalidated with `xcodebuild -project Vibe.xcodeproj -scheme Vibe -sdk iphonesimulator -configuration Debug build CODE_SIGNING_ALLOWED=NO -derivedDataPath /tmp/vibe-app-icon-ios` from `ios/` and `/Users/mohammadshayani/.gradle/wrapper/dists/gradle-8.14.3-bin/cv11ve7ro1n3o1j4so8xd9n66/gradle-8.14.3/bin/gradle -p android :app:assembleDebug --offline` from repo root."
+    },
     "ios_saved_messages_route_logging": {
       "status": "passed",
       "details": "Added targeted Xcode-console route logging for the still-broken standalone iOS `Saved Messages` path. `ios/Sources/App/AppRootView.swift` now logs coordinator open requests, route request ids, chats-path replacement, `ChatConversationScreen` creation/update, and `ChatConversationController` lifecycle/apply/native-event/engine-change flow with navigation/root-controller context. `ios/Sources/App/SettingsView.swift` logs the settings-row tap, and `ios/ChatModule/ChatEngine.swift` logs chat-channel open/join behavior including the `saved_messages` realtime-skip path. The pass also changes the pending-route trigger from `chatId` to a monotonically increasing request id so reopening the same chat id cannot be dropped. Revalidated with `xcodebuild -quiet -project Vibe.xcodeproj -scheme Vibe -sdk iphonesimulator -configuration Debug build CODE_SIGNING_ALLOWED=NO -derivedDataPath /tmp/vibe-saved-messages-route-logs` from `ios/`."

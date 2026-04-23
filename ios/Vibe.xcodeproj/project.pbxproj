@@ -39,6 +39,7 @@
 		64C59B622685F652AAA63712 /* ChatHomeService.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE295B6B9A24463008A3BDD7 /* ChatHomeService.swift */; };
 		6605AF1B777E5C5175EAC7C4 /* music_transparent.png in Resources */ = {isa = PBXBuildFile; fileRef = 0FB52D6DA56B715F0ECBAA1A /* music_transparent.png */; };
 		683582D9C9F84639B98D703C /* emoji_smiley.json in Resources */ = {isa = PBXBuildFile; fileRef = 2A807413F9FE37BB526E8A7F /* emoji_smiley.json */; };
+		F0A1C8B31122334455667788 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = F0A1C8B31122334455667789 /* Assets.xcassets */; };
 		696525CD3BDEA5259BA86242 /* AppRuntimeController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 72719CE25DE39CA3F5858805 /* AppRuntimeController.swift */; };
 		6BC6D2607F140F8237049F8B /* ChatPacketTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = E422BC03268AFC7C9B284AC0 /* ChatPacketTransport.swift */; };
 		736D59420211BFFC98A86C40 /* MusicPlayerEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0528A65C97D89BCD72F146B8 /* MusicPlayerEngine.swift */; };
@@ -118,6 +119,7 @@
 		4589748480CA580517B41F11 /* Packet-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Packet-Bridging-Header.h"; sourceTree = "<group>"; };
 		4A3A1CDF7DBF700016F18E53 /* ChatMainProfileActionNode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatMainProfileActionNode.swift; sourceTree = "<group>"; };
 		4F972FE279A51AF4B02E8FDE /* ChatImageEditModule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatImageEditModule.swift; sourceTree = "<group>"; };
+		F0A1C8B31122334455667789 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		5313D3693EED4E59300EF584 /* PacketBootstrapService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PacketBootstrapService.swift; sourceTree = "<group>"; };
 		5467C6795E5CC738709C5F60 /* LottieCompat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LottieCompat.swift; sourceTree = "<group>"; };
 		598820A81E18CB2FB2212BB9 /* VibeCallStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VibeCallStore.swift; sourceTree = "<group>"; };
@@ -247,6 +249,7 @@
 			children = (
 				C849E2FC04325A33DBD9A9D5 /* AppDelegate.swift */,
 				1E631A9B333888CF20B307A9 /* Info.plist */,
+				F0A1C8B31122334455667789 /* Assets.xcassets */,
 			);
 			path = App;
 			sourceTree = "<group>";
@@ -429,6 +432,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				F0A1C8B31122334455667788 /* Assets.xcassets in Resources */,
 				D577876741A5C609C52D6F85 /* animals_transparent.png in Resources */,
 				AA81ECC978071DA754A17B4F /* cat_loader.json in Resources */,
 				7AE21E9D3ECA9E216CC9C307 /* cat_love.json in Resources */,
