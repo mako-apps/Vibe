@@ -27,6 +27,12 @@ targets:
     sources:
       - path: App
       - path: Sources
+      - path: ChatModule
+        excludes:
+          - ChatAgentView.swift
+          - ChatHomeListView.swift
+          - ChatProfileMainView.swift
+          - VibeCallUiCoordinator.swift
     info:
       path: App/Info.plist
       properties:

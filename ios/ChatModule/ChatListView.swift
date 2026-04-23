@@ -1,11 +1,22 @@
 import AVFoundation
 import AVKit
-import ExpoModulesCore
 import QuickLook
 import UIKit
 
 private let chatListMediaVerboseDebugLogs = false
 private let chatListInlineVideoVerboseDebugLogs = false
+
+public final class NativeEventDispatcher {
+  public var handler: (([String: Any]) -> Void)?
+
+  public init(handler: (([String: Any]) -> Void)? = nil) {
+    self.handler = handler
+  }
+
+  public func callAsFunction(_ payload: [String: Any]) {
+    handler?(payload)
+  }
+}
 
 private func chatListDebugLog(_ enabled: Bool, _ format: String, _ args: CVarArg...) {
   guard enabled else { return }
@@ -489,11 +500,11 @@ private let chatListSendVerticalTiming = CAMediaTimingFunction(
 private let chatReactionDebugLogs = true
 private let chatGapDebugOverlayEnabled = false
 
-public final class ChatListView: ExpoView, UICollectionViewDataSource,
+public final class ChatListView: UIView, UICollectionViewDataSource,
   UICollectionViewDelegateFlowLayout
 {
-  public var onViewportChanged = EventDispatcher()
-  public var onNativeEvent = EventDispatcher()
+  public var onViewportChanged = NativeEventDispatcher()
+  public var onNativeEvent = NativeEventDispatcher()
 
   @objc public var surfaceId: String = "" {
     didSet {
@@ -629,7 +640,7 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
     isGroupOrChannel = value
   }
 
-  required init(appContext: AppContext? = nil) {
+  override init(frame: CGRect) {
     let layout = ChatCollectionFlowLayout()
     layout.minimumLineSpacing = 2
     layout.sectionInset = UIEdgeInsets(
@@ -640,7 +651,7 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
     flowLayout = layout
     collectionView = UICollectionView(frame: .zero, collectionViewLayout: layout)
 
-    super.init(appContext: appContext)
+    super.init(frame: frame)
     clipsToBounds = false
 
     if let cachedAppearance = Self.bootstrapCachedAppearance() {
@@ -734,6 +745,10 @@ public final class ChatListView: ExpoView, UICollectionViewDataSource,
       object: nil
     )
 
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
   }
 
   private func pixelAlignedValue(_ value: CGFloat) -> CGFloat {

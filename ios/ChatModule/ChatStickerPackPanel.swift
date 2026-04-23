@@ -1,4 +1,3 @@
-import Lottie
 import UIKit
 
 // MARK: - Selection
@@ -51,7 +50,10 @@ private final class LottieStickerCell: UICollectionViewCell {
       return
     }
 
-    let animation = LottieAnimation.filepath(filePath)
+    guard let animation = LottieAnimation.filepath(filePath) else {
+      showFallback(sticker: sticker)
+      return
+    }
     let view = LottieAnimationView(animation: animation)
     view.contentMode = .scaleAspectFit
     view.loopMode = .loop
@@ -87,7 +89,10 @@ private final class LottieStickerCell: UICollectionViewCell {
       return
     }
 
-    let animation = LottieAnimation.filepath(filePath)
+    guard let animation = LottieAnimation.filepath(filePath) else {
+      showFallbackEmoji("📦")
+      return
+    }
     let view = LottieAnimationView(animation: animation)
     view.contentMode = .scaleAspectFit
     view.loopMode = .loop

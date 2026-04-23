@@ -833,7 +833,12 @@ final class ChatGifPanelView: UIView {
             if panelVisible {
                 installEmbeddedPickerIfNeeded()
             }
-            updateEmbeddedPickerContent(showLoading: animated && pickerViewController == nil)
+            #if canImport(GiphyUISDK)
+                let shouldShowLoading = animated && pickerViewController == nil
+            #else
+                let shouldShowLoading = false
+            #endif
+            updateEmbeddedPickerContent(showLoading: shouldShowLoading)
         }
         setNeedsLayout()
     }

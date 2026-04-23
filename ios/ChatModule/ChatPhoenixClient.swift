@@ -384,9 +384,9 @@ final class ChatPhoenixClient: NSObject, URLSessionWebSocketDelegate, URLSession
     config.tlsMinimumSupportedProtocolVersion = .TLSv12
     if let proxyConfig = resolvedProxyConfiguration(from: proxyConfig) {
       config.connectionProxyDictionary = [
-        kCFNetworkProxiesSOCKSEnable as String: 1,
-        kCFNetworkProxiesSOCKSProxy as String: proxyConfig.host,
-        kCFNetworkProxiesSOCKSPort as String: proxyConfig.port,
+        "SOCKSEnable": 1,
+        "SOCKSProxy": proxyConfig.host,
+        "SOCKSPort": proxyConfig.port,
       ]
     }
     return config

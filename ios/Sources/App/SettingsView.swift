@@ -243,6 +243,7 @@ struct SettingsView: View {
       }
     )
     .background(palette.background.ignoresSafeArea())
+    .toolbar(.hidden, for: .navigationBar)
     .task {
       await profileController.loadIfNeeded()
     }
@@ -260,16 +261,22 @@ struct SettingsView: View {
       switch route {
       case .profile:
         ProfileSettingsDetailView(profileController: profileController)
+          .toolbar(.visible, for: .navigationBar)
       case .qr:
         UserQRSettingsDetailView(profile: currentProfile)
+          .toolbar(.visible, for: .navigationBar)
       case .privacy:
         PrivacySettingsDetailView(profileController: profileController)
+          .toolbar(.visible, for: .navigationBar)
       case .secretKey:
         SecretKeySettingsDetailView()
+          .toolbar(.visible, for: .navigationBar)
       case .appearance:
         AppearanceSettingsDetailView()
+          .toolbar(.visible, for: .navigationBar)
       case .mediaCache:
         MediaCacheSettingsDetailView()
+          .toolbar(.visible, for: .navigationBar)
       }
     }
   }
@@ -326,8 +333,9 @@ struct SettingsView: View {
   }
 
   private func openSavedMessages() {
-    coordinator.selectedTab = .chats
-    coordinator.pendingChatRoute = nil
+    coordinator.openChat(
+      .savedMessages(initialRows: ChatEngine.shared.getChatRows(["chatId": "saved_messages"]))
+    )
   }
 }
 

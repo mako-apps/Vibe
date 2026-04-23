@@ -1179,7 +1179,7 @@ final class SettingsNativeMainView: UIView, UIScrollViewDelegate {
       contentStack.leadingAnchor.constraint(equalTo: scrollContentView.leadingAnchor, constant: 16),
       contentStack.trailingAnchor.constraint(equalTo: scrollContentView.trailingAnchor, constant: -16),
       contentStack.topAnchor.constraint(equalTo: scrollContentView.topAnchor),
-      contentStack.bottomAnchor.constraint(equalTo: scrollContentView.bottomAnchor, constant: -100),
+      contentStack.bottomAnchor.constraint(equalTo: scrollContentView.bottomAnchor, constant: -28),
 
       headerMaskContainer.leadingAnchor.constraint(equalTo: leadingAnchor),
       headerMaskContainer.trailingAnchor.constraint(equalTo: trailingAnchor),
@@ -1313,8 +1313,8 @@ final class SettingsNativeMainView: UIView, UIScrollViewDelegate {
     NSLayoutConstraint.activate([
       footerLabel.leadingAnchor.constraint(equalTo: footerContainer.leadingAnchor),
       footerLabel.trailingAnchor.constraint(equalTo: footerContainer.trailingAnchor),
-      footerLabel.topAnchor.constraint(equalTo: footerContainer.topAnchor, constant: 10),
-      footerLabel.bottomAnchor.constraint(equalTo: footerContainer.bottomAnchor, constant: -30),
+      footerLabel.topAnchor.constraint(equalTo: footerContainer.topAnchor, constant: 8),
+      footerLabel.bottomAnchor.constraint(equalTo: footerContainer.bottomAnchor, constant: -12),
     ])
 
     return footerContainer

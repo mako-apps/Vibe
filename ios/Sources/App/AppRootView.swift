@@ -45,6 +45,17 @@ struct ChatRoute: Identifiable, Hashable {
     )
   }
 
+  static func savedMessages(initialRows: [[String: Any]] = []) -> ChatRoute {
+    ChatRoute(
+      chatId: "saved_messages",
+      title: "Saved Messages",
+      peerUserId: nil,
+      avatarURI: nil,
+      isGroup: false,
+      initialRows: initialRows
+    )
+  }
+
   static func == (lhs: ChatRoute, rhs: ChatRoute) -> Bool {
     lhs.chatId == rhs.chatId && lhs.peerUserId == rhs.peerUserId
   }
@@ -141,6 +152,8 @@ struct AppRootView: View {
     }
     .tint(palette.accent)
     .background(palette.background.ignoresSafeArea())
+    .toolbarBackground(palette.background, for: .tabBar)
+    .toolbarBackground(.visible, for: .tabBar)
     .environmentObject(coordinator)
     .onAppear {
       AppAppearanceController.applyStoredPreference()
@@ -278,10 +291,10 @@ private struct ChatsRootView: View {
       }
       .background(palette.background.ignoresSafeArea())
       .navigationBarTitleDisplayMode(.inline)
+      .toolbarBackground(.hidden, for: .navigationBar)
       .navigationDestination(for: ChatRoute.self) { route in
         ChatConversationScreen(route: route)
-          .navigationTitle(route.title)
-          .navigationBarTitleDisplayMode(.inline)
+          .toolbar(.hidden, for: .navigationBar)
           .toolbar(.hidden, for: .tabBar)
       }
       .toolbar {
@@ -467,6 +480,7 @@ private struct ContactsPageView: View {
     .background(palette.background.ignoresSafeArea())
     .navigationTitle("Contacts")
     .navigationBarTitleDisplayMode(.inline)
+    .toolbarBackground(.hidden, for: .navigationBar)
     .toolbar {
       ToolbarItem(placement: .topBarTrailing) {
         Button {
@@ -574,85 +588,270 @@ private struct CallsPageView: View {
     .background(palette.background.ignoresSafeArea())
     .navigationTitle("Calls")
     .navigationBarTitleDisplayMode(.inline)
+    .toolbarBackground(.hidden, for: .navigationBar)
   }
 }
 
-private struct ChatConversationScreen: View {
+private struct ChatConversationScreen: UIViewControllerRepresentable {
   @Environment(\.colorScheme) private var colorScheme
   let route: ChatRoute
 
-  private var palette: AppThemePalette {
-    AppThemePalette.resolve(for: colorScheme)
+  func makeUIViewController(context: Context) -> ChatConversationController {
+    ChatConversationController(route: route, isDark: colorScheme == .dark)
   }
 
-  private var previewMessages: [ChatPreviewMessage] {
-    route.initialRows.compactMap(ChatPreviewMessage.init(raw:))
-  }
-
-  var body: some View {
-    ScrollView {
-      VStack(alignment: .leading, spacing: 16) {
-        if previewMessages.isEmpty {
-          ContentUnavailableView(
-            "Chat View",
-            systemImage: "message",
-            description: Text("Full live chat rendering still needs the extracted chat module linked into this standalone target.")
-          )
-        } else {
-          ForEach(previewMessages) { message in
-            ChatPreviewBubble(message: message, palette: palette)
-          }
-        }
-
-        Text("This page now lives inside the native SwiftUI navigation flow. Live message rendering will move here once the extracted chat target is linked.")
-          .font(.footnote)
-          .foregroundStyle(palette.secondaryText)
-          .padding(.top, 8)
-      }
-      .padding(16)
-      .frame(maxWidth: .infinity, alignment: .leading)
-    }
-    .background(palette.background.ignoresSafeArea())
+  func updateUIViewController(_ uiViewController: ChatConversationController, context: Context) {
+    uiViewController.update(route: route, isDark: colorScheme == .dark)
   }
 }
 
-private struct ChatPreviewMessage: Identifiable {
-  let id: String
-  let body: String
-  let timestamp: String
-  let isOutgoing: Bool
+private enum ChatConversationPage: String {
+  case chat
+  case profile
+  case agent
+}
 
-  init?(raw: [String: Any]) {
-    let message =
-      (raw["message"] as? [String: Any])
-      ?? (raw["data"] as? [String: Any])
-      ?? raw
+private final class ChatConversationController: UIViewController {
+  private let mainView = ChatMainView()
+  private var route: ChatRoute
+  private var isDark: Bool
+  private var currentPage: ChatConversationPage = .chat
+  private var openedChatId: String?
+  private var didInitialScroll = false
 
-    let fallbackText =
-      Self.normalizedString(message["plaintext"])
-      ?? Self.normalizedString(message["text"])
-      ?? Self.normalizedString(message["body"])
-      ?? Self.normalizedString(message["preview"])
-      ?? Self.normalizedString(message["message"])
-      ?? Self.normalizedString(raw["preview"])
-    guard let body = fallbackText else {
-      return nil
+  init(route: ChatRoute, isDark: Bool) {
+    self.route = route
+    self.isDark = isDark
+    super.init(nibName: nil, bundle: nil)
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    view.backgroundColor = .clear
+
+    mainView.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(mainView)
+    NSLayoutConstraint.activate([
+      mainView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      mainView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      mainView.topAnchor.constraint(equalTo: view.topAnchor),
+      mainView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+    ])
+
+    mainView.onNativeEvent.handler = { [weak self] payload in
+      self?.handleNativeEvent(payload)
     }
 
-    self.id =
-      Self.normalizedString(message["id"])
-      ?? Self.normalizedString(message["messageId"])
-      ?? UUID().uuidString
-    self.body = body
-    self.timestamp =
-      Self.normalizedString(message["timestamp"])
-      ?? Self.normalizedString(message["timeLabel"])
-      ?? Self.normalizedString(raw["timeLabel"])
-      ?? ""
-    self.isOutgoing =
-      (message["isMe"] as? Bool)
-      ?? (message["outgoing"] as? Bool)
-      ?? false
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleChatEngineChanged(_:)),
+      name: ChatEngine.didChangeNotification,
+      object: nil
+    )
+
+    applyRoute(forceChannelRefresh: true)
+  }
+
+  override func viewDidAppear(_ animated: Bool) {
+    super.viewDidAppear(animated)
+    guard !didInitialScroll else { return }
+    didInitialScroll = true
+    DispatchQueue.main.async { [weak self] in
+      self?.mainView.scrollToBottom(animated: false)
+    }
+  }
+
+  deinit {
+    NotificationCenter.default.removeObserver(
+      self,
+      name: ChatEngine.didChangeNotification,
+      object: nil
+    )
+    closeOpenedChatChannel()
+  }
+
+  func update(route: ChatRoute, isDark: Bool) {
+    let chatChanged = self.route.chatId != route.chatId
+    let themeChanged = self.isDark != isDark
+    self.route = route
+    self.isDark = isDark
+    applyRoute(forceChannelRefresh: chatChanged)
+    if themeChanged {
+      mainView.setAppearance(Self.resolvedAppearance(isDark: isDark))
+    }
+  }
+
+  private func applyRoute(forceChannelRefresh: Bool) {
+    view.backgroundColor = Self.backgroundColor(isDark: isDark)
+    currentPage = .chat
+
+    let surfaceId = "native_chat_\(route.chatId)"
+    mainView.surfaceId = surfaceId
+    mainView.setEngineSurfaceId(surfaceId)
+    mainView.setEngineChatId(route.chatId)
+    mainView.setEnginePeerUserId(route.peerUserId ?? "")
+    if let myUserId = Self.normalizedString(
+      ChatEngineStore.shared.getConfig()["myUserId"] ?? ChatEngineStore.shared.getConfig()["userId"]
+    ) {
+      mainView.setEngineMyUserId(myUserId)
+    }
+    mainView.setAppearance(Self.resolvedAppearance(isDark: isDark))
+    mainView.setHeaderMode(route.chatId == "saved_messages" ? "savedmessages" : "default")
+    mainView.setHeaderTitle(route.title)
+    mainView.setProfileName(route.title)
+    mainView.setProfileHandle(Self.profileHandle(for: route))
+    mainView.setProfileBio("")
+    mainView.setAvatarUri(route.avatarURI)
+    mainView.setIsGroupOrChannel(route.isGroup)
+    mainView.setStatusAuthorityEnabled(true)
+    mainView.setInputPlaceholder(route.chatId == "saved_messages" ? "Saved Message" : "Message")
+    mainView.setInputBarEnabled(true)
+    mainView.setNativeSendEnabled(true)
+    mainView.setStandaloneProfileMode(false)
+    mainView.setPage(ChatConversationPage.chat.rawValue, animated: false)
+
+    refreshHeaderState()
+    refreshRows()
+
+    if forceChannelRefresh {
+      closeOpenedChatChannel()
+    }
+    openChatChannelIfNeeded()
+  }
+
+  private func openChatChannelIfNeeded() {
+    guard openedChatId != route.chatId else { return }
+    _ = ChatEngine.shared.openChatChannel([
+      "chatId": route.chatId,
+      "peerUserId": route.peerUserId ?? "",
+    ])
+    openedChatId = route.chatId
+  }
+
+  private func closeOpenedChatChannel() {
+    guard let openedChatId else { return }
+    _ = ChatEngine.shared.closeChatChannel(["chatId": openedChatId])
+    self.openedChatId = nil
+  }
+
+  private func refreshRows() {
+    mainView.setRows(Self.resolvedRows(for: route))
+  }
+
+  private func refreshHeaderState() {
+    mainView.setHeaderSubtitle(Self.headerSubtitle(for: route))
+    mainView.setIsOnline(Self.isOnline(for: route))
+    mainView.setProfileHandle(Self.profileHandle(for: route))
+  }
+
+  private func handleNativeEvent(_ payload: [String: Any]) {
+    let type = Self.normalizedString(payload["type"]) ?? ""
+    switch type {
+    case "headerBack":
+      switch currentPage {
+      case .chat:
+        navigationController?.popViewController(animated: true)
+      case .profile:
+        currentPage = .chat
+        mainView.setPage(ChatConversationPage.chat.rawValue, animated: true)
+      case .agent:
+        currentPage = .profile
+        mainView.setPage(ChatConversationPage.profile.rawValue, animated: true)
+      }
+    case "headerAvatarPressed":
+      return
+    case "headerAgentPressed":
+      return
+    case "mainPageChanged":
+      if let page = Self.normalizedString(payload["page"]),
+        let resolved = ChatConversationPage(rawValue: page)
+      {
+        currentPage = resolved
+      }
+    default:
+      break
+    }
+  }
+
+  @objc private func handleChatEngineChanged(_ notification: Notification) {
+    if !Thread.isMainThread {
+      DispatchQueue.main.async { [weak self] in
+        self?.handleChatEngineChanged(notification)
+      }
+      return
+    }
+
+    let changedChatId = Self.normalizedString(notification.userInfo?["chatId"])
+    guard changedChatId == route.chatId || changedChatId == nil else { return }
+
+    refreshHeaderState()
+
+    switch Self.normalizedString(notification.userInfo?["reason"]) ?? "" {
+    case "chatRowsReloaded", "chatMessageInserted", "chatMessageEdited", "chatMessageDeleted",
+      "chatMessageChanged", "messageStatusChanged", "presenceChanged", "peerTyping",
+      "chatChannelStateChanged":
+      refreshRows()
+    default:
+      break
+    }
+  }
+
+  private static func resolvedRows(for route: ChatRoute) -> [[String: Any]] {
+    let nativeRows = ChatEngine.shared.getChatRows(["chatId": route.chatId])
+    if !nativeRows.isEmpty {
+      return nativeRows
+    }
+    return route.initialRows
+  }
+
+  private static func isOnline(for route: ChatRoute) -> Bool {
+    ChatEngine.shared.isUserOnline(userId: route.peerUserId)
+  }
+
+  private static func headerSubtitle(for route: ChatRoute) -> String {
+    if route.chatId == "saved_messages" {
+      return "Saved Messages"
+    }
+    if ChatEngine.shared.isTyping(["chatId": route.chatId]) {
+      return "typing..."
+    }
+    if isOnline(for: route) {
+      return "online"
+    }
+    if route.isGroup {
+      return "group"
+    }
+    if let lastSeen = ChatEngine.shared.lastSeenTimestampMs(userId: route.peerUserId),
+      let label = lastSeenLabel(from: lastSeen)
+    {
+      return label
+    }
+    return route.peerUserId == nil ? "" : "last seen recently"
+  }
+
+  private static func profileHandle(for route: ChatRoute) -> String {
+    if route.chatId == "saved_messages" {
+      return "Personal notes and media"
+    }
+    if let peerUserId = normalizedString(route.peerUserId) {
+      return peerUserId
+    }
+    return route.isGroup ? "Group chat" : ""
+  }
+
+  private static func lastSeenLabel(from timestampMs: Int64) -> String? {
+    guard timestampMs > 0 else { return nil }
+    let date = Date(timeIntervalSince1970: TimeInterval(timestampMs) / 1000.0)
+    let formatter = RelativeDateTimeFormatter()
+    formatter.unitsStyle = .short
+    let relative = formatter.localizedString(for: date, relativeTo: Date())
+    let trimmed = relative.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+    return "last seen \(trimmed)"
   }
 
   private static func normalizedString(_ value: Any?) -> String? {
@@ -665,32 +864,37 @@ private struct ChatPreviewMessage: Identifiable {
     }
     return nil
   }
-}
 
-private struct ChatPreviewBubble: View {
-  let message: ChatPreviewMessage
-  let palette: AppThemePalette
+  private static func backgroundColor(isDark: Bool) -> UIColor {
+    isDark
+      ? UIColor(red: 18.0 / 255.0, green: 18.0 / 255.0, blue: 18.0 / 255.0, alpha: 1.0)
+      : UIColor(red: 245.0 / 255.0, green: 244.0 / 255.0, blue: 241.0 / 255.0, alpha: 1.0)
+  }
 
-  var body: some View {
-    VStack(alignment: message.isOutgoing ? .trailing : .leading, spacing: 6) {
-      Text(message.body)
-        .font(.body)
-        .foregroundStyle(message.isOutgoing ? palette.buttonText : palette.text)
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .background(
-          RoundedRectangle(cornerRadius: 18, style: .continuous)
-            .fill(message.isOutgoing ? palette.bubbleMe : palette.card)
-        )
-
-      if !message.timestamp.isEmpty {
-        Text(message.timestamp)
-          .font(.caption2)
-          .foregroundStyle(palette.secondaryText)
-          .padding(.horizontal, 4)
-      }
+  private static func resolvedAppearance(isDark: Bool) -> [String: Any] {
+    if isDark {
+      return [
+        "theme": "dark",
+        "backgroundMode": "gradient",
+        "wallpaperGradient": ["#131325", "#0D0D1F"],
+        "wallpaperOpacity": 1.0,
+        "wallpaperPatternGradient": ["#115E59", "#0891B2", "#0284C7"],
+        "wallpaperPatternLocations": [0.0, 0.5, 1.0],
+        "wallpaperPatternOpacity": 0.12,
+        "wallpaperMaskKey": "doodles",
+      ]
     }
-    .frame(maxWidth: .infinity, alignment: message.isOutgoing ? .trailing : .leading)
+
+    return [
+      "theme": "light",
+      "backgroundMode": "gradient",
+      "wallpaperGradient": ["#F9F3EA", "#EFE6D9"],
+      "wallpaperOpacity": 1.0,
+      "wallpaperPatternGradient": ["#5A8A66", "#5A6675", "#8A75A3"],
+      "wallpaperPatternLocations": [0.0, 0.5, 1.0],
+      "wallpaperPatternOpacity": 0.06,
+      "wallpaperMaskKey": "doodles",
+    ]
   }
 }
 

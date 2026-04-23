@@ -1,4 +1,3 @@
-import ExpoModulesCore
 import UIKit
 
 final class ChatNativeMainRegistry {
@@ -86,15 +85,15 @@ private struct ChatMainPinnedBannerContent: Equatable {
   let fileName: String?
 }
 
-public final class ChatMainView: ExpoView,
+public final class ChatMainView: UIView,
   UIGestureRecognizerDelegate,
   ChatMainProfileAgentPromptNodeDelegate,
   UITextFieldDelegate
 {
-  public var onViewportChanged = EventDispatcher() {
+  public var onViewportChanged = NativeEventDispatcher() {
     didSet { syncListDispatchers() }
   }
-  public var onNativeEvent = EventDispatcher() {
+  public var onNativeEvent = NativeEventDispatcher() {
     didSet { syncListDispatchers() }
   }
 
@@ -294,9 +293,9 @@ public final class ChatMainView: ExpoView,
   private static let themeDarkCard = UIColor(
     red: 36.0 / 255.0, green: 36.0 / 255.0, blue: 36.0 / 255.0, alpha: 1.0)
   private static let themeLightCard = UIColor.white
-  required init(appContext: AppContext? = nil) {
-    chatListView = ChatListView(appContext: appContext)
-    super.init(appContext: appContext)
+  override init(frame: CGRect) {
+    chatListView = ChatListView()
+    super.init(frame: frame)
     clipsToBounds = true
     configureView()
     startObservingChatEngine()
@@ -304,6 +303,10 @@ public final class ChatMainView: ExpoView,
     applyTheme()
     updateHeaderTexts()
     updateProfileTexts()
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
   }
 
   deinit {
@@ -3311,7 +3314,7 @@ public final class ChatMainView: ExpoView,
   }
 
   private func resolveFullAvatarUri(_ uri: String) -> String {
-    return ChatNativeAvatarURLResolver.resolve(
+    return ChatAvatarURLResolver.resolve(
       rawAvatar: uri,
       peerUserId: enginePeerUserIdRaw,
       chatId: engineChatId,

@@ -1,6 +1,14 @@
 {
   "updated_at": "2026-04-23",
   "checks": {
+    "ios_chat_push_route_and_settings_spacing_followup": {
+      "status": "passed",
+      "details": "Fixed the latest standalone iOS follow-up regression where pushed conversations were incorrectly forcing `ChatMainView` into standalone profile mode. `ios/Sources/App/AppRootView.swift` now keeps the pushed conversation controller in normal chat mode, ignores the unsupported profile/agent header actions in the standalone shell, restores `Saved Messages` to the same real chat route, hides the extra SwiftUI navigation-bar chrome on the root settings page, and aligns the tab/root bar backgrounds with the app palette. `ios/Sources/App/SettingsNativeComponents.swift` also reduces the oversized bottom/footer spacing in the native settings host. Revalidated with `xcodebuild -quiet -project Vibe.xcodeproj -scheme Vibe -sdk iphonesimulator -configuration Debug build CODE_SIGNING_ALLOWED=NO -derivedDataPath /tmp/vibe-chat-layout-fix` from `ios/`."
+    },
+    "ios_native_chat_route_restoration": {
+      "status": "passed",
+      "details": "Restored the standalone iOS shell to the real native chat surface instead of the placeholder conversation route. `ios/Sources/App/AppRootView.swift` now pushes chat rows and `Saved Messages` into `ChatMainView`, `ios/Sources/App/SettingsView.swift` routes `Saved Messages` through the same chat route, and `ios/project.yml` / `ios/Vibe.xcodeproj/project.pbxproj` now compile the reusable `ios/ChatModule/` sources directly into the app target. The pass also removed Expo-only base-class usage from `ChatListView.swift` and `ChatMainView.swift`, restored the native image/video edit payload modules, added `ios/ChatModule/LottieCompat.swift` plus sticker fallbacks so the target builds without the missing Lottie dependency, reused `ChatAvatarURLResolver` in `ChatMainView.swift`, and switched `ChatPhoenixClient.swift` to the iOS-safe SOCKS proxy dictionary keys already used by `PacketRuntime`. Revalidated with `xcodebuild -quiet -project Vibe.xcodeproj -scheme Vibe -sdk iphonesimulator -configuration Debug build CODE_SIGNING_ALLOWED=NO -derivedDataPath /tmp/vibe-native-chat-route-7` from `ios/`."
+    },
     "ios_settings_old_native_host_restore": {
       "status": "passed",
       "details": "Replaced the standalone iOS settings root SwiftUI recreation with the old native host pattern. `ios/Sources/App/SettingsView.swift` now uses `SettingsNativeMainViewRepresentable`, and `ios/Sources/App/SettingsNativeComponents.swift` now hosts the avatar outside the scroll view, keeps the hero spacer inside the scroll content, and forwards `scrollViewDidScroll` into `setScrollOffset(...)` like the legacy native settings module. Revalidated with `xcodebuild -project Vibe.xcodeproj -scheme Vibe -sdk iphonesimulator -configuration Debug build CODE_SIGNING_ALLOWED=NO -derivedDataPath /tmp/vibe-settings-old-host` from `ios/`."

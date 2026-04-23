@@ -1,7 +1,6 @@
 import AVFoundation
 import ImageIO
 import LinkPresentation
-import Lottie
 import MediaPlayer
 import UIKit
 

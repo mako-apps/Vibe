@@ -5326,6 +5326,10 @@ final class ChatEngine {
     let reason: String?
   }
 
+  private struct LocalMediaPreparationFailure: Error {
+    let reason: String
+  }
+
   private struct PreparedLocalMediaUpload {
     let fileData: Data
     let fileName: String
@@ -5350,7 +5354,7 @@ final class ChatEngine {
     normalizedURL: URL,
     messageType: String,
     fileNameHint: String?
-  ) -> Result<PreparedLocalMediaUpload, String> {
+  ) -> Result<PreparedLocalMediaUpload, LocalMediaPreparationFailure> {
     let resolvedFileName = fileNameHint ?? normalizedURL.lastPathComponent
     let transportMode = syncOnQueue { transportModeLocked() }
 
@@ -5367,7 +5371,7 @@ final class ChatEngine {
     switch messageType {
     case "voice":
       guard fileData.count <= packetMeshMaxVoiceUploadBytes else {
-        return .failure("packet_mesh_voice_too_large")
+        return .failure(LocalMediaPreparationFailure(reason: "packet_mesh_voice_too_large"))
       }
       return .success(
         PreparedLocalMediaUpload(
@@ -5383,7 +5387,7 @@ final class ChatEngine {
         fileNameHint: fileNameHint
       )
     default:
-      return .failure("packet_mesh_type_blocked")
+      return .failure(LocalMediaPreparationFailure(reason: "packet_mesh_type_blocked"))
     }
   }
 
@@ -5391,9 +5395,9 @@ final class ChatEngine {
     fileData: Data,
     normalizedURL: URL,
     fileNameHint: String?
-  ) -> Result<PreparedLocalMediaUpload, String> {
+  ) -> Result<PreparedLocalMediaUpload, LocalMediaPreparationFailure> {
     guard let image = UIImage(data: fileData) else {
-      return .failure("packet_mesh_image_decode_failed")
+      return .failure(LocalMediaPreparationFailure(reason: "packet_mesh_image_decode_failed"))
     }
 
     let rawBaseName = (
@@ -5424,7 +5428,7 @@ final class ChatEngine {
       }
     }
 
-    return .failure("packet_mesh_image_too_large")
+    return .failure(LocalMediaPreparationFailure(reason: "packet_mesh_image_too_large"))
   }
 
   private func packetMeshRenderedImage(_ image: UIImage, maxDimension: CGFloat) -> UIImage? {
@@ -5614,8 +5618,8 @@ final class ChatEngine {
     ) {
     case .success(let value):
       preparedUpload = value
-    case .failure(let reason):
-      return LocalMediaUploadOutcome(result: nil, reason: reason)
+    case .failure(let error):
+      return LocalMediaUploadOutcome(result: nil, reason: error.reason)
     }
     let preparedFileSize = preparedUpload.fileSize
     let resolvedFileName = preparedUpload.fileName
