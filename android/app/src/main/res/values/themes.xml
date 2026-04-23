@@ -4,4 +4,18 @@
     <item name="android:navigationBarColor">@android:color/black</item>
     <item name="android:windowLightStatusBar" tools:targetApi="23">false</item>
   </style>
+
+  <style name="ThemeOverlay.Vibe.BottomSheetDialog" parent="ThemeOverlay.Material3.BottomSheetDialog">
+    <item name="bottomSheetStyle">@style/Widget.Vibe.BottomSheet.Modal</item>
+    <item name="android:windowAnimationStyle">@style/Animation.Vibe.BottomSheet</item>
+  </style>
+
+  <style name="Widget.Vibe.BottomSheet.Modal" parent="Widget.Material3.BottomSheet.Modal">
+    <item name="android:background">@android:color/transparent</item>
+  </style>
+
+  <style name="Animation.Vibe.BottomSheet" parent="@android:style/Animation">
+    <item name="android:windowEnterAnimation">@anim/vibe_sheet_slide_up</item>
+    <item name="android:windowExitAnimation">@anim/vibe_sheet_slide_down</item>
+  </style>
 </resources>

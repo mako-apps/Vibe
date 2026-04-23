@@ -1,5 +1,7 @@
 package com.mohammadshayani.vibe.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
 import android.content.res.ColorStateList
 import android.graphics.Color
@@ -32,6 +34,7 @@ import com.mohammadshayani.vibe.home.ChatHomeService
 import com.mohammadshayani.vibe.packet.PacketTransportMode
 import com.mohammadshayani.vibe.session.AppSessionConfig
 import com.mohammadshayani.vibe.storage.ChatEngineStore
+import com.mohammadshayani.vibe.storage.SecureKeyStore
 
 class ChatHomeActivity : AppCompatActivity() {
   private enum class ShellTab(
@@ -332,6 +335,12 @@ class ChatHomeActivity : AppCompatActivity() {
           ).joinToString(" • ").ifBlank { "Private account" },
         appearanceSummary = "${AppAppearanceController.current(this).title} • ${AppThemePlateController.current(this).title}",
         connectionModeTitle = connectionModeTitle(),
+        secretKeySummary =
+          if (SecureKeyStore.retrieveSecret(applicationContext, "loginSecret").isNullOrBlank()) {
+            "Unavailable"
+          } else {
+            "Stored"
+          },
         notificationsEnabled = notificationsEnabled,
       ),
     )
@@ -387,6 +396,9 @@ class ChatHomeActivity : AppCompatActivity() {
           .setPositiveButton("Close", null)
           .show()
       }
+      "secret_key" -> {
+        showSecretKeyDialog()
+      }
     }
   }
 
@@ -407,6 +419,81 @@ class ChatHomeActivity : AppCompatActivity() {
       },
     )
     finish()
+  }
+
+  private fun showSecretKeyDialog(revealed: Boolean = false) {
+    val secret = SecureKeyStore.retrieveSecret(applicationContext, "loginSecret").orEmpty()
+    val body =
+      LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(4f), dp(10f), dp(4f), 0)
+      }
+    body.addView(
+      TextView(this).apply {
+        text = "YOUR SECRET KEY"
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+        setTextColor(resolveAppThemePalette(this@ChatHomeActivity).secondaryTextColor)
+        typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+      },
+    )
+    body.addView(space(this, 10f))
+    body.addView(
+      TextView(this).apply {
+        text =
+          if (secret.isBlank()) {
+            "No secret key is stored on this device yet."
+          } else {
+            displaySecret(secret, revealed)
+          }
+        setTextColor(
+          if (secret.isBlank()) {
+            resolveAppThemePalette(this@ChatHomeActivity).secondaryTextColor
+          } else {
+            resolveAppThemePalette(this@ChatHomeActivity).textColor
+          },
+        )
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+        typeface = Typeface.MONOSPACE
+        setTextIsSelectable(true)
+      },
+    )
+    body.addView(space(this, 14f))
+    body.addView(
+      TextView(this).apply {
+        text = "Do not share this key. Anyone with it can sign in as you on another device."
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+        setTextColor(resolveAppThemePalette(this@ChatHomeActivity).dangerColor)
+      },
+    )
+
+    val builder =
+      MaterialAlertDialogBuilder(this)
+        .setTitle("Secret Key")
+        .setView(body)
+
+    if (secret.isBlank()) {
+      builder.setPositiveButton("Close", null)
+    } else {
+      builder
+        .setNeutralButton(if (revealed) "Hide" else "Show") { _, _ ->
+          showSecretKeyDialog(!revealed)
+        }
+        .setPositiveButton("Copy") { _, _ ->
+          val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+          clipboard.setPrimaryClip(ClipData.newPlainText("Secret Key", secret))
+        }
+        .setNegativeButton("Close", null)
+    }
+
+    builder.show()
+  }
+
+  private fun displaySecret(secret: String, revealed: Boolean): String {
+    if (revealed) return secret
+    if (secret.length <= 10) return secret
+    val prefix = secret.take(6)
+    val suffix = secret.takeLast(4)
+    return prefix + "•".repeat(secret.length - 10) + suffix
   }
 
   private fun navigationTintList(palette: AppThemePalette): ColorStateList {
@@ -640,6 +727,7 @@ private data class SettingsPageState(
   val subtitle: String,
   val appearanceSummary: String,
   val connectionModeTitle: String,
+  val secretKeySummary: String,
   val notificationsEnabled: Boolean,
 )
 
@@ -697,6 +785,23 @@ private class SettingsPageView(
             android.R.drawable.ic_menu_upload,
             "Connection Manager",
             state.connectionModeTitle,
+          ),
+        ),
+      ),
+    )
+    stack.addView(space(context, 18f))
+    stack.addView(sectionLabel("PRIVACY & SECURITY", state.palette))
+    stack.addView(space(context, 10f))
+    stack.addView(
+      sectionGroup(
+        state.palette,
+        listOf(
+          settingsRow(
+            state.palette,
+            "secret_key",
+            android.R.drawable.ic_lock_lock,
+            "Secret Key",
+            state.secretKeySummary,
           ),
         ),
       ),

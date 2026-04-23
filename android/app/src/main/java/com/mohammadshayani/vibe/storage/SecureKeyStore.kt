@@ -11,7 +11,8 @@ internal object SecureKeyStore {
   private const val PREFS_NAME = "vibe_secure_keys"
   const val SENTINEL = "__SECURE__"
 
-  val sensitiveKeys = setOf("privateKeyPem", "privateKey", "authToken", "token", "packetTicket")
+  val sensitiveKeys =
+    setOf("privateKeyPem", "privateKey", "authToken", "token", "packetTicket", "loginSecret")
 
   @Volatile
   private var cachedPrefs: SharedPreferences? = null

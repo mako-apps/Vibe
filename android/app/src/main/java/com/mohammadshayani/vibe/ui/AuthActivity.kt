@@ -1,7 +1,5 @@
 package com.mohammadshayani.vibe.ui
 
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.res.ColorStateList
@@ -21,6 +19,7 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -31,10 +30,12 @@ import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.progressindicator.CircularProgressIndicator
 import com.google.android.material.textfield.TextInputEditText
 import com.google.android.material.textfield.TextInputLayout
+import com.mohammadshayani.vibe.R
 import com.mohammadshayani.vibe.network.fallbackApiBaseUrl
 import com.mohammadshayani.vibe.network.resolveApiBaseUrl
 import com.mohammadshayani.vibe.packet.PacketTransportMode
 import com.mohammadshayani.vibe.session.AppSessionConfig
+import com.mohammadshayani.vibe.storage.SecureKeyStore
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -92,6 +93,7 @@ class AuthActivity : AppCompatActivity() {
     }
   }
 
+  private lateinit var backdropView: WelcomeGpuBackdropView
   private var dialog: BottomSheetDialog? = null
 
   override fun onCreate(savedInstanceState: Bundle?) {
@@ -109,8 +111,9 @@ class AuthActivity : AppCompatActivity() {
     val root = FrameLayout(this).apply {
       setBackgroundColor(if (isDark) Color.rgb(8, 13, 22) else Color.rgb(241, 246, 255))
     }
+    backdropView = WelcomeGpuBackdropView(this)
     root.addView(
-      WelcomeBackdropView(this),
+      backdropView,
       FrameLayout.LayoutParams(
         ViewGroup.LayoutParams.MATCH_PARENT,
         ViewGroup.LayoutParams.MATCH_PARENT,
@@ -127,6 +130,17 @@ class AuthActivity : AppCompatActivity() {
           onDismiss = { finish() },
         )
     }
+  }
+
+  override fun onResume() {
+    super.onResume()
+    backdropView.refreshAppearance()
+    backdropView.onHostResume()
+  }
+
+  override fun onPause() {
+    backdropView.onHostPause()
+    super.onPause()
   }
 
   override fun onDestroy() {
@@ -217,6 +231,9 @@ internal object AuthSheetPresenter {
         defaultHintTextColor = ColorStateList.valueOf(palette.fieldPlaceholderColor)
         setHintTextColor(ColorStateList.valueOf(palette.fieldPlaceholderColor))
         setPadding(0, dp(activity, 20f), 0, 0)
+        if (mode == AuthActivity.Mode.SIGN_IN) {
+          endIconMode = TextInputLayout.END_ICON_PASSWORD_TOGGLE
+        }
       }
     val inputField =
       TextInputEditText(inputLayout.context).apply {
@@ -226,7 +243,7 @@ internal object AuthSheetPresenter {
         imeOptions = EditorInfo.IME_ACTION_DONE
         inputType =
           if (mode == AuthActivity.Mode.SIGN_IN) {
-            InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+            InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
           } else {
             InputType.TYPE_CLASS_TEXT
           }
@@ -297,7 +314,7 @@ internal object AuthSheetPresenter {
       }
     }
 
-    val bottomSheetDialog = BottomSheetDialog(activity)
+    val bottomSheetDialog = BottomSheetDialog(activity, R.style.ThemeOverlay_Vibe_BottomSheetDialog)
     var shouldNotifyDismiss = true
     var behavior: BottomSheetBehavior<View>? = null
 
@@ -319,6 +336,23 @@ internal object AuthSheetPresenter {
       statusView.text = status
     }
 
+    fun completeAuthentication(secretToStore: String, showSecretSavedToast: Boolean, result: NativeAuthResult) {
+      AppSessionConfig.store(activity.applicationContext, result.config)
+      if (secretToStore.isNotBlank()) {
+        SecureKeyStore.storeSecret(activity.applicationContext, "loginSecret", secretToStore)
+      }
+      if (showSecretSavedToast) {
+        Toast.makeText(
+          activity,
+          "Secret key saved in Settings > Secret Key.",
+          Toast.LENGTH_LONG,
+        ).show()
+      }
+      shouldNotifyDismiss = false
+      bottomSheetDialog.dismiss()
+      onAuthenticated?.invoke()
+    }
+
     actionButton.setOnClickListener {
       if (mode == AuthActivity.Mode.SIGN_UP) {
         val username = NativeAuthCrypto.normalizeUsername(inputField.text?.toString())
@@ -333,12 +367,11 @@ internal object AuthSheetPresenter {
             NativeAuthService.signUp(activity.applicationContext, username)
           }.onSuccess { result ->
             activity.runOnUiThread {
-              AppSessionConfig.store(activity.applicationContext, result.config)
-              shouldNotifyDismiss = false
-              bottomSheetDialog.dismiss()
-              showRecoveryDialog(activity, result.recoverySecret) {
-                onAuthenticated?.invoke()
-              }
+              completeAuthentication(
+                secretToStore = result.recoverySecret,
+                showSecretSavedToast = true,
+                result = result,
+              )
             }
           }.onFailure { error ->
             activity.runOnUiThread {
@@ -364,10 +397,11 @@ internal object AuthSheetPresenter {
             NativeAuthService.signIn(activity.applicationContext, secret)
           }.onSuccess { result ->
             activity.runOnUiThread {
-              AppSessionConfig.store(activity.applicationContext, result.config)
-              shouldNotifyDismiss = false
-              bottomSheetDialog.dismiss()
-              onAuthenticated?.invoke()
+              completeAuthentication(
+                secretToStore = secret,
+                showSecretSavedToast = false,
+                result = result,
+              )
             }
           }.onFailure { error ->
             activity.runOnUiThread {
@@ -384,8 +418,18 @@ internal object AuthSheetPresenter {
     }
 
     bottomSheetDialog.show()
+    bottomSheetDialog.window?.setWindowAnimations(R.style.Animation_Vibe_BottomSheet)
     bottomSheetDialog.findViewById<View>(com.google.android.material.R.id.design_bottom_sheet)?.let { sheet ->
+      val targetHeight = (activity.resources.displayMetrics.heightPixels * 0.90f).toInt()
+      sheet.layoutParams = sheet.layoutParams.apply {
+        height = targetHeight
+      }
+      sheet.minimumHeight = targetHeight
       behavior = BottomSheetBehavior.from(sheet)
+      behavior?.isFitToContents = false
+      behavior?.expandedOffset =
+        (activity.resources.displayMetrics.heightPixels - targetHeight).coerceAtLeast(0)
+      behavior?.peekHeight = targetHeight
       behavior?.skipCollapsed = true
       behavior?.state = BottomSheetBehavior.STATE_EXPANDED
       sheet.background =
@@ -408,27 +452,6 @@ internal object AuthSheetPresenter {
     }
 
     return bottomSheetDialog
-  }
-
-  private fun showRecoveryDialog(
-    activity: AppCompatActivity,
-    secret: String,
-    onContinue: () -> Unit,
-  ) {
-    MaterialAlertDialogBuilder(activity)
-      .setTitle("Secret Key")
-      .setMessage(secret)
-      .setPositiveButton("Copy & Continue") { _, _ ->
-        val clipboard =
-          activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        clipboard.setPrimaryClip(ClipData.newPlainText("Secret Key", secret))
-        onContinue()
-      }
-      .setNegativeButton("Continue") { _, _ ->
-        onContinue()
-      }
-      .setCancelable(false)
-      .show()
   }
 
   private fun dp(context: Context, value: Float): Int =
