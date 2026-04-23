@@ -178,29 +178,17 @@ struct AppRootView: View {
       .tint(palette.accent)
       .background(palette.background.ignoresSafeArea())
       .toolbarBackground(.hidden, for: .tabBar)
-      .allowsHitTesting(coordinator.presentedChat == nil)
-      .zIndex(0)
 
-      if let presented = coordinator.presentedChat {
-        ZStack {
-          palette.background.ignoresSafeArea()
-          ChatConversationScreen(route: presented.route) {
-            coordinator.closePresentedChat(requestID: presented.requestID)
-          }
-          .ignoresSafeArea()
+      RootChatPresenterBridge(
+        presentedChat: coordinator.presentedChat,
+        isDark: colorScheme == .dark,
+        onClose: { requestID in
+          coordinator.closePresentedChat(requestID: requestID)
         }
-        .id(presented.requestID)
-        .zIndex(1)
-        .transition(.move(edge: .trailing).combined(with: .opacity))
-        .onAppear {
-          appShellRouteLog(
-            "AppRootView rootChatOverlay appear requestId=\(presented.requestID) chatId=\(presented.route.chatId) title=\(presented.route.title)")
-        }
-        .onDisappear {
-          appShellRouteLog(
-            "AppRootView rootChatOverlay disappear requestId=\(presented.requestID) chatId=\(presented.route.chatId) title=\(presented.route.title)")
-        }
-      }
+      )
+      .ignoresSafeArea()
+      .allowsHitTesting(false)
+      .accessibilityHidden(true)
     }
     .onChange(of: coordinator.presentedChat?.requestID) { previousRequestID, _ in
       if let presented = coordinator.presentedChat {
@@ -657,6 +645,195 @@ private struct ChatConversationScreen: UIViewControllerRepresentable {
   }
 }
 
+private struct RootChatPresenterBridge: UIViewControllerRepresentable {
+  let presentedChat: PresentedChatRoute?
+  let isDark: Bool
+  let onClose: (Int) -> Void
+
+  func makeUIViewController(context: Context) -> RootChatPresenterController {
+    let controller = RootChatPresenterController()
+    controller.onClose = onClose
+    appShellRouteLog("RootChatPresenterBridge makeUIViewController")
+    return controller
+  }
+
+  func updateUIViewController(_ uiViewController: RootChatPresenterController, context: Context) {
+    uiViewController.onClose = onClose
+    appShellRouteLog(
+      "RootChatPresenterBridge update requestId=\(presentedChat.map { String($0.requestID) } ?? "nil") chatId=\(presentedChat?.route.chatId ?? "nil") windowAttached=\(uiViewController.viewIfLoaded?.window != nil)")
+    uiViewController.sync(presentedChat: presentedChat, isDark: isDark)
+  }
+}
+
+private final class RootChatPresenterController: UIViewController {
+  var onClose: ((Int) -> Void)?
+
+  private var activeRequestID: Int?
+  private var activeRoute: ChatRoute?
+  private weak var activeChatController: ChatConversationController?
+  private var pendingPresentation: (presented: PresentedChatRoute, isDark: Bool)?
+
+  override func loadView() {
+    let view = UIView(frame: .zero)
+    view.backgroundColor = .clear
+    view.isUserInteractionEnabled = false
+    self.view = view
+  }
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    appShellRouteLog("RootChatPresenterBridge viewDidLoad windowAttached=\(view.window != nil)")
+  }
+
+  override func viewDidAppear(_ animated: Bool) {
+    super.viewDidAppear(animated)
+    flushPendingPresentationIfPossible(trigger: "viewDidAppear")
+  }
+
+  override func didMove(toParent parent: UIViewController?) {
+    super.didMove(toParent: parent)
+    flushPendingPresentationIfPossible(trigger: "didMoveToParent")
+  }
+
+  func sync(presentedChat: PresentedChatRoute?, isDark: Bool) {
+    if let presentedChat {
+      if activeRequestID == presentedChat.requestID, let activeChatController {
+        appShellRouteLog(
+          "RootChatPresenterBridge updateExisting requestId=\(presentedChat.requestID) chatId=\(presentedChat.route.chatId) windowAttached=\(view.window != nil)")
+        activeRoute = presentedChat.route
+        activeChatController.update(
+          route: presentedChat.route,
+          isDark: isDark,
+          onClose: { [weak self] in
+            self?.handleChatClose(requestID: presentedChat.requestID)
+          }
+        )
+        return
+      }
+
+      if activeRequestID != nil {
+        appShellRouteLog(
+          "RootChatPresenterBridge replace requestId=\(presentedChat.requestID) chatId=\(presentedChat.route.chatId) previousRequestId=\(activeRequestID.map(String.init) ?? "nil")")
+        dismissActiveChat(animated: false) { [weak self] in
+          self?.presentChat(presentedChat, isDark: isDark)
+        }
+        return
+      }
+
+      presentChat(presentedChat, isDark: isDark)
+      return
+    }
+
+    pendingPresentation = nil
+    if activeRequestID != nil {
+      appShellRouteLog(
+        "RootChatPresenterBridge dismiss requestId=\(activeRequestID.map(String.init) ?? "nil") chatId=\(activeRoute?.chatId ?? "nil")")
+      dismissActiveChat(animated: true, completion: nil)
+    }
+  }
+
+  private func presentChat(_ presentedChat: PresentedChatRoute, isDark: Bool) {
+    guard let presenter = topMostPresentingController() else {
+      appShellRouteLog(
+        "RootChatPresenterBridge deferPresent requestId=\(presentedChat.requestID) chatId=\(presentedChat.route.chatId) reason=noPresenter windowAttached=\(view.window != nil)")
+      pendingPresentation = (presentedChat, isDark)
+      DispatchQueue.main.async { [weak self] in
+        self?.flushPendingPresentationIfPossible(trigger: "asyncRetry")
+      }
+      return
+    }
+
+    let controller = ChatConversationController(
+      route: presentedChat.route,
+      isDark: isDark,
+      onClose: { [weak self] in
+        self?.handleChatClose(requestID: presentedChat.requestID)
+      }
+    )
+    controller.modalPresentationStyle = .fullScreen
+    activeRequestID = presentedChat.requestID
+    activeRoute = presentedChat.route
+    activeChatController = controller
+    pendingPresentation = nil
+
+    appShellRouteLog(
+      "RootChatPresenterBridge present requestId=\(presentedChat.requestID) chatId=\(presentedChat.route.chatId) presenter=\(String(describing: type(of: presenter))) presenterPresented=\(presenter.presentedViewController.map { String(describing: type(of: $0)) } ?? "nil")")
+    presenter.present(controller, animated: true)
+  }
+
+  private func dismissActiveChat(animated: Bool, completion: (() -> Void)?) {
+    guard let activeChatController else {
+      activeRequestID = nil
+      activeRoute = nil
+      completion?()
+      return
+    }
+
+    let finish: () -> Void = { [weak self] in
+      self?.activeRequestID = nil
+      self?.activeRoute = nil
+      self?.activeChatController = nil
+      completion?()
+    }
+
+    if activeChatController.presentingViewController != nil {
+      activeChatController.dismiss(animated: animated) {
+        finish()
+      }
+    } else {
+      finish()
+    }
+  }
+
+  private func flushPendingPresentationIfPossible(trigger: String) {
+    guard let pendingPresentation else { return }
+    appShellRouteLog(
+      "RootChatPresenterBridge flushPending trigger=\(trigger) requestId=\(pendingPresentation.presented.requestID) chatId=\(pendingPresentation.presented.route.chatId) windowAttached=\(view.window != nil)")
+    guard activeRequestID == nil else { return }
+    presentChat(pendingPresentation.presented, isDark: pendingPresentation.isDark)
+  }
+
+  private func handleChatClose(requestID: Int) {
+    appShellRouteLog("RootChatPresenterBridge handleClose requestId=\(requestID)")
+    onClose?(requestID)
+  }
+
+  private func topMostPresentingController() -> UIViewController? {
+    let window = view.window ?? Self.activeWindow()
+    guard var top = window?.rootViewController else {
+      return nil
+    }
+
+    while let presented = top.presentedViewController {
+      top = presented
+    }
+
+    if let navigation = top as? UINavigationController, let visible = navigation.visibleViewController {
+      return visible
+    }
+
+    if let tab = top as? UITabBarController, let selected = tab.selectedViewController {
+      if let navigation = selected as? UINavigationController, let visible = navigation.visibleViewController
+      {
+        return visible
+      }
+      return selected
+    }
+
+    return top
+  }
+
+  private static func activeWindow() -> UIWindow? {
+    for scene in UIApplication.shared.connectedScenes {
+      guard let windowScene = scene as? UIWindowScene else { continue }
+      if let keyWindow = windowScene.windows.first(where: { $0.isKeyWindow }) {
+        return keyWindow
+      }
+    }
+    return nil
+  }
+}
+
 private enum ChatConversationPage: String {
   case chat
   case profile
@@ -951,11 +1128,12 @@ private final class ChatConversationController: UIViewController {
   }
 
   private func logVisualState(_ event: String, force: Bool = false) {
-    let viewFrame = NSStringFromCGRect(view.frame)
-    let viewBounds = NSStringFromCGRect(view.bounds)
-    let mainFrame = NSStringFromCGRect(mainView.frame)
-    let mainBounds = NSStringFromCGRect(mainView.bounds)
-    let windowBounds = view.window.map { NSStringFromCGRect($0.bounds) } ?? "nil"
+    let viewFrame = NSCoder.string(for: view.frame)
+    let viewBounds = NSCoder.string(for: view.bounds)
+    let mainFrame = NSCoder.string(for: mainView.frame)
+    let mainBounds = NSCoder.string(for: mainView.bounds)
+    let windowBounds = view.window.map { NSCoder.string(for: $0.bounds) } ?? "nil"
+    let safeInsets = NSCoder.string(for: view.safeAreaInsets)
     let signature =
       "\(viewFrame)|\(viewBounds)|\(mainFrame)|\(mainBounds)|\(windowBounds)|\(view.window != nil)|\(view.isHidden)|\(view.alpha)|\(mainView.isHidden)|\(mainView.alpha)"
     if !force, signature == lastLayoutSignature {
@@ -963,7 +1141,7 @@ private final class ChatConversationController: UIViewController {
     }
     lastLayoutSignature = signature
     appShellRouteLog(
-      "ChatConversationController \(event) chatId=\(route.chatId) viewFrame=\(viewFrame) viewBounds=\(viewBounds) mainFrame=\(mainFrame) mainBounds=\(mainBounds) windowBounds=\(windowBounds) safeInsets=\(NSStringFromUIEdgeInsets(view.safeAreaInsets)) hidden=\(view.isHidden) alpha=\(view.alpha) mainHidden=\(mainView.isHidden) mainAlpha=\(mainView.alpha)")
+      "ChatConversationController \(event) chatId=\(route.chatId) viewFrame=\(viewFrame) viewBounds=\(viewBounds) mainFrame=\(mainFrame) mainBounds=\(mainBounds) windowBounds=\(windowBounds) safeInsets=\(safeInsets) hidden=\(view.isHidden) alpha=\(view.alpha) mainHidden=\(mainView.isHidden) mainAlpha=\(mainView.alpha)")
   }
 
   private static func profileHandle(for route: ChatRoute) -> String {
