@@ -82,6 +82,7 @@ final class AppShellCoordinator: ObservableObject {
   @Published var selectedTab: AppShellTab = .chats
   @Published var presentedChat: PresentedChatRoute?
   @Published var chatOpenRequestID: Int = 0
+  @Published var chatSearchPresentationRequestID: Int = 0
 
   private var activeRequestID: Int?
   private weak var activeChatController: ChatConversationController?
@@ -111,6 +112,13 @@ final class AppShellCoordinator: ObservableObject {
       "closeChat requested requestId=\(presentedChat.requestID) chatId=\(presentedChat.route.chatId) title=\(presentedChat.route.title)")
     self.presentedChat = nil
     dismissActiveChatController(animated: true)
+  }
+
+  func openChatSearch() {
+    selectedTab = .chats
+    DispatchQueue.main.async { [weak self] in
+      self?.chatSearchPresentationRequestID &+= 1
+    }
   }
 
   // MARK: - UIKit presentation
@@ -347,7 +355,12 @@ struct AppRootView: View {
           }
           .tag(AppShellTab.calls)
 
-        ChatsRootView()
+        ChatsRootView(
+          storyAvatarImage: settingsTabAvatarImage,
+          storyAvatarFallback: profileController.profile?.displayName
+            ?? AppSessionConfig.current?.name
+            ?? "U"
+        )
           .tabItem {
             Label("Chats", systemImage: "message")
           }
@@ -390,9 +403,15 @@ struct AppRootView: View {
       if let message = toastController.message {
         AppToastBanner(message: message, palette: palette)
           .padding(.horizontal, 20)
-          .padding(.bottom, 30)
+          .padding(.bottom, 116)
           .transition(.move(edge: .bottom).combined(with: .opacity))
       }
+    }
+    .overlay(alignment: .bottom) {
+      AppShellSearchButton(palette: palette) {
+        coordinator.openChatSearch()
+      }
+      .padding(.bottom, 58)
     }
     .animation(.easeInOut(duration: 0.22), value: coordinator.presentedChat?.requestID)
     .animation(.spring(response: 0.3, dampingFraction: 0.82), value: toastController.message)
@@ -408,7 +427,7 @@ struct AppRootView: View {
     settingsTabAvatarImage = await SettingsAvatarImageLoader.load(from: uri)
   }
 
-  private static func renderCircularTabAvatar(
+  fileprivate static func renderCircularTabAvatar(
     source: UIImage?, fallback: String, size: CGFloat
   ) -> UIImage {
     let renderer = UIGraphicsImageRenderer(size: CGSize(width: size, height: size))
@@ -497,21 +516,17 @@ private struct CallsRootView: View {
 private struct ChatsRootView: View {
   @EnvironmentObject private var coordinator: AppShellCoordinator
   @Environment(\.colorScheme) private var colorScheme
+  let storyAvatarImage: UIImage?
+  let storyAvatarFallback: String
   @StateObject private var model = ChatsViewModel()
   @State private var isShowingSearch = false
   @State private var isShowingStorySheet = false
   @State private var isStartingChat = false
   @State private var errorMessage: String?
+  @State private var lastHandledSearchRequestID = 0
 
   private var palette: AppThemePalette {
     AppThemePalette.resolve(for: colorScheme)
-  }
-
-  private var headerState: AppHomeHeaderState {
-    if isStartingChat || model.isLoading {
-      return .updating
-    }
-    return .ready
   }
 
   var body: some View {
@@ -519,6 +534,8 @@ private struct ChatsRootView: View {
       Group {
         if model.rows.isEmpty && model.isLoading {
           ProgressView()
+            .controlSize(.large)
+            .tint(palette.secondaryText)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(palette.background)
         } else if model.rows.isEmpty {
@@ -532,22 +549,19 @@ private struct ChatsRootView: View {
             isShowingSearch = true
           }
         } else {
-          List {
-            ForEach(model.rows, id: \.chatId) { row in
-              Button {
-                coordinator.openChat(ChatRoute(row: row))
-              } label: {
-                ChatHomeRowView(row: row, palette: palette)
-              }
-              .buttonStyle(.plain)
-              .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
-              .listRowSeparator(.hidden)
-              .listRowBackground(Color.clear)
+          ChatHomeNativeListRepresentable(
+            rows: model.rows,
+            isDark: colorScheme == .dark,
+            onSelect: { row in
+              coordinator.openChat(ChatRoute(row: row))
+            },
+            onRefresh: {
+              await model.refresh()
+            },
+            onUnavailableAction: { message in
+              AppToastController.shared.show(message)
             }
-          }
-          .listStyle(.plain)
-          .scrollContentBackground(.hidden)
-          .background(palette.background)
+          )
         }
       }
       .background(palette.background.ignoresSafeArea())
@@ -559,14 +573,17 @@ private struct ChatsRootView: View {
             .disabled(model.rows.isEmpty)
         }
         ToolbarItem(placement: .principal) {
-          AppHomeStatusHeaderView(state: headerState, palette: palette)
+          AppHomeStatusHeaderView(state: .ready, palette: palette)
         }
         ToolbarItemGroup(placement: .topBarTrailing) {
           Button {
             isShowingStorySheet = true
           } label: {
-            AppVectorIcon(glyph: .story, tint: palette.secondaryText)
-              .frame(width: 22, height: 22)
+            AppStoryAvatarButton(
+              image: storyAvatarImage,
+              fallback: storyAvatarFallback,
+              palette: palette
+            )
           }
 
           Button {
@@ -577,11 +594,14 @@ private struct ChatsRootView: View {
           }
         }
       }
-      .refreshable {
-        await model.refresh()
-      }
       .task {
         await model.loadIfNeeded()
+      }
+      .onAppear {
+        presentSearchIfRequested()
+      }
+      .onChange(of: coordinator.chatSearchPresentationRequestID) { _, _ in
+        presentSearchIfRequested()
       }
       .sheet(isPresented: $isShowingSearch) {
         if let config = AppSessionConfig.current {
@@ -596,6 +616,14 @@ private struct ChatsRootView: View {
         StorySheetPlaceholderView(palette: palette)
       }
     }
+  }
+
+  private func presentSearchIfRequested() {
+    let requestID = coordinator.chatSearchPresentationRequestID
+    guard coordinator.selectedTab == .chats else { return }
+    guard requestID > lastHandledSearchRequestID else { return }
+    lastHandledSearchRequestID = requestID
+    isShowingSearch = true
   }
 
   private func handleSearchPayload(_ payload: [String: Any]) {
@@ -665,6 +693,236 @@ private struct SettingsRootView: View {
     NavigationStack {
       SettingsView()
     }
+  }
+}
+
+private struct AppShellSearchButton: View {
+  let palette: AppThemePalette
+  let action: () -> Void
+
+  var body: some View {
+    Button(action: action) {
+      Image(systemName: "magnifyingglass")
+        .font(.system(size: 18, weight: .semibold))
+        .foregroundStyle(palette.text)
+        .frame(width: 50, height: 50)
+        .background(.ultraThinMaterial, in: Circle())
+        .overlay(
+          Circle()
+            .stroke(palette.border, lineWidth: 1)
+        )
+    }
+    .buttonStyle(.plain)
+    .accessibilityLabel("Search")
+  }
+}
+
+private struct AppStoryAvatarButton: View {
+  let image: UIImage?
+  let fallback: String
+  let palette: AppThemePalette
+
+  private var avatarImage: UIImage {
+    AppRootView.renderCircularTabAvatar(
+      source: image,
+      fallback: String(
+        (fallback.nilIfBlank ?? "U").prefix(1)
+      ).uppercased(),
+      size: 28
+    )
+  }
+
+  var body: some View {
+    Image(uiImage: avatarImage)
+      .renderingMode(.original)
+      .frame(width: 28, height: 28)
+      .overlay(
+        Circle()
+          .stroke(palette.border.opacity(0.9), lineWidth: 1)
+      )
+      .accessibilityLabel("Stories")
+  }
+}
+
+private struct ChatHomeNativeListRepresentable: UIViewControllerRepresentable {
+  let rows: [ChatHomeListRow]
+  let isDark: Bool
+  let onSelect: (ChatHomeListRow) -> Void
+  let onRefresh: () async -> Void
+  let onUnavailableAction: (String) -> Void
+
+  func makeUIViewController(context: Context) -> ChatHomeNativeListController {
+    let controller = ChatHomeNativeListController()
+    controller.onSelect = onSelect
+    controller.onRefresh = onRefresh
+    controller.onUnavailableAction = onUnavailableAction
+    controller.apply(rows: rows, isDark: isDark)
+    return controller
+  }
+
+  func updateUIViewController(_ uiViewController: ChatHomeNativeListController, context: Context) {
+    uiViewController.onSelect = onSelect
+    uiViewController.onRefresh = onRefresh
+    uiViewController.onUnavailableAction = onUnavailableAction
+    uiViewController.apply(rows: rows, isDark: isDark)
+  }
+}
+
+private final class ChatHomeNativeListController: UIViewController, UITableViewDataSource,
+  UITableViewDelegate, ChatHomeCardCellSwipeDelegate
+{
+  private let tableView = UITableView(frame: .zero, style: .plain)
+  private let refreshControl = UIRefreshControl()
+
+  fileprivate var onSelect: (ChatHomeListRow) -> Void = { _ in }
+  fileprivate var onRefresh: (() async -> Void)?
+  fileprivate var onUnavailableAction: (String) -> Void = { _ in }
+
+  private var rows: [ChatHomeListRow] = []
+  private var isDark = false
+  private var isRunningRefresh = false
+  private weak var openSwipeCell: ChatHomeCardCell?
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    view.backgroundColor = .clear
+
+    tableView.translatesAutoresizingMaskIntoConstraints = false
+    tableView.backgroundColor = .clear
+    tableView.separatorStyle = .none
+    tableView.rowHeight = 84
+    tableView.contentInset = UIEdgeInsets(top: 8, left: 0, bottom: 24, right: 0)
+    tableView.dataSource = self
+    tableView.delegate = self
+    tableView.register(ChatHomeCardCell.self, forCellReuseIdentifier: ChatHomeCardCell.reuseIdentifier)
+    tableView.refreshControl = refreshControl
+    refreshControl.addTarget(self, action: #selector(handleRefresh), for: .valueChanged)
+
+    view.addSubview(tableView)
+
+    NSLayoutConstraint.activate([
+      tableView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      tableView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      tableView.topAnchor.constraint(equalTo: view.topAnchor),
+      tableView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+    ])
+  }
+
+  func apply(rows: [ChatHomeListRow], isDark: Bool) {
+    self.rows = rows
+    self.isDark = isDark
+    tableView.reloadData()
+  }
+
+  @objc private func handleRefresh() {
+    guard !isRunningRefresh else { return }
+    isRunningRefresh = true
+    Task { @MainActor [weak self] in
+      guard let self else { return }
+      await onRefresh?()
+      isRunningRefresh = false
+      refreshControl.endRefreshing()
+    }
+  }
+
+  func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+    rows.count
+  }
+
+  func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+    guard
+      let cell = tableView.dequeueReusableCell(
+        withIdentifier: ChatHomeCardCell.reuseIdentifier,
+        for: indexPath
+      ) as? ChatHomeCardCell
+    else {
+      return UITableViewCell()
+    }
+
+    let row = rows[indexPath.row]
+    cell.swipeDelegate = self
+    cell.selectionStyle = .none
+    cell.backgroundColor = .clear
+    cell.contentView.backgroundColor = .clear
+    cell.configure(
+      row: row,
+      isDark: isDark,
+      avatarBackgroundColor: nil,
+      avatarGradientColors: resolvedAvatarGradientColors(for: row),
+      isEditing: false,
+      isEditSelected: false
+    )
+    return cell
+  }
+
+  func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+    guard rows.indices.contains(indexPath.row) else { return }
+    openSwipeCell?.closeSwipe(animated: true)
+    openSwipeCell = nil
+    onSelect(rows[indexPath.row])
+    tableView.deselectRow(at: indexPath, animated: true)
+  }
+
+  func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+    openSwipeCell?.closeSwipe(animated: true)
+    openSwipeCell = nil
+  }
+
+  func homeCardCellDidBeginSwipe(_ cell: ChatHomeCardCell) {
+    if openSwipeCell !== cell {
+      openSwipeCell?.closeSwipe(animated: true)
+    }
+    openSwipeCell = cell
+  }
+
+  func homeCardCellDidCloseSwipe(_ cell: ChatHomeCardCell) {
+    if openSwipeCell === cell {
+      openSwipeCell = nil
+    }
+  }
+
+  func homeCardCell(
+    _ cell: ChatHomeCardCell,
+    didTriggerSwipeEvent eventType: String,
+    chatId: String
+  ) {
+    if openSwipeCell === cell {
+      openSwipeCell = nil
+    }
+    onUnavailableAction("Home actions are not wired into this shell yet.")
+  }
+
+  private func resolvedAvatarGradientColors(for row: ChatHomeListRow) -> (UIColor, UIColor)? {
+    let startRaw = isDark ? row.avatarGradientStartDark : row.avatarGradientStartLight
+    let endRaw = isDark ? row.avatarGradientEndDark : row.avatarGradientEndLight
+    guard let startRaw, let endRaw else { return nil }
+    guard let startColor = Self.parseHexColor(startRaw), let endColor = Self.parseHexColor(endRaw)
+    else { return nil }
+    return (startColor, endColor)
+  }
+
+  private static func parseHexColor(_ raw: String) -> UIColor? {
+    var hex = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if hex.hasPrefix("#") {
+      hex.removeFirst()
+    }
+    guard hex.count == 6 || hex.count == 8 else { return nil }
+
+    var value: UInt64 = 0
+    guard Scanner(string: hex).scanHexInt64(&value) else { return nil }
+
+    if hex.count == 6 {
+      let r = CGFloat((value >> 16) & 0xFF) / 255.0
+      let g = CGFloat((value >> 8) & 0xFF) / 255.0
+      let b = CGFloat(value & 0xFF) / 255.0
+      return UIColor(red: r, green: g, blue: b, alpha: 1.0)
+    }
+
+    let r = CGFloat((value >> 24) & 0xFF) / 255.0
+    let g = CGFloat((value >> 16) & 0xFF) / 255.0
+    let b = CGFloat((value >> 8) & 0xFF) / 255.0
+    let a = CGFloat(value & 0xFF) / 255.0
+    return UIColor(red: r, green: g, blue: b, alpha: a)
   }
 }
 
@@ -1335,16 +1593,11 @@ private enum AppHomeHeaderState {
   case ready
 
   var title: String {
-    switch self {
-    case .updating:
-      return "Updating"
-    case .ready:
-      return "Chats"
-    }
+    "Chats"
   }
 
   var showsProgress: Bool {
-    self == .updating
+    false
   }
 }
 
@@ -1481,6 +1734,7 @@ private struct ContactSearchView: View {
   @State private var results: [ContactSearchUser] = []
   @State private var isLoading = false
   @State private var statusText = "Find by username, phone, or user ID"
+  @FocusState private var isQueryFieldFocused: Bool
 
   private var palette: AppThemePalette {
     AppThemePalette.resolve(for: colorScheme)
@@ -1490,6 +1744,7 @@ private struct ContactSearchView: View {
     List {
       Section {
         TextField("Search username, phone, or ID", text: $query)
+          .focused($isQueryFieldFocused)
           .textInputAutocapitalization(.never)
           .autocorrectionDisabled()
           .submitLabel(.search)
@@ -1542,6 +1797,11 @@ private struct ContactSearchView: View {
     .background(palette.background.ignoresSafeArea())
     .navigationTitle("New Chat")
     .navigationBarTitleDisplayMode(.inline)
+    .onAppear {
+      DispatchQueue.main.async {
+        isQueryFieldFocused = true
+      }
+    }
     .toolbar {
       ToolbarItem(placement: .topBarLeading) {
         Button("Close") {
