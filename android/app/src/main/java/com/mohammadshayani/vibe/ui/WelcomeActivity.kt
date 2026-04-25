@@ -22,7 +22,15 @@ import com.google.android.material.button.MaterialButton
 
 class WelcomeActivity : AppCompatActivity() {
   private lateinit var backdropView: WelcomeGpuBackdropView
-  private val animatedWordViews = ArrayList<TextView>()
+  private lateinit var messageLabel: RevealLabel
+  private val messages = listOf(
+    "Unbreakable Encryption.",
+    "Autonomous AI Agents.",
+    "Your Private Sanctuary.",
+  )
+  private var messageHandler = android.os.Handler(android.os.Looper.getMainLooper())
+  private var messageRunnable: Runnable? = null
+  private var currentMessageIndex = 0
 
   override fun onCreate(savedInstanceState: Bundle?) {
     AppAppearanceController.applyStoredPreference(this)
@@ -110,16 +118,37 @@ class WelcomeActivity : AppCompatActivity() {
     }
 
     setContentView(root)
-    root.post { startWordAnimation() }
+
+    // Trigger initial reveal
+    root.postDelayed({
+      messageLabel.reveal(1000L)
+    }, 100L)
+
+    setupSyncAnimation()
+  }
+
+  private fun setupSyncAnimation() {
+    messageRunnable = object : Runnable {
+      override fun run() {
+        currentMessageIndex = (currentMessageIndex + 1) % messages.size
+        messageLabel.transition(messages[currentMessageIndex], 1200L)
+        messageHandler.postDelayed(this, 4500L)
+      }
+    }
+    messageHandler.postDelayed(messageRunnable!!, 4500L)
   }
 
   override fun onResume() {
     super.onResume()
-    backdropView.refreshAppearance()
     backdropView.onHostResume()
+    if (messageRunnable == null) {
+      setupSyncAnimation()
+    }
   }
 
   override fun onPause() {
+    messageRunnable?.let { messageHandler.removeCallbacks(it) }
+    messageRunnable = null
     backdropView.onHostPause()
     super.onPause()
   }
@@ -128,86 +157,48 @@ class WelcomeActivity : AppCompatActivity() {
     return LinearLayout(this).apply {
       orientation = LinearLayout.VERTICAL
       gravity = Gravity.CENTER_HORIZONTAL
+      // Narrower width (matching iOS 40dp margins)
+      setPadding(dp(44f), 0, dp(44f), 0)
 
       addView(
         TextView(context).apply {
-          text = "Vibe"
+          text = "VIBE"
           setTextColor(palette.brandTextColor)
-          setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-          typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+          setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+          typeface = Typeface.create("sans-serif", Typeface.BOLD)
+          letterSpacing = 0.4f
           gravity = Gravity.CENTER
         },
       )
 
+      messageLabel = RevealLabel(this@WelcomeActivity).apply {
+        text = messages[0]
+        // Dimmed contrast (matching iOS 0.88 white)
+        setTextColor(Color.parseColor("#E0E0E0"))
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 26f)
+        typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
+        gravity = Gravity.CENTER
+        setLineSpacing(0f, 1.0f)
+      }
       addView(
-        buildAnimatedWordsRow(palette),
-        LinearLayout.LayoutParams(
-          LinearLayout.LayoutParams.WRAP_CONTENT,
-          LinearLayout.LayoutParams.WRAP_CONTENT,
-        ).apply {
-          topMargin = dp(12f)
-        },
-      )
-
-      addView(
-        TextView(context).apply {
-          text = "Use your secret key to return or create a new identity."
-          setTextColor(palette.secondaryTextColor)
-          setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-          typeface = Typeface.create("sans-serif", Typeface.NORMAL)
-          gravity = Gravity.CENTER
-          setLineSpacing(0f, 1.12f)
-        },
+        messageLabel,
         LinearLayout.LayoutParams(
           LinearLayout.LayoutParams.MATCH_PARENT,
           LinearLayout.LayoutParams.WRAP_CONTENT,
         ).apply {
-          topMargin = dp(16f)
-          marginStart = dp(16f)
-          marginEnd = dp(16f)
+          topMargin = dp(24f)
         },
       )
     }
   }
 
-  private fun buildAnimatedWordsRow(palette: WelcomeSurfacePalette): LinearLayout {
-    return LinearLayout(this).apply {
-      orientation = LinearLayout.HORIZONTAL
-      gravity = Gravity.CENTER
 
-      listOf("Light", "in", "darkness.").forEachIndexed { index, word ->
-        val label =
-          TextView(context).apply {
-            text = word
-            alpha = 0f
-            translationY = dp(10f).toFloat()
-            setTextColor(palette.primaryTextColor)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, if (index == 2) 23f else 24f)
-            typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
-            gravity = Gravity.CENTER
-          }
-        animatedWordViews += label
-        addView(
-          label,
-          LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-          ).apply {
-            if (index > 0) {
-              marginStart = dp(6f)
-            }
-          },
-        )
-      }
-    }
-  }
 
   private fun buildActionPanel(palette: WelcomeSurfacePalette): LinearLayout {
     return LinearLayout(this).apply {
       orientation = LinearLayout.VERTICAL
-      background = palette.panelDrawable(this@WelcomeActivity)
-      elevation = dp(8f).toFloat()
-      setPadding(dp(16f), dp(16f), dp(16f), dp(16f))
+      gravity = Gravity.CENTER_HORIZONTAL
+      setPadding(dp(32f), dp(22f), dp(32f), dp(24f))
 
       val signUpButton = makePrimaryButton("Create Account", palette).apply {
         setOnClickListener {
@@ -248,13 +239,11 @@ class WelcomeActivity : AppCompatActivity() {
       isAllCaps = false
       setTextColor(palette.primaryButtonTextColor)
       textSize = 15f
-      cornerRadius = dp(26f)
-      strokeWidth = dp(1f)
-      strokeColor = ColorStateList.valueOf(palette.primaryButtonBorderColor)
+      cornerRadius = dp(27f)
       backgroundTintList = ColorStateList.valueOf(palette.primaryButtonBackgroundColor)
       insetTop = 0
       insetBottom = 0
-      minimumHeight = dp(52f)
+      minimumHeight = dp(54f)
     }
   }
 
@@ -264,13 +253,13 @@ class WelcomeActivity : AppCompatActivity() {
       isAllCaps = false
       setTextColor(palette.secondaryButtonTextColor)
       textSize = 15f
-      cornerRadius = dp(26f)
+      cornerRadius = dp(27f)
       strokeWidth = dp(1f)
       strokeColor = ColorStateList.valueOf(palette.secondaryButtonBorderColor)
       backgroundTintList = ColorStateList.valueOf(palette.secondaryButtonBackgroundColor)
       insetTop = 0
       insetBottom = 0
-      minimumHeight = dp(52f)
+      minimumHeight = dp(54f)
     }
   }
 
@@ -283,16 +272,7 @@ class WelcomeActivity : AppCompatActivity() {
     }
   }
 
-  private fun startWordAnimation() {
-    animatedWordViews.forEachIndexed { index, view ->
-      view.animate()
-        .alpha(1f)
-        .translationY(0f)
-        .setStartDelay(160L + (index * 210L))
-        .setDuration(760L)
-        .start()
-    }
-  }
+
 
   private fun dp(value: Float): Int =
     TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, value, resources.displayMetrics).toInt()
@@ -329,20 +309,20 @@ private data class WelcomeSurfacePalette(
       return if (isNightMode(context)) {
         WelcomeSurfacePalette(
           isDark = true,
-          backgroundColor = Color.rgb(6, 9, 16),
-          navigationBarColor = Color.rgb(5, 8, 13),
-          brandTextColor = Color.argb(178, 223, 230, 243),
-          primaryTextColor = Color.rgb(248, 250, 255),
-          secondaryTextColor = Color.argb(196, 200, 210, 225),
-          panelTopColor = Color.argb(224, 13, 18, 30),
-          panelBottomColor = Color.argb(214, 8, 11, 19),
-          panelBorderColor = Color.argb(40, 255, 255, 255),
-          primaryButtonBackgroundColor = Color.rgb(227, 235, 248),
-          primaryButtonTextColor = Color.rgb(14, 18, 27),
-          primaryButtonBorderColor = Color.argb(26, 255, 255, 255),
-          secondaryButtonBackgroundColor = Color.argb(22, 255, 255, 255),
-          secondaryButtonTextColor = Color.WHITE,
-          secondaryButtonBorderColor = Color.argb(44, 255, 255, 255),
+          backgroundColor = Color.rgb(4, 4, 5),
+          navigationBarColor = Color.rgb(4, 4, 5),
+          brandTextColor = Color.argb(166, 166, 166, 166),
+          primaryTextColor = Color.rgb(245, 245, 245),
+          secondaryTextColor = Color.argb(166, 166, 166, 166),
+          panelTopColor = Color.TRANSPARENT,
+          panelBottomColor = Color.TRANSPARENT,
+          panelBorderColor = Color.TRANSPARENT,
+          primaryButtonBackgroundColor = Color.rgb(242, 242, 242),
+          primaryButtonTextColor = Color.BLACK,
+          primaryButtonBorderColor = Color.TRANSPARENT,
+          secondaryButtonBackgroundColor = Color.argb(13, 255, 255, 255),
+          secondaryButtonTextColor = Color.rgb(230, 230, 230),
+          secondaryButtonBorderColor = Color.argb(38, 255, 255, 255),
         )
       } else {
         WelcomeSurfacePalette(
@@ -364,6 +344,48 @@ private data class WelcomeSurfacePalette(
         )
       }
     }
+  }
+}
+
+private class RevealLabel(context: android.content.Context) : TextView(context) {
+  init {
+    alpha = 0f
+    translationY = 8f * context.resources.displayMetrics.density
+    scaleX = 0.96f
+    scaleY = 0.96f
+  }
+
+  fun reveal(duration: Long) {
+    animate()
+      .alpha(1f)
+      .translationY(0f)
+      .scaleX(1.0f)
+      .scaleY(1.0f)
+      .setDuration(duration)
+      .setInterpolator(android.view.animation.DecelerateInterpolator())
+      .start()
+  }
+
+  fun transition(toText: String, duration: Long) {
+    animate()
+      .alpha(0f)
+      .translationY(8f * context.resources.displayMetrics.density)
+      .scaleX(0.96f)
+      .scaleY(0.96f)
+      .setDuration(400)
+      .setInterpolator(android.view.animation.AccelerateInterpolator())
+      .withEndAction {
+        text = toText
+        animate()
+          .alpha(1f)
+          .translationY(0f)
+          .scaleX(1.0f)
+          .scaleY(1.0f)
+          .setDuration(duration)
+          .setInterpolator(android.view.animation.DecelerateInterpolator())
+          .start()
+      }
+      .start()
   }
 }
 

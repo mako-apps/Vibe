@@ -119,7 +119,12 @@ private fun resolvePreview(
   val explicit =
     raw["preview"]?.toString()?.trim()?.takeIf { it.isNotEmpty() }
       ?: raw["subtitle"]?.toString()?.trim()?.takeIf { it.isNotEmpty() }
-  if (!explicit.isNullOrBlank()) return explicit
+  if (!explicit.isNullOrBlank()) {
+    if (isSavedMessages && explicit.equals("Your private notes", ignoreCase = true)) {
+      return ""
+    }
+    return explicit
+  }
 
   val previewRows =
     (raw["previewRows"] as? List<*>)
@@ -138,7 +143,7 @@ private fun resolvePreview(
     }
   if (!derived.isNullOrBlank()) return derived
 
-  return if (isSavedMessages) "Your private notes" else "Start a conversation"
+  return if (isSavedMessages) "" else "Start a conversation"
 }
 
 private fun resolveRowAvatarUri(

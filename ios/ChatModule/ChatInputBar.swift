@@ -1348,11 +1348,81 @@ final class ChatInputBar: UIView {
 
   private func makeBackgroundSnapshot(captureRect: CGRect) -> UIView? {
     guard captureRect.width > 1.0, captureRect.height > 1.0 else { return nil }
-    let emptyView = UIView(frame: captureRect)
-    emptyView.backgroundColor = .clear  // Native transparent pill snapshot just like Telegram!
-    emptyView.isOpaque = false
-    emptyView.clipsToBounds = false
-    return emptyView
+
+    // Temporarily strip corner radius so it's not baked into the pixel data.
+    // The transition clipping view's own cornerRadius animation handles the
+    // visual rounding during the morph.
+    let savedGlassRadius = pillGlass.layer.cornerRadius
+    let savedContainerRadius = pillContainer.layer.cornerRadius
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    pillGlass.layer.cornerRadius = 0
+    pillContainer.layer.cornerRadius = 0
+    if #available(iOS 26.0, *) {
+      pillGlass.cornerConfiguration = .uniformCorners(radius: .fixed(0))
+    }
+    // CRITICAL: Hide contentView so we only capture the blur/glass,
+    // NOT the text, gif button, mic button, etc.
+    let wasHidden = pillGlass.contentView.isHidden
+    pillGlass.contentView.isHidden = true
+    pillGlass.setNeedsLayout()
+    pillGlass.layoutIfNeeded()
+    CATransaction.commit()
+
+    let captureRectInGlass = pillContainer.convert(captureRect, to: pillGlass)
+
+    let format = UIGraphicsImageRendererFormat()
+    format.opaque = false
+    format.scale = UIScreen.main.scale
+    let renderer = UIGraphicsImageRenderer(size: captureRect.size, format: format)
+
+    // IMPORTANT: Use drawHierarchy instead of layer.render.
+    // layer.render does NOT capture UIVisualEffectView blur — it produces
+    // a transparent image. drawHierarchy captures what's actually on screen,
+    // including blur, vibrancy, and glass effects.
+    let image = renderer.image { _ in
+      pillGlass.drawHierarchy(
+        in: CGRect(
+          x: -captureRectInGlass.minX,
+          y: -captureRectInGlass.minY,
+          width: pillGlass.bounds.width,
+          height: pillGlass.bounds.height
+        ),
+        afterScreenUpdates: true
+      )
+    }
+
+    // Restore corner radius and content visibility
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    pillGlass.layer.cornerRadius = savedGlassRadius
+    pillContainer.layer.cornerRadius = savedContainerRadius
+    if #available(iOS 26.0, *) {
+      pillGlass.cornerConfiguration = .uniformCorners(radius: .fixed(savedGlassRadius))
+    }
+    pillGlass.contentView.isHidden = wasHidden
+    pillGlass.setNeedsLayout()
+    pillGlass.layoutIfNeeded()
+    CATransaction.commit()
+
+    // Verify the image has actual content (not all transparent)
+    if let cgImage = image.cgImage {
+      let alphaInfo = cgImage.alphaInfo
+      print("[SendMorph] sourceBackground captured: size=\(image.size) alpha=\(alphaInfo.rawValue) bytesPerRow=\(cgImage.bytesPerRow)")
+    } else {
+      print("[SendMorph] sourceBackground capture FAILED — cgImage is nil, using fallback")
+      // Fallback: use the bubble gradient color as source background
+      if let gradientColors = sendGradient.colors as? [CGColor], let first = gradientColors.first {
+        let fallback = UIView(frame: CGRect(origin: .zero, size: captureRect.size))
+        fallback.backgroundColor = UIColor(cgColor: first).withAlphaComponent(0.15)
+        return fallback
+      }
+    }
+
+    let imageView = UIImageView(image: image)
+    imageView.contentMode = .scaleToFill
+    imageView.clipsToBounds = false
+    return imageView
   }
 
   /// Captures Telegram-style transition inputs in one call:
@@ -1571,7 +1641,9 @@ final class ChatInputBar: UIView {
     // Pin them to the bottom of the pill, aligned with the text input box,
     // so they don't float up when text expands or banners are added.
     let textRowH = clampedTextH + textInsetV * 2
-    let btnCenterY = pillH - (textRowH / 2)
+    let textRowBottom = bannerExtra + textRowH
+    let controlBottomInset = max(0.0, (minPillH - sideSize) * 0.5)
+    let btnCenterY = textRowBottom - (sideSize / 2.0) - controlBottomInset
     let squareBounds = CGRect(origin: .zero, size: CGSize(width: sideSize, height: sideSize))
 
     attachGlass.bounds = squareBounds
@@ -1602,7 +1674,8 @@ final class ChatInputBar: UIView {
     pillContainer.layer.cornerRadius = min(cornerBase / 2, 22)
 
     // Position Send Button inside pill (inline with text area)
-    let sendCenterY = bannerExtra + ((clampedTextH + textInsetV * 2) / 2)
+    let sendBottomInset = max(5.0, (minPillH - sendH) * 0.5)
+    let sendCenterY = textRowBottom - (sendH / 2.0) - sendBottomInset
     let sendCenterX = actualPillW - 4 - (sendW / 2)
     sendButton.bounds = CGRect(origin: .zero, size: CGSize(width: sendW, height: sendH))
     sendButton.center = CGPoint(x: sendCenterX, y: sendCenterY)
@@ -1636,9 +1709,10 @@ final class ChatInputBar: UIView {
       gifTrailingInsetCollapsed
       - ((gifTrailingInsetCollapsed - gifTrailingInsetExpanded) * clampedSendProgress)
     let gifX = actualPillW - gifTrailingInset - sendActionReserve - gifButtonSize
+    let gifBottomInset = max(3.0, (minPillH - gifButtonSize) * 0.5)
     gifButton.frame = CGRect(
       x: gifX,
-      y: tfY + (clampedTextH - gifButtonSize) / 2,
+      y: textRowBottom - gifButtonSize - gifBottomInset,
       width: gifButtonSize,
       height: gifButtonSize
     )

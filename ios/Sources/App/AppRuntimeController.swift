@@ -794,11 +794,11 @@ enum AppRootControllerFactory {
   }
 
   static func showAuthenticatedRoot(animated: Bool = true) {
-    replaceRoot(with: makeAuthenticatedController(), animated: animated)
+    replaceRoot(with: makeAuthenticatedController(), animated: animated, slideIn: animated)
   }
 
   static func showWelcomeRoot(animated: Bool = true) {
-    replaceRoot(with: makeWelcomeController(), animated: animated)
+    replaceRoot(with: makeWelcomeController(), animated: animated, slideIn: false)
   }
 
   static func signOut(animated: Bool = true) {
@@ -808,7 +808,7 @@ enum AppRootControllerFactory {
     showWelcomeRoot(animated: animated)
   }
 
-  private static func replaceRoot(with controller: UIViewController, animated: Bool) {
+  private static func replaceRoot(with controller: UIViewController, animated: Bool, slideIn: Bool = false) {
     guard let window = activeWindow() else { return }
 
     let applyRoot = {
@@ -818,12 +818,22 @@ enum AppRootControllerFactory {
     }
 
     if animated {
-      UIView.transition(
-        with: window,
-        duration: 0.25,
-        options: [.transitionCrossDissolve, .allowAnimatedContent]
-      ) {
+      if slideIn {
+        let transition = CATransition()
+        transition.duration = 0.32
+        transition.type = .push
+        transition.subtype = .fromRight
+        transition.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        window.layer.add(transition, forKey: kCATransition)
         applyRoot()
+      } else {
+        UIView.transition(
+          with: window,
+          duration: 0.25,
+          options: [.transitionCrossDissolve, .allowAnimatedContent]
+        ) {
+          applyRoot()
+        }
       }
     } else {
       applyRoot()

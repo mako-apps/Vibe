@@ -108,6 +108,7 @@ struct ChatHomeListRow {
   let type: String?
   let isGroup: Bool
   let previewRows: [[String: Any]]
+  let initialMessages: [[String: Any]]
 
   func withPresence(isTyping: Bool, isOnline: Bool, preview: String? = nil) -> ChatHomeListRow {
     ChatHomeListRow(
@@ -131,7 +132,8 @@ struct ChatHomeListRow {
       isSavedMessages: isSavedMessages,
       type: type,
       isGroup: isGroup,
-      previewRows: previewRows
+      previewRows: previewRows,
+      initialMessages: initialMessages
     )
   }
 
@@ -181,6 +183,7 @@ struct ChatHomeListRow {
     let type = normalizedString(raw["type"] ?? raw["chatType"] ?? raw["chat_type"])
     let isGroup =
       parseBool(raw["isGroup"] ?? raw["is_group"]) ?? (type == "group" || type == "channel")
+    let initialMessages = serverMessages
     let previewRows = parsePreviewRows(raw["previewRows"] ?? raw["preview_rows"])
 
     return ChatHomeListRow(
@@ -204,7 +207,8 @@ struct ChatHomeListRow {
       isSavedMessages: isSavedMessages,
       type: type,
       isGroup: isGroup,
-      previewRows: previewRows
+      previewRows: previewRows,
+      initialMessages: initialMessages
     )
   }
 

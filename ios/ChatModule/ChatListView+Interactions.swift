@@ -214,10 +214,10 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
       return
     }
 
-    // All messages swipe to the LEFT to reply (standard convention)
-    let directional = -translation.x
-    let clamped = max(0.0, min(swipeReplyMaxOffset, directional))
-    let signedOffset = clamped * -1.0
+    let horizontal = translation.x
+    let clamped = max(0.0, min(swipeReplyMaxOffset, abs(horizontal)))
+    let direction: CGFloat = horizontal < 0.0 ? -1.0 : 1.0
+    let signedOffset = clamped * direction
 
     if let cell = collectionView.cellForItem(at: indexPath) {
       cell.contentView.transform = CGAffineTransform(translationX: signedOffset, y: 0.0)

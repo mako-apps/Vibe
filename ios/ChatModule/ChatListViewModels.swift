@@ -250,6 +250,9 @@ struct ChatListRow {
   let isPinned: Bool
   let messageId: String?
   let chatId: String?
+  let replyToId: String?
+  let replyPreviewTitle: String?
+  let replyPreviewText: String?
   let reactionEmoji: String?
   let shape: BubbleShape
   let messageType: String
@@ -456,6 +459,9 @@ struct ChatListRow {
       isPinned = false
       messageId = nil
       chatId = nil
+      replyToId = nil
+      replyPreviewTitle = nil
+      replyPreviewText = nil
       reactionEmoji = nil
       shape = BubbleShape(
         isMe: false, showTail: false, borderTopLeftRadius: 18, borderTopRightRadius: 18,
@@ -516,6 +522,31 @@ struct ChatListRow {
       ?? parseNonEmptyString(message["chat_id"])
       ?? parseNonEmptyString(metadata?["chatId"])
       ?? parseNonEmptyString(metadata?["chat_id"])
+    let replyPreview =
+      (message["replyPreview"] as? [String: Any])
+      ?? (message["reply_preview"] as? [String: Any])
+      ?? (metadata?["replyPreview"] as? [String: Any])
+      ?? (metadata?["reply_preview"] as? [String: Any])
+      ?? (extra?["replyPreview"] as? [String: Any])
+      ?? (extra?["reply_preview"] as? [String: Any])
+    replyToId = firstNonEmptyString(
+      in: [message, metadata, extra],
+      keys: ["replyToId", "reply_to_id", "replyToMessageId", "reply_to_message_id"]
+    )
+    replyPreviewTitle = firstNonEmptyString(
+      in: [message, metadata],
+      keys: ["replyPreviewTitle", "reply_preview_title", "replyAuthorName", "reply_author_name"]
+    ) ?? firstNonEmptyString(
+      in: [replyPreview],
+      keys: ["title", "senderName", "sender_name"]
+    )
+    replyPreviewText = firstNonEmptyString(
+      in: [message, metadata],
+      keys: ["replyPreviewText", "reply_preview_text", "replyText", "reply_text"]
+    ) ?? firstNonEmptyString(
+      in: [replyPreview],
+      keys: ["text", "preview"]
+    )
     reactionEmoji = message["reactionEmoji"] as? String
     messageType = ((message["type"] as? String) ?? "text").lowercased()
     shape = BubbleShape.from(raw: message["bubbleShape"] as? [String: Any], isMe: isMe)
@@ -557,18 +588,14 @@ struct ChatListRow {
         guard let value, !value.isEmpty else { return nil }
         return value
       }.first
-    mediaKey =
-      parseNonEmptyString(message["mediaKey"])
-      ?? parseNonEmptyString(message["media_key"])
-      ?? parseNonEmptyString(metadata?["mediaKey"])
-      ?? parseNonEmptyString(metadata?["media_key"])
-    thumbnailBase64 =
-      parseNonEmptyString(message["thumbnailBase64"])
-      ?? parseNonEmptyString(message["thumbnail_base64"])
-      ?? parseNonEmptyString(metadata?["thumbnailBase64"])
-      ?? parseNonEmptyString(metadata?["thumbnail_base64"])
-      ?? parseNonEmptyString(extra?["thumbnailBase64"])
-      ?? parseNonEmptyString(extra?["thumbnail_base64"])
+    mediaKey = firstNonEmptyString(
+      in: [message, metadata],
+      keys: ["mediaKey", "media_key"]
+    )
+    thumbnailBase64 = firstNonEmptyString(
+      in: [message, metadata, extra],
+      keys: ["thumbnailBase64", "thumbnail_base64"]
+    )
     fileName =
       (message["fileName"] as? String)
       ?? (message["file_name"] as? String)
@@ -644,20 +671,18 @@ struct ChatListRow {
       (message["isStreaming"] as? Bool)
       ?? (metadata?["isStreaming"] as? Bool)
       ?? false
-    agentActionSourceId =
-      parseNonEmptyString(metadata?["sourceMessageId"])
-      ?? parseNonEmptyString(metadata?["actionSourceId"])
-      ?? parseNonEmptyString(message["sourceMessageId"])
-      ?? parseNonEmptyString(message["actionSourceId"])
-    agentActionSourceText =
-      parseNonEmptyString(metadata?["sourceText"])
-      ?? parseNonEmptyString(metadata?["actionSourceText"])
-      ?? parseNonEmptyString(message["sourceText"])
-      ?? parseNonEmptyString(message["actionSourceText"])
-      ?? plainContent
-    agentRegeneratePrompt =
-      parseNonEmptyString(metadata?["regeneratePrompt"])
-      ?? parseNonEmptyString(message["regeneratePrompt"])
+    agentActionSourceId = firstNonEmptyString(
+      in: [metadata, message],
+      keys: ["sourceMessageId", "actionSourceId"]
+    )
+    agentActionSourceText = firstNonEmptyString(
+      in: [metadata, message],
+      keys: ["sourceText", "actionSourceText"]
+    ) ?? plainContent
+    agentRegeneratePrompt = firstNonEmptyString(
+      in: [metadata, message],
+      keys: ["regeneratePrompt"]
+    )
     agentCard =
       AgentCard.parse(message["agentCard"] as? [String: Any] ?? [:])
       ?? AgentCard.parse(metadata?["agentCard"] as? [String: Any] ?? [:])
@@ -667,16 +692,14 @@ struct ChatListRow {
         + parseStringArray(message["relatedMessageIds"])
         + parseStringArray(message["related_message_ids"])
     )
-    relatedMessagesTitle =
-      parseNonEmptyString(metadata?["relatedMessagesTitle"])
-      ?? parseNonEmptyString(metadata?["related_messages_title"])
-      ?? parseNonEmptyString(message["relatedMessagesTitle"])
-      ?? parseNonEmptyString(message["related_messages_title"])
-    relatedMessagesSubtitle =
-      parseNonEmptyString(metadata?["relatedMessagesSubtitle"])
-      ?? parseNonEmptyString(metadata?["related_messages_subtitle"])
-      ?? parseNonEmptyString(message["relatedMessagesSubtitle"])
-      ?? parseNonEmptyString(message["related_messages_subtitle"])
+    relatedMessagesTitle = firstNonEmptyString(
+      in: [metadata, message],
+      keys: ["relatedMessagesTitle", "related_messages_title"]
+    )
+    relatedMessagesSubtitle = firstNonEmptyString(
+      in: [metadata, message],
+      keys: ["relatedMessagesSubtitle", "related_messages_subtitle"]
+    )
   }
 }
 
@@ -943,6 +966,9 @@ func chatListRowContentEqual(_ lhs: ChatListRow, _ rhs: ChatListRow) -> Bool {
     && lhs.status == rhs.status
     && lhs.isEdited == rhs.isEdited && lhs.isPinned == rhs.isPinned
     && lhs.messageId == rhs.messageId && lhs.reactionEmoji == rhs.reactionEmoji
+    && lhs.replyToId == rhs.replyToId
+    && lhs.replyPreviewTitle == rhs.replyPreviewTitle
+    && lhs.replyPreviewText == rhs.replyPreviewText
     && lhs.messageType == rhs.messageType
     && lhs.mediaUrl == rhs.mediaUrl && lhs.localMediaUrl == rhs.localMediaUrl
     && lhs.mediaKey == rhs.mediaKey && lhs.fileName == rhs.fileName

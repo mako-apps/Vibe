@@ -10,6 +10,7 @@ enum AppShellTab: Hashable {
   case calls
   case chats
   case settings
+  case search
 }
 
 struct ChatRoute: Identifiable, Hashable {
@@ -39,13 +40,20 @@ struct ChatRoute: Identifiable, Hashable {
   }
 
   init(row: ChatHomeListRow) {
+    let initialRows =
+      !row.previewRows.isEmpty
+      ? row.previewRows
+      : ChatEngine.shared.makeTransientChatRows([
+        "chatId": row.chatId,
+        "messages": row.initialMessages,
+      ])
     self.init(
       chatId: row.chatId,
       title: row.title,
       peerUserId: row.peerUserId,
       avatarURI: row.avatarUri,
       isGroup: row.isGroup,
-      initialRows: row.previewRows
+      initialRows: initialRows
     )
   }
 
@@ -332,50 +340,53 @@ struct AppRootView: View {
   private var settingsTabUIImage: UIImage {
     Self.renderCircularTabAvatar(
       source: settingsTabAvatarImage,
-      fallback: String(
-        (profileController.profile?.displayName ?? AppSessionConfig.current?.name ?? "U")
-          .prefix(1)
-      ).uppercased(),
       size: 26
     )
+  }
+
+  @ViewBuilder
+  private var settingsTabIcon: some View {
+    if settingsTabAvatarImage != nil {
+      Image(uiImage: settingsTabUIImage)
+        .renderingMode(.original)
+    } else {
+      Image(systemName: "person.circle.fill")
+    }
   }
 
   var body: some View {
     ZStack {
       TabView(selection: $coordinator.selectedTab) {
-        ContactsRootView()
-          .tabItem {
-            Label("Contacts", systemImage: "person.2")
-          }
-          .tag(AppShellTab.contacts)
+        Tab("Contacts", systemImage: "person.circle", value: AppShellTab.contacts) {
+          ContactsRootView()
+        }
 
-        CallsRootView()
-          .tabItem {
-            Label("Calls", systemImage: "phone")
-          }
-          .tag(AppShellTab.calls)
+        Tab("Calls", systemImage: "phone", value: AppShellTab.calls) {
+          CallsRootView()
+        }
 
-        ChatsRootView(
-          storyAvatarImage: settingsTabAvatarImage,
-          storyAvatarFallback: profileController.profile?.displayName
-            ?? AppSessionConfig.current?.name
-            ?? "U"
-        )
-          .tabItem {
-            Label("Chats", systemImage: "message")
-          }
-          .tag(AppShellTab.chats)
+        Tab("Chats", systemImage: "message", value: AppShellTab.chats) {
+          ChatsRootView()
+        }
 
-        SettingsRootView()
-          .tabItem {
-            Label {
-              Text("Settings")
-            } icon: {
-              Image(uiImage: settingsTabUIImage)
-                .renderingMode(.original)
-            }
+        Tab(value: AppShellTab.settings) {
+          SettingsRootView()
+        } label: {
+          Label {
+            Text("Settings")
+          } icon: {
+            settingsTabIcon
           }
-          .tag(AppShellTab.settings)
+        }
+
+        Tab(
+          "Search",
+          systemImage: "magnifyingglass",
+          value: AppShellTab.search,
+          role: .search
+        ) {
+          Color.clear
+        }
       }
       .tint(palette.accent)
       .background(palette.background.ignoresSafeArea())
@@ -399,6 +410,10 @@ struct AppRootView: View {
     .onChange(of: profileController.profile?.profileImage) { _, _ in
       Task { await loadSettingsTabAvatar() }
     }
+    .onChange(of: coordinator.selectedTab) { _, newTab in
+      guard newTab == .search else { return }
+      coordinator.openChatSearch()
+    }
     .overlay(alignment: .bottom) {
       if let message = toastController.message {
         AppToastBanner(message: message, palette: palette)
@@ -406,12 +421,6 @@ struct AppRootView: View {
           .padding(.bottom, 116)
           .transition(.move(edge: .bottom).combined(with: .opacity))
       }
-    }
-    .overlay(alignment: .bottom) {
-      AppShellSearchButton(palette: palette) {
-        coordinator.openChatSearch()
-      }
-      .padding(.bottom, 58)
     }
     .animation(.easeInOut(duration: 0.22), value: coordinator.presentedChat?.requestID)
     .animation(.spring(response: 0.3, dampingFraction: 0.82), value: toastController.message)
@@ -427,8 +436,8 @@ struct AppRootView: View {
     settingsTabAvatarImage = await SettingsAvatarImageLoader.load(from: uri)
   }
 
-  fileprivate static func renderCircularTabAvatar(
-    source: UIImage?, fallback: String, size: CGFloat
+  private static func renderCircularTabAvatar(
+    source: UIImage?, size: CGFloat
   ) -> UIImage {
     let renderer = UIGraphicsImageRenderer(size: CGSize(width: size, height: size))
     return renderer.image { context in
@@ -442,19 +451,17 @@ struct AppRootView: View {
         UIColor(red: 180 / 255, green: 190 / 255, blue: 210 / 255, alpha: 1.0).setFill()
         path.fill()
 
-        let text = fallback.isEmpty ? "U" : fallback
-        let attributes: [NSAttributedString.Key: Any] = [
-          .font: UIFont.systemFont(ofSize: size * 0.42, weight: .semibold),
-          .foregroundColor: UIColor.white,
-        ]
-        let textSize = (text as NSString).size(withAttributes: attributes)
-        let textRect = CGRect(
-          x: (size - textSize.width) / 2,
-          y: (size - textSize.height) / 2,
-          width: textSize.width,
-          height: textSize.height
+        let configuration = UIImage.SymbolConfiguration(pointSize: size * 0.48, weight: .semibold)
+        let icon = UIImage(systemName: "person.fill", withConfiguration: configuration)?
+          .withTintColor(.white, renderingMode: .alwaysOriginal)
+        let iconSize = CGSize(width: size * 0.52, height: size * 0.52)
+        let iconRect = CGRect(
+          x: (size - iconSize.width) / 2,
+          y: (size - iconSize.height) / 2,
+          width: iconSize.width,
+          height: iconSize.height
         )
-        (text as NSString).draw(in: textRect, withAttributes: attributes)
+        icon?.draw(in: iconRect)
       }
     }
   }
@@ -516,11 +523,11 @@ private struct CallsRootView: View {
 private struct ChatsRootView: View {
   @EnvironmentObject private var coordinator: AppShellCoordinator
   @Environment(\.colorScheme) private var colorScheme
-  let storyAvatarImage: UIImage?
-  let storyAvatarFallback: String
   @StateObject private var model = ChatsViewModel()
   @State private var isShowingSearch = false
-  @State private var isShowingStorySheet = false
+  @State private var isShowingStoryCamera = false
+  @State private var isEditingHome = false
+  @State private var selectedChatIDs = Set<String>()
   @State private var isStartingChat = false
   @State private var errorMessage: String?
   @State private var lastHandledSearchRequestID = 0
@@ -530,92 +537,140 @@ private struct ChatsRootView: View {
   }
 
   var body: some View {
-    NavigationStack {
-      Group {
-        if model.rows.isEmpty && model.isLoading {
-          ProgressView()
-            .controlSize(.large)
-            .tint(palette.secondaryText)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(palette.background)
-        } else if model.rows.isEmpty {
-          AppShellEmptyStateView(
-            icon: "message",
-            title: "No Messages Yet",
-            message: errorMessage ?? model.errorMessage ?? "Start a conversation to catch the vibe.",
-            buttonTitle: "New Chat",
-            palette: palette
-          ) {
-            isShowingSearch = true
-          }
-        } else {
-          ChatHomeNativeListRepresentable(
-            rows: model.rows,
-            isDark: colorScheme == .dark,
-            onSelect: { row in
-              coordinator.openChat(ChatRoute(row: row))
-            },
-            onRefresh: {
-              await model.refresh()
-            },
-            onUnavailableAction: { message in
-              AppToastController.shared.show(message)
-            }
-          )
-        }
-      }
-      .background(palette.background.ignoresSafeArea())
-      .navigationBarTitleDisplayMode(.inline)
-      .toolbarBackground(.hidden, for: .navigationBar)
-      .toolbar {
-        ToolbarItem(placement: .topBarLeading) {
-          EditButton()
-            .disabled(model.rows.isEmpty)
-        }
-        ToolbarItem(placement: .principal) {
-          AppHomeStatusHeaderView(state: .ready, palette: palette)
-        }
-        ToolbarItemGroup(placement: .topBarTrailing) {
-          Button {
-            isShowingStorySheet = true
-          } label: {
-            AppStoryAvatarButton(
-              image: storyAvatarImage,
-              fallback: storyAvatarFallback,
+    ZStack {
+      NavigationStack {
+        Group {
+          if model.rows.isEmpty && model.isLoading {
+            ProgressView()
+              .controlSize(.regular)
+              .tint(palette.secondaryText)
+              .frame(maxWidth: .infinity, maxHeight: .infinity)
+              .background(palette.background)
+          } else if model.rows.isEmpty {
+            AppShellEmptyStateView(
+              icon: "message",
+              title: "No Messages Yet",
+              message: errorMessage ?? model.errorMessage ?? "Start a conversation to catch the vibe.",
+              buttonTitle: "New Chat",
               palette: palette
+            ) {
+              isShowingSearch = true
+            }
+          } else {
+            ChatHomeNativeListRepresentable(
+              rows: model.rows,
+              isDark: colorScheme == .dark,
+              isEditing: isEditingHome,
+              selectedChatIDs: selectedChatIDs,
+              onSelect: { row in
+                coordinator.openChat(ChatRoute(row: row))
+              },
+              onToggleSelection: { chatID in
+                toggleHomeSelection(chatID)
+              },
+              onRefresh: {
+                await model.refresh()
+              },
+              onUnavailableAction: { message in
+                AppToastController.shared.show(message)
+              }
             )
           }
-
-          Button {
-            isShowingSearch = true
-          } label: {
-            AppVectorIcon(glyph: .compose, tint: palette.secondaryText)
-              .frame(width: 22, height: 22)
+        }
+        .safeAreaInset(edge: .bottom) {
+          if isEditingHome {
+            ChatHomeEditActionBar(
+              selectedCount: selectedChatIDs.count,
+              palette: palette,
+              onMarkRead: {
+                Task {
+                  await performHomeEditAction(.markRead)
+                }
+              },
+              onMute: {
+                Task {
+                  await performHomeEditAction(.mute)
+                }
+              },
+              onDelete: {
+                Task {
+                  await performHomeEditAction(.delete)
+                }
+              }
+            )
+            .transition(.move(edge: .bottom).combined(with: .opacity))
           }
         }
-      }
-      .task {
-        await model.loadIfNeeded()
-      }
-      .onAppear {
-        presentSearchIfRequested()
-      }
-      .onChange(of: coordinator.chatSearchPresentationRequestID) { _, _ in
-        presentSearchIfRequested()
-      }
-      .sheet(isPresented: $isShowingSearch) {
-        if let config = AppSessionConfig.current {
-          NavigationStack {
-            ContactSearchView(config: config) { payload in
-              handleSearchPayload(payload)
+        .background(palette.background.ignoresSafeArea())
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(palette.background, for: .navigationBar)
+        .toolbarBackground(.visible, for: .navigationBar)
+        .toolbar(isShowingStoryCamera || isEditingHome ? .hidden : .visible, for: .tabBar)
+        .toolbar {
+          ToolbarItem(placement: .topBarLeading) {
+            Button(isEditingHome ? "Done" : "Edit") {
+              withAnimation(.easeInOut(duration: 0.18)) {
+                isEditingHome.toggle()
+                if !isEditingHome {
+                  selectedChatIDs.removeAll()
+                }
+              }
+            }
+            .foregroundStyle(palette.secondaryText)
+            .disabled(model.rows.isEmpty)
+          }
+          ToolbarItem(placement: .principal) {
+            AppHomeStatusHeaderView(state: .ready, palette: palette)
+          }
+          ToolbarItemGroup(placement: .topBarTrailing) {
+            Button {
+              withAnimation(.easeInOut(duration: 0.24)) {
+                isShowingStoryCamera = true
+              }
+            } label: {
+              AppVectorIcon(glyph: .story, tint: palette.secondaryText)
+                .frame(width: 23, height: 23)
+            }
+
+            Button {
+              isShowingSearch = true
+            } label: {
+              AppVectorIcon(glyph: .compose, tint: palette.secondaryText)
+                .frame(width: 22, height: 22)
+            }
+          }
+        }
+        .task {
+          await model.loadIfNeeded()
+        }
+        .onAppear {
+          presentSearchIfRequested()
+        }
+        .onChange(of: coordinator.chatSearchPresentationRequestID) { _, _ in
+          presentSearchIfRequested()
+        }
+        .sheet(isPresented: $isShowingSearch) {
+          if let config = AppSessionConfig.current {
+            NavigationStack {
+              ContactSearchView(config: config) { payload in
+                handleSearchPayload(payload)
+              }
             }
           }
         }
       }
-      .sheet(isPresented: $isShowingStorySheet) {
-        StorySheetPlaceholderView(palette: palette)
+
+      if isShowingStoryCamera {
+        AppNativeStoryCameraPage {
+          withAnimation(.easeInOut(duration: 0.24)) {
+            isShowingStoryCamera = false
+          }
+        }
+        .transition(.move(edge: .leading).combined(with: .opacity))
+        .zIndex(20)
       }
     }
+    .animation(.easeInOut(duration: 0.18), value: isEditingHome)
   }
 
   private func presentSearchIfRequested() {
@@ -624,6 +679,33 @@ private struct ChatsRootView: View {
     guard requestID > lastHandledSearchRequestID else { return }
     lastHandledSearchRequestID = requestID
     isShowingSearch = true
+  }
+
+  private func toggleHomeSelection(_ chatID: String) {
+    if selectedChatIDs.contains(chatID) {
+      selectedChatIDs.remove(chatID)
+    } else {
+      selectedChatIDs.insert(chatID)
+    }
+  }
+
+  @MainActor
+  private func performHomeEditAction(_ action: ChatHomeEditBulkAction) async {
+    guard !selectedChatIDs.isEmpty else { return }
+    guard let config = AppSessionConfig.current else {
+      AppToastController.shared.show("The current session is unavailable.")
+      return
+    }
+
+    let chatIDs = Array(selectedChatIDs)
+    do {
+      try await ChatHomeEditService.apply(action: action, chatIDs: chatIDs, config: config)
+      selectedChatIDs.removeAll()
+      isEditingHome = false
+      await model.refresh()
+    } catch {
+      AppToastController.shared.show(error.localizedDescription)
+    }
   }
 
   private func handleSearchPayload(_ payload: [String: Any]) {
@@ -696,78 +778,182 @@ private struct SettingsRootView: View {
   }
 }
 
-private struct AppShellSearchButton: View {
-  let palette: AppThemePalette
-  let action: () -> Void
+private enum ChatHomeEditBulkAction {
+  case markRead
+  case mute
+  case delete
+}
 
-  var body: some View {
-    Button(action: action) {
-      Image(systemName: "magnifyingglass")
-        .font(.system(size: 18, weight: .semibold))
-        .foregroundStyle(palette.text)
-        .frame(width: 50, height: 50)
-        .background(.ultraThinMaterial, in: Circle())
-        .overlay(
-          Circle()
-            .stroke(palette.border, lineWidth: 1)
-        )
+private enum ChatHomeEditService {
+  private enum EditError: LocalizedError {
+    case invalidEndpoint
+    case requestFailed(String)
+
+    var errorDescription: String? {
+      switch self {
+      case .invalidEndpoint:
+        return "Chat action endpoint is unavailable."
+      case .requestFailed(let message):
+        return message
+      }
     }
-    .buttonStyle(.plain)
-    .accessibilityLabel("Search")
+  }
+
+  static func apply(
+    action: ChatHomeEditBulkAction,
+    chatIDs: [String],
+    config: AppSessionConfig
+  ) async throws {
+    for chatID in chatIDs {
+      try await apply(action: action, chatID: chatID, config: config)
+    }
+  }
+
+  private static func apply(
+    action: ChatHomeEditBulkAction,
+    chatID: String,
+    config: AppSessionConfig
+  ) async throws {
+    let endpoint: String
+    let method: String
+    let body: [String: Any]?
+
+    switch action {
+    case .markRead:
+      endpoint = "/chat/\(chatID)/mark-unread"
+      method = "POST"
+      body = ["userId": config.userID, "unread": false]
+    case .mute:
+      endpoint = "/chat/\(chatID)/mute"
+      method = "POST"
+      body = ["userId": config.userID, "muted": true]
+    case .delete:
+      endpoint = "/chats/\(chatID)"
+      method = "DELETE"
+      body = nil
+    }
+
+    guard let url = apiURL(base: config.apiBaseURLString, path: endpoint) else {
+      throw EditError.invalidEndpoint
+    }
+
+    var request = URLRequest(url: url)
+    request.httpMethod = method
+    request.timeoutInterval = 20
+    request.setValue("Bearer \(config.authToken)", forHTTPHeaderField: "Authorization")
+    request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
+    if let body {
+      request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+      request.httpBody = try JSONSerialization.data(withJSONObject: body)
+    }
+
+    let (data, response) = try await URLSession.shared.data(for: request)
+    guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+      throw EditError.requestFailed(responseMessage(from: data))
+    }
+  }
+
+  private static func apiURL(base rawBase: String, path: String) -> URL? {
+    var base = rawBase.trimmingCharacters(in: .whitespacesAndNewlines)
+    while base.hasSuffix("/") {
+      base.removeLast()
+    }
+    if base.hasSuffix("/api") {
+      base = String(base.dropLast(4))
+    }
+    return URL(string: base + "/api" + path)
+  }
+
+  private static func responseMessage(from data: Data) -> String {
+    if
+      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+      let message = (json["error"] ?? json["message"] ?? json["reason"]) as? String,
+      !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    {
+      return message
+    }
+    return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+      ?? "Chat action failed."
   }
 }
 
-private struct AppStoryAvatarButton: View {
-  let image: UIImage?
-  let fallback: String
+private struct ChatHomeEditActionBar: View {
+  let selectedCount: Int
   let palette: AppThemePalette
-
-  private var avatarFallbackText: String {
-    let trimmed = fallback.trimmingCharacters(in: .whitespacesAndNewlines)
-    return String((trimmed.isEmpty ? "U" : trimmed).prefix(1)).uppercased()
-  }
-
-  private var avatarImage: UIImage {
-    AppRootView.renderCircularTabAvatar(
-      source: image,
-      fallback: avatarFallbackText,
-      size: 28
-    )
-  }
+  let onMarkRead: () -> Void
+  let onMute: () -> Void
+  let onDelete: () -> Void
 
   var body: some View {
-    Image(uiImage: avatarImage)
-      .renderingMode(.original)
-      .frame(width: 28, height: 28)
-      .overlay(
-        Circle()
-          .stroke(palette.border.opacity(0.9), lineWidth: 1)
-      )
-      .accessibilityLabel("Stories")
+    HStack(spacing: 20) {
+      editActionButton(title: "Read", systemImage: "envelope.open", action: onMarkRead)
+      editActionButton(title: "Mute", systemImage: "bell.slash", action: onMute)
+      Text("\(selectedCount) selected")
+        .font(.system(size: 13, weight: .semibold))
+        .foregroundStyle(palette.secondaryText)
+        .frame(maxWidth: .infinity)
+      editActionButton(title: "Delete", systemImage: "trash", role: .destructive, action: onDelete)
+    }
+    .padding(.horizontal, 18)
+    .padding(.vertical, 10)
+    .background(.bar)
+  }
+
+  private func editActionButton(
+    title: String,
+    systemImage: String,
+    role: ButtonRole? = nil,
+    action: @escaping () -> Void
+  ) -> some View {
+    Button(role: role, action: action) {
+      VStack(spacing: 3) {
+        Image(systemName: systemImage)
+          .font(.system(size: 18, weight: .medium))
+        Text(title)
+          .font(.system(size: 11, weight: .medium))
+      }
+      .frame(minWidth: 48)
+    }
+    .disabled(selectedCount == 0)
   }
 }
 
 private struct ChatHomeNativeListRepresentable: UIViewControllerRepresentable {
   let rows: [ChatHomeListRow]
   let isDark: Bool
+  let isEditing: Bool
+  let selectedChatIDs: Set<String>
   let onSelect: (ChatHomeListRow) -> Void
+  let onToggleSelection: (String) -> Void
   let onRefresh: () async -> Void
   let onUnavailableAction: (String) -> Void
 
   func makeUIViewController(context: Context) -> ChatHomeNativeListController {
     let controller = ChatHomeNativeListController()
     controller.onSelect = onSelect
+    controller.onToggleSelection = onToggleSelection
     controller.onRefresh = onRefresh
     controller.onUnavailableAction = onUnavailableAction
-    controller.apply(rows: rows, isDark: isDark)
+    controller.apply(
+      rows: rows,
+      isDark: isDark,
+      isEditing: isEditing,
+      selectedChatIDs: selectedChatIDs
+    )
     return controller
   }
 
   func updateUIViewController(_ uiViewController: ChatHomeNativeListController, context: Context) {
     uiViewController.onSelect = onSelect
+    uiViewController.onToggleSelection = onToggleSelection
     uiViewController.onRefresh = onRefresh
     uiViewController.onUnavailableAction = onUnavailableAction
-    uiViewController.apply(rows: rows, isDark: isDark)
+    uiViewController.apply(
+      rows: rows,
+      isDark: isDark,
+      isEditing: isEditing,
+      selectedChatIDs: selectedChatIDs
+    )
   }
 }
 
@@ -778,11 +964,14 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
   private let refreshControl = UIRefreshControl()
 
   fileprivate var onSelect: (ChatHomeListRow) -> Void = { _ in }
+  fileprivate var onToggleSelection: (String) -> Void = { _ in }
   fileprivate var onRefresh: (() async -> Void)?
   fileprivate var onUnavailableAction: (String) -> Void = { _ in }
 
   private var rows: [ChatHomeListRow] = []
   private var isDark = false
+  private var isEditingMode = false
+  private var selectedChatIDs = Set<String>()
   private var isRunningRefresh = false
   private weak var openSwipeCell: ChatHomeCardCell?
 
@@ -811,9 +1000,16 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     ])
   }
 
-  func apply(rows: [ChatHomeListRow], isDark: Bool) {
+  func apply(
+    rows: [ChatHomeListRow],
+    isDark: Bool,
+    isEditing: Bool,
+    selectedChatIDs: Set<String>
+  ) {
     self.rows = rows
     self.isDark = isDark
+    self.isEditingMode = isEditing
+    self.selectedChatIDs = selectedChatIDs
     tableView.reloadData()
   }
 
@@ -852,8 +1048,8 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       isDark: isDark,
       avatarBackgroundColor: nil,
       avatarGradientColors: resolvedAvatarGradientColors(for: row),
-      isEditing: false,
-      isEditSelected: false
+      isEditing: isEditingMode,
+      isEditSelected: selectedChatIDs.contains(row.chatId)
     )
     return cell
   }
@@ -862,8 +1058,86 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     guard rows.indices.contains(indexPath.row) else { return }
     openSwipeCell?.closeSwipe(animated: true)
     openSwipeCell = nil
-    onSelect(rows[indexPath.row])
+    let row = rows[indexPath.row]
+    if let cell = tableView.cellForRow(at: indexPath) as? ChatHomeCardCell {
+      cell.flashPressedFeedback()
+    }
+    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    if isEditingMode {
+      let chatID = row.chatId
+      onToggleSelection(chatID)
+      if selectedChatIDs.contains(chatID) {
+        selectedChatIDs.remove(chatID)
+      } else {
+        selectedChatIDs.insert(chatID)
+      }
+      tableView.reloadRows(at: [indexPath], with: .none)
+      return
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.045) { [weak self] in
+      self?.onSelect(row)
+    }
     tableView.deselectRow(at: indexPath, animated: true)
+  }
+
+  func tableView(
+    _ tableView: UITableView,
+    contextMenuConfigurationForRowAt indexPath: IndexPath,
+    point: CGPoint
+  ) -> UIContextMenuConfiguration? {
+    guard !isEditingMode, rows.indices.contains(indexPath.row) else { return nil }
+    let row = rows[indexPath.row]
+    return UIContextMenuConfiguration(identifier: row.chatId as NSString, previewProvider: nil) {
+      [weak self] _ in
+      let openAction = UIAction(
+        title: "Open Chat",
+        image: UIImage(systemName: "bubble.left")
+      ) { [weak self] _ in
+        self?.onSelect(row)
+      }
+      let hasUnread = row.unreadCount > 0 || row.markedUnread
+      let readAction = UIAction(
+        title: hasUnread ? "Mark as Read" : "Mark as Unread",
+        image: UIImage(systemName: hasUnread ? "message.fill" : "circle")
+      ) { [weak self] _ in
+        self?.onUnavailableAction("Home actions are not wired into this shell yet.")
+      }
+      let pinAction = UIAction(
+        title: row.pinned ? "Unpin" : "Pin",
+        image: UIImage(systemName: row.pinned ? "pin.slash" : "pin")
+      ) { [weak self] _ in
+        self?.onUnavailableAction("Home actions are not wired into this shell yet.")
+      }
+      let muteAction = UIAction(
+        title: row.muted ? "Unmute" : "Mute",
+        image: UIImage(systemName: row.muted ? "speaker.wave.2" : "speaker.slash")
+      ) { [weak self] _ in
+        self?.onUnavailableAction("Home actions are not wired into this shell yet.")
+      }
+      let archiveAction = UIAction(
+        title: "Archive",
+        image: UIImage(systemName: "archivebox")
+      ) { [weak self] _ in
+        self?.onUnavailableAction("Home actions are not wired into this shell yet.")
+      }
+      let clearAction = UIAction(
+        title: "Clear Chat",
+        image: UIImage(systemName: "eraser")
+      ) { [weak self] _ in
+        self?.onUnavailableAction("Home actions are not wired into this shell yet.")
+      }
+      let deleteAction = UIAction(
+        title: "Delete",
+        image: UIImage(systemName: "trash"),
+        attributes: .destructive
+      ) { [weak self] _ in
+        self?.onUnavailableAction("Home actions are not wired into this shell yet.")
+      }
+      return UIMenu(
+        title: "",
+        children: [openAction, readAction, pinAction, muteAction, archiveAction, clearAction, deleteAction]
+      )
+    }
   }
 
   func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
@@ -1119,6 +1393,7 @@ private final class ChatConversationController: UIViewController {
   private var currentPage: ChatConversationPage = .chat
   private var openedChatId: String?
   private var didInitialScroll = false
+  private var rowsRefreshGeneration: UInt = 0
   private var lastLayoutSignature: String?
 
   init(route: ChatRoute, isDark: Bool, onClose: (() -> Void)?) {
@@ -1172,17 +1447,12 @@ private final class ChatConversationController: UIViewController {
     super.viewDidAppear(animated)
     logLifecycle("viewDidAppear")
     logVisualState("viewDidAppear", force: true)
-    guard !didInitialScroll else { return }
-    didInitialScroll = true
-    DispatchQueue.main.async { [weak self] in
-      self?.logLifecycle("initialScrollToBottom")
-      self?.mainView.scrollToBottom(animated: false)
-      self?.logVisualState("afterInitialScroll", force: true)
-    }
+    settleInitialBottomIfNeeded(reason: "viewDidAppear")
   }
 
   override func viewDidLayoutSubviews() {
     super.viewDidLayoutSubviews()
+    settleInitialBottomIfNeeded(reason: "viewDidLayoutSubviews")
     logVisualState("viewDidLayoutSubviews")
   }
 
@@ -1255,7 +1525,7 @@ private final class ChatConversationController: UIViewController {
       "ChatConversationController configuredSurface chatId=\(route.chatId) surfaceId=\(surfaceId) peerUserId=\(route.peerUserId ?? "") isGroup=\(route.isGroup) headerMode=\(route.chatId == "saved_messages" ? "savedmessages" : "default") windowAttached=\(view.window != nil)")
 
     refreshHeaderState()
-    refreshRows()
+    refreshRows(preferInitialRows: true)
     logVisualState("afterApplyRoute", force: true)
 
     if forceChannelRefresh {
@@ -1266,32 +1536,94 @@ private final class ChatConversationController: UIViewController {
 
   private func openChatChannelIfNeeded() {
     guard openedChatId != route.chatId else { return }
+    let chatId = route.chatId
+    let peerUserId = route.peerUserId ?? ""
+    openedChatId = chatId
     appShellRouteLog(
-      "ChatConversationController openChatChannel chatId=\(route.chatId) peerUserId=\(route.peerUserId ?? "")")
-    let snapshot = ChatEngine.shared.openChatChannel([
-      "chatId": route.chatId,
-      "peerUserId": route.peerUserId ?? "",
-    ])
-    appShellRouteLog(
-      "ChatConversationController openChatChannelResult chatId=\(route.chatId) snapshotState=\(Self.normalizedString(snapshot["state"]) ?? "nil") connected=\(snapshot["connected"] as? Bool == true) snapshotKeys=\(snapshot.keys.sorted())")
-    openedChatId = route.chatId
+      "ChatConversationController openChatChannel chatId=\(chatId) peerUserId=\(peerUserId)")
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      guard self != nil else { return }
+      let snapshot = ChatEngine.shared.openChatChannel([
+        "chatId": chatId,
+        "peerUserId": peerUserId,
+      ])
+      DispatchQueue.main.async { [weak self] in
+        guard let self else {
+          DispatchQueue.global(qos: .utility).async {
+            _ = ChatEngine.shared.closeChatChannel(["chatId": chatId])
+          }
+          return
+        }
+        guard self.openedChatId == chatId else {
+          DispatchQueue.global(qos: .utility).async {
+            _ = ChatEngine.shared.closeChatChannel(["chatId": chatId])
+          }
+          return
+        }
+        self.appRouteLogOpenResult(chatId: chatId, snapshot: snapshot)
+        self.refreshRows()
+      }
+    }
   }
 
   private func closeOpenedChatChannel() {
     guard let openedChatId else { return }
     appShellRouteLog("ChatConversationController closeChatChannel chatId=\(openedChatId)")
-    _ = ChatEngine.shared.closeChatChannel(["chatId": openedChatId])
     self.openedChatId = nil
+    DispatchQueue.global(qos: .utility).async {
+      _ = ChatEngine.shared.closeChatChannel(["chatId": openedChatId])
+    }
   }
 
-  private func refreshRows() {
-    let nativeRows = ChatEngine.shared.getChatRows(["chatId": route.chatId])
-    let rows = nativeRows.isEmpty ? route.initialRows : nativeRows
-    let firstRowID = Self.normalizedString(rows.first?["id"]) ?? Self.normalizedString(rows.first?["messageId"]) ?? "nil"
+  private func refreshRows(preferInitialRows: Bool = false) {
+    rowsRefreshGeneration &+= 1
+    let generation = rowsRefreshGeneration
+    let chatId = route.chatId
+    let initialRows = route.initialRows
+    if preferInitialRows {
+      let firstRowID =
+        Self.normalizedString(initialRows.first?["id"])
+        ?? Self.normalizedString(initialRows.first?["messageId"])
+        ?? "nil"
+      appShellRouteLog(
+        "ChatConversationController refreshRows immediate chatId=\(chatId) rows=\(initialRows.count) source=initial firstRowId=\(firstRowID)")
+      mainView.setRows(initialRows)
+      settleInitialBottomIfNeeded(reason: "initialRows")
+    }
+
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      let nativeRows = ChatEngine.shared.getChatRows(["chatId": chatId])
+      DispatchQueue.main.async { [weak self] in
+        guard let self, self.route.chatId == chatId, self.rowsRefreshGeneration == generation else {
+          return
+        }
+        let rows = nativeRows.isEmpty ? initialRows : nativeRows
+        let firstRowID =
+          Self.normalizedString(rows.first?["id"])
+          ?? Self.normalizedString(rows.first?["messageId"])
+          ?? "nil"
+        appShellRouteLog(
+          "ChatConversationController refreshRows chatId=\(chatId) rows=\(rows.count) nativeRows=\(nativeRows.count) initialRows=\(initialRows.count) source=\(nativeRows.isEmpty ? "initial" : "native") firstRowId=\(firstRowID)")
+        self.mainView.setRows(rows)
+        self.settleInitialBottomIfNeeded(reason: "refreshRows")
+        self.logVisualState("afterRefreshRows")
+      }
+    }
+  }
+
+  private func appRouteLogOpenResult(chatId: String, snapshot: [String: Any]) {
     appShellRouteLog(
-      "ChatConversationController refreshRows chatId=\(route.chatId) rows=\(rows.count) nativeRows=\(nativeRows.count) initialRows=\(route.initialRows.count) source=\(nativeRows.isEmpty ? "initial" : "native") firstRowId=\(firstRowID)")
-    mainView.setRows(rows)
-    logVisualState("afterRefreshRows")
+      "ChatConversationController openChatChannelResult chatId=\(chatId) snapshotState=\(Self.normalizedString(snapshot["state"]) ?? "nil") connected=\(snapshot["connected"] as? Bool == true) snapshotKeys=\(snapshot.keys.sorted())")
+  }
+
+  private func settleInitialBottomIfNeeded(reason: String) {
+    guard !didInitialScroll else { return }
+    guard view.bounds.width > 0.0, view.bounds.height > 0.0 else { return }
+    didInitialScroll = true
+    mainView.layoutIfNeeded()
+    mainView.scrollToBottom(animated: false)
+    logLifecycle("initialScrollToBottom reason=\(reason)")
+    logVisualState("afterInitialScroll", force: true)
   }
 
   private func refreshHeaderState() {
@@ -1696,34 +2028,6 @@ private struct AppToastBanner: View {
           .stroke(palette.border, lineWidth: 1)
       )
       .shadow(color: Color.black.opacity(0.12), radius: 18, y: 8)
-  }
-}
-
-private struct StorySheetPlaceholderView: View {
-  @Environment(\.dismiss) private var dismiss
-  let palette: AppThemePalette
-
-  var body: some View {
-    NavigationStack {
-      AppShellEmptyStateView(
-        icon: "camera.macro",
-        title: "Stories",
-        message: "The story composer from the old app still needs to be linked into this standalone target.",
-        buttonTitle: nil,
-        palette: palette,
-        action: nil
-      )
-      .background(palette.background.ignoresSafeArea())
-      .navigationTitle("Stories")
-      .navigationBarTitleDisplayMode(.inline)
-      .toolbar {
-        ToolbarItem(placement: .topBarLeading) {
-          Button("Close") {
-            dismiss()
-          }
-        }
-      }
-    }
   }
 }
 

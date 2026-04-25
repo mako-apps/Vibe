@@ -1,6 +1,7 @@
 package com.mohammadshayani.vibe.home
 
 import android.content.Context
+import com.mohammadshayani.vibe.R
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Typeface
@@ -9,6 +10,7 @@ import android.os.Build
 import android.util.LruCache
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.View
 import android.view.ViewOutlineProvider
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -49,7 +51,9 @@ internal class ChatHomeCardView(context: Context) : FrameLayout(context) {
   private val metaColumn = LinearLayout(context)
   private val timeView = TextView(context)
   private val badgeView = TextView(context)
-  private val iconsView = TextView(context)
+  private val statusIconsContainer = LinearLayout(context)
+  private val muteIconView = ImageView(context)
+  private val pinIconView = ImageView(context)
   private var isPressedVisual = false
   private var avatarLoadToken = 0
   private var avatarLoadCall: Call? = null
@@ -155,16 +159,26 @@ internal class ChatHomeCardView(context: Context) : FrameLayout(context) {
     badgeView.background = circleDrawable(Color.argb(255, 23, 132, 209))
     metaColumn.addView(badgeView)
 
-    iconsView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-    iconsView.gravity = Gravity.END
-    iconsView.layoutParams = LinearLayout.LayoutParams(
+    statusIconsContainer.orientation = LinearLayout.HORIZONTAL
+    statusIconsContainer.gravity = Gravity.END
+    statusIconsContainer.layoutParams = LinearLayout.LayoutParams(
       LinearLayout.LayoutParams.WRAP_CONTENT,
       LinearLayout.LayoutParams.WRAP_CONTENT,
     ).apply {
       topMargin = dp(4f)
       gravity = Gravity.END
     }
-    metaColumn.addView(iconsView)
+    metaColumn.addView(statusIconsContainer)
+
+    muteIconView.layoutParams = LinearLayout.LayoutParams(dp(14f), dp(14f)).apply {
+      marginEnd = dp(4f)
+    }
+    muteIconView.setImageResource(R.drawable.ic_vibe_mute)
+    statusIconsContainer.addView(muteIconView)
+
+    pinIconView.layoutParams = LinearLayout.LayoutParams(dp(14f), dp(14f))
+    pinIconView.setImageResource(R.drawable.ic_vibe_pin)
+    statusIconsContainer.addView(pinIconView)
 
     divider.layoutParams = LayoutParams(LayoutParams.MATCH_PARENT, 1).apply {
       gravity = Gravity.BOTTOM
@@ -187,14 +201,16 @@ internal class ChatHomeCardView(context: Context) : FrameLayout(context) {
     titleView.text = row.title
     titleView.setTextColor(primary)
 
-    previewView.text = if (row.isTyping) "typing..." else row.preview
+    val previewText = if (row.isTyping) "typing..." else row.preview
+    previewView.text = previewText
+    previewView.visibility = if (previewText.isBlank()) View.GONE else View.VISIBLE
     previewView.setTextColor(if (row.isTyping) typing else secondary)
 
     timeView.text = row.timeLabel
     timeView.setTextColor(secondary)
 
     avatarFallbackIcon.setImageResource(
-      if (row.isSavedMessages) android.R.drawable.ic_menu_save else android.R.drawable.ic_menu_myplaces,
+      if (row.isSavedMessages) R.drawable.ic_vibe_saved else R.drawable.ic_vibe_tab_avatar_fallback,
     )
     avatarFallbackIcon.setColorFilter(Color.WHITE)
     val resolvedAvatarGradientColors =
@@ -223,14 +239,14 @@ internal class ChatHomeCardView(context: Context) : FrameLayout(context) {
       if (isDark) Color.rgb(157, 216, 255) else Color.rgb(23, 132, 209),
     )
 
-    val icons = buildString {
-      if (row.muted) append("🔇")
-      if (row.muted && row.pinned) append(" ")
-      if (row.pinned) append("📌")
-    }
-    iconsView.text = icons
-    iconsView.visibility = if (icons.isNotEmpty()) VISIBLE else GONE
-    iconsView.setTextColor(secondary)
+    val showStatusIcons = !row.isSavedMessages
+    muteIconView.visibility = if (showStatusIcons && row.muted) VISIBLE else GONE
+    muteIconView.setColorFilter(secondary)
+
+    pinIconView.visibility = if (showStatusIcons && row.pinned) VISIBLE else GONE
+    pinIconView.setColorFilter(secondary)
+
+    statusIconsContainer.visibility = if (showStatusIcons && (row.muted || row.pinned)) VISIBLE else GONE
     pressOverlay.setBackgroundColor(if (isDark) Color.argb(20, 255, 255, 255) else Color.argb(13, 0, 0, 0))
     divider.setBackgroundColor(if (isDark) Color.argb(15, 255, 255, 255) else Color.argb(8, 0, 0, 0))
     setPressedVisual(false)

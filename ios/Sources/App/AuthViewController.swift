@@ -99,7 +99,6 @@ struct AuthSheetAlert: Identifiable {
 final class NativeAuthSheetViewModel: ObservableObject {
   @Published var username = ""
   @Published var secret = ""
-  @Published var statusText: String?
   @Published var isLoading = false
   @Published var activeAlert: AuthSheetAlert?
 
@@ -175,7 +174,7 @@ final class NativeAuthSheetViewModel: ObservableObject {
 
     let transportMode = AppSessionConfig.current?.transportMode ?? .packetMesh
     let apiBaseURLString = AppSessionConfig.current?.apiBaseURLString ?? AppSessionConfig.defaultAPIBaseURLString
-    setLoading(true, status: "Unlocking")
+    isLoading = true
     authTask = Task { [weak self] in
       guard let self else { return }
       do {
@@ -212,7 +211,7 @@ final class NativeAuthSheetViewModel: ObservableObject {
 
     let transportMode = AppSessionConfig.current?.transportMode ?? .packetMesh
     let apiBaseURLString = AppSessionConfig.current?.apiBaseURLString ?? AppSessionConfig.defaultAPIBaseURLString
-    setLoading(true, status: "Generating Keys")
+    isLoading = true
     authTask = Task { [weak self] in
       guard let self else { return }
       do {
@@ -225,7 +224,7 @@ final class NativeAuthSheetViewModel: ObservableObject {
           self.persist(
             result.config,
             storedSecret: result.recoverySecret,
-            shouldShowSecretSavedToast: true
+            shouldShowSecretSavedToast: false
           )
         }
       } catch {
@@ -236,20 +235,18 @@ final class NativeAuthSheetViewModel: ObservableObject {
     }
   }
 
-  private func setLoading(_ loading: Bool, status: String?) {
-    isLoading = loading
-    statusText = status
-  }
 
   private func persist(
     _ config: AppSessionConfig,
     storedSecret: String?,
     shouldShowSecretSavedToast: Bool
   ) {
+    AppSessionConfig.store(config)
+    // Store loginSecret AFTER AppSessionConfig.store() because store() calls
+    // clearConfig() which wipes all keychain secrets including loginSecret.
     if let storedSecret, !storedSecret.isEmpty {
       _ = SecureKeyStore.shared.storeSecret(key: "loginSecret", value: storedSecret)
     }
-    AppSessionConfig.store(config)
     AppProfileController.shared.reset()
     Task.detached {
       await PacketBootstrapService.prefetchIfNeeded(config: config)
@@ -262,7 +259,7 @@ final class NativeAuthSheetViewModel: ObservableObject {
 
   private func finishAuthenticatedFlow() {
     activeAlert = nil
-    setLoading(false, status: nil)
+    isLoading = false
     let completion = onAuthenticated
     dismissHandler? {
       completion?()
@@ -270,7 +267,7 @@ final class NativeAuthSheetViewModel: ObservableObject {
   }
 
   private func presentError(title: String, message: String) {
-    setLoading(false, status: nil)
+    isLoading = false
     activeAlert = AuthSheetAlert(title: title, message: message, kind: .error)
   }
 }
@@ -317,33 +314,16 @@ struct NativeAuthSheetView: View {
               }
             }
 
-            if let statusText = model.statusText {
-              HStack(spacing: 10) {
-                if model.isLoading {
-                  ProgressView()
-                    .tint(NativeAuthSheetTheme.text)
-                    .scaleEffect(0.9)
-                }
-                Text(statusText)
-                  .font(.system(size: 13, weight: .medium))
-                  .foregroundStyle(NativeAuthSheetTheme.muted)
-                Spacer()
-              }
-              .padding(12)
-              .background(NativeAuthSheetTheme.statusFill)
-              .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-              .transition(.opacity.combined(with: .move(edge: .top)))
-            }
-
             Button(action: model.submit) {
-              HStack(spacing: 10) {
+              ZStack {
                 if model.isLoading {
                   ProgressView()
                     .tint(NativeAuthSheetTheme.primaryForeground)
                     .scaleEffect(0.9)
+                } else {
+                  Text(model.mode.buttonTitle)
+                    .font(.system(size: 16, weight: .semibold))
                 }
-                Text(model.mode.buttonTitle)
-                  .font(.system(size: 16, weight: .semibold))
               }
               .frame(maxWidth: .infinity)
             }

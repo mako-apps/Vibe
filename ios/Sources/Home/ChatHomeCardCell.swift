@@ -43,7 +43,6 @@ final class ChatHomeCardCell: UITableViewCell {
   private let avatarContainer = UIView()
   private let avatarImageView = UIImageView()
   private let avatarFallbackIconView = UIImageView()
-  private let avatarFallbackLabel = UILabel()
   private let editSelectionBackgroundView = UIView()
   private let editSelectionCheckView = UIImageView()
   private let onlineDot = UIView()
@@ -102,9 +101,7 @@ final class ChatHomeCardCell: UITableViewCell {
     avatarToken = UUID().uuidString
     lastAvatarURLString = nil
     avatarImageView.image = nil
-    avatarFallbackIconView.isHidden = true
-    avatarFallbackLabel.isHidden = false
-    avatarFallbackLabel.text = nil
+    avatarFallbackIconView.isHidden = false
     avatarContainer.layer.sublayers?.removeAll(where: { $0.name == self.avatarGradientLayerName })
     unreadBadge.isHidden = true
     muteIconView.isHidden = true
@@ -146,7 +143,6 @@ final class ChatHomeCardCell: UITableViewCell {
     isEditing: Bool,
     isEditSelected: Bool
   ) {
-    currentRow = row
     let primary =
       isDark ? UIColor.white : UIColor(red: 22 / 255, green: 28 / 255, blue: 36 / 255, alpha: 1)
     let secondary =
@@ -208,14 +204,8 @@ final class ChatHomeCardCell: UITableViewCell {
     editSelectionCheckView.isHidden = !(isEditing && isEditSelected)
     editSelectionCheckView.tintColor = isDark ? UIColor.black : UIColor.white
 
-    avatarFallbackIconView.image = UIImage(systemName: "bookmark.fill")
+    avatarFallbackIconView.image = UIImage(systemName: row.isSavedMessages ? "bookmark.fill" : "person.fill")
     avatarFallbackIconView.tintColor = .white
-    avatarFallbackLabel.text =
-      row.avatarFallback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-      ? String(row.title.prefix(1)).uppercased()
-      : row.avatarFallback
-    avatarFallbackLabel.textColor = .white
-    updateAvatarFallbackVisibility(hasLoadedImage: false)
 
     let resolvedAvatarGradientColors =
       avatarGradientColors
@@ -273,6 +263,18 @@ final class ChatHomeCardCell: UITableViewCell {
       }
     } else {
       pressOverlayView.alpha = targetAlpha
+    }
+  }
+
+  func flashPressedFeedback(duration: TimeInterval = 0.14) {
+    pressOverlayView.layer.removeAllAnimations()
+    pressOverlayView.alpha = 1
+    UIView.animate(
+      withDuration: duration,
+      delay: 0.045,
+      options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut]
+    ) {
+      self.pressOverlayView.alpha = 0
     }
   }
 
@@ -361,15 +363,8 @@ final class ChatHomeCardCell: UITableViewCell {
 
     avatarFallbackIconView.translatesAutoresizingMaskIntoConstraints = false
     avatarFallbackIconView.contentMode = .scaleAspectFit
-    avatarFallbackIconView.image = UIImage(systemName: "bookmark.fill")
+    avatarFallbackIconView.image = UIImage(systemName: "person.fill")
     avatarFallbackIconView.tintColor = UIColor.white
-
-    avatarFallbackLabel.translatesAutoresizingMaskIntoConstraints = false
-    avatarFallbackLabel.font = .systemFont(ofSize: 24, weight: .bold)
-    avatarFallbackLabel.textAlignment = .center
-    avatarFallbackLabel.adjustsFontSizeToFitWidth = true
-    avatarFallbackLabel.minimumScaleFactor = 0.7
-    avatarFallbackLabel.textColor = UIColor.white
 
     editSelectionBackgroundView.translatesAutoresizingMaskIntoConstraints = false
     editSelectionBackgroundView.backgroundColor = .clear
@@ -451,7 +446,6 @@ final class ChatHomeCardCell: UITableViewCell {
     rowContentContainer.addSubview(avatarContainer)
     avatarContainer.addSubview(avatarImageView)
     avatarContainer.addSubview(avatarFallbackIconView)
-    avatarContainer.addSubview(avatarFallbackLabel)
     editSelectionContainer.addSubview(editSelectionBackgroundView)
     editSelectionBackgroundView.addSubview(editSelectionCheckView)
     rowContentContainer.addSubview(onlineDot)
@@ -513,11 +507,6 @@ final class ChatHomeCardCell: UITableViewCell {
       avatarFallbackIconView.centerYAnchor.constraint(equalTo: avatarContainer.centerYAnchor),
       avatarFallbackIconView.widthAnchor.constraint(equalToConstant: 24),
       avatarFallbackIconView.heightAnchor.constraint(equalToConstant: 24),
-
-      avatarFallbackLabel.leadingAnchor.constraint(greaterThanOrEqualTo: avatarContainer.leadingAnchor, constant: 8),
-      avatarFallbackLabel.trailingAnchor.constraint(lessThanOrEqualTo: avatarContainer.trailingAnchor, constant: -8),
-      avatarFallbackLabel.centerXAnchor.constraint(equalTo: avatarContainer.centerXAnchor),
-      avatarFallbackLabel.centerYAnchor.constraint(equalTo: avatarContainer.centerYAnchor),
 
       editSelectionBackgroundView.centerXAnchor.constraint(equalTo: editSelectionContainer.centerXAnchor),
       editSelectionBackgroundView.centerYAnchor.constraint(equalTo: editSelectionContainer.centerYAnchor),
@@ -1019,18 +1008,12 @@ final class ChatHomeCardCell: UITableViewCell {
     min(1, max(0, value))
   }
 
-  private func updateAvatarFallbackVisibility(hasLoadedImage: Bool) {
-    let showsSavedMessagesGlyph = !hasLoadedImage && (currentRow?.isSavedMessages ?? false)
-    avatarFallbackIconView.isHidden = !showsSavedMessagesGlyph
-    avatarFallbackLabel.isHidden = hasLoadedImage || showsSavedMessagesGlyph
-  }
-
   private func loadAvatarImage(urlString: String?) {
     let normalizedURL = (urlString ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     if normalizedURL == lastAvatarURLString,
       avatarImageView.image != nil
     {
-      updateAvatarFallbackVisibility(hasLoadedImage: true)
+      avatarFallbackIconView.isHidden = true
       return
     }
 
@@ -1046,19 +1029,19 @@ final class ChatHomeCardCell: UITableViewCell {
       scheme == "https" || scheme == "http"
     else {
       avatarImageView.image = nil
-      updateAvatarFallbackVisibility(hasLoadedImage: false)
+      avatarFallbackIconView.isHidden = false
       lastAvatarURLString = nil
       return
     }
 
     if let cached = Self.avatarImageCache.object(forKey: normalizedURL as NSString) {
       avatarImageView.image = cached
-      updateAvatarFallbackVisibility(hasLoadedImage: true)
+      avatarFallbackIconView.isHidden = true
       return
     }
 
     avatarImageView.image = nil
-    updateAvatarFallbackVisibility(hasLoadedImage: false)
+    avatarFallbackIconView.isHidden = false
 
     let token = avatarToken
     var request = URLRequest(url: url)
@@ -1078,7 +1061,7 @@ final class ChatHomeCardCell: UITableViewCell {
       DispatchQueue.main.async {
         guard token == self.avatarToken else { return }
         self.avatarImageView.image = image
-        self.updateAvatarFallbackVisibility(hasLoadedImage: true)
+        self.avatarFallbackIconView.isHidden = true
       }
     }
     avatarLoadTask = task

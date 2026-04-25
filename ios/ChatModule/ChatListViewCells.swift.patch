@@ -1,0 +1,24 @@
+--- /Users/mohammadshayani/Vibe/ios/ChatModule/ChatListViewCells.swift
++++ /Users/mohammadshayani/Vibe/ios/ChatModule/ChatListViewCells.swift
+@@ -7655,11 +7655,13 @@
+     inlineAttachmentView.isHidden = true
+     contentView.layoutIfNeeded()
+     CATransaction.commit()
+ 
+-    let replica = bubbleView.duplicate()
+-    replica.frame = contentView.convert(captureRect, to: view)
+-    let imageView = UIImageView(image: replica.renderToImage())
+-    imageView.frame = replica.frame
++    let format = UIGraphicsImageRendererFormat()
++    format.opaque = false
++    format.scale = UIScreen.main.scale
++    let renderer = UIGraphicsImageRenderer(size: captureRect.size, format: format)
++    let image = renderer.image { context in
++      context.cgContext.translateBy(x: -captureRect.minX, y: -captureRect.minY)
++      contentView.layer.render(in: context.cgContext)
++    }
++    let imageView = UIImageView(image: image)
++    imageView.frame = contentView.convert(captureRect, to: view)
+     imageView.contentMode = .scaleAspectFill
+     imageView.clipsToBounds = false
+     return imageView

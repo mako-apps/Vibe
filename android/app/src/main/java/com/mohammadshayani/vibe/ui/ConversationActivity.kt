@@ -2,46 +2,21 @@ package com.mohammadshayani.vibe.ui
 
 import android.content.Context
 import android.content.Intent
-import android.graphics.Color
-import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.util.TypedValue
-import android.view.Gravity
-import android.view.View
-import android.view.ViewGroup
-import android.widget.FrameLayout
-import android.widget.ImageView
-import android.widget.LinearLayout
-import android.widget.ProgressBar
-import android.widget.TextView
+import android.util.Log
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
-import androidx.recyclerview.widget.LinearLayoutManager
-import androidx.recyclerview.widget.RecyclerView
-import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
-import com.google.android.material.button.MaterialButton
+import com.mohammadshayani.vibe.chat.ChatEngine
+import com.mohammadshayani.vibe.chat.ChatMainView
+import com.mohammadshayani.vibe.chat.NativeChatContext
 import com.mohammadshayani.vibe.home.ChatHomeListRow
-import com.mohammadshayani.vibe.packet.PacketBootstrapService
-import com.mohammadshayani.vibe.packet.PacketRuntime
-import com.mohammadshayani.vibe.packet.PacketTransportMode
 import com.mohammadshayani.vibe.session.AppSessionConfig
-import okhttp3.OkHttpClient
-import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.IOException
 import java.text.DateFormat
-import java.time.Instant
-import java.time.OffsetDateTime
-import java.time.ZonedDateTime
-import java.time.format.DateTimeFormatter
 import java.util.Date
-import java.util.Locale
-import java.util.concurrent.TimeUnit
 
 class ConversationActivity : AppCompatActivity() {
   companion object {
@@ -49,6 +24,7 @@ class ConversationActivity : AppCompatActivity() {
     private const val extraTitle = "title"
     private const val extraPeerUserId = "peer_user_id"
     private const val extraIsSavedMessages = "is_saved_messages"
+    private const val savedMessagesCachePrefs = "vibe_android_saved_messages_cache"
 
     internal fun intent(context: Context, row: ChatHomeListRow): Intent {
       return Intent(context, ConversationActivity::class.java).apply {
@@ -68,567 +44,216 @@ class ConversationActivity : AppCompatActivity() {
     }
   }
 
-  private val adapter = ConversationAdapter()
-
-  private lateinit var swipeRefreshLayout: SwipeRefreshLayout
-  private lateinit var recyclerView: RecyclerView
-  private lateinit var progressView: ProgressBar
-  private lateinit var emptyStateView: LinearLayout
-  private lateinit var emptyTitleView: TextView
-  private lateinit var emptyMessageView: TextView
-  private lateinit var titleView: TextView
-  private lateinit var subtitleView: TextView
-  private lateinit var avatarView: FrameLayout
-  private lateinit var avatarIconView: ImageView
-
-  private var themeSignature = ""
-  private var isLoading = false
-  private var errorMessage: String? = null
-  private var messages: List<ConversationMessage> = emptyList()
-
-  private val chatId: String
-    get() = intent.getStringExtra(extraChatId).orEmpty()
-
-  private val chatTitle: String
-    get() = intent.getStringExtra(extraTitle).orEmpty().ifBlank { "Chat" }
-
-  private val peerUserId: String?
-    get() = intent.getStringExtra(extraPeerUserId)?.trim()?.takeIf { it.isNotEmpty() }
-
-  private val isSavedMessages: Boolean
-    get() = intent.getBooleanExtra(extraIsSavedMessages, false)
+  private lateinit var chatView: ChatMainView
+  private var chatId = ""
+  private var isSavedMessages = false
+  private var savedMessageIds: List<String> = emptyList()
 
   override fun onCreate(savedInstanceState: Bundle?) {
     AppAppearanceController.applyStoredPreference(this)
     super.onCreate(savedInstanceState)
 
-    if (AppSessionConfig.current(applicationContext) == null) {
+    val palette = resolveAppThemePalette(this)
+    applyThemedSystemBars(this, palette)
+
+    val config = AppSessionConfig.current(applicationContext)
+    if (config == null) {
       startActivity(Intent(this, WelcomeActivity::class.java))
       finish()
       return
     }
 
-    themeSignature = appThemeSignature(this)
-    buildViewHierarchy()
-    loadMessages()
-  }
-
-  override fun onResume() {
-    super.onResume()
-    val nextSignature = appThemeSignature(this)
-    if (nextSignature != themeSignature) {
-      recreate()
+    chatId = intent.getStringExtra(extraChatId).orEmpty().ifBlank { "saved_messages" }
+    isSavedMessages = intent.getBooleanExtra(extraIsSavedMessages, false) || chatId == "saved_messages"
+    val title = intent.getStringExtra(extraTitle).orEmpty().ifBlank {
+      if (isSavedMessages) "Saved Messages" else "Chat"
     }
-  }
+    val peerUserId = intent.getStringExtra(extraPeerUserId).orEmpty()
 
-  private fun buildViewHierarchy() {
-    val palette = resolveAppThemePalette(this)
-    applyThemedSystemBars(this, palette)
-    adapter.setPalette(palette)
+    ChatEngine.configure(applicationContext, config.toPayload())
 
-    val root = FrameLayout(this).apply {
-      setBackgroundColor(palette.backgroundColor)
-    }
-
-    val content = LinearLayout(this).apply {
-      orientation = LinearLayout.VERTICAL
-    }
-    root.addView(
-      content,
-      FrameLayout.LayoutParams(
-        FrameLayout.LayoutParams.MATCH_PARENT,
-        FrameLayout.LayoutParams.MATCH_PARENT,
-      ),
-    )
-
-    val header = LinearLayout(this).apply {
-      orientation = LinearLayout.HORIZONTAL
-      gravity = Gravity.CENTER_VERTICAL
-      setPadding(dp(12f), dp(10f), dp(16f), dp(10f))
-      background =
-        GradientDrawable().apply {
-          setColor(adjustColor(palette.backgroundColor, if (palette.isDark) 0.04f else -0.01f))
+    chatView = ChatMainView(this, NativeChatContext(this)).apply {
+      setSurfaceId("standalone-$chatId")
+      setEngineSurfaceId("standalone-engine-$chatId")
+      setEngineChatId(chatId)
+      setEngineMyUserId(config.userId)
+      setEnginePeerUserId(peerUserId)
+      setAppearance(buildNativeThemeSeed(this@ConversationActivity))
+      setHeaderMode(if (isSavedMessages) "saved_messages" else "default")
+      setHeaderTitle(title)
+      setHeaderSubtitle(if (isSavedMessages) "" else peerUserId)
+      setProfileName(title)
+      setInputPlaceholder(if (isSavedMessages) "Saved Message" else "Message")
+      setInputBarEnabled(true)
+      setNativeSendEnabled(true)
+      setStatusAuthorityEnabled(true)
+      setRows(emptyList())
+      nativeEventSink = { payload ->
+        when (payload["type"]) {
+          "headerBack" -> finish()
+          "savedMessageSent" -> if (isSavedMessages) loadSavedMessages(config.userId)
+          "savedMessagesClearRequested" -> if (isSavedMessages) confirmClearSavedMessages(config.userId)
         }
-    }
-    content.addView(
-      header,
-      LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT,
-        LinearLayout.LayoutParams.WRAP_CONTENT,
-      ),
-    )
-
-    header.addView(
-      ImageView(this).apply {
-        setImageResource(android.R.drawable.ic_media_previous)
-        setColorFilter(palette.textColor)
-        background = selectableItemBackground()
-        setPadding(dp(10f), dp(10f), dp(10f), dp(10f))
-        setOnClickListener { finish() }
-      },
-      LinearLayout.LayoutParams(dp(40f), dp(40f)),
-    )
-
-    avatarView = FrameLayout(this).apply {
-      background =
-        GradientDrawable(
-          GradientDrawable.Orientation.TL_BR,
-          intArrayOf(
-            if (isSavedMessages) palette.warningColor else palette.accentColor,
-            adjustColor(if (isSavedMessages) palette.warningColor else palette.accentColor, -0.16f),
-          ),
-        ).apply {
-          shape = GradientDrawable.OVAL
-        }
-    }
-    avatarIconView = ImageView(this).apply {
-      setImageResource(if (isSavedMessages) android.R.drawable.ic_menu_save else android.R.drawable.ic_menu_myplaces)
-      setColorFilter(Color.WHITE)
-      scaleType = ImageView.ScaleType.CENTER_INSIDE
-    }
-    avatarView.addView(
-      avatarIconView,
-      FrameLayout.LayoutParams(dp(20f), dp(20f), Gravity.CENTER),
-    )
-    header.addView(
-      avatarView,
-      LinearLayout.LayoutParams(dp(40f), dp(40f)).apply {
-        marginStart = dp(8f)
-      },
-    )
-
-    val textColumn = LinearLayout(this).apply {
-      orientation = LinearLayout.VERTICAL
-    }
-    header.addView(
-      textColumn,
-      LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-        marginStart = dp(12f)
-      },
-    )
-
-    titleView =
-      TextView(this).apply {
-        text = chatTitle
-        setTextColor(palette.textColor)
-        setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
-        typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
       }
-    subtitleView =
-      TextView(this).apply {
-        text = if (isSavedMessages) "Private notes" else (peerUserId ?: "Messages")
-        setTextColor(palette.secondaryTextColor)
-        setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-      }
-    textColumn.addView(titleView)
-    textColumn.addView(subtitleView)
-
-    swipeRefreshLayout = SwipeRefreshLayout(this).apply {
-      setOnRefreshListener { loadMessages() }
-      setColorSchemeColors(palette.accentColor)
     }
-    content.addView(
-      swipeRefreshLayout,
-      LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT,
-        0,
-        1f,
-      ),
-    )
-
-    val bodyHost = FrameLayout(this)
-    swipeRefreshLayout.addView(
-      bodyHost,
-      ViewGroup.LayoutParams(
-        ViewGroup.LayoutParams.MATCH_PARENT,
-        ViewGroup.LayoutParams.MATCH_PARENT,
-      ),
-    )
-
-    recyclerView = RecyclerView(this).apply {
-      layoutManager = LinearLayoutManager(this@ConversationActivity)
-      adapter = this@ConversationActivity.adapter
-      clipToPadding = false
-      setPadding(dp(14f), dp(18f), dp(14f), dp(18f))
-    }
-    bodyHost.addView(
-      recyclerView,
-      FrameLayout.LayoutParams(
-        FrameLayout.LayoutParams.MATCH_PARENT,
-        FrameLayout.LayoutParams.MATCH_PARENT,
-      ),
-    )
-
-    progressView = ProgressBar(this).apply {
-      visibility = View.GONE
-      indeterminateDrawable?.setTint(palette.accentColor)
-    }
-    bodyHost.addView(
-      progressView,
-      FrameLayout.LayoutParams(
-        FrameLayout.LayoutParams.WRAP_CONTENT,
-        FrameLayout.LayoutParams.WRAP_CONTENT,
-        Gravity.CENTER,
-      ),
-    )
-
-    emptyStateView = LinearLayout(this).apply {
-      orientation = LinearLayout.VERTICAL
-      gravity = Gravity.CENTER_HORIZONTAL
-      visibility = View.GONE
-      setPadding(dp(28f), dp(28f), dp(28f), dp(28f))
-    }
-    bodyHost.addView(
-      emptyStateView,
-      FrameLayout.LayoutParams(
-        FrameLayout.LayoutParams.MATCH_PARENT,
-        FrameLayout.LayoutParams.MATCH_PARENT,
-        Gravity.CENTER,
-      ),
-    )
-    emptyStateView.addView(
-      ImageView(this).apply {
-        setImageResource(if (isSavedMessages) android.R.drawable.ic_menu_save else android.R.drawable.ic_dialog_email)
-        setColorFilter(palette.tertiaryTextColor)
-      },
-      LinearLayout.LayoutParams(dp(42f), dp(42f)),
-    )
-    emptyStateView.addView(space(12f))
-    emptyTitleView =
-      TextView(this).apply {
-        setTextColor(palette.textColor)
-        setTextSize(TypedValue.COMPLEX_UNIT_SP, 19f)
-        typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-        gravity = Gravity.CENTER
-      }
-    emptyStateView.addView(emptyTitleView)
-    emptyStateView.addView(space(8f))
-    emptyMessageView =
-      TextView(this).apply {
-        setTextColor(palette.secondaryTextColor)
-        setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-        gravity = Gravity.CENTER
-      }
-    emptyStateView.addView(emptyMessageView)
-    emptyStateView.addView(space(14f))
-    emptyStateView.addView(
-      MaterialButton(this).apply {
-        text = "Refresh"
-        isAllCaps = false
-        setTextColor(palette.buttonTextColor)
-        backgroundTintList = android.content.res.ColorStateList.valueOf(palette.buttonColor)
-        cornerRadius = dp(24f)
-        setOnClickListener { loadMessages() }
-      },
-    )
-
-    ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
-      val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
-      header.setPadding(dp(12f), bars.top + dp(10f), dp(16f), dp(10f))
-      recyclerView.setPadding(dp(14f), dp(18f), dp(14f), bars.bottom + dp(18f))
-      emptyStateView.setPadding(dp(28f), dp(28f), dp(28f), bars.bottom + dp(28f))
+    setContentView(chatView)
+    ViewCompat.setOnApplyWindowInsetsListener(chatView) { view, insets ->
+      val bars = insets.getInsets(WindowInsetsCompat.Type.navigationBars())
+      view.setPadding(0, 0, 0, bars.bottom)
       insets
     }
 
-    setContentView(root)
-    renderState()
-  }
-
-  private fun loadMessages() {
-    isLoading = true
-    errorMessage = null
-    renderState()
-    ConversationService.fetchMessages(
-      context = applicationContext,
-      chatId = chatId,
-      isSavedMessages = isSavedMessages,
-    ) { result ->
-      swipeRefreshLayout.isRefreshing = false
-      isLoading = false
-      result.onSuccess { next ->
-        messages = next
-      }.onFailure { error ->
-        messages = emptyList()
-        errorMessage = error.localizedMessage ?: error.message ?: "Failed to load messages."
-      }
-      renderState()
-      if (messages.isNotEmpty()) {
-        recyclerView.scrollToPosition(messages.lastIndex)
-      }
+    if (isSavedMessages) {
+      loadCachedSavedMessages(config.userId)
+      loadSavedMessages(config.userId)
+    } else {
+      ChatEngine.openChatChannel(mapOf("chatId" to chatId))
     }
   }
 
-  private fun renderState() {
-    adapter.submit(messages)
-    progressView.visibility = if (isLoading && messages.isEmpty()) View.VISIBLE else View.GONE
-    recyclerView.visibility = if (messages.isEmpty()) View.INVISIBLE else View.VISIBLE
-    emptyStateView.visibility = if (!isLoading && messages.isEmpty()) View.VISIBLE else View.GONE
-    emptyTitleView.text = if (errorMessage != null) "Unable to load chat" else if (isSavedMessages) "No saved messages" else "No messages yet"
-    emptyMessageView.text =
-      errorMessage
-        ?: if (isSavedMessages) {
-          "Saved notes and forwarded items will appear here."
-        } else {
-          "Pull to refresh once the conversation has activity."
-        }
+  private fun loadCachedSavedMessages(userId: String) {
+    val rows = cachedSavedRows(userId) ?: return
+    savedMessageIds = rows.mapNotNull { savedMessageIdFromRow(it) }
+    chatView.setRows(rows)
+    Log.i("ConversationActivity", "loaded cached saved messages rows=${rows.size}")
   }
 
-  private fun selectableItemBackground() =
-    obtainStyledAttributes(intArrayOf(android.R.attr.selectableItemBackground)).let { typedArray ->
-      val drawable = getDrawable(typedArray.getResourceId(0, 0))
-      typedArray.recycle()
-      drawable
-    }
-
-  private fun space(valueDp: Float): View {
-    return View(this).apply {
-      layoutParams = LinearLayout.LayoutParams(1, dp(valueDp))
-    }
-  }
-
-  private fun dp(value: Float): Int =
-    TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, value, resources.displayMetrics).toInt()
-}
-
-private data class ConversationMessage(
-  val id: String,
-  val body: String,
-  val timestampMs: Long,
-  val timeLabel: String,
-  val isOutgoing: Boolean,
-)
-
-private class ConversationAdapter : RecyclerView.Adapter<ConversationMessageViewHolder>() {
-  private var palette = AppThemePalette(
-    isDark = true,
-    backgroundColor = Color.BLACK,
-    secondaryBackgroundColor = Color.BLACK,
-    cardColor = Color.BLACK,
-    inputColor = Color.BLACK,
-    elevatedColor = Color.BLACK,
-    textColor = Color.WHITE,
-    secondaryTextColor = Color.LTGRAY,
-    tertiaryTextColor = Color.GRAY,
-    accentColor = Color.CYAN,
-    accentMutedColor = Color.CYAN,
-    buttonColor = Color.CYAN,
-    buttonTextColor = Color.WHITE,
-    bubbleMeColor = Color.CYAN,
-    bubbleThemColor = Color.DKGRAY,
-    borderColor = Color.TRANSPARENT,
-    dividerColor = Color.TRANSPARENT,
-    overlayColor = Color.TRANSPARENT,
-    successColor = Color.GREEN,
-    warningColor = Color.YELLOW,
-    dangerColor = Color.RED,
-  )
-  private val rows = ArrayList<ConversationMessage>()
-
-  fun setPalette(value: AppThemePalette) {
-    palette = value
-    notifyDataSetChanged()
-  }
-
-  fun submit(nextRows: List<ConversationMessage>) {
-    rows.clear()
-    rows.addAll(nextRows)
-    notifyDataSetChanged()
-  }
-
-  override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ConversationMessageViewHolder {
-    return ConversationMessageViewHolder(parent.context)
-  }
-
-  override fun onBindViewHolder(holder: ConversationMessageViewHolder, position: Int) {
-    holder.bind(rows[position], palette)
-  }
-
-  override fun getItemCount(): Int = rows.size
-}
-
-private class ConversationMessageViewHolder(
-  context: Context,
-) : RecyclerView.ViewHolder(FrameLayout(context)) {
-  private val root = itemView as FrameLayout
-  private val bubble = LinearLayout(context)
-  private val bodyView = TextView(context)
-  private val timeView = TextView(context)
-
-  init {
-    root.layoutParams = RecyclerView.LayoutParams(
-      RecyclerView.LayoutParams.MATCH_PARENT,
-      RecyclerView.LayoutParams.WRAP_CONTENT,
-    ).apply {
-      topMargin = dp(context, 4f)
-      bottomMargin = dp(context, 4f)
-    }
-
-    bubble.orientation = LinearLayout.VERTICAL
-    bubble.setPadding(dp(context, 14f), dp(context, 10f), dp(context, 14f), dp(context, 10f))
-
-    bodyView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
-    bodyView.setLineSpacing(0f, 1.08f)
-    bodyView.maxWidth = dp(context, 280f)
-
-    timeView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-    timeView.gravity = Gravity.END
-
-    bubble.addView(
-      bodyView,
-      LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.WRAP_CONTENT,
-        LinearLayout.LayoutParams.WRAP_CONTENT,
-      ),
-    )
-    bubble.addView(
-      timeView,
-      LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.WRAP_CONTENT,
-        LinearLayout.LayoutParams.WRAP_CONTENT,
-      ).apply {
-        topMargin = dp(context, 6f)
-        gravity = Gravity.END
-      },
-    )
-
-    root.addView(
-      bubble,
-      FrameLayout.LayoutParams(
-        FrameLayout.LayoutParams.WRAP_CONTENT,
-        FrameLayout.LayoutParams.WRAP_CONTENT,
-        Gravity.START,
-      ),
-    )
-  }
-
-  fun bind(row: ConversationMessage, palette: AppThemePalette) {
-    (bubble.layoutParams as FrameLayout.LayoutParams).gravity =
-      if (row.isOutgoing) Gravity.END else Gravity.START
-    bodyView.text = row.body
-    timeView.text = row.timeLabel
-    bubble.background =
-      GradientDrawable().apply {
-        shape = GradientDrawable.RECTANGLE
-        cornerRadius = dp(root.context, 19f).toFloat()
-        setColor(if (row.isOutgoing) palette.bubbleMeColor else palette.bubbleThemColor)
-      }
-    bodyView.setTextColor(if (row.isOutgoing) palette.buttonTextColor else palette.textColor)
-    timeView.setTextColor(
-      if (row.isOutgoing) colorRgba(255, 255, 255, 0.72f) else palette.secondaryTextColor,
-    )
-  }
-}
-
-private object ConversationService {
-  private val httpClient by lazy {
-    OkHttpClient.Builder()
-      .connectTimeout(15, TimeUnit.SECONDS)
-      .readTimeout(20, TimeUnit.SECONDS)
-      .writeTimeout(20, TimeUnit.SECONDS)
-      .callTimeout(22, TimeUnit.SECONDS)
-      .build()
-  }
-  private val mainHandler = Handler(Looper.getMainLooper())
-
-  fun fetchMessages(
-    context: Context,
-    chatId: String,
-    isSavedMessages: Boolean,
-    callback: (Result<List<ConversationMessage>>) -> Unit,
-  ) {
-    val config = AppSessionConfig.current(context)
-    if (config == null) {
-      callback(Result.failure(IllegalStateException("Missing native auth config.")))
-      return
-    }
-
+  private fun loadSavedMessages(userId: String) {
     Thread {
-      val result = runCatching {
-        val request = buildRequest(config, chatId, isSavedMessages)
-        when (config.transportMode) {
-          PacketTransportMode.OFFLINE ->
-            throw IOException("Transport mode offline is not available in the standalone native app.")
-          PacketTransportMode.BRIDGE_TEXT ->
-            throw IOException("Transport mode bridge_text is not available in the standalone native app.")
-          PacketTransportMode.PACKET_MESH -> {
-            val snapshot = PacketRuntime.ensureStarted(context, config)
-            execute(PacketRuntime.buildHttpClient(snapshot), request, config, isSavedMessages)
-          }
-          PacketTransportMode.DIRECT -> {
-            try {
-              val rows = execute(httpClient, request, config, isSavedMessages)
-              PacketRuntime.stop(context, resetToDirect = true)
-              PacketBootstrapService.prefetchIfNeeded(context, config)
-              rows
-            } catch (_: Throwable) {
-              val snapshot = PacketRuntime.ensureStarted(context, config)
-              execute(PacketRuntime.buildHttpClient(snapshot), request, config, isSavedMessages)
-            }
-          }
-        }
+      val result = ChatEngine.fetchSavedMessages(mapOf("userId" to userId))
+      @Suppress("UNCHECKED_CAST")
+      val messages = result["messages"] as? List<Map<String, Any?>> ?: emptyList()
+      val rows =
+        messages
+          .sortedBy { savedMessageTimestampMs(it) }
+          .mapIndexed { index, message -> savedMessageRow(index, message, userId) }
+      runOnUiThread {
+        savedMessageIds = rows.mapNotNull { savedMessageIdFromRow(it) }
+        chatView.setRows(rows)
+        cacheSavedRows(userId, rows)
+        Log.i("ConversationActivity", "loaded remote saved messages rows=${rows.size} success=${result["success"]}")
       }
-      mainHandler.post { callback(result) }
     }.start()
   }
 
-  private fun buildRequest(
-    config: AppSessionConfig,
-    chatId: String,
-    isSavedMessages: Boolean,
-  ): Request {
-    val base = config.apiBaseUrl.trim().trimEnd('/')
-    val pathBase = if (base.lowercase().endsWith("/api")) base else "$base/api"
-    val url =
-      if (isSavedMessages) {
-        "$pathBase/saved_messages/${config.userId}"
-      } else {
-        "$pathBase/chat/$chatId/messages?limit=60"
-      }
-    return Request.Builder()
-      .url(url)
-      .get()
-      .header("Accept", "application/json")
-      .header("ngrok-skip-browser-warning", "true")
-      .header("Authorization", "Bearer ${config.authToken}")
-      .build()
+  private fun confirmClearSavedMessages(userId: String) {
+    val ids = savedMessageIds
+    if (ids.isEmpty()) return
+    AlertDialog.Builder(this)
+      .setTitle("Clear Saved Messages?")
+      .setMessage("This removes all saved messages from this device and your account.")
+      .setNegativeButton("Cancel", null)
+      .setPositiveButton("Clear") { _, _ -> clearSavedMessages(userId, ids) }
+      .show()
   }
 
-  private fun execute(
-    client: OkHttpClient,
-    request: Request,
-    config: AppSessionConfig,
-    isSavedMessages: Boolean,
-  ): List<ConversationMessage> {
-    client.newCall(request).execute().use { response ->
-      if (!response.isSuccessful) {
-        throw IOException(
-          "Request failed with status ${response.code}: ${response.body?.string().orEmpty().take(160)}",
-        )
+  private fun clearSavedMessages(userId: String, ids: List<String>) {
+    savedMessageIds = emptyList()
+    chatView.setRows(emptyList())
+    Thread {
+      var successCount = 0
+      ids.forEach { id ->
+        val result = ChatEngine.deleteSavedMessage(mapOf("userId" to userId, "messageId" to id))
+        if ((result["success"] as? Boolean) == true) successCount += 1
       }
-      val body = response.body?.string().orEmpty()
-      return parseConversationMessages(parsePayload(body), config.userId, isSavedMessages)
-    }
+      cacheSavedRows(userId, emptyList())
+      Log.i("ConversationActivity", "clear saved messages requested=${ids.size} success=$successCount")
+      loadSavedMessages(userId)
+    }.start()
   }
 
-  private fun parsePayload(body: String): List<Map<String, Any?>> {
-    val trimmed = body.trim()
-    if (trimmed.startsWith("{")) {
-      val obj = JSONObject(trimmed)
-      val nested = obj.optJSONArray("messages") ?: obj.optJSONArray("data") ?: JSONArray()
-      return parseArray(nested)
-    }
-    return parseArray(JSONArray(trimmed))
+  private fun savedMessageTimestampMs(message: Map<String, Any?>): Long {
+    return (message["timestampMs"] as? Number)?.toLong()
+      ?: (message["timestamp"] as? Number)?.toLong()
+      ?: 0L
   }
 
-  private fun parseArray(array: JSONArray): List<Map<String, Any?>> {
-    val items = ArrayList<Map<String, Any?>>(array.length())
-    for (index in 0 until array.length()) {
-      val item = array.opt(index)
-      if (item is JSONObject) {
-        items.add(jsonObjectToMap(item))
-      }
+  private fun savedMessageRow(
+    index: Int,
+    message: Map<String, Any?>,
+    userId: String,
+  ): Map<String, Any?> {
+    val id = message["id"]?.toString()?.takeIf { it.isNotBlank() } ?: "saved-$index"
+    val timestampMs = savedMessageTimestampMs(message).takeIf { it > 0L } ?: System.currentTimeMillis()
+    val type = message["type"]?.toString()?.ifBlank { "text" } ?: "text"
+    val fromId = message["fromId"]?.toString()
+    val text = message["text"]?.toString()
+      ?: message["plaintext"]?.toString()
+      ?: message["content"]?.toString()
+      ?: ""
+    val rowMessage = linkedMapOf<String, Any?>(
+      "id" to id,
+      "text" to text,
+      "timestamp" to DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(timestampMs)),
+      "timestampMs" to timestampMs,
+      "type" to type,
+      "isMe" to (fromId.isNullOrBlank() || fromId == userId),
+      "status" to (message["status"] ?: "sent"),
+    )
+    listOf(
+      "mediaUrl",
+      "localMediaUrl",
+      "fileName",
+      "mediaKey",
+      "duration",
+      "width",
+      "height",
+      "waveform",
+      "isVideoNote",
+      "stickerId",
+      "stickerPackId",
+      "packId",
+      "stickerBundleFileName",
+      "bundleFileName",
+      "emoji",
+    ).forEach { key ->
+      message[key]?.let { rowMessage[key] = it }
     }
-    return items
+    return mapOf(
+      "kind" to "message",
+      "key" to id,
+      "message" to rowMessage,
+    )
+  }
+
+  private fun savedMessageIdFromRow(row: Map<String, Any?>): String? {
+    val message = row["message"] as? Map<*, *> ?: return null
+    return message["id"]?.toString()?.takeIf { it.isNotBlank() }
+  }
+
+  private fun cacheSavedRows(userId: String, rows: List<Map<String, Any?>>) {
+    getSharedPreferences(savedMessagesCachePrefs, Context.MODE_PRIVATE)
+      .edit()
+      .putString(savedMessagesCacheKey(userId), JSONArray(rows.map { jsonValue(it) }).toString())
+      .apply()
+  }
+
+  private fun cachedSavedRows(userId: String): List<Map<String, Any?>>? {
+    val raw = getSharedPreferences(savedMessagesCachePrefs, Context.MODE_PRIVATE)
+      .getString(savedMessagesCacheKey(userId), null)
+      ?: return null
+    return runCatching {
+      jsonArrayToList(JSONArray(raw)).mapNotNull { it as? Map<String, Any?> }
+    }.getOrNull()
+  }
+
+  private fun savedMessagesCacheKey(userId: String): String = "saved_rows_$userId"
+
+  private fun jsonValue(value: Any?): Any {
+    return when (value) {
+      null -> JSONObject.NULL
+      is Map<*, *> -> {
+        val obj = JSONObject()
+        value.forEach { (key, item) ->
+          if (key != null) obj.put(key.toString(), jsonValue(item))
+        }
+        obj
+      }
+      is Iterable<*> -> JSONArray(value.map { jsonValue(it) })
+      is Array<*> -> JSONArray(value.map { jsonValue(it) })
+      is Number, is Boolean, is String -> value
+      else -> value.toString()
+    }
   }
 
   private fun jsonObjectToMap(json: JSONObject): Map<String, Any?> {
@@ -636,7 +261,7 @@ private object ConversationService {
     val keys = json.keys()
     while (keys.hasNext()) {
       val key = keys.next()
-      map[key] = jsonValueToAny(json.opt(key))
+      map[key] = jsonAny(json.opt(key))
     }
     return map
   }
@@ -644,12 +269,12 @@ private object ConversationService {
   private fun jsonArrayToList(json: JSONArray): List<Any?> {
     val list = ArrayList<Any?>(json.length())
     for (index in 0 until json.length()) {
-      list.add(jsonValueToAny(json.opt(index)))
+      list.add(jsonAny(json.opt(index)))
     }
     return list
   }
 
-  private fun jsonValueToAny(value: Any?): Any? {
+  private fun jsonAny(value: Any?): Any? {
     return when (value) {
       null, JSONObject.NULL -> null
       is JSONObject -> jsonObjectToMap(value)
@@ -658,74 +283,3 @@ private object ConversationService {
     }
   }
 }
-
-private fun parseConversationMessages(
-  rawRows: List<Map<String, Any?>>,
-  currentUserId: String,
-  isSavedMessages: Boolean,
-): List<ConversationMessage> {
-  return rawRows.mapIndexedNotNull { index, raw ->
-    val body = resolveConversationBody(raw)
-    val timestampMs = resolveTimestampMs(raw) ?: index.toLong()
-    val fromId =
-      normalized(raw["fromId"] ?: raw["from_id"] ?: raw["senderId"] ?: raw["sender_id"] ?: raw["userId"] ?: raw["user_id"])
-    ConversationMessage(
-      id = normalized(raw["id"] ?: raw["messageId"] ?: raw["message_id"]) ?: "row-$index",
-      body = body,
-      timestampMs = timestampMs,
-      timeLabel = DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(timestampMs)),
-      isOutgoing = isSavedMessages || fromId == null || fromId == currentUserId,
-    )
-  }.sortedBy { it.timestampMs }
-}
-
-private fun resolveConversationBody(raw: Map<String, Any?>): String {
-  val explicit =
-    normalized(
-      raw["body"] ?: raw["content"] ?: raw["text"] ?: raw["plainContent"] ?: raw["plain_content"] ?: raw["decryptedContent"] ?: raw["decrypted_content"],
-    )
-  if (!explicit.isNullOrBlank()) return explicit
-
-  val fileName = normalized(raw["fileName"] ?: raw["file_name"])
-  return when (normalized(raw["type"])?.lowercase(Locale.ROOT)) {
-    "image", "gif" -> "Photo"
-    "video" -> "Video"
-    "voice" -> "Voice message"
-    "music" -> "Audio"
-    "file" -> fileName ?: "File"
-    else -> fileName ?: "Unsupported message"
-  }
-}
-
-private fun resolveTimestampMs(raw: Map<String, Any?>): Long? {
-  val direct =
-    parseLong(raw["timestamp"])
-      ?: parseLong(raw["timestampMs"] ?: raw["timestamp_ms"])
-      ?: parseLong(raw["createdAtMs"] ?: raw["created_at_ms"])
-  if (direct != null) {
-    return if (direct < 100000000000L) direct * 1000L else direct
-  }
-
-  val text =
-    normalized(raw["insertedAt"] ?: raw["inserted_at"] ?: raw["createdAt"] ?: raw["created_at"])
-      ?: return null
-  return runCatching { Instant.parse(text).toEpochMilli() }.getOrNull()
-    ?: runCatching { OffsetDateTime.parse(text, DateTimeFormatter.ISO_OFFSET_DATE_TIME).toInstant().toEpochMilli() }.getOrNull()
-    ?: runCatching { ZonedDateTime.parse(text, DateTimeFormatter.ISO_ZONED_DATE_TIME).toInstant().toEpochMilli() }.getOrNull()
-}
-
-private fun parseLong(value: Any?): Long? {
-  return when (value) {
-    is Number -> value.toLong()
-    is String -> value.trim().toLongOrNull()
-    else -> null
-  }
-}
-
-private fun normalized(value: Any?): String? {
-  val text = value?.toString()?.trim().orEmpty()
-  return text.takeIf { it.isNotEmpty() }
-}
-
-private fun dp(context: Context, value: Float): Int =
-  TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, value, context.resources.displayMetrics).toInt()

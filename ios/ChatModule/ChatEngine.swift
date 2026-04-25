@@ -2907,6 +2907,15 @@ final class ChatEngine {
     }
   }
 
+  func makeTransientChatRows(_ payload: [String: Any]) -> [[String: Any]] {
+    let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"])
+    let messages = payload["messages"] as? [[String: Any]]
+    guard let chatId, let messages, !messages.isEmpty else { return [] }
+    return syncOnQueue {
+      buildHistoryRowsLocked(chatId: chatId, rawMessages: messages)
+    }
+  }
+
   func typingUserIds(chatId: String?) -> [String] {
     guard let chatId = normalizedString(chatId), !chatId.isEmpty else { return [] }
     return syncOnQueue {
@@ -4422,6 +4431,21 @@ final class ChatEngine {
     if let longitude = json["longitude"] { out["longitude"] = longitude }
     if let duration = json["duration"] { out["duration"] = duration }
     if let replyToId = json["replyToId"] { out["replyToId"] = replyToId }
+    if let replyPreview = json["replyPreview"] ?? json["reply_preview"] {
+      out["replyPreview"] = replyPreview
+    }
+    if let replyPreviewTitle =
+      json["replyPreviewTitle"] ?? json["reply_preview_title"] ?? json["replyAuthorName"]
+      ?? json["reply_author_name"]
+    {
+      out["replyPreviewTitle"] = replyPreviewTitle
+    }
+    if let replyPreviewText =
+      json["replyPreviewText"] ?? json["reply_preview_text"] ?? json["replyText"]
+      ?? json["reply_text"]
+    {
+      out["replyPreviewText"] = replyPreviewText
+    }
     if let contact = json["contact"] { out["contact"] = contact }
     if let caption = json["caption"] { out["caption"] = caption }
     if let viewOnce = json["viewOnce"] { out["viewOnce"] = viewOnce }
@@ -4451,6 +4475,72 @@ final class ChatEngine {
     formatter.locale = Locale.current
     formatter.dateFormat = "HH:mm"
     return formatter.string(from: Date(timeIntervalSince1970: TimeInterval(timestampMs) / 1000.0))
+  }
+
+  private func messageId(fromRow row: [String: Any]) -> String? {
+    guard normalizedString(row["kind"]) == "message",
+      let message = row["message"] as? [String: Any]
+    else {
+      return nil
+    }
+    return normalizedString(message["id"])
+  }
+
+  private func messageIsMe(fromRow row: [String: Any]) -> Bool {
+    guard let message = row["message"] as? [String: Any] else { return false }
+    return (message["isMe"] as? Bool) == true
+  }
+
+  private func bubbleShapePayload(
+    isMe: Bool,
+    isSequenceStart: Bool,
+    isSequenceEnd: Bool
+  ) -> [String: Any] {
+    var shape: [String: Any] = [
+      "isMe": isMe,
+      "showTail": isSequenceEnd,
+      "borderTopLeftRadius": 18,
+      "borderTopRightRadius": 18,
+      "borderBottomLeftRadius": 18,
+      "borderBottomRightRadius": 18,
+    ]
+
+    if isMe {
+      shape["borderTopRightRadius"] = isSequenceStart ? 18 : 8
+      shape["borderBottomRightRadius"] = isSequenceEnd ? 18 : 5
+    } else {
+      shape["borderTopLeftRadius"] = isSequenceStart ? 18 : 5
+      shape["borderBottomLeftRadius"] = isSequenceEnd ? 18 : 5
+    }
+
+    return shape
+  }
+
+  private func rowsByApplyingBubbleSequenceShapes(_ rows: [[String: Any]]) -> [[String: Any]] {
+    var patchedRows = rows
+    let messageIndices = rows.indices.filter { messageId(fromRow: rows[$0]) != nil }
+    guard !messageIndices.isEmpty else { return rows }
+
+    for (offset, rowIndex) in messageIndices.enumerated() {
+      guard var message = patchedRows[rowIndex]["message"] as? [String: Any] else { continue }
+      let isMe = messageIsMe(fromRow: rows[rowIndex])
+      let previousIsSameSender: Bool = {
+        guard offset > 0 else { return false }
+        return messageIsMe(fromRow: rows[messageIndices[offset - 1]]) == isMe
+      }()
+      let nextIsSameSender: Bool = {
+        guard offset + 1 < messageIndices.count else { return false }
+        return messageIsMe(fromRow: rows[messageIndices[offset + 1]]) == isMe
+      }()
+      message["bubbleShape"] = bubbleShapePayload(
+        isMe: isMe,
+        isSequenceStart: !previousIsSameSender,
+        isSequenceEnd: !nextIsSameSender
+      )
+      patchedRows[rowIndex]["message"] = message
+    }
+
+    return patchedRows
   }
 
   private func upsertLiveMessageRowLocked(chatId: String, messageId: String, row: [String: Any]) {
@@ -4604,6 +4694,13 @@ final class ChatEngine {
     let longitude = parseDoubleValue(decryptedFields["longitude"])
     let duration = parseDoubleValue(decryptedFields["duration"])
     let replyToId = normalizedString(decryptedFields["replyToId"])
+    let replyPreviewTitle = normalizedString(
+      decryptedFields["replyPreviewTitle"] ?? decryptedFields["reply_preview_title"]
+        ?? decryptedFields["replyAuthorName"] ?? decryptedFields["reply_author_name"])
+    let replyPreviewText = normalizedString(
+      decryptedFields["replyPreviewText"] ?? decryptedFields["reply_preview_text"]
+        ?? decryptedFields["replyText"] ?? decryptedFields["reply_text"])
+    let replyPreview = decryptedFields["replyPreview"] ?? decryptedFields["reply_preview"]
     let caption = normalizedString(decryptedFields["caption"])
     let waveform = parseWaveformArray(decryptedFields["waveform"])
     let isEdited = forceEdited || ((decryptedFields["isEdited"] as? Bool) == true)
@@ -4625,6 +4722,9 @@ final class ChatEngine {
     if let caption { metadata["caption"] = caption }
     if let mediaKey = decryptedFields["mediaKey"] { metadata["mediaKey"] = mediaKey }
     if let localMediaUrl { metadata["localMediaUrl"] = localMediaUrl }
+    if let replyPreviewTitle { metadata["replyPreviewTitle"] = replyPreviewTitle }
+    if let replyPreviewText { metadata["replyPreviewText"] = replyPreviewText }
+    if let replyPreview { metadata["replyPreview"] = replyPreview }
     if let stickerId = normalizedString(decryptedFields["stickerId"]) {
       metadata["stickerId"] = stickerId
     }
@@ -4670,6 +4770,9 @@ final class ChatEngine {
     if let fileName { message["fileName"] = fileName }
     if let duration { message["duration"] = duration }
     if let replyToId { message["replyToId"] = replyToId }
+    if let replyPreviewTitle { message["replyPreviewTitle"] = replyPreviewTitle }
+    if let replyPreviewText { message["replyPreviewText"] = replyPreviewText }
+    if let replyPreview { message["replyPreview"] = replyPreview }
     if let caption { message["caption"] = caption }
     if let contact = decryptedFields["contact"] { message["contact"] = contact }
     if !metadata.isEmpty { message["metadata"] = metadata }
@@ -4735,6 +4838,11 @@ final class ChatEngine {
       !isAgentMessage && hadEncryptedContent && encryptedLooksHybrid && decryptedText.isEmpty
 
     var decryptedFields = parseDecryptedMessagePayload(decryptedText)
+    if let rawReplyToId = normalizedString(payload["replyToId"] ?? payload["reply_to_id"]),
+      normalizedString(decryptedFields["replyToId"]) == nil
+    {
+      decryptedFields["replyToId"] = rawReplyToId
+    }
     if let rawMediaUrl, !rawMediaUrl.isEmpty, normalizedString(decryptedFields["mediaUrl"]) == nil {
       decryptedFields["mediaUrl"] = rawMediaUrl
     }
@@ -6089,7 +6197,7 @@ final class ChatEngine {
       let rt = parseLongValue(rhs["timestamp"] ?? rhs["timestampMs"] ?? rhs["timestamp_ms"]) ?? 0
       return lt < rt
     }
-    return sortedMessages.compactMap { raw in
+    let rows: [[String: Any]] = sortedMessages.compactMap { (raw: [String: Any]) -> [String: Any]? in
       guard let messageId = normalizedString(raw["id"] ?? raw["message_id"]) else { return nil }
       let fromId = normalizedString(raw["fromId"] ?? raw["from_id"])
       let type = normalizedString(raw["type"]) ?? "text"
@@ -6154,6 +6262,33 @@ final class ChatEngine {
         return plaintextFallback.isEmpty ? [:] : ["text": plaintextFallback]
       }()
       var enrichedFields = decryptedFields
+      if let rawReplyToId = normalizedString(raw["replyToId"] ?? raw["reply_to_id"]),
+        normalizedString(enrichedFields["replyToId"] ?? enrichedFields["reply_to_id"]) == nil
+      {
+        enrichedFields["replyToId"] = rawReplyToId
+      }
+      if let rawReplyPreview = raw["replyPreview"] ?? raw["reply_preview"],
+        enrichedFields["replyPreview"] == nil,
+        enrichedFields["reply_preview"] == nil
+      {
+        enrichedFields["replyPreview"] = rawReplyPreview
+      }
+      if let rawReplyPreviewTitle = normalizedString(
+        raw["replyPreviewTitle"] ?? raw["reply_preview_title"] ?? raw["replyAuthorName"]
+          ?? raw["reply_author_name"]),
+        normalizedString(enrichedFields["replyPreviewTitle"] ?? enrichedFields["reply_preview_title"])
+          == nil
+      {
+        enrichedFields["replyPreviewTitle"] = rawReplyPreviewTitle
+      }
+      if let rawReplyPreviewText = normalizedString(
+        raw["replyPreviewText"] ?? raw["reply_preview_text"] ?? raw["replyText"]
+          ?? raw["reply_text"]),
+        normalizedString(enrichedFields["replyPreviewText"] ?? enrichedFields["reply_preview_text"])
+          == nil
+      {
+        enrichedFields["replyPreviewText"] = rawReplyPreviewText
+      }
       if let rawMediaUrl, !rawMediaUrl.isEmpty, normalizedString(enrichedFields["mediaUrl"]) == nil
       {
         enrichedFields["mediaUrl"] = rawMediaUrl
@@ -6208,6 +6343,7 @@ final class ChatEngine {
       }
       return row
     }
+    return rowsByApplyingBubbleSequenceShapes(rows)
   }
 
   private func appendJournalLocked(event: String, payload: [String: Any]) {
@@ -6440,6 +6576,21 @@ final class ChatEngine {
       }
       if let replyToId = normalizedString(decryptedFields["replyToId"]) {
         normalized["replyToId"] = replyToId
+      }
+      if let replyPreview = decryptedFields["replyPreview"] ?? decryptedFields["reply_preview"] {
+        normalized["replyPreview"] = replyPreview
+      }
+      if let replyPreviewTitle = normalizedString(
+        decryptedFields["replyPreviewTitle"] ?? decryptedFields["reply_preview_title"]
+          ?? decryptedFields["replyAuthorName"] ?? decryptedFields["reply_author_name"])
+      {
+        normalized["replyPreviewTitle"] = replyPreviewTitle
+      }
+      if let replyPreviewText = normalizedString(
+        decryptedFields["replyPreviewText"] ?? decryptedFields["reply_preview_text"]
+          ?? decryptedFields["replyText"] ?? decryptedFields["reply_text"])
+      {
+        normalized["replyPreviewText"] = replyPreviewText
       }
       if let width = decryptedFields["width"] { normalized["width"] = width }
       if let height = decryptedFields["height"] { normalized["height"] = height }

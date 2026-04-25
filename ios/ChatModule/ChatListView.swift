@@ -583,6 +583,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var hiddenMessageId: String?
   private var pendingSendTransition: SendTransitionPayload?
   private var activeSendTransition: SendTransitionState?
+  private var projectedSendTransitionMessageId: String?
+  private var deferredPendingSendBottomScrollMessageId: String?
   var swipeReplyPanGesture: UIPanGestureRecognizer?
   var contextMenuLongPressGesture: UILongPressGestureRecognizer?
   var dismissInputTapGesture: UITapGestureRecognizer?
@@ -600,8 +602,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var inputBarEnabled = false
   private var inputBarPlaceholder = "Message"
   var keyboardHeight: CGFloat = 0
-  /// Persistent overlay container that sits above everything for send transitions.
+  /// Persistent overlay container that sits above the list but below the composer.
   private let transitionOverlayHost = UIView()
+  private let nativeSendMorphTopRightRadius: CGFloat = 8.0
 
   // --- Debug animation tuning ---
   private var debugAnimDuration: CGFloat = 0.4
@@ -694,7 +697,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     applyScrollToneTheme()
     updateScrollToneOverlay(offsetY: 0.0)
 
-    // Transition overlay host — always on top of everything
+    // Transition overlay host — above messages, below the native composer.
     transitionOverlayHost.isUserInteractionEnabled = false
     transitionOverlayHost.clipsToBounds = false
     addSubview(transitionOverlayHost)
@@ -777,11 +780,19 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       requestedContentPaddingBottom
     )
 
+    positionTransitionOverlayHost()
     bringSubviewToFront(gapDebugOverlay)
-    if let inputBar {
+  }
+
+  private func positionTransitionOverlayHost() {
+    guard transitionOverlayHost.superview === self else { return }
+    transitionOverlayHost.frame = bounds
+    if let inputBar, inputBar.superview === self {
+      insertSubview(transitionOverlayHost, belowSubview: inputBar)
       bringSubviewToFront(inputBar)
+    } else {
+      bringSubviewToFront(transitionOverlayHost)
     }
-    bringSubviewToFront(transitionOverlayHost)
   }
 
   private func reactionDebugLog(_ message: String) {
@@ -842,7 +853,18 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       collectionView.collectionViewLayout.invalidateLayout()
     }
 
-    guard previousHeight > 0.0, abs(previousHeight - currentHeight) > 0.5 else {
+    if previousHeight <= 0.0 {
+      updateBottomAnchorInset()
+      if shouldAutoScroll || !rows.isEmpty {
+        collectionView.layoutIfNeeded()
+        scrollToBottom(animated: false)
+      }
+      emitViewport(force: true)
+      maybeStartPendingSendTransition()
+      return
+    }
+
+    guard abs(previousHeight - currentHeight) > 0.5 else {
       updateBottomAnchorInset()
       emitViewport(force: true)
       maybeStartPendingSendTransition()
@@ -852,8 +874,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let distanceBeforeResize = max(
       0.0, collectionView.contentSize.height - (collectionView.contentOffset.y + previousHeight))
     updateBottomAnchorInset()
+    let shouldForceBottomDuringTransition =
+      (pendingSendTransition != nil || activeSendTransition != nil || hiddenMessageId != nil)
+      && deferredPendingSendBottomScrollMessageId == nil
     if distanceBeforeResize <= listBottomThreshold || shouldAutoScroll
-      || pendingSendTransition != nil || activeSendTransition != nil || hiddenMessageId != nil
+      || shouldForceBottomDuringTransition
     {
       scrollToBottom(animated: false)
     } else {
@@ -894,6 +919,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       }
     }
     let previousRows = rows
+    let previousContentOffsetY = collectionView.contentOffset.y
     let previousDistanceFromBottom = currentDistanceFromBottom()
     let wasNearBottom = previousDistanceFromBottom <= listBottomThreshold
 
@@ -949,9 +975,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       guard let self else {
         return
       }
+      let pendingPayload = self.pendingSendTransition
+      let shouldDeferPendingBottomScroll =
+        pendingPayload.map { self.shouldDeferBottomScrollForPendingSend($0, parsedRows: parsed) }
+        ?? false
       let shouldForceBottomForPendingSend =
-        self.pendingSendTransition != nil || self.activeSendTransition != nil
-        || self.hiddenMessageId != nil
+        (self.pendingSendTransition != nil || self.activeSendTransition != nil
+          || self.hiddenMessageId != nil)
+        && self.deferredPendingSendBottomScrollMessageId == nil
       let preInsetContentH = self.collectionView.contentSize.height
       let preInsetOffset = self.collectionView.contentOffset.y
       self.collectionView.layoutIfNeeded()
@@ -968,7 +999,17 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         preInsetOffset, postInsetOffset, preInsetContentH, postInsetContentH,
         self.collectionView.bounds.height, parsed.count,
         self.pendingRowsPayload != nil ? "Y" : "N")
-      if wasNearBottom || shouldForceBottomForPendingSend {
+      if shouldDeferPendingBottomScroll, let pendingPayload {
+        self.deferredPendingSendBottomScrollMessageId = pendingPayload.messageId
+        self.projectedSendTransitionMessageId = pendingPayload.messageId
+        let maxOffset = max(
+          0.0, self.collectionView.contentSize.height - self.collectionView.bounds.height)
+        let clampedOffset = pixelAlignedValue(max(0.0, min(maxOffset, previousContentOffsetY)))
+        self.performInternalScrollAdjustment {
+          self.collectionView.setContentOffset(CGPoint(x: 0.0, y: clampedOffset), animated: false)
+        }
+        self.shouldAutoScroll = true
+      } else if wasNearBottom || shouldForceBottomForPendingSend {
         self.scrollToBottom(animated: shouldForceBottomForPendingSend ? false : animated)
       } else if let anchor = stationaryAnchor,
         let newIndex = parsed.firstIndex(where: { $0.key == anchor.key })
@@ -2435,6 +2476,24 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     return measureMessageBubbleLayout(row: row, rowWidth: rowWidth).bubbleHeight
   }
 
+  private func shouldDeferBottomScrollForPendingSend(
+    _ payload: SendTransitionPayload,
+    parsedRows: [ChatListRow]
+  ) -> Bool {
+    guard
+      let row = parsedRows.first(where: { $0.messageId == payload.messageId }),
+      row.kind == .message,
+      row.visualKind == .text
+    else {
+      return false
+    }
+    let rowWidth = max(1.0, collectionView.bounds.width - (messageHorizontalInset * 2.0))
+    let metrics = measureMessageBubbleLayout(row: row, rowWidth: rowWidth)
+    let sourceHeight = max(1.0, payload.resolvedSourceBackgroundRect.height)
+    let heightDelta = metrics.bubbleHeight - sourceHeight
+    return metrics.bubbleHeight >= 112.0 && heightDelta >= 44.0
+  }
+
   private func currentDistanceFromBottom() -> CGFloat {
     let contentHeight = collectionView.contentSize.height
     let layoutHeight = collectionView.bounds.height
@@ -2533,6 +2592,114 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     return messageId
   }
 
+  private func replyToMessageId(fromRawMessage message: [String: Any]) -> String? {
+    let metadata = message["metadata"] as? [String: Any]
+    let extra = message["extra"] as? [String: Any]
+    return normalizedMessageId(message["replyToId"])
+      ?? normalizedMessageId(message["reply_to_id"])
+      ?? normalizedMessageId(message["replyToMessageId"])
+      ?? normalizedMessageId(message["reply_to_message_id"])
+      ?? normalizedMessageId(metadata?["replyToId"])
+      ?? normalizedMessageId(metadata?["reply_to_id"])
+      ?? normalizedMessageId(extra?["replyToId"])
+      ?? normalizedMessageId(extra?["reply_to_id"])
+  }
+
+  private func replyPreviewDescriptor(forRawRow row: [String: Any]) -> (title: String, text: String)? {
+    guard
+      (row["kind"] as? String) == "message",
+      let message = row["message"] as? [String: Any],
+      messageId(fromRawRow: row) != nil
+    else {
+      return nil
+    }
+
+    let metadata = message["metadata"] as? [String: Any]
+    let type = (nonEmptyString(from: message["type"]) ?? "text").lowercased()
+    let peerName = enginePeerDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+    let title =
+      isMeMessage(rawRow: row)
+      ? "You"
+      : (nonEmptyString(from: message["senderName"])
+        ?? nonEmptyString(from: message["sender_name"])
+        ?? nonEmptyString(from: metadata?["senderName"])
+        ?? nonEmptyString(from: metadata?["sender_name"])
+        ?? (peerName.isEmpty ? "Reply" : peerName))
+
+    if let text =
+      nonEmptyString(from: message["text"])
+      ?? nonEmptyString(from: message["caption"])
+      ?? nonEmptyString(from: metadata?["caption"])
+    {
+      return (title, text)
+    }
+
+    if let fileName =
+      nonEmptyString(from: message["fileName"])
+      ?? nonEmptyString(from: message["file_name"])
+      ?? nonEmptyString(from: metadata?["fileName"])
+      ?? nonEmptyString(from: metadata?["file_name"])
+    {
+      return (title, fileName)
+    }
+
+    switch type {
+    case "image", "gif":
+      return (title, "Photo")
+    case "video":
+      return (title, "Video")
+    case "voice", "audio", "music", "mp3":
+      return (title, "Voice message")
+    case "sticker":
+      return (title, "Sticker")
+    case "file":
+      return (title, "File")
+    default:
+      return (title, "Message")
+    }
+  }
+
+  private func rowsByAttachingReplyPreviews(_ rows: [[String: Any]]) -> [[String: Any]] {
+    var previewsById: [String: (title: String, text: String)] = [:]
+    previewsById.reserveCapacity(rows.count)
+    for row in rows {
+      guard let messageId = messageId(fromRawRow: row),
+        let descriptor = replyPreviewDescriptor(forRawRow: row)
+      else {
+        continue
+      }
+      previewsById[messageId] = descriptor
+    }
+
+    return rows.map { row in
+      guard
+        (row["kind"] as? String) == "message",
+        var message = row["message"] as? [String: Any],
+        let replyToId = replyToMessageId(fromRawMessage: message)
+      else {
+        return row
+      }
+
+      message["replyToId"] = replyToId
+      if let preview = previewsById[replyToId] {
+        if (nonEmptyString(from: message["replyPreviewTitle"])
+          ?? nonEmptyString(from: message["reply_preview_title"])) == nil
+        {
+          message["replyPreviewTitle"] = preview.title
+        }
+        if (nonEmptyString(from: message["replyPreviewText"])
+          ?? nonEmptyString(from: message["reply_preview_text"])) == nil
+        {
+          message["replyPreviewText"] = preview.text
+        }
+      }
+
+      var patchedRow = row
+      patchedRow["message"] = message
+      return patchedRow
+    }
+  }
+
   private func normalizedMessageId(_ raw: Any?) -> String? {
     if let value = raw as? String {
       let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2554,6 +2721,89 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     -> [String: Any]?
   {
     payload.first(where: { messageId(fromRawRow: $0) == targetMessageId })
+  }
+
+  private func isMeMessage(rawRow row: [String: Any]) -> Bool {
+    guard let message = row["message"] as? [String: Any] else { return false }
+    return
+      (message["isMe"] as? Bool)
+      ?? (message["isMe"] as? NSNumber)?.boolValue
+      ?? false
+  }
+
+  private func patchBubbleShape(
+    in row: [String: Any],
+    showTail: Bool? = nil,
+    topRightRadius: CGFloat? = nil,
+    bottomRightRadius: CGFloat? = nil
+  ) -> [String: Any] {
+    guard var message = row["message"] as? [String: Any] else { return row }
+    var shape =
+      (message["bubbleShape"] as? [String: Any])
+      ?? [
+        "showTail": true,
+        "borderTopLeftRadius": 18,
+        "borderTopRightRadius": 18,
+        "borderBottomRightRadius": 18,
+        "borderBottomLeftRadius": 18,
+      ]
+    if let showTail {
+      shape["showTail"] = showTail
+    }
+    if let topRightRadius {
+      shape["borderTopRightRadius"] = topRightRadius
+    }
+    if let bottomRightRadius {
+      shape["borderBottomRightRadius"] = bottomRightRadius
+    }
+    message["bubbleShape"] = shape
+    var patchedRow = row
+    patchedRow["message"] = message
+    return patchedRow
+  }
+
+  private func rowsByApplyingNativeOutgoingSequenceShape(
+    _ rows: [[String: Any]],
+    nativeOutgoingIds: Set<String>
+  ) -> [[String: Any]] {
+    guard !nativeOutgoingIds.isEmpty else { return rows }
+    var patchedRows = rows
+    let messageIndices = rows.indices.filter { messageId(fromRawRow: rows[$0]) != nil }
+
+    for (offset, rowIndex) in messageIndices.enumerated() {
+      guard let currentMessageId = messageId(fromRawRow: rows[rowIndex]) else { continue }
+      let isNativeOutgoing = nativeOutgoingIds.contains(currentMessageId)
+      let isMe = isMeMessage(rawRow: rows[rowIndex])
+      guard isMe else { continue }
+
+      let previousIndex = offset > 0 ? messageIndices[offset - 1] : nil
+      let nextIndex = offset + 1 < messageIndices.count ? messageIndices[offset + 1] : nil
+      let previousSameSender =
+        previousIndex.map { isMeMessage(rawRow: rows[$0]) == isMe } ?? false
+      let nextSameSender =
+        nextIndex.map { isMeMessage(rawRow: rows[$0]) == isMe } ?? false
+      let nextIsNativeOutgoing =
+        nextIndex.flatMap { messageId(fromRawRow: rows[$0]) }.map {
+          nativeOutgoingIds.contains($0)
+        } ?? false
+
+      if isNativeOutgoing {
+        patchedRows[rowIndex] = patchBubbleShape(
+          in: patchedRows[rowIndex],
+          showTail: !nextSameSender,
+          topRightRadius: previousSameSender ? nativeSendMorphTopRightRadius : 18.0,
+          bottomRightRadius: nextSameSender ? 5.0 : 18.0
+        )
+      } else if nextSameSender && nextIsNativeOutgoing {
+        patchedRows[rowIndex] = patchBubbleShape(
+          in: patchedRows[rowIndex],
+          showTail: false,
+          bottomRightRadius: 5.0
+        )
+      }
+    }
+
+    return patchedRows
   }
 
   private func nonEmptyString(from raw: Any?) -> String? {
@@ -2800,7 +3050,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
 
     guard nativeSendEnabled, !nativeOutgoingOrder.isEmpty else {
-      return engineMergedRows
+      return rowsByAttachingReplyPreviews(engineMergedRows)
     }
 
     var baseMessageIds = Set<String>()
@@ -2835,7 +3085,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     nativeOutgoingOrder = nextOrder
 
     guard !nativeOutgoingOrder.isEmpty else {
-      return engineMergedRows
+      return rowsByAttachingReplyPreviews(engineMergedRows)
     }
 
     var merged = engineMergedRows
@@ -2848,7 +3098,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       }
       merged.append(row)
     }
-    return merged
+    let shapedRows = rowsByApplyingNativeOutgoingSequenceShape(
+      merged,
+      nativeOutgoingIds: Set(nativeOutgoingOrder)
+    )
+    return rowsByAttachingReplyPreviews(shapedRows)
   }
 
   private func mergeMessageRowPreservingShape(baseRow: [String: Any], overlayRow: [String: Any])
@@ -2950,8 +3204,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       }
       return false
     }()
-
-    let borderTopRightRadius: CGFloat = isPreviousMe ? 5 : 18
+    let borderTopRightRadius: CGFloat = isPreviousMe ? nativeSendMorphTopRightRadius : 18.0
 
     var message: [String: Any] = [
       "id": messageId,
@@ -3017,8 +3270,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       }
       return false
     }()
-
-    let borderTopRightRadius: CGFloat = isPreviousMe ? 5 : 18
+    let borderTopRightRadius: CGFloat = isPreviousMe ? nativeSendMorphTopRightRadius : 18.0
     var metadata: [String: Any] = [
       "mediaUrl": localUri,
       "localMediaUrl": localUri,
@@ -3100,6 +3352,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     messageId: String,
     fallbackPayload: SendTransitionPayload? = nil
   ) -> CGRect? {
+    if projectedSendTransitionMessageId == messageId,
+      let fallbackPayload,
+      let row = resolveTransitionRow(for: fallbackPayload),
+      let projected = projectedTransitionTargetRect(for: row)
+    {
+      return projected
+    }
     if let rowIndex = indexForMessage(messageId), rowIndex < rows.count {
       let indexPath = IndexPath(item: rowIndex, section: 0)
       if let cell = collectionView.cellForItem(at: indexPath) as? ChatListCell,
@@ -3114,7 +3373,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     return nil
   }
 
-  private func makeTransitionSnapshotCell(for row: ChatListRow) -> ChatListCell {
+  private func makeTransitionSnapshotCell(for row: ChatListRow, targetBubbleRect: CGRect)
+    -> ChatListCell
+  {
     let rowWidth = max(1.0, bounds.width - (messageHorizontalInset * 2.0))
     let rowHeight: CGFloat
     if row.kind == .day {
@@ -3124,7 +3385,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
 
     let renderCell = ChatListCell(
-      frame: CGRect(x: -10_000.0, y: -10_000.0, width: rowWidth, height: max(1.0, rowHeight))
+      frame: CGRect(x: messageHorizontalInset, y: 0.0, width: rowWidth, height: max(1.0, rowHeight))
     )
     renderCell.applyAppearance(appearance)
     renderCell.configure(row: row, hiddenMessageId: nil)
@@ -3132,6 +3393,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     transitionOverlayHost.addSubview(renderCell)
     renderCell.setNeedsLayout()
     renderCell.layoutIfNeeded()
+    if let renderedBubbleRect = renderCell.bubbleRect(in: self) {
+      renderCell.frame = renderCell.frame.offsetBy(
+        dx: targetBubbleRect.minX - renderedBubbleRect.minX,
+        dy: targetBubbleRect.minY - renderedBubbleRect.minY
+      )
+      renderCell.setNeedsLayout()
+      renderCell.layoutIfNeeded()
+      bindWallpaperBackdrop(to: renderCell)
+      renderCell.updateWallpaperBackdropLayoutIfNeeded()
+    }
     return renderCell
   }
 
@@ -3157,7 +3428,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
 
     pendingSendTransition = nil
-    let snapshotCell = makeTransitionSnapshotCell(for: targetRow)
+    collectionView.layoutIfNeeded()
+    let settledTargetRect =
+      resolveTransitionTargetRect(messageId: payload.messageId, fallbackPayload: payload)
+      ?? targetRect
+    let snapshotCell = makeTransitionSnapshotCell(
+      for: targetRow,
+      targetBubbleRect: settledTargetRect
+    )
     defer {
       snapshotCell.removeFromSuperview()
     }
@@ -3166,11 +3444,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let overlayParts = SendTransitionOverlayFactory.make(
       appearance: appearance,
       snapshotCell: snapshotCell,
-      targetBubbleRect: targetRect,
+      targetBubbleRect: settledTargetRect,
       payload: payload,
       hostView: self
     )
     transitionOverlayHost.addSubview(overlayParts.container)
+    positionTransitionOverlayHost()
 
     let state = SendTransitionState(
       host: self,
@@ -3189,11 +3468,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     )
     activeSendTransition = state
     onNativeEvent(["type": "sendTransitionStarted", "messageId": payload.messageId])
-
-    collectionView.layoutIfNeeded()
-    let settledTargetRect =
-      resolveTransitionTargetRect(messageId: payload.messageId, fallbackPayload: payload)
-      ?? targetRect
 
     // Start the additive animation from source rect → target rect.
     NSLog(
@@ -3237,12 +3511,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     NSLog(
       "[ChatListView] completeTransition — revealing message '%@'", transition.payload.messageId)
     transition.invalidate()
+    let shouldSettleDeferredBottomScroll =
+      deferredPendingSendBottomScrollMessageId == transition.payload.messageId
 
-    // Smoothly fade out the overlay instead of dropping it instantly
-    // The real cell becomes visible instantly behind it, creating a perfect crossfade.
+    // Finish almost immediately so status/check glyphs do not linger between states.
     let overlay = transition.overlayContainer
     UIView.animate(
-      withDuration: 0.15, delay: 0, options: [.curveEaseOut],
+      withDuration: 0.055, delay: 0, options: [.curveEaseOut, .beginFromCurrentState],
       animations: {
         overlay.alpha = 0.0
       }
@@ -3251,6 +3526,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
 
     activeSendTransition = nil
+    if projectedSendTransitionMessageId == transition.payload.messageId {
+      projectedSendTransitionMessageId = nil
+    }
+    if shouldSettleDeferredBottomScroll {
+      deferredPendingSendBottomScrollMessageId = nil
+    }
 
     let revealedMessageId = hiddenMessageId
     hiddenMessageId = nil
@@ -3284,6 +3565,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       setRows(sourceRowsPayload)
     }
     flushQueuedAppearanceAfterTransitionIfNeeded()
+    if shouldSettleDeferredBottomScroll {
+      DispatchQueue.main.async { [weak self] in
+        self?.scrollToBottom(animated: true)
+      }
+    }
     onNativeEvent(["type": "sendTransitionCompleted", "messageId": revealedMessageId ?? ""])
   }
 
@@ -3654,13 +3940,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       bar.placeholder = inputBarPlaceholder
       bar.applyAppearance(appearance)
       addSubview(bar)
-      // Ensure overlay host is always on top
-      bringSubviewToFront(transitionOverlayHost)
       inputBar = bar
+      positionTransitionOverlayHost()
       NSLog("[ChatListView] native input bar ENABLED")
     } else {
       inputBar?.removeFromSuperview()
       inputBar = nil
+      positionTransitionOverlayHost()
       if abs(contentPaddingBottom - requestedContentPaddingBottom) > 0.5 {
         contentPaddingBottom = requestedContentPaddingBottom
         updateBottomAnchorInset()
@@ -3775,9 +4061,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       emitViewport(force: true)
     }
 
-    // Keep transition overlay host above everything
-    transitionOverlayHost.frame = bounds
-    bringSubviewToFront(transitionOverlayHost)
+    // Keep transition overlay host above messages but behind the composer.
+    positionTransitionOverlayHost()
     layoutActivityOverlay()
   }
 
@@ -3804,13 +4089,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       "[ChatListView] handleNativeSend START — messageId: %@, text length: %lu, nativeSendEnabled: %@, replyTo: %@",
       messageId, text.count, nativeSendEnabled ? "true" : "false", replyToMessageId ?? "nil")
 
-    // 1. Dismiss reply banner (non-animated, before layout measurement).
-    inputBar?.dismissReplyBanner(animated: false)
-
-    // 2. Hide the message cell immediately (before it even exists).
+    // 1. Hide the message cell immediately (before it even exists).
     hiddenMessageId = messageId
 
-    // 3. Compute source rects and capture live text snapshot (BEFORE clearing).
+    // 2. Compute source rects and capture live text snapshot (BEFORE clearing).
     let sourceRect: CGRect
     let sourceContainerRect: CGRect?
     let sourceBackgroundRectInContainer: CGRect?
@@ -3851,7 +4133,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       sourceContentSnapshotView = nil
     }
 
-    // 4. Store pending transition so it starts when the cell arrives.
+    // 3. Store pending transition so it starts when the cell arrives.
     let payload = SendTransitionPayload(
       messageId: messageId,
       text: text,
@@ -3865,6 +4147,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       sourceContentSnapshotView: sourceContentSnapshotView
     )
     pendingSendTransition = payload
+
+    // 4. Dismiss reply banner after capture, so reply sends morph from the same composer height.
+    inputBar?.dismissReplyBanner(animated: false)
 
     // 5. Clear the input bar.
     inputBar?.clearText()

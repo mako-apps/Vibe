@@ -221,16 +221,23 @@ fun resolveAppThemePalette(
     overlayColor = if (isDark) colorRgba(0, 0, 0, 0.34f) else colorRgba(0, 0, 0, 0.12f),
     successColor = colorHex(0x34C759),
     warningColor = colorHex(0xFF9F0A),
-    dangerColor = colorHex(0xFF3B30),
+    dangerColor = if (isDark) colorHex(0xF2B8B5) else colorHex(0xB3261E),
   )
 }
 
 internal fun buildNativeThemeSeed(context: Context): Map<String, Any> {
+  val palette = resolveAppThemePalette(context)
   return mapOf(
     "backgroundMode" to "gradient",
     "nativeThemeId" to AppThemePlateController.current(context).rawValue,
     "nativeThemeIsDark" to AppAppearanceController.resolvedIsDark(context),
+    "headerBackgroundColor" to colorToHex(palette.backgroundColor),
+    "headerTextColor" to colorToHex(palette.textColor),
   )
+}
+
+private fun colorToHex(color: Int): String {
+  return String.format("#%02X%02X%02X", Color.red(color), Color.green(color), Color.blue(color))
 }
 
 internal fun appThemeSignature(context: Context): String {

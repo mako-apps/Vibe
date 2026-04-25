@@ -94,7 +94,6 @@ enum ChatHomeService {
     }
 
     let payload = try parsePayload(data)
-    seedChatHistories(from: payload)
     return payload.compactMap(ChatHomeListRow.parse)
   }
 
@@ -111,8 +110,6 @@ enum ChatHomeService {
 
       let messages = try parsePayload(data)
       guard !messages.isEmpty else { return nil }
-
-      seedChatHistories(from: [["chatId": "saved_messages", "messages": messages]])
 
       let latestMessage = messages.max { lhs, rhs in
         savedMessageTimestamp(lhs) < savedMessageTimestamp(rhs)
@@ -139,7 +136,8 @@ enum ChatHomeService {
         isSavedMessages: true,
         type: "saved_messages",
         isGroup: false,
-        previewRows: []
+        previewRows: [],
+        initialMessages: ChatHomeListRow.parseServerMessages(messages)
       )
     } catch {
       return nil
@@ -198,24 +196,6 @@ enum ChatHomeService {
     request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
     request.setValue("Bearer \(config.authToken)", forHTTPHeaderField: "Authorization")
     return request
-  }
-
-  private static func seedChatHistories(from payload: [[String: Any]]) {
-    var histories: [String: [[String: Any]]] = [:]
-
-    for item in payload {
-      guard
-        let chatId = normalizedString(item["chatId"] ?? item["chat_id"]),
-        !chatId.isEmpty
-      else { continue }
-
-      let rawMessages = ChatHomeListRow.parseServerMessages(item["messages"])
-      guard !rawMessages.isEmpty else { continue }
-      histories[chatId] = rawMessages
-    }
-
-    guard !histories.isEmpty else { return }
-    _ = ChatEngine.shared.seedChatHistories(["chatHistories": histories])
   }
 
   private static func normalizedString(_ value: Any?) -> String? {

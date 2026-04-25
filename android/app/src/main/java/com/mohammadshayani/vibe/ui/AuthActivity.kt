@@ -134,7 +134,6 @@ class AuthActivity : AppCompatActivity() {
 
   override fun onResume() {
     super.onResume()
-    backdropView.refreshAppearance()
     backdropView.onHostResume()
   }
 

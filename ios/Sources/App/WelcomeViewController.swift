@@ -1,33 +1,48 @@
-import CoreImage
 import MetalKit
 import UIKit
 
 final class WelcomeViewController: UIViewController {
   private let backgroundView = WelcomeMetalBackgroundView()
-  private let heroStack = UIStackView()
-  private let eyebrowLabel = UILabel()
-  private let titleLabel = UILabel()
-  private let subtitleLabel = UILabel()
-  private let detailsLabel = UILabel()
+  private let messageLabel = AnimatedRevealLabel()
+
   private let footerContainerView = UIView()
   private let buttonStack = UIStackView()
   private let signUpButton = UIButton(type: .system)
   private let signInButton = UIButton(type: .system)
   private var footerButtonsBottomConstraint: NSLayoutConstraint?
 
+  private let messages = [
+    "Unbreakable Encryption.",
+    "Autonomous AI Agents.",
+    "Your Private Sanctuary.",
+  ]
+
+  private var animationTimer: Timer?
+
   override var preferredStatusBarStyle: UIStatusBarStyle {
-    palette.prefersDarkStatusBar ? .darkContent : .lightContent
+    .lightContent
   }
 
   override func viewDidLoad() {
     super.viewDidLoad()
     configureView()
-    applyPalette()
+    setupSyncAnimation()
   }
 
   override func viewWillAppear(_ animated: Bool) {
     super.viewWillAppear(animated)
     navigationController?.setNavigationBarHidden(true, animated: false)
+    backgroundView.isPaused = false
+    if animationTimer == nil {
+      setupSyncAnimation()
+    }
+  }
+
+  override func viewWillDisappear(_ animated: Bool) {
+    super.viewWillDisappear(animated)
+    backgroundView.isPaused = true
+    animationTimer?.invalidate()
+    animationTimer = nil
   }
 
   override func viewSafeAreaInsetsDidChange() {
@@ -35,70 +50,47 @@ final class WelcomeViewController: UIViewController {
     footerButtonsBottomConstraint?.constant = -(view.safeAreaInsets.bottom + 24)
   }
 
-  override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
-    super.traitCollectionDidChange(previousTraitCollection)
-    guard previousTraitCollection?.hasDifferentColorAppearance(comparedTo: traitCollection) == true
-    else {
-      return
-    }
-
-    applyPalette()
-    backgroundView.refreshAppearance()
-    setNeedsStatusBarAppearanceUpdate()
-  }
-
-  private var palette: WelcomePalette {
-    WelcomePalette(traits: traitCollection)
-  }
-
   private func configureView() {
-    view.backgroundColor = .systemBackground
+    // Pure deep dark base canvas
+    view.backgroundColor = UIColor(red: 0.012, green: 0.012, blue: 0.02, alpha: 1.0)
 
     backgroundView.translatesAutoresizingMaskIntoConstraints = false
     view.addSubview(backgroundView)
 
-    heroStack.translatesAutoresizingMaskIntoConstraints = false
-    heroStack.axis = .vertical
-    heroStack.alignment = .leading
-    heroStack.spacing = 10
-
-    eyebrowLabel.translatesAutoresizingMaskIntoConstraints = false
-    eyebrowLabel.text = "Private by default"
-    eyebrowLabel.font = .systemFont(ofSize: 13, weight: .semibold)
-    eyebrowLabel.textAlignment = .left
-
-    titleLabel.translatesAutoresizingMaskIntoConstraints = false
-    titleLabel.text = "Vibe"
-    titleLabel.textAlignment = .left
-    titleLabel.font = .systemFont(ofSize: 60, weight: .black)
-
-    subtitleLabel.translatesAutoresizingMaskIntoConstraints = false
-    subtitleLabel.text = "Private chat, lit with focus."
-    subtitleLabel.font = .systemFont(ofSize: 30, weight: .semibold)
-    subtitleLabel.numberOfLines = 0
-
-    detailsLabel.translatesAutoresizingMaskIntoConstraints = false
-    detailsLabel.text = "Return with your secret key or start a new identity."
-    detailsLabel.font = .systemFont(ofSize: 17, weight: .medium)
-    detailsLabel.numberOfLines = 0
-    detailsLabel.lineBreakMode = .byWordWrapping
-    detailsLabel.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
-
-    heroStack.addArrangedSubview(eyebrowLabel)
-    heroStack.addArrangedSubview(titleLabel)
-    heroStack.addArrangedSubview(subtitleLabel)
-    heroStack.addArrangedSubview(detailsLabel)
+    // Centered, Single-Line text
+    messageLabel.translatesAutoresizingMaskIntoConstraints = false
+    messageLabel.font = .systemFont(ofSize: 26, weight: .light)
+    messageLabel.textColor = UIColor(white: 0.88, alpha: 1.0)
+    messageLabel.numberOfLines = 1  // nowrap
+    messageLabel.textAlignment = .center
+    messageLabel.adjustsFontSizeToFitWidth = true
+    messageLabel.minimumScaleFactor = 0.8
+    view.addSubview(messageLabel)
+    messageLabel.text = messages[0]
 
     footerContainerView.translatesAutoresizingMaskIntoConstraints = false
     footerContainerView.clipsToBounds = true
-    footerContainerView.layer.cornerRadius = 34
-    footerContainerView.layer.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+    footerContainerView.backgroundColor = .clear
 
     signUpButton.translatesAutoresizingMaskIntoConstraints = false
     signUpButton.addTarget(self, action: #selector(handleSignUp), for: .touchUpInside)
+    var primary = UIButton.Configuration.filled()
+    primary.title = "Create Account"
+    primary.cornerStyle = .capsule
+    primary.baseBackgroundColor = UIColor(white: 0.95, alpha: 1)
+    primary.baseForegroundColor = .black
+    signUpButton.configuration = primary
 
     signInButton.translatesAutoresizingMaskIntoConstraints = false
     signInButton.addTarget(self, action: #selector(handleSignIn), for: .touchUpInside)
+    var secondary = UIButton.Configuration.filled()
+    secondary.title = "Sign In"
+    secondary.cornerStyle = .capsule
+    secondary.baseBackgroundColor = UIColor(white: 1.0, alpha: 0.05)
+    secondary.baseForegroundColor = UIColor(white: 0.9, alpha: 1)
+    secondary.background.strokeColor = UIColor(white: 1.0, alpha: 0.15)
+    secondary.background.strokeWidth = 1
+    signInButton.configuration = secondary
 
     buttonStack.translatesAutoresizingMaskIntoConstraints = false
     buttonStack.axis = .vertical
@@ -107,8 +99,6 @@ final class WelcomeViewController: UIViewController {
     buttonStack.addArrangedSubview(signInButton)
 
     footerContainerView.addSubview(buttonStack)
-
-    view.addSubview(heroStack)
     view.addSubview(footerContainerView)
 
     footerButtonsBottomConstraint = buttonStack.bottomAnchor.constraint(
@@ -122,60 +112,37 @@ final class WelcomeViewController: UIViewController {
       backgroundView.topAnchor.constraint(equalTo: view.topAnchor),
       backgroundView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
 
-      heroStack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 28),
-      heroStack.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -28),
-      heroStack.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 54),
-      heroStack.bottomAnchor.constraint(lessThanOrEqualTo: footerContainerView.topAnchor, constant: -40),
+      messageLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+      messageLabel.centerYAnchor.constraint(equalTo: view.centerYAnchor, constant: -40),
+      messageLabel.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 40),
+      messageLabel.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -40),
 
       footerContainerView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       footerContainerView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
       footerContainerView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
 
       buttonStack.leadingAnchor.constraint(
-        equalTo: footerContainerView.leadingAnchor,
-        constant: 24
-      ),
+        equalTo: footerContainerView.leadingAnchor, constant: 32),
       buttonStack.trailingAnchor.constraint(
-        equalTo: footerContainerView.trailingAnchor,
-        constant: -24
-      ),
+        equalTo: footerContainerView.trailingAnchor, constant: -32),
       buttonStack.topAnchor.constraint(equalTo: footerContainerView.topAnchor, constant: 22),
       footerButtonsBottomConstraint!,
-      signUpButton.heightAnchor.constraint(equalToConstant: 56),
-      signInButton.heightAnchor.constraint(equalToConstant: 56),
+      signUpButton.heightAnchor.constraint(equalToConstant: 54),
+      signInButton.heightAnchor.constraint(equalToConstant: 54),
     ])
+
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+      self.messageLabel.reveal(duration: 1.2)
+    }
   }
 
-  private func applyPalette() {
-    let palette = palette
-    view.backgroundColor = palette.backgroundColor
-
-    eyebrowLabel.textColor = palette.eyebrowTextColor
-    titleLabel.textColor = palette.primaryTextColor
-    subtitleLabel.textColor = palette.primaryTextColor
-    detailsLabel.textColor = palette.secondaryTextColor
-
-    footerContainerView.backgroundColor = .clear
-    footerContainerView.layer.borderWidth = 0
-    footerContainerView.layer.borderColor = nil
-
-    var primary = UIButton.Configuration.filled()
-    primary.title = "Create Account"
-    primary.cornerStyle = .capsule
-    primary.baseBackgroundColor = palette.primaryButtonBackgroundColor
-    primary.baseForegroundColor = palette.primaryButtonForegroundColor
-    primary.background.strokeColor = palette.primaryButtonStrokeColor
-    primary.background.strokeWidth = 1
-    signUpButton.configuration = primary
-
-    var secondary = UIButton.Configuration.filled()
-    secondary.title = "Sign In"
-    secondary.cornerStyle = .capsule
-    secondary.baseBackgroundColor = palette.secondaryButtonBackgroundColor
-    secondary.baseForegroundColor = palette.secondaryButtonForegroundColor
-    secondary.background.strokeColor = palette.secondaryButtonStrokeColor
-    secondary.background.strokeWidth = 1
-    signInButton.configuration = secondary
+  private func setupSyncAnimation() {
+    var currentIndex = 0
+    animationTimer = Timer.scheduledTimer(withTimeInterval: 4.5, repeats: true) { [weak self] _ in
+      guard let self = self else { return }
+      currentIndex = (currentIndex + 1) % self.messages.count
+      self.messageLabel.transition(to: self.messages[currentIndex], duration: 1.2)
+    }
   }
 
   @objc private func handleSignIn() {
@@ -194,271 +161,226 @@ final class WelcomeViewController: UIViewController {
   }
 }
 
-private final class WelcomeMetalBackgroundView: UIView, MTKViewDelegate {
-  private let mtkView: MTKView?
-  private let fallbackLayer = CAGradientLayer()
-  private var ciContext: CIContext?
-  private let colorSpace = CGColorSpaceCreateDeviceRGB()
-  private let startedAt = CACurrentMediaTime()
+// MARK: - Smooth Reveal Label
 
-  override class var layerClass: AnyClass {
-    CAGradientLayer.self
+private final class AnimatedRevealLabel: UILabel {
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    self.alpha = 0.0
+    self.transform = CGAffineTransform(scaleX: 0.96, y: 0.96)
   }
+
+  required init?(coder: NSCoder) { nil }
+
+  func reveal(duration: TimeInterval) {
+    UIView.animate(withDuration: duration, delay: 0.1, options: [.curveEaseOut]) {
+      self.alpha = 1.0
+      self.transform = .identity
+    }
+  }
+
+  func transition(to newText: String, duration: TimeInterval) {
+    UIView.animate(
+      withDuration: 0.5, delay: 0, options: [.curveEaseIn],
+      animations: {
+        self.alpha = 0.0
+        self.transform = CGAffineTransform(scaleX: 0.96, y: 0.96)
+      }
+    ) { _ in
+      self.text = newText
+      UIView.animate(withDuration: duration, delay: 0.1, options: [.curveEaseOut]) {
+        self.alpha = 1.0
+        self.transform = .identity
+      }
+    }
+  }
+}
+
+// MARK: - Direct Metal 3D Particle Implementation (Tuned Bronze Torus)
+
+private final class WelcomeMetalBackgroundView: UIView, MTKViewDelegate {
+  private var metalView: MTKView!
+  private var commandQueue: MTLCommandQueue!
+  private var pipelineState: MTLRenderPipelineState!
+
+  private let startedAt = CACurrentMediaTime()
+  private let particleCount = 60_000
+
+  var isPaused: Bool {
+    get { metalView.isPaused }
+    set { metalView.isPaused = newValue }
+  }
+
+  private let shaderSource = """
+    #include <metal_stdlib>
+    using namespace metal;
+
+    float hash(uint n) {
+        n = (n << 13U) ^ n;
+        n = n * (n * n * 15731U + 789221U) + 1376312589U;
+        return float(n & 0x7fffffffU) / float(0x7fffffff);
+    }
+
+    float3 hsl2rgb(float3 c) {
+        float3 rgb = clamp(abs(fmod(c.x*6.0+float3(0.0,4.0,2.0),6.0)-3.0)-1.0, 0.0, 1.0);
+        return c.z + c.y * (rgb-0.5)*(1.0-abs(2.0*c.z-1.0));
+    }
+
+    float3 cubicBezier(float3 p0, float3 c0, float3 c1, float3 p1, float t) {
+        float tn = 1.0 - t;
+        return tn * tn * tn * p0 + 3.0 * tn * tn * t * c0 + 3.0 * tn * t * t * c1 + t * t * t * p1;
+    }
+
+    struct ParticleOut {
+        float4 position [[position]];
+        float pointSize [[point_size]];
+        float3 color;
+        float alpha;
+    };
+
+    vertex ParticleOut vertex_main(uint vertexID [[vertex_id]],
+                                   constant float& uTime [[buffer(0)]],
+                                   constant float2& uResolution [[buffer(1)]]) {
+        
+        float rand1 = hash(vertexID * 3);
+        float rand2 = hash(vertexID * 3 + 1);
+        float rand3 = hash(vertexID * 3 + 2);
+        
+        float angle = rand1 * 6.2831853; 
+        float radius = 150.0 + rand2 * 550.0; // Scaled slightly to match the 150-700 from ThreeJS
+        
+        // TALLER HEIGHT matches the tuned HTML (±1400)
+        float3 startPos = float3(0.0, -1400.0, 0.0);
+        float3 endPos   = float3(0.0, 1400.0, 0.0);
+        
+        float3 c1 = float3(cos(angle) * radius * 1.5, -600.0, sin(angle) * radius * 1.5);
+        float3 c2 = float3(cos(angle) * radius * 1.5,  600.0, sin(angle) * radius * 1.5);
+        
+        // SLOWER SPEED matches the tuned HTML (32.0s)
+        float duration = 32.0;
+        float tProgress = fmod((uTime + rand3 * duration), duration) / duration;
+        
+        float3 pos = cubicBezier(startPos, c1, c2, endPos, tProgress);
+        
+        // Very slow system rotation to reduce noise
+        float sysAngle = uTime * 0.05;
+        float cosA = cos(sysAngle);
+        float sinA = sin(sysAngle);
+        float newX = pos.x * cosA - pos.z * sinA;
+        float newZ = pos.x * sinA + pos.z * cosA;
+        pos.x = newX; pos.z = newZ;
+        
+        // Z-axis camera pushback (1800) matches the updated HTML camera position
+        float cameraZ = 1800.0;
+        float zDist = cameraZ - pos.z;
+        float scale = 1400.0 / zDist;
+        
+        float2 screenPos = pos.xy * scale;
+        screenPos.x /= (uResolution.x * 0.5);
+        screenPos.y /= (uResolution.y * 0.5);
+        
+        // REFINED COLORS: Slightly more visible Bronze / Copper
+        float h = 0.08 + rand1 * 0.04; 
+        float s = 0.38; 
+        float l = 0.32; 
+        
+        float tAlpha = smoothstep(0.0, 0.22, tProgress) * smoothstep(1.0, 0.78, tProgress);
+        
+        ParticleOut out;
+        out.position = float4(screenPos, 0.0, 1.0);
+        out.pointSize = 18.0 * scale * tAlpha; 
+        out.color = hsl2rgb(float3(h, s, l));
+        out.alpha = tAlpha;
+        
+        return out;
+    }
+
+    fragment float4 fragment_main(ParticleOut in [[stage_in]],
+                                  float2 pointCoord [[point_coord]]) {
+        float dist = length(pointCoord - float2(0.5, 0.5));
+        if (dist > 0.5) { discard_fragment(); }
+        
+        float intensity = 1.0 - (dist * 2.0);
+        intensity = intensity * intensity; 
+        
+        // REFINED CONTRAST: 0.40 multiplier for a subtle but visible blended effect
+        float finalAlpha = intensity * in.alpha * 0.40; 
+        
+        return float4(in.color * finalAlpha, finalAlpha);
+    }
+    """
 
   override init(frame: CGRect) {
-    if let device = MTLCreateSystemDefaultDevice() {
-      let metalView = MTKView(frame: .zero, device: device)
-      metalView.isPaused = false
-      metalView.enableSetNeedsDisplay = false
-      metalView.framebufferOnly = false
-      metalView.preferredFramesPerSecond = 24
-      metalView.clearColor = MTLClearColorMake(0.03, 0.05, 0.1, 1)
-      metalView.autoResizeDrawable = true
-      metalView.colorPixelFormat = .bgra8Unorm
-      mtkView = metalView
-      ciContext = CIContext(mtlDevice: device)
-    } else {
-      mtkView = nil
-    }
     super.init(frame: frame)
-    configure()
+    setupMetal()
   }
 
-  required init?(coder: NSCoder) {
-    nil
-  }
+  required init?(coder: NSCoder) { nil }
 
-  override func layoutSubviews() {
-    super.layoutSubviews()
-    fallbackLayer.frame = bounds
-    mtkView?.frame = bounds
-  }
+  private func setupMetal() {
+    guard let device = MTLCreateSystemDefaultDevice() else { return }
 
-  private func configure() {
-    fallbackLayer.startPoint = CGPoint(x: 0.08, y: 0.0)
-    fallbackLayer.endPoint = CGPoint(x: 0.95, y: 1.0)
-    layer.addSublayer(fallbackLayer)
+    metalView = MTKView(frame: bounds, device: device)
+    metalView.delegate = self
+    metalView.framebufferOnly = true
+    metalView.colorPixelFormat = .bgra8Unorm
+    metalView.preferredFramesPerSecond = 60
+    metalView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    metalView.clearColor = MTLClearColor(red: 0.012, green: 0.012, blue: 0.02, alpha: 1.0)
+    metalView.isPaused = false
+    addSubview(metalView)
 
-    if let mtkView {
-      mtkView.delegate = self
-      mtkView.translatesAutoresizingMaskIntoConstraints = false
-      addSubview(mtkView)
-      sendSubviewToBack(mtkView)
+    commandQueue = device.makeCommandQueue()
+
+    do {
+      let library = try device.makeLibrary(source: shaderSource, options: nil)
+      let vertexFunction = library.makeFunction(name: "vertex_main")
+      let fragmentFunction = library.makeFunction(name: "fragment_main")
+
+      let pipelineDescriptor = MTLRenderPipelineDescriptor()
+      pipelineDescriptor.vertexFunction = vertexFunction
+      pipelineDescriptor.fragmentFunction = fragmentFunction
+
+      if let attachment = pipelineDescriptor.colorAttachments[0] {
+        attachment.pixelFormat = metalView.colorPixelFormat
+        attachment.isBlendingEnabled = true
+        attachment.rgbBlendOperation = .add
+        attachment.alphaBlendOperation = .add
+        attachment.sourceRGBBlendFactor = .sourceAlpha
+        attachment.sourceAlphaBlendFactor = .sourceAlpha
+        attachment.destinationRGBBlendFactor = .one
+        attachment.destinationAlphaBlendFactor = .one
+      }
+
+      pipelineState = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
+    } catch {
+      print("Failed to compile custom Metal shader: \(error)")
     }
-
-    refreshAppearance()
-  }
-
-  func refreshAppearance() {
-    let palette = WelcomeMetalPalette(style: traitCollection.userInterfaceStyle)
-    fallbackLayer.colors = palette.fallbackColors
-    mtkView?.clearColor = palette.clearColor
   }
 
   func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
   func draw(in view: MTKView) {
     guard let drawable = view.currentDrawable,
-      let ciContext,
-      view.drawableSize.width > 0,
-      view.drawableSize.height > 0
+      let renderPassDescriptor = view.currentRenderPassDescriptor,
+      let commandBuffer = commandQueue.makeCommandBuffer(),
+      let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor),
+      let pipelineState = pipelineState
     else {
       return
     }
 
-    let size = CGSize(width: view.drawableSize.width, height: view.drawableSize.height)
-    let bounds = CGRect(origin: .zero, size: size)
-    let time = CGFloat(CACurrentMediaTime() - startedAt)
-    let palette = WelcomeMetalPalette(style: traitCollection.userInterfaceStyle)
+    var time = Float(CACurrentMediaTime() - startedAt)
+    var resolution = SIMD2<Float>(Float(view.drawableSize.width), Float(view.drawableSize.height))
 
-    let base = linearGradient(
-      startPoint: CGPoint(x: size.width * 0.14, y: 0),
-      endPoint: CGPoint(x: size.width * 0.94, y: size.height),
-      startColor: palette.baseTopColor,
-      endColor: palette.baseBottomColor
-    )
-    let source = radialGlow(
-      center: CGPoint(
-        x: size.width * (0.94 + 0.01 * sin(time * 0.21)),
-        y: size.height * (0.06 + 0.01 * cos(time * 0.17))
-      ),
-      radius: max(size.width, size.height) * 0.24,
-      color: palette.sourceGlowColor
-    )
-    let beamMid = radialGlow(
-      center: CGPoint(
-        x: size.width * (0.72 + 0.02 * cos(time * 0.19)),
-        y: size.height * (0.14 + 0.014 * sin(time * 0.16))
-      ),
-      radius: max(size.width, size.height) * 0.34,
-      color: palette.beamGlowColor
-    )
-    let beamNearText = radialGlow(
-      center: CGPoint(
-        x: size.width * (0.44 + 0.02 * sin(time * 0.15)),
-        y: size.height * (0.20 + 0.014 * cos(time * 0.11))
-      ),
-      radius: max(size.width, size.height) * 0.22,
-      color: palette.textGlowColor
-    )
-    let warmLift = radialGlow(
-      center: CGPoint(
-        x: size.width * (0.26 + 0.03 * sin(time * 0.08)),
-        y: size.height * (0.36 + 0.02 * cos(time * 0.07))
-      ),
-      radius: max(size.width, size.height) * 0.54,
-      color: palette.secondaryAmbientGlowColor
-    )
-    let ambient = radialGlow(
-      center: CGPoint(
-        x: size.width * (0.56 + 0.03 * cos(time * 0.09)),
-        y: size.height * (0.78 + 0.03 * sin(time * 0.13))
-      ),
-      radius: max(size.width, size.height) * 0.82,
-      color: palette.ambientGlowColor
-    )
+    renderEncoder.setRenderPipelineState(pipelineState)
+    renderEncoder.setVertexBytes(&time, length: MemoryLayout<Float>.size, index: 0)
+    renderEncoder.setVertexBytes(&resolution, length: MemoryLayout<SIMD2<Float>>.size, index: 1)
 
-    let image = beamNearText
-      .composited(over: beamMid)
-      .composited(over: source)
-      .composited(over: warmLift)
-      .composited(over: ambient)
-      .composited(over: base)
-      .applyingFilter("CIGaussianBlur", parameters: ["inputRadius": 20.0])
-      .cropped(to: bounds)
+    renderEncoder.drawPrimitives(type: .point, vertexStart: 0, vertexCount: particleCount)
 
-    ciContext.render(image, to: drawable.texture, commandBuffer: nil, bounds: bounds, colorSpace: colorSpace)
-    drawable.present()
-  }
-
-  private func radialGlow(center: CGPoint, radius: CGFloat, color: CIColor) -> CIImage {
-    let transparent = CIColor(red: color.red, green: color.green, blue: color.blue, alpha: 0)
-    return CIFilter(
-      name: "CIRadialGradient",
-      parameters: [
-        "inputCenter": CIVector(cgPoint: center),
-        "inputRadius0": radius * 0.12,
-        "inputRadius1": radius,
-        "inputColor0": color,
-        "inputColor1": transparent,
-      ]
-    )?.outputImage ?? CIImage.empty()
-  }
-
-  private func linearGradient(
-    startPoint: CGPoint,
-    endPoint: CGPoint,
-    startColor: CIColor,
-    endColor: CIColor
-  ) -> CIImage {
-    CIFilter(
-      name: "CILinearGradient",
-      parameters: [
-        "inputPoint0": CIVector(cgPoint: startPoint),
-        "inputPoint1": CIVector(cgPoint: endPoint),
-        "inputColor0": startColor,
-        "inputColor1": endColor,
-      ]
-    )?.outputImage ?? CIImage.empty()
-  }
-}
-
-private struct WelcomePalette {
-  let prefersDarkStatusBar: Bool
-  let backgroundColor: UIColor
-  let eyebrowTextColor: UIColor
-  let primaryTextColor: UIColor
-  let secondaryTextColor: UIColor
-  let footerTintColor: UIColor
-  let footerBorderColor: UIColor
-  let primaryButtonBackgroundColor: UIColor
-  let primaryButtonForegroundColor: UIColor
-  let primaryButtonStrokeColor: UIColor
-  let secondaryButtonBackgroundColor: UIColor
-  let secondaryButtonForegroundColor: UIColor
-  let secondaryButtonStrokeColor: UIColor
-
-  init(traits: UITraitCollection) {
-    let isDark = traits.userInterfaceStyle == .dark
-    prefersDarkStatusBar = !isDark
-    backgroundColor = isDark
-      ? UIColor(red: 0.15, green: 0.13, blue: 0.12, alpha: 1)
-      : UIColor(red: 0.97, green: 0.95, blue: 0.93, alpha: 1)
-    eyebrowTextColor = isDark
-      ? UIColor(red: 0.97, green: 0.94, blue: 0.91, alpha: 0.78)
-      : UIColor(red: 0.37, green: 0.31, blue: 0.29, alpha: 0.78)
-    primaryTextColor = isDark
-      ? UIColor(red: 0.99, green: 0.96, blue: 0.92, alpha: 1)
-      : UIColor(red: 0.17, green: 0.14, blue: 0.13, alpha: 1)
-    secondaryTextColor = isDark
-      ? UIColor(red: 0.88, green: 0.82, blue: 0.76, alpha: 0.82)
-      : UIColor(red: 0.39, green: 0.32, blue: 0.29, alpha: 0.76)
-    footerTintColor = isDark
-      ? UIColor(red: 0.26, green: 0.21, blue: 0.19, alpha: 0.62)
-      : UIColor(red: 0.98, green: 0.96, blue: 0.94, alpha: 0.66)
-    footerBorderColor = isDark
-      ? UIColor.white.withAlphaComponent(0.14)
-      : UIColor.white.withAlphaComponent(0.72)
-    primaryButtonBackgroundColor = isDark
-      ? UIColor(red: 0.97, green: 0.96, blue: 0.95, alpha: 0.94)
-      : UIColor(red: 0.11, green: 0.10, blue: 0.11, alpha: 0.96)
-    primaryButtonForegroundColor = isDark
-      ? UIColor(red: 0.13, green: 0.11, blue: 0.10, alpha: 1)
-      : UIColor.white
-    primaryButtonStrokeColor = isDark
-      ? UIColor.white.withAlphaComponent(0.18)
-      : UIColor.white.withAlphaComponent(0.28)
-    secondaryButtonBackgroundColor = isDark
-      ? UIColor.white.withAlphaComponent(0.12)
-      : UIColor.white.withAlphaComponent(0.58)
-    secondaryButtonForegroundColor = primaryTextColor
-    secondaryButtonStrokeColor = isDark
-      ? UIColor(red: 0.79, green: 0.72, blue: 0.66, alpha: 0.34)
-      : UIColor(red: 0.83, green: 0.77, blue: 0.72, alpha: 0.92)
-  }
-}
-
-private struct WelcomeMetalPalette {
-  let fallbackColors: [CGColor]
-  let clearColor: MTLClearColor
-  let baseTopColor: CIColor
-  let baseBottomColor: CIColor
-  let sourceGlowColor: CIColor
-  let beamGlowColor: CIColor
-  let textGlowColor: CIColor
-  let ambientGlowColor: CIColor
-  let secondaryAmbientGlowColor: CIColor
-
-  init(style: UIUserInterfaceStyle) {
-    let isDark = style != .light
-    if isDark {
-      fallbackColors = [
-        UIColor(red: 0.16, green: 0.14, blue: 0.13, alpha: 1).cgColor,
-        UIColor(red: 0.12, green: 0.11, blue: 0.10, alpha: 1).cgColor,
-        UIColor(red: 0.09, green: 0.08, blue: 0.08, alpha: 1).cgColor,
-      ]
-      clearColor = MTLClearColorMake(0.16, 0.14, 0.13, 1)
-      baseTopColor = CIColor(red: 0.14, green: 0.13, blue: 0.12, alpha: 1)
-      baseBottomColor = CIColor(red: 0.10, green: 0.09, blue: 0.09, alpha: 1)
-      sourceGlowColor = CIColor(red: 0.98, green: 0.85, blue: 0.67, alpha: 0.92)
-      beamGlowColor = CIColor(red: 0.99, green: 0.95, blue: 0.89, alpha: 0.42)
-      textGlowColor = CIColor(red: 0.98, green: 0.92, blue: 0.84, alpha: 0.34)
-      ambientGlowColor = CIColor(red: 0.46, green: 0.34, blue: 0.31, alpha: 0.28)
-      secondaryAmbientGlowColor = CIColor(red: 0.64, green: 0.50, blue: 0.42, alpha: 0.34)
-    } else {
-      fallbackColors = [
-        UIColor(red: 0.98, green: 0.97, blue: 0.95, alpha: 1).cgColor,
-        UIColor(red: 0.93, green: 0.90, blue: 0.86, alpha: 1).cgColor,
-        UIColor(red: 0.89, green: 0.84, blue: 0.80, alpha: 1).cgColor,
-      ]
-      clearColor = MTLClearColorMake(0.98, 0.97, 0.95, 1)
-      baseTopColor = CIColor(red: 0.98, green: 0.97, blue: 0.95, alpha: 1)
-      baseBottomColor = CIColor(red: 0.91, green: 0.88, blue: 0.84, alpha: 1)
-      sourceGlowColor = CIColor(red: 0.92, green: 0.75, blue: 0.58, alpha: 0.58)
-      beamGlowColor = CIColor(red: 0.94, green: 0.87, blue: 0.81, alpha: 0.32)
-      textGlowColor = CIColor(red: 0.99, green: 0.97, blue: 0.93, alpha: 0.26)
-      ambientGlowColor = CIColor(red: 0.86, green: 0.76, blue: 0.70, alpha: 0.28)
-      secondaryAmbientGlowColor = CIColor(red: 0.83, green: 0.67, blue: 0.56, alpha: 0.32)
-    }
+    renderEncoder.endEncoding()
+    commandBuffer.present(drawable)
+    commandBuffer.commit()
   }
 }

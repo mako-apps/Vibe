@@ -16,7 +16,7 @@ struct AppVectorIcon: View {
         switch glyph {
         case .story:
           storyPath(in: geometry.size)
-            .fill(tint)
+            .stroke(tint, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round, lineJoin: .round))
         case .compose:
           composePaths(in: geometry.size)
             .stroke(tint, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round, lineJoin: .round))
@@ -36,9 +36,18 @@ struct AppVectorIcon: View {
     )
 
     var path = Path()
-    path.addEllipse(in: CGRect(x: rect.minX + 2.25 * scale, y: rect.minY + 2.25 * scale, width: 19.5 * scale, height: 19.5 * scale))
-    path.addRoundedRect(in: CGRect(x: rect.minX + 11.25 * scale, y: rect.minY + 7.25 * scale, width: 1.5 * scale, height: 9.5 * scale), cornerSize: CGSize(width: 0.75 * scale, height: 0.75 * scale))
-    path.addRoundedRect(in: CGRect(x: rect.minX + 7.25 * scale, y: rect.minY + 11.25 * scale, width: 9.5 * scale, height: 1.5 * scale), cornerSize: CGSize(width: 0.75 * scale, height: 0.75 * scale))
+    let center = CGPoint(x: rect.midX, y: rect.midY)
+    path.addArc(
+      center: center,
+      radius: 9.0 * scale,
+      startAngle: .degrees(-39),
+      endAngle: .degrees(-70),
+      clockwise: false
+    )
+    path.move(to: CGPoint(x: rect.minX + 12.0 * scale, y: rect.minY + 8.0 * scale))
+    path.addLine(to: CGPoint(x: rect.minX + 12.0 * scale, y: rect.minY + 16.0 * scale))
+    path.move(to: CGPoint(x: rect.minX + 8.0 * scale, y: rect.minY + 12.0 * scale))
+    path.addLine(to: CGPoint(x: rect.minX + 16.0 * scale, y: rect.minY + 12.0 * scale))
     return path
   }
 

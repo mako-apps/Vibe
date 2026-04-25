@@ -1,36 +1,40 @@
 package com.mohammadshayani.vibe.ui
 
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Intent
+import android.widget.Toast
 import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
+import android.text.Editable
+import android.text.TextWatcher
+import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
-import android.view.ViewGroup
+import android.view.WindowManager
+import android.view.inputmethod.InputMethodManager
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
-import androidx.recyclerview.widget.LinearLayoutManager
-import androidx.recyclerview.widget.RecyclerView
-import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import com.google.android.material.bottomnavigation.BottomNavigationView
 import com.google.android.material.button.MaterialButton
-import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.materialswitch.MaterialSwitch
-import com.mohammadshayani.vibe.home.ChatHomeCardView
+import com.google.android.material.navigation.NavigationBarView
+import com.mohammadshayani.vibe.R
+import com.mohammadshayani.vibe.chat.ChatNativeHomeListView
+import com.mohammadshayani.vibe.chat.NativeChatContext
+import com.mohammadshayani.vibe.chat.ChatEngineApi
 import com.mohammadshayani.vibe.home.ChatHomeListRow
-import com.mohammadshayani.vibe.home.ChatHomeService
 import com.mohammadshayani.vibe.packet.PacketTransportMode
 import com.mohammadshayani.vibe.session.AppSessionConfig
 import com.mohammadshayani.vibe.storage.ChatEngineStore
@@ -54,10 +58,12 @@ class ChatHomeActivity : AppCompatActivity() {
   }
 
   private lateinit var contentHost: FrameLayout
+  private lateinit var headerContainer: LinearLayout
+  private lateinit var navigationContainer: FrameLayout
   private lateinit var bottomNavigationView: BottomNavigationView
   private lateinit var headerTitleView: TextView
-  private lateinit var headerSubtitleView: TextView
-  private lateinit var headerActionButton: ImageView
+  private lateinit var storyActionButton: ImageView
+  private lateinit var newChatActionButton: ImageView
 
   private lateinit var chatsPage: ChatListPageView
   private lateinit var contactsPage: ChatListPageView
@@ -70,6 +76,7 @@ class ChatHomeActivity : AppCompatActivity() {
   private var isLoading = false
   private var errorMessage: String? = null
   private var notificationsEnabled = true
+  private var isSyncingBottomNavigation = false
 
   override fun onCreate(savedInstanceState: Bundle?) {
     AppAppearanceController.applyStoredPreference(this)
@@ -109,6 +116,7 @@ class ChatHomeActivity : AppCompatActivity() {
   }
 
   private fun buildViewHierarchy() {
+    window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING)
     val palette = resolveAppThemePalette(this)
     applyThemedSystemBars(this, palette)
 
@@ -120,12 +128,13 @@ class ChatHomeActivity : AppCompatActivity() {
     val header = LinearLayout(this).apply {
       orientation = LinearLayout.HORIZONTAL
       gravity = Gravity.CENTER_VERTICAL
-      setPadding(dp(18f), dp(10f), dp(12f), dp(10f))
+      setPadding(dp(12f), dp(8f), dp(12f), dp(8f))
       background =
         GradientDrawable().apply {
-          setColor(adjustColor(palette.backgroundColor, if (palette.isDark) 0.04f else -0.01f))
+          setColor(palette.backgroundColor)
         }
     }
+    headerContainer = header
     root.addView(
       header,
       LinearLayout.LayoutParams(
@@ -134,39 +143,65 @@ class ChatHomeActivity : AppCompatActivity() {
       ),
     )
 
-    val headerTextColumn = LinearLayout(this).apply {
-      orientation = LinearLayout.VERTICAL
-    }
     header.addView(
-      headerTextColumn,
-      LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
+      View(this),
+      LinearLayout.LayoutParams(dp(88f), dp(40f)),
     )
 
     headerTitleView =
       TextView(this).apply {
         setTextColor(palette.textColor)
-        setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
         typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-      }
-    headerSubtitleView =
-      TextView(this).apply {
-        setTextColor(palette.secondaryTextColor)
-        setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-      }
-    headerTextColumn.addView(headerTitleView)
-    headerTextColumn.addView(headerSubtitleView)
-
-    headerActionButton =
-      ImageView(this).apply {
-        setImageResource(android.R.drawable.ic_popup_sync)
-        setColorFilter(palette.textColor)
-        background = selectableItemBackground()
-        setPadding(dp(10f), dp(10f), dp(10f), dp(10f))
-        setOnClickListener { loadChats() }
+        gravity = Gravity.CENTER
+        maxLines = 1
       }
     header.addView(
-      headerActionButton,
-      LinearLayout.LayoutParams(dp(42f), dp(42f)),
+      headerTitleView,
+      LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
+    )
+
+    val headerActions = LinearLayout(this).apply {
+      orientation = LinearLayout.HORIZONTAL
+      gravity = Gravity.CENTER_VERTICAL or Gravity.END
+    }
+    header.addView(
+      headerActions,
+      LinearLayout.LayoutParams(dp(88f), LinearLayout.LayoutParams.WRAP_CONTENT),
+    )
+
+    storyActionButton =
+      ImageView(this).apply {
+        setImageResource(R.drawable.ic_vibe_story_add)
+        setColorFilter(palette.textColor)
+        background = selectableItemBackground()
+        setPadding(dp(8f), dp(8f), dp(8f), dp(8f))
+        setOnClickListener {
+          startActivity(Intent(this@ChatHomeActivity, StoryActivity::class.java))
+        }
+      }
+    headerActions.addView(
+      storyActionButton,
+      LinearLayout.LayoutParams(dp(40f), dp(40f)),
+    )
+
+    newChatActionButton =
+      ImageView(this).apply {
+        setImageResource(R.drawable.ic_vibe_new_chat)
+        setColorFilter(palette.textColor)
+        background = selectableItemBackground()
+        setPadding(dp(8f), dp(8f), dp(8f), dp(8f))
+        setOnClickListener {
+          currentTab = ShellTab.CHATS
+          renderShell()
+          showNewChatDialog()
+        }
+      }
+    headerActions.addView(
+      newChatActionButton,
+      LinearLayout.LayoutParams(dp(40f), dp(40f)).apply {
+        marginStart = dp(4f)
+      },
     )
 
     contentHost = FrameLayout(this).apply {
@@ -181,31 +216,58 @@ class ChatHomeActivity : AppCompatActivity() {
       ),
     )
 
+    navigationContainer = FrameLayout(this).apply {
+      layoutParams = LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT,
+        LinearLayout.LayoutParams.WRAP_CONTENT,
+      )
+      background = GradientDrawable().apply {
+        setColor(colorRgba(
+          Color.red(palette.backgroundColor),
+          Color.green(palette.backgroundColor),
+          Color.blue(palette.backgroundColor),
+          1f
+        ))
+      }
+    }
+    root.addView(navigationContainer)
+
     bottomNavigationView =
       BottomNavigationView(this).apply {
-        setBackgroundColor(palette.cardColor)
+        setBackgroundColor(palette.backgroundColor)
+        elevation = 0f
+        labelVisibilityMode = NavigationBarView.LABEL_VISIBILITY_LABELED
+        itemActiveIndicatorColor = ColorStateList.valueOf(palette.overlayColor)
         itemIconTintList = navigationTintList(palette)
         itemTextColor = navigationTintList(palette)
         itemRippleColor = ColorStateList.valueOf(palette.overlayColor)
+
+        // Ensure clean and modern SVG icons are used
         menu.add(0, ShellTab.CONTACTS.menuId, 0, ShellTab.CONTACTS.title)
-          .setIcon(android.R.drawable.ic_menu_myplaces)
+          .setIcon(R.drawable.ic_vibe_tab_contacts)
         menu.add(0, ShellTab.CALLS.menuId, 1, ShellTab.CALLS.title)
-          .setIcon(android.R.drawable.ic_menu_call)
+          .setIcon(R.drawable.ic_vibe_tab_calls)
         menu.add(0, ShellTab.CHATS.menuId, 2, ShellTab.CHATS.title)
-          .setIcon(android.R.drawable.ic_dialog_email)
-        menu.add(0, ShellTab.SETTINGS.menuId, 3, ShellTab.SETTINGS.title)
-          .setIcon(android.R.drawable.ic_menu_manage)
+          .setIcon(R.drawable.ic_vibe_tab_chats)
+
+        // Settings Tab with Avatar Fallback
+        val settingsMenuItem = menu.add(0, ShellTab.SETTINGS.menuId, 3, ShellTab.SETTINGS.title)
+        settingsMenuItem.setIcon(R.drawable.ic_vibe_tab_settings)
+
         setOnItemSelectedListener {
+          if (isSyncingBottomNavigation) {
+            return@setOnItemSelectedListener true
+          }
           currentTab = ShellTab.fromMenuId(it.itemId)
           renderShell()
           true
         }
       }
-    root.addView(
+    navigationContainer.addView(
       bottomNavigationView,
-      LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT,
-        LinearLayout.LayoutParams.WRAP_CONTENT,
+      FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams.MATCH_PARENT,
+        FrameLayout.LayoutParams.WRAP_CONTENT,
       ),
     )
 
@@ -214,12 +276,14 @@ class ChatHomeActivity : AppCompatActivity() {
         context = this,
         onRefresh = { loadChats() },
         onRowPress = { openConversation(it) },
+        onSearchFocusChanged = { updateSearchPresentation(it) },
       )
     contactsPage =
       ChatListPageView(
         context = this,
         onRefresh = { loadChats() },
         onRowPress = { openConversation(it) },
+        onSearchFocusChanged = {},
       )
     callsPage = PlaceholderPageView(this)
     settingsPage =
@@ -232,8 +296,8 @@ class ChatHomeActivity : AppCompatActivity() {
 
     ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
       val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
-      header.setPadding(dp(18f), bars.top + dp(10f), dp(12f), dp(10f))
-      bottomNavigationView.setPadding(dp(8f), dp(4f), dp(8f), bars.bottom + dp(6f))
+      header.setPadding(dp(12f), bars.top + dp(8f), dp(12f), dp(8f))
+      navigationContainer.setPadding(dp(8f), dp(4f), dp(8f), dp(6f))
       insets
     }
 
@@ -242,18 +306,21 @@ class ChatHomeActivity : AppCompatActivity() {
   }
 
   private fun loadChats() {
+    if (rows.isEmpty()) {
+      rows = ensureSavedMessagesRow(ChatEngineApi.cachedRows(applicationContext) ?: emptyList())
+    }
     isLoading = true
     errorMessage = null
-    renderPages()
-    ChatHomeService.fetchChats(applicationContext) { result ->
+    renderShell()
+    ChatEngineApi.fetchChats(applicationContext) { result ->
       isLoading = false
       result.onSuccess { nextRows ->
-        rows = nextRows
+        rows = ensureSavedMessagesRow(nextRows)
       }.onFailure { error ->
-        rows = emptyList()
+        rows = listOf(savedMessagesRow())
         errorMessage = error.localizedMessage ?: error.message ?: "Load failed."
       }
-      renderPages()
+      renderShell()
     }
   }
 
@@ -261,15 +328,27 @@ class ChatHomeActivity : AppCompatActivity() {
     val palette = resolveAppThemePalette(this)
     applyThemedSystemBars(this, palette)
 
-    headerTitleView.text = currentTab.title
-    headerSubtitleView.text = currentSubtitle()
-    headerActionButton.visibility =
-      if (currentTab == ShellTab.SETTINGS || currentTab == ShellTab.CALLS) View.GONE else View.VISIBLE
-    bottomNavigationView.selectedItemId = currentTab.menuId
-    bottomNavigationView.setBackgroundColor(palette.cardColor)
+    headerTitleView.text = currentHeaderTitle()
+    headerTitleView.setTextColor(palette.textColor)
+    val showHeaderActions = currentTab == ShellTab.CHATS
+    storyActionButton.visibility = if (showHeaderActions) View.VISIBLE else View.INVISIBLE
+    newChatActionButton.visibility = if (showHeaderActions) View.VISIBLE else View.INVISIBLE
+    storyActionButton.setColorFilter(palette.textColor)
+    newChatActionButton.setColorFilter(palette.textColor)
+    if (bottomNavigationView.selectedItemId != currentTab.menuId) {
+      isSyncingBottomNavigation = true
+      bottomNavigationView.selectedItemId = currentTab.menuId
+      isSyncingBottomNavigation = false
+    }
+    bottomNavigationView.setBackgroundColor(palette.backgroundColor)
+    bottomNavigationView.labelVisibilityMode = NavigationBarView.LABEL_VISIBILITY_LABELED
+    bottomNavigationView.itemActiveIndicatorColor = ColorStateList.valueOf(palette.overlayColor)
     bottomNavigationView.itemIconTintList = navigationTintList(palette)
     bottomNavigationView.itemTextColor = navigationTintList(palette)
     contentHost.setBackgroundColor(palette.backgroundColor)
+    if (currentTab != ShellTab.CHATS) {
+      updateSearchPresentation(false)
+    }
 
     renderPages()
 
@@ -290,6 +369,12 @@ class ChatHomeActivity : AppCompatActivity() {
         ),
       )
     }
+  }
+
+  private fun updateSearchPresentation(focused: Boolean) {
+    if (!::headerContainer.isInitialized || !::navigationContainer.isInitialized) return
+    val shouldCoverHeader = focused && currentTab == ShellTab.CHATS
+    headerContainer.visibility = if (shouldCoverHeader) View.GONE else View.VISIBLE
   }
 
   private fun renderPages() {
@@ -346,12 +431,18 @@ class ChatHomeActivity : AppCompatActivity() {
     )
   }
 
-  private fun currentSubtitle(): String {
+  private fun currentHeaderTitle(): String {
     return when (currentTab) {
-      ShellTab.CONTACTS -> "People you already message"
-      ShellTab.CALLS -> "Recent calls"
-      ShellTab.CHATS -> "Connected"
-      ShellTab.SETTINGS -> AppSessionConfig.current(applicationContext)?.username ?: "Account"
+      ShellTab.CONTACTS -> "Contacts"
+      ShellTab.CALLS -> "Calls"
+      ShellTab.CHATS -> {
+        when {
+          isLoading && rows.isEmpty() -> "Updating..."
+          errorMessage != null && rows.size <= 1 -> "Connection issue"
+          else -> "Chats"
+        }
+      }
+      ShellTab.SETTINGS -> "Settings"
     }
   }
 
@@ -365,7 +456,198 @@ class ChatHomeActivity : AppCompatActivity() {
   }
 
   private fun openConversation(row: ChatHomeListRow) {
-    startActivity(ConversationActivity.intent(this, row))
+    startActivity(
+      if (row.isSavedMessages) {
+        ConversationActivity.savedMessagesIntent(this)
+      } else {
+        ConversationActivity.intent(this, row)
+      },
+    )
+  }
+
+  private fun showNewChatDialog() {
+    val palette = resolveAppThemePalette(this)
+    val bottomSheet = com.google.android.material.bottomsheet.BottomSheetDialog(this, R.style.ThemeOverlay_Vibe_BottomSheetDialog)
+    val displayMetrics = resources.displayMetrics
+    val targetHeight = (displayMetrics.heightPixels * 0.90f).toInt()
+
+    val container = FrameLayout(this).apply {
+      layoutParams = android.view.ViewGroup.LayoutParams(
+        android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+        targetHeight
+      )
+    }
+
+    val searchView = LinearLayout(this).apply {
+      orientation = LinearLayout.VERTICAL
+      setPadding(dp(24f), dp(24f), dp(24f), dp(28f))
+      layoutParams = FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+    }
+
+    val title = TextView(this).apply {
+      text = "New Chat"
+      setTextColor(palette.textColor)
+      textSize = 28f
+      typeface = Typeface.create("sans-serif-black", Typeface.NORMAL)
+      setPadding(0, 0, 0, dp(16f))
+    }
+    searchView.addView(title)
+
+    val input = EditText(this).apply {
+      hint = "Username, phone, or user id"
+      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+      isSingleLine = true
+      setTextColor(palette.textColor)
+      setHintTextColor(palette.tertiaryTextColor)
+      background = GradientDrawable().apply {
+        shape = GradientDrawable.RECTANGLE
+        cornerRadius = dp(22f).toFloat()
+        setColor(palette.inputColor)
+      }
+      setPadding(dp(20f), dp(16f), dp(20f), dp(16f))
+    }
+    searchView.addView(input, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+      bottomMargin = dp(16f)
+    })
+
+    val startButton = MaterialButton(this).apply {
+      text = "Search"
+      isAllCaps = false
+      setBackgroundColor(palette.accentColor)
+      setTextColor(Color.WHITE)
+      cornerRadius = dp(27f)
+      minimumHeight = dp(54f)
+    }
+    searchView.addView(startButton, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+    val resultView = LinearLayout(this).apply {
+      orientation = LinearLayout.VERTICAL
+      setPadding(dp(24f), dp(24f), dp(24f), dp(28f))
+      layoutParams = FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+      visibility = View.GONE
+      gravity = Gravity.CENTER_HORIZONTAL
+    }
+
+    val resultAvatar = FrameLayout(this).apply {
+      background = GradientDrawable().apply {
+        shape = GradientDrawable.OVAL
+        setColor(palette.inputColor)
+      }
+      layoutParams = LinearLayout.LayoutParams(dp(90f), dp(90f)).apply {
+        topMargin = dp(40f)
+        bottomMargin = dp(16f)
+      }
+    }
+    resultView.addView(resultAvatar)
+
+    val resultName = TextView(this).apply {
+      setTextColor(palette.textColor)
+      textSize = 24f
+      typeface = Typeface.create("sans-serif-bold", Typeface.NORMAL)
+      gravity = Gravity.CENTER
+    }
+    resultView.addView(resultName)
+
+    val resultId = TextView(this).apply {
+      setTextColor(palette.secondaryTextColor)
+      textSize = 16f
+      gravity = Gravity.CENTER
+      setPadding(0, dp(4f), 0, dp(32f))
+    }
+    resultView.addView(resultId)
+
+    val actionsRow = LinearLayout(this).apply {
+      orientation = LinearLayout.HORIZONTAL
+      gravity = Gravity.CENTER
+      weightSum = 2f
+    }
+    val messageBtn = MaterialButton(this).apply {
+      text = "Message"
+      isAllCaps = false
+      setBackgroundColor(palette.accentColor)
+      setTextColor(Color.WHITE)
+      cornerRadius = dp(20f)
+      layoutParams = LinearLayout.LayoutParams(0, dp(54f), 1f).apply { marginEnd = dp(8f) }
+    }
+    val addContactBtn = MaterialButton(this).apply {
+      text = "Add Contact"
+      isAllCaps = false
+      setBackgroundColor(palette.inputColor)
+      setTextColor(palette.textColor)
+      cornerRadius = dp(20f)
+      layoutParams = LinearLayout.LayoutParams(0, dp(54f), 1f).apply { marginStart = dp(8f) }
+    }
+    actionsRow.addView(messageBtn)
+    actionsRow.addView(addContactBtn)
+    resultView.addView(actionsRow, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+    container.addView(searchView)
+    container.addView(resultView)
+
+    var foundUserLookup = ""
+
+    startButton.setOnClickListener {
+      val lookup = input.text?.toString().orEmpty().trim()
+      if (lookup.isBlank()) {
+        input.error = "Enter a username, phone, or user id"
+        return@setOnClickListener
+      }
+      startButton.isEnabled = false
+      startButton.text = "Searching..."
+      ChatEngineApi.startDirectChat(this@ChatHomeActivity, lookup) { result ->
+        startButton.isEnabled = true
+        startButton.text = "Search"
+        result.onSuccess { row ->
+          foundUserLookup = lookup
+          searchView.visibility = View.GONE
+          resultView.visibility = View.VISIBLE
+          resultName.text = row.title
+          resultId.text = "@$lookup"
+          
+          messageBtn.setOnClickListener {
+            rows = ensureSavedMessagesRow(listOf(row) + rows.filter { it.chatId != row.chatId })
+            renderShell()
+            bottomSheet.dismiss()
+            openConversation(row)
+          }
+          addContactBtn.setOnClickListener {
+            Toast.makeText(this@ChatHomeActivity, "Contact Added", Toast.LENGTH_SHORT).show()
+            addContactBtn.text = "Added"
+            addContactBtn.isEnabled = false
+          }
+        }.onFailure { error ->
+          input.error = error.localizedMessage ?: error.message ?: "Could not find user"
+        }
+      }
+    }
+
+    bottomSheet.setContentView(container)
+    bottomSheet.window?.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(Color.TRANSPARENT))
+
+    bottomSheet.findViewById<View>(com.google.android.material.R.id.design_bottom_sheet)?.let { sheet ->
+      sheet.layoutParams = sheet.layoutParams.apply { height = targetHeight }
+      sheet.minimumHeight = targetHeight
+      val behavior = com.google.android.material.bottomsheet.BottomSheetBehavior.from(sheet)
+      behavior.isFitToContents = false
+      behavior.expandedOffset = (displayMetrics.heightPixels - targetHeight).coerceAtLeast(0)
+      behavior.peekHeight = targetHeight
+      behavior.skipCollapsed = true
+      behavior.state = com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDED
+      
+      sheet.background = GradientDrawable().apply {
+        shape = GradientDrawable.RECTANGLE
+        val r = dp(34f).toFloat()
+        cornerRadii = floatArrayOf(r, r, r, r, 0f, 0f, 0f, 0f)
+        setColor(palette.backgroundColor)
+      }
+    }
+
+    bottomSheet.show()
+    input.requestFocus()
+    input.post {
+      (getSystemService(INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager)
+        ?.showSoftInput(input, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+    }
   }
 
   private fun handleSettingsRowPress(rowId: String) {
@@ -377,27 +659,13 @@ class ChatHomeActivity : AppCompatActivity() {
         startActivity(Intent(this, AppearanceSettingsActivity::class.java))
       }
       "your_qr" -> {
-        val config = AppSessionConfig.current(applicationContext)
-        MaterialAlertDialogBuilder(this)
-          .setTitle("Your QR")
-          .setMessage(
-            listOfNotNull(
-              config?.username?.let { "@$it" },
-              config?.userId?.let { "ID: $it" },
-            ).joinToString("\n"),
-          )
-          .setPositiveButton("Close", null)
-          .show()
+        startActivity(Intent(this, UserQRDetailActivity::class.java))
       }
       "connection_manager" -> {
-        MaterialAlertDialogBuilder(this)
-          .setTitle("Connection Manager")
-          .setMessage("Transport mode: ${connectionModeTitle()}")
-          .setPositiveButton("Close", null)
-          .show()
+        startActivity(Intent(this, ConnectionDetailActivity::class.java))
       }
       "secret_key" -> {
-        showSecretKeyDialog()
+        startActivity(Intent(this, SecretKeyDetailActivity::class.java))
       }
     }
   }
@@ -421,81 +689,6 @@ class ChatHomeActivity : AppCompatActivity() {
     finish()
   }
 
-  private fun showSecretKeyDialog(revealed: Boolean = false) {
-    val secret = SecureKeyStore.retrieveSecret(applicationContext, "loginSecret").orEmpty()
-    val body =
-      LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
-        setPadding(dp(4f), dp(10f), dp(4f), 0)
-      }
-    body.addView(
-      TextView(this).apply {
-        text = "YOUR SECRET KEY"
-        setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-        setTextColor(resolveAppThemePalette(this@ChatHomeActivity).secondaryTextColor)
-        typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-      },
-    )
-    body.addView(space(this, 10f))
-    body.addView(
-      TextView(this).apply {
-        text =
-          if (secret.isBlank()) {
-            "No secret key is stored on this device yet."
-          } else {
-            displaySecret(secret, revealed)
-          }
-        setTextColor(
-          if (secret.isBlank()) {
-            resolveAppThemePalette(this@ChatHomeActivity).secondaryTextColor
-          } else {
-            resolveAppThemePalette(this@ChatHomeActivity).textColor
-          },
-        )
-        setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-        typeface = Typeface.MONOSPACE
-        setTextIsSelectable(true)
-      },
-    )
-    body.addView(space(this, 14f))
-    body.addView(
-      TextView(this).apply {
-        text = "Do not share this key. Anyone with it can sign in as you on another device."
-        setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-        setTextColor(resolveAppThemePalette(this@ChatHomeActivity).dangerColor)
-      },
-    )
-
-    val builder =
-      MaterialAlertDialogBuilder(this)
-        .setTitle("Secret Key")
-        .setView(body)
-
-    if (secret.isBlank()) {
-      builder.setPositiveButton("Close", null)
-    } else {
-      builder
-        .setNeutralButton(if (revealed) "Hide" else "Show") { _, _ ->
-          showSecretKeyDialog(!revealed)
-        }
-        .setPositiveButton("Copy") { _, _ ->
-          val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
-          clipboard.setPrimaryClip(ClipData.newPlainText("Secret Key", secret))
-        }
-        .setNegativeButton("Close", null)
-    }
-
-    builder.show()
-  }
-
-  private fun displaySecret(secret: String, revealed: Boolean): String {
-    if (revealed) return secret
-    if (secret.length <= 10) return secret
-    val prefix = secret.take(6)
-    val suffix = secret.takeLast(4)
-    return prefix + "•".repeat(secret.length - 10) + suffix
-  }
-
   private fun navigationTintList(palette: AppThemePalette): ColorStateList {
     return ColorStateList(
       arrayOf(
@@ -503,7 +696,7 @@ class ChatHomeActivity : AppCompatActivity() {
         intArrayOf(),
       ),
       intArrayOf(
-        palette.accentColor,
+        palette.textColor,
         palette.secondaryTextColor,
       ),
     )
@@ -518,37 +711,174 @@ class ChatHomeActivity : AppCompatActivity() {
 
   private fun dp(value: Float): Int =
     TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, value, resources.displayMetrics).toInt()
+
+  private fun ensureSavedMessagesRow(nextRows: List<ChatHomeListRow>): List<ChatHomeListRow> {
+    if (nextRows.any { it.isSavedMessages || it.chatId == "saved_messages" }) return nextRows
+    return listOf(savedMessagesRow()) + nextRows
+  }
+
+  private fun savedMessagesRow(): ChatHomeListRow {
+    return ChatHomeListRow(
+      chatId = "saved_messages",
+      title = "Saved Messages",
+      preview = "",
+      timeLabel = "",
+      unreadCount = 0,
+      markedUnread = false,
+      muted = false,
+      pinned = false,
+      isTyping = false,
+      isOnline = false,
+      peerUserId = null,
+      avatarUri = null,
+      avatarFallback = "S",
+      avatarGradientStartLight = "#7ADCE6",
+      avatarGradientEndLight = "#1B8E99",
+      avatarGradientStartDark = "#174A50",
+      avatarGradientEndDark = "#2AA6B5",
+      isSavedMessages = true,
+    )
+  }
 }
 
 private class ChatListPageView(
   context: android.content.Context,
   private val onRefresh: () -> Unit,
   private val onRowPress: (ChatHomeListRow) -> Unit,
+  private val onSearchFocusChanged: (Boolean) -> Unit,
 ) : FrameLayout(context) {
-  private val swipeRefreshLayout = SwipeRefreshLayout(context)
-  private val recyclerView = RecyclerView(context)
+  private val listColumn = LinearLayout(context)
+  private val searchShell = LinearLayout(context)
+  private val searchInput = EditText(context)
+  private val searchClearButton = ImageView(context)
+  private val nativeHomeListView =
+    ChatNativeHomeListView(context, NativeChatContext(context as? android.app.Activity))
   private val progressView = ProgressBar(context)
   private val emptyView = PlaceholderPageView(context)
-  private val adapter = ChatRowsAdapter(onRowPress)
+  private var allRows: List<ChatHomeListRow> = emptyList()
+  private var query = ""
+  private var searchFocused = false
+
+  private val storyStrip = android.widget.HorizontalScrollView(context).apply {
+    isHorizontalScrollBarEnabled = false
+    setPadding(0, dp(context, 4f), 0, dp(context, 8f))
+  }
+  private val storyContainer = LinearLayout(context).apply {
+    orientation = LinearLayout.HORIZONTAL
+    setPadding(dp(context, 16f), 0, dp(context, 16f), 0)
+  }
+  private val addStoryItem = LinearLayout(context).apply {
+    orientation = LinearLayout.VERTICAL
+    gravity = Gravity.CENTER
+    setOnClickListener {
+      context.startActivity(android.content.Intent(context, com.mohammadshayani.vibe.ui.StoryActivity::class.java))
+    }
+  }
+  private val addStoryAvatarContainer = FrameLayout(context).apply {
+    setPadding(dp(context, 4f), dp(context, 4f), dp(context, 4f), dp(context, 4f))
+  }
+  private val addStoryIcon = ImageView(context).apply {
+    setImageResource(R.drawable.ic_vibe_story_add)
+    setPadding(dp(context, 12f), dp(context, 12f), dp(context, 12f), dp(context, 12f))
+  }
+  private val addStoryLabel = TextView(context).apply {
+    text = "Your Story"
+    textSize = 12f
+    maxLines = 1
+    setPadding(0, dp(context, 4f), 0, 0)
+  }
 
   init {
     setBackgroundColor(Color.TRANSPARENT)
 
-    recyclerView.layoutManager = LinearLayoutManager(context)
-    recyclerView.adapter = adapter
-    recyclerView.clipToPadding = false
-    recyclerView.setPadding(dp(context, 0f), dp(context, 8f), dp(context, 0f), dp(context, 8f))
+    listColumn.orientation = LinearLayout.VERTICAL
 
-    swipeRefreshLayout.setOnRefreshListener { onRefresh() }
-    swipeRefreshLayout.addView(
-      recyclerView,
-      LayoutParams(
-        LayoutParams.MATCH_PARENT,
-        LayoutParams.MATCH_PARENT,
+    searchShell.orientation = LinearLayout.HORIZONTAL
+    searchShell.gravity = Gravity.CENTER_VERTICAL
+    searchShell.setPadding(dp(context, 14f), 0, dp(context, 14f), 0)
+    searchShell.addView(
+      ImageView(context).apply {
+        setImageResource(R.drawable.ic_vibe_search)
+      },
+      LinearLayout.LayoutParams(dp(context, 20f), dp(context, 20f)),
+    )
+    searchInput.apply {
+      background = null
+      hint = "Search"
+      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+      isSingleLine = true
+      setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+      setPadding(dp(context, 8f), 0, 0, 0)
+      addTextChangedListener(object : TextWatcher {
+        override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+        override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+          query = s?.toString().orEmpty()
+          applyFilteredRows()
+          updateSearchChrome()
+        }
+        override fun afterTextChanged(s: Editable?) = Unit
+      })
+      setOnFocusChangeListener { _, focused ->
+        searchFocused = focused
+        onSearchFocusChanged(focused)
+        updateSearchChrome()
+      }
+    }
+    searchShell.addView(
+      searchInput,
+      LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f),
+    )
+    searchClearButton.apply {
+      setImageResource(R.drawable.ic_close)
+      background = selectableItemBackground()
+      setPadding(dp(context, 8f), dp(context, 8f), dp(context, 8f), dp(context, 8f))
+      visibility = View.GONE
+      setOnClickListener {
+        searchInput.setText("")
+        searchInput.requestFocus()
+      }
+    }
+    searchShell.addView(
+      searchClearButton,
+      LinearLayout.LayoutParams(dp(context, 40f), dp(context, 40f)),
+    )
+    listColumn.addView(
+      searchShell,
+      LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT,
+        dp(context, 44f),
+      ).apply {
+        setMargins(dp(context, 16f), dp(context, 12f), dp(context, 16f), dp(context, 8f))
+      },
+    )
+
+    addStoryAvatarContainer.addView(addStoryIcon, FrameLayout.LayoutParams(dp(context, 56f), dp(context, 56f)))
+    addStoryItem.addView(addStoryAvatarContainer, LinearLayout.LayoutParams(dp(context, 64f), dp(context, 64f)))
+    addStoryItem.addView(addStoryLabel, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+    storyContainer.addView(addStoryItem)
+    storyStrip.addView(storyContainer)
+    listColumn.addView(storyStrip, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+    nativeHomeListView.nativeEventSink = { payload ->
+      when (payload["type"]) {
+        "press" -> {
+          val chatId = payload["chatId"]?.toString().orEmpty()
+          allRows.firstOrNull { it.chatId == chatId }?.let(onRowPress)
+        }
+        "refresh" -> onRefresh()
+      }
+    }
+    listColumn.addView(
+      nativeHomeListView,
+      LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT,
+        0,
+        1f,
       ),
     )
+
     addView(
-      swipeRefreshLayout,
+      listColumn,
       LayoutParams(
         LayoutParams.MATCH_PARENT,
         LayoutParams.MATCH_PARENT,
@@ -575,6 +905,18 @@ private class ChatListPageView(
     )
   }
 
+  fun focusSearch() {
+    searchInput.requestFocus()
+    (context.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as? InputMethodManager)
+      ?.showSoftInput(searchInput, InputMethodManager.SHOW_IMPLICIT)
+    searchInput.post {
+      searchShell.requestRectangleOnScreen(
+        android.graphics.Rect(0, 0, searchShell.width, searchShell.height),
+        true,
+      )
+    }
+  }
+
   fun render(
     palette: AppThemePalette,
     rows: List<ChatHomeListRow>,
@@ -585,69 +927,112 @@ private class ChatListPageView(
     emptyButtonTitle: String?,
   ) {
     setBackgroundColor(palette.backgroundColor)
-    swipeRefreshLayout.setColorSchemeColors(palette.accentColor)
-    adapter.setPalette(palette)
-    adapter.submit(rows)
-    swipeRefreshLayout.isRefreshing = isLoading && rows.isNotEmpty()
-    progressView.visibility = if (isLoading && rows.isEmpty()) View.VISIBLE else View.GONE
+    searchShell.background =
+      GradientDrawable().apply {
+        shape = GradientDrawable.RECTANGLE
+        cornerRadius = dp(context, 22f).toFloat()
+        setColor(palette.inputColor)
+    }
+    (searchShell.getChildAt(0) as? ImageView)?.setColorFilter(palette.tertiaryTextColor)
+    searchClearButton.setColorFilter(palette.tertiaryTextColor)
+    searchInput.setTextColor(palette.textColor)
+    searchInput.setHintTextColor(palette.tertiaryTextColor)
+
+    addStoryAvatarContainer.background = GradientDrawable().apply {
+      shape = GradientDrawable.OVAL
+      setStroke(dp(context, 2f), Color.parseColor("#807ADCE6"))
+    }
+    addStoryIcon.background = GradientDrawable().apply {
+      shape = GradientDrawable.OVAL
+      setColor(Color.parseColor(if (palette.isDark) "#174A50" else "#E9EEF5"))
+    }
+    addStoryIcon.setColorFilter(palette.textColor)
+    addStoryLabel.setTextColor(palette.secondaryTextColor)
+    storyStrip.visibility = if (query.isEmpty()) View.VISIBLE else View.GONE
+    allRows = rows
+    nativeHomeListView.setIsDark(palette.isDark)
+    nativeHomeListView.setPreviewAppearance(
+      mapOf(
+        "avatarBackgroundColorLight" to "#E9EEF5",
+        "avatarBackgroundColorDark" to "#2A2C34",
+      ),
+    )
+    applyFilteredRows()
+    nativeHomeListView.setRefreshing(isLoading && rows.isNotEmpty())
+    progressView.visibility = View.GONE
     progressView.indeterminateDrawable?.setTint(palette.accentColor)
-    recyclerView.visibility = if (rows.isEmpty()) View.INVISIBLE else View.VISIBLE
-    emptyView.visibility = if (!isLoading && rows.isEmpty()) View.VISIBLE else View.GONE
+    val visibleRows = filteredRows()
+    listColumn.visibility = View.VISIBLE
+    nativeHomeListView.visibility = if (visibleRows.isEmpty()) View.INVISIBLE else View.VISIBLE
+    emptyView.visibility = if (!isLoading && visibleRows.isEmpty()) View.VISIBLE else View.GONE
+    updateSearchChrome()
     emptyView.render(
       palette = palette,
-      iconRes = android.R.drawable.ic_dialog_email,
-      title = emptyTitle,
-      message = errorMessage ?: emptyMessage,
+      iconRes = R.drawable.ic_vibe_tab_chats,
+      title = if (query.isBlank()) emptyTitle else "No results",
+      message = if (query.isBlank()) errorMessage ?: emptyMessage else "Try a different search.",
       buttonTitle = emptyButtonTitle,
       onButtonPress = if (emptyButtonTitle != null) onRefresh else null,
     )
   }
-}
 
-private class ChatRowsAdapter(
-  private val onRowPress: (ChatHomeListRow) -> Unit,
-) : RecyclerView.Adapter<ChatRowViewHolder>() {
-  private val rows = ArrayList<ChatHomeListRow>()
-  private var palette = resolveFallbackPalette()
-
-  fun setPalette(value: AppThemePalette) {
-    palette = value
-    notifyDataSetChanged()
+  private fun filteredRows(): List<ChatHomeListRow> {
+    val needle = query.trim().lowercase()
+    if (needle.isBlank()) return allRows
+    return allRows.filter {
+      it.title.lowercase().contains(needle) ||
+        it.preview.lowercase().contains(needle) ||
+        it.chatId.lowercase().contains(needle) ||
+        it.peerUserId.orEmpty().lowercase().contains(needle) ||
+        it.avatarFallback.lowercase().contains(needle)
+    }
   }
 
-  fun submit(nextRows: List<ChatHomeListRow>) {
-    rows.clear()
-    rows.addAll(nextRows)
-    notifyDataSetChanged()
+  private fun applyFilteredRows() {
+    nativeHomeListView.setRows(filteredRows().map(::rowPayload))
   }
 
-  override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ChatRowViewHolder {
-    val view = ChatHomeCardView(parent.context)
-    view.layoutParams =
-      RecyclerView.LayoutParams(
-        RecyclerView.LayoutParams.MATCH_PARENT,
-        RecyclerView.LayoutParams.WRAP_CONTENT,
-      )
-    return ChatRowViewHolder(view)
+  private fun updateSearchChrome() {
+    searchClearButton.visibility = if (query.isBlank()) View.GONE else View.VISIBLE
+    val lp = searchShell.layoutParams as? LinearLayout.LayoutParams ?: return
+    val targetTop = if (searchFocused) dp(context, 4f) else dp(context, 12f)
+    if (lp.topMargin != targetTop) {
+      lp.topMargin = targetTop
+      searchShell.layoutParams = lp
+    }
+    nativeHomeListView.translationY = if (searchFocused) -dp(context, 6f).toFloat() else 0f
   }
 
-  override fun onBindViewHolder(holder: ChatRowViewHolder, position: Int) {
-    val row = rows[position]
-    holder.view.bind(
-      row = row,
-      isDark = palette.isDark,
-      avatarBackgroundColor = null,
-      avatarGradientColors = resolveAvatarGradient(row, palette.isDark),
+  private fun selectableItemBackground() =
+    context.obtainStyledAttributes(intArrayOf(android.R.attr.selectableItemBackground)).let { typedArray ->
+      val drawable = typedArray.getDrawable(0)
+      typedArray.recycle()
+      drawable
+    }
+
+  private fun rowPayload(row: ChatHomeListRow): Map<String, Any?> {
+    return mapOf(
+      "chatId" to row.chatId,
+      "chatType" to if (row.peerUserId == null && !row.isSavedMessages) "group" else "dm",
+      "name" to row.title,
+      "preview" to row.preview,
+      "timeLabel" to row.timeLabel,
+      "unreadCount" to row.unreadCount,
+      "markedUnread" to row.markedUnread,
+      "muted" to row.muted,
+      "pinned" to row.pinned,
+      "isTyping" to row.isTyping,
+      "isOnline" to row.isOnline,
+      "friendId" to row.peerUserId,
+      "avatarUri" to row.avatarUri,
+      "avatarFallback" to row.avatarFallback,
+      "avatarGradientStartLight" to row.avatarGradientStartLight,
+      "avatarGradientEndLight" to row.avatarGradientEndLight,
+      "avatarGradientStartDark" to row.avatarGradientStartDark,
+      "avatarGradientEndDark" to row.avatarGradientEndDark,
     )
-    holder.view.setOnClickListener { onRowPress(row) }
   }
-
-  override fun getItemCount(): Int = rows.size
 }
-
-private class ChatRowViewHolder(
-  val view: ChatHomeCardView,
-) : RecyclerView.ViewHolder(view)
 
 private class PlaceholderPageView(
   context: android.content.Context,
@@ -768,21 +1153,21 @@ private class SettingsPageView(
           settingsRow(
             state.palette,
             "saved_messages",
-            android.R.drawable.ic_menu_save,
+            R.drawable.ic_vibe_saved,
             "Saved Messages",
             null,
           ),
           settingsRow(
             state.palette,
             "your_qr",
-            android.R.drawable.ic_menu_share,
+            R.drawable.ic_vibe_qr,
             "Your QR",
             "Show",
           ),
           settingsRow(
             state.palette,
             "connection_manager",
-            android.R.drawable.ic_menu_upload,
+            R.drawable.ic_vibe_connection,
             "Connection Manager",
             state.connectionModeTitle,
           ),
@@ -799,7 +1184,7 @@ private class SettingsPageView(
           settingsRow(
             state.palette,
             "secret_key",
-            android.R.drawable.ic_lock_lock,
+            R.drawable.ic_vibe_key,
             "Secret Key",
             state.secretKeySummary,
           ),
@@ -816,7 +1201,7 @@ private class SettingsPageView(
           settingsRow(
             state.palette,
             "appearance",
-            android.R.drawable.ic_menu_gallery,
+            R.drawable.ic_vibe_palette,
             "Appearance",
             state.appearanceSummary,
           ),
@@ -908,9 +1293,9 @@ private class SettingsPageView(
       }
     group.addView(row)
     row.addView(
-      ImageView(context).apply {
-        setImageResource(android.R.drawable.ic_lock_idle_alarm)
-        setColorFilter(palette.accentColor)
+	      ImageView(context).apply {
+	        setImageResource(R.drawable.ic_vibe_bell)
+	        setColorFilter(palette.accentColor)
       },
       LinearLayout.LayoutParams(dp(context, 22f), dp(context, 22f)),
     )
@@ -1033,9 +1418,9 @@ private class SettingsPageView(
       )
     }
     row.addView(
-      ImageView(context).apply {
-        setImageResource(android.R.drawable.ic_media_next)
-        setColorFilter(palette.tertiaryTextColor)
+	      ImageView(context).apply {
+	        setImageResource(R.drawable.ic_vibe_chevron_right)
+	        setColorFilter(palette.tertiaryTextColor)
       },
       LinearLayout.LayoutParams(dp(context, 16f), dp(context, 16f)).apply {
         marginStart = dp(context, 10f)
@@ -1083,46 +1468,6 @@ private class SettingsPageView(
       typedArray.recycle()
       drawable
     }
-}
-
-private fun resolveAvatarGradient(row: ChatHomeListRow, isDark: Boolean): IntArray? {
-  val start = if (isDark) row.avatarGradientStartDark else row.avatarGradientStartLight
-  val end = if (isDark) row.avatarGradientEndDark else row.avatarGradientEndLight
-  val resolvedStart = parseColorCompat(start)
-  val resolvedEnd = parseColorCompat(end)
-  return if (resolvedStart != null && resolvedEnd != null) intArrayOf(resolvedStart, resolvedEnd) else null
-}
-
-private fun parseColorCompat(value: String?): Int? {
-  val text = value?.trim().orEmpty()
-  if (text.isEmpty()) return null
-  return runCatching { Color.parseColor(text) }.getOrNull()
-}
-
-private fun resolveFallbackPalette(): AppThemePalette {
-  return AppThemePalette(
-    isDark = true,
-    backgroundColor = Color.BLACK,
-    secondaryBackgroundColor = Color.BLACK,
-    cardColor = Color.BLACK,
-    inputColor = Color.BLACK,
-    elevatedColor = Color.BLACK,
-    textColor = Color.WHITE,
-    secondaryTextColor = Color.LTGRAY,
-    tertiaryTextColor = Color.GRAY,
-    accentColor = Color.CYAN,
-    accentMutedColor = Color.CYAN,
-    buttonColor = Color.CYAN,
-    buttonTextColor = Color.WHITE,
-    bubbleMeColor = Color.CYAN,
-    bubbleThemColor = Color.DKGRAY,
-    borderColor = Color.TRANSPARENT,
-    dividerColor = Color.TRANSPARENT,
-    overlayColor = Color.TRANSPARENT,
-    successColor = Color.GREEN,
-    warningColor = Color.YELLOW,
-    dangerColor = Color.RED,
-  )
 }
 
 private fun space(context: android.content.Context, valueDp: Float): View {

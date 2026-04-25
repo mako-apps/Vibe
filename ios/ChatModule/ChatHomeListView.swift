@@ -79,9 +79,9 @@ public final class ChatNativeHomeListView: ExpoView, UITableViewDataSource, UITa
     openSwipeCell = nil
     rows = rawRows.compactMap(ChatNativeHomeListRow.parse)
     tableView.reloadData()
-    // Pre-fetch chat histories for visible chats so messages are ready
-    // before the user taps into a chat. Only trigger on first load or
-    // when the chat list changes to avoid redundant requests.
+    // Warm only lightweight visual assets from the root list. Message history
+    // rows are built for the selected chat when it opens so encrypted payloads
+    // are not decrypted for every home row in the background.
     let currentChatIds = Set(rows.map(\.chatId))
     let addedChatIds = Array(currentChatIds.subtracting(previousChatIds)).sorted()
     let removedChatIds = Array(previousChatIds.subtracting(currentChatIds)).sorted()
@@ -91,17 +91,13 @@ public final class ChatNativeHomeListView: ExpoView, UITableViewDataSource, UITa
     if previousChatIds != currentChatIds {
       mediaPrefetchedChatIds.removeAll()
       lastPrefetchedScrollIndex = 0
-      prefetchTopChatHistories()
+      prefetchTopChatAssets()
     }
   }
 
-  private func prefetchTopChatHistories() {
-    // Only preload the top few chats initially — the rest are loaded
-    // progressively as the user scrolls via scrollViewDidScroll.
+  private func prefetchTopChatAssets() {
     let initialCount = 5
-    let chatIds = rows.prefix(initialCount).map(\.chatId)
-    guard !chatIds.isEmpty else { return }
-    ChatEngine.shared.prefetchChatHistories(chatIds: chatIds)
+    guard !rows.isEmpty else { return }
     // Warm avatar image cache for visible rows so cells display instantly.
     prefetchAvatars()
     // Warm media cache only for the initially visible chats.

@@ -404,9 +404,9 @@ final class BubbleBackgroundView: UIView {
   private let fillLayer = CAShapeLayer()
   private let bubbleMaskLayer = CAShapeLayer()
   private var appearance = ChatListAppearance.fallback
-  private var wallpaperSnapshot: CGImage?
-  private var wallpaperContainerSize: CGSize = .zero
-  private var wallpaperSampleRect: CGRect = .zero
+  internal var wallpaperSnapshot: CGImage?
+  internal var wallpaperContainerSize: CGSize = .zero
+  internal var wallpaperSampleRect: CGRect = .zero
   private var shape = BubbleShape(
     isMe: false, showTail: false, borderTopLeftRadius: 18, borderTopRightRadius: 18,
     borderBottomLeftRadius: 18, borderBottomRightRadius: 18)
@@ -426,6 +426,29 @@ final class BubbleBackgroundView: UIView {
 
   required init?(coder: NSCoder) {
     return nil
+  }
+
+  func duplicate() -> BubbleBackgroundView {
+    let replica = BubbleBackgroundView(frame: frame)
+    replica.configure(isMe: shape.isMe, shape: shape, hidden: false, appearance: appearance)
+    if let snapshot = wallpaperSnapshot {
+      replica.applyWallpaperBackdrop(
+        snapshot: snapshot,
+        containerSize: wallpaperContainerSize,
+        sampleRect: wallpaperSampleRect
+      )
+    }
+    return replica
+  }
+
+  func renderToImage() -> UIImage? {
+    let format = UIGraphicsImageRendererFormat()
+    format.opaque = false
+    format.scale = UIScreen.main.scale
+    let renderer = UIGraphicsImageRenderer(bounds: bounds, format: format)
+    return renderer.image { ctx in
+      layer.render(in: ctx.cgContext)
+    }
   }
 
   func configure(isMe: Bool, shape: BubbleShape, hidden: Bool, appearance: ChatListAppearance) {
@@ -670,9 +693,9 @@ private let bubbleMetaPendingFont = UIFont.systemFont(ofSize: 10.5, weight: .sem
 private let bubbleMetaStatusFont = UIFont.systemFont(ofSize: 11, weight: .semibold)
 private let bubbleMetaInlineSpacing: CGFloat = 6.0
 private let bubbleMetaItemGap: CGFloat = 3.0
-private let bubbleStatusSlotWidth: CGFloat = 16.0
-private let bubbleStatusSlotHeight: CGFloat = 14.0
-private let bubbleStatusCheckStrokeWidth: CGFloat = 1.55
+private let bubbleStatusSlotWidth: CGFloat = 18.0
+private let bubbleStatusSlotHeight: CGFloat = 15.0
+private let bubbleStatusCheckStrokeWidth: CGFloat = 1.7
 
 private func pixelAlignedRect(_ rect: CGRect) -> CGRect {
   let scale = max(UIScreen.main.scale, 1.0)
@@ -732,6 +755,8 @@ struct ChatMessageBubbleLayoutMetrics {
   let isMediaLayout: Bool
   let inlineAttachmentHeight: CGFloat
   let hasInlineAttachment: Bool
+  let replyPreviewHeight: CGFloat
+  let hasReplyPreview: Bool
   let previewHeight: CGFloat
   let hasLinkPreview: Bool
   let usesBottomMetaLayout: Bool
@@ -900,6 +925,9 @@ private func bubbleMetaWidths(for row: ChatListRow) -> ChatBubbleMetaWidths {
 
 private let inlineAttachmentHeight: CGFloat = 48.0
 private let inlineAttachmentSpacing: CGFloat = 8.0
+private let bubbleReplyPreviewHeight: CGFloat = 36.0
+private let bubbleReplyPreviewSpacing: CGFloat = 6.0
+private let bubbleReplyPreviewMinWidth: CGFloat = 184.0
 private let stickerMinDisplaySide: CGFloat = 72.0
 private let stickerDefaultDisplaySide: CGFloat = 136.0
 private let stickerMaxDisplayWidth: CGFloat = 152.0
@@ -930,6 +958,29 @@ private func hasInlineRelatedMessages(_ row: ChatListRow) -> Bool {
 
 private func hasInlineAttachment(_ row: ChatListRow) -> Bool {
   hasInlineRelatedMessages(row) || hasInlineFileAttachment(row)
+}
+
+private func hasReplyPreview(_ row: ChatListRow) -> Bool {
+  guard row.kind == .message, row.visualKind == .text else { return false }
+  return row.replyToId != nil
+}
+
+private func replyPreviewTitle(for row: ChatListRow) -> String {
+  if let title = row.replyPreviewTitle?.trimmingCharacters(in: .whitespacesAndNewlines),
+    !title.isEmpty
+  {
+    return title
+  }
+  return "Reply"
+}
+
+private func replyPreviewText(for row: ChatListRow) -> String {
+  if let text = row.replyPreviewText?.trimmingCharacters(in: .whitespacesAndNewlines),
+    !text.isEmpty
+  {
+    return text
+  }
+  return "Message"
 }
 
 private func inlineAttachmentTitle(for row: ChatListRow) -> String {
@@ -1589,6 +1640,79 @@ private final class BubbleLinkPreviewStore {
   }
 }
 
+private final class BubbleReplyPreviewView: UIView {
+  private let backgroundOverlay = UIView()
+  private let accentView = UIView()
+  private let titleLabel = UILabel()
+  private let previewLabel = UILabel()
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    backgroundColor = .clear
+    clipsToBounds = true
+    layer.cornerRadius = 6.0
+
+    backgroundOverlay.isUserInteractionEnabled = false
+    addSubview(backgroundOverlay)
+
+    accentView.layer.cornerCurve = .continuous
+    accentView.layer.cornerRadius = 1.5
+    addSubview(accentView)
+
+    titleLabel.font = UIFont.systemFont(ofSize: 13, weight: .semibold)
+    titleLabel.numberOfLines = 1
+    titleLabel.lineBreakMode = .byTruncatingTail
+    addSubview(titleLabel)
+
+    previewLabel.font = UIFont.systemFont(ofSize: 13, weight: .regular)
+    previewLabel.numberOfLines = 1
+    previewLabel.lineBreakMode = .byTruncatingTail
+    addSubview(previewLabel)
+  }
+
+  required init?(coder: NSCoder) {
+    return nil
+  }
+
+  func reset() {
+    titleLabel.text = nil
+    previewLabel.text = nil
+  }
+
+  func configure(title: String, text: String, appearance: ChatListAppearance, isMe: Bool) {
+    titleLabel.text = title
+    previewLabel.text = text
+    applyAppearance(appearance, isMe: isMe)
+  }
+
+  func applyAppearance(_ appearance: ChatListAppearance, isMe: Bool) {
+    let titleColor = isMe ? appearance.textColorMe : appearance.textColorThem
+    let accentColor =
+      isMe ? (appearance.bubbleMeGradient.first ?? titleColor) : appearance.bubbleThemColor
+
+    accentView.backgroundColor = accentColor.withAlphaComponent(0.95)
+    titleLabel.textColor = titleColor.withAlphaComponent(0.94)
+    previewLabel.textColor = titleColor.withAlphaComponent(0.68)
+
+    backgroundOverlay.backgroundColor = accentColor.withAlphaComponent(appearance.isDark ? 0.15 : 0.08)
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    backgroundOverlay.frame = bounds
+
+    let height = bounds.height
+    let accentH = max(4.0, height - 8.0)
+    accentView.frame = CGRect(x: 4.0, y: 4.0, width: 3.0, height: accentH)
+
+    let textX = accentView.frame.maxX + 6.0
+    let textW = max(1.0, bounds.width - textX - 8.0)
+
+    titleLabel.frame = CGRect(x: textX, y: 3.0, width: textW, height: 16.0)
+    previewLabel.frame = CGRect(x: textX, y: titleLabel.frame.maxY, width: textW, height: 16.0)
+  }
+}
+
 private final class BubbleLinkPreviewView: UIView {
   private let accentView = UIView()
   private let iconView = UIImageView()
@@ -1754,6 +1878,8 @@ func measureMessageBubbleLayout(row: ChatListRow, rowWidth: CGFloat)
       isMediaLayout: false,
       inlineAttachmentHeight: 0.0,
       hasInlineAttachment: false,
+      replyPreviewHeight: 0.0,
+      hasReplyPreview: false,
       previewHeight: previewHeight,
       hasLinkPreview: previewHeight > 0.0,
       usesBottomMetaLayout: previewHeight > 0.0 || usesRichTextLayout,
@@ -1885,6 +2011,8 @@ func measureMessageBubbleLayout(row: ChatListRow, rowWidth: CGFloat)
       isMediaLayout: true,
       inlineAttachmentHeight: 0.0,
       hasInlineAttachment: false,
+      replyPreviewHeight: 0.0,
+      hasReplyPreview: false,
       previewHeight: 0.0,
       hasLinkPreview: false,
       usesBottomMetaLayout: false,
@@ -1895,9 +2023,13 @@ func measureMessageBubbleLayout(row: ChatListRow, rowWidth: CGFloat)
     break
   }
 
+  let showsReplyPreview = hasReplyPreview(row)
   let showsInlineAttachment = hasInlineAttachment(row)
   let usesRichTextLayout = bubbleUsesBlockLayout(row)
   let previewHeight = bubblePreviewURL(for: row) == nil ? 0.0 : bubbleLinkPreviewHeight
+  let replyPreviewHeight = showsReplyPreview ? bubbleReplyPreviewHeight : 0.0
+  let replyPreviewBlockHeight =
+    showsReplyPreview ? (bubbleReplyPreviewHeight + bubbleReplyPreviewSpacing) : 0.0
   let usesBottomMetaLayout = usesRichTextLayout || previewHeight > 0.0
   let textMaxWidth: CGFloat =
     showsInlineAttachment || usesBottomMetaLayout
@@ -1924,6 +2056,19 @@ func measureMessageBubbleLayout(row: ChatListRow, rowWidth: CGFloat)
   }
   let attachmentBodyHeight: CGFloat = showsInlineAttachment ? inlineAttachmentHeight : 0.0
   let desiredContentWidth: CGFloat
+  let replyPreviewWidth: CGFloat
+  if showsReplyPreview {
+    let titleWidth = measuredTextWidth(
+      replyPreviewTitle(for: row), font: UIFont.systemFont(ofSize: 13, weight: .semibold))
+    let textWidth = measuredTextWidth(
+      replyPreviewText(for: row), font: UIFont.systemFont(ofSize: 13, weight: .regular))
+    replyPreviewWidth = min(
+      maxContentWidth,
+      max(bubbleReplyPreviewMinWidth, max(titleWidth, textWidth) + 24.0)
+    )
+  } else {
+    replyPreviewWidth = 0.0
+  }
   if showsInlineAttachment {
     let attachmentTitle = inlineAttachmentTitle(for: row)
     let attachmentWidth =
@@ -1934,11 +2079,15 @@ func measureMessageBubbleLayout(row: ChatListRow, rowWidth: CGFloat)
           measuredTextWidth(attachmentTitle, font: UIFont.systemFont(ofSize: 13, weight: .semibold))
             + 62.0)
       )
-    desiredContentWidth = max(textWidth, attachmentWidth)
+    desiredContentWidth = max(textWidth, attachmentWidth, replyPreviewWidth)
   } else if usesBottomMetaLayout {
-    desiredContentWidth = max(textWidth, previewHeight > 0.0 ? bubbleLinkPreviewMinWidth : 0.0)
+    desiredContentWidth = max(
+      textWidth,
+      previewHeight > 0.0 ? bubbleLinkPreviewMinWidth : 0.0,
+      replyPreviewWidth
+    )
   } else {
-    desiredContentWidth = textWidth + bubbleMetaInlineSpacing + meta.total
+    desiredContentWidth = max(textWidth + bubbleMetaInlineSpacing + meta.total, replyPreviewWidth)
   }
   let contentWidth = max(meta.total, min(maxContentWidth, desiredContentWidth))
   let messageWidth =
@@ -1947,13 +2096,13 @@ func measureMessageBubbleLayout(row: ChatListRow, rowWidth: CGFloat)
     : max(1.0, contentWidth - meta.total - bubbleMetaInlineSpacing)
   let bodyHeight =
     showsInlineAttachment
-    ? max(textHeight, 0.0) + inlineAttachmentSpacing + attachmentBodyHeight + bubbleMetaTopSpacing
-      + bubbleMetaHeight
+    ? replyPreviewBlockHeight + max(textHeight, 0.0) + inlineAttachmentSpacing
+      + attachmentBodyHeight + bubbleMetaTopSpacing + bubbleMetaHeight
     : usesBottomMetaLayout
-    ? max(textHeight, 0.0)
+    ? replyPreviewBlockHeight + max(textHeight, 0.0)
       + (previewHeight > 0.0 ? (bubbleLinkPreviewSpacing + previewHeight) : 0.0)
       + bubbleMetaTopSpacing + bubbleMetaHeight
-    : max(textHeight, bubbleMetaHeight)
+    : replyPreviewBlockHeight + max(textHeight, bubbleMetaHeight)
   let hasReaction = row.reactionEmoji != nil && row.reactionEmoji?.isEmpty == false
   let reactionHeightOffset: CGFloat = hasReaction ? 28.0 : 0.0
   let bubbleWidth = max(bubbleMinWidth, contentWidth + (bubbleHorizontalPadding * 2.0))
@@ -1971,6 +2120,8 @@ func measureMessageBubbleLayout(row: ChatListRow, rowWidth: CGFloat)
     isMediaLayout: false,
     inlineAttachmentHeight: attachmentBodyHeight,
     hasInlineAttachment: showsInlineAttachment,
+    replyPreviewHeight: replyPreviewHeight,
+    hasReplyPreview: showsReplyPreview,
     previewHeight: previewHeight,
     hasLinkPreview: previewHeight > 0.0,
     usesBottomMetaLayout: usesBottomMetaLayout,
@@ -4677,6 +4828,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
   private let messageLabel = AgentStreamingLabel()
   private let richTextView = BubbleRichTextView()
+  private let replyPreviewView = BubbleReplyPreviewView()
   private let linkPreviewView = BubbleLinkPreviewView()
   private let mediaContainerView = UIView()
   private let mediaPlaceholderBlurView = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
@@ -4712,7 +4864,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private let reactionPillView = UIView()
   private let reactionLabel = UILabel()
   private var appearance = ChatListAppearance.fallback
-  private var row: ChatListRow?
+  internal(set) var row: ChatListRow?
   private var isGhostHidden = false
   private var isContextMenuExtracted = false
   private var isContextMenuHeld = false
@@ -4721,6 +4873,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private var savedReactionHiddenBeforeExtraction = false
   private var savedMessageAlphaBeforeExtraction: CGFloat = 1.0
   private var savedRichTextAlphaBeforeExtraction: CGFloat = 1.0
+  private var savedReplyPreviewAlphaBeforeExtraction: CGFloat = 1.0
   private var savedLinkPreviewAlphaBeforeExtraction: CGFloat = 1.0
   private var savedInlineAttachmentAlphaBeforeExtraction: CGFloat = 1.0
   private var savedMediaAlphaBeforeExtraction: CGFloat = 1.0
@@ -4758,6 +4911,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private let fullBleedMaskLayer = CAShapeLayer()
   private var lastReportedMediaSizeKey: String?
   private var lastReactionDebugSignature: String?
+  private var renderedStatusKey: String?
   var resolveDisplayStatus: ((ChatListRow) -> String?)?
   var onVoiceBubbleTap: ((ChatListRow) -> Void)?
   var onVoiceUploadCancelTap: ((ChatListRow) -> Void)?
@@ -4775,6 +4929,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
     contentView.addSubview(messageLabel)
     contentView.addSubview(richTextView)
+    contentView.addSubview(replyPreviewView)
     contentView.addSubview(linkPreviewView)
     contentView.addSubview(mediaContainerView)
     mediaContainerView.addSubview(mediaPlaceholderBlurView)
@@ -4963,6 +5118,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     // agentSenderLabel removed
     messageLabel.isHidden = true
     richTextView.isHidden = true
+    replyPreviewView.isHidden = true
     linkPreviewView.isHidden = true
     mediaContainerView.isHidden = true
     mediaPrimaryIconView.isHidden = true
@@ -5041,6 +5197,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       white: appearance.isDark ? 0.02 : 0.98,
       alpha: appearance.isDark ? 0.18 : 0.10
     )
+    replyPreviewView.applyAppearance(appearance, isMe: isCurrentRowMe)
     linkPreviewView.applyAppearance(appearance, isMe: isCurrentRowMe)
     updateInlineVideoAudioIcon()
     updateMediaPlaceholderVisibility()
@@ -5083,6 +5240,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       isGhostHidden = false
       resetStickerAnimation()
       richTextView.reset()
+      replyPreviewView.reset()
       linkPreviewView.reset()
       dayLabel.text = row.label
       dayLabel.isHidden = false
@@ -5090,6 +5248,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       tailView.isHidden = true
       messageLabel.isHidden = true
       richTextView.isHidden = true
+      replyPreviewView.isHidden = true
       linkPreviewView.isHidden = true
       mediaContainerView.isHidden = true
       inlineAttachmentView.isHidden = true
@@ -5103,12 +5262,14 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       let usesTransparentAgentStreaming = usesTransparentAgentStreamingLayout(row)
       let usesBlockLayout = bubbleUsesBlockLayout(row)
       let previewURL = bubblePreviewURL(for: row)
+      let showsReplyPreview = hasReplyPreview(row)
       self.isGhostHidden = isGhostHidden
       dayLabel.isHidden = true
       bubbleView.isHidden = false
       tailView.isHidden = isGhostHidden || !row.shape.showTail
       messageLabel.isHidden = isGhostHidden || !(row.visualKind == .text || hasMediaCaptionLayout(row)) || usesBlockLayout
       richTextView.isHidden = isGhostHidden || !usesBlockLayout
+      replyPreviewView.isHidden = isGhostHidden || !showsReplyPreview
       linkPreviewView.isHidden = isGhostHidden || previewURL == nil
       if row.messageType == "typing" {
         startTypingShimmer()
@@ -5137,6 +5298,16 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         linkPreviewView.configure(url: previewURL, appearance: appearance, isMe: row.isMe)
       } else {
         linkPreviewView.reset()
+      }
+      if !replyPreviewView.isHidden {
+        replyPreviewView.configure(
+          title: replyPreviewTitle(for: row),
+          text: replyPreviewText(for: row),
+          appearance: appearance,
+          isMe: row.isMe
+        )
+      } else {
+        replyPreviewView.reset()
       }
       editedLabel.text = "edited"
       pinnedLabel.text = "pinned"
@@ -5252,6 +5423,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       // This eliminates the 0→1 opacity flicker that plagued updates.
       messageLabel.alpha = 1.0
       richTextView.alpha = 1.0
+      replyPreviewView.alpha = 1.0
       linkPreviewView.alpha = 1.0
       inlineAttachmentView.alpha = 1.0
       mediaContainerView.alpha = 1.0
@@ -5265,6 +5437,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       savedReactionHiddenBeforeExtraction = reactionPillView.isHidden
       savedMessageAlphaBeforeExtraction = messageLabel.alpha
       savedRichTextAlphaBeforeExtraction = richTextView.alpha
+      savedReplyPreviewAlphaBeforeExtraction = replyPreviewView.alpha
       savedLinkPreviewAlphaBeforeExtraction = linkPreviewView.alpha
       savedInlineAttachmentAlphaBeforeExtraction = inlineAttachmentView.alpha
       savedMediaAlphaBeforeExtraction = mediaContainerView.alpha
@@ -5295,6 +5468,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     mediaProgressSizeLabel.text = nil
     richTextView.reset()
     richTextView.isHidden = true
+    replyPreviewView.reset()
+    replyPreviewView.isHidden = true
     linkPreviewView.reset()
     linkPreviewView.isHidden = true
     mediaVideoInfoBadgeView.isHidden = true
@@ -5325,6 +5500,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     statusImageView.image = nil
     statusLabel.isHidden = true
     statusLabel.text = nil
+    renderedStatusKey = nil
     isContextMenuExtracted = false
     isContextMenuHeld = false
     hasSavedExtractionState = false
@@ -5454,6 +5630,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     if metrics.isMediaLayout {
       let hasMediaCaption = hasMediaCaptionLayout(row) && metrics.textHeight > 0.0 && !isFullBleed
       richTextView.frame = .zero
+      replyPreviewView.frame = .zero
       linkPreviewView.frame = .zero
       let mediaFrame: CGRect
       if isFullBleed {
@@ -5547,16 +5724,30 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       if metrics.hasInlineAttachment {
         richTextView.frame = .zero
         linkPreviewView.frame = .zero
+        let contentX = bubbleFrame.minX + bubbleHorizontalPadding
+        var contentY = bubbleFrame.minY + bubbleTopPadding
+        if metrics.hasReplyPreview {
+          replyPreviewView.frame = pixelAlignedRect(
+            CGRect(
+              x: contentX,
+              y: contentY,
+              width: metrics.contentWidth,
+              height: metrics.replyPreviewHeight
+            ))
+          contentY = replyPreviewView.frame.maxY + bubbleReplyPreviewSpacing
+        } else {
+          replyPreviewView.frame = .zero
+        }
         messageLabel.frame = pixelAlignedRect(
           CGRect(
-            x: bubbleFrame.minX + bubbleHorizontalPadding,
-            y: bubbleFrame.minY + bubbleTopPadding,
+            x: contentX,
+            y: contentY,
             width: metrics.messageWidth,
             height: metrics.textHeight
           ))
         inlineAttachmentView.frame = pixelAlignedRect(
           CGRect(
-            x: bubbleFrame.minX + bubbleHorizontalPadding,
+            x: contentX,
             y: messageLabel.frame.maxY + inlineAttachmentSpacing,
             width: metrics.contentWidth,
             height: metrics.inlineAttachmentHeight
@@ -5586,9 +5777,21 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         )
       } else if metrics.usesBottomMetaLayout {
         let contentX = bubbleFrame.minX + bubbleHorizontalPadding
-        let contentY = bubbleFrame.minY + bubbleTopPadding
+        var contentY = bubbleFrame.minY + bubbleTopPadding
 
         inlineAttachmentView.frame = .zero
+        if metrics.hasReplyPreview {
+          replyPreviewView.frame = pixelAlignedRect(
+            CGRect(
+              x: contentX,
+              y: contentY,
+              width: metrics.contentWidth,
+              height: metrics.replyPreviewHeight
+            ))
+          contentY = replyPreviewView.frame.maxY + bubbleReplyPreviewSpacing
+        } else {
+          replyPreviewView.frame = .zero
+        }
         if metrics.usesRichTextLayout {
           messageLabel.frame = .zero
           let richTextHeight = richTextView.configure(
@@ -5647,6 +5850,19 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         richTextView.frame = .zero
         linkPreviewView.frame = .zero
         inlineAttachmentView.frame = .zero
+
+        if metrics.hasReplyPreview {
+          replyPreviewView.frame = pixelAlignedRect(
+            CGRect(
+              x: bubbleFrame.minX + bubbleHorizontalPadding,
+              y: bubbleFrame.minY + bubbleTopPadding,
+              width: metrics.contentWidth,
+              height: metrics.replyPreviewHeight
+            ))
+        } else {
+          replyPreviewView.frame = .zero
+        }
+
         messageLabel.frame = pixelAlignedRect(
           CGRect(
             x: bubbleFrame.minX + bubbleHorizontalPadding,
@@ -7218,6 +7434,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
   private func configureStatus(for newRow: ChatListRow, baseColor: UIColor) {
     let newStatus = (resolveDisplayStatus?(newRow) ?? newRow.status)?.lowercased()
+    let oldStatusKey = renderedStatusKey
+    let nextStatusKey = newRow.isMe ? (newStatus ?? "none") : nil
 
     statusLabel.text = nil
     statusLabel.textColor = baseColor
@@ -7225,8 +7443,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     statusLabel.isHidden = true
     statusImageView.image = nil
     statusImageView.isHidden = true
+    statusImageView.layer.opacity = 1.0
 
     guard newRow.isMe else {
+      renderedStatusKey = nil
       return
     }
 
@@ -7261,6 +7481,34 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       break
     }
 
+    let shouldAnimateCheckIn =
+      oldStatusKey != nil
+      && oldStatusKey != nextStatusKey
+      && statusImageView.isHidden == false
+      && (newStatus == "sent" || newStatus == "delivered" || newStatus == "read")
+    renderedStatusKey = nextStatusKey
+    if shouldAnimateCheckIn {
+      animateStatusGlyphIn()
+    }
+  }
+
+  private func animateStatusGlyphIn() {
+    statusImageView.layer.removeAnimation(forKey: "statusCheckScaleIn")
+    statusImageView.layer.removeAnimation(forKey: "statusCheckFadeIn")
+    statusImageView.layer.opacity = 1.0
+
+    let scale = CASpringAnimation(keyPath: "transform.scale")
+    scale.fromValue = 0.82
+    scale.toValue = 1.0
+    scale.mass = 0.7
+    scale.stiffness = 520.0
+    scale.damping = 34.0
+    scale.initialVelocity = 0.0
+    scale.duration = 0.2
+    scale.timingFunction = CAMediaTimingFunction(name: .easeOut)
+    scale.isRemovedOnCompletion = true
+
+    statusImageView.layer.add(scale, forKey: "statusCheckScaleIn")
   }
 
   func setContextMenuExtracted(_ extracted: Bool) {
@@ -7300,6 +7548,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         savedReactionHiddenBeforeExtraction = reactionPillView.isHidden
         savedMessageAlphaBeforeExtraction = messageLabel.alpha
         savedRichTextAlphaBeforeExtraction = richTextView.alpha
+        savedReplyPreviewAlphaBeforeExtraction = replyPreviewView.alpha
         savedLinkPreviewAlphaBeforeExtraction = linkPreviewView.alpha
         savedInlineAttachmentAlphaBeforeExtraction = inlineAttachmentView.alpha
         savedMediaAlphaBeforeExtraction = mediaContainerView.alpha
@@ -7312,6 +7561,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       // Keep text/media/meta rendering alive for snapshot correctness, but hide them.
       messageLabel.alpha = 0.0
       richTextView.alpha = 0.0
+      replyPreviewView.alpha = 0.0
       linkPreviewView.alpha = 0.0
       inlineAttachmentView.alpha = 0.0
       mediaContainerView.alpha = 0.0
@@ -7327,6 +7577,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     reactionPillView.isHidden = savedReactionHiddenBeforeExtraction
     messageLabel.alpha = savedMessageAlphaBeforeExtraction
     richTextView.alpha = savedRichTextAlphaBeforeExtraction
+    replyPreviewView.alpha = savedReplyPreviewAlphaBeforeExtraction
     linkPreviewView.alpha = savedLinkPreviewAlphaBeforeExtraction
     inlineAttachmentView.alpha = savedInlineAttachmentAlphaBeforeExtraction
     mediaContainerView.alpha = savedMediaAlphaBeforeExtraction
@@ -7607,6 +7858,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     if !richTextView.isHidden {
       contentRect = contentRect.union(richTextView.frame)
     }
+    if !replyPreviewView.isHidden {
+      contentRect = contentRect.union(replyPreviewView.frame)
+    }
     if !linkPreviewView.isHidden {
       contentRect = contentRect.union(linkPreviewView.frame)
     }
@@ -7643,17 +7897,21 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
     let messageWasHidden = messageLabel.isHidden
     let richTextWasHidden = richTextView.isHidden
+    let replyWasHidden = replyPreviewView.isHidden
     let previewWasHidden = linkPreviewView.isHidden
     let mediaWasHidden = mediaContainerView.isHidden
     let attachmentWasHidden = inlineAttachmentView.isHidden
+    let metaWasHidden = metaContainerView.isHidden
 
     CATransaction.begin()
     CATransaction.setDisableActions(true)
     messageLabel.isHidden = true
     richTextView.isHidden = true
+    replyPreviewView.isHidden = true
     linkPreviewView.isHidden = true
     mediaContainerView.isHidden = true
     inlineAttachmentView.isHidden = true
+    metaContainerView.isHidden = true
     contentView.layoutIfNeeded()
     CATransaction.commit()
 
@@ -7662,38 +7920,35 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       CATransaction.setDisableActions(true)
       messageLabel.isHidden = messageWasHidden
       richTextView.isHidden = richTextWasHidden
+      replyPreviewView.isHidden = replyWasHidden
       linkPreviewView.isHidden = previewWasHidden
       mediaContainerView.isHidden = mediaWasHidden
       inlineAttachmentView.isHidden = attachmentWasHidden
+      metaContainerView.isHidden = metaWasHidden
       contentView.layoutIfNeeded()
       CATransaction.commit()
-    }
-
-    // Prefer UIKit snapshot APIs first. They tend to preserve UIVisualEffectView
-    // appearance better than offscreen rasterization during transitions.
-    if let snapshot = contentView.resizableSnapshotView(
-      from: captureRect,
-      afterScreenUpdates: true,
-      withCapInsets: .zero
-    ) {
-      snapshot.frame = contentView.convert(captureRect, to: view)
-      snapshot.clipsToBounds = false
-      return snapshot
     }
 
     let format = UIGraphicsImageRendererFormat()
     format.opaque = false
     format.scale = UIScreen.main.scale
     let renderer = UIGraphicsImageRenderer(size: captureRect.size, format: format)
-    let image = renderer.image { context in
-      context.cgContext.translateBy(x: -captureRect.minX, y: -captureRect.minY)
-      if !contentView.drawHierarchy(in: contentView.bounds, afterScreenUpdates: true) {
-        contentView.layer.render(in: context.cgContext)
-      }
+    let image = renderer.image { _ in
+      contentView.drawHierarchy(
+        in: CGRect(
+          x: -captureRect.minX,
+          y: -captureRect.minY,
+          width: contentView.bounds.width,
+          height: contentView.bounds.height
+        ),
+        afterScreenUpdates: true
+      )
     }
     let imageView = UIImageView(image: image)
     imageView.frame = contentView.convert(captureRect, to: view)
-    imageView.contentMode = .scaleAspectFill
+    imageView.contentMode = .scaleToFill
+    imageView.backgroundColor = .clear
+    imageView.isOpaque = false
     imageView.clipsToBounds = false
     return imageView
   }
@@ -7932,12 +8187,14 @@ final class BubbleTailView: UIView {
         : appearance.bubbleThemColor.withAlphaComponent(appearance.isDark ? 0.86 : 0.90).cgColor
     }
 
-    // For 'me': rotate CW 26.5° (tail curves right at bottom-right of bubble)
-    // For 'them': flip horizontally + rotate CCW 26.5° (tail curves left at bottom-left)
-    let angle = (isMe ? 26.5 : -26.5) * (.pi / 180.0)
+    // For 'me': rotate CW 26.565° (tail curves right at bottom-right of bubble)
+    // For 'them': flip horizontally + rotate CCW 26.565° (tail curves left at bottom-left)
+    let angle = (isMe ? 26.565 : -26.565) * (.pi / 180.0)
     let rotate = CGAffineTransform(rotationAngle: angle)
     let flip = CGAffineTransform(scaleX: isMe ? 1.0 : -1.0, y: 1.0)
-    transform = flip.concatenating(rotate)
+    // Translate slightly inward to bury the tail edge into the bubble body and prevent any 1px gaps
+    let translate = CGAffineTransform(translationX: isMe ? -0.5 : 0.5, y: 0.0)
+    transform = flip.concatenating(rotate).concatenating(translate)
   }
 }
 

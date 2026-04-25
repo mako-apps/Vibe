@@ -39,10 +39,10 @@
 		64C59B622685F652AAA63712 /* ChatHomeService.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE295B6B9A24463008A3BDD7 /* ChatHomeService.swift */; };
 		6605AF1B777E5C5175EAC7C4 /* music_transparent.png in Resources */ = {isa = PBXBuildFile; fileRef = 0FB52D6DA56B715F0ECBAA1A /* music_transparent.png */; };
 		683582D9C9F84639B98D703C /* emoji_smiley.json in Resources */ = {isa = PBXBuildFile; fileRef = 2A807413F9FE37BB526E8A7F /* emoji_smiley.json */; };
-		F0A1C8B31122334455667788 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = F0A1C8B31122334455667789 /* Assets.xcassets */; };
 		696525CD3BDEA5259BA86242 /* AppRuntimeController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 72719CE25DE39CA3F5858805 /* AppRuntimeController.swift */; };
 		6BC6D2607F140F8237049F8B /* ChatPacketTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = E422BC03268AFC7C9B284AC0 /* ChatPacketTransport.swift */; };
 		736D59420211BFFC98A86C40 /* MusicPlayerEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0528A65C97D89BCD72F146B8 /* MusicPlayerEngine.swift */; };
+		73EAE27B898F92B632FAA861 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = EC3C9CB779DF9BA408AFB3A8 /* Assets.xcassets */; };
 		76FCB9F74F4723621017FC0E /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8C445A54B65FF38D0D9CA8B2 /* SettingsView.swift */; };
 		7730224BACF4052A8D8931FE /* PacketBootstrapService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5313D3693EED4E59300EF584 /* PacketBootstrapService.swift */; };
 		7756E432FC0ED0FE8F1A09BA /* cat_play.json in Resources */ = {isa = PBXBuildFile; fileRef = E806310A66FFEA5416C12134 /* cat_play.json */; };
@@ -65,6 +65,9 @@
 		97BC3CE94386EA9EBD84B66F /* ChatAgentMessagesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C381C383FBC5EEB2C4C9037 /* ChatAgentMessagesView.swift */; };
 		9C1AC14728CB73DB35265073 /* ChatBlackoutTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = EA8C3E9F24AB4E8CF179CBC5 /* ChatBlackoutTransport.swift */; };
 		9CA0936827918AE53C010A72 /* fun_orange.json in Resources */ = {isa = PBXBuildFile; fileRef = 783ECEDCAE9458C3230FE0A0 /* fun_orange.json */; };
+		A1715C2B2C6A4D6B9B96D221 /* AppNativeStoryCameraView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1715C2A2C6A4D6B9B96D221 /* AppNativeStoryCameraView.swift */; };
+		A1715C2D2C6A4D6B9B96D221 /* AppNativeStoryComposerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1715C2C2C6A4D6B9B96D221 /* AppNativeStoryComposerView.swift */; };
+		A3E92C2504EFE92139D6FE33 /* MetalKeyMaskView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4F24580E3BF8D099E93E2414 /* MetalKeyMaskView.swift */; };
 		A5125BE9F5DF66AC74B8FB10 /* ChatMainProfileContentNodes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DC16714FB24740618191CC8 /* ChatMainProfileContentNodes.swift */; };
 		AA81ECC978071DA754A17B4F /* cat_loader.json in Resources */ = {isa = PBXBuildFile; fileRef = FF1C3ED62BF71EDEFC8C3B63 /* cat_loader.json */; };
 		AFCFC1BFE0BFBEF5343D1EBB /* ChatListView+Interactions.swift in Sources */ = {isa = PBXBuildFile; fileRef = D7BB32A09BAAE22CC20E4E46 /* ChatListView+Interactions.swift */; };
@@ -80,6 +83,7 @@
 		C91B78CD343D4B647B1311C4 /* ChatListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2B319B578FC6EF4C15E451BC /* ChatListView.swift */; };
 		CC88AAD1B2914B80BC2A1053 /* ChatVideoEditViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = BEEE61510F6D03851DBE2104 /* ChatVideoEditViewController.swift */; };
 		CED87D9F1FEE6E5CEBCA9A65 /* SettingsNativeComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = D9FD7201BB6BE30C5C3D5827 /* SettingsNativeComponents.swift */; };
+		D43BFE32BF17C20D69236718 /* logo.PNG in Resources */ = {isa = PBXBuildFile; fileRef = E6E62CB906FA9E727D74B905 /* logo.PNG */; };
 		D4EFE23D6777302C0BE2225A /* ChatAgentConfigPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5CF15311A6AF8A24F5B4A1FA /* ChatAgentConfigPanel.swift */; };
 		D577876741A5C609C52D6F85 /* animals_transparent.png in Resources */ = {isa = PBXBuildFile; fileRef = 8FE229CCCCACC43B1D3426A2 /* animals_transparent.png */; };
 		D615AA9C6418E0DF034F350D /* ChatHomeUndoBannerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D32E4E831DD2A0B3CAEF1A82 /* ChatHomeUndoBannerView.swift */; };
@@ -118,8 +122,8 @@
 		442580188ADA2A3D9C1F6346 /* ChatVideoEditModule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatVideoEditModule.swift; sourceTree = "<group>"; };
 		4589748480CA580517B41F11 /* Packet-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Packet-Bridging-Header.h"; sourceTree = "<group>"; };
 		4A3A1CDF7DBF700016F18E53 /* ChatMainProfileActionNode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatMainProfileActionNode.swift; sourceTree = "<group>"; };
+		4F24580E3BF8D099E93E2414 /* MetalKeyMaskView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalKeyMaskView.swift; sourceTree = "<group>"; };
 		4F972FE279A51AF4B02E8FDE /* ChatImageEditModule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatImageEditModule.swift; sourceTree = "<group>"; };
-		F0A1C8B31122334455667789 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		5313D3693EED4E59300EF584 /* PacketBootstrapService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PacketBootstrapService.swift; sourceTree = "<group>"; };
 		5467C6795E5CC738709C5F60 /* LottieCompat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LottieCompat.swift; sourceTree = "<group>"; };
 		598820A81E18CB2FB2212BB9 /* VibeCallStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VibeCallStore.swift; sourceTree = "<group>"; };
@@ -152,6 +156,8 @@
 		9E8CD913AF073565CD677369 /* TelegramSendMorphProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TelegramSendMorphProfile.swift; sourceTree = "<group>"; };
 		A2FB9239F8391F97370A3D6E /* ChatTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatTransport.swift; sourceTree = "<group>"; };
 		A45DF26139DA115643B0E3A7 /* ChatAttachmentMenuController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatAttachmentMenuController.swift; sourceTree = "<group>"; };
+		A1715C2A2C6A4D6B9B96D221 /* AppNativeStoryCameraView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppNativeStoryCameraView.swift; sourceTree = "<group>"; };
+		A1715C2C2C6A4D6B9B96D221 /* AppNativeStoryComposerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppNativeStoryComposerView.swift; sourceTree = "<group>"; };
 		A94D3BC975603A36B997C1F5 /* emoji_wink.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = emoji_wink.json; sourceTree = "<group>"; };
 		A99569B73B37CD9EACA59C56 /* ChatProfileMediaGridRowCell.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatProfileMediaGridRowCell.swift; sourceTree = "<group>"; };
 		AA7CDE7484C711D2F7EDEAEA /* AuthViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthViewController.swift; sourceTree = "<group>"; };
@@ -174,8 +180,10 @@
 		DE295B6B9A24463008A3BDD7 /* ChatHomeService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatHomeService.swift; sourceTree = "<group>"; };
 		DF9427113BB15D9D69DB6DF1 /* ChatListViewConstants.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatListViewConstants.swift; sourceTree = "<group>"; };
 		E422BC03268AFC7C9B284AC0 /* ChatPacketTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatPacketTransport.swift; sourceTree = "<group>"; };
+		E6E62CB906FA9E727D74B905 /* logo.PNG */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = logo.PNG; sourceTree = "<group>"; };
 		E806310A66FFEA5416C12134 /* cat_play.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = cat_play.json; sourceTree = "<group>"; };
 		EA8C3E9F24AB4E8CF179CBC5 /* ChatBlackoutTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatBlackoutTransport.swift; sourceTree = "<group>"; };
+		EC3C9CB779DF9BA408AFB3A8 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		EEBB6198BAEEEE29633FC594 /* ChatPinnedBannerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatPinnedBannerView.swift; sourceTree = "<group>"; };
 		F66CB476D4CD073DC1350014 /* ChatMainProfileHeaderHelpers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatMainProfileHeaderHelpers.swift; sourceTree = "<group>"; };
 		FF1C3ED62BF71EDEFC8C3B63 /* cat_loader.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = cat_loader.json; sourceTree = "<group>"; };
@@ -248,8 +256,9 @@
 			isa = PBXGroup;
 			children = (
 				C849E2FC04325A33DBD9A9D5 /* AppDelegate.swift */,
+				EC3C9CB779DF9BA408AFB3A8 /* Assets.xcassets */,
 				1E631A9B333888CF20B307A9 /* Info.plist */,
-				F0A1C8B31122334455667789 /* Assets.xcassets */,
+				E6E62CB906FA9E727D74B905 /* logo.PNG */,
 			);
 			path = App;
 			sourceTree = "<group>";
@@ -257,11 +266,14 @@
 		7260F98D9294A438FBC151ED /* App */ = {
 			isa = PBXGroup;
 			children = (
+				A1715C2A2C6A4D6B9B96D221 /* AppNativeStoryCameraView.swift */,
+				A1715C2C2C6A4D6B9B96D221 /* AppNativeStoryComposerView.swift */,
 				63AB2BA5F0D14231A16909E1 /* AppRootView.swift */,
 				72719CE25DE39CA3F5858805 /* AppRuntimeController.swift */,
 				30C7C11C298B1C883985B199 /* AppSessionConfig.swift */,
 				9C563C9F812D3D45058F2062 /* AppVectorIcons.swift */,
 				AA7CDE7484C711D2F7EDEAEA /* AuthViewController.swift */,
+				4F24580E3BF8D099E93E2414 /* MetalKeyMaskView.swift */,
 				D9FD7201BB6BE30C5C3D5827 /* SettingsNativeComponents.swift */,
 				8C445A54B65FF38D0D9CA8B2 /* SettingsView.swift */,
 				65EA3037B88F594799DC5DE5 /* WelcomeViewController.swift */,
@@ -432,7 +444,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				F0A1C8B31122334455667788 /* Assets.xcassets in Resources */,
+				73EAE27B898F92B632FAA861 /* Assets.xcassets in Resources */,
 				D577876741A5C609C52D6F85 /* animals_transparent.png in Resources */,
 				AA81ECC978071DA754A17B4F /* cat_loader.json in Resources */,
 				7AE21E9D3ECA9E216CC9C307 /* cat_love.json in Resources */,
@@ -447,6 +459,7 @@
 				84BA7ABD34DE47841DDDA044 /* fun_groovy.json in Resources */,
 				9CA0936827918AE53C010A72 /* fun_orange.json in Resources */,
 				2644B167FE52D9F1DA946E8B /* fun_potato.json in Resources */,
+				D43BFE32BF17C20D69236718 /* logo.PNG in Resources */,
 				575D88947922F7BA0CC224B4 /* music2_transparent.png in Resources */,
 				6605AF1B777E5C5175EAC7C4 /* music_transparent.png in Resources */,
 			);
@@ -460,6 +473,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				C6389EFB3A26025807BB829E /* AppDelegate.swift in Sources */,
+				A1715C2B2C6A4D6B9B96D221 /* AppNativeStoryCameraView.swift in Sources */,
+				A1715C2D2C6A4D6B9B96D221 /* AppNativeStoryComposerView.swift in Sources */,
 				C026A1AD9FF0219C6EC9011F /* AppRootView.swift in Sources */,
 				696525CD3BDEA5259BA86242 /* AppRuntimeController.swift in Sources */,
 				DBEDD11EA19CBB1755CD6083 /* AppSessionConfig.swift in Sources */,
@@ -510,6 +525,7 @@
 				45801E22164C4B81E25FACFE /* GlassMorphTransition.swift in Sources */,
 				56838C5725638D46CB312436 /* InAppBrowserViewController.swift in Sources */,
 				098D36FD542323E59B120363 /* LottieCompat.swift in Sources */,
+				A3E92C2504EFE92139D6FE33 /* MetalKeyMaskView.swift in Sources */,
 				58300AB7E7F83232B575C1A5 /* MusicPlayerBannerView.swift in Sources */,
 				736D59420211BFFC98A86C40 /* MusicPlayerEngine.swift in Sources */,
 				C1EDAA12E7A7F7E2CF9D11E6 /* MusicPlayerModalView.swift in Sources */,
