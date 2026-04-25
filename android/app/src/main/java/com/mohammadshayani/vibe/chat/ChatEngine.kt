@@ -1172,7 +1172,6 @@ internal object ChatEngine {
         )
         return@synchronized mapOf("accepted" to true, "transport" to "native", "deduped" to true, "typing" to typing)
       }
-      nativeTypingStateByChatId[chatId] = typing
       val client = phoenixClient ?: run {
         Log.w(
           "ChatEngine",
@@ -1190,6 +1189,7 @@ internal object ChatEngine {
         ensureNativeTransportAsync("typing_chat_not_joined")
         return@synchronized mapOf("accepted" to false, "reason" to "chat_not_joined", "typing" to typing)
       }
+      nativeTypingStateByChatId[chatId] = typing
       val userId = normalized(getConfigValueLocked("userId")) ?: "me"
       val event = if (typing) "typing" else "stop-typing"
       val ref = client.push(chatTopic(chatId), event, mapOf("userId" to userId))

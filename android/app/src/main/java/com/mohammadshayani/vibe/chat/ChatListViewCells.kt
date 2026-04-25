@@ -99,7 +99,10 @@ internal class BubbleStatusIndicatorView(context: Context) : View(context) {
   private var status: String? = null
   private var baseColor: Int = Color.WHITE
   private var rotationDegrees = 0f
+  private var glyphAlpha = 1f
+  private var glyphScale = 1f
   private var pendingAnimator: ValueAnimator? = null
+  private var transitionAnimator: ValueAnimator? = null
   private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
     style = Paint.Style.STROKE
     strokeCap = Paint.Cap.ROUND
@@ -113,6 +116,7 @@ internal class BubbleStatusIndicatorView(context: Context) : View(context) {
   fun bind(rawStatus: String?, color: Int) {
     val normalized = rawStatus?.trim()?.lowercase()
     if (status == normalized && baseColor == color) return
+    val statusChanged = status != normalized
     status = normalized
     baseColor = color
     if (normalized == "pending" || normalized == "sending") {
@@ -120,18 +124,15 @@ internal class BubbleStatusIndicatorView(context: Context) : View(context) {
     } else {
       stopPendingAnimator()
     }
+    if (statusChanged && normalized != null) {
+      startTransitionAnimator()
+    }
     requestLayout()
     invalidate()
   }
 
   override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-    val s = status
-    val baseWidthDp = when (s) {
-      "sent" -> 16
-      "delivered", "read" -> 22
-      else -> 16
-    }
-    val w = resolveSize(dp(baseWidthDp), widthMeasureSpec)
+    val w = resolveSize(dp(22), widthMeasureSpec)
     val h = resolveSize(dp(14), heightMeasureSpec)
     setMeasuredDimension(w, h)
   }
@@ -149,6 +150,13 @@ internal class BubbleStatusIndicatorView(context: Context) : View(context) {
     strokePaint.color = tintColor
     fillPaint.color = tintColor
     strokePaint.strokeWidth = dpF(if (normalized == "error") 1.8f else 1.55f)
+    strokePaint.alpha = (255f * glyphAlpha).roundToInt().coerceIn(0, 255)
+    fillPaint.alpha = (255f * glyphAlpha).roundToInt().coerceIn(0, 255)
+
+    val cx = width - dpF(10.5f)
+    val cy = height * 0.5f
+    canvas.save()
+    canvas.scale(glyphScale, glyphScale, cx, cy)
 
     when (normalized) {
       "pending", "sending" -> drawPending(canvas)
@@ -156,43 +164,56 @@ internal class BubbleStatusIndicatorView(context: Context) : View(context) {
       "delivered", "read" -> drawCheck(canvas, second = true)
       "error" -> drawError(canvas)
     }
+    canvas.restore()
+    strokePaint.alpha = 255
+    fillPaint.alpha = 255
   }
 
   override fun onDetachedFromWindow() {
     stopPendingAnimator()
+    transitionAnimator?.cancel()
+    transitionAnimator = null
     super.onDetachedFromWindow()
   }
 
   private fun drawPending(canvas: Canvas) {
-    val side = min(width.toFloat(), height.toFloat()) - dpF(2f)
+    val side = min(width.toFloat(), height.toFloat()) - dpF(4f)
     if (side <= 0f) return
-    val cx = width - side * 0.5f - dpF(0.5f)
+    val cx = width - dpF(10.5f)
     val cy = height * 0.5f
     val radius = side * 0.46f
     arcRect.set(cx - radius, cy - radius, cx + radius, cy + radius)
     strokePaint.alpha = 148
     canvas.drawOval(arcRect, strokePaint)
-    strokePaint.alpha = 255
+    strokePaint.alpha = (255f * glyphAlpha).roundToInt().coerceIn(0, 255)
+    canvas.drawLine(cx, cy, cx + radius * 0.32f, cy, strokePaint)
     canvas.save()
     canvas.rotate(rotationDegrees, cx, cy)
     canvas.drawLine(cx, cy, cx, cy - radius * 0.58f, strokePaint)
-    canvas.drawLine(cx, cy, cx + radius * 0.42f, cy, strokePaint)
     canvas.restore()
   }
 
   private fun drawCheck(canvas: Canvas, second: Boolean) {
-    fun checkPath(offsetX: Float): Path {
-      path.reset()
-      path.moveTo(offsetX + dpF(1.5f), height * 0.55f)
-      path.lineTo(offsetX + dpF(5.2f), height * 0.78f)
-      path.lineTo(offsetX + dpF(13.8f), height * 0.24f)
-      return path
-    }
+    val scale = dpF(0.72f)
+    val baseX = width - dpF(21.5f)
+    val baseY = (height - (24f * scale)) * 0.5f
     if (second) {
-      canvas.drawPath(checkPath(width - dpF(20f)), strokePaint)
-      canvas.drawPath(checkPath(width - dpF(12.5f)), strokePaint)
+      path.reset()
+      path.moveTo(baseX + 4f * scale, baseY + 12.9f * scale)
+      path.lineTo(baseX + 7.14286f * scale, baseY + 16.5f * scale)
+      path.lineTo(baseX + 15f * scale, baseY + 7.5f * scale)
+      canvas.drawPath(path, strokePaint)
+      path.reset()
+      path.moveTo(baseX + 20f * scale, baseY + 7.5625f * scale)
+      path.lineTo(baseX + 11.4283f * scale, baseY + 16.5625f * scale)
+      path.lineTo(baseX + 11f * scale, baseY + 16f * scale)
+      canvas.drawPath(path, strokePaint)
     } else {
-      canvas.drawPath(checkPath(width - dpF(15.5f)), strokePaint)
+      path.reset()
+      path.moveTo(baseX + 4f * scale, baseY + 12f * scale)
+      path.lineTo(baseX + 8.94975f * scale, baseY + 16.9497f * scale)
+      path.lineTo(baseX + 19.5572f * scale, baseY + 6.34326f * scale)
+      canvas.drawPath(path, strokePaint)
     }
   }
 
@@ -213,6 +234,22 @@ internal class BubbleStatusIndicatorView(context: Context) : View(context) {
         interpolator = LinearInterpolator()
         addUpdateListener {
           rotationDegrees = it.animatedValue as Float
+          invalidate()
+        }
+        start()
+      }
+  }
+
+  private fun startTransitionAnimator() {
+    transitionAnimator?.cancel()
+    transitionAnimator =
+      ValueAnimator.ofFloat(0f, 1f).apply {
+        duration = 150L
+        interpolator = AccelerateDecelerateInterpolator()
+        addUpdateListener {
+          val t = it.animatedValue as Float
+          glyphAlpha = 0.58f + (0.42f * t)
+          glyphScale = 0.88f + (0.12f * t)
           invalidate()
         }
         start()

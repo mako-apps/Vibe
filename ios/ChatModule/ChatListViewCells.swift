@@ -733,7 +733,7 @@ private final class ChatPendingStatusView: UIView {
 
   override func layoutSubviews() {
     super.layoutSubviews()
-    let side = min(bounds.width, bounds.height) - 1.5
+    let side = min(bounds.width, bounds.height) - 4.0
     let rect = CGRect(
       x: floor((bounds.width - side) * 0.5),
       y: floor((bounds.height - side) * 0.5),

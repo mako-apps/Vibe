@@ -1269,7 +1269,6 @@ final class ChatEngine {
       if nativeTypingStateByChatId[chatId] == typing {
         return ["accepted": true, "transport": "native", "deduped": true, "typing": typing]
       }
-      nativeTypingStateByChatId[chatId] = typing
       guard let client = phoenixClient else {
         DispatchQueue.global(qos: .utility).async { [weak self] in
           self?.ensureNativeTransport(trigger: "typing_no_socket")
@@ -1283,6 +1282,7 @@ final class ChatEngine {
         }
         return ["accepted": false, "reason": "chat_not_joined", "typing": typing]
       }
+      nativeTypingStateByChatId[chatId] = typing
       let userId = normalizedString(getConfigValueLocked("userId")) ?? "me"
       let event = typing ? "typing" : "stop-typing"
       let ref = client.push(

@@ -170,6 +170,18 @@ private fun hasMediaCaptionLayout(item: NativeRowItem): Boolean {
   return nativeRowDisplayCaption(item).isNotBlank()
 }
 
+private fun nativeTextLooksRtl(value: String): Boolean {
+  for (char in value) {
+    when (Character.getDirectionality(char)) {
+      Character.DIRECTIONALITY_RIGHT_TO_LEFT,
+      Character.DIRECTIONALITY_RIGHT_TO_LEFT_ARABIC,
+      Character.DIRECTIONALITY_RIGHT_TO_LEFT_EMBEDDING,
+      Character.DIRECTIONALITY_RIGHT_TO_LEFT_OVERRIDE -> return true
+    }
+  }
+  return false
+}
+
 private fun usesFullBleedMediaLayout(item: NativeRowItem): Boolean {
   if (hasMediaCaptionLayout(item)) return false
   return (nativeRowRepresentsImage(item) && item.messageType != "file") || nativeRowRepresentsVideo(item)
@@ -1236,6 +1248,10 @@ private class NativeRowsAdapter(
         item.messageType == "file" &&
         !item.mediaUrl.isNullOrBlank()
     val displayCaption = nativeRowDisplayCaption(item)
+    val usesRtlTextColumn =
+      !isVoice &&
+        !hasMediaPreview &&
+        nativeTextLooksRtl(if (hasMediaPreview) displayCaption else item.text)
 
     // Agent message rendering
     if (item.isAgentMessage) {
@@ -1255,6 +1271,8 @@ private class NativeRowsAdapter(
     // Agent messages use "them" styling (not isMe)
     val effectiveIsMe = if (item.isAgentMessage) false else item.isMe
     textView.setTextColor(if (effectiveIsMe) appearance.textColorMe else appearance.textColorThem)
+    textView.textDirection = if (usesRtlTextColumn) View.TEXT_DIRECTION_RTL else View.TEXT_DIRECTION_FIRST_STRONG
+    textView.gravity = if (usesRtlTextColumn) Gravity.END else Gravity.START
     replyPreviewTitleView.setTextColor(if (effectiveIsMe) withAlpha(appearance.textColorMe, 0.92f) else withAlpha(appearance.textColorThem, 0.88f))
     replyPreviewTextView.setTextColor(if (effectiveIsMe) withAlpha(appearance.textColorMe, 0.72f) else withAlpha(appearance.textColorThem, 0.66f))
     inlineAttachmentTitleView.setTextColor(if (effectiveIsMe) appearance.textColorMe else appearance.textColorThem)
@@ -1324,15 +1342,11 @@ private class NativeRowsAdapter(
     statusLp.bottomMargin = 0
     statusView.layoutParams = statusLp
 
-    val baseStatusWidth = when(displayStatus?.lowercase()) {
-      "sent" -> 16
-      "delivered", "read" -> 22
-      else -> 16
-    }
+    val baseStatusWidth = 22
     
     val timeLp = timeView.layoutParams as FrameLayout.LayoutParams
     timeLp.gravity = Gravity.END or Gravity.BOTTOM
-    timeLp.rightMargin = if (showStatus) dp(baseStatusWidth + 3) else 0
+    timeLp.rightMargin = if (showStatus) dp(baseStatusWidth + 5) else 0
     timeLp.bottomMargin = 0
     timeView.layoutParams = timeLp
 
@@ -1434,7 +1448,7 @@ private class NativeRowsAdapter(
       val durationWidth = dp(50)
       val durationHeight = dp(14)
       val timeWidth = ceil(timeView.paint.measureText(item.timestamp)).toInt()
-      val statusReserve = if (showStatus) dp(baseStatusWidth + 3) else dp(19)
+      val statusReserve = if (showStatus) dp(baseStatusWidth + 5) else dp(19)
       val maxBubbleWidth =
         min(
           (context.resources.displayMetrics.widthPixels * 0.72f).toInt(),
@@ -1553,8 +1567,8 @@ private class NativeRowsAdapter(
       voiceWaveView.setWaveform(null, null)
 
       val timeWidth = kotlin.math.ceil(timeView.paint.measureText(item.timestamp ?: "")).toInt()
-      val statusReserve = if (showStatus) dp(16 + 3) else 0
-      val metaReserve = dp(6) + timeWidth + statusReserve
+      val statusReserve = if (showStatus) dp(baseStatusWidth + 5) else 0
+      val metaReserve = dp(12) + timeWidth + statusReserve
       val replyReserve = if (hasReplyPreview) dp(50) else 0
       val textLp = textView.layoutParams as FrameLayout.LayoutParams
       val attachmentLp = inlineAttachmentView.layoutParams as FrameLayout.LayoutParams
@@ -1655,9 +1669,9 @@ private class NativeRowsAdapter(
         statusView.layoutParams = statusLp
         timeLp.rightMargin =
           if (isFullBleedMedia) {
-            dp(10) + if (showStatus) dp(baseStatusWidth + 3) else 0
+            dp(10) + if (showStatus) dp(baseStatusWidth + 5) else 0
           } else {
-            if (showStatus) dp(baseStatusWidth + 3) else 0
+            if (showStatus) dp(baseStatusWidth + 5) else 0
           }
         timeLp.bottomMargin = if (isFullBleedMedia) dp(8) else 0
         timeView.layoutParams = timeLp
@@ -1701,7 +1715,7 @@ private class NativeRowsAdapter(
         statusLp.rightMargin = 0
         statusLp.bottomMargin = 0
         statusView.layoutParams = statusLp
-        timeLp.rightMargin = if (showStatus) dp(baseStatusWidth + 3) else 0
+        timeLp.rightMargin = if (showStatus) dp(baseStatusWidth + 5) else 0
         timeLp.bottomMargin = 0
         timeView.layoutParams = timeLp
         textView.visibility = View.VISIBLE
@@ -1746,7 +1760,7 @@ private class NativeRowsAdapter(
         statusLp.rightMargin = 0
         statusLp.bottomMargin = 0
         statusView.layoutParams = statusLp
-        timeLp.rightMargin = if (showStatus) dp(baseStatusWidth + 3) else 0
+        timeLp.rightMargin = if (showStatus) dp(baseStatusWidth + 5) else 0
         timeLp.bottomMargin = 0
         timeView.layoutParams = timeLp
         textView.visibility = View.VISIBLE
@@ -1765,14 +1779,18 @@ private class NativeRowsAdapter(
         inlineAttachmentView.setPadding(dp(12), dp(8), dp(12), dp(8))
         inlineAttachmentView.minimumWidth = dp(170)
         val maxBubbleWidth = (context.resources.displayMetrics.widthPixels * 0.85f).toInt()
-        textView.maxWidth = (maxBubbleWidth - dp(20) - metaReserve).coerceAtLeast(dp(24))
+        textView.maxWidth = (
+          maxBubbleWidth -
+            dp(20) -
+            if (usesRtlTextColumn) 0 else metaReserve
+          ).coerceAtLeast(dp(24))
         replyPreviewView.layoutParams = (replyPreviewView.layoutParams as FrameLayout.LayoutParams).apply {
           width = (maxBubbleWidth - dp(20)).coerceAtLeast(dp(120))
         }
         textLp.gravity = Gravity.START or Gravity.TOP
         textLp.topMargin = replyReserve
-        textLp.rightMargin = metaReserve
-        textLp.bottomMargin = 0
+        textLp.rightMargin = if (usesRtlTextColumn) 0 else metaReserve
+        textLp.bottomMargin = if (usesRtlTextColumn && showStatus) dp(18) else 0
         textView.layoutParams = textLp
         inlineAttachmentView.setOnClickListener(null)
       }
@@ -3014,7 +3032,9 @@ class ChatListView(
     val generation = ++parseGeneration
     diffExecutor.execute {
       val mergedPayload = mergedRowsPayload(input)
-      val visiblePayload = filterRowsForSearch(mergedPayload)
+      val visiblePayloadBase = filterRowsForSearch(mergedPayload)
+      val visiblePayload =
+        if (isPeerTyping && searchQuery.isBlank()) visiblePayloadBase + typingRowPayload() else visiblePayloadBase
       val next = parseRows(visiblePayload)
       if (next.isEmpty() && input.isNotEmpty()) {
         val firstInputKind = (input.firstOrNull()?.get("kind") as? String) ?: "-"
@@ -3072,6 +3092,20 @@ class ChatListView(
         }
       }
     }
+  }
+
+  private fun typingRowPayload(): Map<String, Any?> {
+    return mapOf(
+      "kind" to "message",
+      "key" to "peer-typing-indicator",
+      "message" to mapOf(
+        "id" to "peer-typing-indicator",
+        "type" to "typing",
+        "text" to "Typing...",
+        "timestamp" to "",
+        "isMe" to false,
+      ),
+    )
   }
 
   fun setSearchQuery(value: String) {
@@ -3662,6 +3696,30 @@ class ChatListView(
         replyPreview?.get("body"),
       )
       if (messageType == "typing") {
+        output.add(
+          NativeRowItem(
+            kind = kind,
+            key = key,
+            text = text.ifBlank { "Typing..." },
+            caption = "",
+            timestamp = "",
+            status = null,
+            isMe = false,
+            messageId = messageId ?: key,
+            shape = NativeBubbleShape(showTail = false, topLeft = 18f, topRight = 18f, bottomRight = 18f, bottomLeft = 18f),
+            messageType = "typing",
+            mediaUrl = null,
+            localMediaUrl = null,
+            mediaKey = null,
+            fileName = null,
+            thumbnailBase64 = null,
+            mediaWidthPx = null,
+            mediaHeightPx = null,
+            duration = null,
+            waveform = null,
+            fileSize = null,
+          ),
+        )
         continue
       }
       val localMediaUrl1 = message["localMediaUrl"] as? String
@@ -4764,7 +4822,11 @@ class ChatListView(
     
     val generation = ++parseGeneration
     diffExecutor.execute {
-      val next = parseRows(mergedRowsPayload(sourceRowsPayload))
+      val mergedPayload = mergedRowsPayload(sourceRowsPayload)
+      val visiblePayloadBase = filterRowsForSearch(mergedPayload)
+      val visiblePayload =
+        if (typing && searchQuery.isBlank()) visiblePayloadBase + typingRowPayload() else visiblePayloadBase
+      val next = parseRows(visiblePayload)
       mainHandler.post {
         if (generation != parseGeneration) return@post
         rows.clear()
