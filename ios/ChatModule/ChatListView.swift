@@ -2362,6 +2362,27 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   private func resolvedDisplayStatus(for row: ChatListRow) -> String? {
+    let resolved = rawResolvedDisplayStatus(for: row)
+    guard row.isMe, resolved == "sent" || resolved == "delivered" else {
+      return resolved
+    }
+    guard let rowIndex = rows.firstIndex(where: { candidate in
+      if let messageId = row.messageId, let candidateId = candidate.messageId {
+        return messageId == candidateId
+      }
+      return candidate.key == row.key
+    }) else {
+      return resolved
+    }
+    for later in rows.dropFirst(rowIndex + 1) where later.isMe && later.kind == .message {
+      if rawResolvedDisplayStatus(for: later) == "read" {
+        return "read"
+      }
+    }
+    return resolved
+  }
+
+  private func rawResolvedDisplayStatus(for row: ChatListRow) -> String? {
     guard statusAuthorityEnabled else {
       return row.status?.lowercased()
     }

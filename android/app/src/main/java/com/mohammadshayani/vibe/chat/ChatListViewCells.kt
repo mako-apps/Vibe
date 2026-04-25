@@ -132,7 +132,7 @@ internal class BubbleStatusIndicatorView(context: Context) : View(context) {
   }
 
   override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-    val w = resolveSize(dp(22), widthMeasureSpec)
+    val w = resolveSize(dp(20), widthMeasureSpec)
     val h = resolveSize(dp(14), heightMeasureSpec)
     setMeasuredDimension(w, h)
   }
@@ -149,11 +149,18 @@ internal class BubbleStatusIndicatorView(context: Context) : View(context) {
       }
     strokePaint.color = tintColor
     fillPaint.color = tintColor
-    strokePaint.strokeWidth = dpF(if (normalized == "error") 1.8f else 1.55f)
+    strokePaint.strokeWidth =
+      dpF(
+        when (normalized) {
+          "error" -> 1.8f
+          "delivered", "read" -> 1.25f
+          else -> 1.35f
+        },
+      )
     strokePaint.alpha = (255f * glyphAlpha).roundToInt().coerceIn(0, 255)
     fillPaint.alpha = (255f * glyphAlpha).roundToInt().coerceIn(0, 255)
 
-    val cx = width - dpF(10.5f)
+    val cx = width - dpF(9.8f)
     val cy = height * 0.5f
     canvas.save()
     canvas.scale(glyphScale, glyphScale, cx, cy)
@@ -179,7 +186,7 @@ internal class BubbleStatusIndicatorView(context: Context) : View(context) {
   private fun drawPending(canvas: Canvas) {
     val side = min(width.toFloat(), height.toFloat()) - dpF(4f)
     if (side <= 0f) return
-    val cx = width - dpF(10.5f)
+    val cx = width - dpF(9.8f)
     val cy = height * 0.5f
     val radius = side * 0.46f
     arcRect.set(cx - radius, cy - radius, cx + radius, cy + radius)
@@ -194,8 +201,8 @@ internal class BubbleStatusIndicatorView(context: Context) : View(context) {
   }
 
   private fun drawCheck(canvas: Canvas, second: Boolean) {
-    val scale = dpF(0.72f)
-    val baseX = width - dpF(21.5f)
+    val scale = dpF(0.63f)
+    val baseX = width - (24f * scale) - dpF(1.0f)
     val baseY = (height - (24f * scale)) * 0.5f
     if (second) {
       path.reset()

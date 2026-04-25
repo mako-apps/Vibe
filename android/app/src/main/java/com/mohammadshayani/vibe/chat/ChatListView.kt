@@ -753,6 +753,30 @@ private class NativeRowsAdapter(
     notifyDataSetChanged()
   }
 
+  private fun rawDisplayStatus(item: NativeRowItem): String? {
+    return (statusResolver?.invoke(item) ?: item.status)
+      ?.trim()
+      ?.lowercase()
+      ?.takeIf { it.isNotEmpty() }
+  }
+
+  private fun displayStatusForPosition(position: Int, item: NativeRowItem): String? {
+    val ownStatus = rawDisplayStatus(item)
+    if (!item.isMe || ownStatus == "read" || ownStatus == "pending" || ownStatus == "sending" || ownStatus == "error") {
+      return ownStatus
+    }
+    if (ownStatus != "sent" && ownStatus != "delivered") {
+      return ownStatus
+    }
+    for (index in position + 1 until rows.size) {
+      val later = rows[index]
+      if (later.isMe && later.kind == "message" && rawDisplayStatus(later) == "read") {
+        return "read"
+      }
+    }
+    return ownStatus
+  }
+
   fun refreshStatusDecorations() {
     notifyDataSetChanged()
   }
@@ -842,7 +866,7 @@ private class NativeRowsAdapter(
     }
 
     if (holder is NativeRowViewHolder) {
-      holder.bind(item, hiddenMessageId == item.messageId)
+      holder.bind(item, hiddenMessageId == item.messageId, position)
       if (pendingBottomInsertKeys.remove(item.key)) {
         holder.container.clearAnimation()
         holder.container.alpha = 1f
@@ -1208,7 +1232,7 @@ private class NativeRowsAdapter(
     return value
   }
 
-  private fun NativeRowViewHolder.bind(item: NativeRowItem, hidden: Boolean) {
+  private fun NativeRowViewHolder.bind(item: NativeRowItem, hidden: Boolean, position: Int) {
     if (item.kind == "day") {
       voicePlayback.detach(this)
       dayLabel.visibility = View.VISIBLE
@@ -1296,7 +1320,7 @@ private class NativeRowsAdapter(
       if (isDarkPalette) 0.88f else 0.90f,
     )
     val metaBaseColor = if (effectiveIsMe) appearance.timeColorMe else appearance.timeColorThem
-    val displayStatus = statusResolver?.invoke(item) ?: item.status
+    val displayStatus = displayStatusForPosition(position, item)
     statusView.bind(displayStatus, metaBaseColor)
     val showStatus = effectiveIsMe && when (displayStatus?.lowercase()) {
       "pending", "sending", "sent", "delivered", "read", "error" -> true
@@ -1342,11 +1366,11 @@ private class NativeRowsAdapter(
     statusLp.bottomMargin = 0
     statusView.layoutParams = statusLp
 
-    val baseStatusWidth = 22
+    val baseStatusWidth = 20
     
     val timeLp = timeView.layoutParams as FrameLayout.LayoutParams
     timeLp.gravity = Gravity.END or Gravity.BOTTOM
-    timeLp.rightMargin = if (showStatus) dp(baseStatusWidth + 5) else 0
+    timeLp.rightMargin = if (showStatus) dp(baseStatusWidth + 4) else 0
     timeLp.bottomMargin = 0
     timeView.layoutParams = timeLp
 
@@ -1448,7 +1472,7 @@ private class NativeRowsAdapter(
       val durationWidth = dp(50)
       val durationHeight = dp(14)
       val timeWidth = ceil(timeView.paint.measureText(item.timestamp)).toInt()
-      val statusReserve = if (showStatus) dp(baseStatusWidth + 5) else dp(19)
+      val statusReserve = if (showStatus) dp(baseStatusWidth + 4) else dp(19)
       val maxBubbleWidth =
         min(
           (context.resources.displayMetrics.widthPixels * 0.72f).toInt(),
@@ -1567,7 +1591,7 @@ private class NativeRowsAdapter(
       voiceWaveView.setWaveform(null, null)
 
       val timeWidth = kotlin.math.ceil(timeView.paint.measureText(item.timestamp ?: "")).toInt()
-      val statusReserve = if (showStatus) dp(baseStatusWidth + 5) else 0
+      val statusReserve = if (showStatus) dp(baseStatusWidth + 4) else 0
       val metaReserve = dp(12) + timeWidth + statusReserve
       val replyReserve = if (hasReplyPreview) dp(50) else 0
       val textLp = textView.layoutParams as FrameLayout.LayoutParams
@@ -1669,9 +1693,9 @@ private class NativeRowsAdapter(
         statusView.layoutParams = statusLp
         timeLp.rightMargin =
           if (isFullBleedMedia) {
-            dp(10) + if (showStatus) dp(baseStatusWidth + 5) else 0
+            dp(10) + if (showStatus) dp(baseStatusWidth + 4) else 0
           } else {
-            if (showStatus) dp(baseStatusWidth + 5) else 0
+            if (showStatus) dp(baseStatusWidth + 4) else 0
           }
         timeLp.bottomMargin = if (isFullBleedMedia) dp(8) else 0
         timeView.layoutParams = timeLp
@@ -1715,7 +1739,7 @@ private class NativeRowsAdapter(
         statusLp.rightMargin = 0
         statusLp.bottomMargin = 0
         statusView.layoutParams = statusLp
-        timeLp.rightMargin = if (showStatus) dp(baseStatusWidth + 5) else 0
+        timeLp.rightMargin = if (showStatus) dp(baseStatusWidth + 4) else 0
         timeLp.bottomMargin = 0
         timeView.layoutParams = timeLp
         textView.visibility = View.VISIBLE
@@ -1755,12 +1779,17 @@ private class NativeRowsAdapter(
           openDocumentInApp(item)
         }
       } else {
-        bubbleContainer.setPadding(dp(10), dp(7), dp(10), dp(7))
+        bubbleContainer.setPadding(
+          dp(if (usesRtlTextColumn) 9 else 10),
+          dp(if (usesRtlTextColumn) 6 else 7),
+          dp(if (usesRtlTextColumn) 9 else 10),
+          dp(if (usesRtlTextColumn) 6 else 7),
+        )
         bubbleContainer.background = drawable
         statusLp.rightMargin = 0
         statusLp.bottomMargin = 0
         statusView.layoutParams = statusLp
-        timeLp.rightMargin = if (showStatus) dp(baseStatusWidth + 5) else 0
+        timeLp.rightMargin = if (showStatus) dp(baseStatusWidth + 4) else 0
         timeLp.bottomMargin = 0
         timeView.layoutParams = timeLp
         textView.visibility = View.VISIBLE
@@ -1781,7 +1810,7 @@ private class NativeRowsAdapter(
         val maxBubbleWidth = (context.resources.displayMetrics.widthPixels * 0.85f).toInt()
         textView.maxWidth = (
           maxBubbleWidth -
-            dp(20) -
+            dp(if (usesRtlTextColumn) 18 else 20) -
             if (usesRtlTextColumn) 0 else metaReserve
           ).coerceAtLeast(dp(24))
         replyPreviewView.layoutParams = (replyPreviewView.layoutParams as FrameLayout.LayoutParams).apply {
@@ -1790,7 +1819,7 @@ private class NativeRowsAdapter(
         textLp.gravity = Gravity.START or Gravity.TOP
         textLp.topMargin = replyReserve
         textLp.rightMargin = if (usesRtlTextColumn) 0 else metaReserve
-        textLp.bottomMargin = if (usesRtlTextColumn && showStatus) dp(18) else 0
+        textLp.bottomMargin = if (usesRtlTextColumn && showStatus) dp(13) else 0
         textView.layoutParams = textLp
         inlineAttachmentView.setOnClickListener(null)
       }

@@ -693,12 +693,13 @@ private let bubbleMetaPendingFont = UIFont.systemFont(ofSize: 10.5, weight: .sem
 private let bubbleMetaStatusFont = UIFont.systemFont(ofSize: 11, weight: .semibold)
 private let bubbleMetaInlineSpacing: CGFloat = 6.0
 private let bubbleMetaItemGap: CGFloat = 3.0
-private let bubbleStatusSlotWidth: CGFloat = 18.0
-private let bubbleStatusSlotHeight: CGFloat = 15.0
-private let bubbleStatusCheckStrokeWidth: CGFloat = 1.7
+private let bubbleStatusSlotWidth: CGFloat = 17.0
+private let bubbleStatusSlotHeight: CGFloat = 14.0
+private let bubbleStatusCheckStrokeWidth: CGFloat = 1.0
 
 private final class ChatPendingStatusView: UIView {
   private let ringLayer = CAShapeLayer()
+  private let staticHandLayer = CAShapeLayer()
   private let handLayer = CAShapeLayer()
   private var color = UIColor.white
 
@@ -709,9 +710,12 @@ private final class ChatPendingStatusView: UIView {
     ringLayer.fillColor = UIColor.clear.cgColor
     ringLayer.lineCap = .round
     ringLayer.opacity = 0.58
+    staticHandLayer.fillColor = UIColor.clear.cgColor
+    staticHandLayer.lineCap = .round
     handLayer.fillColor = UIColor.clear.cgColor
     handLayer.lineCap = .round
     layer.addSublayer(ringLayer)
+    layer.addSublayer(staticHandLayer)
     layer.addSublayer(handLayer)
   }
 
@@ -722,6 +726,7 @@ private final class ChatPendingStatusView: UIView {
   func configure(color: UIColor) {
     self.color = color
     ringLayer.strokeColor = color.cgColor
+    staticHandLayer.strokeColor = color.cgColor
     handLayer.strokeColor = color.cgColor
     setNeedsLayout()
     startAnimating()
@@ -745,13 +750,20 @@ private final class ChatPendingStatusView: UIView {
     ringLayer.lineWidth = lineWidth
     ringLayer.path = UIBezierPath(ovalIn: rect).cgPath
 
-    handLayer.frame = bounds
-    handLayer.lineWidth = lineWidth
+    staticHandLayer.frame = bounds
+    staticHandLayer.lineWidth = lineWidth
     let center = CGPoint(x: rect.midX, y: rect.midY)
     let radius = side * 0.30
+    let staticPath = UIBezierPath()
+    staticPath.move(to: center)
+    staticPath.addLine(to: CGPoint(x: center.x + radius * 0.42, y: center.y))
+    staticHandLayer.path = staticPath.cgPath
+
+    handLayer.frame = bounds
+    handLayer.lineWidth = lineWidth
     let path = UIBezierPath()
     path.move(to: center)
-    path.addLine(to: CGPoint(x: center.x, y: center.y - radius))
+    path.addLine(to: CGPoint(x: center.x, y: center.y - radius * 1.12))
     handLayer.path = path.cgPath
   }
 
@@ -781,21 +793,27 @@ private func bubbleStatusCheckImage(double: Bool, color: UIColor) -> UIImage? {
   let size = CGSize(width: bubbleStatusSlotWidth, height: bubbleStatusSlotHeight)
   let renderer = UIGraphicsImageRenderer(size: size)
   return renderer.image { ctx in
-    let sx = size.width / 24.0
-    let sy = size.height / 24.0
+    let scale: CGFloat = 0.63
+    let baseX = size.width - (24.0 * scale) - 0.5
+    let baseY = (size.height - (24.0 * scale)) * 0.5
 
     func point(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
-      CGPoint(x: x * sx, y: y * sy)
+      CGPoint(x: baseX + x * scale, y: baseY + y * scale)
     }
 
-    let lineWidth = bubbleStatusCheckStrokeWidth * min(sx, sy) * 1.6
     color.setStroke()
 
     let firstPath = UIBezierPath()
-    firstPath.move(to: point(4.0, 12.9))
-    firstPath.addLine(to: point(7.14286, 16.5))
-    firstPath.addLine(to: point(15.0, 7.5))
-    firstPath.lineWidth = lineWidth
+    if double {
+      firstPath.move(to: point(4.0, 12.9))
+      firstPath.addLine(to: point(7.14286, 16.5))
+      firstPath.addLine(to: point(15.0, 7.5))
+    } else {
+      firstPath.move(to: point(4.0, 12.0))
+      firstPath.addLine(to: point(8.94975, 16.9497))
+      firstPath.addLine(to: point(19.5572, 6.34326))
+    }
+    firstPath.lineWidth = (double ? 1.5 : 2.0) * scale
     firstPath.lineCapStyle = .round
     firstPath.lineJoinStyle = .round
     firstPath.stroke()
@@ -805,7 +823,7 @@ private func bubbleStatusCheckImage(double: Bool, color: UIColor) -> UIImage? {
       secondPath.move(to: point(20.0, 7.5625))
       secondPath.addLine(to: point(11.4283, 16.5625))
       secondPath.addLine(to: point(11.0, 16.0))
-      secondPath.lineWidth = lineWidth
+      secondPath.lineWidth = 1.5 * scale
       secondPath.lineCapStyle = .round
       secondPath.lineJoinStyle = .round
       secondPath.stroke()
@@ -1083,6 +1101,12 @@ private func inlineAttachmentIconName(for row: ChatListRow) -> String {
 
 private func isRTL(_ text: String) -> Bool {
   return text.range(of: "[\\u0600-\\u06FF]", options: .regularExpression) != nil
+}
+
+private func usesRTLColumnLayout(_ row: ChatListRow) -> Bool {
+  guard row.kind == .message, row.visualKind == .text else { return false }
+  guard row.messageType != "typing" else { return false }
+  return isRTL(row.text)
 }
 
 private func cachedNaturalMediaSize(for mediaUrl: String?) -> CGSize? {
@@ -2098,10 +2122,11 @@ func measureMessageBubbleLayout(row: ChatListRow, rowWidth: CGFloat)
   let showsInlineAttachment = hasInlineAttachment(row)
   let usesRichTextLayout = bubbleUsesBlockLayout(row)
   let previewHeight = bubblePreviewURL(for: row) == nil ? 0.0 : bubbleLinkPreviewHeight
+  let usesRTLColumn = usesRTLColumnLayout(row) && !showsInlineAttachment && !usesRichTextLayout && previewHeight <= 0.0
   let replyPreviewHeight = showsReplyPreview ? bubbleReplyPreviewHeight : 0.0
   let replyPreviewBlockHeight =
     showsReplyPreview ? (bubbleReplyPreviewHeight + bubbleReplyPreviewSpacing) : 0.0
-  let usesBottomMetaLayout = usesRichTextLayout || previewHeight > 0.0
+  let usesBottomMetaLayout = usesRichTextLayout || previewHeight > 0.0 || usesRTLColumn
   let textMaxWidth: CGFloat =
     showsInlineAttachment || usesBottomMetaLayout
     ? maxContentWidth
@@ -2154,6 +2179,7 @@ func measureMessageBubbleLayout(row: ChatListRow, rowWidth: CGFloat)
   } else if usesBottomMetaLayout {
     desiredContentWidth = max(
       textWidth,
+      usesRTLColumn ? meta.total : 0.0,
       previewHeight > 0.0 ? bubbleLinkPreviewMinWidth : 0.0,
       replyPreviewWidth
     )
@@ -5374,6 +5400,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       let resolveTextColor = row.isMe ? appearance.textColorMe : appearance.textColorThem
       let displayText = bubbleDisplayAttributedString(
         for: row, font: messageFont, textColor: resolveTextColor)
+      messageLabel.textAlignment = usesRTLColumnLayout(row) ? .right : .natural
+      messageLabel.semanticContentAttribute = usesRTLColumnLayout(row) ? .forceRightToLeft : .unspecified
       messageLabel.applyStreamingText(
         displayText,
         rawText: displayText.string,
