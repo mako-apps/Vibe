@@ -1,6 +1,10 @@
 import Foundation
 
 enum ChatHomeService {
+  static func cachedRows(config: AppSessionConfig) -> [ChatHomeListRow] {
+    ChatHomeRowsCache.rows(userID: config.userID)
+  }
+
   static func fetchChats(config: AppSessionConfig) async throws -> [ChatHomeListRow] {
     let request = try buildRequest(config: config)
     switch config.transportMode {
@@ -59,6 +63,7 @@ enum ChatHomeService {
 
     var request = URLRequest(url: url)
     request.httpMethod = "GET"
+    request.timeoutInterval = 18
     request.setValue("application/json", forHTTPHeaderField: "Accept")
     request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
     request.setValue("Bearer \(config.authToken)", forHTTPHeaderField: "Authorization")
@@ -76,10 +81,17 @@ enum ChatHomeService {
     let rows = try await chats
     let filteredRows = rows.filter { !$0.isSavedMessages }
 
-    if let savedMessagesRow = await savedMessagesRow {
-      return [savedMessagesRow] + filteredRows
+    let combinedRows: [ChatHomeListRow]
+    let resolvedSavedMessagesRow =
+      await savedMessagesRow
+      ?? ChatHomeRowsCache.rows(userID: config.userID).first(where: \.isSavedMessages)
+    if let resolvedSavedMessagesRow {
+      combinedRows = [resolvedSavedMessagesRow] + filteredRows
+    } else {
+      combinedRows = filteredRows
     }
-    return filteredRows
+    ChatHomeRowsCache.store(combinedRows, userID: config.userID)
+    return combinedRows
   }
 
   private static func perform(_ request: URLRequest, session: URLSession) async throws -> [ChatHomeListRow] {
@@ -192,6 +204,7 @@ enum ChatHomeService {
 
     var request = URLRequest(url: url)
     request.httpMethod = "GET"
+    request.timeoutInterval = 18
     request.setValue("application/json", forHTTPHeaderField: "Accept")
     request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
     request.setValue("Bearer \(config.authToken)", forHTTPHeaderField: "Authorization")
@@ -217,6 +230,43 @@ enum ChatHomeService {
       return Int64(value.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
     }
     return 0
+  }
+}
+
+private enum ChatHomeRowsCache {
+  private static let keyPrefix = "vibe.ios.chatHome.rows.v1"
+
+  static func rows(userID: String) -> [ChatHomeListRow] {
+    let defaults = UserDefaults.standard
+    guard let data = defaults.data(forKey: cacheKey(userID: userID)),
+      let object = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+    else {
+      return []
+    }
+    return object.compactMap(ChatHomeListRow.parse)
+  }
+
+  static func store(_ rows: [ChatHomeListRow], userID: String) {
+    let payload = rows.map { $0.cachePayload() }
+    guard JSONSerialization.isValidJSONObject(payload),
+      let data = try? JSONSerialization.data(withJSONObject: payload, options: [])
+    else {
+      NSLog("[ChatHomeRowsCache] skipped invalid payload rows=%d", rows.count)
+      return
+    }
+    UserDefaults.standard.set(data, forKey: cacheKey(userID: userID))
+  }
+
+  private static func cacheKey(userID: String) -> String {
+    let safeUserID =
+      userID
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .unicodeScalars
+      .map { scalar -> Character in
+        CharacterSet.alphanumerics.contains(scalar) ? Character(scalar) : "_"
+      }
+    let suffix = String(safeUserID).isEmpty ? "default" : String(safeUserID)
+    return "\(keyPrefix).\(suffix)"
   }
 }
 

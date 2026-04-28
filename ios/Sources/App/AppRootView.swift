@@ -40,20 +40,13 @@ struct ChatRoute: Identifiable, Hashable {
   }
 
   init(row: ChatHomeListRow) {
-    let initialRows =
-      !row.previewRows.isEmpty
-      ? row.previewRows
-      : ChatEngine.shared.makeTransientChatRows([
-        "chatId": row.chatId,
-        "messages": row.initialMessages,
-      ])
     self.init(
       chatId: row.chatId,
       title: row.title,
       peerUserId: row.peerUserId,
       avatarURI: row.avatarUri,
       isGroup: row.isGroup,
-      initialRows: initialRows
+      initialRows: row.previewRows
     )
   }
 
@@ -292,32 +285,68 @@ private final class ChatPushAnimator: NSObject, UIViewControllerAnimatedTransiti
 private final class ChatsViewModel: ObservableObject {
   @Published var rows: [ChatHomeListRow] = []
   @Published var isLoading = false
+  @Published var isWaitingForNetwork = false
   @Published var errorMessage: String?
 
   private var hasLoaded = false
 
   func loadIfNeeded() async {
     guard !hasLoaded else { return }
+    if let config = AppSessionConfig.current {
+      let cachedRows = ChatHomeService.cachedRows(config: config)
+      if !cachedRows.isEmpty {
+        rows = cachedRows
+        hasLoaded = true
+        warmCachedRows(cachedRows, shouldFetchHistory: false)
+      }
+    }
     await refresh()
   }
 
   func refresh() async {
     guard let config = AppSessionConfig.current else {
-      rows = []
-      errorMessage = "The current session is unavailable."
+      if rows.isEmpty {
+        errorMessage = "The current session is unavailable."
+      } else {
+        isWaitingForNetwork = true
+      }
       return
     }
 
-    isLoading = true
+    isLoading = rows.isEmpty
+    isWaitingForNetwork = false
     errorMessage = nil
     defer { isLoading = false }
 
     do {
       rows = try await ChatHomeService.fetchChats(config: config)
       hasLoaded = true
+      isWaitingForNetwork = false
+      warmCachedRows(rows, shouldFetchHistory: true)
     } catch {
-      errorMessage = error.localizedDescription
+      isWaitingForNetwork = true
+      if rows.isEmpty {
+        errorMessage = error.localizedDescription
+      } else {
+        errorMessage = error.localizedDescription
+      }
+      hasLoaded = true
     }
+  }
+
+  private func warmCachedRows(_ rows: [ChatHomeListRow], shouldFetchHistory: Bool) {
+    let visibleRows = Array(rows.prefix(4))
+    for row in visibleRows where !row.initialMessages.isEmpty {
+      ChatEngine.shared.seedRecentChatHistory(
+        chatId: row.chatId,
+        messages: row.initialMessages,
+        limit: 3
+      )
+    }
+
+    guard shouldFetchHistory else { return }
+    let preloadChatIds = visibleRows.prefix(2).map(\.chatId)
+    ChatEngine.shared.prefetchChatHistories(chatIds: preloadChatIds)
   }
 }
 
@@ -549,8 +578,11 @@ private struct ChatsRootView: View {
           } else if model.rows.isEmpty {
             AppShellEmptyStateView(
               icon: "message",
-              title: "No Messages Yet",
-              message: errorMessage ?? model.errorMessage ?? "Start a conversation to catch the vibe.",
+              title: model.isWaitingForNetwork ? "Waiting for Network" : "No Messages Yet",
+              message: errorMessage ?? model.errorMessage
+                ?? (model.isWaitingForNetwork
+                  ? "Your chats will stay here when the connection returns."
+                  : "Start a conversation to catch the vibe."),
               buttonTitle: "New Chat",
               palette: palette
             ) {
@@ -563,6 +595,13 @@ private struct ChatsRootView: View {
               isEditing: isEditingHome,
               selectedChatIDs: selectedChatIDs,
               onSelect: { row in
+                if !row.initialMessages.isEmpty {
+                  ChatEngine.shared.seedRecentChatHistory(
+                    chatId: row.chatId,
+                    messages: row.initialMessages,
+                    limit: 3
+                  )
+                }
                 coordinator.openChat(ChatRoute(row: row))
               },
               onToggleSelection: { chatID in
@@ -620,7 +659,10 @@ private struct ChatsRootView: View {
             .disabled(model.rows.isEmpty)
           }
           ToolbarItem(placement: .principal) {
-            AppHomeStatusHeaderView(state: .ready, palette: palette)
+            AppHomeStatusHeaderView(
+              state: model.isWaitingForNetwork ? .waitingForNetwork : .ready,
+              palette: palette
+            )
           }
           ToolbarItemGroup(placement: .topBarTrailing) {
             Button {
@@ -1006,6 +1048,7 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
   private var isEditingMode = false
   private var selectedChatIDs = Set<String>()
   private var isRunningRefresh = false
+  private var lastAppliedSignature = ""
   private weak var openSwipeCell: ChatHomeCardCell?
 
   override func viewDidLoad() {
@@ -1039,11 +1082,51 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     isEditing: Bool,
     selectedChatIDs: Set<String>
   ) {
+    let nextSignature = Self.signature(
+      rows: rows,
+      isDark: isDark,
+      isEditing: isEditing,
+      selectedChatIDs: selectedChatIDs
+    )
+    guard nextSignature != lastAppliedSignature else { return }
+    lastAppliedSignature = nextSignature
     self.rows = rows
     self.isDark = isDark
     self.isEditingMode = isEditing
     self.selectedChatIDs = selectedChatIDs
-    tableView.reloadData()
+    UIView.performWithoutAnimation {
+      tableView.reloadData()
+      tableView.layoutIfNeeded()
+    }
+  }
+
+  private static func signature(
+    rows: [ChatHomeListRow],
+    isDark: Bool,
+    isEditing: Bool,
+    selectedChatIDs: Set<String>
+  ) -> String {
+    let rowSignature = rows.map { row in
+      [
+        row.chatId,
+        row.title,
+        row.preview,
+        row.timeLabel,
+        "\(row.unreadCount)",
+        "\(row.markedUnread)",
+        "\(row.muted)",
+        "\(row.pinned)",
+        "\(row.isTyping)",
+        "\(row.isOnline)",
+        row.avatarUri ?? "",
+      ].joined(separator: "\u{1F}")
+    }.joined(separator: "\u{1E}")
+    return [
+      isDark ? "dark" : "light",
+      isEditing ? "editing" : "normal",
+      selectedChatIDs.sorted().joined(separator: ","),
+      rowSignature,
+    ].joined(separator: "\u{1D}")
   }
 
   @objc private func handleRefresh() {
@@ -1990,11 +2073,16 @@ private struct ChatAvatarView: View {
 }
 
 private enum AppHomeHeaderState {
-  case updating
   case ready
+  case waitingForNetwork
 
   var title: String {
-    "Chats"
+    switch self {
+    case .ready:
+      return "Chats"
+    case .waitingForNetwork:
+      return "Waiting for Network"
+    }
   }
 
   var showsProgress: Bool {

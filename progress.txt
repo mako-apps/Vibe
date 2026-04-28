@@ -1,3 +1,12 @@
+2026-04-28
+
+Completed:
+- Fixed the iOS root chat/home loading path that could make the app feel frozen while opening large encrypted chats. Home rows are now persisted after a successful fetch and restored before the remote refresh on the next launch, refresh failures keep the existing list visible instead of replacing it with the empty state, and the home header switches to `Waiting for Network` when refresh fails. Chat row taps no longer synchronously build/decrypt full transient message rows on the main thread; the first visible chats seed only a small recent slice in the background and the first two visible chats prefetch full native history after a successful home refresh. Chat/history requests now use an explicit 18s timeout instead of waiting for long QUIC stalls. The native home table also skips identical reloads to reduce row flicker.
+- Revalidated with targeted `xcrun swiftc -parse`, `git diff --check`, `python3 -m json.tool tests.json`, and `xcodebuild -project Vibe.xcodeproj -scheme Vibe -sdk iphonesimulator -configuration Debug -derivedDataPath /tmp/vibe-ios-home-cache-chat-preload CODE_SIGNING_ALLOWED=NO build` from `ios/`; the full build succeeded with existing deprecation warnings only.
+
+Remaining:
+- Device verification is still needed for the reported real-world freeze: launch from the home screen, confirm the chat list appears from cache after a cold restart, turn off network and confirm rows stay visible with the waiting-network header, then open a large chat and confirm the back button stays responsive while history loads.
+
 2026-04-25
 
 Completed:

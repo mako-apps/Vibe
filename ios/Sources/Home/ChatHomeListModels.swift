@@ -110,6 +110,34 @@ struct ChatHomeListRow {
   let previewRows: [[String: Any]]
   let initialMessages: [[String: Any]]
 
+  func cachePayload(messageLimit: Int = 5) -> [String: Any] {
+    var payload: [String: Any] = [
+      "chatId": chatId,
+      "title": title,
+      "preview": preview,
+      "timeLabel": timeLabel,
+      "unreadCount": unreadCount,
+      "markedUnread": markedUnread,
+      "muted": muted,
+      "pinned": pinned,
+      "isTyping": isTyping,
+      "isOnline": isOnline,
+      "avatarFallback": avatarFallback,
+      "isSavedMessages": isSavedMessages,
+      "isGroup": isGroup,
+      "previewRows": previewRows,
+      "messages": Array(initialMessages.suffix(max(0, messageLimit))),
+    ]
+    if let peerUserId { payload["peerUserId"] = peerUserId }
+    if let avatarUri { payload["avatarUri"] = avatarUri }
+    if let avatarGradientStartLight { payload["avatarGradientStartLight"] = avatarGradientStartLight }
+    if let avatarGradientEndLight { payload["avatarGradientEndLight"] = avatarGradientEndLight }
+    if let avatarGradientStartDark { payload["avatarGradientStartDark"] = avatarGradientStartDark }
+    if let avatarGradientEndDark { payload["avatarGradientEndDark"] = avatarGradientEndDark }
+    if let type { payload["type"] = type }
+    return payload
+  }
+
   func withPresence(isTyping: Bool, isOnline: Bool, preview: String? = nil) -> ChatHomeListRow {
     ChatHomeListRow(
       chatId: chatId,

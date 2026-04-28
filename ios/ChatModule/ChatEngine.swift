@@ -1204,6 +1204,36 @@ final class ChatEngine {
     }
   }
 
+  /// Seeds a small, recent slice from the home payload so opening a heavy chat
+  /// never has to decrypt or normalize a large history synchronously on tap.
+  func seedRecentChatHistory(chatId rawChatId: String, messages: [[String: Any]], limit: Int = 5) {
+    queue.async { [weak self] in
+      guard let self else { return }
+      guard let chatId = self.normalizedString(rawChatId), !chatId.isEmpty else { return }
+      guard !messages.isEmpty, !self.historyFullyLoadedChats.contains(chatId) else { return }
+
+      let sortedMessages = messages.sorted { lhs, rhs in
+        let lt =
+          self.parseLongValue(lhs["timestamp"] ?? lhs["timestampMs"] ?? lhs["timestamp_ms"]) ?? 0
+        let rt =
+          self.parseLongValue(rhs["timestamp"] ?? rhs["timestampMs"] ?? rhs["timestamp_ms"]) ?? 0
+        return lt < rt
+      }
+      let recentMessages = Array(sortedMessages.suffix(max(1, min(limit, sortedMessages.count))))
+      let rows = self.buildHistoryRowsLocked(chatId: chatId, rawMessages: recentMessages)
+      guard !rows.isEmpty else { return }
+
+      let existingCount = self.historyRowsByChat[chatId]?.count ?? 0
+      guard existingCount < rows.count else { return }
+      self.historyRowsByChat[chatId] = rows
+      self.appendJournalLocked(
+        event: "native-chat-history-seed-recent",
+        payload: ["chatId": chatId, "rows": rows.count]
+      )
+      self.postChangeLocked(reason: "chatRowsReloaded", userInfo: ["chatId": chatId])
+    }
+  }
+
   /// Seeds lightweight preview rows from the Home API payload without triggering
   /// background full-history fetches for every chat.
   func seedChatHistories(_ payload: [String: Any]) -> [String: Any] {
@@ -2639,6 +2669,7 @@ final class ChatEngine {
     request.httpMethod = "POST"
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.timeoutInterval = 18
     request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
     if !token.isEmpty {
       request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -6904,6 +6935,7 @@ final class ChatEngine {
         url: apiBase.appendingPathComponent("api").appendingPathComponent("saved_messages")
           .appendingPathComponent(userId))
       request.httpMethod = "GET"
+      request.timeoutInterval = 18
       request.setValue("application/json", forHTTPHeaderField: "Accept")
       request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
       if !token.isEmpty { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
