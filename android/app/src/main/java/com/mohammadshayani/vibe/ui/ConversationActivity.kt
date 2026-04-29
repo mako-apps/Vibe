@@ -64,6 +64,7 @@ class ConversationActivity : AppCompatActivity() {
   private var currentRows: List<Map<String, Any?>> = emptyList()
   private var pendingCallPermissionType: String? = null
   private var isProfileVisible = false
+  private var currentChatMuted = false
   private val engineListenerId = "conversation-${System.identityHashCode(this)}"
   @Volatile private var profileRowsRefreshInFlight = false
 
@@ -116,6 +117,7 @@ class ConversationActivity : AppCompatActivity() {
           "headerAvatarPressed" -> showProfileView()
           "headerAudioCallPressed" -> startNativeCall("voice")
           "headerVideoCallPressed" -> startNativeCall("video")
+          "headerMenuAction" -> if (payload["action"]?.toString() == "muteToggle") toggleChatMute()
           "savedMessageSent" -> if (isSavedMessages) loadSavedMessages(config.userId)
           "savedMessagesClearRequested" -> if (isSavedMessages) confirmClearSavedMessages(config.userId)
         }
@@ -176,6 +178,7 @@ class ConversationActivity : AppCompatActivity() {
     setProfileHandle(if (isSavedMessages) "Personal notes and media" else peerUserId)
     setProfileBio("")
     setIsGroupOrChannel(false)
+    setIsChatMuted(currentChatMuted)
     setRows(rows)
   }
 
@@ -199,7 +202,12 @@ class ConversationActivity : AppCompatActivity() {
             val messageId = payload["messageId"]?.toString().orEmpty()
             hideProfileView()
             if (messageId.isNotBlank()) {
-              chatView.scrollToMessage(messageId, true, 0.5)
+              chatView.scrollToMessageAndHighlight(messageId, true, 0.5)
+            }
+          }
+          "headerMenuAction" -> {
+            if (payload["action"]?.toString() == "muteToggle") {
+              toggleChatMute()
             }
           }
           else -> Unit
@@ -296,6 +304,38 @@ class ConversationActivity : AppCompatActivity() {
     val accepted = result["signalingAccepted"] as? Boolean ?: true
     if (!accepted) {
       Toast.makeText(this, "Could not start call.", Toast.LENGTH_SHORT).show()
+    }
+  }
+
+  private fun toggleChatMute() {
+    if (isSavedMessages || chatId.isBlank()) {
+      Toast.makeText(this, "Mute is available in direct chats.", Toast.LENGTH_SHORT).show()
+      return
+    }
+    val config = currentConfig ?: AppSessionConfig.current(applicationContext)
+    if (config == null) {
+      Toast.makeText(this, "The current session is unavailable.", Toast.LENGTH_SHORT).show()
+      return
+    }
+    val nextMuted = !currentChatMuted
+    currentChatMuted = nextMuted
+    chatView.setIsChatMuted(nextMuted)
+    profileView?.setIsChatMuted(nextMuted)
+    val result = ChatEngine.setChatMuted(
+      mapOf(
+        "chatId" to chatId,
+        "userId" to config.userId,
+        "muted" to nextMuted,
+      ),
+    )
+    val accepted = result["accepted"] as? Boolean ?: false
+    if (!accepted) {
+      currentChatMuted = !nextMuted
+      chatView.setIsChatMuted(!nextMuted)
+      profileView?.setIsChatMuted(!nextMuted)
+      Toast.makeText(this, "Could not update mute.", Toast.LENGTH_SHORT).show()
+    } else {
+      Toast.makeText(this, if (nextMuted) "Chat muted" else "Chat unmuted", Toast.LENGTH_SHORT).show()
     }
   }
 

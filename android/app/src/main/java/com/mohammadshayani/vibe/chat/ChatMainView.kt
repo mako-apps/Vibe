@@ -482,7 +482,11 @@ class ChatMainView(
   }
 
   fun scrollToMessage(messageId: String, animated: Boolean, viewPosition: Double) {
-    chatListView.scrollToMessage(messageId, animated, viewPosition)
+    chatListView.scrollToMessage(messageId, animated, viewPosition, highlight = false)
+  }
+
+  fun scrollToMessageAndHighlight(messageId: String, animated: Boolean, viewPosition: Double) {
+    chatListView.scrollToMessage(messageId, animated, viewPosition, highlight = true)
   }
 
   fun startSendTransition(payload: Map<String, Any?>) {
@@ -1492,7 +1496,8 @@ class ChatMainView(
       if (isPinned) {
         pinnedCount += 1
       }
-      if (containsProfileLink(text) || containsProfileLink(mediaUrl)) {
+      val caption = normalized(message["caption"]).orEmpty()
+      if (containsProfileLink(text) || containsProfileLink(caption)) {
         linkCount += 1
       }
     }
@@ -1923,6 +1928,10 @@ class ChatMainView(
     val savedMessagesMode = isSavedMessagesHeaderMode()
     chatVideoButton.visibility = if (savedMessagesMode) View.GONE else View.VISIBLE
     chatPhoneButton.visibility = if (savedMessagesMode) View.GONE else View.VISIBLE
+    if (isHeaderSearchMode) {
+      chatVideoButton.visibility = View.GONE
+      chatPhoneButton.visibility = View.GONE
+    }
     chatSearchButton.visibility = if (savedMessagesMode || isHeaderSearchMode) View.VISIBLE else View.GONE
     chatClearButton.visibility = if (savedMessagesMode && !isHeaderSearchMode) View.VISIBLE else View.GONE
     chatAvatarButton.visibility = View.VISIBLE

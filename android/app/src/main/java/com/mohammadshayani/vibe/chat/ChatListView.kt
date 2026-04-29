@@ -3542,7 +3542,7 @@ class ChatListView(
     }
   }
 
-  fun scrollToMessage(messageId: String, animated: Boolean, viewPosition: Double) {
+  fun scrollToMessage(messageId: String, animated: Boolean, viewPosition: Double, highlight: Boolean = false) {
     if (rows.isEmpty()) return
     val index = adapter.findMessageIndex(messageId)
     if (index < 0) return
@@ -3556,12 +3556,56 @@ class ChatListView(
       recyclerView.post {
         layoutManager.scrollToPositionWithOffset(index, offset)
         emitViewport()
+        if (highlight) {
+          recyclerView.postDelayed({ flashMessageBubble(messageId) }, 160L)
+        }
       }
     } else {
       layoutManager.scrollToPositionWithOffset(index, offset)
-      recyclerView.post { emitViewport() }
+      recyclerView.post {
+        emitViewport()
+        if (highlight) flashMessageBubble(messageId)
+      }
     }
     shouldAutoScroll = false
+  }
+
+  private fun flashMessageBubble(messageId: String) {
+    val index = adapter.findMessageIndex(messageId)
+    if (index < 0) return
+    val holder = recyclerView.findViewHolderForAdapterPosition(index) as? NativeRowViewHolder
+      ?: run {
+        recyclerView.postDelayed({ flashMessageBubble(messageId) }, 180L)
+        return
+      }
+    val bubble = holder.bubbleContainer
+    val previousForeground = bubble.foreground
+    val accent = appearance.bubbleMeGradient.firstOrNull() ?: appearance.textColorThem
+    bubble.foreground = GradientDrawable().apply {
+      cornerRadius = dp(18).toFloat()
+      setColor(alphaColor(accent, 0.16f))
+      setStroke(dp(1), alphaColor(accent, 0.72f))
+    }
+    bubble.animate().cancel()
+    bubble.scaleX = 1.02f
+    bubble.scaleY = 1.02f
+    bubble.animate()
+      .scaleX(1f)
+      .scaleY(1f)
+      .setDuration(260L)
+      .withEndAction {
+        bubble.postDelayed({
+          if (bubble.foreground != null) {
+            bubble.foreground = previousForeground
+          }
+        }, 520L)
+      }
+      .start()
+  }
+
+  private fun alphaColor(color: Int, alpha: Float): Int {
+    val a = (alpha.coerceIn(0f, 1f) * 255f).toInt().coerceIn(0, 255)
+    return Color.argb(a, Color.red(color), Color.green(color), Color.blue(color))
   }
 
   fun startSendTransition(payload: Map<String, Any?>) {

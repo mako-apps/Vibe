@@ -11,11 +11,13 @@ import android.graphics.Color
 import android.graphics.PorterDuff
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.media.MediaPlayer
 import android.text.TextUtils
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.widget.FrameLayout
+import android.widget.GridLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -109,6 +111,8 @@ class ChatProfileMainView(
   private var sharedPinnedCount = 0
   private var sharedItems: List<ProfileSharedItem> = emptyList()
   private var activeSection: String? = null
+  private var profileVoicePlayer: MediaPlayer? = null
+  private var profileVoiceMessageId: String? = null
 
   private var appearance = ChatListAppearance()
   private var textColor: Int = Color.WHITE
@@ -136,6 +140,13 @@ class ChatProfileMainView(
         "surfaceId" to surfaceId,
       ),
     )
+  }
+
+  override fun onDetachedFromWindow() {
+    profileVoicePlayer?.release()
+    profileVoicePlayer = null
+    profileVoiceMessageId = null
+    super.onDetachedFromWindow()
   }
 
   fun setProfileOnly(value: Boolean) {
@@ -293,8 +304,7 @@ class ChatProfileMainView(
     backButton.setPadding(dp(10), dp(10), dp(10), dp(10))
     backButton.setOnClickListener {
       if (activeSection != null) {
-        activeSection = null
-        configureProfileSummaryRows()
+        showProfileRootFromSection()
         return@setOnClickListener
       }
       onNativeEvent(mapOf("type" to "headerBack"))
@@ -420,15 +430,6 @@ class ChatProfileMainView(
     identityCard.setPadding(dp(16), dp(12), dp(14), dp(12))
     identityCard.background = roundedShape(withAlpha(surfaceColor, 0.92f), dp(18))
     identityCard.setOnClickListener { copyPeerUserId() }
-    contentView.addView(
-      identityCard,
-      LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT,
-        LinearLayout.LayoutParams.WRAP_CONTENT,
-      ).apply {
-        topMargin = dp(16)
-      },
-    )
 
     val identityTextStack = LinearLayout(context).apply {
       orientation = LinearLayout.VERTICAL
@@ -504,10 +505,6 @@ class ChatProfileMainView(
     muteAction.setOnClickListener {
       onNativeEvent(mapOf("type" to "headerMenuAction", "action" to "muteToggle"))
     }
-    actionsRow.addView(
-      muteAction,
-      LinearLayout.LayoutParams(0, dp(64), 1f).apply { marginEnd = dp(6) },
-    )
 
     searchAction.configure(
       title = "Search",
@@ -516,13 +513,6 @@ class ChatProfileMainView(
     searchAction.setOnClickListener {
       onNativeEvent(mapOf("type" to "headerSearchPressed"))
     }
-    actionsRow.addView(
-      searchAction,
-      LinearLayout.LayoutParams(0, dp(64), 1f).apply {
-        marginStart = dp(2)
-        marginEnd = dp(2)
-      },
-    )
 
     audioAction.configure(
       title = "Call",
@@ -531,13 +521,6 @@ class ChatProfileMainView(
     audioAction.setOnClickListener {
       onNativeEvent(mapOf("type" to "headerAudioCallPressed"))
     }
-    actionsRow.addView(
-      audioAction,
-      LinearLayout.LayoutParams(0, dp(64), 1f).apply {
-        marginStart = dp(2)
-        marginEnd = dp(2)
-      },
-    )
 
     videoAction.configure(
       title = "Video",
@@ -546,9 +529,38 @@ class ChatProfileMainView(
     videoAction.setOnClickListener {
       onNativeEvent(mapOf("type" to "headerVideoCallPressed"))
     }
+
+    actionsRow.addView(
+      audioAction,
+      LinearLayout.LayoutParams(0, dp(64), 1f).apply { marginEnd = dp(4) },
+    )
+    actionsRow.addView(
+      searchAction,
+      LinearLayout.LayoutParams(0, dp(64), 1f).apply {
+        marginStart = dp(2)
+        marginEnd = dp(2)
+      },
+    )
+    actionsRow.addView(
+      muteAction,
+      LinearLayout.LayoutParams(0, dp(64), 1f).apply {
+        marginStart = dp(2)
+        marginEnd = dp(2)
+      },
+    )
     actionsRow.addView(
       videoAction,
-      LinearLayout.LayoutParams(0, dp(64), 1f).apply { marginStart = dp(6) },
+      LinearLayout.LayoutParams(0, dp(64), 1f).apply { marginStart = dp(4) },
+    )
+
+    contentView.addView(
+      identityCard,
+      LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT,
+        LinearLayout.LayoutParams.WRAP_CONTENT,
+      ).apply {
+        topMargin = dp(14)
+      },
     )
 
     infoCard.orientation = LinearLayout.VERTICAL
@@ -705,6 +717,9 @@ class ChatProfileMainView(
     val resolvedHandle = when {
       !isUuidLike(profileHandle) && profileHandle.isNotBlank() -> atHandle(profileHandle)
       resolvedTitle.isNotBlank() && !isUuidLike(resolvedTitle) -> atHandle(resolvedTitle)
+      else -> ""
+    }
+    val resolvedSubtitle = when {
       isGroupOrChannel -> {
         val count = resolvedGroupMemberCount()
         if (count > 0) "$count members" else "group chat"
@@ -716,8 +731,11 @@ class ChatProfileMainView(
 
     val resolvedBio = profileBio.takeIf { it.isNotBlank() }.orEmpty()
     headerNameView.text = resolvedTitle
+    if (activeSection == null) {
+      headerTitleView.text = resolvedTitle
+    }
     nameView.text = resolvedTitle
-    handleView.text = resolvedHandle
+    handleView.text = resolvedSubtitle
     val userIdDisplay = resolvedUserIdDisplay()
     identityValueView.text = userIdDisplay
     identityCard.visibility = if (userIdDisplay.isBlank() || isSavedMessagesProfile()) View.GONE else View.VISIBLE
@@ -733,14 +751,13 @@ class ChatProfileMainView(
   }
 
   private fun updateProfileHeaderChrome(scrollY: Int) {
-    val progress = (scrollY / dpF(PROFILE_HEADER_COLLAPSE_DISTANCE_DP)).coerceIn(0f, 1f)
-    headerGlass.alpha = progress
-    headerGlass.translationY = dpF(6f) * (1f - progress)
-    headerTitleView.alpha = 1f - progress
-    headerTitleView.translationY = -dpF(8f) * progress
-    headerNameView.alpha = progress
-    headerNameView.translationY = dpF(8f) * (1f - progress)
-    headerContainer.elevation = dpF(6f) * progress
+    headerGlass.alpha = 0f
+    headerGlass.translationY = 0f
+    headerTitleView.alpha = 1f
+    headerTitleView.translationY = 0f
+    headerNameView.alpha = 0f
+    headerNameView.translationY = 0f
+    headerContainer.elevation = 0f
   }
 
   private fun rebuildProfileSummaryFromRows(rows: List<Map<String, Any?>>) {
@@ -782,10 +799,10 @@ class ChatProfileMainView(
           nextItems.add(ProfileSharedItem("files", messageId, title, subtitle, type, mediaUrl, fileName))
         }
       }
-      if (containsProfileLink(text) || containsProfileLink(mediaUrl)) {
+      if (containsProfileLink(text) || containsProfileLink(caption)) {
         linkCount += 1
         if (messageId.isNotBlank()) {
-          nextItems.add(ProfileSharedItem("links", messageId, linkTitle(text, mediaUrl), subtitle, type, mediaUrl, fileName))
+          nextItems.add(ProfileSharedItem("links", messageId, linkTitle(text, caption), subtitle, type, mediaUrl, fileName))
         }
       }
       if (isPinned) {
@@ -806,7 +823,7 @@ class ChatProfileMainView(
 
   private fun configureProfileSummaryRows() {
     activeSection = null
-    headerTitleView.text = "Profile"
+    headerTitleView.text = profileName.ifBlank { headerTitle.ifBlank { "Profile" } }
     heroAvatar.visibility = View.VISIBLE
     nameView.visibility = View.VISIBLE
     handleView.visibility = View.VISIBLE
@@ -814,6 +831,9 @@ class ChatProfileMainView(
     bioView.visibility = if (profileBio.isBlank()) View.GONE else View.VISIBLE
     actionsRow.visibility = View.VISIBLE
     infoCard.removeAllViews()
+    val isDarkPalette = contrastForegroundFor(profileBackgroundColor) == Color.WHITE
+    infoCard.background = roundedShape(withAlpha(surfaceColor, if (isDarkPalette) 0.92f else 0.96f), dp(24))
+    infoCard.clipToOutline = true
     infoTitleView.text = if (isGroupOrChannel) "Overview" else "Shared Content"
     infoCard.addView(
       infoTitleView,
@@ -891,9 +911,30 @@ class ChatProfileMainView(
   }
 
   private fun showSection(section: String) {
+    if (activeSection == section) return
     activeSection = section
     configureSectionRows(section)
     scrollView.smoothScrollTo(0, 0)
+    animateContentPush(forward = true)
+  }
+
+  private fun showProfileRootFromSection() {
+    activeSection = null
+    configureProfileSummaryRows()
+    scrollView.smoothScrollTo(0, 0)
+    animateContentPush(forward = false)
+  }
+
+  private fun animateContentPush(forward: Boolean) {
+    val width = width.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
+    contentView.animate().cancel()
+    contentView.alpha = 0f
+    contentView.translationX = if (forward) width * 0.18f else -width * 0.18f
+    contentView.animate()
+      .alpha(1f)
+      .translationX(0f)
+      .setDuration(220L)
+      .start()
   }
 
   private fun configureSectionRows(section: String) {
@@ -906,14 +947,8 @@ class ChatProfileMainView(
     bioView.visibility = View.GONE
     actionsRow.visibility = View.GONE
     infoCard.removeAllViews()
-    infoTitleView.text = title
-    infoCard.addView(
-      infoTitleView,
-      LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT,
-        LinearLayout.LayoutParams.WRAP_CONTENT,
-      ),
-    )
+    infoCard.background = roundedStrokeShape(Color.TRANSPARENT, withAlpha(textColor, 0.12f), dp(24), dp(1))
+    infoCard.clipToOutline = false
 
     val items = sharedItems.filter { it.section == section }
     if (items.isEmpty()) {
@@ -933,25 +968,55 @@ class ChatProfileMainView(
       return
     }
 
+    if (section == "media") {
+      val grid = GridLayout(context).apply {
+        columnCount = 2
+        setPadding(dp(10), dp(10), dp(10), dp(10))
+      }
+      items.forEach { item ->
+        grid.addView(
+          mediaGridCellView(item),
+          GridLayout.LayoutParams().apply {
+            width = 0
+            height = dp(154)
+            columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1f)
+            setMargins(dp(6), dp(6), dp(6), dp(6))
+          },
+        )
+      }
+      infoCard.addView(
+        grid,
+        LinearLayout.LayoutParams(
+          LinearLayout.LayoutParams.MATCH_PARENT,
+          LinearLayout.LayoutParams.WRAP_CONTENT,
+        ),
+      )
+      return
+    }
+
     items.forEachIndexed { index, item ->
-      val view =
-        if (section == "media") {
-          mediaItemView(item, showsSeparator = index != items.lastIndex)
-        } else {
-          listItemView(item, showsSeparator = index != items.lastIndex)
-        }
-      infoCard.addView(view)
+      val view = if (section == "audio") audioBubbleItemView(item) else listItemView(item)
+      infoCard.addView(
+        view,
+        LinearLayout.LayoutParams(
+          LinearLayout.LayoutParams.MATCH_PARENT,
+          LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply {
+          leftMargin = dp(10)
+          rightMargin = dp(10)
+          topMargin = if (index == 0) dp(10) else dp(6)
+          bottomMargin = if (index == items.lastIndex) dp(10) else dp(6)
+        },
+      )
     }
   }
 
-  private fun mediaItemView(item: ProfileSharedItem, showsSeparator: Boolean): View {
-    val row = LinearLayout(context).apply {
-      orientation = LinearLayout.HORIZONTAL
-      gravity = Gravity.CENTER_VERTICAL
-      setPadding(dp(18), dp(12), dp(18), dp(12))
+  private fun mediaGridCellView(item: ProfileSharedItem): View {
+    val cell = FrameLayout(context).apply {
+      background = roundedStrokeShape(withAlpha(surfaceColor, 0.22f), withAlpha(textColor, 0.13f), dp(18), dp(1))
       setOnClickListener { openSharedItemInChat(item) }
     }
-    row.addView(
+    cell.addView(
       ChatMainProfileMediaCellNode(context).apply {
         configure(item.mediaUrl.takeIf { item.type != "video" }, isVideo = item.type == "video")
         applyTheme(
@@ -959,17 +1024,110 @@ class ChatProfileMainView(
           placeholderBackgroundColor = withAlpha(textColor, 0.07f),
         )
       },
-      LinearLayout.LayoutParams(dp(58), dp(58)),
+      FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT),
     )
+    cell.addView(
+      TextView(context).apply {
+        text = item.title
+        setTextColor(Color.WHITE)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+        maxLines = 1
+        ellipsize = TextUtils.TruncateAt.END
+        setPadding(dp(9), dp(5), dp(9), dp(5))
+        background = roundedShape(Color.argb(132, 0, 0, 0), dp(10))
+      },
+      FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM).apply {
+        leftMargin = dp(8)
+        rightMargin = dp(8)
+        bottomMargin = dp(8)
+      },
+    )
+    return cell
+  }
+
+  private fun audioBubbleItemView(item: ProfileSharedItem): View {
+    val row = LinearLayout(context).apply {
+      orientation = LinearLayout.HORIZONTAL
+      gravity = Gravity.CENTER_VERTICAL
+      setPadding(dp(14), dp(12), dp(14), dp(12))
+      background = roundedStrokeShape(Color.TRANSPARENT, withAlpha(textColor, 0.13f), dp(18), dp(1))
+    }
+    val playButton = TextView(context).apply {
+      text = if (profileVoiceMessageId == item.messageId) "Pause" else "Play"
+      setTypeface(Typeface.DEFAULT_BOLD)
+      setTextColor(textColor)
+      setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+      gravity = Gravity.CENTER
+      background = roundedShape(withAlpha(textColor, 0.10f), dp(16))
+      setOnClickListener { toggleProfileVoice(item, this) }
+    }
+    row.addView(playButton, LinearLayout.LayoutParams(dp(64), dp(38)))
     val textStack = LinearLayout(context).apply {
       orientation = LinearLayout.VERTICAL
-      setPadding(dp(14), 0, 0, 0)
+      setPadding(dp(12), 0, dp(10), 0)
     }
     textStack.addView(
       TextView(context).apply {
         text = item.title
         setTextColor(textColor)
-        setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+        maxLines = 1
+        ellipsize = TextUtils.TruncateAt.END
+      },
+    )
+    textStack.addView(
+      TextView(context).apply {
+        text = item.subtitle.ifBlank { "Voice message" }
+        setTextColor(secondaryTextColor)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+        maxLines = 1
+        ellipsize = TextUtils.TruncateAt.END
+        setPadding(0, dp(3), 0, 0)
+      },
+    )
+    row.addView(textStack, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+    row.addView(
+      TextView(context).apply {
+        text = "Chat"
+        setTypeface(Typeface.DEFAULT_BOLD)
+        setTextColor(textColor)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+        gravity = Gravity.CENTER
+        setPadding(dp(12), dp(8), dp(12), dp(8))
+        background = roundedShape(withAlpha(textColor, 0.08f), dp(14))
+        setOnClickListener { openSharedItemInChat(item) }
+      },
+      LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT),
+    )
+    return row
+  }
+
+  private fun listItemView(item: ProfileSharedItem): View {
+    val row = LinearLayout(context).apply {
+      orientation = LinearLayout.HORIZONTAL
+      gravity = Gravity.CENTER_VERTICAL
+      setPadding(dp(14), dp(12), dp(14), dp(12))
+      background = roundedStrokeShape(Color.TRANSPARENT, withAlpha(textColor, 0.13f), dp(18), dp(1))
+      setOnClickListener { openSharedItemInChat(item) }
+    }
+    row.addView(
+      ImageView(context).apply {
+        setImageResource(iconForType(item.type, item.section))
+        setColorFilter(accentForSection(item.section), PorterDuff.Mode.SRC_IN)
+        background = roundedShape(withAlpha(accentForSection(item.section), 0.10f), dp(15))
+        setPadding(dp(8), dp(8), dp(8), dp(8))
+      },
+      LinearLayout.LayoutParams(dp(40), dp(40)),
+    )
+    val textStack = LinearLayout(context).apply {
+      orientation = LinearLayout.VERTICAL
+      setPadding(dp(12), 0, 0, 0)
+    }
+    textStack.addView(
+      TextView(context).apply {
+        text = item.title
+        setTextColor(textColor)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
         maxLines = 1
         ellipsize = TextUtils.TruncateAt.END
       },
@@ -985,47 +1143,51 @@ class ChatProfileMainView(
       },
     )
     row.addView(textStack, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-    return wrapProfileItemRow(row, showsSeparator)
+    return row
   }
 
-  private fun listItemView(item: ProfileSharedItem, showsSeparator: Boolean): View {
-    return ChatMainProfileListRowNode(context).apply {
-      configure(
-        title = item.title,
-        subtitle = item.subtitle.ifBlank { "Open in chat" },
-        iconRes = iconForType(item.type, item.section),
-        showsSeparator = showsSeparator,
-      )
-      applyTheme(
-        titleColor = textColor,
-        subtitleColor = secondaryTextColor,
-        valueColor = secondaryTextColor,
-        separatorColor = withAlpha(textColor, 0.08f),
-        highlightedColor = withAlpha(textColor, 0.06f),
-        iconTintColor = accentForSection(item.section),
-        iconBackgroundColor = withAlpha(accentForSection(item.section), 0.12f),
-      )
-      setOnClickListener { openSharedItemInChat(item) }
+  private fun toggleProfileVoice(item: ProfileSharedItem, button: TextView) {
+    val current = profileVoicePlayer
+    if (profileVoiceMessageId == item.messageId && current != null) {
+      current.stop()
+      current.release()
+      profileVoicePlayer = null
+      profileVoiceMessageId = null
+      button.text = "Play"
+      return
     }
-  }
-
-  private fun wrapProfileItemRow(row: View, showsSeparator: Boolean): View {
-    if (!showsSeparator) return row
-    return FrameLayout(context).apply {
-      addView(
-        row,
-        FrameLayout.LayoutParams(
-          FrameLayout.LayoutParams.MATCH_PARENT,
-          FrameLayout.LayoutParams.WRAP_CONTENT,
-        ),
-      )
-      addView(
-        View(context).apply { setBackgroundColor(withAlpha(textColor, 0.08f)) },
-        FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, 1, Gravity.BOTTOM).apply {
-          marginStart = dp(18)
-          marginEnd = dp(18)
-        },
-      )
+    profileVoicePlayer?.release()
+    profileVoicePlayer = null
+    profileVoiceMessageId = null
+    val source = item.mediaUrl.trim()
+    if (source.isBlank()) {
+      Toast.makeText(context, "Voice is not available", Toast.LENGTH_SHORT).show()
+      return
+    }
+    try {
+      val player = MediaPlayer()
+      player.setDataSource(source)
+      player.setOnPreparedListener {
+        profileVoiceMessageId = item.messageId
+        button.text = "Pause"
+        it.start()
+      }
+      player.setOnCompletionListener {
+        it.release()
+        if (profileVoicePlayer === it) {
+          profileVoicePlayer = null
+          profileVoiceMessageId = null
+          button.text = "Play"
+        }
+      }
+      profileVoicePlayer = player
+      player.prepareAsync()
+    } catch (_: Throwable) {
+      profileVoicePlayer?.release()
+      profileVoicePlayer = null
+      profileVoiceMessageId = null
+      button.text = "Play"
+      Toast.makeText(context, "Couldn't play voice", Toast.LENGTH_SHORT).show()
     }
   }
 
@@ -1049,7 +1211,14 @@ class ChatProfileMainView(
   }
 
   private fun resolvedUserIdDisplay(): String {
-    return enginePeerUserIdRaw.takeIf { it.isNotBlank() } ?: profileHandle.takeIf { isUuidLike(it) }.orEmpty()
+    val title = profileName.ifBlank { headerTitle }
+    val handle =
+      when {
+        !isUuidLike(profileHandle) && profileHandle.isNotBlank() -> atHandle(profileHandle)
+        title.isNotBlank() && !isUuidLike(title) -> atHandle(title)
+        else -> ""
+      }
+    return handle
   }
 
   private fun atHandle(value: String): String {
@@ -1102,8 +1271,8 @@ class ChatProfileMainView(
     }
   }
 
-  private fun linkTitle(text: String, mediaUrl: String): String {
-    val candidate = LINK_REGEX.find(text)?.value ?: mediaUrl
+  private fun linkTitle(text: String, caption: String): String {
+    val candidate = LINK_REGEX.find(text)?.value ?: LINK_REGEX.find(caption)?.value.orEmpty()
     return candidate.ifBlank { "Link" }.take(80)
   }
 
@@ -1270,6 +1439,14 @@ class ChatProfileMainView(
     cornerRadius = radiusPx.toFloat()
     setColor(color)
   }
+
+  private fun roundedStrokeShape(color: Int, strokeColor: Int, radiusPx: Int, strokeWidthPx: Int) =
+    GradientDrawable().apply {
+      shape = GradientDrawable.RECTANGLE
+      cornerRadius = radiusPx.toFloat()
+      setColor(color)
+      setStroke(strokeWidthPx, strokeColor)
+    }
 
   private fun statusBarHeightPx(): Int {
     val id = resources.getIdentifier("status_bar_height", "dimen", "android")
