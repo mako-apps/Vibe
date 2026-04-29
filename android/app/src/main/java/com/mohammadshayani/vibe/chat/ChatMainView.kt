@@ -301,7 +301,7 @@ class ChatMainView(
 
   fun setInputBarEnabled(enabled: Boolean) {
     chatInputEnabled = enabled
-    chatListView.setInputBarEnabled(enabled && !isHeaderSearchMode)
+    chatListView.setInputBarEnabled(enabled)
   }
 
   fun setInputPlaceholder(value: String) {
@@ -463,6 +463,14 @@ class ChatMainView(
     if (next == currentPage) return
     currentPage = next
     applyPageState(animated = animated, emitEvent = true)
+  }
+
+  fun openHeaderSearch() {
+    if (currentPage != "chat") {
+      currentPage = "chat"
+      applyPageState(animated = true, emitEvent = true)
+    }
+    setHeaderSearchMode(true)
   }
 
   fun applyTransactions(transactions: List<Map<String, Any?>>) {
@@ -884,11 +892,7 @@ class ChatMainView(
 
     styleHeaderActionButton(chatSearchButton, R.drawable.ic_search)
     chatSearchButton.setOnClickListener {
-      if (isSavedMessagesHeaderMode()) {
-        setHeaderSearchMode(!isHeaderSearchMode)
-      } else {
-        onNativeEvent(mapOf("type" to "headerSearchPressed"))
-      }
+      setHeaderSearchMode(!isHeaderSearchMode)
     }
 
     styleHeaderActionButton(chatClearButton, R.drawable.ic_delete)
@@ -1919,7 +1923,7 @@ class ChatMainView(
     val savedMessagesMode = isSavedMessagesHeaderMode()
     chatVideoButton.visibility = if (savedMessagesMode) View.GONE else View.VISIBLE
     chatPhoneButton.visibility = if (savedMessagesMode) View.GONE else View.VISIBLE
-    chatSearchButton.visibility = if (savedMessagesMode) View.VISIBLE else View.GONE
+    chatSearchButton.visibility = if (savedMessagesMode || isHeaderSearchMode) View.VISIBLE else View.GONE
     chatClearButton.visibility = if (savedMessagesMode && !isHeaderSearchMode) View.VISIBLE else View.GONE
     chatAvatarButton.visibility = View.VISIBLE
     chatProfileGroup.visibility = if (isHeaderSearchMode) View.GONE else View.VISIBLE
@@ -1930,12 +1934,11 @@ class ChatMainView(
   }
 
   private fun setHeaderSearchMode(enabled: Boolean) {
-    if (!isSavedMessagesHeaderMode() && enabled) return
     if (isHeaderSearchMode == enabled) return
     isHeaderSearchMode = enabled
     updateChatHeaderControls()
     applyTheme()
-    chatListView.setInputBarEnabled(chatInputEnabled && !isHeaderSearchMode)
+    chatListView.setInputBarEnabled(chatInputEnabled)
     if (enabled) {
       chatSearchField.post {
         chatSearchField.requestFocus()

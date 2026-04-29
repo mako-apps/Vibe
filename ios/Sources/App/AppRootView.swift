@@ -108,10 +108,9 @@ private enum NativeCallRouteBridge {
       "chatId": route.chatId,
     ]
     let status = VibeNativeCallEngine.shared.startOutgoing(payload)
+    VibeNativeCallOverlayPresenter.shared.showOutgoing(payload: payload, status: status)
     let accepted = (status["signalingAccepted"] as? Bool) ?? true
-    if accepted {
-      AppToastController.shared.show(callType == "video" ? "Starting video call..." : "Calling...")
-    } else {
+    if !accepted {
       AppToastController.shared.show("Could not start call.")
     }
     return status
@@ -120,6 +119,518 @@ private enum NativeCallRouteBridge {
   private static func normalizedString(_ value: String?) -> String? {
     let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     return trimmed.isEmpty ? nil : trimmed
+  }
+}
+
+@MainActor
+private final class VibeNativeCallOverlayPresenter {
+  static let shared = VibeNativeCallOverlayPresenter()
+
+  private var observer: NSObjectProtocol?
+  private var window: UIWindow?
+  private var controller: VibeNativeCallOverlayController?
+
+  private init() {}
+
+  func startObserving() {
+    guard observer == nil else { return }
+    observer = NotificationCenter.default.addObserver(
+      forName: VibeNativeCallEngine.stateDidChangeNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] notification in
+      guard let self,
+        let state = notification.userInfo?["state"] as? [String: Any]
+      else { return }
+      Task { @MainActor in
+        self.applyEngineState(state)
+      }
+    }
+  }
+
+  func showOutgoing(payload: [String: Any], status: [String: Any]) {
+    startObserving()
+    var state = status
+    for key in [
+      "event", "callId", "callType", "toUserId", "toUserName", "toUserImage", "chatId",
+      "signalingAccepted", "signalingQueued", "failureReason",
+    ] where state[key] == nil {
+      state[key] = payload[key]
+    }
+    if state["direction"] == nil {
+      state["direction"] = "outgoing"
+    }
+    present(state: state, retryPayload: payload)
+  }
+
+  private func applyEngineState(_ state: [String: Any]) {
+    let stateValue = normalizedString(state["state"]) ?? ""
+    let direction = normalizedString(state["direction"]) ?? ""
+    guard ["ringing", "starting", "connecting", "active", "failed", "ended"].contains(stateValue)
+      || (stateValue == "configured" && controller != nil)
+    else { return }
+
+    if stateValue == "ended" {
+      present(state: state, retryPayload: nil)
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.65) { [weak self] in
+        guard let self, self.controller?.callId == self.normalizedString(state["callId"] ?? state["call_id"])
+        else { return }
+        self.hide()
+      }
+      return
+    }
+
+    if controller == nil, direction == "incoming" || direction == "outgoing" || stateValue == "failed" {
+      present(state: state, retryPayload: nil)
+    } else {
+      controller?.applyState(state, retryPayload: nil)
+    }
+  }
+
+  private func present(state: [String: Any], retryPayload: [String: Any]?) {
+    guard let scene = activeWindowScene() else {
+      NSLog("[VibeNativeCall][Overlay] present skipped missing window scene")
+      return
+    }
+
+    let controller = self.controller ?? VibeNativeCallOverlayController()
+    controller.onDismiss = { [weak self] in self?.hide() }
+    controller.applyState(state, retryPayload: retryPayload)
+
+    if window == nil {
+      let nextWindow = UIWindow(windowScene: scene)
+      nextWindow.windowLevel = UIWindow.Level(rawValue: UIWindow.Level.alert.rawValue + 2)
+      nextWindow.backgroundColor = .clear
+      nextWindow.rootViewController = controller
+      nextWindow.makeKeyAndVisible()
+      window = nextWindow
+      self.controller = controller
+    } else if self.controller == nil {
+      window?.rootViewController = controller
+      self.controller = controller
+      window?.isHidden = false
+    } else {
+      window?.isHidden = false
+    }
+
+    NSLog(
+      "[VibeNativeCall][Overlay] present state=%@ direction=%@ callId=%@",
+      normalizedString(state["state"]) ?? "-",
+      normalizedString(state["direction"]) ?? "-",
+      normalizedString(state["callId"] ?? state["call_id"]) ?? "-"
+    )
+  }
+
+  private func hide() {
+    controller?.cancelTimers()
+    controller = nil
+    window?.isHidden = true
+    window = nil
+  }
+
+  private func activeWindowScene() -> UIWindowScene? {
+    let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+    return scenes.first(where: { $0.activationState == .foregroundActive })
+      ?? scenes.first(where: { $0.activationState == .foregroundInactive })
+      ?? scenes.first
+  }
+
+  private func normalizedString(_ value: Any?) -> String? {
+    guard let raw = value as? String else { return nil }
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
+  }
+}
+
+private final class VibeNativeCallOverlayController: UIViewController {
+  var onDismiss: (() -> Void)?
+
+  private let blurView = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
+  private let contentStack = UIStackView()
+  private let avatarView = UIImageView()
+  private let avatarInitialLabel = UILabel()
+  private let directionLabel = UILabel()
+  private let nameLabel = UILabel()
+  private let statusLabel = UILabel()
+  private let controlsStack = UIStackView()
+  private let closeButton = UIButton(type: .system)
+
+  private var currentState: [String: Any] = [:]
+  private var retryPayload: [String: Any]?
+  private var timeoutWork: DispatchWorkItem?
+  private var avatarTask: URLSessionDataTask?
+
+  var callId: String? {
+    normalizedString(currentState["callId"] ?? currentState["call_id"])
+  }
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    view.backgroundColor = UIColor.black.withAlphaComponent(0.72)
+
+    blurView.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(blurView)
+    NSLayoutConstraint.activate([
+      blurView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      blurView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      blurView.topAnchor.constraint(equalTo: view.topAnchor),
+      blurView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+    ])
+
+    closeButton.translatesAutoresizingMaskIntoConstraints = false
+    closeButton.setImage(UIImage(systemName: "xmark"), for: .normal)
+    closeButton.tintColor = UIColor.white.withAlphaComponent(0.78)
+    closeButton.backgroundColor = UIColor.white.withAlphaComponent(0.12)
+    closeButton.layer.cornerRadius = 18
+    closeButton.addTarget(self, action: #selector(handleClose), for: .touchUpInside)
+    view.addSubview(closeButton)
+
+    contentStack.axis = .vertical
+    contentStack.alignment = .center
+    contentStack.spacing = 12
+    contentStack.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(contentStack)
+
+    avatarView.translatesAutoresizingMaskIntoConstraints = false
+    avatarView.backgroundColor = UIColor.white.withAlphaComponent(0.14)
+    avatarView.layer.cornerRadius = 52
+    avatarView.layer.masksToBounds = true
+    avatarView.contentMode = .scaleAspectFill
+    avatarView.addSubview(avatarInitialLabel)
+    avatarInitialLabel.translatesAutoresizingMaskIntoConstraints = false
+    avatarInitialLabel.font = .systemFont(ofSize: 34, weight: .semibold)
+    avatarInitialLabel.textColor = .white
+    avatarInitialLabel.textAlignment = .center
+
+    directionLabel.font = .systemFont(ofSize: 13, weight: .medium)
+    directionLabel.textColor = UIColor.white.withAlphaComponent(0.68)
+    directionLabel.textAlignment = .center
+
+    nameLabel.font = .systemFont(ofSize: 20, weight: .semibold)
+    nameLabel.textColor = .white
+    nameLabel.textAlignment = .center
+    nameLabel.numberOfLines = 2
+
+    statusLabel.font = .systemFont(ofSize: 15, weight: .regular)
+    statusLabel.textColor = UIColor.white.withAlphaComponent(0.78)
+    statusLabel.textAlignment = .center
+    statusLabel.numberOfLines = 3
+
+    controlsStack.axis = .horizontal
+    controlsStack.alignment = .center
+    controlsStack.distribution = .equalSpacing
+    controlsStack.spacing = 28
+    controlsStack.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(controlsStack)
+
+    contentStack.addArrangedSubview(avatarView)
+    contentStack.setCustomSpacing(18, after: avatarView)
+    contentStack.addArrangedSubview(directionLabel)
+    contentStack.addArrangedSubview(nameLabel)
+    contentStack.addArrangedSubview(statusLabel)
+
+    NSLayoutConstraint.activate([
+      closeButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 18),
+      closeButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -18),
+      closeButton.widthAnchor.constraint(equalToConstant: 36),
+      closeButton.heightAnchor.constraint(equalToConstant: 36),
+
+      avatarView.widthAnchor.constraint(equalToConstant: 104),
+      avatarView.heightAnchor.constraint(equalToConstant: 104),
+      avatarInitialLabel.leadingAnchor.constraint(equalTo: avatarView.leadingAnchor),
+      avatarInitialLabel.trailingAnchor.constraint(equalTo: avatarView.trailingAnchor),
+      avatarInitialLabel.topAnchor.constraint(equalTo: avatarView.topAnchor),
+      avatarInitialLabel.bottomAnchor.constraint(equalTo: avatarView.bottomAnchor),
+
+      contentStack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 28),
+      contentStack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -28),
+      contentStack.centerYAnchor.constraint(equalTo: view.centerYAnchor, constant: -42),
+
+      controlsStack.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+      controlsStack.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -52),
+    ])
+  }
+
+  func applyState(_ state: [String: Any], retryPayload: [String: Any]?) {
+    currentState = mergedState(existing: currentState, incoming: state)
+    if let retryPayload {
+      self.retryPayload = retryPayload
+    }
+
+    let name = displayName(from: currentState)
+    let stateValue = normalizedString(currentState["state"]) ?? "ringing"
+    nameLabel.text = name
+    directionLabel.text = directionTitle(from: currentState)
+    statusLabel.text = statusText(from: currentState)
+    avatarInitialLabel.text = initial(for: name)
+    loadAvatarIfNeeded(from: currentState)
+    closeButton.isHidden = !["failed", "ended"].contains(stateValue)
+    configureActions(for: currentState)
+    scheduleTimeoutIfNeeded()
+  }
+
+  func cancelTimers() {
+    timeoutWork?.cancel()
+    timeoutWork = nil
+    avatarTask?.cancel()
+    avatarTask = nil
+  }
+
+  private func configureActions(for state: [String: Any]) {
+    controlsStack.arrangedSubviews.forEach { view in
+      controlsStack.removeArrangedSubview(view)
+      view.removeFromSuperview()
+    }
+
+    let stateValue = normalizedString(state["state"]) ?? "ringing"
+    let direction = normalizedString(state["direction"]) ?? ""
+
+    if stateValue == "failed" {
+      controlsStack.addArrangedSubview(actionView(title: "Close", systemImage: "xmark", fillColor: UIColor.white.withAlphaComponent(0.16), action: #selector(handleClose)))
+      controlsStack.addArrangedSubview(actionView(title: "Retry", systemImage: "arrow.clockwise", fillColor: UIColor.systemGreen, action: #selector(handleRetry)))
+      return
+    }
+
+    if direction == "incoming", stateValue == "ringing" {
+      controlsStack.addArrangedSubview(actionView(title: "Decline", systemImage: "phone.down.fill", fillColor: UIColor.systemRed, action: #selector(handleEnd)))
+      controlsStack.addArrangedSubview(actionView(title: "Accept", systemImage: "phone.fill", fillColor: UIColor.systemGreen, action: #selector(handleAccept)))
+      return
+    }
+
+    if stateValue != "ended" {
+      controlsStack.addArrangedSubview(actionView(title: "End", systemImage: "phone.down.fill", fillColor: UIColor.systemRed, action: #selector(handleEnd)))
+    }
+  }
+
+  private func actionView(
+    title: String,
+    systemImage: String,
+    fillColor: UIColor,
+    action: Selector
+  ) -> UIView {
+    let stack = UIStackView()
+    stack.axis = .vertical
+    stack.alignment = .center
+    stack.spacing = 8
+
+    let button = UIButton(type: .system)
+    button.translatesAutoresizingMaskIntoConstraints = false
+    button.setImage(UIImage(systemName: systemImage), for: .normal)
+    button.tintColor = .white
+    button.backgroundColor = fillColor
+    button.layer.cornerRadius = 30
+    button.addTarget(self, action: action, for: .touchUpInside)
+    NSLayoutConstraint.activate([
+      button.widthAnchor.constraint(equalToConstant: 60),
+      button.heightAnchor.constraint(equalToConstant: 60),
+    ])
+
+    let label = UILabel()
+    label.text = title
+    label.font = .systemFont(ofSize: 12, weight: .medium)
+    label.textColor = UIColor.white.withAlphaComponent(0.82)
+    label.textAlignment = .center
+
+    stack.addArrangedSubview(button)
+    stack.addArrangedSubview(label)
+    return stack
+  }
+
+  @objc private func handleAccept() {
+    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+    let status = VibeNativeCallEngine.shared.acceptIncoming(currentPayload())
+    applyState(status, retryPayload: nil)
+  }
+
+  @objc private func handleEnd() {
+    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+    let status = VibeNativeCallEngine.shared.endCall(currentPayload())
+    applyState(status, retryPayload: nil)
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
+      self?.onDismiss?()
+    }
+  }
+
+  @objc private func handleRetry() {
+    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    guard var payload = retryPayload ?? outgoingPayload(from: currentState) else {
+      statusLabel.text = "Call could not start. Open the chat and try again."
+      return
+    }
+    guard let config = AppSessionConfig.current else {
+      statusLabel.text = "Call could not start. Sign in again and retry."
+      return
+    }
+    _ = VibeNativeCallEngine.shared.configure(config.payload)
+    let now = Int(Date().timeIntervalSince1970 * 1000)
+    payload["event"] = "call-start"
+    payload["callId"] = "call_\(now)_\(UUID().uuidString.prefix(8))"
+    payload["direction"] = "outbound"
+    let status = VibeNativeCallEngine.shared.startOutgoing(payload)
+    retryPayload = payload
+    applyState(status, retryPayload: payload)
+  }
+
+  @objc private func handleClose() {
+    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    onDismiss?()
+  }
+
+  private func scheduleTimeoutIfNeeded() {
+    timeoutWork?.cancel()
+    timeoutWork = nil
+
+    let stateValue = normalizedString(currentState["state"]) ?? ""
+    let direction = normalizedString(currentState["direction"]) ?? ""
+    guard direction == "outgoing", ["ringing", "starting"].contains(stateValue),
+      let callId = callId
+    else { return }
+
+    let work = DispatchWorkItem { [weak self] in
+      guard let self,
+        self.callId == callId,
+        ["ringing", "starting"].contains(self.normalizedString(self.currentState["state"]) ?? "")
+      else { return }
+      let failed = VibeNativeCallEngine.shared.failCall(
+        self.currentPayload(),
+        reason: "No answer. You can retry the call."
+      )
+      self.applyState(failed, retryPayload: self.retryPayload ?? self.outgoingPayload(from: self.currentState))
+    }
+    timeoutWork = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + 40, execute: work)
+  }
+
+  private func currentPayload() -> [String: Any] {
+    var payload = currentState
+    if let callId = normalizedString(currentState["callId"] ?? currentState["call_id"]) {
+      payload["callId"] = callId
+    }
+    if normalizedString(payload["toUserId"] ?? payload["to_user_id"]) == nil,
+      let fromUserId = normalizedString(payload["fromUserId"] ?? payload["from_user_id"])
+    {
+      payload["toUserId"] = fromUserId
+    }
+    return payload
+  }
+
+  private func outgoingPayload(from state: [String: Any]) -> [String: Any]? {
+    guard let toUserId = normalizedString(state["toUserId"] ?? state["to_user_id"]) else {
+      return nil
+    }
+    return [
+      "event": "call-start",
+      "callType": normalizedString(state["callType"] ?? state["call_type"]) ?? "voice",
+      "toUserId": toUserId,
+      "toUserName": displayName(from: state),
+      "toUserImage": normalizedString(state["toUserImage"] ?? state["to_user_image"]) ?? "",
+      "chatId": normalizedString(state["chatId"] ?? state["chat_id"]) ?? "",
+    ]
+  }
+
+  private func directionTitle(from state: [String: Any]) -> String {
+    let callType = normalizedString(state["callType"] ?? state["call_type"]) == "video" ? "Video" : "Voice"
+    let direction = normalizedString(state["direction"]) ?? ""
+    if direction == "incoming" {
+      return "Incoming \(callType) Call"
+    }
+    if direction == "outgoing" {
+      return "Outgoing \(callType) Call"
+    }
+    return "\(callType) Call"
+  }
+
+  private func statusText(from state: [String: Any]) -> String {
+    let stateValue = normalizedString(state["state"]) ?? "ringing"
+    switch stateValue {
+    case "ringing", "starting":
+      return normalizedString(state["direction"]) == "incoming" ? "Ringing..." : "Ringing..."
+    case "connecting":
+      return "Connecting..."
+    case "active":
+      return "Connected"
+    case "failed":
+      return friendlyFailureText(from: state)
+    case "ended":
+      return "Call ended"
+    default:
+      return "Connecting..."
+    }
+  }
+
+  private func friendlyFailureText(from state: [String: Any]) -> String {
+    if let reason = normalizedString(state["failureReason"]), !reason.isEmpty {
+      return reason
+    }
+    if boolValue(state["signalingQueued"]) {
+      return "Still waiting for the connection. You can retry the call."
+    }
+    return "Call could not start. Check the connection and try again."
+  }
+
+  private func displayName(from state: [String: Any]) -> String {
+    normalizedString(state["toUserName"] ?? state["to_user_name"])
+      ?? normalizedString(state["fromUserName"] ?? state["from_user_name"])
+      ?? normalizedString(state["name"])
+      ?? "Vibe Call"
+  }
+
+  private func loadAvatarIfNeeded(from state: [String: Any]) {
+    avatarTask?.cancel()
+    avatarTask = nil
+    avatarView.image = nil
+    avatarInitialLabel.isHidden = false
+
+    guard let raw = normalizedString(
+      state["toUserImage"] ?? state["to_user_image"] ?? state["fromUserImage"] ?? state["from_user_image"]
+    ),
+      let url = URL(string: raw), ["http", "https"].contains(url.scheme?.lowercased() ?? "")
+    else { return }
+
+    avatarTask = URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+      guard let self, let data, let image = UIImage(data: data) else { return }
+      DispatchQueue.main.async {
+        self.avatarView.image = image
+        self.avatarInitialLabel.isHidden = true
+      }
+    }
+    avatarTask?.resume()
+  }
+
+  private func initial(for name: String) -> String {
+    let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let first = trimmed.first else { return "V" }
+    return String(first).uppercased()
+  }
+
+  private func mergedState(existing: [String: Any], incoming: [String: Any]) -> [String: Any] {
+    var next = existing
+    for (key, value) in incoming {
+      if !(value is NSNull) {
+        next[key] = value
+      }
+    }
+    return next
+  }
+
+  private func normalizedString(_ value: Any?) -> String? {
+    guard let raw = value as? String else { return nil }
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
+  }
+
+  private func boolValue(_ value: Any?) -> Bool {
+    switch value {
+    case let bool as Bool:
+      return bool
+    case let number as NSNumber:
+      return number.boolValue
+    case let string as String:
+      let raw = string.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+      return raw == "true" || raw == "1" || raw == "yes"
+    default:
+      return false
+    }
   }
 }
 
@@ -134,6 +645,7 @@ final class AppShellCoordinator: ObservableObject {
   private weak var activeChatController: ChatConversationController?
   private var isChatPresentationTransitioning = false
   private var deferredChatPresentation: PresentedChatRoute?
+  private var chatDismissWatchdog: DispatchWorkItem?
   private let pushTransitionDelegate = ChatPushTransitionDelegate()
 
   func openChat(_ route: ChatRoute) {
@@ -166,7 +678,11 @@ final class AppShellCoordinator: ObservableObject {
       "closeChat requested requestId=\(presentedChat.requestID) chatId=\(presentedChat.route.chatId) title=\(presentedChat.route.title)")
     self.presentedChat = nil
     deferredChatPresentation = nil
-    dismissActiveChatController(animated: true)
+    isChatPresentationTransitioning = true
+    armChatDismissWatchdog(source: "closePresentedChat")
+    dismissActiveChatController(animated: true) { [weak self] in
+      self?.finishChatDismissal(source: "closePresentedChat")
+    }
   }
 
   func openChatSearch() {
@@ -298,24 +814,35 @@ final class AppShellCoordinator: ObservableObject {
       if let window = Self.activeWindow(), let visibleChat = Self.visibleChatController(in: window),
         visibleChat.presentingViewController != nil, !visibleChat.isBeingDismissed
       {
+        appShellRouteLog(
+          "dismissActiveChatController dismissing recovered visible chat animated=\(animated)")
         visibleChat.dismiss(animated: animated, completion: completion)
       } else {
+        appShellRouteLog(
+          "dismissActiveChatController no active controller and no visible chat animated=\(animated)")
         completion?()
       }
       return
     }
 
+    let dismissedRequestID = activeRequestID
     activeRequestID = nil
     activeChatController = nil
 
     if controller.presentingViewController != nil, !controller.isBeingDismissed {
+      appShellRouteLog(
+        "dismissActiveChatController dismissing active requestId=\(dismissedRequestID.map(String.init) ?? "nil") animated=\(animated) windowAttached=\(controller.view.window != nil)")
       controller.dismiss(animated: animated, completion: completion)
     } else {
+      appShellRouteLog(
+        "dismissActiveChatController active controller already detached requestId=\(dismissedRequestID.map(String.init) ?? "nil") windowAttached=\(controller.view.window != nil) presenting=\(controller.presentingViewController != nil)")
       completion?()
     }
   }
 
   private func completeChatPresentationTransition() {
+    chatDismissWatchdog?.cancel()
+    chatDismissWatchdog = nil
     isChatPresentationTransitioning = false
     guard let deferred = deferredChatPresentation else { return }
     deferredChatPresentation = nil
@@ -329,6 +856,30 @@ final class AppShellCoordinator: ObservableObject {
     }
   }
 
+  private func armChatDismissWatchdog(source: String) {
+    chatDismissWatchdog?.cancel()
+    let work = DispatchWorkItem { [weak self] in
+      self?.finishChatDismissal(source: "\(source)-watchdog")
+    }
+    chatDismissWatchdog = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.75, execute: work)
+  }
+
+  private func finishChatDismissal(source: String) {
+    chatDismissWatchdog?.cancel()
+    chatDismissWatchdog = nil
+    activeRequestID = nil
+    activeChatController = nil
+    if presentedChat == nil {
+      deferredChatPresentation = nil
+    }
+    isChatPresentationTransitioning = false
+    Self.restoreWindowInteraction()
+    let hasVisibleChat = Self.activeWindow().flatMap { Self.visibleChatController(in: $0) } != nil
+    appShellRouteLog(
+      "finishChatDismissal source=\(source) visibleChat=\(hasVisibleChat) selectedTab=\(selectedTab)")
+  }
+
   private static func activeWindow() -> UIWindow? {
     for scene in UIApplication.shared.connectedScenes {
       guard let windowScene = scene as? UIWindowScene else { continue }
@@ -337,6 +888,16 @@ final class AppShellCoordinator: ObservableObject {
       }
     }
     return nil
+  }
+
+  private static func restoreWindowInteraction() {
+    for scene in UIApplication.shared.connectedScenes {
+      guard let windowScene = scene as? UIWindowScene else { continue }
+      for window in windowScene.windows {
+        window.isUserInteractionEnabled = true
+        window.rootViewController?.view.isUserInteractionEnabled = true
+      }
+    }
   }
 
   private static func visibleChatController(in window: UIWindow) -> ChatConversationController? {
@@ -661,6 +1222,7 @@ struct AppRootView: View {
     }
     .onAppear {
       AppAppearanceController.applyStoredPreference()
+      VibeNativeCallOverlayPresenter.shared.startObserving()
     }
     .task {
       await profileController.loadIfNeeded()
@@ -1779,6 +2341,7 @@ private enum ChatConversationPage: String {
 
 private final class ChatConversationController: UIViewController {
   private let mainView = ChatMainView()
+  private var profileView: ChatProfileMainView?
   private var route: ChatRoute
   private var isDark: Bool
   private var onClose: (() -> Void)?
@@ -1790,6 +2353,7 @@ private final class ChatConversationController: UIViewController {
   private var hasAppeared = false
   private var pendingDeferredEngineStateRefresh = false
   private var deferredEngineRowsReadyChatId: String?
+  private var latestProfileRows: [[String: Any]] = []
 
   init(route: ChatRoute, isDark: Bool, onClose: (() -> Void)?) {
     self.route = route
@@ -1885,6 +2449,7 @@ private final class ChatConversationController: UIViewController {
     applyRoute(forceChannelRefresh: chatChanged)
     if themeChanged {
       mainView.setAppearance(Self.resolvedAppearance(isDark: isDark))
+      profileView?.setAppearance(Self.resolvedAppearance(isDark: isDark))
     }
   }
 
@@ -1910,6 +2475,7 @@ private final class ChatConversationController: UIViewController {
     }
 
     let surfaceId = "native_chat_\(route.chatId)"
+    latestProfileRows = route.initialRows
     mainView.surfaceId = surfaceId
     mainView.setDefersEngineStateRefreshes(deferEngineStateRefreshes)
     mainView.setEngineChannelBindingEnabled(false)
@@ -1935,6 +2501,7 @@ private final class ChatConversationController: UIViewController {
     mainView.setNativeSendEnabled(true)
     mainView.setStandaloneProfileMode(false)
     mainView.setPage(ChatConversationPage.chat.rawValue, animated: false)
+    removeProfileView(animated: false)
     appShellRouteLog(
       "ChatConversationController configuredSurface chatId=\(route.chatId) surfaceId=\(surfaceId) peerUserId=\(route.peerUserId ?? "") isGroup=\(route.isGroup) headerMode=\(route.chatId == "saved_messages" ? "savedmessages" : "default") windowAttached=\(view.window != nil)")
 
@@ -1986,10 +2553,22 @@ private final class ChatConversationController: UIViewController {
 
   private func closeOpenedChatChannel() {
     guard let openedChatId else { return }
-    appShellRouteLog("ChatConversationController closeChatChannel chatId=\(openedChatId)")
+    let windowAttachedAtSchedule: Bool?
+    if Thread.isMainThread {
+      windowAttachedAtSchedule = view.window != nil
+    } else {
+      windowAttachedAtSchedule = nil
+    }
+    let windowAttachedLabel = windowAttachedAtSchedule.map { String($0) } ?? "unknown"
+    appShellRouteLog(
+      "ChatConversationController closeChatChannel scheduled chatId=\(openedChatId) windowAttached=\(windowAttachedLabel) mainThread=\(Thread.isMainThread)")
     self.openedChatId = nil
     DispatchQueue.global(qos: .utility).async {
-      _ = ChatEngine.shared.closeChatChannel(["chatId": openedChatId])
+      let snapshot = ChatEngine.shared.closeChatChannel(["chatId": openedChatId])
+      let state = Self.normalizedString(snapshot["state"]) ?? "nil"
+      let openCount = snapshot["openChatChannelCount"] as? Int ?? -1
+      appShellRouteLog(
+        "ChatConversationController closeChatChannel finished chatId=\(openedChatId) state=\(state) openChatCount=\(openCount)")
     }
   }
 
@@ -2006,6 +2585,10 @@ private final class ChatConversationController: UIViewController {
       appShellRouteLog(
         "ChatConversationController refreshRows immediate chatId=\(chatId) rows=\(initialRows.count) source=initial firstRowId=\(firstRowID)")
       mainView.setRows(initialRows)
+      latestProfileRows = initialRows
+      if currentPage == .profile {
+        profileView?.setRows(initialRows)
+      }
       settleInitialBottomIfNeeded(reason: "initialRows")
     }
 
@@ -2023,6 +2606,10 @@ private final class ChatConversationController: UIViewController {
         appShellRouteLog(
           "ChatConversationController refreshRows chatId=\(chatId) rows=\(rows.count) nativeRows=\(nativeRows.count) initialRows=\(initialRows.count) source=\(nativeRows.isEmpty ? "initial" : "native") firstRowId=\(firstRowID)")
         self.mainView.setRows(rows)
+        self.latestProfileRows = rows
+        if self.currentPage == .profile {
+          self.profileView?.setRows(rows)
+        }
         self.deferredEngineRowsReadyChatId = chatId
         self.completeDeferredEngineStateRefreshIfNeeded(chatId: chatId)
         self.settleInitialBottomIfNeeded(reason: "refreshRows")
@@ -2064,12 +2651,139 @@ private final class ChatConversationController: UIViewController {
     mainView.setHeaderSubtitle(Self.headerSubtitle(for: route))
     mainView.setIsOnline(Self.isOnline(for: route))
     mainView.setProfileHandle(Self.profileHandle(for: route))
+    profileView?.setHeaderSubtitle(Self.headerSubtitle(for: route))
+    profileView?.setIsOnline(Self.isOnline(for: route))
+    profileView?.setProfileHandle(Self.profileHandle(for: route))
   }
 
   private func refreshRouteOnlyHeaderState() {
     mainView.setHeaderSubtitle(Self.routeOnlyHeaderSubtitle(for: route))
     mainView.setIsOnline(false)
     mainView.setProfileHandle(Self.profileHandle(for: route))
+    profileView?.setHeaderSubtitle(Self.routeOnlyHeaderSubtitle(for: route))
+    profileView?.setIsOnline(false)
+    profileView?.setProfileHandle(Self.profileHandle(for: route))
+  }
+
+  private func makeProfileViewIfNeeded() -> ChatProfileMainView {
+    if let profileView {
+      return profileView
+    }
+
+    let nextProfileView = ChatProfileMainView()
+    nextProfileView.translatesAutoresizingMaskIntoConstraints = false
+    nextProfileView.isHidden = true
+    nextProfileView.alpha = 0.0
+    nextProfileView.onNativeEvent.handler = { [weak self] payload in
+      self?.handleNativeEvent(payload)
+    }
+    view.addSubview(nextProfileView)
+    NSLayoutConstraint.activate([
+      nextProfileView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      nextProfileView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      nextProfileView.topAnchor.constraint(equalTo: view.topAnchor),
+      nextProfileView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+    ])
+    profileView = nextProfileView
+    return nextProfileView
+  }
+
+  private func configureProfileView(_ profileView: ChatProfileMainView, rows: [[String: Any]]) {
+    let surfaceId = "native_profile_\(route.chatId)"
+    profileView.surfaceId = surfaceId
+    profileView.setProfileOnly(true)
+    profileView.setEngineSurfaceId(surfaceId)
+    profileView.setEngineChatId(route.chatId)
+    profileView.setEnginePeerUserId(route.peerUserId ?? "")
+    if let myUserId = Self.normalizedString(
+      ChatEngineStore.shared.getConfig()["myUserId"] ?? ChatEngineStore.shared.getConfig()["userId"]
+    ) {
+      profileView.setEngineMyUserId(myUserId)
+    }
+    profileView.setAppearance(Self.resolvedAppearance(isDark: isDark))
+    profileView.setHeaderTitle(route.title)
+    profileView.setHeaderSubtitle(Self.routeOnlyHeaderSubtitle(for: route))
+    profileView.setProfileName(route.title)
+    profileView.setProfileHandle(Self.profileHandle(for: route))
+    profileView.setProfileBio("")
+    profileView.setAvatarUri(route.avatarURI)
+    profileView.setIsGroupOrChannel(route.isGroup)
+    profileView.setRows(rows)
+  }
+
+  private func showProfileView(animated: Bool) {
+    guard currentPage != .profile else { return }
+    currentPage = .profile
+    let profileView = makeProfileViewIfNeeded()
+    configureProfileView(profileView, rows: latestProfileRows)
+    profileView.layer.removeAllAnimations()
+    mainView.layer.removeAllAnimations()
+    view.bringSubviewToFront(profileView)
+    profileView.isHidden = false
+    profileView.alpha = 1.0
+    let width = max(view.bounds.width, 1.0)
+    guard animated, view.window != nil else {
+      profileView.transform = .identity
+      mainView.transform = .identity
+      return
+    }
+    profileView.transform = CGAffineTransform(translationX: width, y: 0.0)
+    UIView.animate(
+      withDuration: 0.26,
+      delay: 0.0,
+      options: [.curveEaseOut, .beginFromCurrentState]
+    ) {
+      profileView.transform = .identity
+      self.mainView.transform = CGAffineTransform(translationX: -width * 0.18, y: 0.0)
+    } completion: { _ in
+      self.mainView.transform = .identity
+    }
+  }
+
+  private func hideProfileView(animated: Bool) {
+    guard profileView?.isHidden == false else {
+      currentPage = .chat
+      return
+    }
+    removeProfileView(animated: animated)
+  }
+
+  private func removeProfileView(animated: Bool) {
+    guard let profileView else {
+      currentPage = .chat
+      mainView.transform = .identity
+      return
+    }
+    currentPage = .chat
+    profileView.layer.removeAllAnimations()
+    mainView.layer.removeAllAnimations()
+    let width = max(view.bounds.width, 1.0)
+    guard animated, view.window != nil else {
+      profileView.transform = .identity
+      profileView.alpha = 0.0
+      profileView.isHidden = true
+      mainView.transform = .identity
+      profileView.removeFromSuperview()
+      self.profileView = nil
+      return
+    }
+    UIView.animate(
+      withDuration: 0.22,
+      delay: 0.0,
+      options: [.curveEaseOut, .beginFromCurrentState]
+    ) {
+      profileView.transform = CGAffineTransform(translationX: width, y: 0.0)
+      profileView.alpha = 0.92
+    } completion: { _ in
+      profileView.transform = .identity
+      profileView.alpha = 0.0
+      profileView.isHidden = true
+      self.mainView.transform = .identity
+      if self.profileView === profileView {
+        profileView.removeFromSuperview()
+        self.profileView = nil
+      }
+    }
   }
 
   private func handleNativeEvent(_ payload: [String: Any]) {
@@ -2095,15 +2809,12 @@ private final class ChatConversationController: UIViewController {
           navigationController.popViewController(animated: true)
         }
       case .profile:
-        currentPage = .chat
-        mainView.setPage(ChatConversationPage.chat.rawValue, animated: true)
+        hideProfileView(animated: true)
       case .agent:
-        currentPage = .profile
-        mainView.setPage(ChatConversationPage.profile.rawValue, animated: true)
+        showProfileView(animated: true)
       }
     case "headerAvatarPressed":
-      currentPage = .profile
-      mainView.setPage(ChatConversationPage.profile.rawValue, animated: true)
+      showProfileView(animated: true)
     case "headerAgentPressed":
       return
     case "headerAudioCallPressed":
@@ -2126,6 +2837,17 @@ private final class ChatConversationController: UIViewController {
       DispatchQueue.main.async { [weak self] in
         self?.handleChatEngineChanged(notification)
       }
+      return
+    }
+
+    if hasAppeared && view.window == nil {
+      appShellRouteLog(
+        "ChatConversationController engineChanged ignoredDetached chatId=\(route.chatId) reason=\(Self.normalizedString(notification.userInfo?["reason"]) ?? "unknown")")
+      return
+    }
+    if isBeingDismissed {
+      appShellRouteLog(
+        "ChatConversationController engineChanged ignoredDismissing chatId=\(route.chatId) reason=\(Self.normalizedString(notification.userInfo?["reason"]) ?? "unknown")")
       return
     }
 

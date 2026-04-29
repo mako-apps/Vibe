@@ -500,23 +500,21 @@ class ChatHomeActivity : AppCompatActivity() {
     ChatEngine.configure(applicationContext, config.toPayload())
     NativeCallEngine.configure(applicationContext, config.toPayload())
     val now = System.currentTimeMillis()
-    val result = NativeCallEngine.startOutgoing(
-      mapOf(
-        "event" to "call-start",
-        "callId" to "call_${now}_${java.util.UUID.randomUUID().toString().take(8)}",
-        "callType" to if (callType == "video") "video" else "voice",
-        "toUserId" to targetUserId,
-        "toUserName" to row.title,
-        "toUserImage" to (row.avatarUri ?: ""),
-        "chatId" to row.chatId,
-      ),
+    val payload = mapOf(
+      "event" to "call-start",
+      "callId" to "call_${now}_${java.util.UUID.randomUUID().toString().take(8)}",
+      "callType" to if (callType == "video") "video" else "voice",
+      "toUserId" to targetUserId,
+      "toUserName" to row.title,
+      "toUserImage" to (row.avatarUri ?: ""),
+      "chatId" to row.chatId,
     )
+    val result = NativeCallEngine.startOutgoing(payload)
+    NativeCallActivity.startOutgoing(this, payload, result)
     val accepted = result["signalingAccepted"] as? Boolean ?: true
-    Toast.makeText(
-      this,
-      if (accepted) "Calling..." else "Could not start call.",
-      Toast.LENGTH_SHORT,
-    ).show()
+    if (!accepted) {
+      Toast.makeText(this, "Could not start call.", Toast.LENGTH_SHORT).show()
+    }
   }
 
   private fun hasCallPermissions(callType: String): Boolean {

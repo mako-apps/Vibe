@@ -183,7 +183,12 @@ internal object NativeCallEngine {
       callPayload["signalingQueued"] = signal["queued"] ?: false
       callPayload["signalingRef"] = signal["ref"]
       recordSignalingEvent(callPayload, defaultEvent = "call-start", defaultDirection = "outbound")
-      transition("starting", callPayload, "outgoing", signalingNote(signal, "Outgoing call routed through native signaling."))
+      transition(
+        if (boolValue(signal["accepted"])) "ringing" else "failed",
+        callPayload,
+        "outgoing",
+        signalingNote(signal, "Outgoing call routed through native signaling."),
+      )
     }
 
   fun acceptIncoming(payload: Map<String, Any?>): Map<String, Any?> =
@@ -198,7 +203,14 @@ internal object NativeCallEngine {
       callPayload["signalingQueued"] = signal["queued"] ?: false
       callPayload["signalingRef"] = signal["ref"]
       recordSignalingEvent(callPayload, defaultEvent = "call-accepted", defaultDirection = "outbound")
-      transition("accepting", callPayload, "incoming", signalingNote(signal, "Incoming call accepted through native signaling."))
+      transition("connecting", callPayload, "incoming", signalingNote(signal, "Incoming call accepted through native signaling."))
+    }
+
+  fun failCall(payload: Map<String, Any?>, reason: String): Map<String, Any?> =
+    run {
+      val callPayload = preparedCallPayload(payload, event = "call-failed", direction = "local").toMutableMap()
+      callPayload["failureReason"] = reason
+      transition("failed", callPayload, payload["direction"]?.toString(), reason)
     }
 
   fun handleSignal(payload: Map<String, Any?>): Map<String, Any?> =
@@ -314,12 +326,38 @@ internal object NativeCallEngine {
       state["callId"] = payload["callId"] ?: payload["call_id"]
       state["callType"] = payload["callType"] ?: payload["call_type"]
       if (direction != null) state["direction"] = direction
+      passthroughKeys.forEach { key ->
+        if (payload.containsKey(key)) state[key] = payload[key]
+      }
       state["updatedAt"] = System.currentTimeMillis()
       state["note"] = note
       Log.d("VibeNativeCall", "Engine.transition state=$nextState callId=${state["callId"]} type=${state["callType"]}")
       return LinkedHashMap(state)
     }
   }
+
+  private val passthroughKeys = listOf(
+    "toUserId",
+    "to_user_id",
+    "toUserName",
+    "to_user_name",
+    "toUserImage",
+    "to_user_image",
+    "fromUserId",
+    "from_user_id",
+    "fromUserName",
+    "from_user_name",
+    "fromUserImage",
+    "from_user_image",
+    "remoteUserId",
+    "remote_user_id",
+    "chatId",
+    "chat_id",
+    "signalingAccepted",
+    "signalingQueued",
+    "signalingRef",
+    "failureReason",
+  )
 
   private fun finishTurnRefreshError(error: String) {
     synchronized(state) {

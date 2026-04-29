@@ -1,6 +1,313 @@
-import ExpoModulesCore
+import SwiftUI
 import UIKit
 import AVFoundation
+
+@MainActor
+private final class NativeProfileAvatarModel: ObservableObject {
+  @Published var fallbackText: String = "U"
+  @Published var loadedImage: UIImage?
+  @Published var expandedSize: CGFloat = 100.0
+  @Published var collapsedSize: CGFloat = 40.0
+  @Published var expandedTopInset: CGFloat = 0.0
+  @Published var collapsedTopInset: CGFloat = 0.0
+  @Published var scrollOffset: CGFloat = 0.0
+  @Published var islandCoverColor: UIColor = UIColor(red: 0.071, green: 0.071, blue: 0.075, alpha: 1.0)
+  @Published var fallbackBackgroundColor: UIColor = UIColor(
+    red: 222 / 255,
+    green: 230 / 255,
+    blue: 243 / 255,
+    alpha: 1.0
+  )
+  @Published var fallbackIconTintColor: UIColor = UIColor.darkText
+
+  private var imageUri: String?
+  private var imageTask: Task<Void, Never>?
+
+  deinit {
+    imageTask?.cancel()
+  }
+
+  func setImageUri(_ value: String?) {
+    let normalizedValue = value?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .nilIfEmpty
+
+    guard normalizedValue != imageUri else { return }
+    imageUri = normalizedValue
+    imageTask?.cancel()
+
+    guard let normalizedValue else {
+      loadedImage = nil
+      return
+    }
+
+    imageTask = Task { [weak self] in
+      let image = await NativeProfileAvatarImageLoader.load(from: normalizedValue)
+      guard !Task.isCancelled else { return }
+
+      await MainActor.run {
+        guard let self, self.imageUri == normalizedValue else { return }
+        self.loadedImage = image
+      }
+    }
+  }
+}
+
+extension String {
+  fileprivate var nilIfEmpty: String? {
+    isEmpty ? nil : self
+  }
+}
+
+private enum NativeProfileAvatarImageLoader {
+  static func load(from rawValue: String?) async -> UIImage? {
+    guard let rawValue else { return nil }
+    let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !value.isEmpty else { return nil }
+
+    if value.hasPrefix("data:"), let commaIndex = value.firstIndex(of: ",") {
+      let base64 = String(value[value.index(after: commaIndex)...])
+      guard let data = Data(base64Encoded: base64, options: [.ignoreUnknownCharacters]) else {
+        return nil
+      }
+      return UIImage(data: data)
+    }
+
+    if let data = Data(base64Encoded: value, options: [.ignoreUnknownCharacters]) {
+      return UIImage(data: data)
+    }
+
+    if value.hasPrefix("/") {
+      return UIImage(contentsOfFile: value)
+    }
+
+    guard let url = URL(string: value) else { return nil }
+    if url.isFileURL {
+      return UIImage(contentsOfFile: url.path)
+    }
+
+    guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
+      return nil
+    }
+
+    do {
+      let (data, _) = try await URLSession.shared.data(from: url)
+      return UIImage(data: data)
+    } catch {
+      return nil
+    }
+  }
+}
+
+enum NativeProfileAvatarHeroMetrics {
+  static let topAdjust: CGFloat = 12
+  static let islandAnchor: CGFloat = 56
+  static let topOffset: CGFloat = 80
+  static let collapsedTopOffset: CGFloat = 25
+  static let expandedSize: CGFloat = 100
+  static let collapsedSize: CGFloat = 32
+  static let bottomSpacing: CGFloat = 20
+
+  static func expandedTop(for safeTop: CGFloat) -> CGFloat {
+    max(0, safeTop - islandAnchor - topAdjust) + topOffset
+  }
+
+  static func collapsedTop(for safeTop: CGFloat) -> CGFloat {
+    max(0, safeTop - 18 - collapsedTopOffset)
+  }
+
+  static func hostHeight(for safeTop: CGFloat) -> CGFloat {
+    expandedTop(for: safeTop) + expandedSize + bottomSpacing
+  }
+}
+
+private struct NativeProfileAvatarContentView: View {
+  @ObservedObject var model: NativeProfileAvatarModel
+
+  var body: some View {
+    NativeProfileAvatarLegacyView(model: model)
+  }
+}
+
+private struct NativeProfileAvatarInnerContent: View {
+  let image: UIImage?
+  let fallbackIconTintColor: UIColor
+  let fallbackBackgroundColor: UIColor
+  let size: CGFloat
+
+  private var inset: CGFloat {
+    max(2.0, size * 0.06)
+  }
+
+  var body: some View {
+    ZStack {
+      Circle()
+        .fill(Color(uiColor: fallbackBackgroundColor))
+
+      Group {
+        if let image {
+          Image(uiImage: image)
+            .resizable()
+            .scaledToFill()
+        } else {
+          Image(systemName: "person.fill")
+            .resizable()
+            .scaledToFit()
+            .frame(width: max(14.0, size * 0.34), height: max(14.0, size * 0.34))
+            .foregroundStyle(Color(uiColor: fallbackIconTintColor))
+        }
+      }
+      .padding(inset)
+      .clipShape(Circle())
+    }
+    .frame(width: size, height: size)
+    .clipShape(Circle())
+  }
+}
+
+private struct NativeProfileAvatarLegacyView: View {
+  @ObservedObject var model: NativeProfileAvatarModel
+
+  private var progress: CGFloat {
+    let travelDistance = max(1.0, model.expandedTopInset - model.collapsedTopInset)
+    return max(0.0, min(1.0, model.scrollOffset / travelDistance))
+  }
+
+  private var currentSize: CGFloat {
+    model.expandedSize + ((model.collapsedSize - model.expandedSize) * progress)
+  }
+
+  private var currentTopInset: CGFloat {
+    model.expandedTopInset + ((model.collapsedTopInset - model.expandedTopInset) * progress)
+  }
+
+  var body: some View {
+    NativeProfileAvatarInnerContent(
+      image: model.loadedImage,
+      fallbackIconTintColor: model.fallbackIconTintColor,
+      fallbackBackgroundColor: model.fallbackBackgroundColor,
+      size: currentSize
+    )
+    .padding(.top, currentTopInset)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+  }
+}
+
+final class NativeProfileAvatarView: UIView {
+  private let model = NativeProfileAvatarModel()
+  private let hostingController: UIHostingController<AnyView>
+  private var isHostingControllerAttached = false
+
+  override init(frame: CGRect) {
+    hostingController = UIHostingController(
+      rootView: AnyView(NativeProfileAvatarContentView(model: model))
+    )
+    super.init(frame: frame)
+
+    backgroundColor = .clear
+    clipsToBounds = false
+
+    if #available(iOS 16.4, *) {
+      hostingController.safeAreaRegions = []
+    }
+
+    let hostedView = hostingController.view!
+    hostedView.translatesAutoresizingMaskIntoConstraints = false
+    hostedView.backgroundColor = .clear
+    hostedView.clipsToBounds = false
+    addSubview(hostedView)
+
+    NSLayoutConstraint.activate([
+      hostedView.leadingAnchor.constraint(equalTo: leadingAnchor),
+      hostedView.trailingAnchor.constraint(equalTo: trailingAnchor),
+      hostedView.topAnchor.constraint(equalTo: topAnchor),
+      hostedView.bottomAnchor.constraint(equalTo: bottomAnchor),
+    ])
+  }
+
+  required init?(coder: NSCoder) {
+    return nil
+  }
+
+  override func didMoveToWindow() {
+    super.didMoveToWindow()
+    if window != nil, !isHostingControllerAttached {
+      if let parentVC = findNearestViewController() {
+        parentVC.addChild(hostingController)
+        hostingController.didMove(toParent: parentVC)
+        isHostingControllerAttached = true
+      }
+    } else if window == nil, isHostingControllerAttached {
+      hostingController.willMove(toParent: nil)
+      hostingController.removeFromParent()
+      isHostingControllerAttached = false
+    }
+  }
+
+  private func findNearestViewController() -> UIViewController? {
+    var responder: UIResponder? = self
+    while let next = responder?.next {
+      if let vc = next as? UIViewController {
+        return vc
+      }
+      responder = next
+    }
+    return nil
+  }
+
+  func setImageUri(_ value: String?) {
+    model.setImageUri(value)
+  }
+
+  func setFallbackText(_ value: String?) {
+    let nextValue =
+      (value?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? value : "U") ?? "U"
+    guard model.fallbackText != nextValue else { return }
+    model.fallbackText = nextValue
+  }
+
+  func setExpandedSize(_ value: CGFloat?) {
+    let resolved = max(1.0, value ?? 100.0)
+    guard model.expandedSize != resolved else { return }
+    model.expandedSize = resolved
+  }
+
+  func setCollapsedSize(_ value: CGFloat?) {
+    let resolved = max(1.0, value ?? 40.0)
+    guard model.collapsedSize != resolved else { return }
+    model.collapsedSize = resolved
+  }
+
+  func setExpandedTopInset(_ value: CGFloat?) {
+    let resolved = max(0.0, value ?? 0.0)
+    guard model.expandedTopInset != resolved else { return }
+    model.expandedTopInset = resolved
+  }
+
+  func setCollapsedTopInset(_ value: CGFloat?) {
+    let resolved = max(0.0, value ?? 0.0)
+    guard model.collapsedTopInset != resolved else { return }
+    model.collapsedTopInset = resolved
+  }
+
+  func setScrollOffset(_ value: CGFloat?) {
+    let resolved = max(0.0, value ?? 0.0)
+    guard model.scrollOffset != resolved else { return }
+    model.scrollOffset = resolved
+  }
+
+  func setIslandCoverUIColor(_ value: UIColor) {
+    model.islandCoverColor = value
+  }
+
+  func setFallbackBackgroundUIColor(_ value: UIColor) {
+    model.fallbackBackgroundColor = value
+  }
+
+  func setFallbackIconTintUIColor(_ value: UIColor) {
+    model.fallbackIconTintColor = value
+  }
+}
 
 private struct ChatProfileRow {
   let messageId: String
@@ -720,9 +1027,9 @@ private final class ChatProfileVoiceContentCell: UITableViewCell, VoicePlayableC
   }
 }
 
-final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDelegate {
-  public var onViewportChanged = EventDispatcher()
-  public var onNativeEvent = EventDispatcher()
+final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDelegate {
+  public var onViewportChanged = NativeEventDispatcher()
+  public var onNativeEvent = NativeEventDispatcher()
 
   @objc public var surfaceId: String = ""
 
@@ -806,15 +1113,19 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
     return formatter
   }()
 
-  required init(appContext: AppContext? = nil) {
-    floatingAvatarView = NativeProfileAvatarView(appContext: appContext)
-    super.init(appContext: appContext)
+  override init(frame: CGRect) {
+    floatingAvatarView = NativeProfileAvatarView()
+    super.init(frame: frame)
     configureView()
     applyTheme()
     rebuildDerivedContent()
     reloadHeaderText()
     refreshHeroContent()
     rebuildMenu()
+  }
+
+  required init?(coder: NSCoder) {
+    return nil
   }
 
   override func safeAreaInsetsDidChange() {
@@ -1427,7 +1738,7 @@ final class ChatProfileMainView: ExpoView, UITableViewDataSource, UITableViewDel
   }
 
   private func resolvedAvatarUri() -> String? {
-    return ChatNativeAvatarURLResolver.resolve(
+    return ChatAvatarURLResolver.resolve(
       rawAvatar: avatarUri,
       peerUserId: enginePeerUserId,
       chatId: engineChatId,

@@ -7,6 +7,8 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
+import android.view.View
+import android.widget.FrameLayout
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -14,6 +16,7 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import com.mohammadshayani.vibe.chat.ChatEngine
 import com.mohammadshayani.vibe.chat.ChatMainView
+import com.mohammadshayani.vibe.chat.ChatProfileMainView
 import com.mohammadshayani.vibe.chat.NativeCallEngine
 import com.mohammadshayani.vibe.chat.NativeChatContext
 import com.mohammadshayani.vibe.home.ChatHomeListRow
@@ -50,13 +53,19 @@ class ConversationActivity : AppCompatActivity() {
   }
 
   private lateinit var chatView: ChatMainView
+  private lateinit var rootContainer: FrameLayout
+  private var profileView: ChatProfileMainView? = null
   private var chatId = ""
   private var conversationTitle = ""
   private var peerUserId = ""
   private var currentConfig: AppSessionConfig? = null
   private var isSavedMessages = false
   private var savedMessageIds: List<String> = emptyList()
+  private var currentRows: List<Map<String, Any?>> = emptyList()
   private var pendingCallPermissionType: String? = null
+  private var isProfileVisible = false
+  private val engineListenerId = "conversation-${System.identityHashCode(this)}"
+  @Volatile private var profileRowsRefreshInFlight = false
 
   override fun onCreate(savedInstanceState: Bundle?) {
     AppAppearanceController.applyStoredPreference(this)
@@ -84,7 +93,8 @@ class ConversationActivity : AppCompatActivity() {
     ChatEngine.configure(applicationContext, config.toPayload())
     NativeCallEngine.configure(applicationContext, config.toPayload())
 
-    chatView = ChatMainView(this, NativeChatContext(this)).apply {
+    val nativeContext = NativeChatContext(this)
+    chatView = ChatMainView(this, nativeContext).apply {
       setSurfaceId("standalone-$chatId")
       setEngineSurfaceId("standalone-engine-$chatId")
       setEngineChatId(chatId)
@@ -102,8 +112,8 @@ class ConversationActivity : AppCompatActivity() {
       setRows(emptyList())
       nativeEventSink = { payload ->
         when (payload["type"]) {
-          "headerBack" -> finish()
-          "headerAvatarPressed" -> chatView.setPage("profile", true)
+          "headerBack" -> if (isProfileVisible) hideProfileView() else finish()
+          "headerAvatarPressed" -> showProfileView()
           "headerAudioCallPressed" -> startNativeCall("voice")
           "headerVideoCallPressed" -> startNativeCall("video")
           "savedMessageSent" -> if (isSavedMessages) loadSavedMessages(config.userId)
@@ -111,8 +121,19 @@ class ConversationActivity : AppCompatActivity() {
         }
       }
     }
-    setContentView(chatView)
-    ViewCompat.setOnApplyWindowInsetsListener(chatView) { view, insets ->
+
+    rootContainer = FrameLayout(this).apply {
+      addView(
+        chatView,
+        FrameLayout.LayoutParams(
+          FrameLayout.LayoutParams.MATCH_PARENT,
+          FrameLayout.LayoutParams.MATCH_PARENT,
+        ),
+      )
+    }
+
+    setContentView(rootContainer)
+    ViewCompat.setOnApplyWindowInsetsListener(rootContainer) { view, insets ->
       val bars = insets.getInsets(WindowInsetsCompat.Type.navigationBars())
       view.setPadding(0, 0, 0, bars.bottom)
       insets
@@ -122,8 +143,126 @@ class ConversationActivity : AppCompatActivity() {
       loadCachedSavedMessages(config.userId)
       loadSavedMessages(config.userId)
     } else {
+      ChatEngine.setListener(engineListenerId) { _, changedChatId, _ ->
+        val changed = changedChatId?.trim().orEmpty()
+        if (changed.isBlank() || changed == chatId) {
+          refreshNormalChatRowsForProfile()
+        }
+      }
       ChatEngine.openChatChannel(mapOf("chatId" to chatId))
+      refreshNormalChatRowsForProfile()
     }
+  }
+
+  override fun onDestroy() {
+    ChatEngine.setListener(engineListenerId, null)
+    super.onDestroy()
+  }
+
+  private fun ChatProfileMainView.configureProfileSurface(
+    config: AppSessionConfig,
+    rows: List<Map<String, Any?>>,
+  ) {
+    setProfileOnly(true)
+    setSurfaceId("standalone-profile-$chatId")
+    setEngineSurfaceId("standalone-profile-engine-$chatId")
+    setEngineChatId(chatId)
+    setEngineMyUserId(config.userId)
+    setEnginePeerUserId(peerUserId)
+    setAppearance(buildNativeThemeSeed(this@ConversationActivity))
+    setHeaderTitle(conversationTitle)
+    setHeaderSubtitle(if (isSavedMessages) "Saved Messages" else peerUserId)
+    setProfileName(conversationTitle)
+    setProfileHandle(if (isSavedMessages) "Personal notes and media" else peerUserId)
+    setProfileBio("")
+    setIsGroupOrChannel(false)
+    setRows(rows)
+  }
+
+  private fun makeProfileView(config: AppSessionConfig): ChatProfileMainView {
+    profileView?.let { return it }
+
+    val nextProfileView = ChatProfileMainView(this, NativeChatContext(this)).apply {
+      configureProfileSurface(config, rows = currentRows)
+      visibility = View.GONE
+      alpha = 0f
+      nativeEventSink = { payload ->
+        when (payload["type"]) {
+          "headerBack" -> hideProfileView()
+          "headerAudioCallPressed" -> startNativeCall("voice")
+          "headerVideoCallPressed" -> startNativeCall("video")
+          "headerSearchPressed" -> {
+            hideProfileView()
+            chatView.openHeaderSearch()
+          }
+          "profileSharedItemPressed" -> {
+            val messageId = payload["messageId"]?.toString().orEmpty()
+            hideProfileView()
+            if (messageId.isNotBlank()) {
+              chatView.scrollToMessage(messageId, true, 0.5)
+            }
+          }
+          else -> Unit
+        }
+      }
+    }
+    rootContainer.addView(
+      nextProfileView,
+      FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams.MATCH_PARENT,
+        FrameLayout.LayoutParams.MATCH_PARENT,
+      ),
+    )
+    profileView = nextProfileView
+    return nextProfileView
+  }
+
+  private fun showProfileView() {
+    if (isProfileVisible) return
+    val config = currentConfig ?: AppSessionConfig.current(applicationContext) ?: return
+    val profileView = makeProfileView(config)
+    profileView.configureProfileSurface(config, rows = currentRows)
+    if (!isSavedMessages) {
+      refreshNormalChatRowsForProfile()
+    }
+    isProfileVisible = true
+    profileView.animate().cancel()
+    chatView.animate().cancel()
+    profileView.bringToFront()
+    profileView.visibility = View.VISIBLE
+    profileView.alpha = 1f
+    val width = rootContainer.width.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
+    profileView.translationX = width.toFloat()
+    profileView.animate()
+      .translationX(0f)
+      .setDuration(260L)
+      .start()
+  }
+
+  private fun hideProfileView() {
+    if (!isProfileVisible) return
+    val profileView = profileView ?: run {
+      isProfileVisible = false
+      return
+    }
+    isProfileVisible = false
+    profileView.animate().cancel()
+    chatView.animate().cancel()
+    val width = rootContainer.width.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
+    profileView.animate()
+      .translationX(width.toFloat())
+      .alpha(0.96f)
+      .setDuration(220L)
+      .withEndAction {
+        profileView.translationX = 0f
+        profileView.alpha = 0f
+        profileView.visibility = View.GONE
+        rootContainer.removeView(profileView)
+        if (this.profileView === profileView) {
+          this.profileView = null
+        }
+      }
+      .start()
   }
 
   private fun startNativeCall(callType: String) {
@@ -144,26 +283,35 @@ class ConversationActivity : AppCompatActivity() {
 
     NativeCallEngine.configure(applicationContext, config.toPayload())
     val now = System.currentTimeMillis()
-    val result = NativeCallEngine.startOutgoing(
-      mapOf(
-        "event" to "call-start",
-        "callId" to "call_${now}_${java.util.UUID.randomUUID().toString().take(8)}",
-        "callType" to if (callType == "video") "video" else "voice",
-        "toUserId" to targetUserId,
-        "toUserName" to conversationTitle,
-        "chatId" to chatId,
-      ),
+    val payload = mapOf(
+      "event" to "call-start",
+      "callId" to "call_${now}_${java.util.UUID.randomUUID().toString().take(8)}",
+      "callType" to if (callType == "video") "video" else "voice",
+      "toUserId" to targetUserId,
+      "toUserName" to conversationTitle,
+      "chatId" to chatId,
     )
+    val result = NativeCallEngine.startOutgoing(payload)
+    NativeCallActivity.startOutgoing(this, payload, result)
     val accepted = result["signalingAccepted"] as? Boolean ?: true
-    Toast.makeText(
-      this,
-      if (accepted) {
-        if (callType == "video") "Starting video call..." else "Calling..."
-      } else {
-        "Could not start call."
-      },
-      Toast.LENGTH_SHORT,
-    ).show()
+    if (!accepted) {
+      Toast.makeText(this, "Could not start call.", Toast.LENGTH_SHORT).show()
+    }
+  }
+
+  private fun refreshNormalChatRowsForProfile() {
+    if (isSavedMessages || profileRowsRefreshInFlight) return
+    profileRowsRefreshInFlight = true
+    Thread {
+      val rows = ChatEngine.getChatRows(mapOf("chatId" to chatId))
+      runOnUiThread {
+        profileRowsRefreshInFlight = false
+        if (rows.isNotEmpty()) {
+          currentRows = rows
+          profileView?.setRows(rows)
+        }
+      }
+    }.start()
   }
 
   private fun hasCallPermissions(callType: String): Boolean {
@@ -200,8 +348,10 @@ class ConversationActivity : AppCompatActivity() {
 
   private fun loadCachedSavedMessages(userId: String) {
     val rows = cachedSavedRows(userId) ?: return
+    currentRows = rows
     savedMessageIds = rows.mapNotNull { savedMessageIdFromRow(it) }
     chatView.setRows(rows)
+    profileView?.setRows(rows)
     Log.i("ConversationActivity", "loaded cached saved messages rows=${rows.size}")
   }
 
@@ -215,8 +365,10 @@ class ConversationActivity : AppCompatActivity() {
           .sortedBy { savedMessageTimestampMs(it) }
           .mapIndexed { index, message -> savedMessageRow(index, message, userId) }
       runOnUiThread {
+        currentRows = rows
         savedMessageIds = rows.mapNotNull { savedMessageIdFromRow(it) }
         chatView.setRows(rows)
+        profileView?.setRows(rows)
         cacheSavedRows(userId, rows)
         Log.i("ConversationActivity", "loaded remote saved messages rows=${rows.size} success=${result["success"]}")
       }
@@ -236,7 +388,9 @@ class ConversationActivity : AppCompatActivity() {
 
   private fun clearSavedMessages(userId: String, ids: List<String>) {
     savedMessageIds = emptyList()
+    currentRows = emptyList()
     chatView.setRows(emptyList())
+    profileView?.setRows(emptyList())
     Thread {
       var successCount = 0
       ids.forEach { id ->

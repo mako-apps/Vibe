@@ -3164,7 +3164,7 @@ final class ChatEngine {
 
     return syncOnQueue {
       _ = restoreCachedHistoryRowsLocked(chatId: chatId)
-      let rows = historyRowsByChat[chatId] ?? []
+      let rows = mergedChatRowsLocked(chatId: chatId)
       var totalMessages = 0
       var mediaCount = 0
       var fileCount = 0
@@ -3266,7 +3266,7 @@ final class ChatEngine {
     guard let chatId else { return [] }
     return syncOnQueue {
       _ = restoreCachedHistoryRowsLocked(chatId: chatId)
-      return historyRowsByChat[chatId] ?? []
+      return mergedChatRowsLocked(chatId: chatId)
     }
   }
 
@@ -4867,6 +4867,10 @@ final class ChatEngine {
   }
 
   private func parseLongValue(_ value: Any?) -> Int64? {
+    if let n = value as? Int64 { return n }
+    if let n = value as? Int { return Int64(n) }
+    if let n = value as? Double, n.isFinite { return Int64(n) }
+    if let n = value as? Float, n.isFinite { return Int64(n) }
     if let n = value as? NSNumber { return n.int64Value }
     if let s = value as? String { return Int64(s) }
     return nil
@@ -4996,6 +5000,12 @@ final class ChatEngine {
     return (message["isMe"] as? Bool) == true
   }
 
+  private func messageTimestampMs(fromRow row: [String: Any]) -> Int64 {
+    guard let message = row["message"] as? [String: Any] else { return 0 }
+    return parseLongValue(message["timestampMs"] ?? message["timestamp_ms"] ?? message["timestamp"])
+      ?? 0
+  }
+
   private func bubbleShapePayload(
     isMe: Bool,
     isSequenceStart: Bool,
@@ -5048,6 +5058,48 @@ final class ChatEngine {
     return patchedRows
   }
 
+  private func mergedChatRowsLocked(chatId: String) -> [[String: Any]] {
+    let historyRows = historyRowsByChat[chatId] ?? []
+    let liveRows = liveMessageRowsByChat[chatId] ?? [:]
+    let deletedIds = deletedMessageIdsByChat[chatId] ?? []
+    guard !historyRows.isEmpty || !liveRows.isEmpty else { return [] }
+
+    var mergedById: [String: [String: Any]] = [:]
+    var rowsWithoutIds: [[String: Any]] = []
+    for row in historyRows {
+      guard let messageId = messageId(fromRow: row) else {
+        rowsWithoutIds.append(row)
+        continue
+      }
+      guard !deletedIds.contains(messageId) else { continue }
+      mergedById[messageId] = liveRows[messageId] ?? row
+    }
+
+    for (messageId, row) in liveRows {
+      guard !deletedIds.contains(messageId), mergedById[messageId] == nil else { continue }
+      mergedById[messageId] = row
+    }
+
+    var mergedRows = Array(mergedById.values)
+    mergedRows.sort { lhs, rhs in
+      let lt = messageTimestampMs(fromRow: lhs)
+      let rt = messageTimestampMs(fromRow: rhs)
+      if lt == rt {
+        return (messageId(fromRow: lhs) ?? "") < (messageId(fromRow: rhs) ?? "")
+      }
+      return lt < rt
+    }
+    mergedRows.insert(contentsOf: rowsWithoutIds, at: 0)
+    return rowsByApplyingBubbleSequenceShapes(mergedRows)
+  }
+
+  private func storeMergedChatHistoryIfLoadedLocked(chatId: String) {
+    guard historyFullyLoadedChats.contains(chatId) else { return }
+    let rows = mergedChatRowsLocked(chatId: chatId)
+    guard !rows.isEmpty else { return }
+    storeCachedHistoryRowsLocked(chatId: chatId, rows: rows)
+  }
+
   private func upsertLiveMessageRowLocked(chatId: String, messageId: String, row: [String: Any]) {
     var perChat = liveMessageRowsByChat[chatId] ?? [:]
     perChat[messageId] = row
@@ -5060,6 +5112,7 @@ final class ChatEngine {
         deletedMessageIdsByChat[chatId] = deleted
       }
     }
+    storeMergedChatHistoryIfLoadedLocked(chatId: chatId)
   }
 
   private func mutateLiveMessagePayloadLocked(
@@ -5156,6 +5209,7 @@ final class ChatEngine {
     var deleted = deletedMessageIdsByChat[chatId] ?? Set<String>()
     deleted.insert(messageId)
     deletedMessageIdsByChat[chatId] = deleted
+    storeMergedChatHistoryIfLoadedLocked(chatId: chatId)
   }
 
   private func findMessagePayloadLocked(chatId: String, messageId: String) -> [String: Any]? {
@@ -6746,7 +6800,7 @@ final class ChatEngine {
     historyRowsByChat[chatId] = rows
     historyFullyLoadedChats.insert(chatId)
     historyRowsRestoredFromCacheChats.remove(chatId)
-    storeCachedHistoryRowsLocked(chatId: chatId, rows: rows)
+    storeMergedChatHistoryIfLoadedLocked(chatId: chatId)
     state["updatedAt"] = nowMs()
     appendJournalLocked(
       event: "native-chat-history-load-ok",
@@ -6787,7 +6841,7 @@ final class ChatEngine {
     historyRowsByChat[chatId] = rows
     historyFullyLoadedChats.insert(chatId)
     historyRowsRestoredFromCacheChats.remove(chatId)
-    storeCachedHistoryRowsLocked(chatId: chatId, rows: rows)
+    storeMergedChatHistoryIfLoadedLocked(chatId: chatId)
     state["updatedAt"] = nowMs()
     appendJournalLocked(
       event: "native-chat-history-load-ok",

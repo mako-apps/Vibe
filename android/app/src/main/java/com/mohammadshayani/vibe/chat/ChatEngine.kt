@@ -11,6 +11,7 @@ import com.mohammadshayani.vibe.chat.notifications.VibeNativeCallStore
 import com.mohammadshayani.vibe.packet.PacketRuntime
 import com.mohammadshayani.vibe.session.AppSessionConfig
 import com.mohammadshayani.vibe.storage.ChatEngineStore
+import com.mohammadshayani.vibe.ui.NativeCallActivity
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -4713,9 +4714,21 @@ internal object ChatEngine {
     when (event) {
       "call-end" -> {
         callPayload["remote"] = true
-        NativeCallEngine.endCall(callPayload)
+        val status = NativeCallEngine.endCall(callPayload)
+        NativeCallActivity.applyEngineState(status)
       }
-      else -> NativeCallEngine.handleSignal(callPayload)
+      "call-start" -> {
+        val status = NativeCallEngine.handleSignal(callPayload)
+        appContextRef?.let { context ->
+          Handler(Looper.getMainLooper()).post {
+            NativeCallActivity.startIncoming(context, status)
+          }
+        }
+      }
+      else -> {
+        val status = NativeCallEngine.handleSignal(callPayload)
+        NativeCallActivity.applyEngineState(status)
+      }
     }
     emitChangeLocked("callSignalReceived", null, null)
     return true

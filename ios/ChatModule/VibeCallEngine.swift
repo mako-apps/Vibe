@@ -2,6 +2,7 @@ import Foundation
 
 public final class VibeNativeCallEngine {
   public static let shared = VibeNativeCallEngine()
+  public static let stateDidChangeNotification = Notification.Name("VibeNativeCallStateDidChange")
 
   private let queue = DispatchQueue(label: "vibe.native.call.engine")
   private let store = VibeNativeCallStore.shared
@@ -233,8 +234,9 @@ public final class VibeNativeCallEngine {
     callPayload["signalingQueued"] = signal["queued"] ?? false
     callPayload["signalingRef"] = signal["ref"] ?? NSNull()
     recordSignalingEvent(callPayload, defaultEvent: "call-start", defaultDirection: "outbound")
+    let accepted = boolValue(signal["accepted"])
     return transition(
-      stateValue: "starting",
+      stateValue: accepted ? "ringing" : "failed",
       payload: callPayload,
       direction: "outgoing",
       note: signalingNote(signal, fallback: "Outgoing call routed through native signaling.")
@@ -254,10 +256,21 @@ public final class VibeNativeCallEngine {
     callPayload["signalingRef"] = signal["ref"] ?? NSNull()
     recordSignalingEvent(callPayload, defaultEvent: "call-accepted", defaultDirection: "outbound")
     return transition(
-      stateValue: "accepting",
+      stateValue: "connecting",
       payload: callPayload,
       direction: "incoming",
       note: signalingNote(signal, fallback: "Incoming call accepted through native signaling.")
+    )
+  }
+
+  public func failCall(_ payload: [String: Any], reason: String) -> [String: Any] {
+    var callPayload = preparedCallPayload(payload, event: "call-failed", direction: "local")
+    callPayload["failureReason"] = reason
+    return transition(
+      stateValue: "failed",
+      payload: callPayload,
+      direction: normalizedString(payload["direction"]),
+      note: reason
     )
   }
 
@@ -374,12 +387,23 @@ public final class VibeNativeCallEngine {
     direction: String?,
     note: String
   ) -> [String: Any] {
-    queue.sync {
+    let nextState = queue.sync {
       var next = state
       next[Keys.state] = stateValue
       next[Keys.callId] = payload["callId"] ?? payload["call_id"]
       next[Keys.callType] = payload["callType"] ?? payload["call_type"]
       if let direction { next[Keys.direction] = direction }
+      let passthroughKeys = [
+        "toUserId", "to_user_id", "toUserName", "to_user_name", "toUserImage", "to_user_image",
+        "fromUserId", "from_user_id", "fromUserName", "from_user_name", "fromUserImage",
+        "from_user_image", "remoteUserId", "remote_user_id", "chatId", "chat_id",
+        "signalingAccepted", "signalingQueued", "signalingRef", "failureReason",
+      ]
+      for key in passthroughKeys {
+        if let value = payload[key] {
+          next[key] = value
+        }
+      }
       next[Keys.updatedAt] = Int(Date().timeIntervalSince1970 * 1000)
       next[Keys.note] = note
       state = next
@@ -391,6 +415,14 @@ public final class VibeNativeCallEngine {
       )
       return next
     }
+    DispatchQueue.main.async {
+      NotificationCenter.default.post(
+        name: Self.stateDidChangeNotification,
+        object: self,
+        userInfo: ["state": nextState]
+      )
+    }
+    return nextState
   }
 
   private func finishTurnRefreshError(_ error: String, at timestamp: Int) {

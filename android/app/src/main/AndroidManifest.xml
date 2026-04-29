@@ -21,6 +21,12 @@
     android:supportsRtl="true"
     android:theme="@style/Theme.Vibe">
     <activity
+      android:name=".ui.NativeCallActivity"
+      android:excludeFromRecents="true"
+      android:screenOrientation="portrait"
+      android:showWhenLocked="true"
+      android:turnScreenOn="true" />
+    <activity
       android:name=".ui.ConversationActivity"
       android:windowSoftInputMode="adjustResize" />
     <activity android:name=".ui.AppearanceSettingsActivity" />
