@@ -1,13 +1,12 @@
 name: Vibe
 options:
-  bundleIdPrefix: com.mohammadshayani
+  bundleIdPrefix: com.vibegram
 settings:
   base:
     SWIFT_VERSION: 5.10
     IPHONEOS_DEPLOYMENT_TARGET: 26.0
-    PRODUCT_BUNDLE_IDENTIFIER: com.mohammadshayani.vibe.native
+    PRODUCT_BUNDLE_IDENTIFIER: com.vibegram.app
     PRODUCT_NAME: Vibe
-    DEVELOPMENT_TEAM: BXY4DH6H7D
     CURRENT_PROJECT_VERSION: 1
     MARKETING_VERSION: 1.0.0
     SWIFT_OBJC_BRIDGING_HEADER: Sources/Packet/Packet-Bridging-Header.h
