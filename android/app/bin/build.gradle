@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-  namespace 'com.mohammadshayani.vibe'
+  namespace 'com.vibegram.app'
   compileSdk 35
 
   defaultConfig {
-    applicationId 'com.mohammadshayani.vibe'
+    applicationId 'com.vibegram.app'
     minSdk 26
     targetSdk 35
     versionCode 1
