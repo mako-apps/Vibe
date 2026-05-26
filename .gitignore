@@ -102,8 +102,8 @@ legacy/mobile-rn/modules/vibe-chat-native/android/.gradle/
 # Xcode user state and build artifacts
 *.xcuserstate
 *.xcuserdatad/
-ios/Vibe.xcodeproj/project.xcworkspace/xcuserdata/
-ios/Vibe.xcodeproj/xcuserdata/
+*.xcodeproj/
+.xcodeproj/
 DerivedData/
 build/
 .build/
