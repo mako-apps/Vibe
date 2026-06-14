@@ -18,6 +18,7 @@ struct ChatImageEditActionPayload {
 enum ChatImageEditModule {
   static func presentEditor(
     from presenter: UIViewController,
+    sourceView: UIView? = nil,
     messageId: String?,
     mediaURL: String,
     initialImage: UIImage?,
@@ -34,6 +35,14 @@ enum ChatImageEditModule {
       headerTitle: headerTitle,
       dismissPresenterOnSend: dismissPresenterOnSend
     )
+    if #available(iOS 18.0, *), let sourceView = sourceView {
+      let options = UIViewController.Transition.ZoomOptions()
+      controller.preferredTransition = .zoom(options: options) { _ in
+        return sourceView
+      }
+    } else {
+      controller.modalTransitionStyle = .crossDissolve
+    }
     controller.modalPresentationStyle = .overFullScreen
     controller.onAction = onAction
     presenter.present(controller, animated: true)

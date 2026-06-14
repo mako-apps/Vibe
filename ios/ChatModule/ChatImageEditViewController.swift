@@ -1033,3 +1033,32 @@ final class ChatImageEditViewController: UIViewController, UITextViewDelegate,
     return true
   }
 }
+
+import SwiftUI
+
+struct ChatImageEditSwiftUIView: UIViewControllerRepresentable {
+  let messageId: String?
+  let mediaURL: String
+  let initialImage: UIImage?
+  let initialCaption: String?
+  let headerTitle: String?
+  let dismissPresenterOnSend: Bool
+  var onAction: ((ChatImageEditActionPayload) -> Void)?
+
+  func makeUIViewController(context: Context) -> ChatImageEditViewController {
+    let vc = ChatImageEditViewController(
+      messageId: messageId,
+      mediaURL: mediaURL,
+      initialImage: initialImage,
+      initialCaption: initialCaption,
+      headerTitle: headerTitle,
+      dismissPresenterOnSend: dismissPresenterOnSend
+    )
+    vc.onAction = onAction
+    return vc
+  }
+
+  func updateUIViewController(_ uiViewController: ChatImageEditViewController, context: Context) {
+    // No dynamic updates required for this standalone editor
+  }
+}

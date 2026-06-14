@@ -5344,6 +5344,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     mediaImageView.image
   }
 
+  func currentMediaImageView() -> UIImageView? {
+    mediaImageView
+  }
+
   func setInlineVideoPlaybackActive(_ active: Bool) {
     guard mediaVideoPlaybackActive != active else { return }
     mediaVideoPlaybackActive = active
@@ -8191,8 +8195,13 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     format.opaque = false
     format.scale = UIScreen.main.scale
     let renderer = UIGraphicsImageRenderer(size: captureRect.size, format: format)
-    let image = renderer.image { _ in
-      contentView.drawHierarchy(
+    let image = renderer.image { context in
+      // drawHierarchy fails (returns false, leaving the image fully
+      // transparent) when the cell hasn't been committed to the screen yet —
+      // e.g. the very first message in a chat, where the transition starts
+      // right after the initial reloadData. Fall back to layer.render so the
+      // bubble plate is never blank during the send morph.
+      let drewHierarchy = contentView.drawHierarchy(
         in: CGRect(
           x: -captureRect.minX,
           y: -captureRect.minY,
@@ -8201,6 +8210,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         ),
         afterScreenUpdates: true
       )
+      if !drewHierarchy {
+        context.cgContext.translateBy(x: -captureRect.minX, y: -captureRect.minY)
+        contentView.layer.render(in: context.cgContext)
+      }
     }
     let imageView = UIImageView(image: image)
     imageView.frame = contentView.convert(captureRect, to: view)

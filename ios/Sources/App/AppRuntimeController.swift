@@ -818,7 +818,10 @@ enum AppRootControllerFactory {
   }
 
   static func makeAuthenticatedController() -> UIViewController {
-    UIHostingController(rootView: AppRootView())
+    // Native UIKit tab shell. The chats tab is a real UINavigationController so
+    // the conversation pushes natively with its own header and the tab bar
+    // slides away; the other tabs host their SwiftUI pages.
+    AppRootTabBarController()
   }
 
   static func makeWelcomeController() -> UIViewController {

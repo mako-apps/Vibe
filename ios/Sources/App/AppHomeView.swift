@@ -1,6 +1,8 @@
 import SwiftUI
 import UIKit
+import WebKit
 import OSLog
+import Combine
 
 enum AppUITrace {
   static let subsystem = "com.mohammadshayani.vibe.native"
@@ -225,7 +227,7 @@ struct PresentedChatProfileRoute: Identifiable, Hashable {
   var id: Int { requestID }
 }
 
-private enum AppChatNavigationAction {
+enum AppChatNavigationAction {
   case avatar
 }
 
@@ -467,6 +469,7 @@ private final class VibeNativeCallOverlayModel: ObservableObject {
     }
     scheduleTimeoutIfNeeded()
   }
+
 
   func cancelTimers() {
     timeoutWork?.cancel()
@@ -733,255 +736,73 @@ private final class VibeNativeCallOverlayController: UIHostingController<VibeNat
 
 @MainActor
 final class AppShellCoordinator: ObservableObject {
+  // Per-tab SwiftUI navigation paths. Contacts / Calls / Settings stay pure
+  // SwiftUI pages hosted in UIHostingControllers and keep their own in-page
+  // navigation through these stacks. The chat list/conversation is NOT here:
+  // it lives in a real UIKit UINavigationController (chatsNavigationController),
+  // so opening a chat is a native push with a stable, self-owned header.
+  @Published var contactsPath: [AppRoute] = []
+  @Published var callsPath: [AppRoute] = []
+  @Published var settingsPath: [AppRoute] = []
+  // Mirror of the active tab so SwiftUI pages that read it (the chat home's
+  // search trigger, Settings) stay in sync with the UIKit tab bar.
   @Published var selectedTab: AppShellTab = .chats
-  @Published var presentedChat: PresentedChatRoute?
-  @Published var presentedChatProfile: PresentedChatProfileRoute?
-  @Published var chatOpenRequestID: Int = 0
-  @Published var chatProfileOpenRequestID: Int = 0
+  // Bumped to ask the chat home to present the contact-search sheet.
   @Published var chatSearchPresentationRequestID: Int = 0
-  private weak var activeChatController: ChatConversationController?
-  private var activeChatControllerRequestID: Int?
+
+  // UIKit handles, set by AppRootTabBarController.
+  weak var tabBarController: UITabBarController?
+  weak var chatsNavigationController: UINavigationController?
+
+  /// Select a tab in both our mirror and the UIKit tab bar.
+  func selectTab(_ tab: AppShellTab) {
+    if selectedTab != tab {
+      selectedTab = tab
+    }
+    guard let index = AppRootTabBarController.tabIndex(for: tab),
+      let tabBarController, tabBarController.selectedIndex != index
+    else { return }
+    tabBarController.selectedIndex = index
+  }
 
   func openChat(_ route: ChatRoute) {
-    if let presentedChat, presentedChat.route == route {
-      appShellRouteLog(
-        "openChat ignored duplicate requestId=\(presentedChat.requestID) chatId=\(route.chatId) title=\(route.title)")
+    appShellRouteLog(
+      "openChat requested chatId=\(route.chatId) title=\(route.title) fromTab=\(selectedTab)")
+    guard let nav = chatsNavigationController else {
+      appShellRouteLog("openChat skipped: no chats navigation controller")
       return
     }
-
-    chatOpenRequestID &+= 1
-    let requestID = chatOpenRequestID
-    appShellRouteLog(
-      "openChat requested requestId=\(requestID) chatId=\(route.chatId) title=\(route.title) fromTab=\(selectedTab)")
-    let presented = PresentedChatRoute(requestID: requestID, route: route)
-    presentedChat = presented
+    selectTab(.chats)
+    if let top = nav.topViewController as? ChatConversationController, top.chatId == route.chatId {
+      appShellRouteLog("openChat ignored duplicate chatId=\(route.chatId)")
+      return
+    }
+    let isDark = nav.traitCollection.userInterfaceStyle == .dark
+    let controller = ChatConversationController(
+      route: route,
+      isDark: isDark,
+      onClose: { [weak nav] in
+        guard let nav, nav.viewControllers.count > 1 else { return }
+        nav.popViewController(animated: true)
+      }
+    )
+    // Slides the tab bar away natively while the conversation is on screen.
+    controller.hidesBottomBarWhenPushed = true
+    nav.pushViewController(controller, animated: true)
   }
 
+  /// Pop back to the chat list. Native back/swipe handle the common case; this
+  /// supports programmatic closes.
   func closePresentedChat(requestID: Int? = nil) {
-    guard let presentedChat else { return }
-    if let requestID, presentedChat.requestID != requestID {
-      return
-    }
-    appShellRouteLog(
-      "closeChat requested requestId=\(presentedChat.requestID) chatId=\(presentedChat.route.chatId) title=\(presentedChat.route.title)")
-    if presentedChatProfile?.route == presentedChat.route {
-      presentedChatProfile = nil
-    }
-    if activeChatControllerRequestID == presentedChat.requestID {
-      activeChatController = nil
-      activeChatControllerRequestID = nil
-    }
-    self.presentedChat = nil
-  }
-
-  func openPresentedChatProfile(_ presented: PresentedChatRoute) {
-    guard presented.route.chatId != "saved_messages" else { return }
-    chatProfileOpenRequestID &+= 1
-    let requestID = chatProfileOpenRequestID
-    appShellRouteLog(
-      "openChatProfile requested requestId=\(requestID) chatRequestId=\(presented.requestID) chatId=\(presented.route.chatId) title=\(presented.route.title)"
-    )
-    presentedChatProfile = PresentedChatProfileRoute(requestID: requestID, route: presented.route)
-  }
-
-  func closePresentedChatProfile(requestID: Int? = nil) {
-    guard let presentedChatProfile else { return }
-    if let requestID, presentedChatProfile.requestID != requestID {
-      return
-    }
-    appShellRouteLog(
-      "closeChatProfile requested requestId=\(presentedChatProfile.requestID) chatId=\(presentedChatProfile.route.chatId)"
-    )
-    self.presentedChatProfile = nil
-  }
-
-  fileprivate func bindPresentedChatController(
-    _ controller: ChatConversationController,
-    requestID: Int
-  ) {
-    guard presentedChat?.requestID == requestID else { return }
-    activeChatController = controller
-    activeChatControllerRequestID = requestID
-  }
-
-  fileprivate func performPresentedChatNavigationAction(
-    _ action: AppChatNavigationAction,
-    requestID: Int
-  ) {
-    guard presentedChat?.requestID == requestID,
-      activeChatControllerRequestID == requestID,
-      let activeChatController
-    else { return }
-    activeChatController.handleNavigationAction(action)
+    guard let nav = chatsNavigationController, nav.viewControllers.count > 1 else { return }
+    nav.popToRootViewController(animated: true)
   }
 
   func openChatSearch() {
     DispatchQueue.main.async { [weak self] in
-      self?.selectedTab = .chats
+      self?.selectTab(.chats)
       self?.chatSearchPresentationRequestID &+= 1
     }
-  }
-}
-
-private struct ChatConversationRootHost: UIViewControllerRepresentable {
-  let presented: PresentedChatRoute
-  let isDark: Bool
-  let coordinator: AppShellCoordinator
-
-  func makeUIViewController(context: Context) -> ChatConversationController {
-    appShellRouteLog(
-      "ChatConversationRootHost make requestId=\(presented.requestID) chatId=\(presented.route.chatId)")
-    let controller = ChatConversationController(
-      route: presented.route,
-      isDark: isDark,
-      onClose: {
-        coordinator.closePresentedChat(requestID: presented.requestID)
-      }
-    )
-    coordinator.bindPresentedChatController(controller, requestID: presented.requestID)
-    appShellRouteLog(
-      "ChatConversationRootHost made requestId=\(presented.requestID) chatId=\(presented.route.chatId)")
-    return controller
-  }
-
-  func updateUIViewController(_ controller: ChatConversationController, context: Context) {
-    // Skip updates if this route is no longer the active presentedChat.
-    // During the removal animation SwiftUI may call update one final time;
-    // allowing applyRoute to run at that point causes a main-thread deadlock
-    // because refreshHeaderState calls ChatEngine.shared.isTyping() which
-    // does queue.sync while the engine queue may be held by the previous
-    // closeChatChannel completing its postChangeLocked notification.
-    guard coordinator.presentedChat?.requestID == presented.requestID else {
-      let activePresentedId = coordinator.presentedChat?.requestID.description ?? "nil"
-      appShellRouteLog(
-        "ChatConversationRootHost update SKIPPED requestId=\(presented.requestID) chatId=\(presented.route.chatId) presentedRequestId=\(activePresentedId)")
-      return
-    }
-    appShellRouteLog(
-      "ChatConversationRootHost update requestId=\(presented.requestID) chatId=\(presented.route.chatId)")
-    coordinator.bindPresentedChatController(controller, requestID: presented.requestID)
-    controller.update(
-      route: presented.route,
-      isDark: isDark,
-      onClose: {
-        coordinator.closePresentedChat(requestID: presented.requestID)
-      }
-    )
-  }
-
-  static func dismantleUIViewController(
-    _ controller: ChatConversationController,
-    coordinator: ()
-  ) {
-    appShellRouteLog("ChatConversationRootHost dismantle")
-    controller.dismantle()
-  }
-}
-
-private struct ChatProfileRootHost: UIViewControllerRepresentable {
-  let presented: PresentedChatProfileRoute
-  let isDark: Bool
-  let coordinator: AppShellCoordinator
-
-  func makeUIViewController(context: Context) -> ChatProfileRootController {
-    appShellRouteLog(
-      "ChatProfileRootHost make requestId=\(presented.requestID) chatId=\(presented.route.chatId)")
-    return ChatProfileRootController(
-      route: presented.route,
-      isDark: isDark,
-      onClose: {
-        coordinator.closePresentedChatProfile(requestID: presented.requestID)
-      }
-    )
-  }
-
-  func updateUIViewController(_ controller: ChatProfileRootController, context: Context) {
-    guard coordinator.presentedChatProfile?.requestID == presented.requestID else { return }
-    controller.update(
-      route: presented.route,
-      isDark: isDark,
-      onClose: {
-        coordinator.closePresentedChatProfile(requestID: presented.requestID)
-      }
-    )
-  }
-}
-
-private struct ChatConversationNavigationDestinationModifier: ViewModifier {
-  @Environment(\.colorScheme) private var colorScheme
-  @EnvironmentObject private var coordinator: AppShellCoordinator
-  @AppStorage(AppThemePlateController.storageKey) private var themePlateRaw =
-    AppThemePlateOption.glacier.rawValue
-
-  private var palette: AppThemePalette {
-    AppThemePalette.resolve(
-      for: colorScheme,
-      plate: AppThemePlateOption(rawValue: themePlateRaw) ?? .glacier
-    )
-  }
-
-  func body(content: Content) -> some View {
-    content
-      .modifier(
-        ChatConversationChromeSuppressionModifier(
-          isPresented: coordinator.presentedChat != nil
-        )
-      )
-      .navigationDestination(item: $coordinator.presentedChat) { presented in
-        ChatConversationRootHost(
-          presented: presented,
-          isDark: colorScheme == .dark,
-          coordinator: coordinator
-        )
-        .id(presented.requestID)
-        .background(palette.background.ignoresSafeArea())
-        .ignoresSafeArea(.container, edges: [.top, .bottom])
-        .ignoresSafeArea(.keyboard, edges: .bottom)
-        .navigationTitle("")
-        .navigationBarTitleDisplayMode(.inline)
-        .navigationBarBackButtonHidden(true)
-        .tint(palette.text)
-        .toolbar(.hidden, for: .tabBar)
-        .toolbarBackground(.hidden, for: .navigationBar)
-        .toolbar {
-          ToolbarItem(placement: .topBarLeading) {
-            AppChatNavigationBackButton(
-              unreadCount: presented.route.unreadCount,
-              palette: palette
-            ) {
-              coordinator.closePresentedChat(requestID: presented.requestID)
-            }
-          }
-          ToolbarItem(placement: .principal) {
-            AppChatNavigationHeaderView(route: presented.route, palette: palette)
-          }
-          ToolbarItem(placement: .topBarTrailing) {
-            AppChatNavigationAvatarButton(route: presented.route, palette: palette) {
-              coordinator.openPresentedChatProfile(presented)
-            }
-          }
-        }
-      }
-  }
-}
-
-private struct ChatConversationChromeSuppressionModifier: ViewModifier {
-  let isPresented: Bool
-
-  @ViewBuilder
-  func body(content: Content) -> some View {
-    if isPresented {
-      content
-        .toolbar(.hidden, for: .tabBar)
-    } else {
-      content
-    }
-  }
-}
-
-private extension View {
-  func chatConversationNavigationDestination() -> some View {
-    modifier(ChatConversationNavigationDestinationModifier())
   }
 }
 
@@ -991,8 +812,8 @@ private final class ChatsViewModel: ObservableObject {
   @Published var isLoading = false
   @Published var isWaitingForNetwork = false
   @Published var errorMessage: String?
+  @Published var hasLoaded = false
 
-  private var hasLoaded = false
   private var backgroundRefreshTask: Task<Void, Never>?
 
   deinit {
@@ -1135,193 +956,6 @@ private final class ChatsViewModel: ObservableObject {
   }
 }
 
-struct AppRootView: View {
-  @Environment(\.colorScheme) private var colorScheme
-  @Environment(\.scenePhase) private var scenePhase
-  @AppStorage(AppThemePlateController.storageKey) private var themePlateRaw =
-    AppThemePlateOption.glacier.rawValue
-  @StateObject private var coordinator = AppShellCoordinator()
-  @StateObject private var toastController = AppToastController.shared
-  @StateObject private var profileController = AppProfileController.shared
-  @State private var settingsTabAvatarImage: UIImage?
-  @State private var settingsTabUIImage: UIImage?
-
-  private var palette: AppThemePalette {
-    AppThemePalette.resolve(
-      for: colorScheme,
-      plate: AppThemePlateOption(rawValue: themePlateRaw) ?? .glacier
-    )
-  }
-
-  @ViewBuilder
-  private var settingsTabIcon: some View {
-    if let uiImage = settingsTabUIImage {
-      Image(uiImage: uiImage)
-        .renderingMode(.original)
-    } else {
-      Image(systemName: "person.circle.fill")
-    }
-  }
-
-  var body: some View {
-    ZStack {
-      TabView(selection: $coordinator.selectedTab) {
-        Tab("Contacts", systemImage: "person.circle", value: AppShellTab.contacts) {
-          ContactsRootView()
-        }
-
-        Tab("Calls", systemImage: "phone", value: AppShellTab.calls) {
-          CallsRootView()
-        }
-
-        Tab("Chats", systemImage: "message", value: AppShellTab.chats) {
-          ChatsRootView()
-        }
-
-        Tab(value: AppShellTab.settings) {
-          SettingsRootView()
-        } label: {
-          Label {
-            Text("Settings")
-          } icon: {
-            settingsTabIcon
-          }
-        }
-
-        Tab(
-          "Search",
-          systemImage: "magnifyingglass",
-          value: AppShellTab.search,
-          role: .search
-        ) {
-          Color.clear
-        }
-      }
-      .tint(palette.accent)
-
-      if let presented = coordinator.presentedChatProfile {
-        ChatProfileRootHost(
-          presented: presented,
-          isDark: colorScheme == .dark,
-          coordinator: coordinator
-        )
-        .id(presented.requestID)
-        .background(palette.background.ignoresSafeArea())
-        .ignoresSafeArea(.container, edges: [.top, .bottom])
-        .transition(.move(edge: .trailing))
-        .zIndex(50)
-      }
-    }
-    .onChange(of: coordinator.presentedChat?.requestID) { previousRequestID, _ in
-      if let presented = coordinator.presentedChat {
-        appShellRouteLog(
-          "AppRootView presentedChat changed requestId=\(presented.requestID) chatId=\(presented.route.chatId) title=\(presented.route.title)")
-      } else {
-        appShellRouteLog(
-          "AppRootView presentedChat cleared lastRequestId=\(previousRequestID.map(String.init) ?? "nil")")
-      }
-    }
-    .onAppear {
-      let appearance = UINavigationBarAppearance()
-      appearance.configureWithTransparentBackground()
-      appearance.shadowColor = .clear
-      appearance.backgroundColor = .clear
-      UINavigationBar.appearance().standardAppearance = appearance
-      UINavigationBar.appearance().scrollEdgeAppearance = appearance
-      UINavigationBar.appearance().compactAppearance = appearance
-
-      AppAppearanceController.applyStoredPreference()
-      AppUITrace.notice("AppRootView onAppear tab=\(coordinator.selectedTab)")
-      AppUIStallWatchdog.shared.start(context: "AppRootView appear tab=\(coordinator.selectedTab)")
-      VibeNativeCallOverlayPresenter.shared.startObserving()
-      VibeNativeCallOverlayPresenter.shared.refreshFromEngine()
-    }
-    .task {
-      await profileController.loadIfNeeded()
-      await loadSettingsTabAvatar()
-    }
-    .onChange(of: profileController.profile?.profileImage) { _, _ in
-      Task { await loadSettingsTabAvatar() }
-    }
-    .onChange(of: settingsTabAvatarImage) { _, image in
-      settingsTabUIImage = Self.renderCircularTabAvatar(source: image, size: 26)
-    }
-    .onChange(of: coordinator.selectedTab) { previousTab, newTab in
-      AppUITrace.notice("tab-change from=\(previousTab) to=\(newTab)")
-      AppUIStallWatchdog.shared.updateContext("tab-change from=\(previousTab) to=\(newTab)")
-      guard newTab == .search else { return }
-      coordinator.openChatSearch()
-    }
-    .onChange(of: scenePhase) { _, newPhase in
-      AppUITrace.notice("scene-phase \(newPhase)")
-      AppUIStallWatchdog.shared.setActive(
-        newPhase == .active,
-        context: "scene-phase \(newPhase) tab=\(coordinator.selectedTab)"
-      )
-      guard newPhase == .active else { return }
-      VibeNativeCallOverlayPresenter.shared.refreshFromEngine()
-    }
-    .overlay(alignment: .bottom) {
-      if let message = toastController.message {
-        AppToastBanner(message: message, palette: palette)
-          .padding(.horizontal, 20)
-          .padding(.bottom, 116)
-          .transition(.move(edge: .bottom).combined(with: .opacity))
-      }
-    }
-    .animation(.spring(response: 0.3, dampingFraction: 0.82), value: toastController.message)
-    .animation(.easeInOut(duration: 0.24), value: coordinator.presentedChatProfile?.requestID)
-    .environmentObject(coordinator)
-  }
-
-  @MainActor
-  private func loadSettingsTabAvatar() async {
-    guard let uri = profileController.profile?.profileImage else {
-      AppUITrace.notice("AppRootView settingsTabAvatar clear")
-      settingsTabAvatarImage = nil
-      return
-    }
-    let startedAt = CFAbsoluteTimeGetCurrent()
-    AppUITrace.notice("AppRootView settingsTabAvatar load start")
-    AppUIStallWatchdog.shared.updateContext("AppRootView settingsTabAvatar load")
-    settingsTabAvatarImage = await SettingsAvatarImageLoader.load(from: uri)
-    let durationMs = Int((CFAbsoluteTimeGetCurrent() - startedAt) * 1000)
-    AppUITrace.notice(
-      "AppRootView settingsTabAvatar load done success=\(settingsTabAvatarImage != nil) durationMs=\(durationMs)"
-    )
-  }
-
-  private static func renderCircularTabAvatar(
-    source: UIImage?, size: CGFloat
-  ) -> UIImage {
-    let renderer = UIGraphicsImageRenderer(size: CGSize(width: size, height: size))
-    return renderer.image { context in
-      let rect = CGRect(origin: .zero, size: CGSize(width: size, height: size))
-      let path = UIBezierPath(ovalIn: rect)
-      path.addClip()
-
-      if let source {
-        source.draw(in: rect)
-      } else {
-        UIColor(red: 180 / 255, green: 190 / 255, blue: 210 / 255, alpha: 1.0).setFill()
-        path.fill()
-
-        let configuration = UIImage.SymbolConfiguration(pointSize: size * 0.48, weight: .semibold)
-        let icon = UIImage(systemName: "person.fill", withConfiguration: configuration)?
-          .withTintColor(.white, renderingMode: .alwaysOriginal)
-        let iconSize = CGSize(width: size * 0.52, height: size * 0.52)
-        let iconRect = CGRect(
-          x: (size - iconSize.width) / 2,
-          y: (size - iconSize.height) / 2,
-          width: iconSize.width,
-          height: iconSize.height
-        )
-        icon?.draw(in: iconRect)
-      }
-    }
-  }
-}
-
 @MainActor
 private final class ContactDirectoryViewModel: ObservableObject {
   @Published var rows: [ChatHomeListRow] = []
@@ -1360,24 +994,26 @@ private final class ContactDirectoryViewModel: ObservableObject {
 }
 
 private struct ContactsRootView: View {
+  @EnvironmentObject private var coordinator: AppShellCoordinator
   var body: some View {
-    NavigationStack {
+    NavigationStack(path: $coordinator.contactsPath) {
       ContactsPageView()
-        .chatConversationNavigationDestination()
     }
   }
 }
+
+
 
 private struct CallsRootView: View {
+  @EnvironmentObject private var coordinator: AppShellCoordinator
   var body: some View {
-    NavigationStack {
+    NavigationStack(path: $coordinator.callsPath) {
       CallsPageView()
-        .chatConversationNavigationDestination()
     }
   }
 }
 
-private struct ChatsRootView: View {
+private struct ChatHomeScreen: View {
   @EnvironmentObject private var coordinator: AppShellCoordinator
   @Environment(\.colorScheme) private var colorScheme
   @StateObject private var model = ChatsViewModel()
@@ -1395,164 +1031,167 @@ private struct ChatsRootView: View {
 
   var body: some View {
     ZStack {
-      NavigationStack {
-        Group {
-          if model.rows.isEmpty && model.isLoading {
-            ProgressView()
-              .controlSize(.regular)
-              .tint(palette.secondaryText)
-              .frame(maxWidth: .infinity, maxHeight: .infinity)
-              .background(palette.background)
-          } else if model.rows.isEmpty {
-            AppShellEmptyStateView(
-              icon: "message",
-              title: model.isWaitingForNetwork ? "Waiting for Network" : "No Messages Yet",
-              message: errorMessage ?? model.errorMessage
-                ?? (model.isWaitingForNetwork
-                  ? "Your chats will stay here when the connection returns."
-                  : "Start a conversation to catch the vibe."),
-              buttonTitle: "New Chat",
-              palette: palette
-            ) {
-              isShowingSearch = true
-            }
-          } else {
-            ChatHomeNativeListRepresentable(
-              rows: model.rows,
-              isDark: colorScheme == .dark,
-              isEditing: isEditingHome,
-              selectedChatIDs: selectedChatIDs,
-              onSelect: { row in
-                AppUITrace.notice(
-                  "ChatsRootView select chatId=\(String(row.chatId.prefix(12))) title=\(row.title) rows=\(model.rows.count) initialMessages=\(row.initialMessages.count)"
-                )
-                AppUIStallWatchdog.shared.updateContext(
-                  "ChatsRootView select chatId=\(String(row.chatId.prefix(12))) rows=\(model.rows.count)"
-                )
-                if !row.initialMessages.isEmpty {
-                  ChatEngine.shared.seedRecentChatHistory(
-                    chatId: row.chatId,
-                    messages: row.initialMessages,
-                    limit: 3
-                  )
-                }
-                coordinator.openChat(ChatRoute(row: row))
-              },
-              onToggleSelection: { chatID in
-                toggleHomeSelection(chatID)
-              },
-              onRefresh: {
-                await model.refresh()
-              },
-              onUnavailableAction: { message in
-                AppToastController.shared.show(message)
-              }
-            )
-          }
-        }
-        .background(palette.background.ignoresSafeArea())
-        .ignoresSafeArea(.container, edges: [.top, .bottom])
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(.hidden, for: .navigationBar)
-        .toolbarBackground(.hidden, for: .tabBar)
+      palette.background.ignoresSafeArea()
 
-        .toolbar(isShowingStoryCamera || isEditingHome ? .hidden : .visible, for: .tabBar)
-        .toolbar {
-          ToolbarItem(placement: .topBarLeading) {
-            Button {
-              AppUITrace.notice(
-                "ChatsRootView editToggle next=\(!isEditingHome ? "editing" : "normal") selected=\(selectedChatIDs.count) rows=\(model.rows.count)"
-              )
-              withAnimation(.easeInOut(duration: 0.18)) {
-                isEditingHome.toggle()
-                if !isEditingHome {
-                  selectedChatIDs.removeAll()
-                }
-              }
-            } label: {
-              Text(isEditingHome ? "Done" : "Edit")
-                .font(.system(size: 17))
-                .foregroundStyle(palette.text)
-                .frame(width: 48, height: 44, alignment: .center)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .disabled(model.rows.isEmpty)
-            .transaction { transaction in
-              transaction.disablesAnimations = true
-            }
-          }
-          ToolbarItem(placement: .principal) {
-            AppHomeStatusHeaderView(
-              state: model.isWaitingForNetwork ? .waitingForNetwork : .ready,
-              palette: palette
-            )
-            .transaction { transaction in
-              transaction.disablesAnimations = true
-            }
-          }
-          ToolbarItemGroup(placement: .topBarTrailing) {
-            Button {
-              AppUITrace.notice("ChatsRootView story open rows=\(model.rows.count)")
-              withAnimation(.easeInOut(duration: 0.24)) {
-                isShowingStoryCamera = true
-              }
-            } label: {
-              AppVectorIcon(glyph: .story, tint: palette.secondaryText)
-                .frame(width: 23, height: 23)
-            }
+      VStack(spacing: 0) {
+        header
 
-            Button {
-              AppUITrace.notice("ChatsRootView compose/search open rows=\(model.rows.count)")
-              isShowingSearch = true
-            } label: {
-              AppVectorIcon(glyph: .compose, tint: palette.secondaryText)
-                .frame(width: 22, height: 22)
-            }
-          }
-        }
-        .task {
-          AppUITrace.notice("ChatsRootView task loadIfNeeded")
-          await model.loadIfNeeded()
-        }
-        .onAppear {
-          AppUITrace.notice(
-            "ChatsRootView onAppear rows=\(model.rows.count) searchRequest=\(coordinator.chatSearchPresentationRequestID)"
-          )
-          AppUIStallWatchdog.shared.updateContext("ChatsRootView appear rows=\(model.rows.count)")
-          presentSearchIfRequested()
-        }
-        .onChange(of: coordinator.chatSearchPresentationRequestID) { _, _ in
-          AppUITrace.notice(
-            "ChatsRootView searchRequest changed requestId=\(coordinator.chatSearchPresentationRequestID) selectedTab=\(coordinator.selectedTab)"
-          )
-          presentSearchIfRequested()
-        }
-        .sheet(isPresented: $isShowingSearch) {
-          if let config = AppSessionConfig.current {
-            NavigationStack {
-              ContactSearchView(config: config) { payload in
-                handleSearchPayload(payload)
-              }
-            }
-          }
-        }
-        .chatConversationNavigationDestination()
+        Divider()
+          .overlay(palette.divider)
+
+        listContent
       }
-
-      if isShowingStoryCamera {
-        AppNativeStoryCameraPage {
-          AppUITrace.notice("ChatsRootView story close")
-          withAnimation(.easeInOut(duration: 0.24)) {
-            isShowingStoryCamera = false
+    }
+    .task {
+      AppUITrace.notice("ChatHomeScreen task loadIfNeeded")
+      await model.loadIfNeeded()
+    }
+    .onAppear {
+      AppUITrace.notice(
+        "ChatHomeScreen onAppear rows=\(model.rows.count) searchRequest=\(coordinator.chatSearchPresentationRequestID)"
+      )
+      AppUIStallWatchdog.shared.updateContext("ChatHomeScreen appear rows=\(model.rows.count)")
+      presentSearchIfRequested()
+    }
+    .onChange(of: coordinator.chatSearchPresentationRequestID) { _, _ in
+      AppUITrace.notice(
+        "ChatHomeScreen searchRequest changed requestId=\(coordinator.chatSearchPresentationRequestID) selectedTab=\(coordinator.selectedTab)"
+      )
+      presentSearchIfRequested()
+    }
+    .sheet(isPresented: $isShowingSearch) {
+      if let config = AppSessionConfig.current {
+        NavigationStack {
+          ContactSearchView(config: config) { payload in
+            handleSearchPayload(payload)
           }
         }
-        .transition(.move(edge: .leading).combined(with: .opacity))
-        .zIndex(20)
       }
+    }
+    .fullScreenCover(isPresented: $isShowingStoryCamera) {
+      AppNativeStoryCameraPage {
+        AppUITrace.notice("ChatHomeScreen story close")
+        isShowingStoryCamera = false
+      }
+      .ignoresSafeArea()
     }
     .animation(.easeInOut(duration: 0.18), value: isEditingHome)
   }
+
+  // The chat-home header is plain in-content layout (NOT a nav-bar .toolbar),
+  // hosted in a UIKit UINavigationController whose system bar is hidden. There is
+  // no SwiftUI navigation container here to drop the items, so it can't vanish.
+  private var header: some View {
+    HStack(spacing: 16) {
+      Button {
+        withAnimation(.easeInOut(duration: 0.18)) {
+          isEditingHome.toggle()
+          if !isEditingHome {
+            selectedChatIDs.removeAll()
+          }
+        }
+      } label: {
+        Text(isEditingHome ? "Done" : "Edit")
+          .font(.system(size: 17))
+          .foregroundStyle(model.rows.isEmpty ? palette.tertiaryText : palette.text)
+          .contentShape(Rectangle())
+      }
+      .buttonStyle(.plain)
+      .disabled(model.rows.isEmpty)
+
+      Spacer(minLength: 8)
+
+      AppHomeStatusHeaderView(
+        state: model.isWaitingForNetwork ? .waitingForNetwork : .ready,
+        palette: palette
+      )
+
+      Spacer(minLength: 8)
+
+      Button {
+        isShowingStoryCamera = true
+      } label: {
+        AppVectorIcon(glyph: .story, tint: palette.secondaryText)
+          .frame(width: 23, height: 23)
+      }
+      .buttonStyle(.plain)
+
+      Button {
+        isShowingSearch = true
+      } label: {
+        AppVectorIcon(glyph: .compose, tint: palette.secondaryText)
+          .frame(width: 22, height: 22)
+      }
+      .buttonStyle(.plain)
+    }
+    .padding(.horizontal, 16)
+    .frame(height: 44)
+    .background(palette.background)
+  }
+
+  @ViewBuilder
+  private var listContent: some View {
+    if model.rows.isEmpty && (!model.hasLoaded || model.isLoading) {
+      ProgressView()
+        .controlSize(.regular)
+        .tint(palette.secondaryText)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(palette.background)
+    } else if model.rows.isEmpty {
+      AppShellEmptyStateView(
+        icon: """
+        <?xml version="1.0" encoding="utf-8"?><svg fill="none" viewBox="0 0 800 600" xmlns="http://www.w3.org/2000/svg"><defs><clipPath id="cp-800-600"><rect height="600" width="800" y="0" x="0" /></clipPath><g id="comp_0"><g opacity="0" id="planete Outlines - Group 5"><animate repeatCount="indefinite" attributeName="opacity" dur="3s" begin="0s" calcMode="spline" values="0; 1; 1; 0" keyTimes="0; 0.3; 0.68; 1" keySplines="0.333 0 0.667 1; 0.333 0 0.667 1; 0.333 0 0.667 1" fill="freeze" /><g transform="translate(327.38,267.583)"><animateTransform repeatCount="indefinite" type="translate" attributeName="transform" dur="3s" begin="0s" calcMode="spline" values="327.38 267.583; 482.38 267.583" keyTimes="0; 1" keySplines="0 0 1 1" fill="freeze" /><g transform="scale(0.5,0.5) translate(-171.76,-193.166)"><g id="Group 5" transform="matrix(1,0,0,1,171.76,193.166)"><path fill="#d0d2d3" fill-opacity="1" d="M59.669,-8.242C53.143,-8.242,47.22,-5.677,42.84,-1.506C42.047,-23.225,24.2,-40.592,2.287,-40.592C-17.519,-40.592,-34.001,-26.403,-37.576,-7.638C-39.31,-8.029,-41.111,-8.242,-42.962,-8.242C-56.447,-8.242,-67.378,2.69,-67.378,16.174C-67.378,16.467,-67.367,16.758,-67.356,17.049C-68.756,16.49,-70.279,16.174,-71.878,16.174C-78.62,16.174,-84.086,21.64,-84.086,28.383C-84.086,35.125,-78.62,40.591,-71.878,40.591L59.669,40.591C73.154,40.591,84.086,29.659,84.086,16.174C84.086,2.69,73.154,-8.242,59.669,-8.242Z" /></g></g></g></g><g id="Merged Shape Layer"><g transform="translate(390.319,298.2)"><animateTransform repeatCount="indefinite" type="translate" attributeName="transform" dur="3s" begin="0s" calcMode="spline" values="390.319 298.2; 390.319 282.7; 390.319 319.25; 390.319 298.2" keyTimes="0; 0.293; 0.733; 1" keySplines="0.333 0 0.667 1; 0.333 0 0.667 1; 0.333 0 0.667 1" fill="freeze" /><g transform="rotate(0)"><animateTransform repeatCount="indefinite" type="rotate" attributeName="transform" dur="3s" begin="0s" calcMode="spline" values="0; 35; 0" keyTimes="0; 0.513; 1" keySplines="0.547 0 0.667 1; 0.333 0 0.845 1" fill="freeze" /><g transform="scale(1,1) translate(-664.319,-256.2)"><g id="planete Outlines - Group 3" transform="matrix(0.5,0,0,0.5,515.5,129)"><g id="Group 3" transform="matrix(1,0,0,1,297.638,254.4)"><path fill="#5d68f9" fill-opacity="1" d="M-133.812,-42.171L133.812,-75.141L5.765,75.141L-61.708,18.402L124.227,-71.307L-87.011,-1.534L-133.812,-42.171Z" /></g></g><g id="planete Outlines - Group 2" transform="matrix(0.5,0,0,0.5,515.5,129)"><g id="Group 2" transform="matrix(1,0,0,1,316.247,247.882)"><path fill="#474bd8" fill-opacity="1" d="M-98.335,64.79L-105.619,4.984L105.619,-64.79L-80.316,24.919L-98.335,64.79Z" /></g></g><g id="planete Outlines - Group 1" transform="matrix(0.5,0,0,0.5,515.5,129.001)"><g id="Group 1" transform="matrix(1,0,0,1,236.879,292.737)"><path fill="#3931ac" fill-opacity="1" d="M18.967,-3.189L-18.967,19.935L-0.949,-19.935L18.967,-3.189Z" /></g></g></g></g></g></g><g opacity="0" id="planete Outlines - Group 4"><animate repeatCount="indefinite" attributeName="opacity" dur="2.4s" begin="0s" calcMode="spline" values="0; 0.5; 0.5; 0" keyTimes="0; 0.317; 0.733; 1" keySplines="0 0 1 1; 0 0 1 1; 0 0 1 1" fill="freeze" /><g transform="translate(468.336,323.378)"><animateTransform repeatCount="indefinite" type="translate" attributeName="transform" dur="2.04s" begin="0s" calcMode="spline" values="468.336 323.378; 294.336 323.378" keyTimes="0; 1" keySplines="0 0 1 1" fill="freeze" /><g transform="scale(0.5,0.5) translate(-453.672,-304.756)"><g id="Group 4" transform="matrix(1,0,0,1,453.672,304.756)"><path fill="#d0d2d3" fill-opacity="1" d="M75.134,16.175C74.353,16.175,73.591,16.256,72.85,16.396C72.851,16.322,72.856,16.249,72.856,16.175C72.856,2.691,61.924,-8.241,48.44,-8.241C46.662,-8.241,44.931,-8.046,43.262,-7.685C39.668,-26.427,23.196,-40.591,3.406,-40.591C-16.624,-40.591,-33.254,-26.077,-36.571,-6.995C-38.992,-7.799,-41.578,-8.241,-44.269,-8.241C-57.754,-8.241,-68.685,2.691,-68.685,16.175C-68.685,16.817,-68.652,17.45,-68.604,18.079C-70.494,16.88,-72.728,16.175,-75.133,16.175C-81.875,16.175,-87.341,21.641,-87.341,28.383C-87.341,35.126,-81.875,40.592,-75.133,40.592L75.134,40.592C81.876,40.592,87.342,35.126,87.342,28.383C87.342,21.641,81.876,16.175,75.134,16.175Z" /></g></g></g></g></g></defs><g transform="matrix(1.79,0,0,1.79,-310,-231)" id="Pre-comp 1"><use clip-path="url(#cp-800-600)" height="600" width="800" y="0" x="0" xlink:href="#comp_0" href="#comp_0" /></g></svg>
+        """,
+        title: model.isWaitingForNetwork ? "Waiting for Network" : "No Messages Yet",
+        message: errorMessage ?? model.errorMessage
+          ?? (model.isWaitingForNetwork
+            ? "Your chats will stay here when the connection returns."
+            : "Start a conversation to catch the vibe."),
+        buttonTitle: "New Chat",
+        palette: palette
+      ) {
+        isShowingSearch = true
+      }
+      .frame(maxWidth: .infinity, maxHeight: .infinity)
+      .background(palette.background)
+    } else {
+      ChatHomeNativeListRepresentable(
+        rows: model.rows,
+        isDark: colorScheme == .dark,
+        isEditing: isEditingHome,
+        selectedChatIDs: selectedChatIDs,
+        onSelect: { row in
+          AppUITrace.notice(
+            "ChatHomeScreen select chatId=\(String(row.chatId.prefix(12))) title=\(row.title) rows=\(model.rows.count) initialMessages=\(row.initialMessages.count)"
+          )
+          AppUIStallWatchdog.shared.updateContext(
+            "ChatHomeScreen select chatId=\(String(row.chatId.prefix(12))) rows=\(model.rows.count)"
+          )
+          if !row.initialMessages.isEmpty {
+            ChatEngine.shared.seedRecentChatHistory(
+              chatId: row.chatId,
+              messages: row.initialMessages,
+              limit: 3
+            )
+          }
+          coordinator.openChat(ChatRoute(row: row))
+        },
+        onToggleSelection: { chatID in
+          toggleHomeSelection(chatID)
+        },
+        onRefresh: {
+          await model.refresh()
+        },
+        onUnavailableAction: { message in
+          AppToastController.shared.show(message)
+        }
+      )
+      .frame(maxWidth: .infinity, maxHeight: .infinity)
+      .background(palette.background)
+      .ignoresSafeArea(.container, edges: .bottom)
+    }
+  }
+
 
   private func presentSearchIfRequested() {
     let requestID = coordinator.chatSearchPresentationRequestID
@@ -1694,14 +1333,16 @@ private struct ChatsRootView: View {
   }
 }
 
+
 private struct SettingsRootView: View {
+  @EnvironmentObject private var coordinator: AppShellCoordinator
   var body: some View {
-    NavigationStack {
+    NavigationStack(path: $coordinator.settingsPath) {
       SettingsView()
-        .chatConversationNavigationDestination()
     }
   }
 }
+
 
 private enum ChatHomeEditBulkAction {
   case markRead
@@ -2279,65 +1920,68 @@ private struct ContactsPageView: View {
 
   var body: some View {
     Group {
-      if model.rows.isEmpty && model.isLoading {
-        ProgressView()
-          .frame(maxWidth: .infinity, maxHeight: .infinity)
-          .background(palette.background)
-      } else if model.rows.isEmpty {
-        AppShellEmptyStateView(
-          icon: "person.2",
-          title: "No Contacts Yet",
-          message: errorMessage ?? model.errorMessage ?? "Find someone by username, phone number, or user ID.",
-          buttonTitle: "New Chat",
-          palette: palette
-        ) {
-          isShowingSearch = true
-        }
-      } else {
-        List {
-          ForEach(model.rows, id: \.chatId) { row in
-            Button {
-              coordinator.openChat(ChatRoute(row: row))
-            } label: {
-              ChatHomeRowView(row: row, palette: palette)
-            }
-            .buttonStyle(.plain)
-            .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
-            .listRowSeparator(.hidden)
-            .listRowBackground(Color.clear)
-          }
 
-          if isStartingChat {
-            Section {
-              HStack(spacing: 12) {
-                ProgressView()
-                Text("Opening chat")
-                  .foregroundStyle(palette.secondaryText)
-              }
-            }
-            .listRowBackground(palette.card)
+      Group {
+        if model.rows.isEmpty && model.isLoading {
+          ProgressView()
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(palette.background)
+        } else if model.rows.isEmpty {
+          AppShellEmptyStateView(
+            icon: "person.2",
+            title: "No Contacts Yet",
+            message: errorMessage ?? model.errorMessage ?? "Find someone by username, phone number, or user ID.",
+            buttonTitle: "New Chat",
+            palette: palette
+          ) {
+            isShowingSearch = true
           }
+        } else {
+          List {
+            ForEach(model.rows, id: \.chatId) { row in
+              Button {
+                coordinator.openChat(ChatRoute(row: row))
+              } label: {
+                ChatHomeRowView(row: row, palette: palette)
+              }
+              .buttonStyle(.plain)
+              .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
+              .listRowSeparator(.hidden)
+              .listRowBackground(Color.clear)
+            }
+
+            if isStartingChat {
+              Section {
+                HStack(spacing: 12) {
+                  ProgressView()
+                  Text("Opening chat")
+                    .foregroundStyle(palette.secondaryText)
+                }
+              }
+              .listRowBackground(palette.card)
+            }
+          }
+          .listStyle(.plain)
+          .scrollContentBackground(.hidden)
         }
-        .listStyle(.plain)
-        .scrollContentBackground(.hidden)
       }
-    }
-    .background(palette.background.ignoresSafeArea())
-    .ignoresSafeArea(.container, edges: .top)
-    .navigationBarTitleDisplayMode(.inline)
-    .toolbarBackground(.hidden, for: .navigationBar)
-    .toolbar {
-      ToolbarItem(placement: .topBarLeading) {
-        Text("Contacts")
-          .font(.system(size: 17, weight: .semibold))
-          .foregroundStyle(palette.text)
-      }
-      ToolbarItem(placement: .topBarTrailing) {
-        Button {
-          isShowingSearch = true
-        } label: {
-          AppVectorIcon(glyph: .compose, tint: palette.secondaryText)
-            .frame(width: 22, height: 22)
+      .background(palette.background.ignoresSafeArea())
+      .navigationBarTitleDisplayMode(.inline)
+      .toolbarBackground(palette.background, for: .navigationBar)
+      .toolbarBackground(.visible, for: .navigationBar)
+      .toolbar {
+        ToolbarItem(placement: .topBarLeading) {
+          Text("Contacts")
+            .font(.system(size: 17, weight: .semibold))
+            .foregroundStyle(palette.text)
+        }
+        ToolbarItem(placement: .topBarTrailing) {
+          Button {
+            isShowingSearch = true
+          } label: {
+            AppVectorIcon(glyph: .compose, tint: palette.secondaryText)
+              .frame(width: 22, height: 22)
+          }
         }
       }
     }
@@ -2349,7 +1993,7 @@ private struct ContactsPageView: View {
     }
     .sheet(isPresented: $isShowingSearch) {
       if let config = AppSessionConfig.current {
-        NavigationStack {
+        Group {
           ContactSearchView(config: config) { payload in
             handleSearchPayload(payload)
           }
@@ -2461,22 +2105,25 @@ private struct CallsPageView: View {
   }
 
   var body: some View {
-    AppShellEmptyStateView(
-      icon: "phone",
-      title: "No Calls Yet",
-      message: "Recent and active calls will appear here when the call runtime is linked into the standalone shell.",
-      buttonTitle: nil,
-      palette: palette,
-      action: nil
-    )
-    .background(palette.background.ignoresSafeArea())
-    .ignoresSafeArea(.container, edges: .top)
-    .toolbarBackground(.hidden, for: .navigationBar)
-    .toolbar {
-      ToolbarItem(placement: .topBarLeading) {
-        Text("Calls")
-          .font(.system(size: 17, weight: .semibold))
-          .foregroundStyle(palette.text)
+    Group {
+      AppShellEmptyStateView(
+        icon: "phone",
+        title: "No Calls Yet",
+        message: "Recent and active calls will appear here when the call runtime is linked into the standalone shell.",
+        buttonTitle: nil,
+        palette: palette,
+        action: nil
+      )
+      .background(palette.background.ignoresSafeArea())
+      .navigationBarTitleDisplayMode(.inline)
+      .toolbarBackground(palette.background, for: .navigationBar)
+      .toolbarBackground(.visible, for: .navigationBar)
+      .toolbar {
+        ToolbarItem(placement: .topBarLeading) {
+          Text("Calls")
+            .font(.system(size: 17, weight: .semibold))
+            .foregroundStyle(palette.text)
+        }
       }
     }
   }
@@ -2492,7 +2139,7 @@ private enum ChatConversationPage: String {
   case agent
 }
 
-private final class ChatProfileRootController: UIViewController {
+final class ChatProfileRootController: UIViewController {
   private let profileView = ChatProfileMainView()
   private var route: ChatRoute
   private var isDark: Bool
@@ -2630,10 +2277,14 @@ private final class ChatProfileRootController: UIViewController {
   }
 }
 
-private final class ChatConversationController: UIViewController {
+final class ChatConversationController: UIViewController {
   private static let postPresentationActivationDelay: TimeInterval = 0.28
 
   private let mainView = ChatMainView()
+  private let navigationTitleStack = UIStackView()
+  private let navigationTitleLabel = UILabel()
+  private let navigationSubtitleLabel = UILabel()
+  private var navigationAvatarTask: Task<Void, Never>?
   private var profileView: ChatProfileMainView?
   private var route: ChatRoute
   private var isDark: Bool
@@ -2661,6 +2312,10 @@ private final class ChatConversationController: UIViewController {
   private var pendingAppearanceForAttachment: [String: Any]?
   private var pendingInputActivationForAttachment = false
 
+  /// The chat currently shown. Used by the coordinator to avoid pushing a
+  /// duplicate of the chat already on top of the navigation stack.
+  var chatId: String { route.chatId }
+
   init(route: ChatRoute, isDark: Bool, onClose: (() -> Void)?) {
     self.route = route
     self.isDark = isDark
@@ -2678,6 +2333,7 @@ private final class ChatConversationController: UIViewController {
     super.viewDidLoad()
     view.backgroundColor = .clear
     logLifecycle("viewDidLoad")
+    configureNavigationHeader()
 
     mainView.translatesAutoresizingMaskIntoConstraints = false
     view.addSubview(mainView)
@@ -2691,6 +2347,8 @@ private final class ChatConversationController: UIViewController {
     mainView.onNativeEvent.handler = { [weak self] payload in
       self?.handleNativeEvent(payload)
     }
+    // The UINavigationController owns the visible header. ChatMainView keeps
+    // only the message surface and uses the controller-provided safe area.
     mainView.setExternalNavigationHeaderEnabled(true)
 
     NotificationCenter.default.addObserver(
@@ -2705,6 +2363,9 @@ private final class ChatConversationController: UIViewController {
 
   override func viewWillAppear(_ animated: Bool) {
     super.viewWillAppear(animated)
+    if currentPage == .chat {
+      navigationController?.setNavigationBarHidden(false, animated: animated)
+    }
     logLifecycle("viewWillAppear")
     logVisualState("viewWillAppear", force: true)
   }
@@ -2744,6 +2405,7 @@ private final class ChatConversationController: UIViewController {
   }
 
   deinit {
+    navigationAvatarTask?.cancel()
     NotificationCenter.default.removeObserver(
       self,
       name: ChatEngine.didChangeNotification,
@@ -2841,6 +2503,7 @@ private final class ChatConversationController: UIViewController {
     mainView.setProfileBio("")
     markRouteSurfaceStep("avatar")
     mainView.setAvatarUri(route.avatarURI)
+    updateNavigationHeader()
     markRouteSurfaceStep("groupAndInput")
     mainView.setIsGroupOrChannel(route.isGroup)
     mainView.setInputPlaceholder(route.chatId == "saved_messages" ? "Saved Message" : "Message")
@@ -3288,6 +2951,7 @@ private final class ChatConversationController: UIViewController {
       DispatchQueue.main.async { [weak self] in
         guard let self, self.route == route else { return }
         self.mainView.setHeaderSubtitle(subtitle)
+        self.updateNavigationSubtitle(subtitle)
         self.mainView.setIsOnline(isOnline)
         self.mainView.setProfileHandle(handle)
         self.profileView?.setHeaderSubtitle(subtitle)
@@ -3298,7 +2962,9 @@ private final class ChatConversationController: UIViewController {
   }
 
   private func refreshRouteOnlyHeaderState() {
-    mainView.setHeaderSubtitle(Self.routeOnlyHeaderSubtitle(for: route))
+    let subtitle = Self.routeOnlyHeaderSubtitle(for: route)
+    mainView.setHeaderSubtitle(subtitle)
+    updateNavigationSubtitle(subtitle)
     mainView.setIsOnline(false)
     mainView.setProfileHandle(Self.profileHandle(for: route))
     profileView?.setHeaderSubtitle(Self.routeOnlyHeaderSubtitle(for: route))
@@ -3354,6 +3020,7 @@ private final class ChatConversationController: UIViewController {
 
   private func showProfileView(animated: Bool) {
     guard currentPage != .profile else { return }
+    navigationController?.setNavigationBarHidden(true, animated: false)
     currentPage = .profile
     let profileView = makeProfileViewIfNeeded()
     configureProfileView(profileView, rows: latestProfileRows)
@@ -3384,6 +3051,7 @@ private final class ChatConversationController: UIViewController {
   private func hideProfileView(animated: Bool) {
     guard profileView?.isHidden == false else {
       currentPage = .chat
+      navigationController?.setNavigationBarHidden(false, animated: false)
       return
     }
     removeProfileView(animated: animated)
@@ -3393,6 +3061,7 @@ private final class ChatConversationController: UIViewController {
     guard let profileView else {
       currentPage = .chat
       mainView.transform = .identity
+      navigationController?.setNavigationBarHidden(false, animated: false)
       return
     }
     currentPage = .chat
@@ -3406,6 +3075,7 @@ private final class ChatConversationController: UIViewController {
       mainView.transform = .identity
       profileView.removeFromSuperview()
       self.profileView = nil
+      navigationController?.setNavigationBarHidden(false, animated: false)
       return
     }
     UIView.animate(
@@ -3424,6 +3094,7 @@ private final class ChatConversationController: UIViewController {
         profileView.removeFromSuperview()
         self.profileView = nil
       }
+      self.navigationController?.setNavigationBarHidden(false, animated: false)
     }
   }
 
@@ -3463,6 +3134,8 @@ private final class ChatConversationController: UIViewController {
         hideProfileView(animated: true)
       }
       mainView.openHeaderSearch()
+    case "headerSearchDismissed":
+      navigationController?.setNavigationBarHidden(false, animated: false)
     case "headerAudioCallPressed":
       NativeCallRouteBridge.startOutgoing(route: route, callType: "voice")
     case "headerVideoCallPressed":
@@ -3523,6 +3196,9 @@ private final class ChatConversationController: UIViewController {
       "chatMessageChanged", "messageStatusChanged", "presenceChanged", "peerTyping",
       "chatMuteChanged":
       refreshRows()
+      if changeReason == "presenceChanged" || changeReason == "peerTyping" {
+        refreshHeaderState()
+      }
     default:
       break
     }
@@ -3622,6 +3298,124 @@ private final class ChatConversationController: UIViewController {
       return value.stringValue
     }
     return nil
+  }
+
+  private func configureNavigationHeader() {
+    navigationItem.largeTitleDisplayMode = .never
+    navigationItem.hidesBackButton = true
+    navigationItem.leftBarButtonItem = UIBarButtonItem(
+      image: UIImage(
+        systemName: "chevron.left",
+        withConfiguration: UIImage.SymbolConfiguration(pointSize: 18, weight: .semibold)
+      ),
+      style: .plain,
+      target: self,
+      action: #selector(handleNavigationBack)
+    )
+    navigationItem.leftBarButtonItem?.accessibilityLabel = "Back to chats"
+
+    navigationTitleStack.axis = .vertical
+    navigationTitleStack.alignment = .center
+    navigationTitleStack.spacing = 0
+    navigationTitleStack.isUserInteractionEnabled = true
+    navigationTitleStack.addArrangedSubview(navigationTitleLabel)
+    navigationTitleStack.addArrangedSubview(navigationSubtitleLabel)
+    navigationTitleStack.addGestureRecognizer(
+      UITapGestureRecognizer(target: self, action: #selector(handleNavigationTitlePressed))
+    )
+
+    navigationTitleLabel.font = .systemFont(ofSize: 17, weight: .semibold)
+    navigationTitleLabel.textColor = .label
+    navigationTitleLabel.textAlignment = .center
+    navigationTitleLabel.lineBreakMode = .byTruncatingTail
+
+    navigationSubtitleLabel.font = .systemFont(ofSize: 12, weight: .regular)
+    navigationSubtitleLabel.textColor = .secondaryLabel
+    navigationSubtitleLabel.textAlignment = .center
+    navigationSubtitleLabel.lineBreakMode = .byTruncatingTail
+
+    navigationItem.titleView = navigationTitleStack
+    updateNavigationHeader()
+  }
+
+  private func updateNavigationHeader() {
+    navigationTitleLabel.text = route.title
+    updateNavigationSubtitle(Self.routeOnlyHeaderSubtitle(for: route))
+    navigationAvatarTask?.cancel()
+
+    if route.chatId == "saved_messages" {
+      let searchItem = UIBarButtonItem(
+        image: UIImage(
+          systemName: "magnifyingglass",
+          withConfiguration: UIImage.SymbolConfiguration(pointSize: 17, weight: .semibold)
+        ),
+        style: .plain,
+        target: self,
+        action: #selector(handleNavigationTrailingPressed)
+      )
+      searchItem.accessibilityLabel = "Search messages"
+      navigationItem.rightBarButtonItem = searchItem
+      return
+    }
+
+    applyNavigationAvatar(nil)
+    guard let avatarURI = route.avatarURI, !avatarURI.isEmpty else { return }
+    let chatID = route.chatId
+    navigationAvatarTask = Task { [weak self] in
+      let image = await SettingsAvatarImageLoader.load(from: avatarURI)
+      guard !Task.isCancelled else { return }
+      await MainActor.run {
+        guard let self, self.route.chatId == chatID else { return }
+        self.applyNavigationAvatar(image)
+      }
+    }
+  }
+
+  private func updateNavigationSubtitle(_ subtitle: String) {
+    let trimmed = subtitle.trimmingCharacters(in: .whitespacesAndNewlines)
+    navigationSubtitleLabel.text = trimmed
+    navigationSubtitleLabel.isHidden = trimmed.isEmpty
+  }
+
+  private func applyNavigationAvatar(_ source: UIImage?) {
+    let palette = AppThemePalette.resolve(for: traitCollection.userInterfaceStyle == .dark ? .dark : .light)
+    let image =
+      source.flatMap { AppInitialsAvatarRenderer.circularImage(from: $0, size: 30) }
+      ?? AppInitialsAvatarRenderer.image(
+        for: route.title,
+        size: 30,
+        backgroundColor: palette.accentUIColor
+      )
+    let avatarItem = UIBarButtonItem(
+      image: image,
+      style: .plain,
+      target: self,
+      action: #selector(handleNavigationTrailingPressed)
+    )
+    avatarItem.accessibilityLabel = "Open \(route.title) profile"
+    navigationItem.rightBarButtonItem = avatarItem
+  }
+
+  @objc private func handleNavigationBack() {
+    if let onClose {
+      onClose()
+    } else {
+      navigationController?.popViewController(animated: true)
+    }
+  }
+
+  @objc private func handleNavigationTitlePressed() {
+    guard route.chatId != "saved_messages" else { return }
+    showProfileView(animated: true)
+  }
+
+  @objc private func handleNavigationTrailingPressed() {
+    if route.chatId == "saved_messages" {
+      navigationController?.setNavigationBarHidden(true, animated: false)
+      mainView.openHeaderSearch()
+    } else {
+      showProfileView(animated: true)
+    }
   }
 
   private static func backgroundColor(isDark: Bool) -> UIColor {
@@ -3783,7 +3577,7 @@ private struct ChatAvatarView: View {
   }
 }
 
-private struct AppChatNavigationHeaderView: View {
+struct AppChatNavigationHeaderView: View {
   let route: ChatRoute
   let palette: AppThemePalette
 
@@ -3832,7 +3626,7 @@ private struct AppChatNavigationHeaderView: View {
   }
 }
 
-private struct AppChatNavigationBackButton: View {
+struct AppChatNavigationBackButton: View {
   let unreadCount: Int
   let palette: AppThemePalette
   let action: () -> Void
@@ -3859,7 +3653,7 @@ private struct AppChatNavigationBackButton: View {
   }
 }
 
-private struct AppChatNavigationAvatarButton: View {
+struct AppChatNavigationAvatarButton: View {
   let route: ChatRoute
   let palette: AppThemePalette
   let action: () -> Void
@@ -4011,9 +3805,14 @@ private struct AppShellEmptyStateView: View {
 
   var body: some View {
     VStack(spacing: 18) {
-      Image(systemName: icon)
-        .font(.system(size: 34, weight: .semibold))
-        .foregroundStyle(palette.accent)
+      if icon.hasPrefix("<?xml") || icon.hasPrefix("<svg") {
+        AppAnimatedSVGView(svgString: icon)
+          .frame(width: 120, height: 120)
+      } else {
+        Image(systemName: icon)
+          .font(.system(size: 34, weight: .semibold))
+          .foregroundStyle(palette.accent)
+      }
 
       VStack(spacing: 8) {
         Text(title)
@@ -4085,112 +3884,77 @@ private struct ContactSearchView: View {
   let onResult: ([String: Any]) -> Void
   @State private var query = ""
   @State private var results: [ContactSearchUser] = []
-  @State private var selectedUser: ContactSearchUser?
   @State private var savedUserIDs = Set<String>()
   @State private var isLoading = false
-  @State private var statusText = "Find by username, phone, or user ID"
+  @State private var hasSearched = false
+  @State private var statusText = ""
+  @State private var searchTask: Task<Void, Never>?
   @FocusState private var isQueryFieldFocused: Bool
 
   private var palette: AppThemePalette {
     AppThemePalette.resolve(for: colorScheme)
   }
 
+  private var trimmedQuery: String {
+    query.trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
   var body: some View {
     List {
       Section {
-        TextField("Search username, phone, or ID", text: $query)
-          .focused($isQueryFieldFocused)
-          .textInputAutocapitalization(.never)
-          .autocorrectionDisabled()
-          .submitLabel(.search)
-          .onSubmit {
-            Task {
-              await performSearch()
+        HStack(spacing: 10) {
+          Image(systemName: "magnifyingglass")
+            .foregroundStyle(palette.secondaryText)
+          TextField("Username, phone, or ID", text: $query)
+            .focused($isQueryFieldFocused)
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+            .submitLabel(.search)
+            .onSubmit { scheduleSearch(immediate: true) }
+          if isLoading {
+            ProgressView().controlSize(.small)
+          } else if !query.isEmpty {
+            Button {
+              query = ""
+              results = []
+              hasSearched = false
+              isQueryFieldFocused = true
+            } label: {
+              Image(systemName: "xmark.circle.fill")
+                .foregroundStyle(palette.secondaryText)
             }
+            .buttonStyle(.plain)
           }
+        }
       }
       .listRowBackground(palette.card)
 
-      if let selectedUser {
-        Section {
-          VStack(spacing: 16) {
-            Circle()
-              .fill(palette.card)
-              .frame(width: 78, height: 78)
-              .overlay {
-                Text(String(selectedUser.username.prefix(1)).uppercased())
-                  .font(.system(size: 28, weight: .semibold))
-                  .foregroundStyle(palette.accent)
-              }
-
-            VStack(spacing: 4) {
-              Text(selectedUser.username)
-                .font(.system(size: 20, weight: .semibold))
-                .foregroundStyle(palette.text)
-              Text(selectedUser.subtitle)
-                .font(.footnote)
-                .foregroundStyle(palette.secondaryText)
-            }
-
-            HStack(spacing: 10) {
+      if !results.isEmpty {
+        Section("People") {
+          ForEach(results) { user in
+            ContactSearchResultRow(
+              user: user,
+              isSaved: savedUserIDs.contains(user.userID),
+              palette: palette
+            )
+            .contentShape(Rectangle())
+            .onTapGesture { open(user, action: "chat") }
+            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
               Button {
-                onResult(["action": "chat", "user": selectedUser.payload])
-                dismiss()
-              } label: {
-                Label("Chat", systemImage: "message.fill")
-                  .frame(maxWidth: .infinity)
-              }
-              .buttonStyle(.borderedProminent)
-
-              Button {
-                onResult(["action": "call", "user": selectedUser.payload])
-                dismiss()
+                open(user, action: "call")
               } label: {
                 Label("Call", systemImage: "phone.fill")
-                  .frame(maxWidth: .infinity)
               }
-              .buttonStyle(.bordered)
-            }
+              .tint(.green)
 
-            Button {
-              savedUserIDs.insert(selectedUser.userID)
-              onResult(["action": "saveContact", "user": selectedUser.payload])
-            } label: {
-              Label(
-                savedUserIDs.contains(selectedUser.userID) ? "Saved" : "Add Contact",
-                systemImage: savedUserIDs.contains(selectedUser.userID) ? "checkmark.circle.fill" : "person.badge.plus"
-              )
-              .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.bordered)
-            .disabled(savedUserIDs.contains(selectedUser.userID))
-          }
-          .frame(maxWidth: .infinity)
-          .padding(.vertical, 16)
-        }
-        .listRowBackground(palette.card)
-      } else if isLoading {
-        Section {
-          HStack(spacing: 12) {
-            ProgressView()
-            Text("Searching")
-              .foregroundStyle(.secondary)
-          }
-        }
-        .listRowBackground(palette.card)
-      } else if !results.isEmpty {
-        Section("Results") {
-          ForEach(results) { user in
-            Button {
-              selectedUser = user
-              isQueryFieldFocused = false
-            } label: {
-              VStack(alignment: .leading, spacing: 4) {
-                Text(user.username)
-                  .foregroundStyle(.primary)
-                Text(user.subtitle)
-                  .font(.footnote)
-                  .foregroundStyle(.secondary)
+              if !savedUserIDs.contains(user.userID) {
+                Button {
+                  savedUserIDs.insert(user.userID)
+                  onResult(["action": "saveContact", "user": user.payload])
+                } label: {
+                  Label("Add", systemImage: "person.badge.plus")
+                }
+                .tint(palette.accent)
               }
             }
           }
@@ -4198,11 +3962,16 @@ private struct ContactSearchView: View {
         .listRowBackground(palette.card)
       } else {
         Section {
-          Text(statusText)
-            .font(.footnote)
-            .foregroundStyle(.secondary)
+          ContactSearchStatusView(
+            isLoading: isLoading,
+            hasSearched: hasSearched,
+            message: statusText,
+            palette: palette
+          )
+          .frame(maxWidth: .infinity)
+          .listRowBackground(Color.clear)
+          .listRowSeparator(.hidden)
         }
-        .listRowBackground(palette.card)
       }
     }
     .listStyle(.insetGrouped)
@@ -4215,6 +3984,10 @@ private struct ContactSearchView: View {
         isQueryFieldFocused = true
       }
     }
+    .onChange(of: query) { _, _ in
+      scheduleSearch(immediate: false)
+    }
+    .onDisappear { searchTask?.cancel() }
     .toolbar {
       ToolbarItem(placement: .topBarLeading) {
         Button("Close") {
@@ -4222,37 +3995,128 @@ private struct ContactSearchView: View {
           dismiss()
         }
       }
-      ToolbarItem(placement: .topBarTrailing) {
-        Button("Search") {
-          Task {
-            await performSearch()
-          }
-        }
-        .disabled(query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isLoading)
+    }
+  }
+
+  private func open(_ user: ContactSearchUser, action: String) {
+    isQueryFieldFocused = false
+    onResult(["action": action, "user": user.payload])
+    dismiss()
+  }
+
+  /// Debounced live search. Typing reschedules a 350ms-delayed query; submitting
+  /// runs immediately. A single in-flight task is kept so results never race.
+  private func scheduleSearch(immediate: Bool) {
+    searchTask?.cancel()
+    let queryValue = trimmedQuery
+    guard !queryValue.isEmpty else {
+      results = []
+      hasSearched = false
+      statusText = ""
+      isLoading = false
+      return
+    }
+
+    searchTask = Task { @MainActor in
+      if !immediate {
+        try? await Task.sleep(nanoseconds: 350_000_000)
+        if Task.isCancelled { return }
       }
+      await performSearch(for: queryValue)
     }
   }
 
   @MainActor
-  private func performSearch() async {
-    let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !trimmedQuery.isEmpty else {
-      results = []
-      statusText = "Find by username, phone, or user ID"
-      return
-    }
-
+  private func performSearch(for queryValue: String) async {
     isLoading = true
-    selectedUser = nil
     defer { isLoading = false }
 
     do {
-      results = try await ContactSearchService.search(config: config, query: trimmedQuery)
-      statusText = results.isEmpty ? "No user found" : ""
+      let found = try await ContactSearchService.search(config: config, query: queryValue)
+      if Task.isCancelled { return }
+      results = found
+      hasSearched = true
+      statusText = found.isEmpty ? "No people found for “\(queryValue)”." : ""
     } catch {
+      if Task.isCancelled { return }
       results = []
+      hasSearched = true
       statusText = error.localizedDescription
     }
+  }
+}
+
+private struct ContactSearchResultRow: View {
+  let user: ContactSearchUser
+  let isSaved: Bool
+  let palette: AppThemePalette
+
+  var body: some View {
+    HStack(spacing: 12) {
+      Circle()
+        .fill(palette.background)
+        .frame(width: 44, height: 44)
+        .overlay {
+          Text(String(user.username.prefix(1)).uppercased())
+            .font(.system(size: 18, weight: .semibold))
+            .foregroundStyle(palette.accent)
+        }
+
+      VStack(alignment: .leading, spacing: 2) {
+        Text(user.username)
+          .font(.system(size: 16, weight: .medium))
+          .foregroundStyle(palette.text)
+        Text(user.subtitle)
+          .font(.footnote)
+          .foregroundStyle(palette.secondaryText)
+      }
+
+      Spacer(minLength: 8)
+
+      if isSaved {
+        Image(systemName: "checkmark.circle.fill")
+          .foregroundStyle(palette.accent)
+      }
+      Image(systemName: "chevron.right")
+        .font(.system(size: 13, weight: .semibold))
+        .foregroundStyle(palette.secondaryText.opacity(0.6))
+    }
+    .padding(.vertical, 4)
+  }
+}
+
+private struct ContactSearchStatusView: View {
+  let isLoading: Bool
+  let hasSearched: Bool
+  let message: String
+  let palette: AppThemePalette
+
+  var body: some View {
+    VStack(spacing: 12) {
+      if isLoading {
+        ProgressView()
+          .tint(palette.secondaryText)
+        Text("Searching…")
+          .font(.footnote)
+          .foregroundStyle(palette.secondaryText)
+      } else {
+        Image(systemName: hasSearched ? "person.fill.questionmark" : "magnifyingglass")
+          .font(.system(size: 30, weight: .regular))
+          .foregroundStyle(palette.secondaryText.opacity(0.7))
+        Text(displayMessage)
+          .font(.footnote)
+          .multilineTextAlignment(.center)
+          .foregroundStyle(palette.secondaryText)
+      }
+    }
+    .padding(.vertical, 36)
+  }
+
+  private var displayMessage: String {
+    if !message.isEmpty { return message }
+    return hasSearched
+      ? "No people found."
+      : "Find people by username, phone number, or user ID to start a new chat."
   }
 }
 
@@ -4328,8 +4192,83 @@ private struct ContactSearchUser: Identifiable {
   }
 }
 
+private enum AppSessionRefreshError: LocalizedError {
+  case missingSecret
+
+  var errorDescription: String? {
+    switch self {
+    case .missingSecret:
+      return "Session expired. Sign in again."
+    }
+  }
+}
+
+private enum AppSessionRefreshService {
+  static func refresh(config: AppSessionConfig) async throws -> AppSessionConfig {
+    let rawSecret = SecureKeyStore.shared.retrieveSecret(key: "loginSecret")
+    guard
+      let secret = rawSecret?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !secret.isEmpty
+    else {
+      throw AppSessionRefreshError.missingSecret
+    }
+
+    let result = try await NativeAuthService.signIn(
+      secret: secret,
+      apiBaseURLString: config.apiBaseURLString,
+      transportMode: config.transportMode
+    )
+    AppSessionConfig.store(result.config)
+    _ = SecureKeyStore.shared.storeSecret(key: "loginSecret", value: secret)
+    return result.config
+  }
+}
+
+private func appShellServerErrorMessage(
+  statusCode: Int,
+  body: String,
+  fallback: String
+) -> String {
+  if
+    let data = body.data(using: .utf8),
+    let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+    let message = (object["message"] ?? object["error"] ?? object["reason"]) as? String
+  {
+    let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !trimmed.isEmpty {
+      return statusCode == 401 ? trimmed : "\(fallback) (\(statusCode)): \(trimmed)"
+    }
+  }
+
+  let trimmed = appShellSanitizedServerBody(body)
+  return trimmed.isEmpty ? "\(fallback) (\(statusCode))." : "\(fallback) (\(statusCode)): \(trimmed)"
+}
+
+private func appShellSanitizedServerBody(_ body: String) -> String {
+  let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+  if trimmed.isEmpty { return "" }
+  let lowered = trimmed.lowercased()
+  if lowered.hasPrefix("<!doctype") || lowered.hasPrefix("<html") || lowered.contains("<body") {
+    return ""
+  }
+  return String(trimmed.prefix(180))
+}
+
 private enum ContactSearchService {
   static func search(config: AppSessionConfig, query: String) async throws -> [ContactSearchUser] {
+    let activeConfig = AppSessionConfig.current ?? config
+    do {
+      return try await performSearch(config: activeConfig, query: query)
+    } catch let error as ContactSearchServiceError {
+      guard error.isSessionExpired else {
+        throw error
+      }
+      let refreshedConfig = try await AppSessionRefreshService.refresh(config: activeConfig)
+      return try await performSearch(config: refreshedConfig, query: query)
+    }
+  }
+
+  private static func performSearch(config: AppSessionConfig, query: String) async throws -> [ContactSearchUser] {
     guard let url = buildSearchURL(apiBaseURLString: config.apiBaseURLString, query: query) else {
       throw ContactSearchServiceError.invalidURL
     }
@@ -4446,6 +4385,15 @@ private enum ContactSearchServiceError: LocalizedError {
   case invalidResponse
   case http(Int, String)
 
+  var isSessionExpired: Bool {
+    switch self {
+    case let .http(statusCode, _):
+      return statusCode == 401
+    default:
+      return false
+    }
+  }
+
   var errorDescription: String? {
     switch self {
     case .invalidURL:
@@ -4453,8 +4401,7 @@ private enum ContactSearchServiceError: LocalizedError {
     case .invalidResponse:
       return "The server did not return a valid response."
     case let .http(statusCode, body):
-      let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
-      return "Search unavailable (\(statusCode))\(trimmed.isEmpty ? "" : ": \(trimmed)")"
+      return appShellServerErrorMessage(statusCode: statusCode, body: body, fallback: "Search unavailable")
     }
   }
 }
@@ -4466,6 +4413,19 @@ private struct ChatCreateResult {
 
 private enum ChatDirectMessageService {
   static func startChat(config: AppSessionConfig, friendID: String) async throws -> ChatCreateResult {
+    let activeConfig = AppSessionConfig.current ?? config
+    do {
+      return try await startChatOnce(config: activeConfig, friendID: friendID)
+    } catch let error as ChatDirectMessageServiceError {
+      guard error.isSessionExpired else {
+        throw error
+      }
+      let refreshedConfig = try await AppSessionRefreshService.refresh(config: activeConfig)
+      return try await startChatOnce(config: refreshedConfig, friendID: friendID)
+    }
+  }
+
+  private static func startChatOnce(config: AppSessionConfig, friendID: String) async throws -> ChatCreateResult {
     let request = try buildRequest(config: config, friendID: friendID)
 
     switch config.transportMode {
@@ -4579,6 +4539,15 @@ private enum ChatDirectMessageServiceError: LocalizedError {
   case http(Int, String)
   case transportUnavailable(String)
 
+  var isSessionExpired: Bool {
+    switch self {
+    case let .http(statusCode, _):
+      return statusCode == 401
+    default:
+      return false
+    }
+  }
+
   var errorDescription: String? {
     switch self {
     case .invalidURL:
@@ -4588,10 +4557,381 @@ private enum ChatDirectMessageServiceError: LocalizedError {
     case .invalidPayload:
       return "The chat response could not be parsed."
     case let .http(statusCode, body):
-      let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
-      return "Request failed with status \(statusCode)\(trimmed.isEmpty ? "" : ": \(trimmed)")"
+      return appShellServerErrorMessage(statusCode: statusCode, body: body, fallback: "Chat request failed")
     case let .transportUnavailable(mode):
       return "Transport mode \(mode) is not available in the standalone native app."
     }
+  }
+}
+
+private struct AppAnimatedSVGView: UIViewRepresentable {
+  let svgString: String
+
+  func makeUIView(context: Context) -> WKWebView {
+    let configuration = WKWebViewConfiguration()
+    configuration.allowsInlineMediaPlayback = true
+    configuration.mediaTypesRequiringUserActionForPlayback = []
+
+    let webView = WKWebView(frame: .zero, configuration: configuration)
+    webView.isOpaque = false
+    webView.backgroundColor = .clear
+    webView.scrollView.isScrollEnabled = false
+    webView.scrollView.bounces = false
+    webView.isUserInteractionEnabled = false
+    return webView
+  }
+
+  func updateUIView(_ uiView: WKWebView, context: Context) {
+    let html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <style>
+      body, html { margin: 0; padding: 0; width: 100%; height: 100%; background-color: transparent; display: flex; justify-content: center; align-items: center; }
+      svg { width: 100%; height: 100%; object-fit: contain; }
+    </style>
+    </head>
+    <body>
+    \(svgString)
+    </body>
+    </html>
+    """
+    uiView.loadHTMLString(html, baseURL: nil)
+  }
+}
+
+// MARK: - Native UIKit shell
+
+private enum AppInitialsAvatarRenderer {
+  static func image(for displayName: String, size: CGFloat, backgroundColor: UIColor) -> UIImage {
+    let renderer = UIGraphicsImageRenderer(size: CGSize(width: size, height: size))
+    let image = renderer.image { _ in
+      let rect = CGRect(origin: .zero, size: CGSize(width: size, height: size))
+      backgroundColor.setFill()
+      UIBezierPath(ovalIn: rect).fill()
+
+      let text = initials(for: displayName) as NSString
+      let attributes: [NSAttributedString.Key: Any] = [
+        .font: UIFont.systemFont(ofSize: size * 0.36, weight: .bold),
+        .foregroundColor: UIColor.white,
+      ]
+      let textSize = text.size(withAttributes: attributes)
+      text.draw(
+        at: CGPoint(
+          x: (size - textSize.width) * 0.5,
+          y: (size - textSize.height) * 0.5
+        ),
+        withAttributes: attributes
+      )
+    }
+    return image.withRenderingMode(.alwaysOriginal)
+  }
+
+  static func circularImage(from source: UIImage, size: CGFloat) -> UIImage? {
+    let renderer = UIGraphicsImageRenderer(size: CGSize(width: size, height: size))
+    let image = renderer.image { _ in
+      let rect = CGRect(origin: .zero, size: CGSize(width: size, height: size))
+      UIBezierPath(ovalIn: rect).addClip()
+      source.draw(in: rect)
+    }
+    return image.withRenderingMode(.alwaysOriginal)
+  }
+
+  private static func initials(for displayName: String) -> String {
+    let words = displayName
+      .split(whereSeparator: { $0.isWhitespace || $0 == "_" || $0 == "-" })
+      .filter { !$0.isEmpty }
+    if words.count >= 2 {
+      return words.prefix(2).compactMap(\.first).map(String.init).joined().uppercased()
+    }
+    let letters = displayName.filter(\.isLetter)
+    let fallback = letters.isEmpty ? "ME" : String(letters.prefix(2))
+    return fallback.uppercased()
+  }
+}
+
+/// Root of the authenticated app. A real UIKit `UITabBarController` so the chat
+/// conversation can be pushed by a genuine `UINavigationController`: native
+/// horizontal push, a single self-owned stable header, and the tab bar sliding
+/// away via `hidesBottomBarWhenPushed`. Contact / Calls / Avatar remain pure
+/// SwiftUI, each hosted in a `UIHostingController`.
+final class AppRootTabBarController: UITabBarController, UITabBarControllerDelegate,
+  UINavigationControllerDelegate, UIGestureRecognizerDelegate
+{
+  let coordinator = AppShellCoordinator()
+
+  /// Tab order; the index maps 1:1 to `AppShellTab`.
+  static let orderedTabs: [AppShellTab] = [.contacts, .calls, .chats, .search, .settings]
+  static func tabIndex(for tab: AppShellTab) -> Int? { orderedTabs.firstIndex(of: tab) }
+
+  private var chatsNav: UINavigationController?
+  private weak var chatHomeController: UIViewController?
+  private var toastHost: UIHostingController<AppToastHostView>?
+  private var profileCancellable: AnyCancellable?
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    delegate = self
+
+    // --- Tabs -------------------------------------------------------------
+    let contactsVC = makeHosted(ContactsRootView())
+    contactsVC.tabBarItem = UITabBarItem(
+      title: "Contact", image: UIImage(systemName: "person.circle"), selectedImage: nil)
+
+    let callsVC = makeHosted(CallsRootView())
+    callsVC.tabBarItem = UITabBarItem(
+      title: "Calls", image: UIImage(systemName: "phone"), selectedImage: nil)
+
+    let chatHomeVC = UIHostingController(rootView: ChatHomeScreen().environmentObject(coordinator))
+    let nav = UINavigationController(rootViewController: chatHomeVC)
+    // The home draws its in-content header. Pushed conversations use the real
+    // navigation bar so iOS owns the safe-area and scroll-edge treatment.
+    nav.setNavigationBarHidden(true, animated: false)
+    nav.delegate = self
+    nav.interactivePopGestureRecognizer?.delegate = self
+    nav.tabBarItem = UITabBarItem(
+      title: "Chat",
+      image: UIImage(systemName: "bubble.left.and.bubble.right.fill"),
+      selectedImage: nil)
+    chatsNav = nav
+    chatHomeController = chatHomeVC
+
+    let searchVC = UIViewController()
+    searchVC.view.backgroundColor = .clear
+    searchVC.tabBarItem = UITabBarItem(
+      title: "Search", image: UIImage(systemName: "magnifyingglass"), selectedImage: nil)
+
+    let settingsVC = makeHosted(SettingsRootView())
+    settingsVC.tabBarItem = UITabBarItem(
+      title: "Avatar", image: nil, selectedImage: nil)
+
+    viewControllers = [contactsVC, callsVC, nav, searchVC, settingsVC]
+    selectedIndex = Self.tabIndex(for: .chats) ?? 2
+
+    // --- Coordinator wiring ----------------------------------------------
+    coordinator.tabBarController = self
+    coordinator.chatsNavigationController = nav
+    coordinator.selectedTab = .chats
+
+    // --- Appearance & lifecycle ------------------------------------------
+    configureGlobalNavigationBarAppearance()
+    applyTabBarAppearance()
+    AppAppearanceController.applyStoredPreference()
+    installToastHost()
+
+    VibeNativeCallOverlayPresenter.shared.startObserving()
+    VibeNativeCallOverlayPresenter.shared.refreshFromEngine()
+
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleDidBecomeActive),
+      name: UIApplication.didBecomeActiveNotification,
+      object: nil
+    )
+
+    profileCancellable = AppProfileController.shared.$profile.sink { [weak self] _ in
+      Task { @MainActor in
+        self?.refreshAvatarTabItem()
+      }
+    }
+    Task { [weak self] in
+      await AppProfileController.shared.loadIfNeeded()
+      await MainActor.run { self?.refreshAvatarTabItem() }
+    }
+  }
+
+  deinit {
+    profileCancellable?.cancel()
+    NotificationCenter.default.removeObserver(self)
+  }
+
+  private func makeHosted<Content: View>(_ view: Content) -> UIViewController {
+    UIHostingController(rootView: view.environmentObject(coordinator))
+  }
+
+  // MARK: Tab selection sync
+
+  func tabBarController(
+    _ tabBarController: UITabBarController,
+    shouldSelect viewController: UIViewController
+  ) -> Bool {
+    guard let index = viewControllers?.firstIndex(of: viewController),
+      index < Self.orderedTabs.count
+    else { return true }
+    guard Self.orderedTabs[index] == .search else { return true }
+    coordinator.openChatSearch()
+    return false
+  }
+
+  func tabBarController(
+    _ tabBarController: UITabBarController, didSelect viewController: UIViewController
+  ) {
+    let index = tabBarController.selectedIndex
+    guard index < Self.orderedTabs.count else { return }
+    let tab = Self.orderedTabs[index]
+    if coordinator.selectedTab != tab {
+      coordinator.selectedTab = tab
+    }
+  }
+
+  // MARK: Interactive pop with the system nav bar hidden
+
+  func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+    (chatsNav?.viewControllers.count ?? 0) > 1
+  }
+
+  // MARK: Chat navigation chrome
+
+  func navigationController(
+    _ navigationController: UINavigationController,
+    willShow viewController: UIViewController,
+    animated: Bool
+  ) {
+    let showingHome = viewController === chatHomeController
+    navigationController.setNavigationBarHidden(showingHome, animated: animated)
+
+    guard showingHome else {
+      tabBar.alpha = 0.0
+      return
+    }
+
+    // UIKit reveals the tab bar at the start of an interactive pop. Keeping it
+    // transparent until the transition completes prevents it from compositing
+    // above the outgoing chat view.
+    tabBar.alpha = 0.0
+    guard let transition = navigationController.transitionCoordinator else {
+      tabBar.alpha = 1.0
+      return
+    }
+    transition.animate(alongsideTransition: nil) { [weak self] context in
+      self?.tabBar.alpha = context.isCancelled ? 0.0 : 1.0
+    }
+  }
+
+  func navigationController(
+    _ navigationController: UINavigationController,
+    didShow viewController: UIViewController,
+    animated: Bool
+  ) {
+    let showingHome = viewController === chatHomeController
+    navigationController.setNavigationBarHidden(showingHome, animated: false)
+    tabBar.alpha = showingHome ? 1.0 : 0.0
+  }
+
+  // MARK: Appearance
+
+  override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+    super.traitCollectionDidChange(previousTraitCollection)
+    if previousTraitCollection?.userInterfaceStyle != traitCollection.userInterfaceStyle {
+      applyTabBarAppearance()
+      configureGlobalNavigationBarAppearance()
+      refreshAvatarTabItem()
+    }
+  }
+
+  private var paletteForCurrentStyle: AppThemePalette {
+    AppThemePalette.resolve(for: traitCollection.userInterfaceStyle == .dark ? .dark : .light)
+  }
+
+  private func applyTabBarAppearance() {
+    let palette = paletteForCurrentStyle
+    let appearance = UITabBarAppearance()
+    appearance.configureWithDefaultBackground()
+
+    for itemAppearance in [
+      appearance.stackedLayoutAppearance,
+      appearance.inlineLayoutAppearance,
+      appearance.compactInlineLayoutAppearance,
+    ] {
+      itemAppearance.selected.iconColor = palette.accentUIColor
+      itemAppearance.selected.titleTextAttributes = [.foregroundColor: palette.accentUIColor]
+      itemAppearance.normal.iconColor = palette.secondaryTextUIColor
+      itemAppearance.normal.titleTextAttributes = [.foregroundColor: palette.secondaryTextUIColor]
+    }
+
+    tabBar.standardAppearance = appearance
+    tabBar.scrollEdgeAppearance = appearance
+    tabBar.tintColor = palette.accentUIColor
+    tabBar.unselectedItemTintColor = palette.secondaryTextUIColor
+  }
+
+  private func configureGlobalNavigationBarAppearance() {
+    let appearance = UINavigationBarAppearance()
+    appearance.configureWithTransparentBackground()
+    appearance.shadowColor = .clear
+    appearance.backgroundColor = .clear
+    UINavigationBar.appearance().standardAppearance = appearance
+    UINavigationBar.appearance().scrollEdgeAppearance = appearance
+    UINavigationBar.appearance().compactAppearance = appearance
+  }
+
+  // MARK: Settings tab avatar
+
+  @objc private func handleDidBecomeActive() {
+    VibeNativeCallOverlayPresenter.shared.refreshFromEngine()
+    refreshAvatarTabItem()
+  }
+
+  private func refreshAvatarTabItem() {
+    guard let settingsIndex = Self.tabIndex(for: .settings),
+      let controllers = viewControllers, settingsIndex < controllers.count
+    else { return }
+    let displayName =
+      AppProfileController.shared.profile?.displayName
+      ?? AppSessionConfig.current?.name
+      ?? AppSessionConfig.current?.username
+      ?? "Me"
+    let image = AppInitialsAvatarRenderer.image(
+      for: displayName,
+      size: 28,
+      backgroundColor: paletteForCurrentStyle.accentUIColor
+    )
+    let item = controllers[settingsIndex].tabBarItem
+    item?.image = image
+    item?.selectedImage = image
+  }
+
+  // MARK: Toast host
+
+  private func installToastHost() {
+    let host = UIHostingController(rootView: AppToastHostView())
+    host.view.backgroundColor = .clear
+    host.view.isUserInteractionEnabled = false
+    addChild(host)
+    host.view.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(host.view)
+    NSLayoutConstraint.activate([
+      host.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      host.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      host.view.topAnchor.constraint(equalTo: view.topAnchor),
+      host.view.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+    ])
+    host.didMove(toParent: self)
+    toastHost = host
+  }
+}
+
+/// Floating toast overlay hosted above the whole tab shell (including a pushed
+/// conversation) so it stays visible while a chat is open. Non-interactive.
+private struct AppToastHostView: View {
+  @ObservedObject private var toast = AppToastController.shared
+  @Environment(\.colorScheme) private var colorScheme
+
+  private var palette: AppThemePalette { AppThemePalette.resolve(for: colorScheme) }
+
+  var body: some View {
+    VStack {
+      Spacer()
+      if let message = toast.message {
+        AppToastBanner(message: message, palette: palette)
+          .padding(.horizontal, 20)
+          .padding(.bottom, 100)
+          .transition(.move(edge: .bottom).combined(with: .opacity))
+      }
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .animation(.spring(response: 0.3, dampingFraction: 0.82), value: toast.message)
+    .allowsHitTesting(false)
   }
 }

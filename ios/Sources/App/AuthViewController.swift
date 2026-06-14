@@ -518,12 +518,12 @@ private struct NativeAuthResponse: Decodable {
   let phoneNumber: String?
 }
 
-private struct NativeAuthResult {
+struct NativeAuthResult {
   let config: AppSessionConfig
   let recoverySecret: String?
 }
 
-private enum NativeAuthService {
+enum NativeAuthService {
   static func signUp(
     username: String,
     apiBaseURLString: String,
@@ -661,7 +661,11 @@ private enum NativeAuthService {
       let body = String(data: data, encoding: .utf8)?.trimmingCharacters(
         in: .whitespacesAndNewlines)
       if let body, !body.isEmpty {
-        return .message(body)
+        let lowered = body.lowercased()
+        if lowered.hasPrefix("<!doctype") || lowered.hasPrefix("<html") || lowered.contains("<body") {
+          return .message("Request failed with status \(statusCode).")
+        }
+        return .message(String(body.prefix(180)))
       }
       return .message("Request failed with status \(statusCode).")
     }

@@ -705,6 +705,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     collectionView.clipsToBounds = false
     collectionView.alwaysBounceVertical = true
     collectionView.showsVerticalScrollIndicator = false
+    collectionView.contentInsetAdjustmentBehavior = .never
+    if #available(iOS 26.0, *) {
+      collectionView.topEdgeEffect.style = .soft
+      collectionView.bottomEdgeEffect.style = .soft
+    }
     collectionView.register(
       ChatListCell.self, forCellWithReuseIdentifier: ChatListCell.reuseIdentifier)
     collectionView.dataSource = self
@@ -716,6 +721,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     scrollToneOverlay.clipsToBounds = true
     scrollToneOverlay.addSubview(scrollToneTopView)
     scrollToneOverlay.addSubview(scrollToneBottomView)
+    if #available(iOS 26.0, *) {
+      scrollToneOverlay.isHidden = true
+    }
     addSubview(scrollToneOverlay)
 
     applyWallpaperAppearance()
@@ -2348,12 +2356,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         startRemoteMediaDownload(for: row, presentOnComplete: true)
         return
       }
-      let seedImage = (collectionView.cellForItem(at: indexPath) as? ChatListCell)?
-        .currentMediaImage()
+      let cell = collectionView.cellForItem(at: indexPath) as? ChatListCell
+      let seedImage = cell?.currentMediaImage()
+      let sourceView = cell?.currentMediaImageView()
       presentImageEditView(
         for: row,
         mediaURL: resolvedPreferredMediaURL(for: row) ?? mediaURL,
-        seedImage: seedImage)
+        seedImage: seedImage,
+        sourceView: sourceView)
       return
     }
     let isMediaOrVideo =
@@ -4974,12 +4984,45 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     guard let raw, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
     let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
     if let parsed = URL(string: trimmed), parsed.isFileURL {
-      return parsed
+      return Self.relocatedToCurrentContainer(parsed)
     }
     if trimmed.hasPrefix("/") {
-      return URL(fileURLWithPath: trimmed)
+      return Self.relocatedToCurrentContainer(URL(fileURLWithPath: trimmed))
     }
     return nil
+  }
+
+  /// The app's data-container UUID changes on every reinstall/rebuild, so any
+  /// absolute path we previously persisted in `localMediaUrl` (e.g.
+  /// `/var/mobile/Containers/Data/Application/<OLD-UUID>/Library/Caches/...`)
+  /// points at a container that no longer exists after a rebuild — the file
+  /// reads as "missing" and the image renders empty. If the original path is
+  /// gone but the same sandbox-relative suffix exists under the CURRENT
+  /// container's home directory, return that instead so cached media survives
+  /// rebuilds.
+  static func relocatedToCurrentContainer(_ url: URL) -> URL {
+    let fileManager = FileManager.default
+    if fileManager.fileExists(atPath: url.path) {
+      return url
+    }
+    // Anchor on a sandbox-relative marker and rebuild the path against the
+    // current home directory. Order matters: match the deepest marker first.
+    let markers = [
+      "/Library/Caches/", "/Library/Application Support/", "/Library/",
+      "/Documents/", "/tmp/",
+    ]
+    let path = url.path
+    for marker in markers {
+      guard let range = path.range(of: marker) else { continue }
+      let suffix = String(path[range.lowerBound...])
+      let candidatePath = NSHomeDirectory() + suffix
+      if fileManager.fileExists(atPath: candidatePath) {
+        return URL(fileURLWithPath: candidatePath)
+      }
+      // First matching marker is authoritative; don't fall through to shallower ones.
+      break
+    }
+    return url
   }
 
   private func localFileSize(at url: URL) -> Int64 {
@@ -5381,10 +5424,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     return row.mediaUrl?.trimmingCharacters(in: .whitespacesAndNewlines)
   }
 
-  private func presentImageEditView(for row: ChatListRow, mediaURL: String, seedImage: UIImage?) {
+  private func presentImageEditView(for row: ChatListRow, mediaURL: String, seedImage: UIImage?, sourceView: UIView? = nil) {
     guard let presenter = topPresentingViewController() else { return }
     ChatImageEditModule.presentEditor(
       from: presenter,
+      sourceView: sourceView,
       messageId: row.messageId,
       mediaURL: mediaURL,
       initialImage: seedImage,
@@ -5873,7 +5917,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       let trimmedKey = mediaKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
       if !trimmedKey.isEmpty {
         let encryptedData = try Data(contentsOf: tempURL, options: [.mappedIfSafe])
-        guard let decryptedData = ChatEngine.shared.decryptMediaDataIfNeeded(encryptedData, mediaKey: trimmedKey)
+        guard
+          let decryptedData = ChatEngine.shared.decryptMediaDataIfNeeded(
+            encryptedData, mediaKey: trimmedKey),
+          !decryptedData.isEmpty
         else {
           return nil
         }
@@ -5881,6 +5928,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         try? fileManager.removeItem(at: tempURL)
       } else {
         try fileManager.moveItem(at: tempURL, to: destinationURL)
+      }
+      // Never cache an empty file: a 0-byte result reads back as a broken image
+      // and poisons the cache until manually evicted.
+      guard localFileSize(at: destinationURL) > 0 else {
+        try? fileManager.removeItem(at: destinationURL)
+        return nil
       }
       chatListDebugLog(
         chatListMediaVerboseDebugLogs,
@@ -5899,13 +5952,20 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         let trimmedKey = mediaKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !trimmedKey.isEmpty {
           let encryptedData = try Data(contentsOf: tempURL, options: [.mappedIfSafe])
-          guard let decryptedData = ChatEngine.shared.decryptMediaDataIfNeeded(encryptedData, mediaKey: trimmedKey)
+          guard
+            let decryptedData = ChatEngine.shared.decryptMediaDataIfNeeded(
+              encryptedData, mediaKey: trimmedKey),
+            !decryptedData.isEmpty
           else {
             return nil
           }
           try decryptedData.write(to: destinationURL, options: [.atomic])
         } else {
           try fileManager.copyItem(at: tempURL, to: destinationURL)
+        }
+        guard localFileSize(at: destinationURL) > 0 else {
+          try? fileManager.removeItem(at: destinationURL)
+          return nil
         }
         chatListDebugLog(
           chatListMediaVerboseDebugLogs,

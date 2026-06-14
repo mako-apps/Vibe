@@ -1584,7 +1584,7 @@ final class ChatInputBar: UIView {
     let bannerExtra: CGFloat = replyBannerExtra + mentionBannerExtra
     let pillH = clampedTextH + textInsetV * 2 + bannerExtra
 
-    let composerBottomVPad = keyboardHeightForPanels > 0 || keyboardProgress > 0.01 ? 0 : bottomVPad
+    let composerBottomVPad = keyboardHeightForPanels > 0 || keyboardProgress > 0.01 ? 6.0 : bottomVPad
     let composerHeight = topVPad + pillH + composerBottomVPad + safeBottom
     let panelHeight = gifPanelVisible ? preferredGifPanelHeight() : 0
     let totalH = composerHeight + panelHeight

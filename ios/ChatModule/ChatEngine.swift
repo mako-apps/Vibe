@@ -538,7 +538,7 @@ final class ChatEngine {
       guard let self else { return }
       // Reset backoff and cancel pending reconnect timer so we connect
       // immediately instead of waiting for the next backoff tick.
-      self.queue.sync {
+      self.syncOnQueue {
         self.reconnectAttempt = 0
         self.cancelReconnectLocked()
         self.appendJournalLocked(
@@ -684,7 +684,7 @@ final class ChatEngine {
   private func ensureNativeTransport(trigger: String) {
     guard #available(iOS 13.0, *) else { return }
     var clientToDisconnect: ChatRealtimeTransport?
-    let shouldConnect = queue.sync {
+    let shouldConnect = syncOnQueue {
       if !hasRealtimeDemandLocked() {
         return false
       }
@@ -749,7 +749,7 @@ final class ChatEngine {
   private func ensurePacketRuntimeAsync(trigger: String) -> Bool {
     var shouldStart = false
     var handled = false
-    let configPayload = queue.sync { () -> [String: Any]? in
+    let configPayload = syncOnQueue { () -> [String: Any]? in
       let config = store.getConfig()
       if transportModeLocked(config: config) == "packet_mesh" && packetProxyPortLocked(config: config) == nil {
         handled = true
@@ -809,7 +809,7 @@ final class ChatEngine {
           )
         }
         self.ensureNativeTransport(trigger: "packet_runtime_ready:\(trigger)")
-        let queuedChatIds = self.queue.sync { Array(self.pendingOutboundQueueByChat.keys) }
+        let queuedChatIds = self.syncOnQueue { Array(self.pendingOutboundQueueByChat.keys) }
         for chatId in queuedChatIds {
           self.queue.async {
             self.scheduleReplayQueuedOutboundLocked(chatId: chatId, trigger: "packet_runtime_ready")
@@ -947,7 +947,7 @@ final class ChatEngine {
       : payload
     store.setConfig(mergedPayload)
     let now = nowMs()
-    let snapshot = queue.sync {
+    let snapshot = syncOnQueue {
       if configuredUserId != nil, configuredUserId != nextUserId {
         pendingOutboundDraftsByMessageId.removeAll()
         pendingOutboundQueueByChat.removeAll()
@@ -1022,7 +1022,7 @@ final class ChatEngine {
       return connectNativePresence()
     }
     let now = nowMs()
-    return queue.sync {
+    return syncOnQueue {
       state["connected"] = true
       state["state"] = "connected-shadow"
       state["updatedAt"] = now
@@ -1035,7 +1035,7 @@ final class ChatEngine {
   }
 
   func disconnect() -> [String: Any] {
-    let clientToClose: ChatRealtimeTransport? = queue.sync {
+    let clientToClose: ChatRealtimeTransport? = syncOnQueue {
       let now = nowMs()
       autoReconnectEnabled = false
       cancelReconnectLocked()
@@ -1112,7 +1112,7 @@ final class ChatEngine {
       normalizedString(payload["peerAgentId"] ?? payload["peer_agent_id"])
     guard !surfaceId.isEmpty else { return getStatus() }
 
-    let result = queue.sync { () -> (snapshot: [String: Any], shouldEnsureTransport: Bool) in
+    let result = syncOnQueue { () -> (snapshot: [String: Any], shouldEnsureTransport: Bool) in
       let nextBinding = SurfaceBinding(
         surfaceId: surfaceId,
         chatId: chatId,
@@ -1168,7 +1168,7 @@ final class ChatEngine {
     let surfaceId =
       normalizedString(payload["surfaceId"]) ?? normalizedString(payload["engineSurfaceId"]) ?? ""
     guard !surfaceId.isEmpty else { return getStatus() }
-    return queue.sync {
+    return syncOnQueue {
       surfaceBindings.removeValue(forKey: surfaceId)
       state["updatedAt"] = nowMs()
       appendJournalLocked(event: "unbind-surface", payload: ["surfaceId": surfaceId])
@@ -1181,7 +1181,7 @@ final class ChatEngine {
   func openChatChannel(_ payload: [String: Any]) -> [String: Any] {
     let chatId = normalizedString(payload["chatId"]) ?? normalizedString(payload["chat_id"])
     let peerUserIdHint = normalizedUpper(payload["peerUserId"] ?? payload["peer_user_id"])
-    let snapshot = queue.sync {
+    let snapshot = syncOnQueue {
       if let chatId, !chatId.isEmpty {
         if let peerUserIdHint {
           chatPeerUserIdsByChatId[chatId] = peerUserIdHint
@@ -1213,7 +1213,7 @@ final class ChatEngine {
 
   func closeChatChannel(_ payload: [String: Any]) -> [String: Any] {
     let chatId = normalizedString(payload["chatId"]) ?? normalizedString(payload["chat_id"])
-    return queue.sync {
+    return syncOnQueue {
       if let chatId, !chatId.isEmpty, let current = openChatChannels[chatId] {
         if current <= 1 {
           openChatChannels.removeValue(forKey: chatId)
@@ -1290,7 +1290,7 @@ final class ChatEngine {
     }
 
     var triggered = 0
-    queue.sync {
+    syncOnQueue {
       for (rawChatId, messagesArray) in histories {
         guard let chatId = normalizedString(rawChatId), !chatId.isEmpty else { continue }
         _ = restoreCachedHistoryRowsLocked(chatId: chatId)
@@ -1354,7 +1354,7 @@ final class ChatEngine {
     let signalId = "\(event):\(callId):\(toUserId):\(now)"
     var shouldConnect = false
 
-    let result = queue.sync {
+    let result = syncOnQueue {
       nativeUserChannelDemandUntilMs = max(nativeUserChannelDemandUntilMs, now + nativeCallSignalDemandMs)
       expirePendingCallSignalsLocked(now: now)
 
@@ -1431,7 +1431,7 @@ final class ChatEngine {
         return false
       }
     }()
-    return queue.sync {
+    return syncOnQueue {
       if isBridgeTextModeLocked() {
         return ["accepted": false, "reason": "typing_disabled_in_blackout", "typing": typing]
       }
@@ -1492,7 +1492,7 @@ final class ChatEngine {
       }
     }()
     let mode = normalizedString(payload["mode"]) ?? "voice"
-    return queue.sync {
+    return syncOnQueue {
       if isBridgeTextModeLocked() {
         return [
           "accepted": false,
@@ -1553,7 +1553,7 @@ final class ChatEngine {
   func retryOutgoingMessage(_ payload: [String: Any]) -> [String: Any] {
     let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"])
     let messageId = normalizedString(payload["messageId"] ?? payload["message_id"])
-    return queue.sync {
+    return syncOnQueue {
       guard let messageId else {
         return ["accepted": false, "reason": "invalid_message"]
       }
@@ -1589,7 +1589,7 @@ final class ChatEngine {
     let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"])
     let peerUserId = normalizedUpper(payload["peerUserId"] ?? payload["peer_user_id"] ?? payload["userId"] ?? payload["id"])
     let publicKey = extractPublicKeyValue(from: payload)
-    return queue.sync {
+    return syncOnQueue {
       guard let chatId, !chatId.isEmpty, let peerUserId, !peerUserId.isEmpty else {
         return ["accepted": false, "reason": "invalid_peer"]
       }
@@ -1622,7 +1622,7 @@ final class ChatEngine {
   func cancelOutgoingMessage(_ payload: [String: Any]) -> [String: Any] {
     let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"])
     let messageId = normalizedString(payload["messageId"] ?? payload["message_id"])
-    return queue.sync {
+    return syncOnQueue {
       guard let messageId else {
         return ["accepted": false, "reason": "invalid_message"]
       }
@@ -1765,7 +1765,7 @@ final class ChatEngine {
         payload["peerAgentId"] ?? payload["peer_agent_id"] ?? payload["mentionedAgentId"]
           ?? payload["mentioned_agent_id"])
 
-    return queue.sync {
+    return syncOnQueue {
       canceledOutboundMessageIds.remove(messageId)
       let effectivePayload = payload
       let isGroup =
@@ -2454,7 +2454,7 @@ final class ChatEngine {
       ]
     }
 
-    return queue.sync {
+    return syncOnQueue {
       guard let client = phoenixClient else {
         return [
           "accepted": false,
@@ -2525,7 +2525,7 @@ final class ChatEngine {
       return ["accepted": false, "reason": "edit_disabled_in_blackout"]
     }
 
-    return queue.sync {
+    return syncOnQueue {
       guard let client = phoenixClient else {
         return ["accepted": false, "reason": "no_native_socket"]
       }
@@ -2579,7 +2579,7 @@ final class ChatEngine {
       }
     }()
 
-    return queue.sync {
+    return syncOnQueue {
       guard let client = phoenixClient else {
         return ["accepted": false, "reason": "no_native_socket"]
       }
@@ -2620,7 +2620,7 @@ final class ChatEngine {
       return ["accepted": false, "reason": "empty_text"]
     }
 
-    return queue.sync {
+    return syncOnQueue {
       guard let existingMessage = findMessagePayloadLocked(chatId: chatId, messageId: messageId)
       else {
         return ["accepted": false, "reason": "message_not_found"]
@@ -2746,7 +2746,7 @@ final class ChatEngine {
     let status = normalizedString(payload["status"])?.lowercased()
     guard let chatId, let messageId, let status else { return getStatus() }
     if status == "delivered" || status == "read" {
-      return queue.sync {
+      return syncOnQueue {
         upsertReceiptLocked(chatId: chatId, messageId: messageId, status: status)
         if status == "read" || status == "delivered" {
           upsertLocalStatusLocked(chatId: chatId, messageId: messageId, status: status)
@@ -2760,7 +2760,7 @@ final class ChatEngine {
         return snapshot
       }
     }
-    return queue.sync {
+    return syncOnQueue {
       upsertLocalStatusLocked(chatId: chatId, messageId: messageId, status: status)
       appendJournalLocked(event: "upsert-local-status", payload: payload)
       state["updatedAt"] = nowMs()
@@ -3262,7 +3262,7 @@ final class ChatEngine {
 
   func clearJournal() -> [String: Any] {
     store.clearJournal()
-    return queue.sync {
+    return syncOnQueue {
       journalEntryCount = 0
       state["updatedAt"] = nowMs()
       state["journalCount"] = 0
@@ -3382,7 +3382,7 @@ final class ChatEngine {
   // Shadow-mode bridge from JS until native Phoenix transport is implemented.
   func setPresenceSnapshot(userIds: [String]) -> [String: Any] {
     let normalized = Set(userIds.compactMap { normalizedUpper($0) })
-    return queue.sync {
+    return syncOnQueue {
       if nativePresenceActive {
         state["updatedAt"] = nowMs()
         appendJournalLocked(
@@ -3738,7 +3738,7 @@ final class ChatEngine {
 
   @available(iOS 13.0, *)
   private func connectNativePresence() -> [String: Any] {
-    _ = queue.sync {
+    _ = syncOnQueue {
       bootstrapConfigFromNativeSessionIfNeededLocked(trigger: "connect_native_presence")
     }
     let config = store.getConfig()
@@ -3753,7 +3753,7 @@ final class ChatEngine {
       ?? (userId != nil ? "user:\(userId!)" : nil)
 
     if transportMode == "offline" {
-      return queue.sync {
+      return syncOnQueue {
         state["state"] = "offline"
         state["connected"] = false
         state["updatedAt"] = nowMs()
@@ -3781,7 +3781,7 @@ final class ChatEngine {
       return getStatus()
     }
     guard resolvedTarget != nil, let userTopic, hasRequiredPacketProxy else {
-      return queue.sync {
+      return syncOnQueue {
         state["state"] = "native-config-missing"
         state["connected"] = false
         state["updatedAt"] = nowMs()
@@ -3818,7 +3818,7 @@ final class ChatEngine {
       onEvent: { [weak self] frame in self?.handleNativeSocketFrame(frame) }
     )
 
-    let clientToReplace: ChatRealtimeTransport? = queue.sync {
+    let clientToReplace: ChatRealtimeTransport? = syncOnQueue {
       autoReconnectEnabled = true
       cancelReconnectLocked()
       var clientToReplace: ChatRealtimeTransport?
@@ -3915,7 +3915,7 @@ final class ChatEngine {
     }
 
     clientToReplace?.disconnect()
-    (queue.sync { phoenixClient })?.connect()
+    (syncOnQueue { phoenixClient })?.connect()
     return getStatus()
   }
 
@@ -4614,7 +4614,7 @@ final class ChatEngine {
   }
 
   func isJsEmergencyFallbackEnabled() -> Bool {
-    queue.sync {
+    syncOnQueue {
       switch getConfigValueLocked("chatNativeJsFallbackEnabled") {
       case let bool as Bool:
         return bool
