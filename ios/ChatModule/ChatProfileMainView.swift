@@ -60,6 +60,12 @@ extension String {
 }
 
 private enum NativeProfileAvatarImageLoader {
+  private static let cache: NSCache<NSString, UIImage> = {
+    let cache = NSCache<NSString, UIImage>()
+    cache.countLimit = 128
+    return cache
+  }()
+
   static func load(from rawValue: String?) async -> UIImage? {
     guard let rawValue else { return nil }
     let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -90,9 +96,17 @@ private enum NativeProfileAvatarImageLoader {
       return nil
     }
 
+    if let cached = cache.object(forKey: value as NSString) {
+      return cached
+    }
+
     do {
-      let (data, _) = try await URLSession.shared.data(from: url)
-      return UIImage(data: data)
+      var request = URLRequest(url: url)
+      request.cachePolicy = .returnCacheDataElseLoad
+      let (data, _) = try await URLSession.shared.data(for: request)
+      guard let image = UIImage(data: data) else { return nil }
+      cache.setObject(image, forKey: value as NSString)
+      return image
     } catch {
       return nil
     }
@@ -1311,6 +1325,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
 
   func setAvatarUri(_ value: String?) {
     let normalized = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard avatarUri != normalized else { return }
     avatarUri = normalized
     refreshAvatar()
   }

@@ -1643,29 +1643,20 @@ private struct ChatHomeEditActionBar: View {
   }
 }
 
-private struct ResoloGlassEffectRepresentable: UIViewRepresentable {
-  let isDark: Bool
-
-  func makeUIView(context: Context) -> UIVisualEffectView {
-    let view = UIVisualEffectView(effect: nil)
-    if #available(iOS 26.0, *) {
-      let effect = UIGlassEffect()
-      effect.isInteractive = false
-      view.effect = effect
-    } else {
-      let style: UIBlurEffect.Style = isDark ? .systemUltraThinMaterialDark : .systemUltraThinMaterialLight
-      view.effect = UIBlurEffect(style: style)
-    }
-    return view
+private struct ChatShareSheetPresentationModifier: ViewModifier {
+  func body(content: Content) -> some View {
+    content
+      .background(Color.black.opacity(0.3).ignoresSafeArea())
+      .presentationDetents([.medium, .large])
+      .presentationContentInteraction(.resizes)
+      .presentationDragIndicator(.hidden)
+      .presentationCornerRadius(30)
   }
+}
 
-  func updateUIView(_ uiView: UIVisualEffectView, context: Context) {
-    if #available(iOS 26.0, *) {
-      // UIGlassEffect handles trait changes natively
-    } else {
-      let style: UIBlurEffect.Style = isDark ? .systemUltraThinMaterialDark : .systemUltraThinMaterialLight
-      uiView.effect = UIBlurEffect(style: style)
-    }
+private extension View {
+  func chatShareSheetPresentation() -> some View {
+    modifier(ChatShareSheetPresentationModifier())
   }
 }
 
@@ -2709,6 +2700,7 @@ final class ChatConversationController: UIViewController {
     applyPendingRowsAfterAttachment(reason: "viewDidAppear")
     settleInitialBottomIfNeeded(reason: "viewDidAppear")
     schedulePostPresentationActivation(reason: "viewDidAppear")
+    refreshPersistentAgentInboxSummary()
   }
 
   override func viewDidLayoutSubviews() {
@@ -2840,6 +2832,7 @@ final class ChatConversationController: UIViewController {
     // Inbox mode: when the attached agent batches events, the chat view keeps the
     // transcript clean and surfaces event notifications behind the Inbox banner.
     mainView.setAgentEventInboxMode(enabled: route.isAgentInboxMode)
+    refreshPersistentAgentInboxSummary()
     mainView.setInputPlaceholder(
       route.chatId == "saved_messages"
         ? "Saved Message"
@@ -3163,6 +3156,38 @@ final class ChatConversationController: UIViewController {
     }
   }
 
+  private func refreshPersistentAgentInboxSummary() {
+    guard route.isAgentInboxMode,
+      let agentID = route.peerAgentId,
+      !agentID.isEmpty,
+      let config = AppSessionConfig.current
+    else { return }
+
+    Task { [weak self] in
+      guard let self else { return }
+      do {
+        let page = try await AgentInboxAPI.loadPage(
+          agentID: agentID,
+          config: config,
+          limit: 1,
+          offset: 0
+        )
+        let preview = page.items.first.map { item in
+          item.body.isEmpty ? item.title : item.body
+        }
+        await MainActor.run {
+          guard self.route.peerAgentId == agentID else { return }
+          self.mainView.setPersistentAgentEventInbox(
+            count: page.total,
+            latestPreview: preview
+          )
+        }
+      } catch {
+        // The chat-row fallback remains visible if the persistent request fails.
+      }
+    }
+  }
+
   @discardableResult
   private func applyRowsToSurface(
     _ rows: [[String: Any]],
@@ -3370,14 +3395,16 @@ final class ChatConversationController: UIViewController {
     }
     profileView.transform = CGAffineTransform(translationX: width, y: 0.0)
     UIView.animate(
-      withDuration: 0.26,
+      withDuration: 0.34,
       delay: 0.0,
-      options: [.curveEaseOut, .beginFromCurrentState]
+      usingSpringWithDamping: 0.9,
+      initialSpringVelocity: 0.28,
+      options: [.curveEaseInOut, .beginFromCurrentState, .allowUserInteraction]
     ) {
       profileView.transform = .identity
-      self.mainView.transform = .identity
+      self.mainView.transform = CGAffineTransform(translationX: -width * 0.28, y: 0.0)
     } completion: { _ in
-      self.mainView.transform = .identity
+      self.mainView.transform = CGAffineTransform(translationX: -width * 0.28, y: 0.0)
     }
   }
 
@@ -3404,26 +3431,23 @@ final class ChatConversationController: UIViewController {
       profileView.alpha = 0.0
       profileView.isHidden = true
       mainView.transform = .identity
-      profileView.removeFromSuperview()
-      self.profileView = nil
       return
     }
     UIView.animate(
-      withDuration: 0.22,
+      withDuration: 0.32,
       delay: 0.0,
-      options: [.curveEaseOut, .beginFromCurrentState]
+      usingSpringWithDamping: 0.92,
+      initialSpringVelocity: 0.24,
+      options: [.curveEaseInOut, .beginFromCurrentState, .allowUserInteraction]
     ) {
       profileView.transform = CGAffineTransform(translationX: width, y: 0.0)
-      profileView.alpha = 0.92
+      profileView.alpha = 1.0
+      self.mainView.transform = .identity
     } completion: { _ in
       profileView.transform = .identity
       profileView.alpha = 0.0
       profileView.isHidden = true
       self.mainView.transform = .identity
-      if self.profileView === profileView {
-        profileView.removeFromSuperview()
-        self.profileView = nil
-      }
     }
   }
 
@@ -3463,6 +3487,10 @@ final class ChatConversationController: UIViewController {
         let agentUserId = Self.normalizedString(
           payload["agentUserId"] ?? payload["agent_user_id"])
       else { return }
+      let tappedAgentID = Self.normalizedString(payload["agentId"] ?? payload["agent_id"])
+      if agentUserId == route.peerUserId || tappedAgentID == route.peerAgentId {
+        return
+      }
       let agentName =
         Self.normalizedString(payload["agentName"] ?? payload["agent_name"]) ?? "Agent"
       let agentUsername = Self.normalizedString(
@@ -3479,7 +3507,12 @@ final class ChatConversationController: UIViewController {
       }
     case "agentInboxPressed":
       let inboxRows = mainView.currentEventInboxRows()
-      let inboxVC = AgentInboxViewController(rows: inboxRows, agentTitle: route.title)
+      let inboxVC = AgentInboxViewController(
+        rows: inboxRows,
+        agentTitle: route.title,
+        agentID: route.peerAgentId,
+        config: AppSessionConfig.current
+      )
       let nav = UINavigationController(rootViewController: inboxVC)
       nav.modalPresentationStyle = .pageSheet
       if let sheet = nav.sheetPresentationController {
@@ -3522,13 +3555,12 @@ final class ChatConversationController: UIViewController {
         appShellRouteLog(
           "ChatConversationController shareInside chatId=\(route.chatId) count=\(messageIds.count)")
         // Present chat selection to pick a target chat for forwarding
-        if let config = AppSessionConfig.current {
+        if AppSessionConfig.current != nil {
           let sourceChatId = route.chatId
           struct ShareSheetWrapper: View {
             let onSelect: ([String: Any]) -> Void
             let onDismiss: () -> Void
             @State private var isPresented = false
-            @Environment(\.colorScheme) private var colorScheme
 
             var body: some View {
               Color.clear
@@ -3538,22 +3570,14 @@ final class ChatConversationController: UIViewController {
                 .sheet(isPresented: $isPresented, onDismiss: {
                   onDismiss()
                 }) {
-                  ZStack {
-                    ResoloGlassEffectRepresentable(isDark: colorScheme == .dark)
-                      .ignoresSafeArea()
-
-                    ShareChatSelectionView(onSelect: { payload in
-                      isPresented = false
-                      DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                        onSelect(payload)
-                        onDismiss()
-                      }
-                    })
-                  }
-                  .presentationDetents([.fraction(0.72)])
-                  .presentationCornerRadius(30)
-                  .presentationDragIndicator(.hidden)
-                  .presentationBackground(.clear)
+                  ShareChatSelectionView(onSelect: { payload in
+                    isPresented = false
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                      onSelect(payload)
+                      onDismiss()
+                    }
+                  })
+                  .chatShareSheetPresentation()
                 }
             }
           }

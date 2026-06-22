@@ -133,6 +133,7 @@ defmodule VibeWeb.Router do
     get "/agents/:id/integrations", AgentsController, :integrations
     post "/agents/:id/integrations", AgentsController, :create_integration
     put "/agents/:id/integrations/:integration_id", AgentsController, :update_integration
+    get "/agents/:id/events", AgentsController, :events
     get "/agents/:id/threads", AgentsController, :threads
     get "/agents/:id/threads/:thread_id", AgentsController, :thread
     post "/agents/:id/approval_tasks/:task_id/approve", AgentsController, :approve_task

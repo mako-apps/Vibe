@@ -517,6 +517,31 @@ defmodule Vibe.Agents do
     )
   end
 
+  def list_events(%Agent{} = agent, opts \\ []) do
+    limit =
+      opts
+      |> Keyword.get(:limit, 200)
+      |> max(1)
+      |> min(500)
+
+    offset =
+      opts
+      |> Keyword.get(:offset, 0)
+      |> max(0)
+
+    base = from e in AgentEvent, where: e.agent_id == ^agent.id
+
+    events =
+      base
+      |> order_by([e], desc: e.occurred_at, desc: e.inserted_at, desc: e.id)
+      |> limit(^limit)
+      |> offset(^offset)
+      |> preload([:thread])
+      |> Repo.all()
+
+    {events, Repo.aggregate(base, :count, :id)}
+  end
+
   def get_thread(%Agent{} = agent, thread_id) when is_binary(thread_id) do
     Repo.one(
       from t in AgentEventThread,
@@ -860,6 +885,34 @@ defmodule Vibe.Agents do
     else
       base
     end
+  end
+
+  def event_payload(%AgentEvent{} = event) do
+    thread =
+      case event.thread do
+        %AgentEventThread{} = value -> value
+        _ -> nil
+      end
+
+    %{
+      id: event.id,
+      eventId: event.event_id,
+      eventType: event.event_type,
+      source: event.source,
+      title: event.title,
+      text: event.text,
+      attachments: normalize_attachments_payload(event.attachments),
+      payload: event.payload || %{},
+      occurredAt: event.occurred_at,
+      status: event.status,
+      decision: event.decision,
+      decisionReason: event.decision_reason,
+      messageId: event.message_id,
+      threadId: event.thread_id,
+      threadKey: thread && thread.thread_key,
+      threadTitle: thread && thread.title,
+      priority: (thread && thread.priority) || "normal"
+    }
   end
 
   def approval_task_payload(%AgentApprovalTask{} = task) do

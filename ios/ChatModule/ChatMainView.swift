@@ -223,6 +223,8 @@ public final class ChatMainView: UIView,
   private var agentInboxModeEnabled = false
   private var inboxBannerCount = 0
   private var inboxBannerPreview: String?
+  private var persistentInboxCount: Int?
+  private var persistentInboxPreview: String?
   private var builderSetupPanelPayload: ChatBuilderPanelPayload?
   private var builderSetupNavigationController: UINavigationController?
   private var lastPresentedBuilderRequestId: String?
@@ -416,6 +418,8 @@ public final class ChatMainView: UIView,
       if !enabled {
         inboxBannerCount = 0
         inboxBannerPreview = nil
+        persistentInboxCount = nil
+        persistentInboxPreview = nil
         setNeedsLayout()
       }
     }
@@ -425,6 +429,18 @@ public final class ChatMainView: UIView,
   private func updateInboxBanner(count: Int, latestPreview: String?) {
     inboxBannerCount = count
     inboxBannerPreview = latestPreview
+    renderInboxBanner()
+  }
+
+  func setPersistentAgentEventInbox(count: Int, latestPreview: String?) {
+    persistentInboxCount = max(0, count)
+    persistentInboxPreview = latestPreview
+    renderInboxBanner()
+  }
+
+  private func renderInboxBanner() {
+    let count = max(inboxBannerCount, persistentInboxCount ?? 0)
+    let latestPreview = persistentInboxPreview ?? inboxBannerPreview
     // The banner is the inbox surface: show it whenever the agent is in inbox
     // mode, even with zero notifications, so the user always has a place to tap.
     // In batched_summary mode a summary message may not arrive for hours, so a
@@ -689,7 +705,9 @@ public final class ChatMainView: UIView,
   }
 
   func setAvatarUri(_ value: String?) {
-    avatarUri = (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    let next = (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    guard avatarUri != next else { return }
+    avatarUri = next
     updateAvatarViews()
   }
 
@@ -1199,8 +1217,9 @@ public final class ChatMainView: UIView,
     
     UIView.transition(with: headerContentView, duration: 0.3, options: .transitionCrossDissolve) {
       if isActive {
-        self.backButton.setImage(nil, for: .normal)
-        self.backButton.setTitle("Clear Chat", for: .normal)
+        self.backButton.setTitle(nil, for: .normal)
+        self.backButton.setImage(UIImage(systemName: "xmark"), for: .normal)
+        self.backButton.accessibilityLabel = "Cancel selection"
         self.chatTitleLabel.text = "\(count) Selected"
         self.chatSubtitleLabel.isHidden = true
         self.avatarImageView.alpha = 0
@@ -1210,6 +1229,7 @@ public final class ChatMainView: UIView,
       } else {
         self.backButton.setTitle(nil, for: .normal)
         self.backButton.setImage(UIImage(systemName: "chevron.left"), for: .normal)
+        self.backButton.accessibilityLabel = "Back"
         self.updateHeaderTexts() // restores chatTitleLabel and chatSubtitleLabel
         self.avatarImageView.alpha = 1
         self.avatarFallbackIconView.alpha = 1
@@ -2662,7 +2682,9 @@ public final class ChatMainView: UIView,
       backEffect.isInteractive = true
       backGlassView.effect = backEffect
 
-      titleGlassView.effect = nil
+      let titleEffect = UIGlassEffect()
+      titleEffect.isInteractive = true
+      titleGlassView.effect = titleEffect
 
       let avatarEffect = UIGlassEffect()
       avatarEffect.isInteractive = true
@@ -2682,7 +2704,7 @@ public final class ChatMainView: UIView,
       profileMenuGlassView.effect = profileMenuEffect
     } else {
       backGlassView.effect = UIBlurEffect(style: .systemMaterial)
-      titleGlassView.effect = nil
+      titleGlassView.effect = UIBlurEffect(style: .systemMaterial)
       avatarGlassView.effect = UIBlurEffect(style: .systemMaterial)
       menuGlassView.effect = UIBlurEffect(style: .systemMaterial)
       savedSearchCancelGlassView.effect = UIBlurEffect(style: .systemMaterial)
@@ -3875,12 +3897,24 @@ public final class ChatMainView: UIView,
     guard avatarResolveGeneration == generation else { return }
     guard let url = URL(string: resolvedUri), !resolvedUri.isEmpty else { return }
 
+    if let cached = ChatHomeCardCell.avatarCached(forKey: resolvedUri) {
+      avatarImageView.image = cached
+      profileAvatarImageView.image = cached
+      avatarImageView.isHidden = false
+      profileAvatarImageView.isHidden = false
+      avatarFallbackIconView.isHidden = true
+      profileAvatarFallbackIconView.isHidden = true
+      return
+    }
+
     var request = URLRequest(url: url)
+    request.cachePolicy = .returnCacheDataElseLoad
     request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
     let task = URLSession.shared.dataTask(with: request) { [weak self, generation] data, _, _ in
       guard let self, let data, let image = UIImage(data: data) else { return }
       DispatchQueue.main.async {
         guard self.avatarResolveGeneration == generation else { return }
+        ChatHomeCardCell.cacheAvatar(image, forKey: resolvedUri)
         self.avatarImageView.image = image
         self.profileAvatarImageView.image = image
         self.avatarImageView.isHidden = false

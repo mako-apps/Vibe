@@ -240,6 +240,28 @@ defmodule VibeWeb.AgentsController do
     end
   end
 
+  def events(conn, %{"id" => id} = params) do
+    owner_id = conn.assigns.current_user.id
+    limit = bounded_integer(params["limit"], 200, 1, 500)
+    offset = bounded_integer(params["offset"], 0, 0, 100_000)
+
+    case Agents.get_agent(id, owner_id) do
+      nil ->
+        conn |> put_status(:not_found) |> json(%{error: "Agent not found"})
+
+      agent ->
+        {events, total} = Agents.list_events(agent, limit: limit, offset: offset)
+
+        json(conn, %{
+          items: Enum.map(events, &Agents.event_payload/1),
+          total: total,
+          limit: limit,
+          offset: offset,
+          hasMore: offset + length(events) < total
+        })
+    end
+  end
+
   def threads(conn, %{"id" => id}) do
     owner_id = conn.assigns.current_user.id
 
@@ -365,6 +387,25 @@ defmodule VibeWeb.AgentsController do
 
         reraise exception, __STACKTRACE__
     end
+  end
+
+  defp bounded_integer(value, fallback, minimum, maximum) do
+    parsed =
+      cond do
+        is_integer(value) -> value
+        is_binary(value) ->
+          case Integer.parse(value) do
+            {number, _} -> number
+            :error -> fallback
+          end
+
+        true ->
+          fallback
+      end
+
+    parsed
+    |> max(minimum)
+    |> min(maximum)
   end
 
   defp ensure_agent_published(%{status: "published"}), do: :ok

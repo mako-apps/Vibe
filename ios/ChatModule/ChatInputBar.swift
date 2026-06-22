@@ -1417,6 +1417,10 @@ final class ChatInputBar: UIView {
   func setSelectionMode(_ active: Bool, animated: Bool) {
     if isSelectionMode == active { return }
     isSelectionMode = active
+    // Recompute mic/send visibility when leaving selection. The selection layout
+    // drives the mic alpha to zero, so preserving the previous alpha leaves it
+    // permanently hidden after deselection.
+    updateButtonStates(animated: false)
     if animated {
       UIView.animate(withDuration: 0.3, delay: 0, options: .curveEaseInOut) {
         self.setNeedsLayout()
