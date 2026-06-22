@@ -19,7 +19,8 @@ defmodule Vibe.AI.Tools.ConnectedApp do
          {:ok, selection} <- resolve_connected_app(agent, input, action),
          :ok <- ensure_action_allowed(selection, action),
          {:ok, secret} <- Agents.integration_secret(selection.integration),
-         {:ok, result} <- dispatch_action(selection, agent, requester_user_id, action, params, secret) do
+         {:ok, result} <-
+           dispatch_action(selection, agent, requester_user_id, action, params, secret) do
       result
     else
       {:error, reason} -> error_payload(reason)
@@ -38,15 +39,13 @@ defmodule Vibe.AI.Tools.ConnectedApp do
 
       items ->
         joined =
-          Enum.map_join(items, "\n", fn selection ->
-            actions = Enum.join(selection.allowed_actions, ", ")
-            "- #{selection.integration.name} (#{selection.integration.source_type}): #{actions}"
-          end)
+          Enum.map_join(items, "\n", &integration_prompt_guidance/1)
 
         """
         Connected app access is configured for this agent.
         Use the `call_connected_app` tool for website, business, admin, or app-side questions and actions instead of guessing.
-        Only use the configured actions below:
+        Preserve explicit user filters and timeframes in `params`; do not replace a requested query window with an inbox or report delivery cadence.
+        Only use the configured actions and parameter guidance below:
         #{joined}
         If the user asks for connected app data and none of these actions fit, say the connected app has not exposed that action yet.
         """
@@ -134,8 +133,11 @@ defmodule Vibe.AI.Tools.ConnectedApp do
     case candidates do
       [] ->
         case list_connected_apps(agent) do
-          [] -> {:error, :no_connected_app}
-          available -> {:error, {:integration_not_found, Enum.map(available, & &1.integration.name)}}
+          [] ->
+            {:error, :no_connected_app}
+
+          available ->
+            {:error, {:integration_not_found, Enum.map(available, & &1.integration.name)}}
         end
 
       [selection] ->
@@ -153,10 +155,17 @@ defmodule Vibe.AI.Tools.ConnectedApp do
       integration = selection.integration
 
       cond do
-        is_binary(requested_id) -> integration.id == requested_id
-        is_binary(requested_name) -> String.downcase(integration.name || "") == requested_name
-        is_binary(requested_source_type) -> String.downcase(integration.source_type || "") == requested_source_type
-        true -> true
+        is_binary(requested_id) ->
+          integration.id == requested_id
+
+        is_binary(requested_name) ->
+          String.downcase(integration.name || "") == requested_name
+
+        is_binary(requested_source_type) ->
+          String.downcase(integration.source_type || "") == requested_source_type
+
+        true ->
+          true
       end
     end)
   end
@@ -195,22 +204,72 @@ defmodule Vibe.AI.Tools.ConnectedApp do
 
   defp connected_app_config(%AgentIntegration{} = integration) do
     config =
-      get_nested_map(integration.routing_rules || %{}, ["connected_app"])
-      || get_nested_map(integration.routing_rules || %{}, ["connectedApp"])
+      get_nested_map(integration.routing_rules || %{}, ["connected_app"]) ||
+        get_nested_map(integration.routing_rules || %{}, ["connectedApp"])
 
-    endpoint_url = normalize_endpoint_url(map_get(config, "endpoint_url") || map_get(config, "endpointUrl"))
-    allowed_actions = normalize_string_list(map_get(config, "allowed_actions") || map_get(config, "allowedActions") || map_get(config, "actions"))
-    static_params = normalize_params(map_get(config, "static_params") || map_get(config, "staticParams"))
+    endpoint_url =
+      normalize_endpoint_url(map_get(config, "endpoint_url") || map_get(config, "endpointUrl"))
+
+    action_specs =
+      normalize_action_specs(map_get(config, "action_specs") || map_get(config, "actionSpecs"))
+
+    allowed_actions =
+      normalize_string_list(
+        map_get(config, "allowed_actions") || map_get(config, "allowedActions") ||
+          map_get(config, "actions")
+      )
+      |> Kernel.++(Map.keys(action_specs))
+      |> Enum.uniq()
+
+    static_params =
+      normalize_params(map_get(config, "static_params") || map_get(config, "staticParams"))
+
     timeout_ms = normalize_timeout(map_get(config, "timeout_ms") || map_get(config, "timeoutMs"))
 
     if is_binary(endpoint_url) and allowed_actions != [] do
       %{
         endpoint_url: endpoint_url,
         allowed_actions: allowed_actions,
+        action_specs: Map.take(action_specs, allowed_actions),
         static_params: static_params,
         timeout_ms: timeout_ms
       }
     end
+  end
+
+  defp integration_prompt_guidance(selection) do
+    actions =
+      Enum.map_join(selection.allowed_actions, "\n", fn action ->
+        case Map.get(selection.action_specs, action) do
+          nil ->
+            "  - #{action}"
+
+          spec ->
+            description =
+              case spec.description do
+                nil -> ""
+                value -> ": #{value}"
+              end
+
+            params =
+              case spec.params do
+                params when map_size(params) > 0 ->
+                  formatted =
+                    params
+                    |> Enum.sort_by(fn {name, _hint} -> name end)
+                    |> Enum.map_join("; ", fn {name, hint} -> "#{name}=#{hint}" end)
+
+                  " Params: #{formatted}."
+
+                _ ->
+                  ""
+              end
+
+            "  - #{action}#{description}#{params}"
+        end
+      end)
+
+    "- #{selection.integration.name} (#{selection.integration.source_type}):\n#{actions}"
   end
 
   defp get_nested_map(map, [key]) when is_map(map) do
@@ -290,6 +349,87 @@ defmodule Vibe.AI.Tools.ConnectedApp do
     |> Enum.uniq()
   end
 
+  defp normalize_action_specs(value) when is_map(value) do
+    Enum.reduce(value, %{}, fn {action, raw_spec}, specs ->
+      case normalize_action_spec(action, raw_spec) do
+        nil -> specs
+        {id, spec} -> Map.put(specs, id, spec)
+      end
+    end)
+  end
+
+  defp normalize_action_specs(value) when is_list(value) do
+    Enum.reduce(value, %{}, fn
+      raw_spec, specs when is_map(raw_spec) ->
+        action =
+          map_get(raw_spec, "id") || map_get(raw_spec, "action") || map_get(raw_spec, "name")
+
+        case normalize_action_spec(action, raw_spec) do
+          nil -> specs
+          {id, spec} -> Map.put(specs, id, spec)
+        end
+
+      _, specs ->
+        specs
+    end)
+  end
+
+  defp normalize_action_specs(_), do: %{}
+
+  defp normalize_action_spec(action, raw_spec) do
+    with id when is_binary(id) <- normalize_identifier(action) do
+      description =
+        case raw_spec do
+          value when is_binary(value) -> normalize_prompt_hint(value, 320)
+          value when is_map(value) -> normalize_prompt_hint(map_get(value, "description"), 320)
+          _ -> nil
+        end
+
+      params =
+        case raw_spec do
+          value when is_map(value) ->
+            normalize_action_params(map_get(value, "params") || map_get(value, "parameters"))
+
+          _ ->
+            %{}
+        end
+
+      {id, %{description: description, params: params}}
+    else
+      _ -> nil
+    end
+  end
+
+  defp normalize_action_params(value) when is_map(value) do
+    value
+    |> Enum.reduce(%{}, fn {name, hint}, params ->
+      with normalized_name when is_binary(normalized_name) <-
+             normalize_prompt_hint(to_string(name), 80),
+           normalized_hint when is_binary(normalized_hint) <-
+             normalize_prompt_hint(hint, 240) do
+        Map.put(params, normalized_name, normalized_hint)
+      else
+        _ -> params
+      end
+    end)
+    |> Enum.take(12)
+    |> Map.new()
+  end
+
+  defp normalize_action_params(_), do: %{}
+
+  defp normalize_prompt_hint(value, max_length) when is_binary(value) do
+    value
+    |> String.replace(~r/\s+/, " ")
+    |> String.trim()
+    |> case do
+      "" -> nil
+      trimmed -> String.slice(trimmed, 0, max_length)
+    end
+  end
+
+  defp normalize_prompt_hint(_, _), do: nil
+
   defp normalize_identifier(value) when is_binary(value) do
     case normalize_string(value) do
       nil -> nil
@@ -323,9 +463,15 @@ defmodule Vibe.AI.Tools.ConnectedApp do
 
   defp decode_response_body(other), do: other
 
-  defp response_summary(%{"summary" => summary}) when is_binary(summary) and summary != "", do: summary
-  defp response_summary(%{"message" => message}) when is_binary(message) and message != "", do: message
-  defp response_summary(%{"ok" => ok, "count" => count}) when is_boolean(ok) and is_number(count), do: "Result count: #{count}"
+  defp response_summary(%{"summary" => summary}) when is_binary(summary) and summary != "",
+    do: summary
+
+  defp response_summary(%{"message" => message}) when is_binary(message) and message != "",
+    do: message
+
+  defp response_summary(%{"ok" => ok, "count" => count}) when is_boolean(ok) and is_number(count),
+    do: "Result count: #{count}"
+
   defp response_summary(_), do: nil
 
   defp summarize_body(body) when is_binary(body) do
@@ -366,7 +512,8 @@ defmodule Vibe.AI.Tools.ConnectedApp do
   defp error_payload({:multiple_connected_apps, names}) do
     %{
       "ok" => false,
-      "error" => "Multiple connected app integrations match. Specify integration_name or integration_id.",
+      "error" =>
+        "Multiple connected app integrations match. Specify integration_name or integration_id.",
       "available_integrations" => names
     }
   end
