@@ -162,3 +162,9 @@ server_nodejs_old/
 legacy/
 .easignore
 docs/MESH_NETWORKING.md
+
+# Deploy-critical files — MUST be committed for Railway's Docker build
+# (override the broad *.sh / Dockerfile ignores above)
+!server/Dockerfile
+!server/start.sh
+!server/.dockerignore
