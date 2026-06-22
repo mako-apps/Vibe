@@ -36,6 +36,18 @@ final class ChatPinnedBannerView: UIControl {
     }
   }
 
+  /// Configures the banner with an explicit SF Symbol — used by the agent Inbox
+  /// banner (tray icon) rather than the default pin glyph.
+  func configure(title: String, body: String, systemImage: String, animateIcon: Bool = false) {
+    let shouldAnimate = animateIcon || titleLabel.text != title || bodyLabel.text != body
+    titleLabel.text = title
+    bodyLabel.text = body
+    iconImageView.image = UIImage(systemName: systemImage)
+    if shouldAnimate {
+      animatePinIcon()
+    }
+  }
+
   func applyTheme(textColor: UIColor, surfaceColor: UIColor, isDark: Bool) {
     if #available(iOS 26.0, *) {
       let glass = UIGlassEffect()

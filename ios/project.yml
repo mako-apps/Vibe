@@ -29,7 +29,6 @@ targets:
       - path: Sources
       - path: ChatModule
         excludes:
-          - ChatAgentView.swift
           - ChatHomeListView.swift
           - ChatListViewCells.swift.patch
           - VibeCallUiCoordinator.swift

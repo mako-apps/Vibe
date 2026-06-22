@@ -93,7 +93,8 @@ public final class ChatContextMenuOverlay: UIView {
     bubbleFrame: CGRect,
     bubbleIsMe: Bool,
     appearance: ChatListAppearance,
-    showResendAction: Bool
+    showResendAction: Bool,
+    showRegenerateAction: Bool = false
   ) {
     self.messageId = messageId
     self.bubbleSnapshot = bubbleSnapshot
@@ -129,7 +130,8 @@ public final class ChatContextMenuOverlay: UIView {
     self.contextMenu = ContextMenuView(
       appearance: appearance,
       messageId: messageId,
-      showResendAction: showResendAction
+      showResendAction: showResendAction,
+      showRegenerateAction: showRegenerateAction
     )
 
     super.init(frame: .zero)
@@ -754,7 +756,12 @@ final class ContextMenuView: UIView {
 
   let messageId: String
 
-  init(appearance: ChatListAppearance, messageId: String, showResendAction: Bool) {
+  init(
+    appearance: ChatListAppearance,
+    messageId: String,
+    showResendAction: Bool,
+    showRegenerateAction: Bool = false
+  ) {
     self.messageId = messageId
     var resolvedActions: [ActionItem] = [
       ActionItem(
@@ -774,6 +781,18 @@ final class ContextMenuView: UIView {
           isDestructive: false
         ),
         at: 2
+      )
+    }
+    if showRegenerateAction {
+      // Agent bubbles: offer regenerate at the top of the hold menu.
+      resolvedActions.insert(
+        ActionItem(
+          id: "regenerate",
+          title: "Regenerate",
+          iconName: "arrow.trianglehead.2.counterclockwise",
+          isDestructive: false
+        ),
+        at: 0
       )
     }
     self.actions = resolvedActions

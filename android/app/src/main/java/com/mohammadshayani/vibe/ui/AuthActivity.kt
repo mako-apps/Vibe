@@ -519,7 +519,7 @@ private data class NativeAuthResponse(
   val phoneNumber: String?,
 )
 
-private data class NativeAuthResult(
+internal data class NativeAuthResult(
   val config: AppSessionConfig,
   val recoverySecret: String,
 )
@@ -529,7 +529,7 @@ private data class NativeAuthKeyPair(
   val privateKeyPem: String,
 )
 
-private object NativeAuthService {
+internal object NativeAuthService {
   private val jsonMediaType = "application/json".toMediaType()
   private val client =
     OkHttpClient.Builder()
@@ -653,9 +653,19 @@ private object NativeAuthService {
   }
 
   private fun parseServerError(rawBody: String, statusCode: Int): String {
-    return runCatching {
-      JSONObject(rawBody).optString("error").takeIf { it.isNotBlank() }
-    }.getOrNull() ?: rawBody.ifBlank { "Request failed with status $statusCode." }
+    val serverMessage =
+      runCatching {
+        val json = JSONObject(rawBody)
+        listOf(json.optString("error"), json.optString("message"), json.optString("reason"))
+          .firstOrNull { it.isNotBlank() }
+      }.getOrNull()
+    if (!serverMessage.isNullOrBlank()) return serverMessage
+    val trimmed = rawBody.trim()
+    val lower = trimmed.lowercase()
+    if (trimmed.isBlank() || lower.startsWith("<!doctype") || lower.startsWith("<html") || "<body" in lower) {
+      return "Request failed with status $statusCode."
+    }
+    return trimmed.take(180)
   }
 
   private fun deriveSocketUrl(apiBaseUrl: String): String {

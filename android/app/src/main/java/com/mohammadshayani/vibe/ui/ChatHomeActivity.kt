@@ -50,9 +50,10 @@ class ChatHomeActivity : AppCompatActivity() {
     val menuId: Int,
     val title: String,
   ) {
-    CONTACTS(1, "Contacts"),
-    CALLS(2, "Calls"),
-    CHATS(3, "Chats"),
+    CONTACTS(0, "Contacts"),
+    CALLS(1, "Calls"),
+    CHATS(2, "Chats"),
+    SEARCH(3, "Search"),
     SETTINGS(4, "Settings");
 
     companion object {
@@ -246,12 +247,27 @@ class ChatHomeActivity : AppCompatActivity() {
 
     bottomNavigationView =
       BottomNavigationView(this).apply {
-        setBackgroundColor(palette.backgroundColor)
+        background = android.graphics.drawable.GradientDrawable().apply {
+          shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+          setColor(Color.parseColor("#111111"))
+          cornerRadius = dp(24f).toFloat()
+        }
         elevation = 0f
         labelVisibilityMode = NavigationBarView.LABEL_VISIBILITY_LABELED
-        itemActiveIndicatorColor = ColorStateList.valueOf(palette.overlayColor)
-        itemIconTintList = navigationTintList(palette)
-        itemTextColor = navigationTintList(palette)
+        
+        val activeColor = Color.parseColor("#007AFF")
+        itemActiveIndicatorColor = ColorStateList.valueOf(activeColor)
+        val states = arrayOf(
+          intArrayOf(android.R.attr.state_checked),
+          intArrayOf(-android.R.attr.state_checked)
+        )
+        val colors = intArrayOf(
+          activeColor,
+          Color.parseColor("#8E8E93")
+        )
+        val tintList = ColorStateList(states, colors)
+        itemIconTintList = tintList
+        itemTextColor = tintList
         itemRippleColor = ColorStateList.valueOf(palette.overlayColor)
 
         // Ensure clean and modern SVG icons are used
@@ -261,12 +277,44 @@ class ChatHomeActivity : AppCompatActivity() {
           .setIcon(R.drawable.ic_vibe_tab_calls)
         menu.add(0, ShellTab.CHATS.menuId, 2, ShellTab.CHATS.title)
           .setIcon(R.drawable.ic_vibe_tab_chats)
+        menu.add(0, ShellTab.SEARCH.menuId, 3, ShellTab.SEARCH.title)
+          .setIcon(android.R.drawable.ic_menu_search)
 
         // Settings Tab with Avatar Fallback
-        val settingsMenuItem = menu.add(0, ShellTab.SETTINGS.menuId, 3, ShellTab.SETTINGS.title)
-        settingsMenuItem.setIcon(R.drawable.ic_vibe_tab_settings)
+        val settingsMenuItem = menu.add(0, ShellTab.SETTINGS.menuId, 4, ShellTab.SETTINGS.title)
+        
+        // Generate circular avatar with colored badge
+        val size = dp(24f)
+        val bitmap = android.graphics.Bitmap.createBitmap(size, size, android.graphics.Bitmap.Config.ARGB_8888)
+        val canvas = android.graphics.Canvas(bitmap)
+        val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+        paint.color = Color.parseColor("#8E8E93")
+        val radius = size / 2f
+        canvas.drawCircle(radius, radius, radius, paint)
+        
+        // Draw initials
+        paint.color = Color.WHITE
+        paint.textSize = size * 0.5f
+        paint.textAlign = android.graphics.Paint.Align.CENTER
+        canvas.drawText("U", radius, radius - (paint.descent() + paint.ascent()) / 2f, paint)
+
+        // Draw green status badge
+        val badgeRadius = dp(4f).toFloat()
+        paint.color = Color.GREEN
+        canvas.drawCircle(size - badgeRadius, size - badgeRadius, badgeRadius, paint)
+        paint.style = android.graphics.Paint.Style.STROKE
+        paint.color = Color.BLACK
+        paint.strokeWidth = dp(1.5f).toFloat()
+        canvas.drawCircle(size - badgeRadius, size - badgeRadius, badgeRadius, paint)
+        
+        settingsMenuItem.icon = android.graphics.drawable.BitmapDrawable(resources, bitmap)
 
         setOnItemSelectedListener {
+          if (it.itemId == ShellTab.SEARCH.menuId) {
+            updateSearchPresentation(true)
+            chatsPage.focusSearch()
+            return@setOnItemSelectedListener false
+          }
           if (isSyncingBottomNavigation) {
             return@setOnItemSelectedListener true
           }
@@ -279,8 +327,12 @@ class ChatHomeActivity : AppCompatActivity() {
       bottomNavigationView,
       FrameLayout.LayoutParams(
         FrameLayout.LayoutParams.MATCH_PARENT,
-        FrameLayout.LayoutParams.WRAP_CONTENT,
-      ),
+        dp(48f),
+      ).apply {
+        leftMargin = dp(20f)
+        rightMargin = dp(20f)
+        bottomMargin = dp(16f)
+      }
     )
 
     chatsPage =
@@ -352,11 +404,25 @@ class ChatHomeActivity : AppCompatActivity() {
       bottomNavigationView.selectedItemId = currentTab.menuId
       isSyncingBottomNavigation = false
     }
-    bottomNavigationView.setBackgroundColor(palette.backgroundColor)
+    bottomNavigationView.background = android.graphics.drawable.GradientDrawable().apply {
+      shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+      setColor(Color.parseColor("#111111"))
+      cornerRadius = dp(24f).toFloat()
+    }
     bottomNavigationView.labelVisibilityMode = NavigationBarView.LABEL_VISIBILITY_LABELED
-    bottomNavigationView.itemActiveIndicatorColor = ColorStateList.valueOf(palette.overlayColor)
-    bottomNavigationView.itemIconTintList = navigationTintList(palette)
-    bottomNavigationView.itemTextColor = navigationTintList(palette)
+    val activeColor = Color.parseColor("#007AFF")
+    bottomNavigationView.itemActiveIndicatorColor = ColorStateList.valueOf(activeColor)
+    val states = arrayOf(
+      intArrayOf(android.R.attr.state_checked),
+      intArrayOf(-android.R.attr.state_checked)
+    )
+    val colors = intArrayOf(
+      activeColor,
+      Color.parseColor("#8E8E93")
+    )
+    val tintList = ColorStateList(states, colors)
+    bottomNavigationView.itemIconTintList = tintList
+    bottomNavigationView.itemTextColor = tintList
     contentHost.setBackgroundColor(palette.backgroundColor)
     if (currentTab != ShellTab.CHATS) {
       updateSearchPresentation(false)
@@ -369,6 +435,7 @@ class ChatHomeActivity : AppCompatActivity() {
         ShellTab.CONTACTS -> contactsPage
         ShellTab.CALLS -> callsPage
         ShellTab.CHATS -> chatsPage
+        ShellTab.SEARCH -> chatsPage
         ShellTab.SETTINGS -> settingsPage
       }
     if (contentHost.childCount == 0 || contentHost.getChildAt(0) !== page) {
@@ -454,6 +521,7 @@ class ChatHomeActivity : AppCompatActivity() {
           else -> "Chats"
         }
       }
+      ShellTab.SEARCH -> "Search"
       ShellTab.SETTINGS -> "Settings"
     }
   }
@@ -1311,6 +1379,7 @@ private class SettingsPageView(
             state.palette,
             "saved_messages",
             R.drawable.ic_vibe_saved,
+            Color.rgb(255, 149, 0),
             "Saved Messages",
             null,
           ),
@@ -1318,6 +1387,7 @@ private class SettingsPageView(
             state.palette,
             "your_qr",
             R.drawable.ic_vibe_qr,
+            Color.rgb(52, 199, 89),
             "Your QR",
             "Show",
           ),
@@ -1325,6 +1395,7 @@ private class SettingsPageView(
             state.palette,
             "connection_manager",
             R.drawable.ic_vibe_connection,
+            Color.rgb(0, 122, 255),
             "Connection Manager",
             state.connectionModeTitle,
           ),
@@ -1342,6 +1413,7 @@ private class SettingsPageView(
             state.palette,
             "secret_key",
             R.drawable.ic_vibe_key,
+            Color.rgb(175, 82, 222),
             "Secret Key",
             state.secretKeySummary,
           ),
@@ -1359,6 +1431,7 @@ private class SettingsPageView(
             state.palette,
             "appearance",
             R.drawable.ic_vibe_palette,
+            Color.rgb(88, 86, 214),
             "Appearance",
             state.appearanceSummary,
           ),
@@ -1381,7 +1454,7 @@ private class SettingsPageView(
       LinearLayout(context).apply {
         orientation = LinearLayout.HORIZONTAL
         gravity = Gravity.CENTER_VERTICAL
-        background = roundedRect(palette.cardColor, palette.borderColor, 24f)
+        background = roundedRect(palette.cardColor, Color.TRANSPARENT, 24f)
         setPadding(dp(context, 18f), dp(context, 18f), dp(context, 18f), dp(context, 18f))
       }
 
@@ -1449,13 +1522,7 @@ private class SettingsPageView(
         setPadding(dp(context, 16f), dp(context, 14f), dp(context, 16f), dp(context, 14f))
       }
     group.addView(row)
-    row.addView(
-	      ImageView(context).apply {
-	        setImageResource(R.drawable.ic_vibe_bell)
-	        setColorFilter(palette.accentColor)
-      },
-      LinearLayout.LayoutParams(dp(context, 22f), dp(context, 22f)),
-    )
+    row.addView(settingsIconChip(R.drawable.ic_vibe_bell, Color.rgb(255, 59, 48)))
     val textColumn = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
     row.addView(
       textColumn,
@@ -1521,7 +1588,7 @@ private class SettingsPageView(
     val container =
       LinearLayout(context).apply {
         orientation = LinearLayout.VERTICAL
-        background = roundedRect(palette.cardColor, palette.borderColor, 24f)
+        background = roundedRect(palette.cardColor, Color.TRANSPARENT, 24f)
       }
     rows.forEachIndexed { index, row ->
       container.addView(row)
@@ -1536,6 +1603,7 @@ private class SettingsPageView(
     palette: AppThemePalette,
     rowId: String,
     iconRes: Int,
+    iconColor: Int,
     title: String,
     detail: String?,
   ): View {
@@ -1544,16 +1612,10 @@ private class SettingsPageView(
         orientation = LinearLayout.HORIZONTAL
         gravity = Gravity.CENTER_VERTICAL
         foreground = selectableItemBackground()
-        setPadding(dp(context, 16f), dp(context, 14f), dp(context, 16f), dp(context, 14f))
+        setPadding(dp(context, 16f), dp(context, 12f), dp(context, 16f), dp(context, 12f))
         setOnClickListener { onRowPress(rowId) }
       }
-    row.addView(
-      ImageView(context).apply {
-        setImageResource(iconRes)
-        setColorFilter(palette.accentColor)
-      },
-      LinearLayout.LayoutParams(dp(context, 22f), dp(context, 22f)),
-    )
+    row.addView(settingsIconChip(iconRes, iconColor))
     row.addView(
       TextView(context).apply {
         text = title
@@ -1575,15 +1637,29 @@ private class SettingsPageView(
       )
     }
     row.addView(
-	      ImageView(context).apply {
-	        setImageResource(R.drawable.ic_vibe_chevron_right)
-	        setColorFilter(palette.tertiaryTextColor)
+      ImageView(context).apply {
+        setImageResource(R.drawable.ic_vibe_chevron_right)
+        setColorFilter(palette.tertiaryTextColor)
       },
       LinearLayout.LayoutParams(dp(context, 16f), dp(context, 16f)).apply {
         marginStart = dp(context, 10f)
       },
     )
     return row
+  }
+
+  private fun settingsIconChip(iconRes: Int, fillColor: Int): View {
+    return FrameLayout(context).apply {
+      background = roundedRect(fillColor, Color.TRANSPARENT, 8f)
+      addView(
+        ImageView(context).apply {
+          setImageResource(iconRes)
+          setColorFilter(Color.WHITE)
+        },
+        FrameLayout.LayoutParams(dp(context, 20f), dp(context, 20f), Gravity.CENTER),
+      )
+      layoutParams = LinearLayout.LayoutParams(dp(context, 32f), dp(context, 32f))
+    }
   }
 
   private fun sectionLabel(
@@ -1615,7 +1691,9 @@ private class SettingsPageView(
       shape = GradientDrawable.RECTANGLE
       cornerRadius = dp(context, radiusDp).toFloat()
       setColor(fillColor)
-      setStroke(dp(context, 1f), strokeColor)
+      if (strokeColor != Color.TRANSPARENT) {
+        setStroke(dp(context, 1f), strokeColor)
+      }
     }
   }
 

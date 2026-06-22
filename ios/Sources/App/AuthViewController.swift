@@ -172,7 +172,7 @@ final class NativeAuthSheetViewModel: ObservableObject {
       return
     }
 
-    let transportMode = AppSessionConfig.current?.transportMode ?? .packetMesh
+    let transportMode = AppSessionConfig.current?.transportMode ?? .direct
     let apiBaseURLString = AppSessionConfig.current?.apiBaseURLString ?? AppSessionConfig.defaultAPIBaseURLString
     isLoading = true
     authTask = Task { [weak self] in
@@ -209,7 +209,7 @@ final class NativeAuthSheetViewModel: ObservableObject {
       return
     }
 
-    let transportMode = AppSessionConfig.current?.transportMode ?? .packetMesh
+    let transportMode = AppSessionConfig.current?.transportMode ?? .direct
     let apiBaseURLString = AppSessionConfig.current?.apiBaseURLString ?? AppSessionConfig.defaultAPIBaseURLString
     isLoading = true
     authTask = Task { [weak self] in

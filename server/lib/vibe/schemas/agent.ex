@@ -13,6 +13,7 @@ defmodule Vibe.Agent do
     field :status, :string, default: "draft"
     field :display_name, :string
     field :system_prompt, :string, default: ""
+    field :prompt_variables, {:array, :map}, default: []
     field :persona, :string
     field :avatar_url, :string
     field :welcome_message, :string
@@ -48,6 +49,7 @@ defmodule Vibe.Agent do
       :status,
       :display_name,
       :system_prompt,
+      :prompt_variables,
       :persona,
       :avatar_url,
       :welcome_message,

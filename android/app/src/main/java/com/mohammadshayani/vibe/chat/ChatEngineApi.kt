@@ -9,6 +9,8 @@ import com.mohammadshayani.vibe.packet.PacketBootstrapService
 import com.mohammadshayani.vibe.packet.PacketRuntime
 import com.mohammadshayani.vibe.packet.PacketTransportMode
 import com.mohammadshayani.vibe.session.AppSessionConfig
+import com.mohammadshayani.vibe.storage.SecureKeyStore
+import com.mohammadshayani.vibe.ui.NativeAuthService
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -23,6 +25,9 @@ import java.util.concurrent.TimeUnit
 object ChatEngineApi {
   private const val CACHE_PREFS = "vibe_android_chat_home_cache"
   private const val CACHE_CHATS = "chats_payload_v1"
+
+  private open class FatalRequestException(message: String) : IOException(message)
+  private class SessionExpiredException(message: String) : FatalRequestException(message)
 
   private val httpClient by lazy {
     OkHttpClient.Builder()
@@ -63,30 +68,10 @@ object ChatEngineApi {
 
     Thread {
       val result = runCatching {
-        val request = buildRequest(config)
-        when (config.transportMode) {
-          PacketTransportMode.OFFLINE ->
-            throw IOException("Transport mode offline is not available in the standalone native app.")
-          PacketTransportMode.BRIDGE_TEXT ->
-            throw IOException("Transport mode bridge_text is not available in the standalone native app.")
-          PacketTransportMode.PACKET_MESH -> {
-            try {
-              val snapshot = PacketRuntime.ensureStarted(context, config)
-              execute(PacketRuntime.buildHttpClient(snapshot), request, context)
-            } catch (_: Throwable) {
-              execute(httpClient, request, context)
-            }
-          }
-          PacketTransportMode.DIRECT -> {
-            try {
-              val rows = execute(httpClient, request, context)
-              PacketRuntime.stop(context, resetToDirect = true)
-              PacketBootstrapService.prefetchIfNeeded(context, config)
-              rows
-            } catch (_: Throwable) {
-              val snapshot = PacketRuntime.ensureStarted(context, config)
-              execute(PacketRuntime.buildHttpClient(snapshot), request, context)
-            }
+        withSessionRefresh(context, config) { activeConfig ->
+          val request = buildRequest(activeConfig)
+          executeWithTransport(context, activeConfig) { client ->
+            execute(client, request, context)
           }
         }
       }
@@ -132,32 +117,9 @@ object ChatEngineApi {
 
     Thread {
       val result = runCatching {
-        val executor: (OkHttpClient) -> PeerLookupResult = { client ->
-          resolvePeer(client, config, normalizedLookup)
-        }
-        when (config.transportMode) {
-          PacketTransportMode.OFFLINE ->
-            throw IOException("Transport mode offline is not available in the standalone native app.")
-          PacketTransportMode.BRIDGE_TEXT ->
-            throw IOException("Transport mode bridge_text is not available in the standalone native app.")
-          PacketTransportMode.PACKET_MESH -> {
-            try {
-              val snapshot = PacketRuntime.ensureStarted(context, config)
-              executor(PacketRuntime.buildHttpClient(snapshot))
-            } catch (_: Throwable) {
-              executor(httpClient)
-            }
-          }
-          PacketTransportMode.DIRECT -> {
-            try {
-              val row = executor(httpClient)
-              PacketRuntime.stop(context, resetToDirect = true)
-              PacketBootstrapService.prefetchIfNeeded(context, config)
-              row
-            } catch (_: Throwable) {
-              val snapshot = PacketRuntime.ensureStarted(context, config)
-              executor(PacketRuntime.buildHttpClient(snapshot))
-            }
+        withSessionRefresh(context, config) { activeConfig ->
+          executeWithTransport(context, activeConfig) { client ->
+            resolvePeer(client, activeConfig, normalizedLookup)
           }
         }
       }
@@ -178,64 +140,106 @@ object ChatEngineApi {
 
     Thread {
       val result = runCatching {
-        val executor: (OkHttpClient) -> ChatHomeListRow = { client ->
-          val chatId = createDirectChat(client, config, peer.userId)
-          ChatEngine.seedChatPeerInfo(
-            mapOf(
-              "chatId" to chatId,
-              "peerUserId" to peer.userId,
-              "publicKey" to peer.publicKey,
-            ),
-          )
-          ChatHomeListRow(
-            chatId = chatId,
-            title = peer.displayName,
-            preview = "Start a conversation",
-            timeLabel = "",
-            unreadCount = 0,
-            markedUnread = false,
-            muted = false,
-            pinned = false,
-            isTyping = false,
-            isOnline = peer.isOnline,
-            peerUserId = peer.userId,
-            avatarUri = peer.avatarUri,
-            avatarFallback = peer.displayName.take(1).uppercase().ifBlank { "?" },
-            avatarGradientStartLight = null,
-            avatarGradientEndLight = null,
-            avatarGradientStartDark = null,
-            avatarGradientEndDark = null,
-            isSavedMessages = false,
-          )
-        }
-        when (config.transportMode) {
-          PacketTransportMode.OFFLINE ->
-            throw IOException("Transport mode offline is not available in the standalone native app.")
-          PacketTransportMode.BRIDGE_TEXT ->
-            throw IOException("Transport mode bridge_text is not available in the standalone native app.")
-          PacketTransportMode.PACKET_MESH -> {
-            try {
-              val snapshot = PacketRuntime.ensureStarted(context, config)
-              executor(PacketRuntime.buildHttpClient(snapshot))
-            } catch (_: Throwable) {
-              executor(httpClient)
-            }
+        withSessionRefresh(context, config) { activeConfig ->
+          val executor: (OkHttpClient) -> ChatHomeListRow = { client ->
+            val chatId = createDirectChat(client, activeConfig, peer.userId)
+            ChatEngine.seedChatPeerInfo(
+              mapOf(
+                "chatId" to chatId,
+                "peerUserId" to peer.userId,
+                "publicKey" to peer.publicKey,
+              ),
+            )
+            ChatHomeListRow(
+              chatId = chatId,
+              title = peer.displayName,
+              preview = "Start a conversation",
+              timeLabel = "",
+              unreadCount = 0,
+              markedUnread = false,
+              muted = false,
+              pinned = false,
+              isTyping = false,
+              isOnline = peer.isOnline,
+              peerUserId = peer.userId,
+              avatarUri = peer.avatarUri,
+              avatarFallback = peer.displayName.take(1).uppercase().ifBlank { "?" },
+              avatarGradientStartLight = null,
+              avatarGradientEndLight = null,
+              avatarGradientStartDark = null,
+              avatarGradientEndDark = null,
+              isSavedMessages = false,
+            )
           }
-          PacketTransportMode.DIRECT -> {
-            try {
-              val row = executor(httpClient)
-              PacketRuntime.stop(context, resetToDirect = true)
-              PacketBootstrapService.prefetchIfNeeded(context, config)
-              row
-            } catch (_: Throwable) {
-              val snapshot = PacketRuntime.ensureStarted(context, config)
-              executor(PacketRuntime.buildHttpClient(snapshot))
-            }
-          }
+          executeWithTransport(context, activeConfig, executor)
         }
       }
       mainHandler.post { callback(result) }
     }.start()
+  }
+
+  private fun <T> withSessionRefresh(
+    context: Context,
+    config: AppSessionConfig,
+    operation: (AppSessionConfig) -> T,
+  ): T {
+    return try {
+      operation(config)
+    } catch (error: SessionExpiredException) {
+      operation(refreshSession(context, error.message))
+    }
+  }
+
+  private fun refreshSession(context: Context, fallbackMessage: String?): AppSessionConfig {
+    val secret =
+      SecureKeyStore.retrieveSecret(context.applicationContext, "loginSecret")
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+        ?: throw SessionExpiredException(fallbackMessage ?: "Session expired. Sign in again.")
+    val result = NativeAuthService.signIn(context.applicationContext, secret)
+    AppSessionConfig.store(context.applicationContext, result.config)
+    SecureKeyStore.storeSecret(context.applicationContext, "loginSecret", secret)
+    return result.config
+  }
+
+  private fun <T> executeWithTransport(
+    context: Context,
+    config: AppSessionConfig,
+    operation: (OkHttpClient) -> T,
+  ): T {
+    return when (config.transportMode) {
+      PacketTransportMode.OFFLINE ->
+        throw IOException("Transport mode offline is not available in the standalone native app.")
+      PacketTransportMode.BRIDGE_TEXT ->
+        throw IOException("Transport mode bridge_text is not available in the standalone native app.")
+      PacketTransportMode.PACKET_MESH -> {
+        try {
+          val snapshot = PacketRuntime.ensureStarted(context, config)
+          operation(PacketRuntime.buildHttpClient(snapshot))
+        } catch (error: SessionExpiredException) {
+          throw error
+        } catch (error: FatalRequestException) {
+          throw error
+        } catch (_: Throwable) {
+          operation(httpClient)
+        }
+      }
+      PacketTransportMode.DIRECT -> {
+        try {
+          val value = operation(httpClient)
+          PacketRuntime.stop(context, resetToDirect = true)
+          PacketBootstrapService.prefetchIfNeeded(context, config)
+          value
+        } catch (error: SessionExpiredException) {
+          throw error
+        } catch (error: FatalRequestException) {
+          throw error
+        } catch (_: Throwable) {
+          val snapshot = PacketRuntime.ensureStarted(context, config)
+          operation(PacketRuntime.buildHttpClient(snapshot))
+        }
+      }
+    }
   }
 
   private fun buildRequest(config: AppSessionConfig): Request {
@@ -262,8 +266,18 @@ object ChatEngineApi {
       try {
         client.newCall(request).execute().use { response ->
           val body = response.body?.string().orEmpty()
+          if (response.code == 401) {
+            throw SessionExpiredException(serverErrorMessage(response.code, body, "Session expired. Sign in again."))
+          }
           if (!response.isSuccessful) {
-            lastFailure = IOException("User lookup failed with status ${response.code}: ${body.take(160)}")
+            lastFailure =
+              FatalRequestException(
+                if (response.code == 404) "User not found." else serverErrorMessage(response.code, body, "User lookup failed.")
+              )
+            return@use
+          }
+          if (!looksLikeJson(body)) {
+            lastFailure = FatalRequestException("The server returned an invalid user lookup response.")
             return@use
           }
           val json = JSONObject(body)
@@ -298,8 +312,12 @@ object ChatEngineApi {
             isOnline = parseBool(source.opt("online") ?: source.opt("isOnline") ?: source.opt("is_online")) ?: false,
           )
         }
-      } catch (error: IOException) {
-        lastFailure = error
+      } catch (error: SessionExpiredException) {
+        throw error
+      } catch (error: FatalRequestException) {
+        throw error
+      } catch (error: Throwable) {
+        lastFailure = IOException(sanitizeClientError(error.message, "User lookup failed."), error)
       }
     }
     throw lastFailure ?: IOException("User not found.")
@@ -328,8 +346,11 @@ object ChatEngineApi {
         .build()
     client.newCall(request).execute().use { response ->
       val payload = response.body?.string().orEmpty()
+      if (response.code == 401) {
+        throw SessionExpiredException(serverErrorMessage(response.code, payload, "Session expired. Sign in again."))
+      }
       if (!response.isSuccessful) {
-        throw IOException("Chat create failed with status ${response.code}: ${payload.take(160)}")
+        throw FatalRequestException(serverErrorMessage(response.code, payload, "Chat create failed."))
       }
       val chatId = JSONObject(payload).optString("chatId").trim()
       if (chatId.isBlank()) throw IOException("Chat create returned no chat id.")
@@ -368,15 +389,44 @@ object ChatEngineApi {
     context: Context,
   ): List<ChatHomeListRow> {
     client.newCall(request).execute().use { response ->
-      if (!response.isSuccessful) {
-        throw IOException(
-          "Request failed with status ${response.code}: ${response.body?.string().orEmpty().take(160)}"
-        )
-      }
       val body = response.body?.string().orEmpty()
+      if (response.code == 401) {
+        throw SessionExpiredException(serverErrorMessage(response.code, body, "Session expired. Sign in again."))
+      }
+      if (!response.isSuccessful) {
+        throw FatalRequestException(serverErrorMessage(response.code, body, "Request failed."))
+      }
       cachePayload(context, body)
       return parseChatHomeRows(parsePayload(body), context)
     }
+  }
+
+  private fun serverErrorMessage(statusCode: Int, body: String, fallback: String): String {
+    val serverMessage =
+      runCatching {
+        val json = JSONObject(body)
+        firstNonBlank(json.opt("message"), json.opt("error"), json.opt("reason"))
+      }.getOrNull()
+    if (!serverMessage.isNullOrBlank()) {
+      return if (statusCode == 401) serverMessage else "$fallback ($statusCode): $serverMessage"
+    }
+    val sanitized = sanitizeClientError(body, "")
+    return if (sanitized.isBlank()) "$fallback ($statusCode)." else "$fallback ($statusCode): $sanitized"
+  }
+
+  private fun sanitizeClientError(raw: String?, fallback: String): String {
+    val trimmed = raw?.trim().orEmpty()
+    if (trimmed.isBlank()) return fallback
+    val lower = trimmed.lowercase()
+    if (lower.startsWith("<!doctype") || lower.startsWith("<html") || "<body" in lower) {
+      return fallback
+    }
+    return trimmed.take(160)
+  }
+
+  private fun looksLikeJson(body: String): Boolean {
+    val trimmed = body.trimStart()
+    return trimmed.startsWith("{") || trimmed.startsWith("[")
   }
 
   private fun cachePayload(context: Context, body: String) {

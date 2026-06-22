@@ -105,9 +105,11 @@ struct ChatListRow {
     let id: String
     let style: String
     let agentId: String
+    let agentUserId: String?
     let displayName: String
     let username: String?
     let identifier: String
+    let avatarUrl: String?
     let status: String
     let promptStatus: String?
     let promptPreview: String?
@@ -127,33 +129,68 @@ struct ChatListRow {
     let attachedChats: [AgentCardDestination]
     let eventInboxMode: String
     let summaryWindowHours: Int
+    // "interval" (rolling window) or "daily" (fixed clock times). Optional so
+    // older cached cards decode cleanly; treat nil as "interval".
+    let summarySchedule: String?
+    // Fixed delivery times for the "daily" schedule, as "HH:MM" strings (UTC).
+    let summaryTimes: [String]?
     let incomingChatEnabled: Bool
     let canDelete: Bool
 
     static func parse(_ raw: [String: Any]) -> AgentCard? {
-      let id = parseNonEmptyString(raw["id"]) ?? UUID().uuidString
-      let style = parseNonEmptyString(raw["style"]) ?? "summary"
+      let rawId = parseNonEmptyString(raw["id"])
       guard
-        let agentId = parseNonEmptyString(raw["agent_id"] ?? raw["agentId"]),
-        let displayName = parseNonEmptyString(raw["display_name"] ?? raw["displayName"]),
-        let identifier = parseNonEmptyString(raw["identifier"]),
-        let status = parseNonEmptyString(raw["status"])
+        let agentId =
+          parseNonEmptyString(raw["agent_id"] ?? raw["agentId"])
+          ?? rawId
       else { return nil }
+      let id =
+        parseNonEmptyString(raw["card_id"] ?? raw["cardId"])
+        ?? ((raw["agent_id"] != nil || raw["agentId"] != nil) ? rawId : nil)
+        ?? "agent-card:\(agentId)"
+      let style = parseNonEmptyString(raw["style"]) ?? "summary"
+      let rawUsername =
+        parseNonEmptyString(raw["username"])
+        ?? parseNonEmptyString(raw["handle"])?.trimmingCharacters(
+          in: CharacterSet(charactersIn: "@"))
+      let displayName =
+        parseNonEmptyString(raw["display_name"] ?? raw["displayName"])
+        ?? rawUsername
+        ?? "Agent"
+      let identifier = parseNonEmptyString(raw["identifier"]) ?? rawUsername ?? agentId
+      let status = parseNonEmptyString(raw["status"]) ?? "draft"
 
       let defaultDestinationChat =
-        (raw["default_destination_chat"] as? [String: Any])
+        ((raw["default_destination_chat"] as? [String: Any])
+          ?? (raw["defaultDestinationChat"] as? [String: Any]))
         .flatMap(AgentCardDestination.parse)
       let attachedChats =
-        (raw["attached_chats"] as? [[String: Any]] ?? []).compactMap(AgentCardDestination.parse)
+        ((raw["attached_chats"] as? [[String: Any]])
+          ?? (raw["attachedChats"] as? [[String: Any]])
+          ?? []).compactMap(AgentCardDestination.parse)
       let (eventInboxMode, summaryWindowHours) = parseAgentCardEventInbox(raw)
+      let summarySchedule = parseAgentCardSummarySchedule(raw)
+      let summaryTimes = parseAgentCardSummaryTimes(raw)
+      let approvalRules =
+        (raw["approval_rules"] as? [String: Any])
+        ?? (raw["approvalRules"] as? [String: Any])
+      let chatInput =
+        (approvalRules?["chat_input"] as? [String: Any])
+        ?? (approvalRules?["chatInput"] as? [String: Any])
 
       return AgentCard(
         id: id,
         style: style,
         agentId: agentId,
+        agentUserId:
+          parseNonEmptyString(
+            raw["agent_user_id"] ?? raw["agentUserId"] ?? raw["user_id"] ?? raw["userId"]),
         displayName: displayName,
-        username: parseNonEmptyString(raw["username"]),
+        username: rawUsername,
         identifier: identifier,
+        avatarUrl:
+          parseNonEmptyString(
+            raw["avatar_url"] ?? raw["avatarUrl"] ?? raw["profile_image"] ?? raw["profileImage"]),
         status: status,
         promptStatus: parseNonEmptyString(raw["prompt_status"] ?? raw["promptStatus"]),
         promptPreview: parseNonEmptyString(raw["prompt_preview"] ?? raw["promptPreview"]),
@@ -176,8 +213,12 @@ struct ChatListRow {
         attachedChats: attachedChats,
         eventInboxMode: eventInboxMode,
         summaryWindowHours: summaryWindowHours,
+        summarySchedule: summarySchedule,
+        summaryTimes: summaryTimes,
         incomingChatEnabled:
-          parseBool(raw["incoming_chat_enabled"] ?? raw["incomingChatEnabled"]) ?? true,
+          parseBool(raw["incoming_chat_enabled"] ?? raw["incomingChatEnabled"])
+          ?? parseBool(chatInput?["enabled"])
+          ?? true,
         canDelete:
           (raw["can_delete"] as? Bool)
           ?? ((raw["canDelete"] as? Bool) ?? true)
@@ -197,7 +238,9 @@ struct ChatListRow {
         "attached_chats": attachedChats.map(\.rawValue),
         "can_delete": canDelete,
       ]
+      if let agentUserId { raw["agent_user_id"] = agentUserId }
       if let username { raw["username"] = username }
+      if let avatarUrl { raw["avatar_url"] = avatarUrl }
       if let promptStatus { raw["prompt_status"] = promptStatus }
       if let promptPreview { raw["prompt_preview"] = promptPreview }
       if let systemPrompt { raw["system_prompt"] = systemPrompt }
@@ -213,6 +256,8 @@ struct ChatListRow {
       if let defaultDestinationChat { raw["default_destination_chat"] = defaultDestinationChat.rawValue }
       raw["event_inbox_mode"] = eventInboxMode
       raw["summary_window_hours"] = summaryWindowHours
+      if let summarySchedule { raw["summary_schedule"] = summarySchedule }
+      if let summaryTimes { raw["summary_times"] = summaryTimes }
       raw["incoming_chat_enabled"] = incomingChatEnabled
       return raw
     }
@@ -277,6 +322,9 @@ struct ChatListRow {
   // Agent message fields
   let isAgentMessage: Bool
   let agentName: String?
+  let agentId: String?
+  let agentUserId: String?
+  let agentUsername: String?
   let plainContent: String?
   let isStreamingText: Bool
   let agentProgressNodes: [AgentProgressNode]
@@ -287,6 +335,21 @@ struct ChatListRow {
   let relatedMessageIds: [String]
   let relatedMessagesTitle: String?
   let relatedMessagesSubtitle: String?
+
+  // Agent event-inbox fields. An "event notification" is a message the agent
+  // posted from an external event ingestion (eventThread) or a batched event
+  // summary (eventInboxSummary). When the attached agent runs in inbox mode
+  // these are pulled out of the transcript and surfaced through the Inbox banner.
+  let isEventNotification: Bool
+  let isEventInboxSummary: Bool
+  let eventType: String?
+  let eventPriority: String?
+  let eventThreadId: String?
+
+  // Outgoing message failed to be delivered/answered (agent error or stopped).
+  let isDeliveryFailed: Bool
+  // Agent response whose turn errored out — drives the side regenerate button.
+  let isAgentError: Bool
 
   var isAgentMention: Bool {
     return isMe && text.lowercased().contains("@vibe")
@@ -484,6 +547,9 @@ struct ChatListRow {
       stickerBundleFileName = nil
       isAgentMessage = false
       agentName = nil
+      agentId = nil
+      agentUserId = nil
+      agentUsername = nil
       plainContent = nil
       isStreamingText = false
       agentProgressNodes = []
@@ -494,6 +560,13 @@ struct ChatListRow {
       relatedMessageIds = []
       relatedMessagesTitle = nil
       relatedMessagesSubtitle = nil
+      isEventNotification = false
+      isEventInboxSummary = false
+      eventType = nil
+      eventPriority = nil
+      eventThreadId = nil
+      isDeliveryFailed = false
+      isAgentError = false
       return
     }
 
@@ -664,7 +737,23 @@ struct ChatListRow {
 
     // Agent message fields
     isAgentMessage = (message["isAgentMessage"] as? Bool) ?? false
-    agentName = message["agentName"] as? String
+    agentName = firstNonEmptyString(
+      in: [message, metadata],
+      keys: ["agentName", "agent_name"]
+    )
+    agentId = firstNonEmptyString(
+      in: [message, metadata],
+      keys: ["agentId", "agent_id"]
+    )
+    agentUserId = firstNonEmptyString(
+      in: [message, metadata],
+      keys: ["agentUserId", "agent_user_id"]
+    )
+    agentUsername =
+      firstNonEmptyString(
+        in: [message, metadata],
+        keys: ["agentUsername", "agent_username", "agentHandle", "agent_handle"]
+      )?.trimmingCharacters(in: CharacterSet(charactersIn: "@"))
     plainContent = message["plainContent"] as? String
     agentProgressNodes = parseAgentProgressNodes(metadata?["progressNodes"])
     isStreamingText =
@@ -700,6 +789,36 @@ struct ChatListRow {
       in: [metadata, message],
       keys: ["relatedMessagesSubtitle", "related_messages_subtitle"]
     )
+    let eventInboxSummaryFlag =
+      (parseBool(metadata?["eventInboxSummary"]) ?? parseBool(metadata?["event_inbox_summary"]))
+      ?? (parseBool(message["eventInboxSummary"]) ?? parseBool(message["event_inbox_summary"]))
+      ?? false
+    let eventThreadFlag =
+      (parseBool(metadata?["eventThread"]) ?? parseBool(metadata?["event_thread"]))
+      ?? (parseBool(message["eventThread"]) ?? parseBool(message["event_thread"]))
+      ?? false
+    isEventInboxSummary = eventInboxSummaryFlag
+    isEventNotification = eventThreadFlag || eventInboxSummaryFlag
+    eventType = firstNonEmptyString(
+      in: [metadata, message],
+      keys: ["eventType", "event_type"]
+    )
+    eventPriority = firstNonEmptyString(
+      in: [metadata, message],
+      keys: ["priority", "eventPriority", "event_priority"]
+    )
+    eventThreadId = firstNonEmptyString(
+      in: [metadata, message],
+      keys: ["eventThreadId", "event_thread_id"]
+    )
+    isDeliveryFailed =
+      (message["deliveryFailed"] as? Bool)
+      ?? (message["delivery_failed"] as? Bool)
+      ?? false
+    isAgentError =
+      (message["isError"] as? Bool)
+      ?? (message["is_error"] as? Bool)
+      ?? false
   }
 }
 
@@ -982,6 +1101,9 @@ func chatListRowContentEqual(_ lhs: ChatListRow, _ rhs: ChatListRow) -> Bool {
     && lhs.stickerBundleFileName == rhs.stickerBundleFileName
     && lhs.isAgentMessage == rhs.isAgentMessage
     && lhs.agentName == rhs.agentName
+    && lhs.agentId == rhs.agentId
+    && lhs.agentUserId == rhs.agentUserId
+    && lhs.agentUsername == rhs.agentUsername
     && lhs.plainContent == rhs.plainContent
     && lhs.isStreamingText == rhs.isStreamingText
     && lhs.agentProgressNodes == rhs.agentProgressNodes
@@ -992,6 +1114,13 @@ func chatListRowContentEqual(_ lhs: ChatListRow, _ rhs: ChatListRow) -> Bool {
     && lhs.relatedMessageIds == rhs.relatedMessageIds
     && lhs.relatedMessagesTitle == rhs.relatedMessagesTitle
     && lhs.relatedMessagesSubtitle == rhs.relatedMessagesSubtitle
+    && lhs.isEventNotification == rhs.isEventNotification
+    && lhs.isEventInboxSummary == rhs.isEventInboxSummary
+    && lhs.eventType == rhs.eventType
+    && lhs.eventPriority == rhs.eventPriority
+    && lhs.eventThreadId == rhs.eventThreadId
+    && lhs.isDeliveryFailed == rhs.isDeliveryFailed
+    && lhs.isAgentError == rhs.isAgentError
 }
 
 private func parseAgentProgressNodes(_ raw: Any?) -> [ChatListRow.AgentProgressNode] {
@@ -1082,6 +1211,61 @@ private func parseAgentCardEventInbox(_ raw: [String: Any]) -> (mode: String, su
     normalizeAgentSummaryWindowHours(directHours ?? nestedHours)
 
   return (normalizedMode, normalizedHours)
+}
+
+private func agentCardEventInbox(_ raw: [String: Any]) -> [String: Any]? {
+  let approvalRules =
+    (raw["approval_rules"] as? [String: Any])
+    ?? (raw["approvalRules"] as? [String: Any])
+  return (approvalRules?["event_inbox"] as? [String: Any])
+    ?? (approvalRules?["eventInbox"] as? [String: Any])
+}
+
+private func parseAgentCardSummarySchedule(_ raw: [String: Any]) -> String? {
+  let eventInbox = agentCardEventInbox(raw)
+  let value =
+    parseNonEmptyString(raw["summary_schedule"])
+    ?? parseNonEmptyString(raw["summarySchedule"])
+    ?? parseNonEmptyString(eventInbox?["summary_schedule"])
+    ?? parseNonEmptyString(eventInbox?["summarySchedule"])
+  switch value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+  case "daily", "time_of_day", "times", "fixed":
+    return "daily"
+  case "interval", "window", "rolling":
+    return "interval"
+  default:
+    return nil
+  }
+}
+
+private func parseAgentCardSummaryTimes(_ raw: [String: Any]) -> [String]? {
+  let eventInbox = agentCardEventInbox(raw)
+  let rawList =
+    (raw["summary_times"] as? [Any])
+    ?? (raw["summaryTimes"] as? [Any])
+    ?? (eventInbox?["summary_times"] as? [Any])
+    ?? (eventInbox?["summaryTimes"] as? [Any])
+  guard let rawList else { return nil }
+  let times = rawList.compactMap { normalizeAgentSummaryTime($0) }
+  return times.isEmpty ? nil : Array(Set(times)).sorted()
+}
+
+/// Normalizes a clock time to "HH:MM" (24h, zero-padded). Accepts "H:MM"/"HH:MM"
+/// strings or an integer hour (0–23).
+private func normalizeAgentSummaryTime(_ value: Any?) -> String? {
+  if let intValue = value as? Int, (0...23).contains(intValue) {
+    return String(format: "%02d:00", intValue)
+  }
+  guard let str = parseNonEmptyString(value) else { return nil }
+  let parts = str.trimmingCharacters(in: .whitespaces).split(separator: ":", maxSplits: 1)
+  if parts.count == 2, let h = Int(parts[0]), let m = Int(parts[1]),
+    (0...23).contains(h), (0...59).contains(m) {
+    return String(format: "%02d:%02d", h, m)
+  }
+  if parts.count == 1, let h = Int(parts[0]), (0...23).contains(h) {
+    return String(format: "%02d:00", h)
+  }
+  return nil
 }
 
 private func normalizeAgentEventInboxMode(_ raw: String?) -> String {

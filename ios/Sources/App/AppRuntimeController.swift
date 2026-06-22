@@ -177,7 +177,7 @@ struct AppThemePalette {
     plate: AppThemePlateOption = AppThemePlateController.currentOption
   ) -> AppThemePalette {
     let isDark = colorScheme == .dark
-    let baseBackground = isDark ? hex(0x121212) : hex(0xF5F4F1)
+    let baseBackground = isDark ? hex(0x000000) : hex(0xFFFFFF)
     let baseSecondaryBackground = isDark ? hex(0x151515) : hex(0xF5F4F1)
     let baseCard = isDark ? hex(0x242424) : hex(0xFFFFFF)
     let baseInput = isDark ? hex(0x222222) : hex(0xF2F2F2)
@@ -818,10 +818,14 @@ enum AppRootControllerFactory {
   }
 
   static func makeAuthenticatedController() -> UIViewController {
-    // Native UIKit tab shell. The chats tab is a real UINavigationController so
-    // the conversation pushes natively with its own header and the tab bar
-    // slides away; the other tabs host their SwiftUI pages.
-    AppRootTabBarController()
+    // Native UIKit tab shell wrapped in a root navigation controller. A chat
+    // conversation is pushed onto the wrapping nav so it slides in z-above all
+    // four tabs (openable from any tab, never nested in Home); the tabs host
+    // their SwiftUI pages.
+    let tabBarController = AppRootTabBarController()
+    let rootNav = AppRootNavigationController(rootViewController: tabBarController)
+    tabBarController.coordinator.rootNavigationController = rootNav
+    return rootNav
   }
 
   static func makeWelcomeController() -> UIViewController {

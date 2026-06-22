@@ -158,6 +158,7 @@ public final class ChatMainView: UIView,
   private let pagesHost = UIView()
   private let chatPage = UIView()
   private let pinnedBannerView = ChatPinnedBannerView()
+  private let inboxBannerView = ChatPinnedBannerView()
   private let profilePage = UIView()
   private let agentPage = UIView()
   private let agentScrollView = UIScrollView()
@@ -219,6 +220,9 @@ public final class ChatMainView: UIView,
   private var pinnedBannerMediaUrl: String?
   private var pinnedBannerFileName: String?
   private var pinnedBannerIsFile = false
+  private var agentInboxModeEnabled = false
+  private var inboxBannerCount = 0
+  private var inboxBannerPreview: String?
   private var builderSetupPanelPayload: ChatBuilderPanelPayload?
   private var builderSetupNavigationController: UINavigationController?
   private var lastPresentedBuilderRequestId: String?
@@ -338,7 +342,7 @@ public final class ChatMainView: UIView,
     layoutProfileMembersContent()
     layoutAgentContent()
     applyPageState(animated: false, emitEvent: false)
-    
+
     avatarGlassView.contentView.layer.sublayers?.first(where: { $0.name == "savedMessagesGradient" })?.frame = avatarGlassView.contentView.bounds
     avatarGlassView.contentView.layer.sublayers?.first(where: { $0.name == "userAvatarGradient" })?.frame = avatarGlassView.contentView.bounds
     profileAvatarView.layer.sublayers?.first(where: { $0.name == "savedMessagesGradient" })?.frame = profileAvatarView.bounds
@@ -404,6 +408,72 @@ public final class ChatMainView: UIView,
     chatListView.setEnginePeerAgentId(value)
   }
 
+  /// Enables agent inbox mode: event notifications are filtered out of the
+  /// transcript and surfaced via the Inbox banner.
+  func setAgentEventInboxMode(enabled: Bool) {
+    if agentInboxModeEnabled != enabled {
+      agentInboxModeEnabled = enabled
+      if !enabled {
+        inboxBannerCount = 0
+        inboxBannerPreview = nil
+        setNeedsLayout()
+      }
+    }
+    chatListView.setEventInboxModeEnabled(enabled)
+  }
+
+  private func updateInboxBanner(count: Int, latestPreview: String?) {
+    inboxBannerCount = count
+    inboxBannerPreview = latestPreview
+    // The banner is the inbox surface: show it whenever the agent is in inbox
+    // mode, even with zero notifications, so the user always has a place to tap.
+    // In batched_summary mode a summary message may not arrive for hours, so a
+    // count-gated banner would otherwise stay hidden the whole time.
+    let shouldShow = agentInboxModeEnabled
+    if shouldShow {
+      let title: String
+      switch count {
+      case 0: title = "Inbox"
+      case 1: title = "Inbox · 1 notification"
+      default: title = "Inbox · \(count) notifications"
+      }
+      let body = count == 0 ? "No new notifications" : (latestPreview ?? "Tap to review agent updates")
+      inboxBannerView.configure(
+        title: title,
+        body: body,
+        systemImage: count == 0 ? "tray" : "tray.full.fill",
+        animateIcon: inboxBannerView.isHidden
+      )
+    }
+    let wasHidden = inboxBannerView.isHidden
+    if shouldShow, wasHidden {
+      inboxBannerView.alpha = 0.0
+      inboxBannerView.isHidden = false
+      UIView.animate(withDuration: 0.2) {
+        self.inboxBannerView.alpha = self.currentPage == .chat ? 1.0 : 0.0
+      }
+    } else if !shouldShow, !wasHidden {
+      UIView.animate(
+        withDuration: 0.2,
+        animations: { self.inboxBannerView.alpha = 0.0 },
+        completion: { _ in self.inboxBannerView.isHidden = true })
+    } else if shouldShow {
+      inboxBannerView.alpha = currentPage == .chat ? 1.0 : 0.0
+    }
+    setNeedsLayout()
+  }
+
+  @objc private func handleInboxBannerPressed() {
+    guard currentPage == .chat else { return }
+    onNativeEvent(["type": "agentInboxPressed"])
+  }
+
+  /// Notification rows currently held out of the transcript by inbox mode, in
+  /// transcript order (oldest first). Used to populate the Inbox view.
+  func currentEventInboxRows() -> [ChatListRow] {
+    chatListView.eventInboxRows
+  }
+
   func setEngineChannelBindingEnabled(_ enabled: Bool) {
     chatListView.setEngineChannelBindingEnabled(enabled)
   }
@@ -458,8 +528,20 @@ public final class ChatMainView: UIView,
     chatListView.setInputPlaceholder(value)
   }
 
+  func setComposerText(_ value: String, focus: Bool = true) {
+    chatListView.setComposerText(value, focus: focus)
+  }
+
   func setNativeSendEnabled(_ enabled: Bool) {
     chatListView.setNativeSendEnabled(enabled)
+  }
+
+  func setAgentChatMode(_ enabled: Bool) {
+    chatListView.setAgentChatMode(enabled)
+  }
+
+  func setAgentStreaming(_ streaming: Bool) {
+    chatListView.setAgentStreaming(streaming)
   }
 
   func setDebugAnimationPanel(_ enabled: Bool) {
@@ -728,6 +810,15 @@ public final class ChatMainView: UIView,
     pinnedBannerView.addTarget(
       self, action: #selector(handlePinnedBannerPressed), for: .touchUpInside)
 
+    chatPage.addSubview(inboxBannerView)
+    inboxBannerView.isHidden = true
+    inboxBannerView.alpha = 0.0
+    inboxBannerView.addTarget(
+      self, action: #selector(handleInboxBannerPressed), for: .touchUpInside)
+    chatListView.onEventInboxChanged = { [weak self] count, latestPreview in
+      self?.updateInboxBanner(count: count, latestPreview: latestPreview)
+    }
+
     pagesHost.addSubview(profilePage)
     profilePage.addSubview(profileScrollView)
     profileScrollView.addSubview(profileContentView)
@@ -786,12 +877,12 @@ public final class ChatMainView: UIView,
     headerMaskView.addSubview(headerMaskBlurView)
     headerMaskBlurView.contentView.addSubview(headerMaskOverlayView)
     headerMaskGradientLayer.colors = [
-      UIColor.black.withAlphaComponent(0.98).cgColor,
-      UIColor.black.withAlphaComponent(0.86).cgColor,
-      UIColor.black.withAlphaComponent(0.38).cgColor,
+      UIColor.black.withAlphaComponent(1.0).cgColor,
+      UIColor.black.withAlphaComponent(0.95).cgColor,
+      UIColor.black.withAlphaComponent(0.55).cgColor,
       UIColor.clear.cgColor,
     ]
-    headerMaskGradientLayer.locations = [0.0, 0.34, 0.76, 1.0]
+    headerMaskGradientLayer.locations = [0.0, 0.35, 0.75, 1.0]
     headerMaskView.layer.mask = headerMaskGradientLayer
     headerContainer.addSubview(headerContentView)
     headerContainer.layer.zPosition = 50.0
@@ -883,6 +974,11 @@ public final class ChatMainView: UIView,
     avatarButton.addTarget(self, action: #selector(handleAvatarPressed), for: .touchUpInside)
     avatarButton.addSubview(avatarImageView)
     avatarButton.addSubview(avatarFallbackIconView)
+    avatarButton.addSubview(checkmarkImageView)
+    checkmarkImageView.contentMode = .scaleAspectFit
+    checkmarkImageView.image = UIImage(systemName: "checkmark.circle.fill")
+    checkmarkImageView.tintColor = .systemBlue
+    checkmarkImageView.isHidden = true
 
     let backSymbolConfig = UIImage.SymbolConfiguration(pointSize: 18, weight: .semibold)
     backButton.setPreferredSymbolConfiguration(backSymbolConfig, forImageIn: .normal)
@@ -1019,6 +1115,18 @@ public final class ChatMainView: UIView,
     updateAvatarViews()
     syncProfileHierarchyForMode()
     updateChatModeHeaderControls()
+
+    if #available(iOS 26.0, *) {
+      let mainInteraction = UIScrollEdgeElementContainerInteraction()
+      mainInteraction.scrollView = chatListView.collectionView
+      mainInteraction.edge = .top
+      headerContainer.addInteraction(mainInteraction)
+
+      let profileInteraction = UIScrollEdgeElementContainerInteraction()
+      profileInteraction.scrollView = profileScrollView
+      profileInteraction.edge = .top
+      profileHeaderContainer.addInteraction(profileInteraction)
+    }
   }
 
   private func ensureProfileHierarchyAttached() {
@@ -1056,9 +1164,64 @@ public final class ChatMainView: UIView,
     }
   }
 
+  private var selectionModeActive = false
+  private var selectionCount = 0
+  private let checkmarkImageView = UIImageView()
+
   private func syncListDispatchers() {
-    chatListView.onNativeEvent = onNativeEvent
+    chatListView.onNativeEvent = NativeEventDispatcher { [weak self] event in
+      self?.handleInternalListEvent(event)
+      self?.onNativeEvent(event)
+    }
     chatListView.onViewportChanged = onViewportChanged
+  }
+
+  private func handleInternalListEvent(_ event: [String: Any]) {
+    if let type = event["type"] as? String, type == "messageSelectionChanged" {
+      if let active = event["active"] as? Bool, let count = event["selectedCount"] as? Int {
+        let changed = (active != self.selectionModeActive || count != self.selectionCount)
+        self.selectionModeActive = active
+        self.selectionCount = count
+        if changed {
+          self.updateHeaderForSelectionState()
+        }
+      }
+    } else if let type = event["type"] as? String, type == "messageSelectionAction" {
+      // In case we want to hide selection immediately
+      self.selectionModeActive = false
+      self.updateHeaderForSelectionState()
+    }
+  }
+
+  private func updateHeaderForSelectionState() {
+    let isActive = selectionModeActive
+    let count = selectionCount
+    
+    UIView.transition(with: headerContentView, duration: 0.3, options: .transitionCrossDissolve) {
+      if isActive {
+        self.backButton.setImage(nil, for: .normal)
+        self.backButton.setTitle("Clear Chat", for: .normal)
+        self.chatTitleLabel.text = "\(count) Selected"
+        self.chatSubtitleLabel.isHidden = true
+        self.avatarImageView.alpha = 0
+        self.avatarFallbackIconView.alpha = 0
+        self.checkmarkImageView.isHidden = false
+        self.checkmarkImageView.alpha = 1
+      } else {
+        self.backButton.setTitle(nil, for: .normal)
+        self.backButton.setImage(UIImage(systemName: "chevron.left"), for: .normal)
+        self.updateHeaderTexts() // restores chatTitleLabel and chatSubtitleLabel
+        self.avatarImageView.alpha = 1
+        self.avatarFallbackIconView.alpha = 1
+        self.checkmarkImageView.alpha = 0
+        self.checkmarkImageView.isHidden = true
+      }
+    }
+    
+    UIView.animate(withDuration: 0.3) {
+      self.setNeedsLayout()
+      self.layoutIfNeeded()
+    }
   }
 
   private func updateChatModeHeaderControls() {
@@ -2492,6 +2655,9 @@ public final class ChatMainView: UIView,
 
   private func refreshHeaderGlass() {
     if #available(iOS 26.0, *) {
+      headerMaskView.isHidden = true
+      profileHeaderMaskView.isHidden = true
+
       let backEffect = UIGlassEffect()
       backEffect.isInteractive = true
       backGlassView.effect = backEffect
@@ -2576,17 +2742,24 @@ public final class ChatMainView: UIView,
       applyHeaderSearchPresentation()
     } else {
       headerContainer.frame = CGRect(x: 0, y: 0, width: bounds.width, height: headerHeight)
-      headerMaskView.frame = .zero
-      headerMaskBlurView.frame = .zero
-      headerMaskOverlayView.frame = .zero
-      headerMaskGradientLayer.frame = .zero
+      headerMaskView.frame = headerContainer.bounds
+      headerMaskBlurView.frame = headerMaskView.bounds
+      headerMaskOverlayView.frame = headerMaskBlurView.bounds
+      headerMaskGradientLayer.frame = headerMaskView.bounds
       headerContainer.bringSubviewToFront(headerContentView)
 
       headerContentView.frame = CGRect(
         x: 12.0, y: contentY, width: max(0.0, bounds.width - 24.0), height: 44.0)
 
-      let backWidth: CGFloat = headerUnreadCount > 0 ? 62.0 : 44.0
+      let backWidth: CGFloat
+      if selectionModeActive {
+        let size = backButton.sizeThatFits(CGSize(width: .greatestFiniteMagnitude, height: 44.0))
+        backWidth = max(size.width + 24.0, 44.0)
+      } else {
+        backWidth = headerUnreadCount > 0 ? 62.0 : 44.0
+      }
       backGlassView.frame = CGRect(x: 0.0, y: 0.0, width: backWidth, height: 44.0)
+      
       let trailingHeaderFrame = CGRect(
         x: max(0.0, headerContentView.bounds.width - 44.0), y: 0.0, width: 44.0, height: 44.0)
       if headerMode == .savedMessages || savedSearchExpanded {
@@ -2667,6 +2840,7 @@ public final class ChatMainView: UIView,
 
       avatarImageView.frame = avatarButton.bounds
       avatarFallbackIconView.frame = avatarButton.bounds.insetBy(dx: 12.0, dy: 12.0)
+      checkmarkImageView.frame = avatarButton.bounds.insetBy(dx: 4.0, dy: 4.0)
 
       let titleBounds =
         headerMode == .savedMessages || savedSearchExpanded
@@ -2817,7 +2991,12 @@ public final class ChatMainView: UIView,
     let pinnedBannerInset: CGFloat = pinnedBannerVisible
       ? (ChatPinnedBannerView.preferredHeight + 12.0)
       : 0.0
-    chatListView.setContentPaddingTop(Double(externalHeaderInset + 8.0 + pinnedBannerInset))
+    let inboxBannerVisible = !(inboxBannerView.isHidden || inboxBannerView.alpha <= 0.01)
+    let inboxBannerInset: CGFloat = inboxBannerVisible
+      ? (ChatPinnedBannerView.preferredHeight + 12.0)
+      : 0.0
+    chatListView.setContentPaddingTop(
+      Double(externalHeaderInset + 8.0 + pinnedBannerInset + inboxBannerInset))
     pagesHost.frame = CGRect(
       x: 0.0,
       y: headerHeight,
@@ -2842,6 +3021,20 @@ public final class ChatMainView: UIView,
       height: ChatPinnedBannerView.preferredHeight
     )
     chatPage.bringSubviewToFront(pinnedBannerView)
+
+    // Inbox banner stacks directly below the pinned banner (or in its slot when
+    // there is no pinned message).
+    let inboxBannerY =
+      pinnedBannerInset > 0.0
+      ? pinnedBannerView.frame.maxY + 8.0
+      : externalHeaderInset + 8.0
+    inboxBannerView.frame = CGRect(
+      x: 16.0,
+      y: inboxBannerY,
+      width: bannerWidth,
+      height: ChatPinnedBannerView.preferredHeight
+    )
+    chatPage.bringSubviewToFront(inboxBannerView)
 
     if standaloneProfileMode {
       profilePage.frame = bounds
@@ -3043,10 +3236,14 @@ public final class ChatMainView: UIView,
 
     backgroundColor = .clear
     headerMaskBlurView.effect =
-      UIBlurEffect(style: isDarkTheme ? .systemMaterialDark : .systemMaterialLight)
+      UIBlurEffect(style: isDarkTheme ? .systemThickMaterialDark : .systemThickMaterialLight)
     headerMaskOverlayView.backgroundColor =
-      chatBackground.withAlphaComponent(isDarkTheme ? 0.74 : 0.66)
-    rootWallpaperLayer.isHidden = true
+      chatBackground.withAlphaComponent(isDarkTheme ? 0.78 : 0.70)
+    rootWallpaperLayer.isHidden = appearance.backgroundMode == "transparent"
+    rootWallpaperLayer.colors = appearance.wallpaperGradient.map(\.cgColor)
+    rootWallpaperLayer.startPoint = CGPoint(x: 0.0, y: 0.0)
+    rootWallpaperLayer.endPoint = CGPoint(x: 1.0, y: 1.0)
+    rootWallpaperLayer.opacity = Float(max(0.0, min(1.0, appearance.wallpaperOpacity)))
     backGlassView.contentView.backgroundColor = chatBackground.withAlphaComponent(0.10)
     titleGlassView.contentView.backgroundColor = .clear
     avatarGlassView.contentView.backgroundColor = appearance.bubbleThemColor.withAlphaComponent(0.22)
@@ -3083,6 +3280,11 @@ public final class ChatMainView: UIView,
     profileSubtitleLabel.textColor = secondary
     avatarFallbackIconView.tintColor = .white
     pinnedBannerView.applyTheme(
+      textColor: text,
+      surfaceColor: chatBackground,
+      isDark: isDarkTheme
+    )
+    inboxBannerView.applyTheme(
       textColor: text,
       surfaceColor: chatBackground,
       isDark: isDarkTheme
@@ -3710,6 +3912,7 @@ public final class ChatMainView: UIView,
       agentPage.alpha = 0.0
       agentPage.transform = .identity
       pinnedBannerView.alpha = 0.0
+      inboxBannerView.alpha = 0.0
       avatarGlassView.alpha = 0.0
       bringSubviewToFront(profileHeaderContainer)
       applyHeaderGlassMorph(chatFactor: 0.0)
@@ -3791,6 +3994,7 @@ public final class ChatMainView: UIView,
       self.savedSearchCancelGlassView.alpha =
         (isChat && self.savedSearchExpanded) ? 1.0 : 0.0
       self.pinnedBannerView.alpha = (isChat && !self.pinnedBannerView.isHidden) ? 1.0 : 0.0
+      self.inboxBannerView.alpha = (isChat && !self.inboxBannerView.isHidden) ? 1.0 : 0.0
       self.profileMenuGlassView.alpha = isProfile ? 1.0 : 0.0
       self.applyHeaderGlassMorph(chatFactor: isChat ? 1.0 : 0.0)
       self.applyHeaderSearchPresentation()
@@ -3925,7 +4129,15 @@ public final class ChatMainView: UIView,
     return true
   }
 
+  func clearMessageSelection() {
+    chatListView.clearMessageSelection()
+  }
+
   @objc private func handleBackPressed() {
+    if selectionModeActive {
+      chatListView.clearMessageSelection()
+      return
+    }
     if profileMembersNode.isPresented {
       setProfileMembersVisible(false, animated: true)
       return
@@ -3939,6 +4151,10 @@ public final class ChatMainView: UIView,
   }
 
   @objc private func handleAvatarPressed() {
+    if selectionModeActive {
+      chatListView.clearMessageSelection()
+      return
+    }
     guard headerMode != .savedMessages else { return }
     guard currentPage == .chat else { return }
     onNativeEvent(["type": "headerAvatarPressed"])

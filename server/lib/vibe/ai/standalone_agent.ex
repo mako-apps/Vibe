@@ -167,6 +167,11 @@ defmodule Vibe.AI.StandaloneAgent do
     message_type = output_type(output)
     plain_text = output_text(output)
     media_url = output_media_url(output)
+    agent_username =
+      case agent.agent_user do
+        %{username: username} when is_binary(username) -> username
+        _ -> nil
+      end
 
     metadata =
       output_metadata(output)
@@ -174,6 +179,9 @@ defmodule Vibe.AI.StandaloneAgent do
       |> Map.put("isAgentMessage", true)
       |> Map.put("agentId", agent.id)
       |> Map.put("agentName", agent.display_name)
+      |> Map.put("agentUserId", agent.agent_user_id)
+      |> Map.put("agentUsername", agent_username)
+      |> Map.put("agentHandle", if(agent_username, do: "@#{agent_username}", else: nil))
 
     payload =
       %{
@@ -189,6 +197,9 @@ defmodule Vibe.AI.StandaloneAgent do
         "isAgentMessage" => true,
         "agentName" => agent.display_name,
         "agentId" => agent.id,
+        "agentUserId" => agent.agent_user_id,
+        "agentUsername" => agent_username,
+        "agentHandle" => if(agent_username, do: "@#{agent_username}", else: nil),
         "mediaUrl" => media_url,
         "metadata" => metadata,
         "replyToId" => reply_to_id
@@ -250,6 +261,7 @@ defmodule Vibe.AI.StandaloneAgent do
         do: Vibe.AI.Tools.ConnectedApp.prompt_guidance(agent),
         else: nil
       ),
+      prompt_variables_guidance(agent),
       if(agent.persona, do: "Persona: #{agent.persona}", else: nil),
       if(agent.welcome_message && !has_prior_messages,
         do:
@@ -260,6 +272,19 @@ defmodule Vibe.AI.StandaloneAgent do
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join("\n\n")
+    |> Vibe.AI.PromptVariables.render(agent)
+  end
+
+  defp prompt_variables_guidance(agent) do
+    case Vibe.AI.PromptVariables.definitions(agent) do
+      [] ->
+        nil
+
+      vars ->
+        names = vars |> Enum.map(& &1["name"]) |> Enum.join(", ")
+
+        "Configured prompt variables (#{names}) are already filled in above. If you rewrite your own system prompt, keep any {{variable}} placeholders intact and never invent values for locked variables."
+    end
   end
 
   defp normalize_attachments(value) when is_list(value) do

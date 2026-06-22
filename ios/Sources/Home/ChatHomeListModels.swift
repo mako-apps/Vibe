@@ -107,8 +107,33 @@ struct ChatHomeListRow {
   let isSavedMessages: Bool
   let type: String?
   let isGroup: Bool
+  /// True when the chat's friend is an AI agent's shadow user — i.e. this is a
+  /// 1:1 "talk to the agent" chat. Mirrors the server's `friendIsAgent` flag.
+  let isAgentFriend: Bool
+  /// The agent's id when `isAgentFriend` is true. Sent as `peerAgentId` so the
+  /// engine routes the message to the agent backend instead of E2E-encrypting
+  /// to a human peer. Mirrors the server's `friendAgentId`.
+  let peerAgentId: String?
+  /// The attached agent's event-inbox mode (`per_event` or `batched_summary`).
+  /// In `batched_summary` (inbox) mode the chat view hides event notifications
+  /// from the transcript and surfaces them via the Inbox banner. Mirrors the
+  /// server's `friendAgentEventInboxMode`.
+  let agentEventInboxMode: String?
   let previewRows: [[String: Any]]
   let initialMessages: [[String: Any]]
+
+  var isBuiltInAgentSurface: Bool {
+    Self.isBuiltInAgentChatId(chatId)
+  }
+
+  static func isBuiltInAgentChatId(_ rawChatId: String) -> Bool {
+    switch rawChatId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+    case "vibe", "vibe_agent", "vibeagent", "vibe-ai", "vibe_ai":
+      return true
+    default:
+      return false
+    }
+  }
 
   func cachePayload(messageLimit: Int = 5) -> [String: Any] {
     let shouldIncludeMessagePayload = messageLimit > 0
@@ -126,10 +151,13 @@ struct ChatHomeListRow {
       "avatarFallback": avatarFallback,
       "isSavedMessages": isSavedMessages,
       "isGroup": isGroup,
+      "isAgentFriend": isAgentFriend,
       "previewRows": shouldIncludeMessagePayload ? previewRows : [],
       "messages": shouldIncludeMessagePayload ? Array(initialMessages.suffix(messageLimit)) : [],
     ]
     if let peerUserId { payload["peerUserId"] = peerUserId }
+    if let peerAgentId { payload["peerAgentId"] = peerAgentId }
+    if let agentEventInboxMode { payload["agentEventInboxMode"] = agentEventInboxMode }
     if let avatarUri { payload["avatarUri"] = avatarUri }
     if let avatarGradientStartLight { payload["avatarGradientStartLight"] = avatarGradientStartLight }
     if let avatarGradientEndLight { payload["avatarGradientEndLight"] = avatarGradientEndLight }
@@ -161,6 +189,9 @@ struct ChatHomeListRow {
       isSavedMessages: isSavedMessages,
       type: type,
       isGroup: isGroup,
+      isAgentFriend: isAgentFriend,
+      peerAgentId: peerAgentId,
+      agentEventInboxMode: agentEventInboxMode,
       previewRows: previewRows,
       initialMessages: initialMessages
     )
@@ -230,6 +261,15 @@ struct ChatHomeListRow {
     let type = normalizedString(raw["type"] ?? raw["chatType"] ?? raw["chat_type"])
     let isGroup =
       parseBool(raw["isGroup"] ?? raw["is_group"]) ?? (type == "group" || type == "channel")
+    let peerAgentId = normalizedString(
+      raw["friendAgentId"] ?? raw["friend_agent_id"] ?? raw["agentId"] ?? raw["agent_id"])
+    let isAgentFriend =
+      Self.isBuiltInAgentChatId(chatId)
+      || (parseBool(raw["friendIsAgent"] ?? raw["friend_is_agent"]) ?? (peerAgentId != nil))
+    let agentEventInboxMode = normalizedString(
+      raw["friendAgentEventInboxMode"] ?? raw["friend_agent_event_inbox_mode"]
+        ?? raw["agentEventInboxMode"] ?? raw["agent_event_inbox_mode"] ?? raw["eventInboxMode"]
+        ?? raw["event_inbox_mode"])
     let initialMessages = serverMessages
     let previewRows = parsePreviewRows(raw["previewRows"] ?? raw["preview_rows"])
 
@@ -254,6 +294,9 @@ struct ChatHomeListRow {
       isSavedMessages: isSavedMessages,
       type: type,
       isGroup: isGroup,
+      isAgentFriend: isAgentFriend,
+      peerAgentId: peerAgentId,
+      agentEventInboxMode: agentEventInboxMode,
       previewRows: previewRows,
       initialMessages: initialMessages
     )

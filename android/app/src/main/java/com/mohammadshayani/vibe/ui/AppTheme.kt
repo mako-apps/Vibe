@@ -123,7 +123,7 @@ fun resolveAppThemePalette(
   plate: AppThemePlateOption = AppThemePlateController.current(context),
 ): AppThemePalette {
   val isDark = AppAppearanceController.resolvedIsDark(context)
-  val baseBackground = if (isDark) colorHex(0x121212) else colorHex(0xF5F4F1)
+  val baseBackground = if (isDark) colorHex(0x000000) else colorHex(0xFFFFFF)
   val baseSecondaryBackground = if (isDark) colorHex(0x151515) else colorHex(0xF5F4F1)
   val baseCard = if (isDark) colorHex(0x242424) else colorHex(0xFFFFFF)
   val baseInput = if (isDark) colorHex(0x222222) else colorHex(0xF2F2F2)

@@ -8,7 +8,9 @@ enum PacketTransportMode: String {
 
   init(_ rawValue: Any?) {
     let normalized = (rawValue as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    self = PacketTransportMode(rawValue: normalized ?? "") ?? .packetMesh
+    // Default to direct when the stored value is missing/unknown. Packet mesh is
+    // opt-in via Settings → Connection; it is only used when explicitly selected.
+    self = PacketTransportMode(rawValue: normalized ?? "") ?? .direct
   }
 }
 

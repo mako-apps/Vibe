@@ -255,6 +255,10 @@ defmodule Vibe.Chat do
               ),
             friendIsAgent: !!friend_agent,
             friendAgentId: if(friend_agent, do: friend_agent.agent_id, else: nil),
+            friendAgentEventInboxMode:
+              if(friend_agent, do: friend_agent_event_inbox_mode(friend_agent), else: nil),
+            friendAgentSummaryWindowHours:
+              if(friend_agent, do: friend_agent_event_inbox_window_hours(friend_agent), else: nil),
             acceptsIncomingChat:
               if(friend_agent, do: friend_agent_accepts_incoming_chat(friend_agent), else: nil),
             friendImage:
@@ -1219,7 +1223,10 @@ defmodule Vibe.Chat do
           plain_content: plain_text,
           is_agent_message: true,
           agent_name: meta.agent_name,
-          agent_id: meta.agent_id
+          agent_id: meta.agent_id,
+          agent_user_id: meta.agent_user_id,
+          agent_username: meta.agent_username,
+          agent_handle: meta.agent_handle
         })
     end
   end
@@ -1248,12 +1255,22 @@ defmodule Vibe.Chat do
 
     cond do
       legacy_group_agent_id?(message.from_id) ->
-        %{agent_name: "Vibe AI", agent_id: nil}
+        %{
+          agent_name: "Vibe AI",
+          agent_id: nil,
+          agent_user_id: message.from_id,
+          agent_username: "vibe_ai_agent_0001",
+          agent_handle: "@vibe_ai_agent_0001"
+        }
 
       metadata["isAgentMessage"] == true or metadata["is_agent_message"] == true ->
         %{
           agent_name: metadata["agentName"] || metadata["agent_name"] || "Vibe Agent",
-          agent_id: metadata["agentId"] || metadata["agent_id"]
+          agent_id: metadata["agentId"] || metadata["agent_id"],
+          agent_user_id:
+            metadata["agentUserId"] || metadata["agent_user_id"] || message.from_id,
+          agent_username: metadata["agentUsername"] || metadata["agent_username"],
+          agent_handle: metadata["agentHandle"] || metadata["agent_handle"]
         }
 
       true ->
@@ -1265,6 +1282,37 @@ defmodule Vibe.Chat do
     case {Ecto.UUID.cast(from_id), Ecto.UUID.cast(@agent_user_id)} do
       {{:ok, a}, {:ok, b}} -> a == b
       _ -> false
+    end
+  end
+
+  defp friend_agent_event_inbox(friend_agent) when is_map(friend_agent) do
+    get_in(friend_agent, [:approval_rules, "event_inbox"]) ||
+      get_in(friend_agent, [:approval_rules, :event_inbox]) || %{}
+  end
+
+  defp friend_agent_event_inbox(_), do: %{}
+
+  defp friend_agent_event_inbox_mode(friend_agent) do
+    inbox = friend_agent_event_inbox(friend_agent)
+
+    resolved =
+      case inbox["mode"] do
+        mode when mode in ["batched_summary", "batched", "batch", "summary"] -> "batched_summary"
+        _ -> "per_event"
+      end
+
+    Logger.info(
+      "[InboxBanner] chat payload agent_id=#{inspect(Map.get(friend_agent, :agent_id))} " <>
+        "raw_event_inbox=#{inspect(inbox)} resolved_mode=#{resolved}"
+    )
+
+    resolved
+  end
+
+  defp friend_agent_event_inbox_window_hours(friend_agent) do
+    case friend_agent_event_inbox(friend_agent)["summary_window_hours"] do
+      hours when is_integer(hours) and hours > 0 -> hours
+      _ -> 24
     end
   end
 

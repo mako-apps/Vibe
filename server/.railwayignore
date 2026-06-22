@@ -1,0 +1,24 @@
+# Built artifacts (rebuilt inside Docker)
+_build/
+deps/
+.mix/
+
+# Uploads / user data
+uploads/
+
+# Logs
+*.log
+
+# Secrets
+.env
+.env.local
+*.key
+*.pem
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Tests
+test/

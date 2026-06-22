@@ -1,4 +1,3 @@
-import ExpoModulesCore
 import Foundation
 import Security
 import UIKit
@@ -76,6 +75,14 @@ private struct ChatNativeAgentMessage: Codable, Equatable {
   var timestampMs: Int64
   var isStreaming: Bool
   var streamSegments: [ChatNativeAgentStreamSegment]
+  // Set on a user message when its turn fails to get a response (agent error or
+  // the user stops generation). Drives the "not sent" indicator. Optional so
+  // older persisted state without the key still decodes.
+  var deliveryFailed: Bool?
+  // Set on an assistant message whose turn errored out. Drives the side
+  // "regenerate" button, which now only appears on failed responses. Optional
+  // so older persisted state without the key still decodes.
+  var isError: Bool?
 
   init(
     id: String,
@@ -83,7 +90,9 @@ private struct ChatNativeAgentMessage: Codable, Equatable {
     content: String,
     timestampMs: Int64,
     isStreaming: Bool,
-    streamSegments: [ChatNativeAgentStreamSegment] = []
+    streamSegments: [ChatNativeAgentStreamSegment] = [],
+    deliveryFailed: Bool? = nil,
+    isError: Bool? = nil
   ) {
     self.id = id
     self.role = role
@@ -91,6 +100,8 @@ private struct ChatNativeAgentMessage: Codable, Equatable {
     self.timestampMs = timestampMs
     self.isStreaming = isStreaming
     self.streamSegments = streamSegments
+    self.deliveryFailed = deliveryFailed
+    self.isError = isError
   }
 }
 
@@ -152,6 +163,8 @@ private struct ChatNativeAgentRenderEntry {
   let agentCard: ChatListRow.AgentCard?
   let actionSourceMessageId: String?
   let actionSourceText: String?
+  var deliveryFailed: Bool = false
+  var isError: Bool = false
 }
 
 private final class ChatNativeAgentHistoryCell: UITableViewCell {
@@ -256,10 +269,31 @@ private final class ChatNativeAgentHistoryCell: UITableViewCell {
   }()
 }
 
-public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITableViewDelegate,
+public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableViewDelegate,
   UIScrollViewDelegate
 {
-  public var onNativeEvent = EventDispatcher()
+  static let conversationsDidChangeNotification = Notification.Name(
+    "ChatNativeAgentView.conversationsDidChange"
+  )
+
+  public var onNativeEvent = NativeEventDispatcher()
+
+  /// Invoked when the header back button is tapped on the chat page. Set by a
+  /// native UIKit host (e.g. `ChatAgentConversationController`) to pop the
+  /// navigation stack, since the Expo `onNativeEvent` bridge is not wired when
+  /// the view is hosted natively.
+  public var onHeaderBack: (() -> Void)?
+
+  /// Fired whenever the active conversation's rows change (sends, streaming
+  /// chunks, completion). Lets a host render the agent conversation in the real
+  /// chat surface (`ChatMainView`/`ChatListView`) while this view runs headless
+  /// as the transport + row source. Rows use the same `kind`/`message` envelope
+  /// `ChatListView` consumes.
+  public var onRowsChanged: (([[String: Any]]) -> Void)?
+
+  /// Fired when streaming starts/stops, so a host can toggle the composer's
+  /// send/stop button.
+  public var onStreamingStateChanged: ((Bool) -> Void)?
 
   @objc public var surfaceId: String = "" {
     didSet {
@@ -330,8 +364,8 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
   private static let fallbackApiBaseURL = "https://api.vibegram.io"
   private static let persistenceKey = "vibe.native.agent.screen.v1"
 
-  required init(appContext: AppContext? = nil) {
-    super.init(appContext: appContext)
+  override init(frame: CGRect) {
+    super.init(frame: frame)
 
     backgroundColor = .clear
     clipsToBounds = true
@@ -343,6 +377,10 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
     refreshHeader(animated: false)
     refreshHistoryList()
     rebuildChatRows(scrollToBottom: false, animated: false)
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
   }
 
   deinit {
@@ -487,6 +525,15 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
     applyAppearance(rawAppearance)
   }
 
+  func synchronizeHostState() {
+    rebuildChatRows(scrollToBottom: false, animated: false)
+    onStreamingStateChanged?(streamingConversationId != nil)
+  }
+
+  func handleHostEvent(_ event: [String: Any]) {
+    handleMessagesEvent(event)
+  }
+
   func setBuilderActiveAgentId(_ activeAgentId: String?) {
     builderActiveAgentId = Self.normalizedString(activeAgentId)
     cacheBuilderSecretIfPossible()
@@ -497,29 +544,49 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
     cacheBuilderSecretIfPossible()
   }
 
-  func submitText(_ rawText: String) {
+  func submitText(_ rawText: String, userMessageId: String? = nil) {
     let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !text.isEmpty else { return }
 
     connectIfNeeded()
+
+    // Edit / resend of an existing message: if this id is already in the active
+    // conversation, the turn it started (and everything after it) is stale. We
+    // truncate it locally in `beginStreamingTurn` and ask the server to drop the
+    // same tail so the list doesn't accumulate duplicate / orphaned bubbles.
+    let trimmedId = userMessageId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    var serverTruncateAtId: String? = nil
+    if !trimmedId.isEmpty,
+      let activeId = activeConversationId,
+      let conversation = conversation(for: activeId),
+      conversation.messages.contains(where: { $0.id == trimmedId })
+    {
+      serverTruncateAtId = trimmedId
+    }
+
     guard let conversationId = beginStreamingTurn(
       userText: text,
-      fallbackTitle: String(text.prefix(20))
+      fallbackTitle: String(text.prefix(20)),
+      userMessageId: userMessageId
     ) else { return }
 
     if joinedTopic {
-      pushMessage(text: text, conversationId: conversationId, truncateAtId: nil)
+      pushMessage(text: text, conversationId: conversationId, truncateAtId: serverTruncateAtId)
     } else {
       pendingSends.append(
         .message(
           conversationId: conversationId,
           text: text,
-          truncateAtId: nil
+          truncateAtId: serverTruncateAtId
         ))
     }
   }
 
-  private func beginStreamingTurn(userText: String, fallbackTitle: String) -> String? {
+  private func beginStreamingTurn(
+    userText: String,
+    fallbackTitle: String,
+    userMessageId: String? = nil
+  ) -> String? {
     let trimmedText = userText.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmedText.isEmpty else { return nil }
 
@@ -530,8 +597,12 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
     guard let conversationId else { return nil }
 
     let timestampMs = Self.nowMs()
+    let resolvedUserMessageId: String = {
+      let trimmed = userMessageId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      return trimmed.isEmpty ? UUID().uuidString : trimmed
+    }()
     let userMessage = ChatNativeAgentMessage(
-      id: UUID().uuidString,
+      id: resolvedUserMessageId,
       role: .user,
       content: trimmedText,
       timestampMs: timestampMs,
@@ -548,6 +619,14 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
     )
 
     updateConversation(conversationId) { conversation in
+      // Edit / resend: drop the prior copy of this message and every bubble that
+      // followed it before re-appending the fresh turn, so the list shows a
+      // single clean exchange instead of stacking duplicates.
+      if let existingIndex = conversation.messages.firstIndex(where: {
+        $0.id == resolvedUserMessageId
+      }) {
+        conversation.messages = Array(conversation.messages.prefix(existingIndex))
+      }
       conversation.messages.append(userMessage)
       conversation.messages.append(assistantMessage)
       conversation.updatedAt = timestampMs
@@ -772,7 +851,9 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
     historyTableView.backgroundColor = .clear
 
     var white: CGFloat = 0.0
-    if appearance.textColorThem.getWhite(&white, alpha: nil) {
+    if #available(iOS 26.0, *) {
+      // On iOS 26, headerMask is hidden; glass handles everything.
+    } else if appearance.textColorThem.getWhite(&white, alpha: nil) {
       headerMaskBlurView.effect = UIBlurEffect(style: white > 0.5 ? .dark : .light)
     } else {
       headerMaskBlurView.effect = UIBlurEffect(style: .regular)
@@ -828,6 +909,10 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
   @objc private func handleBackPressed() {
     if currentPage == .history {
       setPage(.chat, animated: true)
+      return
+    }
+    if let onHeaderBack {
+      onHeaderBack()
       return
     }
     onNativeEvent(["type": "headerBack"])
@@ -916,19 +1001,69 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
     controller.onDeleteAgent = { [weak self] card, dismiss in
       self?.deleteAgent(card, dismiss: dismiss)
     }
+    controller.onOpenAgentChat = { [weak self] card in
+      self?.emitOpenAgentChat(card)
+    }
 
     let navigation = UINavigationController(rootViewController: controller)
-    navigation.modalPresentationStyle = .pageSheet
-    if let sheet = navigation.sheetPresentationController {
-      sheet.detents = [.medium(), .large()]
-      sheet.prefersGrabberVisible = true
-      sheet.preferredCornerRadius = 28.0
-    }
+    navigation.modalPresentationStyle = .fullScreen
     presenter.present(navigation, animated: true)
+  }
+
+  func presentAgentControlPanel(from presenter: UIViewController) {
+    guard let config = resolveAPIConfig() else {
+      onNativeEvent(["type": "agentToast", "message": "Missing API session"])
+      return
+    }
+    let apiContext = ChatNativeAgentConfigAPIContext(
+      apiBaseURL: config.apiBaseURL,
+      token: config.token
+    )
+    let controller = ChatNativeAgentsControlController(
+      apiContext: apiContext,
+      appearance: appearance
+    )
+    controller.onToast = { [weak self] message in
+      self?.onNativeEvent(["type": "agentToast", "message": message])
+    }
+    controller.onCreateAgent = { [weak self] in
+      self?.onNativeEvent(["type": "agentCreateRequested"])
+    }
+    controller.onOpenAgentChat = { [weak self] card in
+      self?.emitOpenAgentChat(card)
+    }
+    controller.onDeleteAgent = { [weak self] card, completion in
+      self?.deleteAgent(card, dismiss: completion)
+    }
+
+    let navigation = UINavigationController(rootViewController: controller)
+    navigation.modalPresentationStyle = .fullScreen
+    presenter.present(navigation, animated: true)
+  }
+
+  private func emitOpenAgentChat(_ card: ChatListRow.AgentCard) {
+    guard let agentUserId = card.agentUserId, !agentUserId.isEmpty else {
+      onNativeEvent(["type": "agentToast", "message": "Agent chat is not available yet"])
+      return
+    }
+    var payload: [String: Any] = [
+      "type": "agentChatPressed",
+      "agentUserId": agentUserId,
+      "agentId": card.agentId,
+      "agentName": card.displayName,
+    ]
+    if let username = card.username, !username.isEmpty {
+      payload["agentUsername"] = username
+      payload["agentHandle"] = "@\(username)"
+    }
+    onNativeEvent(payload)
   }
 
   private func refreshHeaderGlass(isDarkTheme: Bool) {
     if #available(iOS 26.0, *) {
+      headerMaskView.isHidden = true
+      footerMaskView.isHidden = true
+
       let backEffect = UIGlassEffect()
       backEffect.isInteractive = true
       backGlassView.effect = backEffect
@@ -992,6 +1127,8 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
     guard let config = resolveConnectionConfig() else { return }
 
     topic = "agent:\(config.userId)"
+    NSLog("[ChatNativeAgent] connecting socketURL=%@ userId=%@ hasToken=%@",
+      config.socketURL.absoluteString, config.userId, config.token.isEmpty ? "false" : "true")
 
     let callbacks = ChatPhoenixClient.Callbacks(
       onOpen: { [weak self] in
@@ -1036,14 +1173,23 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
   private func handleSocketOpen() {
     reconnectWorkItem?.cancel()
     guard let client = phoenixClient, !topic.isEmpty else { return }
+    NSLog("[ChatNativeAgent] socket open — joining topic=%@", topic)
     let joinRef = client.join(topic: topic, payload: [:])
-    pendingReplies[joinRef] = { [weak self] status, _ in
+    pendingReplies[joinRef] = { [weak self] status, response in
       guard let self else { return }
       if status == "ok" {
+        NSLog("[ChatNativeAgent] join OK topic=%@ pendingSends=%d", self.topic, self.pendingSends.count)
         self.joinedTopic = true
         self.syncConversations()
         self.flushPendingSends()
         return
+      }
+      NSLog("[ChatNativeAgent] join FAILED topic=%@ status=%@ response=%@", self.topic, status, "\(response)")
+      if self.streamingConversationId != nil {
+        self.finishStreaming(
+          fallbackText: "Couldn’t connect. Tap retry to try again.",
+          forceErrorText: true
+        )
       }
       self.scheduleReconnect()
     }
@@ -1084,12 +1230,15 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
   }
 
   private func resolveConnectionConfig() -> (socketURL: URL, token: String, userId: String)? {
+    // Primary source is the live chat engine config (same store the working chat
+    // socket uses); fall back to the native-call config and keychain session.
+    let engineConfig = ChatEngineStore.shared.getConfig()
     let nativeCallConfig = VibeNativeCallStore.shared.getNativeEngineConfig()
     let session = Self.loadNativeAuthSessionFromKeychain()
 
     guard
       let userId = Self.normalizedString(
-        nativeCallConfig["userId"] ?? session?["userId"])
+        engineConfig["userId"] ?? nativeCallConfig["userId"] ?? session?["userId"])
     else {
       NSLog("[ChatNativeAgent] missing native user id")
       return nil
@@ -1097,14 +1246,18 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
 
     let apiBase =
       Self.normalizedString(
-        nativeCallConfig["baseUrl"] ?? nativeCallConfig["apiBaseUrl"])
+        engineConfig["apiBaseUrl"] ?? engineConfig["baseUrl"]
+          ?? nativeCallConfig["baseUrl"] ?? nativeCallConfig["apiBaseUrl"])
       ?? Self.fallbackApiBaseURL
     let socketString =
-      Self.normalizedString(nativeCallConfig["socketUrl"])
+      Self.normalizedString(
+        engineConfig["socketUrl"] ?? engineConfig["url"] ?? nativeCallConfig["socketUrl"])
       ?? (apiBase.replacingOccurrences(of: "^http", with: "ws", options: .regularExpression)
         + "/socket")
     let token =
-      Self.normalizedString(nativeCallConfig["authToken"] ?? session?["loginToken"])
+      Self.normalizedString(
+        engineConfig["authToken"] ?? engineConfig["token"]
+          ?? nativeCallConfig["authToken"] ?? session?["loginToken"])
       ?? userId
 
     guard let socketURL = URL(string: socketString) else {
@@ -1116,20 +1269,26 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
   }
 
   private func resolveAPIConfig() -> (apiBaseURL: URL, token: String, userId: String)? {
+    let engineConfig = ChatEngineStore.shared.getConfig()
     let nativeCallConfig = VibeNativeCallStore.shared.getNativeEngineConfig()
     let session = Self.loadNativeAuthSessionFromKeychain()
 
     guard
-      let userId = Self.normalizedString(nativeCallConfig["userId"] ?? session?["userId"])
+      let userId = Self.normalizedString(
+        engineConfig["userId"] ?? nativeCallConfig["userId"] ?? session?["userId"])
     else {
       return nil
     }
 
     let apiBase =
-      Self.normalizedString(nativeCallConfig["baseUrl"] ?? nativeCallConfig["apiBaseUrl"])
+      Self.normalizedString(
+        engineConfig["apiBaseUrl"] ?? engineConfig["baseUrl"]
+          ?? nativeCallConfig["baseUrl"] ?? nativeCallConfig["apiBaseUrl"])
       ?? Self.fallbackApiBaseURL
     let token =
-      Self.normalizedString(nativeCallConfig["authToken"] ?? session?["loginToken"])
+      Self.normalizedString(
+        engineConfig["authToken"] ?? engineConfig["token"]
+          ?? nativeCallConfig["authToken"] ?? session?["loginToken"])
       ?? userId
 
     guard let apiBaseURL = URL(string: apiBase) else { return nil }
@@ -1205,6 +1364,7 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
       scheduleStreamingTimeout()
       handleBuilderReviewReadyEvent(frame.payload)
     case "ack":
+      NSLog("[ChatNativeAgent] ack received conv=%@", (frame.payload["conversation_id"] as? String) ?? "nil")
       if let conversationId = frame.payload["conversation_id"] as? String {
         applyAcknowledgedConversationId(conversationId)
       }
@@ -1356,9 +1516,11 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
         id: card.id,
         style: card.style,
         agentId: card.agentId,
+        agentUserId: card.agentUserId,
         displayName: card.displayName,
         username: card.username,
         identifier: card.identifier,
+        avatarUrl: card.avatarUrl,
         status: card.status,
         promptStatus: card.promptStatus,
         promptPreview: card.promptPreview,
@@ -1378,6 +1540,8 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
         attachedChats: card.attachedChats,
         eventInboxMode: card.eventInboxMode,
         summaryWindowHours: card.summaryWindowHours,
+        summarySchedule: card.summarySchedule,
+        summaryTimes: card.summaryTimes,
         incomingChatEnabled: card.incomingChatEnabled,
         canDelete: card.canDelete
       )
@@ -1398,9 +1562,11 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
       id: card.id,
       style: card.style,
       agentId: card.agentId,
+      agentUserId: card.agentUserId,
       displayName: card.displayName,
       username: card.username,
       identifier: card.identifier,
+      avatarUrl: card.avatarUrl,
       status: card.status,
       promptStatus: card.promptStatus,
       promptPreview: card.promptPreview,
@@ -1420,6 +1586,8 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
       attachedChats: card.attachedChats,
       eventInboxMode: card.eventInboxMode,
       summaryWindowHours: card.summaryWindowHours,
+      summarySchedule: card.summarySchedule,
+      summaryTimes: card.summaryTimes,
       incomingChatEnabled: card.incomingChatEnabled,
       canDelete: card.canDelete
     )
@@ -1629,7 +1797,11 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
     if let truncateAtId, !truncateAtId.isEmpty {
       payload["truncate_at_id"] = truncateAtId
     }
-    sendChannelEvent(event: "message", payload: payload) { _, _ in }
+    NSLog("[ChatNativeAgent] pushing message conv=%@ joined=%@ len=%d",
+      conversationId, joinedTopic ? "true" : "false", text.count)
+    sendChannelEvent(event: "message", payload: payload) { status, response in
+      NSLog("[ChatNativeAgent] message push reply status=%@ response=%@", status, "\(response)")
+    }
   }
 
   private func flushPendingSends() {
@@ -1736,15 +1908,23 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
     rebuildChatRows(scrollToBottom: false, animated: false)
   }
 
-  private func finishStreaming(fallbackText: String?, forceErrorText: Bool) {
+  private func finishStreaming(
+    fallbackText: String?,
+    forceErrorText: Bool,
+    markUserMessageFailed: Bool? = nil
+  ) {
     streamingTimeoutWorkItem?.cancel()
 
     guard let conversationId = streamingConversationId ?? activeConversationId else {
       NSLog("[ChatNativeAgent] finishStreaming: no active conversation")
       return
     }
+    // A failed/stopped turn marks the user's message as "not sent". Default to the
+    // error flag so connection-loss / error / join-failure paths all light it up.
+    let markFailed = markUserMessageFailed ?? forceErrorText
     NSLog("[ChatNativeAgent] finishStreaming conversationId=%@ fallback=%@ forceError=%d",
           String(conversationId.prefix(8)), fallbackText ?? "nil", forceErrorText ? 1 : 0)
+    pendingSends.removeAll { $0.conversationId == conversationId }
 
     updateConversation(conversationId) { conversation in
       guard !conversation.messages.isEmpty else { return }
@@ -1757,7 +1937,17 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
         conversation.messages[lastIndex].content = fallbackText
       }
       conversation.messages[lastIndex].isStreaming = false
+      // Only an errored turn keeps the regenerate affordance; a clean/stopped
+      // finish clears it.
+      conversation.messages[lastIndex].isError = forceErrorText ? true : nil
       conversation.messages[lastIndex].streamSegments.removeAll { $0.isRunningProgress }
+
+      // Tag (or clear) the nearest preceding user message's delivered state.
+      if let userIndex = conversation.messages[..<lastIndex].lastIndex(where: {
+        $0.role == .user
+      }) {
+        conversation.messages[userIndex].deliveryFailed = markFailed ? true : nil
+      }
       conversation.updatedAt = Self.nowMs()
     }
 
@@ -1775,7 +1965,7 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
     pendingReplies.removeAll()
     pendingSends.removeAll { $0.conversationId == conversationId }
 
-    finishStreaming(fallbackText: "Stopped.", forceErrorText: false)
+    finishStreaming(fallbackText: "Stopped.", forceErrorText: false, markUserMessageFailed: true)
     onNativeEvent(["type": "agentToast", "message": "Stopped response"])
 
     joinedTopic = false
@@ -1874,14 +2064,14 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
   private func scheduleStreamingTimeout() {
     streamingTimeoutWorkItem?.cancel()
     let workItem = DispatchWorkItem { [weak self] in
-      NSLog("[ChatNativeAgent] streaming timeout fired after 120s")
+      NSLog("[ChatNativeAgent] streaming timeout fired after 45s")
       self?.finishStreaming(
-        fallbackText: "Response timed out. Tap regenerate to retry.",
+        fallbackText: "Response timed out. Tap retry to try again.",
         forceErrorText: true
       )
     }
     streamingTimeoutWorkItem = workItem
-    DispatchQueue.main.asyncAfter(deadline: .now() + 120.0, execute: workItem)
+    DispatchQueue.main.asyncAfter(deadline: .now() + 45.0, execute: workItem)
   }
 
   private func createConversation(title: String) -> String {
@@ -1983,6 +2173,7 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
         scrollToBottom: false,
         animated: false
       )
+      onRowsChanged?([])
       return
     }
 
@@ -1995,6 +2186,7 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
       scrollToBottom: false,
       animated: animated
     )
+    onRowsChanged?(rows)
 
     guard scrollToBottom else { return }
     DispatchQueue.main.async { [weak self] in
@@ -2023,7 +2215,6 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
 
       let previous = index > 0 ? renderEntries[index - 1] : nil
       let next = index + 1 < renderEntries.count ? renderEntries[index + 1] : nil
-      let isLastEntryForMessage = next?.messageId != entry.messageId
       let isSequenceStart = previous?.role != entry.role
       let isSequenceEnd = next?.role != entry.role
       let shape = Self.makeBubbleShape(
@@ -2042,6 +2233,10 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
         "bubbleShape": shape,
       ]
 
+      if entry.deliveryFailed {
+        message["deliveryFailed"] = true
+      }
+
       if entry.isAgentMessage {
         message["isAgentMessage"] = true
         message["agentName"] = "Vibe AI"
@@ -2053,8 +2248,16 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
         if let agentCard = entry.agentCard {
           metadata["agentCard"] = agentCard.rawValue
         }
+        if entry.isError {
+          message["isError"] = true
+        }
         if entry.messageType == "text", let actionSourceMessageId = entry.actionSourceMessageId {
           metadata["sourceMessageId"] = actionSourceMessageId
+          if let regeneratePrompt = regeneratePromptByAssistantId[actionSourceMessageId],
+            !regeneratePrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+          {
+            metadata["regeneratePrompt"] = regeneratePrompt
+          }
         }
         if entry.messageType == "text", let actionSourceText = entry.actionSourceText {
           metadata["sourceText"] = actionSourceText
@@ -2073,47 +2276,10 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
         "message": message,
       ])
 
-      let actionSourceText = entry.actionSourceText ?? entry.text
-      let trimmedActionSourceText =
-        actionSourceText.trimmingCharacters(in: .whitespacesAndNewlines)
-      if entry.isAgentMessage,
-        !entry.isStreaming,
-        isLastEntryForMessage,
-        !trimmedActionSourceText.isEmpty,
-        let actionSourceMessageId = entry.actionSourceMessageId
-      {
-        var actionMetadata: [String: Any] = [
-          "sourceMessageId": actionSourceMessageId,
-          "sourceText": actionSourceText,
-        ]
-        if let regeneratePrompt = regeneratePromptByAssistantId[actionSourceMessageId],
-          !regeneratePrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        {
-          actionMetadata["regeneratePrompt"] = regeneratePrompt
-        }
-
-        rows.append([
-          "kind": "message",
-          "key": "a-\(actionSourceMessageId)",
-          "message": [
-            "id": "actions-\(actionSourceMessageId)",
-            "text": "",
-            "timestamp": "",
-            "isMe": false,
-            "type": "agent_actions",
-            "isAgentMessage": true,
-            "agentName": "Vibe AI",
-            "bubbleShape": [
-              "showTail": false,
-              "borderTopLeftRadius": 18,
-              "borderTopRightRadius": 18,
-              "borderBottomLeftRadius": 18,
-              "borderBottomRightRadius": 18,
-            ],
-            "metadata": actionMetadata,
-          ],
-        ])
-      }
+      // The standalone bottom "agent_actions" row (copy/thumb/regenerate tab bar)
+      // is intentionally not emitted anymore. Regenerate now lives on the agent
+      // bubble itself — a side button + long-press menu — carried via the agent
+      // message's `regeneratePrompt`/`sourceMessageId` metadata above.
     }
 
     return rows
@@ -2192,7 +2358,9 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
           progressNodes: nil,
           agentCard: nil,
           actionSourceMessageId: message.role == .assistant ? message.id : nil,
-          actionSourceText: message.role == .assistant ? message.content : nil
+          actionSourceText: message.role == .assistant ? message.content : nil,
+          deliveryFailed: message.role == .user && (message.deliveryFailed ?? false),
+          isError: message.role == .assistant && (message.isError ?? false)
         ))
     }
 
@@ -2204,8 +2372,6 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
     isStreaming: Bool,
     into entries: inout [ChatNativeAgentRenderEntry]
   ) {
-    var pendingProgressSegments: [ChatNativeAgentStreamSegment] = []
-    var deferredCardEntries: [ChatNativeAgentRenderEntry] = []
     let lastRenderableSegmentIndex = message.streamSegments.lastIndex(where: {
       switch $0 {
       case .text(let text):
@@ -2216,111 +2382,55 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
         return false
       }
     })
-    let lastTextSegmentIndex = message.streamSegments.lastIndex(where: {
-      if case .text(let text) = $0 {
-        return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-      }
-      return false
-    })
 
-    func flushProgressSegments(position: Int) {
-      guard !pendingProgressSegments.isEmpty else { return }
-      let progressNodes = buildProgressNodes(from: pendingProgressSegments)
-      pendingProgressSegments.removeAll()
-      guard !progressNodes.isEmpty else { return }
-
-      entries.append(
-        ChatNativeAgentRenderEntry(
-          id: "\(message.id)-progress-\(position)",
-          messageId: message.id,
-          role: .assistant,
-          text: (progressNodes.first?["label"] as? String) ?? "Working...",
-          timestampMs: max(message.timestampMs, Self.nowMs()),
-          messageType: "agent_progress_tree",
-          isStreaming: false,
-          isAgentMessage: true,
-          showTail: false,
-          progressNodes: progressNodes,
-          agentCard: nil,
-          actionSourceMessageId: nil,
-          actionSourceText: nil
-        ))
-    }
-
+    // Cards are rendered after the response body (deferred).
+    var deferredCardEntries: [ChatNativeAgentRenderEntry] = []
     for (index, segment) in message.streamSegments.enumerated() {
-      switch segment {
-      case .progress(_, _, _, let status):
-        guard status == "running" else { continue }
-        pendingProgressSegments.append(segment)
-
-      case .text(let text):
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { continue }
-        // Drop any accumulated progress segments — the arrival of text means the tool
-        // already completed.  Showing a running-progress tree above the response text
-        // would be misleading and visually incorrect.
-        pendingProgressSegments.removeAll()
-
-        let isLastTextSegment = index == lastTextSegmentIndex
-        let isLastRenderableSegment = index == lastRenderableSegmentIndex
-        entries.append(
+      guard case .cards(let groupId, let cards) = segment, !cards.isEmpty else { continue }
+      let shouldAttachActions = !isStreaming && index == lastRenderableSegmentIndex
+      for (cardIndex, card) in cards.enumerated() {
+        deferredCardEntries.append(
           ChatNativeAgentRenderEntry(
-            id: "\(message.id)-text-\(index)",
+            id: "\(message.id)-card-\(groupId)-\(cardIndex)",
             messageId: message.id,
             role: .assistant,
-            text: text,
+            text: card.displayName,
             timestampMs: message.timestampMs,
-            messageType: "text",
-            isStreaming: isStreaming && isLastTextSegment,
+            messageType: "agent_card",
+            isStreaming: false,
             isAgentMessage: true,
-            showTail: isLastTextSegment,
+            showTail: false,
             progressNodes: nil,
-            agentCard: nil,
+            agentCard: card,
             actionSourceMessageId:
-              isStreaming ? nil : (isLastRenderableSegment ? message.id : nil),
+              shouldAttachActions && cardIndex == cards.count - 1 ? message.id : nil,
             actionSourceText:
-              isStreaming ? nil : (isLastRenderableSegment ? message.content : nil)
+              shouldAttachActions && cardIndex == cards.count - 1 ? message.content : nil
           ))
-
-      case .cards(let groupId, let cards):
-        // Defer card entries to render after all text content
-        pendingProgressSegments.removeAll()
-        let shouldAttachActions = !isStreaming && index == lastRenderableSegmentIndex
-        for (cardIndex, card) in cards.enumerated() {
-          deferredCardEntries.append(
-            ChatNativeAgentRenderEntry(
-              id: "\(message.id)-card-\(groupId)-\(cardIndex)",
-              messageId: message.id,
-              role: .assistant,
-              text: card.displayName,
-              timestampMs: message.timestampMs,
-              messageType: "agent_card",
-              isStreaming: false,
-              isAgentMessage: true,
-              showTail: false,
-              progressNodes: nil,
-              agentCard: card,
-              actionSourceMessageId:
-                shouldAttachActions && cardIndex == cards.count - 1 ? message.id : nil,
-              actionSourceText:
-                shouldAttachActions && cardIndex == cards.count - 1 ? message.content : nil
-            ))
-        }
       }
     }
 
-    flushProgressSegments(position: message.streamSegments.count)
+    // The whole assistant turn renders as a SINGLE bubble. `content` already
+    // accumulates every streamed chunk, so a response that streamed across tool
+    // calls (text → progress → text) collapses into one cell that expands as it
+    // streams — instead of several stacked bubbles split at each tool boundary.
+    let mergedText = message.content
+    let hasText = !mergedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 
-    if entries.last(where: { $0.id.hasPrefix(message.id) }) == nil,
-      let lastTextSegmentIndex,
-      case .text(let text) = message.streamSegments[lastTextSegmentIndex]
-    {
+    if hasText {
+      // Attach the action bar (regenerate / copy) once the turn is finished and
+      // text is the final renderable segment.
+      let lastIsText: Bool = lastRenderableSegmentIndex.map { idx in
+        if case .text = message.streamSegments[idx] { return true }
+        return false
+      } ?? true
+      let attachActions = !isStreaming && lastIsText
       entries.append(
         ChatNativeAgentRenderEntry(
-          id: message.id,
+          id: "\(message.id)-text",
           messageId: message.id,
           role: .assistant,
-          text: text,
+          text: mergedText,
           timestampMs: message.timestampMs,
           messageType: "text",
           isStreaming: isStreaming,
@@ -2328,12 +2438,36 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
           showTail: true,
           progressNodes: nil,
           agentCard: nil,
-          actionSourceMessageId: isStreaming ? nil : message.id,
-          actionSourceText: isStreaming ? nil : message.content
+          actionSourceMessageId: attachActions ? message.id : nil,
+          actionSourceText: attachActions ? message.content : nil,
+          isError: message.isError ?? false
         ))
+    } else {
+      // No text yet — surface the running-progress tree so the user sees tool
+      // activity before the answer arrives. Once text exists it supersedes this.
+      let runningProgress = message.streamSegments.filter { $0.isRunningProgress }
+      let progressNodes = buildProgressNodes(from: runningProgress)
+      if !progressNodes.isEmpty {
+        entries.append(
+          ChatNativeAgentRenderEntry(
+            id: "\(message.id)-progress",
+            messageId: message.id,
+            role: .assistant,
+            text: (progressNodes.first?["label"] as? String) ?? "Working...",
+            timestampMs: max(message.timestampMs, Self.nowMs()),
+            messageType: "agent_progress_tree",
+            isStreaming: false,
+            isAgentMessage: true,
+            showTail: false,
+            progressNodes: progressNodes,
+            agentCard: nil,
+            actionSourceMessageId: nil,
+            actionSourceText: nil
+          ))
+      }
     }
 
-    if !deferredCardEntries.isEmpty, !isStreaming || lastTextSegmentIndex != nil {
+    if !deferredCardEntries.isEmpty, !isStreaming || hasText {
       entries.append(contentsOf: deferredCardEntries)
     }
   }
@@ -2406,6 +2540,7 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
     let isStreaming = streamingConversationId != nil
     guard isStreaming != lastReportedStreamingState else { return }
     lastReportedStreamingState = isStreaming
+    onStreamingStateChanged?(isStreaming)
     onNativeEvent([
       "type": "agentStreamingState",
       "isStreaming": isStreaming,
@@ -2449,6 +2584,29 @@ public final class ChatNativeAgentView: ExpoView, UITableViewDataSource, UITable
     )
     guard let data = try? JSONEncoder().encode(state) else { return }
     UserDefaults.standard.set(data, forKey: Self.persistenceKey)
+    NotificationCenter.default.post(name: Self.conversationsDidChangeNotification, object: nil)
+  }
+
+  static func homeListSummary() -> (preview: String, timestampMs: Int64)? {
+    guard
+      let data = UserDefaults.standard.data(forKey: persistenceKey),
+      let state = try? JSONDecoder().decode(ChatNativeAgentPersistedState.self, from: data),
+      let conversation =
+        state.activeConversationId.flatMap({ activeId in
+          state.conversations.first(where: { $0.id == activeId })
+        })
+        ?? state.conversations.max(by: { $0.updatedAt < $1.updatedAt })
+    else {
+      return nil
+    }
+
+    let latestMessage = conversation.messages.max(by: { $0.timestampMs < $1.timestampMs })
+    let trimmedContent = latestMessage?.content.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let preview =
+      trimmedContent.isEmpty && latestMessage?.isStreaming == true
+      ? "Thinking…"
+      : (trimmedContent.isEmpty ? "Ask Vibe AI anything" : trimmedContent)
+    return (preview, latestMessage?.timestampMs ?? conversation.updatedAt)
   }
 
   private func topMostViewController() -> UIViewController? {

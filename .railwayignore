@@ -1,0 +1,67 @@
+# Git history (never needed for Docker build)
+.git/
+
+# Heavy / irrelevant directories
+legacy/
+android/
+ios/
+mobile/
+server_nodejs_old/
+tor_data/
+tmp_trade_patch/
+tmp_trade_agent_bridge.patch
+/docs/
+
+# Gradle/Android build cache
+.gradle-local/
+.gradle/
+android/.gradle/
+
+# Node dependencies (installed in Docker build)
+node_modules/
+client/node_modules/
+
+# Elixir build artifacts (built in Docker)
+server/_build/
+server/deps/
+server/.mix/
+server/uploads/
+
+# Logs and temp files
+*.log
+access.log
+error.log
+*.tgz
+tmp/
+
+# Secrets and local config
+.env
+.env.local
+.env.*.local
+server/.env
+*.key
+*.pem
+ngrok_token.txt
+ngrok_domain.txt
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+.claude/
+
+# Tests
+coverage/
+tests.json
+
+# React build output (built in Docker)
+client/dist/
+client/build/
+
+# Android/iOS artifacts
+*.apk
+*.aab
+*.ipa
+*.gradle
+DerivedData/
+Pods/

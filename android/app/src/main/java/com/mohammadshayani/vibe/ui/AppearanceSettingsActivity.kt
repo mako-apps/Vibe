@@ -20,6 +20,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import com.google.android.material.button.MaterialButton
+import com.mohammadshayani.vibe.R
 
 class AppearanceSettingsActivity : AppCompatActivity() {
   private var themeSignature = ""
@@ -73,10 +74,10 @@ class AppearanceSettingsActivity : AppCompatActivity() {
     )
 
     val backButton = ImageView(this).apply {
-      setImageResource(android.R.drawable.ic_media_previous)
+      setImageResource(R.drawable.ic_vibe_chevron_left)
       setColorFilter(palette.textColor)
       background = selectableItemBackground()
-      setPadding(dp(10f), dp(10f), dp(10f), dp(10f))
+      setPadding(dp(9f), dp(9f), dp(9f), dp(9f))
       setOnClickListener { finish() }
     }
     header.addView(
@@ -86,22 +87,25 @@ class AppearanceSettingsActivity : AppCompatActivity() {
 
     val titleColumn = LinearLayout(this).apply {
       orientation = LinearLayout.VERTICAL
+      gravity = Gravity.CENTER
     }
     header.addView(
       titleColumn,
-      LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-        marginStart = dp(8f)
-      },
+      LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
     )
 
-    titleColumn.addView(sectionTitle("Appearance", palette, 20f, "sans-serif-medium"))
+    titleColumn.addView(sectionTitle("Appearance", palette, 20f, "sans-serif-medium").apply {
+      gravity = Gravity.CENTER
+    })
     titleColumn.addView(
       TextView(this).apply {
         text = "Mode and plate apply across the Android shell."
         setTextColor(palette.secondaryTextColor)
         setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+        gravity = Gravity.CENTER
       },
     )
+    header.addView(View(this), LinearLayout.LayoutParams(dp(40f), dp(40f)))
 
     val scrollView = ScrollView(this).apply {
       isFillViewport = true
@@ -169,7 +173,6 @@ class AppearanceSettingsActivity : AppCompatActivity() {
           ),
         ).apply {
           cornerRadius = dp(26f).toFloat()
-          setStroke(dp(1f), palette.borderColor)
         }
       setPadding(dp(18f), dp(18f), dp(18f), dp(18f))
     }
@@ -225,7 +228,7 @@ class AppearanceSettingsActivity : AppCompatActivity() {
   private fun buildModeList(palette: AppThemePalette): View {
     val container = LinearLayout(this).apply {
       orientation = LinearLayout.VERTICAL
-      background = roundedRect(palette.cardColor, palette.borderColor, 24f)
+      background = roundedRect(palette.cardColor, Color.TRANSPARENT, 24f)
     }
     val selected = AppAppearanceController.current(this)
     AppAppearanceOption.entries.forEachIndexed { index, option ->
@@ -278,7 +281,7 @@ class AppearanceSettingsActivity : AppCompatActivity() {
             orientation = GradientDrawable.Orientation.TL_BR
             setStroke(
               dp(if (option == selected) 2f else 1f),
-              if (option == selected) optionPalette.accentColor else optionPalette.borderColor,
+              if (option == selected) optionPalette.accentColor else Color.TRANSPARENT,
             )
           }
         foreground = selectableItemBackground()
@@ -369,7 +372,7 @@ class AppearanceSettingsActivity : AppCompatActivity() {
       background =
         roundedRect(
           if (filled) palette.accentColor else palette.cardColor,
-          if (filled) palette.accentColor else palette.borderColor,
+          if (filled) palette.accentColor else Color.TRANSPARENT,
           999f,
         )
       setPadding(dp(12f), dp(7f), dp(12f), dp(7f))

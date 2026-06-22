@@ -2,6 +2,7 @@ package com.mohammadshayani.vibe.ui
 
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -19,8 +20,10 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import com.google.android.material.button.MaterialButton
 import com.mohammadshayani.vibe.R
+import com.mohammadshayani.vibe.packet.PacketRuntime
 import com.mohammadshayani.vibe.packet.PacketTransportMode
 import com.mohammadshayani.vibe.session.AppSessionConfig
+import com.mohammadshayani.vibe.storage.ChatEngineStore
 import com.mohammadshayani.vibe.storage.SecureKeyStore
 
 class UserQRDetailActivity : AppCompatActivity() {
@@ -80,28 +83,44 @@ class SecretKeyDetailActivity : AppCompatActivity() {
       title = "Secret Key",
       subtitle = if (secret.isBlank()) "No key stored on this device" else "Stored on this device",
     ) { stack, palette ->
+      if (secret.isNotBlank()) {
+        stack.addView(
+          ImageView(this).apply {
+            setImageBitmap(QRCodeRenderer.render(secret, dp(236f)))
+            setBackgroundColor(Color.WHITE)
+            setPadding(dp(16f), dp(16f), dp(16f), dp(16f))
+          },
+          LinearLayout.LayoutParams(dp(268f), dp(268f)).apply {
+            gravity = Gravity.CENTER_HORIZONTAL
+          },
+        )
+        stack.addView(space(28f))
+      }
+
       stack.addView(
         TextView(this).apply {
-          text = if (secret.isBlank()) "No secret key is stored on this device yet." else displaySecret(secret, revealed)
+          text = "YOUR SECRET KEY"
+          setTextColor(palette.secondaryTextColor)
+          setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+          typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+          setPadding(dp(4f), 0, 0, dp(8f))
+        },
+      )
+
+      stack.addView(
+        TextView(this).apply {
+          text = if (secret.isBlank()) "No secret key stored" else displaySecret(secret, revealed)
           setTextColor(if (secret.isBlank()) palette.secondaryTextColor else palette.textColor)
           setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
           typeface = Typeface.MONOSPACE
           setTextIsSelectable(true)
-          background = roundedRect(palette.cardColor, palette.borderColor, 18f)
-          setPadding(dp(16f), dp(16f), dp(16f), dp(16f))
+          background = roundedRect(palette.cardColor, Color.TRANSPARENT, 16f)
+          setPadding(dp(16f), dp(20f), dp(16f), dp(20f))
         },
         LinearLayout.LayoutParams(
           LinearLayout.LayoutParams.MATCH_PARENT,
           LinearLayout.LayoutParams.WRAP_CONTENT,
         ),
-      )
-      stack.addView(space(14f))
-      stack.addView(
-        TextView(this).apply {
-          text = "Do not share this key. Anyone with it can sign in as you on another device."
-          setTextColor(palette.dangerColor)
-          setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-        },
       )
       if (secret.isNotBlank()) {
         stack.addView(space(18f))
@@ -110,7 +129,7 @@ class SecretKeyDetailActivity : AppCompatActivity() {
           gravity = Gravity.CENTER_VERTICAL
         }
         actions.addView(
-          detailButton(if (revealed) "Hide" else "Show", palette) {
+          detailButton(if (revealed) "Hide Key" else "Reveal Key", palette, filled = false) {
             revealed = !revealed
             render()
           },
@@ -118,7 +137,7 @@ class SecretKeyDetailActivity : AppCompatActivity() {
         )
         actions.addView(space(10f, horizontal = true))
         actions.addView(
-          detailButton("Copy", palette) {
+          detailButton("Copy", palette, filled = true) {
             val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
             clipboard.setPrimaryClip(ClipData.newPlainText("Secret Key", secret))
           },
@@ -126,6 +145,15 @@ class SecretKeyDetailActivity : AppCompatActivity() {
         )
         stack.addView(actions)
       }
+      stack.addView(space(18f))
+      stack.addView(
+        TextView(this).apply {
+          text = "CRITICAL: Never share your secret key. This key provides full access to your identity and encrypted messages."
+          setTextColor(palette.dangerColor)
+          setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+          gravity = Gravity.CENTER
+        },
+      )
     }
   }
 
@@ -136,22 +164,133 @@ class SecretKeyDetailActivity : AppCompatActivity() {
 }
 
 class ConnectionDetailActivity : AppCompatActivity() {
+  private val modes = listOf(
+    PacketTransportMode.PACKET_MESH,
+    PacketTransportMode.DIRECT,
+    PacketTransportMode.OFFLINE,
+  )
+
   override fun onCreate(savedInstanceState: Bundle?) {
     AppAppearanceController.applyStoredPreference(this)
     super.onCreate(savedInstanceState)
+    render()
+  }
+
+  private fun render() {
     val config = AppSessionConfig.current(applicationContext)
+    val storedConfig = ChatEngineStore.getConfig(applicationContext)
+    val mode = config?.transportMode ?: PacketTransportMode.PACKET_MESH
+    val packetStatus = storedConfig["packetStatus"]?.toString()?.takeIf { it.isNotBlank() }
+    val bridgeId = storedConfig["activePacketBridgeId"]?.toString()?.takeIf { it.isNotBlank() }
+    val proxyPort = storedConfig["packetProxyPort"]?.toString()?.takeIf { it.isNotBlank() }
+    val lastError = storedConfig["packetLastError"]?.toString()?.takeIf { it.isNotBlank() }
+
     renderDetailPage(
-      title = "Connection",
-      subtitle = connectionModeTitle(config?.transportMode ?: PacketTransportMode.PACKET_MESH),
+      title = "Connection Manager",
+      subtitle = connectionModeTitle(mode),
     ) { stack, palette ->
       stack.addView(detailGroup(palette, listOf(
-        labelValueRow("Mode", connectionModeTitle(config?.transportMode ?: PacketTransportMode.PACKET_MESH), palette),
-        labelValueRow("API", config?.apiBaseUrl ?: "Unavailable", palette),
-        labelValueRow("Socket", config?.socketUrl ?: "Unavailable", palette),
-        labelValueRow("Bootstrap", config?.bootstrapUrl ?: "Unavailable", palette),
-        labelValueRow("Identity", config?.identityKey ?: "v2", palette),
+        labelValueRow("Mode", connectionModeTitle(mode), palette),
+        labelValueRow("Status", connectivityStatus(mode, packetStatus), palette),
+        labelValueRow("Bridge", bridgeId ?: "Automatic", palette),
+        labelValueRow("Proxy", proxyPort?.let { "Local mesh port $it" } ?: "Not running", palette),
+        labelValueRow("Last Error", lastError ?: "None", palette),
       )))
+      stack.addView(space(22f))
+      stack.addView(
+        TextView(this).apply {
+          text = "MODES"
+          setTextColor(palette.secondaryTextColor)
+          setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+          typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+          setPadding(dp(4f), 0, 0, dp(8f))
+        },
+      )
+      stack.addView(
+        detailGroup(
+          palette,
+          modes.map { modeOption ->
+            modeRow(
+              mode = modeOption,
+              selected = modeOption == mode,
+              palette = palette,
+            ) {
+              applyConnectionMode(modeOption)
+            }
+          },
+        ),
+      )
     }
+  }
+
+  private fun applyConnectionMode(mode: PacketTransportMode) {
+    val current = AppSessionConfig.current(applicationContext) ?: return
+    val updated = current.copy(transportMode = mode)
+    val loginSecret = SecureKeyStore.retrieveSecret(applicationContext, "loginSecret")
+    AppSessionConfig.store(applicationContext, updated)
+    if (!loginSecret.isNullOrBlank()) {
+      SecureKeyStore.storeSecret(applicationContext, "loginSecret", loginSecret)
+    }
+    PacketRuntime.stop(applicationContext, resetToDirect = mode == PacketTransportMode.DIRECT)
+    render()
+  }
+
+  private fun connectivityStatus(mode: PacketTransportMode, packetStatus: String?): String {
+    return when (mode) {
+      PacketTransportMode.PACKET_MESH -> packetStatus ?: "Automatic"
+      PacketTransportMode.DIRECT -> "Direct connectivity"
+      PacketTransportMode.OFFLINE -> "Remote traffic paused"
+      PacketTransportMode.BRIDGE_TEXT -> "Bridge text"
+    }
+  }
+
+  private fun modeRow(
+    mode: PacketTransportMode,
+    selected: Boolean,
+    palette: AppThemePalette,
+    onClick: () -> Unit,
+  ): View {
+    val row = LinearLayout(this).apply {
+      orientation = LinearLayout.HORIZONTAL
+      gravity = Gravity.CENTER_VERTICAL
+      foreground = selectableItemBackground()
+      setPadding(dp(16f), dp(14f), dp(16f), dp(14f))
+      setOnClickListener { onClick() }
+    }
+    val textColumn = LinearLayout(this).apply {
+      orientation = LinearLayout.VERTICAL
+    }
+    row.addView(
+      textColumn,
+      LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
+    )
+    textColumn.addView(
+      TextView(this).apply {
+        text = connectionModeTitle(mode)
+        setTextColor(palette.textColor)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+        typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+      },
+    )
+    textColumn.addView(
+      TextView(this).apply {
+        text = connectionModeDescription(mode)
+        setTextColor(palette.secondaryTextColor)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+      },
+    )
+    if (selected) {
+      row.addView(
+        ImageView(this).apply {
+          setImageResource(android.R.drawable.checkbox_on_background)
+          imageTintList = ColorStateList.valueOf(palette.accentColor)
+        },
+        LinearLayout.LayoutParams(dp(22f), dp(22f)).apply {
+          marginStart = dp(12f)
+        },
+      )
+    }
+    return row
   }
 }
 
@@ -180,7 +319,7 @@ private fun AppCompatActivity.renderDetailPage(
   val header = LinearLayout(this).apply {
     orientation = LinearLayout.HORIZONTAL
     gravity = Gravity.CENTER_VERTICAL
-    setPadding(dp(12f), dp(10f), dp(16f), dp(10f))
+    setPadding(dp(12f), dp(10f), dp(12f), dp(10f))
   }
   content.addView(
     header,
@@ -203,12 +342,11 @@ private fun AppCompatActivity.renderDetailPage(
 
   val titleColumn = LinearLayout(this).apply {
     orientation = LinearLayout.VERTICAL
+    gravity = Gravity.CENTER
   }
   header.addView(
     titleColumn,
-    LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-      marginStart = dp(8f)
-    },
+    LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
   )
   titleColumn.addView(
     TextView(this).apply {
@@ -216,6 +354,7 @@ private fun AppCompatActivity.renderDetailPage(
       setTextColor(palette.textColor)
       setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
       typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+      gravity = Gravity.CENTER
     },
   )
   titleColumn.addView(
@@ -223,8 +362,10 @@ private fun AppCompatActivity.renderDetailPage(
       text = subtitle
       setTextColor(palette.secondaryTextColor)
       setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+      gravity = Gravity.CENTER
     },
   )
+  header.addView(View(this), LinearLayout.LayoutParams(dp(40f), dp(40f)))
 
   val scrollView = ScrollView(this).apply {
     isFillViewport = true
@@ -253,7 +394,7 @@ private fun AppCompatActivity.renderDetailPage(
 
   ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
     val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
-    header.setPadding(dp(12f), bars.top + dp(10f), dp(16f), dp(10f))
+    header.setPadding(dp(12f), bars.top + dp(10f), dp(12f), dp(10f))
     stack.setPadding(dp(16f), dp(18f), dp(16f), bars.bottom + dp(24f))
     insets
   }
@@ -295,7 +436,7 @@ private fun AppCompatActivity.detailGroup(
 ): LinearLayout {
   val group = LinearLayout(this).apply {
     orientation = LinearLayout.VERTICAL
-    background = roundedRect(palette.cardColor, palette.borderColor, 18f)
+    background = roundedRect(palette.cardColor, Color.TRANSPARENT, 18f)
   }
   rows.forEachIndexed { index, row ->
     group.addView(row)
@@ -313,14 +454,15 @@ private fun AppCompatActivity.detailGroup(
 private fun AppCompatActivity.detailButton(
   title: String,
   palette: AppThemePalette,
+  filled: Boolean = true,
   onClick: () -> Unit,
 ): MaterialButton {
   return MaterialButton(this).apply {
     text = title
     isAllCaps = false
     cornerRadius = dp(20f)
-    setTextColor(palette.buttonTextColor)
-    backgroundTintList = android.content.res.ColorStateList.valueOf(palette.buttonColor)
+    setTextColor(if (filled) palette.buttonTextColor else palette.textColor)
+    backgroundTintList = ColorStateList.valueOf(if (filled) palette.buttonColor else palette.cardColor)
     setOnClickListener { onClick() }
   }
 }
@@ -334,12 +476,23 @@ private fun connectionModeTitle(mode: PacketTransportMode): String {
   }
 }
 
+private fun connectionModeDescription(mode: PacketTransportMode): String {
+  return when (mode) {
+    PacketTransportMode.PACKET_MESH -> "Use packet mesh when available and fall back automatically."
+    PacketTransportMode.DIRECT -> "Connect directly without packet mesh."
+    PacketTransportMode.OFFLINE -> "Pause remote chat traffic until you switch back."
+    PacketTransportMode.BRIDGE_TEXT -> "Use the text bridge transport."
+  }
+}
+
 private fun AppCompatActivity.roundedRect(fillColor: Int, strokeColor: Int, radiusDp: Float): GradientDrawable {
   return GradientDrawable().apply {
     shape = GradientDrawable.RECTANGLE
     cornerRadius = dp(radiusDp).toFloat()
     setColor(fillColor)
-    setStroke(dp(1f), strokeColor)
+    if (strokeColor != Color.TRANSPARENT) {
+      setStroke(dp(1f), strokeColor)
+    }
   }
 }
 

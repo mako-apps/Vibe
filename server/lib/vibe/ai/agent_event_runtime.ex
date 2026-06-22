@@ -26,10 +26,23 @@ defmodule Vibe.AI.AgentEventRuntime do
   def ingest(%Agent{} = agent, params, opts \\ []) when is_map(params) do
     secret = Keyword.get(opts, :secret)
 
+    Logger.info(
+      "[InboxBanner] ingest agent_id=#{inspect(agent.id)} " <>
+        "raw_approval_rules_event_inbox=#{inspect(get_in(agent.approval_rules || %{}, ["event_inbox"]))} " <>
+        "params_event_type=#{inspect(Map.get(params, "eventType") || Map.get(params, :eventType))}"
+    )
+
     with {:ok, integration} <- resolve_integration(agent, params, secret),
          {:ok, normalized} <- normalize_event(agent, integration, params),
          :ok <- ensure_destination_chat(agent, normalized.destination_chat_id),
          {:ok, result} <- persist_event(agent, integration, normalized) do
+      Logger.info(
+        "[InboxBanner] ingest result agent_id=#{inspect(agent.id)} " <>
+          "decision=#{inspect(Map.get(result, :decision))} " <>
+          "messagePosted=#{inspect(Map.get(result, :messagePosted))} " <>
+          "status=#{inspect(Map.get(result, :status))}"
+      )
+
       {:ok, result}
     end
   end
@@ -93,6 +106,13 @@ defmodule Vibe.AI.AgentEventRuntime do
           policy = evaluate_policy(agent, integration, normalized, last_event, runbook)
           inbox_config = event_inbox_config(agent, integration)
 
+          Logger.info(
+            "[InboxBanner] persist agent_id=#{inspect(agent.id)} " <>
+              "inbox_mode=#{inspect(inbox_config.mode)} window_hours=#{inspect(inbox_config.summary_window_hours)} " <>
+              "policy_mode=#{inspect(policy.mode)} post_event_message?=#{inspect(policy.post_event_message?)} " <>
+              "post_individual?=#{inspect(post_individual_event_message?(policy, inbox_config))}"
+          )
+
           event =
             %AgentEvent{}
             |> AgentEvent.changeset(%{
@@ -116,26 +136,28 @@ defmodule Vibe.AI.AgentEventRuntime do
           {thread, event, message_payload} =
             case policy.post_event_message? do
               true ->
-                if post_individual_event_message?(policy, inbox_config) do
-                  {:ok, message_payload} = post_event_message(agent, thread, event, normalized, policy)
-                  updated_event =
-                    event
-                    |> AgentEvent.changeset(%{message_id: message_payload.message_id})
+                # In batched_summary mode, still post each event but SILENTLY so
+                # it populates the dedicated Inbox view (clients route eventThread
+                # messages out of the transcript) without a push per event. The
+                # periodic batched summary still posts normally with a push.
+                silent? = not post_individual_event_message?(policy, inbox_config)
+                {:ok, message_payload} = post_event_message(agent, thread, event, normalized, policy, silent?)
+
+                updated_event =
+                  event
+                  |> AgentEvent.changeset(%{message_id: message_payload.message_id})
+                  |> Repo.update!()
+
+                updated_thread =
+                  if is_nil(thread.root_message_id) do
+                    thread
+                    |> AgentEventThread.changeset(%{root_message_id: message_payload.message_id})
                     |> Repo.update!()
+                  else
+                    thread
+                  end
 
-                  updated_thread =
-                    if is_nil(thread.root_message_id) do
-                      thread
-                      |> AgentEventThread.changeset(%{root_message_id: message_payload.message_id})
-                      |> Repo.update!()
-                    else
-                      thread
-                    end
-
-                  {updated_thread, updated_event, message_payload}
-                else
-                  {thread, event, nil}
-                end
+                {updated_thread, updated_event, message_payload}
 
               false ->
                 {thread, event, nil}
@@ -554,28 +576,32 @@ defmodule Vibe.AI.AgentEventRuntime do
       get_in(integration.routing_rules || %{}, ["event_inbox"]) ||
         get_in(agent.approval_rules || %{}, ["event_inbox"]) || %{}
 
-    %{
-      mode: normalize_event_inbox_mode(merged["mode"] || merged[:mode]),
-      summary_window_hours:
-        normalize_summary_window_hours(
-          merged["summary_window_hours"] || merged[:summary_window_hours] || merged["cadence"] ||
-            merged[:cadence]
-        )
-    }
+    build_event_inbox_config(merged)
   end
 
   defp event_inbox_config(%Agent{} = agent, _integration) do
     merged = get_in(agent.approval_rules || %{}, ["event_inbox"]) || %{}
+    build_event_inbox_config(merged)
+  end
 
+  # Normalized inbox config. Supports two summary schedules:
+  #   * "interval" — post a summary every `summary_window_hours` (rolling window)
+  #   * "daily"    — post a summary at fixed clock times (`summary_times`, UTC minutes)
+  defp build_event_inbox_config(merged) when is_map(merged) do
     %{
       mode: normalize_event_inbox_mode(merged["mode"] || merged[:mode]),
       summary_window_hours:
         normalize_summary_window_hours(
           merged["summary_window_hours"] || merged[:summary_window_hours] || merged["cadence"] ||
             merged[:cadence]
-        )
+        ),
+      schedule: normalize_summary_schedule(merged["summary_schedule"] || merged[:summary_schedule]),
+      summary_times:
+        normalize_summary_times(merged["summary_times"] || merged[:summary_times])
     }
   end
+
+  defp build_event_inbox_config(_), do: build_event_inbox_config(%{})
 
   defp normalize_event_inbox_mode(value) do
     case normalize_string(value) do
@@ -605,6 +631,91 @@ defmodule Vibe.AI.AgentEventRuntime do
     end
   end
 
+  defp normalize_summary_schedule(value) do
+    case normalize_string(value) do
+      "daily" -> "daily"
+      "time_of_day" -> "daily"
+      "times" -> "daily"
+      "fixed" -> "daily"
+      _ -> "interval"
+    end
+  end
+
+  # Accepts a list of clock times ("HH:MM" strings or integer hours/minutes) and
+  # returns a sorted, de-duped list of minutes-from-midnight (UTC). Invalid or
+  # empty input yields []; callers fall back to the interval schedule when empty.
+  defp normalize_summary_times(value) do
+    value
+    |> List.wrap()
+    |> Enum.map(&parse_summary_time/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  defp parse_summary_time(value) when is_integer(value) do
+    cond do
+      value >= 0 and value <= 23 -> value * 60
+      value >= 0 and value < 1440 -> value
+      true -> nil
+    end
+  end
+
+  defp parse_summary_time(value) when is_binary(value) do
+    case String.split(String.trim(value), ":", parts: 2) do
+      [h, m] ->
+        with {hour, _} <- Integer.parse(h),
+             {minute, _} <- Integer.parse(m),
+             true <- hour in 0..23 and minute in 0..59 do
+          hour * 60 + minute
+        else
+          _ -> nil
+        end
+
+      [h] ->
+        case Integer.parse(h) do
+          {hour, _} when hour in 0..23 -> hour * 60
+          _ -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp parse_summary_time(_), do: nil
+
+  # True when a fixed-time summary is due: some configured clock time has elapsed
+  # since the pending batch started and on/before the current event time.
+  defp daily_summary_due?(_pending_started_at, _occurred_at, []), do: false
+
+  defp daily_summary_due?(pending_started_at, occurred_at, minutes_list) do
+    case last_scheduled_at(occurred_at, minutes_list) do
+      nil -> false
+      scheduled_at -> DateTime.compare(scheduled_at, pending_started_at) == :gt
+    end
+  end
+
+  # Most recent scheduled datetime at or before `now` across the configured times.
+  defp last_scheduled_at(now, minutes_list) do
+    today = DateTime.to_date(now)
+
+    [today, Date.add(today, -1)]
+    |> Enum.flat_map(fn date ->
+      Enum.map(minutes_list, fn minutes ->
+        {:ok, dt} =
+          DateTime.new(date, Time.new!(div(minutes, 60), rem(minutes, 60), 0), "Etc/UTC")
+
+        dt
+      end)
+    end)
+    |> Enum.filter(fn dt -> DateTime.compare(dt, now) != :gt end)
+    |> case do
+      [] -> nil
+      candidates -> Enum.max_by(candidates, &DateTime.to_unix/1)
+    end
+  end
+
   defp post_individual_event_message?(policy, inbox_config) do
     policy.mode != "summarize" or inbox_config.mode != "batched_summary"
   end
@@ -616,13 +727,19 @@ defmodule Vibe.AI.AgentEventRuntime do
           parse_datetime(current_state["pending_summary_started_at"]) || occurred_at
 
         due? =
-          DateTime.diff(occurred_at, pending_started_at, :second) >=
-            inbox_config.summary_window_hours * 3600
+          if inbox_config.schedule == "daily" and inbox_config.summary_times != [] do
+            daily_summary_due?(pending_started_at, occurred_at, inbox_config.summary_times)
+          else
+            DateTime.diff(occurred_at, pending_started_at, :second) >=
+              inbox_config.summary_window_hours * 3600
+          end
 
         next_state =
           current_state
           |> Map.put("event_inbox_mode", inbox_config.mode)
           |> Map.put("summary_window_hours", inbox_config.summary_window_hours)
+          |> Map.put("summary_schedule", inbox_config.schedule)
+          |> Map.put("summary_times", inbox_config.summary_times)
           |> Map.put("pending_summary_started_at", DateTime.to_iso8601(pending_started_at))
 
         {next_state, if(due?, do: pending_started_at, else: nil)}
@@ -962,15 +1079,10 @@ defmodule Vibe.AI.AgentEventRuntime do
     |> Repo.insert!()
   end
 
-  defp post_event_message(agent, thread, event, normalized, policy) do
-    body =
-      [
-        normalized.title || humanize_event_type(normalized.event_type),
-        normalize_string(normalized.text),
-        summarize_payload_line(normalized.payload)
-      ]
-      |> Enum.reject(&is_nil/1)
-      |> Enum.join("\n")
+  defp post_event_message(agent, thread, event, normalized, policy, silent) do
+    title = normalized.title || humanize_event_type(normalized.event_type)
+    detail = normalize_string(normalized.text) || summarize_payload_line(normalized.payload)
+    body = event_message_body(title, detail)
 
     metadata = %{
       "eventThread" => true,
@@ -986,14 +1098,15 @@ defmodule Vibe.AI.AgentEventRuntime do
     }
 
     with {:ok, primary_message} <-
-           maybe_post_event_summary(agent, thread.chat_id, body, metadata, thread.root_message_id),
+           maybe_post_event_summary(agent, thread.chat_id, body, metadata, thread.root_message_id, silent),
          {:ok, _attachment_messages} <-
            post_event_attachments(
              agent,
              thread.chat_id,
              normalize_attachments_payload(normalized.attachments),
              metadata,
-             primary_message && primary_message.message_id || thread.root_message_id
+             primary_message && primary_message.message_id || thread.root_message_id,
+             silent
            ) do
       {:ok, primary_message}
     end
@@ -1018,6 +1131,11 @@ defmodule Vibe.AI.AgentEventRuntime do
     timestamp = System.system_time(:millisecond)
     message_type = Keyword.get(opts, :type, "text")
     media_url = Keyword.get(opts, :media_url)
+    # Silent posts still broadcast over the live channel (so the Inbox view
+    # updates in real time) but skip the push notification. Used for individual
+    # inbox items in batched_summary mode so the inbox is populated without a
+    # push per event.
+    silent = Keyword.get(opts, :silent, false)
 
     metadata =
       metadata
@@ -1027,6 +1145,12 @@ defmodule Vibe.AI.AgentEventRuntime do
       |> maybe_put("mimeType", normalize_string(metadata["mimeType"] || metadata[:mimeType]))
       |> maybe_put("caption", normalize_string(metadata["caption"] || metadata[:caption]))
       |> maybe_put("isVideoNote", normalize_boolean(metadata["isVideoNote"] || metadata[:isVideoNote]))
+
+    agent_username =
+      case agent.agent_user do
+        %{username: username} when is_binary(username) -> username
+        _ -> nil
+      end
 
     attrs =
       %{
@@ -1040,7 +1164,13 @@ defmodule Vibe.AI.AgentEventRuntime do
           metadata
           |> Map.put("isAgentMessage", true)
           |> Map.put("agentName", agent.display_name)
-          |> Map.put("agentId", agent.id),
+          |> Map.put("agentId", agent.id)
+          |> Map.put("agentUserId", agent.agent_user_id)
+          |> Map.put("agentUsername", agent_username)
+          |> Map.put(
+            "agentHandle",
+            if(agent_username, do: "@#{agent_username}", else: nil)
+          ),
         reply_to_id: reply_to_id,
         timestamp: timestamp
       }
@@ -1068,6 +1198,9 @@ defmodule Vibe.AI.AgentEventRuntime do
           "isAgentMessage" => true,
           "agentName" => agent.display_name,
           "agentId" => agent.id,
+          "agentUserId" => agent.agent_user_id,
+          "agentUsername" => agent_username,
+          "agentHandle" => if(agent_username, do: "@#{agent_username}", else: nil),
           "metadata" => attrs.metadata,
           "replyToId" => reply_to_id
         }
@@ -1089,7 +1222,7 @@ defmodule Vibe.AI.AgentEventRuntime do
               muted: participant.muted || false
             })
 
-            if not participant.muted do
+            if not participant.muted and not silent do
               _ =
                 Notifications.send_message_push(participant.user_id, %{
                   "chat_id" => chat_id,
@@ -1110,17 +1243,17 @@ defmodule Vibe.AI.AgentEventRuntime do
     end
   end
 
-  defp maybe_post_event_summary(agent, chat_id, body, metadata, reply_to_id) do
+  defp maybe_post_event_summary(agent, chat_id, body, metadata, reply_to_id, silent) do
     if normalize_string(body) do
-      post_chat_message(agent, chat_id, body, metadata, reply_to_id)
+      post_chat_message(agent, chat_id, body, metadata, reply_to_id, silent: silent)
     else
       {:ok, nil}
     end
   end
 
-  defp post_event_attachments(_agent, _chat_id, [], _metadata, _reply_to_id), do: {:ok, []}
+  defp post_event_attachments(_agent, _chat_id, [], _metadata, _reply_to_id, _silent), do: {:ok, []}
 
-  defp post_event_attachments(agent, chat_id, attachments, metadata, reply_to_id) do
+  defp post_event_attachments(agent, chat_id, attachments, metadata, reply_to_id, silent) do
     attachments
     |> Enum.reduce_while({:ok, []}, fn attachment, {:ok, acc} ->
       attachment_metadata =
@@ -1145,7 +1278,8 @@ defmodule Vibe.AI.AgentEventRuntime do
              attachment_metadata,
              reply_to_id,
              type: attachment_message_type(attachment),
-             media_url: attachment["url"]
+             media_url: attachment["url"],
+             silent: silent
            ) do
         {:ok, message_payload} ->
           {:cont, {:ok, acc ++ [message_payload]}}
@@ -1433,6 +1567,9 @@ defmodule Vibe.AI.AgentEventRuntime do
     |> String.trim()
     |> String.capitalize()
   end
+
+  defp event_message_body(title, nil), do: "# #{title}"
+  defp event_message_body(title, detail), do: "# #{title}\n\n#{detail}"
 
   defp summarize_payload_line(payload) when map_size(payload) == 0, do: nil
 

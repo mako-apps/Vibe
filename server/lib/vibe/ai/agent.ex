@@ -119,20 +119,35 @@ defmodule Vibe.AI.Agent do
     %{
       name: "query_event_inbox",
       description:
-        "Look up the agent's received notification/event inbox for a live timeframe such as today, yesterday, last 4h, daily, or a recent period. Use this before answering questions about past notifications, counts, times, or related received items.",
+        "Query and AGGREGATE the events this agent has received from its connected apps, to answer questions about them over a timeframe (today, yesterday, last 4h, last 24h, last 7d, last 30d). Returns exact total counts that are NOT limited by `limit`, plus per-event-type and per-source breakdowns. The agent does not know the event shapes in advance: FIRST call it without `group_by` to inspect a few sample events and learn the available payload fields, THEN refine. Pass `group_by` to break counts down by a dimension (a payload path like `a.b.c`, or one of `event_type`/`source`), and `metrics` to sum numeric payload fields by path. Filter with `event_type` (exact) or `event_type_prefix` (a whole family). Compute any derived rates yourself. Only fall back to `call_connected_app` for fresh live data the inbox has not received yet.",
       input_schema: %{
         type: "object",
         properties: %{
           timeframe: %{
             type: "string",
-            description: "Time window to inspect, such as today, yesterday, last 4h, last 24h, or last 7d"
+            description: "Time window to inspect, such as today, yesterday, last 4h, last 24h, last 7d, or last 30d"
           },
-          source: %{type: "string", description: "Optional source filter, such as tradeai"},
-          event_type: %{type: "string", description: "Optional event type filter"},
-          limit: %{type: "integer", description: "Maximum matching events to return, default 25"},
+          source: %{type: "string", description: "Optional source filter to a single sending app"},
+          event_type: %{type: "string", description: "Optional exact event type filter (use a value seen in the samples)"},
+          event_type_prefix: %{
+            type: "string",
+            description: "Optional event type prefix filter to match a whole family of event types"
+          },
+          group_by: %{
+            type: "string",
+            description:
+              "Optional dimension to break counts down by. Use a dotted payload path (e.g. `a.b.c`) seen in the sample events, or one of `event_type`, `source`."
+          },
+          metrics: %{
+            type: "array",
+            items: %{type: "string"},
+            description:
+              "Optional list of numeric payload paths to sum across matching events (use dotted paths seen in the sample events)."
+          },
+          limit: %{type: "integer", description: "Maximum sample events to return alongside the aggregates, default 25"},
           query: %{
             type: "string",
-            description: "Optional free-form intent note for the lookup, such as trades opened yesterday"
+            description: "Optional free-form intent note for the lookup"
           }
         }
       }
@@ -203,7 +218,7 @@ defmodule Vibe.AI.Agent do
     %{
       name: "update_current_agent_config",
       description:
-        "Update the current standalone agent directly for simple one-agent changes such as prompt, name, persona, welcome message, voice profile, or status. Prefer this over delegate_to_subagent when the user is changing the agent they are already chatting with.",
+        "Update the current standalone agent directly for simple one-agent changes such as prompt, name, persona, welcome message, profile image/avatar, voice profile, or status. Prefer this over delegate_to_subagent when the user is changing the agent they are already chatting with. When the user shares an image and asks to use it as the agent's profile/avatar, pass its URL as avatar_url.",
       input_schema: %{
         type: "object",
         properties: %{
@@ -211,6 +226,11 @@ defmodule Vibe.AI.Agent do
           system_prompt: %{type: "string", description: "Updated system prompt."},
           persona: %{type: "string", description: "Updated persona."},
           welcome_message: %{type: "string", description: "Updated welcome message."},
+          avatar_url: %{
+            type: "string",
+            description:
+              "Updated profile image/avatar URL for the agent. Use a hosted image URL, e.g. one the user just sent."
+          },
           voice_profile: %{type: "string", description: "Updated voice profile."},
           status: %{
             type: "string",
@@ -292,13 +312,14 @@ defmodule Vibe.AI.Agent do
      - Convert natural language times to ISO8601 (e.g., "6pm today" → appropriate datetime).
      - Confirm the scheduled time after scheduling.
 
-  9. query_event_inbox: Use for questions about the agent's received notifications or past events.
+  9. query_event_inbox: Use for questions about the events this agent has received from its connected apps (analytics, notifications, past activity).
+     - Returns EXACT total counts (not limited by `limit`) plus per-event-type and per-source breakdowns. You do not know the payload shapes in advance: first call it without `group_by` to inspect a few sample events and learn what fields they carry, then pass `group_by` (a payload path, or event_type/source) and `metrics` (numeric payload paths) to break down and sum. Compute any derived rates yourself.
      - Use this BEFORE answering questions like:
-       * "How many trades did I have yesterday?"
-       * "When were they opened?"
+       * "How many <events> did we get today, and how do they break down?"
+       * "What were the totals or top values over the last 7 days?"
        * "Summarize the last 4 hours of notifications"
-       * "Show me related messages from that inbox"
      - If you are not certain about past events, counts, timing, or related notifications, look them up first instead of guessing from memory.
+     - The agent's own system prompt describes which event types this agent receives and what their fields mean; rely on that for project-specific context.
 
   10. configure_event_inbox: Use when the user wants notification mode changes.
       - Use this for requests like:
@@ -408,7 +429,7 @@ defmodule Vibe.AI.Agent do
       {:error, "No API key configured"}
     else
       body = Jason.encode!(%{
-        model: "claude-3-haiku-20240307",
+        model: @claude_model,
         max_tokens: 100,
         messages: [%{role: "user", content: prompt}]
       })
@@ -616,57 +637,78 @@ defmodule Vibe.AI.Agent do
     }
   end
 
+  # Cap of events pulled into memory for payload-based aggregation (group_by /
+  # metric sums). Exact totals and event_type/source breakdowns are computed in
+  # SQL and are NOT bounded by this cap; only payload aggregation samples it.
+  @inbox_aggregation_cap 5_000
+
   defp query_event_inbox(input, agent_id, requester_user_id) do
     with {:ok, agent} <- resolve_owned_agent(agent_id, requester_user_id) do
       timeframe = resolve_event_timeframe(input["timeframe"] || input["window"] || input["period"])
       source_filter = normalize_tool_string(input["source"])
       event_type_filter = normalize_tool_string(input["event_type"] || input["eventType"])
+      event_type_prefix = normalize_tool_string(input["event_type_prefix"] || input["eventTypePrefix"])
+      group_by = normalize_tool_string(input["group_by"] || input["groupBy"])
+      metrics = normalize_metric_paths(input["metrics"])
       limit = normalize_limit(input["limit"], 25, 60)
 
-      query =
+      base =
         from e in AgentEvent,
-          join: t in AgentEventThread,
-          on: t.id == e.thread_id,
           where:
             e.agent_id == ^agent.id and
               e.occurred_at >= ^timeframe.since and
-              e.occurred_at <= ^timeframe.until,
-          order_by: [desc: e.occurred_at, desc: e.inserted_at]
+              e.occurred_at <= ^timeframe.until
 
-      query =
-        if is_binary(source_filter) do
-          from [e, _t] in query, where: e.source == ^source_filter
-        else
-          query
-        end
+      base =
+        if is_binary(source_filter),
+          do: from(e in base, where: e.source == ^source_filter),
+          else: base
 
-      query =
-        if is_binary(event_type_filter) do
-          from [e, _t] in query, where: e.event_type == ^event_type_filter
-        else
-          query
-        end
+      base =
+        if is_binary(event_type_filter),
+          do: from(e in base, where: e.event_type == ^event_type_filter),
+          else: base
 
-      events =
-        query
-        |> limit(^limit)
-        |> select([e, t], %{
-          id: e.id,
-          message_id: e.message_id,
-          occurred_at: e.occurred_at,
-          source: e.source,
-          event_type: e.event_type,
-          title: e.title,
-          text: e.text,
-          payload: e.payload,
-          thread_id: t.id,
-          thread_key: t.thread_key,
-          thread_title: t.title
-        })
+      base =
+        if is_binary(event_type_prefix),
+          do: from(e in base, where: like(e.event_type, ^(event_type_prefix <> "%"))),
+          else: base
+
+      # Exact totals, independent of any row limit.
+      total_matching = Repo.aggregate(base, :count, :id)
+      source_counts = sql_count_by(base, :source)
+      event_type_counts = sql_count_by(base, :event_type)
+
+      # Sample (capped) for payload-based aggregation and human-readable rows.
+      sample_cap = if(group_by || metrics != [], do: @inbox_aggregation_cap, else: limit)
+
+      sample =
+        from(e in base,
+          join: t in AgentEventThread,
+          on: t.id == e.thread_id,
+          order_by: [desc: e.occurred_at, desc: e.inserted_at],
+          limit: ^sample_cap,
+          select: %{
+            id: e.id,
+            message_id: e.message_id,
+            occurred_at: e.occurred_at,
+            source: e.source,
+            event_type: e.event_type,
+            title: e.title,
+            text: e.text,
+            payload: e.payload,
+            thread_id: t.id,
+            thread_key: t.thread_key,
+            thread_title: t.title
+          }
+        )
         |> Repo.all()
+
+      events = Enum.take(sample, limit)
+      aggregation_sampled = total_matching > length(sample)
       related_message_ids = events |> Enum.map(& &1.message_id) |> Enum.filter(&is_binary/1) |> Enum.uniq()
 
-      %{
+      base_result = %{
         "ok" => true,
         "timeframe" => %{
           "label" => timeframe.label,
@@ -675,9 +717,10 @@ defmodule Vibe.AI.Agent do
         },
         "mode" => current_event_inbox_mode(agent),
         "summary_window_hours" => current_event_inbox_window_hours(agent),
-        "total_events" => length(events),
-        "source_counts" => count_by(events, & &1.source),
-        "event_type_counts" => count_by(events, & &1.event_type),
+        "total_events" => total_matching,
+        "sampled_events" => length(sample),
+        "source_counts" => source_counts,
+        "event_type_counts" => event_type_counts,
         "events" =>
           Enum.map(events, fn event ->
             %{
@@ -694,17 +737,170 @@ defmodule Vibe.AI.Agent do
               "payload" => condensed_payload(event.payload)
             }
           end),
-        "summary" => build_event_inbox_summary(events, timeframe.label, source_filter, event_type_filter),
+        "summary" =>
+          build_event_inbox_summary(events, total_matching, timeframe.label, source_filter, event_type_filter),
         "related_message_ids" => related_message_ids,
         "related_title" => related_messages_title(length(related_message_ids)),
         "related_subtitle" =>
           if(related_message_ids == [], do: nil, else: "Tap to review the underlying messages")
       }
+
+      base_result
+      |> maybe_put_group_counts(group_by, sample)
+      |> maybe_put_metric_sums(metrics, sample)
+      |> maybe_flag_sampled(aggregation_sampled, group_by, metrics)
     else
       {:error, reason} ->
         %{"ok" => false, "error" => inbox_error_message(reason)}
     end
   end
+
+  defp maybe_put_group_counts(result, nil, _sample), do: result
+
+  defp maybe_put_group_counts(result, group_by, sample) do
+    counts = aggregate_group_counts(sample, group_by)
+
+    result
+    |> Map.put("group_by", group_by)
+    |> Map.put("group_counts", counts)
+  end
+
+  defp maybe_put_metric_sums(result, [], _sample), do: result
+
+  defp maybe_put_metric_sums(result, metrics, sample) do
+    Map.put(result, "metric_sums", aggregate_metric_sums(sample, metrics))
+  end
+
+  defp maybe_flag_sampled(result, true, group_by, metrics)
+       when not is_nil(group_by) or metrics != [] do
+    result
+    |> Map.put("aggregation_sampled", true)
+    |> Map.put(
+      "aggregation_note",
+      "group_by/metrics aggregates cover the most recent #{result["sampled_events"]} of #{result["total_events"]} matching events; totals and breakdowns above are exact."
+    )
+  end
+
+  defp maybe_flag_sampled(result, _sampled, _group_by, _metrics), do: result
+
+  defp normalize_metric_paths(values) do
+    values
+    |> List.wrap()
+    |> Enum.map(&normalize_tool_string/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+  end
+
+  # Exact group counts computed in SQL for a top-level column.
+  defp sql_count_by(query, column) do
+    from(e in query,
+      group_by: field(e, ^column),
+      select: {field(e, ^column), count(e.id)}
+    )
+    |> Repo.all()
+    |> Enum.reduce(%{}, fn
+      {nil, _count}, acc -> acc
+      {key, count}, acc -> Map.put(acc, to_string(key), count)
+    end)
+  end
+
+  # Group counts over a payload dimension (or event_type/source) from the
+  # in-memory sample. Supports arbitrary dotted payload paths (e.g. "a.b.c").
+  defp aggregate_group_counts(events, "event_type"), do: count_by(events, & &1.event_type)
+  defp aggregate_group_counts(events, "source"), do: count_by(events, & &1.source)
+
+  defp aggregate_group_counts(events, path) do
+    segments = String.split(path, ".")
+
+    Enum.reduce(events, %{}, fn event, acc ->
+      case dig_payload(event.payload, segments) do
+        value when is_binary(value) or is_number(value) or is_boolean(value) ->
+          key = to_string(value)
+          if key == "", do: acc, else: Map.update(acc, key, 1, &(&1 + 1))
+
+        _ ->
+          acc
+      end
+    end)
+  end
+
+  defp aggregate_metric_sums(events, metrics) do
+    Enum.reduce(metrics, %{}, fn path, acc ->
+      segments = String.split(path, ".")
+
+      sum =
+        Enum.reduce(events, 0, fn event, total ->
+          total + coerce_number(dig_payload(event.payload, segments))
+        end)
+
+      Map.put(acc, path, sum)
+    end)
+  end
+
+  # Resolve a dotted path against an event payload. Robust to two shapes:
+  #   * flat dotted scalar keys, e.g. %{"traffic.sessions" => 12} (how external
+  #     senders that flatten nested data deliver analytics), and
+  #   * nested maps, e.g. %{"traffic" => %{"sessions" => 12}}, including the case
+  #     where an intermediate value arrived as a JSON-encoded string.
+  defp dig_payload(payload, segments) when is_map(payload) do
+    path = Enum.join(segments, ".")
+
+    case fetch_payload_key(payload, path) do
+      {:ok, value} -> value
+      :error -> descend_payload(payload, segments)
+    end
+  end
+
+  defp dig_payload(_payload, _segments), do: nil
+
+  defp descend_payload(payload, [segment | rest]) when is_map(payload) do
+    case fetch_payload_key(payload, segment) do
+      {:ok, value} when rest == [] -> value
+      {:ok, value} -> descend_payload(maybe_decode_json(value), rest)
+      :error -> nil
+    end
+  end
+
+  defp descend_payload(_payload, _segments), do: nil
+
+  defp fetch_payload_key(map, key) do
+    cond do
+      Map.has_key?(map, key) ->
+        {:ok, Map.get(map, key)}
+
+      (atom = safe_atom(key)) && Map.has_key?(map, atom) ->
+        {:ok, Map.get(map, atom)}
+
+      true ->
+        :error
+    end
+  end
+
+  defp maybe_decode_json(value) when is_binary(value) do
+    case Jason.decode(value) do
+      {:ok, decoded} when is_map(decoded) -> decoded
+      _ -> value
+    end
+  end
+
+  defp maybe_decode_json(value), do: value
+
+  defp safe_atom(value) when is_binary(value) do
+    String.to_existing_atom(value)
+  rescue
+    ArgumentError -> nil
+  end
+
+  defp coerce_number(value) when is_number(value), do: value
+
+  defp coerce_number(value) when is_binary(value) do
+    case Float.parse(value) do
+      {number, _} -> number
+      :error -> 0
+    end
+  end
+
+  defp coerce_number(_), do: 0
 
   defp configure_event_inbox(input, agent_id, requester_user_id) do
     with {:ok, agent} <- resolve_owned_agent(agent_id, requester_user_id),
@@ -801,6 +997,7 @@ defmodule Vibe.AI.Agent do
       |> maybe_put_trimmed(input, "display_name")
       |> maybe_put_trimmed(input, "persona")
       |> maybe_put_trimmed(input, "welcome_message")
+      |> maybe_put_trimmed(input, "avatar_url")
       |> maybe_put_trimmed(input, "voice_profile")
       |> maybe_put_status(input)
 
@@ -995,9 +1192,9 @@ defmodule Vibe.AI.Agent do
     end
   end
 
-  defp build_event_inbox_summary(events, timeframe_label, source_filter, event_type_filter) do
+  defp build_event_inbox_summary(events, total_matching, timeframe_label, source_filter, event_type_filter) do
     headline =
-      "Found #{length(events)} event#{if length(events) == 1, do: "", else: "s"} in #{timeframe_label}."
+      "Found #{total_matching} event#{if total_matching == 1, do: "", else: "s"} in #{timeframe_label}."
 
     filters =
       [
@@ -1031,9 +1228,12 @@ defmodule Vibe.AI.Agent do
   end
 
   defp condensed_payload(payload) when is_map(payload) do
+    # Senders that flatten nested data deliver grouped analytics sections as
+    # JSON-encoded strings. Decode them back so the model sees structured numbers
+    # (e.g. traffic/commerce/funnel summary blobs) instead of opaque strings.
     payload
-    |> Enum.into(%{}, fn {key, value} -> {to_string(key), value} end)
-    |> Enum.take(10)
+    |> Enum.map(fn {key, value} -> {to_string(key), maybe_decode_json(value)} end)
+    |> Enum.take(40)
     |> Enum.into(%{})
   end
 

@@ -378,6 +378,9 @@ private final class ChatNativeAgentPlainTextView: UIView {
   private let shimmerLabel = ChatNativeStreamingTextLabel()
   private let shimmerGradient = CAGradientLayer()
   private var isShimmering = false
+  private let shimmerBandWidth: CGFloat = 190.0
+  private let shimmerTravelPadding: CGFloat = 180.0
+  private var shimmerAnimatedWidth: CGFloat = 0.0
 
   // Block-render path (isProgress=false)
   private var blockViews: [UIView] = []
@@ -403,7 +406,7 @@ private final class ChatNativeAgentPlainTextView: UIView {
 
     shimmerGradient.startPoint = CGPoint(x: 0, y: 0.5)
     shimmerGradient.endPoint = CGPoint(x: 1, y: 0.5)
-    shimmerGradient.locations = [0.2, 0.5, 0.8]
+    shimmerGradient.locations = [0.0, 0.18, 0.38, 0.50, 0.62, 0.82, 1.0]
     shimmerLabel.layer.mask = shimmerGradient
   }
 
@@ -462,11 +465,6 @@ private final class ChatNativeAgentPlainTextView: UIView {
       baseLabel.isHidden = false
       shimmerLabel.isHidden = false
 
-      shimmerGradient.colors = [
-        UIColor.black.withAlphaComponent(0.0).cgColor,
-        UIColor.black.cgColor,
-        UIColor.black.withAlphaComponent(0.0).cgColor,
-      ]
       startShimmerAnimation()
       setNeedsLayout()
       return topPadding + textHeight + bottomPadding
@@ -485,7 +483,11 @@ private final class ChatNativeAgentPlainTextView: UIView {
 
       // Rebuild subviews only when block structure changes
       let signature = blocks.map { block -> String in
-        switch block { case .text: return "T"; case .code: return "C" }
+        switch block {
+        case .text: return "T"
+        case .code: return "C"
+        case .agentPack: return "P"
+        }
       }.joined()
 
       if signature != lastBlockSignature {
@@ -502,6 +504,10 @@ private final class ChatNativeAgentPlainTextView: UIView {
             let card = AgentCodeBlockView()
             addSubview(card)
             return card
+          case .agentPack:
+            let packView = AgentIntegrationPackView()
+            addSubview(packView)
+            return packView
           }
         }
         lastBlockSignature = signature
@@ -549,6 +555,19 @@ private final class ChatNativeAgentPlainTextView: UIView {
           let frame = CGRect(x: leftPadding, y: yOffset, width: cardAvailableWidth, height: cardHeight)
           blockFrames.append(frame)
           yOffset += cardHeight + 6.0
+        case .agentPack(let pack):
+          let packView = view as! AgentIntegrationPackView
+          let packAvailableWidth = max(1.0, availableWidth - leftPadding)
+          let packHeight = packView.configure(
+            pack: pack,
+            textColor: textColor,
+            availableWidth: packAvailableWidth,
+            storageKey: "\(row.key)#\(i)"
+          )
+          blockFrames.append(
+            CGRect(x: leftPadding, y: yOffset, width: packAvailableWidth, height: packHeight)
+          )
+          yOffset += packHeight + 6.0
         }
       }
 
@@ -565,7 +584,10 @@ private final class ChatNativeAgentPlainTextView: UIView {
     // Progress path
     baseLabel.frame = cachedProgressFrame
     shimmerLabel.frame = cachedProgressFrame
-    shimmerGradient.frame = shimmerLabel.bounds
+    updateShimmerGradientFrame()
+    if isShimmering, abs(shimmerAnimatedWidth - shimmerLabel.bounds.width) > 1.0 {
+      restartShimmerAnimation()
+    }
     // Block path
     for (i, view) in blockViews.enumerated() where i < blockFrames.count {
       view.frame = blockFrames[i]
@@ -578,20 +600,54 @@ private final class ChatNativeAgentPlainTextView: UIView {
     shimmerLabel.isHidden = false
     shimmerLabel.alpha = 1.0
 
-    let animation = CABasicAnimation(keyPath: "locations")
-    animation.fromValue = [-1.5, -0.75, 0.0]
-    animation.toValue = [1.0, 1.75, 2.5]
-    animation.duration = 1.35
+    shimmerGradient.colors = [
+      UIColor.clear.cgColor,
+      UIColor.black.withAlphaComponent(0.10).cgColor,
+      UIColor.black.withAlphaComponent(0.54).cgColor,
+      UIColor.black.cgColor,
+      UIColor.black.withAlphaComponent(0.54).cgColor,
+      UIColor.black.withAlphaComponent(0.10).cgColor,
+      UIColor.clear.cgColor,
+    ]
+    updateShimmerGradientFrame()
+    restartShimmerAnimation()
+  }
+
+  private func restartShimmerAnimation() {
+    shimmerGradient.removeAnimation(forKey: "shimmerTranslate")
+    shimmerGradient.transform = CATransform3DIdentity
+
+    let contentWidth = max(shimmerLabel.bounds.width, 1.0)
+    shimmerAnimatedWidth = contentWidth
+
+    let animation = CABasicAnimation(keyPath: "transform.translation.x")
+    animation.fromValue = 0.0
+    animation.toValue = contentWidth + shimmerBandWidth + shimmerTravelPadding * 2.0
+    animation.duration = 2.45
     animation.repeatCount = .infinity
-    animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-    shimmerGradient.add(animation, forKey: "shimmerLocations")
+    animation.timingFunction = CAMediaTimingFunction(name: .linear)
+    shimmerGradient.add(animation, forKey: "shimmerTranslate")
   }
 
   private func stopShimmerAnimation() {
     guard isShimmering else { return }
     isShimmering = false
-    shimmerGradient.removeAnimation(forKey: "shimmerLocations")
+    shimmerGradient.removeAnimation(forKey: "shimmerTranslate")
+    shimmerGradient.transform = CATransform3DIdentity
+    shimmerAnimatedWidth = 0.0
     shimmerLabel.isHidden = true
+  }
+
+  private func updateShimmerGradientFrame() {
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    shimmerGradient.frame = CGRect(
+      x: -(shimmerBandWidth + shimmerTravelPadding),
+      y: 0.0,
+      width: shimmerBandWidth,
+      height: max(shimmerLabel.bounds.height, 18.0)
+    )
+    CATransaction.commit()
   }
 }
 
@@ -606,6 +662,9 @@ private final class ChatNativeAgentProgressStepView: UIView {
   private var cachedLabelFrame: CGRect = .zero
   private var isPulsing = false
   private var isShimmering = false
+  private let shimmerBandWidth: CGFloat = 190.0
+  private let shimmerTravelPadding: CGFloat = 180.0
+  private var shimmerAnimatedWidth: CGFloat = 0.0
   private var lastNodeId: String?
   private var lastLabelText: String?
 
@@ -628,7 +687,7 @@ private final class ChatNativeAgentProgressStepView: UIView {
 
     shimmerGradient.startPoint = CGPoint(x: 0, y: 0.5)
     shimmerGradient.endPoint = CGPoint(x: 1, y: 0.5)
-    shimmerGradient.locations = [0.2, 0.5, 0.8]
+    shimmerGradient.locations = [0.0, 0.18, 0.38, 0.50, 0.62, 0.82, 1.0]
     shimmerLabel.layer.mask = shimmerGradient
   }
 
@@ -717,11 +776,6 @@ private final class ChatNativeAgentProgressStepView: UIView {
     lastLabelText = node.label
 
     if isRunning {
-      shimmerGradient.colors = [
-        UIColor.black.withAlphaComponent(0.0).cgColor,
-        UIColor.black.cgColor,
-        UIColor.black.withAlphaComponent(0.0).cgColor,
-      ]
       startShimmerAnimation()
     } else {
       stopShimmerAnimation()
@@ -757,7 +811,10 @@ private final class ChatNativeAgentProgressStepView: UIView {
     dotView.layer.cornerRadius = cachedDotFrame.width * 0.5
     baseLabel.frame = cachedLabelFrame
     shimmerLabel.frame = cachedLabelFrame
-    shimmerGradient.frame = shimmerLabel.bounds
+    updateShimmerGradientFrame()
+    if isShimmering, abs(shimmerAnimatedWidth - shimmerLabel.bounds.width) > 1.0 {
+      restartShimmerAnimation()
+    }
   }
 
   private func performLabelUpdate(
@@ -805,20 +862,54 @@ private final class ChatNativeAgentProgressStepView: UIView {
     shimmerLabel.isHidden = false
     shimmerLabel.alpha = 1.0
 
-    let animation = CABasicAnimation(keyPath: "locations")
-    animation.fromValue = [-1.5, -0.75, 0.0]
-    animation.toValue = [1.0, 1.75, 2.5]
-    animation.duration = 1.35
+    shimmerGradient.colors = [
+      UIColor.clear.cgColor,
+      UIColor.black.withAlphaComponent(0.10).cgColor,
+      UIColor.black.withAlphaComponent(0.54).cgColor,
+      UIColor.black.cgColor,
+      UIColor.black.withAlphaComponent(0.54).cgColor,
+      UIColor.black.withAlphaComponent(0.10).cgColor,
+      UIColor.clear.cgColor,
+    ]
+    updateShimmerGradientFrame()
+    restartShimmerAnimation()
+  }
+
+  private func restartShimmerAnimation() {
+    shimmerGradient.removeAnimation(forKey: "stepShimmerTranslate")
+    shimmerGradient.transform = CATransform3DIdentity
+
+    let contentWidth = max(shimmerLabel.bounds.width, 1.0)
+    shimmerAnimatedWidth = contentWidth
+
+    let animation = CABasicAnimation(keyPath: "transform.translation.x")
+    animation.fromValue = 0.0
+    animation.toValue = contentWidth + shimmerBandWidth + shimmerTravelPadding * 2.0
+    animation.duration = 2.45
     animation.repeatCount = .infinity
-    animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-    shimmerGradient.add(animation, forKey: "stepShimmerLocations")
+    animation.timingFunction = CAMediaTimingFunction(name: .linear)
+    shimmerGradient.add(animation, forKey: "stepShimmerTranslate")
   }
 
   private func stopShimmerAnimation() {
     guard isShimmering else { return }
     isShimmering = false
-    shimmerGradient.removeAnimation(forKey: "stepShimmerLocations")
+    shimmerGradient.removeAnimation(forKey: "stepShimmerTranslate")
+    shimmerGradient.transform = CATransform3DIdentity
+    shimmerAnimatedWidth = 0.0
     shimmerLabel.isHidden = true
+  }
+
+  private func updateShimmerGradientFrame() {
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    shimmerGradient.frame = CGRect(
+      x: -(shimmerBandWidth + shimmerTravelPadding),
+      y: 0.0,
+      width: shimmerBandWidth,
+      height: max(shimmerLabel.bounds.height, 18.0)
+    )
+    CATransaction.commit()
   }
 }
 
@@ -929,13 +1020,14 @@ private final class ChatNativeAgentProgressTreeView: UIView {
   }
 }
 
-private final class ChatNativeAgentActionBarView: UIView {
+final class ChatNativeAgentActionBarView: UIView {
   private let buttonSize: CGFloat = 28.0
   private let stackView = UIStackView()
   private let copyButton = UIButton(type: .system)
   private let thumbUpButton = UIButton(type: .system)
   private let thumbDownButton = UIButton(type: .system)
   private let regenerateButton = UIButton(type: .system)
+  private var regenerateWidthConstraint: NSLayoutConstraint?
   private var cachedStackFrame: CGRect = .zero
   private var sourceMessageId: String = ""
   private var sourceText: String = ""
@@ -958,6 +1050,12 @@ private final class ChatNativeAgentActionBarView: UIView {
     configureButton(thumbUpButton, symbolName: "hand.thumbsup", action: .thumbUp)
     configureButton(thumbDownButton, symbolName: "hand.thumbsdown", action: .thumbDown)
     configureButton(regenerateButton, symbolName: "arrow.trianglehead.2.counterclockwise", action: .regenerate)
+    regenerateWidthConstraint = regenerateButton.widthAnchor.constraint(equalToConstant: buttonSize)
+    // Non-required so this bar can be laid out at zero size (e.g. inside the
+    // headless transport's collapsed cells) without flooding the console with
+    // unsatisfiable-constraint warnings.
+    regenerateWidthConstraint?.priority = .init(999)
+    regenerateWidthConstraint?.isActive = true
   }
 
   required init?(coder: NSCoder) {
@@ -984,13 +1082,44 @@ private final class ChatNativeAgentActionBarView: UIView {
     copyButton.isHidden = !hasSourceText
     thumbUpButton.isHidden = !hasSourceText
     thumbDownButton.isHidden = !hasSourceText
-    regenerateButton.isHidden =
-      regeneratePrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    let hasRegeneratePrompt =
+      !regeneratePrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    regenerateButton.isHidden = !hasRegeneratePrompt
+
+    let normalizedSourceText = sourceText.lowercased()
+    let isRetryState =
+      normalizedSourceText.contains("retry")
+      || normalizedSourceText.contains("interrupted")
+      || normalizedSourceText.contains("timed out")
+      || normalizedSourceText.contains("connection lost")
+      || normalizedSourceText.contains("went wrong")
+    let regenerateWidth: CGFloat = hasRegeneratePrompt && isRetryState ? 76.0 : buttonSize
+    regenerateWidthConstraint?.constant = regenerateWidth
+    var regenerateConfiguration = UIButton.Configuration.plain()
+    regenerateConfiguration.contentInsets = NSDirectionalEdgeInsets(
+      top: 4.0,
+      leading: isRetryState ? 9.0 : 4.0,
+      bottom: 4.0,
+      trailing: isRetryState ? 9.0 : 4.0
+    )
+    regenerateConfiguration.image = UIImage(
+      systemName: "arrow.trianglehead.2.counterclockwise",
+      withConfiguration: UIImage.SymbolConfiguration(pointSize: 14.0, weight: .regular)
+    )
+    if isRetryState {
+      regenerateConfiguration.title = "Retry"
+      regenerateConfiguration.imagePadding = 5.0
+      regenerateConfiguration.background.backgroundColor = iconColor.withAlphaComponent(0.10)
+      regenerateConfiguration.background.cornerRadius = buttonSize * 0.5
+    }
+    regenerateButton.configuration = regenerateConfiguration
 
     let visibleButtons = [copyButton, thumbUpButton, thumbDownButton, regenerateButton]
       .filter { !$0.isHidden }
     let contentWidth =
-      CGFloat(visibleButtons.count) * buttonSize
+      visibleButtons.reduce(CGFloat.zero) { partial, button in
+        partial + (button === regenerateButton ? regenerateWidth : buttonSize)
+      }
       + CGFloat(max(0, visibleButtons.count - 1)) * stackView.spacing
     cachedStackFrame = CGRect(
       x: 8.0,
@@ -1024,8 +1153,16 @@ private final class ChatNativeAgentActionBarView: UIView {
     buttonConfiguration.image = UIImage(systemName: symbolName, withConfiguration: config)
     button.configuration = buttonConfiguration
     button.frame.size = CGSize(width: buttonSize, height: buttonSize)
-    button.widthAnchor.constraint(equalToConstant: buttonSize).isActive = true
-    button.heightAnchor.constraint(equalToConstant: buttonSize).isActive = true
+    // Non-required (999) so the bar collapses cleanly at zero size without
+    // logging unsatisfiable-constraint warnings (headless transport cells).
+    if button !== regenerateButton {
+      let widthConstraint = button.widthAnchor.constraint(equalToConstant: buttonSize)
+      widthConstraint.priority = .init(999)
+      widthConstraint.isActive = true
+    }
+    let heightConstraint = button.heightAnchor.constraint(equalToConstant: buttonSize)
+    heightConstraint.priority = .init(999)
+    heightConstraint.isActive = true
     button.accessibilityIdentifier = action.rawValue
     button.addTarget(self, action: #selector(handleButtonTap(_:)), for: .touchUpInside)
     stackView.addArrangedSubview(button)
@@ -1050,10 +1187,19 @@ private final class ChatNativeAgentActionBarView: UIView {
 
 private final class ChatNativeAgentCardView: UIControl {
   private let cardView = UIView()
+  private let avatarView = UIView()
+  private let avatarLabel = UILabel()
   private let titleLabel = UILabel()
+  private let subtitleLabel = UILabel()
+  private let statusLabel = UILabel()
+  private let openLabel = UILabel()
   private let arrowView = UIImageView()
   private var cachedCardFrame: CGRect = .zero
+  private var cachedAvatarFrame: CGRect = .zero
   private var cachedTitleFrame: CGRect = .zero
+  private var cachedSubtitleFrame: CGRect = .zero
+  private var cachedStatusFrame: CGRect = .zero
+  private var cachedOpenFrame: CGRect = .zero
   private var cachedArrowFrame: CGRect = .zero
   private var currentCard: ChatListRow.AgentCard?
   var onNativeEvent: (([String: Any]) -> Void)?
@@ -1077,13 +1223,38 @@ private final class ChatNativeAgentCardView: UIControl {
     cardView.isUserInteractionEnabled = false
     addSubview(cardView)
 
-    titleLabel.font = .systemFont(ofSize: 14.0, weight: .semibold)
+    avatarView.layer.cornerCurve = .continuous
+    avatarView.layer.cornerRadius = 18.0
+    cardView.addSubview(avatarView)
+
+    avatarLabel.font = .systemFont(ofSize: 13.0, weight: .bold)
+    avatarLabel.textAlignment = .center
+    avatarView.addSubview(avatarLabel)
+
+    titleLabel.font = .systemFont(ofSize: 15.0, weight: .semibold)
     titleLabel.numberOfLines = 1
     titleLabel.lineBreakMode = .byTruncatingTail
     cardView.addSubview(titleLabel)
 
+    subtitleLabel.font = .systemFont(ofSize: 12.0, weight: .regular)
+    subtitleLabel.numberOfLines = 1
+    subtitleLabel.lineBreakMode = .byTruncatingTail
+    cardView.addSubview(subtitleLabel)
+
+    statusLabel.font = .systemFont(ofSize: 10.0, weight: .semibold)
+    statusLabel.textAlignment = .center
+    statusLabel.layer.cornerRadius = 8.0
+    statusLabel.layer.cornerCurve = .continuous
+    statusLabel.clipsToBounds = true
+    cardView.addSubview(statusLabel)
+
+    openLabel.text = "Open"
+    openLabel.font = .systemFont(ofSize: 12.0, weight: .semibold)
+    openLabel.textAlignment = .right
+    cardView.addSubview(openLabel)
+
     arrowView.image = UIImage(
-      systemName: "arrow.up.right",
+      systemName: "chevron.right",
       withConfiguration: UIImage.SymbolConfiguration(pointSize: 11.0, weight: .semibold)
     )
     cardView.addSubview(arrowView)
@@ -1110,30 +1281,64 @@ private final class ChatNativeAgentCardView: UIControl {
     let outerLeft: CGFloat = 6.0
     let outerRight: CGFloat = 26.0
     let cardWidth = max(1.0, availableWidth - outerLeft - outerRight)
-    let cardHeight: CGFloat = 38.0
-    let leftPadding: CGFloat = 14.0
-    let rightPadding: CGFloat = 14.0
+    let cardHeight: CGFloat = 68.0
+    let leftPadding: CGFloat = 12.0
+    let rightPadding: CGFloat = 12.0
     let arrowSize = CGSize(width: 12.0, height: 12.0)
 
-    cardView.backgroundColor = appearance.bubbleThemColor.withAlphaComponent(0.18)
+    cardView.backgroundColor = appearance.bubbleThemColor.withAlphaComponent(0.26)
     cardView.layer.borderWidth = 0.5
-    cardView.layer.borderColor = appearance.dayBorderColor.withAlphaComponent(0.18).cgColor
+    cardView.layer.borderColor = appearance.dayBorderColor.withAlphaComponent(0.28).cgColor
 
+    avatarView.backgroundColor = appearance.textColorThem.withAlphaComponent(0.10)
+    avatarLabel.text = String(
+      card.displayName
+        .split(separator: " ")
+        .prefix(2)
+        .compactMap { $0.first }
+    ).uppercased()
+    avatarLabel.textColor = appearance.textColorThem
     titleLabel.text = card.displayName
     titleLabel.textColor = appearance.textColorThem
+    subtitleLabel.text = card.username.map { "@\($0)" } ?? "Agent"
+    subtitleLabel.textColor = appearance.timeColorThem.withAlphaComponent(0.78)
+    statusLabel.text = "  \(card.status.capitalized)  "
+    statusLabel.textColor = appearance.textColorThem.withAlphaComponent(0.82)
+    statusLabel.backgroundColor = appearance.textColorThem.withAlphaComponent(0.08)
+    openLabel.textColor = appearance.textColorThem.withAlphaComponent(0.72)
 
     arrowView.tintColor = appearance.timeColorThem.withAlphaComponent(0.45)
 
-    // Layout — title centered vertically, arrow on right
+    cachedAvatarFrame = CGRect(x: leftPadding, y: 16.0, width: 36.0, height: 36.0)
     let arrowX = cardWidth - rightPadding - arrowSize.width
     let arrowY = (cardHeight - arrowSize.height) * 0.5
     cachedArrowFrame = CGRect(x: arrowX, y: arrowY, width: arrowSize.width, height: arrowSize.height)
 
-    let textRight = arrowX - 8.0
-    let textWidth = max(1.0, textRight - leftPadding)
+    let openWidth: CGFloat = 34.0
+    cachedOpenFrame = CGRect(
+      x: arrowX - openWidth - 5.0,
+      y: 25.0,
+      width: openWidth,
+      height: 18.0
+    )
+    let textX = cachedAvatarFrame.maxX + 10.0
+    let textRight = cachedOpenFrame.minX - 10.0
+    let textWidth = max(1.0, textRight - textX)
     let titleHeight: CGFloat = 18.0
-    let titleY = (cardHeight - titleHeight) * 0.5
-    cachedTitleFrame = CGRect(x: leftPadding, y: titleY, width: textWidth, height: titleHeight)
+    cachedTitleFrame = CGRect(x: textX, y: 13.0, width: textWidth, height: titleHeight)
+    let statusWidth = min(58.0, max(42.0, statusLabel.intrinsicContentSize.width))
+    cachedStatusFrame = CGRect(
+      x: textRight - statusWidth,
+      y: 38.0,
+      width: statusWidth,
+      height: 16.0
+    )
+    cachedSubtitleFrame = CGRect(
+      x: textX,
+      y: 36.0,
+      width: max(1.0, cachedStatusFrame.minX - textX - 6.0),
+      height: 18.0
+    )
 
     cachedCardFrame = CGRect(x: outerLeft, y: 2.0, width: cardWidth, height: cardHeight)
 
@@ -1144,7 +1349,12 @@ private final class ChatNativeAgentCardView: UIControl {
   override func layoutSubviews() {
     super.layoutSubviews()
     cardView.frame = cachedCardFrame
+    avatarView.frame = cachedAvatarFrame
+    avatarLabel.frame = avatarView.bounds
     titleLabel.frame = cachedTitleFrame
+    subtitleLabel.frame = cachedSubtitleFrame
+    statusLabel.frame = cachedStatusFrame
+    openLabel.frame = cachedOpenFrame
     arrowView.frame = cachedArrowFrame
   }
 
@@ -1386,6 +1596,7 @@ final class ChatNativeAgentMessagesView: UIView {
   private var appearance = ChatListAppearance.fallback
   private var lastKnownWidth: CGFloat = 0.0
   private var keyboardHeight: CGFloat = 0.0
+  private var pendingStreamingTextLayoutInvalidation = false
 
   private let contentHorizontalInset: CGFloat = 10.0
   private let bottomStickThreshold: CGFloat = 56.0
@@ -1494,6 +1705,12 @@ final class ChatNativeAgentMessagesView: UIView {
       self,
       selector: #selector(keyboardWillHide(_:)),
       name: UIResponder.keyboardWillHideNotification,
+      object: nil
+    )
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleStreamingTextLayoutInvalidated(_:)),
+      name: .chatNativeStreamingTextLayoutInvalidated,
       object: nil
     )
   }
@@ -1692,6 +1909,42 @@ final class ChatNativeAgentMessagesView: UIView {
 
   @objc private func handleTap() {
     onTap?()
+  }
+
+  @objc private func handleStreamingTextLayoutInvalidated(_ notification: Notification) {
+    guard
+      let sourceView = notification.object as? UIView,
+      sourceView.isDescendant(of: self)
+    else {
+      return
+    }
+    guard !pendingStreamingTextLayoutInvalidation else { return }
+
+    pendingStreamingTextLayoutInvalidation = true
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      self.pendingStreamingTextLayoutInvalidation = false
+      guard self.window != nil else { return }
+
+      let distanceFromBottom = self.currentDistanceFromBottom()
+      let wasNearBottom = distanceFromBottom <= self.bottomStickThreshold
+
+      self.reconfigureVisibleRows()
+      UIView.animate(
+        withDuration: 0.24,
+        delay: 0.0,
+        options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut]
+      ) {
+        self.layoutIfNeeded()
+      } completion: { [weak self] _ in
+        guard let self else { return }
+        if wasNearBottom {
+          self.scrollToBottom(animated: false)
+        } else {
+          self.restoreStationaryDistance(distanceFromBottom)
+        }
+      }
+    }
   }
 
   @objc private func keyboardWillChangeFrame(_ notification: Notification) {

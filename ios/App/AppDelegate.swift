@@ -21,6 +21,10 @@ final class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationC
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
   ) -> Bool {
     appDelegateUITrace("AppDelegate didFinishLaunching")
+    // Packet mesh is now opt-in (default direct). Downgrade any legacy
+    // packet_mesh session to direct before the UI binds to the config so large
+    // media sends (music/video/files) no longer fail immediately on mesh.
+    ChatEngineStore.shared.migrateLegacyPacketMeshToDirectIfNeeded()
     let window = UIWindow(frame: UIScreen.main.bounds)
     window.rootViewController = AppRootControllerFactory.makeInitialController()
     AppAppearanceController.applyStoredPreference(to: window)

@@ -55,15 +55,24 @@ defmodule Vibe.Agents do
   def get_agent(id, owner_user_id \\ nil)
 
   def get_agent(id, nil) when is_binary(id) do
-    Repo.one(from a in Agent, where: a.id == ^id, preload: [:agent_user])
+    with {:ok, agent_id} <- Ecto.UUID.cast(id) do
+      Repo.one(from a in Agent, where: a.id == ^agent_id, preload: [:agent_user])
+    else
+      :error -> nil
+    end
   end
 
   def get_agent(id, owner_user_id) when is_binary(id) do
-    Repo.one(
-      from a in Agent,
-        where: a.id == ^id and a.owner_user_id == ^owner_user_id,
-        preload: [:agent_user]
-    )
+    with {:ok, agent_id} <- Ecto.UUID.cast(id),
+         {:ok, owner_id} <- Ecto.UUID.cast(owner_user_id) do
+      Repo.one(
+        from a in Agent,
+          where: a.id == ^agent_id and a.owner_user_id == ^owner_id,
+          preload: [:agent_user]
+      )
+    else
+      :error -> nil
+    end
   end
 
   def get_agent_by_shadow_user(user_id) when is_binary(user_id) do
@@ -98,6 +107,7 @@ defmodule Vibe.Agents do
              status: "draft",
              display_name: display_name_from_attrs(attrs),
              system_prompt: string_attr(attrs, "system_prompt") || "",
+             prompt_variables: Vibe.AI.PromptVariables.normalize(attrs["prompt_variables"] || attrs[:prompt_variables]),
              persona: string_attr(attrs, "persona"),
              avatar_url: string_attr(attrs, "avatar_url"),
              welcome_message: string_attr(attrs, "welcome_message"),
@@ -132,6 +142,7 @@ defmodule Vibe.Agents do
         |> Agent.changeset(%{
           display_name: display_name_from_attrs(attrs, agent.display_name),
           system_prompt: Map.get(attrs, "system_prompt", Map.get(attrs, :system_prompt, agent.system_prompt || "")),
+          prompt_variables: update_prompt_variables(agent, attrs),
           persona: map_get(attrs, "persona", agent.persona),
           avatar_url: map_get(attrs, "avatar_url", agent.avatar_url),
           welcome_message: map_get(attrs, "welcome_message", agent.welcome_message),
@@ -620,6 +631,7 @@ defmodule Vibe.Agents do
       displayName: agent.display_name,
       status: agent.status,
       systemPrompt: agent.system_prompt,
+      promptVariables: Vibe.AI.PromptVariables.definitions(agent),
       persona: agent.persona,
       avatarUrl: agent.avatar_url,
       welcomeMessage: agent.welcome_message,
@@ -684,6 +696,62 @@ defmodule Vibe.Agents do
   end
 
   def normalize_username(_), do: ""
+
+  @doc """
+  Checks whether `username` can be assigned to the given agent (or, when
+  `agent` is nil, to a brand-new agent). Mirrors the validation used by
+  `ensure_valid_username!/1` but returns a tagged result instead of raising.
+
+  Returns `{:ok, normalized}` when available, or `{:error, reason}` where
+  reason is one of `:invalid_username`, `:reserved_username`, `:username_taken`,
+  or `:username_locked_after_publish`.
+  """
+  def username_availability(username, agent \\ nil)
+
+  def username_availability(username, %Agent{} = agent) do
+    agent = if Ecto.assoc_loaded?(agent.agent_user), do: agent, else: Repo.preload(agent, :agent_user)
+    current = agent.agent_user && normalize_username(agent.agent_user.username)
+    normalized = normalize_username(username)
+
+    cond do
+      agent.status != "draft" and normalized != current ->
+        {:error, :username_locked_after_publish}
+
+      not is_nil(current) and normalized == current ->
+        {:ok, normalized}
+
+      true ->
+        validate_username_string(normalized)
+    end
+  end
+
+  def username_availability(username, nil) do
+    validate_username_string(normalize_username(username))
+  end
+
+  defp validate_username_string(normalized) do
+    cond do
+      normalized == "" -> {:error, :invalid_username}
+      reserved_username?(normalized) or Accounts.reserved_username?(normalized) -> {:error, :reserved_username}
+      not Regex.match?(~r/^[a-z0-9_]+$/, normalized) -> {:error, :invalid_username}
+      String.length(normalized) < 3 or String.length(normalized) > 30 -> {:error, :invalid_username}
+      Accounts.username_exists?(normalized) -> {:error, :username_taken}
+      true -> {:ok, normalized}
+    end
+  end
+
+  defp update_prompt_variables(%Agent{} = agent, attrs) do
+    cond do
+      Map.has_key?(attrs, "prompt_variables") ->
+        Vibe.AI.PromptVariables.normalize(attrs["prompt_variables"])
+
+      Map.has_key?(attrs, :prompt_variables) ->
+        Vibe.AI.PromptVariables.normalize(attrs[:prompt_variables])
+
+      true ->
+        agent.prompt_variables || []
+    end
+  end
 
   def normalize_enabled_tools(raw_tools) do
     raw_tools

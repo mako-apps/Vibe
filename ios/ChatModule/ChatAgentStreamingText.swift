@@ -12,6 +12,25 @@ protocol ChatNativeStreamingTextLabelDelegate: AnyObject {
 enum AgentParsedBlock: Equatable {
   case text(String)
   case code(String, String?) // code + optional language
+  case agentPack(AgentIntegrationPack)
+}
+
+struct AgentIntegrationPack: Equatable {
+  let agentId: String
+  let displayName: String
+  let username: String?
+  let status: String
+  let environment: String
+  let eventsURL: String?
+  let invokeURL: String?
+
+  var summary: String {
+    "Your \(displayName) agent is ready."
+  }
+
+  var storageKey: String {
+    "agent-pack:\(agentId)"
+  }
 }
 
 enum ChatNativeAgentTextRenderer {
@@ -49,8 +68,12 @@ enum ChatNativeAgentTextRenderer {
 
   // MARK: - Block parsing
 
-  /// Split raw markdown into alternating text and fenced-code blocks.
+  /// Split raw markdown into text, fenced-code, and structured agent-pack blocks.
   static func parseBlocks(_ text: String) -> [AgentParsedBlock] {
+    if let pack = parseAgentIntegrationPack(text) {
+      return [.text(pack.summary), .agentPack(pack)]
+    }
+
     var blocks: [AgentParsedBlock] = []
     var normalLines: [String] = []
     var codeLines: [String] = []
@@ -89,6 +112,85 @@ enum ChatNativeAgentTextRenderer {
       if !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { blocks.append(.text(t)) }
     }
     return blocks.isEmpty ? [.text(text)] : blocks
+  }
+
+  private static func parseAgentIntegrationPack(_ text: String) -> AgentIntegrationPack? {
+    let markerCount = [
+      "Agent Details:",
+      "Environment Variables:",
+      "VIBE_AGENT_IDENTIFIER=",
+      "API Endpoints:",
+    ].filter { text.localizedCaseInsensitiveContains($0) }.count
+    guard markerCount >= 2 else { return nil }
+
+    let normalized =
+      text
+      .replacingOccurrences(of: "**", with: "")
+      .replacingOccurrences(of: "__", with: "")
+    guard
+      let agentId = firstCapture(
+        in: normalized,
+        pattern: #"(?im)^\s*[-*]?\s*Agent ID\s*:\s*`?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})`?"#
+      ),
+      let environment = firstCapture(
+        in: normalized,
+        pattern: #"(?is)Environment Variables\s*:\s*```[^\n]*\n(.*?)```"#
+      )?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !environment.isEmpty
+    else {
+      return nil
+    }
+
+    let username =
+      firstCapture(
+        in: normalized,
+        pattern: #"(?im)^\s*[-*]?\s*Username\s*:\s*`?@?([a-z0-9_]{3,64})`?"#
+      )
+      ?? firstCapture(
+        in: normalized,
+        pattern: #"(?im)^\s*VIBE_AGENT_IDENTIFIER\s*=\s*([a-z0-9_]{3,64})\s*$"#
+      )
+    let displayName =
+      firstCapture(
+        in: normalized,
+        pattern: #"(?i)\bYour\s+([^\n]{1,80}?)\s+agent\s+is\s+ready\b"#
+      )?.trimmingCharacters(in: .whitespacesAndNewlines)
+      ?? username
+      ?? "Agent"
+    let eventsURL = firstCapture(
+      in: normalized,
+      pattern: #"(?im)^\s*[-*]?\s*Events\s*:\s*(?:\[)?(https?://[^\s\])`]+)"#
+    )
+    let invokeURL = firstCapture(
+      in: normalized,
+      pattern: #"(?im)^\s*[-*]?\s*Invoke\s*:\s*(?:\[)?(https?://[^\s\])`]+)"#
+    )
+    let status =
+      normalized.localizedCaseInsensitiveContains("published status")
+      || normalized.localizedCaseInsensitiveContains("is published")
+      ? "published" : "draft"
+
+    return AgentIntegrationPack(
+      agentId: agentId,
+      displayName: displayName,
+      username: username,
+      status: status,
+      environment: environment,
+      eventsURL: eventsURL,
+      invokeURL: invokeURL
+    )
+  }
+
+  private static func firstCapture(in text: String, pattern: String) -> String? {
+    guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+    let range = NSRange(text.startIndex..<text.endIndex, in: text)
+    guard let match = regex.firstMatch(in: text, range: range),
+      match.numberOfRanges > 1,
+      let captureRange = Range(match.range(at: 1), in: text)
+    else {
+      return nil
+    }
+    return String(text[captureRange])
   }
 
   // MARK: - Line-level markdown
@@ -304,6 +406,300 @@ enum ChatNativeAgentTextRenderer {
       context: nil
     )
     return CGSize(width: ceil(measured.width), height: ceil(measured.height))
+  }
+}
+
+// MARK: - AgentIntegrationPackView
+
+final class AgentIntegrationPackView: UIControl, UIGestureRecognizerDelegate {
+  private static var expandedStorageKeys = Set<String>()
+  private static let collapsedHeight: CGFloat = 72.0
+
+  private let cardView = UIView()
+  private let iconView = UIImageView()
+  private let titleLabel = UILabel()
+  private let subtitleLabel = UILabel()
+  private let actionLabel = UILabel()
+  private let chevronView = UIImageView()
+  private let dividerView = UIView()
+  private let environmentTitleLabel = UILabel()
+  private let environmentView = UIView()
+  private let environmentLabel = UILabel()
+  private let copyButton = UIButton(type: .system)
+  private let endpointsTitleLabel = UILabel()
+  private let endpointsLabel = UILabel()
+
+  private var currentPack: AgentIntegrationPack?
+  private var currentStorageKey = ""
+  private var currentAvailableWidth: CGFloat = 0
+  private var currentTextColor = UIColor.label
+  private var isExpanded = false
+
+  static func isExpanded(pack: AgentIntegrationPack, storageKey: String? = nil) -> Bool {
+    expandedStorageKeys.contains(resolvedStorageKey(pack: pack, storageKey: storageKey))
+  }
+
+  static func measuredHeight(
+    pack: AgentIntegrationPack,
+    availableWidth: CGFloat,
+    storageKey: String? = nil
+  ) -> CGFloat {
+    guard isExpanded(pack: pack, storageKey: storageKey) else { return collapsedHeight }
+
+    let horizontalPadding: CGFloat = 12.0
+    let environmentWidth = max(1.0, availableWidth - (horizontalPadding * 4.0) - 34.0)
+    let environmentFont = UIFont.monospacedSystemFont(ofSize: 12.0, weight: .regular)
+    let environmentHeight = ceil(
+      (pack.environment as NSString).boundingRect(
+        with: CGSize(width: environmentWidth, height: .greatestFiniteMagnitude),
+        options: [.usesLineFragmentOrigin, .usesFontLeading],
+        attributes: [.font: environmentFont],
+        context: nil
+      ).height
+    )
+    let endpointCount = [pack.eventsURL, pack.invokeURL].compactMap { $0 }.count
+    let endpointsHeight: CGFloat = endpointCount > 0 ? CGFloat(endpointCount) * 19.0 : 0.0
+    return collapsedHeight + 1.0 + 30.0 + max(42.0, environmentHeight + 20.0)
+      + (endpointCount > 0 ? 30.0 + endpointsHeight : 0.0) + 12.0
+  }
+
+  private static func resolvedStorageKey(
+    pack: AgentIntegrationPack,
+    storageKey: String?
+  ) -> String {
+    let override = storageKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return override.isEmpty ? pack.storageKey : override
+  }
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    backgroundColor = .clear
+    isOpaque = false
+
+    cardView.isUserInteractionEnabled = true
+    cardView.layer.cornerRadius = 14.0
+    cardView.layer.cornerCurve = .continuous
+    cardView.clipsToBounds = true
+    addSubview(cardView)
+
+    iconView.contentMode = .center
+    iconView.layer.cornerRadius = 18.0
+    iconView.layer.cornerCurve = .continuous
+    cardView.addSubview(iconView)
+
+    titleLabel.font = .systemFont(ofSize: 14.0, weight: .semibold)
+    cardView.addSubview(titleLabel)
+
+    subtitleLabel.font = .systemFont(ofSize: 11.5, weight: .regular)
+    subtitleLabel.lineBreakMode = .byTruncatingTail
+    cardView.addSubview(subtitleLabel)
+
+    actionLabel.font = .systemFont(ofSize: 12.0, weight: .semibold)
+    actionLabel.textAlignment = .right
+    cardView.addSubview(actionLabel)
+
+    chevronView.contentMode = .scaleAspectFit
+    cardView.addSubview(chevronView)
+
+    cardView.addSubview(dividerView)
+
+    environmentTitleLabel.text = "ENVIRONMENT"
+    environmentTitleLabel.font = .systemFont(ofSize: 10.0, weight: .semibold)
+    cardView.addSubview(environmentTitleLabel)
+
+    environmentView.layer.cornerRadius = 10.0
+    environmentView.layer.cornerCurve = .continuous
+    cardView.addSubview(environmentView)
+
+    environmentLabel.numberOfLines = 0
+    environmentLabel.font = .monospacedSystemFont(ofSize: 12.0, weight: .regular)
+    environmentView.addSubview(environmentLabel)
+
+    copyButton.setImage(
+      UIImage(
+        systemName: "doc.on.doc",
+        withConfiguration: UIImage.SymbolConfiguration(pointSize: 12.0, weight: .medium)
+      ),
+      for: .normal
+    )
+    copyButton.addTarget(self, action: #selector(handleCopy), for: .touchUpInside)
+    environmentView.addSubview(copyButton)
+
+    endpointsTitleLabel.text = "ENDPOINTS"
+    endpointsTitleLabel.font = .systemFont(ofSize: 10.0, weight: .semibold)
+    cardView.addSubview(endpointsTitleLabel)
+
+    endpointsLabel.numberOfLines = 0
+    endpointsLabel.font = .monospacedSystemFont(ofSize: 11.0, weight: .regular)
+    endpointsLabel.lineBreakMode = .byTruncatingMiddle
+    cardView.addSubview(endpointsLabel)
+
+    let tapGesture = UITapGestureRecognizer(target: self, action: #selector(handleToggle))
+    tapGesture.delegate = self
+    cardView.addGestureRecognizer(tapGesture)
+    accessibilityTraits = .button
+  }
+
+  required init?(coder: NSCoder) { return nil }
+
+  @discardableResult
+  func configure(
+    pack: AgentIntegrationPack,
+    textColor: UIColor,
+    availableWidth: CGFloat,
+    storageKey: String? = nil
+  ) -> CGFloat {
+    currentPack = pack
+    currentAvailableWidth = availableWidth
+    currentTextColor = textColor
+    currentStorageKey = Self.resolvedStorageKey(pack: pack, storageKey: storageKey)
+    isExpanded = Self.expandedStorageKeys.contains(currentStorageKey)
+
+    let accent = UIColor.systemTeal
+    cardView.backgroundColor = textColor.withAlphaComponent(0.055)
+    cardView.layer.borderWidth = 0.5
+    cardView.layer.borderColor = textColor.withAlphaComponent(0.14).cgColor
+    iconView.backgroundColor = accent.withAlphaComponent(0.16)
+    iconView.tintColor = accent
+    iconView.image = UIImage(
+      systemName: "shippingbox.fill",
+      withConfiguration: UIImage.SymbolConfiguration(pointSize: 15.0, weight: .semibold)
+    )
+    titleLabel.text = "Agent pack"
+    titleLabel.textColor = textColor
+    let identity = pack.username.map { "@\($0)" } ?? pack.displayName
+    subtitleLabel.text = "\(identity)  •  \(pack.status.capitalized)"
+    subtitleLabel.textColor = textColor.withAlphaComponent(0.62)
+    actionLabel.text = isExpanded ? "Close" : "Open"
+    actionLabel.textColor = accent
+    chevronView.tintColor = accent
+    chevronView.image = UIImage(
+      systemName: isExpanded ? "chevron.up" : "chevron.down",
+      withConfiguration: UIImage.SymbolConfiguration(pointSize: 10.0, weight: .semibold)
+    )
+    dividerView.backgroundColor = textColor.withAlphaComponent(0.10)
+    environmentTitleLabel.textColor = textColor.withAlphaComponent(0.48)
+    environmentView.backgroundColor = textColor.withAlphaComponent(0.055)
+    environmentLabel.text = pack.environment
+    environmentLabel.textColor = textColor.withAlphaComponent(0.86)
+    copyButton.tintColor = accent
+    endpointsTitleLabel.textColor = textColor.withAlphaComponent(0.48)
+    endpointsLabel.text = [
+      pack.eventsURL.map { "Events  \($0)" },
+      pack.invokeURL.map { "Invoke  \($0)" },
+    ].compactMap { $0 }.joined(separator: "\n")
+    endpointsLabel.textColor = accent
+
+    let hasEndpoints = !(endpointsLabel.text ?? "").isEmpty
+    dividerView.isHidden = !isExpanded
+    environmentTitleLabel.isHidden = !isExpanded
+    environmentView.isHidden = !isExpanded
+    endpointsTitleLabel.isHidden = !isExpanded || !hasEndpoints
+    endpointsLabel.isHidden = !isExpanded || !hasEndpoints
+
+    let height = Self.measuredHeight(
+      pack: pack,
+      availableWidth: availableWidth,
+      storageKey: currentStorageKey
+    )
+    cardView.frame = CGRect(x: 0.0, y: 0.0, width: availableWidth, height: height)
+
+    iconView.frame = CGRect(x: 12.0, y: 18.0, width: 36.0, height: 36.0)
+    let chevronWidth: CGFloat = 12.0
+    chevronView.frame = CGRect(
+      x: availableWidth - 12.0 - chevronWidth,
+      y: 30.0,
+      width: chevronWidth,
+      height: 12.0
+    )
+    actionLabel.frame = CGRect(
+      x: chevronView.frame.minX - 48.0,
+      y: 25.0,
+      width: 42.0,
+      height: 22.0
+    )
+    let textX = iconView.frame.maxX + 10.0
+    let textWidth = max(1.0, actionLabel.frame.minX - textX - 8.0)
+    titleLabel.frame = CGRect(x: textX, y: 17.0, width: textWidth, height: 19.0)
+    subtitleLabel.frame = CGRect(x: textX, y: 37.0, width: textWidth, height: 18.0)
+
+    if isExpanded {
+      dividerView.frame = CGRect(x: 12.0, y: 71.0, width: availableWidth - 24.0, height: 0.5)
+      environmentTitleLabel.frame = CGRect(x: 12.0, y: 83.0, width: availableWidth - 24.0, height: 14.0)
+      let environmentY: CGFloat = 103.0
+      let endpointCount = [pack.eventsURL, pack.invokeURL].compactMap { $0 }.count
+      let endpointBlockHeight: CGFloat = endpointCount > 0 ? 30.0 + CGFloat(endpointCount) * 19.0 : 0.0
+      let environmentHeight = max(42.0, height - environmentY - endpointBlockHeight - 12.0)
+      environmentView.frame = CGRect(
+        x: 12.0,
+        y: environmentY,
+        width: availableWidth - 24.0,
+        height: environmentHeight
+      )
+      copyButton.frame = CGRect(
+        x: environmentView.bounds.width - 38.0,
+        y: 4.0,
+        width: 34.0,
+        height: 34.0
+      )
+      environmentLabel.frame = CGRect(
+        x: 10.0,
+        y: 10.0,
+        width: environmentView.bounds.width - 54.0,
+        height: environmentView.bounds.height - 20.0
+      )
+      if endpointCount > 0 {
+        endpointsTitleLabel.frame = CGRect(
+          x: 12.0,
+          y: environmentView.frame.maxY + 10.0,
+          width: availableWidth - 24.0,
+          height: 14.0
+        )
+        endpointsLabel.frame = CGRect(
+          x: 12.0,
+          y: endpointsTitleLabel.frame.maxY + 4.0,
+          width: availableWidth - 24.0,
+          height: CGFloat(endpointCount) * 19.0
+        )
+      }
+    }
+
+    accessibilityLabel = "Agent pack for \(identity)"
+    accessibilityValue = isExpanded ? "Expanded" : "Collapsed"
+    setNeedsLayout()
+    return height
+  }
+
+  @objc private func handleToggle() {
+    guard let pack = currentPack else { return }
+    isExpanded.toggle()
+    if isExpanded {
+      Self.expandedStorageKeys.insert(currentStorageKey)
+    } else {
+      Self.expandedStorageKeys.remove(currentStorageKey)
+    }
+    _ = configure(
+      pack: pack,
+      textColor: currentTextColor,
+      availableWidth: currentAvailableWidth,
+      storageKey: currentStorageKey
+    )
+    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    NotificationCenter.default.post(name: Notification.Name("AgentCodeBlockExpanded"), object: nil)
+    NotificationCenter.default.post(name: .chatNativeStreamingTextLayoutInvalidated, object: self)
+  }
+
+  @objc private func handleCopy() {
+    guard let pack = currentPack else { return }
+    UIPasteboard.general.string = pack.environment
+    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+  }
+
+  func gestureRecognizer(
+    _ gestureRecognizer: UIGestureRecognizer,
+    shouldReceive touch: UITouch
+  ) -> Bool {
+    !(touch.view is UIControl)
   }
 }
 
@@ -569,18 +965,36 @@ final class AgentCodeBlockView: UIView {
   }
 }
 
+extension Notification.Name {
+  static let chatNativeStreamingTextLayoutInvalidated = Notification.Name(
+    "ChatNativeStreamingTextLayoutInvalidated"
+  )
+}
+
+private struct ChatNativeStreamingRevealSegment {
+  let range: NSRange
+  let startTime: CFTimeInterval
+  let duration: CFTimeInterval
+}
+
 // MARK: - ChatNativeStreamingTextLabel
 
 final class ChatNativeStreamingTextLabel: UITextView {
-  private static let revealInterval: CFTimeInterval = 0.01
-  private static let tokenRegex = try! NSRegularExpression(pattern: "\\S+|\\s+")
+  private static let streamingFadeAnimationKey = "vibe.streaming.fade"
+  private static let streamingChunkFadeDuration: CFTimeInterval = 0.42
+  private static let streamingFinalFadeDuration: CFTimeInterval = 0.24
+  private static let streamingRevealInitialAlpha: CGFloat = 0.0
+  private static let streamingRevealSegmentStagger: CFTimeInterval = 0.0
+  private static let streamingRevealSingleSegmentLimit = Int.max
+  private static let streamingRevealSegmentMinLength = 44
+  private static let streamingRevealSegmentMaxLength = 104
 
   private var fullAttributedValue: NSAttributedString?
-  private var rawTextValue: String?
-  private var tokenRanges: [NSRange] = []
-  private var revealedTokenCount = 0
-  private var displayLink: CADisplayLink?
-  private var nextRevealTime: CFTimeInterval = 0
+  private var displayedCharacterLength = 0
+  private var committedCharacterLength = 0
+  private var fadeDisplayLink: CADisplayLink?
+  private var revealSegments: [ChatNativeStreamingRevealSegment] = []
+  private var lastAppliedStreaming = false
   weak var linkDelegate: ChatNativeStreamingTextLabelDelegate?
   private static let uuidRegex = try! NSRegularExpression(pattern: "[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}")
 
@@ -588,6 +1002,20 @@ final class ChatNativeStreamingTextLabel: UITextView {
   var numberOfLines: Int {
     get { textContainer.maximumNumberOfLines }
     set { textContainer.maximumNumberOfLines = newValue }
+  }
+
+  var targetCharacterLength: Int {
+    fullAttributedValue?.length ?? attributedText?.length ?? 0
+  }
+
+  var renderedCharacterLength: Int {
+    attributedText?.length ?? 0
+  }
+
+  var isRevealActiveForMeasurement: Bool {
+    fadeDisplayLink != nil
+      || !revealSegments.isEmpty
+      || displayedCharacterLength < targetCharacterLength
   }
 
   required init?(coder: NSCoder) {
@@ -605,6 +1033,7 @@ final class ChatNativeStreamingTextLabel: UITextView {
     isSelectable = false
     self.textContainerInset = .zero
     self.textContainer.lineFragmentPadding = 0
+    self.textContainer.widthTracksTextView = true
     backgroundColor = .clear
     isUserInteractionEnabled = true
     let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
@@ -613,135 +1042,400 @@ final class ChatNativeStreamingTextLabel: UITextView {
   }
 
   deinit {
-    stopStreamingAnimation()
+    cancelChunkFade()
+    stopStreamingFadeAnimation()
+  }
+
+  override func didMoveToWindow() {
+    super.didMoveToWindow()
+    if window != nil {
+      if !revealSegments.isEmpty {
+        startStreamingRevealDisplayLinkIfNeeded()
+      }
+    } else {
+      fadeDisplayLink?.invalidate()
+      fadeDisplayLink = nil
+    }
   }
 
   func applyStreamingText(_ attributedText: NSAttributedString, rawText: String, isStreaming: Bool) {
-    let previousRawText = rawTextValue ?? ""
-    let shouldContinueExistingAnimation =
-      isStreaming
-      && !previousRawText.isEmpty
-      && rawText.hasPrefix(previousRawText)
+    _ = rawText
+    let previousTargetText = fullAttributedValue?.string ?? self.attributedText?.string ?? ""
+    let previousTargetLength = fullAttributedValue?.length ?? self.attributedText?.length ?? 0
+    let currentRenderedString = self.attributedText?.string ?? ""
+    let targetString = attributedText.string
+    let targetDeltaLength = max(0, attributedText.length - previousTargetLength)
 
-    fullAttributedValue = attributedText
-    rawTextValue = rawText
-    tokenRanges = Self.tokenize(attributedText.string)
-
-    if !shouldContinueExistingAnimation {
-      revealedTokenCount = isStreaming ? 0 : tokenRanges.count
-      nextRevealTime = 0
+    if currentRenderedString == targetString,
+      previousTargetText == targetString,
+      isStreaming == lastAppliedStreaming,
+      revealSegments.isEmpty
+    {
+      return
     }
 
-    revealedTokenCount = min(revealedTokenCount, tokenRanges.count)
-    applyVisibleTokenState()
+    fullAttributedValue = attributedText
+    lastAppliedStreaming = isStreaming
 
-    if isStreaming {
-      startStreamingAnimation()
+    if !isStreaming {
+      if targetString == previousTargetText, !revealSegments.isEmpty {
+        displayedCharacterLength = attributedText.length
+        startStreamingRevealDisplayLinkIfNeeded()
+        return
+      }
+
+      if targetString.hasPrefix(previousTargetText),
+        targetDeltaLength > 0,
+        previousTargetLength > 0
+      {
+        enqueueAppendedReveal(
+          attributedText: attributedText,
+          targetString: targetString,
+          appendedStart: min(previousTargetLength, attributedText.length)
+        )
+        return
+      }
+
+      cancelChunkFade()
+      displayedCharacterLength = attributedText.length
+      committedCharacterLength = attributedText.length
+      setDisplayedText(
+        attributedText,
+        animated: previousTargetLength > 0 && targetString != currentRenderedString,
+        fadeDuration: Self.streamingFinalFadeDuration
+      )
+      return
+    }
+
+    let shouldResetReveal =
+      !previousTargetText.isEmpty
+      && !targetString.hasPrefix(previousTargetText)
+    let isAppendOnly =
+      targetString.hasPrefix(previousTargetText)
+      && targetDeltaLength > 0
+      && previousTargetLength > 0
+
+    let needsUpdate =
+      shouldResetReveal
+      || targetDeltaLength > 0
+      || (currentRenderedString != targetString && revealSegments.isEmpty)
+
+    guard needsUpdate else {
+      if !revealSegments.isEmpty {
+        startStreamingRevealDisplayLinkIfNeeded()
+      }
+      return
+    }
+
+    if previousTargetLength == 0, currentRenderedString.isEmpty, attributedText.length > 0 {
+      cancelChunkFade()
+      displayedCharacterLength = 0
+      committedCharacterLength = 0
+      enqueueAppendedReveal(
+        attributedText: attributedText,
+        targetString: targetString,
+        appendedStart: 0
+      )
+      return
+    }
+
+    displayedCharacterLength = attributedText.length
+
+    if isAppendOnly && !shouldResetReveal {
+      enqueueAppendedReveal(
+        attributedText: attributedText,
+        targetString: targetString,
+        appendedStart: min(previousTargetLength, attributedText.length)
+      )
     } else {
-      stopStreamingAnimation()
+      cancelChunkFade()
+      committedCharacterLength = attributedText.length
+      setDisplayedText(attributedText, animated: false)
     }
   }
 
   func resetStreamingState() {
-    stopStreamingAnimation()
+    cancelChunkFade()
+    stopStreamingFadeAnimation()
     fullAttributedValue = nil
-    rawTextValue = nil
-    tokenRanges = []
-    revealedTokenCount = 0
+    displayedCharacterLength = 0
+    committedCharacterLength = 0
+    lastAppliedStreaming = false
     attributedText = nil
   }
 
-  private func startStreamingAnimation() {
-    guard !tokenRanges.isEmpty else { return }
-    guard revealedTokenCount < tokenRanges.count else {
-      stopStreamingAnimation()
-      return
-    }
-    guard displayLink == nil else { return }
-    let link = CADisplayLink(target: self, selector: #selector(handleDisplayLink))
-    link.add(to: .main, forMode: .common)
-    displayLink = link
+  func measurementAttributedText(
+    fallback: NSAttributedString,
+    isStreaming: Bool
+  ) -> (text: NSAttributedString, source: String) {
+    _ = isStreaming
+    return (fallback, "target")
   }
 
-  private func stopStreamingAnimation() {
-    displayLink?.invalidate()
-    displayLink = nil
-    nextRevealTime = 0
+  private func cancelChunkFade() {
+    fadeDisplayLink?.invalidate()
+    fadeDisplayLink = nil
+    revealSegments.removeAll()
   }
 
-  @objc private func handleDisplayLink() {
-    guard !tokenRanges.isEmpty else {
-      stopStreamingAnimation()
-      return
-    }
+  private func stopStreamingFadeAnimation() {
+    layer.removeAnimation(forKey: Self.streamingFadeAnimationKey)
+  }
 
+  private func startStreamingRevealDisplayLinkIfNeeded() {
+    guard fadeDisplayLink == nil else { return }
+    let displayLink = CADisplayLink(target: self, selector: #selector(handleStreamingRevealFrame(_:)))
+    displayLink.preferredFramesPerSecond = 60
+    displayLink.add(to: .main, forMode: .common)
+    fadeDisplayLink = displayLink
+  }
+
+  @objc private func handleStreamingRevealFrame(_ displayLink: CADisplayLink) {
+    renderStreamingRevealFrame(at: displayLink.timestamp)
+  }
+
+  private func enqueueAppendedReveal(
+    attributedText: NSAttributedString,
+    targetString: String,
+    appendedStart: Int
+  ) {
+    let appendedRange = NSRange(
+      location: appendedStart,
+      length: max(0, attributedText.length - appendedStart)
+    )
+    if revealSegments.isEmpty {
+      committedCharacterLength = appendedStart
+    }
+    enqueueRevealSegments(for: appendedRange, in: targetString)
+    renderStreamingRevealFrame(at: CACurrentMediaTime(), invalidateLayout: true)
+    startStreamingRevealDisplayLinkIfNeeded()
+  }
+
+  private func enqueueRevealSegments(for appendedRange: NSRange, in targetString: String) {
+    guard appendedRange.length > 0 else { return }
     let now = CACurrentMediaTime()
-    if nextRevealTime <= 0 {
-      nextRevealTime = now
+    let targetNSString = targetString as NSString
+    let ranges = revealRanges(in: targetNSString, appendedRange: appendedRange)
+    guard !ranges.isEmpty else { return }
+
+    let nextStartTime: CFTimeInterval
+    if let latestQueuedStart = revealSegments.map(\.startTime).max() {
+      nextStartTime = max(now, latestQueuedStart + Self.streamingRevealSegmentStagger)
+    } else {
+      nextStartTime = now
     }
 
-    var didReveal = false
-    while revealedTokenCount < tokenRanges.count, now >= nextRevealTime {
-      revealedTokenCount += 1
-      nextRevealTime += Self.revealInterval
-      didReveal = true
-    }
-
-    if didReveal {
-      applyVisibleTokenState()
-    }
-
-    if revealedTokenCount >= tokenRanges.count {
-      stopStreamingAnimation()
-    }
-  }
-
-  private func applyVisibleTokenState() {
-    guard let fullAttributedValue else {
-      attributedText = nil
-      return
-    }
-
-    guard revealedTokenCount < tokenRanges.count else {
-      attributedText = fullAttributedValue
-      return
-    }
-
-    let mutable = NSMutableAttributedString(attributedString: fullAttributedValue)
-    for index in revealedTokenCount..<tokenRanges.count {
-      let range = tokenRanges[index]
-      guard range.location != NSNotFound, range.length > 0, range.location < mutable.length else {
-        continue
-      }
-
-      var appliedForeground = false
-      mutable.enumerateAttribute(.foregroundColor, in: range, options: []) { value, subrange, _ in
-        let baseColor = (value as? UIColor) ?? self.textColor ?? .white
-        mutable.addAttribute(
-          .foregroundColor,
-          value: baseColor.withAlphaComponent(0.0),
-          range: subrange
+    for (index, range) in ranges.enumerated() {
+      revealSegments.append(
+        ChatNativeStreamingRevealSegment(
+          range: range,
+          startTime: nextStartTime + CFTimeInterval(index) * Self.streamingRevealSegmentStagger,
+          duration: Self.streamingChunkFadeDuration
         )
-        appliedForeground = true
-      }
-
-      if !appliedForeground {
-        let fallbackColor = (textColor ?? .white).withAlphaComponent(0.0)
-        mutable.addAttribute(.foregroundColor, value: fallbackColor, range: range)
-      }
+      )
     }
-    attributedText = mutable
   }
 
-  private static func tokenize(_ string: String) -> [NSRange] {
-    guard !string.isEmpty else { return [] }
-    let nsString = string as NSString
-    let fullRange = NSRange(location: 0, length: nsString.length)
-    let matches = tokenRegex.matches(in: string, range: fullRange).map(\.range)
-    if matches.isEmpty {
-      return [fullRange]
+  private func renderStreamingRevealFrame(
+    at timestamp: CFTimeInterval,
+    invalidateLayout: Bool = false
+  ) {
+    guard let target = fullAttributedValue else {
+      cancelChunkFade()
+      return
     }
-    return matches
+
+    let currentLength = attributedText?.length ?? 0
+    let currentString = attributedText?.string ?? ""
+    let needsContentUpdate = currentLength != target.length || currentString != target.string
+    if needsContentUpdate {
+      UIView.performWithoutAnimation {
+        self.attributedText = target
+      }
+      if invalidateLayout {
+        invalidateIntrinsicContentSize()
+        setNeedsLayout()
+        notifyLayoutInvalidated()
+      }
+    }
+
+    guard !revealSegments.isEmpty else {
+      displayedCharacterLength = target.length
+      committedCharacterLength = target.length
+      return
+    }
+
+    let storage = textStorage
+    let storageRange = NSRange(location: 0, length: storage.length)
+    storage.beginEditing()
+
+    var keepers: [ChatNativeStreamingRevealSegment] = []
+
+    for segment in revealSegments {
+      let safeRange = NSIntersectionRange(segment.range, storageRange)
+      guard safeRange.length > 0 else { continue }
+
+      let rawProgress = CGFloat((timestamp - segment.startTime) / segment.duration)
+      let isComplete = rawProgress >= 1.0
+
+      if isComplete {
+        applyRevealAlpha(1.0, to: safeRange, from: target, into: storage)
+      } else {
+        let progress = max(0.0, rawProgress)
+        let eased = easedRevealProgress(progress)
+        let alphaFactor =
+          Self.streamingRevealInitialAlpha
+          + (1.0 - Self.streamingRevealInitialAlpha) * eased
+        applyRevealAlpha(alphaFactor, to: safeRange, from: target, into: storage)
+        keepers.append(segment)
+      }
+    }
+
+    storage.endEditing()
+
+    revealSegments = keepers
+    displayedCharacterLength = target.length
+
+    if keepers.isEmpty {
+      fadeDisplayLink?.invalidate()
+      fadeDisplayLink = nil
+      committedCharacterLength = target.length
+    }
+  }
+
+  private func revealRanges(in string: NSString, appendedRange: NSRange) -> [NSRange] {
+    let availableRange = NSRange(location: 0, length: string.length)
+    let safeRange = NSIntersectionRange(appendedRange, availableRange)
+    guard safeRange.length > 0 else { return [] }
+
+    if safeRange.length <= Self.streamingRevealSingleSegmentLimit {
+      let composedRange = string.rangeOfComposedCharacterSequences(for: safeRange)
+      let range = NSIntersectionRange(composedRange, safeRange)
+      return range.length > 0 ? [range] : []
+    }
+
+    let limit = NSMaxRange(safeRange)
+    var cursor = safeRange.location
+    var ranges: [NSRange] = []
+
+    while cursor < limit {
+      var segmentEnd = cursor
+      var lastSoftBoundaryEnd: Int?
+      var segmentLength = 0
+
+      while segmentEnd < limit {
+        let composedRange = string.rangeOfComposedCharacterSequence(at: segmentEnd)
+        let nextEnd = min(NSMaxRange(composedRange), limit)
+        let characterRange = NSRange(location: segmentEnd, length: max(0, nextEnd - segmentEnd))
+        let character = characterRange.length > 0 ? string.substring(with: characterRange) : ""
+
+        segmentEnd = nextEnd
+        segmentLength += characterRange.length
+
+        if isRevealBoundary(character) {
+          lastSoftBoundaryEnd = segmentEnd
+          if segmentLength >= Self.streamingRevealSegmentMinLength {
+            break
+          }
+        }
+
+        if segmentLength >= Self.streamingRevealSegmentMaxLength {
+          if let boundaryEnd = lastSoftBoundaryEnd, boundaryEnd > cursor {
+            segmentEnd = boundaryEnd
+          }
+          break
+        }
+      }
+
+      let rawRange = NSRange(location: cursor, length: max(1, segmentEnd - cursor))
+      let composedRange = string.rangeOfComposedCharacterSequences(for: rawRange)
+      let range = NSIntersectionRange(composedRange, safeRange)
+      if range.length > 0 {
+        ranges.append(range)
+      }
+      cursor = max(NSMaxRange(composedRange), cursor + 1)
+    }
+
+    return ranges
+  }
+
+  private func isRevealBoundary(_ character: String) -> Bool {
+    guard let scalar = character.unicodeScalars.last else { return false }
+    if CharacterSet.whitespacesAndNewlines.contains(scalar) {
+      return true
+    }
+    return ".!,;:?)]}\u{060C}\u{061B}\u{061F}".unicodeScalars.contains(scalar)
+  }
+
+  private func easedRevealProgress(_ progress: CGFloat) -> CGFloat {
+    progress * progress * (3.0 - 2.0 * progress)
+  }
+
+  private func applyRevealAlpha(
+    _ alpha: CGFloat,
+    to range: NSRange,
+    from target: NSAttributedString,
+    into storage: NSTextStorage
+  ) {
+    let storageRange = NSRange(location: 0, length: storage.length)
+    let safeRange = NSIntersectionRange(range, storageRange)
+    guard safeRange.length > 0 else { return }
+
+    var appliedForeground = false
+    target.enumerateAttribute(.foregroundColor, in: safeRange, options: []) { value, subrange, _ in
+      let baseColor = (value as? UIColor) ?? self.textColor ?? .label
+      let resolved = baseColor.resolvedColor(with: self.traitCollection)
+      let baseAlpha = resolved.cgColor.alpha
+      storage.addAttribute(
+        .foregroundColor,
+        value: resolved.withAlphaComponent(baseAlpha * alpha),
+        range: subrange
+      )
+      appliedForeground = true
+    }
+
+    if !appliedForeground {
+      let resolved = (textColor ?? .label).resolvedColor(with: traitCollection)
+      storage.addAttribute(
+        .foregroundColor,
+        value: resolved.withAlphaComponent(resolved.cgColor.alpha * alpha),
+        range: safeRange
+      )
+    }
+  }
+
+  private func setDisplayedText(
+    _ attributedText: NSAttributedString,
+    animated: Bool,
+    fadeDuration: CFTimeInterval = ChatNativeStreamingTextLabel.streamingChunkFadeDuration,
+    invalidateLayout: Bool = true
+  ) {
+    _ = animated
+    _ = fadeDuration
+    let renderedText = attributedText.length == 0 ? NSAttributedString() : attributedText
+    let currentString = self.attributedText?.string ?? ""
+    let targetString = renderedText.string
+    let textIsIdentical = currentString == targetString
+
+    stopStreamingFadeAnimation()
+    UIView.performWithoutAnimation {
+      self.attributedText = renderedText
+    }
+    if invalidateLayout, !textIsIdentical {
+      invalidateIntrinsicContentSize()
+      setNeedsLayout()
+      notifyLayoutInvalidated()
+    }
+  }
+
+  private func notifyLayoutInvalidated() {
+    DispatchQueue.main.async { [weak self] in
+      guard let self, self.window != nil else { return }
+      NotificationCenter.default.post(
+        name: .chatNativeStreamingTextLayoutInvalidated,
+        object: self
+      )
+    }
   }
 
   // MARK: - Link tap (layout manager hit-test — no cursor, isSelectable stays false)

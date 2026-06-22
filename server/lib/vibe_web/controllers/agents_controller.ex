@@ -18,6 +18,32 @@ defmodule VibeWeb.AgentsController do
     json(conn, %{items: items, quota: quota})
   end
 
+  @doc "Returns the catalog of tools an agent can be granted."
+  def tool_registry(conn, _params) do
+    json(conn, %{items: Vibe.AI.ToolRegistry.tools()})
+  end
+
+  @doc """
+  Live availability check for an agent handle/username. Pass `username` and,
+  when editing an existing agent, `agent_id` so the agent's own current handle
+  reads as available.
+  """
+  def username_available(conn, params) do
+    owner_id = conn.assigns.current_user.id
+    username = params["username"] || ""
+
+    agent =
+      case params["agent_id"] || params["id"] do
+        id when is_binary(id) and id != "" -> Agents.get_agent(id, owner_id)
+        _ -> nil
+      end
+
+    case Agents.username_availability(username, agent) do
+      {:ok, normalized} -> json(conn, %{available: true, username: normalized})
+      {:error, reason} -> json(conn, %{available: false, reason: to_string(reason)})
+    end
+  end
+
   def create(conn, params) do
     owner_id = conn.assigns.current_user.id
 

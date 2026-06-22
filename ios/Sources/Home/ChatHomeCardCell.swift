@@ -54,6 +54,7 @@ final class ChatHomeCardCell: UITableViewCell {
   private let unreadLabel = UILabel()
   private let muteIconView = UIImageView()
   private let pinIconView = UIImageView()
+  private let rightCheckmarkView = UIImageView()
 
   private var avatarLoadTask: URLSessionDataTask?
   private var avatarToken = UUID().uuidString
@@ -141,7 +142,8 @@ final class ChatHomeCardCell: UITableViewCell {
     avatarBackgroundColor: UIColor?,
     avatarGradientColors: (UIColor, UIColor)?,
     isEditing: Bool,
-    isEditSelected: Bool
+    isEditSelected: Bool,
+    showsRightCheckmark: Bool = false
   ) {
     let primary =
       isDark ? UIColor.white : UIColor(red: 22 / 255, green: 28 / 255, blue: 36 / 255, alpha: 1)
@@ -182,16 +184,18 @@ final class ChatHomeCardCell: UITableViewCell {
     titleLabel.textColor = primary
     previewLabel.text = row.isTyping ? "typing..." : row.preview
     previewLabel.textColor = row.isTyping ? typingColor : secondary
+    
+    timeLabel.isHidden = showsRightCheckmark
     timeLabel.text = row.timeLabel
     timeLabel.textColor = secondary
 
-    unreadBadge.isHidden = !(row.unreadCount > 0 || row.markedUnread)
+    unreadBadge.isHidden = showsRightCheckmark || !(row.unreadCount > 0 || row.markedUnread)
     unreadLabel.text = row.unreadCount > 0 ? "\(row.unreadCount)" : ""
     unreadLabel.textColor = isDark ? UIColor.black : UIColor.white
     unreadBadge.backgroundColor = badgeBackground
 
-    muteIconView.isHidden = !row.muted
-    pinIconView.isHidden = !row.pinned
+    muteIconView.isHidden = showsRightCheckmark || !row.muted
+    pinIconView.isHidden = showsRightCheckmark || !row.pinned
     muteIconView.tintColor = secondary
     pinIconView.tintColor = secondary
     onlineDot.isHidden = !row.isOnline
@@ -203,6 +207,9 @@ final class ChatHomeCardCell: UITableViewCell {
     editSelectionBackgroundView.layer.borderColor = (isEditSelected ? badgeBackground : selectionRingColor).cgColor
     editSelectionCheckView.isHidden = !(isEditing && isEditSelected)
     editSelectionCheckView.tintColor = isDark ? UIColor.black : UIColor.white
+    
+    rightCheckmarkView.isHidden = !showsRightCheckmark
+    rightCheckmarkView.tintColor = isEditSelected ? badgeBackground : secondary.withAlphaComponent(0.3)
 
     avatarFallbackIconView.image = UIImage(systemName: row.isSavedMessages ? "bookmark.fill" : "person.fill")
     avatarFallbackIconView.tintColor = .white
@@ -415,6 +422,11 @@ final class ChatHomeCardCell: UITableViewCell {
     pinIconView.contentMode = .scaleAspectFit
     pinIconView.transform = CGAffineTransform(rotationAngle: CGFloat.pi / 4)
 
+    rightCheckmarkView.translatesAutoresizingMaskIntoConstraints = false
+    rightCheckmarkView.image = UIImage(systemName: "checkmark")
+    rightCheckmarkView.contentMode = .scaleAspectFit
+    rightCheckmarkView.isHidden = true
+
     let textStack = UIStackView(arrangedSubviews: [titleLabel, previewLabel])
     textStack.translatesAutoresizingMaskIntoConstraints = false
     textStack.axis = .vertical
@@ -451,6 +463,7 @@ final class ChatHomeCardCell: UITableViewCell {
     rowContentContainer.addSubview(onlineDot)
     rowContentContainer.addSubview(textStack)
     rowContentContainer.addSubview(metaStack)
+    rowContentContainer.addSubview(rightCheckmarkView)
     unreadBadge.addSubview(unreadLabel)
 
     let rowContentLeadingConstraint = rowContentContainer.leadingAnchor.constraint(
@@ -535,6 +548,11 @@ final class ChatHomeCardCell: UITableViewCell {
       unreadLabel.leadingAnchor.constraint(equalTo: unreadBadge.leadingAnchor, constant: 6),
       unreadLabel.trailingAnchor.constraint(equalTo: unreadBadge.trailingAnchor, constant: -6),
       unreadLabel.centerYAnchor.constraint(equalTo: unreadBadge.centerYAnchor),
+
+      rightCheckmarkView.trailingAnchor.constraint(equalTo: rowContentContainer.trailingAnchor, constant: -20),
+      rightCheckmarkView.centerYAnchor.constraint(equalTo: rowContentContainer.centerYAnchor),
+      rightCheckmarkView.widthAnchor.constraint(equalToConstant: 20),
+      rightCheckmarkView.heightAnchor.constraint(equalToConstant: 20),
 
       muteIconView.widthAnchor.constraint(equalToConstant: 14),
       muteIconView.heightAnchor.constraint(equalToConstant: 14),

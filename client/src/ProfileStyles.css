@@ -1,8 +1,16 @@
 /* === Profile Settings Page (User's Own Profile) === */
 .settings-container {
-    padding: 80px 20px 20px;
+    padding: 0 20px 20px;
     height: 100%;
     overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+}
+
+.settings-container::before {
+    content: '';
+    display: block;
+    height: 80px;
+    flex-shrink: 0;
 }
 
 .settings-avatar-section {

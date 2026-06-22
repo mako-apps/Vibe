@@ -10,6 +10,7 @@ private let chatGapDebugOverlayEnabled = false
 
 protocol ChatInputBarDelegate: AnyObject {
   func inputBarDidSend(text: String)
+  func inputBarDidRequestStopStreaming()
   func inputBarDidSendWithAgentMention(text: String, agentText: String)
   func inputBarDidSendWithStandaloneAgentMention(
     text: String,
@@ -17,10 +18,12 @@ protocol ChatInputBarDelegate: AnyObject {
     agentUsername: String
   )
   func inputBarDidRequestVibeAgentBuilder()
+  func inputBarDidRequestAgentPanel()
   func inputBarDidTapAttachment()
   func inputBarDidTapAction()
   func inputBarTextDidChange(text: String)
   func inputBarHeightDidChange()
+  func inputBarDidRequestSelectionAction(_ action: String, payload: [String: Any]?)
   // Rich attachment callbacks (mirrors AttachmentMenu.tsx)
   func inputBarDidSelectImage(
     uri: String,
@@ -703,6 +706,7 @@ final class ChatInputBar: UIView {
   private let pillGlass = UIVisualEffectView(effect: nil)
   private let textView = ChatComposerTextView()
   private let placeholderLabel = UILabel()
+  private let inlineAttachButton = UIButton(type: .system)
   private let gifButton = UIButton(type: .system)
   private let sendButton = UIButton(type: .system)
   private let sendGradient = CAGradientLayer()
@@ -710,6 +714,15 @@ final class ChatInputBar: UIView {
   private let micButton = UIButton(type: .system)
   private let micGlass = UIVisualEffectView(effect: nil)
   private let micVADView = FluidVADVisualizer()
+
+  // Selection UI
+  private var isSelectionMode = false
+  private let selectionDeleteButton = UIButton(type: .system)
+  private let selectionDeleteGlass = UIVisualEffectView(effect: nil)
+  private let selectionShareOutsideButton = UIButton(type: .system)
+  private let selectionShareOutsideGlass = UIVisualEffectView(effect: nil)
+  private let selectionShareInsideButton = UIButton(type: .system)
+  private let selectionShareInsideGlass = UIVisualEffectView(effect: nil)
   private let gifPanel = ChatGifPanelView()
   private var gifOverlayWindow: UIWindow?
   private weak var gifOverlayController: ChatGifPanelOverlayController?
@@ -721,6 +734,8 @@ final class ChatInputBar: UIView {
   private var isVideoMode: Bool = false
   // Width progress for right action morph: 0 = mic, 1 = send.
   private var sendProgress: CGFloat = 0
+  private var isAgentStreaming = false
+  private var agentControlMode = false
   // Recording layout morph progress: 0 = regular, 1 = expanded left.
   private var recordingExpandProgress: CGFloat = 0
 
@@ -1077,6 +1092,15 @@ final class ChatInputBar: UIView {
 
     pillButton.addSubview(pillContainer)
 
+    inlineAttachButton.isHidden = true
+    inlineAttachButton.accessibilityLabel = "Add attachment"
+    inlineAttachButton.addTarget(
+      self,
+      action: #selector(inlineAttachTapped),
+      for: .touchUpInside
+    )
+    pillContainer.addSubview(inlineAttachButton)
+
     // placeholder
     placeholderLabel.text = placeholder
     placeholderLabel.font = UIFont.systemFont(ofSize: 16)
@@ -1177,6 +1201,44 @@ final class ChatInputBar: UIView {
     cancelOverlayButton.isHidden = true
     pillContainer.addSubview(cancelOverlayButton)
 
+    // ── Selection Buttons (glass pills) ───────────────────────────────────────
+    let selectionCfg = UIImage.SymbolConfiguration(pointSize: 15, weight: .regular)
+    
+    [selectionDeleteGlass, selectionShareOutsideGlass, selectionShareInsideGlass].forEach {
+      $0.isUserInteractionEnabled = true
+      $0.clipsToBounds = true
+      $0.isHidden = true
+      $0.alpha = 0
+      contentRow.addSubview($0)
+    }
+    
+    selectionDeleteButton.clipsToBounds = false
+    selectionDeleteButton.backgroundColor = .clear
+    selectionDeleteGlass.contentView.addSubview(selectionDeleteButton)
+    applyControlGlyph(
+      button: selectionDeleteButton, symbolName: "trash",
+      symbolConfig: selectionCfg, tintColor: UIColor(white: 0.85, alpha: 1.0)
+    )
+    selectionDeleteButton.addTarget(self, action: #selector(handleSelectionDelete), for: .touchUpInside)
+    
+    selectionShareOutsideButton.clipsToBounds = false
+    selectionShareOutsideButton.backgroundColor = .clear
+    selectionShareOutsideGlass.contentView.addSubview(selectionShareOutsideButton)
+    applyControlGlyph(
+      button: selectionShareOutsideButton, symbolName: "square.and.arrow.up",
+      symbolConfig: selectionCfg, tintColor: UIColor(white: 0.85, alpha: 1.0)
+    )
+    selectionShareOutsideButton.addTarget(self, action: #selector(handleSelectionShareOutside), for: .touchUpInside)
+    
+    selectionShareInsideButton.clipsToBounds = false
+    selectionShareInsideButton.backgroundColor = .clear
+    selectionShareInsideGlass.contentView.addSubview(selectionShareInsideButton)
+    applyControlGlyph(
+      button: selectionShareInsideButton, symbolName: "arrowshape.turn.up.right",
+      symbolConfig: selectionCfg, tintColor: UIColor(white: 0.85, alpha: 1.0)
+    )
+    selectionShareInsideButton.addTarget(self, action: #selector(handleSelectionShareInside), for: .touchUpInside)
+
     // ── Mic button (glass pill) ───────────────────────────────────────────
     micVADView.alpha = 0
     contentRow.addSubview(micVADView)
@@ -1240,6 +1302,7 @@ final class ChatInputBar: UIView {
     placeholderLabel.textColor = a.textColorThem.withAlphaComponent(0.45)
     let controlTint = a.textColorThem.withAlphaComponent(0.9)
     attachButton.tintColor = controlTint
+    inlineAttachButton.tintColor = controlTint
     gifButton.tintColor = a.textColorThem.withAlphaComponent(gifPanelVisible ? 1.0 : 0.85)
     micButton.tintColor = controlTint
     sendGradient.colors = a.bubbleMeGradient.map(\.cgColor)
@@ -1282,13 +1345,7 @@ final class ChatInputBar: UIView {
     mentionDescLabel.textColor = a.textColorThem.withAlphaComponent(0.72)
 
     refreshGlass()
-    let plusCfg = UIImage.SymbolConfiguration(pointSize: 15, weight: .regular)
-    applyControlGlyph(
-      button: attachButton,
-      symbolName: "plus",
-      symbolConfig: plusCfg,
-      tintColor: controlTint
-    )
+    refreshAgentControlModeAppearance()
     let micCfg = UIImage.SymbolConfiguration(pointSize: 13, weight: .medium)
     let micSymbol = isVideoMode ? "video" : "mic"
     applyControlGlyph(
@@ -1298,6 +1355,77 @@ final class ChatInputBar: UIView {
       tintColor: controlTint
     )
     CATransaction.commit()
+  }
+
+  private func refreshAgentControlModeAppearance() {
+    let controlTint = appearance.textColorThem.withAlphaComponent(0.9)
+    let agentAccent =
+      appearance.bubbleMeGradient.first
+      ?? UIColor(red: 0.16, green: 0.62, blue: 0.62, alpha: 1.0)
+    let plusConfiguration = UIImage.SymbolConfiguration(pointSize: 15, weight: .regular)
+    applyControlGlyph(
+      button: inlineAttachButton,
+      symbolName: "plus",
+      symbolConfig: plusConfiguration,
+      tintColor: controlTint
+    )
+
+    if agentControlMode {
+      var configuration = UIButton.Configuration.filled()
+      configuration.title = "Open"
+      configuration.image = UIImage(
+        systemName: "slider.horizontal.3",
+        withConfiguration: UIImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
+      )
+      configuration.imagePlacement = .leading
+      configuration.imagePadding = 5
+      configuration.baseForegroundColor = .white
+      configuration.baseBackgroundColor = agentAccent
+      configuration.cornerStyle = .capsule
+      configuration.contentInsets = NSDirectionalEdgeInsets(
+        top: 0,
+        leading: 10,
+        bottom: 0,
+        trailing: 10
+      )
+      configuration.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer {
+        incoming in
+        var outgoing = incoming
+        outgoing.font = .systemFont(ofSize: 13.0, weight: .semibold)
+        return outgoing
+      }
+      attachButton.configuration = configuration
+      attachButton.contentHorizontalAlignment = .center
+      attachButton.titleLabel?.lineBreakMode = .byClipping
+      attachButton.accessibilityLabel = "Open agents"
+    } else {
+      attachButton.configuration = nil
+      attachButton.setTitle(nil, for: .normal)
+      attachButton.contentHorizontalAlignment = .center
+      applyControlGlyph(
+        button: attachButton,
+        symbolName: "plus",
+        symbolConfig: plusConfiguration,
+        tintColor: controlTint
+      )
+      attachButton.accessibilityLabel = "Add attachment"
+    }
+  }
+
+  // MARK: - Input State Reset
+
+  func setSelectionMode(_ active: Bool, animated: Bool) {
+    if isSelectionMode == active { return }
+    isSelectionMode = active
+    if animated {
+      UIView.animate(withDuration: 0.3, delay: 0, options: .curveEaseInOut) {
+        self.setNeedsLayout()
+        self.layoutIfNeeded()
+      }
+    } else {
+      setNeedsLayout()
+      layoutIfNeeded()
+    }
   }
 
   // MARK: - Public helpers
@@ -1317,6 +1445,44 @@ final class ChatInputBar: UIView {
       self.superview?.setNeedsLayout()
       self.superview?.layoutIfNeeded()
     }
+  }
+
+  /// Load text into the composer (used when re-opening a failed message to edit
+  /// and resend) and bring up the keyboard.
+  func setComposerText(_ text: String, focus: Bool = true) {
+    textView.text = text
+    setMentionBannerVisible(false, animated: false)
+    applyPlaceholder()
+    updateButtonStates(animated: true)
+    if focus {
+      textView.becomeFirstResponder()
+    }
+    // Position the caret at the end of the loaded text.
+    let end = textView.endOfDocument
+    textView.selectedTextRange = textView.textRange(from: end, to: end)
+    UIView.animate(
+      withDuration: 0.25, delay: 0,
+      options: [.curveEaseOut, .allowUserInteraction, .beginFromCurrentState]
+    ) {
+      self.setNeedsLayout()
+      self.layoutIfNeeded()
+      self.superview?.setNeedsLayout()
+      self.superview?.layoutIfNeeded()
+    }
+  }
+
+  func setAgentStreaming(_ streaming: Bool) {
+    guard isAgentStreaming != streaming else { return }
+    isAgentStreaming = streaming
+    updateButtonStates(animated: true)
+  }
+
+  func setAgentControlMode(_ enabled: Bool) {
+    guard agentControlMode != enabled else { return }
+    agentControlMode = enabled
+    inlineAttachButton.isHidden = !enabled
+    refreshAgentControlModeAppearance()
+    setNeedsLayout()
   }
 
   func pillRect(in view: UIView) -> CGRect {
@@ -1565,8 +1731,9 @@ final class ChatInputBar: UIView {
     let dynamicHPad = accessoryHorizontalPadding()
 
     // Measure text height
-    let recordingLeftExpansion = (sideSize + sideGap) * clampedRecordingExpand
-    let pillX = dynamicHPad + sideSize + sideGap - recordingLeftExpansion
+    let leftControlWidth: CGFloat = agentControlMode ? 76.0 : sideSize
+    let recordingLeftExpansion = (leftControlWidth + sideGap) * clampedRecordingExpand
+    let pillX = dynamicHPad + leftControlWidth + sideGap - recordingLeftExpansion
     let pillRight = w - dynamicHPad - (sideSize * micVisibility) - (sideGap * micVisibility)
     let sendW: CGFloat = 44
     let sendH: CGFloat = 32
@@ -1575,7 +1742,11 @@ final class ChatInputBar: UIView {
       isRecording ? 0 : max(24, gifButtonSize - (8 * clampedSendProgress))
     let pillW = max(1, pillRight - pillX)
     let sendActionReserve = (sendW + 2) * clampedSendProgress
-    let textW = max(1, pillW - textInsetH * 2 - sendActionReserve - gifTextReserve)
+    let inlineAttachReserve: CGFloat = agentControlMode && !isRecording ? 30.0 : 0.0
+    let textW = max(
+      1,
+      pillW - textInsetH * 2 - inlineAttachReserve - sendActionReserve - gifTextReserve
+    )
     let textH = textView.sizeThatFits(CGSize(width: textW, height: .greatestFiniteMagnitude)).height
     let clampedTextH = max(minPillH - textInsetV * 2, min(maxPillH - textInsetV * 2, textH))
     let replyBannerExtra: CGFloat = replyBannerVisible ? (replyBannerContentH + replyBannerGap) : 0
@@ -1647,10 +1818,16 @@ final class ChatInputBar: UIView {
     let btnCenterY = textRowBottom - (sideSize / 2.0) - controlBottomInset
     let squareBounds = CGRect(origin: .zero, size: CGSize(width: sideSize, height: sideSize))
 
-    attachGlass.bounds = squareBounds
+    let selectionYOffset: CGFloat = isSelectionMode ? 0.0 : 100.0
+    let normalYOffset: CGFloat = isSelectionMode ? 100.0 : 0.0
+
+    attachGlass.bounds = CGRect(
+      origin: .zero,
+      size: CGSize(width: leftControlWidth, height: sideSize)
+    )
     attachGlass.center = CGPoint(
-      x: dynamicHPad + (sideSize / 2) - (recordingLeftExpansion * 0.85),
-      y: btnCenterY
+      x: dynamicHPad + (leftControlWidth / 2) - (recordingLeftExpansion * 0.85),
+      y: btnCenterY + normalYOffset
     )
     attachButton.frame = attachGlass.contentView.bounds
 
@@ -1659,14 +1836,14 @@ final class ChatInputBar: UIView {
 
     // Position Mic Button (use center/bounds to preserve transforms)
     micGlass.bounds = squareBounds
-    micGlass.center = CGPoint(x: micBaseCenterX + micPushOutX, y: btnCenterY)
+    micGlass.center = CGPoint(x: micBaseCenterX + micPushOutX, y: btnCenterY + normalYOffset)
     micButton.frame = micGlass.contentView.bounds
     micVADView.bounds = squareBounds
-    micVADView.center = micGlass.center
+    micVADView.center = CGPoint(x: micGlass.center.x, y: btnCenterY) // Keep VAD untouched or slide it too?
     // Layout check: Initial visibility handled by updateButtonStates
 
     let actualPillW = max(1, pillRight - pillX)
-    pillGlass.frame = CGRect(x: pillX, y: 0, width: actualPillW, height: pillH)
+    pillGlass.frame = CGRect(x: pillX, y: normalYOffset, width: actualPillW, height: pillH)
     pillButton.frame = pillGlass.bounds
     pillContainer.frame = pillGlass.bounds
     // Corner radius: use the text-row height for capsule feel, capped for tall pills
@@ -1699,11 +1876,21 @@ final class ChatInputBar: UIView {
       layoutReplyBannerContents()
     }
 
-    let tfX = textInsetH
-    let tfW = max(1, actualPillW - textInsetH * 2 - sendActionReserve - gifTextReserve)
+    let tfX = textInsetH + inlineAttachReserve
+    let tfW = max(
+      1,
+      actualPillW - textInsetH * 2 - inlineAttachReserve - sendActionReserve - gifTextReserve
+    )
     let tfY = bannerExtra + (clampedTextH + textInsetV * 2 - clampedTextH) / 2
     textView.frame = CGRect(x: tfX, y: tfY, width: tfW, height: clampedTextH)
     placeholderLabel.frame = CGRect(x: tfX + 2, y: tfY, width: tfW - 4, height: clampedTextH)
+    inlineAttachButton.frame = CGRect(
+      x: 4.0,
+      y: textRowBottom - 36.0 - max(2.0, (minPillH - 36.0) * 0.5),
+      width: 36.0,
+      height: 36.0
+    )
+    inlineAttachButton.isHidden = !agentControlMode || isRecording
     let gifTrailingInsetCollapsed: CGFloat = textInsetH
     let gifTrailingInsetExpanded: CGFloat = 2
     let gifTrailingInset =
@@ -1770,6 +1957,34 @@ final class ChatInputBar: UIView {
     // ── View frame updates that should inherit UIView animations ──
     attachButton.frame = attachGlass.contentView.bounds
     micButton.frame = micGlass.contentView.bounds
+    
+    // Position Selection controls
+    let selectionSideSize: CGFloat = 48.0
+    let selectionBounds = CGRect(origin: .zero, size: CGSize(width: selectionSideSize, height: selectionSideSize))
+    
+    selectionDeleteGlass.bounds = selectionBounds
+    selectionDeleteGlass.center = CGPoint(x: dynamicHPad + (selectionSideSize / 2), y: btnCenterY + selectionYOffset)
+    selectionDeleteButton.frame = selectionDeleteGlass.contentView.bounds
+    
+    selectionShareOutsideGlass.bounds = selectionBounds
+    selectionShareOutsideGlass.center = CGPoint(x: w / 2, y: btnCenterY + selectionYOffset)
+    selectionShareOutsideButton.frame = selectionShareOutsideGlass.contentView.bounds
+    
+    selectionShareInsideGlass.bounds = selectionBounds
+    selectionShareInsideGlass.center = CGPoint(x: w - dynamicHPad - (selectionSideSize / 2), y: btnCenterY + selectionYOffset)
+    selectionShareInsideButton.frame = selectionShareInsideGlass.contentView.bounds
+    
+    let activeAlpha: CGFloat = isSelectionMode ? 1 : 0
+    let normalAlpha: CGFloat = isSelectionMode ? 0 : 1
+    
+    [selectionDeleteGlass, selectionShareOutsideGlass, selectionShareInsideGlass].forEach {
+      $0.alpha = activeAlpha
+      $0.isHidden = !isSelectionMode && $0.alpha == 0
+    }
+    
+    attachGlass.alpha = normalAlpha
+    pillGlass.alpha = normalAlpha
+    micGlass.alpha = isSelectionMode ? 0 : micGlass.alpha // respect existing mic alpha logic if not selection mode
 
     if #available(iOS 26.0, *) {
       // Use native cornerConfiguration for liquid glass shapes
@@ -1779,11 +1994,17 @@ final class ChatInputBar: UIView {
       pillGlass.cornerConfiguration = .uniformCorners(radius: .fixed(pillContainer.layer.cornerRadius))
       pillContainer.layer.cornerCurve = .continuous
       lockPill.cornerConfiguration = .capsule()
+      [selectionDeleteGlass, selectionShareOutsideGlass, selectionShareInsideGlass].forEach {
+        $0.cornerConfiguration = .capsule()
+      }
     } else {
-      attachGlass.layer.cornerRadius = sideSize / 2
+      attachGlass.layer.cornerRadius = attachGlass.bounds.height / 2
       micGlass.layer.cornerRadius = sideSize / 2
       pillGlass.layer.cornerRadius = pillContainer.layer.cornerRadius
       lockPill.layer.cornerRadius = lockPill.bounds.width / 2
+      [selectionDeleteGlass, selectionShareOutsideGlass, selectionShareInsideGlass].forEach {
+        $0.layer.cornerRadius = $0.bounds.height / 2
+      }
     }
 
     // ── Layer-only updates (no implicit animation wanted) ──
@@ -1849,6 +2070,12 @@ final class ChatInputBar: UIView {
       lockEffect.isInteractive = true
       lockPill.effect = lockEffect
       lockPill.contentView.backgroundColor = UIColor(white: 0.1, alpha: 0.2)
+      
+      [selectionDeleteGlass, selectionShareOutsideGlass, selectionShareInsideGlass].forEach {
+        let effect = UIGlassEffect()
+        effect.isInteractive = true
+        $0.effect = effect
+      }
     } else {
       attachGlass.effect = UIBlurEffect(style: .systemMaterial)
       micGlass.effect = UIBlurEffect(style: .systemMaterial)
@@ -1856,6 +2083,10 @@ final class ChatInputBar: UIView {
       pillGlass.contentView.backgroundColor = pillTint
       lockPill.effect = UIBlurEffect(style: .systemMaterialDark)
       lockPill.contentView.backgroundColor = UIColor(white: 0.1, alpha: 0.2)
+      
+      [selectionDeleteGlass, selectionShareOutsideGlass, selectionShareInsideGlass].forEach {
+        $0.effect = UIBlurEffect(style: .systemMaterial)
+      }
     }
   }
 
@@ -1875,7 +2106,20 @@ final class ChatInputBar: UIView {
 
   private func updateButtonStates(animated: Bool = false) {
     let has = !(textView.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    let showSend = has
+    let showSend = has || isAgentStreaming
+    let sendSymbol = isAgentStreaming ? "stop.fill" : "paperplane.fill"
+    let sendPointSize: CGFloat = isAgentStreaming ? 11 : 13
+    sendButton.setImage(
+      UIImage(
+        systemName: sendSymbol,
+        withConfiguration: UIImage.SymbolConfiguration(
+          pointSize: sendPointSize,
+          weight: isAgentStreaming ? .semibold : .regular
+        )
+      ),
+      for: .normal
+    )
+    sendButton.accessibilityLabel = isAgentStreaming ? "Stop response" : "Send"
 
     // Inline send button in pill, with mic slot collapsing on the right.
     let targetProgress: CGFloat = showSend ? 1 : 0
@@ -2184,6 +2428,18 @@ final class ChatInputBar: UIView {
   }
 
   @objc private func attachTapped() {
+    if agentControlMode {
+      delegate?.inputBarDidRequestAgentPanel()
+      return
+    }
+    presentAttachmentSheet(sourceView: attachGlass)
+  }
+
+  @objc private func inlineAttachTapped() {
+    presentAttachmentSheet(sourceView: inlineAttachButton)
+  }
+
+  private func presentAttachmentSheet(sourceView: UIView) {
     setGifPanelVisible(false, animated: false)
     // Show native attachment sheet
     guard let vc = findViewController() else {
@@ -2191,11 +2447,11 @@ final class ChatInputBar: UIView {
       return
     }
     let sheet = ChatAttachmentMenuController(appearance: appearance)
-    sheet.sourceButtonView = attachGlass
+    sheet.sourceButtonView = sourceView
     if let window = vc.view.window {
-      sheet.sourceButtonFrameInWindow = attachGlass.convert(attachGlass.bounds, to: window)
+      sheet.sourceButtonFrameInWindow = sourceView.convert(sourceView.bounds, to: window)
     } else {
-      sheet.sourceButtonFrameInWindow = attachGlass.convert(attachGlass.bounds, to: nil)
+      sheet.sourceButtonFrameInWindow = sourceView.convert(sourceView.bounds, to: nil)
     }
     sheet.onSelectImage = { [weak self] uri, caption, transitionCapture in
       self?.attachmentSheet = nil
@@ -2247,7 +2503,38 @@ final class ChatInputBar: UIView {
     }
   }
 
+  @objc private func handleSelectionDelete() {
+    let alert = UIAlertController(title: nil, message: nil, preferredStyle: .actionSheet)
+    alert.addAction(UIAlertAction(title: "Delete for me", style: .destructive, handler: { _ in
+      self.delegate?.inputBarDidRequestSelectionAction("delete", payload: ["forEveryone": false])
+    }))
+    alert.addAction(UIAlertAction(title: "Delete for both", style: .destructive, handler: { _ in
+      self.delegate?.inputBarDidRequestSelectionAction("delete", payload: ["forEveryone": true])
+    }))
+    alert.addAction(UIAlertAction(title: "Cancel", style: .cancel, handler: nil))
+    
+    // Find the view controller to present the alert
+    if let window = self.window, let rootVC = window.rootViewController {
+      var topVC = rootVC
+      while let presented = topVC.presentedViewController {
+        topVC = presented
+      }
+      topVC.present(alert, animated: true, completion: nil)
+    }
+  }
+  @objc private func handleSelectionShareOutside() {
+    delegate?.inputBarDidRequestSelectionAction("shareOutside", payload: nil)
+  }
+  @objc private func handleSelectionShareInside() {
+    delegate?.inputBarDidRequestSelectionAction("shareInside", payload: nil)
+  }
+
   @objc private func sendTapped() {
+    if isAgentStreaming {
+      delegate?.inputBarDidRequestStopStreaming()
+      return
+    }
+
     let t = currentText
     guard !t.isEmpty else { return }
 

@@ -50,6 +50,33 @@ final class ChatEngineStore {
     }
   }
 
+  /// One-time migration: packet mesh is now opt-in (default direct). Sessions
+  /// persisted before this change still carry transportMode=packet_mesh, which
+  /// blocks large media (music/video/files) and makes sends fail immediately.
+  /// Downgrade such sessions to direct exactly once; after this runs,
+  /// Settings → Connection remains the source of truth and can re-enable mesh
+  /// without being undone on the next launch.
+  func migrateLegacyPacketMeshToDirectIfNeeded() {
+    let flagKey = "vibe.mesh.legacyDowngradeDone.v1"
+    queue.sync {
+      guard !defaults.bool(forKey: flagKey) else { return }
+      defaults.set(true, forKey: flagKey)
+      var current = loadConfigLocked()
+      let mode = (current["transportMode"] as? String)?
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+      guard mode == "packet_mesh" else { return }
+      current["transportMode"] = "direct"
+      current["packetStatus"] = "direct"
+      current.removeValue(forKey: "packetProxyPort")
+      let sanitized = SecureKeyStore.shared.migrateAndSanitize(current)
+      guard JSONSerialization.isValidJSONObject(sanitized),
+            let data = try? JSONSerialization.data(withJSONObject: sanitized)
+      else { return }
+      defaults.set(data, forKey: configKey)
+      NSLog("[ChatEngineStore] migrated legacy transportMode packet_mesh -> direct")
+    }
+  }
+
   func appendJournal(_ entry: [String: Any]) {
     queue.async {
       var items = self.loadJournalLocked()

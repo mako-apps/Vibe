@@ -311,7 +311,7 @@ struct SettingsView: View {
   }
 
   private var connectionModeTitle: String {
-    switch AppSessionConfig.current?.transportMode ?? .packetMesh {
+    switch AppSessionConfig.current?.transportMode ?? .direct {
     case .packetMesh:
       return "Automatic"
     case .direct:
@@ -1446,7 +1446,7 @@ private struct ConnectionManagerSheetView: View {
   @Environment(\.colorScheme) private var colorScheme
   let onDismiss: () -> Void
 
-  @State private var selectedMode = AppSessionConfig.current?.transportMode ?? .packetMesh
+  @State private var selectedMode = AppSessionConfig.current?.transportMode ?? .direct
 
   private var palette: AppThemePalette {
     AppThemePalette.resolve(for: colorScheme)

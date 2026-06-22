@@ -40,7 +40,14 @@ final class PacketRuntime {
   }
 
   func stop(resetToDirect: Bool = false) {
-    queue.sync {
+    // `stopLocked` calls the blocking `phantom_stop_client()` FFI, which can hang
+    // for a long time (or indefinitely) when the mesh is in a wedged state. This
+    // method is invoked directly on the main thread (e.g. from the connection-mode
+    // picker in Settings), so a synchronous `queue.sync` would freeze the entire UI
+    // for the full duration of that FFI call. Dispatch asynchronously instead: no
+    // caller depends on stop() completing synchronously, and the serial queue still
+    // preserves stop→start ordering for any subsequent `ensureStarted`.
+    queue.async { [self] in
       stopLocked(resetToDirect: resetToDirect)
     }
   }

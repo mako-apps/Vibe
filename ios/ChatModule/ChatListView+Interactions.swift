@@ -1,8 +1,137 @@
+import AudioToolbox
 import UIKit
 
-private let swipeReplyTrigger: CGFloat = 28.0
-private let swipeReplyMaxOffset: CGFloat = 88.0
+private let swipeReplyTrigger: CGFloat = 56.0
+private let swipeReplyMaxOffset: CGFloat = 80.0
 private let chatHoldDebugLogs = true
+
+/// Telegram-style circular reply indicator. Soft blur disc, thin outline arrow,
+/// no colour tint. It emerges from the right edge as the bubble slides, scaling
+/// and rotating in from the first pixel of the swipe. On the reply hit it fires a
+/// dedicated FX pass: a springy bounce, an expanding burst ring, and a glint
+/// shimmer that sweeps across the disc.
+final class ChatSwipeReplyIconView: UIView {
+  static let diameter: CGFloat = 28.0
+  private let blurView = UIVisualEffectView(effect: nil)
+  private let arrow = UIImageView()
+  private let ringLayer = CAShapeLayer()
+  private let shimmerHost = UIView()
+  private let shimmerLayer = CAGradientLayer()
+  private(set) var didPop = false
+
+  init() {
+    super.init(frame: CGRect(x: 0, y: 0, width: Self.diameter, height: Self.diameter))
+    isUserInteractionEnabled = false
+
+    blurView.frame = bounds
+    blurView.layer.cornerRadius = Self.diameter / 2.0
+    blurView.clipsToBounds = true
+    blurView.layer.borderWidth = 0.5
+    addSubview(blurView)
+
+    // Burst-ring FX layer — invisible until the hit, then expands + fades.
+    ringLayer.frame = bounds
+    ringLayer.fillColor = UIColor.clear.cgColor
+    ringLayer.lineWidth = 1.5
+    ringLayer.path = UIBezierPath(ovalIn: bounds.insetBy(dx: 0.75, dy: 0.75)).cgPath
+    ringLayer.opacity = 0.0
+    layer.addSublayer(ringLayer)
+
+    // Thin outline arrow (not filled) for a lighter stroke at small size.
+    let cfg = UIImage.SymbolConfiguration(pointSize: 12.0, weight: .semibold)
+    arrow.image = UIImage(systemName: "arrowshape.turn.up.left", withConfiguration: cfg)
+    arrow.contentMode = .center
+    arrow.frame = bounds
+    addSubview(arrow)
+
+    // Glint-shimmer FX layer — a diagonal highlight clipped to the disc that
+    // sweeps across once on the hit. Hidden until then.
+    shimmerHost.frame = bounds
+    shimmerHost.layer.cornerRadius = Self.diameter / 2.0
+    shimmerHost.clipsToBounds = true
+    shimmerHost.isUserInteractionEnabled = false
+    shimmerHost.isHidden = true
+    addSubview(shimmerHost)
+
+    shimmerLayer.frame = CGRect(x: -Self.diameter, y: 0, width: Self.diameter, height: Self.diameter)
+    shimmerLayer.startPoint = CGPoint(x: 0.0, y: 0.0)
+    shimmerLayer.endPoint = CGPoint(x: 1.0, y: 1.0)
+    shimmerLayer.colors = [
+      UIColor.white.withAlphaComponent(0.0).cgColor,
+      UIColor.white.withAlphaComponent(0.75).cgColor,
+      UIColor.white.withAlphaComponent(0.0).cgColor,
+    ]
+    shimmerLayer.locations = [0.0, 0.5, 1.0]
+    shimmerHost.layer.addSublayer(shimmerLayer)
+
+    alpha = 0.0
+    // Start from nothing so it visibly scales up as the swipe begins.
+    transform = CGAffineTransform(scaleX: 0.1, y: 0.1)
+  }
+
+  required init?(coder: NSCoder) { nil }
+
+  func applyTheme(isDark: Bool) {
+    // Soft, modern material — no colour tint, just a frosted disc.
+    blurView.effect = UIBlurEffect(
+      style: isDark ? .systemUltraThinMaterialDark : .systemUltraThinMaterialLight)
+    blurView.layer.borderColor = UIColor(white: isDark ? 1.0 : 0.0, alpha: 0.12).cgColor
+    arrow.tintColor = isDark ? .white : UIColor(white: 0.12, alpha: 1.0)
+    ringLayer.strokeColor = UIColor(white: isDark ? 1.0 : 0.1, alpha: 0.9).cgColor
+  }
+
+  /// progress: 0 at rest, 1 at the trigger threshold (may exceed 1 past it).
+  func apply(progress: CGFloat) {
+    guard !didPop else { return }
+    let p = max(0.0, min(1.0, progress))
+    // Fade in faster than it scales so it's visible from the first movement,
+    // while the scale keeps growing toward the threshold.
+    alpha = min(1.0, p * 1.7)
+    let angle = (1.0 - p) * (.pi / 5.0)  // rotate 36° -> 0° as it locks in
+    let scale = 0.2 + (0.8 * p)  // grows from tiny to full
+    transform = CGAffineTransform(rotationAngle: -angle).scaledBy(x: scale, y: scale)
+  }
+
+  func pop() {
+    guard !didPop else { return }
+    didPop = true
+    alpha = 1.0
+
+    // 1) Springy bounce — low damping for a lively overshoot.
+    UIView.animate(
+      withDuration: 0.55, delay: 0.0, usingSpringWithDamping: 0.42,
+      initialSpringVelocity: 0.9, options: [.allowUserInteraction, .beginFromCurrentState],
+      animations: { self.transform = CGAffineTransform(scaleX: 1.18, y: 1.18) },
+      completion: nil)
+
+    // 2) Burst ring — expands beyond the disc and fades out.
+    let ringScale = CABasicAnimation(keyPath: "transform.scale")
+    ringScale.fromValue = 0.85
+    ringScale.toValue = 2.0
+    let ringFade = CABasicAnimation(keyPath: "opacity")
+    ringFade.fromValue = 0.9
+    ringFade.toValue = 0.0
+    let ringGroup = CAAnimationGroup()
+    ringGroup.animations = [ringScale, ringFade]
+    ringGroup.duration = 0.45
+    ringGroup.timingFunction = CAMediaTimingFunction(name: .easeOut)
+    ringGroup.isRemovedOnCompletion = true
+    ringLayer.add(ringGroup, forKey: "ringBurst")
+
+    // 3) Glint shimmer — a highlight sweeps diagonally across the disc once.
+    shimmerHost.isHidden = false
+    let sweep = CABasicAnimation(keyPath: "position.x")
+    sweep.fromValue = -Self.diameter / 2.0
+    sweep.toValue = Self.diameter * 1.5
+    sweep.duration = 0.5
+    sweep.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+    sweep.isRemovedOnCompletion = true
+    shimmerLayer.add(sweep, forKey: "shimmerSweep")
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.52) { [weak self] in
+      self?.shimmerHost.isHidden = true
+    }
+  }
+}
 
 private func isKeyboardHostWindow(_ window: UIWindow) -> Bool {
   let typeName = String(describing: type(of: window))
@@ -77,6 +206,13 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
     // Start observing keyboard windows as early as possible so first open is stable.
     _ = ChatKeyboardWindowObserver.shared
 
+    // A UIScrollView runs an implicit ~150ms timer before it delivers touches to
+    // its content / lets other recognizers proceed (WWDC "Advanced Scrollviews
+    // and Touch Handling"). That delay is what made the swipe-reply bubble lag
+    // behind the finger. Disabling it lets our pan track from the first pixel.
+    collectionView.delaysContentTouches = false
+    collectionView.canCancelContentTouches = true
+
     let tap = UITapGestureRecognizer(
       target: self, action: #selector(handleDismissInputTap(_:)))
     tap.delegate = self
@@ -100,6 +236,13 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
     // Telegram-like cadence: fast enough for real-time feel without accidental triggers.
     longPress.minimumPressDuration = 0.24
     longPress.allowableMovement = 10.0
+    // The hold detector must never hold up touch delivery to the swipe pan: a
+    // swipe (movement) and a hold (stationary) are two independent detections.
+    // Without these, the long-press can swallow the first touches and the swipe
+    // only starts tracking after the hold gives up — felt as lag.
+    longPress.delaysTouchesBegan = false
+    longPress.delaysTouchesEnded = false
+    longPress.cancelsTouchesInView = false
     // Prevent a long-press from also being treated as a tap that dismisses keyboard.
     tap.require(toFail: longPress)
     collectionView.addGestureRecognizer(longPress)
@@ -133,18 +276,17 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
 
     let translation = pan.translation(in: collectionView)
     let velocity = pan.velocity(in: collectionView)
-    let translationHorizontal = abs(translation.x)
     let translationVertical = abs(translation.y)
 
-    // Translation is usually a better early signal for intent than velocity.
-    // Keep this permissive so the bubble starts tracking finger immediately.
-    if translationHorizontal > 2.0 || translationVertical > 2.0 {
-      return translationHorizontal > translationVertical * 0.9
+    // Reply swipe is LEFTWARD only. Begin the moment a leftward, mostly-
+    // horizontal drag is detected; reject rightward/vertical drags so the scroll
+    // view keeps handling them.
+    if translation.x < -2.0 || translationVertical > 2.0 {
+      return -translation.x > translationVertical * 0.9
     }
 
-    let velocityHorizontal = abs(velocity.x)
     let velocityVertical = abs(velocity.y)
-    return velocityHorizontal > 8.0 && velocityHorizontal > velocityVertical * 0.9
+    return velocity.x < -8.0 && -velocity.x > velocityVertical * 0.9
   }
 
   public func gestureRecognizer(
@@ -207,6 +349,32 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
     swipeReplyIndexPath = indexPath
     swipeReplyMessageId = messageId
     swipeReplyIsMe = row.isMe
+
+    // Freeze the list for the duration of the reply drag. Without this the scroll
+    // view keeps panning/laying out simultaneously and each layout pass fights the
+    // cell's transform — which is what made the bubble trail behind the finger.
+    // With scrolling off, the transform we set in .changed is the only thing
+    // moving the bubble, so it pins to the finger 1:1.
+    collectionView.isScrollEnabled = false
+
+    // Rasterize the cell into a bitmap while it's dragged. The bubble background
+    // is a live UIVisualEffectView blur; without this it re-samples the wallpaper
+    // every frame as it moves, which reads as shimmer/flicker. Caching it as a
+    // bitmap (at screen scale, so text stays crisp) makes the slide buttery and
+    // solid like Telegram. Cleared again in resetSwipeReplyTransform.
+    if let cell = collectionView.cellForItem(at: indexPath) {
+      cell.layer.rasterizationScale = window?.screen.scale ?? UIScreen.main.scale
+      cell.layer.shouldRasterize = true
+    }
+
+    // Build the reply indicator that tracks the drag (Telegram-style). Add it
+    // INSIDE the collection view at index 0 — behind the cells but above the
+    // wallpaper — so the bubble slides over it to reveal it on the right edge
+    // (true "behind" effect) while still being guaranteed visible.
+    let icon = ChatSwipeReplyIconView()
+    icon.applyTheme(isDark: resolvedAppearance().isDark)
+    collectionView.insertSubview(icon, at: 0)
+    swipeReplyIconView = icon
   }
 
   private func updateSwipeReply(translation: CGPoint) {
@@ -214,23 +382,46 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
       return
     }
 
-    let horizontal = translation.x
-    let clamped = max(0.0, min(swipeReplyMaxOffset, abs(horizontal)))
-    let direction: CGFloat = horizontal < 0.0 ? -1.0 : 1.0
-    let signedOffset = clamped * direction
+    guard let cell = collectionView.cellForItem(at: indexPath) else { return }
 
-    if let cell = collectionView.cellForItem(at: indexPath) {
-      cell.contentView.transform = CGAffineTransform(translationX: signedOffset, y: 0.0)
+    // Reply swipe is LEFTWARD only. Ignore rightward drags entirely.
+    let distance = max(0.0, -translation.x)
+    // Rubber-band past the max so the pull feels elastic instead of hitting a wall.
+    let visualDistance: CGFloat
+    if distance <= swipeReplyMaxOffset {
+      visualDistance = distance
+    } else {
+      visualDistance = swipeReplyMaxOffset + (distance - swipeReplyMaxOffset) * 0.18
     }
 
-    guard clamped >= swipeReplyTrigger,
+    // Set the transform directly (no per-frame CATransaction). A UIView transform
+    // doesn't implicitly animate outside an animation block, and the extra commit
+    // was adding a redundant render pass that read as flicker.
+    cell.transform = CGAffineTransform(translationX: -visualDistance, y: 0.0)
+
+    // Drive the reply indicator (subview of the collection view → content coords).
+    // Emerge it from the right edge tracking the gap the bubble opens, so a sliver
+    // shows from the very first movement and it settles at its rest spot. Pinning
+    // it at a fixed far-right x kept it hidden behind the bubble until the end.
+    if let icon = swipeReplyIconView {
+      let rightEdge = collectionView.bounds.width
+      let restX = rightEdge - 30.0
+      let emergeX = rightEdge - (visualDistance * 0.7)
+      icon.center = CGPoint(x: max(restX, emergeX), y: cell.frame.midY)
+      icon.apply(progress: distance / swipeReplyTrigger)
+    }
+
+    guard distance >= swipeReplyTrigger,
       !swipeReplyDidTrigger,
       let messageId = swipeReplyMessageId
     else {
       return
     }
     swipeReplyDidTrigger = true
-    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    swipeReplyIconView?.pop()
+    // Harder feedback when the reply locks in: heavy haptic + an audible tick.
+    UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+    AudioServicesPlaySystemSound(1104)
     onNativeEvent([
       "type": "swipeReply",
       "messageId": messageId,
@@ -249,20 +440,34 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
   }
 
   private func resetSwipeReplyTransform(animated: Bool) {
-    guard let indexPath = swipeReplyIndexPath,
-      let cell = collectionView.cellForItem(at: indexPath)
-    else {
-      return
-    }
+    let icon = swipeReplyIconView
+    swipeReplyIconView = nil
+    let cell = swipeReplyIndexPath.flatMap { collectionView.cellForItem(at: $0) }
+    guard cell != nil || icon != nil else { return }
+
     let apply = {
-      cell.contentView.transform = .identity
+      cell?.transform = .identity
+      cell?.contentView.transform = .identity
+      icon?.alpha = 0.0
+      icon?.transform = CGAffineTransform(scaleX: 0.4, y: 0.4)
     }
     if animated {
+      // Snappy spring return instead of a slow ease-out, so the bubble settles
+      // with a lively feel rather than appearing laggy. Keep the cell rasterized
+      // through the return so the blur stays smooth, then clear it on completion.
       UIView.animate(
-        withDuration: 0.22, delay: 0.0, options: [.curveEaseOut, .beginFromCurrentState],
-        animations: apply)
+        withDuration: 0.34, delay: 0.0, usingSpringWithDamping: 0.72,
+        initialSpringVelocity: 0.5,
+        options: [.allowUserInteraction, .beginFromCurrentState],
+        animations: apply,
+        completion: { _ in
+          cell?.layer.shouldRasterize = false
+          icon?.removeFromSuperview()
+        })
     } else {
       apply()
+      cell?.layer.shouldRasterize = false
+      icon?.removeFromSuperview()
     }
   }
 
@@ -271,6 +476,12 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
     swipeReplyMessageId = nil
     swipeReplyIsMe = false
     swipeReplyDidTrigger = false
+    // Safety: if any path cleared state without going through the reset, make sure
+    // the indicator never lingers on screen.
+    swipeReplyIconView?.removeFromSuperview()
+    swipeReplyIconView = nil
+    // Always restore scrolling — this is the single exit point for every swipe path.
+    collectionView.isScrollEnabled = true
   }
 
   private func openContextMenu(at point: CGPoint) {
@@ -283,7 +494,15 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
     let row = rows[indexPath.item]
     guard row.kind == .message, let messageId = row.messageId else { return }
     let isMe = row.isMe
-    let showResendAction = row.isMe && (row.status?.lowercased() == "error")
+    let showResendAction =
+      row.isMe && (row.status?.lowercased() == "error" || row.isDeliveryFailed)
+    // Regenerate is only offered on errored responses (matches the side button).
+    let showRegenerateAction =
+      row.isAgentMessage
+      && row.isAgentError
+      && !row.isStreamingText
+      && (row.agentActionSourceId?.isEmpty == false)
+      && (row.agentRegeneratePrompt?.isEmpty == false)
 
     holdDebugLog(
       "openContextMenu begin mid=\(messageId) cellTransform=\(NSCoder.string(for: cell.transform)) contentTransform=\(NSCoder.string(for: cell.contentView.transform))"
@@ -316,7 +535,8 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
       bubbleFrame: bubbleFrameInHost,
       bubbleIsMe: isMe,
       appearance: self.resolvedAppearance(),
-      showResendAction: showResendAction
+      showResendAction: showResendAction,
+      showRegenerateAction: showRegenerateAction
     )
     overlay.delegate = self
 
@@ -487,9 +707,8 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
     let mid = overlay.messageId
 
     if actionId == "select" {
-      overlay.animateOut(reason: "action:\(actionId)") { [weak self] in
-        self?.beginMessageSelection(messageId: mid)
-      }
+      self.beginMessageSelection(messageId: mid)
+      overlay.animateOut(reason: "action:\(actionId)", completion: nil)
       return
     }
 
@@ -505,9 +724,20 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
       if actionId == "reply" {
         inputBar?.showReplyBanner(messageId: mid, text: row.text, isMe: row.isMe)
       } else if actionId == "copy" {
-        UIPasteboard.general.string = row.text
+        UIPasteboard.general.string = row.plainContent ?? row.text
       } else if actionId == "resend" {
         retryOutgoingMessage(row: row, source: "context_menu")
+      } else if actionId == "regenerate" {
+        let sourceMessageId = row.agentActionSourceId ?? ""
+        if !sourceMessageId.isEmpty {
+          onNativeEvent([
+            "type": "agentMessageAction",
+            "action": "regenerate",
+            "sourceMessageId": sourceMessageId,
+            "sourceText": row.agentActionSourceText ?? row.plainContent ?? row.text,
+            "regeneratePrompt": row.agentRegeneratePrompt ?? "",
+          ])
+        }
       }
     }
   }

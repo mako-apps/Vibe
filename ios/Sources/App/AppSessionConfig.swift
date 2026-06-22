@@ -93,7 +93,7 @@ struct AppSessionConfig {
     socketURLString: String?,
     userID: String,
     authToken: String,
-    transportMode: PacketTransportMode = .packetMesh,
+    transportMode: PacketTransportMode = .direct,
     username: String? = nil,
     name: String? = nil,
     secureID: String? = nil,

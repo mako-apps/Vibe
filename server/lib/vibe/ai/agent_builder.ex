@@ -1862,13 +1862,48 @@ defmodule Vibe.AI.AgentBuilder do
   defp emit_builder_ui(_callback, _result), do: :ok
 
   defp builder_tool_model_result(result) when is_map(result) do
-    result
-    |> Map.delete("_ui_cards")
-    |> Map.delete("_ui_group_id")
-    |> sanitize_builder_payload()
+    cards = Map.get(result, "_ui_cards")
+
+    if is_list(cards) and cards != [] do
+      agent =
+        result
+        |> Map.get("agent", %{})
+        |> compact_agent_model_context()
+
+      %{
+        "ok" => Map.get(result, "ok", true),
+        "message" =>
+          Map.get(result, "message") ||
+            "The agent details and integration pack are available in the interactive card.",
+        "agent" => agent,
+        "ui_card_rendered" => true,
+        "response_instruction" =>
+          "Reply with one short confirmation. Do not repeat IDs, URLs, secrets, env vars, or endpoint lists in chat."
+      }
+      |> sanitize_builder_payload()
+    else
+      result
+      |> Map.delete("_ui_cards")
+      |> Map.delete("_ui_group_id")
+      |> sanitize_builder_payload()
+    end
   end
 
   defp builder_tool_model_result(result), do: result
+
+  defp compact_agent_model_context(%{} = context) do
+    payload = Map.get(context, "agent", context)
+
+    %{
+      "display_name" => payload[:displayName] || payload["displayName"] || payload["display_name"],
+      "username" => payload[:username] || payload["username"],
+      "status" => payload[:status] || payload["status"]
+    }
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+  end
+
+  defp compact_agent_model_context(_context), do: %{}
 
   defp sanitize_builder_payload(%DateTime{} = value), do: DateTime.to_iso8601(value)
   defp sanitize_builder_payload(%NaiveDateTime{} = value), do: NaiveDateTime.to_iso8601(value)
@@ -1926,8 +1961,10 @@ defmodule Vibe.AI.AgentBuilder do
       "id" => "agent-card:#{payload.id}:#{style}",
       "style" => style,
       "agent_id" => payload.id,
+      "agent_user_id" => payload.userId,
       "display_name" => payload.displayName || "Agent",
       "username" => payload.username,
+      "handle" => if(payload.username, do: "@#{payload.username}", else: nil),
       "identifier" => payload.username || payload.id,
       "status" => payload.status,
       "prompt_status" => prompt_status_line(agent),

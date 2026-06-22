@@ -364,6 +364,10 @@ final class ChatEngine {
   }
 
   private let queue = DispatchQueue(label: "vibe.chat.engine")
+  // Dedicated low-priority queue for the main-thread-hang watchdog timer so it
+  // can fire even while the main thread (and engine queue) are blocked.
+  private static let syncWatchdogQueue = DispatchQueue(
+    label: "vibe.chat.engine.sync-watchdog", qos: .utility)
   private let queueSpecificKey = DispatchSpecificKey<UInt8>()
   private let queueSpecificValue: UInt8 = 1
   private let store = ChatEngineStore.shared
@@ -850,7 +854,17 @@ final class ChatEngine {
     guard let chatId = normalizedString(rawChatId), !chatId.isEmpty else {
       return true
     }
-    return chatId != "saved_messages"
+    return chatId != "saved_messages" && !isBuiltInAgentChatId(chatId)
+  }
+
+  private func isBuiltInAgentChatId(_ rawChatId: String?) -> Bool {
+    guard let chatId = normalizedString(rawChatId)?.lowercased() else { return false }
+    switch chatId {
+    case "vibe_agent", "vibeagent", "vibe-ai", "vibe_ai":
+      return true
+    default:
+      return false
+    }
   }
 
   private func hasRealtimeDemandLocked() -> Bool {
@@ -1181,6 +1195,24 @@ final class ChatEngine {
   func openChatChannel(_ payload: [String: Any]) -> [String: Any] {
     let chatId = normalizedString(payload["chatId"]) ?? normalizedString(payload["chat_id"])
     let peerUserIdHint = normalizedUpper(payload["peerUserId"] ?? payload["peer_user_id"])
+    if isBuiltInAgentChatId(chatId) {
+      return syncOnQueue {
+        if let chatId {
+          openChatChannels.removeValue(forKey: chatId)
+          nativeJoinedChatIds.remove(chatId)
+          historyLoadingChats.remove(chatId)
+          appendJournalLocked(
+            event: "open-chat-channel-skip",
+            payload: ["chatId": chatId, "reason": "built_in_agent_surface"]
+          )
+          NSLog(
+            "[ChatEngine][Route] skip normal chat channel for built-in agent chatId=%@",
+            chatId
+          )
+        }
+        return statusSnapshotLocked()
+      }
+    }
     let snapshot = syncOnQueue {
       if let chatId, !chatId.isEmpty {
         if let peerUserIdHint {
@@ -1246,6 +1278,13 @@ final class ChatEngine {
       guard let self else { return }
       for rawChatId in chatIds {
         guard let chatId = self.normalizedString(rawChatId), !chatId.isEmpty else { continue }
+        guard !self.isBuiltInAgentChatId(chatId) else {
+          self.appendJournalLocked(
+            event: "native-chat-history-skip",
+            payload: ["chatId": chatId, "reason": "built_in_agent_surface"]
+          )
+          continue
+        }
         self.loadChatHistoryIfNeededLocked(chatId: chatId)
       }
     }
@@ -1257,6 +1296,7 @@ final class ChatEngine {
     queue.async { [weak self] in
       guard let self else { return }
       guard let chatId = self.normalizedString(rawChatId), !chatId.isEmpty else { return }
+      guard !self.isBuiltInAgentChatId(chatId) else { return }
       _ = self.restoreCachedHistoryRowsLocked(chatId: chatId)
       guard !messages.isEmpty, !self.historyFullyLoadedChats.contains(chatId) else { return }
 
@@ -1635,13 +1675,20 @@ final class ChatEngine {
       guard !resolvedChatId.isEmpty else {
         return ["accepted": false, "reason": "invalid_chat", "messageId": messageId]
       }
+      // Canceling a media send is a full clean-up: abort the in-flight upload,
+      // drop the queued draft, and remove the optimistic bubble entirely (the
+      // message was never delivered). Inserting into canceledOutboundMessageIds
+      // makes a racing upload completion bail instead of resurrecting the row,
+      // and markLiveMessageDeletedLocked records the deletion so a later history
+      // merge cannot bring the canceled message back.
       let activeUploadTask = activeMediaUploadTasksByMessageId.removeValue(forKey: messageId)
       let hadActiveUpload = activeUploadTask != nil
       activeUploadTask?.cancel()
       canceledOutboundMessageIds.insert(messageId)
       removeQueuedOutboundDraftLocked(chatId: resolvedChatId, messageId: messageId, dropDraft: true)
       setLiveMessageUploadProgressLocked(chatId: resolvedChatId, messageId: messageId, progress: nil)
-      upsertLocalStatusLocked(chatId: resolvedChatId, messageId: messageId, status: "error")
+      removeMessageIndicesLocked(chatId: resolvedChatId, messageId: messageId)
+      markLiveMessageDeletedLocked(chatId: resolvedChatId, messageId: messageId)
       appendJournalLocked(
         event: "native-outgoing-cancel",
         payload: [
@@ -1658,22 +1705,14 @@ final class ChatEngine {
           "state": snapshot,
         ])
       postChangeLocked(
-        reason: "chatMessageChanged",
+        reason: "chatMessageDeleted",
         userInfo: [
           "chatId": resolvedChatId,
           "messageId": messageId,
-          "action": "updated",
+          "action": "deleted",
           "state": snapshot,
         ])
-      postChangeLocked(
-        reason: "messageStatusChanged",
-        userInfo: [
-          "chatId": resolvedChatId,
-          "messageId": messageId,
-          "status": "error",
-          "state": snapshot,
-        ])
-      return ["accepted": true, "messageId": messageId, "state": "canceled"]
+      return ["accepted": true, "messageId": messageId, "state": "removed"]
     }
   }
 
@@ -2099,6 +2138,11 @@ final class ChatEngine {
                 self.queueOutboundDraftLocked(
                   chatId: chatId, messageId: messageId, payload: localEffectivePayload,
                   reason: reason)
+              } else {
+                // Non-retryable failure: keep the draft (without auto-replay) so a
+                // manual Retry can re-attempt the send instead of bailing with
+                // missing_draft.
+                self.pendingOutboundDraftsByMessageId[messageId] = localEffectivePayload
               }
               self.canceledOutboundMessageIds.remove(messageId)
             }
@@ -5445,6 +5489,12 @@ final class ChatEngine {
       normalizedString(payload["plainContent"] ?? payload["plain_content"] ?? payload["plaintext"])
     let agentName = normalizedString(payload["agentName"] ?? payload["agent_name"])
     let agentId = normalizedString(payload["agentId"] ?? payload["agent_id"])
+    let agentUserId =
+      normalizedString(payload["agentUserId"] ?? payload["agent_user_id"])
+      ?? (isAgentMessage ? fromId : nil)
+    let agentUsername = normalizedString(
+      payload["agentUsername"] ?? payload["agent_username"]
+        ?? payload["agentHandle"] ?? payload["agent_handle"])
 
     let hadEncryptedContent = encryptedContent != nil && !encryptedContent!.isEmpty
     let decryptedText: String = {
@@ -5500,6 +5550,11 @@ final class ChatEngine {
       message["isMe"] = false
       if let agentName { message["agentName"] = agentName }
       if let agentId { message["agentId"] = agentId }
+      if let agentUserId { message["agentUserId"] = agentUserId }
+      if let agentUsername {
+        message["agentUsername"] = agentUsername.trimmingCharacters(
+          in: CharacterSet(charactersIn: "@"))
+      }
       if let plainContent { message["plainContent"] = plainContent }
       // Use plainContent as the display text for agent messages
       if let plainContent, !plainContent.isEmpty { message["text"] = plainContent }
@@ -5988,6 +6043,10 @@ final class ChatEngine {
 
   private func joinNativeChatTopicIfNeededLocked(chatId: String) {
     guard !chatId.isEmpty else { return }
+    guard !isBuiltInAgentChatId(chatId) else {
+      NSLog("[ChatEngine][Route] skip realtime join for built-in agent chatId=%@", chatId)
+      return
+    }
     guard chatId != "saved_messages" else {
       NSLog("[ChatEngine][Route] skip realtime join for saved_messages")
       return
@@ -6699,6 +6758,19 @@ final class ChatEngine {
 
   private func loadChatHistoryIfNeededLocked(chatId: String, force: Bool = false) {
     guard !chatId.isEmpty else { return }
+    guard !isBuiltInAgentChatId(chatId) else {
+      historyLoadingChats.remove(chatId)
+      historyRowsByChat.removeValue(forKey: chatId)
+      historyFullyLoadedChats.remove(chatId)
+      historyRowsRestoredFromCacheChats.remove(chatId)
+      clearCachedHistoryRowsLocked(chatId: chatId)
+      appendJournalLocked(
+        event: "native-chat-history-skip",
+        payload: ["chatId": chatId, "reason": "built_in_agent_surface"]
+      )
+      NSLog("[ChatEngine] loadChatHistory SKIP chatId=%@ reason=built_in_agent_surface", chatId)
+      return
+    }
     if historyLoadingChats.contains(chatId) { return }
     if !force, historyFullyLoadedChats.contains(chatId),
       !historyRowsRestoredFromCacheChats.contains(chatId)
@@ -7069,6 +7141,19 @@ final class ChatEngine {
         if let agentId = normalizedString(raw["agentId"] ?? raw["agent_id"]) {
           message["agentId"] = agentId
         }
+        if let agentUserId =
+          normalizedString(raw["agentUserId"] ?? raw["agent_user_id"])
+          ?? fromId
+        {
+          message["agentUserId"] = agentUserId
+        }
+        if let username = normalizedString(
+          raw["agentUsername"] ?? raw["agent_username"]
+            ?? raw["agentHandle"] ?? raw["agent_handle"])
+        {
+          message["agentUsername"] = username.trimmingCharacters(
+            in: CharacterSet(charactersIn: "@"))
+        }
         if let name = normalizedString(raw["agentName"] ?? raw["agent_name"]) {
           message["agentName"] = name
         }
@@ -7155,19 +7240,44 @@ final class ChatEngine {
     Int(Date().timeIntervalSince1970 * 1000)
   }
 
-  private func syncOnQueue<T>(_ work: () -> T) -> T {
+  private func syncOnQueue<T>(
+    _ work: () -> T,
+    function: StaticString = #function,
+    file: StaticString = #fileID,
+    line: UInt = #line
+  ) -> T {
     if DispatchQueue.getSpecific(key: queueSpecificKey) == queueSpecificValue {
       return work()
     }
-    let isMain = Thread.isMainThread
-    let start = isMain ? CFAbsoluteTimeGetCurrent() : 0
+    guard Thread.isMainThread else {
+      return queue.sync(execute: work)
+    }
+
+    // Main-thread read of the engine queue. If the queue is busy/blocked this
+    // call freezes the UI for the full duration — and queue.sync only returns
+    // once it unblocks, so a "log after the fact" never fires during a true
+    // hang. Arm a background watchdog that reports WHILE we are still blocked,
+    // identifying the exact main-thread call site so the offender is findable
+    // from device logs even when the app never recovers.
+    let start = CFAbsoluteTimeGetCurrent()
+    let callSite = "\(function) (\(file):\(line))"
+    let watchdog = DispatchSource.makeTimerSource(queue: ChatEngine.syncWatchdogQueue)
+    watchdog.schedule(deadline: .now() + 0.75, repeating: 1.0)
+    watchdog.setEventHandler {
+      let blockedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+      NSLog(
+        "[ChatEngine][MAIN-THREAD-HANG] main thread blocked %dms in syncOnQueue at %@",
+        blockedMs, callSite)
+    }
+    watchdog.resume()
     let result = queue.sync(execute: work)
-    if isMain {
-      let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
-      if elapsedMs > 50 {
-        let symbols = Thread.callStackSymbols.prefix(8).joined(separator: "\n")
-        NSLog("[ChatEngine][MAIN-THREAD-SYNC-STALL] syncOnQueue blocked main thread for %dms\n%@", elapsedMs, symbols)
-      }
+    watchdog.cancel()
+
+    let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+    if elapsedMs > 50 {
+      NSLog(
+        "[ChatEngine][MAIN-THREAD-SYNC-STALL] syncOnQueue blocked main thread for %dms at %@",
+        elapsedMs, callSite)
     }
     return result
   }

@@ -2,7 +2,7 @@ import Foundation
 
 enum ChatHomeService {
   static func cachedRows(config: AppSessionConfig) -> [ChatHomeListRow] {
-    ChatHomeRowsCache.rows(userID: config.userID)
+    rowsIncludingBuiltInAgent(ChatHomeRowsCache.rows(userID: config.userID))
   }
 
   static func isOfflineError(_ error: Error) -> Bool {
@@ -110,8 +110,50 @@ enum ChatHomeService {
     } else {
       combinedRows = filteredRows
     }
-    ChatHomeRowsCache.store(combinedRows, userID: config.userID)
-    return combinedRows
+    let rowsWithAgent = rowsIncludingBuiltInAgent(combinedRows)
+    ChatHomeRowsCache.store(rowsWithAgent, userID: config.userID)
+    return rowsWithAgent
+  }
+
+  static func rowsIncludingBuiltInAgent(_ rows: [ChatHomeListRow]) -> [ChatHomeListRow] {
+    var filteredRows = rows.filter { !$0.isBuiltInAgentSurface }
+    let insertionIndex = filteredRows.first?.isSavedMessages == true ? 1 : 0
+    filteredRows.insert(builtInAgentRow(), at: min(insertionIndex, filteredRows.count))
+    return filteredRows
+  }
+
+  private static func builtInAgentRow() -> ChatHomeListRow {
+    let summary = ChatNativeAgentView.homeListSummary()
+    let timeLabel = summary.map {
+      ChatHomeListRow.homeTimeLabel(from: ["timestamp": NSNumber(value: $0.timestampMs)])
+    } ?? ""
+    return ChatHomeListRow(
+      chatId: "vibe",
+      title: "Vibe AI",
+      preview: summary?.preview ?? "Ask Vibe AI anything",
+      timeLabel: timeLabel,
+      unreadCount: 0,
+      markedUnread: false,
+      muted: false,
+      pinned: false,
+      isTyping: summary?.preview == "Thinking…",
+      isOnline: true,
+      peerUserId: nil,
+      avatarUri: nil,
+      avatarFallback: "V",
+      avatarGradientStartLight: "#2F9AA8",
+      avatarGradientEndLight: "#207585",
+      avatarGradientStartDark: "#4BB6C4",
+      avatarGradientEndDark: "#1B6575",
+      isSavedMessages: false,
+      type: "vibe_agent",
+      isGroup: false,
+      isAgentFriend: true,
+      peerAgentId: nil,
+      agentEventInboxMode: nil,
+      previewRows: [],
+      initialMessages: []
+    )
   }
 
   private static func perform(_ request: URLRequest, session: URLSession) async throws -> [ChatHomeListRow] {
@@ -168,6 +210,9 @@ enum ChatHomeService {
         isSavedMessages: true,
         type: "saved_messages",
         isGroup: false,
+        isAgentFriend: false,
+        peerAgentId: nil,
+        agentEventInboxMode: nil,
         previewRows: [],
         initialMessages: ChatHomeListRow.parseServerMessages(messages)
       )

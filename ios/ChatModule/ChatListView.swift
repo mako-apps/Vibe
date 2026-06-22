@@ -1,3 +1,4 @@
+import SwiftUI
 import AVFoundation
 import AVKit
 import OSLog
@@ -412,7 +413,7 @@ private final class ChatNativeMusicPlayerBar: UIView {
     artworkView.image = snapshot.artwork
     artworkPlaceholderView.isHidden = snapshot.artwork != nil
     titleLabel.text = snapshot.title ?? "Audio"
-    
+
     let newSubtitle: String
     if snapshot.isDownloading {
       let percent = Int(round(Double(snapshot.downloadProgress ?? 0.0) * 100.0))
@@ -443,7 +444,7 @@ private final class ChatNativeMusicPlayerBar: UIView {
         level: snapshot.isPlaying ? 0.22 : 0.0
       )
     }
-    
+
     if bounds.width > 0 {
       let progressWidth = max(0.0, closeButton.frame.minX - 10.0 - titleLabel.frame.minX)
       progressFillView.frame.size.width = progressWidth * max(0.0, min(1.0, snapshot.progress))
@@ -539,6 +540,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private let wallpaperLayer = CAGradientLayer()
   private let wallpaperPatternLayer = CAGradientLayer()
   private let wallpaperPatternMaskLayer = CALayer()
+  private let wallpaperContainerView = UIView()
   private let scrollToneOverlay = UIView()
   private let scrollToneTopView = ChatWallpaperEdgeEffectView(edge: .top)
   private let scrollToneBottomView = ChatWallpaperEdgeEffectView(edge: .bottom)
@@ -556,11 +558,26 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var requestedContentPaddingBottom: CGFloat = sectionBottomInset
   private var contentPaddingBottom: CGFloat = sectionBottomInset
   private var isApplyingRowsUpdate = false
+  private var pendingStreamingTextLayoutInvalidation = false
   private var _setRowsGeneration: UInt = 0
   private var pendingRowsPayload: [[String: Any]]?
   private var sourceRowsPayload: [[String: Any]] = []
   private var searchQuery = ""
   private var nativeSendEnabled = false
+  private var agentChatMode = false
+  // When the user taps "!" on a failed agent message, its id is armed here so the
+  // next composer send re-uses it (triggering a clean truncate-and-resend).
+  private var editingAgentMessageId: String?
+  private var agentStreaming = false
+  /// Set when an agent message is sent so the next rows-apply scrolls the new
+  /// user message to the top (with a bottom spacer) to leave room for the answer.
+  private var pendingAgentPushToTop = false
+  private var agentPushToTopSpacer: CGFloat = 0
+  /// Latches true the moment the user manually drags during an agent turn. While
+  /// latched we stop re-pinning the question to the top so the user can scroll
+  /// freely (ChatGPT-style: pinned until you scroll, then free until next send).
+  /// Reset on each send.
+  private var agentPinUserDetached = false
   private var engineSurfaceId: String = ""
   private var engineChatId: String = ""
   private var engineMyUserId: String = ""
@@ -570,6 +587,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var engineOpenedChatId: String = ""
   private var engineChannelBindingEnabled = true
   private var statusAuthorityEnabled = false
+
+  // Agent inbox mode. When enabled, agent event-notification rows (eventThread /
+  // eventInboxSummary) are pulled out of the transcript and reported to the host
+  // (ChatMainView) so they can be surfaced via the Inbox banner instead.
+  private var eventInboxModeEnabled = false
+  /// Notification rows filtered out of the transcript, newest last (transcript order).
+  private(set) var eventInboxRows: [ChatListRow] = []
+  /// Reports the current inbox state (count + newest preview text) to the host.
+  var onEventInboxChanged: ((_ count: Int, _ latestPreview: String?) -> Void)?
   private var nativeHistoryHydrationGeneration: UInt = 0
   private var nativeOutgoingRowsById: [String: [String: Any]] = [:]
   private var nativeOutgoingOrder: [String] = []
@@ -617,6 +643,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   var swipeReplyMessageId: String?
   var swipeReplyIsMe: Bool = false
   var swipeReplyDidTrigger = false
+  var swipeReplyIconView: ChatSwipeReplyIconView?
   weak var contextMenuHostCell: UICollectionViewCell?
   var contextMenuHostCellOriginalTransform: CGAffineTransform = .identity
   var customContextMenuOverlay: ChatContextMenuOverlay?
@@ -689,8 +716,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     wallpaperPatternLayer.mask = wallpaperPatternMaskLayer
     wallpaperPatternMaskLayer.contentsGravity = .resizeAspectFill
     wallpaperPatternMaskLayer.contentsScale = UIScreen.main.scale
-    layer.insertSublayer(wallpaperLayer, at: 0)
-    layer.insertSublayer(wallpaperPatternLayer, above: wallpaperLayer)
+    wallpaperContainerView.isUserInteractionEnabled = false
+    wallpaperContainerView.layer.addSublayer(wallpaperLayer)
+    wallpaperContainerView.layer.addSublayer(wallpaperPatternLayer)
+    collectionView.addSubview(wallpaperContainerView)
 
     addSubview(collectionView)
     collectionView.translatesAutoresizingMaskIntoConstraints = false
@@ -705,7 +734,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     collectionView.clipsToBounds = false
     collectionView.alwaysBounceVertical = true
     collectionView.showsVerticalScrollIndicator = false
-    collectionView.contentInsetAdjustmentBehavior = .never
+
+    if #available(iOS 11.0, *) {
+      collectionView.contentInsetAdjustmentBehavior = .never
+    }
+
     if #available(iOS 26.0, *) {
       collectionView.topEdgeEffect.style = .soft
       collectionView.bottomEdgeEffect.style = .soft
@@ -721,9 +754,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     scrollToneOverlay.clipsToBounds = true
     scrollToneOverlay.addSubview(scrollToneTopView)
     scrollToneOverlay.addSubview(scrollToneBottomView)
-    if #available(iOS 26.0, *) {
-      scrollToneOverlay.isHidden = true
-    }
     addSubview(scrollToneOverlay)
 
     applyWallpaperAppearance()
@@ -780,6 +810,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       name: Notification.Name("AgentCodeBlockExpanded"),
       object: nil
     )
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleAgentStreamingTextLayoutInvalidated(_:)),
+      name: .chatNativeStreamingTextLayoutInvalidated,
+      object: nil
+    )
 
   }
 
@@ -820,12 +856,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private func positionTransitionOverlayHost() {
     guard transitionOverlayHost.superview === self else { return }
     transitionOverlayHost.frame = bounds
-    if let inputBar, inputBar.superview === self {
-      insertSubview(transitionOverlayHost, belowSubview: inputBar)
-      bringSubviewToFront(inputBar)
-    } else {
-      bringSubviewToFront(transitionOverlayHost)
-    }
+    // Keep the send-transition overlay ABOVE the input bar so the morphing /
+    // newly-sent bubble is never occluded behind the composer (it was rendering
+    // at a lower z-index than the input). The host is non-interactive and empty
+    // at rest, so this doesn't block the composer's controls.
+    bringSubviewToFront(transitionOverlayHost)
   }
 
   private func reactionDebugLog(_ message: String) {
@@ -860,6 +895,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     wallpaperLayer.frame = bounds
     wallpaperPatternLayer.frame = bounds
     wallpaperPatternMaskLayer.frame = wallpaperPatternLayer.bounds
+    var wallpaperFrame = bounds
+    wallpaperFrame.origin.y = collectionView.contentOffset.y
+    wallpaperContainerView.frame = wallpaperFrame
+    collectionView.sendSubviewToBack(wallpaperContainerView)
     scrollToneOverlay.frame = bounds
     refreshWallpaperSnapshotIfNeeded()
     updateScrollToneOverlay(offsetY: collectionView.contentOffset.y)
@@ -948,8 +987,37 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
     let mergedRows = mergedRowsPayload(from: nextRows)
     let visibleRows = filterRowsForSearch(mergedRows)
-    let parsed = visibleRows.compactMap(ChatListRow.init).filter { row in
+    let parsedAll = visibleRows.compactMap(ChatListRow.init).filter { row in
       row.messageType != "agent_progress"
+    }
+    // Inbox mode: split agent event notifications out of the transcript and
+    // report them to the host so they surface via the Inbox banner/view.
+    let parsed: [ChatListRow]
+    if eventInboxModeEnabled {
+      var transcript: [ChatListRow] = []
+      var inbox: [ChatListRow] = []
+      for row in parsedAll {
+        if row.kind == .message, row.isEventNotification {
+          inbox.append(row)
+        } else {
+          transcript.append(row)
+        }
+      }
+      eventInboxRows = inbox
+      parsed = transcript
+      let latestPreview = inbox.last.map { eventInboxPreviewText(for: $0) }
+      let count = inbox.count
+      DispatchQueue.main.async { [weak self] in
+        self?.onEventInboxChanged?(count, latestPreview)
+      }
+    } else {
+      if !eventInboxRows.isEmpty {
+        eventInboxRows = []
+        DispatchQueue.main.async { [weak self] in
+          self?.onEventInboxChanged?(0, nil)
+        }
+      }
+      parsed = parsedAll
     }
     if let targetMessageId = reactionDebugTargetMessageId, reactionDebugRemainingRowsChecks > 0 {
       reactionDebugRemainingRowsChecks -= 1
@@ -1048,7 +1116,24 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       chatListUITrace(
         "ChatListView setRows finalize chatId=\(traceChatId.isEmpty ? "<empty>" : String(traceChatId.prefix(12))) parsed=\(parsed.count) animated=\(animated ? "Y" : "N") wasNearBottom=\(wasNearBottom ? "Y" : "N") queued=\(self.pendingRowsPayload != nil ? "Y" : "N") durationMs=\(Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000)) contentH=\(Int(postInsetContentH)) offsetY=\(Int(postInsetOffset))"
       )
-      if shouldDeferPendingBottomScroll, let pendingPayload {
+      if self.agentChatMode, self.pendingAgentPushToTop {
+        self.pendingAgentPushToTop = false
+        self.performAgentPushToTop(animated: animated)
+      } else if self.agentChatMode, self.agentStreaming || self.agentPushToTopSpacer > 0 {
+        // Active (or just-finished) agent turn: only SHRINK the reserved room below
+        // the question (forceOffset:false) — never move the scroll offset here, and
+        // do nothing at all once the user has taken over scrolling. The question
+        // holds its place naturally because the answer grows below it. Staying on
+        // this branch for the whole turn also keeps the normal-chat near-bottom /
+        // scroll-to-bottom path from yanking content down.
+        NSLog(
+          "[AgentScroll] setRows finalize AGENT branch off:%.1f (atStart:%.1f d:%+.1f) contentH:%.1f insetB:%.1f detached:%@",
+          self.collectionView.contentOffset.y, previousContentOffsetY,
+          self.collectionView.contentOffset.y - previousContentOffsetY,
+          self.collectionView.contentSize.height, self.collectionView.contentInset.bottom,
+          self.agentPinUserDetached ? "Y" : "N")
+        self.applyAgentPin(forceOffset: false)
+      } else if shouldDeferPendingBottomScroll, let pendingPayload {
         self.deferredPendingSendBottomScrollMessageId = pendingPayload.messageId
         self.projectedSendTransitionMessageId = pendingPayload.messageId
         let maxOffset = max(
@@ -1782,6 +1867,24 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     updateChatEngineBinding()
   }
 
+  func setEventInboxModeEnabled(_ enabled: Bool) {
+    if eventInboxModeEnabled == enabled { return }
+    eventInboxModeEnabled = enabled
+    // Re-run the row pipeline so notifications are filtered (or restored) and the
+    // host banner is refreshed for the new mode.
+    setRows(sourceRowsPayload)
+  }
+
+  /// One-line preview for the Inbox banner: drops a leading markdown heading
+  /// marker and collapses whitespace so the banner shows the latest event text.
+  func eventInboxPreviewText(for row: ChatListRow) -> String {
+    let raw = row.text.trimmingCharacters(in: .whitespacesAndNewlines)
+    let firstLine = raw.split(whereSeparator: { $0 == "\n" || $0 == "\r" }).first.map(String.init) ?? raw
+    var line = firstLine.trimmingCharacters(in: .whitespaces)
+    while line.hasPrefix("#") { line.removeFirst() }
+    return line.trimmingCharacters(in: .whitespaces)
+  }
+
   func setEngineChannelBindingEnabled(_ enabled: Bool) {
     if engineChannelBindingEnabled == enabled { return }
     engineChannelBindingEnabled = enabled
@@ -1854,12 +1957,20 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   private func emitMessageSelectionChanged() {
+    inputBar?.setSelectionMode(selectionMode, animated: true)
     onNativeEvent([
       "type": "messageSelectionChanged",
       "active": selectionMode,
       "selectedCount": selectedMessageIds.count,
       "selectedMessageIds": Array(selectedMessageIds),
     ])
+  }
+
+  func clearMessageSelection() {
+    selectedMessageIds.removeAll()
+    selectionMode = false
+    refreshMessageSelectionLayout()
+    emitMessageSelectionChanged()
   }
 
   func setAppearance(_ rawAppearance: [String: Any]) {
@@ -2025,6 +2136,22 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   func scrollToBottom(animated: Bool) {
+    // During an agent push-to-top turn the question is pinned at the top and the
+    // answer grows into the reserved space below. Any "stick to bottom" auto-scroll
+    // here (there are several call sites: setRows finalize, streaming-text layout
+    // invalidation, resize/keyboard) fights that pin and makes the list impossible
+    // to scroll up. Suppress it for the whole turn — a deliberate send re-pins via
+    // performAgentPushToTop, never through scrollToBottom.
+    if agentChatMode, agentStreaming || agentPushToTopSpacer > 0 {
+      NSLog("[AgentScroll] scrollToBottom SUPPRESSED (agent turn)")
+      return
+    }
+    if agentChatMode {
+      NSLog(
+        "[AgentScroll] scrollToBottom RUNNING (not suppressed) anim:%@ curOff:%.1f -> %.1f  <<< PUSHER",
+        animated ? "Y" : "N", collectionView.contentOffset.y,
+        pixelAlignedValue(max(0.0, collectionView.contentSize.height - collectionView.bounds.height)))
+    }
     let maxOffsetY = pixelAlignedValue(
       max(0.0, collectionView.contentSize.height - collectionView.bounds.height))
     if animated {
@@ -2226,6 +2353,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     cell.onRetryMessageTap = { [weak self] row in
       self?.retryOutgoingMessage(row: row, source: "inline_retry")
     }
+    cell.onNotSentTap = { [weak self] row in
+      self?.handleNotSentTap(row: row)
+    }
+    cell.onAgentAction = { [weak self] payload in
+      self?.onNativeEvent(payload)
+    }
     cell.onSelectionToggle = { [weak self] row in
       self?.toggleMessageSelection(row: row)
     }
@@ -2242,10 +2375,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         }
         return
       }
-      self.onNativeEvent([
-        "type": "cancelOutgoingUpload",
-        "messageId": messageId,
-      ])
+      self.cancelOutgoingMessage(row: row, source: "voice_upload_cancel")
     }
     // Removed onVoiceBubbleTap so iOS uses Native Audio playback for Voice bubbles (like Android)
     cell.setExternalVoicePlayback(
@@ -2311,6 +2441,26 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       toggleMessageSelection(row: row)
       return
     }
+    if row.isAgentMessage,
+      row.visualKind == .text,
+      let agentUserId = row.agentUserId,
+      !agentUserId.isEmpty
+    {
+      var payload: [String: Any] = [
+        "type": "agentChatPressed",
+        "agentUserId": agentUserId,
+        "agentName": row.agentName ?? "Agent",
+      ]
+      if let agentId = row.agentId, !agentId.isEmpty {
+        payload["agentId"] = agentId
+      }
+      if let username = row.agentUsername, !username.isEmpty {
+        payload["agentUsername"] = username
+        payload["agentHandle"] = "@\(username)"
+      }
+      onNativeEvent(payload)
+      return
+    }
     guard let mediaURLRaw = row.mediaUrl else { return }
     let mediaURL = mediaURLRaw.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !mediaURL.isEmpty else { return }
@@ -2330,10 +2480,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       || lowerMediaURL.contains("/api/agent/document/")
     if isUploadCancelableVisual, row.shouldShowUploadOverlay {
       if let messageId = row.messageId, !messageId.isEmpty {
-        onNativeEvent([
-          "type": "cancelOutgoingUpload",
-          "messageId": messageId,
-        ])
+        cancelOutgoingMessage(row: row, source: "media_upload_cancel")
       }
       return
     }
@@ -2603,16 +2750,32 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if row.kind == .day {
       return CGSize(width: width, height: 30.0)
     }
-    let measurementWidth =
-      selectionMode ? max(1.0, width - messageSelectionLeadingInset) : width
+    let measurementWidth = width
     return CGSize(width: width, height: estimateMessageHeight(row, rowWidth: measurementWidth))
   }
 
   public func scrollViewDidScroll(_ scrollView: UIScrollView) {
+    let offsetY = scrollView.contentOffset.y
+
+    if agentChatMode {
+      NSLog(
+        "[AgentScroll] didScroll off:%.1f (prev:%.1f d:%+.1f) maxOff:%.1f contentH:%.1f insetB:%.1f bounds:%.1f track:%@ drag:%@ decel:%@ internal:%@ detached:%@ streaming:%@ spacer:%.1f",
+        offsetY, previousOffsetY, offsetY - previousOffsetY,
+        scrollView.contentSize.height + scrollView.contentInset.bottom - scrollView.bounds.height,
+        scrollView.contentSize.height, scrollView.contentInset.bottom, scrollView.bounds.height,
+        scrollView.isTracking ? "Y" : "N", scrollView.isDragging ? "Y" : "N",
+        scrollView.isDecelerating ? "Y" : "N", isInternalScrollAdjustment ? "Y" : "N",
+        agentPinUserDetached ? "Y" : "N", agentStreaming ? "Y" : "N", agentPushToTopSpacer)
+    }
+
+    var wallpaperFrame = bounds
+    wallpaperFrame.origin.y = offsetY
+    wallpaperContainerView.frame = wallpaperFrame
+    collectionView.sendSubviewToBack(wallpaperContainerView)
+
     if customContextMenuOverlay != nil {
       dismissCustomContextMenu(animated: false)
     }
-    let offsetY = scrollView.contentOffset.y
     _ = offsetY - previousOffsetY  // delta unused
     previousOffsetY = offsetY
     updateScrollToneOverlay(offsetY: offsetY)
@@ -2631,6 +2794,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if !isInternalScrollAdjustment {
       let distanceFromBottom = currentDistanceFromBottom()
       shouldAutoScroll = distanceFromBottom <= listBottomThreshold
+
+      // Agent turn: once the user physically drags the list, stop re-pinning the
+      // question to the top so they can scroll freely for the rest of the turn.
+      if agentChatMode, agentStreaming || agentPushToTopSpacer > 0,
+        collectionView.isTracking || collectionView.isDragging
+      {
+        agentPinUserDetached = true
+      }
     }
     scheduleVisibleAutoDownloads()
     maybeStartPendingSendTransition()
@@ -2662,8 +2833,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let currentInsets = flowLayout.sectionInset
     let contentHeight = collectionView.collectionViewLayout.collectionViewContentSize.height
     let contentWithoutInsets = max(0.0, contentHeight - currentInsets.top - currentInsets.bottom)
-    let desiredTop = max(
-      baseInsets.top, collectionView.bounds.height - contentWithoutInsets - baseInsets.bottom)
+    let desiredTop =
+      agentChatMode
+      ? baseInsets.top
+      : max(baseInsets.top, collectionView.bounds.height - contentWithoutInsets - baseInsets.bottom)
 
     let topUnchanged = abs(desiredTop - currentInsets.top) <= 0.5
     let bottomUnchanged = abs(baseInsets.bottom - currentInsets.bottom) <= 0.5
@@ -2709,6 +2882,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private func restoreStationaryDistance(_ distanceFromBottom: CGFloat) {
     let targetOffset = max(
       0.0, collectionView.contentSize.height - collectionView.bounds.height - distanceFromBottom)
+    if agentChatMode {
+      NSLog(
+        "[AgentScroll] restoreStationaryDistance dist:%.1f -> targetOff:%.1f (curOff:%.1f) contentH:%.1f  <<< PUSHER",
+        distanceFromBottom, targetOffset, collectionView.contentOffset.y,
+        collectionView.contentSize.height)
+    }
     _ = targetOffset - collectionView.contentOffset.y  // delta unused
     if let activeSendTransition {
       skipNextTransitionScrollCorrection = true
@@ -3547,8 +3726,60 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     setRows(sourceRowsPayload)
   }
 
+  func cancelOutgoingMessage(row: ChatListRow, source: String) {
+    guard let messageId = normalizedMessageId(row.messageId) else { return }
+    let rowChatId = row.chatId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let chatId = rowChatId.isEmpty ? engineChatId.trimmingCharacters(in: .whitespacesAndNewlines) : rowChatId
+    guard !chatId.isEmpty else { return }
+    // Optimistically remove the bubble from every local store so it disappears
+    // immediately; the engine removal (chatMessageDeleted) confirms it.
+    nativeOutgoingRowsById.removeValue(forKey: messageId)
+    nativeEngineRowsById.removeValue(forKey: messageId)
+    nativeDeletedMessageIds.insert(messageId)
+    setRows(sourceRowsPayload)
+    DispatchQueue.global(qos: .utility).async {
+      let result = ChatEngine.shared.cancelOutgoingMessage([
+        "chatId": chatId,
+        "messageId": messageId,
+      ])
+      NSLog(
+        "[ChatListView] cancelOutgoingMessage source=%@ chatId=%@ messageId=%@ result=%@",
+        source, chatId, messageId, String(describing: result))
+    }
+  }
+
+  /// Tapping the "!" on a failed message re-opens it for editing: the text drops
+  /// back into the composer and the original id is armed so the next send reuses
+  /// it (the agent transport then truncates the stale turn). In non-agent chat we
+  /// fall back to a straight resend.
+  func handleNotSentTap(row: ChatListRow) {
+    guard let messageId = normalizedMessageId(row.messageId) else { return }
+    guard agentChatMode else {
+      retryOutgoingMessage(row: row, source: "not_sent_tap")
+      return
+    }
+    let editText = row.plainContent ?? row.text
+    editingAgentMessageId = messageId
+    inputBar?.setComposerText(editText)
+    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+  }
+
   func retryOutgoingMessage(row: ChatListRow, source: String) {
     guard let messageId = normalizedMessageId(row.messageId) else { return }
+    // Agent chat: the headless agent transport owns these bubbles (not the
+    // ChatEngine), so re-send through it reusing the original message id. The
+    // transport truncates the stale turn + tail before re-appending, which keeps
+    // the list clean instead of stacking a duplicate exchange.
+    if agentChatMode {
+      let resendText = row.plainContent ?? row.text
+      guard !resendText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+      onNativeEvent([
+        "type": "sendMessage",
+        "messageId": messageId,
+        "text": resendText,
+      ])
+      return
+    }
     let rowChatId = row.chatId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     let chatId = rowChatId.isEmpty ? engineChatId.trimmingCharacters(in: .whitespacesAndNewlines) : rowChatId
     guard !chatId.isEmpty else { return }
@@ -4215,6 +4446,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       bar.delegate = self
       bar.placeholder = inputBarPlaceholder
       bar.applyAppearance(appearance)
+      bar.setAgentStreaming(agentStreaming)
+      bar.setAgentControlMode(agentChatMode)
+
       addSubview(bar)
       inputBar = bar
       positionTransitionOverlayHost()
@@ -4237,6 +4471,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     inputBar?.placeholder = value
   }
 
+  func setComposerText(_ value: String, focus: Bool = true) {
+    inputBar?.setComposerText(value, focus: focus)
+  }
+
   func setNativeSendEnabled(_ enabled: Bool) {
     guard enabled != nativeSendEnabled else { return }
     nativeSendEnabled = enabled
@@ -4245,6 +4483,144 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       nativeOutgoingOrder.removeAll()
     }
     setRows(sourceRowsPayload)
+  }
+
+  func setAgentChatMode(_ enabled: Bool) {
+    guard agentChatMode != enabled else { return }
+    agentChatMode = enabled
+    inputBar?.setAgentControlMode(enabled)
+    updateBottomAnchorInset()
+    if enabled {
+      performInternalScrollAdjustment {
+        collectionView.setContentOffset(.zero, animated: false)
+      }
+      previousOffsetY = collectionView.contentOffset.y
+    } else {
+      pendingAgentPushToTop = false
+      clearAgentPushToTopSpacer()
+    }
+  }
+
+  func setAgentStreaming(_ streaming: Bool) {
+    guard agentStreaming != streaming else { return }
+    agentStreaming = streaming
+    inputBar?.setAgentStreaming(streaming)
+    // Note: we deliberately do NOT clear the push-to-top spacer when the answer
+    // finishes. Clearing it would drop `maxOffset` below the pinned offset for a
+    // short answer, and the collection view would clamp the content downward —
+    // i.e. the message would "shift to the bottom" right as streaming ends. The
+    // spacer is sized so `maxOffset == pinnedOffset` (see `agentReservedSpacer`),
+    // so leaving it keeps the turn pinned; the next send recomputes it.
+  }
+
+  /// Agent send: scroll the just-sent user message to the top and reserve room
+  /// below for the streaming answer (ChatGPT-style). No morph-from-input — the
+  /// list simply pushes up. The reserve is sized so the pinned offset is exactly
+  /// the max offset, so the message holds at the top on its own without any
+  /// per-chunk re-pinning (which previously locked scrolling).
+  private func performAgentPushToTop(animated: Bool) {
+    // New send: re-arm the pin (user is no longer detached from a prior turn).
+    agentPinUserDetached = false
+    _ = animated  // always pin instantly so a streaming chunk can't interrupt it
+    applyAgentPin(forceOffset: true)
+  }
+
+  /// Space reserved below the current turn so the user message can sit at the top
+  /// with the answer's room below. Sized so `contentSize + reserve - bounds ==
+  /// userMinY - paddingTop`, i.e. the max scroll offset equals the pinned offset
+  /// exactly — the message holds at the top, and because the reserve is bounded by
+  /// what's *already* below the user message it collapses to zero as the answer
+  /// fills the viewport (no fixed empty gap, no overscroll into dead space).
+  private func agentReservedSpacer(forUserMinY userMinY: CGFloat) -> CGFloat {
+    let contentBelowUser = max(0.0, collectionView.contentSize.height - userMinY)
+    let reserve = collectionView.bounds.height - contentPaddingTop - contentBelowUser
+    return max(0.0, reserve)
+  }
+
+  /// Keep the latest user message pinned under the top inset with room reserved
+  /// below for the answer. The scroll OFFSET is moved only on the deliberate send
+  /// pin (`forceOffset: true`); streaming chunks pass `forceOffset: false` so they
+  /// merely re-size the reserved room. The question then holds its place on its own
+  /// because the answer grows *below* the offset — re-asserting the offset per
+  /// chunk is what fought the user and caused the force-scroll. The reserve always
+  /// tracks the answer (even after the user takes over scrolling) so it collapses
+  /// to zero as the answer fills the viewport, leaving no dead space to scroll into.
+  private func applyAgentPin(forceOffset: Bool) {
+    guard agentChatMode else { return }
+    guard let userIndex = rows.lastIndex(where: { $0.kind == .message && $0.isMe }) else {
+      clearAgentPushToTopSpacer()
+      return
+    }
+
+    let indexPath = IndexPath(item: userIndex, section: 0)
+    collectionView.layoutIfNeeded()
+    guard let attrs = collectionView.layoutAttributesForItem(at: indexPath) else { return }
+    let target = agentReservedSpacer(forUserMinY: attrs.frame.minY)
+
+    NSLog(
+      "[AgentScroll] applyAgentPin force:%@ userMinY:%.1f target:%.1f curInsetB:%.1f curOff:%.1f detached:%@ track:%@ drag:%@ decel:%@",
+      forceOffset ? "Y" : "N", attrs.frame.minY, target, collectionView.contentInset.bottom,
+      collectionView.contentOffset.y, agentPinUserDetached ? "Y" : "N",
+      collectionView.isTracking ? "Y" : "N", collectionView.isDragging ? "Y" : "N",
+      collectionView.isDecelerating ? "Y" : "N")
+
+    // ── Deliberate send pin ──────────────────────────────────────────────────
+    // This is the ONLY place the agent surface ever moves the scroll offset, and
+    // it runs UNCONDITIONALLY (no interacting / detached guards in front of it).
+    // A previous flick can leave the list `isDecelerating` at the exact moment the
+    // user taps send; guarding here would swallow the pin entirely — that was the
+    // "no push-to-top on send" bug. Reserve room, then put the question at the top.
+    if forceOffset {
+      agentPinUserDetached = false
+      agentPushToTopSpacer = target
+      if collectionView.contentInset.bottom != target {
+        collectionView.contentInset.bottom = target
+        collectionView.layoutIfNeeded()
+      }
+      let targetOffsetY = pixelAlignedValue(max(0.0, attrs.frame.minY - contentPaddingTop))
+      NSLog(
+        "[AgentScroll] applyAgentPin SEND set offset %.1f -> %.1f insetB:%.1f",
+        collectionView.contentOffset.y, targetOffsetY, collectionView.contentInset.bottom)
+      performInternalScrollAdjustment {
+        collectionView.setContentOffset(CGPoint(x: 0.0, y: targetOffsetY), animated: false)
+      }
+      previousOffsetY = collectionView.contentOffset.y
+      // We own the scroll position for this turn — keep the generic "stick to
+      // bottom" auto-scroll (layoutSubviews / resize) from undoing the pin.
+      shouldAutoScroll = false
+      return
+    }
+
+    // ── Streaming frame ──────────────────────────────────────────────────────
+    // NEVER move the offset here. The user owns scrolling the instant they take it
+    // over (detached) or while they are physically touching / flinging the list —
+    // in those cases do absolutely nothing so we never fight their drag and they
+    // can always reach the top. Otherwise only ever SHRINK the reserved room as the
+    // answer grows so the dead space below collapses; growing the reserve or moving
+    // the offset is what force-scrolled before. Shrinking the bottom inset while the
+    // question is pinned near the top does not move any visible content.
+    if agentPinUserDetached {
+      NSLog("[AgentScroll] applyAgentPin STREAM skip (detached)")
+      return
+    }
+    if collectionView.isTracking || collectionView.isDragging || collectionView.isDecelerating {
+      NSLog("[AgentScroll] applyAgentPin STREAM skip (interacting)")
+      return
+    }
+    if target < agentPushToTopSpacer - 0.5 {
+      NSLog(
+        "[AgentScroll] applyAgentPin STREAM shrink insetB %.1f -> %.1f (off stays %.1f)",
+        collectionView.contentInset.bottom, target, collectionView.contentOffset.y)
+      agentPushToTopSpacer = target
+      collectionView.contentInset.bottom = target
+    }
+  }
+
+  private func clearAgentPushToTopSpacer() {
+    agentPinUserDetached = false
+    guard agentPushToTopSpacer != 0 || collectionView.contentInset.bottom != 0 else { return }
+    agentPushToTopSpacer = 0
+    collectionView.contentInset.bottom = 0
   }
 
   // MARK: - Keyboard Tracking
@@ -4363,6 +4739,33 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     NSLog(
       "[ChatListView] handleNativeSend START — messageId: %@, text length: %lu, nativeSendEnabled: %@, replyTo: %@",
       messageId, text.count, nativeSendEnabled ? "true" : "false", replyToMessageId ?? "nil")
+
+    // Agent chat: no morph-from-input animation and no hidden ghost cell. The
+    // headless agent transport owns the rows (user bubble + streaming answer),
+    // so we just hand the text off and let the list push content up to make room
+    // for the streaming response. Using the morph path here leaves the user
+    // bubble stuck hidden (it never arrives through the normal engine pipeline).
+    if agentChatMode {
+      inputBar?.dismissReplyBanner(animated: false)
+      inputBar?.clearText()
+      pendingAgentPushToTop = true
+      // Re-use the armed id when resending an edited failed message so the
+      // transport truncates the stale turn instead of appending a duplicate.
+      let outgoingMessageId = editingAgentMessageId ?? messageId
+      editingAgentMessageId = nil
+      var sendPayload: [String: Any] = [
+        "type": "sendMessage",
+        "messageId": outgoingMessageId,
+        "text": text,
+        "timestamp": timestamp,
+        "timestampMs": timestampMs,
+      ]
+      if let replyToMessageId {
+        sendPayload["replyToMessageId"] = replyToMessageId
+      }
+      onNativeEvent(sendPayload)
+      return
+    }
 
     // 1. Hide the message cell immediately (before it even exists).
     hiddenMessageId = messageId
@@ -4798,6 +5201,68 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
     flowLayout.invalidateLayout()
     collectionView.performBatchUpdates(nil)
+  }
+
+  @objc private func handleAgentStreamingTextLayoutInvalidated(_ notification: Notification) {
+    // This re-layout/re-pin path exists ONLY for the dedicated agent push-to-top
+    // surface (agentChatMode), where the streaming label grows in place between
+    // setRows calls. In the normal chat, agent messages re-render through setRows
+    // every chunk — that pipeline already owns layout AND scroll — so running this
+    // handler there just races setRows and force-scrolls to the bottom on every
+    // token. Bail in non-agent mode so the normal chat keeps its original behavior.
+    guard agentChatMode else { return }
+    guard
+      let sourceView = notification.object as? UIView,
+      sourceView.isDescendant(of: self)
+    else {
+      return
+    }
+    guard !isApplyingRowsUpdate else { return }
+    guard !pendingStreamingTextLayoutInvalidation else { return }
+
+    pendingStreamingTextLayoutInvalidation = true
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      self.pendingStreamingTextLayoutInvalidation = false
+      guard !self.isApplyingRowsUpdate else { return }
+
+      guard self.window != nil else {
+        self.flowLayout.invalidateLayout()
+        return
+      }
+
+      let distanceFromBottom = self.currentDistanceFromBottom()
+      let wasNearBottom = distanceFromBottom <= listBottomThreshold
+
+      let offsetBeforeInvalidate = self.collectionView.contentOffset.y
+      NSLog(
+        "[AgentScroll] notif BEFORE invalidate off:%.1f contentH:%.1f insetB:%.1f detached:%@ track:%@ drag:%@ decel:%@",
+        offsetBeforeInvalidate, self.collectionView.contentSize.height,
+        self.collectionView.contentInset.bottom, self.agentPinUserDetached ? "Y" : "N",
+        self.collectionView.isTracking ? "Y" : "N", self.collectionView.isDragging ? "Y" : "N",
+        self.collectionView.isDecelerating ? "Y" : "N")
+      self.flowLayout.invalidateLayout()
+      self.collectionView.performBatchUpdates(nil) { [weak self] _ in
+        guard let self else { return }
+        NSLog(
+          "[AgentScroll] notif AFTER batch off:%.1f (was %.1f, d:%+.1f) contentH:%.1f insetB:%.1f",
+          self.collectionView.contentOffset.y, offsetBeforeInvalidate,
+          self.collectionView.contentOffset.y - offsetBeforeInvalidate,
+          self.collectionView.contentSize.height, self.collectionView.contentInset.bottom)
+        if self.agentChatMode, self.agentStreaming || self.agentPushToTopSpacer > 0 {
+          // Push-to-top turn: only SHRINK the reserved room as the answer grows
+          // (passive frames only) and never touch the offset. The question holds at
+          // the top because the answer grows below it; the send pin is the only
+          // thing that ever moves the offset. Doing nothing once the user scrolls
+          // (detached) is what lets them reach — and stay at — the top.
+          self.applyAgentPin(forceOffset: false)
+        } else if wasNearBottom {
+          self.scrollToBottom(animated: true)
+        } else {
+          self.restoreStationaryDistance(distanceFromBottom)
+        }
+      }
+    }
   }
 
   @objc private func handleAgentCodeBlockExpanded(_ notification: Notification) {
@@ -6134,8 +6599,56 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 // MARK: - ChatInputBarDelegate
 
 extension ChatListView: ChatInputBarDelegate {
+  func inputBarDidRequestSelectionAction(_ action: String, payload: [String: Any]?) {
+    if action == "shareOutside" {
+      let selectedRows = rows.filter { selectedMessageIds.contains($0.messageId ?? "") }
+      let textToShare = selectedRows.map { $0.text }.filter { !$0.isEmpty }.joined(separator: "\n\n")
+      guard !textToShare.isEmpty else { return }
+      
+      let activityVC = UIActivityViewController(activityItems: [textToShare], applicationActivities: nil)
+      if let popover = activityVC.popoverPresentationController {
+        popover.sourceView = inputBar
+        popover.sourceRect = inputBar?.bounds ?? .zero
+      }
+      
+      // Find top view controller
+      if let window = self.window, let rootVC = window.rootViewController {
+        var topVC = rootVC
+        while let presented = topVC.presentedViewController {
+          topVC = presented
+        }
+        topVC.present(activityVC, animated: true, completion: nil)
+      }
+      
+      // Optionally clear selection after sharing
+      clearMessageSelection()
+      return
+    }
+    
+    var event: [String: Any] = ["type": "inputActionPressed", "action": action]
+    if let payload = payload {
+      for (key, value) in payload {
+        event[key] = value
+      }
+    }
+    // For delete and shareInside, append the selected message IDs
+    if action == "delete" || action == "shareInside" {
+      event["messageIds"] = Array(selectedMessageIds)
+    }
+    onNativeEvent(event)
+    
+    if action == "delete" {
+      clearMessageSelection()
+    }
+  }
+
   func inputBarDidSend(text: String) {
     handleNativeSend(text: text)
+  }
+
+  func inputBarDidRequestStopStreaming() {
+    guard agentChatMode, agentStreaming else { return }
+    onNativeEvent(["type": "agentStopStreaming"])
   }
 
   func inputBarDidSendWithAgentMention(text: String, agentText: String) {
@@ -6156,6 +6669,10 @@ extension ChatListView: ChatInputBarDelegate {
 
   func inputBarDidRequestVibeAgentBuilder() {
     onNativeEvent(["type": "openVibeAgentBuilder"])
+  }
+
+  func inputBarDidRequestAgentPanel() {
+    onNativeEvent(["type": "openAgentPanel"])
   }
 
   func inputBarDidTapAttachment() {

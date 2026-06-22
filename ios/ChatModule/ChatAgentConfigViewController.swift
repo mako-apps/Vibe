@@ -8,7 +8,7 @@ final class ChatAgentConfigViewController: UIViewController {
   var onDelete: (() -> Void)?
 
   private let scrollView = UIScrollView()
-  private let contentView = UIView()
+  private let mainStack = UIStackView()
 
   private let titleLabel = UILabel()
   private let subtitleLabel = UILabel()
@@ -28,145 +28,37 @@ final class ChatAgentConfigViewController: UIViewController {
   private let promptTextView = UITextView()
   private let promptHintLabel = UILabel()
   private let toolsLabel = UILabel()
-  private let toolsCard = UIView()
+  private let toolsCardContainer = UIView()
+  private let toolsCardStack = UIStackView()
   private let enabledLabel = UILabel()
   private let enabledToggle = UISwitch()
 
   private let deleteButton = UIButton(type: .system)
 
-  private let accentColor = UIColor(red: 0.49, green: 0.36, blue: 0.88, alpha: 1.0)
+  private struct Theme {
+    static let background = UIColor(red: 0.11, green: 0.11, blue: 0.12, alpha: 1.0)
+    static let cardBackground = UIColor(red: 0.17, green: 0.17, blue: 0.18, alpha: 1.0)
+    static let primaryText = UIColor.white
+    static let secondaryText = UIColor(white: 0.65, alpha: 1.0)
+    static let accent = UIColor(red: 0.49, green: 0.36, blue: 0.88, alpha: 1.0)
+  }
+
   private let toolOptions: [(id: String, title: String, subtitle: String)] = [
     ("search_google", "Web Search", "Search Google for up-to-date results"),
     ("analyze_image", "Image Analysis", "Understand images and OCR text"),
     ("analyze_document", "Document Analysis", "Read and summarize document files"),
     ("create_document", "Create Document", "Generate formatted document drafts"),
   ]
-  private var toolRows: [UIView] = []
-  private var toolTitleLabels: [UILabel] = []
-  private var toolSubtitleLabels: [UILabel] = []
-  private var toolToggles: [UISwitch] = []
   private var toolTogglesById: [String: UISwitch] = [:]
 
   override func viewDidLoad() {
     super.viewDidLoad()
     configureNavigation()
     configureViews()
+    setupConstraints()
   }
 
-  override func viewDidLayoutSubviews() {
-    super.viewDidLayoutSubviews()
-
-    let safe = view.safeAreaInsets
-    scrollView.frame = CGRect(
-      x: 0.0,
-      y: safe.top,
-      width: view.bounds.width,
-      height: view.bounds.height - safe.top
-    )
-
-    let width = scrollView.bounds.width
-    let sideInset: CGFloat = 20.0
-    var y: CGFloat = 14.0
-    let contentWidth = width - (sideInset * 2.0)
-
-    titleLabel.frame = CGRect(x: sideInset, y: y, width: contentWidth, height: 30.0)
-    y = titleLabel.frame.maxY + 2.0
-    subtitleLabel.frame = CGRect(x: sideInset, y: y, width: contentWidth, height: 22.0)
-    y = subtitleLabel.frame.maxY + 16.0
-
-    modelCard.frame = CGRect(x: sideInset, y: y, width: contentWidth, height: 48.0)
-    modelLabel.frame = modelCard.bounds.insetBy(dx: 14.0, dy: 0.0)
-    y = modelCard.frame.maxY + 20.0
-
-    nameLabel.frame = CGRect(x: sideInset, y: y, width: contentWidth, height: 20.0)
-    y = nameLabel.frame.maxY + 8.0
-    nameField.frame = CGRect(x: sideInset, y: y, width: contentWidth, height: 48.0)
-    y = nameField.frame.maxY + 18.0
-
-    promptLabel.frame = CGRect(x: sideInset, y: y, width: contentWidth, height: 20.0)
-    let generateWidth: CGFloat = 94.0
-    generatePromptButton.frame = CGRect(
-      x: width - sideInset - generateWidth,
-      y: y - 4.0,
-      width: generateWidth,
-      height: 28.0
-    )
-    promptLabel.frame.size.width = max(80.0, contentWidth - generateWidth - 8.0)
-    y = promptLabel.frame.maxY + 8.0
-    generateInputLabel.frame = CGRect(x: sideInset, y: y, width: contentWidth, height: 18.0)
-    y = generateInputLabel.frame.maxY + 6.0
-    generateInputField.frame = CGRect(x: sideInset, y: y, width: contentWidth, height: 42.0)
-    y = generateInputField.frame.maxY + 12.0
-    promptTextView.frame = CGRect(x: sideInset, y: y, width: contentWidth, height: 180.0)
-    promptHintLabel.frame = CGRect(
-      x: sideInset + 12.0,
-      y: y + 12.0,
-      width: contentWidth - 24.0,
-      height: 42.0
-    )
-    y = promptTextView.frame.maxY + 16.0
-
-    toolsLabel.frame = CGRect(x: sideInset, y: y, width: contentWidth, height: 20.0)
-    y = toolsLabel.frame.maxY + 8.0
-    let rowHeight: CGFloat = 54.0
-    let toolsCardHeight = CGFloat(toolRows.count) * rowHeight
-    toolsCard.frame = CGRect(x: sideInset, y: y, width: contentWidth, height: toolsCardHeight)
-    for index in toolRows.indices {
-      let rowY = CGFloat(index) * rowHeight
-      let row = toolRows[index]
-      row.frame = CGRect(x: 0.0, y: rowY, width: contentWidth, height: rowHeight)
-      let toggle = toolToggles[index]
-      let toggleSize = toggle.intrinsicContentSize
-      toggle.frame = CGRect(
-        x: contentWidth - 16.0 - toggleSize.width,
-        y: (rowHeight - toggleSize.height) * 0.5,
-        width: toggleSize.width,
-        height: toggleSize.height
-      )
-      let textWidth = max(120.0, toggle.frame.minX - 24.0)
-      toolTitleLabels[index].frame = CGRect(x: 12.0, y: 8.0, width: textWidth, height: 20.0)
-      toolSubtitleLabels[index].frame = CGRect(x: 12.0, y: 28.0, width: textWidth, height: 18.0)
-    }
-    y = toolsCard.frame.maxY + 14.0
-
-    if !documents.isEmpty {
-      documentsLabel.frame = CGRect(x: sideInset, y: y, width: contentWidth, height: 20.0)
-      documentsLabel.isHidden = false
-      y = documentsLabel.frame.maxY + 8.0
-      
-      let docHeight: CGFloat = 48.0
-      let docsTotalHeight = CGFloat(documents.count) * docHeight + CGFloat(max(0, documents.count - 1)) * 10.0
-      documentsStack.frame = CGRect(x: sideInset, y: y, width: contentWidth, height: docsTotalHeight)
-      documentsStack.isHidden = false
-      y = documentsStack.frame.maxY + 24.0
-    } else {
-      documentsLabel.isHidden = true
-      documentsStack.isHidden = true
-    }
-
-    enabledLabel.frame = CGRect(x: sideInset, y: y, width: contentWidth - 80.0, height: 30.0)
-    let toggleSize = enabledToggle.intrinsicContentSize
-    enabledToggle.frame = CGRect(
-      x: width - sideInset - toggleSize.width,
-      y: y + (30.0 - toggleSize.height) * 0.5,
-      width: toggleSize.width,
-      height: toggleSize.height
-    )
-    y += 42.0
-
-    if agentConfig != nil {
-      deleteButton.frame = CGRect(x: sideInset, y: y, width: contentWidth, height: 46.0)
-      deleteButton.isHidden = false
-      y = deleteButton.frame.maxY + 18.0
-    } else {
-      deleteButton.isHidden = true
-      deleteButton.frame = .zero
-      y += 10.0
-    }
-
-    contentView.frame = CGRect(x: 0.0, y: 0.0, width: width, height: y)
-    scrollView.contentSize = CGSize(width: width, height: y + max(20.0, safe.bottom))
-  }
+  // Layout is handled by AutoLayout constraints in configureViews and setupConstraints.
 
   private func configureNavigation() {
     navigationItem.title = agentConfig == nil ? "Add AI Agent" : "Edit AI Agent"
@@ -174,7 +66,7 @@ final class ChatAgentConfigViewController: UIViewController {
 
     let saveTitle = agentConfig == nil ? "Create" : "Save"
     let saveItem = UIBarButtonItem(
-      title: saveTitle, style: .done, target: self, action: #selector(handleSave))
+      title: saveTitle, style: .prominent, target: self, action: #selector(handleSave))
     navigationItem.rightBarButtonItem = saveItem
 
     if navigationController?.viewControllers.first === self || presentingViewController != nil {
@@ -184,223 +76,404 @@ final class ChatAgentConfigViewController: UIViewController {
         action: #selector(handleCancel)
       )
     }
+    
+    let appearance = UINavigationBarAppearance()
+    appearance.configureWithOpaqueBackground()
+    appearance.backgroundColor = Theme.background
+    appearance.titleTextAttributes = [.foregroundColor: Theme.primaryText]
+    navigationController?.navigationBar.standardAppearance = appearance
+    navigationController?.navigationBar.scrollEdgeAppearance = appearance
+    navigationController?.navigationBar.tintColor = Theme.accent
   }
 
   private func configureViews() {
-    view.backgroundColor = .systemBackground
+    view.backgroundColor = Theme.background
 
     scrollView.keyboardDismissMode = .interactive
+    scrollView.alwaysBounceVertical = true
+    scrollView.translatesAutoresizingMaskIntoConstraints = false
     view.addSubview(scrollView)
-    scrollView.addSubview(contentView)
 
-    titleLabel.font = UIFont.systemFont(ofSize: 30.0, weight: .bold)
-    titleLabel.textColor = .label
+    mainStack.axis = .vertical
+    mainStack.spacing = 28
+    mainStack.isLayoutMarginsRelativeArrangement = true
+    mainStack.layoutMargins = UIEdgeInsets(top: 24, left: 20, bottom: 40, right: 20)
+    mainStack.translatesAutoresizingMaskIntoConstraints = false
+    scrollView.addSubview(mainStack)
+
+    // MARK: - Header Section
+    let headerStack = UIStackView()
+    headerStack.axis = .vertical
+    headerStack.spacing = 4
+    
+    titleLabel.font = UIFont.systemFont(ofSize: 32.0, weight: .bold)
+    titleLabel.textColor = Theme.primaryText
     titleLabel.text = "Agent Settings"
-    contentView.addSubview(titleLabel)
+    headerStack.addArrangedSubview(titleLabel)
 
-    subtitleLabel.font = UIFont.systemFont(ofSize: 14.0, weight: .medium)
-    subtitleLabel.textColor = .secondaryLabel
+    subtitleLabel.font = UIFont.systemFont(ofSize: 15.0, weight: .medium)
+    subtitleLabel.textColor = Theme.secondaryText
     subtitleLabel.text = "Single native model backend"
-    contentView.addSubview(subtitleLabel)
+    headerStack.addArrangedSubview(subtitleLabel)
+    
+    mainStack.addArrangedSubview(headerStack)
 
-    modelCard.backgroundColor = .secondarySystemGroupedBackground
+    // MARK: - Model Card
+    modelCard.backgroundColor = Theme.cardBackground
     modelCard.layer.cornerRadius = 14.0
     modelCard.layer.cornerCurve = .continuous
-    contentView.addSubview(modelCard)
-
-    modelLabel.font = UIFont.systemFont(ofSize: 14.0, weight: .semibold)
-    modelLabel.textColor = .label
+    
+    modelLabel.font = UIFont.systemFont(ofSize: 15.0, weight: .semibold)
+    modelLabel.textColor = Theme.primaryText
     modelLabel.text = "Model: Native default"
+    modelLabel.translatesAutoresizingMaskIntoConstraints = false
     modelCard.addSubview(modelLabel)
+    
+    mainStack.addArrangedSubview(modelCard)
 
-    let initialEnabledTools = Set(currentEnabledTools())
-
-    nameLabel.font = UIFont.systemFont(ofSize: 13.0, weight: .semibold)
-    nameLabel.textColor = .secondaryLabel
+    // MARK: - Agent Name
+    let nameStack = UIStackView()
+    nameStack.axis = .vertical
+    nameStack.spacing = 8
+    
+    nameLabel.font = UIFont.systemFont(ofSize: 13.0, weight: .bold)
+    nameLabel.textColor = Theme.secondaryText
     nameLabel.text = "AGENT NAME"
-    contentView.addSubview(nameLabel)
+    nameStack.addArrangedSubview(nameLabel)
 
     nameField.font = UIFont.systemFont(ofSize: 16.0, weight: .medium)
+    nameField.textColor = Theme.primaryText
     nameField.layer.cornerRadius = 12.0
     nameField.layer.cornerCurve = .continuous
-    nameField.backgroundColor = .secondarySystemGroupedBackground
-    nameField.leftView = UIView(frame: CGRect(x: 0.0, y: 0.0, width: 12.0, height: 1.0))
+    nameField.backgroundColor = Theme.cardBackground
+    nameField.leftView = UIView(frame: CGRect(x: 0.0, y: 0.0, width: 14.0, height: 1.0))
     nameField.leftViewMode = .always
-    nameField.placeholder = "Vibe AI"
+    nameField.attributedPlaceholder = NSAttributedString(
+      string: "Vibe AI",
+      attributes: [.foregroundColor: Theme.secondaryText.withAlphaComponent(0.5)]
+    )
     nameField.text = (agentConfig?["name"] as? String) ?? ""
-    contentView.addSubview(nameField)
+    nameStack.addArrangedSubview(nameField)
+    
+    mainStack.addArrangedSubview(nameStack)
 
-    promptLabel.font = UIFont.systemFont(ofSize: 13.0, weight: .semibold)
-    promptLabel.textColor = .secondaryLabel
+    // MARK: - System Prompt
+    let promptSectionStack = UIStackView()
+    promptSectionStack.axis = .vertical
+    promptSectionStack.spacing = 16
+    
+    let promptHeaderStack = UIStackView()
+    promptHeaderStack.axis = .horizontal
+    promptHeaderStack.alignment = .center
+    
+    promptLabel.font = UIFont.systemFont(ofSize: 13.0, weight: .bold)
+    promptLabel.textColor = Theme.secondaryText
     promptLabel.text = "SYSTEM PROMPT"
-    contentView.addSubview(promptLabel)
+    promptHeaderStack.addArrangedSubview(promptLabel)
+    
+    let spacer = UIView()
+    promptHeaderStack.addArrangedSubview(spacer)
 
     generatePromptButton.setTitle("Generate", for: .normal)
-    generatePromptButton.titleLabel?.font = UIFont.systemFont(ofSize: 13.0, weight: .semibold)
-    generatePromptButton.tintColor = accentColor
-    generatePromptButton.backgroundColor = .secondarySystemGroupedBackground
+    generatePromptButton.titleLabel?.font = UIFont.systemFont(ofSize: 13.0, weight: .bold)
+    generatePromptButton.tintColor = Theme.accent
+    generatePromptButton.backgroundColor = Theme.cardBackground
     generatePromptButton.layer.cornerRadius = 14.0
     generatePromptButton.layer.cornerCurve = .continuous
-    generatePromptButton.contentEdgeInsets = UIEdgeInsets(top: 0.0, left: 10.0, bottom: 0.0, right: 10.0)
-    generatePromptButton.addTarget(
-      self, action: #selector(handleGeneratePromptTapped), for: .touchUpInside)
-    contentView.addSubview(generatePromptButton)
-
-    generateInputLabel.font = UIFont.systemFont(ofSize: 12.0, weight: .semibold)
-    generateInputLabel.textColor = .secondaryLabel
+    generatePromptButton.contentEdgeInsets = UIEdgeInsets(top: 6.0, left: 12.0, bottom: 6.0, right: 12.0)
+    generatePromptButton.addTarget(self, action: #selector(handleGeneratePromptTapped), for: .touchUpInside)
+    promptHeaderStack.addArrangedSubview(generatePromptButton)
+    
+    promptSectionStack.addArrangedSubview(promptHeaderStack)
+    
+    let genInputStack = UIStackView()
+    genInputStack.axis = .vertical
+    genInputStack.spacing = 6
+    
+    generateInputLabel.font = UIFont.systemFont(ofSize: 12.0, weight: .bold)
+    generateInputLabel.textColor = Theme.secondaryText
     generateInputLabel.text = "GENERATE FROM INPUT"
-    contentView.addSubview(generateInputLabel)
+    genInputStack.addArrangedSubview(generateInputLabel)
 
-    generateInputField.font = UIFont.systemFont(ofSize: 14.0, weight: .regular)
+    generateInputField.font = UIFont.systemFont(ofSize: 15.0, weight: .regular)
+    generateInputField.textColor = Theme.primaryText
     generateInputField.layer.cornerRadius = 12.0
     generateInputField.layer.cornerCurve = .continuous
-    generateInputField.backgroundColor = .secondarySystemGroupedBackground
-    generateInputField.leftView = UIView(frame: CGRect(x: 0.0, y: 0.0, width: 12.0, height: 1.0))
+    generateInputField.backgroundColor = Theme.cardBackground
+    generateInputField.leftView = UIView(frame: CGRect(x: 0.0, y: 0.0, width: 14.0, height: 1.0))
     generateInputField.leftViewMode = .always
-    generateInputField.placeholder = "e.g. Helpful PM assistant for sprint planning"
+    generateInputField.attributedPlaceholder = NSAttributedString(
+      string: "e.g. Helpful PM assistant for sprint planning",
+      attributes: [.foregroundColor: Theme.secondaryText.withAlphaComponent(0.5)]
+    )
     generateInputField.autocapitalizationType = .sentences
-    contentView.addSubview(generateInputField)
+    genInputStack.addArrangedSubview(generateInputField)
+    
+    promptSectionStack.addArrangedSubview(genInputStack)
 
-    promptTextView.font = UIFont.systemFont(ofSize: 15.0, weight: .regular)
-    promptTextView.layer.cornerRadius = 12.0
-    promptTextView.layer.cornerCurve = .continuous
-    promptTextView.backgroundColor = .secondarySystemGroupedBackground
-    promptTextView.textContainerInset = UIEdgeInsets(top: 12.0, left: 8.0, bottom: 12.0, right: 8.0)
+    let textViewContainer = UIView()
+    textViewContainer.backgroundColor = Theme.cardBackground
+    textViewContainer.layer.cornerRadius = 12.0
+    textViewContainer.layer.cornerCurve = .continuous
+    
+    promptTextView.font = UIFont.systemFont(ofSize: 16.0, weight: .regular)
+    promptTextView.textColor = Theme.primaryText
+    promptTextView.backgroundColor = .clear
+    promptTextView.textContainerInset = UIEdgeInsets(top: 14.0, left: 10.0, bottom: 14.0, right: 10.0)
     promptTextView.text = normalizedPrompt(from: agentConfig)
     promptTextView.delegate = self
-    contentView.addSubview(promptTextView)
+    promptTextView.translatesAutoresizingMaskIntoConstraints = false
+    textViewContainer.addSubview(promptTextView)
 
-    promptHintLabel.font = UIFont.systemFont(ofSize: 14.0, weight: .regular)
-    promptHintLabel.textColor = UIColor.secondaryLabel.withAlphaComponent(0.75)
+    promptHintLabel.font = UIFont.systemFont(ofSize: 15.0, weight: .regular)
+    promptHintLabel.textColor = Theme.secondaryText.withAlphaComponent(0.6)
     promptHintLabel.numberOfLines = 0
     promptHintLabel.text = "Describe how this agent should behave in the group."
-    promptTextView.addSubview(promptHintLabel)
-    refreshPromptHintVisibility()
+    promptHintLabel.translatesAutoresizingMaskIntoConstraints = false
+    textViewContainer.addSubview(promptHintLabel)
+    
+    promptSectionStack.addArrangedSubview(textViewContainer)
+    mainStack.addArrangedSubview(promptSectionStack)
 
-    toolsLabel.font = UIFont.systemFont(ofSize: 13.0, weight: .semibold)
-    toolsLabel.textColor = .secondaryLabel
+    // MARK: - Tools
+    let initialEnabledTools = Set(currentEnabledTools())
+    let toolsSectionStack = UIStackView()
+    toolsSectionStack.axis = .vertical
+    toolsSectionStack.spacing = 8
+    
+    toolsLabel.font = UIFont.systemFont(ofSize: 13.0, weight: .bold)
+    toolsLabel.textColor = Theme.secondaryText
     toolsLabel.text = "ENABLED TOOLS"
-    contentView.addSubview(toolsLabel)
+    toolsSectionStack.addArrangedSubview(toolsLabel)
 
-    toolsCard.backgroundColor = .secondarySystemGroupedBackground
-    toolsCard.layer.cornerRadius = 12.0
-    toolsCard.layer.cornerCurve = .continuous
-    contentView.addSubview(toolsCard)
-    for option in toolOptions {
+    toolsCardContainer.backgroundColor = Theme.cardBackground
+    toolsCardContainer.layer.cornerRadius = 14.0
+    toolsCardContainer.layer.cornerCurve = .continuous
+    
+    toolsCardStack.axis = .vertical
+    toolsCardStack.spacing = 0
+    toolsCardStack.translatesAutoresizingMaskIntoConstraints = false
+    toolsCardContainer.addSubview(toolsCardStack)
+    
+    for (index, option) in toolOptions.enumerated() {
       let row = UIView()
-      row.backgroundColor = .clear
-
+      
       let title = UILabel()
-      title.font = UIFont.systemFont(ofSize: 14.0, weight: .semibold)
-      title.textColor = .label
+      title.font = UIFont.systemFont(ofSize: 15.0, weight: .bold)
+      title.textColor = Theme.primaryText
       title.text = option.title
+      title.translatesAutoresizingMaskIntoConstraints = false
       row.addSubview(title)
 
       let subtitle = UILabel()
-      subtitle.font = UIFont.systemFont(ofSize: 12.0, weight: .regular)
-      subtitle.textColor = .secondaryLabel
+      subtitle.font = UIFont.systemFont(ofSize: 13.0, weight: .medium)
+      subtitle.textColor = Theme.secondaryText
       subtitle.text = option.subtitle
+      subtitle.translatesAutoresizingMaskIntoConstraints = false
       row.addSubview(subtitle)
 
       let toggle = UISwitch()
-      toggle.onTintColor = accentColor
+      toggle.onTintColor = Theme.accent
       toggle.isOn = initialEnabledTools.contains(option.id)
+      toggle.translatesAutoresizingMaskIntoConstraints = false
       row.addSubview(toggle)
+      
+      NSLayoutConstraint.activate([
+        row.heightAnchor.constraint(equalToConstant: 64),
+        
+        title.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 16),
+        title.topAnchor.constraint(equalTo: row.topAnchor, constant: 12),
+        
+        subtitle.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+        subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 2),
+        subtitle.trailingAnchor.constraint(lessThanOrEqualTo: toggle.leadingAnchor, constant: -16),
+        
+        toggle.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -16),
+        toggle.centerYAnchor.constraint(equalTo: row.centerYAnchor)
+      ])
+      
+      if index < toolOptions.count - 1 {
+        let separator = UIView()
+        separator.backgroundColor = Theme.background
+        separator.translatesAutoresizingMaskIntoConstraints = false
+        row.addSubview(separator)
+        NSLayoutConstraint.activate([
+            separator.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 16),
+            separator.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -16),
+            separator.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+            separator.heightAnchor.constraint(equalToConstant: 1)
+        ])
+      }
 
-      toolsCard.addSubview(row)
-      toolRows.append(row)
-      toolTitleLabels.append(title)
-      toolSubtitleLabels.append(subtitle)
-      toolToggles.append(toggle)
+      toolsCardStack.addArrangedSubview(row)
       toolTogglesById[option.id] = toggle
     }
+    
+    toolsSectionStack.addArrangedSubview(toolsCardContainer)
+    mainStack.addArrangedSubview(toolsSectionStack)
 
-    documentsLabel.font = UIFont.systemFont(ofSize: 13.0, weight: .semibold)
-    documentsLabel.textColor = .secondaryLabel
+    // MARK: - Documents
+    let docsSectionStack = UIStackView()
+    docsSectionStack.axis = .vertical
+    docsSectionStack.spacing = 8
+    
+    documentsLabel.font = UIFont.systemFont(ofSize: 13.0, weight: .bold)
+    documentsLabel.textColor = Theme.secondaryText
     documentsLabel.text = "AGENT DOCUMENTS"
-    contentView.addSubview(documentsLabel)
+    docsSectionStack.addArrangedSubview(documentsLabel)
     
     documentsStack.axis = .vertical
     documentsStack.spacing = 10.0
     documentsStack.distribution = .equalSpacing
-    contentView.addSubview(documentsStack)
+    docsSectionStack.addArrangedSubview(documentsStack)
     
-    for (index, doc) in documents.enumerated() {
-      let row = UIControl()
-      row.backgroundColor = .secondarySystemGroupedBackground
-      row.layer.cornerRadius = 12.0
-      row.layer.cornerCurve = .continuous
-      row.layer.borderWidth = 0.0
-      row.translatesAutoresizingMaskIntoConstraints = false
-      row.heightAnchor.constraint(equalToConstant: 48).isActive = true
-      row.tag = index
-      row.addTarget(self, action: #selector(handleDocumentTapped(_:)), for: .touchUpInside)
-      row.addTarget(self, action: #selector(handleDocumentTouchDown(_:)), for: [.touchDown, .touchDragEnter])
-      row.addTarget(
-        self,
-        action: #selector(handleDocumentTouchUp(_:)),
-        for: [.touchUpInside, .touchUpOutside, .touchDragExit, .touchCancel]
-      )
-      
-      let icon = UIImageView(image: UIImage(systemName: "doc.text.fill"))
-      icon.tintColor = accentColor
-      icon.contentMode = .scaleAspectFit
-      icon.translatesAutoresizingMaskIntoConstraints = false
-      row.addSubview(icon)
-      
-      let label = UILabel()
-      label.text = doc.name
-      label.font = UIFont.systemFont(ofSize: 14, weight: .medium)
-      label.textColor = .label
-      label.translatesAutoresizingMaskIntoConstraints = false
-      row.addSubview(label)
-
-      let chevron = UIImageView(
-        image: UIImage(
-          systemName: "chevron.right",
-          withConfiguration: UIImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
-        ))
-      chevron.tintColor = UIColor.secondaryLabel.withAlphaComponent(0.7)
-      chevron.contentMode = .scaleAspectFit
-      chevron.translatesAutoresizingMaskIntoConstraints = false
-      row.addSubview(chevron)
-      
-      NSLayoutConstraint.activate([
-        icon.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 14),
-        icon.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-        icon.widthAnchor.constraint(equalToConstant: 20),
-        icon.heightAnchor.constraint(equalToConstant: 20),
+    if !documents.isEmpty {
+      for (index, doc) in documents.enumerated() {
+        let row = UIControl()
+        row.backgroundColor = Theme.cardBackground
+        row.layer.cornerRadius = 12.0
+        row.layer.cornerCurve = .continuous
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.heightAnchor.constraint(equalToConstant: 52).isActive = true
+        row.tag = index
+        row.addTarget(self, action: #selector(handleDocumentTapped(_:)), for: .touchUpInside)
+        row.addTarget(self, action: #selector(handleDocumentTouchDown(_:)), for: [.touchDown, .touchDragEnter])
+        row.addTarget(self, action: #selector(handleDocumentTouchUp(_:)), for: [.touchUpInside, .touchUpOutside, .touchDragExit, .touchCancel])
         
-        label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 12),
-        label.trailingAnchor.constraint(equalTo: chevron.leadingAnchor, constant: -10),
-        label.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+        let icon = UIImageView(image: UIImage(systemName: "doc.text.fill"))
+        icon.tintColor = Theme.accent
+        icon.contentMode = .scaleAspectFit
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        row.addSubview(icon)
+        
+        let label = UILabel()
+        label.text = doc.name
+        label.font = UIFont.systemFont(ofSize: 15, weight: .semibold)
+        label.textColor = Theme.primaryText
+        label.translatesAutoresizingMaskIntoConstraints = false
+        row.addSubview(label)
 
-        chevron.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -14),
-        chevron.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-        chevron.widthAnchor.constraint(equalToConstant: 10),
-        chevron.heightAnchor.constraint(equalToConstant: 14),
-      ])
-      
-      documentsStack.addArrangedSubview(row)
+        let chevron = UIImageView(
+          image: UIImage(
+            systemName: "chevron.right",
+            withConfiguration: UIImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
+          ))
+        chevron.tintColor = Theme.secondaryText.withAlphaComponent(0.5)
+        chevron.contentMode = .scaleAspectFit
+        chevron.translatesAutoresizingMaskIntoConstraints = false
+        row.addSubview(chevron)
+        
+        NSLayoutConstraint.activate([
+          icon.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 16),
+          icon.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+          icon.widthAnchor.constraint(equalToConstant: 22),
+          icon.heightAnchor.constraint(equalToConstant: 22),
+          
+          label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 12),
+          label.trailingAnchor.constraint(equalTo: chevron.leadingAnchor, constant: -10),
+          label.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+
+          chevron.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -16),
+          chevron.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+          chevron.widthAnchor.constraint(equalToConstant: 12),
+          chevron.heightAnchor.constraint(equalToConstant: 16),
+        ])
+        
+        documentsStack.addArrangedSubview(row)
+      }
+      mainStack.addArrangedSubview(docsSectionStack)
     }
 
-    enabledLabel.font =  UIFont.systemFont(ofSize: 16.0, weight: .medium)
-    enabledLabel.textColor = .label
-    enabledLabel.text = "Enabled"
-    contentView.addSubview(enabledLabel)
+    // MARK: - Enabled Toggle
+    let enabledStack = UIStackView()
+    enabledStack.axis = .horizontal
+    enabledStack.alignment = .center
+    
+    enabledLabel.font =  UIFont.systemFont(ofSize: 16.0, weight: .bold)
+    enabledLabel.textColor = Theme.primaryText
+    enabledLabel.text = "Agent Enabled"
+    enabledStack.addArrangedSubview(enabledLabel)
+    
+    let enabledSpacer = UIView()
+    enabledStack.addArrangedSubview(enabledSpacer)
 
-    enabledToggle.onTintColor = accentColor
+    enabledToggle.onTintColor = Theme.accent
     enabledToggle.isOn = normalizedEnabled(from: agentConfig, defaultValue: true)
-    contentView.addSubview(enabledToggle)
+    enabledStack.addArrangedSubview(enabledToggle)
+    
+    let enabledCard = UIView()
+    enabledCard.backgroundColor = Theme.cardBackground
+    enabledCard.layer.cornerRadius = 14.0
+    enabledCard.layer.cornerCurve = .continuous
+    
+    enabledStack.translatesAutoresizingMaskIntoConstraints = false
+    enabledCard.addSubview(enabledStack)
+    
+    NSLayoutConstraint.activate([
+      enabledCard.heightAnchor.constraint(equalToConstant: 60),
+      enabledStack.topAnchor.constraint(equalTo: enabledCard.topAnchor),
+      enabledStack.leadingAnchor.constraint(equalTo: enabledCard.leadingAnchor, constant: 16),
+      enabledStack.trailingAnchor.constraint(equalTo: enabledCard.trailingAnchor, constant: -16),
+      enabledStack.bottomAnchor.constraint(equalTo: enabledCard.bottomAnchor)
+    ])
+    
+    mainStack.addArrangedSubview(enabledCard)
+    mainStack.setCustomSpacing(32, after: enabledCard)
 
-    deleteButton.setTitle("Remove Agent", for: .normal)
-    deleteButton.titleLabel?.font = UIFont.systemFont(ofSize: 16.0, weight: .semibold)
-    deleteButton.setTitleColor(.systemRed, for: .normal)
-    deleteButton.layer.cornerRadius = 14.0
-    deleteButton.layer.cornerCurve = .continuous
-    deleteButton.backgroundColor = .secondarySystemGroupedBackground
-    deleteButton.addTarget(self, action: #selector(handleDelete), for: .touchUpInside)
-    contentView.addSubview(deleteButton)
+    // MARK: - Delete Button
+    if agentConfig != nil {
+      deleteButton.setTitle("Remove Agent", for: .normal)
+      deleteButton.titleLabel?.font = UIFont.systemFont(ofSize: 16.0, weight: .bold)
+      deleteButton.setTitleColor(.systemRed, for: .normal)
+      deleteButton.layer.cornerRadius = 14.0
+      deleteButton.layer.cornerCurve = .continuous
+      deleteButton.backgroundColor = Theme.cardBackground
+      deleteButton.addTarget(self, action: #selector(handleDelete), for: .touchUpInside)
+      mainStack.addArrangedSubview(deleteButton)
+    }
+
+    refreshPromptHintVisibility()
+  }
+
+  private func setupConstraints() {
+    NSLayoutConstraint.activate([
+      scrollView.topAnchor.constraint(equalTo: view.topAnchor),
+      scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+
+      mainStack.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor),
+      mainStack.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor),
+      mainStack.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor),
+      mainStack.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor),
+      mainStack.widthAnchor.constraint(equalTo: scrollView.frameLayoutGuide.widthAnchor),
+      
+      modelCard.heightAnchor.constraint(equalToConstant: 52),
+      modelLabel.leadingAnchor.constraint(equalTo: modelCard.leadingAnchor, constant: 16),
+      modelLabel.centerYAnchor.constraint(equalTo: modelCard.centerYAnchor),
+      
+      nameField.heightAnchor.constraint(equalToConstant: 52),
+      generateInputField.heightAnchor.constraint(equalToConstant: 48),
+      
+      promptTextView.topAnchor.constraint(equalTo: promptTextView.superview!.topAnchor),
+      promptTextView.leadingAnchor.constraint(equalTo: promptTextView.superview!.leadingAnchor),
+      promptTextView.trailingAnchor.constraint(equalTo: promptTextView.superview!.trailingAnchor),
+      promptTextView.bottomAnchor.constraint(equalTo: promptTextView.superview!.bottomAnchor),
+      promptTextView.superview!.heightAnchor.constraint(equalToConstant: 200),
+      
+      promptHintLabel.topAnchor.constraint(equalTo: promptTextView.superview!.topAnchor, constant: 14),
+      promptHintLabel.leadingAnchor.constraint(equalTo: promptTextView.superview!.leadingAnchor, constant: 14),
+      promptHintLabel.trailingAnchor.constraint(equalTo: promptTextView.superview!.trailingAnchor, constant: -14),
+      
+      toolsCardStack.topAnchor.constraint(equalTo: toolsCardContainer.topAnchor),
+      toolsCardStack.leadingAnchor.constraint(equalTo: toolsCardContainer.leadingAnchor),
+      toolsCardStack.trailingAnchor.constraint(equalTo: toolsCardContainer.trailingAnchor),
+      toolsCardStack.bottomAnchor.constraint(equalTo: toolsCardContainer.bottomAnchor)
+    ])
+    
+    if agentConfig != nil {
+       deleteButton.heightAnchor.constraint(equalToConstant: 56).isActive = true
+    }
   }
 
   @objc private func handleCancel() {

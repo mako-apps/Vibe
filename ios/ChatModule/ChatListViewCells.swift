@@ -998,8 +998,18 @@ private func hasMediaCaptionLayout(_ row: ChatListRow) -> Bool {
   return !trimmedBubbleText(row).isEmpty
 }
 
+private func agentResponseInProgress(_ row: ChatListRow) -> Bool {
+  row.isAgentMessage
+    && (row.isStreamingText
+      || row.messageType == "typing"
+      || row.messageType == "agent_progress_tree")
+}
+
 private func bubbleMetaWidths(for row: ChatListRow) -> ChatBubbleMetaWidths {
-  if row.messageType == "agent_progress" || usesTransparentAgentStreamingLayout(row) {
+  if row.messageType == "agent_progress"
+    || usesTransparentAgentStreamingLayout(row)
+    || agentResponseInProgress(row)
+  {
     return ChatBubbleMetaWidths(edited: 0.0, pinned: 0.0, timestamp: 0.0, total: 0.0)
   }
 
@@ -1281,11 +1291,13 @@ private func usesFullBleedMediaLayout(_ row: ChatListRow) -> Bool {
 }
 
 private func usesTransparentAgentStreamingLayout(_ row: ChatListRow) -> Bool {
-  guard row.kind == .message else { return false }
-  return row.isAgentMessage
-    && row.isStreamingText
-    && row.messageType != "typing"
-    && row.visualKind == .text
+  // Streaming agent text now renders inside a normal bubble that grows smoothly
+  // as chunks arrive (the old behaviour floated transparent text with no
+  // background until the response finalized, which looked like the text was
+  // outside the bubble and then snapped into it). Keep the helper so all call
+  // sites compile, but always take the in-bubble path.
+  _ = row
+  return false
 }
 
 private func effectiveMetaTopSpacing(for row: ChatListRow) -> CGFloat {
@@ -1315,7 +1327,8 @@ private struct BubbleLinkPreviewData {
 
 private func bubbleBaseText(for row: ChatListRow) -> (text: String, addPrefix: Bool) {
   if row.isAgentMessage {
-    return (row.plainContent ?? row.text, true)
+    // No ✦ spark prefix on agent bubbles — the agent surface doesn't want it.
+    return (row.plainContent ?? row.text, false)
   }
   if row.isAgentMention {
     return (row.textWithoutMention, true)
@@ -1345,18 +1358,24 @@ private func bubbleParsedBlocks(for row: ChatListRow) -> [AgentParsedBlock] {
     blocks[0] = .text(content.isEmpty ? prefix : prefix + content)
   case .code:
     blocks.insert(.text(prefix.trimmingCharacters(in: .whitespacesAndNewlines)), at: 0)
+  case .agentPack:
+    blocks.insert(.text(prefix.trimmingCharacters(in: .whitespacesAndNewlines)), at: 0)
   }
   return blocks
 }
 
 private func bubbleUsesBlockLayout(_ row: ChatListRow) -> Bool {
-  guard row.kind == .message, row.visualKind == .text, row.messageType != "typing", row.isAgentMessage
+  guard row.kind == .message, row.visualKind == .text, row.messageType != "typing",
+    row.messageType != "agent_progress_tree", row.isAgentMessage
   else {
     return false
   }
   let blocks = bubbleParsedBlocks(for: row)
   return blocks.contains { block in
     if case .code = block {
+      return true
+    }
+    if case .agentPack = block {
       return true
     }
     return false
@@ -1413,6 +1432,12 @@ private func bubblePreviewURL(for row: ChatListRow) -> URL? {
 
   let sourceText = bubbleBaseText(for: row).text
   guard !sourceText.isEmpty else { return nil }
+  if bubbleParsedBlocks(for: row).contains(where: {
+    if case .agentPack = $0 { return true }
+    return false
+  }) {
+    return nil
+  }
 
   let range = NSRange(sourceText.startIndex..., in: sourceText)
   let matches = bubbleURLDetector.matches(in: sourceText, options: [], range: range)
@@ -1515,6 +1540,13 @@ private func measureBubbleRichText(for row: ChatListRow, availableWidth: CGFloat
         storageKey: bubbleRichTextStorageKey(for: row, blockIndex: index)
       )
       maxWidth = max(maxWidth, availableWidth)
+    case .agentPack(let pack):
+      totalHeight += AgentIntegrationPackView.measuredHeight(
+        pack: pack,
+        availableWidth: availableWidth,
+        storageKey: bubbleRichTextStorageKey(for: row, blockIndex: index)
+      )
+      maxWidth = max(maxWidth, availableWidth)
     }
 
     if index < blocks.count - 1 {
@@ -1590,6 +1622,8 @@ private final class BubbleRichTextView: UIView {
         return "T\(index)"
       case .code:
         return "C\(index)"
+      case .agentPack:
+        return "P\(index)"
       }
     }.joined(separator: "-")
 
@@ -1607,6 +1641,10 @@ private final class BubbleRichTextView: UIView {
           let card = AgentCodeBlockView()
           addSubview(card)
           return card
+        case .agentPack:
+          let packView = AgentIntegrationPackView()
+          addSubview(packView)
+          return packView
         }
       }
       lastSignature = signature
@@ -1654,6 +1692,16 @@ private final class BubbleRichTextView: UIView {
         )
         blockFrames.append(CGRect(x: 0.0, y: yOffset, width: availableWidth, height: cardHeight))
         yOffset += cardHeight
+      case .agentPack(let pack):
+        let packView = view as! AgentIntegrationPackView
+        let packHeight = packView.configure(
+          pack: pack,
+          textColor: textColor,
+          availableWidth: availableWidth,
+          storageKey: bubbleRichTextStorageKey(for: row, blockIndex: index)
+        )
+        blockFrames.append(CGRect(x: 0.0, y: yOffset, width: availableWidth, height: packHeight))
+        yOffset += packHeight
       }
 
       if index < blocks.count - 1 {
@@ -1953,6 +2001,29 @@ private final class BubbleLinkPreviewView: UIView {
 func measureMessageBubbleLayout(row: ChatListRow, rowWidth: CGFloat)
   -> ChatMessageBubbleLayoutMetrics
 {
+  if row.kind == .message, row.messageType == "agent_actions" {
+    let actionWidth = max(1.0, rowWidth - (bubbleSideMargin * 2.0))
+    return ChatMessageBubbleLayoutMetrics(
+      bubbleWidth: actionWidth,
+      bubbleHeight: 36.0,
+      messageWidth: actionWidth,
+      textHeight: 0.0,
+      bodyHeight: 36.0,
+      metaWidth: 0.0,
+      contentWidth: actionWidth,
+      mediaHeight: 0.0,
+      isMediaLayout: false,
+      inlineAttachmentHeight: 0.0,
+      hasInlineAttachment: false,
+      replyPreviewHeight: 0.0,
+      hasReplyPreview: false,
+      previewHeight: 0.0,
+      hasLinkPreview: false,
+      usesBottomMetaLayout: false,
+      usesRichTextLayout: false
+    )
+  }
+
   let maxBubbleWidth = floor(rowWidth * bubbleMaxWidthFactor)
   let maxContentWidth = max(1.0, maxBubbleWidth - (bubbleHorizontalPadding * 2.0))
   let meta = bubbleMetaWidths(for: row)
@@ -4747,6 +4818,42 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
       atPath: cachedRemoteVoiceURL(for: resolvedURL, fileName: fileName).path)
   }
 
+  /// Seed the remote-keyed voice cache from the sender's original local file.
+  /// A just-sent voice/music message briefly carries both the remote URL and the
+  /// local file; once the server echo rebuilds the row from encrypted_content the
+  /// localMediaUrl is dropped, and the bubble would otherwise show a download
+  /// button for media the sender already owns. Copying the local file into the
+  /// cache (keyed by the remote URL, the same place a download would land) keeps
+  /// it playable without re-downloading — and survives the app-container UUID
+  /// changing on rebuild, since the key is the remote URL hash, not a sandbox path.
+  func seedRemoteVoiceCacheFromLocal(
+    localMediaURL: String?, remoteMediaURL: String?, fileName: String?
+  ) {
+    guard
+      let remoteRaw = remoteMediaURL?.trimmingCharacters(in: .whitespacesAndNewlines),
+      let remoteURL = URL(string: remoteRaw),
+      let scheme = remoteURL.scheme?.lowercased(),
+      scheme == "http" || scheme == "https"
+    else { return }
+    let destURL = cachedRemoteVoiceURL(for: remoteURL, fileName: fileName)
+    // Already cached (also the cheap early-out after the first successful seed).
+    guard !FileManager.default.fileExists(atPath: destURL.path) else { return }
+    guard
+      let localRaw = localMediaURL?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !localRaw.isEmpty,
+      let localURL = resolveAudioURL(from: localRaw),
+      localURL.isFileURL,
+      FileManager.default.fileExists(atPath: localURL.path)
+    else { return }
+    let srcPath = localURL.path
+    let dstPath = destURL.path
+    DispatchQueue.global(qos: .utility).async {
+      let fm = FileManager.default
+      guard fm.fileExists(atPath: srcPath), !fm.fileExists(atPath: dstPath) else { return }
+      try? fm.copyItem(atPath: srcPath, toPath: dstPath)
+    }
+  }
+
   private func cachedRemoteVoiceURL(for remoteURL: URL, fileName: String?) -> URL {
     let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
     let cacheDir = caches.appendingPathComponent("voice-cache", isDirectory: true)
@@ -5027,6 +5134,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private let statusLabel = UILabel()
   private let pendingStatusView = ChatPendingStatusView()
   private let retryButton = UIButton(type: .system)
+  private let agentRegenerateButton = UIButton(type: .system)
+  private let notSentIndicator = UIImageView()
+  private var notSentIndicatorShown = false
+  private let agentActionBarView = ChatNativeAgentActionBarView()
   private let dayLabel = UILabel()
   private let reactionPillView = UIView()
   private let reactionLabel = UILabel()
@@ -5088,6 +5199,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   var onInlineAttachmentTap: ((ChatListRow) -> Void)?
   var onMediaNaturalSizeResolved: ((String?, String, CGSize) -> Void)?
   var onRetryMessageTap: ((ChatListRow) -> Void)?
+  var onNotSentTap: ((ChatListRow) -> Void)?
+  var onAgentAction: (([String: Any]) -> Void)?
   var onSelectionToggle: ((ChatListRow) -> Void)?
 
   override init(frame: CGRect) {
@@ -5138,6 +5251,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     metaContainerView.addSubview(pendingStatusView)
     contentView.addSubview(dayLabel)
     contentView.addSubview(retryButton)
+    contentView.addSubview(agentRegenerateButton)
+    contentView.addSubview(notSentIndicator)
+    contentView.addSubview(agentActionBarView)
+    agentActionBarView.onNativeEvent = { [weak self] payload in
+      self?.onAgentAction?(payload)
+    }
 
     contentView.addSubview(reactionPillView)
     reactionPillView.addSubview(reactionLabel)
@@ -5284,6 +5403,31 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     retryButton.imageView?.contentMode = .scaleAspectFit
     retryButton.addTarget(self, action: #selector(handleRetryTap), for: .touchUpInside)
 
+    // Agent regenerate — same side-of-bubble placement as the error retry
+    // button, icon only (no text). Re-tinted to the theme in `configure`.
+    agentRegenerateButton.isHidden = true
+    agentRegenerateButton.layer.cornerCurve = .continuous
+    agentRegenerateButton.layer.cornerRadius = 0
+    agentRegenerateButton.backgroundColor = .clear
+    agentRegenerateButton.setImage(
+      UIImage(
+        systemName: "arrow.counterclockwise",
+        withConfiguration: UIImage.SymbolConfiguration(pointSize: 12.0, weight: .semibold)),
+      for: .normal)
+    agentRegenerateButton.imageView?.contentMode = .center
+    agentRegenerateButton.addTarget(
+      self, action: #selector(handleAgentRegenerateTap), for: .touchUpInside)
+
+    notSentIndicator.isHidden = true
+    notSentIndicator.contentMode = .center
+    notSentIndicator.isUserInteractionEnabled = true
+    notSentIndicator.addGestureRecognizer(
+      UITapGestureRecognizer(target: self, action: #selector(handleNotSentTap)))
+    notSentIndicator.tintColor = UIColor(red: 1.0, green: 0.31, blue: 0.29, alpha: 1.0)
+    notSentIndicator.image = UIImage(
+      systemName: "exclamationmark.circle.fill",
+      withConfiguration: UIImage.SymbolConfiguration(pointSize: 17.0, weight: .semibold))
+
     dayLabel.font = UIFont.systemFont(ofSize: 12, weight: .semibold)
     dayLabel.textAlignment = .center
     dayLabel.textColor = UIColor(white: 0.95, alpha: 0.9)
@@ -5324,6 +5468,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     statusLabel.isHidden = true
     dayLabel.isHidden = true
     reactionPillView.isHidden = true
+    agentActionBarView.isHidden = true
   }
 
   required init?(coder: NSCoder) {
@@ -5428,6 +5573,45 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     }
     self.skipRemoteMediaLoad = skipRemoteMediaLoad
     self.preferredLocalMediaURLOverride = preferredLocalMediaURLOverride
+    agentActionBarView.isHidden = true
+    agentRegenerateButton.isHidden = true
+
+    if row.kind == .message, row.messageType == "agent_actions" {
+      isGhostHidden = hiddenMessageId == row.messageId
+      VoiceBubblePlaybackCoordinator.shared.unbind(cell: self)
+      resetStickerAnimation()
+      stopTypingShimmer()
+      richTextView.reset()
+      replyPreviewView.reset()
+      linkPreviewView.reset()
+      dayLabel.isHidden = true
+      bubbleView.isHidden = true
+      tailView.isHidden = true
+      messageLabel.isHidden = true
+      richTextView.isHidden = true
+      replyPreviewView.isHidden = true
+      linkPreviewView.isHidden = true
+      mediaContainerView.isHidden = true
+      inlineAttachmentView.isHidden = true
+      metaContainerView.isHidden = true
+      reactionPillView.isHidden = true
+      retryButton.isHidden = true
+      selectionCircleView.isHidden = true
+      mediaProgressSpinner.stopAnimating()
+      mediaProgressOverlayView.isHidden = true
+      mediaProgressSizeLabel.isHidden = true
+      agentActionBarView.isHidden = isGhostHidden
+      if !isGhostHidden {
+        _ = agentActionBarView.configure(
+          row: row,
+          appearance: appearance,
+          availableWidth: max(1.0, bounds.width - (bubbleSideMargin * 2.0))
+        )
+      }
+      setNeedsLayout()
+      return
+    }
+
     switch row.kind {
     case .day:
       isGhostHidden = false
@@ -5465,18 +5649,48 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       richTextView.isHidden = isGhostHidden || !usesBlockLayout
       replyPreviewView.isHidden = isGhostHidden || !showsReplyPreview
       linkPreviewView.isHidden = isGhostHidden || previewURL == nil
-      if row.messageType == "typing" {
+      if row.messageType == "typing" || row.messageType == "agent_progress_tree" {
+        // Agent "Thinking…" / tool-progress placeholders shimmer like typing.
         startTypingShimmer()
-        messageLabel.font = UIFont.systemFont(ofSize: 13, weight: .regular)
+        messageLabel.font =
+          row.messageType == "typing"
+          ? UIFont.systemFont(ofSize: 13, weight: .regular)
+          : bubbleMessageFont
       } else {
         stopTypingShimmer()
         messageLabel.font = bubbleMessageFont
       }
       mediaContainerView.isHidden = isGhostHidden || row.visualKind == .text
       inlineAttachmentView.isHidden = isGhostHidden || !hasInlineAttachment(row)
-      metaContainerView.isHidden = isGhostHidden || usesTransparentAgentStreaming
+      // Hide the timestamp on an agent bubble until the response is finalized —
+      // otherwise the time reserves width and balloons the empty/"Thinking…"
+      // bubble. Covers the streaming-text, typing, and progress-tree phases.
+      metaContainerView.isHidden =
+        isGhostHidden || usesTransparentAgentStreaming || agentResponseInProgress(row)
       selectionCircleView.isHidden = !selectionMode || isGhostHidden
       selectionCircleView.configure(selected: selected, appearance: appearance)
+
+      // Side regenerate button on completed agent bubbles (replaces the old
+      // bottom action bar). Hidden while streaming / in selection mode.
+      let showsRegenerate = !isGhostHidden && !selectionMode && showsAgentRegenerate(row)
+      agentRegenerateButton.isHidden = !showsRegenerate
+      if showsRegenerate {
+        agentRegenerateButton.tintColor = appearance.timeColorThem.withAlphaComponent(0.75)
+        agentRegenerateButton.backgroundColor = .clear
+      }
+
+      // "Not sent" indicator on a failed outgoing message — sits in the me-side
+      // margin and slides in once when the failure first appears.
+      let showsNotSent =
+        !isGhostHidden && !selectionMode && row.isMe && row.isDeliveryFailed
+      let wasNotSentVisible = !notSentIndicator.isHidden
+      notSentIndicator.isHidden = !showsNotSent
+      if !showsNotSent {
+        notSentIndicatorShown = false
+      } else if !wasNotSentVisible {
+        // First reveal for this cell — animate in layoutSubviews once positioned.
+        notSentIndicatorShown = false
+      }
 
       // Agent/Mention labeling
       let isTyping = row.messageType == "typing"
@@ -5656,6 +5870,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     onInlineAttachmentTap = nil
     onMediaNaturalSizeResolved = nil
     onRetryMessageTap = nil
+    onNotSentTap = nil
+    onAgentAction = nil
     onSelectionToggle = nil
     row = nil
     selectionMode = false
@@ -5706,6 +5922,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     statusLabel.isHidden = true
     statusLabel.text = nil
     retryButton.isHidden = true
+    agentRegenerateButton.isHidden = true
+    notSentIndicator.isHidden = true
+    notSentIndicator.transform = .identity
+    notSentIndicator.alpha = 1.0
+    notSentIndicatorShown = false
+    agentActionBarView.isHidden = true
     renderedStatusKey = nil
     isContextMenuExtracted = false
     isContextMenuHeld = false
@@ -5777,8 +5999,22 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       return
     }
 
+    if row.messageType == "agent_actions" {
+      let selectionInset = selectionMode ? messageSelectionLeadingInset : 0.0
+      let layoutWidth = max(1.0, bounds.width)
+      agentActionBarView.frame = pixelAlignedRect(
+        CGRect(
+          x: bubbleSideMargin + selectionInset,
+          y: max(0.0, bounds.height - 36.0),
+          width: max(1.0, layoutWidth - (bubbleSideMargin * 2.0)),
+          height: 36.0
+        )
+      )
+      return
+    }
+
     let selectionInset = selectionMode ? messageSelectionLeadingInset : 0.0
-    let layoutWidth = max(1.0, bounds.width - selectionInset)
+    let layoutWidth = max(1.0, bounds.width)
     let metrics: ChatMessageBubbleLayoutMetrics
     if let cached = cachedLayoutMetrics, cachedLayoutWidth == layoutWidth, !cached.usesRichTextLayout {
       metrics = cached
@@ -6102,7 +6338,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
     layoutMetaLabels(for: row)
 
-    if row.messageType == "typing" {
+    if row.messageType == "typing" || row.messageType == "agent_progress_tree" {
       if let mask = messageLabel.layer.mask as? CAGradientLayer {
         mask.frame = CGRect(
           x: -messageLabel.bounds.width * 2, y: 0, width: messageLabel.bounds.width * 5,
@@ -6142,6 +6378,48 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         CGRect(x: retryX, y: retryY, width: retrySize, height: retrySize)
       )
       retryButton.layer.cornerRadius = retrySize * 0.5
+    }
+
+    if agentRegenerateButton.isHidden {
+      agentRegenerateButton.frame = .zero
+    } else {
+      // Agent bubbles are always them-side: sit the button just past the
+      // bubble's trailing edge, near its bottom (mirrors the error retry).
+      let regenSize: CGFloat = 22.0
+      let regenX = min(bounds.width - regenSize - 8.0, bubbleFrame.maxX + 7.0)
+      let regenY = min(
+        max(4.0, bubbleFrame.maxY - regenSize - 5.0),
+        max(4.0, bounds.height - regenSize - 2.0)
+      )
+      agentRegenerateButton.frame = pixelAlignedRect(
+        CGRect(x: regenX, y: regenY, width: regenSize, height: regenSize)
+      )
+    }
+
+    if notSentIndicator.isHidden {
+      notSentIndicator.frame = .zero
+    } else {
+      // Outgoing (me) bubbles are trailing-aligned: place the "!" just left of the
+      // bubble's leading edge, vertically centered on it (iMessage "not delivered").
+      let notSentSize: CGFloat = 20.0
+      let notSentX = max(6.0, bubbleFrame.minX - notSentSize - 6.0)
+      let notSentY = max(4.0, bubbleFrame.midY - notSentSize / 2.0)
+      notSentIndicator.frame = pixelAlignedRect(
+        CGRect(x: notSentX, y: notSentY, width: notSentSize, height: notSentSize)
+      )
+      if !notSentIndicatorShown {
+        notSentIndicatorShown = true
+        // Slide-in reveal: start nudged toward the bubble + faded, settle into place.
+        notSentIndicator.alpha = 0.0
+        notSentIndicator.transform = CGAffineTransform(translationX: notSentSize * 0.6, y: 0.0)
+        UIView.animate(
+          withDuration: 0.28, delay: 0.0, usingSpringWithDamping: 0.72,
+          initialSpringVelocity: 0.4, options: [.allowUserInteraction, .beginFromCurrentState]
+        ) {
+          self.notSentIndicator.alpha = 1.0
+          self.notSentIndicator.transform = .identity
+        }
+      }
     }
 
     if !reactionPillView.isHidden {
@@ -7525,6 +7803,36 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     onRetryMessageTap?(row)
   }
 
+  @objc private func handleNotSentTap() {
+    guard let row else { return }
+    onNotSentTap?(row)
+  }
+
+  @objc private func handleAgentRegenerateTap() {
+    guard let row else { return }
+    let sourceMessageId = row.agentActionSourceId ?? ""
+    guard !sourceMessageId.isEmpty else { return }
+    onAgentAction?([
+      "type": "agentMessageAction",
+      "action": "regenerate",
+      "sourceMessageId": sourceMessageId,
+      "sourceText": row.agentActionSourceText ?? row.plainContent ?? row.text,
+      "regeneratePrompt": row.agentRegeneratePrompt ?? "",
+    ])
+  }
+
+  /// Agent message that offers regenerate. Now scoped to *errored* responses
+  /// only (a failed turn the user can retry) — successful answers no longer
+  /// carry the side button. Drives both the side button and long-press menu.
+  private func showsAgentRegenerate(_ row: ChatListRow) -> Bool {
+    row.kind == .message
+      && row.isAgentMessage
+      && row.isAgentError
+      && !row.isStreamingText
+      && (row.agentActionSourceId?.isEmpty == false)
+      && (row.agentRegeneratePrompt?.isEmpty == false)
+  }
+
   @objc private func handleSelectionToggle() {
     guard let row else { return }
     onSelectionToggle?(row)
@@ -7603,6 +7911,14 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
   private func applyExternalVoicePlaybackIfNeeded() {
     guard let row, row.visualKind == .voice else { return }
+    // While the sender still has the local file (right after upload, before the
+    // server echo strips localMediaUrl), cache it under the remote URL so the
+    // bubble shows play instead of a download button for our own sent media.
+    VoiceBubblePlaybackCoordinator.shared.seedRemoteVoiceCacheFromLocal(
+      localMediaURL: row.localMediaUrl,
+      remoteMediaURL: row.mediaUrl,
+      fileName: row.fileName
+    )
     let rowId = row.messageId ?? ""
     let externalId = externalVoiceMessageId ?? ""
     guard !rowId.isEmpty else {
