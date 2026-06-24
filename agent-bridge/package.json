@@ -1,0 +1,17 @@
+{
+  "name": "vibe-bridge",
+  "version": "0.1.0",
+  "description": "Vibe agent bridge — run @claude / @codex on your own computer, driven from the Vibe app.",
+  "bin": {
+    "vibe-bridge": "bin/vibe-bridge.js"
+  },
+  "main": "bin/vibe-bridge.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "phoenix": "^1.7.0",
+    "ws": "^8.16.0"
+  },
+  "license": "MIT"
+}

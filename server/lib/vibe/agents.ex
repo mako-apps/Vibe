@@ -20,7 +20,7 @@ defmodule Vibe.Agents do
   alias Vibe.Subscriptions
 
   @builder_kind "vibeagent_builder"
-  @reserved_usernames ["vibeagent"]
+  @reserved_usernames ["vibeagent", "claude", "codex"]
   @default_output_modes ["text"]
 
   def default_output_modes, do: @default_output_modes

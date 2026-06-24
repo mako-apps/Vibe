@@ -16,7 +16,7 @@ defmodule Vibe.Accounts do
   @legacy_pbkdf2_iterations 1_000
   @phone_min_digits 7
   @phone_max_digits 15
-  @reserved_usernames ["vibeagent"]
+  @reserved_usernames ["vibeagent", "claude", "codex"]
 
   def get_user(id), do: Repo.get(User, id)
 

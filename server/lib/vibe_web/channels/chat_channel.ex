@@ -1,5 +1,6 @@
 defmodule VibeWeb.ChatChannel do
   use VibeWeb, :channel
+  alias Vibe.AgentBridge
   alias Vibe.Agents
   alias Vibe.Chat
   alias Vibe.Chat.AgentMessageCrypto
@@ -294,7 +295,8 @@ defmodule VibeWeb.ChatChannel do
         nil
       else
         LocalAgentWorker.resolve_handle(mentioned_agent_username) ||
-          LocalAgentWorker.resolve_from_message(reply_message)
+          LocalAgentWorker.resolve_from_message(reply_message) ||
+          local_worker_for_dm(chat_id, user_id)
       end
 
     standalone_agent =
@@ -394,6 +396,13 @@ defmodule VibeWeb.ChatChannel do
          requester_user_id
        ) do
     cond do
+      not LocalAgentWorker.user_allowed?(requester_user_id) ->
+        Logger.warning(
+          "[ChatChannel] local worker blocked: user=#{requester_user_id} not in VIBE_AGENT_WORKER_ALLOWED_USERS"
+        )
+
+        :ok
+
       not LocalAgentWorker.allow_request?(requester_user_id) ->
         LocalAgentWorker.post_notice(
           worker,
@@ -403,11 +412,46 @@ defmodule VibeWeb.ChatChannel do
           data["id"]
         )
 
-      true ->
+      # Preferred path: run on the user's OWN paired computer (their subscription).
+      AgentBridge.online?(requester_user_id) ->
+        broadcast_agent_activity(
+          chat_id,
+          worker.agent_user_id,
+          "#{worker.label} working...",
+          "running"
+        )
+
+        case AgentBridge.dispatch_task(requester_user_id, %{
+               "provider" => worker.handle,
+               "chatId" => chat_id,
+               "prompt" => dispatch_text,
+               "replyToId" => data["id"],
+               "requesterUserId" => requester_user_id
+             }) do
+          :ok ->
+            Logger.info(
+              "[ChatChannel] dispatched @#{worker.handle} to bridge user=#{requester_user_id} chat=#{chat_id}"
+            )
+
+          {:error, :offline} ->
+            # Raced with a disconnect — re-lock to the connect prompt.
+            stop_agent_activity(chat_id, worker.agent_user_id)
+
+            LocalAgentWorker.post_notice(
+              worker,
+              chat_id,
+              "Your computer just went offline. Reconnect it to run @#{worker.handle} tasks.",
+              requester_user_id,
+              data["id"]
+            )
+        end
+
+      # Dev fallback: run on the server itself (VIBE_LOCAL_AGENT_WORKERS=1).
+      LocalAgentWorker.enabled?() ->
         run = fn ->
           broadcast_agent_activity(
             chat_id,
-            LocalAgentWorker.agent_user_id(),
+            worker.agent_user_id,
             "#{worker.label} working...",
             "running"
           )
@@ -422,7 +466,7 @@ defmodule VibeWeb.ChatChannel do
                    progress_callback: fn event ->
                      broadcast_agent_activity(
                        chat_id,
-                       LocalAgentWorker.agent_user_id(),
+                       worker.agent_user_id,
                        Map.get(event, "label") || "#{worker.label} working...",
                        "running",
                        Map.get(event, "tool")
@@ -440,7 +484,7 @@ defmodule VibeWeb.ChatChannel do
                 )
             end
           after
-            stop_agent_activity(chat_id, LocalAgentWorker.agent_user_id())
+            stop_agent_activity(chat_id, worker.agent_user_id)
           end
         end
 
@@ -457,6 +501,16 @@ defmodule VibeWeb.ChatChannel do
           _ ->
             :ok
         end
+
+      # No computer connected: tell the user how to connect.
+      true ->
+        LocalAgentWorker.post_notice(
+          worker,
+          chat_id,
+          "Connect your computer to run @#{worker.handle}. Open #{worker.label} in Vibe and tap Connect to pair this chat with your machine.",
+          requester_user_id,
+          data["id"]
+        )
     end
   end
 
@@ -549,6 +603,21 @@ defmodule VibeWeb.ChatChannel do
     case LocalAgentWorker.extract_reserved_mention(text) do
       %{handle: handle} -> handle
       _ -> nil
+    end
+  end
+
+  # In a 1:1 chat with a Claude/Codex shadow user, route plain messages (no
+  # @mention needed) to that bridge worker — the whole DM is "talk to Claude".
+  defp local_worker_for_dm(chat_id, user_id) do
+    case Chat.get_room_type(chat_id) do
+      "dm" ->
+        chat_id
+        |> Chat.get_participant_ids()
+        |> Enum.reject(&(&1 == user_id))
+        |> Enum.find_value(&LocalAgentWorker.resolve_by_agent_user_id/1)
+
+      _ ->
+        nil
     end
   end
 

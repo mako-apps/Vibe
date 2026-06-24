@@ -15,6 +15,7 @@ defmodule Vibe.Application do
     ensure_ets_table(:rate_limiter)
     ensure_ets_table(:chat_home_cache)
     ensure_ets_table(:local_agent_worker_ratelimit)
+    ensure_ets_table(:local_agent_worker_sessions)
 
     children = [
       # Start the Telemetry supervisor
@@ -55,7 +56,17 @@ defmodule Vibe.Application do
     # See https://hexdocs.pm/elixir/Supervisor.html
     # for other strategies and supported options
     opts = [strategy: :one_for_one, name: Vibe.Supervisor]
-    Supervisor.start_link(children, opts)
+
+    case Supervisor.start_link(children, opts) do
+      {:ok, pid} ->
+        # Seed the Claude / Codex agent users so they are searchable and can be
+        # DM'd. Idempotent upsert; runs after the Repo is up.
+        Task.start(fn -> Vibe.AI.LocalAgentWorker.ensure_agent_users() end)
+        {:ok, pid}
+
+      other ->
+        other
+    end
   end
 
   # Tell Phoenix to update the endpoint configuration

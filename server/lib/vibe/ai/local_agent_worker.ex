@@ -9,13 +9,17 @@ defmodule Vibe.AI.LocalAgentWorker do
   alias Vibe.Repo
 
   @agent_user_id Vibe.AI.GroupAgent.agent_user_id()
-  @agent_username "vibe_ai_agent_0001"
+  # Distinct agent user identities so @claude and @codex are separate, searchable
+  # users you can DM, each with their own avatar — instead of one shared bot user.
+  @claude_agent_user_id "11111111-1111-1111-1111-111111111111"
+  @codex_agent_user_id "22222222-2222-2222-2222-222222222222"
   @default_timeout_ms 120_000
   @max_prompt_length 8_000
   @max_tool_events 16
   @max_activity_summary_items 6
   @max_payload_preview_bytes 1_200
   @rate_limit_table :local_agent_worker_ratelimit
+  @session_table :local_agent_worker_sessions
   @default_cooldown_ms 8_000
 
   @workers %{
@@ -23,17 +27,51 @@ defmodule Vibe.AI.LocalAgentWorker do
       handle: "codex",
       label: "Codex",
       command_env: "VIBE_CODEX_COMMAND",
-      default_command: "codex"
+      default_command: "codex",
+      agent_user_id: @codex_agent_user_id,
+      username: "codex",
+      name: "Codex"
     },
     "claude" => %{
       handle: "claude",
       label: "Claude",
       command_env: "VIBE_CLAUDE_COMMAND",
-      default_command: "claude"
+      default_command: "claude",
+      agent_user_id: @claude_agent_user_id,
+      username: "claude",
+      name: "Claude"
     }
   }
 
   def agent_user_id, do: @agent_user_id
+
+  @doc "All worker definitions keyed by handle."
+  def workers, do: @workers
+
+  @doc "List of all worker definitions."
+  def list_workers, do: Map.values(@workers)
+
+  @doc "The dedicated agent user id for a worker (claude/codex are distinct users)."
+  def worker_agent_user_id(%{agent_user_id: id}), do: id
+
+  @doc "Resolve a worker by its dedicated shadow-user id (e.g. for DM auto-routing)."
+  def resolve_by_agent_user_id(user_id) when is_binary(user_id) do
+    normalized = user_id |> String.trim() |> String.downcase()
+
+    Enum.find_value(@workers, fn {_handle, worker} ->
+      if String.downcase(worker.agent_user_id) == normalized, do: worker
+    end)
+  end
+
+  def resolve_by_agent_user_id(_), do: nil
+
+  @doc """
+  Upsert the Claude/Codex agent user records so they are searchable users you can
+  DM. Idempotent — safe to call on every boot.
+  """
+  def ensure_agent_users do
+    Enum.each(list_workers(), &ensure_agent_user_record/1)
+  end
 
   def resolve_handle(value) when is_binary(value) do
     value
@@ -129,13 +167,79 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
+  @doc """
+  Authorization gate. If `VIBE_AGENT_WORKER_ALLOWED_USERS` is set (comma-separated
+  user IDs), only those users may drive the local worker. If unset, all chat
+  participants are allowed (backwards compatible). Set it whenever the worker runs
+  with write/execute permissions so only you can trigger jobs on your machine.
+  """
+  def user_allowed?(user_id) do
+    case allowed_users() do
+      [] -> true
+      list -> is_binary(user_id) and user_id in list
+    end
+  end
+
+  defp allowed_users do
+    case normalize_string(System.get_env("VIBE_AGENT_WORKER_ALLOWED_USERS")) do
+      nil ->
+        []
+
+      raw ->
+        raw
+        |> String.split(",")
+        |> Enum.map(&String.trim/1)
+        |> Enum.reject(&(&1 == ""))
+    end
+  end
+
+  defp ensure_session_table do
+    case :ets.whereis(@session_table) do
+      :undefined ->
+        :ets.new(@session_table, [:set, :public, :named_table, {:read_concurrency, true}])
+        :ok
+
+      _ ->
+        :ok
+    end
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp lookup_session(nil, _handle), do: nil
+
+  defp lookup_session(chat_id, handle) do
+    ensure_session_table()
+
+    case :ets.lookup(@session_table, {chat_id, handle}) do
+      [{_, session_id}] -> session_id
+      _ -> nil
+    end
+  end
+
+  defp store_session(nil, _handle, _session_id), do: :ok
+  defp store_session(_chat_id, _handle, nil), do: :ok
+
+  defp store_session(chat_id, handle, session_id) do
+    ensure_session_table()
+    :ets.insert(@session_table, {{chat_id, handle}, session_id})
+    :ok
+  end
+
+  defp session_id_from_output(output) do
+    output
+    |> decoded_events()
+    |> Enum.find_value(fn event -> normalize_string(event["session_id"]) end)
+  end
+
   def handle_chat_message(worker, chat_id, prompt, opts \\ []) when is_map(worker) do
     reply_to_id = Keyword.get(opts, :reply_to_id)
     requester_user_id = Keyword.get(opts, :requester_user_id)
     progress_callback = Keyword.get(opts, :progress_callback, fn _event -> :ok end)
 
     with {:ok, normalized_prompt} <- normalize_prompt(worker, prompt),
-         {:ok, result} <- run(worker, normalized_prompt, progress_callback: progress_callback) do
+         {:ok, result} <-
+           run(worker, normalized_prompt, progress_callback: progress_callback, chat_id: chat_id) do
       post_worker_message(
         worker,
         chat_id,
@@ -201,6 +305,118 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
+  # ── Bridge entrypoints ──────────────────────────────────────────────
+  # The bridge daemon runs claude/codex on the user's own computer and ships the
+  # RAW stream-json output back. The server reuses the full parsing pipeline below
+  # so the daemon stays thin and we have one source of truth for parsing.
+
+  @doc """
+  Turn a single raw stream-json line from a bridge daemon into a progress event
+  (or nil if the line carries no tool activity). Used to stream live progress
+  into the chat while the task runs on the user's machine.
+  """
+  def bridge_progress_event(provider, line) when is_binary(line) do
+    case resolve_handle(provider) do
+      nil -> nil
+      worker -> progress_event_from_line(line, worker)
+    end
+  end
+
+  def bridge_progress_event(_provider, _line), do: nil
+
+  @doc """
+  Parse a completed bridge run (raw output + exit status) and post the result as
+  the agent's message into the chat. Mirrors `handle_chat_message/4`'s success and
+  failure formatting, but for output produced on the user's computer.
+  """
+  def deliver_bridge_result(provider, chat_id, output, exit_status, duration_ms, opts \\ [])
+      when is_binary(provider) and is_binary(chat_id) and is_binary(output) do
+    case resolve_handle(provider) do
+      nil ->
+        {:error, :unknown_provider}
+
+      worker ->
+        reply_to_id = Keyword.get(opts, :reply_to_id)
+        requester_user_id = Keyword.get(opts, :requester_user_id)
+        extracted = extract_result(worker, output)
+        ok = exit_status == 0
+        base_text = extracted.text || fallback_output(output)
+
+        body =
+          if ok do
+            visible_response_text(base_text, extracted.tool_events)
+          else
+            visible_response_text(
+              command_failed_text(worker, exit_status, base_text),
+              extracted.tool_events
+            )
+          end
+
+        post_worker_message(
+          worker,
+          chat_id,
+          body,
+          %{
+            "agentWorker" => true,
+            "agentWorkerProvider" => worker.handle,
+            "agentWorkerVia" => "bridge",
+            "agentWorkerExitStatus" => exit_status,
+            "agentWorkerDurationMs" => duration_ms,
+            "agentWorkerOk" => ok,
+            "agentWorkerToolEvents" => extracted.tool_events,
+            "agentWorkerAvailableTools" => extracted.available_tools,
+            "agentWorkerRawEventCount" => extracted.raw_event_count,
+            "progressNodes" => extracted.progress_nodes
+          },
+          reply_to_id,
+          requester_user_id
+        )
+    end
+  end
+
+  @doc "Post a short notice (e.g. errors from the bridge) attributed to a worker."
+  def post_bridge_notice(provider, chat_id, text, requester_user_id, reply_to_id) do
+    case resolve_handle(provider) do
+      nil -> {:error, :unknown_provider}
+      worker -> post_notice(worker, chat_id, text, requester_user_id, reply_to_id)
+    end
+  end
+
+  # ── Activity broadcast helpers (shared by chat + bridge channels) ────
+
+  @doc "Broadcast a typing/agent-progress event into a chat for an agent."
+  def broadcast_activity(chat_id, agent_user_id, label, status, tool \\ nil) do
+    VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "typing", %{
+      "userId" => agent_user_id,
+      "isAgent" => true
+    })
+
+    payload =
+      %{"userId" => agent_user_id, "isAgent" => true, "label" => label, "status" => status}
+      |> then(fn payload ->
+        case tool do
+          value when is_binary(value) and value != "" -> Map.put(payload, "tool", value)
+          _ -> payload
+        end
+      end)
+
+    VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-progress", payload)
+  end
+
+  @doc "Broadcast that an agent has finished working in a chat."
+  def stop_activity(chat_id, agent_user_id) do
+    VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-progress", %{
+      "userId" => agent_user_id,
+      "isAgent" => true,
+      "status" => "done"
+    })
+
+    VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "stop-typing", %{
+      "userId" => agent_user_id,
+      "isAgent" => true
+    })
+  end
+
   defp do_run(%{handle: "codex"} = worker, executable, prompt, opts) do
     sandbox =
       System.get_env("VIBE_CODEX_SANDBOX")
@@ -251,9 +467,9 @@ defmodule Vibe.AI.LocalAgentWorker do
         "--output-format",
         output_format,
         "--permission-mode",
-        permission_mode,
-        "--no-session-persistence"
+        permission_mode
       ] ++
+        claude_session_args(worker, Keyword.get(opts, :chat_id)) ++
         maybe_claude_verbose_args(output_format) ++
         maybe_model_args("VIBE_CLAUDE_MODEL", "--model") ++
         maybe_single_arg("VIBE_CLAUDE_MCP_CONFIG", "--mcp-config") ++
@@ -261,6 +477,16 @@ defmodule Vibe.AI.LocalAgentWorker do
         maybe_single_arg("VIBE_CLAUDE_DISALLOWED_TOOLS", "--disallowedTools") ++ ["--", prompt]
 
     run_command(worker, executable, args, opts)
+  end
+
+  # Per-chat conversation continuity: resume the same Claude session for a chat so
+  # follow-up @claude messages keep context. One-off runs (no chat_id) stay stateless.
+  defp claude_session_args(worker, chat_id) do
+    case lookup_session(chat_id, worker.handle) do
+      session_id when is_binary(session_id) -> ["--resume", session_id]
+      _ when is_binary(chat_id) -> []
+      _ -> ["--no-session-persistence"]
+    end
   end
 
   defp run_command(worker, executable, args, opts) do
@@ -287,6 +513,10 @@ defmodule Vibe.AI.LocalAgentWorker do
         extracted = extract_result(worker, output)
         text = extracted.text || fallback_output(output)
         ok = status == 0
+
+        if ok do
+          store_session(Keyword.get(opts, :chat_id), worker.handle, session_id_from_output(output))
+        end
 
         Logger.info(
           "[LocalAgentWorker] finish provider=#{worker.handle} status=#{status} duration_ms=#{duration_ms} text_len=#{String.length(text)}"
@@ -351,7 +581,9 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   defp post_worker_message(worker, chat_id, body, metadata, reply_to_id, requester_user_id) do
-    with :ok <- ensure_agent_user_record() do
+    agent_user_id = worker.agent_user_id
+
+    with :ok <- ensure_agent_user_record(worker) do
       message_id = Ecto.UUID.generate()
       timestamp = System.system_time(:millisecond)
       plain_text = normalize_string(body) || ""
@@ -360,14 +592,14 @@ defmodule Vibe.AI.LocalAgentWorker do
         metadata
         |> Map.put("isAgentMessage", true)
         |> Map.put("agentName", worker.label)
-        |> Map.put("agentUserId", @agent_user_id)
+        |> Map.put("agentUserId", agent_user_id)
         |> Map.put("agentUsername", worker.handle)
         |> Map.put("agentHandle", "@#{worker.handle}")
 
       attrs = %{
         id: message_id,
         chat_id: chat_id,
-        from_id: @agent_user_id,
+        from_id: agent_user_id,
         encrypted_content: AgentMessageCrypto.encrypt_for_storage(plain_text),
         type: "text",
         metadata: metadata,
@@ -379,7 +611,7 @@ defmodule Vibe.AI.LocalAgentWorker do
         {:ok, _message} ->
           payload = %{
             "id" => message_id,
-            "fromId" => @agent_user_id,
+            "fromId" => agent_user_id,
             "chatId" => chat_id,
             "encryptedContent" => "",
             "plainContent" => plain_text,
@@ -389,7 +621,7 @@ defmodule Vibe.AI.LocalAgentWorker do
             "status" => "sent",
             "isAgentMessage" => true,
             "agentName" => worker.label,
-            "agentUserId" => @agent_user_id,
+            "agentUserId" => agent_user_id,
             "agentUsername" => worker.handle,
             "agentHandle" => "@#{worker.handle}",
             "metadata" => metadata,
@@ -397,7 +629,7 @@ defmodule Vibe.AI.LocalAgentWorker do
           }
 
           VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "message", payload)
-          notify_chat_participants(chat_id, message_id, timestamp, plain_text)
+          notify_chat_participants(chat_id, agent_user_id, message_id, timestamp, plain_text)
           {:ok, %{message_id: message_id, timestamp: timestamp}}
 
         error ->
@@ -406,15 +638,15 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
-  defp notify_chat_participants(chat_id, message_id, timestamp, body) do
+  defp notify_chat_participants(chat_id, agent_user_id, message_id, timestamp, body) do
     Chat.get_all_participant_settings(chat_id)
     |> Enum.each(fn participant ->
-      if participant.user_id != @agent_user_id do
+      if participant.user_id != agent_user_id do
         if participant.deleted, do: Chat.restore_if_deleted(chat_id, participant.user_id)
 
         VibeWeb.Endpoint.broadcast!("user:#{participant.user_id}", "new_message", %{
           chat_id: chat_id,
-          from_id: @agent_user_id,
+          from_id: agent_user_id,
           message_id: message_id,
           timestamp: timestamp,
           muted: participant.muted || false
@@ -425,7 +657,7 @@ defmodule Vibe.AI.LocalAgentWorker do
             Notifications.send_message_push(participant.user_id, %{
               "chat_id" => chat_id,
               "message_id" => message_id,
-              "from_id" => @agent_user_id,
+              "from_id" => agent_user_id,
               "type" => "text",
               "body" => body
             })
@@ -434,25 +666,27 @@ defmodule Vibe.AI.LocalAgentWorker do
     end)
   end
 
-  defp ensure_agent_user_record do
+  defp ensure_agent_user_record(worker) do
     now = NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
-    agent_user_id = Ecto.UUID.dump!(@agent_user_id)
+    agent_user_id = Ecto.UUID.dump!(worker.agent_user_id)
 
     Repo.insert_all(
       "users",
       [
         %{
           id: agent_user_id,
-          username: @agent_username,
+          username: worker.username,
+          name: worker.name,
           password_hash: "agent",
           public_key: "agent",
           device_id: "agent",
+          is_agent: true,
           inserted_at: now,
           updated_at: now
         }
       ],
       conflict_target: [:id],
-      on_conflict: [set: [updated_at: now]]
+      on_conflict: [set: [updated_at: now, name: worker.name, is_agent: true]]
     )
 
     :ok

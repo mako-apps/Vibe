@@ -54,6 +54,9 @@ defmodule VibeWeb.Router do
     get "/servers", ApiController, :servers
     get "/vapid-key", ApiController, :vapid_key
     get "/push/avatar/:user_id", PushAvatarController, :show
+
+    # Agent bridge daemon redeems a pairing code (no user auth — code-scoped).
+    post "/agent-bridge/pair", AgentBridgeController, :pair
   end
 
   scope "/api", VibeWeb do
@@ -180,6 +183,11 @@ defmodule VibeWeb.Router do
     post "/channel/:id/schedule", ScheduleController, :create
     get "/channel/:id/schedule", ScheduleController, :list
     delete "/schedule/:id", ScheduleController, :cancel
+
+    # Agent Bridge (pair your own computer to run @claude / @codex locally)
+    post "/agent-bridge/pairing", AgentBridgeController, :request_pairing
+    get "/agent-bridge/status", AgentBridgeController, :status
+    delete "/agent-bridge", AgentBridgeController, :revoke
 
     # Media Upload
     post "/media/upload", MediaController, :upload

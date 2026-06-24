@@ -325,8 +325,40 @@ struct ChatRoute: Identifiable, Hashable {
   /// Attached agent's event-inbox mode (`per_event` / `batched_summary`). Drives
   /// whether the chat view hides agent event notifications behind the Inbox banner.
   let agentEventInboxMode: String?
+  /// `"claude"` / `"codex"` when this chat talks to a computer-bridge agent. Drives
+  /// the connect-state gate in the chat view: when no paired computer is online the
+  /// composer is hidden and a Connect panel is shown instead.
+  let bridgeProvider: String?
 
   var id: String { chatId }
+
+  /// Reserved shadow-user ids for the two computer-bridge agents (seeded server-side).
+  static let claudeAgentUserId = "11111111-1111-1111-1111-111111111111"
+  static let codexAgentUserId = "22222222-2222-2222-2222-222222222222"
+
+  /// Resolves the bridge provider for a chat. The reserved user ids are the strong
+  /// signal; the name is only consulted for confirmed agent users so a human named
+  /// "claude" never trips the gate.
+  static func resolveBridgeProvider(peerUserId: String?, name: String?, isAgent: Bool) -> String? {
+    let pid = peerUserId?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if pid == claudeAgentUserId { return "claude" }
+    if pid == codexAgentUserId { return "codex" }
+    guard isAgent else { return nil }
+    switch name?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+    case "claude": return "claude"
+    case "codex": return "codex"
+    default: return nil
+    }
+  }
+
+  /// Display name for a bridge provider id.
+  static func bridgeDisplayName(for provider: String) -> String {
+    switch provider.lowercased() {
+    case "claude": return "Claude"
+    case "codex": return "Codex"
+    default: return provider.capitalized
+    }
+  }
 
   /// True when this route opens a "talk to the agent" chat.
   var isAgentChat: Bool { isAgent }
@@ -363,18 +395,23 @@ struct ChatRoute: Identifiable, Hashable {
     isGroup: Bool,
     unreadCount: Int = 0,
     initialRows: [[String: Any]],
-    agentEventInboxMode: String? = nil
+    agentEventInboxMode: String? = nil,
+    bridgeProvider: String? = nil
   ) {
     self.chatId = chatId
     self.title = title
     self.peerUserId = peerUserId
     self.peerAgentId = peerAgentId
-    self.isAgent = isAgent || (peerAgentId.map { !$0.isEmpty } ?? false)
+    let resolvedIsAgent = isAgent || (peerAgentId.map { !$0.isEmpty } ?? false)
+    self.isAgent = resolvedIsAgent
     self.avatarURI = avatarURI
     self.isGroup = isGroup
     self.unreadCount = max(0, unreadCount)
     self.initialRows = initialRows
     self.agentEventInboxMode = agentEventInboxMode
+    self.bridgeProvider =
+      bridgeProvider
+      ?? Self.resolveBridgeProvider(peerUserId: peerUserId, name: title, isAgent: resolvedIsAgent)
   }
 
   init(row: ChatHomeListRow) {
@@ -1624,6 +1661,8 @@ private struct ChatHomeScreen: View {
         chatId: result.chatID,
         title: user.username,
         peerUserId: user.userID,
+        peerAgentId: user.bridgeAgentRouteId,
+        isAgent: user.isAgent || user.bridgeProvider != nil,
         avatarURI: ChatAvatarURLResolver.resolve(
           rawAvatar: user.profileImage,
           peerUserId: user.userID,
@@ -1631,7 +1670,8 @@ private struct ChatHomeScreen: View {
           preferPushAvatar: true
         ),
         isGroup: false,
-        initialRows: result.messages
+        initialRows: result.messages,
+        bridgeProvider: user.bridgeProvider
       )
       coordinator.openChat(route)
       await model.refresh()
@@ -2571,6 +2611,8 @@ private struct ContactsPageView: View {
         chatId: result.chatID,
         title: user.username,
         peerUserId: user.userID,
+        peerAgentId: user.bridgeAgentRouteId,
+        isAgent: user.isAgent || user.bridgeProvider != nil,
         avatarURI: ChatAvatarURLResolver.resolve(
           rawAvatar: user.profileImage,
           peerUserId: user.userID,
@@ -2578,7 +2620,8 @@ private struct ContactsPageView: View {
           preferPushAvatar: true
         ),
         isGroup: false,
-        initialRows: result.messages
+        initialRows: result.messages,
+        bridgeProvider: user.bridgeProvider
       )
       coordinator.openChat(route)
       return route
@@ -2846,6 +2889,12 @@ final class ChatConversationController: UIViewController {
   private var engineBindingUserId: String?
   private var pendingAppearanceForAttachment: [String: Any]?
   private var pendingInputActivationForAttachment = false
+  // Computer-bridge agent (Claude/Codex) connect gate. Non-nil while the chat is
+  // an unconnected bridge-agent chat: the composer is hidden and a Connect panel
+  // is shown until a paired computer comes online.
+  private var agentConnectModel: AgentConnectModel?
+  private var agentConnectHost: UIHostingController<AgentConnectPanel>?
+  private var bridgeConnectedThisSession = false
 
   /// The chat currently shown. Used by the coordinator to avoid pushing a
   /// duplicate of the chat already on top of the navigation stack.
@@ -2958,6 +3007,7 @@ final class ChatConversationController: UIViewController {
     isDismantled = true
     postPresentationActivationWorkItem?.cancel()
     postPresentationActivationWorkItem = nil
+    removeAgentConnectPanel()
     closeOpenedChatChannel()
   }
 
@@ -2994,6 +3044,9 @@ final class ChatConversationController: UIViewController {
 
   private func applyRoute(forceChannelRefresh: Bool) {
     view.backgroundColor = Self.backgroundColor(isDark: isDark)
+    // Clear any previous bridge-agent connect gate before reconfiguring; the input
+    // activation below re-establishes it when the new route is an unconnected agent.
+    resetAgentConnectGate()
     currentPage = .chat
     appShellRouteLog(
       "ChatConversationController applyRoute chatId=\(route.chatId) title=\(route.title) forceRefresh=\(forceChannelRefresh) initialRows=\(route.initialRows.count)")
@@ -3065,6 +3118,13 @@ final class ChatConversationController: UIViewController {
     }
     markRouteSurfaceStep("page")
     mainView.setStandaloneProfileMode(false)
+    // setStandaloneProfileMode(false) re-enables the composer — re-assert the
+    // bridge-agent gate so an unconnected Claude/Codex chat stays input-less.
+    if !deferSurfaceUntilAttached, let provider = route.bridgeProvider, !provider.isEmpty,
+      !bridgeConnectedThisSession
+    {
+      applyAgentConnectGate(provider: provider, reason: "applyRoute-afterProfileMode")
+    }
     mainView.setPage(ChatConversationPage.chat.rawValue, animated: false)
     removeProfileView(animated: false)
     appShellRouteLog(
@@ -3129,6 +3189,11 @@ final class ChatConversationController: UIViewController {
 
   private func applyInputActivation(reason: String) {
     pendingInputActivationForAttachment = false
+    // Computer-bridge agents gate the composer behind a paired computer.
+    if let provider = route.bridgeProvider, !provider.isEmpty, !bridgeConnectedThisSession {
+      applyAgentConnectGate(provider: provider, reason: reason)
+      return
+    }
     let startedAt = CFAbsoluteTimeGetCurrent()
     AppUIStallWatchdog.shared.updateContext(
       "ChatConversationController inputActivation chatId=\(route.chatId) reason=\(reason)"
@@ -3140,6 +3205,76 @@ final class ChatConversationController: UIViewController {
     let durationMs = Int((CFAbsoluteTimeGetCurrent() - startedAt) * 1000)
     appShellRouteLog(
       "ChatConversationController inputActivationDone chatId=\(route.chatId) reason=\(reason) durationMs=\(durationMs)")
+  }
+
+  // MARK: - Agent bridge connect gate
+
+  /// Hides the composer and shows the Connect panel for an unconnected bridge
+  /// agent. The panel polls bridge status and calls back once a computer is online.
+  private func applyAgentConnectGate(provider: String, reason: String) {
+    appShellRouteLog(
+      "ChatConversationController agentConnectGate chatId=\(route.chatId) provider=\(provider) reason=\(reason)")
+    mainView.setInputBarEnabled(false)
+    mainView.setNativeSendEnabled(false)
+
+    let model: AgentConnectModel
+    if let existing = agentConnectModel {
+      model = existing
+    } else {
+      let created = AgentConnectModel(
+        provider: provider,
+        displayName: ChatRoute.bridgeDisplayName(for: provider)
+      )
+      created.onConnected = { [weak self] in
+        self?.handleBridgeConnected()
+      }
+      agentConnectModel = created
+      model = created
+    }
+
+    guard agentConnectHost == nil else {
+      model.startPolling()
+      return
+    }
+    let host = UIHostingController(rootView: AgentConnectPanel(model: model))
+    host.view.backgroundColor = .clear
+    addChild(host)
+    host.view.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(host.view)
+    NSLayoutConstraint.activate([
+      host.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      host.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      host.view.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+    ])
+    host.didMove(toParent: self)
+    agentConnectHost = host
+  }
+
+  private func handleBridgeConnected() {
+    guard !bridgeConnectedThisSession else { return }
+    bridgeConnectedThisSession = true
+    appShellRouteLog(
+      "ChatConversationController agentBridgeConnected chatId=\(route.chatId)")
+    removeAgentConnectPanel()
+    mainView.setInputBarEnabled(true)
+    mainView.setNativeSendEnabled(true)
+  }
+
+  private func removeAgentConnectPanel() {
+    agentConnectModel?.stopPolling()
+    if let host = agentConnectHost {
+      host.willMove(toParent: nil)
+      host.view.removeFromSuperview()
+      host.removeFromParent()
+    }
+    agentConnectHost = nil
+  }
+
+  /// Clears any active connect gate (used when the host is reused for another chat).
+  private func resetAgentConnectGate() {
+    removeAgentConnectPanel()
+    agentConnectModel = nil
+    bridgeConnectedThisSession = false
   }
 
   private func applyPendingInputActivationAfterAttachment(reason: String) {
@@ -4697,8 +4832,27 @@ private struct ContactSearchUser: Identifiable {
   let phoneNumber: String?
   let profileImage: String?
   let publicKey: String?
+  /// Server `isAgent` flag — true for Claude/Codex (and any other agent shadow user).
+  let isAgent: Bool
+  /// Server `agentId` — the attached agent's id when `isAgent` is true.
+  let agentId: String?
 
   var id: String { userID }
+
+  /// `"claude"` / `"codex"` when this search result is a computer-bridge agent.
+  var bridgeProvider: String? {
+    ChatRoute.resolveBridgeProvider(peerUserId: userID, name: handle ?? username, isAgent: isAgent)
+  }
+
+  /// `peerAgentId` to bind for engine routing. For a real agent it's the agent id.
+  /// For a bridge agent (Claude/Codex, which have no Agent record) it's the shadow
+  /// user id — a non-empty value makes the engine send the message in cleartext
+  /// (the server resolves the bridge worker from the DM participant) instead of
+  /// E2E-encrypting to the agent's placeholder key, which would fail.
+  var bridgeAgentRouteId: String? {
+    if bridgeProvider != nil { return userID }
+    return agentId
+  }
 
   var subtitle: String {
     if let phoneNumber { return phoneNumber }
@@ -4719,6 +4873,8 @@ private struct ContactSearchUser: Identifiable {
     if let phoneNumber { value["phoneNumber"] = phoneNumber }
     if let profileImage { value["profileImage"] = profileImage }
     if let publicKey { value["publicKey"] = publicKey }
+    if isAgent { value["isAgent"] = true }
+    if let agentId { value["agentId"] = agentId }
     return value
   }
 
@@ -4744,6 +4900,16 @@ private struct ContactSearchUser: Identifiable {
       payload["profileImage"] ?? payload["profile_image"] ?? payload["avatarUrl"] ?? payload["avatar_url"])
     self.publicKey = Self.normalizedString(
       payload["publicKey"] ?? payload["public_key"] ?? payload["friendKey"] ?? payload["friendPublicKey"])
+    self.isAgent = Self.boolValue(payload["isAgent"] ?? payload["is_agent"])
+    self.agentId = Self.normalizedString(
+      payload["agentId"] ?? payload["agent_id"] ?? payload["friendAgentId"] ?? payload["friend_agent_id"])
+  }
+
+  private static func boolValue(_ value: Any?) -> Bool {
+    if let value = value as? Bool { return value }
+    if let value = value as? NSNumber { return value.boolValue }
+    if let value = value as? String { return ["true", "1", "yes"].contains(value.lowercased()) }
+    return false
   }
 
   private static func normalizedString(_ value: Any?) -> String? {

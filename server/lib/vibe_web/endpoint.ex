@@ -23,6 +23,12 @@ defmodule VibeWeb.Endpoint do
     ],
     longpoll: false
 
+  # Agent bridge daemon (the user's computer) connects here, authenticated by its
+  # bridge_token. Outbound-only from the daemon's perspective.
+  socket "/agent-bridge", VibeWeb.AgentBridgeSocket,
+    websocket: [connect_info: [:x_headers]],
+    longpoll: false
+
   socket "/live", Phoenix.LiveView.Socket, websocket: [connect_info: [session: @session_options]]
 
   # Serve at "/" the static files from "priv/static" directory.
