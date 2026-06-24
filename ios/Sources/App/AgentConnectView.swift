@@ -198,21 +198,9 @@ struct AgentConnectPanel: View {
           .frame(maxWidth: .infinity, alignment: .leading)
       }
 
-      if let selected = model.selectedRepository {
-        HStack(spacing: 8) {
-          Image(systemName: "folder")
-            .font(.system(size: 12, weight: .semibold))
-          Text(selected.name)
-            .font(.system(size: 12, weight: .semibold))
-            .lineLimit(1)
-          Text(selected.path)
-            .font(.system(size: 11))
-            .foregroundStyle(palette.secondaryText)
-            .lineLimit(1)
-          Spacer(minLength: 0)
-        }
-        .foregroundStyle(palette.text)
-      }
+      // Repo selection is intentionally NOT shown here. The connect panel is only
+      // about pairing a computer; once connected it's replaced by the composer,
+      // whose repo-picker control is the place to choose a repository.
       }
       .padding(16)
     }

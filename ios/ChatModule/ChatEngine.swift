@@ -4722,13 +4722,27 @@ final class ChatEngine {
     return nil
   }
 
+  /// Reserved shadow-user ids for the computer-bridge agents (Claude/Codex),
+  /// seeded server-side. They are real users with no `Agent` record, so the
+  /// server never sends a `peerAgentId` for them — we recognize the ids here so a
+  /// DM with them routes as an agent (cleartext) instead of being E2E-encrypted to
+  /// a non-existent friend key, which silently drops the prompt into the chat.
+  private static let reservedBridgeAgentUserIds: Set<String> = [
+    "11111111-1111-1111-1111-111111111111",
+    "22222222-2222-2222-2222-222222222222",
+  ]
+
   private func resolvePeerAgentIdLocked(chatId: String, peerUserIdHint: String?) -> String? {
     if let cached = chatPeerAgentIdsByChatId[chatId], !cached.isEmpty {
       return cached
     }
     let resolvedPeerId = peerUserIdHint ?? chatPeerUserIdsByChatId[chatId]
     guard let resolvedPeerId else { return nil }
-    return agentIdsByPeerUserId[resolvedPeerId]
+    if let mapped = agentIdsByPeerUserId[resolvedPeerId] { return mapped }
+    if Self.reservedBridgeAgentUserIds.contains(resolvedPeerId.lowercased()) {
+      return resolvedPeerId
+    }
+    return nil
   }
 
   private func scheduleFriendPublicKeyRetryLocked(peerId: String, reason: String) {

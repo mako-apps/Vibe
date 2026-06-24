@@ -22,7 +22,8 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
-const { spawn } = require("child_process");
+const readline = require("readline");
+const { spawn, execFileSync } = require("child_process");
 
 let WebSocket, Phoenix;
 try {
@@ -53,6 +54,13 @@ function parseArgs(argv) {
     else if (a === "--repo-root") out.repoRoots.push(argv[++i]);
     else if (a === "--label") out.label = argv[++i];
     else if (a === "--logout") out.logout = true;
+    else if (a === "--pick") out.pick = true;
+    else if (a === "--no-pick") out.noPick = true;
+    else if (a === "--all") out.all = true;
+    else if (a === "--install" || a === "--service") out.install = true;
+    else if (a === "--uninstall") out.uninstall = true;
+    else if (a === "--status") out.status = true;
+    else if (a === "--service-run") out.serviceRun = true;
     else if (a === "-h" || a === "--help") out.help = true;
   }
   return out;
@@ -136,6 +144,20 @@ function addRepository(map, dir, source) {
   });
 }
 
+// Top-level folders that are never code projects — skip them so a scan of the
+// home folder reaches real repos instead of filling up on system junk.
+const SKIP_DIRS = new Set([
+  "Library",
+  "Applications",
+  "Music",
+  "Movies",
+  "Pictures",
+  "Downloads",
+  "Public",
+  "node_modules",
+  ".Trash",
+]);
+
 function scanRepoRoot(root, map) {
   const start = realDir(root);
   if (!start) return;
@@ -158,15 +180,39 @@ function scanRepoRoot(root, map) {
     }
     for (const entry of entries) {
       if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+      if (SKIP_DIRS.has(entry.name)) continue;
       queue.push({ dir: path.join(dir, entry.name), depth: depth + 1 });
     }
   }
 }
 
-function buildRepositories() {
+// Common places people keep code — scanned (depth-limited) when the user runs an
+// interactive pick and hasn't named repos explicitly.
+function defaultDiscoveryRoots() {
+  const home = os.homedir();
+  return [
+    process.cwd(),
+    path.join(home, "Desktop"),
+    path.join(home, "Developer"),
+    path.join(home, "Projects"),
+    path.join(home, "projects"),
+    path.join(home, "Code"),
+    path.join(home, "code"),
+    path.join(home, "src"),
+    path.join(home, "git"),
+    path.join(home, "repos"),
+    home,
+  ].filter((dir) => realDir(dir));
+}
+
+function buildRepositories(extraRepos = []) {
   const map = new Map();
-  const defaultCwd = realDir(ARGS.cwd || process.cwd()) || process.cwd();
-  addRepository(map, defaultCwd, "cwd");
+
+  // Repos the user picked interactively (or had cached) come first so they are
+  // always advertised even if the daemon is launched from elsewhere.
+  for (const repo of extraRepos) {
+    addRepository(map, repo, "picked");
+  }
 
   for (const repo of [
     ...ARGS.repos,
@@ -180,6 +226,13 @@ function buildRepositories() {
     ...splitEnvList(process.env.VIBE_BRIDGE_REPO_ROOTS),
   ]) {
     scanRepoRoot(root, map);
+  }
+
+  // The current working tree is a sensible fallback only when nothing else was
+  // chosen — otherwise we'd silently re-add e.g. the folder the daemon ran from.
+  if (map.size === 0) {
+    const defaultCwd = realDir(ARGS.cwd || process.cwd()) || process.cwd();
+    addRepository(map, defaultCwd, "cwd");
   }
 
   return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
@@ -362,8 +415,9 @@ function buildCommand(provider, prompt, chatId, task) {
   return null;
 }
 
-const ADVERTISED_REPOSITORIES = buildRepositories();
-const DEFAULT_CWD = realDir(ARGS.cwd || process.cwd()) || process.cwd();
+// Assigned in main() once repos are resolved (possibly via an interactive pick).
+let ADVERTISED_REPOSITORIES = [];
+let DEFAULT_CWD = realDir(ARGS.cwd || process.cwd()) || process.cwd();
 
 function repositoryById(id) {
   if (!id) return null;
@@ -435,6 +489,201 @@ function pushBridgeStatus(channel) {
   }
 }
 
+// ── Interactive repo pick ───────────────────────────────────────────
+
+function promptLine(question) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer);
+    });
+  });
+}
+
+function discoverRepositories() {
+  const map = new Map();
+  for (const root of defaultDiscoveryRoots()) scanRepoRoot(root, map);
+  addRepository(map, process.cwd(), "cwd");
+  return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// Ask which project(s) @claude / @codex should work on. Returns an array of
+// absolute paths (the user's choice), or null if they cancelled. Only called
+// when stdin is a TTY.
+async function pickRepositoriesInteractively() {
+  const found = discoverRepositories();
+  if (!found.length) {
+    console.log("\n[vibe-bridge] No git repositories found near your home folder.");
+    const custom = (
+      await promptLine("  Enter a project path to link (blank = current folder): ")
+    ).trim();
+    return [custom || process.cwd()];
+  }
+
+  console.log("\n[vibe-bridge] Which project(s) should @claude / @codex work on?\n");
+  found.forEach((r, i) => {
+    console.log(`  ${String(i + 1).padStart(2)}. ${r.name}   ${r.path}`);
+  });
+  console.log("\n  Enter numbers (e.g. 1,3), 'all', or a path. Blank = the first one.");
+  const answer = (await promptLine("  > ")).trim();
+
+  if (!answer) return [found[0].path];
+  if (answer.toLowerCase() === "all") return found.map((r) => r.path);
+  if (answer.startsWith("~") || answer.startsWith("/") || answer.startsWith(".")) {
+    return [answer];
+  }
+  const picks = answer
+    .split(/[,\s]+/)
+    .map((s) => parseInt(s, 10))
+    .filter((n) => Number.isInteger(n) && n >= 1 && n <= found.length);
+  if (!picks.length) return [found[0].path];
+  return picks.map((n) => found[n - 1].path);
+}
+
+// Resolve which repos to advertise. Honors explicit flags/env first; otherwise
+// reuses the cached pick, and prompts interactively the first time (or on
+// `--pick`). Persists the chosen paths so later launches (incl. the background
+// service) reuse them without asking.
+async function resolveRepositories(config, persist) {
+  const explicit =
+    ARGS.repos.length ||
+    ARGS.repoRoots.length ||
+    ARGS.cwd ||
+    splitEnvList(process.env.VIBE_BRIDGE_REPOS).length ||
+    splitEnvList(process.env.VIBE_BRIDGE_REPO_ROOTS).length;
+
+  let picked = Array.isArray(config.repos) ? config.repos.slice() : [];
+
+  const interactive = process.stdin.isTTY && !ARGS.serviceRun && !ARGS.noPick;
+  const shouldPrompt = interactive && (ARGS.pick || (!explicit && picked.length === 0));
+
+  if (shouldPrompt) {
+    if (ARGS.all) {
+      picked = discoverRepositories().map((r) => r.path);
+    } else {
+      const chosen = await pickRepositoriesInteractively();
+      if (chosen && chosen.length) picked = chosen;
+    }
+    config.repos = picked;
+    if (persist) persist();
+  }
+
+  ADVERTISED_REPOSITORIES = buildRepositories(picked);
+  DEFAULT_CWD =
+    (ADVERTISED_REPOSITORIES[0] && ADVERTISED_REPOSITORIES[0].cwd) ||
+    realDir(ARGS.cwd || process.cwd()) ||
+    process.cwd();
+}
+
+// ── Background service (macOS launchd) ──────────────────────────────
+
+const SERVICE_LABEL = "io.vibegram.agent-bridge";
+const SERVICE_LOG = path.join(CONFIG_DIR, "bridge.log");
+
+function servicePlistPath() {
+  return path.join(os.homedir(), "Library", "LaunchAgents", `${SERVICE_LABEL}.plist`);
+}
+
+function escapeXml(value) {
+  return String(value).replace(/[<>&'"]/g, (c) => {
+    return { "<": "&lt;", ">": "&gt;", "&": "&amp;", "'": "&apos;", '"': "&quot;" }[c];
+  });
+}
+
+function installService(server, config) {
+  if (process.platform !== "darwin") {
+    console.log(
+      "[vibe-bridge] --install supports macOS (launchd) right now.\n" +
+        "  On Linux, run as a user systemd unit or `nohup vibegram-bridge --server " +
+        server +
+        " >> ~/.vibe/bridge.log 2>&1 &`."
+    );
+    return;
+  }
+  if (!config.bridge_token || !config.user_id) {
+    console.log(
+      "[vibe-bridge] Pair first, then install the background service:\n" +
+        "  1) vibegram-bridge --server " +
+        server +
+        "   (scan the QR in the app)\n" +
+        "  2) vibegram-bridge --install"
+    );
+    return;
+  }
+
+  fs.mkdirSync(path.dirname(servicePlistPath()), { recursive: true });
+  fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+
+  const args = [process.execPath, __filename, "--server", server, "--service-run"];
+  const xml =
+    '<?xml version="1.0" encoding="UTF-8"?>\n' +
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n' +
+    '<plist version="1.0">\n' +
+    "<dict>\n" +
+    `  <key>Label</key><string>${SERVICE_LABEL}</string>\n` +
+    "  <key>ProgramArguments</key>\n  <array>\n" +
+    args.map((a) => `    <string>${escapeXml(a)}</string>`).join("\n") +
+    "\n  </array>\n" +
+    "  <key>RunAtLoad</key><true/>\n" +
+    "  <key>KeepAlive</key><true/>\n" +
+    "  <key>ThrottleInterval</key><integer>10</integer>\n" +
+    `  <key>StandardOutPath</key><string>${escapeXml(SERVICE_LOG)}</string>\n` +
+    `  <key>StandardErrorPath</key><string>${escapeXml(SERVICE_LOG)}</string>\n` +
+    `  <key>WorkingDirectory</key><string>${escapeXml(os.homedir())}</string>\n` +
+    "  <key>EnvironmentVariables</key>\n  <dict>\n" +
+    `    <key>PATH</key><string>${escapeXml(
+      process.env.PATH || "/usr/local/bin:/usr/bin:/bin"
+    )}</string>\n` +
+    "  </dict>\n" +
+    "</dict>\n</plist>\n";
+
+  fs.writeFileSync(servicePlistPath(), xml);
+  try {
+    execFileSync("launchctl", ["unload", servicePlistPath()], { stdio: "ignore" });
+  } catch (_) {}
+  execFileSync("launchctl", ["load", servicePlistPath()]);
+
+  console.log(
+    "\n✅ [vibe-bridge] Background service installed.\n" +
+      "  • Runs at login and reconnects automatically — no terminal needed.\n" +
+      "  • Restarts itself if it crashes.\n" +
+      `  • Logs: ${SERVICE_LOG}\n` +
+      "  • Stop & remove: vibegram-bridge --uninstall\n"
+  );
+}
+
+function uninstallService() {
+  if (process.platform !== "darwin") {
+    console.log("[vibe-bridge] Nothing to uninstall (launchd is macOS-only).");
+    return;
+  }
+  try {
+    execFileSync("launchctl", ["unload", servicePlistPath()], { stdio: "ignore" });
+  } catch (_) {}
+  try {
+    fs.unlinkSync(servicePlistPath());
+  } catch (_) {}
+  console.log("[vibe-bridge] Background service stopped and removed.");
+}
+
+function serviceStatus() {
+  if (process.platform !== "darwin") {
+    console.log("[vibe-bridge] Service status is macOS-only.");
+    return;
+  }
+  const installed = fs.existsSync(servicePlistPath());
+  console.log(`[vibe-bridge] background service: ${installed ? "installed" : "not installed"}`);
+  if (installed) {
+    try {
+      const out = execFileSync("launchctl", ["list"], { encoding: "utf8" });
+      const line = out.split("\n").find((l) => l.includes(SERVICE_LABEL));
+      console.log(`  launchctl: ${line ? line.trim() : "loaded? (re-run with sudo if unsure)"}`);
+    } catch (_) {}
+    console.log(`  logs: ${SERVICE_LOG}`);
+  }
+}
+
 function captureSessionId(line) {
   try {
     const ev = JSON.parse(line);
@@ -456,6 +705,11 @@ function looksToolish(line) {
 
 function runTask(channel, task) {
   const { provider, chatId, prompt, replyToId, requesterUserId } = task;
+  console.log(
+    `[vibe-bridge] run_task received provider=${provider} chat=${chatId} ` +
+      `repoId=${task.repoId || task.agentBridgeRepoId || "-"} ` +
+      `workMode=${task.workMode || task.agentBridgeWorkMode || "-"} promptLen=${(prompt || "").length}`
+  );
   const built = buildCommand(provider, prompt, chatId, task);
   if (!built) {
     channel.push("error", { provider, chatId, message: `Unknown provider: ${provider}` });
@@ -556,12 +810,19 @@ function connect(server, token, userId) {
   channel
     .join()
     .receive("ok", () => {
-      console.log(`\n✅ [vibe-bridge] CONNECTED! Your computer is now online for user ${userId}.\n   Leave this terminal open to run local AI tasks.\n`);
+      console.log(`\n✅ [vibe-bridge] CONNECTED! Your computer is now online for user ${userId}.`);
       if (ADVERTISED_REPOSITORIES.length) {
-        console.log("[vibe-bridge] available repositories:");
+        console.log("[vibe-bridge] linked repositories:");
         for (const repo of ADVERTISED_REPOSITORIES) {
           console.log(`   • ${repo.name}  ${repo.path}`);
         }
+      }
+      if (!ARGS.serviceRun) {
+        console.log(
+          "\n   Leave this terminal open, OR run it in the background so you can close it:\n" +
+            "     vibegram-bridge --install     (starts at login, auto-reconnects)\n" +
+            "   Change projects later with:  vibegram-bridge --pick\n"
+        );
       }
       pushBridgeStatus(channel);
     })
@@ -581,16 +842,20 @@ function connect(server, token, userId) {
 async function main() {
   if (ARGS.help) {
     console.log(
-      "Usage: vibegram-bridge --server <https://vibe-server>\n" +
-        "         shows a QR — scan it in the Vibe app (Claude/Codex → Connect → Scan)\n" +
-        "       vibegram-bridge --code <PAIRING_CODE> --server <...>   (manual code flow)\n" +
-        "       vibegram-bridge --server <...>   (reuses cached token)\n" +
-        "       vibegram-bridge --server <...> --repo ~/Project --repo-root ~/Desktop\n" +
-        "       vibegram-bridge --logout\n\n" +
-        "Repo selection: --cwd sets the default working tree, --repo advertises an allowed repo,\n" +
-        "     --repo-root scans two levels deep for .git directories. Env alternatives:\n" +
-        "     VIBE_BRIDGE_REPOS, VIBE_BRIDGE_REPO_ROOTS.\n\n" +
-        "Env: VIBE_CLAUDE_PERMISSION_MODE and VIBE_CODEX_SANDBOX override the phone's mode,\n" +
+      "Usage:\n" +
+        "  vibegram-bridge --server <https://vibe-server>\n" +
+        "      First run: shows a QR — scan it in the Vibe app (Claude/Codex → Connect → Scan),\n" +
+        "      then asks which project(s) to link. Later runs reuse the cached token + pick.\n\n" +
+        "  vibegram-bridge --pick            re-choose which project(s) to link\n" +
+        "  vibegram-bridge --all             link every git repo found near your home folder\n" +
+        "  vibegram-bridge --install         run in the background (starts at login, auto-reconnect)\n" +
+        "  vibegram-bridge --uninstall       stop & remove the background service\n" +
+        "  vibegram-bridge --status          show background-service state + log path\n" +
+        "  vibegram-bridge --code <CODE>     manual pairing code flow\n" +
+        "  vibegram-bridge --logout          remove the cached token\n\n" +
+        "Non-interactive repo selection: --cwd <dir>, --repo <dir> (repeatable),\n" +
+        "     --repo-root <dir> (scans 2 levels for .git). Env: VIBE_BRIDGE_REPOS,\n" +
+        "     VIBE_BRIDGE_REPO_ROOTS, VIBE_CLAUDE_PERMISSION_MODE, VIBE_CODEX_SANDBOX,\n" +
         "     VIBE_CLAUDE_MODEL, VIBE_CODEX_MODEL, VIBE_CLAUDE_COMMAND, VIBE_CODEX_COMMAND"
     );
     return;
@@ -605,36 +870,42 @@ async function main() {
   }
 
   const config = loadConfig();
+  const persist = () => saveConfig(config);
   const server = normalizeServer(ARGS.server || config.server || "https://api.vibegram.io");
   if (!server) {
     console.error("[vibe-bridge] Missing --server <https://your-vibe-server>");
     process.exit(1);
   }
+  config.server = server;
 
-  let token = config.bridge_token;
-  let userId = config.user_id;
+  // Background-service management (no socket needed).
+  if (ARGS.uninstall) return uninstallService();
+  if (ARGS.status) return serviceStatus();
+  if (ARGS.install) return installService(server, config);
 
   if (ARGS.code) {
     console.log("[vibe-bridge] pairing…");
     const result = await redeemPairing(server, ARGS.code, ARGS.label);
-    token = result.bridge_token;
-    userId = result.user_id;
-    saveConfig({ server, bridge_token: token, user_id: userId });
+    config.bridge_token = result.bridge_token;
+    config.user_id = result.user_id;
+    persist();
     console.log("[vibe-bridge] paired ✓ (token cached in ~/.vibe/bridge.json)");
   }
 
-  if (!token || !userId) {
+  if (!config.bridge_token || !config.user_id) {
     const result = await scanToPair(server, ARGS.label);
-    token = result.bridge_token;
-    userId = result.user_id;
-    saveConfig({ server, bridge_token: token, user_id: userId });
+    config.bridge_token = result.bridge_token;
+    config.user_id = result.user_id;
+    persist();
     console.log("[vibe-bridge] paired ✓ (token cached in ~/.vibe/bridge.json)");
   }
 
-  // Persist latest server if changed.
-  if (config.server !== server) saveConfig({ server, bridge_token: token, user_id: userId });
+  persist();
 
-  connect(server, token, userId);
+  // Resolve which project(s) to expose (interactive first run, cached after).
+  await resolveRepositories(config, persist);
+
+  connect(server, config.bridge_token, config.user_id);
 }
 
 main().catch((err) => {

@@ -130,17 +130,13 @@ enum AgentBridgeSelectionStore {
 
   @discardableResult
   static func ensureValidSelection(from repositories: [AgentBridgeRepository]) -> AgentBridgeRepository? {
-    guard !repositories.isEmpty else {
-      return selectedRepository()
-    }
-    if let selected = selectedRepository(),
-      repositories.contains(where: { $0.id == selected.id || $0.cwd == selected.cwd })
-    {
-      return selected
-    }
-    let first = repositories[0]
-    select(first)
-    return first
+    // Keep the stored choice only while it still exists on the connected computer.
+    // Never auto-pick a repo the user didn't choose — this previously defaulted to
+    // the first repo, which silently routed every task to e.g. "vibe".
+    guard let selected = selectedRepository() else { return nil }
+    if repositories.isEmpty { return selected }
+    return repositories.contains(where: { $0.id == selected.id || $0.cwd == selected.cwd })
+      ? selected : nil
   }
 
   private static func boolValue(_ value: Any?) -> Bool {

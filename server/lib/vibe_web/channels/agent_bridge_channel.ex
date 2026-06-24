@@ -82,6 +82,10 @@ defmodule VibeWeb.AgentBridgeChannel do
     provider = payload["provider"]
     chat_id = payload["chatId"]
 
+    Logger.info(
+      "[AgentBridge] result received user=#{socket.assigns.user_id} provider=#{inspect(provider)} chat=#{inspect(chat_id)} exit=#{inspect(payload["exitStatus"])} outputBytes=#{byte_size(payload["output"] || "")}"
+    )
+
     if is_binary(provider) and is_binary(chat_id) do
       output = payload["output"] || ""
       exit_status = payload["exitStatus"] || 0
@@ -111,6 +115,10 @@ defmodule VibeWeb.AgentBridgeChannel do
 
   # daemon → server: surface an error notice without a full result
   def handle_in("error", %{"provider" => provider, "chatId" => chat_id} = payload, socket) do
+    Logger.info(
+      "[AgentBridge] error received user=#{socket.assigns.user_id} provider=#{inspect(provider)} chat=#{inspect(chat_id)} message=#{inspect(payload["message"])}"
+    )
+
     message = payload["message"] || "The task could not be completed on your computer."
 
     LocalAgentWorker.post_bridge_notice(

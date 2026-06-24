@@ -1173,7 +1173,6 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   private let floatingAvatarView: NativeProfileAvatarView
 
   private let heroHeaderView = UIView()
-  private var infoHostingController: UIHostingController<ContactProfileInfoView>?
   private let heroBannerView = UIView()
   private let heroNameLabel = UILabel()
   private let heroHandleButton = UIButton(type: .system)
@@ -1594,20 +1593,6 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     }
 
     tableView.tableHeaderView = heroHeaderView
-    
-    let infoView = ContactProfileInfoView(
-      username: resolvedIdentifierRawValue(),
-      onCall: { [weak self] in self?.handleAudioPressed() },
-      onShare: { },
-      onCreateContact: { },
-      onAddToExisting: { },
-      onEmergency: { },
-      onBlock: { }
-    )
-    let hostingController = UIHostingController(rootView: infoView)
-    hostingController.view.backgroundColor = .clear
-    heroHeaderView.addSubview(hostingController.view)
-    self.infoHostingController = hostingController
   }
 
   private func layoutHeroHeaderViewIfNeeded(force: Bool) {
@@ -1664,32 +1649,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       heroBioLabel.isHidden ? 0.0 : heroBioLabel.frame.maxY
     ) + 24.0 + 74.0
     
-    let baseHeaderHeight = max(heroBannerView.frame.maxY + 24.0, actionBottom + 28.0)
-    
-    var finalHeaderHeight = baseHeaderHeight
-    
-    if let infoHost = infoHostingController {
-      let infoView = ContactProfileInfoView(
-        username: resolvedIdentifierRawValue(),
-        onCall: { [weak self] in self?.handleAudioPressed() },
-        onShare: { },
-        onCreateContact: { },
-        onAddToExisting: { },
-        onEmergency: { },
-        onBlock: { }
-      )
-      infoHost.rootView = infoView
-      
-      let targetSize = CGSize(width: width, height: UIView.layoutFittingExpandedSize.height)
-      let infoHeight = infoHost.view.systemLayoutSizeFitting(
-        targetSize,
-        withHorizontalFittingPriority: .required,
-        verticalFittingPriority: .fittingSizeLevel
-      ).height
-      
-      infoHost.view.frame = CGRect(x: 0, y: baseHeaderHeight, width: width, height: infoHeight)
-      finalHeaderHeight = baseHeaderHeight + infoHeight + 24.0
-    }
+    let finalHeaderHeight = max(heroBannerView.frame.maxY + 24.0, actionBottom + 28.0)
 
     if force || heroHeaderView.frame.width != width
       || abs(heroHeaderView.frame.height - finalHeaderHeight) > 0.5
@@ -1843,6 +1803,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     menuButton.tintColor = text
 
     tableView.backgroundColor = .clear
+    tableView.tintColor = .systemBlue
     tableView.separatorColor =
       isDark
       ? UIColor(white: 1.0, alpha: 0.08)
@@ -2198,29 +2159,34 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     showsChevron: Bool = true
   ) {
     cell.rowNode.isHidden = true
-    cell.contentConfiguration = UIHostingConfiguration {
-      ChatProfileModernRowView(
-        title: title,
-        subtitle: subtitle,
-        value: value,
-        iconName: iconName,
-        showsChevron: showsChevron,
-        isDark: traitCollection.userInterfaceStyle == .dark,
-        titleColor: currentTextColor,
-        subtitleColor: currentSecondaryTextColor,
-        accentColor: currentRowAccentColor,
-        cardColor: currentRowCardColor,
-        separatorColor: currentRowSeparatorColor
-      )
+
+    var config = UIListContentConfiguration.subtitleCell()
+    config.text = title
+    config.textProperties.font = UIFont.systemFont(ofSize: 17, weight: .semibold)
+    config.textProperties.color = currentTextColor
+    if !subtitle.isEmpty {
+      config.secondaryText = subtitle
+      config.secondaryTextProperties.font = UIFont.systemFont(ofSize: 13, weight: .regular)
+      config.secondaryTextProperties.color = currentSecondaryTextColor
     }
-    .margins(.all, 0)
-    cell.accessoryType = .none
-    cell.backgroundColor = .clear
-    cell.contentView.backgroundColor = .clear
-    var background = UIBackgroundConfiguration.clear()
-    background.backgroundColor = .clear
-    cell.backgroundConfiguration = background
-    cell.selectedBackgroundView = UIView()
+    config.image = UIImage(systemName: iconName)
+    config.imageProperties.tintColor = .systemBlue
+    cell.contentConfiguration = config
+
+    if !value.isEmpty {
+      let badge = UILabel()
+      badge.text = value
+      badge.font = UIFont.systemFont(ofSize: 15, weight: .medium)
+      badge.textColor = currentSecondaryTextColor
+      badge.sizeToFit()
+      cell.accessoryView = badge
+    } else {
+      cell.accessoryView = nil
+    }
+    cell.accessoryType = showsChevron ? .disclosureIndicator : .none
+
+    cell.backgroundColor = .secondarySystemGroupedBackground
+    cell.backgroundConfiguration = UIBackgroundConfiguration.listGroupedCell()
   }
 
   private func resolvedBioPreview() -> String {
@@ -2246,10 +2212,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   }
 
   private func resolveSectionTitle(_ section: Section) -> String? {
-    switch section {
-    case .contentRows:
-      return nil
-    }
+    return nil
   }
 
   private func tabButtonTitle(_ tab: ChatProfileTab) -> String {
@@ -2496,6 +2459,9 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   // MARK: UITableViewDataSource
 
   private enum Section: Int, CaseIterable {
+    case contactActions
+    case emergency
+    case dangerActions
     case contentRows
   }
 
@@ -2515,6 +2481,12 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     guard let section = Section(rawValue: section) else { return 0 }
 
     switch section {
+    case .contactActions:
+      return 3
+    case .emergency:
+      return 1
+    case .dangerActions:
+      return 1
     case .contentRows:
       return availableTabs.count
     }
@@ -2526,14 +2498,11 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   }
 
   func tableView(_ tableView: UITableView, heightForHeaderInSection section: Int) -> CGFloat {
-    guard let section = Section(rawValue: section) else { return .leastNormalMagnitude }
-    return resolveSectionTitle(section)?.isEmpty == false
-      ? 30.0
-      : .leastNormalMagnitude
+    .leastNormalMagnitude
   }
 
   func tableView(_ tableView: UITableView, heightForFooterInSection section: Int) -> CGFloat {
-    10.0
+    12.0
   }
 
   func tableView(_ tableView: UITableView, heightForRowAt indexPath: IndexPath) -> CGFloat {
@@ -2542,8 +2511,10 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     }
 
     switch section {
+    case .contactActions, .emergency, .dangerActions:
+      return 44.0
     case .contentRows:
-      return 82.0
+      return 74.0
     }
   }
 
@@ -2669,8 +2640,34 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     }
 
     switch section {
+    case .contactActions:
+      let titles = ["Share Contact", "Create New Contact", "Add to Existing Contact"]
+      let cell = UITableViewCell(style: .default, reuseIdentifier: nil)
+      cell.textLabel?.text = titles[indexPath.row]
+      cell.textLabel?.font = UIFont.systemFont(ofSize: 17, weight: .regular)
+      cell.textLabel?.textColor = .systemBlue
+      cell.backgroundColor = .secondarySystemGroupedBackground
+      return cell
+
+    case .emergency:
+      let cell = UITableViewCell(style: .default, reuseIdentifier: nil)
+      cell.textLabel?.text = "Add to Emergency Contacts"
+      cell.textLabel?.font = UIFont.systemFont(ofSize: 17, weight: .regular)
+      cell.textLabel?.textColor = .systemBlue
+      cell.backgroundColor = .secondarySystemGroupedBackground
+      return cell
+
+    case .dangerActions:
+      let cell = UITableViewCell(style: .default, reuseIdentifier: nil)
+      cell.textLabel?.text = "Block Contact"
+      cell.textLabel?.font = UIFont.systemFont(ofSize: 17, weight: .regular)
+      cell.textLabel?.textColor = .systemRed
+      cell.backgroundColor = .secondarySystemGroupedBackground
+      return cell
+
     case .contentRows:
-      guard let cell = tableView.dequeueReusableCell(
+      guard availableTabs.indices.contains(indexPath.row),
+        let cell = tableView.dequeueReusableCell(
           withIdentifier: ChatProfileListRowCell.reuseIdentifier,
           for: indexPath
         ) as? ChatProfileListRowCell
@@ -2678,14 +2675,13 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
         return UITableViewCell(style: .default, reuseIdentifier: nil)
       }
       let tab = availableTabs[indexPath.row]
-      let isLast = indexPath.row == availableTabs.count - 1
       configureListRowCell(
         cell,
         title: sharedTitle(for: tab),
         subtitle: sharedSubtitle(for: tab),
         value: "\(sharedCount(for: tab))",
         iconName: sharedIconName(for: tab),
-        showsSeparator: !isLast
+        showsSeparator: true
       )
       return cell
     }
@@ -2702,7 +2698,20 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     guard let section = Section(rawValue: indexPath.section) else { return }
 
     switch section {
+    case .contactActions:
+      let actions = ["shareContact", "createNewContact", "addToExisting"]
+      if actions.indices.contains(indexPath.row) {
+        onNativeEvent(["type": "profileContactAction", "action": actions[indexPath.row]])
+      }
+
+    case .emergency:
+      onNativeEvent(["type": "profileContactAction", "action": "addToEmergency"])
+
+    case .dangerActions:
+      onNativeEvent(["type": "profileContactAction", "action": "block"])
+
     case .contentRows:
+      guard availableTabs.indices.contains(indexPath.row) else { return }
       let tab = availableTabs[indexPath.row]
       let isDark = traitCollection.userInterfaceStyle == .dark
       var targetRows: [Any] = []
@@ -2714,7 +2723,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       case .links: targetRows = linkRows
       case .pinned: targetRows = pinnedRows
       }
-      
+
       guard let sourceCell = tableView.cellForRow(at: indexPath) else { return }
       let controller = ChatProfileExpandedContentViewController(
         profileTab: tab,
@@ -2727,7 +2736,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       controller.onContentPressed = { [weak self] payload in
         self?.onNativeEvent(payload)
       }
-      
+
       if let presenter = topMostViewController() {
         presenter.present(controller, animated: false)
       }
@@ -3171,120 +3180,3 @@ fileprivate class ChatProfileExpandedContentViewController: UIViewController, UI
   }
 }
 
-// MARK: - SwiftUI Info View
-struct ContactProfileInfoView: View {
-  let username: String
-  let onCall: () -> Void
-  let onShare: () -> Void
-  let onCreateContact: () -> Void
-  let onAddToExisting: () -> Void
-  let onEmergency: () -> Void
-  let onBlock: () -> Void
-
-  @Environment(\.colorScheme) var colorScheme
-
-  private var blockBackground: Color {
-    colorScheme == .dark ? Color(white: 0.15) : Color.white
-  }
-
-  var body: some View {
-    VStack(spacing: 16) {
-      // Username Block
-      VStack(spacing: 0) {
-        HStack {
-          VStack(alignment: .leading, spacing: 4) {
-            Text("username")
-              .font(.system(size: 13, weight: .regular))
-              .foregroundColor(Color.primary.opacity(0.6))
-            Text(username)
-              .font(.system(size: 17, weight: .regular))
-              .foregroundColor(Color.primary)
-          }
-          Spacer()
-          Button(action: onCall) {
-            Image(systemName: "phone.fill")
-              .font(.system(size: 20))
-              .foregroundColor(Color.primary)
-              .frame(width: 44, height: 44)
-              .background(Color.primary.opacity(0.08))
-              .clipShape(Circle())
-          }
-          .buttonStyle(.plain)
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
-      }
-      .background(blockBackground)
-      .cornerRadius(12)
-
-      // Notes Block
-      VStack(spacing: 0) {
-        HStack {
-          Text("Notes")
-            .font(.system(size: 17, weight: .regular))
-            .foregroundColor(Color.primary)
-          Spacer()
-        }
-        .padding(16)
-      }
-      .background(blockBackground)
-      .cornerRadius(12)
-
-      // Share / Add Contacts Block
-      VStack(spacing: 0) {
-        ButtonRow(title: "Share Contact", textColor: .accentColor, action: onShare)
-        Divider().padding(.leading, 16)
-        ButtonRow(title: "Create New Contact", textColor: .accentColor, action: onCreateContact)
-        Divider().padding(.leading, 16)
-        ButtonRow(title: "Add to Existing Contact", textColor: .accentColor, action: onAddToExisting)
-      }
-      .background(blockBackground)
-      .cornerRadius(12)
-
-      // Emergency Block
-      VStack(spacing: 0) {
-        ButtonRow(title: "Add to Emergency Contacts", textColor: .accentColor, action: onEmergency)
-      }
-      .background(blockBackground)
-      .cornerRadius(12)
-
-      // Block Block
-      VStack(spacing: 0) {
-        ButtonRow(title: "Block Contact", textColor: .red, action: onBlock)
-      }
-      .background(blockBackground)
-      .cornerRadius(12)
-    }
-    .padding(.horizontal, 16)
-    .padding(.vertical, 12)
-    .animation(.default, value: username)
-  }
-}
-
-private struct ButtonRow: View {
-  let title: String
-  let textColor: Color
-  let action: () -> Void
-
-  var body: some View {
-    Button(action: action) {
-      HStack {
-        Text(title)
-          .font(.system(size: 17, weight: .regular))
-          .foregroundColor(textColor)
-        Spacer()
-      }
-      .padding(16)
-      .contentShape(Rectangle())
-    }
-    .buttonStyle(RowButtonStyle())
-  }
-}
-
-private struct RowButtonStyle: ButtonStyle {
-  func makeBody(configuration: Configuration) -> some View {
-    configuration.label
-      .background(configuration.isPressed ? Color.primary.opacity(0.05) : Color.clear)
-      .animation(.easeInOut(duration: 0.1), value: configuration.isPressed)
-  }
-}

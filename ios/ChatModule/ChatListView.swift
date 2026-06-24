@@ -1858,6 +1858,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let next = value.trimmingCharacters(in: .whitespacesAndNewlines)
     if enginePeerUserId == next { return }
     enginePeerUserId = next
+    // The peer id may arrive after the input bar is built; re-assert the agent
+    // control so a Claude/Codex DM surfaces the repo picker (not a plain input).
+    inputBar?.setAgentControlMode(agentChatMode || currentBridgeProvider != nil)
     updateAgentBridgeControlTitle()
     updateChatEngineBinding()
     if statusAuthorityEnabled {
@@ -4439,7 +4442,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       bar.placeholder = inputBarPlaceholder
       bar.applyAppearance(appearance)
       bar.setAgentStreaming(agentStreaming)
-      bar.setAgentControlMode(agentChatMode)
+      bar.setAgentControlMode(agentChatMode || currentBridgeProvider != nil)
       inputBar = bar
       updateAgentBridgeControlTitle()
 
@@ -4755,11 +4758,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   private func updateAgentBridgeControlTitle() {
-    guard agentChatMode, currentBridgeProvider != nil else {
+    // Bridge-agent DMs (Claude/Codex) drive the repo picker regardless of the
+    // legacy `agentChatMode` surface. "Open" is the fallback for the Vibe AI panel.
+    guard currentBridgeProvider != nil else {
       inputBar?.setAgentControlTitle("Open")
       return
     }
-    let repositoryName = AgentBridgeSelectionStore.selectedRepository()?.name ?? "Repo"
+    let repositoryName = AgentBridgeSelectionStore.selectedRepository()?.name ?? "Pick repo"
     let mode = AgentBridgeSelectionStore.selectedWorkMode()
     let suffix = mode == .readOnly ? "" : " · \(mode.title)"
     inputBar?.setAgentControlTitle(repositoryName + suffix)
