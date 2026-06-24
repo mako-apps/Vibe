@@ -19,6 +19,15 @@ defmodule Vibe.Chat do
   }
 
   @agent_user_id "00000000-0000-0000-0000-000000000001"
+  # Reserved shadow-user ids that are allowed to post messages on behalf of an
+  # agent (legacy Vibe AI, plus the bridge-paired Claude/Codex agents). These
+  # are exempt from the sender-mismatch guard in add_message/2 because the
+  # acting user (the human requester) legitimately posts the agent's reply.
+  @agent_sender_ids [
+    "00000000-0000-0000-0000-000000000001",
+    "11111111-1111-1111-1111-111111111111",
+    "22222222-2222-2222-2222-222222222222"
+  ]
   @home_preview_message_limit 1
   @history_default_limit 30
   @history_max_limit 100
@@ -425,7 +434,7 @@ defmodule Vibe.Chat do
 
     cond do
       is_binary(acting_user_id) and is_binary(from_id) and acting_user_id != from_id and
-          from_id != @agent_user_id ->
+          from_id not in @agent_sender_ids ->
         {:error, :forbidden_sender}
 
       true ->
