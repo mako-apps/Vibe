@@ -736,6 +736,7 @@ final class ChatInputBar: UIView {
   private var sendProgress: CGFloat = 0
   private var isAgentStreaming = false
   private var agentControlMode = false
+  private var agentControlTitle = "Open"
   // Recording layout morph progress: 0 = regular, 1 = expanded left.
   private var recordingExpandProgress: CGFloat = 0
 
@@ -1372,7 +1373,7 @@ final class ChatInputBar: UIView {
 
     if agentControlMode {
       var configuration = UIButton.Configuration.filled()
-      configuration.title = "Open"
+      configuration.title = agentControlTitle
       configuration.image = UIImage(
         systemName: "slider.horizontal.3",
         withConfiguration: UIImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
@@ -1397,7 +1398,7 @@ final class ChatInputBar: UIView {
       attachButton.configuration = configuration
       attachButton.contentHorizontalAlignment = .center
       attachButton.titleLabel?.lineBreakMode = .byClipping
-      attachButton.accessibilityLabel = "Open agents"
+      attachButton.accessibilityLabel = agentControlTitle == "Open" ? "Open agents" : "Change repository"
     } else {
       attachButton.configuration = nil
       attachButton.setTitle(nil, for: .normal)
@@ -1485,6 +1486,15 @@ final class ChatInputBar: UIView {
     guard agentControlMode != enabled else { return }
     agentControlMode = enabled
     inlineAttachButton.isHidden = !enabled
+    refreshAgentControlModeAppearance()
+    setNeedsLayout()
+  }
+
+  func setAgentControlTitle(_ title: String) {
+    let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+    let next = trimmed.isEmpty ? "Open" : trimmed
+    guard agentControlTitle != next else { return }
+    agentControlTitle = next
     refreshAgentControlModeAppearance()
     setNeedsLayout()
   }
@@ -1735,7 +1745,7 @@ final class ChatInputBar: UIView {
     let dynamicHPad = accessoryHorizontalPadding()
 
     // Measure text height
-    let leftControlWidth: CGFloat = agentControlMode ? 76.0 : sideSize
+    let leftControlWidth: CGFloat = agentControlMode ? agentControlButtonWidth() : sideSize
     let recordingLeftExpansion = (leftControlWidth + sideGap) * clampedRecordingExpand
     let pillX = dynamicHPad + leftControlWidth + sideGap - recordingLeftExpansion
     let pillRight = w - dynamicHPad - (sideSize * micVisibility) - (sideGap * micVisibility)
@@ -2237,6 +2247,14 @@ final class ChatInputBar: UIView {
 
   private func accessoryHorizontalPadding() -> CGFloat {
     26.0 - (16.0 * accessoryLayoutProgress())
+  }
+
+  private func agentControlButtonWidth() -> CGFloat {
+    let titleWidth =
+      (agentControlTitle as NSString).size(
+        withAttributes: [.font: UIFont.systemFont(ofSize: 13.0, weight: .semibold)]
+      ).width
+    return min(132.0, max(76.0, ceil(titleWidth + 44.0)))
   }
 
   @discardableResult

@@ -2368,6 +2368,9 @@ final class ChatEngine {
             wirePayload["agentText"] = agentText
           }
         }
+        if !metadata.isEmpty {
+          wirePayload["metadata"] = makeJSONSafeMap(metadata)
+        }
 
         if var message = localOptimisticRow["message"] as? [String: Any] {
           message["encryptedContent"] = encryptedContent

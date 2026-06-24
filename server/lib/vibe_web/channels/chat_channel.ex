@@ -261,10 +261,16 @@ defmodule VibeWeb.ChatChannel do
 
     agent_mention = data["agentMention"] || false
     mentioned_agent_id = data["mentionedAgentId"] || data["mentioned_agent_id"]
+    room_type = Chat.get_room_type(chat_id) || "dm"
+
+    reserved_workers = reserved_workers_from_text(data)
 
     mentioned_agent_username =
       data["mentionedAgentUsername"] || data["mentioned_agent_username"] ||
-        reserved_worker_mention_from_text(data)
+        case reserved_workers do
+          [%{handle: handle} | _] -> handle
+          _ -> nil
+        end
 
     agent_text = data["agentText"]
     reply_to_id = data["replyToId"] || data["reply_to_id"]
@@ -301,7 +307,7 @@ defmodule VibeWeb.ChatChannel do
 
     standalone_agent =
       standalone_agent ||
-        case Chat.get_room_type(chat_id) do
+        case room_type do
           "dm" ->
             chat_id
             |> Chat.get_participant_ids()
@@ -333,6 +339,22 @@ defmodule VibeWeb.ChatChannel do
     attachment_context = extract_agent_attachment_context(chat_id, data, user_id)
 
     cond do
+      room_type != "dm" and is_nil(standalone_agent) and length(reserved_workers) > 1 and
+          is_binary(dispatch_text) ->
+        reserved_workers
+        |> Enum.with_index()
+        |> Enum.each(fn {worker, index} ->
+          spawn_local_worker_dispatch(
+            chat_id,
+            worker,
+            dispatch_text,
+            data,
+            "reserved_worker_group",
+            user_id,
+            skip_rate_limit: index > 0
+          )
+        end)
+
       local_worker && is_binary(dispatch_text) ->
         trigger_type =
           cond do
@@ -393,8 +415,11 @@ defmodule VibeWeb.ChatChannel do
          dispatch_text,
          data,
          _trigger_type,
-         requester_user_id
+         requester_user_id,
+         opts \\ []
        ) do
+    skip_rate_limit = Keyword.get(opts, :skip_rate_limit, false)
+
     cond do
       not LocalAgentWorker.user_allowed?(requester_user_id) ->
         Logger.warning(
@@ -403,7 +428,7 @@ defmodule VibeWeb.ChatChannel do
 
         :ok
 
-      not LocalAgentWorker.allow_request?(requester_user_id) ->
+      not skip_rate_limit and not LocalAgentWorker.allow_request?(requester_user_id) ->
         LocalAgentWorker.post_notice(
           worker,
           chat_id,
@@ -421,14 +446,35 @@ defmodule VibeWeb.ChatChannel do
           "running"
         )
 
-        case AgentBridge.dispatch_task(requester_user_id, %{
-               "provider" => worker.handle,
-               "chatId" => chat_id,
-               "prompt" => dispatch_text,
-               "replyToId" => data["id"],
-               "requesterUserId" => requester_user_id
-             }) do
+        bridge_prompt =
+          LocalAgentWorker.build_bridge_prompt(
+            chat_id,
+            worker,
+            dispatch_text,
+            requester_user_id
+          )
+
+        task_payload =
+          %{
+            "provider" => worker.handle,
+            "chatId" => chat_id,
+            "prompt" => bridge_prompt,
+            "replyToId" => data["id"],
+            "requesterUserId" => requester_user_id
+          }
+          |> Map.merge(bridge_task_metadata(data))
+
+        case AgentBridge.dispatch_task(requester_user_id, task_payload) do
           :ok ->
+            # Record the human's prompt in the shared group thread (no-op in DMs)
+            # only once we know it was actually dispatched.
+            LocalAgentWorker.note_bridge_user_turn(
+              chat_id,
+              worker,
+              dispatch_text,
+              requester_user_id
+            )
+
             Logger.info(
               "[ChatChannel] dispatched @#{worker.handle} to bridge user=#{requester_user_id} chat=#{chat_id}"
             )
@@ -597,14 +643,48 @@ defmodule VibeWeb.ChatChannel do
     end
   end
 
-  defp reserved_worker_mention_from_text(data) do
+  defp reserved_workers_from_text(data) do
     text = data["pushPreview"] || data["textPreview"] || data["text"] || data["body"]
+    LocalAgentWorker.extract_reserved_mentions(text)
+  end
 
-    case LocalAgentWorker.extract_reserved_mention(text) do
-      %{handle: handle} -> handle
-      _ -> nil
+  defp bridge_task_metadata(data) do
+    metadata =
+      case data["metadata"] || data["meta"] do
+        value when is_map(value) -> value
+        _ -> %{}
+      end
+
+    %{}
+    |> put_optional_string(
+      "cwd",
+      metadata["agentBridgeCwd"] || metadata["agent_bridge_cwd"] || data["agentBridgeCwd"]
+    )
+    |> put_optional_string(
+      "repoId",
+      metadata["agentBridgeRepoId"] || metadata["agent_bridge_repo_id"] ||
+        data["agentBridgeRepoId"]
+    )
+    |> put_optional_string(
+      "repoName",
+      metadata["agentBridgeRepoName"] || metadata["agent_bridge_repo_name"] ||
+        data["agentBridgeRepoName"]
+    )
+    |> put_optional_string(
+      "workMode",
+      metadata["agentBridgeWorkMode"] || metadata["agent_bridge_work_mode"] ||
+        data["agentBridgeWorkMode"]
+    )
+  end
+
+  defp put_optional_string(map, key, value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> map
+      trimmed -> Map.put(map, key, trimmed)
     end
   end
+
+  defp put_optional_string(map, _key, _value), do: map
 
   # In a 1:1 chat with a Claude/Codex shadow user, route plain messages (no
   # @mention needed) to that bridge worker — the whole DM is "talk to Claude".

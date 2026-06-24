@@ -195,7 +195,7 @@ defmodule Vibe.AgentBridge do
   def verify_token(token) when is_binary(token) and token != "" do
     hash = hash_token(token)
 
-    case Repo.one(from c in Connection, where: c.token_hash == ^hash and is_nil(c.revoked_at)) do
+    case Repo.one(from(c in Connection, where: c.token_hash == ^hash and is_nil(c.revoked_at))) do
       %Connection{} = connection ->
         touch(connection)
         {:ok, to_string(connection.user_id)}
@@ -224,7 +224,7 @@ defmodule Vibe.AgentBridge do
 
   @doc "Whether the user has any non-revoked paired computer on record."
   def paired?(user_id) when is_binary(user_id) do
-    Repo.exists?(from c in Connection, where: c.user_id == ^user_id and is_nil(c.revoked_at))
+    Repo.exists?(from(c in Connection, where: c.user_id == ^user_id and is_nil(c.revoked_at)))
   end
 
   def paired?(_), do: false
@@ -249,6 +249,44 @@ defmodule Vibe.AgentBridge do
   end
 
   def online?(_), do: false
+
+  @doc "Public bridge status for the phone UI, including connected devices and repo choices."
+  def status(user_id) when is_binary(user_id) and user_id != "" do
+    presence = VibeWeb.Presence.list(topic(user_id))
+    devices = presence_devices(presence)
+
+    repositories =
+      devices
+      |> Enum.flat_map(fn device -> Map.get(device, "repositories", []) end)
+      |> dedupe_repositories()
+
+    %{
+      connected: map_size(presence) > 0,
+      paired: paired?(user_id),
+      devices: devices,
+      repositories: repositories
+    }
+  rescue
+    _ ->
+      %{connected: false, paired: paired?(user_id), devices: [], repositories: []}
+  end
+
+  def status(_), do: %{connected: false, paired: false, devices: [], repositories: []}
+
+  @doc "Normalize daemon-reported status before storing it in Presence metadata."
+  def presence_meta(payload) when is_map(payload) do
+    %{
+      "online_at" => System.system_time(:second),
+      "deviceLabel" => normalize(payload["deviceLabel"] || payload["device_label"]) || "computer",
+      "cwd" => normalize(payload["cwd"]),
+      "repositories" => normalize_repositories(payload["repositories"]),
+      "permissions" => normalize_permissions(payload["permissions"])
+    }
+  end
+
+  def presence_meta(_payload) do
+    %{"online_at" => System.system_time(:second), "repositories" => []}
+  end
 
   @doc "The bridge channel topic for a user."
   def topic(user_id), do: "bridge:#{user_id}"
@@ -299,4 +337,82 @@ defmodule Vibe.AgentBridge do
   end
 
   defp normalize(_), do: nil
+
+  defp presence_devices(presence) when is_map(presence) do
+    presence
+    |> Enum.flat_map(fn {_key, %{metas: metas}} -> metas || [] end)
+    |> Enum.map(&public_presence_meta/1)
+  end
+
+  defp presence_devices(_), do: []
+
+  defp public_presence_meta(meta) when is_map(meta) do
+    %{
+      "online_at" => meta["online_at"] || meta[:online_at],
+      "deviceLabel" =>
+        meta["deviceLabel"] || meta[:deviceLabel] || meta["device_label"] || "computer",
+      "cwd" => meta["cwd"] || meta[:cwd],
+      "repositories" => normalize_repositories(meta["repositories"] || meta[:repositories]),
+      "permissions" => normalize_permissions(meta["permissions"] || meta[:permissions])
+    }
+  end
+
+  defp public_presence_meta(_), do: %{"repositories" => []}
+
+  defp normalize_repositories(values) when is_list(values) do
+    values
+    |> Enum.map(&normalize_repository/1)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp normalize_repositories(_), do: []
+
+  defp normalize_repository(repo) when is_map(repo) do
+    path = normalize(repo["path"] || repo[:path] || repo["cwd"] || repo[:cwd])
+    id = normalize(repo["id"] || repo[:id])
+
+    cond do
+      is_nil(path) ->
+        nil
+
+      true ->
+        %{
+          "id" => id || repo_id(path),
+          "name" => normalize(repo["name"] || repo[:name]) || Path.basename(path),
+          "path" => path,
+          "cwd" => normalize(repo["cwd"] || repo[:cwd]) || path,
+          "source" => normalize(repo["source"] || repo[:source]) || "bridge",
+          "git" => truthy?(repo["git"] || repo[:git])
+        }
+    end
+  end
+
+  defp normalize_repository(_), do: nil
+
+  defp repo_id(path) do
+    :crypto.hash(:sha256, path)
+    |> Base.url_encode64(padding: false)
+    |> binary_part(0, 16)
+  end
+
+  defp dedupe_repositories(repositories) do
+    repositories
+    |> Enum.reduce({MapSet.new(), []}, fn repo, {seen, acc} ->
+      key = repo["id"] || repo["path"]
+
+      if is_binary(key) and not MapSet.member?(seen, key) do
+        {MapSet.put(seen, key), [repo | acc]}
+      else
+        {seen, acc}
+      end
+    end)
+    |> elem(1)
+    |> Enum.reverse()
+  end
+
+  defp normalize_permissions(value) when is_map(value), do: value
+  defp normalize_permissions(_), do: %{}
+
+  defp truthy?(value) when value in [true, "true", "1", 1], do: true
+  defp truthy?(_), do: false
 end

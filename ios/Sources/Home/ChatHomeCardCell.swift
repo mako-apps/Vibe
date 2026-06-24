@@ -12,22 +12,14 @@ protocol ChatHomeCardCellSwipeDelegate: AnyObject {
 
 final class ChatHomeCardCell: UITableViewCell {
   static let reuseIdentifier = "ChatHomeCardCell"
-  static let avatarImageCache: NSCache<NSString, UIImage> = {
-    let cache = NSCache<NSString, UIImage>()
-    cache.countLimit = 256
-    return cache
-  }()
 
   static func avatarCached(forKey key: String) -> UIImage? {
-    avatarImageCache.object(forKey: key as NSString)
+    ChatAvatarImageStore.cached(for: key)
   }
 
   static func cacheAvatar(_ image: UIImage, forKey key: String) {
-    avatarImageCache.setObject(image, forKey: key as NSString)
+    ChatAvatarImageStore.cache(image, for: key)
   }
-  private static let avatarSession: URLSession = {
-    return URLSession.shared
-  }()
 
   private let pressOverlayView = UIView()
   private let selectionOverlayView = UIView()
@@ -56,7 +48,7 @@ final class ChatHomeCardCell: UITableViewCell {
   private let pinIconView = UIImageView()
   private let rightCheckmarkView = UIImageView()
 
-  private var avatarLoadTask: URLSessionDataTask?
+  private var avatarLoadTask: Task<Void, Never>?
   private var avatarToken = UUID().uuidString
   private var lastAvatarURLString: String?
   private var rowContentLeadingConstraint: NSLayoutConstraint?
@@ -1053,18 +1045,7 @@ final class ChatHomeCardCell: UITableViewCell {
       return
     }
 
-    guard
-      let url = URL(string: normalizedURL),
-      let scheme = url.scheme?.lowercased(),
-      scheme == "https" || scheme == "http"
-    else {
-      avatarImageView.image = nil
-      avatarFallbackIconView.isHidden = false
-      lastAvatarURLString = nil
-      return
-    }
-
-    if let cached = Self.avatarImageCache.object(forKey: normalizedURL as NSString) {
+    if let cached = ChatAvatarImageStore.cached(for: normalizedURL) {
       avatarImageView.image = cached
       avatarFallbackIconView.isHidden = true
       return
@@ -1074,27 +1055,11 @@ final class ChatHomeCardCell: UITableViewCell {
     avatarFallbackIconView.isHidden = false
 
     let token = avatarToken
-    var request = URLRequest(url: url)
-    request.httpMethod = "GET"
-    request.timeoutInterval = 12.0
-    request.cachePolicy = .returnCacheDataElseLoad
-    request.setValue("image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
-    request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
-    let task = Self.avatarSession.dataTask(with: request) { [weak self] data, response, _ in
-      guard let self else { return }
-      guard token == self.avatarToken else { return }
-      let statusCode = (response as? HTTPURLResponse)?.statusCode
-      let image: UIImage?
-      if let statusCode, (200...299).contains(statusCode), let data {
-        image = UIImage(data: data)
-      } else {
-        image = nil
-      }
-      if let image {
-        Self.avatarImageCache.setObject(image, forKey: normalizedURL as NSString)
-      }
-      DispatchQueue.main.async {
-        guard token == self.avatarToken else { return }
+    let task = Task { [weak self] in
+      let image = await ChatAvatarImageStore.load(from: normalizedURL)
+      guard !Task.isCancelled else { return }
+      await MainActor.run {
+        guard let self, token == self.avatarToken else { return }
         self.avatarLoadTask = nil
         if let image {
           self.avatarImageView.image = image
@@ -1103,7 +1068,6 @@ final class ChatHomeCardCell: UITableViewCell {
       }
     }
     avatarLoadTask = task
-    task.resume()
   }
 }
 

@@ -3,6 +3,7 @@ import UIKit
 import WebKit
 import OSLog
 import Darwin
+import Combine
 
 enum AppUITrace {
   static let subsystem = "com.mohammadshayani.vibe.native"
@@ -3384,6 +3385,18 @@ final class ChatConversationController: UIViewController {
     agentConnectHost = nil
   }
 
+  private func presentBridgeRepositoryPicker(provider: String) {
+    let displayName = ChatRoute.bridgeDisplayName(for: provider)
+    let root = AgentBridgeRepositoryPickerView(provider: provider, displayName: displayName)
+    let host = UIHostingController(rootView: root)
+    host.modalPresentationStyle = .pageSheet
+    if let sheet = host.sheetPresentationController {
+      sheet.detents = [.medium(), .large()]
+      sheet.prefersGrabberVisible = true
+    }
+    present(host, animated: true)
+  }
+
   /// Clears any active connect gate (used when the host is reused for another chat).
   private func resetAgentConnectGate() {
     removeAgentConnectPanel()
@@ -3988,6 +4001,10 @@ final class ChatConversationController: UIViewController {
         sheet.prefersGrabberVisible = true
       }
       present(nav, animated: true)
+    case "openAgentPanel":
+      if let provider = route.bridgeProvider, !provider.isEmpty {
+        presentBridgeRepositoryPicker(provider: provider)
+      }
     case "headerSearchPressed":
       if currentPage == .profile {
         hideProfileView(animated: true)
@@ -4320,6 +4337,9 @@ private struct ChatHomeRowView: View {
 private struct ChatAvatarView: View {
   let row: ChatHomeListRow
   let palette: AppThemePalette
+  @Environment(\.colorScheme) private var colorScheme
+  @State private var avatarImage: UIImage?
+  @State private var avatarImageURI: String?
 
   var body: some View {
     ZStack(alignment: .bottomTrailing) {
@@ -4341,19 +4361,16 @@ private struct ChatAvatarView: View {
 
   @ViewBuilder
   private var avatarContent: some View {
-    if let avatarURI = row.avatarUri, let url = URL(string: avatarURI) {
-      AsyncImage(url: url) { phase in
-        switch phase {
-        case let .success(image):
-          image
-            .resizable()
-            .scaledToFill()
-        default:
-          fallbackAvatar
-        }
-      }
-    } else {
+    ZStack {
       fallbackAvatar
+      if avatarImageURI == normalizedAvatarURI(row.avatarUri), let avatarImage {
+        Image(uiImage: avatarImage)
+          .resizable()
+          .scaledToFill()
+      }
+    }
+    .task(id: row.avatarUri ?? "") {
+      await loadAvatarImage(row.avatarUri)
     }
   }
 
@@ -4384,8 +4401,12 @@ private struct ChatAvatarView: View {
 
 
   private func rowAvatarGradientColors(row: ChatHomeListRow, palette: AppThemePalette) -> [Color] {
-    let startRaw = row.avatarGradientStartLight ?? row.avatarGradientStartDark
-    let endRaw = row.avatarGradientEndLight ?? row.avatarGradientEndDark
+    let startRaw = colorScheme == .dark
+      ? (row.avatarGradientStartDark ?? row.avatarGradientStartLight)
+      : (row.avatarGradientStartLight ?? row.avatarGradientStartDark)
+    let endRaw = colorScheme == .dark
+      ? (row.avatarGradientEndDark ?? row.avatarGradientEndLight)
+      : (row.avatarGradientEndLight ?? row.avatarGradientEndDark)
     if let startRaw, let endRaw,
       let start = Color(hexString: startRaw),
       let end = Color(hexString: endRaw)
@@ -4393,6 +4414,33 @@ private struct ChatAvatarView: View {
       return [start, end]
     }
     return [palette.accent.opacity(0.9), palette.button.opacity(0.72)]
+  }
+
+  private func normalizedAvatarURI(_ rawValue: String?) -> String? {
+    let value = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return value.isEmpty ? nil : value
+  }
+
+  @MainActor
+  private func loadAvatarImage(_ rawValue: String?) async {
+    let normalized = normalizedAvatarURI(rawValue)
+    if avatarImageURI != normalized {
+      avatarImageURI = normalized
+      avatarImage = normalized.flatMap { ChatAvatarImageStore.cached(for: $0) }
+    }
+    guard let normalized else {
+      avatarImage = nil
+      return
+    }
+    if let cached = ChatAvatarImageStore.cached(for: normalized) {
+      avatarImage = cached
+      return
+    }
+    let loaded = await ChatAvatarImageStore.load(from: normalized)
+    guard !Task.isCancelled, avatarImageURI == normalized else { return }
+    if let loaded {
+      avatarImage = loaded
+    }
   }
 }
 
@@ -4476,6 +4524,9 @@ struct AppChatNavigationAvatarButton: View {
   let route: ChatRoute
   let palette: AppThemePalette
   let action: () -> Void
+  @Environment(\.colorScheme) private var colorScheme
+  @State private var avatarImage: UIImage?
+  @State private var avatarImageURI: String?
 
   private var fallbackText: String {
     let trimmed = route.title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -4520,19 +4571,18 @@ struct AppChatNavigationAvatarButton: View {
           .font(.system(size: 15, weight: .semibold))
           .foregroundStyle(.white)
       }
-    } else if let rawURI = route.avatarURI,
-      let url = URL(string: rawURI)
-    {
-      AsyncImage(url: url) { phase in
-        switch phase {
-        case .success(let image):
-          image.resizable().scaledToFill()
-        default:
-          fallbackAvatar
+    } else {
+      ZStack {
+        fallbackAvatar
+        if avatarImageURI == normalizedAvatarURI(route.avatarURI), let avatarImage {
+          Image(uiImage: avatarImage)
+            .resizable()
+            .scaledToFill()
         }
       }
-    } else {
-      fallbackAvatar
+      .task(id: route.avatarURI ?? "") {
+        await loadAvatarImage(route.avatarURI)
+      }
     }
   }
     @ViewBuilder
@@ -4547,20 +4597,41 @@ struct AppChatNavigationAvatarButton: View {
     }
 
   private func routeAvatarGradientColors(route: ChatRoute) -> [Color] {
-    let seed =
-      [route.peerUserId, route.title, route.chatId]
-      .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-      .first { !$0.isEmpty } ?? "user"
-    let palettes: [[Color]] = [
-      [Color(red: 91 / 255, green: 141 / 255, blue: 239 / 255), Color(red: 61 / 255, green: 107 / 255, blue: 198 / 255)],
-      [Color(red: 31 / 255, green: 169 / 255, blue: 122 / 255), Color(red: 22 / 255, green: 122 / 255, blue: 96 / 255)],
-      [Color(red: 214 / 255, green: 106 / 255, blue: 90 / 255), Color(red: 175 / 255, green: 73 / 255, blue: 63 / 255)],
-      [Color(red: 160 / 255, green: 106 / 255, blue: 216 / 255), Color(red: 124 / 255, green: 78 / 255, blue: 178 / 255)],
-      [Color(red: 213 / 255, green: 154 / 255, blue: 46 / 255), Color(red: 175 / 255, green: 116 / 255, blue: 29 / 255)],
-      [Color(red: 47 / 255, green: 154 / 255, blue: 168 / 255), Color(red: 32 / 255, green: 117 / 255, blue: 133 / 255)],
-    ]
-    let index = abs(seed.unicodeScalars.reduce(0) { ($0 &* 31) &+ Int($1.value) }) % palettes.count
-    return palettes[index]
+    let colors = ChatAvatarFallbackStyle.uiGradient(
+      title: route.title,
+      peerUserId: route.peerUserId,
+      chatId: route.chatId,
+      isDark: colorScheme == .dark,
+      isSavedMessages: route.chatId == "saved_messages"
+    )
+    return [Color(uiColor: colors.0), Color(uiColor: colors.1)]
+  }
+
+  private func normalizedAvatarURI(_ rawValue: String?) -> String? {
+    let value = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return value.isEmpty ? nil : value
+  }
+
+  @MainActor
+  private func loadAvatarImage(_ rawValue: String?) async {
+    let normalized = normalizedAvatarURI(rawValue)
+    if avatarImageURI != normalized {
+      avatarImageURI = normalized
+      avatarImage = normalized.flatMap { ChatAvatarImageStore.cached(for: $0) }
+    }
+    guard let normalized else {
+      avatarImage = nil
+      return
+    }
+    if let cached = ChatAvatarImageStore.cached(for: normalized) {
+      avatarImage = cached
+      return
+    }
+    let loaded = await ChatAvatarImageStore.load(from: normalized)
+    guard !Task.isCancelled, avatarImageURI == normalized else { return }
+    if let loaded {
+      avatarImage = loaded
+    }
   }
 }
 
@@ -5576,6 +5647,7 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
 
   private var toastHost: UIHostingController<AppToastHostView>?
   private var settingsAvatarTask: Task<Void, Never>?
+  private var profileCancellable: AnyCancellable?
 
   override func viewDidLoad() {
     super.viewDidLoad()
@@ -5633,6 +5705,11 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
       await AppProfileController.shared.loadIfNeeded()
       await MainActor.run { self?.refreshSettingsTabAvatar() }
     }
+    profileCancellable = AppProfileController.shared.$profile
+      .receive(on: DispatchQueue.main)
+      .sink { [weak self] _ in
+        self?.refreshSettingsTabAvatar()
+      }
   }
 
   deinit {
@@ -5758,7 +5835,7 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
       return
     }
     settingsAvatarTask = Task { [weak self] in
-      let image = await SettingsAvatarImageLoader.load(from: uri)
+      let image = await ChatAvatarImageStore.load(from: uri)
       if Task.isCancelled { return }
       await MainActor.run {
         if let img = image {
@@ -5771,40 +5848,51 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
   }
 
   private func applySettingsTabFallback(profile: AppUserProfile?) {
-    print("AppRootTabBarController: applySettingsTabFallback started")
-    do {
-      let name = profile?.name ?? profile?.username ?? "U"
-      let letters = String(name.prefix(2)).uppercased()
-      let hash = name.utf8.reduce(5381) { ($0 << 5) &+ $0 &+ Int($1) }
-      let hue = CGFloat(abs(hash % 256)) / 256.0
-      let color = UIColor(hue: hue, saturation: 0.6, brightness: 0.8, alpha: 1.0)
+    let name = profile?.name ?? profile?.username ?? "U"
+    let letters = String(name.prefix(2)).uppercased()
+    let colors = ChatAvatarFallbackStyle.uiGradient(
+      title: profile?.displayName ?? name,
+      peerUserId: profile?.userID,
+      chatId: profile?.username,
+      isDark: traitCollection.userInterfaceStyle == .dark
+    )
 
-      let size: CGFloat = 26
-      let renderer = UIGraphicsImageRenderer(size: CGSize(width: size, height: size))
-      let image = renderer.image { ctx in
-        let rect = CGRect(x: 0, y: 0, width: size, height: size)
-        UIBezierPath(ovalIn: rect).addClip()
-        color.setFill()
-        ctx.cgContext.fill(rect)
-
-        let attributes: [NSAttributedString.Key: Any] = [
-          .font: UIFont.systemFont(ofSize: size * 0.45, weight: .semibold),
-          .foregroundColor: UIColor.white
-        ]
-        let textSize = letters.size(withAttributes: attributes)
-        let textRect = CGRect(
-          x: (size - textSize.width) / 2,
-          y: (size - textSize.height) / 2,
-          width: textSize.width,
-          height: textSize.height
+    let size: CGFloat = 26
+    let renderer = UIGraphicsImageRenderer(size: CGSize(width: size, height: size))
+    let image = renderer.image { ctx in
+      let rect = CGRect(x: 0, y: 0, width: size, height: size)
+      UIBezierPath(ovalIn: rect).addClip()
+      let gradient = CGGradient(
+        colorsSpace: CGColorSpaceCreateDeviceRGB(),
+        colors: [colors.0.cgColor, colors.1.cgColor] as CFArray,
+        locations: [0.0, 1.0]
+      )
+      if let gradient {
+        ctx.cgContext.drawLinearGradient(
+          gradient,
+          start: CGPoint(x: 0.0, y: 0.0),
+          end: CGPoint(x: size, y: size),
+          options: []
         )
-        letters.draw(in: textRect, withAttributes: attributes)
+      } else {
+        colors.0.setFill()
+        ctx.cgContext.fill(rect)
       }
-      applySettingsTabImage(image)
-      print("AppRootTabBarController: applySettingsTabFallback finished successfully")
-    } catch {
-      print("AppRootTabBarController: applySettingsTabFallback crashed: \(error)")
+
+      let attributes: [NSAttributedString.Key: Any] = [
+        .font: UIFont.systemFont(ofSize: size * 0.45, weight: .semibold),
+        .foregroundColor: UIColor.white
+      ]
+      let textSize = letters.size(withAttributes: attributes)
+      let textRect = CGRect(
+        x: (size - textSize.width) / 2,
+        y: (size - textSize.height) / 2,
+        width: textSize.width,
+        height: textSize.height
+      )
+      letters.draw(in: textRect, withAttributes: attributes)
     }
+    applySettingsTabImage(image)
   }
 
   private func applySettingsTabImage(_ image: UIImage?) {

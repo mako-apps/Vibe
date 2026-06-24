@@ -100,11 +100,7 @@ defmodule VibeWeb.AgentBridgeController do
   # GET /api/agent-bridge/status  (authenticated phone)
   def status(conn, _params) do
     user_id = conn.assigns.current_user.id
-
-    json(conn, %{
-      connected: AgentBridge.online?(user_id),
-      paired: AgentBridge.paired?(user_id)
-    })
+    json(conn, AgentBridge.status(user_id))
   end
 
   # DELETE /api/agent-bridge  (authenticated phone)

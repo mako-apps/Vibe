@@ -819,6 +819,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       name: .chatNativeStreamingTextLayoutInvalidated,
       object: nil
     )
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleAgentBridgeSelectionChanged(_:)),
+      name: AgentBridgeSelectionStore.didChangeNotification,
+      object: nil
+    )
 
   }
 
@@ -1852,6 +1858,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let next = value.trimmingCharacters(in: .whitespacesAndNewlines)
     if enginePeerUserId == next { return }
     enginePeerUserId = next
+    updateAgentBridgeControlTitle()
     updateChatEngineBinding()
     if statusAuthorityEnabled {
       refreshVisibleStatuses(reason: "peerUserId")
@@ -4433,9 +4440,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       bar.applyAppearance(appearance)
       bar.setAgentStreaming(agentStreaming)
       bar.setAgentControlMode(agentChatMode)
+      inputBar = bar
+      updateAgentBridgeControlTitle()
 
       addSubview(bar)
-      inputBar = bar
       positionTransitionOverlayHost()
       NSLog("[ChatListView] native input bar ENABLED")
     } else {
@@ -4474,6 +4482,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     guard agentChatMode != enabled else { return }
     agentChatMode = enabled
     inputBar?.setAgentControlMode(enabled)
+    updateAgentBridgeControlTitle()
     updateBottomAnchorInset()
     if enabled {
       performInternalScrollAdjustment {
@@ -4689,6 +4698,77 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
   // MARK: - Native Send (synchronous, no bridge delay)
 
+  private func agentBridgeMetadataForOutgoing(
+    text: String,
+    mentionedAgentUsername: String?
+  ) -> [String: Any] {
+    guard let provider = resolvedBridgeProviderForOutgoing(
+      text: text,
+      mentionedAgentUsername: mentionedAgentUsername
+    ) else {
+      return [:]
+    }
+    guard let repository = AgentBridgeSelectionStore.selectedRepository() else {
+      return [:]
+    }
+
+    return [
+      "agentBridgeProvider": provider,
+      "agentBridgeRepoId": repository.id,
+      "agentBridgeRepoName": repository.name,
+      "agentBridgeRepoPath": repository.path,
+      "agentBridgeCwd": repository.cwd,
+      "agentBridgeWorkMode": AgentBridgeSelectionStore.selectedWorkMode().rawValue,
+    ]
+  }
+
+  private func resolvedBridgeProviderForOutgoing(
+    text: String,
+    mentionedAgentUsername: String?
+  ) -> String? {
+    let peer = enginePeerUserId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if peer == "11111111-1111-1111-1111-111111111111" { return "claude" }
+    if peer == "22222222-2222-2222-2222-222222222222" { return "codex" }
+
+    let mention =
+      mentionedAgentUsername?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased()
+    if mention == "claude" || mention == "codex" {
+      return mention
+    }
+
+    if text.range(of: "(^|\\s)@claude\\b", options: [.regularExpression, .caseInsensitive]) != nil {
+      return "claude"
+    }
+    if text.range(of: "(^|\\s)@codex\\b", options: [.regularExpression, .caseInsensitive]) != nil {
+      return "codex"
+    }
+    return nil
+  }
+
+  private var currentBridgeProvider: String? {
+    let peer = enginePeerUserId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if peer == "11111111-1111-1111-1111-111111111111" { return "claude" }
+    if peer == "22222222-2222-2222-2222-222222222222" { return "codex" }
+    return nil
+  }
+
+  private func updateAgentBridgeControlTitle() {
+    guard agentChatMode, currentBridgeProvider != nil else {
+      inputBar?.setAgentControlTitle("Open")
+      return
+    }
+    let repositoryName = AgentBridgeSelectionStore.selectedRepository()?.name ?? "Repo"
+    let mode = AgentBridgeSelectionStore.selectedWorkMode()
+    let suffix = mode == .readOnly ? "" : " · \(mode.title)"
+    inputBar?.setAgentControlTitle(repositoryName + suffix)
+  }
+
+  @objc private func handleAgentBridgeSelectionChanged(_ notification: Notification) {
+    updateAgentBridgeControlTitle()
+  }
+
   private func handleNativeSend(
     text: String,
     agentMention: Bool = false,
@@ -4705,6 +4785,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
     // Capture reply-to ID before dismissing the banner (dismissing clears it).
     let replyToMessageId = inputBar?.activeReplyToMessageId
+    let bridgeMetadata = agentBridgeMetadataForOutgoing(
+      text: text,
+      mentionedAgentUsername: mentionedAgentUsername
+    )
 
     NSLog(
       "[ChatListView] handleNativeSend START — messageId: %@, text length: %lu, nativeSendEnabled: %@, replyTo: %@",
@@ -4732,6 +4816,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       ]
       if let replyToMessageId {
         sendPayload["replyToMessageId"] = replyToMessageId
+      }
+      if !bridgeMetadata.isEmpty {
+        sendPayload["metadata"] = bridgeMetadata
       }
       onNativeEvent(sendPayload)
       return
@@ -4838,6 +4925,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         "peerAgentId": peerAgentId,
         "isGroup": isGroupOrChannel,
       ]
+      if !bridgeMetadata.isEmpty {
+        sendPayload["metadata"] = bridgeMetadata
+      }
       if agentMention, let agentText {
         sendPayload["agentMention"] = true
         sendPayload["agentText"] = agentText
@@ -4907,6 +4997,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       ]
       if let replyToMessageId {
         sendPayload["replyToMessageId"] = replyToMessageId
+      }
+      if !bridgeMetadata.isEmpty {
+        sendPayload["metadata"] = bridgeMetadata
       }
       if agentMention, let agentText {
         sendPayload["agentMention"] = true

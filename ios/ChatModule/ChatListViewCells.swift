@@ -1067,7 +1067,8 @@ private func hasInlineFileAttachment(_ row: ChatListRow) -> Bool {
 }
 
 private func hasInlineRelatedMessages(_ row: ChatListRow) -> Bool {
-  !row.relatedMessageIds.isEmpty
+  guard !row.isEventInboxSummary else { return false }
+  return !row.relatedMessageIds.isEmpty
 }
 
 private func hasInlineAttachment(_ row: ChatListRow) -> Bool {

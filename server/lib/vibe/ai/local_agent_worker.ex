@@ -5,8 +5,13 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   alias Vibe.Chat
   alias Vibe.Chat.AgentMessageCrypto
+  alias Vibe.Chat.GroupAgentMemory
   alias Vibe.Notifications
   alias Vibe.Repo
+
+  # How many recent shared-thread turns to inject as collaboration context when
+  # dispatching a bridge agent inside a group.
+  @group_context_messages 12
 
   @agent_user_id Vibe.AI.GroupAgent.agent_user_id()
   # Distinct agent user identities so @claude and @codex are separate, searchable
@@ -100,6 +105,19 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   def extract_reserved_mention(_), do: nil
+
+  def extract_reserved_mentions(text) when is_binary(text) do
+    ~r/(?:^|\s)@(codex|claude)\b/i
+    |> Regex.scan(text)
+    |> Enum.map(fn
+      [_, handle] -> resolve_handle(handle)
+      _ -> nil
+    end)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq_by(& &1.handle)
+  end
+
+  def extract_reserved_mentions(_), do: []
 
   def enabled? do
     truthy?(System.get_env("VIBE_LOCAL_AGENT_WORKERS"))
@@ -352,6 +370,10 @@ defmodule Vibe.AI.LocalAgentWorker do
             )
           end
 
+        # Add the agent's answer to the shared group thread so the other agent can
+        # build on it next turn. Only on success — don't pollute memory with errors.
+        if ok, do: note_bridge_agent_turn(chat_id, worker, base_text, requester_user_id)
+
         post_worker_message(
           worker,
           chat_id,
@@ -381,6 +403,197 @@ defmodule Vibe.AI.LocalAgentWorker do
       worker -> post_notice(worker, chat_id, text, requester_user_id, reply_to_id)
     end
   end
+
+  # ── Shared group memory (Claude + Codex collaborating) ──────────────
+  # Vibe is E2E encrypted, so the server can't read humans' stored messages. But
+  # it CAN see every agent prompt (sent in cleartext as `agentText`) and every
+  # agent reply (generated server-side). That stream IS the agents' shared
+  # collaboration thread: we persist it in `GroupAgentMemory` (keyed by chat) and
+  # re-inject it as context so @claude and @codex can build on each other's work.
+  # In a 1:1 DM the agent keeps its own `--resume` continuity, so we skip all of
+  # this and send the raw prompt unchanged.
+
+  @doc """
+  Build the prompt to send to the bridge. In a group, prepend a speaker-labelled
+  collaboration context (recent turns + any summary) plus a short framing so the
+  agent knows it shares the conversation with the other agents and people. In a
+  DM, returns `dispatch_text` unchanged.
+  """
+  def build_bridge_prompt(chat_id, worker, dispatch_text, requester_user_id)
+      when is_binary(chat_id) and is_map(worker) and is_binary(dispatch_text) do
+    if group_chat?(chat_id) do
+      context = group_collaboration_context(chat_id, requester_user_id)
+
+      if context == "" do
+        dispatch_text
+      else
+        """
+        #{group_framing(worker)}
+
+        Shared conversation so far (you can see everyone's recent messages and the other agents' work — build on it, don't repeat what's already done):
+        #{context}
+
+        Latest request for you (#{worker.label}):
+        #{dispatch_text}
+        """
+        |> String.trim()
+      end
+    else
+      dispatch_text
+    end
+  end
+
+  def build_bridge_prompt(_chat_id, _worker, dispatch_text, _requester), do: dispatch_text
+
+  @doc "Record a human's prompt to a worker into the shared group memory (no-op in DMs)."
+  def note_bridge_user_turn(chat_id, worker, text, requester_user_id)
+      when is_binary(chat_id) and is_map(worker) do
+    if group_chat?(chat_id) do
+      GroupAgentMemory.append_message(
+        chat_id,
+        %{
+          "role" => "user",
+          "content" => clean_for_memory(text),
+          "user_id" => requester_user_id,
+          "sender_name" => sender_display_name(requester_user_id),
+          "target_agent" => worker.handle
+        },
+        acting_user_id: requester_user_id
+      )
+    end
+
+    :ok
+  end
+
+  def note_bridge_user_turn(_chat_id, _worker, _text, _requester), do: :ok
+
+  @doc "Record a worker's answer into the shared group memory (no-op in DMs)."
+  def note_bridge_agent_turn(chat_id, worker, text, requester_user_id)
+      when is_binary(chat_id) and is_map(worker) do
+    if is_binary(text) and String.trim(text) != "" and group_chat?(chat_id) do
+      GroupAgentMemory.append_message(
+        chat_id,
+        %{
+          "role" => "assistant",
+          "content" => clean_for_memory(text),
+          "agent" => worker.handle,
+          "agent_name" => worker.label
+        },
+        acting_user_id: requester_user_id
+      )
+    end
+
+    :ok
+  end
+
+  def note_bridge_agent_turn(_chat_id, _worker, _text, _requester), do: :ok
+
+  defp group_chat?(chat_id) do
+    case Chat.get_room_type(chat_id) do
+      "dm" -> false
+      nil -> false
+      _ -> true
+    end
+  end
+
+  defp group_framing(worker) do
+    "You are #{worker.label}, collaborating with other AI agents (#{other_agents_label(worker)}) " <>
+      "and people in a shared Vibe group chat. Everyone shares this conversation. When you finish, " <>
+      "your reply is posted back into the group so the others can continue from it."
+  end
+
+  defp other_agents_label(worker) do
+    list_workers()
+    |> Enum.reject(&(&1.handle == worker.handle))
+    |> Enum.map_join(", ", & &1.label)
+    |> case do
+      "" -> "other agents"
+      names -> names
+    end
+  end
+
+  defp group_collaboration_context(chat_id, requester_user_id) do
+    case GroupAgentMemory.get_or_create(chat_id, acting_user_id: requester_user_id) do
+      {:ok, memory} ->
+        summary_part =
+          case memory.summary do
+            s when is_binary(s) and s != "" -> "Summary of earlier discussion: #{s}\n"
+            _ -> ""
+          end
+
+        lines =
+          memory.messages
+          |> List.wrap()
+          |> Enum.take(-@group_context_messages)
+          |> Enum.map(&format_thread_line/1)
+          |> Enum.reject(&is_nil/1)
+          |> Enum.join("\n")
+
+        (summary_part <> lines) |> String.trim()
+
+      _ ->
+        ""
+    end
+  end
+
+  defp format_thread_line(%{"role" => "assistant"} = msg) do
+    name = msg["agent_name"] || "Agent"
+
+    case truncate_line(msg["content"]) do
+      "" -> nil
+      content -> "#{name}: #{content}"
+    end
+  end
+
+  defp format_thread_line(%{"role" => "user"} = msg) do
+    who = msg["sender_name"] || "A teammate"
+
+    label =
+      case msg["target_agent"] do
+        target when is_binary(target) and target != "" -> "#{who} → #{String.capitalize(target)}"
+        _ -> who
+      end
+
+    case truncate_line(msg["content"]) do
+      "" -> nil
+      content -> "#{label}: #{content}"
+    end
+  end
+
+  defp format_thread_line(_), do: nil
+
+  defp truncate_line(nil), do: ""
+
+  defp truncate_line(text) when is_binary(text) do
+    collapsed = text |> String.replace(~r/\s+/u, " ") |> String.trim()
+
+    if String.length(collapsed) > 500,
+      do: String.slice(collapsed, 0, 497) <> "...",
+      else: collapsed
+  end
+
+  defp truncate_line(_), do: ""
+
+  # Strip reserved @mentions before storing/re-injecting so the daemon's mention
+  # scrubber never mangles our context labels, and labels stay clean.
+  defp clean_for_memory(text) when is_binary(text) do
+    text
+    |> String.replace(~r/(^|\s)@(claude|codex)\b/iu, "\\1")
+    |> String.trim()
+  end
+
+  defp clean_for_memory(_), do: ""
+
+  defp sender_display_name(user_id) when is_binary(user_id) do
+    case Vibe.Accounts.get_user(user_id) do
+      %{name: name} when is_binary(name) and name != "" -> name
+      _ -> "A teammate"
+    end
+  rescue
+    _ -> "A teammate"
+  end
+
+  defp sender_display_name(_), do: "A teammate"
 
   # ── Activity broadcast helpers (shared by chat + bridge channels) ────
 
@@ -515,7 +728,11 @@ defmodule Vibe.AI.LocalAgentWorker do
         ok = status == 0
 
         if ok do
-          store_session(Keyword.get(opts, :chat_id), worker.handle, session_id_from_output(output))
+          store_session(
+            Keyword.get(opts, :chat_id),
+            worker.handle,
+            session_id_from_output(output)
+          )
         end
 
         Logger.info(
@@ -694,11 +911,11 @@ defmodule Vibe.AI.LocalAgentWorker do
     error -> {:error, error}
   end
 
-  defp normalize_prompt(worker, prompt) do
+  defp normalize_prompt(_worker, prompt) do
     cleaned =
       prompt
       |> to_string()
-      |> String.replace(~r/(?:^|\s)@#{Regex.escape(worker.handle)}\b/i, " ")
+      |> String.replace(~r/(?:^|\s)@(codex|claude)\b/i, " ")
       |> String.trim()
 
     cond do

@@ -1,13 +1,165 @@
 import Foundation
 
+struct AgentBridgeRepository: Hashable, Identifiable {
+  let id: String
+  let name: String
+  let path: String
+  let cwd: String
+  let source: String?
+  let isGitRepository: Bool
+}
+
+struct AgentBridgeDevice: Hashable {
+  let label: String
+  let cwd: String?
+  let repositories: [AgentBridgeRepository]
+}
+
+enum AgentBridgeWorkMode: String, CaseIterable, Identifiable {
+  /// Live per-action approval routed to your phone. Until the live approval
+  /// channel ships, the daemon treats this as safe-propose (same as `.readOnly`).
+  case ask = "ask"
+  /// Analyse & propose only — never changes files.
+  case readOnly = "read_only"
+  /// Auto-approve edits + sandboxed command execution.
+  case allowEdits = "allow_edits"
+  /// No sandbox — the agent can run anything in the selected repo.
+  case fullAccess = "full_access"
+
+  var id: String { rawValue }
+
+  var title: String {
+    switch self {
+    case .ask: return "Ask"
+    case .readOnly: return "Read"
+    case .allowEdits: return "Auto"
+    case .fullAccess: return "Full"
+    }
+  }
+
+  var subtitle: String {
+    switch self {
+    case .ask: return "Approve each change or command from your phone"
+    case .readOnly: return "Read & propose only — never changes files"
+    case .allowEdits: return "Auto-approve edits & sandboxed commands"
+    case .fullAccess: return "No sandbox — can run anything (use with care)"
+    }
+  }
+
+  var icon: String {
+    switch self {
+    case .ask: return "hand.raised"
+    case .readOnly: return "eye"
+    case .allowEdits: return "pencil"
+    case .fullAccess: return "bolt"
+    }
+  }
+}
+
 /// Whether a paired computer (the `vibe-bridge` daemon) is connected right now.
 struct AgentBridgeStatus {
   /// A daemon is currently online (Presence on `bridge:<user_id>`).
   let connected: Bool
   /// The account has at least one non-revoked bridge token on record.
   let paired: Bool
+  /// Flattened list of working trees advertised by the connected bridge daemon.
+  let repositories: [AgentBridgeRepository]
+  /// Connected bridge devices. Usually one computer for now.
+  let devices: [AgentBridgeDevice]
 
-  static let disconnected = AgentBridgeStatus(connected: false, paired: false)
+  static let disconnected = AgentBridgeStatus(
+    connected: false,
+    paired: false,
+    repositories: [],
+    devices: []
+  )
+}
+
+enum AgentBridgeSelectionStore {
+  static let didChangeNotification = Notification.Name("AgentBridgeSelectionStoreDidChange")
+
+  private static let repositoryKey = "agentBridge.selectedRepository"
+  private static let workModeKey = "agentBridge.workMode"
+
+  static func selectedRepository() -> AgentBridgeRepository? {
+    guard
+      let data = UserDefaults.standard.data(forKey: repositoryKey),
+      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+      let id = normalizedString(object["id"]),
+      let path = normalizedString(object["path"])
+    else {
+      return nil
+    }
+
+    return AgentBridgeRepository(
+      id: id,
+      name: normalizedString(object["name"]) ?? URL(fileURLWithPath: path).lastPathComponent,
+      path: path,
+      cwd: normalizedString(object["cwd"]) ?? path,
+      source: normalizedString(object["source"]),
+      isGitRepository: boolValue(object["git"])
+    )
+  }
+
+  static func select(_ repository: AgentBridgeRepository) {
+    var object: [String: Any] = [
+      "id": repository.id,
+      "name": repository.name,
+      "path": repository.path,
+      "cwd": repository.cwd,
+      "git": repository.isGitRepository,
+    ]
+    if let source = repository.source {
+      object["source"] = source
+    }
+    if let data = try? JSONSerialization.data(withJSONObject: object) {
+      UserDefaults.standard.set(data, forKey: repositoryKey)
+      NotificationCenter.default.post(name: didChangeNotification, object: nil)
+    }
+  }
+
+  static func selectedWorkMode() -> AgentBridgeWorkMode {
+    let raw = UserDefaults.standard.string(forKey: workModeKey) ?? AgentBridgeWorkMode.readOnly.rawValue
+    return AgentBridgeWorkMode(rawValue: raw) ?? .readOnly
+  }
+
+  static func setWorkMode(_ mode: AgentBridgeWorkMode) {
+    UserDefaults.standard.set(mode.rawValue, forKey: workModeKey)
+    NotificationCenter.default.post(name: didChangeNotification, object: nil)
+  }
+
+  @discardableResult
+  static func ensureValidSelection(from repositories: [AgentBridgeRepository]) -> AgentBridgeRepository? {
+    guard !repositories.isEmpty else {
+      return selectedRepository()
+    }
+    if let selected = selectedRepository(),
+      repositories.contains(where: { $0.id == selected.id || $0.cwd == selected.cwd })
+    {
+      return selected
+    }
+    let first = repositories[0]
+    select(first)
+    return first
+  }
+
+  private static func boolValue(_ value: Any?) -> Bool {
+    if let value = value as? Bool { return value }
+    if let value = value as? NSNumber { return value.boolValue }
+    if let value = value as? String {
+      return ["true", "1", "yes"].contains(value.lowercased())
+    }
+    return false
+  }
+
+  private static func normalizedString(_ value: Any?) -> String? {
+    if let value = value as? String {
+      let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+      return trimmed.isEmpty ? nil : trimmed
+    }
+    if let value = value as? NSNumber { return value.stringValue }
+    return nil
+  }
 }
 
 /// A freshly minted, single-use pairing code plus the exact command the user runs
@@ -60,9 +212,13 @@ enum AgentPairingService {
   static func status(config: AppSessionConfig) async throws -> AgentBridgeStatus {
     let request = try buildRequest(config: config, path: "/agent-bridge/status", method: "GET")
     let object = try await perform(request)
+    let repositories = repositoryList(object["repositories"])
+    let devices = deviceList(object["devices"])
     return AgentBridgeStatus(
       connected: boolValue(object["connected"]),
-      paired: boolValue(object["paired"])
+      paired: boolValue(object["paired"]),
+      repositories: repositories.isEmpty ? devices.flatMap(\.repositories) : repositories,
+      devices: devices
     )
   }
 
@@ -187,5 +343,35 @@ enum AgentPairingService {
     }
     if let value = value as? NSNumber { return value.stringValue }
     return nil
+  }
+
+  private static func repositoryList(_ value: Any?) -> [AgentBridgeRepository] {
+    guard let values = value as? [[String: Any]] else { return [] }
+    return values.compactMap(repository)
+  }
+
+  private static func repository(_ object: [String: Any]) -> AgentBridgeRepository? {
+    guard let path = normalizedString(object["path"] ?? object["cwd"]) else { return nil }
+    let cwd = normalizedString(object["cwd"]) ?? path
+    let id = normalizedString(object["id"]) ?? path
+    return AgentBridgeRepository(
+      id: id,
+      name: normalizedString(object["name"]) ?? URL(fileURLWithPath: path).lastPathComponent,
+      path: path,
+      cwd: cwd,
+      source: normalizedString(object["source"]),
+      isGitRepository: boolValue(object["git"])
+    )
+  }
+
+  private static func deviceList(_ value: Any?) -> [AgentBridgeDevice] {
+    guard let values = value as? [[String: Any]] else { return [] }
+    return values.map { object in
+      AgentBridgeDevice(
+        label: normalizedString(object["deviceLabel"] ?? object["device_label"]) ?? "Computer",
+        cwd: normalizedString(object["cwd"]),
+        repositories: repositoryList(object["repositories"])
+      )
+    }
   }
 }

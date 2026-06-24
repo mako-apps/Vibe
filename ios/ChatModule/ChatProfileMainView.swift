@@ -60,67 +60,19 @@ extension String {
 }
 
 private enum NativeProfileAvatarImageLoader {
-  private static let cache: NSCache<NSString, UIImage> = {
-    let cache = NSCache<NSString, UIImage>()
-    cache.countLimit = 128
-    return cache
-  }()
-
   static func load(from rawValue: String?) async -> UIImage? {
-    guard let rawValue else { return nil }
-    let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !value.isEmpty else { return nil }
-
-    if value.hasPrefix("data:"), let commaIndex = value.firstIndex(of: ",") {
-      let base64 = String(value[value.index(after: commaIndex)...])
-      guard let data = Data(base64Encoded: base64, options: [.ignoreUnknownCharacters]) else {
-        return nil
-      }
-      return UIImage(data: data)
-    }
-
-    if let data = Data(base64Encoded: value, options: [.ignoreUnknownCharacters]) {
-      return UIImage(data: data)
-    }
-
-    if value.hasPrefix("/") {
-      return UIImage(contentsOfFile: value)
-    }
-
-    guard let url = URL(string: value) else { return nil }
-    if url.isFileURL {
-      return UIImage(contentsOfFile: url.path)
-    }
-
-    guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
-      return nil
-    }
-
-    if let cached = cache.object(forKey: value as NSString) {
-      return cached
-    }
-
-    do {
-      var request = URLRequest(url: url)
-      request.cachePolicy = .returnCacheDataElseLoad
-      let (data, _) = try await URLSession.shared.data(for: request)
-      guard let image = UIImage(data: data) else { return nil }
-      cache.setObject(image, forKey: value as NSString)
-      return image
-    } catch {
-      return nil
-    }
+    await ChatAvatarImageStore.load(from: rawValue)
   }
 }
 
 enum NativeProfileAvatarHeroMetrics {
   static let topAdjust: CGFloat = 12
   static let islandAnchor: CGFloat = 56
-  static let topOffset: CGFloat = 80
-  static let collapsedTopOffset: CGFloat = 25
-  static let expandedSize: CGFloat = 100
-  static let collapsedSize: CGFloat = 32
-  static let bottomSpacing: CGFloat = 20
+  static let topOffset: CGFloat = 92
+  static let collapsedTopOffset: CGFloat = 18
+  static let expandedSize: CGFloat = 154
+  static let collapsedSize: CGFloat = 34
+  static let bottomSpacing: CGFloat = 18
 
   static func expandedTop(for safeTop: CGFloat) -> CGFloat {
     max(0, safeTop - islandAnchor - topAdjust) + topOffset
@@ -149,33 +101,41 @@ private struct NativeProfileAvatarInnerContent: View {
   let fallbackBackgroundColor: UIColor
   let size: CGFloat
 
-  private var inset: CGFloat {
-    max(2.0, size * 0.06)
-  }
-
   var body: some View {
     ZStack {
-      Circle()
-        .fill(Color(uiColor: fallbackBackgroundColor))
-
-      Group {
-        if let image {
-          Image(uiImage: image)
-            .resizable()
-            .scaledToFill()
-        } else {
-          Image(systemName: "person.fill")
-            .resizable()
-            .scaledToFit()
-            .frame(width: max(14.0, size * 0.34), height: max(14.0, size * 0.34))
-            .foregroundStyle(Color(uiColor: fallbackIconTintColor))
-        }
+      if let image {
+        Image(uiImage: image)
+          .resizable()
+          .scaledToFill()
+          .frame(width: size, height: size)
+          .blur(radius: max(10, size * 0.15))
+          .opacity(0.45)
+          .scaleEffect(1.15)
+          .saturation(1.2)
       }
-      .padding(inset)
+
+      ZStack {
+        Circle()
+          .fill(Color(uiColor: fallbackBackgroundColor))
+
+        Group {
+          if let image {
+            Image(uiImage: image)
+              .resizable()
+              .scaledToFill()
+          } else {
+            Image(systemName: "person.fill")
+              .resizable()
+              .scaledToFit()
+              .frame(width: max(14.0, size * 0.34), height: max(14.0, size * 0.34))
+              .foregroundStyle(Color(uiColor: fallbackIconTintColor))
+          }
+        }
+        .clipShape(Circle())
+      }
+      .frame(width: size, height: size)
       .clipShape(Circle())
     }
-    .frame(width: size, height: size)
-    .clipShape(Circle())
   }
 }
 
@@ -203,6 +163,7 @@ private struct NativeProfileAvatarLegacyView: View {
       size: currentSize
     )
     .padding(.top, currentTopInset)
+    .opacity(progress < 0.82 ? 1.0 : max(0.0, 1.0 - ((progress - 0.82) / 0.18)))
     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
   }
 }
@@ -607,6 +568,92 @@ private enum ChatProfileInfoRow {
   case bio
 }
 
+private struct ChatProfileModernRowView: View {
+  let title: String
+  let subtitle: String
+  let value: String
+  let iconName: String
+  let showsChevron: Bool
+  let isDark: Bool
+  let titleColor: UIColor
+  let subtitleColor: UIColor
+  let accentColor: UIColor
+  let cardColor: UIColor
+  let separatorColor: UIColor
+
+  private var hasSubtitle: Bool {
+    !subtitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+  }
+
+  private var hasValue: Bool {
+    !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+  }
+
+  var body: some View {
+    HStack(spacing: 14) {
+      ZStack {
+        Circle()
+          .fill(Color(uiColor: accentColor).opacity(isDark ? 0.20 : 0.14))
+        Image(systemName: iconName)
+          .font(.system(size: 17, weight: .semibold))
+          .foregroundStyle(Color(uiColor: accentColor))
+      }
+      .frame(width: 38, height: 38)
+
+      VStack(alignment: .leading, spacing: hasSubtitle ? 3 : 0) {
+        Text(title)
+          .font(.system(size: 17, weight: .semibold))
+          .foregroundStyle(Color(uiColor: titleColor))
+          .lineLimit(1)
+          .minimumScaleFactor(0.78)
+
+        if hasSubtitle {
+          Text(subtitle)
+            .font(.system(size: 14, weight: .regular))
+            .foregroundStyle(Color(uiColor: subtitleColor))
+            .lineLimit(2)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+
+      if hasValue {
+        Text(value)
+          .font(.system(size: 15, weight: .semibold))
+          .foregroundStyle(Color(uiColor: subtitleColor))
+          .lineLimit(1)
+          .minimumScaleFactor(0.72)
+          .padding(.horizontal, 9)
+          .padding(.vertical, 5)
+          .background(
+            Capsule(style: .continuous)
+              .fill(Color(uiColor: accentColor).opacity(isDark ? 0.18 : 0.12))
+          )
+      }
+
+      if showsChevron {
+        Image(systemName: "chevron.right")
+          .font(.system(size: 15, weight: .semibold))
+          .foregroundStyle(Color(uiColor: subtitleColor).opacity(0.76))
+      }
+    }
+    .padding(.horizontal, 18)
+    .padding(.vertical, 12)
+    .frame(maxWidth: .infinity, minHeight: 70, alignment: .center)
+    .background(
+      RoundedRectangle(cornerRadius: 24, style: .continuous)
+        .fill(.ultraThinMaterial)
+        .overlay(Color(uiColor: cardColor))
+    )
+    .overlay(
+      RoundedRectangle(cornerRadius: 24, style: .continuous)
+        .stroke(Color(uiColor: separatorColor).opacity(isDark ? 0.92 : 0.65), lineWidth: 1)
+    )
+    .padding(.horizontal, 14)
+    .padding(.vertical, 4)
+  }
+}
+
 private final class ChatProfileListRowCell: UITableViewCell {
   static let reuseIdentifier = "ChatProfileListRowCell"
 
@@ -627,6 +674,12 @@ private final class ChatProfileListRowCell: UITableViewCell {
   override func layoutSubviews() {
     super.layoutSubviews()
     rowNode.frame = contentView.bounds
+  }
+
+  override func prepareForReuse() {
+    super.prepareForReuse()
+    contentConfiguration = nil
+    rowNode.isHidden = false
   }
 
   override func setHighlighted(_ highlighted: Bool, animated: Bool) {
@@ -952,6 +1005,8 @@ private final class ChatProfileMediaContentCell: UITableViewCell {
 private final class ChatProfileVoiceContentCell: UITableViewCell, VoicePlayableCell {
   static let reuseIdentifier = "ChatProfileVoiceContentCell"
 
+  private let chromeView = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
+  private let chromeOverlayView = UIView()
   let voiceButtonView = VoicePlayProgressView()
   private let titleLabel = UILabel()
   private let subtitleLabel = UILabel()
@@ -964,6 +1019,13 @@ private final class ChatProfileVoiceContentCell: UITableViewCell, VoicePlayableC
     selectionStyle = .none
     backgroundColor = .clear
     contentView.backgroundColor = .clear
+
+    chromeView.clipsToBounds = true
+    chromeView.layer.cornerCurve = .continuous
+    chromeView.isUserInteractionEnabled = false
+    contentView.addSubview(chromeView)
+    chromeOverlayView.isUserInteractionEnabled = false
+    chromeView.contentView.addSubview(chromeOverlayView)
 
     voiceButtonView.isUserInteractionEnabled = false
     contentView.addSubview(voiceButtonView)
@@ -986,6 +1048,9 @@ private final class ChatProfileVoiceContentCell: UITableViewCell, VoicePlayableC
   override func layoutSubviews() {
     super.layoutSubviews()
     let bounds = contentView.bounds.insetBy(dx: 16.0, dy: 8.0)
+    chromeView.frame = contentView.bounds.insetBy(dx: 14.0, dy: 4.0)
+    chromeView.layer.cornerRadius = 22.0
+    chromeOverlayView.frame = chromeView.bounds
 
     let buttonSize: CGFloat = 44.0
     voiceButtonView.frame = CGRect(
@@ -1065,6 +1130,9 @@ private final class ChatProfileVoiceContentCell: UITableViewCell, VoicePlayableC
     dateLabel.textColor = subtitleColor.withAlphaComponent(0.6)
 
     voiceButtonView.applyStyle(fillColor: accentColor, iconTint: .white, ringTint: accentColor)
+    chromeView.effect = UIBlurEffect(style: titleColor == UIColor.white ? .systemThinMaterialDark : .systemMaterialLight)
+    chromeOverlayView.backgroundColor =
+      (titleColor == UIColor.white ? UIColor.white : UIColor.black).withAlphaComponent(titleColor == UIColor.white ? 0.06 : 0.035)
   }
 
   func applyVoicePlaybackState(isPlaying: Bool, progress: CGFloat, level: CGFloat) {
@@ -1093,6 +1161,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   private let headerMaskView = UIView()
   private let headerMaskBlurView = UIVisualEffectView(effect: UIBlurEffect(style: .regular))
   private let headerMaskOverlayView = UIView()
+  private let headerMaskGradientLayer = CAGradientLayer()
   private let headerContainer = UIView()
   private let headerContentView = UIView()
   private let backButton = UIButton(type: .system)
@@ -1104,6 +1173,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   private let floatingAvatarView: NativeProfileAvatarView
 
   private let heroHeaderView = UIView()
+  private var infoHostingController: UIHostingController<ContactProfileInfoView>?
   private let heroBannerView = UIView()
   private let heroNameLabel = UILabel()
   private let heroHandleButton = UIButton(type: .system)
@@ -1188,13 +1258,15 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     super.layoutSubviews()
 
     let safeTop = safeAreaInsets.top
-    let headerHeight = safeTop + 60.0
+    let headerHeight = safeTop + 62.0
+    let headerChromeHeight = headerHeight + 108.0
     updateAvatarMetrics()
 
-    headerMaskContainer.frame = CGRect(x: 0.0, y: 0.0, width: bounds.width, height: headerHeight)
+    headerMaskContainer.frame = CGRect(x: 0.0, y: 0.0, width: bounds.width, height: headerChromeHeight)
     headerMaskView.frame = headerMaskContainer.bounds
     headerMaskBlurView.frame = headerMaskView.bounds
     headerMaskOverlayView.frame = headerMaskBlurView.bounds
+    headerMaskGradientLayer.frame = headerMaskView.bounds
     headerContainer.frame = headerMaskContainer.frame
     headerContentView.frame = CGRect(
       x: 12.0,
@@ -1220,22 +1292,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       top: headerHeight, left: 0.0, bottom: 0.0, right: 0.0)
 
     layoutHeroHeaderViewIfNeeded(force: true)
-    
-    // Position actionsStack
-    let actionsHeight: CGFloat = 72.0
-    let originalActionsY = heroHeaderView.frame.minY + min(
-      max(heroNameLabel.frame.maxY + 48.0, heroBannerView.bounds.height - actionsHeight - 14.0),
-      heroBannerView.bounds.height - actionsHeight - 8.0
-    ) - tableView.contentOffset.y
-    let stickyY = headerHeight + 8.0
-    let finalActionsY = max(stickyY, originalActionsY)
-    
-    actionsStack.frame = CGRect(
-      x: 26.0,
-      y: finalActionsY,
-      width: bounds.width - 52.0,
-      height: actionsHeight
-    )
+    layoutActionsForCurrentScroll()
     
     // Size the background gradient to fill the view
     backgroundGradientLayer.frame = bounds
@@ -1410,6 +1467,13 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     headerMaskContainer.addSubview(headerMaskView)
     headerMaskView.addSubview(headerMaskBlurView)
     headerMaskBlurView.contentView.addSubview(headerMaskOverlayView)
+    headerMaskGradientLayer.colors = [
+      UIColor.black.cgColor,
+      UIColor.black.cgColor,
+      UIColor.black.withAlphaComponent(0.0).cgColor,
+    ]
+    headerMaskGradientLayer.locations = [0.0, 0.74, 1.0]
+    headerMaskView.layer.mask = headerMaskGradientLayer
     addSubview(headerContainer)
     headerContainer.clipsToBounds = false
     headerContainer.addSubview(headerContentView)
@@ -1508,16 +1572,42 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     heroBannerView.addSubview(heroBioLabel)
 
     actionsStack.axis = .horizontal
-    actionsStack.distribution = .equalCentering
+    actionsStack.distribution = .equalSpacing
     actionsStack.alignment = .center
+    actionsStack.spacing = 12.0
     actionsStack.semanticContentAttribute = .forceLeftToRight
+    actionsStack.isLayoutMarginsRelativeArrangement = true
+    actionsStack.layoutMargins = UIEdgeInsets(top: 0.0, left: 8.0, bottom: 0.0, right: 8.0)
 
     muteActionButton.addTarget(self, action: #selector(handleMutePressed), for: .touchUpInside)
     searchActionButton.addTarget(self, action: #selector(handleSearchPressed), for: .touchUpInside)
     audioActionButton.addTarget(self, action: #selector(handleAudioPressed), for: .touchUpInside)
     videoActionButton.addTarget(self, action: #selector(handleVideoPressed), for: .touchUpInside)
 
+    [muteActionButton, searchActionButton, audioActionButton, videoActionButton].forEach { button in
+      button.translatesAutoresizingMaskIntoConstraints = false
+      actionsStack.addArrangedSubview(button)
+      NSLayoutConstraint.activate([
+        button.widthAnchor.constraint(equalToConstant: 68.0),
+        button.heightAnchor.constraint(equalToConstant: 70.0),
+      ])
+    }
+
     tableView.tableHeaderView = heroHeaderView
+    
+    let infoView = ContactProfileInfoView(
+      username: resolvedIdentifierRawValue(),
+      onCall: { [weak self] in self?.handleAudioPressed() },
+      onShare: { },
+      onCreateContact: { },
+      onAddToExisting: { },
+      onEmergency: { },
+      onBlock: { }
+    )
+    let hostingController = UIHostingController(rootView: infoView)
+    hostingController.view.backgroundColor = .clear
+    heroHeaderView.addSubview(hostingController.view)
+    self.infoHostingController = hostingController
   }
 
   private func layoutHeroHeaderViewIfNeeded(force: Bool) {
@@ -1526,7 +1616,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     let width = tableView.bounds.width
     let sideInset: CGFloat = 16.0
     let bannerTop: CGFloat = 0.0
-    let baseBannerHeight = min(max(bounds.height * 0.40, 220.0), 420.0)
+    let baseBannerHeight = min(max(bounds.height * 0.50, 390.0), 500.0)
     let stretch = max(0.0, -tableView.contentOffset.y)
     let bannerHeight = baseBannerHeight + stretch
     let bannerFrame = CGRect(
@@ -1569,11 +1659,42 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       y = heroBioLabel.frame.maxY + 14.0
     }
 
-    let headerHeight = heroBannerView.frame.maxY + 30.0 // Added bottom padding to accommodate actionsStack overlaps
+    let actionBottom = max(
+      heroHandleButton.isHidden ? heroNameLabel.frame.maxY : heroHandleButton.frame.maxY,
+      heroBioLabel.isHidden ? 0.0 : heroBioLabel.frame.maxY
+    ) + 24.0 + 74.0
+    
+    let baseHeaderHeight = max(heroBannerView.frame.maxY + 24.0, actionBottom + 28.0)
+    
+    var finalHeaderHeight = baseHeaderHeight
+    
+    if let infoHost = infoHostingController {
+      let infoView = ContactProfileInfoView(
+        username: resolvedIdentifierRawValue(),
+        onCall: { [weak self] in self?.handleAudioPressed() },
+        onShare: { },
+        onCreateContact: { },
+        onAddToExisting: { },
+        onEmergency: { },
+        onBlock: { }
+      )
+      infoHost.rootView = infoView
+      
+      let targetSize = CGSize(width: width, height: UIView.layoutFittingExpandedSize.height)
+      let infoHeight = infoHost.view.systemLayoutSizeFitting(
+        targetSize,
+        withHorizontalFittingPriority: .required,
+        verticalFittingPriority: .fittingSizeLevel
+      ).height
+      
+      infoHost.view.frame = CGRect(x: 0, y: baseHeaderHeight, width: width, height: infoHeight)
+      finalHeaderHeight = baseHeaderHeight + infoHeight + 24.0
+    }
+
     if force || heroHeaderView.frame.width != width
-      || abs(heroHeaderView.frame.height - headerHeight) > 0.5
+      || abs(heroHeaderView.frame.height - finalHeaderHeight) > 0.5
     {
-      heroHeaderView.frame = CGRect(x: 0.0, y: 0.0, width: width, height: headerHeight)
+      heroHeaderView.frame = CGRect(x: 0.0, y: 0.0, width: width, height: finalHeaderHeight)
       tableView.tableHeaderView = heroHeaderView
     }
   }
@@ -1638,24 +1759,51 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     avatarGlassRing.alpha = max(0.0, 1.0 - progress * 2.5)
   }
 
+  private func layoutActionsForCurrentScroll() {
+    guard bounds.width > 0 else { return }
+
+    let offset = max(0.0, tableView.contentOffset.y)
+    let actionsHeight: CGFloat = 74.0
+    let actionsWidth = min(bounds.width - 44.0, 360.0)
+    let actionsX = (bounds.width - actionsWidth) * 0.5
+    let expandedBottom = max(
+      heroHandleButton.isHidden ? heroNameLabel.frame.maxY : heroHandleButton.frame.maxY,
+      heroBioLabel.isHidden ? 0.0 : heroBioLabel.frame.maxY
+    )
+    let expandedY = expandedBottom + 24.0 - offset
+    let stickyY = safeAreaInsets.top + 70.0
+    let finalY = max(stickyY, expandedY)
+    let stickyProgress = max(0.0, min(1.0, (stickyY + 34.0 - expandedY) / 54.0))
+
+    actionsStack.frame = CGRect(
+      x: actionsX,
+      y: finalY,
+      width: actionsWidth,
+      height: actionsHeight
+    )
+    actionsStack.alpha = max(0.72, 1.0 - stickyProgress * 0.08)
+    let scale = 1.0 - stickyProgress * 0.035
+    actionsStack.transform = CGAffineTransform(scaleX: scale, y: scale)
+  }
+
   private func applyTheme() {
     let isDark = traitCollection.userInterfaceStyle == .dark
 
-    // Deep purple-blue gradient matching iOS native contact view
+    // Subtle graphite/ink field. Keep it quiet so the material rows carry the profile.
     if isDark {
       backgroundGradientLayer.colors = [
-        UIColor(red: 38.0/255.0, green: 22.0/255.0, blue: 62.0/255.0, alpha: 1.0).cgColor,   // Rich purple top
-        UIColor(red: 18.0/255.0, green: 14.0/255.0, blue: 36.0/255.0, alpha: 1.0).cgColor,   // Deep indigo mid
-        UIColor(red: 10.0/255.0, green: 10.0/255.0, blue: 22.0/255.0, alpha: 1.0).cgColor,   // Near-black bottom
+        UIColor(red: 19.0/255.0, green: 25.0/255.0, blue: 30.0/255.0, alpha: 1.0).cgColor,
+        UIColor(red: 12.0/255.0, green: 16.0/255.0, blue: 22.0/255.0, alpha: 1.0).cgColor,
+        UIColor(red: 6.0/255.0, green: 8.0/255.0, blue: 13.0/255.0, alpha: 1.0).cgColor,
       ]
-      backgroundGradientLayer.locations = [0.0, 0.45, 1.0]
+      backgroundGradientLayer.locations = [0.0, 0.52, 1.0]
     } else {
       backgroundGradientLayer.colors = [
-        UIColor(red: 220.0/255.0, green: 210.0/255.0, blue: 240.0/255.0, alpha: 1.0).cgColor,
-        UIColor(red: 235.0/255.0, green: 230.0/255.0, blue: 245.0/255.0, alpha: 1.0).cgColor,
-        UIColor(red: 245.0/255.0, green: 243.0/255.0, blue: 248.0/255.0, alpha: 1.0).cgColor,
+        UIColor(red: 242.0/255.0, green: 245.0/255.0, blue: 246.0/255.0, alpha: 1.0).cgColor,
+        UIColor(red: 234.0/255.0, green: 239.0/255.0, blue: 241.0/255.0, alpha: 1.0).cgColor,
+        UIColor(red: 226.0/255.0, green: 231.0/255.0, blue: 235.0/255.0, alpha: 1.0).cgColor,
       ]
-      backgroundGradientLayer.locations = [0.0, 0.45, 1.0]
+      backgroundGradientLayer.locations = [0.0, 0.54, 1.0]
     }
 
     let background = UIColor.clear // gradient handles background
@@ -1663,8 +1811,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     let secondary = isDark ? UIColor(white: 0.72, alpha: 1.0) : UIColor(white: 0.44, alpha: 1.0)
     let card =
       isDark
-      ? UIColor(red: 35.0 / 255.0, green: 35.0 / 255.0, blue: 38.0 / 255.0, alpha: 0.96)
-      : UIColor.white
+      ? UIColor(red: 43.0 / 255.0, green: 50.0 / 255.0, blue: 58.0 / 255.0, alpha: 0.44)
+      : UIColor.white.withAlphaComponent(0.72)
     let rowAccent =
       isDark
       ? UIColor(red: 77 / 255, green: 217 / 255, blue: 229 / 255, alpha: 1.0)
@@ -1707,8 +1855,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
 
     // Use a dark base for the island cover so avatar morph blends into gradient
     let gradientBase = isDark
-      ? UIColor(red: 28.0/255.0, green: 18.0/255.0, blue: 48.0/255.0, alpha: 1.0)
-      : UIColor(red: 225.0/255.0, green: 218.0/255.0, blue: 240.0/255.0, alpha: 1.0)
+      ? UIColor(red: 19.0/255.0, green: 25.0/255.0, blue: 30.0/255.0, alpha: 1.0)
+      : UIColor(red: 242.0/255.0, green: 245.0/255.0, blue: 246.0/255.0, alpha: 1.0)
     floatingAvatarView.setIslandCoverUIColor(gradientBase)
     floatingAvatarView.setFallbackBackgroundUIColor(fallbackAvatarBackground)
     floatingAvatarView.setFallbackIconTintUIColor(fallbackAvatarIconTint)
@@ -1716,7 +1864,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     // Avatar glass ring effect
     if isDark {
       avatarGlassRing.effect = UIBlurEffect(style: .systemThinMaterialDark)
-      avatarGlassRing.contentView.backgroundColor = UIColor(red: 160.0/255.0, green: 140.0/255.0, blue: 200.0/255.0, alpha: 0.08)
+      avatarGlassRing.contentView.backgroundColor = UIColor.white.withAlphaComponent(0.08)
     } else {
       avatarGlassRing.effect = UIBlurEffect(style: .systemThinMaterialLight)
       avatarGlassRing.contentView.backgroundColor = UIColor.white.withAlphaComponent(0.15)
@@ -1734,8 +1882,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       : UIColor(white: 0.0, alpha: 0.04)
     currentRowCardColor =
       isDark
-      ? UIColor(red: 50.0/255.0, green: 35.0/255.0, blue: 70.0/255.0, alpha: 0.35)
-      : UIColor.white.withAlphaComponent(0.5)
+      ? UIColor(red: 53.0/255.0, green: 62.0/255.0, blue: 72.0/255.0, alpha: 0.34)
+      : UIColor.white.withAlphaComponent(0.68)
     currentRowAccentColor = rowAccent
     currentRowIconBackgroundColor = rowAccent.withAlphaComponent(0.12)
 
@@ -1768,9 +1916,12 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   }
 
   private func reloadHeaderText() {
-    titleLabel.text =
+    let resolvedName =
       profileName.isEmpty ? (headerTitle.isEmpty ? "Profile" : headerTitle) : profileName
-    subtitleLabel.text = resolvedActiveTabSubtitleText() ?? resolvedDefaultSubtitleText()
+    let collapsedIdentity = resolvedIdentifierRawValue()
+    titleLabel.text = collapsedIdentity.isEmpty ? resolvedName : collapsedIdentity
+    let subtitle = resolvedActiveTabSubtitleText() ?? resolvedName
+    subtitleLabel.text = subtitle == titleLabel.text ? resolvedDefaultSubtitleText() : subtitle
   }
 
   private func refreshHeroSubheader() {
@@ -1833,37 +1984,17 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     let progress = max(0.0, min(1.0, offset / travelDistance))
     avatarMorphProgress = progress
     floatingAvatarView.setScrollOffset(offset)
-    headerMaskContainer.alpha = max(0.0, min(1.0, (progress - 0.06) / 0.24))
+    let headerAlpha = max(0.0, min(1.0, (offset - 18.0) / 82.0))
+    headerMaskContainer.alpha = headerAlpha
 
-    let textAlpha = max(0.0, (progress - 0.5) * 2.0)
+    let textAlpha = max(0.0, min(1.0, (progress - 0.42) / 0.34))
     titleLabel.isHidden = textAlpha == 0
     subtitleLabel.isHidden =
       textAlpha == 0
       || (subtitleLabel.text?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
     titleLabel.alpha = textAlpha
     subtitleLabel.alpha = textAlpha
-    
-    // If we've scrolled enough, actionsStack becomes sticky.
-    let headerHeight = safeAreaInsets.top + 60.0
-    let originalActionsY = heroHeaderView.frame.minY + min(
-      max(heroNameLabel.frame.maxY + 48.0, heroBannerView.bounds.height - 72.0 - 14.0),
-      heroBannerView.bounds.height - 72.0 - 8.0
-    ) - offset
-    let stickyY = headerHeight + 8.0
-    actionsStack.frame.origin.y = max(stickyY, originalActionsY)
-    
-    // Add a blur behind the sticky actions
-    if originalActionsY < stickyY {
-      headerMaskContainer.frame.size.height = headerHeight + 8.0 + 72.0 + 8.0
-      headerMaskView.frame = headerMaskContainer.bounds
-      headerMaskBlurView.frame = headerMaskView.bounds
-      headerMaskOverlayView.frame = headerMaskBlurView.bounds
-    } else {
-      headerMaskContainer.frame.size.height = headerHeight
-      headerMaskView.frame = headerMaskContainer.bounds
-      headerMaskBlurView.frame = headerMaskView.bounds
-      headerMaskOverlayView.frame = headerMaskBlurView.bounds
-    }
+    layoutActionsForCurrentScroll()
 
     layoutAvatarGlassRing()
   }
@@ -1872,7 +2003,15 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     avatarResolveGeneration &+= 1
     let generation = avatarResolveGeneration
     floatingAvatarView.setFallbackText(resolvedAvatarFallbackText())
-    floatingAvatarView.setImageUri(nil)
+    let fallbackColors = ChatAvatarFallbackStyle.uiGradient(
+      title: profileName.isEmpty ? headerTitle : profileName,
+      peerUserId: enginePeerUserId,
+      chatId: engineChatId,
+      isDark: traitCollection.userInterfaceStyle == .dark,
+      isSavedMessages: false
+    )
+    floatingAvatarView.setFallbackBackgroundUIColor(fallbackColors.0)
+    floatingAvatarView.setFallbackIconTintUIColor(.white)
 
     let rawAvatar = avatarUri
     let peerUserId = enginePeerUserId
@@ -1881,7 +2020,10 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     let hasRawAvatar =
       rawAvatar?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
     let hasPeerUser = !peerUserId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    guard hasRawAvatar || (preferPushAvatar && hasPeerUser) else { return }
+    guard hasRawAvatar || (preferPushAvatar && hasPeerUser) else {
+      floatingAvatarView.setImageUri(nil)
+      return
+    }
 
     DispatchQueue.global(qos: .utility).async { [rawAvatar, peerUserId, chatId, preferPushAvatar, generation] in
       let resolvedUri = ChatAvatarURLResolver.resolve(
@@ -1997,6 +2139,24 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     }
   }
 
+  private func sharedSubtitle(for tab: ChatProfileTab) -> String {
+    let count = sharedCount(for: tab)
+    switch tab {
+    case .media:
+      return count == 1 ? "1 photo or video" : "\(count) photos and videos"
+    case .voice:
+      return count == 1 ? "1 voice message" : "\(count) voice messages"
+    case .gifs:
+      return count == 1 ? "1 GIF" : "\(count) GIFs"
+    case .files:
+      return count == 1 ? "1 file" : "\(count) files"
+    case .links:
+      return count == 1 ? "1 shared link" : "\(count) shared links"
+    case .pinned:
+      return count == 1 ? "1 pinned message" : "\(count) pinned messages"
+    }
+  }
+
   private func sharedIconName(for tab: ChatProfileTab) -> String {
     switch tab {
     case .media:
@@ -2037,49 +2197,30 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     showsSeparator: Bool,
     showsChevron: Bool = true
   ) {
-    cell.rowNode.configure(
-      title: title,
-      subtitle: subtitle,
-      value: value,
-      showsSeparator: showsSeparator,
-      iconName: iconName,
-      iconTintColor: currentRowAccentColor,
-      iconBackgroundColor: currentRowIconBackgroundColor,
-      showsChevron: showsChevron
-    )
-    cell.rowNode.applyTheme(
-      titleColor: currentTextColor,
-      subtitleColor: currentSecondaryTextColor,
-      separatorColor: currentRowSeparatorColor,
-      highlightedColor: currentRowHighlightColor,
-      valueColor: currentSecondaryTextColor
-    )
+    cell.rowNode.isHidden = true
+    cell.contentConfiguration = UIHostingConfiguration {
+      ChatProfileModernRowView(
+        title: title,
+        subtitle: subtitle,
+        value: value,
+        iconName: iconName,
+        showsChevron: showsChevron,
+        isDark: traitCollection.userInterfaceStyle == .dark,
+        titleColor: currentTextColor,
+        subtitleColor: currentSecondaryTextColor,
+        accentColor: currentRowAccentColor,
+        cardColor: currentRowCardColor,
+        separatorColor: currentRowSeparatorColor
+      )
+    }
+    .margins(.all, 0)
     cell.accessoryType = .none
     cell.backgroundColor = .clear
     cell.contentView.backgroundColor = .clear
-    if #available(iOS 14.0, *) {
-      var background = UIBackgroundConfiguration.listGroupedCell()
-      background.backgroundColor = .clear
-      
-      let blurEffect = UIBlurEffect(style: traitCollection.userInterfaceStyle == .dark ? .systemThinMaterialDark : .systemMaterialLight)
-      let blurView = UIVisualEffectView(effect: blurEffect)
-      blurView.contentView.backgroundColor = currentRowCardColor
-      blurView.layer.cornerRadius = 22.0
-      blurView.layer.cornerCurve = .continuous
-      blurView.clipsToBounds = true
-      
-      background.customView = blurView
-      background.cornerRadius = 22.0
-      cell.backgroundConfiguration = background
-    } else {
-      let blurEffect = UIBlurEffect(style: traitCollection.userInterfaceStyle == .dark ? .systemThinMaterialDark : .systemMaterialLight)
-      let blurView = UIVisualEffectView(effect: blurEffect)
-      blurView.contentView.backgroundColor = currentRowCardColor
-      blurView.layer.cornerRadius = 22.0
-      blurView.layer.cornerCurve = .continuous
-      blurView.clipsToBounds = true
-      cell.backgroundView = blurView
-    }
+    var background = UIBackgroundConfiguration.clear()
+    background.backgroundColor = .clear
+    cell.backgroundConfiguration = background
+    cell.selectedBackgroundView = UIView()
   }
 
   private func resolvedBioPreview() -> String {
@@ -2106,8 +2247,6 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
 
   private func resolveSectionTitle(_ section: Section) -> String? {
     switch section {
-    case .info:
-      return isGroupOrChannel ? "Overview" : nil
     case .contentRows:
       return nil
     }
@@ -2357,7 +2496,6 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   // MARK: UITableViewDataSource
 
   private enum Section: Int, CaseIterable {
-    case info
     case contentRows
   }
 
@@ -2377,8 +2515,6 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     guard let section = Section(rawValue: section) else { return 0 }
 
     switch section {
-    case .info:
-      return currentInfoRows().count
     case .contentRows:
       return availableTabs.count
     }
@@ -2406,17 +2542,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     }
 
     switch section {
-    case .info:
-      let infoRows = currentInfoRows()
-      guard infoRows.indices.contains(indexPath.row) else { return 68.0 }
-      switch infoRows[indexPath.row] {
-      case .bio:
-        return 84.0
-      default:
-        return 68.0
-      }
     case .contentRows:
-      return 68.0
+      return 82.0
     }
   }
 
@@ -2497,7 +2624,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       cell.backgroundColor = .clear
       cell.contentView.backgroundColor = .clear
       if #available(iOS 14.0, *) {
-        var background = UIBackgroundConfiguration.listGroupedCell()
+        var background = UIBackgroundConfiguration.listCell()
         background.backgroundColor = currentRowCardColor
         background.cornerRadius = 22.0
         cell.backgroundConfiguration = background
@@ -2542,59 +2669,6 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     }
 
     switch section {
-    case .info:
-      guard
-        let cell = tableView.dequeueReusableCell(
-          withIdentifier: ChatProfileListRowCell.reuseIdentifier,
-          for: indexPath
-        ) as? ChatProfileListRowCell
-      else {
-        return UITableViewCell(style: .default, reuseIdentifier: nil)
-      }
-      let infoRows = currentInfoRows()
-      guard infoRows.indices.contains(indexPath.row) else { return cell }
-      let isLast = indexPath.row == infoRows.count - 1
-      switch infoRows[indexPath.row] {
-      case .members:
-        configureListRowCell(
-          cell,
-          title: "Members",
-          subtitle: groupMembersSummary(),
-          value: "\(groupMemberCount ?? groupMembers.count)",
-          iconName: "person.3.fill",
-          showsSeparator: !isLast
-        )
-      case .identifier:
-        configureListRowCell(
-          cell,
-          title: "Username",
-          subtitle: resolvedIdentifierPreview(),
-          iconName: "at",
-          showsSeparator: !isLast,
-          showsChevron: false
-        )
-      case .agent:
-        configureListRowCell(
-          cell,
-          title: "Agent",
-          subtitle: resolvedAgentSubtitle(),
-          value: resolvedAgentValue(),
-          iconName: "sparkles",
-          showsSeparator: !isLast
-        )
-      case .bio:
-        configureListRowCell(
-          cell,
-          title: "Bio",
-          subtitle: resolvedBioPreview(),
-          iconName: "text.quote",
-          showsSeparator: !isLast,
-          showsChevron: false
-        )
-      }
-
-      return cell
-
     case .contentRows:
       guard let cell = tableView.dequeueReusableCell(
           withIdentifier: ChatProfileListRowCell.reuseIdentifier,
@@ -2608,7 +2682,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       configureListRowCell(
         cell,
         title: sharedTitle(for: tab),
-        subtitle: "",
+        subtitle: sharedSubtitle(for: tab),
         value: "\(sharedCount(for: tab))",
         iconName: sharedIconName(for: tab),
         showsSeparator: !isLast
@@ -2628,26 +2702,6 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     guard let section = Section(rawValue: indexPath.section) else { return }
 
     switch section {
-    case .info:
-      let infoRows = currentInfoRows()
-      guard infoRows.indices.contains(indexPath.row) else { return }
-
-      switch infoRows[indexPath.row] {
-      case .members:
-        onNativeEvent([
-          "type": "profileMembersPressed",
-          "chatId": engineChatId,
-        ])
-      case .identifier:
-        handleIdentifierPressed()
-      case .agent:
-        if isGroupOrChannel {
-          presentAgentConfigEditor()
-        }
-      case .bio:
-        break
-      }
-
     case .contentRows:
       let tab = availableTabs[indexPath.row]
       let isDark = traitCollection.userInterfaceStyle == .dark
@@ -2906,6 +2960,7 @@ fileprivate class ChatProfileExpandedContentViewController: UIViewController, UI
   
   private let tableView = UITableView(frame: .zero, style: .plain)
   private let headerBlur = UIVisualEffectView(effect: UIBlurEffect(style: .regular))
+  private let headerOverlay = UIView()
   private let titleLabel = UILabel()
   private let closeButton = UIButton(type: .system)
   
@@ -2931,13 +2986,15 @@ fileprivate class ChatProfileExpandedContentViewController: UIViewController, UI
   
   override func viewDidLoad() {
     super.viewDidLoad()
-    view.backgroundColor = themeIsDark ? UIColor.black.withAlphaComponent(0.6) : UIColor.white.withAlphaComponent(0.6)
+    view.backgroundColor = themeIsDark
+      ? UIColor(red: 7.0/255.0, green: 10.0/255.0, blue: 15.0/255.0, alpha: 1.0)
+      : UIColor(red: 235.0/255.0, green: 240.0/255.0, blue: 243.0/255.0, alpha: 1.0)
     
     tableView.dataSource = self
     tableView.delegate = self
     tableView.backgroundColor = .clear
     tableView.separatorStyle = .none
-    tableView.contentInset = UIEdgeInsets(top: 60, left: 0, bottom: 20, right: 0)
+    tableView.contentInset = UIEdgeInsets(top: 92, left: 0, bottom: 24, right: 0)
     
     tableView.register(ChatProfileVoiceContentCell.self, forCellReuseIdentifier: ChatProfileVoiceContentCell.reuseIdentifier)
     tableView.register(ChatProfileMediaGridRowCell.self, forCellReuseIdentifier: ChatProfileMediaGridRowCell.reuseIdentifier)
@@ -2954,6 +3011,10 @@ fileprivate class ChatProfileExpandedContentViewController: UIViewController, UI
       headerBlur.effect = UIBlurEffect(style: themeIsDark ? .systemMaterialDark : .systemMaterialLight)
     }
     view.addSubview(headerBlur)
+    headerOverlay.isUserInteractionEnabled = false
+    headerOverlay.backgroundColor =
+      (themeIsDark ? UIColor.black : UIColor.white).withAlphaComponent(themeIsDark ? 0.18 : 0.16)
+    headerBlur.contentView.addSubview(headerOverlay)
     
     titleLabel.font = .systemFont(ofSize: 18, weight: .semibold)
     titleLabel.textColor = themeIsDark ? .white : .black
@@ -2984,10 +3045,17 @@ fileprivate class ChatProfileExpandedContentViewController: UIViewController, UI
   override func viewDidLayoutSubviews() {
     super.viewDidLayoutSubviews()
     tableView.frame = view.bounds
-    headerBlur.frame = CGRect(x: 0, y: 0, width: view.bounds.width, height: 60)
+    let headerHeight = view.safeAreaInsets.top + 64.0
+    headerBlur.frame = CGRect(x: 0, y: 0, width: view.bounds.width, height: headerHeight)
+    headerOverlay.frame = headerBlur.bounds
+    let topInset = headerHeight + 20.0
+    if abs(tableView.contentInset.top - topInset) > 0.5 {
+      tableView.contentInset = UIEdgeInsets(top: topInset, left: 0, bottom: 24, right: 0)
+      tableView.scrollIndicatorInsets = UIEdgeInsets(top: headerHeight, left: 0, bottom: 0, right: 0)
+    }
     titleLabel.sizeToFit()
-    titleLabel.center = CGPoint(x: headerBlur.bounds.midX, y: headerBlur.bounds.maxY - 20)
-    closeButton.frame = CGRect(x: headerBlur.bounds.width - 44, y: headerBlur.bounds.maxY - 34, width: 28, height: 28)
+    titleLabel.center = CGPoint(x: headerBlur.bounds.midX, y: view.safeAreaInsets.top + 30.0)
+    closeButton.frame = CGRect(x: headerBlur.bounds.width - 48, y: view.safeAreaInsets.top + 16.0, width: 32, height: 32)
   }
   
   func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
@@ -3012,8 +3080,6 @@ fileprivate class ChatProfileExpandedContentViewController: UIViewController, UI
   }
   
   func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
-    let isLast = indexPath.row == tableView.numberOfRows(inSection: 0) - 1
-    
     if profileTab == .media {
       guard let cell = tableView.dequeueReusableCell(withIdentifier: ChatProfileMediaGridRowCell.reuseIdentifier, for: indexPath) as? ChatProfileMediaGridRowCell else { return UITableViewCell() }
       var items: [(url: String?, isVideo: Bool, thumbnailBase64: String?)] = []
@@ -3045,8 +3111,40 @@ fileprivate class ChatProfileExpandedContentViewController: UIViewController, UI
     }
     
     guard let cell = tableView.dequeueReusableCell(withIdentifier: ChatProfileListRowCell.reuseIdentifier, for: indexPath) as? ChatProfileListRowCell else { return UITableViewCell() }
-    cell.rowNode.configure(title: row.fileName ?? "Item", subtitle: "", value: "", showsSeparator: !isLast, iconName: "doc", iconTintColor: .systemBlue, iconBackgroundColor: .clear, showsChevron: false)
+    let title: String
+    let subtitle: String
+    let iconName: String
+    if profileTab == .links, let linkItem = rowObj as? ChatProfileLinkItem {
+      title = linkItem.url
+      subtitle = "Shared link"
+      iconName = "link"
+    } else {
+      title = row.fileName ?? (row.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Item" : row.text)
+      subtitle = row.type.capitalized
+      iconName = profileTab == .pinned ? "pin.fill" : "doc.text.fill"
+    }
+    cell.rowNode.isHidden = true
+    cell.contentConfiguration = UIHostingConfiguration {
+      ChatProfileModernRowView(
+        title: title,
+        subtitle: subtitle,
+        value: "",
+        iconName: iconName,
+        showsChevron: profileTab != .pinned,
+        isDark: themeIsDark,
+        titleColor: themeIsDark ? .white : .black,
+        subtitleColor: themeIsDark ? UIColor(white: 0.72, alpha: 1.0) : UIColor(white: 0.42, alpha: 1.0),
+        accentColor: .systemBlue,
+        cardColor: themeIsDark
+          ? UIColor(red: 53.0/255.0, green: 62.0/255.0, blue: 72.0/255.0, alpha: 0.30)
+          : UIColor.white.withAlphaComponent(0.68),
+        separatorColor: themeIsDark ? UIColor.white.withAlphaComponent(0.08) : UIColor.black.withAlphaComponent(0.06)
+      )
+    }
+    .margins(.all, 0)
     cell.backgroundColor = .clear
+    cell.contentView.backgroundColor = .clear
+    cell.backgroundConfiguration = UIBackgroundConfiguration.clear()
     return cell
   }
   
@@ -3070,5 +3168,123 @@ fileprivate class ChatProfileExpandedContentViewController: UIViewController, UI
     else if let mediaUrl = row.mediaUrl, !mediaUrl.isEmpty { payload["url"] = mediaUrl }
     
     onContentPressed?(payload)
+  }
+}
+
+// MARK: - SwiftUI Info View
+struct ContactProfileInfoView: View {
+  let username: String
+  let onCall: () -> Void
+  let onShare: () -> Void
+  let onCreateContact: () -> Void
+  let onAddToExisting: () -> Void
+  let onEmergency: () -> Void
+  let onBlock: () -> Void
+
+  @Environment(\.colorScheme) var colorScheme
+
+  private var blockBackground: Color {
+    colorScheme == .dark ? Color(white: 0.15) : Color.white
+  }
+
+  var body: some View {
+    VStack(spacing: 16) {
+      // Username Block
+      VStack(spacing: 0) {
+        HStack {
+          VStack(alignment: .leading, spacing: 4) {
+            Text("username")
+              .font(.system(size: 13, weight: .regular))
+              .foregroundColor(Color.primary.opacity(0.6))
+            Text(username)
+              .font(.system(size: 17, weight: .regular))
+              .foregroundColor(Color.primary)
+          }
+          Spacer()
+          Button(action: onCall) {
+            Image(systemName: "phone.fill")
+              .font(.system(size: 20))
+              .foregroundColor(Color.primary)
+              .frame(width: 44, height: 44)
+              .background(Color.primary.opacity(0.08))
+              .clipShape(Circle())
+          }
+          .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+      }
+      .background(blockBackground)
+      .cornerRadius(12)
+
+      // Notes Block
+      VStack(spacing: 0) {
+        HStack {
+          Text("Notes")
+            .font(.system(size: 17, weight: .regular))
+            .foregroundColor(Color.primary)
+          Spacer()
+        }
+        .padding(16)
+      }
+      .background(blockBackground)
+      .cornerRadius(12)
+
+      // Share / Add Contacts Block
+      VStack(spacing: 0) {
+        ButtonRow(title: "Share Contact", textColor: .accentColor, action: onShare)
+        Divider().padding(.leading, 16)
+        ButtonRow(title: "Create New Contact", textColor: .accentColor, action: onCreateContact)
+        Divider().padding(.leading, 16)
+        ButtonRow(title: "Add to Existing Contact", textColor: .accentColor, action: onAddToExisting)
+      }
+      .background(blockBackground)
+      .cornerRadius(12)
+
+      // Emergency Block
+      VStack(spacing: 0) {
+        ButtonRow(title: "Add to Emergency Contacts", textColor: .accentColor, action: onEmergency)
+      }
+      .background(blockBackground)
+      .cornerRadius(12)
+
+      // Block Block
+      VStack(spacing: 0) {
+        ButtonRow(title: "Block Contact", textColor: .red, action: onBlock)
+      }
+      .background(blockBackground)
+      .cornerRadius(12)
+    }
+    .padding(.horizontal, 16)
+    .padding(.vertical, 12)
+    .animation(.default, value: username)
+  }
+}
+
+private struct ButtonRow: View {
+  let title: String
+  let textColor: Color
+  let action: () -> Void
+
+  var body: some View {
+    Button(action: action) {
+      HStack {
+        Text(title)
+          .font(.system(size: 17, weight: .regular))
+          .foregroundColor(textColor)
+        Spacer()
+      }
+      .padding(16)
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(RowButtonStyle())
+  }
+}
+
+private struct RowButtonStyle: ButtonStyle {
+  func makeBody(configuration: Configuration) -> some View {
+    configuration.label
+      .background(configuration.isPressed ? Color.primary.opacity(0.05) : Color.clear)
+      .animation(.easeInOut(duration: 0.1), value: configuration.isPressed)
   }
 }

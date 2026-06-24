@@ -81,6 +81,24 @@ defmodule Vibe.Chat do
     end
   end
 
+  # Inbox-only agent event rows are implementation details for the dedicated
+  # Agent Inbox. They must not leak into normal chat history/home previews.
+  defp visible_transcript_messages(query) do
+    from(m in query,
+      where:
+        fragment(
+          "COALESCE(?->>'hiddenFromTranscript', ?->>'hidden_from_transcript', 'false') NOT IN ('true', '1')",
+          m.metadata,
+          m.metadata
+        ) and
+          fragment(
+            "LOWER(COALESCE(?->>'eventInboxRole', ?->>'event_inbox_role', '')) NOT IN ('raw_event', 'inbox_item')",
+            m.metadata,
+            m.metadata
+          )
+    )
+  end
+
   defp list_chats_uncached(user_id) do
     result =
       RepoRLS.with_user(user_id, fn ->
@@ -139,12 +157,17 @@ defmodule Vibe.Chat do
         # Batch-fetch latest 15 messages per chat using a window function
         ranked_query =
           from(m in Message,
-            where: m.chat_id in ^chat_ids,
-            select: %{
-              id: m.id,
-              rnk: row_number() |> over(partition_by: m.chat_id, order_by: [desc: m.timestamp])
-            }
+            where: m.chat_id in ^chat_ids
           )
+          |> visible_transcript_messages()
+          |> then(fn query ->
+            from(m in query,
+              select: %{
+                id: m.id,
+                rnk: row_number() |> over(partition_by: m.chat_id, order_by: [desc: m.timestamp])
+              }
+            )
+          end)
 
         top_message_ids =
           if chat_ids == [] do
@@ -203,7 +226,9 @@ defmodule Vibe.Chat do
         Enum.map(results, fn {chat_id, my_settings} ->
           room = Map.get(rooms, chat_id)
           friend_p = List.first(Map.get(friend_participants, chat_id, []))
-          friend_agent = if(friend_p, do: Map.get(agent_friends_by_user_id, friend_p.user_id), else: nil)
+
+          friend_agent =
+            if(friend_p, do: Map.get(agent_friends_by_user_id, friend_p.user_id), else: nil)
 
           # Filter last message by cleared_at if applicable
           chat_messages = Map.get(last_messages_by_chat, chat_id, [])
@@ -438,12 +463,11 @@ defmodule Vibe.Chat do
 
   def get_messages(chat_id, user_id \\ nil) do
     RepoRLS.with_user(user_id, fn ->
-      Repo.all(
-        from(m in Message,
-          where: m.chat_id == ^chat_id,
-          order_by: [asc: m.timestamp]
-        )
-      )
+      Message
+      |> where([m], m.chat_id == ^chat_id)
+      |> visible_transcript_messages()
+      |> order_by([m], asc: m.timestamp)
+      |> Repo.all()
       |> Enum.map(&to_client_message/1)
     end)
   end
@@ -461,9 +485,9 @@ defmodule Vibe.Chat do
 
       query =
         from(m in Message,
-          where: m.chat_id == ^chat_id,
-          order_by: [asc: m.timestamp]
+          where: m.chat_id == ^chat_id
         )
+        |> visible_transcript_messages()
 
       query =
         if participant do
@@ -477,7 +501,9 @@ defmodule Vibe.Chat do
           query
         end
 
-      Repo.all(query)
+      query
+      |> order_by([m], asc: m.timestamp)
+      |> Repo.all()
       |> Enum.map(&to_client_message/1)
     end)
   end
@@ -500,6 +526,7 @@ defmodule Vibe.Chat do
           from(m in Message,
             where: m.chat_id == ^chat_id
           )
+          |> visible_transcript_messages()
 
         query =
           if participant do
@@ -1294,8 +1321,7 @@ defmodule Vibe.Chat do
         %{
           agent_name: metadata["agentName"] || metadata["agent_name"] || "Vibe Agent",
           agent_id: metadata["agentId"] || metadata["agent_id"],
-          agent_user_id:
-            metadata["agentUserId"] || metadata["agent_user_id"] || message.from_id,
+          agent_user_id: metadata["agentUserId"] || metadata["agent_user_id"] || message.from_id,
           agent_username: metadata["agentUsername"] || metadata["agent_username"],
           agent_handle: metadata["agentHandle"] || metadata["agent_handle"]
         }
@@ -1347,9 +1373,9 @@ defmodule Vibe.Chat do
 
   defp friend_agent_accepts_incoming_chat(friend_agent) when is_map(friend_agent) do
     chat_rules =
-      get_in(friend_agent, [:approval_rules, "chat_input"])
-      || get_in(friend_agent, [:approval_rules, :chat_input])
-      || %{}
+      get_in(friend_agent, [:approval_rules, "chat_input"]) ||
+        get_in(friend_agent, [:approval_rules, :chat_input]) ||
+        %{}
 
     case chat_rules["enabled"] || chat_rules[:enabled] do
       false -> false

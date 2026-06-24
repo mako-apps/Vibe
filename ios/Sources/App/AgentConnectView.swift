@@ -17,6 +17,7 @@ final class AgentConnectModel: ObservableObject {
   @Published var isAuthorizing = false
   @Published var didAuthorize = false
   @Published var errorMessage: String?
+  @Published var selectedRepository: AgentBridgeRepository?
 
   /// Invoked once a computer comes online so the host can reveal the input bar.
   var onConnected: (() -> Void)?
@@ -59,6 +60,7 @@ final class AgentConnectModel: ObservableObject {
     do {
       let next = try await AgentPairingService.status(config: config)
       status = next
+      selectedRepository = AgentBridgeSelectionStore.ensureValidSelection(from: next.repositories)
       if next.connected {
         stopPolling()
         onConnected?()
@@ -114,7 +116,8 @@ struct AgentConnectPanel: View {
   private var palette: AppThemePalette { AppThemePalette.resolve(for: colorScheme) }
 
   var body: some View {
-    VStack(spacing: 14) {
+    UIGlassWrapper(cornerRadius: 20) {
+      VStack(spacing: 14) {
       HStack(spacing: 12) {
         ZStack {
           Circle().fill(palette.accent.opacity(0.16))
@@ -149,17 +152,18 @@ struct AgentConnectPanel: View {
       }
 
       if model.didAuthorize {
-        HStack(spacing: 10) {
-          ProgressView().controlSize(.small)
-          Text("Auth is done — waiting for your computer…")
-            .font(.system(size: 13, weight: .medium))
-            .foregroundStyle(palette.text)
-          Spacer(minLength: 0)
+        UIGlassWrapper(cornerRadius: 12) {
+          HStack(spacing: 10) {
+            ProgressView().controlSize(.small)
+            Text("Auth is done — waiting for your computer…")
+              .font(.system(size: 13, weight: .medium))
+              .foregroundStyle(palette.text)
+            Spacer(minLength: 0)
+          }
+          .padding(12)
+          .frame(maxWidth: .infinity)
         }
-        .padding(12)
-        .frame(maxWidth: .infinity)
-        .background(AgentConnectGlassBackground())
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .fixedSize(horizontal: false, vertical: true)
       } else {
         Button(action: { model.beginScan() }) {
           HStack(spacing: 8) {
@@ -193,14 +197,26 @@ struct AgentConnectPanel: View {
           .foregroundStyle(.red)
           .frame(maxWidth: .infinity, alignment: .leading)
       }
+
+      if let selected = model.selectedRepository {
+        HStack(spacing: 8) {
+          Image(systemName: "folder")
+            .font(.system(size: 12, weight: .semibold))
+          Text(selected.name)
+            .font(.system(size: 12, weight: .semibold))
+            .lineLimit(1)
+          Text(selected.path)
+            .font(.system(size: 11))
+            .foregroundStyle(palette.secondaryText)
+            .lineLimit(1)
+          Spacer(minLength: 0)
+        }
+        .foregroundStyle(palette.text)
+      }
+      }
+      .padding(16)
     }
-    .padding(16)
-    .background(AgentConnectGlassBackground())
-    .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-    .overlay(
-      RoundedRectangle(cornerRadius: 20, style: .continuous)
-        .stroke(palette.secondaryText.opacity(0.12), lineWidth: 1)
-    )
+    .fixedSize(horizontal: false, vertical: true)
     .padding(.horizontal, 12)
     .padding(.bottom, 8)
     .onAppear { model.onAppear() }
@@ -212,6 +228,153 @@ struct AgentConnectPanel: View {
         onCancel: { model.cancelScan() }
       )
       .ignoresSafeArea()
+    }
+  }
+}
+
+struct AgentBridgeRepositoryPickerView: View {
+  let provider: String
+  let displayName: String
+
+  @Environment(\.dismiss) private var dismiss
+  @Environment(\.colorScheme) private var colorScheme
+  @State private var status: AgentBridgeStatus = .disconnected
+  @State private var selected: AgentBridgeRepository? = AgentBridgeSelectionStore.selectedRepository()
+  @State private var workMode: AgentBridgeWorkMode = AgentBridgeSelectionStore.selectedWorkMode()
+  @State private var isLoading = false
+  @State private var errorMessage: String?
+
+  private var palette: AppThemePalette { AppThemePalette.resolve(for: colorScheme) }
+
+  var body: some View {
+    NavigationView {
+      Group {
+        if status.repositories.isEmpty && isLoading {
+          ProgressView()
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if status.repositories.isEmpty {
+          VStack(spacing: 14) {
+            Image(systemName: status.connected ? "folder.badge.questionmark" : "laptopcomputer.slash")
+              .font(.system(size: 36, weight: .semibold))
+              .foregroundStyle(palette.secondaryText)
+            Text(status.connected ? "No repositories shared" : "Computer offline")
+              .font(.system(size: 17, weight: .semibold))
+              .foregroundStyle(palette.text)
+            if let errorMessage {
+              Text(errorMessage)
+                .font(.system(size: 13))
+                .foregroundStyle(.red)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 24)
+            }
+          }
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+          List {
+            Section {
+              ForEach(AgentBridgeWorkMode.allCases) { mode in
+                Button {
+                  workMode = mode
+                  AgentBridgeSelectionStore.setWorkMode(mode)
+                } label: {
+                  HStack(spacing: 12) {
+                    Image(systemName: mode.icon)
+                      .font(.system(size: 17, weight: .medium))
+                      .foregroundStyle(palette.accent)
+                      .frame(width: 24)
+                    VStack(alignment: .leading, spacing: 3) {
+                      Text(mode.title)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(palette.text)
+                      Text(mode.subtitle)
+                        .font(.system(size: 12))
+                        .foregroundStyle(palette.secondaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 0)
+                    if workMode == mode {
+                      Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(palette.accent)
+                    }
+                  }
+                  .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+              }
+            } header: {
+              Text("Permission")
+            }
+
+            Section {
+              ForEach(status.repositories) { repo in
+                Button {
+                  AgentBridgeSelectionStore.select(repo)
+                  selected = repo
+                  dismiss()
+                } label: {
+                  HStack(spacing: 12) {
+                    Image(systemName: repo.isGitRepository ? "shippingbox" : "folder")
+                      .font(.system(size: 18, weight: .medium))
+                      .foregroundStyle(palette.accent)
+                      .frame(width: 24)
+                    VStack(alignment: .leading, spacing: 3) {
+                      Text(repo.name)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(palette.text)
+                        .lineLimit(1)
+                      Text(repo.path)
+                        .font(.system(size: 12))
+                        .foregroundStyle(palette.secondaryText)
+                        .lineLimit(1)
+                    }
+                    Spacer(minLength: 0)
+                    if selected?.id == repo.id || selected?.cwd == repo.cwd {
+                      Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(palette.accent)
+                    }
+                  }
+                  .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+              }
+            }
+          }
+          .listStyle(.insetGrouped)
+        }
+      }
+      .navigationTitle("\(displayName) repo")
+      .navigationBarTitleDisplayMode(.inline)
+      .toolbar {
+        ToolbarItem(placement: .topBarLeading) {
+          Button("Close") { dismiss() }
+        }
+        ToolbarItem(placement: .topBarTrailing) {
+          Button {
+            Task { await refresh() }
+          } label: {
+            Image(systemName: "arrow.clockwise")
+          }
+          .disabled(isLoading)
+        }
+      }
+      .task { await refresh() }
+    }
+  }
+
+  @MainActor
+  private func refresh() async {
+    guard let config = AppSessionConfig.current else { return }
+    isLoading = true
+    errorMessage = nil
+    defer { isLoading = false }
+    do {
+      let next = try await AgentPairingService.status(config: config)
+      status = next
+      selected = AgentBridgeSelectionStore.ensureValidSelection(from: next.repositories)
+    } catch {
+      errorMessage = error.localizedDescription
     }
   }
 }
@@ -256,12 +419,17 @@ final class AgentQRScannerController: UIViewController, AVCaptureMetadataOutputO
     view.backgroundColor = .black
     
     if #available(iOS 26.0, *) {
-      let glass = UIGlassEffect(style: .regular)
+      let glass = UIGlassEffect()
       glass.isInteractive = true
       overlayEffectView.effect = glass
     } else {
-      overlayEffectView.effect = UIBlurEffect(style: .systemThinMaterialDark)
+      overlayEffectView.effect = UIBlurEffect(style: .systemMaterialDark)
     }
+    
+    let maskView = UIView()
+    overlayMaskLayer.fillColor = UIColor.black.cgColor
+    maskView.layer.addSublayer(overlayMaskLayer)
+    overlayEffectView.mask = maskView
     view.addSubview(overlayEffectView)
     
     targetBoxLayer.strokeColor = UIColor.white.withAlphaComponent(0.6).cgColor
@@ -303,7 +471,7 @@ final class AgentQRScannerController: UIViewController, AVCaptureMetadataOutputO
     
     overlayMaskLayer.path = path.cgPath
     overlayMaskLayer.fillRule = .evenOdd
-    overlayEffectView.layer.mask = overlayMaskLayer
+    overlayEffectView.mask?.frame = view.bounds
     
     targetBoxLayer.path = innerPath.cgPath
     
@@ -453,13 +621,82 @@ final class AgentQRScannerController: UIViewController, AVCaptureMetadataOutputO
   }
 }
 
-struct AgentConnectGlassBackground: UIViewRepresentable {
-  func makeUIView(context: Context) -> UIVisualEffectView {
-    if #available(iOS 26.0, *) {
-      return UIVisualEffectView(effect: UIGlassEffect(style: .regular))
-    } else {
-      return UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
-    }
+struct UIGlassWrapper<Content: View>: UIViewRepresentable {
+  var cornerRadius: CGFloat
+  var strokeColor: Color = .clear
+  let content: Content
+
+  init(cornerRadius: CGFloat, strokeColor: Color = .clear, @ViewBuilder content: () -> Content) {
+    self.cornerRadius = cornerRadius
+    self.strokeColor = strokeColor
+    self.content = content()
   }
-  func updateUIView(_ uiView: UIVisualEffectView, context: Context) {}
+
+  func makeUIView(context: Context) -> GlassContainerView<Content> {
+    let blurView = UIVisualEffectView()
+    if #available(iOS 26.0, *) {
+      let effect = UIGlassEffect()
+      effect.isInteractive = true
+      blurView.effect = effect
+    } else {
+      blurView.effect = UIBlurEffect(style: .systemMaterial)
+    }
+    blurView.layer.cornerCurve = .continuous
+    blurView.layer.cornerRadius = cornerRadius
+    if strokeColor != .clear {
+      blurView.layer.borderColor = UIColor(strokeColor).cgColor
+      blurView.layer.borderWidth = 1.0
+    }
+    blurView.clipsToBounds = true
+
+    let hostingController = UIHostingController(rootView: content)
+    hostingController.view.backgroundColor = .clear
+    
+    blurView.contentView.addSubview(hostingController.view)
+    hostingController.view.translatesAutoresizingMaskIntoConstraints = false
+    NSLayoutConstraint.activate([
+      hostingController.view.leadingAnchor.constraint(equalTo: blurView.contentView.leadingAnchor),
+      hostingController.view.trailingAnchor.constraint(equalTo: blurView.contentView.trailingAnchor),
+      hostingController.view.topAnchor.constraint(equalTo: blurView.contentView.topAnchor),
+      hostingController.view.bottomAnchor.constraint(equalTo: blurView.contentView.bottomAnchor)
+    ])
+    
+    return GlassContainerView(blurView: blurView, hostingController: hostingController)
+  }
+
+  func updateUIView(_ uiView: GlassContainerView<Content>, context: Context) {
+    uiView.hostingController.rootView = content
+    uiView.hostingController.view.setNeedsUpdateConstraints()
+  }
+}
+
+final class GlassContainerView<Content: View>: UIView {
+  let blurView: UIVisualEffectView
+  let hostingController: UIHostingController<Content>
+
+  init(blurView: UIVisualEffectView, hostingController: UIHostingController<Content>) {
+    self.blurView = blurView
+    self.hostingController = hostingController
+    super.init(frame: .zero)
+    backgroundColor = .clear
+    addSubview(blurView)
+    blurView.translatesAutoresizingMaskIntoConstraints = false
+    NSLayoutConstraint.activate([
+      blurView.leadingAnchor.constraint(equalTo: leadingAnchor),
+      blurView.trailingAnchor.constraint(equalTo: trailingAnchor),
+      blurView.topAnchor.constraint(equalTo: topAnchor),
+      blurView.bottomAnchor.constraint(equalTo: bottomAnchor)
+    ])
+  }
+  
+  required init?(coder: NSCoder) { fatalError() }
+  
+  override func systemLayoutSizeFitting(_ targetSize: CGSize) -> CGSize {
+    return hostingController.view.systemLayoutSizeFitting(targetSize)
+  }
+  
+  override var intrinsicContentSize: CGSize {
+    let size = hostingController.view.intrinsicContentSize
+    return CGSize(width: UIView.noIntrinsicMetric, height: size.height)
+  }
 }

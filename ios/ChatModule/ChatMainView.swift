@@ -252,8 +252,9 @@ public final class ChatMainView: UIView,
   private var profileTabContentNeedsReload = true
   private var profileLastTabContentWidth: CGFloat = 0.0
   private var currentPage: ChatMainPage = .chat
-  private var avatarLoadTask: URLSessionDataTask?
+  private var avatarLoadTask: Task<Void, Never>?
   private var avatarResolveGeneration: UInt = 0
+  private var displayedAvatarUri: String?
   private var registeredSurfaceId: String = ""
   private var pendingNativePageTarget: ChatMainPage?
   private var pendingNativePageLockUntil: CFTimeInterval = 0.0
@@ -2740,7 +2741,7 @@ public final class ChatMainView: UIView,
     let headerHeight = safeTop + 60.0
     let contentY = safeTop + 8.0
     let headerContentWidth = max(0.0, bounds.width - 24.0)
-    let maxCenterWidth = max(0.0, headerContentWidth * 0.65)
+    let maxCenterWidth = max(0.0, headerContentWidth * 0.55)
     let hideChatHeader = externalNavigationHeaderEnabled && !savedSearchExpanded
     if hideChatHeader {
       headerContainer.frame = .zero
@@ -3816,34 +3817,29 @@ public final class ChatMainView: UIView,
     profileAvatarFallbackIconView.image = UIImage(systemName: "person.fill")
     profileAvatarFallbackIconView.tintColor = .white
 
-    avatarImageView.image = nil
-    profileAvatarImageView.image = nil
-    avatarImageView.isHidden = true
-    profileAvatarImageView.isHidden = true
-    avatarFallbackIconView.isHidden = false
-    profileAvatarFallbackIconView.isHidden = false
-
     let rawAvatar = avatarUri
     let peerUserId = enginePeerUserIdRaw
     let chatId = engineChatId
     let preferPushAvatar = !isGroupOrChannel
     if rawAvatar.isEmpty && (!preferPushAvatar || peerUserId.isEmpty) {
+      displayedAvatarUri = nil
+      avatarImageView.image = nil
+      profileAvatarImageView.image = nil
+      avatarImageView.isHidden = true
+      profileAvatarImageView.isHidden = true
+      avatarFallbackIconView.isHidden = false
+      profileAvatarFallbackIconView.isHidden = false
       return
     }
 
-    DispatchQueue.global(qos: .utility).async { [rawAvatar, peerUserId, chatId, preferPushAvatar, generation] in
-      let resolvedUri =
-        ChatAvatarURLResolver.resolve(
-          rawAvatar: rawAvatar,
-          peerUserId: peerUserId,
-          chatId: chatId,
-          preferPushAvatar: preferPushAvatar
-        ) ?? ""
-      DispatchQueue.main.async { [weak self] in
-        guard let self, self.avatarResolveGeneration == generation else { return }
-        self.startAvatarLoad(resolvedUri: resolvedUri, generation: generation)
-      }
-    }
+    let resolvedUri =
+      ChatAvatarURLResolver.resolve(
+        rawAvatar: rawAvatar,
+        peerUserId: peerUserId,
+        chatId: chatId,
+        preferPushAvatar: preferPushAvatar
+      ) ?? ""
+    startAvatarLoad(resolvedUri: resolvedUri, generation: generation)
   }
 
   private func applyUserAvatarGradient() {
@@ -3878,26 +3874,29 @@ public final class ChatMainView: UIView,
   }
 
   private func userAvatarGradientColors() -> (UIColor, UIColor) {
-    let seed =
-      [enginePeerUserIdRaw, chatTitleText, engineChatId]
-      .first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } ?? "user"
-    let palettes: [(UIColor, UIColor)] = [
-      (UIColor(red: 91 / 255, green: 141 / 255, blue: 239 / 255, alpha: 1), UIColor(red: 61 / 255, green: 107 / 255, blue: 198 / 255, alpha: 1)),
-      (UIColor(red: 31 / 255, green: 169 / 255, blue: 122 / 255, alpha: 1), UIColor(red: 22 / 255, green: 122 / 255, blue: 96 / 255, alpha: 1)),
-      (UIColor(red: 214 / 255, green: 106 / 255, blue: 90 / 255, alpha: 1), UIColor(red: 175 / 255, green: 73 / 255, blue: 63 / 255, alpha: 1)),
-      (UIColor(red: 160 / 255, green: 106 / 255, blue: 216 / 255, alpha: 1), UIColor(red: 124 / 255, green: 78 / 255, blue: 178 / 255, alpha: 1)),
-      (UIColor(red: 213 / 255, green: 154 / 255, blue: 46 / 255, alpha: 1), UIColor(red: 175 / 255, green: 116 / 255, blue: 29 / 255, alpha: 1)),
-      (UIColor(red: 47 / 255, green: 154 / 255, blue: 168 / 255, alpha: 1), UIColor(red: 32 / 255, green: 117 / 255, blue: 133 / 255, alpha: 1)),
-    ]
-    let index = abs(seed.unicodeScalars.reduce(0) { ($0 &* 31) &+ Int($1.value) }) % palettes.count
-    return palettes[index]
+    ChatAvatarFallbackStyle.uiGradient(
+      title: chatTitleText,
+      peerUserId: enginePeerUserIdRaw,
+      chatId: engineChatId,
+      isDark: appearance.isDark
+    )
   }
 
   private func startAvatarLoad(resolvedUri: String, generation: UInt) {
     guard avatarResolveGeneration == generation else { return }
-    guard let url = URL(string: resolvedUri), !resolvedUri.isEmpty else { return }
+    guard !resolvedUri.isEmpty else {
+      displayedAvatarUri = nil
+      avatarImageView.image = nil
+      profileAvatarImageView.image = nil
+      avatarImageView.isHidden = true
+      profileAvatarImageView.isHidden = true
+      avatarFallbackIconView.isHidden = false
+      profileAvatarFallbackIconView.isHidden = false
+      return
+    }
 
-    if let cached = ChatHomeCardCell.avatarCached(forKey: resolvedUri) {
+    if let cached = ChatAvatarImageStore.cached(for: resolvedUri) {
+      displayedAvatarUri = resolvedUri
       avatarImageView.image = cached
       profileAvatarImageView.image = cached
       avatarImageView.isHidden = false
@@ -3907,14 +3906,23 @@ public final class ChatMainView: UIView,
       return
     }
 
-    var request = URLRequest(url: url)
-    request.cachePolicy = .returnCacheDataElseLoad
-    request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
-    let task = URLSession.shared.dataTask(with: request) { [weak self, generation] data, _, _ in
-      guard let self, let data, let image = UIImage(data: data) else { return }
-      DispatchQueue.main.async {
-        guard self.avatarResolveGeneration == generation else { return }
-        ChatHomeCardCell.cacheAvatar(image, forKey: resolvedUri)
+    if displayedAvatarUri != resolvedUri {
+      avatarImageView.image = nil
+      profileAvatarImageView.image = nil
+      avatarImageView.isHidden = true
+      profileAvatarImageView.isHidden = true
+      avatarFallbackIconView.isHidden = false
+      profileAvatarFallbackIconView.isHidden = false
+    }
+
+    let task = Task { [weak self] in
+      let image = await ChatAvatarImageStore.load(from: resolvedUri)
+      guard !Task.isCancelled else { return }
+      await MainActor.run {
+        guard let self, self.avatarResolveGeneration == generation else { return }
+        self.avatarLoadTask = nil
+        guard let image else { return }
+        self.displayedAvatarUri = resolvedUri
         self.avatarImageView.image = image
         self.profileAvatarImageView.image = image
         self.avatarImageView.isHidden = false
@@ -3924,7 +3932,6 @@ public final class ChatMainView: UIView,
       }
     }
     avatarLoadTask = task
-    task.resume()
   }
 
   private func applyPageState(animated: Bool, emitEvent: Bool) {

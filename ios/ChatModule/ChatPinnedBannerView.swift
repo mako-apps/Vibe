@@ -63,7 +63,6 @@ final class ChatPinnedBannerView: UIControl {
     iconImageView.tintColor = textColor.withAlphaComponent(0.95)
     titleLabel.textColor = textColor.withAlphaComponent(0.96)
     bodyLabel.textColor = textColor.withAlphaComponent(0.82)
-    blurView.layer.borderColor = textColor.withAlphaComponent(isDark ? 0.10 : 0.06).cgColor
   }
 
   private func setup() {
@@ -72,8 +71,6 @@ final class ChatPinnedBannerView: UIControl {
     addSubview(blurView)
     blurView.layer.cornerCurve = .continuous
     blurView.layer.cornerRadius = ChatPinnedBannerView.preferredHeight / 2.0
-    blurView.layer.borderWidth = 1.0
-    blurView.layer.borderColor = UIColor.white.withAlphaComponent(0.12).cgColor
     blurView.clipsToBounds = true
 
     blurView.contentView.addSubview(iconContainer)

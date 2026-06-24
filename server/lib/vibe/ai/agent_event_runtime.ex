@@ -22,6 +22,7 @@ defmodule Vibe.AI.AgentEventRuntime do
 
   @safe_action_types ~w[post_message post_checklist request_confirmation set_thread_status]
   @high_priority_keywords ~w[failed failure blocked fraud urgent escalated chargeback liquidation stop_loss]
+  @batch_summary_event_line_limit 12
 
   def ingest(%Agent{} = agent, params, opts \\ []) when is_map(params) do
     secret = Keyword.get(opts, :secret)
@@ -811,12 +812,6 @@ defmodule Vibe.AI.AgentEventRuntime do
     if events == [] do
       {:ok, thread, nil}
     else
-      related_message_ids =
-        events
-        |> Enum.map(& &1.message_id)
-        |> Enum.filter(&is_binary/1)
-        |> Enum.uniq()
-
       metadata =
         %{
           "eventThread" => true,
@@ -831,21 +826,6 @@ defmodule Vibe.AI.AgentEventRuntime do
           "summaryEndAt" => DateTime.to_iso8601(occurred_at),
           "eventIds" => Enum.map(events, & &1.id)
         }
-        |> maybe_put(
-          "relatedMessageIds",
-          if(related_message_ids == [], do: nil, else: related_message_ids)
-        )
-        |> maybe_put(
-          "relatedMessagesTitle",
-          if(related_message_ids == [],
-            do: nil,
-            else: related_messages_title(length(related_message_ids))
-          )
-        )
-        |> maybe_put(
-          "relatedMessagesSubtitle",
-          if(related_message_ids == [], do: nil, else: "Tap to review")
-        )
 
       with {:ok, summary_payload} <-
              post_chat_message(
@@ -893,20 +873,38 @@ defmodule Vibe.AI.AgentEventRuntime do
       end
 
     count = length(events)
-    preview_events = Enum.take(events, -4)
+    preview_events = Enum.take(events, -@batch_summary_event_line_limit)
     omitted_count = max(count - length(preview_events), 0)
+
+    type_line =
+      events
+      |> summary_count_line(fn event -> event |> event_type() |> humanize_event_type() end)
+      |> case do
+        nil -> nil
+        counts -> "Types: #{counts}"
+      end
+
+    source_line =
+      events
+      |> summary_count_line(fn event -> Map.get(event, :source) || Map.get(event, "source") end)
+      |> case do
+        nil -> nil
+        counts -> "Sources: #{counts}"
+      end
 
     lines =
       preview_events
       |> Enum.map(fn event ->
-        line_body = event |> compact_event_summary_line() |> truncate_line(180)
+        line_body = event |> compact_event_summary_line() |> truncate_line(220)
 
         "#{summary_timestamp(event.occurred_at)} #{line_body}"
       end)
 
     omitted_line =
       if omitted_count > 0 do
-        ["+#{omitted_count} earlier event#{if omitted_count == 1, do: "", else: "s"}"]
+        [
+          "Showing latest #{length(preview_events)} of #{count}; #{omitted_count} earlier event#{if omitted_count == 1, do: "", else: "s"} saved in Inbox."
+        ]
       else
         []
       end
@@ -914,8 +912,10 @@ defmodule Vibe.AI.AgentEventRuntime do
     ([
        "#{window_label}: #{count} event#{if count == 1, do: "", else: "s"}",
        "#{thread.title || thread.thread_key}",
-       "Window: #{summary_timestamp(pending_since)} to #{summary_timestamp(occurred_at)}"
-     ] ++ omitted_line ++ lines)
+       "Window: #{summary_timestamp(pending_since)} to #{summary_timestamp(occurred_at)}",
+       type_line,
+       source_line
+     ] ++ omitted_line ++ ["Events:"] ++ lines)
     |> Enum.reject(&is_nil/1)
     |> Enum.join("\n")
   end
@@ -926,8 +926,22 @@ defmodule Vibe.AI.AgentEventRuntime do
     _ -> DateTime.to_iso8601(value)
   end
 
-  defp related_messages_title(count) when count <= 1, do: "Related message"
-  defp related_messages_title(count), do: "#{count} related messages"
+  defp summary_count_line(events, value_fun) do
+    events
+    |> Enum.map(value_fun)
+    |> Enum.map(&normalize_string/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.frequencies()
+    |> Enum.sort_by(fn {label, count} -> {-count, label} end)
+    |> Enum.take(4)
+    |> case do
+      [] ->
+        nil
+
+      counts ->
+        Enum.map_join(counts, " · ", fn {label, count} -> "#{label} #{count}" end)
+    end
+  end
 
   defp truncate_line(nil, _limit), do: nil
 
@@ -1188,10 +1202,10 @@ defmodule Vibe.AI.AgentEventRuntime do
     timestamp = System.system_time(:millisecond)
     message_type = Keyword.get(opts, :type, "text")
     media_url = Keyword.get(opts, :media_url)
-    # Silent posts still broadcast over the live channel (so the Inbox view
-    # updates in real time) but skip the push notification. Used for individual
-    # inbox items in batched_summary mode so the inbox is populated without a
-    # push per event.
+    # Silent posts still broadcast over the open chat channel (so the Inbox view
+    # can update in real time) but skip Home/new-message fanout and push
+    # notifications. Used for individual inbox items in batched_summary mode so
+    # the inbox is populated without behaving like normal chat traffic.
     silent = Keyword.get(opts, :silent, false)
 
     metadata =
@@ -1275,13 +1289,15 @@ defmodule Vibe.AI.AgentEventRuntime do
           if participant.user_id != agent.agent_user_id do
             if participant.deleted, do: Chat.restore_if_deleted(chat_id, participant.user_id)
 
-            VibeWeb.Endpoint.broadcast!("user:#{participant.user_id}", "new_message", %{
-              chat_id: chat_id,
-              from_id: agent.agent_user_id,
-              message_id: message_id,
-              timestamp: timestamp,
-              muted: participant.muted || false
-            })
+            if not silent do
+              VibeWeb.Endpoint.broadcast!("user:#{participant.user_id}", "new_message", %{
+                chat_id: chat_id,
+                from_id: agent.agent_user_id,
+                message_id: message_id,
+                timestamp: timestamp,
+                muted: participant.muted || false
+              })
+            end
 
             if not participant.muted and not silent do
               _ =

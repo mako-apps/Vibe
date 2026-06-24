@@ -13,6 +13,7 @@ defmodule VibeWeb.AgentBridgeChannel do
   use VibeWeb, :channel
   require Logger
 
+  alias Vibe.AgentBridge
   alias Vibe.AI.LocalAgentWorker
   alias VibeWeb.Presence
 
@@ -30,12 +31,30 @@ defmodule VibeWeb.AgentBridgeChannel do
   def handle_info(:after_join, socket) do
     {:ok, _ref} =
       Presence.track(socket, to_string(socket.assigns.user_id), %{
-        online_at: System.system_time(:second)
+        "online_at" => System.system_time(:second),
+        "repositories" => []
       })
 
     push(socket, "presence_state", Presence.list(socket))
     Logger.info("[AgentBridge] computer online user=#{socket.assigns.user_id}")
     {:noreply, socket}
+  end
+
+  # daemon → server: connected device capabilities and allowed working trees
+  @impl true
+  def handle_in("status", payload, socket) do
+    meta = AgentBridge.presence_meta(payload)
+    key = to_string(socket.assigns.user_id)
+
+    case Presence.update(socket, key, meta) do
+      {:ok, _ref} ->
+        :ok
+
+      {:error, _reason} ->
+        Presence.track(socket, key, meta)
+    end
+
+    {:reply, :ok, socket}
   end
 
   # daemon → server: live progress for an in-flight task (raw stream-json line)
@@ -93,7 +112,15 @@ defmodule VibeWeb.AgentBridgeChannel do
   # daemon → server: surface an error notice without a full result
   def handle_in("error", %{"provider" => provider, "chatId" => chat_id} = payload, socket) do
     message = payload["message"] || "The task could not be completed on your computer."
-    LocalAgentWorker.post_bridge_notice(provider, chat_id, message, to_string(socket.assigns.user_id), payload["replyToId"])
+
+    LocalAgentWorker.post_bridge_notice(
+      provider,
+      chat_id,
+      message,
+      to_string(socket.assigns.user_id),
+      payload["replyToId"]
+    )
+
     LocalAgentWorker.stop_activity(chat_id, agent_user_id_for(provider))
     {:reply, :ok, socket}
   end

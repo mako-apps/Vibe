@@ -86,6 +86,190 @@ enum ChatAvatarURLResolver {
   }
 }
 
+enum ChatAvatarImageStore {
+  private static let imageCache: NSCache<NSString, UIImage> = {
+    let cache = NSCache<NSString, UIImage>()
+    cache.countLimit = 384
+    return cache
+  }()
+  private static let inFlightCoordinator = ChatAvatarImageLoadCoordinator()
+
+  static func cached(for rawValue: String?) -> UIImage? {
+    guard let key = cacheKey(rawValue) else { return nil }
+    return imageCache.object(forKey: key as NSString)
+  }
+
+  static func cache(_ image: UIImage, for rawValue: String?) {
+    guard let key = cacheKey(rawValue) else { return }
+    imageCache.setObject(image, forKey: key as NSString)
+  }
+
+  static func load(from rawValue: String?) async -> UIImage? {
+    guard let key = cacheKey(rawValue) else { return nil }
+    if let cached = imageCache.object(forKey: key as NSString) {
+      return cached
+    }
+
+    let task = await inFlightCoordinator.task(for: key) {
+      Task.detached(priority: .utility) {
+        await fetchImage(for: key)
+      }
+    }
+    let image = await task.value
+
+    await inFlightCoordinator.finish(key: key)
+
+    if let image {
+      imageCache.setObject(image, forKey: key as NSString)
+    }
+    return image
+  }
+
+  private static func fetchImage(for value: String) async -> UIImage? {
+    if value.hasPrefix("data:"), let commaIndex = value.firstIndex(of: ",") {
+      let base64 = String(value[value.index(after: commaIndex)...])
+      guard let data = Data(base64Encoded: base64, options: [.ignoreUnknownCharacters]) else {
+        return nil
+      }
+      return UIImage(data: data)
+    }
+
+    if value.hasPrefix("/") {
+      return UIImage(contentsOfFile: value)
+    }
+
+    if let url = URL(string: value) {
+      if url.isFileURL {
+        return UIImage(contentsOfFile: url.path)
+      }
+
+      if let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" {
+        do {
+          var request = URLRequest(url: url)
+          request.cachePolicy = .returnCacheDataElseLoad
+          request.timeoutInterval = 12.0
+          request.setValue("image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
+          request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
+          let (data, response) = try await URLSession.shared.data(for: request)
+          if let status = (response as? HTTPURLResponse)?.statusCode,
+            !(200...299).contains(status)
+          {
+            return nil
+          }
+          return UIImage(data: data)
+        } catch {
+          return nil
+        }
+      }
+    }
+
+    guard let data = Data(base64Encoded: value, options: [.ignoreUnknownCharacters]) else {
+      return nil
+    }
+    return UIImage(data: data)
+  }
+
+  private static func cacheKey(_ rawValue: String?) -> String? {
+    let value = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return value.isEmpty ? nil : value
+  }
+}
+
+private actor ChatAvatarImageLoadCoordinator {
+  private var inFlightLoads: [String: Task<UIImage?, Never>] = [:]
+
+  func task(
+    for key: String,
+    create: () -> Task<UIImage?, Never>
+  ) -> Task<UIImage?, Never> {
+    if let existing = inFlightLoads[key] {
+      return existing
+    }
+    let task = create()
+    inFlightLoads[key] = task
+    return task
+  }
+
+  func finish(key: String) {
+    inFlightLoads.removeValue(forKey: key)
+  }
+}
+
+enum ChatAvatarFallbackStyle {
+  private static let palettes: [(lightStart: String, lightEnd: String, darkStart: String, darkEnd: String)] = [
+    ("#5B8DEF", "#3D6BC6", "#6EA2FF", "#355EAA"),
+    ("#1FA97A", "#167A60", "#3BC99A", "#126B55"),
+    ("#D66A5A", "#AF493F", "#E98574", "#963B33"),
+    ("#A06AD8", "#7C4EB2", "#B984EA", "#6E45A0"),
+    ("#D59A2E", "#AF741D", "#E6B24A", "#966418"),
+    ("#2F9AA8", "#207585", "#4BB6C4", "#1B6575"),
+    ("#E05A8A", "#B83E6A", "#F178A4", "#9C345B"),
+    ("#6078D6", "#4659AE", "#7A91EA", "#3A4E9C"),
+  ]
+
+  static func hexGradient(
+    title: String?,
+    peerUserId: String?,
+    chatId: String?,
+    isSavedMessages: Bool
+  ) -> (lightStart: String, lightEnd: String, darkStart: String, darkEnd: String)? {
+    guard !isSavedMessages else { return nil }
+    let seed = stableSeed(title: title, peerUserId: peerUserId, chatId: chatId)
+    guard !seed.isEmpty else { return nil }
+    return palettes[paletteIndex(for: seed)]
+  }
+
+  static func uiGradient(
+    title: String?,
+    peerUserId: String?,
+    chatId: String?,
+    isDark: Bool,
+    isSavedMessages: Bool = false
+  ) -> (UIColor, UIColor) {
+    if isSavedMessages {
+      return isDark
+        ? (
+          UIColor(red: 77 / 255, green: 217 / 255, blue: 229 / 255, alpha: 1),
+          UIColor(red: 43 / 255, green: 165 / 255, blue: 181 / 255, alpha: 1)
+        )
+        : (
+          UIColor(red: 43 / 255, green: 165 / 255, blue: 181 / 255, alpha: 1),
+          UIColor(red: 0 / 255, green: 122 / 255, blue: 124 / 255, alpha: 1)
+        )
+    }
+
+    let seed = stableSeed(title: title, peerUserId: peerUserId, chatId: chatId)
+    let palette = palettes[paletteIndex(for: seed.isEmpty ? "user" : seed)]
+    return (
+      uiColor(hex: isDark ? palette.darkStart : palette.lightStart),
+      uiColor(hex: isDark ? palette.darkEnd : palette.lightEnd)
+    )
+  }
+
+  static func stableSeed(title: String?, peerUserId: String?, chatId: String?) -> String {
+    [peerUserId, title, chatId]
+      .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .first { !$0.isEmpty } ?? ""
+  }
+
+  private static func paletteIndex(for seed: String) -> Int {
+    abs(seed.unicodeScalars.reduce(0) { ($0 &* 31) &+ Int($1.value) }) % palettes.count
+  }
+
+  private static func uiColor(hex raw: String) -> UIColor {
+    var hex = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if hex.hasPrefix("#") { hex.removeFirst() }
+    var value: UInt64 = 0
+    Scanner(string: hex).scanHexInt64(&value)
+    return UIColor(
+      red: CGFloat((value >> 16) & 0xff) / 255.0,
+      green: CGFloat((value >> 8) & 0xff) / 255.0,
+      blue: CGFloat(value & 0xff) / 255.0,
+      alpha: 1.0
+    )
+  }
+}
+
 struct ChatHomeListRow {
   let chatId: String
   let title: String
@@ -252,7 +436,7 @@ struct ChatHomeListRow {
       normalizedString(raw["avatarGradientStartDark"] ?? raw["avatar_gradient_start_dark"])
     let avatarGradientEndDark =
       normalizedString(raw["avatarGradientEndDark"] ?? raw["avatar_gradient_end_dark"])
-    let fallbackGradient = avatarGradientSeed(
+    let fallbackGradient = ChatAvatarFallbackStyle.hexGradient(
       title: title,
       peerUserId: peerUserId,
       chatId: chatId,
@@ -307,30 +491,6 @@ struct ChatHomeListRow {
     return array.compactMap { item in
       item as? [String: Any]
     }
-  }
-
-  private static func avatarGradientSeed(
-    title: String,
-    peerUserId: String?,
-    chatId: String,
-    isSavedMessages: Bool
-  ) -> (lightStart: String, lightEnd: String, darkStart: String, darkEnd: String)? {
-    guard !isSavedMessages else { return nil }
-    let seed = normalizedString(peerUserId) ?? normalizedString(title) ?? chatId
-    guard !seed.isEmpty else { return nil }
-    let palettes: [(String, String, String, String)] = [
-      ("#5B8DEF", "#3D6BC6", "#6EA2FF", "#355EAA"),
-      ("#1FA97A", "#167A60", "#3BC99A", "#126B55"),
-      ("#D66A5A", "#AF493F", "#E98574", "#963B33"),
-      ("#A06AD8", "#7C4EB2", "#B984EA", "#6E45A0"),
-      ("#D59A2E", "#AF741D", "#E6B24A", "#966418"),
-      ("#2F9AA8", "#207585", "#4BB6C4", "#1B6575"),
-      ("#E05A8A", "#B83E6A", "#F178A4", "#9C345B"),
-      ("#6078D6", "#4659AE", "#7A91EA", "#3A4E9C"),
-    ]
-    let index = abs(seed.unicodeScalars.reduce(0) { ($0 &* 31) &+ Int($1.value) }) % palettes.count
-    let palette = palettes[index]
-    return (palette.0, palette.1, palette.2, palette.3)
   }
 
   static func parseServerMessages(_ value: Any?) -> [[String: Any]] {
