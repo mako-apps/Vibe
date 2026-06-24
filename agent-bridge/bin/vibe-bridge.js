@@ -144,7 +144,7 @@ async function scanToPair(server, label) {
     await sleep(2500);
     const result = await claimPairToken(server, request_id, device_secret);
     if (result && result.bridge_token) {
-      process.stdout.write("\n");
+      process.stdout.write("\n[vibe-bridge] Auth is done — waiting for your computer...\n");
       return result;
     }
     process.stdout.write(".");
@@ -296,7 +296,7 @@ function connect(server, token, userId) {
 
   channel
     .join()
-    .receive("ok", () => console.log(`[vibe-bridge] connected — computer online for user ${userId}`))
+    .receive("ok", () => console.log(`\n✅ [vibe-bridge] CONNECTED! Your computer is now online for user ${userId}.\n   Leave this terminal open to run local AI tasks.\n`))
     .receive("error", (e) => console.error("[vibe-bridge] join error:", JSON.stringify(e)));
 
   // Lightweight heartbeat to keep last_seen fresh (socket also heartbeats).
@@ -332,7 +332,7 @@ async function main() {
   }
 
   const config = loadConfig();
-  const server = normalizeServer(ARGS.server || config.server);
+  const server = normalizeServer(ARGS.server || config.server || "https://api.vibegram.io");
   if (!server) {
     console.error("[vibe-bridge] Missing --server <https://your-vibe-server>");
     process.exit(1);

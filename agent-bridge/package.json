@@ -9,6 +9,9 @@
     "access": "public"
   },
   "main": "bin/vibe-bridge.js",
+  "scripts": {
+    "start": "node bin/vibe-bridge.js --server https://api.vibegram.io"
+  },
   "engines": {
     "node": ">=18"
   },

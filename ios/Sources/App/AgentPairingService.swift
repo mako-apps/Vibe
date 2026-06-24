@@ -87,6 +87,25 @@ enum AgentPairingService {
     _ = try await perform(request)
   }
 
+  /// POST /api/agent-bridge/authorize — authorize a scanned desktop pairing
+  /// request, binding the paired computer to this account.
+  static func authorize(config: AppSessionConfig, requestId: String) async throws {
+    let request = try buildRequest(
+      config: config, path: "/agent-bridge/authorize", method: "POST",
+      body: ["request_id": requestId])
+    _ = try await perform(request)
+  }
+
+  /// Extract the `request_id` from a scanned QR payload (`vibegram-pair:<id>`).
+  /// Returns nil for anything that isn't one of our pairing codes.
+  static func requestId(fromScanned payload: String) -> String? {
+    let trimmed = payload.trimmingCharacters(in: .whitespacesAndNewlines)
+    let prefix = "vibegram-pair:"
+    guard trimmed.hasPrefix(prefix) else { return nil }
+    let id = String(trimmed.dropFirst(prefix.count))
+    return id.isEmpty ? nil : id
+  }
+
   // MARK: - URL building
 
   /// Root server URL without a trailing `/api`. The daemon appends `/api/...` and
@@ -110,7 +129,8 @@ enum AgentPairingService {
   private static func buildRequest(
     config: AppSessionConfig,
     path: String,
-    method: String
+    method: String,
+    body: [String: Any]? = nil
   ) throws -> URLRequest {
     guard let url = URL(string: apiBase(config: config) + path) else {
       throw AgentPairingError.invalidURL
@@ -122,6 +142,9 @@ enum AgentPairingService {
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
     request.setValue("Bearer \(config.authToken)", forHTTPHeaderField: "Authorization")
+    if let body {
+      request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+    }
     return request
   }
 

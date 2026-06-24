@@ -93,7 +93,14 @@ final class ChatMainProfileActionNode: UIControl {
     titleView.textColor = foreground
     iconView.tintColor = foreground
 
-    glassView.effect = nil
-    glassView.contentView.backgroundColor = background.withAlphaComponent(0.68)
+    if #available(iOS 26.0, *) {
+      let glass = UIGlassEffect(style: .regular)
+      glass.isInteractive = true
+      glassView.effect = glass
+      glassView.contentView.backgroundColor = .clear
+    } else {
+      glassView.effect = UIBlurEffect(style: .systemThinMaterialDark)
+      glassView.contentView.backgroundColor = background.withAlphaComponent(0.25)
+    }
   }
 }

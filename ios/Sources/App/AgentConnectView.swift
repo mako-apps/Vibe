@@ -1,10 +1,10 @@
-import CoreImage.CIFilterBuiltins
+import AVFoundation
 import SwiftUI
 import UIKit
 
 /// Drives the "connect your computer" flow shown inside a Claude/Codex chat while
-/// no paired computer is online. Owns pairing-code requests and status polling so
-/// the panel can flip to "connected" the moment the daemon dials in.
+/// no paired computer is online. The desktop daemon shows a QR; the phone scans it
+/// and authorizes the pairing, then waits for the computer to come online.
 @MainActor
 final class AgentConnectModel: ObservableObject {
   /// `"claude"` / `"codex"`.
@@ -13,9 +13,9 @@ final class AgentConnectModel: ObservableObject {
   let displayName: String
 
   @Published var status: AgentBridgeStatus = .disconnected
-  @Published var ticket: AgentPairingTicket?
-  @Published var isRequestingCode = false
-  @Published var isShowingCode = false
+  @Published var isScanning = false
+  @Published var isAuthorizing = false
+  @Published var didAuthorize = false
   @Published var errorMessage: String?
 
   /// Invoked once a computer comes online so the host can reveal the input bar.
@@ -36,7 +36,8 @@ final class AgentConnectModel: ObservableObject {
     stopPolling()
   }
 
-  /// Polls bridge status every couple of seconds while the panel is on screen.
+  /// Polls bridge status every couple of seconds while the panel is on screen so
+  /// it flips to "connected" the moment the daemon claims its token and joins.
   func startPolling() {
     guard pollTask == nil else { return }
     pollTask = Task { [weak self] in
@@ -59,7 +60,6 @@ final class AgentConnectModel: ObservableObject {
       let next = try await AgentPairingService.status(config: config)
       status = next
       if next.connected {
-        isShowingCode = false
         stopPolling()
         onConnected?()
       }
@@ -68,21 +68,36 @@ final class AgentConnectModel: ObservableObject {
     }
   }
 
-  func requestCode() {
-    guard !isRequestingCode else { return }
+  func beginScan() {
+    errorMessage = nil
+    isScanning = true
+  }
+
+  func cancelScan() {
+    isScanning = false
+  }
+
+  /// A QR was scanned. Parse the pairing request and authorize it against this
+  /// (authenticated) account, binding the computer to the user.
+  func handleScanned(_ payload: String) {
+    isScanning = false
+    guard let requestId = AgentPairingService.requestId(fromScanned: payload) else {
+      errorMessage =
+        "That isn't a Vibe pairing code. On your computer run the bridge and scan the QR it shows."
+      return
+    }
     guard let config = AppSessionConfig.current else {
       errorMessage = AgentPairingError.noSession.localizedDescription
       return
     }
-    isRequestingCode = true
+    isAuthorizing = true
     errorMessage = nil
     Task { [weak self] in
       guard let self else { return }
-      defer { self.isRequestingCode = false }
+      defer { self.isAuthorizing = false }
       do {
-        let ticket = try await AgentPairingService.requestPairing(config: config)
-        self.ticket = ticket
-        self.isShowingCode = true
+        try await AgentPairingService.authorize(config: config, requestId: requestId)
+        self.didAuthorize = true
         self.startPolling()
       } catch {
         self.errorMessage = error.localizedDescription
@@ -133,23 +148,44 @@ struct AgentConnectPanel: View {
         Spacer(minLength: 0)
       }
 
-      Button(action: { model.requestCode() }) {
-        HStack(spacing: 8) {
-          if model.isRequestingCode {
-            ProgressView().tint(.white)
-          } else {
-            Image(systemName: "qrcode")
-          }
-          Text(model.isRequestingCode ? "Preparing…" : "Connect \(model.displayName)")
-            .font(.system(size: 16, weight: .semibold))
+      if model.didAuthorize {
+        HStack(spacing: 10) {
+          ProgressView().controlSize(.small)
+          Text("Auth is done — waiting for your computer…")
+            .font(.system(size: 13, weight: .medium))
+            .foregroundStyle(palette.text)
+          Spacer(minLength: 0)
         }
+        .padding(12)
         .frame(maxWidth: .infinity)
-        .frame(height: 48)
-        .foregroundStyle(.white)
-        .background(palette.accent)
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .background(AgentConnectGlassBackground())
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+      } else {
+        Button(action: { model.beginScan() }) {
+          HStack(spacing: 8) {
+            if model.isAuthorizing {
+              ProgressView().tint(.white)
+            } else {
+              Image(systemName: "qrcode.viewfinder")
+            }
+            Text(model.isAuthorizing ? "Connecting…" : "Scan to connect")
+              .font(.system(size: 16, weight: .semibold))
+          }
+          .frame(maxWidth: .infinity)
+          .frame(height: 48)
+          .foregroundStyle(.white)
+          .background(palette.accent)
+          .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+        .disabled(model.isAuthorizing)
+
+        Text(
+          "On your computer run the bridge — it shows a QR. Scan it here to connect."
+        )
+        .font(.system(size: 11.5))
+        .foregroundStyle(palette.secondaryText)
+        .frame(maxWidth: .infinity, alignment: .leading)
       }
-      .disabled(model.isRequestingCode)
 
       if let errorMessage = model.errorMessage {
         Text(errorMessage)
@@ -159,7 +195,7 @@ struct AgentConnectPanel: View {
       }
     }
     .padding(16)
-    .background(palette.card)
+    .background(AgentConnectGlassBackground())
     .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
     .overlay(
       RoundedRectangle(cornerRadius: 20, style: .continuous)
@@ -169,135 +205,261 @@ struct AgentConnectPanel: View {
     .padding(.bottom, 8)
     .onAppear { model.onAppear() }
     .onDisappear { model.onDisappear() }
-    .sheet(isPresented: $model.isShowingCode) {
-      AgentConnectQRSheet(model: model)
+    .fullScreenCover(isPresented: $model.isScanning) {
+      AgentQRScannerView(
+        instruction: "Scan the QR shown on your computer",
+        onResult: { model.handleScanned($0) },
+        onCancel: { model.cancelScan() }
+      )
+      .ignoresSafeArea()
     }
   }
 }
 
-/// QR + copyable command + live "waiting for your computer" status.
-private struct AgentConnectQRSheet: View {
-  @ObservedObject var model: AgentConnectModel
-  @Environment(\.colorScheme) private var colorScheme
-  @Environment(\.dismiss) private var dismiss
-  @State private var didCopy = false
+// MARK: - Camera QR scanner
 
-  private var palette: AppThemePalette { AppThemePalette.resolve(for: colorScheme) }
+/// SwiftUI wrapper over an AVFoundation QR scanner used to pair a computer.
+struct AgentQRScannerView: UIViewControllerRepresentable {
+  let instruction: String
+  let onResult: (String) -> Void
+  let onCancel: () -> Void
 
-  var body: some View {
-    NavigationView {
-      ScrollView {
-        VStack(spacing: 20) {
-          Text("On the computer you want \(model.displayName) to use, run this in a terminal:")
-            .font(.system(size: 14))
-            .foregroundStyle(palette.secondaryText)
-            .multilineTextAlignment(.center)
-            .padding(.top, 8)
+  func makeUIViewController(context: Context) -> AgentQRScannerController {
+    let controller = AgentQRScannerController()
+    controller.instruction = instruction
+    controller.onResult = onResult
+    controller.onCancel = onCancel
+    return controller
+  }
 
-          if let payload = model.ticket?.qrPayload, let image = AgentQRRenderer.image(for: payload) {
-            Image(uiImage: image)
-              .interpolation(.none)
-              .resizable()
-              .scaledToFit()
-              .frame(width: 220, height: 220)
-              .padding(14)
-              .background(Color.white)
-              .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+  func updateUIViewController(_ controller: AgentQRScannerController, context: Context) {}
+}
+
+final class AgentQRScannerController: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
+  var instruction: String = "Scan the QR"
+  var onResult: ((String) -> Void)?
+  var onCancel: (() -> Void)?
+
+  private let session = AVCaptureSession()
+  private var previewLayer: AVCaptureVideoPreviewLayer?
+  private var metadataOutput: AVCaptureMetadataOutput?
+  private let sessionQueue = DispatchQueue(label: "vibe.agent.qr.scanner")
+  private var hasEmitted = false
+  private let messageLabel = UILabel()
+  
+  private let overlayEffectView = UIVisualEffectView()
+  private let overlayMaskLayer = CAShapeLayer()
+  private let targetBoxLayer = CAShapeLayer()
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    view.backgroundColor = .black
+    
+    if #available(iOS 26.0, *) {
+      let glass = UIGlassEffect(style: .regular)
+      glass.isInteractive = true
+      overlayEffectView.effect = glass
+    } else {
+      overlayEffectView.effect = UIBlurEffect(style: .systemThinMaterialDark)
+    }
+    view.addSubview(overlayEffectView)
+    
+    targetBoxLayer.strokeColor = UIColor.white.withAlphaComponent(0.6).cgColor
+    targetBoxLayer.fillColor = UIColor.clear.cgColor
+    targetBoxLayer.lineWidth = 2
+    view.layer.addSublayer(targetBoxLayer)
+    
+    configureChrome()
+    requestCameraAndConfigure()
+  }
+
+  override func viewWillAppear(_ animated: Bool) {
+    super.viewWillAppear(animated)
+    startRunning()
+  }
+
+  override func viewWillDisappear(_ animated: Bool) {
+    super.viewWillDisappear(animated)
+    stopRunning()
+  }
+
+  override func viewDidLayoutSubviews() {
+    super.viewDidLayoutSubviews()
+    previewLayer?.frame = view.bounds
+    overlayEffectView.frame = view.bounds
+    
+    let boxSize: CGFloat = 260
+    let boxRect = CGRect(
+      x: (view.bounds.width - boxSize) / 2,
+      y: (view.bounds.height - boxSize) / 2,
+      width: boxSize,
+      height: boxSize
+    )
+    
+    let path = UIBezierPath(rect: view.bounds)
+    let innerPath = UIBezierPath(roundedRect: boxRect, cornerRadius: 24)
+    path.append(innerPath)
+    path.usesEvenOddFillRule = true
+    
+    overlayMaskLayer.path = path.cgPath
+    overlayMaskLayer.fillRule = .evenOdd
+    overlayEffectView.layer.mask = overlayMaskLayer
+    
+    targetBoxLayer.path = innerPath.cgPath
+    
+    if let preview = previewLayer, let output = metadataOutput {
+      output.rectOfInterest = preview.metadataOutputRectConverted(fromLayerRect: boxRect)
+    }
+  }
+
+  // MARK: Camera
+
+  private func requestCameraAndConfigure() {
+    switch AVCaptureDevice.authorizationStatus(for: .video) {
+    case .authorized:
+      configureSession()
+    case .notDetermined:
+      AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
+        DispatchQueue.main.async {
+          guard let self else { return }
+          if granted {
+            self.configureSession()
+            self.startRunning()
           } else {
-            ProgressView().frame(width: 220, height: 220)
+            self.showMessage("Camera access is needed to scan the pairing QR.")
           }
-
-          if let command = model.ticket?.command {
-            VStack(spacing: 10) {
-              Text(command)
-                .font(.system(size: 13, weight: .regular, design: .monospaced))
-                .foregroundStyle(palette.text)
-                .multilineTextAlignment(.leading)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .textSelection(.enabled)
-                .padding(12)
-                .background(palette.background)
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-
-              Button(action: { copyCommand(command) }) {
-                HStack(spacing: 6) {
-                  Image(systemName: didCopy ? "checkmark" : "doc.on.doc")
-                  Text(didCopy ? "Copied" : "Copy command")
-                }
-                .font(.system(size: 14, weight: .medium))
-                .foregroundStyle(palette.accent)
-              }
-            }
-          }
-
-          statusRow
-
-          VStack(spacing: 6) {
-            Label(
-              "The code is single-use and expires in ~10 minutes.",
-              systemImage: "clock")
-            Label(
-              "Don't have it installed? `npx` fetches @vibegram/agent-bridge automatically (Node 18+).",
-              systemImage: "shippingbox")
-          }
-          .font(.system(size: 12))
-          .foregroundStyle(palette.secondaryText)
-          .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(20)
-      }
-      .background(palette.background.ignoresSafeArea())
-      .navigationTitle("Pair your computer")
-      .navigationBarTitleDisplayMode(.inline)
-      .toolbar {
-        ToolbarItem(placement: .topBarTrailing) {
-          Button("Done") { dismiss() }
         }
       }
+    default:
+      showMessage("Camera access is off. Enable it in Settings to scan the pairing QR.")
     }
   }
 
-  private var statusRow: some View {
-    HStack(spacing: 10) {
-      if model.status.connected {
-        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-        Text("Computer connected — you're ready to chat.")
-          .foregroundStyle(palette.text)
-      } else {
-        ProgressView().controlSize(.small)
-        Text("Waiting for your computer to connect…")
-          .foregroundStyle(palette.secondaryText)
-      }
-      Spacer(minLength: 0)
+  private func configureSession() {
+    guard
+      let device = AVCaptureDevice.default(for: .video),
+      let input = try? AVCaptureDeviceInput(device: device),
+      session.canAddInput(input)
+    else {
+      showMessage("This device can't scan a QR code.")
+      return
     }
-    .font(.system(size: 14, weight: .medium))
-    .padding(12)
-    .frame(maxWidth: .infinity)
-    .background(palette.card)
-    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    session.addInput(input)
+
+    let output = AVCaptureMetadataOutput()
+    self.metadataOutput = output
+    guard session.canAddOutput(output) else {
+      showMessage("This device can't scan a QR code.")
+      return
+    }
+    session.addOutput(output)
+    output.setMetadataObjectsDelegate(self, queue: .main)
+    output.metadataObjectTypes = [.qr]
+
+    let preview = AVCaptureVideoPreviewLayer(session: session)
+    preview.videoGravity = .resizeAspectFill
+    preview.frame = view.bounds
+    view.layer.insertSublayer(preview, at: 0)
+    previewLayer = preview
+    hideMessage()
   }
 
-  private func copyCommand(_ command: String) {
-    UIPasteboard.general.string = command
-    withAnimation { didCopy = true }
-    DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
-      withAnimation { didCopy = false }
+  private func startRunning() {
+    sessionQueue.async { [weak self] in
+      guard let self, !self.session.inputs.isEmpty, !self.session.isRunning else { return }
+      self.session.startRunning()
     }
+  }
+
+  private func stopRunning() {
+    sessionQueue.async { [weak self] in
+      guard let self, self.session.isRunning else { return }
+      self.session.stopRunning()
+    }
+  }
+
+  func metadataOutput(
+    _ output: AVCaptureMetadataOutput,
+    didOutput metadataObjects: [AVMetadataObject],
+    from connection: AVCaptureConnection
+  ) {
+    guard
+      !hasEmitted,
+      let object = metadataObjects.first as? AVMetadataMachineReadableCodeObject,
+      object.type == .qr,
+      let value = object.stringValue
+    else { return }
+    hasEmitted = true
+    UINotificationFeedbackGenerator().notificationOccurred(.success)
+    stopRunning()
+    onResult?(value)
+  }
+
+  // MARK: Chrome
+
+  private func configureChrome() {
+    let close = UIButton(type: .system)
+    close.setImage(
+      UIImage(systemName: "xmark.circle.fill"), for: .normal)
+    close.tintColor = .white
+    close.translatesAutoresizingMaskIntoConstraints = false
+    close.addTarget(self, action: #selector(handleClose), for: .touchUpInside)
+    view.addSubview(close)
+
+    let title = UILabel()
+    title.text = instruction
+    title.textColor = .white
+    title.font = .systemFont(ofSize: 16, weight: .semibold)
+    title.textAlignment = .center
+    title.numberOfLines = 0
+    title.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(title)
+
+    messageLabel.textColor = .white
+    messageLabel.font = .systemFont(ofSize: 15, weight: .medium)
+    messageLabel.textAlignment = .center
+    messageLabel.numberOfLines = 0
+    messageLabel.isHidden = true
+    messageLabel.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(messageLabel)
+
+    NSLayoutConstraint.activate([
+      close.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
+      close.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+      close.widthAnchor.constraint(equalToConstant: 32),
+      close.heightAnchor.constraint(equalToConstant: 32),
+
+      title.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 16),
+      title.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 56),
+      title.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -56),
+
+      messageLabel.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+      messageLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 32),
+      messageLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -32),
+    ])
+  }
+
+  private func showMessage(_ text: String) {
+    messageLabel.text = text
+    messageLabel.isHidden = false
+  }
+
+  private func hideMessage() {
+    messageLabel.isHidden = true
+  }
+
+  @objc private func handleClose() {
+    onCancel?()
   }
 }
 
-/// Minimal QR generator (the one in SettingsView is file-private).
-enum AgentQRRenderer {
-  private static let context = CIContext()
-
-  static func image(for value: String) -> UIImage? {
-    guard !value.isEmpty else { return nil }
-    let filter = CIFilter.qrCodeGenerator()
-    filter.message = Data(value.utf8)
-    filter.correctionLevel = "M"
-    guard let output = filter.outputImage else { return nil }
-    let scaled = output.transformed(by: CGAffineTransform(scaleX: 10, y: 10))
-    guard let cgImage = context.createCGImage(scaled, from: scaled.extent) else { return nil }
-    return UIImage(cgImage: cgImage)
+struct AgentConnectGlassBackground: UIViewRepresentable {
+  func makeUIView(context: Context) -> UIVisualEffectView {
+    if #available(iOS 26.0, *) {
+      return UIVisualEffectView(effect: UIGlassEffect(style: .regular))
+    } else {
+      return UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
+    }
   }
+  func updateUIView(_ uiView: UIVisualEffectView, context: Context) {}
 }

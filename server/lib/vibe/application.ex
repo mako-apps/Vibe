@@ -16,6 +16,8 @@ defmodule Vibe.Application do
     ensure_ets_table(:chat_home_cache)
     ensure_ets_table(:local_agent_worker_ratelimit)
     ensure_ets_table(:local_agent_worker_sessions)
+    ensure_ets_table(:agent_bridge_pairings)
+    ensure_ets_table(:agent_bridge_requests)
 
     children = [
       # Start the Telemetry supervisor
