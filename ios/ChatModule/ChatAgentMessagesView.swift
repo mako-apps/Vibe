@@ -959,6 +959,46 @@ private final class ChatNativeAgentProgressTreeView: UIView {
     return nil
   }
 
+  // Compact, Claude-Code-style label for an enriched tool node:
+  //   "Read ChatEngine.swift", "Edit chat.ex  +12 −3", "Run git status", …
+  private func agentNodeDisplayLabel(_ node: ChatListRow.AgentProgressNode) -> String {
+    guard let kind = node.kind, !kind.isEmpty else { return node.label }
+    let verb: String
+    switch kind {
+    case "read": verb = "Read"
+    case "edit": verb = "Edit"
+    case "write": verb = "Create"
+    case "bash": verb = "Run"
+    case "search": verb = "Search"
+    case "web": verb = "Fetch"
+    case "task": verb = "Task"
+    case "todo": return "Planning"
+    default: return node.label
+    }
+    var text = verb
+    if let target = node.target, !target.isEmpty {
+      text += " \(target)"
+    }
+    var stats: [String] = []
+    if let added = node.added, added > 0 { stats.append("+\(added)") }
+    if let removed = node.removed, removed > 0 { stats.append("−\(removed)") }
+    if !stats.isEmpty {
+      text += "  " + stats.joined(separator: " ")
+    }
+    return text
+  }
+
+  private func normalizedNodeStatus(_ status: String) -> String {
+    switch status.lowercased() {
+    case "done", "complete", "completed", "success", "ok":
+      return "complete"
+    case "error", "failed", "failure":
+      return "error"
+    default:
+      return "running"
+    }
+  }
+
   func configure(
     row: ChatListRow,
     appearance: ChatListAppearance,
@@ -966,10 +1006,34 @@ private final class ChatNativeAgentProgressTreeView: UIView {
   ) -> CGFloat {
     let nodes = row.agentProgressNodes
 
-    // Inline design: show only the deepest (last) running node as a single flat row.
-    // Force depth=0 so there is no indentation or connector line.
+    // Bridge/CLI agents (Claude, Codex) emit a flat sequence of enriched tool
+    // nodes (each carries a `kind`). For those we render the FULL live feed —
+    // Read/Edit/Write/Run rows building up as Claude works — like Claude Code.
+    // The built-in Vibe AI agent emits a NESTED tree (depth > 0, no kind); we
+    // keep its original minimalist behavior of showing only the last node.
+    let isFlatToolFeed =
+      !nodes.isEmpty
+      && nodes.allSatisfy { $0.depth == 0 }
+      && nodes.contains { ($0.kind?.isEmpty == false) }
+
     let displayNodes: [ChatListRow.AgentProgressNode]
-    if let lastNode = nodes.last {
+    if isFlatToolFeed {
+      let maxVisible = 6
+      displayNodes = nodes.suffix(maxVisible).map { node in
+        ChatListRow.AgentProgressNode(
+          id: node.id,
+          label: agentNodeDisplayLabel(node),
+          status: normalizedNodeStatus(node.status),
+          depth: 0,
+          kind: node.kind,
+          target: node.target,
+          added: node.added,
+          removed: node.removed
+        )
+      }
+    } else if let lastNode = nodes.last {
+      // Inline design: show only the deepest (last) running node as a single
+      // flat row. Force depth=0 so there is no indentation or connector line.
       displayNodes = [
         ChatListRow.AgentProgressNode(
           id: lastNode.id, label: lastNode.label, status: lastNode.status, depth: 0)

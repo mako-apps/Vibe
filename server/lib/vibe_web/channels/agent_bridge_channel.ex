@@ -77,21 +77,10 @@ defmodule VibeWeb.AgentBridgeChannel do
     accumulated = lines |> Enum.reverse() |> Enum.join("\n")
     state = %{state | lines: lines}
 
+    # The live tool/execution feed now renders INSIDE the chat bubble (via the
+    # agent-stream progress nodes), not as a tool-specific subtitle in the chat
+    # header. We intentionally no longer broadcast `agent-progress` here.
     LocalAgentWorker.bridge_stream_update(provider, chat_id, accumulated, state.stream_id)
-
-    case LocalAgentWorker.bridge_progress_event(provider, line) do
-      nil ->
-        :ok
-
-      event ->
-        LocalAgentWorker.broadcast_activity(
-          chat_id,
-          agent_user_id_for(provider),
-          event["label"] || "Working...",
-          "running",
-          event["tool"]
-        )
-    end
 
     {:noreply, assign(socket, :streams, Map.put(streams, chat_id, state))}
   end

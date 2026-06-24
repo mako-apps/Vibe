@@ -407,6 +407,9 @@ final class ChatEngine {
   private var nativeTypingStateByChatId: [String: Bool] = [:]
   private var peerTypingUserIdsByChatId: [String: Set<String>] = [:]
   private var agentProgressByChatId: [String: AgentProgressState] = [:]
+  // Stable first-seen timestamp for each live agent stream (keyed chatId -> streamId)
+  // so the streaming bubble keeps its position while its text grows.
+  private var agentStreamTimestampsByChat: [String: [String: Int64]] = [:]
   private var nativeRecordingStateByChatId: [String: Bool] = [:]
   private var pinnedMessagesByChatId: [String: [[String: Any]]] = [:]
   private var pinnedFetchInFlightChatIds = Set<String>()
@@ -3725,6 +3728,99 @@ final class ChatEngine {
       chatId: chatId, state: nil, previous: previous, status: normalizedStatus)
   }
 
+  // MARK: - Live agent streaming (bridge)
+  //
+  // A bridge agent (Claude/Codex) running on the user's computer streams its
+  // reply back as it is produced. The server reparses the partial output and
+  // broadcasts `agent-stream` events. We render that as a synthetic agent
+  // message row (keyed by a stable streamId) that updates in place — text grows
+  // and tool/progress nodes appear inline in the bubble — instead of showing the
+  // execution only in the header and the answer as one final batch. When the
+  // real persisted message arrives, the streaming row is removed.
+  private func applyAgentStreamLocked(chatId: String, payload: [String: Any]) {
+    guard let streamId = normalizedString(payload["streamId"] ?? payload["stream_id"]) else {
+      return
+    }
+    let status = (normalizedString(payload["status"]) ?? "running").lowercased()
+    let agentUserId = normalizedString(payload["userId"] ?? payload["user_id"] ?? payload["id"])
+    let text = normalizedString(payload["text"]) ?? ""
+    let progressNodes = (payload["progressNodes"] as? [[String: Any]]) ?? []
+
+    if status == "done" || status == "error" || status == "stopped" {
+      // Keep the accumulated text but stop the live indicator. The persisted
+      // message (or its absence, on failure) takes over from here.
+      mutateLiveMessagePayloadLocked(chatId: chatId, messageId: streamId) { message in
+        message["isStreaming"] = false
+        var metadata = (message["metadata"] as? [String: Any]) ?? [:]
+        metadata["isStreaming"] = false
+        message["metadata"] = metadata
+      }
+      postChangeLocked(
+        reason: "chatMessageInserted",
+        userInfo: ["chatId": chatId, "messageId": streamId, "state": statusSnapshotLocked()]
+      )
+      return
+    }
+
+    // Stable timestamp so the bubble holds its position as text grows.
+    var perChat = agentStreamTimestampsByChat[chatId] ?? [:]
+    let timestampMs = perChat[streamId] ?? Int64(nowMs())
+    perChat[streamId] = timestampMs
+    agentStreamTimestampsByChat[chatId] = perChat
+
+    var synthetic: [String: Any] = [
+      "id": streamId,
+      "type": "text",
+      "timestamp": timestampMs,
+      "isAgentMessage": true,
+      "plainContent": text,
+      "metadata": [
+        "progressNodes": progressNodes,
+        "agentWorkerVia": "bridge",
+        "isStreaming": true,
+      ],
+    ]
+    if let agentUserId {
+      synthetic["fromId"] = agentUserId
+      synthetic["agentUserId"] = agentUserId
+    }
+
+    _ = applyNativeIncomingMessageEventLocked(chatId: chatId, payload: synthetic)
+    mutateLiveMessagePayloadLocked(chatId: chatId, messageId: streamId) { message in
+      message["isStreaming"] = true
+    }
+    postChangeLocked(
+      reason: "chatMessageInserted",
+      userInfo: ["chatId": chatId, "messageId": streamId, "state": statusSnapshotLocked()]
+    )
+  }
+
+  private func removeAgentStreamRowsLocked(chatId: String, agentUserId: String?) {
+    guard var perChat = liveMessageRowsByChat[chatId], !perChat.isEmpty else { return }
+    let targetAgent = normalizedUpper(agentUserId)
+    let streamIds = perChat.keys.filter { $0.hasPrefix("stream-") }
+    guard !streamIds.isEmpty else { return }
+    var removedAny = false
+    for streamId in streamIds {
+      if let targetAgent {
+        let rowAgent = normalizedUpper(
+          (perChat[streamId]?["message"] as? [String: Any])?["agentUserId"]
+            ?? (perChat[streamId]?["message"] as? [String: Any])?["fromId"])
+        // Only remove a streaming row that belongs to the agent that just posted.
+        if let rowAgent, rowAgent != targetAgent { continue }
+      }
+      perChat.removeValue(forKey: streamId)
+      removedAny = true
+    }
+    guard removedAny else { return }
+    if perChat.isEmpty {
+      liveMessageRowsByChat.removeValue(forKey: chatId)
+    } else {
+      liveMessageRowsByChat[chatId] = perChat
+    }
+    agentStreamTimestampsByChat.removeValue(forKey: chatId)
+  }
+
   private func emitAgentProgressChangeLocked(
     chatId: String,
     state: AgentProgressState?,
@@ -4334,6 +4430,10 @@ final class ChatEngine {
           }
           return
         }
+        if frame.event == "agent-stream" {
+          self.applyAgentStreamLocked(chatId: chatId, payload: frame.payload)
+          return
+        }
         if frame.event == "typing" || frame.event == "stop-typing" {
           let typing = frame.event == "typing"
           let payloadUserId = self.normalizedUpper(
@@ -4413,6 +4513,8 @@ final class ChatEngine {
             || fromId?.lowercased() == Self.agentUserId
           if isAgentMessage {
             self.clearAgentProgressLocked(chatId: chatId, status: "done")
+            // The persisted message supersedes any live streaming bubble for this agent.
+            self.removeAgentStreamRowsLocked(chatId: chatId, agentUserId: fromId)
           }
 
           let myUserId = self.normalizedUpper(self.getConfigValueLocked("userId"))

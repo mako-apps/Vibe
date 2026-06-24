@@ -1170,15 +1170,17 @@ defmodule Vibe.AI.LocalAgentWorker do
     tool = normalize_string(block["name"]) || "tool"
     input = block["input"] || %{}
 
-    event = %{
-      "id" => id,
-      "provider" => "claude",
-      "tool" => tool,
-      "label" => tool_label("Claude", tool, input),
-      "status" => "running",
-      "input" => safe_payload(input),
-      "providerEventType" => "tool_use"
-    }
+    event =
+      %{
+        "id" => id,
+        "provider" => "claude",
+        "tool" => tool,
+        "label" => tool_label("Claude", tool, input),
+        "status" => "running",
+        "input" => safe_payload(input),
+        "providerEventType" => "tool_use"
+      }
+      |> put_node_shape(tool, input)
 
     {Map.put(events_by_id, id, event), append_once(order, id)}
   end
@@ -1252,6 +1254,7 @@ defmodule Vibe.AI.LocalAgentWorker do
       "outputPreview" => safe_text(codex_tool_output(item)),
       "providerEventType" => normalize_string(event["type"]) || item_type
     }
+    |> put_node_shape(tool, input)
   end
 
   defp codex_toolish_event?(event, item, item_type) do
@@ -1392,8 +1395,138 @@ defmodule Vibe.AI.LocalAgentWorker do
         "status" => event["status"] || "running",
         "depth" => 0
       }
+      |> copy_node_shape(event)
     end)
   end
+
+  # ── Claude-Code-style node shape (kind / target / patch stats) ──────
+  # Enrich a tool event with the structured fields the app renders as a live
+  # read/edit/patch feed inside the chat bubble. Computed from the RAW tool
+  # input (before truncation) so patch line counts are accurate.
+  defp put_node_shape(event, tool, input) do
+    {kind, target} = tool_kind_and_target(tool, input)
+
+    event =
+      event
+      |> Map.put("kind", kind)
+      |> maybe_put("target", target)
+
+    case patch_stats(tool, input) do
+      {added, removed} when added > 0 or removed > 0 ->
+        event |> Map.put("added", added) |> Map.put("removed", removed)
+
+      _ ->
+        event
+    end
+  end
+
+  # Copy the structured shape fields from a tool event onto a progress node.
+  defp copy_node_shape(node, event) do
+    ["kind", "target", "added", "removed"]
+    |> Enum.reduce(node, fn key, acc ->
+      case Map.get(event, key) do
+        nil -> acc
+        value -> Map.put(acc, key, value)
+      end
+    end)
+  end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, _key, ""), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  # Map a provider tool name + input to a coarse kind and a short target
+  # (file basename, command, pattern, url…) for compact display.
+  defp tool_kind_and_target(tool, input) when is_map(input) do
+    t = tool |> to_string() |> String.downcase()
+    path = input["file_path"] || input["filePath"] || input["path"] || input["notebook_path"]
+
+    cond do
+      t in ["read", "notebookread", "view", "cat", "open"] ->
+        {"read", target_basename(path)}
+
+      t in ["edit", "multiedit", "notebookedit", "str_replace", "str_replace_editor", "update", "apply_patch", "applypatch"] ->
+        {"edit", target_basename(path)}
+
+      t in ["write", "create", "createfile", "new_file"] ->
+        {"write", target_basename(path)}
+
+      t in ["bash", "shell", "exec", "run", "command", "terminal"] ->
+        {"bash", short_target(input["command"] || input["cmd"])}
+
+      t in ["grep", "search", "glob", "find", "ripgrep", "rg"] ->
+        {"search", short_target(input["pattern"] || input["query"] || path)}
+
+      t in ["webfetch", "websearch", "fetch", "web_search", "web_fetch", "browse"] ->
+        {"web", short_target(input["url"] || input["query"] || input["domain"])}
+
+      t in ["task", "agent", "dispatch_agent"] ->
+        {"task", short_target(input["description"] || input["prompt"])}
+
+      t in ["todowrite", "todo"] ->
+        {"todo", nil}
+
+      true ->
+        {"tool", target_basename(path) || short_target(input["command"])}
+    end
+  end
+
+  defp tool_kind_and_target(tool, _input), do: {to_string(tool) |> String.downcase(), nil}
+
+  defp target_basename(path) when is_binary(path) do
+    case Path.basename(String.trim(path)) do
+      "" -> nil
+      base -> base
+    end
+  end
+
+  defp target_basename(_), do: nil
+
+  defp short_target(value) do
+    value
+    |> safe_text()
+    |> normalize_string()
+    |> case do
+      nil -> nil
+      text -> text |> String.replace(~r/\s+/, " ") |> truncate(80)
+    end
+  end
+
+  # Approximate added/removed line counts for file-mutating tools, mirroring
+  # Claude Code's +N/−M. nil for non-mutating tools.
+  defp patch_stats(tool, input) when is_map(input) do
+    t = tool |> to_string() |> String.downcase()
+
+    cond do
+      t in ["write", "create", "createfile", "new_file"] ->
+        {line_count(input["content"] || input["file_text"] || input["text"]), 0}
+
+      t in ["edit", "notebookedit", "str_replace", "str_replace_editor", "update"] ->
+        {line_count(input["new_string"] || input["newString"] || input["new_str"] || input["new_source"]),
+         line_count(input["old_string"] || input["oldString"] || input["old_str"] || input["old_source"])}
+
+      t in ["multiedit"] ->
+        (input["edits"] || [])
+        |> Enum.reduce({0, 0}, fn edit, {add, del} ->
+          {add + line_count(edit["new_string"] || edit["newString"]),
+           del + line_count(edit["old_string"] || edit["oldString"])}
+        end)
+
+      true ->
+        nil
+    end
+  end
+
+  defp patch_stats(_tool, _input), do: nil
+
+  defp line_count(value) when is_binary(value) do
+    case String.trim_trailing(value, "\n") do
+      "" -> 0
+      trimmed -> trimmed |> String.split("\n") |> length()
+    end
+  end
+
+  defp line_count(_), do: 0
 
   defp progress_event_from_line(line, worker) do
     with {:ok, event} when is_map(event) <- Jason.decode(line),

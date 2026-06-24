@@ -40,7 +40,7 @@ try {
 
 const CONFIG_DIR = path.join(os.homedir(), ".vibe");
 const CONFIG_FILE = path.join(CONFIG_DIR, "bridge.json");
-const MAX_PROGRESS_LINES = 60; // cap chatter per task
+const MAX_PROGRESS_LINES = 400; // safety cap on streamed events per task
 const MAX_LINE_BYTES = 8 * 1024;
 
 function parseArgs(argv) {
@@ -703,6 +703,19 @@ function looksToolish(line) {
   );
 }
 
+// Forward a line live if it carries assistant TEXT or tool activity, so the
+// server can stream a live bubble (not just the final batch). System/init lines
+// are skipped. The server is the source of truth for parsing — we stay thin.
+function streamable(line) {
+  return (
+    looksToolish(line) ||
+    line.includes('"text"') || // claude assistant text blocks
+    line.includes('"assistant"') ||
+    line.includes('"agent_message"') || // codex agent text
+    line.includes('"item"') // codex item events
+  );
+}
+
 function runTask(channel, task) {
   const { provider, chatId, prompt, replyToId, requesterUserId } = task;
   console.log(
@@ -755,7 +768,7 @@ function runTask(channel, task) {
       if (!line) continue;
       const sid = captureSessionId(line);
       if (sid) sessionByChat.set(chatId, sid);
-      if (progressCount < MAX_PROGRESS_LINES && line.length <= MAX_LINE_BYTES && looksToolish(line)) {
+      if (progressCount < MAX_PROGRESS_LINES && line.length <= MAX_LINE_BYTES && streamable(line)) {
         progressCount++;
         channel.push("progress", { provider, chatId, line });
       }

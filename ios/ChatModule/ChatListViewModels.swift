@@ -74,6 +74,12 @@ struct ChatListRow {
     let label: String
     let status: String
     let depth: Int
+    // Claude-Code-style shape for the live tool feed (optional; older payloads
+    // only carry label/status/depth).
+    var kind: String? = nil
+    var target: String? = nil
+    var added: Int? = nil
+    var removed: Int? = nil
   }
 
   struct AgentCardDestination: Codable, Equatable {
@@ -1154,7 +1160,11 @@ private func parseAgentProgressNodes(_ raw: Any?) -> [ChatListRow.AgentProgressN
       id: id,
       label: label,
       status: status,
-      depth: max(0, depth)
+      depth: max(0, depth),
+      kind: parseNonEmptyString(item["kind"])?.lowercased(),
+      target: parseNonEmptyString(item["target"]),
+      added: parseLong(item["added"]).map { Int($0) },
+      removed: parseLong(item["removed"]).map { Int($0) }
     )
   }
 }
