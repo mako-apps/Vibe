@@ -104,6 +104,11 @@ defmodule VibeWeb.AgentBridgeChannel do
             reply_to_id: reply_to_id,
             requester_user_id: requester_user_id
           )
+        rescue
+          err ->
+            Logger.error(
+              "[AgentBridge] deliver_bridge_result crashed chat=#{chat_id} provider=#{provider} error=#{Exception.message(err)}\n#{Exception.format(:error, err, __STACKTRACE__)}"
+            )
         after
           LocalAgentWorker.stop_activity(chat_id, agent_user_id_for(provider))
         end

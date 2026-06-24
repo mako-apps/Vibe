@@ -374,25 +374,42 @@ defmodule Vibe.AI.LocalAgentWorker do
         # build on it next turn. Only on success — don't pollute memory with errors.
         if ok, do: note_bridge_agent_turn(chat_id, worker, base_text, requester_user_id)
 
-        post_worker_message(
-          worker,
-          chat_id,
-          body,
-          %{
-            "agentWorker" => true,
-            "agentWorkerProvider" => worker.handle,
-            "agentWorkerVia" => "bridge",
-            "agentWorkerExitStatus" => exit_status,
-            "agentWorkerDurationMs" => duration_ms,
-            "agentWorkerOk" => ok,
-            "agentWorkerToolEvents" => extracted.tool_events,
-            "agentWorkerAvailableTools" => extracted.available_tools,
-            "agentWorkerRawEventCount" => extracted.raw_event_count,
-            "progressNodes" => extracted.progress_nodes
-          },
-          reply_to_id,
-          requester_user_id
+        Logger.info(
+          "[AgentBridge] deliver chat=#{chat_id} provider=#{worker.handle} ok=#{ok} rawEvents=#{extracted.raw_event_count} baseTextLen=#{String.length(base_text || "")} bodyLen=#{String.length(body || "")}"
         )
+
+        result =
+          post_worker_message(
+            worker,
+            chat_id,
+            body,
+            %{
+              "agentWorker" => true,
+              "agentWorkerProvider" => worker.handle,
+              "agentWorkerVia" => "bridge",
+              "agentWorkerExitStatus" => exit_status,
+              "agentWorkerDurationMs" => duration_ms,
+              "agentWorkerOk" => ok,
+              "agentWorkerToolEvents" => extracted.tool_events,
+              "agentWorkerAvailableTools" => extracted.available_tools,
+              "agentWorkerRawEventCount" => extracted.raw_event_count,
+              "progressNodes" => extracted.progress_nodes
+            },
+            reply_to_id,
+            requester_user_id
+          )
+
+        case result do
+          {:ok, %{message_id: mid}} ->
+            Logger.info("[AgentBridge] deliver posted chat=#{chat_id} message_id=#{mid}")
+
+          other ->
+            Logger.error(
+              "[AgentBridge] deliver FAILED chat=#{chat_id} provider=#{worker.handle} reason=#{inspect(other)}"
+            )
+        end
+
+        result
     end
   end
 
