@@ -338,6 +338,10 @@ defmodule VibeWeb.ChatChannel do
 
     attachment_context = extract_agent_attachment_context(chat_id, data, user_id)
 
+    Logger.info(
+      "[ChatChannel] dispatch_resolve chat_id=#{chat_id} room_type=#{room_type} reserved=#{length(reserved_workers)} standalone=#{not is_nil(standalone_agent)} local_worker=#{if local_worker, do: local_worker.handle, else: "nil"} dispatch_text?=#{is_binary(dispatch_text)} agent_text?=#{is_binary(agent_text) and String.trim(to_string(agent_text)) != ""} mentioned_username=#{inspect(mentioned_agent_username)} participants=#{inspect(Chat.get_participant_ids(chat_id))}"
+    )
+
     cond do
       room_type != "dm" and is_nil(standalone_agent) and length(reserved_workers) > 1 and
           is_binary(dispatch_text) ->

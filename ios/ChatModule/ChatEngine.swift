@@ -1825,6 +1825,11 @@ final class ChatEngine {
       let peerUserId = peerUserIdHint ?? chatPeerUserIdsByChatId[chatId]
       let peerAgentId = explicitPeerAgentId ?? resolvePeerAgentIdLocked(
         chatId: chatId, peerUserIdHint: peerUserId)
+      NSLog(
+        "[AgentRoute] sendMessage routing chatId=%@ messageId=%@ explicitPeerAgentId=%@ resolvedPeerAgentId=%@ peerUserId=%@ willRoute=%@",
+        chatId, messageId, explicitPeerAgentId ?? "nil", peerAgentId ?? "nil",
+        peerUserId ?? "nil",
+        (peerAgentId?.isEmpty == false) ? "agent-cleartext" : "e2e-peer")
 
       // ── Build + emit optimistic row FIRST so message bubble appears instantly ──
       let optimisticStartMs = nowMs()

@@ -417,6 +417,12 @@ struct ChatRoute: Identifiable, Hashable {
 
   init(row: ChatHomeListRow) {
     let cachedRows = row.initialMessages.isEmpty ? row.previewRows : row.initialMessages
+    let resolvedBridge = ChatRoute.resolveBridgeProvider(
+      peerUserId: row.peerUserId, name: row.title, isAgent: row.isAgentFriend)
+    NSLog(
+      "[AgentRoute] ChatRoute(row:) chatId=%@ title=%@ peerUserId=%@ peerAgentId=%@ isAgentFriend=%@ resolvedBridge=%@",
+      row.chatId, row.title, row.peerUserId ?? "nil", row.peerAgentId ?? "nil",
+      row.isAgentFriend ? "true" : "false", resolvedBridge ?? "nil")
     self.init(
       chatId: row.chatId,
       title: row.title,
@@ -3216,6 +3222,8 @@ final class ChatConversationController: UIViewController {
     // sends to the agent backend (peerAgentId) instead of E2E-encrypting to a
     // human peer. Empty string clears it for normal peer/group chats.
     mainView.setEnginePeerAgentId(route.peerAgentId ?? "")
+    appShellRouteLog(
+      "ChatConversationController agentRouting chatId=\(route.chatId) peerUserId=\(route.peerUserId ?? "nil") peerAgentId=\(route.peerAgentId ?? "nil") bridgeProvider=\(route.bridgeProvider ?? "nil") isAgent=\(route.isAgent) isAgentChat=\(route.isAgentChat)")
     // Inbox mode: when the attached agent batches events, the chat view keeps the
     // transcript clean and surfaces event notifications behind the Inbox banner.
     mainView.setAgentEventInboxMode(enabled: route.isAgentInboxMode)
