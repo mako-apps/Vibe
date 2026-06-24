@@ -3,6 +3,7 @@ defmodule VibeWeb.ChatController do
   alias Vibe.Chat
   alias Vibe.Accounts
   alias Vibe.Agents
+  alias Vibe.AI.LocalAgentWorker
   require Logger
 
   def create(conn, %{"friendId" => friend_id}) do
@@ -14,7 +15,10 @@ defmodule VibeWeb.ChatController do
         conn |> put_status(:not_found) |> json(%{error: "User not found"})
 
       %{is_agent: true} ->
-        if Agents.published_agent_user?(friend_id) do
+        # Published standalone agents OR the reserved computer-bridge workers
+        # (Claude/Codex — agent users with no Agent record) can be DM'd.
+        if Agents.published_agent_user?(friend_id) or
+             LocalAgentWorker.resolve_by_agent_user_id(friend_id) != nil do
           do_create_chat(conn, my_id, friend_id)
         else
           conn |> put_status(:forbidden) |> json(%{error: "Agent not available"})

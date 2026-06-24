@@ -1336,6 +1336,9 @@ private struct ChatHomeScreen: View {
   @State private var errorMessage: String?
   @State private var homeSearchQuery = ""
   @State private var isHomeSearchFocused = false
+  /// Global username/phone/ID lookups (incl. Claude/Codex) for the search drawer.
+  @State private var globalResults: [ContactSearchUser] = []
+  @State private var isGlobalSearching = false
 
   private var palette: AppThemePalette {
     AppThemePalette.resolve(for: colorScheme)
@@ -1348,6 +1351,68 @@ private struct ChatHomeScreen: View {
       row.title.localizedCaseInsensitiveContains(query)
         || row.preview.localizedCaseInsensitiveContains(query)
     }
+  }
+
+  private var trimmedHomeQuery: String {
+    homeSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  /// Claude/Codex surfaced instantly on a username prefix (no network). They are
+  /// real users but the exact-match `/user/name/:username` lookup only hits on the
+  /// full handle, so we offer them as soon as the user starts typing "cl"/"co".
+  private func agentSuggestions(for query: String) -> [ContactSearchUser] {
+    let q = query.lowercased()
+    guard !q.isEmpty else { return [] }
+    let agents = [
+      (ChatRoute.claudeAgentUserId, "claude"),
+      (ChatRoute.codexAgentUserId, "codex"),
+    ]
+    return agents.compactMap { uid, uname in
+      guard uname.hasPrefix(q) else { return nil }
+      return ContactSearchUser(payload: ["userId": uid, "username": uname, "isAgent": true])
+    }
+  }
+
+  /// People to show in the search drawer: agent suggestions + global lookups,
+  /// de-duplicated and minus anyone already listed under "Chats".
+  private var combinedPeopleResults: [ContactSearchUser] {
+    var seen = Set<String>()
+    var out: [ContactSearchUser] = []
+    for user in agentSuggestions(for: trimmedHomeQuery) + globalResults {
+      if seen.insert(user.userID.uppercased()).inserted { out.append(user) }
+    }
+    let existingPeerIds = Set(filteredRows.compactMap { $0.peerUserId?.uppercased() })
+    return out.filter { !existingPeerIds.contains($0.userID.uppercased()) }
+  }
+
+  @MainActor
+  private func runGlobalSearch() async {
+    let q = trimmedHomeQuery
+    guard q.count >= 2 else {
+      globalResults = []
+      return
+    }
+    try? await Task.sleep(nanoseconds: 300_000_000)
+    if Task.isCancelled { return }
+    guard let config = AppSessionConfig.current else { return }
+    isGlobalSearching = true
+    defer { isGlobalSearching = false }
+    let found = (try? await ContactSearchService.search(config: config, query: q)) ?? []
+    if Task.isCancelled { return }
+    globalResults = found
+  }
+
+  private func openLocalChatRow(_ row: ChatHomeListRow) {
+    if !row.isBuiltInAgentSurface, !row.initialMessages.isEmpty {
+      ChatEngine.shared.seedRecentChatHistory(
+        chatId: row.chatId, messages: row.initialMessages, limit: 3)
+    }
+    coordinator.openChat(ChatRoute(row: row))
+  }
+
+  private func handleGlobalUserTap(_ user: ContactSearchUser) {
+    isHomeSearchFocused = false
+    Task { _ = await openChat(for: user) }
   }
 
   var body: some View {
@@ -1433,6 +1498,9 @@ private struct ChatHomeScreen: View {
       AppUITrace.notice("ChatHomeScreen task loadIfNeeded")
       await model.loadIfNeeded()
     }
+    .task(id: homeSearchQuery) {
+      await runGlobalSearch()
+    }
     .onAppear {
       AppUITrace.notice(
         "ChatHomeScreen onAppear rows=\(model.rows.count) searchRequest=\(coordinator.chatSearchPresentationRequestID)"
@@ -1467,7 +1535,9 @@ private struct ChatHomeScreen: View {
 
   @ViewBuilder
   private var listContent: some View {
-    if model.rows.isEmpty && (!model.hasLoaded || model.isLoading) {
+    if !trimmedHomeQuery.isEmpty {
+      searchResultsView
+    } else if model.rows.isEmpty && (!model.hasLoaded || model.isLoading) {
       ProgressView()
         .controlSize(.regular)
         .tint(palette.secondaryText)
@@ -1539,6 +1609,50 @@ private struct ChatHomeScreen: View {
     }
   }
 
+
+  @ViewBuilder
+  private var searchResultsView: some View {
+    let chats = filteredRows
+    let people = combinedPeopleResults
+    if chats.isEmpty && people.isEmpty {
+      ContactSearchStatusView(
+        isLoading: isGlobalSearching,
+        hasSearched: !isGlobalSearching,
+        message: isGlobalSearching ? "" : "No chats or people match \"\(trimmedHomeQuery)\".",
+        palette: palette
+      )
+      .frame(maxWidth: .infinity, maxHeight: .infinity)
+      .background(palette.background)
+    } else {
+      List {
+        if !chats.isEmpty {
+          Section(header: Text("Chats").foregroundStyle(palette.secondaryText)) {
+            ForEach(chats, id: \.chatId) { row in
+              Button { openLocalChatRow(row) } label: {
+                HomeSearchChatRow(row: row, palette: palette)
+              }
+              .buttonStyle(.plain)
+              .listRowBackground(palette.background)
+            }
+          }
+        }
+        if !people.isEmpty {
+          Section(header: Text("People").foregroundStyle(palette.secondaryText)) {
+            ForEach(people) { user in
+              Button { handleGlobalUserTap(user) } label: {
+                ContactSearchResultRow(user: user, isSaved: false, palette: palette)
+              }
+              .buttonStyle(.plain)
+              .listRowBackground(palette.background)
+            }
+          }
+        }
+      }
+      .listStyle(.plain)
+      .scrollContentBackground(.hidden)
+      .background(palette.background)
+    }
+  }
 
   private func toggleHomeSelection(_ chatID: String) {
     AppUITrace.notice(
@@ -4748,6 +4862,43 @@ private struct ContactSearchView: View {
       hasSearched = true
       statusText = error.localizedDescription
     }
+  }
+}
+
+/// Compact existing-chat row for the Home search drawer ("Chats" section).
+private struct HomeSearchChatRow: View {
+  let row: ChatHomeListRow
+  let palette: AppThemePalette
+
+  var body: some View {
+    HStack(spacing: 12) {
+      Circle()
+        .fill(palette.background)
+        .frame(width: 44, height: 44)
+        .overlay {
+          Text(String(row.title.prefix(1)).uppercased())
+            .font(.system(size: 18, weight: .semibold))
+            .foregroundStyle(palette.accent)
+        }
+
+      VStack(alignment: .leading, spacing: 2) {
+        Text(row.title)
+          .font(.system(size: 16, weight: .medium))
+          .foregroundStyle(palette.text)
+          .lineLimit(1)
+        Text(row.preview)
+          .font(.footnote)
+          .foregroundStyle(palette.secondaryText)
+          .lineLimit(1)
+      }
+
+      Spacer(minLength: 8)
+      Image(systemName: "chevron.right")
+        .font(.system(size: 13, weight: .semibold))
+        .foregroundStyle(palette.secondaryText.opacity(0.6))
+    }
+    .padding(.vertical, 4)
+    .contentShape(Rectangle())
   }
 }
 
