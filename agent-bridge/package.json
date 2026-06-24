@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "phoenix": "^1.7.0",
+    "qrcode-terminal": "^0.12.0",
     "ws": "^8.16.0"
   },
   "license": "MIT"

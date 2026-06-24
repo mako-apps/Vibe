@@ -23,7 +23,115 @@ defmodule Vibe.AgentBridge do
   alias Vibe.AgentBridge.Connection
 
   @pairing_table :agent_bridge_pairings
+  @request_table :agent_bridge_requests
   @pairing_ttl_ms 10 * 60 * 1000
+  @request_ttl_ms 10 * 60 * 1000
+
+  # ── Scan-to-pair (daemon-initiated; the phone scans the desktop QR) ──
+
+  @doc """
+  Create a pairing request initiated by the daemon (desktop). Returns a public
+  `request_id` (encoded into the QR the desktop shows) plus a private
+  `device_secret` the daemon keeps to later claim its token. The authenticated
+  phone scans the QR and calls `authorize_request/2`; the daemon then redeems
+  the parked token with `claim_request/2`.
+  """
+  def create_request(device_label \\ "computer") do
+    ensure_table(@request_table)
+    request_id = generate_token(18)
+    device_secret = generate_token(24)
+    expires_at = System.system_time(:millisecond) + @request_ttl_ms
+
+    :ets.insert(
+      @request_table,
+      {request_id,
+       %{
+         device_hash: hash_token(device_secret),
+         device_label: normalize(device_label) || "computer",
+         status: :pending,
+         user_id: nil,
+         bridge_token: nil,
+         expires_at: expires_at
+       }}
+    )
+
+    %{
+      request_id: request_id,
+      device_secret: device_secret,
+      expires_in: div(@request_ttl_ms, 1000)
+    }
+  end
+
+  @doc """
+  Authorize a pending request for `user_id` — called by the authenticated phone
+  right after it scans the QR. Mints the bridge token now and parks it (in ETS)
+  for the daemon to claim.
+  """
+  def authorize_request(request_id, user_id)
+      when is_binary(request_id) and is_binary(user_id) and user_id != "" do
+    ensure_table(@request_table)
+    now = System.system_time(:millisecond)
+
+    case :ets.lookup(@request_table, request_id) do
+      [{^request_id, %{status: :pending, expires_at: exp} = req}] when exp > now ->
+        case mint_token(user_id, req.device_label) do
+          {:ok, %{bridge_token: token}} ->
+            :ets.insert(
+              @request_table,
+              {request_id, %{req | status: :authorized, user_id: user_id, bridge_token: token}}
+            )
+
+            :ok
+
+          {:error, _} = err ->
+            err
+        end
+
+      [{^request_id, %{status: :authorized}}] ->
+        {:error, :already_authorized}
+
+      [{^request_id, _expired}] ->
+        :ets.delete(@request_table, request_id)
+        {:error, :expired}
+
+      _ ->
+        {:error, :invalid_request}
+    end
+  end
+
+  def authorize_request(_, _), do: {:error, :invalid_request}
+
+  @doc """
+  Claim the parked bridge token for an authorized request — called by the daemon,
+  proving ownership with its `device_secret`. Single use.
+  """
+  def claim_request(request_id, device_secret)
+      when is_binary(request_id) and is_binary(device_secret) do
+    ensure_table(@request_table)
+    now = System.system_time(:millisecond)
+
+    case :ets.lookup(@request_table, request_id) do
+      [{^request_id, %{expires_at: exp}}] when exp <= now ->
+        :ets.delete(@request_table, request_id)
+        {:error, :expired}
+
+      [{^request_id, %{status: :authorized, device_hash: dh, user_id: uid, bridge_token: token}}] ->
+        if Plug.Crypto.secure_compare(hash_token(device_secret), dh) do
+          :ets.delete(@request_table, request_id)
+          {:ok, %{user_id: uid, bridge_token: token}}
+        else
+          {:error, :invalid}
+        end
+
+      [{^request_id, %{status: :pending}}] ->
+        {:error, :pending}
+
+      _ ->
+        {:error, :invalid_request}
+    end
+  end
+
+  def claim_request(_, _), do: {:error, :invalid_request}
 
   # ── Pairing codes (ephemeral, ETS) ──────────────────────────────────
 
@@ -32,7 +140,7 @@ defmodule Vibe.AgentBridge do
   app composes the QR / install command from its known server URL.
   """
   def request_pairing(user_id) when is_binary(user_id) and user_id != "" do
-    ensure_table()
+    ensure_table(@pairing_table)
     code = generate_pairing_code()
     expires_at = System.system_time(:millisecond) + @pairing_ttl_ms
     :ets.insert(@pairing_table, {code, %{user_id: user_id, expires_at: expires_at}})
@@ -45,7 +153,7 @@ defmodule Vibe.AgentBridge do
   mints a long-lived bridge token bound to the code's user.
   """
   def redeem_pairing(code, device_label \\ "computer") when is_binary(code) do
-    ensure_table()
+    ensure_table(@pairing_table)
     now = System.system_time(:millisecond)
 
     case :ets.lookup(@pairing_table, code) do
@@ -166,10 +274,14 @@ defmodule Vibe.AgentBridge do
     :crypto.strong_rand_bytes(9) |> Base.url_encode64(padding: false)
   end
 
-  defp ensure_table do
-    case :ets.whereis(@pairing_table) do
+  defp generate_token(bytes) do
+    :crypto.strong_rand_bytes(bytes) |> Base.url_encode64(padding: false)
+  end
+
+  defp ensure_table(table) do
+    case :ets.whereis(table) do
       :undefined ->
-        :ets.new(@pairing_table, [:set, :public, :named_table, {:read_concurrency, true}])
+        :ets.new(table, [:set, :public, :named_table, {:read_concurrency, true}])
         :ok
 
       _ ->

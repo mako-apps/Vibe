@@ -57,6 +57,10 @@ defmodule VibeWeb.Router do
 
     # Agent bridge daemon redeems a pairing code (no user auth — code-scoped).
     post "/agent-bridge/pair", AgentBridgeController, :pair
+    # Scan-to-pair (desktop shows QR, phone scans): daemon starts a request and
+    # later claims the token with its device_secret (both unauth, secret-scoped).
+    post "/agent-bridge/request", AgentBridgeController, :start_request
+    post "/agent-bridge/claim", AgentBridgeController, :claim
   end
 
   scope "/api", VibeWeb do
@@ -186,6 +190,8 @@ defmodule VibeWeb.Router do
 
     # Agent Bridge (pair your own computer to run @claude / @codex locally)
     post "/agent-bridge/pairing", AgentBridgeController, :request_pairing
+    # Phone authorizes a scanned desktop pairing request (binds it to this user).
+    post "/agent-bridge/authorize", AgentBridgeController, :authorize
     get "/agent-bridge/status", AgentBridgeController, :status
     delete "/agent-bridge", AgentBridgeController, :revoke
 

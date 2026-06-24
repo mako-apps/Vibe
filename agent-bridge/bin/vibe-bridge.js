@@ -88,6 +88,70 @@ async function redeemPairing(server, code, label) {
   return res.json(); // { bridge_token, user_id }
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function startPairRequest(server, label) {
+  const res = await fetch(`${server}/api/agent-bridge/request`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ device_label: label || os.hostname() }),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`could not start pairing (${res.status}): ${body}`);
+  }
+  return res.json(); // { request_id, device_secret, expires_in }
+}
+
+async function claimPairToken(server, requestId, deviceSecret) {
+  const res = await fetch(`${server}/api/agent-bridge/claim`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ request_id: requestId, device_secret: deviceSecret }),
+  });
+  if (res.status === 202) return null; // still pending — phone hasn't scanned yet
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`claim failed (${res.status}): ${body}`);
+  }
+  return res.json(); // { bridge_token, user_id }
+}
+
+function renderQR(payload) {
+  try {
+    require("qrcode-terminal").generate(payload, { small: true });
+  } catch (_) {
+    console.log("(Tip: `npm i qrcode-terminal` in this folder for a scannable QR.)");
+  }
+  console.log(`\n  manual code: ${payload}\n`);
+}
+
+// Desktop-shows-QR / phone-scans pairing (WhatsApp-Web style). The daemon holds
+// a private device_secret; the QR only carries the public request_id, so anyone
+// who merely sees the QR cannot claim the token.
+async function scanToPair(server, label) {
+  const { request_id, device_secret, expires_in } = await startPairRequest(server, label);
+  console.log(
+    "\n[vibe-bridge] In Vibe on your phone: open Claude or Codex → Connect → Scan, then scan this:\n"
+  );
+  renderQR(`vibegram-pair:${request_id}`);
+  console.log(`[vibe-bridge] Waiting for your phone to authorize (expires in ${expires_in}s)…`);
+
+  const deadline = Date.now() + expires_in * 1000;
+  while (Date.now() < deadline) {
+    await sleep(2500);
+    const result = await claimPairToken(server, request_id, device_secret);
+    if (result && result.bridge_token) {
+      process.stdout.write("\n");
+      return result;
+    }
+    process.stdout.write(".");
+  }
+  throw new Error("pairing timed out — re-run to get a fresh code");
+}
+
 // ── Running claude / codex ──────────────────────────────────────────
 
 const sessionByChat = new Map(); // chatId -> claude session_id
@@ -248,8 +312,10 @@ const ARGS = parseArgs(process.argv);
 async function main() {
   if (ARGS.help) {
     console.log(
-      "Usage: vibegram-bridge --code <PAIRING_CODE> --server <https://vibe-server>\n" +
-        "       vibegram-bridge --server <https://vibe-server>   (uses cached token)\n" +
+      "Usage: vibegram-bridge --server <https://vibe-server>\n" +
+        "         shows a QR — scan it in the Vibe app (Claude/Codex → Connect → Scan)\n" +
+        "       vibegram-bridge --code <PAIRING_CODE> --server <...>   (manual code flow)\n" +
+        "       vibegram-bridge --server <...>   (reuses cached token)\n" +
         "       vibegram-bridge --logout\n\n" +
         "Env: VIBE_CLAUDE_PERMISSION_MODE (default plan), VIBE_CODEX_SANDBOX (default read-only),\n" +
         "     VIBE_CLAUDE_MODEL, VIBE_CODEX_MODEL, VIBE_CLAUDE_COMMAND, VIBE_CODEX_COMMAND"
@@ -285,10 +351,11 @@ async function main() {
   }
 
   if (!token || !userId) {
-    console.error(
-      "[vibe-bridge] Not paired. Open Claude or Codex in the Vibe app, tap Connect, and run this with --code <CODE>."
-    );
-    process.exit(1);
+    const result = await scanToPair(server, ARGS.label);
+    token = result.bridge_token;
+    userId = result.user_id;
+    saveConfig({ server, bridge_token: token, user_id: userId });
+    console.log("[vibe-bridge] paired ✓ (token cached in ~/.vibe/bridge.json)");
   }
 
   // Persist latest server if changed.
