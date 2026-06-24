@@ -1,9 +1,12 @@
 {
-  "name": "vibe-bridge",
+  "name": "@vibegram/agent-bridge",
   "version": "0.1.0",
   "description": "Vibe agent bridge — run @claude / @codex on your own computer, driven from the Vibe app.",
   "bin": {
-    "vibe-bridge": "bin/vibe-bridge.js"
+    "vibegram-bridge": "bin/vibe-bridge.js"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "main": "bin/vibe-bridge.js",
   "engines": {

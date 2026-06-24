@@ -21,7 +21,7 @@ struct AgentPairingTicket {
 
   /// The one-liner the user runs on their computer to pair + go online.
   var command: String {
-    "npx vibe-bridge --code \(code) --server \(serverBase)"
+    "npx @vibegram/agent-bridge --code \(code) --server \(serverBase)"
   }
 
   /// Payload encoded into the QR. We embed the full command so a desktop QR

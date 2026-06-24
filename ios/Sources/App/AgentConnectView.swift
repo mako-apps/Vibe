@@ -237,7 +237,7 @@ private struct AgentConnectQRSheet: View {
               "The code is single-use and expires in ~10 minutes.",
               systemImage: "clock")
             Label(
-              "Don't have it installed? `npx` fetches vibe-bridge automatically (Node 18+).",
+              "Don't have it installed? `npx` fetches @vibegram/agent-bridge automatically (Node 18+).",
               systemImage: "shippingbox")
           }
           .font(.system(size: 12))

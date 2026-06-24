@@ -10,9 +10,9 @@
  * output back — the Vibe server parses it and posts the result into the chat.
  *
  * Usage:
- *   npx vibe-bridge --code <PAIRING_CODE> --server https://your-vibe-server
+ *   npx @vibegram/agent-bridge --code <PAIRING_CODE> --server https://your-vibe-server
  *   # subsequent runs (token cached in ~/.vibe/bridge.json):
- *   npx vibe-bridge --server https://your-vibe-server
+ *   npx @vibegram/agent-bridge --server https://your-vibe-server
  *
  * Safety: defaults to read-only execution (claude --permission-mode plan,
  * codex --sandbox read-only). Escalate explicitly via the env vars below.
@@ -248,9 +248,9 @@ const ARGS = parseArgs(process.argv);
 async function main() {
   if (ARGS.help) {
     console.log(
-      "Usage: vibe-bridge --code <PAIRING_CODE> --server <https://vibe-server>\n" +
-        "       vibe-bridge --server <https://vibe-server>   (uses cached token)\n" +
-        "       vibe-bridge --logout\n\n" +
+      "Usage: vibegram-bridge --code <PAIRING_CODE> --server <https://vibe-server>\n" +
+        "       vibegram-bridge --server <https://vibe-server>   (uses cached token)\n" +
+        "       vibegram-bridge --logout\n\n" +
         "Env: VIBE_CLAUDE_PERMISSION_MODE (default plan), VIBE_CODEX_SANDBOX (default read-only),\n" +
         "     VIBE_CLAUDE_MODEL, VIBE_CODEX_MODEL, VIBE_CLAUDE_COMMAND, VIBE_CODEX_COMMAND"
     );

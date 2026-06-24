@@ -1,4 +1,4 @@
-# vibe-bridge
+# @vibegram/agent-bridge
 
 Run `@claude` / `@codex` on **your own computer**, driven from the Vibe app.
 
@@ -12,15 +12,18 @@ In the Vibe app, open **Claude** or **Codex**, tap **Connect**, and copy the
 command shown. On your computer, inside the project you want the agent to work in:
 
 ```bash
-npx vibe-bridge --code <PAIRING_CODE> --server https://your-vibe-server
+npx @vibegram/agent-bridge --code <PAIRING_CODE> --server https://your-vibe-server
 ```
 
 After the first pairing the token is cached in `~/.vibe/bridge.json`, so later you
 can just run:
 
 ```bash
-npx vibe-bridge --server https://your-vibe-server
+npx @vibegram/agent-bridge --server https://your-vibe-server
 ```
+
+> Until the package is published to npm, run the daemon from this repo instead:
+> `node bin/vibe-bridge.js --code <PAIRING_CODE> --server https://your-vibe-server`
 
 `--logout` removes the cached token. `--cwd <path>` overrides the working
 directory (defaults to where you launched it).
