@@ -14,6 +14,7 @@ defmodule Vibe.Application do
     # This must happen before any requests can hit the RateLimiter plug
     ensure_ets_table(:rate_limiter)
     ensure_ets_table(:chat_home_cache)
+    ensure_ets_table(:local_agent_worker_ratelimit)
 
     children = [
       # Start the Telemetry supervisor
@@ -45,7 +46,10 @@ defmodule Vibe.Application do
       Vibe.Scheduler,
       Vibe.AgentDeliveryScheduler,
       # Start the Story Cleaner
-      Vibe.StoryCleaner
+      Vibe.StoryCleaner,
+      # Bounded pool for @claude / @codex local agent workers (caps concurrency + cost)
+      {Task.Supervisor,
+       name: Vibe.AI.WorkerTaskSupervisor, max_children: local_agent_worker_concurrency()}
     ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html
@@ -60,6 +64,13 @@ defmodule Vibe.Application do
   def config_change(changed, _new, removed) do
     VibeWeb.Endpoint.config_change(changed, removed)
     :ok
+  end
+
+  defp local_agent_worker_concurrency do
+    case Integer.parse(System.get_env("VIBE_AGENT_WORKER_MAX_CONCURRENCY") || "") do
+      {value, _} when value > 0 -> value
+      _ -> 3
+    end
   end
 
   defp ensure_ets_table(name) do

@@ -10,7 +10,28 @@ final class ChatEngineStore {
   private let outboundKey = "vibe.chat.engine.outbound.v1"
   private let maxJournalCount = 300
 
-  private init() {}
+  /// In-memory snapshot of the fully-reassembled config. Reads (`getConfig`) serve
+  /// from this without touching `queue` or the Keychain — critical because SwiftUI
+  /// evaluates `AppSessionConfig.current` inside `body` on the main thread on every
+  /// render, and a `queue.sync` there parks the UI behind the serial store queue +
+  /// Keychain XPC (observed as multi-second freezes). Every writer refreshes it.
+  /// Guarded by its own fast lock, independent of `queue`.
+  private let cacheLock = NSLock()
+  private var cachedConfig: [String: Any]?
+
+  private init() {
+    // Warm the cache off the main thread so the first UI read never blocks.
+    queue.async { [weak self] in
+      guard let self else { return }
+      self.updateCachedConfig(self.loadConfigLocked())
+    }
+  }
+
+  private func updateCachedConfig(_ config: [String: Any]) {
+    cacheLock.lock()
+    cachedConfig = config
+    cacheLock.unlock()
+  }
 
   func setConfig(_ payload: [String: Any]) {
     queue.sync {
@@ -21,13 +42,24 @@ final class ChatEngineStore {
             let data = try? JSONSerialization.data(withJSONObject: sanitized)
       else { return }
       self.defaults.set(data, forKey: self.configKey)
+      // Cache the reassembled view (sentinels → real secrets) so readers stay correct.
+      self.updateCachedConfig(SecureKeyStore.shared.reassemble(sanitized))
     }
   }
 
   func getConfig() -> [String: Any] {
-    queue.sync {
-      loadConfigLocked()
+    // Fast path: serve the in-memory snapshot without blocking on `queue` or the
+    // Keychain. This is what the main thread / SwiftUI `body` hits every render.
+    cacheLock.lock()
+    if let cached = cachedConfig {
+      cacheLock.unlock()
+      return cached
     }
+    cacheLock.unlock()
+    // Cold miss (before the warm-up completes): load once, then cache.
+    let loaded = queue.sync { loadConfigLocked() }
+    updateCachedConfig(loaded)
+    return loaded
   }
 
   func updateConfig(_ changes: [String: Any?]) {
@@ -47,6 +79,7 @@ final class ChatEngineStore {
     queue.sync {
       defaults.removeObject(forKey: configKey)
       SecureKeyStore.sensitiveKeys.forEach { SecureKeyStore.shared.deleteSecret(key: $0) }
+      updateCachedConfig([:])
     }
   }
 
@@ -73,6 +106,7 @@ final class ChatEngineStore {
             let data = try? JSONSerialization.data(withJSONObject: sanitized)
       else { return }
       defaults.set(data, forKey: configKey)
+      updateCachedConfig(current)
       NSLog("[ChatEngineStore] migrated legacy transportMode packet_mesh -> direct")
     }
   }
@@ -160,6 +194,8 @@ final class ChatEngineStore {
           let data = try? JSONSerialization.data(withJSONObject: sanitized)
     else { return }
     defaults.set(data, forKey: configKey)
+    // `current` already holds the reassembled config (real secrets) + changes.
+    updateCachedConfig(current)
   }
 
   private func saveJournalLocked(_ items: [[String: Any]]) {

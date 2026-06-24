@@ -601,17 +601,23 @@ defmodule Vibe.AI.Agent do
           update_current_agent_config(tool_input, agent_id, requester_user_id)
 
         tool_name == "delegate_to_subagent" ->
-          case SubagentRegistry.run(
-                 tool_input["subagent_id"],
-                 tool_input["task"],
-                 user_id: user_id,
-                 requester_user_id: requester_user_id,
-                 chat_id: chat_id,
-                 active_agent_id: agent_id,
-                 callback: callback
-               ) do
-            {:ok, payload} -> payload
-            {:error, reason} -> %{"ok" => false, "error" => inspect(reason)}
+          case maybe_fast_delegate_current_agent(tool_input, agent_id, requester_user_id) do
+            {:ok, payload} ->
+              payload
+
+            :no_match ->
+              case SubagentRegistry.run(
+                     tool_input["subagent_id"],
+                     tool_input["task"],
+                     user_id: user_id,
+                     requester_user_id: requester_user_id,
+                     chat_id: chat_id,
+                     active_agent_id: agent_id,
+                     callback: callback
+                   ) do
+                {:ok, payload} -> payload
+                {:error, reason} -> %{"ok" => false, "error" => inspect(reason)}
+              end
           end
 
         true ->
@@ -961,6 +967,113 @@ defmodule Vibe.AI.Agent do
       {:error, reason} ->
         %{"ok" => false, "error" => inbox_error_message(reason)}
     end
+  end
+
+  defp maybe_fast_delegate_current_agent(input, agent_id, requester_user_id) when is_map(input) do
+    subagent_id = normalize_tool_string(input["subagent_id"])
+    task = Map.get(input, "task")
+
+    with true <- subagent_id in ["builder_assistant", "integration_advisor"],
+         true <- current_agent_read_task?(task),
+         {:ok, agent} <- resolve_owned_agent(agent_id, requester_user_id) do
+      {:ok, current_agent_delegation_payload(subagent_id, agent, include_prompt_for_task?(task))}
+    else
+      _ -> :no_match
+    end
+  end
+
+  defp maybe_fast_delegate_current_agent(_input, _agent_id, _requester_user_id), do: :no_match
+
+  defp current_agent_read_task?(task) when is_binary(task) do
+    text =
+      task
+      |> String.downcase()
+      |> String.replace(~r/[^a-z0-9_@\s\/\.\-]+/u, " ")
+      |> String.replace(~r/\s+/u, " ")
+      |> String.trim()
+
+    text != "" and read_intent_task?(text) and current_agent_info_task?(text) and
+      not mutating_agent_task?(text)
+  end
+
+  defp current_agent_read_task?(_task), do: false
+
+  defp read_intent_task?(text) do
+    Regex.match?(
+      ~r/\b(what|where|which|who|how|show|list|read|get|fetch|check|inspect|review|tell|provide|give|return|explain|help)\b/u,
+      text
+    )
+  end
+
+  defp current_agent_info_task?(text) do
+    Regex.match?(
+      ~r/\b(current|this|agent|config|configuration|prompt|persona|name|status|tool|endpoint|url|invoke|event|webhook|integration|secret|header|chat\s*id|vibechatid|destination|env|environment|api|base\s*url|identifier|username|inbox|mode|python|curl)\b/u,
+      text
+    )
+  end
+
+  defp mutating_agent_task?(text) do
+    Regex.match?(
+      ~r/\b(create|update|change|rename|publish|disable|delete|remove|archive|rotate|edit|attach|detach)\b/u,
+      text
+    )
+  end
+
+  defp include_prompt_for_task?(task) when is_binary(task) do
+    Regex.match?(~r/\b(prompt|system prompt|instruction|persona)\b/iu, task)
+  end
+
+  defp include_prompt_for_task?(_task), do: false
+
+  defp current_agent_delegation_payload(subagent_id, agent, include_prompt) do
+    agent_payload = current_agent_config_payload(agent, include_prompt)
+
+    %{
+      "ok" => true,
+      "subagent_id" => subagent_id,
+      "label" => current_agent_delegation_label(subagent_id),
+      "response" => current_agent_integration_summary(agent_payload),
+      "metadata" => %{
+        "fast_path" => "current_agent_config",
+        "agent" => agent_payload,
+        "integration" => current_agent_integration_metadata(agent_payload)
+      }
+    }
+  end
+
+  defp current_agent_delegation_label("integration_advisor"), do: "Integration Advisor"
+  defp current_agent_delegation_label("builder_assistant"), do: "Builder Assistant"
+  defp current_agent_delegation_label(_subagent_id), do: "Subagent"
+
+  defp current_agent_integration_summary(agent_payload) do
+    [
+      "Current agent: #{agent_payload["display_name"] || agent_payload["identifier"]}.",
+      "Agent id: #{agent_payload["id"]}.",
+      if(agent_payload["username"], do: "Identifier: #{agent_payload["username"]}.", else: nil),
+      "Invoke URL: #{agent_payload["invoke_url"]}.",
+      "Events URL: #{agent_payload["events_url"]}.",
+      "Default destination chat id: #{agent_payload["default_destination_chat_id"] || "not configured"}.",
+      "Incoming chat: #{if(agent_payload["incoming_chat_enabled"], do: "enabled", else: "disabled")}.",
+      "Inbox mode: #{agent_payload["event_inbox_mode"]}."
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join(" ")
+  end
+
+  defp current_agent_integration_metadata(agent_payload) do
+    %{
+      "agent_id" => agent_payload["id"],
+      "identifier" => agent_payload["identifier"],
+      "username" => agent_payload["username"],
+      "api_base_url" => agent_payload["api_base_url"],
+      "invoke_url" => agent_payload["invoke_url"],
+      "events_url" => agent_payload["events_url"],
+      "default_destination_chat_id" => agent_payload["default_destination_chat_id"],
+      "attached_chats" => agent_payload["attached_chats"] || [],
+      "incoming_chat_enabled" => agent_payload["incoming_chat_enabled"],
+      "event_inbox_mode" => agent_payload["event_inbox_mode"],
+      "headers" => %{"X-Vibe-Agent-Secret" => "<agent secret>"}
+    }
   end
 
   defp persist_current_agent_update(agent, attrs, requester_user_id) do

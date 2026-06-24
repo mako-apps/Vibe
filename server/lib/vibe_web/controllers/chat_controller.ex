@@ -110,20 +110,22 @@ defmodule VibeWeb.ChatController do
       chat_id == "saved_messages" ->
         json(conn, %{data: []})
 
-      Chat.is_participant?(chat_id, user_id) ->
-      pins = Chat.list_pinned_messages(chat_id, user_id)
-
-      Logger.info(
-        "[ChatController] list_pinned_messages chat_id=#{chat_id} user_id=#{user_id} count=#{length(pins)}"
-      )
-
-      json(conn, %{data: pins})
       true ->
-        Logger.warning(
-          "[ChatController] list_pinned_messages forbidden chat_id=#{chat_id} user_id=#{user_id}"
-        )
+        case Chat.list_pinned_messages_for_user(chat_id, user_id) do
+          {:ok, pins} ->
+            Logger.info(
+              "[ChatController] list_pinned_messages chat_id=#{chat_id} user_id=#{user_id} count=#{length(pins)}"
+            )
 
-        conn |> put_status(:forbidden) |> json(%{error: "Not a participant"})
+            json(conn, %{data: pins})
+
+          {:error, :forbidden} ->
+            Logger.warning(
+              "[ChatController] list_pinned_messages forbidden chat_id=#{chat_id} user_id=#{user_id}"
+            )
+
+            conn |> put_status(:forbidden) |> json(%{error: "Not a participant"})
+        end
     end
   end
 

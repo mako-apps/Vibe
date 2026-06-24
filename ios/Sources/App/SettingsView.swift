@@ -258,8 +258,8 @@ struct SettingsView: View {
           AppUIStallWatchdog.shared.updateContext("SettingsView toolbar edit")
           activeRoute = .profile
         }
-        .font(.system(size: 17))
-        .foregroundStyle(palette.accent)
+        .font(.system(size: 17, weight: .semibold))
+        .foregroundStyle(colorScheme == .dark ? .white : .black)
       }
     }
     .onAppear {

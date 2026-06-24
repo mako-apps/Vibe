@@ -1,0 +1,1137 @@
+defmodule Vibe.AI.LocalAgentWorker do
+  @moduledoc false
+
+  require Logger
+
+  alias Vibe.Chat
+  alias Vibe.Chat.AgentMessageCrypto
+  alias Vibe.Notifications
+  alias Vibe.Repo
+
+  @agent_user_id Vibe.AI.GroupAgent.agent_user_id()
+  @agent_username "vibe_ai_agent_0001"
+  @default_timeout_ms 120_000
+  @max_prompt_length 8_000
+  @max_tool_events 16
+  @max_activity_summary_items 6
+  @max_payload_preview_bytes 1_200
+  @rate_limit_table :local_agent_worker_ratelimit
+  @default_cooldown_ms 8_000
+
+  @workers %{
+    "codex" => %{
+      handle: "codex",
+      label: "Codex",
+      command_env: "VIBE_CODEX_COMMAND",
+      default_command: "codex"
+    },
+    "claude" => %{
+      handle: "claude",
+      label: "Claude",
+      command_env: "VIBE_CLAUDE_COMMAND",
+      default_command: "claude"
+    }
+  }
+
+  def agent_user_id, do: @agent_user_id
+
+  def resolve_handle(value) when is_binary(value) do
+    value
+    |> normalize_handle()
+    |> case do
+      handle when is_map_key(@workers, handle) -> Map.fetch!(@workers, handle)
+      _ -> nil
+    end
+  end
+
+  def resolve_handle(_), do: nil
+
+  def resolve_from_message(%{metadata: metadata}) when is_map(metadata) do
+    metadata
+    |> Map.get("agentWorkerProvider")
+    |> resolve_handle()
+  end
+
+  def resolve_from_message(_), do: nil
+
+  def extract_reserved_mention(text) when is_binary(text) do
+    case Regex.run(~r/(?:^|\s)@(codex|claude)\b/i, text) do
+      [_, handle] -> resolve_handle(handle)
+      _ -> nil
+    end
+  end
+
+  def extract_reserved_mention(_), do: nil
+
+  def enabled? do
+    truthy?(System.get_env("VIBE_LOCAL_AGENT_WORKERS"))
+  end
+
+  @doc """
+  Per-user cooldown gate. Returns `true` and records the timestamp if the user
+  is allowed to dispatch now, `false` if they are still within the cooldown
+  window. Bounds cost and abuse from rapid `@claude` / `@codex` spamming.
+  """
+  def allow_request?(user_id) when is_binary(user_id) and user_id != "" do
+    ensure_rate_limit_table()
+    now = System.monotonic_time(:millisecond)
+    cooldown = cooldown_ms()
+
+    case :ets.lookup(@rate_limit_table, user_id) do
+      [{^user_id, last}] when now - last < cooldown ->
+        false
+
+      _ ->
+        :ets.insert(@rate_limit_table, {user_id, now})
+        true
+    end
+  end
+
+  def allow_request?(_), do: true
+
+  @doc """
+  Post a short non-result notice into the chat (rate-limited / busy messages),
+  attributed to the worker agent.
+  """
+  def post_notice(worker, chat_id, text, requester_user_id, reply_to_id) when is_map(worker) do
+    post_worker_message(
+      worker,
+      chat_id,
+      text,
+      %{
+        "agentWorker" => true,
+        "agentWorkerProvider" => worker.handle,
+        "agentWorkerOk" => false,
+        "agentWorkerNotice" => true
+      },
+      reply_to_id,
+      requester_user_id
+    )
+  end
+
+  defp ensure_rate_limit_table do
+    case :ets.whereis(@rate_limit_table) do
+      :undefined ->
+        :ets.new(@rate_limit_table, [:set, :public, :named_table, {:read_concurrency, true}])
+        :ok
+
+      _ ->
+        :ok
+    end
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp cooldown_ms do
+    case Integer.parse(System.get_env("VIBE_AGENT_WORKER_COOLDOWN_MS") || "") do
+      {value, _} when value >= 0 -> value
+      _ -> @default_cooldown_ms
+    end
+  end
+
+  def handle_chat_message(worker, chat_id, prompt, opts \\ []) when is_map(worker) do
+    reply_to_id = Keyword.get(opts, :reply_to_id)
+    requester_user_id = Keyword.get(opts, :requester_user_id)
+    progress_callback = Keyword.get(opts, :progress_callback, fn _event -> :ok end)
+
+    with {:ok, normalized_prompt} <- normalize_prompt(worker, prompt),
+         {:ok, result} <- run(worker, normalized_prompt, progress_callback: progress_callback) do
+      post_worker_message(
+        worker,
+        chat_id,
+        visible_response_text(result.text, result.tool_events),
+        %{
+          "agentWorker" => true,
+          "agentWorkerProvider" => worker.handle,
+          "agentWorkerCommand" => result.command,
+          "agentWorkerExitStatus" => result.exit_status,
+          "agentWorkerDurationMs" => result.duration_ms,
+          "agentWorkerOk" => result.ok,
+          "agentWorkerToolEvents" => result.tool_events,
+          "agentWorkerAvailableTools" => result.available_tools,
+          "agentWorkerRawEventCount" => result.raw_event_count,
+          "progressNodes" => result.progress_nodes
+        },
+        reply_to_id,
+        requester_user_id
+      )
+    else
+      {:error, reason} ->
+        post_worker_message(
+          worker,
+          chat_id,
+          error_message(worker, reason),
+          %{
+            "agentWorker" => true,
+            "agentWorkerProvider" => worker.handle,
+            "agentWorkerOk" => false,
+            "agentWorkerError" => inspect(reason)
+          },
+          reply_to_id,
+          requester_user_id
+        )
+    end
+  end
+
+  def run(worker, prompt, opts \\ []) when is_map(worker) and is_binary(prompt) do
+    cond do
+      not enabled?() ->
+        {:error, :local_agent_workers_disabled}
+
+      String.length(prompt) > @max_prompt_length ->
+        {:error, :prompt_too_long}
+
+      true ->
+        command = command_for(worker)
+
+        case System.find_executable(command) do
+          nil ->
+            {:error, {:command_not_found, command}}
+
+          executable ->
+            do_run(worker, executable, prompt, opts)
+        end
+    end
+  end
+
+  def parse_result(provider, output) when is_binary(provider) and is_binary(output) do
+    case resolve_handle(provider) do
+      nil -> {:error, :unknown_provider}
+      worker -> {:ok, extract_result(worker, output)}
+    end
+  end
+
+  defp do_run(%{handle: "codex"} = worker, executable, prompt, opts) do
+    sandbox =
+      System.get_env("VIBE_CODEX_SANDBOX")
+      |> normalize_string()
+      |> case do
+        value when value in ["read-only", "workspace-write", "danger-full-access"] -> value
+        _ -> "read-only"
+      end
+
+    args =
+      [
+        "exec",
+        "--json",
+        "--sandbox",
+        sandbox,
+        "--cd",
+        worker_cwd(),
+        "--skip-git-repo-check",
+        "--ephemeral"
+      ] ++ maybe_model_args("VIBE_CODEX_MODEL", "--model") ++ [prompt]
+
+    run_command(worker, executable, args, opts)
+  end
+
+  defp do_run(%{handle: "claude"} = worker, executable, prompt, opts) do
+    permission_mode =
+      System.get_env("VIBE_CLAUDE_PERMISSION_MODE")
+      |> normalize_string()
+      |> case do
+        value when value in ["default", "acceptEdits", "bypassPermissions", "plan"] ->
+          value
+
+        _ ->
+          "plan"
+      end
+
+    output_format =
+      System.get_env("VIBE_CLAUDE_OUTPUT_FORMAT")
+      |> normalize_string()
+      |> case do
+        value when value in ["json", "stream-json", "text"] -> value
+        _ -> "stream-json"
+      end
+
+    args =
+      [
+        "-p",
+        "--output-format",
+        output_format,
+        "--permission-mode",
+        permission_mode,
+        "--no-session-persistence"
+      ] ++
+        maybe_claude_verbose_args(output_format) ++
+        maybe_model_args("VIBE_CLAUDE_MODEL", "--model") ++
+        maybe_single_arg("VIBE_CLAUDE_MCP_CONFIG", "--mcp-config") ++
+        maybe_single_arg("VIBE_CLAUDE_ALLOWED_TOOLS", "--allowedTools") ++
+        maybe_single_arg("VIBE_CLAUDE_DISALLOWED_TOOLS", "--disallowedTools") ++ ["--", prompt]
+
+    run_command(worker, executable, args, opts)
+  end
+
+  defp run_command(worker, executable, args, opts) do
+    start = System.monotonic_time(:millisecond)
+    timeout_ms = timeout_ms()
+    progress_callback = Keyword.get(opts, :progress_callback, fn _event -> :ok end)
+
+    Logger.info(
+      "[LocalAgentWorker] start provider=#{worker.handle} command=#{Path.basename(executable)} timeout_ms=#{timeout_ms}"
+    )
+
+    line_callback = fn line ->
+      line
+      |> progress_event_from_line(worker)
+      |> case do
+        nil -> :ok
+        event -> progress_callback.(event)
+      end
+    end
+
+    case collect_command(executable, args, worker_cwd(), timeout_ms, line_callback) do
+      {:ok, status, output} ->
+        duration_ms = System.monotonic_time(:millisecond) - start
+        extracted = extract_result(worker, output)
+        text = extracted.text || fallback_output(output)
+        ok = status == 0
+
+        Logger.info(
+          "[LocalAgentWorker] finish provider=#{worker.handle} status=#{status} duration_ms=#{duration_ms} text_len=#{String.length(text)}"
+        )
+
+        {:ok,
+         %{
+           ok: ok,
+           exit_status: status,
+           command: Path.basename(executable),
+           duration_ms: duration_ms,
+           text: if(ok, do: text, else: command_failed_text(worker, status, text)),
+           tool_events: extracted.tool_events,
+           available_tools: extracted.available_tools,
+           raw_event_count: extracted.raw_event_count,
+           progress_nodes: extracted.progress_nodes
+         }}
+
+      {:error, :timeout, output} ->
+        {:error, {:timeout, timeout_ms, fallback_output(output)}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp collect_command(executable, args, cwd, timeout_ms, line_callback) do
+    shell = System.find_executable("sh") || "/bin/sh"
+    shell_command = "exec </dev/null\nexec " <> shell_join([executable | args])
+
+    port =
+      Port.open({:spawn_executable, shell}, [
+        :binary,
+        :exit_status,
+        :stderr_to_stdout,
+        {:args, ["-lc", shell_command]},
+        {:cd, cwd}
+      ])
+
+    collect_port(port, [], "", line_callback, System.monotonic_time(:millisecond) + timeout_ms)
+  rescue
+    error -> {:error, error}
+  end
+
+  defp collect_port(port, chunks, line_buffer, line_callback, deadline_ms) do
+    remaining = max(deadline_ms - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {^port, {:data, data}} ->
+        {lines, next_line_buffer} = split_complete_lines(line_buffer <> data)
+        Enum.each(lines, &safe_line_callback(line_callback, &1))
+        collect_port(port, [data | chunks], next_line_buffer, line_callback, deadline_ms)
+
+      {^port, {:exit_status, status}} ->
+        if normalize_string(line_buffer), do: safe_line_callback(line_callback, line_buffer)
+        {:ok, status, chunks |> Enum.reverse() |> IO.iodata_to_binary()}
+    after
+      remaining ->
+        Port.close(port)
+        {:error, :timeout, chunks |> Enum.reverse() |> IO.iodata_to_binary()}
+    end
+  end
+
+  defp post_worker_message(worker, chat_id, body, metadata, reply_to_id, requester_user_id) do
+    with :ok <- ensure_agent_user_record() do
+      message_id = Ecto.UUID.generate()
+      timestamp = System.system_time(:millisecond)
+      plain_text = normalize_string(body) || ""
+
+      metadata =
+        metadata
+        |> Map.put("isAgentMessage", true)
+        |> Map.put("agentName", worker.label)
+        |> Map.put("agentUserId", @agent_user_id)
+        |> Map.put("agentUsername", worker.handle)
+        |> Map.put("agentHandle", "@#{worker.handle}")
+
+      attrs = %{
+        id: message_id,
+        chat_id: chat_id,
+        from_id: @agent_user_id,
+        encrypted_content: AgentMessageCrypto.encrypt_for_storage(plain_text),
+        type: "text",
+        metadata: metadata,
+        reply_to_id: reply_to_id,
+        timestamp: timestamp
+      }
+
+      case Chat.add_message(attrs, acting_user_id: requester_user_id || @agent_user_id) do
+        {:ok, _message} ->
+          payload = %{
+            "id" => message_id,
+            "fromId" => @agent_user_id,
+            "chatId" => chat_id,
+            "encryptedContent" => "",
+            "plainContent" => plain_text,
+            "plaintext" => plain_text,
+            "type" => "text",
+            "timestamp" => timestamp,
+            "status" => "sent",
+            "isAgentMessage" => true,
+            "agentName" => worker.label,
+            "agentUserId" => @agent_user_id,
+            "agentUsername" => worker.handle,
+            "agentHandle" => "@#{worker.handle}",
+            "metadata" => metadata,
+            "replyToId" => reply_to_id
+          }
+
+          VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "message", payload)
+          notify_chat_participants(chat_id, message_id, timestamp, plain_text)
+          {:ok, %{message_id: message_id, timestamp: timestamp}}
+
+        error ->
+          error
+      end
+    end
+  end
+
+  defp notify_chat_participants(chat_id, message_id, timestamp, body) do
+    Chat.get_all_participant_settings(chat_id)
+    |> Enum.each(fn participant ->
+      if participant.user_id != @agent_user_id do
+        if participant.deleted, do: Chat.restore_if_deleted(chat_id, participant.user_id)
+
+        VibeWeb.Endpoint.broadcast!("user:#{participant.user_id}", "new_message", %{
+          chat_id: chat_id,
+          from_id: @agent_user_id,
+          message_id: message_id,
+          timestamp: timestamp,
+          muted: participant.muted || false
+        })
+
+        if not participant.muted do
+          _ =
+            Notifications.send_message_push(participant.user_id, %{
+              "chat_id" => chat_id,
+              "message_id" => message_id,
+              "from_id" => @agent_user_id,
+              "type" => "text",
+              "body" => body
+            })
+        end
+      end
+    end)
+  end
+
+  defp ensure_agent_user_record do
+    now = NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
+    agent_user_id = Ecto.UUID.dump!(@agent_user_id)
+
+    Repo.insert_all(
+      "users",
+      [
+        %{
+          id: agent_user_id,
+          username: @agent_username,
+          password_hash: "agent",
+          public_key: "agent",
+          device_id: "agent",
+          inserted_at: now,
+          updated_at: now
+        }
+      ],
+      conflict_target: [:id],
+      on_conflict: [set: [updated_at: now]]
+    )
+
+    :ok
+  rescue
+    error -> {:error, error}
+  end
+
+  defp normalize_prompt(worker, prompt) do
+    cleaned =
+      prompt
+      |> to_string()
+      |> String.replace(~r/(?:^|\s)@#{Regex.escape(worker.handle)}\b/i, " ")
+      |> String.trim()
+
+    cond do
+      cleaned == "" -> {:error, :missing_prompt}
+      String.length(cleaned) > @max_prompt_length -> {:error, :prompt_too_long}
+      true -> {:ok, cleaned}
+    end
+  end
+
+  defp command_for(worker) do
+    System.get_env(worker.command_env)
+    |> normalize_string()
+    |> Kernel.||(worker.default_command)
+  end
+
+  defp worker_cwd do
+    case normalize_string(System.get_env("VIBE_AGENT_WORKER_CWD")) do
+      nil -> default_workspace_dir()
+      path -> path
+    end
+  end
+
+  # Secure default: run the agent in an isolated scratch directory, NOT the live
+  # server repo. Set VIBE_AGENT_WORKER_CWD explicitly to grant access elsewhere.
+  defp default_workspace_dir do
+    dir = Path.join(System.tmp_dir!() || "/tmp", "vibe-agent-workspace")
+    File.mkdir_p(dir)
+    dir
+  end
+
+  defp timeout_ms do
+    case Integer.parse(System.get_env("VIBE_AGENT_WORKER_TIMEOUT_MS") || "") do
+      {value, _} when value >= 5_000 and value <= 900_000 -> value
+      _ -> @default_timeout_ms
+    end
+  end
+
+  defp maybe_model_args(env_name, flag) do
+    case normalize_string(System.get_env(env_name)) do
+      nil -> []
+      model -> [flag, model]
+    end
+  end
+
+  defp maybe_single_arg(env_name, flag) do
+    case normalize_string(System.get_env(env_name)) do
+      nil -> []
+      value -> [flag, value]
+    end
+  end
+
+  defp maybe_claude_verbose_args("stream-json"), do: ["--verbose"]
+  defp maybe_claude_verbose_args(_), do: []
+
+  defp extract_result(worker, output) do
+    decoded = decoded_events(output)
+    tool_events = tool_events_from_decoded(worker, decoded)
+
+    %{
+      text: extract_worker_text(worker, decoded, output),
+      tool_events: tool_events,
+      available_tools: available_tools_from_decoded(worker, decoded),
+      raw_event_count: length(decoded),
+      progress_nodes: progress_nodes_from_events(tool_events)
+    }
+  end
+
+  defp extract_worker_text(%{handle: "codex"}, decoded, output) do
+    extract_codex_text(decoded) || plain_output_text(decoded, output)
+  end
+
+  defp extract_worker_text(%{handle: "claude"}, decoded, output) do
+    extract_claude_text(decoded) || plain_output_text(decoded, output)
+  end
+
+  defp extract_worker_text(_worker, decoded, output), do: plain_output_text(decoded, output)
+
+  defp plain_output_text([], output), do: normalize_string(output)
+  defp plain_output_text(_decoded, _output), do: nil
+
+  defp decoded_events(output) do
+    line_events =
+      output
+      |> to_string()
+      |> String.split("\n", trim: true)
+      |> Enum.flat_map(fn line ->
+        case Jason.decode(line) do
+          {:ok, event} when is_map(event) -> [event]
+          {:ok, events} when is_list(events) -> Enum.filter(events, &is_map/1)
+          _ -> []
+        end
+      end)
+
+    if line_events != [] do
+      line_events
+    else
+      case Jason.decode(output) do
+        {:ok, event} when is_map(event) -> [event]
+        {:ok, events} when is_list(events) -> Enum.filter(events, &is_map/1)
+        _ -> []
+      end
+    end
+  end
+
+  defp extract_codex_text(decoded) do
+    decoded
+    |> Enum.reduce(nil, fn event, acc ->
+      item = map_value(event, "item") || event
+
+      cond do
+        codex_agent_message?(item) and is_binary(item["text"]) ->
+          item["text"]
+
+        is_binary(event["message"]) ->
+          event["message"]
+
+        true ->
+          acc
+      end
+    end)
+    |> normalize_string()
+  end
+
+  defp extract_claude_text(decoded) do
+    result_text =
+      decoded
+      |> Enum.reduce(nil, fn event, acc ->
+        cond do
+          is_binary(event["result"]) ->
+            event["result"]
+
+          is_binary(event["content"]) ->
+            event["content"]
+
+          is_map(event["message"]) ->
+            content_blocks_text(event["message"]["content"]) || acc
+
+          true ->
+            acc
+        end
+      end)
+      |> normalize_string()
+
+    result_text ||
+      decoded
+      |> Enum.flat_map(fn event ->
+        event
+        |> content_blocks_from_event()
+        |> Enum.filter(&match?(%{"type" => "text"}, &1))
+        |> Enum.map(&(&1["text"] || ""))
+      end)
+      |> Enum.join("\n")
+      |> normalize_string()
+  end
+
+  defp tool_events_from_decoded(%{handle: "claude"}, decoded) do
+    decoded
+    |> claude_tool_events()
+    |> Enum.take(@max_tool_events)
+  end
+
+  defp tool_events_from_decoded(%{handle: "codex"}, decoded) do
+    decoded
+    |> codex_tool_events()
+    |> Enum.take(@max_tool_events)
+  end
+
+  defp tool_events_from_decoded(_worker, _decoded), do: []
+
+  defp claude_tool_events(decoded) do
+    {events_by_id, order} =
+      Enum.reduce(decoded, {%{}, []}, fn event, acc ->
+        event
+        |> content_blocks_from_event()
+        |> Enum.reduce(acc, &accumulate_claude_tool_block/2)
+      end)
+
+    order
+    |> Enum.uniq()
+    |> Enum.map(&Map.fetch!(events_by_id, &1))
+  end
+
+  defp accumulate_claude_tool_block(%{"type" => "tool_use"} = block, {events_by_id, order}) do
+    id = normalize_string(block["id"]) || unique_event_id("claude-tool", length(order))
+    tool = normalize_string(block["name"]) || "tool"
+    input = block["input"] || %{}
+
+    event = %{
+      "id" => id,
+      "provider" => "claude",
+      "tool" => tool,
+      "label" => tool_label("Claude", tool, input),
+      "status" => "running",
+      "input" => safe_payload(input),
+      "providerEventType" => "tool_use"
+    }
+
+    {Map.put(events_by_id, id, event), append_once(order, id)}
+  end
+
+  defp accumulate_claude_tool_block(%{"type" => "tool_result"} = block, {events_by_id, order}) do
+    id =
+      normalize_string(block["tool_use_id"]) ||
+        normalize_string(block["id"]) ||
+        unique_event_id("claude-result", length(order))
+
+    existing = Map.get(events_by_id, id)
+    tool = (existing && existing["tool"]) || "tool_result"
+    output = block["content"] || block["text"] || block["result"]
+    status = if block["is_error"] == true, do: "failed", else: "done"
+
+    event =
+      (existing ||
+         %{
+           "id" => id,
+           "provider" => "claude",
+           "tool" => tool,
+           "label" => tool_label("Claude", tool, %{}),
+           "input" => %{}
+         })
+      |> Map.merge(%{
+        "status" => status,
+        "outputPreview" => safe_text(output),
+        "providerEventType" => "tool_result"
+      })
+
+    {Map.put(events_by_id, id, event), append_once(order, id)}
+  end
+
+  defp accumulate_claude_tool_block(_block, acc), do: acc
+
+  defp codex_tool_events(decoded) do
+    decoded
+    |> Enum.with_index()
+    |> Enum.flat_map(fn {event, index} ->
+      item = map_value(event, "item") || event
+      item_type = normalize_string(item["type"]) || normalize_string(event["type"]) || ""
+
+      cond do
+        codex_agent_message?(item) ->
+          []
+
+        codex_toolish_event?(event, item, item_type) ->
+          [codex_tool_event(event, item, item_type, index)]
+
+        true ->
+          []
+      end
+    end)
+    |> compact_tool_events()
+  end
+
+  defp codex_tool_event(event, item, item_type, index) do
+    tool = codex_tool_name(item, item_type)
+    input = codex_tool_input(item)
+
+    %{
+      "id" =>
+        normalize_string(item["id"]) ||
+          normalize_string(event["id"]) ||
+          unique_event_id("codex-tool", index),
+      "provider" => "codex",
+      "tool" => tool,
+      "label" => tool_label("Codex", tool, input),
+      "status" => codex_event_status(event, item),
+      "input" => safe_payload(input),
+      "outputPreview" => safe_text(codex_tool_output(item)),
+      "providerEventType" => normalize_string(event["type"]) || item_type
+    }
+  end
+
+  defp codex_toolish_event?(event, item, item_type) do
+    event_type = normalize_string(event["type"]) || ""
+
+    cond do
+      item_type in ["agent_message", "message", "reasoning"] ->
+        false
+
+      is_binary(item["command"]) or is_list(item["command"]) ->
+        true
+
+      is_binary(item["name"]) or is_binary(item["tool"]) or is_binary(item["tool_name"]) ->
+        true
+
+      String.contains?(item_type, ["tool", "command", "exec", "function", "call", "search"]) ->
+        true
+
+      String.contains?(event_type, ["tool", "command", "exec", "function", "call"]) and
+          not String.contains?(event_type, "agent_message") ->
+        true
+
+      true ->
+        false
+    end
+  end
+
+  defp codex_agent_message?(%{"type" => "agent_message"}), do: true
+  defp codex_agent_message?(_), do: false
+
+  defp codex_tool_name(item, item_type) do
+    cond do
+      is_binary(item["command"]) or is_list(item["command"]) ->
+        "Bash"
+
+      normalize_string(item["name"]) ->
+        normalize_string(item["name"])
+
+      normalize_string(item["tool"]) ->
+        normalize_string(item["tool"])
+
+      normalize_string(item["tool_name"]) ->
+        normalize_string(item["tool_name"])
+
+      item_type != "" ->
+        item_type
+        |> String.replace("_", " ")
+        |> String.split(" ", trim: true)
+        |> Enum.map_join(" ", &String.capitalize/1)
+
+      true ->
+        "Tool"
+    end
+  end
+
+  defp codex_tool_input(item) do
+    cond do
+      is_map(item["input"]) ->
+        item["input"]
+
+      is_map(item["arguments"]) ->
+        item["arguments"]
+
+      is_binary(item["arguments"]) ->
+        %{"arguments" => item["arguments"]}
+
+      is_binary(item["command"]) ->
+        %{"command" => item["command"]}
+
+      is_list(item["command"]) ->
+        %{"command" => Enum.join(item["command"], " ")}
+
+      true ->
+        %{}
+    end
+  end
+
+  defp codex_tool_output(item) do
+    item["output"] || item["result"] || item["content"] || item["text"]
+  end
+
+  defp codex_event_status(event, item) do
+    status =
+      [
+        event["type"],
+        event["status"],
+        item["status"]
+      ]
+      |> Enum.find_value(&normalize_string/1)
+      |> Kernel.||("")
+      |> String.downcase()
+
+    cond do
+      String.contains?(status, ["fail", "error"]) -> "failed"
+      String.contains?(status, ["complete", "completed", "done", "success"]) -> "done"
+      String.contains?(status, ["start", "running", "progress"]) -> "running"
+      true -> "running"
+    end
+  end
+
+  defp compact_tool_events(events) do
+    {events_by_id, order} =
+      Enum.reduce(events, {%{}, []}, fn event, {events_by_id, order} ->
+        id = event["id"]
+
+        {Map.merge(Map.get(events_by_id, id, %{}), event)
+         |> then(&Map.put(events_by_id, id, &1)), append_once(order, id)}
+      end)
+
+    order
+    |> Enum.uniq()
+    |> Enum.map(&Map.fetch!(events_by_id, &1))
+  end
+
+  defp available_tools_from_decoded(%{handle: "claude"}, decoded) do
+    decoded
+    |> Enum.flat_map(fn
+      %{"tools" => tools} when is_list(tools) -> tools
+      %{"message" => %{"tools" => tools}} when is_list(tools) -> tools
+      _ -> []
+    end)
+    |> Enum.map(&to_string/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+    |> Enum.take(40)
+  end
+
+  defp available_tools_from_decoded(_worker, _decoded), do: []
+
+  defp progress_nodes_from_events(events) do
+    events
+    |> Enum.with_index()
+    |> Enum.map(fn {event, index} ->
+      %{
+        "id" => event["id"] || unique_event_id("worker-progress", index),
+        "label" => event["label"] || event["tool"] || "Working...",
+        "status" => event["status"] || "running",
+        "depth" => 0
+      }
+    end)
+  end
+
+  defp progress_event_from_line(line, worker) do
+    with {:ok, event} when is_map(event) <- Jason.decode(line),
+         tool_event when is_map(tool_event) <-
+           Enum.find(tool_events_from_decoded(worker, [event]), fn event ->
+             event["providerEventType"] != "tool_result"
+           end) do
+      Map.put(tool_event, "status", "running")
+    else
+      _ -> nil
+    end
+  end
+
+  defp content_blocks_from_event(%{"message" => %{"content" => content}}),
+    do: content_blocks_from_value(content)
+
+  defp content_blocks_from_event(%{"content" => content}), do: content_blocks_from_value(content)
+  defp content_blocks_from_event(_), do: []
+
+  defp content_blocks_from_value(content) when is_list(content),
+    do: Enum.filter(content, &is_map/1)
+
+  defp content_blocks_from_value(content) when is_map(content), do: [content]
+  defp content_blocks_from_value(_), do: []
+
+  defp content_blocks_text(content) when is_list(content) do
+    content
+    |> Enum.map(fn
+      %{"type" => "text", "text" => text} when is_binary(text) -> text
+      %{"text" => text} when is_binary(text) -> text
+      _ -> ""
+    end)
+    |> Enum.join("\n")
+    |> normalize_string()
+  end
+
+  defp content_blocks_text(_), do: nil
+
+  defp visible_response_text(text, events) do
+    text = normalize_string(text) || "The command finished without returning text."
+
+    case activity_summary(events) do
+      nil -> text
+      summary -> text <> "\n\nActivity\n" <> summary
+    end
+  end
+
+  defp activity_summary([]), do: nil
+
+  defp activity_summary(events) do
+    events
+    |> Enum.take(@max_activity_summary_items)
+    |> Enum.map(fn event ->
+      label = event["label"] || event["tool"] || "Tool"
+      status = event["status"] || "running"
+      "- #{label} (#{status})"
+    end)
+    |> Enum.join("\n")
+    |> then(fn summary ->
+      extra = length(events) - @max_activity_summary_items
+      if extra > 0, do: summary <> "\n- #{extra} more tool event(s)", else: summary
+    end)
+    |> normalize_string()
+  end
+
+  defp tool_label(provider, tool, input) do
+    case tool_detail(input) do
+      nil -> "#{provider} #{tool}"
+      detail -> "#{provider} #{tool}: #{truncate(detail, 96)}"
+    end
+  end
+
+  defp tool_detail(input) when is_map(input) do
+    [
+      "command",
+      "cmd",
+      "description",
+      "path",
+      "file_path",
+      "filePath",
+      "pattern",
+      "query",
+      "url",
+      "prompt"
+    ]
+    |> Enum.find_value(fn key ->
+      input
+      |> Map.get(key)
+      |> safe_text()
+      |> normalize_string()
+    end)
+  end
+
+  defp tool_detail(input), do: input |> safe_text() |> normalize_string()
+
+  defp safe_payload(value) when is_map(value) do
+    value
+    |> Enum.take(12)
+    |> Map.new(fn {key, value} ->
+      key = to_string(key)
+
+      if secret_key?(key) do
+        {key, "[redacted]"}
+      else
+        {key, safe_payload(value)}
+      end
+    end)
+  end
+
+  defp safe_payload(value) when is_list(value) do
+    value
+    |> Enum.take(12)
+    |> Enum.map(&safe_payload/1)
+  end
+
+  defp safe_payload(value) when is_binary(value), do: truncate(value, @max_payload_preview_bytes)
+  defp safe_payload(value) when is_number(value) or is_boolean(value) or is_nil(value), do: value
+  defp safe_payload(value), do: value |> inspect() |> truncate(@max_payload_preview_bytes)
+
+  defp safe_text(nil), do: nil
+
+  defp safe_text(value) when is_binary(value), do: truncate(value, @max_payload_preview_bytes)
+
+  defp safe_text(value) when is_list(value) do
+    value
+    |> Enum.map(fn
+      %{"text" => text} when is_binary(text) -> text
+      %{"content" => content} -> safe_text(content)
+      item when is_binary(item) -> item
+      item -> inspect(item)
+    end)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
+    |> truncate(@max_payload_preview_bytes)
+  end
+
+  defp safe_text(value) when is_map(value),
+    do: value |> safe_payload() |> inspect() |> truncate(@max_payload_preview_bytes)
+
+  defp safe_text(value), do: value |> inspect() |> truncate(@max_payload_preview_bytes)
+
+  defp secret_key?(key) do
+    key
+    |> String.downcase()
+    |> then(
+      &String.contains?(&1, ["secret", "token", "password", "api_key", "apikey", "private_key"])
+    )
+  end
+
+  defp append_once(values, value) do
+    if value in values, do: values, else: values ++ [value]
+  end
+
+  defp unique_event_id(prefix, index), do: "#{prefix}-#{index}"
+
+  defp map_value(map, key) when is_map(map) do
+    case Map.get(map, key) do
+      value when is_map(value) -> value
+      _ -> nil
+    end
+  end
+
+  defp split_complete_lines(data) do
+    parts = String.split(data, "\n", trim: false)
+
+    case Enum.reverse(parts) do
+      [tail | reversed_complete] -> {Enum.reverse(reversed_complete), tail}
+      [] -> {[], ""}
+    end
+  end
+
+  defp safe_line_callback(callback, line) do
+    callback.(String.trim_trailing(line, "\r"))
+  rescue
+    error ->
+      Logger.debug("[LocalAgentWorker] progress callback failed: #{inspect(error)}")
+      :ok
+  end
+
+  defp shell_join(args) do
+    Enum.map_join(args, " ", &shell_quote/1)
+  end
+
+  defp shell_quote(arg) do
+    value = to_string(arg)
+
+    if Regex.match?(~r/^[A-Za-z0-9_\/:.,=@%+\-]+$/, value) do
+      value
+    else
+      "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
+    end
+  end
+
+  defp fallback_output(output) do
+    output
+    |> to_string()
+    |> String.trim()
+    |> truncate(6_000)
+    |> case do
+      "" -> "The command finished without returning text."
+      text -> text
+    end
+  end
+
+  defp command_failed_text(worker, status, text) do
+    """
+    #{worker.label} command exited with status #{status}.
+
+    #{truncate(text, 5_500)}
+    """
+    |> String.trim()
+  end
+
+  defp error_message(worker, :local_agent_workers_disabled) do
+    "#{worker.label} local worker is disabled. Set `VIBE_LOCAL_AGENT_WORKERS=1` on the server that runs Vibe to allow @#{worker.handle} tasks."
+  end
+
+  defp error_message(worker, {:command_not_found, command}) do
+    "#{worker.label} command `#{command}` was not found on this server."
+  end
+
+  defp error_message(worker, {:timeout, timeout_ms, output}) do
+    "#{worker.label} timed out after #{div(timeout_ms, 1000)}s.\n\n#{truncate(output, 4_000)}"
+  end
+
+  defp error_message(worker, :missing_prompt), do: "Tell @#{worker.handle} what task to run."
+
+  defp error_message(worker, reason) do
+    "#{worker.label} could not run this task: #{inspect(reason)}"
+  end
+
+  defp normalize_handle(value) do
+    value
+    |> to_string()
+    |> String.trim()
+    |> String.trim_leading("@")
+    |> String.downcase()
+  end
+
+  defp normalize_string(value) when is_binary(value) do
+    trimmed = String.trim(value)
+    if trimmed == "", do: nil, else: trimmed
+  end
+
+  defp normalize_string(_), do: nil
+
+  defp truthy?(value) when is_binary(value) do
+    normalized = value |> String.trim() |> String.downcase()
+    normalized in ["1", "true", "yes", "on", "enabled"]
+  end
+
+  defp truthy?(_), do: false
+
+  defp truncate(text, limit) when is_binary(text) and byte_size(text) > limit do
+    String.slice(text, 0, limit) <> "\n...[truncated]"
+  end
+
+  defp truncate(text, _limit), do: text
+end

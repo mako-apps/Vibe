@@ -345,6 +345,8 @@ struct ChatListRow {
   let eventType: String?
   let eventPriority: String?
   let eventThreadId: String?
+  let eventInboxRole: String?
+  let hiddenFromTranscript: Bool
 
   // Outgoing message failed to be delivered/answered (agent error or stopped).
   let isDeliveryFailed: Bool
@@ -565,6 +567,8 @@ struct ChatListRow {
       eventType = nil
       eventPriority = nil
       eventThreadId = nil
+      eventInboxRole = nil
+      hiddenFromTranscript = false
       isDeliveryFailed = false
       isAgentError = false
       return
@@ -811,6 +815,18 @@ struct ChatListRow {
       in: [metadata, message],
       keys: ["eventThreadId", "event_thread_id"]
     )
+    eventInboxRole = firstNonEmptyString(
+      in: [metadata, message],
+      keys: ["eventInboxRole", "event_inbox_role"]
+    )?.lowercased()
+    let explicitHiddenFromTranscript =
+      (parseBool(metadata?["hiddenFromTranscript"]) ?? parseBool(metadata?["hidden_from_transcript"]))
+      ?? (parseBool(message["hiddenFromTranscript"]) ?? parseBool(message["hidden_from_transcript"]))
+      ?? false
+    hiddenFromTranscript =
+      explicitHiddenFromTranscript
+      || eventInboxRole == "raw_event"
+      || eventInboxRole == "inbox_item"
     isDeliveryFailed =
       (message["deliveryFailed"] as? Bool)
       ?? (message["delivery_failed"] as? Bool)
@@ -1119,6 +1135,8 @@ func chatListRowContentEqual(_ lhs: ChatListRow, _ rhs: ChatListRow) -> Bool {
     && lhs.eventType == rhs.eventType
     && lhs.eventPriority == rhs.eventPriority
     && lhs.eventThreadId == rhs.eventThreadId
+    && lhs.eventInboxRole == rhs.eventInboxRole
+    && lhs.hiddenFromTranscript == rhs.hiddenFromTranscript
     && lhs.isDeliveryFailed == rhs.isDeliveryFailed
     && lhs.isAgentError == rhs.isAgentError
 }

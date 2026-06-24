@@ -1076,6 +1076,7 @@ private func hasInlineAttachment(_ row: ChatListRow) -> Bool {
 
 private func hasReplyPreview(_ row: ChatListRow) -> Bool {
   guard row.kind == .message, row.visualKind == .text else { return false }
+  guard !row.isEventNotification, !row.hiddenFromTranscript else { return false }
   return row.replyToId != nil
 }
 

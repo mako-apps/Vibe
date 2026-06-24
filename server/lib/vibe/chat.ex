@@ -724,6 +724,33 @@ defmodule Vibe.Chat do
     end)
   end
 
+  def list_pinned_messages_for_user(chat_id, user_id) do
+    RepoRLS.with_user(user_id, fn ->
+      rows =
+        Repo.all(
+          from(p in Participant,
+            left_join: pm in PinnedMessage,
+            on: pm.chat_id == p.chat_id and pm.user_id == p.user_id,
+            left_join: m in Message,
+            on: pm.message_id == m.id,
+            where: p.chat_id == ^chat_id and p.user_id == ^user_id,
+            order_by: [desc: pm.inserted_at],
+            select: %{
+              messageId: pm.message_id,
+              chatId: pm.chat_id,
+              pinnedAt: pm.inserted_at,
+              timestamp: m.timestamp
+            }
+          )
+        )
+
+      case rows do
+        [] -> {:error, :forbidden}
+        rows -> {:ok, Enum.reject(rows, &(is_nil(&1.messageId) or is_nil(&1.timestamp)))}
+      end
+    end)
+  end
+
   def set_message_pin(chat_id, message_id, user_id, pinned \\ true) do
     result =
       RepoRLS.with_user(user_id, fn ->

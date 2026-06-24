@@ -559,6 +559,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var contentPaddingBottom: CGFloat = sectionBottomInset
   private var isApplyingRowsUpdate = false
   private var pendingStreamingTextLayoutInvalidation = false
+  // A streaming relayout arrived while the user was scrolling and was deferred to
+  // avoid stuttering the gesture; flushed once the scroll settles.
+  private var pendingDeferredAgentStreamingRelayout = false
   private var _setRowsGeneration: UInt = 0
   private var pendingRowsPayload: [[String: Any]]?
   private var sourceRowsPayload: [[String: Any]] = []
@@ -932,7 +935,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       updateBottomAnchorInset()
       if shouldAutoScroll || !rows.isEmpty {
         collectionView.layoutIfNeeded()
-        scrollToBottom(animated: false)
+        // First layout of the chat: land on the latest message even in agent mode.
+        scrollToBottom(animated: false, force: true)
       }
       emitViewport(force: true)
       maybeStartPendingSendTransition()
@@ -990,14 +994,20 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let parsedAll = visibleRows.compactMap(ChatListRow.init).filter { row in
       row.messageType != "agent_progress"
     }
-    // Inbox mode: split agent event notifications out of the transcript and
-    // report them to the host so they surface via the Inbox banner/view.
+    // Inbox mode: split raw agent event notifications out of the transcript and
+    // report them to the host so they surface via the Inbox banner/view. Batched
+    // summary rows stay in the main chat as the clean default agent view.
     let parsed: [ChatListRow]
-    if eventInboxModeEnabled {
+    let hasInboxOnlyRows = parsedAll.contains { $0.kind == .message && $0.hiddenFromTranscript }
+    if eventInboxModeEnabled || hasInboxOnlyRows {
       var transcript: [ChatListRow] = []
       var inbox: [ChatListRow] = []
       for row in parsedAll {
-        if row.kind == .message, row.isEventNotification {
+        let shouldRouteToInbox =
+          row.hiddenFromTranscript
+          || (eventInboxModeEnabled && row.isEventNotification && !row.isEventInboxSummary)
+        if row.kind == .message, shouldRouteToInbox
+        {
           inbox.append(row)
         } else {
           transcript.append(row)
@@ -1097,8 +1107,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         (self.pendingSendTransition != nil || self.activeSendTransition != nil
           || self.hiddenMessageId != nil)
         && self.deferredPendingSendBottomScrollMessageId == nil
-      let preInsetContentH = self.collectionView.contentSize.height
-      let preInsetOffset = self.collectionView.contentOffset.y
       self.collectionView.layoutIfNeeded()
       self.updateBottomAnchorInset()
       // Force a second layout pass so contentSize reflects the inset change
@@ -1107,32 +1115,22 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       self.collectionView.layoutIfNeeded()
       let postInsetContentH = self.collectionView.contentSize.height
       let postInsetOffset = self.collectionView.contentOffset.y
-      NSLog(
-        "[ChatListFinalize] wasNear:%@ anim:%@ preOff:%.1f postOff:%.1f preH:%.1f postH:%.1f bounds:%.1f rows:%d queued:%@",
-        wasNearBottom ? "Y" : "N", animated ? "Y" : "N",
-        preInsetOffset, postInsetOffset, preInsetContentH, postInsetContentH,
-        self.collectionView.bounds.height, parsed.count,
-        self.pendingRowsPayload != nil ? "Y" : "N")
       chatListUITrace(
         "ChatListView setRows finalize chatId=\(traceChatId.isEmpty ? "<empty>" : String(traceChatId.prefix(12))) parsed=\(parsed.count) animated=\(animated ? "Y" : "N") wasNearBottom=\(wasNearBottom ? "Y" : "N") queued=\(self.pendingRowsPayload != nil ? "Y" : "N") durationMs=\(Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000)) contentH=\(Int(postInsetContentH)) offsetY=\(Int(postInsetOffset))"
       )
       if self.agentChatMode, self.pendingAgentPushToTop {
         self.pendingAgentPushToTop = false
         self.performAgentPushToTop(animated: animated)
-      } else if self.agentChatMode, self.agentStreaming || self.agentPushToTopSpacer > 0 {
-        // Active (or just-finished) agent turn: only SHRINK the reserved room below
-        // the question (forceOffset:false) — never move the scroll offset here, and
-        // do nothing at all once the user has taken over scrolling. The question
-        // holds its place naturally because the answer grows below it. Staying on
-        // this branch for the whole turn also keeps the normal-chat near-bottom /
-        // scroll-to-bottom path from yanking content down.
-        NSLog(
-          "[AgentScroll] setRows finalize AGENT branch off:%.1f (atStart:%.1f d:%+.1f) contentH:%.1f insetB:%.1f detached:%@",
-          self.collectionView.contentOffset.y, previousContentOffsetY,
-          self.collectionView.contentOffset.y - previousContentOffsetY,
-          self.collectionView.contentSize.height, self.collectionView.contentInset.bottom,
-          self.agentPinUserDetached ? "Y" : "N")
-        self.applyAgentPin(forceOffset: false)
+      } else if self.agentChatMode {
+        // Agent surface: while a pin is active, only SHRINK the reserved room below
+        // the question (forceOffset:false) so the dead space collapses as the answer
+        // grows — never move the offset. Once the turn ends and the reserve is gone
+        // (or the user has taken over scrolling) do nothing at all: the user owns the
+        // scroll. Crucially we must NOT fall through to the normal-chat near-bottom /
+        // stationary-anchor / restore branches below, which yank the offset around.
+        if self.agentStreaming || self.agentPushToTopSpacer > 0 {
+          self.applyAgentPin(forceOffset: false)
+        }
       } else if shouldDeferPendingBottomScroll, let pendingPayload {
         self.deferredPendingSendBottomScrollMessageId = pendingPayload.messageId
         self.projectedSendTransitionMessageId = pendingPayload.messageId
@@ -2135,22 +2133,17 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     onNativeEvent(["type": "transactionsApplied", "count": transactions.count])
   }
 
-  func scrollToBottom(animated: Bool) {
-    // During an agent push-to-top turn the question is pinned at the top and the
-    // answer grows into the reserved space below. Any "stick to bottom" auto-scroll
-    // here (there are several call sites: setRows finalize, streaming-text layout
-    // invalidation, resize/keyboard) fights that pin and makes the list impossible
-    // to scroll up. Suppress it for the whole turn — a deliberate send re-pins via
-    // performAgentPushToTop, never through scrollToBottom.
-    if agentChatMode, agentStreaming || agentPushToTopSpacer > 0 {
-      NSLog("[AgentScroll] scrollToBottom SUPPRESSED (agent turn)")
+  func scrollToBottom(animated: Bool, force: Bool = false) {
+    // On the agent surface the scroll offset is owned by exactly two things: the
+    // deliberate send pin (performAgentPushToTop) and the user's finger. Every
+    // other "stick to bottom" caller — setRows finalize, streaming-text layout
+    // invalidation, resize/keyboard — must NOT run here, or it fights the user and
+    // makes the list impossible to scroll (this kept snapping the offset back to the
+    // bottom on every link-preview / markdown relayout once a turn had ended). The
+    // only exception is `force` (first open of the chat), where we genuinely want to
+    // land at the latest message.
+    if agentChatMode, !force {
       return
-    }
-    if agentChatMode {
-      NSLog(
-        "[AgentScroll] scrollToBottom RUNNING (not suppressed) anim:%@ curOff:%.1f -> %.1f  <<< PUSHER",
-        animated ? "Y" : "N", collectionView.contentOffset.y,
-        pixelAlignedValue(max(0.0, collectionView.contentSize.height - collectionView.bounds.height)))
     }
     let maxOffsetY = pixelAlignedValue(
       max(0.0, collectionView.contentSize.height - collectionView.bounds.height))
@@ -2757,17 +2750,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   public func scrollViewDidScroll(_ scrollView: UIScrollView) {
     let offsetY = scrollView.contentOffset.y
 
-    if agentChatMode {
-      NSLog(
-        "[AgentScroll] didScroll off:%.1f (prev:%.1f d:%+.1f) maxOff:%.1f contentH:%.1f insetB:%.1f bounds:%.1f track:%@ drag:%@ decel:%@ internal:%@ detached:%@ streaming:%@ spacer:%.1f",
-        offsetY, previousOffsetY, offsetY - previousOffsetY,
-        scrollView.contentSize.height + scrollView.contentInset.bottom - scrollView.bounds.height,
-        scrollView.contentSize.height, scrollView.contentInset.bottom, scrollView.bounds.height,
-        scrollView.isTracking ? "Y" : "N", scrollView.isDragging ? "Y" : "N",
-        scrollView.isDecelerating ? "Y" : "N", isInternalScrollAdjustment ? "Y" : "N",
-        agentPinUserDetached ? "Y" : "N", agentStreaming ? "Y" : "N", agentPushToTopSpacer)
-    }
-
     var wallpaperFrame = bounds
     wallpaperFrame.origin.y = offsetY
     wallpaperContainerView.frame = wallpaperFrame
@@ -2811,11 +2793,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   public func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
     if !decelerate {
       runVisibleAutoDownloads()
+      flushDeferredAgentStreamingRelayoutIfNeeded()
     }
   }
 
   public func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
     runVisibleAutoDownloads()
+    flushDeferredAgentStreamingRelayoutIfNeeded()
   }
 
   private func updateBottomAnchorInset() {
@@ -2880,14 +2864,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   private func restoreStationaryDistance(_ distanceFromBottom: CGFloat) {
+    // The agent surface never re-anchors the offset to a captured distance-from-
+    // bottom. That value grows as the answer streams in (and is recomputed on every
+    // link-preview / markdown relayout), so re-applying it drags the user back down
+    // and prevents scrolling. The user owns the scroll; only the send pin moves it.
+    if agentChatMode {
+      return
+    }
     let targetOffset = max(
       0.0, collectionView.contentSize.height - collectionView.bounds.height - distanceFromBottom)
-    if agentChatMode {
-      NSLog(
-        "[AgentScroll] restoreStationaryDistance dist:%.1f -> targetOff:%.1f (curOff:%.1f) contentH:%.1f  <<< PUSHER",
-        distanceFromBottom, targetOffset, collectionView.contentOffset.y,
-        collectionView.contentSize.height)
-    }
     _ = targetOffset - collectionView.contentOffset.y  // delta unused
     if let activeSendTransition {
       skipNextTransitionScrollCorrection = true
@@ -4557,13 +4542,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     guard let attrs = collectionView.layoutAttributesForItem(at: indexPath) else { return }
     let target = agentReservedSpacer(forUserMinY: attrs.frame.minY)
 
-    NSLog(
-      "[AgentScroll] applyAgentPin force:%@ userMinY:%.1f target:%.1f curInsetB:%.1f curOff:%.1f detached:%@ track:%@ drag:%@ decel:%@",
-      forceOffset ? "Y" : "N", attrs.frame.minY, target, collectionView.contentInset.bottom,
-      collectionView.contentOffset.y, agentPinUserDetached ? "Y" : "N",
-      collectionView.isTracking ? "Y" : "N", collectionView.isDragging ? "Y" : "N",
-      collectionView.isDecelerating ? "Y" : "N")
-
     // ── Deliberate send pin ──────────────────────────────────────────────────
     // This is the ONLY place the agent surface ever moves the scroll offset, and
     // it runs UNCONDITIONALLY (no interacting / detached guards in front of it).
@@ -4578,9 +4556,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         collectionView.layoutIfNeeded()
       }
       let targetOffsetY = pixelAlignedValue(max(0.0, attrs.frame.minY - contentPaddingTop))
-      NSLog(
-        "[AgentScroll] applyAgentPin SEND set offset %.1f -> %.1f insetB:%.1f",
-        collectionView.contentOffset.y, targetOffsetY, collectionView.contentInset.bottom)
       performInternalScrollAdjustment {
         collectionView.setContentOffset(CGPoint(x: 0.0, y: targetOffsetY), animated: false)
       }
@@ -4600,17 +4575,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // the offset is what force-scrolled before. Shrinking the bottom inset while the
     // question is pinned near the top does not move any visible content.
     if agentPinUserDetached {
-      NSLog("[AgentScroll] applyAgentPin STREAM skip (detached)")
       return
     }
     if collectionView.isTracking || collectionView.isDragging || collectionView.isDecelerating {
-      NSLog("[AgentScroll] applyAgentPin STREAM skip (interacting)")
       return
     }
     if target < agentPushToTopSpacer - 0.5 {
-      NSLog(
-        "[AgentScroll] applyAgentPin STREAM shrink insetB %.1f -> %.1f (off stays %.1f)",
-        collectionView.contentInset.bottom, target, collectionView.contentOffset.y)
       agentPushToTopSpacer = target
       collectionView.contentInset.bottom = target
     }
@@ -5231,38 +5201,66 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         return
       }
 
+      if self.agentChatMode {
+        // While the user is physically scrolling, running the full layout
+        // invalidation + batch update on every streaming token competes with the
+        // scroll gesture and makes it stutter (the reported "laggy" scroll). The
+        // growing answer is almost always off-screen below them at that point, so
+        // defer the heavy relayout and flush it once the scroll settles
+        // (scrollViewDidEnd*). This keeps scrolling smooth without dropping the
+        // measurement.
+        if self.collectionView.isTracking || self.collectionView.isDragging
+          || self.collectionView.isDecelerating
+        {
+          self.pendingDeferredAgentStreamingRelayout = true
+          return
+        }
+        self.performAgentStreamingRelayout()
+        return
+      }
+
       let distanceFromBottom = self.currentDistanceFromBottom()
       let wasNearBottom = distanceFromBottom <= listBottomThreshold
 
-      let offsetBeforeInvalidate = self.collectionView.contentOffset.y
-      NSLog(
-        "[AgentScroll] notif BEFORE invalidate off:%.1f contentH:%.1f insetB:%.1f detached:%@ track:%@ drag:%@ decel:%@",
-        offsetBeforeInvalidate, self.collectionView.contentSize.height,
-        self.collectionView.contentInset.bottom, self.agentPinUserDetached ? "Y" : "N",
-        self.collectionView.isTracking ? "Y" : "N", self.collectionView.isDragging ? "Y" : "N",
-        self.collectionView.isDecelerating ? "Y" : "N")
       self.flowLayout.invalidateLayout()
       self.collectionView.performBatchUpdates(nil) { [weak self] _ in
         guard let self else { return }
-        NSLog(
-          "[AgentScroll] notif AFTER batch off:%.1f (was %.1f, d:%+.1f) contentH:%.1f insetB:%.1f",
-          self.collectionView.contentOffset.y, offsetBeforeInvalidate,
-          self.collectionView.contentOffset.y - offsetBeforeInvalidate,
-          self.collectionView.contentSize.height, self.collectionView.contentInset.bottom)
-        if self.agentChatMode, self.agentStreaming || self.agentPushToTopSpacer > 0 {
-          // Push-to-top turn: only SHRINK the reserved room as the answer grows
-          // (passive frames only) and never touch the offset. The question holds at
-          // the top because the answer grows below it; the send pin is the only
-          // thing that ever moves the offset. Doing nothing once the user scrolls
-          // (detached) is what lets them reach — and stay at — the top.
-          self.applyAgentPin(forceOffset: false)
-        } else if wasNearBottom {
+        if wasNearBottom {
           self.scrollToBottom(animated: true)
         } else {
           self.restoreStationaryDistance(distanceFromBottom)
         }
       }
     }
+  }
+
+  /// Commit the streaming answer's new self-sized height. The answer grows in place
+  /// every chunk; the default `performBatchUpdates` animation re-flows the whole list
+  /// on each token, which jitters/flickers the cells and visibly rocks the pinned
+  /// question. Doing it WITHOUT animation makes the answer extend downward in one step
+  /// and holds the question rock-steady at the top. We re-measure the text but NEVER
+  /// move the offset — only keep the reserved room in sync while a pin is active so the
+  /// dead space collapses as the answer fills the viewport. Once the turn ends (no pin,
+  /// no reserve) we leave the offset exactly where the user/content left it.
+  private func performAgentStreamingRelayout() {
+    guard agentChatMode, window != nil else { return }
+    UIView.performWithoutAnimation {
+      self.flowLayout.invalidateLayout()
+      self.collectionView.performBatchUpdates(nil) { [weak self] _ in
+        guard let self else { return }
+        if self.agentStreaming || self.agentPushToTopSpacer > 0 {
+          self.applyAgentPin(forceOffset: false)
+        }
+      }
+    }
+  }
+
+  /// Flush a streaming relayout that was deferred because the user was scrolling.
+  /// Called when the scroll settles so the answer cell catches up to its final height.
+  private func flushDeferredAgentStreamingRelayoutIfNeeded() {
+    guard pendingDeferredAgentStreamingRelayout else { return }
+    pendingDeferredAgentStreamingRelayout = false
+    performAgentStreamingRelayout()
   }
 
   @objc private func handleAgentCodeBlockExpanded(_ notification: Notification) {

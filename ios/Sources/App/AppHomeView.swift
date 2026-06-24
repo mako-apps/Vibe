@@ -2,6 +2,7 @@ import SwiftUI
 import UIKit
 import WebKit
 import OSLog
+import Darwin
 
 enum AppUITrace {
   static let subsystem = "com.mohammadshayani.vibe.native"
@@ -35,6 +36,10 @@ final class AppUIStallWatchdog {
   private var latestContext = "launch"
   private var lastReportedStallBucket = -1
   private var wasStalled = false
+  /// Mach port for the main thread, captured on the main thread itself. Lets the
+  /// background watchdog read the main thread's run-state during a stall to tell
+  /// a busy-loop (run=running, high cpu) apart from a blocking wait (run=waiting).
+  private var mainMachThread: mach_port_t = 0
 
   private init() {}
 
@@ -92,6 +97,9 @@ final class AppUIStallWatchdog {
   private func recordMainBeat() {
     let now = ProcessInfo.processInfo.systemUptime
     let recovered: (blockedMs: Int, context: String)? = locked {
+      if mainMachThread == 0 {
+        mainMachThread = pthread_mach_thread_np(pthread_self())
+      }
       let elapsed = now - lastMainBeatAt
       lastMainBeatAt = now
       lastReportedStallBucket = -1
@@ -108,21 +116,171 @@ final class AppUIStallWatchdog {
 
   private func checkForStall() {
     let now = ProcessInfo.processInfo.systemUptime
-    let stalled: (blockedMs: Int, context: String)? = locked {
+    let stalled: (blockedMs: Int, context: String, first: Bool)? = locked {
       guard active else { return nil }
       let elapsed = now - lastMainBeatAt
       guard elapsed >= stallThresholdSeconds else { return nil }
       let bucket = Int(elapsed)
       guard bucket != lastReportedStallBucket else { return nil }
       lastReportedStallBucket = bucket
+      let first = !wasStalled
       wasStalled = true
-      return (Int(elapsed * 1000), latestContext)
+      return (Int(elapsed * 1000), latestContext, first)
     }
-    if let stalled {
-      AppUITrace.fault(
-        "main-thread-stall blockedMs=\(stalled.blockedMs) context=\(stalled.context)"
-      )
+    guard let stalled else { return }
+    AppUITrace.fault(
+      "main-thread-stall blockedMs=\(stalled.blockedMs) context=\(stalled.context)"
+    )
+    // Probe the main thread's scheduler state once per stall episode. This is the
+    // single fact the context label can't give us: whether main is BURNING CPU
+    // (run=running → infinite loop / runaway layout) or PARKED (run=waiting →
+    // blocked on a synchronous network/lock/FFI call). It narrows the hunt before
+    // a full `sample`/Instruments capture pins the exact frame.
+    if stalled.first {
+      AppUITrace.fault("main-thread-stall \(mainThreadStateDescription())")
+      AppUITrace.fault("main-thread-stall backtrace:\n\(captureMainThreadStack())")
     }
+  }
+
+  /// Read-only snapshot of the main thread's run-state and CPU usage via
+  /// `thread_info`. Safe to call from the watchdog queue — it does not suspend
+  /// the thread or walk its stack.
+  private func mainThreadStateDescription() -> String {
+    let machThread = locked { mainMachThread }
+    guard machThread != 0 else { return "threadState=unavailable" }
+    var info = thread_basic_info()
+    // THREAD_BASIC_INFO_COUNT is a compound C macro that doesn't import into
+    // Swift; derive the integer-word count from the struct size instead.
+    var count = mach_msg_type_number_t(
+      MemoryLayout<thread_basic_info_data_t>.size / MemoryLayout<integer_t>.size)
+    let kr = withUnsafeMutablePointer(to: &info) { pointer in
+      pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { rebound in
+        thread_info(machThread, thread_flavor_t(THREAD_BASIC_INFO), rebound, &count)
+      }
+    }
+    guard kr == KERN_SUCCESS else { return "threadState=error(kr=\(kr))" }
+    let runLabel: String
+    switch Int32(info.run_state) {
+    case TH_STATE_RUNNING: runLabel = "running"
+    case TH_STATE_STOPPED: runLabel = "stopped"
+    case TH_STATE_WAITING: runLabel = "waiting"
+    case TH_STATE_UNINTERRUPTIBLE: runLabel = "uninterruptible"
+    case TH_STATE_HALTED: runLabel = "halted"
+    default: runLabel = "unknown(\(info.run_state))"
+    }
+    let idle = (Int32(info.flags) & TH_FLAGS_IDLE) != 0
+    let hint =
+      runLabel == "running"
+      ? "likely-infinite-loop" : (runLabel == "waiting" ? "likely-blocking-wait" : "?")
+    return
+      "threadState run=\(runLabel) cpu=\(info.cpu_usage)/\(TH_USAGE_SCALE) idle=\(idle ? "Y" : "N") hint=\(hint)"
+  }
+
+  /// Capture the main thread's call stack during a stall and symbolicate it.
+  ///
+  /// Safety: while the main thread is suspended we do ZERO heap allocation and
+  /// only issue `vm_read_overwrite` (a mach trap that cannot take the malloc
+  /// lock). The frame buffer is pre-reserved before the suspend, and `dladdr`
+  /// symbolication (which may allocate) runs only after the thread is resumed —
+  /// otherwise, if main were suspended inside malloc, the watchdog could deadlock
+  /// and never resume it.
+  private func captureMainThreadStack() -> String {
+    let machThread = locked { mainMachThread }
+    guard machThread != 0 else { return "stack=unavailable" }
+
+    var addresses: [UInt] = []
+    addresses.reserveCapacity(64)
+
+    guard thread_suspend(machThread) == KERN_SUCCESS else {
+      return "stack=suspend-failed"
+    }
+
+    var pc: UInt = 0
+    var fp: UInt = 0
+    var stateOK = false
+    #if arch(arm64)
+    var state = arm_thread_state64_t()
+    var count = mach_msg_type_number_t(
+      MemoryLayout<arm_thread_state64_t>.size / MemoryLayout<natural_t>.size)
+    let kr = withUnsafeMutablePointer(to: &state) { pointer in
+      pointer.withMemoryRebound(to: natural_t.self, capacity: Int(count)) { rebound in
+          thread_get_state(machThread, thread_state_flavor_t(thread_flavor_t(ARM_THREAD_STATE64)), rebound, &count)
+      }
+    }
+    if kr == KERN_SUCCESS {
+      // Strip arm64e pointer-authentication bits (top 16) so dladdr resolves.
+      pc = UInt(state.__pc) & 0x0000_FFFF_FFFF_FFFF
+      fp = UInt(state.__fp)
+      stateOK = true
+    }
+    #elseif arch(x86_64)
+    var state = x86_thread_state64_t()
+    var count = mach_msg_type_number_t(
+      MemoryLayout<x86_thread_state64_t>.size / MemoryLayout<natural_t>.size)
+    let kr = withUnsafeMutablePointer(to: &state) { pointer in
+      pointer.withMemoryRebound(to: natural_t.self, capacity: Int(count)) { rebound in
+        thread_get_state(machThread, thread_state_flavor_t(x86_THREAD_STATE64), rebound, &count)
+      }
+    }
+    if kr == KERN_SUCCESS {
+      pc = UInt(state.__rip)
+      fp = UInt(state.__rbp)
+      stateOK = true
+    }
+    #endif
+
+    if stateOK {
+      addresses.append(pc)
+      var currentFP = fp
+      var depth = 0
+      while currentFP != 0, depth < 48 {
+        guard let savedFP = readWord(at: currentFP),
+          let retAddr = readWord(at: currentFP + UInt(MemoryLayout<UInt>.size))
+        else { break }
+        if retAddr == 0 { break }
+        addresses.append(retAddr & 0x0000_FFFF_FFFF_FFFF)
+        if savedFP <= currentFP { break }  // stack grows down; saved FP is higher
+        currentFP = savedFP
+        depth += 1
+      }
+    }
+
+    thread_resume(machThread)  // resume BEFORE symbolication (dladdr may allocate)
+
+    guard stateOK else { return "stack=state-failed" }
+    let lines = addresses.enumerated().map { index, address in
+      symbolicate(address: address, frame: index)
+    }
+    return lines.joined(separator: "\n")
+  }
+
+  /// Read one machine word from this process's memory without crashing on a bad
+  /// address (`vm_read_overwrite` returns an error instead of faulting).
+  private func readWord(at address: UInt) -> UInt? {
+    var value: UInt = 0
+    var outSize: vm_size_t = 0
+    let kr = withUnsafeMutableBytes(of: &value) { raw -> kern_return_t in
+      guard let base = raw.baseAddress else { return KERN_FAILURE }
+      return vm_read_overwrite(
+        mach_task_self_,
+        vm_address_t(address),
+        vm_size_t(raw.count),
+        vm_address_t(UInt(bitPattern: base)),
+        &outSize)
+    }
+    return (kr == KERN_SUCCESS && outSize == vm_size_t(MemoryLayout<UInt>.size)) ? value : nil
+  }
+
+  private func symbolicate(address: UInt, frame: Int) -> String {
+    var info = Dl_info()
+    if dladdr(UnsafeRawPointer(bitPattern: address), &info) != 0 {
+      let symbol = info.dli_sname.map { String(cString: $0) } ?? "?"
+      let image = info.dli_fname.map { (String(cString: $0) as NSString).lastPathComponent } ?? "?"
+      let symBase = UInt(bitPattern: info.dli_saddr)
+      let offset = address >= symBase ? address - symBase : 0
+      return "\(frame)  \(image)  \(symbol) + \(offset)"
+    }
+    return "\(frame)  ???  0x" + String(address, radix: 16)
   }
 
   private func locked<T>(_ body: () -> T) -> T {
@@ -1166,22 +1324,14 @@ private struct ChatHomeScreen: View {
         // suppressed that glass, which is what the user saw as "removed glass".
         .toolbar {
           ToolbarItem(placement: .topBarLeading) {
-            Button {
-              withAnimation(.easeInOut(duration: 0.18)) {
-                isEditingHome.toggle()
-                if !isEditingHome {
-                  selectedChatIDs.removeAll()
-                }
+            Button(isEditingHome ? "Done" : "Edit") {
+              withAnimation { isEditingHome.toggle() }
+              if !isEditingHome {
+                selectedChatIDs.removeAll()
               }
-            } label: {
-              Text(isEditingHome ? "Done" : "Edit")
-                .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(model.rows.isEmpty ? (colorScheme == .dark ? Color.white.opacity(0.3) : Color.black.opacity(0.3)) : (colorScheme == .dark ? .white : .black))
-                .padding(.horizontal, 14)
-                .padding(.vertical, 6)
             }
-            .buttonStyle(.plain)
-            .contentShape(Rectangle())
+            .font(.system(size: 17, weight: .semibold))
+            .tint(model.rows.isEmpty ? (colorScheme == .dark ? Color.white.opacity(0.3) : Color.black.opacity(0.3)) : (colorScheme == .dark ? .white : .black))
             .disabled(model.rows.isEmpty)
           }
 
@@ -1192,8 +1342,22 @@ private struct ChatHomeScreen: View {
             )
           }
 
-          ToolbarItem(placement: .topBarTrailing) {
+          if !isEditingHome {
+            ToolbarItem(placement: .topBarTrailing) {
             HStack(spacing: 18) {
+              Button {
+                openAgentChat()
+              } label: {
+                Image("BrandLogo")
+                  .renderingMode(.template)
+                  .resizable()
+                  .scaledToFit()
+                  .foregroundStyle(colorScheme == .dark ? .white : .black)
+                  .frame(width: 22, height: 22)
+              }
+              .buttonStyle(.plain)
+              .contentShape(Rectangle())
+
               Button {
                 isShowingStoryCamera = true
               } label: {
@@ -1211,19 +1375,9 @@ private struct ChatHomeScreen: View {
               }
               .buttonStyle(.plain)
               .contentShape(Rectangle())
-
-              Button {
-                openAgentChat()
-              } label: {
-                Image(systemName: "sparkles")
-                  .font(.system(size: 19, weight: .regular))
-                  .foregroundStyle(colorScheme == .dark ? .white : .black)
-                  .frame(width: 22, height: 22)
-              }
-              .buttonStyle(.plain)
-              .contentShape(Rectangle())
             }
             .padding(.horizontal, 6)
+          }
           }
         }
         .searchable(
@@ -1271,7 +1425,6 @@ private struct ChatHomeScreen: View {
       }
       .ignoresSafeArea()
     }
-    .animation(.easeInOut(duration: 0.18), value: isEditingHome)
   }
 
 
@@ -2226,6 +2379,7 @@ private struct ContactsPageView: View {
   @Environment(\.colorScheme) private var colorScheme
   @StateObject private var model = ContactDirectoryViewModel()
   @State private var isShowingSearch = false
+  @State private var isEditingContacts = false
   @State private var isStartingChat = false
   @State private var errorMessage: String?
 
@@ -2252,51 +2406,74 @@ private struct ContactsPageView: View {
             isShowingSearch = true
           }
         } else {
-          List {
-            ForEach(model.rows, id: \.chatId) { row in
-              Button {
-                coordinator.openChat(ChatRoute(row: row))
-              } label: {
-                ChatHomeRowView(row: row, palette: palette)
-              }
-              .buttonStyle(.plain)
-              .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
-              .listRowSeparator(.hidden)
-              .listRowBackground(Color.clear)
-            }
-
-            if isStartingChat {
-              Section {
-                HStack(spacing: 12) {
-                  ProgressView()
-                  Text("Opening chat")
-                    .foregroundStyle(palette.secondaryText)
-                }
-              }
-              .listRowBackground(palette.card)
-            }
-          }
-          .listStyle(.plain)
-          .scrollContentBackground(.hidden)
+          ChatHomeNativeListRepresentable(
+            rows: model.rows,
+            isDark: colorScheme == .dark,
+            isEditing: isEditingContacts,
+            showsRightCheckmark: false,
+            selectedChatIDs: [],
+            onSelect: { row in
+              coordinator.openChat(ChatRoute(row: row))
+            },
+            onToggleSelection: { _ in },
+            onRefresh: { await model.refresh() },
+            onUnavailableAction: { _ in }
+          )
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+          .background(palette.background)
         }
       }
       .background(palette.background.ignoresSafeArea())
       .navigationBarTitleDisplayMode(.inline)
-      .toolbarBackground(palette.background, for: .navigationBar)
-      .toolbarBackground(.visible, for: .navigationBar)
       .toolbar {
         ToolbarItem(placement: .topBarLeading) {
+          Button(isEditingContacts ? "Done" : "Edit") {
+            withAnimation { isEditingContacts.toggle() }
+          }
+          .font(.system(size: 17, weight: .semibold))
+          .tint(colorScheme == .dark ? .white : .black)
+        }
+
+        ToolbarItem(placement: .principal) {
           Text("Contacts")
             .font(.system(size: 17, weight: .semibold))
-            .foregroundStyle(palette.text)
+            .foregroundStyle(colorScheme == .dark ? .white : .black)
         }
-        ToolbarItem(placement: .topBarTrailing) {
-          Button {
-            isShowingSearch = true
-          } label: {
-            AppVectorIcon(glyph: .compose, tint: palette.secondaryText)
-              .frame(width: 22, height: 22)
+
+        if !isEditingContacts {
+          ToolbarItem(placement: .topBarTrailing) {
+          HStack(spacing: 18) {
+            Button {
+            } label: {
+              Image("BrandLogo")
+                .renderingMode(.template)
+                .resizable()
+                .scaledToFit()
+                .foregroundStyle(colorScheme == .dark ? .white : .black)
+                .frame(width: 22, height: 22)
+            }
+            .buttonStyle(.plain)
+            .contentShape(Rectangle())
+
+            Button {
+            } label: {
+              AppVectorIcon(glyph: .story, tint: colorScheme == .dark ? .white : .black)
+                .frame(width: 22, height: 22)
+            }
+            .buttonStyle(.plain)
+            .contentShape(Rectangle())
+
+            Button {
+              isShowingSearch = true
+            } label: {
+              AppVectorIcon(glyph: .compose, tint: colorScheme == .dark ? .white : .black)
+                .frame(width: 22, height: 22)
+            }
+            .buttonStyle(.plain)
+            .contentShape(Rectangle())
           }
+          .padding(.horizontal, 6)
+        }
         }
       }
     }
@@ -2414,6 +2591,7 @@ private struct ContactsPageView: View {
 
 private struct CallsPageView: View {
   @Environment(\.colorScheme) private var colorScheme
+  @State private var isEditingCalls = false
 
   private var palette: AppThemePalette {
     AppThemePalette.resolve(for: colorScheme)
@@ -2431,13 +2609,54 @@ private struct CallsPageView: View {
       )
       .background(palette.background.ignoresSafeArea())
       .navigationBarTitleDisplayMode(.inline)
-      .toolbarBackground(palette.background, for: .navigationBar)
-      .toolbarBackground(.visible, for: .navigationBar)
       .toolbar {
         ToolbarItem(placement: .topBarLeading) {
+          Button(isEditingCalls ? "Done" : "Edit") {
+            withAnimation { isEditingCalls.toggle() }
+          }
+          .font(.system(size: 17, weight: .semibold))
+          .tint(colorScheme == .dark ? .white : .black)
+        }
+
+        ToolbarItem(placement: .principal) {
           Text("Calls")
             .font(.system(size: 17, weight: .semibold))
-            .foregroundStyle(palette.text)
+            .foregroundStyle(colorScheme == .dark ? .white : .black)
+        }
+
+        if !isEditingCalls {
+          ToolbarItem(placement: .topBarTrailing) {
+          HStack(spacing: 18) {
+            Button {
+            } label: {
+              Image("BrandLogo")
+                .renderingMode(.template)
+                .resizable()
+                .scaledToFit()
+                .foregroundStyle(colorScheme == .dark ? .white : .black)
+                .frame(width: 22, height: 22)
+            }
+            .buttonStyle(.plain)
+            .contentShape(Rectangle())
+
+            Button {
+            } label: {
+              AppVectorIcon(glyph: .story, tint: colorScheme == .dark ? .white : .black)
+                .frame(width: 22, height: 22)
+            }
+            .buttonStyle(.plain)
+            .contentShape(Rectangle())
+
+            Button {
+            } label: {
+              AppVectorIcon(glyph: .compose, tint: colorScheme == .dark ? .white : .black)
+                .frame(width: 22, height: 22)
+            }
+            .buttonStyle(.plain)
+            .contentShape(Rectangle())
+          }
+          .padding(.horizontal, 6)
+        }
         }
       }
     }

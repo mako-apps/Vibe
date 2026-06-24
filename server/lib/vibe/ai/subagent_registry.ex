@@ -302,12 +302,31 @@ defmodule Vibe.AI.SubagentRegistry do
   defp fallback_sentence(""), do: nil
   defp fallback_sentence(text), do: "#{truncate_detail(text)}..."
 
+  # Progress chips must stay short — they render in a single-line shimmer row.
+  # Keep at most a few words of detail and trim any dangling partial word.
+  @progress_detail_limit 36
+
   defp truncate_detail(detail) do
     detail
     |> String.trim_leading("whether ")
     |> String.trim_leading("if ")
-    |> String.slice(0, 96)
     |> String.trim()
+    |> shorten_to_words(@progress_detail_limit)
+  end
+
+  defp shorten_to_words(text, limit) do
+    if String.length(text) <= limit do
+      text
+    else
+      text
+      |> String.slice(0, limit)
+      |> String.replace(~r/\s+\S*$/u, "")
+      |> String.trim()
+      |> case do
+        "" -> String.slice(text, 0, limit) |> String.trim()
+        shortened -> shortened
+      end
+    end
   end
 
   defp fallback_progress_label("builder_assistant"), do: "Reviewing your agent setup..."

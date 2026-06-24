@@ -1090,7 +1090,6 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   private let headerMaskView = UIView()
   private let headerMaskBlurView = UIVisualEffectView(effect: UIBlurEffect(style: .regular))
   private let headerMaskOverlayView = UIView()
-  private let headerMaskGradientLayer = CAGradientLayer()
   private let headerContainer = UIView()
   private let headerContentView = UIView()
   private let backButton = UIButton(type: .system)
@@ -1099,8 +1098,6 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   private let subtitleLabel = UILabel()
 
   private let tableView = UITableView(frame: .zero, style: .insetGrouped)
-  private let stickyTabsContainer = UIView()
-  private let stickyTabsView = ChatProfileTabStripView()
   private let floatingAvatarView: NativeProfileAvatarView
 
   private let heroHeaderView = UIView()
@@ -1122,10 +1119,6 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   private var fileRows: [ChatProfileRow] = []
   private var pinnedRows: [ChatProfileRow] = []
   private var linkRows: [ChatProfileLinkItem] = []
-
-  private var availableTabs: [ChatProfileTab] = []
-  private var activeTab: ChatProfileTab = .media
-  private weak var inlineTabsCell: ChatProfileTabStripCell?
 
 
   private var profileName = "User"
@@ -1199,7 +1192,6 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     headerMaskView.frame = headerMaskContainer.bounds
     headerMaskBlurView.frame = headerMaskView.bounds
     headerMaskOverlayView.frame = headerMaskBlurView.bounds
-    headerMaskGradientLayer.frame = headerMaskView.bounds
     headerContainer.frame = headerMaskContainer.frame
     headerContentView.frame = CGRect(
       x: 12.0,
@@ -1223,20 +1215,29 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     tableView.frame = bounds
     tableView.scrollIndicatorInsets = UIEdgeInsets(
       top: headerHeight, left: 0.0, bottom: 0.0, right: 0.0)
-    stickyTabsContainer.frame = CGRect(
-      x: 12.0,
-      y: headerHeight + 8.0,
-      width: max(0.0, bounds.width - 24.0),
-      height: availableTabs.isEmpty ? 0.0 : ChatProfileTabStripView.preferredHeight
-    )
-    stickyTabsView.frame = stickyTabsContainer.bounds
 
     layoutHeroHeaderViewIfNeeded(force: true)
+    
+    // Position actionsStack
+    let actionsHeight: CGFloat = 72.0
+    let originalActionsY = heroHeaderView.frame.minY + min(
+      max(heroNameLabel.frame.maxY + 48.0, heroBannerView.bounds.height - actionsHeight - 14.0),
+      heroBannerView.bounds.height - actionsHeight - 8.0
+    ) - tableView.contentOffset.y
+    let stickyY = headerHeight + 8.0
+    let finalActionsY = max(stickyY, originalActionsY)
+    
+    actionsStack.frame = CGRect(
+      x: 26.0,
+      y: finalActionsY,
+      width: bounds.width - 52.0,
+      height: actionsHeight
+    )
+    
     layoutFloatingAvatarView()
     updateAvatarMorphProgress()
-    updateStickyTabsPresentation()
     bringSubviewToFront(headerMaskContainer)
-    bringSubviewToFront(stickyTabsContainer)
+    bringSubviewToFront(actionsStack)
     bringSubviewToFront(floatingAvatarView)
     bringSubviewToFront(headerContainer)
 
@@ -1381,7 +1382,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     clipsToBounds = false
 
     addSubview(headerMaskContainer)
-    headerMaskContainer.clipsToBounds = false
+    headerMaskContainer.clipsToBounds = true
     headerMaskContainer.isUserInteractionEnabled = false
     headerMaskContainer.layer.zPosition = 20.0
     headerMaskContainer.alpha = 0.0
@@ -1389,13 +1390,6 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     headerMaskContainer.addSubview(headerMaskView)
     headerMaskView.addSubview(headerMaskBlurView)
     headerMaskBlurView.contentView.addSubview(headerMaskOverlayView)
-    headerMaskGradientLayer.colors = [
-      UIColor.black.withAlphaComponent(0.95).cgColor,
-      UIColor.black.withAlphaComponent(0.72).cgColor,
-      UIColor.clear.cgColor,
-    ]
-    headerMaskGradientLayer.locations = [0.0, 0.58, 1.0]
-    headerMaskView.layer.mask = headerMaskGradientLayer
     addSubview(headerContainer)
     headerContainer.clipsToBounds = false
     headerContainer.addSubview(headerContentView)
@@ -1448,19 +1442,15 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     }
     addSubview(tableView)
 
-    stickyTabsContainer.alpha = 0.0
-    stickyTabsContainer.isHidden = true
-    stickyTabsContainer.clipsToBounds = false
-    stickyTabsContainer.layer.zPosition = 54.0
-    stickyTabsContainer.addSubview(stickyTabsView)
-    addSubview(stickyTabsContainer)
+    addSubview(actionsStack)
+    actionsStack.layer.zPosition = 54.0
 
     addSubview(floatingAvatarView)
     floatingAvatarView.clipsToBounds = false
     floatingAvatarView.isUserInteractionEnabled = false
     floatingAvatarView.layer.zPosition = 40.0
     bringSubviewToFront(headerMaskContainer)
-    bringSubviewToFront(stickyTabsContainer)
+    bringSubviewToFront(actionsStack)
     bringSubviewToFront(floatingAvatarView)
     bringSubviewToFront(headerContainer)
 
@@ -1498,15 +1488,9 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     heroBannerView.addSubview(heroBioLabel)
 
     actionsStack.axis = .horizontal
-    actionsStack.distribution = .fillEqually
-    actionsStack.alignment = .fill
-    actionsStack.spacing = 8.0
+    actionsStack.distribution = .equalCentering
+    actionsStack.alignment = .center
     actionsStack.semanticContentAttribute = .forceLeftToRight
-    heroBannerView.addSubview(actionsStack)
-
-    [audioActionButton, videoActionButton, muteActionButton, searchActionButton].forEach {
-      actionsStack.addArrangedSubview($0)
-    }
 
     muteActionButton.addTarget(self, action: #selector(handleMutePressed), for: .touchUpInside)
     searchActionButton.addTarget(self, action: #selector(handleSearchPressed), for: .touchUpInside)
@@ -1565,14 +1549,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       y = heroBioLabel.frame.maxY + 14.0
     }
 
-    let actionsHeight: CGFloat = 72.0
-    let actionsY = min(
-      max(y, heroBannerView.bounds.height - actionsHeight - 14.0),
-      heroBannerView.bounds.height - actionsHeight - 8.0)
-    actionsStack.frame = CGRect(
-      x: 10.0, y: actionsY, width: heroBannerView.bounds.width - 20.0, height: actionsHeight)
-
-    let headerHeight = heroBannerView.frame.maxY + 10.0
+    let headerHeight = heroBannerView.frame.maxY + 30.0 // Added bottom padding to accommodate actionsStack overlaps
     if force || heroHeaderView.frame.width != width
       || abs(heroHeaderView.frame.height - headerHeight) > 0.5
     {
@@ -1657,8 +1634,6 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     heroHandleButton.setTitleColor(secondary, for: .normal)
     heroBioLabel.textColor = secondary
     heroBannerView.backgroundColor = .clear
-    stickyTabsContainer.backgroundColor = .clear
-    stickyTabsView.applyTheme(isDark: isDark)
     floatingAvatarView.setIslandCoverUIColor(background)
     floatingAvatarView.setFallbackBackgroundUIColor(fallbackAvatarBackground)
     floatingAvatarView.setFallbackIconTintUIColor(fallbackAvatarIconTint)
@@ -1675,8 +1650,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       : UIColor(white: 0.0, alpha: 0.04)
     currentRowCardColor =
       isDark
-      ? UIColor.secondarySystemGroupedBackground.withAlphaComponent(0.72)
-      : card.withAlphaComponent(0.98)
+      ? UIColor.secondarySystemGroupedBackground.withAlphaComponent(0.2)
+      : card.withAlphaComponent(0.4)
     currentRowAccentColor = rowAccent
     currentRowIconBackgroundColor = rowAccent.withAlphaComponent(0.12)
 
@@ -1701,8 +1676,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   }
 
   private func resolvedActiveTabSubtitleText() -> String? {
-    guard !availableTabs.isEmpty else { return nil }
-    return "\(sharedCount(for: activeTab)) \(sharedTitle(for: activeTab))"
+    return nil
   }
 
   private func resolvedHeroSubheaderText() -> String {
@@ -1784,7 +1758,28 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       || (subtitleLabel.text?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
     titleLabel.alpha = textAlpha
     subtitleLabel.alpha = textAlpha
-    updateStickyTabsPresentation()
+    
+    // If we've scrolled enough, actionsStack becomes sticky.
+    let headerHeight = safeAreaInsets.top + 60.0
+    let originalActionsY = heroHeaderView.frame.minY + min(
+      max(heroNameLabel.frame.maxY + 48.0, heroBannerView.bounds.height - 72.0 - 14.0),
+      heroBannerView.bounds.height - 72.0 - 8.0
+    ) - offset
+    let stickyY = headerHeight + 8.0
+    actionsStack.frame.origin.y = max(stickyY, originalActionsY)
+    
+    // Add a blur behind the sticky actions
+    if originalActionsY < stickyY {
+      headerMaskContainer.frame.size.height = headerHeight + 8.0 + 72.0 + 8.0
+      headerMaskView.frame = headerMaskContainer.bounds
+      headerMaskBlurView.frame = headerMaskView.bounds
+      headerMaskOverlayView.frame = headerMaskBlurView.bounds
+    } else {
+      headerMaskContainer.frame.size.height = headerHeight
+      headerMaskView.frame = headerMaskContainer.bounds
+      headerMaskBlurView.frame = headerMaskView.bounds
+      headerMaskOverlayView.frame = headerMaskBlurView.bounds
+    }
   }
 
   private func refreshAvatar() {
@@ -1978,15 +1973,26 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     cell.contentView.backgroundColor = .clear
     if #available(iOS 14.0, *) {
       var background = UIBackgroundConfiguration.listGroupedCell()
-      background.backgroundColor = currentRowCardColor
+      background.backgroundColor = .clear
+      
+      let blurEffect = UIBlurEffect(style: traitCollection.userInterfaceStyle == .dark ? .systemThinMaterialDark : .systemMaterialLight)
+      let blurView = UIVisualEffectView(effect: blurEffect)
+      blurView.contentView.backgroundColor = currentRowCardColor
+      blurView.layer.cornerRadius = 22.0
+      blurView.layer.cornerCurve = .continuous
+      blurView.clipsToBounds = true
+      
+      background.customView = blurView
       background.cornerRadius = 22.0
       cell.backgroundConfiguration = background
     } else {
-      let backgroundView = UIView()
-      backgroundView.backgroundColor = currentRowCardColor
-      backgroundView.layer.cornerRadius = 22.0
-      backgroundView.layer.cornerCurve = .continuous
-      cell.backgroundView = backgroundView
+      let blurEffect = UIBlurEffect(style: traitCollection.userInterfaceStyle == .dark ? .systemThinMaterialDark : .systemMaterialLight)
+      let blurView = UIVisualEffectView(effect: blurEffect)
+      blurView.contentView.backgroundColor = currentRowCardColor
+      blurView.layer.cornerRadius = 22.0
+      blurView.layer.cornerCurve = .continuous
+      blurView.clipsToBounds = true
+      cell.backgroundView = blurView
     }
   }
 
@@ -2339,8 +2345,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
 
   private enum Section: Int, CaseIterable {
     case info
-    case tabs
-    case content
+    case contentRows
   }
 
   func scrollViewDidScroll(_ scrollView: UIScrollView) {
@@ -2361,10 +2366,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     switch section {
     case .info:
       return currentInfoRows().count
-    case .tabs:
-      return availableTabs.isEmpty ? 0 : 1
-    case .content:
-      return currentContentCount()
+    case .contentRows:
+      return availableTabs.count
     }
   }
 
@@ -2399,22 +2402,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       default:
         return 68.0
       }
-    case .tabs:
-      return ChatProfileTabStripView.preferredHeight + 12.0
-    case .content:
-      switch activeTab {
-      case .media:
-        let cols: CGFloat = 3.0
-        let padding: CGFloat = 16.0
-        let gap: CGFloat = 2.0
-        let avail = max(0.0, tableView.bounds.width - padding * 2.0 - gap * (cols - 1))
-        let itemHeight = floor(avail / cols)
-        return itemHeight + gap
-      case .voice, .gifs:
-        return 72.0
-      default:
-        return 68.0
-      }
+    case .contentRows:
+      return 68.0
     }
   }
 
@@ -2593,44 +2582,31 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
 
       return cell
 
-    case .tabs:
-      guard
-        let cell = tableView.dequeueReusableCell(
-          withIdentifier: ChatProfileTabStripCell.reuseIdentifier,
+    case .contentRows:
+      guard let cell = tableView.dequeueReusableCell(
+          withIdentifier: ChatProfileListRowCell.reuseIdentifier,
           for: indexPath
-        ) as? ChatProfileTabStripCell
+        ) as? ChatProfileListRowCell
       else {
         return UITableViewCell(style: .default, reuseIdentifier: nil)
       }
-      inlineTabsCell = cell
-      cell.backgroundColor = .clear
-      cell.contentView.backgroundColor = .clear
-      cell.tabsView.applyTheme(isDark: traitCollection.userInterfaceStyle == .dark)
-      cell.tabsView.onSelect = { [weak self] tab in
-        self?.switchToTab(tab, animated: true)
-      }
-      cell.tabsView.configure(
-        tabs: availableTabs,
-        activeTab: activeTab,
-        titleProvider: tabButtonTitle(_:))
+      let tab = availableTabs[indexPath.row]
+      let isLast = indexPath.row == availableTabs.count - 1
+      configureListRowCell(
+        cell,
+        title: sharedTitle(for: tab),
+        subtitle: "",
+        value: "\(sharedCount(for: tab))",
+        iconName: sharedIconName(for: tab),
+        showsSeparator: !isLast
+      )
       return cell
-
-    case .content:
-      return contentListCell(tableView, indexPath: indexPath)
     }
   }
 
   func tableView(
     _ tableView: UITableView, didEndDisplaying cell: UITableViewCell, forRowAt indexPath: IndexPath
   ) {
-    guard let section = Section(rawValue: indexPath.section) else { return }
-    if section == .tabs, inlineTabsCell === cell {
-      inlineTabsCell = nil
-    } else if section == .content {
-      if let voiceCell = cell as? VoicePlayableCell {
-        VoiceBubblePlaybackCoordinator.shared.unbind(cell: voiceCell)
-      }
-    }
   }
 
   func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
@@ -2659,41 +2635,34 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
         break
       }
 
-    case .tabs:
-      break
-
-    case .content:
-      guard let row = contentRow(at: indexPath.row) else { return }
-      if activeTab == .voice {
-        if let cell = tableView.cellForRow(at: indexPath) as? VoicePlayableCell {
-          VoiceBubblePlaybackCoordinator.shared.toggle(
-            cell: cell,
-            messageId: row.messageId,
-            mediaURL: row.mediaUrl,
-            mediaKey: row.mediaKey,
-            fileName: row.fileName
-          )
-        }
-        return
+    case .contentRows:
+      let tab = availableTabs[indexPath.row]
+      let isDark = traitCollection.userInterfaceStyle == .dark
+      var targetRows: [Any] = []
+      switch tab {
+      case .media: targetRows = mediaRows
+      case .voice: targetRows = voiceRows
+      case .gifs: targetRows = gifRows
+      case .files: targetRows = fileRows
+      case .links: targetRows = linkRows
+      case .pinned: targetRows = pinnedRows
       }
-
-      if activeTab == .media {
-        return
+      
+      guard let sourceCell = tableView.cellForRow(at: indexPath) else { return }
+      let controller = ChatProfileExpandedContentViewController(
+        tab: tab,
+        rows: targetRows,
+        themeIsDark: isDark,
+        sourceView: sourceCell,
+        hostView: self
+      )
+      controller.onContentPressed = { [weak self] payload in
+        self?.onNativeEvent(payload)
       }
-
-      var payload: [String: Any] = [
-        "type": "profileContentPressed",
-        "tab": activeTab.rawValue,
-        "messageId": row.messageId,
-      ]
-
-      if activeTab == .links {
-        payload["url"] = linkRows[indexPath.row].url
-      } else if let mediaUrl = row.mediaUrl, !mediaUrl.isEmpty {
-        payload["url"] = mediaUrl
+      
+      if let presenter = topMostViewController() {
+        presenter.present(controller, animated: false)
       }
-
-      onNativeEvent(payload)
     }
   }
 

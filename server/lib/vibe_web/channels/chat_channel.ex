@@ -5,6 +5,7 @@ defmodule VibeWeb.ChatChannel do
   alias Vibe.Chat.AgentMessageCrypto
   alias Vibe.Notifications
   alias Vibe.AI.GroupAgent
+  alias Vibe.AI.LocalAgentWorker
   alias Vibe.AI.StandaloneAgent
   require Logger
 
@@ -259,7 +260,11 @@ defmodule VibeWeb.ChatChannel do
 
     agent_mention = data["agentMention"] || false
     mentioned_agent_id = data["mentionedAgentId"] || data["mentioned_agent_id"]
-    mentioned_agent_username = data["mentionedAgentUsername"] || data["mentioned_agent_username"]
+
+    mentioned_agent_username =
+      data["mentionedAgentUsername"] || data["mentioned_agent_username"] ||
+        reserved_worker_mention_from_text(data)
+
     agent_text = data["agentText"]
     reply_to_id = data["replyToId"] || data["reply_to_id"]
 
@@ -282,6 +287,14 @@ defmodule VibeWeb.ChatChannel do
 
         true ->
           nil
+      end
+
+    local_worker =
+      if standalone_agent do
+        nil
+      else
+        LocalAgentWorker.resolve_handle(mentioned_agent_username) ||
+          LocalAgentWorker.resolve_from_message(reply_message)
       end
 
     standalone_agent =
@@ -318,6 +331,23 @@ defmodule VibeWeb.ChatChannel do
     attachment_context = extract_agent_attachment_context(chat_id, data, user_id)
 
     cond do
+      local_worker && is_binary(dispatch_text) ->
+        trigger_type =
+          cond do
+            is_binary(mentioned_agent_username) -> "mention"
+            reply_message -> "reply"
+            true -> "reserved_worker"
+          end
+
+        spawn_local_worker_dispatch(
+          chat_id,
+          local_worker,
+          dispatch_text,
+          data,
+          trigger_type,
+          user_id
+        )
+
       standalone_agent && is_binary(dispatch_text) ->
         trigger_type =
           cond do
@@ -352,6 +382,81 @@ defmodule VibeWeb.ChatChannel do
 
       true ->
         Logger.info("[ChatChannel] No agent mention detected for chat #{chat_id}")
+    end
+  end
+
+  defp spawn_local_worker_dispatch(
+         chat_id,
+         worker,
+         dispatch_text,
+         data,
+         _trigger_type,
+         requester_user_id
+       ) do
+    cond do
+      not LocalAgentWorker.allow_request?(requester_user_id) ->
+        LocalAgentWorker.post_notice(
+          worker,
+          chat_id,
+          "You're sending @#{worker.handle} tasks too quickly. Please wait a few seconds and try again.",
+          requester_user_id,
+          data["id"]
+        )
+
+      true ->
+        run = fn ->
+          broadcast_agent_activity(
+            chat_id,
+            LocalAgentWorker.agent_user_id(),
+            "#{worker.label} working...",
+            "running"
+          )
+
+          try do
+            case LocalAgentWorker.handle_chat_message(
+                   worker,
+                   chat_id,
+                   dispatch_text,
+                   reply_to_id: data["id"],
+                   requester_user_id: requester_user_id,
+                   progress_callback: fn event ->
+                     broadcast_agent_activity(
+                       chat_id,
+                       LocalAgentWorker.agent_user_id(),
+                       Map.get(event, "label") || "#{worker.label} working...",
+                       "running",
+                       Map.get(event, "tool")
+                     )
+                   end
+                 ) do
+              {:ok, _response} ->
+                Logger.info(
+                  "[ChatChannel] Local worker responded chat_id=#{chat_id} provider=#{worker.handle}"
+                )
+
+              {:error, reason} ->
+                Logger.error(
+                  "[ChatChannel] Local worker dispatch failed chat_id=#{chat_id} provider=#{worker.handle} reason=#{inspect(reason)}"
+                )
+            end
+          after
+            stop_agent_activity(chat_id, LocalAgentWorker.agent_user_id())
+          end
+        end
+
+        case Task.Supervisor.start_child(Vibe.AI.WorkerTaskSupervisor, run) do
+          {:error, :max_children} ->
+            LocalAgentWorker.post_notice(
+              worker,
+              chat_id,
+              "#{worker.label} is busy with other tasks right now. Please try again in a moment.",
+              requester_user_id,
+              data["id"]
+            )
+
+          _ ->
+            :ok
+        end
     end
   end
 
@@ -438,6 +543,15 @@ defmodule VibeWeb.ChatChannel do
     end
   end
 
+  defp reserved_worker_mention_from_text(data) do
+    text = data["pushPreview"] || data["textPreview"] || data["text"] || data["body"]
+
+    case LocalAgentWorker.extract_reserved_mention(text) do
+      %{handle: handle} -> handle
+      _ -> nil
+    end
+  end
+
   defp message_metadata_for_persistence(data, standalone_agent) do
     base_metadata =
       case data["metadata"] do
@@ -462,18 +576,27 @@ defmodule VibeWeb.ChatChannel do
     end
   end
 
-  defp broadcast_agent_activity(chat_id, agent_user_id, label, status) do
+  defp broadcast_agent_activity(chat_id, agent_user_id, label, status, tool \\ nil) do
     VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "typing", %{
       "userId" => agent_user_id,
       "isAgent" => true
     })
 
-    VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-progress", %{
-      "userId" => agent_user_id,
-      "isAgent" => true,
-      "label" => label,
-      "status" => status
-    })
+    payload =
+      %{
+        "userId" => agent_user_id,
+        "isAgent" => true,
+        "label" => label,
+        "status" => status
+      }
+      |> then(fn payload ->
+        case tool do
+          value when is_binary(value) and value != "" -> Map.put(payload, "tool", value)
+          _ -> payload
+        end
+      end)
+
+    VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-progress", payload)
   end
 
   defp stop_agent_activity(chat_id, agent_user_id) do

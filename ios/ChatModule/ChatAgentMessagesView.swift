@@ -613,16 +613,28 @@ private final class ChatNativeAgentPlainTextView: UIView {
     restartShimmerAnimation()
   }
 
+  // Size the shimmer band relative to the (often short) progress text so the
+  // highlight visibly sweeps left→right across the label instead of glinting the
+  // whole word at once. Band ≈ 55% of the text, clamped to a sensible range, and
+  // the lead-in/out padding stays small so the highlight spends its time on text.
+  private func effectiveShimmerBand() -> (band: CGFloat, padding: CGFloat) {
+    let contentWidth = max(shimmerLabel.bounds.width, 1.0)
+    let band = max(36.0, min(shimmerBandWidth, contentWidth * 0.55))
+    let padding = min(shimmerTravelPadding, band * 0.6)
+    return (band, padding)
+  }
+
   private func restartShimmerAnimation() {
     shimmerGradient.removeAnimation(forKey: "shimmerTranslate")
     shimmerGradient.transform = CATransform3DIdentity
 
     let contentWidth = max(shimmerLabel.bounds.width, 1.0)
     shimmerAnimatedWidth = contentWidth
+    let (band, padding) = effectiveShimmerBand()
 
     let animation = CABasicAnimation(keyPath: "transform.translation.x")
     animation.fromValue = 0.0
-    animation.toValue = contentWidth + shimmerBandWidth + shimmerTravelPadding * 2.0
+    animation.toValue = contentWidth + band + padding * 2.0
     animation.duration = 2.45
     animation.repeatCount = .infinity
     animation.timingFunction = CAMediaTimingFunction(name: .linear)
@@ -639,12 +651,13 @@ private final class ChatNativeAgentPlainTextView: UIView {
   }
 
   private func updateShimmerGradientFrame() {
+    let (band, padding) = effectiveShimmerBand()
     CATransaction.begin()
     CATransaction.setDisableActions(true)
     shimmerGradient.frame = CGRect(
-      x: -(shimmerBandWidth + shimmerTravelPadding),
+      x: -(band + padding),
       y: 0.0,
-      width: shimmerBandWidth,
+      width: band,
       height: max(shimmerLabel.bounds.height, 18.0)
     )
     CATransaction.commit()
@@ -875,16 +888,27 @@ private final class ChatNativeAgentProgressStepView: UIView {
     restartShimmerAnimation()
   }
 
+  // See ChatNativeAgentPlainTextView.effectiveShimmerBand — band sized to the
+  // text so the highlight sweeps a short progress label instead of glinting it
+  // whole.
+  private func effectiveShimmerBand() -> (band: CGFloat, padding: CGFloat) {
+    let contentWidth = max(shimmerLabel.bounds.width, 1.0)
+    let band = max(36.0, min(shimmerBandWidth, contentWidth * 0.55))
+    let padding = min(shimmerTravelPadding, band * 0.6)
+    return (band, padding)
+  }
+
   private func restartShimmerAnimation() {
     shimmerGradient.removeAnimation(forKey: "stepShimmerTranslate")
     shimmerGradient.transform = CATransform3DIdentity
 
     let contentWidth = max(shimmerLabel.bounds.width, 1.0)
     shimmerAnimatedWidth = contentWidth
+    let (band, padding) = effectiveShimmerBand()
 
     let animation = CABasicAnimation(keyPath: "transform.translation.x")
     animation.fromValue = 0.0
-    animation.toValue = contentWidth + shimmerBandWidth + shimmerTravelPadding * 2.0
+    animation.toValue = contentWidth + band + padding * 2.0
     animation.duration = 2.45
     animation.repeatCount = .infinity
     animation.timingFunction = CAMediaTimingFunction(name: .linear)
@@ -901,12 +925,13 @@ private final class ChatNativeAgentProgressStepView: UIView {
   }
 
   private func updateShimmerGradientFrame() {
+    let (band, padding) = effectiveShimmerBand()
     CATransaction.begin()
     CATransaction.setDisableActions(true)
     shimmerGradient.frame = CGRect(
-      x: -(shimmerBandWidth + shimmerTravelPadding),
+      x: -(band + padding),
       y: 0.0,
-      width: shimmerBandWidth,
+      width: band,
       height: max(shimmerLabel.bounds.height, 18.0)
     )
     CATransaction.commit()

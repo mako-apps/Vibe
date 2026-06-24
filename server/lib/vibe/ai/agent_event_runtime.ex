@@ -49,7 +49,13 @@ defmodule Vibe.AI.AgentEventRuntime do
 
   def execute_approved_task(%Agent{} = agent, %AgentApprovalTask{} = task) do
     with %AgentEventThread{} = thread <- Repo.get(AgentEventThread, task.thread_id),
-         {:ok, payload} <- execute_requested_action(agent, thread, task.requested_action || %{}, thread.root_message_id),
+         {:ok, payload} <-
+           execute_requested_action(
+             agent,
+             thread,
+             task.requested_action || %{},
+             thread.root_message_id
+           ),
          {:ok, _thread} <-
            thread
            |> AgentEventThread.changeset(%{
@@ -67,12 +73,13 @@ defmodule Vibe.AI.AgentEventRuntime do
   defp persist_event(%Agent{} = agent, integration, normalized) do
     existing =
       Repo.one(
-        from e in AgentEvent,
+        from(e in AgentEvent,
           where:
             e.agent_id == ^agent.id and
               e.source == ^normalized.source and
               e.event_id == ^normalized.event_id,
           preload: [:thread]
+        )
       )
 
     case existing do
@@ -141,7 +148,9 @@ defmodule Vibe.AI.AgentEventRuntime do
                 # messages out of the transcript) without a push per event. The
                 # periodic batched summary still posts normally with a push.
                 silent? = not post_individual_event_message?(policy, inbox_config)
-                {:ok, message_payload} = post_event_message(agent, thread, event, normalized, policy, silent?)
+
+                {:ok, message_payload} =
+                  post_event_message(agent, thread, event, normalized, policy, silent?)
 
                 updated_event =
                   event
@@ -149,7 +158,7 @@ defmodule Vibe.AI.AgentEventRuntime do
                   |> Repo.update!()
 
                 updated_thread =
-                  if is_nil(thread.root_message_id) do
+                  if is_nil(thread.root_message_id) and not silent? do
                     thread
                     |> AgentEventThread.changeset(%{root_message_id: message_payload.message_id})
                     |> Repo.update!()
@@ -164,6 +173,7 @@ defmodule Vibe.AI.AgentEventRuntime do
             end
 
           summary = build_summary(thread.summary, normalized, policy)
+
           {current_state, batch_summary_since} =
             thread.current_state
             |> Kernel.||(%{})
@@ -197,16 +207,33 @@ defmodule Vibe.AI.AgentEventRuntime do
           result =
             case policy.mode do
               "act" ->
-                execute_runbook(agent, integration, updated_thread, event, runbook, normalized, policy)
+                execute_runbook(
+                  agent,
+                  integration,
+                  updated_thread,
+                  event,
+                  runbook,
+                  normalized,
+                  policy
+                )
 
               "approval_required" ->
-                create_approval(agent, integration, updated_thread, event, runbook, normalized, policy)
+                create_approval(
+                  agent,
+                  integration,
+                  updated_thread,
+                  event,
+                  runbook,
+                  normalized,
+                  policy
+                )
 
               _ ->
                 {:ok,
                  %{
                    status: initial_event_status(policy.mode),
-                   run: create_run!(agent, integration, updated_thread, event, runbook, policy, %{}),
+                   run:
+                     create_run!(agent, integration, updated_thread, event, runbook, policy, %{}),
                    message: batch_summary_payload || message_payload
                  }}
             end
@@ -275,27 +302,30 @@ defmodule Vibe.AI.AgentEventRuntime do
 
   defp normalize_event(%Agent{} = agent, integration, params) do
     event_type = normalize_string(params["eventType"] || params["event_type"])
-    source = normalize_string(params["source"]) || (integration && integration.source_type) || "internal"
+
+    source =
+      normalize_string(params["source"]) || (integration && integration.source_type) || "internal"
+
     title = normalize_rich_text(params["title"])
     text = normalize_rich_text(params["text"] || params["message"])
     payload = normalize_payload(params["data"] || params["payload"])
     occurred_at = parse_datetime(params["timestamp"]) || DateTime.utc_now()
 
     event_id =
-      normalize_string(params["eventId"] || params["event_id"])
-      || build_fingerprint(source, title, text, occurred_at, payload)
+      normalize_string(params["eventId"] || params["event_id"]) ||
+        build_fingerprint(source, title, text, occurred_at, payload)
 
     thread_key =
-      normalize_string(params["threadKey"] || params["thread_key"])
-      || normalize_string(payload["thread_key"])
-      || normalize_string(payload["order_id"])
-      || normalize_string(payload["trade_id"])
-      || event_id
+      normalize_string(params["threadKey"] || params["thread_key"]) ||
+        normalize_string(payload["thread_key"]) ||
+        normalize_string(payload["order_id"]) ||
+        normalize_string(payload["trade_id"]) ||
+        event_id
 
     destination_chat_id =
-      normalize_string(params["destinationChatId"] || params["destination_chat_id"])
-      || (integration && integration.default_destination_chat_id)
-      || agent.default_destination_chat_id
+      normalize_string(params["destinationChatId"] || params["destination_chat_id"]) ||
+        (integration && integration.default_destination_chat_id) ||
+        agent.default_destination_chat_id
 
     cond do
       is_nil(event_type) ->
@@ -322,14 +352,26 @@ defmodule Vibe.AI.AgentEventRuntime do
   end
 
   defp ensure_destination_chat(%Agent{} = agent, chat_id) do
-    if Chat.is_participant?(chat_id, agent.agent_user_id), do: :ok, else: {:error, :chat_not_attached}
+    if Chat.is_participant?(chat_id, agent.agent_user_id),
+      do: :ok,
+      else: {:error, :chat_not_attached}
   end
 
-  defp upsert_thread!(agent, integration, source, thread_key, chat_id, title, payload, occurred_at) do
+  defp upsert_thread!(
+         agent,
+         integration,
+         source,
+         thread_key,
+         chat_id,
+         title,
+         payload,
+         occurred_at
+       ) do
     existing =
       Repo.one(
-        from t in AgentEventThread,
+        from(t in AgentEventThread,
           where: t.agent_id == ^agent.id and t.source == ^source and t.thread_key == ^thread_key
+        )
       )
 
     attrs = %{
@@ -352,7 +394,7 @@ defmodule Vibe.AI.AgentEventRuntime do
       %AgentEventThread{} = thread ->
         thread
         |> AgentEventThread.changeset(%{
-          integration_id: integration && integration.id || thread.integration_id,
+          integration_id: (integration && integration.id) || thread.integration_id,
           chat_id: chat_id,
           title: title || thread.title,
           latest_event_at: occurred_at
@@ -363,10 +405,11 @@ defmodule Vibe.AI.AgentEventRuntime do
 
   defp latest_thread_event(thread_id) do
     Repo.one(
-      from e in AgentEvent,
+      from(e in AgentEvent,
         where: e.thread_id == ^thread_id,
         order_by: [desc: e.occurred_at, desc: e.inserted_at],
         limit: 1
+      )
     )
   end
 
@@ -464,7 +507,9 @@ defmodule Vibe.AI.AgentEventRuntime do
     end
   end
 
-  defp effective_autonomy(agent, %AgentIntegration{} = integration), do: integration.autonomy_mode || agent.autonomy_mode
+  defp effective_autonomy(agent, %AgentIntegration{} = integration),
+    do: integration.autonomy_mode || agent.autonomy_mode
+
   defp effective_autonomy(agent, _integration), do: agent.autonomy_mode || "safe_auto"
 
   defp auto_executable?(autonomy, %AgentRunbook{} = runbook) do
@@ -482,10 +527,12 @@ defmodule Vibe.AI.AgentEventRuntime do
     monthly_budget = (integration && integration.cost_budget_monthly) || agent.cost_budget_monthly
 
     cond do
-      is_integer(daily_budget) and daily_budget >= 0 and today_cost_cents(agent, integration) + estimated_cost_cents > daily_budget ->
+      is_integer(daily_budget) and daily_budget >= 0 and
+          today_cost_cents(agent, integration) + estimated_cost_cents > daily_budget ->
         true
 
-      is_integer(monthly_budget) and monthly_budget >= 0 and month_cost_cents(agent, integration) + estimated_cost_cents > monthly_budget ->
+      is_integer(monthly_budget) and monthly_budget >= 0 and
+          month_cost_cents(agent, integration) + estimated_cost_cents > monthly_budget ->
         true
 
       true ->
@@ -508,13 +555,14 @@ defmodule Vibe.AI.AgentEventRuntime do
     integration_id = integration && integration.id
 
     query =
-      from r in AgentRun,
+      from(r in AgentRun,
         where: r.agent_id == ^agent.id and r.inserted_at >= ^since,
         select: r.cost_usd
+      )
 
     query =
       if is_binary(integration_id) do
-        from r in query, where: r.integration_id == ^integration_id
+        from(r in query, where: r.integration_id == ^integration_id)
       else
         query
       end
@@ -541,24 +589,12 @@ defmodule Vibe.AI.AgentEventRuntime do
   defp estimated_cost_cents(%AgentRunbook{action_type: "request_confirmation"}), do: 3
   defp estimated_cost_cents(%AgentRunbook{}), do: 5
 
-  defp build_summary(previous_summary, normalized, policy) do
-    headline =
-      [normalized.title, normalized.text]
-      |> Enum.reject(&is_nil/1)
-      |> Enum.join(": ")
-      |> String.trim()
-
+  defp build_summary(_previous_summary, normalized, policy) do
     latest =
-      if headline == "" do
+      compact_event_summary_line(normalized) ||
         "#{humanize_event_type(normalized.event_type)} in #{normalized.thread_key}"
-      else
-        headline
-      end
 
-    case normalize_string(previous_summary) do
-      nil -> "[#{String.upcase(policy.priority)}] #{latest}"
-      summary -> "#{summary}\nLatest: #{latest}"
-    end
+    "[#{String.upcase(policy.priority)}] #{latest}"
   end
 
   defp next_thread_state(current_state, normalized, policy) do
@@ -567,6 +603,7 @@ defmodule Vibe.AI.AgentEventRuntime do
     |> Map.put("last_event_type", normalized.event_type)
     |> Map.put("last_event_text", normalized.text)
     |> Map.put("last_event_title", normalized.title)
+    |> Map.put("last_event_summary", compact_event_summary_line(normalized))
     |> Map.put("last_event_at", DateTime.to_iso8601(normalized.occurred_at))
     |> Map.put("priority", policy.priority)
   end
@@ -595,9 +632,9 @@ defmodule Vibe.AI.AgentEventRuntime do
           merged["summary_window_hours"] || merged[:summary_window_hours] || merged["cadence"] ||
             merged[:cadence]
         ),
-      schedule: normalize_summary_schedule(merged["summary_schedule"] || merged[:summary_schedule]),
-      summary_times:
-        normalize_summary_times(merged["summary_times"] || merged[:summary_times])
+      schedule:
+        normalize_summary_schedule(merged["summary_schedule"] || merged[:summary_schedule]),
+      summary_times: normalize_summary_times(merged["summary_times"] || merged[:summary_times])
     }
   end
 
@@ -618,11 +655,21 @@ defmodule Vibe.AI.AgentEventRuntime do
 
   defp normalize_summary_window_hours(value) do
     case normalize_string(value) do
-      "4h" -> 4
-      "4" -> 4
-      "daily" -> 24
-      "24h" -> 24
-      "24" -> 24
+      "4h" ->
+        4
+
+      "4" ->
+        4
+
+      "daily" ->
+        24
+
+      "24h" ->
+        24
+
+      "24" ->
+        24
+
       _ ->
         case normalize_integer(value) do
           hours when is_integer(hours) and hours > 0 -> hours
@@ -774,6 +821,8 @@ defmodule Vibe.AI.AgentEventRuntime do
         %{
           "eventThread" => true,
           "eventInboxSummary" => true,
+          "eventInboxRole" => "summary",
+          "hiddenFromTranscript" => false,
           "eventThreadId" => thread.id,
           "threadKey" => thread.thread_key,
           "source" => thread.source,
@@ -782,10 +831,16 @@ defmodule Vibe.AI.AgentEventRuntime do
           "summaryEndAt" => DateTime.to_iso8601(occurred_at),
           "eventIds" => Enum.map(events, & &1.id)
         }
-        |> maybe_put("relatedMessageIds", if(related_message_ids == [], do: nil, else: related_message_ids))
+        |> maybe_put(
+          "relatedMessageIds",
+          if(related_message_ids == [], do: nil, else: related_message_ids)
+        )
         |> maybe_put(
           "relatedMessagesTitle",
-          if(related_message_ids == [], do: nil, else: related_messages_title(length(related_message_ids)))
+          if(related_message_ids == [],
+            do: nil,
+            else: related_messages_title(length(related_message_ids))
+          )
         )
         |> maybe_put(
           "relatedMessagesSubtitle",
@@ -798,7 +853,7 @@ defmodule Vibe.AI.AgentEventRuntime do
                thread.chat_id,
                build_batch_summary_body(thread, events, pending_since, occurred_at, inbox_config),
                metadata,
-               thread.root_message_id
+               nil
              ) do
         next_state =
           (thread.current_state || %{})
@@ -820,12 +875,13 @@ defmodule Vibe.AI.AgentEventRuntime do
 
   defp pending_summary_events(thread_id, pending_since, occurred_at) do
     Repo.all(
-      from e in AgentEvent,
+      from(e in AgentEvent,
         where:
           e.thread_id == ^thread_id and
             e.occurred_at >= ^pending_since and
             e.occurred_at <= ^occurred_at,
         order_by: [asc: e.occurred_at, asc: e.inserted_at]
+      )
     )
   end
 
@@ -843,11 +899,7 @@ defmodule Vibe.AI.AgentEventRuntime do
     lines =
       preview_events
       |> Enum.map(fn event ->
-        line_body =
-          [event.title || humanize_event_type(event.event_type), normalize_string(event.text)]
-          |> Enum.reject(&is_nil/1)
-          |> Enum.join(" - ")
-          |> truncate_line(140)
+        line_body = event |> compact_event_summary_line() |> truncate_line(180)
 
         "#{summary_timestamp(event.occurred_at)} #{line_body}"
       end)
@@ -859,11 +911,11 @@ defmodule Vibe.AI.AgentEventRuntime do
         []
       end
 
-    [
-      "#{window_label}: #{count} event#{if count == 1, do: "", else: "s"}",
-      "Thread: #{thread.title || thread.thread_key}",
-      "Window: #{summary_timestamp(pending_since)} to #{summary_timestamp(occurred_at)}"
-    ] ++ omitted_line ++ lines
+    ([
+       "#{window_label}: #{count} event#{if count == 1, do: "", else: "s"}",
+       "#{thread.title || thread.thread_key}",
+       "Window: #{summary_timestamp(pending_since)} to #{summary_timestamp(occurred_at)}"
+     ] ++ omitted_line ++ lines)
     |> Enum.reject(&is_nil/1)
     |> Enum.join("\n")
   end
@@ -891,7 +943,8 @@ defmodule Vibe.AI.AgentEventRuntime do
 
   defp execute_runbook(agent, integration, thread, event, runbook, normalized, policy) do
     with {:ok, action_payload} <- runbook_action_payload(normalized, runbook),
-         {:ok, execution} <- execute_requested_action(agent, thread, action_payload, thread.root_message_id),
+         {:ok, execution} <-
+           execute_requested_action(agent, thread, action_payload, thread.root_message_id),
          {:ok, _event} <-
            event
            |> AgentEvent.changeset(%{status: "acted"})
@@ -970,9 +1023,9 @@ defmodule Vibe.AI.AgentEventRuntime do
         "actionType" => action_type,
         "title" => Map.get(config, "title") || title,
         "message" =>
-          Map.get(config, "message")
-          || runbook.instructions
-          || fallback_action_message(normalized)
+          Map.get(config, "message") ||
+            runbook.instructions ||
+            fallback_action_message(normalized)
       }
 
     payload =
@@ -1010,7 +1063,9 @@ defmodule Vibe.AI.AgentEventRuntime do
   end
 
   defp execute_requested_action(agent, thread, requested_action, reply_to_id) do
-    action_type = requested_action["actionType"] || requested_action["action_type"] || "post_message"
+    action_type =
+      requested_action["actionType"] || requested_action["action_type"] || "post_message"
+
     title = normalize_string(requested_action["title"])
     message = normalize_string(requested_action["message"])
 
@@ -1081,11 +1136,13 @@ defmodule Vibe.AI.AgentEventRuntime do
 
   defp post_event_message(agent, thread, event, normalized, policy, silent) do
     title = normalized.title || humanize_event_type(normalized.event_type)
-    detail = normalize_string(normalized.text) || summarize_payload_line(normalized.payload)
+    detail = event_display_detail(normalized) || summarize_payload_line(normalized.payload)
     body = event_message_body(title, detail)
 
     metadata = %{
       "eventThread" => true,
+      "eventInboxRole" => if(silent, do: "raw_event", else: "event"),
+      "hiddenFromTranscript" => silent,
       "eventThreadId" => thread.id,
       "eventId" => event.id,
       "threadKey" => thread.thread_key,
@@ -1098,14 +1155,14 @@ defmodule Vibe.AI.AgentEventRuntime do
     }
 
     with {:ok, primary_message} <-
-           maybe_post_event_summary(agent, thread.chat_id, body, metadata, thread.root_message_id, silent),
+           maybe_post_event_summary(agent, thread.chat_id, body, metadata, nil, silent),
          {:ok, _attachment_messages} <-
            post_event_attachments(
              agent,
              thread.chat_id,
              normalize_attachments_payload(normalized.attachments),
              metadata,
-             primary_message && primary_message.message_id || thread.root_message_id,
+             nil,
              silent
            ) do
       {:ok, primary_message}
@@ -1144,7 +1201,10 @@ defmodule Vibe.AI.AgentEventRuntime do
       |> maybe_put("duration", normalize_number(metadata["duration"] || metadata[:duration]))
       |> maybe_put("mimeType", normalize_string(metadata["mimeType"] || metadata[:mimeType]))
       |> maybe_put("caption", normalize_string(metadata["caption"] || metadata[:caption]))
-      |> maybe_put("isVideoNote", normalize_boolean(metadata["isVideoNote"] || metadata[:isVideoNote]))
+      |> maybe_put(
+        "isVideoNote",
+        normalize_boolean(metadata["isVideoNote"] || metadata[:isVideoNote])
+      )
 
     agent_username =
       case agent.agent_user do
@@ -1179,33 +1239,34 @@ defmodule Vibe.AI.AgentEventRuntime do
 
     case Chat.add_message(attrs, acting_user_id: agent.agent_user_id) do
       {:ok, _message} ->
-        payload = %{
-          "id" => message_id,
-          "fromId" => agent.agent_user_id,
-          "chatId" => chat_id,
-          "encryptedContent" => "",
-          "plainContent" => body,
-          "plaintext" => body,
-          "type" => message_type,
-          "mediaUrl" => media_url,
-          "fileName" => metadata["fileName"],
-          "fileSize" => metadata["fileSize"],
-          "duration" => metadata["duration"],
-          "caption" => metadata["caption"] || normalize_string(body),
-          "isVideoNote" => metadata["isVideoNote"],
-          "timestamp" => timestamp,
-          "status" => "sent",
-          "isAgentMessage" => true,
-          "agentName" => agent.display_name,
-          "agentId" => agent.id,
-          "agentUserId" => agent.agent_user_id,
-          "agentUsername" => agent_username,
-          "agentHandle" => if(agent_username, do: "@#{agent_username}", else: nil),
-          "metadata" => attrs.metadata,
-          "replyToId" => reply_to_id
-        }
-        |> Enum.reject(fn {_k, v} -> is_nil(v) end)
-        |> Map.new()
+        payload =
+          %{
+            "id" => message_id,
+            "fromId" => agent.agent_user_id,
+            "chatId" => chat_id,
+            "encryptedContent" => "",
+            "plainContent" => body,
+            "plaintext" => body,
+            "type" => message_type,
+            "mediaUrl" => media_url,
+            "fileName" => metadata["fileName"],
+            "fileSize" => metadata["fileSize"],
+            "duration" => metadata["duration"],
+            "caption" => metadata["caption"] || normalize_string(body),
+            "isVideoNote" => metadata["isVideoNote"],
+            "timestamp" => timestamp,
+            "status" => "sent",
+            "isAgentMessage" => true,
+            "agentName" => agent.display_name,
+            "agentId" => agent.id,
+            "agentUserId" => agent.agent_user_id,
+            "agentUsername" => agent_username,
+            "agentHandle" => if(agent_username, do: "@#{agent_username}", else: nil),
+            "metadata" => attrs.metadata,
+            "replyToId" => reply_to_id
+          }
+          |> Enum.reject(fn {_k, v} -> is_nil(v) end)
+          |> Map.new()
 
         VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "message", payload)
 
@@ -1251,7 +1312,8 @@ defmodule Vibe.AI.AgentEventRuntime do
     end
   end
 
-  defp post_event_attachments(_agent, _chat_id, [], _metadata, _reply_to_id, _silent), do: {:ok, []}
+  defp post_event_attachments(_agent, _chat_id, [], _metadata, _reply_to_id, _silent),
+    do: {:ok, []}
 
   defp post_event_attachments(agent, chat_id, attachments, metadata, reply_to_id, silent) do
     attachments
@@ -1260,10 +1322,22 @@ defmodule Vibe.AI.AgentEventRuntime do
         metadata
         |> Map.put("attachment", attachment)
         |> maybe_put("fileName", normalize_string(attachment["name"] || attachment[:name]))
-        |> maybe_put("fileSize", normalize_integer(attachment["fileSize"] || attachment[:fileSize]))
-        |> maybe_put("duration", normalize_number(attachment["duration"] || attachment[:duration]))
-        |> maybe_put("mimeType", normalize_string(attachment["mimeType"] || attachment[:mimeType]))
-        |> maybe_put("isVideoNote", normalize_boolean(attachment["isVideoNote"] || attachment[:isVideoNote]))
+        |> maybe_put(
+          "fileSize",
+          normalize_integer(attachment["fileSize"] || attachment[:fileSize])
+        )
+        |> maybe_put(
+          "duration",
+          normalize_number(attachment["duration"] || attachment[:duration])
+        )
+        |> maybe_put(
+          "mimeType",
+          normalize_string(attachment["mimeType"] || attachment[:mimeType])
+        )
+        |> maybe_put(
+          "isVideoNote",
+          normalize_boolean(attachment["isVideoNote"] || attachment[:isVideoNote])
+        )
         |> maybe_put("caption", normalize_string(attachment["caption"] || attachment[:caption]))
 
       caption =
@@ -1300,15 +1374,16 @@ defmodule Vibe.AI.AgentEventRuntime do
     integration_id = integration && integration.id
 
     query =
-      from r in AgentRunbook,
+      from(r in AgentRunbook,
         where: r.agent_id == ^agent.id and r.enabled == true,
         order_by: [desc: r.integration_id, asc: r.inserted_at]
+      )
 
     query =
       if is_binary(integration_id) do
-        from r in query, where: is_nil(r.integration_id) or r.integration_id == ^integration_id
+        from(r in query, where: is_nil(r.integration_id) or r.integration_id == ^integration_id)
       else
-        from r in query, where: is_nil(r.integration_id)
+        from(r in query, where: is_nil(r.integration_id))
       end
 
     Repo.all(query)
@@ -1318,7 +1393,8 @@ defmodule Vibe.AI.AgentEventRuntime do
     end)
   end
 
-  defp verify_integration_secret(%AgentIntegration{} = integration, secret) when is_binary(secret) do
+  defp verify_integration_secret(%AgentIntegration{} = integration, secret)
+       when is_binary(secret) do
     secure_compare(hash_secret(secret), integration.secret_hash || "")
   end
 
@@ -1352,7 +1428,8 @@ defmodule Vibe.AI.AgentEventRuntime do
       Enum.map(value, fn item ->
         %{
           "type" => normalize_string(item["type"] || item[:type]),
-          "url" => normalize_string(item["url"] || item[:url] || item["mediaUrl"] || item[:mediaUrl]),
+          "url" =>
+            normalize_string(item["url"] || item[:url] || item["mediaUrl"] || item[:mediaUrl]),
           "name" =>
             normalize_string(item["name"] || item[:name] || item["fileName"] || item[:fileName]),
           "mimeType" =>
@@ -1450,7 +1527,9 @@ defmodule Vibe.AI.AgentEventRuntime do
     end
   end
 
-  defp normalize_string(value) when is_atom(value), do: value |> Atom.to_string() |> normalize_string()
+  defp normalize_string(value) when is_atom(value),
+    do: value |> Atom.to_string() |> normalize_string()
+
   defp normalize_string(_), do: nil
 
   defp normalize_integer(value) when is_integer(value), do: value
@@ -1526,7 +1605,8 @@ defmodule Vibe.AI.AgentEventRuntime do
     lowered_url = String.downcase(url)
 
     cond do
-      String.starts_with?(lowered_mime, "image/gif") or String.match?(lowered_url, ~r/\.gif(\?|$)/) ->
+      String.starts_with?(lowered_mime, "image/gif") or
+          String.match?(lowered_url, ~r/\.gif(\?|$)/) ->
         "gif"
 
       String.starts_with?(lowered_mime, "image/") or
@@ -1571,12 +1651,273 @@ defmodule Vibe.AI.AgentEventRuntime do
   defp event_message_body(title, nil), do: "# #{title}"
   defp event_message_body(title, detail), do: "# #{title}\n\n#{detail}"
 
+  defp compact_event_summary_line(eventish) do
+    title =
+      eventish
+      |> event_title()
+      |> normalize_string()
+
+    detail =
+      eventish
+      |> event_display_detail()
+      |> normalize_string()
+
+    [title, detail]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join(" — ")
+    |> normalize_string()
+  end
+
+  defp event_display_detail(eventish) do
+    payload = event_payload(eventish)
+
+    display_summary =
+      payload
+      |> payload_group("display")
+      |> payload_value(["summary", "text", "description"])
+      |> normalize_string()
+
+    analytics_summary =
+      if analytics_event?(eventish, payload) do
+        analytics_event_summary(payload)
+      end
+
+    display_summary || analytics_summary || normalize_string(event_text(eventish))
+  end
+
+  defp analytics_event?(eventish, payload) do
+    event_type = event_type(eventish) || ""
+
+    String.starts_with?(event_type, "analytics.") or
+      Map.has_key?(payload, "traffic") or Map.has_key?(payload, "commerce") or
+      Map.has_key?(payload, "funnel")
+  end
+
+  defp analytics_event_summary(payload) do
+    traffic = payload_group(payload, "traffic")
+    commerce = payload_group(payload, "commerce")
+    funnel = payload_group(payload, "funnel")
+
+    metric_line =
+      [
+        metric_phrase(payload_value(traffic, ["sessions"]), "session", "sessions"),
+        metric_phrase(
+          payload_value(traffic, ["pageViews", "page_views"]),
+          "page view",
+          "page views"
+        ),
+        metric_phrase(
+          payload_value(commerce, ["addToCartEvents", "add_to_cart_events"]),
+          "add-to-cart event",
+          "add-to-cart events"
+        ),
+        metric_phrase(
+          payload_value(commerce, ["checkoutSessions", "checkout_sessions"]),
+          "checkout session",
+          "checkout sessions"
+        ),
+        metric_phrase(
+          payload_value(commerce, ["paidOrders", "paid_orders"]),
+          "paid order",
+          "paid orders"
+        )
+      ]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.join(" · ")
+      |> normalize_string()
+
+    highlights =
+      [
+        top_item_phrase("Top country", payload_value(traffic, ["topCountries", "top_countries"])),
+        top_item_phrase("Top source", payload_value(traffic, ["topSources", "top_sources"])),
+        top_item_phrase(
+          "Most-added product",
+          payload_value(commerce, ["topAddedProducts", "top_added_products"])
+        )
+      ]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.join(" · ")
+      |> normalize_string()
+
+    funnel_line =
+      [
+        rate_phrase(
+          "cart rate",
+          payload_value(funnel, ["sessionToCartRate", "session_to_cart_rate"])
+        ),
+        rate_phrase(
+          "purchase rate",
+          payload_value(funnel, ["sessionToPurchaseRate", "session_to_purchase_rate"])
+        )
+      ]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.join(" · ")
+      |> normalize_string()
+
+    [metric_line, highlights, funnel_line]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
+    |> normalize_string()
+  end
+
+  defp metric_phrase(nil, _singular, _plural), do: nil
+
+  defp metric_phrase(value, singular, plural) do
+    case normalize_number(value) do
+      nil ->
+        nil
+
+      number ->
+        label = if number == 1.0, do: singular, else: plural
+        "#{format_number(number)} #{label}"
+    end
+  end
+
+  defp rate_phrase(_label, nil), do: nil
+
+  defp rate_phrase(label, value) do
+    case normalize_number(value) do
+      nil -> nil
+      number -> "#{label}: #{format_number(number)}%"
+    end
+  end
+
+  defp top_item_phrase(_label, nil), do: nil
+  defp top_item_phrase(_label, []), do: nil
+
+  defp top_item_phrase(label, [first | _]), do: top_item_phrase(label, first)
+
+  defp top_item_phrase(label, %{} = item) do
+    name = item |> payload_value(["name", "label", "value"]) |> normalize_string()
+    count = payload_value(item, ["count", "total"])
+
+    cond do
+      is_nil(name) -> nil
+      is_nil(count) -> "#{label}: #{name}"
+      true -> "#{label}: #{name} (#{format_payload_value(count)})"
+    end
+  end
+
+  defp top_item_phrase(label, value) do
+    case normalize_string(value) do
+      nil -> nil
+      text -> "#{label}: #{text}"
+    end
+  end
+
+  defp payload_group(payload, key) when is_map(payload) do
+    payload
+    |> payload_value([key, Macro.underscore(key)])
+    |> decode_payload_value()
+    |> case do
+      value when is_map(value) -> value
+      _ -> %{}
+    end
+  end
+
+  defp payload_group(_payload, _key), do: %{}
+
+  defp payload_value(map, keys) when is_map(map) and is_list(keys) do
+    Enum.find_value(keys, fn key ->
+      key = to_string(key)
+      Map.get(map, key) || Map.get(map, Macro.underscore(key))
+    end)
+    |> decode_payload_value()
+  end
+
+  defp payload_value(_map, _keys), do: nil
+
+  defp decode_payload_value(value) when is_binary(value) do
+    case Jason.decode(value) do
+      {:ok, decoded} -> decoded
+      _ -> value
+    end
+  end
+
+  defp decode_payload_value(value), do: value
+
+  defp event_title(eventish) do
+    Map.get(eventish, :title) || Map.get(eventish, "title") ||
+      humanize_event_type(event_type(eventish))
+  end
+
+  defp event_text(eventish), do: Map.get(eventish, :text) || Map.get(eventish, "text")
+
+  defp event_type(eventish) do
+    Map.get(eventish, :event_type) || Map.get(eventish, "eventType") ||
+      Map.get(eventish, "event_type")
+  end
+
+  defp event_payload(eventish) do
+    case Map.get(eventish, :payload) || Map.get(eventish, "payload") || Map.get(eventish, "data") do
+      payload when is_map(payload) -> payload
+      _ -> %{}
+    end
+  end
+
+  defp format_number(value) when is_integer(value), do: Integer.to_string(value)
+
+  defp format_number(value) when is_float(value) do
+    rounded = Float.round(value, 2)
+
+    if rounded == Float.round(rounded, 0) do
+      rounded |> round() |> Integer.to_string()
+    else
+      rounded
+      |> :erlang.float_to_binary(decimals: 2)
+      |> String.trim_trailing("0")
+      |> String.trim_trailing(".")
+    end
+  end
+
   defp summarize_payload_line(payload) when map_size(payload) == 0, do: nil
 
+  # Fallback bubble text when a connected app sends an event without its own
+  # `text`. Stays project-agnostic: it just renders whatever keys arrived in a
+  # readable way. Values are formatted defensively so lists/maps never get
+  # interpolated into a mangled blob (e.g. ["a","b"] becoming "ab").
   defp summarize_payload_line(payload) do
     payload
     |> Enum.take(4)
-    |> Enum.map_join(" | ", fn {key, value} -> "#{key}=#{value}" end)
+    |> Enum.map_join(" · ", fn {key, value} ->
+      "#{humanize_payload_key(key)}: #{format_payload_value(value)}"
+    end)
+  end
+
+  defp humanize_payload_key(key) do
+    key
+    |> to_string()
+    |> String.replace(["_", "."], " ")
+    |> String.trim()
+  end
+
+  defp format_payload_value(value) when is_list(value) do
+    cond do
+      value == [] ->
+        "none"
+
+      Enum.all?(value, &scalar_payload_value?/1) ->
+        Enum.map_join(value, ", ", &format_payload_value/1)
+
+      true ->
+        count = length(value)
+        "#{count} item#{if count == 1, do: "", else: "s"}"
+    end
+  end
+
+  defp format_payload_value(value) when is_map(value) do
+    count = map_size(value)
+    "#{count} field#{if count == 1, do: "", else: "s"}"
+  end
+
+  defp format_payload_value(value) when is_binary(value), do: value
+  defp format_payload_value(value) when is_boolean(value), do: to_string(value)
+  defp format_payload_value(value) when is_number(value), do: to_string(value)
+  defp format_payload_value(nil), do: "none"
+  defp format_payload_value(value), do: inspect(value)
+
+  defp scalar_payload_value?(value) do
+    is_binary(value) or is_number(value) or is_boolean(value)
   end
 
   defp join_title_and_body(nil, nil), do: ""

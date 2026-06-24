@@ -5378,7 +5378,7 @@ final class ChatEngine {
     let isEdited = forceEdited || ((decryptedFields["isEdited"] as? Bool) == true)
     let editedAt = forceEditedAt ?? decryptedFields["editedAt"]
 
-    var metadata: [String: Any] = [:]
+    var metadata = (decryptedFields["metadata"] as? [String: Any]) ?? [:]
     if let waveform { metadata["waveform"] = waveform }
     if let width = decryptedFields["width"] { metadata["width"] = width }
     if let height = decryptedFields["height"] { metadata["height"] = height }
@@ -5516,6 +5516,9 @@ final class ChatEngine {
       !isAgentMessage && hadEncryptedContent && encryptedLooksHybrid && decryptedText.isEmpty
 
     var decryptedFields = parseDecryptedMessagePayload(decryptedText)
+    if let metadata = payload["metadata"] as? [String: Any], decryptedFields["metadata"] == nil {
+      decryptedFields["metadata"] = metadata
+    }
     if let rawReplyToId = normalizedString(payload["replyToId"] ?? payload["reply_to_id"]),
       normalizedString(decryptedFields["replyToId"]) == nil
     {
@@ -7032,7 +7035,19 @@ final class ChatEngine {
       let rawMediaUrl = normalizedString(raw["mediaUrl"] ?? raw["media_url"])
       let rawFileName = normalizedString(raw["fileName"] ?? raw["file_name"])
       let rawMediaKey = normalizedString(raw["mediaKey"] ?? raw["media_key"])
+      let rawMetadata = raw["metadata"] as? [String: Any]
       let derivedFileName = deriveFileNameFromURL(rawMediaUrl)
+      let rawAgentId = firstNormalizedString(
+        raw["agentId"], raw["agent_id"], rawMetadata?["agentId"], rawMetadata?["agent_id"])
+      let rawAgentName = firstNormalizedString(
+        raw["agentName"], raw["agent_name"], rawMetadata?["agentName"], rawMetadata?["agent_name"])
+      let rawAgentUserId = firstNormalizedString(
+        raw["agentUserId"], raw["agent_user_id"], rawMetadata?["agentUserId"],
+        rawMetadata?["agent_user_id"])
+      let rawAgentUsername = firstNormalizedString(
+        raw["agentUsername"], raw["agent_username"], raw["agentHandle"], raw["agent_handle"],
+        rawMetadata?["agentUsername"], rawMetadata?["agent_username"], rawMetadata?["agentHandle"],
+        rawMetadata?["agent_handle"])
 
       let isMe = normalizedUpper(fromId) != nil && normalizedUpper(fromId) == currentUserIdLocked()
       let encryptedLooksHybrid = isLikelyHybridCiphertext(encryptedContent)
@@ -7040,8 +7055,8 @@ final class ChatEngine {
         (raw["isAgentMessage"] as? Bool == true)
         || (raw["is_agent_message"] as? Bool == true)
         || (normalizedString(fromId)?.lowercased() == Self.agentUserId)
-        || normalizedString(raw["agentId"] ?? raw["agent_id"]) != nil
-        || normalizedString(raw["agentName"] ?? raw["agent_name"]) != nil
+        || rawAgentId != nil
+        || rawAgentName != nil
         || (rawMediaUrl?.lowercased().contains("/uploads/agent-docs/") == true)
         || (rawMediaUrl?.lowercased().contains("/api/agent/document/") == true)
       let agentPlainContent =
@@ -7082,6 +7097,9 @@ final class ChatEngine {
         return plaintextFallback.isEmpty ? [:] : ["text": plaintextFallback]
       }()
       var enrichedFields = decryptedFields
+      if let rawMetadata, enrichedFields["metadata"] == nil {
+        enrichedFields["metadata"] = rawMetadata
+      }
       if let rawReplyToId = normalizedString(raw["replyToId"] ?? raw["reply_to_id"]),
         normalizedString(enrichedFields["replyToId"] ?? enrichedFields["reply_to_id"]) == nil
       {
@@ -7138,25 +7156,15 @@ final class ChatEngine {
       if historyIsAgent, var message = row["message"] as? [String: Any] {
         message["isAgentMessage"] = true
         message["isMe"] = false
-        if let agentId = normalizedString(raw["agentId"] ?? raw["agent_id"]) {
-          message["agentId"] = agentId
-        }
-        if let agentUserId =
-          normalizedString(raw["agentUserId"] ?? raw["agent_user_id"])
-          ?? fromId
-        {
+        if let rawAgentId { message["agentId"] = rawAgentId }
+        if let agentUserId = rawAgentUserId ?? fromId {
           message["agentUserId"] = agentUserId
         }
-        if let username = normalizedString(
-          raw["agentUsername"] ?? raw["agent_username"]
-            ?? raw["agentHandle"] ?? raw["agent_handle"])
-        {
+        if let username = rawAgentUsername {
           message["agentUsername"] = username.trimmingCharacters(
             in: CharacterSet(charactersIn: "@"))
         }
-        if let name = normalizedString(raw["agentName"] ?? raw["agent_name"]) {
-          message["agentName"] = name
-        }
+        if let rawAgentName { message["agentName"] = rawAgentName }
         if let agentPlainContent, !agentPlainContent.isEmpty {
           message["plainContent"] = agentPlainContent
           message["text"] = agentPlainContent
@@ -7289,6 +7297,15 @@ final class ChatEngine {
     }
     if let n = value as? NSNumber {
       return n.stringValue
+    }
+    return nil
+  }
+
+  private func firstNormalizedString(_ values: Any?...) -> String? {
+    for value in values {
+      if let normalized = normalizedString(value) {
+        return normalized
+      }
     }
     return nil
   }
