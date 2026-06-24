@@ -633,6 +633,56 @@ defmodule Vibe.AI.LocalAgentWorker do
     VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-progress", payload)
   end
 
+  @doc """
+  Parse the bridge output accumulated so far and broadcast a live `agent-stream`
+  update (partial text + inline progress/tool nodes) into the chat, so the reply
+  appears as it is produced instead of arriving as one final batch. Reuses the
+  same `extract_result/2` parser as the final delivery — one source of truth.
+  """
+  def bridge_stream_update(provider, chat_id, accumulated_output, stream_id)
+      when is_binary(provider) and is_binary(chat_id) and is_binary(accumulated_output) do
+    case resolve_handle(provider) do
+      nil ->
+        :ok
+
+      worker ->
+        extracted = extract_result(worker, accumulated_output)
+        text = normalize_string(extracted.text) || ""
+
+        VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-stream", %{
+          "chatId" => chat_id,
+          "streamId" => stream_id,
+          "userId" => worker.agent_user_id,
+          "isAgent" => true,
+          "text" => text,
+          "progressNodes" => extracted.progress_nodes,
+          "toolEvents" => extracted.tool_events,
+          "status" => "running"
+        })
+
+        :ok
+    end
+  end
+
+  def bridge_stream_update(_provider, _chat_id, _output, _stream_id), do: :ok
+
+  @doc "Mark a live stream finished. The final persisted message carries the content."
+  def finish_stream(provider, chat_id, stream_id) do
+    agent_id =
+      case resolve_handle(provider) do
+        nil -> agent_user_id()
+        worker -> worker.agent_user_id
+      end
+
+    VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-stream", %{
+      "chatId" => chat_id,
+      "streamId" => stream_id,
+      "userId" => agent_id,
+      "isAgent" => true,
+      "status" => "done"
+    })
+  end
+
   @doc "Broadcast that an agent has finished working in a chat."
   def stop_activity(chat_id, agent_user_id) do
     VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-progress", %{

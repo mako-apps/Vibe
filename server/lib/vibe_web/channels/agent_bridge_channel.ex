@@ -17,6 +17,11 @@ defmodule VibeWeb.AgentBridgeChannel do
   alias Vibe.AI.LocalAgentWorker
   alias VibeWeb.Presence
 
+  # Keep only the most recent stream-json lines per in-flight task so a long run
+  # can't grow the channel's memory without bound. The final `result` always
+  # carries the complete output, so dropping the oldest progress lines is safe.
+  @max_stream_lines 500
+
   @impl true
   def join("bridge:" <> topic_user_id, _payload, socket) do
     if topic_user_id == to_string(socket.assigns.user_id) do
@@ -57,10 +62,24 @@ defmodule VibeWeb.AgentBridgeChannel do
     {:reply, :ok, socket}
   end
 
-  # daemon → server: live progress for an in-flight task (raw stream-json line)
+  # daemon → server: live progress for an in-flight task (raw stream-json line).
+  # We accumulate the lines for this chat and re-parse the buffer-so-far, then
+  # broadcast a live `agent-stream` (partial text + inline tool/progress nodes)
+  # so the reply renders as it is produced. The lightweight `agent-progress`
+  # ping is kept for the typing indicator / backwards compatibility.
   @impl true
   def handle_in("progress", %{"provider" => provider, "chatId" => chat_id} = payload, socket) do
-    case LocalAgentWorker.bridge_progress_event(provider, payload["line"] || "") do
+    line = payload["line"] || ""
+    streams = Map.get(socket.assigns, :streams, %{})
+    state = Map.get(streams, chat_id, %{lines: [], stream_id: new_stream_id(chat_id)})
+
+    lines = Enum.take([line | state.lines], @max_stream_lines)
+    accumulated = lines |> Enum.reverse() |> Enum.join("\n")
+    state = %{state | lines: lines}
+
+    LocalAgentWorker.bridge_stream_update(provider, chat_id, accumulated, state.stream_id)
+
+    case LocalAgentWorker.bridge_progress_event(provider, line) do
       nil ->
         :ok
 
@@ -74,7 +93,7 @@ defmodule VibeWeb.AgentBridgeChannel do
         )
     end
 
-    {:noreply, socket}
+    {:noreply, assign(socket, :streams, Map.put(streams, chat_id, state))}
   end
 
   # daemon → server: completed task (raw output + exit status)
@@ -115,7 +134,7 @@ defmodule VibeWeb.AgentBridgeChannel do
       end)
     end
 
-    {:reply, :ok, socket}
+    {:reply, :ok, clear_stream(socket, chat_id, provider)}
   end
 
   # daemon → server: surface an error notice without a full result
@@ -135,11 +154,31 @@ defmodule VibeWeb.AgentBridgeChannel do
     )
 
     LocalAgentWorker.stop_activity(chat_id, agent_user_id_for(provider))
-    {:reply, :ok, socket}
+    {:reply, :ok, clear_stream(socket, chat_id, provider)}
   end
 
   def handle_in("heartbeat", _payload, socket), do: {:reply, :ok, socket}
   def handle_in(_event, _payload, socket), do: {:noreply, socket}
+
+  defp new_stream_id(chat_id) do
+    "stream-" <> chat_id <> "-" <> Integer.to_string(System.system_time(:millisecond))
+  end
+
+  # Finish + drop the live stream for a chat once the task ends.
+  defp clear_stream(socket, chat_id, provider) when is_binary(chat_id) do
+    streams = Map.get(socket.assigns, :streams, %{})
+
+    case Map.pop(streams, chat_id) do
+      {nil, _streams} ->
+        socket
+
+      {state, rest} ->
+        if is_binary(provider), do: LocalAgentWorker.finish_stream(provider, chat_id, state.stream_id)
+        assign(socket, :streams, rest)
+    end
+  end
+
+  defp clear_stream(socket, _chat_id, _provider), do: socket
 
   defp agent_user_id_for(provider) do
     case LocalAgentWorker.resolve_handle(provider) do
