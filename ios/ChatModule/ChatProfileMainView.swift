@@ -68,11 +68,11 @@ private enum NativeProfileAvatarImageLoader {
 enum NativeProfileAvatarHeroMetrics {
   static let topAdjust: CGFloat = 12
   static let islandAnchor: CGFloat = 56
-  static let topOffset: CGFloat = 92
+  static let topOffset: CGFloat = 76
   static let collapsedTopOffset: CGFloat = 18
-  static let expandedSize: CGFloat = 154
+  static let expandedSize: CGFloat = 196
   static let collapsedSize: CGFloat = 34
-  static let bottomSpacing: CGFloat = 18
+  static let bottomSpacing: CGFloat = 14
 
   static func expandedTop(for safeTop: CGFloat) -> CGFloat {
     max(0, safeTop - islandAnchor - topAdjust) + topOffset
@@ -566,6 +566,65 @@ private enum ChatProfileInfoRow {
   case identifier
   case agent
   case bio
+}
+
+private struct ChatProfileGroupedRowView: View {
+  let title: String
+  let subtitle: String
+  let systemImage: String?
+  let showsChevron: Bool
+  let titleColor: UIColor
+  let subtitleColor: UIColor
+  let separatorColor: UIColor
+  let isLast: Bool
+
+  private var hasSubtitle: Bool {
+    !subtitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+  }
+
+  var body: some View {
+    HStack(spacing: 12) {
+      VStack(alignment: .leading, spacing: hasSubtitle ? 3 : 0) {
+        Text(title)
+          .font(.system(size: 17, weight: .regular))
+          .foregroundStyle(Color(uiColor: titleColor))
+          .lineLimit(1)
+          .minimumScaleFactor(0.78)
+
+        if hasSubtitle {
+          Text(subtitle)
+            .font(.system(size: 13, weight: .regular))
+            .foregroundStyle(Color(uiColor: subtitleColor))
+            .lineLimit(3)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+
+      if let systemImage {
+        Image(systemName: systemImage)
+          .font(.system(size: 17, weight: .semibold))
+          .foregroundStyle(Color(uiColor: subtitleColor))
+      }
+
+      if showsChevron {
+        Image(systemName: "chevron.right")
+          .font(.system(size: 15, weight: .semibold))
+          .foregroundStyle(Color(uiColor: subtitleColor).opacity(0.75))
+      }
+    }
+    .padding(.horizontal, 18)
+    .padding(.vertical, hasSubtitle ? 11 : 13)
+    .frame(maxWidth: .infinity, minHeight: hasSubtitle ? 62 : 48, alignment: .center)
+    .overlay(alignment: .bottom) {
+      if !isLast {
+        Rectangle()
+          .fill(Color(uiColor: separatorColor))
+          .frame(height: 1.0 / UIScreen.main.scale)
+          .padding(.leading, 18)
+      }
+    }
+  }
 }
 
 private struct ChatProfileModernRowView: View {
@@ -1525,15 +1584,11 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     }
     addSubview(tableView)
 
-    addSubview(actionsStack)
-    actionsStack.layer.zPosition = 54.0
-
     addSubview(floatingAvatarView)
     floatingAvatarView.clipsToBounds = false
     floatingAvatarView.isUserInteractionEnabled = false
     floatingAvatarView.layer.zPosition = 40.0
     bringSubviewToFront(headerMaskContainer)
-    bringSubviewToFront(actionsStack)
     bringSubviewToFront(floatingAvatarView)
     bringSubviewToFront(headerContainer)
 
@@ -1577,6 +1632,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     actionsStack.semanticContentAttribute = .forceLeftToRight
     actionsStack.isLayoutMarginsRelativeArrangement = true
     actionsStack.layoutMargins = UIEdgeInsets(top: 0.0, left: 8.0, bottom: 0.0, right: 8.0)
+    heroHeaderView.addSubview(actionsStack)
 
     muteActionButton.addTarget(self, action: #selector(handleMutePressed), for: .touchUpInside)
     searchActionButton.addTarget(self, action: #selector(handleSearchPressed), for: .touchUpInside)
@@ -1616,12 +1672,12 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     let nameHeight: CGFloat = 36.0
     heroNameLabel.frame = CGRect(
       x: 12.0, y: y, width: heroBannerView.bounds.width - 24.0, height: nameHeight)
-    y = heroNameLabel.frame.maxY + 2.0
+    y = heroNameLabel.frame.maxY + 18.0
 
     let handleHeight: CGFloat = 24.0
     heroHandleButton.frame = CGRect(
       x: 12.0, y: y, width: heroBannerView.bounds.width - 24.0, height: handleHeight)
-    y = heroHandleButton.frame.maxY + 8.0
+    y = heroHandleButton.isHidden ? y : heroHandleButton.frame.maxY + 8.0
 
     let bioText = heroBioLabel.text ?? ""
     let bioVisible = !bioText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -1644,10 +1700,22 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       y = heroBioLabel.frame.maxY + 14.0
     }
 
-    let actionBottom = max(
+    let actionsHeight: CGFloat = 74.0
+    let actionsWidth = min(width - 44.0, 360.0)
+    let actionsTop = max(
       heroHandleButton.isHidden ? heroNameLabel.frame.maxY : heroHandleButton.frame.maxY,
       heroBioLabel.isHidden ? 0.0 : heroBioLabel.frame.maxY
-    ) + 24.0 + 74.0
+    ) + 22.0
+    actionsStack.frame = CGRect(
+      x: (width - actionsWidth) * 0.5,
+      y: actionsTop,
+      width: actionsWidth,
+      height: actionsHeight
+    )
+    actionsStack.alpha = 1.0
+    actionsStack.transform = .identity
+
+    let actionBottom = actionsStack.frame.maxY
     
     let finalHeaderHeight = max(heroBannerView.frame.maxY + 24.0, actionBottom + 28.0)
 
@@ -1720,30 +1788,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   }
 
   private func layoutActionsForCurrentScroll() {
-    guard bounds.width > 0 else { return }
-
-    let offset = max(0.0, tableView.contentOffset.y)
-    let actionsHeight: CGFloat = 74.0
-    let actionsWidth = min(bounds.width - 44.0, 360.0)
-    let actionsX = (bounds.width - actionsWidth) * 0.5
-    let expandedBottom = max(
-      heroHandleButton.isHidden ? heroNameLabel.frame.maxY : heroHandleButton.frame.maxY,
-      heroBioLabel.isHidden ? 0.0 : heroBioLabel.frame.maxY
-    )
-    let expandedY = expandedBottom + 24.0 - offset
-    let stickyY = safeAreaInsets.top + 70.0
-    let finalY = max(stickyY, expandedY)
-    let stickyProgress = max(0.0, min(1.0, (stickyY + 34.0 - expandedY) / 54.0))
-
-    actionsStack.frame = CGRect(
-      x: actionsX,
-      y: finalY,
-      width: actionsWidth,
-      height: actionsHeight
-    )
-    actionsStack.alpha = max(0.72, 1.0 - stickyProgress * 0.08)
-    let scale = 1.0 - stickyProgress * 0.035
-    actionsStack.transform = CGAffineTransform(scaleX: scale, y: scale)
+    layoutHeroHeaderViewIfNeeded(force: false)
   }
 
   private func applyTheme() {
@@ -1879,16 +1924,13 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   private func reloadHeaderText() {
     let resolvedName =
       profileName.isEmpty ? (headerTitle.isEmpty ? "Profile" : headerTitle) : profileName
-    let collapsedIdentity = resolvedIdentifierRawValue()
-    titleLabel.text = collapsedIdentity.isEmpty ? resolvedName : collapsedIdentity
-    let subtitle = resolvedActiveTabSubtitleText() ?? resolvedName
-    subtitleLabel.text = subtitle == titleLabel.text ? resolvedDefaultSubtitleText() : subtitle
+    titleLabel.text = resolvedName
+    subtitleLabel.text = resolvedActiveTabSubtitleText() ?? resolvedDefaultSubtitleText()
   }
 
   private func refreshHeroSubheader() {
-    let subheader = resolvedHeroSubheaderText()
-    heroHandleButton.setTitle(subheader, for: .normal)
-    heroHandleButton.isHidden = subheader.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    heroHandleButton.setTitle(nil, for: .normal)
+    heroHandleButton.isHidden = true
   }
 
   private func refreshHeroContent() {
@@ -2323,11 +2365,14 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
 
   private func resolvedIdentifierRawValue() -> String {
     let handle = profileHandle.trimmingCharacters(in: .whitespacesAndNewlines)
-    if !handle.isEmpty, !handle.lowercased().hasPrefix("id:") {
+    if !handle.isEmpty, !handle.lowercased().hasPrefix("id:"), !Self.looksLikeUUID(handle) {
       return handle.hasPrefix("@") ? handle : "@\(handle)"
     }
 
     let fallbackName = profileName.trimmingCharacters(in: .whitespacesAndNewlines)
+    if Self.looksLikeUUID(fallbackName) {
+      return ""
+    }
     let compact =
       fallbackName
       .components(separatedBy: CharacterSet.alphanumerics.inverted)
@@ -2337,6 +2382,10 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       return "@\(compact)"
     }
     return ""
+  }
+
+  private static func looksLikeUUID(_ value: String) -> Bool {
+    UUID(uuidString: value.trimmingCharacters(in: .whitespacesAndNewlines)) != nil
   }
 
   private func getAgentDocuments() -> [(id: String, name: String, url: String)] {
@@ -2459,10 +2508,12 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   // MARK: UITableViewDataSource
 
   private enum Section: Int, CaseIterable {
+    case profileInfo
+    case chatHistory
+    case sharedContent
     case contactActions
     case emergency
     case dangerActions
-    case contentRows
   }
 
   func scrollViewDidScroll(_ scrollView: UIScrollView) {
@@ -2481,14 +2532,18 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     guard let section = Section(rawValue: section) else { return 0 }
 
     switch section {
+    case .profileInfo:
+      return profileInfoRowCount()
+    case .chatHistory:
+      return rows.isEmpty ? 0 : 1
+    case .sharedContent:
+      return availableTabs.count
     case .contactActions:
       return 3
     case .emergency:
       return 1
     case .dangerActions:
       return 1
-    case .contentRows:
-      return availableTabs.count
     }
   }
 
@@ -2511,10 +2566,14 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     }
 
     switch section {
+    case .profileInfo:
+      return indexPath.row == 1 ? UITableView.automaticDimension : 62.0
+    case .chatHistory:
+      return 74.0
+    case .sharedContent:
+      return 58.0
     case .contactActions, .emergency, .dangerActions:
       return 44.0
-    case .contentRows:
-      return 74.0
     }
   }
 
@@ -2634,12 +2693,119 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     return cell
   }
 
+  private func profileInfoRowCount() -> Int {
+    let hasUsername = !resolvedIdentifierRawValue().trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    let hasNote = !profileBio.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    return (hasUsername ? 1 : 0) + (hasNote ? 1 : 0)
+  }
+
+  private func profileInfoModel(at row: Int) -> (title: String, subtitle: String, image: String?, copyable: Bool)? {
+    var models: [(String, String, String?, Bool)] = []
+    let username = resolvedIdentifierRawValue().trimmingCharacters(in: .whitespacesAndNewlines)
+    if !username.isEmpty {
+      models.append(("username", username, "doc.on.doc", true))
+    }
+    let note = profileBio.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !note.isEmpty {
+      models.append(("note", note, nil, false))
+    }
+    guard models.indices.contains(row) else { return nil }
+    let item = models[row]
+    return (item.0, item.1, item.2, item.3)
+  }
+
+  private func latestChatHistorySubtitle() -> String {
+    guard let latest = rows.compactMap({ $0.timestampMs }).max(), latest > 0 else {
+      let count = rows.count
+      return count == 1 ? "1 message" : "\(count) messages"
+    }
+
+    let date = Date(timeIntervalSince1970: TimeInterval(latest) / 1000.0)
+    let formatter = DateFormatter()
+    formatter.doesRelativeDateFormatting = true
+    formatter.dateStyle = .medium
+    formatter.timeStyle = .short
+    let count = rows.count == 1 ? "1 message" : "\(rows.count) messages"
+    return "\(count) • \(formatter.string(from: date))"
+  }
+
+  private func configureGroupedCell(
+    _ cell: UITableViewCell,
+    title: String,
+    subtitle: String = "",
+    image: String? = nil,
+    showsChevron: Bool = false,
+    isLast: Bool
+  ) {
+    cell.selectionStyle = showsChevron || image != nil ? .default : .none
+    cell.backgroundColor = .clear
+    cell.contentView.backgroundColor = .clear
+    cell.backgroundConfiguration = UIBackgroundConfiguration.clear()
+    cell.contentConfiguration = UIHostingConfiguration {
+      ChatProfileGroupedRowView(
+        title: title,
+        subtitle: subtitle,
+        systemImage: image,
+        showsChevron: showsChevron,
+        titleColor: currentTextColor,
+        subtitleColor: currentSecondaryTextColor,
+        separatorColor: currentRowSeparatorColor,
+        isLast: isLast
+      )
+    }
+    .background(.ultraThinMaterial)
+    .margins(.all, 0)
+  }
+
   func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
     guard let section = Section(rawValue: indexPath.section) else {
       return UITableViewCell(style: .default, reuseIdentifier: nil)
     }
 
     switch section {
+    case .profileInfo:
+      let cell = UITableViewCell(style: .default, reuseIdentifier: nil)
+      let count = profileInfoRowCount()
+      if let model = profileInfoModel(at: indexPath.row) {
+        configureGroupedCell(
+          cell,
+          title: model.title,
+          subtitle: model.subtitle,
+          image: model.image,
+          showsChevron: false,
+          isLast: indexPath.row == count - 1
+        )
+      }
+      return cell
+
+    case .chatHistory:
+      let cell = UITableViewCell(style: .default, reuseIdentifier: nil)
+      configureGroupedCell(
+        cell,
+        title: "Chat History",
+        subtitle: latestChatHistorySubtitle(),
+        image: nil,
+        showsChevron: true,
+        isLast: true
+      )
+      return cell
+
+    case .sharedContent:
+      guard availableTabs.indices.contains(indexPath.row) else {
+        return UITableViewCell(style: .default, reuseIdentifier: nil)
+      }
+      let tab = availableTabs[indexPath.row]
+      let cell = UITableViewCell(style: .default, reuseIdentifier: nil)
+      configureGroupedCell(
+        cell,
+        title: sharedTitle(for: tab),
+        subtitle: sharedSubtitle(for: tab),
+        image: nil,
+        showsChevron: true,
+        isLast: indexPath.row == availableTabs.count - 1
+      )
+      return cell
+
     case .contactActions:
       let titles = ["Share Contact", "Create New Contact", "Add to Existing Contact"]
       let cell = UITableViewCell(style: .default, reuseIdentifier: nil)
@@ -2664,26 +2830,6 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       cell.textLabel?.textColor = .systemRed
       cell.backgroundColor = .secondarySystemGroupedBackground
       return cell
-
-    case .contentRows:
-      guard availableTabs.indices.contains(indexPath.row),
-        let cell = tableView.dequeueReusableCell(
-          withIdentifier: ChatProfileListRowCell.reuseIdentifier,
-          for: indexPath
-        ) as? ChatProfileListRowCell
-      else {
-        return UITableViewCell(style: .default, reuseIdentifier: nil)
-      }
-      let tab = availableTabs[indexPath.row]
-      configureListRowCell(
-        cell,
-        title: sharedTitle(for: tab),
-        subtitle: sharedSubtitle(for: tab),
-        value: "\(sharedCount(for: tab))",
-        iconName: sharedIconName(for: tab),
-        showsSeparator: true
-      )
-      return cell
     }
   }
 
@@ -2698,19 +2844,42 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     guard let section = Section(rawValue: indexPath.section) else { return }
 
     switch section {
-    case .contactActions:
-      let actions = ["shareContact", "createNewContact", "addToExisting"]
-      if actions.indices.contains(indexPath.row) {
-        onNativeEvent(["type": "profileContactAction", "action": actions[indexPath.row]])
+    case .profileInfo:
+      guard let model = profileInfoModel(at: indexPath.row), model.copyable else { return }
+      UIPasteboard.general.string = model.subtitle
+      onNativeEvent(["type": "profileIdPressed", "id": model.subtitle])
+
+    case .chatHistory:
+      guard !availableTabs.isEmpty else {
+        onNativeEvent(["type": "profileChatHistoryPressed", "chatId": engineChatId])
+        return
       }
+      let tab = activeTab
+      let isDark = traitCollection.userInterfaceStyle == .dark
+      var targetRows: [Any] = []
+      switch tab {
+      case .media: targetRows = mediaRows
+      case .voice: targetRows = voiceRows
+      case .gifs: targetRows = gifRows
+      case .files: targetRows = fileRows
+      case .links: targetRows = linkRows
+      case .pinned: targetRows = pinnedRows
+      }
+      guard let sourceCell = tableView.cellForRow(at: indexPath) else { return }
+      let controller = ChatProfileExpandedContentViewController(
+        profileTab: tab,
+        titleText: "Chat History",
+        rows: targetRows,
+        themeIsDark: isDark,
+        sourceView: sourceCell,
+        hostView: self
+      )
+      controller.onContentPressed = { [weak self] payload in
+        self?.onNativeEvent(payload)
+      }
+      topMostViewController()?.present(controller, animated: false)
 
-    case .emergency:
-      onNativeEvent(["type": "profileContactAction", "action": "addToEmergency"])
-
-    case .dangerActions:
-      onNativeEvent(["type": "profileContactAction", "action": "block"])
-
-    case .contentRows:
+    case .sharedContent:
       guard availableTabs.indices.contains(indexPath.row) else { return }
       let tab = availableTabs[indexPath.row]
       let isDark = traitCollection.userInterfaceStyle == .dark
@@ -2740,6 +2909,18 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       if let presenter = topMostViewController() {
         presenter.present(controller, animated: false)
       }
+
+    case .contactActions:
+      let actions = ["shareContact", "createNewContact", "addToExisting"]
+      if actions.indices.contains(indexPath.row) {
+        onNativeEvent(["type": "profileContactAction", "action": actions[indexPath.row]])
+      }
+
+    case .emergency:
+      onNativeEvent(["type": "profileContactAction", "action": "addToEmergency"])
+
+    case .dangerActions:
+      onNativeEvent(["type": "profileContactAction", "action": "block"])
     }
   }
 
@@ -3179,4 +3360,3 @@ fileprivate class ChatProfileExpandedContentViewController: UIViewController, UI
     onContentPressed?(payload)
   }
 }
-

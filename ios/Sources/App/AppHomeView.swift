@@ -4009,14 +4009,24 @@ final class ChatConversationController: UIViewController {
         sheet.prefersGrabberVisible = true
       }
       present(nav, animated: true)
-    case "openAgentPanel":
-      if let provider = route.bridgeProvider, !provider.isEmpty {
-        presentBridgeRepositoryPicker(provider: provider)
-      }
-    case "headerSearchPressed":
-      if currentPage == .profile {
-        hideProfileView(animated: true)
-      }
+	    case "openAgentPanel":
+	      if let provider = route.bridgeProvider, !provider.isEmpty {
+	        presentBridgeRepositoryPicker(provider: provider)
+	      }
+	    case "agentStopStreaming":
+	      if let provider = route.bridgeProvider, !provider.isEmpty {
+	        let result = ChatEngine.shared.sendAgentBridgeControl([
+	          "chatId": route.chatId,
+	          "provider": provider,
+	          "action": "cancel",
+	        ])
+	        appShellRouteLog(
+	          "ChatConversationController bridgeStop chatId=\(route.chatId) provider=\(provider) result=\(result)")
+	      }
+	    case "headerSearchPressed":
+	      if currentPage == .profile {
+	        hideProfileView(animated: true)
+	      }
       mainView.openHeaderSearch()
     case "headerAudioCallPressed":
       NativeCallRouteBridge.startOutgoing(route: route, callType: "voice")

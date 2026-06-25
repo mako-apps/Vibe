@@ -2444,6 +2444,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       toggleMessageSelection(row: row)
       return
     }
+    if let runtime = row.agentRuntime {
+      presentAgentRuntimeTask(row: row, runtime: runtime)
+      return
+    }
     if row.isAgentMessage,
       row.visualKind == .text,
       let agentUserId = row.agentUserId,
@@ -2537,6 +2541,27 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
     guard isFileLikeType || hasFileNameHint || isAgentDocURL || isMediaOrVideo else { return }
     openDocumentInApp(row: row)
+  }
+
+  private func presentAgentRuntimeTask(row: ChatListRow, runtime: ChatListRow.AgentRuntimeSummary) {
+    guard let presenter = topPresentingViewController() else { return }
+    let rowChatId = row.chatId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let resolvedChatId =
+      rowChatId.isEmpty ? engineChatId.trimmingCharacters(in: .whitespacesAndNewlines) : rowChatId
+    let controller = AgentRuntimeTaskViewController(
+      row: row,
+      runtime: runtime,
+      appearance: appearance,
+      chatId: resolvedChatId,
+      fallbackProvider: currentBridgeProvider
+    )
+    let nav = UINavigationController(rootViewController: controller)
+    nav.modalPresentationStyle = .pageSheet
+    if let sheet = nav.sheetPresentationController {
+      sheet.detents = [.large()]
+      sheet.prefersGrabberVisible = true
+    }
+    presenter.present(nav, animated: true)
   }
 
   @objc private func handleChatEngineChanged(_ note: Notification) {
@@ -6742,10 +6767,10 @@ extension ChatListView: ChatInputBarDelegate {
     handleNativeSend(text: text)
   }
 
-  func inputBarDidRequestStopStreaming() {
-    guard agentChatMode, agentStreaming else { return }
-    onNativeEvent(["type": "agentStopStreaming"])
-  }
+	  func inputBarDidRequestStopStreaming() {
+	    guard (agentChatMode || currentBridgeProvider != nil), agentStreaming else { return }
+	    onNativeEvent(["type": "agentStopStreaming"])
+	  }
 
   func inputBarDidSendWithAgentMention(text: String, agentText: String) {
     handleNativeSend(text: text, agentMention: true, agentText: agentText)

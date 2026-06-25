@@ -479,7 +479,15 @@ private final class ChatNativeAgentPlainTextView: UIView {
       let lineHeight: CGFloat = 26.0
       let textColor = appearance.textColorThem
       let isStreaming = row.isStreamingText
-      let blocks = ChatNativeAgentTextRenderer.parseBlocks(text)
+      var blocks = ChatNativeAgentTextRenderer.parseBlocks(text)
+      if let runtime = row.agentRuntime,
+        !blocks.contains(where: {
+          if case .agentRuntime = $0 { return true }
+          return false
+        })
+      {
+        blocks.append(.agentRuntime(runtime))
+      }
 
       // Rebuild subviews only when block structure changes
       let signature = blocks.map { block -> String in
@@ -487,6 +495,7 @@ private final class ChatNativeAgentPlainTextView: UIView {
         case .text: return "T"
         case .code: return "C"
         case .agentPack: return "P"
+        case .agentRuntime: return "R"
         }
       }.joined()
 
@@ -508,6 +517,10 @@ private final class ChatNativeAgentPlainTextView: UIView {
             let packView = AgentIntegrationPackView()
             addSubview(packView)
             return packView
+          case .agentRuntime:
+            let runtimeView = AgentRuntimeSummaryView()
+            addSubview(runtimeView)
+            return runtimeView
           }
         }
         lastBlockSignature = signature
@@ -568,6 +581,18 @@ private final class ChatNativeAgentPlainTextView: UIView {
             CGRect(x: leftPadding, y: yOffset, width: packAvailableWidth, height: packHeight)
           )
           yOffset += packHeight + 6.0
+        case .agentRuntime(let runtime):
+          let runtimeView = view as! AgentRuntimeSummaryView
+          let runtimeAvailableWidth = max(1.0, availableWidth - leftPadding)
+          let runtimeHeight = runtimeView.configure(
+            runtime: runtime,
+            textColor: textColor,
+            availableWidth: runtimeAvailableWidth
+          )
+          blockFrames.append(
+            CGRect(x: leftPadding, y: yOffset, width: runtimeAvailableWidth, height: runtimeHeight)
+          )
+          yOffset += runtimeHeight + 6.0
         }
       }
 

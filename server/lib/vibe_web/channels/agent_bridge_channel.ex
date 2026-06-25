@@ -110,7 +110,8 @@ defmodule VibeWeb.AgentBridgeChannel do
             exit_status,
             duration_ms,
             reply_to_id: reply_to_id,
-            requester_user_id: requester_user_id
+            requester_user_id: requester_user_id,
+            runtime: payload["agentRuntime"] || payload["agent_runtime"]
           )
         rescue
           err ->
@@ -124,6 +125,15 @@ defmodule VibeWeb.AgentBridgeChannel do
     end
 
     {:reply, :ok, clear_stream(socket, chat_id, provider)}
+  end
+
+  # daemon → server: acknowledgement for a phone-issued task control action.
+  def handle_in("control_result", payload, socket) do
+    Logger.info(
+      "[AgentBridge] control_result user=#{socket.assigns.user_id} payload=#{inspect(payload)}"
+    )
+
+    {:reply, :ok, socket}
   end
 
   # daemon → server: surface an error notice without a full result
@@ -162,7 +172,9 @@ defmodule VibeWeb.AgentBridgeChannel do
         socket
 
       {state, rest} ->
-        if is_binary(provider), do: LocalAgentWorker.finish_stream(provider, chat_id, state.stream_id)
+        if is_binary(provider),
+          do: LocalAgentWorker.finish_stream(provider, chat_id, state.stream_id)
+
         assign(socket, :streams, rest)
     end
   end

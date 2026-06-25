@@ -145,6 +145,40 @@ defmodule VibeWeb.ChatChannel do
   end
 
   @impl true
+  def handle_in("agent-bridge-control", payload, socket) when is_map(payload) do
+    "chat:" <> chat_id = socket.topic
+    user_id = socket.assigns.user_id
+    action = normalize_control_action(payload["action"] || payload["type"])
+    provider = normalize_bridge_provider(payload["provider"] || payload["agentBridgeProvider"])
+
+    task_id =
+      normalize_bridge_string(payload["taskId"] || payload["agentTaskId"] || payload["messageId"])
+
+    cond do
+      is_nil(action) ->
+        {:reply, {:error, %{reason: "invalid_action"}}, socket}
+
+      is_nil(provider) ->
+        {:reply, {:error, %{reason: "invalid_provider"}}, socket}
+
+      true ->
+        control_payload =
+          %{
+            "action" => action,
+            "provider" => provider,
+            "chatId" => chat_id,
+            "requesterUserId" => user_id
+          }
+          |> put_optional_string("taskId", task_id)
+
+        case AgentBridge.dispatch_control(user_id, control_payload) do
+          :ok -> {:reply, :ok, socket}
+          {:error, :offline} -> {:reply, {:error, %{reason: "offline"}}, socket}
+        end
+    end
+  end
+
+  @impl true
   def handle_in("typing", payload, socket) do
     broadcast_from!(socket, "typing", payload)
     {:noreply, socket}
@@ -462,6 +496,7 @@ defmodule VibeWeb.ChatChannel do
           %{
             "provider" => worker.handle,
             "chatId" => chat_id,
+            "taskId" => data["id"] || Ecto.UUID.generate(),
             "prompt" => bridge_prompt,
             "replyToId" => data["id"],
             "requesterUserId" => requester_user_id
@@ -680,6 +715,33 @@ defmodule VibeWeb.ChatChannel do
         data["agentBridgeWorkMode"]
     )
   end
+
+  defp normalize_control_action(value) do
+    value = normalize_bridge_string(value)
+
+    case value && String.downcase(value) do
+      action when action in ["cancel", "stop", "revert"] -> action
+      _ -> nil
+    end
+  end
+
+  defp normalize_bridge_provider(value) do
+    value = normalize_bridge_string(value)
+
+    case value && String.downcase(value) do
+      provider when provider in ["claude", "codex"] -> provider
+      _ -> nil
+    end
+  end
+
+  defp normalize_bridge_string(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp normalize_bridge_string(_), do: nil
 
   defp put_optional_string(map, key, value) when is_binary(value) do
     case String.trim(value) do

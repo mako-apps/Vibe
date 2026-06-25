@@ -1591,6 +1591,59 @@ final class ChatEngine {
         ])
       return ["accepted": true, "transport": "native", "ref": ref, "isRecording": isRecording]
     }
+	  }
+
+  func sendAgentBridgeControl(_ payload: [String: Any]) -> [String: Any] {
+    let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"])
+    let provider = normalizedString(payload["provider"] ?? payload["agentBridgeProvider"])
+    let action = normalizedString(payload["action"] ?? payload["type"]) ?? "cancel"
+    let taskId = normalizedString(payload["taskId"] ?? payload["agentTaskId"] ?? payload["messageId"])
+
+    guard let chatId, !chatId.isEmpty else {
+      return ["accepted": false, "reason": "invalid_chat"]
+    }
+    guard let provider, !provider.isEmpty else {
+      return ["accepted": false, "reason": "invalid_provider"]
+    }
+
+    return syncOnQueue {
+      guard let client = phoenixClient else {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+          self?.ensureNativeTransport(trigger: "bridge_control_no_socket")
+        }
+        return ["accepted": false, "reason": "no_native_socket"]
+      }
+      guard nativeJoinedChatIds.contains(chatId), (state["connected"] as? Bool) == true else {
+        joinNativeChatTopicIfNeededLocked(chatId: chatId)
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+          self?.ensureNativeTransport(trigger: "bridge_control_chat_not_joined")
+        }
+        return ["accepted": false, "reason": "chat_not_joined"]
+      }
+
+      var wirePayload: [String: Any] = [
+        "action": action,
+        "provider": provider,
+      ]
+      if let taskId, !taskId.isEmpty {
+        wirePayload["taskId"] = taskId
+      }
+      let ref = client.push(
+        topic: chatTopic(for: chatId),
+        event: "agent-bridge-control",
+        payload: wirePayload
+      )
+      appendJournalLocked(
+        event: "native-agent-bridge-control",
+        payload: ["chatId": chatId, "provider": provider, "action": action, "ref": ref]
+      )
+      state["updatedAt"] = nowMs()
+      postChangeLocked(
+        reason: "agentBridgeControlSent",
+        userInfo: ["chatId": chatId, "provider": provider, "action": action]
+      )
+      return ["accepted": true, "transport": "native", "ref": ref]
+    }
   }
 
   func retryOutgoingMessage(_ payload: [String: Any]) -> [String: Any] {

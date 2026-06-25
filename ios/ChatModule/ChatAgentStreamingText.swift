@@ -13,6 +13,7 @@ enum AgentParsedBlock: Equatable {
   case text(String)
   case code(String, String?) // code + optional language
   case agentPack(AgentIntegrationPack)
+  case agentRuntime(ChatListRow.AgentRuntimeSummary)
 }
 
 struct AgentIntegrationPack: Equatable {
@@ -406,6 +407,763 @@ enum ChatNativeAgentTextRenderer {
       context: nil
     )
     return CGSize(width: ceil(measured.width), height: ceil(measured.height))
+  }
+}
+
+// MARK: - AgentRuntimeSummaryView
+
+final class AgentRuntimeSummaryView: UIView {
+  private final class FileRowView: UIView {
+    private let nameLabel = UILabel()
+    private let pathLabel = UILabel()
+    private let statsLabel = UILabel()
+    private let statusLabel = UILabel()
+
+    override init(frame: CGRect) {
+      super.init(frame: frame)
+      [nameLabel, pathLabel, statsLabel, statusLabel].forEach {
+        $0.translatesAutoresizingMaskIntoConstraints = false
+        $0.backgroundColor = .clear
+        addSubview($0)
+      }
+      nameLabel.font = UIFont.systemFont(ofSize: 13, weight: .semibold)
+      pathLabel.font = UIFont.systemFont(ofSize: 11, weight: .regular)
+      pathLabel.lineBreakMode = .byTruncatingMiddle
+      statsLabel.font = UIFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
+      statsLabel.textAlignment = .right
+      statusLabel.font = UIFont.monospacedSystemFont(ofSize: 10, weight: .semibold)
+      statusLabel.textAlignment = .center
+      statusLabel.layer.cornerRadius = 6
+      statusLabel.layer.masksToBounds = true
+    }
+
+    required init?(coder: NSCoder) {
+      return nil
+    }
+
+    func configure(file: ChatListRow.AgentRuntimeFile, textColor: UIColor) {
+      nameLabel.text = file.name
+      pathLabel.text = file.path
+      let additions = file.additions > 0 ? "+\(file.additions)" : "+0"
+      let deletions = file.deletions > 0 ? "-\(file.deletions)" : "-0"
+      statsLabel.text = "\(additions) \(deletions)"
+      statusLabel.text = file.status
+
+      nameLabel.textColor = textColor.withAlphaComponent(0.94)
+      pathLabel.textColor = textColor.withAlphaComponent(0.56)
+      statsLabel.textColor = UIColor.systemGreen
+      if file.deletions > file.additions {
+        statsLabel.textColor = UIColor.systemRed
+      }
+      statusLabel.textColor = textColor.withAlphaComponent(0.78)
+      statusLabel.backgroundColor = textColor.withAlphaComponent(0.10)
+    }
+
+    override func layoutSubviews() {
+      super.layoutSubviews()
+      let statusWidth: CGFloat = 34
+      let statsWidth: CGFloat = 86
+      let gap: CGFloat = 8
+      statusLabel.frame = CGRect(x: 0, y: 7, width: statusWidth, height: 18)
+      statsLabel.frame = CGRect(
+        x: bounds.width - statsWidth,
+        y: 7,
+        width: statsWidth,
+        height: 18
+      )
+      let textX = statusWidth + gap
+      let textWidth = max(1, bounds.width - textX - statsWidth - gap)
+      nameLabel.frame = CGRect(x: textX, y: 1, width: textWidth, height: 17)
+      pathLabel.frame = CGRect(x: textX, y: 18, width: textWidth, height: 14)
+    }
+  }
+
+  private let backgroundView = UIView()
+  private let titleLabel = UILabel()
+  private let statsLabel = UILabel()
+  private let repoLabel = UILabel()
+  private let commandLabel = UILabel()
+  private let dirtyLabel = UILabel()
+  private let moreLabel = UILabel()
+  private var fileRows: [FileRowView] = []
+  private var runtime: ChatListRow.AgentRuntimeSummary?
+  private var textColor: UIColor = .label
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    backgroundColor = .clear
+    isOpaque = false
+    backgroundView.backgroundColor = UIColor.secondarySystemBackground.withAlphaComponent(0.72)
+    backgroundView.layer.cornerRadius = 12
+    backgroundView.layer.cornerCurve = .continuous
+    backgroundView.layer.borderWidth = 1
+    backgroundView.layer.borderColor = UIColor.separator.withAlphaComponent(0.25).cgColor
+    addSubview(backgroundView)
+
+    [titleLabel, statsLabel, repoLabel, commandLabel, dirtyLabel, moreLabel].forEach {
+      $0.backgroundColor = .clear
+      $0.numberOfLines = 1
+      addSubview($0)
+    }
+    titleLabel.font = UIFont.systemFont(ofSize: 15, weight: .semibold)
+    statsLabel.font = UIFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
+    statsLabel.textAlignment = .right
+    repoLabel.font = UIFont.systemFont(ofSize: 12, weight: .medium)
+    commandLabel.font = UIFont.monospacedSystemFont(ofSize: 11.5, weight: .regular)
+    commandLabel.lineBreakMode = .byTruncatingMiddle
+    dirtyLabel.font = UIFont.systemFont(ofSize: 11.5, weight: .regular)
+    moreLabel.font = UIFont.systemFont(ofSize: 12, weight: .medium)
+  }
+
+  required init?(coder: NSCoder) {
+    return nil
+  }
+
+  static func measuredHeight(runtime: ChatListRow.AgentRuntimeSummary, availableWidth: CGFloat) -> CGFloat {
+    _ = availableWidth
+    let files = runtime.diff?.files ?? []
+    var height: CGFloat = 14 + 22 + 18 + 8
+    if runtime.command?.display?.isEmpty == false || runtime.command?.executable?.isEmpty == false {
+      height += 18
+    }
+    if runtime.dirtyBefore {
+      height += 17
+    }
+    height += CGFloat(min(files.count, 4)) * 34
+    if files.count > 4 {
+      height += 25
+    }
+    return max(82, height + 12)
+  }
+
+  @discardableResult
+  func configure(
+    runtime: ChatListRow.AgentRuntimeSummary,
+    textColor: UIColor,
+    availableWidth: CGFloat
+  ) -> CGFloat {
+    self.runtime = runtime
+    self.textColor = textColor
+    let diff = runtime.diff
+    let filesChanged = diff?.filesChanged ?? 0
+    titleLabel.text = filesChanged == 1 ? "1 file changed" : "\(filesChanged) files changed"
+    statsLabel.text = "+\(diff?.additions ?? 0) -\(diff?.deletions ?? 0)"
+    repoLabel.text = runtimeSubtitle(runtime)
+    commandLabel.text = runtime.command?.display ?? runtime.command?.executable
+    dirtyLabel.text =
+      runtime.dirtyBefore
+      ? "Repo already had \(runtime.dirtyBeforeCount) change(s) before this run"
+      : nil
+    let hiddenCount = max(0, (diff?.files.count ?? 0) - 4)
+    moreLabel.text = hiddenCount > 0 ? "View \(hiddenCount) more file(s)" : nil
+
+    titleLabel.textColor = textColor.withAlphaComponent(0.96)
+    statsLabel.textColor = (diff?.deletions ?? 0) > (diff?.additions ?? 0)
+      ? UIColor.systemRed : UIColor.systemGreen
+    repoLabel.textColor = textColor.withAlphaComponent(0.62)
+    commandLabel.textColor = textColor.withAlphaComponent(0.62)
+    dirtyLabel.textColor = UIColor.systemOrange
+    moreLabel.textColor = textColor.withAlphaComponent(0.62)
+
+    let files = Array((diff?.files ?? []).prefix(4))
+    while fileRows.count < files.count {
+      let row = FileRowView()
+      addSubview(row)
+      fileRows.append(row)
+    }
+    for (index, row) in fileRows.enumerated() {
+      if index < files.count {
+        row.isHidden = false
+        row.configure(file: files[index], textColor: textColor)
+      } else {
+        row.isHidden = true
+      }
+    }
+
+    let height = Self.measuredHeight(runtime: runtime, availableWidth: availableWidth)
+    frame.size = CGSize(width: availableWidth, height: height)
+    setNeedsLayout()
+    return height
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    backgroundView.frame = bounds
+    let inset: CGFloat = 12
+    let width = max(1, bounds.width - inset * 2)
+    var y: CGFloat = 12
+    let statsWidth: CGFloat = 96
+    titleLabel.frame = CGRect(x: inset, y: y, width: max(1, width - statsWidth - 8), height: 22)
+    statsLabel.frame = CGRect(x: bounds.width - inset - statsWidth, y: y + 1, width: statsWidth, height: 20)
+    y += 24
+    repoLabel.frame = CGRect(x: inset, y: y, width: width, height: 16)
+    y += 20
+    if !(commandLabel.text?.isEmpty ?? true) {
+      commandLabel.isHidden = false
+      commandLabel.frame = CGRect(x: inset, y: y, width: width, height: 16)
+      y += 18
+    } else {
+      commandLabel.isHidden = true
+      commandLabel.frame = .zero
+    }
+    if !(dirtyLabel.text?.isEmpty ?? true) {
+      dirtyLabel.isHidden = false
+      dirtyLabel.frame = CGRect(x: inset, y: y, width: width, height: 15)
+      y += 17
+    } else {
+      dirtyLabel.isHidden = true
+      dirtyLabel.frame = .zero
+    }
+
+    for row in fileRows where !row.isHidden {
+      row.frame = CGRect(x: inset, y: y, width: width, height: 32)
+      y += 34
+    }
+    if !(moreLabel.text?.isEmpty ?? true) {
+      moreLabel.isHidden = false
+      moreLabel.frame = CGRect(x: inset, y: y + 2, width: width, height: 18)
+    } else {
+      moreLabel.isHidden = true
+      moreLabel.frame = .zero
+    }
+  }
+
+  private func runtimeSubtitle(_ runtime: ChatListRow.AgentRuntimeSummary) -> String {
+    var parts: [String] = []
+    if let provider = runtime.provider, !provider.isEmpty {
+      let title = provider.prefix(1).uppercased() + String(provider.dropFirst())
+      parts.append(title)
+    }
+    if let repo = runtime.repoName, !repo.isEmpty {
+      parts.append(repo)
+    }
+    if let mode = runtime.workMode, !mode.isEmpty {
+      parts.append(mode.replacingOccurrences(of: "_", with: " "))
+    }
+    if let exit = runtime.exitStatus, runtime.status == "failed" {
+      parts.append("exit \(exit)")
+    }
+    return parts.isEmpty ? "Local bridge" : parts.joined(separator: " · ")
+  }
+}
+
+// MARK: - AgentRuntimeTaskViewController
+
+final class AgentRuntimeTaskViewController: UIViewController {
+  private let row: ChatListRow
+  private let runtime: ChatListRow.AgentRuntimeSummary
+  private let appearance: ChatListAppearance
+  private let chatId: String
+  private let fallbackProvider: String?
+
+  private let messagesView = ChatNativeAgentMessagesView()
+  private let actionBar = UIVisualEffectView(effect: UIBlurEffect(style: .systemMaterial))
+  private let actionStack = UIStackView()
+  private let filesButton = UIButton(type: .system)
+  private let copyPatchButton = UIButton(type: .system)
+  private let stopButton = UIButton(type: .system)
+  private let revertButton = UIButton(type: .system)
+  private let statusLabel = UILabel()
+
+  init(
+    row: ChatListRow,
+    runtime: ChatListRow.AgentRuntimeSummary,
+    appearance: ChatListAppearance,
+    chatId: String,
+    fallbackProvider: String?
+  ) {
+    self.row = row
+    self.runtime = runtime
+    self.appearance = appearance
+    self.chatId = chatId
+    self.fallbackProvider = fallbackProvider
+    super.init(nibName: nil, bundle: nil)
+  }
+
+  required init?(coder: NSCoder) {
+    return nil
+  }
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    view.backgroundColor = appearance.isDark ? .black : .systemBackground
+    title = runtime.provider?.capitalized ?? fallbackProvider?.capitalized ?? "Agent"
+    navigationItem.leftBarButtonItem = UIBarButtonItem(
+      barButtonSystemItem: .done,
+      target: self,
+      action: #selector(handleDone)
+    )
+
+    messagesView.translatesAutoresizingMaskIntoConstraints = false
+    messagesView.applyAppearance(appearance)
+    view.addSubview(messagesView)
+
+    actionBar.translatesAutoresizingMaskIntoConstraints = false
+    actionBar.layer.cornerRadius = 20
+    actionBar.layer.cornerCurve = .continuous
+    actionBar.clipsToBounds = true
+    view.addSubview(actionBar)
+
+    actionStack.axis = .horizontal
+    actionStack.alignment = .fill
+    actionStack.distribution = .fillEqually
+    actionStack.spacing = 8
+    actionStack.translatesAutoresizingMaskIntoConstraints = false
+    actionBar.contentView.addSubview(actionStack)
+
+    statusLabel.translatesAutoresizingMaskIntoConstraints = false
+    statusLabel.font = .systemFont(ofSize: 12, weight: .medium)
+    statusLabel.textColor = appearance.isDark ? UIColor.white.withAlphaComponent(0.58) : .secondaryLabel
+    statusLabel.textAlignment = .center
+    actionBar.contentView.addSubview(statusLabel)
+
+    configureActionButton(filesButton, title: "Files", symbolName: "doc.text.magnifyingglass")
+    configureActionButton(copyPatchButton, title: "Patch", symbolName: "doc.on.doc")
+    configureActionButton(stopButton, title: "Stop", symbolName: "stop.fill")
+    configureActionButton(revertButton, title: "Revert", symbolName: "arrow.uturn.backward")
+
+    filesButton.addTarget(self, action: #selector(handleFiles), for: .touchUpInside)
+    copyPatchButton.addTarget(self, action: #selector(handleCopyPatch), for: .touchUpInside)
+    stopButton.addTarget(self, action: #selector(handleStop), for: .touchUpInside)
+    revertButton.addTarget(self, action: #selector(handleRevert), for: .touchUpInside)
+
+    actionStack.addArrangedSubview(filesButton)
+    actionStack.addArrangedSubview(copyPatchButton)
+    actionStack.addArrangedSubview(stopButton)
+    actionStack.addArrangedSubview(revertButton)
+
+    let hasPatch = runtime.diff?.patch?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    let hasFiles = !(runtime.diff?.files ?? []).isEmpty
+    filesButton.isEnabled = hasFiles
+    filesButton.alpha = hasFiles ? 1.0 : 0.42
+    copyPatchButton.isEnabled = hasPatch
+    copyPatchButton.alpha = hasPatch ? 1.0 : 0.42
+    stopButton.isEnabled = runtime.controls?.canCancel == true || runtime.status == "running"
+    stopButton.alpha = stopButton.isEnabled ? 1.0 : 0.42
+    revertButton.isEnabled = runtime.controls?.canRevert == true
+    revertButton.alpha = revertButton.isEnabled ? 1.0 : 0.42
+
+    NSLayoutConstraint.activate([
+      messagesView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      messagesView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      messagesView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+      messagesView.bottomAnchor.constraint(equalTo: actionBar.topAnchor, constant: -10),
+
+      actionBar.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
+      actionBar.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+      actionBar.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -10),
+      actionBar.heightAnchor.constraint(equalToConstant: 86),
+
+      statusLabel.leadingAnchor.constraint(equalTo: actionBar.contentView.leadingAnchor, constant: 12),
+      statusLabel.trailingAnchor.constraint(equalTo: actionBar.contentView.trailingAnchor, constant: -12),
+      statusLabel.topAnchor.constraint(equalTo: actionBar.contentView.topAnchor, constant: 8),
+      statusLabel.heightAnchor.constraint(equalToConstant: 16),
+
+      actionStack.leadingAnchor.constraint(equalTo: actionBar.contentView.leadingAnchor, constant: 10),
+      actionStack.trailingAnchor.constraint(equalTo: actionBar.contentView.trailingAnchor, constant: -10),
+      actionStack.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 8),
+      actionStack.bottomAnchor.constraint(equalTo: actionBar.contentView.bottomAnchor, constant: -10),
+    ])
+
+    statusLabel.text = statusText()
+    messagesView.setRows(
+      buildRawRows(),
+      topPadding: 10,
+      spacerHeight: 0,
+      bottomPadding: 18,
+      scrollToBottom: false,
+      animated: false
+    )
+  }
+
+  override func viewDidAppear(_ animated: Bool) {
+    super.viewDidAppear(animated)
+    messagesView.scrollToBottom(animated: false)
+  }
+
+  private func configureActionButton(_ button: UIButton, title: String, symbolName: String) {
+    var config = UIButton.Configuration.filled()
+    config.title = title
+    config.image = UIImage(systemName: symbolName)
+    config.imagePadding = 5
+    config.cornerStyle = .large
+    config.baseForegroundColor = appearance.isDark ? .white : .label
+    config.baseBackgroundColor =
+      appearance.isDark
+      ? UIColor.white.withAlphaComponent(0.10)
+      : UIColor.black.withAlphaComponent(0.06)
+    button.configuration = config
+    button.titleLabel?.font = .systemFont(ofSize: 12, weight: .semibold)
+  }
+
+  private func buildRawRows() -> [[String: Any]] {
+    var rows: [[String: Any]] = []
+    let timestampMs = Int64(Date().timeIntervalSince1970 * 1000)
+    rows.append([
+      "kind": "day",
+      "key": "runtime-day-\(row.messageId ?? row.key)",
+      "label": "Task",
+      "timestampMs": timestampMs,
+    ])
+
+    let resultText = (row.plainContent ?? row.text).trimmingCharacters(in: .whitespacesAndNewlines)
+    let runtimeMessageId = row.messageId ?? row.key
+    rows.append(agentMessageRow(
+      key: "runtime-result-\(runtimeMessageId)",
+      id: runtimeMessageId,
+      text: resultText.isEmpty ? statusText() : resultText,
+      timestamp: row.timestamp,
+      metadata: ["agentRuntime": runtimePayloadDictionary(runtime)]
+    ))
+
+    if let patch = runtime.diff?.patch?.trimmingCharacters(in: .whitespacesAndNewlines), !patch.isEmpty {
+      let truncated = runtime.diff?.patchTruncated == true ? "\n\nPatch truncated by bridge payload limit." : ""
+      rows.append(agentMessageRow(
+        key: "runtime-patch-\(runtimeMessageId)",
+        id: "\(runtimeMessageId)-patch",
+        text: "```diff\n\(patch)\n```\n\(truncated)",
+        timestamp: row.timestamp,
+        metadata: [:]
+      ))
+    }
+
+    return rows
+  }
+
+  private func agentMessageRow(
+    key: String,
+    id: String,
+    text: String,
+    timestamp: String,
+    metadata: [String: Any]
+  ) -> [String: Any] {
+    var message: [String: Any] = [
+      "id": id,
+      "text": text,
+      "plainContent": text,
+      "timestamp": timestamp,
+      "isMe": false,
+      "type": "text",
+      "isAgentMessage": true,
+      "agentName": runtime.provider?.capitalized ?? fallbackProvider?.capitalized ?? "Agent",
+      "metadata": metadata,
+      "bubbleShape": [
+        "showTail": true,
+        "borderTopLeftRadius": 18,
+        "borderTopRightRadius": 18,
+        "borderBottomLeftRadius": 18,
+        "borderBottomRightRadius": 18,
+      ],
+    ]
+
+    if metadata.isEmpty {
+      message.removeValue(forKey: "metadata")
+    }
+
+    return [
+      "kind": "message",
+      "key": key,
+      "message": message,
+    ]
+  }
+
+  private func runtimePayloadDictionary(_ runtime: ChatListRow.AgentRuntimeSummary) -> [String: Any] {
+    var payload: [String: Any] = [
+      "status": runtime.status,
+      "dirtyBefore": runtime.dirtyBefore,
+      "dirtyBeforeCount": runtime.dirtyBeforeCount,
+    ]
+    put(runtime.taskId, into: &payload, key: "taskId")
+    put(runtime.provider, into: &payload, key: "provider")
+    put(runtime.repoName, into: &payload, key: "repoName")
+    put(runtime.cwd, into: &payload, key: "cwd")
+    put(runtime.workMode, into: &payload, key: "workMode")
+    if let durationMs = runtime.durationMs { payload["durationMs"] = durationMs }
+    if let exitStatus = runtime.exitStatus { payload["exitStatus"] = exitStatus }
+    if let command = runtime.command {
+      var commandPayload: [String: Any] = [:]
+      put(command.executable, into: &commandPayload, key: "executable")
+      put(command.display, into: &commandPayload, key: "display")
+      payload["command"] = commandPayload
+    }
+    if let diff = runtime.diff {
+      payload["diff"] = [
+        "filesChanged": diff.filesChanged,
+        "additions": diff.additions,
+        "deletions": diff.deletions,
+        "files": diff.files.map { file in
+          [
+            "path": file.path,
+            "name": file.name,
+            "status": file.status,
+            "additions": file.additions,
+            "deletions": file.deletions,
+          ]
+        },
+        "patch": diff.patch ?? "",
+        "patchTruncated": diff.patchTruncated,
+      ]
+    }
+    if let controls = runtime.controls {
+      payload["controls"] = [
+        "canCancel": controls.canCancel,
+        "canRevert": controls.canRevert,
+      ]
+    }
+    return payload
+  }
+
+  private func put(_ value: String?, into payload: inout [String: Any], key: String) {
+    guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+    payload[key] = value
+  }
+
+  private func statusText() -> String {
+    var parts: [String] = []
+    if let repo = runtime.repoName, !repo.isEmpty { parts.append(repo) }
+    if let cwd = runtime.cwd, !cwd.isEmpty { parts.append(cwd) }
+    if let mode = runtime.workMode, !mode.isEmpty {
+      parts.append(mode.replacingOccurrences(of: "_", with: " "))
+    }
+    if let duration = runtime.durationMs, duration > 0 {
+      parts.append(String(format: "%.1fs", Double(duration) / 1000.0))
+    }
+    if runtime.status == "failed", let exit = runtime.exitStatus {
+      parts.append("exit \(exit)")
+    } else {
+      parts.append(runtime.status)
+    }
+    return parts.joined(separator: "  ")
+  }
+
+  private func providerForControl() -> String? {
+    let provider = runtime.provider ?? fallbackProvider
+    let trimmed = provider?.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed?.isEmpty == false ? trimmed : nil
+  }
+
+  @objc private func handleDone() {
+    dismiss(animated: true)
+  }
+
+  @objc private func handleFiles() {
+    guard let diff = runtime.diff, !diff.files.isEmpty else { return }
+    let controller = AgentRuntimeFilesViewController(runtime: runtime, appearance: appearance)
+    navigationController?.pushViewController(controller, animated: true)
+  }
+
+  @objc private func handleCopyPatch() {
+    guard let patch = runtime.diff?.patch, !patch.isEmpty else { return }
+    UIPasteboard.general.string = patch
+    statusLabel.text = "Patch copied"
+  }
+
+  @objc private func handleStop() {
+    sendControl(action: "cancel", button: stopButton, pendingTitle: "Stopping", doneTitle: "Stop Sent")
+  }
+
+  @objc private func handleRevert() {
+    let alert = UIAlertController(
+      title: "Revert Task Changes",
+      message: "This asks the bridge to revert only the files reported by this task.",
+      preferredStyle: .actionSheet
+    )
+    alert.addAction(UIAlertAction(title: "Revert", style: .destructive) { [weak self] _ in
+      self?.sendControl(action: "revert", button: self?.revertButton, pendingTitle: "Reverting", doneTitle: "Revert Sent")
+    })
+    alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+    if let popover = alert.popoverPresentationController {
+      popover.sourceView = revertButton
+      popover.sourceRect = revertButton.bounds
+    }
+    present(alert, animated: true)
+  }
+
+  private func sendControl(
+    action: String,
+    button: UIButton?,
+    pendingTitle: String,
+    doneTitle: String
+  ) {
+    guard let provider = providerForControl(), !chatId.isEmpty else {
+      statusLabel.text = "Bridge control unavailable"
+      return
+    }
+    button?.isEnabled = false
+    statusLabel.text = pendingTitle
+    var payload: [String: Any] = [
+      "chatId": chatId,
+      "provider": provider,
+      "action": action,
+    ]
+    if let taskId = runtime.taskId, !taskId.isEmpty {
+      payload["taskId"] = taskId
+    }
+    let result = ChatEngine.shared.sendAgentBridgeControl(payload)
+    if (result["accepted"] as? Bool) == true {
+      statusLabel.text = doneTitle
+    } else {
+      let reason = (result["reason"] as? String) ?? "not accepted"
+      statusLabel.text = "Control failed: \(reason)"
+      button?.isEnabled = true
+    }
+  }
+}
+
+private final class AgentRuntimeFilesViewController: UITableViewController {
+  private let runtime: ChatListRow.AgentRuntimeSummary
+  private let appearance: ChatListAppearance
+  private let files: [ChatListRow.AgentRuntimeFile]
+
+  init(runtime: ChatListRow.AgentRuntimeSummary, appearance: ChatListAppearance) {
+    self.runtime = runtime
+    self.appearance = appearance
+    self.files = runtime.diff?.files ?? []
+    super.init(style: .insetGrouped)
+  }
+
+  required init?(coder: NSCoder) {
+    return nil
+  }
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    title = "Files"
+    view.backgroundColor = appearance.isDark ? .black : .systemGroupedBackground
+    tableView.register(UITableViewCell.self, forCellReuseIdentifier: "file")
+  }
+
+  override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+    files.count
+  }
+
+  override func tableView(
+    _ tableView: UITableView,
+    cellForRowAt indexPath: IndexPath
+  ) -> UITableViewCell {
+    let cell = tableView.dequeueReusableCell(withIdentifier: "file", for: indexPath)
+    let file = files[indexPath.row]
+    var content = UIListContentConfiguration.subtitleCell()
+    content.text = file.name
+    content.secondaryText = "\(file.path)   +\(file.additions) -\(file.deletions)"
+    content.textProperties.font = .systemFont(ofSize: 15, weight: .semibold)
+    content.secondaryTextProperties.font = .systemFont(ofSize: 12, weight: .regular)
+    cell.contentConfiguration = content
+    cell.accessoryType = .disclosureIndicator
+    cell.backgroundColor = appearance.isDark ? UIColor.white.withAlphaComponent(0.06) : .secondarySystemGroupedBackground
+    return cell
+  }
+
+  override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+    tableView.deselectRow(at: indexPath, animated: true)
+    let file = files[indexPath.row]
+    let controller = AgentRuntimePatchPreviewController(
+      file: file,
+      patch: runtime.diff?.patch ?? "",
+      patchTruncated: runtime.diff?.patchTruncated == true,
+      appearance: appearance
+    )
+    navigationController?.pushViewController(controller, animated: true)
+  }
+}
+
+private final class AgentRuntimePatchPreviewController: UIViewController {
+  private let file: ChatListRow.AgentRuntimeFile
+  private let patch: String
+  private let patchTruncated: Bool
+  private let appearance: ChatListAppearance
+  private let textView = UITextView()
+
+  init(
+    file: ChatListRow.AgentRuntimeFile,
+    patch: String,
+    patchTruncated: Bool,
+    appearance: ChatListAppearance
+  ) {
+    self.file = file
+    self.patch = patch
+    self.patchTruncated = patchTruncated
+    self.appearance = appearance
+    super.init(nibName: nil, bundle: nil)
+  }
+
+  required init?(coder: NSCoder) {
+    return nil
+  }
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    title = file.name
+    view.backgroundColor = appearance.isDark ? .black : .systemBackground
+    navigationItem.rightBarButtonItem = UIBarButtonItem(
+      image: UIImage(systemName: "doc.on.doc"),
+      style: .plain,
+      target: self,
+      action: #selector(handleCopy)
+    )
+
+    textView.translatesAutoresizingMaskIntoConstraints = false
+    textView.isEditable = false
+    textView.alwaysBounceVertical = true
+    textView.backgroundColor = .clear
+    textView.textColor = appearance.isDark ? .white : .label
+    textView.font = .monospacedSystemFont(ofSize: 12.5, weight: .regular)
+    textView.textContainerInset = UIEdgeInsets(top: 16, left: 12, bottom: 24, right: 12)
+    view.addSubview(textView)
+
+    NSLayoutConstraint.activate([
+      textView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      textView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      textView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+      textView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+    ])
+
+    textView.text = previewText()
+  }
+
+  private func previewText() -> String {
+    let chunk = diffChunk(for: file.path, patch: patch)
+    if !chunk.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      return patchTruncated ? chunk + "\n\n[Patch truncated]" : chunk
+    }
+    return """
+    \(file.path)
+    status: \(file.status)
+    additions: \(file.additions)
+    deletions: \(file.deletions)
+
+    No per-file patch was included in this payload.
+    """
+  }
+
+  private func diffChunk(for path: String, patch: String) -> String {
+    let lines = patch.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+    var chunks: [[String]] = []
+    var current: [String] = []
+
+    for line in lines {
+      if line.hasPrefix("diff --git ") && !current.isEmpty {
+        chunks.append(current)
+        current = [line]
+      } else {
+        current.append(line)
+      }
+    }
+    if !current.isEmpty { chunks.append(current) }
+
+    for chunk in chunks {
+      let joined = chunk.joined(separator: "\n")
+      if joined.contains(" b/\(path)") || joined.contains(" a/\(path)")
+        || joined.contains("+++ b/\(path)") || joined.contains("--- a/\(path)")
+      {
+        return joined
+      }
+    }
+    return ""
+  }
+
+  @objc private func handleCopy() {
+    UIPasteboard.general.string = textView.text
   }
 }
 

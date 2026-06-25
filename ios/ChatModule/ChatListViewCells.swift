@@ -1348,11 +1348,27 @@ private func bubbleDisplayText(for row: ChatListRow) -> String {
 private func bubbleParsedBlocks(for row: ChatListRow) -> [AgentParsedBlock] {
   let payload = bubbleBaseText(for: row)
   var blocks = ChatNativeAgentTextRenderer.parseBlocks(payload.text)
-  guard payload.addPrefix else { return blocks }
+  func appendRuntimeIfNeeded() {
+    guard let runtime = row.agentRuntime else { return }
+    if blocks.contains(where: { block in
+      if case .agentRuntime = block { return true }
+      return false
+    }) {
+      return
+    }
+    blocks.append(.agentRuntime(runtime))
+  }
+
+  guard payload.addPrefix else {
+    appendRuntimeIfNeeded()
+    return blocks
+  }
 
   let prefix = isRTL(payload.text) ? "\u{200F}✦ " : "✦ "
   if blocks.isEmpty {
-    return [.text(prefix)]
+    blocks = [.text(prefix)]
+    appendRuntimeIfNeeded()
+    return blocks
   }
 
   switch blocks[0] {
@@ -1362,7 +1378,10 @@ private func bubbleParsedBlocks(for row: ChatListRow) -> [AgentParsedBlock] {
     blocks.insert(.text(prefix.trimmingCharacters(in: .whitespacesAndNewlines)), at: 0)
   case .agentPack:
     blocks.insert(.text(prefix.trimmingCharacters(in: .whitespacesAndNewlines)), at: 0)
+  case .agentRuntime:
+    blocks.insert(.text(prefix.trimmingCharacters(in: .whitespacesAndNewlines)), at: 0)
   }
+  appendRuntimeIfNeeded()
   return blocks
 }
 
@@ -1378,6 +1397,9 @@ private func bubbleUsesBlockLayout(_ row: ChatListRow) -> Bool {
       return true
     }
     if case .agentPack = block {
+      return true
+    }
+    if case .agentRuntime = block {
       return true
     }
     return false
@@ -1436,6 +1458,7 @@ private func bubblePreviewURL(for row: ChatListRow) -> URL? {
   guard !sourceText.isEmpty else { return nil }
   if bubbleParsedBlocks(for: row).contains(where: {
     if case .agentPack = $0 { return true }
+    if case .agentRuntime = $0 { return true }
     return false
   }) {
     return nil
@@ -1549,6 +1572,12 @@ private func measureBubbleRichText(for row: ChatListRow, availableWidth: CGFloat
         storageKey: bubbleRichTextStorageKey(for: row, blockIndex: index)
       )
       maxWidth = max(maxWidth, availableWidth)
+    case .agentRuntime(let runtime):
+      totalHeight += AgentRuntimeSummaryView.measuredHeight(
+        runtime: runtime,
+        availableWidth: availableWidth
+      )
+      maxWidth = max(maxWidth, availableWidth)
     }
 
     if index < blocks.count - 1 {
@@ -1626,6 +1655,8 @@ private final class BubbleRichTextView: UIView {
         return "C\(index)"
       case .agentPack:
         return "P\(index)"
+      case .agentRuntime:
+        return "R\(index)"
       }
     }.joined(separator: "-")
 
@@ -1647,6 +1678,10 @@ private final class BubbleRichTextView: UIView {
           let packView = AgentIntegrationPackView()
           addSubview(packView)
           return packView
+        case .agentRuntime:
+          let runtimeView = AgentRuntimeSummaryView()
+          addSubview(runtimeView)
+          return runtimeView
         }
       }
       lastSignature = signature
@@ -1704,6 +1739,15 @@ private final class BubbleRichTextView: UIView {
         )
         blockFrames.append(CGRect(x: 0.0, y: yOffset, width: availableWidth, height: packHeight))
         yOffset += packHeight
+      case .agentRuntime(let runtime):
+        let runtimeView = view as! AgentRuntimeSummaryView
+        let runtimeHeight = runtimeView.configure(
+          runtime: runtime,
+          textColor: textColor,
+          availableWidth: availableWidth
+        )
+        blockFrames.append(CGRect(x: 0.0, y: yOffset, width: availableWidth, height: runtimeHeight))
+        yOffset += runtimeHeight
       }
 
       if index < blocks.count - 1 {

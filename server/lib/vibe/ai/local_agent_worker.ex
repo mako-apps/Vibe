@@ -23,6 +23,8 @@ defmodule Vibe.AI.LocalAgentWorker do
   @max_tool_events 16
   @max_activity_summary_items 6
   @max_payload_preview_bytes 1_200
+  @max_runtime_files 32
+  @max_runtime_patch_bytes 90_000
   @rate_limit_table :local_agent_worker_ratelimit
   @session_table :local_agent_worker_sessions
   @default_cooldown_ms 8_000
@@ -356,7 +358,9 @@ defmodule Vibe.AI.LocalAgentWorker do
       worker ->
         reply_to_id = Keyword.get(opts, :reply_to_id)
         requester_user_id = Keyword.get(opts, :requester_user_id)
+        runtime = normalize_runtime_payload(Keyword.get(opts, :runtime))
         extracted = extract_result(worker, output)
+        progress_nodes = progress_nodes_with_runtime(extracted.progress_nodes, runtime)
         ok = exit_status == 0
         base_text = extracted.text || fallback_output(output)
 
@@ -378,23 +382,27 @@ defmodule Vibe.AI.LocalAgentWorker do
           "[AgentBridge] deliver chat=#{chat_id} provider=#{worker.handle} ok=#{ok} rawEvents=#{extracted.raw_event_count} baseTextLen=#{String.length(base_text || "")} bodyLen=#{String.length(body || "")}"
         )
 
+        metadata =
+          %{
+            "agentWorker" => true,
+            "agentWorkerProvider" => worker.handle,
+            "agentWorkerVia" => "bridge",
+            "agentWorkerExitStatus" => exit_status,
+            "agentWorkerDurationMs" => duration_ms,
+            "agentWorkerOk" => ok,
+            "agentWorkerToolEvents" => extracted.tool_events,
+            "agentWorkerAvailableTools" => extracted.available_tools,
+            "agentWorkerRawEventCount" => extracted.raw_event_count,
+            "progressNodes" => progress_nodes
+          }
+          |> maybe_put("agentRuntime", runtime)
+
         result =
           post_worker_message(
             worker,
             chat_id,
             body,
-            %{
-              "agentWorker" => true,
-              "agentWorkerProvider" => worker.handle,
-              "agentWorkerVia" => "bridge",
-              "agentWorkerExitStatus" => exit_status,
-              "agentWorkerDurationMs" => duration_ms,
-              "agentWorkerOk" => ok,
-              "agentWorkerToolEvents" => extracted.tool_events,
-              "agentWorkerAvailableTools" => extracted.available_tools,
-              "agentWorkerRawEventCount" => extracted.raw_event_count,
-              "progressNodes" => extracted.progress_nodes
-            },
+            metadata,
             reply_to_id,
             requester_user_id
           )
@@ -1399,6 +1407,203 @@ defmodule Vibe.AI.LocalAgentWorker do
     end)
   end
 
+  defp progress_nodes_with_runtime(nodes, nil), do: nodes
+
+  defp progress_nodes_with_runtime(nodes, runtime) when is_map(runtime) do
+    runtime_nodes = runtime_progress_nodes(runtime)
+    Enum.take(nodes ++ runtime_nodes, @max_tool_events + @max_runtime_files + 1)
+  end
+
+  defp runtime_progress_nodes(runtime) do
+    diff = runtime["diff"] || %{}
+
+    files =
+      case diff["files"] do
+        value when is_list(value) -> value
+        _ -> []
+      end
+
+    task_id = runtime["taskId"] || "bridge-runtime"
+    additions = normalize_runtime_int(diff["additions"]) || 0
+    deletions = normalize_runtime_int(diff["deletions"]) || 0
+    files_changed = normalize_runtime_int(diff["filesChanged"]) || length(files)
+
+    summary =
+      if files_changed > 0 do
+        [
+          %{
+            "id" => "#{task_id}-diff-summary",
+            "label" => "#{files_changed} file(s) changed",
+            "status" => runtime["status"] || "done",
+            "depth" => 0,
+            "kind" => "diff",
+            "added" => additions,
+            "removed" => deletions
+          }
+        ]
+      else
+        []
+      end
+
+    file_nodes =
+      files
+      |> Enum.take(10)
+      |> Enum.with_index()
+      |> Enum.map(fn {file, index} ->
+        path = file["path"] || file["name"] || "file"
+
+        %{
+          "id" => "#{task_id}-file-#{index}",
+          "label" => runtime_file_label(file),
+          "status" => runtime["status"] || "done",
+          "depth" => 1,
+          "kind" => "edit",
+          "target" => Path.basename(to_string(path)),
+          "added" => normalize_runtime_int(file["additions"]) || 0,
+          "removed" => normalize_runtime_int(file["deletions"]) || 0
+        }
+      end)
+
+    summary ++ file_nodes
+  end
+
+  defp runtime_file_label(file) when is_map(file) do
+    path = normalize_string(file["path"]) || normalize_string(file["name"]) || "file"
+    status = normalize_string(file["status"]) || "M"
+    "#{status} #{path}"
+  end
+
+  defp normalize_runtime_payload(runtime) when is_map(runtime) do
+    diff = runtime["diff"] || runtime[:diff] || %{}
+    controls = runtime["controls"] || runtime[:controls] || %{}
+
+    %{}
+    |> maybe_put(
+      "taskId",
+      normalize_string(runtime["taskId"] || runtime[:taskId] || runtime["task_id"])
+    )
+    |> maybe_put("provider", normalize_string(runtime["provider"] || runtime[:provider]))
+    |> maybe_put("status", normalize_string(runtime["status"] || runtime[:status]))
+    |> maybe_put(
+      "repoId",
+      normalize_string(runtime["repoId"] || runtime[:repoId] || runtime["repo_id"])
+    )
+    |> maybe_put(
+      "repoName",
+      normalize_string(runtime["repoName"] || runtime[:repoName] || runtime["repo_name"])
+    )
+    |> maybe_put("cwd", normalize_string(runtime["cwd"] || runtime[:cwd]))
+    |> maybe_put(
+      "workMode",
+      normalize_string(runtime["workMode"] || runtime[:workMode] || runtime["work_mode"])
+    )
+    |> maybe_put(
+      "durationMs",
+      normalize_runtime_int(runtime["durationMs"] || runtime[:durationMs])
+    )
+    |> maybe_put("dirtyBefore", runtime_bool(runtime["dirtyBefore"] || runtime[:dirtyBefore]))
+    |> maybe_put(
+      "dirtyBeforeCount",
+      normalize_runtime_int(runtime["dirtyBeforeCount"] || runtime[:dirtyBeforeCount])
+    )
+    |> maybe_put(
+      "exitStatus",
+      normalize_runtime_int(runtime["exitStatus"] || runtime[:exitStatus])
+    )
+    |> maybe_put("command", normalize_runtime_command(runtime["command"] || runtime[:command]))
+    |> maybe_put("diff", normalize_runtime_diff(diff))
+    |> maybe_put("controls", normalize_runtime_controls(controls))
+  end
+
+  defp normalize_runtime_payload(_), do: nil
+
+  defp normalize_runtime_command(command) when is_map(command) do
+    %{}
+    |> maybe_put("executable", normalize_string(command["executable"] || command[:executable]))
+    |> maybe_put("display", normalize_string(command["display"] || command[:display]))
+    |> maybe_put("args", normalize_runtime_args(command["args"] || command[:args]))
+  end
+
+  defp normalize_runtime_command(_), do: nil
+
+  defp normalize_runtime_args(args) when is_list(args) do
+    args
+    |> Enum.map(&to_string/1)
+    |> Enum.map(&truncate(&1, 300))
+    |> Enum.take(40)
+  end
+
+  defp normalize_runtime_args(_), do: nil
+
+  defp normalize_runtime_diff(diff) when is_map(diff) do
+    files =
+      (diff["files"] || diff[:files] || [])
+      |> Enum.map(&normalize_runtime_file/1)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.take(@max_runtime_files)
+
+    %{}
+    |> maybe_put("git", runtime_bool(diff["git"] || diff[:git]))
+    |> maybe_put(
+      "filesChanged",
+      normalize_runtime_int(diff["filesChanged"] || diff[:filesChanged]) || length(files)
+    )
+    |> maybe_put("additions", normalize_runtime_int(diff["additions"] || diff[:additions]) || 0)
+    |> maybe_put("deletions", normalize_runtime_int(diff["deletions"] || diff[:deletions]) || 0)
+    |> maybe_put("files", files)
+    |> maybe_put("patch", runtime_patch(diff["patch"] || diff[:patch]))
+    |> maybe_put("patchTruncated", runtime_bool(diff["patchTruncated"] || diff[:patchTruncated]))
+  end
+
+  defp normalize_runtime_diff(_), do: nil
+
+  defp normalize_runtime_file(file) when is_map(file) do
+    path = normalize_string(file["path"] || file[:path])
+    name = normalize_string(file["name"] || file[:name]) || (path && Path.basename(path))
+
+    if is_nil(path) and is_nil(name) do
+      nil
+    else
+      %{}
+      |> maybe_put("path", path || name)
+      |> maybe_put("name", name || path)
+      |> maybe_put("status", normalize_string(file["status"] || file[:status]) || "M")
+      |> maybe_put("additions", normalize_runtime_int(file["additions"] || file[:additions]) || 0)
+      |> maybe_put("deletions", normalize_runtime_int(file["deletions"] || file[:deletions]) || 0)
+    end
+  end
+
+  defp normalize_runtime_file(_), do: nil
+
+  defp normalize_runtime_controls(controls) when is_map(controls) do
+    %{}
+    |> maybe_put("canCancel", runtime_bool(controls["canCancel"] || controls[:canCancel]))
+    |> maybe_put("canRevert", runtime_bool(controls["canRevert"] || controls[:canRevert]))
+  end
+
+  defp normalize_runtime_controls(_), do: nil
+
+  defp normalize_runtime_int(value) when is_integer(value), do: value
+
+  defp normalize_runtime_int(value) when is_float(value), do: round(value)
+
+  defp normalize_runtime_int(value) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {number, _} -> number
+      :error -> nil
+    end
+  end
+
+  defp normalize_runtime_int(_), do: nil
+
+  defp runtime_bool(value) when is_boolean(value), do: value
+  defp runtime_bool(value) when is_binary(value), do: truthy?(value)
+  defp runtime_bool(value) when is_integer(value), do: value != 0
+  defp runtime_bool(_), do: nil
+
+  defp runtime_patch(value) when is_binary(value), do: truncate(value, @max_runtime_patch_bytes)
+  defp runtime_patch(_), do: nil
+
   # ── Claude-Code-style node shape (kind / target / patch stats) ──────
   # Enrich a tool event with the structured fields the app renders as a live
   # read/edit/patch feed inside the chat bubble. Computed from the RAW tool
@@ -1445,7 +1650,16 @@ defmodule Vibe.AI.LocalAgentWorker do
       t in ["read", "notebookread", "view", "cat", "open"] ->
         {"read", target_basename(path)}
 
-      t in ["edit", "multiedit", "notebookedit", "str_replace", "str_replace_editor", "update", "apply_patch", "applypatch"] ->
+      t in [
+        "edit",
+        "multiedit",
+        "notebookedit",
+        "str_replace",
+        "str_replace_editor",
+        "update",
+        "apply_patch",
+        "applypatch"
+      ] ->
         {"edit", target_basename(path)}
 
       t in ["write", "create", "createfile", "new_file"] ->
@@ -1502,8 +1716,12 @@ defmodule Vibe.AI.LocalAgentWorker do
         {line_count(input["content"] || input["file_text"] || input["text"]), 0}
 
       t in ["edit", "notebookedit", "str_replace", "str_replace_editor", "update"] ->
-        {line_count(input["new_string"] || input["newString"] || input["new_str"] || input["new_source"]),
-         line_count(input["old_string"] || input["oldString"] || input["old_str"] || input["old_source"])}
+        {line_count(
+           input["new_string"] || input["newString"] || input["new_str"] || input["new_source"]
+         ),
+         line_count(
+           input["old_string"] || input["oldString"] || input["old_str"] || input["old_source"]
+         )}
 
       t in ["multiedit"] ->
         (input["edits"] || [])

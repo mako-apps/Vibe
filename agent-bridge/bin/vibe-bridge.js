@@ -42,6 +42,9 @@ const CONFIG_DIR = path.join(os.homedir(), ".vibe");
 const CONFIG_FILE = path.join(CONFIG_DIR, "bridge.json");
 const MAX_PROGRESS_LINES = 400; // safety cap on streamed events per task
 const MAX_LINE_BYTES = 8 * 1024;
+const MAX_DIFF_BYTES = 90 * 1024;
+const MAX_DIFF_FILES = 24;
+const MAX_UNTRACKED_FILE_BYTES = 220 * 1024;
 
 function parseArgs(argv) {
   const out = { repos: [], repoRoots: [] };
@@ -60,6 +63,11 @@ function parseArgs(argv) {
     else if (a === "--install" || a === "--service") out.install = true;
     else if (a === "--uninstall") out.uninstall = true;
     else if (a === "--status") out.status = true;
+    else if (a === "--self-test") out.selfTest = true;
+    else if (a === "--self-test-revert") out.selfTestRevert = true;
+    else if (a === "--provider") out.provider = argv[++i];
+    else if (a === "--prompt") out.prompt = argv[++i];
+    else if (a === "--work-mode") out.workMode = argv[++i];
     else if (a === "--service-run") out.serviceRun = true;
     else if (a === "-h" || a === "--help") out.help = true;
   }
@@ -320,6 +328,8 @@ async function scanToPair(server, label) {
 // ── Running claude / codex ──────────────────────────────────────────
 
 const sessionByChat = new Map(); // chatId -> claude session_id
+const runningTasks = new Map(); // taskKey -> { child, provider, chatId, taskId, startedAt }
+const finishedTasks = new Map(); // taskKey -> { provider, chatId, taskId, repo, runtime, finishedAt }
 
 function stripReservedMention(prompt, provider) {
   return String(prompt || "")
@@ -332,6 +342,7 @@ function stripReservedMention(prompt, provider) {
 //   ask         — live per-action approval (safe-propose until the live channel
 //                 lands; see VIBE live-approval follow-up)
 //   read_only   — analyse & propose, never change files
+//   ask_auto    — let the local CLI decide safe actions automatically
 //   allow_edits — auto-approve edits + sandboxed command execution
 //   full_access — no sandbox, run anything
 function workModeFor(task) {
@@ -346,6 +357,9 @@ function workModeFor(task) {
     )
   ) {
     return "full_access";
+  }
+  if (["ask_auto", "ask-auto", "askauto", "auto_ask", "auto-ask"].includes(raw)) {
+    return "ask_auto";
   }
   if (
     ["allow_edits", "auto", "edit", "edits", "write", "workspace-write", "accept_edits"].includes(
@@ -365,6 +379,8 @@ function claudePermissionMode(task) {
   switch (workModeFor(task)) {
     case "full_access":
       return "bypassPermissions";
+    case "ask_auto":
+      return "auto";
     case "allow_edits":
       return "acceptEdits";
     // "ask" maps to plan for now (propose, don't execute) until live mobile
@@ -379,6 +395,8 @@ function codexSandbox(task) {
   switch (workModeFor(task)) {
     case "full_access":
       return "danger-full-access";
+    case "ask_auto":
+      return "workspace-write";
     case "allow_edits":
       return "workspace-write";
     default:
@@ -464,6 +482,364 @@ function resolveTaskRepository(task) {
   return { ok: true, repo: defaultRepository() };
 }
 
+function taskIdFor(task) {
+  const raw =
+    task &&
+    (task.taskId ||
+      task.agentTaskId ||
+      task.messageId ||
+      task.replyToId ||
+      task.id ||
+      `${task.provider || "agent"}:${task.chatId || "chat"}:${Date.now()}`);
+  return String(raw || crypto.randomUUID());
+}
+
+function taskKey(provider, chatId, taskId) {
+  return `${provider || "agent"}:${chatId || "chat"}:${taskId || "-"}`;
+}
+
+function taskLookupCandidates(provider, chatId, taskId, records) {
+  const candidates = [];
+  if (provider && chatId && taskId) candidates.push(taskKey(provider, chatId, taskId));
+  if (provider && chatId) {
+    for (const key of records.keys()) {
+      if (key.startsWith(`${provider}:${chatId}:`)) candidates.push(key);
+    }
+  }
+  return candidates;
+}
+
+function rememberFinishedTask(key, record) {
+  finishedTasks.set(key, record);
+  while (finishedTasks.size > 120) {
+    const oldest = finishedTasks.keys().next().value;
+    if (!oldest) break;
+    finishedTasks.delete(oldest);
+  }
+}
+
+function runGit(cwd, args, maxBytes = MAX_DIFF_BYTES) {
+  try {
+    return execFileSync("git", args, {
+      cwd,
+      encoding: "utf8",
+      timeout: 10_000,
+      maxBuffer: maxBytes + 4096,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).slice(0, maxBytes);
+  } catch (_) {
+    return "";
+  }
+}
+
+function parseNameStatus(text) {
+  const statuses = new Map();
+  for (const line of String(text || "").split("\n")) {
+    if (!line.trim()) continue;
+    const parts = line.split("\t");
+    const status = parts[0] || "";
+    const file = parts[parts.length - 1] || "";
+    if (file) statuses.set(file, status);
+  }
+  return statuses;
+}
+
+function parseNumstat(text, statuses) {
+  const files = [];
+  let added = 0;
+  let removed = 0;
+  for (const line of String(text || "").split("\n")) {
+    if (!line.trim()) continue;
+    const parts = line.split("\t");
+    if (parts.length < 3) continue;
+    const add = parseInt(parts[0], 10);
+    const del = parseInt(parts[1], 10);
+    const file = parts.slice(2).join("\t");
+    const additions = Number.isFinite(add) ? add : 0;
+    const deletions = Number.isFinite(del) ? del : 0;
+    added += additions;
+    removed += deletions;
+    files.push({
+      path: file,
+      name: path.basename(file),
+      status: statuses.get(file) || "M",
+      additions,
+      deletions,
+    });
+  }
+  return { files, added, removed };
+}
+
+function untrackedFiles(cwd, existingPaths) {
+  const output = runGit(cwd, ["ls-files", "--others", "--exclude-standard"], 64 * 1024);
+  const files = [];
+  for (const file of output.split("\n").map((line) => line.trim()).filter(Boolean)) {
+    if (existingPaths.has(file)) continue;
+    const absolute = path.join(cwd, file);
+    let additions = 0;
+    try {
+      const stat = fs.statSync(absolute);
+      if (stat.isFile() && stat.size <= MAX_UNTRACKED_FILE_BYTES) {
+        const content = fs.readFileSync(absolute, "utf8");
+        additions = content.trimEnd() ? content.trimEnd().split("\n").length : 0;
+      }
+    } catch (_) {
+      additions = 0;
+    }
+    files.push({
+      path: file,
+      name: path.basename(file),
+      status: "A?",
+      additions,
+      deletions: 0,
+    });
+  }
+  return files;
+}
+
+function diffFilePath(file) {
+  return String(file || "").replace(/[\r\n]/g, "");
+}
+
+function untrackedPatch(cwd, files, maxBytes) {
+  const chunks = [];
+  let used = 0;
+  let truncated = false;
+
+  for (const file of files) {
+    if (used >= maxBytes) {
+      truncated = true;
+      break;
+    }
+
+    const relativePath = diffFilePath(file.path);
+    if (!relativePath) continue;
+
+    const absolute = path.join(cwd, relativePath);
+    let content;
+    try {
+      const stat = fs.statSync(absolute);
+      if (!stat.isFile() || stat.size > MAX_UNTRACKED_FILE_BYTES) continue;
+      const raw = fs.readFileSync(absolute);
+      if (raw.includes(0)) continue;
+      content = raw.toString("utf8");
+    } catch (_) {
+      continue;
+    }
+
+    const normalized = content.endsWith("\n") ? content.slice(0, -1) : content;
+    const lines = normalized.length ? normalized.split("\n") : [];
+    const header =
+      `diff --git a/${relativePath} b/${relativePath}\n` +
+      "new file mode 100644\n" +
+      "index 0000000..0000000\n" +
+      "--- /dev/null\n" +
+      `+++ b/${relativePath}\n` +
+      `@@ -0,0 +1,${lines.length} @@\n`;
+    const body = lines.map((line) => `+${line}`).join("\n") + (lines.length ? "\n" : "");
+    const chunk = header + body;
+    const remaining = maxBytes - used;
+
+    if (chunk.length > remaining) {
+      chunks.push(chunk.slice(0, remaining));
+      used = maxBytes;
+      truncated = true;
+      break;
+    }
+
+    chunks.push(chunk);
+    used += chunk.length;
+  }
+
+  return { patch: chunks.join(""), truncated };
+}
+
+function gitSnapshot(cwd) {
+  const inside = runGit(cwd, ["rev-parse", "--is-inside-work-tree"], 128).trim() === "true";
+  if (!inside) return { git: false, dirty: false, files: [], additions: 0, deletions: 0, patch: "" };
+
+  const statusText = runGit(cwd, ["status", "--porcelain=v1"], 64 * 1024);
+  const statuses = parseNameStatus(runGit(cwd, ["diff", "--name-status", "HEAD", "--"], 64 * 1024));
+  const parsed = parseNumstat(runGit(cwd, ["diff", "--numstat", "HEAD", "--"], 64 * 1024), statuses);
+  const existingPaths = new Set(parsed.files.map((file) => file.path));
+  const untracked = untrackedFiles(cwd, existingPaths);
+  const files = [...parsed.files, ...untracked]
+    .sort((a, b) => (b.additions + b.deletions) - (a.additions + a.deletions))
+    .slice(0, MAX_DIFF_FILES);
+  const additions = files.reduce((sum, file) => sum + (file.additions || 0), 0);
+  const deletions = files.reduce((sum, file) => sum + (file.deletions || 0), 0);
+  const trackedPatch = runGit(
+    cwd,
+    ["diff", "--no-ext-diff", "--unified=80", "HEAD", "--"],
+    MAX_DIFF_BYTES
+  );
+  const remainingPatchBytes = Math.max(0, MAX_DIFF_BYTES - trackedPatch.length);
+  const newFilePatch = untrackedPatch(
+    cwd,
+    files.filter((file) => file.status === "A?"),
+    remainingPatchBytes
+  );
+  const patch = trackedPatch + newFilePatch.patch;
+
+  return {
+    git: true,
+    dirty: statusText.trim().length > 0,
+    statusCount: statusText.split("\n").filter((line) => line.trim()).length,
+    files,
+    additions,
+    deletions,
+    patch,
+    patchTruncated: patch.length >= MAX_DIFF_BYTES || newFilePatch.truncated,
+  };
+}
+
+function compactCommand(cmd, args) {
+  return [cmd, ...(args || [])].join(" ").replace(/\s+/g, " ").slice(0, 1200);
+}
+
+function runtimePayload({
+  provider,
+  task,
+  taskId,
+  repo,
+  built,
+  exitStatus,
+  durationMs,
+  before,
+  after,
+  canceled,
+}) {
+  const fileSummary = after && after.git ? after : { files: [], additions: 0, deletions: 0, patch: "" };
+  return {
+    taskId,
+    provider,
+    status: canceled ? "stopped" : exitStatus === 0 ? "done" : "failed",
+    repoId: repo.id,
+    repoName: repo.name,
+    cwd: repo.cwd || repo.path,
+    workMode: workModeFor(task),
+    durationMs,
+    dirtyBefore: !!(before && before.dirty),
+    dirtyBeforeCount: (before && before.statusCount) || 0,
+    exitStatus,
+    command: {
+      executable: built.cmd,
+      args: built.args,
+      display: compactCommand(built.cmd, built.args),
+    },
+    diff: {
+      git: !!(after && after.git),
+      filesChanged: fileSummary.files.length,
+      additions: fileSummary.additions || 0,
+      deletions: fileSummary.deletions || 0,
+      files: fileSummary.files || [],
+      patch: fileSummary.patch || "",
+      patchTruncated: !!fileSummary.patchTruncated,
+    },
+    controls: {
+      canCancel: false,
+      canRevert: !!(
+        after &&
+        after.git &&
+        before &&
+        !before.dirty &&
+        fileSummary.files &&
+        fileSummary.files.length > 0
+      ),
+    },
+  };
+}
+
+function safeRepoPath(cwd, relativePath) {
+  const clean = diffFilePath(relativePath);
+  if (!clean || path.isAbsolute(clean)) return null;
+  const base = path.resolve(cwd);
+  const absolute = path.resolve(base, clean);
+  if (absolute === base || !absolute.startsWith(base + path.sep)) return null;
+  return absolute;
+}
+
+function restoreTrackedFiles(cwd, files) {
+  if (!files.length) return;
+  const args = ["restore", "--staged", "--worktree", "--", ...files];
+  try {
+    execFileSync("git", args, { cwd, stdio: "ignore", timeout: 10_000 });
+  } catch (_) {
+    execFileSync("git", ["checkout", "--", ...files], { cwd, stdio: "ignore", timeout: 10_000 });
+  }
+}
+
+function revertFinishedTask(channel, payload) {
+  const provider = payload.provider || payload.agentWorkerProvider || payload.agentBridgeProvider;
+  const chatId = payload.chatId || payload.chat_id;
+  const taskId = payload.taskId || payload.agentTaskId || payload.messageId;
+  const candidates = taskLookupCandidates(provider, chatId, taskId, finishedTasks);
+  const key = candidates.find((candidate) => finishedTasks.has(candidate));
+  const record = key && finishedTasks.get(key);
+
+  if (!record) {
+    channel.push("control_result", { ok: false, reason: "task_not_found", action: "revert", provider, chatId, taskId });
+    return;
+  }
+
+  const runtime = record.runtime || {};
+  if (!runtime.controls || runtime.controls.canRevert !== true) {
+    channel.push("control_result", {
+      ok: false,
+      reason: runtime.dirtyBefore ? "repo_was_dirty_before_task" : "task_not_revertible",
+      action: "revert",
+      provider: record.provider,
+      chatId: record.chatId,
+      taskId: record.taskId,
+    });
+    return;
+  }
+
+  const cwd = record.repo.cwd || record.repo.path;
+  const files = (runtime.diff && Array.isArray(runtime.diff.files) ? runtime.diff.files : []).filter(
+    (file) => file && file.path
+  );
+  const tracked = files
+    .filter((file) => file.status !== "A?")
+    .map((file) => diffFilePath(file.path))
+    .filter(Boolean);
+  const untracked = files.filter((file) => file.status === "A?");
+
+  try {
+    restoreTrackedFiles(cwd, tracked);
+    for (const file of untracked) {
+      const absolute = safeRepoPath(cwd, file.path);
+      if (absolute) fs.rmSync(absolute, { recursive: true, force: true });
+    }
+    const after = gitSnapshot(cwd);
+    finishedTasks.delete(key);
+    channel.push("control_result", {
+      ok: true,
+      action: "revert",
+      provider: record.provider,
+      chatId: record.chatId,
+      taskId: record.taskId,
+      repoId: record.repo.id,
+      repoName: record.repo.name,
+      cwd,
+      diffAfter: {
+        filesChanged: after.files.length,
+        additions: after.additions || 0,
+        deletions: after.deletions || 0,
+      },
+    });
+  } catch (err) {
+    channel.push("control_result", {
+      ok: false,
+      reason: err.message || "revert_failed",
+      action: "revert",
+      provider: record.provider,
+      chatId: record.chatId,
+      taskId: record.taskId,
+    });
+  }
+}
+
 function bridgeStatusPayload() {
   return {
     deviceLabel: ARGS.label || os.hostname(),
@@ -478,7 +854,7 @@ function bridgeStatusPayload() {
         sandbox: process.env.VIBE_CODEX_SANDBOX || "per-task",
         command: process.env.VIBE_CODEX_COMMAND || "codex",
       },
-      workModes: ["ask", "read_only", "allow_edits", "full_access"],
+      workModes: ["ask", "ask_auto", "read_only", "allow_edits", "full_access"],
     },
   };
 }
@@ -553,7 +929,7 @@ async function resolveRepositories(config, persist) {
     splitEnvList(process.env.VIBE_BRIDGE_REPOS).length ||
     splitEnvList(process.env.VIBE_BRIDGE_REPO_ROOTS).length;
 
-  let picked = Array.isArray(config.repos) ? config.repos.slice() : [];
+  let picked = !explicit && Array.isArray(config.repos) ? config.repos.slice() : [];
 
   const interactive = process.stdin.isTTY && !ARGS.serviceRun && !ARGS.noPick;
   const shouldPrompt = interactive && (ARGS.pick || (!explicit && picked.length === 0));
@@ -718,8 +1094,10 @@ function streamable(line) {
 
 function runTask(channel, task) {
   const { provider, chatId, prompt, replyToId, requesterUserId } = task;
+  const taskId = taskIdFor(task || {});
   console.log(
     `[vibe-bridge] run_task received provider=${provider} chat=${chatId} ` +
+      `task=${taskId} ` +
       `repoId=${task.repoId || task.agentBridgeRepoId || "-"} ` +
       `workMode=${task.workMode || task.agentBridgeWorkMode || "-"} promptLen=${(prompt || "").length}`
   );
@@ -742,9 +1120,10 @@ function runTask(channel, task) {
 
   const repo = repoResult.repo;
   const cwd = repo.cwd || repo.path || DEFAULT_CWD;
-  console.log(`[vibe-bridge] run ${provider} chat=${chatId} cwd=${cwd}`);
+  console.log(`[vibe-bridge] run ${provider} chat=${chatId} task=${taskId} cwd=${cwd}`);
 
   const startedAt = Date.now();
+  const beforeGit = gitSnapshot(cwd);
   let child;
   try {
     child = spawn(built.cmd, built.args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
@@ -753,9 +1132,12 @@ function runTask(channel, task) {
     return;
   }
 
+  const key = taskKey(provider, chatId, taskId);
+  runningTasks.set(key, { child, provider, chatId, taskId, startedAt });
   let output = "";
   let lineBuf = "";
   let progressCount = 0;
+  let canceled = false;
 
   const onChunk = (buf) => {
     const text = buf.toString();
@@ -770,7 +1152,16 @@ function runTask(channel, task) {
       if (sid) sessionByChat.set(chatId, sid);
       if (progressCount < MAX_PROGRESS_LINES && line.length <= MAX_LINE_BYTES && streamable(line)) {
         progressCount++;
-        channel.push("progress", { provider, chatId, line });
+        channel.push("progress", {
+          provider,
+          chatId,
+          taskId,
+          repoId: repo.id,
+          repoName: repo.name,
+          cwd,
+          workMode: workModeFor(task),
+          line,
+        });
       }
     }
   };
@@ -783,21 +1174,109 @@ function runTask(channel, task) {
   });
 
   child.on("close", (code) => {
+    runningTasks.delete(key);
     const durationMs = Date.now() - startedAt;
-    console.log(`[vibe-bridge] done ${provider} chat=${chatId} exit=${code} ${durationMs}ms`);
+    canceled = canceled || child.signalCode === "SIGTERM" || child.signalCode === "SIGKILL";
+    const afterGit = gitSnapshot(cwd);
+    const exitStatus = code == null ? (canceled ? 130 : 1) : code;
+    console.log(
+      `[vibe-bridge] done ${provider} chat=${chatId} task=${taskId} exit=${exitStatus} ${durationMs}ms`
+    );
+    const agentRuntime = runtimePayload({
+      provider,
+      task,
+      taskId,
+      repo,
+      built,
+      exitStatus,
+      durationMs,
+      before: beforeGit,
+      after: afterGit,
+      canceled,
+    });
+    rememberFinishedTask(key, {
+      provider,
+      chatId,
+      taskId,
+      repo,
+      runtime: agentRuntime,
+      finishedAt: Date.now(),
+    });
     channel.push("result", {
       provider,
       chatId,
+      taskId,
       output,
-      exitStatus: code == null ? 1 : code,
+      exitStatus,
       durationMs,
       replyToId,
       requesterUserId,
       repoId: repo.id,
+      repoName: repo.name,
       cwd,
       workMode: workModeFor(task),
+      agentRuntime,
     });
   });
+
+  return {
+    taskId,
+    cancel() {
+      canceled = true;
+      try {
+        child.kill("SIGTERM");
+        setTimeout(() => {
+          if (!child.killed) child.kill("SIGKILL");
+        }, 2500).unref?.();
+      } catch (_) {}
+    },
+  };
+}
+
+function controlTask(channel, payload) {
+  const provider = payload.provider || payload.agentWorkerProvider || payload.agentBridgeProvider;
+  const chatId = payload.chatId || payload.chat_id;
+  const taskId = payload.taskId || payload.agentTaskId || payload.messageId;
+  const action = String(payload.action || payload.type || "").trim().toLowerCase();
+  if (action === "revert") {
+    revertFinishedTask(channel, payload);
+    return;
+  }
+  if (action !== "cancel" && action !== "stop") {
+    channel.push("control_result", { ok: false, reason: "unsupported_action", action, provider, chatId, taskId });
+    return;
+  }
+
+  const candidates = taskLookupCandidates(provider, chatId, taskId, runningTasks);
+  const key = candidates.find((candidate) => runningTasks.has(candidate));
+  const entry = key && runningTasks.get(key);
+  if (!entry) {
+    channel.push("control_result", { ok: false, reason: "task_not_running", action, provider, chatId, taskId });
+    return;
+  }
+
+  try {
+    entry.child.kill("SIGTERM");
+    setTimeout(() => {
+      if (!entry.child.killed) entry.child.kill("SIGKILL");
+    }, 2500).unref?.();
+    channel.push("control_result", {
+      ok: true,
+      action,
+      provider: entry.provider,
+      chatId: entry.chatId,
+      taskId: entry.taskId,
+    });
+  } catch (err) {
+    channel.push("control_result", {
+      ok: false,
+      reason: err.message || "cancel_failed",
+      action,
+      provider: entry.provider,
+      chatId: entry.chatId,
+      taskId: entry.taskId,
+    });
+  }
 }
 
 // ── Socket / channel ────────────────────────────────────────────────
@@ -819,6 +1298,7 @@ function connect(server, token, userId) {
 
   const channel = socket.channel(`bridge:${userId}`, {});
   channel.on("run_task", (task) => runTask(channel, task));
+  channel.on("control_task", (payload) => controlTask(channel, payload || {}));
 
   channel
     .join()
@@ -850,6 +1330,50 @@ function connect(server, token, userId) {
   }, 30000);
 }
 
+async function runSelfTest() {
+  const config = loadConfig();
+  await resolveRepositories(config, () => {});
+  DEFAULT_CWD =
+    (ADVERTISED_REPOSITORIES[0] && ADVERTISED_REPOSITORIES[0].cwd) ||
+    realDir(ARGS.cwd || process.cwd()) ||
+    process.cwd();
+
+  const provider = String(ARGS.provider || "codex").trim().toLowerCase();
+  const task = {
+    provider,
+    chatId: "self-test-chat",
+    taskId: "self-test-task",
+    prompt: ARGS.prompt || "Bridge self-test",
+    replyToId: "self-test-message",
+    requesterUserId: "self-test-user",
+    repoId: ADVERTISED_REPOSITORIES[0] && ADVERTISED_REPOSITORIES[0].id,
+    workMode: ARGS.workMode || "allow_edits",
+  };
+
+  await new Promise((resolve) => {
+    let awaitingRevert = false;
+    const channel = {
+      state: "joined",
+      push(event, payload) {
+        console.log(JSON.stringify({ event, payload }));
+        if (event === "result" && ARGS.selfTestRevert && payload.agentRuntime?.controls?.canRevert) {
+          awaitingRevert = true;
+          controlTask(channel, {
+            action: "revert",
+            provider,
+            chatId: task.chatId,
+            taskId: task.taskId,
+          });
+          return;
+        }
+        if (event === "control_result" && awaitingRevert) resolve();
+        if (event === "result" || event === "error") resolve();
+      },
+    };
+    runTask(channel, task);
+  });
+}
+
 // ── Main ────────────────────────────────────────────────────────────
 
 async function main() {
@@ -864,6 +1388,8 @@ async function main() {
         "  vibegram-bridge --install         run in the background (starts at login, auto-reconnect)\n" +
         "  vibegram-bridge --uninstall       stop & remove the background service\n" +
         "  vibegram-bridge --status          show background-service state + log path\n" +
+        "  vibegram-bridge --self-test       run one local task and print bridge payload JSON\n" +
+        "  vibegram-bridge --self-test-revert  also test bridge-side revert after self-test\n" +
         "  vibegram-bridge --code <CODE>     manual pairing code flow\n" +
         "  vibegram-bridge --logout          remove the cached token\n\n" +
         "Non-interactive repo selection: --cwd <dir>, --repo <dir> (repeatable),\n" +
@@ -873,6 +1399,8 @@ async function main() {
     );
     return;
   }
+
+  if (ARGS.selfTest) return runSelfTest();
 
   if (ARGS.logout) {
     try {

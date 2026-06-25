@@ -82,6 +82,49 @@ struct ChatListRow {
     var removed: Int? = nil
   }
 
+  struct AgentRuntimeCommand: Equatable {
+    let executable: String?
+    let display: String?
+  }
+
+  struct AgentRuntimeFile: Equatable {
+    let path: String
+    let name: String
+    let status: String
+    let additions: Int
+    let deletions: Int
+  }
+
+  struct AgentRuntimeDiff: Equatable {
+    let filesChanged: Int
+    let additions: Int
+    let deletions: Int
+    let files: [AgentRuntimeFile]
+    let patch: String?
+    let patchTruncated: Bool
+  }
+
+  struct AgentRuntimeControls: Equatable {
+    let canCancel: Bool
+    let canRevert: Bool
+  }
+
+  struct AgentRuntimeSummary: Equatable {
+    let taskId: String?
+    let provider: String?
+    let status: String
+    let repoName: String?
+    let cwd: String?
+    let workMode: String?
+    let durationMs: Int?
+    let dirtyBefore: Bool
+    let dirtyBeforeCount: Int
+    let exitStatus: Int?
+    let command: AgentRuntimeCommand?
+    let diff: AgentRuntimeDiff?
+    let controls: AgentRuntimeControls?
+  }
+
   struct AgentCardDestination: Codable, Equatable {
     let chatId: String
     let name: String?
@@ -338,6 +381,7 @@ struct ChatListRow {
   let agentActionSourceText: String?
   let agentRegeneratePrompt: String?
   let agentCard: AgentCard?
+  let agentRuntime: AgentRuntimeSummary?
   let relatedMessageIds: [String]
   let relatedMessagesTitle: String?
   let relatedMessagesSubtitle: String?
@@ -565,6 +609,7 @@ struct ChatListRow {
       agentActionSourceText = nil
       agentRegeneratePrompt = nil
       agentCard = nil
+      agentRuntime = nil
       relatedMessageIds = []
       relatedMessagesTitle = nil
       relatedMessagesSubtitle = nil
@@ -785,6 +830,9 @@ struct ChatListRow {
     agentCard =
       AgentCard.parse(message["agentCard"] as? [String: Any] ?? [:])
       ?? AgentCard.parse(metadata?["agentCard"] as? [String: Any] ?? [:])
+    agentRuntime = parseAgentRuntimeSummary(
+      metadata?["agentRuntime"] ?? metadata?["agent_runtime"] ?? message["agentRuntime"]
+        ?? message["agent_runtime"])
     relatedMessageIds = uniqueStrings(
       parseStringArray(metadata?["relatedMessageIds"])
         + parseStringArray(metadata?["related_message_ids"])
@@ -1133,6 +1181,7 @@ func chatListRowContentEqual(_ lhs: ChatListRow, _ rhs: ChatListRow) -> Bool {
     && lhs.agentActionSourceText == rhs.agentActionSourceText
     && lhs.agentRegeneratePrompt == rhs.agentRegeneratePrompt
     && lhs.agentCard == rhs.agentCard
+    && lhs.agentRuntime == rhs.agentRuntime
     && lhs.relatedMessageIds == rhs.relatedMessageIds
     && lhs.relatedMessagesTitle == rhs.relatedMessagesTitle
     && lhs.relatedMessagesSubtitle == rhs.relatedMessagesSubtitle
@@ -1167,6 +1216,79 @@ private func parseAgentProgressNodes(_ raw: Any?) -> [ChatListRow.AgentProgressN
       removed: parseLong(item["removed"]).map { Int($0) }
     )
   }
+}
+
+private func parseAgentRuntimeSummary(_ raw: Any?) -> ChatListRow.AgentRuntimeSummary? {
+  guard let object = raw as? [String: Any] else { return nil }
+  let diff = parseAgentRuntimeDiff(object["diff"])
+  let command = parseAgentRuntimeCommand(object["command"])
+  let controls = parseAgentRuntimeControls(object["controls"])
+  let status = parseNonEmptyString(object["status"]) ?? "done"
+
+  return ChatListRow.AgentRuntimeSummary(
+    taskId: parseNonEmptyString(object["taskId"] ?? object["task_id"]),
+    provider: parseNonEmptyString(object["provider"]),
+    status: status,
+    repoName: parseNonEmptyString(object["repoName"] ?? object["repo_name"]),
+    cwd: parseNonEmptyString(object["cwd"]),
+    workMode: parseNonEmptyString(object["workMode"] ?? object["work_mode"]),
+    durationMs: parseLong(object["durationMs"] ?? object["duration_ms"]).map { Int($0) },
+    dirtyBefore: parseBool(object["dirtyBefore"] ?? object["dirty_before"]) ?? false,
+    dirtyBeforeCount: Int(parseLong(object["dirtyBeforeCount"] ?? object["dirty_before_count"]) ?? 0),
+    exitStatus: parseLong(object["exitStatus"] ?? object["exit_status"]).map { Int($0) },
+    command: command,
+    diff: diff,
+    controls: controls
+  )
+}
+
+private func parseAgentRuntimeCommand(_ raw: Any?) -> ChatListRow.AgentRuntimeCommand? {
+  guard let object = raw as? [String: Any] else { return nil }
+  let executable = parseNonEmptyString(object["executable"])
+  let display = parseNonEmptyString(object["display"])
+  guard executable != nil || display != nil else { return nil }
+  return ChatListRow.AgentRuntimeCommand(executable: executable, display: display)
+}
+
+private func parseAgentRuntimeDiff(_ raw: Any?) -> ChatListRow.AgentRuntimeDiff? {
+  guard let object = raw as? [String: Any] else { return nil }
+  let files = parseAgentRuntimeFiles(object["files"])
+  let filesChanged = Int(parseLong(object["filesChanged"] ?? object["files_changed"]) ?? Int64(files.count))
+  let additions = Int(parseLong(object["additions"]) ?? 0)
+  let deletions = Int(parseLong(object["deletions"]) ?? 0)
+  guard filesChanged > 0 || additions > 0 || deletions > 0 || !files.isEmpty else { return nil }
+  return ChatListRow.AgentRuntimeDiff(
+    filesChanged: max(filesChanged, files.count),
+    additions: additions,
+    deletions: deletions,
+    files: files,
+    patch: parseNonEmptyString(object["patch"]),
+    patchTruncated: parseBool(object["patchTruncated"] ?? object["patch_truncated"]) ?? false
+  )
+}
+
+private func parseAgentRuntimeFiles(_ raw: Any?) -> [ChatListRow.AgentRuntimeFile] {
+  guard let items = raw as? [[String: Any]] else { return [] }
+  return items.compactMap { item in
+    let path = parseNonEmptyString(item["path"]) ?? parseNonEmptyString(item["name"])
+    guard let path else { return nil }
+    let name = parseNonEmptyString(item["name"]) ?? URL(fileURLWithPath: path).lastPathComponent
+    return ChatListRow.AgentRuntimeFile(
+      path: path,
+      name: name.isEmpty ? path : name,
+      status: parseNonEmptyString(item["status"]) ?? "M",
+      additions: Int(parseLong(item["additions"]) ?? 0),
+      deletions: Int(parseLong(item["deletions"]) ?? 0)
+    )
+  }
+}
+
+private func parseAgentRuntimeControls(_ raw: Any?) -> ChatListRow.AgentRuntimeControls? {
+  guard let object = raw as? [String: Any] else { return nil }
+  let canCancel = parseBool(object["canCancel"] ?? object["can_cancel"]) ?? false
+  let canRevert = parseBool(object["canRevert"] ?? object["can_revert"]) ?? false
+  guard canCancel || canRevert else { return nil }
+  return ChatListRow.AgentRuntimeControls(canCancel: canCancel, canRevert: canRevert)
 }
 
 private func parseStringArray(_ raw: Any?) -> [String] {

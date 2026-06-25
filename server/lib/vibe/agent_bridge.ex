@@ -304,6 +304,21 @@ defmodule Vibe.AgentBridge do
     end
   end
 
+  @doc """
+  Push a control action to the connected bridge daemon for an in-flight task.
+
+  The chat channel verifies chat membership before calling this; the bridge daemon
+  still matches by task id/provider/chat id and refuses unknown tasks.
+  """
+  def dispatch_control(user_id, payload) when is_binary(user_id) and is_map(payload) do
+    if online?(user_id) do
+      VibeWeb.Endpoint.broadcast(topic(user_id), "control_task", payload)
+      :ok
+    else
+      {:error, :offline}
+    end
+  end
+
   # ── Helpers ─────────────────────────────────────────────────────────
 
   defp hash_token(token), do: :crypto.hash(:sha256, token) |> Base.encode16(case: :lower)
