@@ -7991,7 +7991,6 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private func showsAgentView(_ row: ChatListRow) -> Bool {
     row.kind == .message
       && row.isAgentMessage
-      && !row.isStreamingText
       && !showsAgentRegenerate(row)
   }
 

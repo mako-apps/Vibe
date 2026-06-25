@@ -80,6 +80,7 @@ struct VibeAgentKitChatMessage: Equatable {
   var progressCompletedAt: String?
   var progress: [String]
   var progressItems: [VibeAgentKitProgressItem]
+  var runtime: ChatListRow.AgentRuntimeSummary?
 
   init(
     id: String,
@@ -95,7 +96,8 @@ struct VibeAgentKitChatMessage: Equatable {
     progressStartedAt: String? = nil,
     progressCompletedAt: String? = nil,
     progress: [String] = [],
-    progressItems: [VibeAgentKitProgressItem] = []
+    progressItems: [VibeAgentKitProgressItem] = [],
+    runtime: ChatListRow.AgentRuntimeSummary? = nil
   ) {
     self.id = id
     self.role = role
@@ -111,6 +113,7 @@ struct VibeAgentKitChatMessage: Equatable {
     self.progressCompletedAt = progressCompletedAt
     self.progress = progress
     self.progressItems = progressItems
+    self.runtime = runtime
   }
 }
 

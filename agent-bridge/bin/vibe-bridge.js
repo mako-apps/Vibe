@@ -1031,10 +1031,12 @@ function runBridgeCommand(channel, task, repo, beforeGit, command) {
     provider,
     chatId,
     taskId,
+    replyToId,
     repoId: repo.id,
     repoName: repo.name,
     cwd: repo.cwd || repo.path,
     workMode: workModeFor(task),
+    model: modelFor(provider, chatId, task) || "provider default",
     stage: "bridge_command",
     command: command.raw,
     line: JSON.stringify({
@@ -1134,7 +1136,7 @@ function runtimePayload({
     },
   };
 
-  if (metadata.model) payload.model = metadata.model;
+  payload.model = metadata.model || modelFor(provider, task && task.chatId, task) || "provider default";
   if (metadata.permissionMode) payload.permissionMode = metadata.permissionMode;
   if (metadata.sessionId) payload.sessionId = metadata.sessionId;
   if (metadata.threadId) payload.threadId = metadata.threadId;
@@ -1266,13 +1268,14 @@ function runningTaskSummaries() {
     chatId: entry.chatId,
     taskId: entry.taskId,
     sessionId: entry.sessionId || null,
-    topic: clip(entry.prompt || `${entry.provider || "Agent"} task`, 80),
+    topic: cleanTopicCandidate(entry.prompt) || clip(`${entry.provider || "Agent"} task`, 80),
     repoId: entry.repo && entry.repo.id,
     repoName: entry.repo && entry.repo.name,
     project: entry.repo && (entry.repo.cwd || entry.repo.path),
     projectName: entry.repo && entry.repo.name,
     cwd: entry.cwd,
     workMode: entry.workMode,
+    model: entry.model || null,
     startedAt: new Date(entry.startedAt).toISOString(),
     command: entry.command,
   }));
@@ -1603,6 +1606,7 @@ function runTask(channel, task) {
     repo,
     cwd,
     workMode: workModeFor(task),
+    model: modelFor(provider, chatId, task),
     command: compactCommand(built.cmd, built.args),
     startedAt,
   });
@@ -1611,10 +1615,12 @@ function runTask(channel, task) {
     provider,
     chatId,
     taskId,
+    replyToId,
     repoId: repo.id,
     repoName: repo.name,
     cwd,
     workMode: workModeFor(task),
+    model: modelFor(provider, chatId, task) || "provider default",
     stage: "started",
     command: compactCommand(built.cmd, built.args),
     line: JSON.stringify({
@@ -1650,10 +1656,12 @@ function runTask(channel, task) {
           provider,
           chatId,
           taskId,
+          replyToId,
           repoId: repo.id,
           repoName: repo.name,
           cwd,
           workMode: workModeFor(task),
+          model: modelFor(provider, chatId, task) || "provider default",
           line,
         });
       }
@@ -1775,6 +1783,7 @@ function cleanTopicCandidate(text) {
     if (/AGENTS\.md|caveat:/i.test(line)) continue;
     if (/^#{1,4}\s*(context from|active file|attached|open tabs?|cursor|selection|agents|environment|instructions)/i.test(line)) continue;
     if (/^(active file|cwd|shell|repo|branch)\s*:/i.test(line)) continue;
+    if (/^(continue|cont|resume|keep going|go on|ok|okay|yes)$/i.test(line)) continue;
     return clip(line, 80);
   }
   return null;
@@ -1994,8 +2003,10 @@ async function codexDetail(id, limit) {
     messages.push({ role, text: clip(text, 4000), ts: ev.timestamp });
     if (messages.length >= limit) return false;
   });
-  const topicMsg = messages.find((m) => m.role === "user") || messages.find((m) => m.role === "assistant");
-  return { provider: "codex", id, topic: topicMsg ? clip(topicMsg.text, 80) : "Untitled", project, projectName: project ? path.basename(project) : "", messages };
+  const topic =
+    messages.map((m) => cleanTopicCandidate(m.text)).find(Boolean) ||
+    "Untitled";
+  return { provider: "codex", id, topic, project, projectName: project ? path.basename(project) : "", messages };
 }
 
 async function readHistory({ provider, mode, sessionId, limit }) {

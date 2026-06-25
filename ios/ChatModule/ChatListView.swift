@@ -5310,29 +5310,28 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private func presentAgentConversation(forMessageId messageId: String) {
     guard let agentIndex = rows.firstIndex(where: { $0.messageId == messageId }) else { return }
     let agentRow = rows[agentIndex]
-
-    var taskRows: [ChatListRow] = []
-    // Prefer the explicit source (the user prompt that triggered this turn);
-    // otherwise fall back to the nearest preceding user message.
-    if let sourceId = agentRow.agentActionSourceId, !sourceId.isEmpty,
-       let promptRow = rows.first(where: { $0.messageId == sourceId }) {
-      taskRows.append(promptRow)
-    } else if agentIndex > 0 {
-      for i in stride(from: agentIndex - 1, through: 0, by: -1) {
-        let candidate = rows[i]
-        guard case .message = candidate.kind else { continue }
-        if candidate.isMe && !candidate.isAgentMessage {
-          taskRows.append(candidate)
-          break
-        }
-      }
-    }
-    taskRows.append(agentRow)
+    let sourceMessageId = agentConversationSourceId(agentRow: agentRow, agentIndex: agentIndex)
+    let taskRows = agentConversationRows(forMessageId: messageId, sourceMessageId: sourceMessageId)
+    let topic = agentConversationTopic(agentRow: agentRow, taskRows: taskRows)
+    let subtitle = agentConversationSubtitle(agentRow: agentRow)
+    let inputName = agentRow.agentName ?? agentRow.agentRuntime?.provider?.capitalized ?? "Agent"
+    let mentionedAgentUsername = agentRow.agentUsername
 
     let vc = VibeAgentConversationViewController(
-      title: agentRow.agentName ?? "Agent",
+      title: topic,
+      subtitle: subtitle,
       messages: VibeAgentKitMap.messages(from: taskRows),
-      regeneratePrompt: agentRow.agentRegeneratePrompt ?? ""
+      regeneratePrompt: agentRow.agentRegeneratePrompt ?? "",
+      inputPlaceholder: "Ask \(inputName)",
+      messagesProvider: { [weak self] in
+        guard let self else { return [] }
+        return VibeAgentKitMap.messages(
+          from: self.agentConversationRows(forMessageId: messageId, sourceMessageId: sourceMessageId)
+        )
+      },
+      onSend: { [weak self] text in
+        self?.handleNativeSend(text: text, mentionedAgentUsername: mentionedAgentUsername)
+      }
     )
 
     guard let owner = topPresentingViewController() else { return }
@@ -5348,6 +5347,112 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       )
       owner.present(nav, animated: true)
     }
+  }
+
+  private func agentConversationRows(forMessageId messageId: String, sourceMessageId: String? = nil) -> [ChatListRow] {
+    let agentIndex = rows.firstIndex(where: { $0.messageId == messageId })
+    let agentRow = agentIndex.map { rows[$0] }
+    let resolvedSourceId = sourceMessageId ?? agentRow.flatMap {
+      agentConversationSourceId(agentRow: $0, agentIndex: agentIndex ?? 0)
+    }
+    var taskRows: [ChatListRow] = []
+    if let sourceId = resolvedSourceId, !sourceId.isEmpty,
+       let promptRow = rows.first(where: { $0.messageId == sourceId }) {
+      taskRows.append(promptRow)
+    } else if let agentIndex, agentIndex > 0 {
+      for i in stride(from: agentIndex - 1, through: 0, by: -1) {
+        let candidate = rows[i]
+        guard case .message = candidate.kind else { continue }
+        if candidate.isMe && !candidate.isAgentMessage {
+          taskRows.append(candidate)
+          break
+        }
+      }
+    }
+
+    var seenKeys = Set(taskRows.map(\.key))
+    for row in rows {
+      guard case .message = row.kind, row.isAgentMessage else { continue }
+      let rowMessageId = row.messageId ?? row.key
+      let matchesTappedRow = rowMessageId == messageId
+      let matchesSource =
+        resolvedSourceId?.isEmpty == false
+        && (row.agentActionSourceId == resolvedSourceId || row.replyToId == resolvedSourceId)
+      guard matchesTappedRow || matchesSource else { continue }
+      if seenKeys.insert(row.key).inserted {
+        taskRows.append(row)
+      }
+    }
+
+    if let agentRow, seenKeys.insert(agentRow.key).inserted {
+      taskRows.append(agentRow)
+    }
+    return taskRows
+  }
+
+  private func agentConversationSourceId(agentRow: ChatListRow, agentIndex: Int) -> String? {
+    if let sourceId = agentRow.agentActionSourceId?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !sourceId.isEmpty
+    {
+      return sourceId
+    }
+    if let replyToId = agentRow.replyToId?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !replyToId.isEmpty
+    {
+      return replyToId
+    }
+    guard agentIndex > 0 else { return nil }
+    for i in stride(from: agentIndex - 1, through: 0, by: -1) {
+      let candidate = rows[i]
+      guard case .message = candidate.kind else { continue }
+      if candidate.isMe && !candidate.isAgentMessage {
+        return candidate.messageId
+      }
+    }
+    return nil
+  }
+
+  private func agentConversationTopic(agentRow: ChatListRow, taskRows: [ChatListRow]) -> String {
+    let candidates = [
+      taskRows.first(where: { $0.isMe && !$0.isAgentMessage })?.text,
+      agentRow.agentActionSourceText,
+      agentRow.agentRuntime?.repoName,
+      agentRow.agentName,
+    ]
+    for candidate in candidates {
+      let trimmed = candidate?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      if let title = normalizedAgentConversationTitle(trimmed) {
+        return title
+      }
+    }
+    return "Agent chat"
+  }
+
+  private func normalizedAgentConversationTitle(_ text: String) -> String? {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+    let lower = trimmed.lowercased()
+    if ["continue", "cont", "resume", "keep going", "go on", "ok", "okay", "yes"].contains(lower) {
+      return nil
+    }
+    return trimmed.count > 80 ? String(trimmed.prefix(77)) + "..." : trimmed
+  }
+
+  private func agentConversationSubtitle(agentRow: ChatListRow) -> String {
+    var parts: [String] = []
+    if let repoName = agentRow.agentRuntime?.repoName?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !repoName.isEmpty
+    {
+      parts.append(repoName)
+    }
+    if let provider = agentRow.agentRuntime?.provider?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !provider.isEmpty
+    {
+      parts.append(provider.capitalized)
+    } else if let provider = currentBridgeProvider {
+      parts.append(provider.capitalized)
+    }
+    return parts.joined(separator: " · ")
   }
 
   private func handleResolvedMediaSize(messageId: String?, mediaURL: String, size: CGSize) {

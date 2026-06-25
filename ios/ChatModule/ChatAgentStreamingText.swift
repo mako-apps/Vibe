@@ -488,6 +488,7 @@ final class AgentRuntimeSummaryView: UIView {
   private var fileRows: [FileRowView] = []
   private var runtime: ChatListRow.AgentRuntimeSummary?
   private var textColor: UIColor = .label
+  var onTap: ((ChatListRow.AgentRuntimeSummary) -> Void)?
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -513,6 +514,9 @@ final class AgentRuntimeSummaryView: UIView {
     commandLabel.lineBreakMode = .byTruncatingMiddle
     dirtyLabel.font = UIFont.systemFont(ofSize: 11.5, weight: .regular)
     moreLabel.font = UIFont.systemFont(ofSize: 12, weight: .medium)
+    let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap))
+    addGestureRecognizer(tap)
+    isUserInteractionEnabled = true
   }
 
   required init?(coder: NSCoder) {
@@ -647,6 +651,11 @@ final class AgentRuntimeSummaryView: UIView {
       parts.append("exit \(exit)")
     }
     return parts.isEmpty ? "Local bridge" : parts.joined(separator: " · ")
+  }
+
+  @objc private func handleTap() {
+    guard let runtime else { return }
+    onTap?(runtime)
   }
 }
 
@@ -1112,7 +1121,7 @@ final class AgentRuntimeTaskViewController: UIViewController {
   }
 }
 
-private final class AgentRuntimeFilesViewController: UITableViewController {
+final class AgentRuntimeFilesViewController: UITableViewController {
   private let runtime: ChatListRow.AgentRuntimeSummary
   private let appearance: ChatListAppearance
   private let files: [ChatListRow.AgentRuntimeFile]

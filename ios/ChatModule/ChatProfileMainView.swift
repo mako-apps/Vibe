@@ -340,6 +340,7 @@ private struct ChatProfileRow {
   let fileSize: Int64?
   let timestampMs: Int64?
   let isPinned: Bool
+  let isAgentMessage: Bool
   let duration: CGFloat?
   let waveform: [CGFloat]?
   let thumbnailBase64: String?
@@ -417,6 +418,13 @@ private struct ChatProfileRow {
       || (message["pinned"] as? Bool == true)
       || (raw["pinned"] as? Bool == true)
 
+    let isAgentMessage =
+      (message["isAgentMessage"] as? Bool == true)
+      || (raw["isAgentMessage"] as? Bool == true)
+      || (metadata?["isAgentMessage"] as? Bool == true)
+      || ((metadata?["agentBridgeProvider"] as? String)?.isEmpty == false)
+      || ((metadata?["agentRuntime"] as? [String: Any]) != nil)
+
     let duration: CGFloat? = {
       if let val = message["duration"] as? NSNumber { return CGFloat(val.floatValue) }
       if let val = raw["duration"] as? NSNumber { return CGFloat(val.floatValue) }
@@ -443,6 +451,7 @@ private struct ChatProfileRow {
       fileSize: fileSize,
       timestampMs: timestampMs,
       isPinned: isPinned,
+      isAgentMessage: isAgentMessage,
       duration: duration,
       waveform: waveform,
       thumbnailBase64: thumbnailBase64
@@ -738,6 +747,7 @@ private struct ChatProfileSwiftUIContentItem: Identifiable {
 private enum ChatProfileSwiftUIDestination: Hashable {
   case history
   case bridgeHistory
+  case bridgeSession(AgentBridgeHistorySession)
   case tab(ChatProfileTab)
 
   var transitionID: String {
@@ -746,6 +756,8 @@ private enum ChatProfileSwiftUIDestination: Hashable {
       return "chat-history"
     case .bridgeHistory:
       return "bridge-history"
+    case .bridgeSession(let session):
+      return "bridge-session-\(session.id)"
     case .tab(let tab):
       return "shared-\(tab.rawValue)"
     }
@@ -777,6 +789,7 @@ private struct ChatProfileSwiftUIRootView: View {
   var bridgeConnected: Bool = false
   var bridgePaired: Bool = false
   var bridgeDeviceLabel: String = ""
+  var bridgeRunningTasks: [AgentBridgeRunningTask] = []
   let onScroll: (CGFloat) -> Void
   let onNavigationActiveChanged: (Bool) -> Void
   let onCopyUsername: () -> Void
@@ -993,6 +1006,11 @@ private struct ChatProfileSwiftUIRootView: View {
   }
 
   private var bridgeComputerSubtitle: String {
+    if bridgeConnected && !bridgeRunningTasks.isEmpty {
+      let count = bridgeRunningTasks.count
+      let label = bridgeDeviceLabel.isEmpty ? "Connected" : bridgeDeviceLabel
+      return "\(label) · \(count) running"
+    }
     if bridgeConnected {
       return bridgeDeviceLabel.isEmpty ? "Connected" : "\(bridgeDeviceLabel) · Connected"
     }
@@ -1036,7 +1054,7 @@ private struct ChatProfileSwiftUIRootView: View {
       } label: {
         ChatProfileSwiftUIRow(
           title: "Chat History",
-          subtitle: "\(bridgeDisplayName) conversations on your computer",
+          subtitle: bridgeHistorySubtitle,
           trailingSystemImage: nil,
           showsChevron: true,
           separatorColor: separatorColor,
@@ -1046,6 +1064,14 @@ private struct ChatProfileSwiftUIRootView: View {
       }
       .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
     }
+  }
+
+  private var bridgeHistorySubtitle: String {
+    if !bridgeRunningTasks.isEmpty {
+      let count = bridgeRunningTasks.count
+      return count == 1 ? "1 running \(bridgeDisplayName) chat" : "\(count) running \(bridgeDisplayName) chats"
+    }
+    return "\(bridgeDisplayName) conversations on your computer"
   }
 
   @ViewBuilder
@@ -1130,27 +1156,22 @@ private struct ChatProfileSwiftUIRootView: View {
       AgentBridgeHistoryInlineView(
         provider: bridgeProvider,
         chatId: bridgeChatId,
+        runningTasks: bridgeRunningTasks,
         onOpenSession: { session in
-          // Tapping a past session loads its whole transcript into the DEFAULT
-          // chat as bubbles (user prompt -> right bubble, agent reply -> agent
-          // cell) and leaves the profile — it is no longer rendered in-profile.
-          _ = ChatEngine.shared.loadAgentBridgeSessionIntoChat([
-            "chatId": bridgeChatId,
-            "provider": bridgeProvider,
-            "sessionId": session.id,
-          ])
-          onContentPressed([
-            "type": "openBridgeSessionInChat",
-            "chatId": bridgeChatId,
-            "provider": bridgeProvider,
-            "sessionId": session.id,
-            "topic": session.topic,
-          ])
-          // Reuse the proven back path so we land back on the chat.
-          onAction("headerBack")
+          path.append(.bridgeSession(session))
         }
       )
       .background(Color(uiColor: UIColor.systemGroupedBackground))
+    case .bridgeSession(let session):
+      AgentBridgeRuntimeView(
+        provider: bridgeProvider,
+        chatId: bridgeChatId,
+        session: session,
+        subtitle: session.displayProjectName
+      )
+      .navigationTitle(session.topic)
+      .navigationBarTitleDisplayMode(.inline)
+      .ignoresSafeArea(.container, edges: .bottom)
     case .tab(let tab):
       ChatProfileSwiftUIExpandedContentView(
         title: tabSummaries.first(where: { $0.tab == tab })?.title ?? tab.label,
@@ -1903,7 +1924,9 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   private var bridgeConnected = false
   private var bridgePaired = false
   private var bridgeDeviceLabel = ""
+  private var bridgeRunningTasks: [AgentBridgeRunningTask] = []
   private var bridgeStatusTask: Task<Void, Never>?
+  private var bridgeStatusRefreshWorkItem: DispatchWorkItem?
   private var avatarMorphProgress: CGFloat = 0.0
   private var currentHeroTop: CGFloat = 0.0
   private var currentCollapsedTop: CGFloat = 0.0
@@ -1944,6 +1967,11 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     return nil
   }
 
+  deinit {
+    bridgeStatusTask?.cancel()
+    bridgeStatusRefreshWorkItem?.cancel()
+  }
+
   override func safeAreaInsetsDidChange() {
     super.safeAreaInsetsDidChange()
     updateAvatarMetrics()
@@ -1953,6 +1981,13 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   override func didMoveToWindow() {
     super.didMoveToWindow()
     attachSwiftUIHostIfNeeded()
+    if window == nil {
+      bridgeStatusTask?.cancel()
+      bridgeStatusRefreshWorkItem?.cancel()
+      bridgeStatusRefreshWorkItem = nil
+    } else {
+      refreshBridgeStatus()
+    }
   }
 
   override func layoutSubviews() {
@@ -2122,7 +2157,9 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   }
 
   private func refreshBridgeStatus() {
-    guard !bridgeProvider.isEmpty else { return }
+    bridgeStatusRefreshWorkItem?.cancel()
+    bridgeStatusRefreshWorkItem = nil
+    guard !bridgeProvider.isEmpty, window != nil else { return }
     bridgeStatusTask?.cancel()
     bridgeStatusTask = Task { [weak self] in
       guard let config = AppSessionConfig.current else { return }
@@ -2133,9 +2170,24 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
         self.bridgeConnected = status.connected
         self.bridgePaired = status.paired
         self.bridgeDeviceLabel = status.devices.first?.label ?? ""
+        self.bridgeRunningTasks = status.runningTasks.filter { task in
+          let taskProvider = task.provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+          return taskProvider.isEmpty || taskProvider == self.bridgeProvider
+        }
         self.renderSwiftUIProfile()
+        self.scheduleBridgeStatusRefresh()
       }
     }
+  }
+
+  private func scheduleBridgeStatusRefresh() {
+    bridgeStatusRefreshWorkItem?.cancel()
+    guard !bridgeProvider.isEmpty, window != nil else { return }
+    let item = DispatchWorkItem { [weak self] in
+      self?.refreshBridgeStatus()
+    }
+    bridgeStatusRefreshWorkItem = item
+    DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: item)
   }
 
   func setProfileBio(_ value: String) {
@@ -2346,6 +2398,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       bridgeConnected: bridgeConnected,
       bridgePaired: bridgePaired,
       bridgeDeviceLabel: bridgeDeviceLabel,
+      bridgeRunningTasks: bridgeRunningTasks,
       onScroll: { [weak self] offset in
         guard let self else { return }
         self.swiftUIScrollOffset = offset
@@ -2991,18 +3044,23 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     var links: [ChatProfileLinkItem] = []
     for row in rows {
       guard let detector else { continue }
-      let candidates = [row.text, row.mediaUrl ?? ""]
+      guard !row.isAgentMessage else { continue }
+      guard !["file", "music", "voice", "image", "video", "sticker", "gif"].contains(row.type) else {
+        continue
+      }
 
-      for candidate in candidates {
-        let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { continue }
-        let nsText = trimmed as NSString
-        let matches = detector.matches(
-          in: trimmed, options: [], range: NSRange(location: 0, length: nsText.length))
-        if let firstURL = matches.first?.url?.absoluteString, !firstURL.isEmpty {
-          links.append(ChatProfileLinkItem(row: row, url: firstURL))
-          break
-        }
+      let trimmed = row.text.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard trimmed.range(of: #"https?://|www\."#, options: [.regularExpression, .caseInsensitive]) != nil else {
+        continue
+      }
+      let nsText = trimmed as NSString
+      let matches = detector.matches(
+        in: trimmed, options: [], range: NSRange(location: 0, length: nsText.length))
+      if let first = matches.first?.url,
+        let scheme = first.scheme?.lowercased(),
+        ["http", "https"].contains(scheme)
+      {
+        links.append(ChatProfileLinkItem(row: row, url: first.absoluteString))
       }
     }
     linkRows = links

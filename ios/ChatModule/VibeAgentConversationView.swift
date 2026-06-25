@@ -76,7 +76,8 @@ enum VibeAgentKitMap {
       isStreaming: row.isAgentMessage && row.isStreamingText,
       isError: row.status == "failed",
       progress: [],
-      progressItems: items
+      progressItems: items,
+      runtime: row.isAgentMessage ? row.agentRuntime : nil
     )
   }
 
@@ -88,7 +89,7 @@ enum VibeAgentKitMap {
       guard case .message = row.kind else { return nil }
       // Skip empty system/placeholder rows.
       let m = chatMessage(from: row)
-      if m.text.isEmpty && m.progressItems.isEmpty { return nil }
+      if m.text.isEmpty && m.progressItems.isEmpty && m.runtime == nil { return nil }
       return m
     }
   }
@@ -100,23 +101,58 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
 
   private let tableView = UITableView(frame: .zero, style: .plain)
   private let progressSheet = VibeAgentKitAgentProgressSheetView()
+  private let composerView = VibeAgentRuntimeComposerView()
+  private let titleLabel = UILabel()
+  private let subtitleLabel = UILabel()
+  private let liveDotView = UIView()
+  private let liveLabel = UILabel()
   private var messages: [VibeAgentKitChatMessage]
   private var appearance: VibeAgentKitChatAppearance
+  private let runtimeTitle: String
+  private let runtimeSubtitle: String
+  private let inputPlaceholder: String
   private let regeneratePrompt: String
+  private let messagesProvider: (() -> [VibeAgentKitChatMessage])?
+  private let onSend: ((String) -> Void)?
+  private var tableBottomConstraint: NSLayoutConstraint?
+  private var composerBottomConstraint: NSLayoutConstraint?
+  private var composerHeightConstraint: NSLayoutConstraint?
+  private var changeObserver: NSObjectProtocol?
+  private var keyboardObservers: [NSObjectProtocol] = []
 
   /// Tapping a message's progress row opens the full tool sheet for that message.
   /// Stashed so we know which message's items to present.
   private var progressItemsByMessageId: [String: [VibeAgentKitProgressItem]] = [:]
 
-  init(title: String, messages: [VibeAgentKitChatMessage], regeneratePrompt: String = "") {
+  init(
+    title: String,
+    subtitle: String = "",
+    messages: [VibeAgentKitChatMessage],
+    regeneratePrompt: String = "",
+    inputPlaceholder: String? = nil,
+    messagesProvider: (() -> [VibeAgentKitChatMessage])? = nil,
+    onSend: ((String) -> Void)? = nil
+  ) {
     self.messages = messages
+    self.runtimeTitle = title
+    self.runtimeSubtitle = subtitle
+    self.inputPlaceholder = inputPlaceholder ?? "Ask \(title)"
     self.regeneratePrompt = regeneratePrompt
+    self.messagesProvider = messagesProvider
+    self.onSend = onSend
     self.appearance = .fallback
     super.init(nibName: nil, bundle: nil)
     self.title = title
   }
 
   required init?(coder: NSCoder) { return nil }
+
+  deinit {
+    if let changeObserver {
+      NotificationCenter.default.removeObserver(changeObserver)
+    }
+    keyboardObservers.forEach(NotificationCenter.default.removeObserver)
+  }
 
   @objc func closeTapped() {
     if let nav = navigationController, nav.viewControllers.first !== self {
@@ -130,6 +166,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     super.viewDidLoad()
     appearance = VibeAgentKitMap.appearance(for: traitCollection)
     view.backgroundColor = appearance.background
+    configureNavigationTitle()
 
     tableView.translatesAutoresizingMaskIntoConstraints = false
     tableView.backgroundColor = appearance.background
@@ -139,20 +176,42 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     tableView.rowHeight = UITableView.automaticDimension
     tableView.estimatedRowHeight = 96.0
     tableView.keyboardDismissMode = .interactive
-    tableView.contentInset = UIEdgeInsets(top: 12, left: 0, bottom: 24, right: 0)
+    tableView.contentInset = UIEdgeInsets(top: 12, left: 0, bottom: 12, right: 0)
     tableView.register(VibeAgentKitMessageCell.self, forCellReuseIdentifier: VibeAgentKitMessageCell.reuseIdentifier)
     view.addSubview(tableView)
+
+    composerView.translatesAutoresizingMaskIntoConstraints = false
+    composerView.applyAppearance(appearance)
+    composerView.placeholder = inputPlaceholder
+    composerView.onSend = { [weak self] text in
+      self?.onSend?(text)
+    }
+    composerView.onHeightChanged = { [weak self] height in
+      self?.updateComposerHeight(height, animated: true)
+    }
+    view.addSubview(composerView)
 
     progressSheet.translatesAutoresizingMaskIntoConstraints = false
     progressSheet.applyAppearance(appearance)
     progressSheet.isHidden = true
     view.addSubview(progressSheet)
 
+    let tableBottomConstraint = tableView.bottomAnchor.constraint(equalTo: composerView.topAnchor, constant: -8)
+    let composerBottomConstraint = composerView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -8)
+    let composerHeightConstraint = composerView.heightAnchor.constraint(equalToConstant: composerView.preferredHeight)
+    self.tableBottomConstraint = tableBottomConstraint
+    self.composerBottomConstraint = composerBottomConstraint
+    self.composerHeightConstraint = composerHeightConstraint
+
     NSLayoutConstraint.activate([
       tableView.topAnchor.constraint(equalTo: view.topAnchor),
       tableView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       tableView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-      tableView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+      tableBottomConstraint,
+      composerView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14),
+      composerView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -14),
+      composerBottomConstraint,
+      composerHeightConstraint,
       progressSheet.topAnchor.constraint(equalTo: view.topAnchor),
       progressSheet.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       progressSheet.trailingAnchor.constraint(equalTo: view.trailingAnchor),
@@ -160,6 +219,8 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     ])
 
     indexProgress()
+    observeKeyboard()
+    observeLiveMessages()
     DispatchQueue.main.async { [weak self] in self?.scrollToBottom(animated: false) }
   }
 
@@ -170,6 +231,8 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       view.backgroundColor = appearance.background
       tableView.backgroundColor = appearance.background
       progressSheet.applyAppearance(appearance)
+      composerView.applyAppearance(appearance)
+      applyNavigationAppearance()
       tableView.reloadData()
     }
   }
@@ -179,11 +242,125 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   /// Replace the rendered messages (e.g. when the agent stream advances). Cheap
   /// reload is fine here — the surface is single-task and short.
   func setMessages(_ newMessages: [VibeAgentKitChatMessage]) {
+    guard newMessages != messages else { return }
     let wasNearBottom = isNearBottom()
     messages = newMessages
     indexProgress()
+    updateNavigationLiveState()
     tableView.reloadData()
     if wasNearBottom { scrollToBottom(animated: true) }
+  }
+
+  private func observeLiveMessages() {
+    guard messagesProvider != nil else { return }
+    changeObserver = NotificationCenter.default.addObserver(
+      forName: ChatEngine.didChangeNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      self?.refreshFromProvider()
+    }
+  }
+
+  private func refreshFromProvider() {
+    guard let messagesProvider else { return }
+    let next = messagesProvider()
+    guard !next.isEmpty else { return }
+    setMessages(next)
+  }
+
+  private func configureNavigationTitle() {
+    titleLabel.text = runtimeTitle
+    titleLabel.font = UIFont.systemFont(ofSize: 17, weight: .semibold)
+    titleLabel.textAlignment = .left
+    titleLabel.lineBreakMode = .byTruncatingTail
+
+    subtitleLabel.text = runtimeSubtitle
+    subtitleLabel.font = UIFont.systemFont(ofSize: 12, weight: .regular)
+    subtitleLabel.textAlignment = .left
+    subtitleLabel.lineBreakMode = .byTruncatingTail
+
+    liveDotView.layer.cornerRadius = 3.5
+    liveDotView.layer.cornerCurve = .continuous
+    liveLabel.text = "Live"
+    liveLabel.font = UIFont.systemFont(ofSize: 11, weight: .semibold)
+
+    let titleRow = UIStackView(arrangedSubviews: [titleLabel, liveDotView, liveLabel])
+    titleRow.axis = .horizontal
+    titleRow.alignment = .center
+    titleRow.spacing = 6
+
+    let stack = UIStackView(arrangedSubviews: [titleRow, subtitleLabel])
+    stack.axis = .vertical
+    stack.alignment = .leading
+    stack.spacing = 1
+    stack.frame = CGRect(x: 0, y: 0, width: 220, height: 38)
+    NSLayoutConstraint.activate([
+      liveDotView.widthAnchor.constraint(equalToConstant: 7),
+      liveDotView.heightAnchor.constraint(equalToConstant: 7),
+    ])
+    navigationItem.titleView = stack
+    applyNavigationAppearance()
+    updateNavigationLiveState()
+  }
+
+  private func applyNavigationAppearance() {
+    titleLabel.textColor = appearance.text
+    subtitleLabel.textColor = appearance.textSecondary
+    liveDotView.backgroundColor = UIColor.systemGreen
+    liveLabel.textColor = UIColor.systemGreen
+  }
+
+  private func updateNavigationLiveState() {
+    let isLive = messages.contains { message in
+      message.isStreaming || message.runtime?.status == "running"
+    }
+    liveDotView.isHidden = !isLive
+    liveLabel.isHidden = !isLive
+    subtitleLabel.isHidden = runtimeSubtitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+  }
+
+  private func updateComposerHeight(_ height: CGFloat, animated: Bool) {
+    composerHeightConstraint?.constant = height
+    let changes = { self.view.layoutIfNeeded() }
+    if animated {
+      UIView.animate(withDuration: 0.22, delay: 0, options: [.curveEaseOut, .beginFromCurrentState], animations: changes)
+    } else {
+      changes()
+    }
+  }
+
+  private func observeKeyboard() {
+    let center = NotificationCenter.default
+    keyboardObservers.append(center.addObserver(
+      forName: UIResponder.keyboardWillChangeFrameNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] note in
+      self?.handleKeyboard(note)
+    })
+    keyboardObservers.append(center.addObserver(
+      forName: UIResponder.keyboardWillHideNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] note in
+      self?.handleKeyboard(note)
+    })
+  }
+
+  private func handleKeyboard(_ note: Notification) {
+    guard
+      let window = view.window,
+      let endFrame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect
+    else { return }
+    let endFrameInView = view.convert(endFrame, from: window.screen.coordinateSpace)
+    let overlap = max(0, view.bounds.maxY - endFrameInView.minY)
+    composerBottomConstraint?.constant = overlap > 0 ? -(overlap - view.safeAreaInsets.bottom + 8) : -8
+    let duration = (note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?.doubleValue ?? 0.25
+    UIView.animate(withDuration: duration, delay: 0, options: [.curveEaseOut, .beginFromCurrentState]) {
+      self.view.layoutIfNeeded()
+      if self.isNearBottom() { self.scrollToBottom(animated: false) }
+    }
   }
 
   private func indexProgress() {
@@ -207,8 +384,14 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     let message = messages[indexPath.row]
     cell.backgroundColor = .clear
     cell.selectionStyle = .none
-    cell.configure(message: message, appearance: appearance, regeneratePrompt: regeneratePrompt)
     cell.onProgressTap = { [weak self] in self?.presentProgress(for: message.id) }
+    cell.onRuntimeTap = { [weak self] runtime in self?.presentRuntime(runtime) }
+    cell.configure(
+      message: message,
+      appearance: appearance,
+      regeneratePrompt: regeneratePrompt,
+      showsActions: false
+    )
     return cell
   }
 
@@ -219,6 +402,12 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     progressSheet.isHidden = false
     progressSheet.onDismiss = { [weak self] in self?.progressSheet.isHidden = true }
     progressSheet.present(items: items, animated: true)
+  }
+
+  private func presentRuntime(_ runtime: ChatListRow.AgentRuntimeSummary) {
+    guard runtime.diff?.files.isEmpty == false else { return }
+    let controller = AgentRuntimeFilesViewController(runtime: runtime, appearance: .fallback)
+    navigationController?.pushViewController(controller, animated: true)
   }
 
   // MARK: Scroll helpers
@@ -233,5 +422,207 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     guard messages.count > 0 else { return }
     let last = IndexPath(row: messages.count - 1, section: 0)
     tableView.scrollToRow(at: last, at: .bottom, animated: animated)
+  }
+}
+
+private final class VibeAgentRuntimeComposerView: UIView, UITextViewDelegate {
+  var onSend: ((String) -> Void)? {
+    didSet { updateSendState() }
+  }
+  var onHeightChanged: ((CGFloat) -> Void)?
+  var placeholder: String = "Ask Codex" {
+    didSet { placeholderLabel.text = placeholder }
+  }
+
+  private let blurView = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
+  private let overlayView = UIView()
+  private let textView = UITextView()
+  private let placeholderLabel = UILabel()
+  private let topControlsView = UIView()
+  private let controlsLabel = UILabel()
+  private let plusButton = UIButton(type: .system)
+  private let micButton = UIButton(type: .system)
+  private let sendButton = UIButton(type: .system)
+  private var appearance: VibeAgentKitChatAppearance = .fallback
+  private var expanded = false
+  private var textTopCompactConstraint: NSLayoutConstraint?
+  private var textTopExpandedConstraint: NSLayoutConstraint?
+
+  var preferredHeight: CGFloat {
+    expanded ? 126 : 64
+  }
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    configure()
+  }
+
+  required init?(coder: NSCoder) { return nil }
+
+  func applyAppearance(_ appearance: VibeAgentKitChatAppearance) {
+    self.appearance = appearance
+    backgroundColor = .clear
+    layer.borderColor = appearance.border.withAlphaComponent(0.72).cgColor
+    overlayView.backgroundColor = appearance.surface.withAlphaComponent(appearance.isDark ? 0.82 : 0.92)
+    textView.textColor = appearance.text
+    placeholderLabel.textColor = appearance.textTertiary
+    controlsLabel.textColor = appearance.textSecondary
+    [plusButton, micButton].forEach { button in
+      button.tintColor = appearance.text
+    }
+    updateSendState()
+  }
+
+  private func configure() {
+    clipsToBounds = true
+    layer.cornerRadius = 24
+    layer.cornerCurve = .continuous
+    layer.borderWidth = 1
+
+    blurView.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(blurView)
+
+    overlayView.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(overlayView)
+
+    topControlsView.translatesAutoresizingMaskIntoConstraints = false
+    topControlsView.alpha = 0
+    addSubview(topControlsView)
+
+    controlsLabel.text = "5.5  Extra High"
+    controlsLabel.font = UIFont.systemFont(ofSize: 15, weight: .medium)
+    controlsLabel.textAlignment = .center
+    controlsLabel.translatesAutoresizingMaskIntoConstraints = false
+    topControlsView.addSubview(controlsLabel)
+
+    textView.translatesAutoresizingMaskIntoConstraints = false
+    textView.backgroundColor = .clear
+    textView.font = UIFont.systemFont(ofSize: 17, weight: .regular)
+    textView.textContainerInset = UIEdgeInsets(top: 10, left: 0, bottom: 8, right: 0)
+    textView.textContainer.lineFragmentPadding = 0
+    textView.isScrollEnabled = true
+    textView.returnKeyType = .default
+    textView.delegate = self
+    addSubview(textView)
+
+    placeholderLabel.translatesAutoresizingMaskIntoConstraints = false
+    placeholderLabel.text = placeholder
+    placeholderLabel.font = UIFont.systemFont(ofSize: 17, weight: .regular)
+    placeholderLabel.numberOfLines = 1
+    addSubview(placeholderLabel)
+
+    configureIconButton(plusButton, systemName: "plus")
+    configureIconButton(micButton, systemName: "mic")
+    configureIconButton(sendButton, systemName: "arrow.up")
+    sendButton.backgroundColor = UIColor.white.withAlphaComponent(0.20)
+    sendButton.layer.cornerRadius = 21
+    sendButton.layer.cornerCurve = .continuous
+    sendButton.addTarget(self, action: #selector(handleSend), for: .touchUpInside)
+    [plusButton, micButton, sendButton].forEach(addSubview)
+
+    let textTopCompactConstraint = textView.topAnchor.constraint(equalTo: topAnchor)
+    let textTopExpandedConstraint = textView.topAnchor.constraint(equalTo: topControlsView.bottomAnchor)
+    textTopExpandedConstraint.isActive = false
+    self.textTopCompactConstraint = textTopCompactConstraint
+    self.textTopExpandedConstraint = textTopExpandedConstraint
+
+    NSLayoutConstraint.activate([
+      blurView.topAnchor.constraint(equalTo: topAnchor),
+      blurView.leadingAnchor.constraint(equalTo: leadingAnchor),
+      blurView.trailingAnchor.constraint(equalTo: trailingAnchor),
+      blurView.bottomAnchor.constraint(equalTo: bottomAnchor),
+      overlayView.topAnchor.constraint(equalTo: topAnchor),
+      overlayView.leadingAnchor.constraint(equalTo: leadingAnchor),
+      overlayView.trailingAnchor.constraint(equalTo: trailingAnchor),
+      overlayView.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+      topControlsView.topAnchor.constraint(equalTo: topAnchor, constant: 10),
+      topControlsView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 54),
+      topControlsView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -54),
+      topControlsView.heightAnchor.constraint(equalToConstant: 28),
+      controlsLabel.centerXAnchor.constraint(equalTo: topControlsView.centerXAnchor),
+      controlsLabel.centerYAnchor.constraint(equalTo: topControlsView.centerYAnchor),
+
+      plusButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 13),
+      plusButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
+      plusButton.widthAnchor.constraint(equalToConstant: 42),
+      plusButton.heightAnchor.constraint(equalToConstant: 42),
+
+      sendButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+      sendButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
+      sendButton.widthAnchor.constraint(equalToConstant: 42),
+      sendButton.heightAnchor.constraint(equalToConstant: 42),
+
+      micButton.trailingAnchor.constraint(equalTo: sendButton.leadingAnchor, constant: -8),
+      micButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
+      micButton.widthAnchor.constraint(equalToConstant: 38),
+      micButton.heightAnchor.constraint(equalToConstant: 42),
+
+      textView.leadingAnchor.constraint(equalTo: plusButton.trailingAnchor, constant: 10),
+      textView.trailingAnchor.constraint(equalTo: micButton.leadingAnchor, constant: -8),
+      textTopCompactConstraint,
+      textView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
+
+      placeholderLabel.leadingAnchor.constraint(equalTo: textView.leadingAnchor),
+      placeholderLabel.trailingAnchor.constraint(lessThanOrEqualTo: textView.trailingAnchor),
+      placeholderLabel.topAnchor.constraint(equalTo: textView.topAnchor, constant: 10),
+    ])
+
+    applyAppearance(.fallback)
+  }
+
+  private func configureIconButton(_ button: UIButton, systemName: String) {
+    button.translatesAutoresizingMaskIntoConstraints = false
+    button.setImage(UIImage(systemName: systemName), for: .normal)
+    button.imageView?.contentMode = .scaleAspectFit
+    button.tintColor = .white
+  }
+
+  @objc private func handleSend() {
+    let text = textView.text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !text.isEmpty, onSend != nil else { return }
+    textView.text = ""
+    textViewDidChange(textView)
+    onSend?(text)
+  }
+
+  func textViewDidBeginEditing(_ textView: UITextView) {
+    setExpanded(true, animated: true)
+  }
+
+  func textViewDidEndEditing(_ textView: UITextView) {
+    if textView.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      setExpanded(false, animated: true)
+    }
+  }
+
+  func textViewDidChange(_ textView: UITextView) {
+    placeholderLabel.isHidden = !textView.text.isEmpty
+    updateSendState()
+  }
+
+  private func setExpanded(_ value: Bool, animated: Bool) {
+    guard expanded != value else { return }
+    expanded = value
+    textTopCompactConstraint?.isActive = !value
+    textTopExpandedConstraint?.isActive = value
+    onHeightChanged?(preferredHeight)
+    let changes = {
+      self.topControlsView.alpha = value ? 1 : 0
+      self.layoutIfNeeded()
+    }
+    if animated {
+      UIView.animate(withDuration: 0.2, delay: 0, options: [.curveEaseOut, .beginFromCurrentState], animations: changes)
+    } else {
+      changes()
+    }
+  }
+
+  private func updateSendState() {
+    let hasText = !textView.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    let enabled = hasText && onSend != nil
+    sendButton.isEnabled = enabled
+    sendButton.tintColor = enabled ? appearance.background : appearance.textSecondary
+    sendButton.backgroundColor = enabled ? appearance.text : appearance.textSecondary.withAlphaComponent(0.24)
   }
 }

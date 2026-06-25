@@ -75,12 +75,37 @@ defmodule VibeWeb.AgentBridgeChannel do
 
     lines = Enum.take([line | state.lines], @max_stream_lines)
     accumulated = lines |> Enum.reverse() |> Enum.join("\n")
-    state = %{state | lines: lines}
+    task_id = payload["taskId"] || payload["task_id"] || Map.get(state, :task_id)
+    source_message_id =
+      payload["sourceMessageId"] ||
+        payload["source_message_id"] ||
+        payload["replyToId"] ||
+        payload["reply_to_id"] ||
+        Map.get(state, :source_message_id)
+
+    state =
+      Map.merge(state, %{
+        lines: lines,
+        task_id: task_id,
+        source_message_id: source_message_id,
+        repo_name: payload["repoName"] || payload["repo_name"] || Map.get(state, :repo_name),
+        cwd: payload["cwd"] || Map.get(state, :cwd),
+        work_mode: payload["workMode"] || payload["work_mode"] || Map.get(state, :work_mode),
+        model: payload["model"] || Map.get(state, :model)
+      })
 
     # The live tool/execution feed now renders INSIDE the chat bubble (via the
     # agent-stream progress nodes), not as a tool-specific subtitle in the chat
     # header. We intentionally no longer broadcast `agent-progress` here.
-    LocalAgentWorker.bridge_stream_update(provider, chat_id, accumulated, state.stream_id)
+    LocalAgentWorker.bridge_stream_update(provider, chat_id, accumulated, state.stream_id, %{
+      task_id: state.task_id,
+      source_message_id: state.source_message_id,
+      reply_to_id: state.source_message_id,
+      repo_name: state.repo_name,
+      cwd: state.cwd,
+      work_mode: state.work_mode,
+      model: state.model
+    })
 
     {:noreply, assign(socket, :streams, Map.put(streams, chat_id, state))}
   end

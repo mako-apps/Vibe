@@ -3963,6 +3963,9 @@ final class ChatEngine {
     let agentUserId = normalizedString(payload["userId"] ?? payload["user_id"] ?? payload["id"])
     let text = normalizedString(payload["text"]) ?? ""
     let progressNodes = (payload["progressNodes"] as? [[String: Any]]) ?? []
+    let sourceMessageId = normalizedString(
+      payload["sourceMessageId"] ?? payload["source_message_id"] ?? payload["replyToId"] ?? payload["reply_to_id"]
+    )
 
     if status == "done" || status == "error" || status == "stopped" {
       // Keep the accumulated text but stop the live indicator. The persisted
@@ -3986,18 +3989,42 @@ final class ChatEngine {
     perChat[streamId] = timestampMs
     agentStreamTimestampsByChat[chatId] = perChat
 
+    var metadata: [String: Any] = [
+      "progressNodes": progressNodes,
+      "agentWorkerVia": "bridge",
+      "isStreaming": true,
+    ]
+    if let sourceMessageId {
+      metadata["sourceMessageId"] = sourceMessageId
+      metadata["actionSourceId"] = sourceMessageId
+    }
+    if let taskId = normalizedString(payload["taskId"] ?? payload["task_id"]) {
+      metadata["agentTaskId"] = taskId
+    }
+    if let repoName = normalizedString(payload["repoName"] ?? payload["repo_name"]) {
+      metadata["agentRuntimeRepoName"] = repoName
+    }
+    if let cwd = normalizedString(payload["cwd"]) {
+      metadata["agentRuntimeCwd"] = cwd
+    }
+    if let workMode = normalizedString(payload["workMode"] ?? payload["work_mode"]) {
+      metadata["agentRuntimeWorkMode"] = workMode
+    }
+    if let model = normalizedString(payload["model"]) {
+      metadata["agentRuntimeModel"] = model
+    }
+
     var synthetic: [String: Any] = [
       "id": streamId,
       "type": "text",
       "timestamp": timestampMs,
       "isAgentMessage": true,
       "plainContent": text,
-      "metadata": [
-        "progressNodes": progressNodes,
-        "agentWorkerVia": "bridge",
-        "isStreaming": true,
-      ],
+      "metadata": metadata,
     ]
+    if let sourceMessageId {
+      synthetic["replyToId"] = sourceMessageId
+    }
     if let agentUserId {
       synthetic["fromId"] = agentUserId
       synthetic["agentUserId"] = agentUserId

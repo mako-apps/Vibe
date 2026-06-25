@@ -115,8 +115,10 @@ final class VibeAgentKitMessageActionBarView: UIView {
 private final class VibeAgentKitAssistantMessageBodyView: UIView {
   private let stackView = UIStackView()
   private let loaderView = VibeAgentKitAgentLoaderView()
+  private let runtimeSummaryView = AgentRuntimeSummaryView()
   private var blockViews: [UIView] = []
   private var blockHeightConstraints: [NSLayoutConstraint] = []
+  private var runtimeHeightConstraint: NSLayoutConstraint?
   private var lastBlockSignature: String = ""
 
   override init(frame: CGRect) {
@@ -137,6 +139,13 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     loaderView.configure(text: "", isStreaming: false, progressItems: [])
     loaderView.onTap = nil
     loaderView.isHidden = true
+    runtimeSummaryView.onTap = nil
+    runtimeSummaryView.isHidden = true
+    runtimeHeightConstraint?.constant = 0.0
+    removeBlockViews()
+  }
+
+  private func removeBlockViews() {
     for view in blockViews {
       if let label = view as? VibeAgentKitStreamingTextLabel {
         label.resetStreamingState()
@@ -158,6 +167,8 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     messageId: String,
     progressItems: [VibeAgentKitProgressItem],
     fallbackProgressLabels: [String],
+    runtime: ChatListRow.AgentRuntimeSummary?,
+    onRuntimeTap: ((ChatListRow.AgentRuntimeSummary) -> Void)?,
     onLoaderTap: (() -> Void)?
   ) {
     let font = UIFont.systemFont(ofSize: 18.0, weight: .regular)
@@ -188,6 +199,13 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
       loaderView.configure(text: "", isStreaming: false, progressItems: [])
     }
 
+    configureRuntimeSummary(
+      runtime,
+      textColor: appearance.text,
+      availableWidth: availableWidth,
+      onTap: onRuntimeTap
+    )
+
     guard hasDisplayText else {
       for (index, view) in blockViews.enumerated() {
         if let label = view as? VibeAgentKitStreamingTextLabel {
@@ -210,7 +228,7 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     }.joined()
 
     if signature != lastBlockSignature || blockViews.count != blocks.count {
-      reset()
+      removeBlockViews()
       for block in blocks {
         let view: UIView
         switch block {
@@ -227,7 +245,7 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
         }
         stackView.insertArrangedSubview(
           view,
-          at: max(0, stackView.arrangedSubviews.count - 1)
+          at: max(0, stackView.arrangedSubviews.count - 2)
         )
         let heightConstraint = view.heightAnchor.constraint(equalToConstant: 0.0)
         heightConstraint.priority = .defaultHigh
@@ -290,8 +308,15 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     stackView.spacing = 7.0
     loaderView.translatesAutoresizingMaskIntoConstraints = false
     loaderView.isHidden = true
+    runtimeSummaryView.translatesAutoresizingMaskIntoConstraints = false
+    runtimeSummaryView.isHidden = true
     addSubview(stackView)
     stackView.addArrangedSubview(loaderView)
+    stackView.addArrangedSubview(runtimeSummaryView)
+    let runtimeHeightConstraint = runtimeSummaryView.heightAnchor.constraint(equalToConstant: 0.0)
+    runtimeHeightConstraint.priority = .defaultHigh
+    runtimeHeightConstraint.isActive = true
+    self.runtimeHeightConstraint = runtimeHeightConstraint
 
     NSLayoutConstraint.activate([
       stackView.topAnchor.constraint(equalTo: topAnchor),
@@ -299,6 +324,28 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
       stackView.trailingAnchor.constraint(equalTo: trailingAnchor),
       stackView.bottomAnchor.constraint(equalTo: bottomAnchor),
     ])
+  }
+
+  private func configureRuntimeSummary(
+    _ runtime: ChatListRow.AgentRuntimeSummary?,
+    textColor: UIColor,
+    availableWidth: CGFloat,
+    onTap: ((ChatListRow.AgentRuntimeSummary) -> Void)?
+  ) {
+    guard let runtime else {
+      runtimeSummaryView.onTap = nil
+      runtimeSummaryView.isHidden = true
+      runtimeHeightConstraint?.constant = 0.0
+      return
+    }
+    runtimeSummaryView.onTap = onTap
+    let height = runtimeSummaryView.configure(
+      runtime: runtime,
+      textColor: textColor,
+      availableWidth: availableWidth
+    )
+    runtimeSummaryView.isHidden = false
+    runtimeHeightConstraint?.constant = height
   }
 }
 
@@ -365,6 +412,7 @@ final class VibeAgentKitMessageCell: UITableViewCell {
   }
 
   var onProgressTap: (() -> Void)?
+  var onRuntimeTap: ((ChatListRow.AgentRuntimeSummary) -> Void)?
 
   /// The visible text currently displayed (exposed for the hold context menu).
   var currentMessageText: String { storedMessageText }
@@ -386,6 +434,7 @@ final class VibeAgentKitMessageCell: UITableViewCell {
     userTextView.resetStreamingState()
     assistantBodyView.reset()
     onProgressTap = nil
+    onRuntimeTap = nil
     progressStack.arrangedSubviews.forEach {
       progressStack.removeArrangedSubview($0)
       $0.removeFromSuperview()
@@ -408,7 +457,8 @@ final class VibeAgentKitMessageCell: UITableViewCell {
   func configure(
     message: VibeAgentKitChatMessage,
     appearance: VibeAgentKitChatAppearance,
-    regeneratePrompt: String
+    regeneratePrompt: String,
+    showsActions: Bool = true
   ) {
     let isUser = message.role.isUser
     currentIsUser = isUser
@@ -519,6 +569,8 @@ final class VibeAgentKitMessageCell: UITableViewCell {
         messageId: message.id,
         progressItems: message.progressItems,
         fallbackProgressLabels: message.progress,
+        runtime: message.runtime,
+        onRuntimeTap: onRuntimeTap,
         onLoaderTap: onProgressTap
       )
 
@@ -553,6 +605,7 @@ final class VibeAgentKitMessageCell: UITableViewCell {
     let canRegenerate = !regeneratePrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     let shouldShowActions =
       !isUser
+      && showsActions
       && !message.isStreaming
       && !message.isError
       && (hasSourceText || canRegenerate)

@@ -849,8 +849,8 @@ struct ChatListRow {
       ?? false
     agentActionSourceId = firstNonEmptyString(
       in: [metadata, message],
-      keys: ["sourceMessageId", "actionSourceId"]
-    )
+      keys: ["sourceMessageId", "actionSourceId", "agentActionSourceId", "replyToId", "reply_to_id"]
+    ) ?? replyToId
     agentActionSourceText = firstNonEmptyString(
       in: [metadata, message],
       keys: ["sourceText", "actionSourceText"]

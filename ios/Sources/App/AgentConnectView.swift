@@ -470,9 +470,13 @@ struct AgentBridgeRepositoryPickerView: View {
         id: id,
         topic: (item["topic"] as? String) ?? "Untitled",
         projectName: (item["projectName"] as? String) ?? "",
+        projectPath: (item["project"] as? String) ?? (item["projectPath"] as? String) ?? (item["cwd"] as? String) ?? "",
         updatedAt: (item["updatedAt"] as? String) ?? "",
         messageCount: (item["messageCount"] as? NSNumber)?.intValue
-          ?? (item["messageCount"] as? Int) ?? 0
+          ?? (item["messageCount"] as? Int) ?? 0,
+        isRunning: false,
+        taskId: nil,
+        sessionId: id
       )
     }
   }

@@ -7,15 +7,13 @@ import UIKit
 //   * AgentBridgeHistoryInlineView — the agent's OWN past Claude/Codex
 //     conversations (topic list), read from the connected computer via the
 //     bridge. Pushed into `ChatProfileMainView`'s NavigationStack so it
-//     morph-expands from the "Chat History" row (matching the normal contact
-//     history). Tapping a topic no longer renders a transcript in-profile —
-//     it loads that whole conversation into the DEFAULT chat as bubbles
-//     (`ChatEngine.loadAgentBridgeSessionIntoChat`) and leaves the profile.
+//     morph-expands from the "Chat History" row. Tapping a topic pushes the
+//     dedicated agent runtime surface with the topic header and composer.
 //
 // The connection sheet is presented; the history is pushed (morph) from
 // `ChatProfileMainView` for Claude/Codex profiles.
 //
-// `AgentBridgeTranscriptView` below is retained as a standalone transcript
+// `AgentBridgeTranscriptView` below is retained as a standalone fallback
 // renderer but is no longer wired into the profile navigation.
 
 enum AgentBridgeProfile {
@@ -198,12 +196,42 @@ struct AgentBridgeConnectionSheet: View {
 
 // MARK: - History (topics → transcript), read from the connected computer
 
-struct AgentBridgeHistorySession: Identifiable {
+struct AgentBridgeHistorySession: Identifiable, Hashable {
   let id: String
   let topic: String
   let projectName: String
+  let projectPath: String
   let updatedAt: String
   let messageCount: Int
+  let isRunning: Bool
+  let taskId: String?
+  let sessionId: String?
+
+  var resolvedSessionId: String {
+    if let sessionId, !sessionId.isEmpty { return sessionId }
+    return id
+  }
+
+  var projectKey: String {
+    let path = projectPath.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !path.isEmpty { return path }
+    let name = projectName.trimmingCharacters(in: .whitespacesAndNewlines)
+    return name.isEmpty ? "Computer" : name
+  }
+
+  var displayProjectName: String {
+    let name = projectName.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !name.isEmpty { return name }
+    let path = projectPath.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !path.isEmpty { return URL(fileURLWithPath: path).lastPathComponent }
+    return "Computer"
+  }
+}
+
+private struct AgentBridgeHistoryProjectGroup: Identifiable {
+  let id: String
+  let name: String
+  let sessions: [AgentBridgeHistorySession]
 }
 
 struct AgentBridgeTranscriptMessage: Identifiable {
@@ -213,13 +241,12 @@ struct AgentBridgeTranscriptMessage: Identifiable {
 }
 
 // Inline history list, designed to be PUSHED into the profile's own
-// NavigationStack (so it morph-expands from the "Chat History" row, matching the
-// normal contact history) rather than presented as a sheet. Selecting a topic
-// invokes `onOpenSession`, which loads that conversation into the default chat
-// as bubbles and dismisses the profile (no in-profile transcript).
+// NavigationStack rather than presented as a sheet. Selecting a topic pushes the
+// dedicated agent runtime surface instead of injecting rows into the default chat.
 struct AgentBridgeHistoryInlineView: View {
   let provider: String
   let chatId: String
+  var runningTasks: [AgentBridgeRunningTask] = []
   let onOpenSession: (AgentBridgeHistorySession) -> Void
 
   @Environment(\.colorScheme) private var colorScheme
@@ -231,10 +258,35 @@ struct AgentBridgeHistoryInlineView: View {
 
   private var palette: AppThemePalette { AppThemePalette.resolve(for: colorScheme) }
   private var displayName: String { AgentBridgeProfile.displayName(for: provider) }
+  private var visibleSessions: [AgentBridgeHistorySession] { mergedSessions() }
+  private var projectGroups: [AgentBridgeHistoryProjectGroup] {
+    var groups: [AgentBridgeHistoryProjectGroup] = []
+    var indexByKey: [String: Int] = [:]
+    for session in visibleSessions {
+      let key = session.projectKey
+      if let index = indexByKey[key] {
+        var existing = groups[index]
+        existing = AgentBridgeHistoryProjectGroup(
+          id: existing.id,
+          name: existing.name,
+          sessions: existing.sessions + [session]
+        )
+        groups[index] = existing
+      } else {
+        indexByKey[key] = groups.count
+        groups.append(AgentBridgeHistoryProjectGroup(
+          id: key,
+          name: session.displayProjectName,
+          sessions: [session]
+        ))
+      }
+    }
+    return groups
+  }
 
   var body: some View {
     Group {
-      if loading && sessions.isEmpty {
+      if loading && visibleSessions.isEmpty {
         VStack(spacing: 12) {
           ProgressView()
           Text("Reading \(displayName) history from your computer…")
@@ -242,7 +294,7 @@ struct AgentBridgeHistoryInlineView: View {
             .foregroundStyle(palette.secondaryText)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-      } else if sessions.isEmpty {
+      } else if visibleSessions.isEmpty {
         VStack(spacing: 12) {
           Image(systemName: errorMessage == nil ? "clock.badge.questionmark" : "laptopcomputer.slash")
             .font(.system(size: 34, weight: .semibold))
@@ -255,40 +307,16 @@ struct AgentBridgeHistoryInlineView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
       } else {
-        List(sessions) { session in
-          Button {
-            onOpenSession(session)
-          } label: {
-            HStack(spacing: 12) {
-              VStack(alignment: .leading, spacing: 4) {
-                Text(session.topic)
-                  .font(.system(size: 15, weight: .semibold))
-                  .foregroundStyle(palette.text)
-                  .lineLimit(2)
-                HStack(spacing: 6) {
-                  if !session.projectName.isEmpty {
-                    Text(session.projectName)
-                      .lineLimit(1)
-                    Text("·")
-                  }
-                  Text("\(session.messageCount) messages")
-                  if let when = Self.relativeDate(session.updatedAt) {
-                    Text("·")
-                    Text(when)
-                  }
-                }
-                .font(.system(size: 12))
-                .foregroundStyle(palette.secondaryText)
+        List {
+          ForEach(projectGroups) { group in
+            Section {
+              ForEach(group.sessions) { session in
+                sessionRow(session)
               }
-              Spacer(minLength: 8)
-              Image(systemName: "chevron.right")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(palette.secondaryText.opacity(0.7))
+            } header: {
+              projectHeader(group)
             }
-            .padding(.vertical, 2)
-            .contentShape(Rectangle())
           }
-          .buttonStyle(.plain)
         }
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
@@ -300,6 +328,60 @@ struct AgentBridgeHistoryInlineView: View {
       handle(note)
     }
     .onAppear { requestList() }
+  }
+
+  private func projectHeader(_ group: AgentBridgeHistoryProjectGroup) -> some View {
+    HStack(spacing: 10) {
+      Image(systemName: "folder")
+        .font(.system(size: 16, weight: .semibold))
+      Text(group.name)
+        .font(.system(size: 20, weight: .bold))
+      Spacer(minLength: 0)
+    }
+    .textCase(nil)
+    .foregroundStyle(palette.text)
+    .padding(.top, 14)
+    .padding(.bottom, 6)
+  }
+
+  private func sessionRow(_ session: AgentBridgeHistorySession) -> some View {
+    Button {
+      onOpenSession(session)
+    } label: {
+      HStack(spacing: 12) {
+        VStack(alignment: .leading, spacing: 5) {
+          HStack(spacing: 7) {
+            if session.isRunning {
+              Circle().fill(Color.green).frame(width: 8, height: 8)
+            }
+            Text(session.topic)
+              .font(.system(size: 18, weight: .regular))
+              .foregroundStyle(palette.text)
+              .lineLimit(2)
+          }
+          HStack(spacing: 6) {
+            if session.isRunning {
+              Text("Running")
+            } else {
+              Text("\(session.messageCount) messages")
+            }
+            if let when = Self.relativeDate(session.updatedAt) {
+              Text("·")
+              Text(when)
+            }
+          }
+          .font(.system(size: 12))
+          .foregroundStyle(session.isRunning ? Color.green.opacity(0.9) : palette.secondaryText)
+        }
+        Spacer(minLength: 8)
+        Image(systemName: "chevron.right")
+          .font(.system(size: 13, weight: .semibold))
+          .foregroundStyle(palette.secondaryText.opacity(0.7))
+      }
+      .padding(.vertical, 9)
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
   }
 
   private func requestList() {
@@ -334,18 +416,57 @@ struct AgentBridgeHistoryInlineView: View {
     loading = false
     let raw = payload["sessions"] as? [[String: Any]] ?? []
     sessions = raw.compactMap { item in
-      guard let id = (item["id"] as? String), !id.isEmpty else { return nil }
-      return AgentBridgeHistorySession(
-        id: id,
-        topic: (item["topic"] as? String) ?? "Untitled",
-        projectName: (item["projectName"] as? String) ?? "",
-        updatedAt: (item["updatedAt"] as? String) ?? "",
-        messageCount: (item["messageCount"] as? NSNumber)?.intValue ?? (item["messageCount"] as? Int) ?? 0
-      )
+      Self.parseSession(item)
     }
     if sessions.isEmpty && (payload["ok"] as? Bool) == false {
       errorMessage = (payload["error"] as? String) ?? "Couldn't read history from your computer."
     }
+  }
+
+  private func mergedSessions() -> [AgentBridgeHistorySession] {
+    let running = runningTasks.compactMap { task -> AgentBridgeHistorySession? in
+      let normalizedProvider = task.provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+      if !normalizedProvider.isEmpty && normalizedProvider != provider.lowercased() { return nil }
+      if !task.chatId.isEmpty && !chatId.isEmpty && task.chatId != chatId { return nil }
+      let id = task.sessionId?.isEmpty == false ? task.sessionId! : "running:\(task.taskId)"
+      return AgentBridgeHistorySession(
+        id: id,
+        topic: task.topic,
+        projectName: task.projectName ?? task.repoName ?? "",
+        projectPath: task.project ?? task.cwd ?? "",
+        updatedAt: task.startedAt ?? "",
+        messageCount: 0,
+        isRunning: true,
+        taskId: task.taskId,
+        sessionId: task.sessionId
+      )
+    }
+    var seen = Set(running.map(\.id))
+    return running + sessions.filter { session in
+      if seen.contains(session.id) { return false }
+      seen.insert(session.id)
+      return true
+    }
+  }
+
+  static func parseSession(_ item: [String: Any]) -> AgentBridgeHistorySession? {
+    guard let id = (item["id"] as? String), !id.isEmpty else { return nil }
+    let projectPath =
+      (item["project"] as? String)
+      ?? (item["projectPath"] as? String)
+      ?? (item["cwd"] as? String)
+      ?? ""
+    return AgentBridgeHistorySession(
+      id: id,
+      topic: (item["topic"] as? String) ?? "Untitled",
+      projectName: (item["projectName"] as? String) ?? "",
+      projectPath: projectPath,
+      updatedAt: (item["updatedAt"] as? String) ?? "",
+      messageCount: (item["messageCount"] as? NSNumber)?.intValue ?? (item["messageCount"] as? Int) ?? 0,
+      isRunning: false,
+      taskId: nil,
+      sessionId: id
+    )
   }
 
   static func relativeDate(_ iso: String) -> String? {
@@ -359,6 +480,177 @@ struct AgentBridgeHistoryInlineView: View {
     let rel = RelativeDateTimeFormatter()
     rel.unitsStyle = .abbreviated
     return rel.localizedString(for: date, relativeTo: Date())
+  }
+}
+
+struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
+  let provider: String
+  let chatId: String
+  let session: AgentBridgeHistorySession
+  let subtitle: String
+
+  func makeCoordinator() -> Coordinator {
+    Coordinator(parent: self)
+  }
+
+  func makeUIViewController(context: Context) -> VibeAgentConversationViewController {
+    let controller = VibeAgentConversationViewController(
+      title: session.topic,
+      subtitle: subtitle,
+      messages: context.coordinator.seedMessages(),
+      inputPlaceholder: "Ask \(AgentBridgeProfile.displayName(for: provider))"
+    )
+    context.coordinator.controller = controller
+    context.coordinator.requestDetailIfPossible()
+    return controller
+  }
+
+  func updateUIViewController(_ controller: VibeAgentConversationViewController, context: Context) {
+    context.coordinator.parent = self
+    context.coordinator.controller = controller
+  }
+
+  final class Coordinator {
+    var parent: AgentBridgeRuntimeView
+    weak var controller: VibeAgentConversationViewController?
+    private var pendingRequestId: String?
+    private var observer: NSObjectProtocol?
+
+    init(parent: AgentBridgeRuntimeView) {
+      self.parent = parent
+      observer = NotificationCenter.default.addObserver(
+        forName: ChatEngine.didChangeNotification,
+        object: nil,
+        queue: .main
+      ) { [weak self] note in
+        self?.handle(note)
+      }
+    }
+
+    deinit {
+      if let observer {
+        NotificationCenter.default.removeObserver(observer)
+      }
+    }
+
+    func seedMessages() -> [VibeAgentKitChatMessage] {
+      if parent.session.isRunning {
+        return [
+          VibeAgentKitChatMessage(
+            id: parent.session.id,
+            role: .assistant,
+            text: "Running on \(parent.session.displayProjectName).",
+            timestamp: "",
+            timestampMs: 0,
+            isStreaming: true
+          )
+        ]
+      }
+      return [
+        VibeAgentKitChatMessage(
+          id: parent.session.id,
+          role: .assistant,
+          text: "Loading conversation...",
+          timestamp: "",
+          timestampMs: 0,
+          isStreaming: true
+        )
+      ]
+    }
+
+    func requestDetailIfPossible() {
+      let sessionId = parent.session.resolvedSessionId.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !sessionId.isEmpty, !sessionId.hasPrefix("running:") else { return }
+      let result = ChatEngine.shared.requestAgentBridgeHistory([
+        "chatId": parent.chatId,
+        "provider": parent.provider,
+        "mode": "detail",
+        "sessionId": sessionId,
+      ])
+      if (result["accepted"] as? Bool) == true {
+        pendingRequestId = result["requestId"] as? String
+      } else {
+        controller?.setMessages([
+          VibeAgentKitChatMessage(
+            id: "offline",
+            role: .assistant,
+            text: "Your computer is not connected right now.",
+            timestamp: "",
+            timestampMs: 0,
+            isError: true
+          )
+        ])
+      }
+    }
+
+    private func handle(_ note: Notification) {
+      guard
+        let info = note.userInfo,
+        (info["reason"] as? String) == "agentBridgeHistory",
+        let payload = ChatEngine.shared.latestAgentBridgeHistory(chatId: parent.chatId)
+      else { return }
+
+      if let pendingRequestId,
+        let requestId = info["requestId"] as? String,
+        requestId != pendingRequestId
+      {
+        return
+      }
+      guard (payload["mode"] as? String) == "detail" else { return }
+      guard let sessionPayload = payload["session"] as? [String: Any] else {
+        if (payload["ok"] as? Bool) == false {
+          controller?.setMessages([
+            VibeAgentKitChatMessage(
+              id: "unavailable",
+              role: .assistant,
+              text: "This conversation is not available yet.",
+              timestamp: "",
+              timestampMs: 0,
+              isError: true
+            )
+          ])
+        }
+        return
+      }
+      if let id = sessionPayload["id"] as? String,
+        id != parent.session.resolvedSessionId
+      {
+        return
+      }
+      let messages = Self.messages(from: sessionPayload)
+      if messages.isEmpty {
+        controller?.setMessages([
+          VibeAgentKitChatMessage(
+            id: "empty",
+            role: .assistant,
+            text: "This conversation has no readable messages.",
+            timestamp: "",
+            timestampMs: 0,
+            isError: true
+          )
+        ])
+      } else {
+        controller?.setMessages(messages)
+      }
+    }
+
+    private static func messages(from sessionPayload: [String: Any]) -> [VibeAgentKitChatMessage] {
+      let raw = sessionPayload["messages"] as? [[String: Any]] ?? []
+      return raw.enumerated().compactMap { index, item in
+        let text = (item["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !text.isEmpty else { return nil }
+        let roleText = ((item["role"] as? String) ?? "").lowercased()
+        let role: VibeAgentKitChatRole = roleText == "user" ? .user : .assistant
+        return VibeAgentKitChatMessage(
+          id: (item["id"] as? String) ?? "\(roleText)-\(index)",
+          role: role,
+          text: text,
+          timestamp: (item["ts"] as? String) ?? (item["timestamp"] as? String) ?? "",
+          timestampMs: 0,
+          isStreaming: false
+        )
+      }
+    }
   }
 }
 

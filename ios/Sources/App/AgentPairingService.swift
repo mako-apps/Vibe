@@ -28,6 +28,7 @@ struct AgentBridgeRunningTask: Hashable, Identifiable {
   let projectName: String?
   let cwd: String?
   let workMode: String?
+  let model: String?
   let startedAt: String?
 
   var id: String {
@@ -271,11 +272,13 @@ enum AgentPairingService {
     let object = try await perform(request)
     let repositories = repositoryList(object["repositories"])
     let devices = deviceList(object["devices"])
+    let runningTasks = runningTaskList(object["runningTasks"] ?? object["running_tasks"])
     return AgentBridgeStatus(
       connected: boolValue(object["connected"]),
       paired: boolValue(object["paired"]),
       repositories: repositories.isEmpty ? devices.flatMap(\.repositories) : repositories,
-      devices: devices
+      devices: devices,
+      runningTasks: runningTasks.isEmpty ? devices.flatMap(\.runningTasks) : runningTasks
     )
   }
 
@@ -427,8 +430,38 @@ enum AgentPairingService {
       AgentBridgeDevice(
         label: normalizedString(object["deviceLabel"] ?? object["device_label"]) ?? "Computer",
         cwd: normalizedString(object["cwd"]),
-        repositories: repositoryList(object["repositories"])
+        repositories: repositoryList(object["repositories"]),
+        runningTasks: runningTaskList(object["runningTasks"] ?? object["running_tasks"])
       )
     }
+  }
+
+  private static func runningTaskList(_ value: Any?) -> [AgentBridgeRunningTask] {
+    guard let values = value as? [[String: Any]] else { return [] }
+    return values.compactMap(runningTask)
+  }
+
+  private static func runningTask(_ object: [String: Any]) -> AgentBridgeRunningTask? {
+    guard
+      let taskId = normalizedString(object["taskId"] ?? object["task_id"])
+        ?? normalizedString(object["id"])
+    else {
+      return nil
+    }
+    return AgentBridgeRunningTask(
+      provider: normalizedString(object["provider"]) ?? "",
+      chatId: normalizedString(object["chatId"] ?? object["chat_id"]) ?? "",
+      taskId: taskId,
+      sessionId: normalizedString(object["sessionId"] ?? object["session_id"]),
+      topic: normalizedString(object["topic"]) ?? "Running task",
+      repoId: normalizedString(object["repoId"] ?? object["repo_id"]),
+      repoName: normalizedString(object["repoName"] ?? object["repo_name"]),
+      project: normalizedString(object["project"] ?? object["cwd"]),
+      projectName: normalizedString(object["projectName"] ?? object["project_name"]),
+      cwd: normalizedString(object["cwd"]),
+      workMode: normalizedString(object["workMode"] ?? object["work_mode"]),
+      model: normalizedString(object["model"]),
+      startedAt: normalizedString(object["startedAt"] ?? object["started_at"])
+    )
   }
 }

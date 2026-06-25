@@ -647,7 +647,11 @@ defmodule Vibe.AI.LocalAgentWorker do
   appears as it is produced instead of arriving as one final batch. Reuses the
   same `extract_result/2` parser as the final delivery — one source of truth.
   """
-  def bridge_stream_update(provider, chat_id, accumulated_output, stream_id)
+  def bridge_stream_update(provider, chat_id, accumulated_output, stream_id) do
+    bridge_stream_update(provider, chat_id, accumulated_output, stream_id, %{})
+  end
+
+  def bridge_stream_update(provider, chat_id, accumulated_output, stream_id, metadata)
       when is_binary(provider) and is_binary(chat_id) and is_binary(accumulated_output) do
     case resolve_handle(provider) do
       nil ->
@@ -657,7 +661,7 @@ defmodule Vibe.AI.LocalAgentWorker do
         extracted = extract_result(worker, accumulated_output)
         text = normalize_string(extracted.text) || ""
 
-        VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-stream", %{
+        payload = %{
           "chatId" => chat_id,
           "streamId" => stream_id,
           "userId" => worker.agent_user_id,
@@ -666,13 +670,22 @@ defmodule Vibe.AI.LocalAgentWorker do
           "progressNodes" => extracted.progress_nodes,
           "toolEvents" => extracted.tool_events,
           "status" => "running"
-        })
+        }
+        |> maybe_put("taskId", metadata["taskId"] || metadata[:task_id])
+        |> maybe_put("sourceMessageId", metadata["sourceMessageId"] || metadata[:source_message_id])
+        |> maybe_put("replyToId", metadata["replyToId"] || metadata[:reply_to_id])
+        |> maybe_put("repoName", metadata["repoName"] || metadata[:repo_name])
+        |> maybe_put("cwd", metadata["cwd"] || metadata[:cwd])
+        |> maybe_put("workMode", metadata["workMode"] || metadata[:work_mode])
+        |> maybe_put("model", metadata["model"] || metadata[:model])
+
+        VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-stream", payload)
 
         :ok
     end
   end
 
-  def bridge_stream_update(_provider, _chat_id, _output, _stream_id), do: :ok
+  def bridge_stream_update(_provider, _chat_id, _output, _stream_id, _metadata), do: :ok
 
   @doc "Mark a live stream finished. The final persisted message carries the content."
   def finish_stream(provider, chat_id, stream_id) do
@@ -1255,12 +1268,13 @@ defmodule Vibe.AI.LocalAgentWorker do
     decoded
     |> Enum.with_index()
     |> Enum.flat_map(fn {event, index} ->
+      item = codex_event_item(event)
+
       cond do
-        is_map(map_value(event, "item")) ->
-          item = map_value(event, "item")
+        is_map(item) ->
           type = codex_item_type(item) || ""
 
-          if type in ["agent_message", "reasoning"] do
+          if type in ["agent_message", "reasoning", "message"] do
             []
           else
             [codex_tool_event(event, item, type, index)]
@@ -1276,6 +1290,21 @@ defmodule Vibe.AI.LocalAgentWorker do
     |> compact_tool_events()
   end
 
+  defp codex_event_item(event) when is_map(event) do
+    cond do
+      is_map(map_value(event, "item")) ->
+        map_value(event, "item")
+
+      normalize_string(event["type"]) == "response_item" and is_map(event["payload"]) ->
+        event["payload"]
+
+      true ->
+        nil
+    end
+  end
+
+  defp codex_event_item(_), do: nil
+
   defp codex_item_type(item) when is_map(item) do
     normalize_string(item["item_type"]) || normalize_string(item["type"])
   end
@@ -1290,7 +1319,8 @@ defmodule Vibe.AI.LocalAgentWorker do
 
     %{
       "id" =>
-        normalize_string(item["id"]) ||
+        normalize_string(item["call_id"]) ||
+          normalize_string(item["id"]) ||
           normalize_string(event["id"]) ||
           unique_event_id("codex-tool", index),
       "provider" => "codex",
@@ -1366,6 +1396,17 @@ defmodule Vibe.AI.LocalAgentWorker do
     {label, input, item["result"] || item["output"] || item["content"]}
   end
 
+  defp codex_item_fields("function_call", item) do
+    name = normalize_string(item["name"]) || normalize_string(item["tool"]) || "tool"
+    input = codex_decode_arguments(item["arguments"])
+    {codex_function_tool_name(name, input), input, nil}
+  end
+
+  defp codex_item_fields("function_call_output", item) do
+    output = item["output"] || item["result"] || item["content"]
+    {"Tool result", %{}, output}
+  end
+
   defp codex_item_fields("todo_list", item) do
     {"TodoWrite", %{"todos" => item["items"] || item["todos"] || []}, nil}
   end
@@ -1402,9 +1443,30 @@ defmodule Vibe.AI.LocalAgentWorker do
       is_binary(item["command"]) -> normalize_string(item["command"])
       is_list(item["command"]) -> item["command"] |> Enum.join(" ") |> normalize_string()
       is_binary(item["cmd"]) -> normalize_string(item["cmd"])
+      is_map(item["input"]) and is_binary(item["input"]["cmd"]) -> normalize_string(item["input"]["cmd"])
+      is_map(item["input"]) and is_binary(item["input"]["command"]) -> normalize_string(item["input"]["command"])
       true -> nil
     end
   end
+
+  defp codex_decode_arguments(arguments) when is_map(arguments), do: arguments
+
+  defp codex_decode_arguments(arguments) when is_binary(arguments) do
+    case Jason.decode(arguments) do
+      {:ok, decoded} when is_map(decoded) -> decoded
+      _ -> %{"arguments" => arguments}
+    end
+  end
+
+  defp codex_decode_arguments(_), do: %{}
+
+  defp codex_function_tool_name("exec_command", input) do
+    if codex_command_string(%{"input" => input}), do: "Bash", else: "exec_command"
+  end
+
+  defp codex_function_tool_name("apply_patch", _input), do: "Edit"
+  defp codex_function_tool_name("view_image", _input), do: "ViewImage"
+  defp codex_function_tool_name(name, _input), do: name
 
   defp codex_file_change_paths(item) do
     case item["changes"] do
@@ -1477,6 +1539,7 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   defp codex_item_status(event, item) do
     envelope = (normalize_string(event["type"]) || "") |> String.downcase()
+    item_type = (codex_item_type(item) || "") |> String.downcase()
     item_status = (normalize_string(item["status"]) || "") |> String.downcase()
     exit_code = item["exit_code"]
 
@@ -1484,6 +1547,7 @@ defmodule Vibe.AI.LocalAgentWorker do
       is_integer(exit_code) and exit_code != 0 -> "failed"
       String.contains?(item_status, ["fail", "error", "abort", "interrupt", "not_found"]) -> "failed"
       envelope in ["turn.failed", "error", "thread.failed"] -> "failed"
+      item_type in ["function_call_output"] -> "done"
       String.contains?(item_status, ["complete", "done", "success"]) -> "done"
       envelope in ["item.completed", "turn.completed"] -> "done"
       is_integer(exit_code) and exit_code == 0 -> "done"
@@ -1497,15 +1561,34 @@ defmodule Vibe.AI.LocalAgentWorker do
     {events_by_id, order} =
       Enum.reduce(events, {%{}, []}, fn event, {events_by_id, order} ->
         id = event["id"]
+        merged = merge_tool_event(Map.get(events_by_id, id), event)
 
-        {Map.merge(Map.get(events_by_id, id, %{}), event)
-         |> then(&Map.put(events_by_id, id, &1)), append_once(order, id)}
+        {Map.put(events_by_id, id, merged), append_once(order, id)}
       end)
 
     order
     |> Enum.uniq()
     |> Enum.map(&Map.fetch!(events_by_id, &1))
   end
+
+  defp merge_tool_event(nil, event), do: event
+
+  defp merge_tool_event(existing, event) do
+    Map.merge(existing, event, fn
+      "tool", old, "Tool result" -> old
+      "label", old, new -> if generic_tool_result_label?(new), do: old, else: new
+      "input", old, new when is_map(new) and map_size(new) == 0 -> old
+      "kind", old, nil -> old
+      "target", old, nil -> old
+      _key, _old, new -> new
+    end)
+  end
+
+  defp generic_tool_result_label?(value) when is_binary(value) do
+    String.downcase(value) in ["tool result", "codex tool result"]
+  end
+
+  defp generic_tool_result_label?(_), do: false
 
   defp available_tools_from_decoded(%{handle: "claude"}, decoded) do
     decoded
