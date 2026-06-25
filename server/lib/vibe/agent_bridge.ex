@@ -319,6 +319,21 @@ defmodule Vibe.AgentBridge do
     end
   end
 
+  @doc """
+  Ask a user's connected bridge daemon for the agent's local conversation
+  history (Claude Code / Codex session logs). The daemon reads its session
+  store read-only and replies with a `history_result` over the bridge channel,
+  which the channel relays back to the requesting phone.
+  """
+  def dispatch_history(user_id, payload) when is_binary(user_id) and is_map(payload) do
+    if online?(user_id) do
+      VibeWeb.Endpoint.broadcast(topic(user_id), "history_request", payload)
+      :ok
+    else
+      {:error, :offline}
+    end
+  end
+
   # ── Helpers ─────────────────────────────────────────────────────────
 
   defp hash_token(token), do: :crypto.hash(:sha256, token) |> Base.encode16(case: :lower)

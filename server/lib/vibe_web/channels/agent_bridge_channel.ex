@@ -127,6 +127,23 @@ defmodule VibeWeb.AgentBridgeChannel do
     {:reply, :ok, clear_stream(socket, chat_id, provider)}
   end
 
+  # daemon → server: the agent's local conversation history (Claude/Codex
+  # session logs) in reply to a phone-issued `history_request`. We relay it to
+  # the requesting chat so the Claude/Codex profile can render it.
+  def handle_in("history_result", payload, socket) when is_map(payload) do
+    chat_id = payload["chatId"] || payload["chat_id"]
+
+    if is_binary(chat_id) and chat_id != "" do
+      VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-bridge-history", payload)
+    else
+      Logger.info(
+        "[AgentBridge] history_result without chatId user=#{socket.assigns.user_id} requestId=#{inspect(payload["requestId"])}"
+      )
+    end
+
+    {:reply, :ok, socket}
+  end
+
   # daemon → server: acknowledgement for a phone-issued task control action.
   def handle_in("control_result", payload, socket) do
     Logger.info(

@@ -179,6 +179,32 @@ defmodule VibeWeb.ChatChannel do
   end
 
   @impl true
+  def handle_in("agent-bridge-history", payload, socket) when is_map(payload) do
+    "chat:" <> chat_id = socket.topic
+    user_id = socket.assigns.user_id
+    provider = normalize_bridge_provider(payload["provider"] || payload["agentBridgeProvider"])
+
+    if is_nil(provider) do
+      {:reply, {:error, %{reason: "invalid_provider"}}, socket}
+    else
+      request_payload =
+        %{
+          "requestId" => normalize_bridge_string(payload["requestId"]) || Ecto.UUID.generate(),
+          "provider" => provider,
+          "chatId" => chat_id,
+          "requesterUserId" => user_id,
+          "mode" => normalize_bridge_string(payload["mode"]) || "list"
+        }
+        |> put_optional_string("sessionId", normalize_bridge_string(payload["sessionId"]))
+
+      case AgentBridge.dispatch_history(user_id, request_payload) do
+        :ok -> {:reply, {:ok, %{"requestId" => request_payload["requestId"]}}, socket}
+        {:error, :offline} -> {:reply, {:error, %{reason: "offline"}}, socket}
+      end
+    end
+  end
+
+  @impl true
   def handle_in("typing", payload, socket) do
     broadcast_from!(socket, "typing", payload)
     {:noreply, socket}
