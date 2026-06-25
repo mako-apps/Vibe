@@ -274,10 +274,17 @@ defmodule Vibe.AgentBridge do
     }
   rescue
     _ ->
-      %{connected: false, paired: paired?(user_id), devices: [], repositories: [], runningTasks: []}
+      %{
+        connected: false,
+        paired: paired?(user_id),
+        devices: [],
+        repositories: [],
+        runningTasks: []
+      }
   end
 
-  def status(_), do: %{connected: false, paired: false, devices: [], repositories: [], runningTasks: []}
+  def status(_),
+    do: %{connected: false, paired: false, devices: [], repositories: [], runningTasks: []}
 
   @doc "Normalize daemon-reported status before storing it in Presence metadata."
   def presence_meta(payload) when is_map(payload) do
@@ -286,7 +293,8 @@ defmodule Vibe.AgentBridge do
       "deviceLabel" => normalize(payload["deviceLabel"] || payload["device_label"]) || "computer",
       "cwd" => normalize(payload["cwd"]),
       "repositories" => normalize_repositories(payload["repositories"]),
-      "runningTasks" => normalize_running_tasks(payload["runningTasks"] || payload["running_tasks"]),
+      "runningTasks" =>
+        normalize_running_tasks(payload["runningTasks"] || payload["running_tasks"]),
       "permissions" => normalize_permissions(payload["permissions"])
     }
   end
@@ -390,7 +398,10 @@ defmodule Vibe.AgentBridge do
         meta["deviceLabel"] || meta[:deviceLabel] || meta["device_label"] || "computer",
       "cwd" => meta["cwd"] || meta[:cwd],
       "repositories" => normalize_repositories(meta["repositories"] || meta[:repositories]),
-      "runningTasks" => normalize_running_tasks(meta["runningTasks"] || meta[:runningTasks] || meta["running_tasks"]),
+      "runningTasks" =>
+        normalize_running_tasks(
+          meta["runningTasks"] || meta[:runningTasks] || meta["running_tasks"]
+        ),
       "permissions" => normalize_permissions(meta["permissions"] || meta[:permissions])
     }
   end
@@ -421,17 +432,39 @@ defmodule Vibe.AgentBridge do
     else
       %{
         "provider" => normalize(task["provider"] || task[:provider]),
-        "chatId" => normalize(task["chatId"] || task[:chatId] || task["chat_id"] || task[:chat_id]),
+        "chatId" =>
+          normalize(task["chatId"] || task[:chatId] || task["chat_id"] || task[:chat_id]),
         "taskId" => task_id,
-        "sessionId" => normalize(task["sessionId"] || task[:sessionId] || task["session_id"] || task[:session_id]),
+        "sessionId" =>
+          normalize(
+            task["sessionId"] || task[:sessionId] || task["session_id"] || task[:session_id]
+          ),
         "topic" => normalize(task["topic"] || task[:topic]) || "Running task",
-        "repoId" => normalize(task["repoId"] || task[:repoId] || task["repo_id"] || task[:repo_id]),
-        "repoName" => normalize(task["repoName"] || task[:repoName] || task["repo_name"] || task[:repo_name]),
+        "repoId" =>
+          normalize(task["repoId"] || task[:repoId] || task["repo_id"] || task[:repo_id]),
+        "repoName" =>
+          normalize(task["repoName"] || task[:repoName] || task["repo_name"] || task[:repo_name]),
         "project" => normalize(task["project"] || task[:project] || task["cwd"] || task[:cwd]),
-        "projectName" => normalize(task["projectName"] || task[:projectName] || task["project_name"] || task[:project_name]),
+        "projectName" =>
+          normalize(
+            task["projectName"] || task[:projectName] || task["project_name"] ||
+              task[:project_name]
+          ),
         "cwd" => normalize(task["cwd"] || task[:cwd]),
-        "workMode" => normalize(task["workMode"] || task[:workMode] || task["work_mode"] || task[:work_mode]),
-        "startedAt" => normalize(task["startedAt"] || task[:startedAt] || task["started_at"] || task[:started_at])
+        "workMode" =>
+          normalize(task["workMode"] || task[:workMode] || task["work_mode"] || task[:work_mode]),
+        "startedAt" =>
+          normalize(
+            task["startedAt"] || task[:startedAt] || task["started_at"] || task[:started_at]
+          ),
+        "durationMs" =>
+          task["durationMs"] || task[:durationMs] || task["duration_ms"] || task[:duration_ms],
+        "command" => normalize(task["command"] || task[:command]),
+        "pendingCommand" =>
+          normalize(
+            task["pendingCommand"] || task[:pendingCommand] || task["pending_command"] ||
+              task[:pending_command]
+          )
       }
     end
   end

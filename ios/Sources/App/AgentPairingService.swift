@@ -1,4 +1,94 @@
+import CryptoKit
 import Foundation
+
+/// End-to-end decryption for the agent runtime payload (file diffs / patches).
+///
+/// The bridge encrypts the runtime blob with a 32-byte key shared only with this
+/// phone — handed over during pairing through the QR, which the Vibe server never
+/// sees. We keep that key in the Keychain and decrypt locally so the
+/// "files changed" card can render. The server only ever holds opaque ciphertext.
+enum AgentRuntimeCrypto {
+  /// Keychain account for the shared runtime key (base64 of 32 bytes).
+  static let keychainAccount = "agentBridge.runtimeKey"
+  private static let blobPrefix = "arte1"
+
+  // The key is read on a hot path (every agent row with an encrypted blob), so
+  // cache it in memory and only fall back to the Keychain on a cold miss.
+  private static let cacheQueue = DispatchQueue(label: "agentRuntimeCrypto.key")
+  private static var cachedKey: Data?
+  private static var cacheLoaded = false
+
+  private static func keyData() -> Data? {
+    cacheQueue.sync {
+      if !cacheLoaded {
+        cacheLoaded = true
+        if let b64 = SecureKeyStore.shared.retrieveSecret(key: keychainAccount),
+          let data = Data(base64Encoded: b64), data.count == 32
+        {
+          cachedKey = data
+        }
+      }
+      return cachedKey
+    }
+  }
+
+  /// Persist a runtime key (base64, 32 bytes) handed over by the bridge.
+  @discardableResult
+  static func storeKey(_ base64Key: String) -> Bool {
+    let trimmed = base64Key.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let data = Data(base64Encoded: trimmed), data.count == 32 else { return false }
+    let ok = SecureKeyStore.shared.storeSecret(key: keychainAccount, value: trimmed)
+    if ok { cacheQueue.sync { cachedKey = data; cacheLoaded = true } }
+    return ok
+  }
+
+  static var hasKey: Bool { keyData() != nil }
+
+  /// Extract a runtime key from a scanned QR payload, if one is present: the
+  /// dedicated `vibegram-rk:<b64>` sync QR, or the `#<b64>` fragment of a
+  /// `vibegram-pair:<id>#<b64>` pairing QR.
+  static func runtimeKey(fromScanned payload: String) -> String? {
+    let trimmed = payload.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.hasPrefix("vibegram-rk:") {
+      let key = String(trimmed.dropFirst("vibegram-rk:".count))
+      return key.isEmpty ? nil : key
+    }
+    if trimmed.hasPrefix("vibegram-pair:"), let hash = trimmed.firstIndex(of: "#") {
+      let key = String(trimmed[trimmed.index(after: hash)...])
+      return key.isEmpty ? nil : key
+    }
+    return nil
+  }
+
+  /// Decrypt an `arte1.<iv>.<ct>.<tag>` blob into the runtime dictionary. Returns
+  /// nil when there's no key, the envelope is malformed, or authentication fails.
+  static func decrypt(_ blob: Any?) -> [String: Any]? {
+    guard let blob = blob as? String else { return nil }
+    let parts = blob.split(separator: ".", omittingEmptySubsequences: false).map(String.init)
+    guard parts.count == 4, parts[0] == blobPrefix else { return nil }
+    guard let key = keyData(),
+      let iv = base64urlDecode(parts[1]),
+      let ct = base64urlDecode(parts[2]),
+      let tag = base64urlDecode(parts[3])
+    else { return nil }
+    do {
+      let box = try AES.GCM.SealedBox(
+        nonce: try AES.GCM.Nonce(data: iv), ciphertext: ct, tag: tag)
+      let plaintext = try AES.GCM.open(box, using: SymmetricKey(data: key))
+      return try JSONSerialization.jsonObject(with: plaintext) as? [String: Any]
+    } catch {
+      return nil
+    }
+  }
+
+  private static func base64urlDecode(_ value: String) -> Data? {
+    var str = value.replacingOccurrences(of: "-", with: "+").replacingOccurrences(
+      of: "_", with: "/")
+    let remainder = str.count % 4
+    if remainder > 0 { str += String(repeating: "=", count: 4 - remainder) }
+    return Data(base64Encoded: str)
+  }
+}
 
 struct AgentBridgeRepository: Hashable, Identifiable {
   let id: String
@@ -318,8 +408,15 @@ enum AgentPairingService {
     let trimmed = payload.trimmingCharacters(in: .whitespacesAndNewlines)
     let prefix = "vibegram-pair:"
     guard trimmed.hasPrefix(prefix) else { return nil }
-    let id = String(trimmed.dropFirst(prefix.count))
-    return id.isEmpty ? nil : id
+    var body = String(trimmed.dropFirst(prefix.count))
+    // The pairing QR may carry the E2E runtime key in a `#<b64>` fragment. Capture
+    // it (server-blind) and keep only the request id.
+    if let hash = body.firstIndex(of: "#") {
+      let key = String(body[body.index(after: hash)...])
+      if !key.isEmpty { AgentRuntimeCrypto.storeKey(key) }
+      body = String(body[..<hash])
+    }
+    return body.isEmpty ? nil : body
   }
 
   // MARK: - URL building

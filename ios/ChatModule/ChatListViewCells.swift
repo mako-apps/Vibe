@@ -1413,13 +1413,19 @@ private func bubbleParsedBlocks(for row: ChatListRow) -> [AgentParsedBlock] {
   let payload = bubbleBaseText(for: row)
   var blocks = ChatNativeAgentTextRenderer.parseBlocks(payload.text)
   func appendRuntimeIfNeeded() {
-    guard let runtime = row.agentRuntime else { return }
+    guard let runtime = row.agentRuntime else {
+      if row.isAgentMessage {
+        NSLog("[AgentView] chatCell blocks: msg=\(row.messageId ?? row.key) runtime=nil -> NO card block (plain text only)")
+      }
+      return
+    }
     if blocks.contains(where: { block in
       if case .agentRuntime = block { return true }
       return false
     }) {
       return
     }
+    NSLog("[AgentView] chatCell blocks: msg=\(row.messageId ?? row.key) appended card block files=\(runtime.diff?.files.count ?? -1) +\(runtime.diff?.additions ?? -1)/-\(runtime.diff?.deletions ?? -1) patchLen=\(runtime.diff?.patch?.count ?? -1)")
     blocks.append(.agentRuntime(runtime))
   }
 

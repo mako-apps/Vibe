@@ -16,6 +16,7 @@ final class AgentConnectModel: ObservableObject {
   @Published var isScanning = false
   @Published var isAuthorizing = false
   @Published var didAuthorize = false
+  @Published var didSyncRuntimeKey = false
   @Published var errorMessage: String?
   @Published var selectedRepository: AgentBridgeRepository?
 
@@ -83,6 +84,20 @@ final class AgentConnectModel: ObservableObject {
   /// (authenticated) account, binding the computer to the user.
   func handleScanned(_ payload: String) {
     isScanning = false
+    // A dedicated key-sync QR (`vibegram-rk:…`) only hands over the E2E runtime
+    // key for an already-paired computer — store it, no authorize needed.
+    let trimmed = payload.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.hasPrefix("vibegram-rk:"),
+      let key = AgentRuntimeCrypto.runtimeKey(fromScanned: payload)
+    {
+      if AgentRuntimeCrypto.storeKey(key) {
+        errorMessage = nil
+        didSyncRuntimeKey = true
+      } else {
+        errorMessage = "That key QR couldn't be read. Re-run the bridge with --show-key."
+      }
+      return
+    }
     guard let requestId = AgentPairingService.requestId(fromScanned: payload) else {
       errorMessage =
         "That isn't a Vibe pairing code. On your computer run the bridge and scan the QR it shows."
@@ -195,6 +210,13 @@ struct AgentConnectPanel: View {
         Text(errorMessage)
           .font(.system(size: 12))
           .foregroundStyle(.red)
+          .frame(maxWidth: .infinity, alignment: .leading)
+      }
+
+      if model.didSyncRuntimeKey {
+        Text("Encryption key synced — agent file-changes will now show on this phone.")
+          .font(.system(size: 12))
+          .foregroundStyle(.green)
           .frame(maxWidth: .infinity, alignment: .leading)
       }
 

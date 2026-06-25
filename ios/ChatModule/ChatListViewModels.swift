@@ -862,9 +862,29 @@ struct ChatListRow {
     agentCard =
       AgentCard.parse(message["agentCard"] as? [String: Any] ?? [:])
       ?? AgentCard.parse(metadata?["agentCard"] as? [String: Any] ?? [:])
-    agentRuntime = parseAgentRuntimeSummary(
+    let rawAgentRuntimeForLog =
       metadata?["agentRuntime"] ?? metadata?["agent_runtime"] ?? message["agentRuntime"]
-        ?? message["agent_runtime"])
+        ?? message["agent_runtime"]
+    if metadata?["agentWorker"] != nil || rawAgentRuntimeForLog != nil {
+      NSLog(
+        "[AgentView] rowparse msg=\(parseNonEmptyString(message["id"] ?? message["messageId"]) ?? "?") "
+          + "agentWorker=\(metadata?["agentWorker"] ?? "nil") via=\(metadata?["agentWorkerVia"] ?? "nil") "
+          + "rawRuntime?=\(rawAgentRuntimeForLog != nil) metaKeys=\((metadata ?? [:]).keys.sorted()) "
+          + "progressNodes=\((metadata?["progressNodes"] as? [[String: Any]])?.count ?? -1)")
+    }
+    // New bridges send the runtime end-to-end encrypted (`agentRuntimeEnc`); the
+    // server stores only opaque ciphertext. Decrypt locally with the paired key.
+    // Falls back to the legacy plaintext `agentRuntime` for older messages.
+    let decryptedRuntime = AgentRuntimeCrypto.decrypt(
+      metadata?["agentRuntimeEnc"] ?? message["agentRuntimeEnc"])
+    if metadata?["agentRuntimeEnc"] != nil || message["agentRuntimeEnc"] != nil {
+      NSLog(
+        "[AgentView] rowparse enc present decrypted=\(decryptedRuntime != nil) hasKey=\(AgentRuntimeCrypto.hasKey)"
+      )
+    }
+    agentRuntime =
+      parseAgentRuntimeSummary(rawAgentRuntimeForLog)
+      ?? parseAgentRuntimeSummary(decryptedRuntime)
     relatedMessageIds = uniqueStrings(
       parseStringArray(metadata?["relatedMessageIds"])
         + parseStringArray(metadata?["related_message_ids"])
@@ -1251,8 +1271,12 @@ private func parseAgentProgressNodes(_ raw: Any?) -> [ChatListRow.AgentProgressN
 }
 
 private func parseAgentRuntimeSummary(_ raw: Any?) -> ChatListRow.AgentRuntimeSummary? {
-  guard let object = raw as? [String: Any] else { return nil }
+  guard let object = raw as? [String: Any] else {
+    NSLog("[AgentView] parseRuntime: raw is NOT a dict (type=\(raw.map { String(describing: type(of: $0)) } ?? "nil")) -> nil (no card)")
+    return nil
+  }
   let diff = parseAgentRuntimeDiff(object["diff"])
+  NSLog("[AgentView] parseRuntime: keys=\(object.keys.sorted()) status=\(object["status"] ?? "nil") diff?=\(diff != nil) files=\(diff?.files.count ?? -1) +\(diff?.additions ?? -1)/-\(diff?.deletions ?? -1) patchLen=\(diff?.patch?.count ?? -1) rawDiffType=\(object["diff"].map { String(describing: type(of: $0)) } ?? "nil")")
   let command = parseAgentRuntimeCommand(object["command"])
   let controls = parseAgentRuntimeControls(object["controls"])
   let usage = parseAgentRuntimeUsage(object["usage"])

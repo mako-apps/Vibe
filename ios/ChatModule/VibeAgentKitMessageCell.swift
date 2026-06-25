@@ -333,6 +333,7 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     onTap: ((ChatListRow.AgentRuntimeSummary) -> Void)?
   ) {
     guard let runtime else {
+      NSLog("[AgentView] cell.configureRuntimeSummary: runtime=nil -> card HIDDEN")
       runtimeSummaryView.onTap = nil
       runtimeSummaryView.isHidden = true
       runtimeHeightConstraint?.constant = 0.0
@@ -344,6 +345,7 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
       textColor: textColor,
       availableWidth: availableWidth
     )
+    NSLog("[AgentView] cell.configureRuntimeSummary: card SHOWN files=\(runtime.diff?.files.count ?? -1) +\(runtime.diff?.additions ?? -1)/-\(runtime.diff?.deletions ?? -1) patchLen=\(runtime.diff?.patch?.count ?? -1) height=\(height) width=\(availableWidth)")
     runtimeSummaryView.isHidden = false
     runtimeHeightConstraint?.constant = height
   }

@@ -359,6 +359,11 @@ defmodule Vibe.AI.LocalAgentWorker do
         reply_to_id = Keyword.get(opts, :reply_to_id)
         requester_user_id = Keyword.get(opts, :requester_user_id)
         runtime = normalize_runtime_payload(Keyword.get(opts, :runtime))
+        # End-to-end encrypted runtime blob. Opaque to the server: stored and
+        # served verbatim, never decrypted, parsed, or logged. The key lives
+        # only on the user's bridge and phone.
+        runtime_enc = normalize_runtime_enc(Keyword.get(opts, :runtime_enc))
+        runtime_can_revert = Keyword.get(opts, :can_revert) == true
         extracted = extract_result(worker, output)
         progress_nodes = progress_nodes_with_runtime(extracted.progress_nodes, runtime)
         ok = exit_status == 0
@@ -396,6 +401,8 @@ defmodule Vibe.AI.LocalAgentWorker do
             "progressNodes" => progress_nodes
           }
           |> maybe_put("agentRuntime", runtime)
+          |> maybe_put("agentRuntimeEnc", runtime_enc)
+          |> maybe_put("agentRuntimeCanRevert", if(runtime_can_revert, do: true))
 
         result =
           post_worker_message(
@@ -1729,6 +1736,19 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   defp normalize_runtime_payload(_), do: nil
+
+  # The E2E runtime blob is opaque ciphertext (key lives only on the bridge +
+  # phone). Accept only the expected envelope ("arte1.") within a sane size;
+  # never inspect, parse, or log the contents.
+  defp normalize_runtime_enc(value) when is_binary(value) do
+    if String.starts_with?(value, "arte1.") and byte_size(value) <= 200_000 do
+      value
+    else
+      nil
+    end
+  end
+
+  defp normalize_runtime_enc(_), do: nil
 
   defp normalize_runtime_command(command) when is_map(command) do
     %{}

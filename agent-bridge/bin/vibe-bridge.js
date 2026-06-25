@@ -69,6 +69,8 @@ function parseArgs(argv) {
     else if (a === "--self-test-sequence") out.selfTestSequence = true;
     else if (a === "--provider") out.provider = argv[++i];
     else if (a === "--prompt") out.prompt = argv[++i];
+    else if (a === "--rk") out.rk = argv[++i];
+    else if (a === "--show-key") out.showKey = true;
     else if (a === "--work-mode") out.workMode = argv[++i];
     else if (a === "--service-run") out.serviceRun = true;
     else if (a === "-h" || a === "--help") out.help = true;
@@ -89,6 +91,70 @@ function loadConfig() {
 function saveConfig(obj) {
   fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(obj, null, 2), { mode: 0o600 });
+}
+
+// ── End-to-end runtime encryption (zero-knowledge server) ────────────
+// The runtime payload (diffs, patches, file paths, command output) is the
+// user's real source code. The Vibe server must never be able to read it. The
+// bridge encrypts it with a 32-byte key (AES-256-GCM) shared ONLY with the
+// phone, over the pairing QR — a phone↔desktop visual channel the server never
+// sees. The server stores/relays the opaque ciphertext and cannot decrypt it.
+// Matches the iOS reader: "arte1.<ivB64url>.<ctB64url>.<tagB64url>".
+let RUNTIME_KEY_B64 = null;
+const RUNTIME_BLOB_PREFIX = "arte1";
+
+function isValidRuntimeKeyB64(b64) {
+  try {
+    return Buffer.from(String(b64 || ""), "base64").length === 32;
+  } catch (_) {
+    return false;
+  }
+}
+
+// Establish the per-pairing runtime key. Priority: explicit --rk handed over by
+// the phone's pairing QR, then the cached key, otherwise generate a fresh one.
+function ensureRuntimeKey(config) {
+  if (ARGS.rk && isValidRuntimeKeyB64(ARGS.rk)) {
+    config.runtime_key = Buffer.from(ARGS.rk, "base64").toString("base64");
+  }
+  if (!isValidRuntimeKeyB64(config.runtime_key)) {
+    config.runtime_key = crypto.randomBytes(32).toString("base64");
+  }
+  RUNTIME_KEY_B64 = config.runtime_key;
+  return RUNTIME_KEY_B64;
+}
+
+function runtimeKeyQRPayload() {
+  return `vibegram-rk:${RUNTIME_KEY_B64}`;
+}
+
+function encryptRuntimeBlob(obj) {
+  if (!RUNTIME_KEY_B64) return null;
+  try {
+    const key = Buffer.from(RUNTIME_KEY_B64, "base64");
+    if (key.length !== 32) return null;
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+    const pt = Buffer.from(JSON.stringify(obj), "utf8");
+    const ct = Buffer.concat([cipher.update(pt), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    const b = (buf) => buf.toString("base64url");
+    return [RUNTIME_BLOB_PREFIX, b(iv), b(ct), b(tag)].join(".");
+  } catch (err) {
+    console.error("[vibe-bridge] runtime encrypt failed:", err.message);
+    return null;
+  }
+}
+
+// What to attach to a `result` push for the runtime payload. When a key is
+// present we send ONLY the encrypted blob (plus a non-sensitive `canRevert`
+// boolean the server/self-test need); the server never receives the plaintext
+// diff. With no key we still send no plaintext — the card just stays hidden
+// until the phone syncs the key.
+function runtimeResultField(agentRuntime) {
+  const canRevert = !!(agentRuntime && agentRuntime.controls && agentRuntime.controls.canRevert);
+  const enc = encryptRuntimeBlob(agentRuntime);
+  return enc ? { agentRuntimeEnc: enc, canRevert } : { canRevert };
 }
 
 function normalizeServer(url) {
@@ -215,6 +281,16 @@ function defaultDiscoveryRoots() {
   ].filter((dir) => realDir(dir));
 }
 
+function hasExplicitRepositorySelection() {
+  return !!(
+    ARGS.repos.length ||
+    ARGS.repoRoots.length ||
+    ARGS.cwd ||
+    splitEnvList(process.env.VIBE_BRIDGE_REPOS).length ||
+    splitEnvList(process.env.VIBE_BRIDGE_REPO_ROOTS).length
+  );
+}
+
 function buildRepositories(extraRepos = []) {
   const map = new Map();
 
@@ -240,7 +316,7 @@ function buildRepositories(extraRepos = []) {
 
   // The current working tree is a sensible fallback only when nothing else was
   // chosen — otherwise we'd silently re-add e.g. the folder the daemon ran from.
-  if (map.size === 0) {
+  if (map.size === 0 && !hasExplicitRepositorySelection()) {
     const defaultCwd = realDir(ARGS.cwd || process.cwd()) || process.cwd();
     addRepository(map, defaultCwd, "cwd");
   }
@@ -311,7 +387,10 @@ async function scanToPair(server, label) {
   console.log(
     "\n[vibe-bridge] In Vibe on your phone: open Claude or Codex → Connect → Scan, then scan this:\n"
   );
-  renderQR(`vibegram-pair:${request_id}`);
+  // The QR carries the public request_id plus the end-to-end runtime key in the
+  // fragment. The key never reaches the server (the phone authorizes by
+  // request_id only); it travels phone-ward purely over this scanned QR.
+  renderQR(`vibegram-pair:${request_id}#${RUNTIME_KEY_B64 || ""}`);
   console.log(`[vibe-bridge] Waiting for your phone to authorize (expires in ${expires_in}s)…`);
 
   const deadline = Date.now() + expires_in * 1000;
@@ -1077,7 +1156,7 @@ function runBridgeCommand(channel, task, repo, beforeGit, command) {
     repoName: repo.name,
     cwd: repo.cwd || repo.path,
     workMode: workModeFor(task),
-    agentRuntime,
+    ...runtimeResultField(agentRuntime),
   });
   return true;
 }
@@ -1263,6 +1342,7 @@ function bridgeStatusPayload() {
 }
 
 function runningTaskSummaries() {
+  const now = Date.now();
   return Array.from(runningTasks.values()).map((entry) => ({
     provider: entry.provider,
     chatId: entry.chatId,
@@ -1277,7 +1357,9 @@ function runningTaskSummaries() {
     workMode: entry.workMode,
     model: entry.model || null,
     startedAt: new Date(entry.startedAt).toISOString(),
+    durationMs: Math.max(0, now - (entry.startedAt || now)),
     command: entry.command,
+    pendingCommand: entry.command,
   }));
 }
 
@@ -1373,12 +1455,7 @@ async function pickRepositoriesInteractively() {
 // `--pick`). Persists the chosen paths so later launches (incl. the background
 // service) reuse them without asking.
 async function resolveRepositories(config, persist) {
-  const explicit =
-    ARGS.repos.length ||
-    ARGS.repoRoots.length ||
-    ARGS.cwd ||
-    splitEnvList(process.env.VIBE_BRIDGE_REPOS).length ||
-    splitEnvList(process.env.VIBE_BRIDGE_REPO_ROOTS).length;
+  const explicit = hasExplicitRepositorySelection();
 
   let picked = !explicit && Array.isArray(config.repos) ? config.repos.slice() : [];
 
@@ -1397,6 +1474,9 @@ async function resolveRepositories(config, persist) {
   }
 
   ADVERTISED_REPOSITORIES = buildRepositories(picked);
+  if (explicit && ADVERTISED_REPOSITORIES.length === 0) {
+    throw new Error("No valid repositories matched --repo/--cwd/--repo-root. Refusing to fall back to the current folder.");
+  }
   DEFAULT_CWD =
     (ADVERTISED_REPOSITORIES[0] && ADVERTISED_REPOSITORIES[0].cwd) ||
     realDir(ARGS.cwd || process.cwd()) ||
@@ -1720,7 +1800,7 @@ function runTask(channel, task) {
       repoName: repo.name,
       cwd,
       workMode: workModeFor(task),
-      agentRuntime,
+      ...runtimeResultField(agentRuntime),
     });
   });
 
@@ -2210,7 +2290,11 @@ async function runSelfTest() {
       state: "joined",
       push(event, payload) {
         console.log(JSON.stringify({ event, payload }));
-        if (event === "result" && shouldRevert && payload.agentRuntime?.controls?.canRevert) {
+        if (
+          event === "result" &&
+          shouldRevert &&
+          (payload.canRevert || payload.agentRuntime?.controls?.canRevert)
+        ) {
           awaitingRevert = true;
           controlTask(channel, {
             action: "revert",
@@ -2311,6 +2395,20 @@ async function main() {
   }
   config.server = server;
 
+  // Establish the end-to-end runtime key before any pairing, so the pairing QR
+  // can hand it to the phone (server never sees it). Generated once, cached.
+  ensureRuntimeKey(config);
+  persist();
+
+  if (ARGS.showKey) {
+    console.log(
+      "\n[vibe-bridge] In Vibe (Claude/Codex → Connect → Sync key), scan this to view\n" +
+        "encrypted agent file-changes on your phone. The server can't read it.\n"
+    );
+    renderQR(runtimeKeyQRPayload());
+    return;
+  }
+
   // Background-service management (no socket needed).
   if (ARGS.uninstall) return uninstallService();
   if (ARGS.status) return serviceStatus();
@@ -2327,6 +2425,13 @@ async function main() {
     config.user_id = result.user_id;
     persist();
     console.log("[vibe-bridge] paired ✓ (token cached in ~/.vibe/bridge.json)");
+    if (!ARGS.rk) {
+      console.log(
+        "\n[vibe-bridge] To view encrypted agent file-changes on your phone, scan this in\n" +
+          "Vibe (Claude/Codex → Connect → Sync key). The server can't read it.\n"
+      );
+      renderQR(runtimeKeyQRPayload());
+    }
   }
 
   if (

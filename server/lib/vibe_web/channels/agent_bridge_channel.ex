@@ -136,7 +136,12 @@ defmodule VibeWeb.AgentBridgeChannel do
             duration_ms,
             reply_to_id: reply_to_id,
             requester_user_id: requester_user_id,
-            runtime: payload["agentRuntime"] || payload["agent_runtime"]
+            runtime: payload["agentRuntime"] || payload["agent_runtime"],
+            # End-to-end encrypted runtime blob. The server stores/relays this
+            # verbatim and can never decrypt it (key lives only on the bridge +
+            # phone). Never parse, normalize, or log its contents.
+            runtime_enc: payload["agentRuntimeEnc"] || payload["agent_runtime_enc"],
+            can_revert: payload["canRevert"] || payload["can_revert"] || false
           )
         rescue
           err ->

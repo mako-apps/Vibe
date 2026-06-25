@@ -67,6 +67,12 @@ enum VibeAgentKitMap {
     let items = row.isAgentMessage
       ? row.agentProgressNodes.filter { $0.depth == 0 }.map(progressItem(from:))
       : []
+    if row.isAgentMessage {
+      NSLog(
+        "[AgentView] map.chatMessage id=\(row.messageId ?? row.key) isUser=\(isUser) "
+          + "runtime?=\(row.agentRuntime != nil) diffFiles=\(row.agentRuntime?.diff?.files.count ?? -1) "
+          + "progressNodes(total=\(row.agentProgressNodes.count), depth0=\(items.count)) bodyLen=\(body.count)")
+    }
     return VibeAgentKitChatMessage(
       id: row.messageId ?? row.key,
       role: isUser ? .user : .assistant,
