@@ -410,6 +410,10 @@ final class ChatEngine {
   // Stable first-seen timestamp for each live agent stream (keyed chatId -> streamId)
   // so the streaming bubble keeps its position while its text grows.
   private var agentStreamTimestampsByChat: [String: [String: Int64]] = [:]
+  // Latest agent-bridge history payload (Claude/Codex local session logs) per
+  // chat, keyed chatId -> payload. The Claude/Codex profile requests it and
+  // observes `didChangeNotification` with reason "agentBridgeHistory".
+  private var agentBridgeHistoryByChat: [String: [String: Any]] = [:]
   private var nativeRecordingStateByChatId: [String: Bool] = [:]
   private var pinnedMessagesByChatId: [String: [[String: Any]]] = [:]
   private var pinnedFetchInFlightChatIds = Set<String>()
@@ -1081,6 +1085,7 @@ final class ChatEngine {
       nativeTypingStateByChatId.removeAll()
       peerTypingUserIdsByChatId.removeAll()
       agentProgressByChatId.removeAll()
+      agentBridgeHistoryByChat.removeAll()
       nativeRecordingStateByChatId.removeAll()
       pinnedMessagesByChatId.removeAll()
       pinnedFetchInFlightChatIds.removeAll()
@@ -1644,6 +1649,67 @@ final class ChatEngine {
       )
       return ["accepted": true, "transport": "native", "ref": ref]
     }
+  }
+
+  /// Ask the connected computer for the agent's own Claude/Codex conversation
+  /// history. `mode` is "list" (topic summaries) or "detail" (a transcript for
+  /// `sessionId`). The reply arrives asynchronously as a `didChange`
+  /// notification with reason "agentBridgeHistory"; read it via
+  /// `latestAgentBridgeHistory(chatId:)`.
+  func requestAgentBridgeHistory(_ payload: [String: Any]) -> [String: Any] {
+    let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"])
+    let provider = normalizedString(payload["provider"] ?? payload["agentBridgeProvider"])
+    let mode = normalizedString(payload["mode"]) ?? "list"
+    let sessionId = normalizedString(payload["sessionId"] ?? payload["session_id"])
+    let requestId = normalizedString(payload["requestId"]) ?? UUID().uuidString
+
+    guard let chatId, !chatId.isEmpty else {
+      return ["accepted": false, "reason": "invalid_chat"]
+    }
+    guard let provider, !provider.isEmpty else {
+      return ["accepted": false, "reason": "invalid_provider"]
+    }
+
+    return syncOnQueue {
+      guard let client = phoenixClient else {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+          self?.ensureNativeTransport(trigger: "bridge_history_no_socket")
+        }
+        return ["accepted": false, "reason": "no_native_socket"]
+      }
+      guard nativeJoinedChatIds.contains(chatId), (state["connected"] as? Bool) == true else {
+        joinNativeChatTopicIfNeededLocked(chatId: chatId)
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+          self?.ensureNativeTransport(trigger: "bridge_history_chat_not_joined")
+        }
+        return ["accepted": false, "reason": "chat_not_joined"]
+      }
+
+      var wirePayload: [String: Any] = [
+        "provider": provider,
+        "mode": mode,
+        "requestId": requestId,
+      ]
+      if let sessionId, !sessionId.isEmpty {
+        wirePayload["sessionId"] = sessionId
+      }
+      let ref = client.push(
+        topic: chatTopic(for: chatId),
+        event: "agent-bridge-history",
+        payload: wirePayload
+      )
+      appendJournalLocked(
+        event: "native-agent-bridge-history-request",
+        payload: ["chatId": chatId, "provider": provider, "mode": mode, "ref": ref]
+      )
+      return ["accepted": true, "transport": "native", "ref": ref, "requestId": requestId]
+    }
+  }
+
+  /// The most recent agent-bridge history payload relayed for a chat, if any.
+  func latestAgentBridgeHistory(chatId rawChatId: String) -> [String: Any]? {
+    let chatId = normalizedString(rawChatId) ?? rawChatId
+    return syncOnQueue { agentBridgeHistoryByChat[chatId] }
   }
 
   func retryOutgoingMessage(_ payload: [String: Any]) -> [String: Any] {
@@ -4485,6 +4551,22 @@ final class ChatEngine {
         }
         if frame.event == "agent-stream" {
           self.applyAgentStreamLocked(chatId: chatId, payload: frame.payload)
+          return
+        }
+        if frame.event == "agent-bridge-history" {
+          self.agentBridgeHistoryByChat[chatId] = frame.payload
+          let mode = self.normalizedString(frame.payload["mode"]) ?? "list"
+          let provider = self.normalizedString(frame.payload["provider"]) ?? ""
+          let requestId = self.normalizedString(frame.payload["requestId"]) ?? ""
+          self.postChangeLocked(
+            reason: "agentBridgeHistory",
+            userInfo: [
+              "chatId": chatId,
+              "provider": provider,
+              "mode": mode,
+              "requestId": requestId,
+            ]
+          )
           return
         }
         if frame.event == "typing" || frame.event == "stop-typing" {

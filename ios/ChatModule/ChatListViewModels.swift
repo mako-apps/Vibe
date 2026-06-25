@@ -109,6 +109,25 @@ struct ChatListRow {
     let canRevert: Bool
   }
 
+  struct AgentRuntimeUsage: Equatable {
+    let inputTokens: Int?
+    let cachedInputTokens: Int?
+    let cacheCreationInputTokens: Int?
+    let outputTokens: Int?
+    let reasoningOutputTokens: Int?
+    let totalCostUsd: Double?
+    let durationMs: Int?
+    let durationApiMs: Int?
+    let ttftMs: Int?
+    let ttftStreamMs: Int?
+    let numTurns: Int?
+  }
+
+  struct AgentRuntimeMCPServer: Equatable {
+    let name: String
+    let status: String?
+  }
+
   struct AgentRuntimeSummary: Equatable {
     let taskId: String?
     let provider: String?
@@ -116,6 +135,11 @@ struct ChatListRow {
     let repoName: String?
     let cwd: String?
     let workMode: String?
+    let model: String?
+    let permissionMode: String?
+    let sessionId: String?
+    let threadId: String?
+    let cliVersion: String?
     let durationMs: Int?
     let dirtyBefore: Bool
     let dirtyBeforeCount: Int
@@ -123,6 +147,14 @@ struct ChatListRow {
     let command: AgentRuntimeCommand?
     let diff: AgentRuntimeDiff?
     let controls: AgentRuntimeControls?
+    let usage: AgentRuntimeUsage?
+    let availableTools: [String]
+    let slashCommands: [String]
+    let cliCommands: [String]
+    let providerCommands: [String]
+    let mcpServers: [AgentRuntimeMCPServer]
+    let agents: [String]
+    let skills: [String]
   }
 
   struct AgentCardDestination: Codable, Equatable {
@@ -1223,6 +1255,8 @@ private func parseAgentRuntimeSummary(_ raw: Any?) -> ChatListRow.AgentRuntimeSu
   let diff = parseAgentRuntimeDiff(object["diff"])
   let command = parseAgentRuntimeCommand(object["command"])
   let controls = parseAgentRuntimeControls(object["controls"])
+  let usage = parseAgentRuntimeUsage(object["usage"])
+  let mcpServers = parseAgentRuntimeMCPServers(object["mcpServers"] ?? object["mcp_servers"])
   let status = parseNonEmptyString(object["status"]) ?? "done"
 
   return ChatListRow.AgentRuntimeSummary(
@@ -1232,13 +1266,26 @@ private func parseAgentRuntimeSummary(_ raw: Any?) -> ChatListRow.AgentRuntimeSu
     repoName: parseNonEmptyString(object["repoName"] ?? object["repo_name"]),
     cwd: parseNonEmptyString(object["cwd"]),
     workMode: parseNonEmptyString(object["workMode"] ?? object["work_mode"]),
+    model: parseNonEmptyString(object["model"]),
+    permissionMode: parseNonEmptyString(object["permissionMode"] ?? object["permission_mode"]),
+    sessionId: parseNonEmptyString(object["sessionId"] ?? object["session_id"]),
+    threadId: parseNonEmptyString(object["threadId"] ?? object["thread_id"]),
+    cliVersion: parseNonEmptyString(object["cliVersion"] ?? object["cli_version"]),
     durationMs: parseLong(object["durationMs"] ?? object["duration_ms"]).map { Int($0) },
     dirtyBefore: parseBool(object["dirtyBefore"] ?? object["dirty_before"]) ?? false,
     dirtyBeforeCount: Int(parseLong(object["dirtyBeforeCount"] ?? object["dirty_before_count"]) ?? 0),
     exitStatus: parseLong(object["exitStatus"] ?? object["exit_status"]).map { Int($0) },
     command: command,
     diff: diff,
-    controls: controls
+    controls: controls,
+    usage: usage,
+    availableTools: parseStringArray(object["availableTools"] ?? object["available_tools"]),
+    slashCommands: parseStringArray(object["slashCommands"] ?? object["slash_commands"]),
+    cliCommands: parseStringArray(object["cliCommands"] ?? object["cli_commands"]),
+    providerCommands: parseStringArray(object["providerCommands"] ?? object["provider_commands"]),
+    mcpServers: mcpServers,
+    agents: parseStringArray(object["agents"]),
+    skills: parseStringArray(object["skills"])
   )
 }
 
@@ -1289,6 +1336,42 @@ private func parseAgentRuntimeControls(_ raw: Any?) -> ChatListRow.AgentRuntimeC
   let canRevert = parseBool(object["canRevert"] ?? object["can_revert"]) ?? false
   guard canCancel || canRevert else { return nil }
   return ChatListRow.AgentRuntimeControls(canCancel: canCancel, canRevert: canRevert)
+}
+
+private func parseAgentRuntimeUsage(_ raw: Any?) -> ChatListRow.AgentRuntimeUsage? {
+  guard let object = raw as? [String: Any] else { return nil }
+  let usage = ChatListRow.AgentRuntimeUsage(
+    inputTokens: parseLong(object["inputTokens"] ?? object["input_tokens"]).map { Int($0) },
+    cachedInputTokens: parseLong(object["cachedInputTokens"] ?? object["cached_input_tokens"]).map { Int($0) },
+    cacheCreationInputTokens: parseLong(object["cacheCreationInputTokens"] ?? object["cache_creation_input_tokens"]).map { Int($0) },
+    outputTokens: parseLong(object["outputTokens"] ?? object["output_tokens"]).map { Int($0) },
+    reasoningOutputTokens: parseLong(object["reasoningOutputTokens"] ?? object["reasoning_output_tokens"]).map { Int($0) },
+    totalCostUsd: parseDouble(object["totalCostUsd"] ?? object["total_cost_usd"]),
+    durationMs: parseLong(object["durationMs"] ?? object["duration_ms"]).map { Int($0) },
+    durationApiMs: parseLong(object["durationApiMs"] ?? object["duration_api_ms"]).map { Int($0) },
+    ttftMs: parseLong(object["ttftMs"] ?? object["ttft_ms"]).map { Int($0) },
+    ttftStreamMs: parseLong(object["ttftStreamMs"] ?? object["ttft_stream_ms"]).map { Int($0) },
+    numTurns: parseLong(object["numTurns"] ?? object["num_turns"]).map { Int($0) }
+  )
+  guard usage.inputTokens != nil || usage.cachedInputTokens != nil || usage.outputTokens != nil
+    || usage.reasoningOutputTokens != nil || usage.totalCostUsd != nil || usage.durationMs != nil
+    || usage.durationApiMs != nil || usage.ttftMs != nil || usage.ttftStreamMs != nil
+    || usage.numTurns != nil
+  else {
+    return nil
+  }
+  return usage
+}
+
+private func parseAgentRuntimeMCPServers(_ raw: Any?) -> [ChatListRow.AgentRuntimeMCPServer] {
+  guard let items = raw as? [[String: Any]] else { return [] }
+  return items.compactMap { item in
+    guard let name = parseNonEmptyString(item["name"]) else { return nil }
+    return ChatListRow.AgentRuntimeMCPServer(
+      name: name,
+      status: parseNonEmptyString(item["status"])
+    )
+  }
 }
 
 private func parseStringArray(_ raw: Any?) -> [String] {

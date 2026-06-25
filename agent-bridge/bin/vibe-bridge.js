@@ -65,6 +65,7 @@ function parseArgs(argv) {
     else if (a === "--status") out.status = true;
     else if (a === "--self-test") out.selfTest = true;
     else if (a === "--self-test-revert") out.selfTestRevert = true;
+    else if (a === "--self-test-sequence") out.selfTestSequence = true;
     else if (a === "--provider") out.provider = argv[++i];
     else if (a === "--prompt") out.prompt = argv[++i];
     else if (a === "--work-mode") out.workMode = argv[++i];
@@ -330,6 +331,62 @@ async function scanToPair(server, label) {
 const sessionByChat = new Map(); // chatId -> claude session_id
 const runningTasks = new Map(); // taskKey -> { child, provider, chatId, taskId, startedAt }
 const finishedTasks = new Map(); // taskKey -> { provider, chatId, taskId, repo, runtime, finishedAt }
+const modelBySession = new Map(); // provider:chatId -> model selected from mobile
+const lastRuntimeBySession = new Map(); // provider:chatId -> last completed runtime payload
+const capabilitiesByProvider = new Map(); // provider -> latest tools/slash/MCP metadata
+
+const BRIDGE_COMMANDS = [
+  "/commands",
+  "/help",
+  "/usage",
+  "/model [name|default]",
+  "/compact",
+  "/status",
+];
+
+const DEFAULT_CLAUDE_SLASH_COMMANDS = [
+  "clear",
+  "compact",
+  "config",
+  "context",
+  "init",
+  "review",
+  "security-review",
+  "usage",
+  "usage-credits",
+  "extra-usage",
+  "insights",
+  "goal",
+];
+
+const DEFAULT_CLAUDE_CLI_COMMANDS = [
+  "agents",
+  "auth",
+  "auto-mode",
+  "doctor",
+  "mcp",
+  "plugin",
+  "project",
+  "ultrareview",
+  "update",
+];
+
+const DEFAULT_CODEX_CLI_COMMANDS = [
+  "exec",
+  "review",
+  "login",
+  "logout",
+  "mcp",
+  "plugin",
+  "mcp-server",
+  "app-server",
+  "remote-control",
+  "app",
+  "doctor",
+  "apply",
+  "resume",
+  "cloud",
+];
 
 function stripReservedMention(prompt, provider) {
   return String(prompt || "")
@@ -342,7 +399,7 @@ function stripReservedMention(prompt, provider) {
 //   ask         — live per-action approval (safe-propose until the live channel
 //                 lands; see VIBE live-approval follow-up)
 //   read_only   — analyse & propose, never change files
-//   ask_auto    — let the local CLI decide safe actions automatically
+//   ask_auto    — safe automatic execution for noninteractive mobile runs
 //   allow_edits — auto-approve edits + sandboxed command execution
 //   full_access — no sandbox, run anything
 function workModeFor(task) {
@@ -379,9 +436,8 @@ function claudePermissionMode(task) {
   switch (workModeFor(task)) {
     case "full_access":
       return "bypassPermissions";
-    case "ask_auto":
-      return "auto";
     case "allow_edits":
+    case "ask_auto":
       return "acceptEdits";
     // "ask" maps to plan for now (propose, don't execute) until live mobile
     // approval is wired; "read_only" is plan too.
@@ -404,15 +460,25 @@ function codexSandbox(task) {
   }
 }
 
+function modelFor(provider, chatId, task) {
+  const requested = task && (task.model || task.agentModel || task.agentBridgeModel);
+  if (requested && String(requested).trim()) return String(requested).trim();
+  const stored = modelBySession.get(sessionKey(provider, chatId));
+  if (stored && String(stored).trim()) return String(stored).trim();
+  const envModel = provider === "claude" ? process.env.VIBE_CLAUDE_MODEL : process.env.VIBE_CODEX_MODEL;
+  return envModel && String(envModel).trim() ? String(envModel).trim() : null;
+}
+
 function buildCommand(provider, prompt, chatId, task) {
   const cleaned = stripReservedMention(prompt, provider);
+  const model = modelFor(provider, chatId, task);
   if (provider === "claude") {
     const mode = claudePermissionMode(task);
     const args = ["-p", "--output-format", "stream-json", "--permission-mode", mode];
     const sid = sessionByChat.get(chatId);
     if (sid) args.push("--resume", sid);
     args.push("--verbose");
-    if (process.env.VIBE_CLAUDE_MODEL) args.push("--model", process.env.VIBE_CLAUDE_MODEL);
+    if (model) args.push("--model", model);
     args.push("--", cleaned);
     return { cmd: process.env.VIBE_CLAUDE_COMMAND || "claude", args };
   }
@@ -426,7 +492,7 @@ function buildCommand(provider, prompt, chatId, task) {
       "--skip-git-repo-check",
       "--ephemeral",
     ];
-    if (process.env.VIBE_CODEX_MODEL) args.push("--model", process.env.VIBE_CODEX_MODEL);
+    if (model) args.push("--model", model);
     args.push(cleaned);
     return { cmd: process.env.VIBE_CODEX_COMMAND || "codex", args };
   }
@@ -498,6 +564,10 @@ function taskKey(provider, chatId, taskId) {
   return `${provider || "agent"}:${chatId || "chat"}:${taskId || "-"}`;
 }
 
+function sessionKey(provider, chatId) {
+  return `${provider || "agent"}:${chatId || "chat"}`;
+}
+
 function taskLookupCandidates(provider, chatId, taskId, records) {
   const candidates = [];
   if (provider && chatId && taskId) candidates.push(taskKey(provider, chatId, taskId));
@@ -515,6 +585,25 @@ function rememberFinishedTask(key, record) {
     const oldest = finishedTasks.keys().next().value;
     if (!oldest) break;
     finishedTasks.delete(oldest);
+  }
+}
+
+function rememberRuntime(provider, chatId, runtime) {
+  if (!provider || !chatId || !runtime) return;
+  lastRuntimeBySession.set(sessionKey(provider, chatId), runtime);
+  if (
+    runtime.availableTools ||
+    runtime.slashCommands ||
+    runtime.mcpServers ||
+    runtime.providerCommands
+  ) {
+    capabilitiesByProvider.set(provider, {
+      availableTools: runtime.availableTools || [],
+      slashCommands: runtime.slashCommands || [],
+      mcpServers: runtime.mcpServers || [],
+      providerCommands: runtime.providerCommands || [],
+      cliCommands: runtime.cliCommands || [],
+    });
   }
 }
 
@@ -697,6 +786,282 @@ function compactCommand(cmd, args) {
   return [cmd, ...(args || [])].join(" ").replace(/\s+/g, " ").slice(0, 1200);
 }
 
+function decodedOutputEvents(output) {
+  const events = [];
+  for (const line of String(output || "").split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || !trimmed.startsWith("{") && !trimmed.startsWith("[")) continue;
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) {
+        for (const item of parsed) {
+          if (item && typeof item === "object") events.push(item);
+        }
+      } else if (parsed && typeof parsed === "object") {
+        events.push(parsed);
+      }
+    } catch (_) {}
+  }
+  return events;
+}
+
+function compactStringList(value, limit = 40) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => String(item || "").trim())
+    .filter(Boolean)
+    .filter((item, index, arr) => arr.indexOf(item) === index)
+    .slice(0, limit);
+}
+
+function compactMcpServers(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((item) => item && typeof item === "object")
+    .map((server) => ({
+      name: String(server.name || "").trim(),
+      status: String(server.status || "").trim(),
+    }))
+    .filter((server) => server.name)
+    .slice(0, 20);
+}
+
+function numberValue(...values) {
+  for (const value of values) {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string" && value.trim()) {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+  }
+  return undefined;
+}
+
+function compactUsage(raw, event) {
+  if (!raw || typeof raw !== "object") return null;
+  const usage = {
+    inputTokens: numberValue(raw.input_tokens, raw.inputTokens),
+    cachedInputTokens: numberValue(raw.cached_input_tokens, raw.cache_read_input_tokens, raw.cachedInputTokens, raw.cacheReadInputTokens),
+    cacheCreationInputTokens: numberValue(raw.cache_creation_input_tokens, raw.cacheCreationInputTokens),
+    outputTokens: numberValue(raw.output_tokens, raw.outputTokens),
+    reasoningOutputTokens: numberValue(raw.reasoning_output_tokens, raw.reasoningOutputTokens),
+    totalCostUsd: numberValue(raw.total_cost_usd, raw.costUSD, raw.costUsd, event && event.total_cost_usd),
+    durationMs: numberValue(event && event.duration_ms),
+    durationApiMs: numberValue(event && event.duration_api_ms),
+    ttftMs: numberValue(event && event.ttft_ms),
+    ttftStreamMs: numberValue(event && event.ttft_stream_ms),
+    numTurns: numberValue(event && event.num_turns),
+  };
+  for (const key of Object.keys(usage)) {
+    if (usage[key] === undefined) delete usage[key];
+  }
+  return Object.keys(usage).length ? usage : null;
+}
+
+function providerCommandCatalog(provider, metadata = {}) {
+  return {
+    bridge: BRIDGE_COMMANDS,
+    slash: provider === "claude"
+      ? compactStringList(metadata.slashCommands || DEFAULT_CLAUDE_SLASH_COMMANDS, 80)
+      : compactStringList(metadata.slashCommands || [], 80),
+    cli: provider === "claude"
+      ? compactStringList(metadata.cliCommands || DEFAULT_CLAUDE_CLI_COMMANDS, 80)
+      : compactStringList(metadata.cliCommands || DEFAULT_CODEX_CLI_COMMANDS, 80),
+  };
+}
+
+function providerMetadataFromOutput(provider, output, task, chatId) {
+  const events = decodedOutputEvents(output);
+  const metadata = {};
+  if (provider === "claude") {
+    const init = events.find((event) => event && event.type === "system" && event.subtype === "init") ||
+      events.find((event) => Array.isArray(event.tools) || Array.isArray(event.slash_commands));
+    const resultEvents = events.filter((event) => event && event.type === "result");
+    const result = resultEvents[resultEvents.length - 1] || null;
+    const assistantEvents = events.filter((event) => event && event.message && event.message.usage);
+    const assistant = assistantEvents[assistantEvents.length - 1] || null;
+    metadata.model = (result && result.model) || (init && init.model) || modelFor(provider, chatId, task);
+    metadata.permissionMode = init && init.permissionMode;
+    metadata.sessionId = (result && result.session_id) || (init && init.session_id);
+    metadata.cliVersion = init && init.claude_code_version;
+    metadata.availableTools = compactStringList((init && init.tools) || [], 80);
+    metadata.slashCommands = compactStringList((init && init.slash_commands) || DEFAULT_CLAUDE_SLASH_COMMANDS, 80);
+    metadata.cliCommands = DEFAULT_CLAUDE_CLI_COMMANDS;
+    metadata.mcpServers = compactMcpServers(init && init.mcp_servers);
+    metadata.agents = compactStringList((init && init.agents) || [], 40);
+    metadata.skills = compactStringList((init && init.skills) || [], 40);
+    metadata.usage = compactUsage((result && result.usage) || (assistant && assistant.message && assistant.message.usage), result || assistant);
+  } else if (provider === "codex") {
+    const thread = events.find((event) => event && event.type === "thread.started");
+    const turnEvents = events.filter((event) => event && event.type === "turn.completed");
+    const turn = turnEvents[turnEvents.length - 1] || null;
+    metadata.model = modelFor(provider, chatId, task);
+    metadata.threadId = thread && thread.thread_id;
+    metadata.cliVersion = "codex-cli";
+    metadata.availableTools = [];
+    metadata.slashCommands = [];
+    metadata.cliCommands = DEFAULT_CODEX_CLI_COMMANDS;
+    metadata.mcpServers = [];
+    metadata.usage = compactUsage(turn && turn.usage, turn);
+  }
+
+  const catalog = providerCommandCatalog(provider, metadata);
+  metadata.providerCommands = catalog.bridge;
+  metadata.slashCommands = catalog.slash;
+  metadata.cliCommands = catalog.cli;
+  return metadata;
+}
+
+function parseBridgeCommand(prompt) {
+  const text = String(prompt || "").trim();
+  if (!text.startsWith("/")) return null;
+  const firstLine = text.split(/\r?\n/, 1)[0].trim();
+  const match = firstLine.match(/^\/([a-z][a-z0-9_-]*)(?:\s+(.*))?$/i);
+  if (!match) return null;
+  const name = match[1].toLowerCase();
+  if (!["commands", "help", "usage", "model", "compact", "status"].includes(name)) return null;
+  return { name, args: (match[2] || "").trim(), raw: firstLine };
+}
+
+function formatUsage(runtime) {
+  const usage = runtime && runtime.usage;
+  if (!usage) return "No usage has been recorded for this chat yet. Run one agent task first.";
+  const parts = [];
+  if (usage.inputTokens != null) parts.push(`input ${usage.inputTokens}`);
+  if (usage.cachedInputTokens != null) parts.push(`cached ${usage.cachedInputTokens}`);
+  if (usage.outputTokens != null) parts.push(`output ${usage.outputTokens}`);
+  if (usage.reasoningOutputTokens != null) parts.push(`reasoning ${usage.reasoningOutputTokens}`);
+  if (usage.totalCostUsd != null) parts.push(`cost $${Number(usage.totalCostUsd).toFixed(4)}`);
+  if (usage.ttftMs != null) parts.push(`ttft ${(Number(usage.ttftMs) / 1000).toFixed(1)}s`);
+  if (usage.durationMs != null) parts.push(`duration ${(Number(usage.durationMs) / 1000).toFixed(1)}s`);
+  return parts.length ? parts.join(" · ") : "Usage was present, but did not include token totals.";
+}
+
+function formatCommands(provider) {
+  const caps = capabilitiesByProvider.get(provider) || {};
+  const catalog = providerCommandCatalog(provider, caps);
+  const lines = [
+    "Bridge commands available from mobile:",
+    ...catalog.bridge.map((cmd) => `- ${cmd}`),
+    "",
+  ];
+  if (catalog.slash.length) {
+    lines.push(`${provider === "claude" ? "Claude" : "Provider"} slash commands reported by CLI metadata:`);
+    lines.push(...catalog.slash.map((cmd) => `- /${cmd}`));
+    lines.push("");
+  }
+  if (catalog.cli.length) {
+    lines.push(`${provider === "claude" ? "Claude" : "Codex"} terminal commands visible on this computer:`);
+    lines.push(...catalog.cli.map((cmd) => `- ${cmd}`));
+  }
+  return lines.join("\n").trim();
+}
+
+function bridgeCommandOutput(provider, chatId, task, repo, command) {
+  const key = sessionKey(provider, chatId);
+  const currentModel = modelFor(provider, chatId, task);
+  const lastRuntime = lastRuntimeBySession.get(key);
+  switch (command.name) {
+    case "commands":
+    case "help":
+      return formatCommands(provider);
+    case "usage":
+      return [
+        `${provider} usage for this chat:`,
+        formatUsage(lastRuntime),
+        currentModel ? `Current model: ${currentModel}` : "Current model: provider default",
+      ].join("\n");
+    case "model": {
+      const next = command.args.trim();
+      if (!next) return `Current ${provider} model: ${currentModel || "provider default"}`;
+      if (["default", "reset", "auto"].includes(next.toLowerCase())) {
+        modelBySession.delete(key);
+        return `${provider} model reset to provider default for this chat.`;
+      }
+      modelBySession.set(key, next);
+      return `${provider} model set to ${next} for this chat.`;
+    }
+    case "compact":
+      sessionByChat.delete(chatId);
+      return [
+        "Bridge context compacted for this chat.",
+        "The next Claude request will start without the previous --resume session.",
+        "Codex bridge runs are already ephemeral in this noninteractive path.",
+      ].join("\n");
+    case "status":
+      return [
+        `${provider} bridge status`,
+        `repo: ${repo.name}`,
+        `cwd: ${repo.cwd || repo.path}`,
+        `work mode: ${workModeFor(task)}`,
+        `model: ${currentModel || "provider default"}`,
+        `last usage: ${formatUsage(lastRuntime)}`,
+      ].join("\n");
+    default:
+      return null;
+  }
+}
+
+function runBridgeCommand(channel, task, repo, beforeGit, command) {
+  const { provider, chatId, replyToId, requesterUserId } = task;
+  const taskId = taskIdFor(task || {});
+  const startedAt = Date.now();
+  const output = bridgeCommandOutput(provider, chatId, task, repo, command);
+  if (output == null) return false;
+
+  channel.push("progress", {
+    provider,
+    chatId,
+    taskId,
+    repoId: repo.id,
+    repoName: repo.name,
+    cwd: repo.cwd || repo.path,
+    workMode: workModeFor(task),
+    stage: "bridge_command",
+    command: command.raw,
+    line: JSON.stringify({
+      type: "vibe_bridge_command",
+      provider,
+      taskId,
+      command: command.raw,
+    }),
+  });
+
+  const durationMs = Date.now() - startedAt;
+  const afterGit = gitSnapshot(repo.cwd || repo.path || DEFAULT_CWD);
+  const built = { cmd: "vibe-bridge", args: [command.raw] };
+  const agentRuntime = runtimePayload({
+    provider,
+    task,
+    taskId,
+    repo,
+    built,
+    exitStatus: 0,
+    durationMs,
+    before: beforeGit,
+    after: afterGit,
+    canceled: false,
+    output: "",
+  });
+  rememberRuntime(provider, chatId, agentRuntime);
+  channel.push("result", {
+    provider,
+    chatId,
+    taskId,
+    output,
+    exitStatus: 0,
+    durationMs,
+    replyToId,
+    requesterUserId,
+    repoId: repo.id,
+    repoName: repo.name,
+    cwd: repo.cwd || repo.path,
+    workMode: workModeFor(task),
+    agentRuntime,
+  });
+  return true;
+}
+
 function runtimePayload({
   provider,
   task,
@@ -708,9 +1073,11 @@ function runtimePayload({
   before,
   after,
   canceled,
+  output,
 }) {
   const fileSummary = after && after.git ? after : { files: [], additions: 0, deletions: 0, patch: "" };
-  return {
+  const metadata = providerMetadataFromOutput(provider, output || "", task, task && task.chatId);
+  const payload = {
     taskId,
     provider,
     status: canceled ? "stopped" : exitStatus === 0 ? "done" : "failed",
@@ -748,6 +1115,21 @@ function runtimePayload({
       ),
     },
   };
+
+  if (metadata.model) payload.model = metadata.model;
+  if (metadata.permissionMode) payload.permissionMode = metadata.permissionMode;
+  if (metadata.sessionId) payload.sessionId = metadata.sessionId;
+  if (metadata.threadId) payload.threadId = metadata.threadId;
+  if (metadata.cliVersion) payload.cliVersion = metadata.cliVersion;
+  if (metadata.usage) payload.usage = metadata.usage;
+  if (metadata.availableTools && metadata.availableTools.length) payload.availableTools = metadata.availableTools;
+  if (metadata.slashCommands && metadata.slashCommands.length) payload.slashCommands = metadata.slashCommands;
+  if (metadata.cliCommands && metadata.cliCommands.length) payload.cliCommands = metadata.cliCommands;
+  if (metadata.providerCommands && metadata.providerCommands.length) payload.providerCommands = metadata.providerCommands;
+  if (metadata.mcpServers && metadata.mcpServers.length) payload.mcpServers = metadata.mcpServers;
+  if (metadata.agents && metadata.agents.length) payload.agents = metadata.agents;
+  if (metadata.skills && metadata.skills.length) payload.skills = metadata.skills;
+  return payload;
 }
 
 function safeRepoPath(cwd, relativePath) {
@@ -1124,6 +1506,11 @@ function runTask(channel, task) {
 
   const startedAt = Date.now();
   const beforeGit = gitSnapshot(cwd);
+  const bridgeCommand = parseBridgeCommand(prompt);
+  if (bridgeCommand && runBridgeCommand(channel, task, repo, beforeGit, bridgeCommand)) {
+    return;
+  }
+
   let child;
   try {
     child = spawn(built.cmd, built.args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
@@ -1134,9 +1521,30 @@ function runTask(channel, task) {
 
   const key = taskKey(provider, chatId, taskId);
   runningTasks.set(key, { child, provider, chatId, taskId, startedAt });
+  channel.push("progress", {
+    provider,
+    chatId,
+    taskId,
+    repoId: repo.id,
+    repoName: repo.name,
+    cwd,
+    workMode: workModeFor(task),
+    stage: "started",
+    command: compactCommand(built.cmd, built.args),
+    line: JSON.stringify({
+      type: "vibe_bridge_started",
+      provider,
+      taskId,
+      repoId: repo.id,
+      repoName: repo.name,
+      cwd,
+      workMode: workModeFor(task),
+      command: compactCommand(built.cmd, built.args),
+    }),
+  });
   let output = "";
   let lineBuf = "";
-  let progressCount = 0;
+  let progressCount = 1;
   let canceled = false;
 
   const onChunk = (buf) => {
@@ -1193,6 +1601,7 @@ function runTask(channel, task) {
       before: beforeGit,
       after: afterGit,
       canceled,
+      output,
     });
     rememberFinishedTask(key, {
       provider,
@@ -1202,6 +1611,7 @@ function runTask(channel, task) {
       runtime: agentRuntime,
       finishedAt: Date.now(),
     });
+    rememberRuntime(provider, chatId, agentRuntime);
     channel.push("result", {
       provider,
       chatId,
@@ -1231,6 +1641,307 @@ function runTask(channel, task) {
       } catch (_) {}
     },
   };
+}
+
+// ── Session history (Claude Code + Codex local conversation stores) ──────
+//
+// The phone (via the server) can ask the connected computer for the agent's
+// own past conversations so they render in the Claude/Codex profile. We read
+// the CLIs' local session logs read-only:
+//   Claude → ~/.claude/projects/<encoded-cwd>/<session>.jsonl  (ai-title + msgs)
+//   Codex  → ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl       (session_meta + msgs)
+// `list` returns lightweight topic summaries; `detail` returns the transcript.
+
+const HISTORY_LIST_LIMIT = 40;
+const HISTORY_MSG_LIMIT = 250;
+
+function clip(value, n) {
+  if (typeof value !== "string") return "";
+  const s = value.replace(/\s+/g, " ").trim();
+  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+
+// A user message that is purely machine/IDE/environment scaffolding — never a topic.
+function isContextMessage(text) {
+  if (typeof text !== "string") return true;
+  const head = text.slice(0, 400);
+  return (
+    /^\s*<(environment_context|user_instructions|INSTRUCTIONS|permissions|ide_opened_file|ide_selection|local-command-caveat|command-name|system-reminder|turn_aborted|turn_context|user_action)/i.test(head) ||
+    /^\s*#\s*Context from my IDE/i.test(head) ||
+    /^\s*AGENTS\.md instructions/i.test(head) ||
+    /^\s*The following is the Codex agent history/i.test(head) ||
+    /^\s*The user interrupted the previous turn/i.test(head) ||
+    /## Active (file|selection)/i.test(head)
+  );
+}
+
+function cleanTopicCandidate(text) {
+  if (typeof text !== "string" || isContextMessage(text)) return null;
+  let t = text.replace(
+    /<(environment_context|user_instructions|INSTRUCTIONS|permissions|system-reminder|local-command-caveat|command-name|command-message|command-args|ide_opened_file|ide_selection)[\s\S]*?<\/\1>/gi,
+    " "
+  );
+  t = t.replace(/^\s*(<[^>]+>\s*)+/, " ");
+  for (const raw of t.split("\n")) {
+    const line = raw.trim();
+    if (!line || line.startsWith("<")) continue;
+    if (/AGENTS\.md|caveat:/i.test(line)) continue;
+    if (/^#{1,4}\s*(context from|active file|attached|open tabs?|cursor|selection|agents|environment|instructions)/i.test(line)) continue;
+    if (/^(active file|cwd|shell|repo|branch)\s*:/i.test(line)) continue;
+    return clip(line, 80);
+  }
+  return null;
+}
+
+// Strip machine-injected wrapper blocks from a message for readable display.
+function cleanMessageText(text) {
+  if (typeof text !== "string") return "";
+  let t = text.replace(
+    /<(environment_context|user_instructions|INSTRUCTIONS|permissions|system-reminder|local-command-caveat|command-name|command-message|command-args|ide_opened_file|ide_selection)[\s\S]*?<\/\1>/gi,
+    " "
+  );
+  t = t.replace(/<\/?[a-z_-]+>/gi, " ");
+  return t.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+// Skip ephemeral scratch/test working dirs so the list shows real work.
+function isEphemeralProject(p) {
+  return /(^|\/)(private\/)?tmp\//.test(p) || /vibe-(bridge|agent)-/.test(p) || /self-test/.test(p);
+}
+
+function decodeClaudeProject(name) {
+  return String(name || "").replace(/-/g, "/");
+}
+
+async function readJsonl(file, onEvent) {
+  const rl = readline.createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity });
+  try {
+    for await (const line of rl) {
+      if (!line.trim()) continue;
+      let ev;
+      try { ev = JSON.parse(line); } catch { continue; }
+      if (onEvent(ev) === false) break;
+    }
+  } finally {
+    rl.close();
+  }
+}
+
+// — Claude —
+async function claudeSummary(file) {
+  let topic = null, firstUser = null, lastTs = null, messages = 0;
+  await readJsonl(file, (ev) => {
+    const t = ev.type;
+    if (t === "ai-title" && ev.aiTitle) topic = ev.aiTitle;
+    else if (t === "user" || t === "assistant") {
+      messages++;
+      if (ev.timestamp) lastTs = ev.timestamp;
+      if (t === "user" && !firstUser) {
+        const c = ev.message && ev.message.content;
+        if (typeof c === "string") {
+          const clean = cleanTopicCandidate(c);
+          if (clean) firstUser = clean;
+        }
+      }
+    }
+  });
+  return { topic: topic || firstUser || "Untitled", lastTs, messages };
+}
+
+function claudeSessionFiles() {
+  const root = path.join(os.homedir(), ".claude", "projects");
+  const out = [];
+  if (!fs.existsSync(root)) return out;
+  for (const proj of fs.readdirSync(root)) {
+    const projPath = decodeClaudeProject(proj);
+    if (isEphemeralProject(projPath)) continue;
+    const projDir = path.join(root, proj);
+    let entries;
+    try { entries = fs.readdirSync(projDir); } catch { continue; }
+    for (const f of entries) {
+      if (!f.endsWith(".jsonl")) continue;
+      const full = path.join(projDir, f);
+      let st;
+      try { st = fs.statSync(full); } catch { continue; }
+      out.push({ id: f.replace(/\.jsonl$/, ""), file: full, project: projPath, mtime: st.mtimeMs });
+    }
+  }
+  return out;
+}
+
+async function listClaude(limit) {
+  const files = claudeSessionFiles().sort((a, b) => b.mtime - a.mtime).slice(0, limit);
+  const results = [];
+  for (const s of files) {
+    const sum = await claudeSummary(s.file);
+    if (sum.messages === 0) continue;
+    results.push({
+      provider: "claude",
+      id: s.id,
+      topic: sum.topic,
+      project: s.project,
+      projectName: path.basename(s.project),
+      updatedAt: sum.lastTs || new Date(s.mtime).toISOString(),
+      messageCount: sum.messages,
+    });
+  }
+  return results;
+}
+
+async function claudeDetail(id, limit) {
+  const match = claudeSessionFiles().find((s) => s.id === id);
+  if (!match) return null;
+  const messages = [];
+  let topic = null;
+  await readJsonl(match.file, (ev) => {
+    if (ev.type === "ai-title" && ev.aiTitle) topic = ev.aiTitle;
+    if (ev.type !== "user" && ev.type !== "assistant") return;
+    const m = ev.message || {};
+    let text = "";
+    if (typeof m.content === "string") text = m.content;
+    else if (Array.isArray(m.content)) {
+      text = m.content.filter((b) => b && b.type === "text").map((b) => b.text).join("\n").trim();
+    }
+    text = cleanMessageText(text);
+    if (!text) return;
+    messages.push({ role: ev.type, text: clip(text, 4000), ts: ev.timestamp });
+    if (messages.length >= limit) return false;
+  });
+  return { provider: "claude", id, topic: topic || (messages[0] && clip(messages[0].text, 80)) || "Untitled", project: match.project, projectName: path.basename(match.project), messages };
+}
+
+// — Codex —
+function codexText(content) {
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((b) => b && (b.type === "input_text" || b.type === "output_text") && b.text)
+    .map((b) => b.text)
+    .join("\n")
+    .trim();
+}
+
+function codexSessionFiles() {
+  const root = path.join(os.homedir(), ".codex", "sessions");
+  const out = [];
+  if (!fs.existsSync(root)) return out;
+  (function walk(dir) {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) walk(full);
+      else if (e.name.startsWith("rollout-") && e.name.endsWith(".jsonl")) {
+        let st;
+        try { st = fs.statSync(full); } catch { continue; }
+        out.push({ file: full, name: e.name, mtime: st.mtimeMs });
+      }
+    }
+  })(root);
+  return out;
+}
+
+async function codexSummary(file) {
+  let meta = null, topic = null, assistantTopic = null, lastTs = null, messages = 0;
+  await readJsonl(file, (ev) => {
+    if (ev.type === "session_meta") meta = ev.payload || {};
+    else if (ev.type === "response_item" && ev.payload && ev.payload.type === "message") {
+      const role = ev.payload.role;
+      if (role !== "user" && role !== "assistant") return;
+      const text = codexText(ev.payload.content);
+      if (!text) return;
+      messages++;
+      if (ev.timestamp) lastTs = ev.timestamp;
+      if (role === "user" && !topic) {
+        const clean = cleanTopicCandidate(text);
+        if (clean) topic = clean;
+      } else if (role === "assistant" && !assistantTopic) {
+        const clean = cleanTopicCandidate(text);
+        if (clean) assistantTopic = clean;
+      }
+    }
+  });
+  return { meta, topic: topic || assistantTopic || "Untitled", lastTs, messages };
+}
+
+async function listCodex(limit) {
+  const files = codexSessionFiles().sort((a, b) => b.mtime - a.mtime).slice(0, limit);
+  const results = [];
+  for (const f of files) {
+    const sum = await codexSummary(f.file);
+    if (sum.messages === 0) continue;
+    const project = (sum.meta && sum.meta.cwd) || "";
+    if (isEphemeralProject(project)) continue;
+    results.push({
+      provider: "codex",
+      id: (sum.meta && sum.meta.id) || f.name,
+      topic: sum.topic,
+      project,
+      projectName: project ? path.basename(project) : "",
+      updatedAt: sum.lastTs || new Date(f.mtime).toISOString(),
+      messageCount: sum.messages,
+    });
+  }
+  return results;
+}
+
+async function codexDetail(id, limit) {
+  // The session id is embedded in the rollout filename; fall back to meta.id.
+  const files = codexSessionFiles();
+  let match = files.find((f) => f.name.includes(id));
+  if (!match) {
+    for (const f of files) {
+      const sum = await codexSummary(f.file);
+      if (sum.meta && sum.meta.id === id) { match = f; break; }
+    }
+  }
+  if (!match) return null;
+  const messages = [];
+  let project = "";
+  await readJsonl(match.file, (ev) => {
+    if (ev.type === "session_meta" && ev.payload) project = ev.payload.cwd || "";
+    if (ev.type !== "response_item" || !ev.payload || ev.payload.type !== "message") return;
+    const role = ev.payload.role;
+    if (role !== "user" && role !== "assistant") return;
+    let text = cleanMessageText(codexText(ev.payload.content));
+    if (!text || isContextMessage(codexText(ev.payload.content))) return;
+    messages.push({ role, text: clip(text, 4000), ts: ev.timestamp });
+    if (messages.length >= limit) return false;
+  });
+  const topicMsg = messages.find((m) => m.role === "user") || messages.find((m) => m.role === "assistant");
+  return { provider: "codex", id, topic: topicMsg ? clip(topicMsg.text, 80) : "Untitled", project, projectName: project ? path.basename(project) : "", messages };
+}
+
+async function readHistory({ provider, mode, sessionId, limit }) {
+  const p = String(provider || "").trim().toLowerCase();
+  const wantDetail = String(mode || "").toLowerCase() === "detail" || !!sessionId;
+  if (wantDetail) {
+    const cap = limit || HISTORY_MSG_LIMIT;
+    if (p === "codex") return { mode: "detail", session: await codexDetail(sessionId, cap) };
+    return { mode: "detail", session: await claudeDetail(sessionId, cap) };
+  }
+  const cap = limit || HISTORY_LIST_LIMIT;
+  if (p === "codex") return { mode: "list", sessions: await listCodex(cap) };
+  return { mode: "list", sessions: await listClaude(cap) };
+}
+
+function handleHistoryRequest(channel, payload) {
+  const provider = payload.provider || payload.agentBridgeProvider || "claude";
+  const requestId = payload.requestId || payload.request_id || crypto.randomUUID();
+  const chatId = payload.chatId || payload.chat_id || null;
+  const echo = { requestId, provider, chatId, requesterUserId: payload.requesterUserId || payload.requester_user_id || null };
+
+  readHistory({
+    provider,
+    mode: payload.mode,
+    sessionId: payload.sessionId || payload.session_id,
+    limit: payload.limit,
+  })
+    .then((result) => {
+      channel.push("history_result", { ok: true, ...echo, ...result });
+    })
+    .catch((err) => {
+      channel.push("history_result", { ok: false, ...echo, message: err && err.message ? err.message : "history_failed" });
+    });
 }
 
 function controlTask(channel, payload) {
@@ -1299,6 +2010,7 @@ function connect(server, token, userId) {
   const channel = socket.channel(`bridge:${userId}`, {});
   channel.on("run_task", (task) => runTask(channel, task));
   channel.on("control_task", (payload) => controlTask(channel, payload || {}));
+  channel.on("history_request", (payload) => handleHistoryRequest(channel, payload || {}));
 
   channel
     .join()
@@ -1339,28 +2051,27 @@ async function runSelfTest() {
     process.cwd();
 
   const provider = String(ARGS.provider || "codex").trim().toLowerCase();
-  const task = {
+  const baseTask = {
     provider,
     chatId: "self-test-chat",
-    taskId: "self-test-task",
-    prompt: ARGS.prompt || "Bridge self-test",
     replyToId: "self-test-message",
     requesterUserId: "self-test-user",
     repoId: ADVERTISED_REPOSITORIES[0] && ADVERTISED_REPOSITORIES[0].id,
     workMode: ARGS.workMode || "allow_edits",
   };
 
-  await new Promise((resolve) => {
+  const runSelfTestTask = (task, shouldRevert) =>
+    new Promise((resolve) => {
     let awaitingRevert = false;
     const channel = {
       state: "joined",
       push(event, payload) {
         console.log(JSON.stringify({ event, payload }));
-        if (event === "result" && ARGS.selfTestRevert && payload.agentRuntime?.controls?.canRevert) {
+        if (event === "result" && shouldRevert && payload.agentRuntime?.controls?.canRevert) {
           awaitingRevert = true;
           controlTask(channel, {
             action: "revert",
-            provider,
+            provider: task.provider,
             chatId: task.chatId,
             taskId: task.taskId,
           });
@@ -1371,7 +2082,43 @@ async function runSelfTest() {
       },
     };
     runTask(channel, task);
-  });
+    });
+
+  if (ARGS.selfTestSequence) {
+    let steps;
+    try {
+      steps = JSON.parse(ARGS.prompt || "[]");
+    } catch (err) {
+      console.error(`[vibe-bridge] --self-test-sequence expects --prompt to be a JSON array: ${err.message}`);
+      process.exit(1);
+    }
+    if (!Array.isArray(steps) || steps.length === 0) {
+      console.error("[vibe-bridge] --self-test-sequence needs at least one step.");
+      process.exit(1);
+    }
+    for (const [index, step] of steps.entries()) {
+      const stepObject = typeof step === "string" ? { prompt: step } : step || {};
+      const stepProvider = String(stepObject.provider || provider).trim().toLowerCase();
+      const task = {
+        ...baseTask,
+        provider: stepProvider,
+        taskId: `self-test-task-${index + 1}`,
+        prompt: stepObject.prompt || "Bridge self-test",
+        workMode: stepObject.workMode || stepObject.mode || ARGS.workMode || "allow_edits",
+      };
+      await runSelfTestTask(task, stepObject.revert === true);
+    }
+    return;
+  }
+
+  await runSelfTestTask(
+    {
+      ...baseTask,
+      taskId: "self-test-task",
+      prompt: ARGS.prompt || "Bridge self-test",
+    },
+    ARGS.selfTestRevert
+  );
 }
 
 // ── Main ────────────────────────────────────────────────────────────
@@ -1390,6 +2137,7 @@ async function main() {
         "  vibegram-bridge --status          show background-service state + log path\n" +
         "  vibegram-bridge --self-test       run one local task and print bridge payload JSON\n" +
         "  vibegram-bridge --self-test-revert  also test bridge-side revert after self-test\n" +
+        "  vibegram-bridge --self-test-sequence --prompt '[...]'  run JSON task list in one process\n" +
         "  vibegram-bridge --code <CODE>     manual pairing code flow\n" +
         "  vibegram-bridge --logout          remove the cached token\n\n" +
         "Non-interactive repo selection: --cwd <dir>, --repo <dir> (repeatable),\n" +
@@ -1400,7 +2148,7 @@ async function main() {
     return;
   }
 
-  if (ARGS.selfTest) return runSelfTest();
+  if (ARGS.selfTest || ARGS.selfTestRevert || ARGS.selfTestSequence) return runSelfTest();
 
   if (ARGS.logout) {
     try {

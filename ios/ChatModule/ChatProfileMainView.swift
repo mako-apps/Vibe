@@ -107,34 +107,41 @@ private struct NativeProfileAvatarInnerContent: View {
         Image(uiImage: image)
           .resizable()
           .scaledToFill()
-          .frame(width: size, height: size)
-          .blur(radius: max(10, size * 0.15))
-          .opacity(0.45)
-          .scaleEffect(1.15)
-          .saturation(1.2)
+          .frame(width: size * 3.25, height: size * 2.25)
+          .blur(radius: max(22, size * 0.24))
+          .opacity(0.50)
+          .saturation(1.22)
       }
 
-      ZStack {
-        Circle()
-          .fill(Color(uiColor: fallbackBackgroundColor))
+      if let image {
+        ZStack {
+          Circle()
+            .fill(Color(uiColor: fallbackBackgroundColor))
 
-        Group {
-          if let image {
-            Image(uiImage: image)
-              .resizable()
-              .scaledToFill()
-          } else {
-            Image(systemName: "person.fill")
-              .resizable()
-              .scaledToFit()
-              .frame(width: max(14.0, size * 0.34), height: max(14.0, size * 0.34))
-              .foregroundStyle(Color(uiColor: fallbackIconTintColor))
-          }
+          Image(uiImage: image)
+            .resizable()
+            .scaledToFill()
         }
+        .frame(width: size, height: size)
+        .clipShape(Circle())
+        .overlay {
+          Circle()
+            .stroke(Color.white.opacity(0.20), lineWidth: 1)
+        }
+      } else {
+        ZStack {
+          Circle()
+            .fill(Color(uiColor: fallbackBackgroundColor))
+
+          Image(systemName: "person.fill")
+            .resizable()
+            .scaledToFit()
+            .frame(width: max(14.0, size * 0.34), height: max(14.0, size * 0.34))
+            .foregroundStyle(Color(uiColor: fallbackIconTintColor))
+        }
+        .frame(width: size, height: size)
         .clipShape(Circle())
       }
-      .frame(width: size, height: size)
-      .clipShape(Circle())
     }
   }
 }
@@ -143,16 +150,15 @@ private struct NativeProfileAvatarLegacyView: View {
   @ObservedObject var model: NativeProfileAvatarModel
 
   private var progress: CGFloat {
-    let travelDistance = max(1.0, model.expandedTopInset - model.collapsedTopInset)
-    return max(0.0, min(1.0, model.scrollOffset / travelDistance))
+    max(0.0, min(1.0, model.scrollOffset / 220.0))
   }
 
   private var currentSize: CGFloat {
-    model.expandedSize + ((model.collapsedSize - model.expandedSize) * progress)
+    model.expandedSize - (22.0 * progress)
   }
 
   private var currentTopInset: CGFloat {
-    model.expandedTopInset + ((model.collapsedTopInset - model.expandedTopInset) * progress)
+    model.expandedTopInset - (10.0 * progress)
   }
 
   var body: some View {
@@ -163,7 +169,7 @@ private struct NativeProfileAvatarLegacyView: View {
       size: currentSize
     )
     .padding(.top, currentTopInset)
-    .opacity(progress < 0.82 ? 1.0 : max(0.0, 1.0 - ((progress - 0.82) / 0.18)))
+    .opacity(1.0)
     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
   }
 }
@@ -713,6 +719,598 @@ private struct ChatProfileModernRowView: View {
   }
 }
 
+private struct ChatProfileSwiftUITabSummary: Identifiable {
+  let tab: ChatProfileTab
+  let title: String
+  let subtitle: String
+
+  var id: String { tab.rawValue }
+}
+
+private struct ChatProfileSwiftUIContentItem: Identifiable {
+  let id: String
+  let title: String
+  let subtitle: String
+  let systemImage: String
+  let payload: [String: Any]
+}
+
+private enum ChatProfileSwiftUIDestination: Hashable {
+  case history
+  case tab(ChatProfileTab)
+
+  var transitionID: String {
+    switch self {
+    case .history:
+      return "chat-history"
+    case .tab(let tab):
+      return "shared-\(tab.rawValue)"
+    }
+  }
+}
+
+private struct ChatProfileScrollOffsetPreferenceKey: PreferenceKey {
+  static var defaultValue: CGFloat = 0
+
+  static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+    value = nextValue()
+  }
+}
+
+private struct ChatProfileSwiftUIRootView: View {
+  let profileName: String
+  let username: String
+  let note: String
+  let isChatMuted: Bool
+  let isDark: Bool
+  let historySubtitle: String
+  let historyItems: [ChatProfileSwiftUIContentItem]
+  let tabSummaries: [ChatProfileSwiftUITabSummary]
+  let tabItems: [ChatProfileTab: [ChatProfileSwiftUIContentItem]]
+  // Bridge (Claude/Codex paired-computer) state. `bridgeProvider` is empty for a
+  // normal contact/group profile.
+  var bridgeProvider: String = ""
+  var bridgeConnected: Bool = false
+  var bridgePaired: Bool = false
+  var bridgeDeviceLabel: String = ""
+  let onScroll: (CGFloat) -> Void
+  let onNavigationActiveChanged: (Bool) -> Void
+  let onCopyUsername: () -> Void
+  let onAction: (String) -> Void
+  let onContentPressed: ([String: Any]) -> Void
+
+  @Namespace private var morphNamespace
+  @State private var path: [ChatProfileSwiftUIDestination] = []
+
+  private var rowFill: Color {
+    Color(uiColor: isDark
+      ? UIColor(red: 31 / 255, green: 34 / 255, blue: 41 / 255, alpha: 0.94)
+      : UIColor.secondarySystemGroupedBackground.withAlphaComponent(0.96))
+  }
+
+  private var separatorColor: Color {
+    Color(uiColor: isDark ? UIColor.white.withAlphaComponent(0.10) : UIColor.black.withAlphaComponent(0.08))
+  }
+
+  var body: some View {
+    GeometryReader { geometry in
+      NavigationStack(path: $path) {
+        ZStack {
+          Color.clear.ignoresSafeArea()
+
+          ScrollView(.vertical, showsIndicators: true) {
+            offsetReader
+
+            VStack(spacing: 18) {
+              Color.clear
+                .frame(height: heroClearance(safeTop: geometry.safeAreaInsets.top))
+
+              VStack(spacing: 20) {
+                Text(profileName)
+                  .font(.system(size: 34, weight: .bold))
+                  .foregroundStyle(.primary)
+                  .lineLimit(1)
+                  .minimumScaleFactor(0.72)
+                  .frame(maxWidth: .infinity)
+
+                actionRow
+              }
+              .padding(.horizontal, 28)
+
+              profileInfoSection
+              if bridgeProvider.isEmpty {
+                historySection
+              } else {
+                bridgeHistorySection
+              }
+              sharedContentSection
+              contactActionsSection
+              emergencySection
+              dangerSection
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 38)
+          }
+          .coordinateSpace(name: "profile-scroll")
+          .scrollIndicators(.visible)
+          .background(Color.clear)
+        }
+        .background(Color.clear)
+        .toolbar(path.isEmpty ? .hidden : .visible, for: .navigationBar)
+        .navigationDestination(for: ChatProfileSwiftUIDestination.self) { destination in
+          destinationView(for: destination)
+            .navigationTransition(.zoom(sourceID: destination.transitionID, in: morphNamespace))
+        }
+      }
+      .background(Color.clear)
+      .tint(.primary)
+      .onChange(of: path.isEmpty) { _, isEmpty in
+        onNavigationActiveChanged(!isEmpty)
+      }
+    }
+  }
+
+  private var offsetReader: some View {
+    GeometryReader { proxy in
+      Color.clear
+        .preference(
+          key: ChatProfileScrollOffsetPreferenceKey.self,
+          value: max(0, -proxy.frame(in: .named("profile-scroll")).minY)
+        )
+    }
+    .frame(height: 0)
+    .onPreferenceChange(ChatProfileScrollOffsetPreferenceKey.self) { value in
+      onScroll(value)
+    }
+  }
+
+  private func heroClearance(safeTop: CGFloat) -> CGFloat {
+    NativeProfileAvatarHeroMetrics.expandedTop(for: safeTop)
+      + NativeProfileAvatarHeroMetrics.expandedSize
+      + 28
+  }
+
+  private var actionRow: some View {
+    HStack(spacing: 18) {
+      ChatProfileSwiftUIActionButton(
+        title: isChatMuted ? "Unmute" : "Mute",
+        systemImage: isChatMuted ? "bell" : "bell.slash",
+        fill: rowFill
+      ) {
+        onAction("muteToggle")
+      }
+
+      ChatProfileSwiftUIActionButton(title: "Search", systemImage: "magnifyingglass", fill: rowFill) {
+        onAction("search")
+      }
+
+      ChatProfileSwiftUIActionButton(title: "Call", systemImage: "phone", fill: rowFill) {
+        onAction("audio")
+      }
+
+      ChatProfileSwiftUIActionButton(title: "Video", systemImage: "video", fill: rowFill) {
+        onAction("video")
+      }
+    }
+  }
+
+  @ViewBuilder
+  private var profileInfoSection: some View {
+    if !bridgeProvider.isEmpty {
+      // For a Claude/Codex agent there is no username to copy — the identity row
+      // becomes the paired computer (label + live connection dot). Tapping it
+      // opens the connect / disconnect / reconnect sheet.
+      ChatProfileSwiftUISection(fill: rowFill) {
+        Button {
+          onAction("bridgeConnection")
+        } label: {
+          bridgeComputerRow(isLast: note.isEmpty)
+        }
+        .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+
+        if !note.isEmpty {
+          ChatProfileSwiftUIRow(
+            title: "note",
+            subtitle: note,
+            trailingSystemImage: nil,
+            showsChevron: false,
+            separatorColor: separatorColor,
+            isLast: true
+          )
+        }
+      }
+    } else if !username.isEmpty || !note.isEmpty {
+      ChatProfileSwiftUISection(fill: rowFill) {
+        if !username.isEmpty {
+          ChatProfileSwiftUIRow(
+            title: "username",
+            subtitle: username,
+            trailingSystemImage: "doc.on.doc",
+            showsChevron: false,
+            separatorColor: separatorColor,
+            isLast: note.isEmpty
+          )
+          .onTapGesture {
+            onCopyUsername()
+          }
+        }
+
+        if !note.isEmpty {
+          ChatProfileSwiftUIRow(
+            title: "note",
+            subtitle: note,
+            trailingSystemImage: nil,
+            showsChevron: false,
+            separatorColor: separatorColor,
+            isLast: true
+          )
+        }
+      }
+    }
+  }
+
+  // Identity row for a bridge agent: "Computer" + device label, with a live green
+  // dot when the daemon is online. No copy affordance; chevron opens the sheet.
+  private func bridgeComputerRow(isLast: Bool) -> some View {
+    HStack(spacing: 14) {
+      VStack(alignment: .leading, spacing: 4) {
+        Text("computer")
+          .font(.system(size: 17, weight: .regular))
+          .foregroundStyle(.primary)
+          .lineLimit(1)
+        HStack(spacing: 6) {
+          if bridgeConnected {
+            Circle().fill(Color.green).frame(width: 8, height: 8)
+          }
+          Text(bridgeComputerSubtitle)
+            .font(.system(size: 13, weight: .regular))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+        }
+      }
+
+      Spacer(minLength: 12)
+
+      Image(systemName: "chevron.right")
+        .font(.system(size: 15, weight: .semibold))
+        .foregroundStyle(Color.secondary.opacity(0.8))
+    }
+    .padding(.horizontal, 18)
+    .padding(.vertical, 11)
+    .frame(maxWidth: .infinity, minHeight: 62, alignment: .center)
+    .contentShape(Rectangle())
+    .overlay(alignment: .bottom) {
+      if !isLast {
+        Rectangle()
+          .fill(separatorColor)
+          .frame(height: 1 / UIScreen.main.scale)
+          .padding(.leading, 18)
+      }
+    }
+  }
+
+  private var bridgeComputerSubtitle: String {
+    if bridgeConnected {
+      return bridgeDeviceLabel.isEmpty ? "Connected" : "\(bridgeDeviceLabel) · Connected"
+    }
+    if bridgePaired {
+      return "Paired · offline — tap to reconnect"
+    }
+    return "Not connected — tap to connect"
+  }
+
+  private var historySection: some View {
+    ChatProfileSwiftUISection(fill: rowFill) {
+      Button {
+        path.append(.history)
+      } label: {
+        ChatProfileSwiftUIRow(
+          title: "Chat History",
+          subtitle: historySubtitle,
+          trailingSystemImage: nil,
+          showsChevron: true,
+          separatorColor: separatorColor,
+          isLast: true
+        )
+        .matchedTransitionSource(id: ChatProfileSwiftUIDestination.history.transitionID, in: morphNamespace)
+      }
+      .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+    }
+  }
+
+  private var bridgeDisplayName: String {
+    switch bridgeProvider.lowercased() {
+    case "claude": return "Claude"
+    case "codex": return "Codex"
+    default: return bridgeProvider.capitalized
+    }
+  }
+
+  private var bridgeHistorySection: some View {
+    ChatProfileSwiftUISection(fill: rowFill) {
+      Button {
+        onAction("bridgeHistory")
+      } label: {
+        ChatProfileSwiftUIRow(
+          title: "Chat History",
+          subtitle: "\(bridgeDisplayName) conversations on your computer",
+          trailingSystemImage: nil,
+          showsChevron: true,
+          separatorColor: separatorColor,
+          isLast: true
+        )
+      }
+      .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+    }
+  }
+
+  @ViewBuilder
+  private var sharedContentSection: some View {
+    if !tabSummaries.isEmpty {
+      ChatProfileSwiftUISection(fill: rowFill) {
+        ForEach(Array(tabSummaries.enumerated()), id: \.element.id) { index, summary in
+          let destination = ChatProfileSwiftUIDestination.tab(summary.tab)
+          Button {
+            path.append(destination)
+          } label: {
+            ChatProfileSwiftUIRow(
+              title: summary.title,
+              subtitle: summary.subtitle,
+              trailingSystemImage: nil,
+              showsChevron: true,
+              separatorColor: separatorColor,
+              isLast: index == tabSummaries.count - 1
+            )
+            .matchedTransitionSource(id: destination.transitionID, in: morphNamespace)
+          }
+          .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+        }
+      }
+    }
+  }
+
+  private var contactActionsSection: some View {
+    ChatProfileSwiftUISection(fill: rowFill) {
+      Button { onAction("shareContact") } label: {
+        ChatProfileSwiftUIRow(title: "Share Contact", separatorColor: separatorColor, isLast: false)
+      }
+      .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+
+      Button { onAction("createNewContact") } label: {
+        ChatProfileSwiftUIRow(title: "Create New Contact", separatorColor: separatorColor, isLast: false)
+      }
+      .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+
+      Button { onAction("addToExisting") } label: {
+        ChatProfileSwiftUIRow(title: "Add to Existing Contact", separatorColor: separatorColor, isLast: true)
+      }
+      .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+    }
+  }
+
+  private var emergencySection: some View {
+    ChatProfileSwiftUISection(fill: rowFill) {
+      Button { onAction("addToEmergency") } label: {
+        ChatProfileSwiftUIRow(title: "Add to Emergency Contacts", separatorColor: separatorColor, isLast: true)
+      }
+      .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+    }
+  }
+
+  private var dangerSection: some View {
+    ChatProfileSwiftUISection(fill: rowFill) {
+      Button { onAction("block") } label: {
+        ChatProfileSwiftUIRow(
+          title: "Block Contact",
+          titleColor: .red,
+          separatorColor: separatorColor,
+          isLast: true
+        )
+      }
+      .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+    }
+  }
+
+  @ViewBuilder
+  private func destinationView(for destination: ChatProfileSwiftUIDestination) -> some View {
+    switch destination {
+    case .history:
+      ChatProfileSwiftUIExpandedContentView(
+        title: "Chat History",
+        items: historyItems,
+        fill: rowFill,
+        separatorColor: separatorColor,
+        onContentPressed: onContentPressed
+      )
+    case .tab(let tab):
+      ChatProfileSwiftUIExpandedContentView(
+        title: tabSummaries.first(where: { $0.tab == tab })?.title ?? tab.label,
+        items: tabItems[tab] ?? [],
+        fill: rowFill,
+        separatorColor: separatorColor,
+        onContentPressed: onContentPressed
+      )
+    }
+  }
+}
+
+private struct ChatProfileSwiftUISection<Content: View>: View {
+  let fill: Color
+  @ViewBuilder let content: Content
+
+  var body: some View {
+    VStack(spacing: 0) {
+      content
+    }
+    .background(
+      RoundedRectangle(cornerRadius: 24, style: .continuous)
+        .fill(fill)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+    )
+    .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+    .overlay(
+      RoundedRectangle(cornerRadius: 24, style: .continuous)
+        .stroke(Color.primary.opacity(0.07), lineWidth: 1)
+    )
+  }
+}
+
+private struct ChatProfileSwiftUIRow: View {
+  let title: String
+  var subtitle: String = ""
+  var trailingSystemImage: String?
+  var showsChevron: Bool = false
+  var titleColor: Color = .primary
+  let separatorColor: Color
+  let isLast: Bool
+
+  var body: some View {
+    HStack(spacing: 14) {
+      VStack(alignment: .leading, spacing: subtitle.isEmpty ? 0 : 4) {
+        Text(title)
+          .font(.system(size: 17, weight: .regular))
+          .foregroundStyle(titleColor)
+          .lineLimit(1)
+          .minimumScaleFactor(0.76)
+
+        if !subtitle.isEmpty {
+          Text(subtitle)
+            .font(.system(size: 13, weight: .regular))
+            .foregroundStyle(.secondary)
+            .lineLimit(2)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      }
+
+      Spacer(minLength: 12)
+
+      if let trailingSystemImage {
+        Image(systemName: trailingSystemImage)
+          .font(.system(size: 17, weight: .semibold))
+          .foregroundStyle(.secondary)
+      }
+
+      if showsChevron {
+        Image(systemName: "chevron.right")
+          .font(.system(size: 15, weight: .semibold))
+          .foregroundStyle(Color.secondary.opacity(0.8))
+      }
+    }
+    .padding(.horizontal, 18)
+    .padding(.vertical, subtitle.isEmpty ? 13 : 11)
+    .frame(maxWidth: .infinity, minHeight: subtitle.isEmpty ? 48 : 62, alignment: .center)
+    .contentShape(Rectangle())
+    .overlay(alignment: .bottom) {
+      if !isLast {
+        Rectangle()
+          .fill(separatorColor)
+          .frame(height: 1 / UIScreen.main.scale)
+          .padding(.leading, 18)
+      }
+    }
+  }
+}
+
+private struct ChatProfileSwiftUIRowButtonStyle: ButtonStyle {
+  func makeBody(configuration: Configuration) -> some View {
+    configuration.label
+      .background(configuration.isPressed ? Color.primary.opacity(0.07) : Color.clear)
+      .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+  }
+}
+
+private struct ChatProfileSwiftUIActionButton: View {
+  let title: String
+  let systemImage: String
+  let fill: Color
+  let action: () -> Void
+
+  var body: some View {
+    Button(action: action) {
+      VStack(spacing: 7) {
+        Image(systemName: systemImage)
+          .font(.system(size: 22, weight: .semibold))
+          .frame(width: 52, height: 52)
+          .background(
+            Circle()
+              .fill(fill)
+              .background(.regularMaterial, in: Circle())
+          )
+
+        Text(title)
+          .font(.system(size: 12, weight: .semibold))
+          .lineLimit(1)
+          .minimumScaleFactor(0.75)
+      }
+      .foregroundStyle(.primary)
+      .frame(maxWidth: .infinity)
+    }
+    .buttonStyle(.plain)
+  }
+}
+
+private struct ChatProfileSwiftUIExpandedContentView: View {
+  let title: String
+  let items: [ChatProfileSwiftUIContentItem]
+  let fill: Color
+  let separatorColor: Color
+  let onContentPressed: ([String: Any]) -> Void
+
+  var body: some View {
+    List {
+      Section {
+        if items.isEmpty {
+          Text("No items yet")
+            .foregroundStyle(.secondary)
+        } else {
+          ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+            Button {
+              onContentPressed(item.payload)
+            } label: {
+              HStack(spacing: 14) {
+                Image(systemName: item.systemImage)
+                  .font(.system(size: 18, weight: .semibold))
+                  .foregroundStyle(.secondary)
+                  .frame(width: 28)
+
+                VStack(alignment: .leading, spacing: 4) {
+                  Text(item.title)
+                    .font(.system(size: 16, weight: .regular))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+
+                  if !item.subtitle.isEmpty {
+                    Text(item.subtitle)
+                      .font(.system(size: 13, weight: .regular))
+                      .foregroundStyle(.secondary)
+                      .lineLimit(1)
+                  }
+                }
+              }
+              .padding(.vertical, 5)
+              .overlay(alignment: .bottom) {
+                if index != items.count - 1 {
+                  Rectangle()
+                    .fill(separatorColor)
+                    .frame(height: 1 / UIScreen.main.scale)
+                    .padding(.leading, 42)
+                }
+              }
+            }
+            .buttonStyle(.plain)
+            .listRowBackground(fill)
+          }
+        }
+      }
+    }
+    .listStyle(.insetGrouped)
+    .scrollContentBackground(.hidden)
+    .background(Color(uiColor: UIColor.systemGroupedBackground))
+    .navigationTitle(title)
+    .navigationBarTitleDisplayMode(.inline)
+  }
+}
+
 private final class ChatProfileListRowCell: UITableViewCell {
   static let reuseIdentifier = "ChatProfileListRowCell"
 
@@ -1229,6 +1827,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   private let subtitleLabel = UILabel()
 
   private let tableView = UITableView(frame: .zero, style: .insetGrouped)
+  private let swiftUIContainerView = UIView()
+  private var swiftUIHostingController: UIHostingController<AnyView>?
   private let floatingAvatarView: NativeProfileAvatarView
 
   private let heroHeaderView = UIView()
@@ -1268,6 +1868,13 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   private var engineChatId = ""
   private var enginePeerUserId = ""
   private var agentConfig: [String: Any]?
+  // Non-empty ("claude"/"codex") when this profile is a paired-computer bridge
+  // agent. Drives the "Computer" connection card + the agent-history browser.
+  private var bridgeProvider = ""
+  private var bridgeConnected = false
+  private var bridgePaired = false
+  private var bridgeDeviceLabel = ""
+  private var bridgeStatusTask: Task<Void, Never>?
   private var avatarMorphProgress: CGFloat = 0.0
   private var currentHeroTop: CGFloat = 0.0
   private var currentCollapsedTop: CGFloat = 0.0
@@ -1284,6 +1891,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     blue: 0.71,
     alpha: 0.12
   )
+  private var swiftUIScrollOffset: CGFloat = 0.0
+  private var swiftUINavigationActive = false
   private static let listDateFormatter: DateFormatter = {
     let formatter = DateFormatter()
     formatter.dateStyle = .medium
@@ -1312,6 +1921,11 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     setNeedsLayout()
   }
 
+  override func didMoveToWindow() {
+    super.didMoveToWindow()
+    attachSwiftUIHostIfNeeded()
+  }
+
   override func layoutSubviews() {
     super.layoutSubviews()
 
@@ -1325,7 +1939,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     headerMaskBlurView.frame = headerMaskView.bounds
     headerMaskOverlayView.frame = headerMaskBlurView.bounds
     headerMaskGradientLayer.frame = headerMaskView.bounds
-    headerContainer.frame = headerMaskContainer.frame
+    headerContainer.frame = CGRect(x: 0.0, y: 0.0, width: bounds.width, height: headerHeight)
     headerContentView.frame = CGRect(
       x: 12.0,
       y: safeTop + 8.0,
@@ -1344,10 +1958,16 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       textAvailable ? CGRect(x: textX, y: 22.0, width: textWidth, height: 16.0) : .zero
     titleLabel.textAlignment = .center
     subtitleLabel.textAlignment = .center
+    titleLabel.isHidden = true
+    subtitleLabel.isHidden = true
+    titleLabel.alpha = 0.0
+    subtitleLabel.alpha = 0.0
 
     tableView.frame = bounds
     tableView.scrollIndicatorInsets = UIEdgeInsets(
       top: headerHeight, left: 0.0, bottom: 0.0, right: 0.0)
+    swiftUIContainerView.frame = bounds
+    swiftUIHostingController?.view.frame = swiftUIContainerView.bounds
 
     layoutHeroHeaderViewIfNeeded(force: true)
     layoutActionsForCurrentScroll()
@@ -1358,10 +1978,12 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     layoutFloatingAvatarView()
     updateAvatarMorphProgress()
     layoutAvatarGlassRing()
-    bringSubviewToFront(headerMaskContainer)
-    bringSubviewToFront(actionsStack)
-    bringSubviewToFront(avatarGlassRing)
-    bringSubviewToFront(floatingAvatarView)
+    swiftUIContainerView.isHidden = false
+    floatingAvatarView.isHidden = swiftUINavigationActive
+    avatarGlassRing.isHidden = true
+    headerContainer.isHidden = swiftUINavigationActive
+    headerMaskContainer.isHidden = true
+    bringSubviewToFront(swiftUIContainerView)
     bringSubviewToFront(headerContainer)
 
     onViewportChanged([
@@ -1398,6 +2020,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     enginePeerUserId = value.trimmingCharacters(in: .whitespacesAndNewlines)
     tableView.reloadData()
     refreshAvatar()
+    renderSwiftUIProfile()
   }
 
   func setStatusAuthorityEnabled(_ enabled: Bool) {
@@ -1416,6 +2039,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     applyTheme()
     tableView.reloadData()
     layoutHeroHeaderViewIfNeeded(force: true)
+    renderSwiftUIProfile()
   }
 
   func setHeaderTitle(_ value: String) {
@@ -1437,8 +2061,52 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
 
   func setProfileHandle(_ value: String) {
     profileHandle = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    // Fall back to detecting a bridge agent from its reserved username when an
+    // explicit provider wasn't supplied by the host.
+    if bridgeProvider.isEmpty {
+      let handle = profileHandle.lowercased().replacingOccurrences(of: "@", with: "")
+      if handle == "claude" || handle == "codex" {
+        setBridgeProvider(handle)
+      }
+    }
     refreshHeroContent()
     tableView.reloadData()
+    renderSwiftUIProfile()
+  }
+
+  /// Marks this profile as a Claude/Codex paired-computer agent so it shows the
+  /// "Computer" connection card (connect / disconnect / reconnect) and reads the
+  /// agent's own conversation history from the connected computer.
+  func setBridgeProvider(_ value: String) {
+    let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard normalized == "claude" || normalized == "codex" else {
+      if !bridgeProvider.isEmpty {
+        bridgeProvider = ""
+        renderSwiftUIProfile()
+      }
+      return
+    }
+    guard normalized != bridgeProvider else { return }
+    bridgeProvider = normalized
+    refreshBridgeStatus()
+    renderSwiftUIProfile()
+  }
+
+  private func refreshBridgeStatus() {
+    guard !bridgeProvider.isEmpty else { return }
+    bridgeStatusTask?.cancel()
+    bridgeStatusTask = Task { [weak self] in
+      guard let config = AppSessionConfig.current else { return }
+      let status = try? await AgentPairingService.status(config: config)
+      guard let status, !Task.isCancelled else { return }
+      await MainActor.run { [weak self] in
+        guard let self else { return }
+        self.bridgeConnected = status.connected
+        self.bridgePaired = status.paired
+        self.bridgeDeviceLabel = status.devices.first?.label ?? ""
+        self.renderSwiftUIProfile()
+      }
+    }
   }
 
   func setProfileBio(_ value: String) {
@@ -1467,6 +2135,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     updateActionButtons()
     rebuildMenu()
     tableView.reloadData()
+    renderSwiftUIProfile()
   }
 
   func setIsGroupOrChannel(_ value: Bool) {
@@ -1512,9 +2181,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     // Avatar glass ring
     avatarGlassRing.clipsToBounds = true
     avatarGlassRing.isUserInteractionEnabled = false
-    avatarGlassRing.layer.zPosition = 39.0
-    avatarGlassRing.contentView.backgroundColor = UIColor.white.withAlphaComponent(0.06)
-    addSubview(avatarGlassRing)
+    avatarGlassRing.isHidden = false
+    avatarGlassRing.alpha = 1.0
 
     addSubview(headerMaskContainer)
     headerMaskContainer.clipsToBounds = true
@@ -1582,14 +2250,22 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     if #available(iOS 15.0, *) {
       tableView.sectionHeaderTopPadding = 0.0
     }
+    tableView.isHidden = true
+    tableView.isUserInteractionEnabled = false
     addSubview(tableView)
 
-    addSubview(floatingAvatarView)
     floatingAvatarView.clipsToBounds = false
     floatingAvatarView.isUserInteractionEnabled = false
-    floatingAvatarView.layer.zPosition = 40.0
-    bringSubviewToFront(headerMaskContainer)
-    bringSubviewToFront(floatingAvatarView)
+
+    swiftUIContainerView.backgroundColor = .clear
+    swiftUIContainerView.clipsToBounds = true
+    swiftUIContainerView.layer.zPosition = 30.0
+    addSubview(swiftUIContainerView)
+    
+    swiftUIContainerView.insertSubview(avatarGlassRing, at: 0)
+    swiftUIContainerView.insertSubview(floatingAvatarView, at: 1)
+
+    bringSubviewToFront(swiftUIContainerView)
     bringSubviewToFront(headerContainer)
 
     configureHeroHeaderView()
@@ -1598,6 +2274,241 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
 
     updateActionButtons()
     refreshAvatar()
+    renderSwiftUIProfile()
+  }
+
+  private func attachSwiftUIHostIfNeeded() {
+    guard let host = swiftUIHostingController else { return }
+    if host.parent == nil, let parent = nearestViewController() {
+      parent.addChild(host)
+      host.didMove(toParent: parent)
+    }
+  }
+
+  private func nearestViewController() -> UIViewController? {
+    var responder: UIResponder? = self
+    while let next = responder?.next {
+      if let viewController = next as? UIViewController {
+        return viewController
+      }
+      responder = next
+    }
+    return nil
+  }
+
+  private func renderSwiftUIProfile() {
+    let resolvedName =
+      profileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      ? (headerTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "User" : headerTitle)
+      : profileName
+
+    let rootView = ChatProfileSwiftUIRootView(
+      profileName: resolvedName,
+      username: resolvedIdentifierRawValue().trimmingCharacters(in: .whitespacesAndNewlines),
+      note: profileBio.trimmingCharacters(in: .whitespacesAndNewlines),
+      isChatMuted: isChatMuted,
+      isDark: traitCollection.userInterfaceStyle == .dark,
+      historySubtitle: latestChatHistorySubtitle(),
+      historyItems: swiftUIHistoryItems(),
+      tabSummaries: swiftUITabSummaries(),
+      tabItems: swiftUITabItems(),
+      bridgeProvider: bridgeProvider,
+      bridgeConnected: bridgeConnected,
+      bridgePaired: bridgePaired,
+      bridgeDeviceLabel: bridgeDeviceLabel,
+      onScroll: { [weak self] offset in
+        guard let self else { return }
+        self.swiftUIScrollOffset = offset
+        self.updateAvatarMorphProgress()
+      },
+      onNavigationActiveChanged: { [weak self] active in
+        guard let self else { return }
+        self.swiftUINavigationActive = active
+        self.setNeedsLayout()
+      },
+      onCopyUsername: { [weak self] in
+        guard let self else { return }
+        let username = self.resolvedIdentifierRawValue().trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !username.isEmpty else { return }
+        UIPasteboard.general.string = username
+        self.onNativeEvent(["type": "profileIdPressed", "id": username])
+      },
+      onAction: { [weak self] action in
+        self?.handleSwiftUIProfileAction(action)
+      },
+      onContentPressed: { [weak self] payload in
+        self?.onNativeEvent(payload)
+      }
+    )
+    let erasedRoot = AnyView(rootView)
+
+    if let host = swiftUIHostingController {
+      host.rootView = erasedRoot
+      host.view.frame = swiftUIContainerView.bounds
+    } else {
+      let host = UIHostingController(rootView: erasedRoot)
+      if #available(iOS 16.4, *) {
+        host.safeAreaRegions = []
+      }
+      host.view.backgroundColor = .clear
+      host.view.frame = swiftUIContainerView.bounds
+      swiftUIContainerView.addSubview(host.view)
+      swiftUIHostingController = host
+      attachSwiftUIHostIfNeeded()
+    }
+  }
+
+  private func handleSwiftUIProfileAction(_ action: String) {
+    switch action {
+    case "muteToggle":
+      handleMutePressed()
+    case "search":
+      handleSearchPressed()
+    case "audio":
+      handleAudioPressed()
+    case "video":
+      handleVideoPressed()
+    case "bridgeConnection":
+      presentBridgeConnection()
+    case "bridgeHistory":
+      presentBridgeHistory()
+    case "shareContact", "createNewContact", "addToExisting":
+      onNativeEvent(["type": "profileContactAction", "action": action])
+    case "addToEmergency":
+      onNativeEvent(["type": "profileContactAction", "action": "addToEmergency"])
+    case "block":
+      onNativeEvent(["type": "profileContactAction", "action": "block"])
+    default:
+      break
+    }
+  }
+
+  private func swiftUITabSummaries() -> [ChatProfileSwiftUITabSummary] {
+    availableTabs.map {
+      ChatProfileSwiftUITabSummary(
+        tab: $0,
+        title: sharedTitle(for: $0),
+        subtitle: sharedSubtitle(for: $0)
+      )
+    }
+  }
+
+  private func swiftUITabItems() -> [ChatProfileTab: [ChatProfileSwiftUIContentItem]] {
+    var result: [ChatProfileTab: [ChatProfileSwiftUIContentItem]] = [:]
+    for tab in availableTabs {
+      result[tab] = swiftUIContentItems(for: tab)
+    }
+    return result
+  }
+
+  private func swiftUIHistoryItems() -> [ChatProfileSwiftUIContentItem] {
+    rows.enumerated().map { index, row in
+      swiftUIContentItem(for: row, tab: nil, index: index, explicitURL: nil)
+    }
+  }
+
+  private func swiftUIContentItems(for tab: ChatProfileTab) -> [ChatProfileSwiftUIContentItem] {
+    switch tab {
+    case .media:
+      return mediaRows.enumerated().map { index, row in
+        swiftUIContentItem(for: row, tab: tab, index: index, explicitURL: row.mediaUrl)
+      }
+    case .voice:
+      return voiceRows.enumerated().map { index, row in
+        swiftUIContentItem(for: row, tab: tab, index: index, explicitURL: row.mediaUrl)
+      }
+    case .gifs:
+      return gifRows.enumerated().map { index, row in
+        swiftUIContentItem(for: row, tab: tab, index: index, explicitURL: row.mediaUrl)
+      }
+    case .files:
+      return fileRows.enumerated().map { index, row in
+        swiftUIContentItem(for: row, tab: tab, index: index, explicitURL: row.mediaUrl)
+      }
+    case .links:
+      return linkRows.enumerated().map { index, item in
+        swiftUIContentItem(for: item.row, tab: tab, index: index, explicitURL: item.url)
+      }
+    case .pinned:
+      return pinnedRows.enumerated().map { index, row in
+        swiftUIContentItem(for: row, tab: tab, index: index, explicitURL: row.mediaUrl)
+      }
+    }
+  }
+
+  private func swiftUIContentItem(
+    for row: ChatProfileRow,
+    tab: ChatProfileTab?,
+    index: Int,
+    explicitURL: String?
+  ) -> ChatProfileSwiftUIContentItem {
+    let resolvedTab = tab?.rawValue ?? "history"
+    let title: String = {
+      if let explicitURL, tab == .links {
+        return explicitURL
+      }
+      if let fileName = row.fileName?.trimmingCharacters(in: .whitespacesAndNewlines), !fileName.isEmpty {
+        return fileName
+      }
+      let text = row.text.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !text.isEmpty {
+        return text
+      }
+      switch row.type {
+      case "image":
+        return "Photo"
+      case "video":
+        return "Video"
+      case "voice":
+        return "Voice message"
+      case "music":
+        return "Music"
+      case "file":
+        return "File"
+      default:
+        return row.type.isEmpty ? "Message" : row.type.capitalized
+      }
+    }()
+
+    let subtitleParts = [
+      row.type.isEmpty ? nil : row.type.capitalized,
+      formattedRowDate(row),
+    ].compactMap { $0 }
+
+    var payload: [String: Any] = [
+      "type": "profileContentPressed",
+      "tab": resolvedTab,
+      "messageId": row.messageId,
+    ]
+    if let explicitURL, !explicitURL.isEmpty {
+      payload["url"] = explicitURL
+    } else if let mediaUrl = row.mediaUrl, !mediaUrl.isEmpty {
+      payload["url"] = mediaUrl
+    }
+
+    return ChatProfileSwiftUIContentItem(
+      id: "\(resolvedTab)-\(row.messageId)-\(index)",
+      title: title,
+      subtitle: subtitleParts.joined(separator: " • "),
+      systemImage: swiftUIContentSystemImage(for: tab, row: row),
+      payload: payload
+    )
+  }
+
+  private func swiftUIContentSystemImage(for tab: ChatProfileTab?, row: ChatProfileRow) -> String {
+    if let tab {
+      return sharedIconName(for: tab)
+    }
+    switch row.type {
+    case "image", "video", "sticker":
+      return "photo.on.rectangle.angled"
+    case "voice":
+      return "waveform"
+    case "file", "music":
+      return "doc.text.fill"
+    default:
+      return "message"
+    }
   }
 
   private func configureHeroHeaderView() {
@@ -1658,7 +2569,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     let sideInset: CGFloat = 16.0
     let bannerTop: CGFloat = 0.0
     let baseBannerHeight = min(max(bounds.height * 0.50, 390.0), 500.0)
-    let stretch = max(0.0, -tableView.contentOffset.y)
+    let stretch: CGFloat = 0.0
     let bannerHeight = baseBannerHeight + stretch
     let bannerFrame = CGRect(
       x: sideInset, y: bannerTop, width: width - (sideInset * 2.0), height: bannerHeight)
@@ -1755,25 +2666,16 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     guard bounds.width > 0 else { return }
 
     let expandedSize = NativeProfileAvatarHeroMetrics.expandedSize
-    let collapsedSize = NativeProfileAvatarHeroMetrics.collapsedSize
     let ringPadding: CGFloat = 14.0
 
-    let offset = max(0.0, tableView.contentOffset.y)
-    let travelDistance = max(1.0, currentHeroTop - currentCollapsedTop)
-    let progress = max(0.0, min(1.0, offset / travelDistance))
+    let offset = max(0.0, swiftUIScrollOffset)
+    let progress = max(0.0, min(1.0, offset / 220.0))
 
-    let currentSize = expandedSize + (collapsedSize - expandedSize) * progress
+    let currentSize = expandedSize - (22.0 * progress)
     let ringSize = currentSize + ringPadding
 
-    let expandedCenterX = bounds.width * 0.5
-    let expandedCenterY = currentHeroTop + expandedSize * 0.5
-
-    let collapsedCenterX: CGFloat = bounds.width * 0.5
-    let safeTop = safeAreaInsets.top
-    let collapsedCenterY = currentCollapsedTop + collapsedSize * 0.5 + safeTop
-
-    let centerX = expandedCenterX + (collapsedCenterX - expandedCenterX) * progress
-    let centerY = expandedCenterY + (collapsedCenterY - expandedCenterY) * progress - offset * (1.0 - progress)
+    let centerX = bounds.width * 0.5
+    let centerY = currentHeroTop + expandedSize * 0.5 - (10.0 * progress)
 
     avatarGlassRing.frame = CGRect(
       x: centerX - ringSize * 0.5,
@@ -1782,9 +2684,10 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       height: ringSize
     )
     avatarGlassRing.layer.cornerRadius = ringSize * 0.5
-
-    // Fade out the ring as the avatar collapses
-    avatarGlassRing.alpha = max(0.0, 1.0 - progress * 2.5)
+    
+    let isActive = swiftUINavigationActive
+    avatarGlassRing.isHidden = isActive
+    avatarGlassRing.alpha = isActive ? 0.0 : 1.0
   }
 
   private func layoutActionsForCurrentScroll() {
@@ -1926,6 +2829,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       profileName.isEmpty ? (headerTitle.isEmpty ? "Profile" : headerTitle) : profileName
     titleLabel.text = resolvedName
     subtitleLabel.text = resolvedActiveTabSubtitleText() ?? resolvedDefaultSubtitleText()
+    renderSwiftUIProfile()
   }
 
   private func refreshHeroSubheader() {
@@ -1946,6 +2850,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
 
     updateActionButtons()
     layoutHeroHeaderViewIfNeeded(force: true)
+    renderSwiftUIProfile()
   }
 
   private func updateActionButtons() {
@@ -1980,23 +2885,18 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   }
 
   private func updateAvatarMorphProgress() {
-    guard tableView.bounds.width > 0 else { return }
+    guard bounds.width > 0 else { return }
 
-    let offset = max(0.0, tableView.contentOffset.y)
-    let travelDistance = max(1.0, currentHeroTop - currentCollapsedTop)
-    let progress = max(0.0, min(1.0, offset / travelDistance))
+    let offset = max(0.0, swiftUIScrollOffset)
+    let progress = max(0.0, min(1.0, offset / 220.0))
     avatarMorphProgress = progress
     floatingAvatarView.setScrollOffset(offset)
-    let headerAlpha = max(0.0, min(1.0, (offset - 18.0) / 82.0))
-    headerMaskContainer.alpha = headerAlpha
-
-    let textAlpha = max(0.0, min(1.0, (progress - 0.42) / 0.34))
-    titleLabel.isHidden = textAlpha == 0
-    subtitleLabel.isHidden =
-      textAlpha == 0
-      || (subtitleLabel.text?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
-    titleLabel.alpha = textAlpha
-    subtitleLabel.alpha = textAlpha
+    headerMaskContainer.alpha = 0.0
+    headerMaskContainer.isHidden = true
+    titleLabel.isHidden = true
+    subtitleLabel.isHidden = true
+    titleLabel.alpha = 0.0
+    subtitleLabel.alpha = 0.0
     layoutActionsForCurrentScroll()
 
     layoutAvatarGlassRing()
@@ -2227,8 +3127,13 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     }
     cell.accessoryType = showsChevron ? .disclosureIndicator : .none
 
-    cell.backgroundColor = .secondarySystemGroupedBackground
-    cell.backgroundConfiguration = UIBackgroundConfiguration.listGroupedCell()
+    cell.backgroundColor = .clear
+    if #available(iOS 14.0, *) {
+      var background = UIBackgroundConfiguration.listGroupedCell()
+      background.backgroundColor = .clear
+      background.visualEffect = UIBlurEffect(style: isDark ? .systemThinMaterialDark : .systemThinMaterialLight)
+      cell.backgroundConfiguration = background
+    }
   }
 
   private func resolvedBioPreview() -> String {
@@ -2503,6 +3408,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     layoutHeroHeaderViewIfNeeded(force: true)
     syncTabViews()
     updateStickyTabsPresentation()
+    renderSwiftUIProfile()
   }
 
   // MARK: UITableViewDataSource
@@ -2655,7 +3561,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       cell.contentView.backgroundColor = .clear
       if #available(iOS 14.0, *) {
         var background = UIBackgroundConfiguration.listCell()
-        background.backgroundColor = currentRowCardColor
+        background.backgroundColor = .clear
+        background.visualEffect = UIBlurEffect(style: isDark ? .systemThinMaterialDark : .systemThinMaterialLight)
         background.cornerRadius = 22.0
         cell.backgroundConfiguration = background
       }
@@ -3020,6 +3927,29 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     onNativeEvent(["type": "headerAgentPressed"])
   }
 
+  // MARK: Bridge (Claude/Codex) connection + history
+
+  private func presentBridgeConnection() {
+    guard !bridgeProvider.isEmpty, let presenter = topMostViewController() else { return }
+    AgentBridgeProfile.presentConnection(provider: bridgeProvider, from: presenter)
+    // Re-check status when the user returns from the sheet so the card reflects
+    // any connect/disconnect they just performed.
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+      self?.refreshBridgeStatus()
+    }
+  }
+
+  private func presentBridgeHistory() {
+    guard !bridgeProvider.isEmpty, !engineChatId.isEmpty,
+      let presenter = topMostViewController()
+    else { return }
+    AgentBridgeProfile.presentHistory(
+      provider: bridgeProvider,
+      chatId: engineChatId,
+      from: presenter
+    )
+  }
+
   private func normalizedAgentConfig(_ config: [String: Any]?, fallbackChatId: String)
     -> [String: Any]?
   {
@@ -3153,9 +4083,7 @@ fileprivate class ChatProfileExpandedContentViewController: UIViewController, UI
   private let headerOverlay = UIView()
   private let titleLabel = UILabel()
   private let closeButton = UIButton(type: .system)
-  
-  private let transition = GlassMorphTransition()
-  
+
   init(profileTab: ChatProfileTab, titleText: String, rows: [Any], themeIsDark: Bool, sourceView: UIView, hostView: UIView) {
     self.profileTab = profileTab
     self.titleText = titleText
@@ -3163,11 +4091,8 @@ fileprivate class ChatProfileExpandedContentViewController: UIViewController, UI
     self.themeIsDark = themeIsDark
     super.init(nibName: nil, bundle: nil)
     self.modalPresentationStyle = .overFullScreen
-    
-    transition.hostView = hostView
-    transition.sourceView = sourceView
-    transition.targetView = self.view
-    transition.config.blurRadius = 16.0
+    _ = sourceView
+    _ = hostView
   }
   
   required init?(coder: NSCoder) {
@@ -3215,21 +4140,10 @@ fileprivate class ChatProfileExpandedContentViewController: UIViewController, UI
     closeButton.tintColor = themeIsDark ? .lightGray : .darkGray
     closeButton.addTarget(self, action: #selector(handleClose), for: .touchUpInside)
     headerBlur.contentView.addSubview(closeButton)
-    
-    transition.suppressTargetForInitialState()
   }
-  
-  override func viewWillAppear(_ animated: Bool) {
-    super.viewWillAppear(animated)
-    if isBeingPresented {
-      transition.animatePresent(completion: nil)
-    }
-  }
-  
+
   @objc private func handleClose() {
-    transition.animateDismiss { [weak self] in
-      self?.dismiss(animated: false)
-    }
+    dismiss(animated: true)
   }
   
   override func viewDidLayoutSubviews() {

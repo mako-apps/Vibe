@@ -640,6 +640,9 @@ final class AgentRuntimeSummaryView: UIView {
     if let mode = runtime.workMode, !mode.isEmpty {
       parts.append(mode.replacingOccurrences(of: "_", with: " "))
     }
+    if let model = runtime.model, !model.isEmpty {
+      parts.append(model)
+    }
     if let exit = runtime.exitStatus, runtime.status == "failed" {
       parts.append("exit \(exit)")
     }
@@ -816,6 +819,17 @@ final class AgentRuntimeTaskViewController: UIViewController {
       metadata: ["agentRuntime": runtimePayloadDictionary(runtime)]
     ))
 
+    let details = runtimeDetailsText().trimmingCharacters(in: .whitespacesAndNewlines)
+    if !details.isEmpty {
+      rows.append(agentMessageRow(
+        key: "runtime-details-\(runtimeMessageId)",
+        id: "\(runtimeMessageId)-details",
+        text: details,
+        timestamp: row.timestamp,
+        metadata: [:]
+      ))
+    }
+
     if let patch = runtime.diff?.patch?.trimmingCharacters(in: .whitespacesAndNewlines), !patch.isEmpty {
       let truncated = runtime.diff?.patchTruncated == true ? "\n\nPatch truncated by bridge payload limit." : ""
       rows.append(agentMessageRow(
@@ -878,6 +892,11 @@ final class AgentRuntimeTaskViewController: UIViewController {
     put(runtime.repoName, into: &payload, key: "repoName")
     put(runtime.cwd, into: &payload, key: "cwd")
     put(runtime.workMode, into: &payload, key: "workMode")
+    put(runtime.model, into: &payload, key: "model")
+    put(runtime.permissionMode, into: &payload, key: "permissionMode")
+    put(runtime.sessionId, into: &payload, key: "sessionId")
+    put(runtime.threadId, into: &payload, key: "threadId")
+    put(runtime.cliVersion, into: &payload, key: "cliVersion")
     if let durationMs = runtime.durationMs { payload["durationMs"] = durationMs }
     if let exitStatus = runtime.exitStatus { payload["exitStatus"] = exitStatus }
     if let command = runtime.command {
@@ -910,6 +929,34 @@ final class AgentRuntimeTaskViewController: UIViewController {
         "canRevert": controls.canRevert,
       ]
     }
+    if let usage = runtime.usage {
+      var usagePayload: [String: Any] = [:]
+      if let value = usage.inputTokens { usagePayload["inputTokens"] = value }
+      if let value = usage.cachedInputTokens { usagePayload["cachedInputTokens"] = value }
+      if let value = usage.cacheCreationInputTokens { usagePayload["cacheCreationInputTokens"] = value }
+      if let value = usage.outputTokens { usagePayload["outputTokens"] = value }
+      if let value = usage.reasoningOutputTokens { usagePayload["reasoningOutputTokens"] = value }
+      if let value = usage.totalCostUsd { usagePayload["totalCostUsd"] = value }
+      if let value = usage.durationMs { usagePayload["durationMs"] = value }
+      if let value = usage.durationApiMs { usagePayload["durationApiMs"] = value }
+      if let value = usage.ttftMs { usagePayload["ttftMs"] = value }
+      if let value = usage.ttftStreamMs { usagePayload["ttftStreamMs"] = value }
+      if let value = usage.numTurns { usagePayload["numTurns"] = value }
+      if !usagePayload.isEmpty { payload["usage"] = usagePayload }
+    }
+    if !runtime.availableTools.isEmpty { payload["availableTools"] = runtime.availableTools }
+    if !runtime.slashCommands.isEmpty { payload["slashCommands"] = runtime.slashCommands }
+    if !runtime.cliCommands.isEmpty { payload["cliCommands"] = runtime.cliCommands }
+    if !runtime.providerCommands.isEmpty { payload["providerCommands"] = runtime.providerCommands }
+    if !runtime.mcpServers.isEmpty {
+      payload["mcpServers"] = runtime.mcpServers.map { server in
+        var item: [String: Any] = ["name": server.name]
+        put(server.status, into: &item, key: "status")
+        return item
+      }
+    }
+    if !runtime.agents.isEmpty { payload["agents"] = runtime.agents }
+    if !runtime.skills.isEmpty { payload["skills"] = runtime.skills }
     return payload
   }
 
@@ -934,6 +981,61 @@ final class AgentRuntimeTaskViewController: UIViewController {
       parts.append(runtime.status)
     }
     return parts.joined(separator: "  ")
+  }
+
+  private func runtimeDetailsText() -> String {
+    var sections: [String] = []
+    var overview: [String] = []
+    if let model = runtime.model, !model.isEmpty { overview.append("model: \(model)") }
+    if let permission = runtime.permissionMode, !permission.isEmpty { overview.append("permission: \(permission)") }
+    if let cli = runtime.cliVersion, !cli.isEmpty { overview.append("cli: \(cli)") }
+    if let session = runtime.sessionId, !session.isEmpty { overview.append("session: \(shortId(session))") }
+    if let thread = runtime.threadId, !thread.isEmpty { overview.append("thread: \(shortId(thread))") }
+    if !overview.isEmpty {
+      sections.append("Runtime\n" + overview.joined(separator: "\n"))
+    }
+    if let usageText = usageText(runtime.usage) {
+      sections.append("Usage\n\(usageText)")
+    }
+    if !runtime.providerCommands.isEmpty {
+      sections.append("Bridge commands\n" + runtime.providerCommands.prefix(8).joined(separator: "  "))
+    }
+    if !runtime.slashCommands.isEmpty {
+      sections.append("Provider slash commands\n" + runtime.slashCommands.prefix(18).map { "/\($0)" }.joined(separator: "  "))
+    }
+    if !runtime.cliCommands.isEmpty {
+      sections.append("CLI commands\n" + runtime.cliCommands.prefix(18).joined(separator: "  "))
+    }
+    if !runtime.availableTools.isEmpty {
+      sections.append("Tools\n" + runtime.availableTools.prefix(20).joined(separator: "  "))
+    }
+    if !runtime.mcpServers.isEmpty {
+      sections.append("MCP\n" + runtime.mcpServers.prefix(8).map { server in
+        if let status = server.status, !status.isEmpty {
+          return "\(server.name): \(status)"
+        }
+        return server.name
+      }.joined(separator: "\n"))
+    }
+    return sections.joined(separator: "\n\n")
+  }
+
+  private func usageText(_ usage: ChatListRow.AgentRuntimeUsage?) -> String? {
+    guard let usage else { return nil }
+    var parts: [String] = []
+    if let value = usage.inputTokens { parts.append("input \(value)") }
+    if let value = usage.cachedInputTokens { parts.append("cached \(value)") }
+    if let value = usage.outputTokens { parts.append("output \(value)") }
+    if let value = usage.reasoningOutputTokens { parts.append("reasoning \(value)") }
+    if let value = usage.totalCostUsd { parts.append(String(format: "cost $%.4f", value)) }
+    if let value = usage.ttftMs { parts.append(String(format: "ttft %.1fs", Double(value) / 1000.0)) }
+    if let value = usage.durationMs { parts.append(String(format: "duration %.1fs", Double(value) / 1000.0)) }
+    return parts.isEmpty ? nil : parts.joined(separator: "  ")
+  }
+
+  private func shortId(_ value: String) -> String {
+    guard value.count > 12 else { return value }
+    return "\(value.prefix(8))...\(value.suffix(4))"
   }
 
   private func providerForControl() -> String? {
