@@ -1245,6 +1245,7 @@ function bridgeStatusPayload() {
     deviceLabel: ARGS.label || os.hostname(),
     cwd: DEFAULT_CWD,
     repositories: ADVERTISED_REPOSITORIES,
+    runningTasks: runningTaskSummaries(),
     permissions: {
       claude: {
         permissionMode: process.env.VIBE_CLAUDE_PERMISSION_MODE || "per-task",
@@ -1257,6 +1258,24 @@ function bridgeStatusPayload() {
       workModes: ["ask", "ask_auto", "read_only", "allow_edits", "full_access"],
     },
   };
+}
+
+function runningTaskSummaries() {
+  return Array.from(runningTasks.values()).map((entry) => ({
+    provider: entry.provider,
+    chatId: entry.chatId,
+    taskId: entry.taskId,
+    sessionId: entry.sessionId || null,
+    topic: clip(entry.prompt || `${entry.provider || "Agent"} task`, 80),
+    repoId: entry.repo && entry.repo.id,
+    repoName: entry.repo && entry.repo.name,
+    project: entry.repo && (entry.repo.cwd || entry.repo.path),
+    projectName: entry.repo && entry.repo.name,
+    cwd: entry.cwd,
+    workMode: entry.workMode,
+    startedAt: new Date(entry.startedAt).toISOString(),
+    command: entry.command,
+  }));
 }
 
 function pushBridgeStatus(channel) {
@@ -1574,7 +1593,20 @@ function runTask(channel, task) {
   }
 
   const key = taskKey(provider, chatId, taskId);
-  runningTasks.set(key, { child, provider, chatId, taskId, startedAt });
+  runningTasks.set(key, {
+    child,
+    provider,
+    chatId,
+    taskId,
+    sessionId: resumeIdFor(task),
+    prompt,
+    repo,
+    cwd,
+    workMode: workModeFor(task),
+    command: compactCommand(built.cmd, built.args),
+    startedAt,
+  });
+  pushBridgeStatus(channel);
   channel.push("progress", {
     provider,
     chatId,
@@ -1637,6 +1669,7 @@ function runTask(channel, task) {
 
   child.on("close", (code) => {
     runningTasks.delete(key);
+    pushBridgeStatus(channel);
     const durationMs = Date.now() - startedAt;
     canceled = canceled || child.signalCode === "SIGTERM" || child.signalCode === "SIGKILL";
     const afterGit = gitSnapshot(cwd);
@@ -2050,6 +2083,41 @@ function wsUrl(server) {
   return server.replace(/^http/, "ws") + "/agent-bridge";
 }
 
+function websocketTransportUrl(server, token) {
+  const params = new URLSearchParams({ token: token || "", vsn: "2.0.0" });
+  return `${wsUrl(server)}/websocket?${params.toString()}`;
+}
+
+function probeBridgeToken(server, token, timeoutMs = 6000) {
+  return new Promise((resolve) => {
+    if (!token) return resolve({ ok: false, statusCode: 403 });
+
+    let done = false;
+    let ws;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try {
+        if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+      } catch (_) {}
+      resolve(result);
+    };
+    const timer = setTimeout(() => finish({ ok: null, reason: "timeout" }), timeoutMs);
+
+    try {
+      ws = new WebSocket(websocketTransportUrl(server, token));
+      ws.on("open", () => finish({ ok: true }));
+      ws.on("unexpected-response", (_request, response) =>
+        finish({ ok: false, statusCode: response && response.statusCode })
+      );
+      ws.on("error", (error) => finish({ ok: null, reason: error && error.message }));
+    } catch (error) {
+      finish({ ok: null, reason: error && error.message });
+    }
+  });
+}
+
 function connect(server, token, userId) {
   const socket = new Phoenix.Socket(wsUrl(server), {
     params: { token },
@@ -2248,6 +2316,22 @@ async function main() {
     config.user_id = result.user_id;
     persist();
     console.log("[vibe-bridge] paired ✓ (token cached in ~/.vibe/bridge.json)");
+  }
+
+  if (
+    config.bridge_token &&
+    config.user_id &&
+    process.stdin.isTTY &&
+    !ARGS.serviceRun &&
+    !ARGS.foreground
+  ) {
+    const probe = await probeBridgeToken(server, config.bridge_token);
+    if (probe.ok === false && probe.statusCode === 403) {
+      delete config.bridge_token;
+      delete config.user_id;
+      persist();
+      console.log("[vibe-bridge] cached pairing expired; pairing again…");
+    }
   }
 
   if (!config.bridge_token || !config.user_id) {

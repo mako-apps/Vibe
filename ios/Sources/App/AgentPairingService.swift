@@ -13,6 +13,27 @@ struct AgentBridgeDevice: Hashable {
   let label: String
   let cwd: String?
   let repositories: [AgentBridgeRepository]
+  let runningTasks: [AgentBridgeRunningTask]
+}
+
+struct AgentBridgeRunningTask: Hashable, Identifiable {
+  let provider: String
+  let chatId: String
+  let taskId: String
+  let sessionId: String?
+  let topic: String
+  let repoId: String?
+  let repoName: String?
+  let project: String?
+  let projectName: String?
+  let cwd: String?
+  let workMode: String?
+  let startedAt: String?
+
+  var id: String {
+    if let sessionId, !sessionId.isEmpty { return sessionId }
+    return taskId
+  }
 }
 
 enum AgentBridgeWorkMode: String, CaseIterable, Identifiable {
@@ -66,12 +87,15 @@ struct AgentBridgeStatus {
   let repositories: [AgentBridgeRepository]
   /// Connected bridge devices. Usually one computer for now.
   let devices: [AgentBridgeDevice]
+  /// Flattened list of tasks currently running on connected bridge daemons.
+  let runningTasks: [AgentBridgeRunningTask]
 
   static let disconnected = AgentBridgeStatus(
     connected: false,
     paired: false,
     repositories: [],
-    devices: []
+    devices: [],
+    runningTasks: []
   )
 }
 

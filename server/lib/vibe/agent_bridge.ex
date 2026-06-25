@@ -260,18 +260,24 @@ defmodule Vibe.AgentBridge do
       |> Enum.flat_map(fn device -> Map.get(device, "repositories", []) end)
       |> dedupe_repositories()
 
+    running_tasks =
+      devices
+      |> Enum.flat_map(fn device -> Map.get(device, "runningTasks", []) end)
+      |> dedupe_running_tasks()
+
     %{
       connected: map_size(presence) > 0,
       paired: paired?(user_id),
       devices: devices,
-      repositories: repositories
+      repositories: repositories,
+      runningTasks: running_tasks
     }
   rescue
     _ ->
-      %{connected: false, paired: paired?(user_id), devices: [], repositories: []}
+      %{connected: false, paired: paired?(user_id), devices: [], repositories: [], runningTasks: []}
   end
 
-  def status(_), do: %{connected: false, paired: false, devices: [], repositories: []}
+  def status(_), do: %{connected: false, paired: false, devices: [], repositories: [], runningTasks: []}
 
   @doc "Normalize daemon-reported status before storing it in Presence metadata."
   def presence_meta(payload) when is_map(payload) do
@@ -280,6 +286,7 @@ defmodule Vibe.AgentBridge do
       "deviceLabel" => normalize(payload["deviceLabel"] || payload["device_label"]) || "computer",
       "cwd" => normalize(payload["cwd"]),
       "repositories" => normalize_repositories(payload["repositories"]),
+      "runningTasks" => normalize_running_tasks(payload["runningTasks"] || payload["running_tasks"]),
       "permissions" => normalize_permissions(payload["permissions"])
     }
   end
@@ -383,6 +390,7 @@ defmodule Vibe.AgentBridge do
         meta["deviceLabel"] || meta[:deviceLabel] || meta["device_label"] || "computer",
       "cwd" => meta["cwd"] || meta[:cwd],
       "repositories" => normalize_repositories(meta["repositories"] || meta[:repositories]),
+      "runningTasks" => normalize_running_tasks(meta["runningTasks"] || meta[:runningTasks] || meta["running_tasks"]),
       "permissions" => normalize_permissions(meta["permissions"] || meta[:permissions])
     }
   end
@@ -396,6 +404,39 @@ defmodule Vibe.AgentBridge do
   end
 
   defp normalize_repositories(_), do: []
+
+  defp normalize_running_tasks(values) when is_list(values) do
+    values
+    |> Enum.map(&normalize_running_task/1)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp normalize_running_tasks(_), do: []
+
+  defp normalize_running_task(task) when is_map(task) do
+    task_id = normalize(task["taskId"] || task[:taskId] || task["task_id"] || task[:task_id])
+
+    if is_nil(task_id) do
+      nil
+    else
+      %{
+        "provider" => normalize(task["provider"] || task[:provider]),
+        "chatId" => normalize(task["chatId"] || task[:chatId] || task["chat_id"] || task[:chat_id]),
+        "taskId" => task_id,
+        "sessionId" => normalize(task["sessionId"] || task[:sessionId] || task["session_id"] || task[:session_id]),
+        "topic" => normalize(task["topic"] || task[:topic]) || "Running task",
+        "repoId" => normalize(task["repoId"] || task[:repoId] || task["repo_id"] || task[:repo_id]),
+        "repoName" => normalize(task["repoName"] || task[:repoName] || task["repo_name"] || task[:repo_name]),
+        "project" => normalize(task["project"] || task[:project] || task["cwd"] || task[:cwd]),
+        "projectName" => normalize(task["projectName"] || task[:projectName] || task["project_name"] || task[:project_name]),
+        "cwd" => normalize(task["cwd"] || task[:cwd]),
+        "workMode" => normalize(task["workMode"] || task[:workMode] || task["work_mode"] || task[:work_mode]),
+        "startedAt" => normalize(task["startedAt"] || task[:startedAt] || task["started_at"] || task[:started_at])
+      }
+    end
+  end
+
+  defp normalize_running_task(_), do: nil
 
   defp normalize_repository(repo) when is_map(repo) do
     path = normalize(repo["path"] || repo[:path] || repo["cwd"] || repo[:cwd])
@@ -432,6 +473,21 @@ defmodule Vibe.AgentBridge do
 
       if is_binary(key) and not MapSet.member?(seen, key) do
         {MapSet.put(seen, key), [repo | acc]}
+      else
+        {seen, acc}
+      end
+    end)
+    |> elem(1)
+    |> Enum.reverse()
+  end
+
+  defp dedupe_running_tasks(tasks) do
+    tasks
+    |> Enum.reduce({MapSet.new(), []}, fn task, {seen, acc} ->
+      key = task["taskId"] || task["sessionId"]
+
+      if is_binary(key) and not MapSet.member?(seen, key) do
+        {MapSet.put(seen, key), [task | acc]}
       else
         {seen, acc}
       end
