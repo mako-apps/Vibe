@@ -1095,6 +1095,11 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
+  # The `codex exec --json` stdout is the thread-item streaming format
+  # (thread.started / turn.* / item.{started,updated,completed} / error).
+  # See docs/agent-payload-shapes.md. The assistant reply is the last
+  # `agent_message` item's `text`; on failure the envelope `error`/`turn.failed`
+  # message surfaces instead (e.g. usage-limit caps).
   defp extract_codex_text(decoded) do
     decoded
     |> Enum.reduce(nil, fn event, acc ->
@@ -1104,8 +1109,11 @@ defmodule Vibe.AI.LocalAgentWorker do
         codex_agent_message?(item) and is_binary(item["text"]) ->
           item["text"]
 
-        is_binary(event["message"]) ->
-          event["message"]
+        codex_agent_message?(item) and is_binary(item["message"]) ->
+          item["message"]
+
+        codex_envelope_error_message(event) != nil ->
+          codex_envelope_error_message(event)
 
         true ->
           acc
@@ -1113,6 +1121,22 @@ defmodule Vibe.AI.LocalAgentWorker do
     end)
     |> normalize_string()
   end
+
+  # Top-level `{"type":"error","message":…}` or `{"type":"turn.failed","error":{"message":…}}`.
+  defp codex_envelope_error_message(event) when is_map(event) do
+    type = normalize_string(event["type"]) || ""
+
+    cond do
+      type in ["error", "turn.failed", "thread.failed"] ->
+        normalize_string(event["message"]) ||
+          normalize_string(get_in(event, ["error", "message"]))
+
+      true ->
+        nil
+    end
+  end
+
+  defp codex_envelope_error_message(_), do: nil
 
   defp extract_claude_text(decoded) do
     result_text =
@@ -1224,19 +1248,26 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   defp accumulate_claude_tool_block(_block, acc), do: acc
 
+  # Parse the codex thread-item stream into tool events. The discriminator is
+  # `item.item_type` (fall back to `item.type`); envelope `error`/`turn.failed`
+  # become an error node. agent_message/reasoning are excluded (handled as text).
   defp codex_tool_events(decoded) do
     decoded
     |> Enum.with_index()
     |> Enum.flat_map(fn {event, index} ->
-      item = map_value(event, "item") || event
-      item_type = normalize_string(item["type"]) || normalize_string(event["type"]) || ""
-
       cond do
-        codex_agent_message?(item) ->
-          []
+        is_map(map_value(event, "item")) ->
+          item = map_value(event, "item")
+          type = codex_item_type(item) || ""
 
-        codex_toolish_event?(event, item, item_type) ->
-          [codex_tool_event(event, item, item_type, index)]
+          if type in ["agent_message", "reasoning"] do
+            []
+          else
+            [codex_tool_event(event, item, type, index)]
+          end
+
+        codex_envelope_error_message(event) != nil ->
+          [codex_error_tool_event(event, index)]
 
         true ->
           []
@@ -1245,9 +1276,17 @@ defmodule Vibe.AI.LocalAgentWorker do
     |> compact_tool_events()
   end
 
-  defp codex_tool_event(event, item, item_type, index) do
-    tool = codex_tool_name(item, item_type)
-    input = codex_tool_input(item)
+  defp codex_item_type(item) when is_map(item) do
+    normalize_string(item["item_type"]) || normalize_string(item["type"])
+  end
+
+  defp codex_item_type(_), do: nil
+
+  defp codex_agent_message?(item) when is_map(item), do: codex_item_type(item) == "agent_message"
+  defp codex_agent_message?(_), do: false
+
+  defp codex_tool_event(event, item, type, index) do
+    {tool, input, output} = codex_item_fields(type, item)
 
     %{
       "id" =>
@@ -1257,108 +1296,199 @@ defmodule Vibe.AI.LocalAgentWorker do
       "provider" => "codex",
       "tool" => tool,
       "label" => tool_label("Codex", tool, input),
-      "status" => codex_event_status(event, item),
+      "status" => codex_item_status(event, item),
       "input" => safe_payload(input),
-      "outputPreview" => safe_text(codex_tool_output(item)),
-      "providerEventType" => normalize_string(event["type"]) || item_type
+      "outputPreview" => safe_text(output),
+      "providerEventType" => normalize_string(event["type"]) || type
     }
     |> put_node_shape(tool, input)
+    |> codex_apply_file_change_shape(type, item)
   end
 
-  defp codex_toolish_event?(event, item, item_type) do
-    event_type = normalize_string(event["type"]) || ""
+  defp codex_error_tool_event(event, index) do
+    message = codex_envelope_error_message(event)
 
+    # Derive a stable id from the message so `error` + `turn.failed` (which carry
+    # the same text) collapse into one node via compact_tool_events.
+    id =
+      case message do
+        text when is_binary(text) ->
+          "codex-error-" <> (:crypto.hash(:md5, text) |> Base.encode16(case: :lower) |> binary_part(0, 8))
+
+        _ ->
+          unique_event_id("codex-error", index)
+      end
+
+    %{
+      "id" => normalize_string(event["id"]) || id,
+      "provider" => "codex",
+      "tool" => "Error",
+      "label" => "Codex error",
+      "status" => "failed",
+      "input" => %{},
+      "outputPreview" => safe_text(message),
+      "providerEventType" => normalize_string(event["type"]) || "error",
+      "kind" => "error"
+    }
+  end
+
+  # Map a thread-item type to {tool_name, input_map, output} for rendering.
+  defp codex_item_fields("command_execution", item) do
+    command = codex_command_string(item)
+    output = item["aggregated_output"] || item["stdout"] || item["output"]
+    {"Bash", %{"command" => command}, output}
+  end
+
+  defp codex_item_fields("file_change", item) do
+    paths = codex_file_change_paths(item)
+    input = %{"file_path" => List.first(paths)}
+    input = if length(paths) > 1, do: Map.put(input, "files", paths), else: input
+    {codex_file_change_tool(item), input, item["stdout"] || item["output"]}
+  end
+
+  defp codex_item_fields("web_search", item) do
+    query = normalize_string(item["query"]) || normalize_string(item["action"])
+    {"WebSearch", %{"query" => query}, nil}
+  end
+
+  defp codex_item_fields("mcp_tool_call", item) do
+    tool = normalize_string(item["tool"]) || normalize_string(item["name"]) || "MCP"
+    server = normalize_string(item["server"])
+    label = if server, do: "#{server}.#{tool}", else: tool
+
+    input =
+      cond do
+        is_map(item["arguments"]) -> item["arguments"]
+        is_binary(item["arguments"]) -> %{"arguments" => item["arguments"]}
+        true -> %{}
+      end
+
+    {label, input, item["result"] || item["output"] || item["content"]}
+  end
+
+  defp codex_item_fields("todo_list", item) do
+    {"TodoWrite", %{"todos" => item["items"] || item["todos"] || []}, nil}
+  end
+
+  defp codex_item_fields("error", item) do
+    {"Error", %{}, item["message"] || item["text"]}
+  end
+
+  # Unknown / future item types: best-effort generic mapping.
+  defp codex_item_fields(type, item) do
+    tool =
+      cond do
+        codex_command_string(item) != nil -> "Bash"
+        normalize_string(item["name"]) -> normalize_string(item["name"])
+        normalize_string(item["tool"]) -> normalize_string(item["tool"])
+        type not in [nil, ""] -> codex_titlecase(type)
+        true -> "Tool"
+      end
+
+    input =
+      cond do
+        is_map(item["input"]) -> item["input"]
+        is_map(item["arguments"]) -> item["arguments"]
+        is_binary(item["arguments"]) -> %{"arguments" => item["arguments"]}
+        codex_command_string(item) != nil -> %{"command" => codex_command_string(item)}
+        true -> %{}
+      end
+
+    {tool, input, item["output"] || item["result"] || item["content"] || item["text"]}
+  end
+
+  defp codex_command_string(item) do
     cond do
-      item_type in ["agent_message", "message", "reasoning"] ->
-        false
-
-      is_binary(item["command"]) or is_list(item["command"]) ->
-        true
-
-      is_binary(item["name"]) or is_binary(item["tool"]) or is_binary(item["tool_name"]) ->
-        true
-
-      String.contains?(item_type, ["tool", "command", "exec", "function", "call", "search"]) ->
-        true
-
-      String.contains?(event_type, ["tool", "command", "exec", "function", "call"]) and
-          not String.contains?(event_type, "agent_message") ->
-        true
-
-      true ->
-        false
+      is_binary(item["command"]) -> normalize_string(item["command"])
+      is_list(item["command"]) -> item["command"] |> Enum.join(" ") |> normalize_string()
+      is_binary(item["cmd"]) -> normalize_string(item["cmd"])
+      true -> nil
     end
   end
 
-  defp codex_agent_message?(%{"type" => "agent_message"}), do: true
-  defp codex_agent_message?(_), do: false
+  defp codex_file_change_paths(item) do
+    case item["changes"] do
+      changes when is_list(changes) ->
+        changes
+        |> Enum.map(fn
+          %{"path" => path} -> normalize_string(path)
+          path when is_binary(path) -> normalize_string(path)
+          _ -> nil
+        end)
+        |> Enum.reject(&is_nil/1)
 
-  defp codex_tool_name(item, item_type) do
-    cond do
-      is_binary(item["command"]) or is_list(item["command"]) ->
-        "Bash"
-
-      normalize_string(item["name"]) ->
-        normalize_string(item["name"])
-
-      normalize_string(item["tool"]) ->
-        normalize_string(item["tool"])
-
-      normalize_string(item["tool_name"]) ->
-        normalize_string(item["tool_name"])
-
-      item_type != "" ->
-        item_type
-        |> String.replace("_", " ")
-        |> String.split(" ", trim: true)
-        |> Enum.map_join(" ", &String.capitalize/1)
-
-      true ->
-        "Tool"
+      _ ->
+        [normalize_string(item["path"]) || normalize_string(item["file_path"])]
+        |> Enum.reject(&is_nil/1)
     end
   end
 
-  defp codex_tool_input(item) do
+  # If every change is an add ⇒ Write (create); otherwise Edit.
+  defp codex_file_change_tool(item) do
+    kinds =
+      case item["changes"] do
+        changes when is_list(changes) ->
+          Enum.map(changes, fn
+            %{"kind" => kind} -> normalize_string(kind)
+            _ -> nil
+          end)
+
+        _ ->
+          []
+      end
+      |> Enum.reject(&is_nil/1)
+
     cond do
-      is_map(item["input"]) ->
-        item["input"]
-
-      is_map(item["arguments"]) ->
-        item["arguments"]
-
-      is_binary(item["arguments"]) ->
-        %{"arguments" => item["arguments"]}
-
-      is_binary(item["command"]) ->
-        %{"command" => item["command"]}
-
-      is_list(item["command"]) ->
-        %{"command" => Enum.join(item["command"], " ")}
-
-      true ->
-        %{}
+      kinds != [] and Enum.all?(kinds, &(&1 == "add")) -> "Write"
+      true -> "Edit"
     end
   end
 
-  defp codex_tool_output(item) do
-    item["output"] || item["result"] || item["content"] || item["text"]
+  # file_change items carry no inline old/new text, so put_node_shape can't infer
+  # +N/−M. Pin the node kind/target from the change list directly.
+  defp codex_apply_file_change_shape(event, "file_change", item) do
+    paths = codex_file_change_paths(item)
+    target = paths |> List.first() |> codex_basename()
+
+    target =
+      cond do
+        length(paths) > 1 -> "#{length(paths)} files"
+        true -> target
+      end
+
+    kind = if codex_file_change_tool(item) == "Write", do: "write", else: "edit"
+
+    event
+    |> Map.put("kind", kind)
+    |> maybe_put("target", target)
   end
 
-  defp codex_event_status(event, item) do
-    status =
-      [
-        event["type"],
-        event["status"],
-        item["status"]
-      ]
-      |> Enum.find_value(&normalize_string/1)
-      |> Kernel.||("")
-      |> String.downcase()
+  defp codex_apply_file_change_shape(event, _type, _item), do: event
+
+  defp codex_basename(nil), do: nil
+  defp codex_basename(path) when is_binary(path), do: Path.basename(path)
+
+  defp codex_titlecase(type) do
+    type
+    |> String.replace("_", " ")
+    |> String.split(" ", trim: true)
+    |> Enum.map_join(" ", &String.capitalize/1)
+  end
+
+  defp codex_item_status(event, item) do
+    envelope = (normalize_string(event["type"]) || "") |> String.downcase()
+    item_status = (normalize_string(item["status"]) || "") |> String.downcase()
+    exit_code = item["exit_code"]
 
     cond do
-      String.contains?(status, ["fail", "error"]) -> "failed"
-      String.contains?(status, ["complete", "completed", "done", "success"]) -> "done"
-      String.contains?(status, ["start", "running", "progress"]) -> "running"
+      is_integer(exit_code) and exit_code != 0 -> "failed"
+      String.contains?(item_status, ["fail", "error", "abort", "interrupt", "not_found"]) -> "failed"
+      envelope in ["turn.failed", "error", "thread.failed"] -> "failed"
+      String.contains?(item_status, ["complete", "done", "success"]) -> "done"
+      envelope in ["item.completed", "turn.completed"] -> "done"
+      is_integer(exit_code) and exit_code == 0 -> "done"
+      String.contains?(item_status, ["progress", "running", "start", "pending"]) -> "running"
+      envelope in ["item.started", "item.updated"] -> "running"
       true -> "running"
     end
   end
