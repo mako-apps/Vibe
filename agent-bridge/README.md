@@ -9,14 +9,16 @@ Claude/Codex subscription — and the result streams back into the chat.
 ## Use
 
 In the Vibe app, open **Claude** or **Codex**, tap **Connect**, and copy the
-command shown. On your computer, inside the project you want the agent to work in:
+command shown. On your computer:
 
 ```bash
 npx @vibegram/agent-bridge --code <PAIRING_CODE> --server https://your-vibe-server
 ```
 
-After the first pairing the token is cached in `~/.vibe/bridge.json`, so later you
-can just run:
+The first run pairs the computer, asks which project(s) to link, then installs the
+macOS background service so the bridge survives closed terminals and restarts at
+login. After the first pairing the token and project pick are cached in
+`~/.vibe/bridge.json`, so later you can restart/update the background service with:
 
 ```bash
 npx @vibegram/agent-bridge --server https://your-vibe-server
@@ -25,8 +27,9 @@ npx @vibegram/agent-bridge --server https://your-vibe-server
 > Until the package is published to npm, run the daemon from this repo instead:
 > `node bin/vibe-bridge.js --code <PAIRING_CODE> --server https://your-vibe-server`
 
-`--logout` removes the cached token. `--cwd <path>` overrides the working
-directory (defaults to where you launched it).
+`--pick` opens the terminal project selector again. `--foreground` runs in the
+current terminal instead of the background service. `--logout` removes the cached
+token. `--cwd <path>` overrides the working directory.
 
 ## Safety
 

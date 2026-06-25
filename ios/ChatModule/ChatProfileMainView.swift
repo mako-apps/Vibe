@@ -737,12 +737,15 @@ private struct ChatProfileSwiftUIContentItem: Identifiable {
 
 private enum ChatProfileSwiftUIDestination: Hashable {
   case history
+  case bridgeHistory
   case tab(ChatProfileTab)
 
   var transitionID: String {
     switch self {
     case .history:
       return "chat-history"
+    case .bridgeHistory:
+      return "bridge-history"
     case .tab(let tab):
       return "shared-\(tab.rawValue)"
     }
@@ -770,6 +773,7 @@ private struct ChatProfileSwiftUIRootView: View {
   // Bridge (Claude/Codex paired-computer) state. `bridgeProvider` is empty for a
   // normal contact/group profile.
   var bridgeProvider: String = ""
+  var bridgeChatId: String = ""
   var bridgeConnected: Bool = false
   var bridgePaired: Bool = false
   var bridgeDeviceLabel: String = ""
@@ -783,9 +787,7 @@ private struct ChatProfileSwiftUIRootView: View {
   @State private var path: [ChatProfileSwiftUIDestination] = []
 
   private var rowFill: Color {
-    Color(uiColor: isDark
-      ? UIColor(red: 31 / 255, green: 34 / 255, blue: 41 / 255, alpha: 0.94)
-      : UIColor.secondarySystemGroupedBackground.withAlphaComponent(0.96))
+    Color.clear
   }
 
   private var separatorColor: Color {
@@ -837,6 +839,7 @@ private struct ChatProfileSwiftUIRootView: View {
         }
         .background(Color.clear)
         .toolbar(path.isEmpty ? .hidden : .visible, for: .navigationBar)
+        .toolbarBackground(.hidden, for: .navigationBar)
         .navigationDestination(for: ChatProfileSwiftUIDestination.self) { destination in
           destinationView(for: destination)
             .navigationTransition(.zoom(sourceID: destination.transitionID, in: morphNamespace))
@@ -1029,7 +1032,7 @@ private struct ChatProfileSwiftUIRootView: View {
   private var bridgeHistorySection: some View {
     ChatProfileSwiftUISection(fill: rowFill) {
       Button {
-        onAction("bridgeHistory")
+        path.append(.bridgeHistory)
       } label: {
         ChatProfileSwiftUIRow(
           title: "Chat History",
@@ -1039,6 +1042,7 @@ private struct ChatProfileSwiftUIRootView: View {
           separatorColor: separatorColor,
           isLast: true
         )
+        .matchedTransitionSource(id: ChatProfileSwiftUIDestination.bridgeHistory.transitionID, in: morphNamespace)
       }
       .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
     }
@@ -1122,6 +1126,31 @@ private struct ChatProfileSwiftUIRootView: View {
         separatorColor: separatorColor,
         onContentPressed: onContentPressed
       )
+    case .bridgeHistory:
+      AgentBridgeHistoryInlineView(
+        provider: bridgeProvider,
+        chatId: bridgeChatId,
+        onOpenSession: { session in
+          // Tapping a past session loads its whole transcript into the DEFAULT
+          // chat as bubbles (user prompt -> right bubble, agent reply -> agent
+          // cell) and leaves the profile — it is no longer rendered in-profile.
+          _ = ChatEngine.shared.loadAgentBridgeSessionIntoChat([
+            "chatId": bridgeChatId,
+            "provider": bridgeProvider,
+            "sessionId": session.id,
+          ])
+          onContentPressed([
+            "type": "openBridgeSessionInChat",
+            "chatId": bridgeChatId,
+            "provider": bridgeProvider,
+            "sessionId": session.id,
+            "topic": session.topic,
+          ])
+          // Reuse the proven back path so we land back on the chat.
+          onAction("headerBack")
+        }
+      )
+      .background(Color(uiColor: UIColor.systemGroupedBackground))
     case .tab(let tab):
       ChatProfileSwiftUIExpandedContentView(
         title: tabSummaries.first(where: { $0.tab == tab })?.title ?? tab.label,
@@ -2313,6 +2342,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       tabSummaries: swiftUITabSummaries(),
       tabItems: swiftUITabItems(),
       bridgeProvider: bridgeProvider,
+      bridgeChatId: engineChatId,
       bridgeConnected: bridgeConnected,
       bridgePaired: bridgePaired,
       bridgeDeviceLabel: bridgeDeviceLabel,
@@ -2347,10 +2377,11 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       host.view.frame = swiftUIContainerView.bounds
     } else {
       let host = UIHostingController(rootView: erasedRoot)
-      if #available(iOS 16.4, *) {
+      if #available(iOS 14.0, *) {
         host.safeAreaRegions = []
       }
       host.view.backgroundColor = .clear
+      host.view.isOpaque = false
       host.view.frame = swiftUIContainerView.bounds
       swiftUIContainerView.addSubview(host.view)
       swiftUIHostingController = host
@@ -2370,8 +2401,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       handleVideoPressed()
     case "bridgeConnection":
       presentBridgeConnection()
-    case "bridgeHistory":
-      presentBridgeHistory()
+    case "headerBack":
+      handleBackPressed()
     case "shareContact", "createNewContact", "addToExisting":
       onNativeEvent(["type": "profileContactAction", "action": action])
     case "addToEmergency":
@@ -2773,10 +2804,10 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     // Avatar glass ring effect
     if isDark {
       avatarGlassRing.effect = UIBlurEffect(style: .systemThinMaterialDark)
-      avatarGlassRing.contentView.backgroundColor = UIColor.white.withAlphaComponent(0.08)
+      avatarGlassRing.contentView.backgroundColor = .clear
     } else {
       avatarGlassRing.effect = UIBlurEffect(style: .systemThinMaterialLight)
-      avatarGlassRing.contentView.backgroundColor = UIColor.white.withAlphaComponent(0.15)
+      avatarGlassRing.contentView.backgroundColor = .clear
     }
 
     currentTextColor = text
@@ -3131,6 +3162,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     if #available(iOS 14.0, *) {
       var background = UIBackgroundConfiguration.listGroupedCell()
       background.backgroundColor = .clear
+      let isDark = traitCollection.userInterfaceStyle == .dark
       background.visualEffect = UIBlurEffect(style: isDark ? .systemThinMaterialDark : .systemThinMaterialLight)
       cell.backgroundConfiguration = background
     }
@@ -3562,6 +3594,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       if #available(iOS 14.0, *) {
         var background = UIBackgroundConfiguration.listCell()
         background.backgroundColor = .clear
+        let isDark = traitCollection.userInterfaceStyle == .dark
         background.visualEffect = UIBlurEffect(style: isDark ? .systemThinMaterialDark : .systemThinMaterialLight)
         background.cornerRadius = 22.0
         cell.backgroundConfiguration = background
@@ -3937,17 +3970,6 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
       self?.refreshBridgeStatus()
     }
-  }
-
-  private func presentBridgeHistory() {
-    guard !bridgeProvider.isEmpty, !engineChatId.isEmpty,
-      let presenter = topMostViewController()
-    else { return }
-    AgentBridgeProfile.presentHistory(
-      provider: bridgeProvider,
-      chatId: engineChatId,
-      from: presenter
-    )
   }
 
   private func normalizedAgentConfig(_ config: [String: Any]?, fallbackChatId: String)

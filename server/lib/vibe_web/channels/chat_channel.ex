@@ -740,6 +740,15 @@ defmodule VibeWeb.ChatChannel do
       metadata["agentBridgeWorkMode"] || metadata["agent_bridge_work_mode"] ||
         data["agentBridgeWorkMode"]
     )
+    # Explicit resume target chosen on the phone ("continue a session"). When absent,
+    # the bridge starts a fresh session (new task per message) — it no longer
+    # auto-resumes by chatId. The id is provider-appropriate (Claude session_id /
+    # Codex thread_id); the bridge interprets it per provider.
+    |> put_optional_string(
+      "resumeSessionId",
+      metadata["agentBridgeResumeSessionId"] || metadata["agent_bridge_resume_session_id"] ||
+        data["agentBridgeResumeSessionId"]
+    )
   end
 
   defp normalize_control_action(value) do

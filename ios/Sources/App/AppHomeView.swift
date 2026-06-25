@@ -3396,7 +3396,8 @@ final class ChatConversationController: UIViewController {
 
   private func presentBridgeRepositoryPicker(provider: String) {
     let displayName = ChatRoute.bridgeDisplayName(for: provider)
-    let root = AgentBridgeRepositoryPickerView(provider: provider, displayName: displayName)
+    let root = AgentBridgeRepositoryPickerView(
+      provider: provider, displayName: displayName, chatId: route.chatId)
     let host = UIHostingController(rootView: root)
     host.modalPresentationStyle = .pageSheet
     if let sheet = host.sheetPresentationController {

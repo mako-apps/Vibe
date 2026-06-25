@@ -414,6 +414,10 @@ final class ChatEngine {
   // chat, keyed chatId -> payload. The Claude/Codex profile requests it and
   // observes `didChangeNotification` with reason "agentBridgeHistory".
   private var agentBridgeHistoryByChat: [String: [String: Any]] = [:]
+  // Pending "open this past session into the chat as bubbles" requests, keyed by
+  // the detail requestId we pushed -> the target chat/provider. When the matching
+  // "detail" reply lands we synthesize its transcript into chat rows.
+  private var pendingBridgeSessionIngestByRequestId: [String: (chatId: String, provider: String)] = [:]
   private var nativeRecordingStateByChatId: [String: Bool] = [:]
   private var pinnedMessagesByChatId: [String: [[String: Any]]] = [:]
   private var pinnedFetchInFlightChatIds = Set<String>()
@@ -1710,6 +1714,101 @@ final class ChatEngine {
   func latestAgentBridgeHistory(chatId rawChatId: String) -> [String: Any]? {
     let chatId = normalizedString(rawChatId) ?? rawChatId
     return syncOnQueue { agentBridgeHistoryByChat[chatId] }
+  }
+
+  /// Open a Claude/Codex past session into the DEFAULT chat as bubbles: request
+  /// the session transcript over the bridge and, when it arrives, synthesize it
+  /// into chat rows (user prompt -> right bubble, agent reply -> agent cell) via
+  /// the normal incoming-message path. Replaces the old in-profile transcript.
+  @discardableResult
+  func loadAgentBridgeSessionIntoChat(_ payload: [String: Any]) -> [String: Any] {
+    let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"]) ?? ""
+    let provider = normalizedString(payload["provider"]) ?? ""
+    let sessionId = normalizedString(payload["sessionId"] ?? payload["session_id"]) ?? ""
+    guard !chatId.isEmpty, !provider.isEmpty, !sessionId.isEmpty else {
+      return ["accepted": false, "reason": "invalid_session"]
+    }
+    let requestId = UUID().uuidString
+    let result = requestAgentBridgeHistory([
+      "chatId": chatId,
+      "provider": provider,
+      "mode": "detail",
+      "sessionId": sessionId,
+      "requestId": requestId,
+    ])
+    if (result["accepted"] as? Bool) == true {
+      syncOnQueue {
+        pendingBridgeSessionIngestByRequestId[requestId] = (chatId: chatId, provider: provider)
+      }
+    }
+    return result
+  }
+
+  /// Render a bridge "detail" transcript payload into the chat as message rows.
+  /// Runs on the engine queue (called from the socket-frame handler). Message ids
+  /// are derived from the session id so re-opening the same session upserts in
+  /// place rather than duplicating.
+  private func ingestAgentBridgeSessionLocked(
+    chatId: String,
+    provider: String,
+    payload: [String: Any]
+  ) {
+    guard let session = payload["session"] as? [String: Any] else { return }
+    let sessionId =
+      normalizedString(session["id"]) ?? normalizedString(payload["sessionId"]) ?? UUID().uuidString
+    let rawMessages = session["messages"] as? [[String: Any]] ?? []
+    guard !rawMessages.isEmpty else { return }
+
+    let agentName: String = {
+      switch provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+      case "claude": return "Claude"
+      case "codex": return "Codex"
+      default: return provider.capitalized
+      }
+    }()
+    let baseTs = Int64(nowMs())
+    let me = currentUserIdLocked()
+    var lastMessageId: String?
+
+    for (index, item) in rawMessages.enumerated() {
+      let role = (normalizedString(item["role"]) ?? "").lowercased()
+      let text = (normalizedString(item["text"]) ?? "")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !text.isEmpty else { continue }
+      let messageId = "bridge-\(sessionId)-\(index)"
+      let timestampMs = baseTs + Int64(index)
+
+      var synthetic: [String: Any] = [
+        "id": messageId,
+        "type": "text",
+        "timestamp": timestampMs,
+      ]
+      if role == "user" {
+        // isMe is derived from fromId == current user; plain text flows through
+        // the non-hybrid `encryptedContent` path as the bubble text.
+        if let me, !me.isEmpty { synthetic["fromId"] = me }
+        synthetic["encryptedContent"] = text
+      } else {
+        synthetic["isAgentMessage"] = true
+        synthetic["plainContent"] = text
+        synthetic["agentName"] = agentName
+        synthetic["fromId"] = Self.agentUserId
+        synthetic["agentUserId"] = Self.agentUserId
+        synthetic["metadata"] = [
+          "agentWorkerVia": "bridge",
+          "bridgeSessionId": sessionId,
+        ]
+      }
+      _ = applyNativeIncomingMessageEventLocked(chatId: chatId, payload: synthetic)
+      lastMessageId = messageId
+    }
+
+    if let lastMessageId {
+      postChangeLocked(
+        reason: "chatMessageInserted",
+        userInfo: ["chatId": chatId, "messageId": lastMessageId, "state": statusSnapshotLocked()]
+      )
+    }
   }
 
   func retryOutgoingMessage(_ payload: [String: Any]) -> [String: Any] {
@@ -4558,6 +4657,17 @@ final class ChatEngine {
           let mode = self.normalizedString(frame.payload["mode"]) ?? "list"
           let provider = self.normalizedString(frame.payload["provider"]) ?? ""
           let requestId = self.normalizedString(frame.payload["requestId"]) ?? ""
+          // If this detail reply was requested to be opened into the chat, render
+          // its transcript as bubbles (the profile no longer shows a transcript).
+          if mode == "detail",
+            let target = self.pendingBridgeSessionIngestByRequestId.removeValue(forKey: requestId)
+          {
+            self.ingestAgentBridgeSessionLocked(
+              chatId: chatId,
+              provider: provider.isEmpty ? target.provider : provider,
+              payload: frame.payload
+            )
+          }
           self.postChangeLocked(
             reason: "agentBridgeHistory",
             userInfo: [

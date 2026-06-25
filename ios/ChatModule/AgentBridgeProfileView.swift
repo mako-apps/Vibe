@@ -4,11 +4,19 @@ import UIKit
 // Profile surfaces for a Claude/Codex bridge agent:
 //   * AgentBridgeConnectionSheet — which computer is connected, Disconnect, and
 //     Reconnect / Add connection (scan the QR the daemon prints).
-//   * AgentBridgeHistoryView — the agent's OWN past Claude/Codex conversations
-//     (topics → transcript), read from the connected computer via the bridge.
-//     Rendered as a topic list + plain transcript, never chat bubbles.
+//   * AgentBridgeHistoryInlineView — the agent's OWN past Claude/Codex
+//     conversations (topic list), read from the connected computer via the
+//     bridge. Pushed into `ChatProfileMainView`'s NavigationStack so it
+//     morph-expands from the "Chat History" row (matching the normal contact
+//     history). Tapping a topic no longer renders a transcript in-profile —
+//     it loads that whole conversation into the DEFAULT chat as bubbles
+//     (`ChatEngine.loadAgentBridgeSessionIntoChat`) and leaves the profile.
 //
-// Both are presented from `ChatProfileMainView` for Claude/Codex profiles.
+// The connection sheet is presented; the history is pushed (morph) from
+// `ChatProfileMainView` for Claude/Codex profiles.
+//
+// `AgentBridgeTranscriptView` below is retained as a standalone transcript
+// renderer but is no longer wired into the profile navigation.
 
 enum AgentBridgeProfile {
   static func displayName(for provider: String) -> String {
@@ -30,16 +38,6 @@ enum AgentBridgeProfile {
     presenter.present(host, animated: true)
   }
 
-  static func presentHistory(provider: String, chatId: String, from presenter: UIViewController) {
-    let root = AgentBridgeHistoryView(provider: provider, chatId: chatId)
-    let host = UIHostingController(rootView: root)
-    host.modalPresentationStyle = .pageSheet
-    if let sheet = host.sheetPresentationController {
-      sheet.detents = [.large()]
-      sheet.prefersGrabberVisible = true
-    }
-    presenter.present(host, animated: true)
-  }
 }
 
 // MARK: - Connection sheet (connect / disconnect / reconnect)
@@ -214,11 +212,16 @@ struct AgentBridgeTranscriptMessage: Identifiable {
   let text: String
 }
 
-struct AgentBridgeHistoryView: View {
+// Inline history list, designed to be PUSHED into the profile's own
+// NavigationStack (so it morph-expands from the "Chat History" row, matching the
+// normal contact history) rather than presented as a sheet. Selecting a topic
+// invokes `onOpenSession`, which loads that conversation into the default chat
+// as bubbles and dismisses the profile (no in-profile transcript).
+struct AgentBridgeHistoryInlineView: View {
   let provider: String
   let chatId: String
+  let onOpenSession: (AgentBridgeHistorySession) -> Void
 
-  @Environment(\.dismiss) private var dismiss
   @Environment(\.colorScheme) private var colorScheme
 
   @State private var sessions: [AgentBridgeHistorySession] = []
@@ -230,38 +233,33 @@ struct AgentBridgeHistoryView: View {
   private var displayName: String { AgentBridgeProfile.displayName(for: provider) }
 
   var body: some View {
-    NavigationStack {
-      Group {
-        if loading && sessions.isEmpty {
-          VStack(spacing: 12) {
-            ProgressView()
-            Text("Reading \(displayName) history from your computer…")
-              .font(.system(size: 13))
-              .foregroundStyle(palette.secondaryText)
-          }
-          .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if sessions.isEmpty {
-          VStack(spacing: 12) {
-            Image(systemName: errorMessage == nil ? "clock.badge.questionmark" : "laptopcomputer.slash")
-              .font(.system(size: 34, weight: .semibold))
-              .foregroundStyle(palette.secondaryText)
-            Text(errorMessage ?? "No \(displayName) conversations found on your computer.")
-              .font(.system(size: 14))
-              .foregroundStyle(palette.secondaryText)
-              .multilineTextAlignment(.center)
-              .padding(.horizontal, 28)
-          }
-          .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else {
-          List(sessions) { session in
-            NavigationLink {
-              AgentBridgeTranscriptView(
-                provider: provider,
-                chatId: chatId,
-                sessionId: session.id,
-                topic: session.topic
-              )
-            } label: {
+    Group {
+      if loading && sessions.isEmpty {
+        VStack(spacing: 12) {
+          ProgressView()
+          Text("Reading \(displayName) history from your computer…")
+            .font(.system(size: 13))
+            .foregroundStyle(palette.secondaryText)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+      } else if sessions.isEmpty {
+        VStack(spacing: 12) {
+          Image(systemName: errorMessage == nil ? "clock.badge.questionmark" : "laptopcomputer.slash")
+            .font(.system(size: 34, weight: .semibold))
+            .foregroundStyle(palette.secondaryText)
+          Text(errorMessage ?? "No \(displayName) conversations found on your computer.")
+            .font(.system(size: 14))
+            .foregroundStyle(palette.secondaryText)
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, 28)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+      } else {
+        List(sessions) { session in
+          Button {
+            onOpenSession(session)
+          } label: {
+            HStack(spacing: 12) {
               VStack(alignment: .leading, spacing: 4) {
                 Text(session.topic)
                   .font(.system(size: 15, weight: .semibold))
@@ -282,20 +280,22 @@ struct AgentBridgeHistoryView: View {
                 .font(.system(size: 12))
                 .foregroundStyle(palette.secondaryText)
               }
-              .padding(.vertical, 2)
+              Spacer(minLength: 8)
+              Image(systemName: "chevron.right")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(palette.secondaryText.opacity(0.7))
             }
+            .padding(.vertical, 2)
+            .contentShape(Rectangle())
           }
-          .listStyle(.plain)
+          .buttonStyle(.plain)
         }
-      }
-      .navigationTitle("\(displayName) history")
-      .navigationBarTitleDisplayMode(.inline)
-      .toolbar {
-        ToolbarItem(placement: .topBarTrailing) {
-          Button("Done") { dismiss() }
-        }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
       }
     }
+    .navigationTitle("\(displayName) history")
+    .navigationBarTitleDisplayMode(.inline)
     .onReceive(NotificationCenter.default.publisher(for: ChatEngine.didChangeNotification)) { note in
       handle(note)
     }

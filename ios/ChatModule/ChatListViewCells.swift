@@ -1327,10 +1327,74 @@ private struct BubbleLinkPreviewData {
   let icon: UIImage?
 }
 
+// Compact, Claude-Code-style label for one enriched tool node:
+//   "Read ChatEngine.swift", "Edit chat.ex  +12 −3", "Run git status", …
+// Mirrors the agent view's `agentNodeDisplayLabel` so the in-bubble compact feed
+// reads identically to the full agent view. Kept at file scope (not private to a
+// cell) so history rendering can reuse the same parsing style.
+func chatAgentNodeCompactLabel(_ node: ChatListRow.AgentProgressNode) -> String {
+  guard let kind = node.kind, !kind.isEmpty else { return node.label }
+  let verb: String
+  switch kind {
+  case "read": verb = "Read"
+  case "edit": verb = "Edit"
+  case "write": verb = "Create"
+  case "bash": verb = "Run"
+  case "search": verb = "Search"
+  case "web": verb = "Fetch"
+  case "task": verb = "Task"
+  case "todo": return "Planning"
+  default: return node.label
+  }
+  var text = verb
+  if let target = node.target, !target.isEmpty {
+    text += " \(target)"
+  }
+  var stats: [String] = []
+  if let added = node.added, added > 0 { stats.append("+\(added)") }
+  if let removed = node.removed, removed > 0 { stats.append("−\(removed)") }
+  if !stats.isEmpty {
+    text += "  " + stats.joined(separator: " ")
+  }
+  return text
+}
+
+// Compact multi-line feed for the live "loadings" (Read/Edit/Run rows building up
+// as Claude/Codex works), rendered inside the streaming chat bubble via the normal
+// text path. Each line is a status glyph + compact node label. Returns "" when
+// there is no enriched flat tool feed (the built-in Vibe AI nested tree keeps its
+// own minimalist behavior elsewhere).
+func chatAgentProgressFeedText(
+  _ nodes: [ChatListRow.AgentProgressNode],
+  maxVisible: Int = 6
+) -> String {
+  // Only the flat, enriched tool feed (Claude/Codex bridge) — every node depth 0
+  // and at least one carrying a `kind`.
+  let flat = nodes.filter { $0.depth == 0 }
+  guard !flat.isEmpty, flat.contains(where: { ($0.kind?.isEmpty == false) }) else {
+    return ""
+  }
+  return flat.suffix(maxVisible).map { node in
+    let glyph: String
+    switch node.status.lowercased() {
+    case "done", "complete", "completed", "success", "ok": glyph = "✓"
+    case "error", "failed", "failure": glyph = "✕"
+    default: glyph = "▸"  // running — not a markdown bullet glyph
+    }
+    return "\(glyph) \(chatAgentNodeCompactLabel(node))"
+  }.joined(separator: "\n")
+}
+
 private func bubbleBaseText(for row: ChatListRow) -> (text: String, addPrefix: Bool) {
   if row.isAgentMessage {
     // No ✦ spark prefix on agent bubbles — the agent surface doesn't want it.
-    return (row.plainContent ?? row.text, false)
+    // The default chat bubble is a COMPACT summary only. The live tool feed
+    // (Read/Edit/Run loadings) and full progress live in the pushed full-page
+    // agent view (reached via the per-bubble "view agent" affordance), NOT
+    // inflated inline here. `chatAgentNodeCompactLabel`/`chatAgentProgressFeedText`
+    // are kept at file scope so that surface (and history rendering) can reuse them.
+    let body = row.plainContent ?? row.text
+    return (body, false)
   }
   if row.isAgentMention {
     return (row.textWithoutMention, true)
@@ -5181,6 +5245,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private let pendingStatusView = ChatPendingStatusView()
   private let retryButton = UIButton(type: .system)
   private let agentRegenerateButton = UIButton(type: .system)
+  // "View agent" side button on completed agent bubbles — opens the native
+  // full-page agent surface (progress/thinking/tools) for that single task.
+  private let agentViewButton = UIButton(type: .system)
   private let notSentIndicator = UIImageView()
   private var notSentIndicatorShown = false
   private let agentActionBarView = ChatNativeAgentActionBarView()
@@ -5298,6 +5365,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     contentView.addSubview(dayLabel)
     contentView.addSubview(retryButton)
     contentView.addSubview(agentRegenerateButton)
+    contentView.addSubview(agentViewButton)
     contentView.addSubview(notSentIndicator)
     contentView.addSubview(agentActionBarView)
     agentActionBarView.onNativeEvent = { [weak self] payload in
@@ -5464,6 +5532,21 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     agentRegenerateButton.addTarget(
       self, action: #selector(handleAgentRegenerateTap), for: .touchUpInside)
 
+    // "View agent" — same side-of-bubble placement, icon only. Final styling/
+    // placement is refined against the design; this mirrors the regenerate button.
+    agentViewButton.isHidden = true
+    agentViewButton.layer.cornerCurve = .continuous
+    agentViewButton.layer.cornerRadius = 0
+    agentViewButton.backgroundColor = .clear
+    agentViewButton.setImage(
+      UIImage(
+        systemName: "chevron.forward.circle",
+        withConfiguration: UIImage.SymbolConfiguration(pointSize: 13.0, weight: .semibold)),
+      for: .normal)
+    agentViewButton.imageView?.contentMode = .center
+    agentViewButton.addTarget(
+      self, action: #selector(handleViewAgentTap), for: .touchUpInside)
+
     notSentIndicator.isHidden = true
     notSentIndicator.contentMode = .center
     notSentIndicator.isUserInteractionEnabled = true
@@ -5621,6 +5704,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     self.preferredLocalMediaURLOverride = preferredLocalMediaURLOverride
     agentActionBarView.isHidden = true
     agentRegenerateButton.isHidden = true
+    agentViewButton.isHidden = true
 
     if row.kind == .message, row.messageType == "agent_actions" {
       isGhostHidden = hiddenMessageId == row.messageId
@@ -5723,6 +5807,15 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       if showsRegenerate {
         agentRegenerateButton.tintColor = appearance.timeColorThem.withAlphaComponent(0.75)
         agentRegenerateButton.backgroundColor = .clear
+      }
+
+      // "View agent" side button on every completed agent bubble (not errored —
+      // those show regenerate instead). Opens the native full-page agent surface.
+      let showsViewAgent = !isGhostHidden && !selectionMode && showsAgentView(row)
+      agentViewButton.isHidden = !showsViewAgent
+      if showsViewAgent {
+        agentViewButton.tintColor = appearance.timeColorThem.withAlphaComponent(0.75)
+        agentViewButton.backgroundColor = .clear
       }
 
       // "Not sent" indicator on a failed outgoing message — sits in the me-side
@@ -5969,6 +6062,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     statusLabel.text = nil
     retryButton.isHidden = true
     agentRegenerateButton.isHidden = true
+    agentViewButton.isHidden = true
     notSentIndicator.isHidden = true
     notSentIndicator.transform = .identity
     notSentIndicator.alpha = 1.0
@@ -6439,6 +6533,22 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       )
       agentRegenerateButton.frame = pixelAlignedRect(
         CGRect(x: regenX, y: regenY, width: regenSize, height: regenSize)
+      )
+    }
+
+    if agentViewButton.isHidden {
+      agentViewButton.frame = .zero
+    } else {
+      // Same trailing-edge / bottom placement as regenerate (mutually exclusive
+      // with it: regenerate = errored turn, view-agent = completed turn).
+      let viewSize: CGFloat = 22.0
+      let viewX = min(bounds.width - viewSize - 8.0, bubbleFrame.maxX + 7.0)
+      let viewY = min(
+        max(4.0, bubbleFrame.maxY - viewSize - 5.0),
+        max(4.0, bounds.height - viewSize - 2.0)
+      )
+      agentViewButton.frame = pixelAlignedRect(
+        CGRect(x: viewX, y: viewY, width: viewSize, height: viewSize)
       )
     }
 
@@ -7865,6 +7975,24 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       "sourceText": row.agentActionSourceText ?? row.plainContent ?? row.text,
       "regeneratePrompt": row.agentRegeneratePrompt ?? "",
     ])
+  }
+
+  @objc private func handleViewAgentTap() {
+    guard let row, let messageId = row.messageId, !messageId.isEmpty else { return }
+    onAgentAction?([
+      "type": "viewAgent",
+      "messageId": messageId,
+      "chatId": row.chatId ?? "",
+    ])
+  }
+
+  /// Completed agent message that offers "view agent" (the full-page surface).
+  /// Mutually exclusive with regenerate (which is the errored-turn affordance).
+  private func showsAgentView(_ row: ChatListRow) -> Bool {
+    row.kind == .message
+      && row.isAgentMessage
+      && !row.isStreamingText
+      && !showsAgentRegenerate(row)
   }
 
   /// Agent message that offers regenerate. Now scoped to *errored* responses

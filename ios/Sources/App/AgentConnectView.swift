@@ -223,6 +223,9 @@ struct AgentConnectPanel: View {
 struct AgentBridgeRepositoryPickerView: View {
   let provider: String
   let displayName: String
+  /// Chat the picker was opened from — used to read this chat's session history so
+  /// the user can choose to continue a past session instead of starting a new task.
+  var chatId: String = ""
 
   @Environment(\.dismiss) private var dismiss
   @Environment(\.colorScheme) private var colorScheme
@@ -231,6 +234,9 @@ struct AgentBridgeRepositoryPickerView: View {
   @State private var workMode: AgentBridgeWorkMode = AgentBridgeSelectionStore.selectedWorkMode()
   @State private var isLoading = false
   @State private var errorMessage: String?
+  @State private var sessions: [AgentBridgeHistorySession] = []
+  @State private var historyRequestId: String?
+  @State private var resumeSelectionId: String?
 
   private var palette: AppThemePalette { AppThemePalette.resolve(for: colorScheme) }
 
@@ -259,6 +265,42 @@ struct AgentBridgeRepositoryPickerView: View {
           .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
           List {
+            Section {
+              // Default: start a fresh task for the next message.
+              resumeRow(
+                title: "Start a new task",
+                subtitle: "Each message runs on its own — no shared session",
+                icon: "plus.circle",
+                isSelected: resumeSelectionId == nil
+              ) {
+                resumeSelectionId = nil
+                AgentBridgeSelectionStore.clearResumeSession(provider: provider)
+              }
+              ForEach(sessions) { session in
+                resumeRow(
+                  title: session.topic.isEmpty ? "Session" : session.topic,
+                  subtitle: session.projectName.isEmpty
+                    ? "\(session.messageCount) messages"
+                    : "\(session.projectName) · \(session.messageCount) messages",
+                  icon: "arrow.uturn.left.circle",
+                  isSelected: resumeSelectionId == session.id
+                ) {
+                  resumeSelectionId = session.id
+                  AgentBridgeSelectionStore.setResumeSession(
+                    provider: provider,
+                    id: session.id,
+                    topic: session.topic
+                  )
+                }
+              }
+            } header: {
+              Text("Continue a session")
+            } footer: {
+              Text(sessions.isEmpty
+                ? "Past \(displayName) sessions on your computer will appear here."
+                : "Pick a session to resume it; otherwise each message starts a new task.")
+            }
+
             Section {
               ForEach(AgentBridgeWorkMode.allCases) { mode in
                 Button {
@@ -347,7 +389,91 @@ struct AgentBridgeRepositoryPickerView: View {
           .disabled(isLoading)
         }
       }
-      .task { await refresh() }
+      .task {
+        resumeSelectionId = AgentBridgeSelectionStore.selectedResumeSession(provider: provider)?.id
+        applyCachedHistory()
+        loadHistory()
+        await refresh()
+      }
+      .onReceive(NotificationCenter.default.publisher(for: ChatEngine.didChangeNotification)) { note in
+        guard (note.userInfo?["reason"] as? String) == "agentBridgeHistory" else { return }
+        if let pending = historyRequestId,
+          let rid = note.userInfo?["requestId"] as? String,
+          rid != pending {
+          return
+        }
+        applyCachedHistory()
+      }
+    }
+  }
+
+  @ViewBuilder
+  private func resumeRow(
+    title: String,
+    subtitle: String,
+    icon: String,
+    isSelected: Bool,
+    action: @escaping () -> Void
+  ) -> some View {
+    Button(action: action) {
+      HStack(spacing: 12) {
+        Image(systemName: icon)
+          .font(.system(size: 17, weight: .medium))
+          .foregroundStyle(palette.accent)
+          .frame(width: 24)
+        VStack(alignment: .leading, spacing: 3) {
+          Text(title)
+            .font(.system(size: 15, weight: .semibold))
+            .foregroundStyle(palette.text)
+            .lineLimit(1)
+          Text(subtitle)
+            .font(.system(size: 12))
+            .foregroundStyle(palette.secondaryText)
+            .lineLimit(1)
+        }
+        Spacer(minLength: 0)
+        if isSelected {
+          Image(systemName: "checkmark.circle.fill")
+            .font(.system(size: 18, weight: .semibold))
+            .foregroundStyle(palette.accent)
+        }
+      }
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+  }
+
+  /// Ask the connected computer for this chat's session list (the reply lands via the
+  /// `agentBridgeHistory` change notification, then `applyCachedHistory` reads it).
+  private func loadHistory() {
+    guard !chatId.isEmpty else { return }
+    let result = ChatEngine.shared.requestAgentBridgeHistory([
+      "chatId": chatId,
+      "provider": provider,
+      "mode": "list",
+    ])
+    if (result["accepted"] as? Bool) == true {
+      historyRequestId = result["requestId"] as? String
+    }
+  }
+
+  private func applyCachedHistory() {
+    guard
+      !chatId.isEmpty,
+      let payload = ChatEngine.shared.latestAgentBridgeHistory(chatId: chatId),
+      (payload["mode"] as? String ?? "list") == "list"
+    else { return }
+    let raw = payload["sessions"] as? [[String: Any]] ?? []
+    sessions = raw.compactMap { item in
+      guard let id = item["id"] as? String, !id.isEmpty else { return nil }
+      return AgentBridgeHistorySession(
+        id: id,
+        topic: (item["topic"] as? String) ?? "Untitled",
+        projectName: (item["projectName"] as? String) ?? "",
+        updatedAt: (item["updatedAt"] as? String) ?? "",
+        messageCount: (item["messageCount"] as? NSNumber)?.intValue
+          ?? (item["messageCount"] as? Int) ?? 0
+      )
     }
   }
 

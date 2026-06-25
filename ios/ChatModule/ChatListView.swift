@@ -2360,7 +2360,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       self?.handleNotSentTap(row: row)
     }
     cell.onAgentAction = { [weak self] payload in
-      self?.onNativeEvent(payload)
+      guard let self else { return }
+      // "view agent" opens the native full-page agent surface (ported VibeAgentKit
+      // renderer) for that single task — it does NOT go through the JS bridge.
+      if (payload["type"] as? String) == "viewAgent" {
+        let messageId = (payload["messageId"] as? String) ?? ""
+        self.presentAgentConversation(forMessageId: messageId)
+        return
+      }
+      self.onNativeEvent(payload)
     }
     cell.onSelectionToggle = { [weak self] row in
       self?.toggleMessageSelection(row: row)
@@ -4740,7 +4748,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       return [:]
     }
 
-    return [
+    var metadata: [String: Any] = [
       "agentBridgeProvider": provider,
       "agentBridgeRepoId": repository.id,
       "agentBridgeRepoName": repository.name,
@@ -4748,6 +4756,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       "agentBridgeCwd": repository.cwd,
       "agentBridgeWorkMode": AgentBridgeSelectionStore.selectedWorkMode().rawValue,
     ]
+    // Explicit resume: only attach a session id when the user picked "continue a
+    // session". Without it the bridge starts a fresh task for this message.
+    if let resume = AgentBridgeSelectionStore.selectedResumeSession(provider: provider) {
+      metadata["agentBridgeResumeSessionId"] = resume.id
+    }
+    return metadata
   }
 
   private func resolvedBridgeProviderForOutgoing(
@@ -4792,7 +4806,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let repositoryName = AgentBridgeSelectionStore.selectedRepository()?.name ?? "Pick repo"
     let mode = AgentBridgeSelectionStore.selectedWorkMode()
     let suffix = mode == .readOnly ? "" : " · \(mode.title)"
-    inputBar?.setAgentControlTitle(repositoryName + suffix)
+    // Make a sticky resume selection visible so the user knows this message will
+    // continue a session rather than start a new task.
+    let resumeSuffix =
+      (currentBridgeProvider.flatMap { AgentBridgeSelectionStore.selectedResumeSession(provider: $0) } != nil)
+      ? " · ↺" : ""
+    inputBar?.setAgentControlTitle(repositoryName + suffix + resumeSuffix)
   }
 
   @objc private func handleAgentBridgeSelectionChanged(_ notification: Notification) {
@@ -5280,6 +5299,55 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       responder = current.next
     }
     return window?.rootViewController
+  }
+
+  // MARK: - Native full-page agent surface (VibeAgentConversationViewController)
+
+  /// Push the full-page agent view for the task that produced `messageId`, seeded
+  /// with that task's prior messages (the user prompt + the agent reply) so the
+  /// page is never empty. The default chat list stays the multiplexing surface;
+  /// this view is single-task.
+  private func presentAgentConversation(forMessageId messageId: String) {
+    guard let agentIndex = rows.firstIndex(where: { $0.messageId == messageId }) else { return }
+    let agentRow = rows[agentIndex]
+
+    var taskRows: [ChatListRow] = []
+    // Prefer the explicit source (the user prompt that triggered this turn);
+    // otherwise fall back to the nearest preceding user message.
+    if let sourceId = agentRow.agentActionSourceId, !sourceId.isEmpty,
+       let promptRow = rows.first(where: { $0.messageId == sourceId }) {
+      taskRows.append(promptRow)
+    } else if agentIndex > 0 {
+      for i in stride(from: agentIndex - 1, through: 0, by: -1) {
+        let candidate = rows[i]
+        guard case .message = candidate.kind else { continue }
+        if candidate.isMe && !candidate.isAgentMessage {
+          taskRows.append(candidate)
+          break
+        }
+      }
+    }
+    taskRows.append(agentRow)
+
+    let vc = VibeAgentConversationViewController(
+      title: agentRow.agentName ?? "Agent",
+      messages: VibeAgentKitMap.messages(from: taskRows),
+      regeneratePrompt: agentRow.agentRegeneratePrompt ?? ""
+    )
+
+    guard let owner = topPresentingViewController() else { return }
+    if let nav = owner.navigationController {
+      nav.pushViewController(vc, animated: true)
+    } else {
+      let nav = UINavigationController(rootViewController: vc)
+      nav.modalPresentationStyle = .fullScreen
+      vc.navigationItem.leftBarButtonItem = UIBarButtonItem(
+        barButtonSystemItem: .close,
+        target: vc,
+        action: #selector(VibeAgentConversationViewController.closeTapped)
+      )
+      owner.present(nav, animated: true)
+    }
   }
 
   private func handleResolvedMediaSize(messageId: String?, mediaURL: String, size: CGSize) {

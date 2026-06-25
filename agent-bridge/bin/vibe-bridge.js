@@ -63,6 +63,7 @@ function parseArgs(argv) {
     else if (a === "--install" || a === "--service") out.install = true;
     else if (a === "--uninstall") out.uninstall = true;
     else if (a === "--status") out.status = true;
+    else if (a === "--foreground") out.foreground = true;
     else if (a === "--self-test") out.selfTest = true;
     else if (a === "--self-test-revert") out.selfTestRevert = true;
     else if (a === "--self-test-sequence") out.selfTestSequence = true;
@@ -431,6 +432,23 @@ function workModeFor(task) {
   return "read_only";
 }
 
+// Resume is now EXPLICIT and per-message. The phone attaches a session/thread id
+// only when the user picks "continue a session" in the input bar; absent that, every
+// run starts a FRESH session (new task per message). The bridge no longer
+// auto-resumes by chatId. `sessionByChat` is still captured below for /compact and
+// result reporting, but it does NOT drive --resume anymore.
+function resumeIdFor(task) {
+  if (!task) return null;
+  const raw =
+    task.resumeSessionId ||
+    task.agentBridgeResumeSessionId ||
+    task.resumeThreadId ||
+    task.agentBridgeResumeThreadId ||
+    null;
+  const trimmed = raw == null ? "" : String(raw).trim();
+  return trimmed || null;
+}
+
 function claudePermissionMode(task) {
   if (process.env.VIBE_CLAUDE_PERMISSION_MODE) return process.env.VIBE_CLAUDE_PERMISSION_MODE;
   switch (workModeFor(task)) {
@@ -475,8 +493,8 @@ function buildCommand(provider, prompt, chatId, task) {
   if (provider === "claude") {
     const mode = claudePermissionMode(task);
     const args = ["-p", "--output-format", "stream-json", "--permission-mode", mode];
-    const sid = sessionByChat.get(chatId);
-    if (sid) args.push("--resume", sid);
+    const resumeId = resumeIdFor(task);
+    if (resumeId) args.push("--resume", resumeId);
     args.push("--verbose");
     if (model) args.push("--model", model);
     args.push("--", cleaned);
@@ -484,14 +502,14 @@ function buildCommand(provider, prompt, chatId, task) {
   }
   if (provider === "codex") {
     const sandbox = codexSandbox(task);
-    const args = [
-      "exec",
-      "--json",
-      "--sandbox",
-      sandbox,
-      "--skip-git-repo-check",
-      "--ephemeral",
-    ];
+    const resumeId = resumeIdFor(task);
+    // `codex exec resume <thread-id>` continues a prior thread; a bare `codex exec`
+    // starts fresh. Resume needs the persisted thread on disk, so we must NOT pass
+    // `--ephemeral` in that case (ephemeral runs leave nothing to resume).
+    const args = ["exec"];
+    if (resumeId) args.push("resume", resumeId);
+    args.push("--json", "--sandbox", sandbox, "--skip-git-repo-check");
+    if (!resumeId) args.push("--ephemeral");
     if (model) args.push("--model", model);
     args.push(cleaned);
     return { cmd: process.env.VIBE_CODEX_COMMAND || "codex", args };
@@ -1259,6 +1277,19 @@ function promptLine(question) {
   });
 }
 
+function chooseFolderWithSystemPicker() {
+  if (process.platform !== "darwin") return null;
+  try {
+    return execFileSync(
+      "osascript",
+      ["-e", 'POSIX path of (choose folder with prompt "Select a project folder for Vibe Bridge")'],
+      { encoding: "utf8" }
+    ).trim();
+  } catch (_) {
+    return null;
+  }
+}
+
 function discoverRepositories() {
   const map = new Map();
   for (const root of defaultDiscoveryRoots()) scanRepoRoot(root, map);
@@ -1279,15 +1310,31 @@ async function pickRepositoriesInteractively() {
     return [custom || process.cwd()];
   }
 
-  console.log("\n[vibe-bridge] Which project(s) should @claude / @codex work on?\n");
+  console.log("\n[vibe-bridge] Choose project(s) for @claude / @codex:\n");
   found.forEach((r, i) => {
     console.log(`  ${String(i + 1).padStart(2)}. ${r.name}   ${r.path}`);
   });
-  console.log("\n  Enter numbers (e.g. 1,3), 'all', or a path. Blank = the first one.");
-  const answer = (await promptLine("  > ")).trim();
+  console.log("\n  A. All discovered repos");
+  console.log(`  C. Current folder   ${process.cwd()}`);
+  console.log("  P. Enter a project path");
+  if (process.platform === "darwin") console.log("  F. Select a folder");
+  console.log("\n  Enter a number, numbers like 1,3, or one of the options above. Blank = the first repo.");
+  const answer = (await promptLine("  Selection: ")).trim();
 
   if (!answer) return [found[0].path];
-  if (answer.toLowerCase() === "all") return found.map((r) => r.path);
+  const lower = answer.toLowerCase();
+  if (lower === "a" || lower === "all") return found.map((r) => r.path);
+  if (lower === "c" || lower === "current") return [process.cwd()];
+  if (lower === "p" || lower === "path") {
+    const custom = (await promptLine("  Project path: ")).trim();
+    return [custom || found[0].path];
+  }
+  if (lower === "f" || lower === "file" || lower === "folder" || lower === "select") {
+    const selected = chooseFolderWithSystemPicker();
+    if (selected) return [selected];
+    const custom = (await promptLine("  Project path: ")).trim();
+    return [custom || found[0].path];
+  }
   if (answer.startsWith("~") || answer.startsWith("/") || answer.startsWith(".")) {
     return [answer];
   }
@@ -1314,7 +1361,7 @@ async function resolveRepositories(config, persist) {
   let picked = !explicit && Array.isArray(config.repos) ? config.repos.slice() : [];
 
   const interactive = process.stdin.isTTY && !ARGS.serviceRun && !ARGS.noPick;
-  const shouldPrompt = interactive && (ARGS.pick || (!explicit && picked.length === 0));
+  const shouldPrompt = interactive && (ARGS.pick || ARGS.all || (!explicit && picked.length === 0));
 
   if (shouldPrompt) {
     if (ARGS.all) {
@@ -1409,6 +1456,13 @@ function installService(server, config) {
       `  • Logs: ${SERVICE_LOG}\n` +
       "  • Stop & remove: vibegram-bridge --uninstall\n"
   );
+}
+
+function shouldUseBackgroundByDefault() {
+  if (ARGS.serviceRun || ARGS.foreground) return false;
+  if (ARGS.selfTest || ARGS.selfTestRevert || ARGS.selfTestSequence) return false;
+  if (ARGS.uninstall || ARGS.status || ARGS.logout) return false;
+  return process.platform === "darwin";
 }
 
 function uninstallService() {
@@ -2003,8 +2057,19 @@ function connect(server, token, userId) {
     reconnectAfterMs: (tries) => [1000, 2000, 5000, 10000][tries - 1] || 10000,
   });
 
-  socket.onError(() => console.error("[vibe-bridge] socket error (will retry)"));
-  socket.onClose(() => console.log("[vibe-bridge] socket closed (will retry)"));
+  socket.onError((error) => {
+    const detail =
+      (error && (error.message || error.reason || error.code || error.type)) ||
+      (error ? JSON.stringify(error) : "");
+    console.error(`[vibe-bridge] socket error${detail ? `: ${detail}` : ""} (will retry)`);
+  });
+  socket.onClose((event) => {
+    const detail =
+      event && (event.code || event.reason)
+        ? ` code=${event.code || "-"} reason=${event.reason || "-"}`
+        : "";
+    console.log(`[vibe-bridge] socket closed${detail} (will retry)`);
+  });
   socket.connect();
 
   const channel = socket.channel(`bridge:${userId}`, {});
@@ -2024,8 +2089,7 @@ function connect(server, token, userId) {
       }
       if (!ARGS.serviceRun) {
         console.log(
-          "\n   Leave this terminal open, OR run it in the background so you can close it:\n" +
-            "     vibegram-bridge --install     (starts at login, auto-reconnects)\n" +
+          "\n   Foreground mode is active for this terminal.\n" +
             "   Change projects later with:  vibegram-bridge --pick\n"
         );
       }
@@ -2129,10 +2193,11 @@ async function main() {
       "Usage:\n" +
         "  vibegram-bridge --server <https://vibe-server>\n" +
         "      First run: shows a QR — scan it in the Vibe app (Claude/Codex → Connect → Scan),\n" +
-        "      then asks which project(s) to link. Later runs reuse the cached token + pick.\n\n" +
+        "      then asks which project(s) to link and starts the background service.\n\n" +
         "  vibegram-bridge --pick            re-choose which project(s) to link\n" +
         "  vibegram-bridge --all             link every git repo found near your home folder\n" +
-        "  vibegram-bridge --install         run in the background (starts at login, auto-reconnect)\n" +
+        "  vibegram-bridge --foreground      run in this terminal instead of the background service\n" +
+        "  vibegram-bridge --install         install/restart the background service\n" +
         "  vibegram-bridge --uninstall       stop & remove the background service\n" +
         "  vibegram-bridge --status          show background-service state + log path\n" +
         "  vibegram-bridge --self-test       run one local task and print bridge payload JSON\n" +
@@ -2170,7 +2235,11 @@ async function main() {
   // Background-service management (no socket needed).
   if (ARGS.uninstall) return uninstallService();
   if (ARGS.status) return serviceStatus();
-  if (ARGS.install) return installService(server, config);
+  if (ARGS.install) {
+    if (!config.bridge_token || !config.user_id) return installService(server, config);
+    await resolveRepositories(config, persist);
+    return installService(server, config);
+  }
 
   if (ARGS.code) {
     console.log("[vibe-bridge] pairing…");
@@ -2193,6 +2262,10 @@ async function main() {
 
   // Resolve which project(s) to expose (interactive first run, cached after).
   await resolveRepositories(config, persist);
+
+  if (shouldUseBackgroundByDefault()) {
+    return installService(server, config);
+  }
 
   connect(server, config.bridge_token, config.user_id);
 }

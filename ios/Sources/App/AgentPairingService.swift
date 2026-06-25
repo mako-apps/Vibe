@@ -128,6 +128,43 @@ enum AgentBridgeSelectionStore {
     NotificationCenter.default.post(name: didChangeNotification, object: nil)
   }
 
+  // MARK: - Resume target (per provider)
+  //
+  // Default behavior is "new task per message": each outgoing agent message starts a
+  // fresh session on the bridge. When the user explicitly picks "continue a session"
+  // in the input bar, we stash the chosen session id (provider-appropriate: Claude
+  // session_id / Codex thread_id) here; `agentBridgeMetadataForOutgoing` then attaches
+  // it as `agentBridgeResumeSessionId`. The selection is sticky (surfaced in the
+  // control title) until the user clears it or picks a different one.
+
+  private static func resumeKey(_ provider: String) -> String {
+    "agentBridge.resume.\(provider.lowercased())"
+  }
+
+  static func selectedResumeSession(provider: String) -> (id: String, topic: String)? {
+    guard
+      let data = UserDefaults.standard.data(forKey: resumeKey(provider)),
+      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+      let id = normalizedString(object["id"])
+    else {
+      return nil
+    }
+    return (id: id, topic: normalizedString(object["topic"]) ?? "Session")
+  }
+
+  static func setResumeSession(provider: String, id: String, topic: String) {
+    let object: [String: Any] = ["id": id, "topic": topic]
+    if let data = try? JSONSerialization.data(withJSONObject: object) {
+      UserDefaults.standard.set(data, forKey: resumeKey(provider))
+      NotificationCenter.default.post(name: didChangeNotification, object: nil)
+    }
+  }
+
+  static func clearResumeSession(provider: String) {
+    UserDefaults.standard.removeObject(forKey: resumeKey(provider))
+    NotificationCenter.default.post(name: didChangeNotification, object: nil)
+  }
+
   @discardableResult
   static func ensureValidSelection(from repositories: [AgentBridgeRepository]) -> AgentBridgeRepository? {
     // Keep the stored choice only while it still exists on the connected computer.
