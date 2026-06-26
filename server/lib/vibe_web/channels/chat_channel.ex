@@ -204,6 +204,39 @@ defmodule VibeWeb.ChatChannel do
     end
   end
 
+  # phone → server: open the full contents of a file the agent touched. We relay
+  # it to the user's bridge, which reads it (path-guarded), seals it with the
+  # runtime key, and replies with `file_result` (relayed back as
+  # `agent-bridge-file`). The server never sees the file in the clear.
+  def handle_in("agent-bridge-file", payload, socket) when is_map(payload) do
+    "chat:" <> chat_id = socket.topic
+    user_id = socket.assigns.user_id
+    provider = normalize_bridge_provider(payload["provider"] || payload["agentBridgeProvider"])
+    file_path = normalize_bridge_string(payload["path"] || payload["file"])
+
+    cond do
+      is_nil(provider) ->
+        {:reply, {:error, %{reason: "invalid_provider"}}, socket}
+
+      is_nil(file_path) ->
+        {:reply, {:error, %{reason: "invalid_path"}}, socket}
+
+      true ->
+        request_payload = %{
+          "requestId" => normalize_bridge_string(payload["requestId"]) || Ecto.UUID.generate(),
+          "provider" => provider,
+          "chatId" => chat_id,
+          "requesterUserId" => user_id,
+          "path" => file_path
+        }
+
+        case AgentBridge.dispatch_file(user_id, request_payload) do
+          :ok -> {:reply, {:ok, %{"requestId" => request_payload["requestId"]}}, socket}
+          {:error, :offline} -> {:reply, {:error, %{reason: "offline"}}, socket}
+        end
+    end
+  end
+
   @impl true
   def handle_in("typing", payload, socket) do
     broadcast_from!(socket, "typing", payload)
@@ -322,6 +355,7 @@ defmodule VibeWeb.ChatChannel do
     agent_mention = data["agentMention"] || false
     mentioned_agent_id = data["mentionedAgentId"] || data["mentioned_agent_id"]
     room_type = Chat.get_room_type(chat_id) || "dm"
+    participant_ids = Chat.get_participant_ids(chat_id)
 
     reserved_workers = reserved_workers_from_text(data)
 
@@ -396,13 +430,37 @@ defmodule VibeWeb.ChatChannel do
         value -> value
       end
 
+    team_trigger? = LocalAgentWorker.team_trigger?(dispatch_text)
+
+    team_dispatch_text =
+      if team_trigger?,
+        do: LocalAgentWorker.strip_team_trigger(dispatch_text),
+        else: dispatch_text
+
+    team_workers =
+      if room_type != "dm" and team_trigger? do
+        LocalAgentWorker.team_workers_for_participants(participant_ids)
+      else
+        []
+      end
+
     attachment_context = extract_agent_attachment_context(chat_id, data, user_id)
 
     Logger.info(
-      "[ChatChannel] dispatch_resolve chat_id=#{chat_id} room_type=#{room_type} reserved=#{length(reserved_workers)} standalone=#{not is_nil(standalone_agent)} local_worker=#{if local_worker, do: local_worker.handle, else: "nil"} dispatch_text?=#{is_binary(dispatch_text)} agent_text?=#{is_binary(agent_text) and String.trim(to_string(agent_text)) != ""} mentioned_username=#{inspect(mentioned_agent_username)} participants=#{inspect(Chat.get_participant_ids(chat_id))}"
+      "[ChatChannel] dispatch_resolve chat_id=#{chat_id} room_type=#{room_type} reserved=#{length(reserved_workers)} team=#{team_trigger?} team_workers=#{Enum.map_join(team_workers, ",", & &1.handle)} standalone=#{not is_nil(standalone_agent)} local_worker=#{if local_worker, do: local_worker.handle, else: "nil"} dispatch_text?=#{is_binary(dispatch_text)} agent_text?=#{is_binary(agent_text) and String.trim(to_string(agent_text)) != ""} mentioned_username=#{inspect(mentioned_agent_username)} participants=#{inspect(participant_ids)}"
     )
 
     cond do
+      room_type != "dm" and team_trigger? and length(team_workers) > 1 and
+          is_binary(team_dispatch_text) ->
+        spawn_team_worker_dispatches(
+          chat_id,
+          team_workers,
+          team_dispatch_text,
+          data,
+          user_id
+        )
+
       room_type != "dm" and is_nil(standalone_agent) and length(reserved_workers) > 1 and
           is_binary(dispatch_text) ->
         reserved_workers
@@ -473,6 +531,28 @@ defmodule VibeWeb.ChatChannel do
     end
   end
 
+  defp spawn_team_worker_dispatches(chat_id, workers, dispatch_text, data, requester_user_id) do
+    team_run_id = data["id"] || Ecto.UUID.generate()
+
+    workers
+    |> Enum.with_index()
+    |> Enum.each(fn {worker, index} ->
+      spawn_local_worker_dispatch(
+        chat_id,
+        worker,
+        dispatch_text,
+        data,
+        "reserved_worker_team",
+        requester_user_id,
+        skip_rate_limit: index > 0,
+        note_user_turn: false,
+        note_team_user_turn: index == 0,
+        team_run_id: team_run_id,
+        team_workers: workers
+      )
+    end)
+  end
+
   defp spawn_local_worker_dispatch(
          chat_id,
          worker,
@@ -483,6 +563,10 @@ defmodule VibeWeb.ChatChannel do
          opts \\ []
        ) do
     skip_rate_limit = Keyword.get(opts, :skip_rate_limit, false)
+    note_user_turn? = Keyword.get(opts, :note_user_turn, true)
+    note_team_user_turn? = Keyword.get(opts, :note_team_user_turn, false)
+    team_run_id = Keyword.get(opts, :team_run_id)
+    team_workers = Keyword.get(opts, :team_workers, [])
 
     cond do
       not LocalAgentWorker.user_allowed?(requester_user_id) ->
@@ -511,12 +595,23 @@ defmodule VibeWeb.ChatChannel do
         )
 
         bridge_prompt =
-          LocalAgentWorker.build_bridge_prompt(
-            chat_id,
-            worker,
-            dispatch_text,
-            requester_user_id
-          )
+          if is_binary(team_run_id) do
+            LocalAgentWorker.build_team_bridge_prompt(
+              chat_id,
+              worker,
+              dispatch_text,
+              requester_user_id,
+              team_workers,
+              team_run_id
+            )
+          else
+            LocalAgentWorker.build_bridge_prompt(
+              chat_id,
+              worker,
+              dispatch_text,
+              requester_user_id
+            )
+          end
 
         task_payload =
           %{
@@ -527,18 +622,34 @@ defmodule VibeWeb.ChatChannel do
             "replyToId" => data["id"],
             "requesterUserId" => requester_user_id
           }
+          |> Map.merge(local_worker_team_metadata(worker, team_run_id, team_workers))
           |> Map.merge(bridge_task_metadata(data))
 
         case AgentBridge.dispatch_task(requester_user_id, task_payload) do
           :ok ->
             # Record the human's prompt in the shared group thread (no-op in DMs)
             # only once we know it was actually dispatched.
-            LocalAgentWorker.note_bridge_user_turn(
-              chat_id,
-              worker,
-              dispatch_text,
-              requester_user_id
-            )
+            cond do
+              note_team_user_turn? ->
+                LocalAgentWorker.note_bridge_team_user_turn(
+                  chat_id,
+                  team_workers,
+                  dispatch_text,
+                  requester_user_id,
+                  team_run_id
+                )
+
+              note_user_turn? ->
+                LocalAgentWorker.note_bridge_user_turn(
+                  chat_id,
+                  worker,
+                  dispatch_text,
+                  requester_user_id
+                )
+
+              true ->
+                :ok
+            end
 
             Logger.info(
               "[ChatChannel] dispatched @#{worker.handle} to bridge user=#{requester_user_id} chat=#{chat_id}"
@@ -623,6 +734,17 @@ defmodule VibeWeb.ChatChannel do
           data["id"]
         )
     end
+  end
+
+  defp local_worker_team_metadata(_worker, nil, _team_workers), do: %{}
+
+  defp local_worker_team_metadata(worker, team_run_id, team_workers) do
+    %{
+      "teamMode" => "group_team",
+      "teamRunId" => team_run_id,
+      "teamWorker" => worker.handle,
+      "teamWorkers" => Enum.map(team_workers, & &1.handle)
+    }
   end
 
   defp spawn_standalone_dispatch(

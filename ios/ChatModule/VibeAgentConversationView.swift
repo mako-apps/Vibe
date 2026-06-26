@@ -130,6 +130,11 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   /// Stashed so we know which message's items to present.
   private var progressItemsByMessageId: [String: [VibeAgentKitProgressItem]] = [:]
 
+  /// Chat + provider context (history surface) so a runtime card can route a
+  /// full-file-open request to the user's bridge. Nil in the live agent view.
+  var agentBridgeChatId: String?
+  var agentBridgeProvider: String?
+
   init(
     title: String,
     subtitle: String = "",
@@ -412,8 +417,24 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
 
   private func presentRuntime(_ runtime: ChatListRow.AgentRuntimeSummary) {
     guard runtime.diff?.files.isEmpty == false else { return }
-    let controller = AgentRuntimeFilesViewController(runtime: runtime, appearance: .fallback)
-    navigationController?.pushViewController(controller, animated: true)
+    let controller = AgentRuntimeFilesViewController(
+      runtime: runtime,
+      appearance: .fallback,
+      chatId: agentBridgeChatId,
+      provider: agentBridgeProvider ?? runtime.provider
+    )
+    // The history surface isn't inside a UINavigationController, so a plain push
+    // would silently no-op. Push when we can; otherwise present a modal nav (the
+    // file→diff drill-down then works because it now has a nav stack).
+    if let nav = navigationController {
+      nav.pushViewController(controller, animated: true)
+    } else {
+      controller.navigationItem.leftBarButtonItem = UIBarButtonItem(
+        primaryAction: UIAction(title: "Done") { [weak self] _ in self?.dismiss(animated: true) }
+      )
+      let nav = UINavigationController(rootViewController: controller)
+      present(nav, animated: true)
+    }
   }
 
   // MARK: Scroll helpers

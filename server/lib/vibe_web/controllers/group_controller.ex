@@ -7,6 +7,7 @@ defmodule VibeWeb.GroupController do
 
   def create(conn, %{"name" => name, "memberIds" => member_ids}) do
     creator_id = conn.assigns.current_user.id
+    ensure_local_agent_users(member_ids)
 
     invalid_agent =
       Enum.find(member_ids, fn uid ->
@@ -37,6 +38,7 @@ defmodule VibeWeb.GroupController do
   def add_members(conn, %{"id" => chat_id, "memberIds" => member_ids}) do
     requester_id = conn.assigns.current_user.id
     settings = Chat.get_participant_settings(chat_id, requester_id)
+    ensure_local_agent_users(member_ids)
 
     if settings && settings.role in ["owner", "admin"] do
       results =
@@ -69,6 +71,14 @@ defmodule VibeWeb.GroupController do
   defp addable_agent_user?(uid) do
     Agents.published_agent_user?(uid) or LocalAgentWorker.resolve_by_agent_user_id(uid) != nil
   end
+
+  defp ensure_local_agent_users(member_ids) when is_list(member_ids) do
+    if Enum.any?(member_ids, &(LocalAgentWorker.resolve_by_agent_user_id(&1) != nil)) do
+      LocalAgentWorker.ensure_agent_users()
+    end
+  end
+
+  defp ensure_local_agent_users(_), do: :ok
 
   def remove_member(conn, %{"id" => chat_id, "user_id" => user_id}) do
     requester_id = conn.assigns.current_user.id

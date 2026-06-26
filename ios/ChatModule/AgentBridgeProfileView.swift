@@ -500,6 +500,8 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
       messages: context.coordinator.seedMessages(),
       inputPlaceholder: "Ask \(AgentBridgeProfile.displayName(for: provider))"
     )
+    controller.agentBridgeChatId = chatId
+    controller.agentBridgeProvider = provider
     context.coordinator.controller = controller
     context.coordinator.requestDetailIfPossible()
     return controller
@@ -641,13 +643,26 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
         guard !text.isEmpty else { return nil }
         let roleText = ((item["role"] as? String) ?? "").lowercased()
         let role: VibeAgentKitChatRole = roleText == "user" ? .user : .assistant
+        // The bridge seals a reconstructed file-change card per message as
+        // `agentRuntimeEnc` (arte1 AES-GCM); the server only ever relays the
+        // ciphertext. Decrypt locally so a session you ran on your computer
+        // shows the same "N files changed +X −Y" card on the phone.
+        let runtime: ChatListRow.AgentRuntimeSummary? = AgentRuntimeCrypto
+          .decrypt(item["agentRuntimeEnc"])
+          .flatMap { parseAgentRuntimeSummary($0) }
+        if item["agentRuntimeEnc"] != nil {
+          NSLog(
+            "[AgentView] history rowparse enc present decrypted=\(runtime != nil) hasKey=\(AgentRuntimeCrypto.hasKey)"
+          )
+        }
         return VibeAgentKitChatMessage(
           id: (item["id"] as? String) ?? "\(roleText)-\(index)",
           role: role,
           text: text,
           timestamp: (item["ts"] as? String) ?? (item["timestamp"] as? String) ?? "",
           timestampMs: 0,
-          isStreaming: false
+          isStreaming: false,
+          runtime: runtime
         )
       }
     }

@@ -28,6 +28,7 @@ defmodule Vibe.AI.LocalAgentWorker do
   @rate_limit_table :local_agent_worker_ratelimit
   @session_table :local_agent_worker_sessions
   @default_cooldown_ms 8_000
+  @worker_order ["claude", "codex"]
 
   @workers %{
     "codex" => %{
@@ -56,7 +57,10 @@ defmodule Vibe.AI.LocalAgentWorker do
   def workers, do: @workers
 
   @doc "List of all worker definitions."
-  def list_workers, do: Map.values(@workers)
+  def list_workers do
+    @worker_order
+    |> Enum.map(&Map.fetch!(@workers, &1))
+  end
 
   @doc "The dedicated agent user id for a worker (claude/codex are distinct users)."
   def worker_agent_user_id(%{agent_user_id: id}), do: id
@@ -120,6 +124,48 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   def extract_reserved_mentions(_), do: []
+
+  @doc "Whether a message is explicitly asking the local AI workers to run as a team."
+  def team_trigger?(text) when is_binary(text) do
+    Regex.match?(~r/(?:^|\s)(?:@team|\/team)\b/i, text) or
+      Regex.match?(~r/^\s*team\s*:/i, text)
+  end
+
+  def team_trigger?(_), do: false
+
+  @doc "Remove the team command token before sending the actual user task to providers."
+  def strip_team_trigger(text) when is_binary(text) do
+    text
+    |> String.replace(~r/(^|\s)(?:@team|\/team)\b/i, "\\1")
+    |> String.replace(~r/^\s*team\s*:\s*/i, "")
+    |> String.trim()
+    |> case do
+      "" -> String.trim(text)
+      cleaned -> cleaned
+    end
+  end
+
+  def strip_team_trigger(text), do: text
+
+  @doc """
+  Return local workers whose shadow users are participants in the group.
+  This keeps each user's group isolated: the bridge dispatch still uses the
+  requester user id, while the participant list only decides which local agents
+  are allowed to respond in that group.
+  """
+  def team_workers_for_participants(participant_ids) when is_list(participant_ids) do
+    normalized_ids =
+      participant_ids
+      |> Enum.map(&(to_string(&1) |> String.downcase() |> String.trim()))
+      |> MapSet.new()
+
+    list_workers()
+    |> Enum.filter(fn worker ->
+      MapSet.member?(normalized_ids, String.downcase(worker.agent_user_id))
+    end)
+  end
+
+  def team_workers_for_participants(_), do: []
 
   def enabled? do
     truthy?(System.get_env("VIBE_LOCAL_AGENT_WORKERS"))
@@ -364,6 +410,7 @@ defmodule Vibe.AI.LocalAgentWorker do
         # only on the user's bridge and phone.
         runtime_enc = normalize_runtime_enc(Keyword.get(opts, :runtime_enc))
         runtime_can_revert = Keyword.get(opts, :can_revert) == true
+        team_metadata = normalize_team_metadata(opts)
         extracted = extract_result(worker, output)
         progress_nodes = progress_nodes_with_runtime(extracted.progress_nodes, runtime)
         ok = exit_status == 0
@@ -403,6 +450,7 @@ defmodule Vibe.AI.LocalAgentWorker do
           |> maybe_put("agentRuntime", runtime)
           |> maybe_put("agentRuntimeEnc", runtime_enc)
           |> maybe_put("agentRuntimeCanRevert", if(runtime_can_revert, do: true))
+          |> Map.merge(team_metadata)
 
         result =
           post_worker_message(
@@ -477,6 +525,57 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   def build_bridge_prompt(_chat_id, _worker, dispatch_text, _requester), do: dispatch_text
 
+  @doc """
+  Build a team-run prompt for a worker. The server remains the coordinator and
+  the selected repo remains on the user's bridge machine; the prompt gives both
+  agents a stable team run id plus an optional shared repo handoff file.
+  """
+  def build_team_bridge_prompt(
+        chat_id,
+        worker,
+        dispatch_text,
+        requester_user_id,
+        team_workers,
+        team_run_id
+      )
+      when is_binary(chat_id) and is_map(worker) and is_binary(dispatch_text) do
+    if group_chat?(chat_id) do
+      context = group_collaboration_context(chat_id, requester_user_id)
+      teammate_names = team_workers_label(team_workers)
+      teammate_handles = team_workers_handles(team_workers)
+      handoff_path = ".vibe/team/#{safe_team_run_id(team_run_id)}.md"
+
+      """
+      You are #{worker.label} in a Vibe team run.
+
+      Team run id: #{team_run_id || "unknown"}
+      Teammates in this run: #{teammate_names}
+      Team handles: #{teammate_handles}
+
+      Collaboration rules:
+      - Work as part of one team. Do not duplicate another teammate's likely work.
+      - If the user assigns work by name, follow that assignment exactly.
+      - If the user does not assign work, choose a non-overlapping slice that fits #{worker.label}'s strengths and say what you took.
+      - If the selected repo has AGENTS.md, CLAUDE.md, CODEX.md, or similar local instructions, read and follow them before editing.
+      - When repo writes are allowed, use #{handoff_path} as the shared handoff file. Keep edits additive under a "#{worker.label}" section: ownership, findings, files changed, blockers, and next steps.
+      - If a teammate is offline, unavailable, or rate-limited, say that clearly and continue with useful work that will not conflict.
+      - Final replies should include what you completed, what remains, and any handoff needed by the other teammate.
+
+      Shared Vibe group memory:
+      #{context_or_empty(context)}
+
+      Latest team request:
+      #{dispatch_text}
+      """
+      |> String.trim()
+    else
+      dispatch_text
+    end
+  end
+
+  def build_team_bridge_prompt(_chat_id, _worker, dispatch_text, _requester, _workers, _run_id),
+    do: dispatch_text
+
   @doc "Record a human's prompt to a worker into the shared group memory (no-op in DMs)."
   def note_bridge_user_turn(chat_id, worker, text, requester_user_id)
       when is_binary(chat_id) and is_map(worker) do
@@ -498,6 +597,30 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   def note_bridge_user_turn(_chat_id, _worker, _text, _requester), do: :ok
+
+  @doc "Record a human team request once, instead of once per dispatched worker."
+  def note_bridge_team_user_turn(chat_id, workers, text, requester_user_id, team_run_id)
+      when is_binary(chat_id) and is_list(workers) do
+    if group_chat?(chat_id) do
+      GroupAgentMemory.append_message(
+        chat_id,
+        %{
+          "role" => "user",
+          "content" => clean_for_memory(strip_team_trigger(text)),
+          "user_id" => requester_user_id,
+          "sender_name" => sender_display_name(requester_user_id),
+          "target_agent" => "team",
+          "target_agents" => Enum.map(workers, & &1.handle),
+          "team_run_id" => team_run_id
+        },
+        acting_user_id: requester_user_id
+      )
+    end
+
+    :ok
+  end
+
+  def note_bridge_team_user_turn(_chat_id, _workers, _text, _requester, _team_run_id), do: :ok
 
   @doc "Record a worker's answer into the shared group memory (no-op in DMs)."
   def note_bridge_agent_turn(chat_id, worker, text, requester_user_id)
@@ -581,9 +704,21 @@ defmodule Vibe.AI.LocalAgentWorker do
     who = msg["sender_name"] || "A teammate"
 
     label =
-      case msg["target_agent"] do
-        target when is_binary(target) and target != "" -> "#{who} → #{String.capitalize(target)}"
-        _ -> who
+      cond do
+        msg["target_agent"] == "team" ->
+          "#{who} -> Team"
+
+        is_binary(msg["target_agent"]) and msg["target_agent"] != "" ->
+          "#{who} -> #{String.capitalize(msg["target_agent"])}"
+
+        true ->
+          who
+      end
+
+    label =
+      case msg["team_run_id"] do
+        run_id when is_binary(run_id) and run_id != "" -> "#{label} (team #{run_id})"
+        _ -> label
       end
 
     case truncate_line(msg["content"]) do
@@ -610,11 +745,52 @@ defmodule Vibe.AI.LocalAgentWorker do
   # scrubber never mangles our context labels, and labels stay clean.
   defp clean_for_memory(text) when is_binary(text) do
     text
-    |> String.replace(~r/(^|\s)@(claude|codex)\b/iu, "\\1")
+    |> String.replace(~r/(^|\s)@(claude|codex|team)\b/iu, "\\1")
+    |> String.replace(~r/(^|\s)\/team\b/iu, "\\1")
+    |> String.replace(~r/^\s*team\s*:\s*/iu, "")
     |> String.trim()
   end
 
   defp clean_for_memory(_), do: ""
+
+  defp team_workers_label(workers) do
+    workers
+    |> List.wrap()
+    |> Enum.map(& &1.label)
+    |> Enum.reject(&(is_nil(&1) or &1 == ""))
+    |> case do
+      [] -> "Claude, Codex"
+      names -> Enum.join(names, ", ")
+    end
+  end
+
+  defp team_workers_handles(workers) do
+    workers
+    |> List.wrap()
+    |> Enum.map(&"@#{&1.handle}")
+    |> Enum.reject(&(&1 == "@"))
+    |> case do
+      [] -> "@claude, @codex"
+      handles -> Enum.join(handles, ", ")
+    end
+  end
+
+  defp context_or_empty(""), do: "No previous shared group memory yet."
+  defp context_or_empty(nil), do: "No previous shared group memory yet."
+  defp context_or_empty(context), do: context
+
+  defp safe_team_run_id(nil), do: "current"
+
+  defp safe_team_run_id(value) do
+    value
+    |> to_string()
+    |> String.replace(~r/[^A-Za-z0-9_.-]+/, "-")
+    |> String.trim("-")
+    |> case do
+      "" -> "current"
+      safe -> String.slice(safe, 0, 80)
+    end
+  end
 
   defp sender_display_name(user_id) when is_binary(user_id) do
     case Vibe.Accounts.get_user(user_id) do
@@ -668,23 +844,34 @@ defmodule Vibe.AI.LocalAgentWorker do
         extracted = extract_result(worker, accumulated_output)
         text = normalize_string(extracted.text) || ""
 
-        payload = %{
-          "chatId" => chat_id,
-          "streamId" => stream_id,
-          "userId" => worker.agent_user_id,
-          "isAgent" => true,
-          "text" => text,
-          "progressNodes" => extracted.progress_nodes,
-          "toolEvents" => extracted.tool_events,
-          "status" => "running"
-        }
-        |> maybe_put("taskId", metadata["taskId"] || metadata[:task_id])
-        |> maybe_put("sourceMessageId", metadata["sourceMessageId"] || metadata[:source_message_id])
-        |> maybe_put("replyToId", metadata["replyToId"] || metadata[:reply_to_id])
-        |> maybe_put("repoName", metadata["repoName"] || metadata[:repo_name])
-        |> maybe_put("cwd", metadata["cwd"] || metadata[:cwd])
-        |> maybe_put("workMode", metadata["workMode"] || metadata[:work_mode])
-        |> maybe_put("model", metadata["model"] || metadata[:model])
+        payload =
+          %{
+            "chatId" => chat_id,
+            "streamId" => stream_id,
+            "userId" => worker.agent_user_id,
+            "isAgent" => true,
+            "text" => text,
+            "progressNodes" => extracted.progress_nodes,
+            "toolEvents" => extracted.tool_events,
+            "status" => "running"
+          }
+          |> maybe_put("taskId", metadata["taskId"] || metadata[:task_id])
+          |> maybe_put(
+            "sourceMessageId",
+            metadata["sourceMessageId"] || metadata[:source_message_id]
+          )
+          |> maybe_put("replyToId", metadata["replyToId"] || metadata[:reply_to_id])
+          |> maybe_put("repoName", metadata["repoName"] || metadata[:repo_name])
+          |> maybe_put("cwd", metadata["cwd"] || metadata[:cwd])
+          |> maybe_put("workMode", metadata["workMode"] || metadata[:work_mode])
+          |> maybe_put("model", metadata["model"] || metadata[:model])
+          |> maybe_put("teamMode", metadata["teamMode"] || metadata[:team_mode])
+          |> maybe_put("teamRunId", metadata["teamRunId"] || metadata[:team_run_id])
+          |> maybe_put("teamWorker", metadata["teamWorker"] || metadata[:team_worker])
+          |> maybe_put(
+            "teamWorkers",
+            normalize_team_workers(metadata["teamWorkers"] || metadata[:team_workers])
+          )
 
         VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-stream", payload)
 
@@ -1350,7 +1537,8 @@ defmodule Vibe.AI.LocalAgentWorker do
     id =
       case message do
         text when is_binary(text) ->
-          "codex-error-" <> (:crypto.hash(:md5, text) |> Base.encode16(case: :lower) |> binary_part(0, 8))
+          "codex-error-" <>
+            (:crypto.hash(:md5, text) |> Base.encode16(case: :lower) |> binary_part(0, 8))
 
         _ ->
           unique_event_id("codex-error", index)
@@ -1447,12 +1635,23 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   defp codex_command_string(item) do
     cond do
-      is_binary(item["command"]) -> normalize_string(item["command"])
-      is_list(item["command"]) -> item["command"] |> Enum.join(" ") |> normalize_string()
-      is_binary(item["cmd"]) -> normalize_string(item["cmd"])
-      is_map(item["input"]) and is_binary(item["input"]["cmd"]) -> normalize_string(item["input"]["cmd"])
-      is_map(item["input"]) and is_binary(item["input"]["command"]) -> normalize_string(item["input"]["command"])
-      true -> nil
+      is_binary(item["command"]) ->
+        normalize_string(item["command"])
+
+      is_list(item["command"]) ->
+        item["command"] |> Enum.join(" ") |> normalize_string()
+
+      is_binary(item["cmd"]) ->
+        normalize_string(item["cmd"])
+
+      is_map(item["input"]) and is_binary(item["input"]["cmd"]) ->
+        normalize_string(item["input"]["cmd"])
+
+      is_map(item["input"]) and is_binary(item["input"]["command"]) ->
+        normalize_string(item["input"]["command"])
+
+      true ->
+        nil
     end
   end
 
@@ -1551,16 +1750,35 @@ defmodule Vibe.AI.LocalAgentWorker do
     exit_code = item["exit_code"]
 
     cond do
-      is_integer(exit_code) and exit_code != 0 -> "failed"
-      String.contains?(item_status, ["fail", "error", "abort", "interrupt", "not_found"]) -> "failed"
-      envelope in ["turn.failed", "error", "thread.failed"] -> "failed"
-      item_type in ["function_call_output"] -> "done"
-      String.contains?(item_status, ["complete", "done", "success"]) -> "done"
-      envelope in ["item.completed", "turn.completed"] -> "done"
-      is_integer(exit_code) and exit_code == 0 -> "done"
-      String.contains?(item_status, ["progress", "running", "start", "pending"]) -> "running"
-      envelope in ["item.started", "item.updated"] -> "running"
-      true -> "running"
+      is_integer(exit_code) and exit_code != 0 ->
+        "failed"
+
+      String.contains?(item_status, ["fail", "error", "abort", "interrupt", "not_found"]) ->
+        "failed"
+
+      envelope in ["turn.failed", "error", "thread.failed"] ->
+        "failed"
+
+      item_type in ["function_call_output"] ->
+        "done"
+
+      String.contains?(item_status, ["complete", "done", "success"]) ->
+        "done"
+
+      envelope in ["item.completed", "turn.completed"] ->
+        "done"
+
+      is_integer(exit_code) and exit_code == 0 ->
+        "done"
+
+      String.contains?(item_status, ["progress", "running", "start", "pending"]) ->
+        "running"
+
+      envelope in ["item.started", "item.updated"] ->
+        "running"
+
+      true ->
+        "running"
     end
   end
 
@@ -1815,6 +2033,25 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   defp normalize_runtime_controls(_), do: nil
+
+  defp normalize_team_metadata(opts) do
+    %{}
+    |> maybe_put("agentWorkerTeamMode", normalize_string(Keyword.get(opts, :team_mode)))
+    |> maybe_put("agentWorkerTeamRunId", normalize_string(Keyword.get(opts, :team_run_id)))
+    |> maybe_put("agentWorkerTeamWorker", normalize_string(Keyword.get(opts, :team_worker)))
+    |> maybe_put(
+      "agentWorkerTeamWorkers",
+      normalize_team_workers(Keyword.get(opts, :team_workers))
+    )
+  end
+
+  defp normalize_team_workers(values) when is_list(values) do
+    values
+    |> Enum.map(&normalize_string/1)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp normalize_team_workers(_), do: []
 
   defp normalize_runtime_int(value) when is_integer(value), do: value
 

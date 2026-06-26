@@ -1125,11 +1125,20 @@ final class AgentRuntimeFilesViewController: UITableViewController {
   private let runtime: ChatListRow.AgentRuntimeSummary
   private let appearance: ChatListAppearance
   private let files: [ChatListRow.AgentRuntimeFile]
+  private let chatId: String?
+  private let provider: String?
 
-  init(runtime: ChatListRow.AgentRuntimeSummary, appearance: ChatListAppearance) {
+  init(
+    runtime: ChatListRow.AgentRuntimeSummary,
+    appearance: ChatListAppearance,
+    chatId: String? = nil,
+    provider: String? = nil
+  ) {
     self.runtime = runtime
     self.appearance = appearance
     self.files = runtime.diff?.files ?? []
+    self.chatId = chatId
+    self.provider = provider
     super.init(style: .insetGrouped)
   }
 
@@ -1172,7 +1181,9 @@ final class AgentRuntimeFilesViewController: UITableViewController {
       file: file,
       patch: runtime.diff?.patch ?? "",
       patchTruncated: runtime.diff?.patchTruncated == true,
-      appearance: appearance
+      appearance: appearance,
+      chatId: chatId,
+      provider: provider ?? runtime.provider
     )
     navigationController?.pushViewController(controller, animated: true)
   }
@@ -1183,18 +1194,24 @@ private final class AgentRuntimePatchPreviewController: UIViewController {
   private let patch: String
   private let patchTruncated: Bool
   private let appearance: ChatListAppearance
+  private let chatId: String?
+  private let provider: String?
   private let textView = UITextView()
 
   init(
     file: ChatListRow.AgentRuntimeFile,
     patch: String,
     patchTruncated: Bool,
-    appearance: ChatListAppearance
+    appearance: ChatListAppearance,
+    chatId: String? = nil,
+    provider: String? = nil
   ) {
     self.file = file
     self.patch = patch
     self.patchTruncated = patchTruncated
     self.appearance = appearance
+    self.chatId = chatId
+    self.provider = provider
     super.init(nibName: nil, bundle: nil)
   }
 
@@ -1206,12 +1223,27 @@ private final class AgentRuntimePatchPreviewController: UIViewController {
     super.viewDidLoad()
     title = file.name
     view.backgroundColor = appearance.isDark ? .black : .systemBackground
-    navigationItem.rightBarButtonItem = UIBarButtonItem(
-      image: UIImage(systemName: "doc.on.doc"),
-      style: .plain,
-      target: self,
-      action: #selector(handleCopy)
-    )
+    var rightItems = [
+      UIBarButtonItem(
+        image: UIImage(systemName: "doc.on.doc"),
+        style: .plain,
+        target: self,
+        action: #selector(handleCopy)
+      )
+    ]
+    // Open the FULL file (fetched from the bridge, E2E) when we know the chat +
+    // provider to route the request — like the Codex/ChatGPT mobile file view.
+    if let chatId, !chatId.isEmpty, let provider, !provider.isEmpty {
+      rightItems.append(
+        UIBarButtonItem(
+          image: UIImage(systemName: "doc.text.magnifyingglass"),
+          style: .plain,
+          target: self,
+          action: #selector(handleOpenFile)
+        )
+      )
+    }
+    navigationItem.rightBarButtonItems = rightItems
 
     textView.translatesAutoresizingMaskIntoConstraints = false
     textView.isEditable = false
@@ -1271,6 +1303,172 @@ private final class AgentRuntimePatchPreviewController: UIViewController {
       }
     }
     return ""
+  }
+
+  @objc private func handleCopy() {
+    UIPasteboard.general.string = textView.text
+  }
+
+  @objc private func handleOpenFile() {
+    guard let chatId, let provider else { return }
+    let viewer = AgentBridgeFileViewerController(
+      chatId: chatId,
+      provider: provider,
+      path: file.path,
+      fileName: file.name,
+      appearance: appearance
+    )
+    if let nav = navigationController {
+      nav.pushViewController(viewer, animated: true)
+    } else {
+      present(UINavigationController(rootViewController: viewer), animated: true)
+    }
+  }
+}
+
+// MARK: - AgentBridgeFileViewerController
+
+/// Shows the FULL contents of a file the agent touched, fetched on demand from
+/// the user's bridge. The bytes travel E2E-encrypted (`agentFileEnc`); the
+/// server only relays the opaque blob. Mirrors the Codex/ChatGPT mobile file view.
+final class AgentBridgeFileViewerController: UIViewController {
+  private let chatId: String
+  private let provider: String
+  private let path: String
+  private let fileName: String
+  private let appearance: ChatListAppearance
+  private let requestId = UUID().uuidString
+
+  private let textView = UITextView()
+  private let spinner = UIActivityIndicatorView(style: .large)
+  private let statusLabel = UILabel()
+  private var observer: NSObjectProtocol?
+  private var finished = false
+
+  init(
+    chatId: String,
+    provider: String,
+    path: String,
+    fileName: String,
+    appearance: ChatListAppearance
+  ) {
+    self.chatId = chatId
+    self.provider = provider
+    self.path = path
+    self.fileName = fileName
+    self.appearance = appearance
+    super.init(nibName: nil, bundle: nil)
+  }
+
+  required init?(coder: NSCoder) { return nil }
+
+  deinit {
+    if let observer { NotificationCenter.default.removeObserver(observer) }
+  }
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    title = fileName
+    view.backgroundColor = appearance.isDark ? .black : .systemBackground
+    navigationItem.rightBarButtonItem = UIBarButtonItem(
+      image: UIImage(systemName: "doc.on.doc"),
+      style: .plain,
+      target: self,
+      action: #selector(handleCopy)
+    )
+
+    textView.translatesAutoresizingMaskIntoConstraints = false
+    textView.isEditable = false
+    textView.isHidden = true
+    textView.alwaysBounceVertical = true
+    textView.backgroundColor = .clear
+    textView.textColor = appearance.isDark ? .white : .label
+    textView.font = .monospacedSystemFont(ofSize: 12.5, weight: .regular)
+    textView.textContainerInset = UIEdgeInsets(top: 16, left: 12, bottom: 24, right: 12)
+    view.addSubview(textView)
+
+    statusLabel.translatesAutoresizingMaskIntoConstraints = false
+    statusLabel.numberOfLines = 0
+    statusLabel.textAlignment = .center
+    statusLabel.font = .systemFont(ofSize: 14)
+    statusLabel.textColor = appearance.isDark ? UIColor.white.withAlphaComponent(0.6) : .secondaryLabel
+    statusLabel.text = "Loading file from your computer…"
+    view.addSubview(statusLabel)
+
+    spinner.translatesAutoresizingMaskIntoConstraints = false
+    spinner.color = appearance.isDark ? .white : .gray
+    spinner.startAnimating()
+    view.addSubview(spinner)
+
+    NSLayoutConstraint.activate([
+      textView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      textView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      textView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+      textView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+      spinner.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+      spinner.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+      statusLabel.topAnchor.constraint(equalTo: spinner.bottomAnchor, constant: 12),
+      statusLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+      statusLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+    ])
+
+    observer = NotificationCenter.default.addObserver(
+      forName: ChatEngine.didChangeNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] note in
+      guard let self else { return }
+      guard (note.userInfo?["reason"] as? String) == "agentBridgeFile" else { return }
+      guard (note.userInfo?["requestId"] as? String) == self.requestId else { return }
+      self.deliver()
+    }
+
+    let result = ChatEngine.shared.requestAgentBridgeFile([
+      "chatId": chatId,
+      "provider": provider,
+      "path": path,
+      "requestId": requestId,
+    ])
+    if (result["accepted"] as? Bool) != true {
+      let reason = (result["reason"] as? String) ?? "request_failed"
+      fail("Couldn't reach your computer (\(reason)). Make sure the bridge is running.")
+      return
+    }
+
+    DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
+      guard let self, !self.finished else { return }
+      self.fail("Timed out waiting for the file from your computer.")
+    }
+  }
+
+  private func deliver() {
+    guard !finished else { return }
+    guard let payload = ChatEngine.shared.latestAgentBridgeFile(requestId: requestId) else { return }
+    if (payload["ok"] as? Bool) == false {
+      fail((payload["message"] as? String) ?? "The file could not be read.")
+      return
+    }
+    guard let decrypted = AgentRuntimeCrypto.decrypt(payload["agentFileEnc"]),
+      let content = decrypted["content"] as? String
+    else {
+      fail("This file is sealed and can't be opened on this phone yet — sync the encryption key from the bridge.")
+      return
+    }
+    finished = true
+    spinner.stopAnimating()
+    statusLabel.isHidden = true
+    textView.isHidden = false
+    let truncated = (decrypted["truncated"] as? Bool) == true
+    textView.text = truncated ? content + "\n\n[File truncated — too large to show in full]" : content
+  }
+
+  private func fail(_ message: String) {
+    guard !finished else { return }
+    finished = true
+    spinner.stopAnimating()
+    textView.isHidden = true
+    statusLabel.isHidden = false
+    statusLabel.text = message
   }
 
   @objc private func handleCopy() {

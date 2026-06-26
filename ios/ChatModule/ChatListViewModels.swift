@@ -1270,7 +1270,9 @@ private func parseAgentProgressNodes(_ raw: Any?) -> [ChatListRow.AgentProgressN
   }
 }
 
-private func parseAgentRuntimeSummary(_ raw: Any?) -> ChatListRow.AgentRuntimeSummary? {
+// Module-internal (not file-private) so the agent-bridge history renderer can
+// reuse it to parse the decrypted runtime card for locally-run sessions.
+func parseAgentRuntimeSummary(_ raw: Any?) -> ChatListRow.AgentRuntimeSummary? {
   guard let object = raw as? [String: Any] else {
     NSLog("[AgentView] parseRuntime: raw is NOT a dict (type=\(raw.map { String(describing: type(of: $0)) } ?? "nil")) -> nil (no card)")
     return nil

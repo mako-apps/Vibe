@@ -349,6 +349,21 @@ defmodule Vibe.AgentBridge do
     end
   end
 
+  @doc """
+  Ask a user's connected bridge daemon for the full contents of a file the agent
+  touched. The daemon reads it only if the path is inside a linked repo, seals
+  the bytes with the runtime key (the server stays blind), and replies with a
+  `file_result` over the bridge channel, relayed back to the requesting phone.
+  """
+  def dispatch_file(user_id, payload) when is_binary(user_id) and is_map(payload) do
+    if online?(user_id) do
+      VibeWeb.Endpoint.broadcast(topic(user_id), "file_request", payload)
+      :ok
+    else
+      {:error, :offline}
+    end
+  end
+
   # ── Helpers ─────────────────────────────────────────────────────────
 
   defp hash_token(token), do: :crypto.hash(:sha256, token) |> Base.encode16(case: :lower)
@@ -464,12 +479,36 @@ defmodule Vibe.AgentBridge do
           normalize(
             task["pendingCommand"] || task[:pendingCommand] || task["pending_command"] ||
               task[:pending_command]
+          ),
+        "teamMode" =>
+          normalize(task["teamMode"] || task[:teamMode] || task["team_mode"] || task[:team_mode]),
+        "teamRunId" =>
+          normalize(
+            task["teamRunId"] || task[:teamRunId] || task["team_run_id"] || task[:team_run_id]
+          ),
+        "teamWorker" =>
+          normalize(
+            task["teamWorker"] || task[:teamWorker] || task["team_worker"] ||
+              task[:team_worker]
+          ),
+        "teamWorkers" =>
+          normalize_string_list(
+            task["teamWorkers"] || task[:teamWorkers] || task["team_workers"] ||
+              task[:team_workers]
           )
       }
     end
   end
 
   defp normalize_running_task(_), do: nil
+
+  defp normalize_string_list(values) when is_list(values) do
+    values
+    |> Enum.map(&normalize/1)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp normalize_string_list(_), do: []
 
   defp normalize_repository(repo) when is_map(repo) do
     path = normalize(repo["path"] || repo[:path] || repo["cwd"] || repo[:cwd])

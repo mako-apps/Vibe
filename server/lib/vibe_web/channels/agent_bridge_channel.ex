@@ -76,6 +76,7 @@ defmodule VibeWeb.AgentBridgeChannel do
     lines = Enum.take([line | state.lines], @max_stream_lines)
     accumulated = lines |> Enum.reverse() |> Enum.join("\n")
     task_id = payload["taskId"] || payload["task_id"] || Map.get(state, :task_id)
+
     source_message_id =
       payload["sourceMessageId"] ||
         payload["source_message_id"] ||
@@ -91,7 +92,14 @@ defmodule VibeWeb.AgentBridgeChannel do
         repo_name: payload["repoName"] || payload["repo_name"] || Map.get(state, :repo_name),
         cwd: payload["cwd"] || Map.get(state, :cwd),
         work_mode: payload["workMode"] || payload["work_mode"] || Map.get(state, :work_mode),
-        model: payload["model"] || Map.get(state, :model)
+        model: payload["model"] || Map.get(state, :model),
+        team_mode: payload["teamMode"] || payload["team_mode"] || Map.get(state, :team_mode),
+        team_run_id:
+          payload["teamRunId"] || payload["team_run_id"] || Map.get(state, :team_run_id),
+        team_worker:
+          payload["teamWorker"] || payload["team_worker"] || Map.get(state, :team_worker),
+        team_workers:
+          payload["teamWorkers"] || payload["team_workers"] || Map.get(state, :team_workers)
       })
 
     # The live tool/execution feed now renders INSIDE the chat bubble (via the
@@ -104,7 +112,11 @@ defmodule VibeWeb.AgentBridgeChannel do
       repo_name: state.repo_name,
       cwd: state.cwd,
       work_mode: state.work_mode,
-      model: state.model
+      model: state.model,
+      team_mode: state.team_mode,
+      team_run_id: state.team_run_id,
+      team_worker: state.team_worker,
+      team_workers: state.team_workers
     })
 
     {:noreply, assign(socket, :streams, Map.put(streams, chat_id, state))}
@@ -141,7 +153,11 @@ defmodule VibeWeb.AgentBridgeChannel do
             # verbatim and can never decrypt it (key lives only on the bridge +
             # phone). Never parse, normalize, or log its contents.
             runtime_enc: payload["agentRuntimeEnc"] || payload["agent_runtime_enc"],
-            can_revert: payload["canRevert"] || payload["can_revert"] || false
+            can_revert: payload["canRevert"] || payload["can_revert"] || false,
+            team_mode: payload["teamMode"] || payload["team_mode"],
+            team_run_id: payload["teamRunId"] || payload["team_run_id"],
+            team_worker: payload["teamWorker"] || payload["team_worker"],
+            team_workers: payload["teamWorkers"] || payload["team_workers"]
           )
         rescue
           err ->
@@ -168,6 +184,23 @@ defmodule VibeWeb.AgentBridgeChannel do
     else
       Logger.info(
         "[AgentBridge] history_result without chatId user=#{socket.assigns.user_id} requestId=#{inspect(payload["requestId"])}"
+      )
+    end
+
+    {:reply, :ok, socket}
+  end
+
+  # daemon → server: the sealed full contents of a file the phone asked to open
+  # (reply to a phone-issued `agent-bridge-file`). We relay it verbatim — the
+  # `agentFileEnc` blob is opaque to us — back to the requesting chat.
+  def handle_in("file_result", payload, socket) when is_map(payload) do
+    chat_id = payload["chatId"] || payload["chat_id"]
+
+    if is_binary(chat_id) and chat_id != "" do
+      VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-bridge-file", payload)
+    else
+      Logger.info(
+        "[AgentBridge] file_result without chatId user=#{socket.assigns.user_id} requestId=#{inspect(payload["requestId"])}"
       )
     end
 

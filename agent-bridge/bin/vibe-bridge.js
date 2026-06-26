@@ -1156,6 +1156,7 @@ function runBridgeCommand(channel, task, repo, beforeGit, command) {
     repoName: repo.name,
     cwd: repo.cwd || repo.path,
     workMode: workModeFor(task),
+    ...teamFieldsForTask(task),
     ...runtimeResultField(agentRuntime),
   });
   return true;
@@ -1184,6 +1185,7 @@ function runtimePayload({
     repoName: repo.name,
     cwd: repo.cwd || repo.path,
     workMode: workModeFor(task),
+    ...teamFieldsForTask(task),
     durationMs,
     dirtyBefore: !!(before && before.dirty),
     dirtyBeforeCount: (before && before.statusCount) || 0,
@@ -1360,7 +1362,27 @@ function runningTaskSummaries() {
     durationMs: Math.max(0, now - (entry.startedAt || now)),
     command: entry.command,
     pendingCommand: entry.command,
+    teamMode: entry.teamMode || null,
+    teamRunId: entry.teamRunId || null,
+    teamWorker: entry.teamWorker || null,
+    teamWorkers: Array.isArray(entry.teamWorkers) ? entry.teamWorkers : [],
   }));
+}
+
+function teamFieldsForTask(task) {
+  if (!task || typeof task !== "object") {
+    return { teamMode: null, teamRunId: null, teamWorker: null, teamWorkers: [] };
+  }
+  return {
+    teamMode: task.teamMode || task.team_mode || null,
+    teamRunId: task.teamRunId || task.team_run_id || null,
+    teamWorker: task.teamWorker || task.team_worker || null,
+    teamWorkers: Array.isArray(task.teamWorkers)
+      ? task.teamWorkers
+      : Array.isArray(task.team_workers)
+        ? task.team_workers
+        : [],
+  };
 }
 
 function pushBridgeStatus(channel) {
@@ -1688,6 +1710,14 @@ function runTask(channel, task) {
     workMode: workModeFor(task),
     model: modelFor(provider, chatId, task),
     command: compactCommand(built.cmd, built.args),
+    teamMode: task.teamMode || task.team_mode || null,
+    teamRunId: task.teamRunId || task.team_run_id || null,
+    teamWorker: task.teamWorker || task.team_worker || null,
+    teamWorkers: Array.isArray(task.teamWorkers)
+      ? task.teamWorkers
+      : Array.isArray(task.team_workers)
+        ? task.team_workers
+        : [],
     startedAt,
   });
   pushBridgeStatus(channel);
@@ -1701,6 +1731,14 @@ function runTask(channel, task) {
     cwd,
     workMode: workModeFor(task),
     model: modelFor(provider, chatId, task) || "provider default",
+    teamMode: task.teamMode || task.team_mode || null,
+    teamRunId: task.teamRunId || task.team_run_id || null,
+    teamWorker: task.teamWorker || task.team_worker || null,
+    teamWorkers: Array.isArray(task.teamWorkers)
+      ? task.teamWorkers
+      : Array.isArray(task.team_workers)
+        ? task.team_workers
+        : [],
     stage: "started",
     command: compactCommand(built.cmd, built.args),
     line: JSON.stringify({
@@ -1800,6 +1838,7 @@ function runTask(channel, task) {
       repoName: repo.name,
       cwd,
       workMode: workModeFor(task),
+      ...teamFieldsForTask(task),
       ...runtimeResultField(agentRuntime),
     });
   });
@@ -1828,7 +1867,7 @@ function runTask(channel, task) {
 // `list` returns lightweight topic summaries; `detail` returns the transcript.
 
 const HISTORY_LIST_LIMIT = 40;
-const HISTORY_MSG_LIMIT = 250;
+const HISTORY_MSG_LIMIT = 600;
 
 function clip(value, n) {
   if (typeof value !== "string") return "";
@@ -1945,6 +1984,198 @@ function claudeSessionFiles() {
   return out;
 }
 
+// ── History runtime reconstruction ──────────────────────────────────
+// Browsing a past session must show the same "N files changed +X −Y" card the
+// live run produces — including sessions you ran directly on your computer
+// (not from the phone). The live path diffs the working tree; history can't
+// (the tree has moved on, or the run happened elsewhere), so we rebuild the
+// card from the transcript's own edit operations: Claude `tool_use`
+// (Edit/MultiEdit/Write/NotebookEdit) and Codex `apply_patch` envelopes. The
+// output is the exact `diff` shape runtimePayload() emits, so the iOS card
+// renders unchanged, and it is sealed via runtimeResultField() → the server
+// only ever sees ciphertext.
+const MAX_RUNTIME_FILES = 80;
+
+function countTextLines(value) {
+  const s = value == null ? "" : String(value);
+  if (s === "") return 0;
+  const trimmed = s.replace(/\n+$/, "");
+  return trimmed === "" ? 1 : trimmed.split("\n").length;
+}
+
+function newRuntimeAccumulator() {
+  return { byPath: new Map(), order: [], additions: 0, deletions: 0, patch: "", patchTruncated: false };
+}
+
+function accumulateRuntimeFile(acc, filePath, status, additions, deletions, patchBlock) {
+  const clean = diffFilePath(filePath);
+  if (!clean) return;
+  let entry = acc.byPath.get(clean);
+  if (!entry) {
+    entry = { path: clean, name: path.basename(clean), status, additions: 0, deletions: 0 };
+    acc.byPath.set(clean, entry);
+    acc.order.push(clean);
+  } else if (entry.status !== status && entry.status !== "A" && entry.status !== "A?") {
+    entry.status = status === "D" ? "D" : "M";
+  }
+  entry.additions += additions;
+  entry.deletions += deletions;
+  acc.additions += additions;
+  acc.deletions += deletions;
+  if (patchBlock && !acc.patchTruncated) {
+    if (acc.patch.length + patchBlock.length > MAX_DIFF_BYTES) acc.patchTruncated = true;
+    else acc.patch += patchBlock;
+  }
+}
+
+// Build a git-style unified block from a before/after string pair.
+function unifiedDiffBlock(filePath, oldStr, newStr, status) {
+  const rel = diffFilePath(filePath);
+  if (!rel) return "";
+  const oldLines = oldStr == null || oldStr === "" ? [] : String(oldStr).replace(/\n$/, "").split("\n");
+  const newLines = newStr == null || newStr === "" ? [] : String(newStr).replace(/\n$/, "").split("\n");
+  const header =
+    `diff --git a/${rel} b/${rel}\n` +
+    (status === "A"
+      ? `new file mode 100644\n--- /dev/null\n+++ b/${rel}\n`
+      : `--- a/${rel}\n+++ b/${rel}\n`) +
+    `@@ -${oldLines.length ? "1," + oldLines.length : "0,0"} +${newLines.length ? "1," + newLines.length : "0,0"} @@\n`;
+  const body =
+    (oldLines.length ? oldLines.map((l) => "-" + l).join("\n") + "\n" : "") +
+    (newLines.length ? newLines.map((l) => "+" + l).join("\n") + "\n" : "");
+  return header + body;
+}
+
+// Claude assistant content blocks → accumulate file edits.
+function collectClaudeEdits(acc, content) {
+  if (!Array.isArray(content)) return;
+  for (const b of content) {
+    if (!b || b.type !== "tool_use") continue;
+    const inp = b.input || {};
+    if (b.name === "Edit") {
+      const oldS = inp.old_string || "";
+      const newS = inp.new_string || "";
+      accumulateRuntimeFile(acc, inp.file_path, "M", countTextLines(newS), countTextLines(oldS), unifiedDiffBlock(inp.file_path, oldS, newS, "M"));
+    } else if (b.name === "MultiEdit" && Array.isArray(inp.edits)) {
+      for (const e of inp.edits) {
+        const oldS = (e && e.old_string) || "";
+        const newS = (e && e.new_string) || "";
+        accumulateRuntimeFile(acc, inp.file_path, "M", countTextLines(newS), countTextLines(oldS), unifiedDiffBlock(inp.file_path, oldS, newS, "M"));
+      }
+    } else if (b.name === "Write") {
+      const body = inp.content || "";
+      accumulateRuntimeFile(acc, inp.file_path, "A", countTextLines(body), 0, unifiedDiffBlock(inp.file_path, "", body, "A"));
+    } else if (b.name === "NotebookEdit") {
+      const target = inp.notebook_path || inp.file_path;
+      const oldS = inp.old_source || "";
+      const newS = inp.new_source || "";
+      accumulateRuntimeFile(acc, target, "M", countTextLines(newS), countTextLines(oldS), unifiedDiffBlock(target, oldS, newS, "M"));
+    }
+  }
+}
+
+// Codex `apply_patch` envelope → accumulate file edits. Codex emits these as a
+// `custom_tool_call` (sometimes `function_call`) whose `input` is the classic
+// `*** Begin Patch / *** Add|Update|Delete File:` text.
+function collectCodexEdits(acc, payload) {
+  const p = payload;
+  if (!p) return;
+  const isPatch =
+    (p.type === "custom_tool_call" || p.type === "function_call") && /apply_patch/i.test(p.name || "");
+  if (!isPatch) return;
+  const input = typeof p.input === "string" ? p.input : typeof p.arguments === "string" ? p.arguments : "";
+  if (!input) return;
+  for (const f of parseApplyPatchEnvelope(input)) {
+    accumulateRuntimeFile(acc, f.path, f.status, f.additions, f.deletions, f.patchBlock);
+  }
+}
+
+function parseApplyPatchEnvelope(input) {
+  const lines = String(input).split("\n");
+  const files = [];
+  let cur = null;
+  const flush = () => {
+    if (cur) files.push(cur);
+    cur = null;
+  };
+  for (const line of lines) {
+    const mAdd = line.match(/^\*\*\* Add File: (.+)$/);
+    const mUpd = line.match(/^\*\*\* Update File: (.+)$/);
+    const mDel = line.match(/^\*\*\* Delete File: (.+)$/);
+    if (mAdd || mUpd || mDel) {
+      flush();
+      cur = { path: (mAdd || mUpd || mDel)[1].trim(), status: mAdd ? "A" : mDel ? "D" : "M", additions: 0, deletions: 0, body: [] };
+      continue;
+    }
+    if (/^\*\*\* /.test(line)) continue; // Begin Patch / End Patch / Move to: …
+    if (!cur) continue;
+    cur.body.push(line);
+    if (line.startsWith("+") && !line.startsWith("+++")) cur.additions++;
+    else if (line.startsWith("-") && !line.startsWith("---")) cur.deletions++;
+  }
+  flush();
+  return files.map((f) => {
+    const rel = diffFilePath(f.path);
+    const head =
+      `diff --git a/${rel} b/${rel}\n` +
+      (f.status === "A"
+        ? `new file mode 100644\n--- /dev/null\n+++ b/${rel}\n`
+        : f.status === "D"
+          ? `deleted file mode 100644\n--- a/${rel}\n+++ /dev/null\n`
+          : `--- a/${rel}\n+++ b/${rel}\n`);
+    const body = f.body.join("\n");
+    return {
+      path: rel,
+      status: f.status,
+      additions: f.additions,
+      deletions: f.deletions,
+      patchBlock: head + (body ? body + (body.endsWith("\n") ? "" : "\n") : ""),
+    };
+  });
+}
+
+function buildHistoryRuntime(provider, acc) {
+  if (!acc.order.length) return null;
+  const files = acc.order.map((p) => acc.byPath.get(p));
+  return {
+    provider,
+    status: "done",
+    workMode: "history",
+    diff: {
+      git: false,
+      filesChanged: files.length,
+      additions: acc.additions,
+      deletions: acc.deletions,
+      files,
+      patch: acc.patch,
+      patchTruncated: acc.patchTruncated,
+    },
+    controls: { canCancel: false, canRevert: false },
+  };
+}
+
+// Seal ONE turn's reconstructed runtime onto a specific message, so each turn
+// shows the patch IT applied — inline, where it happened (matching the Codex
+// app) — instead of one consolidated card dumped at the end of the session.
+function sealHistoryRuntime(provider, message, acc) {
+  const runtime = buildHistoryRuntime(provider, acc);
+  if (!runtime) return false;
+  const field = runtimeResultField(runtime);
+  if (!field || !field.agentRuntimeEnc) return false; // no key → never send plaintext
+  Object.assign(message, field);
+  return true;
+}
+
+// A real user prompt (not a tool_result/tool-output envelope) opens a new turn.
+function messageHasUserText(m) {
+  if (!m) return false;
+  if (typeof m.content === "string") return m.content.trim().length > 0;
+  if (Array.isArray(m.content)) {
+    return m.content.some((b) => b && b.type === "text" && String(b.text || "").trim().length > 0);
+  }
+  return false;
+}
+
 async function listClaude(limit) {
   const files = claudeSessionFiles().sort((a, b) => b.mtime - a.mtime).slice(0, limit);
   const results = [];
@@ -1968,21 +2199,41 @@ async function claudeDetail(id, limit) {
   const match = claudeSessionFiles().find((s) => s.id === id);
   if (!match) return null;
   const messages = [];
+  let pending = newRuntimeAccumulator();
+  let lastAssistantInTurn = null;
   let topic = null;
+  // One card per user-turn: seal the edits made since the last user prompt onto
+  // that turn's final assistant message.
+  const flushTurn = () => {
+    if (lastAssistantInTurn && pending.order.length) {
+      sealHistoryRuntime("claude", lastAssistantInTurn, pending);
+    }
+    pending = newRuntimeAccumulator();
+    lastAssistantInTurn = null;
+  };
   await readJsonl(match.file, (ev) => {
     if (ev.type === "ai-title" && ev.aiTitle) topic = ev.aiTitle;
     if (ev.type !== "user" && ev.type !== "assistant") return;
     const m = ev.message || {};
+    if (ev.type === "user" && messageHasUserText(m)) flushTurn(); // new turn
+    if (ev.type === "assistant") collectClaudeEdits(pending, m.content);
     let text = "";
     if (typeof m.content === "string") text = m.content;
     else if (Array.isArray(m.content)) {
       text = m.content.filter((b) => b && b.type === "text").map((b) => b.text).join("\n").trim();
     }
     text = cleanMessageText(text);
-    if (!text) return;
-    messages.push({ role: ev.type, text: clip(text, 4000), ts: ev.timestamp });
-    if (messages.length >= limit) return false;
+    if (text && messages.length < limit) {
+      const msg = { role: ev.type, text: clip(text, 4000), ts: ev.timestamp };
+      if (ev.type === "assistant") lastAssistantInTurn = msg;
+      messages.push(msg);
+    }
+    if (messages.length >= limit) {
+      flushTurn();
+      return false;
+    }
   });
+  flushTurn();
   return { provider: "claude", id, topic: topic || (messages[0] && clip(messages[0].text, 80)) || "Untitled", project: match.project, projectName: path.basename(match.project), messages };
 }
 
@@ -2072,17 +2323,37 @@ async function codexDetail(id, limit) {
   }
   if (!match) return null;
   const messages = [];
+  let pending = newRuntimeAccumulator();
+  let lastAssistantInTurn = null;
   let project = "";
+  const flushTurn = () => {
+    if (lastAssistantInTurn && pending.order.length) {
+      sealHistoryRuntime("codex", lastAssistantInTurn, pending);
+    }
+    pending = newRuntimeAccumulator();
+    lastAssistantInTurn = null;
+  };
   await readJsonl(match.file, (ev) => {
     if (ev.type === "session_meta" && ev.payload) project = ev.payload.cwd || "";
-    if (ev.type !== "response_item" || !ev.payload || ev.payload.type !== "message") return;
-    const role = ev.payload.role;
-    if (role !== "user" && role !== "assistant") return;
-    let text = cleanMessageText(codexText(ev.payload.content));
-    if (!text || isContextMessage(codexText(ev.payload.content))) return;
-    messages.push({ role, text: clip(text, 4000), ts: ev.timestamp });
-    if (messages.length >= limit) return false;
+    if (ev.type !== "response_item" || !ev.payload) return;
+    const p = ev.payload;
+    collectCodexEdits(pending, p); // apply_patch items accumulate into the turn
+    if (p.type === "message" && (p.role === "user" || p.role === "assistant")) {
+      const raw = codexText(p.content);
+      if (p.role === "user" && raw.trim()) flushTurn(); // new turn
+      const text = cleanMessageText(raw);
+      if (text && !isContextMessage(raw) && messages.length < limit) {
+        const msg = { role: p.role, text: clip(text, 4000), ts: ev.timestamp };
+        if (p.role === "assistant") lastAssistantInTurn = msg;
+        messages.push(msg);
+      }
+    }
+    if (messages.length >= limit) {
+      flushTurn();
+      return false;
+    }
   });
+  flushTurn();
   const topic =
     messages.map((m) => cleanTopicCandidate(m.text)).find(Boolean) ||
     "Untitled";
@@ -2120,6 +2391,63 @@ function handleHistoryRequest(channel, payload) {
     .catch((err) => {
       channel.push("history_result", { ok: false, ...echo, message: err && err.message ? err.message : "history_failed" });
     });
+}
+
+// ── File open (full file contents, on demand) ───────────────────────
+// The phone can open a file the agent touched. We read it ONLY when it lives
+// inside a linked repository (never an arbitrary path), cap the size, and seal
+// the bytes with the runtime key so the server relays an opaque blob — the
+// user's source code never reaches the server in the clear.
+const MAX_FILE_BYTES = 2 * 1024 * 1024;
+
+function fileWithinLinkedRepo(absPath) {
+  const dir = realDir(path.dirname(absPath));
+  if (!dir) return null;
+  const full = path.join(dir, path.basename(absPath));
+  const inside = ADVERTISED_REPOSITORIES.some((repo) => {
+    const root = realDir(repo.cwd || repo.path);
+    return root && (full === root || full.startsWith(root + path.sep));
+  });
+  return inside ? full : null;
+}
+
+function handleFileRequest(channel, payload) {
+  const requestId = payload.requestId || payload.request_id || crypto.randomUUID();
+  const chatId = payload.chatId || payload.chat_id || null;
+  const provider = payload.provider || payload.agentBridgeProvider || "claude";
+  const rawPath = String(payload.path || payload.file || payload.filePath || "").trim();
+  const echo = { requestId, chatId, provider, path: rawPath };
+  try {
+    if (!rawPath) throw new Error("missing path");
+    const absPath = path.resolve(expandHome(rawPath) || rawPath);
+    const safePath = fileWithinLinkedRepo(absPath);
+    if (!safePath) throw new Error("that file is outside your linked repositories");
+    const stat = fs.statSync(safePath);
+    if (!stat.isFile()) throw new Error("not a file");
+    let truncated = false;
+    let content;
+    if (stat.size > MAX_FILE_BYTES) {
+      const fd = fs.openSync(safePath, "r");
+      const buf = Buffer.alloc(MAX_FILE_BYTES);
+      const read = fs.readSync(fd, buf, 0, MAX_FILE_BYTES, 0);
+      fs.closeSync(fd);
+      content = buf.slice(0, read).toString("utf8");
+      truncated = true;
+    } else {
+      content = fs.readFileSync(safePath, "utf8");
+    }
+    const enc = encryptRuntimeBlob({
+      path: safePath,
+      name: path.basename(safePath),
+      content,
+      truncated,
+      size: stat.size,
+    });
+    if (!enc) throw new Error("encryption key not ready — sync it from the bridge (--show-key)");
+    channel.push("file_result", { ok: true, ...echo, agentFileEnc: enc, truncated, size: stat.size });
+  } catch (err) {
+    channel.push("file_result", { ok: false, ...echo, message: (err && err.message) || "file_failed" });
+  }
 }
 
 function controlTask(channel, payload) {
@@ -2235,6 +2563,7 @@ function connect(server, token, userId) {
   channel.on("run_task", (task) => runTask(channel, task));
   channel.on("control_task", (payload) => controlTask(channel, payload || {}));
   channel.on("history_request", (payload) => handleHistoryRequest(channel, payload || {}));
+  channel.on("file_request", (payload) => handleFileRequest(channel, payload || {}));
 
   channel
     .join()
@@ -2332,6 +2661,7 @@ async function runSelfTest() {
         taskId: `self-test-task-${index + 1}`,
         prompt: stepObject.prompt || "Bridge self-test",
         workMode: stepObject.workMode || stepObject.mode || ARGS.workMode || "allow_edits",
+        ...teamFieldsForTask(stepObject),
       };
       await runSelfTestTask(task, stepObject.revert === true);
     }
@@ -2343,6 +2673,7 @@ async function runSelfTest() {
       ...baseTask,
       taskId: "self-test-task",
       prompt: ARGS.prompt || "Bridge self-test",
+      ...teamFieldsForTask(ARGS),
     },
     ARGS.selfTestRevert
   );
@@ -2470,7 +2801,24 @@ async function main() {
   connect(server, config.bridge_token, config.user_id);
 }
 
-main().catch((err) => {
-  console.error("[vibe-bridge] fatal:", err.message);
-  process.exit(1);
-});
+// Exposed for local tests (history runtime reconstruction). Harmless at runtime.
+module.exports = {
+  claudeDetail,
+  codexDetail,
+  buildHistoryRuntime,
+  collectClaudeEdits,
+  collectCodexEdits,
+  parseApplyPatchEnvelope,
+  newRuntimeAccumulator,
+  ensureRuntimeKey,
+  fileWithinLinkedRepo,
+  handleFileRequest,
+};
+
+// Only auto-run the daemon when invoked directly (so the module is requireable).
+if (require.main === module) {
+  main().catch((err) => {
+    console.error("[vibe-bridge] fatal:", err.message);
+    process.exit(1);
+  });
+}

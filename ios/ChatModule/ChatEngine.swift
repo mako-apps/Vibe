@@ -414,6 +414,10 @@ final class ChatEngine {
   // chat, keyed chatId -> payload. The Claude/Codex profile requests it and
   // observes `didChangeNotification` with reason "agentBridgeHistory".
   private var agentBridgeHistoryByChat: [String: [String: Any]] = [:]
+  // Full-file-open replies from the bridge, keyed requestId -> payload (holds the
+  // sealed `agentFileEnc`). Observers watch `didChangeNotification` reason
+  // "agentBridgeFile" and read it via `latestAgentBridgeFile(requestId:)`.
+  private var agentBridgeFileByRequestId: [String: [String: Any]] = [:]
   // Pending "open this past session into the chat as bubbles" requests, keyed by
   // the detail requestId we pushed -> the target chat/provider. When the matching
   // "detail" reply lands we synthesize its transcript into chat rows.
@@ -1714,6 +1718,54 @@ final class ChatEngine {
   func latestAgentBridgeHistory(chatId rawChatId: String) -> [String: Any]? {
     let chatId = normalizedString(rawChatId) ?? rawChatId
     return syncOnQueue { agentBridgeHistoryByChat[chatId] }
+  }
+
+  /// Ask the bridge for the full contents of a file the agent touched. The reply
+  /// arrives over the chat topic as `agent-bridge-file`; observe
+  /// `didChangeNotification` reason "agentBridgeFile" + matching requestId, then
+  /// read it via `latestAgentBridgeFile(requestId:)` (decrypt `agentFileEnc`).
+  func requestAgentBridgeFile(_ payload: [String: Any]) -> [String: Any] {
+    let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"])
+    let provider = normalizedString(payload["provider"] ?? payload["agentBridgeProvider"])
+    let filePath = normalizedString(payload["path"] ?? payload["file"])
+    let requestId = normalizedString(payload["requestId"]) ?? UUID().uuidString
+
+    guard let chatId, !chatId.isEmpty else { return ["accepted": false, "reason": "invalid_chat"] }
+    guard let provider, !provider.isEmpty else { return ["accepted": false, "reason": "invalid_provider"] }
+    guard let filePath, !filePath.isEmpty else { return ["accepted": false, "reason": "invalid_path"] }
+
+    return syncOnQueue {
+      guard let client = phoenixClient else {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+          self?.ensureNativeTransport(trigger: "bridge_file_no_socket")
+        }
+        return ["accepted": false, "reason": "no_native_socket"]
+      }
+      guard nativeJoinedChatIds.contains(chatId), (state["connected"] as? Bool) == true else {
+        joinNativeChatTopicIfNeededLocked(chatId: chatId)
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+          self?.ensureNativeTransport(trigger: "bridge_file_chat_not_joined")
+        }
+        return ["accepted": false, "reason": "chat_not_joined"]
+      }
+
+      let ref = client.push(
+        topic: chatTopic(for: chatId),
+        event: "agent-bridge-file",
+        payload: ["provider": provider, "path": filePath, "requestId": requestId]
+      )
+      appendJournalLocked(
+        event: "native-agent-bridge-file-request",
+        payload: ["chatId": chatId, "provider": provider, "path": filePath, "ref": ref]
+      )
+      return ["accepted": true, "transport": "native", "ref": ref, "requestId": requestId]
+    }
+  }
+
+  /// The most recent full-file reply for a requestId, if it has arrived.
+  func latestAgentBridgeFile(requestId rawRequestId: String) -> [String: Any]? {
+    let requestId = normalizedString(rawRequestId) ?? rawRequestId
+    return syncOnQueue { agentBridgeFileByRequestId[requestId] }
   }
 
   /// Open a Claude/Codex past session into the DEFAULT chat as bubbles: request
@@ -4702,6 +4754,21 @@ final class ChatEngine {
               "provider": provider,
               "mode": mode,
               "requestId": requestId,
+            ]
+          )
+          return
+        }
+        if frame.event == "agent-bridge-file" {
+          let requestId = self.normalizedString(frame.payload["requestId"]) ?? ""
+          if !requestId.isEmpty {
+            self.agentBridgeFileByRequestId[requestId] = frame.payload
+          }
+          self.postChangeLocked(
+            reason: "agentBridgeFile",
+            userInfo: [
+              "chatId": chatId,
+              "requestId": requestId,
+              "ok": (frame.payload["ok"] as? Bool) ?? true,
             ]
           )
           return
