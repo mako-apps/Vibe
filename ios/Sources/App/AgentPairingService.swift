@@ -168,6 +168,98 @@ enum AgentBridgeWorkMode: String, CaseIterable, Identifiable {
   }
 }
 
+enum AgentBridgeIntelligenceLevel: String, CaseIterable, Identifiable {
+  case low
+  case medium
+  case high
+  case extraHigh = "extra_high"
+
+  var id: String { rawValue }
+
+  var title: String {
+    switch self {
+    case .low: return "Low"
+    case .medium: return "Medium"
+    case .high: return "High"
+    case .extraHigh: return "Extra High"
+    }
+  }
+
+  var claudeEffort: String {
+    switch self {
+    case .low: return "low"
+    case .medium: return "medium"
+    case .high: return "high"
+    case .extraHigh: return "xhigh"
+    }
+  }
+
+  var codexEffort: String {
+    switch self {
+    case .low: return "low"
+    case .medium: return "medium"
+    case .high, .extraHigh: return "high"
+    }
+  }
+}
+
+enum AgentBridgeSpeedMode: String, CaseIterable, Identifiable {
+  case fast
+  case standard
+  case careful
+
+  var id: String { rawValue }
+
+  var title: String {
+    switch self {
+    case .fast: return "Fast"
+    case .standard: return "Standard"
+    case .careful: return "Careful"
+    }
+  }
+}
+
+struct AgentBridgeRunOptions: Equatable {
+  let model: String?
+  let intelligence: AgentBridgeIntelligenceLevel
+  let speed: AgentBridgeSpeedMode
+
+  func payload(provider: String) -> [String: Any] {
+    var out: [String: Any] = [
+      "agentBridgeIntelligence": intelligence.rawValue,
+      "agentBridgeSpeed": speed.rawValue,
+      "agentBridgeReasoningEffort": Self.effectiveEffort(
+        provider: provider,
+        intelligence: intelligence,
+        speed: speed
+      ),
+    ]
+    if let model, !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      out["agentBridgeModel"] = model
+    }
+    return out
+  }
+
+  static func effectiveEffort(
+    provider: String,
+    intelligence: AgentBridgeIntelligenceLevel,
+    speed: AgentBridgeSpeedMode
+  ) -> String {
+    let ladder = provider.lowercased() == "claude"
+      ? ["low", "medium", "high", "xhigh"]
+      : ["low", "medium", "high"]
+    let base = provider.lowercased() == "claude" ? intelligence.claudeEffort : intelligence.codexEffort
+    let baseIndex = ladder.firstIndex(of: base) ?? min(1, ladder.count - 1)
+    let offset: Int
+    switch speed {
+    case .fast: offset = -1
+    case .standard: offset = 0
+    case .careful: offset = 1
+    }
+    return ladder[min(max(baseIndex + offset, 0), ladder.count - 1)]
+  }
+}
+
 /// Whether a paired computer (the `vibe-bridge` daemon) is connected right now.
 struct AgentBridgeStatus {
   /// A daemon is currently online (Presence on `bridge:<user_id>`).
@@ -195,6 +287,11 @@ enum AgentBridgeSelectionStore {
 
   private static let repositoryKey = "agentBridge.selectedRepository"
   private static let workModeKey = "agentBridge.workMode"
+  private static let intelligenceKey = "agentBridge.intelligence"
+  private static let speedKey = "agentBridge.speed"
+  private static func modelKey(_ provider: String) -> String {
+    "agentBridge.model.\(provider.lowercased())"
+  }
 
   static func selectedRepository() -> AgentBridgeRepository? {
     guard
@@ -241,6 +338,47 @@ enum AgentBridgeSelectionStore {
   static func setWorkMode(_ mode: AgentBridgeWorkMode) {
     UserDefaults.standard.set(mode.rawValue, forKey: workModeKey)
     NotificationCenter.default.post(name: didChangeNotification, object: nil)
+  }
+
+  static func selectedIntelligence() -> AgentBridgeIntelligenceLevel {
+    let raw = UserDefaults.standard.string(forKey: intelligenceKey) ?? AgentBridgeIntelligenceLevel.low.rawValue
+    return AgentBridgeIntelligenceLevel(rawValue: raw) ?? .low
+  }
+
+  static func setIntelligence(_ level: AgentBridgeIntelligenceLevel) {
+    UserDefaults.standard.set(level.rawValue, forKey: intelligenceKey)
+    NotificationCenter.default.post(name: didChangeNotification, object: nil)
+  }
+
+  static func selectedSpeed() -> AgentBridgeSpeedMode {
+    let raw = UserDefaults.standard.string(forKey: speedKey) ?? AgentBridgeSpeedMode.standard.rawValue
+    return AgentBridgeSpeedMode(rawValue: raw) ?? .standard
+  }
+
+  static func setSpeed(_ speed: AgentBridgeSpeedMode) {
+    UserDefaults.standard.set(speed.rawValue, forKey: speedKey)
+    NotificationCenter.default.post(name: didChangeNotification, object: nil)
+  }
+
+  static func selectedModel(provider: String) -> String? {
+    normalizedString(UserDefaults.standard.string(forKey: modelKey(provider)))
+  }
+
+  static func setModel(provider: String, model: String?) {
+    if let model = normalizedString(model) {
+      UserDefaults.standard.set(model, forKey: modelKey(provider))
+    } else {
+      UserDefaults.standard.removeObject(forKey: modelKey(provider))
+    }
+    NotificationCenter.default.post(name: didChangeNotification, object: nil)
+  }
+
+  static func selectedRunOptions(provider: String) -> AgentBridgeRunOptions {
+    AgentBridgeRunOptions(
+      model: selectedModel(provider: provider),
+      intelligence: selectedIntelligence(),
+      speed: selectedSpeed()
+    )
   }
 
   // MARK: - Resume target (per provider)

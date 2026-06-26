@@ -1,6 +1,285 @@
 import SwiftUI
 import UIKit
 import AVFoundation
+import PhotosUI
+
+enum ChatProfileAppearanceMode: String, CaseIterable, Identifiable {
+  case avatar
+  case poster
+
+  var id: String { rawValue }
+
+  var title: String {
+    switch self {
+    case .avatar:
+      return "Avatar"
+    case .poster:
+      return "Poster"
+    }
+  }
+}
+
+struct ChatProfileAppearanceSelection: Codable, Equatable {
+  var avatarPaletteID: String
+  var posterPaletteID: String
+  var avatarGlyph: String?
+  var avatarFontStyleID: String?
+  var avatarCustomStartHex: String?
+  var avatarCustomEndHex: String?
+  var posterCustomStartHex: String?
+  var posterCustomEndHex: String?
+  var posterImageData: Data?
+
+  static let `default` = ChatProfileAppearanceSelection(
+    avatarPaletteID: ChatProfileAppearancePalette.defaultAvatarID,
+    posterPaletteID: ChatProfileAppearancePalette.defaultPosterID,
+    avatarGlyph: nil,
+    avatarFontStyleID: nil,
+    avatarCustomStartHex: nil,
+    avatarCustomEndHex: nil,
+    posterCustomStartHex: nil,
+    posterCustomEndHex: nil,
+    posterImageData: nil
+  )
+}
+
+enum ChatProfileAvatarFontStyle: String, CaseIterable, Identifiable {
+  case rounded
+  case standard
+  case serif
+  case mono
+
+  var id: String { rawValue }
+
+  var design: Font.Design {
+    switch self {
+    case .rounded:
+      return .rounded
+    case .standard:
+      return .default
+    case .serif:
+      return .serif
+    case .mono:
+      return .monospaced
+    }
+  }
+
+  static func style(id: String?) -> ChatProfileAvatarFontStyle {
+    guard let id, let style = allCases.first(where: { $0.rawValue == id }) else {
+      return .rounded
+    }
+    return style
+  }
+}
+
+struct ChatProfileAppearancePalette: Identifiable, Equatable {
+  let id: String
+  let topHex: String
+  let bottomHex: String
+
+  static let defaultAvatarID = "warm-gold"
+  static let defaultPosterID = "poster-black"
+
+  static let all: [ChatProfileAppearancePalette] = [
+    ChatProfileAppearancePalette(id: "warm-gold", topHex: "#F1C766", bottomHex: "#8B411B"),
+    ChatProfileAppearancePalette(id: "aurora", topHex: "#8B4CF5", bottomHex: "#008C72"),
+    ChatProfileAppearancePalette(id: "lime", topHex: "#F0DB35", bottomHex: "#098B27"),
+    ChatProfileAppearancePalette(id: "ocean", topHex: "#23C08D", bottomHex: "#0057A8"),
+    ChatProfileAppearancePalette(id: "ember", topHex: "#3E8B69", bottomHex: "#D64A12"),
+    ChatProfileAppearancePalette(id: "rose", topHex: "#F39C62", bottomHex: "#7A1E83"),
+    ChatProfileAppearancePalette(id: "midnight", topHex: "#2F74D0", bottomHex: "#071B65"),
+    ChatProfileAppearancePalette(id: "earth", topHex: "#8C735C", bottomHex: "#4B2413"),
+    ChatProfileAppearancePalette(id: "graphite", topHex: "#727A7D", bottomHex: "#06131B"),
+    ChatProfileAppearancePalette(id: "ruby", topHex: "#B94F55", bottomHex: "#6A0808"),
+    ChatProfileAppearancePalette(id: "teal", topHex: "#35A7A5", bottomHex: "#053746"),
+    ChatProfileAppearancePalette(id: "mint", topHex: "#16C995", bottomHex: "#007D4E"),
+    ChatProfileAppearancePalette(id: "coral", topHex: "#F0516A", bottomHex: "#B71210"),
+    ChatProfileAppearancePalette(id: "marigold", topHex: "#FFE154", bottomHex: "#F0830C"),
+    ChatProfileAppearancePalette(id: "steel", topHex: "#8793A1", bottomHex: "#071026"),
+    ChatProfileAppearancePalette(id: "poster-black", topHex: "#050507", bottomHex: "#000000"),
+  ]
+
+  static let defaultAvatarPalettes: [ChatProfileAppearancePalette] = all.filter { $0.id != defaultPosterID }
+
+  static func palette(id: String) -> ChatProfileAppearancePalette {
+    all.first(where: { $0.id == id }) ?? all[0]
+  }
+
+  static func colors(
+    for selection: ChatProfileAppearanceSelection,
+    mode: ChatProfileAppearanceMode
+  ) -> (UIColor, UIColor) {
+    let palette = palette(id: mode == .avatar ? selection.avatarPaletteID : selection.posterPaletteID)
+    let customStart = mode == .avatar ? selection.avatarCustomStartHex : selection.posterCustomStartHex
+    let customEnd = mode == .avatar ? selection.avatarCustomEndHex : selection.posterCustomEndHex
+    return (
+      uiColor(hex: customStart ?? palette.topHex),
+      uiColor(hex: customEnd ?? palette.bottomHex)
+    )
+  }
+
+  static func uiColor(hex raw: String) -> UIColor {
+    var hex = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if hex.hasPrefix("#") { hex.removeFirst() }
+    var value: UInt64 = 0
+    Scanner(string: hex).scanHexInt64(&value)
+    return UIColor(
+      red: CGFloat((value >> 16) & 0xff) / 255.0,
+      green: CGFloat((value >> 8) & 0xff) / 255.0,
+      blue: CGFloat(value & 0xff) / 255.0,
+      alpha: 1.0
+    )
+  }
+}
+
+enum ChatProfileAppearanceStore {
+  private static let defaultsPrefix = "chatProfileAppearance.v1."
+
+  static func selection(title: String?, peerUserId: String?, chatId: String?) -> ChatProfileAppearanceSelection {
+    let key = defaultsKey(title: title, peerUserId: peerUserId, chatId: chatId)
+    guard let data = UserDefaults.standard.data(forKey: key),
+      let decoded = try? JSONDecoder().decode(ChatProfileAppearanceSelection.self, from: data)
+    else {
+      return defaultSelection(title: title, peerUserId: peerUserId, chatId: chatId)
+    }
+    return normalizedStoredSelection(decoded, title: title, peerUserId: peerUserId, chatId: chatId)
+  }
+
+  static func save(
+    _ selection: ChatProfileAppearanceSelection,
+    title: String?,
+    peerUserId: String?,
+    chatId: String?
+  ) {
+    let key = defaultsKey(title: title, peerUserId: peerUserId, chatId: chatId)
+    guard let data = try? JSONEncoder().encode(selection) else { return }
+    UserDefaults.standard.set(data, forKey: key)
+  }
+
+  static func avatarColors(title: String?, peerUserId: String?, chatId: String?) -> (UIColor, UIColor) {
+    ChatProfileAppearancePalette.colors(
+      for: selection(title: title, peerUserId: peerUserId, chatId: chatId),
+      mode: .avatar
+    )
+  }
+
+  static func posterColors(title: String?, peerUserId: String?, chatId: String?) -> (UIColor, UIColor) {
+    ChatProfileAppearancePalette.colors(
+      for: selection(title: title, peerUserId: peerUserId, chatId: chatId),
+      mode: .poster
+    )
+  }
+
+  static func posterImage(title: String?, peerUserId: String?, chatId: String?) -> UIImage? {
+    let selection = selection(title: title, peerUserId: peerUserId, chatId: chatId)
+    guard let data = selection.posterImageData else { return nil }
+    return UIImage(data: data)
+  }
+
+  private static func defaultsKey(title: String?, peerUserId: String?, chatId: String?) -> String {
+    let seed = defaultsSeed(title: title, peerUserId: peerUserId, chatId: chatId)
+    let safeSeed = seed.isEmpty ? "user" : seed
+    return defaultsPrefix + safeSeed
+  }
+
+  private static func defaultsSeed(title: String?, peerUserId: String?, chatId: String?) -> String {
+    ChatAvatarFallbackStyle.stableSeed(
+      title: title,
+      peerUserId: peerUserId,
+      chatId: chatId
+    )
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased()
+  }
+
+  private static func defaultSelection(
+    title: String?,
+    peerUserId: String?,
+    chatId: String?
+  ) -> ChatProfileAppearanceSelection {
+    var selection = ChatProfileAppearanceSelection.default
+    selection.avatarPaletteID = defaultAvatarPaletteID(seed: defaultsSeed(
+      title: title,
+      peerUserId: peerUserId,
+      chatId: chatId
+    ))
+    selection.posterPaletteID = ChatProfileAppearancePalette.defaultPosterID
+    return selection
+  }
+
+  private static func normalizedStoredSelection(
+    _ selection: ChatProfileAppearanceSelection,
+    title: String?,
+    peerUserId: String?,
+    chatId: String?
+  ) -> ChatProfileAppearanceSelection {
+    var normalized = selection
+    if normalized.posterPaletteID == "warm-cocoa" {
+      normalized.posterPaletteID = ChatProfileAppearancePalette.defaultPosterID
+    }
+    if normalized.avatarPaletteID == ChatProfileAppearancePalette.defaultAvatarID
+      && normalized.avatarCustomStartHex == nil
+      && normalized.avatarCustomEndHex == nil
+      && normalized.avatarGlyph == nil
+      && normalized.avatarFontStyleID == nil
+    {
+      normalized.avatarPaletteID = defaultAvatarPaletteID(seed: defaultsSeed(
+        title: title,
+        peerUserId: peerUserId,
+        chatId: chatId
+      ))
+    }
+    return normalized
+  }
+
+  private static func defaultAvatarPaletteID(seed: String) -> String {
+    let palettes = ChatProfileAppearancePalette.defaultAvatarPalettes
+    guard !palettes.isEmpty else { return ChatProfileAppearancePalette.defaultAvatarID }
+    let safeSeed = seed.isEmpty ? "user" : seed
+    let hash = safeSeed.unicodeScalars.reduce(UInt(0)) { ($0 &* 31) &+ UInt($1.value) }
+    let index = Int(hash % UInt(palettes.count))
+    return palettes[index].id
+  }
+}
+
+private extension UIColor {
+  var chatProfileHexString: String {
+    var red: CGFloat = 0
+    var green: CGFloat = 0
+    var blue: CGFloat = 0
+    var alpha: CGFloat = 0
+    guard getRed(&red, green: &green, blue: &blue, alpha: &alpha) else { return "#000000" }
+    return String(
+      format: "#%02X%02X%02X",
+      Int(round(red * 255.0)),
+      Int(round(green * 255.0)),
+      Int(round(blue * 255.0))
+    )
+  }
+
+  func blended(withFraction fraction: CGFloat, of color: UIColor) -> UIColor {
+    var red1: CGFloat = 0
+    var green1: CGFloat = 0
+    var blue1: CGFloat = 0
+    var alpha1: CGFloat = 0
+    var red2: CGFloat = 0
+    var green2: CGFloat = 0
+    var blue2: CGFloat = 0
+    var alpha2: CGFloat = 0
+    guard getRed(&red1, green: &green1, blue: &blue1, alpha: &alpha1),
+      color.getRed(&red2, green: &green2, blue: &blue2, alpha: &alpha2)
+    else {
+      return self
+    }
+    let clamped = max(0, min(1, fraction))
+    return UIColor(
+      red: red1 + (red2 - red1) * clamped,
+      green: green1 + (green2 - green1) * clamped,
+      blue: blue1 + (blue2 - blue1) * clamped,
+      alpha: alpha1 + (alpha2 - alpha1) * clamped
+    )
+  }
+}
 
 @MainActor
 private final class NativeProfileAvatarModel: ObservableObject {
@@ -16,6 +295,12 @@ private final class NativeProfileAvatarModel: ObservableObject {
     red: 222 / 255,
     green: 230 / 255,
     blue: 243 / 255,
+    alpha: 1.0
+  )
+  @Published var fallbackGradientEndColor: UIColor = UIColor(
+    red: 139 / 255,
+    green: 65 / 255,
+    blue: 27 / 255,
     alpha: 1.0
   )
   @Published var fallbackIconTintColor: UIColor = UIColor.darkText
@@ -97,8 +382,10 @@ private struct NativeProfileAvatarContentView: View {
 
 private struct NativeProfileAvatarInnerContent: View {
   let image: UIImage?
+  let fallbackText: String
   let fallbackIconTintColor: UIColor
   let fallbackBackgroundColor: UIColor
+  let fallbackGradientEndColor: UIColor
   let size: CGFloat
 
   var body: some View {
@@ -115,8 +402,14 @@ private struct NativeProfileAvatarInnerContent: View {
 
       if let image {
         ZStack {
-          Circle()
-            .fill(Color(uiColor: fallbackBackgroundColor))
+          LinearGradient(
+            colors: [
+              Color(uiColor: fallbackBackgroundColor),
+              Color(uiColor: fallbackGradientEndColor),
+            ],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+          )
 
           Image(uiImage: image)
             .resizable()
@@ -130,17 +423,29 @@ private struct NativeProfileAvatarInnerContent: View {
         }
       } else {
         ZStack {
-          Circle()
-            .fill(Color(uiColor: fallbackBackgroundColor))
+          LinearGradient(
+            colors: [
+              Color(uiColor: fallbackBackgroundColor),
+              Color(uiColor: fallbackGradientEndColor),
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+          )
 
-          Image(systemName: "person.fill")
-            .resizable()
-            .scaledToFit()
-            .frame(width: max(14.0, size * 0.34), height: max(14.0, size * 0.34))
+          Text(fallbackText)
+            .font(.system(size: max(28.0, size * 0.50), weight: .bold))
             .foregroundStyle(Color(uiColor: fallbackIconTintColor))
+            .lineLimit(1)
+            .minimumScaleFactor(0.4)
+            .padding(.horizontal, size * 0.14)
         }
         .frame(width: size, height: size)
         .clipShape(Circle())
+        .overlay {
+          Circle()
+            .stroke(Color.white.opacity(0.20), lineWidth: 1)
+        }
+        .shadow(color: Color.black.opacity(0.22), radius: 8, x: 0, y: 4)
       }
     }
   }
@@ -164,8 +469,10 @@ private struct NativeProfileAvatarLegacyView: View {
   var body: some View {
     NativeProfileAvatarInnerContent(
       image: model.loadedImage,
+      fallbackText: model.fallbackText,
       fallbackIconTintColor: model.fallbackIconTintColor,
       fallbackBackgroundColor: model.fallbackBackgroundColor,
+      fallbackGradientEndColor: model.fallbackGradientEndColor,
       size: currentSize
     )
     .padding(.top, currentTopInset)
@@ -190,6 +497,12 @@ final class NativeProfileAvatarView: UIView {
     red: 222 / 255,
     green: 230 / 255,
     blue: 243 / 255,
+    alpha: 1.0
+  )
+  private var currentFallbackGradientEndColor: UIColor = UIColor(
+    red: 139 / 255,
+    green: 65 / 255,
+    blue: 27 / 255,
     alpha: 1.0
   )
   private var currentFallbackIconTintColor: UIColor = UIColor.darkText
@@ -312,7 +625,20 @@ final class NativeProfileAvatarView: UIView {
   func setFallbackBackgroundUIColor(_ value: UIColor) {
     guard currentFallbackBackgroundColor != value else { return }
     currentFallbackBackgroundColor = value
-    publishModelChange { $0.fallbackBackgroundColor = value }
+    publishModelChange {
+      $0.fallbackBackgroundColor = value
+      $0.fallbackGradientEndColor = value
+    }
+  }
+
+  func setFallbackGradientUIColors(start: UIColor, end: UIColor) {
+    guard currentFallbackBackgroundColor != start || currentFallbackGradientEndColor != end else { return }
+    currentFallbackBackgroundColor = start
+    currentFallbackGradientEndColor = end
+    publishModelChange {
+      $0.fallbackBackgroundColor = start
+      $0.fallbackGradientEndColor = end
+    }
   }
 
   func setFallbackIconTintUIColor(_ value: UIColor) {
@@ -748,6 +1074,7 @@ private enum ChatProfileSwiftUIDestination: Hashable {
   case history
   case bridgeHistory
   case bridgeSession(AgentBridgeHistorySession)
+  case appearance
   case tab(ChatProfileTab)
 
   var transitionID: String {
@@ -758,6 +1085,8 @@ private enum ChatProfileSwiftUIDestination: Hashable {
       return "bridge-history"
     case .bridgeSession(let session):
       return "bridge-session-\(session.id)"
+    case .appearance:
+      return "contact-photo-poster"
     case .tab(let tab):
       return "shared-\(tab.rawValue)"
     }
@@ -782,6 +1111,13 @@ private struct ChatProfileSwiftUIRootView: View {
   let historyItems: [ChatProfileSwiftUIContentItem]
   let tabSummaries: [ChatProfileSwiftUITabSummary]
   let tabItems: [ChatProfileTab: [ChatProfileSwiftUIContentItem]]
+  let appearanceSelection: ChatProfileAppearanceSelection
+  let hasProfileImage: Bool
+  let avatarUri: String?
+  let isGroupOrChannel: Bool
+  let groupMembersSubtitle: String
+  let groupBridgeProvider: String?
+  let selectedRepositoryName: String?
   // Bridge (Claude/Codex paired-computer) state. `bridgeProvider` is empty for a
   // normal contact/group profile.
   var bridgeProvider: String = ""
@@ -794,27 +1130,84 @@ private struct ChatProfileSwiftUIRootView: View {
   let onNavigationActiveChanged: (Bool) -> Void
   let onCopyUsername: () -> Void
   let onAction: (String) -> Void
+  let onSaveAppearance: (ChatProfileAppearanceSelection) -> Void
   let onContentPressed: ([String: Any]) -> Void
 
   @Namespace private var morphNamespace
   @State private var path: [ChatProfileSwiftUIDestination] = []
+  @State private var localScrollOffset: CGFloat = 0
+  @State private var lastReportedScrollOffset: CGFloat = -1
+  @State private var stickyTitleVisible = false
 
   private var rowFill: Color {
-    Color.clear
+    let tint = usesDefaultPoster ? avatarGradientColors.0 : posterGradientColors.0
+    return Color(uiColor: tint).opacity(isDark ? 0.13 : 0.20)
   }
 
   private var separatorColor: Color {
     Color(uiColor: isDark ? UIColor.white.withAlphaComponent(0.10) : UIColor.black.withAlphaComponent(0.08))
   }
 
+  private var avatarGradientColors: (UIColor, UIColor) {
+    ChatProfileAppearancePalette.colors(for: appearanceSelection, mode: .avatar)
+  }
+
+  private var posterGradientColors: (UIColor, UIColor) {
+    ChatProfileAppearancePalette.colors(for: appearanceSelection, mode: .poster)
+  }
+
+  private var usesDefaultPoster: Bool {
+    appearanceSelection.posterPaletteID == ChatProfileAppearancePalette.defaultPosterID
+      && appearanceSelection.posterCustomStartHex == nil
+      && appearanceSelection.posterCustomEndHex == nil
+      && appearanceSelection.posterImageData == nil
+  }
+
+  private var posterImage: UIImage? {
+    guard let data = appearanceSelection.posterImageData else { return nil }
+    return UIImage(data: data)
+  }
+
+  private var profileInitial: String {
+    let trimmed = profileName.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? "U" : String(trimmed.prefix(1)).uppercased()
+  }
+
+  private var avatarDisplayText: String {
+    let glyph = appearanceSelection.avatarGlyph?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return glyph.isEmpty ? profileInitial : glyph
+  }
+
   var body: some View {
     GeometryReader { geometry in
       NavigationStack(path: $path) {
         ZStack {
-          Color.clear.ignoresSafeArea()
+          profileBackdrop
+
+          if path.isEmpty {
+            ChatProfileHeroReflection(
+              colors: avatarGradientColors,
+              width: geometry.size.width,
+              size: heroAvatarSize,
+              top: heroReflectionTop(safeTop: geometry.safeAreaInsets.top)
+            )
+            .allowsHitTesting(false)
+
+            ChatProfileHeroAvatar(
+              text: avatarDisplayText,
+              fontStyleID: appearanceSelection.avatarFontStyleID,
+              colors: avatarGradientColors,
+              imageUri: hasProfileImage ? avatarUri : nil,
+              size: heroAvatarSize,
+              top: heroAvatarTop(safeTop: geometry.safeAreaInsets.top),
+              scrollOffset: localScrollOffset
+            )
+            .allowsHitTesting(false)
+            .transition(.opacity)
+          }
 
           ScrollView(.vertical, showsIndicators: true) {
-            offsetReader
+            offsetReader(safeTop: geometry.safeAreaInsets.top)
 
             VStack(spacing: 18) {
               Color.clear
@@ -838,11 +1231,15 @@ private struct ChatProfileSwiftUIRootView: View {
               } else {
                 bridgeHistorySection
               }
+              if bridgeProvider.isEmpty {
+                appearanceSection
+              }
               sharedContentSection
               contactActionsSection
               emergencySection
               dangerSection
             }
+            .frame(width: max(0, geometry.size.width - 32))
             .padding(.horizontal, 16)
             .padding(.bottom, 38)
           }
@@ -851,8 +1248,44 @@ private struct ChatProfileSwiftUIRootView: View {
           .background(Color.clear)
         }
         .background(Color.clear)
-        .toolbar(path.isEmpty ? .hidden : .visible, for: .navigationBar)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.visible, for: .navigationBar)
         .toolbarBackground(.hidden, for: .navigationBar)
+        .toolbar {
+          if path.isEmpty {
+            ToolbarItem(placement: .topBarLeading) {
+              Button {
+                onAction("headerBack")
+              } label: {
+                Image(systemName: "chevron.left")
+                  .font(.system(size: 18, weight: .semibold))
+              }
+            }
+
+            ToolbarItem(placement: .principal) {
+              Text(profileName)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.78)
+                .opacity(stickyTitleVisible ? 1 : 0)
+                .animation(.easeInOut(duration: 0.16), value: stickyTitleVisible)
+                .accessibilityHidden(!stickyTitleVisible)
+            }
+
+            ToolbarItem(placement: .topBarTrailing) {
+              Menu {
+                Button(isChatMuted ? "Unmute" : "Mute") { onAction("muteToggle") }
+                Button("Search") { onAction("search") }
+                Button("Share Contact") { onAction("shareContact") }
+                Button("Block Contact", role: .destructive) { onAction("block") }
+              } label: {
+                Image(systemName: "ellipsis")
+                  .font(.system(size: 18, weight: .semibold))
+              }
+            }
+          }
+        }
         .navigationDestination(for: ChatProfileSwiftUIDestination.self) { destination in
           destinationView(for: destination)
             .navigationTransition(.zoom(sourceID: destination.transitionID, in: morphNamespace))
@@ -866,7 +1299,40 @@ private struct ChatProfileSwiftUIRootView: View {
     }
   }
 
-  private var offsetReader: some View {
+  @ViewBuilder
+  private var profileBackdrop: some View {
+    ZStack {
+      if let posterImage {
+        Image(uiImage: posterImage)
+          .resizable()
+          .scaledToFill()
+          .overlay(
+            LinearGradient(
+              colors: [
+                Color.black.opacity(isDark ? 0.10 : 0.04),
+                Color.black.opacity(isDark ? 0.58 : 0.24),
+              ],
+              startPoint: .top,
+              endPoint: .bottom
+            )
+          )
+      } else {
+        LinearGradient(
+          colors: [
+            Color(uiColor: posterGradientColors.0),
+            Color(uiColor: posterGradientColors.1),
+          ],
+          startPoint: .top,
+          endPoint: .bottom
+        )
+      }
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .clipped()
+    .ignoresSafeArea()
+  }
+
+  private func offsetReader(safeTop: CGFloat) -> some View {
     GeometryReader { proxy in
       Color.clear
         .preference(
@@ -876,7 +1342,19 @@ private struct ChatProfileSwiftUIRootView: View {
     }
     .frame(height: 0)
     .onPreferenceChange(ChatProfileScrollOffsetPreferenceKey.self) { value in
-      onScroll(value)
+      let nextValue = (max(0, value) * 2.0).rounded() / 2.0
+      DispatchQueue.main.async {
+        guard abs(localScrollOffset - nextValue) >= 0.5 else { return }
+        localScrollOffset = nextValue
+        let shouldShowTitle = nextValue >= stickyTitleThreshold(safeTop: safeTop)
+        if stickyTitleVisible != shouldShowTitle {
+          stickyTitleVisible = shouldShowTitle
+        }
+        if lastReportedScrollOffset < 0 || abs(lastReportedScrollOffset - nextValue) >= 4.0 {
+          lastReportedScrollOffset = nextValue
+          onScroll(nextValue)
+        }
+      }
     }
   }
 
@@ -884,6 +1362,22 @@ private struct ChatProfileSwiftUIRootView: View {
     NativeProfileAvatarHeroMetrics.expandedTop(for: safeTop)
       + NativeProfileAvatarHeroMetrics.expandedSize
       + 28
+  }
+
+  private func stickyTitleThreshold(safeTop: CGFloat) -> CGFloat {
+    max(120, heroClearance(safeTop: safeTop) - safeTop - 58)
+  }
+
+  private var heroAvatarSize: CGFloat {
+    NativeProfileAvatarHeroMetrics.expandedSize - min(22, localScrollOffset * 0.10)
+  }
+
+  private func heroAvatarTop(safeTop: CGFloat) -> CGFloat {
+    NativeProfileAvatarHeroMetrics.expandedTop(for: safeTop) - min(12, localScrollOffset * 0.05)
+  }
+
+  private func heroReflectionTop(safeTop: CGFloat) -> CGFloat {
+    max(safeTop + 78, heroAvatarTop(safeTop: safeTop) + heroAvatarSize * 0.18)
   }
 
   private var actionRow: some View {
@@ -933,6 +1427,52 @@ private struct ChatProfileSwiftUIRootView: View {
             separatorColor: separatorColor,
             isLast: true
           )
+        }
+      }
+    } else if isGroupOrChannel {
+      ChatProfileSwiftUISection(fill: rowFill) {
+        Button {
+          onAction("members")
+        } label: {
+          ChatProfileSwiftUIRow(
+            title: "Members",
+            subtitle: groupMembersSubtitle,
+            trailingSystemImage: "chevron.right",
+            showsChevron: true,
+            separatorColor: separatorColor,
+            isLast: groupBridgeProvider == nil
+          )
+        }
+        .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+
+        if let provider = groupBridgeProvider {
+          Button {
+            onAction("bridgeRepository:\(provider)")
+          } label: {
+            ChatProfileSwiftUIRow(
+              title: "Repository",
+              subtitle: selectedRepositoryName ?? "Pick repo for Claude/Codex",
+              trailingSystemImage: "chevron.right",
+              showsChevron: true,
+              separatorColor: separatorColor,
+              isLast: false
+            )
+          }
+          .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+
+          Button {
+            onAction("agentConfig")
+          } label: {
+            ChatProfileSwiftUIRow(
+              title: "Configuration",
+              subtitle: "Agent and group settings",
+              trailingSystemImage: "chevron.right",
+              showsChevron: true,
+              separatorColor: separatorColor,
+              isLast: true
+            )
+          }
+          .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
         }
       }
     } else if !username.isEmpty || !note.isEmpty {
@@ -1022,9 +1562,7 @@ private struct ChatProfileSwiftUIRootView: View {
 
   private var historySection: some View {
     ChatProfileSwiftUISection(fill: rowFill) {
-      Button {
-        path.append(.history)
-      } label: {
+      NavigationLink(value: ChatProfileSwiftUIDestination.history) {
         ChatProfileSwiftUIRow(
           title: "Chat History",
           subtitle: historySubtitle,
@@ -1049,9 +1587,7 @@ private struct ChatProfileSwiftUIRootView: View {
 
   private var bridgeHistorySection: some View {
     ChatProfileSwiftUISection(fill: rowFill) {
-      Button {
-        path.append(.bridgeHistory)
-      } label: {
+      NavigationLink(value: ChatProfileSwiftUIDestination.bridgeHistory) {
         ChatProfileSwiftUIRow(
           title: "Chat History",
           subtitle: bridgeHistorySubtitle,
@@ -1061,6 +1597,30 @@ private struct ChatProfileSwiftUIRootView: View {
           isLast: true
         )
         .matchedTransitionSource(id: ChatProfileSwiftUIDestination.bridgeHistory.transitionID, in: morphNamespace)
+      }
+      .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+    }
+  }
+
+  private var appearanceSection: some View {
+    ChatProfileSwiftUISection(fill: rowFill) {
+      NavigationLink(value: ChatProfileSwiftUIDestination.appearance) {
+        ChatProfileSwiftUIRow(
+          title: "Contact Photo & Poster",
+          leading: AnyView(
+            ChatProfileMiniAvatar(
+              text: avatarDisplayText,
+              fontStyleID: appearanceSelection.avatarFontStyleID,
+              colors: avatarGradientColors,
+              imageUri: hasProfileImage ? avatarUri : nil
+            )
+          ),
+          trailingSystemImage: nil,
+          showsChevron: true,
+          separatorColor: separatorColor,
+          isLast: true
+        )
+        .matchedTransitionSource(id: ChatProfileSwiftUIDestination.appearance.transitionID, in: morphNamespace)
       }
       .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
     }
@@ -1080,9 +1640,7 @@ private struct ChatProfileSwiftUIRootView: View {
       ChatProfileSwiftUISection(fill: rowFill) {
         ForEach(Array(tabSummaries.enumerated()), id: \.element.id) { index, summary in
           let destination = ChatProfileSwiftUIDestination.tab(summary.tab)
-          Button {
-            path.append(destination)
-          } label: {
+          NavigationLink(value: destination) {
             ChatProfileSwiftUIRow(
               title: summary.title,
               subtitle: summary.subtitle,
@@ -1172,6 +1730,14 @@ private struct ChatProfileSwiftUIRootView: View {
       .navigationTitle(session.topic)
       .navigationBarTitleDisplayMode(.inline)
       .ignoresSafeArea(.container, edges: .bottom)
+    case .appearance:
+      ChatProfileAppearanceEditorView(
+        profileName: profileName,
+        avatarUri: avatarUri,
+        hasProfileImage: hasProfileImage,
+        initialSelection: appearanceSelection,
+        onSave: onSaveAppearance
+      )
     case .tab(let tab):
       ChatProfileSwiftUIExpandedContentView(
         title: tabSummaries.first(where: { $0.tab == tab })?.title ?? tab.label,
@@ -1184,30 +1750,868 @@ private struct ChatProfileSwiftUIRootView: View {
   }
 }
 
-private struct ChatProfileSwiftUISection<Content: View>: View {
-  let fill: Color
+private struct ChatProfileAvatarGlyph: View {
+  let text: String
+  let fontStyleID: String?
+  let size: CGFloat
+
+  var body: some View {
+    Text(text)
+      .font(.system(size: max(16, size), weight: .bold, design: ChatProfileAvatarFontStyle.style(id: fontStyleID).design))
+      .foregroundStyle(.white)
+      .lineLimit(1)
+      .minimumScaleFactor(0.28)
+      .padding(.horizontal, size * 0.26)
+  }
+}
+
+private struct ChatProfileHeroReflection: View {
+  let colors: (UIColor, UIColor)
+  let width: CGFloat
+  let size: CGFloat
+  let top: CGFloat
+
+  var body: some View {
+    let paintWidth = max(width * 1.75, size * 4.1)
+    let reflectionHeight = max(size * 2.12, width * 0.96)
+
+    VStack(spacing: 0) {
+      ZStack {
+        RoundedRectangle(cornerRadius: max(42, size * 0.34), style: .continuous)
+          .fill(
+            LinearGradient(
+              colors: [
+                Color(uiColor: colors.0).opacity(0.44),
+                Color(uiColor: colors.1).opacity(0.24),
+                Color.black.opacity(0.02),
+              ],
+              startPoint: .top,
+              endPoint: .bottom
+            )
+          )
+          .frame(width: paintWidth * 0.74, height: reflectionHeight * 0.82)
+          .blur(radius: 48)
+
+        RoundedRectangle(cornerRadius: max(20, size * 0.14), style: .continuous)
+          .fill(Color(uiColor: colors.0).opacity(0.22))
+          .frame(width: paintWidth * 0.56, height: reflectionHeight * 0.44)
+          .blur(radius: 34)
+          .offset(y: -size * 0.04)
+      }
+      .frame(width: width, height: reflectionHeight)
+      .mask(
+        LinearGradient(
+          stops: [
+            .init(color: .clear, location: 0.0),
+            .init(color: .black.opacity(0.50), location: 0.08),
+            .init(color: .black, location: 0.36),
+            .init(color: .black.opacity(0.72), location: 0.66),
+            .init(color: .clear, location: 1.0),
+          ],
+          startPoint: .top,
+          endPoint: .bottom
+        )
+      )
+      .frame(maxWidth: .infinity)
+      .padding(.top, max(0, top - reflectionHeight * 0.08))
+
+      Spacer(minLength: 0)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+  }
+}
+
+private struct ChatProfileHeroAvatar: View {
+  let text: String
+  let fontStyleID: String?
+  let colors: (UIColor, UIColor)
+  let imageUri: String?
+  let size: CGFloat
+  let top: CGFloat
+  let scrollOffset: CGFloat
+
+  @State private var image: UIImage?
+  @State private var loadedUri: String?
+
+  var body: some View {
+    let blurRadius = min(11, max(0, scrollOffset - 76) * 0.052)
+    let opacity = 1.0 - min(0.22, max(0, scrollOffset - 126) * 0.0015)
+
+    VStack(spacing: 0) {
+      ZStack {
+        LinearGradient(
+          colors: [Color(uiColor: colors.0), Color(uiColor: colors.1)],
+          startPoint: .top,
+          endPoint: .bottom
+        )
+
+        if loadedUri == normalizedImageUri, let image {
+          Image(uiImage: image)
+            .resizable()
+            .scaledToFill()
+        } else {
+          ChatProfileAvatarGlyph(text: text, fontStyleID: fontStyleID, size: size * 0.48)
+        }
+      }
+      .frame(width: size, height: size)
+      .clipShape(Circle())
+      .overlay(Circle().stroke(Color.white.opacity(0.20), lineWidth: 1))
+      .shadow(color: Color.black.opacity(0.20), radius: 10, x: 0, y: 5)
+      .compositingGroup()
+      .blur(radius: blurRadius)
+      .opacity(opacity)
+
+      Spacer(minLength: 0)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    .padding(.top, top)
+    .task(id: normalizedImageUri ?? "") {
+      await loadImage()
+    }
+  }
+
+  private var normalizedImageUri: String? {
+    let value = imageUri?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return value.isEmpty ? nil : value
+  }
+
+  @MainActor
+  private func loadImage() async {
+    let normalized = normalizedImageUri
+    if loadedUri != normalized {
+      loadedUri = normalized
+      image = normalized.flatMap { ChatAvatarImageStore.cached(for: $0) }
+    }
+    guard let normalized else {
+      image = nil
+      return
+    }
+    if let cached = ChatAvatarImageStore.cached(for: normalized) {
+      image = cached
+      return
+    }
+    let loaded = await ChatAvatarImageStore.load(from: normalized)
+    guard !Task.isCancelled, loadedUri == normalized else { return }
+    image = loaded
+  }
+}
+
+private struct ChatProfileMiniAvatar: View {
+  let text: String
+  let fontStyleID: String?
+  let colors: (UIColor, UIColor)
+  let imageUri: String?
+
+  @State private var image: UIImage?
+  @State private var loadedUri: String?
+
+  var body: some View {
+    ZStack {
+      LinearGradient(
+        colors: [Color(uiColor: colors.0), Color(uiColor: colors.1)],
+        startPoint: .top,
+        endPoint: .bottom
+      )
+
+      if loadedUri == normalizedImageUri, let image {
+        Image(uiImage: image)
+          .resizable()
+          .scaledToFill()
+      } else {
+        ChatProfileAvatarGlyph(text: text, fontStyleID: fontStyleID, size: 20)
+      }
+    }
+    .frame(width: 52, height: 52)
+    .clipShape(Circle())
+    .overlay(Circle().stroke(Color.white.opacity(0.18), lineWidth: 1))
+    .task(id: normalizedImageUri ?? "") {
+      await loadImage()
+    }
+  }
+
+  private var normalizedImageUri: String? {
+    let value = imageUri?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return value.isEmpty ? nil : value
+  }
+
+  @MainActor
+  private func loadImage() async {
+    let normalized = normalizedImageUri
+    if loadedUri != normalized {
+      loadedUri = normalized
+      image = normalized.flatMap { ChatAvatarImageStore.cached(for: $0) }
+    }
+    guard let normalized else {
+      image = nil
+      return
+    }
+    if let cached = ChatAvatarImageStore.cached(for: normalized) {
+      image = cached
+      return
+    }
+    let loaded = await ChatAvatarImageStore.load(from: normalized)
+    guard !Task.isCancelled, loadedUri == normalized else { return }
+    image = loaded
+  }
+}
+
+private struct ChatProfileAppearanceEditorView: View {
+  let profileName: String
+  let avatarUri: String?
+  let hasProfileImage: Bool
+  let onSave: (ChatProfileAppearanceSelection) -> Void
+
+  @Environment(\.dismiss) private var dismiss
+  @State private var draft: ChatProfileAppearanceSelection
+  @State private var mode: ChatProfileAppearanceMode = .avatar
+  @State private var selectedPhotoItem: PhotosPickerItem?
+  @State private var avatarImage: UIImage?
+  @State private var avatarImageUri: String?
+  @State private var isCustomizerPresented = false
+
+  init(
+    profileName: String,
+    avatarUri: String?,
+    hasProfileImage: Bool,
+    initialSelection: ChatProfileAppearanceSelection,
+    onSave: @escaping (ChatProfileAppearanceSelection) -> Void
+  ) {
+    self.profileName = profileName
+    self.avatarUri = avatarUri
+    self.hasProfileImage = hasProfileImage
+    self.onSave = onSave
+    _draft = State(initialValue: initialSelection)
+  }
+
+  private var initial: String {
+    let trimmed = profileName.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? "U" : String(trimmed.prefix(1)).uppercased()
+  }
+
+  private var avatarDisplayText: String {
+    let glyph = draft.avatarGlyph?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return glyph.isEmpty ? initial : glyph
+  }
+
+  private var backgroundColors: (UIColor, UIColor) {
+    ChatProfileAppearancePalette.colors(for: draft, mode: .poster)
+  }
+
+  var body: some View {
+    ZStack {
+      LinearGradient(
+        colors: [Color(uiColor: backgroundColors.0), Color(uiColor: backgroundColors.1)],
+        startPoint: .top,
+        endPoint: .bottom
+      )
+      .ignoresSafeArea()
+
+      ScrollView(.vertical, showsIndicators: false) {
+        VStack(spacing: 30) {
+          Picker("", selection: $mode) {
+            ForEach(ChatProfileAppearanceMode.allCases) { option in
+              Text(option.title).tag(option)
+            }
+          }
+          .pickerStyle(.segmented)
+          .frame(maxWidth: 270)
+          .padding(.top, 16)
+
+          ChatProfileAvatarPosterPreview(
+            mode: mode,
+            displayText: avatarDisplayText,
+            selection: draft,
+            avatarImage: hasProfileImage ? avatarImage : nil
+          )
+          .frame(maxWidth: .infinity)
+          .padding(.top, 10)
+
+          customizeButton
+
+          if mode == .poster {
+            posterPhotoSection
+          } else {
+            emojiSection
+            memojiSection
+            monogramSection
+          }
+        }
+        .padding(.horizontal, 22)
+        .padding(.bottom, 44)
+      }
+    }
+    .navigationBarBackButtonHidden(true)
+    .toolbar {
+      ToolbarItem(placement: .topBarLeading) {
+        Button {
+          dismiss()
+        } label: {
+          Image(systemName: "xmark")
+            .font(.system(size: 18, weight: .semibold))
+        }
+      }
+
+      ToolbarItem(placement: .topBarTrailing) {
+        Button {
+          onSave(draft)
+          dismiss()
+        } label: {
+          Image(systemName: "checkmark")
+            .font(.system(size: 20, weight: .semibold))
+        }
+      }
+    }
+    .toolbarBackground(.hidden, for: .navigationBar)
+    .task(id: normalizedAvatarUri ?? "") {
+      await loadAvatarImage()
+    }
+    .task(id: selectedPhotoItem) {
+      await loadSelectedPosterPhoto()
+    }
+    .sheet(isPresented: $isCustomizerPresented) {
+      ChatProfileAppearanceGradientSheet(
+        mode: mode,
+        displayText: avatarDisplayText,
+        selection: $draft,
+        onChoose: { selection in
+          onSave(selection)
+        }
+      )
+      .presentationDetents(mode == .poster ? Set([.large]) : Set([.medium, .large]))
+      .presentationDragIndicator(.visible)
+    }
+  }
+
+  private var customizeButton: some View {
+    Button {
+      isCustomizerPresented = true
+    } label: {
+      Text("Customize")
+        .font(.system(size: 20, weight: .bold))
+        .foregroundStyle(.white)
+        .padding(.horizontal, 30)
+        .frame(height: 58)
+        .background(
+          Capsule(style: .continuous)
+            .fill(Color.black.opacity(0.28))
+        )
+        .overlay(
+          Capsule(style: .continuous)
+            .stroke(Color.white.opacity(0.13), lineWidth: 1)
+        )
+    }
+    .buttonStyle(.plain)
+  }
+
+  private var posterPhotoSection: some View {
+    VStack(alignment: .leading, spacing: 14) {
+      Text("Photos")
+        .font(.system(size: 24, weight: .bold))
+        .foregroundStyle(.white)
+
+      HStack(spacing: 18) {
+        PhotosPicker(selection: $selectedPhotoItem, matching: .images) {
+          ZStack {
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+              .fill(Color.black.opacity(0.24))
+
+            Image(systemName: "photo.on.rectangle.angled")
+              .font(.system(size: 30, weight: .semibold))
+              .foregroundStyle(.white)
+          }
+          .frame(width: 104, height: 118)
+        }
+        .buttonStyle(.plain)
+
+        VStack(alignment: .leading, spacing: 6) {
+          Text("Choose a Photo")
+            .font(.system(size: 24, weight: .bold))
+          Text("Poster")
+            .font(.system(size: 18, weight: .regular))
+            .foregroundStyle(.white.opacity(0.74))
+        }
+        .foregroundStyle(.white)
+
+        Spacer(minLength: 0)
+      }
+
+      if draft.posterImageData != nil {
+        Button(role: .destructive) {
+          var nextDraft = draft
+          nextDraft.posterImageData = nil
+          draft = nextDraft
+          onSave(nextDraft)
+        } label: {
+          Label("Remove Photo", systemImage: "minus.circle")
+        }
+        .buttonStyle(.bordered)
+      }
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+  }
+
+  private var emojiSection: some View {
+    ChatProfileHorizontalChoiceSection(title: "Emoji") {
+      ForEach(["😀", "😎", "✨", "🔥", "💫", "🌙"], id: \.self) { emoji in
+        Button {
+          var nextDraft = draft
+          nextDraft.avatarGlyph = emoji
+          draft = nextDraft
+          onSave(nextDraft)
+        } label: {
+          ChatProfileEmojiTile(text: emoji, colors: avatarTileColors)
+        }
+        .buttonStyle(.plain)
+      }
+    }
+  }
+
+  private var memojiSection: some View {
+    ChatProfileHorizontalChoiceSection(title: "Memoji") {
+      ForEach(["🙂", "🤖", "👾", "🧑‍💻"], id: \.self) { emoji in
+        Button {
+          var nextDraft = draft
+          nextDraft.avatarGlyph = emoji
+          draft = nextDraft
+          onSave(nextDraft)
+        } label: {
+          ChatProfileEmojiTile(text: emoji, colors: avatarTileColors, roundedRectangle: true)
+        }
+        .buttonStyle(.plain)
+      }
+    }
+  }
+
+  private var monogramSection: some View {
+    ChatProfileHorizontalChoiceSection(title: "Monogram") {
+      ForEach(ChatProfileAvatarFontStyle.allCases) { style in
+        Button {
+          var nextDraft = draft
+          nextDraft.avatarGlyph = nil
+          nextDraft.avatarFontStyleID = style.rawValue
+          draft = nextDraft
+          onSave(nextDraft)
+        } label: {
+          ZStack {
+            LinearGradient(
+              colors: [Color(uiColor: avatarTileColors.0), Color(uiColor: avatarTileColors.1)],
+              startPoint: .top,
+              endPoint: .bottom
+            )
+            ChatProfileAvatarGlyph(text: initial, fontStyleID: style.rawValue, size: 44)
+          }
+          .frame(width: 96, height: 96)
+          .clipShape(Circle())
+        }
+        .buttonStyle(.plain)
+      }
+    }
+  }
+
+  private var avatarTileColors: (UIColor, UIColor) {
+    ChatProfileAppearancePalette.colors(for: draft, mode: .avatar)
+  }
+
+  private var normalizedAvatarUri: String? {
+    let value = avatarUri?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return value.isEmpty ? nil : value
+  }
+
+  @MainActor
+  private func loadAvatarImage() async {
+    let normalized = normalizedAvatarUri
+    if avatarImageUri != normalized {
+      avatarImageUri = normalized
+      avatarImage = normalized.flatMap { ChatAvatarImageStore.cached(for: $0) }
+    }
+    guard let normalized else {
+      avatarImage = nil
+      return
+    }
+    if let cached = ChatAvatarImageStore.cached(for: normalized) {
+      avatarImage = cached
+      return
+    }
+    let loaded = await ChatAvatarImageStore.load(from: normalized)
+    guard !Task.isCancelled, avatarImageUri == normalized else { return }
+    avatarImage = loaded
+  }
+
+  @MainActor
+  private func loadSelectedPosterPhoto() async {
+    guard let selectedPhotoItem else { return }
+    guard let data = try? await selectedPhotoItem.loadTransferable(type: Data.self) else { return }
+    var nextDraft = draft
+    if let image = UIImage(data: data), let jpeg = image.jpegData(compressionQuality: 0.84) {
+      nextDraft.posterImageData = jpeg
+    } else {
+      nextDraft.posterImageData = data
+    }
+    draft = nextDraft
+    onSave(nextDraft)
+    mode = .poster
+  }
+}
+
+private struct ChatProfileHorizontalChoiceSection<Content: View>: View {
+  let title: String
   @ViewBuilder let content: Content
 
   var body: some View {
+    VStack(alignment: .leading, spacing: 14) {
+      Text(title)
+        .font(.system(size: 24, weight: .bold))
+        .foregroundStyle(.white)
+
+      ScrollView(.horizontal, showsIndicators: false) {
+        HStack(spacing: 18) {
+          content
+        }
+        .padding(.vertical, 2)
+      }
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+  }
+}
+
+private struct ChatProfileEmojiTile: View {
+  let text: String
+  let colors: (UIColor, UIColor)
+  var roundedRectangle: Bool = false
+
+  var body: some View {
+    ZStack {
+      LinearGradient(
+        colors: [Color(uiColor: colors.0), Color(uiColor: colors.1)],
+        startPoint: .top,
+        endPoint: .bottom
+      )
+      Text(text)
+        .font(.system(size: 44))
+    }
+    .frame(width: 96, height: 96)
+    .clipShape(
+      RoundedRectangle(cornerRadius: roundedRectangle ? 24 : 48, style: .continuous)
+    )
+  }
+}
+
+private struct ChatProfileAppearanceGradientSheet: View {
+  let mode: ChatProfileAppearanceMode
+  let displayText: String
+  @Binding var selection: ChatProfileAppearanceSelection
+  let onChoose: (ChatProfileAppearanceSelection) -> Void
+
+  @Environment(\.dismiss) private var dismiss
+
+  private var backgroundColors: (UIColor, UIColor) {
+    ChatProfileAppearancePalette.colors(for: selection, mode: .poster)
+  }
+
+  var body: some View {
+    ZStack {
+      LinearGradient(
+        colors: [Color(uiColor: backgroundColors.0), Color(uiColor: backgroundColors.1)],
+        startPoint: .top,
+        endPoint: .bottom
+      )
+      .ignoresSafeArea()
+
+      ScrollView(.vertical, showsIndicators: false) {
+        VStack(spacing: 26) {
+          HStack {
+            Button("Cancel") {
+              dismiss()
+            }
+            .font(.system(size: 20, weight: .medium))
+            .padding(.horizontal, 22)
+            .frame(height: 52)
+            .background(Capsule(style: .continuous).stroke(Color.white.opacity(0.25), lineWidth: 1))
+
+            Spacer()
+
+            Button("Choose") {
+              onChoose(selection)
+              dismiss()
+            }
+            .font(.system(size: 20, weight: .medium))
+            .padding(.horizontal, 22)
+            .frame(height: 52)
+            .background(Capsule(style: .continuous).stroke(Color.white.opacity(0.25), lineWidth: 1))
+          }
+          .foregroundStyle(.white)
+          .padding(.top, 12)
+
+          ChatProfileAvatarPosterPreview(
+            mode: mode,
+            displayText: displayText,
+            selection: selection,
+            avatarImage: nil
+          )
+          .frame(maxWidth: .infinity)
+
+          VStack(alignment: .leading, spacing: 20) {
+            Text("Suggestions")
+              .font(.system(size: 24, weight: .bold))
+              .foregroundStyle(.white)
+
+            ChatProfilePaletteGrid(mode: mode, selection: $selection)
+
+            VStack(spacing: 12) {
+              ColorPicker("Start", selection: customStartBinding, supportsOpacity: false)
+              ColorPicker("End", selection: customEndBinding, supportsOpacity: false)
+            }
+            .font(.system(size: 17, weight: .semibold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 18)
+            .padding(.vertical, 14)
+            .background(
+              RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(Color.black.opacity(0.18))
+            )
+          }
+          .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 22)
+        .padding(.bottom, 34)
+      }
+    }
+  }
+
+  private var customStartBinding: Binding<Color> {
+    Binding {
+      let colors = ChatProfileAppearancePalette.colors(for: selection, mode: mode)
+      return Color(uiColor: colors.0)
+    } set: { value in
+      let hex = UIColor(value).chatProfileHexString
+      if mode == .avatar {
+        selection.avatarCustomStartHex = hex
+      } else {
+        selection.posterCustomStartHex = hex
+        selection.posterImageData = nil
+      }
+    }
+  }
+
+  private var customEndBinding: Binding<Color> {
+    Binding {
+      let colors = ChatProfileAppearancePalette.colors(for: selection, mode: mode)
+      return Color(uiColor: colors.1)
+    } set: { value in
+      let hex = UIColor(value).chatProfileHexString
+      if mode == .avatar {
+        selection.avatarCustomEndHex = hex
+      } else {
+        selection.posterCustomEndHex = hex
+        selection.posterImageData = nil
+      }
+    }
+  }
+}
+
+private struct ChatProfileAvatarPosterPreview: View {
+  let mode: ChatProfileAppearanceMode
+  let displayText: String
+  let selection: ChatProfileAppearanceSelection
+  let avatarImage: UIImage?
+
+  private var avatarColors: (UIColor, UIColor) {
+    ChatProfileAppearancePalette.colors(for: selection, mode: .avatar)
+  }
+
+  private var posterColors: (UIColor, UIColor) {
+    ChatProfileAppearancePalette.colors(for: selection, mode: .poster)
+  }
+
+  private var posterImage: UIImage? {
+    guard let data = selection.posterImageData else { return nil }
+    return UIImage(data: data)
+  }
+
+  var body: some View {
+    let isPoster = mode == .poster
+    ZStack {
+      previewBackground(isPoster: isPoster)
+
+      if isPoster {
+        avatarCircle(size: 92)
+      } else {
+        avatarCircle(size: 252)
+      }
+    }
+    .frame(width: isPoster ? 188 : 252, height: isPoster ? 332 : 252)
+    .clipShape(RoundedRectangle(cornerRadius: isPoster ? 42 : 126, style: .continuous))
+    .overlay(
+      RoundedRectangle(cornerRadius: isPoster ? 42 : 126, style: .continuous)
+        .stroke(Color.white.opacity(0.16), lineWidth: 1)
+    )
+    .shadow(color: Color.black.opacity(0.20), radius: 12, x: 0, y: 6)
+    .animation(.spring(response: 0.42, dampingFraction: 0.86), value: mode)
+  }
+
+  @ViewBuilder
+  private func previewBackground(isPoster: Bool) -> some View {
+    if isPoster, let posterImage {
+      Image(uiImage: posterImage)
+        .resizable()
+        .scaledToFill()
+    } else {
+      LinearGradient(
+        colors: [
+          Color(uiColor: isPoster ? posterColors.0 : avatarColors.0),
+          Color(uiColor: isPoster ? posterColors.1 : avatarColors.1),
+        ],
+        startPoint: .top,
+        endPoint: .bottom
+      )
+    }
+  }
+
+  private func avatarCircle(size: CGFloat) -> some View {
+    ZStack {
+      LinearGradient(
+        colors: [Color(uiColor: avatarColors.0), Color(uiColor: avatarColors.1)],
+        startPoint: .top,
+        endPoint: .bottom
+      )
+
+      if let avatarImage {
+        Image(uiImage: avatarImage)
+          .resizable()
+          .scaledToFill()
+      } else {
+        ChatProfileAvatarGlyph(
+          text: displayText,
+          fontStyleID: selection.avatarFontStyleID,
+          size: size * 0.46
+        )
+      }
+    }
+    .frame(width: size, height: size)
+    .clipShape(Circle())
+    .overlay(Circle().stroke(Color.white.opacity(0.18), lineWidth: 1))
+    .shadow(color: Color.black.opacity(0.18), radius: size > 120 ? 10 : 4, x: 0, y: 4)
+  }
+}
+
+private struct ChatProfilePaletteGrid: View {
+  let mode: ChatProfileAppearanceMode
+  @Binding var selection: ChatProfileAppearanceSelection
+
+  private let columns = Array(repeating: GridItem(.flexible(), spacing: 22), count: 5)
+
+  var body: some View {
+    LazyVGrid(columns: columns, spacing: 24) {
+      ForEach(ChatProfileAppearancePalette.all) { palette in
+        Button {
+          if mode == .avatar {
+            selection.avatarPaletteID = palette.id
+            selection.avatarCustomStartHex = nil
+            selection.avatarCustomEndHex = nil
+          } else {
+            selection.posterPaletteID = palette.id
+            selection.posterCustomStartHex = nil
+            selection.posterCustomEndHex = nil
+            selection.posterImageData = nil
+          }
+        } label: {
+          Circle()
+            .fill(
+              LinearGradient(
+                colors: [
+                  Color(uiColor: ChatProfileAppearancePalette.uiColor(hex: palette.topHex)),
+                  Color(uiColor: ChatProfileAppearancePalette.uiColor(hex: palette.bottomHex)),
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+              )
+            )
+            .frame(width: 44, height: 44)
+            .overlay {
+              if isSelected(palette) {
+                Circle()
+                  .stroke(Color.white, lineWidth: 3)
+                  .padding(-4)
+              }
+            }
+        }
+        .buttonStyle(.plain)
+      }
+    }
+  }
+
+  private func isSelected(_ palette: ChatProfileAppearancePalette) -> Bool {
+    switch mode {
+    case .avatar:
+      return selection.avatarPaletteID == palette.id
+        && selection.avatarCustomStartHex == nil
+        && selection.avatarCustomEndHex == nil
+    case .poster:
+      return selection.posterPaletteID == palette.id
+        && selection.posterCustomStartHex == nil
+        && selection.posterCustomEndHex == nil
+    }
+  }
+}
+
+private struct ChatProfileSwiftUIMaterialBackground: UIViewRepresentable {
+  let style: UIBlurEffect.Style
+
+  func makeUIView(context: Context) -> UIVisualEffectView {
+    let view = UIVisualEffectView(effect: resolvedEffect)
+    view.backgroundColor = .clear
+    view.isUserInteractionEnabled = false
+    return view
+  }
+
+  func updateUIView(_ uiView: UIVisualEffectView, context: Context) {
+    uiView.effect = resolvedEffect
+  }
+
+  private var resolvedEffect: UIVisualEffect {
+    if #available(iOS 26.0, *) {
+      let effect = UIGlassEffect(style: .regular)
+      effect.isInteractive = false
+      return effect
+    }
+    return UIBlurEffect(style: style)
+  }
+}
+
+private struct ChatProfileSwiftUISection<Content: View>: View {
+  @Environment(\.colorScheme) private var colorScheme
+
+  let fill: Color
+  @ViewBuilder let content: Content
+
+  private var materialStyle: UIBlurEffect.Style {
+    colorScheme == .dark ? .systemThinMaterialDark : .systemThinMaterialLight
+  }
+
+  private var glassLift: Color {
+    colorScheme == .dark ? Color.white.opacity(0.055) : Color.white.opacity(0.16)
+  }
+
+  var body: some View {
+    let shape = RoundedRectangle(cornerRadius: 24, style: .continuous)
     VStack(spacing: 0) {
       content
     }
-    .background(
-      RoundedRectangle(cornerRadius: 24, style: .continuous)
-        .fill(fill)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
-    )
-    .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-    .overlay(
-      RoundedRectangle(cornerRadius: 24, style: .continuous)
-        .stroke(Color.primary.opacity(0.07), lineWidth: 1)
-    )
+    .background {
+      ChatProfileSwiftUIMaterialBackground(style: materialStyle)
+        .clipShape(shape)
+      shape.fill(fill)
+      shape.fill(glassLift)
+    }
+    .clipShape(shape)
+    .overlay(shape.stroke(Color.white.opacity(colorScheme == .dark ? 0.12 : 0.18), lineWidth: 1))
   }
 }
 
 private struct ChatProfileSwiftUIRow: View {
   let title: String
   var subtitle: String = ""
+  var leading: AnyView? = nil
   var trailingSystemImage: String?
   var showsChevron: Bool = false
   var titleColor: Color = .primary
@@ -1216,6 +2620,10 @@ private struct ChatProfileSwiftUIRow: View {
 
   var body: some View {
     HStack(spacing: 14) {
+      if let leading {
+        leading
+      }
+
       VStack(alignment: .leading, spacing: subtitle.isEmpty ? 0 : 4) {
         Text(title)
           .font(.system(size: 17, weight: .regular))
@@ -1270,10 +2678,16 @@ private struct ChatProfileSwiftUIRowButtonStyle: ButtonStyle {
 }
 
 private struct ChatProfileSwiftUIActionButton: View {
+  @Environment(\.colorScheme) private var colorScheme
+
   let title: String
   let systemImage: String
   let fill: Color
   let action: () -> Void
+
+  private var materialStyle: UIBlurEffect.Style {
+    colorScheme == .dark ? .systemThinMaterialDark : .systemThinMaterialLight
+  }
 
   var body: some View {
     Button(action: action) {
@@ -1281,11 +2695,13 @@ private struct ChatProfileSwiftUIActionButton: View {
         Image(systemName: systemImage)
           .font(.system(size: 22, weight: .semibold))
           .frame(width: 52, height: 52)
-          .background(
-            Circle()
-              .fill(fill)
-              .background(.regularMaterial, in: Circle())
-          )
+          .background {
+            ChatProfileSwiftUIMaterialBackground(style: materialStyle)
+              .clipShape(Circle())
+            Circle().fill(fill)
+            Circle().fill(Color.white.opacity(colorScheme == .dark ? 0.055 : 0.15))
+          }
+          .overlay(Circle().stroke(Color.white.opacity(colorScheme == .dark ? 0.12 : 0.20), lineWidth: 1))
 
         Text(title)
           .font(.system(size: 12, weight: .semibold))
@@ -1862,6 +3278,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   @objc public var surfaceId: String = ""
 
   private let backgroundGradientLayer = CAGradientLayer()
+  private let posterImageLayer = CALayer()
   private let avatarGlassRing = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
 
   private let headerMaskContainer = UIView()
@@ -2038,17 +3455,21 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     
     // Size the background gradient to fill the view
     backgroundGradientLayer.frame = bounds
+    posterImageLayer.frame = bounds
 
     layoutFloatingAvatarView()
     updateAvatarMorphProgress()
     layoutAvatarGlassRing()
     swiftUIContainerView.isHidden = false
-    floatingAvatarView.isHidden = swiftUINavigationActive
+    floatingAvatarView.isHidden = true
     avatarGlassRing.isHidden = true
-    headerContainer.isHidden = swiftUINavigationActive
+    avatarGlassRing.alpha = 0.0
+    headerContainer.isHidden = true
     headerMaskContainer.isHidden = true
     bringSubviewToFront(swiftUIContainerView)
-    bringSubviewToFront(headerContainer)
+    if let hostView = swiftUIHostingController?.view {
+      swiftUIContainerView.bringSubviewToFront(hostView)
+    }
 
     onViewportChanged([
       "width": bounds.width,
@@ -2074,6 +3495,9 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   func setEngineChatId(_ value: String) {
     engineChatId = value.trimmingCharacters(in: .whitespacesAndNewlines)
     fetchAgentConfigForCurrentChat()
+    applyTheme()
+    refreshAvatar()
+    renderSwiftUIProfile()
   }
 
   func setEngineMyUserId(_ value: String) {
@@ -2083,6 +3507,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   func setEnginePeerUserId(_ value: String) {
     enginePeerUserId = value.trimmingCharacters(in: .whitespacesAndNewlines)
     tableView.reloadData()
+    applyTheme()
     refreshAvatar()
     renderSwiftUIProfile()
   }
@@ -2108,6 +3533,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
 
   func setHeaderTitle(_ value: String) {
     headerTitle = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    applyTheme()
+    refreshAvatar()
     reloadHeaderText()
     refreshHeroContent()
   }
@@ -2119,6 +3546,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
 
   func setProfileName(_ value: String) {
     profileName = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    applyTheme()
+    refreshAvatar()
     reloadHeaderText()
     refreshHeroContent()
   }
@@ -2194,6 +3623,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     profileBio = value.trimmingCharacters(in: .whitespacesAndNewlines)
     refreshHeroContent()
     tableView.reloadData()
+    renderSwiftUIProfile()
   }
 
   func setAvatarUri(_ value: String?) {
@@ -2201,6 +3631,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     guard avatarUri != normalized else { return }
     avatarUri = normalized
     refreshAvatar()
+    renderSwiftUIProfile()
   }
 
   func setIsOnline(_ value: Bool) {
@@ -2258,12 +3689,15 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     backgroundGradientLayer.startPoint = CGPoint(x: 0.5, y: 0.0)
     backgroundGradientLayer.endPoint = CGPoint(x: 0.5, y: 1.0)
     layer.insertSublayer(backgroundGradientLayer, at: 0)
+    posterImageLayer.contentsGravity = .resizeAspectFill
+    posterImageLayer.opacity = 0.0
+    layer.insertSublayer(posterImageLayer, above: backgroundGradientLayer)
 
     // Avatar glass ring
     avatarGlassRing.clipsToBounds = true
     avatarGlassRing.isUserInteractionEnabled = false
-    avatarGlassRing.isHidden = false
-    avatarGlassRing.alpha = 1.0
+    avatarGlassRing.isHidden = true
+    avatarGlassRing.alpha = 0.0
 
     addSubview(headerMaskContainer)
     headerMaskContainer.clipsToBounds = true
@@ -2283,6 +3717,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     headerMaskView.layer.mask = headerMaskGradientLayer
     addSubview(headerContainer)
     headerContainer.clipsToBounds = false
+    headerContainer.isHidden = true
+    headerContainer.isUserInteractionEnabled = false
     headerContainer.addSubview(headerContentView)
     headerContainer.layer.zPosition = 60.0
     headerContentView.addSubview(backButton)
@@ -2339,12 +3775,12 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     floatingAvatarView.isUserInteractionEnabled = false
 
     swiftUIContainerView.backgroundColor = .clear
-    swiftUIContainerView.clipsToBounds = true
+    swiftUIContainerView.clipsToBounds = false
     swiftUIContainerView.layer.zPosition = 30.0
     addSubview(swiftUIContainerView)
     
     swiftUIContainerView.insertSubview(avatarGlassRing, at: 0)
-    swiftUIContainerView.insertSubview(floatingAvatarView, at: 1)
+    swiftUIContainerView.insertSubview(floatingAvatarView, at: 0)
 
     bringSubviewToFront(swiftUIContainerView)
     bringSubviewToFront(headerContainer)
@@ -2393,6 +3829,13 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       historyItems: swiftUIHistoryItems(),
       tabSummaries: swiftUITabSummaries(),
       tabItems: swiftUITabItems(),
+      appearanceSelection: currentAppearanceSelection(resolvedName: resolvedName),
+      hasProfileImage: hasResolvedProfileImage,
+      avatarUri: resolvedAvatarImageUriForSwiftUI(),
+      isGroupOrChannel: isGroupOrChannel,
+      groupMembersSubtitle: groupMembersSummary(),
+      groupBridgeProvider: groupBridgeProviderFromMembers(),
+      selectedRepositoryName: AgentBridgeSelectionStore.selectedRepository()?.name,
       bridgeProvider: bridgeProvider,
       bridgeChatId: engineChatId,
       bridgeConnected: bridgeConnected,
@@ -2419,6 +3862,10 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       onAction: { [weak self] action in
         self?.handleSwiftUIProfileAction(action)
       },
+      onSaveAppearance: { [weak self] selection in
+        guard let self else { return }
+        self.saveCurrentAppearance(selection, resolvedName: resolvedName)
+      },
       onContentPressed: { [weak self] payload in
         self?.onNativeEvent(payload)
       }
@@ -2428,18 +3875,66 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     if let host = swiftUIHostingController {
       host.rootView = erasedRoot
       host.view.frame = swiftUIContainerView.bounds
+      swiftUIContainerView.bringSubviewToFront(host.view)
     } else {
       let host = UIHostingController(rootView: erasedRoot)
-      if #available(iOS 14.0, *) {
+      if #available(iOS 16.4, *) {
         host.safeAreaRegions = []
       }
       host.view.backgroundColor = .clear
       host.view.isOpaque = false
       host.view.frame = swiftUIContainerView.bounds
       swiftUIContainerView.addSubview(host.view)
+      swiftUIContainerView.bringSubviewToFront(host.view)
       swiftUIHostingController = host
       attachSwiftUIHostIfNeeded()
     }
+  }
+
+  private func currentAppearanceSelection(resolvedName: String? = nil) -> ChatProfileAppearanceSelection {
+    ChatProfileAppearanceStore.selection(
+      title: resolvedName ?? (profileName.isEmpty ? headerTitle : profileName),
+      peerUserId: enginePeerUserId,
+      chatId: engineChatId
+    )
+  }
+
+  private func saveCurrentAppearance(
+    _ selection: ChatProfileAppearanceSelection,
+    resolvedName: String? = nil
+  ) {
+    let name = resolvedName ?? (profileName.isEmpty ? headerTitle : profileName)
+    ChatProfileAppearanceStore.save(
+      selection,
+      title: name,
+      peerUserId: enginePeerUserId,
+      chatId: engineChatId
+    )
+    applyTheme()
+    refreshAvatar()
+    renderSwiftUIProfile()
+    setNeedsLayout()
+    updateAvatarMorphProgress()
+    onNativeEvent(["type": "profileAppearanceUpdated"])
+  }
+
+  private var hasResolvedProfileImage: Bool {
+    let rawAvatarHasValue =
+      avatarUri?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    let hasPushAvatar =
+      !isGroupOrChannel && !enginePeerUserId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    return rawAvatarHasValue || hasPushAvatar
+  }
+
+  private func resolvedAvatarImageUriForSwiftUI() -> String? {
+    let rawAvatar = avatarUri
+    let preferPushAvatar = !isGroupOrChannel
+    return ChatAvatarURLResolver.resolve(
+      rawAvatar: rawAvatar,
+      peerUserId: enginePeerUserId,
+      chatId: engineChatId,
+      preferPushAvatar: preferPushAvatar
+    )
   }
 
   private func handleSwiftUIProfileAction(_ action: String) {
@@ -2454,6 +3949,13 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       handleVideoPressed()
     case "bridgeConnection":
       presentBridgeConnection()
+    case let value where value.hasPrefix("bridgeRepository:"):
+      let provider = String(value.dropFirst("bridgeRepository:".count))
+      onNativeEvent(["type": "openAgentPanel", "provider": provider])
+    case "members":
+      onNativeEvent(["type": "profileMembersPressed"])
+    case "agentConfig":
+      presentAgentConfigEditor()
     case "headerBack":
       handleBackPressed()
     case "shareContact", "createNewContact", "addToExisting":
@@ -2769,9 +4271,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     )
     avatarGlassRing.layer.cornerRadius = ringSize * 0.5
     
-    let isActive = swiftUINavigationActive
-    avatarGlassRing.isHidden = isActive
-    avatarGlassRing.alpha = isActive ? 0.0 : 1.0
+    avatarGlassRing.isHidden = true
+    avatarGlassRing.alpha = 0.0
   }
 
   private func layoutActionsForCurrentScroll() {
@@ -2780,22 +4281,33 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
 
   private func applyTheme() {
     let isDark = traitCollection.userInterfaceStyle == .dark
+    let resolvedName = profileName.isEmpty ? headerTitle : profileName
+    let posterColors = ChatProfileAppearanceStore.posterColors(
+      title: resolvedName,
+      peerUserId: enginePeerUserId,
+      chatId: engineChatId
+    )
+    let posterTop = posterColors.0
+    let posterBottom = posterColors.1
+    let posterMid = posterTop.blended(withFraction: 0.42, of: posterBottom)
 
-    // Subtle graphite/ink field. Keep it quiet so the material rows carry the profile.
-    if isDark {
-      backgroundGradientLayer.colors = [
-        UIColor(red: 19.0/255.0, green: 25.0/255.0, blue: 30.0/255.0, alpha: 1.0).cgColor,
-        UIColor(red: 12.0/255.0, green: 16.0/255.0, blue: 22.0/255.0, alpha: 1.0).cgColor,
-        UIColor(red: 6.0/255.0, green: 8.0/255.0, blue: 13.0/255.0, alpha: 1.0).cgColor,
-      ]
-      backgroundGradientLayer.locations = [0.0, 0.52, 1.0]
+    backgroundGradientLayer.colors = [
+      posterTop.cgColor,
+      posterMid.cgColor,
+      posterBottom.cgColor,
+    ]
+    backgroundGradientLayer.locations = [0.0, 0.48, 1.0]
+
+    if let posterImage = ChatProfileAppearanceStore.posterImage(
+      title: resolvedName,
+      peerUserId: enginePeerUserId,
+      chatId: engineChatId
+    )?.cgImage {
+      posterImageLayer.contents = posterImage
+      posterImageLayer.opacity = isDark ? 0.54 : 0.42
     } else {
-      backgroundGradientLayer.colors = [
-        UIColor(red: 242.0/255.0, green: 245.0/255.0, blue: 246.0/255.0, alpha: 1.0).cgColor,
-        UIColor(red: 234.0/255.0, green: 239.0/255.0, blue: 241.0/255.0, alpha: 1.0).cgColor,
-        UIColor(red: 226.0/255.0, green: 231.0/255.0, blue: 235.0/255.0, alpha: 1.0).cgColor,
-      ]
-      backgroundGradientLayer.locations = [0.0, 0.54, 1.0]
+      posterImageLayer.contents = nil
+      posterImageLayer.opacity = 0.0
     }
 
     let background = UIColor.clear // gradient handles background
@@ -2809,10 +4321,11 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       isDark
       ? UIColor(red: 77 / 255, green: 217 / 255, blue: 229 / 255, alpha: 1.0)
       : UIColor(red: 0 / 255, green: 122 / 255, blue: 124 / 255, alpha: 1.0)
-    let fallbackAvatarBackground =
-      isDark
-      ? UIColor(red: 248 / 255, green: 246 / 255, blue: 252 / 255, alpha: 20 / 255)
-      : UIColor(red: 26 / 255, green: 26 / 255, blue: 31 / 255, alpha: 13 / 255)
+    let fallbackAvatarColors = ChatProfileAppearanceStore.avatarColors(
+      title: resolvedName,
+      peerUserId: enginePeerUserId,
+      chatId: engineChatId
+    )
     let fallbackAvatarIconTint = text
 
     backgroundColor = background
@@ -2847,11 +4360,11 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     heroBannerView.backgroundColor = .clear
 
     // Use a dark base for the island cover so avatar morph blends into gradient
-    let gradientBase = isDark
-      ? UIColor(red: 19.0/255.0, green: 25.0/255.0, blue: 30.0/255.0, alpha: 1.0)
-      : UIColor(red: 242.0/255.0, green: 245.0/255.0, blue: 246.0/255.0, alpha: 1.0)
-    floatingAvatarView.setIslandCoverUIColor(gradientBase)
-    floatingAvatarView.setFallbackBackgroundUIColor(fallbackAvatarBackground)
+    floatingAvatarView.setIslandCoverUIColor(posterTop)
+    floatingAvatarView.setFallbackGradientUIColors(
+      start: fallbackAvatarColors.0,
+      end: fallbackAvatarColors.1
+    )
     floatingAvatarView.setFallbackIconTintUIColor(fallbackAvatarIconTint)
 
     // Avatar glass ring effect
@@ -2990,14 +4503,15 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     avatarResolveGeneration &+= 1
     let generation = avatarResolveGeneration
     floatingAvatarView.setFallbackText(resolvedAvatarFallbackText())
-    let fallbackColors = ChatAvatarFallbackStyle.uiGradient(
+    let fallbackColors = ChatProfileAppearanceStore.avatarColors(
       title: profileName.isEmpty ? headerTitle : profileName,
       peerUserId: enginePeerUserId,
-      chatId: engineChatId,
-      isDark: traitCollection.userInterfaceStyle == .dark,
-      isSavedMessages: false
+      chatId: engineChatId
     )
-    floatingAvatarView.setFallbackBackgroundUIColor(fallbackColors.0)
+    floatingAvatarView.setFallbackGradientUIColors(
+      start: fallbackColors.0,
+      end: fallbackColors.1
+    )
     floatingAvatarView.setFallbackIconTintUIColor(.white)
 
     let rawAvatar = avatarUri
@@ -3178,6 +4692,46 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     }
     guard !names.isEmpty else { return "View all participants" }
     return names.prefix(3).joined(separator: ", ")
+  }
+
+  private func groupBridgeProviderFromMembers() -> String? {
+    for member in groupMembers {
+      let values = [
+        member["userId"],
+        member["user_id"],
+        member["id"],
+        member["name"],
+        member["displayName"],
+        member["username"],
+        member["handle"],
+        member["label"]
+      ]
+      .compactMap { value -> String? in
+        if let string = value as? String {
+          return string.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }
+        if let number = value as? NSNumber {
+          return number.stringValue.lowercased()
+        }
+        return nil
+      }
+
+      if values.contains("00000000-0000-0000-0000-0000000000c1")
+        || values.contains("claude")
+        || values.contains("@claude")
+      {
+        return "claude"
+      }
+
+      if values.contains("00000000-0000-0000-0000-0000000000c2")
+        || values.contains("codex")
+        || values.contains("@codex")
+      {
+        return "codex"
+      }
+    }
+
+    return nil
   }
 
   private func configureListRowCell(

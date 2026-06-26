@@ -67,7 +67,12 @@ final class AgentConnectModel: ObservableObject {
         onConnected?()
       }
     } catch {
-      // Transient — keep the last known status and let the next tick retry.
+      // A 401 here means the whole session token died, not just the bridge — kick
+      // off a silent session refresh so the panel stops spinning on a dead token.
+      if let pairingError = error as? AgentPairingError, case .http(401, _) = pairingError {
+        Task { await AppSessionGuard.shared.recover(reason: "agent-connect-status") }
+      }
+      // Otherwise transient — keep the last known status and let the next tick retry.
     }
   }
 

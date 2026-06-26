@@ -45,6 +45,78 @@ const MAX_LINE_BYTES = 8 * 1024;
 const MAX_DIFF_BYTES = 90 * 1024;
 const MAX_DIFF_FILES = 24;
 const MAX_UNTRACKED_FILE_BYTES = 220 * 1024;
+const BRIDGE_INSTRUCTION_DIR = path.join(".vibe", "instructions");
+const BRIDGE_INSTRUCTION_FILES = {
+  "AGENTS.md": `# Vibe Agent Operating Guide
+
+These rules apply to AI agents working through Vibe, including Claude and Codex.
+
+## Role
+
+- Act like a senior engineer working in a real production codebase.
+- Inspect the existing code before proposing or editing.
+- Prefer the repository's existing architecture, naming, and UI patterns.
+- Keep changes scoped to the user's request.
+- Do not perform unrelated refactors or cleanup.
+
+## Local Bridge Workflow
+
+- The selected project lives on the user's computer, not on the phone.
+- Treat the mobile app as the control surface for prompts, command approvals, progress, files, diffs, and results.
+- Surface useful runtime details: commands, files touched, patches, blockers, verification, and remaining risk.
+- If a command needs approval, explain the exact command, why it is needed, and the risk.
+
+## Claude and Codex Teamwork
+
+- When a task includes both Claude and Codex, work as one team.
+- Do not duplicate another agent's likely work.
+- If the user assigns work by name, follow that assignment exactly.
+- If work is not assigned, choose a non-overlapping slice and state what you took.
+- Read teammate notes before continuing.
+- Use .vibe/team/<team_run_id>.md as the shared handoff file when repo writes are allowed.
+- Keep handoff edits additive under your own section with ownership, findings, files changed, blockers, and next steps.
+
+## Safety
+
+- Start with read-only inspection when the risk is unclear.
+- Do not delete files, reset git state, force push, rotate secrets, or run destructive commands unless the user explicitly approves.
+- Never expose secrets, tokens, private keys, or local credentials.
+- Do not overwrite user work. Check the current diff before touching files that may already be edited.
+
+## Implementation Standard
+
+- Make the smallest complete change that solves the real problem.
+- Prefer structured payloads over flattened text when the app needs to render tools, commands, patches, or runtime state.
+- For iOS work, keep UI behavior consistent with the existing SwiftUI/UIKit patterns.
+- For server work, preserve auth boundaries, group ownership, and per-user bridge routing.
+- For bridge work, keep repo selection, work mode, provider, command status, and task metadata visible.
+
+## Done Criteria
+
+- State what changed.
+- State what was tested.
+- State whether the result was source-verified, build-verified, bridge-verified, mobile-verified, or live-verified.
+- Call out any remaining risk or manual validation that is still needed.
+`,
+  "CLAUDE.md": `# Claude Instructions
+
+Follow AGENTS.md first. These additions are specific to Claude.
+
+- Use planning and code review strengths to identify risks, architecture boundaries, and missing verification.
+- When paired with Codex, avoid doing the same implementation slice unless the user asks for a second opinion.
+- Write concise handoff notes in .vibe/team/<team_run_id>.md so Codex can continue without rereading everything.
+- If the task is not safe to edit yet, explain the blocker and the exact inspection or approval needed.
+`,
+  "CODEX.md": `# Codex Instructions
+
+Follow AGENTS.md first. These additions are specific to Codex.
+
+- Use implementation and verification strengths to make focused patches and run the relevant checks.
+- When paired with Claude, read Claude's handoff before editing and take the next non-overlapping implementation slice.
+- Keep command output and patch summaries structured enough for Vibe to render progress, files changed, and verification.
+- If a command or edit is risky, stop and ask for explicit approval through Vibe.
+`,
+};
 
 function parseArgs(argv) {
   const out = { repos: [], repoRoots: [] };
@@ -218,6 +290,87 @@ function addRepository(map, dir, source) {
     source,
     git: fs.existsSync(path.join(root, ".git")),
   });
+}
+
+function bridgeInstructionRelativeFiles(provider) {
+  const files = [path.join(BRIDGE_INSTRUCTION_DIR, "AGENTS.md")];
+  if (provider === "claude") files.push(path.join(BRIDGE_INSTRUCTION_DIR, "CLAUDE.md"));
+  else if (provider === "codex") files.push(path.join(BRIDGE_INSTRUCTION_DIR, "CODEX.md"));
+  else {
+    files.push(path.join(BRIDGE_INSTRUCTION_DIR, "CLAUDE.md"));
+    files.push(path.join(BRIDGE_INSTRUCTION_DIR, "CODEX.md"));
+  }
+  return files;
+}
+
+function ensureBridgeInstructionFiles(repo) {
+  const root = repo && (repo.cwd || repo.path);
+  if (!root) return [];
+
+  const dir = path.join(root, BRIDGE_INSTRUCTION_DIR);
+  const written = [];
+
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    ensureBridgeInstructionGitExclude(root);
+
+    for (const [name, content] of Object.entries(BRIDGE_INSTRUCTION_FILES)) {
+      const absolutePath = path.join(dir, name);
+      if (!fs.existsSync(absolutePath) || fs.readFileSync(absolutePath, "utf8") !== content) {
+        fs.writeFileSync(absolutePath, content, "utf8");
+      }
+      written.push({
+        name,
+        path: path.join(BRIDGE_INSTRUCTION_DIR, name),
+        absolutePath,
+      });
+    }
+
+    repo.instructionFiles = written;
+    repo.instructionsReady = true;
+    return written;
+  } catch (err) {
+    repo.instructionFiles = written;
+    repo.instructionsReady = false;
+    repo.instructionsError = err && err.message ? err.message : String(err);
+    console.error(`[vibe-bridge] could not write instruction files for ${root}: ${repo.instructionsError}`);
+    return written;
+  }
+}
+
+function ensureBridgeInstructionGitExclude(root) {
+  const gitDir = path.join(root, ".git");
+  try {
+    if (!fs.existsSync(gitDir) || !fs.statSync(gitDir).isDirectory()) return;
+    const excludePath = path.join(gitDir, "info", "exclude");
+    fs.mkdirSync(path.dirname(excludePath), { recursive: true });
+    const marker = ".vibe/instructions/";
+    const current = fs.existsSync(excludePath) ? fs.readFileSync(excludePath, "utf8") : "";
+    if (!current.split(/\r?\n/).some((line) => line.trim() === marker)) {
+      fs.appendFileSync(excludePath, `${current.endsWith("\n") || current.length === 0 ? "" : "\n"}${marker}\n`);
+    }
+  } catch (_) {}
+}
+
+function ensureBridgeInstructionsForRepositories(repositories) {
+  for (const repo of repositories || []) ensureBridgeInstructionFiles(repo);
+}
+
+function taskPromptWithBridgeInstructions(provider, prompt, repo) {
+  const cleaned = stripReservedMention(prompt, provider);
+  const ready = ensureBridgeInstructionFiles(repo);
+  const readyNames = new Set(ready.map((file) => file.path));
+  const fileLines = bridgeInstructionRelativeFiles(provider)
+    .map((file) => `- ${file}${readyNames.has(file) ? "" : " (write failed; follow inline rules instead)"}`)
+    .join("\n");
+
+  return `Vibe bridge startup prepared these instruction files for this project:
+${fileLines}
+
+Before acting, read and follow those files when available. If they are unavailable, follow the same rules from the Vibe bridge prompt: inspect first, keep changes scoped, avoid duplicate teammate work, ask before risky commands, report files changed, verification, blockers, and remaining risk.
+
+User task:
+${cleaned}`;
 }
 
 // Top-level folders that are never code projects — skip them so a scan of the
@@ -566,12 +719,71 @@ function modelFor(provider, chatId, task) {
   return envModel && String(envModel).trim() ? String(envModel).trim() : null;
 }
 
+function intelligenceFor(task) {
+  const raw = String(
+    (task && (task.intelligence || task.agentBridgeIntelligence || task.thinkingMode)) || "low"
+  )
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+  if (["extra_high", "xhigh", "extra", "max"].includes(raw)) return "extra_high";
+  if (["high"].includes(raw)) return "high";
+  if (["medium", "med", "standard"].includes(raw)) return "medium";
+  return "low";
+}
+
+function speedFor(task) {
+  const raw = String((task && (task.speed || task.agentBridgeSpeed || task.speedMode)) || "standard")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+  if (["fast", "quick", "low_latency"].includes(raw)) return "fast";
+  if (["careful", "thorough", "deep", "slow"].includes(raw)) return "careful";
+  return "standard";
+}
+
+function requestedReasoningEffortFor(task) {
+  const raw =
+    task &&
+    (task.reasoningEffort ||
+      task.agentBridgeReasoningEffort ||
+      task.effort ||
+      task.agentBridgeEffort);
+  if (!raw) return null;
+  const normalized = String(raw).trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (["xhigh", "extra_high", "max"].includes(normalized)) return "xhigh";
+  if (["high", "medium", "low"].includes(normalized)) return normalized;
+  return null;
+}
+
+function reasoningEffortFor(provider, task) {
+  const requested = requestedReasoningEffortFor(task);
+  const ladder = provider === "claude" ? ["low", "medium", "high", "xhigh"] : ["low", "medium", "high"];
+  if (requested) {
+    if (ladder.includes(requested)) return requested;
+    if (requested === "xhigh") return "high";
+  }
+
+  const intelligence = intelligenceFor(task);
+  const speed = speedFor(task);
+  const base =
+    intelligence === "extra_high"
+      ? provider === "claude"
+        ? "xhigh"
+        : "high"
+      : intelligence;
+  const baseIndex = Math.max(0, ladder.indexOf(base));
+  const offset = speed === "fast" ? -1 : speed === "careful" ? 1 : 0;
+  return ladder[Math.min(Math.max(baseIndex + offset, 0), ladder.length - 1)];
+}
+
 function buildCommand(provider, prompt, chatId, task) {
   const cleaned = stripReservedMention(prompt, provider);
   const model = modelFor(provider, chatId, task);
   if (provider === "claude") {
     const mode = claudePermissionMode(task);
-    const args = ["-p", "--output-format", "stream-json", "--permission-mode", mode];
+    const effort = reasoningEffortFor(provider, task);
+    const args = ["-p", "--output-format", "stream-json", "--permission-mode", mode, "--effort", effort];
     const resumeId = resumeIdFor(task);
     if (resumeId) args.push("--resume", resumeId);
     args.push("--verbose");
@@ -590,6 +802,7 @@ function buildCommand(provider, prompt, chatId, task) {
     args.push("--json", "--sandbox", sandbox, "--skip-git-repo-check");
     if (!resumeId) args.push("--ephemeral");
     if (model) args.push("--model", model);
+    args.push("-c", `model_reasoning_effort="${reasoningEffortFor(provider, task)}"`);
     args.push(cleaned);
     return { cmd: process.env.VIBE_CODEX_COMMAND || "codex", args };
   }
@@ -1358,6 +1571,9 @@ function runningTaskSummaries() {
     cwd: entry.cwd,
     workMode: entry.workMode,
     model: entry.model || null,
+    intelligence: entry.intelligence || null,
+    speed: entry.speed || null,
+    reasoningEffort: entry.reasoningEffort || null,
     startedAt: new Date(entry.startedAt).toISOString(),
     durationMs: Math.max(0, now - (entry.startedAt || now)),
     command: entry.command,
@@ -1499,6 +1715,7 @@ async function resolveRepositories(config, persist) {
   if (explicit && ADVERTISED_REPOSITORIES.length === 0) {
     throw new Error("No valid repositories matched --repo/--cwd/--repo-root. Refusing to fall back to the current folder.");
   }
+  ensureBridgeInstructionsForRepositories(ADVERTISED_REPOSITORIES);
   DEFAULT_CWD =
     (ADVERTISED_REPOSITORIES[0] && ADVERTISED_REPOSITORIES[0].cwd) ||
     realDir(ARGS.cwd || process.cwd()) ||
@@ -1661,11 +1878,6 @@ function runTask(channel, task) {
       `repoId=${task.repoId || task.agentBridgeRepoId || "-"} ` +
       `workMode=${task.workMode || task.agentBridgeWorkMode || "-"} promptLen=${(prompt || "").length}`
   );
-  const built = buildCommand(provider, prompt, chatId, task);
-  if (!built) {
-    channel.push("error", { provider, chatId, message: `Unknown provider: ${provider}` });
-    return;
-  }
 
   const repoResult = resolveTaskRepository(task || {});
   if (!repoResult.ok) {
@@ -1686,6 +1898,12 @@ function runTask(channel, task) {
   const beforeGit = gitSnapshot(cwd);
   const bridgeCommand = parseBridgeCommand(prompt);
   if (bridgeCommand && runBridgeCommand(channel, task, repo, beforeGit, bridgeCommand)) {
+    return;
+  }
+  const promptForCli = taskPromptWithBridgeInstructions(provider, prompt, repo);
+  const built = buildCommand(provider, promptForCli, chatId, task);
+  if (!built) {
+    channel.push("error", { provider, chatId, message: `Unknown provider: ${provider}` });
     return;
   }
 
@@ -1709,6 +1927,9 @@ function runTask(channel, task) {
     cwd,
     workMode: workModeFor(task),
     model: modelFor(provider, chatId, task),
+    intelligence: intelligenceFor(task),
+    speed: speedFor(task),
+    reasoningEffort: reasoningEffortFor(provider, task),
     command: compactCommand(built.cmd, built.args),
     teamMode: task.teamMode || task.team_mode || null,
     teamRunId: task.teamRunId || task.team_run_id || null,
@@ -1731,6 +1952,9 @@ function runTask(channel, task) {
     cwd,
     workMode: workModeFor(task),
     model: modelFor(provider, chatId, task) || "provider default",
+    intelligence: intelligenceFor(task),
+    speed: speedFor(task),
+    reasoningEffort: reasoningEffortFor(provider, task),
     teamMode: task.teamMode || task.team_mode || null,
     teamRunId: task.teamRunId || task.team_run_id || null,
     teamWorker: task.teamWorker || task.team_worker || null,
@@ -1749,6 +1973,9 @@ function runTask(channel, task) {
       repoName: repo.name,
       cwd,
       workMode: workModeFor(task),
+      intelligence: intelligenceFor(task),
+      speed: speedFor(task),
+      reasoningEffort: reasoningEffortFor(provider, task),
       command: compactCommand(built.cmd, built.args),
     }),
   });
@@ -2134,13 +2361,26 @@ function parseApplyPatchEnvelope(input) {
   });
 }
 
-function buildHistoryRuntime(provider, acc) {
+// Elapsed time of a turn from its first (user prompt) to last (assistant) event
+// timestamp. Returns undefined when either timestamp is missing/unparseable.
+function turnDurationMs(startTs, endTs) {
+  if (!startTs || !endTs) return undefined;
+  const a = Date.parse(startTs);
+  const b = Date.parse(endTs);
+  if (Number.isNaN(a) || Number.isNaN(b) || b < a) return undefined;
+  return b - a;
+}
+
+function buildHistoryRuntime(provider, acc, durationMs) {
   if (!acc.order.length) return null;
   const files = acc.order.map((p) => acc.byPath.get(p));
   return {
     provider,
     status: "done",
     workMode: "history",
+    // Per-turn elapsed time reconstructed from the transcript timestamps so the
+    // phone's "Worked for Xs · N steps" line reads the same on history as live.
+    ...(typeof durationMs === "number" && durationMs > 0 ? { durationMs } : {}),
     diff: {
       git: false,
       filesChanged: files.length,
@@ -2157,8 +2397,8 @@ function buildHistoryRuntime(provider, acc) {
 // Seal ONE turn's reconstructed runtime onto a specific message, so each turn
 // shows the patch IT applied — inline, where it happened (matching the Codex
 // app) — instead of one consolidated card dumped at the end of the session.
-function sealHistoryRuntime(provider, message, acc) {
-  const runtime = buildHistoryRuntime(provider, acc);
+function sealHistoryRuntime(provider, message, acc, durationMs) {
+  const runtime = buildHistoryRuntime(provider, acc, durationMs);
   if (!runtime) return false;
   const field = runtimeResultField(runtime);
   if (!field || !field.agentRuntimeEnc) return false; // no key → never send plaintext
@@ -2195,6 +2435,241 @@ async function listClaude(limit) {
   return results;
 }
 
+// Human-readable one-liners for tool actions, so a session watched live shows
+// what the agent is DOING (running a command, editing a file) in-line — not
+// just its text and a summary card. Applied to the trailing in-progress turn.
+function safeBase(x) {
+  try { return path.basename(String(x || "")); } catch (_) { return String(x || ""); }
+}
+function claudeActionLine(b) {
+  const inp = b.input || {};
+  switch (b.name) {
+    case "Bash": {
+      const cmd = String(inp.command || "").replace(/\s+/g, " ").trim();
+      return cmd ? "⚡ $ " + clip(cmd, 160) : "⚡ Bash";
+    }
+    case "Edit":
+    case "MultiEdit": return "✏️ Edit " + safeBase(inp.file_path);
+    case "Write": return "📝 Write " + safeBase(inp.file_path);
+    case "NotebookEdit": return "✏️ Edit " + safeBase(inp.notebook_path || inp.file_path);
+    case "Read": return "📖 Read " + safeBase(inp.file_path);
+    case "Grep": return "🔎 Grep " + clip(String(inp.pattern || ""), 80);
+    case "Glob": return "🔎 Glob " + clip(String(inp.pattern || ""), 80);
+    case "TodoWrite": return "✅ Updated todos";
+    case "Task": return "🤖 " + clip(String(inp.description || "subagent"), 80);
+    case "WebFetch": return "🌐 " + clip(String(inp.url || ""), 80);
+    case "WebSearch": return "🌐 Search " + clip(String(inp.query || ""), 80);
+    default: return "🔧 " + (b.name || "tool");
+  }
+}
+function codexActionLine(p) {
+  const name = String(p.name || "");
+  if (/apply_patch/i.test(name)) {
+    const input = typeof p.input === "string" ? p.input : typeof p.arguments === "string" ? p.arguments : "";
+    const files = parseApplyPatchEnvelope(input).map((f) => safeBase(f.path));
+    return "✏️ Edit " + (files.length ? clip(files.join(", "), 120) : "files");
+  }
+  if (name === "shell" || name === "local_shell" || name === "container.exec") {
+    let args = {};
+    try { args = JSON.parse(typeof p.arguments === "string" ? p.arguments : typeof p.input === "string" ? p.input : "{}") || {}; } catch (_) {}
+    let cmd = args.command;
+    if (Array.isArray(cmd)) cmd = cmd.join(" ");
+    cmd = String(cmd || "").replace(/\s+/g, " ").trim();
+    return cmd ? "⚡ $ " + clip(cmd, 160) : "⚡ shell";
+  }
+  return "🔧 " + (name || "tool");
+}
+
+// ── Structured tool detail (E2E-encrypted) ──────────────────────────
+// The one-line action label above stays plaintext (it is already in the known
+// Tier-2 gap: command strings + prose reach the server). The SENSITIVE detail —
+// command OUTPUT, todo contents, diff counts, search hits — rides a per-message
+// `agentActionEnc` blob encrypted with the SAME arte1 key as the diff card, so
+// the server stays zero-knowledge. The phone joins detail→entry by `uid` and
+// renders a rich inline card (collapsible command+output, todo list, …).
+const OUTPUT_KINDS = new Set(["bash", "search", "task", "web", "tool"]);
+const MAX_ACTION_OUTPUT = 4000;
+
+function toolResultText(content) {
+  if (content == null) return "";
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((b) => (typeof b === "string" ? b : b && typeof b.text === "string" ? b.text : ""))
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (typeof content === "object" && typeof content.text === "string") return content.text;
+  return "";
+}
+
+function claudeActionDetail(b) {
+  const inp = b.input || {};
+  switch (b.name) {
+    case "Bash":
+      return { kind: "bash", command: String(inp.command || ""), description: inp.description ? String(inp.description) : "" };
+    case "Edit":
+      return { kind: "edit", path: diffFilePath(inp.file_path), name: safeBase(inp.file_path), additions: countTextLines(inp.new_string), deletions: countTextLines(inp.old_string) };
+    case "MultiEdit": {
+      let add = 0, del = 0;
+      if (Array.isArray(inp.edits)) for (const e of inp.edits) { add += countTextLines(e && e.new_string); del += countTextLines(e && e.old_string); }
+      return { kind: "edit", path: diffFilePath(inp.file_path), name: safeBase(inp.file_path), additions: add, deletions: del };
+    }
+    case "Write":
+      return { kind: "write", path: diffFilePath(inp.file_path), name: safeBase(inp.file_path), additions: countTextLines(inp.content) };
+    case "NotebookEdit":
+      return { kind: "edit", path: diffFilePath(inp.notebook_path || inp.file_path), name: safeBase(inp.notebook_path || inp.file_path), additions: countTextLines(inp.new_source), deletions: countTextLines(inp.old_source) };
+    case "Read":
+      return { kind: "read", path: diffFilePath(inp.file_path), name: safeBase(inp.file_path) };
+    case "Grep":
+      return { kind: "search", tool: "grep", pattern: String(inp.pattern || ""), path: inp.path ? String(inp.path) : "", glob: inp.glob ? String(inp.glob) : "" };
+    case "Glob":
+      return { kind: "search", tool: "glob", pattern: String(inp.pattern || ""), path: inp.path ? String(inp.path) : "" };
+    case "TodoWrite":
+      return { kind: "todo", todos: Array.isArray(inp.todos) ? inp.todos.map((t) => ({ content: String((t && t.content) || ""), status: String((t && t.status) || ""), activeForm: String((t && t.activeForm) || "") })) : [] };
+    case "Task":
+      return { kind: "task", description: String(inp.description || ""), subagent: String(inp.subagent_type || "") };
+    case "WebFetch":
+      return { kind: "web", url: String(inp.url || ""), prompt: clip(String(inp.prompt || ""), 200) };
+    case "WebSearch":
+      return { kind: "web", query: String(inp.query || "") };
+    default:
+      return { kind: "tool", name: String(b.name || "tool") };
+  }
+}
+
+function codexActionDetail(p) {
+  const name = String(p.name || "");
+  if (/apply_patch/i.test(name)) {
+    const input = typeof p.input === "string" ? p.input : typeof p.arguments === "string" ? p.arguments : "";
+    const files = parseApplyPatchEnvelope(input);
+    return {
+      kind: "edit",
+      name: files.map((f) => safeBase(f.path)).join(", "),
+      path: files[0] ? files[0].path : "",
+      additions: files.reduce((s, f) => s + (f.additions || 0), 0),
+      deletions: files.reduce((s, f) => s + (f.deletions || 0), 0),
+      files: files.length,
+    };
+  }
+  if (name === "shell" || name === "local_shell" || name === "container.exec") {
+    let args = {};
+    try { args = JSON.parse(typeof p.arguments === "string" ? p.arguments : typeof p.input === "string" ? p.input : "{}") || {}; } catch (_) {}
+    let cmd = args.command;
+    if (Array.isArray(cmd)) cmd = cmd.join(" ");
+    return { kind: "bash", command: String(cmd || ""), description: "" };
+  }
+  return { kind: "tool", name: name || "tool" };
+}
+
+// Codex emits the command result as a separate `function_call_output` whose
+// `output` is sometimes a JSON-wrapped string. Pull out the readable text.
+function codexOutputText(output) {
+  if (output == null) return "";
+  if (typeof output === "string") {
+    try {
+      const o = JSON.parse(output);
+      if (o && typeof o.output === "string") return o.output;
+      if (o && typeof o.content === "string") return o.content;
+    } catch (_) {}
+    return output;
+  }
+  if (typeof output === "object") {
+    if (typeof output.output === "string") return output.output;
+    return toolResultText(output.content);
+  }
+  return "";
+}
+
+// Seal a structured tool detail onto its action message. Never sends plaintext:
+// with no runtime key the rich card simply stays hidden (the label still shows).
+function sealActionDetail(message, detail) {
+  if (!detail) return false;
+  const enc = encryptRuntimeBlob(detail);
+  if (!enc) return false;
+  message.agentActionEnc = enc;
+  return true;
+}
+
+// ── Tool actions → native progress nodes (no emoji) ─────────────────
+// The phone renders an assistant turn natively: a compact shimmer line that
+// expands to a tool sheet (Read/Edit/Run …), then the prose, then the diff card.
+// To feed that path we attach each turn's tool actions to its assistant message
+// as `progressNodes` (plaintext labels — already in the Tier-2 gap) plus an
+// E2E-encrypted `agentActionsEnc` carrying the SENSITIVE detail (command OUTPUT,
+// todo contents, search hits). The node label is recomputed app-side from
+// kind/target/added/removed; we still ship a clean (emoji-free) fallback label.
+function actionNodeTarget(kind, d) {
+  switch (kind) {
+    case "bash": return clip(String(d.command || "").replace(/\s+/g, " ").trim(), 72);
+    case "edit":
+    case "write":
+    case "read": return d.name || "";
+    case "search": return clip(String(d.pattern || ""), 72);
+    case "web": return d.url || d.query || "";
+    case "task": return clip(String(d.description || ""), 72);
+    default: return "";
+  }
+}
+function cleanNodeLabel(kind, target, d) {
+  switch (kind) {
+    case "bash": return target ? "Run " + target : "Run command";
+    case "edit": return "Edit " + (target || "file");
+    case "write": return "Create " + (target || "file");
+    case "read": return "Read " + (target || "file");
+    case "search": return (d.tool ? d.tool : "Search") + (target ? " " + target : "");
+    case "web": return "Fetch" + (target ? " " + target : "");
+    case "task": return "Task" + (target ? " " + target : "");
+    case "todo": return "Planning";
+    case "thinking": return "Thinking";
+    default: return d.name || "Tool";
+  }
+}
+function actionNode(detail, uid, status) {
+  const d = detail || {};
+  const kind = d.kind || "tool";
+  const target = actionNodeTarget(kind, d);
+  const node = {
+    id: String(uid || ""),
+    label: cleanNodeLabel(kind, target, d),
+    kind,
+    status: status || "done",
+    depth: 0,
+  };
+  if (target) node.target = target;
+  if (typeof d.additions === "number" && d.additions > 0) node.added = d.additions;
+  if (typeof d.deletions === "number" && d.deletions > 0) node.removed = d.deletions;
+  return node;
+}
+// Build a turn's progress nodes + sealed detail array and attach them to the
+// turn's host message (its final assistant text, or a synthetic empty assistant
+// message when the turn produced only tool calls). Output/contents are joined
+// from `resultByUid` and ride ONLY the encrypted blob.
+function attachTurnActions(messages, host, uids, detailByUid, resultByUid) {
+  const nodes = [];
+  const actions = [];
+  for (const uid of uids) {
+    const det = detailByUid.get(uid);
+    if (!det) continue;
+    if (OUTPUT_KINDS.has(det.kind)) {
+      const r = resultByUid.get(uid);
+      if (r) { det.output = r.output; det.isError = r.isError; }
+    }
+    nodes.push(actionNode(det, uid, det.isError ? "error" : "done"));
+    actions.push(Object.assign({ id: String(uid) }, det));
+  }
+  if (!nodes.length) return;
+  let target = host;
+  if (!target) {
+    target = { role: "assistant", text: "", uid: "actions-" + String(uids[0] || nodes.length) };
+    messages.push(target);
+  }
+  // Cap to keep a single turn's feed bounded on pathological sessions.
+  target.progressNodes = nodes.slice(-60);
+  const enc = encryptRuntimeBlob({ actions: actions.slice(-60) });
+  if (enc) target.agentActionsEnc = enc;
+}
+
 async function claudeDetail(id, limit) {
   const match = claudeSessionFiles().find((s) => s.id === id);
   if (!match) return null;
@@ -2202,39 +2677,126 @@ async function claudeDetail(id, limit) {
   let pending = newRuntimeAccumulator();
   let lastAssistantInTurn = null;
   let topic = null;
-  // One card per user-turn: seal the edits made since the last user prompt onto
-  // that turn's final assistant message.
+  // Claude Code re-appends prior messages (same `uuid`) into the JSONL every time a
+  // session is resumed/compacted, so a long session contains the SAME message many
+  // times over. Replaying those duplicates produced garbled "corpse" history and
+  // repeated diff cards — dedupe by uuid so each message (and its edits) counts once.
+  const seen = new Set();
+  // Turn tracking: each user-text message starts a new turn. A turn's tool
+  // actions are folded into that turn's assistant message as native progress
+  // nodes (+ encrypted detail), so the phone renders one compact, expandable
+  // turn instead of a pile of per-action bubbles.
+  let turnActionUids = [];
+  let turnReasoning = "";  // accumulated thinking for the current turn → ONE node
+  let thinkSeq = 0;
+  // Turn timespan (user prompt → last assistant event) → "Worked for Xs".
+  let turnStartTs = null;
+  let turnEndTs = null;
+  // Structured tool detail join: uid → {kind, command, …} and
+  // tool_use_id → {output, isError}.
+  const actionDetailByUid = new Map();
+  const resultByUid = new Map();
+  // One card per user-turn: seal the edits + the action feed made since the last
+  // user prompt onto that turn's final assistant message.
   const flushTurn = () => {
     if (lastAssistantInTurn && pending.order.length) {
-      sealHistoryRuntime("claude", lastAssistantInTurn, pending);
+      sealHistoryRuntime("claude", lastAssistantInTurn, pending, turnDurationMs(turnStartTs, turnEndTs));
+    }
+    if (turnReasoning.trim()) {
+      // ONE "Thinking" node per turn (reasoning rides the encrypted blob; the
+      // label is the generic, leak-free "Thinking"). Lead the turn's feed.
+      const tid = "think-" + thinkSeq++;
+      actionDetailByUid.set(tid, { kind: "thinking", output: clip(turnReasoning.trim(), MAX_ACTION_OUTPUT) });
+      turnActionUids.unshift(tid);
+    }
+    if (turnActionUids.length) {
+      attachTurnActions(messages, lastAssistantInTurn, turnActionUids, actionDetailByUid, resultByUid);
     }
     pending = newRuntimeAccumulator();
     lastAssistantInTurn = null;
+    turnActionUids = [];
+    turnReasoning = "";
+    turnStartTs = null;
+    turnEndTs = null;
   };
   await readJsonl(match.file, (ev) => {
     if (ev.type === "ai-title" && ev.aiTitle) topic = ev.aiTitle;
     if (ev.type !== "user" && ev.type !== "assistant") return;
+    if (ev.uuid) { if (seen.has(ev.uuid)) return; seen.add(ev.uuid); }
     const m = ev.message || {};
-    if (ev.type === "user" && messageHasUserText(m)) flushTurn(); // new turn
-    if (ev.type === "assistant") collectClaudeEdits(pending, m.content);
+    // /compact summaries are injected as user messages — render them as a
+    // mid-chat divider (kind:"summary"), never a user bubble or a turn boundary.
+    if (ev.type === "user" && ev.isCompactSummary) {
+      let st = "";
+      if (typeof m.content === "string") st = m.content;
+      else if (Array.isArray(m.content)) st = m.content.filter((b) => b && b.type === "text").map((b) => b.text).join("\n").trim();
+      st = cleanMessageText(st);
+      if (st) messages.push({ role: "system", kind: "summary", text: clip(st, 4000), ts: ev.timestamp, uid: ev.uuid });
+      return;
+    }
+    // Capture tool results (bash stdout, …) to join onto their action entry.
+    // These are user-type events carrying a tool_result block and no user text.
+    if (ev.type === "user" && Array.isArray(m.content)) {
+      for (const b of m.content) {
+        if (b && b.type === "tool_result" && b.tool_use_id) {
+          resultByUid.set(b.tool_use_id, { output: clip(toolResultText(b.content), MAX_ACTION_OUTPUT), isError: !!b.is_error });
+        }
+      }
+    }
+    // Skip Claude Code's own meta annotations (local-command output, IDE
+    // open/selection, caveats) — not conversation; they render as junk bubbles.
+    if (ev.type === "user" && ev.isMeta) return;
+    if (ev.type === "user" && messageHasUserText(m)) {
+      flushTurn();                  // seal prior turn's card + action feed
+      turnStartTs = ev.timestamp || null;   // new turn opens at this prompt
+    }
+    if (ev.type === "assistant") {
+      collectClaudeEdits(pending, m.content);
+      if (ev.timestamp) turnEndTs = ev.timestamp;   // extend turn end to last assistant event
+    }
     let text = "";
     if (typeof m.content === "string") text = m.content;
     else if (Array.isArray(m.content)) {
       text = m.content.filter((b) => b && b.type === "text").map((b) => b.text).join("\n").trim();
     }
     text = cleanMessageText(text);
-    if (text && messages.length < limit) {
-      const msg = { role: ev.type, text: clip(text, 4000), ts: ev.timestamp };
+    if (text) {
+      const msg = { role: ev.type, text: clip(text, 4000), ts: ev.timestamp, uid: ev.uuid };
       if (ev.type === "assistant") lastAssistantInTurn = msg;
       messages.push(msg);
     }
-    if (messages.length >= limit) {
-      flushTurn();
-      return false;
+    // Collect this assistant message's reasoning (one coalesced "Thinking" node,
+    // placed before its tools) + each tool action for the current turn. The
+    // reasoning text + tool output ride ONLY the turn's encrypted blob; the node
+    // label stays the generic, leak-free "Thinking".
+    if (ev.type === "assistant" && Array.isArray(m.content)) {
+      const think = m.content
+        .filter((b) => b && b.type === "thinking" && b.thinking)
+        .map((b) => String(b.thinking))
+        .join("\n\n")
+        .trim();
+      // (Claude Code usually persists thinking with EMPTY text — only the
+      // signature — so this is typically a no-op; it lights up if a session ever
+      // stores summarized reasoning. Aggregated per-turn into one node.)
+      if (think) turnReasoning += (turnReasoning ? "\n\n" : "") + think;
+      for (const b of m.content) {
+        if (b && b.type === "tool_use") {
+          turnActionUids.push(b.id);
+          actionDetailByUid.set(b.id, claudeActionDetail(b));
+        }
+      }
     }
   });
   flushTurn();
-  return { provider: "claude", id, topic: topic || (messages[0] && clip(messages[0].text, 80)) || "Untitled", project: match.project, projectName: path.basename(match.project), messages };
+  // Keep the most RECENT `limit` messages (the tail), not the oldest — a long
+  // session must show what's happening NOW, not its opening turns (this was the
+  // "messages are too old" bug: reading stopped at `limit` from the top). The
+  // per-turn cards + action feeds were sealed onto the message objects above, so
+  // they ride along with whatever survives the trim. Stable `uid`s (not array
+  // position) key the app-side upsert, so a sliding window re-pushes cleanly.
+  const topicText = topic || (messages[0] && clip(messages[0].text, 80)) || "Untitled";
+  if (messages.length > limit) messages.splice(0, messages.length - limit);
+  return { provider: "claude", id, topic: topicText, project: match.project, projectName: path.basename(match.project), messages };
 }
 
 // — Codex —
@@ -2326,37 +2888,88 @@ async function codexDetail(id, limit) {
   let pending = newRuntimeAccumulator();
   let lastAssistantInTurn = null;
   let project = "";
+  // Same guard as Claude: skip any response_item we've already processed (by id) so a
+  // resumed/re-emitted rollout never replays a message or its apply_patch twice.
+  const seen = new Set();
+  // Per-turn action collection folded into the turn's assistant message (see claudeDetail).
+  let turnActionUids = [];
+  let turnReasoning = "";  // accumulated reasoning for the current turn → ONE node
+  let thinkSeq = 0;
+  // Turn timespan (user prompt → last assistant message) → "Worked for Xs".
+  let turnStartTs = null;
+  let turnEndTs = null;
+  // Structured tool detail join. Codex references a call by `call_id` in the
+  // separate output item, while the action entry is keyed by the message uid —
+  // so callIdToUid bridges output → entry.
+  const actionDetailByUid = new Map();
+  const resultByUid = new Map();
+  const callIdToUid = new Map();
   const flushTurn = () => {
     if (lastAssistantInTurn && pending.order.length) {
-      sealHistoryRuntime("codex", lastAssistantInTurn, pending);
+      sealHistoryRuntime("codex", lastAssistantInTurn, pending, turnDurationMs(turnStartTs, turnEndTs));
+    }
+    if (turnReasoning.trim()) {
+      const tid = "think-" + thinkSeq++;
+      actionDetailByUid.set(tid, { kind: "thinking", output: clip(turnReasoning.trim(), MAX_ACTION_OUTPUT) });
+      turnActionUids.unshift(tid);
+    }
+    if (turnActionUids.length) {
+      attachTurnActions(messages, lastAssistantInTurn, turnActionUids, actionDetailByUid, resultByUid);
     }
     pending = newRuntimeAccumulator();
     lastAssistantInTurn = null;
+    turnActionUids = [];
+    turnReasoning = "";
+    turnStartTs = null;
+    turnEndTs = null;
   };
   await readJsonl(match.file, (ev) => {
     if (ev.type === "session_meta" && ev.payload) project = ev.payload.cwd || "";
     if (ev.type !== "response_item" || !ev.payload) return;
     const p = ev.payload;
+    const dkey = p.id || ev.id;
+    if (dkey) { if (seen.has(dkey)) return; seen.add(dkey); }
     collectCodexEdits(pending, p); // apply_patch items accumulate into the turn
     if (p.type === "message" && (p.role === "user" || p.role === "assistant")) {
       const raw = codexText(p.content);
-      if (p.role === "user" && raw.trim()) flushTurn(); // new turn
+      if (p.role === "user" && raw.trim()) {
+        flushTurn();                // seal prior turn's card + action feed
+        turnStartTs = ev.timestamp || null;   // new turn opens at this prompt
+      } else if (p.role === "assistant" && ev.timestamp) {
+        turnEndTs = ev.timestamp;             // extend turn end to last assistant message
+      }
       const text = cleanMessageText(raw);
-      if (text && !isContextMessage(raw) && messages.length < limit) {
-        const msg = { role: p.role, text: clip(text, 4000), ts: ev.timestamp };
+      if (text && !isContextMessage(raw)) {
+        const msg = { role: p.role, text: clip(text, 4000), ts: ev.timestamp, uid: dkey };
         if (p.role === "assistant") lastAssistantInTurn = msg;
         messages.push(msg);
       }
-    }
-    if (messages.length >= limit) {
-      flushTurn();
-      return false;
+    } else if (p.type === "reasoning") {
+      // Codex emits a reasoning item before nearly every tool call; aggregate the
+      // whole turn's reasoning into ONE "Thinking" node (at flushTurn) so the feed
+      // isn't flooded. Reasoning rides the encrypted blob (codex's own
+      // `encrypted_content` is opaque to us; `summary` text is the readable gist).
+      const think = (Array.isArray(p.summary)
+        ? p.summary.map((s) => (s && s.text ? String(s.text) : "")).filter(Boolean).join("\n")
+        : "").trim();
+      if (think) turnReasoning += (turnReasoning ? "\n\n" : "") + think;
+    } else if (p.type === "function_call" || p.type === "custom_tool_call") {
+      // Collect the tool call for the current turn (output joins via call_id).
+      turnActionUids.push(dkey);
+      actionDetailByUid.set(dkey, codexActionDetail(p));
+      if (p.call_id) callIdToUid.set(p.call_id, dkey);
+    } else if (p.type === "function_call_output" || p.type === "custom_tool_call_output") {
+      const uid = p.call_id ? callIdToUid.get(p.call_id) : null;
+      if (uid) resultByUid.set(uid, { output: clip(codexOutputText(p.output), MAX_ACTION_OUTPUT), isError: false });
     }
   });
   flushTurn();
+  // Topic from the FULL set (the opening message), then keep the most recent
+  // `limit` messages — see claudeDetail for rationale (tail, not head; stable uid).
   const topic =
     messages.map((m) => cleanTopicCandidate(m.text)).find(Boolean) ||
     "Untitled";
+  if (messages.length > limit) messages.splice(0, messages.length - limit);
   return { provider: "codex", id, topic, project, projectName: project ? path.basename(project) : "", messages };
 }
 
@@ -2373,20 +2986,99 @@ async function readHistory({ provider, mode, sessionId, limit }) {
   return { mode: "list", sessions: await listClaude(cap) };
 }
 
+// ── Live transcript tail (directly-run sessions) ─────────────────────
+// A `claude`/`codex` session the user started in their OWN terminal is never
+// spawned by us via run_task, so it has no live stream — we only read it on
+// demand. While the phone is viewing such a session we WATCH its JSONL and
+// re-push the transcript as it grows, so the app upserts new turns live.
+// Keyed by chatId, capped, polled via watchFile (robust to appends), and torn
+// down on disconnect. Re-pushes reuse the ORIGINAL requestId so the app's
+// existing ingest upserts in place — no server change needed.
+const MAX_HISTORY_WATCHERS = 8;
+const HISTORY_WATCH_DEBOUNCE_MS = 200; // coalesce rapid appends, then re-read
+const historyWatchers = new Map(); // chatId -> watcher record
+
+function sessionFilePath(provider, sessionId) {
+  if (!sessionId) return null;
+  const p = String(provider || "").trim().toLowerCase();
+  const files = p === "codex" ? codexSessionFiles() : claudeSessionFiles();
+  const match = files.find((s) => s.id === sessionId);
+  return match ? match.file : null;
+}
+
+function stopHistoryWatch(chatId) {
+  const rec = historyWatchers.get(chatId);
+  if (!rec) return;
+  try { if (rec.watcher) rec.watcher.close(); } catch (_) {}
+  try { if (rec.listener) fs.unwatchFile(rec.file, rec.listener); } catch (_) {}
+  try { if (rec.debounce) clearTimeout(rec.debounce); } catch (_) {}
+  historyWatchers.delete(chatId);
+}
+
+function stopAllHistoryWatches() {
+  for (const chatId of Array.from(historyWatchers.keys())) stopHistoryWatch(chatId);
+}
+
+function startHistoryWatch(channel, { chatId, provider, sessionId, echo }) {
+  const file = sessionFilePath(provider, sessionId);
+  if (!chatId || !sessionId || !file) return;
+  stopHistoryWatch(chatId); // replace any prior watch for this chat
+  if (historyWatchers.size >= MAX_HISTORY_WATCHERS) {
+    const oldest = historyWatchers.keys().next().value;
+    if (oldest) stopHistoryWatch(oldest);
+  }
+  const rec = { file, watcher: null, listener: null, debounce: null, lastSig: "", busy: false, again: false };
+  const fire = () => {
+    if (channel.state !== "joined") return;
+    if (rec.busy) { rec.again = true; return; } // re-read once the in-flight read finishes
+    rec.busy = true;
+    readHistory({ provider, mode: "detail", sessionId })
+      .then((result) => {
+        const msgs = (result && result.session && result.session.messages) || [];
+        const last = msgs.length ? msgs[msgs.length - 1] : null;
+        const sig = msgs.length + ":" + (last ? (last.uid || "") + ":" + String(last.text || "").length : 0);
+        if (sig !== rec.lastSig) {
+          rec.lastSig = sig;
+          channel.push("history_result", { ok: true, ...echo, ...result });
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        rec.busy = false;
+        if (rec.again) { rec.again = false; schedule(); }
+      });
+  };
+  const schedule = () => {
+    if (rec.debounce) return;
+    rec.debounce = setTimeout(() => { rec.debounce = null; fire(); }, HISTORY_WATCH_DEBOUNCE_MS);
+  };
+  try {
+    // Event-based: fires within ms of claude/codex appending to the transcript.
+    rec.watcher = fs.watch(file, { persistent: true }, () => schedule());
+  } catch (_) {
+    // Fallback to polling if fs.watch is unavailable on this filesystem.
+    rec.listener = () => schedule();
+    fs.watchFile(file, { interval: 1000 }, rec.listener);
+  }
+  historyWatchers.set(chatId, rec);
+  schedule(); // catch anything appended between the initial read and now
+}
+
 function handleHistoryRequest(channel, payload) {
   const provider = payload.provider || payload.agentBridgeProvider || "claude";
   const requestId = payload.requestId || payload.request_id || crypto.randomUUID();
   const chatId = payload.chatId || payload.chat_id || null;
+  const sessionId = payload.sessionId || payload.session_id || null;
   const echo = { requestId, provider, chatId, requesterUserId: payload.requesterUserId || payload.requester_user_id || null };
 
-  readHistory({
-    provider,
-    mode: payload.mode,
-    sessionId: payload.sessionId || payload.session_id,
-    limit: payload.limit,
-  })
+  readHistory({ provider, mode: payload.mode, sessionId, limit: payload.limit })
     .then((result) => {
       channel.push("history_result", { ok: true, ...echo, ...result });
+      // The phone opened a specific session → keep it live by tailing the
+      // transcript and re-pushing as it grows.
+      if (chatId && sessionId && result.mode === "detail") {
+        startHistoryWatch(channel, { chatId, provider, sessionId, echo });
+      }
     })
     .catch((err) => {
       channel.push("history_result", { ok: false, ...echo, message: err && err.message ? err.message : "history_failed" });
@@ -2556,6 +3248,7 @@ function connect(server, token, userId) {
         ? ` code=${event.code || "-"} reason=${event.reason || "-"}`
         : "";
     console.log(`[vibe-bridge] socket closed${detail} (will retry)`);
+    stopAllHistoryWatches(); // watchers hold a now-stale channel
   });
   socket.connect();
 

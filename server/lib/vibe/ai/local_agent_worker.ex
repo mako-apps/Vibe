@@ -3,6 +3,7 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   require Logger
 
+  alias Vibe.AgentBridge
   alias Vibe.Chat
   alias Vibe.Chat.AgentMessageCrypto
   alias Vibe.Chat.GroupAgentMemory
@@ -27,6 +28,7 @@ defmodule Vibe.AI.LocalAgentWorker do
   @max_runtime_patch_bytes 90_000
   @rate_limit_table :local_agent_worker_ratelimit
   @session_table :local_agent_worker_sessions
+  @team_run_table :local_agent_worker_team_runs
   @default_cooldown_ms 8_000
   @worker_order ["claude", "codex"]
 
@@ -472,6 +474,8 @@ defmodule Vibe.AI.LocalAgentWorker do
             )
         end
 
+        maybe_dispatch_next_team_worker(chat_id, worker, requester_user_id, opts)
+
         result
     end
   end
@@ -504,20 +508,18 @@ defmodule Vibe.AI.LocalAgentWorker do
     if group_chat?(chat_id) do
       context = group_collaboration_context(chat_id, requester_user_id)
 
-      if context == "" do
-        dispatch_text
-      else
-        """
-        #{group_framing(worker)}
+      """
+      #{group_framing(worker)}
 
-        Shared conversation so far (you can see everyone's recent messages and the other agents' work — build on it, don't repeat what's already done):
-        #{context}
+      #{agent_operating_rules(worker)}
 
-        Latest request for you (#{worker.label}):
-        #{dispatch_text}
-        """
-        |> String.trim()
-      end
+      Shared conversation so far (you can see everyone's recent messages and the other agents' work; build on it and do not repeat completed work):
+      #{context_or_empty(context)}
+
+      Latest request for you (#{worker.label}):
+      #{dispatch_text}
+      """
+      |> String.trim()
     else
       dispatch_text
     end
@@ -553,13 +555,7 @@ defmodule Vibe.AI.LocalAgentWorker do
       Team handles: #{teammate_handles}
 
       Collaboration rules:
-      - Work as part of one team. Do not duplicate another teammate's likely work.
-      - If the user assigns work by name, follow that assignment exactly.
-      - If the user does not assign work, choose a non-overlapping slice that fits #{worker.label}'s strengths and say what you took.
-      - If the selected repo has AGENTS.md, CLAUDE.md, CODEX.md, or similar local instructions, read and follow them before editing.
-      - When repo writes are allowed, use #{handoff_path} as the shared handoff file. Keep edits additive under a "#{worker.label}" section: ownership, findings, files changed, blockers, and next steps.
-      - If a teammate is offline, unavailable, or rate-limited, say that clearly and continue with useful work that will not conflict.
-      - Final replies should include what you completed, what remains, and any handoff needed by the other teammate.
+      #{agent_operating_rules(worker, handoff_path)}
 
       Shared Vibe group memory:
       #{context_or_empty(context)}
@@ -575,6 +571,55 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   def build_team_bridge_prompt(_chat_id, _worker, dispatch_text, _requester, _workers, _run_id),
     do: dispatch_text
+
+  @doc "Start an in-memory bridge team run and return the first worker to dispatch."
+  def register_bridge_team_run(
+        chat_id,
+        team_run_id,
+        workers,
+        dispatch_text,
+        requester_user_id,
+        reply_to_id,
+        bridge_metadata
+      )
+      when is_binary(chat_id) and is_binary(team_run_id) and is_list(workers) do
+    handles = Enum.map(workers, & &1.handle)
+
+    case handles do
+      [] ->
+        nil
+
+      [first | remaining] ->
+        ensure_team_run_table()
+
+        :ets.insert(
+          @team_run_table,
+          {{chat_id, team_run_id},
+           %{
+             chat_id: chat_id,
+             team_run_id: team_run_id,
+             workers: handles,
+             remaining: remaining,
+             dispatch_text: dispatch_text,
+             requester_user_id: requester_user_id,
+             reply_to_id: reply_to_id,
+             bridge_metadata: bridge_metadata || %{},
+             started_at: System.system_time(:millisecond)
+           }}
+        )
+
+        resolve_handle(first)
+    end
+  end
+
+  def register_bridge_team_run(_, _, _, _, _, _, _), do: nil
+
+  @doc "Remove stale or completed team sequencing state."
+  def clear_bridge_team_run(chat_id, team_run_id) do
+    ensure_team_run_table()
+    :ets.delete(@team_run_table, {chat_id, team_run_id})
+    :ok
+  end
 
   @doc "Record a human's prompt to a worker into the shared group memory (no-op in DMs)."
   def note_bridge_user_turn(chat_id, worker, text, requester_user_id)
@@ -643,6 +688,113 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   def note_bridge_agent_turn(_chat_id, _worker, _text, _requester), do: :ok
 
+  defp maybe_dispatch_next_team_worker(chat_id, worker, requester_user_id, opts) do
+    team_run_id = normalize_string(Keyword.get(opts, :team_run_id))
+
+    cond do
+      is_nil(team_run_id) ->
+        :ok
+
+      is_nil(requester_user_id) ->
+        clear_bridge_team_run(chat_id, team_run_id)
+
+      true ->
+        dispatch_next_team_worker(chat_id, team_run_id, worker, requester_user_id)
+    end
+  end
+
+  defp dispatch_next_team_worker(chat_id, team_run_id, completed_worker, requester_user_id) do
+    ensure_team_run_table()
+
+    case :ets.lookup(@team_run_table, {chat_id, team_run_id}) do
+      [{{^chat_id, ^team_run_id}, state}] ->
+        remaining = Map.get(state, :remaining, [])
+
+        case remaining do
+          [] ->
+            clear_bridge_team_run(chat_id, team_run_id)
+
+          [next_handle | rest] ->
+            :ets.insert(@team_run_table, {{chat_id, team_run_id}, %{state | remaining: rest}})
+
+            dispatch_team_worker_from_state(
+              state,
+              next_handle,
+              completed_worker,
+              requester_user_id
+            )
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp dispatch_team_worker_from_state(state, next_handle, completed_worker, requester_user_id) do
+    case resolve_handle(next_handle) do
+      nil ->
+        clear_bridge_team_run(state.chat_id, state.team_run_id)
+
+      next_worker ->
+        team_workers =
+          state.workers
+          |> Enum.map(&resolve_handle/1)
+          |> Enum.reject(&is_nil/1)
+
+        bridge_prompt =
+          build_team_bridge_prompt(
+            state.chat_id,
+            next_worker,
+            state.dispatch_text,
+            requester_user_id,
+            team_workers,
+            state.team_run_id
+          )
+
+        broadcast_activity(
+          state.chat_id,
+          next_worker.agent_user_id,
+          "#{next_worker.label} continuing team run after #{completed_worker.label}...",
+          "running"
+        )
+
+        task_payload =
+          %{
+            "provider" => next_worker.handle,
+            "chatId" => state.chat_id,
+            "taskId" => "#{state.team_run_id}-#{next_worker.handle}",
+            "prompt" => bridge_prompt,
+            "replyToId" => state.reply_to_id,
+            "requesterUserId" => requester_user_id,
+            "teamMode" => "group_team",
+            "teamRunId" => state.team_run_id,
+            "teamWorker" => next_worker.handle,
+            "teamWorkers" => Enum.map(team_workers, & &1.handle)
+          }
+          |> Map.merge(state.bridge_metadata || %{})
+
+        case AgentBridge.dispatch_task(requester_user_id, task_payload) do
+          :ok ->
+            Logger.info(
+              "[LocalAgentWorker] chained team dispatch chat=#{state.chat_id} run=#{state.team_run_id} from=#{completed_worker.handle} to=#{next_worker.handle}"
+            )
+
+          {:error, :offline} ->
+            stop_activity(state.chat_id, next_worker.agent_user_id)
+
+            post_notice(
+              next_worker,
+              state.chat_id,
+              "Your computer went offline before @#{next_worker.handle} could continue the team run.",
+              requester_user_id,
+              state.reply_to_id
+            )
+
+            clear_bridge_team_run(state.chat_id, state.team_run_id)
+        end
+    end
+  end
+
   defp group_chat?(chat_id) do
     case Chat.get_room_type(chat_id) do
       "dm" -> false
@@ -655,6 +807,47 @@ defmodule Vibe.AI.LocalAgentWorker do
     "You are #{worker.label}, collaborating with other AI agents (#{other_agents_label(worker)}) " <>
       "and people in a shared Vibe group chat. Everyone shares this conversation. When you finish, " <>
       "your reply is posted back into the group so the others can continue from it."
+  end
+
+  defp agent_operating_rules(worker, handoff_path \\ nil) do
+    provider_file =
+      case worker.handle do
+        "claude" -> "CLAUDE.md"
+        "codex" -> "CODEX.md"
+        _ -> nil
+      end
+
+    provider_line =
+      if provider_file do
+        "- If the selected repo has #{provider_file} or .vibe/instructions/#{provider_file}, read it after AGENTS.md and follow it."
+      end
+
+    handoff_line =
+      if is_binary(handoff_path) and handoff_path != "" do
+        "- When repo writes are allowed, use #{handoff_path} as the shared handoff file. Keep edits additive under a \"#{worker.label}\" section: ownership, findings, files changed, blockers, and next steps."
+      else
+        "- If working with another agent, read teammate notes before continuing and avoid duplicate work."
+      end
+
+    [
+      "Operating rules:",
+      "- Act like a senior engineer in a production codebase.",
+      "- Inspect existing code before editing and follow local patterns.",
+      "- Keep changes scoped to the user's request; do not do unrelated refactors.",
+      "- If the selected repo has AGENTS.md or .vibe/instructions/AGENTS.md, read it before editing and follow it.",
+      provider_line,
+      "- Start with read-only inspection when risk is unclear.",
+      "- Do not delete files, reset git state, force push, rotate secrets, or run destructive commands unless the user explicitly approves.",
+      "- Surface commands, files touched, patches, blockers, verification, and remaining risk clearly for Vibe's mobile UI.",
+      "- If a command needs approval, explain the exact command, why it is needed, and the risk.",
+      "- If the user assigns work by name, follow that assignment exactly.",
+      "- If work is not assigned, choose a non-overlapping slice that fits your strengths and say what you took.",
+      handoff_line,
+      "- If a teammate is offline, unavailable, or rate-limited, say that clearly and continue with useful work that will not conflict.",
+      "- Final replies should include what you completed, what was tested, what remains, and any handoff needed by the other teammate."
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
   end
 
   defp other_agents_label(worker) do
@@ -803,6 +996,19 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   defp sender_display_name(_), do: "A teammate"
 
+  defp ensure_team_run_table do
+    case :ets.whereis(@team_run_table) do
+      :undefined ->
+        :ets.new(@team_run_table, [:set, :public, :named_table, {:read_concurrency, true}])
+        :ok
+
+      _ ->
+        :ok
+    end
+  rescue
+    ArgumentError -> :ok
+  end
+
   # ── Activity broadcast helpers (shared by chat + bridge channels) ────
 
   @doc "Broadcast a typing/agent-progress event into a chat for an agent."
@@ -913,6 +1119,8 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   defp do_run(%{handle: "codex"} = worker, executable, prompt, opts) do
+    bridge_options = Keyword.get(opts, :bridge_metadata) || %{}
+
     sandbox =
       System.get_env("VIBE_CODEX_SANDBOX")
       |> normalize_string()
@@ -931,12 +1139,16 @@ defmodule Vibe.AI.LocalAgentWorker do
         worker_cwd(),
         "--skip-git-repo-check",
         "--ephemeral"
-      ] ++ maybe_model_args("VIBE_CODEX_MODEL", "--model") ++ [prompt]
+      ] ++
+        maybe_model_args(bridge_options, "VIBE_CODEX_MODEL", "--model") ++
+        codex_reasoning_args(bridge_options) ++ [prompt]
 
     run_command(worker, executable, args, opts)
   end
 
   defp do_run(%{handle: "claude"} = worker, executable, prompt, opts) do
+    bridge_options = Keyword.get(opts, :bridge_metadata) || %{}
+
     permission_mode =
       System.get_env("VIBE_CLAUDE_PERMISSION_MODE")
       |> normalize_string()
@@ -964,9 +1176,10 @@ defmodule Vibe.AI.LocalAgentWorker do
         "--permission-mode",
         permission_mode
       ] ++
+        claude_effort_args(bridge_options) ++
         claude_session_args(worker, Keyword.get(opts, :chat_id)) ++
         maybe_claude_verbose_args(output_format) ++
-        maybe_model_args("VIBE_CLAUDE_MODEL", "--model") ++
+        maybe_model_args(bridge_options, "VIBE_CLAUDE_MODEL", "--model") ++
         maybe_single_arg("VIBE_CLAUDE_MCP_CONFIG", "--mcp-config") ++
         maybe_single_arg("VIBE_CLAUDE_ALLOWED_TOOLS", "--allowedTools") ++
         maybe_single_arg("VIBE_CLAUDE_DISALLOWED_TOOLS", "--disallowedTools") ++ ["--", prompt]
@@ -1235,12 +1448,55 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
-  defp maybe_model_args(env_name, flag) do
-    case normalize_string(System.get_env(env_name)) do
+  defp maybe_model_args(options, env_name, flag) do
+    case normalize_string(option_value(options, "model")) || normalize_string(System.get_env(env_name)) do
       nil -> []
       model -> [flag, model]
     end
   end
+
+  defp claude_effort_args(options) do
+    case normalize_reasoning_effort(option_value(options, "reasoningEffort"), :claude) do
+      nil -> []
+      effort -> ["--effort", effort]
+    end
+  end
+
+  defp codex_reasoning_args(options) do
+    case normalize_reasoning_effort(option_value(options, "reasoningEffort"), :codex) do
+      nil -> []
+      effort -> ["-c", "model_reasoning_effort=\"#{effort}\""]
+    end
+  end
+
+  defp normalize_reasoning_effort(value, provider) do
+    value =
+      value
+      |> normalize_string()
+      |> case do
+        nil -> nil
+        raw -> raw |> String.downcase() |> String.replace(["-", " "], "_")
+      end
+
+    case {provider, value} do
+      {_, nil} -> nil
+      {:claude, value} when value in ["low", "medium", "high", "xhigh"] -> value
+      {:claude, value} when value in ["extra_high", "max"] -> "xhigh"
+      {:codex, value} when value in ["low", "medium", "high"] -> value
+      {:codex, value} when value in ["xhigh", "extra_high", "max"] -> "high"
+      _ -> nil
+    end
+  end
+
+  defp option_value(options, key) when is_map(options) do
+    options[key] || options[camelize_key(key)] || options[String.to_atom(key)]
+  end
+
+  defp option_value(_options, _key), do: nil
+
+  defp camelize_key("reasoningEffort"), do: "agentBridgeReasoningEffort"
+  defp camelize_key("model"), do: "agentBridgeModel"
+  defp camelize_key(key), do: key
 
   defp maybe_single_arg(env_name, flag) do
     case normalize_string(System.get_env(env_name)) do

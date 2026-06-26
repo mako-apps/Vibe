@@ -1109,6 +1109,8 @@ private final class ChatsViewModel: ObservableObject {
 
   private var backgroundRefreshTask: Task<Void, Never>?
   private var agentConversationObserver: NSObjectProtocol?
+  private var realtimeMessageObserver: NSObjectProtocol?
+  private var realtimeRefreshTask: Task<Void, Never>?
 
   init() {
     agentConversationObserver = NotificationCenter.default.addObserver(
@@ -1121,12 +1123,42 @@ private final class ChatsViewModel: ObservableObject {
         self.rows = ChatHomeService.rowsIncludingBuiltInAgent(self.rows)
       }
     }
+
+    // A message arrived in one of this user's chats — from a peer OR mirrored from
+    // the user's own other device (server emits `new_message` on the user topic,
+    // ChatEngine turns it into this signal). Refresh the list in near-real-time so a
+    // message sent on the phone shows on the laptop's chat list without a re-open.
+    realtimeMessageObserver = NotificationCenter.default.addObserver(
+      forName: ChatEngine.didChangeNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] note in
+      guard (note.userInfo?["reason"] as? String) == "remoteNewMessage" else { return }
+      self?.scheduleRealtimeRefresh()
+    }
   }
 
   deinit {
     backgroundRefreshTask?.cancel()
+    realtimeRefreshTask?.cancel()
     if let agentConversationObserver {
       NotificationCenter.default.removeObserver(agentConversationObserver)
+    }
+    if let realtimeMessageObserver {
+      NotificationCenter.default.removeObserver(realtimeMessageObserver)
+    }
+  }
+
+  /// Debounce a light, row-preserving refresh so bursts of incoming messages (group
+  /// traffic) coalesce into one fetch instead of a storm. No spinner — the list just
+  /// updates its previews/unread in place.
+  private func scheduleRealtimeRefresh() {
+    guard hasLoaded else { return }
+    realtimeRefreshTask?.cancel()
+    realtimeRefreshTask = Task { @MainActor [weak self] in
+      try? await Task.sleep(nanoseconds: 400_000_000)
+      guard !Task.isCancelled, let self else { return }
+      await self.refresh(preserveRows: true)
     }
   }
 
@@ -1341,6 +1373,8 @@ private struct ChatHomeScreen: View {
   @State private var selectedChatIDs = Set<String>()
   @State private var isStartingChat = false
   @State private var errorMessage: String?
+  @State private var pendingRoomCreationKind: ChatRoomCreationKind?
+  @State private var roomCreationName = ""
   @State private var homeSearchQuery = ""
   @State private var isHomeSearchFocused = false
   /// Global username/phone/ID lookups (incl. Claude/Codex) for the search drawer.
@@ -1530,6 +1564,30 @@ private struct ChatHomeScreen: View {
         }
       }
     }
+    .alert(
+      pendingRoomCreationKind?.title ?? "",
+      isPresented: Binding(
+        get: { pendingRoomCreationKind != nil },
+        set: { if !$0 { pendingRoomCreationKind = nil; roomCreationName = "" } }
+      )
+    ) {
+      TextField(pendingRoomCreationKind?.placeholder ?? "Name", text: $roomCreationName)
+      Button("Cancel", role: .cancel) {
+        pendingRoomCreationKind = nil
+        roomCreationName = ""
+      }
+      Button("Create") {
+        let kind = pendingRoomCreationKind
+        let name = roomCreationName
+        pendingRoomCreationKind = nil
+        roomCreationName = ""
+        if let kind {
+          Task { await createRoom(kind: kind, name: name) }
+        }
+      }
+    } message: {
+      Text(pendingRoomCreationKind?.message ?? "")
+    }
     .fullScreenCover(isPresented: $isShowingStoryCamera) {
       AppNativeStoryCameraPage {
         AppUITrace.notice("ChatHomeScreen story close")
@@ -1716,6 +1774,18 @@ private struct ChatHomeScreen: View {
       return
     }
 
+    if action == "newContact" {
+      isShowingSearch = true
+      return
+    }
+
+    if action == "newGroup" || action == "newChannel" {
+      isShowingSearch = false
+      roomCreationName = ""
+      pendingRoomCreationKind = action == "newGroup" ? .group : .channel
+      return
+    }
+
     guard
       ["select", "chat", "call", "saveContact"].contains(action),
       let rawUser = payload["user"] as? [String: Any],
@@ -1739,6 +1809,40 @@ private struct ChatHomeScreen: View {
       if action == "call", let route {
         NativeCallRouteBridge.startOutgoing(route: route, callType: "voice")
       }
+    }
+  }
+
+  @MainActor
+  private func createRoom(kind: ChatRoomCreationKind, name rawName: String) async {
+    guard let config = AppSessionConfig.current else {
+      errorMessage = "The current session is unavailable."
+      return
+    }
+
+    let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !name.isEmpty else {
+      errorMessage = "\(kind.displayName) name is required."
+      return
+    }
+
+    isStartingChat = true
+    errorMessage = nil
+    defer { isStartingChat = false }
+
+    do {
+      let result = try await ChatRoomCreateService.create(kind: kind, config: config, name: name)
+      let route = ChatRoute(
+        chatId: result.chatID,
+        title: result.name,
+        peerUserId: nil,
+        avatarURI: nil,
+        isGroup: true,
+        initialRows: []
+      )
+      coordinator.openChat(route)
+      await model.refresh()
+    } catch {
+      errorMessage = error.localizedDescription
     }
   }
 
@@ -2502,6 +2606,14 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
   }
 
   private func resolvedAvatarGradientColors(for row: ChatHomeListRow) -> (UIColor, UIColor)? {
+    if !row.isSavedMessages {
+      return ChatProfileAppearanceStore.avatarColors(
+        title: row.title,
+        peerUserId: row.peerUserId,
+        chatId: row.chatId
+      )
+    }
+
     let startRaw = isDark ? row.avatarGradientStartDark : row.avatarGradientStartLight
     let endRaw = isDark ? row.avatarGradientEndDark : row.avatarGradientEndLight
     guard let startRaw, let endRaw else { return nil }
@@ -2543,6 +2655,8 @@ private struct ContactsPageView: View {
   @State private var isEditingContacts = false
   @State private var isStartingChat = false
   @State private var errorMessage: String?
+  @State private var pendingRoomCreationKind: ChatRoomCreationKind?
+  @State private var roomCreationName = ""
 
   private var palette: AppThemePalette {
     AppThemePalette.resolve(for: colorScheme)
@@ -2653,6 +2767,30 @@ private struct ContactsPageView: View {
         }
       }
     }
+    .alert(
+      pendingRoomCreationKind?.title ?? "",
+      isPresented: Binding(
+        get: { pendingRoomCreationKind != nil },
+        set: { if !$0 { pendingRoomCreationKind = nil; roomCreationName = "" } }
+      )
+    ) {
+      TextField(pendingRoomCreationKind?.placeholder ?? "Name", text: $roomCreationName)
+      Button("Cancel", role: .cancel) {
+        pendingRoomCreationKind = nil
+        roomCreationName = ""
+      }
+      Button("Create") {
+        let kind = pendingRoomCreationKind
+        let name = roomCreationName
+        pendingRoomCreationKind = nil
+        roomCreationName = ""
+        if let kind {
+          Task { await createRoom(kind: kind, name: name) }
+        }
+      }
+    } message: {
+      Text(pendingRoomCreationKind?.message ?? "")
+    }
   }
 
   private func handleSearchPayload(_ payload: [String: Any]) {
@@ -2663,6 +2801,18 @@ private struct ContactsPageView: View {
 
     if action == "cancel" {
       isShowingSearch = false
+      return
+    }
+
+    if action == "newContact" {
+      isShowingSearch = true
+      return
+    }
+
+    if action == "newGroup" || action == "newChannel" {
+      isShowingSearch = false
+      roomCreationName = ""
+      pendingRoomCreationKind = action == "newGroup" ? .group : .channel
       return
     }
 
@@ -2689,6 +2839,40 @@ private struct ContactsPageView: View {
       if action == "call", let route {
         NativeCallRouteBridge.startOutgoing(route: route, callType: "voice")
       }
+    }
+  }
+
+  @MainActor
+  private func createRoom(kind: ChatRoomCreationKind, name rawName: String) async {
+    guard let config = AppSessionConfig.current else {
+      errorMessage = "The current session is unavailable."
+      return
+    }
+
+    let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !name.isEmpty else {
+      errorMessage = "\(kind.displayName) name is required."
+      return
+    }
+
+    isStartingChat = true
+    errorMessage = nil
+    defer { isStartingChat = false }
+
+    do {
+      let result = try await ChatRoomCreateService.create(kind: kind, config: config, name: name)
+      let route = ChatRoute(
+        chatId: result.chatID,
+        title: result.name,
+        peerUserId: nil,
+        avatarURI: nil,
+        isGroup: true,
+        initialRows: []
+      )
+      coordinator.openChat(route)
+      await model.refresh()
+    } catch {
+      errorMessage = error.localizedDescription
     }
   }
 
@@ -4013,7 +4197,9 @@ final class ChatConversationController: UIViewController {
       }
       present(nav, animated: true)
 	    case "openAgentPanel":
-	      if let provider = route.bridgeProvider, !provider.isEmpty {
+	      let payloadProvider =
+	        Self.normalizedString(payload["provider"] ?? payload["agentBridgeProvider"])
+	      if let provider = payloadProvider ?? route.bridgeProvider, !provider.isEmpty {
 	        presentBridgeRepositoryPicker(provider: provider)
 	      }
 	    case "agentStopStreaming":
@@ -4422,6 +4608,15 @@ private struct ChatAvatarView: View {
 
 
   private func rowAvatarGradientColors(row: ChatHomeListRow, palette: AppThemePalette) -> [Color] {
+    if !row.isSavedMessages {
+      let colors = ChatProfileAppearanceStore.avatarColors(
+        title: row.title,
+        peerUserId: row.peerUserId,
+        chatId: row.chatId
+      )
+      return [Color(uiColor: colors.0), Color(uiColor: colors.1)]
+    }
+
     let startRaw = colorScheme == .dark
       ? (row.avatarGradientStartDark ?? row.avatarGradientStartLight)
       : (row.avatarGradientStartLight ?? row.avatarGradientStartDark)
@@ -4611,19 +4806,19 @@ struct AppChatNavigationAvatarButton: View {
       let colors = routeAvatarGradientColors(route: route)
       ZStack {
         LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing)
-        Image(systemName: "person.fill")
-          .font(.system(size: 14, weight: .semibold))
+        Text(fallbackText)
+          .font(.system(size: 16, weight: .bold))
+          .lineLimit(1)
+          .minimumScaleFactor(0.5)
           .foregroundStyle(.white)
       }
     }
 
   private func routeAvatarGradientColors(route: ChatRoute) -> [Color] {
-    let colors = ChatAvatarFallbackStyle.uiGradient(
+    let colors = ChatProfileAppearanceStore.avatarColors(
       title: route.title,
       peerUserId: route.peerUserId,
-      chatId: route.chatId,
-      isDark: colorScheme == .dark,
-      isSavedMessages: route.chatId == "saved_messages"
+      chatId: route.chatId
     )
     return [Color(uiColor: colors.0), Color(uiColor: colors.1)]
   }
@@ -4813,6 +5008,36 @@ private struct ContactSearchView: View {
   var body: some View {
     List {
       Section {
+        ContactSearchActionRow(
+          title: "New Group",
+          systemImage: "person.2",
+          palette: palette
+        ) {
+          onResult(["action": "newGroup"])
+          dismiss()
+        }
+
+        ContactSearchActionRow(
+          title: "New Contact",
+          systemImage: "person.badge.plus",
+          palette: palette
+        ) {
+          isQueryFieldFocused = true
+        }
+
+        ContactSearchActionRow(
+          title: "New Channel",
+          systemImage: "megaphone",
+          palette: palette
+        ) {
+          onResult(["action": "newChannel"])
+          dismiss()
+        }
+      }
+      .listRowBackground(Color.clear)
+      .listRowSeparatorTint(palette.border)
+
+      Section {
         HStack(spacing: 10) {
           Image(systemName: "magnifyingglass")
             .foregroundStyle(palette.secondaryText)
@@ -4888,7 +5113,7 @@ private struct ContactSearchView: View {
     .listStyle(.insetGrouped)
     .scrollContentBackground(.hidden)
     .background(palette.background.ignoresSafeArea())
-    .navigationTitle("New Chat")
+    .navigationTitle("New Message")
     .navigationBarTitleDisplayMode(.inline)
     .onAppear {
       DispatchQueue.main.async {
@@ -5030,6 +5255,36 @@ private struct ContactSearchResultRow: View {
         .foregroundStyle(palette.secondaryText.opacity(0.6))
     }
     .padding(.vertical, 4)
+  }
+}
+
+private struct ContactSearchActionRow: View {
+  let title: String
+  let systemImage: String
+  let palette: AppThemePalette
+  let action: () -> Void
+
+  var body: some View {
+    Button(action: action) {
+      HStack(spacing: 18) {
+        Image(systemName: systemImage)
+          .font(.system(size: 27, weight: .regular))
+          .symbolRenderingMode(.hierarchical)
+          .foregroundStyle(palette.accent)
+          .frame(width: 44, height: 44)
+
+        Text(title)
+          .font(.system(size: 26, weight: .regular))
+          .foregroundStyle(palette.accent)
+          .lineLimit(1)
+          .minimumScaleFactor(0.82)
+
+        Spacer(minLength: 8)
+      }
+      .padding(.vertical, 6)
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
   }
 }
 
@@ -5390,6 +5645,148 @@ private struct ChatCreateResult {
   let messages: [[String: Any]]
 }
 
+private enum ChatRoomCreationKind {
+  case group
+  case channel
+
+  var displayName: String {
+    switch self {
+    case .group: return "Group"
+    case .channel: return "Channel"
+    }
+  }
+
+  var title: String {
+    switch self {
+    case .group: return "New Group"
+    case .channel: return "New Channel"
+    }
+  }
+
+  var placeholder: String {
+    switch self {
+    case .group: return "Group name"
+    case .channel: return "Channel name"
+    }
+  }
+
+  var message: String {
+    switch self {
+    case .group: return "Create the group now. Members can be added from the group profile."
+    case .channel: return "Create a broadcast channel with you as owner."
+    }
+  }
+}
+
+private struct ChatRoomCreateResult {
+  let chatID: String
+  let name: String
+  let type: String
+}
+
+private enum ChatRoomCreateService {
+  static func create(kind: ChatRoomCreationKind, config: AppSessionConfig, name: String) async throws -> ChatRoomCreateResult {
+    let activeConfig = AppSessionConfig.current ?? config
+    do {
+      return try await createOnce(kind: kind, config: activeConfig, name: name)
+    } catch let error as ChatDirectMessageServiceError {
+      guard error.isSessionExpired else {
+        throw error
+      }
+      let refreshedConfig = try await AppSessionRefreshService.refresh(config: activeConfig)
+      return try await createOnce(kind: kind, config: refreshedConfig, name: name)
+    }
+  }
+
+  private static func createOnce(kind: ChatRoomCreationKind, config: AppSessionConfig, name: String) async throws -> ChatRoomCreateResult {
+    let request = try buildRequest(kind: kind, config: config, name: name)
+
+    switch config.transportMode {
+    case .offline:
+      throw ChatDirectMessageServiceError.transportUnavailable("offline")
+    case .bridgeText:
+      throw ChatDirectMessageServiceError.transportUnavailable("bridge_text")
+    case .packetMesh:
+      let packetSnapshot = try await PacketRuntime.shared.ensureStarted(config: config)
+      let session = PacketRuntime.shared.makeURLSession(snapshot: packetSnapshot)
+      return try await perform(request, fallbackName: name, session: session)
+    case .direct:
+      do {
+        let result = try await perform(request, fallbackName: name, session: .shared)
+        PacketRuntime.shared.stop(resetToDirect: true)
+        Task.detached {
+          await PacketBootstrapService.prefetchIfNeeded(config: config)
+        }
+        return result
+      } catch {
+        guard ChatDirectMessageService.shouldAttemptPacketFallback(for: error) else {
+          throw error
+        }
+        let packetSnapshot = try await PacketRuntime.shared.ensureStarted(config: config)
+        let session = PacketRuntime.shared.makeURLSession(snapshot: packetSnapshot)
+        return try await perform(request, fallbackName: name, session: session)
+      }
+    }
+  }
+
+  private static func buildRequest(kind: ChatRoomCreationKind, config: AppSessionConfig, name: String) throws -> URLRequest {
+    var base = config.apiBaseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+    while base.hasSuffix("/") {
+      base.removeLast()
+    }
+
+    let pathBase = base.lowercased().hasSuffix("/api") ? base : "\(base)/api"
+    let endpoint: String
+    switch kind {
+    case .group:
+      endpoint = "/group"
+    case .channel:
+      endpoint = "/channel"
+    }
+    guard let url = URL(string: "\(pathBase)\(endpoint)") else {
+      throw ChatDirectMessageServiceError.invalidURL
+    }
+
+    var body: [String: Any] = ["name": name]
+    if case .group = kind {
+      body["memberIds"] = []
+    }
+
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.timeoutInterval = 20
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
+    request.setValue("Bearer \(config.authToken)", forHTTPHeaderField: "Authorization")
+    request.httpBody = try JSONSerialization.data(withJSONObject: body)
+    return request
+  }
+
+  private static func perform(_ request: URLRequest, fallbackName: String, session: URLSession) async throws -> ChatRoomCreateResult {
+    let (data, response) = try await session.data(for: request)
+
+    guard let httpResponse = response as? HTTPURLResponse else {
+      throw ChatDirectMessageServiceError.invalidResponse
+    }
+    guard (200...299).contains(httpResponse.statusCode) else {
+      let body = String(data: data, encoding: .utf8) ?? ""
+      throw ChatDirectMessageServiceError.http(httpResponse.statusCode, body)
+    }
+
+    let object = try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+    guard let payload = object as? [String: Any] else {
+      throw ChatDirectMessageServiceError.invalidPayload
+    }
+    guard let chatID = ChatDirectMessageService.normalizedString(payload["chatId"] ?? payload["chat_id"]) else {
+      throw ChatDirectMessageServiceError.invalidPayload
+    }
+    let name = ChatDirectMessageService.normalizedString(payload["name"]) ?? fallbackName
+    let type = ChatDirectMessageService.normalizedString(payload["type"]) ?? "group"
+    return ChatRoomCreateResult(chatID: chatID, name: name, type: type)
+  }
+}
+
 private enum ChatDirectMessageService {
   static func startChat(config: AppSessionConfig, friendID: String) async throws -> ChatCreateResult {
     let activeConfig = AppSessionConfig.current ?? config
@@ -5485,7 +5882,7 @@ private enum ChatDirectMessageService {
     return ChatCreateResult(chatID: chatID, messages: messages)
   }
 
-  private static func shouldAttemptPacketFallback(for error: Error) -> Bool {
+  fileprivate static func shouldAttemptPacketFallback(for error: Error) -> Bool {
     if let serviceError = error as? ChatDirectMessageServiceError {
       switch serviceError {
       case let .http(statusCode, _):
@@ -5499,7 +5896,7 @@ private enum ChatDirectMessageService {
     return true
   }
 
-  private static func normalizedString(_ value: Any?) -> String? {
+  fileprivate static func normalizedString(_ value: Any?) -> String? {
     if let value = value as? String {
       let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
       return trimmed.isEmpty ? nil : trimmed
@@ -5722,6 +6119,8 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
       object: nil
     )
 
+    refreshSettingsTabAvatar()
+
     Task { [weak self] in
       await AppProfileController.shared.loadIfNeeded()
       await MainActor.run { self?.refreshSettingsTabAvatar() }
@@ -5871,11 +6270,10 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
   private func applySettingsTabFallback(profile: AppUserProfile?) {
     let name = profile?.name ?? profile?.username ?? "U"
     let letters = String(name.prefix(2)).uppercased()
-    let colors = ChatAvatarFallbackStyle.uiGradient(
+    let colors = ChatProfileAppearanceStore.avatarColors(
       title: profile?.displayName ?? name,
       peerUserId: profile?.userID,
-      chatId: profile?.username,
-      isDark: traitCollection.userInterfaceStyle == .dark
+      chatId: profile?.username
     )
 
     let size: CGFloat = 26

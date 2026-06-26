@@ -494,16 +494,67 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
   }
 
   func makeUIViewController(context: Context) -> VibeAgentConversationViewController {
+    // Capture value-type context so the live closures don't retain SwiftUI state.
+    let chatId = chatId
+    let provider = provider
+    let sessionId = session.resolvedSessionId.trimmingCharacters(in: .whitespacesAndNewlines)
+    let coordinator = context.coordinator
+
     let controller = VibeAgentConversationViewController(
       title: session.topic,
       subtitle: subtitle,
       messages: context.coordinator.seedMessages(),
-      inputPlaceholder: "Ask \(AgentBridgeProfile.displayName(for: provider))"
+      inputPlaceholder: "Ask \(AgentBridgeProfile.displayName(for: provider))",
+      // Render this session's rows. Every session ingests into the same DM chatId
+      // (keyed `bridge-<sessionId>-…`), so reading the chat unfiltered would show the
+      // default-DM history identically for every session. We isolate to the ingested
+      // transcript for this session id, PLUS — once the user sends a follow-up from
+      // this view — that follow-up and its resumed reply (the live `agent-stream`
+      // bubble and the final message, linked back by source id). Without that, a
+      // resume landed in the shared DM with a non-`bridge-` id and was filtered out,
+      // so the view looked empty/stuck. We still never pull in another session's
+      // ingested history (also `bridge-`prefixed) or the DM's unrelated rows. If the
+      // transcript hasn't arrived yet we fall back to live streaming rows so a
+      // running task isn't blank. The controller's live observer re-reads this on
+      // every engine change.
+      messagesProvider: { [weak coordinator] in
+        let prefix = "bridge-\(sessionId)-"
+        let all = ChatEngine.shared
+          .getChatRows(["chatId": chatId])
+          .compactMap { ChatListRow(raw: $0) }
+        // Follow-ups that resume THIS session: identified durably by the resume
+        // session id their send stamped into metadata (so a follow-up sent from
+        // ANOTHER device folds in too), plus any this device sent locally. Their
+        // replies (live stream + final message) link back by source id.
+        var followUps = coordinator?.followUpMessageIds ?? []
+        for row in all where row.agentBridgeResumeSessionId == sessionId {
+          if let mid = row.messageId { followUps.insert(mid) }
+        }
+        let keep = all.filter { row in
+          let mid = row.messageId ?? ""
+          if mid.hasPrefix(prefix) { return true }
+          guard !followUps.isEmpty else { return false }
+          if mid.hasPrefix("bridge-") { return false }
+          if followUps.contains(mid) { return true }
+          if let src = row.agentActionSourceId, followUps.contains(src) { return true }
+          if row.isStreamingText { return true }
+          return false
+        }
+        if !keep.isEmpty {
+          return VibeAgentKitMap.messages(from: keep)
+        }
+        let liveRows = all.filter { $0.isStreamingText }
+        return VibeAgentKitMap.messages(from: liveRows)
+      },
+      // Send continues THIS session on the user's computer and streams back in place.
+      onSend: { [weak coordinator] text, options in
+        coordinator?.sendFollowUp(text, options: options)
+      }
     )
     controller.agentBridgeChatId = chatId
     controller.agentBridgeProvider = provider
     context.coordinator.controller = controller
-    context.coordinator.requestDetailIfPossible()
+    context.coordinator.start()
     return controller
   }
 
@@ -512,26 +563,83 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
     context.coordinator.controller = controller
   }
 
+  /// Dispatch a message to the agent on the user's computer over the live chat
+  /// channel. The server detects the bridge-agent DM and routes to the daemon; the
+  /// reply streams back as `agent-stream` / `message` frames that ChatEngine folds
+  /// into this chat's rows (rendered via `messagesProvider`).
+  static func sendToAgent(
+    chatId: String,
+    provider: String,
+    resumeSessionId: String,
+    text: String,
+    messageId: String = UUID().uuidString.lowercased(),
+    options: AgentBridgeRunOptions? = nil
+  ) {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return }
+    var metadata: [String: Any] = ["agentBridgeProvider": provider]
+    if let repo = AgentBridgeSelectionStore.selectedRepository() {
+      metadata["agentBridgeRepoId"] = repo.id
+      metadata["agentBridgeRepoName"] = repo.name
+      metadata["agentBridgeRepoPath"] = repo.path
+      metadata["agentBridgeCwd"] = repo.cwd
+    }
+    metadata["agentBridgeWorkMode"] = AgentBridgeSelectionStore.selectedWorkMode().rawValue
+    metadata.merge(
+      (options ?? AgentBridgeSelectionStore.selectedRunOptions(provider: provider)).payload(provider: provider)
+    ) { _, new in new }
+    // Explicit resume so the message continues the session you opened rather than
+    // starting a fresh task (per the resume contract).
+    if !resumeSessionId.isEmpty, !resumeSessionId.hasPrefix("running:") {
+      metadata["agentBridgeResumeSessionId"] = resumeSessionId
+    }
+    _ = ChatEngine.shared.sendMessage([
+      "chatId": chatId,
+      "type": "text",
+      "text": trimmed,
+      "messageId": messageId,
+      "metadata": metadata,
+    ])
+  }
+
   final class Coordinator {
     var parent: AgentBridgeRuntimeView
     weak var controller: VibeAgentConversationViewController?
-    private var pendingRequestId: String?
-    private var observer: NSObjectProtocol?
+    private var didOpenChannel = false
+
+    /// Message ids of follow-ups the user sent from THIS view. The live
+    /// `messagesProvider` uses these to fold the resumed turn (the follow-up bubble
+    /// plus its streaming + final reply, joined by source id) into the rendered
+    /// transcript — otherwise a resume lands in the shared DM with a non-`bridge-`
+    /// id and gets filtered out, leaving the view looking empty.
+    var followUpMessageIds: Set<String> = []
 
     init(parent: AgentBridgeRuntimeView) {
       self.parent = parent
-      observer = NotificationCenter.default.addObserver(
-        forName: ChatEngine.didChangeNotification,
-        object: nil,
-        queue: .main
-      ) { [weak self] note in
-        self?.handle(note)
-      }
+    }
+
+    /// Send a follow-up that resumes this session and surface it inline. We mint the
+    /// id up front so we can register it before dispatch; the engine's optimistic
+    /// insert + the streamed/final reply then render through `messagesProvider`.
+    func sendFollowUp(_ text: String, options: AgentBridgeRunOptions) {
+      let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !trimmed.isEmpty else { return }
+      let messageId = UUID().uuidString.lowercased()
+      followUpMessageIds.insert(messageId)
+      AgentBridgeRuntimeView.sendToAgent(
+        chatId: parent.chatId,
+        provider: parent.provider,
+        resumeSessionId: parent.session.resolvedSessionId
+          .trimmingCharacters(in: .whitespacesAndNewlines),
+        text: trimmed,
+        messageId: messageId,
+        options: options
+      )
     }
 
     deinit {
-      if let observer {
-        NotificationCenter.default.removeObserver(observer)
+      if didOpenChannel {
+        _ = ChatEngine.shared.closeChatChannel(["chatId": parent.chatId])
       }
     }
 
@@ -548,30 +656,39 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
           )
         ]
       }
+      // A finished conversation must NOT look live — no streaming shimmer. This is a
+      // transient placeholder replaced as soon as the transcript loads.
       return [
         VibeAgentKitChatMessage(
           id: parent.session.id,
           role: .assistant,
-          text: "Loading conversation...",
+          text: "Loading conversation…",
           timestamp: "",
           timestampMs: 0,
-          isStreaming: true
+          isStreaming: false
         )
       ]
     }
 
-    func requestDetailIfPossible() {
+    /// Join the chat channel (so live frames arrive) and ingest the selected local
+    /// session into the chat as rows. From here the controller's own live observer
+    /// re-reads `messagesProvider` on every engine change, so seeded history, live
+    /// `agent-stream` deltas, and final `message`s all render through one path —
+    /// no close-and-reload. The ingest carries each message's E2E `agentRuntimeEnc`
+    /// so the file-change cards survive (decrypted by ChatListRow with the phone key).
+    func start() {
+      _ = ChatEngine.shared.openChatChannel(["chatId": parent.chatId])
+      didOpenChannel = true
+
       let sessionId = parent.session.resolvedSessionId.trimmingCharacters(in: .whitespacesAndNewlines)
       guard !sessionId.isEmpty, !sessionId.hasPrefix("running:") else { return }
-      let result = ChatEngine.shared.requestAgentBridgeHistory([
+
+      let result = ChatEngine.shared.loadAgentBridgeSessionIntoChat([
         "chatId": parent.chatId,
         "provider": parent.provider,
-        "mode": "detail",
         "sessionId": sessionId,
       ])
-      if (result["accepted"] as? Bool) == true {
-        pendingRequestId = result["requestId"] as? String
-      } else {
+      if (result["accepted"] as? Bool) != true {
         controller?.setMessages([
           VibeAgentKitChatMessage(
             id: "offline",
@@ -582,88 +699,6 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
             isError: true
           )
         ])
-      }
-    }
-
-    private func handle(_ note: Notification) {
-      guard
-        let info = note.userInfo,
-        (info["reason"] as? String) == "agentBridgeHistory",
-        let payload = ChatEngine.shared.latestAgentBridgeHistory(chatId: parent.chatId)
-      else { return }
-
-      if let pendingRequestId,
-        let requestId = info["requestId"] as? String,
-        requestId != pendingRequestId
-      {
-        return
-      }
-      guard (payload["mode"] as? String) == "detail" else { return }
-      guard let sessionPayload = payload["session"] as? [String: Any] else {
-        if (payload["ok"] as? Bool) == false {
-          controller?.setMessages([
-            VibeAgentKitChatMessage(
-              id: "unavailable",
-              role: .assistant,
-              text: "This conversation is not available yet.",
-              timestamp: "",
-              timestampMs: 0,
-              isError: true
-            )
-          ])
-        }
-        return
-      }
-      if let id = sessionPayload["id"] as? String,
-        id != parent.session.resolvedSessionId
-      {
-        return
-      }
-      let messages = Self.messages(from: sessionPayload)
-      if messages.isEmpty {
-        controller?.setMessages([
-          VibeAgentKitChatMessage(
-            id: "empty",
-            role: .assistant,
-            text: "This conversation has no readable messages.",
-            timestamp: "",
-            timestampMs: 0,
-            isError: true
-          )
-        ])
-      } else {
-        controller?.setMessages(messages)
-      }
-    }
-
-    private static func messages(from sessionPayload: [String: Any]) -> [VibeAgentKitChatMessage] {
-      let raw = sessionPayload["messages"] as? [[String: Any]] ?? []
-      return raw.enumerated().compactMap { index, item in
-        let text = (item["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !text.isEmpty else { return nil }
-        let roleText = ((item["role"] as? String) ?? "").lowercased()
-        let role: VibeAgentKitChatRole = roleText == "user" ? .user : .assistant
-        // The bridge seals a reconstructed file-change card per message as
-        // `agentRuntimeEnc` (arte1 AES-GCM); the server only ever relays the
-        // ciphertext. Decrypt locally so a session you ran on your computer
-        // shows the same "N files changed +X −Y" card on the phone.
-        let runtime: ChatListRow.AgentRuntimeSummary? = AgentRuntimeCrypto
-          .decrypt(item["agentRuntimeEnc"])
-          .flatMap { parseAgentRuntimeSummary($0) }
-        if item["agentRuntimeEnc"] != nil {
-          NSLog(
-            "[AgentView] history rowparse enc present decrypted=\(runtime != nil) hasKey=\(AgentRuntimeCrypto.hasKey)"
-          )
-        }
-        return VibeAgentKitChatMessage(
-          id: (item["id"] as? String) ?? "\(roleText)-\(index)",
-          role: role,
-          text: text,
-          timestamp: (item["ts"] as? String) ?? (item["timestamp"] as? String) ?? "",
-          timestampMs: 0,
-          isStreaming: false,
-          runtime: runtime
-        )
       }
     }
   }

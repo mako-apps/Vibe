@@ -472,6 +472,9 @@ final class VibeAgentKitAgentLoaderView: UIControl {
   private let contentStack = UIStackView()
   private let activityIconView = UIImageView()
   private let shimmerLabel = VibeAgentKitShimmerLabelView()
+  // Trailing disclosure shown on a completed turn so "Worked · N steps" reads as a
+  // tappable toggle (expands the tool sheet); hidden while a turn is in flight.
+  private let disclosureIconView = UIImageView()
 
   private var appearance = VibeAgentKitChatAppearance.fallback
   private var currentText: String = ""
@@ -545,7 +548,8 @@ final class VibeAgentKitAgentLoaderView: UIControl {
   func configure(
     text: String,
     isStreaming: Bool,
-    progressItems: [VibeAgentKitProgressItem]
+    progressItems: [VibeAgentKitProgressItem],
+    isExpanded: Bool = false
   ) {
     self.progressItems = progressItems
     updateActivityIcon(for: progressItems.last)
@@ -561,6 +565,15 @@ final class VibeAgentKitAgentLoaderView: UIControl {
 
     isUserInteractionEnabled = onTap != nil
     accessibilityTraits = onTap == nil ? [] : [.button]
+
+    // Disclosure only on a finished, tappable summary ("Worked · N steps"); never
+    // while the live shimmer is running. Points down once the step list is
+    // expanded inline, right once collapsed.
+    disclosureIconView.isHidden = isStreaming || onTap == nil || progressItems.isEmpty
+    disclosureIconView.image = UIImage(systemName: isExpanded ? "chevron.down" : "chevron.right")
+    disclosureIconView.tintColor = appearance.isDark
+      ? UIColor(white: 1.0, alpha: 0.5)
+      : vibeAgentKitColorWithAlpha(appearance.text, 0.42)
 
     if isStreaming && !isStreamingActive {
       isStreamingActive = true
@@ -581,11 +594,22 @@ final class VibeAgentKitAgentLoaderView: UIControl {
   }
 
   private func updateActivityIcon(for item: VibeAgentKitProgressItem?) {
-    _ = item
     currentActivityIconKind = nil
-    activityIconView.image = nil
-    activityIconView.alpha = 0.0
-    activityIconView.isHidden = true
+    let kind = item?.tool ?? item?.itemType
+    guard let kind, !kind.isEmpty else {
+      activityIconView.image = nil
+      activityIconView.alpha = 0.0
+      activityIconView.isHidden = true
+      return
+    }
+    // Native SF Symbol for the in-flight / latest tool (terminal, pencil, …) —
+    // tinted to match the shimmer text, no emoji.
+    activityIconView.image = UIImage(systemName: vibeAgentKitToolSymbol(forKind: kind))
+    activityIconView.tintColor = appearance.isDark
+      ? UIColor(white: 1.0, alpha: 0.66)
+      : vibeAgentKitColorWithAlpha(appearance.text, 0.56)
+    activityIconView.alpha = 1.0
+    activityIconView.isHidden = false
   }
 
   private func activityIconKind(for item: VibeAgentKitProgressItem?) -> VibeAgentKitChatVectorIcon.Kind {
@@ -661,10 +685,28 @@ final class VibeAgentKitAgentLoaderView: UIControl {
     contentStack.alignment = .center
     contentStack.spacing = 6.0
     contentStack.distribution = .fill
+    // The stack and its labels/icons are display-only. Leaving them interactive
+    // makes them the hit-test target, so taps land on the shimmer label instead
+    // of this UIControl and `touchUpInside` never fires (the chevron renders but
+    // the tap "does nothing"). Disabling interaction on the content subtree lets
+    // the control itself receive the touch and drive `onTap`.
+    contentStack.isUserInteractionEnabled = false
     addSubview(contentStack)
 
     contentStack.addArrangedSubview(activityIconView)
     contentStack.addArrangedSubview(shimmerLabel)
+    contentStack.addArrangedSubview(disclosureIconView)
+
+    disclosureIconView.translatesAutoresizingMaskIntoConstraints = false
+    disclosureIconView.contentMode = .scaleAspectFit
+    disclosureIconView.image = UIImage(systemName: "chevron.right")
+    disclosureIconView.isHidden = true
+    disclosureIconView.setContentHuggingPriority(.required, for: .horizontal)
+    disclosureIconView.setContentCompressionResistancePriority(.required, for: .horizontal)
+    NSLayoutConstraint.activate([
+      disclosureIconView.widthAnchor.constraint(equalToConstant: 11.0),
+      disclosureIconView.heightAnchor.constraint(equalToConstant: 11.0),
+    ])
 
     activityIconView.translatesAutoresizingMaskIntoConstraints = false
     activityIconView.contentMode = .scaleAspectFit
@@ -694,11 +736,16 @@ final class VibeAgentKitAgentLoaderView: UIControl {
 
 private final class VibeAgentKitAgentProgressRowView: UIView {
   private let railView = UIView()
-  private let dotView = UIView()
+  private let iconView = UIImageView()
   private let connectorView = UIView()
   private let titleLabel = UILabel()
+  private let detailContainer = UIView()
   private let detailLabel = UILabel()
   private let badgesWrapView = UIView()
+
+  private let contentX: CGFloat = 30.0
+  private let detailHPad: CGFloat = 10.0
+  private let detailVPad: CGFloat = 8.0
 
   private var badgeViews: [UILabel] = []
   private var showsConnector = false
@@ -715,23 +762,26 @@ private final class VibeAgentKitAgentProgressRowView: UIView {
 
   override func layoutSubviews() {
     super.layoutSubviews()
-    railView.frame = CGRect(x: 0.0, y: 0.0, width: 18.0, height: bounds.height)
-    dotView.frame = CGRect(x: 5.0, y: 6.0, width: 8.0, height: 8.0)
-    connectorView.frame = CGRect(x: 8.5, y: 18.0, width: 1.0, height: max(0.0, bounds.height - 18.0))
+    railView.frame = CGRect(x: 0.0, y: 0.0, width: 22.0, height: bounds.height)
+    iconView.frame = CGRect(x: 2.0, y: 1.0, width: 16.0, height: 16.0)
+    connectorView.frame = CGRect(x: 9.5, y: 22.0, width: 1.0, height: max(0.0, bounds.height - 22.0))
 
-    let contentX: CGFloat = 28.0
     let contentWidth = max(0.0, bounds.width - contentX)
-    let titleSize = titleLabel.sizeThatFits(CGSize(width: contentWidth, height: 40.0))
+    let titleSize = titleLabel.sizeThatFits(CGSize(width: contentWidth, height: 60.0))
     titleLabel.frame = CGRect(x: contentX, y: 0.0, width: contentWidth, height: titleSize.height)
 
-    var currentY = titleLabel.frame.maxY + 3.0
+    var currentY = titleLabel.frame.maxY + 4.0
 
-    if detailLabel.isHidden {
+    if detailContainer.isHidden {
+      detailContainer.frame = .zero
       detailLabel.frame = .zero
     } else {
-      let detailSize = detailLabel.sizeThatFits(CGSize(width: contentWidth, height: 80.0))
-      detailLabel.frame = CGRect(x: contentX, y: currentY, width: contentWidth, height: detailSize.height)
-      currentY = detailLabel.frame.maxY + 8.0
+      let textWidth = max(0.0, contentWidth - detailHPad * 2.0)
+      let detailSize = detailLabel.sizeThatFits(CGSize(width: textWidth, height: 600.0))
+      let boxHeight = detailSize.height + detailVPad * 2.0
+      detailContainer.frame = CGRect(x: contentX, y: currentY, width: contentWidth, height: boxHeight)
+      detailLabel.frame = CGRect(x: detailHPad, y: detailVPad, width: textWidth, height: detailSize.height)
+      currentY = detailContainer.frame.maxY + 8.0
     }
 
     badgesWrapView.frame = CGRect(
@@ -752,19 +802,34 @@ private final class VibeAgentKitAgentProgressRowView: UIView {
     self.appearance = appearance
     self.showsConnector = showsConnector
 
-    dotView.backgroundColor = item.eventType == "result"
-      ? appearance.primary
-      : vibeAgentKitColorWithAlpha(appearance.textSecondary, appearance.isDark ? 0.88 : 0.72)
+    let kind = (item.tool ?? item.itemType ?? "").lowercased()
+    let isError = (item.status ?? "").lowercased() == "error" || (item.status ?? "").lowercased() == "failed"
+    let iconTint: UIColor = isError
+      ? UIColor.systemRed
+      : (kind == "thinking"
+        ? vibeAgentKitColorWithAlpha(appearance.primary, 0.95)
+        : vibeAgentKitColorWithAlpha(appearance.textSecondary, appearance.isDark ? 0.92 : 0.74))
+    iconView.image = UIImage(systemName: vibeAgentKitToolSymbol(forKind: kind))
+    iconView.tintColor = iconTint
     connectorView.backgroundColor = vibeAgentKitColorWithAlpha(appearance.border, appearance.isDark ? 0.54 : 0.68)
     connectorView.isHidden = !showsConnector
 
     titleLabel.text = item.label
     titleLabel.textColor = appearance.text
 
-    let detailText = item.detailLines.joined(separator: "\n")
+    // Command OUTPUT / todo checklist / reasoning lives in `messageContent`; show
+    // it in a rounded, (monospaced for command output) container. Edits/reads have
+    // no body → the container hides.
+    let detailText = (item.messageContent ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    let isCode = ["bash", "search", "web", "task", "tool"].contains(kind)
     detailLabel.text = detailText
-    detailLabel.isHidden = detailText.isEmpty
-    detailLabel.textColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, appearance.isDark ? 0.88 : 0.90)
+    detailContainer.isHidden = detailText.isEmpty
+    detailLabel.font = isCode
+      ? UIFont.monospacedSystemFont(ofSize: 11.5, weight: .regular)
+      : UIFont.systemFont(ofSize: 12.5, weight: .regular)
+    detailLabel.textColor = vibeAgentKitColorWithAlpha(appearance.text, appearance.isDark ? 0.86 : 0.86)
+    detailContainer.backgroundColor = vibeAgentKitColorWithAlpha(
+      appearance.surfaceElevated, appearance.isDark ? 0.60 : 0.78)
 
     badgeViews.forEach { $0.removeFromSuperview() }
     badgeViews.removeAll()
@@ -787,13 +852,14 @@ private final class VibeAgentKitAgentProgressRowView: UIView {
   }
 
   func preferredHeight(for width: CGFloat) -> CGFloat {
-    let contentWidth = max(0.0, width - 28.0)
-    let titleHeight = titleLabel.sizeThatFits(CGSize(width: contentWidth, height: 40.0)).height
+    let contentWidth = max(0.0, width - contentX)
+    let titleHeight = titleLabel.sizeThatFits(CGSize(width: contentWidth, height: 60.0)).height
     var height = max(20.0, titleHeight)
 
-    if !detailLabel.isHidden {
-      let detailHeight = detailLabel.sizeThatFits(CGSize(width: contentWidth, height: 90.0)).height
-      height += 3.0 + detailHeight
+    if !detailContainer.isHidden {
+      let textWidth = max(0.0, contentWidth - detailHPad * 2.0)
+      let detailHeight = detailLabel.sizeThatFits(CGSize(width: textWidth, height: 600.0)).height
+      height += 4.0 + detailHeight + detailVPad * 2.0
     }
 
     if !badgeViews.isEmpty {
@@ -842,19 +908,25 @@ private final class VibeAgentKitAgentProgressRowView: UIView {
     backgroundColor = .clear
 
     addSubview(railView)
-    railView.addSubview(dotView)
+    railView.addSubview(iconView)
     railView.addSubview(connectorView)
 
-    dotView.layer.cornerRadius = 4.0
+    iconView.contentMode = .scaleAspectFit
+    iconView.preferredSymbolConfiguration = UIImage.SymbolConfiguration(pointSize: 13.0, weight: .medium)
     connectorView.isHidden = true
 
     titleLabel.font = UIFont.systemFont(ofSize: 15.0, weight: .semibold)
     titleLabel.numberOfLines = 0
     addSubview(titleLabel)
 
-    detailLabel.font = UIFont.systemFont(ofSize: 12.5, weight: .regular)
+    detailContainer.layer.cornerRadius = 9.0
+    detailContainer.layer.cornerCurve = .continuous
+    detailContainer.clipsToBounds = true
+    addSubview(detailContainer)
+
     detailLabel.numberOfLines = 0
-    addSubview(detailLabel)
+    detailLabel.lineBreakMode = .byCharWrapping
+    detailContainer.addSubview(detailLabel)
 
     addSubview(badgesWrapView)
   }

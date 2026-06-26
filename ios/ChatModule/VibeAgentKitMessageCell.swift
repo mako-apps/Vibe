@@ -115,6 +115,9 @@ final class VibeAgentKitMessageActionBarView: UIView {
 private final class VibeAgentKitAssistantMessageBodyView: UIView {
   private let stackView = UIStackView()
   private let loaderView = VibeAgentKitAgentLoaderView()
+  // Inline, expandable step list that drops in directly under the "Worked · N
+  // steps" line when the user taps it (Claude-Code style) — no separate sheet.
+  private let stepsStack = UIStackView()
   private let runtimeSummaryView = AgentRuntimeSummaryView()
   private var blockViews: [UIView] = []
   private var blockHeightConstraints: [NSLayoutConstraint] = []
@@ -139,10 +142,51 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     loaderView.configure(text: "", isStreaming: false, progressItems: [])
     loaderView.onTap = nil
     loaderView.isHidden = true
+    clearStepsList()
     runtimeSummaryView.onTap = nil
     runtimeSummaryView.isHidden = true
     runtimeHeightConstraint?.constant = 0.0
     removeBlockViews()
+  }
+
+  private func clearStepsList() {
+    stepsStack.arrangedSubviews.forEach {
+      stepsStack.removeArrangedSubview($0)
+      $0.removeFromSuperview()
+    }
+    stepsStack.isHidden = true
+  }
+
+  // Build the inline step rows shown when "Worked · N steps" is expanded. Each
+  // row is a muted, wrapping label with a hanging bullet (matching the body
+  // renderer's list style), so the feed reads as a quiet sub-list under the
+  // summary line rather than a heavy card.
+  private func updateStepsList(
+    _ items: [VibeAgentKitProgressItem],
+    expanded: Bool,
+    appearance: VibeAgentKitChatAppearance
+  ) {
+    clearStepsList()
+    guard expanded, !items.isEmpty else { return }
+    let stepFont = UIFont.systemFont(ofSize: 15.0, weight: .regular)
+    let marker = "•  "
+    let indent = (marker as NSString).size(withAttributes: [.font: stepFont]).width
+    let color = appearance.textSecondary
+    for item in items {
+      let label = UILabel()
+      label.numberOfLines = 0
+      label.translatesAutoresizingMaskIntoConstraints = false
+      let para = NSMutableParagraphStyle()
+      para.lineBreakMode = .byWordWrapping
+      para.headIndent = indent
+      para.lineSpacing = 1.0
+      label.attributedText = NSAttributedString(
+        string: marker + item.label,
+        attributes: [.font: stepFont, .foregroundColor: color, .paragraphStyle: para]
+      )
+      stepsStack.addArrangedSubview(label)
+    }
+    stepsStack.isHidden = false
   }
 
   private func removeBlockViews() {
@@ -169,7 +213,8 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     fallbackProgressLabels: [String],
     runtime: ChatListRow.AgentRuntimeSummary?,
     onRuntimeTap: ((ChatListRow.AgentRuntimeSummary) -> Void)?,
-    onLoaderTap: (() -> Void)?
+    onLoaderTap: (() -> Void)?,
+    isProgressExpanded: Bool = false
   ) {
     let font = UIFont.systemFont(ofSize: 18.0, weight: .regular)
     let lineHeight: CGFloat = 27.5
@@ -182,22 +227,39 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
 
     let hasProgressItems = !progressItems.isEmpty
     let shouldShowLoader = showsLoader || hasProgressItems
+    // Only a finished turn can expand its step list inline; a live turn shows the
+    // shimmer, not a static list.
+    let stepsExpanded = isProgressExpanded && hasProgressItems && !showsLoader
 
     if shouldShowLoader {
-      let loaderText = progressItems.last?.label
-        ?? fallbackProgressLabels.last
-        ?? "Thinking"
-        
+      let loaderText: String
+      if showsLoader {
+        // Live turn: shimmer the action in flight ("Edit chat.ex", "Run …").
+        loaderText = progressItems.last?.label ?? fallbackProgressLabels.last ?? "Thinking"
+      } else {
+        // Completed turn: collapse the whole run into one tappable summary line
+        // ("Worked for 1m 3s · N steps") that expands the step list inline. The
+        // elapsed time rides the decrypted runtime (live turns carry durationMs);
+        // history turns have no duration, so they read "Worked · N steps". Same
+        // structure for Claude and Codex — both feed progressItems + runtime.
+        loaderText = Self.workedSummary(
+          stepCount: progressItems.count,
+          durationMs: runtime?.durationMs
+        )
+      }
       loaderView.isHidden = false
       loaderView.configure(
         text: loaderText,
         isStreaming: showsLoader,
-        progressItems: progressItems
+        progressItems: progressItems,
+        isExpanded: stepsExpanded
       )
     } else {
       loaderView.isHidden = true
       loaderView.configure(text: "", isStreaming: false, progressItems: [])
     }
+
+    updateStepsList(progressItems, expanded: stepsExpanded, appearance: appearance)
 
     configureRuntimeSummary(
       runtime,
@@ -214,6 +276,8 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
         view.isHidden = true
         blockHeightConstraints[index].constant = 0.0
       }
+      // No answer text (pure-tool / live-start turn): the summary sits at the top.
+      positionSummaryViews(belowText: false)
       return
     }
 
@@ -243,9 +307,12 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
           codeView.translatesAutoresizingMaskIntoConstraints = false
           view = codeView
         }
+        // Insert text blocks above the bottom runtime card. Final ordering of the
+        // loader/steps summary (top while live, footer once done) is applied by
+        // positionSummaryViews() after this loop.
         stackView.insertArrangedSubview(
           view,
-          at: max(0, stackView.arrangedSubviews.count - 2)
+          at: max(1, stackView.arrangedSubviews.count - 1)
         )
         let heightConstraint = view.heightAnchor.constraint(equalToConstant: 0.0)
         heightConstraint.priority = .defaultHigh
@@ -297,6 +364,56 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
         blockHeightConstraints[index].constant = height
       }
     }
+
+    // A completed turn's "Worked · N steps" summary reads as a footer UNDER the
+    // answer (the work is done — show it after, not mid-turn). A live turn keeps
+    // the shimmer pinned at the top so you watch it work.
+    positionSummaryViews(belowText: shouldShowLoader && !showsLoader)
+  }
+
+  /// Place the loader (Worked summary) + its expandable step list either at the TOP
+  /// (live turn — watch it work) or as a footer just above the bottom file-change
+  /// card (completed turn — the summary follows the answer, Claude-Code style). The
+  /// `runtimeSummaryView` always stays last.
+  private func positionSummaryViews(belowText: Bool) {
+    guard stackView.arrangedSubviews.contains(runtimeSummaryView) else { return }
+    if belowText {
+      for view in [loaderView, stepsStack] {
+        stackView.removeArrangedSubview(view)
+        stackView.insertArrangedSubview(view, at: max(0, stackView.arrangedSubviews.count - 1))
+      }
+    } else {
+      stackView.removeArrangedSubview(loaderView)
+      stackView.insertArrangedSubview(loaderView, at: 0)
+      stackView.removeArrangedSubview(stepsStack)
+      stackView.insertArrangedSubview(stepsStack, at: 1)
+    }
+  }
+
+  // Completed-turn summary line. Matches the Claude Code / Codex "Worked for Xs"
+  // affordance: elapsed time first (when the runtime carries it), then the step
+  // count. Provider-agnostic — Claude and Codex both populate progressItems and
+  // (for live turns) a runtime with durationMs.
+  static func workedSummary(stepCount: Int, durationMs: Int?) -> String {
+    let steps = max(0, stepCount)
+    let stepText = steps == 1 ? "1 step" : "\(steps) steps"
+    guard let ms = durationMs, ms >= 1000 else {
+      return "Worked · \(stepText)"
+    }
+    return "Worked for \(formatElapsed(ms)) · \(stepText)"
+  }
+
+  private static func formatElapsed(_ ms: Int) -> String {
+    let totalSeconds = ms / 1000
+    if totalSeconds < 60 { return "\(totalSeconds)s" }
+    let minutes = totalSeconds / 60
+    let seconds = totalSeconds % 60
+    if minutes < 60 {
+      return seconds == 0 ? "\(minutes)m" : "\(minutes)m \(seconds)s"
+    }
+    let hours = minutes / 60
+    let remMinutes = minutes % 60
+    return remMinutes == 0 ? "\(hours)h" : "\(hours)h \(remMinutes)m"
   }
 
   private func setup() {
@@ -308,10 +425,21 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     stackView.spacing = 7.0
     loaderView.translatesAutoresizingMaskIntoConstraints = false
     loaderView.isHidden = true
+    stepsStack.translatesAutoresizingMaskIntoConstraints = false
+    stepsStack.axis = .vertical
+    stepsStack.alignment = .fill
+    stepsStack.distribution = .fill
+    stepsStack.spacing = 4.0
+    stepsStack.isHidden = true
+    stepsStack.isLayoutMarginsRelativeArrangement = true
+    stepsStack.layoutMargins = UIEdgeInsets(top: 1.0, left: 4.0, bottom: 3.0, right: 0.0)
     runtimeSummaryView.translatesAutoresizingMaskIntoConstraints = false
     runtimeSummaryView.isHidden = true
     addSubview(stackView)
+    // Order: loader ("Worked …"), inline steps (expand target), response text
+    // blocks (inserted between here and the runtime card), then the diff card.
     stackView.addArrangedSubview(loaderView)
+    stackView.addArrangedSubview(stepsStack)
     stackView.addArrangedSubview(runtimeSummaryView)
     let runtimeHeightConstraint = runtimeSummaryView.heightAnchor.constraint(equalToConstant: 0.0)
     runtimeHeightConstraint.priority = .defaultHigh
@@ -460,7 +588,8 @@ final class VibeAgentKitMessageCell: UITableViewCell {
     message: VibeAgentKitChatMessage,
     appearance: VibeAgentKitChatAppearance,
     regeneratePrompt: String,
-    showsActions: Bool = true
+    showsActions: Bool = true,
+    isProgressExpanded: Bool = false
   ) {
     let isUser = message.role.isUser
     currentIsUser = isUser
@@ -573,7 +702,8 @@ final class VibeAgentKitMessageCell: UITableViewCell {
         fallbackProgressLabels: message.progress,
         runtime: message.runtime,
         onRuntimeTap: onRuntimeTap,
-        onLoaderTap: onProgressTap
+        onLoaderTap: onProgressTap,
+        isProgressExpanded: isProgressExpanded
       )
 
       messageContainerView.backgroundColor = .clear

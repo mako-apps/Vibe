@@ -7,7 +7,7 @@ private let resoloItalicRegex = try! NSRegularExpression(
 private let resoloStrikethroughRegex = try! NSRegularExpression(pattern: "~~([^~\n]+?)~~")
 private let resoloStrayBoldMarkerRegex = try! NSRegularExpression(pattern: "\\*\\*")
 private let resoloMarkdownLinkRegex = try! NSRegularExpression(
-  pattern: "\\[([^\\]]+)\\]\\((https?://[^)]+)\\)"
+  pattern: "\\[([^\\]]+)\\]\\(([^)]+)\\)"
 )
 private let resoloInlineCodeRegex = try! NSRegularExpression(pattern: "`([^`]+)`")
 
@@ -28,25 +28,37 @@ enum VibeAgentKitTextRenderer {
     lineHeight: CGFloat? = nil
   ) -> NSAttributedString {
     let isRtl = isRTL(text)
-    let paragraphStyle = NSMutableParagraphStyle()
-    paragraphStyle.alignment = isRtl ? .right : .natural
-    paragraphStyle.baseWritingDirection = isRtl ? .rightToLeft : .leftToRight
-    paragraphStyle.lineBreakMode = .byWordWrapping
+    let lineSpacing: CGFloat = {
+      guard let lineHeight else { return 0.0 }
+      return max(0.0, lineHeight - font.lineHeight)
+    }()
+    return applyLineMarkdown(
+      text,
+      font: font,
+      textColor: textColor,
+      isRtl: isRtl,
+      lineSpacing: lineSpacing
+    )
+  }
 
-    let baseAttributes: [NSAttributedString.Key: Any] = [
-      .font: font,
-      .foregroundColor: textColor,
-      .paragraphStyle: paragraphStyle,
-    ]
-
-    if let lineHeight {
-      paragraphStyle.minimumLineHeight = 0.0
-      paragraphStyle.maximumLineHeight = 0.0
-      paragraphStyle.lineSpacing = max(0.0, lineHeight - font.lineHeight)
-      paragraphStyle.paragraphSpacing = max(2.0, (lineHeight - font.lineHeight) * 0.24)
-    }
-
-    return applyLineMarkdown(text, baseAttributes: baseAttributes, font: font, textColor: textColor)
+  /// Shared paragraph style for a single rendered line/paragraph. `spacingBefore`
+  /// is the vertical gap above this paragraph (used to separate paragraphs and
+  /// give headings breathing room); `headIndent` hangs wrapped list-item text
+  /// under the marker.
+  private static func makeParagraphStyle(
+    isRtl: Bool,
+    lineSpacing: CGFloat,
+    spacingBefore: CGFloat,
+    headIndent: CGFloat = 0.0
+  ) -> NSMutableParagraphStyle {
+    let style = NSMutableParagraphStyle()
+    style.alignment = isRtl ? .right : .natural
+    style.baseWritingDirection = isRtl ? .rightToLeft : .leftToRight
+    style.lineBreakMode = .byWordWrapping
+    style.lineSpacing = lineSpacing
+    style.paragraphSpacingBefore = spacingBefore
+    style.headIndent = headIndent
+    return style
   }
 
   static func parseBlocks(_ text: String) -> [VibeAgentKitParsedBlock] {
@@ -127,43 +139,109 @@ enum VibeAgentKitTextRenderer {
 
   private static func applyLineMarkdown(
     _ text: String,
-    baseAttributes: [NSAttributedString.Key: Any],
     font: UIFont,
-    textColor: UIColor
+    textColor: UIColor,
+    isRtl: Bool,
+    lineSpacing: CGFloat
   ) -> NSAttributedString {
     let result = NSMutableAttributedString()
-    var insertedLine = false
 
-    for line in text.components(separatedBy: "\n") {
-      if isTableSeparatorLine(line) {
+    // Spacing scales with the body font so the structure reads the same at any
+    // text size. Blank lines in the source become inter-paragraph spacing rather
+    // than empty rendered lines (the markdown way), and headings get a larger gap
+    // above plus a small gap before their body.
+    let paragraphGap = max(6.0, (font.pointSize * 0.5).rounded())
+    let headingGap = max(10.0, (font.pointSize * 0.85).rounded())
+    let headingBodyGap = max(2.0, (font.pointSize * 0.18).rounded())
+    let listItemGap = max(2.0, (font.pointSize * 0.2).rounded())
+
+    var emittedContent = false
+    var pendingBlank = false
+    var previousWasHeading = false
+    var previousWasListItem = false
+
+    for rawLine in text.components(separatedBy: "\n") {
+      if isTableSeparatorLine(rawLine) {
         continue
       }
 
-      if insertedLine {
-        result.append(NSAttributedString(string: "\n", attributes: baseAttributes))
+      if rawLine.trimmingCharacters(in: .whitespaces).isEmpty {
+        if emittedContent { pendingBlank = true }
+        continue
       }
 
-      if let (level, headingText) = parseHeadingLine(line) {
+      let heading = parseHeadingLine(rawLine)
+      let bullet = heading == nil ? parseBulletListLine(rawLine) : nil
+      let numbered = (heading == nil && bullet == nil) ? parseNumberedListLine(rawLine) : nil
+      let isListItem = bullet != nil || numbered != nil
+
+      var spacingBefore: CGFloat = 0.0
+      if emittedContent {
+        if heading != nil {
+          spacingBefore = headingGap
+        } else if previousWasHeading {
+          spacingBefore = headingBodyGap
+        } else if pendingBlank {
+          spacingBefore = (isListItem && previousWasListItem) ? listItemGap : paragraphGap
+        } else if isListItem && previousWasListItem {
+          spacingBefore = listItemGap
+        }
+        result.append(NSAttributedString(string: "\n", attributes: [.font: font]))
+      }
+
+      if let (level, headingText) = heading {
         result.append(
           renderHeadingLine(
             headingText,
             level: level,
             baseFont: font,
             textColor: textColor,
-            baseAttributes: baseAttributes
+            isRtl: isRtl,
+            lineSpacing: lineSpacing,
+            spacingBefore: spacingBefore
           )
         )
-      } else if let listText = parseBulletListLine(line) {
-        result.append(renderBulletListItem(listText, baseAttributes: baseAttributes, font: font))
-      } else if let (prefix, listText) = parseNumberedListLine(line) {
+      } else if let listText = bullet {
         result.append(
-          renderNumberedListItem(prefix, text: listText, baseAttributes: baseAttributes, font: font)
+          renderBulletListItem(
+            listText,
+            font: font,
+            textColor: textColor,
+            isRtl: isRtl,
+            lineSpacing: lineSpacing,
+            spacingBefore: spacingBefore
+          )
+        )
+      } else if let (prefix, listText) = numbered {
+        result.append(
+          renderNumberedListItem(
+            prefix,
+            text: listText,
+            font: font,
+            textColor: textColor,
+            isRtl: isRtl,
+            lineSpacing: lineSpacing,
+            spacingBefore: spacingBefore
+          )
         )
       } else {
-        result.append(applyInlineFormatting(line, baseAttributes: baseAttributes, font: font))
+        let style = makeParagraphStyle(
+          isRtl: isRtl,
+          lineSpacing: lineSpacing,
+          spacingBefore: spacingBefore
+        )
+        let attributes: [NSAttributedString.Key: Any] = [
+          .font: font,
+          .foregroundColor: textColor,
+          .paragraphStyle: style,
+        ]
+        result.append(applyInlineFormatting(rawLine, baseAttributes: attributes, font: font))
       }
 
-      insertedLine = true
+      emittedContent = true
+      pendingBlank = false
+      previousWasHeading = heading != nil
+      previousWasListItem = isListItem
     }
 
     return result
@@ -196,22 +274,54 @@ enum VibeAgentKitTextRenderer {
 
   private static func renderBulletListItem(
     _ text: String,
-    baseAttributes: [NSAttributedString.Key: Any],
-    font: UIFont
+    font: UIFont,
+    textColor: UIColor,
+    isRtl: Bool,
+    lineSpacing: CGFloat,
+    spacingBefore: CGFloat
   ) -> NSAttributedString {
-    let result = NSMutableAttributedString(string: "• ", attributes: baseAttributes)
-    result.append(applyInlineFormatting(text, baseAttributes: baseAttributes, font: font))
+    let marker = "•  "
+    let indent = (marker as NSString).size(withAttributes: [.font: font]).width
+    let style = makeParagraphStyle(
+      isRtl: isRtl,
+      lineSpacing: lineSpacing,
+      spacingBefore: spacingBefore,
+      headIndent: indent
+    )
+    let base: [NSAttributedString.Key: Any] = [
+      .font: font,
+      .foregroundColor: textColor,
+      .paragraphStyle: style,
+    ]
+    let result = NSMutableAttributedString(string: marker, attributes: base)
+    result.append(applyInlineFormatting(text, baseAttributes: base, font: font))
     return result
   }
 
   private static func renderNumberedListItem(
     _ prefix: String,
     text: String,
-    baseAttributes: [NSAttributedString.Key: Any],
-    font: UIFont
+    font: UIFont,
+    textColor: UIColor,
+    isRtl: Bool,
+    lineSpacing: CGFloat,
+    spacingBefore: CGFloat
   ) -> NSAttributedString {
-    let result = NSMutableAttributedString(string: "\(prefix) ", attributes: baseAttributes)
-    result.append(applyInlineFormatting(text, baseAttributes: baseAttributes, font: font))
+    let marker = "\(prefix) "
+    let indent = (marker as NSString).size(withAttributes: [.font: font]).width
+    let style = makeParagraphStyle(
+      isRtl: isRtl,
+      lineSpacing: lineSpacing,
+      spacingBefore: spacingBefore,
+      headIndent: indent
+    )
+    let base: [NSAttributedString.Key: Any] = [
+      .font: font,
+      .foregroundColor: textColor,
+      .paragraphStyle: style,
+    ]
+    let result = NSMutableAttributedString(string: marker, attributes: base)
+    result.append(applyInlineFormatting(text, baseAttributes: base, font: font))
     return result
   }
 
@@ -242,7 +352,10 @@ enum VibeAgentKitTextRenderer {
       )
 
       let replacedRange = NSRange(location: match.range.location, length: (label as NSString).length)
-      if let url = URL(string: urlString) {
+      // Only scheme'd targets (http(s):, mailto:, …) become tappable links. Bare
+      // file-path references like (/Users/…/File.swift:120) render as clean label
+      // text instead of raw `[label](path)` markdown.
+      if let url = URL(string: urlString), let scheme = url.scheme, !scheme.isEmpty {
         mutable.addAttribute(.link, value: url, range: replacedRange)
         mutable.addAttribute(.foregroundColor, value: UIColor.systemBlue, range: replacedRange)
         mutable.addAttribute(
@@ -332,6 +445,8 @@ enum VibeAgentKitTextRenderer {
       }
       let codeText = String(mutable.string[range])
       var codeAttributes = baseAttributes
+      // Plain monospace, matching the Codex/native renderer (ChatAgentStreamingText)
+      // so inline code reads identically across both agent surfaces.
       codeAttributes[.font] = UIFont.monospacedSystemFont(ofSize: font.pointSize, weight: .regular)
       mutable.replaceCharacters(
         in: match.range,
@@ -424,9 +539,11 @@ enum VibeAgentKitTextRenderer {
     level: Int,
     baseFont: UIFont,
     textColor: UIColor,
-    baseAttributes: [NSAttributedString.Key: Any]
+    isRtl: Bool,
+    lineSpacing: CGFloat,
+    spacingBefore: CGFloat
   ) -> NSAttributedString {
-    let scale: CGFloat = level == 1 ? 1.15 : level == 2 ? 1.07 : 1.0
+    let scale: CGFloat = level <= 1 ? 1.28 : level == 2 ? 1.16 : level == 3 ? 1.06 : 1.0
     let headingFont: UIFont
     if let descriptor = baseFont.fontDescriptor.withSymbolicTraits(.traitBold) {
       headingFont = UIFont(descriptor: descriptor, size: round(baseFont.pointSize * scale))
@@ -434,18 +551,16 @@ enum VibeAgentKitTextRenderer {
       headingFont = UIFont.boldSystemFont(ofSize: round(baseFont.pointSize * scale))
     }
 
-    let paragraphStyle = NSMutableParagraphStyle()
-    if let existing = baseAttributes[.paragraphStyle] as? NSParagraphStyle {
-      paragraphStyle.setParagraphStyle(existing)
-    }
-    paragraphStyle.minimumLineHeight = 0
-    paragraphStyle.maximumLineHeight = 0
-
-    var attributes = baseAttributes
-    attributes[.font] = headingFont
-    attributes[.foregroundColor] = textColor
-    attributes[.paragraphStyle] = paragraphStyle
-    attributes.removeValue(forKey: .baselineOffset)
+    let style = makeParagraphStyle(
+      isRtl: isRtl,
+      lineSpacing: lineSpacing,
+      spacingBefore: spacingBefore
+    )
+    let attributes: [NSAttributedString.Key: Any] = [
+      .font: headingFont,
+      .foregroundColor: textColor,
+      .paragraphStyle: style,
+    ]
     // Apply inline formatting so **bold** markers inside headings are stripped/styled
     return applyInlineFormatting(text, baseAttributes: attributes, font: headingFont)
   }

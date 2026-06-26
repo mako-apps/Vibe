@@ -974,6 +974,64 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     maybeStartPendingSendTransition()
   }
 
+  // MARK: - Bridge-agent fresh surface
+  //
+  // A Claude/Codex DM is a scratch surface: it opens with NO prior history (that
+  // lives in the profile's "Chat History"), so the next message you send starts a
+  // clean thread. The first time the chat's loaded transcript arrives we snapshot
+  // its message ids and suppress them thereafter; newly sent/arriving messages and
+  // any live/streaming row always show. A fresh navigation builds a fresh
+  // ChatListView, so every open starts empty.
+  private var bridgeFreshSnapshotChatId: String?
+  private var bridgeFreshHiddenIds: Set<String> = []
+  // Messages the user sent from THIS surface — always visible, even if a send lands
+  // before the history snapshot is taken (so a new thread never vanishes).
+  private var bridgeFreshOwnSentIds: Set<String> = []
+
+  /// Register an outgoing message id so the fresh-surface filter never hides it.
+  func noteBridgeFreshOwnSentId(_ messageId: String) {
+    let id = messageId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !id.isEmpty else { return }
+    bridgeFreshOwnSentIds.insert(id)
+  }
+
+  private func bridgeRowIsLive(_ row: ChatListRow) -> Bool {
+    if row.isStreamingText { return true }
+    let status = (row.status ?? "").lowercased()
+    return status == "running" || status == "streaming"
+  }
+
+  /// Hides prior history for a bridge-agent DM so the surface opens empty. Non–
+  /// bridge chats pass through untouched.
+  private func bridgeFreshFiltered(_ parsed: [ChatListRow]) -> [ChatListRow] {
+    guard currentBridgeProvider != nil else { return parsed }
+    let chatKey = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    if bridgeFreshSnapshotChatId != chatKey {
+      // Snapshot only once the full transcript has loaded, so a partial first page
+      // doesn't leak the rest of the history in afterward.
+      let historyReady = chatKey.isEmpty || ChatEngine.shared.isChatHistoryLoaded(chatId: chatKey)
+      guard historyReady else { return parsed.filter { bridgeRowIsLive($0) } }
+      bridgeFreshSnapshotChatId = chatKey
+      bridgeFreshHiddenIds = Set(parsed.compactMap { $0.messageId })
+      NSLog(
+        "[ChatListView] bridgeFreshOpen chatId=%@ hiddenHistory=%d",
+        chatKey, bridgeFreshHiddenIds.count)
+    }
+    return parsed.filter { row in
+      let id = row.messageId ?? ""
+      // Session transcripts opened from profile history are ingested under this same
+      // DM chatId (keyed `bridge-<sessionId>-…`); never surface them in the fresh
+      // default chat.
+      if id.hasPrefix("bridge-") { return false }
+      if bridgeRowIsLive(row) { return true }
+      // Drop prior-history rows AND non-message rows (stale date separators); a new
+      // thread renders only the messages exchanged this session.
+      guard !id.isEmpty else { return false }
+      if bridgeFreshOwnSentIds.contains(id) { return true }
+      return !bridgeFreshHiddenIds.contains(id)
+    }
+  }
+
   func setRows(_ nextRows: [[String: Any]]) {
     let startedAt = ProcessInfo.processInfo.systemUptime
     sourceRowsPayload = nextRows
@@ -1003,7 +1061,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // Inbox mode: split raw agent event notifications out of the transcript and
     // report them to the host so they surface via the Inbox banner/view. Batched
     // summary rows stay in the main chat as the clean default agent view.
-    let parsed: [ChatListRow]
+    var parsed: [ChatListRow]
     let hasInboxOnlyRows = parsedAll.contains { $0.kind == .message && $0.hiddenFromTranscript }
     if eventInboxModeEnabled || hasInboxOnlyRows {
       var transcript: [ChatListRow] = []
@@ -1035,6 +1093,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       }
       parsed = parsedAll
     }
+    // Bridge-agent DMs open fresh: hide prior history (kept reachable via the
+    // profile's "Chat History"); newly sent/live rows still show.
+    parsed = bridgeFreshFiltered(parsed)
     if let targetMessageId = reactionDebugTargetMessageId, reactionDebugRemainingRowsChecks > 0 {
       reactionDebugRemainingRowsChecks -= 1
       if let row = parsed.first(where: { $0.messageId == targetMessageId }) {
@@ -4756,11 +4817,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       "agentBridgeCwd": repository.cwd,
       "agentBridgeWorkMode": AgentBridgeSelectionStore.selectedWorkMode().rawValue,
     ]
-    // Explicit resume: only attach a session id when the user picked "continue a
-    // session". Without it the bridge starts a fresh task for this message.
-    if let resume = AgentBridgeSelectionStore.selectedResumeSession(provider: provider) {
-      metadata["agentBridgeResumeSessionId"] = resume.id
-    }
+    metadata.merge(
+      AgentBridgeSelectionStore.selectedRunOptions(provider: provider).payload(provider: provider)
+    ) { _, new in new }
+    // The default chat is a fresh-thread surface: every send starts a NEW task on
+    // the computer (no resume). Continuing a past conversation happens explicitly
+    // from the profile's "Chat History", which carries its own resume id.
     return metadata
   }
 
@@ -4806,12 +4868,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let repositoryName = AgentBridgeSelectionStore.selectedRepository()?.name ?? "Pick repo"
     let mode = AgentBridgeSelectionStore.selectedWorkMode()
     let suffix = mode == .readOnly ? "" : " · \(mode.title)"
-    // Make a sticky resume selection visible so the user knows this message will
-    // continue a session rather than start a new task.
-    let resumeSuffix =
-      (currentBridgeProvider.flatMap { AgentBridgeSelectionStore.selectedResumeSession(provider: $0) } != nil)
-      ? " · ↺" : ""
-    inputBar?.setAgentControlTitle(repositoryName + suffix + resumeSuffix)
+    // The default chat always starts a fresh thread, so no resume indicator here —
+    // continuing a session is an explicit action from the profile's Chat History.
+    inputBar?.setAgentControlTitle(repositoryName + suffix)
   }
 
   @objc private func handleAgentBridgeSelectionChanged(_ notification: Notification) {
@@ -4838,6 +4897,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       text: text,
       mentionedAgentUsername: mentionedAgentUsername
     )
+    // A bridge-agent send opens this fresh thread — keep it visible regardless of
+    // history-snapshot timing (see bridgeFreshFiltered).
+    if !bridgeMetadata.isEmpty {
+      noteBridgeFreshOwnSentId(messageId)
+    }
 
     NSLog(
       "[ChatListView] handleNativeSend START — messageId: %@, text length: %lu, nativeSendEnabled: %@, replyTo: %@",
@@ -5329,10 +5393,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           from: self.agentConversationRows(forMessageId: messageId, sourceMessageId: sourceMessageId)
         )
       },
-      onSend: { [weak self] text in
+      onSend: { [weak self] text, _ in
         self?.handleNativeSend(text: text, mentionedAgentUsername: mentionedAgentUsername)
       }
     )
+    if let provider = agentRow.agentRuntime?.provider ?? mentionedAgentUsername ?? currentBridgeProvider {
+      vc.agentBridgeProvider = provider
+    }
 
     guard let owner = topPresentingViewController() else { return }
     if let nav = owner.navigationController {

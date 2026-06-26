@@ -1183,9 +1183,20 @@ final class AgentRuntimeFilesViewController: UITableViewController {
       patchTruncated: runtime.diff?.patchTruncated == true,
       appearance: appearance,
       chatId: chatId,
-      provider: provider ?? runtime.provider
+      provider: provider ?? runtime.provider,
+      presentedAsSheet: true
     )
-    navigationController?.pushViewController(controller, animated: true)
+    // The +/- patch opens as a bottom sheet (not another pushed page), so the file
+    // list stays underneath and the user can flick between files quickly.
+    let nav = UINavigationController(rootViewController: controller)
+    nav.modalPresentationStyle = .pageSheet
+    if let sheet = nav.sheetPresentationController {
+      sheet.detents = [.medium(), .large()]
+      sheet.prefersGrabberVisible = true
+      sheet.preferredCornerRadius = 20
+      sheet.prefersScrollingExpandsWhenScrolledToEdge = true
+    }
+    present(nav, animated: true)
   }
 }
 
@@ -1196,6 +1207,7 @@ private final class AgentRuntimePatchPreviewController: UIViewController {
   private let appearance: ChatListAppearance
   private let chatId: String?
   private let provider: String?
+  private let presentedAsSheet: Bool
   private let textView = UITextView()
 
   init(
@@ -1204,7 +1216,8 @@ private final class AgentRuntimePatchPreviewController: UIViewController {
     patchTruncated: Bool,
     appearance: ChatListAppearance,
     chatId: String? = nil,
-    provider: String? = nil
+    provider: String? = nil,
+    presentedAsSheet: Bool = false
   ) {
     self.file = file
     self.patch = patch
@@ -1212,6 +1225,7 @@ private final class AgentRuntimePatchPreviewController: UIViewController {
     self.appearance = appearance
     self.chatId = chatId
     self.provider = provider
+    self.presentedAsSheet = presentedAsSheet
     super.init(nibName: nil, bundle: nil)
   }
 
@@ -1244,6 +1258,13 @@ private final class AgentRuntimePatchPreviewController: UIViewController {
       )
     }
     navigationItem.rightBarButtonItems = rightItems
+    if presentedAsSheet {
+      navigationItem.leftBarButtonItem = UIBarButtonItem(
+        barButtonSystemItem: .close,
+        target: self,
+        action: #selector(handleDone)
+      )
+    }
 
     textView.translatesAutoresizingMaskIntoConstraints = false
     textView.isEditable = false
@@ -1261,7 +1282,7 @@ private final class AgentRuntimePatchPreviewController: UIViewController {
       textView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
     ])
 
-    textView.text = previewText()
+    textView.attributedText = attributedPreview()
   }
 
   private func previewText() -> String {
@@ -1277,6 +1298,50 @@ private final class AgentRuntimePatchPreviewController: UIViewController {
 
     No per-file patch was included in this payload.
     """
+  }
+
+  /// Renders the unified diff with GitHub-style coloring: added lines green,
+  /// removed lines red, hunk headers tinted, file metadata muted.
+  private func attributedPreview() -> NSAttributedString {
+    let font = UIFont.monospacedSystemFont(ofSize: 12.5, weight: .regular)
+    let baseColor: UIColor = appearance.isDark ? .white : .label
+    let muted: UIColor = appearance.isDark
+      ? UIColor.white.withAlphaComponent(0.45) : UIColor.label.withAlphaComponent(0.45)
+    let addText = UIColor.systemGreen
+    let delText = UIColor.systemRed
+    let addBg = UIColor.systemGreen.withAlphaComponent(appearance.isDark ? 0.16 : 0.12)
+    let delBg = UIColor.systemRed.withAlphaComponent(appearance.isDark ? 0.16 : 0.12)
+    let hunkColor: UIColor = appearance.isDark
+      ? UIColor.systemTeal : UIColor.systemBlue
+
+    let result = NSMutableAttributedString()
+    let lines = previewText().components(separatedBy: "\n")
+    for (idx, line) in lines.enumerated() {
+      let text = idx == lines.count - 1 ? line : line + "\n"
+      var attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: baseColor]
+      if line.hasPrefix("+++") || line.hasPrefix("---")
+        || line.hasPrefix("diff --git") || line.hasPrefix("index ")
+        || line.hasPrefix("new file") || line.hasPrefix("deleted file")
+        || line.hasPrefix("rename ") || line.hasPrefix("similarity ") {
+        attrs[.foregroundColor] = muted
+      } else if line.hasPrefix("@@") {
+        attrs[.foregroundColor] = hunkColor
+      } else if line.hasPrefix("+") {
+        attrs[.foregroundColor] = addText
+        attrs[.backgroundColor] = addBg
+      } else if line.hasPrefix("-") {
+        attrs[.foregroundColor] = delText
+        attrs[.backgroundColor] = delBg
+      } else if line.hasPrefix("[Patch truncated]") {
+        attrs[.foregroundColor] = muted
+      }
+      result.append(NSAttributedString(string: text, attributes: attrs))
+    }
+    return result
+  }
+
+  @objc private func handleDone() {
+    dismiss(animated: true)
   }
 
   private func diffChunk(for path: String, patch: String) -> String {
@@ -1319,6 +1384,10 @@ private final class AgentRuntimePatchPreviewController: UIViewController {
       appearance: appearance
     )
     if let nav = navigationController {
+      // Inside a sheet, expand to full height first so the file is readable.
+      if let sheet = nav.sheetPresentationController {
+        sheet.animateChanges { sheet.selectedDetentIdentifier = .large }
+      }
       nav.pushViewController(viewer, animated: true)
     } else {
       present(UINavigationController(rootViewController: viewer), animated: true)

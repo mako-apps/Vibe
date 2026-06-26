@@ -478,6 +478,23 @@ func vibeAgentKitColorWithAlpha(_ color: UIColor, _ alpha: CGFloat) -> UIColor {
   color.withAlphaComponent(alpha)
 }
 
+/// SF Symbol for a Claude/Codex tool-node kind — used by the loader line and the
+/// tool sheet rows so the feed reads with native icons instead of emoji.
+func vibeAgentKitToolSymbol(forKind kind: String?) -> String {
+  switch (kind ?? "").lowercased() {
+  case "bash", "run": return "terminal"
+  case "edit": return "pencil"
+  case "write", "create": return "square.and.pencil"
+  case "read": return "doc.text"
+  case "search", "grep", "glob": return "magnifyingglass"
+  case "web", "fetch": return "globe"
+  case "task": return "sparkles"
+  case "todo", "planning": return "checklist"
+  case "thinking": return "brain"
+  default: return "wrench.and.screwdriver"
+  }
+}
+
 // NOTE: Removed Resolo leftovers that the agent view never uses and that broke
 // the build: the `nativeRole`/`nativeMessage` round-trip extensions (the latter
 // referenced a dropped `VibeAgentKitProgressItem.from(_:)` overload that no longer

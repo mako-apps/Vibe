@@ -78,6 +78,13 @@ final class ChatPhoenixClient: NSObject, URLSessionWebSocketDelegate, URLSession
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
       }
       let task = session.webSocketTask(with: request)
+      // URLSessionWebSocketTask defaults maximumMessageSize to 1 MiB (1,048,576).
+      // Agent-bridge session histories (especially Claude, with many tool events)
+      // routinely exceed that as a single Phoenix frame, which the OS rejects with
+      // POSIX error 40 "Message too long" — tearing down the socket so the history
+      // never loads. Cowboy on the server side already sends unbounded frames, so
+      // raise the client receive ceiling to match (16 MiB).
+      task.maximumMessageSize = 16 * 1024 * 1024
       self.session = session
       self.task = task
       task.resume()

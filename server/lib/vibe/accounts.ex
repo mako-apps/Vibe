@@ -18,6 +18,13 @@ defmodule Vibe.Accounts do
   @phone_max_digits 15
   @reserved_usernames ["vibeagent", "claude", "codex"]
 
+  # SECURITY: Session token validity window — must match AuthController.
+  @token_validity_seconds 30 * 24 * 60 * 60
+  # Sliding-expiration cadence. While a token is actively used we push its expiry
+  # back to a full window, but only once the window has slipped by more than this,
+  # so an active session never lapses yet we touch the DB at most ~once/day/user.
+  @token_slide_after_seconds 24 * 60 * 60
+
   def get_user(id), do: Repo.get(User, id)
 
   def get_user_by_token(token) do
@@ -29,10 +36,35 @@ defmodule Vibe.Accounts do
       user ->
         # SECURITY: Check token expiration
         if token_valid?(user) do
-          {:ok, user}
+          {:ok, maybe_slide_token_expiry(user)}
         else
           {:error, :token_expired}
         end
+    end
+  end
+
+  # Push a still-valid token's expiry forward on use, so an actively-used app never
+  # gets logged out. With key-only login that lockout can mean permanent account
+  # loss, so keeping live sessions alive is the safer default. Writes only once the
+  # window has slipped past @token_slide_after_seconds (≈ one DB write/day/active
+  # user); a failed extension is non-fatal — the caller still gets the user.
+  defp maybe_slide_token_expiry(%User{token_expires_at: nil} = user), do: user
+  defp maybe_slide_token_expiry(%User{token_expires_at: expires_at} = user) do
+    now = DateTime.utc_now()
+    remaining = DateTime.diff(expires_at, now, :second)
+
+    if remaining < @token_validity_seconds - @token_slide_after_seconds do
+      new_expiry =
+        now
+        |> DateTime.add(@token_validity_seconds, :second)
+        |> DateTime.truncate(:second)
+
+      case update_user(user, %{"token_expires_at" => new_expiry}) do
+        {:ok, updated} -> updated
+        _ -> user
+      end
+    else
+      user
     end
   end
 

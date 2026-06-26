@@ -422,6 +422,11 @@ final class ChatEngine {
   // the detail requestId we pushed -> the target chat/provider. When the matching
   // "detail" reply lands we synthesize its transcript into chat rows.
   private var pendingBridgeSessionIngestByRequestId: [String: (chatId: String, provider: String)] = [:]
+  // While an agent session view is open, the bridge live-tails the transcript and
+  // re-pushes `history_result` (same requestId) as it grows. Unlike the one-shot
+  // map above, this stays registered for the chat so every re-push upserts the
+  // (now longer) transcript in place. Cleared when the chat channel closes.
+  private var liveBridgeSessionIngestByChatId: [String: (provider: String, sessionId: String, requestId: String)] = [:]
   private var nativeRecordingStateByChatId: [String: Bool] = [:]
   private var pinnedMessagesByChatId: [String: [[String: Any]]] = [:]
   private var pinnedFetchInFlightChatIds = Set<String>()
@@ -1268,6 +1273,8 @@ final class ChatEngine {
           nativeJoinedChatIds.remove(chatId)
           peerTypingUserIdsByChatId.removeValue(forKey: chatId)
           agentProgressByChatId.removeValue(forKey: chatId)
+          // Stop accepting bridge live-tail re-pushes for this closed view.
+          liveBridgeSessionIngestByChatId.removeValue(forKey: chatId)
           if let client = phoenixClient {
             client.leave(topic: chatTopic(for: chatId))
           }
@@ -1791,6 +1798,9 @@ final class ChatEngine {
     if (result["accepted"] as? Bool) == true {
       syncOnQueue {
         pendingBridgeSessionIngestByRequestId[requestId] = (chatId: chatId, provider: provider)
+        // Stay subscribed: the bridge re-pushes this requestId as the transcript
+        // grows, and each re-push upserts new turns in place (live tail).
+        liveBridgeSessionIngestByChatId[chatId] = (provider: provider, sessionId: sessionId, requestId: requestId)
       }
     }
     return result
@@ -1826,8 +1836,17 @@ final class ChatEngine {
       let role = (normalizedString(item["role"]) ?? "").lowercased()
       let text = (normalizedString(item["text"]) ?? "")
         .trimmingCharacters(in: .whitespacesAndNewlines)
-      guard !text.isEmpty else { continue }
-      let messageId = "bridge-\(sessionId)-\(index)"
+      // A turn that has only run tools so far (no assistant prose yet) arrives as
+      // an empty-text assistant message hosting the progress feed — keep it so the
+      // live action stream still renders; otherwise drop empty placeholders.
+      let hasProgressNodes = (item["progressNodes"] as? [[String: Any]])?.isEmpty == false
+      guard !text.isEmpty || hasProgressNodes else { continue }
+      // Stable id from the transcript's own message identity (claude uuid /
+      // codex response-id) so the bridge's live re-pushes upsert in place even
+      // as the capped window slides; fall back to array position.
+      let stableKey =
+        normalizedString(item["uid"]) ?? normalizedString(item["id"]) ?? "\(index)"
+      let messageId = "bridge-\(sessionId)-\(stableKey)"
       let timestampMs = baseTs + Int64(index)
 
       var synthetic: [String: Any] = [
@@ -1846,10 +1865,38 @@ final class ChatEngine {
         synthetic["agentName"] = agentName
         synthetic["fromId"] = Self.agentUserId
         synthetic["agentUserId"] = Self.agentUserId
-        synthetic["metadata"] = [
+        var meta: [String: Any] = [
           "agentWorkerVia": "bridge",
           "bridgeSessionId": sessionId,
         ]
+        // Carry the per-message E2E runtime card forward so the ingested history
+        // shows the same "N files changed +X −Y" card as the live path. The blob
+        // stays opaque here; ChatListRow decrypts it with the phone-held key.
+        if let enc = normalizedString(item["agentRuntimeEnc"] ?? item["agent_runtime_enc"]) {
+          meta["agentRuntimeEnc"] = enc
+        }
+        if let canRevert = item["canRevert"] ?? item["can_revert"] {
+          meta["canRevert"] = canRevert
+        }
+        // Live-tail per-action detail: the message sub-kind ("action"/"summary")
+        // and its E2E-encrypted structured tool detail (command+output/todos).
+        if let aKind = normalizedString(item["kind"]) {
+          meta["agentMsgKind"] = aKind
+        }
+        if let aEnc = normalizedString(item["agentActionEnc"] ?? item["agent_action_enc"]) {
+          meta["agentActionEnc"] = aEnc
+        }
+        // A turn's tool actions, folded into this assistant message as native
+        // progress nodes (clean plaintext labels) + an E2E-encrypted detail array
+        // (command OUTPUT, todo contents). Renders as the compact shimmer feed +
+        // tap-to-open tool sheet — same path as the live stream.
+        if let nodes = item["progressNodes"] ?? item["progress_nodes"] {
+          meta["progressNodes"] = nodes
+        }
+        if let actionsEnc = normalizedString(item["agentActionsEnc"] ?? item["agent_actions_enc"]) {
+          meta["agentActionsEnc"] = actionsEnc
+        }
+        synthetic["metadata"] = meta
       }
       _ = applyNativeIncomingMessageEventLocked(chatId: chatId, payload: synthetic)
       lastMessageId = messageId
@@ -4738,14 +4785,24 @@ final class ChatEngine {
           let requestId = self.normalizedString(frame.payload["requestId"]) ?? ""
           // If this detail reply was requested to be opened into the chat, render
           // its transcript as bubbles (the profile no longer shows a transcript).
-          if mode == "detail",
-            let target = self.pendingBridgeSessionIngestByRequestId.removeValue(forKey: requestId)
-          {
-            self.ingestAgentBridgeSessionLocked(
-              chatId: chatId,
-              provider: provider.isEmpty ? target.provider : provider,
-              payload: frame.payload
-            )
+          if mode == "detail" {
+            var ingestProvider: String?
+            if let target = self.pendingBridgeSessionIngestByRequestId.removeValue(forKey: requestId) {
+              ingestProvider = provider.isEmpty ? target.provider : provider
+            } else if let live = self.liveBridgeSessionIngestByChatId[chatId],
+              live.requestId == requestId
+            {
+              // Live-tail re-push from the bridge's transcript watcher — keep the
+              // subscription registered and upsert the (now longer) transcript.
+              ingestProvider = provider.isEmpty ? live.provider : provider
+            }
+            if let ingestProvider {
+              self.ingestAgentBridgeSessionLocked(
+                chatId: chatId,
+                provider: ingestProvider,
+                payload: frame.payload
+              )
+            }
           }
           self.postChangeLocked(
             reason: "agentBridgeHistory",
@@ -4928,6 +4985,25 @@ final class ChatEngine {
       }
 
       guard frame.topic == self.nativeUserTopic else { return }
+      if frame.event == "new_message" {
+        // A new message landed in one of this user's chats (from a peer, or mirrored
+        // from the user's OWN other device). Devices only join a chat's realtime
+        // topic while that chat screen is open, so this user-topic ping is how the
+        // chat LIST and any other-device surface learn to refresh without waiting for
+        // a re-open/pull. Content for an open chat still arrives over the chat topic;
+        // this just nudges observers (home list debounces a refresh; the agent view
+        // re-reads its provider).
+        let signalChatId = self.normalizedString(
+          frame.payload["chatId"] ?? frame.payload["chat_id"])
+        self.postChangeLocked(
+          reason: "remoteNewMessage",
+          userInfo: [
+            "chatId": signalChatId ?? "",
+            "state": self.statusSnapshotLocked(),
+          ]
+        )
+        return
+      }
       if self.handleUserCallEventLocked(event: frame.event, payload: frame.payload) {
         let snapshot = self.statusSnapshotLocked()
         self.postChangeLocked(
@@ -6321,6 +6397,9 @@ final class ChatEngine {
             trigger,
             String(statusCode)
           )
+          if statusCode == 401 {
+            Task { await AppSessionGuard.shared.recover(reason: "pinned-http-401") }
+          }
           self.appendJournalLocked(
             event: "native-pinned-load-error",
             payload: [

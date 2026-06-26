@@ -572,6 +572,9 @@ final class AppProfileController: ObservableObject {
         "AppProfileController refresh success durationMs=\(durationMs) hasImage=\(fetchedProfile.profileImage != nil)"
       )
     } catch {
+      if let serviceError = error as? AppProfileServiceError, case .http(401, _) = serviceError {
+        Task { await AppSessionGuard.shared.recover(reason: "profile-refresh") }
+      }
       errorMessage = error.localizedDescription
       if profile == nil {
         seedFromCurrentSession()
@@ -896,5 +899,96 @@ private extension String {
   var nilIfBlank: String? {
     let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
     return trimmed.isEmpty ? nil : trimmed
+  }
+}
+
+/// Central recovery for an expired or rejected session token.
+///
+/// When the server stops accepting our `login_token` — a 401 "Token expired" /
+/// "Invalid token" on REST, or a refused WebSocket handshake — every data path
+/// fails at once. Without recovery the app spins forever retrying the dead token
+/// (chats, profile, pinned, and the socket all 401 with the same token).
+///
+/// Instead we silently re-mint a token from the `loginSecret` kept in the Keychain
+/// (the same credential the user signed in with), restore the session, and
+/// reconnect — no interaction needed. This pairs with server-side sliding
+/// expiration (which keeps actively-used tokens alive) and is the safety net for
+/// cold cases: reinstall, a long idle gap, or a token rotated by signing in on
+/// another device.
+///
+/// It deliberately NEVER signs the user out: with key-only login, proactively
+/// clearing a session over a transient hiccup (a 5xx on `/login`, or a Keychain
+/// read that fails because the device is briefly locked) could strand a user who no
+/// longer has their secret key. When a refresh can't succeed we just stay put and
+/// retry later — cached content remains, and the user can still act manually.
+///
+/// Every 401 site may call `recover(reason:)` freely: concurrent and rapid-repeat
+/// calls collapse into a single in-flight refresh, and a short throttle stops a
+/// burst of already-in-flight stale 401s from hammering `/login`.
+actor AppSessionGuard {
+  static let shared = AppSessionGuard()
+
+  /// Posted on the main thread after the session token is successfully refreshed,
+  /// so polling UI can re-fetch immediately instead of waiting for the next tick.
+  static let didRefreshNotification = Notification.Name("Vibe.AppSessionGuard.didRefresh")
+
+  private static let loginSecretKey = "loginSecret"
+
+  private var isRecovering = false
+  private var lastAttemptAt: Date?
+  /// Minimum spacing between refresh attempts — covers both the post-success window
+  /// (stale 401s already on the wire) and back-to-back transient failures.
+  private let minAttemptInterval: TimeInterval = 4
+
+  private init() {}
+
+  func recover(reason: String) async {
+    if isRecovering { return }
+    let now = Date()
+    if let last = lastAttemptAt, now.timeIntervalSince(last) < minAttemptInterval { return }
+    lastAttemptAt = now
+    isRecovering = true
+    defer { isRecovering = false }
+
+    guard let config = AppSessionConfig.current else { return }
+
+    let storedSecret = SecureKeyStore.shared.retrieveSecret(key: Self.loginSecretKey)?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let secret = storedSecret, !secret.isEmpty else {
+      // No credential available right now (never stored, or a transient Keychain
+      // read while the device is locked). Don't tear anything down — retry later.
+      NSLog("[AppSessionGuard] recover(%@): no loginSecret available, will retry later", reason)
+      return
+    }
+
+    NSLog("[AppSessionGuard] recover(%@): refreshing session token", reason)
+    do {
+      let result = try await NativeAuthService.signIn(
+        secret: secret,
+        apiBaseURLString: config.apiBaseURLString,
+        transportMode: config.transportMode
+      )
+      AppSessionConfig.store(result.config)
+      // store() clears Keychain secrets — put the login secret back so a later
+      // recovery still has it.
+      _ = SecureKeyStore.shared.storeSecret(key: Self.loginSecretKey, value: secret)
+      NSLog("[AppSessionGuard] recover(%@): session refreshed, reconnecting", reason)
+      await MainActor.run {
+        // The socket signature includes the auth token, so connect() tears down the
+        // stale socket and rebuilds it with the fresh token; REST paths read the
+        // new token from AppSessionConfig on their next call.
+        _ = ChatEngine.shared.connect()
+        NotificationCenter.default.post(name: Self.didRefreshNotification, object: nil)
+      }
+    } catch {
+      // Could be transient (network drop, a 5xx on /login) or a genuinely dead
+      // secret. We can't tell the two apart safely, and signing the user out over a
+      // transient failure risks account loss — so never do that here. Just log and
+      // let the next 401 retry; if the secret really is dead the user still has
+      // cached content and can sign out/in manually.
+      NSLog(
+        "[AppSessionGuard] recover(%@): refresh failed (%@), will retry later",
+        reason, error.localizedDescription)
+    }
   }
 }

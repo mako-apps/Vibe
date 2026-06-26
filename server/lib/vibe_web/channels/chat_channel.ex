@@ -81,6 +81,19 @@ defmodule VibeWeb.ChatChannel do
         # BROADCAST IMMEDIATELY for instant message delivery
         broadcast!(socket, "message", broadcast_payload)
 
+        # Mirror a lightweight ping to the sender's OWN other devices. The chat-topic
+        # broadcast above only reaches devices that currently have THIS chat open, so
+        # a message typed on the phone never reached the same user's laptop sitting on
+        # the chat list. This `new_message` on the sender's user topic lets those other
+        # devices refresh in real time (no push — it's the sender's own device).
+        VibeWeb.Endpoint.broadcast!("user:#{user_id}", "new_message", %{
+          chat_id: chat_id,
+          from_id: user_id,
+          message_id: data["id"],
+          timestamp: data["timestamp"],
+          self_echo: true
+        })
+
         # Check for @vibe agent mention and dispatch to group agent
         maybe_dispatch_agent(chat_id, data, user_id)
 
@@ -533,24 +546,38 @@ defmodule VibeWeb.ChatChannel do
 
   defp spawn_team_worker_dispatches(chat_id, workers, dispatch_text, data, requester_user_id) do
     team_run_id = data["id"] || Ecto.UUID.generate()
+    bridge_metadata = bridge_task_metadata(data)
 
-    workers
-    |> Enum.with_index()
-    |> Enum.each(fn {worker, index} ->
-      spawn_local_worker_dispatch(
+    first_worker =
+      LocalAgentWorker.register_bridge_team_run(
         chat_id,
-        worker,
+        team_run_id,
+        workers,
         dispatch_text,
-        data,
-        "reserved_worker_team",
         requester_user_id,
-        skip_rate_limit: index > 0,
-        note_user_turn: false,
-        note_team_user_turn: index == 0,
-        team_run_id: team_run_id,
-        team_workers: workers
+        data["id"],
+        bridge_metadata
       )
-    end)
+
+    case first_worker do
+      nil ->
+        :ok
+
+      worker ->
+        spawn_local_worker_dispatch(
+          chat_id,
+          worker,
+          dispatch_text,
+          data,
+          "reserved_worker_team",
+          requester_user_id,
+          bridge_metadata: bridge_metadata,
+          note_user_turn: false,
+          note_team_user_turn: true,
+          team_run_id: team_run_id,
+          team_workers: workers
+        )
+    end
   end
 
   defp spawn_local_worker_dispatch(
@@ -567,9 +594,12 @@ defmodule VibeWeb.ChatChannel do
     note_team_user_turn? = Keyword.get(opts, :note_team_user_turn, false)
     team_run_id = Keyword.get(opts, :team_run_id)
     team_workers = Keyword.get(opts, :team_workers, [])
+    bridge_metadata = Keyword.get(opts, :bridge_metadata) || bridge_task_metadata(data)
 
     cond do
       not LocalAgentWorker.user_allowed?(requester_user_id) ->
+        maybe_clear_team_run(chat_id, team_run_id)
+
         Logger.warning(
           "[ChatChannel] local worker blocked: user=#{requester_user_id} not in VIBE_AGENT_WORKER_ALLOWED_USERS"
         )
@@ -577,6 +607,8 @@ defmodule VibeWeb.ChatChannel do
         :ok
 
       not skip_rate_limit and not LocalAgentWorker.allow_request?(requester_user_id) ->
+        maybe_clear_team_run(chat_id, team_run_id)
+
         LocalAgentWorker.post_notice(
           worker,
           chat_id,
@@ -623,7 +655,7 @@ defmodule VibeWeb.ChatChannel do
             "requesterUserId" => requester_user_id
           }
           |> Map.merge(local_worker_team_metadata(worker, team_run_id, team_workers))
-          |> Map.merge(bridge_task_metadata(data))
+          |> Map.merge(bridge_metadata)
 
         case AgentBridge.dispatch_task(requester_user_id, task_payload) do
           :ok ->
@@ -656,6 +688,8 @@ defmodule VibeWeb.ChatChannel do
             )
 
           {:error, :offline} ->
+            maybe_clear_team_run(chat_id, team_run_id)
+
             # Raced with a disconnect — re-lock to the connect prompt.
             stop_agent_activity(chat_id, worker.agent_user_id)
 
@@ -685,6 +719,7 @@ defmodule VibeWeb.ChatChannel do
                    dispatch_text,
                    reply_to_id: data["id"],
                    requester_user_id: requester_user_id,
+                   bridge_metadata: bridge_metadata,
                    progress_callback: fn event ->
                      broadcast_agent_activity(
                        chat_id,
@@ -735,6 +770,11 @@ defmodule VibeWeb.ChatChannel do
         )
     end
   end
+
+  defp maybe_clear_team_run(_chat_id, nil), do: :ok
+
+  defp maybe_clear_team_run(chat_id, team_run_id),
+    do: LocalAgentWorker.clear_bridge_team_run(chat_id, team_run_id)
 
   defp local_worker_team_metadata(_worker, nil, _team_workers), do: %{}
 
@@ -861,6 +901,24 @@ defmodule VibeWeb.ChatChannel do
       "workMode",
       metadata["agentBridgeWorkMode"] || metadata["agent_bridge_work_mode"] ||
         data["agentBridgeWorkMode"]
+    )
+    |> put_optional_string(
+      "model",
+      metadata["agentBridgeModel"] || metadata["agent_bridge_model"] || data["agentBridgeModel"]
+    )
+    |> put_optional_string(
+      "intelligence",
+      metadata["agentBridgeIntelligence"] || metadata["agent_bridge_intelligence"] ||
+        data["agentBridgeIntelligence"]
+    )
+    |> put_optional_string(
+      "speed",
+      metadata["agentBridgeSpeed"] || metadata["agent_bridge_speed"] || data["agentBridgeSpeed"]
+    )
+    |> put_optional_string(
+      "reasoningEffort",
+      metadata["agentBridgeReasoningEffort"] || metadata["agent_bridge_reasoning_effort"] ||
+        data["agentBridgeReasoningEffort"]
     )
     # Explicit resume target chosen on the phone ("continue a session"). When absent,
     # the bridge starts a fresh session (new task per message) — it no longer

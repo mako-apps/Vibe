@@ -410,10 +410,23 @@ struct ChatListRow {
   let isStreamingText: Bool
   let agentProgressNodes: [AgentProgressNode]
   let agentActionSourceId: String?
+  // The bridge session this message resumes (stamped by the agent-history composer
+  // when sending a follow-up). Durable across devices, so the agent runtime view can
+  // fold a resumed turn into the right session no matter which device sent it.
+  let agentBridgeResumeSessionId: String?
   let agentActionSourceText: String?
   let agentRegeneratePrompt: String?
   let agentCard: AgentCard?
   let agentRuntime: AgentRuntimeSummary?
+  // Bridge live-tail per-action detail: the message sub-kind ("action"/"summary")
+  // and the E2E-encrypted structured tool detail (command+output, todos, diff
+  // counts). Kept opaque here; decrypted at render time with the phone-held key.
+  let agentMsgKind: String?
+  let agentActionEnc: String?
+  // A turn's tool actions sealed as one E2E-encrypted detail array (joined to the
+  // plaintext `agentProgressNodes` by node id) — powers the tool sheet's command
+  // output / todo contents without leaking them to the server.
+  let agentActionsEnc: String?
   let relatedMessageIds: [String]
   let relatedMessagesTitle: String?
   let relatedMessagesSubtitle: String?
@@ -638,10 +651,14 @@ struct ChatListRow {
       isStreamingText = false
       agentProgressNodes = []
       agentActionSourceId = nil
+      agentBridgeResumeSessionId = nil
       agentActionSourceText = nil
       agentRegeneratePrompt = nil
       agentCard = nil
       agentRuntime = nil
+      agentMsgKind = nil
+      agentActionEnc = nil
+      agentActionsEnc = nil
       relatedMessageIds = []
       relatedMessagesTitle = nil
       relatedMessagesSubtitle = nil
@@ -851,6 +868,10 @@ struct ChatListRow {
       in: [metadata, message],
       keys: ["sourceMessageId", "actionSourceId", "agentActionSourceId", "replyToId", "reply_to_id"]
     ) ?? replyToId
+    agentBridgeResumeSessionId = firstNonEmptyString(
+      in: [metadata, message],
+      keys: ["agentBridgeResumeSessionId", "agent_bridge_resume_session_id"]
+    )
     agentActionSourceText = firstNonEmptyString(
       in: [metadata, message],
       keys: ["sourceText", "actionSourceText"]
@@ -885,6 +906,9 @@ struct ChatListRow {
     agentRuntime =
       parseAgentRuntimeSummary(rawAgentRuntimeForLog)
       ?? parseAgentRuntimeSummary(decryptedRuntime)
+    agentMsgKind = firstNonEmptyString(in: [metadata, message], keys: ["agentMsgKind", "agent_msg_kind"])
+    agentActionEnc = firstNonEmptyString(in: [metadata, message], keys: ["agentActionEnc", "agent_action_enc"])
+    agentActionsEnc = firstNonEmptyString(in: [metadata, message], keys: ["agentActionsEnc", "agent_actions_enc"])
     relatedMessageIds = uniqueStrings(
       parseStringArray(metadata?["relatedMessageIds"])
         + parseStringArray(metadata?["related_message_ids"])
@@ -1234,6 +1258,9 @@ func chatListRowContentEqual(_ lhs: ChatListRow, _ rhs: ChatListRow) -> Bool {
     && lhs.agentRegeneratePrompt == rhs.agentRegeneratePrompt
     && lhs.agentCard == rhs.agentCard
     && lhs.agentRuntime == rhs.agentRuntime
+    && lhs.agentMsgKind == rhs.agentMsgKind
+    && lhs.agentActionEnc == rhs.agentActionEnc
+    && lhs.agentActionsEnc == rhs.agentActionsEnc
     && lhs.relatedMessageIds == rhs.relatedMessageIds
     && lhs.relatedMessagesTitle == rhs.relatedMessagesTitle
     && lhs.relatedMessagesSubtitle == rhs.relatedMessagesSubtitle

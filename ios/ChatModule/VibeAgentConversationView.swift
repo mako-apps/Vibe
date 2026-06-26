@@ -35,7 +35,12 @@ enum VibeAgentKitMap {
   /// One enriched tool node -> a progress item. The compact label
   /// (`chatAgentNodeCompactLabel`, shared with the chat-cell formatter) gives the
   /// Claude-Code-style "Read ChatEngine.swift", "Edit chat.ex  +12 −3" reading.
-  static func progressItem(from node: ChatListRow.AgentProgressNode) -> VibeAgentKitProgressItem {
+  /// `detail` is the decrypted per-action blob (command OUTPUT, todo contents);
+  /// it becomes the row's expandable body in the tool sheet.
+  static func progressItem(
+    from node: ChatListRow.AgentProgressNode,
+    detail: [String: Any]? = nil
+  ) -> VibeAgentKitProgressItem {
     VibeAgentKitProgressItem(
       label: chatAgentNodeCompactLabel(node),
       badges: [],
@@ -43,7 +48,7 @@ enum VibeAgentKitMap {
       recipient: nil,
       platform: nil,
       format: nil,
-      messageContent: nil,
+      messageContent: actionDetailBody(kind: node.kind, detail: detail),
       messagePreview: nil,
       voiceUrl: nil,
       voiceDuration: nil,
@@ -57,15 +62,60 @@ enum VibeAgentKitMap {
     )
   }
 
+  /// Decrypt a turn's sealed action array into `nodeId -> detail`. Server-opaque:
+  /// without the phone-held key this is empty and rows show labels only.
+  private static func actionDetailMap(for row: ChatListRow) -> [String: [String: Any]] {
+    guard let enc = row.agentActionsEnc,
+      let obj = AgentRuntimeCrypto.decrypt(enc),
+      let actions = obj["actions"] as? [[String: Any]]
+    else { return [:] }
+    var map: [String: [String: Any]] = [:]
+    for action in actions {
+      if let id = action["id"] as? String, !id.isEmpty { map[id] = action }
+    }
+    return map
+  }
+
+  /// The decrypted detail rendered as the tool sheet row's expandable body: a
+  /// command's OUTPUT, a todo checklist, search hits. Returns nil to leave the
+  /// row as just its label (edits/reads need no body).
+  private static func actionDetailBody(kind: String?, detail: [String: Any]?) -> String? {
+    guard let detail else { return nil }
+    let output = ((detail["output"] as? String) ?? "")
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    let clipped = output.count > 1400 ? String(output.prefix(1400)) + "\n… (truncated)" : output
+    switch kind ?? (detail["kind"] as? String) ?? "" {
+    case "todo":
+      let todos = detail["todos"] as? [[String: Any]] ?? []
+      guard !todos.isEmpty else { return nil }
+      return todos.map { todo -> String in
+        let content = (todo["content"] as? String) ?? ""
+        switch (todo["status"] as? String) ?? "" {
+        case "completed": return "✓ \(content)"
+        case "in_progress": return "→ \(content)"
+        default: return "• \(content)"
+        }
+      }.joined(separator: "\n")
+    case "bash", "search", "web", "task", "tool", "thinking":
+      return clipped.isEmpty ? nil : clipped
+    default:
+      return nil
+    }
+  }
+
   /// A chat row -> a render message. User rows render as right-side bubbles; agent
   /// rows render as the assistant body (streaming text + progress).
   static func chatMessage(from row: ChatListRow) -> VibeAgentKitChatMessage {
     let isUser = row.isMe && !row.isAgentMessage
-    let body = row.isAgentMessage ? (row.plainContent ?? row.text) : row.text
-    // Only depth-0 enriched nodes belong in the flat tool feed (the built-in Vibe
-    // AI nested tree keeps its own minimalist behavior in the chat list).
+    let defaultBody = row.isAgentMessage ? (row.plainContent ?? row.text) : row.text
+    // /compact summaries render as a distinct mid-chat block (not a user bubble).
+    let body = (row.isAgentMessage ? agentSummaryBody(for: row) : nil) ?? defaultBody
+    // A turn's tool actions render natively: each depth-0 node becomes a progress
+    // item (compact shimmer line + tap-to-open tool sheet). The decrypted detail
+    // (command OUTPUT, todo contents) becomes each row's expandable body.
+    let detailMap: [String: [String: Any]] = row.isAgentMessage ? actionDetailMap(for: row) : [:]
     let items = row.isAgentMessage
-      ? row.agentProgressNodes.filter { $0.depth == 0 }.map(progressItem(from:))
+      ? row.agentProgressNodes.filter { $0.depth == 0 }.map { progressItem(from: $0, detail: detailMap[$0.id]) }
       : []
     if row.isAgentMessage {
       NSLog(
@@ -87,15 +137,30 @@ enum VibeAgentKitMap {
     )
   }
 
+  /// A /compact summary → a distinct, emoji-free "what happened" block rendered
+  /// mid-chat (not a user bubble). Returns nil for ordinary agent messages.
+  private static func agentSummaryBody(for row: ChatListRow) -> String? {
+    guard row.agentMsgKind == "summary" else { return nil }
+    let full = (row.plainContent ?? row.text).trimmingCharacters(in: .whitespacesAndNewlines)
+    let preview = String(full.prefix(400)).trimmingCharacters(in: .whitespacesAndNewlines)
+    let ellipsis = full.count > 400 ? "…" : ""
+    return "## Summary so far\n\n\(preview)\(ellipsis)"
+  }
+
   /// Build the seed message list for a task. `rows` should already be the slice of
   /// chat rows that belong to this task (the prompt + the agent reply, and any
   /// prior turns when resumed).
   static func messages(from rows: [ChatListRow]) -> [VibeAgentKitChatMessage] {
     rows.compactMap { row in
       guard case .message = row.kind else { return nil }
-      // Skip empty system/placeholder rows.
+      // Skip empty system/placeholder rows — but KEEP a freshly-started streaming
+      // row even before it has text/steps/runtime, so the live "Working…" loader
+      // appears the instant a run begins instead of the view looking like nothing
+      // is happening.
       let m = chatMessage(from: row)
-      if m.text.isEmpty && m.progressItems.isEmpty && m.runtime == nil { return nil }
+      if m.text.isEmpty && m.progressItems.isEmpty && m.runtime == nil && !m.isStreaming {
+        return nil
+      }
       return m
     }
   }
@@ -119,7 +184,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   private let inputPlaceholder: String
   private let regeneratePrompt: String
   private let messagesProvider: (() -> [VibeAgentKitChatMessage])?
-  private let onSend: ((String) -> Void)?
+  private let onSend: ((String, AgentBridgeRunOptions) -> Void)?
   private var tableBottomConstraint: NSLayoutConstraint?
   private var composerBottomConstraint: NSLayoutConstraint?
   private var composerHeightConstraint: NSLayoutConstraint?
@@ -130,10 +195,16 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   /// Stashed so we know which message's items to present.
   private var progressItemsByMessageId: [String: [VibeAgentKitProgressItem]] = [:]
 
+  /// Message ids whose "Worked · N steps" line is currently expanded inline.
+  /// Persists across reloads so a live update doesn't collapse what the user opened.
+  private var expandedProgressMessageIds: Set<String> = []
+
   /// Chat + provider context (history surface) so a runtime card can route a
   /// full-file-open request to the user's bridge. Nil in the live agent view.
   var agentBridgeChatId: String?
-  var agentBridgeProvider: String?
+  var agentBridgeProvider: String? {
+    didSet { composerView.provider = agentBridgeProvider ?? "codex" }
+  }
 
   init(
     title: String,
@@ -142,7 +213,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     regeneratePrompt: String = "",
     inputPlaceholder: String? = nil,
     messagesProvider: (() -> [VibeAgentKitChatMessage])? = nil,
-    onSend: ((String) -> Void)? = nil
+    onSend: ((String, AgentBridgeRunOptions) -> Void)? = nil
   ) {
     self.messages = messages
     self.runtimeTitle = title
@@ -175,6 +246,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
 
   override func viewDidLoad() {
     super.viewDidLoad()
+    edgesForExtendedLayout = []
     appearance = VibeAgentKitMap.appearance(for: traitCollection)
     view.backgroundColor = appearance.background
     configureNavigationTitle()
@@ -194,8 +266,9 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     composerView.translatesAutoresizingMaskIntoConstraints = false
     composerView.applyAppearance(appearance)
     composerView.placeholder = inputPlaceholder
-    composerView.onSend = { [weak self] text in
-      self?.onSend?(text)
+    composerView.provider = agentBridgeProvider ?? "codex"
+    composerView.onSend = { [weak self] text, options in
+      self?.onSend?(text, options)
     }
     composerView.onHeightChanged = { [weak self] height in
       self?.updateComposerHeight(height, animated: true)
@@ -215,7 +288,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     self.composerHeightConstraint = composerHeightConstraint
 
     NSLayoutConstraint.activate([
-      tableView.topAnchor.constraint(equalTo: view.topAnchor),
+      tableView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
       tableView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       tableView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
       tableBottomConstraint,
@@ -320,6 +393,15 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     subtitleLabel.textColor = appearance.textSecondary
     liveDotView.backgroundColor = UIColor.systemGreen
     liveLabel.textColor = UIColor.systemGreen
+    let navAppearance = UINavigationBarAppearance()
+    navAppearance.configureWithOpaqueBackground()
+    navAppearance.backgroundColor = appearance.background
+    navAppearance.shadowColor = .clear
+    navAppearance.titleTextAttributes = [.foregroundColor: appearance.text]
+    navigationController?.navigationBar.standardAppearance = navAppearance
+    navigationController?.navigationBar.scrollEdgeAppearance = navAppearance
+    navigationController?.navigationBar.compactAppearance = navAppearance
+    navigationController?.navigationBar.isTranslucent = false
   }
 
   private func updateNavigationLiveState() {
@@ -395,24 +477,44 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     let message = messages[indexPath.row]
     cell.backgroundColor = .clear
     cell.selectionStyle = .none
-    cell.onProgressTap = { [weak self] in self?.presentProgress(for: message.id) }
+    cell.onProgressTap = { [weak self] in self?.toggleProgress(for: message.id) }
     cell.onRuntimeTap = { [weak self] runtime in self?.presentRuntime(runtime) }
     cell.configure(
       message: message,
       appearance: appearance,
       regeneratePrompt: regeneratePrompt,
-      showsActions: false
+      showsActions: false,
+      isProgressExpanded: expandedProgressMessageIds.contains(message.id)
     )
     return cell
   }
 
-  // MARK: Progress sheet
+  // MARK: Progress (inline expand)
 
-  private func presentProgress(for messageId: String) {
-    guard let items = progressItemsByMessageId[messageId], !items.isEmpty else { return }
-    progressSheet.isHidden = false
-    progressSheet.onDismiss = { [weak self] in self?.progressSheet.isHidden = true }
-    progressSheet.present(items: items, animated: true)
+  // Tapping "Worked · N steps" reveals/hides that turn's step list inline, in the
+  // bubble (Claude-Code style). The expanded set persists across reloads, and the
+  // height change animates via a no-op batch update after reconfiguring the cell.
+  private func toggleProgress(for messageId: String) {
+    if expandedProgressMessageIds.contains(messageId) {
+      expandedProgressMessageIds.remove(messageId)
+    } else {
+      expandedProgressMessageIds.insert(messageId)
+    }
+    guard let row = messages.firstIndex(where: { $0.id == messageId }) else { return }
+    let indexPath = IndexPath(row: row, section: 0)
+    // Reconfigure the visible cell in place (cheap, idempotent), then let the
+    // table animate to its new height. If the cell isn't on screen the set is
+    // already updated, so cellForRowAt renders it expanded when it scrolls in.
+    if let cell = tableView.cellForRow(at: indexPath) as? VibeAgentKitMessageCell {
+      cell.configure(
+        message: messages[row],
+        appearance: appearance,
+        regeneratePrompt: regeneratePrompt,
+        showsActions: false,
+        isProgressExpanded: expandedProgressMessageIds.contains(messageId)
+      )
+    }
+    tableView.performBatchUpdates(nil, completion: nil)
   }
 
   private func presentRuntime(_ runtime: ChatListRow.AgentRuntimeSummary) {
@@ -446,37 +548,37 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   }
 
   private func scrollToBottom(animated: Bool) {
-    guard messages.count > 0 else { return }
-    let last = IndexPath(row: messages.count - 1, section: 0)
+    let rows = tableView.numberOfRows(inSection: 0)
+    guard rows > 0 else { return }
+    let last = IndexPath(row: rows - 1, section: 0)
     tableView.scrollToRow(at: last, at: .bottom, animated: animated)
   }
 }
 
 private final class VibeAgentRuntimeComposerView: UIView, UITextViewDelegate {
-  var onSend: ((String) -> Void)? {
+  var onSend: ((String, AgentBridgeRunOptions) -> Void)? {
     didSet { updateSendState() }
   }
   var onHeightChanged: ((CGFloat) -> Void)?
   var placeholder: String = "Ask Codex" {
     didSet { placeholderLabel.text = placeholder }
   }
+  var provider: String = "codex" {
+    didSet { rebuildOptionsMenu() }
+  }
 
   private let blurView = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
   private let overlayView = UIView()
   private let textView = UITextView()
   private let placeholderLabel = UILabel()
-  private let topControlsView = UIView()
-  private let controlsLabel = UILabel()
   private let plusButton = UIButton(type: .system)
+  private let optionsButton = UIButton(type: .system)
   private let micButton = UIButton(type: .system)
   private let sendButton = UIButton(type: .system)
   private var appearance: VibeAgentKitChatAppearance = .fallback
-  private var expanded = false
-  private var textTopCompactConstraint: NSLayoutConstraint?
-  private var textTopExpandedConstraint: NSLayoutConstraint?
 
   var preferredHeight: CGFloat {
-    expanded ? 126 : 64
+    64
   }
 
   override init(frame: CGRect) {
@@ -493,8 +595,7 @@ private final class VibeAgentRuntimeComposerView: UIView, UITextViewDelegate {
     overlayView.backgroundColor = appearance.surface.withAlphaComponent(appearance.isDark ? 0.82 : 0.92)
     textView.textColor = appearance.text
     placeholderLabel.textColor = appearance.textTertiary
-    controlsLabel.textColor = appearance.textSecondary
-    [plusButton, micButton].forEach { button in
+    [plusButton, optionsButton, micButton].forEach { button in
       button.tintColor = appearance.text
     }
     updateSendState()
@@ -511,16 +612,6 @@ private final class VibeAgentRuntimeComposerView: UIView, UITextViewDelegate {
 
     overlayView.translatesAutoresizingMaskIntoConstraints = false
     addSubview(overlayView)
-
-    topControlsView.translatesAutoresizingMaskIntoConstraints = false
-    topControlsView.alpha = 0
-    addSubview(topControlsView)
-
-    controlsLabel.text = "5.5  Extra High"
-    controlsLabel.font = UIFont.systemFont(ofSize: 15, weight: .medium)
-    controlsLabel.textAlignment = .center
-    controlsLabel.translatesAutoresizingMaskIntoConstraints = false
-    topControlsView.addSubview(controlsLabel)
 
     textView.translatesAutoresizingMaskIntoConstraints = false
     textView.backgroundColor = .clear
@@ -539,19 +630,18 @@ private final class VibeAgentRuntimeComposerView: UIView, UITextViewDelegate {
     addSubview(placeholderLabel)
 
     configureIconButton(plusButton, systemName: "plus")
+    configureIconButton(optionsButton, systemName: "exclamationmark.shield")
+    optionsButton.showsMenuAsPrimaryAction = true
+    optionsButton.changesSelectionAsPrimaryAction = false
+    optionsButton.accessibilityLabel = "Agent options"
+    rebuildOptionsMenu()
     configureIconButton(micButton, systemName: "mic")
     configureIconButton(sendButton, systemName: "arrow.up")
     sendButton.backgroundColor = UIColor.white.withAlphaComponent(0.20)
     sendButton.layer.cornerRadius = 21
     sendButton.layer.cornerCurve = .continuous
     sendButton.addTarget(self, action: #selector(handleSend), for: .touchUpInside)
-    [plusButton, micButton, sendButton].forEach(addSubview)
-
-    let textTopCompactConstraint = textView.topAnchor.constraint(equalTo: topAnchor)
-    let textTopExpandedConstraint = textView.topAnchor.constraint(equalTo: topControlsView.bottomAnchor)
-    textTopExpandedConstraint.isActive = false
-    self.textTopCompactConstraint = textTopCompactConstraint
-    self.textTopExpandedConstraint = textTopExpandedConstraint
+    [plusButton, optionsButton, micButton, sendButton].forEach(addSubview)
 
     NSLayoutConstraint.activate([
       blurView.topAnchor.constraint(equalTo: topAnchor),
@@ -563,17 +653,15 @@ private final class VibeAgentRuntimeComposerView: UIView, UITextViewDelegate {
       overlayView.trailingAnchor.constraint(equalTo: trailingAnchor),
       overlayView.bottomAnchor.constraint(equalTo: bottomAnchor),
 
-      topControlsView.topAnchor.constraint(equalTo: topAnchor, constant: 10),
-      topControlsView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 54),
-      topControlsView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -54),
-      topControlsView.heightAnchor.constraint(equalToConstant: 28),
-      controlsLabel.centerXAnchor.constraint(equalTo: topControlsView.centerXAnchor),
-      controlsLabel.centerYAnchor.constraint(equalTo: topControlsView.centerYAnchor),
-
       plusButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 13),
       plusButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
       plusButton.widthAnchor.constraint(equalToConstant: 42),
       plusButton.heightAnchor.constraint(equalToConstant: 42),
+
+      optionsButton.leadingAnchor.constraint(equalTo: plusButton.trailingAnchor, constant: 2),
+      optionsButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
+      optionsButton.widthAnchor.constraint(equalToConstant: 38),
+      optionsButton.heightAnchor.constraint(equalToConstant: 42),
 
       sendButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
       sendButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
@@ -585,9 +673,9 @@ private final class VibeAgentRuntimeComposerView: UIView, UITextViewDelegate {
       micButton.widthAnchor.constraint(equalToConstant: 38),
       micButton.heightAnchor.constraint(equalToConstant: 42),
 
-      textView.leadingAnchor.constraint(equalTo: plusButton.trailingAnchor, constant: 10),
+      textView.leadingAnchor.constraint(equalTo: optionsButton.trailingAnchor, constant: 8),
       textView.trailingAnchor.constraint(equalTo: micButton.leadingAnchor, constant: -8),
-      textTopCompactConstraint,
+      textView.topAnchor.constraint(equalTo: topAnchor),
       textView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
 
       placeholderLabel.leadingAnchor.constraint(equalTo: textView.leadingAnchor),
@@ -608,41 +696,21 @@ private final class VibeAgentRuntimeComposerView: UIView, UITextViewDelegate {
   @objc private func handleSend() {
     let text = textView.text.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !text.isEmpty, onSend != nil else { return }
+    let options = AgentBridgeSelectionStore.selectedRunOptions(provider: provider)
     textView.text = ""
     textViewDidChange(textView)
-    onSend?(text)
+    onSend?(text, options)
   }
 
   func textViewDidBeginEditing(_ textView: UITextView) {
-    setExpanded(true, animated: true)
   }
 
   func textViewDidEndEditing(_ textView: UITextView) {
-    if textView.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-      setExpanded(false, animated: true)
-    }
   }
 
   func textViewDidChange(_ textView: UITextView) {
     placeholderLabel.isHidden = !textView.text.isEmpty
     updateSendState()
-  }
-
-  private func setExpanded(_ value: Bool, animated: Bool) {
-    guard expanded != value else { return }
-    expanded = value
-    textTopCompactConstraint?.isActive = !value
-    textTopExpandedConstraint?.isActive = value
-    onHeightChanged?(preferredHeight)
-    let changes = {
-      self.topControlsView.alpha = value ? 1 : 0
-      self.layoutIfNeeded()
-    }
-    if animated {
-      UIView.animate(withDuration: 0.2, delay: 0, options: [.curveEaseOut, .beginFromCurrentState], animations: changes)
-    } else {
-      changes()
-    }
   }
 
   private func updateSendState() {
@@ -651,5 +719,64 @@ private final class VibeAgentRuntimeComposerView: UIView, UITextViewDelegate {
     sendButton.isEnabled = enabled
     sendButton.tintColor = enabled ? appearance.background : appearance.textSecondary
     sendButton.backgroundColor = enabled ? appearance.text : appearance.textSecondary.withAlphaComponent(0.24)
+  }
+
+  private func rebuildOptionsMenu() {
+    let selectedOptions = AgentBridgeSelectionStore.selectedRunOptions(provider: provider)
+    let intelligenceActions = AgentBridgeIntelligenceLevel.allCases.map { level in
+      UIAction(
+        title: level.title,
+        state: selectedOptions.intelligence == level ? .on : .off
+      ) { [weak self] _ in
+        AgentBridgeSelectionStore.setIntelligence(level)
+        self?.rebuildOptionsMenu()
+      }
+    }
+
+    let modelActions = modelChoices(for: provider).map { choice in
+      UIAction(
+        title: choice.title,
+        subtitle: choice.subtitle,
+        state: choice.value == selectedOptions.model ? .on : .off
+      ) { [weak self] _ in
+        AgentBridgeSelectionStore.setModel(provider: self?.provider ?? "codex", model: choice.value)
+        self?.rebuildOptionsMenu()
+      }
+    }
+
+    let speedActions = AgentBridgeSpeedMode.allCases.map { speed in
+      UIAction(
+        title: speed.title,
+        state: selectedOptions.speed == speed ? .on : .off
+      ) { [weak self] _ in
+        AgentBridgeSelectionStore.setSpeed(speed)
+        self?.rebuildOptionsMenu()
+      }
+    }
+
+    optionsButton.menu = UIMenu(
+      title: "Intelligence",
+      children: intelligenceActions + [
+        UIMenu(title: "Model", subtitle: selectedOptions.model ?? "Provider default", children: modelActions),
+        UIMenu(title: "Speed", subtitle: selectedOptions.speed.title, children: speedActions),
+      ]
+    )
+  }
+
+  private func modelChoices(for provider: String) -> [(title: String, subtitle: String?, value: String?)] {
+    switch provider.lowercased() {
+    case "claude":
+      return [
+        ("Provider default", nil, nil),
+        ("Sonnet", "Claude Code alias", "sonnet"),
+        ("Opus", "Claude Code alias", "opus"),
+      ]
+    default:
+      return [
+        ("Provider default", nil, nil),
+        ("GPT-5.5", nil, "gpt-5.5"),
+        ("GPT-5.3 Codex", nil, "gpt-5.3-codex"),
+      ]
+    }
   }
 }
