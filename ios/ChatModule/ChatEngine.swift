@@ -1823,6 +1823,40 @@ final class ChatEngine {
     return String(text[marker.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
   }
 
+  private static let transcriptISO8601MsFormatter: ISO8601DateFormatter = {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return formatter
+  }()
+  private static let transcriptISO8601Formatter = ISO8601DateFormatter()
+
+  /// Parse a transcript entry's timestamp — an ISO-8601 string from the CLI session
+  /// JSONL (Claude/Codex), or an epoch number — into epoch milliseconds for row
+  /// ordering. Returns nil when there's nothing parseable (caller falls back to
+  /// ingest order).
+  static func parseTranscriptTimestampMs(_ raw: Any?) -> Int64? {
+    func fromNumber(_ value: Double) -> Int64? {
+      guard value > 0 else { return nil }
+      // Heuristic: values below ~1e11 are epoch seconds, above are already ms.
+      return value < 100_000_000_000 ? Int64(value * 1000.0) : Int64(value)
+    }
+    if let value = raw as? Int64 { return fromNumber(Double(value)) }
+    if let value = raw as? Int { return fromNumber(Double(value)) }
+    if let value = raw as? Double { return fromNumber(value) }
+    guard
+      let string = (raw as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !string.isEmpty
+    else { return nil }
+    if let numeric = Double(string) { return fromNumber(numeric) }
+    if let date = transcriptISO8601MsFormatter.date(from: string) {
+      return Int64(date.timeIntervalSince1970 * 1000.0)
+    }
+    if let date = transcriptISO8601Formatter.date(from: string) {
+      return Int64(date.timeIntervalSince1970 * 1000.0)
+    }
+    return nil
+  }
+
   private func ingestAgentBridgeSessionLocked(
     chatId: String,
     provider: String,
@@ -1844,6 +1878,7 @@ final class ChatEngine {
     let baseTs = Int64(nowMs())
     let me = currentUserIdLocked()
     var lastMessageId: String?
+    var ingestedIds = Set<String>()
 
     for (index, item) in rawMessages.enumerated() {
       let role = (normalizedString(item["role"]) ?? "").lowercased()
@@ -1860,7 +1895,13 @@ final class ChatEngine {
       let stableKey =
         normalizedString(item["uid"]) ?? normalizedString(item["id"]) ?? "\(index)"
       let messageId = "bridge-\(sessionId)-\(stableKey)"
-      let timestampMs = baseTs + Int64(index)
+      // Order by the transcript's REAL timestamp so a turn's "Worked" card sits
+      // right after its prompt. Before, every live re-ingest re-stamped all rows to
+      // `now` (baseTs), so the worked card tied with the user's own follow-up (also
+      // ~now) and the sort tiebreaker placed it in the wrong spot. Fall back to
+      // ingest order only when the entry carries no parseable timestamp.
+      let timestampMs =
+        Self.parseTranscriptTimestampMs(item["ts"] ?? item["timestamp"]) ?? (baseTs + Int64(index))
 
       var synthetic: [String: Any] = [
         "id": messageId,
@@ -1886,6 +1927,14 @@ final class ChatEngine {
           "agentWorkerVia": "bridge",
           "bridgeSessionId": sessionId,
         ]
+        // The bridge flags the in-flight turn `running` while its task is live. Render
+        // that turn as the streaming "working" state (shimmer + step feed), NOT a
+        // collapsed "Worked · N steps" card — the card only belongs to a finished turn
+        // (once the run's result lands the flag clears and it collapses).
+        let isRunningTranscriptItem = (item["running"] as? Bool) == true
+        if isRunningTranscriptItem {
+          meta["isStreaming"] = true
+        }
         // Carry the per-message E2E runtime card forward so the ingested history
         // shows the same "N files changed +X −Y" card as the live path. The blob
         // stays opaque here; ChatListRow decrypts it with the phone-held key.
@@ -1908,7 +1957,19 @@ final class ChatEngine {
         // (command OUTPUT, todo contents). Renders as the compact shimmer feed +
         // tap-to-open tool sheet — same path as the live stream.
         if let nodes = item["progressNodes"] ?? item["progress_nodes"] {
-          meta["progressNodes"] = nodes
+          if isRunningTranscriptItem, var mutableNodes = nodes as? [[String: Any]] {
+            for index in mutableNodes.indices.reversed() {
+              let rawStatus = normalizedString(mutableNodes[index]["status"])?.lowercased() ?? ""
+              if ["failed", "error", "cancelled", "canceled", "stopped"].contains(rawStatus) {
+                continue
+              }
+              mutableNodes[index]["status"] = "running"
+              break
+            }
+            meta["progressNodes"] = mutableNodes
+          } else {
+            meta["progressNodes"] = nodes
+          }
         }
         if let actionsEnc = normalizedString(item["agentActionsEnc"] ?? item["agent_actions_enc"]) {
           meta["agentActionsEnc"] = actionsEnc
@@ -1916,7 +1977,47 @@ final class ChatEngine {
         synthetic["metadata"] = meta
       }
       _ = applyNativeIncomingMessageEventLocked(chatId: chatId, payload: synthetic)
+      ingestedIds.insert(messageId)
       lastMessageId = messageId
+    }
+
+    // Clear rows left over from a PRIOR transcript shape. A previously-ingested row
+    // for THIS session that the current transcript no longer contains (e.g. the old
+    // one-bubble-per-assistant-text layout, now folded into a single per-turn
+    // message) would otherwise linger as an orphan bubble. Tombstone every cached
+    // `bridge-<sessionId>-…` row — across BOTH the live store and persisted history —
+    // that wasn't just re-ingested. Skip this when the bridge sent a windowed tail
+    // (`truncated`): then "absent" only means "older than the window", not "stale",
+    // and deleting those would erase valid scrollback.
+    let windowTruncated = (session["truncated"] as? Bool) ?? false
+    if !windowTruncated {
+      let sessionPrefix = "bridge-\(sessionId)-"
+      var cachedSessionIds = Set<String>()
+      for key in (liveMessageRowsByChat[chatId] ?? [:]).keys where key.hasPrefix(sessionPrefix) {
+        cachedSessionIds.insert(key)
+      }
+      for row in historyRowsByChat[chatId] ?? [] {
+        if let mid = messageId(fromRow: row), mid.hasPrefix(sessionPrefix) {
+          cachedSessionIds.insert(mid)
+        }
+      }
+      let alreadyDeleted = deletedMessageIdsByChat[chatId] ?? []
+      let staleIds = cachedSessionIds.subtracting(ingestedIds).subtracting(alreadyDeleted)
+      if !staleIds.isEmpty {
+        var perChat = liveMessageRowsByChat[chatId] ?? [:]
+        var deleted = deletedMessageIdsByChat[chatId] ?? Set<String>()
+        for staleId in staleIds {
+          perChat.removeValue(forKey: staleId)
+          deleted.insert(staleId)
+        }
+        if perChat.isEmpty {
+          liveMessageRowsByChat.removeValue(forKey: chatId)
+        } else {
+          liveMessageRowsByChat[chatId] = perChat
+        }
+        deletedMessageIdsByChat[chatId] = deleted
+        storeMergedChatHistoryIfLoadedLocked(chatId: chatId)
+      }
     }
 
     if let lastMessageId {
@@ -4084,6 +4185,7 @@ final class ChatEngine {
     )
 
     if status == "done" || status == "error" || status == "stopped" {
+      clearAgentProgressLocked(chatId: chatId, status: status)
       // Keep the accumulated text but stop the live indicator. The persisted
       // message (or its absence, on failure) takes over from here.
       mutateLiveMessagePayloadLocked(chatId: chatId, messageId: streamId) { message in
@@ -4098,6 +4200,17 @@ final class ChatEngine {
       )
       return
     }
+
+    let streamProgressLabel =
+      progressNodes.reversed().compactMap { node in
+        normalizedString(node["label"] ?? node["title"])
+      }.first ?? "Running task"
+    setAgentProgressLocked(
+      chatId: chatId,
+      label: streamProgressLabel,
+      tool: nil,
+      status: "running"
+    )
 
     // Stable timestamp so the bubble holds its position as text grows.
     var perChat = agentStreamTimestampsByChat[chatId] ?? [:]

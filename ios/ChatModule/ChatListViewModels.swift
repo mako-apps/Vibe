@@ -80,6 +80,9 @@ struct ChatListRow {
     var target: String? = nil
     var added: Int? = nil
     var removed: Int? = nil
+    // Read-tool line range (plaintext) so the row preview reads "Read foo.swift (12–48)".
+    var start: Int? = nil
+    var end: Int? = nil
   }
 
   struct AgentRuntimeCommand: Equatable {
@@ -1292,7 +1295,9 @@ private func parseAgentProgressNodes(_ raw: Any?) -> [ChatListRow.AgentProgressN
       kind: parseNonEmptyString(item["kind"])?.lowercased(),
       target: parseNonEmptyString(item["target"]),
       added: parseLong(item["added"]).map { Int($0) },
-      removed: parseLong(item["removed"]).map { Int($0) }
+      removed: parseLong(item["removed"]).map { Int($0) },
+      start: parseLong(item["start"]).map { Int($0) },
+      end: parseLong(item["end"]).map { Int($0) }
     )
   }
 }

@@ -303,7 +303,7 @@ private final class VibeAgentKitAgentOrbView: UIView {
 private final class VibeAgentKitShimmerLabelView: UIView {
   private let baseLabel = UILabel()
   private let shimmerLabel = UILabel()
-  private let shimmerFont = UIFont.systemFont(ofSize: 13.0, weight: .medium)
+  private let shimmerFont = UIFont.systemFont(ofSize: 14.5, weight: .medium)
   private let shimmerBandWidth: CGFloat = 190.0
   private let shimmerTravelPadding: CGFloat = 180.0
   private var isAnimating = false
@@ -481,6 +481,14 @@ final class VibeAgentKitAgentLoaderView: UIControl {
   private var currentActivityIconKind: VibeAgentKitChatVectorIcon.Kind?
   private var isStreamingActive = false
 
+  // Live "Working · M:SS" elapsed clock. The start instant is owned by the host
+  // (keyed by message id) and passed in on every reconfigure, so the clock counts
+  // up continuously and NEVER restarts as new chunks stream in. The 1s ticker is
+  // internal so the time advances even between host reconfigures.
+  private var elapsedStartDate: Date?
+  private var elapsedTimer: Timer?
+  private var isExpandedState = false
+
   var progressItems: [VibeAgentKitProgressItem] = []
   var onTap: (() -> Void)?
 
@@ -515,6 +523,7 @@ final class VibeAgentKitAgentLoaderView: UIControl {
     super.didMoveToWindow()
     if window == nil {
       stopAnimating()
+      stopElapsedTimer()
     }
   }
 
@@ -549,31 +558,39 @@ final class VibeAgentKitAgentLoaderView: UIControl {
     text: String,
     isStreaming: Bool,
     progressItems: [VibeAgentKitProgressItem],
-    isExpanded: Bool = false
+    isExpanded: Bool = false,
+    streamingStartDate: Date? = nil
   ) {
     self.progressItems = progressItems
     updateActivityIcon(for: progressItems.last)
 
-    let resolvedText = resolvedLoaderText(text)
-
-    if resolvedText != currentText {
-      currentText = resolvedText
-      shimmerLabel.setText(resolvedText)
-      invalidateIntrinsicContentSize()
-      setNeedsLayout()
+    // Live turn: the header is a steady "Working · M:SS" clock that ticks up from
+    // the turn's start and never resets (the model just does its job underneath).
+    // Finished turn: the passed "Worked for X · N steps" summary.
+    if isStreaming, let start = streamingStartDate {
+      elapsedStartDate = start
+      startElapsedTimer()
+      setDisplayedText(workingClockText())
+    } else {
+      stopElapsedTimer()
+      setDisplayedText(resolvedLoaderText(text))
     }
 
     isUserInteractionEnabled = onTap != nil
     accessibilityTraits = onTap == nil ? [] : [.button]
 
     // Disclosure only on a finished, tappable summary ("Worked · N steps"); never
-    // while the live shimmer is running. Points down once the step list is
-    // expanded inline, right once collapsed.
+    // while the live shimmer is running. A single chevron that ROTATES — pointing
+    // right when collapsed, down (rotated 90°) when expanded — so the open/closed
+    // direction reads at a glance.
     disclosureIconView.isHidden = isStreaming || onTap == nil || progressItems.isEmpty
-    disclosureIconView.image = UIImage(systemName: isExpanded ? "chevron.down" : "chevron.right")
+    disclosureIconView.image = UIImage(systemName: "chevron.right")?
+      .withRenderingMode(.alwaysTemplate)
     disclosureIconView.tintColor = appearance.isDark
       ? UIColor(white: 1.0, alpha: 0.5)
       : vibeAgentKitColorWithAlpha(appearance.text, 0.42)
+    applyDisclosureRotation(expanded: isExpanded, animated: isExpanded != isExpandedState)
+    isExpandedState = isExpanded
 
     if isStreaming && !isStreamingActive {
       isStreamingActive = true
@@ -582,6 +599,43 @@ final class VibeAgentKitAgentLoaderView: UIControl {
       isStreamingActive = false
       stopAnimating()
     }
+  }
+
+  private func setDisplayedText(_ resolved: String) {
+    guard resolved != currentText else { return }
+    currentText = resolved
+    shimmerLabel.setText(resolved)
+    invalidateIntrinsicContentSize()
+    setNeedsLayout()
+  }
+
+  private func applyDisclosureRotation(expanded: Bool, animated: Bool) {
+    let target = expanded ? CGAffineTransform(rotationAngle: .pi / 2.0) : .identity
+    guard animated else { disclosureIconView.transform = target; return }
+    UIView.animate(withDuration: 0.22, delay: 0.0, options: [.beginFromCurrentState]) {
+      self.disclosureIconView.transform = target
+    }
+  }
+
+  private func workingClockText() -> String {
+    guard let start = elapsedStartDate else { return "Working" }
+    let secs = max(0, Int(Date().timeIntervalSince(start)))
+    return "Working · \(secs / 60):" + String(format: "%02d", secs % 60)
+  }
+
+  private func startElapsedTimer() {
+    guard elapsedTimer == nil else { return }
+    let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+      guard let self, self.isStreamingActive || self.elapsedStartDate != nil else { return }
+      self.setDisplayedText(self.workingClockText())
+    }
+    RunLoop.main.add(timer, forMode: .common)
+    elapsedTimer = timer
+  }
+
+  private func stopElapsedTimer() {
+    elapsedTimer?.invalidate()
+    elapsedTimer = nil
   }
 
   private func resolvedLoaderText(_ text: String) -> String {

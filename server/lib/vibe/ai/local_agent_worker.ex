@@ -1063,7 +1063,10 @@ defmodule Vibe.AI.LocalAgentWorker do
             # body above the feed, so emitting it as nodes too would double it up. The
             # interleaved text nodes land only on the final persisted message, where
             # the body collapses to the summary and the narration moves into the card.
-            "progressNodes" => Enum.reject(extracted.progress_nodes, &(&1["kind"] == "text")),
+            "progressNodes" =>
+              extracted.progress_nodes
+              |> Enum.reject(&(&1["kind"] == "text"))
+              |> mark_latest_progress_node_running(),
             "toolEvents" => extracted.tool_events,
             "status" => "running"
           }
@@ -1092,6 +1095,28 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   def bridge_stream_update(_provider, _chat_id, _output, _stream_id, _metadata), do: :ok
+
+  defp mark_latest_progress_node_running(nodes) when is_list(nodes) do
+    {marked, _done} =
+      nodes
+      |> Enum.reverse()
+      |> Enum.map_reduce(false, fn node, done ->
+        cond do
+          done ->
+            {node, done}
+
+          node["status"] in ["failed", "error", "cancelled", "canceled", "stopped"] ->
+            {node, done}
+
+          true ->
+            {Map.put(node, "status", "running"), true}
+        end
+      end)
+
+    Enum.reverse(marked)
+  end
+
+  defp mark_latest_progress_node_running(nodes), do: nodes
 
   @doc "Mark a live stream finished. The final persisted message carries the content."
   def finish_stream(provider, chat_id, stream_id) do

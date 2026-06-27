@@ -751,13 +751,30 @@ function codexApprovalPolicy(task) {
   }
 }
 
+function normalizeModel(provider, value) {
+  const raw = value == null ? "" : String(value).trim();
+  if (!raw) return null;
+  const normalized = raw.toLowerCase().replace(/_/g, "-");
+  if (provider === "claude") {
+    if (normalized.includes("haiku")) return "haiku";
+    if (normalized.includes("sonnet")) return "sonnet";
+    if (normalized.includes("opus")) return "opus";
+    return raw;
+  }
+  if (normalized === "gpt-5.3-codex" || normalized === "gpt-5-3-codex") return "gpt-5.5";
+  if (["gpt-5.5", "gpt-5.5-pro", "gpt-5.4", "gpt-5.2", "gpt-5"].includes(normalized)) {
+    return normalized;
+  }
+  return raw;
+}
+
 function modelFor(provider, chatId, task) {
   const requested = task && (task.model || task.agentModel || task.agentBridgeModel);
-  if (requested && String(requested).trim()) return String(requested).trim();
+  if (requested && String(requested).trim()) return normalizeModel(provider, requested);
   const stored = modelBySession.get(sessionKey(provider, chatId));
-  if (stored && String(stored).trim()) return String(stored).trim();
+  if (stored && String(stored).trim()) return normalizeModel(provider, stored);
   const envModel = provider === "claude" ? process.env.VIBE_CLAUDE_MODEL : process.env.VIBE_CODEX_MODEL;
-  return envModel && String(envModel).trim() ? String(envModel).trim() : null;
+  return envModel && String(envModel).trim() ? normalizeModel(provider, envModel) : null;
 }
 
 function intelligenceFor(task) {
@@ -1330,8 +1347,9 @@ function bridgeCommandOutput(provider, chatId, task, repo, command) {
         modelBySession.delete(key);
         return `${provider} model reset to provider default for this chat.`;
       }
-      modelBySession.set(key, next);
-      return `${provider} model set to ${next} for this chat.`;
+      const normalizedModel = normalizeModel(provider, next);
+      modelBySession.set(key, normalizedModel);
+      return `${provider} model set to ${normalizedModel} for this chat.`;
     }
     case "compact":
       sessionByChat.delete(chatId);
@@ -1370,7 +1388,7 @@ function runBridgeCommand(channel, task, repo, beforeGit, command) {
     repoName: repo.name,
     cwd: repo.cwd || repo.path,
     workMode: workModeFor(task),
-    model: modelFor(provider, chatId, task) || "provider default",
+    model: modelFor(provider, chatId, task) || null,
     stage: "bridge_command",
     command: command.raw,
     line: JSON.stringify({
@@ -1472,7 +1490,8 @@ function runtimePayload({
     },
   };
 
-  payload.model = metadata.model || modelFor(provider, task && task.chatId, task) || "provider default";
+  const resolvedPayloadModel = metadata.model || modelFor(provider, task && task.chatId, task);
+  if (resolvedPayloadModel) payload.model = resolvedPayloadModel;
   if (metadata.permissionMode) payload.permissionMode = metadata.permissionMode;
   if (metadata.sessionId) payload.sessionId = metadata.sessionId;
   if (metadata.threadId) payload.threadId = metadata.threadId;
@@ -2039,7 +2058,7 @@ function runTask(channel, task) {
     repoName: repo.name,
     cwd,
     workMode: workModeFor(task),
-    model: modelFor(provider, chatId, task) || "provider default",
+    model: modelFor(provider, chatId, task) || null,
     intelligence: intelligenceFor(task),
     speed: speedFor(task),
     reasoningEffort: reasoningEffortFor(provider, task),
@@ -2094,7 +2113,7 @@ function runTask(channel, task) {
           repoName: repo.name,
           cwd,
           workMode: workModeFor(task),
-          model: modelFor(provider, chatId, task) || "provider default",
+          model: modelFor(provider, chatId, task) || null,
           line,
         });
       }
@@ -2111,6 +2130,9 @@ function runTask(channel, task) {
   child.on("close", (code) => {
     runningTasks.delete(key);
     pushBridgeStatus(channel);
+    // The run is done — re-push this chat's transcript so the live "running" flag on
+    // the last turn clears and the phone collapses it into the "Worked" card.
+    refireHistoryWatch(chatId);
     // The agent has finished reading them — don't leave image attachments in the repo.
     for (const attachment of attachments) {
       try {
@@ -2194,6 +2216,22 @@ const HISTORY_MSG_LIMIT = 600;
 function clip(value, n) {
   if (typeof value !== "string") return "";
   const s = value.replace(/\s+/g, " ").trim();
+  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+
+// Length-cap a string WITHOUT destroying its line structure. clip() collapses
+// every whitespace run (incl. "\n") to a single space — correct for one-line
+// labels (bash command, topic title) but it flattens markdown answers, narration
+// prose, and terminal output into a single paragraph. clipText preserves newlines
+// and intra-line indentation (diffs, code, JSON), only trimming trailing spaces
+// per line and capping runaway blank-line runs, then applies the length cap.
+function clipText(value, n) {
+  if (typeof value !== "string") return "";
+  const s = value
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{4,}/g, "\n\n\n")
+    .trim();
   return s.length > n ? s.slice(0, n - 1) + "…" : s;
 }
 
@@ -2578,8 +2616,13 @@ function codexActionLine(p) {
 // `agentActionEnc` blob encrypted with the SAME arte1 key as the diff card, so
 // the server stays zero-knowledge. The phone joins detail→entry by `uid` and
 // renders a rich inline card (collapsible command+output, todo list, …).
-const OUTPUT_KINDS = new Set(["bash", "search", "task", "web", "tool"]);
+// `read` is included so the file slice Claude read rides the encrypted blob and
+// powers the read row's "expand to full file" layer (line range still shows in the
+// plaintext preview via the node's start/end).
+const OUTPUT_KINDS = new Set(["bash", "search", "task", "web", "tool", "read"]);
 const MAX_ACTION_OUTPUT = 4000;
+// Per-edit unified-diff cap (rides the encrypted blob for the edit row's patch layer).
+const MAX_NODE_PATCH = 6000;
 
 function toolResultText(content) {
   if (content == null) return "";
@@ -2600,18 +2643,33 @@ function claudeActionDetail(b) {
     case "Bash":
       return { kind: "bash", command: String(inp.command || ""), description: inp.description ? String(inp.description) : "" };
     case "Edit":
-      return { kind: "edit", path: diffFilePath(inp.file_path), name: safeBase(inp.file_path), additions: countTextLines(inp.new_string), deletions: countTextLines(inp.old_string) };
+      return { kind: "edit", path: diffFilePath(inp.file_path), name: safeBase(inp.file_path), additions: countTextLines(inp.new_string), deletions: countTextLines(inp.old_string), patch: clipText(unifiedDiffBlock(inp.file_path, inp.old_string || "", inp.new_string || "", "M"), MAX_NODE_PATCH) };
     case "MultiEdit": {
-      let add = 0, del = 0;
-      if (Array.isArray(inp.edits)) for (const e of inp.edits) { add += countTextLines(e && e.new_string); del += countTextLines(e && e.old_string); }
-      return { kind: "edit", path: diffFilePath(inp.file_path), name: safeBase(inp.file_path), additions: add, deletions: del };
+      let add = 0, del = 0, patch = "";
+      if (Array.isArray(inp.edits)) for (const e of inp.edits) {
+        const oldS = (e && e.old_string) || "", newS = (e && e.new_string) || "";
+        add += countTextLines(newS); del += countTextLines(oldS);
+        patch += unifiedDiffBlock(inp.file_path, oldS, newS, "M");
+      }
+      return { kind: "edit", path: diffFilePath(inp.file_path), name: safeBase(inp.file_path), additions: add, deletions: del, patch: clipText(patch, MAX_NODE_PATCH) };
     }
     case "Write":
-      return { kind: "write", path: diffFilePath(inp.file_path), name: safeBase(inp.file_path), additions: countTextLines(inp.content) };
+      return { kind: "write", path: diffFilePath(inp.file_path), name: safeBase(inp.file_path), additions: countTextLines(inp.content), patch: clipText(unifiedDiffBlock(inp.file_path, "", inp.content || "", "A"), MAX_NODE_PATCH) };
     case "NotebookEdit":
-      return { kind: "edit", path: diffFilePath(inp.notebook_path || inp.file_path), name: safeBase(inp.notebook_path || inp.file_path), additions: countTextLines(inp.new_source), deletions: countTextLines(inp.old_source) };
-    case "Read":
-      return { kind: "read", path: diffFilePath(inp.file_path), name: safeBase(inp.file_path) };
+      return { kind: "edit", path: diffFilePath(inp.notebook_path || inp.file_path), name: safeBase(inp.notebook_path || inp.file_path), additions: countTextLines(inp.new_source), deletions: countTextLines(inp.old_source), patch: clipText(unifiedDiffBlock(inp.notebook_path || inp.file_path, inp.old_source || "", inp.new_source || "", "M"), MAX_NODE_PATCH) };
+    case "Read": {
+      // Carry the line range Claude requested so the row preview reads "Read foo.swift (12–48)";
+      // the file slice itself rides the encrypted blob (read ∈ OUTPUT_KINDS) for the expand layer.
+      const d = { kind: "read", path: diffFilePath(inp.file_path), name: safeBase(inp.file_path) };
+      const offset = Number(inp.offset), limit = Number(inp.limit);
+      if (Number.isFinite(offset) && offset > 0) {
+        d.start = offset;
+        if (Number.isFinite(limit) && limit > 0) d.end = offset + limit - 1;
+      } else if (Number.isFinite(limit) && limit > 0) {
+        d.start = 1; d.end = limit;
+      }
+      return d;
+    }
     case "Grep":
       return { kind: "search", tool: "grep", pattern: String(inp.pattern || ""), path: inp.path ? String(inp.path) : "", glob: inp.glob ? String(inp.glob) : "" };
     case "Glob":
@@ -2760,7 +2818,7 @@ function liveClaudeActions(output) {
         const id = block.tool_use_id || block.id;
         if (id) {
           resultByUid.set(id, {
-            output: clip(toolResultText(block.content || block.text || block.result), MAX_ACTION_OUTPUT),
+            output: clipText(toolResultText(block.content || block.text || block.result), MAX_ACTION_OUTPUT),
             isError: !!block.is_error,
           });
         }
@@ -2812,7 +2870,7 @@ function liveCodexActions(output) {
       const uid = item.call_id ? callIdToUid.get(item.call_id) || item.call_id : codexLiveNodeId(event, item, index);
       if (uid) {
         resultByUid.set(uid, {
-          output: clip(codexOutputText(item.output || item.result || item.content), MAX_ACTION_OUTPUT),
+          output: clipText(codexOutputText(item.output || item.result || item.content), MAX_ACTION_OUTPUT),
           isError: !!item.is_error,
         });
       }
@@ -2828,7 +2886,7 @@ function liveCodexActions(output) {
       const outputText = codexOutputText(item.aggregated_output || item.stdout || item.stderr || item.output);
       if (outputText) {
         resultByUid.set(uid, {
-          output: clip(outputText, MAX_ACTION_OUTPUT),
+          output: clipText(outputText, MAX_ACTION_OUTPUT),
           isError: typeof item.exit_code === "number" && item.exit_code !== 0,
         });
       }
@@ -2910,6 +2968,10 @@ function actionNode(detail, uid, status) {
   if (target) node.target = target;
   if (typeof d.additions === "number" && d.additions > 0) node.added = d.additions;
   if (typeof d.deletions === "number" && d.deletions > 0) node.removed = d.deletions;
+  // Read line range — plaintext (line numbers aren't sensitive) so the row preview can
+  // show "Read foo.swift (12–48)" without needing the decrypted blob.
+  if (typeof d.start === "number" && d.start > 0) node.start = d.start;
+  if (typeof d.end === "number" && d.end > 0) node.end = d.end;
   return node;
 }
 // Build a turn's progress nodes + sealed detail array and attach them to the
@@ -2941,23 +3003,105 @@ function attachTurnActions(messages, host, uids, detailByUid, resultByUid) {
   if (enc) target.agentActionsEnc = enc;
 }
 
+// Fold ONE user-turn into a SINGLE assistant "host" message. The turn's LAST
+// assistant text becomes the host's visible summary (rendered OUTSIDE the card);
+// every earlier assistant text plus all tool actions become interleaved progress
+// nodes (rendered INSIDE the "Worked for Xs" card) in chronological order — so a
+// turn reads as one collapsed card + one summary, never a pile of separate text
+// bubbles with a stray "Worked" card wedged between them (the bug this fixes).
+// `turnItems` is the ordered list captured during the turn:
+//   { type:"text", text, uid, ts }  |  { type:"tool", uid, ts }
+// Returns the host (already pushed onto `messages`) or null if the turn was empty.
+function foldTurnIntoHost(messages, turnItems, detailByUid, resultByUid, turnReasoning, hostFallbackUid) {
+  // The LAST non-empty text is the answer; it rides OUTSIDE the card.
+  let lastTextIndex = -1;
+  for (let i = 0; i < turnItems.length; i++) {
+    if (turnItems[i].type === "text" && String(turnItems[i].text || "").trim()) lastTextIndex = i;
+  }
+  const summary = lastTextIndex >= 0 ? turnItems[lastTextIndex] : null;
+
+  const nodes = [];
+  const actions = [];
+  // ONE "Thinking" node leads the turn's feed (reasoning rides the encrypted blob;
+  // the label stays the generic, leak-free "Thinking").
+  const reasoning = String(turnReasoning || "").trim();
+  if (reasoning) {
+    const tid = "think-host";
+    const det = { kind: "thinking", output: clipText(reasoning, MAX_ACTION_OUTPUT) };
+    nodes.push(actionNode(det, tid, "done"));
+    actions.push(Object.assign({ id: tid }, det));
+  }
+  let textSeq = 0;
+  for (let i = 0; i < turnItems.length; i++) {
+    if (i === lastTextIndex) continue;   // the answer rides OUTSIDE the card
+    const it = turnItems[i];
+    if (it.type === "text") {
+      // Interior narration → an in-card text node (phone renders it as prose,
+      // interleaved with the tool rows, via VibeAgentKitMessageCell).
+      const t = String(it.text || "").trim();
+      if (!t) continue;
+      nodes.push({
+        id: it.uid ? "txt-" + String(it.uid) : "txt-" + textSeq++,
+        label: clipText(t, 4000),
+        kind: "text",
+        status: "done",
+        depth: 0,
+      });
+      continue;
+    }
+    const det = detailByUid.get(it.uid);
+    if (!det) continue;
+    if (OUTPUT_KINDS.has(det.kind)) {
+      const r = resultByUid.get(it.uid);
+      if (r) { det.output = r.output; det.isError = r.isError; }
+    }
+    nodes.push(actionNode(det, it.uid, det.isError ? "error" : "done"));
+    actions.push(Object.assign({ id: String(it.uid) }, det));
+  }
+
+  if (!summary && !nodes.length) return null;
+
+  // Key the host by the turn's FIRST event uid — stable across live-tail re-pushes.
+  // (The "last text" changes as a turn streams, so keying by the summary would make
+  // the row id jump mid-run and leave a stale bubble; the first event is fixed once
+  // the turn opens, so the phone upserts the same row cleanly as the turn grows.)
+  const hostUid =
+    (turnItems[0] && turnItems[0].uid) ||
+    (summary && summary.uid) ||
+    hostFallbackUid ||
+    ("turn-" + messages.length);
+  const host = {
+    role: "assistant",
+    text: summary ? clipText(String(summary.text || "").trim(), 4000) : "",
+    ts: (summary && summary.ts) || (turnItems.length && turnItems[turnItems.length - 1].ts) || null,
+    uid: hostUid,
+  };
+  if (nodes.length) {
+    host.progressNodes = nodes.slice(-60);
+    const enc = encryptRuntimeBlob({ actions: actions.slice(-60) });
+    if (enc) host.agentActionsEnc = enc;
+  }
+  messages.push(host);
+  return host;
+}
+
 async function claudeDetail(id, limit) {
   const match = claudeSessionFiles().find((s) => s.id === id);
   if (!match) return null;
   const messages = [];
   let pending = newRuntimeAccumulator();
-  let lastAssistantInTurn = null;
   let topic = null;
   // Claude Code re-appends prior messages (same `uuid`) into the JSONL every time a
   // session is resumed/compacted, so a long session contains the SAME message many
   // times over. Replaying those duplicates produced garbled "corpse" history and
   // repeated diff cards — dedupe by uuid so each message (and its edits) counts once.
   const seen = new Set();
-  // Turn tracking: each user-text message starts a new turn. A turn's tool
-  // actions are folded into that turn's assistant message as native progress
-  // nodes (+ encrypted detail), so the phone renders one compact, expandable
-  // turn instead of a pile of per-action bubbles.
-  let turnActionUids = [];
+  // Turn tracking: each user-text message starts a new turn. The turn's assistant
+  // prose AND tool actions are captured IN ORDER, then folded into ONE host
+  // message at flush (foldTurnIntoHost): the last text = the summary (outside the
+  // card), every earlier text + all tools = interleaved progress nodes (inside the
+  // "Worked" card). One compact, expandable turn — never a pile of text bubbles.
+  let turnItems = [];      // ordered [{type:"text",text,uid,ts}|{type:"tool",uid,ts}]
   let turnReasoning = "";  // accumulated thinking for the current turn → ONE node
   let thinkSeq = 0;
   // Turn timespan (user prompt → last assistant event) → "Worked for Xs".
@@ -2967,25 +3111,15 @@ async function claudeDetail(id, limit) {
   // tool_use_id → {output, isError}.
   const actionDetailByUid = new Map();
   const resultByUid = new Map();
-  // One card per user-turn: seal the edits + the action feed made since the last
-  // user prompt onto that turn's final assistant message.
+  // One card per user-turn: fold the turn's prose + tool feed into ONE host
+  // message, then seal the edits/diff card onto it.
   const flushTurn = () => {
-    if (lastAssistantInTurn && pending.order.length) {
-      sealHistoryRuntime("claude", lastAssistantInTurn, pending, turnDurationMs(turnStartTs, turnEndTs));
-    }
-    if (turnReasoning.trim()) {
-      // ONE "Thinking" node per turn (reasoning rides the encrypted blob; the
-      // label is the generic, leak-free "Thinking"). Lead the turn's feed.
-      const tid = "think-" + thinkSeq++;
-      actionDetailByUid.set(tid, { kind: "thinking", output: clip(turnReasoning.trim(), MAX_ACTION_OUTPUT) });
-      turnActionUids.unshift(tid);
-    }
-    if (turnActionUids.length) {
-      attachTurnActions(messages, lastAssistantInTurn, turnActionUids, actionDetailByUid, resultByUid);
+    const host = foldTurnIntoHost(messages, turnItems, actionDetailByUid, resultByUid, turnReasoning, null);
+    if (host && pending.order.length) {
+      sealHistoryRuntime("claude", host, pending, turnDurationMs(turnStartTs, turnEndTs));
     }
     pending = newRuntimeAccumulator();
-    lastAssistantInTurn = null;
-    turnActionUids = [];
+    turnItems = [];
     turnReasoning = "";
     turnStartTs = null;
     turnEndTs = null;
@@ -3002,7 +3136,7 @@ async function claudeDetail(id, limit) {
       if (typeof m.content === "string") st = m.content;
       else if (Array.isArray(m.content)) st = m.content.filter((b) => b && b.type === "text").map((b) => b.text).join("\n").trim();
       st = cleanMessageText(st);
-      if (st) messages.push({ role: "system", kind: "summary", text: clip(st, 4000), ts: ev.timestamp, uid: ev.uuid });
+      if (st) messages.push({ role: "system", kind: "summary", text: clipText(st, 4000), ts: ev.timestamp, uid: ev.uuid });
       return;
     }
     // Capture tool results (bash stdout, …) to join onto their action entry.
@@ -3010,13 +3144,26 @@ async function claudeDetail(id, limit) {
     if (ev.type === "user" && Array.isArray(m.content)) {
       for (const b of m.content) {
         if (b && b.type === "tool_result" && b.tool_use_id) {
-          resultByUid.set(b.tool_use_id, { output: clip(toolResultText(b.content), MAX_ACTION_OUTPUT), isError: !!b.is_error });
+          resultByUid.set(b.tool_use_id, { output: clipText(toolResultText(b.content), MAX_ACTION_OUTPUT), isError: !!b.is_error });
         }
       }
     }
     // Skip Claude Code's own meta annotations (local-command output, IDE
     // open/selection, caveats) — not conversation; they render as junk bubbles.
     if (ev.type === "user" && ev.isMeta) return;
+    let rawText = "";
+    if (typeof m.content === "string") rawText = m.content;
+    else if (Array.isArray(m.content)) {
+      rawText = m.content.filter((b) => b && b.type === "text").map((b) => b.text).join("\n").trim();
+    }
+    // Claude Code records a local slash-command invocation (/compact, /clear, …) as a
+    // user event wrapping <command-name>/<local-command-stdout> chrome. It's UI, not
+    // conversation — drop it BEFORE the turn-boundary flush so it neither seals a turn
+    // nor leaks a junk "Compacted" user bubble next to the real summary divider. The
+    // compaction SUMMARY itself is handled above (isCompactSummary → kind:"summary").
+    if (ev.type === "user" && /<command-name>|<command-message>|<local-command-stdout>/i.test(rawText)) {
+      return;
+    }
     if (ev.type === "user" && messageHasUserText(m)) {
       flushTurn();                  // seal prior turn's card + action feed
       turnStartTs = ev.timestamp || null;   // new turn opens at this prompt
@@ -3025,35 +3172,31 @@ async function claudeDetail(id, limit) {
       collectClaudeEdits(pending, m.content);
       if (ev.timestamp) turnEndTs = ev.timestamp;   // extend turn end to last assistant event
     }
-    let text = "";
-    if (typeof m.content === "string") text = m.content;
-    else if (Array.isArray(m.content)) {
-      text = m.content.filter((b) => b && b.type === "text").map((b) => b.text).join("\n").trim();
-    }
-    text = cleanMessageText(text);
-    if (text) {
-      const msg = { role: ev.type, text: clip(text, 4000), ts: ev.timestamp, uid: ev.uuid };
-      if (ev.type === "assistant") lastAssistantInTurn = msg;
-      messages.push(msg);
-    }
-    // Collect this assistant message's reasoning (one coalesced "Thinking" node,
-    // placed before its tools) + each tool action for the current turn. The
-    // reasoning text + tool output ride ONLY the turn's encrypted blob; the node
-    // label stays the generic, leak-free "Thinking".
-    if (ev.type === "assistant" && Array.isArray(m.content)) {
-      const think = m.content
-        .filter((b) => b && b.type === "thinking" && b.thinking)
-        .map((b) => String(b.thinking))
-        .join("\n\n")
-        .trim();
-      // (Claude Code usually persists thinking with EMPTY text — only the
-      // signature — so this is typically a no-op; it lights up if a session ever
-      // stores summarized reasoning. Aggregated per-turn into one node.)
-      if (think) turnReasoning += (turnReasoning ? "\n\n" : "") + think;
-      for (const b of m.content) {
-        if (b && b.type === "tool_use") {
-          turnActionUids.push(b.id);
-          actionDetailByUid.set(b.id, claudeActionDetail(b));
+    let text = cleanMessageText(rawText);
+    if (ev.type === "user") {
+      // User prompts stay their own right-side bubble (each one is a turn boundary).
+      if (text) messages.push({ role: "user", text: clipText(text, 4000), ts: ev.timestamp, uid: ev.uuid });
+    } else if (ev.type === "assistant") {
+      // Fold this assistant event into the current turn IN ORDER: its prose first
+      // (an interior text becomes an in-card narration node; the turn's LAST text
+      // becomes the summary), then its tool calls — so the card reads chronologically.
+      if (text) turnItems.push({ type: "text", text, uid: ev.uuid, ts: ev.timestamp });
+      if (Array.isArray(m.content)) {
+        // Coalesce this message's reasoning into the turn's single "Thinking" node.
+        // (Claude Code usually persists thinking with EMPTY text — only the
+        // signature — so this is typically a no-op; it lights up if a session ever
+        // stores summarized reasoning.)
+        const think = m.content
+          .filter((b) => b && b.type === "thinking" && b.thinking)
+          .map((b) => String(b.thinking))
+          .join("\n\n")
+          .trim();
+        if (think) turnReasoning += (turnReasoning ? "\n\n" : "") + think;
+        for (const b of m.content) {
+          if (b && b.type === "tool_use") {
+            turnItems.push({ type: "tool", uid: b.id, ts: ev.timestamp });
+            actionDetailByUid.set(b.id, claudeActionDetail(b));
+          }
         }
       }
     }
@@ -3066,8 +3209,12 @@ async function claudeDetail(id, limit) {
   // they ride along with whatever survives the trim. Stable `uid`s (not array
   // position) key the app-side upsert, so a sliding window re-pushes cleanly.
   const topicText = topic || (messages[0] && clip(messages[0].text, 80)) || "Untitled";
-  if (messages.length > limit) messages.splice(0, messages.length - limit);
-  return { provider: "claude", id, topic: topicText, project: match.project, projectName: path.basename(match.project), messages };
+  // Flag a windowed tail so the app only runs aggressive stale-row cleanup when it
+  // received the WHOLE session — otherwise "absent" just means "older than the
+  // window", and deleting those would erase valid scrollback.
+  const truncated = messages.length > limit;
+  if (truncated) messages.splice(0, messages.length - limit);
+  return { provider: "claude", id, topic: topicText, project: match.project, projectName: path.basename(match.project), truncated, messages };
 }
 
 // — Codex —
@@ -3157,13 +3304,12 @@ async function codexDetail(id, limit) {
   if (!match) return null;
   const messages = [];
   let pending = newRuntimeAccumulator();
-  let lastAssistantInTurn = null;
   let project = "";
   // Same guard as Claude: skip any response_item we've already processed (by id) so a
   // resumed/re-emitted rollout never replays a message or its apply_patch twice.
   const seen = new Set();
-  // Per-turn action collection folded into the turn's assistant message (see claudeDetail).
-  let turnActionUids = [];
+  // Per-turn prose+action collection, folded into ONE host message (see claudeDetail).
+  let turnItems = [];      // ordered [{type:"text",text,uid,ts}|{type:"tool",uid,ts}]
   let turnReasoning = "";  // accumulated reasoning for the current turn → ONE node
   let thinkSeq = 0;
   // Turn timespan (user prompt → last assistant message) → "Worked for Xs".
@@ -3176,20 +3322,12 @@ async function codexDetail(id, limit) {
   const resultByUid = new Map();
   const callIdToUid = new Map();
   const flushTurn = () => {
-    if (lastAssistantInTurn && pending.order.length) {
-      sealHistoryRuntime("codex", lastAssistantInTurn, pending, turnDurationMs(turnStartTs, turnEndTs));
-    }
-    if (turnReasoning.trim()) {
-      const tid = "think-" + thinkSeq++;
-      actionDetailByUid.set(tid, { kind: "thinking", output: clip(turnReasoning.trim(), MAX_ACTION_OUTPUT) });
-      turnActionUids.unshift(tid);
-    }
-    if (turnActionUids.length) {
-      attachTurnActions(messages, lastAssistantInTurn, turnActionUids, actionDetailByUid, resultByUid);
+    const host = foldTurnIntoHost(messages, turnItems, actionDetailByUid, resultByUid, turnReasoning, null);
+    if (host && pending.order.length) {
+      sealHistoryRuntime("codex", host, pending, turnDurationMs(turnStartTs, turnEndTs));
     }
     pending = newRuntimeAccumulator();
-    lastAssistantInTurn = null;
-    turnActionUids = [];
+    turnItems = [];
     turnReasoning = "";
     turnStartTs = null;
     turnEndTs = null;
@@ -3211,9 +3349,13 @@ async function codexDetail(id, limit) {
       }
       const text = cleanMessageText(raw);
       if (text && !isContextMessage(raw)) {
-        const msg = { role: p.role, text: clip(text, 4000), ts: ev.timestamp, uid: dkey };
-        if (p.role === "assistant") lastAssistantInTurn = msg;
-        messages.push(msg);
+        if (p.role === "user") {
+          // User prompts stay their own right-side bubble (turn boundary).
+          messages.push({ role: "user", text: clipText(text, 4000), ts: ev.timestamp, uid: dkey });
+        } else {
+          // Assistant prose folds into the current turn IN ORDER (last text = summary).
+          turnItems.push({ type: "text", text, uid: dkey, ts: ev.timestamp });
+        }
       }
     } else if (p.type === "reasoning") {
       // Codex emits a reasoning item before nearly every tool call; aggregate the
@@ -3225,13 +3367,13 @@ async function codexDetail(id, limit) {
         : "").trim();
       if (think) turnReasoning += (turnReasoning ? "\n\n" : "") + think;
     } else if (p.type === "function_call" || p.type === "custom_tool_call") {
-      // Collect the tool call for the current turn (output joins via call_id).
-      turnActionUids.push(dkey);
+      // Collect the tool call for the current turn IN ORDER (output joins via call_id).
+      turnItems.push({ type: "tool", uid: dkey, ts: ev.timestamp });
       actionDetailByUid.set(dkey, codexActionDetail(p));
       if (p.call_id) callIdToUid.set(p.call_id, dkey);
     } else if (p.type === "function_call_output" || p.type === "custom_tool_call_output") {
       const uid = p.call_id ? callIdToUid.get(p.call_id) : null;
-      if (uid) resultByUid.set(uid, { output: clip(codexOutputText(p.output), MAX_ACTION_OUTPUT), isError: false });
+      if (uid) resultByUid.set(uid, { output: clipText(codexOutputText(p.output), MAX_ACTION_OUTPUT), isError: false });
     }
   });
   flushTurn();
@@ -3240,8 +3382,9 @@ async function codexDetail(id, limit) {
   const topic =
     messages.map((m) => cleanTopicCandidate(m.text)).find(Boolean) ||
     "Untitled";
-  if (messages.length > limit) messages.splice(0, messages.length - limit);
-  return { provider: "codex", id, topic, project, projectName: project ? path.basename(project) : "", messages };
+  const truncated = messages.length > limit;
+  if (truncated) messages.splice(0, messages.length - limit);
+  return { provider: "codex", id, topic, project, projectName: project ? path.basename(project) : "", truncated, messages };
 }
 
 async function readHistory({ provider, mode, sessionId, limit }) {
@@ -3277,6 +3420,68 @@ function sessionFilePath(provider, sessionId) {
   return match ? match.file : null;
 }
 
+// True while any run_task is in flight for this chat — used to flag the live turn.
+function isChatTaskRunning(chatId) {
+  for (const entry of runningTasks.values()) {
+    if (entry && entry.chatId === chatId) return true;
+  }
+  return false;
+}
+
+function runningTaskForChat(chatId) {
+  for (const entry of runningTasks.values()) {
+    if (entry && entry.chatId === chatId) return entry;
+  }
+  return null;
+}
+
+function markMessageRunning(message) {
+  if (!message || typeof message !== "object") return message;
+  message.running = true;
+  const nodes = Array.isArray(message.progressNodes) ? message.progressNodes : [];
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    const node = nodes[i];
+    if (!node || typeof node !== "object") continue;
+    const status = String(node.status || "").trim().toLowerCase();
+    if (["failed", "error", "cancelled", "canceled", "stopped"].includes(status)) continue;
+    node.status = "running";
+    break;
+  }
+  return message;
+}
+
+function runningPlaceholderMessage(entry) {
+  if (!entry || !entry.taskId) return null;
+  const providerTitle = entry.provider === "claude" ? "Claude" : entry.provider === "codex" ? "Codex" : "Agent";
+  const target = entry.repo && entry.repo.name ? entry.repo.name : "";
+  return {
+    role: "assistant",
+    text: "",
+    uid: `running-${entry.taskId}`,
+    ts: new Date(entry.startedAt || Date.now()).toISOString(),
+    running: true,
+    progressNodes: [
+      {
+        id: `running-${entry.taskId}`,
+        label: `${providerTitle} is working`,
+        kind: "task",
+        status: "running",
+        depth: 0,
+        ...(target ? { target } : {}),
+      },
+    ],
+  };
+}
+
+// Force the chat's history watcher to re-read + re-push even if the transcript text
+// is unchanged (used when a run finishes so the live "running" flag flips to done).
+function refireHistoryWatch(chatId) {
+  const rec = historyWatchers.get(chatId);
+  if (!rec) return;
+  rec.lastSig = "";
+  if (rec.schedule) rec.schedule();
+}
+
 function stopHistoryWatch(chatId) {
   const rec = historyWatchers.get(chatId);
   if (!rec) return;
@@ -3298,7 +3503,7 @@ function startHistoryWatch(channel, { chatId, provider, sessionId, echo }) {
     const oldest = historyWatchers.keys().next().value;
     if (oldest) stopHistoryWatch(oldest);
   }
-  const rec = { file, watcher: null, listener: null, debounce: null, lastSig: "", busy: false, again: false };
+  const rec = { file, watcher: null, listener: null, debounce: null, lastSig: "", busy: false, again: false, schedule: null };
   const fire = () => {
     if (channel.state !== "joined") return;
     if (rec.busy) { rec.again = true; return; } // re-read once the in-flight read finishes
@@ -3306,8 +3511,26 @@ function startHistoryWatch(channel, { chatId, provider, sessionId, echo }) {
     readHistory({ provider, mode: "detail", sessionId })
       .then((result) => {
         const msgs = (result && result.session && result.session.messages) || [];
-        const last = msgs.length ? msgs[msgs.length - 1] : null;
-        const sig = msgs.length + ":" + (last ? (last.uid || "") + ":" + String(last.text || "").length : 0);
+        const runningEntry = runningTaskForChat(chatId);
+        let last = msgs.length ? msgs[msgs.length - 1] : null;
+        // While a task is actively running for this chat, the LAST turn is still in
+        // flight — flag it so the phone renders the live "working" state (shimmer +
+        // feed) instead of collapsing to a "Worked · N steps" card. The flag clears
+        // on the next re-push after the run finishes (see refireHistoryWatch on close).
+        const running = !!runningEntry;
+        if (running && last && last.role === "assistant") {
+          markMessageRunning(last);
+        } else if (running) {
+          const placeholder = runningPlaceholderMessage(runningEntry);
+          if (placeholder) {
+            msgs.push(placeholder);
+            last = placeholder;
+          }
+        }
+        const sig =
+          msgs.length + ":" +
+          (last ? (last.uid || "") + ":" + String(last.text || "").length : 0) +
+          ":" + (running ? "run" : "done");
         if (sig !== rec.lastSig) {
           rec.lastSig = sig;
           channel.push("history_result", { ok: true, ...echo, ...result });
@@ -3323,6 +3546,7 @@ function startHistoryWatch(channel, { chatId, provider, sessionId, echo }) {
     if (rec.debounce) return;
     rec.debounce = setTimeout(() => { rec.debounce = null; fire(); }, HISTORY_WATCH_DEBOUNCE_MS);
   };
+  rec.schedule = schedule;
   try {
     // Event-based: fires within ms of claude/codex appending to the transcript.
     rec.watcher = fs.watch(file, { persistent: true }, () => schedule());
@@ -3782,6 +4006,8 @@ module.exports = {
 	  liveCodexActions,
 	  fileWithinLinkedRepo,
 	  handleFileRequest,
+	  normalizeModel,
+	  runningPlaceholderMessage,
 	};
 
 // Only auto-run the daemon when invoked directly (so the module is requireable).

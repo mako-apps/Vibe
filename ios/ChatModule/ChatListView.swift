@@ -599,6 +599,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private(set) var eventInboxRows: [ChatListRow] = []
   /// Reports the current inbox state (count + newest preview text) to the host.
   var onEventInboxChanged: ((_ count: Int, _ latestPreview: String?) -> Void)?
+  /// Asks the host (ChatMainView) to embed the DM-level agent runtime view in-place,
+  /// sharing the chat header chrome, instead of pushing it as a separate VC. When unset,
+  /// `presentBridgeAgentConversation` falls back to a pushed/modal presentation.
+  var onHostBridgeAgentView: ((VibeAgentConversationViewController) -> Void)?
+  /// Asks the host to remove any embedded agent runtime view (DM changed, or this is no
+  /// longer a bridge surface).
+  var onTearDownBridgeAgentView: (() -> Void)?
+  /// Provider of the currently embedded agent runtime view, or nil if none is shown.
+  var hostedBridgeAgentProvider: (() -> String?)?
   private var nativeHistoryHydrationGeneration: UInt = 0
   private var nativeOutgoingRowsById: [String: [String: Any]] = [:]
   private var nativeOutgoingOrder: [String] = []
@@ -894,6 +903,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     updateChatEngineChannelBinding()
     if window != nil {
       hydrateRowsFromNativeHistoryIfReady(trigger: "didMoveToWindow")
+      presentPreferredAgentViewIfNeeded()
+      prefetchBridgeHistoryIfNeeded()
     }
   }
 
@@ -987,6 +998,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   // Messages the user sent from THIS surface — always visible, even if a send lands
   // before the history snapshot is taken (so a new thread never vanishes).
   private var bridgeFreshOwnSentIds: Set<String> = []
+  // A history session the user explicitly opened FROM the History surface. Its rows
+  // are ingested under this DM's chatId keyed `bridge-<sessionId>-…`; while set, those
+  // rows are allowed through the fresh-surface filter so the picked conversation shows
+  // in the default chat view (everything else still opens clean). Nil = fresh thread.
+  private var bridgeLoadedSessionId: String?
 
   /// Register an outgoing message id so the fresh-surface filter never hides it.
   func noteBridgeFreshOwnSentId(_ messageId: String) {
@@ -995,34 +1011,58 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     bridgeFreshOwnSentIds.insert(id)
   }
 
+  /// Load (or clear, when nil) an explicitly-picked history session into this chat
+  /// surface. Re-applies the fresh-surface filter so the session's rows appear without
+  /// leaking the rest of the stored transcript.
+  func setBridgeLoadedSessionId(_ sessionId: String?) {
+    let next = sessionId?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let resolved = (next?.isEmpty == false) ? next : nil
+    guard bridgeLoadedSessionId != resolved else { return }
+    bridgeLoadedSessionId = resolved
+    if !sourceRowsPayload.isEmpty { setRows(sourceRowsPayload) }
+  }
+
   private func bridgeRowIsLive(_ row: ChatListRow) -> Bool {
     if row.isStreamingText { return true }
     let status = (row.status ?? "").lowercased()
     return status == "running" || status == "streaming"
   }
 
-  /// Hides prior history for a bridge-agent DM so the surface opens empty. Non–
-  /// bridge chats pass through untouched.
+  /// A Claude/Codex DM opens as a fresh scratch surface: the engine's stored transcript
+  /// is hidden so the chat starts clean (no "phantom" prior history loading itself).
+  /// Visible: live/streaming rows, messages sent from this surface this session, and —
+  /// only when the user explicitly picks one from the History surface — that session's
+  /// rows (ingested under this chatId keyed `bridge-<sessionId>-…`).
   private func bridgeFreshFiltered(_ parsed: [ChatListRow]) -> [ChatListRow] {
     guard currentBridgeProvider != nil else { return parsed }
     let chatKey = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    let loadedPrefix = bridgeLoadedSessionId.map { "bridge-\($0)" }
+    // The host recycles this ChatListView across DMs, so re-arm the snapshot whenever the
+    // chat identity changes — otherwise one DM's hidden-set leaks into the next.
     if bridgeFreshSnapshotChatId != chatKey {
-      // Snapshot only once the full transcript has loaded, so a partial first page
-      // doesn't leak the rest of the history in afterward.
-      let historyReady = chatKey.isEmpty || ChatEngine.shared.isChatHistoryLoaded(chatId: chatKey)
-      guard historyReady else { return parsed.filter { bridgeRowIsLive($0) } }
       bridgeFreshSnapshotChatId = chatKey
-      bridgeFreshHiddenIds = Set(parsed.compactMap { $0.messageId })
-      NSLog(
-        "[ChatListView] bridgeFreshOpen chatId=%@ hiddenHistory=%d",
-        chatKey, bridgeFreshHiddenIds.count)
+      bridgeFreshHiddenIds.removeAll()
+    }
+    // Until the user actually engages this session (sends a message, or explicitly opens a
+    // history session), EVERY non-live row is prior history — keep accumulating it into the
+    // hidden set, even rows that stream in late after the first page. A one-shot snapshot
+    // missed those late arrivals, which is how a finished runtime card ("User task: Hi")
+    // loaded itself on a clean open. Live rows still show so a resumed run stays visible.
+    let sessionEngaged = !bridgeFreshOwnSentIds.isEmpty || bridgeLoadedSessionId != nil
+    if !sessionEngaged {
+      for row in parsed where !bridgeRowIsLive(row) {
+        if let id = row.messageId, !id.isEmpty { bridgeFreshHiddenIds.insert(id) }
+      }
     }
     return parsed.filter { row in
       let id = row.messageId ?? ""
-      // Session transcripts opened from profile history are ingested under this same
-      // DM chatId (keyed `bridge-<sessionId>-…`); never surface them in the fresh
-      // default chat.
-      if id.hasPrefix("bridge-") { return false }
+      // Session transcripts opened from History are ingested under this DM chatId keyed
+      // `bridge-<sessionId>-…`. Show them only for the explicitly-loaded session; never
+      // surface other sessions in the fresh default chat.
+      if id.hasPrefix("bridge-") {
+        if let loadedPrefix, id.hasPrefix(loadedPrefix) { return true }
+        return false
+      }
       if bridgeRowIsLive(row) { return true }
       // Drop prior-history rows AND non-message rows (stale date separators); a new
       // thread renders only the messages exchanged this session.
@@ -1093,9 +1133,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       }
       parsed = parsedAll
     }
-    // Bridge-agent DMs open fresh: hide prior history (kept reachable via the
-    // profile's "Chat History"); newly sent/live rows still show.
+    // Bridge-agent DMs open fresh: hide prior history; newly sent/live rows and an
+    // explicitly-loaded history session still show.
     parsed = bridgeFreshFiltered(parsed)
+    dismissBridgeSpinnerIfSessionLoaded(parsed)
+    updateSeeProgressButton(parsed)
     if let targetMessageId = reactionDebugTargetMessageId, reactionDebugRemainingRowsChecks > 0 {
       reactionDebugRemainingRowsChecks -= 1
       if let row = parsed.first(where: { $0.messageId == targetMessageId }) {
@@ -1901,6 +1943,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     nativeEngineRowsById.removeAll()
     nativeEngineOrder.removeAll()
     nativeDeletedMessageIds.removeAll()
+    // Switching DMs: drop the previous chat's fresh-surface tracking so a recycled
+    // ChatListView opens the next bridge DM clean (no leaked history / loaded session),
+    // and re-evaluate whether the in-place agent view belongs to this DM.
+    bridgeFreshSnapshotChatId = nil
+    bridgeFreshHiddenIds.removeAll()
+    bridgeFreshOwnSentIds.removeAll()
+    bridgeLoadedSessionId = nil
+    bridgeAgentManuallyShown = false
+    scheduleBridgeAgentPresenceRefresh()
     updateChatEngineBinding()
     updateChatEngineChannelBinding()
     if statusAuthorityEnabled {
@@ -1919,6 +1970,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let next = value.trimmingCharacters(in: .whitespacesAndNewlines)
     if enginePeerUserId == next { return }
     enginePeerUserId = next
+    didAutoPresentAgentView = false
+    didPrefetchBridgeHistory = false
     // The peer id may arrive after the input bar is built; re-assert the agent
     // control so a Claude/Codex DM surfaces the repo picker (not a plain input).
     inputBar?.setAgentControlMode(agentChatMode || currentBridgeProvider != nil)
@@ -1927,6 +1980,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if statusAuthorityEnabled {
       refreshVisibleStatuses(reason: "peerUserId")
     }
+    presentPreferredAgentViewIfNeeded()
+    prefetchBridgeHistoryIfNeeded()
   }
 
   func setEnginePeerAgentId(_ value: String) {
@@ -4859,22 +4914,219 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   private func updateAgentBridgeControlTitle() {
-    // Bridge-agent DMs (Claude/Codex) drive the repo picker regardless of the
+    // Bridge-agent DMs (Claude/Codex) drive the repo chip + agent menu regardless of the
     // legacy `agentChatMode` surface. "Open" is the fallback for the Vibe AI panel.
-    guard currentBridgeProvider != nil else {
+    guard let provider = currentBridgeProvider else {
+      inputBar?.setAgentControlMenu(nil)
       inputBar?.setAgentControlTitle("Open")
       return
     }
-    let repositoryName = AgentBridgeSelectionStore.selectedRepository()?.name ?? "Pick repo"
-    let mode = AgentBridgeSelectionStore.selectedWorkMode()
-    let suffix = mode == .readOnly ? "" : " · \(mode.title)"
-    // The default chat always starts a fresh thread, so no resume indicator here —
-    // continuing a session is an explicit action from the profile's Chat History.
-    inputBar?.setAgentControlTitle(repositoryName + suffix)
+    let repoName =
+      AgentBridgeSelectionStore.selectedRepository()?.name
+        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    inputBar?.setAgentControlRepoTitle(repoName)
+    inputBar?.setAgentControlMenu(agentControlMenu(provider: provider))
+  }
+
+  /// Build the agent-control chip menu for a Claude/Codex DM: switch repository, set the
+  /// permission (work mode), open the run Report, or open the full History surface. These
+  /// are distinct items so History no longer bundles permission/report.
+  private func agentControlMenu(provider: String) -> UIMenu {
+    let repos = AgentPairingService.lastStatusSnapshot?.repositories ?? []
+    let selectedRepo = AgentBridgeSelectionStore.selectedRepository()
+    var repoChildren: [UIMenuElement] = repos.map { repo in
+      UIAction(
+        title: repo.name,
+        subtitle: repo.path,
+        image: UIImage(systemName: repo.isGitRepository ? "shippingbox" : "folder"),
+        state: (repo.id == selectedRepo?.id || repo.cwd == selectedRepo?.cwd) ? .on : .off
+      ) { [weak self] _ in
+        AgentBridgeSelectionStore.select(repo)
+        self?.updateAgentBridgeControlTitle()
+      }
+    }
+    repoChildren.append(
+      UIAction(title: "Pick repository…", image: UIImage(systemName: "folder.badge.plus")) {
+        [weak self] _ in
+        self?.onNativeEvent(["type": "openAgentPanel", "provider": provider])
+      })
+    let repoMenu = UIMenu(title: "Repository", options: .displayInline, children: repoChildren)
+
+    let currentMode = AgentBridgeSelectionStore.selectedWorkMode()
+    let permissionChildren = AgentBridgeWorkMode.allCases.map { mode in
+      UIAction(
+        title: mode.title,
+        subtitle: mode.subtitle,
+        image: UIImage(systemName: mode.icon),
+        state: mode == currentMode ? .on : .off
+      ) { _ in
+        AgentBridgeSelectionStore.setWorkMode(mode)
+      }
+    }
+    let permissionMenu = UIMenu(
+      title: "Permission",
+      subtitle: currentMode.title,
+      image: UIImage(systemName: "hand.raised"),
+      children: permissionChildren)
+
+    let reportAction = UIAction(
+      title: "Report", image: UIImage(systemName: "doc.text.magnifyingglass")
+    ) { [weak self] _ in
+      self?.presentLatestAgentReport()
+    }
+    let historyAction = UIAction(
+      title: "History", image: UIImage(systemName: "clock.arrow.circlepath")
+    ) { [weak self] _ in
+      self?.presentBridgeHistorySurface(provider: provider)
+    }
+    return UIMenu(children: [repoMenu, permissionMenu, reportAction, historyAction])
+  }
+
+  /// Report: open the most recent run's files-changed / diff report (its runtime card).
+  private func presentLatestAgentReport() {
+    guard
+      let index = rows.lastIndex(where: { $0.agentRuntime != nil }),
+      let runtime = rows[index].agentRuntime
+    else { return }
+    presentAgentRuntimeTask(row: rows[index], runtime: runtime)
+  }
+
+  /// History: full-screen slide-in list of this agent's past/running conversations
+  /// (reusing the profile's `AgentBridgeHistoryInlineView`). Picking one loads it into
+  /// THIS chat view (not the agent view) — see `loadBridgeSessionIntoChat`.
+  private func presentBridgeHistorySurface(provider: String) {
+    guard let presenter = topPresentingViewController() else { return }
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    let status = AgentPairingService.lastStatusSnapshot
+    let host = UIHostingController(
+      rootView: AgentBridgeHistorySheet(
+        provider: provider,
+        chatId: chatId,
+        runningTasks: status?.runningTasks ?? [],
+        deviceLabel: AgentPairingService.lastDeviceLabel ?? "",
+        connected: AgentPairingService.lastConnected,
+        paired: status?.paired ?? false,
+        onPick: { [weak self] session in
+          self?.loadBridgeSessionIntoChat(provider: provider, session: session)
+        }
+      ))
+    host.modalPresentationStyle = .fullScreen
+    presenter.present(host, animated: true)
+  }
+
+  /// Ingest a picked history session's transcript into THIS chat (keyed
+  /// `bridge-<sessionId>-…`), reveal it through the fresh-surface filter, and show a
+  /// brief spinner until its rows land.
+  private func loadBridgeSessionIntoChat(provider: String, session: AgentBridgeHistorySession) {
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    let sessionId = session.resolvedSessionId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !sessionId.isEmpty, !sessionId.hasPrefix("running:") else {
+      // A running task with no session id yet: jump straight to the live agent view.
+      presentBridgeAgentConversation(provider: provider)
+      return
+    }
+    setBridgeLoadedSessionId(sessionId)
+    showBridgeSessionLoadingSpinner()
+    let result = ChatEngine.shared.loadAgentBridgeSessionIntoChat([
+      "chatId": chatId,
+      "provider": provider,
+      "sessionId": sessionId,
+    ])
+    if (result["accepted"] as? Bool) != true {
+      hideBridgeSessionLoadingSpinner()
+    }
+  }
+
+  private lazy var bridgeSessionSpinner: UIActivityIndicatorView = {
+    let spinner = UIActivityIndicatorView(style: .large)
+    spinner.hidesWhenStopped = true
+    spinner.translatesAutoresizingMaskIntoConstraints = false
+    return spinner
+  }()
+  private var bridgeSessionSpinnerTimeout: DispatchWorkItem?
+
+  private func showBridgeSessionLoadingSpinner() {
+    if bridgeSessionSpinner.superview == nil {
+      addSubview(bridgeSessionSpinner)
+      NSLayoutConstraint.activate([
+        bridgeSessionSpinner.centerXAnchor.constraint(equalTo: centerXAnchor),
+        bridgeSessionSpinner.centerYAnchor.constraint(equalTo: centerYAnchor),
+      ])
+    }
+    bringSubviewToFront(bridgeSessionSpinner)
+    bridgeSessionSpinner.startAnimating()
+    bridgeSessionSpinnerTimeout?.cancel()
+    let work = DispatchWorkItem { [weak self] in self?.hideBridgeSessionLoadingSpinner() }
+    bridgeSessionSpinnerTimeout = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: work)
+  }
+
+  private func hideBridgeSessionLoadingSpinner() {
+    bridgeSessionSpinnerTimeout?.cancel()
+    bridgeSessionSpinnerTimeout = nil
+    bridgeSessionSpinner.stopAnimating()
+  }
+
+  /// Once a picked session's rows land, drop the loading spinner.
+  private func dismissBridgeSpinnerIfSessionLoaded(_ parsed: [ChatListRow]) {
+    guard bridgeSessionSpinner.isAnimating, let sessionId = bridgeLoadedSessionId else { return }
+    let prefix = "bridge-\(sessionId)"
+    if parsed.contains(where: { ($0.messageId ?? "").hasPrefix(prefix) }) {
+      hideBridgeSessionLoadingSpinner()
+    }
+  }
+
+  // A floating "See progress" pill shown in the chat when the currently-loaded session
+  // is live/running on the computer — tapping it opens the full agent runtime view (we
+  // never auto-push there; the user chooses to "see the progress").
+  private lazy var seeProgressButton: UIButton = {
+    var cfg = UIButton.Configuration.filled()
+    cfg.title = "See progress"
+    cfg.image = UIImage(systemName: "waveform")
+    cfg.imagePadding = 6
+    cfg.cornerStyle = .capsule
+    cfg.baseBackgroundColor = appearance.bubbleMeGradient.first
+      ?? UIColor(red: 0.16, green: 0.62, blue: 0.62, alpha: 1.0)
+    cfg.baseForegroundColor = .white
+    let button = UIButton(configuration: cfg)
+    button.translatesAutoresizingMaskIntoConstraints = false
+    button.isHidden = true
+    button.addTarget(self, action: #selector(seeProgressTapped), for: .touchUpInside)
+    button.layer.shadowColor = UIColor.black.cgColor
+    button.layer.shadowOpacity = 0.18
+    button.layer.shadowRadius = 8
+    button.layer.shadowOffset = CGSize(width: 0, height: 3)
+    return button
+  }()
+
+  @objc private func seeProgressTapped() {
+    guard let provider = currentBridgeProvider else { return }
+    bridgeAgentManuallyShown = true
+    presentBridgeAgentConversation(provider: provider)
+  }
+
+  /// Show the "See progress" pill when a loaded session has a live/streaming row.
+  private func updateSeeProgressButton(_ parsed: [ChatListRow]) {
+    let live = bridgeLoadedSessionId != nil && parsed.contains(where: { bridgeRowIsLive($0) })
+    if live, seeProgressButton.superview == nil {
+      addSubview(seeProgressButton)
+      NSLayoutConstraint.activate([
+        seeProgressButton.centerXAnchor.constraint(equalTo: centerXAnchor),
+        seeProgressButton.bottomAnchor.constraint(equalTo: safeAreaLayoutGuide.bottomAnchor, constant: -96),
+      ])
+    }
+    if seeProgressButton.superview != nil {
+      bringSubviewToFront(seeProgressButton)
+      seeProgressButton.isHidden = !live
+    }
   }
 
   @objc private func handleAgentBridgeSelectionChanged(_ notification: Notification) {
     updateAgentBridgeControlTitle()
+    // A live flip of this agent's "Default view" → Agent (set from the profile) is honored
+    // by the presence refresh; model/repo changes are no-ops there, so the user is never
+    // yanked between views by an unrelated selection change.
+    scheduleBridgeAgentPresenceRefresh()
   }
 
   private func handleNativeSend(
@@ -5371,6 +5623,134 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// with that task's prior messages (the user prompt + the agent reply) so the
   /// page is never empty. The default chat list stays the multiplexing surface;
   /// this view is single-task.
+  /// One-shot guard so the legacy pushed "agent view on open" only auto-presents once per
+  /// DM (reset when the peer changes). The in-place host path uses an idempotent presence
+  /// refresh instead and ignores this flag.
+  private var didAutoPresentAgentView = false
+  private var didPrefetchBridgeHistory = false
+  /// True when the in-place agent view was opened manually ("See progress") rather than by
+  /// the Default view = Agent setting. A manual view is left alone by unrelated selection
+  /// changes; an auto view follows a live flip of the Default-view setting.
+  private var bridgeAgentManuallyShown = false
+
+  /// Warm the bridge history list when a Claude/Codex DM opens, so the History surface
+  /// opens instantly (it seeds from `latestAgentBridgeHistory` then refreshes). Cheap:
+  /// one list request (topic titles only), one-shot per DM.
+  private func prefetchBridgeHistoryIfNeeded() {
+    guard window != nil, !didPrefetchBridgeHistory else { return }
+    guard let provider = currentBridgeProvider else { return }
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !chatId.isEmpty else { return }
+    didPrefetchBridgeHistory = true
+    _ = ChatEngine.shared.requestAgentBridgeHistory([
+      "chatId": chatId, "provider": provider, "mode": "list",
+    ])
+  }
+
+  /// When the user set this Claude/Codex profile's default view to "Agent", show the
+  /// agent runtime view instead of the bubble chat. The in-place host path re-evaluates
+  /// presence (idempotent); the legacy push path keeps the one-shot guard.
+  private func presentPreferredAgentViewIfNeeded(retry: Int = 0) {
+    // In-place host path: re-evaluate presence after the engine setters settle, so the
+    // decision doesn't depend on the order chatId / peerId / window arrive in (that
+    // ordering race is what produced the chat→agent→chat shift).
+    if onHostBridgeAgentView != nil {
+      scheduleBridgeAgentPresenceRefresh()
+      return
+    }
+    // Legacy push path (no in-place host wired — e.g. an embedded profile presentation).
+    guard window != nil, !didAutoPresentAgentView else { return }
+    guard let provider = currentBridgeProvider else { return }
+    guard AgentBridgeSelectionStore.defaultView(provider: provider) == .agent else { return }
+    didAutoPresentAgentView = true
+    presentBridgeAgentConversation(provider: provider, animated: false)
+  }
+
+  /// Coalesce DM-context changes into one presence evaluation on the next runloop tick.
+  private func scheduleBridgeAgentPresenceRefresh() {
+    DispatchQueue.main.async { [weak self] in self?.refreshBridgeAgentPresence() }
+  }
+
+  /// Single source of truth for whether the in-place agent runtime view is shown:
+  /// - a hosted view belonging to a DIFFERENT DM (or none now) is torn down;
+  /// - a bridge DM whose Default view is Agent is hosted if not already showing;
+  /// - default Chat leaves a view the user opened manually ("See progress") untouched.
+  private func refreshBridgeAgentPresence(retry: Int = 0) {
+    guard onHostBridgeAgentView != nil else { return }
+    let provider = currentBridgeProvider
+    // A view hosted for a different DM (or no bridge DM now) is always stale — clear it.
+    if let hosted = hostedBridgeAgentProvider?(), hosted != provider {
+      onTearDownBridgeAgentView?()
+      bridgeAgentManuallyShown = false
+    }
+    guard let provider else { return }
+    let wantsAgent = AgentBridgeSelectionStore.defaultView(provider: provider) == .agent
+    let isShown = hostedBridgeAgentProvider?() == provider
+    guard wantsAgent else {
+      // Default view = Chat: tear down an auto-shown agent view (the user flipped the
+      // setting back), but leave a manually-opened "See progress" view in place.
+      if isShown, !bridgeAgentManuallyShown { onTearDownBridgeAgentView?() }
+      return
+    }
+    if isShown { return }
+    guard window != nil else {
+      guard retry < 16 else { return }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+        self?.refreshBridgeAgentPresence(retry: retry + 1)
+      }
+      return
+    }
+    bridgeAgentManuallyShown = false
+    presentBridgeAgentConversation(provider: provider, animated: false)
+  }
+
+  /// Open a DM-level agent runtime view for `provider` (no specific task): seeded with
+  /// the conversation's current rows and kept live via the provider, sending through the
+  /// normal bridge path. Used by the "Agent" default view and the History "See progress".
+  private func presentBridgeAgentConversation(provider: String, animated: Bool = true) {
+    let displayName = provider.capitalized
+    let vc = VibeAgentConversationViewController(
+      title: displayName,
+      subtitle: "",
+      messages: VibeAgentKitMap.messages(from: rows),
+      inputPlaceholder: "Ask \(displayName)",
+      messagesProvider: { [weak self] in
+        guard let self else { return [] }
+        return VibeAgentKitMap.messages(from: self.rows)
+      },
+      onSend: { [weak self] text, _, _ in
+        self?.handleNativeSend(text: text, mentionedAgentUsername: provider)
+      }
+    )
+    vc.agentBridgeProvider = provider
+    vc.runModel = AgentBridgeSelectionStore.selectedModel(provider: provider)
+    vc.deviceLabel = AgentPairingService.lastDeviceLabel
+    vc.deviceConnected = AgentPairingService.lastConnected
+    vc.hidesBottomBarWhenPushed = true
+
+    // Preferred path: host it in-place inside ChatMainView as a page that shares the chat
+    // header chrome (no present/dismiss shift). The host suppresses the VC's own header.
+    if let host = onHostBridgeAgentView {
+      vc.embeddedInChatHost = true
+      host(vc)
+      return
+    }
+
+    guard let owner = topPresentingViewController() else { return }
+    if let nav = owner.navigationController {
+      nav.pushViewController(vc, animated: animated)
+    } else {
+      let nav = UINavigationController(rootViewController: vc)
+      nav.modalPresentationStyle = .fullScreen
+      vc.navigationItem.leftBarButtonItem = UIBarButtonItem(
+        barButtonSystemItem: .close,
+        target: vc,
+        action: #selector(VibeAgentConversationViewController.closeTapped)
+      )
+      owner.present(nav, animated: animated)
+    }
+  }
+
   private func presentAgentConversation(forMessageId messageId: String) {
     guard let agentIndex = rows.firstIndex(where: { $0.messageId == messageId }) else { return }
     let agentRow = rows[agentIndex]
@@ -5402,6 +5782,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if let provider = agentRow.agentRuntime?.provider ?? mentionedAgentUsername ?? currentBridgeProvider {
       vc.agentBridgeProvider = provider
     }
+    // Seed the header so it shows this run's real model + the connected computer.
+    vc.runModel = agentRow.agentRuntime?.model
+    vc.deviceLabel = AgentPairingService.lastDeviceLabel
+    vc.deviceConnected = AgentPairingService.lastConnected
     // Hide any host tab bar while pushed so the composer reaches the true bottom
     // edge (no tab-bar strip/edge under the input).
     vc.hidesBottomBarWhenPushed = true

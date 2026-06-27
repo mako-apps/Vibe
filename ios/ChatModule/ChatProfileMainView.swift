@@ -1046,11 +1046,6 @@ private struct ChatProfileModernRowView: View {
     .background(
       RoundedRectangle(cornerRadius: 24, style: .continuous)
         .fill(.ultraThinMaterial)
-        .overlay(Color(uiColor: cardColor))
-    )
-    .overlay(
-      RoundedRectangle(cornerRadius: 24, style: .continuous)
-        .stroke(Color(uiColor: separatorColor).opacity(isDark ? 0.92 : 0.65), lineWidth: 1)
     )
     .padding(.horizontal, 14)
     .padding(.vertical, 4)
@@ -1104,6 +1099,10 @@ private struct ChatProfileScrollOffsetPreferenceKey: PreferenceKey {
   }
 }
 
+fileprivate class ChatProfileNavigationCoordinator: ObservableObject {
+  @Published fileprivate var path: [ChatProfileSwiftUIDestination] = []
+}
+
 private struct ChatProfileSwiftUIRootView: View {
   let profileName: String
   let username: String
@@ -1137,10 +1136,14 @@ private struct ChatProfileSwiftUIRootView: View {
   let onContentPressed: ([String: Any]) -> Void
 
   @Namespace private var morphNamespace
-  @State private var path: [ChatProfileSwiftUIDestination] = []
+  @StateObject private var navCoordinator = ChatProfileNavigationCoordinator()
   @State private var localScrollOffset: CGFloat = 0
   @State private var lastReportedScrollOffset: CGFloat = -1
   @State private var stickyTitleVisible = false
+  @State private var newChatTrigger = false
+  /// Per-agent default view (chat vs agent runtime) for Claude/Codex. Seeded from the
+  /// store when the section appears; the picker writes back through the store.
+  @State private var bridgeDefaultView: AgentBridgeDefaultView = .chat
 
   private var rowFill: Color {
     Color(uiColor: posterGradientColors.0).opacity(isDark ? 0.055 : 0.11)
@@ -1155,7 +1158,11 @@ private struct ChatProfileSwiftUIRootView: View {
   }
 
   private var posterGradientColors: (UIColor, UIColor) {
-    ChatProfileAppearancePalette.colors(for: appearanceSelection, mode: .poster)
+    if usesDefaultPoster && hasProfileImage {
+      let softDark = UIColor(red: 0.12, green: 0.12, blue: 0.12, alpha: 1.0)
+      return (softDark, softDark)
+    }
+    return ChatProfileAppearancePalette.colors(for: appearanceSelection, mode: .poster)
   }
 
   private var usesDefaultPoster: Bool {
@@ -1182,19 +1189,21 @@ private struct ChatProfileSwiftUIRootView: View {
 
   var body: some View {
     GeometryReader { geometry in
-      NavigationStack(path: $path) {
+      NavigationStack(path: $navCoordinator.path) {
         ZStack {
           profileBackdrop
 
-          if path.isEmpty {
-            ChatProfileHeroReflection(
-              colors: avatarGradientColors,
-              width: geometry.size.width,
-              screenHeight: geometry.size.height,
-              size: heroAvatarSize,
-              top: heroReflectionTop(safeTop: geometry.safeAreaInsets.top)
-            )
-            .allowsHitTesting(false)
+          if navCoordinator.path.isEmpty {
+            if hasProfileImage, let avatarUri = avatarUri {
+              ChatProfileHeroReflection(
+                imageUri: avatarUri,
+                width: geometry.size.width,
+                screenHeight: geometry.size.height,
+                size: heroAvatarSize,
+                top: heroReflectionTop(safeTop: geometry.safeAreaInsets.top)
+              )
+              .allowsHitTesting(false)
+            }
 
             ChatProfileHeroAvatar(
               text: avatarDisplayText,
@@ -1229,10 +1238,11 @@ private struct ChatProfileSwiftUIRootView: View {
               .padding(.horizontal, 28)
 
               profileInfoSection
+              if !bridgeProvider.isEmpty {
+                defaultViewSection
+              }
               if bridgeProvider.isEmpty {
                 historySection
-              } else {
-                bridgeHistorySection
               }
               if bridgeProvider.isEmpty {
                 appearanceSection
@@ -1246,16 +1256,18 @@ private struct ChatProfileSwiftUIRootView: View {
             .padding(.horizontal, 16)
             .padding(.bottom, 38)
           }
+          .ignoresSafeArea(edges: .top)
           .coordinateSpace(name: "profile-scroll")
           .scrollIndicators(.visible)
           .background(Color.clear)
         }
         .background(Color.clear)
+        .ignoresSafeArea(edges: .top)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.visible, for: .navigationBar)
         .toolbarBackground(.hidden, for: .navigationBar)
         .toolbar {
-          if path.isEmpty {
+          if navCoordinator.path.isEmpty {
             ToolbarItem(placement: .topBarLeading) {
               Button {
                 onAction("headerBack")
@@ -1290,13 +1302,17 @@ private struct ChatProfileSwiftUIRootView: View {
           }
         }
         .navigationDestination(for: ChatProfileSwiftUIDestination.self) { destination in
-          destinationView(for: destination)
-            .navigationTransition(.zoom(sourceID: destination.transitionID, in: morphNamespace))
+          if case .bridgeSession = destination {
+            destinationView(for: destination)
+          } else {
+            destinationView(for: destination)
+              .navigationTransition(.zoom(sourceID: destination.transitionID, in: morphNamespace))
+          }
         }
       }
       .background(Color.clear)
       .tint(.primary)
-      .onChange(of: path.isEmpty) { _, isEmpty in
+      .onChange(of: navCoordinator.path.isEmpty) { _, isEmpty in
         onNavigationActiveChanged(!isEmpty)
       }
     }
@@ -1567,6 +1583,43 @@ private struct ChatProfileSwiftUIRootView: View {
     return "Not connected — tap to connect"
   }
 
+  /// Claude/Codex only: pick whether opening this agent's DM lands in the classic chat
+  /// (bubbles + wallpaper) or jumps straight to the full-page agent runtime view.
+  private var defaultViewSection: some View {
+    ChatProfileSwiftUISection(fill: rowFill) {
+      Menu {
+        Picker("Default view", selection: bridgeDefaultViewBinding) {
+          ForEach(AgentBridgeDefaultView.allCases) { option in
+            Text(option.title).tag(option)
+          }
+        }
+      } label: {
+        ChatProfileSwiftUIRow(
+          title: "Default view",
+          subtitle: bridgeDefaultView.subtitle,
+          trailingSystemImage: "chevron.up.chevron.down",
+          showsChevron: false,
+          separatorColor: separatorColor,
+          isLast: true
+        )
+      }
+      .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+    }
+    .onAppear {
+      bridgeDefaultView = AgentBridgeSelectionStore.defaultView(provider: bridgeProvider)
+    }
+  }
+
+  private var bridgeDefaultViewBinding: Binding<AgentBridgeDefaultView> {
+    Binding(
+      get: { bridgeDefaultView },
+      set: { newValue in
+        bridgeDefaultView = newValue
+        AgentBridgeSelectionStore.setDefaultView(provider: bridgeProvider, newValue)
+      }
+    )
+  }
+
   private var historySection: some View {
     ChatProfileSwiftUISection(fill: rowFill) {
       NavigationLink(value: ChatProfileSwiftUIDestination.history) {
@@ -1726,7 +1779,7 @@ private struct ChatProfileSwiftUIRootView: View {
         connected: bridgeConnected,
         paired: bridgePaired,
         onOpenSession: { session in
-          path.append(.bridgeSession(session))
+          navCoordinator.path.append(.bridgeSession(session))
         }
       )
       .background(Color(uiColor: UIColor.systemGroupedBackground))
@@ -1735,11 +1788,38 @@ private struct ChatProfileSwiftUIRootView: View {
         provider: bridgeProvider,
         chatId: bridgeChatId,
         session: session,
-        subtitle: session.displayProjectName
+        subtitle: session.displayProjectName,
+        newChatTrigger: $newChatTrigger
       )
+      .ignoresSafeArea()
       .navigationTitle(session.topic)
       .navigationBarTitleDisplayMode(.inline)
-      .ignoresSafeArea(.container, edges: .bottom)
+      .toolbar {
+        ToolbarItem(placement: .principal) {
+          Text(session.topic)
+            .font(.system(size: 15, weight: .semibold))
+            .foregroundStyle(.primary)
+            .lineLimit(1)
+            .minimumScaleFactor(0.78)
+        }
+        ToolbarItem(placement: .topBarTrailing) {
+          HStack(spacing: 14) {
+            Button {
+              newChatTrigger = true
+            } label: {
+              Image(systemName: "square.and.pencil")
+            }
+
+            Menu {
+              Button("Pin", systemImage: "pin") {}
+              Button("Files", systemImage: "folder") {}
+            } label: {
+              Image(systemName: "ellipsis")
+            }
+          }
+          .padding(.trailing, 8)
+        }
+      }
     case .appearance:
       ChatProfileAppearanceEditorView(
         profileName: profileName,
@@ -1776,59 +1856,66 @@ private struct ChatProfileAvatarGlyph: View {
 }
 
 private struct ChatProfileHeroReflection: View {
-  let colors: (UIColor, UIColor)
+  let imageUri: String
   let width: CGFloat
   let screenHeight: CGFloat
   let size: CGFloat
   let top: CGFloat
 
+  @State private var image: UIImage?
+  @State private var loadedUri: String?
+
   var body: some View {
-    let paintWidth = max(width * 1.75, size * 4.1)
-    let reflectionHeight = max(screenHeight * 0.38, size * 2.18)
+    let paintWidth = max(width * 1.85, size * 4.5)
+    let reflectionHeight = max(screenHeight * 0.42, size * 2.5)
 
     VStack(spacing: 0) {
       ZStack {
-        RoundedRectangle(cornerRadius: max(42, size * 0.34), style: .continuous)
-          .fill(
-            LinearGradient(
-              colors: [
-                Color(uiColor: colors.0).opacity(0.44),
-                Color(uiColor: colors.1).opacity(0.24),
-                Color.black.opacity(0.02),
-              ],
-              startPoint: .top,
-              endPoint: .bottom
-            )
-          )
-          .frame(width: paintWidth * 0.80, height: reflectionHeight * 0.92)
-          .blur(radius: 54)
-
-        RoundedRectangle(cornerRadius: max(20, size * 0.14), style: .continuous)
-          .fill(Color(uiColor: colors.0).opacity(0.18))
-          .frame(width: paintWidth * 0.64, height: reflectionHeight * 0.50)
-          .blur(radius: 40)
-          .offset(y: -size * 0.02)
+        if loadedUri == normalizedImageUri, let image {
+          Image(uiImage: image)
+            .resizable()
+            .scaledToFill()
+            .frame(width: paintWidth * 0.85, height: reflectionHeight * 0.95)
+            .clipShape(RoundedRectangle(cornerRadius: max(60, size * 0.45), style: .continuous))
+            .blur(radius: 40)
+            .opacity(0.85)
+        }
       }
       .frame(width: width, height: reflectionHeight)
-      .mask(
-        LinearGradient(
-          stops: [
-            .init(color: .clear, location: 0.0),
-            .init(color: .black.opacity(0.42), location: 0.06),
-            .init(color: .black, location: 0.28),
-            .init(color: .black.opacity(0.80), location: 0.74),
-            .init(color: .clear, location: 1.0),
-          ],
-          startPoint: .top,
-          endPoint: .bottom
-        )
-      )
       .frame(maxWidth: .infinity)
       .padding(.top, max(0, top - reflectionHeight * 0.06))
 
       Spacer(minLength: 0)
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    .task(id: normalizedImageUri ?? "") {
+      await loadImage()
+    }
+  }
+
+  private var normalizedImageUri: String? {
+    let value = imageUri.trimmingCharacters(in: .whitespacesAndNewlines)
+    return value.isEmpty ? nil : value
+  }
+
+  @MainActor
+  private func loadImage() async {
+    let normalized = normalizedImageUri
+    if loadedUri != normalized {
+      loadedUri = normalized
+      image = normalized.flatMap { ChatAvatarImageStore.cached(for: $0) }
+    }
+    guard let normalized else {
+      image = nil
+      return
+    }
+    if let cached = ChatAvatarImageStore.cached(for: normalized) {
+      image = cached
+      return
+    }
+    let loaded = await ChatAvatarImageStore.load(from: normalized)
+    guard !Task.isCancelled, loadedUri == normalized else { return }
+    image = loaded
   }
 }
 
@@ -2595,27 +2682,15 @@ private struct ChatProfileSwiftUISection<Content: View>: View {
   let fill: Color
   @ViewBuilder let content: Content
 
-  private var materialStyle: UIBlurEffect.Style {
-    colorScheme == .dark ? .systemUltraThinMaterialDark : .systemUltraThinMaterialLight
-  }
-
-  private var glassLift: Color {
-    colorScheme == .dark ? Color.white.opacity(0.030) : Color.white.opacity(0.12)
-  }
-
   var body: some View {
     let shape = RoundedRectangle(cornerRadius: 24, style: .continuous)
     VStack(spacing: 0) {
       content
     }
     .background {
-      ChatProfileSwiftUIMaterialBackground(style: materialStyle)
-        .clipShape(shape)
-      shape.fill(fill)
-      shape.fill(glassLift)
+      shape.fill(.ultraThinMaterial)
     }
     .clipShape(shape)
-    .overlay(shape.stroke(Color.white.opacity(colorScheme == .dark ? 0.10 : 0.20), lineWidth: 1))
   }
 }
 
@@ -2696,10 +2771,6 @@ private struct ChatProfileSwiftUIActionButton: View {
   let fill: Color
   let action: () -> Void
 
-  private var materialStyle: UIBlurEffect.Style {
-    colorScheme == .dark ? .systemUltraThinMaterialDark : .systemUltraThinMaterialLight
-  }
-
   var body: some View {
     Button(action: action) {
       VStack(spacing: 7) {
@@ -2707,11 +2778,8 @@ private struct ChatProfileSwiftUIActionButton: View {
           .font(.system(size: 22, weight: .semibold))
           .frame(width: 52, height: 52)
           .background {
-            ChatProfileSwiftUIMaterialBackground(style: materialStyle)
-              .clipShape(Circle())
-            Circle().fill(Color.white.opacity(colorScheme == .dark ? 0.045 : 0.18))
+            Circle().fill(.thinMaterial)
           }
-          .overlay(Circle().stroke(Color.white.opacity(colorScheme == .dark ? 0.16 : 0.28), lineWidth: 1))
           .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.18 : 0.08), radius: 10, x: 0, y: 5)
 
         Text(title)

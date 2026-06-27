@@ -1303,7 +1303,7 @@ private final class ChatsViewModel: ObservableObject {
 }
 
 @MainActor
-private final class ContactDirectoryViewModel: ObservableObject {
+final class ContactDirectoryViewModel: ObservableObject {
   @Published var rows: [ChatHomeListRow] = []
   @Published var isLoading = false
   @Published var errorMessage: String?
@@ -1375,6 +1375,7 @@ private struct ChatHomeScreen: View {
   @State private var errorMessage: String?
   @State private var pendingRoomCreationKind: ChatRoomCreationKind?
   @State private var roomCreationName = ""
+  @State private var isShowingGroupCreation = false
   @State private var homeSearchQuery = ""
   @State private var isHomeSearchFocused = false
   /// Global username/phone/ID lookups (incl. Claude/Codex) for the search drawer.
@@ -1561,6 +1562,14 @@ private struct ChatHomeScreen: View {
           ContactSearchView(config: config) { payload in
             handleSearchPayload(payload)
           }
+        }
+      }
+    }
+    .sheet(isPresented: $isShowingGroupCreation) {
+      if let config = AppSessionConfig.current {
+        ChatGroupCreationSheet(config: config) { route in
+          coordinator.openChat(route)
+          Task { await model.refresh() }
         }
       }
     }
@@ -1782,7 +1791,11 @@ private struct ChatHomeScreen: View {
     if action == "newGroup" || action == "newChannel" {
       isShowingSearch = false
       roomCreationName = ""
-      pendingRoomCreationKind = action == "newGroup" ? .group : .channel
+      if action == "newGroup" {
+        isShowingGroupCreation = true
+      } else {
+        pendingRoomCreationKind = .channel
+      }
       return
     }
 
@@ -2657,6 +2670,7 @@ private struct ContactsPageView: View {
   @State private var errorMessage: String?
   @State private var pendingRoomCreationKind: ChatRoomCreationKind?
   @State private var roomCreationName = ""
+  @State private var isShowingGroupCreation = false
 
   private var palette: AppThemePalette {
     AppThemePalette.resolve(for: colorScheme)
@@ -2767,6 +2781,14 @@ private struct ContactsPageView: View {
         }
       }
     }
+    .sheet(isPresented: $isShowingGroupCreation) {
+      if let config = AppSessionConfig.current {
+        ChatGroupCreationSheet(config: config) { route in
+          coordinator.openChat(route)
+          Task { await model.refresh() }
+        }
+      }
+    }
     .alert(
       pendingRoomCreationKind?.title ?? "",
       isPresented: Binding(
@@ -2812,7 +2834,11 @@ private struct ContactsPageView: View {
     if action == "newGroup" || action == "newChannel" {
       isShowingSearch = false
       roomCreationName = ""
-      pendingRoomCreationKind = action == "newGroup" ? .group : .channel
+      if action == "newGroup" {
+        isShowingGroupCreation = true
+      } else {
+        pendingRoomCreationKind = .channel
+      }
       return
     }
 
@@ -3256,6 +3282,12 @@ final class ChatConversationController: UIViewController {
       name: ChatEngine.didChangeNotification,
       object: nil
     )
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleAgentBridgeSelectionChanged(_:)),
+      name: AgentBridgeSelectionStore.didChangeNotification,
+      object: nil
+    )
 
     applyRoute(forceChannelRefresh: true)
   }
@@ -3305,6 +3337,11 @@ final class ChatConversationController: UIViewController {
     NotificationCenter.default.removeObserver(
       self,
       name: ChatEngine.didChangeNotification,
+      object: nil
+    )
+    NotificationCenter.default.removeObserver(
+      self,
+      name: AgentBridgeSelectionStore.didChangeNotification,
       object: nil
     )
     postPresentationActivationWorkItem?.cancel()
@@ -3397,6 +3434,7 @@ final class ChatConversationController: UIViewController {
       "ChatConversationController configureRouteSurfaceStart chatId=\(route.chatId) reason=applyRoute")
     markRouteSurfaceStep("header")
     mainView.setHeaderMode(route.chatId == "saved_messages" ? "savedmessages" : "default")
+    mainView.setBridgeProvider(route.bridgeProvider ?? "")
     mainView.setHeaderTitle(route.title)
     mainView.setHeaderUnreadCount(route.unreadCount)
     mainView.setProfileName(route.title)
@@ -3616,11 +3654,14 @@ final class ChatConversationController: UIViewController {
     let displayName = ChatRoute.bridgeDisplayName(for: provider)
     let root = AgentBridgeRepositoryPickerView(
       provider: provider, displayName: displayName, chatId: route.chatId)
+      .preferredColorScheme(isDark ? .dark : .light)
     let host = UIHostingController(rootView: root)
     host.modalPresentationStyle = .pageSheet
+    host.view.backgroundColor = .clear
     if let sheet = host.sheetPresentationController {
       sheet.detents = [.medium(), .large()]
       sheet.prefersGrabberVisible = true
+      sheet.preferredCornerRadius = 28
     }
     present(host, animated: true)
   }
@@ -4399,8 +4440,24 @@ final class ChatConversationController: UIViewController {
     }
   }
 
+  @objc private func handleAgentBridgeSelectionChanged(_ notification: Notification) {
+    guard route.bridgeProvider?.isEmpty == false else { return }
+    refreshHeaderState()
+  }
+
   private static func isOnline(for route: ChatRoute) -> Bool {
     ChatEngine.shared.isUserOnline(userId: route.peerUserId)
+  }
+
+  private static func bridgeHeaderSubtitle(for route: ChatRoute) -> String? {
+    guard let provider = route.bridgeProvider?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !provider.isEmpty
+    else {
+      return nil
+    }
+    let repoName = AgentBridgeSelectionStore.selectedRepository()?.name
+      .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return repoName.isEmpty ? "Pick repository" : repoName
   }
 
   private static func headerSubtitle(for route: ChatRoute) -> String {
@@ -4408,7 +4465,13 @@ final class ChatConversationController: UIViewController {
       return "Saved Messages"
     }
     if ChatEngine.shared.isTyping(["chatId": route.chatId]) {
+      if route.bridgeProvider?.isEmpty == false {
+        return "Running task"
+      }
       return "typing..."
+    }
+    if let bridgeSubtitle = bridgeHeaderSubtitle(for: route) {
+      return bridgeSubtitle
     }
     if isOnline(for: route) {
       return "online"
@@ -4427,6 +4490,9 @@ final class ChatConversationController: UIViewController {
   private static func routeOnlyHeaderSubtitle(for route: ChatRoute) -> String {
     if route.chatId == "saved_messages" {
       return "Saved Messages"
+    }
+    if let bridgeSubtitle = bridgeHeaderSubtitle(for: route) {
+      return bridgeSubtitle
     }
     if route.isGroup {
       return "group"
@@ -5030,6 +5096,7 @@ private struct ContactSearchView: View {
   @State private var statusText = ""
   @State private var searchTask: Task<Void, Never>?
   @FocusState private var isQueryFieldFocused: Bool
+  @StateObject private var directoryModel = ContactDirectoryViewModel()
 
   private var palette: AppThemePalette {
     AppThemePalette.resolve(for: colorScheme)
@@ -5040,132 +5107,210 @@ private struct ContactSearchView: View {
   }
 
   var body: some View {
-    List {
-      Section {
-        ContactSearchActionRow(
-          title: "New Group",
-          systemImage: "person.2",
-          palette: palette
-        ) {
-          onResult(["action": "newGroup"])
-          dismiss()
-        }
-
-        ContactSearchActionRow(
-          title: "New Contact",
-          systemImage: "person.badge.plus",
-          palette: palette
-        ) {
+    contactList
+      .listStyle(.insetGrouped)
+      .scrollContentBackground(.hidden)
+      .background(palette.background.ignoresSafeArea())
+      .navigationTitle("New Message")
+      .navigationBarTitleDisplayMode(.inline)
+      .onAppear {
+        DispatchQueue.main.async {
           isQueryFieldFocused = true
         }
-
-        ContactSearchActionRow(
-          title: "New Channel",
-          systemImage: "megaphone",
-          palette: palette
-        ) {
-          onResult(["action": "newChannel"])
-          dismiss()
-        }
       }
-      .listRowBackground(Color.clear)
-      .listRowSeparatorTint(palette.border)
-
-      Section {
-        HStack(spacing: 10) {
-          Image(systemName: "magnifyingglass")
-            .foregroundStyle(palette.secondaryText)
-          TextField("Username, phone, or ID", text: $query)
-            .focused($isQueryFieldFocused)
-            .textInputAutocapitalization(.never)
-            .autocorrectionDisabled()
-            .submitLabel(.search)
-            .onSubmit { scheduleSearch(immediate: true) }
-          if isLoading {
-            ProgressView().controlSize(.small)
-          } else if !query.isEmpty {
-            Button {
-              query = ""
-              results = []
-              hasSearched = false
-              isQueryFieldFocused = true
-            } label: {
-              Image(systemName: "xmark.circle.fill")
-                .foregroundStyle(palette.secondaryText)
-            }
-            .buttonStyle(.plain)
+      .task {
+        await directoryModel.loadIfNeeded()
+      }
+      .onChange(of: query) { _, _ in
+        scheduleSearch(immediate: false)
+      }
+      .onDisappear { searchTask?.cancel() }
+      .toolbar {
+        ToolbarItem(placement: .topBarLeading) {
+          Button("Close") {
+            onResult(["action": "cancel"])
+            dismiss()
           }
         }
       }
-      .listRowBackground(palette.card)
+  }
 
-      if !results.isEmpty {
-        Section("People") {
-          ForEach(results) { user in
-            ContactSearchResultRow(
-              user: user,
-              isSaved: savedUserIDs.contains(user.userID),
-              palette: palette
-            )
-            .contentShape(Rectangle())
-            .onTapGesture { open(user, action: "chat") }
-            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-              Button {
-                open(user, action: "call")
-              } label: {
-                Label("Call", systemImage: "phone.fill")
-              }
-              .tint(.green)
-
-              if !savedUserIDs.contains(user.userID) {
-                Button {
-                  savedUserIDs.insert(user.userID)
-                  onResult(["action": "saveContact", "user": user.payload])
-                } label: {
-                  Label("Add", systemImage: "person.badge.plus")
-                }
-                .tint(palette.accent)
-              }
-            }
-          }
-        }
-        .listRowBackground(palette.card)
-      } else {
-        Section {
-          ContactSearchStatusView(
-            isLoading: isLoading,
-            hasSearched: hasSearched,
-            message: statusText,
-            palette: palette
-          )
-          .frame(maxWidth: .infinity)
-          .listRowBackground(Color.clear)
-          .listRowSeparator(.hidden)
-        }
-      }
+  private var contactList: some View {
+    List {
+      actionSection
+      searchSection
+      contentSection
     }
-    .listStyle(.insetGrouped)
-    .scrollContentBackground(.hidden)
-    .background(palette.background.ignoresSafeArea())
-    .navigationTitle("New Message")
-    .navigationBarTitleDisplayMode(.inline)
-    .onAppear {
-      DispatchQueue.main.async {
+  }
+
+  private var actionSection: some View {
+    Section {
+      ContactSearchActionRow(
+        title: "New Group",
+        systemImage: "person.2",
+        palette: palette
+      ) {
+        onResult(["action": "newGroup"])
+        dismiss()
+      }
+
+      ContactSearchActionRow(
+        title: "New Contact",
+        systemImage: "person.badge.plus",
+        palette: palette
+      ) {
         isQueryFieldFocused = true
       }
+
+      ContactSearchActionRow(
+        title: "New Channel",
+        systemImage: "megaphone",
+        palette: palette
+      ) {
+        onResult(["action": "newChannel"])
+        dismiss()
+      }
     }
-    .onChange(of: query) { _, _ in
-      scheduleSearch(immediate: false)
-    }
-    .onDisappear { searchTask?.cancel() }
-    .toolbar {
-      ToolbarItem(placement: .topBarLeading) {
-        Button("Close") {
-          onResult(["action": "cancel"])
-          dismiss()
+    .listRowBackground(Color.clear)
+    .listRowSeparatorTint(palette.border)
+  }
+
+  private var searchSection: some View {
+    Section {
+      HStack(spacing: 10) {
+        Image(systemName: "magnifyingglass")
+          .foregroundStyle(palette.secondaryText)
+        TextField("Username, phone, or ID", text: $query)
+          .focused($isQueryFieldFocused)
+          .textInputAutocapitalization(.never)
+          .autocorrectionDisabled()
+          .submitLabel(.search)
+          .onSubmit { scheduleSearch(immediate: true) }
+        if isLoading {
+          ProgressView().controlSize(.small)
+        } else if !query.isEmpty {
+          Button(action: clearSearch) {
+            Image(systemName: "xmark.circle.fill")
+              .foregroundStyle(palette.secondaryText)
+          }
+          .buttonStyle(.plain)
         }
       }
     }
+    .listRowBackground(palette.card)
+  }
+
+  @ViewBuilder
+  private var contentSection: some View {
+    if !results.isEmpty {
+      peopleSection
+    } else if query.isEmpty {
+      recentAndAgentsSection
+    } else {
+      statusSection
+    }
+  }
+
+  private var peopleSection: some View {
+    Section("People") {
+      ForEach(results) { user in
+        ContactSearchResultRow(
+          user: user,
+          isSaved: savedUserIDs.contains(user.userID),
+          palette: palette
+        )
+        .contentShape(Rectangle())
+        .onTapGesture { open(user, action: "chat") }
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+          Button {
+            open(user, action: "call")
+          } label: {
+            Label("Call", systemImage: "phone.fill")
+          }
+          .tint(.green)
+
+          if !savedUserIDs.contains(user.userID) {
+            Button {
+              savedUserIDs.insert(user.userID)
+              onResult(["action": "saveContact", "user": user.payload])
+            } label: {
+              Label("Add", systemImage: "person.badge.plus")
+            }
+            .tint(palette.accent)
+          }
+        }
+      }
+    }
+    .listRowBackground(palette.card)
+  }
+
+  private var recentAndAgentsSection: some View {
+    Section("Recent & Local Agents") {
+      ForEach(localAgentUsers) { user in
+        ContactSearchResultRow(user: user, isSaved: false, palette: palette)
+          .contentShape(Rectangle())
+          .onTapGesture { open(user, action: "chat") }
+      }
+
+      ForEach(directoryModel.rows, id: \.chatId) { row in
+        let user = contactUser(for: row)
+        ContactSearchResultRow(user: user, isSaved: false, palette: palette)
+          .contentShape(Rectangle())
+          .onTapGesture { open(user, action: "chat") }
+      }
+    }
+    .listRowBackground(palette.card)
+  }
+
+  private var statusSection: some View {
+    Section {
+      ContactSearchStatusView(
+        isLoading: isLoading,
+        hasSearched: hasSearched,
+        message: statusText,
+        palette: palette
+      )
+      .frame(maxWidth: .infinity)
+      .listRowBackground(Color.clear)
+      .listRowSeparator(.hidden)
+    }
+  }
+
+  private var localAgentUsers: [ContactSearchUser] {
+    [
+      [
+        "userId": "claude",
+        "username": "Claude",
+        "handle": "claude",
+        "isAgent": true,
+        "agentId": "claude",
+      ],
+      [
+        "userId": "codex",
+        "username": "Codex",
+        "handle": "codex",
+        "isAgent": true,
+        "agentId": "codex",
+      ],
+    ].compactMap(ContactSearchUser.init(payload:))
+  }
+
+  private func contactUser(for row: ChatHomeListRow) -> ContactSearchUser {
+    ContactSearchUser(payload: [
+      "userId": row.chatId,
+      "username": row.title,
+      "displayName": row.title,
+      "profileImage": row.avatarUri ?? "",
+      "isAgent": row.isAgentFriend,
+      "agentId": row.peerAgentId ?? "",
+    ])!
+  }
+
+  private func clearSearch() {
+    query = ""
+    results = []
+    hasSearched = false
+    isQueryFieldFocused = true
   }
 
   private func open(_ user: ContactSearchUser, action: String) {
@@ -5300,22 +5445,22 @@ private struct ContactSearchActionRow: View {
 
   var body: some View {
     Button(action: action) {
-      HStack(spacing: 18) {
+      HStack(spacing: 16) {
         Image(systemName: systemImage)
-          .font(.system(size: 27, weight: .regular))
+          .font(.system(size: 20, weight: .regular))
           .symbolRenderingMode(.hierarchical)
           .foregroundStyle(palette.accent)
-          .frame(width: 44, height: 44)
+          .frame(width: 32, height: 32)
 
         Text(title)
-          .font(.system(size: 26, weight: .regular))
+          .font(.system(size: 17, weight: .regular))
           .foregroundStyle(palette.accent)
           .lineLimit(1)
           .minimumScaleFactor(0.82)
 
         Spacer(minLength: 8)
       }
-      .padding(.vertical, 6)
+      .padding(.vertical, 4)
       .contentShape(Rectangle())
     }
     .buttonStyle(.plain)
@@ -5357,7 +5502,7 @@ private struct ContactSearchStatusView: View {
   }
 }
 
-private struct ContactSearchUser: Identifiable {
+struct ContactSearchUser: Identifiable {
   let userID: String
   let username: String
   let handle: String?
@@ -5522,7 +5667,7 @@ private func appShellSanitizedServerBody(_ body: String) -> String {
   return String(trimmed.prefix(180))
 }
 
-private enum ContactSearchService {
+enum ContactSearchService {
   static func search(config: AppSessionConfig, query: String) async throws -> [ContactSearchUser] {
     let activeConfig = AppSessionConfig.current ?? config
     do {
@@ -5648,7 +5793,7 @@ private enum ContactSearchService {
   }
 }
 
-private enum ContactSearchServiceError: LocalizedError {
+enum ContactSearchServiceError: LocalizedError {
   case invalidURL
   case invalidResponse
   case http(Int, String)
@@ -5679,7 +5824,7 @@ private struct ChatCreateResult {
   let messages: [[String: Any]]
 }
 
-private enum ChatRoomCreationKind {
+enum ChatRoomCreationKind {
   case group
   case channel
 
@@ -5712,28 +5857,28 @@ private enum ChatRoomCreationKind {
   }
 }
 
-private struct ChatRoomCreateResult {
+struct ChatRoomCreateResult {
   let chatID: String
   let name: String
   let type: String
 }
 
-private enum ChatRoomCreateService {
-  static func create(kind: ChatRoomCreationKind, config: AppSessionConfig, name: String) async throws -> ChatRoomCreateResult {
+enum ChatRoomCreateService {
+  static func create(kind: ChatRoomCreationKind, config: AppSessionConfig, name: String, memberIds: [String] = []) async throws -> ChatRoomCreateResult {
     let activeConfig = AppSessionConfig.current ?? config
     do {
-      return try await createOnce(kind: kind, config: activeConfig, name: name)
+      return try await createOnce(kind: kind, config: activeConfig, name: name, memberIds: memberIds)
     } catch let error as ChatDirectMessageServiceError {
       guard error.isSessionExpired else {
         throw error
       }
       let refreshedConfig = try await AppSessionRefreshService.refresh(config: activeConfig)
-      return try await createOnce(kind: kind, config: refreshedConfig, name: name)
+      return try await createOnce(kind: kind, config: refreshedConfig, name: name, memberIds: memberIds)
     }
   }
 
-  private static func createOnce(kind: ChatRoomCreationKind, config: AppSessionConfig, name: String) async throws -> ChatRoomCreateResult {
-    let request = try buildRequest(kind: kind, config: config, name: name)
+  private static func createOnce(kind: ChatRoomCreationKind, config: AppSessionConfig, name: String, memberIds: [String] = []) async throws -> ChatRoomCreateResult {
+    let request = try buildRequest(kind: kind, config: config, name: name, memberIds: memberIds)
 
     switch config.transportMode {
     case .offline:
@@ -5763,7 +5908,7 @@ private enum ChatRoomCreateService {
     }
   }
 
-  private static func buildRequest(kind: ChatRoomCreationKind, config: AppSessionConfig, name: String) throws -> URLRequest {
+  private static func buildRequest(kind: ChatRoomCreationKind, config: AppSessionConfig, name: String, memberIds: [String] = []) throws -> URLRequest {
     var base = config.apiBaseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
     while base.hasSuffix("/") {
       base.removeLast()
@@ -5783,7 +5928,7 @@ private enum ChatRoomCreateService {
 
     var body: [String: Any] = ["name": name]
     if case .group = kind {
-      body["memberIds"] = []
+      body["memberIds"] = memberIds
     }
 
     var request = URLRequest(url: url)

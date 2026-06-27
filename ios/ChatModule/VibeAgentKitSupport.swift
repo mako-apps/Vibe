@@ -43,8 +43,8 @@ struct VibeAgentKitChatAppearance {
     textTertiary: UIColor(red: 0.5451, green: 0.5294, blue: 0.5020, alpha: 1.0),
     border: UIColor(red: 0.2667, green: 0.2118, blue: 0.1843, alpha: 1.0),
     primary: UIColor(red: 0.7608, green: 0.6078, blue: 0.4784, alpha: 1.0),
-    // Dark warm charcoal — noticeably above pure black but stays within the app's warm dark palette
-    userBubbleBackground: UIColor(red: 0.148, green: 0.137, blue: 0.127, alpha: 1.0),
+    // Neutral near-black — matches Resolo's dark-mode user bubble color (0.105, 0.105, 0.110)
+    userBubbleBackground: UIColor(red: 0.105, green: 0.105, blue: 0.110, alpha: 1.0),
     userBubbleText: UIColor(red: 0.9529, green: 0.9451, blue: 0.9294, alpha: 1.0),
     userBubbleBorder: UIColor(red: 0.2667, green: 0.2118, blue: 0.1843, alpha: 1.0)
   )
@@ -81,6 +81,10 @@ struct VibeAgentKitChatMessage: Equatable {
   var progress: [String]
   var progressItems: [VibeAgentKitProgressItem]
   var runtime: ChatListRow.AgentRuntimeSummary?
+  /// A /compact context-summary turn — renders as a centered, collapsible mid-chat
+  /// divider ("Context compacted") rather than a left assistant bubble. `text` holds
+  /// the raw summary that the divider reveals when expanded.
+  var isCompactionSummary: Bool
 
   init(
     id: String,
@@ -97,7 +101,8 @@ struct VibeAgentKitChatMessage: Equatable {
     progressCompletedAt: String? = nil,
     progress: [String] = [],
     progressItems: [VibeAgentKitProgressItem] = [],
-    runtime: ChatListRow.AgentRuntimeSummary? = nil
+    runtime: ChatListRow.AgentRuntimeSummary? = nil,
+    isCompactionSummary: Bool = false
   ) {
     self.id = id
     self.role = role
@@ -114,6 +119,7 @@ struct VibeAgentKitChatMessage: Equatable {
     self.progress = progress
     self.progressItems = progressItems
     self.runtime = runtime
+    self.isCompactionSummary = isCompactionSummary
   }
 }
 
@@ -171,6 +177,19 @@ struct VibeAgentKitProgressItem: Equatable {
   let image: String?
   let itemType: String?
   let sourceUrl: String?
+  // Per-node detail (full-page agent view step rows). Defaulted so the legacy
+  // agent-stream constructor (`from(label:raw:)`) keeps compiling unchanged; the
+  // bridge full-page path (`VibeAgentKitMap.progressItem`) populates them.
+  // `nodeId` keys this row's inline expand state; `command`/`patch`/`fileContent`
+  // are the decrypted expand-layer bodies; `lineStart`/`lineEnd` drive the read
+  // preview's "(12–48)" range.
+  var nodeId: String? = nil
+  var command: String? = nil
+  var patch: String? = nil
+  var fileName: String? = nil
+  var fileContent: String? = nil
+  var lineStart: Int? = nil
+  var lineEnd: Int? = nil
 
   static func from(label: String, raw: [String: Any]?, eventType: String = "progress")
     -> VibeAgentKitProgressItem

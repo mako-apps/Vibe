@@ -247,6 +247,30 @@ enum AgentBridgeSpeedMode: String, CaseIterable, Identifiable {
   }
 }
 
+/// Which surface a Claude/Codex DM opens into. `.chat` is the classic bubble view
+/// (with wallpaper); `.agent` jumps straight to the full-page agent runtime view.
+/// Stored per provider so Claude and Codex can differ.
+enum AgentBridgeDefaultView: String, CaseIterable, Identifiable {
+  case chat
+  case agent
+
+  var id: String { rawValue }
+
+  var title: String {
+    switch self {
+    case .chat: return "Chat"
+    case .agent: return "Agent"
+    }
+  }
+
+  var subtitle: String {
+    switch self {
+    case .chat: return "Classic chat bubbles with wallpaper"
+    case .agent: return "Full-page agent runtime view"
+    }
+  }
+}
+
 struct AgentBridgeRunOptions: Equatable {
   let model: String?
   let intelligence: AgentBridgeIntelligenceLevel
@@ -320,6 +344,9 @@ enum AgentBridgeSelectionStore {
   private static func modelKey(_ provider: String) -> String {
     "agentBridge.model.\(provider.lowercased())"
   }
+  private static func defaultViewKey(_ provider: String) -> String {
+    "agentBridge.defaultView.\(provider.lowercased())"
+  }
 
   static func selectedRepository() -> AgentBridgeRepository? {
     guard
@@ -389,11 +416,22 @@ enum AgentBridgeSelectionStore {
   }
 
   static func selectedModel(provider: String) -> String? {
-    normalizedString(UserDefaults.standard.string(forKey: modelKey(provider)))
+    guard let model = normalizedString(UserDefaults.standard.string(forKey: modelKey(provider))) else {
+      return nil
+    }
+    let normalized = normalizedModel(provider: provider, model: model)
+    if normalized != model {
+      if let normalized {
+        UserDefaults.standard.set(normalized, forKey: modelKey(provider))
+      } else {
+        UserDefaults.standard.removeObject(forKey: modelKey(provider))
+      }
+    }
+    return normalized
   }
 
   static func setModel(provider: String, model: String?) {
-    if let model = normalizedString(model) {
+    if let model = normalizedModel(provider: provider, model: normalizedString(model)) {
       UserDefaults.standard.set(model, forKey: modelKey(provider))
     } else {
       UserDefaults.standard.removeObject(forKey: modelKey(provider))
@@ -407,6 +445,86 @@ enum AgentBridgeSelectionStore {
       intelligence: selectedIntelligence(),
       speed: selectedSpeed()
     )
+  }
+
+  /// Default view (chat vs agent) for a provider's DM. Defaults to `.chat`.
+  static func defaultView(provider: String) -> AgentBridgeDefaultView {
+    let raw = UserDefaults.standard.string(forKey: defaultViewKey(provider))
+    return raw.flatMap(AgentBridgeDefaultView.init(rawValue:)) ?? .chat
+  }
+
+  static func setDefaultView(provider: String, _ view: AgentBridgeDefaultView) {
+    UserDefaults.standard.set(view.rawValue, forKey: defaultViewKey(provider))
+    NotificationCenter.default.post(name: didChangeNotification, object: nil)
+  }
+
+  // MARK: - Model catalog (shared title/menu source)
+
+  /// Selectable models per provider. `value` is the canonical id stored/sent.
+  static func modelChoices(provider: String) -> [(title: String, subtitle: String?, value: String)] {
+    switch provider.lowercased() {
+    case "claude":
+      return [
+        ("Haiku", "Fastest Claude alias", "haiku"),
+        ("Sonnet", "Balanced Claude alias", "sonnet"),
+        ("Opus", "Most capable Claude alias", "opus"),
+      ]
+    default:
+      return [
+        ("GPT-5.5", nil, "gpt-5.5"),
+        ("GPT-5.5 Pro", nil, "gpt-5.5-pro"),
+        ("GPT-5.4", nil, "gpt-5.4"),
+        ("GPT-5.2", nil, "gpt-5.2"),
+        ("GPT-5", nil, "gpt-5"),
+      ]
+    }
+  }
+
+  /// "Use the model active in the local CLI session" fallback label.
+  static func defaultModelTitle(provider: String) -> String {
+    switch provider.lowercased() {
+    case "claude": return "Claude"
+    case "codex": return "Codex"
+    default: return provider.capitalized
+    }
+  }
+
+  /// Human title for a model id (or the provider default when nil/unknown). Use this
+  /// for the header so the displayed model matches whatever a loaded run reports.
+  static func modelTitle(provider: String, model: String?) -> String {
+    let resolved = normalizedModel(provider: provider, model: normalizedString(model))
+    guard let resolved else { return defaultModelTitle(provider: provider) }
+    if let match = modelChoices(provider: provider).first(where: { $0.value == resolved }) {
+      return match.title
+    }
+    return resolved
+  }
+
+  /// Public canonical-id resolver (e.g. "claude-3-5-sonnet" → "sonnet"). Returns nil
+  /// for empty/unset; used to compare a loaded run's model against the menu choices.
+  static func canonicalModel(provider: String, model: String?) -> String? {
+    normalizedModel(provider: provider, model: normalizedString(model))
+  }
+
+  private static func normalizedModel(provider: String, model: String?) -> String? {
+    guard let model = normalizedString(model) else { return nil }
+    let normalized = model.lowercased().replacingOccurrences(of: "_", with: "-")
+    switch provider.lowercased() {
+    case "claude":
+      if normalized.contains("haiku") { return "haiku" }
+      if normalized.contains("sonnet") { return "sonnet" }
+      if normalized.contains("opus") { return "opus" }
+      return model
+    default:
+      switch normalized {
+      case "gpt-5.3-codex", "gpt-5-3-codex":
+        return "gpt-5.5"
+      case "gpt-5.5", "gpt-5.5-pro", "gpt-5.4", "gpt-5.2", "gpt-5":
+        return normalized
+      default:
+        return model
+      }
+    }
   }
 
   // MARK: - Resume target (per provider)
@@ -529,6 +647,15 @@ enum AgentPairingService {
   /// account, so a single global snapshot is correct.
   @MainActor private(set) static var lastStatus: AgentBridgeStatus?
 
+  /// Plain (non-actor) mirror of the connected computer's name + online flag, so UIKit
+  /// surfaces (the agent runtime header) can read it synchronously without hopping to
+  /// the main actor. Single writer (`status()`), display-only readers.
+  nonisolated(unsafe) static var lastDeviceLabel: String?
+  nonisolated(unsafe) static var lastConnected: Bool = false
+  /// Full non-actor snapshot of the last status (repos / running tasks / paired), so
+  /// UIKit surfaces (the chat's repo chip + History) can read it synchronously.
+  nonisolated(unsafe) static var lastStatusSnapshot: AgentBridgeStatus?
+
   /// GET /api/agent-bridge/status
   static func status(config: AppSessionConfig) async throws -> AgentBridgeStatus {
     let request = try buildRequest(config: config, path: "/agent-bridge/status", method: "GET")
@@ -543,6 +670,9 @@ enum AgentPairingService {
       devices: devices,
       runningTasks: runningTasks.isEmpty ? devices.flatMap(\.runningTasks) : runningTasks
     )
+    lastDeviceLabel = result.devices.first?.label
+    lastConnected = result.connected
+    lastStatusSnapshot = result
     await MainActor.run { lastStatus = result }
     return result
   }

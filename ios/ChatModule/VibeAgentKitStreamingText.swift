@@ -150,10 +150,12 @@ enum VibeAgentKitTextRenderer {
     // text size. Blank lines in the source become inter-paragraph spacing rather
     // than empty rendered lines (the markdown way), and headings get a larger gap
     // above plus a small gap before their body.
-    let paragraphGap = max(6.0, (font.pointSize * 0.5).rounded())
-    let headingGap = max(10.0, (font.pointSize * 0.85).rounded())
-    let headingBodyGap = max(2.0, (font.pointSize * 0.18).rounded())
-    let listItemGap = max(2.0, (font.pointSize * 0.2).rounded())
+    // Paragraphs need a clearly visible gap or the answer reads as one continuous
+    // block; headings get a larger gap above so sections are insulated.
+    let paragraphGap = max(11.0, (font.pointSize * 0.8).rounded())
+    let headingGap = max(16.0, (font.pointSize * 1.1).rounded())
+    let headingBodyGap = max(3.0, (font.pointSize * 0.22).rounded())
+    let listItemGap = max(3.0, (font.pointSize * 0.25).rounded())
 
     var emittedContent = false
     var pendingBlank = false

@@ -627,6 +627,7 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
   let chatId: String
   let session: AgentBridgeHistorySession
   let subtitle: String
+  var newChatTrigger: Binding<Bool>? = nil
 
   func makeCoordinator() -> Coordinator {
     Coordinator(parent: self)
@@ -710,6 +711,7 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
     // Editing a message reverts its turn's files (handled in the controller) and then
     // re-runs the revised prompt as a fresh task from that reverted state.
     controller.onEditMessage = { [weak coordinator] _ in coordinator?.startNewChat() }
+    controller.isEmbeddedInSwiftUI = true
     context.coordinator.controller = controller
     // Show the centered spinner until the session's transcript / live stream lands.
     controller.isLoadingTranscript = true
@@ -720,6 +722,12 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
   func updateUIViewController(_ controller: VibeAgentConversationViewController, context: Context) {
     context.coordinator.parent = self
     context.coordinator.controller = controller
+    if let trigger = newChatTrigger, trigger.wrappedValue {
+      DispatchQueue.main.async {
+        trigger.wrappedValue = false
+        controller.onNewChat?()
+      }
+    }
   }
 
   /// Dispatch a message to the agent on the user's computer over the live chat
@@ -876,6 +884,44 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
             isError: true
           )
         ])
+      }
+    }
+  }
+}
+
+/// Full-screen sheet wrapper for `AgentBridgeHistoryInlineView`, presented from the
+/// chat's History menu (it "slides" up over the chat). Picking a session dismisses and
+/// hands it back so the chat loads it into the default view (not the agent view).
+struct AgentBridgeHistorySheet: View {
+  let provider: String
+  let chatId: String
+  var runningTasks: [AgentBridgeRunningTask] = []
+  var deviceLabel: String = ""
+  var connected: Bool = false
+  var paired: Bool = false
+  let onPick: (AgentBridgeHistorySession) -> Void
+
+  @Environment(\.dismiss) private var dismiss
+
+  var body: some View {
+    NavigationStack {
+      AgentBridgeHistoryInlineView(
+        provider: provider,
+        chatId: chatId,
+        runningTasks: runningTasks,
+        deviceLabel: deviceLabel,
+        connected: connected,
+        paired: paired,
+        onOpenSession: { session in
+          dismiss()
+          onPick(session)
+        }
+      )
+      .background(Color(uiColor: UIColor.systemGroupedBackground))
+      .toolbar {
+        ToolbarItem(placement: .topBarLeading) {
+          Button("Done") { dismiss() }
+        }
       }
     }
   }

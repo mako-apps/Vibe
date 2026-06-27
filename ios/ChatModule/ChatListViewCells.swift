@@ -1005,10 +1005,29 @@ private func agentResponseInProgress(_ row: ChatListRow) -> Bool {
       || row.messageType == "agent_progress_tree")
 }
 
+private func bubbleUsesAgentProgressPreview(_ row: ChatListRow) -> Bool {
+  row.kind == .message
+    && row.visualKind == .text
+    && row.isAgentMessage
+    && (row.isStreamingText
+      || row.messageType == "agent_progress_tree"
+      || !row.agentProgressNodes.isEmpty
+      || row.agentRuntime != nil
+      || (row.agentActionsEnc?.isEmpty == false))
+}
+
+private func showsAgentProgressOpenButton(_ row: ChatListRow) -> Bool {
+  row.kind == .message
+    && row.isAgentMessage
+    && bubbleUsesAgentProgressPreview(row)
+    && (row.messageId?.isEmpty == false)
+}
+
 private func bubbleMetaWidths(for row: ChatListRow) -> ChatBubbleMetaWidths {
   if row.messageType == "agent_progress"
     || usesTransparentAgentStreamingLayout(row)
     || agentResponseInProgress(row)
+    || bubbleUsesAgentProgressPreview(row)
   {
     return ChatBubbleMetaWidths(edited: 0.0, pinned: 0.0, timestamp: 0.0, total: 0.0)
   }
@@ -1385,6 +1404,678 @@ func chatAgentProgressFeedText(
   }.joined(separator: "\n")
 }
 
+private enum AgentProgressPreviewState {
+  case running
+  case done
+  case failed
+}
+
+private struct AgentProgressPreviewItem {
+  let title: String
+  let detail: String?
+  let state: AgentProgressPreviewState
+}
+
+private struct AgentProgressPreviewContent {
+  let title: String
+  let detail: String?
+  let previewText: String?
+  let items: [AgentProgressPreviewItem]
+  let hiddenItemCount: Int
+  let isLive: Bool
+  let showsOpenButton: Bool
+  let openButtonTitle: String
+}
+
+private let agentProgressPreviewHeaderFont = UIFont.systemFont(ofSize: 14.5, weight: .semibold)
+private let agentProgressPreviewDetailFont = UIFont.systemFont(ofSize: 12.5, weight: .regular)
+private let agentProgressPreviewStepFont = UIFont.systemFont(ofSize: 13.5, weight: .medium)
+private let agentProgressPreviewMoreFont = UIFont.systemFont(ofSize: 12.0, weight: .medium)
+private let agentProgressPreviewButtonFont = UIFont.systemFont(ofSize: 13.0, weight: .semibold)
+private let agentProgressPreviewHeaderHeight: CGFloat = 20.0
+private let agentProgressPreviewStepMinHeight: CGFloat = 22.0
+private let agentProgressPreviewStepGap: CGFloat = 5.0
+private let agentProgressPreviewDetailTopGap: CGFloat = 3.0
+private let agentProgressPreviewStepsTopGap: CGFloat = 9.0
+private let agentProgressPreviewMoreTopGap: CGFloat = 5.0
+private let agentProgressPreviewButtonTopGap: CGFloat = 10.0
+private let agentProgressPreviewButtonHeight: CGFloat = 34.0
+private let agentProgressPreviewHorizontalInset: CGFloat = 12.0
+private let agentProgressPreviewMaxActiveItems = 3
+private let agentProgressPreviewMaxCompletedItems = 4
+
+private func agentProgressPreviewState(from status: String, fallbackRunning: Bool = false)
+  -> AgentProgressPreviewState
+{
+  switch status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+  case "done", "complete", "completed", "success", "ok":
+    return .done
+  case "active", "in_progress", "pending", "queued", "running", "started", "streaming", "working":
+    return .running
+  case "error", "failed", "failure", "cancelled", "canceled", "stopped":
+    return .failed
+  default:
+    return fallbackRunning ? .running : .done
+  }
+}
+
+private func compactAgentPreviewDetail(_ text: String?) -> String? {
+  let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+  guard !trimmed.isEmpty else { return nil }
+  let firstLine = trimmed.components(separatedBy: .newlines).first ?? trimmed
+  return firstLine.count > 120 ? String(firstLine.prefix(117)) + "..." : firstLine
+}
+
+private func compactAgentLivePreviewText(_ text: String?) -> String? {
+  let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+  guard !trimmed.isEmpty else { return nil }
+  let lines = trimmed
+    .components(separatedBy: .newlines)
+    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+    .filter { !$0.isEmpty }
+  let compact = (lines.isEmpty ? trimmed : lines.prefix(5).joined(separator: "\n"))
+  return compact.count > 520 ? String(compact.prefix(517)) + "..." : compact
+}
+
+private func agentProgressPreviewRuntimeItems(_ runtime: ChatListRow.AgentRuntimeSummary)
+  -> [AgentProgressPreviewItem]
+{
+  var items: [AgentProgressPreviewItem] = []
+  let state = agentProgressPreviewState(from: runtime.status)
+  if let command = runtime.command {
+    let display = command.display ?? command.executable
+    if let detail = compactAgentPreviewDetail(display) {
+      items.append(
+        AgentProgressPreviewItem(
+          title: "Run command",
+          detail: detail,
+          state: state
+        ))
+    }
+  }
+  if let diff = runtime.diff {
+    for file in diff.files {
+      var title = file.status.lowercased() == "added" ? "Create \(file.name)" : "Edit \(file.name)"
+      var stats: [String] = []
+      if file.additions > 0 { stats.append("+\(file.additions)") }
+      if file.deletions > 0 { stats.append("-\(file.deletions)") }
+      if !stats.isEmpty {
+        title += "  " + stats.joined(separator: " ")
+      }
+      items.append(
+        AgentProgressPreviewItem(
+          title: title,
+          detail: compactAgentPreviewDetail(file.path),
+          state: state
+        ))
+    }
+  }
+  return items
+}
+
+private func agentProgressPreviewItems(for row: ChatListRow) -> [AgentProgressPreviewItem] {
+  let candidateNodes: [ChatListRow.AgentProgressNode] = {
+    let topLevel = row.agentProgressNodes.filter { $0.depth == 0 }
+    if !topLevel.isEmpty { return topLevel }
+    return row.agentProgressNodes
+  }()
+
+  var seenIds = Set<String>()
+  var items: [AgentProgressPreviewItem] = candidateNodes.compactMap { node in
+    let uniqueKey = node.id.isEmpty ? "\(node.label)-\(node.status)-\(node.depth)" : node.id
+    guard seenIds.insert(uniqueKey).inserted else { return nil }
+    return AgentProgressPreviewItem(
+      title: chatAgentNodeCompactLabel(node),
+      detail: nil,
+      state: agentProgressPreviewState(from: node.status, fallbackRunning: row.isStreamingText)
+    )
+  }
+
+  if items.isEmpty, let runtime = row.agentRuntime {
+    items = agentProgressPreviewRuntimeItems(runtime)
+  }
+
+  if items.isEmpty {
+    let fallbackTitle: String
+    if row.isStreamingText || row.messageType == "agent_progress_tree" {
+      fallbackTitle = "Working on task"
+    } else if row.agentActionsEnc?.isEmpty == false {
+      fallbackTitle = "Commands captured"
+    } else {
+      fallbackTitle = "Agent response"
+    }
+    items.append(
+      AgentProgressPreviewItem(
+        title: fallbackTitle,
+        detail: nil,
+        state: row.isStreamingText ? .running : .done
+      ))
+  }
+  return items
+}
+
+private func agentProgressPreviewContent(for row: ChatListRow) -> AgentProgressPreviewContent {
+  let allItems = agentProgressPreviewItems(for: row)
+  let runtimeIsLive = row.agentRuntime.map {
+    agentProgressPreviewState(from: $0.status) == .running
+  } ?? false
+  let isLive = row.isStreamingText || runtimeIsLive || allItems.contains { $0.state == .running }
+  let limit =
+    isLive
+    ? agentProgressPreviewMaxActiveItems
+    : agentProgressPreviewMaxCompletedItems
+  let visibleItems: [AgentProgressPreviewItem]
+  if isLive {
+    visibleItems = []
+  } else {
+    visibleItems = Array(allItems.suffix(limit))
+  }
+  let agentName = row.agentName?.trimmingCharacters(in: .whitespacesAndNewlines)
+  let titlePrefix = (agentName?.isEmpty == false) ? agentName! : "Agent"
+  let title: String
+  if isLive {
+    title = "\(titlePrefix) is working"
+  } else if row.isAgentError {
+    title = "\(titlePrefix) stopped"
+  } else {
+    title = "\(titlePrefix) finished"
+  }
+
+  let bodyText = compactAgentPreviewDetail(row.plainContent ?? row.text)
+  let livePreviewText = isLive ? compactAgentLivePreviewText(row.plainContent ?? row.text) : nil
+  let runtimeDetail: String? = {
+    guard let runtime = row.agentRuntime else { return nil }
+    var parts: [String] = []
+    if let repo = runtime.repoName?.trimmingCharacters(in: .whitespacesAndNewlines), !repo.isEmpty {
+      parts.append(repo)
+    }
+    if let model = runtime.model?.trimmingCharacters(in: .whitespacesAndNewlines), !model.isEmpty {
+      parts.append(model)
+    }
+    return parts.isEmpty ? nil : parts.joined(separator: " - ")
+  }()
+  let liveDetail: String? = {
+    guard isLive else { return nil }
+    guard let active = allItems.last(where: { $0.state == .running }) ?? visibleItems.last else {
+      return nil
+    }
+    return compactAgentPreviewDetail(active.detail ?? active.title)
+  }()
+
+  return AgentProgressPreviewContent(
+    title: title,
+    detail: liveDetail ?? runtimeDetail ?? bodyText,
+    previewText: livePreviewText,
+    items: visibleItems,
+    hiddenItemCount: 0,
+    isLive: isLive,
+    showsOpenButton: showsAgentProgressOpenButton(row),
+    openButtonTitle: isLive ? "Live progress" : "View progress"
+  )
+}
+
+private final class AgentProgressStepIconView: UIView {
+  private var state: AgentProgressPreviewState = .done
+  private var tint = UIColor.secondaryLabel
+  private static let spinAnimationKey = "agentProgressPreviewSpin"
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    backgroundColor = .clear
+    isOpaque = false
+  }
+
+  required init?(coder: NSCoder) {
+    return nil
+  }
+
+  func configure(state: AgentProgressPreviewState, tint: UIColor) {
+    self.state = state
+    self.tint = tint
+    updateSpinAnimation()
+    setNeedsDisplay()
+  }
+
+  override func didMoveToWindow() {
+    super.didMoveToWindow()
+    updateSpinAnimation()
+  }
+
+  private func updateSpinAnimation() {
+    if state == .running, window != nil {
+      if layer.animation(forKey: Self.spinAnimationKey) == nil {
+        let animation = CABasicAnimation(keyPath: "transform.rotation.z")
+        animation.fromValue = 0.0
+        animation.toValue = CGFloat.pi * 2.0
+        animation.duration = 1.0
+        animation.repeatCount = .infinity
+        animation.timingFunction = CAMediaTimingFunction(name: .linear)
+        layer.add(animation, forKey: Self.spinAnimationKey)
+      }
+    } else {
+      layer.removeAnimation(forKey: Self.spinAnimationKey)
+    }
+  }
+
+  override func draw(_ rect: CGRect) {
+    guard let context = UIGraphicsGetCurrentContext() else { return }
+    let scale = UIScreen.main.scale
+    let lineWidth = max(1.0 / scale, 1.7)
+    let diameter = min(bounds.width, bounds.height) - lineWidth
+    let circleRect = CGRect(
+      x: floor((bounds.width - diameter) * 0.5),
+      y: floor((bounds.height - diameter) * 0.5),
+      width: diameter,
+      height: diameter
+    )
+    context.setLineWidth(lineWidth)
+    context.setLineCap(.round)
+    context.setLineJoin(.round)
+
+    switch state {
+    case .running:
+      tint.withAlphaComponent(0.28).setStroke()
+      context.strokeEllipse(in: circleRect)
+      tint.withAlphaComponent(0.94).setStroke()
+      context.addArc(
+        center: CGPoint(x: circleRect.midX, y: circleRect.midY),
+        radius: diameter * 0.5,
+        startAngle: -CGFloat.pi * 0.5,
+        endAngle: CGFloat.pi * 0.72,
+        clockwise: false
+      )
+      context.strokePath()
+    case .done:
+      tint.withAlphaComponent(0.38).setStroke()
+      context.strokeEllipse(in: circleRect)
+      let path = UIBezierPath()
+      path.move(to: CGPoint(x: circleRect.minX + diameter * 0.28, y: circleRect.midY))
+      path.addLine(to: CGPoint(x: circleRect.minX + diameter * 0.43, y: circleRect.maxY - diameter * 0.30))
+      path.addLine(to: CGPoint(x: circleRect.maxX - diameter * 0.24, y: circleRect.minY + diameter * 0.31))
+      path.lineWidth = lineWidth
+      path.lineCapStyle = .round
+      path.lineJoinStyle = .round
+      tint.setStroke()
+      path.stroke()
+    case .failed:
+      tint.withAlphaComponent(0.95).setStroke()
+      context.strokeEllipse(in: circleRect)
+      let path = UIBezierPath()
+      path.move(to: CGPoint(x: circleRect.minX + diameter * 0.34, y: circleRect.minY + diameter * 0.34))
+      path.addLine(to: CGPoint(x: circleRect.maxX - diameter * 0.34, y: circleRect.maxY - diameter * 0.34))
+      path.move(to: CGPoint(x: circleRect.maxX - diameter * 0.34, y: circleRect.minY + diameter * 0.34))
+      path.addLine(to: CGPoint(x: circleRect.minX + diameter * 0.34, y: circleRect.maxY - diameter * 0.34))
+      path.lineWidth = lineWidth
+      path.lineCapStyle = .round
+      tint.setStroke()
+      path.stroke()
+    }
+  }
+}
+
+private final class AgentProgressPreviewStepView: UIView {
+  private let iconView = AgentProgressStepIconView()
+  private let titleLabel = UILabel()
+  private let detailLabel = UILabel()
+  private var hasDetail = false
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    backgroundColor = .clear
+    isOpaque = false
+    addSubview(iconView)
+    addSubview(titleLabel)
+    addSubview(detailLabel)
+    titleLabel.font = agentProgressPreviewStepFont
+    titleLabel.numberOfLines = 1
+    titleLabel.lineBreakMode = .byTruncatingTail
+    detailLabel.font = agentProgressPreviewDetailFont
+    detailLabel.numberOfLines = 1
+    detailLabel.lineBreakMode = .byTruncatingMiddle
+  }
+
+  required init?(coder: NSCoder) {
+    return nil
+  }
+
+  func configure(item: AgentProgressPreviewItem, textColor: UIColor, mutedColor: UIColor) {
+    hasDetail = item.detail?.isEmpty == false
+    titleLabel.text = item.title
+    detailLabel.text = item.detail
+    titleLabel.textColor = textColor
+    detailLabel.textColor = mutedColor
+    let iconTint: UIColor
+    switch item.state {
+    case .running: iconTint = textColor.withAlphaComponent(0.88)
+    case .done: iconTint = textColor.withAlphaComponent(0.72)
+    case .failed: iconTint = UIColor.systemRed.withAlphaComponent(0.85)
+    }
+    iconView.configure(state: item.state, tint: iconTint)
+    detailLabel.isHidden = !hasDetail
+    setNeedsLayout()
+  }
+
+  static func measuredHeight(item: AgentProgressPreviewItem, availableWidth: CGFloat) -> CGFloat {
+    _ = availableWidth
+    let titleHeight = ceil(agentProgressPreviewStepFont.lineHeight)
+    let detail = item.detail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if detail.isEmpty {
+      return max(agentProgressPreviewStepMinHeight, titleHeight)
+    }
+    let detailHeight = ceil(agentProgressPreviewDetailFont.lineHeight)
+    return max(agentProgressPreviewStepMinHeight, titleHeight + 2.0 + detailHeight)
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    let iconSize: CGFloat = 16.0
+    iconView.frame = CGRect(
+      x: 0.0,
+      y: max(1.0, floor((bounds.height - iconSize) * 0.5)),
+      width: iconSize,
+      height: iconSize
+    )
+    let textX = iconView.frame.maxX + 8.0
+    let textWidth = max(1.0, bounds.width - textX)
+    if hasDetail {
+      titleLabel.frame = CGRect(x: textX, y: 0.0, width: textWidth, height: 17.0)
+      detailLabel.frame = CGRect(
+        x: textX,
+        y: titleLabel.frame.maxY + 1.0,
+        width: textWidth,
+        height: max(14.0, bounds.height - titleLabel.frame.maxY - 1.0)
+      )
+    } else {
+      titleLabel.frame = CGRect(
+        x: textX,
+        y: floor((bounds.height - 17.0) * 0.5),
+        width: textWidth,
+        height: 17.0
+      )
+      detailLabel.frame = .zero
+    }
+  }
+}
+
+private final class AgentProgressPreviewView: UIView {
+  private let headerIconView = AgentProgressStepIconView()
+  private let titleLabel = UILabel()
+  private let detailLabel = UILabel()
+  private let previewTextLabel = ChatNativeStreamingTextLabel()
+  private var stepViews: [AgentProgressPreviewStepView] = []
+  private let moreLabel = UILabel()
+  private let openButton = UIButton(type: .system)
+  private var content: AgentProgressPreviewContent?
+  private var availableWidth: CGFloat = 1.0
+  private var showsDetail = false
+  private var showsPreview = false
+  private var showsMore = false
+  var onOpenTap: (() -> Void)?
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    backgroundColor = .clear
+    isOpaque = false
+    addSubview(headerIconView)
+    addSubview(titleLabel)
+    addSubview(detailLabel)
+    addSubview(previewTextLabel)
+    addSubview(moreLabel)
+    addSubview(openButton)
+
+    titleLabel.font = agentProgressPreviewHeaderFont
+    titleLabel.numberOfLines = 1
+    detailLabel.font = agentProgressPreviewDetailFont
+    detailLabel.numberOfLines = 2
+    previewTextLabel.numberOfLines = 5
+    previewTextLabel.backgroundColor = .clear
+    moreLabel.font = agentProgressPreviewMoreFont
+    moreLabel.numberOfLines = 1
+
+    openButton.titleLabel?.font = agentProgressPreviewButtonFont
+    openButton.layer.cornerCurve = .continuous
+    openButton.layer.cornerRadius = 11.0
+    openButton.contentHorizontalAlignment = .center
+    var buttonConfiguration = UIButton.Configuration.plain()
+    buttonConfiguration.title = "View agent progress"
+    buttonConfiguration.image = UIImage(
+      systemName: "chevron.forward",
+      withConfiguration: UIImage.SymbolConfiguration(pointSize: 11.0, weight: .semibold))
+    buttonConfiguration.imagePlacement = .trailing
+    buttonConfiguration.imagePadding = 6.0
+    buttonConfiguration.contentInsets = NSDirectionalEdgeInsets(
+      top: 0.0,
+      leading: 0.0,
+      bottom: 0.0,
+      trailing: 0.0
+    )
+    openButton.configuration = buttonConfiguration
+    openButton.addTarget(self, action: #selector(handleOpenTap), for: .touchUpInside)
+  }
+
+  required init?(coder: NSCoder) {
+    return nil
+  }
+
+  func reset() {
+    content = nil
+    stepViews.forEach { $0.removeFromSuperview() }
+    stepViews = []
+    titleLabel.text = nil
+    detailLabel.text = nil
+    previewTextLabel.resetStreamingState()
+    previewTextLabel.isHidden = true
+    moreLabel.text = nil
+    openButton.isHidden = true
+  }
+
+  @discardableResult
+  func configure(
+    row: ChatListRow,
+    appearance: ChatListAppearance,
+    availableWidth: CGFloat
+  ) -> CGFloat {
+    let content = agentProgressPreviewContent(for: row)
+    self.content = content
+    self.availableWidth = availableWidth
+
+    let textColor = row.isMe ? appearance.textColorMe : appearance.textColorThem
+    let mutedColor = textColor.withAlphaComponent(0.62)
+    titleLabel.text = content.title
+    titleLabel.textColor = textColor
+    detailLabel.text = content.detail
+    detailLabel.textColor = mutedColor
+    showsDetail = content.detail?.isEmpty == false
+    detailLabel.isHidden = !showsDetail
+    showsPreview = content.previewText?.isEmpty == false
+    previewTextLabel.isHidden = !showsPreview
+    if let previewText = content.previewText, showsPreview {
+      let attributedPreview = ChatNativeAgentTextRenderer.makeAttributedText(
+        text: previewText,
+        font: agentProgressPreviewDetailFont,
+        textColor: textColor.withAlphaComponent(0.84)
+      )
+      previewTextLabel.applyStreamingText(
+        attributedPreview,
+        rawText: previewText,
+        isStreaming: content.isLive
+      )
+    } else {
+      previewTextLabel.resetStreamingState()
+    }
+    headerIconView.configure(
+      state: row.isAgentError ? .failed : (content.isLive ? .running : .done),
+      tint: row.isAgentError
+        ? UIColor.systemRed.withAlphaComponent(0.85)
+        : textColor.withAlphaComponent(content.isLive ? 0.92 : 0.74)
+    )
+
+    while stepViews.count < content.items.count {
+      let stepView = AgentProgressPreviewStepView()
+      stepViews.append(stepView)
+      addSubview(stepView)
+    }
+    while stepViews.count > content.items.count {
+      stepViews.removeLast().removeFromSuperview()
+    }
+    for (index, item) in content.items.enumerated() {
+      stepViews[index].configure(item: item, textColor: textColor, mutedColor: mutedColor)
+    }
+
+    showsMore = content.hiddenItemCount > 0
+    moreLabel.isHidden = !showsMore
+    moreLabel.text = showsMore ? "+\(content.hiddenItemCount) earlier steps" : nil
+    moreLabel.textColor = mutedColor
+
+    openButton.isHidden = !content.showsOpenButton
+    openButton.tintColor = textColor
+    var buttonConfiguration = openButton.configuration
+    buttonConfiguration?.title = content.openButtonTitle
+    buttonConfiguration?.baseForegroundColor = textColor
+    openButton.configuration = buttonConfiguration
+    openButton.backgroundColor = textColor.withAlphaComponent(0.10)
+
+    setNeedsLayout()
+    return Self.measuredHeight(row: row, availableWidth: availableWidth)
+  }
+
+  static func measuredHeight(row: ChatListRow, availableWidth: CGFloat) -> CGFloat {
+    let content = agentProgressPreviewContent(for: row)
+    let inset = agentProgressPreviewHorizontalInset * 2.0
+    let contentWidth = max(1.0, availableWidth - inset)
+    let textWidth = max(1.0, contentWidth - 24.0)
+    var height = agentProgressPreviewHeaderHeight
+    if let detail = content.detail, !detail.isEmpty {
+      let detailHeight = ceil(
+        (detail as NSString).boundingRect(
+          with: CGSize(width: textWidth, height: .greatestFiniteMagnitude),
+          options: [.usesLineFragmentOrigin, .usesFontLeading],
+          attributes: [.font: agentProgressPreviewDetailFont],
+          context: nil
+        ).height
+      )
+      height += agentProgressPreviewDetailTopGap + min(34.0, max(16.0, detailHeight))
+    }
+    if let previewText = content.previewText, !previewText.isEmpty {
+      let attributedPreview = ChatNativeAgentTextRenderer.makeAttributedText(
+        text: previewText,
+        font: agentProgressPreviewDetailFont,
+        textColor: .label
+      )
+      let previewHeight = ceil(
+        attributedPreview.boundingRect(
+          with: CGSize(width: contentWidth, height: .greatestFiniteMagnitude),
+          options: [.usesLineFragmentOrigin, .usesFontLeading],
+          context: nil
+        ).height
+      )
+      height += 6.0 + min(86.0, max(18.0, previewHeight))
+    }
+    if !content.items.isEmpty {
+      height += agentProgressPreviewStepsTopGap
+      for (index, item) in content.items.enumerated() {
+        if index > 0 { height += agentProgressPreviewStepGap }
+        height += AgentProgressPreviewStepView.measuredHeight(item: item, availableWidth: contentWidth)
+      }
+    }
+    if content.hiddenItemCount > 0 {
+      height += agentProgressPreviewMoreTopGap + 15.0
+    }
+    if content.showsOpenButton {
+      height += agentProgressPreviewButtonTopGap + agentProgressPreviewButtonHeight
+    }
+    return ceil(height)
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    let contentInsetX = agentProgressPreviewHorizontalInset
+    let contentWidth = max(1.0, min(bounds.width, availableWidth) - (contentInsetX * 2.0))
+    var y: CGFloat = 0.0
+    let headerIconSize: CGFloat = 16.0
+    headerIconView.frame = CGRect(
+      x: contentInsetX,
+      y: floor((agentProgressPreviewHeaderHeight - headerIconSize) * 0.5),
+      width: headerIconSize,
+      height: headerIconSize
+    )
+    titleLabel.frame = CGRect(
+      x: headerIconView.frame.maxX + 8.0,
+      y: 0.0,
+      width: max(1.0, (contentInsetX + contentWidth) - headerIconView.frame.maxX - 8.0),
+      height: agentProgressPreviewHeaderHeight
+    )
+    y += agentProgressPreviewHeaderHeight
+
+    if showsDetail {
+      y += agentProgressPreviewDetailTopGap
+      let detailHeight = min(34.0, detailLabel.sizeThatFits(CGSize(width: contentWidth, height: 60.0)).height)
+      detailLabel.frame = CGRect(x: contentInsetX, y: y, width: contentWidth, height: max(16.0, detailHeight))
+      y = detailLabel.frame.maxY
+    } else {
+      detailLabel.frame = .zero
+    }
+
+    if showsPreview {
+      y += 6.0
+      let previewHeight = min(
+        86.0,
+        max(18.0, previewTextLabel.sizeThatFits(CGSize(width: contentWidth, height: 120.0)).height)
+      )
+      previewTextLabel.frame = CGRect(
+        x: contentInsetX,
+        y: y,
+        width: contentWidth,
+        height: previewHeight
+      )
+      y = previewTextLabel.frame.maxY
+    } else {
+      previewTextLabel.frame = .zero
+    }
+
+    if !stepViews.isEmpty {
+      y += agentProgressPreviewStepsTopGap
+      let items = content?.items ?? []
+      for (index, view) in stepViews.enumerated() {
+        if index > 0 { y += agentProgressPreviewStepGap }
+        let item = index < items.count
+          ? items[index]
+          : AgentProgressPreviewItem(title: "", detail: nil, state: .done)
+        let stepHeight = AgentProgressPreviewStepView.measuredHeight(
+          item: item,
+          availableWidth: contentWidth
+        )
+        view.frame = CGRect(x: contentInsetX, y: y, width: contentWidth, height: stepHeight)
+        y = view.frame.maxY
+      }
+    }
+
+    if showsMore {
+      y += agentProgressPreviewMoreTopGap
+      moreLabel.frame = CGRect(x: contentInsetX + 24.0, y: y, width: max(1.0, contentWidth - 24.0), height: 15.0)
+      y = moreLabel.frame.maxY
+    } else {
+      moreLabel.frame = .zero
+    }
+
+    if let content, content.showsOpenButton {
+      y += agentProgressPreviewButtonTopGap
+      openButton.frame = CGRect(
+        x: contentInsetX,
+        y: y,
+        width: contentWidth,
+        height: agentProgressPreviewButtonHeight
+      )
+    } else {
+      openButton.frame = .zero
+    }
+  }
+
+  @objc private func handleOpenTap() {
+    onOpenTap?()
+  }
+}
+
 private func bubbleBaseText(for row: ChatListRow) -> (text: String, addPrefix: Bool) {
   if row.isAgentMessage {
     // No ✦ spark prefix on agent bubbles — the agent surface doesn't want it.
@@ -1456,6 +2147,9 @@ private func bubbleParsedBlocks(for row: ChatListRow) -> [AgentParsedBlock] {
 }
 
 private func bubbleUsesBlockLayout(_ row: ChatListRow) -> Bool {
+  if bubbleUsesAgentProgressPreview(row) {
+    return false
+  }
   guard row.kind == .message, row.visualKind == .text, row.messageType != "typing",
     row.messageType != "agent_progress_tree", row.isAgentMessage
   else {
@@ -1519,7 +2213,7 @@ private func bubbleCanPreviewURL(_ url: URL) -> Bool {
 
 private func bubblePreviewURL(for row: ChatListRow) -> URL? {
   guard row.kind == .message, row.visualKind == .text, row.messageType != "typing",
-    !hasInlineAttachment(row)
+    !hasInlineAttachment(row), !bubbleUsesAgentProgressPreview(row)
   else {
     return nil
   }
@@ -2143,6 +2837,40 @@ func measureMessageBubbleLayout(row: ChatListRow, rowWidth: CGFloat)
   let maxBubbleWidth = floor(rowWidth * bubbleMaxWidthFactor)
   let maxContentWidth = max(1.0, maxBubbleWidth - (bubbleHorizontalPadding * 2.0))
   let meta = bubbleMetaWidths(for: row)
+
+  if bubbleUsesAgentProgressPreview(row) {
+    let contentWidth = max(1.0, maxContentWidth)
+    let previewHeight = AgentProgressPreviewView.measuredHeight(
+      row: row,
+      availableWidth: contentWidth
+    )
+    let hasReaction = row.reactionEmoji != nil && row.reactionEmoji?.isEmpty == false
+    let reactionHeightOffset: CGFloat = hasReaction ? 28.0 : 0.0
+    let bubbleWidth = max(bubbleMinWidth, contentWidth + (bubbleHorizontalPadding * 2.0))
+    let bubbleHeight = max(
+      52.0,
+      previewHeight + bubbleTopPadding + bubbleBottomPadding + reactionHeightOffset
+    )
+    return ChatMessageBubbleLayoutMetrics(
+      bubbleWidth: bubbleWidth,
+      bubbleHeight: bubbleHeight,
+      messageWidth: contentWidth,
+      textHeight: previewHeight,
+      bodyHeight: previewHeight,
+      metaWidth: 0.0,
+      contentWidth: contentWidth,
+      mediaHeight: 0.0,
+      isMediaLayout: false,
+      inlineAttachmentHeight: 0.0,
+      hasInlineAttachment: false,
+      replyPreviewHeight: 0.0,
+      hasReplyPreview: false,
+      previewHeight: 0.0,
+      hasLinkPreview: false,
+      usesBottomMetaLayout: true,
+      usesRichTextLayout: false
+    )
+  }
 
   if usesTransparentAgentStreamingLayout(row) {
     let bubbleWidth = max(1.0, rowWidth - (bubbleSideMargin * 2.0))
@@ -5215,6 +5943,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   let tailView = BubbleTailView()
 
   private let messageLabel = AgentStreamingLabel()
+  private let agentProgressPreviewView = AgentProgressPreviewView()
   private let richTextView = BubbleRichTextView()
   private let replyPreviewView = BubbleReplyPreviewView()
   private let linkPreviewView = BubbleLinkPreviewView()
@@ -5272,6 +6001,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private var savedTailHiddenBeforeExtraction = false
   private var savedReactionHiddenBeforeExtraction = false
   private var savedMessageAlphaBeforeExtraction: CGFloat = 1.0
+  private var savedAgentProgressPreviewAlphaBeforeExtraction: CGFloat = 1.0
   private var savedRichTextAlphaBeforeExtraction: CGFloat = 1.0
   private var savedReplyPreviewAlphaBeforeExtraction: CGFloat = 1.0
   private var savedLinkPreviewAlphaBeforeExtraction: CGFloat = 1.0
@@ -5332,6 +6062,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     contentView.addSubview(tailView)
 
     contentView.addSubview(messageLabel)
+    contentView.addSubview(agentProgressPreviewView)
     contentView.addSubview(richTextView)
     contentView.addSubview(replyPreviewView)
     contentView.addSubview(linkPreviewView)
@@ -5376,6 +6107,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     contentView.addSubview(agentActionBarView)
     agentActionBarView.onNativeEvent = { [weak self] payload in
       self?.onAgentAction?(payload)
+    }
+    agentProgressPreviewView.onOpenTap = { [weak self] in
+      self?.handleViewAgentTap()
     }
 
     contentView.addSubview(reactionPillView)
@@ -5581,6 +6315,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     tailView.isHidden = true
     // agentSenderLabel removed
     messageLabel.isHidden = true
+    agentProgressPreviewView.isHidden = true
     richTextView.isHidden = true
     replyPreviewView.isHidden = true
     linkPreviewView.isHidden = true
@@ -5718,12 +6453,14 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       resetStickerAnimation()
       stopTypingShimmer()
       richTextView.reset()
+      agentProgressPreviewView.reset()
       replyPreviewView.reset()
       linkPreviewView.reset()
       dayLabel.isHidden = true
       bubbleView.isHidden = true
       tailView.isHidden = true
       messageLabel.isHidden = true
+      agentProgressPreviewView.isHidden = true
       richTextView.isHidden = true
       replyPreviewView.isHidden = true
       linkPreviewView.isHidden = true
@@ -5752,6 +6489,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     case .day:
       isGhostHidden = false
       resetStickerAnimation()
+      agentProgressPreviewView.reset()
       richTextView.reset()
       replyPreviewView.reset()
       linkPreviewView.reset()
@@ -5760,6 +6498,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       bubbleView.isHidden = true
       tailView.isHidden = true
       messageLabel.isHidden = true
+      agentProgressPreviewView.isHidden = true
       richTextView.isHidden = true
       replyPreviewView.isHidden = true
       linkPreviewView.isHidden = true
@@ -5774,6 +6513,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     case .message:
       let isGhostHidden = hiddenMessageId == row.messageId
       let usesTransparentAgentStreaming = usesTransparentAgentStreamingLayout(row)
+      let usesAgentProgressPreview = bubbleUsesAgentProgressPreview(row)
       let usesBlockLayout = bubbleUsesBlockLayout(row)
       let previewURL = bubblePreviewURL(for: row)
       let showsReplyPreview = hasReplyPreview(row)
@@ -5781,11 +6521,19 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       dayLabel.isHidden = true
       bubbleView.isHidden = false
       tailView.isHidden = isGhostHidden || !row.shape.showTail
-      messageLabel.isHidden = isGhostHidden || !(row.visualKind == .text || hasMediaCaptionLayout(row)) || usesBlockLayout
-      richTextView.isHidden = isGhostHidden || !usesBlockLayout
+      messageLabel.isHidden =
+        isGhostHidden || usesAgentProgressPreview
+        || !(row.visualKind == .text || hasMediaCaptionLayout(row)) || usesBlockLayout
+      agentProgressPreviewView.isHidden = isGhostHidden || !usesAgentProgressPreview
+      if agentProgressPreviewView.isHidden {
+        agentProgressPreviewView.reset()
+      }
+      richTextView.isHidden = isGhostHidden || usesAgentProgressPreview || !usesBlockLayout
       replyPreviewView.isHidden = isGhostHidden || !showsReplyPreview
-      linkPreviewView.isHidden = isGhostHidden || previewURL == nil
-      if row.messageType == "typing" || row.messageType == "agent_progress_tree" {
+      linkPreviewView.isHidden = isGhostHidden || usesAgentProgressPreview || previewURL == nil
+      if !usesAgentProgressPreview
+        && (row.messageType == "typing" || row.messageType == "agent_progress_tree")
+      {
         // Agent "Thinking…" / tool-progress placeholders shimmer like typing.
         startTypingShimmer()
         messageLabel.font =
@@ -5803,6 +6551,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       // bubble. Covers the streaming-text, typing, and progress-tree phases.
       metaContainerView.isHidden =
         isGhostHidden || usesTransparentAgentStreaming || agentResponseInProgress(row)
+        || usesAgentProgressPreview
       selectionCircleView.isHidden = !selectionMode || isGhostHidden
       selectionCircleView.configure(selected: selected, appearance: appearance)
 
@@ -5846,11 +6595,15 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         for: row, font: messageFont, textColor: resolveTextColor)
       messageLabel.textAlignment = usesRTLColumnLayout(row) ? .right : .natural
       messageLabel.semanticContentAttribute = usesRTLColumnLayout(row) ? .forceRightToLeft : .unspecified
-      messageLabel.applyStreamingText(
-        displayText,
-        rawText: displayText.string,
-        isStreaming: row.isAgentMessage && row.isStreamingText && row.messageType != "typing"
-      )
+      if messageLabel.isHidden {
+        messageLabel.resetStreamingState()
+      } else {
+        messageLabel.applyStreamingText(
+          displayText,
+          rawText: displayText.string,
+          isStreaming: row.isAgentMessage && row.isStreamingText && row.messageType != "typing"
+        )
+      }
       if let previewURL, !linkPreviewView.isHidden {
         linkPreviewView.configure(url: previewURL, appearance: appearance, isMe: row.isMe)
       } else {
@@ -5979,6 +6732,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       // Use full opacity — visibility is controlled by isHidden, not alpha.
       // This eliminates the 0→1 opacity flicker that plagued updates.
       messageLabel.alpha = 1.0
+      agentProgressPreviewView.alpha = 1.0
       richTextView.alpha = 1.0
       replyPreviewView.alpha = 1.0
       linkPreviewView.alpha = 1.0
@@ -5993,6 +6747,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       savedTailHiddenBeforeExtraction = tailView.isHidden
       savedReactionHiddenBeforeExtraction = reactionPillView.isHidden
       savedMessageAlphaBeforeExtraction = messageLabel.alpha
+      savedAgentProgressPreviewAlphaBeforeExtraction = agentProgressPreviewView.alpha
       savedRichTextAlphaBeforeExtraction = richTextView.alpha
       savedReplyPreviewAlphaBeforeExtraction = replyPreviewView.alpha
       savedLinkPreviewAlphaBeforeExtraction = linkPreviewView.alpha
@@ -6031,6 +6786,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     mediaProgressSizeLabel.text = nil
     richTextView.reset()
     richTextView.isHidden = true
+    agentProgressPreviewView.reset()
+    agentProgressPreviewView.isHidden = true
+    agentProgressPreviewView.alpha = 1.0
     replyPreviewView.reset()
     replyPreviewView.isHidden = true
     linkPreviewView.reset()
@@ -6146,6 +6904,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     }
 
     if row.messageType == "agent_actions" {
+      agentProgressPreviewView.frame = .zero
       let selectionInset = selectionMode ? messageSelectionLeadingInset : 0.0
       let layoutWidth = max(1.0, bounds.width)
       agentActionBarView.frame = pixelAlignedRect(
@@ -6156,6 +6915,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           height: 36.0
         )
       )
+      agentProgressPreviewView.frame = .zero
       return
     }
 
@@ -6228,6 +6988,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
     if metrics.isMediaLayout {
       let hasMediaCaption = hasMediaCaptionLayout(row) && metrics.textHeight > 0.0 && !isFullBleed
+      agentProgressPreviewView.frame = .zero
       richTextView.frame = .zero
       replyPreviewView.frame = .zero
       linkPreviewView.frame = .zero
@@ -6320,7 +7081,30 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     } else {
       mediaContainerView.frame = .zero
       let bubbleTextColor = row.isMe ? appearance.textColorMe : appearance.textColorThem
-      if metrics.hasInlineAttachment {
+      if bubbleUsesAgentProgressPreview(row) {
+        richTextView.frame = .zero
+        messageLabel.frame = .zero
+        replyPreviewView.frame = .zero
+        linkPreviewView.frame = .zero
+        inlineAttachmentView.frame = .zero
+        metaContainerView.frame = .zero
+        let contentX = bubbleFrame.minX + bubbleHorizontalPadding
+        let contentY = bubbleFrame.minY + bubbleTopPadding
+        let previewHeight = agentProgressPreviewView.configure(
+          row: row,
+          appearance: appearance,
+          availableWidth: metrics.messageWidth
+        )
+        agentProgressPreviewView.frame = pixelAlignedRect(
+          CGRect(
+            x: contentX,
+            y: contentY,
+            width: metrics.messageWidth,
+            height: max(metrics.textHeight, previewHeight)
+          )
+        )
+      } else if metrics.hasInlineAttachment {
+        agentProgressPreviewView.frame = .zero
         richTextView.frame = .zero
         linkPreviewView.frame = .zero
         let contentX = bubbleFrame.minX + bubbleHorizontalPadding
@@ -6375,6 +7159,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           height: 15.0
         )
       } else if metrics.usesBottomMetaLayout {
+        agentProgressPreviewView.frame = .zero
         let contentX = bubbleFrame.minX + bubbleHorizontalPadding
         var contentY = bubbleFrame.minY + bubbleTopPadding
 
@@ -6446,6 +7231,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           )
         )
       } else {
+        agentProgressPreviewView.frame = .zero
         richTextView.frame = .zero
         linkPreviewView.frame = .zero
         inlineAttachmentView.frame = .zero
@@ -7992,12 +8778,11 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     ])
   }
 
-  /// Completed agent message that offers "view agent" (the full-page surface).
-  /// Mutually exclusive with regenerate (which is the errored-turn affordance).
+  /// The old outside-bubble "view agent" arrow is intentionally retired. Active
+  /// agent progress rows expose the push control inside the bubble preview.
   private func showsAgentView(_ row: ChatListRow) -> Bool {
-    row.kind == .message
-      && row.isAgentMessage
-      && !showsAgentRegenerate(row)
+    _ = row
+    return false
   }
 
   /// Agent message that offers regenerate. Now scoped to *errored* responses
@@ -8304,6 +9089,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         savedTailHiddenBeforeExtraction = tailView.isHidden
         savedReactionHiddenBeforeExtraction = reactionPillView.isHidden
         savedMessageAlphaBeforeExtraction = messageLabel.alpha
+        savedAgentProgressPreviewAlphaBeforeExtraction = agentProgressPreviewView.alpha
         savedRichTextAlphaBeforeExtraction = richTextView.alpha
         savedReplyPreviewAlphaBeforeExtraction = replyPreviewView.alpha
         savedLinkPreviewAlphaBeforeExtraction = linkPreviewView.alpha
@@ -8317,6 +9103,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       reactionPillView.isHidden = true
       // Keep text/media/meta rendering alive for snapshot correctness, but hide them.
       messageLabel.alpha = 0.0
+      agentProgressPreviewView.alpha = 0.0
       richTextView.alpha = 0.0
       replyPreviewView.alpha = 0.0
       linkPreviewView.alpha = 0.0
@@ -8333,6 +9120,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     tailView.isHidden = savedTailHiddenBeforeExtraction
     reactionPillView.isHidden = savedReactionHiddenBeforeExtraction
     messageLabel.alpha = savedMessageAlphaBeforeExtraction
+    agentProgressPreviewView.alpha = savedAgentProgressPreviewAlphaBeforeExtraction
     richTextView.alpha = savedRichTextAlphaBeforeExtraction
     replyPreviewView.alpha = savedReplyPreviewAlphaBeforeExtraction
     linkPreviewView.alpha = savedLinkPreviewAlphaBeforeExtraction
@@ -8611,6 +9399,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     var contentRect = CGRect.null
     if !messageLabel.isHidden {
       contentRect = contentRect.union(messageLabel.frame)
+    }
+    if !agentProgressPreviewView.isHidden {
+      contentRect = contentRect.union(agentProgressPreviewView.frame)
     }
     if !richTextView.isHidden {
       contentRect = contentRect.union(richTextView.frame)

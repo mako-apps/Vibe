@@ -737,6 +737,11 @@ final class ChatInputBar: UIView {
   private var isAgentStreaming = false
   private var agentControlMode = false
   private var agentControlTitle = "Open"
+  // Bridge-agent (Claude/Codex) input control: the leading chip shows the selected
+  // repository and opens a menu (Repository / Report / Permission / History). The host
+  // builds the menu (it owns the repo list + presenters) and pushes it down here.
+  private var agentControlMenu: UIMenu?
+  private var agentControlRepoTitle = ""
   // Recording layout morph progress: 0 = regular, 1 = expanded left.
   private var recordingExpandProgress: CGFloat = 0
 
@@ -1372,22 +1377,28 @@ final class ChatInputBar: UIView {
     )
 
     if agentControlMode {
-      var configuration = UIButton.Configuration.filled()
-      configuration.title = agentControlTitle
-      configuration.image = UIImage(
-        systemName: "slider.horizontal.3",
-        withConfiguration: UIImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
-      )
+      // Repo switcher chip (📁 <repo> ⌄). When the host has supplied a menu (Repository
+      // / Report / Permission / History), the chip opens it directly; otherwise it falls
+      // back to the legacy agent-panel tap.
+      let usesMenu = agentControlMenu != nil
+      let repoLabel = agentControlRepoTitle.isEmpty ? (usesMenu ? "Repository" : agentControlTitle) : agentControlRepoTitle
+      var configuration = usesMenu ? UIButton.Configuration.gray() : UIButton.Configuration.filled()
+      configuration.title = usesMenu ? "\(repoLabel)  ⌄" : agentControlTitle
+      configuration.image =
+        usesMenu
+        ? UIImage(systemName: "folder", withConfiguration: UIImage.SymbolConfiguration(pointSize: 12, weight: .semibold))
+        : nil
       configuration.imagePlacement = .leading
       configuration.imagePadding = 5
-      configuration.baseForegroundColor = .white
-      configuration.baseBackgroundColor = agentAccent
+      configuration.titleLineBreakMode = .byTruncatingTail
+      configuration.baseForegroundColor = usesMenu ? controlTint : .white
+      if !usesMenu { configuration.baseBackgroundColor = agentAccent }
       configuration.cornerStyle = .capsule
       configuration.contentInsets = NSDirectionalEdgeInsets(
         top: 0,
-        leading: 10,
+        leading: usesMenu ? 10 : 12,
         bottom: 0,
-        trailing: 10
+        trailing: usesMenu ? 10 : 12
       )
       configuration.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer {
         incoming in
@@ -1395,13 +1406,21 @@ final class ChatInputBar: UIView {
         outgoing.font = .systemFont(ofSize: 13.0, weight: .semibold)
         return outgoing
       }
+      attachButton.setImage(nil, for: .normal)
       attachButton.configuration = configuration
       attachButton.contentHorizontalAlignment = .center
-      attachButton.titleLabel?.lineBreakMode = .byClipping
-      attachButton.accessibilityLabel = agentControlTitle == "Open" ? "Open agents" : "Change repository"
+      attachButton.titleLabel?.lineBreakMode = .byTruncatingTail
+      attachButton.titleLabel?.numberOfLines = 1
+      attachButton.titleLabel?.adjustsFontSizeToFitWidth = true
+      attachButton.titleLabel?.minimumScaleFactor = 0.82
+      attachButton.menu = agentControlMenu
+      attachButton.showsMenuAsPrimaryAction = usesMenu
+      attachButton.accessibilityLabel = usesMenu ? "Repository and agent options" : "Open agents"
     } else {
       attachButton.configuration = nil
       attachButton.setTitle(nil, for: .normal)
+      attachButton.menu = nil
+      attachButton.showsMenuAsPrimaryAction = false
       attachButton.contentHorizontalAlignment = .center
       applyControlGlyph(
         button: attachButton,
@@ -1495,6 +1514,23 @@ final class ChatInputBar: UIView {
     let next = trimmed.isEmpty ? "Open" : trimmed
     guard agentControlTitle != next else { return }
     agentControlTitle = next
+    refreshAgentControlModeAppearance()
+    setNeedsLayout()
+  }
+
+  /// Repository name shown on the agent-control chip (📁 <repo>). Empty → "Repository".
+  func setAgentControlRepoTitle(_ title: String) {
+    let next = title.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard agentControlRepoTitle != next else { return }
+    agentControlRepoTitle = next
+    refreshAgentControlModeAppearance()
+    setNeedsLayout()
+  }
+
+  /// Host-built menu (Repository / Report / Permission / History) for the agent-control
+  /// chip. Pass nil to fall back to the legacy agent-panel tap.
+  func setAgentControlMenu(_ menu: UIMenu?) {
+    agentControlMenu = menu
     refreshAgentControlModeAppearance()
     setNeedsLayout()
   }
@@ -1756,7 +1792,7 @@ final class ChatInputBar: UIView {
       isRecording ? 0 : max(24, gifButtonSize - (8 * clampedSendProgress))
     let pillW = max(1, pillRight - pillX)
     let sendActionReserve = (sendW + 2) * clampedSendProgress
-    let inlineAttachReserve: CGFloat = agentControlMode && !isRecording ? 30.0 : 0.0
+    let inlineAttachReserve: CGFloat = agentControlMode ? 40.0 : 0.0
     let textW = max(
       1,
       pillW - textInsetH * 2 - inlineAttachReserve - sendActionReserve - gifTextReserve
@@ -2250,11 +2286,19 @@ final class ChatInputBar: UIView {
   }
 
   private func agentControlButtonWidth() -> CGFloat {
+    // In menu mode the chip shows "📁 <repo>  ⌄" — size it from the repo label and add
+    // room for the folder icon + chevron; otherwise size from the plain control title.
+    let usesMenu = agentControlMenu != nil
+    let label =
+      usesMenu
+      ? "\(agentControlRepoTitle.isEmpty ? "Repository" : agentControlRepoTitle)  ⌄"
+      : agentControlTitle
+    let extra: CGFloat = usesMenu ? 48.0 : 28.0
     let titleWidth =
-      (agentControlTitle as NSString).size(
+      (label as NSString).size(
         withAttributes: [.font: UIFont.systemFont(ofSize: 13.0, weight: .semibold)]
       ).width
-    return min(132.0, max(76.0, ceil(titleWidth + 44.0)))
+    return min(184.0, max(64.0, ceil(titleWidth + extra)))
   }
 
   @discardableResult

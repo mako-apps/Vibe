@@ -157,6 +157,11 @@ public final class ChatMainView: UIView,
   private let rootWallpaperLayer = CAGradientLayer()
   private let pagesHost = UIView()
   private let chatPage = UIView()
+  // In-place host for the DM-level agent runtime view (Claude/Codex). Overlays the chat
+  // page below the shared header so switching chat⇄agent has no present/dismiss shift; the
+  // embedded VC suppresses its own header and the chat header provides the chrome.
+  private let bridgeAgentHost = UIView()
+  private weak var bridgeAgentVC: VibeAgentConversationViewController?
   private let pinnedBannerView = ChatPinnedBannerView()
   private let inboxBannerView = ChatPinnedBannerView()
   private let profilePage = UIView()
@@ -198,6 +203,7 @@ public final class ChatMainView: UIView,
 
   private var appearance = ChatListAppearance.fallback
   private var headerMode: ChatMainHeaderMode = .default
+  private var bridgeProvider: String = ""
   private var isOnline = false
   private var surfacePresenceOnline: Bool?
   private var chatTitleText: String = "Chat"
@@ -409,6 +415,15 @@ public final class ChatMainView: UIView,
 
   func setEnginePeerAgentId(_ value: String) {
     chatListView.setEnginePeerAgentId(value)
+  }
+
+  func setBridgeProvider(_ value: String) {
+    let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard bridgeProvider != normalized else { return }
+    bridgeProvider = normalized
+    updateChatModeHeaderControls()
+    updateHeaderTexts()
+    setNeedsLayout()
   }
 
   /// Enables agent inbox mode: event notifications are filtered out of the
@@ -838,6 +853,21 @@ public final class ChatMainView: UIView,
       self?.updateInboxBanner(count: count, latestPreview: latestPreview)
     }
 
+    // Host the DM-level agent runtime view in-place, above the chat page but below the
+    // profile/agent-prompt pages so those still slide over it.
+    pagesHost.addSubview(bridgeAgentHost)
+    bridgeAgentHost.isHidden = true
+    bridgeAgentHost.clipsToBounds = true
+    chatListView.onHostBridgeAgentView = { [weak self] vc in
+      self?.hostBridgeAgentView(vc)
+    }
+    chatListView.onTearDownBridgeAgentView = { [weak self] in
+      self?.tearDownBridgeAgentView()
+    }
+    chatListView.hostedBridgeAgentProvider = { [weak self] in
+      self?.bridgeAgentVC?.agentBridgeProvider
+    }
+
     pagesHost.addSubview(profilePage)
     profilePage.addSubview(profileScrollView)
     profileScrollView.addSubview(profileContentView)
@@ -1255,15 +1285,20 @@ public final class ChatMainView: UIView,
       menuGlassView.isHidden = true
       savedSearchCancelGlassView.isHidden = true
       titleButton.isUserInteractionEnabled = false
+      titleButton.showsMenuAsPrimaryAction = false
+      titleButton.menu = nil
       return
     }
     headerContainer.isHidden = false
     let usesSavedMessagesHeader = headerMode == .savedMessages
     let searchActive = savedSearchExpanded && currentPage == .chat
+    let usesBridgeHeader = !bridgeProvider.isEmpty && !usesSavedMessagesHeader && !searchActive
     avatarButton.isHidden = usesSavedMessagesHeader || searchActive
     avatarGlassView.isHidden = usesSavedMessagesHeader || searchActive
     avatarButton.isUserInteractionEnabled = !usesSavedMessagesHeader && !searchActive
     titleButton.isUserInteractionEnabled = !usesSavedMessagesHeader && !searchActive
+    titleButton.showsMenuAsPrimaryAction = usesBridgeHeader
+    titleButton.menu = usesBridgeHeader ? bridgeHeaderMenu() : nil
     menuButton.isHidden = !(usesSavedMessagesHeader || searchActive)
     menuGlassView.isHidden = !(usesSavedMessagesHeader || searchActive)
     savedSearchCancelGlassView.isHidden = !searchActive
@@ -2741,7 +2776,9 @@ public final class ChatMainView: UIView,
     let headerHeight = safeTop + 60.0
     let contentY = safeTop + 8.0
     let headerContentWidth = max(0.0, bounds.width - 24.0)
-    let maxCenterWidth = max(0.0, headerContentWidth * 0.55)
+    let bridgeHeaderActive =
+      !bridgeProvider.isEmpty && headerMode != .savedMessages && !savedSearchExpanded
+    let maxCenterWidth = max(0.0, headerContentWidth * (bridgeHeaderActive ? 0.52 : 0.55))
     let hideChatHeader = externalNavigationHeaderEnabled && !savedSearchExpanded
     if hideChatHeader {
       headerContainer.frame = .zero
@@ -2815,16 +2852,44 @@ public final class ChatMainView: UIView,
         savedSearchCancelGlassView.frame = .zero
       }
 
+      let trailingSideInset =
+        headerContentView.bounds.width - avatarGlassView.frame.minX
       let centerSideInset = max(
         backGlassView.frame.maxX,
-        headerContentView.bounds.width - avatarGlassView.frame.minX
+        trailingSideInset
       ) + 10.0
-      let centerWidth = min(
-        maxCenterWidth,
-        max(120.0, headerContentView.bounds.width - (centerSideInset * 2.0))
+      let usesBridgeHeaderLayout =
+        !bridgeProvider.isEmpty && headerMode != .savedMessages && !savedSearchExpanded
+      let requestedHeaderWidth = max(
+        chatTitleLabel.intrinsicContentSize.width,
+        chatSubtitleLabel.intrinsicContentSize.width
       )
+      let centerWidth: CGFloat
+      if usesBridgeHeaderLayout {
+        centerWidth = min(
+          172.0,
+          max(108.0, min(requestedHeaderWidth + 36.0, headerContentView.bounds.width * 0.48))
+        )
+      } else {
+        centerWidth = min(
+          maxCenterWidth,
+          max(120.0, headerContentView.bounds.width - (centerSideInset * 2.0))
+        )
+      }
+      let centerX: CGFloat
+      if usesBridgeHeaderLayout {
+        // Center the model/device pill between the back button and avatar — clamped so it
+        // never overlaps either. The old code right-aligned it against the avatar, which
+        // pushed the pill noticeably off to the right.
+        let centered = (headerContentView.bounds.width - centerWidth) * 0.5
+        let minX = backGlassView.frame.maxX + 8.0
+        let maxX = max(minX, avatarGlassView.frame.minX - centerWidth - 8.0)
+        centerX = min(max(centered, minX), maxX)
+      } else {
+        centerX = (headerContentView.bounds.width - centerWidth) * 0.5
+      }
       titleGlassView.frame = CGRect(
-        x: (headerContentView.bounds.width - centerWidth) * 0.5,
+        x: centerX,
         y: 0.0,
         width: centerWidth,
         height: 44.0
@@ -3036,6 +3101,10 @@ public final class ChatMainView: UIView,
       x: 0.0, y: -headerHeight,
       width: pageWidth, height: pageHeight + headerHeight)
     chatListView.frame = chatPage.bounds
+    // The agent host fills the area below the header (not behind it — its feed/composer
+    // start under the shared header pill).
+    bridgeAgentHost.frame = CGRect(x: 0.0, y: 0.0, width: pageWidth, height: pageHeight)
+    bridgeAgentVC?.view.frame = bridgeAgentHost.bounds
     let bannerWidth = max(0.0, pageWidth - 32.0)
     pinnedBannerView.frame = CGRect(
       x: 16.0,
@@ -3436,8 +3505,12 @@ public final class ChatMainView: UIView,
   }
 
   private func updateHeaderTexts() {
+    let bridgeTitle = resolvedBridgeHeaderTitle()
+    let bridgeSubtitle = resolvedBridgeRepositorySubtitle()
     let resolvedTitle: String =
-      if headerMode == .savedMessages {
+      if let bridgeTitle {
+        bridgeTitle
+      } else if headerMode == .savedMessages {
         chatTitleText.isEmpty ? "Saved Messages" : chatTitleText
       } else {
         chatTitleText.isEmpty ? "Chat" : chatTitleText
@@ -3454,6 +3527,8 @@ public final class ChatMainView: UIView,
       resolvedSubtitle = ""
     } else if let resolvedAgentProgress {
       resolvedSubtitle = resolvedAgentProgress
+    } else if let bridgeSubtitle {
+      resolvedSubtitle = bridgeSubtitle
     } else if let resolvedDirectTyping {
       resolvedSubtitle = resolvedDirectTyping
     } else if let groupTypingSubtitle {
@@ -3495,6 +3570,143 @@ public final class ChatMainView: UIView,
         }
         return appearance.timeColorThem.withAlphaComponent(0.85)
       }()
+    updateBridgeHeaderMenuIfNeeded()
+  }
+
+  private func updateBridgeHeaderMenuIfNeeded() {
+    guard !bridgeProvider.isEmpty, titleButton.showsMenuAsPrimaryAction else { return }
+    titleButton.menu = bridgeHeaderMenu()
+  }
+
+  private func bridgeHeaderMenu() -> UIMenu {
+    let provider = bridgeProvider.isEmpty ? "codex" : bridgeProvider
+    let selectedOptions = AgentBridgeSelectionStore.selectedRunOptions(provider: provider)
+
+    let modelActions = bridgeModelChoices(for: provider).map { choice in
+      UIAction(
+        title: choice.title,
+        subtitle: choice.subtitle,
+        state: choice.value == selectedOptions.model ? .on : .off
+      ) { [weak self] _ in
+        guard let self else { return }
+        AgentBridgeSelectionStore.setModel(provider: provider, model: choice.value)
+        self.updateHeaderTexts()
+      }
+    }
+
+    let thinkingActions = AgentBridgeIntelligenceLevel.allCases.map { level in
+      UIAction(
+        title: level.title,
+        state: selectedOptions.intelligence == level ? .on : .off
+      ) { [weak self] _ in
+        guard let self else { return }
+        AgentBridgeSelectionStore.setIntelligence(level)
+        self.updateHeaderTexts()
+      }
+    }
+
+    let speedActions = AgentBridgeSpeedMode.allCases.map { speed in
+      UIAction(
+        title: speed.title,
+        state: selectedOptions.speed == speed ? .on : .off
+      ) { [weak self] _ in
+        guard let self else { return }
+        AgentBridgeSelectionStore.setSpeed(speed)
+        self.updateHeaderTexts()
+      }
+    }
+
+    // The repository switcher now lives in the input bar's repo chip, so the header
+    // menu carries only run options (model / thinking / speed).
+    return UIMenu(
+      title: provider == "claude" ? "Claude" : "Codex",
+      children: [
+        UIMenu(
+          title: "Model",
+          subtitle: bridgeCurrentModelTitle(selectedOptions, provider: provider),
+          children: bridgeDefaultModelActions(provider: provider, selectedOptions: selectedOptions)
+            + modelActions
+        ),
+        UIMenu(title: "Thinking", subtitle: selectedOptions.intelligence.title, children: thinkingActions),
+        UIMenu(title: "Speed", subtitle: selectedOptions.speed.title, children: speedActions),
+      ]
+    )
+  }
+
+  private func bridgeCurrentModelTitle(_ options: AgentBridgeRunOptions, provider: String) -> String {
+    if let model = options.model?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !model.isEmpty
+    {
+      return bridgeModelChoices(for: provider).first(where: { $0.value == model })?.title ?? model
+    }
+    return bridgeProviderDefaultModelTitle(provider)
+  }
+
+  private func resolvedBridgeHeaderTitle() -> String? {
+    guard !bridgeProvider.isEmpty else { return nil }
+    let options = AgentBridgeSelectionStore.selectedRunOptions(provider: bridgeProvider)
+    let modelTitle = bridgeCurrentModelTitle(options, provider: bridgeProvider)
+    let hasExplicitModel = options.model?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    guard options.intelligence != .low, hasExplicitModel else { return modelTitle }
+    return "\(modelTitle.lowercased())-thinking"
+  }
+
+  private func resolvedBridgeRepositorySubtitle() -> String? {
+    guard !bridgeProvider.isEmpty else { return nil }
+    // The header shows the connected computer beneath the model now; the repo moved to
+    // the input's repo switcher. Fall back to the repo name only if no device is known,
+    // and to nil (so connection/presence subtitles can show) when neither exists.
+    if let device = AgentPairingService.lastDeviceLabel, !device.isEmpty {
+      return AgentPairingService.lastConnected ? device : "\(device) · reconnecting"
+    }
+    let repositoryName =
+      AgentBridgeSelectionStore.selectedRepository()?.name
+        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return repositoryName.isEmpty ? nil : repositoryName
+  }
+
+  private func bridgeModelChoices(for provider: String) -> [(title: String, subtitle: String?, value: String?)] {
+    switch provider.lowercased() {
+    case "claude":
+      return [
+        ("Haiku", "Fastest Claude alias", "haiku"),
+        ("Sonnet", "Balanced Claude alias", "sonnet"),
+        ("Opus", "Most capable Claude alias", "opus"),
+      ]
+    default:
+      return [
+        ("GPT-5.5", nil, "gpt-5.5"),
+        ("GPT-5.5 Pro", nil, "gpt-5.5-pro"),
+        ("GPT-5.4", nil, "gpt-5.4"),
+        ("GPT-5.2", nil, "gpt-5.2"),
+        ("GPT-5", nil, "gpt-5"),
+      ]
+    }
+  }
+
+  private func bridgeDefaultModelActions(
+    provider: String,
+    selectedOptions: AgentBridgeRunOptions
+  ) -> [UIAction] {
+    [
+      UIAction(
+        title: "\(bridgeProviderDefaultModelTitle(provider)) default",
+        subtitle: "Use the model active in the local CLI session",
+        state: selectedOptions.model == nil ? .on : .off
+      ) { [weak self] _ in
+        guard let self else { return }
+        AgentBridgeSelectionStore.setModel(provider: provider, model: nil)
+        self.updateHeaderTexts()
+      }
+    ]
+  }
+
+  private func bridgeProviderDefaultModelTitle(_ provider: String) -> String {
+    switch provider.lowercased() {
+    case "claude": return "Claude"
+    case "codex": return "Codex"
+    default: return provider.capitalized
+    }
   }
 
   private func updateBackButtonContent() {
@@ -3874,11 +4086,10 @@ public final class ChatMainView: UIView,
   }
 
   private func userAvatarGradientColors() -> (UIColor, UIColor) {
-    ChatAvatarFallbackStyle.uiGradient(
+    ChatProfileAppearanceStore.avatarColors(
       title: chatTitleText,
       peerUserId: enginePeerUserIdRaw,
-      chatId: engineChatId,
-      isDark: appearance.isDark
+      chatId: engineChatId
     )
   }
 
@@ -3932,6 +4143,51 @@ public final class ChatMainView: UIView,
       }
     }
     avatarLoadTask = task
+  }
+
+  // MARK: - In-place agent runtime host
+
+  /// Walk the responder chain to the view controller that owns this view, so the embedded
+  /// agent runtime VC can be added as a proper child (lifecycle + appearance callbacks).
+  private func owningViewController() -> UIViewController? {
+    var responder: UIResponder? = self.next
+    while let current = responder {
+      if let vc = current as? UIViewController { return vc }
+      responder = current.next
+    }
+    return nil
+  }
+
+  /// Embed the DM-level agent runtime view in-place: it fills the body below the shared
+  /// chat header (which already shows the model + device for a bridge DM), so there's no
+  /// present/dismiss shift when switching chat⇄agent. The host sits above the chat page
+  /// but below the profile/agent-prompt pages, which still slide over it.
+  private func hostBridgeAgentView(_ vc: VibeAgentConversationViewController) {
+    guard let owner = owningViewController() else {
+      // Not in a VC hierarchy yet — retry on the next runloop.
+      DispatchQueue.main.async { [weak self] in self?.hostBridgeAgentView(vc) }
+      return
+    }
+    tearDownBridgeAgentView()
+    bridgeAgentVC = vc
+    owner.addChild(vc)
+    vc.view.frame = bridgeAgentHost.bounds
+    vc.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    bridgeAgentHost.addSubview(vc.view)
+    vc.didMove(toParent: owner)
+    bridgeAgentHost.isHidden = false
+    setNeedsLayout()
+    layoutIfNeeded()
+  }
+
+  /// Remove any embedded agent runtime view (DM change / teardown).
+  private func tearDownBridgeAgentView() {
+    bridgeAgentHost.isHidden = true
+    guard let vc = bridgeAgentVC else { return }
+    vc.willMove(toParent: nil)
+    vc.view.removeFromSuperview()
+    vc.removeFromParent()
+    bridgeAgentVC = nil
   }
 
   private func applyPageState(animated: Bool, emitEvent: Bool) {

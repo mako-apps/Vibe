@@ -123,6 +123,13 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
   private var blockHeightConstraints: [NSLayoutConstraint] = []
   private var runtimeHeightConstraint: NSLayoutConstraint?
   private var lastBlockSignature: String = ""
+  // Per-step inline expansion: which node ids have their detail layer open, plus the
+  // tap-up hook that asks the host to toggle one (it flips the set + re-measures).
+  var onStepTap: ((String) -> Void)?
+  private var expandedStepIds: Set<String> = []
+  // True while the turn is live: the work band + answer read as one continuous,
+  // growing feed, so the gaps between them stay tight (no big void mid-stream).
+  private var isLiveTurn = false
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -157,91 +164,61 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     stepsStack.isHidden = true
   }
 
-  // Build the inline step rows shown when "Worked · N steps" is expanded. Each
-  // row is a muted, wrapping label with a hanging bullet (matching the body
-  // renderer's list style), so the feed reads as a quiet sub-list under the
-  // summary line rather than a heavy card.
+  // Build the rows shown when "Worked · N steps" is expanded. Narration ("text")
+  // nodes render as prose at the streaming body size (so the in-card voice matches
+  // the answer below); every tool node renders as an expandable `StepRowView` — a
+  // collapsed preview (verb/target, or the raw command for bash, + a chevron) that
+  // opens its own detail layer on tap (command + result code box, edit patch, read
+  // file slice). `interactive` is false on a live turn (previews only, no toggles).
   private func updateStepsList(
     _ items: [VibeAgentKitProgressItem],
     expanded: Bool,
-    showDetails: Bool,
-    appearance: VibeAgentKitChatAppearance
+    interactive: Bool,
+    appearance: VibeAgentKitChatAppearance,
+    streaming: Bool = false
   ) {
     clearStepsList()
     guard expanded, !items.isEmpty else { return }
-    let stepFont = UIFont.systemFont(ofSize: 15.0, weight: .regular)
-    let detailFont = UIFont.monospacedSystemFont(ofSize: 12.5, weight: .regular)
-    let marker = "•  "
-    let indent = (marker as NSString).size(withAttributes: [.font: stepFont]).width
-    let color = appearance.textSecondary
     for item in items {
-      // A "text" node is the agent's working narration, folded into the card in
-      // chronological order (interleaved with the tool steps) so the collapsed
-      // "Worked …" card reads top-down exactly as the agent worked. It renders as
-      // plain wrapping prose — no bullet, no diff coloring — to read as the model's
-      // own voice, distinct from the Read/Edit/Run step rows around it.
       if item.itemType == "text" {
         let narration = item.label.trimmingCharacters(in: .whitespacesAndNewlines)
         if narration.isEmpty { continue }
         let textLabel = UILabel()
         textLabel.numberOfLines = 0
         textLabel.translatesAutoresizingMaskIntoConstraints = false
-        let tpara = NSMutableParagraphStyle()
-        tpara.lineBreakMode = .byWordWrapping
-        tpara.lineSpacing = 2.0
-        tpara.paragraphSpacing = 4.0
-        textLabel.attributedText = NSAttributedString(
-          string: narration,
-          attributes: [
-            .font: UIFont.systemFont(ofSize: 15.0, weight: .regular),
-            .foregroundColor: appearance.text,
-            .paragraphStyle: tpara,
-          ]
+        // While the turn is LIVE, narration renders at the full answer size/color so
+        // the in-order feed reads as one body of prose — and so a chunk doesn't visibly
+        // shrink/morph when the next one arrives and folds it into the feed. Once the
+        // turn is DONE and tucked inside the collapsed "Worked" card, narration drops to
+        // the subordinate, slightly-muted size so the final answer below leads.
+        let narrationFont = streaming
+          ? UIFont.systemFont(ofSize: 18.0, weight: .regular)
+          : UIFont.systemFont(ofSize: 15.5, weight: .regular)
+        let narrationColor = streaming
+          ? appearance.text
+          : vibeAgentKitColorWithAlpha(appearance.text, 0.82)
+        textLabel.attributedText = VibeAgentKitTextRenderer.makeAttributedText(
+          text: narration,
+          font: narrationFont,
+          textColor: narrationColor,
+          lineHeight: streaming ? 27.5 : 22.0
         )
         stepsStack.addArrangedSubview(textLabel)
         continue
       }
-      let label = UILabel()
-      label.numberOfLines = 0
-      label.translatesAutoresizingMaskIntoConstraints = false
-      let para = NSMutableParagraphStyle()
-      para.lineBreakMode = .byWordWrapping
-      para.headIndent = indent
-      para.lineSpacing = 1.0
-      // "Edit file  +12 −3" — verb/target stay muted; the additions read green and
-      // deletions red so the expanded card scans like a diff summary.
-      label.attributedText = Self.styledStepLabel(
-        marker + item.label, font: stepFont, baseColor: color, paragraph: para)
-      stepsStack.addArrangedSubview(label)
-
-      // The decrypted per-step detail (a command's OUTPUT, search hits, a todo
-      // checklist) renders inline under its step, so the expanded work card shows
-      // "what actually ran" — not just the verb. Edits/reads carry no body (their
-      // +N/−N counts ride the label; the full line-by-line diff lives in the
-      // file-change card below).
-      if showDetails,
-        let detail = item.messageContent?.trimmingCharacters(in: .whitespacesAndNewlines),
-        !detail.isEmpty
-      {
-        let detailLabel = UILabel()
-        detailLabel.numberOfLines = 8
-        detailLabel.lineBreakMode = .byTruncatingTail
-        detailLabel.translatesAutoresizingMaskIntoConstraints = false
-        let dpara = NSMutableParagraphStyle()
-        dpara.lineBreakMode = .byWordWrapping
-        dpara.headIndent = indent
-        dpara.firstLineHeadIndent = indent
-        dpara.lineSpacing = 1.0
-        detailLabel.attributedText = NSAttributedString(
-          string: detail,
-          attributes: [
-            .font: detailFont,
-            .foregroundColor: vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.7),
-            .paragraphStyle: dpara,
-          ]
-        )
-        stepsStack.addArrangedSubview(detailLabel)
-      }
+      let nodeId = item.nodeId ?? item.label
+      let row = VibeAgentKitStepRowView()
+      row.translatesAutoresizingMaskIntoConstraints = false
+      row.configure(
+        item: item,
+        // A live feed shows compact previews only (no inline detail — taps are off
+        // until the turn is done); a finished feed makes each row tap-to-open.
+        expanded: false,
+        interactive: interactive,
+        appearance: appearance
+      )
+      row.onToggle = interactive ? { [weak self] in self?.onStepTap?(nodeId) } : nil
+      stepsStack.addArrangedSubview(row)
     }
     stepsStack.isHidden = false
   }
@@ -250,7 +227,7 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
   /// expanded work card reads like a diff summary (Claude/Codex style), while the verb
   /// + target stay in the muted base color. The minus is U+2212 (the formatter emits
   /// it, not an ASCII hyphen).
-  private static func styledStepLabel(
+  fileprivate static func styledStepLabel(
     _ string: String,
     font: UIFont,
     baseColor: UIColor,
@@ -301,13 +278,17 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     runtime: ChatListRow.AgentRuntimeSummary?,
     onRuntimeTap: ((ChatListRow.AgentRuntimeSummary) -> Void)?,
     onLoaderTap: (() -> Void)?,
-    isProgressExpanded: Bool = false
+    isProgressExpanded: Bool = false,
+    expandedStepIds: Set<String> = [],
+    streamingStartDate: Date? = nil
   ) {
+    self.expandedStepIds = expandedStepIds
     let font = UIFont.systemFont(ofSize: 18.0, weight: .regular)
     let lineHeight: CGFloat = 27.5
     let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
     let hasDisplayText = !trimmedText.isEmpty
     let showsLoader = isStreaming && !hasFinalResponseText
+    isLiveTurn = showsLoader
 
     loaderView.applyAppearance(appearance)
     loaderView.onTap = onLoaderTap
@@ -343,7 +324,8 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
         text: loaderText,
         isStreaming: showsLoader,
         progressItems: progressItems,
-        isExpanded: stepsExpanded
+        isExpanded: stepsExpanded,
+        streamingStartDate: showsLoader ? streamingStartDate : nil
       )
     } else {
       loaderView.isHidden = true
@@ -357,10 +339,15 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     // live inside the tappable "Worked" card and reveal their command output / search
     // hits + diff counts when expanded.
     if showsLoader {
-      let priorSteps = progressItems.count > 1 ? Array(progressItems.dropLast().suffix(7)) : []
-      updateStepsList(priorSteps, expanded: true, showDetails: false, appearance: appearance)
+      // Live turn: show the WHOLE turn so far, in order, at a consistent size — no
+      // dropping, no capping, no collapsing. The model just works and the feed grows
+      // downward; the trailing answer chunk renders as the body block right below it.
+      // (Earlier behaviour folded each chunk into a smaller card on the next arrival,
+      // which made the text "morph" out of and back into the work band.)
+      updateStepsList(
+        progressItems, expanded: true, interactive: false, appearance: appearance, streaming: true)
     } else {
-      updateStepsList(progressItems, expanded: stepsExpanded, showDetails: true, appearance: appearance)
+      updateStepsList(progressItems, expanded: stepsExpanded, interactive: true, appearance: appearance)
     }
 
     // The file-change / diff card belongs to a FINISHED turn only — the agent works
@@ -496,6 +483,13 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
       stackView.removeArrangedSubview(stepsStack)
       stackView.insertArrangedSubview(stepsStack, at: 1)
     }
+    // Spacing follows each view across reordering and is ignored while a view is
+    // hidden. While LIVE, the header → feed → answer are one continuous, growing
+    // stream, so keep the gaps tight (no big void between the streaming text and the
+    // work feed). Once DONE, give the collapsed "Worked" card a clear gap above the
+    // final answer so the two read as distinct bands.
+    stackView.setCustomSpacing(isLiveTurn ? 6.0 : 10.0, after: loaderView)
+    stackView.setCustomSpacing(isLiveTurn ? 6.0 : 14.0, after: stepsStack)
   }
 
   // Completed-turn summary line. Matches the Claude Code / Codex "Worked for Xs"
@@ -560,17 +554,20 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     stackView.axis = .vertical
     stackView.alignment = .fill
     stackView.distribution = .fill
-    stackView.spacing = 7.0
+    stackView.spacing = 8.0
     loaderView.translatesAutoresizingMaskIntoConstraints = false
     loaderView.isHidden = true
     stepsStack.translatesAutoresizingMaskIntoConstraints = false
     stepsStack.axis = .vertical
     stepsStack.alignment = .fill
     stepsStack.distribution = .fill
-    stepsStack.spacing = 4.0
+    // The work log is a subordinate band: a little more air between its rows and a
+    // hanging left indent so the whole "what the agent did" block reads as a unit,
+    // visually distinct from the answer body that follows it.
+    stepsStack.spacing = 7.0
     stepsStack.isHidden = true
     stepsStack.isLayoutMarginsRelativeArrangement = true
-    stepsStack.layoutMargins = UIEdgeInsets(top: 1.0, left: 4.0, bottom: 3.0, right: 0.0)
+    stepsStack.layoutMargins = UIEdgeInsets(top: 2.0, left: 6.0, bottom: 4.0, right: 0.0)
     runtimeSummaryView.translatesAutoresizingMaskIntoConstraints = false
     runtimeSummaryView.isHidden = true
     addSubview(stackView)
@@ -614,6 +611,388 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     NSLog("[AgentView] cell.configureRuntimeSummary: card SHOWN files=\(runtime.diff?.files.count ?? -1) +\(runtime.diff?.additions ?? -1)/-\(runtime.diff?.deletions ?? -1) patchLen=\(runtime.diff?.patch?.count ?? -1) height=\(height) width=\(availableWidth)")
     runtimeSummaryView.isHidden = false
     runtimeHeightConstraint?.constant = height
+  }
+}
+
+// One tool step inside the "Worked" card: a tappable collapsed preview (verb +
+// target — or the raw command for bash — plus a chevron) that expands an inline
+// detail layer on tap. The layer is built per-kind: bash → full (un-clipped)
+// command box + a result code box tinted by success/failure; edit/write → the
+// unified-diff patch (green/red lines) with the file name; read → the line range
+// and the file slice it read (fallback "Reading…"); everything else → its output.
+// All rows self-size (no explicit heights) so the table's automaticDimension grows
+// the cell as a row opens.
+private final class VibeAgentKitStepRowView: UIView {
+  private let container = UIStackView()
+  private let header = UIControl()
+  private let titleLabel = UILabel()
+  private let chevron = UIImageView()
+  private let detailStack = UIStackView()
+  var onToggle: (() -> Void)?
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    setup()
+  }
+
+  required init?(coder: NSCoder) { return nil }
+
+  private func setup() {
+    backgroundColor = .clear
+    container.translatesAutoresizingMaskIntoConstraints = false
+    container.axis = .vertical
+    container.alignment = .fill
+    container.spacing = 6.0
+    addSubview(container)
+    NSLayoutConstraint.activate([
+      container.topAnchor.constraint(equalTo: topAnchor),
+      container.leadingAnchor.constraint(equalTo: leadingAnchor),
+      container.trailingAnchor.constraint(equalTo: trailingAnchor),
+      container.bottomAnchor.constraint(equalTo: bottomAnchor),
+    ])
+
+    header.translatesAutoresizingMaskIntoConstraints = false
+    titleLabel.translatesAutoresizingMaskIntoConstraints = false
+    titleLabel.numberOfLines = 2
+    titleLabel.lineBreakMode = .byTruncatingTail
+    titleLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+    titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    chevron.translatesAutoresizingMaskIntoConstraints = false
+    chevron.contentMode = .scaleAspectFit
+    chevron.setContentHuggingPriority(.required, for: .horizontal)
+    chevron.setContentCompressionResistancePriority(.required, for: .horizontal)
+    header.addSubview(titleLabel)
+    header.addSubview(chevron)
+    NSLayoutConstraint.activate([
+      titleLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor),
+      titleLabel.topAnchor.constraint(equalTo: header.topAnchor, constant: 2.0),
+      titleLabel.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -2.0),
+      chevron.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 8.0),
+      chevron.trailingAnchor.constraint(equalTo: header.trailingAnchor),
+      chevron.centerYAnchor.constraint(equalTo: titleLabel.firstBaselineAnchor, constant: -5.0),
+      chevron.widthAnchor.constraint(equalToConstant: 11.0),
+      chevron.heightAnchor.constraint(equalToConstant: 11.0),
+    ])
+    header.addAction(UIAction { [weak self] _ in self?.onToggle?() }, for: .touchUpInside)
+    container.addArrangedSubview(header)
+
+    detailStack.translatesAutoresizingMaskIntoConstraints = false
+    detailStack.axis = .vertical
+    detailStack.alignment = .fill
+    detailStack.spacing = 6.0
+    detailStack.isLayoutMarginsRelativeArrangement = true
+    detailStack.layoutMargins = UIEdgeInsets(top: 0.0, left: 2.0, bottom: 4.0, right: 0.0)
+    detailStack.isHidden = true
+    container.addArrangedSubview(detailStack)
+  }
+
+  func configure(
+    item: VibeAgentKitProgressItem,
+    expanded: Bool,
+    interactive: Bool,
+    appearance: VibeAgentKitChatAppearance
+  ) {
+    let kind = (item.itemType ?? item.tool ?? "").lowercased()
+    let isError = ["error", "failed", "failure"].contains((item.status ?? "").lowercased())
+
+    // Header preview ── bash shows its raw command (monospace, one line); everything
+    // else shows the compact verb/target label (read appends its line range).
+    if kind == "bash", let cmd = item.command, !cmd.isEmpty {
+      titleLabel.numberOfLines = 1
+      titleLabel.lineBreakMode = .byTruncatingTail
+      let oneLine = cmd.replacingOccurrences(of: "\n", with: " ")
+      titleLabel.attributedText = NSAttributedString(
+        string: oneLine,
+        attributes: [
+          .font: UIFont.monospacedSystemFont(ofSize: 14.0, weight: .regular),
+          .foregroundColor: appearance.text,
+        ]
+      )
+    } else {
+      titleLabel.numberOfLines = 2
+      titleLabel.lineBreakMode = .byTruncatingTail
+      var labelText = item.label
+      if kind == "read", let start = item.lineStart {
+        let range = item.lineEnd.map { "\(start)–\($0)" } ?? "\(start)"
+        labelText += "  (\(range))"
+      }
+      let para = NSMutableParagraphStyle()
+      para.lineBreakMode = .byTruncatingTail
+      titleLabel.attributedText = VibeAgentKitAssistantMessageBodyView.styledStepLabel(
+        labelText,
+        font: UIFont.systemFont(ofSize: 15.5, weight: .regular),
+        baseColor: appearance.textSecondary,
+        paragraph: para
+      )
+    }
+
+    let expandable = interactive && Self.hasDetail(item, kind: kind)
+    chevron.isHidden = !expandable
+    header.isUserInteractionEnabled = expandable
+    if expandable {
+      let name = expanded ? "chevron.down" : "chevron.right"
+      chevron.image = UIImage(systemName: name)?.withRenderingMode(.alwaysTemplate)
+      chevron.tintColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.6)
+    }
+
+    detailStack.arrangedSubviews.forEach {
+      detailStack.removeArrangedSubview($0)
+      $0.removeFromSuperview()
+    }
+    guard expanded else {
+      detailStack.isHidden = true
+      return
+    }
+    buildDetail(item: item, kind: kind, isError: isError, appearance: appearance)
+    detailStack.isHidden = detailStack.arrangedSubviews.isEmpty
+  }
+
+  private static func hasDetail(_ item: VibeAgentKitProgressItem, kind: String) -> Bool {
+    if let c = item.command, !c.isEmpty { return true }
+    if let p = item.patch, !p.isEmpty { return true }
+    if let f = item.fileContent, !f.isEmpty { return true }
+    if let m = item.messageContent, !m.isEmpty { return true }
+    // A read with no shipped slice still expands to show its range / a "Reading…" note.
+    return kind == "read"
+  }
+
+  private func buildDetail(
+    item: VibeAgentKitProgressItem,
+    kind: String,
+    isError: Bool,
+    appearance: VibeAgentKitChatAppearance
+  ) {
+    switch kind {
+    case "bash":
+      detailStack.addArrangedSubview(caption("Shell", appearance.textSecondary))
+      detailStack.addArrangedSubview(
+        terminalCard(
+          command: item.command, output: item.messageContent, isError: isError,
+          appearance: appearance))
+
+    case "edit", "write":
+      if let name = item.fileName, !name.isEmpty {
+        detailStack.addArrangedSubview(caption(name, appearance.textSecondary))
+      }
+      if let patch = item.patch, !patch.isEmpty {
+        detailStack.addArrangedSubview(patchBox(patch, appearance: appearance))
+      } else {
+        detailStack.addArrangedSubview(
+          caption("No diff available.", vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.7)))
+      }
+
+    case "read":
+      if let start = item.lineStart {
+        let range = item.lineEnd.map { "Lines \(start)–\($0)" } ?? "From line \(start)"
+        detailStack.addArrangedSubview(caption(range, appearance.textSecondary))
+      }
+      if let content = item.fileContent, !content.isEmpty {
+        detailStack.addArrangedSubview(monoBox(content, appearance: appearance))
+      } else {
+        detailStack.addArrangedSubview(
+          caption("Reading…", vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.7)))
+      }
+
+    default:
+      if let output = item.messageContent, !output.isEmpty {
+        detailStack.addArrangedSubview(monoBox(output, appearance: appearance))
+      }
+    }
+  }
+
+  // MARK: Detail builders (all self-sizing)
+
+  private func caption(_ text: String, _ color: UIColor) -> UILabel {
+    let label = UILabel()
+    label.translatesAutoresizingMaskIntoConstraints = false
+    label.numberOfLines = 0
+    label.font = UIFont.systemFont(ofSize: 12.0, weight: .semibold)
+    label.textColor = color
+    label.text = text
+    return label
+  }
+
+  /// One terminal-style card: the `$ command`, its output, and a right-aligned
+  /// ✓ Success / ✕ Failed result — the shell-result look.
+  private func terminalCard(
+    command: String?,
+    output: String?,
+    isError: Bool,
+    appearance: VibeAgentKitChatAppearance
+  ) -> UIView {
+    let dark = appearance.isDark
+    let card = UIView()
+    card.translatesAutoresizingMaskIntoConstraints = false
+    card.backgroundColor = vibeAgentKitColorWithAlpha(
+      dark ? UIColor.white : UIColor.black, dark ? 0.06 : 0.045)
+    card.layer.cornerRadius = 12.0
+    card.layer.cornerCurve = .continuous
+
+    let inner = UIStackView()
+    inner.translatesAutoresizingMaskIntoConstraints = false
+    inner.axis = .vertical
+    inner.alignment = .fill
+    inner.spacing = 10.0
+    card.addSubview(inner)
+
+    let mono = UIFont.monospacedSystemFont(ofSize: 13.0, weight: .regular)
+    let monoBold = UIFont.monospacedSystemFont(ofSize: 13.0, weight: .semibold)
+    let para = NSMutableParagraphStyle()
+    para.lineBreakMode = .byCharWrapping
+    para.lineSpacing = 1.5
+
+    if let command, !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      let label = UILabel()
+      label.translatesAutoresizingMaskIntoConstraints = false
+      label.numberOfLines = 0
+      label.lineBreakMode = .byCharWrapping
+      let line = NSMutableAttributedString(
+        string: "$ ",
+        attributes: [
+          .font: monoBold,
+          .foregroundColor: vibeAgentKitColorWithAlpha(appearance.primary, 0.9),
+          .paragraphStyle: para,
+        ])
+      line.append(
+        NSAttributedString(
+          string: command,
+          attributes: [.font: monoBold, .foregroundColor: appearance.text, .paragraphStyle: para]))
+      label.attributedText = line
+      inner.addArrangedSubview(label)
+    }
+
+    if let output, !output.isEmpty {
+      let label = UILabel()
+      label.translatesAutoresizingMaskIntoConstraints = false
+      label.numberOfLines = 0
+      label.lineBreakMode = .byCharWrapping
+      label.attributedText = NSAttributedString(
+        string: output,
+        attributes: [
+          .font: mono,
+          .foregroundColor: vibeAgentKitColorWithAlpha(appearance.text, 0.82),
+          .paragraphStyle: para,
+        ])
+      inner.addArrangedSubview(label)
+    }
+
+    let status = UILabel()
+    status.translatesAutoresizingMaskIntoConstraints = false
+    status.font = UIFont.systemFont(ofSize: 12.0, weight: .semibold)
+    status.textColor = isError ? .systemRed : .systemGreen
+    status.text = isError ? "✕ Failed" : "✓ Success"
+    status.textAlignment = .right
+    inner.addArrangedSubview(status)
+
+    NSLayoutConstraint.activate([
+      inner.topAnchor.constraint(equalTo: card.topAnchor, constant: 12.0),
+      inner.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -12.0),
+      inner.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 12.0),
+      inner.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -12.0),
+    ])
+    return card
+  }
+
+  /// A padded, rounded monospace box (command, result, or read slice). `accent`
+  /// tints the border so a bash result reads green (success) / red (failure).
+  private func monoBox(
+    _ text: String,
+    appearance: VibeAgentKitChatAppearance,
+    accent: UIColor? = nil
+  ) -> UIView {
+    let box = UIView()
+    box.translatesAutoresizingMaskIntoConstraints = false
+    box.backgroundColor = vibeAgentKitColorWithAlpha(
+      appearance.isDark ? UIColor.white : UIColor.black, appearance.isDark ? 0.05 : 0.04)
+    box.layer.cornerRadius = 8.0
+    box.layer.cornerCurve = .continuous
+    if let accent {
+      box.layer.borderWidth = 1.0
+      box.layer.borderColor = vibeAgentKitColorWithAlpha(accent, 0.45).cgColor
+    }
+    let label = UILabel()
+    label.translatesAutoresizingMaskIntoConstraints = false
+    label.numberOfLines = 0
+    label.lineBreakMode = .byCharWrapping
+    let para = NSMutableParagraphStyle()
+    para.lineBreakMode = .byCharWrapping
+    para.lineSpacing = 1.0
+    label.attributedText = NSAttributedString(
+      string: text,
+      attributes: [
+        .font: UIFont.monospacedSystemFont(ofSize: 13.0, weight: .regular),
+        .foregroundColor: appearance.text,
+        .paragraphStyle: para,
+      ]
+    )
+    box.addSubview(label)
+    NSLayoutConstraint.activate([
+      label.topAnchor.constraint(equalTo: box.topAnchor, constant: 9.0),
+      label.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 11.0),
+      label.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -11.0),
+      label.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -9.0),
+    ])
+    return box
+  }
+
+  /// A padded box rendering a unified diff with per-line coloring (+ green, − red,
+  /// @@ hunks muted) — the edit/write patch layer.
+  private func patchBox(_ patch: String, appearance: VibeAgentKitChatAppearance) -> UIView {
+    let box = UIView()
+    box.translatesAutoresizingMaskIntoConstraints = false
+    box.backgroundColor = vibeAgentKitColorWithAlpha(
+      appearance.isDark ? UIColor.white : UIColor.black, appearance.isDark ? 0.05 : 0.04)
+    box.layer.cornerRadius = 8.0
+    box.layer.cornerCurve = .continuous
+    let label = UILabel()
+    label.translatesAutoresizingMaskIntoConstraints = false
+    label.numberOfLines = 0
+    label.lineBreakMode = .byCharWrapping
+    label.attributedText = Self.diffAttributed(patch, appearance: appearance)
+    box.addSubview(label)
+    NSLayoutConstraint.activate([
+      label.topAnchor.constraint(equalTo: box.topAnchor, constant: 9.0),
+      label.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 11.0),
+      label.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -11.0),
+      label.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -9.0),
+    ])
+    return box
+  }
+
+  private static func diffAttributed(
+    _ patch: String,
+    appearance: VibeAgentKitChatAppearance
+  ) -> NSAttributedString {
+    let mono = UIFont.monospacedSystemFont(ofSize: 12.5, weight: .regular)
+    let para = NSMutableParagraphStyle()
+    para.lineBreakMode = .byCharWrapping
+    para.lineSpacing = 1.0
+    let muted = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.85)
+    let faint = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.55)
+    let result = NSMutableAttributedString()
+    let lines = patch.components(separatedBy: "\n")
+    for (index, line) in lines.enumerated() {
+      let color: UIColor
+      if line.hasPrefix("+") && !line.hasPrefix("+++") {
+        color = .systemGreen
+      } else if line.hasPrefix("-") && !line.hasPrefix("---") {
+        color = .systemRed
+      } else if line.hasPrefix("@@") {
+        color = muted
+      } else if line.hasPrefix("diff ") || line.hasPrefix("---") || line.hasPrefix("+++")
+        || line.hasPrefix("new file") || line.hasPrefix("deleted file")
+      {
+        color = faint
+      } else {
+        color = appearance.text
+      }
+      let suffix = index == lines.count - 1 ? "" : "\n"
+      result.append(
+        NSAttributedString(
+          string: line + suffix,
+          attributes: [.font: mono, .foregroundColor: color, .paragraphStyle: para]))
+    }
+    return result
   }
 }
 
@@ -681,6 +1060,7 @@ final class VibeAgentKitMessageCell: UITableViewCell {
 
   var onProgressTap: (() -> Void)?
   var onRuntimeTap: ((ChatListRow.AgentRuntimeSummary) -> Void)?
+  var onStepTap: ((String) -> Void)?
 
   /// The visible text currently displayed (exposed for the hold context menu).
   var currentMessageText: String { storedMessageText }
@@ -703,6 +1083,8 @@ final class VibeAgentKitMessageCell: UITableViewCell {
     assistantBodyView.reset()
     onProgressTap = nil
     onRuntimeTap = nil
+    onStepTap = nil
+    assistantBodyView.onStepTap = nil
     progressStack.arrangedSubviews.forEach {
       progressStack.removeArrangedSubview($0)
       $0.removeFromSuperview()
@@ -727,7 +1109,9 @@ final class VibeAgentKitMessageCell: UITableViewCell {
     appearance: VibeAgentKitChatAppearance,
     regeneratePrompt: String,
     showsActions: Bool = true,
-    isProgressExpanded: Bool = false
+    isProgressExpanded: Bool = false,
+    expandedStepIds: Set<String> = [],
+    streamingStartDate: Date? = nil
   ) {
     let isUser = message.role.isUser
     currentIsUser = isUser
@@ -784,6 +1168,8 @@ final class VibeAgentKitMessageCell: UITableViewCell {
       $0.removeFromSuperview()
     }
 
+    let fallbackWidth = window?.bounds.width ?? 390.0
+
     if isUser {
       let attributed = VibeAgentKitTextRenderer.makeAttributedText(
         text: displayText,
@@ -791,7 +1177,6 @@ final class VibeAgentKitMessageCell: UITableViewCell {
         textColor: userBubbleTextColor(for: appearance),
         lineHeight: 27.5
       )
-      let fallbackWidth = window?.bounds.width ?? 390.0
       let userWidth = max(
         140.0,
         (contentView.bounds.width > 0.0 ? contentView.bounds.width : fallbackWidth) * 0.68
@@ -823,12 +1208,12 @@ final class VibeAgentKitMessageCell: UITableViewCell {
         "[VibeAgentKitMessageCell] assistant display message=\(message.id) age_ms=\(ageMs) raw=\(message.text.count) display=\(displayText.count) initial=\(message.initialResponseText?.count ?? 0) hasInitial=\(message.hasInitialResponseText) hasFinal=\(message.hasFinalResponseText) progress=\(message.progress.count) items=\(message.progressItems.count)"
       )
       #endif
-      let fallbackWidth = window?.bounds.width ?? 390.0
       let availableWidth = max(
         160.0,
-        ((contentView.bounds.width > 0.0 ? contentView.bounds.width : fallbackWidth) - 48.0) * 0.92
+        ((contentView.bounds.width > 0.0 ? contentView.bounds.width : fallbackWidth) - 64.0) * 0.92
       )
       assistantBodyView.isHidden = false
+      assistantBodyView.onStepTap = onStepTap
       assistantBodyView.configure(
         text: displayText,
         isStreaming: message.isStreaming,
@@ -841,7 +1226,9 @@ final class VibeAgentKitMessageCell: UITableViewCell {
         runtime: message.runtime,
         onRuntimeTap: onRuntimeTap,
         onLoaderTap: onProgressTap,
-        isProgressExpanded: isProgressExpanded
+        isProgressExpanded: isProgressExpanded,
+        expandedStepIds: expandedStepIds,
+        streamingStartDate: streamingStartDate
       )
 
       messageContainerView.backgroundColor = .clear
@@ -942,8 +1329,8 @@ final class VibeAgentKitMessageCell: UITableViewCell {
 
     NSLayoutConstraint.activate([
       rowTopConstraint,
-      rowContainer.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 12.0),
-      rowContainer.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -12.0),
+      rowContainer.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20.0),
+      rowContainer.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20.0),
       rowBottomConstraint,
 
       messageContainerView.topAnchor.constraint(equalTo: rowContainer.topAnchor),
@@ -1071,5 +1458,441 @@ final class VibeAgentKitMessageCell: UITableViewCell {
     let newOrigin = view.frame.origin
     let delta = CGPoint(x: newOrigin.x - oldOrigin.x, y: newOrigin.y - oldOrigin.y)
     view.center = CGPoint(x: view.center.x - delta.x, y: view.center.y - delta.y)
+  }
+}
+
+// A /compact context summary rendered as a centered, collapsible mid-chat divider —
+// a thin rule with a "Context compacted" pill in the middle (Claude-Code / ChatGPT
+// style), NOT a left assistant bubble. Tapping the pill reveals the full summary the
+// model kept; tapping again hides it. State lives in the host VC (reuses the per-message
+// expand set) so it survives cell reuse.
+final class VibeAgentKitCompactionCell: UITableViewCell {
+  static let reuseIdentifier = "VibeAgentKitCompactionCell"
+
+  private let headerControl = UIControl()
+  private let leftRule = UIView()
+  private let rightRule = UIView()
+  private let pill = UIView()
+  private let pillIcon = UIImageView()
+  private let pillLabel = UILabel()
+  private let chevron = UIImageView()
+  private let summaryLabel = UILabel()
+  private var summaryTopConstraint: NSLayoutConstraint!
+  private var isExpandedState = false
+
+  var onToggle: (() -> Void)?
+
+  override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+    super.init(style: style, reuseIdentifier: reuseIdentifier)
+    setup()
+  }
+
+  required init?(coder: NSCoder) { return nil }
+
+  override func prepareForReuse() {
+    super.prepareForReuse()
+    onToggle = nil
+    isExpandedState = false
+    chevron.transform = .identity
+  }
+
+  private func setup() {
+    backgroundColor = .clear
+    selectionStyle = .none
+    contentView.backgroundColor = .clear
+
+    headerControl.translatesAutoresizingMaskIntoConstraints = false
+    headerControl.addAction(UIAction { [weak self] _ in self?.onToggle?() }, for: .touchUpInside)
+    contentView.addSubview(headerControl)
+
+    leftRule.translatesAutoresizingMaskIntoConstraints = false
+    rightRule.translatesAutoresizingMaskIntoConstraints = false
+    headerControl.addSubview(leftRule)
+    headerControl.addSubview(rightRule)
+
+    pill.translatesAutoresizingMaskIntoConstraints = false
+    pill.layer.cornerRadius = 12.0
+    pill.layer.cornerCurve = .continuous
+    pill.isUserInteractionEnabled = false
+    headerControl.addSubview(pill)
+
+    pillIcon.translatesAutoresizingMaskIntoConstraints = false
+    pillIcon.contentMode = .scaleAspectFit
+    pillIcon.image = UIImage(systemName: "rectangle.compress.vertical")?
+      .withRenderingMode(.alwaysTemplate)
+    pill.addSubview(pillIcon)
+
+    pillLabel.translatesAutoresizingMaskIntoConstraints = false
+    pillLabel.font = UIFont.systemFont(ofSize: 12.5, weight: .semibold)
+    pill.addSubview(pillLabel)
+
+    chevron.translatesAutoresizingMaskIntoConstraints = false
+    chevron.contentMode = .scaleAspectFit
+    pill.addSubview(chevron)
+
+    summaryLabel.translatesAutoresizingMaskIntoConstraints = false
+    summaryLabel.numberOfLines = 0
+    summaryLabel.backgroundColor = .clear
+    contentView.addSubview(summaryLabel)
+
+    summaryTopConstraint = summaryLabel.topAnchor.constraint(
+      equalTo: headerControl.bottomAnchor, constant: 0.0)
+
+    NSLayoutConstraint.activate([
+      headerControl.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 10.0),
+      headerControl.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20.0),
+      headerControl.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20.0),
+      headerControl.heightAnchor.constraint(equalToConstant: 24.0),
+
+      pill.centerXAnchor.constraint(equalTo: headerControl.centerXAnchor),
+      pill.centerYAnchor.constraint(equalTo: headerControl.centerYAnchor),
+      pill.heightAnchor.constraint(equalToConstant: 24.0),
+
+      pillIcon.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: 10.0),
+      pillIcon.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
+      pillIcon.widthAnchor.constraint(equalToConstant: 12.0),
+      pillIcon.heightAnchor.constraint(equalToConstant: 12.0),
+
+      pillLabel.leadingAnchor.constraint(equalTo: pillIcon.trailingAnchor, constant: 6.0),
+      pillLabel.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
+
+      chevron.leadingAnchor.constraint(equalTo: pillLabel.trailingAnchor, constant: 6.0),
+      chevron.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -10.0),
+      chevron.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
+      chevron.widthAnchor.constraint(equalToConstant: 10.0),
+      chevron.heightAnchor.constraint(equalToConstant: 10.0),
+
+      leftRule.leadingAnchor.constraint(equalTo: headerControl.leadingAnchor),
+      leftRule.trailingAnchor.constraint(equalTo: pill.leadingAnchor, constant: -10.0),
+      leftRule.centerYAnchor.constraint(equalTo: headerControl.centerYAnchor),
+      leftRule.heightAnchor.constraint(equalToConstant: 1.0),
+
+      rightRule.leadingAnchor.constraint(equalTo: pill.trailingAnchor, constant: 10.0),
+      rightRule.trailingAnchor.constraint(equalTo: headerControl.trailingAnchor),
+      rightRule.centerYAnchor.constraint(equalTo: headerControl.centerYAnchor),
+      rightRule.heightAnchor.constraint(equalToConstant: 1.0),
+
+      summaryTopConstraint,
+      summaryLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20.0),
+      summaryLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20.0),
+      summaryLabel.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -10.0),
+    ])
+  }
+
+  func configure(text: String, expanded: Bool, appearance: VibeAgentKitChatAppearance) {
+    let ruleColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.22)
+    leftRule.backgroundColor = ruleColor
+    rightRule.backgroundColor = ruleColor
+    pill.backgroundColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.14)
+    pillIcon.tintColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.9)
+    pillLabel.textColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.95)
+    pillLabel.text = expanded ? "Hide summary" : "Context compacted"
+    // One chevron that rotates (down when collapsed, up when expanded) so the toggle
+    // direction reads clearly and animates rather than snapping between two glyphs.
+    chevron.image = UIImage(systemName: "chevron.down")?.withRenderingMode(.alwaysTemplate)
+    chevron.tintColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.7)
+    let rotation = expanded ? CGAffineTransform(rotationAngle: .pi) : .identity
+    if expanded != isExpandedState {
+      UIView.animate(withDuration: 0.22, delay: 0.0, options: [.beginFromCurrentState]) {
+        self.chevron.transform = rotation
+      }
+    } else {
+      chevron.transform = rotation
+    }
+    isExpandedState = expanded
+
+    if expanded, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      summaryLabel.isHidden = false
+      summaryLabel.attributedText = VibeAgentKitTextRenderer.makeAttributedText(
+        text: text,
+        font: UIFont.systemFont(ofSize: 14.5, weight: .regular),
+        textColor: vibeAgentKitColorWithAlpha(appearance.text, 0.78),
+        lineHeight: 21.0
+      )
+      summaryTopConstraint.constant = 12.0
+    } else {
+      summaryLabel.isHidden = true
+      summaryLabel.attributedText = nil
+      summaryTopConstraint.constant = 0.0
+    }
+  }
+}
+
+// MARK: - Step detail sheet
+
+/// Full detail for ONE tool step, shown in a bottom sheet when its card is tapped (the
+/// step list itself stays put — no inline unfolding). Renders per-kind: bash → the full
+/// command box + a success/failure-tinted result box; edit/write → the file name + the
+/// unified-diff patch (green/red); read → the line range + the file slice; everything
+/// else → its output. Generous vertical spacing keeps the command and the terminal
+/// output as clearly separated blocks.
+final class VibeAgentKitStepDetailViewController: UIViewController {
+  private let item: VibeAgentKitProgressItem
+  private let appearance: VibeAgentKitChatAppearance
+  private let scrollView = UIScrollView()
+  private let stack = UIStackView()
+
+  init(item: VibeAgentKitProgressItem, appearance: VibeAgentKitChatAppearance) {
+    self.item = item
+    self.appearance = appearance
+    super.init(nibName: nil, bundle: nil)
+  }
+
+  required init?(coder: NSCoder) { return nil }
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    view.backgroundColor = appearance.background
+
+    let kind = (item.itemType ?? item.tool ?? "").lowercased()
+    navigationItem.title = stepTitle(kind: kind)
+    navigationItem.leftBarButtonItem = UIBarButtonItem(
+      barButtonSystemItem: .close, target: self, action: #selector(closeTapped))
+    navigationItem.leftBarButtonItem?.tintColor = appearance.primary
+
+    scrollView.translatesAutoresizingMaskIntoConstraints = false
+    scrollView.alwaysBounceVertical = true
+    view.addSubview(scrollView)
+
+    stack.translatesAutoresizingMaskIntoConstraints = false
+    stack.axis = .vertical
+    stack.alignment = .fill
+    // Wide gaps so the command block and the terminal-output block read as distinct,
+    // un-cramped sections (the padding the previous inline layout was missing).
+    stack.spacing = 18.0
+    scrollView.addSubview(stack)
+
+    NSLayoutConstraint.activate([
+      scrollView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+      scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+      stack.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor, constant: 20.0),
+      stack.bottomAnchor.constraint(
+        equalTo: scrollView.contentLayoutGuide.bottomAnchor, constant: -28.0),
+      stack.leadingAnchor.constraint(
+        equalTo: scrollView.frameLayoutGuide.leadingAnchor, constant: 20.0),
+      stack.trailingAnchor.constraint(
+        equalTo: scrollView.frameLayoutGuide.trailingAnchor, constant: -20.0),
+    ])
+
+    buildContent(kind: kind)
+  }
+
+  @objc private func closeTapped() { dismiss(animated: true) }
+
+  private func stepTitle(kind: String) -> String {
+    switch kind {
+    case "bash": return "Shell"
+    case "edit", "write": return item.fileName ?? "Edit"
+    case "read": return item.fileName ?? "Read"
+    case "thinking": return "Thinking"
+    default: return item.label.isEmpty ? "Step" : item.label
+    }
+  }
+
+  private func buildContent(kind: String) {
+    let isError = ["error", "failed", "failure"].contains((item.status ?? "").lowercased())
+
+    // A label header so the sheet always names what ran, even for non-bash steps.
+    if kind != "bash", !item.label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      stack.addArrangedSubview(sectionLabel(item.label, weight: .semibold, size: 16.0))
+    }
+
+    switch kind {
+    case "bash":
+      stack.addArrangedSubview(caption("Shell", appearance.textSecondary))
+      stack.addArrangedSubview(
+        terminalCard(command: item.command, output: item.messageContent, isError: isError))
+
+    case "edit", "write":
+      if let name = item.fileName, !name.isEmpty {
+        stack.addArrangedSubview(caption(name, appearance.textSecondary))
+      }
+      if let patch = item.patch, !patch.isEmpty {
+        stack.addArrangedSubview(monoBox(patch, isPatch: true))
+      } else {
+        stack.addArrangedSubview(
+          caption("No diff available.", vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.7)))
+      }
+
+    case "read":
+      if let start = item.lineStart {
+        let range = item.lineEnd.map { "Lines \(start)–\($0)" } ?? "From line \(start)"
+        stack.addArrangedSubview(caption(range, appearance.textSecondary))
+      }
+      if let content = item.fileContent, !content.isEmpty {
+        stack.addArrangedSubview(monoBox(content))
+      } else {
+        stack.addArrangedSubview(
+          caption("No file slice available.", vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.7)))
+      }
+
+    default:
+      if let output = item.messageContent, !output.isEmpty {
+        stack.addArrangedSubview(monoBox(output))
+      } else {
+        stack.addArrangedSubview(
+          caption("Nothing more to show for this step.",
+            vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.7)))
+      }
+    }
+  }
+
+  private func sectionLabel(_ text: String, weight: UIFont.Weight, size: CGFloat) -> UILabel {
+    let label = UILabel()
+    label.numberOfLines = 0
+    label.font = UIFont.systemFont(ofSize: size, weight: weight)
+    label.textColor = appearance.text
+    label.text = text
+    return label
+  }
+
+  private func caption(_ text: String, _ color: UIColor) -> UILabel {
+    let label = UILabel()
+    label.numberOfLines = 0
+    label.font = UIFont.systemFont(ofSize: 12.5, weight: .semibold)
+    label.textColor = color
+    label.text = text
+    return label
+  }
+
+  /// One terminal-style card: the `$ command`, its output, and a right-aligned
+  /// ✓ Success / ✕ Failed result — the shell-result look.
+  private func terminalCard(command: String?, output: String?, isError: Bool) -> UIView {
+    let dark = appearance.isDark
+    let card = UIView()
+    card.translatesAutoresizingMaskIntoConstraints = false
+    card.backgroundColor = vibeAgentKitColorWithAlpha(
+      dark ? UIColor.white : UIColor.black, dark ? 0.06 : 0.045)
+    card.layer.cornerRadius = 14.0
+    card.layer.cornerCurve = .continuous
+
+    let inner = UIStackView()
+    inner.translatesAutoresizingMaskIntoConstraints = false
+    inner.axis = .vertical
+    inner.alignment = .fill
+    inner.spacing = 12.0
+    card.addSubview(inner)
+
+    let mono = UIFont.monospacedSystemFont(ofSize: 13.0, weight: .regular)
+    let monoBold = UIFont.monospacedSystemFont(ofSize: 13.0, weight: .semibold)
+    let para = NSMutableParagraphStyle()
+    para.lineBreakMode = .byCharWrapping
+    para.lineSpacing = 2.0
+
+    if let command, !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      let label = UILabel()
+      label.translatesAutoresizingMaskIntoConstraints = false
+      label.numberOfLines = 0
+      label.lineBreakMode = .byCharWrapping
+      let line = NSMutableAttributedString(
+        string: "$ ",
+        attributes: [
+          .font: monoBold,
+          .foregroundColor: vibeAgentKitColorWithAlpha(appearance.primary, 0.9),
+          .paragraphStyle: para,
+        ])
+      line.append(
+        NSAttributedString(
+          string: command,
+          attributes: [.font: monoBold, .foregroundColor: appearance.text, .paragraphStyle: para]))
+      label.attributedText = line
+      inner.addArrangedSubview(label)
+    }
+
+    if let output, !output.isEmpty {
+      let label = UILabel()
+      label.translatesAutoresizingMaskIntoConstraints = false
+      label.numberOfLines = 0
+      label.lineBreakMode = .byCharWrapping
+      label.attributedText = NSAttributedString(
+        string: output,
+        attributes: [
+          .font: mono,
+          .foregroundColor: vibeAgentKitColorWithAlpha(appearance.text, 0.82),
+          .paragraphStyle: para,
+        ])
+      inner.addArrangedSubview(label)
+    }
+
+    let status = UILabel()
+    status.translatesAutoresizingMaskIntoConstraints = false
+    status.font = UIFont.systemFont(ofSize: 12.5, weight: .semibold)
+    status.textColor = isError ? .systemRed : .systemGreen
+    status.text = isError ? "✕ Failed" : "✓ Success"
+    status.textAlignment = .right
+    inner.addArrangedSubview(status)
+
+    NSLayoutConstraint.activate([
+      inner.topAnchor.constraint(equalTo: card.topAnchor, constant: 14.0),
+      inner.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14.0),
+      inner.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14.0),
+      inner.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14.0),
+    ])
+    return card
+  }
+
+  /// A padded monospace box. `isPatch` colours +/− diff lines green/red.
+  private func monoBox(_ text: String, accent: UIColor? = nil, isPatch: Bool = false) -> UIView {
+    let box = UIView()
+    box.translatesAutoresizingMaskIntoConstraints = false
+    box.backgroundColor = vibeAgentKitColorWithAlpha(
+      appearance.isDark ? UIColor.white : UIColor.black, appearance.isDark ? 0.05 : 0.04)
+    box.layer.cornerRadius = 10.0
+    box.layer.cornerCurve = .continuous
+    if let accent {
+      box.layer.borderWidth = 1.0
+      box.layer.borderColor = vibeAgentKitColorWithAlpha(accent, 0.45).cgColor
+    }
+    let label = UILabel()
+    label.translatesAutoresizingMaskIntoConstraints = false
+    label.numberOfLines = 0
+    label.lineBreakMode = .byCharWrapping
+    let font = UIFont.monospacedSystemFont(ofSize: 13.0, weight: .regular)
+    if isPatch {
+      label.attributedText = patchAttributed(text, font: font)
+    } else {
+      let para = NSMutableParagraphStyle()
+      para.lineBreakMode = .byCharWrapping
+      para.lineSpacing = 1.5
+      label.attributedText = NSAttributedString(
+        string: text,
+        attributes: [.font: font, .foregroundColor: appearance.text, .paragraphStyle: para])
+    }
+    box.addSubview(label)
+    NSLayoutConstraint.activate([
+      label.topAnchor.constraint(equalTo: box.topAnchor, constant: 12.0),
+      label.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -12.0),
+      label.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 12.0),
+      label.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -12.0),
+    ])
+    return box
+  }
+
+  private func patchAttributed(_ patch: String, font: UIFont) -> NSAttributedString {
+    let para = NSMutableParagraphStyle()
+    para.lineBreakMode = .byCharWrapping
+    para.lineSpacing = 1.5
+    let result = NSMutableAttributedString()
+    let lines = patch.components(separatedBy: "\n")
+    for (idx, line) in lines.enumerated() {
+      let color: UIColor
+      if line.hasPrefix("+") && !line.hasPrefix("+++") {
+        color = .systemGreen
+      } else if line.hasPrefix("-") && !line.hasPrefix("---") {
+        color = .systemRed
+      } else if line.hasPrefix("@@") {
+        color = appearance.primary
+      } else {
+        color = appearance.text
+      }
+      let suffix = idx == lines.count - 1 ? "" : "\n"
+      result.append(
+        NSAttributedString(
+          string: line + suffix,
+          attributes: [.font: font, .foregroundColor: color, .paragraphStyle: para]))
+    }
+    return result
   }
 }

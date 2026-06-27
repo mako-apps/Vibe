@@ -327,6 +327,7 @@ struct AgentBridgeRepositoryPickerView: View {
                 ? "Past \(displayName) sessions on your computer will appear here."
                 : "Pick a session to resume it; otherwise each message starts a new task.")
             }
+            .listRowBackground(palette.card)
 
             Section {
               ForEach(AgentBridgeWorkMode.allCases) { mode in
@@ -362,6 +363,7 @@ struct AgentBridgeRepositoryPickerView: View {
             } header: {
               Text("Permission")
             }
+            .listRowBackground(palette.card)
 
             Section {
               ForEach(status.repositories) { repo in
@@ -397,10 +399,14 @@ struct AgentBridgeRepositoryPickerView: View {
                 .buttonStyle(.plain)
               }
             }
+            .listRowBackground(palette.card)
           }
           .listStyle(.insetGrouped)
+          .scrollContentBackground(.hidden)
+          .background(palette.background)
         }
       }
+      .background(palette.background.ignoresSafeArea())
       .navigationTitle("\(displayName) repo")
       .navigationBarTitleDisplayMode(.inline)
       .toolbar {
