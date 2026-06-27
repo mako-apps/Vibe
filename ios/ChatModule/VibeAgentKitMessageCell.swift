@@ -164,15 +164,43 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
   private func updateStepsList(
     _ items: [VibeAgentKitProgressItem],
     expanded: Bool,
+    showDetails: Bool,
     appearance: VibeAgentKitChatAppearance
   ) {
     clearStepsList()
     guard expanded, !items.isEmpty else { return }
     let stepFont = UIFont.systemFont(ofSize: 15.0, weight: .regular)
+    let detailFont = UIFont.monospacedSystemFont(ofSize: 12.5, weight: .regular)
     let marker = "•  "
     let indent = (marker as NSString).size(withAttributes: [.font: stepFont]).width
     let color = appearance.textSecondary
     for item in items {
+      // A "text" node is the agent's working narration, folded into the card in
+      // chronological order (interleaved with the tool steps) so the collapsed
+      // "Worked …" card reads top-down exactly as the agent worked. It renders as
+      // plain wrapping prose — no bullet, no diff coloring — to read as the model's
+      // own voice, distinct from the Read/Edit/Run step rows around it.
+      if item.itemType == "text" {
+        let narration = item.label.trimmingCharacters(in: .whitespacesAndNewlines)
+        if narration.isEmpty { continue }
+        let textLabel = UILabel()
+        textLabel.numberOfLines = 0
+        textLabel.translatesAutoresizingMaskIntoConstraints = false
+        let tpara = NSMutableParagraphStyle()
+        tpara.lineBreakMode = .byWordWrapping
+        tpara.lineSpacing = 2.0
+        tpara.paragraphSpacing = 4.0
+        textLabel.attributedText = NSAttributedString(
+          string: narration,
+          attributes: [
+            .font: UIFont.systemFont(ofSize: 15.0, weight: .regular),
+            .foregroundColor: appearance.text,
+            .paragraphStyle: tpara,
+          ]
+        )
+        stepsStack.addArrangedSubview(textLabel)
+        continue
+      }
       let label = UILabel()
       label.numberOfLines = 0
       label.translatesAutoresizingMaskIntoConstraints = false
@@ -180,13 +208,72 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
       para.lineBreakMode = .byWordWrapping
       para.headIndent = indent
       para.lineSpacing = 1.0
-      label.attributedText = NSAttributedString(
-        string: marker + item.label,
-        attributes: [.font: stepFont, .foregroundColor: color, .paragraphStyle: para]
-      )
+      // "Edit file  +12 −3" — verb/target stay muted; the additions read green and
+      // deletions red so the expanded card scans like a diff summary.
+      label.attributedText = Self.styledStepLabel(
+        marker + item.label, font: stepFont, baseColor: color, paragraph: para)
       stepsStack.addArrangedSubview(label)
+
+      // The decrypted per-step detail (a command's OUTPUT, search hits, a todo
+      // checklist) renders inline under its step, so the expanded work card shows
+      // "what actually ran" — not just the verb. Edits/reads carry no body (their
+      // +N/−N counts ride the label; the full line-by-line diff lives in the
+      // file-change card below).
+      if showDetails,
+        let detail = item.messageContent?.trimmingCharacters(in: .whitespacesAndNewlines),
+        !detail.isEmpty
+      {
+        let detailLabel = UILabel()
+        detailLabel.numberOfLines = 8
+        detailLabel.lineBreakMode = .byTruncatingTail
+        detailLabel.translatesAutoresizingMaskIntoConstraints = false
+        let dpara = NSMutableParagraphStyle()
+        dpara.lineBreakMode = .byWordWrapping
+        dpara.headIndent = indent
+        dpara.firstLineHeadIndent = indent
+        dpara.lineSpacing = 1.0
+        detailLabel.attributedText = NSAttributedString(
+          string: detail,
+          attributes: [
+            .font: detailFont,
+            .foregroundColor: vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.7),
+            .paragraphStyle: dpara,
+          ]
+        )
+        stepsStack.addArrangedSubview(detailLabel)
+      }
     }
     stepsStack.isHidden = false
+  }
+
+  /// Color the "+N" additions green and "−N" deletions red inside a step label so the
+  /// expanded work card reads like a diff summary (Claude/Codex style), while the verb
+  /// + target stay in the muted base color. The minus is U+2212 (the formatter emits
+  /// it, not an ASCII hyphen).
+  private static func styledStepLabel(
+    _ string: String,
+    font: UIFont,
+    baseColor: UIColor,
+    paragraph: NSParagraphStyle
+  ) -> NSAttributedString {
+    let attributed = NSMutableAttributedString(
+      string: string,
+      attributes: [.font: font, .foregroundColor: baseColor, .paragraphStyle: paragraph]
+    )
+    let full = string as NSString
+    guard let regex = try? NSRegularExpression(pattern: "[+\u{2212}]\\d[\\d,]*") else {
+      return attributed
+    }
+    for match in regex.matches(in: string, range: NSRange(location: 0, length: full.length)) {
+      let isAdd = full.substring(with: match.range).hasPrefix("+")
+      attributed.addAttribute(
+        .foregroundColor, value: isAdd ? UIColor.systemGreen : UIColor.systemRed,
+        range: match.range)
+      attributed.addAttribute(
+        .font, value: UIFont.systemFont(ofSize: font.pointSize, weight: .semibold),
+        range: match.range)
+    }
+    return attributed
   }
 
   private func removeBlockViews() {
@@ -242,9 +329,13 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
         // elapsed time rides the decrypted runtime (live turns carry durationMs);
         // history turns have no duration, so they read "Worked · N steps". Same
         // structure for Claude and Codex — both feed progressItems + runtime.
+        // "text" nodes are the folded-in narration, not tool steps — don't count
+        // them toward "· N steps" (that count means Read/Edit/Run actions).
+        let toolStepCount = progressItems.filter { $0.itemType != "text" }.count
         loaderText = Self.workedSummary(
-          stepCount: progressItems.count,
-          durationMs: runtime?.durationMs
+          stepCount: toolStepCount,
+          durationMs: runtime?.durationMs,
+          usage: runtime?.usage
         )
       }
       loaderView.isHidden = false
@@ -259,10 +350,24 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
       loaderView.configure(text: "", isStreaming: false, progressItems: [])
     }
 
-    updateStepsList(progressItems, expanded: stepsExpanded, appearance: appearance)
+    // Live turn: stream the recent steps under the shimmer so you watch the agent
+    // work (Read → Edit → Run …) as it happens — labels only (detail bodies would be
+    // too noisy mid-run), capped to the most recent few. The shimmer line carries the
+    // current action, so the feed shows the ones before it. Completed turn: the steps
+    // live inside the tappable "Worked" card and reveal their command output / search
+    // hits + diff counts when expanded.
+    if showsLoader {
+      let priorSteps = progressItems.count > 1 ? Array(progressItems.dropLast().suffix(7)) : []
+      updateStepsList(priorSteps, expanded: true, showDetails: false, appearance: appearance)
+    } else {
+      updateStepsList(progressItems, expanded: stepsExpanded, showDetails: true, appearance: appearance)
+    }
 
+    // The file-change / diff card belongs to a FINISHED turn only — the agent works
+    // top-down and the consolidated patch isn't meaningful until it's done, so don't
+    // flash an "edited file" card mid-stream. Live turns show the step feed instead.
     configureRuntimeSummary(
-      runtime,
+      showsLoader ? nil : runtime,
       textColor: appearance.text,
       availableWidth: availableWidth,
       onTap: onRuntimeTap
@@ -365,10 +470,13 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
       }
     }
 
-    // A completed turn's "Worked · N steps" summary reads as a footer UNDER the
-    // answer (the work is done — show it after, not mid-turn). A live turn keeps
-    // the shimmer pinned at the top so you watch it work.
-    positionSummaryViews(belowText: shouldShowLoader && !showsLoader)
+    // The "Worked …" summary always pins to the TOP of the turn — the agent works
+    // top-down (read → edit → run …) and only emits its final answer once it's
+    // done, so the collapsed work card belongs ABOVE the summary, never mid-answer.
+    // Live turns shimmer the in-flight step at the top; completed turns collapse the
+    // whole run into the tappable "Worked for X · N steps" card, with the answer
+    // rendered underneath it.
+    positionSummaryViews(belowText: false)
   }
 
   /// Place the loader (Worked summary) + its expandable step list either at the TOP
@@ -392,15 +500,45 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
 
   // Completed-turn summary line. Matches the Claude Code / Codex "Worked for Xs"
   // affordance: elapsed time first (when the runtime carries it), then the step
-  // count. Provider-agnostic — Claude and Codex both populate progressItems and
-  // (for live turns) a runtime with durationMs.
-  static func workedSummary(stepCount: Int, durationMs: Int?) -> String {
+  // count, then this turn's usage (tokens + cost) when the runtime carries it — so
+  // the user can see their spend without leaving the chat. Provider-agnostic — Claude
+  // and Codex both populate progressItems and (for live turns) a runtime with usage.
+  static func workedSummary(
+    stepCount: Int,
+    durationMs: Int?,
+    usage: ChatListRow.AgentRuntimeUsage? = nil
+  ) -> String {
     let steps = max(0, stepCount)
     let stepText = steps == 1 ? "1 step" : "\(steps) steps"
-    guard let ms = durationMs, ms >= 1000 else {
-      return "Worked · \(stepText)"
+    let base: String
+    if let ms = durationMs, ms >= 1000 {
+      base = "Worked for \(formatElapsed(ms)) · \(stepText)"
+    } else {
+      base = "Worked · \(stepText)"
     }
-    return "Worked for \(formatElapsed(ms)) · \(stepText)"
+    guard let suffix = usageSuffix(usage) else { return base }
+    return "\(base) · \(suffix)"
+  }
+
+  /// Compact "18.4k tokens · $0.06" suffix from a turn's usage, omitting whichever
+  /// parts the provider didn't report. Returns nil when there's nothing to show.
+  private static func usageSuffix(_ usage: ChatListRow.AgentRuntimeUsage?) -> String? {
+    guard let usage else { return nil }
+    var parts: [String] = []
+    let totalTokens = (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0)
+    if totalTokens > 0 {
+      parts.append("\(compactTokens(totalTokens)) tokens")
+    }
+    if let cost = usage.totalCostUsd, cost > 0 {
+      parts.append(String(format: "$%.2f", cost))
+    }
+    return parts.isEmpty ? nil : parts.joined(separator: " · ")
+  }
+
+  private static func compactTokens(_ n: Int) -> String {
+    if n >= 1_000_000 { return String(format: "%.1fM", Double(n) / 1_000_000.0) }
+    if n >= 1000 { return String(format: "%.1fk", Double(n) / 1000.0) }
+    return "\(n)"
   }
 
   private static func formatElapsed(_ ms: Int) -> String {
@@ -909,6 +1047,20 @@ final class VibeAgentKitMessageCell: UITableViewCell {
   /// Returns the frame of the bubble container in the cell's own coordinate space.
   func bubbleFrameInSelf() -> CGRect {
     messageContainerView.convert(messageContainerView.bounds, to: self)
+  }
+
+  /// A targeted preview of just the rounded bubble, so the hold menu's system lift
+  /// ("mold" effect) raises the clean bubble shape on a clear platter rather than the
+  /// whole row (which includes the action bar / progress).
+  func bubblePreview() -> UITargetedPreview {
+    let params = UIPreviewParameters()
+    params.backgroundColor = .clear
+    let radius = currentIsUser ? messageContainerView.layer.cornerRadius : 12.0
+    params.visiblePath = UIBezierPath(
+      roundedRect: messageContainerView.bounds,
+      cornerRadius: radius
+    )
+    return UITargetedPreview(view: messageContainerView, parameters: params)
   }
 
   // MARK: - Private helpers

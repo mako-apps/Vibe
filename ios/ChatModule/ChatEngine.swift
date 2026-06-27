@@ -1810,6 +1810,19 @@ final class ChatEngine {
   /// Runs on the engine queue (called from the socket-frame handler). Message ids
   /// are derived from the session id so re-opening the same session upserts in
   /// place rather than duplicating.
+  /// The bridge daemon prepends an instruction preamble ("Vibe bridge startup
+  /// prepared these instruction files… User task:\n<text>") to every prompt it hands
+  /// the CLI. The CLI transcript records the full prompt, so when we re-ingest that
+  /// transcript as history the user's own bubble would show the preamble. Strip it
+  /// back to just the user's text. Only triggers on the exact preamble prefix, so a
+  /// normal message that happens to mention "User task:" is untouched.
+  static func strippedBridgeInstructionPreamble(_ text: String) -> String {
+    guard text.hasPrefix("Vibe bridge startup prepared these instruction files"),
+      let marker = text.range(of: "User task:")
+    else { return text }
+    return String(text[marker.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
   private func ingestAgentBridgeSessionLocked(
     chatId: String,
     provider: String,
@@ -1856,9 +1869,13 @@ final class ChatEngine {
       ]
       if role == "user" {
         // isMe is derived from fromId == current user; plain text flows through
-        // the non-hybrid `encryptedContent` path as the bubble text.
+        // the non-hybrid `encryptedContent` path as the bubble text. Strip the bridge
+        // instruction preamble the daemon prepends to each prompt before handing it to
+        // the CLI — the CLI transcript records the WHOLE prompt, so without this the
+        // user's bubble reads "Vibe bridge startup prepared these instruction files…
+        // User task: <text>" instead of just their message.
         if let me, !me.isEmpty { synthetic["fromId"] = me }
-        synthetic["encryptedContent"] = text
+        synthetic["encryptedContent"] = Self.strippedBridgeInstructionPreamble(text)
       } else {
         synthetic["isAgentMessage"] = true
         synthetic["plainContent"] = text

@@ -218,6 +218,29 @@ function encryptRuntimeBlob(obj) {
   }
 }
 
+// Decrypt an `arte1.<iv>.<ct>.<tag>` blob the phone sealed with the shared pairing
+// key (e.g. an image attachment). Returns the parsed object, or null when there's no
+// key, the envelope is malformed, or authentication fails.
+function decryptRuntimeBlob(blob) {
+  if (!RUNTIME_KEY_B64 || typeof blob !== "string") return null;
+  const parts = blob.split(".");
+  if (parts.length !== 4 || parts[0] !== RUNTIME_BLOB_PREFIX) return null;
+  try {
+    const key = Buffer.from(RUNTIME_KEY_B64, "base64");
+    if (key.length !== 32) return null;
+    const iv = Buffer.from(parts[1], "base64url");
+    const ct = Buffer.from(parts[2], "base64url");
+    const tag = Buffer.from(parts[3], "base64url");
+    const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+    decipher.setAuthTag(tag);
+    const pt = Buffer.concat([decipher.update(ct), decipher.final()]);
+    return JSON.parse(pt.toString("utf8"));
+  } catch (err) {
+    console.error("[vibe-bridge] attachment decrypt failed:", err.message);
+    return null;
+  }
+}
+
 // What to attach to a `result` push for the runtime payload. When a key is
 // present we send ONLY the encrypted blob (plus a non-sensitive `canRevert`
 // boolean the server/self-test need); the server never receives the plaintext
@@ -338,18 +361,21 @@ function ensureBridgeInstructionFiles(repo) {
   }
 }
 
-function ensureBridgeInstructionGitExclude(root) {
+function ensureVibeGitExclude(root, marker) {
   const gitDir = path.join(root, ".git");
   try {
     if (!fs.existsSync(gitDir) || !fs.statSync(gitDir).isDirectory()) return;
     const excludePath = path.join(gitDir, "info", "exclude");
     fs.mkdirSync(path.dirname(excludePath), { recursive: true });
-    const marker = ".vibe/instructions/";
     const current = fs.existsSync(excludePath) ? fs.readFileSync(excludePath, "utf8") : "";
     if (!current.split(/\r?\n/).some((line) => line.trim() === marker)) {
       fs.appendFileSync(excludePath, `${current.endsWith("\n") || current.length === 0 ? "" : "\n"}${marker}\n`);
     }
   } catch (_) {}
+}
+
+function ensureBridgeInstructionGitExclude(root) {
+  ensureVibeGitExclude(root, ".vibe/instructions/");
 }
 
 function ensureBridgeInstructionsForRepositories(repositories) {
@@ -686,8 +712,9 @@ function claudePermissionMode(task) {
   switch (workModeFor(task)) {
     case "full_access":
       return "bypassPermissions";
-    case "allow_edits":
     case "ask_auto":
+      return "auto";
+    case "allow_edits":
       return "acceptEdits";
     // "ask" maps to plan for now (propose, don't execute) until live mobile
     // approval is wired; "read_only" is plan too.
@@ -707,6 +734,20 @@ function codexSandbox(task) {
       return "workspace-write";
     default:
       return "read-only";
+  }
+}
+
+function codexApprovalPolicy(task) {
+  if (process.env.VIBE_CODEX_APPROVAL_POLICY) return process.env.VIBE_CODEX_APPROVAL_POLICY;
+  switch (workModeFor(task)) {
+    case "full_access":
+    case "ask_auto":
+    case "allow_edits":
+      return "never";
+    case "ask":
+      return "on-request";
+    default:
+      return "untrusted";
   }
 }
 
@@ -793,13 +834,14 @@ function buildCommand(provider, prompt, chatId, task) {
   }
   if (provider === "codex") {
     const sandbox = codexSandbox(task);
+    const approvalPolicy = codexApprovalPolicy(task);
     const resumeId = resumeIdFor(task);
     // `codex exec resume <thread-id>` continues a prior thread; a bare `codex exec`
     // starts fresh. Resume needs the persisted thread on disk, so we must NOT pass
     // `--ephemeral` in that case (ephemeral runs leave nothing to resume).
     const args = ["exec"];
     if (resumeId) args.push("resume", resumeId);
-    args.push("--json", "--sandbox", sandbox, "--skip-git-repo-check");
+    args.push("--json", "--sandbox", sandbox, "-c", `approval_policy="${approvalPolicy}"`, "--skip-git-repo-check");
     if (!resumeId) args.push("--ephemeral");
     if (model) args.push("--model", model);
     args.push("-c", `model_reasoning_effort="${reasoningEffortFor(provider, task)}"`);
@@ -1546,11 +1588,12 @@ function bridgeStatusPayload() {
       claude: {
         permissionMode: process.env.VIBE_CLAUDE_PERMISSION_MODE || "per-task",
         command: process.env.VIBE_CLAUDE_COMMAND || "claude",
-      },
-      codex: {
-        sandbox: process.env.VIBE_CODEX_SANDBOX || "per-task",
-        command: process.env.VIBE_CODEX_COMMAND || "codex",
-      },
+	      },
+	      codex: {
+	        sandbox: process.env.VIBE_CODEX_SANDBOX || "per-task",
+	        approvalPolicy: process.env.VIBE_CODEX_APPROVAL_POLICY || "per-task",
+	        command: process.env.VIBE_CODEX_COMMAND || "codex",
+	      },
       workModes: ["ask", "ask_auto", "read_only", "allow_edits", "full_access"],
     },
   };
@@ -1869,6 +1912,41 @@ function streamable(line) {
   );
 }
 
+// Decrypt the phone's sealed image attachments and write them under the repo's
+// .vibe/attachments/ so the agent can Read them by path. Returns [{ path, name }].
+// Files are git-excluded and cleaned up when the task finishes.
+function materializeAttachments(task, cwd) {
+  const blobs = Array.isArray(task.attachmentsEnc)
+    ? task.attachmentsEnc
+    : Array.isArray(task.agentBridgeAttachmentsEnc)
+      ? task.agentBridgeAttachmentsEnc
+      : [];
+  if (!blobs.length) return [];
+  const dir = path.join(cwd, ".vibe", "attachments");
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    ensureVibeGitExclude(cwd, ".vibe/attachments/");
+  } catch (_) {
+    return [];
+  }
+  const written = [];
+  for (const blob of blobs) {
+    const obj = decryptRuntimeBlob(blob);
+    if (!obj || typeof obj.dataB64 !== "string") continue;
+    const ext = obj.mime === "image/png" ? "png" : "jpg";
+    const filename = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}.${ext}`;
+    const absolutePath = path.join(dir, filename);
+    try {
+      fs.writeFileSync(absolutePath, Buffer.from(obj.dataB64, "base64"), { mode: 0o600 });
+      written.push({
+        path: absolutePath,
+        name: typeof obj.name === "string" && obj.name ? obj.name : filename,
+      });
+    } catch (_) {}
+  }
+  return written;
+}
+
 function runTask(channel, task) {
   const { provider, chatId, prompt, replyToId, requesterUserId } = task;
   const taskId = taskIdFor(task || {});
@@ -1900,7 +1978,17 @@ function runTask(channel, task) {
   if (bridgeCommand && runBridgeCommand(channel, task, repo, beforeGit, bridgeCommand)) {
     return;
   }
-  const promptForCli = taskPromptWithBridgeInstructions(provider, prompt, repo);
+  // Materialize any phone-sent image attachments to disk and point the agent at
+  // them. Done after the slash-command check so commands aren't affected.
+  const attachments = materializeAttachments(task, cwd);
+  let effectivePrompt = prompt;
+  if (attachments.length) {
+    const lines = attachments.map((a) => `- ${a.path}`).join("\n");
+    effectivePrompt =
+      `The user attached ${attachments.length} image file(s) to this message. ` +
+      `Use your file Read tool to view ${attachments.length === 1 ? "it" : "them"}:\n${lines}\n\n${prompt}`;
+  }
+  const promptForCli = taskPromptWithBridgeInstructions(provider, effectivePrompt, repo);
   const built = buildCommand(provider, promptForCli, chatId, task);
   if (!built) {
     channel.push("error", { provider, chatId, message: `Unknown provider: ${provider}` });
@@ -2023,6 +2111,12 @@ function runTask(channel, task) {
   child.on("close", (code) => {
     runningTasks.delete(key);
     pushBridgeStatus(channel);
+    // The agent has finished reading them — don't leave image attachments in the repo.
+    for (const attachment of attachments) {
+      try {
+        fs.unlinkSync(attachment.path);
+      } catch (_) {}
+    }
     const durationMs = Date.now() - startedAt;
     canceled = canceled || child.signalCode === "SIGTERM" || child.signalCode === "SIGKILL";
     const afterGit = gitSnapshot(cwd);
@@ -2067,6 +2161,7 @@ function runTask(channel, task) {
       workMode: workModeFor(task),
       ...teamFieldsForTask(task),
       ...runtimeResultField(agentRuntime),
+      ...liveAgentActionsField(provider, output),
     });
   });
 
@@ -2469,12 +2564,8 @@ function codexActionLine(p) {
     const files = parseApplyPatchEnvelope(input).map((f) => safeBase(f.path));
     return "✏️ Edit " + (files.length ? clip(files.join(", "), 120) : "files");
   }
-  if (name === "shell" || name === "local_shell" || name === "container.exec") {
-    let args = {};
-    try { args = JSON.parse(typeof p.arguments === "string" ? p.arguments : typeof p.input === "string" ? p.input : "{}") || {}; } catch (_) {}
-    let cmd = args.command;
-    if (Array.isArray(cmd)) cmd = cmd.join(" ");
-    cmd = String(cmd || "").replace(/\s+/g, " ").trim();
+  if (isCodexShellToolName(name)) {
+    const cmd = codexCommandFromPayload(p);
     return cmd ? "⚡ $ " + clip(cmd, 160) : "⚡ shell";
   }
   return "🔧 " + (name || "tool");
@@ -2552,14 +2643,28 @@ function codexActionDetail(p) {
       files: files.length,
     };
   }
-  if (name === "shell" || name === "local_shell" || name === "container.exec") {
-    let args = {};
-    try { args = JSON.parse(typeof p.arguments === "string" ? p.arguments : typeof p.input === "string" ? p.input : "{}") || {}; } catch (_) {}
-    let cmd = args.command;
-    if (Array.isArray(cmd)) cmd = cmd.join(" ");
+  if (isCodexShellToolName(name)) {
+    const cmd = codexCommandFromPayload(p);
     return { kind: "bash", command: String(cmd || ""), description: "" };
   }
   return { kind: "tool", name: name || "tool" };
+}
+
+function isCodexShellToolName(name) {
+  return ["shell", "local_shell", "container.exec", "exec_command"].includes(String(name || ""));
+}
+
+function codexCommandFromPayload(p) {
+  let args = {};
+  try {
+    if (typeof p.arguments === "string") args = JSON.parse(p.arguments) || {};
+    else if (typeof p.input === "string") args = JSON.parse(p.input) || {};
+    else if (p.arguments && typeof p.arguments === "object") args = p.arguments;
+    else if (p.input && typeof p.input === "object") args = p.input;
+  } catch (_) {}
+  let cmd = args.command || args.cmd;
+  if (Array.isArray(cmd)) cmd = cmd.join(" ");
+  return String(cmd || "").replace(/\s+/g, " ").trim();
 }
 
 // Codex emits the command result as a separate `function_call_output` whose
@@ -2570,15 +2675,181 @@ function codexOutputText(output) {
     try {
       const o = JSON.parse(output);
       if (o && typeof o.output === "string") return o.output;
+      if (o && typeof o.aggregated_output === "string") return o.aggregated_output;
+      if (o && (typeof o.stdout === "string" || typeof o.stderr === "string")) {
+        return [o.stdout, o.stderr].filter(Boolean).join("\n");
+      }
       if (o && typeof o.content === "string") return o.content;
     } catch (_) {}
     return output;
   }
   if (typeof output === "object") {
     if (typeof output.output === "string") return output.output;
+    if (typeof output.aggregated_output === "string") return output.aggregated_output;
+    if (typeof output.stdout === "string" || typeof output.stderr === "string") {
+      return [output.stdout, output.stderr].filter(Boolean).join("\n");
+    }
     return toolResultText(output.content);
   }
   return "";
+}
+
+function parsedJsonlEvents(output) {
+  return String(output || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .flatMap((line) => {
+      try {
+        const parsed = JSON.parse(line);
+        if (Array.isArray(parsed)) return parsed.filter((item) => item && typeof item === "object");
+        if (parsed && typeof parsed === "object") return [parsed];
+      } catch (_) {}
+      return [];
+    });
+}
+
+function eventContentBlocks(event) {
+  const content =
+    event && event.message && Array.isArray(event.message.content)
+      ? event.message.content
+      : event && Array.isArray(event.content)
+        ? event.content
+        : null;
+  return Array.isArray(content) ? content.filter((block) => block && typeof block === "object") : [];
+}
+
+function actionListFromMaps(order, detailByUid, resultByUid) {
+  const seen = new Set();
+  const actions = [];
+  for (const uid of order) {
+    if (!uid || seen.has(uid)) continue;
+    seen.add(uid);
+    const detail = detailByUid.get(uid);
+    if (!detail) continue;
+    if (OUTPUT_KINDS.has(detail.kind)) {
+      const result = resultByUid.get(uid);
+      if (result && result.output) {
+        detail.output = result.output;
+        detail.isError = !!result.isError;
+      }
+    }
+    actions.push(Object.assign({ id: String(uid) }, detail));
+  }
+  return actions.slice(-60);
+}
+
+function liveAgentActionsField(provider, output) {
+  const actions = provider === "codex" ? liveCodexActions(output) : liveClaudeActions(output);
+  if (!actions.length) return {};
+  const enc = encryptRuntimeBlob({ actions });
+  return enc ? { agentActionsEnc: enc } : {};
+}
+
+function liveClaudeActions(output) {
+  const detailByUid = new Map();
+  const resultByUid = new Map();
+  const order = [];
+  for (const event of parsedJsonlEvents(output)) {
+    for (const block of eventContentBlocks(event)) {
+      if (block.type === "tool_use") {
+        const id = block.id || `claude-tool-${order.length}`;
+        order.push(id);
+        detailByUid.set(id, claudeActionDetail(block));
+      } else if (block.type === "tool_result") {
+        const id = block.tool_use_id || block.id;
+        if (id) {
+          resultByUid.set(id, {
+            output: clip(toolResultText(block.content || block.text || block.result), MAX_ACTION_OUTPUT),
+            isError: !!block.is_error,
+          });
+        }
+      }
+    }
+  }
+  return actionListFromMaps(order, detailByUid, resultByUid);
+}
+
+function codexLiveItem(event) {
+  if (!event || typeof event !== "object") return null;
+  if (event.item && typeof event.item === "object") return event.item;
+  if (event.type === "response_item" && event.payload && typeof event.payload === "object") return event.payload;
+  if (event.payload && typeof event.payload === "object" && (event.payload.type || event.payload.item_type)) return event.payload;
+  return null;
+}
+
+function codexLiveItemType(item) {
+  return item && String(item.item_type || item.type || "").trim();
+}
+
+function codexLiveNodeId(event, item, index) {
+  return (
+    (item && (item.call_id || item.id)) ||
+    (event && event.id) ||
+    `codex-tool-${index}`
+  );
+}
+
+function codexCommandExecutionDetail(item) {
+  let cmd = item.command || item.cmd;
+  if (Array.isArray(cmd)) cmd = cmd.join(" ");
+  if (!cmd && item.input && typeof item.input === "object") cmd = item.input.command || item.input.cmd;
+  return { kind: "bash", command: String(cmd || "").replace(/\s+/g, " ").trim(), description: "" };
+}
+
+function liveCodexActions(output) {
+  const detailByUid = new Map();
+  const resultByUid = new Map();
+  const callIdToUid = new Map();
+  const order = [];
+  parsedJsonlEvents(output).forEach((event, index) => {
+    const item = codexLiveItem(event);
+    if (!item) return;
+    const type = codexLiveItemType(item);
+    if (!type || ["agent_message", "reasoning", "message"].includes(type)) return;
+
+    if (type === "function_call_output" || type === "custom_tool_call_output") {
+      const uid = item.call_id ? callIdToUid.get(item.call_id) || item.call_id : codexLiveNodeId(event, item, index);
+      if (uid) {
+        resultByUid.set(uid, {
+          output: clip(codexOutputText(item.output || item.result || item.content), MAX_ACTION_OUTPUT),
+          isError: !!item.is_error,
+        });
+      }
+      return;
+    }
+
+    const uid = codexLiveNodeId(event, item, index);
+    if (item.call_id) callIdToUid.set(item.call_id, uid);
+
+    if (type === "command_execution") {
+      detailByUid.set(uid, codexCommandExecutionDetail(item));
+      order.push(uid);
+      const outputText = codexOutputText(item.aggregated_output || item.stdout || item.stderr || item.output);
+      if (outputText) {
+        resultByUid.set(uid, {
+          output: clip(outputText, MAX_ACTION_OUTPUT),
+          isError: typeof item.exit_code === "number" && item.exit_code !== 0,
+        });
+      }
+      return;
+    }
+
+    if (type === "function_call" || type === "custom_tool_call") {
+      detailByUid.set(uid, codexActionDetail(item));
+      order.push(uid);
+      return;
+    }
+
+    if (type === "file_change") {
+      const paths = Array.isArray(item.changes)
+        ? item.changes.map((change) => change && (change.path || change.file_path)).filter(Boolean)
+        : [item.path || item.file_path].filter(Boolean);
+      detailByUid.set(uid, { kind: "edit", name: paths.map(safeBase).join(", "), path: paths[0] || "" });
+      order.push(uid);
+    }
+  });
+  return actionListFromMaps(order, detailByUid, resultByUid);
 }
 
 // Seal a structured tool detail onto its action message. Never sends plaintext:
@@ -3289,6 +3560,7 @@ function connect(server, token, userId) {
 
 async function runSelfTest() {
   const config = loadConfig();
+  ensureRuntimeKey(config);
   await resolveRepositories(config, () => {});
   DEFAULT_CWD =
     (ADVERTISED_REPOSITORIES[0] && ADVERTISED_REPOSITORIES[0].cwd) ||
@@ -3393,10 +3665,11 @@ async function main() {
         "  vibegram-bridge --code <CODE>     manual pairing code flow\n" +
         "  vibegram-bridge --logout          remove the cached token\n\n" +
         "Non-interactive repo selection: --cwd <dir>, --repo <dir> (repeatable),\n" +
-        "     --repo-root <dir> (scans 2 levels for .git). Env: VIBE_BRIDGE_REPOS,\n" +
-        "     VIBE_BRIDGE_REPO_ROOTS, VIBE_CLAUDE_PERMISSION_MODE, VIBE_CODEX_SANDBOX,\n" +
-        "     VIBE_CLAUDE_MODEL, VIBE_CODEX_MODEL, VIBE_CLAUDE_COMMAND, VIBE_CODEX_COMMAND"
-    );
+	        "     --repo-root <dir> (scans 2 levels for .git). Env: VIBE_BRIDGE_REPOS,\n" +
+	        "     VIBE_BRIDGE_REPO_ROOTS, VIBE_CLAUDE_PERMISSION_MODE, VIBE_CODEX_SANDBOX,\n" +
+	        "     VIBE_CODEX_APPROVAL_POLICY, VIBE_CLAUDE_MODEL, VIBE_CODEX_MODEL,\n" +
+	        "     VIBE_CLAUDE_COMMAND, VIBE_CODEX_COMMAND"
+	  );
     return;
   }
 
@@ -3500,13 +3773,16 @@ module.exports = {
   codexDetail,
   buildHistoryRuntime,
   collectClaudeEdits,
-  collectCodexEdits,
-  parseApplyPatchEnvelope,
-  newRuntimeAccumulator,
-  ensureRuntimeKey,
-  fileWithinLinkedRepo,
-  handleFileRequest,
-};
+	  collectCodexEdits,
+	  parseApplyPatchEnvelope,
+	  newRuntimeAccumulator,
+	  ensureRuntimeKey,
+	  liveAgentActionsField,
+	  liveClaudeActions,
+	  liveCodexActions,
+	  fileWithinLinkedRepo,
+	  handleFileRequest,
+	};
 
 // Only auto-run the daemon when invoked directly (so the module is requireable).
 if (require.main === module) {

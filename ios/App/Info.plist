@@ -28,6 +28,8 @@
 	<string>Use Face ID to unlock privacy controls and reveal protected account data.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Use the microphone for calls, story videos, and voice messages.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Transcribe your speech to text so you can dictate messages to the agent.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Save edited stories to your photo library when you choose download.</string>
 	<key>NSPhotoLibraryUsageDescription</key>

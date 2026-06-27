@@ -78,7 +78,7 @@ struct ChatProfileAppearancePalette: Identifiable, Equatable {
   let bottomHex: String
 
   static let defaultAvatarID = "warm-gold"
-  static let defaultPosterID = "poster-black"
+  static let defaultPosterID = "poster-soft-neutral"
 
   static let all: [ChatProfileAppearancePalette] = [
     ChatProfileAppearancePalette(id: "warm-gold", topHex: "#F1C766", bottomHex: "#8B411B"),
@@ -96,10 +96,13 @@ struct ChatProfileAppearancePalette: Identifiable, Equatable {
     ChatProfileAppearancePalette(id: "coral", topHex: "#F0516A", bottomHex: "#B71210"),
     ChatProfileAppearancePalette(id: "marigold", topHex: "#FFE154", bottomHex: "#F0830C"),
     ChatProfileAppearancePalette(id: "steel", topHex: "#8793A1", bottomHex: "#071026"),
+    ChatProfileAppearancePalette(id: "poster-soft-neutral", topHex: "#DCD7CF", bottomHex: "#A9876F"),
     ChatProfileAppearancePalette(id: "poster-black", topHex: "#050507", bottomHex: "#000000"),
   ]
 
-  static let defaultAvatarPalettes: [ChatProfileAppearancePalette] = all.filter { $0.id != defaultPosterID }
+  static let defaultAvatarPalettes: [ChatProfileAppearancePalette] = all.filter {
+    $0.id != defaultPosterID && $0.id != "poster-black"
+  }
 
   static func palette(id: String) -> ChatProfileAppearancePalette {
     all.first(where: { $0.id == id }) ?? all[0]
@@ -214,7 +217,7 @@ enum ChatProfileAppearanceStore {
     chatId: String?
   ) -> ChatProfileAppearanceSelection {
     var normalized = selection
-    if normalized.posterPaletteID == "warm-cocoa" {
+    if normalized.posterPaletteID == "warm-cocoa" || normalized.posterPaletteID == "poster-black" {
       normalized.posterPaletteID = ChatProfileAppearancePalette.defaultPosterID
     }
     if normalized.avatarPaletteID == ChatProfileAppearancePalette.defaultAvatarID
@@ -1140,8 +1143,7 @@ private struct ChatProfileSwiftUIRootView: View {
   @State private var stickyTitleVisible = false
 
   private var rowFill: Color {
-    let tint = usesDefaultPoster ? avatarGradientColors.0 : posterGradientColors.0
-    return Color(uiColor: tint).opacity(isDark ? 0.13 : 0.20)
+    Color(uiColor: posterGradientColors.0).opacity(isDark ? 0.055 : 0.11)
   }
 
   private var separatorColor: Color {
@@ -1188,6 +1190,7 @@ private struct ChatProfileSwiftUIRootView: View {
             ChatProfileHeroReflection(
               colors: avatarGradientColors,
               width: geometry.size.width,
+              screenHeight: geometry.size.height,
               size: heroAvatarSize,
               top: heroReflectionTop(safeTop: geometry.safeAreaInsets.top)
             )
@@ -1309,8 +1312,8 @@ private struct ChatProfileSwiftUIRootView: View {
           .overlay(
             LinearGradient(
               colors: [
-                Color.black.opacity(isDark ? 0.10 : 0.04),
-                Color.black.opacity(isDark ? 0.58 : 0.24),
+                Color.black.opacity(isDark ? 0.06 : 0.02),
+                Color.black.opacity(isDark ? 0.30 : 0.16),
               ],
               startPoint: .top,
               endPoint: .bottom
@@ -1515,12 +1518,16 @@ private struct ChatProfileSwiftUIRootView: View {
           .foregroundStyle(.primary)
           .lineLimit(1)
         HStack(spacing: 6) {
-          if bridgeConnected {
+          if bridgeConnected && !bridgeRunningTasks.isEmpty {
+            // A live task on the computer → a spinner so the profile reads as
+            // "working right now", not just a static "connected" dot.
+            ProgressView().controlSize(.mini)
+          } else if bridgeConnected {
             Circle().fill(Color.green).frame(width: 8, height: 8)
           }
           Text(bridgeComputerSubtitle)
             .font(.system(size: 13, weight: .regular))
-            .foregroundStyle(.secondary)
+            .foregroundStyle(bridgeConnected && !bridgeRunningTasks.isEmpty ? Color.green : Color.secondary)
             .lineLimit(1)
         }
       }
@@ -1715,6 +1722,9 @@ private struct ChatProfileSwiftUIRootView: View {
         provider: bridgeProvider,
         chatId: bridgeChatId,
         runningTasks: bridgeRunningTasks,
+        deviceLabel: bridgeDeviceLabel,
+        connected: bridgeConnected,
+        paired: bridgePaired,
         onOpenSession: { session in
           path.append(.bridgeSession(session))
         }
@@ -1768,12 +1778,13 @@ private struct ChatProfileAvatarGlyph: View {
 private struct ChatProfileHeroReflection: View {
   let colors: (UIColor, UIColor)
   let width: CGFloat
+  let screenHeight: CGFloat
   let size: CGFloat
   let top: CGFloat
 
   var body: some View {
     let paintWidth = max(width * 1.75, size * 4.1)
-    let reflectionHeight = max(size * 2.12, width * 0.96)
+    let reflectionHeight = max(screenHeight * 0.38, size * 2.18)
 
     VStack(spacing: 0) {
       ZStack {
@@ -1789,23 +1800,23 @@ private struct ChatProfileHeroReflection: View {
               endPoint: .bottom
             )
           )
-          .frame(width: paintWidth * 0.74, height: reflectionHeight * 0.82)
-          .blur(radius: 48)
+          .frame(width: paintWidth * 0.80, height: reflectionHeight * 0.92)
+          .blur(radius: 54)
 
         RoundedRectangle(cornerRadius: max(20, size * 0.14), style: .continuous)
-          .fill(Color(uiColor: colors.0).opacity(0.22))
-          .frame(width: paintWidth * 0.56, height: reflectionHeight * 0.44)
-          .blur(radius: 34)
-          .offset(y: -size * 0.04)
+          .fill(Color(uiColor: colors.0).opacity(0.18))
+          .frame(width: paintWidth * 0.64, height: reflectionHeight * 0.50)
+          .blur(radius: 40)
+          .offset(y: -size * 0.02)
       }
       .frame(width: width, height: reflectionHeight)
       .mask(
         LinearGradient(
           stops: [
             .init(color: .clear, location: 0.0),
-            .init(color: .black.opacity(0.50), location: 0.08),
-            .init(color: .black, location: 0.36),
-            .init(color: .black.opacity(0.72), location: 0.66),
+            .init(color: .black.opacity(0.42), location: 0.06),
+            .init(color: .black, location: 0.28),
+            .init(color: .black.opacity(0.80), location: 0.74),
             .init(color: .clear, location: 1.0),
           ],
           startPoint: .top,
@@ -1813,7 +1824,7 @@ private struct ChatProfileHeroReflection: View {
         )
       )
       .frame(maxWidth: .infinity)
-      .padding(.top, max(0, top - reflectionHeight * 0.08))
+      .padding(.top, max(0, top - reflectionHeight * 0.06))
 
       Spacer(minLength: 0)
     }
@@ -2585,11 +2596,11 @@ private struct ChatProfileSwiftUISection<Content: View>: View {
   @ViewBuilder let content: Content
 
   private var materialStyle: UIBlurEffect.Style {
-    colorScheme == .dark ? .systemThinMaterialDark : .systemThinMaterialLight
+    colorScheme == .dark ? .systemUltraThinMaterialDark : .systemUltraThinMaterialLight
   }
 
   private var glassLift: Color {
-    colorScheme == .dark ? Color.white.opacity(0.055) : Color.white.opacity(0.16)
+    colorScheme == .dark ? Color.white.opacity(0.030) : Color.white.opacity(0.12)
   }
 
   var body: some View {
@@ -2604,7 +2615,7 @@ private struct ChatProfileSwiftUISection<Content: View>: View {
       shape.fill(glassLift)
     }
     .clipShape(shape)
-    .overlay(shape.stroke(Color.white.opacity(colorScheme == .dark ? 0.12 : 0.18), lineWidth: 1))
+    .overlay(shape.stroke(Color.white.opacity(colorScheme == .dark ? 0.10 : 0.20), lineWidth: 1))
   }
 }
 
@@ -2686,7 +2697,7 @@ private struct ChatProfileSwiftUIActionButton: View {
   let action: () -> Void
 
   private var materialStyle: UIBlurEffect.Style {
-    colorScheme == .dark ? .systemThinMaterialDark : .systemThinMaterialLight
+    colorScheme == .dark ? .systemUltraThinMaterialDark : .systemUltraThinMaterialLight
   }
 
   var body: some View {
@@ -2698,10 +2709,10 @@ private struct ChatProfileSwiftUIActionButton: View {
           .background {
             ChatProfileSwiftUIMaterialBackground(style: materialStyle)
               .clipShape(Circle())
-            Circle().fill(fill)
-            Circle().fill(Color.white.opacity(colorScheme == .dark ? 0.055 : 0.15))
+            Circle().fill(Color.white.opacity(colorScheme == .dark ? 0.045 : 0.18))
           }
-          .overlay(Circle().stroke(Color.white.opacity(colorScheme == .dark ? 0.12 : 0.20), lineWidth: 1))
+          .overlay(Circle().stroke(Color.white.opacity(colorScheme == .dark ? 0.16 : 0.28), lineWidth: 1))
+          .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.18 : 0.08), radius: 10, x: 0, y: 5)
 
         Text(title)
           .font(.system(size: 12, weight: .semibold))
@@ -3596,14 +3607,24 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       guard let status, !Task.isCancelled else { return }
       await MainActor.run { [weak self] in
         guard let self else { return }
-        self.bridgeConnected = status.connected
-        self.bridgePaired = status.paired
-        self.bridgeDeviceLabel = status.devices.first?.label ?? ""
-        self.bridgeRunningTasks = status.runningTasks.filter { task in
+        let nextDeviceLabel = status.devices.first?.label ?? ""
+        let nextRunningTasks = status.runningTasks.filter { task in
           let taskProvider = task.provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
           return taskProvider.isEmpty || taskProvider == self.bridgeProvider
         }
-        self.renderSwiftUIProfile()
+        let changed =
+          self.bridgeConnected != status.connected
+          || self.bridgePaired != status.paired
+          || self.bridgeDeviceLabel != nextDeviceLabel
+          || self.bridgeRunningTasks != nextRunningTasks
+
+        self.bridgeConnected = status.connected
+        self.bridgePaired = status.paired
+        self.bridgeDeviceLabel = nextDeviceLabel
+        self.bridgeRunningTasks = nextRunningTasks
+        if changed {
+          self.renderSwiftUIProfile()
+        }
         self.scheduleBridgeStatusRefresh()
       }
     }

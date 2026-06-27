@@ -36,16 +36,25 @@ token. `--cwd <path>` overrides the working directory.
 Defaults to **read-only** execution:
 
 - `claude --permission-mode plan`
-- `codex --sandbox read-only`
+- `codex --sandbox read-only -c approval_policy="untrusted"`
 
 Escalate explicitly with env vars (only on machines you control):
 
 | Env | Default | Notes |
 |---|---|---|
-| `VIBE_CLAUDE_PERMISSION_MODE` | `plan` | `acceptEdits` / `bypassPermissions` allow writes/exec |
+| `VIBE_CLAUDE_PERMISSION_MODE` | per task | `plan`, `auto`, `acceptEdits`, `dontAsk`, or `bypassPermissions` |
 | `VIBE_CODEX_SANDBOX` | `read-only` | `workspace-write` / `danger-full-access` |
+| `VIBE_CODEX_APPROVAL_POLICY` | per task | `untrusted`, `on-request`, or `never` |
 | `VIBE_CLAUDE_MODEL`, `VIBE_CODEX_MODEL` | — | model override |
 | `VIBE_CLAUDE_COMMAND`, `VIBE_CODEX_COMMAND` | `claude` / `codex` | binary path override |
+
+Mobile work modes map to CLI safety settings:
+
+- `read_only`: Claude `plan`; Codex `read-only` + `untrusted`.
+- `ask`: Claude `plan`; Codex `read-only` + `on-request`.
+- `ask_auto`: Claude `auto`; Codex `workspace-write` + `never`.
+- `allow_edits`: Claude `acceptEdits`; Codex `workspace-write` + `never`.
+- `full_access`: Claude `bypassPermissions`; Codex `danger-full-access` + `never`.
 
 ## Dev
 

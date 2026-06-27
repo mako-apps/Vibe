@@ -10,6 +10,11 @@ defmodule VibeWeb.ChatChannel do
   alias Vibe.AI.StandaloneAgent
   require Logger
 
+  # Sealed agent image blobs (arte1). They ride the inbound message only to reach the
+  # bridge dispatch; they are stripped from the broadcast + persisted row so devices
+  # never ingest a 270KB+ metadata blob. The bridge reads them off the untouched data.
+  @inline_attachment_keys ~w(agentBridgeAttachmentsEnc agent_bridge_attachments_enc attachmentsEnc)
+
   @impl true
   def join("chat:" <> chat_id, _payload, socket) do
     user_id = socket.assigns.user_id
@@ -63,7 +68,11 @@ defmodule VibeWeb.ChatChannel do
          socket}
       else
         data = deobfuscate(payload)
-        broadcast_payload = enforce_sender_identity(data, user_id)
+        # The sealed image blobs ride `data` only to reach the bridge dispatch below
+        # (which reads the untouched `data`). They must NOT ride the chat broadcast or
+        # the persisted row — a 270KB+ metadata blob echoed to every device is slow to
+        # parse and bloats storage. Strip them from everything except the dispatch.
+        broadcast_payload = strip_inline_agent_attachments(enforce_sender_identity(data, user_id))
         message_metadata = message_metadata_for_persistence(data, standalone_agent)
 
         message_attrs = %{
@@ -929,6 +938,13 @@ defmodule VibeWeb.ChatChannel do
       metadata["agentBridgeResumeSessionId"] || metadata["agent_bridge_resume_session_id"] ||
         data["agentBridgeResumeSessionId"]
     )
+    # Sealed (arte1) image attachments to hand to the daemon, which decrypts and
+    # writes them for the agent to read. Opaque to the server — relayed verbatim.
+    |> put_optional_string_list(
+      "attachmentsEnc",
+      metadata["agentBridgeAttachmentsEnc"] || metadata["agent_bridge_attachments_enc"] ||
+        data["agentBridgeAttachmentsEnc"]
+    )
   end
 
   defp normalize_control_action(value) do
@@ -967,6 +983,15 @@ defmodule VibeWeb.ChatChannel do
 
   defp put_optional_string(map, _key, _value), do: map
 
+  defp put_optional_string_list(map, key, value) when is_list(value) do
+    case Enum.filter(value, &(is_binary(&1) and &1 != "")) do
+      [] -> map
+      strings -> Map.put(map, key, strings)
+    end
+  end
+
+  defp put_optional_string_list(map, _key, _value), do: map
+
   # In a 1:1 chat with a Claude/Codex shadow user, route plain messages (no
   # @mention needed) to that bridge worker — the whole DM is "talk to Claude".
   defp local_worker_for_dm(chat_id, user_id) do
@@ -985,7 +1010,7 @@ defmodule VibeWeb.ChatChannel do
   defp message_metadata_for_persistence(data, standalone_agent) do
     base_metadata =
       case data["metadata"] do
-        value when is_map(value) -> value
+        value when is_map(value) -> Map.drop(value, @inline_attachment_keys)
         _ -> %{}
       end
 
@@ -1005,6 +1030,22 @@ defmodule VibeWeb.ChatChannel do
       base_metadata
     end
   end
+
+  # Remove the sealed image blobs from a broadcast/persist payload (top-level and
+  # nested metadata). Leaves everything else untouched.
+  defp strip_inline_agent_attachments(%{} = payload) do
+    payload
+    |> Map.drop(@inline_attachment_keys)
+    |> case do
+      %{"metadata" => %{} = meta} = stripped ->
+        Map.put(stripped, "metadata", Map.drop(meta, @inline_attachment_keys))
+
+      stripped ->
+        stripped
+    end
+  end
+
+  defp strip_inline_agent_attachments(payload), do: payload
 
   defp broadcast_agent_activity(chat_id, agent_user_id, label, status, tool \\ nil) do
     VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "typing", %{

@@ -5393,13 +5393,18 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           from: self.agentConversationRows(forMessageId: messageId, sourceMessageId: sourceMessageId)
         )
       },
-      onSend: { [weak self] text, _ in
+      onSend: { [weak self] text, _, _ in
+        // The live @mention path doesn't carry image attachments yet; ignore the
+        // staged blobs here (they're wired through the bridge-runtime surface).
         self?.handleNativeSend(text: text, mentionedAgentUsername: mentionedAgentUsername)
       }
     )
     if let provider = agentRow.agentRuntime?.provider ?? mentionedAgentUsername ?? currentBridgeProvider {
       vc.agentBridgeProvider = provider
     }
+    // Hide any host tab bar while pushed so the composer reaches the true bottom
+    // edge (no tab-bar strip/edge under the input).
+    vc.hidesBottomBarWhenPushed = true
 
     guard let owner = topPresentingViewController() else { return }
     if let nav = owner.navigationController {

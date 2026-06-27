@@ -60,6 +60,27 @@ enum AgentRuntimeCrypto {
     return nil
   }
 
+  /// Encrypt a JSON object into an `arte1.<iv>.<ct>.<tag>` blob with the shared
+  /// pairing key — the same envelope the bridge produces, so the daemon can decrypt
+  /// it. Used to seal phone→computer payloads (e.g. image attachments) so the server
+  /// only ever relays an opaque blob. Returns nil when there's no key.
+  static func encrypt(_ object: [String: Any]) -> String? {
+    guard let key = keyData(),
+      let plaintext = try? JSONSerialization.data(withJSONObject: object)
+    else { return nil }
+    do {
+      let sealed = try AES.GCM.seal(plaintext, using: SymmetricKey(data: key))
+      return [
+        blobPrefix,
+        base64urlEncode(Data(sealed.nonce)),
+        base64urlEncode(sealed.ciphertext),
+        base64urlEncode(sealed.tag),
+      ].joined(separator: ".")
+    } catch {
+      return nil
+    }
+  }
+
   /// Decrypt an `arte1.<iv>.<ct>.<tag>` blob into the runtime dictionary. Returns
   /// nil when there's no key, the envelope is malformed, or authentication fails.
   static func decrypt(_ blob: Any?) -> [String: Any]? {
@@ -79,6 +100,13 @@ enum AgentRuntimeCrypto {
     } catch {
       return nil
     }
+  }
+
+  private static func base64urlEncode(_ data: Data) -> String {
+    data.base64EncodedString()
+      .replacingOccurrences(of: "+", with: "-")
+      .replacingOccurrences(of: "/", with: "_")
+      .replacingOccurrences(of: "=", with: "")
   }
 
   private static func base64urlDecode(_ value: String) -> Data? {
@@ -494,6 +522,13 @@ enum AgentPairingError: LocalizedError {
 /// REST client for the agent-bridge pairing endpoints. Mirrors the HTTP shape used
 /// by `ChatHomeService` / `ContactSearchService` (Bearer auth, ngrok skip header).
 enum AgentPairingService {
+  /// Last successfully fetched bridge status, warmed by EVERY `status()` caller
+  /// (connect panel, profile card, history view). Callers read it to decide
+  /// synchronously whether a computer is already online — so the connect gate never
+  /// flashes its panel on a chat that's actually connected. There is one computer per
+  /// account, so a single global snapshot is correct.
+  @MainActor private(set) static var lastStatus: AgentBridgeStatus?
+
   /// GET /api/agent-bridge/status
   static func status(config: AppSessionConfig) async throws -> AgentBridgeStatus {
     let request = try buildRequest(config: config, path: "/agent-bridge/status", method: "GET")
@@ -501,13 +536,15 @@ enum AgentPairingService {
     let repositories = repositoryList(object["repositories"])
     let devices = deviceList(object["devices"])
     let runningTasks = runningTaskList(object["runningTasks"] ?? object["running_tasks"])
-    return AgentBridgeStatus(
+    let result = AgentBridgeStatus(
       connected: boolValue(object["connected"]),
       paired: boolValue(object["paired"]),
       repositories: repositories.isEmpty ? devices.flatMap(\.repositories) : repositories,
       devices: devices,
       runningTasks: runningTasks.isEmpty ? devices.flatMap(\.runningTasks) : runningTasks
     )
+    await MainActor.run { lastStatus = result }
+    return result
   }
 
   /// POST /api/agent-bridge/pairing

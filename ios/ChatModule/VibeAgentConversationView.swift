@@ -20,6 +20,9 @@
 //  `VibeAgentKitMap` below, so we don't drag Resolo's backend into Vibe core.
 //
 
+import AVFoundation
+import Speech
+import PhotosUI
 import UIKit
 
 // MARK: - Mapping: Vibe data -> VibeAgentKit render models
@@ -168,7 +171,9 @@ enum VibeAgentKitMap {
 
 // MARK: - Full-page agent conversation surface
 
-final class VibeAgentConversationViewController: UIViewController, UITableViewDataSource, UITableViewDelegate {
+final class VibeAgentConversationViewController: UIViewController, UITableViewDataSource,
+  UITableViewDelegate, PHPickerViewControllerDelegate
+{
 
   private let tableView = UITableView(frame: .zero, style: .plain)
   private let progressSheet = VibeAgentKitAgentProgressSheetView()
@@ -184,12 +189,29 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   private let inputPlaceholder: String
   private let regeneratePrompt: String
   private let messagesProvider: (() -> [VibeAgentKitChatMessage])?
-  private let onSend: ((String, AgentBridgeRunOptions) -> Void)?
+  private let onSend: ((String, AgentBridgeRunOptions, [String]) -> Void)?
   private var tableBottomConstraint: NSLayoutConstraint?
   private var composerBottomConstraint: NSLayoutConstraint?
   private var composerHeightConstraint: NSLayoutConstraint?
   private var changeObserver: NSObjectProtocol?
   private var keyboardObservers: [NSObjectProtocol] = []
+
+  /// A single centered spinner shown while a session's transcript is loading, instead
+  /// of a fake "Loading conversation…" message bubble. Cleared as soon as rows render.
+  private let loadingSpinner = VibeAgentArcSpinner()
+  private var loadingTimeout: DispatchWorkItem?
+  var isLoadingTranscript = false {
+    didSet {
+      loadingTimeout?.cancel()
+      if isLoadingTranscript {
+        // Never spin forever — fall back to the (blank) empty state if nothing lands.
+        let work = DispatchWorkItem { [weak self] in self?.isLoadingTranscript = false }
+        loadingTimeout = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15, execute: work)
+      }
+      updateLoadingOverlay()
+    }
+  }
 
   /// Tapping a message's progress row opens the full tool sheet for that message.
   /// Stashed so we know which message's items to present.
@@ -198,6 +220,17 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   /// Message ids whose "Worked · N steps" line is currently expanded inline.
   /// Persists across reloads so a live update doesn't collapse what the user opened.
   private var expandedProgressMessageIds: Set<String> = []
+
+  /// Start a fresh conversation with the agent (clears the on-screen transcript and
+  /// begins a new, non-resumed task). When nil the trailing "new chat" button is
+  /// hidden — set by hosts where a new chat is meaningful (the bridge runtime view).
+  var onNewChat: (() -> Void)?
+
+  /// Host hook invoked when the user picks "Edit" on a message — after the VC has
+  /// reverted the turn's file changes and before it refills the composer. Hosts use
+  /// it to reset into a fresh task so the revised prompt re-runs cleanly (rather than
+  /// resuming the old turn). The Edit action itself is gated on `agentBridgeChatId`.
+  var onEditMessage: ((VibeAgentKitChatMessage) -> Void)?
 
   /// Chat + provider context (history surface) so a runtime card can route a
   /// full-file-open request to the user's bridge. Nil in the live agent view.
@@ -213,7 +246,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     regeneratePrompt: String = "",
     inputPlaceholder: String? = nil,
     messagesProvider: (() -> [VibeAgentKitChatMessage])? = nil,
-    onSend: ((String, AgentBridgeRunOptions) -> Void)? = nil
+    onSend: ((String, AgentBridgeRunOptions, [String]) -> Void)? = nil
   ) {
     self.messages = messages
     self.runtimeTitle = title
@@ -244,12 +277,52 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     }
   }
 
+  /// Trailing "new chat" (compose) action — shown only when a host wires `onNewChat`.
+  /// The leading back/close button is the other half of the "two button" header.
+  private func configureNewChatButton() {
+    guard onNewChat != nil else { return }
+    let item = UIBarButtonItem(
+      image: UIImage(systemName: "square.and.pencil"),
+      style: .plain,
+      target: self,
+      action: #selector(newChatTapped)
+    )
+    item.accessibilityLabel = "New chat"
+    navigationItem.rightBarButtonItem = item
+  }
+
+  @objc private func newChatTapped() {
+    // Warn before abandoning a turn that's still generating; otherwise start fresh.
+    let isLive = messages.contains { $0.isStreaming || $0.runtime?.status == "running" }
+    guard isLive else { startNewChat(); return }
+    let alert = UIAlertController(
+      title: "Start a new chat?",
+      message: "A response is still generating. It'll keep running on your computer, but this view will switch to a fresh conversation.",
+      preferredStyle: .alert
+    )
+    alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+    alert.addAction(UIAlertAction(title: "New Chat", style: .destructive) { [weak self] _ in
+      self?.startNewChat()
+    })
+    present(alert, animated: true)
+  }
+
+  private func startNewChat() {
+    expandedProgressMessageIds.removeAll()
+    progressItemsByMessageId.removeAll()
+    onNewChat?()
+  }
+
   override func viewDidLoad() {
     super.viewDidLoad()
-    edgesForExtendedLayout = []
+    // Let the feed extend under the (now translucent) nav bar and the bottom edge so
+    // content flows edge-to-edge and the bars read as seamless blur — no opaque block.
+    edgesForExtendedLayout = .all
+    extendedLayoutIncludesOpaqueBars = true
     appearance = VibeAgentKitMap.appearance(for: traitCollection)
     view.backgroundColor = appearance.background
     configureNavigationTitle()
+    configureNewChatButton()
 
     tableView.translatesAutoresizingMaskIntoConstraints = false
     tableView.backgroundColor = appearance.background
@@ -259,6 +332,8 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     tableView.rowHeight = UITableView.automaticDimension
     tableView.estimatedRowHeight = 96.0
     tableView.keyboardDismissMode = .interactive
+    // Bottom is driven by `updateScrollInsets()` (tracks the composer + keyboard); top
+    // keeps a little breathing room under the translucent nav bar.
     tableView.contentInset = UIEdgeInsets(top: 12, left: 0, bottom: 12, right: 0)
     tableView.register(VibeAgentKitMessageCell.self, forCellReuseIdentifier: VibeAgentKitMessageCell.reuseIdentifier)
     view.addSubview(tableView)
@@ -268,7 +343,11 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     composerView.placeholder = inputPlaceholder
     composerView.provider = agentBridgeProvider ?? "codex"
     composerView.onSend = { [weak self] text, options in
-      self?.onSend?(text, options)
+      guard let self else { return }
+      self.onSend?(text, options, self.composerView.consumePendingAttachments())
+    }
+    composerView.onAttach = { [weak self] in
+      self?.presentImageAttachmentPicker()
     }
     composerView.onHeightChanged = { [weak self] height in
       self?.updateComposerHeight(height, animated: true)
@@ -280,26 +359,40 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     progressSheet.isHidden = true
     view.addSubview(progressSheet)
 
-    let tableBottomConstraint = tableView.bottomAnchor.constraint(equalTo: composerView.topAnchor, constant: -8)
-    let composerBottomConstraint = composerView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -8)
+    loadingSpinner.translatesAutoresizingMaskIntoConstraints = false
+    loadingSpinner.color = appearance.textSecondary
+    loadingSpinner.isHidden = true
+    view.addSubview(loadingSpinner)
+
+    // Pin the feed to the TRUE bottom so messages scroll UNDER the floating composer
+    // (Resolo-style, no hard footer line). `updateScrollInsets()` keeps a bottom
+    // content inset equal to the composer's covered height so the last bubble clears
+    // the pill, and grows it with the keyboard.
+    let tableBottomConstraint = tableView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+    // Pin the composer to the true bottom of the screen (NOT the safe-area guide):
+    // the composer owns its own bottom inset so the pill floats above the home
+    // indicator with no visible strip/edge below it.
+    let composerBottomConstraint = composerView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
     let composerHeightConstraint = composerView.heightAnchor.constraint(equalToConstant: composerView.preferredHeight)
     self.tableBottomConstraint = tableBottomConstraint
     self.composerBottomConstraint = composerBottomConstraint
     self.composerHeightConstraint = composerHeightConstraint
 
     NSLayoutConstraint.activate([
-      tableView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+      tableView.topAnchor.constraint(equalTo: view.topAnchor),
       tableView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       tableView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
       tableBottomConstraint,
-      composerView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14),
-      composerView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -14),
+      composerView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      composerView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
       composerBottomConstraint,
       composerHeightConstraint,
       progressSheet.topAnchor.constraint(equalTo: view.topAnchor),
       progressSheet.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       progressSheet.trailingAnchor.constraint(equalTo: view.trailingAnchor),
       progressSheet.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+      loadingSpinner.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+      loadingSpinner.centerYAnchor.constraint(equalTo: view.centerYAnchor),
     ])
 
     indexProgress()
@@ -316,6 +409,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       tableView.backgroundColor = appearance.background
       progressSheet.applyAppearance(appearance)
       composerView.applyAppearance(appearance)
+      loadingSpinner.color = appearance.textSecondary
       applyNavigationAppearance()
       tableView.reloadData()
     }
@@ -328,11 +422,32 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   func setMessages(_ newMessages: [VibeAgentKitChatMessage]) {
     guard newMessages != messages else { return }
     let wasNearBottom = isNearBottom()
+    let oldIds = messages.map(\.id)
     messages = newMessages
+    // Real rows arrived → drop the centered loading spinner.
+    if !newMessages.isEmpty { isLoadingTranscript = false }
     indexProgress()
     updateNavigationLiveState()
-    tableView.reloadData()
-    if wasNearBottom { scrollToBottom(animated: true) }
+    updateLoadingOverlay()
+
+    // A pure append (new turns pushed onto the end — the typical "send") animates the
+    // new rows in and scrolls up, matching Resolo's push-in feel. Anything else
+    // (streaming edits to existing rows, replacements, reorders) falls back to a plain
+    // reload so the streaming label and bubble geometry stay correct.
+    let newIds = newMessages.map(\.id)
+    let isPureAppend =
+      newIds.count > oldIds.count && Array(newIds.prefix(oldIds.count)) == oldIds
+    if isPureAppend, tableView.window != nil, tableView.numberOfRows(inSection: 0) == oldIds.count {
+      let inserted = (oldIds.count..<newIds.count).map { IndexPath(row: $0, section: 0) }
+      tableView.performBatchUpdates {
+        tableView.insertRows(at: inserted, with: .fade)
+      } completion: { [weak self] _ in
+        if wasNearBottom { self?.scrollToBottom(animated: true) }
+      }
+    } else {
+      tableView.reloadData()
+      if wasNearBottom { scrollToBottom(animated: true) }
+    }
   }
 
   private func observeLiveMessages() {
@@ -378,7 +493,12 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     stack.axis = .vertical
     stack.alignment = .leading
     stack.spacing = 1
-    stack.frame = CGRect(x: 0, y: 0, width: 220, height: 38)
+    // Auto Layout sizing (no fixed 220pt frame): the nav bar hands the title view the
+    // real width available between the back button and the trailing actions, so the
+    // title fills it and truncates cleanly instead of being clipped on the right.
+    stack.translatesAutoresizingMaskIntoConstraints = false
+    titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    subtitleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
     NSLayoutConstraint.activate([
       liveDotView.widthAnchor.constraint(equalToConstant: 7),
       liveDotView.heightAnchor.constraint(equalToConstant: 7),
@@ -393,15 +513,21 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     subtitleLabel.textColor = appearance.textSecondary
     liveDotView.backgroundColor = UIColor.systemGreen
     liveLabel.textColor = UIColor.systemGreen
-    let navAppearance = UINavigationBarAppearance()
-    navAppearance.configureWithOpaqueBackground()
-    navAppearance.backgroundColor = appearance.background
-    navAppearance.shadowColor = .clear
-    navAppearance.titleTextAttributes = [.foregroundColor: appearance.text]
-    navigationController?.navigationBar.standardAppearance = navAppearance
-    navigationController?.navigationBar.scrollEdgeAppearance = navAppearance
-    navigationController?.navigationBar.compactAppearance = navAppearance
-    navigationController?.navigationBar.isTranslucent = false
+
+    // Fully seamless header — no bar background or hairline in ANY state, so the
+    // message feed flows under the nav bar edge-to-edge (the buttons/title float over
+    // the content, Resolo-style) and there is never a solid block behind the buttons.
+    let transparent = UINavigationBarAppearance()
+    transparent.configureWithTransparentBackground()
+    transparent.backgroundColor = .clear
+    transparent.shadowColor = .clear
+    transparent.titleTextAttributes = [.foregroundColor: appearance.text]
+
+    navigationController?.navigationBar.standardAppearance = transparent
+    navigationController?.navigationBar.scrollEdgeAppearance = transparent
+    navigationController?.navigationBar.compactAppearance = transparent
+    navigationController?.navigationBar.isTranslucent = true
+    navigationController?.navigationBar.tintColor = appearance.text
   }
 
   private func updateNavigationLiveState() {
@@ -421,6 +547,54 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     } else {
       changes()
     }
+  }
+
+  // MARK: Image attachments
+
+  private func presentImageAttachmentPicker() {
+    var config = PHPickerConfiguration()
+    config.filter = .images
+    config.selectionLimit = 4
+    let picker = PHPickerViewController(configuration: config)
+    picker.delegate = self
+    present(picker, animated: true)
+  }
+
+  func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+    picker.dismiss(animated: true)
+    for result in results {
+      let provider = result.itemProvider
+      guard provider.canLoadObject(ofClass: UIImage.self) else { continue }
+      provider.loadObject(ofClass: UIImage.self) { [weak self] object, _ in
+        guard let self, let image = object as? UIImage,
+          let blob = Self.sealedImageBlob(from: image)
+        else { return }
+        DispatchQueue.main.async { self.composerView.addAttachment(blob: blob) }
+      }
+    }
+  }
+
+  /// Downscale + JPEG-encode so the encrypted blob is small enough to ride inside a
+  /// chat message, then seal it with the pairing key so the server only relays an
+  /// opaque payload. The daemon decrypts it and writes the file for the agent to read.
+  private static func sealedImageBlob(from image: UIImage) -> String? {
+    let scaled = scaledImage(image, maxDimension: 1024)
+    guard let data = scaled.jpegData(compressionQuality: 0.55) else { return nil }
+    let object: [String: Any] = [
+      "name": "image-\(Int(Date().timeIntervalSince1970 * 1000)).jpg",
+      "mime": "image/jpeg",
+      "dataB64": data.base64EncodedString(),
+    ]
+    return AgentRuntimeCrypto.encrypt(object)
+  }
+
+  private static func scaledImage(_ image: UIImage, maxDimension: CGFloat) -> UIImage {
+    let longest = max(image.size.width, image.size.height)
+    guard longest > maxDimension, longest > 0 else { return image }
+    let scale = maxDimension / longest
+    let newSize = CGSize(width: image.size.width * scale, height: image.size.height * scale)
+    let renderer = UIGraphicsImageRenderer(size: newSize)
+    return renderer.image { _ in image.draw(in: CGRect(origin: .zero, size: newSize)) }
   }
 
   private func observeKeyboard() {
@@ -448,7 +622,10 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     else { return }
     let endFrameInView = view.convert(endFrame, from: window.screen.coordinateSpace)
     let overlap = max(0, view.bounds.maxY - endFrameInView.minY)
-    composerBottomConstraint?.constant = overlap > 0 ? -(overlap - view.safeAreaInsets.bottom + 8) : -8
+    // The composer is pinned to view.bottomAnchor; lift it by exactly the keyboard
+    // overlap. When the keyboard hides (overlap 0) it returns to the bottom, where
+    // it re-applies its own home-indicator inset internally.
+    composerBottomConstraint?.constant = -overlap
     let duration = (note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?.doubleValue ?? 0.25
     UIView.animate(withDuration: duration, delay: 0, options: [.curveEaseOut, .beginFromCurrentState]) {
       self.view.layoutIfNeeded()
@@ -487,6 +664,103 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       isProgressExpanded: expandedProgressMessageIds.contains(message.id)
     )
     return cell
+  }
+
+  // MARK: Hold menu (Copy / Edit)
+
+  // The system context menu provides the "mold" lift/blur (matching Resolo's
+  // `.contextMenu`); a rounded targeted preview makes just the bubble lift, not the
+  // whole row. Copy is always offered for text; Edit only for user messages in a
+  // bridge-backed conversation (where a revert + fresh re-run is possible).
+  func tableView(
+    _ tableView: UITableView,
+    contextMenuConfigurationForRowAt indexPath: IndexPath,
+    point: CGPoint
+  ) -> UIContextMenuConfiguration? {
+    guard indexPath.row < messages.count else { return nil }
+    let message = messages[indexPath.row]
+    let cellText = (tableView.cellForRow(at: indexPath) as? VibeAgentKitMessageCell)?.currentMessageText
+    let text = (cellText?.isEmpty == false) ? cellText! : message.text
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    let isUser = message.role.isUser
+    let canEdit = isUser && agentBridgeChatId != nil && !trimmed.isEmpty
+    guard !trimmed.isEmpty || canEdit else { return nil }
+
+    return UIContextMenuConfiguration(identifier: indexPath as NSIndexPath, previewProvider: nil) {
+      [weak self] _ in
+      guard let self else { return nil }
+      var actions: [UIMenuElement] = []
+      if !trimmed.isEmpty {
+        actions.append(UIAction(title: "Copy", image: UIImage(systemName: "doc.on.doc")) { _ in
+          UIPasteboard.general.string = text
+        })
+      }
+      if canEdit {
+        actions.append(UIAction(title: "Edit", image: UIImage(systemName: "pencil")) { _ in
+          // Defer so the menu finishes dismissing before we mutate the table / focus
+          // the composer.
+          DispatchQueue.main.async { self.beginEdit(message) }
+        })
+      }
+      return actions.isEmpty ? nil : UIMenu(children: actions)
+    }
+  }
+
+  /// "Edit" a user message: revert any file changes the turn it produced made (the
+  /// bridge's file-aware revert), have the host reset to a fresh task, then refill the
+  /// composer so the revised prompt re-runs cleanly from the reverted state.
+  private func beginEdit(_ message: VibeAgentKitChatMessage) {
+    revertTurn(after: message)
+    onEditMessage?(message)
+    composerView.beginEditing(with: message.text)
+  }
+
+  /// Find the agent turn this user message produced (the next assistant message with
+  /// a revertible runtime) and ask the bridge to restore the files it changed. No-op
+  /// when the turn changed nothing revertible (e.g. the repo was dirty beforehand).
+  private func revertTurn(after message: VibeAgentKitChatMessage) {
+    guard
+      let chatId = agentBridgeChatId,
+      let idx = messages.firstIndex(where: { $0.id == message.id })
+    else { return }
+    let turn = messages[messages.index(after: idx)...].first {
+      !$0.role.isUser && $0.runtime != nil
+    }
+    guard
+      let runtime = turn?.runtime,
+      runtime.controls?.canRevert == true,
+      let taskId = runtime.taskId, !taskId.isEmpty
+    else { return }
+    let provider = runtime.provider ?? agentBridgeProvider ?? "codex"
+    _ = ChatEngine.shared.sendAgentBridgeControl([
+      "chatId": chatId,
+      "provider": provider,
+      "action": "revert",
+      "taskId": taskId,
+    ])
+  }
+
+  func tableView(
+    _ tableView: UITableView,
+    previewForHighlightingContextMenuWithConfiguration configuration: UIContextMenuConfiguration
+  ) -> UITargetedPreview? {
+    bubblePreview(for: configuration)
+  }
+
+  func tableView(
+    _ tableView: UITableView,
+    previewForDismissingContextMenuWithConfiguration configuration: UIContextMenuConfiguration
+  ) -> UITargetedPreview? {
+    bubblePreview(for: configuration)
+  }
+
+  private func bubblePreview(for configuration: UIContextMenuConfiguration) -> UITargetedPreview? {
+    guard
+      let indexPath = configuration.identifier as? NSIndexPath,
+      let cell = tableView.cellForRow(at: IndexPath(row: indexPath.row, section: indexPath.section))
+        as? VibeAgentKitMessageCell
+    else { return nil }
+    return cell.bubblePreview()
   }
 
   // MARK: Progress (inline expand)
@@ -539,7 +813,33 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     }
   }
 
+  private func updateLoadingOverlay() {
+    let show = isLoadingTranscript && messages.isEmpty
+    loadingSpinner.isHidden = !show
+    if show { loadingSpinner.startAnimating() } else { loadingSpinner.stopAnimating() }
+  }
+
   // MARK: Scroll helpers
+
+  override func viewDidLayoutSubviews() {
+    super.viewDidLayoutSubviews()
+    updateScrollInsets()
+  }
+
+  /// Keep the feed's bottom inset matched to however much of the screen the floating
+  /// composer (and, when raised, the keyboard) currently covers, so the last bubble
+  /// always clears the pill even though the table extends edge-to-edge beneath it.
+  private func updateScrollInsets() {
+    let covered = max(0, view.bounds.maxY - composerView.frame.minY)
+    // The table reaches the screen bottom, so its automatic safe-area inset already
+    // covers the home indicator; only add the part above it, plus a small gap.
+    let bottom = max(12, covered - view.safeAreaInsets.bottom + 8)
+    guard abs(tableView.contentInset.bottom - bottom) > 0.5 else { return }
+    let wasNearBottom = isNearBottom()
+    tableView.contentInset.bottom = bottom
+    tableView.verticalScrollIndicatorInsets.bottom = bottom
+    if wasNearBottom { scrollToBottom(animated: false) }
+  }
 
   private func isNearBottom() -> Bool {
     let offsetY = tableView.contentOffset.y
@@ -555,30 +855,134 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   }
 }
 
+/// A small custom progress indicator — a single rotating arc — used as the centered
+/// loader while a transcript loads (rather than the system activity indicator or a
+/// fake "Loading…" message bubble).
+private final class VibeAgentArcSpinner: UIView {
+  private let arcLayer = CAShapeLayer()
+
+  var color: UIColor = .secondaryLabel {
+    didSet { arcLayer.strokeColor = color.cgColor }
+  }
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    arcLayer.fillColor = UIColor.clear.cgColor
+    arcLayer.strokeColor = color.cgColor
+    arcLayer.lineCap = .round
+    arcLayer.lineWidth = 3
+    layer.addSublayer(arcLayer)
+  }
+
+  required init?(coder: NSCoder) { return nil }
+
+  override var intrinsicContentSize: CGSize { CGSize(width: 30, height: 30) }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    arcLayer.frame = bounds
+    let inset = arcLayer.lineWidth / 2
+    let rect = bounds.insetBy(dx: inset, dy: inset)
+    arcLayer.path = UIBezierPath(
+      arcCenter: CGPoint(x: rect.midX, y: rect.midY),
+      radius: max(0, rect.width / 2),
+      startAngle: -.pi / 2,
+      endAngle: .pi * 1.15,
+      clockwise: true
+    ).cgPath
+  }
+
+  func startAnimating() {
+    guard layer.animation(forKey: "spin") == nil else { return }
+    let spin = CABasicAnimation(keyPath: "transform.rotation.z")
+    spin.fromValue = 0
+    spin.toValue = 2 * Double.pi
+    spin.duration = 0.85
+    spin.repeatCount = .infinity
+    spin.isRemovedOnCompletion = false
+    layer.add(spin, forKey: "spin")
+  }
+
+  func stopAnimating() {
+    layer.removeAnimation(forKey: "spin")
+  }
+}
+
 private final class VibeAgentRuntimeComposerView: UIView, UITextViewDelegate {
   var onSend: ((String, AgentBridgeRunOptions) -> Void)? {
     didSet { updateSendState() }
   }
   var onHeightChanged: ((CGFloat) -> Void)?
+  /// Tapped the "+" — the controller presents an image picker and stages the result
+  /// via `addAttachment(blob:)`. The composer can't present, so it delegates up.
+  var onAttach: (() -> Void)?
+  /// Encrypted image blobs staged to ride along with the next send.
+  private var pendingAttachmentBlobs: [String] = []
   var placeholder: String = "Ask Codex" {
     didSet { placeholderLabel.text = placeholder }
   }
   var provider: String = "codex" {
-    didSet { rebuildOptionsMenu() }
+    didSet { refreshOptions() }
   }
 
+  /// The visible rounded "pill". `self` is a transparent container that extends to
+  /// the very bottom of the screen (ignoring the safe-area inset) so there is no
+  /// edge/strip below the input; the pill is inset above the home indicator.
+  private let pillView = UIView()
   private let blurView = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
   private let overlayView = UIView()
   private let textView = UITextView()
   private let placeholderLabel = UILabel()
   private let plusButton = UIButton(type: .system)
-  private let optionsButton = UIButton(type: .system)
+  /// Model / reasoning picker chip — shown only in the expanded state.
+  private let optionsChip = UIButton(type: .system)
   private let micButton = UIButton(type: .system)
   private let sendButton = UIButton(type: .system)
   private var appearance: VibeAgentKitChatAppearance = .fallback
 
+  /// Compact (idle) vs expanded (focused / has text). Compact is a short capsule
+  /// with just "+ … mic"; expanded grows and reveals the model chip + send button.
+  private var isExpanded = false
+  private var compactConstraints: [NSLayoutConstraint] = []
+  private var expandedConstraints: [NSLayoutConstraint] = []
+  private var pillBottomConstraint: NSLayoutConstraint!
+
+  private let compactPillHeight: CGFloat = 46
+  private let bottomGap: CGFloat = 8
+  private let pagePadding: CGFloat = 14
+
+  // On-device speech dictation for the mic button: tap to start, tap to stop, the
+  // recognized text fills the composer so you can edit before sending. The agents
+  // are text/code CLIs, so dictation (speech → text) is the useful "record voice"
+  // here, not an audio attachment they can't consume.
+  private let speechRecognizer = SFSpeechRecognizer()
+  private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
+  private var recognitionTask: SFSpeechRecognitionTask?
+  private let audioEngine = AVAudioEngine()
+  private var isDictating = false
+  private var dictationBaseText = ""
+
+  /// Total height the host should give this view: the pill plus the inset that
+  /// keeps the pill above the home indicator. Because `self` extends to the screen
+  /// bottom, `safeAreaInsets.bottom` here is exactly the home-indicator height (and
+  /// becomes 0 once the keyboard covers it, so the pill hugs the keyboard).
   var preferredHeight: CGFloat {
-    64
+    pillHeightForState() + safeAreaInsets.bottom + bottomGap
+  }
+
+  private func pillHeightForState() -> CGFloat {
+    guard isExpanded else { return compactPillHeight }
+    let width = measurementWidth()
+    let textWidth = max(40, width - pagePadding * 2 - 32)
+    let fit = textView.sizeThatFits(CGSize(width: textWidth, height: .greatestFiniteMagnitude))
+    let textHeight = min(max(ceil(fit.height), 30), 124)
+    // topPad(6) + text + gap(4) + controls row (40pt button + 6pt bottom inset).
+    return min(max(6 + textHeight + 4 + 46, 96), 220)
+  }
+
+  private func measurementWidth() -> CGFloat {
+    if bounds.width > 0 { return bounds.width }
+    return window?.bounds.width ?? UIScreen.main.bounds.width
   }
 
   override init(frame: CGRect) {
@@ -588,102 +992,164 @@ private final class VibeAgentRuntimeComposerView: UIView, UITextViewDelegate {
 
   required init?(coder: NSCoder) { return nil }
 
+  deinit {
+    if audioEngine.isRunning {
+      audioEngine.stop()
+      audioEngine.inputNode.removeTap(onBus: 0)
+    }
+    recognitionTask?.cancel()
+  }
+
   func applyAppearance(_ appearance: VibeAgentKitChatAppearance) {
     self.appearance = appearance
     backgroundColor = .clear
-    layer.borderColor = appearance.border.withAlphaComponent(0.72).cgColor
-    overlayView.backgroundColor = appearance.surface.withAlphaComponent(appearance.isDark ? 0.82 : 0.92)
+    // Neutral pill — deliberately NOT the warm/brown `surface`/`border` palette, so
+    // the input reads as a clean dark control matching the rest of the chrome
+    // rather than a brown-tinted card.
+    let fill = appearance.isDark
+      ? UIColor(white: 0.13, alpha: 0.92)
+      : UIColor(white: 0.96, alpha: 0.96)
+    let stroke = appearance.isDark
+      ? UIColor(white: 1.0, alpha: 0.08)
+      : UIColor(white: 0.0, alpha: 0.08)
+    overlayView.backgroundColor = fill
+    pillView.layer.borderColor = stroke.cgColor
     textView.textColor = appearance.text
     placeholderLabel.textColor = appearance.textTertiary
-    [plusButton, optionsButton, micButton].forEach { button in
-      button.tintColor = appearance.text
-    }
+    [plusButton, micButton].forEach { $0.tintColor = appearance.text }
+    refreshOptions()
+    updateAttachmentIndicator()
     updateSendState()
   }
 
   private func configure() {
-    clipsToBounds = true
-    layer.cornerRadius = 24
-    layer.cornerCurve = .continuous
-    layer.borderWidth = 1
+    backgroundColor = .clear
+
+    pillView.translatesAutoresizingMaskIntoConstraints = false
+    pillView.clipsToBounds = true
+    pillView.layer.cornerRadius = 22
+    pillView.layer.cornerCurve = .continuous
+    pillView.layer.borderWidth = 1
+    addSubview(pillView)
 
     blurView.translatesAutoresizingMaskIntoConstraints = false
-    addSubview(blurView)
+    pillView.addSubview(blurView)
 
     overlayView.translatesAutoresizingMaskIntoConstraints = false
-    addSubview(overlayView)
+    pillView.addSubview(overlayView)
 
     textView.translatesAutoresizingMaskIntoConstraints = false
     textView.backgroundColor = .clear
     textView.font = UIFont.systemFont(ofSize: 17, weight: .regular)
-    textView.textContainerInset = UIEdgeInsets(top: 10, left: 0, bottom: 8, right: 0)
+    textView.textContainerInset = UIEdgeInsets(top: 2, left: 0, bottom: 2, right: 0)
     textView.textContainer.lineFragmentPadding = 0
     textView.isScrollEnabled = true
     textView.returnKeyType = .default
     textView.delegate = self
-    addSubview(textView)
+    pillView.addSubview(textView)
 
     placeholderLabel.translatesAutoresizingMaskIntoConstraints = false
     placeholderLabel.text = placeholder
     placeholderLabel.font = UIFont.systemFont(ofSize: 17, weight: .regular)
     placeholderLabel.numberOfLines = 1
-    addSubview(placeholderLabel)
+    pillView.addSubview(placeholderLabel)
 
     configureIconButton(plusButton, systemName: "plus")
-    configureIconButton(optionsButton, systemName: "exclamationmark.shield")
-    optionsButton.showsMenuAsPrimaryAction = true
-    optionsButton.changesSelectionAsPrimaryAction = false
-    optionsButton.accessibilityLabel = "Agent options"
-    rebuildOptionsMenu()
+    plusButton.addTarget(self, action: #selector(handlePlus), for: .touchUpInside)
+    configureOptionsChip()
     configureIconButton(micButton, systemName: "mic")
+    // Mic and send share one glyph size so the trailing controls read as a balanced
+    // pair. Preferred config persists across the dictation icon swaps.
+    let controlGlyph = UIImage.SymbolConfiguration(pointSize: 16, weight: .semibold)
+    micButton.setPreferredSymbolConfiguration(controlGlyph, forImageIn: .normal)
+    micButton.addTarget(self, action: #selector(handleMic), for: .touchUpInside)
     configureIconButton(sendButton, systemName: "arrow.up")
+    sendButton.setPreferredSymbolConfiguration(controlGlyph, forImageIn: .normal)
     sendButton.backgroundColor = UIColor.white.withAlphaComponent(0.20)
-    sendButton.layer.cornerRadius = 21
+    sendButton.layer.cornerRadius = 20
     sendButton.layer.cornerCurve = .continuous
     sendButton.addTarget(self, action: #selector(handleSend), for: .touchUpInside)
-    [plusButton, optionsButton, micButton, sendButton].forEach(addSubview)
+    [plusButton, optionsChip, micButton, sendButton].forEach(pillView.addSubview)
 
+    // `self` extends to the screen bottom; the pill is inset above the home
+    // indicator by `safeAreaInsets.bottom + bottomGap` (updated in
+    // `safeAreaInsetsDidChange`), so there is never a visible strip/edge below it.
+    pillBottomConstraint = pillView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -bottomGap)
     NSLayoutConstraint.activate([
-      blurView.topAnchor.constraint(equalTo: topAnchor),
-      blurView.leadingAnchor.constraint(equalTo: leadingAnchor),
-      blurView.trailingAnchor.constraint(equalTo: trailingAnchor),
-      blurView.bottomAnchor.constraint(equalTo: bottomAnchor),
-      overlayView.topAnchor.constraint(equalTo: topAnchor),
-      overlayView.leadingAnchor.constraint(equalTo: leadingAnchor),
-      overlayView.trailingAnchor.constraint(equalTo: trailingAnchor),
-      overlayView.bottomAnchor.constraint(equalTo: bottomAnchor),
+      pillView.topAnchor.constraint(equalTo: topAnchor),
+      pillView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: pagePadding),
+      pillView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -pagePadding),
+      pillBottomConstraint,
 
-      plusButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 13),
-      plusButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
-      plusButton.widthAnchor.constraint(equalToConstant: 42),
-      plusButton.heightAnchor.constraint(equalToConstant: 42),
+      blurView.topAnchor.constraint(equalTo: pillView.topAnchor),
+      blurView.leadingAnchor.constraint(equalTo: pillView.leadingAnchor),
+      blurView.trailingAnchor.constraint(equalTo: pillView.trailingAnchor),
+      blurView.bottomAnchor.constraint(equalTo: pillView.bottomAnchor),
+      overlayView.topAnchor.constraint(equalTo: pillView.topAnchor),
+      overlayView.leadingAnchor.constraint(equalTo: pillView.leadingAnchor),
+      overlayView.trailingAnchor.constraint(equalTo: pillView.trailingAnchor),
+      overlayView.bottomAnchor.constraint(equalTo: pillView.bottomAnchor),
 
-      optionsButton.leadingAnchor.constraint(equalTo: plusButton.trailingAnchor, constant: 2),
-      optionsButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
-      optionsButton.widthAnchor.constraint(equalToConstant: 38),
-      optionsButton.heightAnchor.constraint(equalToConstant: 42),
-
-      sendButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-      sendButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
-      sendButton.widthAnchor.constraint(equalToConstant: 42),
-      sendButton.heightAnchor.constraint(equalToConstant: 42),
-
-      micButton.trailingAnchor.constraint(equalTo: sendButton.leadingAnchor, constant: -8),
-      micButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
-      micButton.widthAnchor.constraint(equalToConstant: 38),
-      micButton.heightAnchor.constraint(equalToConstant: 42),
-
-      textView.leadingAnchor.constraint(equalTo: optionsButton.trailingAnchor, constant: 8),
-      textView.trailingAnchor.constraint(equalTo: micButton.leadingAnchor, constant: -8),
-      textView.topAnchor.constraint(equalTo: topAnchor),
-      textView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
-
-      placeholderLabel.leadingAnchor.constraint(equalTo: textView.leadingAnchor),
-      placeholderLabel.trailingAnchor.constraint(lessThanOrEqualTo: textView.trailingAnchor),
-      placeholderLabel.topAnchor.constraint(equalTo: textView.topAnchor, constant: 10),
+      plusButton.widthAnchor.constraint(equalToConstant: 40),
+      plusButton.heightAnchor.constraint(equalToConstant: 40),
+      micButton.widthAnchor.constraint(equalToConstant: 40),
+      micButton.heightAnchor.constraint(equalToConstant: 40),
+      sendButton.widthAnchor.constraint(equalToConstant: 40),
+      sendButton.heightAnchor.constraint(equalToConstant: 40),
+      optionsChip.heightAnchor.constraint(equalToConstant: 32),
     ])
 
+    buildStateConstraints()
+    applyState()
     applyAppearance(.fallback)
+  }
+
+  /// Build (but don't activate) the two layouts. `applyState` toggles between them.
+  ///   • Compact: a single short capsule row → "+  text …  mic".
+  ///   • Expanded: text on top with a control row (+, model chip, mic, send) below.
+  private func buildStateConstraints() {
+    compactConstraints = [
+      plusButton.leadingAnchor.constraint(equalTo: pillView.leadingAnchor, constant: 6),
+      plusButton.centerYAnchor.constraint(equalTo: pillView.centerYAnchor),
+      micButton.trailingAnchor.constraint(equalTo: pillView.trailingAnchor, constant: -6),
+      micButton.centerYAnchor.constraint(equalTo: pillView.centerYAnchor),
+      textView.leadingAnchor.constraint(equalTo: plusButton.trailingAnchor, constant: 2),
+      textView.trailingAnchor.constraint(equalTo: micButton.leadingAnchor, constant: -2),
+      textView.topAnchor.constraint(equalTo: pillView.topAnchor),
+      textView.bottomAnchor.constraint(equalTo: pillView.bottomAnchor),
+      placeholderLabel.leadingAnchor.constraint(equalTo: textView.leadingAnchor),
+      placeholderLabel.centerYAnchor.constraint(equalTo: pillView.centerYAnchor),
+    ]
+
+    expandedConstraints = [
+      textView.topAnchor.constraint(equalTo: pillView.topAnchor, constant: 6),
+      textView.leadingAnchor.constraint(equalTo: pillView.leadingAnchor, constant: 16),
+      textView.trailingAnchor.constraint(equalTo: pillView.trailingAnchor, constant: -16),
+      textView.bottomAnchor.constraint(equalTo: plusButton.topAnchor, constant: -2),
+      plusButton.leadingAnchor.constraint(equalTo: pillView.leadingAnchor, constant: 6),
+      plusButton.bottomAnchor.constraint(equalTo: pillView.bottomAnchor, constant: -6),
+      optionsChip.leadingAnchor.constraint(equalTo: plusButton.trailingAnchor, constant: 4),
+      optionsChip.centerYAnchor.constraint(equalTo: plusButton.centerYAnchor),
+      optionsChip.trailingAnchor.constraint(lessThanOrEqualTo: micButton.leadingAnchor, constant: -8),
+      sendButton.trailingAnchor.constraint(equalTo: pillView.trailingAnchor, constant: -6),
+      sendButton.bottomAnchor.constraint(equalTo: pillView.bottomAnchor, constant: -6),
+      micButton.trailingAnchor.constraint(equalTo: sendButton.leadingAnchor, constant: -4),
+      micButton.centerYAnchor.constraint(equalTo: sendButton.centerYAnchor),
+      placeholderLabel.leadingAnchor.constraint(equalTo: textView.leadingAnchor),
+      placeholderLabel.topAnchor.constraint(equalTo: textView.topAnchor, constant: 2),
+    ]
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    // Capsule when compact, rounded-rect once it grows.
+    pillView.layer.cornerRadius = min(pillView.bounds.height / 2, 22)
+  }
+
+  override func safeAreaInsetsDidChange() {
+    super.safeAreaInsetsDidChange()
+    pillBottomConstraint.constant = -(safeAreaInsets.bottom + bottomGap)
+    onHeightChanged?(preferredHeight)
   }
 
   private func configureIconButton(_ button: UIButton, systemName: String) {
@@ -693,7 +1159,56 @@ private final class VibeAgentRuntimeComposerView: UIView, UITextViewDelegate {
     button.tintColor = .white
   }
 
+  private func configureOptionsChip() {
+    optionsChip.translatesAutoresizingMaskIntoConstraints = false
+    optionsChip.showsMenuAsPrimaryAction = true
+    optionsChip.changesSelectionAsPrimaryAction = false
+    optionsChip.accessibilityLabel = "Model and reasoning"
+    var cfg = UIButton.Configuration.plain()
+    cfg.image = UIImage(
+      systemName: "chevron.down",
+      withConfiguration: UIImage.SymbolConfiguration(pointSize: 10, weight: .semibold))
+    cfg.imagePlacement = .trailing
+    cfg.imagePadding = 5
+    cfg.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 10)
+    cfg.titleLineBreakMode = .byTruncatingTail
+    optionsChip.configuration = cfg
+    // Let the chip truncate instead of pushing the mic/send off the trailing edge.
+    optionsChip.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    optionsChip.setContentHuggingPriority(.required, for: .horizontal)
+  }
+
+  // MARK: Compact ↔ expanded
+
+  /// Toggle the active layout. Height changes are driven through `onHeightChanged`
+  /// so the host animates the composer and message list together.
+  private func applyState() {
+    NSLayoutConstraint.deactivate(isExpanded ? compactConstraints : expandedConstraints)
+    NSLayoutConstraint.activate(isExpanded ? expandedConstraints : compactConstraints)
+    optionsChip.isHidden = !isExpanded
+    sendButton.isHidden = !isExpanded
+    onHeightChanged?(preferredHeight)
+    updateSendState()
+  }
+
+  private func setExpanded(_ expanded: Bool) {
+    guard expanded != isExpanded else { return }
+    isExpanded = expanded
+    applyState()
+  }
+
+  /// Refill the composer with an existing message's text for editing — expand and
+  /// focus it so the user can revise and resend (used by the hold menu's "Edit").
+  func beginEditing(with text: String) {
+    textView.text = text
+    placeholderLabel.isHidden = !text.isEmpty
+    setExpanded(true)
+    textViewDidChange(textView)
+    textView.becomeFirstResponder()
+  }
+
   @objc private func handleSend() {
+    stopDictation()
     let text = textView.text.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !text.isEmpty, onSend != nil else { return }
     let options = AgentBridgeSelectionStore.selectedRunOptions(provider: provider)
@@ -702,14 +1217,143 @@ private final class VibeAgentRuntimeComposerView: UIView, UITextViewDelegate {
     onSend?(text, options)
   }
 
+  // MARK: Image attachments
+
+  @objc private func handlePlus() {
+    onAttach?()
+  }
+
+  /// Stage an encrypted image blob to ride along with the next send. The "+" button
+  /// reflects how many are queued so the user knows an image is attached.
+  func addAttachment(blob: String) {
+    pendingAttachmentBlobs.append(blob)
+    updateAttachmentIndicator()
+  }
+
+  /// Hand the staged blobs to the caller and clear them (called at send time).
+  func consumePendingAttachments() -> [String] {
+    let blobs = pendingAttachmentBlobs
+    pendingAttachmentBlobs.removeAll()
+    updateAttachmentIndicator()
+    return blobs
+  }
+
+  private func updateAttachmentIndicator() {
+    let count = pendingAttachmentBlobs.count
+    plusButton.setImage(
+      UIImage(systemName: count > 0 ? "photo.badge.plus.fill" : "plus"), for: .normal)
+    plusButton.tintColor = count > 0 ? .systemBlue : appearance.text
+    plusButton.accessibilityValue = count > 0 ? "\(count) image(s) attached" : nil
+  }
+
+  // MARK: Voice dictation
+
+  @objc private func handleMic() {
+    if isDictating {
+      stopDictation()
+      return
+    }
+    SFSpeechRecognizer.requestAuthorization { [weak self] status in
+      DispatchQueue.main.async {
+        guard let self, status == .authorized else { return }
+        AVAudioSession.sharedInstance().requestRecordPermission { granted in
+          DispatchQueue.main.async {
+            guard granted else { return }
+            self.startDictation()
+          }
+        }
+      }
+    }
+  }
+
+  private func startDictation() {
+    guard let recognizer = speechRecognizer, recognizer.isAvailable, !isDictating else { return }
+    recognitionTask?.cancel()
+    recognitionTask = nil
+
+    let session = AVAudioSession.sharedInstance()
+    do {
+      try session.setCategory(.record, mode: .measurement, options: .duckOthers)
+      try session.setActive(true, options: .notifyOthersOnDeactivation)
+    } catch {
+      return
+    }
+
+    let request = SFSpeechAudioBufferRecognitionRequest()
+    request.shouldReportPartialResults = true
+    recognitionRequest = request
+    // Preserve anything already typed; append dictated text after it.
+    let existing = textView.text.trimmingCharacters(in: .whitespacesAndNewlines)
+    dictationBaseText = existing.isEmpty ? "" : existing + " "
+
+    let inputNode = audioEngine.inputNode
+    recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
+      // The recognition handler is called on an arbitrary queue; touch UI/audio on main.
+      DispatchQueue.main.async {
+        guard let self else { return }
+        if let result {
+          self.textView.text = self.dictationBaseText + result.bestTranscription.formattedString
+          self.textViewDidChange(self.textView)
+        }
+        if error != nil || (result?.isFinal ?? false) {
+          self.stopDictation()
+        }
+      }
+    }
+
+    let format = inputNode.outputFormat(forBus: 0)
+    inputNode.removeTap(onBus: 0)
+    inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+      self?.recognitionRequest?.append(buffer)
+    }
+
+    audioEngine.prepare()
+    do {
+      try audioEngine.start()
+      isDictating = true
+      updateMicAppearance()
+    } catch {
+      stopDictation()
+    }
+  }
+
+  private func stopDictation() {
+    if audioEngine.isRunning {
+      audioEngine.stop()
+      audioEngine.inputNode.removeTap(onBus: 0)
+    }
+    recognitionRequest?.endAudio()
+    recognitionRequest = nil
+    recognitionTask?.cancel()
+    recognitionTask = nil
+    try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    if isDictating {
+      isDictating = false
+      updateMicAppearance()
+    }
+  }
+
+  private func updateMicAppearance() {
+    micButton.setImage(UIImage(systemName: isDictating ? "mic.fill" : "mic"), for: .normal)
+    micButton.tintColor = isDictating ? .systemRed : appearance.text
+  }
+
   func textViewDidBeginEditing(_ textView: UITextView) {
+    setExpanded(true)
   }
 
   func textViewDidEndEditing(_ textView: UITextView) {
+    // Collapse back to the compact capsule only when there's nothing to keep.
+    if textView.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+      pendingAttachmentBlobs.isEmpty {
+      setExpanded(false)
+    }
   }
 
   func textViewDidChange(_ textView: UITextView) {
     placeholderLabel.isHidden = !textView.text.isEmpty
+    if !textView.text.isEmpty { setExpanded(true) }
+    if isExpanded { onHeightChanged?(preferredHeight) }
     updateSendState()
   }
 
@@ -721,18 +1365,13 @@ private final class VibeAgentRuntimeComposerView: UIView, UITextViewDelegate {
     sendButton.backgroundColor = enabled ? appearance.text : appearance.textSecondary.withAlphaComponent(0.24)
   }
 
-  private func rebuildOptionsMenu() {
+  /// Rebuild the picker menu AND the chip's label ("<model> · <reasoning>"). Called
+  /// whenever the selection or provider changes.
+  private func refreshOptions() {
     let selectedOptions = AgentBridgeSelectionStore.selectedRunOptions(provider: provider)
-    let intelligenceActions = AgentBridgeIntelligenceLevel.allCases.map { level in
-      UIAction(
-        title: level.title,
-        state: selectedOptions.intelligence == level ? .on : .off
-      ) { [weak self] _ in
-        AgentBridgeSelectionStore.setIntelligence(level)
-        self?.rebuildOptionsMenu()
-      }
-    }
-
+    // Each control is its OWN picker (Model / Thinking / Speed) with the live
+    // selection shown as the submenu subtitle and a checkmark on the active row, so
+    // it's obvious what's actually selected and being sent — not a placeholder.
     let modelActions = modelChoices(for: provider).map { choice in
       UIAction(
         title: choice.title,
@@ -740,7 +1379,17 @@ private final class VibeAgentRuntimeComposerView: UIView, UITextViewDelegate {
         state: choice.value == selectedOptions.model ? .on : .off
       ) { [weak self] _ in
         AgentBridgeSelectionStore.setModel(provider: self?.provider ?? "codex", model: choice.value)
-        self?.rebuildOptionsMenu()
+        self?.refreshOptions()
+      }
+    }
+
+    let thinkingActions = AgentBridgeIntelligenceLevel.allCases.map { level in
+      UIAction(
+        title: level.title,
+        state: selectedOptions.intelligence == level ? .on : .off
+      ) { [weak self] _ in
+        AgentBridgeSelectionStore.setIntelligence(level)
+        self?.refreshOptions()
       }
     }
 
@@ -750,30 +1399,57 @@ private final class VibeAgentRuntimeComposerView: UIView, UITextViewDelegate {
         state: selectedOptions.speed == speed ? .on : .off
       ) { [weak self] _ in
         AgentBridgeSelectionStore.setSpeed(speed)
-        self?.rebuildOptionsMenu()
+        self?.refreshOptions()
       }
     }
 
-    optionsButton.menu = UIMenu(
-      title: "Intelligence",
-      children: intelligenceActions + [
-        UIMenu(title: "Model", subtitle: selectedOptions.model ?? "Provider default", children: modelActions),
+    optionsChip.menu = UIMenu(
+      title: provider.lowercased() == "claude" ? "Claude run options" : "Codex run options",
+      children: [
+        UIMenu(title: "Model", subtitle: currentModelTitle(selectedOptions), children: modelActions),
+        UIMenu(title: "Thinking", subtitle: selectedOptions.intelligence.title, children: thinkingActions),
         UIMenu(title: "Speed", subtitle: selectedOptions.speed.title, children: speedActions),
       ]
     )
+
+    var cfg = optionsChip.configuration ?? .plain()
+    var title = AttributedString("\(currentModelTitle(selectedOptions)) · \(selectedOptions.intelligence.title)")
+    title.font = UIFont.systemFont(ofSize: 14, weight: .medium)
+    title.foregroundColor = appearance.text
+    cfg.attributedTitle = title
+    cfg.baseForegroundColor = appearance.textSecondary  // chevron tint
+    cfg.background.backgroundColor = appearance.isDark
+      ? UIColor(white: 1.0, alpha: 0.10)
+      : UIColor(white: 0.0, alpha: 0.06)
+    cfg.background.cornerRadius = 16
+    optionsChip.configuration = cfg
+  }
+
+  /// The human label for the currently selected model. When nothing specific is
+  /// picked we show "Auto" (the CLI's own default) rather than the bare provider
+  /// name, so the chip never reads like an unwired placeholder.
+  private func currentModelTitle(_ options: AgentBridgeRunOptions) -> String {
+    if let model = options.model {
+      if let match = modelChoices(for: provider).first(where: { $0.value == model }) {
+        return match.title
+      }
+      if !model.isEmpty { return model }
+    }
+    return "Auto"
   }
 
   private func modelChoices(for provider: String) -> [(title: String, subtitle: String?, value: String?)] {
     switch provider.lowercased() {
     case "claude":
       return [
-        ("Provider default", nil, nil),
-        ("Sonnet", "Claude Code alias", "sonnet"),
-        ("Opus", "Claude Code alias", "opus"),
+        ("Auto", "Claude Code default", nil),
+        ("Haiku", "Fastest, lightest", "haiku"),
+        ("Sonnet", "Balanced", "sonnet"),
+        ("Opus", "Most capable", "opus"),
       ]
     default:
       return [
-        ("Provider default", nil, nil),
+        ("Auto", "Codex default", nil),
         ("GPT-5.5", nil, "gpt-5.5"),
         ("GPT-5.3 Codex", nil, "gpt-5.3-codex"),
       ]

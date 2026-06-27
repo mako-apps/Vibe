@@ -41,6 +41,7 @@ targets:
         NSFaceIDUsageDescription: Use Face ID to unlock privacy controls and reveal protected account data.
         NSCameraUsageDescription: Use the camera for video calls and to capture story photos and videos.
         NSMicrophoneUsageDescription: Use the microphone for calls, story videos, and voice messages.
+        NSSpeechRecognitionUsageDescription: Transcribe your speech to text so you can dictate messages to the agent.
         NSPhotoLibraryUsageDescription: Use the photo library to choose photos and videos for stories.
         NSPhotoLibraryAddUsageDescription: Save edited stories to your photo library when you choose download.
         UIBackgroundModes:

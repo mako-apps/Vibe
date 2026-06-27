@@ -409,9 +409,10 @@ defmodule Vibe.AI.LocalAgentWorker do
         runtime = normalize_runtime_payload(Keyword.get(opts, :runtime))
         # End-to-end encrypted runtime blob. Opaque to the server: stored and
         # served verbatim, never decrypted, parsed, or logged. The key lives
-        # only on the user's bridge and phone.
-        runtime_enc = normalize_runtime_enc(Keyword.get(opts, :runtime_enc))
-        runtime_can_revert = Keyword.get(opts, :can_revert) == true
+	        # only on the user's bridge and phone.
+	        runtime_enc = normalize_runtime_enc(Keyword.get(opts, :runtime_enc))
+	        agent_actions_enc = normalize_runtime_enc(Keyword.get(opts, :agent_actions_enc))
+	        runtime_can_revert = Keyword.get(opts, :can_revert) == true
         team_metadata = normalize_team_metadata(opts)
         extracted = extract_result(worker, output)
         progress_nodes = progress_nodes_with_runtime(extracted.progress_nodes, runtime)
@@ -449,9 +450,10 @@ defmodule Vibe.AI.LocalAgentWorker do
             "agentWorkerRawEventCount" => extracted.raw_event_count,
             "progressNodes" => progress_nodes
           }
-          |> maybe_put("agentRuntime", runtime)
-          |> maybe_put("agentRuntimeEnc", runtime_enc)
-          |> maybe_put("agentRuntimeCanRevert", if(runtime_can_revert, do: true))
+	          |> maybe_put("agentRuntime", runtime)
+	          |> maybe_put("agentRuntimeEnc", runtime_enc)
+	          |> maybe_put("agentActionsEnc", agent_actions_enc)
+	          |> maybe_put("agentRuntimeCanRevert", if(runtime_can_revert, do: true))
           |> Map.merge(team_metadata)
 
         result =
@@ -1057,7 +1059,11 @@ defmodule Vibe.AI.LocalAgentWorker do
             "userId" => worker.agent_user_id,
             "isAgent" => true,
             "text" => text,
-            "progressNodes" => extracted.progress_nodes,
+            # Live feed stays tool-only: the working text is still streaming into the
+            # body above the feed, so emitting it as nodes too would double it up. The
+            # interleaved text nodes land only on the final persisted message, where
+            # the body collapses to the summary and the narration moves into the card.
+            "progressNodes" => Enum.reject(extracted.progress_nodes, &(&1["kind"] == "text")),
             "toolEvents" => extracted.tool_events,
             "status" => "running"
           }
@@ -1121,23 +1127,33 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp do_run(%{handle: "codex"} = worker, executable, prompt, opts) do
     bridge_options = Keyword.get(opts, :bridge_metadata) || %{}
 
-    sandbox =
-      System.get_env("VIBE_CODEX_SANDBOX")
-      |> normalize_string()
-      |> case do
-        value when value in ["read-only", "workspace-write", "danger-full-access"] -> value
-        _ -> "read-only"
-      end
+	    sandbox =
+	      System.get_env("VIBE_CODEX_SANDBOX")
+	      |> normalize_string()
+	      |> case do
+	        value when value in ["read-only", "workspace-write", "danger-full-access"] -> value
+	        _ -> "read-only"
+	      end
 
-    args =
-      [
-        "exec",
-        "--json",
-        "--sandbox",
-        sandbox,
-        "--cd",
-        worker_cwd(),
-        "--skip-git-repo-check",
+	    approval_policy =
+	      System.get_env("VIBE_CODEX_APPROVAL_POLICY")
+	      |> normalize_string()
+	      |> case do
+	        value when value in ["untrusted", "on-request", "never"] -> value
+	        _ -> "untrusted"
+	      end
+
+	    args =
+	      [
+	        "exec",
+	        "--json",
+	        "--sandbox",
+	        sandbox,
+	        "-c",
+	        "approval_policy=\"#{approval_policy}\"",
+	        "--cd",
+	        worker_cwd(),
+	        "--skip-git-repo-check",
         "--ephemeral"
       ] ++
         maybe_model_args(bridge_options, "VIBE_CODEX_MODEL", "--model") ++
@@ -1149,14 +1165,14 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp do_run(%{handle: "claude"} = worker, executable, prompt, opts) do
     bridge_options = Keyword.get(opts, :bridge_metadata) || %{}
 
-    permission_mode =
-      System.get_env("VIBE_CLAUDE_PERMISSION_MODE")
-      |> normalize_string()
-      |> case do
-        value when value in ["default", "acceptEdits", "bypassPermissions", "plan"] ->
-          value
+	    permission_mode =
+	      System.get_env("VIBE_CLAUDE_PERMISSION_MODE")
+	      |> normalize_string()
+	      |> case do
+	        value when value in ["default", "acceptEdits", "auto", "dontAsk", "bypassPermissions", "plan"] ->
+	          value
 
-        _ ->
+	        _ ->
           "plan"
       end
 
@@ -1511,14 +1527,101 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp extract_result(worker, output) do
     decoded = decoded_events(output)
     tool_events = tool_events_from_decoded(worker, decoded)
+    text = extract_worker_text(worker, decoded, output)
 
     %{
-      text: extract_worker_text(worker, decoded, output),
+      text: text,
       tool_events: tool_events,
       available_tools: available_tools_from_decoded(worker, decoded),
       raw_event_count: length(decoded),
-      progress_nodes: progress_nodes_from_events(tool_events)
+      progress_nodes: build_progress_nodes(worker, decoded, tool_events, text)
     }
+  end
+
+  # Progress nodes for the "Worked …" card. For Claude we INTERLEAVE the agent's
+  # working text (the running narration it emits between tool calls) with its tool
+  # steps in chronological order, so the collapsed card reads top-down exactly as
+  # the agent worked (text → edit → read → text …). The FINAL summary block is
+  # excluded — it renders as the message body OUTSIDE the card. Other providers
+  # keep the tool-only feed until their transcript shape is wired the same way.
+  defp build_progress_nodes(%{handle: "claude"}, decoded, tool_events, summary_text) do
+    interleaved_claude_progress_nodes(decoded, tool_events, summary_text)
+  end
+
+  defp build_progress_nodes(_worker, _decoded, tool_events, _summary_text) do
+    progress_nodes_from_events(tool_events)
+  end
+
+  defp interleaved_claude_progress_nodes(decoded, tool_events, summary_text) do
+    tool_by_id = Map.new(tool_events, fn ev -> {ev["id"], ev} end)
+    summary_norm = summary_text |> to_string() |> String.trim()
+
+    {nodes, _used, _text_index} =
+      decoded
+      |> Enum.flat_map(&content_blocks_from_event/1)
+      |> Enum.reduce({[], MapSet.new(), 0}, fn block, {nodes, used, ti} ->
+        case block do
+          %{"type" => "text", "text" => raw_text} when is_binary(raw_text) ->
+            trimmed = String.trim(raw_text)
+
+            # Skip empty chatter and the final summary (it's the body, not a step).
+            if trimmed == "" or trimmed == summary_norm do
+              {nodes, used, ti}
+            else
+              node = %{
+                "id" => "worker-text-#{ti}",
+                "label" => clip_text_node(raw_text),
+                "status" => "done",
+                "depth" => 0,
+                "kind" => "text"
+              }
+
+              {[node | nodes], used, ti + 1}
+            end
+
+          %{"type" => "tool_use"} = tool_block ->
+            id = normalize_string(tool_block["id"])
+
+            case id && Map.get(tool_by_id, id) do
+              nil ->
+                {nodes, used, ti}
+
+              event ->
+                if MapSet.member?(used, id) do
+                  {nodes, used, ti}
+                else
+                  {[tool_event_to_node(event, length(nodes)) | nodes], MapSet.put(used, id), ti}
+                end
+            end
+
+          _ ->
+            {nodes, used, ti}
+        end
+      end)
+
+    Enum.reverse(nodes)
+  end
+
+  # The agent's working text can be long; keep enough to read the card without
+  # bloating the (plaintext) progressNodes payload.
+  defp clip_text_node(text) do
+    text = String.trim(to_string(text))
+
+    if String.length(text) > 4000 do
+      String.slice(text, 0, 4000) <> "…"
+    else
+      text
+    end
+  end
+
+  defp tool_event_to_node(event, index) do
+    %{
+      "id" => event["id"] || unique_event_id("worker-progress", index),
+      "label" => event["label"] || event["tool"] || "Working...",
+      "status" => event["status"] || "running",
+      "depth" => 0
+    }
+    |> copy_node_shape(event)
   end
 
   defp extract_worker_text(%{handle: "codex"}, decoded, output) do
@@ -2090,15 +2193,7 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp progress_nodes_from_events(events) do
     events
     |> Enum.with_index()
-    |> Enum.map(fn {event, index} ->
-      %{
-        "id" => event["id"] || unique_event_id("worker-progress", index),
-        "label" => event["label"] || event["tool"] || "Working...",
-        "status" => event["status"] || "running",
-        "depth" => 0
-      }
-      |> copy_node_shape(event)
-    end)
+    |> Enum.map(fn {event, index} -> tool_event_to_node(event, index) end)
   end
 
   defp progress_nodes_with_runtime(nodes, nil), do: nodes

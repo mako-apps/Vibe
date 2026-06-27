@@ -3201,6 +3201,9 @@ final class ChatConversationController: UIViewController {
   private var agentConnectModel: AgentConnectModel?
   private var agentConnectHost: UIHostingController<AgentConnectPanel>?
   private var bridgeConnectedThisSession = false
+  /// Pending "show the connect panel" work, deferred a beat so a fast status poll can
+  /// reveal the composer with no panel flash. Cancelled the moment we connect.
+  private var pendingConnectPanelWork: DispatchWorkItem?
 
   /// The chat currently shown. Used by the coordinator to avoid pushing a
   /// duplicate of the chat already on top of the navigation stack.
@@ -3520,6 +3523,14 @@ final class ChatConversationController: UIViewController {
   /// Hides the composer and shows the Connect panel for an unconnected bridge
   /// agent. The panel polls bridge status and calls back once a computer is online.
   private func applyAgentConnectGate(provider: String, reason: String) {
+    // Already known online (warm status cache) → never flash the panel; just reveal
+    // the composer. This is the fix for the "we're connected but it shows Connect,
+    // then jumps to no panel" flicker on reopen.
+    if AgentPairingService.lastStatus?.connected == true {
+      handleBridgeConnected()
+      return
+    }
+
     appShellRouteLog(
       "ChatConversationController agentConnectGate chatId=\(route.chatId) provider=\(provider) reason=\(reason)")
     mainView.setInputBarEnabled(false)
@@ -3540,10 +3551,29 @@ final class ChatConversationController: UIViewController {
       model = created
     }
 
-    guard agentConnectHost == nil else {
+    // Already showing (or already scheduled to show) — just keep polling.
+    guard agentConnectHost == nil, pendingConnectPanelWork == nil else {
       model.startPolling()
       return
     }
+    model.startPolling()
+    // Defer the panel a beat: the poll's first tick runs immediately, so a connected
+    // computer reveals the composer (via onConnected) before the panel ever appears.
+    // Only a genuinely offline computer falls through to showing it.
+    let work = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      self.pendingConnectPanelWork = nil
+      // If the poll reported "connected" during the grace window, onConnected already
+      // flipped this flag (and cancelled us); only a still-offline computer shows it.
+      guard !self.bridgeConnectedThisSession, self.agentConnectHost == nil else { return }
+      self.presentAgentConnectPanel(model: model)
+    }
+    pendingConnectPanelWork = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
+  }
+
+  private func presentAgentConnectPanel(model: AgentConnectModel) {
+    guard agentConnectHost == nil else { return }
     let host = UIHostingController(rootView: AgentConnectPanel(model: model))
     host.view.backgroundColor = .clear
     addChild(host)
@@ -3561,6 +3591,8 @@ final class ChatConversationController: UIViewController {
   private func handleBridgeConnected() {
     guard !bridgeConnectedThisSession else { return }
     bridgeConnectedThisSession = true
+    pendingConnectPanelWork?.cancel()
+    pendingConnectPanelWork = nil
     appShellRouteLog(
       "ChatConversationController agentBridgeConnected chatId=\(route.chatId)")
     removeAgentConnectPanel()
@@ -3569,6 +3601,8 @@ final class ChatConversationController: UIViewController {
   }
 
   private func removeAgentConnectPanel() {
+    pendingConnectPanelWork?.cancel()
+    pendingConnectPanelWork = nil
     agentConnectModel?.stopPolling()
     if let host = agentConnectHost {
       host.willMove(toParent: nil)

@@ -240,6 +240,107 @@ struct AgentBridgeTranscriptMessage: Identifiable {
   let text: String
 }
 
+// MARK: - History loading skeletons
+
+/// A single shimmering placeholder block. A muted rounded rect with a highlight band
+/// sweeping across it — the building block for the history skeletons (no spinner).
+private struct AgentBridgeSkeletonBlock: View {
+  var width: CGFloat? = nil
+  var height: CGFloat
+  var cornerRadius: CGFloat = 7
+  let base: Color
+  @State private var animate = false
+
+  var body: some View {
+    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+      .fill(base)
+      .frame(width: width, height: height)
+      .frame(maxWidth: width == nil ? .infinity : nil, alignment: .leading)
+      .overlay(
+        GeometryReader { geo in
+          let w = geo.size.width
+          LinearGradient(
+            colors: [.clear, Color.white.opacity(0.10), .clear],
+            startPoint: .leading,
+            endPoint: .trailing
+          )
+          .frame(width: max(60, w * 0.5))
+          .offset(x: animate ? w : -w * 0.6)
+        }
+      )
+      .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+      .onAppear {
+        withAnimation(.linear(duration: 1.6).repeatForever(autoreverses: false)) {
+          animate = true
+        }
+      }
+  }
+}
+
+/// Skeleton for the session LIST: a few project headers each with a couple of
+/// bubble-shaped session cards. Replaces the "Reading history…" spinner.
+private struct AgentBridgeHistoryListSkeleton: View {
+  let palette: AppThemePalette
+  private var base: Color { palette.secondaryText.opacity(0.15) }
+
+  var body: some View {
+    ScrollView {
+      VStack(alignment: .leading, spacing: 26) {
+        ForEach(0..<3, id: \.self) { _ in
+          VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+              AgentBridgeSkeletonBlock(width: 18, height: 18, cornerRadius: 5, base: base)
+              AgentBridgeSkeletonBlock(width: 150, height: 18, base: base)
+            }
+            ForEach(0..<2, id: \.self) { _ in
+              VStack(alignment: .leading, spacing: 9) {
+                AgentBridgeSkeletonBlock(height: 14, base: base)
+                AgentBridgeSkeletonBlock(width: 190, height: 12, base: base)
+              }
+              .padding(14)
+              .background(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                  .fill(base.opacity(0.5))
+              )
+            }
+          }
+        }
+      }
+      .padding(20)
+    }
+    .allowsHitTesting(false)
+    .transition(.opacity)
+  }
+}
+
+/// Skeleton for the transcript DETAIL: alternating role label + text-line bubbles,
+/// so a loading conversation reads as chat bubbles rather than a spinner.
+private struct AgentBridgeTranscriptSkeleton: View {
+  let palette: AppThemePalette
+  private var base: Color { palette.secondaryText.opacity(0.15) }
+
+  var body: some View {
+    ScrollView {
+      VStack(alignment: .leading, spacing: 18) {
+        ForEach(0..<5, id: \.self) { index in
+          VStack(alignment: .leading, spacing: 6) {
+            AgentBridgeSkeletonBlock(width: 54, height: 11, cornerRadius: 5, base: base)
+            AgentBridgeSkeletonBlock(height: 13, base: base)
+            if index % 2 == 0 {
+              AgentBridgeSkeletonBlock(height: 13, base: base)
+            }
+            AgentBridgeSkeletonBlock(width: 220, height: 13, base: base)
+          }
+          .frame(maxWidth: .infinity, alignment: .leading)
+        }
+      }
+      .padding(18)
+    }
+    .allowsHitTesting(false)
+    .transition(.opacity)
+  }
+}
+
 // Inline history list, designed to be PUSHED into the profile's own
 // NavigationStack rather than presented as a sheet. Selecting a topic pushes the
 // dedicated agent runtime surface instead of injecting rows into the default chat.
@@ -247,6 +348,9 @@ struct AgentBridgeHistoryInlineView: View {
   let provider: String
   let chatId: String
   var runningTasks: [AgentBridgeRunningTask] = []
+  var deviceLabel: String = ""
+  var connected: Bool = false
+  var paired: Bool = false
   let onOpenSession: (AgentBridgeHistorySession) -> Void
 
   @Environment(\.colorScheme) private var colorScheme
@@ -287,13 +391,7 @@ struct AgentBridgeHistoryInlineView: View {
   var body: some View {
     Group {
       if loading && visibleSessions.isEmpty {
-        VStack(spacing: 12) {
-          ProgressView()
-          Text("Reading \(displayName) history from your computer…")
-            .font(.system(size: 13))
-            .foregroundStyle(palette.secondaryText)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        AgentBridgeHistoryListSkeleton(palette: palette)
       } else if visibleSessions.isEmpty {
         VStack(spacing: 12) {
           Image(systemName: errorMessage == nil ? "clock.badge.questionmark" : "laptopcomputer.slash")
@@ -322,12 +420,51 @@ struct AgentBridgeHistoryInlineView: View {
         .scrollContentBackground(.hidden)
       }
     }
+    .safeAreaInset(edge: .bottom) {
+      if connected || paired { connectionFooter }
+    }
     .navigationTitle("\(displayName) history")
     .navigationBarTitleDisplayMode(.inline)
     .onReceive(NotificationCenter.default.publisher(for: ChatEngine.didChangeNotification)) { note in
       handle(note)
     }
-    .onAppear { requestList() }
+    .onAppear { seedThenRefresh() }
+  }
+
+  /// Footer pinned to the bottom of the history list: which computer this history is
+  /// coming from. While paired-but-offline it reads as "Reconnecting…" with a spinner
+  /// so a recovering connection is visible instead of a silent stale list.
+  private var connectionFooter: some View {
+    HStack(spacing: 8) {
+      if connected {
+        Circle().fill(Color.green).frame(width: 8, height: 8)
+        Text(deviceLabel.isEmpty ? "Connected" : "Connected to \(deviceLabel)")
+      } else {
+        ProgressView().controlSize(.small)
+        Text(deviceLabel.isEmpty ? "Reconnecting…" : "Reconnecting to \(deviceLabel)…")
+      }
+    }
+    .font(.system(size: 12, weight: .medium))
+    .foregroundStyle(palette.secondaryText)
+    .frame(maxWidth: .infinity)
+    .padding(.vertical, 10)
+    .background(.bar)
+  }
+
+  /// Re-opening the history must NOT flash the skeleton when we already have rows.
+  /// Seed from the last payload the engine cached, then refresh quietly in place.
+  private func seedThenRefresh() {
+    if visibleSessions.isEmpty,
+      let payload = ChatEngine.shared.latestAgentBridgeHistory(chatId: chatId),
+      (payload["mode"] as? String ?? "list") == "list"
+    {
+      let cached = (payload["sessions"] as? [[String: Any]] ?? []).compactMap { Self.parseSession($0) }
+      if !cached.isEmpty {
+        sessions = cached
+        loading = false
+      }
+    }
+    requestList()
   }
 
   private func projectHeader(_ group: AgentBridgeHistoryProjectGroup) -> some View {
@@ -385,7 +522,9 @@ struct AgentBridgeHistoryInlineView: View {
   }
 
   private func requestList() {
-    loading = true
+    // Only show the skeleton on a cold load. With rows already on screen (cached or a
+    // prior fetch) we refresh silently so re-opening never flashes back to a spinner.
+    if visibleSessions.isEmpty { loading = true }
     errorMessage = nil
     let result = ChatEngine.shared.requestAgentBridgeHistory([
       "chatId": chatId,
@@ -522,6 +661,20 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
         let all = ChatEngine.shared
           .getChatRows(["chatId": chatId])
           .compactMap { ChatListRow(raw: $0) }
+        // "New chat" mode: ignore this session's ingested transcript entirely and
+        // show only the fresh (non-resumed) turns started from the button onward.
+        if coordinator?.forceFreshSession == true {
+          let fresh = coordinator?.freshSendIds ?? []
+          guard !fresh.isEmpty else { return [] }
+          let keep = all.filter { row in
+            let mid = row.messageId ?? ""
+            if fresh.contains(mid) { return true }
+            if let src = row.agentActionSourceId, fresh.contains(src) { return true }
+            if row.isStreamingText { return true }
+            return false
+          }
+          return VibeAgentKitMap.messages(from: keep)
+        }
         // Follow-ups that resume THIS session: identified durably by the resume
         // session id their send stamped into metadata (so a follow-up sent from
         // ANOTHER device folds in too), plus any this device sent locally. Their
@@ -547,13 +700,19 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
         return VibeAgentKitMap.messages(from: liveRows)
       },
       // Send continues THIS session on the user's computer and streams back in place.
-      onSend: { [weak coordinator] text, options in
-        coordinator?.sendFollowUp(text, options: options)
+      onSend: { [weak coordinator] text, options, attachments in
+        coordinator?.sendFollowUp(text, options: options, attachments: attachments)
       }
     )
     controller.agentBridgeChatId = chatId
     controller.agentBridgeProvider = provider
+    controller.onNewChat = { [weak coordinator] in coordinator?.startNewChat() }
+    // Editing a message reverts its turn's files (handled in the controller) and then
+    // re-runs the revised prompt as a fresh task from that reverted state.
+    controller.onEditMessage = { [weak coordinator] _ in coordinator?.startNewChat() }
     context.coordinator.controller = controller
+    // Show the centered spinner until the session's transcript / live stream lands.
+    controller.isLoadingTranscript = true
     context.coordinator.start()
     return controller
   }
@@ -573,10 +732,16 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
     resumeSessionId: String,
     text: String,
     messageId: String = UUID().uuidString.lowercased(),
-    options: AgentBridgeRunOptions? = nil
+    options: AgentBridgeRunOptions? = nil,
+    attachments: [String] = []
   ) {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !trimmed.isEmpty else { return }
+    // An image-only send carries no caption; give the agent (and the bubble) a
+    // sensible default so the prompt isn't empty and the row isn't filtered out.
+    let body =
+      !trimmed.isEmpty
+      ? trimmed : (attachments.isEmpty ? "" : "Please take a look at the attached image.")
+    guard !body.isEmpty else { return }
     var metadata: [String: Any] = ["agentBridgeProvider": provider]
     if let repo = AgentBridgeSelectionStore.selectedRepository() {
       metadata["agentBridgeRepoId"] = repo.id
@@ -588,6 +753,11 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
     metadata.merge(
       (options ?? AgentBridgeSelectionStore.selectedRunOptions(provider: provider)).payload(provider: provider)
     ) { _, new in new }
+    // Sealed image blobs (arte1) the daemon decrypts + writes for the agent to read.
+    // The server only ever relays these opaque strings.
+    if !attachments.isEmpty {
+      metadata["agentBridgeAttachmentsEnc"] = attachments
+    }
     // Explicit resume so the message continues the session you opened rather than
     // starting a fresh task (per the resume contract).
     if !resumeSessionId.isEmpty, !resumeSessionId.hasPrefix("running:") {
@@ -596,7 +766,7 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
     _ = ChatEngine.shared.sendMessage([
       "chatId": chatId,
       "type": "text",
-      "text": trimmed,
+      "text": body,
       "messageId": messageId,
       "metadata": metadata,
     ])
@@ -614,26 +784,54 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
     /// id and gets filtered out, leaving the view looking empty.
     var followUpMessageIds: Set<String> = []
 
+    /// Set once the user taps "new chat": the transcript view is cleared and every
+    /// subsequent send starts a brand-new (non-resumed) task instead of continuing
+    /// this session. `freshSendIds` scopes the provider to just those new turns.
+    var forceFreshSession = false
+    var freshSendIds: Set<String> = []
+
     init(parent: AgentBridgeRuntimeView) {
       self.parent = parent
+    }
+
+    /// Begin a fresh conversation: clear what's on screen and flip into fresh-session
+    /// mode so the next send opens a new task rather than resuming this one.
+    func startNewChat() {
+      forceFreshSession = true
+      followUpMessageIds.removeAll()
+      freshSendIds.removeAll()
+      // A fresh chat is intentionally blank — no spinner, just the empty composer.
+      controller?.isLoadingTranscript = false
+      controller?.setMessages([])
     }
 
     /// Send a follow-up that resumes this session and surface it inline. We mint the
     /// id up front so we can register it before dispatch; the engine's optimistic
     /// insert + the streamed/final reply then render through `messagesProvider`.
-    func sendFollowUp(_ text: String, options: AgentBridgeRunOptions) {
+    func sendFollowUp(_ text: String, options: AgentBridgeRunOptions, attachments: [String] = []) {
       let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-      guard !trimmed.isEmpty else { return }
+      // Allow an image-only send (no caption) as long as something is attached.
+      guard !trimmed.isEmpty || !attachments.isEmpty else { return }
       let messageId = UUID().uuidString.lowercased()
-      followUpMessageIds.insert(messageId)
+      // Fresh-chat sends start a new task (no resume id); normal sends resume this
+      // session. Track the id in the matching set so the provider renders it.
+      let resumeSessionId =
+        forceFreshSession
+        ? ""
+        : parent.session.resolvedSessionId.trimmingCharacters(in: .whitespacesAndNewlines)
+      if forceFreshSession {
+        freshSendIds.insert(messageId)
+      } else {
+        followUpMessageIds.insert(messageId)
+      }
       AgentBridgeRuntimeView.sendToAgent(
         chatId: parent.chatId,
         provider: parent.provider,
-        resumeSessionId: parent.session.resolvedSessionId
-          .trimmingCharacters(in: .whitespacesAndNewlines),
+        resumeSessionId: resumeSessionId,
         text: trimmed,
         messageId: messageId,
-        options: options
+        options: options,
+        attachments: attachments
       )
     }
 
@@ -644,30 +842,9 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
     }
 
     func seedMessages() -> [VibeAgentKitChatMessage] {
-      if parent.session.isRunning {
-        return [
-          VibeAgentKitChatMessage(
-            id: parent.session.id,
-            role: .assistant,
-            text: "Running on \(parent.session.displayProjectName).",
-            timestamp: "",
-            timestampMs: 0,
-            isStreaming: true
-          )
-        ]
-      }
-      // A finished conversation must NOT look live — no streaming shimmer. This is a
-      // transient placeholder replaced as soon as the transcript loads.
-      return [
-        VibeAgentKitChatMessage(
-          id: parent.session.id,
-          role: .assistant,
-          text: "Loading conversation…",
-          timestamp: "",
-          timestampMs: 0,
-          isStreaming: false
-        )
-      ]
+      // Start empty: the controller shows a centered spinner while the transcript (or
+      // the live stream, for a running task) loads — no placeholder "Loading…" bubble.
+      []
     }
 
     /// Join the chat channel (so live frames arrive) and ingest the selected local
@@ -723,8 +900,7 @@ struct AgentBridgeTranscriptView: View {
   var body: some View {
     Group {
       if loading && messages.isEmpty {
-        ProgressView()
-          .frame(maxWidth: .infinity, maxHeight: .infinity)
+        AgentBridgeTranscriptSkeleton(palette: palette)
       } else if messages.isEmpty {
         Text(errorMessage ?? "This conversation is empty.")
           .font(.system(size: 14))
