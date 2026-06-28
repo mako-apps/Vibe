@@ -3555,9 +3555,41 @@ public final class ChatMainView: UIView,
     } else {
       resolvedSubtitle = trimmedSubtitle
     }
-    chatTitleLabel.text = resolvedTitle
-    chatSubtitleLabel.text = resolvedSubtitle
-    chatSubtitleLabel.isHidden = resolvedSubtitle.isEmpty
+    if !bridgeProvider.isEmpty {
+      let chevronAttachment = NSTextAttachment()
+      let chevronConfig = UIImage.SymbolConfiguration(pointSize: 10, weight: .semibold)
+      chevronAttachment.image = UIImage(systemName: "chevron.up.chevron.down", withConfiguration: chevronConfig)?.withTintColor(chatTitleLabel.textColor, renderingMode: .alwaysOriginal)
+      chevronAttachment.bounds = CGRect(x: 0, y: 0, width: 12, height: 12)
+      let attributedTitle = NSMutableAttributedString(string: "\(resolvedTitle) ")
+      attributedTitle.append(NSAttributedString(attachment: chevronAttachment))
+      chatTitleLabel.attributedText = attributedTitle
+
+      // Subtitle with connection pip (green = connected, red = reconnecting) + device name
+      if !resolvedSubtitle.isEmpty {
+        let isConnected = AgentPairingService.lastConnected
+        let dotColor: UIColor = isConnected
+          ? UIColor(red: 83.0/255.0, green: 224.0/255.0, blue: 138.0/255.0, alpha: 1.0)
+          : UIColor(red: 1.0, green: 0.27, blue: 0.27, alpha: 1.0)
+        let dotImage = UIGraphicsImageRenderer(size: CGSize(width: 6, height: 6)).image { ctx in
+          dotColor.setFill()
+          ctx.cgContext.fillEllipse(in: CGRect(x: 0, y: 0, width: 6, height: 6))
+        }
+        let dotAttachment = NSTextAttachment()
+        dotAttachment.image = dotImage
+        dotAttachment.bounds = CGRect(x: 0, y: -0.5, width: 6, height: 6)
+        let attributed = NSMutableAttributedString(attachment: dotAttachment)
+        attributed.append(NSAttributedString(string: " \(resolvedSubtitle)"))
+        chatSubtitleLabel.attributedText = attributed
+        chatSubtitleLabel.isHidden = false
+      } else {
+        chatSubtitleLabel.text = resolvedSubtitle
+        chatSubtitleLabel.isHidden = true
+      }
+    } else {
+      chatTitleLabel.text = resolvedTitle
+      chatSubtitleLabel.text = resolvedSubtitle
+      chatSubtitleLabel.isHidden = resolvedSubtitle.isEmpty
+    }
     chatHeaderStack.spacing = resolvedSubtitle.isEmpty ? 0.0 : -1.0
     profileTitleLabel.text = profileNameText.isEmpty ? resolvedTitle : profileNameText
     profileSubtitleLabel.text = isGroupOrChannel ? "Group Profile" : "Profile"
@@ -3667,7 +3699,7 @@ public final class ChatMainView: UIView,
     // the input's repo switcher. Fall back to the repo name only if no device is known,
     // and to nil (so connection/presence subtitles can show) when neither exists.
     if let device = AgentPairingService.lastDeviceLabel, !device.isEmpty {
-      return AgentPairingService.lastConnected ? device : "\(device) · reconnecting"
+      return device
     }
     let repositoryName =
       AgentBridgeSelectionStore.selectedRepository()?.name

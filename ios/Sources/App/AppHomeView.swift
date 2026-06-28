@@ -5577,7 +5577,7 @@ private struct ContactSearchResultRow: View {
         HStack(spacing: 6) {
           Text(user.username)
             .font(.system(size: 16, weight: .medium))
-            .foregroundStyle(user.isGoldTier ? Color(red: 0.96, green: 0.72, blue: 0.22) : palette.text)
+            .foregroundStyle(palette.text)
           if user.isGoldTier {
             ChatHomeTierBadgeView(label: "Gold")
           }
@@ -6522,6 +6522,7 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
   func tabBarController(
     _ tabBarController: UITabBarController, didSelect viewController: UIViewController
   ) {
+    tabBarController.view.endEditing(true)
     let index = tabBarController.selectedIndex
     guard index < Self.orderedTabs.count else { return }
     let tab = Self.orderedTabs[index]

@@ -329,6 +329,13 @@ private final class NativeProfileAvatarModel: ObservableObject {
       return
     }
 
+    // Serve from cache immediately so reopening the profile shows no fallback flicker.
+    if let cached = ChatAvatarImageStore.cached(for: normalizedValue) {
+      loadedImage = cached
+      return
+    }
+
+    loadedImage = nil
     imageTask = Task { [weak self] in
       let image = await NativeProfileAvatarImageLoader.load(from: normalizedValue)
       guard !Task.isCancelled else { return }
@@ -761,8 +768,8 @@ private struct ChatProfileRow {
     }()
 
     let waveform = parseChatProfileWaveform(message["waveform"] ?? raw["waveform"])
-    
-    let thumbnailBase64 = 
+
+    let thumbnailBase64 =
       (message["thumbnailBase64"] as? String)
       ?? (message["thumbnail_base64"] as? String)
       ?? (metadata?["thumbnailBase64"] as? String)
@@ -1239,8 +1246,8 @@ private struct ChatProfileSwiftUIRootView: View {
                 VStack(spacing: 20) {
                   HStack(spacing: 8) {
                     Text(profileName)
-                      .font(.system(size: max(17, 34 - (localScrollOffset / 8)), weight: .bold))
-                      .foregroundStyle(showsGoldTier ? goldTierColor : .primary)
+                      .font(.system(size: max(17, 34 - (max(0, localScrollOffset) / 8)), weight: .bold))
+                      .foregroundStyle(.primary)
                       .lineLimit(1)
                       .minimumScaleFactor(0.72)
 
@@ -1327,23 +1334,87 @@ private struct ChatProfileSwiftUIRootView: View {
   private func profileBackdrop(width: CGFloat, height: CGFloat) -> some View {
     ZStack {
       if let posterImage {
-        Image(uiImage: posterImage)
-          .resizable()
-          .scaledToFill()
+        let isSquare = posterImage.size.width > 0 && posterImage.size.height > 0 &&
+                       (posterImage.size.width / posterImage.size.height) > 0.95 &&
+                       (posterImage.size.width / posterImage.size.height) < 1.05
+
+        if isSquare {
+          // Reflection Background
+          Image(uiImage: posterImage)
+            .resizable()
+            .scaledToFill()
+            .frame(width: width, height: height)
+            .rotationEffect(.degrees(180))
+            .blur(radius: 60)
+            .opacity(0.8)
+
+          // Original Image at top
+          let img = Image(uiImage: posterImage).resizable().scaledToFit()
+          img.frame(width: width, height: height, alignment: .top)
+
+          // Blurred overlay
+          img.frame(width: width, height: height, alignment: .top)
+            .blur(radius: min(40, 15 + max(0, localScrollOffset / 5)))
+            .mask(
+              LinearGradient(
+                stops: [
+                  .init(color: .clear, location: max(0, 0.4 - max(0, localScrollOffset) / height)),
+                  .init(color: .black, location: max(0.1, 0.6 - max(0, localScrollOffset) / height))
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+              )
+            )
+        } else {
+          // Standard Image
+          let img = Image(uiImage: posterImage).resizable().scaledToFill()
+
+          img.frame(width: width, height: height)
+
+          img.frame(width: width, height: height)
+            .blur(radius: min(40, 15 + max(0, localScrollOffset / 5)))
+            .mask(
+              LinearGradient(
+                stops: [
+                  .init(color: .clear, location: max(0, 0.4 - max(0, localScrollOffset) / height)),
+                  .init(color: .black, location: max(0.1, 0.6 - max(0, localScrollOffset) / height))
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+              )
+            )
+        }
       } else {
-        ChatProfileHeroInlineView(
+        // Fallback Avatar
+        let scale = max(0.6, 1.0 - max(0, localScrollOffset / 500))
+        let hero = ChatProfileHeroInlineView(
           text: avatarDisplayText,
           fontStyleID: appearanceSelection.avatarFontStyleID,
           gradientColors: avatarGradientColors,
           imageUri: hasProfileImage ? avatarUri : nil,
           width: width,
-          height: height
+          height: height,
+          avatarScale: scale
         )
+
+        hero.frame(width: width, height: height)
+
+        hero.frame(width: width, height: height)
+          .blur(radius: 20)
+          .mask(
+            LinearGradient(
+              stops: [
+                .init(color: .black, location: 0.3),
+                .init(color: .clear, location: 0.5)
+              ],
+              startPoint: .top,
+              endPoint: .bottom
+            )
+          )
       }
     }
     .frame(width: width, height: height)
-    .scaleEffect(1.05)
-    .blur(radius: min(40, max(0, localScrollOffset / 6)))
+    .scaleEffect(1.05 + max(0, -localScrollOffset / 500))
     .clipped()
     .ignoresSafeArea()
   }
@@ -1353,12 +1424,12 @@ private struct ChatProfileSwiftUIRootView: View {
       Color.clear
         .preference(
           key: ChatProfileScrollOffsetPreferenceKey.self,
-          value: max(0, -proxy.frame(in: .named("profile-scroll")).minY)
+          value: -proxy.frame(in: .named("profile-scroll")).minY
         )
     }
     .frame(height: 0)
     .onPreferenceChange(ChatProfileScrollOffsetPreferenceKey.self) { value in
-      let nextValue = (max(0, value) * 2.0).rounded() / 2.0
+      let nextValue = (value * 2.0).rounded() / 2.0
       DispatchQueue.main.async {
         guard abs(localScrollOffset - nextValue) >= 0.5 else { return }
         localScrollOffset = nextValue
@@ -1855,9 +1926,27 @@ private struct ChatProfileHeroInlineView: View {
   let imageUri: String?
   let width: CGFloat
   let height: CGFloat
+  var avatarScale: CGFloat = 1.0
 
   @State private var image: UIImage?
   @State private var loadedUri: String?
+
+  init(
+    text: String, fontStyleID: String?, gradientColors: (UIColor, UIColor),
+    imageUri: String?, width: CGFloat, height: CGFloat, avatarScale: CGFloat = 1.0
+  ) {
+    self.text = text
+    self.fontStyleID = fontStyleID
+    self.gradientColors = gradientColors
+    self.imageUri = imageUri
+    self.width = width
+    self.height = height
+    self.avatarScale = avatarScale
+    let normalized = imageUri?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+    let primed = normalized.flatMap { ChatAvatarImageStore.cached(for: $0) }
+    _image = State(initialValue: primed)
+    _loadedUri = State(initialValue: primed != nil ? normalized : nil)
+  }
 
   var body: some View {
     ZStack(alignment: .bottom) {
@@ -1867,19 +1956,22 @@ private struct ChatProfileHeroInlineView: View {
         endPoint: .bottom
       )
 
-      if loadedUri == normalizedUri, let image {
-        bannerImage(image)
-      } else if normalizedUri == nil {
-        Text(text)
-          .font(.system(
-            size: max(56, height * 0.26),
-            weight: .bold,
-            design: ChatProfileAvatarFontStyle.style(id: fontStyleID).design
-          ))
-          .foregroundStyle(.white.opacity(0.94))
-          .minimumScaleFactor(0.4)
-          .frame(maxWidth: .infinity, maxHeight: .infinity)
+      Group {
+        if loadedUri == normalizedUri, let image {
+          bannerImage(image)
+        } else if normalizedUri == nil {
+          Text(text)
+            .font(.system(
+              size: max(56, height * 0.26),
+              weight: .bold,
+              design: ChatProfileAvatarFontStyle.style(id: fontStyleID).design
+            ))
+            .foregroundStyle(.white.opacity(0.94))
+            .minimumScaleFactor(0.4)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
       }
+      .scaleEffect(avatarScale, anchor: .center)
     }
     .frame(width: width, height: height)
     .clipped()
@@ -1932,6 +2024,17 @@ private struct ChatProfileMiniAvatar: View {
 
   @State private var image: UIImage?
   @State private var loadedUri: String?
+
+  init(text: String, fontStyleID: String?, colors: (UIColor, UIColor), imageUri: String?) {
+    self.text = text
+    self.fontStyleID = fontStyleID
+    self.colors = colors
+    self.imageUri = imageUri
+    let normalized = imageUri?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+    let primed = normalized.flatMap { ChatAvatarImageStore.cached(for: $0) }
+    _image = State(initialValue: primed)
+    _loadedUri = State(initialValue: primed != nil ? normalized : nil)
+  }
 
   var body: some View {
     ZStack {
@@ -1996,6 +2099,12 @@ private struct ChatProfileAppearanceEditorView: View {
   @State private var avatarImage: UIImage?
   @State private var avatarImageUri: String?
   @State private var isCustomizerPresented = false
+  @State private var pendingCropImage: UIImageWrapper?
+
+  private struct UIImageWrapper: Identifiable {
+    let id = UUID()
+    let image: UIImage
+  }
 
   init(
     profileName: String,
@@ -2107,6 +2216,20 @@ private struct ChatProfileAppearanceEditorView: View {
       )
       .presentationDetents(mode == .poster ? Set([.large]) : Set([.medium, .large]))
       .presentationDragIndicator(.visible)
+    }
+    .fullScreenCover(item: $pendingCropImage) { wrapper in
+      ChatProfileImageCropper(image: wrapper.image) { cropped in
+        var nextDraft = draft
+        if let cropped, let jpeg = cropped.jpegData(compressionQuality: 0.84) {
+          nextDraft.posterImageData = jpeg
+        }
+        draft = nextDraft
+        onSave(nextDraft)
+        mode = .poster
+        pendingCropImage = nil
+      } onCancel: {
+        pendingCropImage = nil
+      }
     }
   }
 
@@ -2269,15 +2392,9 @@ private struct ChatProfileAppearanceEditorView: View {
   private func loadSelectedPosterPhoto() async {
     guard let selectedPhotoItem else { return }
     guard let data = try? await selectedPhotoItem.loadTransferable(type: Data.self) else { return }
-    var nextDraft = draft
-    if let image = UIImage(data: data), let jpeg = image.jpegData(compressionQuality: 0.84) {
-      nextDraft.posterImageData = jpeg
-    } else {
-      nextDraft.posterImageData = data
+    if let image = UIImage(data: data) {
+      pendingCropImage = UIImageWrapper(image: image)
     }
-    draft = nextDraft
-    onSave(nextDraft)
-    mode = .poster
   }
 }
 
@@ -3486,7 +3603,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
 
     layoutHeroHeaderViewIfNeeded(force: true)
     layoutActionsForCurrentScroll()
-    
+
     // Size the background gradient to fill the view
     backgroundGradientLayer.frame = bounds
     posterImageLayer.frame = bounds
@@ -3815,7 +3932,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     swiftUIContainerView.clipsToBounds = false
     swiftUIContainerView.layer.zPosition = 30.0
     addSubview(swiftUIContainerView)
-    
+
     swiftUIContainerView.insertSubview(avatarGlassRing, at: 0)
     swiftUIContainerView.insertSubview(floatingAvatarView, at: 0)
 
@@ -4250,7 +4367,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     actionsStack.transform = .identity
 
     let actionBottom = actionsStack.frame.maxY
-    
+
     let finalHeaderHeight = max(heroBannerView.frame.maxY + 24.0, actionBottom + 28.0)
 
     if force || heroHeaderView.frame.width != width
@@ -4307,7 +4424,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       height: ringSize
     )
     avatarGlassRing.layer.cornerRadius = ringSize * 0.5
-    
+
     avatarGlassRing.isHidden = true
     avatarGlassRing.alpha = 0.0
   }
@@ -5520,13 +5637,13 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     if row.type == "video", let mediaUrl = row.mediaUrl, !mediaUrl.isEmpty {
       let resolvedUrlStr = ChatEngine.shared.resolveURLForOpen(mediaUrl) ?? mediaUrl
       guard let url = URL(string: resolvedUrlStr) else { return }
-      
+
       var options: [String: Any]? = nil
       if url.scheme?.lowercased() == "http" || url.scheme?.lowercased() == "https",
          let authHeader = ChatEngine.shared.authorizationHeaderForAPI() {
         options = ["AVURLAssetHTTPHeaderFieldsKey": ["Authorization": authHeader]]
       }
-      
+
       let asset = AVURLAsset(url: url, options: options)
       let controller = ChatVideoEditViewController(
         asset: asset,
@@ -5534,7 +5651,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
         headerTitle: "Video",
         previewOnly: true
       )
-      
+
       if let presenter = topMostViewController() {
         presenter.present(controller, animated: true)
       }
@@ -5742,13 +5859,13 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   }
 }
 fileprivate class ChatProfileExpandedContentViewController: UIViewController, UITableViewDataSource, UITableViewDelegate {
-  
+
   let profileTab: ChatProfileTab
   let titleText: String
   let rows: [Any]
   let themeIsDark: Bool
   var onContentPressed: (([String: Any]) -> Void)?
-  
+
   private let tableView = UITableView(frame: .zero, style: .plain)
   private let headerBlur = UIVisualEffectView(effect: UIBlurEffect(style: .regular))
   private let headerOverlay = UIView()
@@ -5765,30 +5882,30 @@ fileprivate class ChatProfileExpandedContentViewController: UIViewController, UI
     _ = sourceView
     _ = hostView
   }
-  
+
   required init?(coder: NSCoder) {
     fatalError()
   }
-  
+
   override func viewDidLoad() {
     super.viewDidLoad()
     view.backgroundColor = themeIsDark
       ? UIColor(red: 7.0/255.0, green: 10.0/255.0, blue: 15.0/255.0, alpha: 1.0)
       : UIColor(red: 235.0/255.0, green: 240.0/255.0, blue: 243.0/255.0, alpha: 1.0)
-    
+
     tableView.dataSource = self
     tableView.delegate = self
     tableView.backgroundColor = .clear
     tableView.separatorStyle = .none
     tableView.contentInset = UIEdgeInsets(top: 92, left: 0, bottom: 24, right: 0)
-    
+
     tableView.register(ChatProfileVoiceContentCell.self, forCellReuseIdentifier: ChatProfileVoiceContentCell.reuseIdentifier)
     tableView.register(ChatProfileMediaGridRowCell.self, forCellReuseIdentifier: ChatProfileMediaGridRowCell.reuseIdentifier)
     tableView.register(ChatProfileMediaContentCell.self, forCellReuseIdentifier: ChatProfileMediaContentCell.reuseIdentifier)
     tableView.register(ChatProfileListRowCell.self, forCellReuseIdentifier: ChatProfileListRowCell.reuseIdentifier)
-    
+
     view.addSubview(tableView)
-    
+
     if #available(iOS 26.0, *) {
       let effect = UIGlassEffect(style: .regular)
       effect.isInteractive = true
@@ -5801,12 +5918,12 @@ fileprivate class ChatProfileExpandedContentViewController: UIViewController, UI
     headerOverlay.backgroundColor =
       (themeIsDark ? UIColor.black : UIColor.white).withAlphaComponent(themeIsDark ? 0.18 : 0.16)
     headerBlur.contentView.addSubview(headerOverlay)
-    
+
     titleLabel.font = .systemFont(ofSize: 18, weight: .semibold)
     titleLabel.textColor = themeIsDark ? .white : .black
     titleLabel.text = titleText
     headerBlur.contentView.addSubview(titleLabel)
-    
+
     closeButton.setImage(UIImage(systemName: "xmark.circle.fill"), for: .normal)
     closeButton.tintColor = themeIsDark ? .lightGray : .darkGray
     closeButton.addTarget(self, action: #selector(handleClose), for: .touchUpInside)
@@ -5816,7 +5933,7 @@ fileprivate class ChatProfileExpandedContentViewController: UIViewController, UI
   @objc private func handleClose() {
     dismiss(animated: true)
   }
-  
+
   override func viewDidLayoutSubviews() {
     super.viewDidLayoutSubviews()
     tableView.frame = view.bounds
@@ -5832,14 +5949,14 @@ fileprivate class ChatProfileExpandedContentViewController: UIViewController, UI
     titleLabel.center = CGPoint(x: headerBlur.bounds.midX, y: view.safeAreaInsets.top + 30.0)
     closeButton.frame = CGRect(x: headerBlur.bounds.width - 48, y: view.safeAreaInsets.top + 16.0, width: 32, height: 32)
   }
-  
+
   func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
     if profileTab == .media {
       return Int(ceil(Double(rows.count) / 3.0))
     }
     return rows.count
   }
-  
+
   func tableView(_ tableView: UITableView, heightForRowAt indexPath: IndexPath) -> CGFloat {
     if profileTab == .media {
       let cols: CGFloat = 3.0
@@ -5853,7 +5970,7 @@ fileprivate class ChatProfileExpandedContentViewController: UIViewController, UI
     }
     return 68.0
   }
-  
+
   func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
     if profileTab == .media {
       guard let cell = tableView.dequeueReusableCell(withIdentifier: ChatProfileMediaGridRowCell.reuseIdentifier, for: indexPath) as? ChatProfileMediaGridRowCell else { return UITableViewCell() }
@@ -5872,19 +5989,19 @@ fileprivate class ChatProfileExpandedContentViewController: UIViewController, UI
       }
       return cell
     }
-    
+
     let rowObj = rows[indexPath.row]
     var r: ChatProfileRow? = rowObj as? ChatProfileRow
     if profileTab == .links, let linkItem = rowObj as? ChatProfileLinkItem { r = linkItem.row }
     guard let row = r else { return UITableViewCell() }
-    
+
     if profileTab == .voice {
       guard let cell = tableView.dequeueReusableCell(withIdentifier: ChatProfileVoiceContentCell.reuseIdentifier, for: indexPath) as? ChatProfileVoiceContentCell else { return UITableViewCell() }
       cell.configure(title: row.fileName ?? "Voice message", subtitle: "Voice", row: row, titleColor: themeIsDark ? .white : .black, subtitleColor: .gray, accentColor: .systemBlue)
       VoiceBubblePlaybackCoordinator.shared.bind(cell: cell, messageId: row.messageId, mediaURL: row.mediaUrl, mediaKey: row.mediaKey, fileName: row.fileName)
       return cell
     }
-    
+
     guard let cell = tableView.dequeueReusableCell(withIdentifier: ChatProfileListRowCell.reuseIdentifier, for: indexPath) as? ChatProfileListRowCell else { return UITableViewCell() }
     let title: String
     let subtitle: String
@@ -5922,7 +6039,7 @@ fileprivate class ChatProfileExpandedContentViewController: UIViewController, UI
     cell.backgroundConfiguration = UIBackgroundConfiguration.clear()
     return cell
   }
-  
+
   func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
     tableView.deselectRow(at: indexPath, animated: true)
     guard profileTab != .media else { return }
@@ -5930,18 +6047,144 @@ fileprivate class ChatProfileExpandedContentViewController: UIViewController, UI
     var r: ChatProfileRow? = rowObj as? ChatProfileRow
     if profileTab == .links, let linkItem = rowObj as? ChatProfileLinkItem { r = linkItem.row }
     guard let row = r else { return }
-    
+
     if profileTab == .voice {
       if let cell = tableView.cellForRow(at: indexPath) as? VoicePlayableCell {
         VoiceBubblePlaybackCoordinator.shared.toggle(cell: cell, messageId: row.messageId, mediaURL: row.mediaUrl, mediaKey: row.mediaKey, fileName: row.fileName)
       }
       return
     }
-    
+
     var payload: [String: Any] = ["type": "profileContentPressed", "tab": profileTab.rawValue, "messageId": row.messageId]
     if profileTab == .links, let linkItem = rowObj as? ChatProfileLinkItem { payload["url"] = linkItem.url }
     else if let mediaUrl = row.mediaUrl, !mediaUrl.isEmpty { payload["url"] = mediaUrl }
-    
+
     onContentPressed?(payload)
+  }
+}
+import SwiftUI
+import UIKit
+
+struct ChatProfileImageCropper: View {
+  let image: UIImage
+  let onCrop: (UIImage?) -> Void
+  let onCancel: () -> Void
+
+  @State private var scale: CGFloat = 1.0
+  @State private var lastScale: CGFloat = 1.0
+  @State private var offset: CGSize = .zero
+  @State private var lastOffset: CGSize = .zero
+
+  var body: some View {
+    VStack(spacing: 0) {
+      ZStack {
+        Color.black.ignoresSafeArea()
+
+        GeometryReader { proxy in
+          let side = min(proxy.size.width, proxy.size.height) - 32
+          let imageAspect = image.size.width / image.size.height
+
+          let displayWidth = imageAspect > 1 ? side * imageAspect : side
+          let displayHeight = imageAspect > 1 ? side : side / imageAspect
+
+          ZStack {
+            Image(uiImage: image)
+              .resizable()
+              .scaledToFit()
+              .frame(width: displayWidth, height: displayHeight)
+              .scaleEffect(scale)
+              .offset(offset)
+              .gesture(
+                DragGesture()
+                  .onChanged { value in
+                    offset = CGSize(
+                      width: lastOffset.width + value.translation.width,
+                      height: lastOffset.height + value.translation.height
+                    )
+                  }
+                  .onEnded { _ in
+                    lastOffset = offset
+                  }
+              )
+              .gesture(
+                MagnificationGesture()
+                  .onChanged { value in
+                    scale = max(1.0, lastScale * value)
+                  }
+                  .onEnded { _ in
+                    lastScale = scale
+                  }
+              )
+          }
+          .frame(width: side, height: side)
+          .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+          .overlay(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+              .stroke(Color.white.opacity(0.4), lineWidth: 2)
+          )
+          .position(x: proxy.size.width / 2, y: proxy.size.height / 2)
+        }
+      }
+
+      HStack {
+        Button("Cancel") {
+          onCancel()
+        }
+        .font(.system(size: 18, weight: .medium))
+        .foregroundStyle(.white)
+
+        Spacer()
+
+        Button("Done") {
+          let cropped = renderCroppedImage()
+          onCrop(cropped)
+        }
+        .font(.system(size: 18, weight: .bold))
+        .foregroundStyle(.white)
+      }
+      .padding(.horizontal, 24)
+      .padding(.vertical, 20)
+      .background(Color.black)
+    }
+  }
+
+  @MainActor
+  private func renderCroppedImage() -> UIImage? {
+    let targetSize = CGSize(width: 800, height: 800)
+    let format = UIGraphicsImageRendererFormat()
+    format.scale = 1.0
+    let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
+
+    let result = renderer.image { ctx in
+      UIColor.black.setFill()
+      ctx.fill(CGRect(origin: .zero, size: targetSize))
+
+      let displayAspect = image.size.width / image.size.height
+      let drawWidth = displayAspect > 1 ? targetSize.width * displayAspect : targetSize.width
+      let drawHeight = displayAspect > 1 ? targetSize.height : targetSize.height / displayAspect
+
+      let centerX = targetSize.width / 2
+      let centerY = targetSize.height / 2
+
+      ctx.cgContext.translateBy(x: centerX, y: centerY)
+      ctx.cgContext.scaleBy(x: scale, y: scale)
+
+      let cropWindowWidth: CGFloat = UIScreen.main.bounds.width - 32
+      let offsetX = (offset.width / cropWindowWidth) * targetSize.width / scale
+      let offsetY = (offset.height / cropWindowWidth) * targetSize.height / scale
+
+      ctx.cgContext.translateBy(x: offsetX, y: offsetY)
+
+      let rect = CGRect(
+        x: -drawWidth / 2,
+        y: -drawHeight / 2,
+        width: drawWidth,
+        height: drawHeight
+      )
+
+      image.draw(in: rect)
+    }
+
+    return result
   }
 }

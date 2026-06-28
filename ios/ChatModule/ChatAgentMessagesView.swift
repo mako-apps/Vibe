@@ -480,7 +480,9 @@ private final class ChatNativeAgentPlainTextView: UIView {
       let textColor = appearance.textColorThem
       let isStreaming = row.isStreamingText
       var blocks = ChatNativeAgentTextRenderer.parseBlocks(text)
-      if let runtime = row.agentRuntime,
+      // The runtime/diff card is the end-of-turn summary — never render it while
+      // the turn is still streaming (it reappears once the row is no longer live).
+      if !isStreaming, let runtime = row.agentRuntime,
         !blocks.contains(where: {
           if case .agentRuntime = $0 { return true }
           return false

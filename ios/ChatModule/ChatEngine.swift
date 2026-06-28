@@ -4233,6 +4233,27 @@ final class ChatEngine {
     let sourceMessageId = normalizedString(
       payload["sourceMessageId"] ?? payload["source_message_id"] ?? payload["replyToId"] ?? payload["reply_to_id"]
     )
+    let sequence = parseLongValue(payload["sequence"])
+    let bridgeSentAtMs = parseLongValue(payload["bridgeSentAtMs"] ?? payload["bridge_sent_at_ms"])
+    let serverReceivedAtMs = parseLongValue(payload["serverReceivedAtMs"] ?? payload["server_received_at_ms"])
+    let serverBroadcastAtMs = parseLongValue(payload["serverBroadcastAtMs"] ?? payload["server_broadcast_at_ms"])
+    let phoneReceivedAtMs = Int64(nowMs())
+    if sequence == nil || sequence ?? 0 <= 3 || (sequence ?? 0) % 10 == 0 {
+      let bridgeToServer = bridgeSentAtMs.flatMap { sent in serverReceivedAtMs.map { $0 - sent } }
+      let serverToPhone = serverBroadcastAtMs.map { phoneReceivedAtMs - $0 }
+      let endToEnd = bridgeSentAtMs.map { phoneReceivedAtMs - $0 }
+      NSLog(
+        "[ChatEngine][AgentStream] chat=%@ stream=%@ seq=%@ text=%d nodes=%d bridgeToServer=%@ms serverToPhone=%@ms e2e=%@ms",
+        chatId,
+        streamId,
+        sequence.map(String.init) ?? "nil",
+        text.count,
+        progressNodes.count,
+        bridgeToServer.map(String.init) ?? "nil",
+        serverToPhone.map(String.init) ?? "nil",
+        endToEnd.map(String.init) ?? "nil"
+      )
+    }
 
     if status == "done" || status == "error" || status == "stopped" {
       clearAgentProgressLocked(chatId: chatId, status: status)
@@ -4245,7 +4266,7 @@ final class ChatEngine {
         message["metadata"] = metadata
       }
       postChangeLocked(
-        reason: "chatMessageInserted",
+        reason: "chatMessageChanged",
         userInfo: ["chatId": chatId, "messageId": streamId, "state": statusSnapshotLocked()]
       )
       return
@@ -4292,7 +4313,20 @@ final class ChatEngine {
     if let model = normalizedString(payload["model"]) {
       metadata["agentRuntimeModel"] = model
     }
+    if let sequence {
+      metadata["agentStreamSequence"] = sequence
+    }
+    if let bridgeSentAtMs {
+      metadata["agentBridgeSentAtMs"] = bridgeSentAtMs
+    }
+    if let serverReceivedAtMs {
+      metadata["agentServerReceivedAtMs"] = serverReceivedAtMs
+    }
+    if let serverBroadcastAtMs {
+      metadata["agentServerBroadcastAtMs"] = serverBroadcastAtMs
+    }
 
+    let hadExistingStreamRow = liveMessageRowsByChat[chatId]?[streamId] != nil
     var synthetic: [String: Any] = [
       "id": streamId,
       "type": "text",
@@ -4317,7 +4351,7 @@ final class ChatEngine {
     // history snapshot may have created for the same turn (order-independent dedup).
     removeRunningBridgeSessionRowsLocked(chatId: chatId)
     postChangeLocked(
-      reason: "chatMessageInserted",
+      reason: hadExistingStreamRow ? "chatMessageChanged" : "chatMessageInserted",
       userInfo: ["chatId": chatId, "messageId": streamId, "state": statusSnapshotLocked()]
     )
   }

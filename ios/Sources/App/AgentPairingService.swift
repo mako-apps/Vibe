@@ -492,12 +492,11 @@ enum AgentBridgeSelectionStore {
   /// Human title for a model id (or the provider default when nil/unknown). Use this
   /// for the header so the displayed model matches whatever a loaded run reports.
   static func modelTitle(provider: String, model: String?) -> String {
-    let resolved = normalizedModel(provider: provider, model: normalizedString(model))
-    guard let resolved else { return defaultModelTitle(provider: provider) }
-    if let match = modelChoices(provider: provider).first(where: { $0.value == resolved }) {
+    guard let rawModel = normalizedString(model) else { return defaultModelTitle(provider: provider) }
+    if let match = modelChoices(provider: provider).first(where: { $0.value == rawModel.lowercased() }) {
       return match.title
     }
-    return resolved
+    return rawModel
   }
 
   /// Public canonical-id resolver (e.g. "claude-3-5-sonnet" → "sonnet"). Returns nil

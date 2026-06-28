@@ -1087,6 +1087,18 @@ defmodule Vibe.AI.LocalAgentWorker do
           |> maybe_put("cwd", metadata["cwd"] || metadata[:cwd])
           |> maybe_put("workMode", metadata["workMode"] || metadata[:work_mode])
           |> maybe_put("model", metadata["model"] || metadata[:model])
+          |> maybe_put(
+            "bridgeSentAtMs",
+            metadata["bridgeSentAtMs"] || metadata["bridge_sent_at_ms"] ||
+              metadata[:bridge_sent_at_ms]
+          )
+          |> maybe_put(
+            "serverReceivedAtMs",
+            metadata["serverReceivedAtMs"] || metadata["server_received_at_ms"] ||
+              metadata[:server_received_at_ms]
+          )
+          |> maybe_put("serverBroadcastAtMs", System.system_time(:millisecond))
+          |> maybe_put("sequence", metadata["sequence"] || metadata[:sequence])
           |> maybe_put("teamMode", metadata["teamMode"] || metadata[:team_mode])
           |> maybe_put("teamRunId", metadata["teamRunId"] || metadata[:team_run_id])
           |> maybe_put("teamWorker", metadata["teamWorker"] || metadata[:team_worker])
@@ -1607,8 +1619,37 @@ defmodule Vibe.AI.LocalAgentWorker do
     interleaved_claude_progress_nodes(decoded, tool_events, summary_text)
   end
 
+  defp build_progress_nodes(%{handle: "codex"}, decoded, tool_events, _summary_text) do
+    (codex_reasoning_progress_nodes(decoded) ++ progress_nodes_from_events(tool_events))
+    |> Enum.take(@max_tool_events)
+  end
+
   defp build_progress_nodes(_worker, _decoded, tool_events, _summary_text) do
     progress_nodes_from_events(tool_events)
+  end
+
+  defp codex_reasoning_progress_nodes(decoded) do
+    decoded
+    |> Enum.with_index()
+    |> Enum.flat_map(fn {event, index} ->
+      item = codex_event_item(event)
+      type = if is_map(item), do: codex_item_type(item) || "", else: ""
+
+      if type == "reasoning" do
+        [
+          %{
+            "id" => "codex-thinking-#{index}",
+            "label" => "Thinking",
+            "status" => "done",
+            "depth" => 0,
+            "kind" => "thinking"
+          }
+        ]
+      else
+        []
+      end
+    end)
+    |> Enum.take(4)
   end
 
   defp interleaved_claude_progress_nodes(decoded, tool_events, summary_text) do
@@ -1654,7 +1695,19 @@ defmodule Vibe.AI.LocalAgentWorker do
             end
 
           _ ->
-            {nodes, used, ti}
+            if block["type"] == "thinking" do
+              node = %{
+                "id" => "claude-thinking-#{ti}",
+                "label" => "Thinking",
+                "status" => "done",
+                "depth" => 0,
+                "kind" => "thinking"
+              }
+
+              {[node | nodes], used, ti + 1}
+            else
+              {nodes, used, ti}
+            end
         end
       end)
 

@@ -1,0 +1,10 @@
+--- /Users/mohammadshayani/Vibe/ios/ChatModule/ChatListView.swift
++++ /Users/mohammadshayani/Vibe/ios/ChatModule/ChatListView.swift
+@@ -671,6 +671,7 @@
+ 
+   // --- Native input bar ---
+   private(set) var inputBar: ChatInputBar?
++  private(set) var agentComposerView: VibeComposerView?
+   private var inputBarEnabled = false
+   private var inputBarPlaceholder = "Message"
+   var keyboardHeight: CGFloat = 0

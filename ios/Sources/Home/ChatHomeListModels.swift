@@ -16,6 +16,13 @@ enum ChatAvatarURLResolver {
     }
 
     let apiBaseURL = resolvedAPIBaseURL()
+
+    // Prefer the raw avatar when it's already a direct HTTPS URL — it carries its
+    // own cache key so a changed image URL automatically busts the in-app cache.
+    if let trimmed = normalizedString(rawAvatar), isHTTPURL(trimmed) {
+      return trimmed
+    }
+
     if preferPushAvatar,
       let normalizedPeerUserId = normalizedString(peerUserId),
       let apiBaseURL
@@ -24,9 +31,6 @@ enum ChatAvatarURLResolver {
     }
 
     guard let trimmed = normalizedString(rawAvatar) else { return nil }
-    if isHTTPURL(trimmed) {
-      return trimmed
-    }
     if trimmed.hasPrefix("/"), let apiBaseURL {
       return URL(string: trimmed, relativeTo: apiBaseURL)?.absoluteURL.absoluteString
     }

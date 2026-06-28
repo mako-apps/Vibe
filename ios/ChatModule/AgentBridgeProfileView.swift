@@ -709,6 +709,8 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
     )
     controller.agentBridgeChatId = chatId
     controller.agentBridgeProvider = provider
+    controller.avatarTitle = AgentBridgeProfile.displayName(for: provider)
+    controller.avatarChatId = chatId
     controller.onNewChat = { [weak coordinator] in coordinator?.startNewChat() }
     // Editing a message reverts its turn's files (handled in the controller) and then
     // re-runs the revised prompt as a fresh task from that reverted state.

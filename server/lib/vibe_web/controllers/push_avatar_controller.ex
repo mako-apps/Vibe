@@ -29,7 +29,7 @@ defmodule VibeWeb.PushAvatarController do
       String.starts_with?(String.downcase(source), ["http://", "https://"]) ->
         Logger.info("[PushAvatar] redirecting to remote avatar url")
         conn
-        |> put_resp_header("cache-control", "public, max-age=300")
+        |> put_resp_header("cache-control", "public, max-age=60")
         |> redirect(external: source)
 
       true ->

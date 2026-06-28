@@ -20,7 +20,7 @@ defmodule VibeWeb.AgentBridgeChannel do
   # Keep only the most recent stream-json lines per in-flight task so a long run
   # can't grow the channel's memory without bound. The final `result` always
   # carries the complete output, so dropping the oldest progress lines is safe.
-  @max_stream_lines 500
+  @max_stream_lines 160
 
   @impl true
   def join("bridge:" <> topic_user_id, _payload, socket) do
@@ -69,13 +69,23 @@ defmodule VibeWeb.AgentBridgeChannel do
   # ping is kept for the typing indicator / backwards compatibility.
   @impl true
   def handle_in("progress", %{"provider" => provider, "chatId" => chat_id} = payload, socket) do
+    received_at_ms = System.system_time(:millisecond)
+    parse_start_ms = System.monotonic_time(:millisecond)
     line = payload["line"] || ""
     streams = Map.get(socket.assigns, :streams, %{})
-    state = Map.get(streams, chat_id, %{lines: [], stream_id: new_stream_id(chat_id)})
+
+    state =
+      Map.get(streams, chat_id, %{
+        lines: [],
+        stream_id: new_stream_id(chat_id),
+        progress_count: 0,
+        last_latency_log_at: 0
+      })
 
     lines = Enum.take([line | state.lines], @max_stream_lines)
     accumulated = lines |> Enum.reverse() |> Enum.join("\n")
     task_id = payload["taskId"] || payload["task_id"] || Map.get(state, :task_id)
+    progress_count = (Map.get(state, :progress_count) || 0) + 1
 
     source_message_id =
       payload["sourceMessageId"] ||
@@ -93,6 +103,10 @@ defmodule VibeWeb.AgentBridgeChannel do
         cwd: payload["cwd"] || Map.get(state, :cwd),
         work_mode: payload["workMode"] || payload["work_mode"] || Map.get(state, :work_mode),
         model: payload["model"] || Map.get(state, :model),
+        progress_count: progress_count,
+        bridge_sent_at_ms:
+          payload["sentAtMs"] || payload["sent_at_ms"] || Map.get(state, :bridge_sent_at_ms),
+        sequence: payload["sequence"] || Map.get(state, :sequence),
         team_mode: payload["teamMode"] || payload["team_mode"] || Map.get(state, :team_mode),
         team_run_id:
           payload["teamRunId"] || payload["team_run_id"] || Map.get(state, :team_run_id),
@@ -113,11 +127,34 @@ defmodule VibeWeb.AgentBridgeChannel do
       cwd: state.cwd,
       work_mode: state.work_mode,
       model: state.model,
+      bridge_sent_at_ms: state.bridge_sent_at_ms,
+      server_received_at_ms: received_at_ms,
+      sequence: state.sequence,
       team_mode: state.team_mode,
       team_run_id: state.team_run_id,
       team_worker: state.team_worker,
       team_workers: state.team_workers
     })
+
+    parse_ms = System.monotonic_time(:millisecond) - parse_start_ms
+    bridge_lag_ms = bridge_lag_ms(state.bridge_sent_at_ms, received_at_ms)
+    last_log_at = Map.get(state, :last_latency_log_at) || 0
+    now_mono = System.monotonic_time(:millisecond)
+
+    should_log =
+      progress_count <= 3 or rem(progress_count, 10) == 0 or parse_ms > 250 or
+        now_mono - last_log_at > 5_000
+
+    state =
+      if should_log do
+        Logger.info(
+          "[AgentBridge] progress latency provider=#{provider} chat=#{chat_id} task=#{inspect(task_id)} seq=#{inspect(state.sequence)} count=#{progress_count} bridgeLagMs=#{inspect(bridge_lag_ms)} parseMs=#{parse_ms} bytes=#{byte_size(accumulated)} lines=#{length(lines)}"
+        )
+
+        Map.put(state, :last_latency_log_at, now_mono)
+      else
+        state
+      end
 
     {:noreply, assign(socket, :streams, Map.put(streams, chat_id, state))}
   end
@@ -152,9 +189,9 @@ defmodule VibeWeb.AgentBridgeChannel do
             # End-to-end encrypted runtime blob. The server stores/relays this
             # verbatim and can never decrypt it (key lives only on the bridge +
             # phone). Never parse, normalize, or log its contents.
-	            runtime_enc: payload["agentRuntimeEnc"] || payload["agent_runtime_enc"],
-	            agent_actions_enc: payload["agentActionsEnc"] || payload["agent_actions_enc"],
-	            can_revert: payload["canRevert"] || payload["can_revert"] || false,
+            runtime_enc: payload["agentRuntimeEnc"] || payload["agent_runtime_enc"],
+            agent_actions_enc: payload["agentActionsEnc"] || payload["agent_actions_enc"],
+            can_revert: payload["canRevert"] || payload["can_revert"] || false,
             team_mode: payload["teamMode"] || payload["team_mode"],
             team_run_id: payload["teamRunId"] || payload["team_run_id"],
             team_worker: payload["teamWorker"] || payload["team_worker"],
@@ -239,6 +276,17 @@ defmodule VibeWeb.AgentBridgeChannel do
 
   def handle_in("heartbeat", _payload, socket), do: {:reply, :ok, socket}
   def handle_in(_event, _payload, socket), do: {:noreply, socket}
+
+  defp bridge_lag_ms(value, received_at_ms) when is_integer(value), do: received_at_ms - value
+
+  defp bridge_lag_ms(value, received_at_ms) when is_binary(value) do
+    case Integer.parse(value) do
+      {int, _} -> received_at_ms - int
+      _ -> nil
+    end
+  end
+
+  defp bridge_lag_ms(_, _), do: nil
 
   defp new_stream_id(chat_id) do
     "stream-" <> chat_id <> "-" <> Integer.to_string(System.system_time(:millisecond))

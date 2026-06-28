@@ -1405,11 +1405,14 @@ function runBridgeCommand(channel, task, repo, beforeGit, command) {
   const startedAt = Date.now();
   const output = bridgeCommandOutput(provider, chatId, task, repo, command);
   if (output == null) return false;
+  const lastRuntime = lastRuntimeBySession.get(sessionKey(provider, chatId));
 
   channel.push("progress", {
     provider,
     chatId,
     taskId,
+    sequence: 1,
+    sentAtMs: Date.now(),
     replyToId,
     repoId: repo.id,
     repoName: repo.name,
@@ -1442,6 +1445,13 @@ function runBridgeCommand(channel, task, repo, beforeGit, command) {
     canceled: false,
     output: "",
   });
+  if ((command.name === "usage" || command.name === "status") && lastRuntime && lastRuntime.usage) {
+    agentRuntime.usage = lastRuntime.usage;
+  }
+  agentRuntime.providerCommands = providerCommandCatalog(
+    provider,
+    capabilitiesByProvider.get(provider) || {}
+  ).bridge;
   rememberRuntime(provider, chatId, agentRuntime);
   channel.push("result", {
     provider,
@@ -1462,6 +1472,49 @@ function runBridgeCommand(channel, task, repo, beforeGit, command) {
   return true;
 }
 
+// The runtime card should reflect what THIS run changed, not the user's
+// pre-existing uncommitted work. `after` is the full `git diff HEAD`, which
+// includes files that were already dirty before the agent ran. Subtract every
+// file that is unchanged since the pre-run snapshot so a no-op turn (e.g. a
+// plain "Hi" that edits nothing) yields an EMPTY diff — which iOS renders as no
+// files-changed card at all (parseAgentRuntimeSummary returns nil on 0 files).
+function runAttributedDiff(cwd, before, after) {
+  if (!after || !after.git) return after;
+  // Clean repo before the run → everything in `after` is the agent's doing.
+  if (!before || !before.dirty) return after;
+  const beforeByPath = new Map();
+  for (const f of before.files || []) beforeByPath.set(f.path, f);
+  const files = (after.files || []).filter((f) => {
+    const prev = beforeByPath.get(f.path);
+    if (!prev) return true; // path first touched during this run
+    return (
+      (prev.additions || 0) !== (f.additions || 0) ||
+      (prev.deletions || 0) !== (f.deletions || 0) ||
+      (prev.status || "") !== (f.status || "")
+    );
+  });
+  // Nothing pre-existing overlapped → keep the original (incl. its full patch).
+  if (files.length === (after.files || []).length) return after;
+  const additions = files.reduce((s, f) => s + (f.additions || 0), 0);
+  const deletions = files.reduce((s, f) => s + (f.deletions || 0), 0);
+  // Re-scope the patch to the attributed paths so the diff viewer matches the
+  // card. Empty when the run changed nothing.
+  let patch = "";
+  let patchTruncated = false;
+  if (files.length) {
+    const tracked = files.filter((f) => f.status !== "A?").map((f) => f.path);
+    const trackedPatch = tracked.length
+      ? runGit(cwd, ["diff", "--no-ext-diff", "--unified=80", "HEAD", "--", ...tracked], MAX_DIFF_BYTES)
+      : "";
+    const newFiles = files.filter((f) => f.status === "A?");
+    const remaining = Math.max(0, MAX_DIFF_BYTES - trackedPatch.length);
+    const np = untrackedPatch(cwd, newFiles, remaining);
+    patch = trackedPatch + np.patch;
+    patchTruncated = patch.length >= MAX_DIFF_BYTES || np.truncated;
+  }
+  return { ...after, files, additions, deletions, patch, patchTruncated };
+}
+
 function runtimePayload({
   provider,
   task,
@@ -1475,7 +1528,9 @@ function runtimePayload({
   canceled,
   output,
 }) {
-  const fileSummary = after && after.git ? after : { files: [], additions: 0, deletions: 0, patch: "" };
+  const attributed = runAttributedDiff(repo.cwd || repo.path, before, after);
+  const fileSummary =
+    attributed && attributed.git ? attributed : { files: [], additions: 0, deletions: 0, patch: "" };
   const metadata = providerMetadataFromOutput(provider, output || "", task, task && task.chatId);
   const payload = {
     taskId,
@@ -1994,6 +2049,7 @@ function materializeAttachments(task, cwd) {
 }
 
 function runTask(channel, task) {
+  const recvAt = Date.now();
   const { provider, chatId, prompt, replyToId, requesterUserId } = task;
   const taskId = taskIdFor(task || {});
   console.log(
@@ -2020,6 +2076,10 @@ function runTask(channel, task) {
 
   const startedAt = Date.now();
   const beforeGit = gitSnapshot(cwd);
+  console.log(
+    `[vibe-bridge] latency gitSnapshot(before)=${Date.now() - startedAt}ms ` +
+      `chat=${chatId} task=${taskId} cwd=${cwd}`
+  );
   const bridgeCommand = parseBridgeCommand(prompt);
   if (bridgeCommand && runBridgeCommand(channel, task, repo, beforeGit, bridgeCommand)) {
     return;
@@ -2050,6 +2110,11 @@ function runTask(channel, task) {
     channel.push("error", { provider, chatId, message: `Could not start ${built.cmd}: ${err.message}`, replyToId });
     return;
   }
+  const spawnAt = Date.now();
+  console.log(
+    `[vibe-bridge] latency recv→spawn=${spawnAt - recvAt}ms ` +
+      `chat=${chatId} task=${taskId} cmd=${built.cmd}`
+  );
 
   const key = taskKey(provider, chatId, taskId);
   runningTasks.set(key, {
@@ -2119,9 +2184,19 @@ function runTask(channel, task) {
   let lineBuf = "";
   let progressCount = 1;
   let canceled = false;
+  let firstOutputLogged = false;
+  let lastProgressLogAt = 0;
 
   const onChunk = (buf) => {
     const text = buf.toString();
+    if (!firstOutputLogged) {
+      firstOutputLogged = true;
+      const now = Date.now();
+      console.log(
+        `[vibe-bridge] latency first-output spawn→first=${now - spawnAt}ms ` +
+          `recv→first=${now - recvAt}ms chat=${chatId} task=${taskId}`
+      );
+    }
     output += text;
     lineBuf += text;
     let idx;
@@ -2133,10 +2208,20 @@ function runTask(channel, task) {
       if (sid) sessionByChat.set(chatId, sid);
       if (progressCount < MAX_PROGRESS_LINES && line.length <= MAX_LINE_BYTES && streamable(line)) {
         progressCount++;
+        const now = Date.now();
+        if (progressCount <= 4 || progressCount % 10 === 0 || now - lastProgressLogAt > 5000) {
+          lastProgressLogAt = now;
+          console.log(
+            `[vibe-bridge] latency progress#${progressCount} recv→push=${now - recvAt}ms ` +
+              `spawn→push=${now - spawnAt}ms bytes=${output.length} chat=${chatId} task=${taskId}`
+          );
+        }
         channel.push("progress", {
           provider,
           chatId,
           taskId,
+          sequence: progressCount,
+          sentAtMs: now,
           replyToId,
           repoId: repo.id,
           repoName: repo.name,

@@ -2158,6 +2158,11 @@ private func bubbleParsedBlocks(for row: ChatListRow) -> [AgentParsedBlock] {
   let payload = bubbleBaseText(for: row)
   var blocks = ChatNativeAgentTextRenderer.parseBlocks(payload.text)
   func appendRuntimeIfNeeded() {
+    // Never surface the finished runtime/diff card while the turn is still
+    // streaming — the card is the END-of-turn summary; showing it mid-stream is
+    // the "card renders before streaming is done" bug. It reappears once the row
+    // is no longer live.
+    guard !row.isStreamingText else { return }
     guard let runtime = row.agentRuntime else {
       if row.isAgentMessage {
         NSLog("[AgentView] chatCell blocks: msg=\(row.messageId ?? row.key) runtime=nil -> NO card block (plain text only)")

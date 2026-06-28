@@ -175,8 +175,7 @@ final class ChatHomeCardCell: UITableViewCell {
       : UIColor.white.withAlphaComponent(0.84)
 
     titleLabel.text = row.title
-    let goldTextColor = UIColor(red: 244 / 255, green: 182 / 255, blue: 53 / 255, alpha: 1)
-    titleLabel.textColor = row.isGoldTier ? goldTextColor : primary
+    titleLabel.textColor = primary
     tierBadgeImageView.isHidden = !row.isGoldTier
     if row.isGoldTier {
       let goldColor = UIColor(red: 255 / 255, green: 205 / 255, blue: 84 / 255, alpha: 1)
@@ -185,7 +184,7 @@ final class ChatHomeCardCell: UITableViewCell {
     }
     previewLabel.text = row.isTyping ? "typing..." : row.preview
     previewLabel.textColor = row.isTyping ? typingColor : secondary
-    
+
     timeLabel.isHidden = showsRightCheckmark
     timeLabel.text = row.timeLabel
     timeLabel.textColor = secondary
@@ -208,7 +207,7 @@ final class ChatHomeCardCell: UITableViewCell {
     editSelectionBackgroundView.layer.borderColor = (isEditSelected ? badgeBackground : selectionRingColor).cgColor
     editSelectionCheckView.isHidden = !(isEditing && isEditSelected)
     editSelectionCheckView.tintColor = isDark ? UIColor.black : UIColor.white
-    
+
     rightCheckmarkView.isHidden = !showsRightCheckmark
     rightCheckmarkView.tintColor = isEditSelected ? badgeBackground : secondary.withAlphaComponent(0.3)
 
@@ -396,6 +395,7 @@ final class ChatHomeCardCell: UITableViewCell {
     titleLabel.font = .systemFont(ofSize: 17, weight: .medium)
     titleLabel.numberOfLines = 1
     titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    titleLabel.setContentHuggingPriority(.required, for: .horizontal)
 
     tierBadgeImageView.translatesAutoresizingMaskIntoConstraints = false
     tierBadgeImageView.contentMode = .scaleAspectFit
@@ -435,7 +435,16 @@ final class ChatHomeCardCell: UITableViewCell {
     rightCheckmarkView.contentMode = .scaleAspectFit
     rightCheckmarkView.isHidden = true
 
-    let titleRowStack = UIStackView(arrangedSubviews: [titleLabel, tierBadgeImageView])
+    let titleRowStack = UIStackView(arrangedSubviews: [
+      titleLabel,
+      tierBadgeImageView,
+      {
+        let spacer = UIView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        return spacer
+      }()
+    ])
     titleRowStack.translatesAutoresizingMaskIntoConstraints = false
     titleRowStack.axis = .horizontal
     titleRowStack.spacing = 6

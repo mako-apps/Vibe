@@ -670,7 +670,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
   // --- Native input bar ---
   private(set) var inputBar: ChatInputBar?
-  private(set) var agentComposerView: VibeComposerView?
   private var inputBarEnabled = false
   private var inputBarPlaceholder = "Message"
   var keyboardHeight: CGFloat = 0
@@ -4597,48 +4596,21 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         contentPaddingBottom = sectionBottomInset
         updateBottomAnchorInset()
       }
-      let isAgent = agentChatMode || currentBridgeProvider != nil
-      if isAgent {
-        let bar = VibeComposerView()
-        bar.placeholder = inputBarPlaceholder
-        bar.applyAppearance(appearance.isDark ? VibeAgentKitChatAppearance.fallback : VibeAgentKitChatAppearance.lightFallback)
-        bar.provider = currentBridgeProvider ?? "codex"
-        bar.onSend = { [weak self] text, options in
-            self?.inputBarDidSend(text: text)
-        }
-        bar.onAttach = { [weak self] in
-            self?.inputBarDidTapAttachment()
-        }
-        bar.onHeightChanged = { [weak self] height in
-            self?.inputBarHeightDidChange()
-        }
-        agentComposerView = bar
-        addSubview(bar)
-
-        inputBar?.removeFromSuperview()
-        inputBar = nil
-      } else {
-        let bar = ChatInputBar()
-        bar.delegate = self
-        bar.placeholder = inputBarPlaceholder
-        bar.applyAppearance(appearance)
-        bar.setAgentStreaming(agentStreaming)
-        bar.setAgentControlMode(false)
-        inputBar = bar
-        addSubview(bar)
-
-        agentComposerView?.removeFromSuperview()
-        agentComposerView = nil
-      }
+      let bar = ChatInputBar()
+      bar.delegate = self
+      bar.placeholder = inputBarPlaceholder
+      bar.applyAppearance(appearance)
+      bar.setAgentStreaming(agentStreaming)
+      bar.setAgentControlMode(agentChatMode || currentBridgeProvider != nil)
+      inputBar = bar
       updateAgentBridgeControlTitle()
 
+      addSubview(bar)
       positionTransitionOverlayHost()
       NSLog("[ChatListView] native input bar ENABLED")
     } else {
       inputBar?.removeFromSuperview()
       inputBar = nil
-      agentComposerView?.removeFromSuperview()
-      agentComposerView = nil
       positionTransitionOverlayHost()
       if abs(contentPaddingBottom - requestedContentPaddingBottom) > 0.5 {
         contentPaddingBottom = requestedContentPaddingBottom
@@ -4837,35 +4809,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   private func layoutInputBarAndInset() {
-    if let agentBar = agentComposerView {
-        let w = bounds.width
-        let h = bounds.height
-        guard w > 0, h > 0 else { return }
-        let distanceBeforeInsetChange = currentDistanceFromBottom()
-        let wasNearBottom = distanceBeforeInsetChange <= listBottomThreshold
-
-        let preferredHeight = agentBar.preferredHeight
-        let effectiveKeyboardHeight = keyboardHeight
-        let safeBottom = keyboardHeight > 0 ? 0 : safeAreaInsets.bottom
-
-        let finalHeight = preferredHeight
-        let finalY = h - effectiveKeyboardHeight - finalHeight
-
-        agentBar.frame = CGRect(x: 0, y: finalY, width: w, height: finalHeight)
-
-        let desiredBottomPadding = effectiveKeyboardHeight + finalHeight
-        if abs(contentPaddingBottom - desiredBottomPadding) > 0.5 {
-          contentPaddingBottom = desiredBottomPadding
-          updateBottomAnchorInset()
-          if wasNearBottom || shouldAutoScroll {
-            scrollToBottom(animated: false, force: true)
-          } else {
-            restoreStationaryDistance(distanceBeforeInsetChange)
-          }
-        }
-        return
-    }
-
     guard let bar = inputBar else { return }
     let w = bounds.width
     let h = bounds.height
@@ -5909,11 +5852,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     vc.runModel = AgentBridgeSelectionStore.selectedModel(provider: provider)
     vc.deviceLabel = AgentPairingService.lastDeviceLabel
     vc.deviceConnected = AgentPairingService.lastConnected
-    // Seed the header avatar identity so it renders the SAME avatar as the main chat
-    // view (gradient keyed by peer/chat + the fetched push picture), not a generic glyph.
-    vc.avatarTitle = displayName
-    vc.avatarPeerUserId = enginePeerUserId
-    vc.avatarChatId = engineChatId
     vc.hidesBottomBarWhenPushed = true
     vc.onPresentHistory = { [weak self] in
       self?.presentBridgeHistorySurface(provider: provider)
@@ -5999,10 +5937,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     vc.runModel = agentRow.agentRuntime?.model
     vc.deviceLabel = AgentPairingService.lastDeviceLabel
     vc.deviceConnected = AgentPairingService.lastConnected
-    // Match the main chat view's avatar (gradient + fetched picture) in the header.
-    vc.avatarTitle = agentRow.agentName ?? inputName
-    vc.avatarPeerUserId = enginePeerUserId
-    vc.avatarChatId = engineChatId
     // Hide any host tab bar while pushed so the composer reaches the true bottom
     // edge (no tab-bar strip/edge under the input).
     vc.hidesBottomBarWhenPushed = true
@@ -7571,13 +7505,13 @@ extension ChatListView: ChatInputBarDelegate {
       let selectedRows = rows.filter { selectedMessageIds.contains($0.messageId ?? "") }
       let textToShare = selectedRows.map { $0.text }.filter { !$0.isEmpty }.joined(separator: "\n\n")
       guard !textToShare.isEmpty else { return }
-
+      
       let activityVC = UIActivityViewController(activityItems: [textToShare], applicationActivities: nil)
       if let popover = activityVC.popoverPresentationController {
         popover.sourceView = inputBar
         popover.sourceRect = inputBar?.bounds ?? .zero
       }
-
+      
       // Find top view controller
       if let window = self.window, let rootVC = window.rootViewController {
         var topVC = rootVC
@@ -7586,12 +7520,12 @@ extension ChatListView: ChatInputBarDelegate {
         }
         topVC.present(activityVC, animated: true, completion: nil)
       }
-
+      
       // Optionally clear selection after sharing
       clearMessageSelection()
       return
     }
-
+    
     var event: [String: Any] = ["type": "inputActionPressed", "action": action]
     if let payload = payload {
       for (key, value) in payload {
@@ -7603,7 +7537,7 @@ extension ChatListView: ChatInputBarDelegate {
       event["messageIds"] = Array(selectedMessageIds)
     }
     onNativeEvent(event)
-
+    
     if action == "delete" {
       clearMessageSelection()
     }

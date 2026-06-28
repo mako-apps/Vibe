@@ -580,11 +580,10 @@ final class VibeAgentKitAgentLoaderView: UIControl {
     accessibilityTraits = onTap == nil ? [] : [.button]
 
     // Disclosure only on a finished, tappable summary ("Worked · N steps"); never
-    // while the live shimmer is running. A single chevron that ROTATES — pointing
-    // right when collapsed, down (rotated 90°) when expanded — so the open/closed
-    // direction reads at a glance.
+    // while the live shimmer is running. A single down chevron rotates from
+    // sideways-collapsed to down-open so the toggle does not visually swap symbols.
     disclosureIconView.isHidden = isStreaming || onTap == nil || progressItems.isEmpty
-    disclosureIconView.image = UIImage(systemName: "chevron.right")?
+    disclosureIconView.image = UIImage(systemName: "chevron.down")?
       .withRenderingMode(.alwaysTemplate)
     disclosureIconView.tintColor = appearance.isDark
       ? UIColor(white: 1.0, alpha: 0.5)
@@ -610,7 +609,7 @@ final class VibeAgentKitAgentLoaderView: UIControl {
   }
 
   private func applyDisclosureRotation(expanded: Bool, animated: Bool) {
-    let target = expanded ? CGAffineTransform(rotationAngle: .pi / 2.0) : .identity
+    let target = expanded ? CGAffineTransform.identity : CGAffineTransform(rotationAngle: -CGFloat.pi / 2.0)
     guard animated else { disclosureIconView.transform = target; return }
     UIView.animate(withDuration: 0.22, delay: 0.0, options: [.beginFromCurrentState]) {
       self.disclosureIconView.transform = target
@@ -753,7 +752,8 @@ final class VibeAgentKitAgentLoaderView: UIControl {
 
     disclosureIconView.translatesAutoresizingMaskIntoConstraints = false
     disclosureIconView.contentMode = .scaleAspectFit
-    disclosureIconView.image = UIImage(systemName: "chevron.right")
+    disclosureIconView.image = UIImage(systemName: "chevron.down")
+    disclosureIconView.transform = CGAffineTransform(rotationAngle: -CGFloat.pi / 2.0)
     disclosureIconView.isHidden = true
     disclosureIconView.setContentHuggingPriority(.required, for: .horizontal)
     disclosureIconView.setContentCompressionResistancePriority(.required, for: .horizontal)

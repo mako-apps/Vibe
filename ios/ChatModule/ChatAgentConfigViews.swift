@@ -202,27 +202,49 @@ struct ChatAgentAvatarView: View {
         return trimmed.isEmpty ? "?" : String(trimmed.prefix(1)).uppercased()
     }
 
+    @State private var image: UIImage?
+    @State private var loadedUrl: String?
+
     var body: some View {
         Group {
-            if let avatarUrl, let url = URL(string: avatarUrl) {
-                AsyncImage(url: url) { phase in
-                    switch phase {
-                    case .success(let image):
-                        image.resizable().scaledToFill()
-                    case .failure:
-                        placeholder
-                    case .empty:
-                        ZStack { placeholder; ProgressView() }
-                    @unknown default:
-                        placeholder
-                    }
-                }
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
             } else {
                 placeholder
             }
         }
         .frame(width: size, height: size)
         .clipShape(Circle())
+        .onAppear { loadInitial() }
+        .onChange(of: avatarUrl) { _ in
+            Task { await loadImage() }
+        }
+    }
+
+    private func loadInitial() {
+        if let avatarUrl, let cached = ChatAvatarImageStore.cached(for: avatarUrl) {
+            image = cached
+            loadedUrl = avatarUrl
+        } else {
+            Task { await loadImage() }
+        }
+    }
+
+    @MainActor
+    private func loadImage() async {
+        guard let url = avatarUrl?.trimmingCharacters(in: .whitespacesAndNewlines), !url.isEmpty else {
+            image = nil
+            loadedUrl = nil
+            return
+        }
+        if let fetched = await ChatAvatarImageStore.load(from: url) {
+            if loadedUrl != url {
+                image = fetched
+                loadedUrl = url
+            }
+        }
     }
 
     private var placeholder: some View {

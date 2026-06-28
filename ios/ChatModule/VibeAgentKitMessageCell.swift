@@ -333,17 +333,36 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     let lineHeight: CGFloat = 27.5
     let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
     let hasDisplayText = !trimmedText.isEmpty
+    let hasProgressItems = !progressItems.isEmpty
+    let hasToolProgressItems = progressItems.contains { $0.itemType != "text" }
     let showsLoader = isStreaming && !hasFinalResponseText
+    let runningStatuses: Set<String> = [
+      "active", "in-progress", "in_progress", "pending", "queued", "running", "streaming", "working",
+    ]
+    let hasRunningProgressItem = progressItems.contains { item in
+      guard let status = item.status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+        !status.isEmpty
+      else { return false }
+      return runningStatuses.contains(status)
+    }
+    let runtimeIsRunning: Bool = {
+      guard let status = runtime?.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+        !status.isEmpty
+      else { return false }
+      return runningStatuses.contains(status)
+    }()
+    let canShowCompletedWork =
+      !isStreaming && hasFinalResponseText && hasDisplayText && hasToolProgressItems
+      && !hasRunningProgressItem && !runtimeIsRunning
     isLiveTurn = showsLoader
 
     loaderView.applyAppearance(appearance)
     loaderView.onTap = onLoaderTap
 
-    let hasProgressItems = !progressItems.isEmpty
-    let shouldShowLoader = showsLoader || hasProgressItems
+    let shouldShowLoader = showsLoader || canShowCompletedWork
     // Only a finished turn can expand its step list inline; a live turn shows the
     // shimmer, not a static list.
-    let stepsExpanded = isProgressExpanded && hasProgressItems && !showsLoader
+    let stepsExpanded = isProgressExpanded && canShowCompletedWork
 
     if shouldShowLoader {
       let loaderText: String
@@ -385,14 +404,12 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     // live inside the tappable "Worked" card and reveal their command output / search
     // hits + diff counts when expanded.
     if showsLoader {
-      // Live turn: show the WHOLE turn so far, in order, at a consistent size — no
-      // dropping, no capping, no collapsing. The model just works and the feed grows
-      // downward; the trailing answer chunk renders as the body block right below it.
-      // (Earlier behaviour folded each chunk into a smaller card on the next arrival,
-      // which made the text "morph" out of and back into the work band.)
+      // Live turn: show the tool feed only as a live, non-interactive stream. It is
+      // never the completed "Worked" collapse, and it disappears into that collapse
+      // only once the final answer is present.
       updateStepsList(
         progressItems,
-        expanded: true,
+        expanded: hasProgressItems,
         interactive: false,
         appearance: appearance,
         streaming: true,
@@ -410,7 +427,7 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     // top-down and the consolidated patch isn't meaningful until it's done, so don't
     // flash an "edited file" card mid-stream. Live turns show the step feed instead.
     configureRuntimeSummary(
-      showsLoader ? nil : runtime,
+      (!isStreaming && hasDisplayText && !runtimeIsRunning) ? runtime : nil,
       textColor: appearance.text,
       availableWidth: availableWidth,
       onTap: onRuntimeTap
@@ -513,13 +530,10 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
       }
     }
 
-    // The "Worked …" summary always pins to the TOP of the turn — the agent works
-    // top-down (read → edit → run …) and only emits its final answer once it's
-    // done, so the collapsed work card belongs ABOVE the summary, never mid-answer.
-    // Live turns shimmer the in-flight step at the top; completed turns collapse the
-    // whole run into the tappable "Worked for X · N steps" card, with the answer
-    // rendered underneath it.
-    positionSummaryViews(belowText: false)
+    // Live turns keep the shimmer/feed above the answer as a real-time timeline.
+    // Completed turns put "Worked …" below the final answer, so opening file/read
+    // details grows downward and does not yank the already-rendered answer text.
+    positionSummaryViews(belowText: canShowCompletedWork)
   }
 
   /// Place the loader (Worked summary) + its expandable step list either at the TOP
@@ -684,6 +698,7 @@ private final class VibeAgentKitStepRowView: UIView {
   private let titleLabel = UILabel()
   private let chevron = UIImageView()
   private let detailStack = UIStackView()
+  private var isExpandedState = false
   var onToggle: (() -> Void)?
 
   override init(frame: CGRect) {
@@ -786,9 +801,21 @@ private final class VibeAgentKitStepRowView: UIView {
     chevron.isHidden = !expandable
     header.isUserInteractionEnabled = expandable
     if expandable {
-      let name = expanded ? "chevron.down" : "chevron.right"
-      chevron.image = UIImage(systemName: name)?.withRenderingMode(.alwaysTemplate)
+      chevron.image = UIImage(systemName: "chevron.down")?.withRenderingMode(.alwaysTemplate)
       chevron.tintColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.6)
+      let target = expanded ? CGAffineTransform.identity : CGAffineTransform(rotationAngle: -CGFloat.pi / 2.0)
+      if expanded != isExpandedState && chevron.window != nil {
+        UIView.animate(withDuration: 0.2, delay: 0.0, options: [.beginFromCurrentState]) {
+          self.chevron.transform = target
+        }
+      } else {
+        chevron.transform = target
+      }
+      isExpandedState = expanded
+    } else {
+      chevron.image = nil
+      chevron.transform = .identity
+      isExpandedState = false
     }
 
     detailStack.arrangedSubviews.forEach {
