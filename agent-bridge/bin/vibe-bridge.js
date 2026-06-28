@@ -382,6 +382,20 @@ function ensureBridgeInstructionsForRepositories(repositories) {
   for (const repo of repositories || []) ensureBridgeInstructionFiles(repo);
 }
 
+// The heavy "read AGENTS.md/CLAUDE.md + use the team handoff file" preamble is only
+// appropriate for real engineering / team work — injecting it on every casual DM
+// message made the agent eagerly go read the repo + team files for a plain "hi".
+// Gate it: inject only for team runs or when the user explicitly @mentions an
+// agent/team. A plain DM message gets just the user's prompt.
+function taskWantsBridgeInstructions(task, prompt) {
+  if (task) {
+    if (task.teamMode || task.team_mode || task.teamRunId || task.team_run_id) return true;
+    if (Array.isArray(task.teamWorkers) && task.teamWorkers.length) return true;
+    if (Array.isArray(task.teamWorker) && task.teamWorker.length) return true;
+  }
+  return /(^|\s)@(codex|claude|team|vibe)\b/i.test(String(prompt || ""));
+}
+
 function taskPromptWithBridgeInstructions(provider, prompt, repo) {
   const cleaned = stripReservedMention(prompt, provider);
   const ready = ensureBridgeInstructionFiles(repo);
@@ -853,15 +867,28 @@ function buildCommand(provider, prompt, chatId, task) {
     const sandbox = codexSandbox(task);
     const approvalPolicy = codexApprovalPolicy(task);
     const resumeId = resumeIdFor(task);
+    const reasoning = reasoningEffortFor(provider, task);
     // `codex exec resume <thread-id>` continues a prior thread; a bare `codex exec`
-    // starts fresh. Resume needs the persisted thread on disk, so we must NOT pass
-    // `--ephemeral` in that case (ephemeral runs leave nothing to resume).
+    // starts fresh. The `resume` subcommand REJECTS the exec-only flags
+    // `--sandbox`/`--model`/`--skip-git-repo-check` (its usage is
+    // `codex exec resume --json <SESSION_ID> [PROMPT]`), so passing them on resume
+    // failed with `error: unexpected argument '--sandbox'` (exit 2). Run config is
+    // therefore passed via `-c` overrides, which are global options accepted on both
+    // `codex exec` and `codex exec resume`. Options precede the positional
+    // SESSION_ID/PROMPT so clap doesn't mistake them for positionals.
     const args = ["exec"];
-    if (resumeId) args.push("resume", resumeId);
-    args.push("--json", "--sandbox", sandbox, "-c", `approval_policy="${approvalPolicy}"`, "--skip-git-repo-check");
-    if (!resumeId) args.push("--ephemeral");
-    if (model) args.push("--model", model);
-    args.push("-c", `model_reasoning_effort="${reasoningEffortFor(provider, task)}"`);
+    if (resumeId) args.push("resume");
+    args.push("--json");
+    args.push("-c", `sandbox_mode="${sandbox}"`);
+    args.push("-c", `approval_policy="${approvalPolicy}"`);
+    if (model) args.push("-c", `model="${model}"`);
+    args.push("-c", `model_reasoning_effort="${reasoning}"`);
+    if (!resumeId) {
+      // Fresh runs only: exec-specific flags the resume subcommand doesn't accept.
+      // Ephemeral runs leave nothing to resume, so they're never used on resume.
+      args.push("--skip-git-repo-check", "--ephemeral");
+    }
+    if (resumeId) args.push(resumeId);
     args.push(cleaned);
     return { cmd: process.env.VIBE_CODEX_COMMAND || "codex", args };
   }
@@ -2007,7 +2034,9 @@ function runTask(channel, task) {
       `The user attached ${attachments.length} image file(s) to this message. ` +
       `Use your file Read tool to view ${attachments.length === 1 ? "it" : "them"}:\n${lines}\n\n${prompt}`;
   }
-  const promptForCli = taskPromptWithBridgeInstructions(provider, effectivePrompt, repo);
+  const promptForCli = taskWantsBridgeInstructions(task, prompt)
+    ? taskPromptWithBridgeInstructions(provider, effectivePrompt, repo)
+    : effectivePrompt;
   const built = buildCommand(provider, promptForCli, chatId, task);
   if (!built) {
     channel.push("error", { provider, chatId, message: `Unknown provider: ${provider}` });
@@ -3442,11 +3471,36 @@ function markMessageRunning(message) {
   for (let i = nodes.length - 1; i >= 0; i--) {
     const node = nodes[i];
     if (!node || typeof node !== "object") continue;
+    if (String(node.kind || "").trim().toLowerCase() === "text") continue;
     const status = String(node.status || "").trim().toLowerCase();
     if (["failed", "error", "cancelled", "canceled", "stopped"].includes(status)) continue;
     node.status = "running";
     break;
   }
+  return message;
+}
+
+function unfoldRunningMessageText(message) {
+  if (!message || typeof message !== "object" || message.running !== true) return message;
+  const nodes = Array.isArray(message.progressNodes) ? message.progressNodes : [];
+  if (!nodes.length) return message;
+
+  const textParts = [];
+  const toolNodes = [];
+  for (const node of nodes) {
+    if (node && typeof node === "object" && String(node.kind || "").trim().toLowerCase() === "text") {
+      const text = String(node.label || "").trim();
+      if (text) textParts.push(text);
+    } else {
+      toolNodes.push(node);
+    }
+  }
+  if (!textParts.length) return message;
+
+  const current = String(message.text || "").trim();
+  if (current) textParts.push(current);
+  message.text = textParts.join("\n\n");
+  message.progressNodes = toolNodes;
   return message;
 }
 
@@ -3520,6 +3574,7 @@ function startHistoryWatch(channel, { chatId, provider, sessionId, echo }) {
         const running = !!runningEntry;
         if (running && last && last.role === "assistant") {
           markMessageRunning(last);
+          unfoldRunningMessageText(last);
         } else if (running) {
           const placeholder = runningPlaceholderMessage(runningEntry);
           if (placeholder) {

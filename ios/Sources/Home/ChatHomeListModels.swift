@@ -303,11 +303,17 @@ struct ChatHomeListRow {
   /// from the transcript and surfaces them via the Inbox banner. Mirrors the
   /// server's `friendAgentEventInboxMode`.
   let agentEventInboxMode: String?
+  /// Profile tier for the peer. Claude/Codex are seeded server-side as `gold`.
+  let peerTier: String?
   let previewRows: [[String: Any]]
   let initialMessages: [[String: Any]]
 
   var isBuiltInAgentSurface: Bool {
     Self.isBuiltInAgentChatId(chatId)
+  }
+
+  var isGoldTier: Bool {
+    peerTier?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "gold"
   }
 
   static func isBuiltInAgentChatId(_ rawChatId: String) -> Bool {
@@ -342,6 +348,7 @@ struct ChatHomeListRow {
     if let peerUserId { payload["peerUserId"] = peerUserId }
     if let peerAgentId { payload["peerAgentId"] = peerAgentId }
     if let agentEventInboxMode { payload["agentEventInboxMode"] = agentEventInboxMode }
+    if let peerTier { payload["peerTier"] = peerTier }
     if let avatarUri { payload["avatarUri"] = avatarUri }
     if let avatarGradientStartLight { payload["avatarGradientStartLight"] = avatarGradientStartLight }
     if let avatarGradientEndLight { payload["avatarGradientEndLight"] = avatarGradientEndLight }
@@ -376,6 +383,7 @@ struct ChatHomeListRow {
       isAgentFriend: isAgentFriend,
       peerAgentId: peerAgentId,
       agentEventInboxMode: agentEventInboxMode,
+      peerTier: peerTier,
       previewRows: previewRows,
       initialMessages: initialMessages
     )
@@ -454,6 +462,9 @@ struct ChatHomeListRow {
       raw["friendAgentEventInboxMode"] ?? raw["friend_agent_event_inbox_mode"]
         ?? raw["agentEventInboxMode"] ?? raw["agent_event_inbox_mode"] ?? raw["eventInboxMode"]
         ?? raw["event_inbox_mode"])
+    let peerTier = normalizedString(
+      raw["friendTier"] ?? raw["friend_tier"] ?? raw["peerTier"] ?? raw["peer_tier"]
+        ?? raw["tier"] ?? raw["badge"] ?? raw["badgeTier"] ?? raw["badge_tier"])
     let initialMessages = serverMessages
     let previewRows = parsePreviewRows(raw["previewRows"] ?? raw["preview_rows"])
 
@@ -481,6 +492,7 @@ struct ChatHomeListRow {
       isAgentFriend: isAgentFriend,
       peerAgentId: peerAgentId,
       agentEventInboxMode: agentEventInboxMode,
+      peerTier: peerTier,
       previewRows: previewRows,
       initialMessages: initialMessages
     )

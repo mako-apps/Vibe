@@ -157,11 +157,13 @@ public final class ChatMainView: UIView,
   private let rootWallpaperLayer = CAGradientLayer()
   private let pagesHost = UIView()
   private let chatPage = UIView()
-  // In-place host for the DM-level agent runtime view (Claude/Codex). Overlays the chat
-  // page below the shared header so switching chat⇄agent has no present/dismiss shift; the
-  // embedded VC suppresses its own header and the chat header provides the chrome.
-  private let bridgeAgentHost = UIView()
-  private weak var bridgeAgentVC: VibeAgentConversationViewController?
+  // The DM-level agent runtime view (Claude/Codex) is hosted FULL-SCREEN by the owning
+  // ChatConversationController (its own header + full bounds), NOT nested inside this view —
+  // nesting it below the shared header clipped its height and overlapped its content. These
+  // passthroughs let ChatListView's presence logic drive that isolated surface.
+  var onPresentBridgeAgentSurface: ((VibeAgentConversationViewController) -> Void)?
+  var onDismissBridgeAgentSurface: (() -> Void)?
+  var hostedBridgeAgentProviderProvider: (() -> String?)?
   private let pinnedBannerView = ChatPinnedBannerView()
   private let inboxBannerView = ChatPinnedBannerView()
   private let profilePage = UIView()
@@ -417,12 +419,22 @@ public final class ChatMainView: UIView,
     chatListView.setEnginePeerAgentId(value)
   }
 
+  /// Host controller asks (at view-appear) to mount the isolated agent surface as this DM's
+  /// primary page when its Default view is Agent — passing the provider straight from the route
+  /// so it mounts during the push (before the deferred peer-id binding) with no chat-view flash.
+  func presentPreferredAgentViewNow(provider: String) {
+    chatListView.presentPreferredAgentViewNow(provider: provider)
+  }
+
   func setBridgeProvider(_ value: String) {
     let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     guard bridgeProvider != normalized else { return }
     bridgeProvider = normalized
+    chatListView.setBridgeProvider(normalized)
     updateChatModeHeaderControls()
+    applyTheme()
     updateHeaderTexts()
+    updateProfileTexts()
     setNeedsLayout()
   }
 
@@ -853,19 +865,16 @@ public final class ChatMainView: UIView,
       self?.updateInboxBanner(count: count, latestPreview: latestPreview)
     }
 
-    // Host the DM-level agent runtime view in-place, above the chat page but below the
-    // profile/agent-prompt pages so those still slide over it.
-    pagesHost.addSubview(bridgeAgentHost)
-    bridgeAgentHost.isHidden = true
-    bridgeAgentHost.clipsToBounds = true
+    // The DM-level agent runtime view is hosted FULL-SCREEN by the owning controller;
+    // forward ChatListView's present/teardown/presence to it (no in-view nesting).
     chatListView.onHostBridgeAgentView = { [weak self] vc in
-      self?.hostBridgeAgentView(vc)
+      self?.onPresentBridgeAgentSurface?(vc)
     }
     chatListView.onTearDownBridgeAgentView = { [weak self] in
-      self?.tearDownBridgeAgentView()
+      self?.onDismissBridgeAgentSurface?()
     }
     chatListView.hostedBridgeAgentProvider = { [weak self] in
-      self?.bridgeAgentVC?.agentBridgeProvider
+      self?.hostedBridgeAgentProviderProvider?()
     }
 
     pagesHost.addSubview(profilePage)
@@ -3101,10 +3110,6 @@ public final class ChatMainView: UIView,
       x: 0.0, y: -headerHeight,
       width: pageWidth, height: pageHeight + headerHeight)
     chatListView.frame = chatPage.bounds
-    // The agent host fills the area below the header (not behind it — its feed/composer
-    // start under the shared header pill).
-    bridgeAgentHost.frame = CGRect(x: 0.0, y: 0.0, width: pageWidth, height: pageHeight)
-    bridgeAgentVC?.view.frame = bridgeAgentHost.bounds
     let bannerWidth = max(0.0, pageWidth - 32.0)
     pinnedBannerView.frame = CGRect(
       x: 16.0,
@@ -3396,11 +3401,16 @@ public final class ChatMainView: UIView,
       ? UIColor(red: 83.0 / 255.0, green: 224.0 / 255.0, blue: 138.0 / 255.0, alpha: 1.0)
       : appearance.timeColorThem.withAlphaComponent(0.32)
     profileOnlineDotView.layer.borderColor = profileBackground.cgColor
-    profileNameLabel.textColor = text
-    profileHandleLabel.textColor =
-      isOnline
-      ? UIColor(red: 83.0 / 255.0, green: 224.0 / 255.0, blue: 138.0 / 255.0, alpha: 1.0)
-      : secondary
+    let profileGoldColor = UIColor(red: 244 / 255, green: 182 / 255, blue: 53 / 255, alpha: 1)
+    profileNameLabel.textColor = bridgeProvider.isEmpty ? text : profileGoldColor
+    if !bridgeProvider.isEmpty {
+      profileHandleLabel.textColor = profileGoldColor.withAlphaComponent(0.92)
+    } else if isOnline {
+      profileHandleLabel.textColor =
+        UIColor(red: 83.0 / 255.0, green: 224.0 / 255.0, blue: 138.0 / 255.0, alpha: 1.0)
+    } else {
+      profileHandleLabel.textColor = secondary
+    }
     profileBioLabel.textColor = secondary
 
     profileMuteButton.applyTheme(foreground: text, background: actionBg)
@@ -3781,6 +3791,7 @@ public final class ChatMainView: UIView,
         iconBackgroundColor: appearance.bubbleThemColor.withAlphaComponent(0.35)
       )
     } else {
+      let goldProfileColor = UIColor(red: 244 / 255, green: 182 / 255, blue: 53 / 255, alpha: 1)
       let usernameRowSubtitle: String
       if profileHandleText.isEmpty {
         usernameRowSubtitle =
@@ -3796,10 +3807,13 @@ public final class ChatMainView: UIView,
       profileUsernameRow.configure(
         title: "Username",
         subtitle: usernameRowSubtitle,
-        titleColor: appearance.bubbleMeGradient.last ?? appearance.textColorMe,
+        titleColor: bridgeProvider.isEmpty
+          ? (appearance.bubbleMeGradient.last ?? appearance.textColorMe)
+          : goldProfileColor,
         showsSeparator: hasBioRow,
         iconName: "at",
-        iconTintColor: appearance.textColorMe.withAlphaComponent(0.95),
+        iconTintColor: (bridgeProvider.isEmpty ? appearance.textColorMe : goldProfileColor)
+          .withAlphaComponent(0.95),
         iconBackgroundColor: appearance.bubbleThemColor.withAlphaComponent(0.35)
       )
       profileBioRow.configure(
@@ -4146,49 +4160,6 @@ public final class ChatMainView: UIView,
   }
 
   // MARK: - In-place agent runtime host
-
-  /// Walk the responder chain to the view controller that owns this view, so the embedded
-  /// agent runtime VC can be added as a proper child (lifecycle + appearance callbacks).
-  private func owningViewController() -> UIViewController? {
-    var responder: UIResponder? = self.next
-    while let current = responder {
-      if let vc = current as? UIViewController { return vc }
-      responder = current.next
-    }
-    return nil
-  }
-
-  /// Embed the DM-level agent runtime view in-place: it fills the body below the shared
-  /// chat header (which already shows the model + device for a bridge DM), so there's no
-  /// present/dismiss shift when switching chat⇄agent. The host sits above the chat page
-  /// but below the profile/agent-prompt pages, which still slide over it.
-  private func hostBridgeAgentView(_ vc: VibeAgentConversationViewController) {
-    guard let owner = owningViewController() else {
-      // Not in a VC hierarchy yet — retry on the next runloop.
-      DispatchQueue.main.async { [weak self] in self?.hostBridgeAgentView(vc) }
-      return
-    }
-    tearDownBridgeAgentView()
-    bridgeAgentVC = vc
-    owner.addChild(vc)
-    vc.view.frame = bridgeAgentHost.bounds
-    vc.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-    bridgeAgentHost.addSubview(vc.view)
-    vc.didMove(toParent: owner)
-    bridgeAgentHost.isHidden = false
-    setNeedsLayout()
-    layoutIfNeeded()
-  }
-
-  /// Remove any embedded agent runtime view (DM change / teardown).
-  private func tearDownBridgeAgentView() {
-    bridgeAgentHost.isHidden = true
-    guard let vc = bridgeAgentVC else { return }
-    vc.willMove(toParent: nil)
-    vc.view.removeFromSuperview()
-    vc.removeFromParent()
-    bridgeAgentVC = nil
-  }
 
   private func applyPageState(animated: Bool, emitEvent: Bool) {
     updateHeaderTexts()

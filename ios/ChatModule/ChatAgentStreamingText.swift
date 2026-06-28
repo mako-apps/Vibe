@@ -451,9 +451,9 @@ final class AgentRuntimeSummaryView: UIView {
 
       nameLabel.textColor = textColor.withAlphaComponent(0.94)
       pathLabel.textColor = textColor.withAlphaComponent(0.56)
-      statsLabel.textColor = UIColor.systemGreen
+      statsLabel.textColor = VibeAgentDiffPalette.additionText
       if file.deletions > file.additions {
-        statsLabel.textColor = UIColor.systemRed
+        statsLabel.textColor = VibeAgentDiffPalette.deletionText
       }
       statusLabel.textColor = textColor.withAlphaComponent(0.78)
       statusLabel.backgroundColor = textColor.withAlphaComponent(0.10)
@@ -563,7 +563,7 @@ final class AgentRuntimeSummaryView: UIView {
 
     titleLabel.textColor = textColor.withAlphaComponent(0.96)
     statsLabel.textColor = (diff?.deletions ?? 0) > (diff?.additions ?? 0)
-      ? UIColor.systemRed : UIColor.systemGreen
+      ? VibeAgentDiffPalette.deletionText : VibeAgentDiffPalette.additionText
     repoLabel.textColor = textColor.withAlphaComponent(0.62)
     commandLabel.textColor = textColor.withAlphaComponent(0.62)
     dirtyLabel.textColor = UIColor.systemOrange
@@ -1307,10 +1307,10 @@ private final class AgentRuntimePatchPreviewController: UIViewController {
     let baseColor: UIColor = appearance.isDark ? .white : .label
     let muted: UIColor = appearance.isDark
       ? UIColor.white.withAlphaComponent(0.45) : UIColor.label.withAlphaComponent(0.45)
-    let addText = UIColor.systemGreen
-    let delText = UIColor.systemRed
-    let addBg = UIColor.systemGreen.withAlphaComponent(appearance.isDark ? 0.16 : 0.12)
-    let delBg = UIColor.systemRed.withAlphaComponent(appearance.isDark ? 0.16 : 0.12)
+    let addText = VibeAgentDiffPalette.additionText
+    let delText = VibeAgentDiffPalette.deletionText
+    let addBg = VibeAgentDiffPalette.additionBackground(isDark: appearance.isDark)
+    let delBg = VibeAgentDiffPalette.deletionBackground(isDark: appearance.isDark)
     let hunkColor: UIColor = appearance.isDark
       ? UIColor.systemTeal : UIColor.systemBlue
 

@@ -151,6 +151,7 @@ enum ChatHomeService {
       isAgentFriend: true,
       peerAgentId: nil,
       agentEventInboxMode: nil,
+      peerTier: nil,
       previewRows: [],
       initialMessages: []
     )
@@ -213,6 +214,7 @@ enum ChatHomeService {
         isAgentFriend: false,
         peerAgentId: nil,
         agentEventInboxMode: nil,
+        peerTier: nil,
         previewRows: [],
         initialMessages: ChatHomeListRow.parseServerMessages(messages)
       )

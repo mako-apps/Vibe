@@ -165,45 +165,32 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
   }
 
   // Build the rows shown when "Worked · N steps" is expanded. Narration ("text")
-  // nodes render as prose at the streaming body size (so the in-card voice matches
-  // the answer below); every tool node renders as an expandable `StepRowView` — a
-  // collapsed preview (verb/target, or the raw command for bash, + a chevron) that
-  // opens its own detail layer on tap (command + result code box, edit patch, read
-  // file slice). `interactive` is false on a live turn (previews only, no toggles).
+  // nodes render with the same font/color/parser as the normal streaming answer.
+  // Tool nodes render as expandable `StepRowView`s.
   private func updateStepsList(
     _ items: [VibeAgentKitProgressItem],
     expanded: Bool,
     interactive: Bool,
     appearance: VibeAgentKitChatAppearance,
-    streaming: Bool = false
+    streaming: Bool = false,
+    availableWidth: CGFloat
   ) {
     clearStepsList()
     guard expanded, !items.isEmpty else { return }
+    stepsStack.spacing = streaming ? 7.0 : 11.0
+    stepsStack.layoutMargins = streaming
+      ? UIEdgeInsets(top: 2.0, left: 6.0, bottom: 4.0, right: 0.0)
+      : UIEdgeInsets(top: 3.0, left: 6.0, bottom: 4.0, right: 0.0)
     for item in items {
       if item.itemType == "text" {
         let narration = item.label.trimmingCharacters(in: .whitespacesAndNewlines)
         if narration.isEmpty { continue }
-        let textLabel = UILabel()
-        textLabel.numberOfLines = 0
-        textLabel.translatesAutoresizingMaskIntoConstraints = false
-        // While the turn is LIVE, narration renders at the full answer size/color so
-        // the in-order feed reads as one body of prose — and so a chunk doesn't visibly
-        // shrink/morph when the next one arrives and folds it into the feed. Once the
-        // turn is DONE and tucked inside the collapsed "Worked" card, narration drops to
-        // the subordinate, slightly-muted size so the final answer below leads.
-        let narrationFont = streaming
-          ? UIFont.systemFont(ofSize: 18.0, weight: .regular)
-          : UIFont.systemFont(ofSize: 15.5, weight: .regular)
-        let narrationColor = streaming
-          ? appearance.text
-          : vibeAgentKitColorWithAlpha(appearance.text, 0.82)
-        textLabel.attributedText = VibeAgentKitTextRenderer.makeAttributedText(
-          text: narration,
-          font: narrationFont,
-          textColor: narrationColor,
-          lineHeight: streaming ? 27.5 : 22.0
-        )
-        stepsStack.addArrangedSubview(textLabel)
+        stepsStack.addArrangedSubview(
+          narrationWorkLogView(
+            text: narration,
+            streaming: streaming,
+            appearance: appearance,
+            availableWidth: availableWidth))
         continue
       }
       let nodeId = item.nodeId ?? item.label
@@ -213,7 +200,7 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
         item: item,
         // A live feed shows compact previews only (no inline detail — taps are off
         // until the turn is done); a finished feed makes each row tap-to-open.
-        expanded: false,
+        expanded: interactive && expandedStepIds.contains(nodeId),
         interactive: interactive,
         appearance: appearance
       )
@@ -221,6 +208,64 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
       stepsStack.addArrangedSubview(row)
     }
     stepsStack.isHidden = false
+  }
+
+  private func narrationWorkLogView(
+    text: String,
+    streaming: Bool,
+    appearance: VibeAgentKitChatAppearance,
+    availableWidth: CGFloat
+  ) -> UIView {
+    let stack = UIStackView()
+    stack.translatesAutoresizingMaskIntoConstraints = false
+    stack.axis = .vertical
+    stack.alignment = .fill
+    stack.distribution = .fill
+    stack.spacing = 9.0
+    stack.isLayoutMarginsRelativeArrangement = true
+    stack.layoutMargins = streaming
+      ? UIEdgeInsets(top: 0.0, left: 0.0, bottom: 0.0, right: 0.0)
+      : UIEdgeInsets(top: 0.0, left: 0.0, bottom: 2.0, right: 0.0)
+
+    let font = UIFont.systemFont(ofSize: 18.0, weight: .regular)
+    let color = appearance.text
+    let lineHeight: CGFloat = 27.5
+    let contentWidth = max(120.0, availableWidth - stepsStack.layoutMargins.left - stepsStack.layoutMargins.right)
+    let blocks = VibeAgentKitTextRenderer.parseBlocks(text)
+
+    for (index, block) in blocks.enumerated() {
+      switch block {
+      case .text(let content):
+        let label = UILabel()
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.numberOfLines = 0
+        label.backgroundColor = .clear
+        label.attributedText = VibeAgentKitTextRenderer.makeAttributedText(
+          text: content,
+          font: font,
+          textColor: color,
+          lineHeight: lineHeight
+        )
+        stack.addArrangedSubview(label)
+
+      case .code(let code, let language):
+        let codeView = VibeAgentKitCodeBlockView()
+        codeView.translatesAutoresizingMaskIntoConstraints = false
+        let height = codeView.configure(
+          code: code,
+          language: language,
+          textColor: color,
+          baseFont: font,
+          availableWidth: contentWidth,
+          storageKey: "worklog-\(text.hashValue)-\(index)"
+        )
+        let heightConstraint = codeView.heightAnchor.constraint(equalToConstant: height)
+        heightConstraint.priority = .defaultHigh
+        heightConstraint.isActive = true
+        stack.addArrangedSubview(codeView)
+      }
+    }
+    return stack
   }
 
   /// Color the "+N" additions green and "−N" deletions red inside a step label so the
@@ -244,7 +289,8 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     for match in regex.matches(in: string, range: NSRange(location: 0, length: full.length)) {
       let isAdd = full.substring(with: match.range).hasPrefix("+")
       attributed.addAttribute(
-        .foregroundColor, value: isAdd ? UIColor.systemGreen : UIColor.systemRed,
+        .foregroundColor,
+        value: isAdd ? VibeAgentDiffPalette.additionText : VibeAgentDiffPalette.deletionText,
         range: match.range)
       attributed.addAttribute(
         .font, value: UIFont.systemFont(ofSize: font.pointSize, weight: .semibold),
@@ -345,9 +391,19 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
       // (Earlier behaviour folded each chunk into a smaller card on the next arrival,
       // which made the text "morph" out of and back into the work band.)
       updateStepsList(
-        progressItems, expanded: true, interactive: false, appearance: appearance, streaming: true)
+        progressItems,
+        expanded: true,
+        interactive: false,
+        appearance: appearance,
+        streaming: true,
+        availableWidth: availableWidth)
     } else {
-      updateStepsList(progressItems, expanded: stepsExpanded, interactive: true, appearance: appearance)
+      updateStepsList(
+        progressItems,
+        expanded: stepsExpanded,
+        interactive: true,
+        appearance: appearance,
+        availableWidth: availableWidth)
     }
 
     // The file-change / diff card belongs to a FINISHED turn only — the agent works
@@ -488,8 +544,8 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     // stream, so keep the gaps tight (no big void between the streaming text and the
     // work feed). Once DONE, give the collapsed "Worked" card a clear gap above the
     // final answer so the two read as distinct bands.
-    stackView.setCustomSpacing(isLiveTurn ? 6.0 : 10.0, after: loaderView)
-    stackView.setCustomSpacing(isLiveTurn ? 6.0 : 14.0, after: stepsStack)
+    stackView.setCustomSpacing(isLiveTurn ? 6.0 : 8.0, after: loaderView)
+    stackView.setCustomSpacing(isLiveTurn ? 6.0 : 8.0, after: stepsStack)
   }
 
   // Completed-turn summary line. Matches the Claude Code / Codex "Worked for Xs"
@@ -642,7 +698,7 @@ private final class VibeAgentKitStepRowView: UIView {
     container.translatesAutoresizingMaskIntoConstraints = false
     container.axis = .vertical
     container.alignment = .fill
-    container.spacing = 6.0
+    container.spacing = 8.0
     addSubview(container)
     NSLayoutConstraint.activate([
       container.topAnchor.constraint(equalTo: topAnchor),
@@ -665,8 +721,8 @@ private final class VibeAgentKitStepRowView: UIView {
     header.addSubview(chevron)
     NSLayoutConstraint.activate([
       titleLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor),
-      titleLabel.topAnchor.constraint(equalTo: header.topAnchor, constant: 2.0),
-      titleLabel.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -2.0),
+      titleLabel.topAnchor.constraint(equalTo: header.topAnchor, constant: 5.0),
+      titleLabel.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -5.0),
       chevron.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 8.0),
       chevron.trailingAnchor.constraint(equalTo: header.trailingAnchor),
       chevron.centerYAnchor.constraint(equalTo: titleLabel.firstBaselineAnchor, constant: -5.0),
@@ -679,9 +735,9 @@ private final class VibeAgentKitStepRowView: UIView {
     detailStack.translatesAutoresizingMaskIntoConstraints = false
     detailStack.axis = .vertical
     detailStack.alignment = .fill
-    detailStack.spacing = 6.0
+    detailStack.spacing = 8.0
     detailStack.isLayoutMarginsRelativeArrangement = true
-    detailStack.layoutMargins = UIEdgeInsets(top: 0.0, left: 2.0, bottom: 4.0, right: 0.0)
+    detailStack.layoutMargins = UIEdgeInsets(top: 2.0, left: 8.0, bottom: 8.0, right: 0.0)
     detailStack.isHidden = true
     container.addArrangedSubview(detailStack)
   }
@@ -720,7 +776,7 @@ private final class VibeAgentKitStepRowView: UIView {
       para.lineBreakMode = .byTruncatingTail
       titleLabel.attributedText = VibeAgentKitAssistantMessageBodyView.styledStepLabel(
         labelText,
-        font: UIFont.systemFont(ofSize: 15.5, weight: .regular),
+        font: UIFont.systemFont(ofSize: 14.75, weight: .regular),
         baseColor: appearance.textSecondary,
         paragraph: para
       )
@@ -832,7 +888,7 @@ private final class VibeAgentKitStepRowView: UIView {
     inner.translatesAutoresizingMaskIntoConstraints = false
     inner.axis = .vertical
     inner.alignment = .fill
-    inner.spacing = 10.0
+    inner.spacing = 12.0
     card.addSubview(inner)
 
     let mono = UIFont.monospacedSystemFont(ofSize: 13.0, weight: .regular)
@@ -879,16 +935,16 @@ private final class VibeAgentKitStepRowView: UIView {
     let status = UILabel()
     status.translatesAutoresizingMaskIntoConstraints = false
     status.font = UIFont.systemFont(ofSize: 12.0, weight: .semibold)
-    status.textColor = isError ? .systemRed : .systemGreen
+    status.textColor = isError ? VibeAgentDiffPalette.deletionText : VibeAgentDiffPalette.additionText
     status.text = isError ? "✕ Failed" : "✓ Success"
     status.textAlignment = .right
     inner.addArrangedSubview(status)
 
     NSLayoutConstraint.activate([
-      inner.topAnchor.constraint(equalTo: card.topAnchor, constant: 12.0),
-      inner.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -12.0),
-      inner.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 12.0),
-      inner.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -12.0),
+      inner.topAnchor.constraint(equalTo: card.topAnchor, constant: 14.0),
+      inner.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14.0),
+      inner.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14.0),
+      inner.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14.0),
     ])
     return card
   }
@@ -904,7 +960,7 @@ private final class VibeAgentKitStepRowView: UIView {
     box.translatesAutoresizingMaskIntoConstraints = false
     box.backgroundColor = vibeAgentKitColorWithAlpha(
       appearance.isDark ? UIColor.white : UIColor.black, appearance.isDark ? 0.05 : 0.04)
-    box.layer.cornerRadius = 8.0
+    box.layer.cornerRadius = 10.0
     box.layer.cornerCurve = .continuous
     if let accent {
       box.layer.borderWidth = 1.0
@@ -927,10 +983,10 @@ private final class VibeAgentKitStepRowView: UIView {
     )
     box.addSubview(label)
     NSLayoutConstraint.activate([
-      label.topAnchor.constraint(equalTo: box.topAnchor, constant: 9.0),
-      label.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 11.0),
-      label.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -11.0),
-      label.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -9.0),
+      label.topAnchor.constraint(equalTo: box.topAnchor, constant: 11.0),
+      label.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 13.0),
+      label.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -13.0),
+      label.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -11.0),
     ])
     return box
   }
@@ -942,7 +998,7 @@ private final class VibeAgentKitStepRowView: UIView {
     box.translatesAutoresizingMaskIntoConstraints = false
     box.backgroundColor = vibeAgentKitColorWithAlpha(
       appearance.isDark ? UIColor.white : UIColor.black, appearance.isDark ? 0.05 : 0.04)
-    box.layer.cornerRadius = 8.0
+    box.layer.cornerRadius = 10.0
     box.layer.cornerCurve = .continuous
     let label = UILabel()
     label.translatesAutoresizingMaskIntoConstraints = false
@@ -951,10 +1007,10 @@ private final class VibeAgentKitStepRowView: UIView {
     label.attributedText = Self.diffAttributed(patch, appearance: appearance)
     box.addSubview(label)
     NSLayoutConstraint.activate([
-      label.topAnchor.constraint(equalTo: box.topAnchor, constant: 9.0),
-      label.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 11.0),
-      label.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -11.0),
-      label.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -9.0),
+      label.topAnchor.constraint(equalTo: box.topAnchor, constant: 11.0),
+      label.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 13.0),
+      label.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -13.0),
+      label.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -11.0),
     ])
     return box
   }
@@ -974,9 +1030,9 @@ private final class VibeAgentKitStepRowView: UIView {
     for (index, line) in lines.enumerated() {
       let color: UIColor
       if line.hasPrefix("+") && !line.hasPrefix("+++") {
-        color = .systemGreen
+        color = VibeAgentDiffPalette.additionText
       } else if line.hasPrefix("-") && !line.hasPrefix("---") {
-        color = .systemRed
+        color = VibeAgentDiffPalette.deletionText
       } else if line.hasPrefix("@@") {
         color = muted
       } else if line.hasPrefix("diff ") || line.hasPrefix("---") || line.hasPrefix("+++")
@@ -987,10 +1043,19 @@ private final class VibeAgentKitStepRowView: UIView {
         color = appearance.text
       }
       let suffix = index == lines.count - 1 ? "" : "\n"
-      result.append(
-        NSAttributedString(
-          string: line + suffix,
-          attributes: [.font: mono, .foregroundColor: color, .paragraphStyle: para]))
+      var attributes: [NSAttributedString.Key: Any] = [
+        .font: mono,
+        .foregroundColor: color,
+        .paragraphStyle: para,
+      ]
+      if line.hasPrefix("+") && !line.hasPrefix("+++") {
+        attributes[.backgroundColor] = VibeAgentDiffPalette.additionBackground(
+          isDark: appearance.isDark)
+      } else if line.hasPrefix("-") && !line.hasPrefix("---") {
+        attributes[.backgroundColor] = VibeAgentDiffPalette.deletionBackground(
+          isDark: appearance.isDark)
+      }
+      result.append(NSAttributedString(string: line + suffix, attributes: attributes))
     }
     return result
   }
@@ -1819,7 +1884,7 @@ final class VibeAgentKitStepDetailViewController: UIViewController {
     let status = UILabel()
     status.translatesAutoresizingMaskIntoConstraints = false
     status.font = UIFont.systemFont(ofSize: 12.5, weight: .semibold)
-    status.textColor = isError ? .systemRed : .systemGreen
+    status.textColor = isError ? VibeAgentDiffPalette.deletionText : VibeAgentDiffPalette.additionText
     status.text = isError ? "✕ Failed" : "✓ Success"
     status.textAlignment = .right
     inner.addArrangedSubview(status)
@@ -1879,19 +1944,28 @@ final class VibeAgentKitStepDetailViewController: UIViewController {
     for (idx, line) in lines.enumerated() {
       let color: UIColor
       if line.hasPrefix("+") && !line.hasPrefix("+++") {
-        color = .systemGreen
+        color = VibeAgentDiffPalette.additionText
       } else if line.hasPrefix("-") && !line.hasPrefix("---") {
-        color = .systemRed
+        color = VibeAgentDiffPalette.deletionText
       } else if line.hasPrefix("@@") {
         color = appearance.primary
       } else {
         color = appearance.text
       }
       let suffix = idx == lines.count - 1 ? "" : "\n"
-      result.append(
-        NSAttributedString(
-          string: line + suffix,
-          attributes: [.font: font, .foregroundColor: color, .paragraphStyle: para]))
+      var attributes: [NSAttributedString.Key: Any] = [
+        .font: font,
+        .foregroundColor: color,
+        .paragraphStyle: para,
+      ]
+      if line.hasPrefix("+") && !line.hasPrefix("+++") {
+        attributes[.backgroundColor] = VibeAgentDiffPalette.additionBackground(
+          isDark: appearance.isDark)
+      } else if line.hasPrefix("-") && !line.hasPrefix("---") {
+        attributes[.backgroundColor] = VibeAgentDiffPalette.deletionBackground(
+          isDark: appearance.isDark)
+      }
+      result.append(NSAttributedString(string: line + suffix, attributes: attributes))
     }
     return result
   }

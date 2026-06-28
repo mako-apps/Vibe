@@ -489,7 +489,9 @@ struct AgentBridgeHistoryInlineView: View {
         VStack(alignment: .leading, spacing: 5) {
           HStack(spacing: 7) {
             if session.isRunning {
-              Circle().fill(Color.green).frame(width: 8, height: 8)
+              ProgressView()
+                .controlSize(.small)
+                .tint(palette.secondaryText)
             }
             Text(session.topic)
               .font(.system(size: 18, weight: .regular))
@@ -508,7 +510,7 @@ struct AgentBridgeHistoryInlineView: View {
             }
           }
           .font(.system(size: 12))
-          .foregroundStyle(session.isRunning ? Color.green.opacity(0.9) : palette.secondaryText)
+          .foregroundStyle(palette.secondaryText)
         }
         Spacer(minLength: 8)
         Image(systemName: "chevron.right")

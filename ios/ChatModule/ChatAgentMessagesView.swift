@@ -996,7 +996,7 @@ private final class ChatNativeAgentProgressTreeView: UIView {
     case "bash": verb = "Run"
     case "search": verb = "Search"
     case "web": verb = "Fetch"
-    case "task": verb = "Task"
+    case "task": verb = "Step"
     case "todo": return "Planning"
     default: return node.label
     }
@@ -1015,8 +1015,6 @@ private final class ChatNativeAgentProgressTreeView: UIView {
 
   private func normalizedNodeStatus(_ status: String) -> String {
     switch status.lowercased() {
-    case "done", "complete", "completed", "success", "ok":
-      return "complete"
     case "error", "failed", "failure":
       return "error"
     default:

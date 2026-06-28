@@ -40,6 +40,7 @@ final class ChatHomeCardCell: UITableViewCell {
   private let onlineDot = UIView()
 
   private let titleLabel = UILabel()
+  private let tierBadgeImageView = UIImageView()
   private let previewLabel = UILabel()
   private let timeLabel = UILabel()
   private let unreadBadge = UIView()
@@ -97,6 +98,7 @@ final class ChatHomeCardCell: UITableViewCell {
     avatarFallbackIconView.isHidden = false
     avatarContainer.layer.sublayers?.removeAll(where: { $0.name == self.avatarGradientLayerName })
     unreadBadge.isHidden = true
+    tierBadgeImageView.isHidden = true
     muteIconView.isHidden = true
     pinIconView.isHidden = true
     selectionOverlayView.alpha = 0
@@ -173,7 +175,14 @@ final class ChatHomeCardCell: UITableViewCell {
       : UIColor.white.withAlphaComponent(0.84)
 
     titleLabel.text = row.title
-    titleLabel.textColor = primary
+    let goldTextColor = UIColor(red: 244 / 255, green: 182 / 255, blue: 53 / 255, alpha: 1)
+    titleLabel.textColor = row.isGoldTier ? goldTextColor : primary
+    tierBadgeImageView.isHidden = !row.isGoldTier
+    if row.isGoldTier {
+      let goldColor = UIColor(red: 255 / 255, green: 205 / 255, blue: 84 / 255, alpha: 1)
+      tierBadgeImageView.image = UIImage(systemName: "checkmark.seal.fill")
+      tierBadgeImageView.tintColor = goldColor
+    }
     previewLabel.text = row.isTyping ? "typing..." : row.preview
     previewLabel.textColor = row.isTyping ? typingColor : secondary
     
@@ -386,6 +395,13 @@ final class ChatHomeCardCell: UITableViewCell {
     titleLabel.translatesAutoresizingMaskIntoConstraints = false
     titleLabel.font = .systemFont(ofSize: 17, weight: .medium)
     titleLabel.numberOfLines = 1
+    titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+    tierBadgeImageView.translatesAutoresizingMaskIntoConstraints = false
+    tierBadgeImageView.contentMode = .scaleAspectFit
+    tierBadgeImageView.isHidden = true
+    tierBadgeImageView.setContentHuggingPriority(.required, for: .horizontal)
+    tierBadgeImageView.setContentCompressionResistancePriority(.required, for: .horizontal)
 
     previewLabel.translatesAutoresizingMaskIntoConstraints = false
     previewLabel.font = .systemFont(ofSize: 15, weight: .regular)
@@ -419,7 +435,13 @@ final class ChatHomeCardCell: UITableViewCell {
     rightCheckmarkView.contentMode = .scaleAspectFit
     rightCheckmarkView.isHidden = true
 
-    let textStack = UIStackView(arrangedSubviews: [titleLabel, previewLabel])
+    let titleRowStack = UIStackView(arrangedSubviews: [titleLabel, tierBadgeImageView])
+    titleRowStack.translatesAutoresizingMaskIntoConstraints = false
+    titleRowStack.axis = .horizontal
+    titleRowStack.spacing = 6
+    titleRowStack.alignment = .center
+
+    let textStack = UIStackView(arrangedSubviews: [titleRowStack, previewLabel])
     textStack.translatesAutoresizingMaskIntoConstraints = false
     textStack.axis = .vertical
     textStack.spacing = 2
@@ -550,6 +572,8 @@ final class ChatHomeCardCell: UITableViewCell {
       muteIconView.heightAnchor.constraint(equalToConstant: 14),
       pinIconView.widthAnchor.constraint(equalToConstant: 14),
       pinIconView.heightAnchor.constraint(equalToConstant: 14),
+      tierBadgeImageView.heightAnchor.constraint(equalToConstant: 16),
+      tierBadgeImageView.widthAnchor.constraint(equalToConstant: 16),
       { let c = contentView.heightAnchor.constraint(greaterThanOrEqualToConstant: 84); c.priority = .defaultHigh; return c }(),
     ])
 

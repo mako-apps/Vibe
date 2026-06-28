@@ -53,10 +53,11 @@ final class ChatPinnedBannerView: UIControl {
       let glass = UIGlassEffect()
       glass.isInteractive = true
       blurView.effect = glass
+      blurView.contentView.backgroundColor = .clear
     } else {
       blurView.effect = UIBlurEffect(style: .systemThinMaterial)
+      blurView.contentView.backgroundColor = surfaceColor.withAlphaComponent(isDark ? 0.16 : 0.10)
     }
-    blurView.contentView.backgroundColor = surfaceColor.withAlphaComponent(isDark ? 0.16 : 0.10)
     blurView.alpha = isDark ? 0.98 : 0.94
     iconContainer.backgroundColor = surfaceColor.withAlphaComponent(isDark ? 0.24 : 0.16)
     iconGlowView.backgroundColor = textColor.withAlphaComponent(isDark ? 0.30 : 0.20)

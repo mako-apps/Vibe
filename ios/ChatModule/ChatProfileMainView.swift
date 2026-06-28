@@ -356,7 +356,7 @@ private enum NativeProfileAvatarImageLoader {
 enum NativeProfileAvatarHeroMetrics {
   static let topAdjust: CGFloat = 12
   static let islandAnchor: CGFloat = 56
-  static let topOffset: CGFloat = 76
+  static let topOffset: CGFloat = 86
   static let collapsedTopOffset: CGFloat = 18
   static let expandedSize: CGFloat = 196
   static let collapsedSize: CGFloat = 34
@@ -1098,6 +1098,16 @@ private struct ChatProfileScrollOffsetPreferenceKey: PreferenceKey {
     value = nextValue()
   }
 }
+private struct ChatProfileSwiftUITierBadge: View {
+  let label: String
+
+  var body: some View {
+    Image(systemName: "checkmark.seal.fill")
+      .font(.system(size: 16))
+      .symbolRenderingMode(.palette)
+      .foregroundStyle(Color.primary, Color(red: 1.0, green: 0.78, blue: 0.28))
+  }
+}
 
 fileprivate class ChatProfileNavigationCoordinator: ObservableObject {
   @Published fileprivate var path: [ChatProfileSwiftUIDestination] = []
@@ -1158,23 +1168,20 @@ private struct ChatProfileSwiftUIRootView: View {
   }
 
   private var posterGradientColors: (UIColor, UIColor) {
-    if usesDefaultPoster && hasProfileImage {
-      let softDark = UIColor(red: 0.12, green: 0.12, blue: 0.12, alpha: 1.0)
-      return (softDark, softDark)
-    }
-    return ChatProfileAppearancePalette.colors(for: appearanceSelection, mode: .poster)
-  }
-
-  private var usesDefaultPoster: Bool {
-    appearanceSelection.posterPaletteID == ChatProfileAppearancePalette.defaultPosterID
-      && appearanceSelection.posterCustomStartHex == nil
-      && appearanceSelection.posterCustomEndHex == nil
-      && appearanceSelection.posterImageData == nil
+    ChatProfileAppearancePalette.colors(for: appearanceSelection, mode: .poster)
   }
 
   private var posterImage: UIImage? {
     guard let data = appearanceSelection.posterImageData else { return nil }
     return UIImage(data: data)
+  }
+
+  private var showsGoldTier: Bool {
+    !bridgeProvider.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+  }
+
+  private var goldTierColor: Color {
+    Color(red: 0.96, green: 0.72, blue: 0.22)
   }
 
   private var profileInitial: String {
@@ -1191,74 +1198,71 @@ private struct ChatProfileSwiftUIRootView: View {
     GeometryReader { geometry in
       NavigationStack(path: $navCoordinator.path) {
         ZStack {
-          profileBackdrop
-
-          if navCoordinator.path.isEmpty {
-            if hasProfileImage, let avatarUri = avatarUri {
-              ChatProfileHeroReflection(
-                imageUri: avatarUri,
-                width: geometry.size.width,
-                screenHeight: geometry.size.height,
-                size: heroAvatarSize,
-                top: heroReflectionTop(safeTop: geometry.safeAreaInsets.top)
-              )
-              .allowsHitTesting(false)
-            }
-
-            ChatProfileHeroAvatar(
-              text: avatarDisplayText,
-              fontStyleID: appearanceSelection.avatarFontStyleID,
-              colors: avatarGradientColors,
-              imageUri: hasProfileImage ? avatarUri : nil,
-              size: heroAvatarSize,
-              top: heroAvatarTop(safeTop: geometry.safeAreaInsets.top),
-              scrollOffset: localScrollOffset
-            )
-            .allowsHitTesting(false)
-            .transition(.opacity)
-          }
+          // Use the full geometry size to ensure it covers the safe areas properly
+          let fullWidth = geometry.size.width + geometry.safeAreaInsets.leading + geometry.safeAreaInsets.trailing
+          let fullHeight = geometry.size.height + geometry.safeAreaInsets.top + geometry.safeAreaInsets.bottom
+          profileBackdrop(width: fullWidth, height: fullHeight)
 
           ScrollView(.vertical, showsIndicators: true) {
-            offsetReader(safeTop: geometry.safeAreaInsets.top)
+            LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
+              offsetReader(
+                safeTop: geometry.safeAreaInsets.top,
+                heroHeight: heroContentHeight(for: geometry)
+              )
 
-            VStack(spacing: 18) {
-              Color.clear
-                .frame(height: heroClearance(safeTop: geometry.safeAreaInsets.top))
+              if navCoordinator.path.isEmpty {
+                Color.clear
+                  .frame(height: heroContentHeight(for: geometry))
+              }
 
-              VStack(spacing: 20) {
-                Text(profileName)
-                  .font(.system(size: 34, weight: .bold))
-                  .foregroundStyle(.primary)
-                  .lineLimit(1)
-                  .minimumScaleFactor(0.72)
+              Section {
+                VStack(spacing: 18) {
+                  profileInfoSection
+                  if !bridgeProvider.isEmpty {
+                    defaultViewSection
+                  }
+                  if bridgeProvider.isEmpty {
+                    historySection
+                  }
+                  if bridgeProvider.isEmpty {
+                    appearanceSection
+                  }
+                  sharedContentSection
+                  contactActionsSection
+                  emergencySection
+                  dangerSection
+                }
+                .frame(width: max(0, geometry.size.width - 32))
+                .padding(.horizontal, 16)
+                .padding(.bottom, 66)
+              } header: {
+                VStack(spacing: 20) {
+                  HStack(spacing: 8) {
+                    Text(profileName)
+                      .font(.system(size: max(17, 34 - (localScrollOffset / 8)), weight: .bold))
+                      .foregroundStyle(showsGoldTier ? goldTierColor : .primary)
+                      .lineLimit(1)
+                      .minimumScaleFactor(0.72)
+
+                    if showsGoldTier {
+                      ChatProfileSwiftUITierBadge(label: "Gold")
+                    }
+                  }
                   .frame(maxWidth: .infinity)
 
-                actionRow
+                  actionRow
+                }
+                .padding(.horizontal, 28)
+                .padding(.top, 22)
+                .padding(.bottom, 18)
+                .background(Color.clear)
               }
-              .padding(.horizontal, 28)
-
-              profileInfoSection
-              if !bridgeProvider.isEmpty {
-                defaultViewSection
-              }
-              if bridgeProvider.isEmpty {
-                historySection
-              }
-              if bridgeProvider.isEmpty {
-                appearanceSection
-              }
-              sharedContentSection
-              contactActionsSection
-              emergencySection
-              dangerSection
             }
-            .frame(width: max(0, geometry.size.width - 32))
-            .padding(.horizontal, 16)
-            .padding(.bottom, 38)
           }
           .ignoresSafeArea(edges: .top)
           .coordinateSpace(name: "profile-scroll")
-          .scrollIndicators(.visible)
+          .scrollIndicators(.never)
+          .chatProfileBounceBehavior()
           .background(Color.clear)
         }
         .background(Color.clear)
@@ -1312,6 +1316,7 @@ private struct ChatProfileSwiftUIRootView: View {
       }
       .background(Color.clear)
       .tint(.primary)
+      .preferredColorScheme(.light)
       .onChange(of: navCoordinator.path.isEmpty) { _, isEmpty in
         onNavigationActiveChanged(!isEmpty)
       }
@@ -1319,39 +1324,31 @@ private struct ChatProfileSwiftUIRootView: View {
   }
 
   @ViewBuilder
-  private var profileBackdrop: some View {
+  private func profileBackdrop(width: CGFloat, height: CGFloat) -> some View {
     ZStack {
       if let posterImage {
         Image(uiImage: posterImage)
           .resizable()
           .scaledToFill()
-          .overlay(
-            LinearGradient(
-              colors: [
-                Color.black.opacity(isDark ? 0.06 : 0.02),
-                Color.black.opacity(isDark ? 0.30 : 0.16),
-              ],
-              startPoint: .top,
-              endPoint: .bottom
-            )
-          )
       } else {
-        LinearGradient(
-          colors: [
-            Color(uiColor: posterGradientColors.0),
-            Color(uiColor: posterGradientColors.1),
-          ],
-          startPoint: .top,
-          endPoint: .bottom
+        ChatProfileHeroInlineView(
+          text: avatarDisplayText,
+          fontStyleID: appearanceSelection.avatarFontStyleID,
+          gradientColors: avatarGradientColors,
+          imageUri: hasProfileImage ? avatarUri : nil,
+          width: width,
+          height: height
         )
       }
     }
-    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .frame(width: width, height: height)
+    .scaleEffect(1.05)
+    .blur(radius: min(40, max(0, localScrollOffset / 6)))
     .clipped()
     .ignoresSafeArea()
   }
 
-  private func offsetReader(safeTop: CGFloat) -> some View {
+  private func offsetReader(safeTop: CGFloat, heroHeight: CGFloat) -> some View {
     GeometryReader { proxy in
       Color.clear
         .preference(
@@ -1365,7 +1362,7 @@ private struct ChatProfileSwiftUIRootView: View {
       DispatchQueue.main.async {
         guard abs(localScrollOffset - nextValue) >= 0.5 else { return }
         localScrollOffset = nextValue
-        let shouldShowTitle = nextValue >= stickyTitleThreshold(safeTop: safeTop)
+        let shouldShowTitle = nextValue >= stickyTitleThreshold(safeTop: safeTop, heroHeight: heroHeight)
         if stickyTitleVisible != shouldShowTitle {
           stickyTitleVisible = shouldShowTitle
         }
@@ -1377,26 +1374,17 @@ private struct ChatProfileSwiftUIRootView: View {
     }
   }
 
-  private func heroClearance(safeTop: CGFloat) -> CGFloat {
-    NativeProfileAvatarHeroMetrics.expandedTop(for: safeTop)
-      + NativeProfileAvatarHeroMetrics.expandedSize
-      + 28
+  private func heroContentHeight(for geometry: GeometryProxy) -> CGFloat {
+    guard hasProfileImage else {
+      return NativeProfileAvatarHeroMetrics.expandedTop(for: geometry.safeAreaInsets.top)
+        + NativeProfileAvatarHeroMetrics.expandedSize
+        + 18
+    }
+    return max(280, geometry.size.height * 0.45)
   }
 
-  private func stickyTitleThreshold(safeTop: CGFloat) -> CGFloat {
-    max(120, heroClearance(safeTop: safeTop) - safeTop - 58)
-  }
-
-  private var heroAvatarSize: CGFloat {
-    NativeProfileAvatarHeroMetrics.expandedSize - min(22, localScrollOffset * 0.10)
-  }
-
-  private func heroAvatarTop(safeTop: CGFloat) -> CGFloat {
-    NativeProfileAvatarHeroMetrics.expandedTop(for: safeTop) - min(12, localScrollOffset * 0.05)
-  }
-
-  private func heroReflectionTop(safeTop: CGFloat) -> CGFloat {
-    max(safeTop + 78, heroAvatarTop(safeTop: safeTop) + heroAvatarSize * 0.18)
+  private func stickyTitleThreshold(safeTop: CGFloat, heroHeight: CGFloat) -> CGFloat {
+    max(120, heroHeight - safeTop - 40)
   }
 
   private var actionRow: some View {
@@ -1531,7 +1519,7 @@ private struct ChatProfileSwiftUIRootView: View {
       VStack(alignment: .leading, spacing: 4) {
         Text("computer")
           .font(.system(size: 17, weight: .regular))
-          .foregroundStyle(.primary)
+          .foregroundStyle(showsGoldTier ? goldTierColor : .primary)
           .lineLimit(1)
         HStack(spacing: 6) {
           if bridgeConnected && !bridgeRunningTasks.isEmpty {
@@ -1855,127 +1843,69 @@ private struct ChatProfileAvatarGlyph: View {
   }
 }
 
-private struct ChatProfileHeroReflection: View {
-  let imageUri: String
-  let width: CGFloat
-  let screenHeight: CGFloat
-  let size: CGFloat
-  let top: CGFloat
-
-  @State private var image: UIImage?
-  @State private var loadedUri: String?
-
-  var body: some View {
-    let paintWidth = max(width * 1.85, size * 4.5)
-    let reflectionHeight = max(screenHeight * 0.42, size * 2.5)
-
-    VStack(spacing: 0) {
-      ZStack {
-        if loadedUri == normalizedImageUri, let image {
-          Image(uiImage: image)
-            .resizable()
-            .scaledToFill()
-            .frame(width: paintWidth * 0.85, height: reflectionHeight * 0.95)
-            .clipShape(RoundedRectangle(cornerRadius: max(60, size * 0.45), style: .continuous))
-            .blur(radius: 40)
-            .opacity(0.85)
-        }
-      }
-      .frame(width: width, height: reflectionHeight)
-      .frame(maxWidth: .infinity)
-      .padding(.top, max(0, top - reflectionHeight * 0.06))
-
-      Spacer(minLength: 0)
-    }
-    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-    .task(id: normalizedImageUri ?? "") {
-      await loadImage()
-    }
-  }
-
-  private var normalizedImageUri: String? {
-    let value = imageUri.trimmingCharacters(in: .whitespacesAndNewlines)
-    return value.isEmpty ? nil : value
-  }
-
-  @MainActor
-  private func loadImage() async {
-    let normalized = normalizedImageUri
-    if loadedUri != normalized {
-      loadedUri = normalized
-      image = normalized.flatMap { ChatAvatarImageStore.cached(for: $0) }
-    }
-    guard let normalized else {
-      image = nil
-      return
-    }
-    if let cached = ChatAvatarImageStore.cached(for: normalized) {
-      image = cached
-      return
-    }
-    let loaded = await ChatAvatarImageStore.load(from: normalized)
-    guard !Task.isCancelled, loadedUri == normalized else { return }
-    image = loaded
-  }
-}
-
-private struct ChatProfileHeroAvatar: View {
+/// Full-width hero banner inline in the profile scroll content (replaces the old
+/// circular avatar overlay). No image: gradient fill + bare glyph, no circle.
+/// With image: image is top-anchored (cropped portion always at top) and a bottom
+/// gradient fades into the content; square/portrait images are never stretched —
+/// the gradient shows through as letterbox instead of zooming.
+private struct ChatProfileHeroInlineView: View {
   let text: String
   let fontStyleID: String?
-  let colors: (UIColor, UIColor)
+  let gradientColors: (UIColor, UIColor)
   let imageUri: String?
-  let size: CGFloat
-  let top: CGFloat
-  let scrollOffset: CGFloat
+  let width: CGFloat
+  let height: CGFloat
 
   @State private var image: UIImage?
   @State private var loadedUri: String?
 
   var body: some View {
-    let blurRadius = min(11, max(0, scrollOffset - 76) * 0.052)
-    let opacity = 1.0 - min(0.22, max(0, scrollOffset - 126) * 0.0015)
+    ZStack(alignment: .bottom) {
+      LinearGradient(
+        colors: [Color(uiColor: gradientColors.0), Color(uiColor: gradientColors.1)],
+        startPoint: .top,
+        endPoint: .bottom
+      )
 
-    VStack(spacing: 0) {
-      ZStack {
-        LinearGradient(
-          colors: [Color(uiColor: colors.0), Color(uiColor: colors.1)],
-          startPoint: .top,
-          endPoint: .bottom
-        )
-
-        if loadedUri == normalizedImageUri, let image {
-          Image(uiImage: image)
-            .resizable()
-            .scaledToFill()
-        } else {
-          ChatProfileAvatarGlyph(text: text, fontStyleID: fontStyleID, size: size * 0.48)
-        }
+      if loadedUri == normalizedUri, let image {
+        bannerImage(image)
+      } else if normalizedUri == nil {
+        Text(text)
+          .font(.system(
+            size: max(56, height * 0.26),
+            weight: .bold,
+            design: ChatProfileAvatarFontStyle.style(id: fontStyleID).design
+          ))
+          .foregroundStyle(.white.opacity(0.94))
+          .minimumScaleFactor(0.4)
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
       }
-      .frame(width: size, height: size)
-      .clipShape(Circle())
-      .overlay(Circle().stroke(Color.white.opacity(0.20), lineWidth: 1))
-      .shadow(color: Color.black.opacity(0.20), radius: 10, x: 0, y: 5)
-      .compositingGroup()
-      .blur(radius: blurRadius)
-      .opacity(opacity)
-
-      Spacer(minLength: 0)
     }
-    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-    .padding(.top, top)
-    .task(id: normalizedImageUri ?? "") {
+    .frame(width: width, height: height)
+    .clipped()
+    .allowsHitTesting(false)
+    .task(id: normalizedUri ?? "") {
       await loadImage()
     }
   }
 
-  private var normalizedImageUri: String? {
+  @ViewBuilder
+  private func bannerImage(_ image: UIImage) -> some View {
+    Image(uiImage: image)
+      .resizable()
+      .scaledToFill()
+      .frame(width: width, height: height)
+      .clipped()
+  }
+
+  private var normalizedUri: String? {
     let value = imageUri?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     return value.isEmpty ? nil : value
   }
 
   @MainActor
   private func loadImage() async {
-    let normalized = normalizedImageUri
+    let normalized = normalizedUri
     if loadedUri != normalized {
       loadedUri = normalized
       image = normalized.flatMap { ChatAvatarImageStore.cached(for: $0) }
@@ -2652,6 +2582,17 @@ private struct ChatProfilePaletteGrid: View {
   }
 }
 
+private extension View {
+  @ViewBuilder
+  func chatProfileBounceBehavior() -> some View {
+    if #available(iOS 16.4, *) {
+      self.scrollBounceBehavior(.basedOnSize)
+    } else {
+      self
+    }
+  }
+}
+
 private struct ChatProfileSwiftUIMaterialBackground: UIViewRepresentable {
   let style: UIBlurEffect.Style
 
@@ -2925,14 +2866,18 @@ private final class ChatProfileTabStripView: UIView {
     backgroundColor = .clear
     clipsToBounds = false
 
+    // Glass effect as a pure background — no content inside contentView so
+    // UIGlassEffect renders correctly without being blocked by nested views.
     chromeView.translatesAutoresizingMaskIntoConstraints = false
     chromeView.clipsToBounds = true
     chromeView.layer.cornerCurve = .continuous
+    chromeView.isUserInteractionEnabled = false
     addSubview(chromeView)
 
+    // Overlay and scroll view are siblings of chromeView, not children of contentView.
     chromeOverlayView.translatesAutoresizingMaskIntoConstraints = false
     chromeOverlayView.isUserInteractionEnabled = false
-    chromeView.contentView.addSubview(chromeOverlayView)
+    addSubview(chromeOverlayView)
 
     scrollView.translatesAutoresizingMaskIntoConstraints = false
     scrollView.backgroundColor = .clear
@@ -2940,7 +2885,7 @@ private final class ChatProfileTabStripView: UIView {
     scrollView.alwaysBounceHorizontal = false
     scrollView.delaysContentTouches = false
     scrollView.canCancelContentTouches = true
-    chromeView.contentView.addSubview(scrollView)
+    addSubview(scrollView)
 
     selectionView.isUserInteractionEnabled = false
     selectionView.layer.cornerCurve = .continuous
@@ -2959,15 +2904,15 @@ private final class ChatProfileTabStripView: UIView {
       chromeView.topAnchor.constraint(equalTo: topAnchor),
       chromeView.bottomAnchor.constraint(equalTo: bottomAnchor),
 
-      chromeOverlayView.leadingAnchor.constraint(equalTo: chromeView.contentView.leadingAnchor),
-      chromeOverlayView.trailingAnchor.constraint(equalTo: chromeView.contentView.trailingAnchor),
-      chromeOverlayView.topAnchor.constraint(equalTo: chromeView.contentView.topAnchor),
-      chromeOverlayView.bottomAnchor.constraint(equalTo: chromeView.contentView.bottomAnchor),
+      chromeOverlayView.leadingAnchor.constraint(equalTo: leadingAnchor),
+      chromeOverlayView.trailingAnchor.constraint(equalTo: trailingAnchor),
+      chromeOverlayView.topAnchor.constraint(equalTo: topAnchor),
+      chromeOverlayView.bottomAnchor.constraint(equalTo: bottomAnchor),
 
-      scrollView.leadingAnchor.constraint(equalTo: chromeView.contentView.leadingAnchor),
-      scrollView.trailingAnchor.constraint(equalTo: chromeView.contentView.trailingAnchor),
-      scrollView.topAnchor.constraint(equalTo: chromeView.contentView.topAnchor),
-      scrollView.bottomAnchor.constraint(equalTo: chromeView.contentView.bottomAnchor),
+      scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
+      scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
+      scrollView.topAnchor.constraint(equalTo: topAnchor),
+      scrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
 
       stackView.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor),
       stackView.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor),
@@ -2991,14 +2936,24 @@ private final class ChatProfileTabStripView: UIView {
   }
 
   private func applyChrome() {
-    let blurStyle: UIBlurEffect.Style =
-      isDark ? .systemChromeMaterialDark : .systemChromeMaterialLight
+    if #available(iOS 26.0, *) {
+      let glass = UIGlassEffect(style: .regular)
+      glass.isInteractive = false
+      chromeView.effect = glass
+    } else {
+      let blurStyle: UIBlurEffect.Style =
+        isDark ? .systemChromeMaterialDark : .systemChromeMaterialLight
+      chromeView.effect = UIBlurEffect(style: blurStyle)
+    }
 
     let primary = isDark ? UIColor(white: 0.95, alpha: 0.96) : UIColor(white: 0.12, alpha: 0.96)
     let secondary = isDark ? UIColor(white: 0.84, alpha: 0.62) : UIColor(white: 0.12, alpha: 0.42)
-    chromeView.effect = UIBlurEffect(style: blurStyle)
-    chromeOverlayView.backgroundColor =
-      (isDark ? UIColor.black : UIColor.white).withAlphaComponent(isDark ? 0.10 : 0.08)
+    if #available(iOS 26.0, *) {
+      chromeOverlayView.backgroundColor = .clear
+    } else {
+      chromeOverlayView.backgroundColor =
+        (isDark ? UIColor.black : UIColor.white).withAlphaComponent(isDark ? 0.10 : 0.08)
+    }
     selectionView.backgroundColor =
       isDark ? UIColor.white.withAlphaComponent(0.18) : UIColor.black.withAlphaComponent(0.10)
 
@@ -3596,14 +3551,6 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   }
 
   func setAppearance(_ rawAppearance: [String: Any]) {
-    let isDarkValue =
-      (rawAppearance["isDark"] as? Bool)
-      ?? (rawAppearance["nativeThemeIsDark"] as? Bool)
-
-    if let isDarkValue {
-      overrideUserInterfaceStyle = isDarkValue ? .dark : .light
-    }
-
     applyTheme()
     tableView.reloadData()
     layoutHeroHeaderViewIfNeeded(force: true)
@@ -3773,6 +3720,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
 
   private func configureView() {
     clipsToBounds = false
+    overrideUserInterfaceStyle = .light
 
     // Background gradient
     backgroundGradientLayer.startPoint = CGPoint(x: 0.5, y: 0.0)

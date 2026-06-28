@@ -494,10 +494,13 @@ final class BubbleBackgroundView: UIView {
     setNeedsLayout()
   }
 
-  func applyAgentStyle(appearance: ChatListAppearance, isMe: Bool) {
-    // Agent bubble: subtle purple tint with border
+  func applyAgentStyle(appearance: ChatListAppearance, isMe: Bool, accent accentOverride: UIColor? = nil) {
+    // Agent bubble: subtle purple tint with border. While a turn is in flight the cell
+    // passes a per-task `accentOverride` so the bubble reads as a distinct "working"
+    // color; when the run finishes the override drops and it settles back to purple.
     let agentColor =
-      appearance.bubbleMeGradient.first ?? UIColor(red: 0.49, green: 0.36, blue: 0.88, alpha: 1.0)
+      accentOverride
+      ?? appearance.bubbleMeGradient.first ?? UIColor(red: 0.49, green: 0.36, blue: 0.88, alpha: 1.0)
     CATransaction.begin()
     CATransaction.setDisableActions(true)
 
@@ -1017,10 +1020,12 @@ private func bubbleUsesAgentProgressPreview(_ row: ChatListRow) -> Bool {
 }
 
 private func showsAgentProgressOpenButton(_ row: ChatListRow) -> Bool {
-  row.kind == .message
-    && row.isAgentMessage
-    && bubbleUsesAgentProgressPreview(row)
-    && (row.messageId?.isEmpty == false)
+  // The explicit "Live progress / View progress" button is retired — the whole agent
+  // bubble is now tappable to open the runtime view (see AgentProgressPreviewView's tap
+  // gesture). Returning false keeps both layout and measuredHeight from reserving the
+  // button's slot (they both read this flag), so heights stay consistent.
+  _ = row
+  return false
 }
 
 private func bubbleMetaWidths(for row: ChatListRow) -> ChatBubbleMetaWidths {
@@ -1361,7 +1366,7 @@ func chatAgentNodeCompactLabel(_ node: ChatListRow.AgentProgressNode) -> String 
   case "bash": verb = "Run"
   case "search": verb = "Search"
   case "web": verb = "Fetch"
-  case "task": verb = "Task"
+  case "task": verb = "Step"
   case "todo": return "Planning"
   default: return node.label
   }
@@ -1572,9 +1577,13 @@ private func agentProgressPreviewContent(for row: ChatListRow) -> AgentProgressP
   }
   let agentName = row.agentName?.trimmingCharacters(in: .whitespacesAndNewlines)
   let titlePrefix = (agentName?.isEmpty == false) ? agentName! : "Agent"
+  // The live header line is the CURRENT activity (running step) — a shimmering,
+  // continuously-updating label that replaces the old static "is working" + spinner.
+  let activeStepTitle = (allItems.last(where: { $0.state == .running })?.title)?
+    .trimmingCharacters(in: .whitespacesAndNewlines)
   let title: String
   if isLive {
-    title = "\(titlePrefix) is working"
+    title = (activeStepTitle?.isEmpty == false) ? activeStepTitle! : "\(titlePrefix) is working…"
   } else if row.isAgentError {
     title = "\(titlePrefix) stopped"
   } else {
@@ -1594,23 +1603,18 @@ private func agentProgressPreviewContent(for row: ChatListRow) -> AgentProgressP
     }
     return parts.isEmpty ? nil : parts.joined(separator: " - ")
   }()
-  let liveDetail: String? = {
-    guard isLive else { return nil }
-    guard let active = allItems.last(where: { $0.state == .running }) ?? visibleItems.last else {
-      return nil
-    }
-    return compactAgentPreviewDetail(active.detail ?? active.title)
-  }()
 
   return AgentProgressPreviewContent(
     title: title,
-    detail: liveDetail ?? runtimeDetail ?? bodyText,
+    // Live: activity is the (shimmering) title and prose lives in previewText, so the
+    // secondary line is just repo · model; finished: fall back to the response body.
+    detail: isLive ? runtimeDetail : (runtimeDetail ?? bodyText),
     previewText: livePreviewText,
     items: visibleItems,
     hiddenItemCount: 0,
     isLive: isLive,
     showsOpenButton: showsAgentProgressOpenButton(row),
-    openButtonTitle: isLive ? "Live progress" : "View progress"
+    openButtonTitle: "View progress"
   )
 }
 
@@ -1688,15 +1692,8 @@ private final class AgentProgressStepIconView: UIView {
     case .done:
       tint.withAlphaComponent(0.38).setStroke()
       context.strokeEllipse(in: circleRect)
-      let path = UIBezierPath()
-      path.move(to: CGPoint(x: circleRect.minX + diameter * 0.28, y: circleRect.midY))
-      path.addLine(to: CGPoint(x: circleRect.minX + diameter * 0.43, y: circleRect.maxY - diameter * 0.30))
-      path.addLine(to: CGPoint(x: circleRect.maxX - diameter * 0.24, y: circleRect.minY + diameter * 0.31))
-      path.lineWidth = lineWidth
-      path.lineCapStyle = .round
-      path.lineJoinStyle = .round
-      tint.setStroke()
-      path.stroke()
+      tint.withAlphaComponent(0.70).setFill()
+      context.fillEllipse(in: circleRect.insetBy(dx: diameter * 0.34, dy: diameter * 0.34))
     case .failed:
       tint.withAlphaComponent(0.95).setStroke()
       context.strokeEllipse(in: circleRect)
@@ -1851,10 +1848,67 @@ private final class AgentProgressPreviewView: UIView {
     )
     openButton.configuration = buttonConfiguration
     openButton.addTarget(self, action: #selector(handleOpenTap), for: .touchUpInside)
+    openButton.isHidden = true
+
+    // The whole card opens the runtime view now that the explicit button is gone.
+    isUserInteractionEnabled = true
+    let tap = UITapGestureRecognizer(target: self, action: #selector(handleOpenTap))
+    addGestureRecognizer(tap)
+
+    // Shimmer the live header line (replaces the old spinner + "is working" text). The
+    // gradient sweeps across the title while a turn is in flight; it's a pure mask
+    // animation, so it never affects layout or measuredHeight.
+    titleShimmerLayer.startPoint = CGPoint(x: 0, y: 0.5)
+    titleShimmerLayer.endPoint = CGPoint(x: 1, y: 0.5)
+    titleShimmerLayer.locations = [0.0, 0.45, 0.5, 0.55, 1.0]
   }
 
   required init?(coder: NSCoder) {
     return nil
+  }
+
+  // MARK: Live header shimmer
+  private let titleShimmerLayer = CAGradientLayer()
+  private var titleIsShimmering = false
+
+  private func startTitleShimmer() {
+    guard !titleIsShimmering else { return }
+    titleIsShimmering = true
+    let base = (titleLabel.textColor ?? .label)
+    let dim = base.withAlphaComponent(0.45).cgColor
+    let bright = base.withAlphaComponent(1.0).cgColor
+    titleShimmerLayer.colors = [dim, dim, bright, dim, dim]
+    if titleShimmerLayer.animation(forKey: "agentTitleShimmer") == nil {
+      let anim = CABasicAnimation(keyPath: "locations")
+      anim.fromValue = [-0.6, -0.15, 0.0, 0.15, 0.6]
+      anim.toValue = [0.4, 0.85, 1.0, 1.15, 1.6]
+      anim.duration = 1.15
+      anim.repeatCount = .infinity
+      anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+      titleShimmerLayer.add(anim, forKey: "agentTitleShimmer")
+    }
+    // The mask is only attached once the label has a real frame (layoutTitleShimmer),
+    // so the title is never briefly masked to nothing before layout runs.
+    layoutTitleShimmer()
+  }
+
+  private func stopTitleShimmer() {
+    guard titleIsShimmering else { return }
+    titleIsShimmering = false
+    titleShimmerLayer.removeAnimation(forKey: "agentTitleShimmer")
+    titleLabel.layer.mask = nil
+  }
+
+  private func layoutTitleShimmer() {
+    guard titleIsShimmering, titleLabel.bounds.width > 1.0 else {
+      if !titleIsShimmering { titleLabel.layer.mask = nil }
+      return
+    }
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    titleShimmerLayer.frame = titleLabel.bounds
+    titleLabel.layer.mask = titleShimmerLayer
+    CATransaction.commit()
   }
 
   func reset() {
@@ -1867,6 +1921,7 @@ private final class AgentProgressPreviewView: UIView {
     previewTextLabel.isHidden = true
     moreLabel.text = nil
     openButton.isHidden = true
+    stopTitleShimmer()
   }
 
   @discardableResult
@@ -1903,12 +1958,15 @@ private final class AgentProgressPreviewView: UIView {
     } else {
       previewTextLabel.resetStreamingState()
     }
-    headerIconView.configure(
-      state: row.isAgentError ? .failed : (content.isLive ? .running : .done),
-      tint: row.isAgentError
-        ? UIColor.systemRed.withAlphaComponent(0.85)
-        : textColor.withAlphaComponent(content.isLive ? 0.92 : 0.74)
-    )
+    // The leading spinner/check icon is retired (the bubble's working tint + the
+    // shimmering live line now carry the state). Keep it hidden so the title can use
+    // the full width from the leading inset.
+    headerIconView.isHidden = true
+    if content.isLive {
+      startTitleShimmer()
+    } else {
+      stopTitleShimmer()
+    }
 
     while stepViews.count < content.items.count {
       let stepView = AgentProgressPreviewStepView()
@@ -1992,19 +2050,15 @@ private final class AgentProgressPreviewView: UIView {
     let contentInsetX = agentProgressPreviewHorizontalInset
     let contentWidth = max(1.0, min(bounds.width, availableWidth) - (contentInsetX * 2.0))
     var y: CGFloat = 0.0
-    let headerIconSize: CGFloat = 16.0
-    headerIconView.frame = CGRect(
-      x: contentInsetX,
-      y: floor((agentProgressPreviewHeaderHeight - headerIconSize) * 0.5),
-      width: headerIconSize,
-      height: headerIconSize
-    )
+    // Spinner/check icon retired — the title spans from the leading inset.
+    headerIconView.frame = .zero
     titleLabel.frame = CGRect(
-      x: headerIconView.frame.maxX + 8.0,
+      x: contentInsetX,
       y: 0.0,
-      width: max(1.0, (contentInsetX + contentWidth) - headerIconView.frame.maxX - 8.0),
+      width: contentWidth,
       height: agentProgressPreviewHeaderHeight
     )
+    if titleIsShimmering { layoutTitleShimmer() }
     y += agentProgressPreviewHeaderHeight
 
     if showsDetail {
@@ -6659,7 +6713,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           // Agent messages use "them" styling (not isMe) with a subtle tint
           bubbleView.configure(
             isMe: false, shape: row.shape, hidden: isGhostHidden, appearance: appearance)
-          bubbleView.applyAgentStyle(appearance: appearance, isMe: false)
+          bubbleView.applyAgentStyle(
+            appearance: appearance, isMe: false, accent: Self.agentWorkingAccent(for: row))
           tailView.configure(
             isMe: false,
             visible: !isGhostHidden && row.shape.showTail,
@@ -8776,6 +8831,19 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       "messageId": messageId,
       "chatId": row.chatId ?? "",
     ])
+  }
+
+  /// A per-task working tint for an in-flight agent bubble, or nil once the turn is
+  /// finished/errored (so the bubble settles back to the default agent purple). Seeded
+  /// from a stable id so one run keeps a single color across its live updates while
+  /// distinct runs read differently.
+  static func agentWorkingAccent(for row: ChatListRow) -> UIColor? {
+    guard row.isAgentMessage, row.isStreamingText, !row.isAgentError else { return nil }
+    let seed = row.agentActionSourceId ?? row.messageId ?? row.key
+    var hash: UInt64 = 1_469_598_103_934_665_603
+    for byte in seed.utf8 { hash = (hash ^ UInt64(byte)) &* 1_099_511_628_211 }
+    let hue = CGFloat(hash % 360) / 360.0
+    return UIColor(hue: hue, saturation: 0.58, brightness: 0.80, alpha: 1.0)
   }
 
   /// The old outside-bubble "view agent" arrow is intentionally retired. Active

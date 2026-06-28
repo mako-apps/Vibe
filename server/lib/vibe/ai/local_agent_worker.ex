@@ -4,6 +4,7 @@ defmodule Vibe.AI.LocalAgentWorker do
   require Logger
 
   alias Vibe.AgentBridge
+  alias Vibe.Badges
   alias Vibe.Chat
   alias Vibe.Chat.AgentMessageCrypto
   alias Vibe.Chat.GroupAgentMemory
@@ -19,6 +20,8 @@ defmodule Vibe.AI.LocalAgentWorker do
   # users you can DM, each with their own avatar — instead of one shared bot user.
   @claude_agent_user_id "11111111-1111-1111-1111-111111111111"
   @codex_agent_user_id "22222222-2222-2222-2222-222222222222"
+  @claude_avatar_data_url "https://media.vibegram.io/chat-media/agent-profiles/claude.png"
+  @codex_avatar_data_url "https://media.vibegram.io/chat-media/agent-profiles/codex.png"
   @default_timeout_ms 120_000
   @max_prompt_length 8_000
   @max_tool_events 16
@@ -40,7 +43,9 @@ defmodule Vibe.AI.LocalAgentWorker do
       default_command: "codex",
       agent_user_id: @codex_agent_user_id,
       username: "codex",
-      name: "Codex"
+      name: "Codex",
+      avatar_url: @codex_avatar_data_url,
+      tier: "gold"
     },
     "claude" => %{
       handle: "claude",
@@ -49,7 +54,9 @@ defmodule Vibe.AI.LocalAgentWorker do
       default_command: "claude",
       agent_user_id: @claude_agent_user_id,
       username: "claude",
-      name: "Claude"
+      name: "Claude",
+      avatar_url: @claude_avatar_data_url,
+      tier: "gold"
     }
   }
 
@@ -409,10 +416,10 @@ defmodule Vibe.AI.LocalAgentWorker do
         runtime = normalize_runtime_payload(Keyword.get(opts, :runtime))
         # End-to-end encrypted runtime blob. Opaque to the server: stored and
         # served verbatim, never decrypted, parsed, or logged. The key lives
-	        # only on the user's bridge and phone.
-	        runtime_enc = normalize_runtime_enc(Keyword.get(opts, :runtime_enc))
-	        agent_actions_enc = normalize_runtime_enc(Keyword.get(opts, :agent_actions_enc))
-	        runtime_can_revert = Keyword.get(opts, :can_revert) == true
+        # only on the user's bridge and phone.
+        runtime_enc = normalize_runtime_enc(Keyword.get(opts, :runtime_enc))
+        agent_actions_enc = normalize_runtime_enc(Keyword.get(opts, :agent_actions_enc))
+        runtime_can_revert = Keyword.get(opts, :can_revert) == true
         team_metadata = normalize_team_metadata(opts)
         extracted = extract_result(worker, output)
         progress_nodes = progress_nodes_with_runtime(extracted.progress_nodes, runtime)
@@ -450,10 +457,10 @@ defmodule Vibe.AI.LocalAgentWorker do
             "agentWorkerRawEventCount" => extracted.raw_event_count,
             "progressNodes" => progress_nodes
           }
-	          |> maybe_put("agentRuntime", runtime)
-	          |> maybe_put("agentRuntimeEnc", runtime_enc)
-	          |> maybe_put("agentActionsEnc", agent_actions_enc)
-	          |> maybe_put("agentRuntimeCanRevert", if(runtime_can_revert, do: true))
+          |> maybe_put("agentRuntime", runtime)
+          |> maybe_put("agentRuntimeEnc", runtime_enc)
+          |> maybe_put("agentActionsEnc", agent_actions_enc)
+          |> maybe_put("agentRuntimeCanRevert", if(runtime_can_revert, do: true))
           |> Map.merge(team_metadata)
 
         result =
@@ -1152,33 +1159,33 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp do_run(%{handle: "codex"} = worker, executable, prompt, opts) do
     bridge_options = Keyword.get(opts, :bridge_metadata) || %{}
 
-	    sandbox =
-	      System.get_env("VIBE_CODEX_SANDBOX")
-	      |> normalize_string()
-	      |> case do
-	        value when value in ["read-only", "workspace-write", "danger-full-access"] -> value
-	        _ -> "read-only"
-	      end
+    sandbox =
+      System.get_env("VIBE_CODEX_SANDBOX")
+      |> normalize_string()
+      |> case do
+        value when value in ["read-only", "workspace-write", "danger-full-access"] -> value
+        _ -> "read-only"
+      end
 
-	    approval_policy =
-	      System.get_env("VIBE_CODEX_APPROVAL_POLICY")
-	      |> normalize_string()
-	      |> case do
-	        value when value in ["untrusted", "on-request", "never"] -> value
-	        _ -> "untrusted"
-	      end
+    approval_policy =
+      System.get_env("VIBE_CODEX_APPROVAL_POLICY")
+      |> normalize_string()
+      |> case do
+        value when value in ["untrusted", "on-request", "never"] -> value
+        _ -> "untrusted"
+      end
 
-	    args =
-	      [
-	        "exec",
-	        "--json",
-	        "--sandbox",
-	        sandbox,
-	        "-c",
-	        "approval_policy=\"#{approval_policy}\"",
-	        "--cd",
-	        worker_cwd(),
-	        "--skip-git-repo-check",
+    args =
+      [
+        "exec",
+        "--json",
+        "--sandbox",
+        sandbox,
+        "-c",
+        "approval_policy=\"#{approval_policy}\"",
+        "--cd",
+        worker_cwd(),
+        "--skip-git-repo-check",
         "--ephemeral"
       ] ++
         maybe_model_args(bridge_options, "VIBE_CODEX_MODEL", "--model") ++
@@ -1190,14 +1197,15 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp do_run(%{handle: "claude"} = worker, executable, prompt, opts) do
     bridge_options = Keyword.get(opts, :bridge_metadata) || %{}
 
-	    permission_mode =
-	      System.get_env("VIBE_CLAUDE_PERMISSION_MODE")
-	      |> normalize_string()
-	      |> case do
-	        value when value in ["default", "acceptEdits", "auto", "dontAsk", "bypassPermissions", "plan"] ->
-	          value
+    permission_mode =
+      System.get_env("VIBE_CLAUDE_PERMISSION_MODE")
+      |> normalize_string()
+      |> case do
+        value
+        when value in ["default", "acceptEdits", "auto", "dontAsk", "bypassPermissions", "plan"] ->
+          value
 
-	        _ ->
+        _ ->
           "plan"
       end
 
@@ -1433,18 +1441,43 @@ defmodule Vibe.AI.LocalAgentWorker do
           password_hash: "agent",
           public_key: "agent",
           device_id: "agent",
+          profile_image: worker.avatar_url,
           is_agent: true,
+          tier: worker.tier,
           inserted_at: now,
           updated_at: now
         }
       ],
       conflict_target: [:id],
-      on_conflict: [set: [updated_at: now, name: worker.name, is_agent: true]]
+      on_conflict: [
+        set: [
+          updated_at: now,
+          username: worker.username,
+          name: worker.name,
+          profile_image: worker.avatar_url,
+          is_agent: true,
+          tier: worker.tier
+        ]
+      ]
     )
+
+    ensure_agent_gold_badge(worker)
 
     :ok
   rescue
     error -> {:error, error}
+  end
+
+  defp ensure_agent_gold_badge(worker) do
+    case Badges.award_badge(worker.agent_user_id, "gold", "system") do
+      {:ok, _badge} ->
+        :ok
+
+      {:error, changeset} ->
+        Logger.warning(
+          "[LocalAgentWorker] failed to seed gold badge for #{worker.handle}: #{inspect(changeset.errors)}"
+        )
+    end
   end
 
   defp normalize_prompt(_worker, prompt) do
@@ -1490,7 +1523,8 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   defp maybe_model_args(options, env_name, flag) do
-    case normalize_string(option_value(options, "model")) || normalize_string(System.get_env(env_name)) do
+    case normalize_string(option_value(options, "model")) ||
+           normalize_string(System.get_env(env_name)) do
       nil -> []
       model -> [flag, model]
     end

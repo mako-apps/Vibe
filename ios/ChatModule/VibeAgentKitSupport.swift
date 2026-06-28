@@ -497,6 +497,23 @@ func vibeAgentKitColorWithAlpha(_ color: UIColor, _ alpha: CGFloat) -> UIColor {
   color.withAlphaComponent(alpha)
 }
 
+enum VibeAgentDiffPalette {
+  static let additionText = UIColor(red: 0.18, green: 0.74, blue: 0.25, alpha: 1.0)
+  static let deletionText = UIColor(red: 0.92, green: 0.24, blue: 0.34, alpha: 1.0)
+
+  static func additionBackground(isDark: Bool) -> UIColor {
+    isDark
+      ? UIColor(red: 0.10, green: 0.30, blue: 0.15, alpha: 0.88)
+      : UIColor(red: 0.18, green: 0.74, blue: 0.25, alpha: 0.12)
+  }
+
+  static func deletionBackground(isDark: Bool) -> UIColor {
+    isDark
+      ? UIColor(red: 0.32, green: 0.10, blue: 0.14, alpha: 0.88)
+      : UIColor(red: 0.92, green: 0.24, blue: 0.34, alpha: 0.12)
+  }
+}
+
 /// SF Symbol for a Claude/Codex tool-node kind — used by the loader line and the
 /// tool sheet rows so the feed reads with native icons instead of emoji.
 func vibeAgentKitToolSymbol(forKind kind: String?) -> String {

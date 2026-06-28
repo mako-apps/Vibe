@@ -1879,6 +1879,14 @@ final class ChatEngine {
     let me = currentUserIdLocked()
     var lastMessageId: String?
     var ingestedIds = Set<String>()
+    // The live `agent-stream` path renders the in-flight turn in real time (keyed
+    // `stream-…`). If one is active, the session transcript's RUNNING turn is a
+    // duplicate of it — skip it here and let the live row own the running turn. The
+    // session still owns every FINISHED turn (rich diff/runtime card + scrollback).
+    let hasLiveStreamRow =
+      (liveMessageRowsByChat[chatId] ?? [:]).keys.contains { $0.hasPrefix("stream-") }
+    var sawRunningAgentItem = false
+    var ingestedAgentRow = false
 
     for (index, item) in rawMessages.enumerated() {
       let role = (normalizedString(item["role"]) ?? "").lowercased()
@@ -1889,6 +1897,36 @@ final class ChatEngine {
       // live action stream still renders; otherwise drop empty placeholders.
       let hasProgressNodes = (item["progressNodes"] as? [[String: Any]])?.isEmpty == false
       guard !text.isEmpty || hasProgressNodes else { continue }
+      // Is this the agent's currently-running turn? (the bridge flags it `running`.)
+      let isRunningTranscriptItem = role != "user" && (item["running"] as? Bool) == true
+      if isRunningTranscriptItem {
+        sawRunningAgentItem = true
+        // A live stream row already shows this turn — skip the parallel session row
+        // (and let the tombstone below drop any previously-ingested running row) so
+        // the chat list never shows two "working" cards for one turn.
+        if hasLiveStreamRow { continue }
+      }
+      var agentBodyText = text
+      var progressNodesPayload: Any? = item["progressNodes"] ?? item["progress_nodes"]
+      if isRunningTranscriptItem, let nodes = progressNodesPayload as? [[String: Any]] {
+        var textParts: [String] = []
+        var toolNodes: [[String: Any]] = []
+        for node in nodes {
+          let kind = (normalizedString(node["kind"]) ?? "").lowercased()
+          if kind == "text" {
+            if let label = normalizedString(node["label"] ?? node["title"]) {
+              textParts.append(label)
+            }
+          } else {
+            toolNodes.append(node)
+          }
+        }
+        if !textParts.isEmpty {
+          if !agentBodyText.isEmpty { textParts.append(agentBodyText) }
+          agentBodyText = textParts.joined(separator: "\n\n")
+          progressNodesPayload = toolNodes
+        }
+      }
       // Stable id from the transcript's own message identity (claude uuid /
       // codex response-id) so the bridge's live re-pushes upsert in place even
       // as the capped window slides; fall back to array position.
@@ -1919,7 +1957,7 @@ final class ChatEngine {
         synthetic["encryptedContent"] = Self.strippedBridgeInstructionPreamble(text)
       } else {
         synthetic["isAgentMessage"] = true
-        synthetic["plainContent"] = text
+        synthetic["plainContent"] = agentBodyText
         synthetic["agentName"] = agentName
         synthetic["fromId"] = Self.agentUserId
         synthetic["agentUserId"] = Self.agentUserId
@@ -1931,7 +1969,6 @@ final class ChatEngine {
         // that turn as the streaming "working" state (shimmer + step feed), NOT a
         // collapsed "Worked · N steps" card — the card only belongs to a finished turn
         // (once the run's result lands the flag clears and it collapses).
-        let isRunningTranscriptItem = (item["running"] as? Bool) == true
         if isRunningTranscriptItem {
           meta["isStreaming"] = true
         }
@@ -1956,9 +1993,11 @@ final class ChatEngine {
         // progress nodes (clean plaintext labels) + an E2E-encrypted detail array
         // (command OUTPUT, todo contents). Renders as the compact shimmer feed +
         // tap-to-open tool sheet — same path as the live stream.
-        if let nodes = item["progressNodes"] ?? item["progress_nodes"] {
+        if let nodes = progressNodesPayload {
           if isRunningTranscriptItem, var mutableNodes = nodes as? [[String: Any]] {
             for index in mutableNodes.indices.reversed() {
+              let kind = (normalizedString(mutableNodes[index]["kind"]) ?? "").lowercased()
+              if kind == "text" { continue }
               let rawStatus = normalizedString(mutableNodes[index]["status"])?.lowercased() ?? ""
               if ["failed", "error", "cancelled", "canceled", "stopped"].contains(rawStatus) {
                 continue
@@ -1978,7 +2017,18 @@ final class ChatEngine {
       }
       _ = applyNativeIncomingMessageEventLocked(chatId: chatId, payload: synthetic)
       ingestedIds.insert(messageId)
+      if role != "user" { ingestedAgentRow = true }
       lastMessageId = messageId
+    }
+
+    // When the transcript shows the run fully finished (no running turn), any leftover
+    // live `stream-…` bubble is stale — the rich finished `bridge-…` row now supersedes
+    // it. Drop it so the finished turn isn't shown twice (mirrors the persisted-message
+    // path's removeAgentStreamRowsLocked at the "message" frame).
+    if ingestedAgentRow, !sawRunningAgentItem {
+      // Pass nil: a bridge DM has a single agent, so clear every live stream bubble
+      // for this chat rather than depending on the stream payload's userId matching.
+      removeAgentStreamRowsLocked(chatId: chatId, agentUserId: nil)
     }
 
     // Clear rows left over from a PRIOR transcript shape. A previously-ingested row
@@ -4263,6 +4313,9 @@ final class ChatEngine {
     mutateLiveMessagePayloadLocked(chatId: chatId, messageId: streamId) { message in
       message["isStreaming"] = true
     }
+    // This live row now owns the in-flight turn — drop any running session row that a
+    // history snapshot may have created for the same turn (order-independent dedup).
+    removeRunningBridgeSessionRowsLocked(chatId: chatId)
     postChangeLocked(
       reason: "chatMessageInserted",
       userInfo: ["chatId": chatId, "messageId": streamId, "state": statusSnapshotLocked()]
@@ -4293,6 +4346,30 @@ final class ChatEngine {
       liveMessageRowsByChat[chatId] = perChat
     }
     agentStreamTimestampsByChat.removeValue(forKey: chatId)
+  }
+
+  /// Drop any session `bridge-…` rows currently flagged running. The live `agent-stream`
+  /// row owns the in-flight turn, so a running session row is a duplicate of it. This is
+  /// the inverse of the ingest-time skip and makes the dedup order-independent: it covers
+  /// the case where a history snapshot lands BEFORE the first stream frame. We remove only
+  /// from the live store (no tombstone) so the SAME id can be re-ingested as the rich
+  /// FINISHED row once the run completes (the bridge upserts the turn in place).
+  private func removeRunningBridgeSessionRowsLocked(chatId: String) {
+    guard var perChat = liveMessageRowsByChat[chatId], !perChat.isEmpty else { return }
+    var removed: [String] = []
+    for (key, entry) in perChat where key.hasPrefix("bridge-") {
+      let message = entry["message"] as? [String: Any]
+      let metaStreaming = (message?["metadata"] as? [String: Any])?["isStreaming"] as? Bool
+      let topStreaming = message?["isStreaming"] as? Bool
+      if metaStreaming == true || topStreaming == true { removed.append(key) }
+    }
+    guard !removed.isEmpty else { return }
+    for key in removed { perChat.removeValue(forKey: key) }
+    if perChat.isEmpty {
+      liveMessageRowsByChat.removeValue(forKey: chatId)
+    } else {
+      liveMessageRowsByChat[chatId] = perChat
+    }
   }
 
   private func emitAgentProgressChangeLocked(

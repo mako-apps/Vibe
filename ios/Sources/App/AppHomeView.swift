@@ -340,10 +340,24 @@ struct ChatRoute: Identifiable, Hashable {
   /// Resolves the bridge provider for a chat. The reserved user ids are the strong
   /// signal; the name is only consulted for confirmed agent users so a human named
   /// "claude" never trips the gate.
-  static func resolveBridgeProvider(peerUserId: String?, name: String?, isAgent: Bool) -> String? {
+  static func resolveBridgeProvider(
+    peerUserId: String?,
+    name: String?,
+    isAgent: Bool,
+    agentId: String? = nil
+  ) -> String? {
     let pid = peerUserId?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     if pid == claudeAgentUserId { return "claude" }
     if pid == codexAgentUserId { return "codex" }
+    let aid = agentId?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    switch aid {
+    case "claude", claudeAgentUserId:
+      return "claude"
+    case "codex", codexAgentUserId:
+      return "codex"
+    default:
+      break
+    }
     guard isAgent else { return nil }
     switch name?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
     case "claude": return "claude"
@@ -412,13 +426,22 @@ struct ChatRoute: Identifiable, Hashable {
     self.agentEventInboxMode = agentEventInboxMode
     self.bridgeProvider =
       bridgeProvider
-      ?? Self.resolveBridgeProvider(peerUserId: peerUserId, name: title, isAgent: resolvedIsAgent)
+      ?? Self.resolveBridgeProvider(
+        peerUserId: peerUserId,
+        name: title,
+        isAgent: resolvedIsAgent,
+        agentId: peerAgentId
+      )
   }
 
   init(row: ChatHomeListRow) {
     let cachedRows = row.initialMessages.isEmpty ? row.previewRows : row.initialMessages
     let resolvedBridge = ChatRoute.resolveBridgeProvider(
-      peerUserId: row.peerUserId, name: row.title, isAgent: row.isAgentFriend)
+      peerUserId: row.peerUserId,
+      name: row.title,
+      isAgent: row.isAgentFriend,
+      agentId: row.peerAgentId
+    )
     NSLog(
       "[AgentRoute] ChatRoute(row:) chatId=%@ title=%@ peerUserId=%@ peerAgentId=%@ isAgentFriend=%@ resolvedBridge=%@",
       row.chatId, row.title, row.peerUserId ?? "nil", row.peerAgentId ?? "nil",
@@ -433,7 +456,8 @@ struct ChatRoute: Identifiable, Hashable {
       isGroup: row.isGroup,
       unreadCount: row.unreadCount,
       initialRows: cachedRows,
-      agentEventInboxMode: row.agentEventInboxMode
+      agentEventInboxMode: row.agentEventInboxMode,
+      bridgeProvider: resolvedBridge
     )
   }
 
@@ -1297,6 +1321,7 @@ private final class ChatsViewModel: ObservableObject {
         "\(row.isTyping)",
         "\(row.isOnline)",
         row.avatarUri ?? "",
+        row.peerTier ?? "",
       ].joined(separator: "\u{1F}")
     }.joined(separator: "\u{1E}")
   }
@@ -2428,6 +2453,7 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
         "\(row.isTyping)",
         "\(row.isOnline)",
         row.avatarUri ?? "",
+        row.peerTier ?? "",
       ].joined(separator: "\u{1F}")
     }
     return rowSignature.joined(separator: "||") + "||\(isDark ? "dark" : "light")||\(isEditing ? "edit" : "normal")||\(showsRightCheckmark ? "check" : "no_check")||\(selectedChatIDs.sorted().joined(separator: ","))"
@@ -3231,6 +3257,12 @@ final class ChatConversationController: UIViewController {
   /// reveal the composer with no panel flash. Cancelled the moment we connect.
   private var pendingConnectPanelWork: DispatchWorkItem?
 
+  /// The isolated full-screen agent runtime surface (Claude/Codex), hosted as a child VC
+  /// over `mainView` when this DM's Default view is Agent or the user taps "See progress".
+  /// It owns its full bounds + its own header (no nesting under the chat header → no clip /
+  /// overlap), and its back returns to the chat surface.
+  private weak var bridgeAgentSurfaceVC: VibeAgentConversationViewController?
+
   /// The chat currently shown. Used by the coordinator to avoid pushing a
   /// duplicate of the chat already on top of the navigation stack.
   var chatId: String { route.chatId }
@@ -3269,6 +3301,17 @@ final class ChatConversationController: UIViewController {
     mainView.onNativeEvent.handler = { [weak self] payload in
       self?.handleNativeEvent(payload)
     }
+    // Host the DM-level agent runtime view as an isolated full-screen surface over the
+    // chat (its own header + full bounds). ChatListView's presence logic drives these.
+    mainView.onPresentBridgeAgentSurface = { [weak self] vc in
+      self?.presentBridgeAgentSurface(vc)
+    }
+    mainView.onDismissBridgeAgentSurface = { [weak self] in
+      self?.dismissBridgeAgentSurface()
+    }
+    mainView.hostedBridgeAgentProviderProvider = { [weak self] in
+      self?.bridgeAgentSurfaceVC?.agentBridgeProvider
+    }
     // Draw the chat's own native header (back / title / avatar). The view fully
     // implements this; it was only disabled so a SwiftUI .toolbar could draw the
     // header instead — the source of the header flicker. Now that the
@@ -3296,6 +3339,12 @@ final class ChatConversationController: UIViewController {
     super.viewWillAppear(animated)
     logLifecycle("viewWillAppear")
     logVisualState("viewWillAppear", force: true)
+    // If this DM's Default view is Agent, mount the isolated agent surface NOW so it rides this
+    // controller's own push transition AS the page — rather than waiting for the deferred peer-id
+    // binding (~0.28s after viewDidAppear), which would show the chat first and then morph the
+    // agent in over it. ChatListView gates on the per-provider Default-view setting and is
+    // one-shot + idempotent, so calling this on every appear is safe.
+    mountPreferredAgentSurfaceIfNeeded(reason: "viewWillAppear")
   }
 
   override func viewDidAppear(_ animated: Bool) {
@@ -3435,6 +3484,7 @@ final class ChatConversationController: UIViewController {
     markRouteSurfaceStep("header")
     mainView.setHeaderMode(route.chatId == "saved_messages" ? "savedmessages" : "default")
     mainView.setBridgeProvider(route.bridgeProvider ?? "")
+    mountPreferredAgentSurfaceIfNeeded(reason: "applyRoute")
     mainView.setHeaderTitle(route.title)
     mainView.setHeaderUnreadCount(route.unreadCount)
     mainView.setProfileName(route.title)
@@ -3498,6 +3548,15 @@ final class ChatConversationController: UIViewController {
     AppUIStallWatchdog.shared.updateContext(
       "ChatConversationController configureRouteSurface.\(step) chatId=\(route.chatId) reason=applyRoute"
     )
+  }
+
+  private func mountPreferredAgentSurfaceIfNeeded(reason: String) {
+    guard let provider = route.bridgeProvider?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !provider.isEmpty
+    else { return }
+    appShellRouteLog(
+      "ChatConversationController primaryAgentMountAttempt chatId=\(route.chatId) provider=\(provider) reason=\(reason) windowAttached=\(view.window != nil) hasAppeared=\(hasAppeared)")
+    mainView.presentPreferredAgentViewNow(provider: provider)
   }
 
   private func applySurfaceAppearance(
@@ -4202,6 +4261,88 @@ final class ChatConversationController: UIViewController {
     }
   }
 
+  private var bridgeAgentSurfaceNav: UINavigationController?
+
+  /// Host the agent runtime VC full-screen over the chat surface (its own header + full
+  /// bounds — no nesting/clipping). Back returns to the chat surface.
+  private func presentBridgeAgentSurface(_ vc: VibeAgentConversationViewController) {
+    dismissBridgeAgentSurface()
+    bridgeAgentSurfaceVC = vc
+    let nav = UINavigationController(rootViewController: vc)
+    nav.navigationBar.prefersLargeTitles = false
+    bridgeAgentSurfaceNav = nav
+    // Back routing: a primary entry (Default view = Agent) is the DM's own page, so Back
+    // exits straight to Home; a "See progress" drill-down peels back to the chat surface.
+    if vc.isPrimaryAgentSurface {
+      vc.onClose = { [weak self] in self?.exitConversationToHome() }
+    } else {
+      vc.onClose = { [weak self] in self?.dismissBridgeAgentSurface() }
+    }
+    addChild(nav)
+    nav.view.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(nav.view)
+    NSLayoutConstraint.activate([
+      nav.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      nav.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      nav.view.topAnchor.constraint(equalTo: view.topAnchor),
+      nav.view.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+    ])
+    nav.didMove(toParent: self)
+    // Primary entry = the DM's own page. The Default-view=Agent path now mounts it BEFORE this
+    // controller has appeared, so it rides the controller's own push/present transition — one
+    // clean page-in, with the opaque agent view covering the chat from the first frame (no chat
+    // flash, no second "morph"). Only animate a separate trailing-edge slide when it's added
+    // AFTER the controller is already on screen, so a late mount still reads as a push.
+    if vc.isPrimaryAgentSurface && hasAppeared {
+      view.layoutIfNeeded()
+      nav.view.transform = CGAffineTransform(translationX: view.bounds.width, y: 0.0)
+      UIView.animate(
+        withDuration: 0.3, delay: 0.0,
+        options: [.curveEaseOut, .allowUserInteraction]
+      ) {
+        nav.view.transform = .identity
+      }
+    }
+    // Keep the Connect panel (if the bridge isn't paired yet) on top so the user can still
+    // connect; once connected it's removed and the agent surface underneath is revealed.
+    if let connectHost = agentConnectHost {
+      view.bringSubviewToFront(connectHost.view)
+    }
+    appShellRouteLog("ChatConversationController presentAgentSurface chatId=\(route.chatId)")
+  }
+
+  /// Exit the whole DM to Home — used when the agent surface is the DM's primary entry, so
+  /// Back doesn't strand the user on the (never-intended) chat surface. Mirrors the `.chat`
+  /// headerBack exit; the agent overlay rides this controller's pop out to Home, then is
+  /// detached once the transition settles so a recycled controller starts clean.
+  private func exitConversationToHome() {
+    if let onClose {
+      onClose()
+      DispatchQueue.main.async { [weak self] in
+        guard let self, self.presentingViewController != nil, !self.isBeingDismissed else {
+          return
+        }
+        self.dismiss(animated: true)
+      }
+    } else if let navigationController {
+      navigationController.popViewController(animated: true)
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+      self?.dismissBridgeAgentSurface()
+    }
+  }
+
+  /// Remove the isolated agent surface, returning to the chat surface underneath.
+  private func dismissBridgeAgentSurface() {
+    guard let nav = bridgeAgentSurfaceNav else { return }
+    nav.willMove(toParent: nil)
+    nav.view.removeFromSuperview()
+    nav.removeFromParent()
+    bridgeAgentSurfaceNav = nil
+    bridgeAgentSurfaceVC = nil
+    appShellRouteLog("ChatConversationController dismissAgentSurface chatId=\(route.chatId)")
+  }
+
   private func handleNativeEvent(_ payload: [String: Any]) {
     let type = Self.normalizedString(payload["type"]) ?? ""
     appShellRouteLog(
@@ -4593,6 +4734,10 @@ private struct ChatHomeRowView: View {
             .lineLimit(1)
             .foregroundStyle(palette.text)
 
+          if row.isGoldTier {
+            ChatHomeTierBadgeView(label: "Gold")
+          }
+
           if row.isTyping {
             Text("Typing…")
               .font(.caption)
@@ -4638,6 +4783,17 @@ private struct ChatHomeRowView: View {
       RoundedRectangle(cornerRadius: 22, style: .continuous)
         .stroke(palette.border, lineWidth: 1)
     )
+  }
+}
+
+private struct ChatHomeTierBadgeView: View {
+  let label: String
+
+  var body: some View {
+    Image(systemName: "checkmark.seal.fill")
+      .font(.system(size: 14))
+      .symbolRenderingMode(.palette)
+      .foregroundStyle(Color.primary, Color(red: 1.0, green: 0.78, blue: 0.28))
   }
 }
 
@@ -5279,18 +5435,20 @@ private struct ContactSearchView: View {
   private var localAgentUsers: [ContactSearchUser] {
     [
       [
-        "userId": "claude",
+        "userId": ChatRoute.claudeAgentUserId,
         "username": "Claude",
         "handle": "claude",
         "isAgent": true,
         "agentId": "claude",
+        "tier": "gold",
       ],
       [
-        "userId": "codex",
+        "userId": ChatRoute.codexAgentUserId,
         "username": "Codex",
         "handle": "codex",
         "isAgent": true,
         "agentId": "codex",
+        "tier": "gold",
       ],
     ].compactMap(ContactSearchUser.init(payload:))
   }
@@ -5303,6 +5461,7 @@ private struct ContactSearchView: View {
       "profileImage": row.avatarUri ?? "",
       "isAgent": row.isAgentFriend,
       "agentId": row.peerAgentId ?? "",
+      "tier": row.peerTier ?? "",
     ])!
   }
 
@@ -5415,9 +5574,15 @@ private struct ContactSearchResultRow: View {
         }
 
       VStack(alignment: .leading, spacing: 2) {
-        Text(user.username)
-          .font(.system(size: 16, weight: .medium))
-          .foregroundStyle(palette.text)
+        HStack(spacing: 6) {
+          Text(user.username)
+            .font(.system(size: 16, weight: .medium))
+            .foregroundStyle(user.isGoldTier ? Color(red: 0.96, green: 0.72, blue: 0.22) : palette.text)
+          if user.isGoldTier {
+            ChatHomeTierBadgeView(label: "Gold")
+          }
+        }
+        .lineLimit(1)
         Text(user.subtitle)
           .font(.footnote)
           .foregroundStyle(palette.secondaryText)
@@ -5509,6 +5674,7 @@ struct ContactSearchUser: Identifiable {
   let phoneNumber: String?
   let profileImage: String?
   let publicKey: String?
+  let tier: String?
   /// Server `isAgent` flag — true for Claude/Codex (and any other agent shadow user).
   let isAgent: Bool
   /// Server `agentId` — the attached agent's id when `isAgent` is true.
@@ -5516,9 +5682,18 @@ struct ContactSearchUser: Identifiable {
 
   var id: String { userID }
 
+  var isGoldTier: Bool {
+    tier?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "gold"
+  }
+
   /// `"claude"` / `"codex"` when this search result is a computer-bridge agent.
   var bridgeProvider: String? {
-    ChatRoute.resolveBridgeProvider(peerUserId: userID, name: handle ?? username, isAgent: isAgent)
+    ChatRoute.resolveBridgeProvider(
+      peerUserId: userID,
+      name: handle ?? username,
+      isAgent: isAgent,
+      agentId: agentId
+    )
   }
 
   /// `peerAgentId` to bind for engine routing. For a real agent it's the agent id.
@@ -5550,6 +5725,7 @@ struct ContactSearchUser: Identifiable {
     if let phoneNumber { value["phoneNumber"] = phoneNumber }
     if let profileImage { value["profileImage"] = profileImage }
     if let publicKey { value["publicKey"] = publicKey }
+    if let tier { value["tier"] = tier }
     if isAgent { value["isAgent"] = true }
     if let agentId { value["agentId"] = agentId }
     return value
@@ -5577,6 +5753,9 @@ struct ContactSearchUser: Identifiable {
       payload["profileImage"] ?? payload["profile_image"] ?? payload["avatarUrl"] ?? payload["avatar_url"])
     self.publicKey = Self.normalizedString(
       payload["publicKey"] ?? payload["public_key"] ?? payload["friendKey"] ?? payload["friendPublicKey"])
+    self.tier = Self.normalizedString(
+      payload["tier"] ?? payload["friendTier"] ?? payload["friend_tier"] ?? payload["peerTier"]
+        ?? payload["peer_tier"] ?? payload["badge"] ?? payload["badgeTier"] ?? payload["badge_tier"])
     self.isAgent = Self.boolValue(payload["isAgent"] ?? payload["is_agent"])
     self.agentId = Self.normalizedString(
       payload["agentId"] ?? payload["agent_id"] ?? payload["friendAgentId"] ?? payload["friend_agent_id"])

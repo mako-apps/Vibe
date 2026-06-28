@@ -209,6 +209,12 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   private var changeObserver: NSObjectProtocol?
   private var keyboardObservers: [NSObjectProtocol] = []
   private let bottomEdgeFadeView = UIView()
+  private let editToastBlur = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterial))
+  private let editToastIcon = UIImageView()
+  private let editToastLabel = UILabel()
+  private let usageBannerView = ChatPinnedBannerView()
+  private var usageBannerVisible = false
+  private var usageBannerKey: String?
 
   // In-view header (the app hides the system nav bar, so this VC carries its own):
   // model name centered (tappable → model/thinking/speed), connected device beneath,
@@ -235,9 +241,37 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   /// Whether that computer is currently online (drives the "· reconnecting" hint).
   var deviceConnected: Bool = true
 
+  /// True if a chat history was explicitly picked or a new message was sent.
+  /// When false, the view hides messages and shows the "History" button instead of
+  /// the standard "New Chat" / "Menu" actions.
+  var isHistoryPicked: Bool = false {
+    didSet {
+      guard isViewLoaded else { return }
+      updateNavigationButtons()
+      updateRepoPickerStyle()
+      updateEmptyState()
+      tableView.reloadData()
+      updateUsageBanner()
+    }
+  }
+
+  /// Closure called when the user taps "History"
+  var onPresentHistory: (() -> Void)?
+  /// Closure called when the user taps the agent profile button.
+  var onPresentProfile: (() -> Void)?
+
   /// A single centered spinner shown while a session's transcript is loading, instead
   /// of a fake "Loading conversation…" message bubble. Cleared as soon as rows render.
   private let loadingSpinner = VibeAgentArcSpinner()
+  private let repoPickerButton = UIButton(type: .system)
+
+  /// Menu assigned by the host (ChatListView) to display Repo/Permission/Report/History options.
+  var repoPickerMenu: UIMenu? {
+    didSet {
+      repoPickerButton.menu = repoPickerMenu
+      updateRepoPickerStyle()
+    }
+  }
   /// Centered welcome shown when the conversation is empty (and not loading): the agent
   /// chat surface lands here directly — a fresh chat with a clear "start typing" cue —
   /// rather than a separate history screen. Past sessions stay reachable via the nav
@@ -258,6 +292,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
         DispatchQueue.main.asyncAfter(deadline: .now() + 7, execute: work)
       }
       updateLoadingOverlay()
+      updateUsageBanner()
     }
   }
 
@@ -283,6 +318,17 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   /// begins a new, non-resumed task). When nil the trailing "new chat" button is
   /// hidden — set by hosts where a new chat is meaningful (the bridge runtime view).
   var onNewChat: (() -> Void)?
+
+  /// Back/close hook. When set (the isolated full-screen DM agent surface hosted as a
+  /// child of ChatConversationController), the header back button calls this instead of
+  /// pop/dismiss so the host can return to the chat surface. Nil for pushed/modal use.
+  var onClose: (() -> Void)?
+
+  /// True when this surface is the DM's PRIMARY entry — opened because the agent's Default
+  /// view is "Agent", not a "See progress" drill-down from the chat surface. The host wires
+  /// Back to exit the whole DM straight to Home in this case (rather than peeling back to the
+  /// chat view underneath), so the agent reads as its own page, not a layer over chat.
+  var isPrimaryAgentSurface = false
 
   /// Host hook invoked when the user picks "Edit" on a message — after the VC has
   /// reverted the turn's file changes and before it refills the composer. Hosts use
@@ -344,6 +390,10 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   }
 
   @objc func closeTapped() {
+    if let onClose {
+      onClose()
+      return
+    }
     if let nav = navigationController, nav.viewControllers.first !== self {
       nav.popViewController(animated: true)
     } else {
@@ -361,20 +411,43 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     )
     newChatButton.accessibilityLabel = "New Chat"
 
-    let pinAction = UIAction(title: "Pin", image: UIImage(systemName: "pin")) { _ in
-      // TODO: Pin action
-    }
-    let filesAction = UIAction(title: "Files", image: UIImage(systemName: "folder")) { _ in
-      // TODO: Files action
-    }
-
-    let menu = UIMenu(title: "", children: [pinAction, filesAction])
-    let menuButton = UIBarButtonItem(
-      image: UIImage(systemName: "ellipsis"),
-      menu: menu
+    let historyButton = UIBarButtonItem(
+      image: UIImage(systemName: "clock.arrow.circlepath"),
+      style: .plain,
+      target: self,
+      action: #selector(historyTapped)
     )
-    menuButton.accessibilityLabel = "Menu"
-    navigationItem.rightBarButtonItems = [menuButton, newChatButton]
+    historyButton.accessibilityLabel = "History"
+
+    let profileButton = UIBarButtonItem(
+      image: UIImage(systemName: "person.crop.circle"),
+      style: .plain,
+      target: self,
+      action: #selector(profileTapped)
+    )
+    profileButton.accessibilityLabel = "Profile"
+
+    if isHistoryPicked {
+      navigationItem.rightBarButtonItems = [newChatButton, profileButton, historyButton]
+    } else {
+      navigationItem.rightBarButtonItems = [profileButton, historyButton]
+    }
+  }
+
+  private func updateNavigationButtons() {
+    if !isEmbeddedInSwiftUI && !embeddedInChatHost {
+      configureNewChatButton()
+    } else {
+      buildInViewHeader()
+    }
+  }
+
+  @objc private func historyTapped() {
+    onPresentHistory?()
+  }
+
+  @objc private func profileTapped() {
+    onPresentProfile?()
   }
 
   @objc private func newChatTapped() {
@@ -397,6 +470,15 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     expandedProgressMessageIds.removeAll()
     expandedStepIdsByMessage.removeAll()
     progressItemsByMessageId.removeAll()
+    streamStartByMessageId.removeAll()
+    messages = []
+    isLoadingTranscript = false
+    isHistoryPicked = false
+    tableView.reloadData()
+    updateNavigationLiveState()
+    updateLoadingOverlay()
+    updateEditToast()
+    updateUsageBanner(force: true)
     onNewChat?()
   }
 
@@ -434,6 +516,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     composerView.provider = agentBridgeProvider ?? "codex"
     composerView.onSend = { [weak self] text, options in
       guard let self else { return }
+      self.isHistoryPicked = true
       self.onSend?(text, options, self.composerView.consumePendingAttachments())
     }
     composerView.onAttach = { [weak self] in
@@ -443,6 +526,13 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       self?.updateComposerHeight(height, animated: true)
     }
     view.addSubview(composerView)
+
+    setupEditToast()
+
+    repoPickerButton.translatesAutoresizingMaskIntoConstraints = false
+    repoPickerButton.showsMenuAsPrimaryAction = true
+    updateRepoPickerStyle()
+    view.addSubview(repoPickerButton)
 
     progressSheet.translatesAutoresizingMaskIntoConstraints = false
     progressSheet.applyAppearance(appearance)
@@ -455,6 +545,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     view.addSubview(loadingSpinner)
 
     setupEmptyState()
+    setupUsageBanner()
 
     // Pin the feed to the TRUE bottom so messages scroll UNDER the floating composer
     // (Resolo-style, no hard footer line). `updateScrollInsets()` keeps a bottom
@@ -479,12 +570,24 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       composerView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
       composerBottomConstraint,
       composerHeightConstraint,
+      editToastBlur.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+      editToastBlur.leadingAnchor.constraint(
+        greaterThanOrEqualTo: view.leadingAnchor, constant: 16.0),
+      editToastBlur.trailingAnchor.constraint(
+        lessThanOrEqualTo: view.trailingAnchor, constant: -16.0),
+      editToastBlur.bottomAnchor.constraint(equalTo: composerView.topAnchor, constant: -8.0),
+      repoPickerButton.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16.0),
+      repoPickerButton.bottomAnchor.constraint(equalTo: composerView.topAnchor, constant: -8.0),
       progressSheet.topAnchor.constraint(equalTo: view.topAnchor),
       progressSheet.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       progressSheet.trailingAnchor.constraint(equalTo: view.trailingAnchor),
       progressSheet.bottomAnchor.constraint(equalTo: view.bottomAnchor),
       loadingSpinner.centerXAnchor.constraint(equalTo: view.centerXAnchor),
       loadingSpinner.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+      usageBannerView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 18.0),
+      usageBannerView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -18.0),
+      usageBannerView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8.0),
+      usageBannerView.heightAnchor.constraint(equalToConstant: ChatPinnedBannerView.preferredHeight),
       emptyStateView.centerXAnchor.constraint(equalTo: view.centerXAnchor),
       emptyStateView.centerYAnchor.constraint(equalTo: view.centerYAnchor, constant: -24.0),
       emptyStateView.leadingAnchor.constraint(
@@ -505,10 +608,9 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     ])
     updateBottomEdgeFade()
 
-    // The in-view header is built early (before the table/composer were added), so lift
-    // it above the feed and keep the spinner/empty-state on top of it.
-    if usesInViewHeader, headerBar.superview === view {
-      view.bringSubviewToFront(headerBar)
+    // Configure model popup on load
+    DispatchQueue.main.async { [weak self] in
+      self?.refreshModelMenu()
     }
 
     indexProgress()
@@ -519,11 +621,6 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
 
   override func viewWillAppear(_ animated: Bool) {
     super.viewWillAppear(animated)
-    if usesInViewHeader {
-      // The VC draws its own header; keep any host nav bar (incl. a wrapped modal nav)
-      // hidden so there's no double bar.
-      navigationController?.setNavigationBarHidden(true, animated: false)
-    }
     applyNavigationAppearance()
   }
 
@@ -544,11 +641,13 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       progressSheet.applyAppearance(appearance)
       composerView.applyAppearance(appearance)
       loadingSpinner.color = appearance.textSecondary
+      updateEditToastAppearance()
       if !isEmbeddedInSwiftUI {
         applyNavigationAppearance()
       }
       updateBottomEdgeFade()
       updateEmptyState()
+      updateUsageBanner(force: true)
       tableView.reloadData()
     }
   }
@@ -559,6 +658,11 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   /// reload is fine here — the surface is single-task and short.
   func setMessages(_ newMessages: [VibeAgentKitChatMessage]) {
     guard newMessages != messages else { return }
+    if !isHistoryPicked,
+      newMessages.contains(where: { $0.isStreaming || $0.runtime?.status == "running" })
+    {
+      isHistoryPicked = true
+    }
     let wasNearBottom = isNearBottom()
     let oldIds = messages.map(\.id)
     messages = newMessages
@@ -566,8 +670,10 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     if !newMessages.isEmpty { isLoadingTranscript = false }
     trackStreamStarts(newMessages)
     indexProgress()
+    updateEditToast()
     updateNavigationLiveState()
     updateLoadingOverlay()
+    updateUsageBanner()
 
     // A pure append (new turns pushed onto the end — the typical "send") animates the
     // new rows in and scrolls up, matching Resolo's push-in feel. Anything else
@@ -576,7 +682,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     let newIds = newMessages.map(\.id)
     let isPureAppend =
       newIds.count > oldIds.count && Array(newIds.prefix(oldIds.count)) == oldIds
-    if isPureAppend, tableView.window != nil, tableView.numberOfRows(inSection: 0) == oldIds.count {
+    if isHistoryPicked, isPureAppend, tableView.window != nil, tableView.numberOfRows(inSection: 0) == oldIds.count {
       let inserted = (oldIds.count..<newIds.count).map { IndexPath(row: $0, section: 0) }
       tableView.performBatchUpdates {
         tableView.insertRows(at: inserted, with: .fade)
@@ -589,7 +695,23 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     }
   }
 
+  func setTranscriptLoading(_ loading: Bool) {
+    if loading { isHistoryPicked = true }
+    isLoadingTranscript = loading
+    updateRepoPickerStyle()
+    updateEmptyState()
+    updateUsageBanner()
+  }
+
   private func observeLiveMessages() {
+    selectionObserver = NotificationCenter.default.addObserver(
+      forName: AgentBridgeSelectionStore.didChangeNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      self?.updateRepoPickerStyle()
+    }
+
     guard messagesProvider != nil else { return }
     changeObserver = NotificationCenter.default.addObserver(
       forName: ChatEngine.didChangeNotification,
@@ -607,6 +729,14 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     setMessages(next)
   }
 
+  /// Pull the latest rows into the feed on demand. Used right after a send from this
+  /// surface: the chat list appends the outgoing bubble synchronously (no engine
+  /// `didChange` fires for the optimistic native row), so without an explicit poke
+  /// the user's message would only appear in the chat view, not here.
+  func reloadLiveMessages() {
+    refreshFromProvider()
+  }
+
   private func configureNavigationTitle() {
     // The embedded (profile) path gets its header from the SwiftUI NavigationStack
     // toolbar; only the standalone/chat presentations build the in-view header.
@@ -614,43 +744,30 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     buildInViewHeader()
   }
 
-  /// Build the VC's own header bar. The app hides the system nav bar (custom chat
-  /// headers), so pushing this VC there left it header-less; this restores a header
-  /// showing the model (center, tappable) + connected device beneath.
   private func buildInViewHeader() {
-    navigationController?.setNavigationBarHidden(true, animated: false)
+    navigationController?.setNavigationBarHidden(false, animated: false)
 
-    headerBar.translatesAutoresizingMaskIntoConstraints = false
-    view.addSubview(headerBar)
+    let titleStack = UIStackView()
+    titleStack.axis = .vertical
+    titleStack.alignment = .center
 
-    headerBlur.translatesAutoresizingMaskIntoConstraints = false
-    headerBlur.isUserInteractionEnabled = false
-    headerBar.addSubview(headerBlur)
-
-    headerSeparator.translatesAutoresizingMaskIntoConstraints = false
-    headerBar.addSubview(headerSeparator)
-
-    let symbol = { (name: String, pt: CGFloat, weight: UIImage.SymbolWeight) in
-      UIImage(systemName: name, withConfiguration: UIImage.SymbolConfiguration(pointSize: pt, weight: weight))
-    }
-
-    headerBackButton.translatesAutoresizingMaskIntoConstraints = false
-    headerBackButton.setImage(symbol("chevron.left", 17, .semibold), for: .normal)
-    headerBackButton.accessibilityLabel = "Back"
-    headerBackButton.addTarget(self, action: #selector(closeTapped), for: .touchUpInside)
-    headerBar.addSubview(headerBackButton)
+    let subtitleStack = UIStackView(arrangedSubviews: [connectionDotView, connectionSpinner, subtitleLabel])
+    subtitleStack.spacing = 4
+    subtitleStack.alignment = .center
 
     var modelCfg = UIButton.Configuration.plain()
     modelCfg.contentInsets = NSDirectionalEdgeInsets(top: 2, leading: 6, bottom: 2, trailing: 6)
     modelCfg.imagePlacement = .trailing
     modelCfg.imagePadding = 4
-    modelCfg.image = symbol("chevron.up.chevron.down", 10, .semibold)
+    modelCfg.image = UIImage(systemName: "chevron.up.chevron.down", withConfiguration: UIImage.SymbolConfiguration(pointSize: 10, weight: .semibold))
     headerModelButton.configuration = modelCfg
     headerModelButton.showsMenuAsPrimaryAction = true
-    headerModelButton.translatesAutoresizingMaskIntoConstraints = false
     headerModelButton.accessibilityLabel = "Model and run options"
 
-    // Connection pip + spinner sit at the LEFT of the device line.
+    titleStack.addArrangedSubview(headerModelButton)
+    titleStack.addArrangedSubview(subtitleStack)
+
+    // Connection pip + spinner
     connectionDotView.layer.cornerRadius = 3
     connectionDotView.layer.cornerCurve = .continuous
     connectionDotView.translatesAutoresizingMaskIntoConstraints = false
@@ -661,96 +778,48 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     subtitleLabel.font = UIFont.systemFont(ofSize: 11.5, weight: .medium)
     subtitleLabel.textAlignment = .left
     subtitleLabel.lineBreakMode = .byTruncatingTail
-    subtitleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
-    let deviceRow = UIStackView(arrangedSubviews: [connectionDotView, connectionSpinner, subtitleLabel])
-    deviceRow.axis = .horizontal
-    deviceRow.alignment = .center
-    deviceRow.spacing = 5
-
-    // The model is the prominent centered title; the device + connection pip sit beneath
-    // it. Keeping the model on its own row (no inline accessories) means toggling the
-    // connection state never shifts the model off-center.
-    let centerStack = UIStackView(arrangedSubviews: [headerModelButton, deviceRow])
-    centerStack.axis = .vertical
-    centerStack.alignment = .center
-    centerStack.spacing = 1
-    centerStack.translatesAutoresizingMaskIntoConstraints = false
-    headerBar.addSubview(centerStack)
-
-    headerNewChatButton.translatesAutoresizingMaskIntoConstraints = false
-    headerNewChatButton.setImage(symbol("square.and.pencil", 16, .regular), for: .normal)
-    headerNewChatButton.accessibilityLabel = "New Chat"
-    headerNewChatButton.addTarget(self, action: #selector(newChatTapped), for: .touchUpInside)
-    headerBar.addSubview(headerNewChatButton)
-
-    headerMenuButton.translatesAutoresizingMaskIntoConstraints = false
-    headerMenuButton.setImage(symbol("ellipsis", 16, .regular), for: .normal)
-    headerMenuButton.accessibilityLabel = "Menu"
-    headerMenuButton.showsMenuAsPrimaryAction = true
-    headerMenuButton.menu = UIMenu(children: [
-      UIAction(title: "Pin", image: UIImage(systemName: "pin")) { _ in },
-      UIAction(title: "Files", image: UIImage(systemName: "folder")) { _ in },
-    ])
-    headerBar.addSubview(headerMenuButton)
-
-    let heightC = headerBar.heightAnchor.constraint(equalToConstant: 52)
-    headerHeightConstraint = heightC
-
-    // Center the title block, but let it yield to the leading/trailing button bounds so a
-    // long model + device line never forces an ambiguous break that shoves it off-center.
-    let centerX = centerStack.centerXAnchor.constraint(equalTo: headerBar.centerXAnchor)
-    centerX.priority = .defaultHigh
 
     NSLayoutConstraint.activate([
-      headerBar.topAnchor.constraint(equalTo: view.topAnchor),
-      headerBar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-      headerBar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-      heightC,
-
-      headerBlur.topAnchor.constraint(equalTo: headerBar.topAnchor),
-      headerBlur.leadingAnchor.constraint(equalTo: headerBar.leadingAnchor),
-      headerBlur.trailingAnchor.constraint(equalTo: headerBar.trailingAnchor),
-      headerBlur.bottomAnchor.constraint(equalTo: headerBar.bottomAnchor),
-
-      headerSeparator.leadingAnchor.constraint(equalTo: headerBar.leadingAnchor),
-      headerSeparator.trailingAnchor.constraint(equalTo: headerBar.trailingAnchor),
-      headerSeparator.bottomAnchor.constraint(equalTo: headerBar.bottomAnchor),
-      headerSeparator.heightAnchor.constraint(equalToConstant: 0.5),
-
-      headerBackButton.leadingAnchor.constraint(equalTo: headerBar.leadingAnchor, constant: 8),
-      headerBackButton.bottomAnchor.constraint(equalTo: headerBar.bottomAnchor, constant: -7),
-      headerBackButton.widthAnchor.constraint(equalToConstant: 38),
-      headerBackButton.heightAnchor.constraint(equalToConstant: 38),
-
-      headerMenuButton.trailingAnchor.constraint(equalTo: headerBar.trailingAnchor, constant: -10),
-      headerMenuButton.centerYAnchor.constraint(equalTo: headerBackButton.centerYAnchor),
-      headerMenuButton.widthAnchor.constraint(equalToConstant: 34),
-      headerMenuButton.heightAnchor.constraint(equalToConstant: 34),
-
-      headerNewChatButton.trailingAnchor.constraint(equalTo: headerMenuButton.leadingAnchor, constant: -4),
-      headerNewChatButton.centerYAnchor.constraint(equalTo: headerBackButton.centerYAnchor),
-      headerNewChatButton.widthAnchor.constraint(equalToConstant: 34),
-      headerNewChatButton.heightAnchor.constraint(equalToConstant: 34),
-
-      centerX,
-      centerStack.centerYAnchor.constraint(equalTo: headerBackButton.centerYAnchor),
-      centerStack.leadingAnchor.constraint(
-        greaterThanOrEqualTo: headerBackButton.trailingAnchor, constant: 8),
-      centerStack.trailingAnchor.constraint(
-        lessThanOrEqualTo: headerNewChatButton.leadingAnchor, constant: -8),
-
       connectionDotView.widthAnchor.constraint(equalToConstant: 6),
-      connectionDotView.heightAnchor.constraint(equalToConstant: 6),
+      connectionDotView.heightAnchor.constraint(equalToConstant: 6)
     ])
 
-    selectionObserver = NotificationCenter.default.addObserver(
-      forName: AgentBridgeSelectionStore.didChangeNotification, object: nil, queue: .main
-    ) { [weak self] _ in self?.updateHeaderTexts() }
+    navigationItem.titleView = titleStack
 
-    applyNavigationAppearance()
+    if onClose != nil {
+      let backButton = UIBarButtonItem(image: UIImage(systemName: "chevron.left"), style: .plain, target: self, action: #selector(closeTapped))
+      navigationItem.leftBarButtonItem = backButton
+    }
+
+    let newChatBtn = UIBarButtonItem(
+      image: UIImage(systemName: "square.and.pencil"),
+      style: .plain,
+      target: self,
+      action: #selector(newChatTapped)
+    )
+
+    let historyButton = UIBarButtonItem(
+      image: UIImage(systemName: "clock.arrow.circlepath"),
+      style: .plain,
+      target: self,
+      action: #selector(historyTapped)
+    )
+    let profileButton = UIBarButtonItem(
+      image: UIImage(systemName: "person.crop.circle"),
+      style: .plain,
+      target: self,
+      action: #selector(profileTapped)
+    )
+    newChatBtn.accessibilityLabel = "New Chat"
+    historyButton.accessibilityLabel = "History"
+    profileButton.accessibilityLabel = "Profile"
+
+    if isHistoryPicked {
+      navigationItem.rightBarButtonItems = [newChatBtn, profileButton, historyButton]
+    } else {
+      navigationItem.rightBarButtonItems = [profileButton, historyButton]
+    }
     updateHeaderTexts()
-    updateNavigationLiveState()
   }
 
   /// Latest model a run in this conversation reported (the bridge sends
@@ -774,11 +843,11 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     let selected = AgentBridgeSelectionStore.selectedModel(provider: provider)
     let modelTitle = AgentBridgeSelectionStore.modelTitle(
       provider: provider, model: selected ?? runModel ?? latestRuntimeModel)
-    var cfg = headerModelButton.configuration ?? UIButton.Configuration.plain()
-    var titleAttributes = AttributeContainer()
-    titleAttributes.font = UIFont.systemFont(ofSize: 16, weight: .semibold)
-    cfg.attributedTitle = AttributedString(modelTitle, attributes: titleAttributes)
-    headerModelButton.configuration = cfg
+
+    headerModelButton.setTitle(modelTitle, for: .normal)
+    let color = vibeAgentKitColorWithAlpha(appearance.text, 0.8)
+    headerModelButton.setTitleColor(color, for: .normal)
+    headerModelButton.tintColor = color
     headerModelButton.menu = runOptionsMenu()
 
     // Compact device name; the connection state is shown by the pip/spinner, not text.
@@ -786,25 +855,19 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     let connected = (deviceLabel != nil) ? deviceConnected : AgentPairingService.lastConnected
     let deviceText = (device?.isEmpty == false) ? device : runtimeSubtitle
     subtitleLabel.text = deviceText
-    let hasDevice = (deviceText ?? "").isEmpty == false
-    subtitleLabel.isHidden = !hasDevice
-    updateConnectionIndicator(connected: connected, hasDevice: hasDevice)
-  }
+    subtitleLabel.textColor = appearance.textSecondary
 
-  /// Green pip when the computer is connected; red pip + spinner while reconnecting.
-  private func updateConnectionIndicator(connected: Bool, hasDevice: Bool) {
-    guard usesInViewHeader else { return }
-    connectionDotView.isHidden = !hasDevice
-    if connected {
-      connectionDotView.backgroundColor = UIColor.systemGreen
-      connectionSpinner.stopAnimating()
+    let hasDevice = (deviceText ?? "").isEmpty == false
+    let isReconnecting = !connected && hasDevice
+
+    if isReconnecting {
+      connectionDotView.isHidden = true
+      connectionSpinner.color = appearance.textSecondary
+      connectionSpinner.startAnimating()
     } else {
-      connectionDotView.backgroundColor = UIColor.systemRed
-      if hasDevice {
-        connectionSpinner.startAnimating()
-      } else {
-        connectionSpinner.stopAnimating()
-      }
+      connectionSpinner.stopAnimating()
+      connectionDotView.isHidden = !hasDevice
+      connectionDotView.backgroundColor = UIColor(red: 0.16, green: 0.78, blue: 0.45, alpha: 1)
     }
   }
 
@@ -856,24 +919,18 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     ])
   }
 
+  private func refreshModelMenu() {
+    headerModelButton.menu = runOptionsMenu()
+  }
+
   private func applyNavigationAppearance() {
-    liveDotView.backgroundColor = UIColor.systemGreen
-    liveLabel.textColor = UIColor.systemGreen
     connectionSpinner.color = appearance.textSecondary
     subtitleLabel.textColor = appearance.textSecondary
 
-    if usesInViewHeader {
-      headerBar.backgroundColor = .clear
-      headerSeparator.backgroundColor = appearance.textSecondary.withAlphaComponent(0.14)
-      headerBackButton.tintColor = appearance.text
-      headerNewChatButton.tintColor = appearance.text
-      headerMenuButton.tintColor = appearance.text
-      headerModelButton.tintColor = appearance.text
-      var cfg = headerModelButton.configuration ?? .plain()
-      cfg.baseForegroundColor = appearance.text
-      headerModelButton.configuration = cfg
-      return
-    }
+    headerModelButton.tintColor = appearance.text
+    var cfg = headerModelButton.configuration ?? .plain()
+    cfg.baseForegroundColor = appearance.text
+    headerModelButton.configuration = cfg
 
     // Embedded (SwiftUI nav) path — keep the bar fully transparent so the feed flows
     // under it edge-to-edge.
@@ -944,7 +1001,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   /// Downscale + JPEG-encode so the encrypted blob is small enough to ride inside a
   /// chat message, then seal it with the pairing key so the server only relays an
   /// opaque payload. The daemon decrypts it and writes the file for the agent to read.
-  private static func sealedImageBlob(from image: UIImage) -> String? {
+  static func sealedImageBlob(from image: UIImage) -> String? {
     let scaled = scaledImage(image, maxDimension: 1024)
     guard let data = scaled.jpegData(compressionQuality: 0.55) else { return nil }
     let object: [String: Any] = [
@@ -1021,7 +1078,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   // MARK: Table
 
   func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-    messages.count
+    isHistoryPicked ? messages.count : 0
   }
 
   func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
@@ -1050,7 +1107,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     cell.selectionStyle = .none
     cell.onProgressTap = { [weak self] in self?.toggleProgress(for: message.id) }
     cell.onRuntimeTap = { [weak self] runtime in self?.presentRuntime(runtime) }
-    cell.onStepTap = { [weak self] nodeId in self?.presentStepDetail(messageId: message.id, nodeId: nodeId) }
+    cell.onStepTap = { [weak self] nodeId in self?.toggleStepDetail(messageId: message.id, nodeId: nodeId) }
     cell.configure(
       message: message,
       appearance: appearance,
@@ -1229,23 +1286,37 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     animateExpansion(anchorRow: indexPath)
   }
 
-  // Tapping a single step row (a command, an edit, a read) opens its full detail in a
-  // bottom SHEET — the command + result code box, the edit patch, the read file slice —
-  // rather than unfolding inline (which pushed the rest of the turn around). The sheet
-  // is self-contained and dismissible, so drilling into a step never disturbs the feed.
-  private func presentStepDetail(messageId: String, nodeId: String) {
-    guard
-      let items = progressItemsByMessageId[messageId],
-      let item = items.first(where: { ($0.nodeId ?? $0.label) == nodeId })
-    else { return }
-    let controller = VibeAgentKitStepDetailViewController(item: item, appearance: appearance)
-    let nav = UINavigationController(rootViewController: controller)
-    if let sheet = nav.sheetPresentationController {
-      sheet.detents = [.medium(), .large()]
-      sheet.prefersGrabberVisible = true
-      sheet.preferredCornerRadius = 22.0
+  // Tapping one completed step row (command, edit, read) opens its detail inline
+  // under that row. The parent "Worked" card stays expanded and the tapped row is
+  // reconfigured in place, so file diffs do not leave the conversation surface.
+  private func toggleStepDetail(messageId: String, nodeId: String) {
+    var expanded = expandedStepIdsByMessage[messageId] ?? []
+    if expanded.contains(nodeId) {
+      expanded.remove(nodeId)
+    } else {
+      expanded.insert(nodeId)
     }
-    present(nav, animated: true)
+    if expanded.isEmpty {
+      expandedStepIdsByMessage.removeValue(forKey: messageId)
+    } else {
+      expandedStepIdsByMessage[messageId] = expanded
+    }
+    expandedProgressMessageIds.insert(messageId)
+
+    guard let row = messages.firstIndex(where: { $0.id == messageId }) else { return }
+    let indexPath = IndexPath(row: row, section: 0)
+    if let cell = tableView.cellForRow(at: indexPath) as? VibeAgentKitMessageCell {
+      cell.configure(
+        message: messages[row],
+        appearance: appearance,
+        regeneratePrompt: regeneratePrompt,
+        showsActions: false,
+        isProgressExpanded: true,
+        expandedStepIds: expanded,
+        streamingStartDate: messages[row].isStreaming ? streamStartByMessageId[messageId] : nil
+      )
+    }
+    animateExpansion(anchorRow: indexPath)
   }
 
   private func presentRuntime(_ runtime: ChatListRow.AgentRuntimeSummary) {
@@ -1294,7 +1365,8 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
 
     emptyStateIcon.translatesAutoresizingMaskIntoConstraints = false
     emptyStateIcon.contentMode = .scaleAspectFit
-    emptyStateIcon.image = UIImage(systemName: "sparkles")?.withRenderingMode(.alwaysTemplate)
+    emptyStateIcon.image = nil
+    emptyStateIcon.isHidden = true
     emptyStateIcon.tintColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.55)
 
     emptyStateTitle.numberOfLines = 0
@@ -1307,28 +1379,33 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     emptyStateSubtitle.font = UIFont.systemFont(ofSize: 14.5, weight: .regular)
     emptyStateSubtitle.textColor = appearance.textSecondary
 
-    emptyStateView.addArrangedSubview(emptyStateIcon)
-    emptyStateView.setCustomSpacing(14.0, after: emptyStateIcon)
     emptyStateView.addArrangedSubview(emptyStateTitle)
     emptyStateView.addArrangedSubview(emptyStateSubtitle)
     view.addSubview(emptyStateView)
-    NSLayoutConstraint.activate([
-      emptyStateIcon.widthAnchor.constraint(equalToConstant: 34.0),
-      emptyStateIcon.heightAnchor.constraint(equalToConstant: 34.0),
-    ])
   }
 
   private func updateEmptyState() {
-    // The Claude/Codex bridge view is a SESSION surface: it loads a specific
-    // conversation's history (or live run), so a "Start a new chat" welcome here just
-    // fought the history load and flashed over the spinner. Only the standalone agent
-    // surface shows the welcome; the bridge view shows the spinner, then the transcript.
-    let show = messages.isEmpty && !isLoadingTranscript && !isEmbeddedInSwiftUI
+    let show = (!isHistoryPicked) || (messages.isEmpty && !isLoadingTranscript && !isEmbeddedInSwiftUI)
     emptyStateView.isHidden = !show
     guard show else { return }
-    let name = agentDisplayName
-    emptyStateTitle.text = "Start a new chat with \(name)"
-    emptyStateSubtitle.text = "Ask a question or describe a task — \(name) runs it on your computer and the reply streams back here."
+    let repoName = AgentBridgeSelectionStore.selectedRepository()?.name
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    switch (agentBridgeProvider ?? "").lowercased() {
+    case "claude":
+      emptyStateTitle.text = "You've come to the absolutely right place."
+      emptyStateSubtitle.text = "Start with a task and Claude will run it on your computer."
+    case "codex":
+      if let repoName, !repoName.isEmpty {
+        emptyStateTitle.text = "What should we build on \(repoName)?"
+      } else {
+        emptyStateTitle.text = "What should we build?"
+      }
+      emptyStateSubtitle.text = "Pick a repo, describe the change, and Codex will work from your computer."
+    default:
+      let name = agentDisplayName
+      emptyStateTitle.text = "Start a new chat with \(name)"
+      emptyStateSubtitle.text = "Ask a question or describe a task and \(name) will run it on your computer."
+    }
     emptyStateIcon.tintColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.55)
     emptyStateTitle.textColor = appearance.text
     emptyStateSubtitle.textColor = appearance.textSecondary
@@ -1338,18 +1415,235 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
 
   override func viewDidLayoutSubviews() {
     super.viewDidLayoutSubviews()
-    if usesInViewHeader {
-      let h = view.safeAreaInsets.top + 52
-      if headerHeightConstraint?.constant != h { headerHeightConstraint?.constant = h }
-      // Tuck the feed just under the blurred header so the first row clears it.
-      let topInset = max(12, h - 4)
-      if abs(tableView.contentInset.top - topInset) > 0.5 {
-        tableView.contentInset.top = topInset
-        tableView.verticalScrollIndicatorInsets.top = h
-      }
-    }
     updateScrollInsets()
     updateBottomEdgeFadeFrame()
+  }
+
+  private func setupEditToast() {
+    editToastBlur.translatesAutoresizingMaskIntoConstraints = false
+    editToastBlur.alpha = 0.0
+    editToastBlur.isHidden = true
+    editToastBlur.clipsToBounds = true
+    editToastBlur.layer.cornerRadius = 16.0
+    editToastBlur.layer.cornerCurve = .continuous
+    editToastBlur.layer.borderWidth = 0.6
+    view.addSubview(editToastBlur)
+
+    editToastIcon.translatesAutoresizingMaskIntoConstraints = false
+    editToastIcon.contentMode = .scaleAspectFit
+    editToastIcon.image = UIImage(systemName: "doc.text.fill")?.withRenderingMode(.alwaysTemplate)
+    editToastBlur.contentView.addSubview(editToastIcon)
+
+    editToastLabel.translatesAutoresizingMaskIntoConstraints = false
+    editToastLabel.numberOfLines = 1
+    editToastLabel.lineBreakMode = .byTruncatingMiddle
+    editToastLabel.font = UIFont.systemFont(ofSize: 12.5, weight: .semibold)
+    editToastBlur.contentView.addSubview(editToastLabel)
+
+    NSLayoutConstraint.activate([
+      editToastIcon.leadingAnchor.constraint(
+        equalTo: editToastBlur.contentView.leadingAnchor, constant: 12.0),
+      editToastIcon.centerYAnchor.constraint(equalTo: editToastBlur.contentView.centerYAnchor),
+      editToastIcon.widthAnchor.constraint(equalToConstant: 14.0),
+      editToastIcon.heightAnchor.constraint(equalToConstant: 14.0),
+      editToastLabel.leadingAnchor.constraint(equalTo: editToastIcon.trailingAnchor, constant: 7.0),
+      editToastLabel.trailingAnchor.constraint(
+        equalTo: editToastBlur.contentView.trailingAnchor, constant: -12.0),
+      editToastLabel.topAnchor.constraint(equalTo: editToastBlur.contentView.topAnchor, constant: 7.0),
+      editToastLabel.bottomAnchor.constraint(
+        equalTo: editToastBlur.contentView.bottomAnchor, constant: -7.0),
+    ])
+    updateEditToastAppearance()
+    updateEditToast()
+  }
+
+  private func updateEditToastAppearance() {
+    editToastIcon.tintColor = vibeAgentKitColorWithAlpha(appearance.text, 0.82)
+    editToastLabel.textColor = vibeAgentKitColorWithAlpha(appearance.text, 0.88)
+    editToastBlur.contentView.backgroundColor =
+      (appearance.isDark ? UIColor.white : UIColor.black)
+      .withAlphaComponent(appearance.isDark ? 0.055 : 0.045)
+    editToastBlur.layer.borderColor =
+      vibeAgentKitColorWithAlpha(appearance.textSecondary, appearance.isDark ? 0.18 : 0.14).cgColor
+  }
+
+  private func setupUsageBanner() {
+    usageBannerView.translatesAutoresizingMaskIntoConstraints = false
+    usageBannerView.isHidden = true
+    usageBannerView.alpha = 0.0
+    usageBannerView.isUserInteractionEnabled = false
+    usageBannerView.applyTheme(
+      textColor: appearance.text,
+      surfaceColor: appearance.surfaceElevated,
+      isDark: appearance.isDark
+    )
+    view.addSubview(usageBannerView)
+  }
+
+  private func updateUsageBanner(force: Bool = false) {
+    guard isViewLoaded else { return }
+    usageBannerView.applyTheme(
+      textColor: appearance.text,
+      surfaceColor: appearance.surfaceElevated,
+      isDark: appearance.isDark
+    )
+
+    guard let snapshot = latestUsageBannerSnapshot(), isHistoryPicked, !isLoadingTranscript else {
+      setUsageBannerVisible(false, key: nil, force: force)
+      return
+    }
+
+    let key = "\(snapshot.title)|\(snapshot.body)"
+    if force || key != usageBannerKey {
+      usageBannerView.configure(
+        title: snapshot.title,
+        body: snapshot.body,
+        systemImage: "gauge.with.dots.needle.bottom.50percent",
+        animateIcon: usageBannerKey != nil
+      )
+    }
+    setUsageBannerVisible(true, key: key, force: force)
+  }
+
+  private func setUsageBannerVisible(_ visible: Bool, key: String?, force: Bool) {
+    usageBannerKey = key
+    guard force || visible != usageBannerVisible else { return }
+    usageBannerVisible = visible
+    updateScrollInsets()
+    if visible {
+      usageBannerView.isHidden = false
+      view.bringSubviewToFront(usageBannerView)
+      UIView.animate(
+        withDuration: 0.18,
+        delay: 0.0,
+        options: [.beginFromCurrentState, .allowUserInteraction]
+      ) {
+        self.usageBannerView.alpha = 1.0
+      }
+    } else {
+      UIView.animate(
+        withDuration: 0.16,
+        delay: 0.0,
+        options: [.beginFromCurrentState, .allowUserInteraction]
+      ) {
+        self.usageBannerView.alpha = 0.0
+      } completion: { _ in
+        if self.usageBannerView.alpha <= 0.01 {
+          self.usageBannerView.isHidden = true
+        }
+      }
+    }
+  }
+
+  private func latestUsageBannerSnapshot() -> (title: String, body: String)? {
+    for message in messages.reversed() {
+      guard let runtime = message.runtime, let usage = runtime.usage else { continue }
+      let used = agentUsageTokens(usage)
+      guard used > 0 else { continue }
+      let limit = agentUsageLimit(provider: runtime.provider ?? agentBridgeProvider, model: runtime.model)
+      let ratio = Double(used) / Double(limit)
+      guard ratio >= 0.72 else { continue }
+
+      let provider = (runtime.provider ?? agentBridgeProvider ?? agentDisplayName)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      let providerTitle =
+        provider.isEmpty
+        ? agentDisplayName
+        : provider.prefix(1).uppercased() + String(provider.dropFirst())
+      let percent = Int(round(ratio * 100.0))
+      var body =
+        "\(providerTitle) \(percent)% · \(Self.compactTokenCount(used)) / \(Self.compactTokenCount(limit)) tokens"
+      if let cost = usage.totalCostUsd, cost > 0 {
+        body += String(format: " · $%.2f", cost)
+      }
+      let title = ratio >= 0.9 ? "Context nearly full" : "Context usage"
+      return (title, body)
+    }
+    return nil
+  }
+
+  private func agentUsageTokens(_ usage: ChatListRow.AgentRuntimeUsage) -> Int {
+    max(
+      0,
+      (usage.inputTokens ?? 0)
+        + (usage.outputTokens ?? 0)
+        + (usage.reasoningOutputTokens ?? 0)
+    )
+  }
+
+  private func agentUsageLimit(provider: String?, model: String?) -> Int {
+    let providerValue = (provider ?? "").lowercased()
+    let modelValue = (model ?? "").lowercased()
+    if providerValue == "claude" || modelValue.contains("claude") {
+      return 200_000
+    }
+    return 200_000
+  }
+
+  private static func compactTokenCount(_ value: Int) -> String {
+    if value >= 1_000_000 {
+      return String(format: "%.1fM", Double(value) / 1_000_000.0)
+    }
+    if value >= 1000 {
+      return String(format: "%.0fk", Double(value) / 1000.0)
+    }
+    return "\(value)"
+  }
+
+  private func updateEditToast() {
+    guard isViewLoaded else { return }
+    let text = latestEditToastText()
+    let shouldShow = text != nil && isHistoryPicked && !isLoadingTranscript
+    editToastLabel.text = text
+    guard editToastBlur.isHidden == shouldShow || abs(editToastBlur.alpha - (shouldShow ? 1.0 : 0.0)) > 0.01 else {
+      return
+    }
+    if shouldShow {
+      editToastBlur.isHidden = false
+      UIView.animate(withDuration: 0.18, delay: 0, options: [.beginFromCurrentState, .allowUserInteraction]) {
+        self.editToastBlur.alpha = 1.0
+      }
+    } else {
+      UIView.animate(withDuration: 0.16, delay: 0, options: [.beginFromCurrentState, .allowUserInteraction]) {
+        self.editToastBlur.alpha = 0.0
+      } completion: { _ in
+        if self.editToastBlur.alpha <= 0.01 { self.editToastBlur.isHidden = true }
+      }
+    }
+  }
+
+  private func latestEditToastText() -> String? {
+    for message in messages.reversed() {
+      for item in message.progressItems.reversed() {
+        let kind = (item.itemType ?? item.tool ?? "").lowercased()
+        guard kind == "edit" || kind == "write" else { continue }
+        let file = item.fileName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = (file?.isEmpty == false) ? file! : item.label
+        var parts = ["Edited \(URL(fileURLWithPath: name).lastPathComponent)"]
+        if let line = editLineRangeText(item) { parts.append(line) }
+        if let counts = editCountText(item.label) { parts.append(counts) }
+        return parts.joined(separator: " · ")
+      }
+    }
+    return nil
+  }
+
+  private func editLineRangeText(_ item: VibeAgentKitProgressItem) -> String? {
+    guard let start = item.lineStart else { return nil }
+    if let end = item.lineEnd, end != start {
+      return "Lines \(start)-\(end)"
+    }
+    return "Line \(start)"
+  }
+
+  private func editCountText(_ label: String) -> String? {
+    guard let regex = try? NSRegularExpression(pattern: "[+\\-\\u{2212}]\\d[\\d,]*") else {
+      return nil
+    }
+    let ns = label as NSString
+    let matches = regex.matches(in: label, range: NSRange(location: 0, length: ns.length))
+    let values = matches.map { ns.substring(with: $0.range) }
+    return values.isEmpty ? nil : values.joined(separator: " ")
   }
 
   private func updateBottomEdgeFade() {
@@ -1361,6 +1655,22 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     bottomEdgeFadeView.layer.sublayers?.forEach { $0.removeFromSuperlayer() }
     bottomEdgeFadeView.layer.addSublayer(gradient)
     updateBottomEdgeFadeFrame()
+  }
+
+  private func updateRepoPickerStyle() {
+    var config = UIButton.Configuration.plain()
+
+    let repoName = AgentBridgeSelectionStore.selectedRepository()?.name ?? "Repository"
+    config.title = repoName
+
+    config.image = UIImage(systemName: "chevron.up.chevron.down", withConfiguration: UIImage.SymbolConfiguration(pointSize: 10, weight: .semibold))
+    config.imagePlacement = .trailing
+    config.imagePadding = 5
+    config.baseForegroundColor = appearance.textSecondary
+    config.contentInsets = NSDirectionalEdgeInsets(top: 0, leading: 10, bottom: 0, trailing: 10)
+
+    repoPickerButton.configuration = config
+    repoPickerButton.isHidden = (repoPickerMenu == nil) || isHistoryPicked
   }
 
   private func updateBottomEdgeFadeFrame() {
@@ -1379,10 +1689,15 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     // The table reaches the screen bottom, so its automatic safe-area inset already
     // covers the home indicator; only add the part above it, plus a small gap.
     let bottom = max(12, covered - view.safeAreaInsets.bottom + 8)
-    guard abs(tableView.contentInset.bottom - bottom) > 0.5 else { return }
+    let top = usageBannerVisible ? ChatPinnedBannerView.preferredHeight + 24.0 : 12.0
+    guard abs(tableView.contentInset.bottom - bottom) > 0.5
+      || abs(tableView.contentInset.top - top) > 0.5
+    else { return }
     let wasNearBottom = isNearBottom()
     tableView.contentInset.bottom = bottom
+    tableView.contentInset.top = top
     tableView.verticalScrollIndicatorInsets.bottom = bottom
+    tableView.verticalScrollIndicatorInsets.top = top
     if wasNearBottom { scrollToBottom(animated: false) }
   }
 
@@ -1495,7 +1810,7 @@ private final class VibeAgentRuntimeComposerView: UIView, UITextViewDelegate {
   private var pillTrailingConstraint: NSLayoutConstraint!
 
   private let compactPillHeight: CGFloat = 46
-  private let bottomGap: CGFloat = 8
+  private let bottomGap: CGFloat = 0
   private let pagePadding: CGFloat = 14
 
   // On-device speech dictation for the mic button: tap to start, tap to stop, the

@@ -608,6 +608,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   var onTearDownBridgeAgentView: (() -> Void)?
   /// Provider of the currently embedded agent runtime view, or nil if none is shown.
   var hostedBridgeAgentProvider: (() -> String?)?
+  /// Route-provided bridge provider for Claude/Codex DMs. Some server rows carry the
+  /// provider through `peerAgentId` rather than the reserved peer user id, so the list
+  /// cannot rely only on `enginePeerUserId`.
+  private var explicitBridgeProvider: String?
+  /// The agent runtime surface currently presented from this list (full-screen child or
+  /// pushed). Used to refresh its feed immediately after a send originates there.
+  private weak var presentedBridgeAgentVC: VibeAgentConversationViewController?
   private var nativeHistoryHydrationGeneration: UInt = 0
   private var nativeOutgoingRowsById: [String: [String: Any]] = [:]
   private var nativeOutgoingOrder: [String] = []
@@ -1183,6 +1190,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let applyDataSource = { [weak self] in
       guard let self else { return }
       self.rows = parsed
+      if let agentVC = self.presentedBridgeAgentVC {
+        agentVC.setMessages(VibeAgentKitMap.messages(from: parsed))
+      }
       self.pruneMessageSelection(for: parsed)
       let engineChatId = self.engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
       let resolvedChatId: String
@@ -4875,9 +4885,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     metadata.merge(
       AgentBridgeSelectionStore.selectedRunOptions(provider: provider).payload(provider: provider)
     ) { _, new in new }
-    // The default chat is a fresh-thread surface: every send starts a NEW task on
-    // the computer (no resume). Continuing a past conversation happens explicitly
-    // from the profile's "Chat History", which carries its own resume id.
+    // The default chat is fresh unless the user explicitly opened a History
+    // session. In that case follow-up sends must carry the selected session id
+    // so the bridge resumes instead of starting a new CLI thread.
+    if let loadedSessionId = bridgeLoadedSessionId,
+      !loadedSessionId.isEmpty,
+      !loadedSessionId.hasPrefix("running:")
+    {
+      metadata["agentBridgeResumeSessionId"] = loadedSessionId
+    }
     return metadata
   }
 
@@ -4907,10 +4923,22 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   private var currentBridgeProvider: String? {
+    if let explicitBridgeProvider { return explicitBridgeProvider }
     let peer = enginePeerUserId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     if peer == "11111111-1111-1111-1111-111111111111" { return "claude" }
     if peer == "22222222-2222-2222-2222-222222222222" { return "codex" }
     return nil
+  }
+
+  func setBridgeProvider(_ provider: String) {
+    let normalized = provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    let next = normalized.isEmpty ? nil : normalized
+    guard explicitBridgeProvider != next else { return }
+    explicitBridgeProvider = next
+    NSLog("[AgentRoute] ChatListView setBridgeProvider=%@", next ?? "nil")
+    updateAgentBridgeControlTitle()
+    inputBar?.setAgentControlMode(agentChatMode || currentBridgeProvider != nil)
+    scheduleBridgeAgentPresenceRefresh()
   }
 
   private func updateAgentBridgeControlTitle() {
@@ -5027,6 +5055,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
     setBridgeLoadedSessionId(sessionId)
     showBridgeSessionLoadingSpinner()
+    presentedBridgeAgentVC?.isHistoryPicked = true
+    presentedBridgeAgentVC?.setTranscriptLoading(true)
     let result = ChatEngine.shared.loadAgentBridgeSessionIntoChat([
       "chatId": chatId,
       "provider": provider,
@@ -5034,6 +5064,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     ])
     if (result["accepted"] as? Bool) != true {
       hideBridgeSessionLoadingSpinner()
+      presentedBridgeAgentVC?.setTranscriptLoading(false)
+    } else {
+      presentedBridgeAgentVC?.isHistoryPicked = true
     }
   }
 
@@ -5073,6 +5106,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let prefix = "bridge-\(sessionId)"
     if parsed.contains(where: { ($0.messageId ?? "").hasPrefix(prefix) }) {
       hideBridgeSessionLoadingSpinner()
+      presentedBridgeAgentVC?.setTranscriptLoading(false)
     }
   }
 
@@ -5105,20 +5139,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     presentBridgeAgentConversation(provider: provider)
   }
 
-  /// Show the "See progress" pill when a loaded session has a live/streaming row.
+  /// The floating "See progress" pill (toast) is retired per the live-progress redesign:
+  /// the in-list agent bubble now carries the live state itself (shimmering activity text
+  /// + a working tint) and is tappable to open the full runtime view. Keep this as a
+  /// no-op that tears down any previously-added pill so callers stay wired.
   private func updateSeeProgressButton(_ parsed: [ChatListRow]) {
-    let live = bridgeLoadedSessionId != nil && parsed.contains(where: { bridgeRowIsLive($0) })
-    if live, seeProgressButton.superview == nil {
-      addSubview(seeProgressButton)
-      NSLayoutConstraint.activate([
-        seeProgressButton.centerXAnchor.constraint(equalTo: centerXAnchor),
-        seeProgressButton.bottomAnchor.constraint(equalTo: safeAreaLayoutGuide.bottomAnchor, constant: -96),
-      ])
-    }
     if seeProgressButton.superview != nil {
-      bringSubviewToFront(seeProgressButton)
-      seeProgressButton.isHidden = !live
+      seeProgressButton.removeFromSuperview()
     }
+    seeProgressButton.isHidden = true
   }
 
   @objc private func handleAgentBridgeSelectionChanged(_ notification: Notification) {
@@ -5133,7 +5162,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     text: String,
     agentMention: Bool = false,
     agentText: String? = nil,
-    mentionedAgentUsername: String? = nil
+    mentionedAgentUsername: String? = nil,
+    fromAgentSurface: Bool = false
   )
   {
     let messageId = UUID().uuidString.lowercased()
@@ -5186,6 +5216,33 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         sendPayload["metadata"] = bridgeMetadata
       }
       onNativeEvent(sendPayload)
+      return
+    }
+
+    // Agent runtime surface: it owns its own composer (the chat input bar is offscreen
+    // behind the full-screen surface), so skip the chat-view send morph + hidden-cell
+    // dance. Dispatch through the shared transport, then refresh the agent feed so the
+    // user's bubble appears HERE — the optimistic native row updates the chat list
+    // directly without firing ChatEngine.didChange, which is the only thing the agent
+    // view observes (root cause of "my message went to the chat view, not the agent view").
+    if fromAgentSurface {
+      inputBar?.dismissReplyBanner(animated: false)
+      dispatchOutgoingSend(
+        messageId: messageId,
+        text: text,
+        timestamp: timestamp,
+        timestampMs: timestampMs,
+        replyToMessageId: replyToMessageId,
+        bridgeMetadata: bridgeMetadata,
+        agentMention: agentMention,
+        agentText: agentText,
+        mentionedAgentUsername: mentionedAgentUsername
+      )
+      // Defer one runloop tick so the optimistic row is fully committed to `rows`
+      // before the agent feed re-reads it.
+      DispatchQueue.main.async { [weak self] in
+        self?.presentedBridgeAgentVC?.reloadLiveMessages()
+      }
       return
     }
 
@@ -5255,6 +5312,33 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     inputBar?.clearText()
 
     // 6. Either append natively (no JS dependency) or delegate to JS.
+    dispatchOutgoingSend(
+      messageId: messageId,
+      text: text,
+      timestamp: timestamp,
+      timestampMs: timestampMs,
+      replyToMessageId: replyToMessageId,
+      bridgeMetadata: bridgeMetadata,
+      agentMention: agentMention,
+      agentText: agentText,
+      mentionedAgentUsername: mentionedAgentUsername
+    )
+  }
+
+  /// Append the outgoing row (native path) and hand the message to the transport —
+  /// shared by the normal chat-input send and the agent-runtime-surface send (which
+  /// skips the chat-view morph but reuses this transport logic verbatim).
+  private func dispatchOutgoingSend(
+    messageId: String,
+    text: String,
+    timestamp: String,
+    timestampMs: Double,
+    replyToMessageId: String?,
+    bridgeMetadata: [String: Any],
+    agentMention: Bool,
+    agentText: String?,
+    mentionedAgentUsername: String?
+  ) {
     if nativeSendEnabled {
       queueNativeOutgoingMessage(
         messageId: messageId,
@@ -5482,11 +5566,32 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       metadata["thumbnailBase64"] = thumbnailBase64
     }
 
+    // Bridge-agent DM: a plain media message never reaches the agent — the daemon only
+    // sees a task when the message carries the bridge run metadata + sealed attachment
+    // blob. Seal the picked image (arte1, same format as the runtime composer) and fold
+    // in the provider/repo/run metadata so this image send dispatches a task. The server
+    // requires non-empty dispatch text, so an image-only send gets a default caption.
+    var bridgeImageBody = effectiveText
+    if type == "image", currentBridgeProvider != nil,
+      let blob = sealedBridgeImageBlob(forLocalURI: uri)
+    {
+      if bridgeImageBody.isEmpty { bridgeImageBody = "Please take a look at the attached image." }
+      let bridgeMeta = agentBridgeMetadataForOutgoing(
+        text: bridgeImageBody,
+        mentionedAgentUsername: currentBridgeProvider
+      )
+      if !bridgeMeta.isEmpty {
+        metadata.merge(bridgeMeta) { _, new in new }
+        metadata["agentBridgeAttachmentsEnc"] = [blob]
+        noteBridgeFreshOwnSentId(messageId)
+      }
+    }
+
     let sendPayload: [String: Any] = [
       "chatId": chatId,
       "messageId": messageId,
       "type": type,
-      "text": effectiveText,
+      "text": bridgeImageBody,
       "timestampMs": timestampMs,
       "replyToId": replyToMessageId as Any,
       "metadata": metadata,
@@ -5651,19 +5756,51 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// agent runtime view instead of the bubble chat. The in-place host path re-evaluates
   /// presence (idempotent); the legacy push path keeps the one-shot guard.
   private func presentPreferredAgentViewIfNeeded(retry: Int = 0) {
-    // In-place host path: re-evaluate presence after the engine setters settle, so the
-    // decision doesn't depend on the order chatId / peerId / window arrive in (that
-    // ordering race is what produced the chat→agent→chat shift).
-    if onHostBridgeAgentView != nil {
-      scheduleBridgeAgentPresenceRefresh()
-      return
-    }
-    // Legacy push path (no in-place host wired — e.g. an embedded profile presentation).
-    guard window != nil, !didAutoPresentAgentView else { return }
+    // First, clear any agent surface left over from a DIFFERENT DM (the recycled view).
+    scheduleBridgeAgentPresenceRefresh()
+    // One-shot on DM open: if this provider's Default view is Agent, open the isolated
+    // agent surface once. It's a one-shot (didAutoPresentAgentView) so backing out to the
+    // chat surface doesn't get auto-re-presented; "See progress" re-opens on demand.
+    guard !didAutoPresentAgentView else { return }
     guard let provider = currentBridgeProvider else { return }
     guard AgentBridgeSelectionStore.defaultView(provider: provider) == .agent else { return }
+    guard window != nil else {
+      guard retry < 16 else { return }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+        self?.presentPreferredAgentViewIfNeeded(retry: retry + 1)
+      }
+      return
+    }
     didAutoPresentAgentView = true
+    bridgeAgentManuallyShown = false
     presentBridgeAgentConversation(provider: provider, animated: false)
+  }
+
+  /// Mount the isolated agent surface for `provider` as this DM's PRIMARY page, driven by the
+  /// host controller at view-appear time. The normal trigger (`presentPreferredAgentViewIfNeeded`)
+  /// can't fire this early because it resolves the provider from `enginePeerUserId`, which the
+  /// controller defers to ~0.28s AFTER the transition (for a smooth push) — so the chat would be
+  /// fully on screen first. Here the controller passes the provider straight from the route, so
+  /// the agent mounts during the push and rides it as the page (no chat-view flash). The later
+  /// deferred-binding auto-present re-enters `presentBridgeAgentConversation`, which is idempotent
+  /// (already-hosted check), so this does not double-mount.
+  func presentPreferredAgentViewNow(provider: String) {
+    let p = provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !p.isEmpty else { return }
+    let hasHost = onHostBridgeAgentView != nil
+    let defaultView = AgentBridgeSelectionStore.defaultView(provider: p)
+    NSLog(
+      "[AgentRoute] presentPreferredAgentViewNow provider=%@ hasHost=%@ already=%@ default=%@",
+      p, hasHost ? "true" : "false", didAutoPresentAgentView ? "true" : "false",
+      "\(defaultView)")
+    // Isolated host path only (it just addChild/addSubviews — needs no window). Without a host
+    // the legacy push/modal fallback owns presentation via presentPreferredAgentViewIfNeeded.
+    guard hasHost else { return }
+    guard !didAutoPresentAgentView else { return }
+    guard defaultView == .agent else { return }
+    didAutoPresentAgentView = true
+    bridgeAgentManuallyShown = false
+    presentBridgeAgentConversation(provider: p, animated: false)
   }
 
   /// Coalesce DM-context changes into one presence evaluation on the next runloop tick.
@@ -5671,67 +5808,76 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     DispatchQueue.main.async { [weak self] in self?.refreshBridgeAgentPresence() }
   }
 
-  /// Single source of truth for whether the in-place agent runtime view is shown:
-  /// - a hosted view belonging to a DIFFERENT DM (or none now) is torn down;
-  /// - a bridge DM whose Default view is Agent is hosted if not already showing;
-  /// - default Chat leaves a view the user opened manually ("See progress") untouched.
-  private func refreshBridgeAgentPresence(retry: Int = 0) {
-    guard onHostBridgeAgentView != nil else { return }
-    let provider = currentBridgeProvider
-    // A view hosted for a different DM (or no bridge DM now) is always stale — clear it.
-    if let hosted = hostedBridgeAgentProvider?(), hosted != provider {
+  /// Tear down an isolated agent surface that belongs to a DIFFERENT DM (or none now) —
+  /// the recycled ChatListView must not show the previous DM's agent view. Presentation
+  /// itself is one-shot per DM open (see presentPreferredAgentViewIfNeeded) and on-demand
+  /// via "See progress", so this never re-presents (which would fight a user back-out).
+  private func refreshBridgeAgentPresence() {
+    guard let hosted = hostedBridgeAgentProvider?() else { return }
+    if hosted != currentBridgeProvider {
       onTearDownBridgeAgentView?()
       bridgeAgentManuallyShown = false
     }
-    guard let provider else { return }
-    let wantsAgent = AgentBridgeSelectionStore.defaultView(provider: provider) == .agent
-    let isShown = hostedBridgeAgentProvider?() == provider
-    guard wantsAgent else {
-      // Default view = Chat: tear down an auto-shown agent view (the user flipped the
-      // setting back), but leave a manually-opened "See progress" view in place.
-      if isShown, !bridgeAgentManuallyShown { onTearDownBridgeAgentView?() }
-      return
-    }
-    if isShown { return }
-    guard window != nil else {
-      guard retry < 16 else { return }
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-        self?.refreshBridgeAgentPresence(retry: retry + 1)
-      }
-      return
-    }
-    bridgeAgentManuallyShown = false
-    presentBridgeAgentConversation(provider: provider, animated: false)
   }
 
   /// Open a DM-level agent runtime view for `provider` (no specific task): seeded with
   /// the conversation's current rows and kept live via the provider, sending through the
   /// normal bridge path. Used by the "Agent" default view and the History "See progress".
   private func presentBridgeAgentConversation(provider: String, animated: Bool = true) {
+    // Idempotent for the isolated host path: if this provider's surface is already hosted, don't
+    // tear it down and rebuild (that flashes and re-runs the slide). The deferred-binding
+    // auto-present re-enters here after the controller mounted it early at view-appear — no-op it.
+    if onHostBridgeAgentView != nil, hostedBridgeAgentProvider?() == provider {
+      didAutoPresentAgentView = true
+      return
+    }
     let displayName = provider.capitalized
+    let initialMessages = VibeAgentKitMap.messages(from: rows)
     let vc = VibeAgentConversationViewController(
       title: displayName,
       subtitle: "",
-      messages: VibeAgentKitMap.messages(from: rows),
+      messages: initialMessages,
       inputPlaceholder: "Ask \(displayName)",
       messagesProvider: { [weak self] in
         guard let self else { return [] }
         return VibeAgentKitMap.messages(from: self.rows)
       },
       onSend: { [weak self] text, _, _ in
-        self?.handleNativeSend(text: text, mentionedAgentUsername: provider)
+      self?.handleNativeSend(text: text, mentionedAgentUsername: provider, fromAgentSurface: true)
       }
     )
+    presentedBridgeAgentVC = vc
     vc.agentBridgeProvider = provider
+    vc.isHistoryPicked = !initialMessages.isEmpty
     vc.runModel = AgentBridgeSelectionStore.selectedModel(provider: provider)
     vc.deviceLabel = AgentPairingService.lastDeviceLabel
     vc.deviceConnected = AgentPairingService.lastConnected
     vc.hidesBottomBarWhenPushed = true
+    vc.onPresentHistory = { [weak self] in
+      self?.presentBridgeHistorySurface(provider: provider)
+    }
+    vc.onPresentProfile = { [weak self] in
+      self?.onNativeEvent(["type": "headerAvatarPressed"])
+    }
+    vc.onNewChat = { [weak self, weak vc] in
+      guard let self else { return }
+      self.setBridgeLoadedSessionId(nil)
+      vc?.setTranscriptLoading(false)
+      vc?.isHistoryPicked = false
+      vc?.setMessages([])
+    }
+    vc.repoPickerMenu = agentControlMenu(provider: provider)
 
-    // Preferred path: host it in-place inside ChatMainView as a page that shares the chat
-    // header chrome (no present/dismiss shift). The host suppresses the VC's own header.
+    // A surface opened by the Default-view=Agent setting is the DM's primary entry: Back
+    // should exit straight to Home. A "See progress" drill-down (manuallyShown) is a layer
+    // over the chat surface, so its Back peels back to chat. The host reads this to wire Back.
+    vc.isPrimaryAgentSurface = !bridgeAgentManuallyShown
+
+    // Preferred path: hand the VC to the owning controller, which hosts it FULL-SCREEN as
+    // an isolated surface (its OWN header + full bounds — no nesting, no clipping, no
+    // present/dismiss shift). embeddedInChatHost stays false so the VC draws its own header.
     if let host = onHostBridgeAgentView {
-      vc.embeddedInChatHost = true
+      vc.embeddedInChatHost = false
       host(vc)
       return
     }
@@ -5776,9 +5922,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       onSend: { [weak self] text, _, _ in
         // The live @mention path doesn't carry image attachments yet; ignore the
         // staged blobs here (they're wired through the bridge-runtime surface).
-        self?.handleNativeSend(text: text, mentionedAgentUsername: mentionedAgentUsername)
+        self?.handleNativeSend(
+          text: text,
+          mentionedAgentUsername: mentionedAgentUsername,
+          fromAgentSurface: true
+        )
       }
     )
+    presentedBridgeAgentVC = vc
     if let provider = agentRow.agentRuntime?.provider ?? mentionedAgentUsername ?? currentBridgeProvider {
       vc.agentBridgeProvider = provider
     }
@@ -7730,6 +7881,17 @@ extension ChatListView: ChatInputBarDelegate {
       return CGSize(width: image.size.width * image.scale, height: image.size.height * image.scale)
     }
     return nil
+  }
+
+  /// Load a picked image from its local uri and seal it into an arte1 blob for the
+  /// agent (same downscale/encrypt path the runtime composer uses). Returns nil if the
+  /// file can't be read or there's no pairing key, so the caller falls back to a plain
+  /// media send.
+  private func sealedBridgeImageBlob(forLocalURI raw: String) -> String? {
+    guard let fileURL = localAttachmentFileURL(for: raw),
+      let image = UIImage(contentsOfFile: fileURL.path)
+    else { return nil }
+    return VibeAgentConversationViewController.sealedImageBlob(from: image)
   }
 
   private func localVideoThumbnailImage(for raw: String, maxDimension: CGFloat = 480.0) -> UIImage? {

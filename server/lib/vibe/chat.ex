@@ -300,6 +300,11 @@ defmodule Vibe.Chat do
                 if(friend_p, do: friend_p.user, else: nil),
                 friend_agent
               ),
+            friendTier:
+              present_chat_friend_tier(
+                if(friend_p, do: friend_p.user, else: nil),
+                friend_agent
+              ),
             members: members,
             messages: messages_for_client,
             unreadCount: 0,
@@ -332,6 +337,14 @@ defmodule Vibe.Chat do
   defp present_chat_friend_image(user, agent_payload) do
     present_string(agent_payload && agent_payload.avatar_url) ||
       present_string(user && user.profile_image)
+  end
+
+  defp present_chat_friend_tier(user, agent_payload) do
+    if agent_payload do
+      present_string(user && user.tier) || "gold"
+    else
+      present_string(user && user.tier)
+    end
   end
 
   defp present_string(value) when is_binary(value) do
