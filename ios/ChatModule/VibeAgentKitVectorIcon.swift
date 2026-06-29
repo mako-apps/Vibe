@@ -575,9 +575,16 @@ private enum SVGPathParser {
 
       var numberEnd = index
       var hasExponent = false
+      var hasDecimal = false
       while numberEnd < string.endIndex {
         let next = string[numberEnd]
-        if next.isNumber || next == "." {
+        if next.isNumber {
+          numberEnd = string.index(after: numberEnd)
+          continue
+        }
+        if next == "." {
+          if hasDecimal { break }
+          hasDecimal = true
           numberEnd = string.index(after: numberEnd)
           continue
         }

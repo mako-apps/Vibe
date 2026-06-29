@@ -333,7 +333,6 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     let lineHeight: CGFloat = 27.5
     let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
     let hasDisplayText = !trimmedText.isEmpty
-    let hasProgressItems = !progressItems.isEmpty
     let hasToolProgressItems = progressItems.contains { $0.itemType != "text" }
     let showsLoader = isStreaming && !hasFinalResponseText
     let runningStatuses: Set<String> = [
@@ -367,8 +366,12 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     if shouldShowLoader {
       let loaderText: String
       if showsLoader {
-        // Live turn: shimmer the action in flight ("Edit chat.ex", "Run …").
-        loaderText = progressItems.last?.label ?? fallbackProgressLabels.last ?? "Thinking"
+        // Live turn: shimmer the tool action in flight ("Edit chat.ex", "Run …"). Prefer
+        // the last NON-text node so the shimmer never echoes the narration prose that is
+        // already rendered (in full) inline in the interleaved feed below; fall back to a
+        // generic "Thinking" while the agent is only producing prose.
+        loaderText = progressItems.last(where: { $0.itemType != "text" })?.label
+          ?? fallbackProgressLabels.last ?? "Thinking"
       } else {
         // Completed turn: collapse the whole run into one tappable summary line
         // ("Worked for 1m 3s · N steps") that expands the step list inline. The
@@ -404,12 +407,18 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     // live inside the tappable "Worked" card and reveal their command output / search
     // hits + diff counts when expanded.
     if showsLoader {
-      // Live turn: show the tool feed only as a live, non-interactive stream. It is
-      // never the completed "Worked" collapse, and it disappears into that collapse
-      // only once the final answer is present.
+      // Live turn: show the TOOL steps (Read/Edit/Run/cd …) in the feed AND the streaming
+      // answer in the body below — BOTH at once, every update. We render only the tool
+      // nodes here (filter out the "text" narration nodes) because the streaming answer
+      // body already shows the prose; rendering prose in both places duplicated it, and
+      // suppressing the body to avoid that hid the answer entirely (the narration nodes do
+      // NOT reliably mirror the streamed answer — that lives in `message.text`). Keeping
+      // the tool feed + the answer body both visible means a progress-only update no
+      // longer toggles the text away. Everything collapses into "Worked · N steps" on done.
+      let liveToolItems = progressItems.filter { $0.itemType != "text" }
       updateStepsList(
-        progressItems,
-        expanded: hasProgressItems,
+        liveToolItems,
+        expanded: !liveToolItems.isEmpty,
         interactive: false,
         appearance: appearance,
         streaming: true,
@@ -427,7 +436,9 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     // top-down and the consolidated patch isn't meaningful until it's done, so don't
     // flash an "edited file" card mid-stream. Live turns show the step feed instead.
     configureRuntimeSummary(
-      (!isStreaming && hasDisplayText && !runtimeIsRunning) ? runtime : nil,
+      (!isStreaming && hasDisplayText && !runtimeIsRunning && Self.hasRuntimeDiff(runtime))
+        ? runtime
+        : nil,
       textColor: appearance.text,
       availableWidth: availableWidth,
       onTap: onRuntimeTap
@@ -441,7 +452,9 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
         view.isHidden = true
         blockHeightConstraints[index].constant = 0.0
       }
-      // No answer text (pure-tool / live-start turn): the summary sits at the top.
+      // No answer text yet (pure-tool / live-start turn): keep the work feed visible so
+      // the row does not look frozen. Once text arrives, the work feed moves under the
+      // answer and grows inline with the streamed prose.
       positionSummaryViews(belowText: false)
       return
     }
@@ -473,8 +486,7 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
           view = codeView
         }
         // Insert text blocks above the bottom runtime card. Final ordering of the
-        // loader/steps summary (top while live, footer once done) is applied by
-        // positionSummaryViews() after this loop.
+        // loader/steps work log is applied by positionSummaryViews() after this loop.
         stackView.insertArrangedSubview(
           view,
           at: max(1, stackView.arrangedSubviews.count - 1)
@@ -530,16 +542,14 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
       }
     }
 
-    // Live turns keep the shimmer/feed above the answer as a real-time timeline.
-    // Completed turns put "Worked …" below the final answer, so opening file/read
-    // details grows downward and does not yank the already-rendered answer text.
-    positionSummaryViews(belowText: canShowCompletedWork)
+    // Once there is answer text, the text owns the row. Tool progress follows it inline
+    // instead of floating above the response, matching the live transcript order.
+    positionSummaryViews(belowText: true)
   }
 
-  /// Place the loader (Worked summary) + its expandable step list either at the TOP
-  /// (live turn — watch it work) or as a footer just above the bottom file-change
-  /// card (completed turn — the summary follows the answer, Claude-Code style). The
-  /// `runtimeSummaryView` always stays last.
+  /// Place the loader/work log either before any text (only while a live turn has not
+  /// emitted prose yet) or directly after the assistant text. The diff/runtime summary
+  /// always stays last.
   private func positionSummaryViews(belowText: Bool) {
     guard stackView.arrangedSubviews.contains(runtimeSummaryView) else { return }
     if belowText {
@@ -554,10 +564,8 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
       stackView.insertArrangedSubview(stepsStack, at: 1)
     }
     // Spacing follows each view across reordering and is ignored while a view is
-    // hidden. While LIVE, the header → feed → answer are one continuous, growing
-    // stream, so keep the gaps tight (no big void between the streaming text and the
-    // work feed). Once DONE, give the collapsed "Worked" card a clear gap above the
-    // final answer so the two read as distinct bands.
+    // hidden. Keep gaps tight so the streaming text and work feed read as one
+    // continuous row rather than two disconnected blocks.
     stackView.setCustomSpacing(isLiveTurn ? 6.0 : 8.0, after: loaderView)
     stackView.setCustomSpacing(isLiveTurn ? 6.0 : 8.0, after: stepsStack)
   }
@@ -666,7 +674,6 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     onTap: ((ChatListRow.AgentRuntimeSummary) -> Void)?
   ) {
     guard let runtime else {
-      NSLog("[AgentView] cell.configureRuntimeSummary: runtime=nil -> card HIDDEN")
       runtimeSummaryView.onTap = nil
       runtimeSummaryView.isHidden = true
       runtimeHeightConstraint?.constant = 0.0
@@ -678,9 +685,15 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
       textColor: textColor,
       availableWidth: availableWidth
     )
-    NSLog("[AgentView] cell.configureRuntimeSummary: card SHOWN files=\(runtime.diff?.files.count ?? -1) +\(runtime.diff?.additions ?? -1)/-\(runtime.diff?.deletions ?? -1) patchLen=\(runtime.diff?.patch?.count ?? -1) height=\(height) width=\(availableWidth)")
     runtimeSummaryView.isHidden = false
     runtimeHeightConstraint?.constant = height
+  }
+
+  private static func hasRuntimeDiff(_ runtime: ChatListRow.AgentRuntimeSummary?) -> Bool {
+    guard let diff = runtime?.diff else { return false }
+    let hasPatch = diff.patch?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    return diff.filesChanged > 0 || diff.additions > 0 || diff.deletions > 0
+      || !diff.files.isEmpty || hasPatch
   }
 }
 
@@ -1113,12 +1126,169 @@ private func resoloAssistantDisplayText(for message: VibeAgentKitChatMessage) ->
   return "\(initialText)\n\n\(finalText)"
 }
 
+final class VibeAgentKitAttachmentGridView: UIView {
+  private var tileControls: [UIControl] = []
+  private var tileImageViews: [UIImageView] = []
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    clipsToBounds = true
+    backgroundColor = .clear
+  }
+
+  required init?(coder: NSCoder) { return nil }
+
+  func reset() {
+    tileControls.forEach { $0.removeFromSuperview() }
+    tileControls.removeAll()
+    tileImageViews.removeAll()
+  }
+
+  @discardableResult
+  func configure(
+    attachments: [VibeAgentKitImageAttachment],
+    appearance: VibeAgentKitChatAppearance,
+    availableWidth: CGFloat,
+    onTap: @escaping (VibeAgentKitImageAttachment) -> Void
+  ) -> CGFloat {
+    reset()
+    let items = Array(attachments.prefix(6))
+    guard !items.isEmpty else { return 0.0 }
+
+    let gap: CGFloat = 6.0
+    let columns = items.count == 1 ? 1 : min(3, items.count)
+    let rawTileWidth = (availableWidth - gap * CGFloat(columns - 1)) / CGFloat(columns)
+    let tileWidth = items.count == 1 ? min(availableWidth, 230.0) : min(max(62.0, rawTileWidth), 92.0)
+    let tileHeight = items.count == 1 ? min(172.0, max(118.0, tileWidth * 0.72)) : tileWidth
+    let rows = Int(ceil(Double(items.count) / Double(columns)))
+    let totalWidth = tileWidth * CGFloat(columns) + gap * CGFloat(columns - 1)
+    let startX = max(0.0, (availableWidth - totalWidth) * 0.5)
+    let totalHeight = tileHeight * CGFloat(rows) + gap * CGFloat(rows - 1)
+
+    for (index, attachment) in items.enumerated() {
+      let row = index / columns
+      let column = index % columns
+      let frame = CGRect(
+        x: startX + CGFloat(column) * (tileWidth + gap),
+        y: CGFloat(row) * (tileHeight + gap),
+        width: tileWidth,
+        height: tileHeight
+      )
+
+      let control = UIControl(frame: frame)
+      control.clipsToBounds = true
+      control.layer.cornerRadius = items.count == 1 ? 14.0 : 11.0
+      control.layer.cornerCurve = .continuous
+      control.backgroundColor = vibeAgentKitColorWithAlpha(
+        appearance.isDark ? UIColor.white : UIColor.black,
+        appearance.isDark ? 0.08 : 0.055
+      )
+      control.accessibilityLabel = attachment.name ?? "Image attachment"
+
+      let imageView = UIImageView(frame: control.bounds)
+      imageView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+      imageView.contentMode = .scaleAspectFill
+      imageView.clipsToBounds = true
+      control.addSubview(imageView)
+      installPlaceholder(in: control, appearance: appearance)
+
+      control.addAction(UIAction { _ in onTap(attachment) }, for: .touchUpInside)
+      addSubview(control)
+      tileControls.append(control)
+      tileImageViews.append(imageView)
+      loadImage(for: attachment, into: imageView)
+    }
+
+    return totalHeight
+  }
+
+  private func installPlaceholder(in control: UIControl, appearance: VibeAgentKitChatAppearance) {
+    let icon = UIImageView(
+      image: UIImage(systemName: "photo")?.withRenderingMode(.alwaysTemplate)
+    )
+    icon.translatesAutoresizingMaskIntoConstraints = false
+    icon.tintColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.75)
+    icon.contentMode = .scaleAspectFit
+    icon.tag = 9327
+    control.addSubview(icon)
+    NSLayoutConstraint.activate([
+      icon.centerXAnchor.constraint(equalTo: control.centerXAnchor),
+      icon.centerYAnchor.constraint(equalTo: control.centerYAnchor),
+      icon.widthAnchor.constraint(equalToConstant: 26.0),
+      icon.heightAnchor.constraint(equalToConstant: 26.0),
+    ])
+  }
+
+  private func loadImage(
+    for attachment: VibeAgentKitImageAttachment,
+    into imageView: UIImageView
+  ) {
+    if let image = decodedImage(from: attachment) {
+      imageView.superview?.viewWithTag(9327)?.removeFromSuperview()
+      imageView.image = image
+      return
+    }
+
+    guard let source = attachment.sourceURI?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !source.isEmpty
+    else { return }
+
+    if let cached = ChatAvatarImageStore.cached(for: source) {
+      imageView.superview?.viewWithTag(9327)?.removeFromSuperview()
+      imageView.image = cached
+      return
+    }
+
+    Task { [weak imageView] in
+      let image = await ChatAvatarImageStore.load(from: source)
+      await MainActor.run {
+        guard let imageView, let image else { return }
+        imageView.superview?.viewWithTag(9327)?.removeFromSuperview()
+        imageView.image = image
+      }
+    }
+  }
+
+  static func decodedImage(from attachment: VibeAgentKitImageAttachment) -> UIImage? {
+    guard let data = imageData(from: attachment) else { return nil }
+    return UIImage(data: data)
+  }
+
+  static func imageData(from attachment: VibeAgentKitImageAttachment) -> Data? {
+    if let base64 = attachment.dataBase64?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !base64.isEmpty
+    {
+      let payload = base64.components(separatedBy: ",").last ?? base64
+      if let data = Data(base64Encoded: payload, options: [.ignoreUnknownCharacters]) {
+        return data
+      }
+    }
+
+    guard let source = attachment.sourceURI?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !source.isEmpty
+    else { return nil }
+    if source.hasPrefix("file://"), let url = URL(string: source) {
+      return try? Data(contentsOf: url)
+    }
+    if source.hasPrefix("/") {
+      return try? Data(contentsOf: URL(fileURLWithPath: source))
+    }
+    return nil
+  }
+
+  private func decodedImage(from attachment: VibeAgentKitImageAttachment) -> UIImage? {
+    Self.decodedImage(from: attachment)
+  }
+}
+
 final class VibeAgentKitMessageCell: UITableViewCell {
   static let reuseIdentifier = "VibeAgentKitMessageCell"
 
   private let rowContainer = UIView()
   private let messageContainerView = UIView()
+  private let userAttachmentGrid = VibeAgentKitAttachmentGridView()
   private let userTextView = VibeAgentKitStreamingTextLabel()
+  private let userExpandButton = UIButton(type: .system)
   private let assistantBodyView = VibeAgentKitAssistantMessageBodyView()
   private let progressStack = UIStackView()
   private let actionBar = VibeAgentKitMessageActionBarView()
@@ -1127,11 +1297,22 @@ final class VibeAgentKitMessageCell: UITableViewCell {
   private var trailingConstraint: NSLayoutConstraint!
   private var assistantMaxWidthConstraint: NSLayoutConstraint!
   private var userMaxWidthConstraint: NSLayoutConstraint!
+  private var userAttachmentMinWidthConstraint: NSLayoutConstraint!
   private var userTopConstraint: NSLayoutConstraint!
   private var userLeadingConstraint: NSLayoutConstraint!
   private var userTrailingConstraint: NSLayoutConstraint!
   private var userBottomConstraint: NSLayoutConstraint!
   private var userTextHeightConstraint: NSLayoutConstraint!
+  private var userAttachmentTopConstraint: NSLayoutConstraint!
+  private var userAttachmentLeadingConstraint: NSLayoutConstraint!
+  private var userAttachmentTrailingConstraint: NSLayoutConstraint!
+  private var userAttachmentHeightConstraint: NSLayoutConstraint!
+  private var userTextTopToAttachmentConstraint: NSLayoutConstraint!
+  private var userTextBottomToExpandConstraint: NSLayoutConstraint!
+  private var userExpandTrailingConstraint: NSLayoutConstraint!
+  private var userExpandBottomConstraint: NSLayoutConstraint!
+  private var userExpandHeightConstraint: NSLayoutConstraint!
+  private var userExpandWidthConstraint: NSLayoutConstraint!
   private var assistantTopConstraint: NSLayoutConstraint!
   private var assistantLeadingConstraint: NSLayoutConstraint!
   private var assistantTrailingConstraint: NSLayoutConstraint!
@@ -1143,6 +1324,7 @@ final class VibeAgentKitMessageCell: UITableViewCell {
   private var rowBottomConstraint: NSLayoutConstraint!
   private var currentIsUser = false
   private var storedMessageText: String = ""
+  private let userCollapsedTextMaxHeight: CGFloat = 240.0
 
   var onAction: ((VibeAgentKitMessageAction) -> Void)? {
     didSet {
@@ -1153,6 +1335,8 @@ final class VibeAgentKitMessageCell: UITableViewCell {
   var onProgressTap: (() -> Void)?
   var onRuntimeTap: ((ChatListRow.AgentRuntimeSummary) -> Void)?
   var onStepTap: ((String) -> Void)?
+  var onTextExpansionTap: (() -> Void)?
+  var onAttachmentTap: ((VibeAgentKitImageAttachment) -> Void)?
 
   /// The visible text currently displayed (exposed for the hold context menu).
   var currentMessageText: String { storedMessageText }
@@ -1172,10 +1356,13 @@ final class VibeAgentKitMessageCell: UITableViewCell {
     transform = .identity
     alpha = 1.0
     userTextView.resetStreamingState()
+    userAttachmentGrid.reset()
     assistantBodyView.reset()
     onProgressTap = nil
     onRuntimeTap = nil
     onStepTap = nil
+    onTextExpansionTap = nil
+    onAttachmentTap = nil
     assistantBodyView.onStepTap = nil
     progressStack.arrangedSubviews.forEach {
       progressStack.removeArrangedSubview($0)
@@ -1187,6 +1374,8 @@ final class VibeAgentKitMessageCell: UITableViewCell {
     messageContainerView.layer.mask = nil
     currentIsUser = false
     storedMessageText = ""
+    userExpandButton.isHidden = true
+    userAttachmentGrid.isHidden = true
     // Restore bubble transform / anchor in case the cell is reused while held
     setBubbleHeld(false, animated: false)
   }
@@ -1203,6 +1392,7 @@ final class VibeAgentKitMessageCell: UITableViewCell {
     showsActions: Bool = true,
     isProgressExpanded: Bool = false,
     expandedStepIds: Set<String> = [],
+    isTextExpanded: Bool = false,
     streamingStartDate: Date? = nil
   ) {
     let isUser = message.role.isUser
@@ -1215,11 +1405,22 @@ final class VibeAgentKitMessageCell: UITableViewCell {
       trailingConstraint,
       assistantMaxWidthConstraint,
       userMaxWidthConstraint,
+      userAttachmentMinWidthConstraint,
       userTopConstraint,
       userLeadingConstraint,
       userTrailingConstraint,
       userBottomConstraint,
       userTextHeightConstraint,
+      userAttachmentTopConstraint,
+      userAttachmentLeadingConstraint,
+      userAttachmentTrailingConstraint,
+      userAttachmentHeightConstraint,
+      userTextTopToAttachmentConstraint,
+      userTextBottomToExpandConstraint,
+      userExpandTrailingConstraint,
+      userExpandBottomConstraint,
+      userExpandHeightConstraint,
+      userExpandWidthConstraint,
       assistantTopConstraint,
       assistantLeadingConstraint,
       assistantTrailingConstraint,
@@ -1232,10 +1433,8 @@ final class VibeAgentKitMessageCell: UITableViewCell {
       NSLayoutConstraint.activate([
         trailingConstraint,
         userMaxWidthConstraint,
-        userTopConstraint,
         userLeadingConstraint,
         userTrailingConstraint,
-        userBottomConstraint,
         userTextHeightConstraint,
       ])
     } else {
@@ -1253,6 +1452,8 @@ final class VibeAgentKitMessageCell: UITableViewCell {
     rowBottomConstraint.constant = isUser ? -4.0 : -3.0
 
     userTextView.isHidden = !isUser
+    userAttachmentGrid.isHidden = true
+    userExpandButton.isHidden = true
     assistantBodyView.isHidden = isUser
 
     progressStack.arrangedSubviews.forEach {
@@ -1271,11 +1472,73 @@ final class VibeAgentKitMessageCell: UITableViewCell {
       )
       let userWidth = max(
         140.0,
-        (contentView.bounds.width > 0.0 ? contentView.bounds.width : fallbackWidth) * 0.68
+        (contentView.bounds.width > 0.0 ? contentView.bounds.width : fallbackWidth) * 0.78
       )
-      let measured = VibeAgentKitTextRenderer.measuredSize(for: attributed, width: userWidth - 32.0)
-      userTextHeightConstraint.constant = max(ceil(UIFont.systemFont(ofSize: 18.0, weight: .regular).lineHeight), measured.height)
+      let textWidth = userWidth - 32.0
+      let hasText = !displayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      let measured = hasText
+        ? VibeAgentKitTextRenderer.measuredSize(for: attributed, width: textWidth)
+        : .zero
+      let fullTextHeight = hasText
+        ? max(ceil(UIFont.systemFont(ofSize: 18.0, weight: .regular).lineHeight), measured.height)
+        : 0.0
+      let attachmentHeight = userAttachmentGrid.configure(
+        attachments: message.attachments,
+        appearance: appearance,
+        availableWidth: userWidth - 20.0
+      ) { [weak self] attachment in
+        self?.onAttachmentTap?(attachment)
+      }
+      let hasAttachments = attachmentHeight > 0.0
+      userAttachmentMinWidthConstraint.constant = min(max(150.0, userWidth * 0.64), userWidth)
+      let isCollapsible = fullTextHeight > userCollapsedTextMaxHeight + 1.0
+      let resolvedTextHeight = isCollapsible && !isTextExpanded
+        ? userCollapsedTextMaxHeight
+        : fullTextHeight
+
+      userAttachmentGrid.isHidden = !hasAttachments
+      userAttachmentHeightConstraint.constant = attachmentHeight
+      userTextView.isHidden = !hasText
+      userTextHeightConstraint.constant = resolvedTextHeight
+      userTextView.clipsToBounds = isCollapsible && !isTextExpanded
       userTextView.applyStreamingText(attributed, rawText: displayText, isStreaming: false)
+
+      var userConstraints: [NSLayoutConstraint] = []
+      if hasAttachments {
+        userConstraints.append(contentsOf: [
+          userAttachmentTopConstraint,
+          userAttachmentLeadingConstraint,
+          userAttachmentTrailingConstraint,
+          userAttachmentHeightConstraint,
+          userAttachmentMinWidthConstraint,
+          userTextTopToAttachmentConstraint,
+        ])
+      } else {
+        userConstraints.append(userTopConstraint)
+      }
+
+      if isCollapsible {
+        userExpandButton.isHidden = false
+        userExpandButton.setImage(
+          UIImage(systemName: isTextExpanded ? "chevron.up" : "chevron.down")?
+            .withRenderingMode(.alwaysTemplate),
+          for: .normal
+        )
+        userExpandButton.tintColor = vibeAgentKitColorWithAlpha(
+          userBubbleTextColor(for: appearance),
+          appearance.isDark ? 0.72 : 0.58
+        )
+        userConstraints.append(contentsOf: [
+          userTextBottomToExpandConstraint,
+          userExpandTrailingConstraint,
+          userExpandBottomConstraint,
+          userExpandHeightConstraint,
+          userExpandWidthConstraint,
+        ])
+      } else {
+        userConstraints.append(userBottomConstraint)
+      }
+      NSLayoutConstraint.activate(userConstraints)
 
       messageContainerView.backgroundColor = userBubbleColor(for: appearance)
       messageContainerView.layer.cornerRadius = 20.0
@@ -1292,14 +1555,6 @@ final class VibeAgentKitMessageCell: UITableViewCell {
       messageContainerView.layer.shadowRadius = 0.0
       messageContainerView.layer.shadowOffset = .zero
     } else {
-      #if DEBUG
-      let ageMs = message.timestampMs > 0
-        ? Int(Date().timeIntervalSince1970 * 1000.0) - Int(message.timestampMs)
-        : -1
-      print(
-        "[VibeAgentKitMessageCell] assistant display message=\(message.id) age_ms=\(ageMs) raw=\(message.text.count) display=\(displayText.count) initial=\(message.initialResponseText?.count ?? 0) hasInitial=\(message.hasInitialResponseText) hasFinal=\(message.hasFinalResponseText) progress=\(message.progress.count) items=\(message.progressItems.count)"
-      )
-      #endif
       let availableWidth = max(
         160.0,
         ((contentView.bounds.width > 0.0 ? contentView.bounds.width : fallbackWidth) - 64.0) * 0.92
@@ -1373,7 +1628,16 @@ final class VibeAgentKitMessageCell: UITableViewCell {
     contentView.backgroundColor = .clear
     selectionStyle = .none
 
-    [rowContainer, messageContainerView, userTextView, assistantBodyView, progressStack, actionBar]
+    [
+      rowContainer,
+      messageContainerView,
+      userAttachmentGrid,
+      userTextView,
+      userExpandButton,
+      assistantBodyView,
+      progressStack,
+      actionBar,
+    ]
       .forEach {
         $0.translatesAutoresizingMaskIntoConstraints = false
       }
@@ -1382,12 +1646,19 @@ final class VibeAgentKitMessageCell: UITableViewCell {
     rowContainer.addSubview(messageContainerView)
     rowContainer.addSubview(progressStack)
     rowContainer.addSubview(actionBar)
+    messageContainerView.addSubview(userAttachmentGrid)
     messageContainerView.addSubview(userTextView)
+    messageContainerView.addSubview(userExpandButton)
     messageContainerView.addSubview(assistantBodyView)
 
     progressStack.axis = .vertical
     progressStack.spacing = 3.0
     progressStack.alignment = .leading
+
+    userExpandButton.backgroundColor = .clear
+    userExpandButton.contentHorizontalAlignment = .center
+    userExpandButton.contentVerticalAlignment = .center
+    userExpandButton.addTarget(self, action: #selector(userExpandTapped), for: .touchUpInside)
 
     rowTopConstraint = rowContainer.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 6.0)
     rowBottomConstraint = rowContainer.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -6.0)
@@ -1401,12 +1672,33 @@ final class VibeAgentKitMessageCell: UITableViewCell {
       lessThanOrEqualTo: rowContainer.widthAnchor,
       multiplier: 0.78
     )
+    userAttachmentMinWidthConstraint = messageContainerView.widthAnchor.constraint(
+      greaterThanOrEqualToConstant: 150.0
+    )
+    userAttachmentMinWidthConstraint.priority = .defaultHigh
 
     userTopConstraint = userTextView.topAnchor.constraint(equalTo: messageContainerView.topAnchor, constant: 14.0)
     userLeadingConstraint = userTextView.leadingAnchor.constraint(equalTo: messageContainerView.leadingAnchor, constant: 16.0)
     userTrailingConstraint = userTextView.trailingAnchor.constraint(equalTo: messageContainerView.trailingAnchor, constant: -16.0)
     userBottomConstraint = userTextView.bottomAnchor.constraint(equalTo: messageContainerView.bottomAnchor, constant: -14.0)
     userTextHeightConstraint = userTextView.heightAnchor.constraint(equalToConstant: 24.0)
+    userAttachmentTopConstraint = userAttachmentGrid.topAnchor.constraint(
+      equalTo: messageContainerView.topAnchor, constant: 10.0)
+    userAttachmentLeadingConstraint = userAttachmentGrid.leadingAnchor.constraint(
+      equalTo: messageContainerView.leadingAnchor, constant: 10.0)
+    userAttachmentTrailingConstraint = userAttachmentGrid.trailingAnchor.constraint(
+      equalTo: messageContainerView.trailingAnchor, constant: -10.0)
+    userAttachmentHeightConstraint = userAttachmentGrid.heightAnchor.constraint(equalToConstant: 0.0)
+    userTextTopToAttachmentConstraint = userTextView.topAnchor.constraint(
+      equalTo: userAttachmentGrid.bottomAnchor, constant: 8.0)
+    userTextBottomToExpandConstraint = userTextView.bottomAnchor.constraint(
+      equalTo: userExpandButton.topAnchor, constant: -4.0)
+    userExpandTrailingConstraint = userExpandButton.trailingAnchor.constraint(
+      equalTo: messageContainerView.trailingAnchor, constant: -10.0)
+    userExpandBottomConstraint = userExpandButton.bottomAnchor.constraint(
+      equalTo: messageContainerView.bottomAnchor, constant: -7.0)
+    userExpandHeightConstraint = userExpandButton.heightAnchor.constraint(equalToConstant: 26.0)
+    userExpandWidthConstraint = userExpandButton.widthAnchor.constraint(equalToConstant: 42.0)
 
     assistantTopConstraint = assistantBodyView.topAnchor.constraint(equalTo: messageContainerView.topAnchor)
     assistantLeadingConstraint = assistantBodyView.leadingAnchor.constraint(equalTo: messageContainerView.leadingAnchor)
@@ -1414,6 +1706,7 @@ final class VibeAgentKitMessageCell: UITableViewCell {
     assistantBottomConstraint = assistantBodyView.bottomAnchor.constraint(equalTo: messageContainerView.bottomAnchor)
 
     userTextHeightConstraint.priority = .defaultHigh
+    userAttachmentHeightConstraint.priority = .defaultHigh
     actionBarHeightConstraint = actionBar.heightAnchor.constraint(equalToConstant: 0.0)
     actionBarHeightConstraint.priority = .defaultHigh
     actionBarTopToProgressConstraint = actionBar.topAnchor.constraint(equalTo: progressStack.bottomAnchor, constant: 4.0)
@@ -1540,6 +1833,10 @@ final class VibeAgentKitMessageCell: UITableViewCell {
       cornerRadius: radius
     )
     return UITargetedPreview(view: messageContainerView, parameters: params)
+  }
+
+  @objc private func userExpandTapped() {
+    onTextExpansionTap?()
   }
 
   // MARK: - Private helpers

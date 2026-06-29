@@ -1658,8 +1658,13 @@ defmodule Vibe.AI.LocalAgentWorker do
 
     {nodes, _used, _text_index} =
       decoded
-      |> Enum.flat_map(&content_blocks_from_event/1)
-      |> Enum.reduce({[], MapSet.new(), 0}, fn block, {nodes, used, ti} ->
+      |> Enum.flat_map(fn event ->
+        # Keep the per-event parent_tool_use_id so a subagent's narration/thinking
+        # rides depth 1 (its own view), not the main feed.
+        parent = normalize_string(event["parent_tool_use_id"])
+        event |> content_blocks_from_event() |> Enum.map(fn block -> {block, parent} end)
+      end)
+      |> Enum.reduce({[], MapSet.new(), 0}, fn {block, parent}, {nodes, used, ti} ->
         case block do
           %{"type" => "text", "text" => raw_text} when is_binary(raw_text) ->
             trimmed = String.trim(raw_text)
@@ -1668,13 +1673,15 @@ defmodule Vibe.AI.LocalAgentWorker do
             if trimmed == "" or trimmed == summary_norm do
               {nodes, used, ti}
             else
-              node = %{
-                "id" => "worker-text-#{ti}",
-                "label" => clip_text_node(raw_text),
-                "status" => "done",
-                "depth" => 0,
-                "kind" => "text"
-              }
+              node =
+                %{
+                  "id" => "worker-text-#{ti}",
+                  "label" => clip_text_node(raw_text),
+                  "status" => "done",
+                  "depth" => 0,
+                  "kind" => "text"
+                }
+                |> put_subagent_depth(parent)
 
               {[node | nodes], used, ti + 1}
             end
@@ -1696,13 +1703,15 @@ defmodule Vibe.AI.LocalAgentWorker do
 
           _ ->
             if block["type"] == "thinking" do
-              node = %{
-                "id" => "claude-thinking-#{ti}",
-                "label" => "Thinking",
-                "status" => "done",
-                "depth" => 0,
-                "kind" => "thinking"
-              }
+              node =
+                %{
+                  "id" => "claude-thinking-#{ti}",
+                  "label" => "Thinking",
+                  "status" => "done",
+                  "depth" => 0,
+                  "kind" => "thinking"
+                }
+                |> put_subagent_depth(parent)
 
               {[node | nodes], used, ti + 1}
             else
@@ -1865,9 +1874,15 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp claude_tool_events(decoded) do
     {events_by_id, order} =
       Enum.reduce(decoded, {%{}, []}, fn event, acc ->
+        # Claude tags every subagent (`Task` tool) event with the parent Task's
+        # tool_use id; parent-agent events have it nil. Carry it down so a
+        # subagent's own tools land at depth 1 / parentId (grouped under the Task)
+        # instead of being flattened into the main feed.
+        parent = normalize_string(event["parent_tool_use_id"])
+
         event
         |> content_blocks_from_event()
-        |> Enum.reduce(acc, &accumulate_claude_tool_block/2)
+        |> Enum.reduce(acc, fn block, inner -> accumulate_claude_tool_block(block, parent, inner) end)
       end)
 
     order
@@ -1875,7 +1890,7 @@ defmodule Vibe.AI.LocalAgentWorker do
     |> Enum.map(&Map.fetch!(events_by_id, &1))
   end
 
-  defp accumulate_claude_tool_block(%{"type" => "tool_use"} = block, {events_by_id, order}) do
+  defp accumulate_claude_tool_block(%{"type" => "tool_use"} = block, parent, {events_by_id, order}) do
     id = normalize_string(block["id"]) || unique_event_id("claude-tool", length(order))
     tool = normalize_string(block["name"]) || "tool"
     input = block["input"] || %{}
@@ -1891,11 +1906,12 @@ defmodule Vibe.AI.LocalAgentWorker do
         "providerEventType" => "tool_use"
       }
       |> put_node_shape(tool, input)
+      |> put_subagent_shape(parent)
 
     {Map.put(events_by_id, id, event), append_once(order, id)}
   end
 
-  defp accumulate_claude_tool_block(%{"type" => "tool_result"} = block, {events_by_id, order}) do
+  defp accumulate_claude_tool_block(%{"type" => "tool_result"} = block, parent, {events_by_id, order}) do
     id =
       normalize_string(block["tool_use_id"]) ||
         normalize_string(block["id"]) ||
@@ -1914,7 +1930,8 @@ defmodule Vibe.AI.LocalAgentWorker do
            "tool" => tool,
            "label" => tool_label("Claude", tool, %{}),
            "input" => %{}
-         })
+         }
+         |> put_subagent_shape(parent))
       |> Map.merge(%{
         "status" => status,
         "outputPreview" => safe_text(output),
@@ -1924,7 +1941,23 @@ defmodule Vibe.AI.LocalAgentWorker do
     {Map.put(events_by_id, id, event), append_once(order, id)}
   end
 
-  defp accumulate_claude_tool_block(_block, acc), do: acc
+  defp accumulate_claude_tool_block(_block, _parent, acc), do: acc
+
+  # Stamp a tool event as a subagent child (depth 1 + parentId) when it carries a
+  # parent_tool_use_id; otherwise it is a depth-0 main-feed step.
+  defp put_subagent_shape(event, parent) when is_binary(parent) and parent != "" do
+    event |> Map.put("depth", 1) |> Map.put("parentId", parent)
+  end
+
+  defp put_subagent_shape(event, _parent), do: Map.put_new(event, "depth", 0)
+
+  # Same idea for plain narration/thinking nodes (no tool shape): depth 1 + parentId
+  # when produced inside a subagent, depth 0 otherwise.
+  defp put_subagent_depth(node, parent) when is_binary(parent) and parent != "" do
+    node |> Map.put("depth", 1) |> Map.put("parentId", parent)
+  end
+
+  defp put_subagent_depth(node, _parent), do: node
 
   # Parse the codex thread-item stream into tool events. The discriminator is
   # `item.item_type` (fall back to `item.type`); envelope `error`/`turn.failed`
@@ -2548,6 +2581,7 @@ defmodule Vibe.AI.LocalAgentWorker do
       event
       |> Map.put("kind", kind)
       |> maybe_put("target", target)
+      |> maybe_put_subagent_type(kind, input)
 
     case patch_stats(tool, input) do
       {added, removed} when added > 0 or removed > 0 ->
@@ -2558,9 +2592,17 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
+  # The parent `Task` node carries the subagent flavor (e.g. "explore") so the
+  # phone can render "🤖 Subagent · explore" and open its read-only view.
+  defp maybe_put_subagent_type(event, "task", input) when is_map(input) do
+    maybe_put(event, "subagentType", normalize_string(input["subagent_type"] || input["subagentType"]))
+  end
+
+  defp maybe_put_subagent_type(event, _kind, _input), do: event
+
   # Copy the structured shape fields from a tool event onto a progress node.
   defp copy_node_shape(node, event) do
-    ["kind", "target", "added", "removed"]
+    ["kind", "target", "added", "removed", "depth", "parentId", "subagentType"]
     |> Enum.reduce(node, fn key, acc ->
       case Map.get(event, key) do
         nil -> acc

@@ -185,6 +185,13 @@ struct AgentConnectPanel: View {
         }
         .fixedSize(horizontal: false, vertical: true)
       } else {
+        Text(
+          "On your computer run the bridge — it shows a QR. Scan it here to connect."
+        )
+        .font(.system(size: 11.5))
+        .foregroundStyle(palette.secondaryText)
+        .frame(maxWidth: .infinity, alignment: .leading)
+
         Button(action: { model.beginScan() }) {
           HStack(spacing: 8) {
             if model.isAuthorizing {
@@ -202,13 +209,6 @@ struct AgentConnectPanel: View {
           .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
         .disabled(model.isAuthorizing)
-
-        Text(
-          "On your computer run the bridge — it shows a QR. Scan it here to connect."
-        )
-        .font(.system(size: 11.5))
-        .foregroundStyle(palette.secondaryText)
-        .frame(maxWidth: .infinity, alignment: .leading)
       }
 
       if let errorMessage = model.errorMessage {

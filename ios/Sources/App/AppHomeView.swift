@@ -3256,6 +3256,10 @@ final class ChatConversationController: UIViewController {
   /// Pending "show the connect panel" work, deferred a beat so a fast status poll can
   /// reveal the composer with no panel flash. Cancelled the moment we connect.
   private var pendingConnectPanelWork: DispatchWorkItem?
+  /// Fresh bridge status verification before the connect panel is allowed to appear.
+  /// This prevents a stale disconnected route state from flashing the panel for a
+  /// second while the daemon is already online.
+  private var pendingConnectStatusTask: Task<Void, Never>?
 
   /// The isolated full-screen agent runtime surface (Claude/Codex), hosted as a child VC
   /// over `mainView` when this DM's Default view is Agent or the user taps "See progress".
@@ -3394,6 +3398,7 @@ final class ChatConversationController: UIViewController {
       object: nil
     )
     postPresentationActivationWorkItem?.cancel()
+    pendingConnectStatusTask?.cancel()
     closeOpenedChatChannel()
   }
 
@@ -3623,8 +3628,9 @@ final class ChatConversationController: UIViewController {
     // Already known online (warm status cache) → never flash the panel; just reveal
     // the composer. This is the fix for the "we're connected but it shows Connect,
     // then jumps to no panel" flicker on reopen.
-    if AgentPairingService.lastStatus?.connected == true {
+    if latestBridgeStatusConnected() {
       handleBridgeConnected()
+      verifyWarmBridgeConnection(provider: provider, reason: reason)
       return
     }
 
@@ -3648,25 +3654,70 @@ final class ChatConversationController: UIViewController {
       model = created
     }
 
-    // Already showing (or already scheduled to show) — just keep polling.
-    guard agentConnectHost == nil, pendingConnectPanelWork == nil else {
+    // Already showing (or already verifying/scheduled to show) — just keep polling.
+    guard agentConnectHost == nil, pendingConnectPanelWork == nil, pendingConnectStatusTask == nil else {
       model.startPolling()
       return
     }
     model.startPolling()
-    // Defer the panel a beat: the poll's first tick runs immediately, so a connected
-    // computer reveals the composer (via onConnected) before the panel ever appears.
-    // Only a genuinely offline computer falls through to showing it.
-    let work = DispatchWorkItem { [weak self] in
-      guard let self else { return }
-      self.pendingConnectPanelWork = nil
-      // If the poll reported "connected" during the grace window, onConnected already
-      // flipped this flag (and cancelled us); only a still-offline computer shows it.
-      guard !self.bridgeConnectedThisSession, self.agentConnectHost == nil else { return }
-      self.presentAgentConnectPanel(model: model)
+
+    let chatId = route.chatId
+    let normalizedProvider = provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    pendingConnectStatusTask = Task { [weak self, weak model] in
+      var status: AgentBridgeStatus?
+      if let config = AppSessionConfig.current {
+        status = try? await AgentPairingService.status(config: config)
+      }
+      guard !Task.isCancelled else { return }
+      await MainActor.run {
+        guard let self, let model, !Task.isCancelled else { return }
+        self.pendingConnectStatusTask = nil
+        let currentProvider = self.route.bridgeProvider?
+          .trimmingCharacters(in: .whitespacesAndNewlines)
+          .lowercased() ?? ""
+        guard self.route.chatId == chatId, currentProvider == normalizedProvider else { return }
+        if let status {
+          model.status = status
+          model.selectedRepository = AgentBridgeSelectionStore.ensureValidSelection(from: status.repositories)
+        }
+        if status?.connected == true || self.latestBridgeStatusConnected() {
+          self.handleBridgeConnected()
+          return
+        }
+        guard !self.bridgeConnectedThisSession, self.agentConnectHost == nil else { return }
+        self.presentAgentConnectPanel(model: model)
+      }
     }
-    pendingConnectPanelWork = work
-    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
+  }
+
+  private func latestBridgeStatusConnected() -> Bool {
+    AgentPairingService.lastConnected
+      || AgentPairingService.lastStatusSnapshot?.connected == true
+      || AgentPairingService.lastStatus?.connected == true
+  }
+
+  private func verifyWarmBridgeConnection(provider: String, reason: String) {
+    let chatId = route.chatId
+    let normalizedProvider = provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    pendingConnectStatusTask?.cancel()
+    pendingConnectStatusTask = Task { [weak self] in
+      guard let config = AppSessionConfig.current else { return }
+      let status = try? await AgentPairingService.status(config: config)
+      guard !Task.isCancelled, status?.connected == false else {
+        await MainActor.run { self?.pendingConnectStatusTask = nil }
+        return
+      }
+      await MainActor.run {
+        guard let self, !Task.isCancelled else { return }
+        self.pendingConnectStatusTask = nil
+        let currentProvider = self.route.bridgeProvider?
+          .trimmingCharacters(in: .whitespacesAndNewlines)
+          .lowercased() ?? ""
+        guard self.route.chatId == chatId, currentProvider == normalizedProvider else { return }
+        self.bridgeConnectedThisSession = false
+        self.applyAgentConnectGate(provider: provider, reason: "\(reason)-verifiedOffline")
+      }
+    }
   }
 
   private func presentAgentConnectPanel(model: AgentConnectModel) {
@@ -3688,6 +3739,8 @@ final class ChatConversationController: UIViewController {
   private func handleBridgeConnected() {
     guard !bridgeConnectedThisSession else { return }
     bridgeConnectedThisSession = true
+    pendingConnectStatusTask?.cancel()
+    pendingConnectStatusTask = nil
     pendingConnectPanelWork?.cancel()
     pendingConnectPanelWork = nil
     appShellRouteLog(
@@ -3700,6 +3753,8 @@ final class ChatConversationController: UIViewController {
   private func removeAgentConnectPanel() {
     pendingConnectPanelWork?.cancel()
     pendingConnectPanelWork = nil
+    pendingConnectStatusTask?.cancel()
+    pendingConnectStatusTask = nil
     agentConnectModel?.stopPolling()
     if let host = agentConnectHost {
       host.willMove(toParent: nil)

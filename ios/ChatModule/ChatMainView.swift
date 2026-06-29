@@ -736,6 +736,7 @@ public final class ChatMainView: UIView,
     let next = (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     guard avatarUri != next else { return }
     avatarUri = next
+    chatListView.setAvatarUri(next)
     updateAvatarViews()
   }
 

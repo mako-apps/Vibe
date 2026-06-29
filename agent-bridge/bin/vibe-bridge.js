@@ -76,6 +76,12 @@ These rules apply to AI agents working through Vibe, including Claude and Codex.
 - Use .vibe/team/<team_run_id>.md as the shared handoff file when repo writes are allowed.
 - Keep handoff edits additive under your own section with ownership, findings, files changed, blockers, and next steps.
 
+## Browser, Chrome, and Agent Browser Work
+
+- When the user mentions Chrome, browser testing, screenshots, clicking UI, or Agent Browser, use the browser automation tools/CLI available on this computer instead of guessing.
+- Prefer the repo's existing dev-server/test scripts, then verify with browser automation: open the page, inspect visible UI, check console/runtime errors, click the important controls, and capture screenshots when useful.
+- Report the URL, what was verified, and any browser/tool blocker in the final result.
+
 ## Safety
 
 - Start with read-only inspection when the risk is unclear.
@@ -106,6 +112,7 @@ Follow AGENTS.md first. These additions are specific to Claude.
 - When paired with Codex, avoid doing the same implementation slice unless the user asks for a second opinion.
 - Write concise handoff notes in .vibe/team/<team_run_id>.md so Codex can continue without rereading everything.
 - If the task is not safe to edit yet, explain the blocker and the exact inspection or approval needed.
+- If the user mentions Agent Browser, Chrome, or browser automation, use the local browser automation path when available and report if Claude cannot access it in this session.
 `,
   "CODEX.md": `# Codex Instructions
 
@@ -603,7 +610,14 @@ async function scanToPair(server, label) {
 
 const sessionByChat = new Map(); // chatId -> claude session_id
 const runningTasks = new Map(); // taskKey -> { child, provider, chatId, taskId, startedAt }
-const finishedTasks = new Map(); // taskKey -> { provider, chatId, taskId, repo, runtime, finishedAt }
+const finishedTasks = new Map(); // taskKey -> { provider, chatId, taskId, repo, runtime, finishedAt, resultPayload }
+// Resilience state for surviving a dropped socket (code=1006 idle/proxy, 1012 server
+// restart) WITHOUT losing a turn. `socketDownSince` is the epoch ms of the drop (null
+// while connected); on rejoin we re-deliver any result that completed during the outage
+// (its one-shot push was lost) and re-establish history watches so the phone re-syncs
+// instead of showing a stale "connected" / needing an app restart.
+let socketDownSince = null;
+const historyWatchSpecs = new Map(); // chatId -> { provider, sessionId, echo } (survives reconnect)
 const modelBySession = new Map(); // provider:chatId -> model selected from mobile
 const lastRuntimeBySession = new Map(); // provider:chatId -> last completed runtime payload
 const capabilitiesByProvider = new Map(); // provider -> latest tools/slash/MCP metadata
@@ -612,36 +626,106 @@ const BRIDGE_COMMANDS = [
   "/commands",
   "/help",
   "/usage",
+  "/skills",
   "/model [name|default]",
   "/compact",
   "/status",
+  "/doctor",
 ];
 
-const DEFAULT_CLAUDE_SLASH_COMMANDS = [
-  "clear",
-  "compact",
-  "config",
-  "context",
-  "init",
-  "review",
-  "security-review",
-  "usage",
-  "usage-credits",
-  "extra-usage",
-  "insights",
-  "goal",
+// Slash-command catalogs surfaced in the phone `/` palette and described by /help and
+// /commands. `kind` records how the bridge handles each when sent from the phone:
+//   bridge  — the bridge synthesizes real output locally (no agent turn, no token cost).
+//   task    — passes through to the CLI and runs as a normal agent turn. PROVEN for
+//             Claude: `claude -p` parses slash commands; skills/workflows/built-ins run,
+//             and an interactive-only one returns a $0 "isn't available in this
+//             environment" notice (so passthrough is safe).
+//   option  — sets a run option for the NEXT send (model / effort / plan mode).
+//   desktop — interactive-only in the terminal / desktop app. Codex slash commands are
+//             ALL TUI-only: `codex exec` treats "/foo" as literal prompt text (verified),
+//             so they cannot run headless from the phone — listed for discovery + handled
+//             by the bridge where an equivalent exists.
+// The authoritative live Claude list comes from each run's stream-json `init.slash_commands`
+// (see providerMetadataFromOutput); these defaults seed the palette before the first run.
+const CLAUDE_SLASH_INFO = [
+  { name: "code-review", desc: "Review the current diff for bugs and cleanups", kind: "task" },
+  { name: "simplify", desc: "Cleanup-only review; apply simplifications", kind: "task" },
+  { name: "security-review", desc: "Scan pending changes for security issues", kind: "task" },
+  { name: "review", desc: "Review a GitHub pull request", kind: "task" },
+  { name: "batch", desc: "Split a large change into parallel units", kind: "task" },
+  { name: "deep-research", desc: "Fan out web research into a cited report", kind: "task" },
+  { name: "claude-api", desc: "Load Claude API reference for this project", kind: "task" },
+  { name: "debug", desc: "Troubleshoot using the session debug log", kind: "task" },
+  { name: "run", desc: "Launch and drive your app to see a change work", kind: "task" },
+  { name: "verify", desc: "Build, run, and observe to confirm a change", kind: "task" },
+  { name: "loop", desc: "Run a prompt repeatedly across iterations", kind: "task" },
+  { name: "schedule", desc: "Create or run a scheduled cloud routine", kind: "task" },
+  { name: "team-onboarding", desc: "Generate a team onboarding guide", kind: "task" },
+  { name: "fewer-permission-prompts", desc: "Add a read-only allowlist to settings", kind: "task" },
+  { name: "init", desc: "Generate a CLAUDE.md project guide", kind: "task" },
+  { name: "insights", desc: "Analyze your recent Claude Code sessions", kind: "task" },
+  { name: "goal", desc: "Keep working across turns until a goal is met", kind: "task" },
+  { name: "context", desc: "Show context-window usage", kind: "task" },
+  { name: "config", desc: "View or set a setting (key=value)", kind: "task" },
+  { name: "skills", desc: "Browse and use skills", kind: "bridge" },
+  { name: "clear", desc: "Start a fresh conversation (new task)", kind: "task" },
+  { name: "compact", desc: "Drop the resumed session for the next run", kind: "bridge" },
+  { name: "usage", desc: "Plan limits + this chat's token/cost usage", kind: "bridge" },
+  { name: "usage-credits", desc: "Configure extra usage credits", kind: "task" },
+  { name: "status", desc: "Account, model, and remaining usage", kind: "bridge" },
+  { name: "doctor", desc: "Diagnose the Claude Code install", kind: "bridge" },
+  { name: "model", desc: "Show or switch the model", kind: "bridge" },
+  { name: "plan", desc: "Plan mode: research & propose, don't edit", kind: "option" },
+  { name: "help", desc: "List bridge, slash, and CLI commands", kind: "bridge" },
 ];
 
+const CODEX_SLASH_INFO = [
+  { name: "review", desc: "Ask Codex to review your working tree", kind: "desktop" },
+  { name: "plan", desc: "Plan mode: research & propose, don't edit", kind: "option" },
+  { name: "model", desc: "Show or switch the model", kind: "bridge" },
+  { name: "approvals", desc: "Set what Codex can do without asking", kind: "desktop" },
+  { name: "status", desc: "Account, model, and remaining usage", kind: "bridge" },
+  { name: "usage", desc: "View account token usage", kind: "bridge" },
+  { name: "diff", desc: "Show the working-tree git diff", kind: "desktop" },
+  { name: "compact", desc: "Summarize the conversation to free tokens", kind: "bridge" },
+  { name: "new", desc: "Start a new conversation", kind: "desktop" },
+  { name: "clear", desc: "Clear and start a fresh chat", kind: "desktop" },
+  { name: "init", desc: "Generate an AGENTS.md scaffold", kind: "desktop" },
+  { name: "skills", desc: "Browse and use skills", kind: "desktop" },
+  { name: "agent", desc: "Switch the active agent thread", kind: "desktop" },
+  { name: "apps", desc: "Browse connectors and insert them", kind: "desktop" },
+  { name: "plugins", desc: "Browse installed and discoverable plugins", kind: "desktop" },
+  { name: "mcp", desc: "List configured MCP tools", kind: "desktop" },
+  { name: "mention", desc: "Attach a file to the conversation", kind: "desktop" },
+  { name: "fork", desc: "Fork the conversation into a new thread", kind: "desktop" },
+  { name: "resume", desc: "Resume a saved conversation", kind: "desktop" },
+  { name: "memories", desc: "Configure memory use and generation", kind: "desktop" },
+  { name: "goal", desc: "Set or view a task goal", kind: "desktop" },
+  { name: "fast", desc: "Toggle the Fast service tier", kind: "option" },
+  { name: "personality", desc: "Choose a response communication style", kind: "desktop" },
+  { name: "doctor", desc: "Diagnose the Codex install", kind: "bridge" },
+  { name: "logout", desc: "Sign out of Codex", kind: "desktop" },
+  { name: "help", desc: "List bridge, slash, and CLI commands", kind: "bridge" },
+];
+
+// Wire catalog sent to the phone palette: every command except the /help & /commands
+// meta entries. Includes run-option (/plan, /fast) and bridge-answered ones so the
+// palette is complete; iOS dedupes them against its built-in defaults.
+const slashNamesFromInfo = (info) => info.filter((c) => c.name !== "help" && c.name !== "commands").map((c) => c.name);
+
+const DEFAULT_CLAUDE_SLASH_COMMANDS = slashNamesFromInfo(CLAUDE_SLASH_INFO);
+const DEFAULT_CODEX_SLASH_COMMANDS = slashNamesFromInfo(CODEX_SLASH_INFO);
+
+// Terminal subcommands visible on this computer (display-only in /commands and /help).
 const DEFAULT_CLAUDE_CLI_COMMANDS = [
   "agents",
-  "auth",
-  "auto-mode",
+  "config",
   "doctor",
   "mcp",
   "plugin",
-  "project",
-  "ultrareview",
   "update",
+  "login",
+  "logout",
 ];
 
 const DEFAULT_CODEX_CLI_COMMANDS = [
@@ -651,15 +735,20 @@ const DEFAULT_CODEX_CLI_COMMANDS = [
   "logout",
   "mcp",
   "plugin",
-  "mcp-server",
-  "app-server",
-  "remote-control",
-  "app",
   "doctor",
   "apply",
   "resume",
+  "fork",
   "cloud",
+  "sandbox",
+  "update",
 ];
+
+// name -> one-line description for the bridge-rendered /help and /commands text.
+const CLAUDE_COMMAND_DESC = Object.fromEntries(CLAUDE_SLASH_INFO.map((c) => [c.name, c.desc]));
+const CODEX_COMMAND_DESC = Object.fromEntries(CODEX_SLASH_INFO.map((c) => [c.name, c.desc]));
+const CLAUDE_DESKTOP_ONLY = new Set(CLAUDE_SLASH_INFO.filter((c) => c.kind === "desktop").map((c) => c.name));
+const CODEX_DESKTOP_ONLY = new Set(CODEX_SLASH_INFO.filter((c) => c.kind === "desktop").map((c) => c.name));
 
 function stripReservedMention(prompt, provider) {
   return String(prompt || "")
@@ -765,6 +854,37 @@ function codexApprovalPolicy(task) {
   }
 }
 
+const DEFAULT_CLAUDE_MOBILE_DISALLOWED_TOOLS = [
+  "Bash(git push*)",
+  "Bash(git checkout*)",
+  "Bash(git reset*)",
+  "Bash(git clean*)",
+  "Bash(rm -rf*)",
+  "Bash(rm -r*)",
+  "Bash(sudo *)",
+  "Bash(chmod -R*)",
+  "Bash(chown -R*)",
+  "Bash(security *)",
+  "Bash(defaults write*)",
+  "Bash(killall *)",
+];
+
+function claudeDisallowedTools(task) {
+  const override = splitEnvList(process.env.VIBE_CLAUDE_DISALLOWED_TOOLS);
+  if (override.length) return override;
+  // Full access means the user explicitly asked for bypass behavior. All other
+  // mobile modes keep destructive commands on the ask/block side while Claude's
+  // own `auto` classifier can run low-risk inspection/build commands.
+  if (workModeFor(task) === "full_access") return [];
+  return DEFAULT_CLAUDE_MOBILE_DISALLOWED_TOOLS;
+}
+
+function appendToolListArg(args, flag, values) {
+  const list = compactStringList(values || [], 80);
+  if (!list.length) return;
+  args.push(flag, list.join(","));
+}
+
 function normalizeModel(provider, value) {
   const raw = value == null ? "" : String(value).trim();
   if (!raw) return null;
@@ -856,6 +976,7 @@ function buildCommand(provider, prompt, chatId, task) {
     const mode = claudePermissionMode(task);
     const effort = reasoningEffortFor(provider, task);
     const args = ["-p", "--output-format", "stream-json", "--permission-mode", mode, "--effort", effort];
+    appendToolListArg(args, "--disallowedTools", claudeDisallowedTools(task));
     const resumeId = resumeIdFor(task);
     if (resumeId) args.push("--resume", resumeId);
     args.push("--verbose");
@@ -1259,7 +1380,7 @@ function providerCommandCatalog(provider, metadata = {}) {
     bridge: BRIDGE_COMMANDS,
     slash: provider === "claude"
       ? compactStringList(metadata.slashCommands || DEFAULT_CLAUDE_SLASH_COMMANDS, 80)
-      : compactStringList(metadata.slashCommands || [], 80),
+      : compactStringList(metadata.slashCommands || DEFAULT_CODEX_SLASH_COMMANDS, 80),
     cli: provider === "claude"
       ? compactStringList(metadata.cliCommands || DEFAULT_CLAUDE_CLI_COMMANDS, 80)
       : compactStringList(metadata.cliCommands || DEFAULT_CODEX_CLI_COMMANDS, 80),
@@ -1295,7 +1416,7 @@ function providerMetadataFromOutput(provider, output, task, chatId) {
     metadata.threadId = thread && thread.thread_id;
     metadata.cliVersion = "codex-cli";
     metadata.availableTools = [];
-    metadata.slashCommands = [];
+    metadata.slashCommands = DEFAULT_CODEX_SLASH_COMMANDS;
     metadata.cliCommands = DEFAULT_CODEX_CLI_COMMANDS;
     metadata.mcpServers = [];
     metadata.usage = compactUsage(turn && turn.usage, turn);
@@ -1308,15 +1429,26 @@ function providerMetadataFromOutput(provider, output, task, chatId) {
   return metadata;
 }
 
-function parseBridgeCommand(prompt) {
+// Bridge-intercepted slash commands answered locally (real data, no agent turn).
+const BRIDGE_INTERCEPT_COMMANDS = ["commands", "help", "usage", "skills", "model", "compact", "status", "doctor"];
+
+function parseBridgeCommand(prompt, provider) {
   const text = String(prompt || "").trim();
   if (!text.startsWith("/")) return null;
   const firstLine = text.split(/\r?\n/, 1)[0].trim();
   const match = firstLine.match(/^\/([a-z][a-z0-9_-]*)(?:\s+(.*))?$/i);
   if (!match) return null;
   const name = match[1].toLowerCase();
-  if (!["commands", "help", "usage", "model", "compact", "status"].includes(name)) return null;
-  return { name, args: (match[2] || "").trim(), raw: firstLine };
+  const base = { name, args: (match[2] || "").trim(), raw: firstLine };
+  if (BRIDGE_INTERCEPT_COMMANDS.includes(name)) return base;
+  // Codex slash commands are TUI-only — `codex exec` would treat "/foo" as literal
+  // prompt text and waste a turn. Intercept its known desktop-only commands and answer
+  // with a helpful note instead of spawning. (Claude DOES parse slash commands headless,
+  // so anything else falls through to the CLI on purpose for Claude.)
+  if (provider === "codex" && CODEX_DESKTOP_ONLY.has(name)) {
+    return { ...base, desktopOnly: true };
+  }
+  return null;
 }
 
 function formatUsage(runtime) {
@@ -1336,37 +1468,200 @@ function formatUsage(runtime) {
 function formatCommands(provider) {
   const caps = capabilitiesByProvider.get(provider) || {};
   const catalog = providerCommandCatalog(provider, caps);
+  const title = provider === "claude" ? "Claude" : provider === "codex" ? "Codex" : provider;
+  const descOf = provider === "claude" ? CLAUDE_COMMAND_DESC : CODEX_COMMAND_DESC;
+  const desktopOnly = provider === "claude" ? CLAUDE_DESKTOP_ONLY : CODEX_DESKTOP_ONLY;
+  const slashLine = (cmd) => {
+    const desc = descOf[cmd];
+    const flag = desktopOnly.has(cmd) ? " (desktop only)" : "";
+    return desc ? `- /${cmd} — ${desc}${flag}` : `- /${cmd}${flag}`;
+  };
   const lines = [
-    "Bridge commands available from mobile:",
+    "Bridge commands (answered right here, no agent run):",
     ...catalog.bridge.map((cmd) => `- ${cmd}`),
     "",
   ];
-  if (catalog.slash.length) {
-    lines.push(`${provider === "claude" ? "Claude" : "Provider"} slash commands reported by CLI metadata:`);
-    lines.push(...catalog.slash.map((cmd) => `- /${cmd}`));
+  const slashToShow = catalog.slash.filter((cmd) => !BRIDGE_INTERCEPT_COMMANDS.includes(cmd));
+  if (slashToShow.length) {
+    lines.push(`${title} slash commands — type / in the message box:`);
+    lines.push(...slashToShow.map(slashLine));
+    if (provider === "claude") {
+      lines.push("Sending one runs it as an agent turn; interactive-only ones reply that they need the desktop.");
+    } else {
+      lines.push("Codex slash commands run in the desktop/terminal app; from the phone the bridge answers the ones it can.");
+    }
     lines.push("");
   }
   if (catalog.cli.length) {
-    lines.push(`${provider === "claude" ? "Claude" : "Codex"} terminal commands visible on this computer:`);
-    lines.push(...catalog.cli.map((cmd) => `- ${cmd}`));
+    lines.push(`${title} terminal subcommands on this computer:`);
+    lines.push(...catalog.cli.map((cmd) => `- ${title.toLowerCase()} ${cmd}`));
   }
   return lines.join("\n").trim();
 }
 
-function bridgeCommandOutput(provider, chatId, task, repo, command) {
+function formatSkills(provider) {
+  const caps = capabilitiesByProvider.get(provider) || {};
+  const title = provider === "claude" ? "Claude" : provider === "codex" ? "Codex" : provider;
+  const sections = [];
+  const addList = (label, values) => {
+    const list = compactStringList(values || [], 80);
+    if (!list.length) return;
+    sections.push(`${label}:\n${list.map((item) => `- ${item}`).join("\n")}`);
+  };
+  addList("Skills", caps.skills);
+  addList("Agents", caps.agents);
+  addList("Tools", caps.availableTools);
+  const mcp = Array.isArray(caps.mcpServers) ? caps.mcpServers : [];
+  if (mcp.length) {
+    sections.push(
+      "MCP servers:\n" +
+        mcp
+          .map((server) => {
+            const name = server && server.name ? String(server.name) : "";
+            const status = server && server.status ? String(server.status) : "";
+            return name ? `- ${name}${status ? ` (${status})` : ""}` : null;
+          })
+          .filter(Boolean)
+          .join("\n")
+    );
+  }
+  if (sections.length) return `${title} capabilities\n\n${sections.join("\n\n")}`;
+  return [
+    `${title} capabilities`,
+    "No skills, agents, MCP servers, or tool list has been reported for this chat yet.",
+    "Run one agent task first so the bridge can capture the provider init metadata.",
+  ].join("\n");
+}
+
+// Run a short, read-only provider subcommand and capture its output. Used to make
+// /status and /doctor reflect what the REAL CLI reports (account, health) instead
+// of a locally-synthesized placeholder. Bounded time + output; never throws.
+function runCliCapture(cmd, args, timeoutMs = 12000) {
+  try {
+    const out = execFileSync(cmd, args, {
+      encoding: "utf8",
+      timeout: timeoutMs,
+      maxBuffer: 256 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return String(out || "").trim();
+  } catch (err) {
+    const partial = String((err && (err.stdout || err.stderr)) || "").trim();
+    return partial || null;
+  }
+}
+
+// Real account/login status from the provider CLI. Codex exposes `codex login
+// status`; Claude has no headless account command, so we return null and let the
+// caller fall back to the model/usage context it already has.
+function providerAccountStatus(provider) {
+  if (provider === "codex") {
+    return runCliCapture("codex", ["login", "status"], 8000) || "Codex login status unavailable.";
+  }
+  return null;
+}
+
+// REAL Claude subscription usage. The interactive `/usage` view fetches this from
+// `GET /api/oauth/usage` (the CLI's `fetchUtilization`) using the same OAuth token
+// the `claude` CLI stores in the macOS Keychain. We read that token and call the
+// endpoint ourselves so the phone's /usage shows the actual 5-hour + 7-day limits
+// (utilization % + reset time), not a locally-synthesized placeholder. Cached
+// briefly so repeated taps don't hammer the endpoint. Returns null on any failure
+// (no token / expired / offline) — callers fall back to per-run token counts.
+let claudeUtilCache = { at: 0, data: null };
+async function fetchClaudeUtilization() {
+  if (claudeUtilCache.data && Date.now() - claudeUtilCache.at < 45000) return claudeUtilCache.data;
+  let token = null;
+  try {
+    const raw = execFileSync(
+      "security",
+      ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
+      { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"] }
+    );
+    const parsed = JSON.parse(raw);
+    token = parsed && parsed.claudeAiOauth && parsed.claudeAiOauth.accessToken;
+  } catch (_) {
+    token = null;
+  }
+  if (!token) return null;
+  try {
+    const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
+      headers: { Authorization: `Bearer ${token}`, "anthropic-beta": "oauth-2025-04-20" },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    claudeUtilCache = { at: Date.now(), data };
+    return data;
+  } catch (_) {
+    return null;
+  }
+}
+
+function fmtResetIn(iso) {
+  const t = Date.parse(iso || "");
+  if (!Number.isFinite(t)) return "";
+  const ms = t - Date.now();
+  if (ms <= 0) return "resetting now";
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor((ms % 3600000) / 60000);
+  if (h >= 24) return `resets in ${Math.floor(h / 24)}d ${h % 24}h`;
+  if (h >= 1) return `resets in ${h}h ${m}m`;
+  return `resets in ${m}m`;
+}
+
+function formatClaudeUtilization(util) {
+  if (!util || typeof util !== "object") return null;
+  const lines = [];
+  const bucket = (label, b) => {
+    if (!b || typeof b !== "object" || b.utilization == null) return;
+    const reset = fmtResetIn(b.resets_at);
+    lines.push(`${label}: ${Math.round(Number(b.utilization))}% used${reset ? ` · ${reset}` : ""}`);
+  };
+  bucket("5-hour session", util.five_hour);
+  bucket("7-day (all models)", util.seven_day);
+  bucket("7-day Opus", util.seven_day_opus);
+  bucket("7-day Sonnet", util.seven_day_sonnet);
+  return lines.length ? lines.join("\n") : null;
+}
+
+async function bridgeCommandOutput(provider, chatId, task, repo, command) {
   const key = sessionKey(provider, chatId);
   const currentModel = modelFor(provider, chatId, task);
   const lastRuntime = lastRuntimeBySession.get(key);
+  const providerTitle = provider === "claude" ? "Claude" : provider === "codex" ? "Codex" : provider;
+  if (command.desktopOnly) {
+    const desc = (provider === "claude" ? CLAUDE_COMMAND_DESC : CODEX_COMMAND_DESC)[command.name];
+    return [
+      `/${command.name}${desc ? ` — ${desc}` : ""}`,
+      `This is an interactive ${providerTitle} command that runs in the desktop/terminal app, so it can't run headless from the phone.`,
+      "Send it from the Codex app on your computer, or just describe what you want and I'll do it as a normal request.",
+    ].join("\n");
+  }
   switch (command.name) {
     case "commands":
     case "help":
       return formatCommands(provider);
-    case "usage":
-      return [
-        `${provider} usage for this chat:`,
-        formatUsage(lastRuntime),
-        currentModel ? `Current model: ${currentModel}` : "Current model: provider default",
-      ].join("\n");
+    case "skills":
+      return formatSkills(provider);
+    case "usage": {
+      const lines = [`${providerTitle} usage`];
+      if (provider === "claude") {
+        const util = formatClaudeUtilization(await fetchClaudeUtilization());
+        if (util) {
+          lines.push("Subscription limits:");
+          lines.push(util);
+          lines.push("");
+        } else {
+          lines.push("(Subscription limits unavailable — sign in to Claude on this computer.)");
+          lines.push("");
+        }
+      }
+      lines.push("This chat (last run):");
+      lines.push(formatUsage(lastRuntime));
+      lines.push(currentModel ? `Model: ${currentModel}` : "Model: provider default");
+      return lines.join("\n");
+    }
     case "model": {
       const next = command.args.trim();
       if (!next) return `Current ${provider} model: ${currentModel || "provider default"}`;
@@ -1385,25 +1680,36 @@ function bridgeCommandOutput(provider, chatId, task, repo, command) {
         "The next Claude request will start without the previous --resume session.",
         "Codex bridge runs are already ephemeral in this noninteractive path.",
       ].join("\n");
-    case "status":
-      return [
-        `${provider} bridge status`,
-        `repo: ${repo.name}`,
-        `cwd: ${repo.cwd || repo.path}`,
-        `work mode: ${workModeFor(task)}`,
-        `model: ${currentModel || "provider default"}`,
-        `last usage: ${formatUsage(lastRuntime)}`,
-      ].join("\n");
+    case "doctor": {
+      const out = runCliCapture(provider === "codex" ? "codex" : "claude", ["doctor"], 25000);
+      return out || `${providerTitle} doctor produced no output.`;
+    }
+    case "status": {
+      // What the user actually wants from /status: their ACCOUNT + remaining usage,
+      // not the bridge connection. Lead with the real login/subscription status and
+      // (for Claude) the live 5h/7d limits, then the run context.
+      const lines = [`${providerTitle} status`];
+      const account = providerAccountStatus(provider);
+      if (account) lines.push(account);
+      if (provider === "claude") {
+        const util = formatClaudeUtilization(await fetchClaudeUtilization());
+        if (util) lines.push(util);
+      }
+      lines.push(`model: ${currentModel || "provider default"}`);
+      lines.push(`usage (last run): ${formatUsage(lastRuntime)}`);
+      lines.push(`repo: ${repo.name} · mode: ${workModeFor(task)}`);
+      return lines.join("\n");
+    }
     default:
       return null;
   }
 }
 
-function runBridgeCommand(channel, task, repo, beforeGit, command) {
+async function runBridgeCommand(channel, task, repo, beforeGit, command) {
   const { provider, chatId, replyToId, requesterUserId } = task;
   const taskId = taskIdFor(task || {});
   const startedAt = Date.now();
-  const output = bridgeCommandOutput(provider, chatId, task, repo, command);
+  const output = await bridgeCommandOutput(provider, chatId, task, repo, command);
   if (output == null) return false;
   const lastRuntime = lastRuntimeBySession.get(sessionKey(provider, chatId));
 
@@ -2048,7 +2354,7 @@ function materializeAttachments(task, cwd) {
   return written;
 }
 
-function runTask(channel, task) {
+async function runTask(channel, task) {
   const recvAt = Date.now();
   const { provider, chatId, prompt, replyToId, requesterUserId } = task;
   const taskId = taskIdFor(task || {});
@@ -2080,8 +2386,8 @@ function runTask(channel, task) {
     `[vibe-bridge] latency gitSnapshot(before)=${Date.now() - startedAt}ms ` +
       `chat=${chatId} task=${taskId} cwd=${cwd}`
   );
-  const bridgeCommand = parseBridgeCommand(prompt);
-  if (bridgeCommand && runBridgeCommand(channel, task, repo, beforeGit, bridgeCommand)) {
+  const bridgeCommand = parseBridgeCommand(prompt, provider);
+  if (bridgeCommand && (await runBridgeCommand(channel, task, repo, beforeGit, bridgeCommand))) {
     return;
   }
   // Materialize any phone-sent image attachments to disk and point the agent at
@@ -2273,16 +2579,7 @@ function runTask(channel, task) {
       canceled,
       output,
     });
-    rememberFinishedTask(key, {
-      provider,
-      chatId,
-      taskId,
-      repo,
-      runtime: agentRuntime,
-      finishedAt: Date.now(),
-    });
-    rememberRuntime(provider, chatId, agentRuntime);
-    channel.push("result", {
+    const resultPayload = {
       provider,
       chatId,
       taskId,
@@ -2298,7 +2595,20 @@ function runTask(channel, task) {
       ...teamFieldsForTask(task),
       ...runtimeResultField(agentRuntime),
       ...liveAgentActionsField(provider, output),
+    };
+    rememberFinishedTask(key, {
+      provider,
+      chatId,
+      taskId,
+      repo,
+      runtime: agentRuntime,
+      finishedAt: Date.now(),
+      // Kept so a result that lands while the socket is down can be re-pushed on
+      // reconnect (see the rejoin recovery in connect()).
+      resultPayload,
     });
+    rememberRuntime(provider, chatId, agentRuntime);
+    channel.push("result", resultPayload);
   });
 
   return {
@@ -2663,8 +2973,32 @@ function messageHasUserText(m) {
   return false;
 }
 
+// A session is "live" when its transcript file is actively being appended to (a
+// turn is in flight) — detected by a recent mtime — OR when it matches a task the
+// bridge itself spawned and is still running. This lets the phone show a live badge
+// in history (and open it as a live stream) for sessions started EITHER by the
+// bridge OR directly in the user's own desktop terminal (which never enter the
+// `runningTasks` Map, so mtime-freshness is the only signal we have for those).
+const LIVE_SESSION_WINDOW_MS = 75_000;
+
+function runningSessionIdSet(provider) {
+  const set = new Set();
+  const want = String(provider || "").trim().toLowerCase();
+  for (const entry of runningTasks.values()) {
+    if (want && entry.provider && String(entry.provider).toLowerCase() !== want) continue;
+    if (entry.sessionId) set.add(entry.sessionId);
+  }
+  return set;
+}
+
+function sessionIsLive(mtime, id, runningIds) {
+  if (id && runningIds && runningIds.has(id)) return true;
+  return mtime != null && Date.now() - mtime < LIVE_SESSION_WINDOW_MS;
+}
+
 async function listClaude(limit) {
   const files = claudeSessionFiles().sort((a, b) => b.mtime - a.mtime).slice(0, limit);
+  const runningIds = runningSessionIdSet("claude");
   const results = [];
   for (const s of files) {
     const sum = await claudeSummary(s.file);
@@ -2677,6 +3011,7 @@ async function listClaude(limit) {
       projectName: path.basename(s.project),
       updatedAt: sum.lastTs || new Date(s.mtime).toISOString(),
       messageCount: sum.messages,
+      live: sessionIsLive(s.mtime, s.id, runningIds),
     });
   }
   return results;
@@ -2923,11 +3258,19 @@ function liveClaudeActions(output) {
   const resultByUid = new Map();
   const order = [];
   for (const event of parsedJsonlEvents(output)) {
+    // Live stream-json tags every subagent event with the parent Task's tool_use id;
+    // carry it onto the child detail so the node lands at depth 1 / parentId.
+    const parentToolUseId =
+      typeof event.parent_tool_use_id === "string" && event.parent_tool_use_id
+        ? event.parent_tool_use_id
+        : "";
     for (const block of eventContentBlocks(event)) {
       if (block.type === "tool_use") {
         const id = block.id || `claude-tool-${order.length}`;
         order.push(id);
-        detailByUid.set(id, claudeActionDetail(block));
+        const det = claudeActionDetail(block);
+        if (parentToolUseId) det.parentId = parentToolUseId;
+        detailByUid.set(id, det);
       } else if (block.type === "tool_result") {
         const id = block.tool_use_id || block.id;
         if (id) {
@@ -3072,13 +3415,20 @@ function actionNode(detail, uid, status) {
   const d = detail || {};
   const kind = d.kind || "tool";
   const target = actionNodeTarget(kind, d);
+  // A subagent (Task tool) child carries the parent Task's tool_use id → depth 1
+  // so the phone groups it under the Task instead of flattening it into the feed.
+  const parentId = d.parentId ? String(d.parentId) : "";
   const node = {
     id: String(uid || ""),
     label: cleanNodeLabel(kind, target, d),
     kind,
     status: status || "done",
-    depth: 0,
+    depth: parentId ? 1 : 0,
   };
+  if (parentId) node.parentId = parentId;
+  // The parent Task node advertises the subagent flavor (e.g. "explore") so the
+  // phone can render "🤖 Subagent · explore" and open its read-only view.
+  if (kind === "task" && d.subagent) node.subagentType = String(d.subagent);
   if (target) node.target = target;
   if (typeof d.additions === "number" && d.additions > 0) node.added = d.additions;
   if (typeof d.deletions === "number" && d.deletions > 0) node.removed = d.deletions;
@@ -3306,10 +3656,18 @@ async function claudeDetail(id, limit) {
           .join("\n\n")
           .trim();
         if (think) turnReasoning += (turnReasoning ? "\n\n" : "") + think;
+        // Subagent (sidechain) events carry the parent Task's tool_use id; tag the
+        // child detail so it groups under the Task (depth 1) like the live path.
+        const parentToolUseId =
+          (typeof ev.parent_tool_use_id === "string" && ev.parent_tool_use_id) ||
+          (typeof m.parent_tool_use_id === "string" && m.parent_tool_use_id) ||
+          "";
         for (const b of m.content) {
           if (b && b.type === "tool_use") {
             turnItems.push({ type: "tool", uid: b.id, ts: ev.timestamp });
-            actionDetailByUid.set(b.id, claudeActionDetail(b));
+            const det = claudeActionDetail(b);
+            if (parentToolUseId) det.parentId = parentToolUseId;
+            actionDetailByUid.set(b.id, det);
           }
         }
       }
@@ -3386,20 +3744,23 @@ async function codexSummary(file) {
 
 async function listCodex(limit) {
   const files = codexSessionFiles().sort((a, b) => b.mtime - a.mtime).slice(0, limit);
+  const runningIds = runningSessionIdSet("codex");
   const results = [];
   for (const f of files) {
     const sum = await codexSummary(f.file);
     if (sum.messages === 0) continue;
     const project = (sum.meta && sum.meta.cwd) || "";
     if (isEphemeralProject(project)) continue;
+    const id = (sum.meta && sum.meta.id) || f.name;
     results.push({
       provider: "codex",
-      id: (sum.meta && sum.meta.id) || f.name,
+      id,
       topic: sum.topic,
       project,
       projectName: project ? path.basename(project) : "",
       updatedAt: sum.lastTs || new Date(f.mtime).toISOString(),
       messageCount: sum.messages,
+      live: sessionIsLive(f.mtime, id, runningIds),
     });
   }
   return results;
@@ -3549,6 +3910,38 @@ function runningTaskForChat(chatId) {
   return null;
 }
 
+// True when the session's transcript file was appended to within the live window —
+// the signal that a turn is in flight for a session the bridge did NOT spawn (a
+// run the user started directly in their own desktop terminal).
+function sessionFileIsLive(provider, sessionId) {
+  const file = sessionFilePath(provider, sessionId);
+  if (!file) return false;
+  try {
+    return Date.now() - fs.statSync(file).mtimeMs < LIVE_SESSION_WINDOW_MS;
+  } catch (_) {
+    return false;
+  }
+}
+
+// Flag the trailing turn of a live session's detail payload as "working" so the
+// phone renders the live state (shimmer + action feed) instead of collapsing to a
+// finalized "Worked · N steps" card. Live = a bridge task is running for this chat
+// OR the transcript file is still growing (desktop-terminal run). Returns true if
+// the turn was marked.
+function markDetailLiveTurn(result, provider, sessionId, chatId) {
+  if (!result || result.mode !== "detail") return false;
+  const msgs = result.session && result.session.messages;
+  if (!Array.isArray(msgs) || !msgs.length) return false;
+  if (!runningTaskForChat(chatId) && !sessionFileIsLive(provider, sessionId)) return false;
+  const last = msgs[msgs.length - 1];
+  if (last && last.role === "assistant") {
+    markMessageRunning(last);
+    unfoldRunningMessageText(last);
+    return true;
+  }
+  return false;
+}
+
 function markMessageRunning(message) {
   if (!message || typeof message !== "object") return message;
   message.running = true;
@@ -3627,6 +4020,7 @@ function stopHistoryWatch(chatId) {
   try { if (rec.watcher) rec.watcher.close(); } catch (_) {}
   try { if (rec.listener) fs.unwatchFile(rec.file, rec.listener); } catch (_) {}
   try { if (rec.debounce) clearTimeout(rec.debounce); } catch (_) {}
+  try { if (rec.settle) clearTimeout(rec.settle); } catch (_) {}
   historyWatchers.delete(chatId);
 }
 
@@ -3637,6 +4031,15 @@ function stopAllHistoryWatches() {
 function startHistoryWatch(channel, { chatId, provider, sessionId, echo }) {
   const file = sessionFilePath(provider, sessionId);
   if (!chatId || !sessionId || !file) return;
+  // Remember the spec so the watch can be re-armed after a reconnect (the socket drop
+  // calls stopAllHistoryWatches, which would otherwise leave the phone stuck on a stale
+  // transcript until a full app restart).
+  historyWatchSpecs.set(chatId, { provider, sessionId, echo });
+  while (historyWatchSpecs.size > MAX_HISTORY_WATCHERS) {
+    const oldest = historyWatchSpecs.keys().next().value;
+    if (oldest === chatId || !oldest) break;
+    historyWatchSpecs.delete(oldest);
+  }
   stopHistoryWatch(chatId); // replace any prior watch for this chat
   if (historyWatchers.size >= MAX_HISTORY_WATCHERS) {
     const oldest = historyWatchers.keys().next().value;
@@ -3651,16 +4054,20 @@ function startHistoryWatch(channel, { chatId, provider, sessionId, echo }) {
       .then((result) => {
         const msgs = (result && result.session && result.session.messages) || [];
         const runningEntry = runningTaskForChat(chatId);
+        // Live = a bridge task is running for this chat OR the transcript file is
+        // still being appended to (a run the user started in their OWN terminal,
+        // which never enters runningTasks). Either way the LAST turn is in flight —
+        // flag it so the phone renders the live "working" state (shimmer + feed)
+        // instead of collapsing to a "Worked · N steps" card. For bridge tasks the
+        // flag clears on close (refireHistoryWatch); for desktop runs a settle timer
+        // below re-fires once the file goes quiet so the final card seals.
+        const liveByFile = sessionFileIsLive(provider, sessionId);
+        const running = !!runningEntry || liveByFile;
         let last = msgs.length ? msgs[msgs.length - 1] : null;
-        // While a task is actively running for this chat, the LAST turn is still in
-        // flight — flag it so the phone renders the live "working" state (shimmer +
-        // feed) instead of collapsing to a "Worked · N steps" card. The flag clears
-        // on the next re-push after the run finishes (see refireHistoryWatch on close).
-        const running = !!runningEntry;
         if (running && last && last.role === "assistant") {
           markMessageRunning(last);
           unfoldRunningMessageText(last);
-        } else if (running) {
+        } else if (runningEntry) {
           const placeholder = runningPlaceholderMessage(runningEntry);
           if (placeholder) {
             msgs.push(placeholder);
@@ -3674,6 +4081,13 @@ function startHistoryWatch(channel, { chatId, provider, sessionId, echo }) {
         if (sig !== rec.lastSig) {
           rec.lastSig = sig;
           channel.push("history_result", { ok: true, ...echo, ...result });
+        }
+        // Desktop-terminal runs have no close event to seal the final card. Once the
+        // file goes quiet past the live window, fire once more: liveByFile flips false,
+        // the trailing turn seals, and the run→done sig change pushes the final state.
+        if (rec.settle) { clearTimeout(rec.settle); rec.settle = null; }
+        if (liveByFile && !runningEntry && channel.state === "joined") {
+          rec.settle = setTimeout(() => { rec.settle = null; fire(); }, LIVE_SESSION_WINDOW_MS + 1500);
         }
       })
       .catch(() => {})
@@ -3708,6 +4122,10 @@ function handleHistoryRequest(channel, payload) {
 
   readHistory({ provider, mode: payload.mode, sessionId, limit: payload.limit })
     .then((result) => {
+      // Mark the trailing turn live on the FIRST detail push too (not just on watch
+      // re-fires) so opening a live session lands directly in the working state with
+      // no flash of the sealed "Worked · N steps" card.
+      markDetailLiveTurn(result, provider, sessionId, chatId);
       channel.push("history_result", { ok: true, ...echo, ...result });
       // The phone opened a specific session → keep it live by tailing the
       // transcript and re-pushing as it grows.
@@ -3864,11 +4282,46 @@ function probeBridgeToken(server, token, timeoutMs = 6000) {
   });
 }
 
+// Called on every successful (re)join. On the FIRST join `socketDownSince` is null so
+// this is a no-op; on a REJOIN after a drop it (1) re-delivers any result that completed
+// while the socket was down — whose one-shot push was lost, leaving the phone's live
+// clock ticking forever until an app restart — and (2) re-arms the history watches the
+// drop tore down, so the transcript re-syncs in place. The finishedAt >= socketDownSince
+// window means only results that were NOT delivered get re-sent (no duplicates).
+function recoverAfterReconnect(channel) {
+  if (socketDownSince == null) return;
+  const downMs = Date.now() - socketDownSince;
+  let redelivered = 0;
+  for (const rec of finishedTasks.values()) {
+    if (rec && rec.resultPayload && rec.finishedAt >= socketDownSince) {
+      try {
+        channel.push("result", rec.resultPayload);
+        redelivered++;
+      } catch (_) {}
+    }
+  }
+  let rewatched = 0;
+  for (const [chatId, spec] of historyWatchSpecs.entries()) {
+    try {
+      startHistoryWatch(channel, { chatId, ...spec });
+      rewatched++;
+    } catch (_) {}
+  }
+  console.log(
+    `[vibe-bridge] reconnected after ${downMs}ms down — recovery: redelivered=${redelivered} result(s), rewatched=${rewatched} chat(s)`
+  );
+  socketDownSince = null;
+}
+
 function connect(server, token, userId) {
   const socket = new Phoenix.Socket(wsUrl(server), {
     params: { token },
     transport: WebSocket,
     reconnectAfterMs: (tries) => [1000, 2000, 5000, 10000][tries - 1] || 10000,
+    // A tighter heartbeat keeps idle connections alive through proxy/LB idle reapers
+    // (the recurring code=1006 drops) and detects a dead socket faster so the auto
+    // reconnect kicks in sooner.
+    heartbeatIntervalMs: 15000,
   });
 
   socket.onError((error) => {
@@ -3883,12 +4336,19 @@ function connect(server, token, userId) {
         ? ` code=${event.code || "-"} reason=${event.reason || "-"}`
         : "";
     console.log(`[vibe-bridge] socket closed${detail} (will retry)`);
+    // Mark the start of the outage (first close only) so the rejoin handler can recover
+    // anything that completed while we were down.
+    if (socketDownSince == null) socketDownSince = Date.now();
     stopAllHistoryWatches(); // watchers hold a now-stale channel
   });
   socket.connect();
 
   const channel = socket.channel(`bridge:${userId}`, {});
-  channel.on("run_task", (task) => runTask(channel, task));
+  channel.on("run_task", (task) =>
+    runTask(channel, task).catch((err) =>
+      console.error(`[vibe-bridge] runTask error: ${(err && err.message) || err}`)
+    )
+  );
   channel.on("control_task", (payload) => controlTask(channel, payload || {}));
   channel.on("history_request", (payload) => handleHistoryRequest(channel, payload || {}));
   channel.on("file_request", (payload) => handleFileRequest(channel, payload || {}));
@@ -3909,6 +4369,7 @@ function connect(server, token, userId) {
             "   Change projects later with:  vibegram-bridge --pick\n"
         );
       }
+      recoverAfterReconnect(channel);
       pushBridgeStatus(channel);
     })
     .receive("error", (e) => console.error("[vibe-bridge] join error:", JSON.stringify(e)));
@@ -3966,7 +4427,9 @@ async function runSelfTest() {
         if (event === "result" || event === "error") resolve();
       },
     };
-    runTask(channel, task);
+    runTask(channel, task).catch((err) =>
+      console.error(`[vibe-bridge] runTask error: ${(err && err.message) || err}`)
+    );
     });
 
   if (ARGS.selfTestSequence) {

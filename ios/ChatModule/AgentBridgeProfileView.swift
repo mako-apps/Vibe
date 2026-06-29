@@ -25,13 +25,19 @@ enum AgentBridgeProfile {
     }
   }
 
-    @MainActor static func presentConnection(provider: String, from presenter: UIViewController) {
+  @MainActor static func presentConnection(provider: String, from presenter: UIViewController) {
     let model = AgentConnectModel(provider: provider, displayName: displayName(for: provider))
+    if let snapshot = AgentPairingService.lastStatusSnapshot {
+      model.status = snapshot
+      model.selectedRepository = AgentBridgeSelectionStore.ensureValidSelection(from: snapshot.repositories)
+    }
     let host = UIHostingController(rootView: AgentBridgeConnectionSheet(model: model))
     host.modalPresentationStyle = .pageSheet
     if let sheet = host.sheetPresentationController {
-      sheet.detents = [.medium(), .large()]
+      sheet.detents = [.large()]
+      sheet.selectedDetentIdentifier = .large
       sheet.prefersGrabberVisible = true
+      sheet.preferredCornerRadius = 28
     }
     presenter.present(host, animated: true)
   }
@@ -51,53 +57,102 @@ struct AgentBridgeConnectionSheet: View {
   private var palette: AppThemePalette { AppThemePalette.resolve(for: colorScheme) }
 
   var body: some View {
-    NavigationView {
-      List {
-        Section {
-          connectionRow
-        } header: {
-          Text("Computer")
-        } footer: {
-          Text("\(model.displayName) runs on your own computer with your own subscription. Pairing is revocable and only you can connect a computer.")
-        }
+    NavigationStack {
+      ScrollView {
+        VStack(alignment: .leading, spacing: 18) {
+          VStack(alignment: .leading, spacing: 7) {
+            Text("\(model.displayName) computer")
+              .font(.system(size: 28, weight: .bold))
+              .foregroundStyle(palette.text)
+            Text("\(model.displayName) runs on your own computer with your own subscription. Pair once, then keep using the same Mac from your phone.")
+              .font(.system(size: 15))
+              .foregroundStyle(palette.secondaryText)
+              .fixedSize(horizontal: false, vertical: true)
+          }
 
-        Section {
-          Button {
-            model.beginScan()
-          } label: {
-            Label(
-              model.status.paired || model.status.connected ? "Reconnect — scan QR" : "Add connection",
-              systemImage: "qrcode.viewfinder"
+          connectionCard
+
+          VStack(alignment: .leading, spacing: 11) {
+            infoRow(
+              icon: "lock.shield",
+              title: "Private by default",
+              body: "Pairing is revocable and only your account can authorize a computer."
+            )
+            infoRow(
+              icon: "qrcode.viewfinder",
+              title: "Scan the bridge QR",
+              body: "On your Mac, run the bridge command. It prints a QR code; scanning it here opens the camera view."
+            )
+            infoRow(
+              icon: "arrow.triangle.2.circlepath",
+              title: model.status.paired || model.status.connected ? "Reconnect anytime" : "Connect once",
+              body: model.status.paired || model.status.connected
+                ? "Reconnect scans a fresh QR without changing your chat history or selected repository."
+                : "After pairing, the app waits for the bridge daemon to come online."
             )
           }
-          .disabled(isWorking)
 
           if model.status.paired || model.status.connected {
             Button(role: .destructive) {
               disconnect()
             } label: {
-              Label("Disconnect computer", systemImage: "xmark.circle")
+              Label("Disconnect current computer", systemImage: "xmark.circle")
+                .font(.system(size: 15, weight: .semibold))
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             .disabled(isWorking)
+            .padding(14)
+            .background(
+              RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(palette.card)
+            )
+            .overlay(
+              RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(palette.border.opacity(0.8), lineWidth: 0.7)
+            )
           }
-        } footer: {
-          if model.status.paired || model.status.connected {
-            Text("Disconnect revokes this computer's pairing token and stops the bridge. To reconnect you scan the QR the daemon prints again.")
-          } else {
-            Text("On your computer run the bridge — it prints a QR. Scan it here to connect.")
-          }
-        }
 
-        if let errorMessage {
-          Section {
+          if let errorMessage {
             Text(errorMessage)
               .font(.system(size: 13))
-              .foregroundStyle(.red)
+              .foregroundStyle(palette.danger)
+              .fixedSize(horizontal: false, vertical: true)
+              .padding(14)
+              .frame(maxWidth: .infinity, alignment: .leading)
+              .background(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                  .fill(palette.danger.opacity(0.10))
+              )
           }
+
+          Button {
+            model.beginScan()
+          } label: {
+            HStack(spacing: 10) {
+              if model.isAuthorizing || isWorking {
+                ProgressView()
+                  .tint(.white)
+              } else {
+                Image(systemName: "qrcode.viewfinder")
+                  .font(.system(size: 18, weight: .semibold))
+              }
+              Text(model.status.paired || model.status.connected ? "Scan QR to reconnect" : "Scan QR to connect")
+                .font(.system(size: 17, weight: .semibold))
+            }
+            .foregroundStyle(.white)
+            .frame(maxWidth: .infinity)
+            .frame(height: 52)
+            .background(palette.accent)
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+          }
+          .disabled(isWorking || model.isAuthorizing)
+          .padding(.top, 2)
+          .padding(.bottom, 18)
         }
+        .padding(.horizontal, 22)
+        .padding(.top, 18)
       }
-      .listStyle(.insetGrouped)
-      .navigationTitle("\(model.displayName) computer")
+      .background(palette.background.ignoresSafeArea())
       .navigationBarTitleDisplayMode(.inline)
       .toolbar {
         ToolbarItem(placement: .topBarTrailing) {
@@ -118,30 +173,45 @@ struct AgentBridgeConnectionSheet: View {
   }
 
   @ViewBuilder
-  private var connectionRow: some View {
-    if model.status.connected, let device = model.status.devices.first {
-      statusRow(
-        icon: "laptopcomputer",
-        title: device.label,
-        subtitle: "Connected",
-        subtitleColor: .green,
-        showsDot: true
-      )
-    } else if model.status.paired {
-      statusRow(
-        icon: "laptopcomputer.slash",
-        title: model.status.devices.first?.label ?? "Your computer",
-        subtitle: "Paired — bridge offline",
-        subtitleColor: palette.secondaryText
-      )
-    } else {
-      statusRow(
-        icon: "laptopcomputer.slash",
-        title: "No computer connected",
-        subtitle: "Pair one to start",
-        subtitleColor: palette.secondaryText
-      )
+  private var connectionCard: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      Text("Computer")
+        .font(.system(size: 13, weight: .semibold))
+        .foregroundStyle(palette.secondaryText)
+      if model.status.connected, let device = model.status.devices.first {
+        statusRow(
+          icon: "laptopcomputer",
+          title: device.label,
+          subtitle: "Connected",
+          subtitleColor: .green,
+          showsDot: true
+        )
+      } else if model.status.paired {
+        statusRow(
+          icon: "laptopcomputer.slash",
+          title: model.status.devices.first?.label ?? "Your computer",
+          subtitle: "Paired — bridge offline",
+          subtitleColor: palette.secondaryText
+        )
+      } else {
+        statusRow(
+          icon: "laptopcomputer.slash",
+          title: "No computer connected",
+          subtitle: "Pair one to start",
+          subtitleColor: palette.secondaryText
+        )
+      }
     }
+    .padding(16)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(
+      RoundedRectangle(cornerRadius: 20, style: .continuous)
+        .fill(palette.card)
+    )
+    .overlay(
+      RoundedRectangle(cornerRadius: 20, style: .continuous)
+        .stroke(palette.border.opacity(0.75), lineWidth: 0.7)
+    )
   }
 
   private func statusRow(
@@ -171,6 +241,24 @@ struct AgentBridgeConnectionSheet: View {
       }
     }
     .padding(.vertical, 2)
+  }
+
+  private func infoRow(icon: String, title: String, body: String) -> some View {
+    HStack(alignment: .top, spacing: 12) {
+      Image(systemName: icon)
+        .font(.system(size: 16, weight: .semibold))
+        .foregroundStyle(palette.accent)
+        .frame(width: 22, height: 22)
+      VStack(alignment: .leading, spacing: 3) {
+        Text(title)
+          .font(.system(size: 14, weight: .semibold))
+          .foregroundStyle(palette.text)
+        Text(body)
+          .font(.system(size: 13))
+          .foregroundStyle(palette.secondaryText)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+    }
   }
 
   private func disconnect() {
@@ -491,7 +579,7 @@ struct AgentBridgeHistoryInlineView: View {
             if session.isRunning {
               ProgressView()
                 .controlSize(.small)
-                .tint(palette.secondaryText)
+                .tint(.green)
             }
             Text(session.topic)
               .font(.system(size: 18, weight: .regular))
@@ -500,7 +588,11 @@ struct AgentBridgeHistoryInlineView: View {
           }
           HStack(spacing: 6) {
             if session.isRunning {
-              Text("Running")
+              HStack(spacing: 4) {
+                Circle().fill(Color.green).frame(width: 6, height: 6)
+                Text("Live")
+                  .foregroundStyle(Color.green)
+              }
             } else {
               Text("\(session.messageCount) messages")
             }
@@ -597,6 +689,11 @@ struct AgentBridgeHistoryInlineView: View {
       ?? (item["projectPath"] as? String)
       ?? (item["cwd"] as? String)
       ?? ""
+    // The bridge marks a session `live` when its transcript file is actively
+    // growing (a turn is in flight) — including chats started directly in the
+    // desktop's own terminal, which never enter the bridge's runningTasks list.
+    // Honor either key so older bridges (no `live`) still parse.
+    let live = (item["live"] as? Bool) ?? (item["isRunning"] as? Bool) ?? false
     return AgentBridgeHistorySession(
       id: id,
       topic: (item["topic"] as? String) ?? "Untitled",
@@ -604,7 +701,7 @@ struct AgentBridgeHistoryInlineView: View {
       projectPath: projectPath,
       updatedAt: (item["updatedAt"] as? String) ?? "",
       messageCount: (item["messageCount"] as? NSNumber)?.intValue ?? (item["messageCount"] as? Int) ?? 0,
-      isRunning: false,
+      isRunning: live,
       taskId: nil,
       sessionId: id
     )
@@ -676,7 +773,7 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
             if row.isStreamingText { return true }
             return false
           }
-          return VibeAgentKitMap.messages(from: keep)
+          return coordinator?.renderMessages(from: keep) ?? VibeAgentKitMap.messages(from: keep)
         }
         // Follow-ups that resume THIS session: identified durably by the resume
         // session id their send stamped into metadata (so a follow-up sent from
@@ -697,10 +794,10 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
           return false
         }
         if !keep.isEmpty {
-          return VibeAgentKitMap.messages(from: keep)
+          return coordinator?.renderMessages(from: keep) ?? VibeAgentKitMap.messages(from: keep)
         }
         let liveRows = all.filter { $0.isStreamingText }
-        return VibeAgentKitMap.messages(from: liveRows)
+        return coordinator?.renderMessages(from: liveRows) ?? VibeAgentKitMap.messages(from: liveRows)
       },
       // Send continues THIS session on the user's computer and streams back in place.
       onSend: { [weak coordinator] text, options, attachments in
@@ -746,14 +843,14 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
     messageId: String = UUID().uuidString.lowercased(),
     options: AgentBridgeRunOptions? = nil,
     attachments: [String] = []
-  ) {
+  ) -> [String: Any] {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
     // An image-only send carries no caption; give the agent (and the bubble) a
     // sensible default so the prompt isn't empty and the row isn't filtered out.
     let body =
       !trimmed.isEmpty
       ? trimmed : (attachments.isEmpty ? "" : "Please take a look at the attached image.")
-    guard !body.isEmpty else { return }
+    guard !body.isEmpty else { return ["accepted": false, "reason": "empty_text"] }
     var metadata: [String: Any] = ["agentBridgeProvider": provider]
     if let repo = AgentBridgeSelectionStore.selectedRepository() {
       metadata["agentBridgeRepoId"] = repo.id
@@ -775,7 +872,7 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
     if !resumeSessionId.isEmpty, !resumeSessionId.hasPrefix("running:") {
       metadata["agentBridgeResumeSessionId"] = resumeSessionId
     }
-    _ = ChatEngine.shared.sendMessage([
+    return ChatEngine.shared.sendMessage([
       "chatId": chatId,
       "type": "text",
       "text": body,
@@ -801,6 +898,8 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
     /// this session. `freshSendIds` scopes the provider to just those new turns.
     var forceFreshSession = false
     var freshSendIds: Set<String> = []
+    private var localMessagesById: [String: VibeAgentKitChatMessage] = [:]
+    private var localMessageOrder: [String] = []
 
     init(parent: AgentBridgeRuntimeView) {
       self.parent = parent
@@ -812,9 +911,60 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
       forceFreshSession = true
       followUpMessageIds.removeAll()
       freshSendIds.removeAll()
+      localMessagesById.removeAll()
+      localMessageOrder.removeAll()
       // A fresh chat is intentionally blank — no spinner, just the empty composer.
       controller?.isLoadingTranscript = false
       controller?.setMessages([])
+    }
+
+    func renderMessages(from rows: [ChatListRow]) -> [VibeAgentKitChatMessage] {
+      let mapped = VibeAgentKitMap.messages(from: rows)
+      let mappedIds = Set(mapped.map(\.id))
+      let local = localMessageOrder.compactMap { id -> VibeAgentKitChatMessage? in
+        guard !mappedIds.contains(id) else { return nil }
+        return localMessagesById[id]
+      }
+      return mapped + local
+    }
+
+    private func upsertLocalMessage(_ message: VibeAgentKitChatMessage) {
+      localMessagesById[message.id] = message
+      if !localMessageOrder.contains(message.id) {
+        localMessageOrder.append(message.id)
+      }
+      controller?.isLoadingTranscript = false
+      controller?.reloadLiveMessages()
+    }
+
+    private func appendLocalSend(
+      messageId: String,
+      body: String
+    ) {
+      upsertLocalMessage(
+        VibeAgentKitChatMessage(
+          id: messageId,
+          role: .user,
+          text: body,
+          timestamp: "",
+          timestampMs: Int64(Date().timeIntervalSince1970 * 1000)
+        )
+      )
+    }
+
+    private func appendLocalSendFailure(messageId: String, result: [String: Any]) {
+      let reason = (result["reason"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+      let detail = reason?.isEmpty == false ? reason! : "send_failed"
+      upsertLocalMessage(
+        VibeAgentKitChatMessage(
+          id: "send-error-\(messageId)",
+          role: .assistant,
+          text: "Message was not delivered to your computer. Reason: \(detail). Reconnect the bridge and send it again.",
+          timestamp: "",
+          timestampMs: Int64(Date().timeIntervalSince1970 * 1000),
+          isError: true
+        )
+      )
     }
 
     /// Send a follow-up that resumes this session and surface it inline. We mint the
@@ -836,7 +986,11 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
       } else {
         followUpMessageIds.insert(messageId)
       }
-      AgentBridgeRuntimeView.sendToAgent(
+      let body = trimmed.isEmpty && !attachments.isEmpty
+        ? "Please take a look at the attached image."
+        : trimmed
+      appendLocalSend(messageId: messageId, body: body)
+      let result = AgentBridgeRuntimeView.sendToAgent(
         chatId: parent.chatId,
         provider: parent.provider,
         resumeSessionId: resumeSessionId,
@@ -845,6 +999,11 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
         options: options,
         attachments: attachments
       )
+      if (result["accepted"] as? Bool) != true {
+        appendLocalSendFailure(messageId: messageId, result: result)
+      } else {
+        controller?.reloadLiveMessages()
+      }
     }
 
     deinit {

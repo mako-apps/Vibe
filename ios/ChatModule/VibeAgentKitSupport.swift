@@ -65,6 +65,14 @@ struct VibeAgentKitChatAppearance {
   )
 }
 
+struct VibeAgentKitImageAttachment: Equatable {
+  let id: String
+  let name: String?
+  let mime: String?
+  let sourceURI: String?
+  let dataBase64: String?
+}
+
 struct VibeAgentKitChatMessage: Equatable {
   var id: String
   var role: VibeAgentKitChatRole
@@ -81,6 +89,7 @@ struct VibeAgentKitChatMessage: Equatable {
   var progress: [String]
   var progressItems: [VibeAgentKitProgressItem]
   var runtime: ChatListRow.AgentRuntimeSummary?
+  var attachments: [VibeAgentKitImageAttachment]
   /// A /compact context-summary turn — renders as a centered, collapsible mid-chat
   /// divider ("Context compacted") rather than a left assistant bubble. `text` holds
   /// the raw summary that the divider reveals when expanded.
@@ -102,6 +111,7 @@ struct VibeAgentKitChatMessage: Equatable {
     progress: [String] = [],
     progressItems: [VibeAgentKitProgressItem] = [],
     runtime: ChatListRow.AgentRuntimeSummary? = nil,
+    attachments: [VibeAgentKitImageAttachment] = [],
     isCompactionSummary: Bool = false
   ) {
     self.id = id
@@ -119,6 +129,7 @@ struct VibeAgentKitChatMessage: Equatable {
     self.progress = progress
     self.progressItems = progressItems
     self.runtime = runtime
+    self.attachments = attachments
     self.isCompactionSummary = isCompactionSummary
   }
 }

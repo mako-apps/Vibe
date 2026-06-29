@@ -587,6 +587,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var enginePeerUserId: String = ""
   private var enginePeerAgentId: String = ""
   private var enginePeerDisplayName: String = ""
+  private var avatarUri: String = ""
   private var engineOpenedChatId: String = ""
   private var engineChannelBindingEnabled = true
   private var statusAuthorityEnabled = false
@@ -946,6 +947,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
     layoutActivityOverlay()
     layoutGapDebugOverlay()
+    layoutBridgeCommandOverlay()
 
     let currentHeight = collectionView.bounds.height
     let currentWidth = collectionView.bounds.width
@@ -1080,6 +1082,144 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
   }
 
+  // Message ids of bridge command results we've already reported to the host, so a
+  // re-render of the same row set doesn't re-fire the overlay on every setRows pass.
+  private var reportedBridgeCommandIds: Set<String> = []
+
+  /// Max agent-DM rows rendered at once. Caps per-row E2E decryption + bubble self-sizing
+  /// so a long transcript can't freeze the main thread.
+  private static let agentTranscriptWindow = 40
+
+  /// Pull bridge info-command results (executable == "vibe-bridge") out of the
+  /// transcript. The newest unreported one is forwarded to the host via
+  /// `onNativeEvent(type: "bridgeCommandResult")` so it renders in the glass overlay /
+  /// pinned usage banner instead of as a chat bubble. Returns the rows minus those.
+  // Slash commands the bridge answers in-place (banner/overlay) — these never belong in
+  // the transcript, neither the bridge's reply NOR the user's outgoing echo. Anything
+  // else ("/code-review", "/debug", …) is a real agent turn and stays in the list.
+  private static let bridgeInfoCommandNames: Set<String> = [
+    "usage", "status", "commands", "help", "model", "compact", "doctor", "context",
+  ]
+
+  private static func isBridgeInfoCommandText(_ text: String?) -> Bool {
+    let trimmed = (text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    guard trimmed.hasPrefix("/") else { return false }
+    let firstToken = trimmed.dropFirst().split(whereSeparator: { $0 == " " || $0 == "\n" }).first
+    guard let name = firstToken.map({ String($0).lowercased() }) else { return false }
+    return bridgeInfoCommandNames.contains(name)
+  }
+
+  private func extractBridgeCommandRows(_ parsed: [ChatListRow]) -> [ChatListRow] {
+    // Only Claude/Codex bridge DMs answer slash commands in-place; never touch a normal
+    // chat's transcript.
+    guard currentBridgeProvider != nil else { return parsed }
+    var kept: [ChatListRow] = []
+    var commandRows: [ChatListRow] = []
+    for row in parsed {
+      if row.agentRuntime?.command?.executable?.lowercased() == "vibe-bridge" {
+        commandRows.append(row)
+      } else if row.isMe, !row.isAgentMessage,
+        Self.isBridgeInfoCommandText(row.plainContent ?? row.text)
+      {
+        // The user's own "/usage" send — drop the echo bubble; the bridge's reply opens
+        // the banner instead. (Functional task commands fall through and stay.)
+        continue
+      } else {
+        kept.append(row)
+      }
+    }
+    guard !commandRows.isEmpty else { return kept }
+
+    // Report only the most recent command result that we haven't surfaced yet.
+    if let latest = commandRows.last,
+      let id = latest.messageId, !id.isEmpty,
+      !reportedBridgeCommandIds.contains(id)
+    {
+      reportedBridgeCommandIds.insert(id)
+      let display = latest.agentRuntime?.command?.display ?? ""
+      let name =
+        display
+        .components(separatedBy: " ")
+        .first(where: { $0.hasPrefix("/") })
+        .map { String($0.dropFirst()) } ?? ""
+      let body = (latest.plainContent ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+      if !body.isEmpty {
+        DispatchQueue.main.async { [weak self] in
+          self?.showBridgeCommandOverlay(name: name, body: body)
+          // Also notify the host (e.g. for a near-limit usage banner refinement).
+          self?.onNativeEvent([
+            "type": "bridgeCommandResult",
+            "name": name,
+            "display": display,
+            "body": body,
+          ])
+        }
+      }
+    }
+    return kept
+  }
+
+  // Glass command overlay (e.g. /usage, /status, /commands output) shown above the
+  // input bar — bridge info commands are answered here, never added to the transcript.
+  private var bridgeCommandOverlay: VibeAgentCommandOverlayView?
+
+  private func showBridgeCommandOverlay(name: String, body: String) {
+    let overlay: VibeAgentCommandOverlayView
+    if let existing = bridgeCommandOverlay {
+      overlay = existing
+    } else {
+      let created = VibeAgentCommandOverlayView()
+      created.onClose = { [weak self] in self?.hideBridgeCommandOverlay() }
+      addSubview(created)
+      bridgeCommandOverlay = created
+      overlay = created
+    }
+    overlay.applyAppearance(appearance.isDark ? .fallback : .lightFallback)
+    let title = name.isEmpty ? "Command" : name.prefix(1).uppercased() + String(name.dropFirst())
+    overlay.configure(title: title, body: body)
+    overlay.isHidden = false
+    bringSubviewToFront(overlay)
+    setNeedsLayout()
+    layoutIfNeeded()
+    overlay.alpha = 0.0
+    overlay.transform = CGAffineTransform(translationX: 0, y: 10)
+    UIView.animate(
+      withDuration: 0.22, delay: 0,
+      options: [.beginFromCurrentState, .allowUserInteraction]
+    ) {
+      overlay.alpha = 1.0
+      overlay.transform = .identity
+    }
+  }
+
+  private func hideBridgeCommandOverlay() {
+    guard let overlay = bridgeCommandOverlay else { return }
+    UIView.animate(
+      withDuration: 0.16, delay: 0,
+      options: [.beginFromCurrentState, .allowUserInteraction]
+    ) {
+      overlay.alpha = 0.0
+      overlay.transform = CGAffineTransform(translationX: 0, y: 8)
+    } completion: { _ in
+      if overlay.alpha <= 0.01 { overlay.isHidden = true }
+    }
+  }
+
+  /// Position the command overlay just above the active input bar (agent composer or
+  /// the standard input bar), matching the bar's horizontal insets.
+  private func layoutBridgeCommandOverlay() {
+    guard let overlay = bridgeCommandOverlay, !overlay.isHidden else { return }
+    let barMinY = agentComposerView?.frame.minY ?? inputBar?.frame.minY ?? bounds.height
+    let width = max(0.0, bounds.width - 36.0)
+    let targetSize = overlay.systemLayoutSizeFitting(
+      CGSize(width: width, height: UIView.layoutFittingCompressedSize.height),
+      withHorizontalFittingPriority: .required,
+      verticalFittingPriority: .fittingSizeLevel
+    )
+    let height = max(60.0, targetSize.height)
+    overlay.frame = CGRect(x: 18.0, y: barMinY - height - 10.0, width: width, height: height)
+  }
+
   func setRows(_ nextRows: [[String: Any]]) {
     let startedAt = ProcessInfo.processInfo.systemUptime
     sourceRowsPayload = nextRows
@@ -1144,6 +1284,17 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // Bridge-agent DMs open fresh: hide prior history; newly sent/live rows and an
     // explicitly-loaded history session still show.
     parsed = bridgeFreshFiltered(parsed)
+    // Bridge info-command results (/usage, /status, /commands, …) are answered right
+    // here by the bridge (runtime.command.executable == "vibe-bridge"). They must NOT
+    // land in the transcript — route them to the host (banner/overlay) and drop them.
+    parsed = extractBridgeCommandRows(parsed)
+    // Agent DMs decrypt per-row (E2E actions/attachments) and self-size every bubble —
+    // rendering a long transcript (hundreds of rows) blocks the main thread for seconds
+    // and overheats the device. Only keep the latest window needed to continue; older
+    // turns load on demand via History. (Normal chats keep their full list.)
+    if currentBridgeProvider != nil, parsed.count > Self.agentTranscriptWindow {
+      parsed = Array(parsed.suffix(Self.agentTranscriptWindow))
+    }
     dismissBridgeSpinnerIfSessionLoaded(parsed)
     updateSeeProgressButton(parsed)
     if let targetMessageId = reactionDebugTargetMessageId, reactionDebugRemainingRowsChecks > 0 {
@@ -1238,10 +1389,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       chatListUITrace(
         "ChatListView setRows finalize chatId=\(traceChatId.isEmpty ? "<empty>" : String(traceChatId.prefix(12))) parsed=\(parsed.count) animated=\(animated ? "Y" : "N") wasNearBottom=\(wasNearBottom ? "Y" : "N") queued=\(self.pendingRowsPayload != nil ? "Y" : "N") durationMs=\(Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000)) contentH=\(Int(postInsetContentH)) offsetY=\(Int(postInsetOffset))"
       )
-      if self.agentChatMode, self.pendingAgentPushToTop {
+      let agentSurface = self.agentChatMode || self.currentBridgeProvider != nil
+      if agentSurface, self.pendingAgentPushToTop {
         self.pendingAgentPushToTop = false
         self.performAgentPushToTop(animated: animated)
-      } else if self.agentChatMode {
+      } else if agentSurface {
         // Agent surface: while a pin is active, only SHRINK the reserved room below
         // the question (forceOffset:false) so the dead space collapses as the answer
         // grows — never move the offset. Once the turn ends and the reserve is gone
@@ -1960,6 +2112,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     bridgeFreshSnapshotChatId = nil
     bridgeFreshHiddenIds.removeAll()
     bridgeFreshOwnSentIds.removeAll()
+    reportedBridgeCommandIds.removeAll()
     bridgeLoadedSessionId = nil
     bridgeAgentManuallyShown = false
     scheduleBridgeAgentPresenceRefresh()
@@ -2279,7 +2432,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // bottom on every link-preview / markdown relayout once a turn had ended). The
     // only exception is `force` (first open of the chat), where we genuinely want to
     // land at the latest message.
-    if agentChatMode, !force {
+    if (agentChatMode || currentBridgeProvider != nil), !force {
       return
     }
     let maxOffsetY = pixelAlignedValue(
@@ -2949,7 +3102,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
       // Agent turn: once the user physically drags the list, stop re-pinning the
       // question to the top so they can scroll freely for the rest of the turn.
-      if agentChatMode, agentStreaming || agentPushToTopSpacer > 0,
+      if (agentChatMode || currentBridgeProvider != nil), agentStreaming || agentPushToTopSpacer > 0,
         collectionView.isTracking || collectionView.isDragging
       {
         agentPinUserDetached = true
@@ -3735,7 +3888,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     timestamp: String,
     timestampMs: Double,
     replyToId: String? = nil,
-    autoMarkSent: Bool = true
+    autoMarkSent: Bool = true,
+    metadata: [String: Any] = [:]
   ) {
     let isPreviousMe: Bool = {
       if let lastMessageRow = rows.last(where: { $0.kind == .message }) {
@@ -3763,6 +3917,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     ]
     if let replyToId {
       message["replyToId"] = replyToId
+    }
+    if !metadata.isEmpty {
+      message["metadata"] = metadata
     }
     nativeOutgoingRowsById[messageId] = [
       "kind": "message",
@@ -4730,7 +4887,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// tracks the answer (even after the user takes over scrolling) so it collapses
   /// to zero as the answer fills the viewport, leaving no dead space to scroll into.
   private func applyAgentPin(forceOffset: Bool) {
-    guard agentChatMode else { return }
+    guard agentChatMode || currentBridgeProvider != nil else { return }
     guard let userIndex = rows.lastIndex(where: { $0.kind == .message && $0.isMe }) else {
       clearAgentPushToTopSpacer()
       return
@@ -4998,11 +5155,19 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     scheduleBridgeAgentPresenceRefresh()
   }
 
+  func setAvatarUri(_ value: String?) {
+    let next = (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    guard avatarUri != next else { return }
+    avatarUri = next
+    presentedBridgeAgentVC?.avatarURI = next.isEmpty ? nil : next
+  }
+
   private func updateAgentBridgeControlTitle() {
     // Bridge-agent DMs (Claude/Codex) drive the repo chip + agent menu regardless of the
     // legacy `agentChatMode` surface. "Open" is the fallback for the Vibe AI panel.
     guard let provider = currentBridgeProvider else {
       inputBar?.setAgentControlMenu(nil)
+      inputBar?.setSlashCommandMenu(nil)
       inputBar?.setAgentControlTitle("Open")
       return
     }
@@ -5011,6 +5176,52 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     inputBar?.setAgentControlRepoTitle(repoName)
     inputBar?.setAgentControlMenu(agentControlMenu(provider: provider))
+    inputBar?.setSlashCommandMenu(slashCommandMenu(provider: provider))
+  }
+
+  /// Build the "/" command menu for the input bar's slash button, grouped Info / Tasks /
+  /// Options. Selecting an item drops "/name " into the composer so the user can add args
+  /// and send (bridge info commands like /usage are answered in the glass overlay; task
+  /// commands run as agent turns). Provider-aware: Codex's desktop-only ones are labelled.
+  private func slashCommandMenu(provider: String) -> UIMenu {
+    let isCodex = provider.lowercased().contains("codex")
+    // (name, subtitle)
+    let info: [(String, String)] = [
+      ("usage", "Subscription limits + token usage"),
+      ("status", "Account, model, remaining usage"),
+      ("commands", "List available commands"),
+      ("model", "Show / switch model"),
+      ("compact", "Summarize to free context"),
+      ("doctor", "Run the CLI health check"),
+    ]
+    let claudeTasks: [(String, String)] = [
+      ("code-review", "Review the diff for bugs"),
+      ("simplify", "Cleanup-only review"),
+      ("security-review", "Scan changes for security issues"),
+      ("debug", "Investigate a failure"),
+      ("init", "Set up project memory"),
+    ]
+    let codexTasks: [(String, String)] = [
+      ("review", "Review your working tree · desktop only"),
+      ("init", "Set up project memory · desktop only"),
+    ]
+    let options: [(String, String)] = [
+      ("plan", "Plan mode: research, don't edit"),
+      (isCodex ? "fast" : "reasoning", isCodex ? "Faster, lighter responses" : "Adjust thinking depth"),
+    ]
+    func actions(_ items: [(String, String)]) -> [UIMenuElement] {
+      items.map { item in
+        UIAction(title: "/\(item.0)", subtitle: item.1) { [weak self] _ in
+          self?.inputBar?.insertSlashCommand(item.0)
+        }
+      }
+    }
+    let infoMenu = UIMenu(title: "Info", options: .displayInline, children: actions(info))
+    let taskMenu = UIMenu(
+      title: "Tasks", options: .displayInline,
+      children: actions(isCodex ? codexTasks : claudeTasks))
+    let optionMenu = UIMenu(title: "Options", options: .displayInline, children: actions(options))
+    return UIMenu(title: "Slash commands", children: [infoMenu, taskMenu, optionMenu])
   }
 
   /// Build the agent-control chip menu for a Claude/Codex DM: switch repository, set the
@@ -5220,7 +5431,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     agentMention: Bool = false,
     agentText: String? = nil,
     mentionedAgentUsername: String? = nil,
-    fromAgentSurface: Bool = false
+    fromAgentSurface: Bool = false,
+    agentBridgeAttachmentsEnc: [String] = []
   )
   {
     let messageId = UUID().uuidString.lowercased()
@@ -5232,10 +5444,17 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
     // Capture reply-to ID before dismissing the banner (dismissing clears it).
     let replyToMessageId = inputBar?.activeReplyToMessageId
-    let bridgeMetadata = agentBridgeMetadataForOutgoing(
+    var bridgeMetadata = agentBridgeMetadataForOutgoing(
       text: text,
       mentionedAgentUsername: mentionedAgentUsername
     )
+    let attachmentBlobs = agentBridgeAttachmentsEnc
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .filter { !$0.isEmpty }
+    if !attachmentBlobs.isEmpty {
+      bridgeMetadata["agentBridgeAttachmentsEnc"] = attachmentBlobs
+      bridgeMetadata["attachmentsEnc"] = attachmentBlobs
+    }
     // A bridge-agent send opens this fresh thread — keep it visible regardless of
     // history-snapshot timing (see bridgeFreshFiltered).
     if !bridgeMetadata.isEmpty {
@@ -5251,7 +5470,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // so we just hand the text off and let the list push content up to make room
     // for the streaming response. Using the morph path here leaves the user
     // bubble stuck hidden (it never arrives through the normal engine pipeline).
-    if agentChatMode {
+    // NOTE: Claude/Codex bridge DMs run with `currentBridgeProvider != nil` but
+    // `agentChatMode == false` — they MUST use this path too, otherwise the normal
+    // morph hides the user bubble and the new turn lands out of order (mixed into
+    // prior history instead of pinned at the bottom).
+    if agentChatMode || currentBridgeProvider != nil {
       inputBar?.dismissReplyBanner(animated: false)
       inputBar?.clearText()
       pendingAgentPushToTop = true
@@ -5403,7 +5626,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         timestamp: timestamp,
         timestampMs: timestampMs,
         replyToId: replyToMessageId,
-        autoMarkSent: false
+        autoMarkSent: false,
+        metadata: bridgeMetadata
       )
       let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
       let myUserId = engineMyUserId.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -5899,12 +6123,20 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         guard let self else { return [] }
         return VibeAgentKitMap.messages(from: self.rows)
       },
-      onSend: { [weak self] text, _, _ in
-      self?.handleNativeSend(text: text, mentionedAgentUsername: provider, fromAgentSurface: true)
+      onSend: { [weak self] text, _, attachments in
+        self?.handleNativeSend(
+          text: text,
+          mentionedAgentUsername: provider,
+          fromAgentSurface: true,
+          agentBridgeAttachmentsEnc: attachments
+        )
       }
     )
     presentedBridgeAgentVC = vc
     vc.agentBridgeProvider = provider
+    // The runtime view belongs to this chat — wire its chatId so the composer's STOP
+    // button (and the hold-menu Edit/revert) can reach the live bridge run.
+    vc.agentBridgeChatId = engineChatId.isEmpty ? nil : engineChatId
     vc.isHistoryPicked = !initialMessages.isEmpty
     vc.runModel = AgentBridgeSelectionStore.selectedModel(provider: provider)
     vc.deviceLabel = AgentPairingService.lastDeviceLabel
@@ -5914,6 +6146,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     vc.avatarTitle = displayName
     vc.avatarPeerUserId = enginePeerUserId
     vc.avatarChatId = engineChatId
+    vc.avatarURI = avatarUri.isEmpty ? nil : avatarUri
     vc.hidesBottomBarWhenPushed = true
     vc.onPresentHistory = { [weak self] in
       self?.presentBridgeHistorySurface(provider: provider)
@@ -5981,13 +6214,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           from: self.agentConversationRows(forMessageId: messageId, sourceMessageId: sourceMessageId)
         )
       },
-      onSend: { [weak self] text, _, _ in
-        // The live @mention path doesn't carry image attachments yet; ignore the
-        // staged blobs here (they're wired through the bridge-runtime surface).
+      onSend: { [weak self] text, _, attachments in
         self?.handleNativeSend(
           text: text,
           mentionedAgentUsername: mentionedAgentUsername,
-          fromAgentSurface: true
+          fromAgentSurface: true,
+          agentBridgeAttachmentsEnc: attachments
         )
       }
     )
@@ -5995,6 +6227,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if let provider = agentRow.agentRuntime?.provider ?? mentionedAgentUsername ?? currentBridgeProvider {
       vc.agentBridgeProvider = provider
     }
+    // The runtime view belongs to this chat — wire its chatId so the composer's STOP
+    // button (and the hold-menu Edit/revert) can reach the live bridge run.
+    vc.agentBridgeChatId = engineChatId.isEmpty ? nil : engineChatId
     // Seed the header so it shows this run's real model + the connected computer.
     vc.runModel = agentRow.agentRuntime?.model
     vc.deviceLabel = AgentPairingService.lastDeviceLabel
@@ -6003,6 +6238,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     vc.avatarTitle = agentRow.agentName ?? inputName
     vc.avatarPeerUserId = enginePeerUserId
     vc.avatarChatId = engineChatId
+    vc.avatarURI = avatarUri.isEmpty ? nil : avatarUri
     // Hide any host tab bar while pushed so the composer reaches the true bottom
     // edge (no tab-bar strip/edge under the input).
     vc.hidesBottomBarWhenPushed = true

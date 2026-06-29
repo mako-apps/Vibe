@@ -161,6 +161,9 @@ enum AgentBridgeWorkMode: String, CaseIterable, Identifiable {
   case ask = "ask"
   /// Analyse & propose only — never changes files.
   case readOnly = "read_only"
+  /// Let the provider auto-run low-risk commands while the bridge keeps destructive
+  /// commands on the deny/approval side.
+  case askAuto = "ask_auto"
   /// Auto-approve edits + sandboxed command execution.
   case allowEdits = "allow_edits"
   /// No sandbox — the agent can run anything in the selected repo.
@@ -172,6 +175,7 @@ enum AgentBridgeWorkMode: String, CaseIterable, Identifiable {
     switch self {
     case .ask: return "Ask"
     case .readOnly: return "Read"
+    case .askAuto: return "Safe Auto"
     case .allowEdits: return "Auto"
     case .fullAccess: return "Full"
     }
@@ -181,6 +185,7 @@ enum AgentBridgeWorkMode: String, CaseIterable, Identifiable {
     switch self {
     case .ask: return "Approve each change or command from your phone"
     case .readOnly: return "Read & propose only — never changes files"
+    case .askAuto: return "Auto-run low-risk work; block destructive commands"
     case .allowEdits: return "Auto-approve edits & sandboxed commands"
     case .fullAccess: return "No sandbox — can run anything (use with care)"
     }
@@ -190,6 +195,7 @@ enum AgentBridgeWorkMode: String, CaseIterable, Identifiable {
     switch self {
     case .ask: return "hand.raised"
     case .readOnly: return "eye"
+    case .askAuto: return "shield.lefthalf.filled"
     case .allowEdits: return "pencil"
     case .fullAccess: return "bolt"
     }

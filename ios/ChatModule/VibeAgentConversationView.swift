@@ -23,6 +23,7 @@
 import AVFoundation
 import Speech
 import PhotosUI
+import SwiftUI
 import UIKit
 
 // MARK: - Mapping: Vibe data -> VibeAgentKit render models
@@ -93,6 +94,120 @@ enum VibeAgentKitMap {
     return map
   }
 
+  private static func imageAttachments(from row: ChatListRow) -> [VibeAgentKitImageAttachment] {
+    var attachments: [VibeAgentKitImageAttachment] = []
+    let rowId = row.messageId ?? row.key
+    let sourceURI = (row.localMediaUrl?.isEmpty == false ? row.localMediaUrl : row.mediaUrl)?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    let isImageMessage =
+      row.visualKind == .media
+      && (row.messageType == "image"
+        || row.messageType == "gif"
+        || isImageReference(uri: sourceURI, fileName: row.fileName))
+    if isImageMessage, let sourceURI, !sourceURI.isEmpty {
+      attachments.append(
+        VibeAgentKitImageAttachment(
+          id: "\(rowId)#media",
+          name: row.fileName,
+          mime: mimeType(for: row.fileName ?? sourceURI),
+          sourceURI: sourceURI,
+          dataBase64: row.thumbnailBase64
+        )
+      )
+    } else if isImageMessage, let thumb = row.thumbnailBase64, !thumb.isEmpty {
+      attachments.append(
+        VibeAgentKitImageAttachment(
+          id: "\(rowId)#thumb",
+          name: row.fileName,
+          mime: "image/jpeg",
+          sourceURI: nil,
+          dataBase64: thumb
+        )
+      )
+    }
+
+    for (index, blob) in row.agentBridgeAttachmentsEnc.enumerated() {
+      guard let object = AgentRuntimeCrypto.decrypt(blob) else { continue }
+      let mime =
+        normalizedString(object["mime"])
+        ?? normalizedString(object["type"])
+        ?? normalizedString(object["contentType"])
+        ?? normalizedString(object["content_type"])
+      let dataBase64 =
+        normalizedString(object["dataB64"])
+        ?? normalizedString(object["data_b64"])
+        ?? normalizedString(object["base64"])
+      let uri =
+        normalizedString(object["uri"])
+        ?? normalizedString(object["url"])
+        ?? normalizedString(object["path"])
+      let name =
+        normalizedString(object["name"])
+        ?? normalizedString(object["fileName"])
+        ?? normalizedString(object["file_name"])
+      let looksImage =
+        (mime?.lowercased().hasPrefix("image/") == true)
+        || dataBase64 != nil
+        || isImageReference(uri: uri, fileName: name)
+      guard looksImage else { continue }
+      attachments.append(
+        VibeAgentKitImageAttachment(
+          id: "\(rowId)#bridge-image-\(index)",
+          name: name,
+          mime: mime ?? mimeType(for: name ?? uri ?? ""),
+          sourceURI: uri,
+          dataBase64: dataBase64
+        )
+      )
+    }
+
+    return attachments
+  }
+
+  private static func normalizedString(_ raw: Any?) -> String? {
+    guard let raw else { return nil }
+    let value: String
+    if let string = raw as? String {
+      value = string
+    } else if let number = raw as? NSNumber {
+      value = number.stringValue
+    } else {
+      return nil
+    }
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
+  }
+
+  private static func isImageReference(uri: String?, fileName: String?) -> Bool {
+    let extensions = [uri, fileName].compactMap { value -> String? in
+      guard let value, !value.isEmpty else { return nil }
+      if let url = URL(string: value), !url.pathExtension.isEmpty {
+        return url.pathExtension.lowercased()
+      }
+      let ext = (value as NSString).pathExtension.lowercased()
+      return ext.isEmpty ? nil : ext
+    }
+    return extensions.contains { ["jpg", "jpeg", "png", "gif", "webp", "heic", "heif", "bmp"].contains($0) }
+  }
+
+  private static func mimeType(for value: String) -> String? {
+    let ext: String
+    if let url = URL(string: value), !url.pathExtension.isEmpty {
+      ext = url.pathExtension.lowercased()
+    } else {
+      ext = (value as NSString).pathExtension.lowercased()
+    }
+    switch ext {
+    case "jpg", "jpeg": return "image/jpeg"
+    case "png": return "image/png"
+    case "gif": return "image/gif"
+    case "webp": return "image/webp"
+    case "heic", "heif": return "image/heic"
+    case "bmp": return "image/bmp"
+    default: return nil
+    }
+  }
+
   /// The decrypted detail rendered as the tool sheet row's expandable body: a
   /// command's OUTPUT, a todo checklist, search hits. Returns nil to leave the
   /// row as just its label (edits/reads need no body).
@@ -139,12 +254,7 @@ enum VibeAgentKitMap {
     let items = row.isAgentMessage
       ? row.agentProgressNodes.filter { $0.depth == 0 }.map { progressItem(from: $0, detail: detailMap[$0.id]) }
       : []
-    if row.isAgentMessage {
-      NSLog(
-        "[AgentView] map.chatMessage id=\(row.messageId ?? row.key) isUser=\(isUser) "
-          + "runtime?=\(row.agentRuntime != nil) diffFiles=\(row.agentRuntime?.diff?.files.count ?? -1) "
-          + "progressNodes(total=\(row.agentProgressNodes.count), depth0=\(items.count)) bodyLen=\(body.count)")
-    }
+    let attachments = row.isAgentMessage ? [] : imageAttachments(from: row)
     return VibeAgentKitChatMessage(
       id: row.messageId ?? row.key,
       role: isUser ? .user : .assistant,
@@ -157,6 +267,7 @@ enum VibeAgentKitMap {
       progress: [],
       progressItems: isCompaction ? [] : items,
       runtime: isCompaction ? nil : (row.isAgentMessage ? row.agentRuntime : nil),
+      attachments: attachments,
       isCompactionSummary: isCompaction
     )
   }
@@ -164,15 +275,23 @@ enum VibeAgentKitMap {
   /// Build the seed message list for a task. `rows` should already be the slice of
   /// chat rows that belong to this task (the prompt + the agent reply, and any
   /// prior turns when resumed).
-  static func messages(from rows: [ChatListRow]) -> [VibeAgentKitChatMessage] {
-    rows.compactMap { row in
+  /// Max rows mapped at once. Each `chatMessage(from:)` performs per-row E2E decryption
+  /// (actions + attachments) which, over hundreds of rows, blocks the main thread for
+  /// seconds and overheats the device. Only the latest window is ever needed to continue.
+  static let transcriptWindow = 40
+
+  static func messages(from rows: [ChatListRow], limit: Int = transcriptWindow) -> [VibeAgentKitChatMessage] {
+    // Decrypt/map only the most recent `limit` rows (the visible tail). Older turns load
+    // on demand via History; mapping all of them is what froze the agent view.
+    let windowed = rows.count > limit ? Array(rows.suffix(limit)) : rows
+    return windowed.compactMap { row in
       guard case .message = row.kind else { return nil }
       // Skip empty system/placeholder rows — but KEEP a freshly-started streaming
       // row even before it has text/steps/runtime, so the live "Working…" loader
       // appears the instant a run begins instead of the view looking like nothing
       // is happening.
       let m = chatMessage(from: row)
-      if m.text.isEmpty && m.progressItems.isEmpty && m.runtime == nil && !m.isStreaming {
+      if m.text.isEmpty && m.progressItems.isEmpty && m.runtime == nil && m.attachments.isEmpty && !m.isStreaming {
         return nil
       }
       return m
@@ -198,6 +317,12 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   private let connectionDotView = UIView()
   private let connectionSpinner = UIActivityIndicatorView(style: .medium)
   private var messages: [VibeAgentKitChatMessage]
+  /// Bridge info-command results (executable == "vibe-bridge") are stored in `messages`
+  /// for banner/catalog computations but suppressed from the table — they render in the
+  /// glass overlay instead.
+  private var tableMessages: [VibeAgentKitChatMessage] {
+    messages.filter { $0.runtime?.command?.executable?.lowercased() != "vibe-bridge" }
+  }
   private var appearance: VibeAgentKitChatAppearance
   private let runtimeTitle: String
   private let runtimeSubtitle: String
@@ -217,6 +342,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   private let usageBannerView = ChatPinnedBannerView()
   private var usageBannerVisible = false
   private var usageBannerKey: String?
+  private let commandOverlayView = VibeAgentCommandOverlayView()
 
   // In-view header (the app hides the system nav bar, so this VC carries its own):
   // model name centered (tappable → model/thinking/speed), connected device beneath,
@@ -323,6 +449,10 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   /// Message ids whose "Worked · N steps" line is currently expanded inline.
   /// Persists across reloads so a live update doesn't collapse what the user opened.
   private var expandedProgressMessageIds: Set<String> = []
+
+  /// User message ids whose long prompt bubble is expanded. Long prompts collapse by
+  /// default so the table does not inherit huge row heights or blank lower padding.
+  private var expandedTextMessageIds: Set<String> = []
 
   /// Per-message set of step node-ids whose detail layer is open (the command/result
   /// box, the edit patch, the read file slice). Keyed by message id → node ids; persists
@@ -536,6 +666,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
 
   private func startNewChat() {
     expandedProgressMessageIds.removeAll()
+    expandedTextMessageIds.removeAll()
     expandedStepIdsByMessage.removeAll()
     progressItemsByMessageId.removeAll()
     streamStartByMessageId.removeAll()
@@ -547,6 +678,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     updateLoadingOverlay()
     updateEditToast()
     updateUsageBanner(force: true)
+    hideCommandOverlay()
     onNewChat?()
   }
 
@@ -601,13 +733,13 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       guard let self else { return }
       let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
       guard !trimmed.isEmpty else { return }
-      self.isHistoryPicked = true
-      let options = AgentBridgeSelectionStore.selectedRunOptions(
-        provider: self.agentBridgeProvider ?? self.composerView.provider)
-      self.onSend?(trimmed, options, [])
+      self.handleComposerCommand(trimmed)
     }
     composerView.onAttach = { [weak self] in
       self?.presentImageAttachmentPicker()
+    }
+    composerView.onStop = { [weak self] in
+      self?.stopActiveTask()
     }
     composerView.onHeightChanged = { [weak self] height in
       self?.updateComposerHeight(height, animated: true)
@@ -633,6 +765,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
 
     setupEmptyState()
     setupUsageBanner()
+    setupCommandOverlay()
 
     // Pin the feed to the TRUE bottom so messages scroll UNDER the floating composer
     // (Resolo-style, no hard footer line). `updateScrollInsets()` keeps a bottom
@@ -680,6 +813,9 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       usageBannerView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -18.0),
       usageBannerView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8.0),
       usageBannerView.heightAnchor.constraint(equalToConstant: ChatPinnedBannerView.preferredHeight),
+      commandOverlayView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 18.0),
+      commandOverlayView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -18.0),
+      commandOverlayView.bottomAnchor.constraint(equalTo: composerView.topAnchor, constant: -10.0),
       emptyStateView.centerXAnchor.constraint(equalTo: view.centerXAnchor),
       emptyStateView.centerYAnchor.constraint(
         equalTo: view.safeAreaLayoutGuide.centerYAnchor, constant: -32.0),
@@ -742,6 +878,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       tableView.backgroundColor = appearance.background
       progressSheet.applyAppearance(appearance)
       composerView.applyAppearance(appearance)
+      commandOverlayView.applyAppearance(appearance)
       loadingSpinner.color = appearance.textSecondary
       updateEditToastAppearance()
       if !isEmbeddedInSwiftUI {
@@ -767,9 +904,23 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     {
       isHistoryPicked = true
     }
+
+    // Intercept newly arrived bridge info-command results and route them to the overlay.
+    let previousIds = Set(messages.map(\.id))
+    for msg in newMessages where msg.runtime?.command?.executable?.lowercased() == "vibe-bridge"
+      && !previousIds.contains(msg.id)
+    {
+      showBridgeCommandResult(msg)
+    }
+
     let wasNearBottom = isNearBottom()
-    let oldIds = messages.map(\.id)
+    // Capture the pre-update rendered ids (bridge commands excluded) for pure-append check.
+    let oldTableIds = tableMessages.map(\.id)
     messages = newMessages
+    let liveIds = Set(newMessages.map(\.id))
+    expandedTextMessageIds = expandedTextMessageIds.filter { liveIds.contains($0) }
+    expandedProgressMessageIds = expandedProgressMessageIds.filter { liveIds.contains($0) }
+    expandedStepIdsByMessage = expandedStepIdsByMessage.filter { liveIds.contains($0.key) }
     // Real rows arrived → drop the centered loading spinner.
     if !newMessages.isEmpty { isLoadingTranscript = false }
     trackStreamStarts(newMessages)
@@ -778,28 +929,60 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     updateNavigationLiveState()
     updateLoadingOverlay()
     updateUsageBanner()
+    updateComposerCommandCatalog()
 
     // A pure append (new turns pushed onto the end — the typical "send") animates the
     // new rows in and scrolls up, matching Resolo's push-in feel. Anything else
     // (streaming edits to existing rows, replacements, reorders) falls back to a plain
     // reload so the streaming label and bubble geometry stay correct.
-    let newIds = newMessages.map(\.id)
+    let newTableIds = tableMessages.map(\.id)
     let isPureAppend =
-      newIds.count > oldIds.count && Array(newIds.prefix(oldIds.count)) == oldIds
-    if isHistoryPicked, isPureAppend, tableView.window != nil, tableView.numberOfRows(inSection: 0) == oldIds.count {
-      let inserted = (oldIds.count..<newIds.count).map { IndexPath(row: $0, section: 0) }
+      newTableIds.count > oldTableIds.count && Array(newTableIds.prefix(oldTableIds.count)) == oldTableIds
+    // A fresh user send = the last rendered row is a user message whose id is new. Pin it
+    // to the top with room reserved below for the streaming answer (ChatGPT-style) instead
+    // of scrolling to the bottom.
+    let newUserSendId: String? = {
+      guard let last = tableMessages.last, last.role.isUser, !oldTableIds.contains(last.id) else { return nil }
+      return last.id
+    }()
+    if let newUserSendId { pushToTopUserId = newUserSendId }
+    // The pinned turn has finished once its answer is no longer streaming.
+    let turnStillLive = tableMessages.contains { $0.isStreaming || $0.runtime?.status == "running" }
+    if pushToTopUserId != nil, !turnStillLive, newUserSendId == nil {
+      pushToTopUserId = nil
+      pushToTopReserve = 0
+    }
+    if isHistoryPicked, isPureAppend, tableView.window != nil, tableView.numberOfRows(inSection: 0) == oldTableIds.count {
+      let inserted = (oldTableIds.count..<newTableIds.count).map { IndexPath(row: $0, section: 0) }
       tableView.performBatchUpdates {
         // `.none` — we drive the appearance ourselves so the new bubble springs up from
         // below as the previous messages slide up (Resolo's on-send morph), instead of a
         // flat fade.
         tableView.insertRows(at: inserted, with: .none)
       } completion: { [weak self] _ in
-        self?.animateSentRows(inserted)
-        if wasNearBottom { self?.scrollToBottom(animated: true) }
+        guard let self else { return }
+        self.animateSentRows(inserted)
+        if let id = newUserSendId {
+          self.pinUserMessageToTop(id: id, animated: true)
+        } else if self.pushToTopUserId != nil {
+          // Pinned turn growing: the reserve shrinks passively in updateScrollInsets as the
+          // answer streams in; just refresh the inset (no scroll move — the question holds).
+          self.updateScrollInsets()
+        } else if wasNearBottom {
+          self.scrollToBottom(animated: true)
+        }
       }
     } else {
       tableView.reloadData()
-      if wasNearBottom { scrollToBottom(animated: true) }
+      if let id = newUserSendId {
+        pinUserMessageToTop(id: id, animated: true)
+      } else if pushToTopUserId != nil {
+        // Pinned turn growing: the reserve shrinks passively in updateScrollInsets as the
+        // answer streams in; just refresh the inset (no scroll move — the question holds).
+        updateScrollInsets()
+      } else if wasNearBottom {
+        scrollToBottom(animated: true)
+      }
     }
   }
 
@@ -1068,14 +1251,18 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   }
 
   private func updateNavigationLiveState() {
+    let isLive = messages.contains { message in
+      message.isStreaming || message.runtime?.status == "running"
+    }
+    // The composer's trailing control becomes STOP while a task is live (cancel the
+    // running bridge run) and reverts to send/mic once it finishes — so an active turn
+    // can never be sent over, and the user can always interrupt it.
+    composerView.setTaskActive(isLive)
     // In-view header: the model can change as runs report it, so refresh the header
     // (model title + connection pip) whenever the message set advances.
     if usesInViewHeader {
       updateHeaderTexts()
       return
-    }
-    let isLive = messages.contains { message in
-      message.isStreaming || message.runtime?.status == "running"
     }
     liveDotView.isHidden = !isLive
     liveLabel.isHidden = !isLive
@@ -1183,11 +1370,11 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   // MARK: Table
 
   func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-    isHistoryPicked ? messages.count : 0
+    isHistoryPicked ? tableMessages.count : 0
   }
 
   func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
-    let message = messages[indexPath.row]
+    let message = tableMessages[indexPath.row]
     // A /compact summary is a centered, collapsible divider — its own cell type, not a
     // bubble. The expand state reuses the per-message progress-expand set.
     if message.isCompactionSummary {
@@ -1213,6 +1400,8 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     cell.onProgressTap = { [weak self] in self?.toggleProgress(for: message.id) }
     cell.onRuntimeTap = { [weak self] runtime in self?.presentRuntime(runtime) }
     cell.onStepTap = { [weak self] nodeId in self?.toggleStepDetail(messageId: message.id, nodeId: nodeId) }
+    cell.onTextExpansionTap = { [weak self] in self?.toggleTextExpansion(for: message.id) }
+    cell.onAttachmentTap = { [weak self] attachment in self?.presentImageAttachment(attachment) }
     cell.configure(
       message: message,
       appearance: appearance,
@@ -1220,6 +1409,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       showsActions: false,
       isProgressExpanded: expandedProgressMessageIds.contains(message.id),
       expandedStepIds: expandedStepIdsByMessage[message.id] ?? [],
+      isTextExpanded: expandedTextMessageIds.contains(message.id),
       streamingStartDate: message.isStreaming ? streamStartByMessageId[message.id] : nil
     )
     return cell
@@ -1236,8 +1426,8 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     contextMenuConfigurationForRowAt indexPath: IndexPath,
     point: CGPoint
   ) -> UIContextMenuConfiguration? {
-    guard indexPath.row < messages.count else { return nil }
-    let message = messages[indexPath.row]
+    guard indexPath.row < tableMessages.count else { return nil }
+    let message = tableMessages[indexPath.row]
     let cellText = (tableView.cellForRow(at: indexPath) as? VibeAgentKitMessageCell)?.currentMessageText
     let text = (cellText?.isEmpty == false) ? cellText! : message.text
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1299,6 +1489,26 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     ])
   }
 
+  /// Cancel the in-flight bridge run for this chat (SIGTERM → SIGKILL on the connected
+  /// computer). Wired to the composer's STOP button, which only appears while a task is
+  /// live. Prefers the live turn's taskId when present; the bridge also falls back to
+  /// the single running task for this chat+provider when taskId is absent.
+  private func stopActiveTask() {
+    guard let chatId = agentBridgeChatId, !chatId.isEmpty else { return }
+    let provider = agentBridgeProvider ?? "codex"
+    let taskId = messages.first {
+      $0.isStreaming || $0.runtime?.status == "running"
+    }?.runtime?.taskId
+    var payload: [String: Any] = [
+      "chatId": chatId,
+      "provider": provider,
+      "action": "cancel",
+    ]
+    if let taskId, !taskId.isEmpty { payload["taskId"] = taskId }
+    NSLog("[AgentView] stopActiveTask chat=%@ provider=%@ taskId=%@", chatId, provider, taskId ?? "nil")
+    _ = ChatEngine.shared.sendAgentBridgeControl(payload)
+  }
+
   func tableView(
     _ tableView: UITableView,
     previewForHighlightingContextMenuWithConfiguration configuration: UIContextMenuConfiguration
@@ -1322,6 +1532,52 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     return cell.bubblePreview()
   }
 
+  private func toggleTextExpansion(for messageId: String) {
+    if expandedTextMessageIds.contains(messageId) {
+      expandedTextMessageIds.remove(messageId)
+    } else {
+      expandedTextMessageIds.insert(messageId)
+    }
+    guard let row = tableMessages.firstIndex(where: { $0.id == messageId }) else { return }
+    let indexPath = IndexPath(row: row, section: 0)
+    if let cell = tableView.cellForRow(at: indexPath) as? VibeAgentKitMessageCell {
+      cell.configure(
+        message: tableMessages[row],
+        appearance: appearance,
+        regeneratePrompt: regeneratePrompt,
+        showsActions: false,
+        isProgressExpanded: expandedProgressMessageIds.contains(messageId),
+        expandedStepIds: expandedStepIdsByMessage[messageId] ?? [],
+        isTextExpanded: expandedTextMessageIds.contains(messageId),
+        streamingStartDate: tableMessages[row].isStreaming ? streamStartByMessageId[messageId] : nil
+      )
+    }
+    animateExpansion(anchorRow: indexPath)
+  }
+
+  private func presentImageAttachment(_ attachment: VibeAgentKitImageAttachment) {
+    if let image = VibeAgentKitAttachmentGridView.decodedImage(from: attachment) {
+      presentImagePreview(image)
+      return
+    }
+    guard let source = attachment.sourceURI?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !source.isEmpty
+    else { return }
+    Task { [weak self] in
+      let image = await ChatAvatarImageStore.load(from: source)
+      await MainActor.run {
+        guard let self, let image else { return }
+        self.presentImagePreview(image)
+      }
+    }
+  }
+
+  private func presentImagePreview(_ image: UIImage) {
+    let host = UIHostingController(rootView: VibeAgentImagePreview(image: image))
+    host.modalPresentationStyle = .fullScreen
+    present(host, animated: true)
+  }
+
   // MARK: Progress (inline expand)
 
   // Tapping "Worked · N steps" reveals/hides that turn's step list inline, in the
@@ -1333,20 +1589,21 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     } else {
       expandedProgressMessageIds.insert(messageId)
     }
-    guard let row = messages.firstIndex(where: { $0.id == messageId }) else { return }
+    guard let row = tableMessages.firstIndex(where: { $0.id == messageId }) else { return }
     let indexPath = IndexPath(row: row, section: 0)
     // Reconfigure the visible cell in place (cheap, idempotent), then let the
     // table animate to its new height. If the cell isn't on screen the set is
     // already updated, so cellForRowAt renders it expanded when it scrolls in.
     if let cell = tableView.cellForRow(at: indexPath) as? VibeAgentKitMessageCell {
       cell.configure(
-        message: messages[row],
+        message: tableMessages[row],
         appearance: appearance,
         regeneratePrompt: regeneratePrompt,
         showsActions: false,
         isProgressExpanded: expandedProgressMessageIds.contains(messageId),
         expandedStepIds: expandedStepIdsByMessage[messageId] ?? [],
-        streamingStartDate: messages[row].isStreaming ? streamStartByMessageId[messageId] : nil
+        isTextExpanded: expandedTextMessageIds.contains(messageId),
+        streamingStartDate: tableMessages[row].isStreaming ? streamStartByMessageId[messageId] : nil
       )
     }
     animateExpansion(anchorRow: indexPath)
@@ -1379,11 +1636,11 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     } else {
       expandedProgressMessageIds.insert(messageId)
     }
-    guard let row = messages.firstIndex(where: { $0.id == messageId }) else { return }
+    guard let row = tableMessages.firstIndex(where: { $0.id == messageId }) else { return }
     let indexPath = IndexPath(row: row, section: 0)
     if let cell = tableView.cellForRow(at: indexPath) as? VibeAgentKitCompactionCell {
       cell.configure(
-        text: messages[row].text,
+        text: tableMessages[row].text,
         expanded: expandedProgressMessageIds.contains(messageId),
         appearance: appearance
       )
@@ -1408,17 +1665,18 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     }
     expandedProgressMessageIds.insert(messageId)
 
-    guard let row = messages.firstIndex(where: { $0.id == messageId }) else { return }
+    guard let row = tableMessages.firstIndex(where: { $0.id == messageId }) else { return }
     let indexPath = IndexPath(row: row, section: 0)
     if let cell = tableView.cellForRow(at: indexPath) as? VibeAgentKitMessageCell {
       cell.configure(
-        message: messages[row],
+        message: tableMessages[row],
         appearance: appearance,
         regeneratePrompt: regeneratePrompt,
         showsActions: false,
         isProgressExpanded: true,
         expandedStepIds: expanded,
-        streamingStartDate: messages[row].isStreaming ? streamStartByMessageId[messageId] : nil
+        isTextExpanded: expandedTextMessageIds.contains(messageId),
+        streamingStartDate: tableMessages[row].isStreaming ? streamStartByMessageId[messageId] : nil
       )
     }
     animateExpansion(anchorRow: indexPath)
@@ -1678,6 +1936,213 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     view.addSubview(usageBannerView)
   }
 
+  private func setupCommandOverlay() {
+    commandOverlayView.translatesAutoresizingMaskIntoConstraints = false
+    commandOverlayView.isHidden = true
+    commandOverlayView.alpha = 0.0
+    commandOverlayView.applyAppearance(appearance)
+    commandOverlayView.onClose = { [weak self] in self?.hideCommandOverlay() }
+    view.addSubview(commandOverlayView)
+  }
+
+  /// Show real bridge output (from a `vibe-bridge` result) in the glass overlay
+  /// instead of letting it land as a chat bubble.
+  private func showBridgeCommandResult(_ msg: VibeAgentKitChatMessage) {
+    guard isViewLoaded, !msg.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+    // Extract the command name from "vibe-bridge /usage" → "usage"
+    let display = msg.runtime?.command?.display ?? ""
+    let rawName = display
+      .components(separatedBy: " ")
+      .first(where: { $0.hasPrefix("/") })
+      .map { String($0.dropFirst()) }
+      ?? ""
+    let name = rawName.isEmpty ? "Command" : rawName
+    let title = name.prefix(1).uppercased() + String(name.dropFirst())
+    commandOverlayView.configure(title: title, body: msg.text)
+    showCommandOverlay()
+  }
+
+  private func handleComposerCommand(_ command: String) {
+    let normalized = command.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !normalized.isEmpty else { return }
+    let content: (title: String, body: String)
+    switch normalized {
+    case "/usage", "usage":
+      content = ("Usage", usageCommandBody())
+    case "/status", "status":
+      content = ("Status", statusCommandBody())
+    case "/commands", "commands":
+      content = ("Commands", commandsCommandBody())
+    case "/skills", "skills":
+      content = ("Skills", skillsCommandBody())
+    case "/reasoning", "reasoning", "/thinking", "thinking":
+      content = ("Reasoning", reasoningCommandBody())
+    case "/plan", "plan":
+      content = ("Plan Mode", "Plan mode is a local run preference. Use the model/reasoning controls before sending; this panel stays local and does not add a chat message.")
+    case "/compact", "compact":
+      content = ("Compact", "Compact is available as a bridge command. It is shown here instead of being inserted into chat; run a compact task from the provider CLI when the bridge reports support.")
+    default:
+      content = ("Command", "No local panel is available for \(command).")
+    }
+    commandOverlayView.configure(title: content.title, body: content.body)
+    showCommandOverlay()
+  }
+
+  private func showCommandOverlay() {
+    view.bringSubviewToFront(commandOverlayView)
+    if commandOverlayView.isHidden {
+      commandOverlayView.isHidden = false
+      commandOverlayView.transform = CGAffineTransform(translationX: 0, y: 10)
+    }
+    UIView.animate(
+      withDuration: 0.22,
+      delay: 0,
+      options: [.beginFromCurrentState, .allowUserInteraction]
+    ) {
+      self.commandOverlayView.alpha = 1.0
+      self.commandOverlayView.transform = .identity
+    }
+  }
+
+  private func hideCommandOverlay() {
+    UIView.animate(
+      withDuration: 0.16,
+      delay: 0,
+      options: [.beginFromCurrentState, .allowUserInteraction]
+    ) {
+      self.commandOverlayView.alpha = 0.0
+      self.commandOverlayView.transform = CGAffineTransform(translationX: 0, y: 8)
+    } completion: { _ in
+      if self.commandOverlayView.alpha <= 0.01 {
+        self.commandOverlayView.isHidden = true
+      }
+    }
+  }
+
+  private func latestRuntimeSummary() -> ChatListRow.AgentRuntimeSummary? {
+    messages.reversed().compactMap { $0.runtime }.first
+  }
+
+  /// Feed the `/` palette the slash + CLI commands the connected provider reports
+  /// (from the latest runtime metadata), so it lists everything the real CLI exposes.
+  private func updateComposerCommandCatalog() {
+    let runtime = latestRuntimeSummary()
+    composerView.setProviderCommands(
+      slash: runtime?.slashCommands ?? [],
+      cli: runtime?.cliCommands ?? []
+    )
+  }
+
+  private func usageCommandBody() -> String {
+    guard let runtime = latestRuntimeSummary(), let usage = runtime.usage else {
+      return "No usage has been recorded for this chat yet. Run one agent task first."
+    }
+    let used = agentUsageTokens(usage)
+    let limit = agentUsageLimit(provider: runtime.provider ?? agentBridgeProvider, model: runtime.model)
+    var parts: [String] = [
+      "\(Self.compactTokenCount(used)) / \(Self.compactTokenCount(limit)) tokens"
+    ]
+    if let input = usage.inputTokens { parts.append("input \(Self.compactTokenCount(input))") }
+    if let output = usage.outputTokens { parts.append("output \(Self.compactTokenCount(output))") }
+    if let reasoning = usage.reasoningOutputTokens {
+      parts.append("reasoning \(Self.compactTokenCount(reasoning))")
+    }
+    if let cost = usage.totalCostUsd, cost > 0 {
+      parts.append(String(format: "$%.2f", cost))
+    }
+    if let duration = usage.durationMs, duration > 0 {
+      parts.append("runtime \(Self.compactDuration(ms: duration))")
+    }
+    return parts.joined(separator: "\n")
+  }
+
+  private func statusCommandBody() -> String {
+    let runtime = latestRuntimeSummary()
+    let provider = (runtime?.provider ?? agentBridgeProvider ?? composerView.provider)
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    let repo = runtime?.repoName
+      ?? AgentBridgeSelectionStore.selectedRepository()?.name
+      ?? "No repository selected"
+    let cwd = runtime?.cwd ?? AgentBridgeSelectionStore.selectedRepository()?.path ?? "-"
+    let model = runtime?.model
+      ?? AgentBridgeSelectionStore.selectedModel(provider: provider)
+      ?? "Provider default"
+    let mode = runtime?.workMode ?? AgentBridgeSelectionStore.selectedWorkMode().rawValue
+    let status = runtime?.status ?? (messages.contains { $0.isStreaming } ? "running" : "idle")
+    let device = deviceLabel?.trimmingCharacters(in: .whitespacesAndNewlines)
+    return [
+      "\(provider.isEmpty ? agentDisplayName : provider) bridge status: \(status)",
+      "repo: \(repo)",
+      "cwd: \(cwd)",
+      "work mode: \(mode)",
+      "model: \(model)",
+      "device: \(device?.isEmpty == false ? device! : "not reported")",
+      "connection: \(deviceConnected ? "connected" : "reconnecting")",
+    ].joined(separator: "\n")
+  }
+
+  private func commandsCommandBody() -> String {
+    let runtime = latestRuntimeSummary()
+    var sections: [String] = []
+    let bridgeCommands = ["/usage", "/status", "/commands", "/skills", "/reasoning", "/plan", "/compact"]
+    sections.append("Vibe controls\n" + bridgeCommands.joined(separator: "  "))
+    if let runtime {
+      let providerSlash = runtime.slashCommands.map { $0.hasPrefix("/") ? $0 : "/\($0)" }
+      appendCommandSection("Provider slash commands", providerSlash, to: &sections)
+      appendCommandSection("Bridge commands", runtime.providerCommands, to: &sections)
+      appendCommandSection("CLI commands", runtime.cliCommands, to: &sections)
+      appendCommandSection("Tools", runtime.availableTools, to: &sections)
+    }
+    return sections.joined(separator: "\n\n")
+  }
+
+  private func skillsCommandBody() -> String {
+    guard let runtime = latestRuntimeSummary() else {
+      return "No skills have been reported for this chat yet."
+    }
+    var sections: [String] = []
+    appendCommandSection("Skills", runtime.skills, to: &sections)
+    appendCommandSection("Agents", runtime.agents, to: &sections)
+    appendCommandSection(
+      "MCP servers",
+      runtime.mcpServers.map { server in
+        if let status = server.status, !status.isEmpty { return "\(server.name) (\(status))" }
+        return server.name
+      },
+      to: &sections
+    )
+    return sections.isEmpty ? "No skills or MCP servers were reported by the bridge." : sections.joined(separator: "\n\n")
+  }
+
+  private func reasoningCommandBody() -> String {
+    let provider = agentBridgeProvider ?? composerView.provider
+    let options = AgentBridgeSelectionStore.selectedRunOptions(provider: provider)
+    let effort = AgentBridgeRunOptions.effectiveEffort(
+      provider: provider,
+      intelligence: options.intelligence,
+      speed: options.speed
+    )
+    let model = options.model ?? latestRuntimeSummary()?.model ?? "Provider default"
+    return [
+      "model: \(model)",
+      "thinking: \(options.intelligence.title)",
+      "speed: \(options.speed.title)",
+      "effective effort: \(effort)",
+    ].joined(separator: "\n")
+  }
+
+  private func appendCommandSection(
+    _ title: String,
+    _ values: [String],
+    to sections: inout [String]
+  ) {
+    let cleaned = values
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .filter { !$0.isEmpty }
+    guard !cleaned.isEmpty else { return }
+    sections.append(title + "\n" + cleaned.prefix(18).joined(separator: "  "))
+  }
+
   private func updateUsageBanner(force: Bool = false) {
     guard isViewLoaded else { return }
     usageBannerView.applyTheme(
@@ -1790,10 +2255,20 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     return "\(value)"
   }
 
+  private static func compactDuration(ms: Int) -> String {
+    let seconds = max(0, ms / 1000)
+    if seconds < 60 { return "\(seconds)s" }
+    let minutes = seconds / 60
+    let remaining = seconds % 60
+    if minutes < 60 { return "\(minutes)m \(remaining)s" }
+    return "\(minutes / 60)h \(minutes % 60)m"
+  }
+
   private func updateEditToast() {
     guard isViewLoaded else { return }
     let summary = editDiffSummary()
-    let shouldShow = summary != nil && isHistoryPicked && !isLoadingTranscript
+    let hasLiveTurn = messages.contains { $0.isStreaming || $0.runtime?.status == "running" }
+    let shouldShow = summary != nil && isHistoryPicked && !isLoadingTranscript && !hasLiveTurn
     if let summary {
       editToastLabel.attributedText = summary.attributed
       editToastLabel.accessibilityLabel = summary.plain
@@ -1937,13 +2412,21 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   /// Keep the feed's bottom inset matched to however much of the screen the floating
   /// composer (and, when raised, the keyboard) currently covers, so the last bubble
   /// always clears the pill even though the table extends edge-to-edge beneath it.
-  private func updateScrollInsets() {
+  private func updateScrollInsets(force: Bool = false) {
     let covered = max(0, view.bounds.maxY - composerView.frame.minY)
     // The table reaches the screen bottom, so its automatic safe-area inset already
     // covers the home indicator; only add the part above it, plus a small gap.
-    let bottom = max(12, covered - view.safeAreaInsets.bottom + 8)
+    let baseBottom = max(12, covered - view.safeAreaInsets.bottom + 8)
+    // While a send is pinned to the top, reserve room below so the question can hold near
+    // the top with the answer streaming beneath it (ChatGPT / Resolo-style). The reserve is
+    // recomputed LIVE here every layout pass (Resolo models it as a `minHeight` floor on the
+    // current-turn container, not an imperatively-managed inset) so it shrinks to 0 on its
+    // own as the answer fills the viewport — no stale "huge gap" left behind by a relax
+    // token that measured a not-yet-grown contentSize.
+    pushToTopReserve = computedPushToTopReserve()
+    let bottom = max(baseBottom, pushToTopReserve)
     let top = usageBannerVisible ? ChatPinnedBannerView.preferredHeight + 24.0 : 12.0
-    guard abs(tableView.contentInset.bottom - bottom) > 0.5
+    guard force || abs(tableView.contentInset.bottom - bottom) > 0.5
       || abs(tableView.contentInset.top - top) > 0.5
     else { return }
     let wasNearBottom = isNearBottom()
@@ -1951,7 +2434,48 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     tableView.contentInset.top = top
     tableView.verticalScrollIndicatorInsets.bottom = bottom
     tableView.verticalScrollIndicatorInsets.top = top
-    if wasNearBottom { scrollToBottom(animated: false) }
+    if wasNearBottom, pushToTopReserve <= 0 { scrollToBottom(animated: false) }
+  }
+
+  /// The reserve needed RIGHT NOW so the pinned user message can stay at the top with the
+  /// answer streaming below it: `viewport − (content below the question)`. Returns 0 when
+  /// nothing is pinned or the turn has already produced enough content to fill the screen,
+  /// so the gap closes itself (Resolo's self-correcting floor, ported to a UITableView).
+  private func computedPushToTopReserve() -> CGFloat {
+    guard let id = pushToTopUserId,
+      let idx = tableMessages.firstIndex(where: { $0.id == id })
+    else { return 0 }
+    let rect = tableView.rectForRow(at: IndexPath(row: idx, section: 0))
+    guard rect.height > 0 else { return 0 }
+    let topInset = tableView.adjustedContentInset.top
+    let viewport = max(0, tableView.bounds.height - topInset - tableView.safeAreaInsets.bottom)
+    let contentBelow = max(0, tableView.contentSize.height - rect.maxY)
+    return max(0, viewport - contentBelow)
+  }
+
+  // MARK: Push-to-top send (ChatGPT-style)
+
+  /// The user message currently pinned near the top while its answer streams below.
+  private var pushToTopUserId: String?
+  /// Extra bottom inset reserved so the pinned question can rise to the top; it shrinks
+  /// toward zero as the answer fills the space below.
+  private var pushToTopReserve: CGFloat = 0
+
+  /// Pin a freshly-sent user message to the top. The room below is reserved passively by
+  /// `updateScrollInsets`/`computedPushToTopReserve` (recomputed every layout pass, so it
+  /// shrinks to 0 as the answer fills it — Resolo's self-correcting floor). Here we only
+  /// force one inset update (so the reserve exists before we move) and scroll the question
+  /// to the top; from then on the content above it is fixed, so it simply holds its place.
+  private func pinUserMessageToTop(id: String, animated: Bool) {
+    guard let idx = tableMessages.firstIndex(where: { $0.id == id }) else { return }
+    pushToTopUserId = id
+    tableView.layoutIfNeeded()
+    updateScrollInsets(force: true)
+    tableView.layoutIfNeeded()
+    let rect = tableView.rectForRow(at: IndexPath(row: idx, section: 0))
+    let topInset = tableView.adjustedContentInset.top
+    let targetY = max(-topInset, rect.minY - topInset)
+    tableView.setContentOffset(CGPoint(x: 0, y: targetY), animated: animated)
   }
 
   private func isNearBottom() -> Bool {
@@ -1971,6 +2495,126 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
 /// A small custom progress indicator — a single rotating arc — used as the centered
 /// loader while a transcript loads (rather than the system activity indicator or a
 /// fake "Loading…" message bubble).
+final class VibeAgentCommandOverlayView: UIView {
+  private let blurView = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterial))
+  private let titleLabel = UILabel()
+  private let bodyLabel = UILabel()
+  private let closeButton = UIButton(type: .system)
+  private var appearance: VibeAgentKitChatAppearance = .fallback
+
+  var onClose: (() -> Void)?
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    setup()
+  }
+
+  required init?(coder: NSCoder) { return nil }
+
+  func applyAppearance(_ appearance: VibeAgentKitChatAppearance) {
+    self.appearance = appearance
+    blurView.contentView.backgroundColor = vibeAgentKitColorWithAlpha(
+      appearance.isDark ? UIColor.white : UIColor.black,
+      appearance.isDark ? 0.065 : 0.045
+    )
+    layer.borderColor = vibeAgentKitColorWithAlpha(
+      appearance.textSecondary,
+      appearance.isDark ? 0.2 : 0.16
+    ).cgColor
+    titleLabel.textColor = appearance.text
+    bodyLabel.textColor = vibeAgentKitColorWithAlpha(appearance.text, 0.78)
+    closeButton.tintColor = vibeAgentKitColorWithAlpha(appearance.text, 0.78)
+  }
+
+  func configure(title: String, body: String) {
+    titleLabel.text = title
+    bodyLabel.text = body
+    setNeedsLayout()
+  }
+
+  private func setup() {
+    clipsToBounds = true
+    layer.cornerRadius = 18.0
+    layer.cornerCurve = .continuous
+    layer.borderWidth = 0.7
+
+    blurView.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(blurView)
+
+    titleLabel.translatesAutoresizingMaskIntoConstraints = false
+    titleLabel.font = UIFont.systemFont(ofSize: 15.0, weight: .semibold)
+    titleLabel.numberOfLines = 1
+    blurView.contentView.addSubview(titleLabel)
+
+    bodyLabel.translatesAutoresizingMaskIntoConstraints = false
+    bodyLabel.font = UIFont.monospacedSystemFont(ofSize: 12.5, weight: .regular)
+    bodyLabel.numberOfLines = 0
+    blurView.contentView.addSubview(bodyLabel)
+
+    closeButton.translatesAutoresizingMaskIntoConstraints = false
+    closeButton.setImage(
+      UIImage(systemName: "xmark", withConfiguration: UIImage.SymbolConfiguration(pointSize: 12.0, weight: .semibold)),
+      for: .normal
+    )
+    closeButton.addTarget(self, action: #selector(closeTapped), for: .touchUpInside)
+    blurView.contentView.addSubview(closeButton)
+
+    NSLayoutConstraint.activate([
+      blurView.topAnchor.constraint(equalTo: topAnchor),
+      blurView.leadingAnchor.constraint(equalTo: leadingAnchor),
+      blurView.trailingAnchor.constraint(equalTo: trailingAnchor),
+      blurView.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+      titleLabel.topAnchor.constraint(equalTo: blurView.contentView.topAnchor, constant: 14.0),
+      titleLabel.leadingAnchor.constraint(equalTo: blurView.contentView.leadingAnchor, constant: 16.0),
+      titleLabel.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -8.0),
+
+      closeButton.topAnchor.constraint(equalTo: blurView.contentView.topAnchor, constant: 8.0),
+      closeButton.trailingAnchor.constraint(equalTo: blurView.contentView.trailingAnchor, constant: -8.0),
+      closeButton.widthAnchor.constraint(equalToConstant: 34.0),
+      closeButton.heightAnchor.constraint(equalToConstant: 34.0),
+
+      bodyLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 10.0),
+      bodyLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+      bodyLabel.trailingAnchor.constraint(equalTo: blurView.contentView.trailingAnchor, constant: -16.0),
+      bodyLabel.bottomAnchor.constraint(equalTo: blurView.contentView.bottomAnchor, constant: -14.0),
+    ])
+
+    applyAppearance(.fallback)
+  }
+
+  @objc private func closeTapped() {
+    onClose?()
+  }
+}
+
+private struct VibeAgentImagePreview: View {
+  let image: UIImage
+  @Environment(\.dismiss) private var dismiss
+
+  var body: some View {
+    ZStack(alignment: .topTrailing) {
+      Color.black.ignoresSafeArea()
+      Image(uiImage: image)
+        .resizable()
+        .scaledToFit()
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .ignoresSafeArea()
+      Button {
+        dismiss()
+      } label: {
+        Image(systemName: "xmark")
+          .font(.system(size: 17, weight: .semibold))
+          .foregroundStyle(.white)
+          .frame(width: 44, height: 44)
+          .background(.ultraThinMaterial, in: Circle())
+      }
+      .padding(.top, 18)
+      .padding(.trailing, 18)
+    }
+  }
+}
+
 private final class VibeAgentArcSpinner: UIView {
   private let arcLayer = CAShapeLayer()
 
@@ -2032,7 +2676,7 @@ final class VibeAgentHeaderAvatarView: UIControl {
   private let initialLabel = UILabel()
   private let imageView = UIImageView()
   private var loadToken = 0
-  private let diameter: CGFloat = 30
+  private let diameter: CGFloat = 34
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -2068,6 +2712,7 @@ final class VibeAgentHeaderAvatarView: UIControl {
   override func layoutSubviews() {
     super.layoutSubviews()
     layer.cornerRadius = bounds.height / 2
+    imageView.layer.cornerRadius = bounds.height / 2
     CATransaction.begin()
     CATransaction.setDisableActions(true)
     gradientLayer.frame = bounds
@@ -2088,6 +2733,8 @@ final class VibeAgentHeaderAvatarView: UIControl {
     // behavior), so the two surfaces always agree.
     loadToken &+= 1
     let token = loadToken
+    imageView.image = nil
+    imageView.isHidden = true
     let raw = (avatarURI ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     let resolved = ChatAvatarURLResolver.resolve(
       rawAvatar: raw,
@@ -2096,7 +2743,6 @@ final class VibeAgentHeaderAvatarView: UIControl {
       preferPushAvatar: (peerUserId?.isEmpty == false)
     ) ?? (raw.isEmpty ? "" : raw)
     guard !resolved.isEmpty else {
-      imageView.image = nil
       imageView.isHidden = true
       return
     }
@@ -2129,16 +2775,33 @@ final class VibeAgentHeaderAvatarView: UIControl {
 /// morph and the height tracks the keyboard smoothly. The public API is unchanged
 /// from the previous implementation so both hosts (the standalone agent runtime view
 /// and the embedded Claude/Codex DM composer) adopt it with no integration changes.
-public final class VibeComposerView: UIView, UITextViewDelegate {
+/// One entry in the composer's `/` command palette. `kind` decides routing when the
+/// command is run: `.runOption` is applied locally (it configures the next run);
+/// every other kind is SENT to the bridge, which executes it for real — bridge info
+/// commands (`/usage`, `/status`, `/doctor`, …) return live data, and provider/CLI
+/// slash commands pass through to the actual CLI. No more local mock panels.
+struct VibeAgentSlashCommand {
+  enum Kind { case bridge, runOption, providerSlash, cli }
+  let name: String           // no leading slash
+  let subtitle: String
+  let kind: Kind
+  let takesArgs: Bool
+  var display: String { "/\(name)" }
+}
+
+public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewDataSource, UITableViewDelegate {
   var onSend: ((String, AgentBridgeRunOptions) -> Void)? {
     didSet { updateSendState() }
   }
+  /// Tapped the trailing control while a task is running — the host cancels the live
+  /// bridge run (SIGTERM). Distinct from `onSend` so an active turn can never send.
+  var onStop: (() -> Void)?
   var onHeightChanged: ((CGFloat) -> Void)?
   /// Tapped the "+" — the controller presents an image picker and stages the result
   /// via `addAttachment(blob:)`. The composer can't present, so it delegates up.
   var onAttach: (() -> Void)?
-  /// Agent bridge command shortcuts (`/usage`, `/compact`, ...). The composer sends
-  /// these as normal bridge prompts, but does not consume staged image attachments.
+  /// Agent bridge command shortcuts (`/usage`, `/compact`, ...). These are local
+  /// control panels in the agent surface, not chat messages.
   var onCommand: ((String) -> Void)? {
     didSet { updateCommandMenu() }
   }
@@ -2149,7 +2812,14 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
   }
   /// Drives which run options are read at send time (Claude vs Codex ladders).
   var provider: String = "codex" {
-    didSet { updateCommandMenu() }
+    didSet {
+      updateCommandMenu()
+      // Seed the `/` palette with this provider's full catalog right away so it's
+      // complete from the first `/`; a later runtime summary swaps in the real list.
+      if provider != oldValue || providerSlashCommands.isEmpty {
+        setProviderCommands(slash: [], cli: [])
+      }
+    }
   }
 
   // MARK: Subviews — three glass surfaces laid out side by side.
@@ -2158,17 +2828,139 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
 
   private let pillGlass = UIVisualEffectView(effect: nil)
   private let pillContainer = UIView()
+  private let optionPillButton = UIButton(type: .system)
   private let textView = UITextView()
   private let placeholderLabel = UILabel()
+  // Plain "/" command button lives in the outside glass slot. The image attach "+"
+  // lives inside the input pill where the slash used to be.
+  private let slashButton = UIButton(type: .system)
+  private let slashButtonSize: CGFloat = 30
   private let sendButton = UIButton(type: .system)
 
   private let micGlass = UIVisualEffectView(effect: nil)
   private let micButton = UIButton(type: .system)
 
+  // `/` command palette — a floating list above the pill. Typing `/<query>` (a single
+  // token, no space yet) filters it; tapping a row inserts the command (args) or runs
+  // it immediately (no-arg). When visible the composer grows UPWARD so the palette
+  // stays inside the view's bounds (clean hit-testing — no out-of-bounds touch hacks).
+  private let commandPaletteBlur = UIVisualEffectView(effect: nil)
+  private let commandTable = UITableView(frame: .zero, style: .plain)
+  private var providerSlashCommands: [VibeAgentSlashCommand] = []
+  private var providerCliCommands: [VibeAgentSlashCommand] = []
+  private var filteredCommands: [VibeAgentSlashCommand] = []
+  private var commandPaletteVisible = false
+  private let paletteRowHeight: CGFloat = 48
+  private let paletteMaxRows = 5
+  private let paletteGap: CGFloat = 8
+
+  /// Bridge + run-option commands always offered, independent of what the CLI reports.
+  private static let defaultCommands: [VibeAgentSlashCommand] = [
+    .init(name: "usage", subtitle: "Subscription limits + this chat's tokens", kind: .bridge, takesArgs: false),
+    .init(name: "status", subtitle: "Account, model, and remaining usage", kind: .bridge, takesArgs: false),
+    .init(name: "commands", subtitle: "List every available command", kind: .bridge, takesArgs: false),
+    .init(name: "skills", subtitle: "Skills, agents, MCP servers, and tools", kind: .bridge, takesArgs: false),
+    .init(name: "doctor", subtitle: "Run the CLI health check", kind: .bridge, takesArgs: false),
+    .init(name: "compact", subtitle: "Start the next run without resume state", kind: .bridge, takesArgs: false),
+    .init(name: "model", subtitle: "Show or set the model for this chat", kind: .bridge, takesArgs: true),
+    .init(name: "plan", subtitle: "Plan only — analyze without editing", kind: .runOption, takesArgs: false),
+    .init(name: "reasoning", subtitle: "Thinking / speed for this chat", kind: .runOption, takesArgs: false),
+  ]
+
+  // One-line descriptions so palette rows show what each command does (not "mock").
+  // Mirrors the bridge catalogs; unknown/custom commands fall back to a generic label.
+  private static let commandDescriptions: [String: String] = [
+    "usage": "Subscription limits + this chat's tokens",
+    "status": "Account, model, and remaining usage",
+    "commands": "List every available command",
+    "skills": "Skills, agents, MCP servers, and tools",
+    "help": "List every available command",
+    "doctor": "Run the CLI health check",
+    "compact": "Free up context / drop resume state",
+    "model": "Show or set the model",
+    "plan": "Plan only — analyze without editing",
+    "reasoning": "Thinking / speed for this chat",
+    // Claude skills / workflows / built-ins (run as an agent turn)
+    "code-review": "Review the diff for bugs and cleanups",
+    "simplify": "Cleanup-only review; apply fixes",
+    "security-review": "Scan changes for security issues",
+    "review": "Review a GitHub pull request",
+    "batch": "Split a large change into parallel units",
+    "deep-research": "Web research into a cited report",
+    "claude-api": "Load Claude API reference",
+    "debug": "Troubleshoot via the debug log",
+    "run": "Launch and drive your app",
+    "verify": "Build, run, and observe a change",
+    "loop": "Run a prompt repeatedly",
+    "schedule": "Create or run a cloud routine",
+    "team-onboarding": "Generate a team onboarding guide",
+    "fewer-permission-prompts": "Add a read-only allowlist",
+    "init": "Generate a project guide",
+    "insights": "Analyze your recent sessions",
+    "goal": "Keep working until a goal is met",
+    "context": "Show context-window usage",
+    "config": "View or set a setting",
+    "clear": "Start a fresh conversation",
+    "usage-credits": "Configure extra usage credits",
+    // Codex-specific
+    "approvals": "Set what Codex can do without asking",
+    "diff": "Show the working-tree git diff",
+    "new": "Start a new conversation",
+    "agent": "Switch the active agent thread",
+    "apps": "Browse connectors",
+    "plugins": "Browse plugins",
+    "mcp": "List configured MCP tools",
+    "mention": "Attach a file",
+    "fork": "Fork into a new thread",
+    "resume": "Resume a saved conversation",
+    "memories": "Configure memory",
+    "fast": "Toggle the Fast tier",
+    "personality": "Choose a response style",
+    "logout": "Sign out",
+    // CLI subcommands
+    "exec": "Run non-interactively",
+    "apply": "Apply the latest diff to your tree",
+    "login": "Sign in",
+    "cloud": "Browse Codex Cloud tasks",
+    "sandbox": "Run inside the sandbox",
+    "update": "Update the CLI",
+    "plugin": "Manage plugins",
+    "agents": "Manage subagents",
+  ]
+
+  // Codex slash commands are TUI-only (`codex exec` can't run them) — flag them so the
+  // palette tells the user, and the bridge answers with a "use the desktop app" note.
+  private static let codexDesktopOnly: Set<String> = [
+    "review", "approvals", "diff", "new", "clear", "init", "skills", "agent", "apps",
+    "plugins", "mcp", "mention", "fork", "resume", "memories", "goal", "personality", "logout",
+  ]
+
+  // Seed the palette before the first run delivers the CLI's real catalog. Claude's live
+  // list (from each run's init event) replaces this once a turn completes.
+  private static let claudeFallbackSlash = [
+    "code-review", "simplify", "security-review", "review", "batch", "deep-research",
+    "claude-api", "debug", "run", "verify", "loop", "schedule", "team-onboarding",
+    "fewer-permission-prompts", "init", "insights", "goal", "context", "config", "skills", "clear",
+    "usage-credits",
+  ]
+  private static let codexFallbackSlash = [
+    "review", "approvals", "diff", "new", "init", "skills", "agent", "apps", "plugins",
+    "mcp", "mention", "fork", "resume", "memories", "goal", "fast", "personality", "logout",
+  ]
+  private static let claudeFallbackCli = ["agents", "config", "doctor", "mcp", "plugin", "update", "login", "logout"]
+  private static let codexFallbackCli = [
+    "exec", "review", "login", "logout", "mcp", "plugin", "doctor", "apply", "resume",
+    "fork", "cloud", "sandbox", "update",
+  ]
+
   private var appearance: VibeAgentKitChatAppearance = .fallback
 
   /// 0 = idle (mic shown), 1 = has-text (send shown). Animated for the morph.
   private var sendProgress: CGFloat = 0
+  /// True while a bridge task is running for this chat: the trailing control becomes a
+  /// STOP button (always visible, regardless of text) that cancels the run instead of
+  /// sending. The host drives this from the live message state.
+  private var isTaskActive = false
   private(set) var barHeight: CGFloat = 0
 
   // On-device speech dictation for the mic button: tap to start, tap to stop, the
@@ -2193,6 +2985,13 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
   private let textInsetV: CGFloat = 11
   private let pagePadding: CGFloat = 14
   private let sendButtonSize: CGFloat = 34
+  private let optionPillHeight: CGFloat = 26
+  private let optionPillGap: CGFloat = 6
+  private var activeOptionTitle: String?
+
+  private var optionReserve: CGFloat {
+    activeOptionTitle == nil ? 0 : optionPillHeight + optionPillGap
+  }
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -2215,13 +3014,23 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
   /// becomes 0 once the keyboard covers it, so the pill hugs the keyboard).
   var preferredHeight: CGFloat {
     let pillH = pillHeightForText()
-    return topVPad + pillH + bottomVPad + safeAreaInsets.bottom
+    return topVPad + pillH + bottomVPad + safeAreaInsets.bottom + paletteReserved
+  }
+
+  /// Height the visible palette occupies above the pill (0 when hidden).
+  private var commandPaletteHeight: CGFloat {
+    guard commandPaletteVisible, !filteredCommands.isEmpty else { return 0 }
+    return CGFloat(min(paletteMaxRows, filteredCommands.count)) * paletteRowHeight
+  }
+  private var paletteReserved: CGFloat {
+    commandPaletteHeight > 0 ? commandPaletteHeight + paletteGap : 0
   }
 
   private func pillHeightForText() -> CGFloat {
     let measured = measuredTextHeight()
-    let clampedTextH = max(minPillH - textInsetV * 2, min(maxPillH - textInsetV * 2, measured))
-    return clampedTextH + textInsetV * 2
+    let maxTextHeight = max(minPillH - textInsetV * 2, maxPillH - textInsetV * 2 - optionReserve)
+    let clampedTextH = max(minPillH - textInsetV * 2, min(maxTextHeight, measured))
+    return clampedTextH + textInsetV * 2 + optionReserve
   }
 
   /// Height the text wants for the width it will get at the current morph progress.
@@ -2232,7 +3041,8 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
     let pillRightIdle = w - pagePadding - sideSize - sideGap
     let pillRight = pillRightIdle + (sideSize + sideGap) * clampedSend
     let sendReserve = (sendButtonSize + 6) * clampedSend
-    let textW = max(1, pillRight - pillLeft - textInsetH * 2 - sendReserve)
+    let leadingReserve = slashButtonSize + 6
+    let textW = max(1, pillRight - pillLeft - textInsetH * 2 - sendReserve - leadingReserve)
     return textView.sizeThatFits(CGSize(width: textW, height: .greatestFiniteMagnitude)).height
   }
 
@@ -2245,10 +3055,15 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
     // Attach glass pill (left)
     configureGlass(attachGlass)
     addSubview(attachGlass)
-    configureIconButton(plusButton, systemName: "plus")
-    plusButton.addTarget(self, action: #selector(handlePlus), for: .touchUpInside)
-    plusButton.showsMenuAsPrimaryAction = true
-    attachGlass.contentView.addSubview(plusButton)
+    slashButton.setTitle("/", for: .normal)
+    slashButton.setImage(nil, for: .normal)
+    slashButton.titleLabel?.font = UIFont.systemFont(ofSize: 25, weight: .medium)
+    slashButton.setTitleColor(.white, for: .normal)
+    slashButton.tintColor = .white
+    slashButton.accessibilityLabel = "Slash commands"
+    slashButton.showsMenuAsPrimaryAction = true
+    attachGlass.contentView.addSubview(slashButton)
+    updateSlashMenu()
 
     // Text glass pill (center)
     configureGlass(pillGlass)
@@ -2257,6 +3072,14 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
     pillContainer.clipsToBounds = true
     pillContainer.layer.cornerCurve = .continuous
     pillGlass.contentView.addSubview(pillContainer)
+
+    configureOptionPill()
+    pillContainer.addSubview(optionPillButton)
+
+    configureIconButton(plusButton, systemName: "plus")
+    plusButton.addTarget(self, action: #selector(handlePlus), for: .touchUpInside)
+    plusButton.showsMenuAsPrimaryAction = false
+    pillContainer.addSubview(plusButton)
 
     placeholderLabel.text = placeholder
     placeholderLabel.font = UIFont.systemFont(ofSize: 17)
@@ -2289,6 +3112,21 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
     micButton.addTarget(self, action: #selector(handleMic), for: .touchUpInside)
     micGlass.contentView.addSubview(micButton)
 
+    // `/` command palette (hidden until a slash query is typed).
+    configureGlass(commandPaletteBlur)
+    commandPaletteBlur.isHidden = true
+    commandPaletteBlur.clipsToBounds = true
+    addSubview(commandPaletteBlur)
+    commandTable.backgroundColor = .clear
+    commandTable.dataSource = self
+    commandTable.delegate = self
+    commandTable.rowHeight = paletteRowHeight
+    commandTable.separatorStyle = .none
+    commandTable.keyboardDismissMode = .none
+    commandTable.showsVerticalScrollIndicator = true
+    commandTable.register(UITableViewCell.self, forCellReuseIdentifier: "vibeCmd")
+    commandPaletteBlur.contentView.addSubview(commandTable)
+
     applyAppearance(.fallback)
     updateCommandMenu()
   }
@@ -2313,6 +3151,37 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
     button.tintColor = appearance.text
   }
 
+  private func configureOptionPill() {
+    var config = UIButton.Configuration.filled()
+    config.cornerStyle = .capsule
+    config.baseBackgroundColor = UIColor.white.withAlphaComponent(0.12)
+    config.baseForegroundColor = appearance.text
+    config.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 10, bottom: 4, trailing: 10)
+    config.image = UIImage(systemName: "checklist")
+    config.imagePlacement = .leading
+    config.imagePadding = 5
+    optionPillButton.configuration = config
+    optionPillButton.titleLabel?.font = UIFont.systemFont(ofSize: 12.5, weight: .semibold)
+    optionPillButton.isHidden = true
+    optionPillButton.isUserInteractionEnabled = false
+  }
+
+  private func setActiveOptionPill(_ title: String?) {
+    let normalized = title?.trimmingCharacters(in: .whitespacesAndNewlines)
+    activeOptionTitle = normalized?.isEmpty == false ? normalized : nil
+    optionPillButton.isHidden = activeOptionTitle == nil
+    if var config = optionPillButton.configuration {
+      config.title = activeOptionTitle
+      config.baseBackgroundColor = appearance.isDark
+        ? UIColor.white.withAlphaComponent(0.13)
+        : UIColor.black.withAlphaComponent(0.08)
+      config.baseForegroundColor = appearance.text
+      optionPillButton.configuration = config
+    }
+    onHeightChanged?(preferredHeight)
+    setNeedsLayout()
+  }
+
   func applyAppearance(_ appearance: VibeAgentKitChatAppearance) {
     self.appearance = appearance
     backgroundColor = .clear
@@ -2320,12 +3189,17 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
     textView.tintColor = appearance.text
     placeholderLabel.textColor = appearance.textTertiary
     plusButton.tintColor = appearance.text
+    slashButton.tintColor = .white
+    slashButton.setTitleColor(.white, for: .normal)
+    optionPillButton.tintColor = appearance.text
+    setActiveOptionPill(activeOptionTitle)
     micButton.tintColor = isDictating ? .systemRed : appearance.text
     sendButton.backgroundColor = appearance.text
-    sendButton.setImage(
-      VibeAgentKitChatVectorIcon.image(.send, color: appearance.background, size: 15), for: .normal)
+    applySendButtonGlyph()
     updateAttachmentIndicator()
     updateSendState()
+    commandTable.indicatorStyle = appearance.isDark ? .white : .black
+    if !filteredCommands.isEmpty { commandTable.reloadData() }
     setNeedsLayout()
   }
 
@@ -2349,13 +3223,18 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
     let pillW = max(1, pillRight - pillLeft)
 
     let sendReserve = (sendButtonSize + 6) * clampedSend
-    let textW = max(1, pillW - textInsetH * 2 - sendReserve)
+    // The leading attachment button reserves room before the text/placeholder.
+    let leadingReserve = slashButtonSize + 6
+    let textW = max(1, pillW - textInsetH * 2 - sendReserve - leadingReserve)
     let measured = textView.sizeThatFits(CGSize(width: textW, height: .greatestFiniteMagnitude)).height
-    let clampedTextH = max(minPillH - textInsetV * 2, min(maxPillH - textInsetV * 2, measured))
-    textView.isScrollEnabled = measured > (maxPillH - textInsetV * 2)
-    let pillH = clampedTextH + textInsetV * 2
+    let maxTextHeight = max(minPillH - textInsetV * 2, maxPillH - textInsetV * 2 - optionReserve)
+    let clampedTextH = max(minPillH - textInsetV * 2, min(maxTextHeight, measured))
+    textView.isScrollEnabled = measured > maxTextHeight
+    let pillH = clampedTextH + textInsetV * 2 + optionReserve
 
-    let rowTop = topVPad
+    // The palette (when open) sits in the reserved space at the TOP of the (grown)
+    // composer; the pill row is pushed down so it still hugs the keyboard at the bottom.
+    let rowTop = topVPad + paletteReserved
     let cornerR = min(pillH / 2, 22)
 
     pillGlass.frame = CGRect(x: pillLeft, y: rowTop, width: pillW, height: pillH)
@@ -2369,7 +3248,7 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
 
     attachGlass.bounds = squareBounds
     attachGlass.center = CGPoint(x: leftEdge + sideSize / 2, y: btnCenterY)
-    plusButton.frame = attachGlass.contentView.bounds
+    slashButton.frame = attachGlass.contentView.bounds
 
     let micCenterX = rightEdge - sideSize / 2 + (sideSize + sideGap * 2) * clampedSend
     micGlass.bounds = squareBounds
@@ -2377,8 +3256,31 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
     micGlass.alpha = micVisibility
     micButton.frame = micGlass.contentView.bounds
 
-    let tfX = textInsetH
-    let tfY = (pillH - clampedTextH) / 2
+    // Leading attachment button — bottom-aligned inside the pill, just before the text.
+    let slashInset = max(4, (minPillH - slashButtonSize) / 2)
+    plusButton.frame = CGRect(
+      x: textInsetH - 2,
+      y: pillH - slashButtonSize - slashInset,
+      width: slashButtonSize,
+      height: slashButtonSize)
+
+    let tfX = textInsetH + leadingReserve
+    if let activeOptionTitle {
+      let pillWLimit = max(80, pillW - tfX - sendReserve - 8)
+      let pillSize = optionPillButton.sizeThatFits(
+        CGSize(width: pillWLimit, height: optionPillHeight))
+      optionPillButton.frame = CGRect(
+        x: tfX,
+        y: 8,
+        width: min(pillWLimit, max(72, pillSize.width)),
+        height: optionPillHeight)
+      optionPillButton.isHidden = false
+      optionPillButton.accessibilityLabel = activeOptionTitle
+    } else {
+      optionPillButton.isHidden = true
+      optionPillButton.frame = .zero
+    }
+    let tfY = activeOptionTitle == nil ? (pillH - clampedTextH) / 2 : textInsetV + optionReserve
     textView.frame = CGRect(x: tfX, y: tfY, width: textW, height: clampedTextH)
     placeholderLabel.frame = CGRect(
       x: tfX + 2, y: tfY, width: max(1, pillW - tfX - 4 - sendReserve), height: clampedTextH)
@@ -2389,16 +3291,23 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
       x: pillW - 4 - sendButtonSize / 2, y: pillH - sendButtonSize / 2 - sendInset)
     sendButton.layer.cornerRadius = sendButtonSize / 2
 
+    if commandPaletteHeight > 0 {
+      commandPaletteBlur.frame = CGRect(x: pillLeft, y: topVPad, width: pillW, height: commandPaletteHeight)
+      commandTable.frame = commandPaletteBlur.contentView.bounds
+    }
+
     CATransaction.begin()
     CATransaction.setDisableActions(true)
     attachGlass.cornerConfiguration = .capsule()
     micGlass.cornerConfiguration = .capsule()
     pillGlass.cornerConfiguration = .uniformCorners(radius: .fixed(cornerR))
+    commandPaletteBlur.cornerConfiguration = .uniformCorners(radius: .fixed(18))
     CATransaction.commit()
 
-    barHeight = topVPad + pillH + bottomVPad + safeAreaInsets.bottom
+    barHeight = topVPad + pillH + bottomVPad + safeAreaInsets.bottom + paletteReserved
 
     pillContainer.bringSubviewToFront(sendButton)
+    pillContainer.bringSubviewToFront(plusButton)
   }
 
   public override func safeAreaInsetsDidChange() {
@@ -2421,23 +3330,74 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
   }
 
   @objc private func handleSend() {
+    // While a task is running the trailing control is a STOP button — cancel the live
+    // run and never send. The button reverts to send/mic when the host clears active.
+    if isTaskActive {
+      onStop?()
+      return
+    }
     stopDictation()
     let text = textView.text.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !text.isEmpty, onSend != nil else { return }
+    let hasAttachments = !pendingAttachmentBlobs.isEmpty
+    guard (!text.isEmpty || hasAttachments), onSend != nil else { return }
+    if !hasAttachments, let localCommand = localCommandForComposerText(text) {
+      textView.text = ""
+      placeholderLabel.isHidden = false
+      updateSendState(animated: true)
+      onHeightChanged?(preferredHeight)
+      if localCommand == "/plan" {
+        AgentBridgeSelectionStore.setWorkMode(.readOnly)
+        setActiveOptionPill("Plan")
+      }
+      onCommand?(localCommand)
+      return
+    }
+    let body = text.isEmpty && hasAttachments
+      ? "Please take a look at the attached image."
+      : text
     let options = AgentBridgeSelectionStore.selectedRunOptions(provider: provider)
     textView.text = ""
     placeholderLabel.isHidden = false
     updateSendState(animated: true)
     onHeightChanged?(preferredHeight)
-    onSend?(text, options)
+    onSend?(body, options)
+  }
+
+  /// Host-driven: flip the trailing control between SEND (idle) and STOP (a bridge task
+  /// is running). When active the button is forced visible, swaps to a stop glyph, and
+  /// `handleSend` routes to `onStop`.
+  func setTaskActive(_ active: Bool) {
+    guard isTaskActive != active else { return }
+    isTaskActive = active
+    applySendButtonGlyph()
+    updateSendState(animated: true)
+  }
+
+  /// The trailing button shows a stop square while a task runs, otherwise the send
+  /// arrow. Both ride the same filled circle (background = `appearance.text`).
+  private func applySendButtonGlyph() {
+    if isTaskActive {
+      sendButton.setImage(
+        UIImage(systemName: "stop.fill")?.withRenderingMode(.alwaysTemplate), for: .normal)
+      sendButton.tintColor = appearance.background
+    } else {
+      sendButton.setImage(
+        VibeAgentKitChatVectorIcon.image(.send, color: appearance.background, size: 15),
+        for: .normal)
+      sendButton.tintColor = appearance.background
+    }
   }
 
   /// Morph the trailing control: mic slides out and the send button fades/scales in
   /// (and back) as the text goes non-empty / empty. One spring keeps it continuous.
   private func updateSendState(animated: Bool = false) {
     let hasText = !textView.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    sendButton.isEnabled = hasText && onSend != nil
-    let target: CGFloat = hasText ? 1 : 0
+    let hasAttachments = !pendingAttachmentBlobs.isEmpty
+    // A running task forces the STOP button on regardless of text; otherwise the send
+    // button appears when there's text or staged images to send.
+    let showsTrailingButton = isTaskActive || hasText || hasAttachments
+    sendButton.isEnabled = isTaskActive || ((hasText || hasAttachments) && onSend != nil)
+    let target: CGFloat = showsTrailingButton ? 1 : 0
     guard abs(sendProgress - target) > 0.01 else {
       sendButton.isHidden = target < 0.01
       sendButton.alpha = target
@@ -2473,49 +3433,51 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
     onAttach?()
   }
 
-  private func updateCommandMenu() {
-    let providerTitle: String = {
-      switch provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-      case "claude": return "Claude"
-      case "codex": return "Codex"
-      default: return "Agent"
+  /// Build the leading "/" button's native menu (grouped Info / Options / Commands / CLI),
+  /// mirroring the "+"/model/repo pickers. Selecting an item inserts args or runs it.
+  private func updateSlashMenu() {
+    func actions(_ cmds: [VibeAgentSlashCommand]) -> [UIMenuElement] {
+      cmds.map { cmd in
+        UIAction(title: cmd.display, subtitle: cmd.subtitle, image: UIImage(systemName: paletteIcon(cmd))) {
+          [weak self] _ in
+          self?.applyCommandSelection(cmd)
+        }
       }
-    }()
-
-    let attachAction = UIAction(
-      title: "Add image",
-      image: UIImage(systemName: "photo")
-    ) { [weak self] _ in
-      self?.onAttach?()
     }
+    let all = allCommands
+    var sections: [UIMenuElement] = []
+    let info = all.filter { $0.kind == .bridge }
+    let options = all.filter { $0.kind == .runOption }
+    let slash = all.filter { $0.kind == .providerSlash }
+    let cli = all.filter { $0.kind == .cli }
+    if !info.isEmpty { sections.append(UIMenu(title: "Info", options: .displayInline, children: actions(info))) }
+    if !options.isEmpty { sections.append(UIMenu(title: "Options", options: .displayInline, children: actions(options))) }
+    if !slash.isEmpty { sections.append(UIMenu(title: "Commands", children: actions(slash))) }
+    if !cli.isEmpty { sections.append(UIMenu(title: "Terminal", children: actions(cli))) }
+    slashButton.menu = UIMenu(title: "Slash commands", children: sections)
+  }
 
-    let commandActions: [UIAction] = [
-      UIAction(
-        title: "\(providerTitle) usage",
-        subtitle: "Show context, token, and cost usage",
-        image: UIImage(systemName: "gauge.with.dots.needle.bottom.50percent")
-      ) { [weak self] _ in self?.onCommand?("/usage") },
-      UIAction(
-        title: "Compact context",
-        subtitle: "Start the next request without the current resume state",
-        image: UIImage(systemName: "rectangle.compress.vertical")
-      ) { [weak self] _ in self?.onCommand?("/compact") },
-      UIAction(
-        title: "Commands",
-        subtitle: "List bridge, CLI, and provider commands",
-        image: UIImage(systemName: "terminal")
-      ) { [weak self] _ in self?.onCommand?("/commands") },
-      UIAction(
-        title: "Status",
-        subtitle: "Show repo, mode, model, and last usage",
-        image: UIImage(systemName: "info.circle")
-      ) { [weak self] _ in self?.onCommand?("/status") },
-    ]
+  /// Only RUN-OPTION commands are handled locally (they configure the next run). Info
+  /// commands (`/usage`, `/status`, `/commands`, `/compact`, `/doctor`, …) now fall
+  /// through to `onSend` so the BRIDGE runs them and returns real CLI/account output —
+  /// they used to render local mock panels, which is what felt fake.
+  private func localCommandForComposerText(_ text: String) -> String? {
+    let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard normalized.hasPrefix("/") else { return nil }
+    let name = normalized.dropFirst().split(separator: " ").first.map(String.init) ?? ""
+    switch name {
+    case "plan": return "/plan"
+    case "reasoning", "thinking": return "/reasoning"
+    default: return nil
+    }
+  }
 
-    plusButton.menu = UIMenu(children: [
-      attachAction,
-      UIMenu(title: "\(providerTitle) commands", options: .displayInline, children: commandActions),
-    ])
+  // The "+" button is purely attachments. Slash commands are opened by the outside
+  // plain "/" button.
+  private func updateCommandMenu() {
+    plusButton.menu = nil
+    plusButton.showsMenuAsPrimaryAction = false
+    updateSlashMenu()
   }
 
   /// Stage an encrypted image blob to ride along with the next send. The "+" button
@@ -2523,6 +3485,7 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
   func addAttachment(blob: String) {
     pendingAttachmentBlobs.append(blob)
     updateAttachmentIndicator()
+    updateSendState(animated: true)
   }
 
   /// Hand the staged blobs to the caller and clear them (called at send time).
@@ -2530,6 +3493,7 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
     let blobs = pendingAttachmentBlobs
     pendingAttachmentBlobs.removeAll()
     updateAttachmentIndicator()
+    updateSendState(animated: true)
     return blobs
   }
 
@@ -2644,8 +3608,145 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
 
   public func textViewDidChange(_ textView: UITextView) {
     placeholderLabel.isHidden = !textView.text.isEmpty
+    updateCommandPalette()
     updateSendState(animated: true)
     onHeightChanged?(preferredHeight)
     setNeedsLayout()
+  }
+
+  // MARK: - `/` command palette
+
+  private var allCommands: [VibeAgentSlashCommand] {
+    Self.defaultCommands + providerSlashCommands + providerCliCommands
+  }
+
+  /// Inject the provider's reported slash + CLI commands (from the latest runtime
+  /// metadata) so the palette lists everything the connected CLI exposes, not just the
+  /// built-in bridge commands. Deduped against the defaults.
+  func setProviderCommands(slash: [String], cli: [String]) {
+    func clean(_ raw: String) -> String {
+      raw.trimmingCharacters(in: .whitespaces)
+        .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        .lowercased()
+    }
+    let isCodex = provider.lowercased().contains("codex")
+    func subtitle(_ n: String, isCli: Bool) -> String {
+      var s = Self.commandDescriptions[n] ?? (isCli ? "Terminal subcommand" : "Slash command")
+      if isCodex && Self.codexDesktopOnly.contains(n) { s += " · desktop only" }
+      return s
+    }
+    // Fall back to the provider's full catalog until a run delivers the real one, so the
+    // palette is complete from the first `/` in a brand-new chat.
+    let slashSource = slash.isEmpty ? (isCodex ? Self.codexFallbackSlash : Self.claudeFallbackSlash) : slash
+    let cliSource = cli.isEmpty ? (isCodex ? Self.codexFallbackCli : Self.claudeFallbackCli) : cli
+    var seen = Set(Self.defaultCommands.map { $0.name.lowercased() })
+    providerSlashCommands = slashSource.compactMap { item in
+      let n = clean(item)
+      guard !n.isEmpty, !seen.contains(n) else { return nil }
+      seen.insert(n)
+      return VibeAgentSlashCommand(name: n, subtitle: subtitle(n, isCli: false), kind: .providerSlash, takesArgs: true)
+    }
+    providerCliCommands = cliSource.compactMap { item in
+      let n = clean(item)
+      guard !n.isEmpty, !seen.contains(n) else { return nil }
+      seen.insert(n)
+      return VibeAgentSlashCommand(name: n, subtitle: subtitle(n, isCli: true), kind: .cli, takesArgs: true)
+    }
+    updateSlashMenu()
+    if commandPaletteVisible { updateCommandPalette() }
+  }
+
+  /// Programmatically open the palette (from the "+" menu's "Slash commands" item).
+  func openCommandPalette() {
+    textView.text = "/"
+    placeholderLabel.isHidden = true
+    textView.becomeFirstResponder()
+    textViewDidChange(textView)
+  }
+
+  private func updateCommandPalette() {
+    // The slash command list is now the native UIMenu on the "/" button (expands in place
+    // like the +/model/repo pickers) — the custom drop-up table is retired so typing "/"
+    // no longer pops a separate overlay sheet.
+    setCommandPaletteVisible(false)
+  }
+
+  private func setCommandPaletteVisible(_ visible: Bool) {
+    if commandPaletteVisible == visible {
+      if visible { onHeightChanged?(preferredHeight); setNeedsLayout() }
+      return
+    }
+    commandPaletteVisible = visible
+    commandPaletteBlur.isHidden = !visible
+    onHeightChanged?(preferredHeight)
+    setNeedsLayout()
+  }
+
+  private func applyCommandSelection(_ cmd: VibeAgentSlashCommand) {
+    if cmd.takesArgs {
+      // Let the user add arguments — insert and keep editing (palette hides on the space).
+      textView.text = cmd.display + " "
+      placeholderLabel.isHidden = true
+      setCommandPaletteVisible(false)
+      updateSendState(animated: true)
+      onHeightChanged?(preferredHeight)
+      textView.becomeFirstResponder()
+    } else {
+      // No args → run immediately. handleSend() routes run-options locally and every
+      // other command to the bridge for real output.
+      textView.text = cmd.display
+      setCommandPaletteVisible(false)
+      handleSend()
+    }
+  }
+
+  private func paletteIcon(_ cmd: VibeAgentSlashCommand) -> String {
+    switch cmd.name {
+    case "usage": return "gauge.with.dots.needle.bottom.50percent"
+    case "status": return "info.circle"
+    case "commands": return "terminal"
+    case "doctor": return "stethoscope"
+    case "compact": return "rectangle.compress.vertical"
+    case "model": return "cpu"
+    case "plan": return "checklist"
+    case "reasoning": return "brain"
+    case "review", "security-review": return "magnifyingglass"
+    case "init": return "doc.badge.plus"
+    case "context": return "doc.text.magnifyingglass"
+    case "mcp": return "server.rack"
+    default: return cmd.kind == .cli ? "terminal" : "slash.circle"
+    }
+  }
+
+  public func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+    filteredCommands.count
+  }
+
+  public func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+    let cell = tableView.dequeueReusableCell(withIdentifier: "vibeCmd", for: indexPath)
+    guard indexPath.row < filteredCommands.count else { return cell }
+    let cmd = filteredCommands[indexPath.row]
+    cell.backgroundColor = .clear
+    var content = cell.defaultContentConfiguration()
+    content.text = cmd.display
+    content.secondaryText = cmd.subtitle
+    content.textProperties.color = appearance.text
+    content.textProperties.font = .systemFont(ofSize: 16, weight: .medium)
+    content.secondaryTextProperties.color = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.9)
+    content.secondaryTextProperties.font = .systemFont(ofSize: 12)
+    content.image = UIImage(systemName: paletteIcon(cmd))
+    content.imageProperties.tintColor = appearance.text
+    content.imageProperties.preferredSymbolConfiguration = UIImage.SymbolConfiguration(pointSize: 15, weight: .regular)
+    cell.contentConfiguration = content
+    let sel = UIView()
+    sel.backgroundColor = vibeAgentKitColorWithAlpha(appearance.text, 0.08)
+    cell.selectedBackgroundView = sel
+    return cell
+  }
+
+  public func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+    tableView.deselectRow(at: indexPath, animated: false)
+    guard indexPath.row < filteredCommands.count else { return }
+    applyCommandSelection(filteredCommands[indexPath.row])
   }
 }

@@ -417,6 +417,9 @@ struct ChatListRow {
   // when sending a follow-up). Durable across devices, so the agent runtime view can
   // fold a resumed turn into the right session no matter which device sent it.
   let agentBridgeResumeSessionId: String?
+  // E2E-encrypted bridge image attachments (phone-held key); rendered locally in the
+  // agent surface and relayed to the desktop bridge as opaque ciphertext.
+  let agentBridgeAttachmentsEnc: [String]
   let agentActionSourceText: String?
   let agentRegeneratePrompt: String?
   let agentCard: AgentCard?
@@ -655,6 +658,7 @@ struct ChatListRow {
       agentProgressNodes = []
       agentActionSourceId = nil
       agentBridgeResumeSessionId = nil
+      agentBridgeAttachmentsEnc = []
       agentActionSourceText = nil
       agentRegeneratePrompt = nil
       agentCard = nil
@@ -874,6 +878,16 @@ struct ChatListRow {
     agentBridgeResumeSessionId = firstNonEmptyString(
       in: [metadata, message],
       keys: ["agentBridgeResumeSessionId", "agent_bridge_resume_session_id"]
+    )
+    agentBridgeAttachmentsEnc = uniqueStrings(
+      parseStringArray(metadata?["agentBridgeAttachmentsEnc"])
+        + parseStringArray(metadata?["agent_bridge_attachments_enc"])
+        + parseStringArray(metadata?["attachmentsEnc"])
+        + parseStringArray(metadata?["attachments_enc"])
+        + parseStringArray(message["agentBridgeAttachmentsEnc"])
+        + parseStringArray(message["agent_bridge_attachments_enc"])
+        + parseStringArray(message["attachmentsEnc"])
+        + parseStringArray(message["attachments_enc"])
     )
     agentActionSourceText = firstNonEmptyString(
       in: [metadata, message],

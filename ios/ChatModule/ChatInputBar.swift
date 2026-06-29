@@ -707,6 +707,10 @@ final class ChatInputBar: UIView {
   private let textView = ChatComposerTextView()
   private let placeholderLabel = UILabel()
   private let inlineAttachButton = UIButton(type: .system)
+  // Slash-command button (agent chats only): a "/" glyph at the pill's leading edge
+  // that opens the provider's slash-command menu. Hidden unless a menu is supplied.
+  private let slashButton = UIButton(type: .system)
+  private var slashCommandMenu: UIMenu?
   private let gifButton = UIButton(type: .system)
   private let sendButton = UIButton(type: .system)
   private let sendGradient = CAGradientLayer()
@@ -1107,6 +1111,11 @@ final class ChatInputBar: UIView {
     )
     pillContainer.addSubview(inlineAttachButton)
 
+    slashButton.isHidden = true
+    slashButton.accessibilityLabel = "Slash commands"
+    slashButton.showsMenuAsPrimaryAction = true
+    pillContainer.addSubview(slashButton)
+
     // placeholder
     placeholderLabel.text = placeholder
     placeholderLabel.font = UIFont.systemFont(ofSize: 16)
@@ -1375,6 +1384,14 @@ final class ChatInputBar: UIView {
       symbolConfig: plusConfiguration,
       tintColor: controlTint
     )
+    applyControlGlyph(
+      button: slashButton,
+      symbolName: "slash.circle",
+      symbolConfig: UIImage.SymbolConfiguration(pointSize: 16, weight: .regular),
+      tintColor: controlTint
+    )
+    slashButton.menu = slashCommandMenu
+    slashButton.isHidden = !agentControlMode || slashCommandMenu == nil || isRecording
 
     if agentControlMode {
       // Repo switcher chip (📁 <repo> ⌄). When the host has supplied a menu (Repository
@@ -1532,6 +1549,30 @@ final class ChatInputBar: UIView {
   func setAgentControlMenu(_ menu: UIMenu?) {
     agentControlMenu = menu
     refreshAgentControlModeAppearance()
+    setNeedsLayout()
+  }
+
+  /// Host-built slash-command menu shown by the "/" button at the pill's leading edge
+  /// (agent chats only). Pass nil to hide the button.
+  func setSlashCommandMenu(_ menu: UIMenu?) {
+    slashCommandMenu = menu
+    slashButton.menu = menu
+    refreshAgentControlModeAppearance()
+    setNeedsLayout()
+  }
+
+  /// Insert a chosen slash command into the composer (caret at end) so the user can add
+  /// arguments before sending — mirrors typing "/name " by hand.
+  func insertSlashCommand(_ name: String) {
+    let token = "/\(name) "
+    let existing = textView.text ?? ""
+    textView.text = existing.isEmpty ? token : (existing + (existing.hasSuffix(" ") ? "" : " ") + token)
+    applyPlaceholder()
+    updateButtonStates(animated: true)
+    textView.becomeFirstResponder()
+    let end = textView.endOfDocument
+    textView.selectedTextRange = textView.textRange(from: end, to: end)
+    delegate?.inputBarTextDidChange(text: textView.text ?? "")
     setNeedsLayout()
   }
 
@@ -1792,7 +1833,8 @@ final class ChatInputBar: UIView {
       isRecording ? 0 : max(24, gifButtonSize - (8 * clampedSendProgress))
     let pillW = max(1, pillRight - pillX)
     let sendActionReserve = (sendW + 2) * clampedSendProgress
-    let inlineAttachReserve: CGFloat = agentControlMode ? 40.0 : 0.0
+    let slashVisible = agentControlMode && slashCommandMenu != nil && !isRecording
+    let inlineAttachReserve: CGFloat = (agentControlMode ? 40.0 : 0.0) + (slashVisible ? 34.0 : 0.0)
     let textW = max(
       1,
       pillW - textInsetH * 2 - inlineAttachReserve - sendActionReserve - gifTextReserve
@@ -1934,13 +1976,22 @@ final class ChatInputBar: UIView {
     let tfY = bannerExtra + (clampedTextH + textInsetV * 2 - clampedTextH) / 2
     textView.frame = CGRect(x: tfX, y: tfY, width: tfW, height: clampedTextH)
     placeholderLabel.frame = CGRect(x: tfX + 2, y: tfY, width: tfW - 4, height: clampedTextH)
+    let inlineButtonY = textRowBottom - 36.0 - max(2.0, (minPillH - 36.0) * 0.5)
     inlineAttachButton.frame = CGRect(
       x: 4.0,
-      y: textRowBottom - 36.0 - max(2.0, (minPillH - 36.0) * 0.5),
+      y: inlineButtonY,
       width: 36.0,
       height: 36.0
     )
     inlineAttachButton.isHidden = !agentControlMode || isRecording
+    // Slash-command button sits just right of the inline "+" attach button.
+    slashButton.frame = CGRect(
+      x: 40.0,
+      y: inlineButtonY,
+      width: 34.0,
+      height: 36.0
+    )
+    slashButton.isHidden = !(agentControlMode && slashCommandMenu != nil && !isRecording)
     let gifTrailingInsetCollapsed: CGFloat = textInsetH
     let gifTrailingInsetExpanded: CGFloat = 2
     let gifTrailingInset =
