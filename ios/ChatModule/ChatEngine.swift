@@ -4230,6 +4230,13 @@ final class ChatEngine {
     let agentUserId = normalizedString(payload["userId"] ?? payload["user_id"] ?? payload["id"])
     let text = normalizedString(payload["text"]) ?? ""
     let progressNodes = (payload["progressNodes"] as? [[String: Any]]) ?? []
+    // Diagnostic: the chronological kind order the server sent for this live frame.
+    // A healthy live turn interleaves (e.g. "text,read,text,edit,bash"); a regression
+    // back to the old "grouped" bug reads as all tools then all text (or vice-versa).
+    let progressKindOrder =
+      progressNodes
+      .map { node in (normalizedString(node["kind"] ?? node["itemType"]) ?? "step").lowercased() }
+      .joined(separator: ",")
     let sourceMessageId = normalizedString(
       payload["sourceMessageId"] ?? payload["source_message_id"] ?? payload["replyToId"] ?? payload["reply_to_id"]
     )
@@ -4243,12 +4250,13 @@ final class ChatEngine {
       let serverToPhone = serverBroadcastAtMs.map { phoneReceivedAtMs - $0 }
       let endToEnd = bridgeSentAtMs.map { phoneReceivedAtMs - $0 }
       NSLog(
-        "[ChatEngine][AgentStream] chat=%@ stream=%@ seq=%@ text=%d nodes=%d bridgeToServer=%@ms serverToPhone=%@ms e2e=%@ms",
+        "[ChatEngine][AgentStream] chat=%@ stream=%@ seq=%@ text=%d nodes=%d order=[%@] bridgeToServer=%@ms serverToPhone=%@ms e2e=%@ms",
         chatId,
         streamId,
         sequence.map(String.init) ?? "nil",
         text.count,
         progressNodes.count,
+        progressKindOrder,
         bridgeToServer.map(String.init) ?? "nil",
         serverToPhone.map(String.init) ?? "nil",
         endToEnd.map(String.init) ?? "nil"
@@ -4272,10 +4280,17 @@ final class ChatEngine {
       return
     }
 
+    // Prefer the most recent TOOL/step node for the working indicator — the feed now
+    // carries narration "text" nodes inline, and echoing a wall of prose in the
+    // typing/working label reads wrong. Fall back to any label, then a generic.
     let streamProgressLabel =
-      progressNodes.reversed().compactMap { node in
+      progressNodes.reversed().first(where: { node in
+        ((normalizedString(node["kind"] ?? node["itemType"]) ?? "").lowercased()) != "text"
+      }).flatMap { normalizedString($0["label"] ?? $0["title"]) }
+      ?? progressNodes.reversed().lazy.compactMap { node in
         normalizedString(node["label"] ?? node["title"])
-      }.first ?? "Running task"
+      }.first
+      ?? "Running task"
     setAgentProgressLocked(
       chatId: chatId,
       label: streamProgressLabel,

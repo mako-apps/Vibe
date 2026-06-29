@@ -88,6 +88,10 @@ struct VibeAgentKitChatMessage: Equatable {
   var progressCompletedAt: String?
   var progress: [String]
   var progressItems: [VibeAgentKitProgressItem]
+  /// Subagent (Claude Task tool) children grouped by their parent Task node id.
+  /// `progressItems` only carries the depth-0 main feed (incl. the compact Task row);
+  /// the subagent's own steps live here and render only in the read-only subagent view.
+  var subagentChildren: [String: [VibeAgentKitProgressItem]]
   var runtime: ChatListRow.AgentRuntimeSummary?
   var attachments: [VibeAgentKitImageAttachment]
   /// A /compact context-summary turn — renders as a centered, collapsible mid-chat
@@ -110,6 +114,7 @@ struct VibeAgentKitChatMessage: Equatable {
     progressCompletedAt: String? = nil,
     progress: [String] = [],
     progressItems: [VibeAgentKitProgressItem] = [],
+    subagentChildren: [String: [VibeAgentKitProgressItem]] = [:],
     runtime: ChatListRow.AgentRuntimeSummary? = nil,
     attachments: [VibeAgentKitImageAttachment] = [],
     isCompactionSummary: Bool = false
@@ -128,6 +133,7 @@ struct VibeAgentKitChatMessage: Equatable {
     self.progressCompletedAt = progressCompletedAt
     self.progress = progress
     self.progressItems = progressItems
+    self.subagentChildren = subagentChildren
     self.runtime = runtime
     self.attachments = attachments
     self.isCompactionSummary = isCompactionSummary
@@ -201,6 +207,11 @@ struct VibeAgentKitProgressItem: Equatable {
   var fileContent: String? = nil
   var lineStart: Int? = nil
   var lineEnd: Int? = nil
+  // Subagent (Claude Task tool) grouping: a parent Task item carries `subagentType`
+  // (e.g. "explore") and renders as a tappable "🤖 Subagent" row; its children carry
+  // `parentId` and live only in the read-only subagent view.
+  var parentId: String? = nil
+  var subagentType: String? = nil
 
   static func from(label: String, raw: [String: Any]?, eventType: String = "progress")
     -> VibeAgentKitProgressItem
@@ -227,7 +238,7 @@ struct VibeAgentKitProgressItem: Equatable {
       recordingStartTime: doubleValue(raw?["recordingStartTime"]),
       tool: vibeAgentKitNormalizedString(raw?["tool"]),
       image: vibeAgentKitNormalizedString(raw?["image"]),
-      itemType: vibeAgentKitNormalizedString(raw?["itemType"]),
+      itemType: vibeAgentKitNormalizedString(raw?["itemType"]) ?? vibeAgentKitNormalizedString(raw?["kind"]),
       sourceUrl: vibeAgentKitNormalizedString(raw?["sourceUrl"])
     )
   }
@@ -507,6 +518,12 @@ func vibeAgentKitParseColor(_ hex: String?) -> UIColor? {
 func vibeAgentKitColorWithAlpha(_ color: UIColor, _ alpha: CGFloat) -> UIColor {
   color.withAlphaComponent(alpha)
 }
+
+// A progress node / runtime status that means "still working" (vs done/failed). Shared
+// across the cell and the conversation VC (e.g. to spin a running subagent's indicator).
+let vibeAgentKitRunningStepStatuses: Set<String> = [
+  "active", "in-progress", "in_progress", "pending", "queued", "running", "streaming", "working",
+]
 
 enum VibeAgentDiffPalette {
   static let additionText = UIColor(red: 0.18, green: 0.74, blue: 0.25, alpha: 1.0)

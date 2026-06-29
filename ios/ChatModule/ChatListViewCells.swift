@@ -1520,9 +1520,13 @@ private func agentProgressPreviewRuntimeItems(_ runtime: ChatListRow.AgentRuntim
 
 private func agentProgressPreviewItems(for row: ChatListRow) -> [AgentProgressPreviewItem] {
   let candidateNodes: [ChatListRow.AgentProgressNode] = {
-    let topLevel = row.agentProgressNodes.filter { $0.depth == 0 }
+    // The compact in-list preview stays TOOL-ONLY: the live feed now interleaves
+    // narration "text" nodes (rendered inline only in the full-page agent view), but
+    // here they would print a wall of prose as a "step" row. Drop them.
+    let toolNodes = row.agentProgressNodes.filter { ($0.kind ?? "") != "text" }
+    let topLevel = toolNodes.filter { $0.depth == 0 }
     if !topLevel.isEmpty { return topLevel }
-    return row.agentProgressNodes
+    return toolNodes
   }()
 
   var seenIds = Set<String>()

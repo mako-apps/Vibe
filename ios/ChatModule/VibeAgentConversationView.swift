@@ -76,7 +76,9 @@ enum VibeAgentKitMap {
       fileName: fileName,
       fileContent: (kind == "read" && rawOutput?.isEmpty == false) ? rawOutput : nil,
       lineStart: node.start,
-      lineEnd: node.end
+      lineEnd: node.end,
+      parentId: node.parentId,
+      subagentType: node.subagentType
     )
   }
 
@@ -254,6 +256,15 @@ enum VibeAgentKitMap {
     let items = row.isAgentMessage
       ? row.agentProgressNodes.filter { $0.depth == 0 }.map { progressItem(from: $0, detail: detailMap[$0.id]) }
       : []
+    // Subagent (Claude Task tool) children: depth>=1 nodes grouped by their parent
+    // Task node id. Kept out of the main feed; the read-only subagent view reads them.
+    var subagentChildren: [String: [VibeAgentKitProgressItem]] = [:]
+    if row.isAgentMessage {
+      for node in row.agentProgressNodes where node.depth >= 1 {
+        guard let parentId = node.parentId, !parentId.isEmpty else { continue }
+        subagentChildren[parentId, default: []].append(progressItem(from: node, detail: detailMap[node.id]))
+      }
+    }
     let attachments = row.isAgentMessage ? [] : imageAttachments(from: row)
     return VibeAgentKitChatMessage(
       id: row.messageId ?? row.key,
@@ -266,6 +277,7 @@ enum VibeAgentKitMap {
       hasFinalResponseText: row.isAgentMessage && !row.isStreamingText && !isCompaction && hasBodyText,
       progress: [],
       progressItems: isCompaction ? [] : items,
+      subagentChildren: isCompaction ? [:] : subagentChildren,
       runtime: isCompaction ? nil : (row.isAgentMessage ? row.agentRuntime : nil),
       attachments: attachments,
       isCompactionSummary: isCompaction
@@ -343,6 +355,17 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   private var usageBannerVisible = false
   private var usageBannerKey: String?
   private let commandOverlayView = VibeAgentCommandOverlayView()
+
+  // Subagent (Claude Task tool) surfacing: a top toast announces a subagent starting,
+  // and tapping it (or its feed row) opens a read-only detail view of its steps.
+  private let subagentToastBlur = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterial))
+  private let subagentToastIcon = UILabel()
+  private let subagentToastLabel = UILabel()
+  private var subagentToastTarget: (messageId: String, nodeId: String)?
+  private var subagentToastHideWork: DispatchWorkItem?
+  private var toastedSubagentIds: Set<String> = []
+  private weak var openSubagentDetail: VibeAgentSubagentDetailViewController?
+  private var openSubagentRef: (messageId: String, nodeId: String)?
 
   // In-view header (the app hides the system nav bar, so this VC carries its own):
   // model name centered (tappable → model/thinking/speed), connected device beneath,
@@ -766,6 +789,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     setupEmptyState()
     setupUsageBanner()
     setupCommandOverlay()
+    setupSubagentToast()
 
     // Pin the feed to the TRUE bottom so messages scroll UNDER the floating composer
     // (Resolo-style, no hard footer line). `updateScrollInsets()` keeps a bottom
@@ -926,6 +950,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     trackStreamStarts(newMessages)
     indexProgress()
     updateEditToast()
+    updateSubagentState(newMessages)
     updateNavigationLiveState()
     updateLoadingOverlay()
     updateUsageBanner()
@@ -1400,6 +1425,9 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     cell.onProgressTap = { [weak self] in self?.toggleProgress(for: message.id) }
     cell.onRuntimeTap = { [weak self] runtime in self?.presentRuntime(runtime) }
     cell.onStepTap = { [weak self] nodeId in self?.toggleStepDetail(messageId: message.id, nodeId: nodeId) }
+    cell.onOpenSubagent = { [weak self] nodeId in
+      self?.presentSubagentView(messageId: message.id, parentNodeId: nodeId)
+    }
     cell.onTextExpansionTap = { [weak self] in self?.toggleTextExpansion(for: message.id) }
     cell.onAttachmentTap = { [weak self] attachment in self?.presentImageAttachment(attachment) }
     cell.configure(
@@ -1764,13 +1792,13 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     let claudeOrange = UIColor(red: 0.83, green: 0.46, blue: 0.30, alpha: 1.0)
     switch (agentBridgeProvider ?? "").lowercased() {
     case "claude":
-      let img = VibeAgentKitChatVectorIcon.image(.claudeAgent, color: claudeOrange, size: 64)
+      let img = VibeAgentKitChatVectorIcon.image(.claudeAgent, color: claudeOrange, size: 48)
       emptyStateIcon.image = img
       emptyStateIcon.isHidden = false
       emptyStateTitle.text = "You've come to absolutely the right place."
       emptyStateSubtitle.isHidden = true
     case "codex":
-      let img = VibeAgentKitChatVectorIcon.image(.gptAgent, color: .white, size: 64)?
+      let img = VibeAgentKitChatVectorIcon.image(.gptAgent, color: .white, size: 48)?
         .withRenderingMode(.alwaysTemplate)
       emptyStateIcon.image = img
       emptyStateIcon.tintColor = UIColor.label
@@ -2288,6 +2316,151 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
         if self.editToastBlur.alpha <= 0.01 { self.editToastBlur.isHidden = true }
       }
     }
+  }
+
+  // MARK: Subagent (Claude Task tool) surfacing
+
+  private func setupSubagentToast() {
+    subagentToastBlur.translatesAutoresizingMaskIntoConstraints = false
+    subagentToastBlur.alpha = 0.0
+    subagentToastBlur.isHidden = true
+    subagentToastBlur.clipsToBounds = true
+    subagentToastBlur.layer.cornerRadius = 16.0
+    subagentToastBlur.layer.cornerCurve = .continuous
+    subagentToastBlur.layer.borderWidth = 0.6
+    subagentToastBlur.layer.borderColor =
+      vibeAgentKitColorWithAlpha(appearance.textSecondary, appearance.isDark ? 0.18 : 0.14).cgColor
+    subagentToastBlur.contentView.backgroundColor =
+      (appearance.isDark ? UIColor.white : UIColor.black)
+      .withAlphaComponent(appearance.isDark ? 0.055 : 0.045)
+    view.addSubview(subagentToastBlur)
+
+    subagentToastIcon.translatesAutoresizingMaskIntoConstraints = false
+    subagentToastIcon.font = UIFont.systemFont(ofSize: 13.0)
+    subagentToastIcon.text = "🤖"
+    subagentToastBlur.contentView.addSubview(subagentToastIcon)
+
+    subagentToastLabel.translatesAutoresizingMaskIntoConstraints = false
+    subagentToastLabel.numberOfLines = 1
+    subagentToastLabel.lineBreakMode = .byTruncatingTail
+    subagentToastLabel.font = UIFont.systemFont(ofSize: 12.5, weight: .semibold)
+    subagentToastLabel.textColor = vibeAgentKitColorWithAlpha(appearance.text, 0.9)
+    subagentToastBlur.contentView.addSubview(subagentToastLabel)
+
+    NSLayoutConstraint.activate([
+      subagentToastBlur.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+      subagentToastBlur.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 60.0),
+      subagentToastBlur.leadingAnchor.constraint(
+        greaterThanOrEqualTo: view.leadingAnchor, constant: 24.0),
+      subagentToastBlur.trailingAnchor.constraint(
+        lessThanOrEqualTo: view.trailingAnchor, constant: -24.0),
+      subagentToastIcon.leadingAnchor.constraint(
+        equalTo: subagentToastBlur.contentView.leadingAnchor, constant: 12.0),
+      subagentToastIcon.centerYAnchor.constraint(equalTo: subagentToastBlur.contentView.centerYAnchor),
+      subagentToastLabel.leadingAnchor.constraint(equalTo: subagentToastIcon.trailingAnchor, constant: 7.0),
+      subagentToastLabel.trailingAnchor.constraint(
+        equalTo: subagentToastBlur.contentView.trailingAnchor, constant: -12.0),
+      subagentToastLabel.topAnchor.constraint(equalTo: subagentToastBlur.contentView.topAnchor, constant: 8.0),
+      subagentToastLabel.bottomAnchor.constraint(
+        equalTo: subagentToastBlur.contentView.bottomAnchor, constant: -8.0),
+    ])
+    subagentToastBlur.contentView.isUserInteractionEnabled = true
+    subagentToastBlur.contentView.addGestureRecognizer(
+      UITapGestureRecognizer(target: self, action: #selector(handleSubagentToastTap)))
+  }
+
+  @objc private func handleSubagentToastTap() {
+    guard let target = subagentToastTarget else { return }
+    hideSubagentToast()
+    presentSubagentView(messageId: target.messageId, parentNodeId: target.nodeId)
+  }
+
+  /// All running subagents in the current transcript, as (messageId, nodeId, type).
+  private func runningSubagents(in msgs: [VibeAgentKitChatMessage])
+    -> [(messageId: String, nodeId: String, type: String)]
+  {
+    var out: [(messageId: String, nodeId: String, type: String)] = []
+    for message in msgs {
+      for item in message.progressItems {
+        guard item.itemType == "task" || (item.subagentType?.isEmpty == false) else { continue }
+        let nodeId = item.nodeId ?? item.label
+        let running = vibeAgentKitRunningStepStatuses.contains((item.status ?? "").lowercased())
+        guard running else { continue }
+        out.append((messageId: message.id, nodeId: nodeId, type: item.subagentType ?? ""))
+      }
+    }
+    return out
+  }
+
+  private func updateSubagentState(_ newMessages: [VibeAgentKitChatMessage]) {
+    guard isViewLoaded else { return }
+    // Announce any newly-running subagent once (toast auto-fades; the feed row persists).
+    for sub in runningSubagents(in: newMessages) where !toastedSubagentIds.contains(sub.nodeId) {
+      toastedSubagentIds.insert(sub.nodeId)
+      showSubagentToast(messageId: sub.messageId, nodeId: sub.nodeId, type: sub.type)
+    }
+    // Keep an open detail view streaming: re-feed it the latest children for its parent.
+    if let ref = openSubagentRef, let detail = openSubagentDetail,
+      let message = newMessages.first(where: { $0.id == ref.messageId })
+    {
+      let stillRunning = runningSubagents(in: newMessages).contains { $0.nodeId == ref.nodeId }
+      detail.update(
+        progressItems: message.subagentChildren[ref.nodeId] ?? [],
+        running: stillRunning)
+    }
+  }
+
+  private func showSubagentToast(messageId: String, nodeId: String, type: String) {
+    subagentToastTarget = (messageId: messageId, nodeId: nodeId)
+    let flavor = type.trimmingCharacters(in: .whitespacesAndNewlines)
+    subagentToastLabel.text = flavor.isEmpty ? "Subagent running" : "Subagent running · \(flavor)"
+    subagentToastBlur.isHidden = false
+    UIView.animate(withDuration: 0.18, delay: 0, options: [.beginFromCurrentState, .allowUserInteraction]) {
+      self.subagentToastBlur.alpha = 1.0
+    }
+    subagentToastHideWork?.cancel()
+    let work = DispatchWorkItem { [weak self] in self?.hideSubagentToast() }
+    subagentToastHideWork = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + 3.5, execute: work)
+  }
+
+  private func hideSubagentToast() {
+    subagentToastHideWork?.cancel()
+    subagentToastHideWork = nil
+    guard !subagentToastBlur.isHidden else { return }
+    UIView.animate(withDuration: 0.16, delay: 0, options: [.beginFromCurrentState, .allowUserInteraction]) {
+      self.subagentToastBlur.alpha = 0.0
+    } completion: { _ in
+      if self.subagentToastBlur.alpha <= 0.01 { self.subagentToastBlur.isHidden = true }
+    }
+  }
+
+  /// Open the read-only subagent view (no composer) for a parent Task node, seeded with
+  /// its current children and kept live by `updateSubagentState`.
+  private func presentSubagentView(messageId: String, parentNodeId: String) {
+    guard let message = messages.first(where: { $0.id == messageId }) else { return }
+    let children = message.subagentChildren[parentNodeId] ?? []
+    let type = message.progressItems.first {
+      (($0.nodeId ?? $0.label) == parentNodeId) && ($0.subagentType?.isEmpty == false)
+    }?.subagentType ?? ""
+    let running = runningSubagents(in: messages).contains { $0.nodeId == parentNodeId }
+    let detail = VibeAgentSubagentDetailViewController(
+      subagentType: type,
+      progressItems: children,
+      running: running,
+      appearance: appearance)
+    openSubagentDetail = detail
+    openSubagentRef = (messageId: messageId, nodeId: parentNodeId)
+    detail.onClose = { [weak self] in
+      self?.openSubagentDetail = nil
+      self?.openSubagentRef = nil
+    }
+    detail.modalPresentationStyle = .pageSheet
+    if let sheet = detail.sheetPresentationController {
+      sheet.detents = [.medium(), .large()]
+      sheet.prefersGrabberVisible = true
+    }
+    present(detail, animated: true)
   }
 
   /// The whole-history diff at a glance (not a single edited-file detail): how many files
@@ -3748,5 +3921,232 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
     tableView.deselectRow(at: indexPath, animated: false)
     guard indexPath.row < filteredCommands.count else { return }
     applyCommandSelection(filteredCommands[indexPath.row])
+  }
+}
+
+// MARK: - Read-only subagent detail (Claude Task tool)
+
+/// A read-only view of one subagent's steps — no composer, no send, just the live
+/// Read/Edit/Run feed. Opened from the "🤖 Subagent" feed row or its start toast;
+/// the host VC calls `update(children:running:)` each transcript tick so it streams.
+final class VibeAgentSubagentDetailViewController: UIViewController {
+  var onClose: (() -> Void)?
+
+  private let appearance: VibeAgentKitChatAppearance
+  private let subagentType: String
+  private var progressItems: [VibeAgentKitProgressItem]
+  private var running: Bool
+
+  private let titleLabel = UILabel()
+  private let subtitleLabel = UILabel()
+  private let spinner = UIActivityIndicatorView(style: .medium)
+  private let emptyLabel = UILabel()
+  private let scrollView = UIScrollView()
+  private let rowsStack = UIStackView()
+
+  init(
+    subagentType: String,
+    progressItems: [VibeAgentKitProgressItem],
+    running: Bool,
+    appearance: VibeAgentKitChatAppearance
+  ) {
+    self.subagentType = subagentType
+    self.progressItems = progressItems
+    self.running = running
+    self.appearance = appearance
+    super.init(nibName: nil, bundle: nil)
+  }
+
+  required init?(coder: NSCoder) { return nil }
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    view.backgroundColor = appearance.background
+
+    let header = UIView()
+    header.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(header)
+
+    titleLabel.translatesAutoresizingMaskIntoConstraints = false
+    titleLabel.font = UIFont.systemFont(ofSize: 17.0, weight: .semibold)
+    titleLabel.textColor = appearance.text
+    let flavor = subagentType.trimmingCharacters(in: .whitespacesAndNewlines)
+    titleLabel.text = flavor.isEmpty ? "Subagent" : "Subagent · \(flavor)"
+    header.addSubview(titleLabel)
+
+    subtitleLabel.translatesAutoresizingMaskIntoConstraints = false
+    subtitleLabel.font = UIFont.systemFont(ofSize: 12.5, weight: .regular)
+    subtitleLabel.textColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.85)
+    header.addSubview(subtitleLabel)
+
+    spinner.translatesAutoresizingMaskIntoConstraints = false
+    spinner.hidesWhenStopped = true
+    spinner.color = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.85)
+    header.addSubview(spinner)
+
+    let closeButton = UIButton(type: .system)
+    closeButton.translatesAutoresizingMaskIntoConstraints = false
+    closeButton.setImage(UIImage(systemName: "xmark.circle.fill"), for: .normal)
+    closeButton.tintColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.6)
+    closeButton.addAction(UIAction { [weak self] _ in self?.dismiss(animated: true) }, for: .touchUpInside)
+    header.addSubview(closeButton)
+
+    scrollView.translatesAutoresizingMaskIntoConstraints = false
+    scrollView.alwaysBounceVertical = true
+    view.addSubview(scrollView)
+
+    rowsStack.translatesAutoresizingMaskIntoConstraints = false
+    rowsStack.axis = .vertical
+    rowsStack.alignment = .fill
+    rowsStack.spacing = 12.0
+    rowsStack.isLayoutMarginsRelativeArrangement = true
+    rowsStack.layoutMargins = UIEdgeInsets(top: 14.0, left: 18.0, bottom: 24.0, right: 18.0)
+    scrollView.addSubview(rowsStack)
+
+    emptyLabel.translatesAutoresizingMaskIntoConstraints = false
+    emptyLabel.font = UIFont.systemFont(ofSize: 14.0, weight: .regular)
+    emptyLabel.textColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.7)
+    emptyLabel.numberOfLines = 0
+    emptyLabel.textAlignment = .center
+    emptyLabel.text = "Waiting for the subagent's first step…"
+    view.addSubview(emptyLabel)
+
+    NSLayoutConstraint.activate([
+      header.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+      header.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      header.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      header.heightAnchor.constraint(equalToConstant: 56.0),
+
+      titleLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 18.0),
+      titleLabel.topAnchor.constraint(equalTo: header.topAnchor, constant: 8.0),
+
+      subtitleLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+      subtitleLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 1.0),
+
+      spinner.leadingAnchor.constraint(equalTo: subtitleLabel.trailingAnchor, constant: 8.0),
+      spinner.centerYAnchor.constraint(equalTo: subtitleLabel.centerYAnchor),
+
+      closeButton.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -16.0),
+      closeButton.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
+      closeButton.widthAnchor.constraint(equalToConstant: 26.0),
+      closeButton.heightAnchor.constraint(equalToConstant: 26.0),
+
+      scrollView.topAnchor.constraint(equalTo: header.bottomAnchor),
+      scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+
+      rowsStack.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor),
+      rowsStack.leadingAnchor.constraint(equalTo: scrollView.frameLayoutGuide.leadingAnchor),
+      rowsStack.trailingAnchor.constraint(equalTo: scrollView.frameLayoutGuide.trailingAnchor),
+      rowsStack.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor),
+
+      emptyLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+      emptyLabel.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+      emptyLabel.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 32.0),
+      emptyLabel.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -32.0),
+    ])
+
+    rebuild()
+  }
+
+  override func viewDidDisappear(_ animated: Bool) {
+    super.viewDidDisappear(animated)
+    if isBeingDismissed || isMovingFromParent { onClose?() }
+  }
+
+  func update(progressItems: [VibeAgentKitProgressItem], running: Bool) {
+    self.progressItems = progressItems
+    self.running = running
+    if isViewLoaded { rebuild() }
+  }
+
+  private func rebuild() {
+    rowsStack.arrangedSubviews.forEach {
+      rowsStack.removeArrangedSubview($0)
+      $0.removeFromSuperview()
+    }
+    let toolChildren = progressItems.filter { $0.itemType != "text" }
+    emptyLabel.isHidden = !progressItems.isEmpty
+    for child in progressItems {
+      rowsStack.addArrangedSubview(makeRow(for: child))
+    }
+    subtitleLabel.text = running
+      ? "Running · \(toolChildren.count) \(toolChildren.count == 1 ? "step" : "steps")"
+      : "\(toolChildren.count) \(toolChildren.count == 1 ? "step" : "steps")"
+    if running { spinner.startAnimating() } else { spinner.stopAnimating() }
+  }
+
+  private func makeRow(for item: VibeAgentKitProgressItem) -> UIView {
+    let kind = (item.itemType ?? item.tool ?? "").lowercased()
+
+    // Narration text node: render as plain prose (no icon), matching the main feed.
+    if kind == "text" {
+      let label = UILabel()
+      label.translatesAutoresizingMaskIntoConstraints = false
+      label.numberOfLines = 0
+      label.font = UIFont.systemFont(ofSize: 15.0, weight: .regular)
+      label.textColor = appearance.text
+      label.text = item.label.trimmingCharacters(in: .whitespacesAndNewlines)
+      return label
+    }
+
+    let row = UIStackView()
+    row.translatesAutoresizingMaskIntoConstraints = false
+    row.axis = .horizontal
+    row.alignment = .top
+    row.spacing = 9.0
+
+    let icon = UIImageView()
+    icon.translatesAutoresizingMaskIntoConstraints = false
+    icon.contentMode = .scaleAspectFit
+    icon.image = UIImage(systemName: Self.iconName(for: kind))?.withRenderingMode(.alwaysTemplate)
+    icon.tintColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.75)
+    icon.setContentHuggingPriority(.required, for: .horizontal)
+    NSLayoutConstraint.activate([
+      icon.widthAnchor.constraint(equalToConstant: 15.0),
+      icon.heightAnchor.constraint(equalToConstant: 15.0),
+      icon.topAnchor.constraint(equalTo: row.topAnchor, constant: 2.0),
+    ])
+
+    let label = UILabel()
+    label.translatesAutoresizingMaskIntoConstraints = false
+    label.numberOfLines = 2
+    label.lineBreakMode = .byTruncatingTail
+    if kind == "bash", let cmd = item.command, !cmd.isEmpty {
+      label.numberOfLines = 1
+      label.attributedText = NSAttributedString(
+        string: cmd.replacingOccurrences(of: "\n", with: " "),
+        attributes: [
+          .font: UIFont.monospacedSystemFont(ofSize: 13.5, weight: .regular),
+          .foregroundColor: appearance.text,
+        ])
+    } else {
+      var text = item.label
+      if kind == "read", let start = item.lineStart {
+        let range = item.lineEnd.map { "\(start)–\($0)" } ?? "\(start)"
+        text += "  (\(range))"
+      }
+      label.font = UIFont.systemFont(ofSize: 14.75, weight: .regular)
+      label.textColor = appearance.text
+      label.text = text
+    }
+
+    row.addArrangedSubview(icon)
+    row.addArrangedSubview(label)
+    return row
+  }
+
+  private static func iconName(for kind: String) -> String {
+    switch kind {
+    case "read": return "doc.text"
+    case "edit", "write": return "pencil"
+    case "bash": return "terminal"
+    case "search": return "magnifyingglass"
+    case "web": return "globe"
+    case "thinking": return "brain"
+    case "task": return "person.2"
+    default: return "circle.dotted"
+    }
   }
 }

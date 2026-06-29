@@ -126,6 +126,10 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
   // Per-step inline expansion: which node ids have their detail layer open, plus the
   // tap-up hook that asks the host to toggle one (it flips the set + re-measures).
   var onStepTap: ((String) -> Void)?
+  // Tapping a "🤖 Subagent" row asks the host to open the read-only subagent view
+  // for that parent Task node id (no inline expand — it's its own view).
+  var onOpenSubagent: ((String) -> Void)?
+  private var subagentChildren: [String: [VibeAgentKitProgressItem]] = [:]
   private var expandedStepIds: Set<String> = []
   // True while the turn is live: the work band + answer read as one continuous,
   // growing feed, so the gaps between them stay tight (no big void mid-stream).
@@ -169,6 +173,7 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
   // Tool nodes render as expandable `StepRowView`s.
   private func updateStepsList(
     _ items: [VibeAgentKitProgressItem],
+    leadingText: String? = nil,
     expanded: Bool,
     interactive: Bool,
     appearance: VibeAgentKitChatAppearance,
@@ -176,11 +181,21 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     availableWidth: CGFloat
   ) {
     clearStepsList()
-    guard expanded, !items.isEmpty else { return }
+    let normalizedLeadingText = leadingText?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let hasLeadingText = normalizedLeadingText?.isEmpty == false
+    guard expanded, hasLeadingText || !items.isEmpty else { return }
     stepsStack.spacing = streaming ? 7.0 : 11.0
     stepsStack.layoutMargins = streaming
       ? UIEdgeInsets(top: 2.0, left: 6.0, bottom: 4.0, right: 0.0)
       : UIEdgeInsets(top: 3.0, left: 6.0, bottom: 4.0, right: 0.0)
+    if let leadingText, hasLeadingText {
+      stepsStack.addArrangedSubview(
+        narrationWorkLogView(
+          text: leadingText,
+          streaming: streaming,
+          appearance: appearance,
+          availableWidth: availableWidth))
+    }
     for item in items {
       if item.itemType == "text" {
         let narration = item.label.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -194,6 +209,23 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
         continue
       }
       let nodeId = item.nodeId ?? item.label
+      // A subagent (Claude Task tool) node renders as a compact, always-tappable row
+      // that opens the read-only subagent view — never an inline expand. Its own
+      // Read/Edit/Run steps live only in that view (subagentChildren).
+      if item.itemType == "task" {
+        let subagentRow = VibeAgentKitSubagentRowView()
+        subagentRow.translatesAutoresizingMaskIntoConstraints = false
+        let running = vibeAgentKitRunningStepStatuses.contains((item.status ?? "").lowercased())
+        let toolStepCount = subagentChildren[nodeId]?.filter { $0.itemType != "text" }.count ?? 0
+        subagentRow.configure(
+          type: item.subagentType?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
+          stepCount: toolStepCount,
+          running: running,
+          appearance: appearance)
+        subagentRow.onTap = { [weak self] in self?.onOpenSubagent?(nodeId) }
+        stepsStack.addArrangedSubview(subagentRow)
+        continue
+      }
       let row = VibeAgentKitStepRowView()
       row.translatesAutoresizingMaskIntoConstraints = false
       row.configure(
@@ -236,17 +268,32 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     for (index, block) in blocks.enumerated() {
       switch block {
       case .text(let content):
-        let label = UILabel()
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.numberOfLines = 0
-        label.backgroundColor = .clear
-        label.attributedText = VibeAgentKitTextRenderer.makeAttributedText(
+        let attributed = VibeAgentKitTextRenderer.makeAttributedText(
           text: content,
           font: font,
           textColor: color,
           lineHeight: lineHeight
         )
-        stack.addArrangedSubview(label)
+        let measured = VibeAgentKitTextRenderer.measuredSize(for: attributed, width: contentWidth)
+        let height = max(ceil(font.lineHeight), measured.height)
+        if streaming {
+          let label = VibeAgentKitStreamingTextLabel()
+          label.translatesAutoresizingMaskIntoConstraints = false
+          label.numberOfLines = 0
+          label.backgroundColor = .clear
+          label.applyStreamingText(attributed, rawText: content, isStreaming: true)
+          let heightConstraint = label.heightAnchor.constraint(equalToConstant: height)
+          heightConstraint.priority = .defaultHigh
+          heightConstraint.isActive = true
+          stack.addArrangedSubview(label)
+        } else {
+          let label = UILabel()
+          label.translatesAutoresizingMaskIntoConstraints = false
+          label.numberOfLines = 0
+          label.backgroundColor = .clear
+          label.attributedText = attributed
+          stack.addArrangedSubview(label)
+        }
 
       case .code(let code, let language):
         let codeView = VibeAgentKitCodeBlockView()
@@ -320,6 +367,7 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     availableWidth: CGFloat,
     messageId: String,
     progressItems: [VibeAgentKitProgressItem],
+    subagentChildren: [String: [VibeAgentKitProgressItem]] = [:],
     fallbackProgressLabels: [String],
     runtime: ChatListRow.AgentRuntimeSummary?,
     onRuntimeTap: ((ChatListRow.AgentRuntimeSummary) -> Void)?,
@@ -329,6 +377,7 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     streamingStartDate: Date? = nil
   ) {
     self.expandedStepIds = expandedStepIds
+    self.subagentChildren = subagentChildren
     let font = UIFont.systemFont(ofSize: 18.0, weight: .regular)
     let lineHeight: CGFloat = 27.5
     let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -407,18 +456,22 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     // live inside the tappable "Worked" card and reveal their command output / search
     // hits + diff counts when expanded.
     if showsLoader {
-      // Live turn: show the TOOL steps (Read/Edit/Run/cd …) in the feed AND the streaming
-      // answer in the body below — BOTH at once, every update. We render only the tool
-      // nodes here (filter out the "text" narration nodes) because the streaming answer
-      // body already shows the prose; rendering prose in both places duplicated it, and
-      // suppressing the body to avoid that hid the answer entirely (the narration nodes do
-      // NOT reliably mirror the streamed answer — that lives in `message.text`). Keeping
-      // the tool feed + the answer body both visible means a progress-only update no
-      // longer toggles the text away. Everything collapses into "Worked · N steps" on done.
-      let liveToolItems = progressItems.filter { $0.itemType != "text" }
+      // Live turn: the work feed is the SINGLE source of the in-flight turn — it
+      // interleaves narration text and tool steps (Read → text → Edit → …) in
+      // chronological order. The separate streaming answer body is suppressed below
+      // (see the `!showsLoader` guard) so the prose is never split off into its own
+      // block under a detached group of tool steps.
+      let feedOrder =
+        progressItems
+        .map { ($0.itemType ?? $0.tool ?? "step").lowercased() }
+        .joined(separator: ",")
+      NSLog(
+        "[AgentFeed] live msg=%@ items=%d order=[%@] bodySuppressed=yes shimmer=%@",
+        messageId, progressItems.count, feedOrder,
+        progressItems.last(where: { $0.itemType != "text" })?.label ?? "Thinking")
       updateStepsList(
-        liveToolItems,
-        expanded: !liveToolItems.isEmpty,
+        progressItems,
+        expanded: hasDisplayText || !progressItems.isEmpty,
         interactive: false,
         appearance: appearance,
         streaming: true,
@@ -444,7 +497,12 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
       onTap: onRuntimeTap
     )
 
-    guard hasDisplayText else {
+    // Suppress the separate answer body when there is no text yet OR while the turn is
+    // live. A live turn's prose rides INSIDE the interleaved feed above (as "text"
+    // nodes), so rendering it again here would split the answer into a detached block
+    // below the tool steps — the "grouped / disconnected flow" bug. The body returns
+    // when the turn finishes (showsLoader == false) and the feed collapses to "Worked".
+    guard hasDisplayText, !showsLoader else {
       for (index, view) in blockViews.enumerated() {
         if let label = view as? VibeAgentKitStreamingTextLabel {
           label.resetStreamingState()
@@ -452,12 +510,13 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
         view.isHidden = true
         blockHeightConstraints[index].constant = 0.0
       }
-      // No answer text yet (pure-tool / live-start turn): keep the work feed visible so
-      // the row does not look frozen. Once text arrives, the work feed moves under the
-      // answer and grows inline with the streamed prose.
+      // Keep the work feed visible so the row never looks frozen; it owns the live
+      // narration + tool steps until the turn finishes.
       positionSummaryViews(belowText: false)
       return
     }
+
+
 
     let blocks = VibeAgentKitTextRenderer.parseBlocks(text)
     let signature = blocks.map { block -> String in
@@ -542,14 +601,14 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
       }
     }
 
-    // Once there is answer text, the text owns the row. Tool progress follows it inline
-    // instead of floating above the response, matching the live transcript order.
-    positionSummaryViews(belowText: true)
+    // The work wrapper stays at the top; when expanded, its own stack owns the
+    // progress/timeline. The answer body below is only for finished/non-live text.
+    positionSummaryViews(belowText: false)
   }
 
-  /// Place the loader/work log either before any text (only while a live turn has not
-  /// emitted prose yet) or directly after the assistant text. The diff/runtime summary
-  /// always stays last.
+  /// Place the loader/work log at the top. For live turns, `stepsStack` owns the
+  /// streamed answer text plus progress rows; for completed turns it owns the expanded
+  /// work details. The diff/runtime summary always stays last.
   private func positionSummaryViews(belowText: Bool) {
     guard stackView.arrangedSubviews.contains(runtimeSummaryView) else { return }
     if belowText {
@@ -564,8 +623,8 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
       stackView.insertArrangedSubview(stepsStack, at: 1)
     }
     // Spacing follows each view across reordering and is ignored while a view is
-    // hidden. Keep gaps tight so the streaming text and work feed read as one
-    // continuous row rather than two disconnected blocks.
+    // hidden. Keep gaps tight so the live text/progress timeline reads as one
+    // continuous shape under the Working header.
     stackView.setCustomSpacing(isLiveTurn ? 6.0 : 8.0, after: loaderView)
     stackView.setCustomSpacing(isLiveTurn ? 6.0 : 8.0, after: stepsStack)
   }
@@ -705,6 +764,117 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
 // and the file slice it read (fallback "Reading…"); everything else → its output.
 // All rows self-size (no explicit heights) so the table's automaticDimension grows
 // the cell as a row opens.
+// A compact, always-tappable row for a Claude subagent (Task tool). Shows the
+// subagent flavor ("Subagent · explore"), a live spinner while it runs, the step
+// count, and a chevron. Tapping opens the read-only subagent view; it never expands
+// inline (the subagent's own steps live in that separate view).
+private final class VibeAgentKitSubagentRowView: UIView {
+  private let header = UIControl()
+  private let iconLabel = UILabel()
+  private let titleLabel = UILabel()
+  private let countLabel = UILabel()
+  private let chevron = UIImageView()
+  private let spinner = UIActivityIndicatorView(style: .medium)
+  var onTap: (() -> Void)?
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    setup()
+  }
+
+  required init?(coder: NSCoder) { return nil }
+
+  private func setup() {
+    backgroundColor = .clear
+    header.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(header)
+    NSLayoutConstraint.activate([
+      header.topAnchor.constraint(equalTo: topAnchor),
+      header.leadingAnchor.constraint(equalTo: leadingAnchor),
+      header.trailingAnchor.constraint(equalTo: trailingAnchor),
+      header.bottomAnchor.constraint(equalTo: bottomAnchor),
+    ])
+
+    let stack = UIStackView()
+    stack.translatesAutoresizingMaskIntoConstraints = false
+    stack.axis = .horizontal
+    stack.alignment = .center
+    stack.spacing = 7.0
+    stack.isUserInteractionEnabled = false
+    header.addSubview(stack)
+
+    iconLabel.translatesAutoresizingMaskIntoConstraints = false
+    iconLabel.font = UIFont.systemFont(ofSize: 13.0)
+    iconLabel.text = "🤖"
+    iconLabel.setContentHuggingPriority(.required, for: .horizontal)
+    iconLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+    titleLabel.translatesAutoresizingMaskIntoConstraints = false
+    titleLabel.numberOfLines = 1
+    titleLabel.lineBreakMode = .byTruncatingTail
+    titleLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+    titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+    countLabel.translatesAutoresizingMaskIntoConstraints = false
+    countLabel.setContentHuggingPriority(.required, for: .horizontal)
+    countLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+    spinner.translatesAutoresizingMaskIntoConstraints = false
+    spinner.hidesWhenStopped = true
+    spinner.setContentHuggingPriority(.required, for: .horizontal)
+
+    chevron.translatesAutoresizingMaskIntoConstraints = false
+    chevron.contentMode = .scaleAspectFit
+    chevron.image = UIImage(systemName: "chevron.right")?.withRenderingMode(.alwaysTemplate)
+    chevron.setContentHuggingPriority(.required, for: .horizontal)
+    chevron.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+    stack.addArrangedSubview(iconLabel)
+    stack.addArrangedSubview(titleLabel)
+    stack.addArrangedSubview(spinner)
+    stack.addArrangedSubview(countLabel)
+    stack.addArrangedSubview(chevron)
+
+    NSLayoutConstraint.activate([
+      stack.leadingAnchor.constraint(equalTo: header.leadingAnchor),
+      stack.trailingAnchor.constraint(equalTo: header.trailingAnchor),
+      stack.topAnchor.constraint(equalTo: header.topAnchor, constant: 6.0),
+      stack.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -6.0),
+      chevron.widthAnchor.constraint(equalToConstant: 10.0),
+      chevron.heightAnchor.constraint(equalToConstant: 12.0),
+    ])
+
+    header.addAction(UIAction { [weak self] _ in self?.onTap?() }, for: .touchUpInside)
+  }
+
+  func configure(
+    type: String,
+    stepCount: Int,
+    running: Bool,
+    appearance: VibeAgentKitChatAppearance
+  ) {
+    let flavor = type.isEmpty ? "Subagent" : "Subagent · \(type)"
+    titleLabel.attributedText = NSAttributedString(
+      string: flavor,
+      attributes: [
+        .font: UIFont.systemFont(ofSize: 14.75, weight: .semibold),
+        .foregroundColor: appearance.text,
+      ])
+    if stepCount > 0 {
+      countLabel.text = stepCount == 1 ? "1 step" : "\(stepCount) steps"
+      countLabel.isHidden = false
+    } else {
+      countLabel.text = nil
+      countLabel.isHidden = true
+    }
+    countLabel.font = UIFont.systemFont(ofSize: 12.5, weight: .regular)
+    countLabel.textColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.8)
+    chevron.tintColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.6)
+    spinner.color = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.85)
+    if running { spinner.startAnimating() } else { spinner.stopAnimating() }
+  }
+}
+
 private final class VibeAgentKitStepRowView: UIView {
   private let container = UIStackView()
   private let header = UIControl()
@@ -1335,6 +1505,7 @@ final class VibeAgentKitMessageCell: UITableViewCell {
   var onProgressTap: (() -> Void)?
   var onRuntimeTap: ((ChatListRow.AgentRuntimeSummary) -> Void)?
   var onStepTap: ((String) -> Void)?
+  var onOpenSubagent: ((String) -> Void)?
   var onTextExpansionTap: (() -> Void)?
   var onAttachmentTap: ((VibeAgentKitImageAttachment) -> Void)?
 
@@ -1361,9 +1532,11 @@ final class VibeAgentKitMessageCell: UITableViewCell {
     onProgressTap = nil
     onRuntimeTap = nil
     onStepTap = nil
+    onOpenSubagent = nil
     onTextExpansionTap = nil
     onAttachmentTap = nil
     assistantBodyView.onStepTap = nil
+    assistantBodyView.onOpenSubagent = nil
     progressStack.arrangedSubviews.forEach {
       progressStack.removeArrangedSubview($0)
       $0.removeFromSuperview()
@@ -1561,6 +1734,7 @@ final class VibeAgentKitMessageCell: UITableViewCell {
       )
       assistantBodyView.isHidden = false
       assistantBodyView.onStepTap = onStepTap
+      assistantBodyView.onOpenSubagent = onOpenSubagent
       assistantBodyView.configure(
         text: displayText,
         isStreaming: message.isStreaming,
@@ -1569,6 +1743,7 @@ final class VibeAgentKitMessageCell: UITableViewCell {
         availableWidth: availableWidth,
         messageId: message.id,
         progressItems: message.progressItems,
+        subagentChildren: message.subagentChildren,
         fallbackProgressLabels: message.progress,
         runtime: message.runtime,
         onRuntimeTap: onRuntimeTap,

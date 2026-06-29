@@ -1066,13 +1066,14 @@ defmodule Vibe.AI.LocalAgentWorker do
             "userId" => worker.agent_user_id,
             "isAgent" => true,
             "text" => text,
-            # Live feed stays tool-only: the working text is still streaming into the
-            # body above the feed, so emitting it as nodes too would double it up. The
-            # interleaved text nodes land only on the final persisted message, where
-            # the body collapses to the summary and the narration moves into the card.
+            # Live feed = ONE interleaved chronological flow (narration text ↔ Read/
+            # Edit/Run steps), exactly like the finished "Worked" card — NOT a tool-only
+            # band detached from a separate streaming-text block. The live agent view
+            # renders this feed as the single source of truth and suppresses the separate
+            # answer body, so the in-progress answer tail must ride here too (hence
+            # live_progress_nodes, which keeps the tail the finished path drops).
             "progressNodes" =>
-              extracted.progress_nodes
-              |> Enum.reject(&(&1["kind"] == "text"))
+              live_progress_nodes(worker, extracted)
               |> mark_latest_progress_node_running(),
             "toolEvents" => extracted.tool_events,
             "status" => "running"
@@ -1136,6 +1137,17 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   defp mark_latest_progress_node_running(nodes), do: nodes
+
+  # Progress nodes for the LIVE stream feed. Same interleaved shape as the finished
+  # "Worked" card (text ↔ tools, chronological) but WITH the in-progress answer tail:
+  # build_progress_nodes drops the block equal to the summary (it re-renders as the
+  # message body once finished), but during the run the live agent view suppresses the
+  # body and shows this feed alone — so passing an empty summary keeps the tail visible.
+  defp live_progress_nodes(%{handle: "claude"}, extracted) do
+    interleaved_claude_progress_nodes(extracted.decoded, extracted.tool_events, "")
+  end
+
+  defp live_progress_nodes(_worker, extracted), do: extracted.progress_nodes
 
   @doc "Mark a live stream finished. The final persisted message carries the content."
   def finish_stream(provider, chat_id, stream_id) do
@@ -1602,6 +1614,10 @@ defmodule Vibe.AI.LocalAgentWorker do
 
     %{
       text: text,
+      # Kept so the LIVE stream path can rebuild the interleaved feed WITH the
+      # in-progress answer tail (build_progress_nodes drops the summary block —
+      # see live_progress_nodes/2).
+      decoded: decoded,
       tool_events: tool_events,
       available_tools: available_tools_from_decoded(worker, decoded),
       raw_event_count: length(decoded),
