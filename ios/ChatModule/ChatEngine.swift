@@ -499,17 +499,44 @@ final class ChatEngine {
     normalizedString(store.getConfig()["userId"])
   }
 
+  private func bridgeProviderForOutboundDraftLocked(_ draft: [String: Any], fallbackChatId: String? = nil) -> String? {
+    let metadata = draft["metadata"] as? [String: Any] ?? [:]
+    let chatId =
+      normalizedString(draft["chatId"] ?? draft["chat_id"])
+      ?? normalizedString(fallbackChatId)
+    let peerUserId = normalizedString(draft["peerUserId"] ?? draft["peer_user_id"])
+    let peerAgentId =
+      normalizedString(
+        draft["peerAgentId"] ?? draft["peer_agent_id"] ?? draft["mentionedAgentId"]
+          ?? draft["mentioned_agent_id"])
+    return bridgeProviderForChatLocked(
+      chatId: chatId,
+      peerUserId: peerUserId,
+      peerAgentId: peerAgentId,
+      metadata: metadata
+    )
+  }
+
   private func persistOutboundStateLocked() {
     guard let userId = currentOutboundUserIdLocked() else { return }
-    if pendingOutboundDraftsByMessageId.isEmpty && pendingOutboundQueueByChat.isEmpty {
+    let persistedDrafts = pendingOutboundDraftsByMessageId.filter { _, draft in
+      bridgeProviderForOutboundDraftLocked(draft) == nil
+    }
+    var persistedQueues: [String: [String]] = [:]
+    for (chatId, ids) in pendingOutboundQueueByChat {
+      if isVolatileBridgeAgentChatLocked(chatId: chatId) { continue }
+      let keptIds = ids.filter { persistedDrafts[$0] != nil }
+      if !keptIds.isEmpty { persistedQueues[chatId] = keptIds }
+    }
+    if persistedDrafts.isEmpty && persistedQueues.isEmpty {
       store.clearOutboundState()
       return
     }
     store.setOutboundState([
       "userId": userId,
       "updatedAt": nowMs(),
-      "draftsByMessageId": pendingOutboundDraftsByMessageId,
-      "queueByChat": pendingOutboundQueueByChat,
+      "draftsByMessageId": persistedDrafts,
+      "queueByChat": persistedQueues,
     ])
   }
 
@@ -525,8 +552,13 @@ final class ChatEngine {
 
     let rawDrafts = payload["draftsByMessageId"] as? [String: Any] ?? [:]
     var restoredDrafts: [String: [String: Any]] = [:]
+    var skippedBridgeDrafts = 0
     for (messageId, value) in rawDrafts {
       if let draft = value as? [String: Any] {
+        if bridgeProviderForOutboundDraftLocked(draft) != nil {
+          skippedBridgeDrafts += 1
+          continue
+        }
         restoredDrafts[messageId] = draft
       }
     }
@@ -535,18 +567,110 @@ final class ChatEngine {
     var restoredQueues: [String: [String]] = [:]
     for (chatId, value) in rawQueues {
       if let ids = value as? [String], !ids.isEmpty {
-        restoredQueues[chatId] = ids
+        if isVolatileBridgeAgentChatLocked(chatId: chatId) {
+          skippedBridgeDrafts += ids.count
+          continue
+        }
+        let keptIds = ids.filter { restoredDrafts[$0] != nil }
+        if !keptIds.isEmpty { restoredQueues[chatId] = keptIds }
       }
     }
 
     pendingOutboundDraftsByMessageId = restoredDrafts
     pendingOutboundQueueByChat = restoredQueues
+    if skippedBridgeDrafts > 0 {
+      appendJournalLocked(
+        event: "native-bridge-outgoing-restore-skip",
+        payload: ["drafts": skippedBridgeDrafts]
+      )
+      persistOutboundStateLocked()
+    }
     if !restoredDrafts.isEmpty || !restoredQueues.isEmpty {
       appendJournalLocked(
         event: "native-outgoing-restored",
         payload: ["drafts": restoredDrafts.count, "chats": restoredQueues.count]
       )
     }
+  }
+
+  private func dropQueuedOutboundForChatLocked(chatId: String, reason: String) {
+    let ids = pendingOutboundQueueByChat.removeValue(forKey: chatId) ?? []
+    guard !ids.isEmpty else { return }
+    for id in ids {
+      pendingOutboundDraftsByMessageId.removeValue(forKey: id)
+      removeMessageIndicesLocked(chatId: chatId, messageId: id)
+      markLiveMessageDeletedLocked(chatId: chatId, messageId: id)
+    }
+    persistOutboundStateLocked()
+    appendJournalLocked(
+      event: "native-bridge-outgoing-drop-queue",
+      payload: ["chatId": chatId, "count": ids.count, "reason": reason]
+    )
+  }
+
+  @discardableResult
+  private func failVolatileBridgeSendLocked(
+    chatId: String,
+    messageId: String,
+    reason: String,
+    provider: String?,
+    removeRow: Bool = true
+  ) -> [String: Any] {
+    if var ids = pendingOutboundQueueByChat[chatId] {
+      ids.removeAll { $0 == messageId }
+      if ids.isEmpty {
+        pendingOutboundQueueByChat.removeValue(forKey: chatId)
+      } else {
+        pendingOutboundQueueByChat[chatId] = ids
+      }
+    }
+    pendingOutboundDraftsByMessageId.removeValue(forKey: messageId)
+    nativePendingMessagePushRefs = nativePendingMessagePushRefs.filter { _, pending in
+      !(pending.chatId == chatId && pending.messageId == messageId)
+    }
+    removeMessageIndicesLocked(chatId: chatId, messageId: messageId)
+    setLiveMessageUploadProgressLocked(chatId: chatId, messageId: messageId, progress: nil)
+    if removeRow {
+      markLiveMessageDeletedLocked(chatId: chatId, messageId: messageId)
+    }
+    persistOutboundStateLocked()
+    appendJournalLocked(
+      event: "native-bridge-send-failed",
+      payload: [
+        "chatId": chatId,
+        "messageId": messageId,
+        "provider": provider ?? "",
+        "reason": reason,
+      ]
+    )
+    let displayProvider = provider.map { $0.capitalized } ?? "Bridge"
+    let snapshot = statusSnapshotLocked()
+    postChangeLocked(
+      reason: "chatMessageDeleted",
+      userInfo: [
+        "chatId": chatId,
+        "messageId": messageId,
+        "action": "deleted",
+        "state": snapshot,
+      ])
+    postChangeLocked(
+      reason: "engineError",
+      userInfo: [
+        "chatId": chatId,
+        "messageId": messageId,
+        "category": "bridgeSendFailed",
+        "provider": provider ?? "",
+        "reason": reason,
+        "error": "\(displayProvider) message did not reach the bridge.",
+        "state": snapshot,
+      ])
+    return [
+      "accepted": false,
+      "reason": reason,
+      "messageId": messageId,
+      "state": "error",
+      "bridgeProvider": provider ?? "",
+    ]
   }
 
   private func clearCachedKeyOnBackground() {
@@ -1238,11 +1362,13 @@ final class ChatEngine {
       if let chatId, !chatId.isEmpty {
         if let peerUserIdHint {
           chatPeerUserIdsByChatId[chatId] = peerUserIdHint
-          scheduleFriendPublicKeyFetchLocked(
-            chatId: chatId,
-            peerUserIdHint: peerUserIdHint,
-            trigger: "open_chat_channel"
-          )
+          if !isVolatileBridgeAgentChatLocked(chatId: chatId, peerUserId: peerUserIdHint) {
+            scheduleFriendPublicKeyFetchLocked(
+              chatId: chatId,
+              peerUserIdHint: peerUserIdHint,
+              trigger: "open_chat_channel"
+            )
+          }
         }
         let nextCount = (openChatChannels[chatId] ?? 0) + 1
         openChatChannels[chatId] = nextCount
@@ -1301,10 +1427,12 @@ final class ChatEngine {
       guard let self else { return }
       for rawChatId in chatIds {
         guard let chatId = self.normalizedString(rawChatId), !chatId.isEmpty else { continue }
-        guard !self.isBuiltInAgentChatId(chatId) else {
+        guard !self.isBuiltInAgentChatId(chatId),
+          !self.isVolatileBridgeAgentChatLocked(chatId: chatId)
+        else {
           self.appendJournalLocked(
             event: "native-chat-history-skip",
-            payload: ["chatId": chatId, "reason": "built_in_agent_surface"]
+            payload: ["chatId": chatId, "reason": "agent_surface"]
           )
           continue
         }
@@ -1319,7 +1447,9 @@ final class ChatEngine {
     queue.async { [weak self] in
       guard let self else { return }
       guard let chatId = self.normalizedString(rawChatId), !chatId.isEmpty else { return }
-      guard !self.isBuiltInAgentChatId(chatId) else { return }
+      guard !self.isBuiltInAgentChatId(chatId),
+        !self.isVolatileBridgeAgentChatLocked(chatId: chatId)
+      else { return }
       _ = self.restoreCachedHistoryRowsLocked(chatId: chatId)
       guard !messages.isEmpty, !self.historyFullyLoadedChats.contains(chatId) else { return }
 
@@ -1356,6 +1486,10 @@ final class ChatEngine {
     syncOnQueue {
       for (rawChatId, messagesArray) in histories {
         guard let chatId = normalizedString(rawChatId), !chatId.isEmpty else { continue }
+        if isVolatileBridgeAgentChatLocked(chatId: chatId) {
+          clearVolatileBridgeHistoryLocked(chatId: chatId, reason: "seed_chat_histories")
+          continue
+        }
         _ = restoreCachedHistoryRowsLocked(chatId: chatId)
         // We only seed if the full history hasn't already been loaded.
         if !historyFullyLoadedChats.contains(chatId) {
@@ -1906,27 +2040,14 @@ final class ChatEngine {
         // the chat list never shows two "working" cards for one turn.
         if hasLiveStreamRow { continue }
       }
-      var agentBodyText = text
-      var progressNodesPayload: Any? = item["progressNodes"] ?? item["progress_nodes"]
-      if isRunningTranscriptItem, let nodes = progressNodesPayload as? [[String: Any]] {
-        var textParts: [String] = []
-        var toolNodes: [[String: Any]] = []
-        for node in nodes {
-          let kind = (normalizedString(node["kind"]) ?? "").lowercased()
-          if kind == "text" {
-            if let label = normalizedString(node["label"] ?? node["title"]) {
-              textParts.append(label)
-            }
-          } else {
-            toolNodes.append(node)
-          }
-        }
-        if !textParts.isEmpty {
-          if !agentBodyText.isEmpty { textParts.append(agentBodyText) }
-          agentBodyText = textParts.joined(separator: "\n\n")
-          progressNodesPayload = toolNodes
-        }
-      }
+      let agentBodyText = text
+      // A running turn KEEPS its narration "text" nodes inside progressNodes so the
+      // live feed renders them interleaved with the tool steps (Read → text → Edit).
+      // We used to strip them out here and fold the prose into the body, but the agent
+      // view SUPPRESSES the body while a turn is live, so that made live turns show
+      // "commands only". The bridge no longer unfolds either (see vibe-bridge.js
+      // markDetailLiveTurn); the running-status mark below still leaves text nodes intact.
+      let progressNodesPayload: Any? = item["progressNodes"] ?? item["progress_nodes"]
       // Stable id from the transcript's own message identity (claude uuid /
       // codex response-id) so the bridge's live re-pushes upsert in place even
       // as the capped window slides; fall back to array position.
@@ -2318,6 +2439,40 @@ final class ChatEngine {
         chatId, messageId, explicitPeerAgentId ?? "nil", peerAgentId ?? "nil",
         peerUserId ?? "nil",
         (peerAgentId?.isEmpty == false) ? "agent-cleartext" : "e2e-peer")
+      let bridgeProvider = bridgeProviderForChatLocked(
+        chatId: chatId,
+        peerUserId: peerUserId,
+        peerAgentId: peerAgentId,
+        metadata: metadata
+      )
+      let isVolatileBridgeSend = bridgeProvider != nil
+      if isVolatileBridgeSend {
+        clearVolatileBridgeHistoryLocked(chatId: chatId, reason: "bridge_send_start")
+        dropQueuedOutboundForChatLocked(chatId: chatId, reason: "bridge_send_start")
+        guard phoenixClient != nil, (state["connected"] as? Bool) == true else {
+          DispatchQueue.global(qos: .utility).async { [weak self] in
+            self?.ensureNativeTransport(trigger: "bridge_send_no_socket")
+          }
+          return failVolatileBridgeSendLocked(
+            chatId: chatId,
+            messageId: messageId,
+            reason: "no_native_socket",
+            provider: bridgeProvider
+          )
+        }
+        guard nativeJoinedChatIds.contains(chatId) else {
+          joinNativeChatTopicIfNeededLocked(chatId: chatId)
+          DispatchQueue.global(qos: .utility).async { [weak self] in
+            self?.ensureNativeTransport(trigger: "bridge_send_chat_not_joined")
+          }
+          return failVolatileBridgeSendLocked(
+            chatId: chatId,
+            messageId: messageId,
+            reason: "chat_not_joined",
+            provider: bridgeProvider
+          )
+        }
+      }
 
       // ── Build + emit optimistic row FIRST so message bubble appears instantly ──
       let optimisticStartMs = nowMs()
@@ -2893,6 +3048,19 @@ final class ChatEngine {
           self.pendingOutboundDraftsByMessageId[messageId] = threadEffectivePayload
 
           guard let client = self.phoenixClient else {
+            if isVolatileBridgeSend {
+              _ = self.failVolatileBridgeSendLocked(
+                chatId: chatId,
+                messageId: messageId,
+                reason: "no_native_socket",
+                provider: bridgeProvider
+              )
+              self.scheduleReconnectLocked(reason: "bridge_send_no_socket")
+              DispatchQueue.global(qos: .utility).async { [weak self] in
+                self?.ensureNativeTransport(trigger: "bridge_send_no_socket")
+              }
+              return
+            }
             self.upsertLocalStatusLocked(chatId: chatId, messageId: messageId, status: "pending")
             self.queueOutboundDraftLocked(
               chatId: chatId, messageId: messageId, payload: threadEffectivePayload,
@@ -2909,6 +3077,19 @@ final class ChatEngine {
 
           guard self.nativeJoinedChatIds.contains(chatId) else {
             self.joinNativeChatTopicIfNeededLocked(chatId: chatId)
+            if isVolatileBridgeSend {
+              _ = self.failVolatileBridgeSendLocked(
+                chatId: chatId,
+                messageId: messageId,
+                reason: "chat_not_joined",
+                provider: bridgeProvider
+              )
+              self.scheduleReconnectLocked(reason: "bridge_send_chat_not_joined")
+              DispatchQueue.global(qos: .utility).async { [weak self] in
+                self?.ensureNativeTransport(trigger: "bridge_send_chat_not_joined")
+              }
+              return
+            }
             self.upsertLocalStatusLocked(chatId: chatId, messageId: messageId, status: "pending")
             self.queueOutboundDraftLocked(
               chatId: chatId, messageId: messageId, payload: threadEffectivePayload,
@@ -2932,6 +3113,20 @@ final class ChatEngine {
           self.queue.asyncAfter(deadline: .now() + 15.0) { [weak self] in
             guard let self = self else { return }
             if let pending = self.nativePendingMessagePushRefs.removeValue(forKey: timeoutRef) {
+              let timeoutProvider = self.bridgeProviderForChatLocked(chatId: pending.chatId)
+              if let timeoutProvider {
+                _ = self.failVolatileBridgeSendLocked(
+                  chatId: pending.chatId,
+                  messageId: pending.messageId,
+                  reason: "send_timeout",
+                  provider: timeoutProvider
+                )
+                self.scheduleReconnectLocked(reason: "bridge_send_timeout")
+                DispatchQueue.global(qos: .utility).async { [weak self] in
+                  self?.ensureNativeTransport(trigger: "bridge_send_timeout")
+                }
+                return
+              }
               if let draft = self.pendingOutboundDraftsByMessageId[pending.messageId] {
                 self.queueOutboundDraftLocked(
                   chatId: pending.chatId,
@@ -4287,7 +4482,7 @@ final class ChatEngine {
       progressNodes.reversed().first(where: { node in
         ((normalizedString(node["kind"] ?? node["itemType"]) ?? "").lowercased()) != "text"
       }).flatMap { normalizedString($0["label"] ?? $0["title"]) }
-      ?? progressNodes.reversed().lazy.compactMap { node in
+      ?? progressNodes.reversed().compactMap { node in
         normalizedString(node["label"] ?? node["title"])
       }.first
       ?? "Running task"
@@ -4591,8 +4786,7 @@ final class ChatEngine {
         pinnedMessagesByChatId.removeAll()
         pinnedFetchInFlightChatIds.removeAll()
         historyLoadingChats.removeAll()
-        liveMessageRowsByChat.removeAll()
-        deletedMessageIdsByChat.removeAll()
+        clearSocketResetLiveRowsLocked()
       }
       if phoenixClient == nil {
         if transportMode == "bridge_text", let bridgeBaseURL {
@@ -4693,8 +4887,7 @@ final class ChatEngine {
       self.pinnedMessagesByChatId.removeAll()
       self.pinnedFetchInFlightChatIds.removeAll()
       self.historyLoadingChats.removeAll()
-      self.liveMessageRowsByChat.removeAll()
-      self.deletedMessageIdsByChat.removeAll()
+      self.clearSocketResetLiveRowsLocked()
       for chatId in self.openChatChannels.keys {
         self.joinNativeChatTopicIfNeededLocked(chatId: chatId)
       }
@@ -4711,6 +4904,15 @@ final class ChatEngine {
     queue.async {
       let inFlightMessages = Array(self.nativePendingMessagePushRefs.values)
       for pending in inFlightMessages {
+        if let provider = self.bridgeProviderForChatLocked(chatId: pending.chatId) {
+          _ = self.failVolatileBridgeSendLocked(
+            chatId: pending.chatId,
+            messageId: pending.messageId,
+            reason: "socket_closed",
+            provider: provider
+          )
+          continue
+        }
         self.upsertLocalStatusLocked(
           chatId: pending.chatId, messageId: pending.messageId, status: "pending")
         if let draft = self.pendingOutboundDraftsByMessageId[pending.messageId] {
@@ -4734,8 +4936,7 @@ final class ChatEngine {
       self.pinnedMessagesByChatId.removeAll()
       self.pinnedFetchInFlightChatIds.removeAll()
       self.historyLoadingChats.removeAll()
-      self.liveMessageRowsByChat.removeAll()
-      self.deletedMessageIdsByChat.removeAll()
+      self.clearSocketResetLiveRowsLocked()
       self.state["connected"] = false
       self.state["state"] = "native-socket-closed"
       self.state["updatedAt"] = self.nowMs()
@@ -4762,6 +4963,15 @@ final class ChatEngine {
       if shouldForceReconnect {
         let inFlightMessages = Array(self.nativePendingMessagePushRefs.values)
         for pending in inFlightMessages {
+          if let provider = self.bridgeProviderForChatLocked(chatId: pending.chatId) {
+            _ = self.failVolatileBridgeSendLocked(
+              chatId: pending.chatId,
+              messageId: pending.messageId,
+              reason: "socket_error",
+              provider: provider
+            )
+            continue
+          }
           self.upsertLocalStatusLocked(
             chatId: pending.chatId, messageId: pending.messageId, status: "pending")
           if let draft = self.pendingOutboundDraftsByMessageId[pending.messageId] {
@@ -4928,6 +5138,14 @@ final class ChatEngine {
           if status == "ok" {
             self.removeQueuedOutboundDraftLocked(
               chatId: pending.chatId, messageId: pending.messageId, dropDraft: true)
+          } else if let provider = self.bridgeProviderForChatLocked(chatId: pending.chatId) {
+            _ = self.failVolatileBridgeSendLocked(
+              chatId: pending.chatId,
+              messageId: pending.messageId,
+              reason: "push_\(status.isEmpty ? "error" : status)",
+              provider: provider
+            )
+            return
           }
           self.upsertLocalStatusLocked(
             chatId: pending.chatId, messageId: pending.messageId, status: nextStatus)
@@ -5500,10 +5718,79 @@ final class ChatEngine {
   /// server never sends a `peerAgentId` for them — we recognize the ids here so a
   /// DM with them routes as an agent (cleartext) instead of being E2E-encrypted to
   /// a non-existent friend key, which silently drops the prompt into the chat.
+  private static let claudeBridgeAgentUserId = "11111111-1111-1111-1111-111111111111"
+  private static let codexBridgeAgentUserId = "22222222-2222-2222-2222-222222222222"
   private static let reservedBridgeAgentUserIds: Set<String> = [
-    "11111111-1111-1111-1111-111111111111",
-    "22222222-2222-2222-2222-222222222222",
+    claudeBridgeAgentUserId,
+    codexBridgeAgentUserId,
   ]
+
+  private static let bridgeAgentProvidersByUserId: [String: String] = [
+    claudeBridgeAgentUserId: "claude",
+    codexBridgeAgentUserId: "codex",
+  ]
+
+  private func bridgeProviderForAgentIdentifier(_ raw: String?) -> String? {
+    guard let value = normalizedString(raw)?.lowercased() else { return nil }
+    switch value {
+    case "claude", Self.claudeBridgeAgentUserId:
+      return "claude"
+    case "codex", Self.codexBridgeAgentUserId:
+      return "codex"
+    default:
+      return nil
+    }
+  }
+
+  private func bridgeProviderForMetadata(_ metadata: [String: Any]) -> String? {
+    bridgeProviderForAgentIdentifier(
+      normalizedString(metadata["agentBridgeProvider"] ?? metadata["agent_bridge_provider"] ?? metadata["provider"]))
+  }
+
+  private func bridgeProviderForChatLocked(
+    chatId: String?,
+    peerUserId: String? = nil,
+    peerAgentId: String? = nil,
+    metadata: [String: Any] = [:]
+  ) -> String? {
+    if let provider = bridgeProviderForMetadata(metadata) {
+      return provider
+    }
+    if let provider = bridgeProviderForAgentIdentifier(peerAgentId) {
+      return provider
+    }
+    if let peer = normalizedString(peerUserId)?.lowercased(),
+      let provider = Self.bridgeAgentProvidersByUserId[peer]
+    {
+      return provider
+    }
+    guard let chatId, !chatId.isEmpty else { return nil }
+    if let cachedAgentId = chatPeerAgentIdsByChatId[chatId],
+      let provider = bridgeProviderForAgentIdentifier(cachedAgentId)
+    {
+      return provider
+    }
+    if let cachedPeer = chatPeerUserIdsByChatId[chatId]?.lowercased(),
+      let provider = Self.bridgeAgentProvidersByUserId[cachedPeer]
+    {
+      return provider
+    }
+    return nil
+  }
+
+  private func isVolatileBridgeAgentChatLocked(
+    chatId: String?,
+    peerUserId: String? = nil,
+    peerAgentId: String? = nil,
+    metadata: [String: Any] = [:]
+  ) -> Bool {
+    bridgeProviderForChatLocked(
+      chatId: chatId,
+      peerUserId: peerUserId,
+      peerAgentId: peerAgentId,
+      metadata: metadata
+    ) != nil
+  }
 
   private func resolvePeerAgentIdLocked(chatId: String, peerUserIdHint: String?) -> String? {
     if let cached = chatPeerAgentIdsByChatId[chatId], !cached.isEmpty {
@@ -6879,6 +7166,15 @@ final class ChatEngine {
   private func queueOutboundDraftLocked(
     chatId: String, messageId: String, payload: [String: Any], reason: String
   ) {
+    if let provider = bridgeProviderForOutboundDraftLocked(payload, fallbackChatId: chatId) {
+      _ = failVolatileBridgeSendLocked(
+        chatId: chatId,
+        messageId: messageId,
+        reason: reason,
+        provider: provider
+      )
+      return
+    }
     pendingOutboundDraftsByMessageId[messageId] = payload
     var ids = pendingOutboundQueueByChat[chatId] ?? []
     if ids.contains(messageId) { return }
@@ -6936,6 +7232,10 @@ final class ChatEngine {
   }
 
   private func scheduleReplayQueuedOutboundLocked(chatId: String, trigger: String) {
+    if isVolatileBridgeAgentChatLocked(chatId: chatId) {
+      dropQueuedOutboundForChatLocked(chatId: chatId, reason: "replay_\(trigger)")
+      return
+    }
     let ids = pendingOutboundQueueByChat[chatId] ?? []
     guard !ids.isEmpty else { return }
     NSLog(
@@ -7491,6 +7791,10 @@ final class ChatEngine {
 
   private func restoreCachedHistoryRowsLocked(chatId: String) -> Bool {
     guard !chatId.isEmpty else { return false }
+    if isVolatileBridgeAgentChatLocked(chatId: chatId) {
+      clearVolatileBridgeHistoryLocked(chatId: chatId, reason: "restore_cache")
+      return false
+    }
     if historyRowsByChat[chatId] != nil, historyFullyLoadedChats.contains(chatId) {
       return true
     }
@@ -7518,6 +7822,10 @@ final class ChatEngine {
   }
 
   private func storeCachedHistoryRowsLocked(chatId: String, rows: [[String: Any]]) {
+    if isVolatileBridgeAgentChatLocked(chatId: chatId) {
+      clearVolatileBridgeHistoryLocked(chatId: chatId, reason: "store_cache")
+      return
+    }
     guard !chatId.isEmpty, !rows.isEmpty, let cacheKey = chatHistoryCacheKeyLocked(chatId: chatId)
     else { return }
     let limitedRows = Array(rows.suffix(chatHistoryCacheRowLimit))
@@ -7548,6 +7856,29 @@ final class ChatEngine {
     UserDefaults.standard.synchronize()
   }
 
+  private func clearVolatileBridgeHistoryLocked(chatId: String, reason: String) {
+    guard !chatId.isEmpty else { return }
+    historyLoadingChats.remove(chatId)
+    historyRowsByChat.removeValue(forKey: chatId)
+    historyFullyLoadedChats.remove(chatId)
+    historyRowsRestoredFromCacheChats.remove(chatId)
+    agentBridgeHistoryByChat.removeValue(forKey: chatId)
+    clearCachedHistoryRowsLocked(chatId: chatId)
+    appendJournalLocked(
+      event: "native-bridge-history-cleared",
+      payload: ["chatId": chatId, "reason": reason]
+    )
+  }
+
+  private func clearSocketResetLiveRowsLocked() {
+    liveMessageRowsByChat = liveMessageRowsByChat.filter { chatId, _ in
+      isVolatileBridgeAgentChatLocked(chatId: chatId)
+    }
+    deletedMessageIdsByChat = deletedMessageIdsByChat.filter { chatId, _ in
+      isVolatileBridgeAgentChatLocked(chatId: chatId)
+    }
+  }
+
   private func cacheKeyComponent(_ value: String) -> String {
     let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
     let mapped = trimmed.unicodeScalars.map { scalar -> Character in
@@ -7559,7 +7890,9 @@ final class ChatEngine {
 
   private func loadChatHistoryIfNeededLocked(chatId: String, force: Bool = false) {
     guard !chatId.isEmpty else { return }
-    guard !isBuiltInAgentChatId(chatId) else {
+    guard !isBuiltInAgentChatId(chatId),
+      !isVolatileBridgeAgentChatLocked(chatId: chatId)
+    else {
       historyLoadingChats.remove(chatId)
       historyRowsByChat.removeValue(forKey: chatId)
       historyFullyLoadedChats.remove(chatId)
@@ -7567,9 +7900,9 @@ final class ChatEngine {
       clearCachedHistoryRowsLocked(chatId: chatId)
       appendJournalLocked(
         event: "native-chat-history-skip",
-        payload: ["chatId": chatId, "reason": "built_in_agent_surface"]
+        payload: ["chatId": chatId, "reason": "agent_surface"]
       )
-      NSLog("[ChatEngine] loadChatHistory SKIP chatId=%@ reason=built_in_agent_surface", chatId)
+      NSLog("[ChatEngine] loadChatHistory SKIP chatId=%@ reason=agent_surface", chatId)
       return
     }
     if historyLoadingChats.contains(chatId) { return }
@@ -7709,6 +8042,10 @@ final class ChatEngine {
   }
 
   private func applyChatHistoryResponseLocked(chatId: String, data: Data) {
+    if isVolatileBridgeAgentChatLocked(chatId: chatId) {
+      clearVolatileBridgeHistoryLocked(chatId: chatId, reason: "history_response")
+      return
+    }
     guard let object = try? JSONSerialization.jsonObject(with: data) else {
       appendJournalLocked(
         event: "native-chat-history-load-error",

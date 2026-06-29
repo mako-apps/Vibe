@@ -3936,7 +3936,12 @@ function markDetailLiveTurn(result, provider, sessionId, chatId) {
   const last = msgs[msgs.length - 1];
   if (last && last.role === "assistant") {
     markMessageRunning(last);
-    unfoldRunningMessageText(last);
+    // NOTE: we deliberately do NOT fold the turn's narration "text" nodes out of
+    // progressNodes into message.text here. The phone SUPPRESSES the message body
+    // while a turn is live, so moving prose into the body made live turns render
+    // "commands only" (no narration). Keeping the text nodes inside progressNodes
+    // lets the live feed interleave them with the tool steps (Read → text → Edit),
+    // matching the agent-stream live path and the finished "Worked" card.
     return true;
   }
   return false;
@@ -3955,30 +3960,6 @@ function markMessageRunning(message) {
     node.status = "running";
     break;
   }
-  return message;
-}
-
-function unfoldRunningMessageText(message) {
-  if (!message || typeof message !== "object" || message.running !== true) return message;
-  const nodes = Array.isArray(message.progressNodes) ? message.progressNodes : [];
-  if (!nodes.length) return message;
-
-  const textParts = [];
-  const toolNodes = [];
-  for (const node of nodes) {
-    if (node && typeof node === "object" && String(node.kind || "").trim().toLowerCase() === "text") {
-      const text = String(node.label || "").trim();
-      if (text) textParts.push(text);
-    } else {
-      toolNodes.push(node);
-    }
-  }
-  if (!textParts.length) return message;
-
-  const current = String(message.text || "").trim();
-  if (current) textParts.push(current);
-  message.text = textParts.join("\n\n");
-  message.progressNodes = toolNodes;
   return message;
 }
 
@@ -4066,7 +4047,9 @@ function startHistoryWatch(channel, { chatId, provider, sessionId, echo }) {
         let last = msgs.length ? msgs[msgs.length - 1] : null;
         if (running && last && last.role === "assistant") {
           markMessageRunning(last);
-          unfoldRunningMessageText(last);
+          // Keep narration "text" nodes inside progressNodes (see markDetailLiveTurn):
+          // the phone interleaves them with the tool steps in the live feed. Folding
+          // them into message.text hid them, because the live body is suppressed.
         } else if (runningEntry) {
           const placeholder = runningPlaceholderMessage(runningEntry);
           if (placeholder) {
@@ -4074,9 +4057,17 @@ function startHistoryWatch(channel, { chatId, provider, sessionId, echo }) {
             last = placeholder;
           }
         }
+        // The live feed grows by appending progress NODES (a new Read/Edit/Run step or
+        // an interior narration "text" node) as well as by the trailing summary text
+        // growing. Fold the node count into the dedup signature so each new step
+        // re-pushes — keying on text length alone left the feed frozen between the
+        // narration paragraphs that bracket a burst of tool calls.
         const sig =
           msgs.length + ":" +
-          (last ? (last.uid || "") + ":" + String(last.text || "").length : 0) +
+          (last
+            ? (last.uid || "") + ":" + String(last.text || "").length +
+              ":" + (Array.isArray(last.progressNodes) ? last.progressNodes.length : 0)
+            : 0) +
           ":" + (running ? "run" : "done");
         if (sig !== rec.lastSig) {
           rec.lastSig = sig;

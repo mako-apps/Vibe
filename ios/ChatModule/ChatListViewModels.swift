@@ -1298,10 +1298,34 @@ func chatListRowContentEqual(_ lhs: ChatListRow, _ rhs: ChatListRow) -> Bool {
 }
 
 private func parseAgentProgressNodes(_ raw: Any?) -> [ChatListRow.AgentProgressNode] {
-  guard let items = raw as? [[String: Any]] else { return [] }
+  guard let items = raw as? [[String: Any]] else {
+    // DIAGNOSTIC (text-in-live-feed): the payload isn't even an array of dicts.
+    if raw != nil {
+      NSLog(
+        "[AgentNodes] raw NOT [[String:Any]] type=%@",
+        String(describing: type(of: raw!)))
+    }
+    return []
+  }
 
-  return items.compactMap { item in
-    guard let label = parseNonEmptyString(item["label"]) else { return nil }
+  // DIAGNOSTIC (text-in-live-feed): a node with no `label` is dropped by the guard
+  // below. If the bridge carries narration prose in a different key (e.g. "text" /
+  // "content" / "message") and leaves `label` empty, every "text" step vanishes here
+  // — which reads on screen as "only commands, no text". Log each dropped node's kind
+  // + available keys so we can see exactly which field the prose is hiding in.
+  var dropped: [String] = []
+  let nodes: [ChatListRow.AgentProgressNode] = items.compactMap { item in
+    guard let label = parseNonEmptyString(item["label"]) else {
+      let kind = parseNonEmptyString(item["kind"]) ?? "?"
+      dropped.append(kind)
+      NSLog(
+        "[AgentNodes] DROP kind=%@ keys=[%@] textKey=%@ contentKey=%@",
+        kind,
+        item.keys.sorted().joined(separator: ","),
+        String(describing: item["text"] ?? "—").prefix(48).description,
+        String(describing: item["content"] ?? "—").prefix(48).description)
+      return nil
+    }
     let id = parseNonEmptyString(item["id"]) ?? UUID().uuidString
     let status = parseNonEmptyString(item["status"]) ?? "running"
     let depth = Int(parseLong(item["depth"]) ?? 0)
@@ -1321,6 +1345,18 @@ private func parseAgentProgressNodes(_ raw: Any?) -> [ChatListRow.AgentProgressN
       subagentType: parseNonEmptyString(item["subagentType"])
     )
   }
+
+  // DIAGNOSTIC (text-in-live-feed): one summary per parse — how many text nodes
+  // survived vs. were dropped. textKept=0 with raw>0 means the prose never arrives
+  // as a node at all (it's in the message body, suppressed mid-stream).
+  let textKept = nodes.filter { $0.kind == "text" }.count
+  if !items.isEmpty {
+    NSLog(
+      "[AgentNodes] parsed raw=%d kept=%d textKept=%d dropped=[%@] kinds=[%@]",
+      items.count, nodes.count, textKept, dropped.joined(separator: ","),
+      nodes.map { $0.kind ?? "nil" }.joined(separator: ","))
+  }
+  return nodes
 }
 
 // Module-internal (not file-private) so the agent-bridge history renderer can

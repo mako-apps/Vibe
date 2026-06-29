@@ -126,7 +126,7 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
   // Per-step inline expansion: which node ids have their detail layer open, plus the
   // tap-up hook that asks the host to toggle one (it flips the set + re-measures).
   var onStepTap: ((String) -> Void)?
-  // Tapping a "🤖 Subagent" row asks the host to open the read-only subagent view
+  // Tapping a "Subagent" row asks the host to open the read-only subagent view
   // for that parent Task node id (no inline expand — it's its own view).
   var onOpenSubagent: ((String) -> Void)?
   private var subagentChildren: [String: [VibeAgentKitProgressItem]] = [:]
@@ -134,6 +134,13 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
   // True while the turn is live: the work band + answer read as one continuous,
   // growing feed, so the gaps between them stay tight (no big void mid-stream).
   private var isLiveTurn = false
+  // Persistent feed views for the LIVE interleaved feed, keyed by node identity. The
+  // streaming path reuses these across frames instead of tearing the feed down and
+  // rebuilding it (which created a fresh streaming label every delta → the whole
+  // narration re-faded in each frame, looked batched, and flickered). Cleared by
+  // `clearStepsList()` when the turn finishes / the cell is reused.
+  private var liveFeedViewsByKey: [String: UIView] = [:]
+  private var liveFeedHeightByKey: [String: NSLayoutConstraint] = [:]
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -165,6 +172,8 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
       stepsStack.removeArrangedSubview($0)
       $0.removeFromSuperview()
     }
+    liveFeedViewsByKey.removeAll()
+    liveFeedHeightByKey.removeAll()
     stepsStack.isHidden = true
   }
 
@@ -230,14 +239,150 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
       row.translatesAutoresizingMaskIntoConstraints = false
       row.configure(
         item: item,
-        // A live feed shows compact previews only (no inline detail — taps are off
-        // until the turn is done); a finished feed makes each row tap-to-open.
+        // Finished feed: each row is a one-line preview that taps open to its detail
+        // (command output / diff / file slice). The live feed has its own builder
+        // (`updateStreamingStepsList`) that also makes rows tappable mid-run.
         expanded: interactive && expandedStepIds.contains(nodeId),
         interactive: interactive,
         appearance: appearance
       )
       row.onToggle = interactive ? { [weak self] in self?.onStepTap?(nodeId) } : nil
       stepsStack.addArrangedSubview(row)
+    }
+    stepsStack.isHidden = false
+  }
+
+  /// Incremental builder for the LIVE interleaved feed (narration text + tool steps).
+  /// Unlike `updateStepsList`, this REUSES the per-node views across streaming frames
+  /// (keyed by stable identity) instead of clearing + rebuilding. That is what makes the
+  /// streaming narration label persist so it reveals ONLY the newly-arrived characters —
+  /// rebuilding it every frame re-faded the whole accumulated prose (the "old text fades
+  /// in alongside the new / batched / flicker" bug). Narration nodes only append, so an
+  /// ordinal key is stable; tool/task nodes key on their node id.
+  private func updateStreamingStepsList(
+    _ items: [VibeAgentKitProgressItem],
+    appearance: VibeAgentKitChatAppearance,
+    availableWidth: CGFloat
+  ) {
+    let renderable = items.filter { item in
+      if item.itemType == "text" {
+        return !item.label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      }
+      return true
+    }
+    guard !renderable.isEmpty else { clearStepsList(); return }
+
+    stepsStack.spacing = 9.0
+    stepsStack.layoutMargins = UIEdgeInsets(top: 4.0, left: 8.0, bottom: 5.0, right: 0.0)
+
+    let font = UIFont.systemFont(ofSize: 18.0, weight: .regular)
+    let lineHeight: CGFloat = 27.5
+    let color = appearance.text
+    let contentWidth = max(
+      120.0, availableWidth - stepsStack.layoutMargins.left - stepsStack.layoutMargins.right)
+
+    var orderedKeys: [String] = []
+    var textOrdinal = 0
+    for item in renderable {
+      if item.itemType == "text" {
+        let key = "text#\(textOrdinal)"
+        textOrdinal += 1
+        orderedKeys.append(key)
+        let narration = item.label.trimmingCharacters(in: .whitespacesAndNewlines)
+        let label: VibeAgentKitStreamingTextLabel
+        if let existing = liveFeedViewsByKey[key] as? VibeAgentKitStreamingTextLabel {
+          label = existing
+        } else {
+          label = VibeAgentKitStreamingTextLabel()
+          label.translatesAutoresizingMaskIntoConstraints = false
+          label.numberOfLines = 0
+          label.backgroundColor = .clear
+          liveFeedViewsByKey[key] = label
+        }
+        let attributed = VibeAgentKitTextRenderer.makeAttributedText(
+          text: narration, font: font, textColor: color, lineHeight: lineHeight)
+        let measured = VibeAgentKitTextRenderer.measuredSize(for: attributed, width: contentWidth)
+        let height = max(ceil(font.lineHeight), measured.height)
+        if let heightConstraint = liveFeedHeightByKey[key] {
+          heightConstraint.constant = height
+        } else {
+          let heightConstraint = label.heightAnchor.constraint(equalToConstant: height)
+          heightConstraint.priority = .defaultHigh
+          heightConstraint.isActive = true
+          liveFeedHeightByKey[key] = heightConstraint
+        }
+        // Same label instance across frames → only the appended characters fade in.
+        label.applyStreamingText(attributed, rawText: narration, isStreaming: true)
+        continue
+      }
+
+      let nodeId = item.nodeId ?? item.label
+      if item.itemType == "task" {
+        let key = "task#\(nodeId)"
+        orderedKeys.append(key)
+        let subagentRow: VibeAgentKitSubagentRowView
+        if let existing = liveFeedViewsByKey[key] as? VibeAgentKitSubagentRowView {
+          subagentRow = existing
+        } else {
+          subagentRow = VibeAgentKitSubagentRowView()
+          subagentRow.translatesAutoresizingMaskIntoConstraints = false
+          liveFeedViewsByKey[key] = subagentRow
+        }
+        let running = vibeAgentKitRunningStepStatuses.contains((item.status ?? "").lowercased())
+        let toolStepCount = subagentChildren[nodeId]?.filter { $0.itemType != "text" }.count ?? 0
+        subagentRow.configure(
+          type: item.subagentType?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
+          stepCount: toolStepCount,
+          running: running,
+          appearance: appearance,
+          live: true)
+        subagentRow.onTap = { [weak self] in self?.onOpenSubagent?(nodeId) }
+        continue
+      }
+
+      let key = "tool#\(nodeId)"
+      orderedKeys.append(key)
+      let row: VibeAgentKitStepRowView
+      if let existing = liveFeedViewsByKey[key] as? VibeAgentKitStepRowView {
+        row = existing
+      } else {
+        row = VibeAgentKitStepRowView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+        liveFeedViewsByKey[key] = row
+      }
+      // Live rows are tappable mid-run: expanding one reveals the command + its output
+      // (or the diff / file slice) AS IT STREAMS, instead of waiting for the turn to
+      // finish. The header stays compact; expanded detail is the only part that grows.
+      // The expand state lives in `expandedStepIds` (owned by the host VC), so it
+      // survives the per-frame reconfigure and the row keeps showing the growing output.
+      row.configure(
+        item: item,
+        expanded: expandedStepIds.contains(nodeId),
+        interactive: true,
+        streaming: true,
+        appearance: appearance)
+      row.onToggle = { [weak self] in self?.onStepTap?(nodeId) }
+    }
+
+    // Drop cached views whose nodes are gone (rare mid-run, e.g. a coalesced feed).
+    // Collect the stale keys first — mutating the dictionary while iterating it is unsafe.
+    let keep = Set(orderedKeys)
+    let staleKeys = liveFeedViewsByKey.keys.filter { !keep.contains($0) }
+    for key in staleKeys {
+      if let view = liveFeedViewsByKey[key] {
+        stepsStack.removeArrangedSubview(view)
+        view.removeFromSuperview()
+      }
+      liveFeedViewsByKey.removeValue(forKey: key)
+      liveFeedHeightByKey.removeValue(forKey: key)
+    }
+    // Sync the stack's arranged order to the node order, reusing views in place.
+    for (index, key) in orderedKeys.enumerated() {
+      guard let view = liveFeedViewsByKey[key] else { continue }
+      if index < stepsStack.arrangedSubviews.count, stepsStack.arrangedSubviews[index] === view {
+        continue
+      }
+      stepsStack.insertArrangedSubview(view, at: min(index, stepsStack.arrangedSubviews.count))
     }
     stepsStack.isHidden = false
   }
@@ -465,16 +610,22 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
         progressItems
         .map { ($0.itemType ?? $0.tool ?? "step").lowercased() }
         .joined(separator: ",")
+      // DIAGNOSTIC (text-in-live-feed): textNodes = how many "text" prose steps reached
+      // the renderer; bodyLen = length of the suppressed answer body. If textNodes=0 but
+      // bodyLen>0, the narration is arriving as the message body (hidden mid-stream),
+      // not as feed nodes — so the live feed shows only commands.
+      let textNodes = progressItems.filter { $0.itemType == "text" }
+      let textChars = textNodes.reduce(0) { $0 + $1.label.count }
+      let bodyTrimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
       NSLog(
-        "[AgentFeed] live msg=%@ items=%d order=[%@] bodySuppressed=yes shimmer=%@",
+        "[AgentFeed] live msg=%@ items=%d order=[%@] textNodes=%d textChars=%d bodyLen=%d hasFinal=%@ bodyPreview=%@ shimmer=%@",
         messageId, progressItems.count, feedOrder,
+        textNodes.count, textChars, bodyTrimmed.count, hasFinalResponseText ? "Y" : "N",
+        String(bodyTrimmed.prefix(48)).replacingOccurrences(of: "\n", with: "⏎"),
         progressItems.last(where: { $0.itemType != "text" })?.label ?? "Thinking")
-      updateStepsList(
+      updateStreamingStepsList(
         progressItems,
-        expanded: hasDisplayText || !progressItems.isEmpty,
-        interactive: false,
         appearance: appearance,
-        streaming: true,
         availableWidth: availableWidth)
     } else {
       updateStepsList(
@@ -770,7 +921,6 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
 // inline (the subagent's own steps live in that separate view).
 private final class VibeAgentKitSubagentRowView: UIView {
   private let header = UIControl()
-  private let iconLabel = UILabel()
   private let titleLabel = UILabel()
   private let countLabel = UILabel()
   private let chevron = UIImageView()
@@ -803,12 +953,6 @@ private final class VibeAgentKitSubagentRowView: UIView {
     stack.isUserInteractionEnabled = false
     header.addSubview(stack)
 
-    iconLabel.translatesAutoresizingMaskIntoConstraints = false
-    iconLabel.font = UIFont.systemFont(ofSize: 13.0)
-    iconLabel.text = "🤖"
-    iconLabel.setContentHuggingPriority(.required, for: .horizontal)
-    iconLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
-
     titleLabel.translatesAutoresizingMaskIntoConstraints = false
     titleLabel.numberOfLines = 1
     titleLabel.lineBreakMode = .byTruncatingTail
@@ -829,7 +973,6 @@ private final class VibeAgentKitSubagentRowView: UIView {
     chevron.setContentHuggingPriority(.required, for: .horizontal)
     chevron.setContentCompressionResistancePriority(.required, for: .horizontal)
 
-    stack.addArrangedSubview(iconLabel)
     stack.addArrangedSubview(titleLabel)
     stack.addArrangedSubview(spinner)
     stack.addArrangedSubview(countLabel)
@@ -851,14 +994,18 @@ private final class VibeAgentKitSubagentRowView: UIView {
     type: String,
     stepCount: Int,
     running: Bool,
-    appearance: VibeAgentKitChatAppearance
+    appearance: VibeAgentKitChatAppearance,
+    live: Bool = false
   ) {
     let flavor = type.isEmpty ? "Subagent" : "Subagent · \(type)"
+    let titleColor = live
+      ? vibeAgentKitColorWithAlpha(appearance.textSecondary, appearance.isDark ? 0.78 : 0.68)
+      : appearance.text
     titleLabel.attributedText = NSAttributedString(
       string: flavor,
       attributes: [
-        .font: UIFont.systemFont(ofSize: 14.75, weight: .semibold),
-        .foregroundColor: appearance.text,
+        .font: UIFont.systemFont(ofSize: live ? 13.4 : 14.75, weight: .semibold),
+        .foregroundColor: titleColor,
       ])
     if stepCount > 0 {
       countLabel.text = stepCount == 1 ? "1 step" : "\(stepCount) steps"
@@ -867,10 +1014,10 @@ private final class VibeAgentKitSubagentRowView: UIView {
       countLabel.text = nil
       countLabel.isHidden = true
     }
-    countLabel.font = UIFont.systemFont(ofSize: 12.5, weight: .regular)
-    countLabel.textColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.8)
-    chevron.tintColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.6)
-    spinner.color = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.85)
+    countLabel.font = UIFont.systemFont(ofSize: live ? 11.8 : 12.5, weight: .regular)
+    countLabel.textColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, live ? 0.68 : 0.8)
+    chevron.tintColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, live ? 0.76 : 0.6)
+    spinner.color = vibeAgentKitColorWithAlpha(appearance.textSecondary, live ? 0.72 : 0.85)
     if running { spinner.startAnimating() } else { spinner.stopAnimating() }
   }
 }
@@ -944,22 +1091,29 @@ private final class VibeAgentKitStepRowView: UIView {
     item: VibeAgentKitProgressItem,
     expanded: Bool,
     interactive: Bool,
+    streaming: Bool = false,
     appearance: VibeAgentKitChatAppearance
   ) {
     let kind = (item.itemType ?? item.tool ?? "").lowercased()
     let isError = ["error", "failed", "failure"].contains((item.status ?? "").lowercased())
+    let wasExpanded = isExpandedState
+    let liveTextColor = vibeAgentKitColorWithAlpha(
+      appearance.textSecondary,
+      appearance.isDark ? 0.78 : 0.68
+    )
+    let previewTextColor = streaming ? liveTextColor : appearance.textSecondary
 
-    // Header preview ── bash shows its raw command (monospace, one line); everything
-    // else shows the compact verb/target label (read appends its line range).
+    // Header preview stays compact even in the live feed; the full command/output opens
+    // inside this row's detail area so the whole table does not balloon while streaming.
     if kind == "bash", let cmd = item.command, !cmd.isEmpty {
       titleLabel.numberOfLines = 1
       titleLabel.lineBreakMode = .byTruncatingTail
-      let oneLine = cmd.replacingOccurrences(of: "\n", with: " ")
+      let commandText = cmd.replacingOccurrences(of: "\n", with: " ")
       titleLabel.attributedText = NSAttributedString(
-        string: oneLine,
+        string: commandText,
         attributes: [
-          .font: UIFont.monospacedSystemFont(ofSize: 14.0, weight: .regular),
-          .foregroundColor: appearance.text,
+          .font: UIFont.monospacedSystemFont(ofSize: streaming ? 13.0 : 14.0, weight: .regular),
+          .foregroundColor: streaming ? liveTextColor : appearance.text,
         ]
       )
     } else {
@@ -974,18 +1128,19 @@ private final class VibeAgentKitStepRowView: UIView {
       para.lineBreakMode = .byTruncatingTail
       titleLabel.attributedText = VibeAgentKitAssistantMessageBodyView.styledStepLabel(
         labelText,
-        font: UIFont.systemFont(ofSize: 14.75, weight: .regular),
-        baseColor: appearance.textSecondary,
+        font: UIFont.systemFont(ofSize: streaming ? 13.4 : 14.75, weight: .regular),
+        baseColor: previewTextColor,
         paragraph: para
       )
     }
 
-    let expandable = interactive && Self.hasDetail(item, kind: kind)
-    chevron.isHidden = !expandable
-    header.isUserInteractionEnabled = expandable
-    if expandable {
+    let hasDetail = Self.hasDetail(item, kind: kind)
+    let canToggle = interactive && (hasDetail || streaming)
+    chevron.isHidden = !canToggle
+    header.isUserInteractionEnabled = canToggle
+    if canToggle {
       chevron.image = UIImage(systemName: "chevron.down")?.withRenderingMode(.alwaysTemplate)
-      chevron.tintColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.6)
+      chevron.tintColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, streaming ? 0.76 : 0.6)
       let target = expanded ? CGAffineTransform.identity : CGAffineTransform(rotationAngle: -CGFloat.pi / 2.0)
       if expanded != isExpandedState && chevron.window != nil {
         UIView.animate(withDuration: 0.2, delay: 0.0, options: [.beginFromCurrentState]) {
@@ -1001,16 +1156,66 @@ private final class VibeAgentKitStepRowView: UIView {
       isExpandedState = false
     }
 
+    guard expanded else {
+      detailStack.alpha = 1.0
+      if wasExpanded { animateDetailCollapseSnapshot() }
+      clearDetailStack()
+      detailStack.transform = .identity
+      detailStack.isHidden = true
+      return
+    }
+
+    clearDetailStack()
+    detailStack.alpha = 1.0
+    detailStack.transform = .identity
+    buildDetail(item: item, kind: kind, isError: isError, appearance: appearance)
+    if streaming && detailStack.arrangedSubviews.isEmpty {
+      detailStack.addArrangedSubview(caption("Waiting for details...", liveTextColor))
+    }
+    let hasVisibleDetail = !detailStack.arrangedSubviews.isEmpty
+    detailStack.isHidden = !hasVisibleDetail
+    guard hasVisibleDetail else { return }
+
+    if !wasExpanded, window != nil {
+      detailStack.transform = CGAffineTransform(translationX: 0.0, y: -8.0)
+      UIView.animate(
+        withDuration: 0.22,
+        delay: 0.0,
+        options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut]
+      ) {
+        self.detailStack.transform = .identity
+      }
+    } else {
+      detailStack.transform = .identity
+    }
+  }
+
+  private func clearDetailStack() {
     detailStack.arrangedSubviews.forEach {
       detailStack.removeArrangedSubview($0)
       $0.removeFromSuperview()
     }
-    guard expanded else {
-      detailStack.isHidden = true
-      return
+  }
+
+  private func animateDetailCollapseSnapshot() {
+    guard window != nil,
+      !detailStack.isHidden,
+      detailStack.bounds.width > 0.0,
+      detailStack.bounds.height > 0.0,
+      let snapshot = detailStack.snapshotView(afterScreenUpdates: false)
+    else { return }
+    snapshot.frame = detailStack.convert(detailStack.bounds, to: self)
+    snapshot.isUserInteractionEnabled = false
+    addSubview(snapshot)
+    UIView.animate(
+      withDuration: 0.18,
+      delay: 0.0,
+      options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseIn]
+    ) {
+      snapshot.transform = CGAffineTransform(translationX: 0.0, y: -8.0)
+    } completion: { _ in
+      snapshot.removeFromSuperview()
     }
-    buildDetail(item: item, kind: kind, isError: isError, appearance: appearance)
-    detailStack.isHidden = detailStack.arrangedSubviews.isEmpty
   }
 
   private static func hasDetail(_ item: VibeAgentKitProgressItem, kind: String) -> Bool {
@@ -1494,7 +1699,10 @@ final class VibeAgentKitMessageCell: UITableViewCell {
   private var rowBottomConstraint: NSLayoutConstraint!
   private var currentIsUser = false
   private var storedMessageText: String = ""
-  private let userCollapsedTextMaxHeight: CGFloat = 240.0
+  private var previousUserTextExpanded: Bool?
+  // A long user message collapses to this height (~5 lines) with a chevron to expand —
+  // so a pasted wall of text can't dominate the screen and shove the answer off-screen.
+  private let userCollapsedTextMaxHeight: CGFloat = 150.0
 
   var onAction: ((VibeAgentKitMessageAction) -> Void)? {
     didSet {
@@ -1547,7 +1755,11 @@ final class VibeAgentKitMessageCell: UITableViewCell {
     messageContainerView.layer.mask = nil
     currentIsUser = false
     storedMessageText = ""
+    previousUserTextExpanded = nil
     userExpandButton.isHidden = true
+    userExpandButton.transform = .identity
+    userTextView.alpha = 1.0
+    userTextView.transform = .identity
     userAttachmentGrid.isHidden = true
     // Restore bubble transform / anchor in case the cell is reused while held
     setBubbleHeld(false, animated: false)
@@ -1692,11 +1904,47 @@ final class VibeAgentKitMessageCell: UITableViewCell {
 
       if isCollapsible {
         userExpandButton.isHidden = false
+        // A small, light chevron — not the default body-sized glyph, which read as an
+        // oversized SVG sitting in the corner of the bubble.
+        let chevronConfig = UIImage.SymbolConfiguration(pointSize: 12.0, weight: .medium)
+        let previousExpanded = previousUserTextExpanded
         userExpandButton.setImage(
-          UIImage(systemName: isTextExpanded ? "chevron.up" : "chevron.down")?
+          UIImage(systemName: "chevron.down")?
+            .withConfiguration(chevronConfig)
             .withRenderingMode(.alwaysTemplate),
           for: .normal
         )
+        let chevronTransform = isTextExpanded
+          ? CGAffineTransform(rotationAngle: .pi)
+          : .identity
+        if let previousExpanded, previousExpanded != isTextExpanded, userExpandButton.window != nil {
+          UIView.animate(
+            withDuration: 0.2,
+            delay: 0.0,
+            options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut]
+          ) {
+            self.userExpandButton.transform = chevronTransform
+          }
+        } else {
+          userExpandButton.transform = chevronTransform
+        }
+        if let previousExpanded, previousExpanded != isTextExpanded, userTextView.window != nil {
+          userTextView.transform = CGAffineTransform(
+            translationX: 0.0,
+            y: isTextExpanded ? -8.0 : 8.0
+          )
+          UIView.animate(
+            withDuration: 0.22,
+            delay: 0.0,
+            options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut]
+          ) {
+            self.userTextView.transform = .identity
+          }
+        } else {
+          userTextView.alpha = 1.0
+          userTextView.transform = .identity
+        }
+        previousUserTextExpanded = isTextExpanded
         userExpandButton.tintColor = vibeAgentKitColorWithAlpha(
           userBubbleTextColor(for: appearance),
           appearance.isDark ? 0.72 : 0.58
@@ -1709,6 +1957,10 @@ final class VibeAgentKitMessageCell: UITableViewCell {
           userExpandWidthConstraint,
         ])
       } else {
+        previousUserTextExpanded = nil
+        userExpandButton.transform = .identity
+        userTextView.alpha = 1.0
+        userTextView.transform = .identity
         userConstraints.append(userBottomConstraint)
       }
       NSLayoutConstraint.activate(userConstraints)

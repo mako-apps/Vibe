@@ -345,6 +345,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   private var tableBottomConstraint: NSLayoutConstraint?
   private var composerBottomConstraint: NSLayoutConstraint?
   private var composerHeightConstraint: NSLayoutConstraint?
+  private var toggleScrollLockDepth = 0
   private var changeObserver: NSObjectProtocol?
   private var keyboardObservers: [NSObjectProtocol] = []
   private let bottomEdgeFadeView = UIView()
@@ -359,7 +360,6 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   // Subagent (Claude Task tool) surfacing: a top toast announces a subagent starting,
   // and tapping it (or its feed row) opens a read-only detail view of its steps.
   private let subagentToastBlur = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterial))
-  private let subagentToastIcon = UILabel()
   private let subagentToastLabel = UILabel()
   private var subagentToastTarget: (messageId: String, nodeId: String)?
   private var subagentToastHideWork: DispatchWorkItem?
@@ -449,17 +449,9 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   private let emptyStateIcon = UIImageView()
   private let emptyStateTitle = UILabel()
   private let emptyStateSubtitle = UILabel()
-  private var loadingTimeout: DispatchWorkItem?
+  private let emptyStateVisibleGuide = UILayoutGuide()
   var isLoadingTranscript = false {
     didSet {
-      loadingTimeout?.cancel()
-      if isLoadingTranscript {
-        // Never spin forever — fall back to the (blank) empty state if nothing lands.
-        // A session with no history shouldn't sit on a spinner, so keep this short.
-        let work = DispatchWorkItem { [weak self] in self?.isLoadingTranscript = false }
-        loadingTimeout = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 7, execute: work)
-      }
       updateLoadingOverlay()
       updateUsageBanner()
     }
@@ -840,16 +832,24 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       commandOverlayView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 18.0),
       commandOverlayView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -18.0),
       commandOverlayView.bottomAnchor.constraint(equalTo: composerView.topAnchor, constant: -10.0),
-      emptyStateView.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-      emptyStateView.centerYAnchor.constraint(
-        equalTo: view.safeAreaLayoutGuide.centerYAnchor, constant: -32.0),
-      emptyStateView.leadingAnchor.constraint(
-        greaterThanOrEqualTo: view.leadingAnchor, constant: 40.0),
-      emptyStateView.trailingAnchor.constraint(
-        lessThanOrEqualTo: view.trailingAnchor, constant: -40.0),
-      emptyStateView.topAnchor.constraint(
-        greaterThanOrEqualTo: view.safeAreaLayoutGuide.topAnchor, constant: 20.0),
     ])
+
+    view.addLayoutGuide(emptyStateVisibleGuide)
+    NSLayoutConstraint.activate([
+      emptyStateVisibleGuide.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+      emptyStateVisibleGuide.bottomAnchor.constraint(equalTo: composerView.topAnchor),
+      emptyStateVisibleGuide.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      emptyStateVisibleGuide.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+
+      emptyStateView.centerXAnchor.constraint(equalTo: emptyStateVisibleGuide.centerXAnchor),
+      emptyStateView.centerYAnchor.constraint(
+        equalTo: emptyStateVisibleGuide.centerYAnchor, constant: -16.0),
+      emptyStateView.leadingAnchor.constraint(
+        greaterThanOrEqualTo: emptyStateVisibleGuide.leadingAnchor, constant: 40.0),
+      emptyStateView.trailingAnchor.constraint(
+        lessThanOrEqualTo: emptyStateVisibleGuide.trailingAnchor, constant: -40.0),
+    ])
+
     updateEmptyState()
 
     bottomEdgeFadeView.translatesAutoresizingMaskIntoConstraints = false
@@ -938,8 +938,10 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     }
 
     let wasNearBottom = isNearBottom()
-    // Capture the pre-update rendered ids (bridge commands excluded) for pure-append check.
-    let oldTableIds = tableMessages.map(\.id)
+    // Capture the pre-update rendered rows (bridge commands excluded) for the pure-append
+    // check and to diff per-row content on the in-place streaming path.
+    let oldTableMessages = tableMessages
+    let oldTableIds = oldTableMessages.map(\.id)
     messages = newMessages
     let liveIds = Set(newMessages.map(\.id))
     expandedTextMessageIds = expandedTextMessageIds.filter { liveIds.contains($0) }
@@ -977,6 +979,8 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       pushToTopUserId = nil
       pushToTopReserve = 0
     }
+    // A streaming delta to the SAME rows (ids unchanged) is the common live case.
+    let isContentOnlyUpdate = !newTableIds.isEmpty && newTableIds == oldTableIds
     if isHistoryPicked, isPureAppend, tableView.window != nil, tableView.numberOfRows(inSection: 0) == oldTableIds.count {
       let inserted = (oldTableIds.count..<newTableIds.count).map { IndexPath(row: $0, section: 0) }
       tableView.performBatchUpdates {
@@ -997,16 +1001,49 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
           self.scrollToBottom(animated: true)
         }
       }
+    } else if isContentOnlyUpdate, isHistoryPicked, tableView.window != nil,
+      tableView.numberOfRows(inSection: 0) == newTableIds.count
+    {
+      // Content-only update (streaming deltas to existing rows): reconfigure the on-screen
+      // cells IN PLACE instead of reloadData(). A full reload dequeues fresh cells every
+      // frame, which remounts the whole turn and — because prepareForReuse wipes the
+      // streaming label's incremental-reveal state — re-fades the ENTIRE answer on each
+      // delta (the "flicker / extra fade" bug). Reusing the live cell instance lets the
+      // label fade in only the newly-arrived characters.
+      for indexPath in tableView.indexPathsForVisibleRows ?? [] {
+        let row = indexPath.row
+        guard row < tableMessages.count else { continue }
+        // Only touch rows whose content actually changed (the streaming turn). Leaving
+        // finished rows untouched stops them from rebuilding (and re-fading) every frame.
+        if row < oldTableMessages.count, oldTableMessages[row] == tableMessages[row] { continue }
+        reconfigureVisibleCell(at: indexPath)
+      }
+      // Pick up the new self-sized heights without a reload or a competing animation, so
+      // the answer grows smoothly under the pinned question (top stays anchored).
+      UIView.performWithoutAnimation {
+        tableView.beginUpdates()
+        tableView.endUpdates()
+      }
+      // Always recompute the bottom inset. While the question is pinned this shrinks the
+      // reserve as the answer grows; once the turn finishes (pin cleared above) it lets the
+      // reserve collapse back to the base inset — otherwise a short final answer leaves the
+      // full-screen reserve behind as a big empty stretch you can scroll into (the "double
+      // gap" bug: the send reserves a screen, the finished agent answer never fills it).
+      updateScrollInsets()
+      if pushToTopUserId == nil, wasNearBottom {
+        scrollToBottom(animated: false)
+      }
     } else {
       tableView.reloadData()
       if let id = newUserSendId {
         pinUserMessageToTop(id: id, animated: true)
-      } else if pushToTopUserId != nil {
-        // Pinned turn growing: the reserve shrinks passively in updateScrollInsets as the
-        // answer streams in; just refresh the inset (no scroll move — the question holds).
+      } else {
+        // Pinned turn growing: the reserve shrinks passively here. Finished turn: the
+        // reserve collapses back to the base inset (same anti-"double gap" reset as above).
         updateScrollInsets()
-      } else if wasNearBottom {
-        scrollToBottom(animated: true)
+        if pushToTopUserId == nil, wasNearBottom {
+          scrollToBottom(animated: true)
+        }
       }
     }
   }
@@ -1443,6 +1480,36 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     return cell
   }
 
+  /// Reconfigure an already-visible cell in place for the content-only streaming path —
+  /// reuses the live cell instance (and, crucially, its streaming-text reveal state)
+  /// instead of a reloadData() remount that would re-fade the whole answer each delta.
+  /// The tap closures wired when the cell was dequeued still target this row's (unchanged)
+  /// message id, so they don't need re-binding here.
+  private func reconfigureVisibleCell(at indexPath: IndexPath) {
+    guard indexPath.row < tableMessages.count else { return }
+    let message = tableMessages[indexPath.row]
+    if message.isCompactionSummary {
+      guard let cell = tableView.cellForRow(at: indexPath) as? VibeAgentKitCompactionCell else { return }
+      cell.configure(
+        text: message.text,
+        expanded: expandedProgressMessageIds.contains(message.id),
+        appearance: appearance
+      )
+      return
+    }
+    guard let cell = tableView.cellForRow(at: indexPath) as? VibeAgentKitMessageCell else { return }
+    cell.configure(
+      message: message,
+      appearance: appearance,
+      regeneratePrompt: regeneratePrompt,
+      showsActions: false,
+      isProgressExpanded: expandedProgressMessageIds.contains(message.id),
+      expandedStepIds: expandedStepIdsByMessage[message.id] ?? [],
+      isTextExpanded: expandedTextMessageIds.contains(message.id),
+      streamingStartDate: message.isStreaming ? streamStartByMessageId[message.id] : nil
+    )
+  }
+
   // MARK: Hold menu (Copy / Edit)
 
   // The system context menu provides the "mold" lift/blur (matching Resolo's
@@ -1568,19 +1635,20 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     }
     guard let row = tableMessages.firstIndex(where: { $0.id == messageId }) else { return }
     let indexPath = IndexPath(row: row, section: 0)
-    if let cell = tableView.cellForRow(at: indexPath) as? VibeAgentKitMessageCell {
-      cell.configure(
-        message: tableMessages[row],
-        appearance: appearance,
-        regeneratePrompt: regeneratePrompt,
-        showsActions: false,
-        isProgressExpanded: expandedProgressMessageIds.contains(messageId),
-        expandedStepIds: expandedStepIdsByMessage[messageId] ?? [],
-        isTextExpanded: expandedTextMessageIds.contains(messageId),
-        streamingStartDate: tableMessages[row].isStreaming ? streamStartByMessageId[messageId] : nil
-      )
+    applyAnchoredRowChange(at: indexPath) {
+      if let cell = tableView.cellForRow(at: indexPath) as? VibeAgentKitMessageCell {
+        cell.configure(
+          message: tableMessages[row],
+          appearance: appearance,
+          regeneratePrompt: regeneratePrompt,
+          showsActions: false,
+          isProgressExpanded: expandedProgressMessageIds.contains(messageId),
+          expandedStepIds: expandedStepIdsByMessage[messageId] ?? [],
+          isTextExpanded: expandedTextMessageIds.contains(messageId),
+          streamingStartDate: tableMessages[row].isStreaming ? streamStartByMessageId[messageId] : nil
+        )
+      }
     }
-    animateExpansion(anchorRow: indexPath)
   }
 
   private func presentImageAttachment(_ attachment: VibeAgentKitImageAttachment) {
@@ -1610,7 +1678,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
 
   // Tapping "Worked · N steps" reveals/hides that turn's step list inline, in the
   // bubble (Claude-Code style). The expanded set persists across reloads, and the
-  // height change animates via a no-op batch update after reconfiguring the cell.
+  // table update keeps the tapped row anchored so the list does not jump.
   private func toggleProgress(for messageId: String) {
     if expandedProgressMessageIds.contains(messageId) {
       expandedProgressMessageIds.remove(messageId)
@@ -1620,40 +1688,52 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     guard let row = tableMessages.firstIndex(where: { $0.id == messageId }) else { return }
     let indexPath = IndexPath(row: row, section: 0)
     // Reconfigure the visible cell in place (cheap, idempotent), then let the
-    // table animate to its new height. If the cell isn't on screen the set is
+    // table remeasure its new height. If the cell isn't on screen the set is
     // already updated, so cellForRowAt renders it expanded when it scrolls in.
-    if let cell = tableView.cellForRow(at: indexPath) as? VibeAgentKitMessageCell {
-      cell.configure(
-        message: tableMessages[row],
-        appearance: appearance,
-        regeneratePrompt: regeneratePrompt,
-        showsActions: false,
-        isProgressExpanded: expandedProgressMessageIds.contains(messageId),
-        expandedStepIds: expandedStepIdsByMessage[messageId] ?? [],
-        isTextExpanded: expandedTextMessageIds.contains(messageId),
-        streamingStartDate: tableMessages[row].isStreaming ? streamStartByMessageId[messageId] : nil
-      )
+    applyAnchoredRowChange(at: indexPath) {
+      if let cell = tableView.cellForRow(at: indexPath) as? VibeAgentKitMessageCell {
+        cell.configure(
+          message: tableMessages[row],
+          appearance: appearance,
+          regeneratePrompt: regeneratePrompt,
+          showsActions: false,
+          isProgressExpanded: expandedProgressMessageIds.contains(messageId),
+          expandedStepIds: expandedStepIdsByMessage[messageId] ?? [],
+          isTextExpanded: expandedTextMessageIds.contains(messageId),
+          streamingStartDate: tableMessages[row].isStreaming ? streamStartByMessageId[messageId] : nil
+        )
+      }
     }
-    animateExpansion(anchorRow: indexPath)
   }
 
-  /// Animate a cell's height change without the rest of the list jumping. Self-sizing
-  /// rows + `performBatchUpdates` can lurch when off-screen heights are re-estimated;
-  /// we pin the tapped row's top to its current on-screen position, let the table
-  /// re-measure, then restore the offset so the detail simply unfolds downward (and
-  /// folds back up) with everything above it held still.
-  private func animateExpansion(anchorRow indexPath: IndexPath) {
-    let beforeRect = tableView.rectForRow(at: indexPath)
-    let distanceFromTop = beforeRect.minY - tableView.contentOffset.y
-    tableView.performBatchUpdates(nil, completion: nil)
-    let afterRect = tableView.rectForRow(at: indexPath)
-    let minOffset = -tableView.adjustedContentInset.top
-    let maxOffset = max(
-      minOffset,
-      tableView.contentSize.height - tableView.bounds.height
-        + tableView.adjustedContentInset.bottom)
-    let targetY = min(max(afterRect.minY - distanceFromTop, minOffset), maxOffset)
-    tableView.setContentOffset(CGPoint(x: tableView.contentOffset.x, y: targetY), animated: false)
+  /// Apply an inline expand/collapse without letting UITableView "helpfully" scroll.
+  /// The cell owns the visible y-translate; the table only remeasures the tapped row.
+  private func applyAnchoredRowChange(at _: IndexPath, _ change: () -> Void) {
+    let offset = tableView.contentOffset
+    toggleScrollLockDepth += 1
+    UIView.performWithoutAnimation {
+      change()
+      tableView.beginUpdates()
+      tableView.endUpdates()
+      tableView.layoutIfNeeded()
+      tableView.setContentOffset(clampedContentOffset(offset), animated: false)
+    }
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      UIView.performWithoutAnimation {
+        self.tableView.setContentOffset(self.clampedContentOffset(offset), animated: false)
+      }
+      self.toggleScrollLockDepth = max(0, self.toggleScrollLockDepth - 1)
+    }
+  }
+
+  private func clampedContentOffset(_ offset: CGPoint) -> CGPoint {
+    let minY = -tableView.adjustedContentInset.top
+    let maxY = max(
+      minY,
+      tableView.contentSize.height - tableView.bounds.height + tableView.adjustedContentInset.bottom
+    )
+    return CGPoint(x: offset.x, y: min(max(offset.y, minY), maxY))
   }
 
   // Tapping a /compact divider reveals or hides the kept summary, in place — same
@@ -1666,14 +1746,15 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     }
     guard let row = tableMessages.firstIndex(where: { $0.id == messageId }) else { return }
     let indexPath = IndexPath(row: row, section: 0)
-    if let cell = tableView.cellForRow(at: indexPath) as? VibeAgentKitCompactionCell {
-      cell.configure(
-        text: tableMessages[row].text,
-        expanded: expandedProgressMessageIds.contains(messageId),
-        appearance: appearance
-      )
+    applyAnchoredRowChange(at: indexPath) {
+      if let cell = tableView.cellForRow(at: indexPath) as? VibeAgentKitCompactionCell {
+        cell.configure(
+          text: tableMessages[row].text,
+          expanded: expandedProgressMessageIds.contains(messageId),
+          appearance: appearance
+        )
+      }
     }
-    animateExpansion(anchorRow: indexPath)
   }
 
   // Tapping one completed step row (command, edit, read) opens its detail inline
@@ -1695,19 +1776,20 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
 
     guard let row = tableMessages.firstIndex(where: { $0.id == messageId }) else { return }
     let indexPath = IndexPath(row: row, section: 0)
-    if let cell = tableView.cellForRow(at: indexPath) as? VibeAgentKitMessageCell {
-      cell.configure(
-        message: tableMessages[row],
-        appearance: appearance,
-        regeneratePrompt: regeneratePrompt,
-        showsActions: false,
-        isProgressExpanded: true,
-        expandedStepIds: expanded,
-        isTextExpanded: expandedTextMessageIds.contains(messageId),
-        streamingStartDate: tableMessages[row].isStreaming ? streamStartByMessageId[messageId] : nil
-      )
+    applyAnchoredRowChange(at: indexPath) {
+      if let cell = tableView.cellForRow(at: indexPath) as? VibeAgentKitMessageCell {
+        cell.configure(
+          message: tableMessages[row],
+          appearance: appearance,
+          regeneratePrompt: regeneratePrompt,
+          showsActions: false,
+          isProgressExpanded: true,
+          expandedStepIds: expanded,
+          isTextExpanded: expandedTextMessageIds.contains(messageId),
+          streamingStartDate: tableMessages[row].isStreaming ? streamStartByMessageId[messageId] : nil
+        )
+      }
     }
-    animateExpansion(anchorRow: indexPath)
   }
 
   private func presentRuntime(_ runtime: ChatListRow.AgentRuntimeSummary) {
@@ -1780,7 +1862,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       emptyStateIcon.heightAnchor.constraint(equalToConstant: 64),
     ])
 
-    view.addSubview(emptyStateView)
+    tableView.insertSubview(emptyStateView, at: 0)
   }
 
   private func updateEmptyState() {
@@ -1832,7 +1914,13 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     // visible jump/settle.
     if !hasPerformedInitialScroll, isHistoryPicked, tableView.numberOfRows(inSection: 0) > 0 {
       hasPerformedInitialScroll = true
-      scrollToBottom(animated: false)
+      // Never yank a freshly-sent question down: when a push-to-top pin is active this
+      // one-shot would otherwise scroll the list to the bottom on the agent's first laid-out
+      // frame (the "push-to-top sometimes jumps back to bottom on agent start" bug). Consume
+      // the one-shot but hold the pin.
+      if pushToTopUserId == nil {
+        scrollToBottom(animated: false)
+      }
     }
   }
 
@@ -2335,11 +2423,6 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       .withAlphaComponent(appearance.isDark ? 0.055 : 0.045)
     view.addSubview(subagentToastBlur)
 
-    subagentToastIcon.translatesAutoresizingMaskIntoConstraints = false
-    subagentToastIcon.font = UIFont.systemFont(ofSize: 13.0)
-    subagentToastIcon.text = "🤖"
-    subagentToastBlur.contentView.addSubview(subagentToastIcon)
-
     subagentToastLabel.translatesAutoresizingMaskIntoConstraints = false
     subagentToastLabel.numberOfLines = 1
     subagentToastLabel.lineBreakMode = .byTruncatingTail
@@ -2354,10 +2437,8 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
         greaterThanOrEqualTo: view.leadingAnchor, constant: 24.0),
       subagentToastBlur.trailingAnchor.constraint(
         lessThanOrEqualTo: view.trailingAnchor, constant: -24.0),
-      subagentToastIcon.leadingAnchor.constraint(
-        equalTo: subagentToastBlur.contentView.leadingAnchor, constant: 12.0),
-      subagentToastIcon.centerYAnchor.constraint(equalTo: subagentToastBlur.contentView.centerYAnchor),
-      subagentToastLabel.leadingAnchor.constraint(equalTo: subagentToastIcon.trailingAnchor, constant: 7.0),
+      subagentToastLabel.leadingAnchor.constraint(
+        equalTo: subagentToastBlur.contentView.leadingAnchor, constant: 14.0),
       subagentToastLabel.trailingAnchor.constraint(
         equalTo: subagentToastBlur.contentView.trailingAnchor, constant: -12.0),
       subagentToastLabel.topAnchor.constraint(equalTo: subagentToastBlur.contentView.topAnchor, constant: 8.0),
@@ -2607,7 +2688,9 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     tableView.contentInset.top = top
     tableView.verticalScrollIndicatorInsets.bottom = bottom
     tableView.verticalScrollIndicatorInsets.top = top
-    if wasNearBottom, pushToTopReserve <= 0 { scrollToBottom(animated: false) }
+    if wasNearBottom, pushToTopReserve <= 0, toggleScrollLockDepth == 0 {
+      scrollToBottom(animated: false)
+    }
   }
 
   /// The reserve needed RIGHT NOW so the pinned user message can stay at the top with the
@@ -2621,7 +2704,13 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     let rect = tableView.rectForRow(at: IndexPath(row: idx, section: 0))
     guard rect.height > 0 else { return 0 }
     let topInset = tableView.adjustedContentInset.top
-    let viewport = max(0, tableView.bounds.height - topInset - tableView.safeAreaInsets.bottom)
+    // Measure the room actually visible BELOW the pinned question — down to the floating
+    // composer's top edge, NOT all the way to the home indicator. The composer overlaps the
+    // feed, so reserving to the safe-area bottom over-reserved by ~the composer's height and
+    // left a second, empty stretch you could scroll into past the answer (the "double bottom
+    // gap", worst with a tall image bubble).
+    let composerCovered = max(0, view.bounds.maxY - composerView.frame.minY)
+    let viewport = max(0, tableView.bounds.height - topInset - composerCovered)
     let contentBelow = max(0, tableView.contentSize.height - rect.maxY)
     return max(0, viewport - contentBelow)
   }
@@ -2800,7 +2889,7 @@ private final class VibeAgentArcSpinner: UIView {
     arcLayer.fillColor = UIColor.clear.cgColor
     arcLayer.strokeColor = color.cgColor
     arcLayer.lineCap = .round
-    arcLayer.lineWidth = 3
+    arcLayer.lineWidth = 1.5
     layer.addSublayer(arcLayer)
   }
 
@@ -3927,7 +4016,7 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
 // MARK: - Read-only subagent detail (Claude Task tool)
 
 /// A read-only view of one subagent's steps — no composer, no send, just the live
-/// Read/Edit/Run feed. Opened from the "🤖 Subagent" feed row or its start toast;
+/// Read/Edit/Run feed. Opened from the "Subagent" feed row or its start toast;
 /// the host VC calls `update(children:running:)` each transcript tick so it streams.
 final class VibeAgentSubagentDetailViewController: UIViewController {
   var onClose: (() -> Void)?
@@ -4106,7 +4195,6 @@ final class VibeAgentSubagentDetailViewController: UIViewController {
     NSLayoutConstraint.activate([
       icon.widthAnchor.constraint(equalToConstant: 15.0),
       icon.heightAnchor.constraint(equalToConstant: 15.0),
-      icon.topAnchor.constraint(equalTo: row.topAnchor, constant: 2.0),
     ])
 
     let label = UILabel()
@@ -4132,6 +4220,9 @@ final class VibeAgentSubagentDetailViewController: UIViewController {
       label.text = text
     }
 
+    // `.top` alignment already pins the icon to the first text line; an extra
+    // icon.top→row.top constraint both crashes (activated pre-hierarchy) and
+    // conflicts with the stack's own required top-alignment constraint.
     row.addArrangedSubview(icon)
     row.addArrangedSubview(label)
     return row

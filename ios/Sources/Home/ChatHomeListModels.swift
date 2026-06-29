@@ -316,6 +316,10 @@ struct ChatHomeListRow {
     Self.isBuiltInAgentChatId(chatId)
   }
 
+  var isBridgeAgentSurface: Bool {
+    Self.bridgeProvider(peerUserId: peerUserId, name: title, isAgent: isAgentFriend, agentId: peerAgentId) != nil
+  }
+
   var isGoldTier: Bool {
     peerTier?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "gold"
   }
@@ -329,12 +333,40 @@ struct ChatHomeListRow {
     }
   }
 
+  static func bridgeProvider(
+    peerUserId: String?,
+    name: String?,
+    isAgent: Bool,
+    agentId: String? = nil
+  ) -> String? {
+    let peer = peerUserId?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if peer == "11111111-1111-1111-1111-111111111111" { return "claude" }
+    if peer == "22222222-2222-2222-2222-222222222222" { return "codex" }
+
+    let agent = agentId?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    switch agent {
+    case "claude", "11111111-1111-1111-1111-111111111111":
+      return "claude"
+    case "codex", "22222222-2222-2222-2222-222222222222":
+      return "codex"
+    default:
+      break
+    }
+
+    guard isAgent else { return nil }
+    switch name?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+    case "claude": return "claude"
+    case "codex": return "codex"
+    default: return nil
+    }
+  }
+
   func cachePayload(messageLimit: Int = 5) -> [String: Any] {
-    let shouldIncludeMessagePayload = messageLimit > 0
+    let shouldIncludeMessagePayload = messageLimit > 0 && !isBridgeAgentSurface
     var payload: [String: Any] = [
       "chatId": chatId,
       "title": title,
-      "preview": preview,
+      "preview": isBridgeAgentSurface ? "Start session" : preview,
       "timeLabel": timeLabel,
       "unreadCount": unreadCount,
       "markedUnread": markedUnread,
@@ -363,10 +395,11 @@ struct ChatHomeListRow {
   }
 
   func withPresence(isTyping: Bool, isOnline: Bool, preview: String? = nil) -> ChatHomeListRow {
-    ChatHomeListRow(
+    let bridgeSurface = isBridgeAgentSurface
+    return ChatHomeListRow(
       chatId: chatId,
       title: title,
-      preview: preview ?? self.preview,
+      preview: bridgeSurface ? "Start session" : (preview ?? self.preview),
       timeLabel: timeLabel,
       unreadCount: unreadCount,
       markedUnread: markedUnread,
@@ -388,8 +421,8 @@ struct ChatHomeListRow {
       peerAgentId: peerAgentId,
       agentEventInboxMode: agentEventInboxMode,
       peerTier: peerTier,
-      previewRows: previewRows,
-      initialMessages: initialMessages
+      previewRows: bridgeSurface ? [] : previewRows,
+      initialMessages: bridgeSurface ? [] : initialMessages
     )
   }
 
@@ -417,7 +450,6 @@ struct ChatHomeListRow {
 
     let previewRaw = firstSafeDisplayText(raw["preview"], raw["subtitle"])
     let previewMessage = serverMessages.last.map(homePreviewText(from:))
-    let preview = previewRaw ?? previewMessage ?? ""
     let timeLabel =
       normalizedString(raw["timeLabel"] ?? raw["time_label"] ?? raw["time"])
       ?? serverMessages.last.map(homeTimeLabel(from:))
@@ -469,8 +501,15 @@ struct ChatHomeListRow {
     let peerTier = normalizedString(
       raw["friendTier"] ?? raw["friend_tier"] ?? raw["peerTier"] ?? raw["peer_tier"]
         ?? raw["tier"] ?? raw["badge"] ?? raw["badgeTier"] ?? raw["badge_tier"])
-    let initialMessages = serverMessages
-    let previewRows = parsePreviewRows(raw["previewRows"] ?? raw["preview_rows"])
+    let isBridgeAgent = Self.bridgeProvider(
+      peerUserId: peerUserId,
+      name: title,
+      isAgent: isAgentFriend,
+      agentId: peerAgentId
+    ) != nil
+    let preview = isBridgeAgent ? "Start session" : (previewRaw ?? previewMessage ?? "")
+    let initialMessages = isBridgeAgent ? [] : serverMessages
+    let previewRows = isBridgeAgent ? [] : parsePreviewRows(raw["previewRows"] ?? raw["preview_rows"])
 
     return ChatHomeListRow(
       chatId: chatId,

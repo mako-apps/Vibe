@@ -4311,7 +4311,15 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
   }
 
   private func configureSystemPlaybackIntegration() {
-    configureRemoteCommandsIfNeeded()
+    // IMPORTANT: do NOT touch the MediaPlayer remote-command center here. The first
+    // access to MPRemoteCommandCenter cold-starts the MediaPlayer framework, which
+    // blocks the main thread ~2s (an os_log lock inside _CFXNotificationPost). This
+    // coordinator is lazily created the moment ANY ChatListView is built — it scopes a
+    // `.voiceBubblePlaybackDidChange` observer — so wiring remote commands in init froze
+    // chat-open (the 2.2s `main-thread-stall` on `openChat`). The lock-screen / control-
+    // center transport is only meaningful once audio actually plays, so it's configured
+    // lazily on the first playback (configurePlaybackSession → configureRemoteCommandsIfNeeded).
+    // Only the cheap, MediaPlayer-free observers stay here.
     NotificationCenter.default.addObserver(
       self,
       selector: #selector(handleAudioSessionInterruption(_:)),
@@ -4336,9 +4344,6 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
       name: UIApplication.willEnterForegroundNotification,
       object: nil
     )
-    DispatchQueue.main.async {
-      UIApplication.shared.beginReceivingRemoteControlEvents()
-    }
   }
 
   private func configureRemoteCommandsIfNeeded() {
@@ -4381,6 +4386,12 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     commandCenter.skipForwardCommand.isEnabled = false
     commandCenter.skipBackwardCommand.isEnabled = false
     syncRemoteCommandAvailability()
+    // Begin receiving lock-screen / control-center remote events now that the command
+    // targets exist (moved out of init with the rest of the MediaPlayer setup so the
+    // cold-start cost is paid on first playback, not on chat-open).
+    DispatchQueue.main.async {
+      UIApplication.shared.beginReceivingRemoteControlEvents()
+    }
   }
 
   private func handleRemoteCommandOnMain(
@@ -4397,6 +4408,10 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
   }
 
   private func configurePlaybackSession() throws {
+    // First real playback: lazily wire the lock-screen / control-center transport.
+    // Kept out of the coordinator's init so the MediaPlayer cold-start never stalls
+    // chat-open (it's idempotent — guarded by `didConfigureRemoteCommands`).
+    configureRemoteCommandsIfNeeded()
     let session = AVAudioSession.sharedInstance()
     do {
       // Keep voice/audio-file playback aligned with the native global player engine.

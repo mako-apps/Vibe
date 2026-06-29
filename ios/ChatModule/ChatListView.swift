@@ -4038,6 +4038,38 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     setRows(sourceRowsPayload)
   }
 
+  private func removeNativeOutgoingMessage(_ messageId: String) {
+    nativeOutgoingRowsById.removeValue(forKey: messageId)
+    nativeOutgoingOrder.removeAll { $0 == messageId }
+    nativeEngineRowsById.removeValue(forKey: messageId)
+    nativeDeletedMessageIds.insert(messageId)
+    if hiddenMessageId == messageId { hiddenMessageId = nil }
+    if pendingSendTransition?.messageId == messageId { pendingSendTransition = nil }
+    if activeSendTransition?.payload.messageId == messageId {
+      activeSendTransition?.invalidate()
+      activeSendTransition = nil
+    }
+    setRows(sourceRowsPayload)
+  }
+
+  private func showBridgeSendFailure(messageId: String, reason: String, provider: String?) {
+    bridgeFreshOwnSentIds.remove(messageId)
+    removeNativeOutgoingMessage(messageId)
+    let trimmedProvider = provider?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let displayProvider =
+      trimmedProvider?.isEmpty == false ? trimmedProvider!.capitalized : "Bridge"
+    NSLog(
+      "[ChatListView] bridge send failed messageId=%@ provider=%@ reason=%@",
+      messageId,
+      displayProvider,
+      reason
+    )
+    onNativeEvent([
+      "type": "agentToast",
+      "message": "\(displayProvider) message did not reach the bridge. Try again.",
+    ])
+  }
+
   func cancelOutgoingMessage(row: ChatListRow, source: String) {
     guard let messageId = normalizedMessageId(row.messageId) else { return }
     let rowChatId = row.chatId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -5470,11 +5502,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // so we just hand the text off and let the list push content up to make room
     // for the streaming response. Using the morph path here leaves the user
     // bubble stuck hidden (it never arrives through the normal engine pipeline).
-    // NOTE: Claude/Codex bridge DMs run with `currentBridgeProvider != nil` but
-    // `agentChatMode == false` — they MUST use this path too, otherwise the normal
-    // morph hides the user bubble and the new turn lands out of order (mixed into
-    // prior history instead of pinned at the bottom).
-    if agentChatMode || currentBridgeProvider != nil {
+    // Claude/Codex bridge DMs are handled below by the native dispatch path. This
+    // host event branch is only for the built-in agent surface.
+    if agentChatMode && currentBridgeProvider == nil && !fromAgentSurface {
       inputBar?.dismissReplyBanner(animated: false)
       inputBar?.clearText()
       pendingAgentPushToTop = true
@@ -5499,6 +5529,29 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       return
     }
 
+    if currentBridgeProvider != nil && !fromAgentSurface {
+      inputBar?.dismissReplyBanner(animated: false)
+      inputBar?.clearText()
+      pendingAgentPushToTop = true
+      let outgoingMessageId = editingAgentMessageId ?? messageId
+      editingAgentMessageId = nil
+      if !bridgeMetadata.isEmpty {
+        noteBridgeFreshOwnSentId(outgoingMessageId)
+      }
+      dispatchOutgoingSend(
+        messageId: outgoingMessageId,
+        text: text,
+        timestamp: timestamp,
+        timestampMs: timestampMs,
+        replyToMessageId: replyToMessageId,
+        bridgeMetadata: bridgeMetadata,
+        agentMention: agentMention,
+        agentText: agentText,
+        mentionedAgentUsername: mentionedAgentUsername
+      )
+      return
+    }
+
     // Agent runtime surface: it owns its own composer (the chat input bar is offscreen
     // behind the full-screen surface), so skip the chat-view send morph + hidden-cell
     // dance. Dispatch through the shared transport, then refresh the agent feed so the
@@ -5507,8 +5560,19 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // view observes (root cause of "my message went to the chat view, not the agent view").
     if fromAgentSurface {
       inputBar?.dismissReplyBanner(animated: false)
+      // Claude/Codex bridge DMs reach here too (full-page agent surface). Re-use the
+      // armed id when resending an edited failed turn so the transport truncates the
+      // stale run instead of stacking a duplicate, and keep the outgoing bubble visible
+      // through the fresh-surface filter even if its id was rewritten by the edit.
+      let outgoingMessageId = editingAgentMessageId ?? messageId
+      editingAgentMessageId = nil
+      if !bridgeMetadata.isEmpty {
+        noteBridgeFreshOwnSentId(outgoingMessageId)
+      }
+      // Pin the freshly-sent question to the top (ChatGPT-style) like the bridge path did.
+      pendingAgentPushToTop = true
       dispatchOutgoingSend(
-        messageId: messageId,
+        messageId: outgoingMessageId,
         text: text,
         timestamp: timestamp,
         timestampMs: timestampMs,
@@ -5620,15 +5684,21 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     mentionedAgentUsername: String?
   ) {
     if nativeSendEnabled {
-      queueNativeOutgoingMessage(
-        messageId: messageId,
-        text: text,
-        timestamp: timestamp,
-        timestampMs: timestampMs,
-        replyToId: replyToMessageId,
-        autoMarkSent: false,
-        metadata: bridgeMetadata
-      )
+      let isBridgeSend =
+        currentBridgeProvider != nil
+        || ((bridgeMetadata["agentBridgeProvider"] as? String)?
+          .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+      if !isBridgeSend {
+        queueNativeOutgoingMessage(
+          messageId: messageId,
+          text: text,
+          timestamp: timestamp,
+          timestampMs: timestampMs,
+          replyToId: replyToMessageId,
+          autoMarkSent: false,
+          metadata: bridgeMetadata
+        )
+      }
       let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
       let myUserId = engineMyUserId.trimmingCharacters(in: .whitespacesAndNewlines)
       let peerUserId = enginePeerUserId.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -5639,8 +5709,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           messageId,
           myUserId,
           peerUserId
-        )
-        setNativeOutgoingMessageStatus(messageId, status: "error")
+          )
+        if isBridgeSend {
+          showBridgeSendFailure(messageId: messageId, reason: "invalid_chat", provider: currentBridgeProvider)
+        } else {
+          setNativeOutgoingMessageStatus(messageId, status: "error")
+        }
         return
       }
       var sendPayload: [String: Any] = [
@@ -5682,7 +5756,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
             String(describing: journalTail)
           )
           DispatchQueue.main.async {
-            self?.setNativeOutgoingMessageStatus(messageId, status: "error")
+            if isBridgeSend {
+              self?.showBridgeSendFailure(
+                messageId: messageId,
+                reason: (result["reason"] as? String) ?? "send_failed",
+                provider: (result["bridgeProvider"] as? String) ?? self?.currentBridgeProvider
+              )
+            } else {
+              self?.setNativeOutgoingMessageStatus(messageId, status: "error")
+            }
           }
           return
         }
@@ -5714,7 +5796,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           return accepted ? "sent" : "error"
         }()
         DispatchQueue.main.async {
-          self?.setNativeOutgoingMessageStatus(messageId, status: resolvedStatus)
+          if isBridgeSend, resolvedStatus == "error" {
+            self?.showBridgeSendFailure(
+              messageId: messageId,
+              reason: (result["reason"] as? String) ?? "send_failed",
+              provider: (result["bridgeProvider"] as? String) ?? self?.currentBridgeProvider
+            )
+          } else if !isBridgeSend {
+            self?.setNativeOutgoingMessageStatus(messageId, status: resolvedStatus)
+          }
         }
       }
     } else {
@@ -5831,7 +5921,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let peerUserId = enginePeerUserId.trimmingCharacters(in: .whitespacesAndNewlines)
     let peerAgentId = enginePeerAgentId.trimmingCharacters(in: .whitespacesAndNewlines)
     if chatId.isEmpty {
-      setNativeOutgoingMessageStatus(messageId, status: "error")
+      if currentBridgeProvider != nil {
+        showBridgeSendFailure(messageId: messageId, reason: "invalid_chat", provider: currentBridgeProvider)
+      } else {
+        setNativeOutgoingMessageStatus(messageId, status: "error")
+      }
       return
     }
 
@@ -5867,6 +5961,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         noteBridgeFreshOwnSentId(messageId)
       }
     }
+    let isBridgeMediaSend =
+      currentBridgeProvider != nil
+      || ((metadata["agentBridgeProvider"] as? String)?
+        .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+    if isBridgeMediaSend {
+      removeNativeOutgoingMessage(messageId)
+    }
 
     let sendPayload: [String: Any] = [
       "chatId": chatId,
@@ -5897,7 +5998,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         return accepted ? "sent" : "error"
       }()
       DispatchQueue.main.async {
-        self?.setNativeOutgoingMessageStatus(messageId, status: resolvedStatus)
+        if isBridgeMediaSend, !accepted || resolvedStatus == "error" {
+          self?.showBridgeSendFailure(
+            messageId: messageId,
+            reason: (result["reason"] as? String) ?? "send_failed",
+            provider: (result["bridgeProvider"] as? String) ?? self?.currentBridgeProvider
+          )
+        } else if !isBridgeMediaSend {
+          self?.setNativeOutgoingMessageStatus(messageId, status: resolvedStatus)
+        }
       }
     }
   }
@@ -6019,18 +6128,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// changes; an auto view follows a live flip of the Default-view setting.
   private var bridgeAgentManuallyShown = false
 
-  /// Warm the bridge history list when a Claude/Codex DM opens, so the History surface
-  /// opens instantly (it seeds from `latestAgentBridgeHistory` then refreshes). Cheap:
-  /// one list request (topic titles only), one-shot per DM.
+  /// Claude/Codex DMs open as fresh sessions. History is loaded only after the user
+  /// explicitly opens History, so relaunch/open never pulls old sessions into view.
   private func prefetchBridgeHistoryIfNeeded() {
-    guard window != nil, !didPrefetchBridgeHistory else { return }
-    guard let provider = currentBridgeProvider else { return }
-    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !chatId.isEmpty else { return }
     didPrefetchBridgeHistory = true
-    _ = ChatEngine.shared.requestAgentBridgeHistory([
-      "chatId": chatId, "provider": provider, "mode": "list",
-    ])
   }
 
   /// When the user set this Claude/Codex profile's default view to "Agent", show the

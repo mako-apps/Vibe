@@ -435,13 +435,15 @@ struct ChatRoute: Identifiable, Hashable {
   }
 
   init(row: ChatHomeListRow) {
-    let cachedRows = row.initialMessages.isEmpty ? row.previewRows : row.initialMessages
     let resolvedBridge = ChatRoute.resolveBridgeProvider(
       peerUserId: row.peerUserId,
       name: row.title,
       isAgent: row.isAgentFriend,
       agentId: row.peerAgentId
     )
+    let cachedRows = resolvedBridge == nil
+      ? (row.initialMessages.isEmpty ? row.previewRows : row.initialMessages)
+      : []
     NSLog(
       "[AgentRoute] ChatRoute(row:) chatId=%@ title=%@ peerUserId=%@ peerAgentId=%@ isAgentFriend=%@ resolvedBridge=%@",
       row.chatId, row.title, row.peerUserId ?? "nil", row.peerAgentId ?? "nil",
@@ -1287,7 +1289,8 @@ private final class ChatsViewModel: ObservableObject {
 
   private func warmCachedRows(_ rows: [ChatHomeListRow], shouldFetchHistory: Bool) {
     let visibleRows = Array(rows.prefix(4))
-    for row in visibleRows where !row.isBuiltInAgentSurface && !row.initialMessages.isEmpty {
+    for row in visibleRows
+    where !row.isBuiltInAgentSurface && !row.isBridgeAgentSurface && !row.initialMessages.isEmpty {
       ChatEngine.shared.seedRecentChatHistory(
         chatId: row.chatId,
         messages: row.initialMessages,
@@ -1298,7 +1301,7 @@ private final class ChatsViewModel: ObservableObject {
     guard shouldFetchHistory else { return }
     let preloadChatIds =
       visibleRows
-      .filter { !$0.isBuiltInAgentSurface }
+      .filter { !$0.isBuiltInAgentSurface && !$0.isBridgeAgentSurface }
       .prefix(2)
       .map(\.chatId)
     AppUITrace.notice(
@@ -1470,7 +1473,7 @@ private struct ChatHomeScreen: View {
   }
 
   private func openLocalChatRow(_ row: ChatHomeListRow) {
-    if !row.isBuiltInAgentSurface, !row.initialMessages.isEmpty {
+    if !row.isBuiltInAgentSurface, !row.isBridgeAgentSurface, !row.initialMessages.isEmpty {
       ChatEngine.shared.seedRecentChatHistory(
         chatId: row.chatId, messages: row.initialMessages, limit: 3)
     }
@@ -1684,7 +1687,7 @@ private struct ChatHomeScreen: View {
           AppUIStallWatchdog.shared.updateContext(
             "ChatHomeScreen select chatId=\(String(row.chatId.prefix(12))) rows=\(model.rows.count)"
           )
-          if !row.isBuiltInAgentSurface, !row.initialMessages.isEmpty {
+          if !row.isBuiltInAgentSurface, !row.isBridgeAgentSurface, !row.initialMessages.isEmpty {
             ChatEngine.shared.seedRecentChatHistory(
               chatId: row.chatId,
               messages: row.initialMessages,
@@ -4467,25 +4470,29 @@ final class ChatConversationController: UIViewController {
         sheet.prefersGrabberVisible = true
       }
       present(nav, animated: true)
-	    case "openAgentPanel":
-	      let payloadProvider =
-	        Self.normalizedString(payload["provider"] ?? payload["agentBridgeProvider"])
-	      if let provider = payloadProvider ?? route.bridgeProvider, !provider.isEmpty {
-	        presentBridgeRepositoryPicker(provider: provider)
-	      }
-	    case "agentStopStreaming":
-	      if let provider = route.bridgeProvider, !provider.isEmpty {
-	        let result = ChatEngine.shared.sendAgentBridgeControl([
-	          "chatId": route.chatId,
-	          "provider": provider,
-	          "action": "cancel",
-	        ])
-	        appShellRouteLog(
-	          "ChatConversationController bridgeStop chatId=\(route.chatId) provider=\(provider) result=\(result)")
-	      }
-	    case "headerSearchPressed":
-	      if currentPage == .profile {
-	        hideProfileView(animated: true)
+    case "openAgentPanel":
+      let payloadProvider =
+        Self.normalizedString(payload["provider"] ?? payload["agentBridgeProvider"])
+      if let provider = payloadProvider ?? route.bridgeProvider, !provider.isEmpty {
+        presentBridgeRepositoryPicker(provider: provider)
+      }
+    case "agentStopStreaming":
+      if let provider = route.bridgeProvider, !provider.isEmpty {
+        let result = ChatEngine.shared.sendAgentBridgeControl([
+          "chatId": route.chatId,
+          "provider": provider,
+          "action": "cancel",
+        ])
+        appShellRouteLog(
+          "ChatConversationController bridgeStop chatId=\(route.chatId) provider=\(provider) result=\(result)")
+      }
+    case "agentToast":
+      if let message = Self.normalizedString(payload["message"]) {
+        AppToastController.shared.show(message)
+      }
+    case "headerSearchPressed":
+      if currentPage == .profile {
+        hideProfileView(animated: true)
 	      }
       mainView.openHeaderSearch()
     case "headerAudioCallPressed":
@@ -4627,6 +4634,13 @@ final class ChatConversationController: UIViewController {
     }
 
     switch changeReason {
+    case "engineError":
+      let category = Self.normalizedString(notification.userInfo?["category"])
+      if category == "bridgeSendFailed",
+        let message = Self.normalizedString(notification.userInfo?["error"])
+      {
+        AppToastController.shared.show(message)
+      }
     case "chatRowsReloaded", "chatMessageInserted", "chatMessageEdited", "chatMessageDeleted",
       "chatMessageChanged", "messageStatusChanged", "presenceChanged", "peerTyping",
       "chatMuteChanged":

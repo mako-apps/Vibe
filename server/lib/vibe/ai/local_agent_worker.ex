@@ -281,17 +281,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     ArgumentError -> :ok
   end
 
-  defp lookup_session(nil, _handle), do: nil
-
-  defp lookup_session(chat_id, handle) do
-    ensure_session_table()
-
-    case :ets.lookup(@session_table, {chat_id, handle}) do
-      [{_, session_id}] -> session_id
-      _ -> nil
-    end
-  end
-
   defp store_session(nil, _handle, _session_id), do: :ok
   defp store_session(_chat_id, _handle, nil), do: :ok
 
@@ -1250,7 +1239,7 @@ defmodule Vibe.AI.LocalAgentWorker do
         permission_mode
       ] ++
         claude_effort_args(bridge_options) ++
-        claude_session_args(worker, Keyword.get(opts, :chat_id)) ++
+        claude_session_args(bridge_options) ++
         maybe_claude_verbose_args(output_format) ++
         maybe_model_args(bridge_options, "VIBE_CLAUDE_MODEL", "--model") ++
         maybe_single_arg("VIBE_CLAUDE_MCP_CONFIG", "--mcp-config") ++
@@ -1260,13 +1249,12 @@ defmodule Vibe.AI.LocalAgentWorker do
     run_command(worker, executable, args, opts)
   end
 
-  # Per-chat conversation continuity: resume the same Claude session for a chat so
-  # follow-up @claude messages keep context. One-off runs (no chat_id) stay stateless.
-  defp claude_session_args(worker, chat_id) do
-    case lookup_session(chat_id, worker.handle) do
+  # Fresh by default: mobile Claude/Codex chats are scratch sessions unless the user
+  # explicitly opens a History session, which carries `agentBridgeResumeSessionId`.
+  defp claude_session_args(bridge_options) do
+    case explicit_resume_session_id(bridge_options) do
       session_id when is_binary(session_id) -> ["--resume", session_id]
-      _ when is_binary(chat_id) -> []
-      _ -> ["--no-session-persistence"]
+      _ -> []
     end
   end
 
@@ -1295,7 +1283,9 @@ defmodule Vibe.AI.LocalAgentWorker do
         text = extracted.text || fallback_output(output)
         ok = status == 0
 
-        if ok do
+        bridge_options = Keyword.get(opts, :bridge_metadata) || %{}
+
+        if ok && explicit_resume_session_id(bridge_options) do
           store_session(
             Keyword.get(opts, :chat_id),
             worker.handle,
@@ -1593,8 +1583,21 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   defp option_value(_options, _key), do: nil
 
+  defp explicit_resume_session_id(options) do
+    [
+      "agentBridgeResumeSessionId",
+      "resumeSessionId",
+      "resume_session_id",
+      "sessionId",
+      "session_id"
+    ]
+    |> Enum.find_value(fn key -> normalize_string(option_value(options, key)) end)
+  end
+
   defp camelize_key("reasoningEffort"), do: "agentBridgeReasoningEffort"
   defp camelize_key("model"), do: "agentBridgeModel"
+  defp camelize_key("resumeSessionId"), do: "agentBridgeResumeSessionId"
+  defp camelize_key("sessionId"), do: "agentBridgeSessionId"
   defp camelize_key(key), do: key
 
   defp maybe_single_arg(env_name, flag) do
