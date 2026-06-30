@@ -97,6 +97,7 @@ defmodule VibeWeb.Router do
     post "/chat/:chat_id/mute", ChatController, :mute
     post "/chat/:chat_id/pin", ChatController, :pin
     post "/chat/:chat_id/mark-unread", ChatController, :mark_unread
+    post "/chat/:chat_id/archive", ChatController, :archive
 
     # Saved Messages
     get "/saved_messages/:user_id", SavedMessageController, :index

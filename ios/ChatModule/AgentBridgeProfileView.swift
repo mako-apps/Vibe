@@ -334,69 +334,54 @@ private struct AgentBridgeShimmerPill: View {
   var width: CGFloat? = nil
   var height: CGFloat
   var cornerRadius: CGFloat = 14
-  let tint: Color
-  @State private var isAnimating = false
-
+  
+  @Environment(\.colorScheme) private var colorScheme
+  @State private var phase: CGFloat = -1.0
+  
   var body: some View {
+    let isDark = colorScheme == .dark
+    let baseColor = isDark ? Color.white.opacity(0.04) : Color.black.opacity(0.04)
+    let shineColor = isDark ? Color.white.opacity(0.12) : Color.black.opacity(0.12)
+    
+    let gradient = LinearGradient(
+      gradient: Gradient(colors: [baseColor, shineColor, baseColor]),
+      startPoint: .leading,
+      endPoint: .trailing
+    )
+    
     RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-      .fill(tint)
+      .fill(baseColor)
+      .overlay(
+        GeometryReader { geo in
+          RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+            .fill(gradient)
+            .offset(x: phase * geo.size.width * 2)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+      )
       .frame(width: width, height: height)
       .frame(maxWidth: width == nil ? .infinity : nil, alignment: .leading)
-      .opacity(isAnimating ? 0.3 : 1.0)
       .onAppear {
-        withAnimation(
-          .easeInOut(duration: 1.2)
-          .repeatForever(autoreverses: true)
-        ) {
-          isAnimating = true
+        withAnimation(.linear(duration: 1.6).repeatForever(autoreverses: false)) {
+          phase = 1.0
         }
       }
   }
 }
 
-/// Modern skeleton for the session list. Each card is a soft rounded pill with a
-/// gentle pulsing opacity — no hard gradients, no nested inner boxes.
+/// Shimmer skeleton matching the CSS: 2 lines
 private struct AgentBridgeHistoryListSkeleton: View {
-  let palette: AppThemePalette
-  private var tint: Color { palette.secondaryText.opacity(0.15) }
-
   var body: some View {
     ScrollView(showsIndicators: false) {
-      VStack(spacing: 28) {
-        ForEach(0..<3, id: \.self) { groupIndex in
-          VStack(alignment: .leading, spacing: 14) {
-            // Project header skeleton
-            HStack(spacing: 10) {
-              AgentBridgeShimmerPill(width: 24, height: 24, cornerRadius: 8, tint: tint)
-              AgentBridgeShimmerPill(
-                width: CGFloat([130, 170, 110][groupIndex % 3]),
-                height: 18,
-                cornerRadius: 10,
-                tint: tint
-              )
-            }
-            .padding(.leading, 4)
-
-            // Session card skeletons
-            ForEach(0..<2, id: \.self) { cardIndex in
-              VStack(alignment: .leading, spacing: 10) {
-                AgentBridgeShimmerPill(
-                  width: CGFloat([220, 180, 200, 160, 240, 190][(groupIndex * 2 + cardIndex) % 6]),
-                  height: 16,
-                  cornerRadius: 10,
-                  tint: tint
-                )
-                AgentBridgeShimmerPill(
-                  width: CGFloat([120, 100, 140, 90][(groupIndex + cardIndex) % 4]),
-                  height: 12,
-                  cornerRadius: 8,
-                  tint: tint
-                )
-              }
-              .padding(.vertical, 9)
-              .frame(maxWidth: .infinity, alignment: .leading)
-            }
+      VStack(spacing: 24) {
+        ForEach(0..<4, id: \.self) { _ in
+          // Lines
+          VStack(alignment: .leading, spacing: 11) {
+            AgentBridgeShimmerPill(width: 140, height: 16, cornerRadius: 7)
+              .padding(.top, 6)
+            AgentBridgeShimmerPill(width: 100, height: 16, cornerRadius: 7)
           }
+          .frame(maxWidth: .infinity, alignment: .leading)
         }
       }
       .padding(.horizontal, 20)
@@ -410,20 +395,17 @@ private struct AgentBridgeHistoryListSkeleton: View {
 /// Skeleton for the transcript DETAIL: alternating role label + text-line bubbles,
 /// so a loading conversation reads as chat bubbles rather than a spinner.
 private struct AgentBridgeTranscriptSkeleton: View {
-  let palette: AppThemePalette
-  private var tint: Color { palette.secondaryText.opacity(0.15) }
-
   var body: some View {
     ScrollView {
       VStack(alignment: .leading, spacing: 18) {
         ForEach(0..<5, id: \.self) { index in
           VStack(alignment: .leading, spacing: 6) {
-            AgentBridgeShimmerPill(width: 54, height: 11, cornerRadius: 6, tint: tint)
-            AgentBridgeShimmerPill(height: 13, cornerRadius: 8, tint: tint)
+            AgentBridgeShimmerPill(width: 54, height: 11, cornerRadius: 6)
+            AgentBridgeShimmerPill(height: 13, cornerRadius: 8)
             if index % 2 == 0 {
-              AgentBridgeShimmerPill(height: 13, cornerRadius: 8, tint: tint)
+              AgentBridgeShimmerPill(height: 13, cornerRadius: 8)
             }
-            AgentBridgeShimmerPill(width: 220, height: 13, cornerRadius: 8, tint: tint)
+            AgentBridgeShimmerPill(width: 220, height: 13, cornerRadius: 8)
           }
           .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -453,6 +435,9 @@ struct AgentBridgeHistoryInlineView: View {
   @State private var loading = true
   @State private var errorMessage: String?
   @State private var pendingRequestId: String?
+  
+  @State private var requestStartAt: Date?
+  @State private var hasReceivedResponse = false
 
   /// Pre-state: read from AgentPairingService snapshot before the panel opens
   /// so we never flash a stale disconnected state on first open.
@@ -500,8 +485,21 @@ struct AgentBridgeHistoryInlineView: View {
 
   var body: some View {
     Group {
-      if visibleSessions.isEmpty {
-        AgentBridgeHistoryListSkeleton(palette: palette)
+      if visibleSessions.isEmpty && loading {
+        AgentBridgeHistoryListSkeleton()
+      } else if visibleSessions.isEmpty {
+        // Empty state
+        VStack(spacing: 12) {
+          Spacer()
+          Image(systemName: "clock.badge.exclamationmark")
+            .font(.system(size: 40))
+            .foregroundStyle(palette.secondaryText.opacity(0.5))
+          Text("No history found.")
+            .font(.system(size: 15))
+            .foregroundStyle(palette.secondaryText)
+          Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
       } else {
         List {
           ForEach(projectGroups) { group in
@@ -663,6 +661,7 @@ struct AgentBridgeHistoryInlineView: View {
       if !cached.isEmpty {
         sessions = cached
         loading = false
+        print("[AgentBridgeHistory] ⚡️ Seeded \(sessions.count) sessions instantly from cache")
       }
     }
     requestList()
@@ -733,13 +732,29 @@ struct AgentBridgeHistoryInlineView: View {
     // prior fetch) we refresh silently so re-opening never flashes back to a spinner.
     if visibleSessions.isEmpty { loading = true }
     errorMessage = nil
+    let reqId = UUID().uuidString
+    let start = Date()
+    requestStartAt = start
+    hasReceivedResponse = false
+    
+    print("[AgentBridgeHistory] 🔄 Requesting history list, reqId: \(reqId) at \(start)")
     let result = ChatEngine.shared.requestAgentBridgeHistory([
       "chatId": chatId,
       "provider": provider,
       "mode": "list",
+      "requestId": reqId
     ])
     if (result["accepted"] as? Bool) == true {
-      pendingRequestId = result["requestId"] as? String
+      pendingRequestId = reqId
+      
+      // Race condition recovery: if the WebSocket was still connecting when we pushed,
+      // or the response was dropped, retry after 4 seconds if we're still stuck in shimmer.
+      DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
+        if self.loading && !self.hasReceivedResponse && self.requestStartAt == start {
+          print("[AgentBridgeHistory] ⚠️ Timed out waiting for response! Retrying...")
+          self.requestList()
+        }
+      }
     } else {
       loading = false
       errorMessage = "Your computer isn't connected right now. Connect it, then try again."
@@ -759,6 +774,12 @@ struct AgentBridgeHistoryInlineView: View {
     }
     guard (payload["mode"] as? String ?? "list") == "list" else { return }
 
+    if let start = requestStartAt {
+      let duration = Date().timeIntervalSince(start)
+      print("[AgentBridgeHistory] ✅ Received list response in \(String(format: "%.2f", duration))s")
+    }
+
+    hasReceivedResponse = true
     loading = false
     let raw = payload["sessions"] as? [[String: Any]] ?? []
     sessions = raw.compactMap { item in
@@ -1220,13 +1241,15 @@ struct AgentBridgeHistorySheet: View {
           onPick(session)
         }
       )
-      .background(Color(uiColor: UIColor.systemGroupedBackground))
+      .background(.clear)
       .toolbar {
         ToolbarItem(placement: .topBarLeading) {
           Button("Done") { dismiss() }
         }
       }
     }
+    .presentationBackground(.regularMaterial)
+    .presentationDetents([.medium, .large])
   }
 }
 
@@ -1249,7 +1272,7 @@ struct AgentBridgeTranscriptView: View {
   var body: some View {
     Group {
       if loading && messages.isEmpty {
-        AgentBridgeTranscriptSkeleton(palette: palette)
+        AgentBridgeTranscriptSkeleton()
       } else if messages.isEmpty {
         Text(errorMessage ?? "This conversation is empty.")
           .font(.system(size: 14))
@@ -1264,11 +1287,15 @@ struct AgentBridgeTranscriptView: View {
                   .font(.system(size: 12, weight: .bold))
                   .foregroundStyle(color(for: message.role))
                   .textCase(.uppercase)
-                Text(message.text)
-                  .font(.system(size: 14))
-                  .foregroundStyle(palette.text)
-                  .textSelection(.enabled)
-                  .fixedSize(horizontal: false, vertical: true)
+                if message.text.hasPrefix("```diff") || message.text.contains("diff --git") {
+                  SwiftUIDiffView(text: message.text.replacingOccurrences(of: "```diff\n", with: "").replacingOccurrences(of: "```", with: ""))
+                } else {
+                  Text(message.text)
+                    .font(.system(size: 14))
+                    .foregroundStyle(palette.text)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
               }
               .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -1340,5 +1367,59 @@ struct AgentBridgeTranscriptView: View {
     if messages.isEmpty {
       errorMessage = "This conversation has no readable messages."
     }
+  }
+}
+
+struct SwiftUIDiffView: View {
+  let text: String
+  @Environment(\.colorScheme) private var colorScheme
+
+  var body: some View {
+    let lines = text.components(separatedBy: .newlines)
+    let isDark = colorScheme == .dark
+
+    VStack(alignment: .leading, spacing: 0) {
+      ForEach(Array(lines.enumerated()), id: \.offset) { index, line in
+        if line.hasPrefix("+") && !line.hasPrefix("+++") {
+          Text(line)
+            .font(.system(size: 13, design: .monospaced))
+            .foregroundColor(.white)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 2)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(VibeAgentDiffPalette.additionBackground(isDark: isDark)))
+            .fixedSize(horizontal: false, vertical: true)
+        } else if line.hasPrefix("-") && !line.hasPrefix("---") {
+          Text(line)
+            .font(.system(size: 13, design: .monospaced))
+            .foregroundColor(.white)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 2)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(VibeAgentDiffPalette.deletionBackground(isDark: isDark)))
+            .fixedSize(horizontal: false, vertical: true)
+        } else if line.hasPrefix("@@") {
+          Text(line)
+            .font(.system(size: 13, design: .monospaced))
+            .foregroundColor(.white)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 2)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.gray.opacity(0.3))
+            .fixedSize(horizontal: false, vertical: true)
+        } else {
+          Text(line)
+            .font(.system(size: 13, design: .monospaced))
+            .foregroundColor(isDark ? .white : .black)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 2)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      }
+    }
+    .background(Color(UIColor.secondarySystemBackground))
+    .cornerRadius(8)
+    .clipShape(RoundedRectangle(cornerRadius: 8))
   }
 }

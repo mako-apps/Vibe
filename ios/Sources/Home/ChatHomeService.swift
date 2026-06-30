@@ -26,7 +26,17 @@ enum ChatHomeService {
   }
 
   static func fetchChats(config: AppSessionConfig) async throws -> [ChatHomeListRow] {
-    let request = try buildRequest(config: config)
+    try await fetchChats(config: config, archived: false)
+  }
+
+  static func fetchArchivedChats(config: AppSessionConfig) async throws -> [ChatHomeListRow] {
+    try await fetchChats(config: config, archived: true)
+  }
+
+  private static func fetchChats(config: AppSessionConfig, archived: Bool) async throws
+    -> [ChatHomeListRow]
+  {
+    let request = try buildRequest(config: config, archived: archived)
     switch config.transportMode {
     case .offline:
       throw ChatHomeServiceError.transportUnavailable("offline")
@@ -38,17 +48,23 @@ enum ChatHomeService {
         return try await loadRows(
           config: config,
           request: request,
-          session: PacketRuntime.shared.makeURLSession(snapshot: packetSnapshot)
+          session: PacketRuntime.shared.makeURLSession(snapshot: packetSnapshot),
+          archived: archived
         )
       } catch {
         // Packet mesh unavailable — fall back to direct HTTP so the home
         // list still loads instead of showing a permanent "Connecting" state.
         NSLog("[ChatHomeService] packetMesh failed, falling back to direct: %@", error.localizedDescription)
-        return try await loadRows(config: config, request: request, session: .shared)
+        return try await loadRows(config: config, request: request, session: .shared, archived: archived)
       }
     case .direct:
       do {
-        let rows = try await loadRows(config: config, request: request, session: .shared)
+        let rows = try await loadRows(
+          config: config,
+          request: request,
+          session: .shared,
+          archived: archived
+        )
         PacketRuntime.shared.stop(resetToDirect: true)
         Task.detached {
           await PacketBootstrapService.prefetchIfNeeded(config: config)
@@ -62,13 +78,14 @@ enum ChatHomeService {
         return try await loadRows(
           config: config,
           request: request,
-          session: PacketRuntime.shared.makeURLSession(snapshot: packetSnapshot)
+          session: PacketRuntime.shared.makeURLSession(snapshot: packetSnapshot),
+          archived: archived
         )
       }
     }
   }
 
-  private static func buildRequest(config: AppSessionConfig) throws -> URLRequest {
+  private static func buildRequest(config: AppSessionConfig, archived: Bool = false) throws -> URLRequest {
     var base = config.apiBaseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
     while base.hasSuffix("/") {
       base.removeLast()
@@ -76,7 +93,7 @@ enum ChatHomeService {
     let pathBase = base.lowercased().hasSuffix("/api") ? base : "\(base)/api"
     guard
       let encodedUserID = config.userID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
-      let url = URL(string: "\(pathBase)/chats/\(encodedUserID)")
+      let url = URL(string: "\(pathBase)/chats/\(encodedUserID)\(archived ? "?archived=true" : "")")
     else {
       throw ChatHomeServiceError.invalidURL
     }
@@ -93,13 +110,19 @@ enum ChatHomeService {
   private static func loadRows(
     config: AppSessionConfig,
     request: URLRequest,
-    session: URLSession
+    session: URLSession,
+    archived: Bool = false
   ) async throws -> [ChatHomeListRow] {
     async let chats = perform(request, session: session)
-    async let savedMessagesRow = fetchSavedMessagesRow(config: config, session: session)
 
     let rows = try await chats
     let filteredRows = rows.filter { !$0.isSavedMessages }
+
+    guard !archived else {
+      return filteredRows
+    }
+
+    async let savedMessagesRow = fetchSavedMessagesRow(config: config, session: session)
 
     let combinedRows: [ChatHomeListRow]
     let resolvedSavedMessagesRow =
@@ -136,6 +159,7 @@ enum ChatHomeService {
       markedUnread: false,
       muted: false,
       pinned: false,
+      archived: false,
       isTyping: summary?.preview == "Thinking…",
       isOnline: true,
       peerUserId: nil,
@@ -199,6 +223,7 @@ enum ChatHomeService {
         markedUnread: false,
         muted: false,
         pinned: true,
+        archived: false,
         isTyping: false,
         isOnline: false,
         peerUserId: nil,

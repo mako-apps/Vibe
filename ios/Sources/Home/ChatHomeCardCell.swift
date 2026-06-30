@@ -61,6 +61,7 @@ final class ChatHomeCardCell: UITableViewCell {
     return gesture
   }()
   private var currentRow: ChatHomeListRow?
+  private var manualSwipeActionsEnabled = true
   private var isSwipeEnabled = true
   private var swipeOffset: CGFloat = 0
   private var swipeStartOffset: CGFloat = 0
@@ -77,6 +78,16 @@ final class ChatHomeCardCell: UITableViewCell {
   private let avatarGradientLayerName = "avatarGradient"
 
   weak var swipeDelegate: ChatHomeCardCellSwipeDelegate?
+
+  func setManualSwipeActionsEnabled(_ enabled: Bool) {
+    guard manualSwipeActionsEnabled != enabled else { return }
+    manualSwipeActionsEnabled = enabled
+    if !enabled {
+      closeSwipe(animated: false, notifyDelegate: false)
+    }
+    isSwipeEnabled = enabled && !(currentEditingLayout)
+    swipePanGestureRecognizer.isEnabled = isSwipeEnabled
+  }
 
   override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
     super.init(style: style, reuseIdentifier: reuseIdentifier)
@@ -638,8 +649,8 @@ final class ChatHomeCardCell: UITableViewCell {
 
   private func configureSwipeActions(for row: ChatHomeListRow, isEditing: Bool) {
     currentRow = row
-    isSwipeEnabled = !isEditing
-    swipePanGestureRecognizer.isEnabled = !isEditing
+    isSwipeEnabled = manualSwipeActionsEnabled && !isEditing
+    swipePanGestureRecognizer.isEnabled = isSwipeEnabled
 
     leadingDisplaySpecs = orderedSwipeSpecs(row.leadingSwipeActionSpecs, edge: .leading)
     trailingDisplaySpecs = orderedSwipeSpecs(row.trailingSwipeActionSpecs, edge: .trailing)

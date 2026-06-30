@@ -1128,10 +1128,13 @@ final class AppShellCoordinator: ObservableObject {
 @MainActor
 private final class ChatsViewModel: ObservableObject {
   @Published var rows: [ChatHomeListRow] = []
+  @Published var archivedRows: [ChatHomeListRow] = []
   @Published var isLoading = false
+  @Published var isLoadingArchived = false
   @Published var isWaitingForNetwork = false
   @Published var errorMessage: String?
   @Published var hasLoaded = false
+  @Published var hasLoadedArchived = false
 
   private var backgroundRefreshTask: Task<Void, Never>?
   private var agentConversationObserver: NSObjectProtocol?
@@ -1207,6 +1210,7 @@ private final class ChatsViewModel: ObservableObject {
       isWaitingForNetwork = false
       errorMessage = nil
       warmCachedRows(cachedRows, shouldFetchHistory: false)
+      scheduleArchivedLoadIfNeeded()
       AppUITrace.notice(
         "ChatsViewModel restored-cache rows=\(cachedRows.count) schedulingBackgroundRefresh=Y"
       )
@@ -1221,6 +1225,20 @@ private final class ChatsViewModel: ObservableObject {
     backgroundRefreshTask?.cancel()
     backgroundRefreshTask = nil
     await refresh(preserveRows: false)
+  }
+
+  func loadArchivedIfNeeded() async {
+    guard !hasLoadedArchived else { return }
+    await refreshArchived(preserveRows: true)
+  }
+
+  func refreshArchived() async {
+    await refreshArchived(preserveRows: false)
+  }
+
+  func refreshAll() async {
+    await refresh(preserveRows: false)
+    await refreshArchived(preserveRows: false)
   }
 
   private func refresh(preserveRows: Bool) async {
@@ -1259,6 +1277,7 @@ private final class ChatsViewModel: ObservableObject {
       hasLoaded = true
       isWaitingForNetwork = false
       warmCachedRows(nextRows, shouldFetchHistory: true)
+      scheduleArchivedLoadIfNeeded()
     } catch {
       let offline = ChatHomeService.isOfflineError(error)
       isWaitingForNetwork = offline
@@ -1271,6 +1290,30 @@ private final class ChatsViewModel: ObservableObject {
       AppUITrace.error(
         "ChatsViewModel refresh error offline=\(offline ? "Y" : "N") rows=\(rows.count) durationMs=\(Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000)) error=\(error.localizedDescription)"
       )
+    }
+  }
+
+  private func scheduleArchivedLoadIfNeeded() {
+    guard !hasLoadedArchived else { return }
+    Task { @MainActor [weak self] in
+      await self?.loadArchivedIfNeeded()
+    }
+  }
+
+  private func refreshArchived(preserveRows: Bool) async {
+    guard let config = AppSessionConfig.current else { return }
+    isLoadingArchived = archivedRows.isEmpty && !preserveRows
+    defer { isLoadingArchived = false }
+
+    do {
+      let nextRows = try await ChatHomeService.fetchArchivedChats(config: config)
+      if Self.rowsSnapshotSignature(nextRows) != Self.rowsSnapshotSignature(archivedRows) {
+        archivedRows = nextRows
+      }
+      hasLoadedArchived = true
+    } catch {
+      hasLoadedArchived = true
+      AppUITrace.error("ChatsViewModel archived refresh error \(error.localizedDescription)")
     }
   }
 
@@ -1321,6 +1364,7 @@ private final class ChatsViewModel: ObservableObject {
         "\(row.markedUnread)",
         "\(row.muted)",
         "\(row.pinned)",
+        "\(row.archived)",
         "\(row.isTyping)",
         "\(row.isOnline)",
         row.avatarUri ?? "",
@@ -1391,6 +1435,22 @@ private struct CallsRootView: View {
   }
 }
 
+private enum ChatHomeListScope: String, CaseIterable, Identifiable {
+  case active
+  case archived
+
+  var id: String { rawValue }
+
+  var title: String {
+    switch self {
+    case .active:
+      return "Chats"
+    case .archived:
+      return "Archived"
+    }
+  }
+}
+
 private struct ChatHomeScreen: View {
   @EnvironmentObject private var coordinator: AppShellCoordinator
   @Environment(\.colorScheme) private var colorScheme
@@ -1398,6 +1458,7 @@ private struct ChatHomeScreen: View {
   @State private var isShowingSearch = false
   @State private var isShowingStoryCamera = false
   @State private var isEditingHome = false
+  @State private var selectedHomeScope: ChatHomeListScope = .active
   @State private var selectedChatIDs = Set<String>()
   @State private var isStartingChat = false
   @State private var errorMessage: String?
@@ -1416,11 +1477,16 @@ private struct ChatHomeScreen: View {
 
   private var filteredRows: [ChatHomeListRow] {
     let query = homeSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !query.isEmpty else { return model.rows }
-    return model.rows.filter { row in
+    let sourceRows = selectedHomeScope == .archived ? model.archivedRows : model.rows
+    guard !query.isEmpty else { return sourceRows }
+    return sourceRows.filter { row in
       row.title.localizedCaseInsensitiveContains(query)
         || row.preview.localizedCaseInsensitiveContains(query)
     }
+  }
+
+  private var hasHomeRowsForAnyScope: Bool {
+    !model.rows.isEmpty || !model.archivedRows.isEmpty
   }
 
   private var trimmedHomeQuery: String {
@@ -1488,7 +1554,6 @@ private struct ChatHomeScreen: View {
   var body: some View {
     NavigationStack {
       listContent
-        .ignoresSafeArea(.container, edges: .top)
         .background(palette.background.ignoresSafeArea())
         .navigationBarTitleDisplayMode(.inline)
         // Let iOS 26 apply its native adaptive Liquid Glass to the nav bar and
@@ -1503,8 +1568,12 @@ private struct ChatHomeScreen: View {
               }
             }
             .font(.system(size: 17, weight: .semibold))
-            .tint(model.rows.isEmpty ? (colorScheme == .dark ? Color.white.opacity(0.3) : Color.black.opacity(0.3)) : (colorScheme == .dark ? .white : .black))
-            .disabled(model.rows.isEmpty)
+            .tint(
+              filteredRows.isEmpty
+                ? (colorScheme == .dark ? Color.white.opacity(0.3) : Color.black.opacity(0.3))
+                : (colorScheme == .dark ? .white : .black)
+            )
+            .disabled(filteredRows.isEmpty)
           }
 
           ToolbarItem(placement: .principal) {
@@ -1567,9 +1636,16 @@ private struct ChatHomeScreen: View {
     .task {
       AppUITrace.notice("ChatHomeScreen task loadIfNeeded")
       await model.loadIfNeeded()
+      await model.loadArchivedIfNeeded()
     }
     .task(id: homeSearchQuery) {
       await runGlobalSearch()
+    }
+    .onChange(of: selectedHomeScope) { _, scope in
+      selectedChatIDs.removeAll()
+      if scope == .archived {
+        Task { await model.loadArchivedIfNeeded() }
+      }
     }
     .onAppear {
       AppUITrace.notice(
@@ -1639,13 +1715,13 @@ private struct ChatHomeScreen: View {
   private var listContent: some View {
     if !trimmedHomeQuery.isEmpty {
       searchResultsView
-    } else if model.rows.isEmpty && (!model.hasLoaded || model.isLoading) {
+    } else if !hasHomeRowsForAnyScope && (!model.hasLoaded || model.isLoading) {
       ProgressView()
         .controlSize(.regular)
         .tint(palette.secondaryText)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(palette.background)
-    } else if model.rows.isEmpty {
+    } else if !hasHomeRowsForAnyScope {
       AppShellEmptyStateView(
         icon: """
         <?xml version="1.0" encoding="utf-8"?><svg fill="none" viewBox="0 0 800 600" xmlns="http://www.w3.org/2000/svg"><defs><clipPath id="cp-800-600"><rect height="600" width="800" y="0" x="0" /></clipPath><g id="comp_0"><g opacity="0" id="planete Outlines - Group 5"><animate repeatCount="indefinite" attributeName="opacity" dur="3s" begin="0s" calcMode="spline" values="0; 1; 1; 0" keyTimes="0; 0.3; 0.68; 1" keySplines="0.333 0 0.667 1; 0.333 0 0.667 1; 0.333 0 0.667 1" fill="freeze" /><g transform="translate(327.38,267.583)"><animateTransform repeatCount="indefinite" type="translate" attributeName="transform" dur="3s" begin="0s" calcMode="spline" values="327.38 267.583; 482.38 267.583" keyTimes="0; 1" keySplines="0 0 1 1" fill="freeze" /><g transform="scale(0.5,0.5) translate(-171.76,-193.166)"><g id="Group 5" transform="matrix(1,0,0,1,171.76,193.166)"><path fill="#d0d2d3" fill-opacity="1" d="M59.669,-8.242C53.143,-8.242,47.22,-5.677,42.84,-1.506C42.047,-23.225,24.2,-40.592,2.287,-40.592C-17.519,-40.592,-34.001,-26.403,-37.576,-7.638C-39.31,-8.029,-41.111,-8.242,-42.962,-8.242C-56.447,-8.242,-67.378,2.69,-67.378,16.174C-67.378,16.467,-67.367,16.758,-67.356,17.049C-68.756,16.49,-70.279,16.174,-71.878,16.174C-78.62,16.174,-84.086,21.64,-84.086,28.383C-84.086,35.125,-78.62,40.591,-71.878,40.591L59.669,40.591C73.154,40.591,84.086,29.659,84.086,16.174C84.086,2.69,73.154,-8.242,59.669,-8.242Z" /></g></g></g></g><g id="Merged Shape Layer"><g transform="translate(390.319,298.2)"><animateTransform repeatCount="indefinite" type="translate" attributeName="transform" dur="3s" begin="0s" calcMode="spline" values="390.319 298.2; 390.319 282.7; 390.319 319.25; 390.319 298.2" keyTimes="0; 0.293; 0.733; 1" keySplines="0.333 0 0.667 1; 0.333 0 0.667 1; 0.333 0 0.667 1" fill="freeze" /><g transform="rotate(0)"><animateTransform repeatCount="indefinite" type="rotate" attributeName="transform" dur="3s" begin="0s" calcMode="spline" values="0; 35; 0" keyTimes="0; 0.513; 1" keySplines="0.547 0 0.667 1; 0.333 0 0.845 1" fill="freeze" /><g transform="scale(1,1) translate(-664.319,-256.2)"><g id="planete Outlines - Group 3" transform="matrix(0.5,0,0,0.5,515.5,129)"><g id="Group 3" transform="matrix(1,0,0,1,297.638,254.4)"><path fill="#5d68f9" fill-opacity="1" d="M-133.812,-42.171L133.812,-75.141L5.765,75.141L-61.708,18.402L124.227,-71.307L-87.011,-1.534L-133.812,-42.171Z" /></g></g><g id="planete Outlines - Group 2" transform="matrix(0.5,0,0,0.5,515.5,129)"><g id="Group 2" transform="matrix(1,0,0,1,316.247,247.882)"><path fill="#474bd8" fill-opacity="1" d="M-98.335,64.79L-105.619,4.984L105.619,-64.79L-80.316,24.919L-98.335,64.79Z" /></g></g><g id="planete Outlines - Group 1" transform="matrix(0.5,0,0,0.5,515.5,129.001)"><g id="Group 1" transform="matrix(1,0,0,1,236.879,292.737)"><path fill="#3931ac" fill-opacity="1" d="M18.967,-3.189L-18.967,19.935L-0.949,-19.935L18.967,-3.189Z" /></g></g></g></g></g></g><g opacity="0" id="planete Outlines - Group 4"><animate repeatCount="indefinite" attributeName="opacity" dur="2.4s" begin="0s" calcMode="spline" values="0; 0.5; 0.5; 0" keyTimes="0; 0.317; 0.733; 1" keySplines="0 0 1 1; 0 0 1 1; 0 0 1 1" fill="freeze" /><g transform="translate(468.336,323.378)"><animateTransform repeatCount="indefinite" type="translate" attributeName="transform" dur="2.04s" begin="0s" calcMode="spline" values="468.336 323.378; 294.336 323.378" keyTimes="0; 1" keySplines="0 0 1 1" fill="freeze" /><g transform="scale(0.5,0.5) translate(-453.672,-304.756)"><g id="Group 4" transform="matrix(1,0,0,1,453.672,304.756)"><path fill="#d0d2d3" fill-opacity="1" d="M75.134,16.175C74.353,16.175,73.591,16.256,72.85,16.396C72.851,16.322,72.856,16.249,72.856,16.175C72.856,2.691,61.924,-8.241,48.44,-8.241C46.662,-8.241,44.931,-8.046,43.262,-7.685C39.668,-26.427,23.196,-40.591,3.406,-40.591C-16.624,-40.591,-33.254,-26.077,-36.571,-6.995C-38.992,-7.799,-41.578,-8.241,-44.269,-8.241C-57.754,-8.241,-68.685,2.691,-68.685,16.175C-68.685,16.817,-68.652,17.45,-68.604,18.079C-70.494,16.88,-72.728,16.175,-75.133,16.175C-81.875,16.175,-87.341,21.641,-87.341,28.383C-87.341,35.126,-81.875,40.592,-75.133,40.592L75.134,40.592C81.876,40.592,87.342,35.126,87.342,28.383C87.342,21.641,81.876,16.175,75.134,16.175Z" /></g></g></g></g></g></defs><g transform="matrix(1.79,0,0,1.79,-310,-231)" id="Pre-comp 1"><use clip-path="url(#cp-800-600)" height="600" width="800" y="0" x="0" xlink:href="#comp_0" href="#comp_0" /></g></svg>
@@ -1662,23 +1738,16 @@ private struct ChatHomeScreen: View {
       }
       .frame(maxWidth: .infinity, maxHeight: .infinity)
       .background(palette.background)
-    } else if filteredRows.isEmpty {
-      AppShellEmptyStateView(
-        icon: "magnifyingglass",
-        title: "No Results",
-        message: "No chats match \"\(homeSearchQuery)\".",
-        buttonTitle: nil,
-        palette: palette,
-        action: nil
-      )
-      .frame(maxWidth: .infinity, maxHeight: .infinity)
-      .background(palette.background)
     } else {
-      ChatHomeNativeListRepresentable(
+      ChatHomeNativeScopedList(
         rows: filteredRows,
+        scope: $selectedHomeScope,
+        activeCount: model.rows.count,
+        archivedCount: model.archivedRows.count,
+        isLoadingArchived: model.isLoadingArchived,
+        palette: palette,
         isDark: colorScheme == .dark,
         isEditing: isEditingHome,
-        showsRightCheckmark: false,
         selectedChatIDs: selectedChatIDs,
         onSelect: { row in
           AppUITrace.notice(
@@ -1699,11 +1768,15 @@ private struct ChatHomeScreen: View {
         onToggleSelection: { chatID in
           toggleHomeSelection(chatID)
         },
-        onRefresh: {
-          await model.refresh()
+        onAction: { action, row in
+          performHomeRowAction(action, row: row)
         },
-        onUnavailableAction: { message in
-          AppToastController.shared.show(message)
+        onRefresh: {
+          if selectedHomeScope == .archived {
+            await model.refreshArchived()
+          } else {
+            await model.refresh()
+          }
         }
       )
       .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1797,6 +1870,32 @@ private struct ChatHomeScreen: View {
     } catch {
       AppUITrace.error("ChatsRootView bulkAction error action=\(action) error=\(error.localizedDescription)")
       AppToastController.shared.show(error.localizedDescription)
+    }
+  }
+
+  private func performHomeRowAction(_ action: ChatHomeRowAction, row: ChatHomeListRow) {
+    guard row.supportsRemoteHomeActions else {
+      AppToastController.shared.show("This chat is stored locally and cannot use server actions.")
+      return
+    }
+
+    guard let config = AppSessionConfig.current else {
+      AppToastController.shared.show("The current session is unavailable.")
+      return
+    }
+
+    Task { @MainActor in
+      do {
+        try await ChatHomeEditService.apply(action: action, chatID: row.chatId, config: config)
+        selectedChatIDs.remove(row.chatId)
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        await model.refreshAll()
+      } catch {
+        AppUITrace.error(
+          "ChatHomeScreen rowAction error chatId=\(String(row.chatId.prefix(12))) error=\(error.localizedDescription)"
+        )
+        AppToastController.shared.show(error.localizedDescription)
+      }
     }
   }
 
@@ -1962,6 +2061,24 @@ private struct SettingsRootView: View {
 }
 
 
+private enum ChatHomeRowAction: Equatable {
+  case markUnread(Bool)
+  case pin(Bool)
+  case mute(Bool)
+  case archive(Bool)
+  case delete
+}
+
+private extension ChatHomeListRow {
+  var hasUnreadState: Bool {
+    unreadCount > 0 || markedUnread
+  }
+
+  var supportsRemoteHomeActions: Bool {
+    !isSavedMessages && !isBuiltInAgentSurface
+  }
+}
+
 private enum ChatHomeEditBulkAction {
   case markRead
   case mute
@@ -1993,6 +2110,41 @@ private enum ChatHomeEditService {
     }
   }
 
+  static func apply(
+    action: ChatHomeRowAction,
+    chatID: String,
+    config: AppSessionConfig
+  ) async throws {
+    let endpoint: String
+    let method: String
+    let body: [String: Any]?
+
+    switch action {
+    case .markUnread(let unread):
+      endpoint = "/chat/\(chatID)/mark-unread"
+      method = "POST"
+      body = ["unread": unread]
+    case .pin(let pinned):
+      endpoint = "/chat/\(chatID)/pin"
+      method = "POST"
+      body = ["pinned": pinned]
+    case .mute(let muted):
+      endpoint = "/chat/\(chatID)/mute"
+      method = "POST"
+      body = ["muted": muted]
+    case .archive(let archived):
+      endpoint = "/chat/\(chatID)/archive"
+      method = "POST"
+      body = ["archived": archived]
+    case .delete:
+      endpoint = "/chats/\(chatID)"
+      method = "DELETE"
+      body = nil
+    }
+
+    try await performRequest(endpoint: endpoint, method: method, body: body, config: config)
+  }
+
   private static func apply(
     action: ChatHomeEditBulkAction,
     chatID: String,
@@ -2017,6 +2169,15 @@ private enum ChatHomeEditService {
       body = nil
     }
 
+    try await performRequest(endpoint: endpoint, method: method, body: body, config: config)
+  }
+
+  private static func performRequest(
+    endpoint: String,
+    method: String,
+    body: [String: Any]?,
+    config: AppSessionConfig
+  ) async throws {
     guard let url = apiURL(base: config.apiBaseURLString, path: endpoint) else {
       throw EditError.invalidEndpoint
     }
@@ -2217,6 +2378,7 @@ private struct ShareChatSelectionView: View {
           }
         },
         onToggleSelection: { _ in },
+        onAction: { _, _ in },
         onRefresh: {
           await model.refresh()
         },
@@ -2228,6 +2390,84 @@ private struct ShareChatSelectionView: View {
   }
 }
 
+private struct ChatHomeNativeScopedList: View {
+  let rows: [ChatHomeListRow]
+  @Binding var scope: ChatHomeListScope
+  let activeCount: Int
+  let archivedCount: Int
+  let isLoadingArchived: Bool
+  let palette: AppThemePalette
+  let isDark: Bool
+  let isEditing: Bool
+  let selectedChatIDs: Set<String>
+  let onSelect: (ChatHomeListRow) -> Void
+  let onToggleSelection: (String) -> Void
+  let onAction: (ChatHomeRowAction, ChatHomeListRow) -> Void
+  let onRefresh: () async -> Void
+
+  var body: some View {
+    VStack(spacing: 0) {
+      scopePicker
+
+      if rows.isEmpty {
+        emptyState
+      } else {
+        ChatHomeNativeListRepresentable(
+          rows: rows,
+          isDark: isDark,
+          isEditing: isEditing,
+          showsRightCheckmark: false,
+          selectedChatIDs: selectedChatIDs,
+          onSelect: onSelect,
+          onToggleSelection: onToggleSelection,
+          onAction: onAction,
+          onRefresh: onRefresh,
+          onUnavailableAction: { AppToastController.shared.show($0) }
+        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+      }
+    }
+    .background(palette.background)
+  }
+
+  private var scopePicker: some View {
+    Picker("Chat list", selection: $scope) {
+      Text("Chats \(activeCount)").tag(ChatHomeListScope.active)
+      Text("Archived \(archivedCount)").tag(ChatHomeListScope.archived)
+    }
+    .pickerStyle(.segmented)
+    .padding(.horizontal, 16)
+    .padding(.top, 8)
+    .padding(.bottom, 6)
+    .background(palette.background)
+  }
+
+  private var emptyState: some View {
+    VStack(spacing: 10) {
+      if scope == .archived && isLoadingArchived {
+        ProgressView()
+          .tint(palette.secondaryText)
+      } else {
+        Image(systemName: scope == .archived ? "archivebox" : "bubble.left.and.bubble.right")
+          .font(.system(size: 28, weight: .medium))
+          .foregroundStyle(palette.secondaryText.opacity(0.75))
+      }
+
+      Text(scope == .archived ? "No Archived Chats" : "No Chats")
+        .font(.system(size: 16, weight: .semibold))
+        .foregroundStyle(palette.text)
+
+      Text(scope == .archived ? "Archived conversations will appear here." : "Start a conversation to catch the vibe.")
+        .font(.system(size: 14, weight: .regular))
+        .foregroundStyle(palette.secondaryText)
+        .multilineTextAlignment(.center)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .padding(.horizontal, 24)
+    .background(palette.background)
+  }
+}
+
 private struct ChatHomeNativeListRepresentable: UIViewControllerRepresentable {
   let rows: [ChatHomeListRow]
   let isDark: Bool
@@ -2236,6 +2476,7 @@ private struct ChatHomeNativeListRepresentable: UIViewControllerRepresentable {
   let selectedChatIDs: Set<String>
   let onSelect: (ChatHomeListRow) -> Void
   let onToggleSelection: (String) -> Void
+  let onAction: (ChatHomeRowAction, ChatHomeListRow) -> Void
   let onRefresh: () async -> Void
   let onUnavailableAction: (String) -> Void
 
@@ -2243,6 +2484,7 @@ private struct ChatHomeNativeListRepresentable: UIViewControllerRepresentable {
     let controller = ChatHomeNativeListController()
     controller.onSelect = onSelect
     controller.onToggleSelection = onToggleSelection
+    controller.onAction = onAction
     controller.onRefresh = onRefresh
     controller.onUnavailableAction = onUnavailableAction
     controller.apply(
@@ -2256,6 +2498,11 @@ private struct ChatHomeNativeListRepresentable: UIViewControllerRepresentable {
   }
 
   func updateUIViewController(_ uiViewController: ChatHomeNativeListController, context: Context) {
+    uiViewController.onSelect = onSelect
+    uiViewController.onToggleSelection = onToggleSelection
+    uiViewController.onAction = onAction
+    uiViewController.onRefresh = onRefresh
+    uiViewController.onUnavailableAction = onUnavailableAction
     uiViewController.apply(
       rows: rows,
       isDark: isDark,
@@ -2274,6 +2521,7 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
 
   fileprivate var onSelect: (ChatHomeListRow) -> Void = { _ in }
   fileprivate var onToggleSelection: (String) -> Void = { _ in }
+  fileprivate var onAction: (ChatHomeRowAction, ChatHomeListRow) -> Void = { _, _ in }
   fileprivate var onRefresh: (() async -> Void)?
   fileprivate var onUnavailableAction: (String) -> Void = { _ in }
 
@@ -2453,6 +2701,7 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
         "\(row.markedUnread)",
         "\(row.muted)",
         "\(row.pinned)",
+        "\(row.archived)",
         "\(row.isTyping)",
         "\(row.isOnline)",
         row.avatarUri ?? "",
@@ -2494,7 +2743,8 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     }
 
     let row = rows[indexPath.row]
-    cell.swipeDelegate = self
+    cell.swipeDelegate = nil
+    cell.setManualSwipeActionsEnabled(false)
     cell.selectionStyle = .none
     cell.backgroundColor = .clear
     cell.contentView.backgroundColor = .clear
@@ -2552,7 +2802,9 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     AppUITrace.notice(
       "ChatHomeNativeListController contextMenu row=\(indexPath.row) chatId=\(String(row.chatId.prefix(12)))"
     )
-    return UIContextMenuConfiguration(identifier: row.chatId as NSString, previewProvider: nil) {
+    return UIContextMenuConfiguration(identifier: row.chatId as NSString) {
+      ChatHomeMiniPreviewController(row: row, isDark: self.isDark)
+    } actionProvider: {
       [weak self] _ in
       let openAction = UIAction(
         title: "Open Chat",
@@ -2565,44 +2817,125 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
         title: hasUnread ? "Mark as Read" : "Mark as Unread",
         image: UIImage(systemName: hasUnread ? "message.fill" : "circle")
       ) { [weak self] _ in
-        self?.onUnavailableAction("Home actions are not wired into this shell yet.")
+        self?.onAction(.markUnread(!hasUnread), row)
       }
       let pinAction = UIAction(
         title: row.pinned ? "Unpin" : "Pin",
         image: UIImage(systemName: row.pinned ? "pin.slash" : "pin")
       ) { [weak self] _ in
-        self?.onUnavailableAction("Home actions are not wired into this shell yet.")
+        self?.onAction(.pin(!row.pinned), row)
       }
       let muteAction = UIAction(
         title: row.muted ? "Unmute" : "Mute",
         image: UIImage(systemName: row.muted ? "speaker.wave.2" : "speaker.slash")
       ) { [weak self] _ in
-        self?.onUnavailableAction("Home actions are not wired into this shell yet.")
+        self?.onAction(.mute(!row.muted), row)
       }
       let archiveAction = UIAction(
-        title: "Archive",
-        image: UIImage(systemName: "archivebox")
+        title: row.archived ? "Unarchive" : "Archive",
+        image: UIImage(systemName: row.archived ? "tray.and.arrow.up" : "archivebox")
       ) { [weak self] _ in
-        self?.onUnavailableAction("Home actions are not wired into this shell yet.")
-      }
-      let clearAction = UIAction(
-        title: "Clear Chat",
-        image: UIImage(systemName: "eraser")
-      ) { [weak self] _ in
-        self?.onUnavailableAction("Home actions are not wired into this shell yet.")
+        self?.onAction(.archive(!row.archived), row)
       }
       let deleteAction = UIAction(
         title: "Delete",
         image: UIImage(systemName: "trash"),
         attributes: .destructive
       ) { [weak self] _ in
-        self?.onUnavailableAction("Home actions are not wired into this shell yet.")
+        self?.onAction(.delete, row)
       }
-      return UIMenu(
-        title: "",
-        children: [openAction, readAction, pinAction, muteAction, archiveAction, clearAction, deleteAction]
-      )
+      var actions: [UIMenuElement] = [openAction]
+      if row.supportsRemoteHomeActions {
+        actions.append(contentsOf: [readAction, pinAction, muteAction, archiveAction, deleteAction])
+      }
+      return UIMenu(title: "", children: actions)
     }
+  }
+
+  func tableView(
+    _ tableView: UITableView,
+    willPerformPreviewActionForMenuWith configuration: UIContextMenuConfiguration,
+    animator: UIContextMenuInteractionCommitAnimating
+  ) {
+    guard let chatId = configuration.identifier as? String,
+      let row = rows.first(where: { $0.chatId == chatId })
+    else { return }
+    animator.addCompletion { [weak self] in
+      self?.onSelect(row)
+    }
+  }
+
+  func tableView(
+    _ tableView: UITableView,
+    leadingSwipeActionsConfigurationForRowAt indexPath: IndexPath
+  ) -> UISwipeActionsConfiguration? {
+    guard !isEditingMode, rows.indices.contains(indexPath.row) else { return nil }
+    let row = rows[indexPath.row]
+    guard row.supportsRemoteHomeActions else { return nil }
+
+    let pin = UIContextualAction(
+      style: .normal,
+      title: row.pinned ? "Unpin" : "Pin"
+    ) { [weak self] _, _, completion in
+      self?.onAction(.pin(!row.pinned), row)
+      completion(true)
+    }
+    pin.image = UIImage(systemName: row.pinned ? "pin.slash.fill" : "pin.fill")
+    pin.backgroundColor = UIColor.systemBlue
+
+    let hasUnread = row.hasUnreadState
+    let unread = UIContextualAction(
+      style: .normal,
+      title: hasUnread ? "Read" : "Unread"
+    ) { [weak self] _, _, completion in
+      self?.onAction(.markUnread(!hasUnread), row)
+      completion(true)
+    }
+    unread.image = UIImage(systemName: hasUnread ? "message.fill" : "circle.fill")
+    unread.backgroundColor = UIColor.systemCyan
+
+    let configuration = UISwipeActionsConfiguration(actions: [pin, unread])
+    configuration.performsFirstActionWithFullSwipe = true
+    return configuration
+  }
+
+  func tableView(
+    _ tableView: UITableView,
+    trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath
+  ) -> UISwipeActionsConfiguration? {
+    guard !isEditingMode, rows.indices.contains(indexPath.row) else { return nil }
+    let row = rows[indexPath.row]
+    guard row.supportsRemoteHomeActions else { return nil }
+
+    let delete = UIContextualAction(style: .destructive, title: "Delete") { [weak self] _, _, completion in
+      self?.onAction(.delete, row)
+      completion(true)
+    }
+    delete.image = UIImage(systemName: "trash.fill")
+
+    let archive = UIContextualAction(
+      style: .normal,
+      title: row.archived ? "Unarchive" : "Archive"
+    ) { [weak self] _, _, completion in
+      self?.onAction(.archive(!row.archived), row)
+      completion(true)
+    }
+    archive.image = UIImage(systemName: row.archived ? "tray.and.arrow.up.fill" : "archivebox.fill")
+    archive.backgroundColor = UIColor.systemGray
+
+    let mute = UIContextualAction(
+      style: .normal,
+      title: row.muted ? "Unmute" : "Mute"
+    ) { [weak self] _, _, completion in
+      self?.onAction(.mute(!row.muted), row)
+      completion(true)
+    }
+    mute.image = UIImage(systemName: row.muted ? "speaker.wave.2.fill" : "speaker.slash.fill")
+    mute.backgroundColor = UIColor.systemOrange
+
+    let configuration = UISwipeActionsConfiguration(actions: [delete, archive, mute])
+    configuration.performsFirstActionWithFullSwipe = false
+    return configuration
   }
 
   func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
@@ -2644,7 +2977,29 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     AppUITrace.notice(
       "ChatHomeNativeListController swipeAction event=\(eventType) chatId=\(String(chatId.prefix(12)))"
     )
-    onUnavailableAction("Home actions are not wired into this shell yet.")
+    guard let row = rows.first(where: { $0.chatId == chatId }) else {
+      onUnavailableAction("Chat action is unavailable.")
+      return
+    }
+    guard row.supportsRemoteHomeActions else {
+      onUnavailableAction("This chat cannot be changed from Home.")
+      return
+    }
+
+    switch eventType {
+    case "swipePin":
+      onAction(.pin(!row.pinned), row)
+    case "swipeMarkRead":
+      onAction(.markUnread(!row.hasUnreadState), row)
+    case "swipeMute":
+      onAction(.mute(!row.muted), row)
+    case "swipeArchive":
+      onAction(.archive(!row.archived), row)
+    case "swipeDelete":
+      onAction(.delete, row)
+    default:
+      onUnavailableAction("Chat action is unavailable.")
+    }
   }
 
   private func resolvedAvatarGradientColors(for row: ChatHomeListRow) -> (UIColor, UIColor)? {
@@ -2686,6 +3041,277 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     let b = CGFloat((value >> 8) & 0xFF) / 255.0
     let a = CGFloat(value & 0xFF) / 255.0
     return UIColor(red: r, green: g, blue: b, alpha: a)
+  }
+}
+
+private final class ChatHomeMiniPreviewController: UIViewController {
+  private let mainView = ChatMainView()
+  private let row: ChatHomeListRow
+  private let isDark: Bool
+  private var didInitialScrollToBottom = false
+  private var openedChatChannel = false
+
+  init(row: ChatHomeListRow, isDark: Bool) {
+    self.row = row
+    self.isDark = isDark
+    super.init(nibName: nil, bundle: nil)
+
+    view.backgroundColor = .clear
+    view.clipsToBounds = true
+
+    mainView.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(mainView)
+    NSLayoutConstraint.activate([
+      mainView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 2),
+      mainView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -2),
+      mainView.topAnchor.constraint(equalTo: view.topAnchor),
+      mainView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+    ])
+
+    mainView.layer.cornerRadius = 20
+    if #available(iOS 13.0, *) {
+      mainView.layer.cornerCurve = .continuous
+    }
+    mainView.clipsToBounds = true
+    mainView.setExternalNavigationHeaderEnabled(false)
+    mainView.setAppearance(Self.previewAppearance(isDark: isDark))
+    mainView.surfaceId = "home_preview_\(row.chatId)"
+    mainView.setEngineSurfaceId(mainView.surfaceId)
+    mainView.setEngineChatId(row.chatId)
+    mainView.setEnginePeerUserId(row.peerUserId ?? "")
+    if let myUserId = Self.normalizedString(
+      ChatEngineStore.shared.getConfig()["myUserId"] ?? ChatEngineStore.shared.getConfig()["userId"]
+    ) {
+      mainView.setEngineMyUserId(myUserId)
+    }
+    mainView.setHeaderTitle(row.title)
+    mainView.setHeaderSubtitle(Self.headerSubtitle(for: row))
+    mainView.setProfileName(row.title)
+    mainView.setProfileHandle(Self.profileHandle(for: row))
+    mainView.setAvatarUri(row.avatarUri)
+    mainView.setIsOnline(Self.isOnline(for: row))
+    mainView.setIsChatMuted(row.muted)
+    mainView.setIsGroupOrChannel(row.isGroup)
+    mainView.setStatusAuthorityEnabled(true)
+    mainView.setInputBarEnabled(false)
+    mainView.setNativeSendEnabled(false)
+    mainView.setPage(ChatConversationPage.chat.rawValue, animated: false)
+    refreshPreviewRows()
+
+    preferredContentSize = Self.preferredContentSize()
+
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleChatEngineChanged(_:)),
+      name: ChatEngine.didChangeNotification,
+      object: nil
+    )
+
+    if row.supportsRemoteHomeActions {
+      openedChatChannel = true
+      _ = ChatEngine.shared.openChatChannel([
+        "chatId": row.chatId,
+        "peerUserId": row.peerUserId ?? "",
+      ])
+    }
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  deinit {
+    NotificationCenter.default.removeObserver(
+      self,
+      name: ChatEngine.didChangeNotification,
+      object: nil
+    )
+    if openedChatChannel {
+      _ = ChatEngine.shared.closeChatChannel(["chatId": row.chatId])
+    }
+  }
+
+  override func viewDidLayoutSubviews() {
+    super.viewDidLayoutSubviews()
+    view.layoutIfNeeded()
+    mainView.layoutIfNeeded()
+    configurePreviewScrollBehavior()
+  }
+
+  private func refreshPreviewRows() {
+    mainView.setRows(Self.previewRows(for: row))
+    guard !didInitialScrollToBottom else { return }
+    didInitialScrollToBottom = true
+    DispatchQueue.main.async { [weak self] in
+      self?.mainView.scrollToBottom(animated: false)
+    }
+  }
+
+  private func configurePreviewScrollBehavior() {
+    for scrollView in Self.collectScrollViews(in: mainView) {
+      scrollView.bounces = false
+      scrollView.alwaysBounceVertical = false
+      scrollView.alwaysBounceHorizontal = false
+      scrollView.panGestureRecognizer.cancelsTouchesInView = false
+      scrollView.delaysContentTouches = false
+      scrollView.canCancelContentTouches = true
+    }
+  }
+
+  @objc private func handleChatEngineChanged(_ note: Notification) {
+    if !Thread.isMainThread {
+      DispatchQueue.main.async { [weak self] in
+        self?.handleChatEngineChanged(note)
+      }
+      return
+    }
+    guard
+      let changedChatId = Self.normalizedString(note.userInfo?["chatId"]),
+      changedChatId == row.chatId
+    else { return }
+
+    let reason = Self.normalizedString(note.userInfo?["reason"]) ?? ""
+    switch reason {
+    case "peerTyping", "presenceChanged":
+      mainView.setHeaderSubtitle(Self.headerSubtitle(for: row))
+      mainView.setIsOnline(Self.isOnline(for: row))
+      mainView.setProfileHandle(Self.profileHandle(for: row))
+    case "chatRowsReloaded", "chatMessageInserted", "chatMessageEdited", "chatMessageDeleted",
+      "chatMessageChanged", "messageStatusChanged":
+      refreshPreviewRows()
+    default:
+      break
+    }
+  }
+
+  private static func preferredContentSize() -> CGSize {
+    let screen = UIScreen.main.bounds.size
+    let width = max(320, screen.width - 14)
+    let height = max(260, screen.height * 0.4)
+    return CGSize(width: width, height: height)
+  }
+
+  private static func previewRows(for row: ChatHomeListRow) -> [[String: Any]] {
+    let engineRows = ChatEngine.shared.getChatRows(["chatId": row.chatId])
+    if !engineRows.isEmpty {
+      return engineRows
+    }
+    if !row.previewRows.isEmpty {
+      return row.previewRows
+    }
+    if !row.initialMessages.isEmpty {
+      return row.initialMessages
+    }
+    return fallbackPreviewRows(for: row)
+  }
+
+  private static func fallbackPreviewRows(for row: ChatHomeListRow) -> [[String: Any]] {
+    let previewText =
+      row.preview.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      ? "Start a conversation"
+      : row.preview
+    let messageId = "preview_message_\(row.chatId)"
+    let message: [String: Any] = [
+      "id": messageId,
+      "text": previewText,
+      "timestamp": row.timeLabel,
+      "isMe": false,
+      "status": "sent",
+      "type": "text",
+      "isPinned": row.pinned,
+      "bubbleShape": [
+        "showTail": true,
+        "borderTopLeftRadius": 18.0,
+        "borderTopRightRadius": 18.0,
+        "borderBottomLeftRadius": 4.0,
+        "borderBottomRightRadius": 18.0,
+      ],
+    ]
+    return [
+      [
+        "kind": "message",
+        "key": messageId,
+        "message": message,
+      ]
+    ]
+  }
+
+  private static func headerSubtitle(for row: ChatHomeListRow) -> String {
+    if row.isSavedMessages {
+      return "Saved Messages"
+    }
+    if ChatEngine.shared.isTyping(["chatId": row.chatId]) {
+      return "typing..."
+    }
+    if isOnline(for: row) {
+      return "online"
+    }
+    return row.isGroup ? "group" : "last seen recently"
+  }
+
+  private static func isOnline(for row: ChatHomeListRow) -> Bool {
+    guard let peerUserId = normalizedString(row.peerUserId) else { return false }
+    return ChatEngine.shared.isUserOnline(userId: peerUserId)
+  }
+
+  private static func profileHandle(for row: ChatHomeListRow) -> String {
+    if row.isSavedMessages {
+      return "saved chat"
+    }
+    if row.isGroup {
+      return "group chat"
+    }
+    if let peer = normalizedString(row.peerUserId) {
+      return "id: \(peer)"
+    }
+    return headerSubtitle(for: row)
+  }
+
+  private static func previewAppearance(isDark: Bool) -> [String: Any] {
+    if isDark {
+      return [
+        "theme": "dark",
+        "backgroundMode": "gradient",
+        "wallpaperGradient": ["#131325", "#0D0D1F"],
+        "wallpaperOpacity": 1.0,
+        "wallpaperPatternGradient": ["#115E59", "#0891B2", "#0284C7"],
+        "wallpaperPatternLocations": [0.0, 0.5, 1.0],
+        "wallpaperPatternOpacity": 0.12,
+        "wallpaperMaskKey": "doodles",
+      ]
+    }
+    return [
+      "theme": "light",
+      "backgroundMode": "gradient",
+      "wallpaperGradient": ["#F9F3EA", "#EFE6D9"],
+      "wallpaperOpacity": 1.0,
+      "wallpaperPatternGradient": ["#5A8A66", "#5A6675", "#8A75A3"],
+      "wallpaperPatternLocations": [0.0, 0.5, 1.0],
+      "wallpaperPatternOpacity": 0.06,
+      "wallpaperMaskKey": "doodles",
+    ]
+  }
+
+  private static func collectScrollViews(in view: UIView) -> [UIScrollView] {
+    var result: [UIScrollView] = []
+    if let scrollView = view as? UIScrollView {
+      result.append(scrollView)
+    }
+    for subview in view.subviews {
+      result.append(contentsOf: collectScrollViews(in: subview))
+    }
+    return result
+  }
+
+  private static func normalizedString(_ value: Any?) -> String? {
+    if let value = value as? String {
+      let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+      return trimmed.isEmpty ? nil : trimmed
+    }
+    if let value = value as? NSNumber {
+      return value.stringValue
+    }
+    return nil
   }
 }
 
@@ -2734,6 +3360,7 @@ private struct ContactsPageView: View {
               coordinator.openChat(ChatRoute(row: row))
             },
             onToggleSelection: { _ in },
+            onAction: { _, _ in },
             onRefresh: { await model.refresh() },
             onUnavailableAction: { _ in }
           )

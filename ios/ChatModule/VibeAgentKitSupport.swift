@@ -92,6 +92,7 @@ struct VibeAgentKitChatMessage: Equatable {
   /// `progressItems` only carries the depth-0 main feed (incl. the compact Task row);
   /// the subagent's own steps live here and render only in the read-only subagent view.
   var subagentChildren: [String: [VibeAgentKitProgressItem]]
+  var sourceMessageId: String?
   var runtime: ChatListRow.AgentRuntimeSummary?
   var attachments: [VibeAgentKitImageAttachment]
   /// A /compact context-summary turn — renders as a centered, collapsible mid-chat
@@ -118,6 +119,7 @@ struct VibeAgentKitChatMessage: Equatable {
     progress: [String] = [],
     progressItems: [VibeAgentKitProgressItem] = [],
     subagentChildren: [String: [VibeAgentKitProgressItem]] = [:],
+    sourceMessageId: String? = nil,
     runtime: ChatListRow.AgentRuntimeSummary? = nil,
     attachments: [VibeAgentKitImageAttachment] = [],
     isCompactionSummary: Bool = false,
@@ -138,6 +140,7 @@ struct VibeAgentKitChatMessage: Equatable {
     self.progress = progress
     self.progressItems = progressItems
     self.subagentChildren = subagentChildren
+    self.sourceMessageId = sourceMessageId
     self.runtime = runtime
     self.attachments = attachments
     self.isCompactionSummary = isCompactionSummary

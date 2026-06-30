@@ -197,8 +197,10 @@ defmodule VibeWeb.ChatController do
     if user_id != current_id do
       conn |> put_status(:forbidden) |> json(%{error: "Forbidden"})
     else
+      archived = Map.get(conn.params, "archived") in [true, "true", "1", 1]
+
       chats =
-        case Chat.list_chats(current_id) do
+        case Chat.list_chats(current_id, archived: archived) do
           list when is_list(list) -> list
           _ -> []
         end
@@ -235,6 +237,17 @@ defmodule VibeWeb.ChatController do
     if Chat.is_participant?(chat_id, user_id) do
       {count, _} = Chat.set_marked_unread(chat_id, user_id, unread)
       json(conn, %{success: count > 0})
+    else
+      conn |> put_status(:forbidden) |> json(%{error: "Not a participant"})
+    end
+  end
+
+  def archive(conn, %{"chat_id" => chat_id, "archived" => archived}) do
+    user_id = conn.assigns.current_user.id
+
+    if Chat.is_participant?(chat_id, user_id) do
+      {count, _} = Chat.set_archived(chat_id, user_id, archived)
+      json(conn, %{success: count > 0, archived: archived})
     else
       conn |> put_status(:forbidden) |> json(%{error: "Not a participant"})
     end

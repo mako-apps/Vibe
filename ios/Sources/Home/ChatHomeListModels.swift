@@ -283,6 +283,7 @@ struct ChatHomeListRow {
   let markedUnread: Bool
   let muted: Bool
   let pinned: Bool
+  let archived: Bool
   let isTyping: Bool
   let isOnline: Bool
   let peerUserId: String?
@@ -372,6 +373,7 @@ struct ChatHomeListRow {
       "markedUnread": markedUnread,
       "muted": muted,
       "pinned": pinned,
+      "archived": archived,
       "isTyping": isTyping,
       "isOnline": isOnline,
       "avatarFallback": avatarFallback,
@@ -405,6 +407,7 @@ struct ChatHomeListRow {
       markedUnread: markedUnread,
       muted: muted,
       pinned: pinned,
+      archived: archived,
       isTyping: isTyping,
       isOnline: isOnline,
       peerUserId: peerUserId,
@@ -458,6 +461,7 @@ struct ChatHomeListRow {
     let markedUnread = parseBool(raw["markedUnread"] ?? raw["marked_unread"]) ?? false
     let muted = parseBool(raw["muted"]) ?? false
     let pinned = parseBool(raw["pinned"]) ?? false
+    let archived = parseBool(raw["archived"]) ?? false
     let isTyping = parseBool(raw["isTyping"] ?? raw["is_typing"]) ?? false
     let isOnline = parseBool(raw["isOnline"] ?? raw["is_online"]) ?? false
     let friendId = normalizedString(
@@ -520,6 +524,7 @@ struct ChatHomeListRow {
       markedUnread: markedUnread,
       muted: muted,
       pinned: pinned,
+      archived: archived,
       isTyping: isTyping,
       isOnline: isOnline,
       peerUserId: peerUserId,

@@ -294,6 +294,7 @@ enum VibeAgentKitMap {
       progress: [],
       progressItems: (isCompaction || isInterrupted) ? [] : items,
       subagentChildren: (isCompaction || isInterrupted) ? [:] : subagentChildren,
+      sourceMessageId: (isCompaction || isInterrupted) ? nil : row.agentActionSourceId,
       runtime: (isCompaction || isInterrupted) ? nil : (row.isAgentMessage ? row.agentRuntime : nil),
       attachments: attachments,
       isCompactionSummary: isCompaction,
@@ -329,7 +330,17 @@ enum VibeAgentKitMap {
       // appears the instant a run begins instead of the view looking like nothing
       // is happening.
       let m = chatMessage(from: row)
-      if m.text.isEmpty && m.progressItems.isEmpty && m.runtime == nil && m.attachments.isEmpty && !m.isStreaming {
+      // A runtime with only metadata (status, provider, model) but no diff is not
+      // renderable — the cell's assistant body view hides everything, producing an
+      // empty cell that creates a large scrollable gap in the history view. Only
+      // treat the runtime as "real content" when it carries an actual file diff.
+      let hasRenderableRuntime: Bool = {
+        guard let rt = m.runtime, let diff = rt.diff else { return false }
+        let hasPatch = diff.patch?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        return diff.filesChanged > 0 || diff.additions > 0 || diff.deletions > 0
+          || !diff.files.isEmpty || hasPatch
+      }()
+      if m.text.isEmpty && m.progressItems.isEmpty && !hasRenderableRuntime && m.attachments.isEmpty && !m.isStreaming {
         continue
       }
       if m.role == .user, m.attachments.isEmpty {
@@ -367,7 +378,31 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   /// for banner/catalog computations but suppressed from the table — they render in the
   /// glass overlay instead.
   private var tableMessages: [VibeAgentKitChatMessage] {
-    messages.filter { $0.runtime?.command?.executable?.lowercased() != "vibe-bridge" }
+    messages.filter { msg in
+      // Bridge info-command results render in the glass overlay, not the table.
+      if msg.runtime?.command?.executable?.lowercased() == "vibe-bridge" { return false }
+      // Skip agent messages that carry no renderable content: no text, no progress
+      // items, no attachments, not streaming, and no runtime diff. Such messages
+      // produce empty cells that create a scrollable gap (the "huge empty state" bug
+      // when opening history).
+      if msg.role == .assistant,
+        !msg.isStreaming,
+        !msg.isCompactionSummary,
+        msg.systemDividerText == nil,
+        msg.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+        msg.progressItems.isEmpty,
+        msg.attachments.isEmpty
+      {
+        let hasDiff: Bool = {
+          guard let diff = msg.runtime?.diff else { return false }
+          let hasPatch = diff.patch?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+          return diff.filesChanged > 0 || diff.additions > 0 || diff.deletions > 0
+            || !diff.files.isEmpty || hasPatch
+        }()
+        if !hasDiff { return false }
+      }
+      return true
+    }
   }
   private var appearance: VibeAgentKitChatAppearance
   private let runtimeTitle: String
@@ -398,9 +433,6 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   private var subagentToastTarget: (messageId: String, nodeId: String)?
   private var subagentToastHideWork: DispatchWorkItem?
   private var toastedSubagentIds: Set<String> = []
-  // Ask requests (plan approval / question) we've already shown a sheet for, so a
-  // re-pushed `agent-bridge-ask` (e.g. after a socket reconnect) can't double-prompt.
-  private var presentedAskRequestIds: Set<String> = []
   private weak var openSubagentDetail: VibeAgentSubagentDetailViewController?
   private var openSubagentRef: (messageId: String, nodeId: String)?
 
@@ -614,11 +646,19 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     navigationItem.rightBarButtonItems = rightBarButtonItems()
   }
 
-  /// The trailing header items. The avatar always sits in the same (rightmost) slot; the
-  /// item beside it toggles between History (fresh/empty state) and New Chat (an active
-  /// conversation) — never a third button.
+  /// The trailing header items.
   private func rightBarButtonItems() -> [UIBarButtonItem] {
-    [makeProfileBarButtonItem(), makeHistoryOrNewChatBarButtonItem()]
+    var items: [UIBarButtonItem] = [makeProfileBarButtonItem()]
+
+    // Add History button next to the profile.
+    items.append(UIBarButtonItem(customView: makeHistoryButton()))
+
+    // If a historic conversation is loaded, also show the New Chat button.
+    if isHistoryPicked {
+      items.append(UIBarButtonItem(customView: makeNewChatButton()))
+    }
+    
+    return items
   }
 
   private func makeProfileBarButtonItem() -> UIBarButtonItem {
@@ -630,25 +670,20 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     return item
   }
 
-  private func makeHistoryOrNewChatBarButtonItem() -> UIBarButtonItem {
-    if isHistoryPicked {
-      let item = UIBarButtonItem(
-        image: UIImage(systemName: "square.and.pencil"),
-        style: .plain,
-        target: self,
-        action: #selector(newChatTapped)
-      )
-      item.accessibilityLabel = "New Chat"
-      return item
-    }
-    let item = UIBarButtonItem(
-      image: UIImage(systemName: "clock.arrow.circlepath"),
-      style: .plain,
-      target: self,
-      action: #selector(historyTapped)
-    )
-    item.accessibilityLabel = "History"
-    return item
+  private func makeHistoryButton() -> UIButton {
+    let btn = UIButton(type: .system)
+    btn.setImage(UIImage(systemName: "clock.arrow.circlepath"), for: .normal)
+    btn.addTarget(self, action: #selector(historyTapped), for: .touchUpInside)
+    btn.accessibilityLabel = "History"
+    return btn
+  }
+
+  private func makeNewChatButton() -> UIButton {
+    let btn = UIButton(type: .system)
+    btn.setImage(UIImage(systemName: "square.and.pencil"), for: .normal)
+    btn.addTarget(self, action: #selector(newChatTapped), for: .touchUpInside)
+    btn.accessibilityLabel = "New Chat"
+    return btn
   }
 
   /// Feed the header avatar the conversation's real identity so it renders the same
@@ -1005,12 +1040,20 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
 
     var resolvedWorkingSources: [(sourceId: String, workingId: String)] = []
     for (sourceId, workingId) in localWorkingMessageIdBySourceId {
-      guard let sourceIndex = incoming.firstIndex(where: { $0.id == sourceId }) else { continue }
-      let replyStart = incoming.index(after: sourceIndex)
-      let hasRealReply = replyStart < incoming.endIndex
-        && incoming[replyStart...].contains { message in
-          !message.role.isUser && !message.id.hasPrefix("local-working-")
-        }
+      let hasSourceLinkedReply = incoming.contains { message in
+        !message.role.isUser
+          && !message.id.hasPrefix("local-working-")
+          && message.sourceMessageId == sourceId
+      }
+      let hasAdjacentReply: Bool = {
+        guard let sourceIndex = incoming.firstIndex(where: { $0.id == sourceId }) else { return false }
+        let replyStart = incoming.index(after: sourceIndex)
+        return replyStart < incoming.endIndex
+          && incoming[replyStart...].contains { message in
+            !message.role.isUser && !message.id.hasPrefix("local-working-")
+          }
+      }()
+      let hasRealReply = hasSourceLinkedReply || hasAdjacentReply
       guard hasRealReply else { continue }
       resolvedWorkingSources.append((sourceId, workingId))
     }
@@ -1237,15 +1280,28 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       NSLog("[AgentView][ask] DROP — chatId mismatch vc=%@ info=%@", chatId, infoChatId)
       return
     }
+    // Every agent session — Claude AND Codex, every run — ingests into the SAME DM
+    // chatId (sessions are isolated only by a `bridge-<sessionId>-` message prefix).
+    // So a chatId match alone lets the OTHER provider's ask surface on this page.
+    // Scope to this page's provider too, so a Codex ask can't pop up on the Claude
+    // page (and vice-versa). Only drop when both sides name a provider and disagree.
+    let infoProvider =
+      (info["provider"] as? String)?
+      .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+    let vcProvider =
+      (agentBridgeProvider ?? "")
+      .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if !infoProvider.isEmpty, !vcProvider.isEmpty, infoProvider != vcProvider {
+      NSLog(
+        "[AgentView][ask] DROP — provider mismatch vc=%@ info=%@ requestId=%@",
+        vcProvider, infoProvider, infoRequestId)
+      return
+    }
     guard !infoRequestId.isEmpty else {
       NSLog("[AgentView][ask] DROP — empty requestId")
       return
     }
     let requestId = infoRequestId
-    if presentedAskRequestIds.contains(requestId) {
-      NSLog("[AgentView][ask] DROP — already presented requestId=%@", requestId)
-      return
-    }
     guard let payload = ChatEngine.shared.latestAgentBridgeAsk(requestId: requestId) else {
       NSLog("[AgentView][ask] DROP — no stored payload for requestId=%@", requestId)
       return
@@ -1267,8 +1323,13 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     }
     let kind = (body["kind"] as? String) ?? (info["kind"] as? String) ?? "ask"
     let request = (body["request"] as? [String: Any]) ?? body
+    // Cross-surface dedup: claim once so the bubble surface (or another agent view)
+    // doesn't also present this same ask.
+    guard ChatEngine.shared.claimAgentBridgeAskPresentation(requestId: requestId) else {
+      NSLog("[AgentView][ask] DROP — already claimed by another surface requestId=%@", requestId)
+      return
+    }
     NSLog("[AgentView][ask] PRESENT sheet kind=%@ requestId=%@ reqKeys=%@", kind, requestId, request.keys.joined(separator: ","))
-    presentedAskRequestIds.insert(requestId)
     presentAskSheet(
       requestId: requestId,
       kind: kind,
@@ -2990,14 +3051,15 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     tableView.contentInset.top = top
     tableView.verticalScrollIndicatorInsets.bottom = bottom
     tableView.verticalScrollIndicatorInsets.top = top
-    if wasNearBottom, pushToTopReserve <= 0, toggleScrollLockDepth == 0 {
+    if wasNearBottom, pushToTopUserId == nil, pushToTopReserve <= 0, toggleScrollLockDepth == 0 {
       scrollToBottom(animated: false)
     }
   }
 
   /// The reserve needed RIGHT NOW so the pinned user message can stay at the top with the
-  /// answer streaming below it: `viewport − (content below the question)`. Returns 0 when
-  /// nothing is pinned or the turn has already produced enough content to fill the screen,
+  /// answer streaming below it. Sized so the max scroll offset equals the pinned question's
+  /// offset (`contentSize + reserve - bounds == userMinY - paddingTop`), matching the
+  /// collection-view agent surface. Returns 0 once the answer fills the available space,
   /// so the gap closes itself (Resolo's self-correcting floor, ported to a UITableView).
   private func computedPushToTopReserve() -> CGFloat {
     guard let id = pushToTopUserId,
@@ -3006,14 +3068,8 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     let rect = tableView.rectForRow(at: IndexPath(row: idx, section: 0))
     guard rect.height > 0 else { return 0 }
     let topInset = tableView.adjustedContentInset.top
-    // Measure the room actually visible BELOW the pinned question — down to the floating
-    // composer's top edge, NOT all the way to the home indicator. The composer overlaps the
-    // feed, so reserving to the safe-area bottom over-reserved by ~the composer's height and
-    // left a second, empty stretch you could scroll into past the answer (the "double bottom
-    // gap", worst with a tall image bubble).
-    let composerCovered = max(0, view.bounds.maxY - composerView.frame.minY)
-    let viewport = max(0, tableView.bounds.height - topInset - composerCovered)
-    let contentBelow = max(0, tableView.contentSize.height - rect.maxY)
+    let viewport = max(0, tableView.bounds.height - topInset)
+    let contentBelow = max(0, tableView.contentSize.height - rect.minY)
     return max(0, viewport - contentBelow)
   }
 
@@ -3038,8 +3094,31 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     tableView.layoutIfNeeded()
     let rect = tableView.rectForRow(at: IndexPath(row: idx, section: 0))
     let topInset = tableView.adjustedContentInset.top
-    let targetY = max(-topInset, rect.minY - topInset)
-    tableView.setContentOffset(CGPoint(x: 0, y: targetY), animated: animated)
+    let targetY = pixelAlignedValue(max(-topInset, rect.minY - topInset))
+    setTableContentOffset(CGPoint(x: 0, y: targetY), animated: animated)
+  }
+
+  private func setTableContentOffset(_ offset: CGPoint, animated: Bool) {
+    guard animated else {
+      tableView.setContentOffset(offset, animated: false)
+      return
+    }
+    UIView.animate(
+      withDuration: 0.42,
+      delay: 0,
+      usingSpringWithDamping: 0.82,
+      initialSpringVelocity: 0.4,
+      options: [.beginFromCurrentState, .allowUserInteraction]
+    ) {
+      self.tableView.setContentOffset(offset, animated: false)
+    }
+  }
+
+  private func pixelAlignedValue(_ value: CGFloat) -> CGFloat {
+    let scale =
+      view.window?.windowScene?.screen.scale ?? view.window?.screen.scale ?? traitCollection.displayScale
+    guard scale > 0 else { return value }
+    return (value * scale).rounded(.toNearestOrAwayFromZero) / scale
   }
 
   private func isNearBottom() -> Bool {
@@ -3268,8 +3347,8 @@ final class VibeAgentHeaderAvatarView: UIControl {
 
     let avatarWidth = widthAnchor.constraint(equalToConstant: diameter)
     let avatarHeight = heightAnchor.constraint(equalToConstant: diameter)
-    avatarWidth.priority = UILayoutPriority(999)
-    avatarHeight.priority = UILayoutPriority(999)
+    avatarWidth.priority = .required
+    avatarHeight.priority = .required
     NSLayoutConstraint.activate([avatarWidth, avatarHeight])
   }
 
@@ -3279,8 +3358,8 @@ final class VibeAgentHeaderAvatarView: UIControl {
 
   override func layoutSubviews() {
     super.layoutSubviews()
-    layer.cornerRadius = bounds.height / 2
-    imageView.layer.cornerRadius = bounds.height / 2
+    layer.cornerRadius = diameter / 2
+    imageView.layer.cornerRadius = diameter / 2
     CATransaction.begin()
     CATransaction.setDisableActions(true)
     gradientLayer.frame = bounds
@@ -3399,10 +3478,8 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
   private let optionPillButton = UIButton(type: .system)
   private let textView = UITextView()
   private let placeholderLabel = UILabel()
-  // Plain "/" command button lives in the outside glass slot. The image attach "+"
-  // lives inside the input pill where the slash used to be.
+  
   private let slashButton = UIButton(type: .system)
-  private let slashButtonSize: CGFloat = 30
   private let sendButton = UIButton(type: .system)
 
   private let micGlass = UIVisualEffectView(effect: nil)
@@ -3615,12 +3692,12 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
   private func measuredTextHeight() -> CGFloat {
     let w = bounds.width > 0 ? bounds.width : (window?.bounds.width ?? UIScreen.main.bounds.width)
     let clampedSend = max(0, min(1, sendProgress))
-    let pillLeft = pagePadding + sideSize + sideGap
+    let pillLeft = pagePadding + sideSize + sideGap // only attach pill outside
     let pillRightIdle = w - pagePadding - sideSize - sideGap
     let pillRight = pillRightIdle + (sideSize + sideGap) * clampedSend
     let sendReserve = (sendButtonSize + 6) * clampedSend
-    let leadingReserve = slashButtonSize + 6
-    let textW = max(1, pillRight - pillLeft - textInsetH * 2 - sendReserve - leadingReserve)
+    let slashReserve = sendButtonSize + 4
+    let textW = max(1, pillRight - pillLeft - textInsetH - slashReserve - textInsetH - sendReserve)
     return textView.sizeThatFits(CGSize(width: textW, height: .greatestFiniteMagnitude)).height
   }
 
@@ -3640,7 +3717,7 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
       self?.refreshModePill()
     }
 
-    // Attach glass pill (left)
+    // Attach glass pill (left 1)
     configureGlass(attachGlass)
     addSubview(attachGlass)
     configureIconButton(plusButton, systemName: "plus")
@@ -3656,16 +3733,17 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
     pillContainer.layer.cornerCurve = .continuous
     pillGlass.contentView.addSubview(pillContainer)
 
-    configureOptionPill()
-    pillContainer.addSubview(optionPillButton)
-
+    // Slash button (inside text pill, left side)
     slashButton.setTitle(nil, for: .normal)
-    slashButton.setImage(UIImage(systemName: "slash.circle", withConfiguration: UIImage.SymbolConfiguration(pointSize: 22, weight: .regular)), for: .normal)
-    slashButton.tintColor = appearance.text
+    slashButton.setImage(UIImage(systemName: "slash.circle", withConfiguration: UIImage.SymbolConfiguration(pointSize: 20, weight: .light)), for: .normal)
+    slashButton.tintColor = appearance.text.withAlphaComponent(0.6)
     slashButton.accessibilityLabel = "Slash commands"
     slashButton.showsMenuAsPrimaryAction = true
     pillContainer.addSubview(slashButton)
     updateSlashMenu()
+
+    configureOptionPill()
+    pillContainer.addSubview(optionPillButton)
 
     placeholderLabel.text = placeholder
     placeholderLabel.font = UIFont.systemFont(ofSize: 17)
@@ -3731,11 +3809,11 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
     button.setImage(
       UIImage(
         systemName: systemName,
-        withConfiguration: UIImage.SymbolConfiguration(pointSize: 15, weight: .regular)),
+        withConfiguration: UIImage.SymbolConfiguration(pointSize: 15, weight: .light)),
       for: .normal)
     button.imageView?.contentMode = .scaleAspectFit
     button.backgroundColor = .clear
-    button.tintColor = appearance.text
+    button.tintColor = appearance.text.withAlphaComponent(0.6)
   }
 
   private func configureOptionPill() {
@@ -3775,11 +3853,11 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
     textView.textColor = appearance.text
     textView.tintColor = appearance.text
     placeholderLabel.textColor = appearance.textTertiary
-    plusButton.tintColor = appearance.text
-    slashButton.tintColor = appearance.text
+    plusButton.tintColor = appearance.text.withAlphaComponent(0.6)
+    slashButton.tintColor = appearance.text.withAlphaComponent(0.6)
     optionPillButton.tintColor = appearance.text
     setActiveOptionPill(activeOptionTitle)
-    micButton.tintColor = isDictating ? .systemRed : appearance.text
+    micButton.tintColor = isDictating ? .systemRed : appearance.text.withAlphaComponent(0.6)
     sendButton.backgroundColor = appearance.text
     applySendButtonGlyph()
     updateAttachmentIndicator()
@@ -3802,16 +3880,16 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
     let leftEdge = pagePadding
     let rightEdge = w - pagePadding
 
-    let pillLeft = leftEdge + sideSize + sideGap
+    let attachCenterX = leftEdge + sideSize / 2
+    let pillLeft = attachCenterX + sideSize / 2 + sideGap
     let pillRightIdle = rightEdge - sideSize - sideGap
     // As send appears the mic leaves, so the text pill extends to the page edge.
     let pillRight = pillRightIdle + (sideSize + sideGap) * clampedSend
     let pillW = max(1, pillRight - pillLeft)
 
     let sendReserve = (sendButtonSize + 6) * clampedSend
-    // The leading attachment button reserves room before the text/placeholder.
-    let leadingReserve = slashButtonSize + 6
-    let textW = max(1, pillW - textInsetH * 2 - sendReserve - leadingReserve)
+    let slashReserve = sendButtonSize + 4
+    let textW = max(1, pillW - textInsetH - slashReserve - textInsetH - sendReserve)
     let measured = textView.sizeThatFits(CGSize(width: textW, height: .greatestFiniteMagnitude)).height
     let maxTextHeight = max(minPillH - textInsetV * 2, maxPillH - textInsetV * 2 - optionReserve)
     let clampedTextH = max(minPillH - textInsetV * 2, min(maxTextHeight, measured))
@@ -3833,7 +3911,7 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
     let squareBounds = CGRect(origin: .zero, size: CGSize(width: sideSize, height: sideSize))
 
     attachGlass.bounds = squareBounds
-    attachGlass.center = CGPoint(x: leftEdge + sideSize / 2, y: btnCenterY)
+    attachGlass.center = CGPoint(x: attachCenterX, y: btnCenterY)
     plusButton.frame = attachGlass.contentView.bounds
 
     let micCenterX = rightEdge - sideSize / 2 + (sideSize + sideGap * 2) * clampedSend
@@ -3842,15 +3920,12 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
     micGlass.alpha = micVisibility
     micButton.frame = micGlass.contentView.bounds
 
-    // Leading slash button — bottom-aligned inside the pill, just before the text.
-    let slashInset = max(4, (minPillH - slashButtonSize) / 2)
-    slashButton.frame = CGRect(
-      x: textInsetH - 2,
-      y: pillH - slashButtonSize - slashInset,
-      width: slashButtonSize,
-      height: slashButtonSize)
+    let sendInset = max(4, (minPillH - sendButtonSize) / 2)
+    slashButton.bounds = CGRect(origin: .zero, size: CGSize(width: sendButtonSize, height: sendButtonSize))
+    slashButton.center = CGPoint(x: textInsetH - 4 + sendButtonSize / 2, y: pillH - sendButtonSize / 2 - sendInset)
+    slashButton.layer.cornerRadius = sendButtonSize / 2
 
-    let tfX = textInsetH + leadingReserve
+    let tfX = textInsetH + slashReserve
     if let activeOptionTitle {
       let pillWLimit = max(80, pillW - tfX - sendReserve - 8)
       let pillSize = optionPillButton.sizeThatFits(
@@ -3871,7 +3946,6 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
     placeholderLabel.frame = CGRect(
       x: tfX + 2, y: tfY, width: max(1, pillW - tfX - 4 - sendReserve), height: clampedTextH)
 
-    let sendInset = max(4, (minPillH - sendButtonSize) / 2)
     sendButton.bounds = CGRect(origin: .zero, size: CGSize(width: sendButtonSize, height: sendButtonSize))
     sendButton.center = CGPoint(
       x: pillW - 4 - sendButtonSize / 2, y: pillH - sendButtonSize / 2 - sendInset)
@@ -3892,6 +3966,7 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
 
     barHeight = topVPad + pillH + bottomVPad + safeAreaInsets.bottom + paletteReserved
 
+    pillContainer.bringSubviewToFront(slashButton)
     pillContainer.bringSubviewToFront(sendButton)
     pillContainer.bringSubviewToFront(plusButton)
   }

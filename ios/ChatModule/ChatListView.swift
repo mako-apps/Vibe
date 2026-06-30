@@ -2872,6 +2872,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       }
       return
     }
+    // Mid-run ask / plan-approval sheets must surface on the bubble (chat) surface too.
+    // The full-page agent view also presents these, but it's only mounted when this DM's
+    // Default view = Agent; with Default view = Chat nothing else observes the ask, so the
+    // run silently blocks for the full ASK timeout. Handle it here (deduped, scoped to this
+    // DM + provider). Runs ahead of the statusAuthority gate so a held-back list still prompts.
+    if (note.userInfo?["reason"] as? String) == "agentBridgeAsk" {
+      presentAgentBridgeAskIfNeeded(note.userInfo ?? [:])
+      return
+    }
     guard statusAuthorityEnabled else { return }
     let changedChatId = (note.userInfo?["chatId"] as? String)?.trimmingCharacters(
       in: .whitespacesAndNewlines)
@@ -2921,6 +2930,118 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       return
     }
     refreshVisibleStatuses(reason: reason)
+  }
+
+  /// Present a mid-run agent ask / plan-approval sheet from the bubble (chat) surface.
+  /// Mirrors VibeAgentConversationView.handleAgentBridgeAsk, but runs when only the chat
+  /// surface is shown so an `ask_user` / plan still prompts. No-ops if the full-page agent
+  /// view is hosting this DM (it owns the sheet then), or on a chat/provider/dedup mismatch.
+  private func presentAgentBridgeAskIfNeeded(_ info: [AnyHashable: Any]) {
+    // Full-page agent view present → let it own the sheet (it also wires plan re-runs
+    // through its own send path). Avoids a double-present of the same requestId.
+    if presentedBridgeAgentVC != nil { return }
+
+    let infoChatId = (info["chatId"] as? String) ?? ""
+    let requestId = (info["requestId"] as? String) ?? ""
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !chatId.isEmpty, infoChatId == chatId else {
+      NSLog("[ChatListView][ask] DROP — chatId mismatch vc=%@ info=%@", chatId, infoChatId)
+      return
+    }
+    guard !requestId.isEmpty else { return }
+    // All agent sessions share ONE DM chatId, so scope by provider too — a Codex ask must
+    // not surface on a Claude chat (and vice-versa). Only drop on a definite mismatch.
+    let infoProvider =
+      (info["provider"] as? String)?
+      .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+    let vcProvider =
+      (currentBridgeProvider ?? "")
+      .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if !infoProvider.isEmpty, !vcProvider.isEmpty, infoProvider != vcProvider {
+      NSLog(
+        "[ChatListView][ask] DROP — provider mismatch chat=%@ vc=%@ info=%@",
+        chatId, vcProvider, infoProvider)
+      return
+    }
+
+    guard let payload = ChatEngine.shared.latestAgentBridgeAsk(requestId: requestId) else {
+      NSLog("[ChatListView][ask] DROP — no stored payload requestId=%@", requestId)
+      return
+    }
+    // Body is E2E-sealed (`askEnc`); fall back to plaintext `request` for a keyless pairing.
+    var body: [String: Any]
+    if let dec = AgentRuntimeCrypto.decrypt(payload["askEnc"]) {
+      body = dec
+    } else if let raw = payload["request"] as? [String: Any] {
+      body = ["request": raw]
+    } else {
+      NSLog("[ChatListView][ask] DROP — decrypt failed & no plaintext requestId=%@", requestId)
+      return
+    }
+    let kind = (body["kind"] as? String) ?? (info["kind"] as? String) ?? "ask"
+    let request = (body["request"] as? [String: Any]) ?? body
+    let provider = info["provider"] as? String
+
+    guard let presenter = topPresentingViewController() else {
+      NSLog("[ChatListView][ask] DROP — no presenter requestId=%@", requestId)
+      return
+    }
+    // Cross-surface dedup: claim once so a full-page agent view doesn't also present it.
+    guard ChatEngine.shared.claimAgentBridgeAskPresentation(requestId: requestId) else {
+      NSLog("[ChatListView][ask] DROP — already claimed by another surface requestId=%@", requestId)
+      return
+    }
+    let kitAppearance: VibeAgentKitChatAppearance =
+      traitCollection.userInterfaceStyle == .light ? .lightFallback : .fallback
+    let sheet = VibeAgentAskSheetViewController(kind: kind, request: request, appearance: kitAppearance)
+    sheet.onResolve = { [weak self] decision, answer in
+      self?.resolveAgentBridgeAsk(
+        requestId: requestId, kind: kind, provider: provider,
+        request: request, decision: decision, answer: answer)
+    }
+    if let presentation = sheet.sheetPresentationController {
+      presentation.detents = [.medium(), .large()]
+      presentation.prefersGrabberVisible = true
+      presentation.preferredCornerRadius = 22
+    }
+    NSLog("[ChatListView][ask] PRESENT sheet kind=%@ requestId=%@ chat=%@", kind, requestId, chatId)
+    presenter.present(sheet, animated: true)
+  }
+
+  /// Send the ask answer back to the bridge; for an approved/rejected plan, continue the
+  /// run on the normal chat send path (mirrors VibeAgentConversationView.resolveAgentBridgeAsk).
+  private func resolveAgentBridgeAsk(
+    requestId: String, kind: String, provider: String?,
+    request: [String: Any], decision: String, answer: [String: Any]?
+  ) {
+    var payload: [String: Any] = [
+      "chatId": engineChatId,
+      "requestId": requestId,
+      "decision": decision,
+    ]
+    if let provider, !provider.isEmpty { payload["provider"] = provider }
+    if let answer, !answer.isEmpty { payload["answer"] = answer }
+    _ = ChatEngine.shared.sendAgentBridgeAskResponse(payload)
+
+    guard kind == "plan" else { return }
+    let resolvedProvider = currentBridgeProvider ?? provider ?? "codex"
+    let feedback = (answer?["feedback"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    if decision == "approve" {
+      // Approving means edits are OK → leave plan mode so the implementation turn can write.
+      AgentBridgeSelectionStore.setWorkMode(.allowEdits)
+      var prompt = "The plan above is approved. Implement it now, end to end."
+      if let feedback, !feedback.isEmpty { prompt += "\n\nAdditional guidance:\n\(feedback)" }
+      if let plan = (request["plan"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+        !plan.isEmpty
+      {
+        prompt += "\n\nApproved plan:\n\(plan)"
+      }
+      handleNativeSend(text: prompt, mentionedAgentUsername: resolvedProvider)
+    } else if decision == "reject", let feedback, !feedback.isEmpty {
+      handleNativeSend(
+        text: "Please revise the plan based on this feedback, then present the updated plan:\n\(feedback)",
+        mentionedAgentUsername: resolvedProvider)
+    }
   }
 
   private func hydrateRowsFromNativeHistoryIfReady(trigger: String) {
@@ -5394,7 +5515,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           self?.loadBridgeSessionIntoChat(provider: provider, session: session)
         }
       ))
-    host.modalPresentationStyle = .fullScreen
+    host.view.backgroundColor = .clear
     presenter.present(host, animated: true)
   }
 

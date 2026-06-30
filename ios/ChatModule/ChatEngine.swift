@@ -423,6 +423,10 @@ final class ChatEngine {
   // `didChangeNotification` reason "agentBridgeAsk" and read it via
   // `latestAgentBridgeAsk(requestId:)`, then reply with `sendAgentBridgeAskResponse`.
   private var agentBridgeAskByRequestId: [String: [String: Any]] = [:]
+  // RequestIds already claimed for sheet presentation, so the two surfaces that can both
+  // be alive at once (chat bubble view + full-page agent view / profile session view)
+  // never double-prompt the same ask. Claimed via `claimAgentBridgeAskPresentation`.
+  private var presentedAskRequestIds: Set<String> = []
   // Pending "open this past session into the chat as bubbles" requests, keyed by
   // the detail requestId we pushed -> the target chat/provider. When the matching
   // "detail" reply lands we synthesize its transcript into chat rows.
@@ -525,11 +529,15 @@ final class ChatEngine {
   private func persistOutboundStateLocked() {
     guard let userId = currentOutboundUserIdLocked() else { return }
     let persistedDrafts = pendingOutboundDraftsByMessageId.filter { _, draft in
-      bridgeProviderForOutboundDraftLocked(draft) == nil
+      guard bridgeProviderForOutboundDraftLocked(draft) == nil else { return false }
+      let chatId = normalizedString(draft["chatId"] ?? draft["chat_id"])
+      return !isBuiltInAgentChatId(chatId)
     }
     var persistedQueues: [String: [String]] = [:]
     for (chatId, ids) in pendingOutboundQueueByChat {
-      if isVolatileBridgeAgentChatLocked(chatId: chatId) { continue }
+      if isBuiltInAgentChatId(chatId) || isVolatileBridgeAgentChatLocked(chatId: chatId) {
+        continue
+      }
       let keptIds = ids.filter { persistedDrafts[$0] != nil }
       if !keptIds.isEmpty { persistedQueues[chatId] = keptIds }
     }
@@ -564,6 +572,11 @@ final class ChatEngine {
           skippedBridgeDrafts += 1
           continue
         }
+        let draftChatId = normalizedString(draft["chatId"] ?? draft["chat_id"])
+        if isBuiltInAgentChatId(draftChatId) {
+          skippedBridgeDrafts += 1
+          continue
+        }
         restoredDrafts[messageId] = draft
       }
     }
@@ -572,7 +585,7 @@ final class ChatEngine {
     var restoredQueues: [String: [String]] = [:]
     for (chatId, value) in rawQueues {
       if let ids = value as? [String], !ids.isEmpty {
-        if isVolatileBridgeAgentChatLocked(chatId: chatId) {
+        if isBuiltInAgentChatId(chatId) || isVolatileBridgeAgentChatLocked(chatId: chatId) {
           skippedBridgeDrafts += ids.count
           continue
         }
@@ -1959,6 +1972,21 @@ final class ChatEngine {
   func latestAgentBridgeAsk(requestId rawRequestId: String) -> [String: Any]? {
     let requestId = normalizedString(rawRequestId) ?? rawRequestId
     return syncOnQueue { agentBridgeAskByRequestId[requestId] }
+  }
+
+  /// Atomically claim an ask requestId for sheet presentation. Returns `true` exactly
+  /// once per requestId — that caller should present the sheet; every later caller gets
+  /// `false` and must skip. This is the cross-surface dedup: the chat bubble view and a
+  /// full-page agent view (incl. the profile session view) can both observe the same
+  /// `agentBridgeAsk`, and without this they'd each present a sheet.
+  func claimAgentBridgeAskPresentation(requestId rawRequestId: String) -> Bool {
+    let requestId = normalizedString(rawRequestId) ?? rawRequestId
+    guard !requestId.isEmpty else { return false }
+    return syncOnQueue {
+      if presentedAskRequestIds.contains(requestId) { return false }
+      presentedAskRequestIds.insert(requestId)
+      return true
+    }
   }
 
   /// Reply to a bridge-issued ask. `decision` ∈ "approve" | "reject" | "answer".
@@ -7297,6 +7325,28 @@ final class ChatEngine {
   private func queueOutboundDraftLocked(
     chatId: String, messageId: String, payload: [String: Any], reason: String
   ) {
+    if isBuiltInAgentChatId(chatId) {
+      pendingOutboundDraftsByMessageId.removeValue(forKey: messageId)
+      if var ids = pendingOutboundQueueByChat[chatId] {
+        ids.removeAll { $0 == messageId }
+        if ids.isEmpty {
+          pendingOutboundQueueByChat.removeValue(forKey: chatId)
+        } else {
+          pendingOutboundQueueByChat[chatId] = ids
+        }
+      }
+      removeMessageIndicesLocked(chatId: chatId, messageId: messageId)
+      markLiveMessageDeletedLocked(chatId: chatId, messageId: messageId)
+      persistOutboundStateLocked()
+      appendJournalLocked(
+        event: "native-outgoing-drop",
+        payload: [
+          "chatId": chatId,
+          "messageId": messageId,
+          "reason": "built_in_agent_surface:\(reason)",
+        ])
+      return
+    }
     if let provider = bridgeProviderForOutboundDraftLocked(payload, fallbackChatId: chatId) {
       _ = failVolatileBridgeSendLocked(
         chatId: chatId,
@@ -7363,6 +7413,10 @@ final class ChatEngine {
   }
 
   private func scheduleReplayQueuedOutboundLocked(chatId: String, trigger: String) {
+    if isBuiltInAgentChatId(chatId) {
+      dropQueuedOutboundForChatLocked(chatId: chatId, reason: "built_in_agent_replay_\(trigger)")
+      return
+    }
     if isVolatileBridgeAgentChatLocked(chatId: chatId) {
       dropQueuedOutboundForChatLocked(chatId: chatId, reason: "replay_\(trigger)")
       return

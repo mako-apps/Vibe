@@ -80,10 +80,11 @@ defmodule Vibe.Chat do
     Repo.all(from(p in Participant, where: p.chat_id == ^chat_id))
   end
 
-  def list_chats(user_id) do
-    loader = fn -> list_chats_uncached(user_id) end
+  def list_chats(user_id, opts \\ []) do
+    archived = Keyword.get(opts, :archived, false)
+    loader = fn -> list_chats_uncached(user_id, archived: archived) end
 
-    if is_binary(user_id) and String.trim(user_id) != "" do
+    if !archived and is_binary(user_id) and String.trim(user_id) != "" do
       ChatHomeCache.fetch(user_id, loader)
     else
       loader.()
@@ -108,13 +109,19 @@ defmodule Vibe.Chat do
     )
   end
 
-  defp list_chats_uncached(user_id) do
+  defp list_chats_uncached(user_id, opts) do
+    archived = Keyword.get(opts, :archived, false)
+
     result =
       RepoRLS.with_user(user_id, fn ->
-        # Find all chats user is participating in (excluding deleted ones)
+        # Find all chats user is participating in (excluding deleted ones),
+        # split by the participant's active/archive state.
         user_chats_query =
           from(p in Participant,
-            where: p.user_id == ^user_id and (is_nil(p.deleted) or p.deleted == false),
+            where:
+              p.user_id == ^user_id and
+                (is_nil(p.deleted) or p.deleted == false) and
+                fragment("COALESCE(?, false) = ?", p.archived, ^archived),
             select: {p.chat_id, p}
           )
 
@@ -308,6 +315,7 @@ defmodule Vibe.Chat do
             members: members,
             messages: messages_for_client,
             unreadCount: 0,
+            archived: my_settings.archived,
             pinned: my_settings.pinned,
             muted: my_settings.muted
           }
@@ -948,6 +956,15 @@ defmodule Vibe.Chat do
     result
   end
 
+  def set_archived(chat_id, user_id, archived) do
+    result =
+      from(p in Participant, where: p.chat_id == ^chat_id and p.user_id == ^user_id)
+      |> Repo.update_all(set: [archived: archived])
+
+    ChatHomeCache.invalidate_user(user_id)
+    result
+  end
+
   def delete_chat(chat_id, user_id) do
     # Instead of deleting the chat, we mark the participant as deleted
     # This way the other user can still see the chat
@@ -982,7 +999,7 @@ defmodule Vibe.Chat do
       participant.deleted == true ->
         # Was deleted - restore it
         from(p in Participant, where: p.chat_id == ^chat_id and p.user_id == ^user_id)
-        |> Repo.update_all(set: [deleted: false])
+        |> Repo.update_all(set: [deleted: false, archived: false])
 
         ChatHomeCache.invalidate_user(user_id)
         :restored

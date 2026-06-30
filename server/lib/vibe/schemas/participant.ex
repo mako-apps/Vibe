@@ -9,6 +9,7 @@ defmodule Vibe.Chat.Participant do
     field :muted, :boolean, default: false
     field :pinned, :boolean, default: false
     field :marked_unread, :boolean, default: false
+    field :archived, :boolean, default: false
     field :deleted, :boolean, default: false
     field :messages_cleared_at, :naive_datetime
     field :role, :string, default: "member"       # "owner", "admin", "member", "subscriber"
@@ -18,7 +19,7 @@ defmodule Vibe.Chat.Participant do
 
   def changeset(participant, attrs) do
     participant
-    |> cast(attrs, [:chat_id, :user_id, :muted, :pinned, :marked_unread, :messages_cleared_at, :role])
+    |> cast(attrs, [:chat_id, :user_id, :muted, :pinned, :marked_unread, :archived, :messages_cleared_at, :role])
     |> validate_required([:chat_id, :user_id])
     |> validate_inclusion(:role, ["owner", "admin", "member", "subscriber"])
   end
