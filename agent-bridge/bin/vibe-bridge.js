@@ -2563,7 +2563,7 @@ async function runTask(channel, task) {
               `spawn→push=${now - spawnAt}ms bytes=${output.length} chat=${chatId} task=${taskId}`
           );
         }
-        channel.push("progress", {
+        const progressPayload = {
           provider,
           chatId,
           taskId,
@@ -2576,7 +2576,12 @@ async function runTask(channel, task) {
           workMode: workModeFor(task),
           model: modelFor(provider, chatId, task) || null,
           line,
-        });
+        };
+        channel.push("progress", progressPayload);
+        // Retain the latest frame so a reconnect can re-sync the live card (the socket
+        // drops constantly; frames pushed while down are lost — see recoverAfterReconnect).
+        const liveEntry = runningTasks.get(key);
+        if (liveEntry) liveEntry.lastProgress = progressPayload;
       }
     }
   };
@@ -2592,7 +2597,7 @@ async function runTask(channel, task) {
     if (canceled) return;
     if (Date.now() - lastChunkAt < KEEPALIVE_MS) return;
     const idleMs = Date.now() - spawnAt;
-    channel.push("progress", {
+    const keepalivePayload = {
       provider,
       chatId,
       taskId,
@@ -2605,7 +2610,10 @@ async function runTask(channel, task) {
       stage: "keepalive",
       sentAtMs: Date.now(),
       line: JSON.stringify({ type: "vibe_bridge_keepalive", provider, taskId, elapsedMs: idleMs }),
-    });
+    };
+    channel.push("progress", keepalivePayload);
+    const kaEntry = runningTasks.get(key);
+    if (kaEntry) kaEntry.lastProgress = keepalivePayload;
   }, KEEPALIVE_MS);
 
   child.on("error", (err) => {
@@ -4699,8 +4707,21 @@ function recoverAfterReconnect(channel) {
       rewatched++;
     } catch (_) {}
   }
+  // Re-sync STILL-RUNNING tasks: their progress frames pushed during the outage went to
+  // a dead socket and were lost, leaving the phone's live card frozen until the run ends.
+  // Re-pushing the last frame re-asserts the turn is alive (the phone merges progress into
+  // the same runtime card by taskId, so this never duplicates steps).
+  let resynced = 0;
+  for (const entry of runningTasks.values()) {
+    if (entry && entry.lastProgress) {
+      try {
+        channel.push("progress", { ...entry.lastProgress, sentAtMs: Date.now() });
+        resynced++;
+      } catch (_) {}
+    }
+  }
   console.log(
-    `[vibe-bridge] reconnected after ${downMs}ms down — recovery: redelivered=${redelivered} result(s), rewatched=${rewatched} chat(s)`
+    `[vibe-bridge] reconnected after ${downMs}ms down — recovery: redelivered=${redelivered} result(s), rewatched=${rewatched} chat(s), resynced=${resynced} running`
   );
   socketDownSince = null;
 }

@@ -1766,42 +1766,82 @@ final class ChatEngine {
     }
 
     return syncOnQueue {
-      guard let client = phoenixClient else {
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-          self?.ensureNativeTransport(trigger: "bridge_control_no_socket")
-        }
-        return ["accepted": false, "reason": "no_native_socket"]
-      }
-      guard nativeJoinedChatIds.contains(chatId), (state["connected"] as? Bool) == true else {
-        joinNativeChatTopicIfNeededLocked(chatId: chatId)
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-          self?.ensureNativeTransport(trigger: "bridge_control_chat_not_joined")
-        }
-        return ["accepted": false, "reason": "chat_not_joined"]
-      }
+      sendAgentBridgeControlLocked(
+        chatId: chatId, provider: provider, action: action, taskId: taskId, attempt: 0)
+    }
+  }
 
-      var wirePayload: [String: Any] = [
-        "action": action,
-        "provider": provider,
-      ]
-      if let taskId, !taskId.isEmpty {
-        wirePayload["taskId"] = taskId
+  /// Max times a control (cancel/revert) is re-attempted while the chat channel is
+  /// still (re)joining. A cancel is idempotent, and the agent bridge connection drops
+  /// constantly (recurring code=1006/1012), so a STOP tapped during a reconnect window
+  /// must NOT be silently dropped — it has to ride through once the socket is back, or
+  /// the run keeps streaming with no way to interrupt it.
+  private static let bridgeControlMaxAttempts = 8
+
+  private func sendAgentBridgeControlLocked(
+    chatId: String, provider: String, action: String, taskId: String?, attempt: Int
+  ) -> [String: Any] {
+    let willRetry = attempt + 1 < Self.bridgeControlMaxAttempts
+    guard let client = phoenixClient else {
+      DispatchQueue.global(qos: .utility).async { [weak self] in
+        self?.ensureNativeTransport(trigger: "bridge_control_no_socket")
       }
-      let ref = client.push(
-        topic: chatTopic(for: chatId),
-        event: "agent-bridge-control",
-        payload: wirePayload
-      )
-      appendJournalLocked(
-        event: "native-agent-bridge-control",
-        payload: ["chatId": chatId, "provider": provider, "action": action, "ref": ref]
-      )
-      state["updatedAt"] = nowMs()
-      postChangeLocked(
-        reason: "agentBridgeControlSent",
-        userInfo: ["chatId": chatId, "provider": provider, "action": action]
-      )
-      return ["accepted": true, "transport": "native", "ref": ref]
+      scheduleAgentBridgeControlRetryLocked(
+        chatId: chatId, provider: provider, action: action, taskId: taskId, attempt: attempt)
+      return ["accepted": false, "reason": "no_native_socket", "willRetry": willRetry]
+    }
+    guard nativeJoinedChatIds.contains(chatId), (state["connected"] as? Bool) == true else {
+      joinNativeChatTopicIfNeededLocked(chatId: chatId)
+      DispatchQueue.global(qos: .utility).async { [weak self] in
+        self?.ensureNativeTransport(trigger: "bridge_control_chat_not_joined")
+      }
+      scheduleAgentBridgeControlRetryLocked(
+        chatId: chatId, provider: provider, action: action, taskId: taskId, attempt: attempt)
+      return ["accepted": false, "reason": "chat_not_joined", "willRetry": willRetry]
+    }
+
+    var wirePayload: [String: Any] = [
+      "action": action,
+      "provider": provider,
+    ]
+    if let taskId, !taskId.isEmpty {
+      wirePayload["taskId"] = taskId
+    }
+    let ref = client.push(
+      topic: chatTopic(for: chatId),
+      event: "agent-bridge-control",
+      payload: wirePayload
+    )
+    appendJournalLocked(
+      event: "native-agent-bridge-control",
+      payload: [
+        "chatId": chatId, "provider": provider, "action": action, "ref": ref, "attempt": attempt,
+      ]
+    )
+    state["updatedAt"] = nowMs()
+    postChangeLocked(
+      reason: "agentBridgeControlSent",
+      userInfo: ["chatId": chatId, "provider": provider, "action": action]
+    )
+    return ["accepted": true, "transport": "native", "ref": ref]
+  }
+
+  /// Re-attempt a control push after a short backoff when the channel wasn't ready.
+  /// Bounded by `bridgeControlMaxAttempts`; stops as soon as a push actually goes out
+  /// (a delivered cancel that races a natural finish is a harmless no-op on the bridge).
+  private func scheduleAgentBridgeControlRetryLocked(
+    chatId: String, provider: String, action: String, taskId: String?, attempt: Int
+  ) {
+    let nextAttempt = attempt + 1
+    guard nextAttempt < Self.bridgeControlMaxAttempts else { return }
+    // ~0.75s, 1.5s, 2.25s, 3s… covering the typical 3–15s reconnect window.
+    let delay = min(0.75 * Double(nextAttempt), 3.0)
+    DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + delay) { [weak self] in
+      guard let self else { return }
+      _ = self.syncOnQueue {
+        self.sendAgentBridgeControlLocked(
+          chatId: chatId, provider: provider, action: action, taskId: taskId, attempt: nextAttempt)
+      }
     }
   }
 
