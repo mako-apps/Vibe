@@ -479,6 +479,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   /// Message ids whose "Worked · N steps" line is currently expanded inline.
   /// Persists across reloads so a live update doesn't collapse what the user opened.
   private var expandedProgressMessageIds: Set<String> = []
+  private var expandedRuntimeMessageIds: Set<String> = []
 
   /// User message ids whose long prompt bubble is expanded. Long prompts collapse by
   /// default so the table does not inherit huge row heights or blank lower padding.
@@ -493,6 +494,11 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   /// reads from this so it counts up steadily and NEVER restarts as new chunks arrive
   /// (a fresh `Date()` per chunk was what made the timer appear to reset).
   private var streamStartByMessageId: [String: Date] = [:]
+  /// Optimistic rows inserted locally immediately after send. The real transport rows
+  /// replace them once ChatEngine/bridge state catches up.
+  private var localMessageOrder: [String] = []
+  private var localMessagesById: [String: VibeAgentKitChatMessage] = [:]
+  private var localWorkingMessageIdBySourceId: [String: String] = [:]
 
   /// Start a fresh conversation with the agent (clears the on-screen transcript and
   /// begins a new, non-resumed task). When nil the trailing "new chat" button is
@@ -679,27 +685,19 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   }
 
   @objc private func newChatTapped() {
-    // Warn before abandoning a turn that's still generating; otherwise start fresh.
-    let isLive = messages.contains { $0.isStreaming || $0.runtime?.status == "running" }
-    guard isLive else { startNewChat(); return }
-    let alert = UIAlertController(
-      title: "Start a new chat?",
-      message: "A response is still generating. It'll keep running on your computer, but this view will switch to a fresh conversation.",
-      preferredStyle: .alert
-    )
-    alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-    alert.addAction(UIAlertAction(title: "New Chat", style: .destructive) { [weak self] _ in
-      self?.startNewChat()
-    })
-    present(alert, animated: true)
+    startNewChat()
   }
 
   private func startNewChat() {
     expandedProgressMessageIds.removeAll()
+    expandedRuntimeMessageIds.removeAll()
     expandedTextMessageIds.removeAll()
     expandedStepIdsByMessage.removeAll()
     progressItemsByMessageId.removeAll()
     streamStartByMessageId.removeAll()
+    localMessageOrder.removeAll()
+    localMessagesById.removeAll()
+    localWorkingMessageIdBySourceId.removeAll()
     messages = []
     isLoadingTranscript = false
     isHistoryPicked = false
@@ -884,6 +882,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       self?.refreshModelMenu()
     }
 
+    trackStreamStarts(messages)
     indexProgress()
     observeKeyboard()
     observeLiveMessages()
@@ -934,9 +933,83 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
 
   // MARK: Live updates
 
+  func appendLocalPendingTurn(messageId: String, body: String) {
+    let id = messageId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !id.isEmpty else { return }
+    let trimmedBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+    let displayBody = trimmedBody.isEmpty ? "Please take a look at the attached image." : trimmedBody
+    let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+    upsertLocalMessage(
+      VibeAgentKitChatMessage(
+        id: id,
+        role: .user,
+        text: displayBody,
+        timestamp: "",
+        timestampMs: nowMs
+      )
+    )
+    let workingId = "local-working-\(id)"
+    localWorkingMessageIdBySourceId[id] = workingId
+    upsertLocalMessage(
+      VibeAgentKitChatMessage(
+        id: workingId,
+        role: .assistant,
+        text: "",
+        timestamp: "",
+        timestampMs: nowMs + 1,
+        isStreaming: true
+      )
+    )
+    setMessages(messages)
+  }
+
+  private func upsertLocalMessage(_ message: VibeAgentKitChatMessage) {
+    localMessagesById[message.id] = message
+    if !localMessageOrder.contains(message.id) {
+      localMessageOrder.append(message.id)
+    }
+  }
+
+  private func removeLocalMessage(_ id: String) {
+    localMessagesById.removeValue(forKey: id)
+    localMessageOrder.removeAll { $0 == id }
+  }
+
+  private func mergeLocalMessages(into incoming: [VibeAgentKitChatMessage]) -> [VibeAgentKitChatMessage] {
+    let incomingIds = Set(incoming.map(\.id))
+    for id in incomingIds where localMessagesById[id] != nil {
+      removeLocalMessage(id)
+    }
+
+    var resolvedWorkingSources: [(sourceId: String, workingId: String)] = []
+    for (sourceId, workingId) in localWorkingMessageIdBySourceId {
+      guard let sourceIndex = incoming.firstIndex(where: { $0.id == sourceId }) else { continue }
+      let replyStart = incoming.index(after: sourceIndex)
+      let hasRealReply = replyStart < incoming.endIndex
+        && incoming[replyStart...].contains { message in
+          !message.role.isUser && !message.id.hasPrefix("local-working-")
+        }
+      guard hasRealReply else { continue }
+      resolvedWorkingSources.append((sourceId, workingId))
+    }
+    for resolved in resolvedWorkingSources {
+      let sourceId = resolved.sourceId
+      let workingId = resolved.workingId
+      removeLocalMessage(workingId)
+      localWorkingMessageIdBySourceId.removeValue(forKey: sourceId)
+    }
+
+    let local = localMessageOrder.compactMap { id -> VibeAgentKitChatMessage? in
+      guard !incomingIds.contains(id) else { return nil }
+      return localMessagesById[id]
+    }
+    return incoming + local
+  }
+
   /// Replace the rendered messages (e.g. when the agent stream advances). Cheap
   /// reload is fine here — the surface is single-task and short.
-  func setMessages(_ newMessages: [VibeAgentKitChatMessage]) {
+  func setMessages(_ incomingMessages: [VibeAgentKitChatMessage]) {
+    let newMessages = mergeLocalMessages(into: incomingMessages)
     guard newMessages != messages else { return }
     if !isHistoryPicked,
       newMessages.contains(where: { $0.isStreaming || $0.runtime?.status == "running" })
@@ -983,10 +1056,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     // A fresh user send = the last rendered row is a user message whose id is new. Pin it
     // to the top with room reserved below for the streaming answer (ChatGPT-style) instead
     // of scrolling to the bottom.
-    let newUserSendId: String? = {
-      guard let last = tableMessages.last, last.role.isUser, !oldTableIds.contains(last.id) else { return nil }
-      return last.id
-    }()
+    let newUserSendId = tableMessages.last { $0.role.isUser && !oldTableIds.contains($0.id) }?.id
     if let newUserSendId { pushToTopUserId = newUserSendId }
     // The pinned turn has finished once its answer is no longer streaming.
     let turnStillLive = tableMessages.contains { $0.isStreaming || $0.runtime?.status == "running" }
@@ -1067,7 +1137,12 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   /// downward offset (with a quick fade) while `scrollToBottom` slides the earlier
   /// messages up — so a send reads as the previous message being pushed up by the new one.
   private func animateSentRows(_ inserted: [IndexPath]) {
-    let cells = inserted.compactMap { tableView.cellForRow(at: $0) }
+    let cells = inserted.compactMap { indexPath -> UITableViewCell? in
+      guard indexPath.row < tableMessages.count, tableMessages[indexPath.row].role.isUser else {
+        return nil
+      }
+      return tableView.cellForRow(at: indexPath)
+    }
     guard !cells.isEmpty else { return }
     for cell in cells {
       cell.transform = CGAffineTransform(translationX: 0, y: 22)
@@ -1575,13 +1650,15 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     cell.backgroundColor = .clear
     cell.selectionStyle = .none
     cell.onProgressTap = { [weak self] in self?.toggleProgress(for: message.id) }
-    cell.onRuntimeTap = { [weak self] runtime in self?.presentRuntime(runtime) }
     cell.onStepTap = { [weak self] nodeId in self?.toggleStepDetail(messageId: message.id, nodeId: nodeId) }
     cell.onOpenSubagent = { [weak self] nodeId in
       self?.presentSubagentView(messageId: message.id, parentNodeId: nodeId)
     }
     cell.onTextExpansionTap = { [weak self] in self?.toggleTextExpansion(for: message.id) }
     cell.onAttachmentTap = { [weak self] attachment in self?.presentImageAttachment(attachment) }
+    cell.onToggleRuntimeExpand = { [weak self] in self?.toggleRuntimeExpand(for: message.id) }
+    cell.onReviewTapped = { [weak self] in self?.presentRuntimeReview(message) }
+    cell.onFileTapped = { [weak self] file in self?.presentRuntimeFile(file, message: message) }
     cell.configure(
       message: message,
       appearance: appearance,
@@ -1590,6 +1667,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       isProgressExpanded: expandedProgressMessageIds.contains(message.id),
       expandedStepIds: expandedStepIdsByMessage[message.id] ?? [],
       isTextExpanded: expandedTextMessageIds.contains(message.id),
+      isRuntimeExpanded: expandedRuntimeMessageIds.contains(message.id),
       streamingStartDate: message.isStreaming ? streamStartByMessageId[message.id] : nil
     )
     return cell
@@ -1621,6 +1699,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       isProgressExpanded: expandedProgressMessageIds.contains(message.id),
       expandedStepIds: expandedStepIdsByMessage[message.id] ?? [],
       isTextExpanded: expandedTextMessageIds.contains(message.id),
+      isRuntimeExpanded: expandedRuntimeMessageIds.contains(message.id),
       streamingStartDate: message.isStreaming ? streamStartByMessageId[message.id] : nil
     )
   }

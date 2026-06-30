@@ -330,27 +330,25 @@ struct AgentBridgeTranscriptMessage: Identifiable {
 
 // MARK: - History loading skeletons
 
-/// A single shimmering placeholder pill. Uses a soft, wide sinusoidal opacity wave
-/// instead of a hard-edge gradient band so the pulse feels organic and premium.
 private struct AgentBridgeShimmerPill: View {
   var width: CGFloat? = nil
   var height: CGFloat
   var cornerRadius: CGFloat = 14
   let tint: Color
-  @State private var phase: CGFloat = 0
+  @State private var isAnimating = false
 
   var body: some View {
     RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
       .fill(tint)
       .frame(width: width, height: height)
       .frame(maxWidth: width == nil ? .infinity : nil, alignment: .leading)
-      .opacity(0.55 + 0.45 * Darwin.sin(Double(phase)))
+      .opacity(isAnimating ? 0.3 : 1.0)
       .onAppear {
         withAnimation(
-          .easeInOut(duration: 1.8)
+          .easeInOut(duration: 1.2)
           .repeatForever(autoreverses: true)
         ) {
-          phase = .pi
+          isAnimating = true
         }
       }
   }
@@ -885,7 +883,6 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
             let mid = row.messageId ?? ""
             if fresh.contains(mid) { return true }
             if let src = row.agentActionSourceId, fresh.contains(src) { return true }
-            if row.isStreamingText { return true }
             return false
           }
           return coordinator?.renderMessages(from: keep) ?? VibeAgentKitMap.messages(from: keep)
@@ -1015,6 +1012,7 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
     var freshSendIds: Set<String> = []
     private var localMessagesById: [String: VibeAgentKitChatMessage] = [:]
     private var localMessageOrder: [String] = []
+    private var localWorkingMessageIdBySourceId: [String: String] = [:]
 
     init(parent: AgentBridgeRuntimeView) {
       self.parent = parent
@@ -1028,12 +1026,26 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
       freshSendIds.removeAll()
       localMessagesById.removeAll()
       localMessageOrder.removeAll()
+      localWorkingMessageIdBySourceId.removeAll()
       // A fresh chat is intentionally blank — no spinner, just the empty composer.
       controller?.isLoadingTranscript = false
       controller?.setMessages([])
     }
 
     func renderMessages(from rows: [ChatListRow]) -> [VibeAgentKitChatMessage] {
+      let resolvedSources = Set(rows.compactMap { row -> String? in
+        guard row.isAgentMessage || row.isStreamingText else { return nil }
+        guard let sourceId = row.agentActionSourceId?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !sourceId.isEmpty
+        else { return nil }
+        return localWorkingMessageIdBySourceId[sourceId] == nil ? nil : sourceId
+      })
+      for sourceId in resolvedSources {
+        if let workingId = localWorkingMessageIdBySourceId.removeValue(forKey: sourceId) {
+          localMessagesById.removeValue(forKey: workingId)
+          localMessageOrder.removeAll { $0 == workingId }
+        }
+      }
       let mapped = VibeAgentKitMap.messages(from: rows)
       let mappedIds = Set(mapped.map(\.id))
       let local = localMessageOrder.compactMap { id -> VibeAgentKitChatMessage? in
@@ -1056,13 +1068,26 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
       messageId: String,
       body: String
     ) {
+      let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
       upsertLocalMessage(
         VibeAgentKitChatMessage(
           id: messageId,
           role: .user,
           text: body,
           timestamp: "",
-          timestampMs: Int64(Date().timeIntervalSince1970 * 1000)
+          timestampMs: nowMs
+        )
+      )
+      let workingId = "local-working-\(messageId)"
+      localWorkingMessageIdBySourceId[messageId] = workingId
+      upsertLocalMessage(
+        VibeAgentKitChatMessage(
+          id: workingId,
+          role: .assistant,
+          text: "",
+          timestamp: "",
+          timestampMs: nowMs + 1,
+          isStreaming: true
         )
       )
     }

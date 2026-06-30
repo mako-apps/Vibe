@@ -98,6 +98,9 @@ struct VibeAgentKitChatMessage: Equatable {
   /// divider ("Context compacted") rather than a left assistant bubble. `text` holds
   /// the raw summary that the divider reveals when expanded.
   var isCompactionSummary: Bool
+  /// System status rows such as "[Request interrupted by user]" render as centered,
+  /// muted dividers instead of assistant or user bubbles.
+  var systemDividerText: String?
 
   init(
     id: String,
@@ -117,7 +120,8 @@ struct VibeAgentKitChatMessage: Equatable {
     subagentChildren: [String: [VibeAgentKitProgressItem]] = [:],
     runtime: ChatListRow.AgentRuntimeSummary? = nil,
     attachments: [VibeAgentKitImageAttachment] = [],
-    isCompactionSummary: Bool = false
+    isCompactionSummary: Bool = false,
+    systemDividerText: String? = nil
   ) {
     self.id = id
     self.role = role
@@ -137,6 +141,7 @@ struct VibeAgentKitChatMessage: Equatable {
     self.runtime = runtime
     self.attachments = attachments
     self.isCompactionSummary = isCompactionSummary
+    self.systemDividerText = systemDividerText
   }
 }
 

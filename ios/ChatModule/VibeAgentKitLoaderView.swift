@@ -340,7 +340,7 @@ private final class VibeAgentKitShimmerLabelView: UIView {
     shimmerLabel.textColor = shimmerColor
   }
 
-  func setText(_ text: String) {
+  func setText(_ text: String, animated: Bool = true) {
     guard baseLabel.text != text else { return }
 
     let applyText = {
@@ -351,6 +351,11 @@ private final class VibeAgentKitShimmerLabelView: UIView {
     }
 
     guard window != nil, baseLabel.text != nil else {
+      applyText()
+      return
+    }
+
+    guard animated else {
       applyText()
       return
     }
@@ -570,7 +575,7 @@ final class VibeAgentKitAgentLoaderView: UIControl {
     if isStreaming, let start = streamingStartDate {
       elapsedStartDate = start
       startElapsedTimer()
-      setDisplayedText(workingClockText())
+      setDisplayedText(workingClockText(), animated: false, updatesLayout: false)
     } else {
       stopElapsedTimer()
       setDisplayedText(resolvedLoaderText(text))
@@ -600,12 +605,19 @@ final class VibeAgentKitAgentLoaderView: UIControl {
     }
   }
 
-  private func setDisplayedText(_ resolved: String) {
+  private func setDisplayedText(
+    _ resolved: String,
+    animated: Bool = true,
+    updatesLayout: Bool = true
+  ) {
     guard resolved != currentText else { return }
+    let needsInitialLayout = currentText.isEmpty
     currentText = resolved
-    shimmerLabel.setText(resolved)
-    invalidateIntrinsicContentSize()
-    setNeedsLayout()
+    shimmerLabel.setText(resolved, animated: animated)
+    if updatesLayout || needsInitialLayout {
+      invalidateIntrinsicContentSize()
+      setNeedsLayout()
+    }
   }
 
   private func applyDisclosureRotation(expanded: Bool, animated: Bool) {
@@ -626,7 +638,7 @@ final class VibeAgentKitAgentLoaderView: UIControl {
     guard elapsedTimer == nil else { return }
     let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
       guard let self, self.isStreamingActive || self.elapsedStartDate != nil else { return }
-      self.setDisplayedText(self.workingClockText())
+      self.setDisplayedText(self.workingClockText(), animated: false, updatesLayout: false)
     }
     RunLoop.main.add(timer, forMode: .common)
     elapsedTimer = timer

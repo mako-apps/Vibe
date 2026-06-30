@@ -414,27 +414,23 @@ enum ChatNativeAgentTextRenderer {
 
 final class AgentRuntimeSummaryView: UIView {
   private final class FileRowView: UIView {
+    private let iconView = UIImageView()
     private let nameLabel = UILabel()
     private let pathLabel = UILabel()
     private let statsLabel = UILabel()
-    private let statusLabel = UILabel()
 
     override init(frame: CGRect) {
       super.init(frame: frame)
-      [nameLabel, pathLabel, statsLabel, statusLabel].forEach {
+      [iconView, nameLabel, pathLabel, statsLabel].forEach {
         $0.translatesAutoresizingMaskIntoConstraints = false
         $0.backgroundColor = .clear
         addSubview($0)
       }
-      nameLabel.font = UIFont.systemFont(ofSize: 13, weight: .semibold)
-      pathLabel.font = UIFont.systemFont(ofSize: 11, weight: .regular)
-      pathLabel.lineBreakMode = .byTruncatingMiddle
-      statsLabel.font = UIFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
+      iconView.contentMode = .scaleAspectFit
+      nameLabel.font = UIFont.systemFont(ofSize: 13, weight: .regular)
+      pathLabel.font = UIFont.systemFont(ofSize: 13, weight: .regular)
+      pathLabel.lineBreakMode = .byTruncatingHead
       statsLabel.textAlignment = .right
-      statusLabel.font = UIFont.monospacedSystemFont(ofSize: 10, weight: .semibold)
-      statusLabel.textAlignment = .center
-      statusLabel.layer.cornerRadius = 6
-      statusLabel.layer.masksToBounds = true
     }
 
     required init?(coder: NSCoder) {
@@ -444,56 +440,85 @@ final class AgentRuntimeSummaryView: UIView {
     func configure(file: ChatListRow.AgentRuntimeFile, textColor: UIColor) {
       nameLabel.text = file.name
       pathLabel.text = file.path
+
+      let ext = (file.name as NSString).pathExtension.lowercased()
+      if ext == "swift" {
+        iconView.image = UIImage(systemName: "swift")
+        iconView.tintColor = .systemOrange
+      } else if ext == "js" || ext == "ts" || ext == "tsx" || ext == "jsx" {
+        iconView.image = UIImage(systemName: "curlybraces")
+        iconView.tintColor = .systemYellow
+      } else {
+        iconView.image = UIImage(systemName: "doc.text")
+        iconView.tintColor = textColor.withAlphaComponent(0.6)
+      }
+
       let additions = file.additions > 0 ? "+\(file.additions)" : "+0"
       let deletions = file.deletions > 0 ? "-\(file.deletions)" : "-0"
-      statsLabel.text = "\(additions) \(deletions)"
-      statusLabel.text = file.status
+      
+      let font = UIFont.systemFont(ofSize: 13, weight: .regular)
+      let addAttr = NSAttributedString(string: additions, attributes: [
+        .foregroundColor: VibeAgentDiffPalette.additionText,
+        .font: font
+      ])
+      let delAttr = NSAttributedString(string: " \(deletions)", attributes: [
+        .foregroundColor: VibeAgentDiffPalette.deletionText,
+        .font: font
+      ])
+      let statsAttr = NSMutableAttributedString()
+      statsAttr.append(addAttr)
+      statsAttr.append(delAttr)
+      statsLabel.attributedText = statsAttr
 
-      nameLabel.textColor = textColor.withAlphaComponent(0.94)
-      pathLabel.textColor = textColor.withAlphaComponent(0.56)
-      statsLabel.textColor = VibeAgentDiffPalette.additionText
-      if file.deletions > file.additions {
-        statsLabel.textColor = VibeAgentDiffPalette.deletionText
-      }
-      statusLabel.textColor = textColor.withAlphaComponent(0.78)
-      statusLabel.backgroundColor = textColor.withAlphaComponent(0.10)
+      nameLabel.textColor = textColor.withAlphaComponent(0.9)
+      pathLabel.textColor = textColor.withAlphaComponent(0.4)
     }
 
     override func layoutSubviews() {
       super.layoutSubviews()
-      let statusWidth: CGFloat = 34
-      let statsWidth: CGFloat = 86
-      let gap: CGFloat = 8
-      statusLabel.frame = CGRect(x: 0, y: 7, width: statusWidth, height: 18)
-      statsLabel.frame = CGRect(
-        x: bounds.width - statsWidth,
-        y: 7,
-        width: statsWidth,
-        height: 18
-      )
-      let textX = statusWidth + gap
-      let textWidth = max(1, bounds.width - textX - statsWidth - gap)
-      nameLabel.frame = CGRect(x: textX, y: 1, width: textWidth, height: 17)
-      pathLabel.frame = CGRect(x: textX, y: 18, width: textWidth, height: 14)
+      let iconSize: CGFloat = 16
+      let statsSize = statsLabel.sizeThatFits(CGSize(width: bounds.width, height: bounds.height))
+      let statsWidth = max(40, statsSize.width)
+      let gap: CGFloat = 6
+      
+      iconView.frame = CGRect(x: 0, y: (bounds.height - iconSize) / 2, width: iconSize, height: iconSize)
+      statsLabel.frame = CGRect(x: bounds.width - statsWidth, y: 0, width: statsWidth, height: bounds.height)
+      
+      let nameSize = nameLabel.sizeThatFits(CGSize(width: bounds.width, height: bounds.height))
+      let maxNameWidth = min(nameSize.width, bounds.width - iconSize - gap - statsWidth - gap - 20)
+      nameLabel.frame = CGRect(x: iconSize + gap, y: 0, width: max(0, maxNameWidth), height: bounds.height)
+      
+      let pathX = nameLabel.frame.maxX + gap
+      pathLabel.frame = CGRect(x: pathX, y: 0, width: max(0, bounds.width - pathX - statsWidth - gap), height: bounds.height)
     }
   }
 
   private let backgroundView = UIView()
+  private let headerContainer = UIView()
   private let titleLabel = UILabel()
-  private let statsLabel = UILabel()
-  private let repoLabel = UILabel()
+  private let titleStatsLabel = UILabel()
+  private let chevronImageView = UIImageView(image: UIImage(systemName: "chevron.down"))
+  private let reviewContainer = UIView()
+  private let reviewIcon = UIImageView(image: UIImage(systemName: "doc.badge.plus"))
+  private let reviewLabel = UILabel()
+  private let separatorView = UIView()
+
   private let commandLabel = UILabel()
   private let dirtyLabel = UILabel()
   private let moreLabel = UILabel()
   private var fileRows: [FileRowView] = []
   private var runtime: ChatListRow.AgentRuntimeSummary?
   private var textColor: UIColor = .label
-  var onTap: ((ChatListRow.AgentRuntimeSummary) -> Void)?
+  var onToggleExpand: (() -> Void)?
+  var onReviewTapped: (() -> Void)?
+  var onFileTapped: ((ChatListRow.AgentRuntimeFile) -> Void)?
+  private var isExpanded: Bool = false
 
   override init(frame: CGRect) {
     super.init(frame: frame)
     backgroundColor = .clear
     isOpaque = false
+    
     backgroundView.backgroundColor = UIColor.secondarySystemBackground.withAlphaComponent(0.72)
     backgroundView.layer.cornerRadius = 12
     backgroundView.layer.cornerCurve = .continuous
@@ -501,58 +526,116 @@ final class AgentRuntimeSummaryView: UIView {
     backgroundView.layer.borderColor = UIColor.separator.withAlphaComponent(0.25).cgColor
     addSubview(backgroundView)
 
-    [titleLabel, statsLabel, repoLabel, commandLabel, dirtyLabel, moreLabel].forEach {
+    [headerContainer, separatorView, commandLabel, dirtyLabel, moreLabel].forEach {
       $0.backgroundColor = .clear
-      $0.numberOfLines = 1
       addSubview($0)
     }
-    titleLabel.font = UIFont.systemFont(ofSize: 15, weight: .semibold)
-    statsLabel.font = UIFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
-    statsLabel.textAlignment = .right
-    repoLabel.font = UIFont.systemFont(ofSize: 12, weight: .medium)
+    
+    [titleLabel, titleStatsLabel, chevronImageView, reviewContainer].forEach {
+      $0.backgroundColor = .clear
+      headerContainer.addSubview($0)
+    }
+
+    [reviewIcon, reviewLabel].forEach {
+      $0.backgroundColor = .clear
+      reviewContainer.addSubview($0)
+    }
+
+    titleLabel.font = UIFont.systemFont(ofSize: 14, weight: .regular)
+    titleLabel.numberOfLines = 1
+    
+    chevronImageView.contentMode = .scaleAspectFit
+    
+    reviewContainer.layer.cornerRadius = 6
+    reviewContainer.layer.borderWidth = 1
+    reviewContainer.layer.borderColor = UIColor.separator.withAlphaComponent(0.4).cgColor
+    reviewContainer.backgroundColor = UIColor.separator.withAlphaComponent(0.1)
+    
+    reviewIcon.contentMode = .scaleAspectFit
+    reviewLabel.text = "Review"
+    reviewLabel.font = UIFont.systemFont(ofSize: 13, weight: .medium)
+    
+    separatorView.backgroundColor = UIColor.separator.withAlphaComponent(0.3)
+    
     commandLabel.font = UIFont.monospacedSystemFont(ofSize: 11.5, weight: .regular)
     commandLabel.lineBreakMode = .byTruncatingMiddle
     dirtyLabel.font = UIFont.systemFont(ofSize: 11.5, weight: .regular)
     moreLabel.font = UIFont.systemFont(ofSize: 12, weight: .medium)
-    let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap))
-    addGestureRecognizer(tap)
-    isUserInteractionEnabled = true
+    
+    let tap = UITapGestureRecognizer(target: self, action: #selector(handleHeaderTap))
+    headerContainer.addGestureRecognizer(tap)
+    headerContainer.isUserInteractionEnabled = true
+    
+    let reviewTap = UITapGestureRecognizer(target: self, action: #selector(handleReviewTap))
+    reviewContainer.addGestureRecognizer(reviewTap)
+    reviewContainer.isUserInteractionEnabled = true
   }
 
   required init?(coder: NSCoder) {
     return nil
   }
 
-  static func measuredHeight(runtime: ChatListRow.AgentRuntimeSummary, availableWidth: CGFloat) -> CGFloat {
+  static func measuredHeight(runtime: ChatListRow.AgentRuntimeSummary, availableWidth: CGFloat, isExpanded: Bool) -> CGFloat {
     _ = availableWidth
+    if !isExpanded {
+      return 12 + 36 + 12
+    }
     let files = runtime.diff?.files ?? []
-    var height: CGFloat = 14 + 22 + 18 + 8
+    var height: CGFloat = 12 + 36 + 1 + 9
+    height += CGFloat(min(files.count, 4)) * 32
+    height += 3
+    
     if runtime.command?.display?.isEmpty == false || runtime.command?.executable?.isEmpty == false {
       height += 18
     }
     if runtime.dirtyBefore {
       height += 17
     }
-    height += CGFloat(min(files.count, 4)) * 34
     if files.count > 4 {
-      height += 25
+      height += 20
     }
-    return max(82, height + 12)
+    
+    return height + 12
   }
 
   @discardableResult
   func configure(
     runtime: ChatListRow.AgentRuntimeSummary,
     textColor: UIColor,
-    availableWidth: CGFloat
+    availableWidth: CGFloat,
+    isExpanded: Bool
   ) -> CGFloat {
     self.runtime = runtime
     self.textColor = textColor
+    self.isExpanded = isExpanded
     let diff = runtime.diff
     let filesChanged = diff?.filesChanged ?? 0
+    
     titleLabel.text = filesChanged == 1 ? "1 file changed" : "\(filesChanged) files changed"
-    statsLabel.text = "+\(diff?.additions ?? 0) -\(diff?.deletions ?? 0)"
-    repoLabel.text = runtimeSubtitle(runtime)
+    titleLabel.textColor = textColor.withAlphaComponent(0.8)
+    
+    let font = UIFont.systemFont(ofSize: 14, weight: .regular)
+    let addAttr = NSAttributedString(string: "+\(diff?.additions ?? 0)", attributes: [
+      .foregroundColor: VibeAgentDiffPalette.additionText,
+      .font: font
+    ])
+    let delAttr = NSAttributedString(string: " -\(diff?.deletions ?? 0)", attributes: [
+      .foregroundColor: VibeAgentDiffPalette.deletionText,
+      .font: font
+    ])
+    let statsAttr = NSMutableAttributedString()
+    statsAttr.append(addAttr)
+    statsAttr.append(delAttr)
+    titleStatsLabel.attributedText = statsAttr
+    
+    chevronImageView.tintColor = textColor.withAlphaComponent(0.5)
+    reviewIcon.tintColor = textColor.withAlphaComponent(0.8)
+    reviewLabel.textColor = textColor.withAlphaComponent(0.8)
+    
+    UIView.animate(withDuration: 0.2) {
+      self.chevronImageView.transform = isExpanded ? CGAffineTransform(rotationAngle: -.pi) : .identity
+    }
+
     commandLabel.text = runtime.command?.display ?? runtime.command?.executable
     dirtyLabel.text =
       runtime.dirtyBefore
@@ -561,30 +644,35 @@ final class AgentRuntimeSummaryView: UIView {
     let hiddenCount = max(0, (diff?.files.count ?? 0) - 4)
     moreLabel.text = hiddenCount > 0 ? "View \(hiddenCount) more file(s)" : nil
 
-    titleLabel.textColor = textColor.withAlphaComponent(0.96)
-    statsLabel.textColor = (diff?.deletions ?? 0) > (diff?.additions ?? 0)
-      ? VibeAgentDiffPalette.deletionText : VibeAgentDiffPalette.additionText
-    repoLabel.textColor = textColor.withAlphaComponent(0.62)
-    commandLabel.textColor = textColor.withAlphaComponent(0.62)
+    commandLabel.textColor = textColor.withAlphaComponent(0.5)
     dirtyLabel.textColor = UIColor.systemOrange
-    moreLabel.textColor = textColor.withAlphaComponent(0.62)
+    moreLabel.textColor = textColor.withAlphaComponent(0.5)
 
     let files = Array((diff?.files ?? []).prefix(4))
     while fileRows.count < files.count {
       let row = FileRowView()
+      row.isUserInteractionEnabled = true
+      let tap = UITapGestureRecognizer(target: self, action: #selector(handleFileTap(_:)))
+      row.addGestureRecognizer(tap)
       addSubview(row)
       fileRows.append(row)
     }
     for (index, row) in fileRows.enumerated() {
       if index < files.count {
-        row.isHidden = false
+        row.isHidden = !isExpanded
         row.configure(file: files[index], textColor: textColor)
+        row.tag = index
       } else {
         row.isHidden = true
       }
     }
+    
+    separatorView.isHidden = !isExpanded
+    commandLabel.isHidden = !isExpanded || commandLabel.text?.isEmpty ?? true
+    dirtyLabel.isHidden = !isExpanded || dirtyLabel.text?.isEmpty ?? true
+    moreLabel.isHidden = !isExpanded || moreLabel.text?.isEmpty ?? true
 
-    let height = Self.measuredHeight(runtime: runtime, availableWidth: availableWidth)
+    let height = Self.measuredHeight(runtime: runtime, availableWidth: availableWidth, isExpanded: isExpanded)
     frame.size = CGSize(width: availableWidth, height: height)
     setNeedsLayout()
     return height
@@ -593,69 +681,71 @@ final class AgentRuntimeSummaryView: UIView {
   override func layoutSubviews() {
     super.layoutSubviews()
     backgroundView.frame = bounds
-    let inset: CGFloat = 12
+    let inset: CGFloat = 16
     let width = max(1, bounds.width - inset * 2)
     var y: CGFloat = 12
-    let statsWidth: CGFloat = 96
-    titleLabel.frame = CGRect(x: inset, y: y, width: max(1, width - statsWidth - 8), height: 22)
-    statsLabel.frame = CGRect(x: bounds.width - inset - statsWidth, y: y + 1, width: statsWidth, height: 20)
-    y += 24
-    repoLabel.frame = CGRect(x: inset, y: y, width: width, height: 16)
-    y += 20
-    if !(commandLabel.text?.isEmpty ?? true) {
-      commandLabel.isHidden = false
-      commandLabel.frame = CGRect(x: inset, y: y, width: width, height: 16)
-      y += 18
-    } else {
-      commandLabel.isHidden = true
-      commandLabel.frame = .zero
-    }
-    if !(dirtyLabel.text?.isEmpty ?? true) {
-      dirtyLabel.isHidden = false
-      dirtyLabel.frame = CGRect(x: inset, y: y, width: width, height: 15)
-      y += 17
-    } else {
-      dirtyLabel.isHidden = true
-      dirtyLabel.frame = .zero
-    }
-
+    
+    // Header
+    headerContainer.frame = CGRect(x: inset, y: y, width: width, height: 36)
+    let titleSize = titleLabel.sizeThatFits(CGSize(width: width, height: 36))
+    titleLabel.frame = CGRect(x: 0, y: 0, width: titleSize.width, height: 36)
+    
+    let statsSize = titleStatsLabel.sizeThatFits(CGSize(width: width, height: 36))
+    titleStatsLabel.frame = CGRect(x: titleLabel.frame.maxX + 6, y: 0, width: statsSize.width, height: 36)
+    
+    chevronImageView.frame = CGRect(x: titleStatsLabel.frame.maxX + 6, y: (36 - 10) / 2, width: 12, height: 10)
+    
+    reviewLabel.sizeToFit()
+    let reviewW = reviewLabel.frame.width + 12 + 6 + 12
+    let reviewH: CGFloat = 28
+    reviewContainer.frame = CGRect(x: width - reviewW, y: (36 - reviewH) / 2, width: reviewW, height: reviewH)
+    reviewIcon.frame = CGRect(x: 10, y: (reviewH - 14) / 2, width: 12, height: 14)
+    reviewLabel.frame = CGRect(x: reviewIcon.frame.maxX + 6, y: 0, width: reviewLabel.frame.width, height: reviewH)
+    
+    y += 36
+    
+    if !isExpanded { return }
+    
+    // Separator
+    separatorView.frame = CGRect(x: 0, y: y, width: bounds.width, height: 1)
+    y += 9
+    
+    // Files
     for row in fileRows where !row.isHidden {
       row.frame = CGRect(x: inset, y: y, width: width, height: 32)
-      y += 34
+      y += 32
     }
-    if !(moreLabel.text?.isEmpty ?? true) {
-      moreLabel.isHidden = false
+    
+    y += 3
+    
+    if !commandLabel.isHidden {
+      commandLabel.frame = CGRect(x: inset, y: y, width: width, height: 16)
+      y += 18
+    }
+    
+    if !dirtyLabel.isHidden {
+      dirtyLabel.frame = CGRect(x: inset, y: y, width: width, height: 15)
+      y += 17
+    }
+    
+    if !moreLabel.isHidden {
       moreLabel.frame = CGRect(x: inset, y: y + 2, width: width, height: 18)
-    } else {
-      moreLabel.isHidden = true
-      moreLabel.frame = .zero
+      y += 20
     }
   }
 
-  private func runtimeSubtitle(_ runtime: ChatListRow.AgentRuntimeSummary) -> String {
-    var parts: [String] = []
-    if let provider = runtime.provider, !provider.isEmpty {
-      let title = provider.prefix(1).uppercased() + String(provider.dropFirst())
-      parts.append(title)
-    }
-    if let repo = runtime.repoName, !repo.isEmpty {
-      parts.append(repo)
-    }
-    if let mode = runtime.workMode, !mode.isEmpty {
-      parts.append(mode.replacingOccurrences(of: "_", with: " "))
-    }
-    if let model = runtime.model, !model.isEmpty {
-      parts.append(model)
-    }
-    if let exit = runtime.exitStatus, runtime.status == "failed" {
-      parts.append("exit \(exit)")
-    }
-    return parts.isEmpty ? "Local bridge" : parts.joined(separator: " · ")
+  @objc private func handleHeaderTap() {
+    onToggleExpand?()
   }
-
-  @objc private func handleTap() {
-    guard let runtime else { return }
-    onTap?(runtime)
+  
+  @objc private func handleReviewTap() {
+    onReviewTapped?()
+  }
+  
+  @objc private func handleFileTap(_ gesture: UITapGestureRecognizer) {
+    guard let view = gesture.view as? FileRowView, view.tag >= 0,
+          let files = runtime?.diff?.files, view.tag < files.count else { return }
+    onFileTapped?(files[view.tag])
   }
 }
 

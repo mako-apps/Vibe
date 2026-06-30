@@ -1079,12 +1079,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         if let loadedPrefix, id.hasPrefix(loadedPrefix) { return true }
         return false
       }
-      if bridgeRowIsLive(row) { return true }
       // Drop prior-history rows AND non-message rows (stale date separators); a new
       // thread renders only the messages exchanged this session.
       guard !id.isEmpty else { return false }
       if bridgeFreshOwnSentIds.contains(id) { return true }
-      return !bridgeFreshHiddenIds.contains(id)
+      if bridgeFreshHiddenIds.contains(id) { return false }
+      if bridgeRowIsLive(row) { return true }
+      return true
     }
   }
 
@@ -5610,6 +5611,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       }
       // Pin the freshly-sent question to the top (ChatGPT-style) like the bridge path did.
       pendingAgentPushToTop = true
+      presentedBridgeAgentVC?.appendLocalPendingTurn(messageId: outgoingMessageId, body: text)
       dispatchOutgoingSend(
         messageId: outgoingMessageId,
         text: text,
@@ -6305,7 +6307,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       self.activeBridgeSessionId = nil
       self.bridgeFreshOwnSentIds.removeAll()
       self.bridgeFreshHiddenIds.removeAll()
-      self.bridgeFreshSnapshotChatId = nil
+      for row in self.sourceRowsPayload {
+        if let id = self.messageId(fromRawRow: row), !id.isEmpty {
+          self.bridgeFreshHiddenIds.insert(id)
+        }
+      }
+      self.bridgeFreshSnapshotChatId = self.engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
       vc?.setTranscriptLoading(false)
       vc?.isHistoryPicked = false
       vc?.setMessages([])

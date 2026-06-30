@@ -515,9 +515,9 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     subagentChildren: [String: [VibeAgentKitProgressItem]] = [:],
     fallbackProgressLabels: [String],
     runtime: ChatListRow.AgentRuntimeSummary?,
-    onRuntimeTap: ((ChatListRow.AgentRuntimeSummary) -> Void)?,
     onLoaderTap: (() -> Void)?,
     isProgressExpanded: Bool = false,
+    isRuntimeExpanded: Bool = false,
     expandedStepIds: Set<String> = [],
     streamingStartDate: Date? = nil
   ) {
@@ -645,7 +645,7 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
         : nil,
       textColor: appearance.text,
       availableWidth: availableWidth,
-      onTap: onRuntimeTap
+      isExpanded: isRuntimeExpanded
     )
 
     // Suppress the separate answer body when there is no text yet OR while the turn is
@@ -877,23 +877,32 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     ])
   }
 
+  var onToggleRuntimeExpand: (() -> Void)?
+  var onReviewTapped: (() -> Void)?
+  var onFileTapped: ((ChatListRow.AgentRuntimeFile) -> Void)?
+
   private func configureRuntimeSummary(
     _ runtime: ChatListRow.AgentRuntimeSummary?,
     textColor: UIColor,
     availableWidth: CGFloat,
-    onTap: ((ChatListRow.AgentRuntimeSummary) -> Void)?
+    isExpanded: Bool
   ) {
     guard let runtime else {
-      runtimeSummaryView.onTap = nil
+      runtimeSummaryView.onToggleExpand = nil
+      runtimeSummaryView.onReviewTapped = nil
+      runtimeSummaryView.onFileTapped = nil
       runtimeSummaryView.isHidden = true
       runtimeHeightConstraint?.constant = 0.0
       return
     }
-    runtimeSummaryView.onTap = onTap
+    runtimeSummaryView.onToggleExpand = onToggleRuntimeExpand
+    runtimeSummaryView.onReviewTapped = onReviewTapped
+    runtimeSummaryView.onFileTapped = onFileTapped
     let height = runtimeSummaryView.configure(
       runtime: runtime,
       textColor: textColor,
-      availableWidth: availableWidth
+      availableWidth: availableWidth,
+      isExpanded: isExpanded
     )
     runtimeSummaryView.isHidden = false
     runtimeHeightConstraint?.constant = height
@@ -1671,6 +1680,7 @@ final class VibeAgentKitMessageCell: UITableViewCell {
   private var leadingConstraint: NSLayoutConstraint!
   private var trailingConstraint: NSLayoutConstraint!
   private var assistantMaxWidthConstraint: NSLayoutConstraint!
+  private var assistantWidthConstraint: NSLayoutConstraint!
   private var userMaxWidthConstraint: NSLayoutConstraint!
   private var userAttachmentMinWidthConstraint: NSLayoutConstraint!
   private var userTopConstraint: NSLayoutConstraint!
@@ -1716,6 +1726,9 @@ final class VibeAgentKitMessageCell: UITableViewCell {
   var onOpenSubagent: ((String) -> Void)?
   var onTextExpansionTap: (() -> Void)?
   var onAttachmentTap: ((VibeAgentKitImageAttachment) -> Void)?
+  var onToggleRuntimeExpand: (() -> Void)?
+  var onReviewTapped: (() -> Void)?
+  var onFileTapped: ((ChatListRow.AgentRuntimeFile) -> Void)?
 
   /// The visible text currently displayed (exposed for the hold context menu).
   var currentMessageText: String { storedMessageText }
@@ -1769,7 +1782,6 @@ final class VibeAgentKitMessageCell: UITableViewCell {
     super.layoutSubviews()
     applyCurrentBubbleShape()
   }
-
   func configure(
     message: VibeAgentKitChatMessage,
     appearance: VibeAgentKitChatAppearance,
@@ -1778,6 +1790,7 @@ final class VibeAgentKitMessageCell: UITableViewCell {
     isProgressExpanded: Bool = false,
     expandedStepIds: Set<String> = [],
     isTextExpanded: Bool = false,
+    isRuntimeExpanded: Bool = false,
     streamingStartDate: Date? = nil
   ) {
     let isUser = message.role.isUser
@@ -1789,6 +1802,7 @@ final class VibeAgentKitMessageCell: UITableViewCell {
       leadingConstraint,
       trailingConstraint,
       assistantMaxWidthConstraint,
+      assistantWidthConstraint,
       userMaxWidthConstraint,
       userAttachmentMinWidthConstraint,
       userTopConstraint,
@@ -1825,7 +1839,7 @@ final class VibeAgentKitMessageCell: UITableViewCell {
     } else {
       NSLayoutConstraint.activate([
         leadingConstraint,
-        assistantMaxWidthConstraint,
+        assistantWidthConstraint,
         assistantTopConstraint,
         assistantLeadingConstraint,
         assistantTrailingConstraint,
@@ -1987,6 +2001,9 @@ final class VibeAgentKitMessageCell: UITableViewCell {
       assistantBodyView.isHidden = false
       assistantBodyView.onStepTap = onStepTap
       assistantBodyView.onOpenSubagent = onOpenSubagent
+      assistantBodyView.onToggleRuntimeExpand = onToggleRuntimeExpand
+      assistantBodyView.onReviewTapped = onReviewTapped
+      assistantBodyView.onFileTapped = onFileTapped
       assistantBodyView.configure(
         text: displayText,
         isStreaming: message.isStreaming,
@@ -2001,6 +2018,7 @@ final class VibeAgentKitMessageCell: UITableViewCell {
         onRuntimeTap: onRuntimeTap,
         onLoaderTap: onProgressTap,
         isProgressExpanded: isProgressExpanded,
+        isRuntimeExpanded: isRuntimeExpanded,
         expandedStepIds: expandedStepIds,
         streamingStartDate: streamingStartDate
       )
@@ -2095,6 +2113,10 @@ final class VibeAgentKitMessageCell: UITableViewCell {
       lessThanOrEqualTo: rowContainer.widthAnchor,
       multiplier: 0.92
     )
+    assistantWidthConstraint = messageContainerView.widthAnchor.constraint(
+      equalTo: rowContainer.widthAnchor,
+      multiplier: 0.92
+    )
     userMaxWidthConstraint = messageContainerView.widthAnchor.constraint(
       lessThanOrEqualTo: rowContainer.widthAnchor,
       multiplier: 0.78
@@ -2159,7 +2181,7 @@ final class VibeAgentKitMessageCell: UITableViewCell {
     ])
 
     leadingConstraint.isActive = true
-    assistantMaxWidthConstraint.isActive = true
+    assistantWidthConstraint.isActive = true
     assistantTopConstraint.isActive = true
     assistantLeadingConstraint.isActive = true
     assistantTrailingConstraint.isActive = true
