@@ -23,6 +23,7 @@ const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
 const readline = require("readline");
+const net = require("net");
 const { spawn, execFileSync } = require("child_process");
 
 let WebSocket, Phoenix;
@@ -42,6 +43,13 @@ const CONFIG_DIR = path.join(os.homedir(), ".vibe");
 const CONFIG_FILE = path.join(CONFIG_DIR, "bridge.json");
 const MAX_PROGRESS_LINES = 400; // safety cap on streamed events per task
 const MAX_LINE_BYTES = 8 * 1024;
+// During long silent stretches (Opus extended thinking emits the whole reasoning
+// block as ONE stream-json event at the end, so the CLI can go 30–60s with zero
+// output) the phone's live feed would otherwise freeze. Re-push a lightweight
+// keepalive on this cadence so the server re-broadcasts the current snapshot —
+// a phone that missed a broadcast during a 1006/1012 drop re-syncs, and the live
+// turn never looks stalled. Carries no feed node (the server parser ignores it).
+const KEEPALIVE_MS = 10 * 1000;
 const MAX_DIFF_BYTES = 90 * 1024;
 const MAX_DIFF_FILES = 24;
 const MAX_UNTRACKED_FILE_BYTES = 220 * 1024;
@@ -756,17 +764,22 @@ function stripReservedMention(prompt, provider) {
     .trim();
 }
 
-// Normalise the per-task permission level chosen on the phone into one of four
-// modes. Accepts a range of aliases so older clients / env overrides keep working.
-//   ask         — live per-action approval (safe-propose until the live channel
-//                 lands; see VIBE live-approval follow-up)
+// Normalise the per-task permission level chosen on the phone into one mode.
+// Accepts a range of aliases so older clients / env overrides keep working.
+//   plan        — research & propose a plan, request approval before editing
+//   ask         — live per-action approval routed to the phone
 //   read_only   — analyse & propose, never change files
-//   ask_auto    — safe automatic execution for noninteractive mobile runs
+//   ask_auto    — safe automatic execution for noninteractive mobile runs (DEFAULT)
 //   allow_edits — auto-approve edits + sandboxed command execution
 //   full_access — no sandbox, run anything
+//
+// IMPORTANT: an UNSET mode now defaults to `ask_auto`, not `read_only`. The old
+// read_only default silently mapped to claude `--permission-mode plan`, so every
+// message ran propose-only ("always plan mode" bug). Plan is now an explicit,
+// deliberately-chosen mode (see `plan` below) surfaced with a badge on the phone.
 function workModeFor(task) {
   const raw = String(
-    (task && (task.workMode || task.agentBridgeWorkMode || task.mode)) || "read_only"
+    (task && (task.workMode || task.agentBridgeWorkMode || task.mode)) || "ask_auto"
   )
     .trim()
     .toLowerCase();
@@ -787,10 +800,19 @@ function workModeFor(task) {
   ) {
     return "allow_edits";
   }
+  // Plan is explicit and distinct from read_only: it runs in claude plan
+  // permission mode AND drives the plan-file → approval round-trip.
+  if (["plan", "plan_mode", "plan-mode", "planmode"].includes(raw)) {
+    return "plan";
+  }
   if (["ask", "approve", "live", "prompt"].includes(raw)) {
     return "ask";
   }
-  return "read_only";
+  if (["read_only", "read-only", "readonly", "read", "propose"].includes(raw)) {
+    return "read_only";
+  }
+  // Unknown / unset → safe-auto default.
+  return "ask_auto";
 }
 
 // Resume is now EXPLICIT and per-message. The phone attaches a session/thread id
@@ -819,9 +841,16 @@ function claudePermissionMode(task) {
       return "auto";
     case "allow_edits":
       return "acceptEdits";
-    // "ask" maps to plan for now (propose, don't execute) until live mobile
-    // approval is wired; "read_only" is plan too.
+    case "plan":
+      // Explicit plan mode: research & propose, then request approval via the
+      // plan-file → ExitPlanMode round-trip (see runClaudeStreaming / askHub).
+      return "plan";
+    case "ask":
+      // Live per-action approval routed to the phone via the permission-prompt
+      // tool; claude's "default" mode raises a permission request per tool.
+      return "default";
     default:
+      // read_only — propose-only, never edits.
       return "plan";
   }
 }
@@ -977,6 +1006,11 @@ function buildCommand(provider, prompt, chatId, task) {
     const effort = reasoningEffortFor(provider, task);
     const args = ["-p", "--output-format", "stream-json", "--permission-mode", mode, "--effort", effort];
     appendToolListArg(args, "--disallowedTools", claudeDisallowedTools(task));
+    if (ASK_MCP_ENABLED && askMcpConfigPath) {
+      // Expose the ask_user MCP tool and pre-allow it so the mid-run question
+      // round-trip never trips a (headless-unanswerable) permission prompt.
+      args.push("--mcp-config", askMcpConfigPath, "--allowedTools", ASK_TOOL_NAME);
+    }
     const resumeId = resumeIdFor(task);
     if (resumeId) args.push("--resume", resumeId);
     args.push("--verbose");
@@ -2411,7 +2445,11 @@ async function runTask(channel, task) {
 
   let child;
   try {
-    child = spawn(built.cmd, built.args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    child = spawn(built.cmd, built.args, {
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, ...askMcpEnv(provider, chatId, taskId) },
+    });
   } catch (err) {
     channel.push("error", { provider, chatId, message: `Could not start ${built.cmd}: ${err.message}`, replyToId });
     return;
@@ -2491,10 +2529,13 @@ async function runTask(channel, task) {
   let progressCount = 1;
   let canceled = false;
   let firstOutputLogged = false;
+  let lastChunkAt = Date.now();
+  let keepaliveTimer = null;
   let lastProgressLogAt = 0;
 
   const onChunk = (buf) => {
     const text = buf.toString();
+    lastChunkAt = Date.now();
     if (!firstOutputLogged) {
       firstOutputLogged = true;
       const now = Date.now();
@@ -2543,11 +2584,39 @@ async function runTask(channel, task) {
   child.stdout.on("data", onChunk);
   child.stderr.on("data", onChunk);
 
+  // Keepalive: while the CLI is mid-run but silent (long thinking / a quiet
+  // tool), re-push the current snapshot so the phone's live turn never appears
+  // frozen and a phone that missed a broadcast during a socket drop re-syncs.
+  // Skipped when output is actively flowing (a real chunk arrived this window).
+  keepaliveTimer = setInterval(() => {
+    if (canceled) return;
+    if (Date.now() - lastChunkAt < KEEPALIVE_MS) return;
+    const idleMs = Date.now() - spawnAt;
+    channel.push("progress", {
+      provider,
+      chatId,
+      taskId,
+      replyToId,
+      repoId: repo.id,
+      repoName: repo.name,
+      cwd,
+      workMode: workModeFor(task),
+      model: modelFor(provider, chatId, task) || null,
+      stage: "keepalive",
+      sentAtMs: Date.now(),
+      line: JSON.stringify({ type: "vibe_bridge_keepalive", provider, taskId, elapsedMs: idleMs }),
+    });
+  }, KEEPALIVE_MS);
+
   child.on("error", (err) => {
     channel.push("error", { provider, chatId, message: `${built.cmd} failed: ${err.message}`, replyToId });
   });
 
   child.on("close", (code) => {
+    if (keepaliveTimer) {
+      clearInterval(keepaliveTimer);
+      keepaliveTimer = null;
+    }
     runningTasks.delete(key);
     pushBridgeStatus(channel);
     // The run is done — re-push this chat's transcript so the live "running" flag on
@@ -2609,12 +2678,32 @@ async function runTask(channel, task) {
     });
     rememberRuntime(provider, chatId, agentRuntime);
     channel.push("result", resultPayload);
+    // Plan mode: the model proposed but made no edits. Surface the plan to the
+    // phone for approval (the phone re-sends an "implement" run on approve).
+    try {
+      maybeEmitPlanApproval(channel, {
+        provider,
+        task,
+        chatId,
+        taskId,
+        replyToId,
+        repo,
+        output,
+        exitStatus,
+      });
+    } catch (err) {
+      console.error(`[vibe-bridge] plan approval emit failed: ${(err && err.message) || err}`);
+    }
   });
 
   return {
     taskId,
     cancel() {
       canceled = true;
+      if (keepaliveTimer) {
+        clearInterval(keepaliveTimer);
+        keepaliveTimer = null;
+      }
       try {
         child.kill("SIGTERM");
         setTimeout(() => {
@@ -4232,6 +4321,318 @@ function controlTask(channel, payload) {
   }
 }
 
+// ── Ask / approval round-trip (the phone is the approver) ───────────────
+//
+// Two distinct flows share one wire event pair (`ask_request` ⇄ `ask_response`):
+//
+//   • PLAN approval — when a plan-mode run finishes, the model has PROPOSED but
+//     not edited. The bridge fire-and-forgets an `ask_request{kind:"plan"}` with
+//     the sealed plan. The phone renders an approval sheet; on approve it sends a
+//     NORMAL run_task that resumes the session with edits enabled ("implement the
+//     plan"), so message creation rides the proven send path — the bridge never
+//     fabricates a turn. No awaited response needed for this flow.
+//
+//   • ASK-USER — a mid-run question the agent raises through the bridge's MCP
+//     `ask_user` tool (opt-in, VIBE_ASK_MCP=1). That call BLOCKS until the phone
+//     answers, so it uses `requestAsk` below, which returns a Promise resolved by
+//     the matching `ask_response`. An unanswered ask auto-rejects after a timeout
+//     so a run can never hang forever.
+//
+// The request/answer bodies are E2E-sealed with the pairing runtime key (arte1),
+// exactly like the diff card — the server relays an opaque blob it cannot read.
+const pendingAsks = new Map(); // requestId -> { resolve, timer }
+let askSeq = 0;
+const ASK_TIMEOUT_MS = Number(process.env.VIBE_ASK_TIMEOUT_MS || 10 * 60 * 1000);
+
+function newAskId(chatId) {
+  askSeq += 1;
+  return `ask-${chatId}-${Date.now()}-${askSeq}`;
+}
+
+function pushAskRequest(channel, { provider, chatId, taskId, replyToId, requestId, kind, body }) {
+  const base = { provider, chatId, taskId, replyToId, requestId, kind };
+  const askEnc = encryptRuntimeBlob({ kind, request: body });
+  // Seal when a key exists; otherwise send plaintext (the phone can't decrypt
+  // without the key anyway, and a keyless pairing has no confidentiality to lose).
+  channel.push("ask_request", askEnc ? { ...base, askEnc } : { ...base, request: body });
+}
+
+// Awaited ask (MCP ask_user). Resolves { decision, answer } from `ask_response`.
+function requestAsk(channel, { provider, chatId, taskId, replyToId, kind, body }) {
+  const requestId = newAskId(chatId);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      if (pendingAsks.delete(requestId)) {
+        console.log(`[vibe-bridge] ask ${requestId} timed out → auto-reject`);
+        resolve({ decision: "reject", answer: null, timedOut: true });
+      }
+    }, ASK_TIMEOUT_MS);
+    timer.unref?.();
+    pendingAsks.set(requestId, { resolve, timer });
+    pushAskRequest(channel, { provider, chatId, taskId, replyToId, requestId, kind, body });
+    console.log(`[vibe-bridge] ask_request ${requestId} kind=${kind} chat=${chatId}`);
+  });
+}
+
+// phone → server → bridge: an answer to an awaited ask.
+function resolveAsk(payload) {
+  const requestId = payload && (payload.requestId || payload.request_id);
+  if (!requestId) return;
+  const entry = pendingAsks.get(requestId);
+  if (!entry) return;
+  pendingAsks.delete(requestId);
+  clearTimeout(entry.timer);
+  const decision = String(payload.decision || payload.action || "answer").trim().toLowerCase();
+  let answer = null;
+  const enc = payload.answerEnc || payload.answer_enc;
+  if (enc) {
+    const dec = decryptRuntimeBlob(enc);
+    if (dec) answer = dec.answer !== undefined ? dec.answer : dec;
+  } else if (payload.answer !== undefined) {
+    answer = payload.answer;
+  }
+  console.log(`[vibe-bridge] ask_response ${requestId} decision=${decision}`);
+  entry.resolve({ decision, answer });
+}
+
+// Extract the proposed plan from a finished claude plan-mode run. Prefer the
+// ExitPlanMode tool input (older clients carry the plan there); otherwise fall
+// back to the final assistant text, which in plan mode IS the printed plan.
+// (Modern claude writes the plan to a plan file too, but in `-p` plan mode the
+// plan is always echoed in the output, so we don't need to read the file.)
+function extractPlan(output) {
+  if (!output) return null;
+  let planFromExit = null;
+  let lastText = null;
+  for (const raw of String(output).split("\n")) {
+    const line = raw.trim();
+    if (!line || line[0] !== "{") continue;
+    let ev;
+    try {
+      ev = JSON.parse(line);
+    } catch (_) {
+      continue;
+    }
+    const msg = ev && ev.message;
+    const blocks = msg && Array.isArray(msg.content) ? msg.content : null;
+    if (!blocks) continue;
+    for (const b of blocks) {
+      if (!b) continue;
+      if (b.type === "tool_use" && b.name === "ExitPlanMode" && b.input) {
+        const p = b.input.plan;
+        if (typeof p === "string" && p.trim()) planFromExit = p.trim();
+      }
+      if (b.type === "text" && typeof b.text === "string" && b.text.trim()) {
+        lastText = b.text.trim();
+      }
+    }
+  }
+  return planFromExit || lastText || null;
+}
+
+// Fire-and-forget plan-approval prompt to the phone after a plan-mode run.
+function maybeEmitPlanApproval(channel, { provider, task, chatId, taskId, replyToId, repo, output, exitStatus }) {
+  if (provider !== "claude") return; // codex exec has no plan-approval round-trip
+  if (workModeFor(task) !== "plan") return;
+  if (exitStatus !== 0) return;
+  const plan = extractPlan(output);
+  if (!plan) return;
+  const requestId = newAskId(chatId);
+  pushAskRequest(channel, {
+    provider,
+    chatId,
+    taskId,
+    replyToId,
+    requestId,
+    kind: "plan",
+    body: { plan, sessionId: sessionByChat.get(chatId) || resumeIdFor(task) || null, repoName: repo && repo.name },
+  });
+  console.log(`[vibe-bridge] ask_request(plan) ${requestId} chat=${chatId} planLen=${plan.length}`);
+}
+
+// ── MCP ask_user producer (mid-run questions) ───────────────────────
+//
+// `claude -p` is non-interactive, so the built-in AskUserQuestion tool can't
+// round-trip to a human. Instead we expose our OWN MCP tool, `ask_user`, via
+// `--mcp-config`. When the model calls it the run BLOCKS (MCP tool calls are
+// synchronous from claude's view) while we relay the question to the phone and
+// wait for the answer:
+//
+//   claude → mcp(ask_user) → unix socket → bridge.requestAsk → phone sheet
+//          ← tool_result   ← unix socket ← bridge ← ask_response ← phone
+//
+// The MCP server is a tiny stdio child of `claude`; it inherits VIBE_ASK_SOCK /
+// VIBE_ASK_CHAT / VIBE_ASK_TASK from the claude spawn env so it knows which
+// chat/task the question belongs to. Disable with VIBE_ASK_MCP=0.
+const ASK_MCP_ENABLED = process.env.VIBE_ASK_MCP !== "0";
+const ASK_TOOL_NAME = "mcp__vibeask__ask_user";
+let activeChannel = null;
+let askMcpConfigPath = null;
+let askIpcSockPath = null;
+let askIpcServer = null;
+
+// One question payload the model can raise. `questions[]` mirrors the iOS sheet
+// (and Claude's own AskUserQuestion): each carries a short header chip, a flag for
+// multi-select, and labelled options.
+const ASK_MCP_SCRIPT = `#!/usr/bin/env node
+"use strict";
+const net = require("net");
+const readline = require("readline");
+const SOCK = process.env.VIBE_ASK_SOCK;
+const CHAT = process.env.VIBE_ASK_CHAT || "";
+const TASK = process.env.VIBE_ASK_TASK || "";
+let proto = "2024-11-05";
+function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }
+function result(id, res) { send({ jsonrpc: "2.0", id, result: res }); }
+const TOOL = {
+  name: "ask_user",
+  description:
+    "Ask the user one or more clarifying questions and wait for their answer. Use this " +
+    "whenever you need a decision, preference, or missing detail before continuing. The user " +
+    "sees a sheet on their phone (one question per page) and their selections are returned. " +
+    "Each question has a short 'header' chip (<=12 chars), a 'multiSelect' flag, and labelled 'options'.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      questions: {
+        type: "array",
+        description: "One or more questions to ask.",
+        items: {
+          type: "object",
+          properties: {
+            question: { type: "string", description: "The full question text." },
+            header: { type: "string", description: "Short label (<=12 chars) for the question chip." },
+            multiSelect: { type: "boolean", description: "Allow selecting multiple options." },
+            options: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  label: { type: "string" },
+                  description: { type: "string" }
+                },
+                required: ["label"]
+              }
+            }
+          },
+          required: ["question", "options"]
+        }
+      }
+    },
+    required: ["questions"]
+  }
+};
+function askBridge(questions) {
+  return new Promise((resolve) => {
+    if (!SOCK) { resolve({ error: "ask_user is unavailable (no bridge socket)." }); return; }
+    let buf = "";
+    let done = false;
+    const finish = (val) => { if (!done) { done = true; resolve(val); } };
+    const conn = net.createConnection(SOCK, () => {
+      conn.write(JSON.stringify({ chatId: CHAT, taskId: TASK, questions }) + "\\n");
+    });
+    conn.setEncoding("utf8");
+    conn.on("data", (d) => {
+      buf += d;
+      const nl = buf.indexOf("\\n");
+      if (nl < 0) return;
+      let parsed = null;
+      try { parsed = JSON.parse(buf.slice(0, nl)); } catch (_) {}
+      conn.end();
+      finish(parsed && parsed.answer != null ? parsed.answer : { error: "No answer." });
+    });
+    conn.on("error", () => finish({ error: "Could not reach the user." }));
+    conn.on("close", () => finish({ error: "The user did not answer." }));
+  });
+}
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", async (line) => {
+  let msg = null;
+  try { msg = JSON.parse(line); } catch (_) { return; }
+  if (!msg || typeof msg !== "object") return;
+  const { id, method, params } = msg;
+  if (method === "initialize") {
+    if (params && params.protocolVersion) proto = params.protocolVersion;
+    result(id, { protocolVersion: proto, capabilities: { tools: {} }, serverInfo: { name: "vibeask", version: "1.0.0" } });
+  } else if (method === "tools/list") {
+    result(id, { tools: [TOOL] });
+  } else if (method === "tools/call") {
+    const args = (params && params.arguments) || {};
+    const questions = Array.isArray(args.questions) ? args.questions : [];
+    const answer = await askBridge(questions);
+    result(id, { content: [{ type: "text", text: JSON.stringify(answer) }] });
+  } else if (method === "ping") {
+    result(id, {});
+  } else if (id !== undefined && id !== null) {
+    send({ jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found: " + method } });
+  }
+});
+`;
+
+// Lazily materialize the MCP server script + its --mcp-config file, and start the
+// unix-socket IPC server the script talks back through. Idempotent.
+function ensureAskMcp(channel) {
+  activeChannel = channel;
+  if (!ASK_MCP_ENABLED || askIpcServer) return;
+  try {
+    const dir = os.tmpdir();
+    const scriptPath = path.join(dir, "vibe-ask-mcp.js");
+    fs.writeFileSync(scriptPath, ASK_MCP_SCRIPT, { mode: 0o700 });
+    askMcpConfigPath = path.join(dir, "vibe-ask-mcp.json");
+    fs.writeFileSync(
+      askMcpConfigPath,
+      JSON.stringify({ mcpServers: { vibeask: { command: process.execPath, args: [scriptPath] } } })
+    );
+    // Short socket path — macOS caps the sun_path at ~104 bytes.
+    askIpcSockPath = path.join(dir, `vibe-ask-${process.pid}.sock`);
+    try { fs.unlinkSync(askIpcSockPath); } catch (_) {}
+    askIpcServer = net.createServer(handleAskIpcConnection);
+    askIpcServer.on("error", (e) => console.error(`[vibe-bridge] ask IPC error: ${e.message}`));
+    askIpcServer.listen(askIpcSockPath, () =>
+      console.log(`[vibe-bridge] ask_user MCP ready (sock=${askIpcSockPath})`)
+    );
+  } catch (e) {
+    console.error(`[vibe-bridge] ask_user MCP setup failed: ${e.message}`);
+    askMcpConfigPath = null;
+    askIpcSockPath = null;
+  }
+}
+
+// The MCP child connected and sent {chatId, taskId, questions}. Relay to the phone
+// via requestAsk and write the answer back so the model's tool call returns.
+function handleAskIpcConnection(conn) {
+  let buf = "";
+  let handled = false;
+  conn.setEncoding("utf8");
+  conn.on("data", async (d) => {
+    buf += d;
+    const nl = buf.indexOf("\n");
+    if (nl < 0 || handled) return;
+    handled = true;
+    let req = null;
+    try { req = JSON.parse(buf.slice(0, nl)); } catch (_) {}
+    if (!req || !activeChannel) { try { conn.end(); } catch (_) {} return; }
+    const result = await requestAsk(activeChannel, {
+      provider: "claude",
+      chatId: req.chatId,
+      taskId: req.taskId,
+      replyToId: null,
+      kind: "ask",
+      body: { questions: Array.isArray(req.questions) ? req.questions : [] },
+    });
+    const answer = result && result.answer != null ? result.answer : { decision: result && result.decision };
+    try { conn.write(JSON.stringify({ answer }) + "\n"); } catch (_) {}
+    try { conn.end(); } catch (_) {}
+  });
+  conn.on("error", () => {});
+}
+
+// Per-task env handed to the claude spawn so the MCP child knows its chat/task.
+function askMcpEnv(provider, chatId, taskId) {
+  if (!ASK_MCP_ENABLED || provider !== "claude" || !askIpcSockPath) return {};
+  return { VIBE_ASK_SOCK: askIpcSockPath, VIBE_ASK_CHAT: String(chatId || ""), VIBE_ASK_TASK: String(taskId || "") };
+}
+
 // ── Socket / channel ────────────────────────────────────────────────
 
 function wsUrl(server) {
@@ -4343,6 +4744,8 @@ function connect(server, token, userId) {
   channel.on("control_task", (payload) => controlTask(channel, payload || {}));
   channel.on("history_request", (payload) => handleHistoryRequest(channel, payload || {}));
   channel.on("file_request", (payload) => handleFileRequest(channel, payload || {}));
+  channel.on("ask_response", (payload) => resolveAsk(payload || {}));
+  ensureAskMcp(channel); // start the ask_user MCP IPC server; refresh active channel
 
   channel
     .join()

@@ -245,6 +245,24 @@ defmodule VibeWeb.AgentBridgeChannel do
     {:reply, :ok, socket}
   end
 
+  # daemon → server: the agent (or the bridge's plan gate) needs the phone to
+  # decide something — approve a plan, or answer a question. We relay it verbatim
+  # to the requesting chat; the `askEnc` blob is opaque to us (sealed with the
+  # pairing runtime key). The phone replies with `agent-bridge-ask-response`.
+  def handle_in("ask_request", payload, socket) when is_map(payload) do
+    chat_id = payload["chatId"] || payload["chat_id"]
+
+    if is_binary(chat_id) and chat_id != "" do
+      VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-bridge-ask", payload)
+    else
+      Logger.info(
+        "[AgentBridge] ask_request without chatId user=#{socket.assigns.user_id} requestId=#{inspect(payload["requestId"])}"
+      )
+    end
+
+    {:reply, :ok, socket}
+  end
+
   # daemon → server: acknowledgement for a phone-issued task control action.
   def handle_in("control_result", payload, socket) do
     Logger.info(

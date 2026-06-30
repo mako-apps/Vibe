@@ -1013,6 +1013,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   // rows are allowed through the fresh-surface filter so the picked conversation shows
   // in the default chat view (everything else still opens clean). Nil = fresh thread.
   private var bridgeLoadedSessionId: String?
+  // The bridge session the CURRENTLY-VISIBLE conversation belongs to, adopted from the
+  // most recent finished agent turn in a fresh thread (one started here, not opened from
+  // History). Lets a follow-up — "apply fix", "continue" — resume that same CLI session
+  // instead of spawning a new one that lands in a different history. Cleared on New Chat
+  // and DM-switch so a genuinely new chat never inherits it.
+  private var activeBridgeSessionId: String?
 
   /// Register an outgoing message id so the fresh-surface filter never hides it.
   func noteBridgeFreshOwnSentId(_ messageId: String) {
@@ -1296,6 +1302,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       parsed = Array(parsed.suffix(Self.agentTranscriptWindow))
     }
     dismissBridgeSpinnerIfSessionLoaded(parsed)
+    adoptActiveBridgeSessionId(from: parsed)
     updateSeeProgressButton(parsed)
     if let targetMessageId = reactionDebugTargetMessageId, reactionDebugRemainingRowsChecks > 0 {
       reactionDebugRemainingRowsChecks -= 1
@@ -2114,6 +2121,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     bridgeFreshOwnSentIds.removeAll()
     reportedBridgeCommandIds.removeAll()
     bridgeLoadedSessionId = nil
+    activeBridgeSessionId = nil
     bridgeAgentManuallyShown = false
     scheduleBridgeAgentPresenceRefresh()
     updateChatEngineBinding()
@@ -5131,14 +5139,20 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     metadata.merge(
       AgentBridgeSelectionStore.selectedRunOptions(provider: provider).payload(provider: provider)
     ) { _, new in new }
-    // The default chat is fresh unless the user explicitly opened a History
-    // session. In that case follow-up sends must carry the selected session id
-    // so the bridge resumes instead of starting a new CLI thread.
-    if let loadedSessionId = bridgeLoadedSessionId,
-      !loadedSessionId.isEmpty,
-      !loadedSessionId.hasPrefix("running:")
+    // Resume target for this send. Priority:
+    //  1. A History session the user explicitly opened (`bridgeLoadedSessionId`).
+    //  2. Otherwise the session the visible conversation already belongs to
+    //     (`activeBridgeSessionId`, adopted from the last finished agent turn) — so a
+    //     follow-up like "apply fix" continues the SAME CLI session instead of spawning
+    //     a new one that lands in a different history.
+    // A brand-new chat (no History pick, no completed turn) resolves to nil → the bridge
+    // starts a fresh session and the message is never filed under a stale one.
+    let resumeSessionId = bridgeLoadedSessionId ?? activeBridgeSessionId
+    if let resumeSessionId,
+      !resumeSessionId.isEmpty,
+      !resumeSessionId.hasPrefix("running:")
     {
-      metadata["agentBridgeResumeSessionId"] = loadedSessionId
+      metadata["agentBridgeResumeSessionId"] = resumeSessionId
     }
     return metadata
   }
@@ -5407,6 +5421,31 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if parsed.contains(where: { ($0.messageId ?? "").hasPrefix(prefix) }) {
       hideBridgeSessionLoadingSpinner()
       presentedBridgeAgentVC?.setTranscriptLoading(false)
+    }
+  }
+
+  /// Adopt the bridge session id of the most recent finished agent turn in this fresh
+  /// thread, so a follow-up resumes that same CLI session (see
+  /// `agentBridgeMetadataForOutgoing`). Skipped when a History session is explicitly
+  /// loaded (that id already governs the resume). Never clears here — New Chat / DM-switch
+  /// own the reset — so a transient runtime-less update can't drop the active session
+  /// mid-thread. A still-running turn (sessionId "running:…") is ignored until it settles.
+  private func adoptActiveBridgeSessionId(from parsed: [ChatListRow]) {
+    guard currentBridgeProvider != nil, bridgeLoadedSessionId == nil else { return }
+    for row in parsed.reversed() {
+      // Claude reports `sessionId`; Codex reports `threadId`. Both resume through the
+      // same `agentBridgeResumeSessionId` slot (resumeIdFor on the bridge), so adopt
+      // whichever this turn carries.
+      let raw = row.agentRuntime?.sessionId ?? row.agentRuntime?.threadId
+      guard
+        let sid = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+        !sid.isEmpty, !sid.hasPrefix("running:")
+      else { continue }
+      if activeBridgeSessionId != sid {
+        activeBridgeSessionId = sid
+        NSLog("[AgentRoute] adopt activeBridgeSessionId=%@", sid)
+      }
+      return
     }
   }
 
@@ -6257,10 +6296,20 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
     vc.onNewChat = { [weak self, weak vc] in
       guard let self else { return }
+      // A deliberate New Chat: forget the session the previous thread resumed AND re-arm
+      // the fresh-surface filter so the old transcript (and its runtime rows) is hidden.
+      // Otherwise the next setRows would re-adopt the old session id via
+      // adoptActiveBridgeSessionId and the new chat's first message would resume the wrong
+      // history — the very leak this is meant to prevent.
       self.setBridgeLoadedSessionId(nil)
+      self.activeBridgeSessionId = nil
+      self.bridgeFreshOwnSentIds.removeAll()
+      self.bridgeFreshHiddenIds.removeAll()
+      self.bridgeFreshSnapshotChatId = nil
       vc?.setTranscriptLoading(false)
       vc?.isHistoryPicked = false
       vc?.setMessages([])
+      if !self.sourceRowsPayload.isEmpty { self.setRows(self.sourceRowsPayload) }
     }
     vc.repoPickerMenu = agentControlMenu(provider: provider)
 

@@ -330,74 +330,82 @@ struct AgentBridgeTranscriptMessage: Identifiable {
 
 // MARK: - History loading skeletons
 
-/// A single shimmering placeholder block. A muted rounded rect with a highlight band
-/// sweeping across it — the building block for the history skeletons (no spinner).
-private struct AgentBridgeSkeletonBlock: View {
+/// A single shimmering placeholder pill. Uses a soft, wide sinusoidal opacity wave
+/// instead of a hard-edge gradient band so the pulse feels organic and premium.
+private struct AgentBridgeShimmerPill: View {
   var width: CGFloat? = nil
   var height: CGFloat
-  var cornerRadius: CGFloat = 7
-  let base: Color
-  @State private var animate = false
+  var cornerRadius: CGFloat = 14
+  let tint: Color
+  @State private var phase: CGFloat = 0
 
   var body: some View {
     RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-      .fill(base)
+      .fill(tint)
       .frame(width: width, height: height)
       .frame(maxWidth: width == nil ? .infinity : nil, alignment: .leading)
-      .overlay(
-        GeometryReader { geo in
-          let w = geo.size.width
-          LinearGradient(
-            colors: [.clear, Color.white.opacity(0.10), .clear],
-            startPoint: .leading,
-            endPoint: .trailing
-          )
-          .frame(width: max(60, w * 0.5))
-          .offset(x: animate ? w : -w * 0.6)
-        }
-      )
-      .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+      .opacity(0.55 + 0.45 * Darwin.sin(Double(phase)))
       .onAppear {
-        withAnimation(.linear(duration: 1.6).repeatForever(autoreverses: false)) {
-          animate = true
+        withAnimation(
+          .easeInOut(duration: 1.8)
+          .repeatForever(autoreverses: true)
+        ) {
+          phase = .pi
         }
       }
   }
 }
 
-/// Skeleton for the session LIST: a few project headers each with a couple of
-/// bubble-shaped session cards. Replaces the "Reading history…" spinner.
+/// Modern skeleton for the session list. Each card is a soft rounded pill with a
+/// gentle pulsing opacity — no hard gradients, no nested inner boxes.
 private struct AgentBridgeHistoryListSkeleton: View {
   let palette: AppThemePalette
-  private var base: Color { palette.secondaryText.opacity(0.15) }
+  private var tint: Color { palette.secondaryText.opacity(0.15) }
 
   var body: some View {
-    ScrollView {
-      VStack(alignment: .leading, spacing: 26) {
-        ForEach(0..<3, id: \.self) { _ in
-          VStack(alignment: .leading, spacing: 12) {
+    ScrollView(showsIndicators: false) {
+      VStack(spacing: 28) {
+        ForEach(0..<3, id: \.self) { groupIndex in
+          VStack(alignment: .leading, spacing: 14) {
+            // Project header skeleton
             HStack(spacing: 10) {
-              AgentBridgeSkeletonBlock(width: 18, height: 18, cornerRadius: 5, base: base)
-              AgentBridgeSkeletonBlock(width: 150, height: 18, base: base)
-            }
-            ForEach(0..<2, id: \.self) { _ in
-              VStack(alignment: .leading, spacing: 9) {
-                AgentBridgeSkeletonBlock(height: 14, base: base)
-                AgentBridgeSkeletonBlock(width: 190, height: 12, base: base)
-              }
-              .padding(14)
-              .background(
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                  .fill(base.opacity(0.5))
+              AgentBridgeShimmerPill(width: 24, height: 24, cornerRadius: 8, tint: tint)
+              AgentBridgeShimmerPill(
+                width: CGFloat([130, 170, 110][groupIndex % 3]),
+                height: 18,
+                cornerRadius: 10,
+                tint: tint
               )
+            }
+            .padding(.leading, 4)
+
+            // Session card skeletons
+            ForEach(0..<2, id: \.self) { cardIndex in
+              VStack(alignment: .leading, spacing: 10) {
+                AgentBridgeShimmerPill(
+                  width: CGFloat([220, 180, 200, 160, 240, 190][(groupIndex * 2 + cardIndex) % 6]),
+                  height: 16,
+                  cornerRadius: 10,
+                  tint: tint
+                )
+                AgentBridgeShimmerPill(
+                  width: CGFloat([120, 100, 140, 90][(groupIndex + cardIndex) % 4]),
+                  height: 12,
+                  cornerRadius: 8,
+                  tint: tint
+                )
+              }
+              .padding(.vertical, 9)
+              .frame(maxWidth: .infinity, alignment: .leading)
             }
           }
         }
       }
-      .padding(20)
+      .padding(.horizontal, 20)
+      .padding(.top, 16)
     }
     .allowsHitTesting(false)
-    .transition(.opacity)
+    .transition(.opacity.animation(.easeInOut(duration: 0.3)))
   }
 }
 
@@ -405,19 +413,19 @@ private struct AgentBridgeHistoryListSkeleton: View {
 /// so a loading conversation reads as chat bubbles rather than a spinner.
 private struct AgentBridgeTranscriptSkeleton: View {
   let palette: AppThemePalette
-  private var base: Color { palette.secondaryText.opacity(0.15) }
+  private var tint: Color { palette.secondaryText.opacity(0.15) }
 
   var body: some View {
     ScrollView {
       VStack(alignment: .leading, spacing: 18) {
         ForEach(0..<5, id: \.self) { index in
           VStack(alignment: .leading, spacing: 6) {
-            AgentBridgeSkeletonBlock(width: 54, height: 11, cornerRadius: 5, base: base)
-            AgentBridgeSkeletonBlock(height: 13, base: base)
+            AgentBridgeShimmerPill(width: 54, height: 11, cornerRadius: 6, tint: tint)
+            AgentBridgeShimmerPill(height: 13, cornerRadius: 8, tint: tint)
             if index % 2 == 0 {
-              AgentBridgeSkeletonBlock(height: 13, base: base)
+              AgentBridgeShimmerPill(height: 13, cornerRadius: 8, tint: tint)
             }
-            AgentBridgeSkeletonBlock(width: 220, height: 13, base: base)
+            AgentBridgeShimmerPill(width: 220, height: 13, cornerRadius: 8, tint: tint)
           }
           .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -448,6 +456,14 @@ struct AgentBridgeHistoryInlineView: View {
   @State private var errorMessage: String?
   @State private var pendingRequestId: String?
 
+  /// Pre-state: read from AgentPairingService snapshot before the panel opens
+  /// so we never flash a stale disconnected state on first open.
+  @State private var resolvedConnected: Bool = false
+  @State private var resolvedDeviceLabel: String = ""
+  @State private var hasConnectedBefore: Bool = false
+  /// Retry timer for race-condition recovery (connection arrives after panel open).
+  @State private var retryTask: Task<Void, Never>?
+
   private var palette: AppThemePalette { AppThemePalette.resolve(for: colorScheme) }
   private var displayName: String { AgentBridgeProfile.displayName(for: provider) }
   private var visibleSessions: [AgentBridgeHistorySession] { mergedSessions() }
@@ -476,22 +492,18 @@ struct AgentBridgeHistoryInlineView: View {
     return groups
   }
 
+  /// The effective connection state: true if either the passed-in prop OR the
+  /// pre-state snapshot says connected. This closes the race window.
+  private var effectiveConnected: Bool { connected || resolvedConnected }
+  private var effectiveDeviceLabel: String {
+    let passed = deviceLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+    return passed.isEmpty ? resolvedDeviceLabel : passed
+  }
+
   var body: some View {
     Group {
-      if loading && visibleSessions.isEmpty {
+      if visibleSessions.isEmpty {
         AgentBridgeHistoryListSkeleton(palette: palette)
-      } else if visibleSessions.isEmpty {
-        VStack(spacing: 12) {
-          Image(systemName: errorMessage == nil ? "clock.badge.questionmark" : "laptopcomputer.slash")
-            .font(.system(size: 34, weight: .semibold))
-            .foregroundStyle(palette.secondaryText)
-          Text(errorMessage ?? "No \(displayName) conversations found on your computer.")
-            .font(.system(size: 14))
-            .foregroundStyle(palette.secondaryText)
-            .multilineTextAlignment(.center)
-            .padding(.horizontal, 28)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
       } else {
         List {
           ForEach(projectGroups) { group in
@@ -508,35 +520,138 @@ struct AgentBridgeHistoryInlineView: View {
         .scrollContentBackground(.hidden)
       }
     }
-    .safeAreaInset(edge: .bottom) {
-      if connected || paired { connectionFooter }
-    }
-    .navigationTitle("\(displayName) history")
+    .navigationTitle("")
     .navigationBarTitleDisplayMode(.inline)
+    .toolbar {
+      ToolbarItem(placement: .principal) {
+        VStack(spacing: 2) {
+          Text("\(displayName) history")
+            .font(.headline)
+            .foregroundStyle(palette.text)
+
+          HStack(spacing: 5) {
+            if effectiveConnected {
+              // Green dot + device name
+              Circle().fill(Color.green).frame(width: 7, height: 7)
+              if !effectiveDeviceLabel.isEmpty {
+                Text(effectiveDeviceLabel)
+                  .font(.system(size: 11, weight: .medium))
+                  .foregroundStyle(palette.secondaryText)
+                  .lineLimit(1)
+              }
+            } else if paired || hasConnectedBefore {
+              // Spinner + device name (connecting / recovering)
+              ProgressView().controlSize(.mini)
+              if !effectiveDeviceLabel.isEmpty {
+                Text(effectiveDeviceLabel)
+                  .font(.system(size: 11, weight: .medium))
+                  .foregroundStyle(palette.secondaryText)
+                  .lineLimit(1)
+              }
+            } else {
+              // Red dot + device name (or empty)
+              Circle().fill(Color.red).frame(width: 7, height: 7)
+              if !effectiveDeviceLabel.isEmpty {
+                Text(effectiveDeviceLabel)
+                  .font(.system(size: 11, weight: .medium))
+                  .foregroundStyle(palette.secondaryText)
+                  .lineLimit(1)
+              }
+            }
+          }
+          .animation(.easeInOut(duration: 0.25), value: effectiveConnected)
+          .animation(.easeInOut(duration: 0.25), value: effectiveDeviceLabel)
+        }
+      }
+    }
     .onReceive(NotificationCenter.default.publisher(for: ChatEngine.didChangeNotification)) { note in
       handle(note)
     }
-    .onAppear { seedThenRefresh() }
-  }
-
-  /// Footer pinned to the bottom of the history list: which computer this history is
-  /// coming from. While paired-but-offline it reads as "Reconnecting…" with a spinner
-  /// so a recovering connection is visible instead of a silent stale list.
-  private var connectionFooter: some View {
-    HStack(spacing: 8) {
-      if connected {
-        Circle().fill(Color.green).frame(width: 8, height: 8)
-        Text(deviceLabel.isEmpty ? "Connected" : "Connected to \(deviceLabel)")
-      } else {
-        ProgressView().controlSize(.small)
-        Text(deviceLabel.isEmpty ? "Reconnecting…" : "Reconnecting to \(deviceLabel)…")
+    .onChange(of: connected) { newValue in
+      if newValue {
+        hasConnectedBefore = true
+        resolvedConnected = true
+        // Connection just came in — if we had an error or empty state, retry.
+        if visibleSessions.isEmpty || errorMessage != nil {
+          requestList()
+        }
       }
     }
-    .font(.system(size: 12, weight: .medium))
-    .foregroundStyle(palette.secondaryText)
-    .frame(maxWidth: .infinity)
-    .padding(.vertical, 10)
-    .background(.bar)
+    .onAppear {
+      preStateCheckup()
+      seedThenRefresh()
+      startRaceConditionRecovery()
+    }
+    .onDisappear {
+      retryTask?.cancel()
+      retryTask = nil
+    }
+  }
+
+  // MARK: - Pre-state checkup
+
+  /// Read the cached snapshot from AgentPairingService BEFORE relying on the
+  /// passed-in `connected` prop, which may still be false during the first
+  /// render if the status poll hasn't completed yet.
+  private func preStateCheckup() {
+    if let snapshot = AgentPairingService.lastStatusSnapshot {
+      if snapshot.connected {
+        resolvedConnected = true
+        hasConnectedBefore = true
+      }
+      if resolvedDeviceLabel.isEmpty {
+        resolvedDeviceLabel = snapshot.devices.first?.label ?? ""
+      }
+    }
+    // Also check the lightweight statics
+    if AgentPairingService.lastConnected {
+      resolvedConnected = true
+      hasConnectedBefore = true
+    }
+    if resolvedDeviceLabel.isEmpty, let lbl = AgentPairingService.lastDeviceLabel {
+      resolvedDeviceLabel = lbl
+    }
+    // Mirror the prop
+    if connected {
+      resolvedConnected = true
+      hasConnectedBefore = true
+    }
+  }
+
+  // MARK: - Race condition recovery
+
+  /// If the panel opened before the bridge status arrived, poll a few times
+  /// in the background to catch a late connection and auto-reload.
+  private func startRaceConditionRecovery() {
+    guard !effectiveConnected else { return }
+    retryTask?.cancel()
+    retryTask = Task { @MainActor in
+      // Try up to 5 times, 2 seconds apart
+      for _ in 0..<5 {
+        try? await Task.sleep(nanoseconds: 2_000_000_000)
+        guard !Task.isCancelled else { return }
+
+        // Re-read the global snapshot
+        if let snapshot = AgentPairingService.lastStatusSnapshot, snapshot.connected {
+          resolvedConnected = true
+          hasConnectedBefore = true
+          if let lbl = snapshot.devices.first?.label, !lbl.isEmpty {
+            resolvedDeviceLabel = lbl
+          }
+          requestList()
+          return
+        }
+        if AgentPairingService.lastConnected {
+          resolvedConnected = true
+          hasConnectedBefore = true
+          if let lbl = AgentPairingService.lastDeviceLabel, !lbl.isEmpty {
+            resolvedDeviceLabel = lbl
+          }
+          requestList()
+          return
+        }
+      }
+    }
   }
 
   /// Re-opening the history must NOT flash the skeleton when we already have rows.

@@ -259,6 +259,44 @@ defmodule VibeWeb.ChatChannel do
     end
   end
 
+  # phone → server: the user's answer to a bridge-issued `ask_request` (plan
+  # approval or a mid-run question). We relay it to the user's bridge, which
+  # resolves the pending ask. The `answerEnc` blob is sealed with the runtime key
+  # (the server stays blind). `decision` ∈ "approve" | "reject" | "answer".
+  def handle_in("agent-bridge-ask-response", payload, socket) when is_map(payload) do
+    "chat:" <> chat_id = socket.topic
+    user_id = socket.assigns.user_id
+    request_id = normalize_bridge_string(payload["requestId"] || payload["request_id"])
+
+    decision =
+      case normalize_bridge_string(payload["decision"] || payload["action"]) do
+        d when d in ["approve", "reject", "answer"] -> d
+        _ -> "answer"
+      end
+
+    if is_nil(request_id) do
+      {:reply, {:error, %{reason: "invalid_request_id"}}, socket}
+    else
+      response_payload =
+        %{
+          "requestId" => request_id,
+          "chatId" => chat_id,
+          "requesterUserId" => user_id,
+          "decision" => decision
+        }
+        |> put_optional_string("answerEnc", normalize_bridge_string(payload["answerEnc"]))
+        |> put_optional_string(
+          "provider",
+          normalize_bridge_provider(payload["provider"] || payload["agentBridgeProvider"])
+        )
+
+      case AgentBridge.dispatch_ask_response(user_id, response_payload) do
+        :ok -> {:reply, :ok, socket}
+        {:error, :offline} -> {:reply, {:error, %{reason: "offline"}}, socket}
+      end
+    end
+  end
+
   @impl true
   def handle_in("typing", payload, socket) do
     broadcast_from!(socket, "typing", payload)

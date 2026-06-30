@@ -418,6 +418,11 @@ final class ChatEngine {
   // sealed `agentFileEnc`). Observers watch `didChangeNotification` reason
   // "agentBridgeFile" and read it via `latestAgentBridgeFile(requestId:)`.
   private var agentBridgeFileByRequestId: [String: [String: Any]] = [:]
+  // Pending "ask" requests from the bridge (plan approval / mid-run question),
+  // keyed requestId -> payload (holds the sealed `askEnc`). Observers watch
+  // `didChangeNotification` reason "agentBridgeAsk" and read it via
+  // `latestAgentBridgeAsk(requestId:)`, then reply with `sendAgentBridgeAskResponse`.
+  private var agentBridgeAskByRequestId: [String: [String: Any]] = [:]
   // Pending "open this past session into the chat as bubbles" requests, keyed by
   // the detail requestId we pushed -> the target chat/provider. When the matching
   // "detail" reply lands we synthesize its transcript into chat rows.
@@ -1907,6 +1912,69 @@ final class ChatEngine {
   func latestAgentBridgeFile(requestId rawRequestId: String) -> [String: Any]? {
     let requestId = normalizedString(rawRequestId) ?? rawRequestId
     return syncOnQueue { agentBridgeFileByRequestId[requestId] }
+  }
+
+  /// The most recent ask request (plan approval / question) for a requestId.
+  /// Decrypt its `askEnc` blob with `AgentRuntimeCrypto.decrypt` to read the body.
+  func latestAgentBridgeAsk(requestId rawRequestId: String) -> [String: Any]? {
+    let requestId = normalizedString(rawRequestId) ?? rawRequestId
+    return syncOnQueue { agentBridgeAskByRequestId[requestId] }
+  }
+
+  /// Reply to a bridge-issued ask. `decision` ∈ "approve" | "reject" | "answer".
+  /// `answer` (any JSON-serializable dict) is sealed E2E with the pairing key so
+  /// the server only relays an opaque blob; the bridge resolves the pending ask.
+  @discardableResult
+  func sendAgentBridgeAskResponse(_ payload: [String: Any]) -> [String: Any] {
+    let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"])
+    let requestId = normalizedString(payload["requestId"] ?? payload["request_id"])
+    let decisionRaw = normalizedString(payload["decision"] ?? payload["action"]) ?? "answer"
+    let decision = ["approve", "reject", "answer"].contains(decisionRaw) ? decisionRaw : "answer"
+    let provider = normalizedString(payload["provider"] ?? payload["agentBridgeProvider"])
+
+    guard let chatId, !chatId.isEmpty else { return ["accepted": false, "reason": "invalid_chat"] }
+    guard let requestId, !requestId.isEmpty else {
+      return ["accepted": false, "reason": "invalid_request_id"]
+    }
+
+    var wirePayload: [String: Any] = ["requestId": requestId, "decision": decision]
+    if let provider, !provider.isEmpty { wirePayload["provider"] = provider }
+    if let answer = payload["answer"] as? [String: Any], !answer.isEmpty,
+      let sealed = AgentRuntimeCrypto.encrypt(["answer": answer])
+    {
+      wirePayload["answerEnc"] = sealed
+    }
+
+    // The ask is resolved once; drop the cached request so a stale sheet can't
+    // re-answer it.
+    syncOnQueue { _ = agentBridgeAskByRequestId.removeValue(forKey: requestId) }
+
+    return syncOnQueue {
+      guard let client = phoenixClient else {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+          self?.ensureNativeTransport(trigger: "bridge_ask_no_socket")
+        }
+        return ["accepted": false, "reason": "no_native_socket"]
+      }
+      guard nativeJoinedChatIds.contains(chatId), (state["connected"] as? Bool) == true else {
+        joinNativeChatTopicIfNeededLocked(chatId: chatId)
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+          self?.ensureNativeTransport(trigger: "bridge_ask_chat_not_joined")
+        }
+        return ["accepted": false, "reason": "chat_not_joined"]
+      }
+
+      let ref = client.push(
+        topic: chatTopic(for: chatId),
+        event: "agent-bridge-ask-response",
+        payload: wirePayload
+      )
+      appendJournalLocked(
+        event: "native-agent-bridge-ask-response",
+        payload: ["chatId": chatId, "requestId": requestId, "decision": decision, "ref": ref]
+      )
+      return ["accepted": true, "transport": "native", "ref": ref, "requestId": requestId]
+    }
   }
 
   /// Open a Claude/Codex past session into the DEFAULT chat as bubbles: request
@@ -5300,6 +5368,24 @@ final class ChatEngine {
               "chatId": chatId,
               "requestId": requestId,
               "ok": (frame.payload["ok"] as? Bool) ?? true,
+            ]
+          )
+          return
+        }
+        if frame.event == "agent-bridge-ask" {
+          let requestId = self.normalizedString(frame.payload["requestId"]) ?? ""
+          let kind = self.normalizedString(frame.payload["kind"]) ?? "ask"
+          let provider = self.normalizedString(frame.payload["provider"]) ?? ""
+          if !requestId.isEmpty {
+            self.agentBridgeAskByRequestId[requestId] = frame.payload
+          }
+          self.postChangeLocked(
+            reason: "agentBridgeAsk",
+            userInfo: [
+              "chatId": chatId,
+              "requestId": requestId,
+              "kind": kind,
+              "provider": provider,
             ]
           )
           return

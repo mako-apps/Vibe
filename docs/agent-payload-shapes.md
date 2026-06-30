@@ -135,3 +135,153 @@ a parse error. The worker maps the message to the visible result text.
 Default chat view shows the **summary** (`agent_message` / Claude final `text`) as a bubble;
 the full progress/thinking/tool/patch nodes render in the **agent view** (solid bg). Each agent
 bubble in the default view gets a compact "view agent" affordance that pushes the agent view.
+
+---
+
+## Plan mode, approvals & ask-user (interactive round-trips)
+
+Captured 2026-06-30 against `claude` **2.1.191** and `codex-cli` **0.142.2**.
+These are the tool/permission shapes that require a phone⇄bridge round-trip
+(the model pauses and waits for the human), as opposed to the fire-and-forget
+progress/result stream above.
+
+### Current state (and the plan-mode bug)
+
+The bridge spawns Claude **one-shot, non-interactive**:
+`claude -p --output-format stream-json --permission-mode <mode>` (no
+`--input-format`, no `--permission-prompt-tool`). With no stdin channel there is
+no way to feed an approval back, so:
+
+- `--permission-mode plan` → Claude researches, writes a plan, calls
+  `ExitPlanMode`, which **auto-denies** (no approver) and the run ends with the
+  plan as text. There is no "approve → continue and edit" step today.
+- `AskUserQuestion` likewise has no human to answer; in `-p` it is effectively
+  unavailable / auto-resolved.
+
+`claudePermissionMode()` maps work mode → permission mode:
+`full_access→bypassPermissions`, `ask_auto→auto`, `allow_edits→acceptEdits`,
+and **`ask`/`read_only`→`plan`**. Because the phone's default work mode is
+`read_only` (`AgentBridgeSelectionStore.selectedWorkMode()`), **every default
+send runs in `plan` permission mode** — the "always plan mode" bug. `read_only`
+and `plan` are conflated; there is no distinct, explicitly-chosen plan state.
+
+### Claude — `ExitPlanMode` (plan approval gate)
+
+```jsonc
+{ "type":"tool_use", "name":"ExitPlanMode", "input": {
+    // OPTIONAL. Plan content is NOT here — Claude writes the plan to the
+    // plan file named in the plan-mode system message; this tool only
+    // SIGNALS "plan is ready, request approval".
+    "allowedPrompts": [ { "tool":"Bash", "prompt":"run tests" } ]
+} }
+```
+
+- Plan content lives in the **plan file** (modern Claude Code writes the plan to
+  a file and `ExitPlanMode` reads from it — it does not pass the plan as a param).
+  The bridge must surface that file's contents to the phone for review.
+- Approval contract: `tool_result` for the `ExitPlanMode` id is the human's
+  decision. **Approve** ⇒ session leaves plan mode (Claude proceeds, typically
+  switching to `acceptEdits`/`default`); **Reject** ⇒ stays in plan, keeps refining.
+- Enabling the round-trip non-interactively requires running Claude with
+  `--input-format stream-json --output-format stream-json` (a persistent stdin
+  channel) and either a `--permission-prompt-tool <mcp_tool>` or feeding the
+  tool_result back over stdin.
+
+### Claude — `AskUserQuestion` (ask-user sheet)
+
+```jsonc
+{ "type":"tool_use", "name":"AskUserQuestion", "input": {
+    "questions": [
+      { "question": "Which auth method?",   // full question text, ends with ?
+        "header": "Auth method",            // ≤12-char chip label
+        "multiSelect": false,               // true ⇒ checkboxes, false ⇒ single
+        "options": [
+          { "label": "OAuth",               // 1–5 words, shown as the choice
+            "description": "Delegated via provider",
+            "preview": "optional markdown — side-by-side compare (single-select only)" }
+        ] } ]   // 1–4 questions, each 2–4 options; "Other" free-text is implicit
+} }
+```
+
+- Result fed back as the `tool_result` for that tool_use id = the chosen option
+  **label(s)** per question (plus any free-text "Other"). For `multiSelect` it is
+  the set of selected labels.
+- iOS render target: a **bottom sheet** — one section per question, the `header`
+  as the section chip, options as single- or multi-select rows, an always-present
+  "Other" text field, and (single-select) the `preview` rendered as monospace
+  markdown beside the focused option.
+
+### Codex — equivalents (constraints)
+
+`codex exec --json` is **non-interactive**; the interactive approval items
+(`exec_approval_request`, `apply_patch_approval_request`) and any ask-user prompt
+exist only in the Codex **app-server/TUI** protocol and are **not emitted by
+`exec`**. Approval policy is set up-front via `-c approval_policy=...`
+(`untrusted`/`on-request`/`on-failure`/`never`) and resolved by policy, not by a
+phone round-trip. Codex's "plan" is the `update_plan` tool / `todo_list` item —
+**display-only**, no approval gate. ⇒ Plan-approval and ask-user round-trips are
+**Claude-only** with the current Codex integration.
+
+### Bridge ⇄ server ⇄ iOS event contract (round-trip) — IMPLEMENTED
+
+Mirrors the existing `control_task`/`history_request` pairs, E2E-wrapped like
+`agentRuntimeEnc` (arte1). The bodies are sealed with the pairing runtime key —
+the server relays opaque blobs.
+
+```
+bridge → server → phone:   "ask_request"  { provider, chatId, taskId, requestId,
+                                            kind:"plan"|"ask",
+                                            askEnc /* arte1 of { kind, request:{…} } */ }
+   server: AgentBridgeChannel.handle_in("ask_request") ⇒ broadcast
+           "chat:<id>" "agent-bridge-ask"
+   iOS:    ChatEngine frame "agent-bridge-ask" → latestAgentBridgeAsk(requestId:)
+           → VibeAgentAskSheetViewController
+
+phone  → server → bridge:  "agent-bridge-ask-response"  (ChatChannel)
+   server: ChatChannel.handle_in("agent-bridge-ask-response")
+           ⇒ AgentBridge.dispatch_ask_response ⇒ "bridge:<uid>" "ask_response"
+   bridge: channel.on("ask_response") → resolveAsk(requestId) resolves requestAsk's Promise
+           { requestId, decision:"approve"|"reject"|"answer",
+             answerEnc /* arte1 of { answer:{…} } */ }
+```
+
+`request` body by kind:
+- `plan`: `{ plan:String, sessionId, repoName }`. Emitted fire-and-forget by the
+  bridge after a `plan`-mode run (`maybeEmitPlanApproval` → `extractPlan`). On
+  **approve** the phone re-sends a normal run (workMode `allow_edits`, resuming the
+  plan's session, plan text inlined) — the bridge never fabricates a turn. On
+  **reject + feedback** the phone re-sends a plan-mode revise run.
+- `ask`: `{ questions:[ AskUserQuestion shape ] }`. Awaited via `requestAsk`
+  (timeout → auto-reject). Answer body: `{ selections:[ {header,question,selected[],other?} ] }`.
+
+### IMPLEMENTED — the MCP `ask_user` producer (mid-run questions)
+
+`claude -p` is non-interactive, so the built-in AskUserQuestion can't reach a
+human. The bridge instead exposes its **own** MCP tool, `ask_user`, so the model
+can pause mid-run and ask. Disable with `VIBE_ASK_MCP=0`.
+
+- **Producer:** `ensureAskMcp()` (vibe-bridge.js) materializes a tiny stdio MCP
+  server (`vibe-ask-mcp.js`, the `ASK_MCP_SCRIPT` template) + its `--mcp-config`
+  JSON in `os.tmpdir()`, and starts a unix-socket IPC server. `buildCommand`
+  (claude branch) adds `--mcp-config <file> --allowedTools mcp__vibeask__ask_user`
+  (pre-allowed so the round-trip never trips a headless-unanswerable permission
+  prompt). The claude spawn env carries `VIBE_ASK_SOCK / VIBE_ASK_CHAT /
+  VIBE_ASK_TASK` (`askMcpEnv`), inherited by the MCP child.
+- **Flow:** model calls `ask_user{questions[]}` → MCP child connects the unix
+  socket → `handleAskIpcConnection` calls `requestAsk` (awaited, E2E-sealed,
+  10-min timeout → auto-reject) → phone renders the paginated ask sheet
+  (`VibeAgentAskSheetViewController`, one question per page) → `ask_response`
+  resolves the promise → bridge writes `{answer}` back over the socket → MCP
+  returns it as the tool_result and the run continues.
+- **Tool schema** (`ask_user` inputSchema): `{ questions:[ { question, header
+  (≤12 chars), multiSelect, options:[{label,description}] } ] }` — mirrors
+  Claude's AskUserQuestion and the iOS sheet. Answer text returned to the model:
+  `{ selections:[ {header,question,selected[],other?} ] }`.
+
+Codex `exec` cannot round-trip (approvals/ask are TUI/app-server only), so this is
+Claude-only.
+
+Alternative not taken: `claude --input-format stream-json` feeding tool_result
+over stdin (also enables `--permission-prompt-tool` for live per-tool `ask`
+approval) — kept in reserve for the future direct-LAN per-action approval phase.
+

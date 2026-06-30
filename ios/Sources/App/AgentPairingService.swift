@@ -156,8 +156,10 @@ struct AgentBridgeRunningTask: Hashable, Identifiable {
 }
 
 enum AgentBridgeWorkMode: String, CaseIterable, Identifiable {
-  /// Live per-action approval routed to your phone. Until the live approval
-  /// channel ships, the daemon treats this as safe-propose (same as `.readOnly`).
+  /// Research & propose a plan, then request approval on your phone before any
+  /// edits run. Drives the plan-file → ExitPlanMode approval round-trip.
+  case plan = "plan"
+  /// Live per-action approval routed to your phone (permission-prompt round-trip).
   case ask = "ask"
   /// Analyse & propose only — never changes files.
   case readOnly = "read_only"
@@ -173,6 +175,7 @@ enum AgentBridgeWorkMode: String, CaseIterable, Identifiable {
 
   var title: String {
     switch self {
+    case .plan: return "Plan"
     case .ask: return "Ask"
     case .readOnly: return "Read"
     case .askAuto: return "Safe Auto"
@@ -183,6 +186,7 @@ enum AgentBridgeWorkMode: String, CaseIterable, Identifiable {
 
   var subtitle: String {
     switch self {
+    case .plan: return "Propose a plan, approve on your phone before editing"
     case .ask: return "Approve each change or command from your phone"
     case .readOnly: return "Read & propose only — never changes files"
     case .askAuto: return "Auto-run low-risk work; block destructive commands"
@@ -193,11 +197,21 @@ enum AgentBridgeWorkMode: String, CaseIterable, Identifiable {
 
   var icon: String {
     switch self {
+    case .plan: return "list.bullet.clipboard"
     case .ask: return "hand.raised"
     case .readOnly: return "eye"
     case .askAuto: return "shield.lefthalf.filled"
     case .allowEdits: return "pencil"
     case .fullAccess: return "bolt"
+    }
+  }
+
+  /// Whether this mode runs as propose-only / plan-style (no autonomous edits).
+  /// Drives the plan-mode badge on the phone.
+  var isPlanLike: Bool {
+    switch self {
+    case .plan, .readOnly: return true
+    case .ask, .askAuto, .allowEdits, .fullAccess: return false
     }
   }
 }
@@ -392,8 +406,11 @@ enum AgentBridgeSelectionStore {
   }
 
   static func selectedWorkMode() -> AgentBridgeWorkMode {
-    let raw = UserDefaults.standard.string(forKey: workModeKey) ?? AgentBridgeWorkMode.readOnly.rawValue
-    return AgentBridgeWorkMode(rawValue: raw) ?? .readOnly
+    // Default is Safe Auto (not Read): the old read_only default silently ran every
+    // message in claude plan permission mode ("always plan mode" bug). Plan is now
+    // an explicit, deliberately-chosen mode.
+    let raw = UserDefaults.standard.string(forKey: workModeKey) ?? AgentBridgeWorkMode.askAuto.rawValue
+    return AgentBridgeWorkMode(rawValue: raw) ?? .askAuto
   }
 
   static func setWorkMode(_ mode: AgentBridgeWorkMode) {

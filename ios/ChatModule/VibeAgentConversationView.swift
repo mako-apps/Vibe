@@ -266,15 +266,27 @@ enum VibeAgentKitMap {
       }
     }
     let attachments = row.isAgentMessage ? [] : imageAttachments(from: row)
+    // A turn delivered via the bridge-history path ("agentBridgeHistory") carries its
+    // live state ONLY as a progress node whose status the bridge flipped to "running"
+    // (markMessageRunning in vibe-bridge.js): the relayed metadata has no `isStreaming`
+    // flag, and the runtime card is sealed/encrypted BEFORE the turn is marked live so
+    // it still reads status:"done". Without keying off the node, a still-running history
+    // turn arrives looking identical to a finished one — so the cell collapses it into a
+    // "Worked · N steps" card instead of showing the live feed (the "still live but it
+    // collapses, no live progress" bug). Every finished node gets an explicit
+    // "done"/"error" status from foldTurnIntoHost, so a lone "running" node unambiguously
+    // means the turn is in flight.
+    let hasRunningNode = row.agentProgressNodes.contains { $0.status.lowercased() == "running" }
+    let isLiveTurn = row.isAgentMessage && !isCompaction && (row.isStreamingText || hasRunningNode)
     return VibeAgentKitChatMessage(
       id: row.messageId ?? row.key,
       role: isUser ? .user : .assistant,
       text: body,
       timestamp: row.timestamp,
       timestampMs: 0,
-      isStreaming: row.isAgentMessage && row.isStreamingText && !isCompaction,
+      isStreaming: isLiveTurn,
       isError: row.status == "failed",
-      hasFinalResponseText: row.isAgentMessage && !row.isStreamingText && !isCompaction && hasBodyText,
+      hasFinalResponseText: row.isAgentMessage && !isLiveTurn && !isCompaction && hasBodyText,
       progress: [],
       progressItems: isCompaction ? [] : items,
       subagentChildren: isCompaction ? [:] : subagentChildren,
@@ -364,6 +376,9 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   private var subagentToastTarget: (messageId: String, nodeId: String)?
   private var subagentToastHideWork: DispatchWorkItem?
   private var toastedSubagentIds: Set<String> = []
+  // Ask requests (plan approval / question) we've already shown a sheet for, so a
+  // re-pushed `agent-bridge-ask` (e.g. after a socket reconnect) can't double-prompt.
+  private var presentedAskRequestIds: Set<String> = []
   private weak var openSubagentDetail: VibeAgentSubagentDetailViewController?
   private var openSubagentRef: (messageId: String, nodeId: String)?
 
@@ -1099,8 +1114,108 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       forName: ChatEngine.didChangeNotification,
       object: nil,
       queue: .main
-    ) { [weak self] _ in
-      self?.refreshFromProvider()
+    ) { [weak self] note in
+      guard let self else { return }
+      self.refreshFromProvider()
+      if (note.userInfo?["reason"] as? String) == "agentBridgeAsk" {
+        self.handleAgentBridgeAsk(note.userInfo ?? [:])
+      }
+    }
+  }
+
+  /// A plan-approval / question request arrived from the bridge for this chat.
+  /// Decrypt the sealed body and present the approval/ask sheet (once per request).
+  private func handleAgentBridgeAsk(_ info: [AnyHashable: Any]) {
+    guard let chatId = agentBridgeChatId, !chatId.isEmpty else { return }
+    guard (info["chatId"] as? String) == chatId else { return }
+    guard let requestId = info["requestId"] as? String, !requestId.isEmpty else { return }
+    if presentedAskRequestIds.contains(requestId) { return }
+    guard let payload = ChatEngine.shared.latestAgentBridgeAsk(requestId: requestId) else { return }
+
+    // The body is E2E-sealed (`askEnc`); fall back to plaintext `request` for a
+    // keyless pairing. Decrypted shape is { kind, request: {...} }.
+    var body: [String: Any]
+    if let dec = AgentRuntimeCrypto.decrypt(payload["askEnc"]) {
+      body = dec
+    } else if let raw = payload["request"] as? [String: Any] {
+      body = ["request": raw]
+    } else {
+      return
+    }
+    let kind = (body["kind"] as? String) ?? (info["kind"] as? String) ?? "ask"
+    let request = (body["request"] as? [String: Any]) ?? body
+    presentedAskRequestIds.insert(requestId)
+    presentAskSheet(
+      requestId: requestId,
+      kind: kind,
+      provider: info["provider"] as? String,
+      request: request
+    )
+  }
+
+  private func presentAskSheet(requestId: String, kind: String, provider: String?, request: [String: Any]) {
+    let sheet = VibeAgentAskSheetViewController(kind: kind, request: request, appearance: appearance)
+    sheet.onResolve = { [weak self] decision, answer in
+      self?.resolveAgentBridgeAsk(
+        requestId: requestId,
+        kind: kind,
+        provider: provider,
+        request: request,
+        decision: decision,
+        answer: answer
+      )
+    }
+    if let presentation = sheet.sheetPresentationController {
+      presentation.detents = [.medium(), .large()]
+      presentation.prefersGrabberVisible = true
+      presentation.preferredCornerRadius = 22
+    }
+    present(sheet, animated: true)
+  }
+
+  /// Send the answer back to the bridge and, for an approved plan, kick off the
+  /// implementation run on the proven send path (edits enabled, resuming the
+  /// plan's session). A rejection with feedback asks the agent to revise the plan.
+  private func resolveAgentBridgeAsk(
+    requestId: String,
+    kind: String,
+    provider: String?,
+    request: [String: Any],
+    decision: String,
+    answer: [String: Any]?
+  ) {
+    var payload: [String: Any] = [
+      "chatId": agentBridgeChatId ?? "",
+      "requestId": requestId,
+      "decision": decision,
+    ]
+    if let provider, !provider.isEmpty { payload["provider"] = provider }
+    if let answer, !answer.isEmpty { payload["answer"] = answer }
+    _ = ChatEngine.shared.sendAgentBridgeAskResponse(payload)
+
+    guard kind == "plan" else { return }
+    let resolvedProvider = agentBridgeProvider ?? "codex"
+    let feedback = (answer?["feedback"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+    if decision == "approve" {
+      // Approving means the user is OK with edits → switch out of plan mode so the
+      // implementation turn can actually change files.
+      AgentBridgeSelectionStore.setWorkMode(.allowEdits)
+      let options = AgentBridgeSelectionStore.selectedRunOptions(provider: resolvedProvider)
+      var prompt = "The plan above is approved. Implement it now, end to end."
+      if let feedback, !feedback.isEmpty { prompt += "\n\nAdditional guidance:\n\(feedback)" }
+      if let plan = (request["plan"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+        !plan.isEmpty
+      {
+        prompt += "\n\nApproved plan:\n\(plan)"
+      }
+      onSend?(prompt, options, [])
+      reloadLiveMessages()
+    } else if decision == "reject", let feedback, !feedback.isEmpty {
+      // Stay in plan mode and revise — the new plan re-triggers approval.
+      let options = AgentBridgeSelectionStore.selectedRunOptions(provider: resolvedProvider)
+      onSend?("Please revise the plan based on this feedback, then present the updated plan:\n\(feedback)", options, [])
+      reloadLiveMessages()
     }
   }
 
@@ -3250,6 +3365,7 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
   private let optionPillHeight: CGFloat = 26
   private let optionPillGap: CGFloat = 6
   private var activeOptionTitle: String?
+  private var modeObserver: NSObjectProtocol?
 
   private var optionReserve: CGFloat {
     activeOptionTitle == nil ? 0 : optionPillHeight + optionPillGap
@@ -3268,6 +3384,15 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
       audioEngine.inputNode.removeTap(onBus: 0)
     }
     recognitionTask?.cancel()
+    if let modeObserver { NotificationCenter.default.removeObserver(modeObserver) }
+  }
+
+  /// Reflect the current work mode as a composer badge: a "Plan" pill whenever the
+  /// selected mode is plan-like (Plan or Read — propose-only). Clears the pill for
+  /// the editing modes. Keeps the badge in sync whether the mode was set via /plan,
+  /// the header permission picker, or any other surface.
+  private func refreshModePill() {
+    setActiveOptionPill(AgentBridgeSelectionStore.selectedWorkMode().isPlanLike ? "Plan" : nil)
   }
 
   /// Total height the host should give this view: the pill row plus the inset that
@@ -3313,6 +3438,16 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
   private func configure() {
     backgroundColor = .clear
     clipsToBounds = false
+
+    // Keep the plan badge in sync with the work mode chosen anywhere (header
+    // picker, /plan, etc.).
+    modeObserver = NotificationCenter.default.addObserver(
+      forName: AgentBridgeSelectionStore.didChangeNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      self?.refreshModePill()
+    }
 
     // Attach glass pill (left)
     configureGlass(attachGlass)
@@ -3391,6 +3526,7 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
 
     applyAppearance(.fallback)
     updateCommandMenu()
+    refreshModePill()
   }
 
   private func configureGlass(_ view: UIVisualEffectView) {
@@ -3608,7 +3744,7 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
       updateSendState(animated: true)
       onHeightChanged?(preferredHeight)
       if localCommand == "/plan" {
-        AgentBridgeSelectionStore.setWorkMode(.readOnly)
+        AgentBridgeSelectionStore.setWorkMode(.plan)
         setActiveOptionPill("Plan")
       }
       onCommand?(localCommand)
@@ -4239,5 +4375,439 @@ final class VibeAgentSubagentDetailViewController: UIViewController {
     case "task": return "person.2"
     default: return "circle.dotted"
     }
+  }
+}
+
+// MARK: - Ask / plan-approval sheet
+
+/// The phone's approver surface for a bridge `ask_request`. Two kinds:
+///   • `plan` — shows the proposed plan + Reject / Approve & Implement (with an
+///     optional notes field). Approving re-runs the turn with edits enabled.
+///   • `ask`  — renders the agent's `questions[]` (the AskUserQuestion shape:
+///     header chip, single/multi-select options, an "Other" field) → Submit.
+/// Resolves exactly once via `onResolve(decision, answer)` then dismisses.
+final class VibeAgentAskSheetViewController: UIViewController {
+  /// (decision, answer). decision ∈ "approve" | "reject" | "answer".
+  var onResolve: ((String, [String: Any]?) -> Void)?
+
+  private let kind: String
+  private let request: [String: Any]
+  private let appearance: VibeAgentKitChatAppearance
+  private var didResolve = false
+
+  private let scrollView = UIScrollView()
+  private let contentStack = UIStackView()
+  private let feedbackView = UITextView()
+  private let feedbackPlaceholder = UILabel()
+
+  // ask-mode question state, parallel to `questions`.
+  private struct AskQuestion {
+    let question: String
+    let header: String
+    let multiSelect: Bool
+    let options: [String]
+  }
+  private var questions: [AskQuestion] = []
+  private var selected: [Set<Int>] = []
+  private var otherFields: [UITextField] = []
+  private var optionButtonsByQuestion: [[UIButton]] = []
+
+  // Multi-question asks are paginated one-per-page (Question 1 of N). Blocks are
+  // built once so selections/Other text persist as the user pages back and forth.
+  private var questionBlocks: [UIView] = []
+  private var askPageIndex = 0
+  private let pageIndicator = UILabel()
+  private weak var askBackButton: UIButton?
+  private weak var askNextButton: UIButton?
+
+  init(kind: String, request: [String: Any], appearance: VibeAgentKitChatAppearance) {
+    self.kind = kind
+    self.request = request
+    self.appearance = appearance
+    super.init(nibName: nil, bundle: nil)
+  }
+
+  required init?(coder: NSCoder) { return nil }
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    view.backgroundColor = appearance.background
+
+    scrollView.translatesAutoresizingMaskIntoConstraints = false
+    scrollView.keyboardDismissMode = .interactive
+    view.addSubview(scrollView)
+
+    contentStack.translatesAutoresizingMaskIntoConstraints = false
+    contentStack.axis = .vertical
+    contentStack.spacing = 14
+    contentStack.alignment = .fill
+    scrollView.addSubview(contentStack)
+
+    // Parse questions before the bar so it can choose paged (Back/Next) vs single Submit.
+    if kind != "plan" { parseQuestions() }
+    let buttonBar = makeButtonBar()
+    buttonBar.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(buttonBar)
+
+    NSLayoutConstraint.activate([
+      scrollView.topAnchor.constraint(equalTo: view.topAnchor),
+      scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      scrollView.bottomAnchor.constraint(equalTo: buttonBar.topAnchor),
+
+      contentStack.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor, constant: 20),
+      contentStack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
+      contentStack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
+      contentStack.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor, constant: -20),
+      contentStack.widthAnchor.constraint(equalTo: view.widthAnchor, constant: -40),
+
+      buttonBar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      buttonBar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      buttonBar.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -8),
+    ])
+
+    if kind == "plan" {
+      buildPlanContent()
+    } else {
+      buildAskContent()
+    }
+  }
+
+  // MARK: content
+
+  private func titleLabel(_ text: String, size: CGFloat = 20, weight: UIFont.Weight = .bold) -> UILabel {
+    let label = UILabel()
+    label.text = text
+    label.numberOfLines = 0
+    label.font = .systemFont(ofSize: size, weight: weight)
+    label.textColor = appearance.text
+    return label
+  }
+
+  private func bodyLabel(_ text: String, color: UIColor? = nil) -> UILabel {
+    let label = UILabel()
+    label.text = text
+    label.numberOfLines = 0
+    label.font = .systemFont(ofSize: 14.5)
+    label.textColor = color ?? appearance.textSecondary
+    return label
+  }
+
+  private func buildPlanContent() {
+    contentStack.addArrangedSubview(titleLabel("Review the plan"))
+    if let repo = (request["repoName"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !repo.isEmpty
+    {
+      contentStack.addArrangedSubview(bodyLabel("\(repo) · the agent will not edit until you approve", color: appearance.textTertiary))
+    }
+
+    let planText = (request["plan"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "(no plan text)"
+    let card = UIView()
+    card.backgroundColor = appearance.surface
+    card.layer.cornerRadius = 14
+    card.layer.cornerCurve = .continuous
+    card.layer.borderWidth = 1
+    card.layer.borderColor = appearance.border.cgColor
+    let planLabel = UILabel()
+    planLabel.text = planText
+    planLabel.numberOfLines = 0
+    planLabel.font = .systemFont(ofSize: 14)
+    planLabel.textColor = appearance.text
+    planLabel.translatesAutoresizingMaskIntoConstraints = false
+    card.addSubview(planLabel)
+    NSLayoutConstraint.activate([
+      planLabel.topAnchor.constraint(equalTo: card.topAnchor, constant: 14),
+      planLabel.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+      planLabel.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+      planLabel.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14),
+    ])
+    contentStack.addArrangedSubview(card)
+
+    contentStack.addArrangedSubview(bodyLabel("Notes for the agent (optional)", color: appearance.textTertiary))
+    contentStack.addArrangedSubview(makeFeedbackField())
+  }
+
+  /// Decode the questions[] payload and pre-build one block per question. Called
+  /// before the button bar so it can size the bar to the page count.
+  private func parseQuestions() {
+    let rawQuestions = (request["questions"] as? [[String: Any]]) ?? []
+    for q in rawQuestions {
+      let questionText = (q["question"] as? String) ?? ""
+      let header = (q["header"] as? String) ?? ""
+      let multi = (q["multiSelect"] as? Bool) ?? false
+      let opts = ((q["options"] as? [[String: Any]]) ?? []).compactMap { $0["label"] as? String }
+      let model = AskQuestion(question: questionText, header: header, multiSelect: multi, options: opts)
+      let index = questions.count
+      questions.append(model)
+      selected.append([])
+      questionBlocks.append(makeQuestionBlock(model, index: index))
+    }
+  }
+
+  private func buildAskContent() {
+    if questions.isEmpty {
+      contentStack.addArrangedSubview(titleLabel("A few questions"))
+      contentStack.addArrangedSubview(bodyLabel("The agent asked a question but sent no options. Add a note below.", color: appearance.textTertiary))
+      contentStack.addArrangedSubview(makeFeedbackField())
+    } else {
+      renderAskPage()
+    }
+  }
+
+  /// Swap the visible question to `askPageIndex` (one question per page) and update
+  /// the page counter + Back/Next/Submit button bar.
+  private func renderAskPage() {
+    guard !questions.isEmpty else { return }
+    askPageIndex = min(max(askPageIndex, 0), questions.count - 1)
+    for sub in contentStack.arrangedSubviews {
+      contentStack.removeArrangedSubview(sub)
+      sub.removeFromSuperview()
+    }
+    if questions.count > 1 {
+      pageIndicator.text = "Question \(askPageIndex + 1) of \(questions.count)"
+      pageIndicator.font = .systemFont(ofSize: 12, weight: .semibold)
+      pageIndicator.textColor = appearance.textTertiary
+      contentStack.addArrangedSubview(pageIndicator)
+    }
+    contentStack.addArrangedSubview(questionBlocks[askPageIndex])
+
+    let isLast = askPageIndex >= questions.count - 1
+    askBackButton?.isHidden = askPageIndex == 0
+    askNextButton?.setTitle(isLast ? "Submit" : "Next", for: .normal)
+    scrollView.setContentOffset(.zero, animated: false)
+  }
+
+  private func makeQuestionBlock(_ q: AskQuestion, index: Int) -> UIView {
+    let block = UIStackView()
+    block.axis = .vertical
+    block.spacing = 8
+    block.alignment = .fill
+
+    if !q.header.isEmpty {
+      let chip = UILabel()
+      chip.text = "  \(q.header.uppercased())  "
+      chip.font = .systemFont(ofSize: 11, weight: .bold)
+      chip.textColor = appearance.primary
+      chip.backgroundColor = appearance.primary.withAlphaComponent(0.14)
+      chip.layer.cornerRadius = 7
+      chip.layer.masksToBounds = true
+      chip.setContentHuggingPriority(.required, for: .horizontal)
+      let wrap = UIStackView(arrangedSubviews: [chip, UIView()])
+      wrap.axis = .horizontal
+      block.addArrangedSubview(wrap)
+    }
+    if !q.question.isEmpty {
+      block.addArrangedSubview(titleLabel(q.question, size: 15.5, weight: .semibold))
+    }
+    if q.multiSelect {
+      block.addArrangedSubview(bodyLabel("Select all that apply", color: appearance.textTertiary))
+    }
+
+    var buttons: [UIButton] = []
+    for (optIndex, label) in q.options.enumerated() {
+      let button = makeOptionButton(label, questionIndex: index, optionIndex: optIndex)
+      buttons.append(button)
+      block.addArrangedSubview(button)
+    }
+    optionButtonsByQuestion.append(buttons)
+
+    let other = UITextField()
+    other.placeholder = "Other…"
+    other.font = .systemFont(ofSize: 14.5)
+    other.textColor = appearance.text
+    other.borderStyle = .roundedRect
+    other.backgroundColor = appearance.surface
+    other.heightAnchor.constraint(equalToConstant: 40).isActive = true
+    otherFields.append(other)
+    block.addArrangedSubview(other)
+
+    return block
+  }
+
+  private func makeOptionButton(_ label: String, questionIndex: Int, optionIndex: Int) -> UIButton {
+    var config = UIButton.Configuration.bordered()
+    config.title = label
+    config.baseForegroundColor = appearance.text
+    config.background.backgroundColor = appearance.surface
+    config.background.cornerRadius = 11
+    config.contentInsets = NSDirectionalEdgeInsets(top: 11, leading: 14, bottom: 11, trailing: 14)
+    config.titleAlignment = .leading
+    let button = UIButton(configuration: config)
+    button.contentHorizontalAlignment = .leading
+    button.tag = questionIndex * 1000 + optionIndex
+    button.addTarget(self, action: #selector(optionTapped(_:)), for: .touchUpInside)
+    return button
+  }
+
+  @objc private func optionTapped(_ sender: UIButton) {
+    let questionIndex = sender.tag / 1000
+    let optionIndex = sender.tag % 1000
+    guard questionIndex < questions.count else { return }
+    let multi = questions[questionIndex].multiSelect
+    if multi {
+      if selected[questionIndex].contains(optionIndex) {
+        selected[questionIndex].remove(optionIndex)
+      } else {
+        selected[questionIndex].insert(optionIndex)
+      }
+    } else {
+      selected[questionIndex] = [optionIndex]
+    }
+    refreshOptionStyles(questionIndex: questionIndex)
+  }
+
+  private func refreshOptionStyles(questionIndex: Int) {
+    guard questionIndex < optionButtonsByQuestion.count else { return }
+    for (optIndex, button) in optionButtonsByQuestion[questionIndex].enumerated() {
+      let isOn = selected[questionIndex].contains(optIndex)
+      var config = button.configuration
+      config?.background.backgroundColor = isOn ? appearance.primary.withAlphaComponent(0.22) : appearance.surface
+      config?.background.strokeColor = isOn ? appearance.primary : appearance.border
+      config?.background.strokeWidth = isOn ? 1.5 : 1
+      config?.baseForegroundColor = appearance.text
+      button.configuration = config
+    }
+  }
+
+  private func makeFeedbackField() -> UIView {
+    let container = UIView()
+    container.backgroundColor = appearance.surface
+    container.layer.cornerRadius = 12
+    container.layer.cornerCurve = .continuous
+    container.layer.borderWidth = 1
+    container.layer.borderColor = appearance.border.cgColor
+
+    feedbackView.translatesAutoresizingMaskIntoConstraints = false
+    feedbackView.backgroundColor = .clear
+    feedbackView.font = .systemFont(ofSize: 14.5)
+    feedbackView.textColor = appearance.text
+    feedbackView.delegate = self
+    feedbackView.textContainerInset = UIEdgeInsets(top: 10, left: 8, bottom: 10, right: 8)
+    container.addSubview(feedbackView)
+
+    feedbackPlaceholder.text = "Add notes or changes…"
+    feedbackPlaceholder.font = .systemFont(ofSize: 14.5)
+    feedbackPlaceholder.textColor = appearance.textTertiary
+    feedbackPlaceholder.translatesAutoresizingMaskIntoConstraints = false
+    container.addSubview(feedbackPlaceholder)
+
+    NSLayoutConstraint.activate([
+      feedbackView.topAnchor.constraint(equalTo: container.topAnchor),
+      feedbackView.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 4),
+      feedbackView.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -4),
+      feedbackView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+      feedbackView.heightAnchor.constraint(equalToConstant: 72),
+      feedbackPlaceholder.topAnchor.constraint(equalTo: feedbackView.topAnchor, constant: 11),
+      feedbackPlaceholder.leadingAnchor.constraint(equalTo: feedbackView.leadingAnchor, constant: 12),
+    ])
+    return container
+  }
+
+  // MARK: buttons
+
+  private func makeButtonBar() -> UIView {
+    let bar = UIStackView()
+    bar.axis = .horizontal
+    bar.spacing = 12
+    bar.distribution = .fillEqually
+    bar.isLayoutMarginsRelativeArrangement = true
+    bar.layoutMargins = UIEdgeInsets(top: 8, left: 20, bottom: 0, right: 20)
+
+    if kind == "plan" {
+      let reject = makeBarButton("Reject", primary: false)
+      reject.addTarget(self, action: #selector(rejectTapped), for: .touchUpInside)
+      let approve = makeBarButton("Approve & Implement", primary: true)
+      approve.addTarget(self, action: #selector(approveTapped), for: .touchUpInside)
+      bar.addArrangedSubview(reject)
+      bar.addArrangedSubview(approve)
+    } else if questions.count > 1 {
+      // Paged ask: Back (hidden on page 1) + Next/Submit.
+      let back = makeBarButton("Back", primary: false)
+      back.addTarget(self, action: #selector(backTapped), for: .touchUpInside)
+      back.isHidden = true
+      let next = makeBarButton("Next", primary: true)
+      next.addTarget(self, action: #selector(nextTapped), for: .touchUpInside)
+      askBackButton = back
+      askNextButton = next
+      bar.addArrangedSubview(back)
+      bar.addArrangedSubview(next)
+    } else {
+      let submit = makeBarButton("Submit", primary: true)
+      submit.addTarget(self, action: #selector(submitTapped), for: .touchUpInside)
+      askNextButton = submit
+      bar.addArrangedSubview(submit)
+    }
+    return bar
+  }
+
+  @objc private func backTapped() {
+    askPageIndex -= 1
+    renderAskPage()
+  }
+
+  @objc private func nextTapped() {
+    if askPageIndex >= questions.count - 1 {
+      submitTapped()
+    } else {
+      askPageIndex += 1
+      renderAskPage()
+    }
+  }
+
+  private func makeBarButton(_ title: String, primary: Bool) -> UIButton {
+    var config = UIButton.Configuration.filled()
+    config.title = title
+    config.cornerStyle = .large
+    config.contentInsets = NSDirectionalEdgeInsets(top: 14, leading: 16, bottom: 14, trailing: 16)
+    config.baseBackgroundColor = primary ? appearance.primary : appearance.surfaceElevated
+    config.baseForegroundColor = primary ? (appearance.isDark ? .black : .white) : appearance.text
+    let button = UIButton(configuration: config)
+    button.titleLabel?.adjustsFontSizeToFitWidth = true
+    button.titleLabel?.minimumScaleFactor = 0.8
+    return button
+  }
+
+  private var feedbackText: String? {
+    let t = feedbackView.text?.trimmingCharacters(in: .whitespacesAndNewlines)
+    return (t?.isEmpty == false) ? t : nil
+  }
+
+  @objc private func approveTapped() {
+    resolve("approve", answer: feedbackText.map { ["feedback": $0] })
+  }
+
+  @objc private func rejectTapped() {
+    resolve("reject", answer: feedbackText.map { ["feedback": $0] })
+  }
+
+  @objc private func submitTapped() {
+    var selections: [[String: Any]] = []
+    for (index, q) in questions.enumerated() {
+      let labels = selected[index].sorted().compactMap { q.options.indices.contains($0) ? q.options[$0] : nil }
+      let other = otherFields.indices.contains(index)
+        ? otherFields[index].text?.trimmingCharacters(in: .whitespacesAndNewlines)
+        : nil
+      var entry: [String: Any] = ["header": q.header, "question": q.question, "selected": labels]
+      if let other, !other.isEmpty {
+        entry["other"] = other
+      }
+      selections.append(entry)
+    }
+    var answer: [String: Any] = ["selections": selections]
+    if questions.isEmpty, let note = feedbackText { answer["feedback"] = note }
+    resolve("answer", answer: answer)
+  }
+
+  private func resolve(_ decision: String, answer: [String: Any]?) {
+    guard !didResolve else { return }
+    didResolve = true
+    onResolve?(decision, answer)
+    dismiss(animated: true)
+  }
+}
+
+extension VibeAgentAskSheetViewController: UITextViewDelegate {
+  func textViewDidChange(_ textView: UITextView) {
+    feedbackPlaceholder.isHidden = !(textView.text?.isEmpty ?? true)
   }
 }

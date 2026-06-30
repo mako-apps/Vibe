@@ -364,6 +364,20 @@ defmodule Vibe.AgentBridge do
     end
   end
 
+  @doc """
+  Relay the phone's answer to a bridge-issued `ask_request` (plan approval or a
+  mid-run question) back to the user's connected bridge daemon. The `answerEnc`
+  blob is sealed with the pairing runtime key — the server never reads it.
+  """
+  def dispatch_ask_response(user_id, payload) when is_binary(user_id) and is_map(payload) do
+    if online?(user_id) do
+      VibeWeb.Endpoint.broadcast(topic(user_id), "ask_response", payload)
+      :ok
+    else
+      {:error, :offline}
+    end
+  end
+
   # ── Helpers ─────────────────────────────────────────────────────────
 
   defp hash_token(token), do: :crypto.hash(:sha256, token) |> Base.encode16(case: :lower)
