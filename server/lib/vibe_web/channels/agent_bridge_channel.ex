@@ -259,6 +259,14 @@ defmodule VibeWeb.AgentBridgeChannel do
           "sealed=#{Map.has_key?(payload, "askEnc")} → broadcast chat:#{chat_id}/agent-bridge-ask"
       )
 
+      # Buffer before broadcasting so a phone that's mid-reconnect (and misses
+      # the one-shot broadcast) gets it replayed on its next chat:<id> join.
+      request_id = payload["requestId"] || payload["request_id"]
+
+      if is_binary(request_id) do
+        Vibe.AgentBridge.remember_pending_ask(chat_id, request_id, payload)
+      end
+
       VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-bridge-ask", payload)
     else
       Logger.info(

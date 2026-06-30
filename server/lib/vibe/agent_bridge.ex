@@ -24,8 +24,11 @@ defmodule Vibe.AgentBridge do
 
   @pairing_table :agent_bridge_pairings
   @request_table :agent_bridge_requests
+  @pending_ask_table :agent_bridge_pending_asks
   @pairing_ttl_ms 10 * 60 * 1000
   @request_ttl_ms 10 * 60 * 1000
+  # Mirrors the bridge's ASK_TIMEOUT_MS — an ask older than this is dead anyway.
+  @pending_ask_ttl_ms 10 * 60 * 1000
 
   # ── Scan-to-pair (daemon-initiated; the phone scans the desktop QR) ──
 
@@ -132,6 +135,83 @@ defmodule Vibe.AgentBridge do
   end
 
   def claim_request(_, _), do: {:error, :invalid_request}
+
+  # ── Pending asks (ephemeral, ETS) ───────────────────────────────────
+  #
+  # An ask (plan approval / question) is relayed to the chat as a one-shot
+  # `agent-bridge-ask` broadcast. If the phone's socket is mid-reconnect at that
+  # instant the broadcast is silently dropped — and unlike streams (re-watched)
+  # or results (re-delivered) there was no second chance, so the run stalls for
+  # the full ASK timeout. We buffer the latest unanswered ask per chat here and
+  # replay it when the phone (re)joins `chat:<id>`; it's cleared when the phone
+  # answers or after the TTL.
+
+  @doc """
+  Remember the latest unanswered ask for `chat_id` so it can be replayed to a
+  phone that joins `chat:<id>` after missing the live broadcast. Keyed by chat
+  (the bridge serializes asks, so at most one is outstanding per chat).
+  """
+  def remember_pending_ask(chat_id, request_id, payload)
+      when is_binary(chat_id) and chat_id != "" and is_binary(request_id) and is_map(payload) do
+    ensure_table(@pending_ask_table)
+    expires_at = System.system_time(:millisecond) + @pending_ask_ttl_ms
+
+    :ets.insert(
+      @pending_ask_table,
+      {chat_id, %{request_id: request_id, payload: payload, expires_at: expires_at}}
+    )
+
+    :ok
+  end
+
+  def remember_pending_ask(_, _, _), do: :ok
+
+  @doc """
+  Peek the buffered ask payload for `chat_id` (or `nil` if none / expired).
+  Does not consume it — a still-unanswered ask must survive repeated rejoins.
+  """
+  def pending_ask(chat_id) when is_binary(chat_id) and chat_id != "" do
+    ensure_table(@pending_ask_table)
+    now = System.system_time(:millisecond)
+
+    case :ets.lookup(@pending_ask_table, chat_id) do
+      [{^chat_id, %{expires_at: expires_at}}] when expires_at <= now ->
+        :ets.delete(@pending_ask_table, chat_id)
+        nil
+
+      [{^chat_id, %{payload: payload}}] ->
+        payload
+
+      _ ->
+        nil
+    end
+  end
+
+  def pending_ask(_), do: nil
+
+  @doc """
+  Clear the buffered ask for `chat_id` once it has been answered. Only clears
+  when `request_id` matches the buffered one (a stale response must not clobber
+  a newer outstanding ask); pass `nil` to clear unconditionally.
+  """
+  def clear_pending_ask(chat_id, request_id) when is_binary(chat_id) and chat_id != "" do
+    ensure_table(@pending_ask_table)
+
+    case :ets.lookup(@pending_ask_table, chat_id) do
+      [{^chat_id, %{request_id: ^request_id}}] ->
+        :ets.delete(@pending_ask_table, chat_id)
+
+      [{^chat_id, _}] when is_nil(request_id) ->
+        :ets.delete(@pending_ask_table, chat_id)
+
+      _ ->
+        :ok
+    end
+
+    :ok
+  end
+
+  def clear_pending_ask(_, _), do: :ok
 
   # ── Pairing codes (ephemeral, ETS) ──────────────────────────────────
 

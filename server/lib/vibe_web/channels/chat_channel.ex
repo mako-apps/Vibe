@@ -28,9 +28,34 @@ defmodule VibeWeb.ChatChannel do
         room_type = Chat.get_room_type(chat_id) || "dm"
         socket = assign(socket, :room_type, room_type)
         socket = assign(socket, :user_role, role)
+        # Replay any ask the phone missed while it was offline/reconnecting.
+        send(self(), {:replay_pending_ask, chat_id})
         {:ok, socket}
     end
   end
+
+  @impl true
+  def handle_info({:replay_pending_ask, chat_id}, socket) do
+    case AgentBridge.pending_ask(chat_id) do
+      payload when is_map(payload) ->
+        Logger.info(
+          "[AgentBridge][ask] replay-on-join chat=#{chat_id} " <>
+            "requestId=#{inspect(payload["requestId"])} → push agent-bridge-ask"
+        )
+
+        push(socket, "agent-bridge-ask", payload)
+
+      _ ->
+        :noop
+    end
+
+    {:noreply, socket}
+  end
+
+  # Catch-all: keep parity with Phoenix's default (no-op) now that this channel
+  # exports handle_info/2 — otherwise any other process message would crash it.
+  @impl true
+  def handle_info(_msg, socket), do: {:noreply, socket}
 
   @impl true
   def handle_in("message", payload, socket) do
@@ -289,6 +314,9 @@ defmodule VibeWeb.ChatChannel do
           "provider",
           normalize_bridge_provider(payload["provider"] || payload["agentBridgeProvider"])
         )
+
+      # The phone answered — drop the buffered ask so it isn't replayed on rejoin.
+      AgentBridge.clear_pending_ask(chat_id, request_id)
 
       case AgentBridge.dispatch_ask_response(user_id, response_payload) do
         :ok -> {:reply, :ok, socket}
