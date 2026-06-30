@@ -161,7 +161,9 @@ private final class VibeAgentKitAssistantMessageBodyView: UIView {
     loaderView.onTap = nil
     loaderView.isHidden = true
     clearStepsList()
-    runtimeSummaryView.onTap = nil
+    runtimeSummaryView.onToggleExpand = nil
+    runtimeSummaryView.onReviewTapped = nil
+    runtimeSummaryView.onFileTapped = nil
     runtimeSummaryView.isHidden = true
     runtimeHeightConstraint?.constant = 0.0
     removeBlockViews()
@@ -2015,7 +2017,6 @@ final class VibeAgentKitMessageCell: UITableViewCell {
         subagentChildren: message.subagentChildren,
         fallbackProgressLabels: message.progress,
         runtime: message.runtime,
-        onRuntimeTap: onRuntimeTap,
         onLoaderTap: onProgressTap,
         isProgressExpanded: isProgressExpanded,
         isRuntimeExpanded: isRuntimeExpanded,
@@ -2299,11 +2300,8 @@ final class VibeAgentKitMessageCell: UITableViewCell {
   }
 }
 
-// A /compact context summary rendered as a centered, collapsible mid-chat divider —
-// a thin rule with a "Context compacted" pill in the middle (Claude-Code / ChatGPT
-// style), NOT a left assistant bubble. Tapping the pill reveals the full summary the
-// model kept; tapping again hides it. State lives in the host VC (reuses the per-message
-// expand set) so it survives cell reuse.
+// Centered muted system row. /compact rows can expand to reveal the kept summary;
+// status rows such as interruptions render as a non-expandable divider.
 final class VibeAgentKitCompactionCell: UITableViewCell {
   static let reuseIdentifier = "VibeAgentKitCompactionCell"
 
@@ -2349,15 +2347,13 @@ final class VibeAgentKitCompactionCell: UITableViewCell {
     headerControl.addSubview(rightRule)
 
     pill.translatesAutoresizingMaskIntoConstraints = false
-    pill.layer.cornerRadius = 12.0
-    pill.layer.cornerCurve = .continuous
+    pill.backgroundColor = .clear
     pill.isUserInteractionEnabled = false
     headerControl.addSubview(pill)
 
     pillIcon.translatesAutoresizingMaskIntoConstraints = false
     pillIcon.contentMode = .scaleAspectFit
-    pillIcon.image = UIImage(systemName: "rectangle.compress.vertical")?
-      .withRenderingMode(.alwaysTemplate)
+    pillIcon.isHidden = true
     pill.addSubview(pillIcon)
 
     pillLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -2391,7 +2387,7 @@ final class VibeAgentKitCompactionCell: UITableViewCell {
       pillIcon.widthAnchor.constraint(equalToConstant: 12.0),
       pillIcon.heightAnchor.constraint(equalToConstant: 12.0),
 
-      pillLabel.leadingAnchor.constraint(equalTo: pillIcon.trailingAnchor, constant: 6.0),
+      pillLabel.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: 8.0),
       pillLabel.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
 
       chevron.leadingAnchor.constraint(equalTo: pillLabel.trailingAnchor, constant: 6.0),
@@ -2417,18 +2413,26 @@ final class VibeAgentKitCompactionCell: UITableViewCell {
     ])
   }
 
-  func configure(text: String, expanded: Bool, appearance: VibeAgentKitChatAppearance) {
+  func configure(
+    text: String,
+    title: String = "Context compacted",
+    expanded: Bool,
+    canExpand: Bool = true,
+    appearance: VibeAgentKitChatAppearance
+  ) {
     let ruleColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.22)
     leftRule.backgroundColor = ruleColor
     rightRule.backgroundColor = ruleColor
-    pill.backgroundColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.14)
-    pillIcon.tintColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.9)
+    pill.backgroundColor = .clear
+    pillIcon.isHidden = true
     pillLabel.textColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.95)
-    pillLabel.text = expanded ? "Hide summary" : "Context compacted"
+    pillLabel.text = canExpand && expanded ? "Hide summary" : title
     // One chevron that rotates (down when collapsed, up when expanded) so the toggle
     // direction reads clearly and animates rather than snapping between two glyphs.
     chevron.image = UIImage(systemName: "chevron.down")?.withRenderingMode(.alwaysTemplate)
     chevron.tintColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.7)
+    chevron.isHidden = !canExpand
+    headerControl.isUserInteractionEnabled = canExpand
     let rotation = expanded ? CGAffineTransform(rotationAngle: .pi) : .identity
     if expanded != isExpandedState {
       UIView.animate(withDuration: 0.22, delay: 0.0, options: [.beginFromCurrentState]) {
@@ -2439,7 +2443,7 @@ final class VibeAgentKitCompactionCell: UITableViewCell {
     }
     isExpandedState = expanded
 
-    if expanded, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+    if canExpand, expanded, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
       summaryLabel.isHidden = false
       summaryLabel.attributedText = VibeAgentKitTextRenderer.makeAttributedText(
         text: text,

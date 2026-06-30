@@ -5416,9 +5416,14 @@ final class ChatEngine {
           let requestId = self.normalizedString(frame.payload["requestId"]) ?? ""
           let kind = self.normalizedString(frame.payload["kind"]) ?? "ask"
           let provider = self.normalizedString(frame.payload["provider"]) ?? ""
+          let sealed = frame.payload["askEnc"] != nil
           if !requestId.isEmpty {
             self.agentBridgeAskByRequestId[requestId] = frame.payload
           }
+          NSLog(
+            "[ChatEngine][ask] RECEIVED chat=%@ requestId=%@ kind=%@ provider=%@ sealed=%@ stored=%@ → post agentBridgeAsk",
+            chatId, requestId, kind, provider, sealed ? "Y" : "N", requestId.isEmpty ? "N(empty-requestId)" : "Y"
+          )
           self.postChangeLocked(
             reason: "agentBridgeAsk",
             userInfo: [

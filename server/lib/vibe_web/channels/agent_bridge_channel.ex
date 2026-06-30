@@ -253,10 +253,16 @@ defmodule VibeWeb.AgentBridgeChannel do
     chat_id = payload["chatId"] || payload["chat_id"]
 
     if is_binary(chat_id) and chat_id != "" do
+      Logger.info(
+        "[AgentBridge][ask] relay user=#{socket.assigns.user_id} chat=#{chat_id} " <>
+          "requestId=#{inspect(payload["requestId"])} kind=#{inspect(payload["kind"])} " <>
+          "sealed=#{Map.has_key?(payload, "askEnc")} → broadcast chat:#{chat_id}/agent-bridge-ask"
+      )
+
       VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-bridge-ask", payload)
     else
       Logger.info(
-        "[AgentBridge] ask_request without chatId user=#{socket.assigns.user_id} requestId=#{inspect(payload["requestId"])}"
+        "[AgentBridge][ask] DROPPED — no chatId user=#{socket.assigns.user_id} requestId=#{inspect(payload["requestId"])}"
       )
     end
 

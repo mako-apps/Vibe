@@ -589,7 +589,8 @@ private final class ChatNativeAgentPlainTextView: UIView {
           let runtimeHeight = runtimeView.configure(
             runtime: runtime,
             textColor: textColor,
-            availableWidth: runtimeAvailableWidth
+            availableWidth: runtimeAvailableWidth,
+            isExpanded: false
           )
           blockFrames.append(
             CGRect(x: leftPadding, y: yOffset, width: runtimeAvailableWidth, height: runtimeHeight)

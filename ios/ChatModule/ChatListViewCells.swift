@@ -2402,7 +2402,8 @@ private func measureBubbleRichText(for row: ChatListRow, availableWidth: CGFloat
     case .agentRuntime(let runtime):
       totalHeight += AgentRuntimeSummaryView.measuredHeight(
         runtime: runtime,
-        availableWidth: availableWidth
+        availableWidth: availableWidth,
+        isExpanded: false
       )
       maxWidth = max(maxWidth, availableWidth)
     }
@@ -2571,7 +2572,8 @@ private final class BubbleRichTextView: UIView {
         let runtimeHeight = runtimeView.configure(
           runtime: runtime,
           textColor: textColor,
-          availableWidth: availableWidth
+          availableWidth: availableWidth,
+          isExpanded: false
         )
         blockFrames.append(CGRect(x: 0.0, y: yOffset, width: availableWidth, height: runtimeHeight))
         yOffset += runtimeHeight

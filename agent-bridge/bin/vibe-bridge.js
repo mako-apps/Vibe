@@ -4362,7 +4362,27 @@ function pushAskRequest(channel, { provider, chatId, taskId, replyToId, requestI
   const askEnc = encryptRuntimeBlob({ kind, request: body });
   // Seal when a key exists; otherwise send plaintext (the phone can't decrypt
   // without the key anyway, and a keyless pairing has no confidentiality to lose).
-  channel.push("ask_request", askEnc ? { ...base, askEnc } : { ...base, request: body });
+  const wire = askEnc ? { ...base, askEnc } : { ...base, request: body };
+  console.log(
+    `[vibe-bridge][ask] push topic=${channel && channel.topic} state=${channel && channel.state} ` +
+      `requestId=${requestId} kind=${kind} chat=${chatId} sealed=${!!askEnc} ` +
+      `bodyKeys=${body ? Object.keys(body).join(",") : "none"}`
+  );
+  try {
+    const push = channel.push("ask_request", wire);
+    if (push && typeof push.receive === "function") {
+      push
+        .receive("ok", () => console.log(`[vibe-bridge][ask] server ACK requestId=${requestId}`))
+        .receive("error", (e) =>
+          console.log(`[vibe-bridge][ask] server ERROR requestId=${requestId} ${JSON.stringify(e)}`)
+        )
+        .receive("timeout", () =>
+          console.log(`[vibe-bridge][ask] server TIMEOUT requestId=${requestId}`)
+        );
+    }
+  } catch (e) {
+    console.log(`[vibe-bridge][ask] push THREW requestId=${requestId} ${e && e.message}`);
+  }
 }
 
 // Awaited ask (MCP ask_user). Resolves { decision, answer } from `ask_response`.

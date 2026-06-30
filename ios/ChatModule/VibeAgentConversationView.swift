@@ -248,6 +248,9 @@ enum VibeAgentKitMap {
     let body = isCompaction
       ? (row.plainContent ?? row.text).trimmingCharacters(in: .whitespacesAndNewlines)
       : defaultBody
+    let trimmedBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+    let isInterrupted = trimmedBody == "[Request interrupted by user]"
+      || trimmedBody.localizedCaseInsensitiveContains("request interrupted by user")
     let hasBodyText = !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     // A turn's tool actions render natively: each depth-0 node becomes a progress
     // item (compact shimmer line + tap-to-open tool sheet). The decrypted detail
@@ -277,22 +280,24 @@ enum VibeAgentKitMap {
     // "done"/"error" status from foldTurnIntoHost, so a lone "running" node unambiguously
     // means the turn is in flight.
     let hasRunningNode = row.agentProgressNodes.contains { $0.status.lowercased() == "running" }
-    let isLiveTurn = row.isAgentMessage && !isCompaction && (row.isStreamingText || hasRunningNode)
+    let isLiveTurn = row.isAgentMessage && !isCompaction && !isInterrupted
+      && (row.isStreamingText || hasRunningNode)
     return VibeAgentKitChatMessage(
       id: row.messageId ?? row.key,
-      role: isUser ? .user : .assistant,
+      role: (isUser && !isInterrupted) ? .user : .assistant,
       text: body,
       timestamp: row.timestamp,
       timestampMs: 0,
       isStreaming: isLiveTurn,
       isError: row.status == "failed",
-      hasFinalResponseText: row.isAgentMessage && !isLiveTurn && !isCompaction && hasBodyText,
+      hasFinalResponseText: row.isAgentMessage && !isLiveTurn && !isCompaction && !isInterrupted && hasBodyText,
       progress: [],
-      progressItems: isCompaction ? [] : items,
-      subagentChildren: isCompaction ? [:] : subagentChildren,
-      runtime: isCompaction ? nil : (row.isAgentMessage ? row.agentRuntime : nil),
+      progressItems: (isCompaction || isInterrupted) ? [] : items,
+      subagentChildren: (isCompaction || isInterrupted) ? [:] : subagentChildren,
+      runtime: (isCompaction || isInterrupted) ? nil : (row.isAgentMessage ? row.agentRuntime : nil),
       attachments: attachments,
-      isCompactionSummary: isCompaction
+      isCompactionSummary: isCompaction,
+      systemDividerText: isInterrupted ? "[Request interrupted by user]" : nil
     )
   }
 
@@ -308,18 +313,35 @@ enum VibeAgentKitMap {
     // Decrypt/map only the most recent `limit` rows (the visible tail). Older turns load
     // on demand via History; mapping all of them is what froze the agent view.
     let windowed = rows.count > limit ? Array(rows.suffix(limit)) : rows
-    return windowed.compactMap { row in
-      guard case .message = row.kind else { return nil }
+    // The same outgoing prompt can surface twice — once as the optimistic/native row and
+    // again as a server- or session-history re-ingest under a DIFFERENT message id, which
+    // slips past the id-based merge upstream and renders as a duplicate user bubble (one
+    // pinned at the top, one down in the feed). Collapse a user bubble that exactly repeats
+    // the previous kept user turn (only assistant/agent turns in between) — the real-world
+    // signature of that double-ingest. A genuinely repeated identical prompt is the rare,
+    // low-harm cost.
+    var lastUserText: String?
+    var result: [VibeAgentKitChatMessage] = []
+    for row in windowed {
+      guard case .message = row.kind else { continue }
       // Skip empty system/placeholder rows — but KEEP a freshly-started streaming
       // row even before it has text/steps/runtime, so the live "Working…" loader
       // appears the instant a run begins instead of the view looking like nothing
       // is happening.
       let m = chatMessage(from: row)
       if m.text.isEmpty && m.progressItems.isEmpty && m.runtime == nil && m.attachments.isEmpty && !m.isStreaming {
-        return nil
+        continue
       }
-      return m
+      if m.role == .user, m.attachments.isEmpty {
+        let trimmed = m.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+          if trimmed == lastUserText { continue }  // duplicate of the previous user turn
+          lastUserText = trimmed
+        }
+      }
+      result.append(m)
     }
+    return result
   }
 }
 
@@ -1201,11 +1223,33 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   /// A plan-approval / question request arrived from the bridge for this chat.
   /// Decrypt the sealed body and present the approval/ask sheet (once per request).
   private func handleAgentBridgeAsk(_ info: [AnyHashable: Any]) {
-    guard let chatId = agentBridgeChatId, !chatId.isEmpty else { return }
-    guard (info["chatId"] as? String) == chatId else { return }
-    guard let requestId = info["requestId"] as? String, !requestId.isEmpty else { return }
-    if presentedAskRequestIds.contains(requestId) { return }
-    guard let payload = ChatEngine.shared.latestAgentBridgeAsk(requestId: requestId) else { return }
+    let infoChatId = (info["chatId"] as? String) ?? ""
+    let infoRequestId = (info["requestId"] as? String) ?? ""
+    NSLog(
+      "[AgentView][ask] handle ENTER vcChat=%@ infoChat=%@ requestId=%@ kind=%@",
+      agentBridgeChatId ?? "nil", infoChatId, infoRequestId, (info["kind"] as? String) ?? "nil"
+    )
+    guard let chatId = agentBridgeChatId, !chatId.isEmpty else {
+      NSLog("[AgentView][ask] DROP — vc has no agentBridgeChatId")
+      return
+    }
+    guard infoChatId == chatId else {
+      NSLog("[AgentView][ask] DROP — chatId mismatch vc=%@ info=%@", chatId, infoChatId)
+      return
+    }
+    guard !infoRequestId.isEmpty else {
+      NSLog("[AgentView][ask] DROP — empty requestId")
+      return
+    }
+    let requestId = infoRequestId
+    if presentedAskRequestIds.contains(requestId) {
+      NSLog("[AgentView][ask] DROP — already presented requestId=%@", requestId)
+      return
+    }
+    guard let payload = ChatEngine.shared.latestAgentBridgeAsk(requestId: requestId) else {
+      NSLog("[AgentView][ask] DROP — no stored payload for requestId=%@", requestId)
+      return
+    }
 
     // The body is E2E-sealed (`askEnc`); fall back to plaintext `request` for a
     // keyless pairing. Decrypted shape is { kind, request: {...} }.
@@ -1215,10 +1259,15 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     } else if let raw = payload["request"] as? [String: Any] {
       body = ["request": raw]
     } else {
+      NSLog(
+        "[AgentView][ask] DROP — decrypt failed AND no plaintext request (sealed=%@) requestId=%@",
+        payload["askEnc"] != nil ? "Y" : "N", requestId
+      )
       return
     }
     let kind = (body["kind"] as? String) ?? (info["kind"] as? String) ?? "ask"
     let request = (body["request"] as? [String: Any]) ?? body
+    NSLog("[AgentView][ask] PRESENT sheet kind=%@ requestId=%@ reqKeys=%@", kind, requestId, request.keys.joined(separator: ","))
     presentedAskRequestIds.insert(requestId)
     presentAskSheet(
       requestId: requestId,
@@ -1245,7 +1294,19 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       presentation.prefersGrabberVisible = true
       presentation.preferredCornerRadius = 22
     }
-    present(sheet, animated: true)
+    // If this VC is already presenting (e.g. an attachment picker or a prior sheet) the
+    // new present() is dropped silently — surface that so we can see it in the logs.
+    if let existing = presentedViewController {
+      NSLog(
+        "[AgentView][ask] WARN already presenting %@ — presenting ask sheet on top may fail",
+        String(describing: type(of: existing))
+      )
+    }
+    NSLog("[AgentView][ask] calling present() inWindow=%@ requestId=%@",
+      view.window != nil ? "Y" : "N", requestId)
+    present(sheet, animated: true) {
+      NSLog("[AgentView][ask] present() completed requestId=%@", requestId)
+    }
   }
 
   /// Send the answer back to the bridge and, for an approved plan, kick off the
@@ -1627,18 +1688,20 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
 
   func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
     let message = tableMessages[indexPath.row]
-    // A /compact summary is a centered, collapsible divider — its own cell type, not a
-    // bubble. The expand state reuses the per-message progress-expand set.
-    if message.isCompactionSummary {
+    // System dividers and /compact summaries are centered muted rows, not bubbles.
+    // Compact summaries can expand; interruption/status dividers are static.
+    if message.isCompactionSummary || message.systemDividerText != nil {
       let cell = tableView.dequeueReusableCell(
         withIdentifier: VibeAgentKitCompactionCell.reuseIdentifier,
         for: indexPath
       ) as! VibeAgentKitCompactionCell
       cell.backgroundColor = .clear
-      cell.onToggle = { [weak self] in self?.toggleCompaction(for: message.id) }
+      cell.onToggle = message.isCompactionSummary ? { [weak self] in self?.toggleCompaction(for: message.id) } : nil
       cell.configure(
         text: message.text,
+        title: message.systemDividerText ?? "Context compacted",
         expanded: expandedProgressMessageIds.contains(message.id),
+        canExpand: message.isCompactionSummary,
         appearance: appearance
       )
       return cell
@@ -1681,11 +1744,13 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   private func reconfigureVisibleCell(at indexPath: IndexPath) {
     guard indexPath.row < tableMessages.count else { return }
     let message = tableMessages[indexPath.row]
-    if message.isCompactionSummary {
+    if message.isCompactionSummary || message.systemDividerText != nil {
       guard let cell = tableView.cellForRow(at: indexPath) as? VibeAgentKitCompactionCell else { return }
       cell.configure(
         text: message.text,
+        title: message.systemDividerText ?? "Context compacted",
         expanded: expandedProgressMessageIds.contains(message.id),
+        canExpand: message.isCompactionSummary,
         appearance: appearance
       )
       return
@@ -1944,7 +2009,9 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       if let cell = tableView.cellForRow(at: indexPath) as? VibeAgentKitCompactionCell {
         cell.configure(
           text: tableMessages[row].text,
+          title: "Context compacted",
           expanded: expandedProgressMessageIds.contains(messageId),
+          canExpand: true,
           appearance: appearance
         )
       }
@@ -1985,27 +2052,68 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       }
     }
   }
-
-  private func presentRuntime(_ runtime: ChatListRow.AgentRuntimeSummary) {
-    guard runtime.diff?.files.isEmpty == false else { return }
-    let controller = AgentRuntimeFilesViewController(
-      runtime: runtime,
-      appearance: .fallback,
-      chatId: agentBridgeChatId,
-      provider: agentBridgeProvider ?? runtime.provider
-    )
-    // The history surface isn't inside a UINavigationController, so a plain push
-    // would silently no-op. Push when we can; otherwise present a modal nav (the
-    // file→diff drill-down then works because it now has a nav stack).
-    if let nav = navigationController {
-      nav.pushViewController(controller, animated: true)
+  private func toggleRuntimeExpand(for messageId: String) {
+    if expandedRuntimeMessageIds.contains(messageId) {
+      expandedRuntimeMessageIds.remove(messageId)
     } else {
-      controller.navigationItem.leftBarButtonItem = UIBarButtonItem(
-        primaryAction: UIAction(title: "Done") { [weak self] _ in self?.dismiss(animated: true) }
-      )
-      let nav = UINavigationController(rootViewController: controller)
-      present(nav, animated: true)
+      expandedRuntimeMessageIds.insert(messageId)
     }
+    guard let row = tableMessages.firstIndex(where: { $0.id == messageId }) else { return }
+    let indexPath = IndexPath(row: row, section: 0)
+    applyAnchoredRowChange(at: indexPath) {
+      if let cell = tableView.cellForRow(at: indexPath) as? VibeAgentKitMessageCell {
+        cell.configure(
+          message: tableMessages[row],
+          appearance: appearance,
+          regeneratePrompt: regeneratePrompt,
+          showsActions: false,
+          isProgressExpanded: expandedProgressMessageIds.contains(messageId),
+          expandedStepIds: expandedStepIdsByMessage[messageId] ?? [],
+          isTextExpanded: expandedTextMessageIds.contains(messageId),
+          isRuntimeExpanded: expandedRuntimeMessageIds.contains(messageId),
+          streamingStartDate: tableMessages[row].isStreaming ? streamStartByMessageId[messageId] : nil
+        )
+      }
+    }
+  }
+
+  private func presentRuntimeReview(_ message: VibeAgentKitChatMessage) {
+    guard let patch = message.runtime?.diff?.patch, !patch.isEmpty else { return }
+    let diffView = VibeAgentDiffSheetView(patch: patch, fileName: nil)
+    presentDiffSheet(diffView: diffView)
+  }
+
+  private func presentRuntimeFile(_ file: ChatListRow.AgentRuntimeFile, message: VibeAgentKitChatMessage) {
+    guard let patch = message.runtime?.diff?.patch, !patch.isEmpty else { return }
+    // VibeAgentDiffSheetView parses the whole patch but displays it. To show just one file,
+    // we extract the file chunk using ChatNativeStreamingTextLabel's diffChunk helper,
+    // or we just pass the whole patch and let the sheet handle it.
+    // For now, we'll extract the chunk the same way AgentRuntimePatchPreviewController did:
+    let chunk = diffChunk(for: file.path, patch: patch)
+    let diffView = VibeAgentDiffSheetView(patch: chunk.isEmpty ? patch : chunk, fileName: file.name)
+    presentDiffSheet(diffView: diffView)
+  }
+
+  private func presentDiffSheet(diffView: VibeAgentDiffSheetView) {
+    let hostingController = UIHostingController(rootView: diffView)
+    hostingController.modalPresentationStyle = .pageSheet
+    if let sheet = hostingController.sheetPresentationController {
+      sheet.detents = [.medium(), .large()]
+      sheet.prefersGrabberVisible = true
+      sheet.preferredCornerRadius = 20
+      sheet.prefersScrollingExpandsWhenScrolledToEdge = true
+    }
+    present(hostingController, animated: true)
+  }
+
+  private func diffChunk(for path: String, patch: String) -> String {
+    let target = "diff --git a/\(path)"
+    guard let start = patch.range(of: target)?.lowerBound else { return "" }
+    let tail = patch[start...]
+    if let next = tail.dropFirst(target.count).range(of: "\ndiff --git a/")?.lowerBound {
+      return String(tail[..<next]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    return String(tail).trimmingCharacters(in: .whitespacesAndNewlines)
   }
 
   private func updateLoadingOverlay() {
@@ -3132,7 +3240,10 @@ final class VibeAgentHeaderAvatarView: UIControl {
   private let initialLabel = UILabel()
   private let imageView = UIImageView()
   private var loadToken = 0
-  private let diameter: CGFloat = 34
+  // Matches the UINavigationBar button wrapper's 36pt min-width slot so the avatar fills
+  // it exactly (no constraint fight); the size constraints below are also sub-required as
+  // a belt-and-suspenders against the wrapper ever pinning a different width.
+  private let diameter: CGFloat = 36
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -3155,10 +3266,11 @@ final class VibeAgentHeaderAvatarView: UIControl {
     imageView.isUserInteractionEnabled = false
     addSubview(imageView)
 
-    NSLayoutConstraint.activate([
-      widthAnchor.constraint(equalToConstant: diameter),
-      heightAnchor.constraint(equalToConstant: diameter),
-    ])
+    let avatarWidth = widthAnchor.constraint(equalToConstant: diameter)
+    let avatarHeight = heightAnchor.constraint(equalToConstant: diameter)
+    avatarWidth.priority = UILayoutPriority(999)
+    avatarHeight.priority = UILayoutPriority(999)
+    NSLayoutConstraint.activate([avatarWidth, avatarHeight])
   }
 
   required init?(coder: NSCoder) { return nil }
@@ -3431,7 +3543,7 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
   private var dictationBaseText = ""
 
   // MARK: Layout constants
-  private let sideSize: CGFloat = 40
+  private let sideSize: CGFloat = 46
   private let sideGap: CGFloat = 6
   private let topVPad: CGFloat = 6
   private let bottomVPad: CGFloat = 6
@@ -3531,15 +3643,10 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
     // Attach glass pill (left)
     configureGlass(attachGlass)
     addSubview(attachGlass)
-    slashButton.setTitle("/", for: .normal)
-    slashButton.setImage(nil, for: .normal)
-    slashButton.titleLabel?.font = UIFont.systemFont(ofSize: 25, weight: .medium)
-    slashButton.setTitleColor(.white, for: .normal)
-    slashButton.tintColor = .white
-    slashButton.accessibilityLabel = "Slash commands"
-    slashButton.showsMenuAsPrimaryAction = true
-    attachGlass.contentView.addSubview(slashButton)
-    updateSlashMenu()
+    configureIconButton(plusButton, systemName: "plus")
+    plusButton.addTarget(self, action: #selector(handlePlus), for: .touchUpInside)
+    plusButton.showsMenuAsPrimaryAction = false
+    attachGlass.contentView.addSubview(plusButton)
 
     // Text glass pill (center)
     configureGlass(pillGlass)
@@ -3552,10 +3659,13 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
     configureOptionPill()
     pillContainer.addSubview(optionPillButton)
 
-    configureIconButton(plusButton, systemName: "plus")
-    plusButton.addTarget(self, action: #selector(handlePlus), for: .touchUpInside)
-    plusButton.showsMenuAsPrimaryAction = false
-    pillContainer.addSubview(plusButton)
+    slashButton.setTitle(nil, for: .normal)
+    slashButton.setImage(UIImage(systemName: "slash.circle", withConfiguration: UIImage.SymbolConfiguration(pointSize: 22, weight: .regular)), for: .normal)
+    slashButton.tintColor = appearance.text
+    slashButton.accessibilityLabel = "Slash commands"
+    slashButton.showsMenuAsPrimaryAction = true
+    pillContainer.addSubview(slashButton)
+    updateSlashMenu()
 
     placeholderLabel.text = placeholder
     placeholderLabel.font = UIFont.systemFont(ofSize: 17)
@@ -3666,8 +3776,7 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
     textView.tintColor = appearance.text
     placeholderLabel.textColor = appearance.textTertiary
     plusButton.tintColor = appearance.text
-    slashButton.tintColor = .white
-    slashButton.setTitleColor(.white, for: .normal)
+    slashButton.tintColor = appearance.text
     optionPillButton.tintColor = appearance.text
     setActiveOptionPill(activeOptionTitle)
     micButton.tintColor = isDictating ? .systemRed : appearance.text
@@ -3725,7 +3834,7 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
 
     attachGlass.bounds = squareBounds
     attachGlass.center = CGPoint(x: leftEdge + sideSize / 2, y: btnCenterY)
-    slashButton.frame = attachGlass.contentView.bounds
+    plusButton.frame = attachGlass.contentView.bounds
 
     let micCenterX = rightEdge - sideSize / 2 + (sideSize + sideGap * 2) * clampedSend
     micGlass.bounds = squareBounds
@@ -3733,9 +3842,9 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
     micGlass.alpha = micVisibility
     micButton.frame = micGlass.contentView.bounds
 
-    // Leading attachment button — bottom-aligned inside the pill, just before the text.
+    // Leading slash button — bottom-aligned inside the pill, just before the text.
     let slashInset = max(4, (minPillH - slashButtonSize) / 2)
-    plusButton.frame = CGRect(
+    slashButton.frame = CGRect(
       x: textInsetH - 2,
       y: pillH - slashButtonSize - slashInset,
       width: slashButtonSize,

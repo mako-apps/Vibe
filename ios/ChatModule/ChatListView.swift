@@ -1353,6 +1353,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       if let agentVC = self.presentedBridgeAgentVC {
         agentVC.setMessages(VibeAgentKitMap.messages(from: parsed))
       }
+      // Keep the DM agent composer's trailing control (SEND vs STOP) in sync with the
+      // live state of the rows — a streaming/running turn forces STOP so the user can
+      // interrupt it. The full-page runtime view drives its own composer separately.
+      self.agentComposerView?.setTaskActive(self.agentComposerHasLiveTask())
       self.pruneMessageSelection(for: parsed)
       let engineChatId = self.engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
       let resolvedChatId: String
@@ -4810,8 +4814,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         bar.onHeightChanged = { [weak self] height in
             self?.inputBarHeightDidChange()
         }
+        // While a bridge task is live the composer's trailing control becomes STOP — tapping
+        // it cancels the running run. Without this wiring (the agent surface uses this
+        // VibeComposerView, NOT `inputBar`) the STOP button never appeared and never fired.
+        bar.onStop = { [weak self] in
+            self?.agentComposerStopActiveTask()
+        }
         agentComposerView = bar
         addSubview(bar)
+        // Seed the trailing control immediately so a composer created mid-run shows STOP.
+        bar.setTaskActive(agentComposerHasLiveTask())
 
         inputBar?.removeFromSuperview()
         inputBar = nil
@@ -4883,10 +4895,39 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
   }
 
+  /// True when this DM agent surface has a live/streaming turn — used to force the
+  /// composer's trailing control to STOP. Mirrors the full-page view's `isLive` check.
+  private func agentComposerHasLiveTask() -> Bool {
+    guard agentChatMode || currentBridgeProvider != nil else { return false }
+    if agentStreaming { return true }
+    return rows.contains { bridgeRowIsLive($0) }
+  }
+
+  /// Composer STOP tapped on the DM agent surface: cancel the running bridge run. Mirrors
+  /// the full-page runtime view's `stopActiveTask` (chatId + provider + the live task id).
+  private func agentComposerStopActiveTask() {
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !chatId.isEmpty else {
+      NSLog("[ChatListView] agentComposerStop skipped — no chatId")
+      return
+    }
+    let provider = currentBridgeProvider ?? "codex"
+    let taskId = rows.first { bridgeRowIsLive($0) }?.agentRuntime?.taskId
+    var payload: [String: Any] = [
+      "chatId": chatId,
+      "provider": provider,
+      "action": "cancel",
+    ]
+    if let taskId, !taskId.isEmpty { payload["taskId"] = taskId }
+    NSLog("[ChatListView] agentComposerStop chat=%@ provider=%@ taskId=%@", chatId, provider, taskId ?? "nil")
+    _ = ChatEngine.shared.sendAgentBridgeControl(payload)
+  }
+
   func setAgentStreaming(_ streaming: Bool) {
     guard agentStreaming != streaming else { return }
     agentStreaming = streaming
     inputBar?.setAgentStreaming(streaming)
+    agentComposerView?.setTaskActive(streaming || agentComposerHasLiveTask())
     // Note: we deliberately do NOT clear the push-to-top spacer when the answer
     // finishes. Clearing it would drop `maxOffset` below the pinned offset for a
     // short answer, and the collection view would clamp the content downward —
