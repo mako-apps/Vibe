@@ -11,7 +11,9 @@ final class ChatHomeUndoBannerView: UIControl {
   private let textStack = UIStackView()
   private let actionPillView = UIView()
   private let actionLabel = UILabel()
-  private let timerLabel = UILabel()
+  private let timerBackgroundLayer = CAShapeLayer()
+  private let timerProgressLayer = CAShapeLayer()
+  private var isTimerAnimating = false
   private var destructive = true
 
   override init(frame: CGRect) {
@@ -34,10 +36,28 @@ final class ChatHomeUndoBannerView: UIControl {
     titleLabel.text = title
     bodyLabel.text = body
     actionLabel.text = actionTitle
-    timerLabel.text = timerText
     iconImageView.image = UIImage(
       systemName: destructive ? "arrow.uturn.backward.circle.fill" : "checkmark.circle.fill"
     )
+
+    if timerText.isEmpty {
+      timerProgressLayer.removeAllAnimations()
+      isTimerAnimating = false
+    } else {
+      let secondsString = timerText.trimmingCharacters(in: CharacterSet(charactersIn: "sS "))
+      let seconds = Double(secondsString) ?? 5.0
+      if !isTimerAnimating && seconds > 0 {
+        isTimerAnimating = true
+        let anim = CABasicAnimation(keyPath: "strokeEnd")
+        anim.fromValue = seconds / 5.0
+        anim.toValue = 0
+        anim.duration = seconds
+        anim.isRemovedOnCompletion = false
+        anim.fillMode = .forwards
+        timerProgressLayer.add(anim, forKey: "countdown")
+        timerProgressLayer.strokeEnd = 0
+      }
+    }
   }
 
   func applyTheme(textColor: UIColor, surfaceColor: UIColor, isDark: Bool) {
@@ -45,27 +65,28 @@ final class ChatHomeUndoBannerView: UIControl {
       let glass = UIGlassEffect()
       glass.isInteractive = true
       blurView.effect = glass
+      blurView.contentView.backgroundColor = .clear
     } else {
       blurView.effect = UIBlurEffect(style: .systemThinMaterial)
+      blurView.contentView.backgroundColor = surfaceColor.withAlphaComponent(isDark ? 0.16 : 0.10)
     }
 
-    let accentColor = destructive
-      ? UIColor(red: 0.93, green: 0.24, blue: 0.25, alpha: 1)
-      : UIColor(red: 0.21, green: 0.58, blue: 0.98, alpha: 1)
+    let accentColor = textColor
 
-    blurView.contentView.backgroundColor = surfaceColor.withAlphaComponent(isDark ? 0.16 : 0.10)
     blurView.alpha = isDark ? 0.98 : 0.95
     blurView.layer.borderColor = textColor.withAlphaComponent(isDark ? 0.10 : 0.06).cgColor
 
-    iconContainer.backgroundColor = accentColor.withAlphaComponent(isDark ? 0.22 : 0.14)
+    iconContainer.backgroundColor = accentColor.withAlphaComponent(isDark ? 0.12 : 0.08)
     iconImageView.tintColor = accentColor
     titleLabel.textColor = textColor.withAlphaComponent(0.96)
     bodyLabel.textColor = textColor.withAlphaComponent(0.78)
 
-    actionPillView.backgroundColor = accentColor.withAlphaComponent(isDark ? 0.20 : 0.14)
-    actionPillView.layer.borderColor = accentColor.withAlphaComponent(isDark ? 0.24 : 0.16).cgColor
+    actionPillView.backgroundColor = accentColor.withAlphaComponent(isDark ? 0.12 : 0.08)
+    actionPillView.layer.borderColor = accentColor.withAlphaComponent(isDark ? 0.14 : 0.10).cgColor
     actionLabel.textColor = accentColor
-    timerLabel.textColor = textColor.withAlphaComponent(0.70)
+    
+    timerBackgroundLayer.strokeColor = textColor.withAlphaComponent(isDark ? 0.15 : 0.08).cgColor
+    timerProgressLayer.strokeColor = textColor.withAlphaComponent(0.70).cgColor
   }
 
   private func setup() {
@@ -73,7 +94,7 @@ final class ChatHomeUndoBannerView: UIControl {
 
     addSubview(blurView)
     blurView.layer.cornerCurve = .continuous
-    blurView.layer.cornerRadius = ChatHomeUndoBannerView.preferredHeight / 2.0
+    blurView.layer.cornerRadius = 99.0
     blurView.layer.borderWidth = 1.0
     blurView.layer.borderColor = UIColor.white.withAlphaComponent(0.12).cgColor
     blurView.clipsToBounds = true
@@ -81,7 +102,14 @@ final class ChatHomeUndoBannerView: UIControl {
     blurView.contentView.addSubview(iconContainer)
     blurView.contentView.addSubview(textStack)
     blurView.contentView.addSubview(actionPillView)
-    blurView.contentView.addSubview(timerLabel)
+    blurView.contentView.layer.addSublayer(timerBackgroundLayer)
+    blurView.contentView.layer.addSublayer(timerProgressLayer)
+
+    timerBackgroundLayer.lineWidth = 2.5
+    timerBackgroundLayer.fillColor = UIColor.clear.cgColor
+    timerProgressLayer.lineWidth = 2.5
+    timerProgressLayer.fillColor = UIColor.clear.cgColor
+    timerProgressLayer.lineCap = .round
 
     iconContainer.layer.cornerCurve = .continuous
     iconContainer.layer.cornerRadius = 15.0
@@ -115,9 +143,6 @@ final class ChatHomeUndoBannerView: UIControl {
 
     actionLabel.font = UIFont.systemFont(ofSize: 12, weight: .semibold)
     actionLabel.textAlignment = .center
-
-    timerLabel.font = UIFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-    timerLabel.textAlignment = .right
   }
 
   override func layoutSubviews() {
@@ -137,7 +162,12 @@ final class ChatHomeUndoBannerView: UIControl {
     let actionX = max(0, bounds.width - actionWidth - 14.0)
     actionPillView.frame = CGRect(x: actionX, y: 8.0, width: actionWidth, height: 30.0)
     actionLabel.frame = actionPillView.bounds.insetBy(dx: 8.0, dy: 6.0)
-    timerLabel.frame = CGRect(x: actionX, y: actionPillView.frame.maxY + 4.0, width: actionWidth, height: 12.0)
+    
+    let timerRadius: CGFloat = 6.0
+    let timerCenter = CGPoint(x: actionX + actionWidth / 2.0, y: actionPillView.frame.maxY + 8.0)
+    let timerPath = UIBezierPath(arcCenter: timerCenter, radius: timerRadius, startAngle: -.pi / 2, endAngle: .pi * 1.5, clockwise: true)
+    timerBackgroundLayer.path = timerPath.cgPath
+    timerProgressLayer.path = timerPath.cgPath
 
     let textX = iconContainer.frame.maxX + 10.0
     let textWidth = max(0.0, actionX - textX - 10.0)

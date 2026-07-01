@@ -426,6 +426,14 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   private var usageBannerKey: String?
   private let commandOverlayView = VibeAgentCommandOverlayView()
 
+  // A short confirmation toast for composer actions that used to pop the (oversized,
+  // unbounded-height) command overlay — `/usage` now just refreshes the pinned banner
+  // above and confirms here instead; `/plan` confirms here instead of a local panel.
+  private let infoToastBlur = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterial))
+  private let infoToastIcon = UIImageView()
+  private let infoToastLabel = UILabel()
+  private var infoToastHideWork: DispatchWorkItem?
+
   // Subagent (Claude Task tool) surfacing: a top toast announces a subagent starting,
   // and tapping it (or its feed row) opens a read-only detail view of its steps.
   private let subagentToastBlur = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterial))
@@ -907,6 +915,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     setupUsageBanner()
     setupCommandOverlay()
     setupSubagentToast()
+    setupInfoToast()
 
     // Pin the feed to the TRUE bottom so messages scroll UNDER the floating composer
     // (Resolo-style, no hard footer line). `updateScrollInsets()` keeps a bottom
@@ -1031,6 +1040,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       commandOverlayView.applyAppearance(appearance)
       loadingSpinner.color = appearance.textSecondary
       updateEditToastAppearance()
+      updateInfoToastAppearance()
       if !isEmbeddedInSwiftUI {
         applyNavigationAppearance()
       }
@@ -1137,12 +1147,19 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       isHistoryPicked = true
     }
 
-    // Intercept newly arrived bridge info-command results and route them to the overlay.
+    // Intercept newly arrived bridge info-command results. `/usage` gets a toast (the
+    // pinned usage banner, refreshed below by `updateUsageBanner()`, already carries the
+    // detail) instead of the old unbounded-height overlay, which could grow to cover the
+    // whole screen for a long result; everything else still uses the overlay.
     let previousIds = Set(messages.map(\.id))
     for msg in newMessages where msg.runtime?.command?.executable?.lowercased() == "vibe-bridge"
       && !previousIds.contains(msg.id)
     {
-      showBridgeCommandResult(msg)
+      if bridgeCommandName(msg) == "usage" {
+        showInfoToast(title: "Usage updated", systemImage: "gauge.with.dots.needle.bottom.50percent")
+      } else {
+        showBridgeCommandResult(msg)
+      }
     }
 
     let wasNearBottom = isNearBottom()
@@ -1404,6 +1421,9 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
         decision: decision,
         answer: answer
       )
+    }
+    sheet.onDismissWithoutResolve = {
+      ChatEngine.shared.releaseAgentBridgeAskPresentation(requestId: requestId)
     }
     if let presentation = sheet.sheetPresentationController {
       presentation.detents = [.medium(), .large()]
@@ -1701,17 +1721,27 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
 
   private func updateComposerHeight(_ height: CGFloat, animated: Bool) {
     composerHeightConstraint?.constant = height
-    if animated {
-      UIView.animate(
-        withDuration: 0.38,
-        delay: 0,
-        usingSpringWithDamping: 0.82,
-        initialSpringVelocity: 0.0,
-        options: [.beginFromCurrentState, .allowUserInteraction]
-      ) { self.view.layoutIfNeeded() }
-    } else {
+    guard animated else {
       view.layoutIfNeeded()
+      return
     }
+    // `onHeightChanged` now fires from inside `VibeComposerView`'s own expand/collapse
+    // animation closure, so most of the time we're already inside an active transaction
+    // here — just ride it. Wrapping our OWN `UIView.animate` on top of that (a second,
+    // differently-timed spring) is what used to make the pill and the keyboard visibly
+    // fall out of sync ("jumping"). Only start a fresh spring when nothing is animating
+    // yet (e.g. a safe-area-only change that didn't go through that closure).
+    guard UIView.inheritedAnimationDuration <= 0 else {
+      view.layoutIfNeeded()
+      return
+    }
+    UIView.animate(
+      withDuration: 0.38,
+      delay: 0,
+      usingSpringWithDamping: 0.82,
+      initialSpringVelocity: 0.0,
+      options: [.beginFromCurrentState, .allowUserInteraction]
+    ) { self.view.layoutIfNeeded() }
   }
 
   // MARK: Image attachments
@@ -2464,6 +2494,80 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       vibeAgentKitColorWithAlpha(appearance.textSecondary, appearance.isDark ? 0.18 : 0.14).cgColor
   }
 
+  /// A short confirmation pill above the composer — replaces the old (unbounded-height,
+  /// "covers the screen" on a long result) command overlay for `/usage` and `/plan`.
+  private func setupInfoToast() {
+    infoToastBlur.translatesAutoresizingMaskIntoConstraints = false
+    infoToastBlur.alpha = 0.0
+    infoToastBlur.isHidden = true
+    infoToastBlur.clipsToBounds = true
+    infoToastBlur.layer.cornerRadius = 16.0
+    infoToastBlur.layer.cornerCurve = .continuous
+    infoToastBlur.layer.borderWidth = 0.6
+    view.addSubview(infoToastBlur)
+
+    infoToastIcon.translatesAutoresizingMaskIntoConstraints = false
+    infoToastIcon.contentMode = .scaleAspectFit
+    infoToastIcon.preferredSymbolConfiguration = UIImage.SymbolConfiguration(pointSize: 12.0, weight: .semibold)
+    infoToastBlur.contentView.addSubview(infoToastIcon)
+
+    infoToastLabel.translatesAutoresizingMaskIntoConstraints = false
+    infoToastLabel.numberOfLines = 1
+    infoToastLabel.lineBreakMode = .byTruncatingTail
+    infoToastLabel.font = UIFont.systemFont(ofSize: 12.5, weight: .semibold)
+    infoToastBlur.contentView.addSubview(infoToastLabel)
+
+    NSLayoutConstraint.activate([
+      infoToastBlur.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+      infoToastBlur.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 16.0),
+      infoToastBlur.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -16.0),
+      infoToastBlur.bottomAnchor.constraint(equalTo: composerView.topAnchor, constant: -8.0),
+      infoToastIcon.leadingAnchor.constraint(equalTo: infoToastBlur.contentView.leadingAnchor, constant: 12.0),
+      infoToastIcon.centerYAnchor.constraint(equalTo: infoToastBlur.contentView.centerYAnchor),
+      infoToastIcon.widthAnchor.constraint(equalToConstant: 14.0),
+      infoToastIcon.heightAnchor.constraint(equalToConstant: 14.0),
+      infoToastLabel.leadingAnchor.constraint(equalTo: infoToastIcon.trailingAnchor, constant: 7.0),
+      infoToastLabel.trailingAnchor.constraint(equalTo: infoToastBlur.contentView.trailingAnchor, constant: -12.0),
+      infoToastLabel.topAnchor.constraint(equalTo: infoToastBlur.contentView.topAnchor, constant: 7.0),
+      infoToastLabel.bottomAnchor.constraint(equalTo: infoToastBlur.contentView.bottomAnchor, constant: -7.0),
+    ])
+    updateInfoToastAppearance()
+  }
+
+  private func updateInfoToastAppearance() {
+    infoToastIcon.tintColor = vibeAgentKitColorWithAlpha(appearance.text, 0.82)
+    infoToastLabel.textColor = vibeAgentKitColorWithAlpha(appearance.text, 0.88)
+    infoToastBlur.contentView.backgroundColor =
+      (appearance.isDark ? UIColor.white : UIColor.black)
+      .withAlphaComponent(appearance.isDark ? 0.055 : 0.045)
+    infoToastBlur.layer.borderColor =
+      vibeAgentKitColorWithAlpha(appearance.textSecondary, appearance.isDark ? 0.18 : 0.14).cgColor
+  }
+
+  private func showInfoToast(title: String, systemImage: String) {
+    infoToastIcon.image = UIImage(systemName: systemImage)
+    infoToastLabel.text = title
+    infoToastBlur.isHidden = false
+    UIView.animate(withDuration: 0.18, delay: 0, options: [.beginFromCurrentState, .allowUserInteraction]) {
+      self.infoToastBlur.alpha = 1.0
+    }
+    infoToastHideWork?.cancel()
+    let work = DispatchWorkItem { [weak self] in self?.hideInfoToast() }
+    infoToastHideWork = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + 2.2, execute: work)
+  }
+
+  private func hideInfoToast() {
+    infoToastHideWork?.cancel()
+    infoToastHideWork = nil
+    guard !infoToastBlur.isHidden else { return }
+    UIView.animate(withDuration: 0.16, delay: 0, options: [.beginFromCurrentState, .allowUserInteraction]) {
+      self.infoToastBlur.alpha = 0.0
+    } completion: { _ in
+      if self.infoToastBlur.alpha <= 0.01 { self.infoToastBlur.isHidden = true }
+    }
+  }
+
   private func setupUsageBanner() {
     usageBannerView.translatesAutoresizingMaskIntoConstraints = false
     usageBannerView.isHidden = true
@@ -2488,15 +2592,20 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
 
   /// Show real bridge output (from a `vibe-bridge` result) in the glass overlay
   /// instead of letting it land as a chat bubble.
-  private func showBridgeCommandResult(_ msg: VibeAgentKitChatMessage) {
-    guard isViewLoaded, !msg.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-    // Extract the command name from "vibe-bridge /usage" → "usage"
+  /// Extracts the command name from a `vibe-bridge` result's display string, e.g.
+  /// "vibe-bridge /usage" → "usage".
+  private func bridgeCommandName(_ msg: VibeAgentKitChatMessage) -> String {
     let display = msg.runtime?.command?.display ?? ""
-    let rawName = display
+    return display
       .components(separatedBy: " ")
       .first(where: { $0.hasPrefix("/") })
-      .map { String($0.dropFirst()) }
+      .map { String($0.dropFirst()).lowercased() }
       ?? ""
+  }
+
+  private func showBridgeCommandResult(_ msg: VibeAgentKitChatMessage) {
+    guard isViewLoaded, !msg.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+    let rawName = bridgeCommandName(msg)
     let name = rawName.isEmpty ? "Command" : rawName
     let title = name.prefix(1).uppercased() + String(name.dropFirst())
     commandOverlayView.configure(title: title, body: msg.text)
@@ -2506,6 +2615,13 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   private func handleComposerCommand(_ command: String) {
     let normalized = command.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     guard !normalized.isEmpty else { return }
+    // Plan mode already has two persistent, always-visible cues (the blue slash icon +
+    // the blue permission icon via `refreshModePill`) — a toast confirms the switch
+    // without popping a local panel that had nothing but stale "reasoning controls" copy.
+    if normalized == "/plan" || normalized == "plan" {
+      showInfoToast(title: "Plan mode — proposals only, no edits", systemImage: AgentBridgeWorkMode.plan.icon)
+      return
+    }
     let content: (title: String, body: String)
     switch normalized {
     case "/usage", "usage":
@@ -2518,8 +2634,6 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       content = ("Skills", skillsCommandBody())
     case "/reasoning", "reasoning", "/thinking", "thinking":
       content = ("Reasoning", reasoningCommandBody())
-    case "/plan", "plan":
-      content = ("Plan Mode", "Plan mode is a local run preference. Use the model/reasoning controls before sending; this panel stays local and does not add a chat message.")
     case "/compact", "compact":
       content = ("Compact", "Compact is available as a bridge command. It is shown here instead of being inserted into chat; run a compact task from the provider CLI when the bridge reports support.")
     default:
@@ -3472,18 +3586,19 @@ final class VibeAgentHeaderAvatarView: UIControl {
   }
 }
 
-/// The agent conversation input. A floating glass composer ported from Resolo's
-/// `AgentConversationInputBar`: three separate glass surfaces — an attach pill on
-/// the left, a growing text pill in the middle, and a mic pill on the right that
-/// morphs out as a send button morphs in. `self` is a transparent container that
-/// extends to the very bottom of the screen (ignoring the safe-area inset) so there
-/// is no edge/strip below the input; the pill row is inset above the home indicator.
+/// The agent conversation input: one glass pill that is a single compact line at
+/// rest (placeholder + mic/send only) and grows into two rows — the text on top,
+/// full width, and a plus/slash/permission row underneath — once it's focused or
+/// holds a draft. `self` is a transparent container that extends to the very
+/// bottom of the screen (ignoring the safe-area inset) so there is no edge/strip
+/// below the input; the pill row is inset above the home indicator.
 ///
-/// Single-state by design: the pill grows vertically as the text wraps instead of
-/// snapping between a compact and an expanded layout, so there is no disconnected
-/// morph and the height tracks the keyboard smoothly. The public API is unchanged
-/// from the previous implementation so both hosts (the standalone agent runtime view
-/// and the embedded Claude/Codex DM composer) adopt it with no integration changes.
+/// Each control in the bottom row is independent: tapping it opens its own native
+/// `UIMenu` (or, for "+", delegates to the host's image picker) and never resizes
+/// the pill itself — only focus/text/attachment state does that. The public API is
+/// unchanged from the previous implementation so both hosts (the standalone agent
+/// runtime view and the embedded Claude/Codex DM composer) adopt it with no
+/// integration changes.
 /// One entry in the composer's `/` command palette. `kind` decides routing when the
 /// command is run: `.runOption` is applied locally (it configures the next run);
 /// every other kind is SENT to the bridge, which executes it for real — bridge info
@@ -3498,7 +3613,7 @@ struct VibeAgentSlashCommand {
   var display: String { "/\(name)" }
 }
 
-public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewDataSource, UITableViewDelegate {
+public final class VibeComposerView: UIView, UITextViewDelegate {
   var onSend: ((String, AgentBridgeRunOptions) -> Void)? {
     didSet { updateSendState() }
   }
@@ -3531,35 +3646,23 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
     }
   }
 
-  // MARK: Subviews — three glass surfaces laid out side by side.
-  private let attachGlass = UIVisualEffectView(effect: nil)
-  private let plusButton = UIButton(type: .system)
-
+  // MARK: Subviews — one glass surface that grows in height on focus.
   private let pillGlass = UIVisualEffectView(effect: nil)
   private let pillContainer = UIView()
-  private let optionPillButton = UIButton(type: .system)
+  private let plusButton = UIButton(type: .system)
+  private let slashButton = UIButton(type: .system)
+  private let permissionButton = UIButton(type: .system)
   private let textView = UITextView()
   private let placeholderLabel = UILabel()
-  
-  private let slashButton = UIButton(type: .system)
   private let sendButton = UIButton(type: .system)
-
-  private let micGlass = UIVisualEffectView(effect: nil)
   private let micButton = UIButton(type: .system)
 
-  // `/` command palette — a floating list above the pill. Typing `/<query>` (a single
-  // token, no space yet) filters it; tapping a row inserts the command (args) or runs
-  // it immediately (no-arg). When visible the composer grows UPWARD so the palette
-  // stays inside the view's bounds (clean hit-testing — no out-of-bounds touch hacks).
-  private let commandPaletteBlur = UIVisualEffectView(effect: nil)
-  private let commandTable = UITableView(frame: .zero, style: .plain)
+  // `/` command list — a native UIMenu on `slashButton` (same pattern as the
+  // permission menu on `permissionButton`): it floats above the composer and never
+  // resizes it. Replaces an older in-house drop-up table that used to grow the
+  // whole pill upward whenever it was opened.
   private var providerSlashCommands: [VibeAgentSlashCommand] = []
   private var providerCliCommands: [VibeAgentSlashCommand] = []
-  private var filteredCommands: [VibeAgentSlashCommand] = []
-  private var commandPaletteVisible = false
-  private let paletteRowHeight: CGFloat = 48
-  private let paletteMaxRows = 5
-  private let paletteGap: CGFloat = 8
 
   /// Bridge + run-option commands always offered, independent of what the CLI reports.
   private static let defaultCommands: [VibeAgentSlashCommand] = [
@@ -3662,13 +3765,20 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
 
   private var appearance: VibeAgentKitChatAppearance = .fallback
 
-  /// 0 = idle (mic shown), 1 = has-text (send shown). Animated for the morph.
-  private var sendProgress: CGFloat = 0
   /// True while a bridge task is running for this chat: the trailing control becomes a
   /// STOP button (always visible, regardless of text) that cancels the run instead of
   /// sending. The host drives this from the live message state.
   private var isTaskActive = false
   private(set) var barHeight: CGFloat = 0
+  /// Tracks the last-applied value of `isExpanded` / send-visibility so the bottom row
+  /// and trailing control only cross-fade when either actually flips, not on every
+  /// keystroke.
+  private var lastExpandedState = false
+  private var lastSendVisible = false
+  /// The most recent keyboard show/hide curve, consumed once by the next expand/collapse
+  /// so the pill's own morph rides the SAME timeline as the keyboard instead of a
+  /// separately-timed spring — a mismatch there was the visible "jump".
+  private var pendingKeyboardAnimation: (duration: TimeInterval, options: UIView.AnimationOptions)?
 
   // On-device speech dictation for the mic button: tap to start, tap to stop, the
   // recognized text fills the composer so you can edit before sending. The agents
@@ -3683,23 +3793,19 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
 
   // MARK: Layout constants
   private let sideSize: CGFloat = 46
-  private let sideGap: CGFloat = 6
   private let topVPad: CGFloat = 6
   private let bottomVPad: CGFloat = 6
   private let minPillH: CGFloat = 46
-  private let maxPillH: CGFloat = 124
+  private let maxPillH: CGFloat = 160
   private let textInsetH: CGFloat = 14
   private let textInsetV: CGFloat = 11
   private let pagePadding: CGFloat = 14
   private let sendButtonSize: CGFloat = 34
-  private let optionPillHeight: CGFloat = 26
-  private let optionPillGap: CGFloat = 6
-  private var activeOptionTitle: String?
+  // The plus/slash/permission row that appears underneath the text once expanded.
+  private let bottomRowHeight: CGFloat = 34
+  private let bottomIconSize: CGFloat = 32
+  private let bottomRowGap: CGFloat = 8
   private var modeObserver: NSObjectProtocol?
-
-  private var optionReserve: CGFloat {
-    activeOptionTitle == nil ? 0 : optionPillHeight + optionPillGap
-  }
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -3715,51 +3821,52 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
     }
     recognitionTask?.cancel()
     if let modeObserver { NotificationCenter.default.removeObserver(modeObserver) }
+    NotificationCenter.default.removeObserver(self, name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
   }
 
-  /// Reflect the current work mode as a composer badge: a "Plan" pill whenever the
-  /// selected mode is plan-like (Plan or Read — propose-only). Clears the pill for
-  /// the editing modes. Keeps the badge in sync whether the mode was set via /plan,
-  /// the header permission picker, or any other surface.
+  /// Keeps the permission icon (and the slash icon's plan-mode accent) in sync whether
+  /// the mode was set via /plan, the header permission picker, or this composer's menu.
   private func refreshModePill() {
-    setActiveOptionPill(AgentBridgeSelectionStore.selectedWorkMode().isPlanLike ? "Plan" : nil)
+    updatePermissionMenu()
+    updateSlashAccent()
   }
 
-  /// Total height the host should give this view: the pill row plus the inset that
-  /// keeps the pill above the home indicator. Because `self` extends to the screen
-  /// bottom, `safeAreaInsets.bottom` here is exactly the home-indicator height (and
-  /// becomes 0 once the keyboard covers it, so the pill hugs the keyboard).
+  /// Total height the host should give this view.
   var preferredHeight: CGFloat {
-    let pillH = pillHeightForText()
-    return topVPad + pillH + bottomVPad + safeAreaInsets.bottom + paletteReserved
+    topVPad + pillHeightForText() + bottomVPad + safeAreaInsets.bottom
   }
 
-  /// Height the visible palette occupies above the pill (0 when hidden).
-  private var commandPaletteHeight: CGFloat {
-    guard commandPaletteVisible, !filteredCommands.isEmpty else { return 0 }
-    return CGFloat(min(paletteMaxRows, filteredCommands.count)) * paletteRowHeight
+  /// True whenever the composer shows its full two-row layout — text on top, the
+  /// plus/slash/permission row underneath — because it's focused or holds a draft.
+  /// False collapses back to a single compact line with just the placeholder and
+  /// the mic/send control, hiding the three icons entirely.
+  private var isExpanded: Bool {
+    textView.isFirstResponder
+      || !textView.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      || !pendingAttachmentBlobs.isEmpty
   }
-  private var paletteReserved: CGFloat {
-    commandPaletteHeight > 0 ? commandPaletteHeight + paletteGap : 0
-  }
+
+  /// The plus/slash/permission row reserves this much height below the text, but
+  /// only while expanded — collapsing drops the reservation instead of leaving a
+  /// gap.
+  private var bottomRowReserve: CGFloat { bottomRowHeight + bottomRowGap }
 
   private func pillHeightForText() -> CGFloat {
+    guard isExpanded else { return minPillH }
     let measured = measuredTextHeight()
-    let maxTextHeight = max(minPillH - textInsetV * 2, maxPillH - textInsetV * 2 - optionReserve)
-    let clampedTextH = max(minPillH - textInsetV * 2, min(maxTextHeight, measured))
-    return clampedTextH + textInsetV * 2 + optionReserve
+    let minTextH = minPillH - textInsetV * 2
+    let maxTextHeight = max(minTextH, maxPillH - textInsetV * 2 - bottomRowReserve)
+    let clampedTextH = max(minTextH, min(maxTextHeight, measured))
+    return clampedTextH + textInsetV * 2 + bottomRowReserve
   }
 
-  /// Height the text wants for the width it will get at the current morph progress.
+  /// Height the text wants for the full-width row it gets — no side reservations,
+  /// since the icon row now lives underneath the text instead of squeezed in
+  /// beside it (which used to eat into every wrapped line, not just the last one).
   private func measuredTextHeight() -> CGFloat {
     let w = bounds.width > 0 ? bounds.width : (window?.bounds.width ?? UIScreen.main.bounds.width)
-    let clampedSend = max(0, min(1, sendProgress))
-    let pillLeft = pagePadding + sideSize + sideGap // only attach pill outside
-    let pillRightIdle = w - pagePadding - sideSize - sideGap
-    let pillRight = pillRightIdle + (sideSize + sideGap) * clampedSend
-    let sendReserve = (sendButtonSize + 6) * clampedSend
-    let slashReserve = sendButtonSize + 4
-    let textW = max(1, pillRight - pillLeft - textInsetH - slashReserve - textInsetH - sendReserve)
+    let pillW = max(1, w - pagePadding * 2)
+    let textW = max(1, pillW - textInsetH * 2)
     return textView.sizeThatFits(CGSize(width: textW, height: .greatestFiniteMagnitude)).height
   }
 
@@ -3769,7 +3876,7 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
     backgroundColor = .clear
     clipsToBounds = false
 
-    // Keep the plan badge in sync with the work mode chosen anywhere (header
+    // Keep the permission icon in sync with the work mode chosen anywhere (header
     // picker, /plan, etc.).
     modeObserver = NotificationCenter.default.addObserver(
       forName: AgentBridgeSelectionStore.didChangeNotification,
@@ -3778,16 +3885,14 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
     ) { [weak self] _ in
       self?.refreshModePill()
     }
+    // Capture the system's own keyboard timing so the pill's expand/collapse morph can
+    // ride the exact same curve instead of a separately-timed spring (see
+    // `pendingKeyboardAnimation`).
+    NotificationCenter.default.addObserver(
+      self, selector: #selector(handleKeyboardWillChangeFrame(_:)),
+      name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
 
-    // Attach glass pill (left 1)
-    configureGlass(attachGlass)
-    addSubview(attachGlass)
-    configureIconButton(plusButton, systemName: "plus")
-    plusButton.addTarget(self, action: #selector(handlePlus), for: .touchUpInside)
-    plusButton.showsMenuAsPrimaryAction = false
-    attachGlass.contentView.addSubview(plusButton)
-
-    // Text glass pill (center)
+    // One glass pill hosts everything; only its height changes (focus/text driven).
     configureGlass(pillGlass)
     addSubview(pillGlass)
     pillContainer.backgroundColor = .clear
@@ -3795,17 +3900,27 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
     pillContainer.layer.cornerCurve = .continuous
     pillGlass.contentView.addSubview(pillContainer)
 
-    // Slash button (inside text pill, left side)
-    slashButton.setTitle(nil, for: .normal)
-    slashButton.setImage(UIImage(systemName: "slash.circle", withConfiguration: UIImage.SymbolConfiguration(pointSize: 20, weight: .light)), for: .normal)
-    slashButton.tintColor = appearance.text.withAlphaComponent(0.6)
-    slashButton.accessibilityLabel = "Slash commands"
-    slashButton.showsMenuAsPrimaryAction = true
-    pillContainer.addSubview(slashButton)
-    updateSlashMenu()
+    // The bottom row — plus / slash / permission — is its own independent tap
+    // target per icon. Each opens its own menu/picker and is hidden entirely at
+    // rest, appearing only once the composer expands.
+    configureIconButton(plusButton, systemName: "plus")
+    plusButton.addTarget(self, action: #selector(handlePlus), for: .touchUpInside)
+    plusButton.showsMenuAsPrimaryAction = false
+    plusButton.isHidden = true
+    plusButton.alpha = 0
+    pillContainer.addSubview(plusButton)
 
-    configureOptionPill()
-    pillContainer.addSubview(optionPillButton)
+    configureIconButton(slashButton, systemName: "slash.circle")
+    slashButton.showsMenuAsPrimaryAction = true
+    slashButton.isHidden = true
+    slashButton.alpha = 0
+    pillContainer.addSubview(slashButton)
+    updateSlashAccent()
+
+    configurePermissionButton()
+    permissionButton.isHidden = true
+    permissionButton.alpha = 0
+    pillContainer.addSubview(permissionButton)
 
     placeholderLabel.text = placeholder
     placeholderLabel.font = UIFont.systemFont(ofSize: 17)
@@ -3829,29 +3944,11 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
     sendButton.isHidden = true
     pillContainer.addSubview(sendButton)
 
-    // Mic glass pill (right)
-    configureGlass(micGlass)
-    addSubview(micGlass)
     configureIconButton(micButton, systemName: "mic")
     micButton.setPreferredSymbolConfiguration(
       UIImage.SymbolConfiguration(pointSize: 15, weight: .medium), forImageIn: .normal)
     micButton.addTarget(self, action: #selector(handleMic), for: .touchUpInside)
-    micGlass.contentView.addSubview(micButton)
-
-    // `/` command palette (hidden until a slash query is typed).
-    configureGlass(commandPaletteBlur)
-    commandPaletteBlur.isHidden = true
-    commandPaletteBlur.clipsToBounds = true
-    addSubview(commandPaletteBlur)
-    commandTable.backgroundColor = .clear
-    commandTable.dataSource = self
-    commandTable.delegate = self
-    commandTable.rowHeight = paletteRowHeight
-    commandTable.separatorStyle = .none
-    commandTable.keyboardDismissMode = .none
-    commandTable.showsVerticalScrollIndicator = true
-    commandTable.register(UITableViewCell.self, forCellReuseIdentifier: "vibeCmd")
-    commandPaletteBlur.contentView.addSubview(commandTable)
+    pillContainer.addSubview(micButton)
 
     applyAppearance(.fallback)
     updateCommandMenu()
@@ -3878,35 +3975,57 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
     button.tintColor = appearance.text.withAlphaComponent(0.6)
   }
 
-  private func configureOptionPill() {
-    var config = UIButton.Configuration.filled()
-    config.cornerStyle = .capsule
-    config.baseBackgroundColor = UIColor.white.withAlphaComponent(0.12)
-    config.baseForegroundColor = appearance.text
-    config.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 10, bottom: 4, trailing: 10)
-    config.image = UIImage(systemName: "checklist")
-    config.imagePlacement = .leading
-    config.imagePadding = 5
-    optionPillButton.configuration = config
-    optionPillButton.titleLabel?.font = UIFont.systemFont(ofSize: 12.5, weight: .semibold)
-    optionPillButton.isHidden = true
-    optionPillButton.isUserInteractionEnabled = false
+  /// Permission is a single icon (no label) that swaps per the active work mode and
+  /// opens its own menu — it never grows or resizes the composer. Its color (not just
+  /// its glyph) carries the mode so it reads at a glance without needing a text label.
+  private func configurePermissionButton() {
+    configureIconButton(permissionButton, systemName: AgentBridgeSelectionStore.selectedWorkMode().icon)
+    permissionButton.showsMenuAsPrimaryAction = true
+    updatePermissionMenu()
   }
 
-  private func setActiveOptionPill(_ title: String?) {
-    let normalized = title?.trimmingCharacters(in: .whitespacesAndNewlines)
-    activeOptionTitle = normalized?.isEmpty == false ? normalized : nil
-    optionPillButton.isHidden = activeOptionTitle == nil
-    if var config = optionPillButton.configuration {
-      config.title = activeOptionTitle
-      config.baseBackgroundColor = appearance.isDark
-        ? UIColor.white.withAlphaComponent(0.13)
-        : UIColor.black.withAlphaComponent(0.08)
-      config.baseForegroundColor = appearance.text
-      optionPillButton.configuration = config
+  /// One color per work mode — roughly risk-ordered (green = read-only, red = full
+  /// access) so plan/ask/auto/full are visually distinguishable at a glance.
+  private static func color(for mode: AgentBridgeWorkMode) -> UIColor {
+    switch mode {
+    case .plan: return .systemBlue
+    case .readOnly: return .systemGreen
+    case .ask: return .systemOrange
+    case .askAuto: return .systemTeal
+    case .allowEdits: return .systemPurple
+    case .fullAccess: return .systemRed
     }
-    onHeightChanged?(preferredHeight)
-    setNeedsLayout()
+  }
+
+  private func updatePermissionMenu() {
+    let currentMode = AgentBridgeSelectionStore.selectedWorkMode()
+    configureIconButton(permissionButton, systemName: currentMode.icon)
+    permissionButton.tintColor = Self.color(for: currentMode)
+    permissionButton.accessibilityLabel = "Permission: \(currentMode.title)"
+    let permissionChildren = AgentBridgeWorkMode.allCases.map { mode in
+      UIAction(
+        title: mode.title,
+        subtitle: mode.subtitle,
+        image: UIImage(systemName: mode.icon)?.withTintColor(Self.color(for: mode), renderingMode: .alwaysOriginal),
+        state: mode == currentMode ? .on : .off
+      ) { _ in
+        AgentBridgeSelectionStore.setWorkMode(mode)
+      }
+    }
+    permissionButton.menu = UIMenu(
+      title: "Permission",
+      subtitle: currentMode.title,
+      image: UIImage(systemName: "hand.raised"),
+      children: permissionChildren)
+  }
+
+  /// The slash icon picks up the plan-mode blue too — a persistent cue that plan mode
+  /// is engaged, independent of the momentary "Plan mode" toast shown when `/plan` runs.
+  private func updateSlashAccent() {
+    slashButton.tintColor =
+      AgentBridgeSelectionStore.selectedWorkMode() == .plan
+      ? .systemBlue
+      : appearance.text.withAlphaComponent(0.6)
   }
 
   func applyAppearance(_ appearance: VibeAgentKitChatAppearance) {
@@ -3916,16 +4035,12 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
     textView.tintColor = appearance.text
     placeholderLabel.textColor = appearance.textTertiary
     plusButton.tintColor = appearance.text.withAlphaComponent(0.6)
-    slashButton.tintColor = appearance.text.withAlphaComponent(0.6)
-    optionPillButton.tintColor = appearance.text
-    setActiveOptionPill(activeOptionTitle)
+    updateSlashAccent()
+    updatePermissionMenu()
     micButton.tintColor = isDictating ? .systemRed : appearance.text.withAlphaComponent(0.6)
-    sendButton.backgroundColor = appearance.text
     applySendButtonGlyph()
     updateAttachmentIndicator()
     updateSendState()
-    commandTable.indicatorStyle = appearance.isDark ? .white : .black
-    if !filteredCommands.isEmpty { commandTable.reloadData() }
     setNeedsLayout()
   }
 
@@ -3936,101 +4051,85 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
     let w = bounds.width
     guard w > 0 else { return }
 
-    let clampedSend = max(0, min(1, sendProgress))
-    let micVisibility = 1 - clampedSend
+    let expanded = isExpanded
+    // While a task is running, STOP must stay reachable even if the composer is
+    // collapsed/unfocused — so its collapsed layout reserves room for it too.
+    let stopReserve: CGFloat = (!expanded && isTaskActive) ? sendButtonSize + 10 : 0
 
     let leftEdge = pagePadding
     let rightEdge = w - pagePadding
+    let pillW = max(1, rightEdge - leftEdge)
 
-    let attachCenterX = leftEdge + sideSize / 2
-    let pillLeft = attachCenterX + sideSize / 2 + sideGap
-    let pillRightIdle = rightEdge - sideSize - sideGap
-    // As send appears the mic leaves, so the text pill extends to the page edge.
-    let pillRight = pillRightIdle + (sideSize + sideGap) * clampedSend
-    let pillW = max(1, pillRight - pillLeft)
-
-    let sendReserve = (sendButtonSize + 6) * clampedSend
-    let slashReserve = sendButtonSize + 4
-    let textW = max(1, pillW - textInsetH - slashReserve - textInsetH - sendReserve)
+    // Text always gets the full width — the icon row lives underneath it instead
+    // of squeezed in beside it, so nothing eats into the text on any wrapped line.
+    let textW = max(1, pillW - textInsetH * 2)
     let measured = textView.sizeThatFits(CGSize(width: textW, height: .greatestFiniteMagnitude)).height
-    let maxTextHeight = max(minPillH - textInsetV * 2, maxPillH - textInsetV * 2 - optionReserve)
-    let clampedTextH = max(minPillH - textInsetV * 2, min(maxTextHeight, measured))
-    textView.isScrollEnabled = measured > maxTextHeight
-    let pillH = clampedTextH + textInsetV * 2 + optionReserve
+    let minTextH = minPillH - textInsetV * 2
+    let maxTextHeight = max(minTextH, maxPillH - textInsetV * 2 - bottomRowReserve)
+    let clampedTextH = expanded ? max(minTextH, min(maxTextHeight, measured)) : minTextH
+    textView.isScrollEnabled = expanded && measured > maxTextHeight
+    let pillH = expanded ? clampedTextH + textInsetV * 2 + bottomRowReserve : minPillH
 
-    // The palette (when open) sits in the reserved space at the TOP of the (grown)
-    // composer; the pill row is pushed down so it still hugs the keyboard at the bottom.
-    let rowTop = topVPad + paletteReserved
     let cornerR = min(pillH / 2, 22)
-
-    pillGlass.frame = CGRect(x: pillLeft, y: rowTop, width: pillW, height: pillH)
+    pillGlass.frame = CGRect(x: leftEdge, y: topVPad, width: pillW, height: pillH)
     pillContainer.frame = pillGlass.bounds
     pillContainer.layer.cornerRadius = cornerR
 
-    // Bottom-align the side buttons so they stay beside the send button as the text grows.
-    let controlInset = max(0, (minPillH - sideSize) / 2)
-    let btnCenterY = rowTop + pillH - sideSize / 2 - controlInset
     let squareBounds = CGRect(origin: .zero, size: CGSize(width: sideSize, height: sideSize))
+    let bottomIconBounds = CGRect(origin: .zero, size: CGSize(width: bottomIconSize, height: bottomIconSize))
+    let sendSize = CGSize(width: sendButtonSize, height: sendButtonSize)
 
-    attachGlass.bounds = squareBounds
-    attachGlass.center = CGPoint(x: attachCenterX, y: btnCenterY)
-    plusButton.frame = attachGlass.contentView.bounds
+    if expanded {
+      // Row 1: the text spans the full width, top-aligned.
+      textView.frame = CGRect(x: textInsetH, y: textInsetV, width: textW, height: clampedTextH)
+      placeholderLabel.frame = CGRect(x: textInsetH + 2, y: textInsetV, width: textW - 4, height: clampedTextH)
 
-    let micCenterX = rightEdge - sideSize / 2 + (sideSize + sideGap * 2) * clampedSend
-    micGlass.bounds = squareBounds
-    micGlass.center = CGPoint(x: micCenterX, y: btnCenterY)
-    micGlass.alpha = micVisibility
-    micButton.frame = micGlass.contentView.bounds
+      // Row 2: plus / slash / permission on the left (each padded from the edge and
+      // from one another), mic + send together on the right — each its own tap
+      // target with its own menu; none of them resize the pill.
+      let rowCenterY = pillH - bottomRowHeight / 2
+      var x = textInsetH
+      for button in [plusButton, slashButton, permissionButton] {
+        button.bounds = bottomIconBounds
+        button.center = CGPoint(x: x + bottomIconSize / 2, y: rowCenterY)
+        x += bottomIconSize + bottomRowGap
+      }
 
-    let sendInset = max(4, (minPillH - sendButtonSize) / 2)
-    slashButton.bounds = CGRect(origin: .zero, size: CGSize(width: sendButtonSize, height: sendButtonSize))
-    slashButton.center = CGPoint(x: textInsetH - 4 + sendButtonSize / 2, y: pillH - sendButtonSize / 2 - sendInset)
-    slashButton.layer.cornerRadius = sendButtonSize / 2
+      // Send sits statically next to mic once expanded — no separate "entrance" morph
+      // when text starts/stops being empty, only an enabled/disabled dim (`updateSendState`).
+      let sendReserve = sendButtonSize + 6
+      micButton.bounds = bottomIconBounds
+      micButton.center = CGPoint(x: pillW - textInsetH - bottomIconSize / 2 - sendReserve, y: rowCenterY)
 
-    let tfX = textInsetH + slashReserve
-    if let activeOptionTitle {
-      let pillWLimit = max(80, pillW - tfX - sendReserve - 8)
-      let pillSize = optionPillButton.sizeThatFits(
-        CGSize(width: pillWLimit, height: optionPillHeight))
-      optionPillButton.frame = CGRect(
-        x: tfX,
-        y: 8,
-        width: min(pillWLimit, max(72, pillSize.width)),
-        height: optionPillHeight)
-      optionPillButton.isHidden = false
-      optionPillButton.accessibilityLabel = activeOptionTitle
+      sendButton.bounds = CGRect(origin: .zero, size: sendSize)
+      sendButton.center = CGPoint(x: pillW - textInsetH - sendButtonSize / 2, y: rowCenterY)
     } else {
-      optionPillButton.isHidden = true
-      optionPillButton.frame = .zero
-    }
-    let tfY = activeOptionTitle == nil ? (pillH - clampedTextH) / 2 : textInsetV + optionReserve
-    textView.frame = CGRect(x: tfX, y: tfY, width: textW, height: clampedTextH)
-    placeholderLabel.frame = CGRect(
-      x: tfX + 2, y: tfY, width: max(1, pillW - tfX - 4 - sendReserve), height: clampedTextH)
+      // Collapsed: one line — placeholder on the left, mic (+ STOP, if a task is
+      // running) on the right.
+      let centerY = pillH / 2
+      let textRight = pillW - sideSize - stopReserve
+      textView.frame = CGRect(x: textInsetH, y: centerY - minTextH / 2, width: max(1, textRight - textInsetH), height: minTextH)
+      placeholderLabel.frame = textView.frame
 
-    sendButton.bounds = CGRect(origin: .zero, size: CGSize(width: sendButtonSize, height: sendButtonSize))
-    sendButton.center = CGPoint(
-      x: pillW - 4 - sendButtonSize / 2, y: pillH - sendButtonSize / 2 - sendInset)
+      micButton.bounds = squareBounds
+      micButton.center = CGPoint(x: pillW - sideSize / 2 - stopReserve, y: centerY)
+
+      sendButton.bounds = CGRect(origin: .zero, size: sendSize)
+      sendButton.center = CGPoint(x: pillW - 8 - sendButtonSize / 2, y: centerY)
+    }
     sendButton.layer.cornerRadius = sendButtonSize / 2
-
-    if commandPaletteHeight > 0 {
-      commandPaletteBlur.frame = CGRect(x: pillLeft, y: topVPad, width: pillW, height: commandPaletteHeight)
-      commandTable.frame = commandPaletteBlur.contentView.bounds
-    }
 
     CATransaction.begin()
     CATransaction.setDisableActions(true)
-    attachGlass.cornerConfiguration = .capsule()
-    micGlass.cornerConfiguration = .capsule()
     pillGlass.cornerConfiguration = .uniformCorners(radius: .fixed(cornerR))
-    commandPaletteBlur.cornerConfiguration = .uniformCorners(radius: .fixed(18))
     CATransaction.commit()
 
-    barHeight = topVPad + pillH + bottomVPad + safeAreaInsets.bottom + paletteReserved
+    barHeight = topVPad + pillH + bottomVPad + safeAreaInsets.bottom
 
-    pillContainer.bringSubviewToFront(slashButton)
     pillContainer.bringSubviewToFront(sendButton)
     pillContainer.bringSubviewToFront(plusButton)
+    pillContainer.bringSubviewToFront(slashButton)
+    pillContainer.bringSubviewToFront(permissionButton)
   }
 
   public override func safeAreaInsetsDidChange() {
@@ -4047,8 +4146,7 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
     textView.text = text
     placeholderLabel.isHidden = !text.isEmpty
     updateSendState(animated: false)
-    onHeightChanged?(preferredHeight)
-    setNeedsLayout()
+    updateExpansionState(animated: false)
     textView.becomeFirstResponder()
   }
 
@@ -4067,10 +4165,9 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
       textView.text = ""
       placeholderLabel.isHidden = false
       updateSendState(animated: true)
-      onHeightChanged?(preferredHeight)
+      updateExpansionState(animated: true)
       if localCommand == "/plan" {
         AgentBridgeSelectionStore.setWorkMode(.plan)
-        setActiveOptionPill("Plan")
       }
       onCommand?(localCommand)
       return
@@ -4082,71 +4179,47 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
     textView.text = ""
     placeholderLabel.isHidden = false
     updateSendState(animated: true)
-    onHeightChanged?(preferredHeight)
+    updateExpansionState(animated: true)
     onSend?(body, options)
   }
 
   /// Host-driven: flip the trailing control between SEND (idle) and STOP (a bridge task
-  /// is running). When active the button is forced visible, swaps to a stop glyph, and
-  /// `handleSend` routes to `onStop`.
+  /// is running). When active the button is forced visible even while collapsed, swaps
+  /// to a stop glyph, and `handleSend` routes to `onStop`.
   func setTaskActive(_ active: Bool) {
     guard isTaskActive != active else { return }
     isTaskActive = active
     applySendButtonGlyph()
     updateSendState(animated: true)
+    updateExpansionState(animated: true)
   }
 
-  /// The trailing button shows a stop square while a task runs, otherwise the send
-  /// arrow. Both ride the same filled circle (background = `appearance.text`).
+  /// The trailing button shows a stop square while a task runs, otherwise a plain send
+  /// arrow. Both ride the same filled circle (background dims via `updateSendState`).
   private func applySendButtonGlyph() {
-    if isTaskActive {
-      sendButton.setImage(
-        UIImage(systemName: "stop.fill")?.withRenderingMode(.alwaysTemplate), for: .normal)
-      sendButton.tintColor = appearance.background
-    } else {
-      sendButton.setImage(
-        VibeAgentKitChatVectorIcon.image(.send, color: appearance.background, size: 15),
-        for: .normal)
-      sendButton.tintColor = appearance.background
-    }
+    let systemName = isTaskActive ? "stop.fill" : "arrow.up"
+    let weight: UIImage.SymbolWeight = isTaskActive ? .regular : .bold
+    sendButton.setImage(
+      UIImage(systemName: systemName, withConfiguration: UIImage.SymbolConfiguration(pointSize: 15, weight: weight))?
+        .withRenderingMode(.alwaysTemplate),
+      for: .normal)
+    sendButton.tintColor = appearance.background
   }
 
-  /// Morph the trailing control: mic slides out and the send button fades/scales in
-  /// (and back) as the text goes non-empty / empty. One spring keeps it continuous.
+  /// Send no longer has its own "entrance" animation — it sits statically next to mic
+  /// whenever the composer is expanded (or a task is active), per `updateExpansionState`.
+  /// This only owns the enabled/disabled dim so typing doesn't need a slide-in morph.
   private func updateSendState(animated: Bool = false) {
     let hasText = !textView.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     let hasAttachments = !pendingAttachmentBlobs.isEmpty
-    // A running task forces the STOP button on regardless of text; otherwise the send
-    // button appears when there's text or staged images to send.
-    let showsTrailingButton = isTaskActive || hasText || hasAttachments
-    sendButton.isEnabled = isTaskActive || ((hasText || hasAttachments) && onSend != nil)
-    let target: CGFloat = showsTrailingButton ? 1 : 0
-    guard abs(sendProgress - target) > 0.01 else {
-      sendButton.isHidden = target < 0.01
-      sendButton.alpha = target
-      return
-    }
+    let canSend = isTaskActive || ((hasText || hasAttachments) && onSend != nil)
+    sendButton.isEnabled = canSend
+    let dimmedColor = appearance.text.withAlphaComponent(canSend ? 1.0 : 0.35)
+    let apply = { self.sendButton.backgroundColor = dimmedColor }
     if animated {
-      sendButton.isHidden = false
-      UIView.animate(
-        withDuration: 0.32,
-        delay: 0,
-        usingSpringWithDamping: 0.86,
-        initialSpringVelocity: 0,
-        options: [.beginFromCurrentState, .allowUserInteraction]
-      ) {
-        self.sendProgress = target
-        self.sendButton.alpha = target
-        self.setNeedsLayout()
-        self.layoutIfNeeded()
-      } completion: { _ in
-        self.sendButton.isHidden = target < 0.01
-      }
+      UIView.animate(withDuration: 0.2, delay: 0, options: [.beginFromCurrentState, .allowUserInteraction], animations: apply)
     } else {
-      sendProgress = target
-      sendButton.isHidden = target < 0.01
-      sendButton.alpha = target
-      setNeedsLayout()
+      apply()
     }
   }
 
@@ -4209,6 +4282,7 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
     pendingAttachmentBlobs.append(blob)
     updateAttachmentIndicator()
     updateSendState(animated: true)
+    updateExpansionState(animated: true)
   }
 
   /// Hand the staged blobs to the caller and clear them (called at send time).
@@ -4217,6 +4291,7 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
     pendingAttachmentBlobs.removeAll()
     updateAttachmentIndicator()
     updateSendState(animated: true)
+    updateExpansionState(animated: true)
     return blobs
   }
 
@@ -4227,7 +4302,7 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
         systemName: count > 0 ? "photo.badge.plus.fill" : "plus",
         withConfiguration: UIImage.SymbolConfiguration(pointSize: 15, weight: .regular)),
       for: .normal)
-    plusButton.tintColor = count > 0 ? .systemBlue : appearance.text
+    plusButton.tintColor = count > 0 ? .systemBlue : appearance.text.withAlphaComponent(0.6)
     plusButton.accessibilityValue = count > 0 ? "\(count) image(s) attached" : nil
   }
 
@@ -4324,20 +4399,98 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
         systemName: isDictating ? "mic.fill" : "mic",
         withConfiguration: UIImage.SymbolConfiguration(pointSize: 15, weight: .medium)),
       for: .normal)
-    micButton.tintColor = isDictating ? .systemRed : appearance.text
+    micButton.tintColor = isDictating ? .systemRed : appearance.text.withAlphaComponent(0.6)
   }
 
   // MARK: - UITextViewDelegate
 
   public func textViewDidChange(_ textView: UITextView) {
     placeholderLabel.isHidden = !textView.text.isEmpty
-    updateCommandPalette()
     updateSendState(animated: true)
-    onHeightChanged?(preferredHeight)
-    setNeedsLayout()
+    updateExpansionState(animated: true)
   }
 
-  // MARK: - `/` command palette
+  public func textViewDidBeginEditing(_ textView: UITextView) {
+    updateExpansionState(animated: true)
+  }
+
+  public func textViewDidEndEditing(_ textView: UITextView) {
+    updateExpansionState(animated: true)
+  }
+
+  /// Captures the system's keyboard timing so the very next expand/collapse can reuse
+  /// it instead of a hand-picked spring (see `pendingKeyboardAnimation`).
+  @objc private func handleKeyboardWillChangeFrame(_ note: Notification) {
+    guard let info = note.userInfo,
+      let duration = (info[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?.doubleValue,
+      duration > 0,
+      let curveRaw = (info[UIResponder.keyboardAnimationCurveUserInfoKey] as? NSNumber)?.uintValue
+    else { return }
+    pendingKeyboardAnimation = (duration, UIView.AnimationOptions(rawValue: curveRaw << 16))
+  }
+
+  /// Cross-fades the plus/slash/permission row (visible while `isExpanded`) and the
+  /// trailing send/stop control (visible while expanded OR a task is running), and
+  /// resizes the pill to match — all in ONE animation. `onHeightChanged` fires from
+  /// INSIDE that animation's closure (not before it starts) so the host's height
+  /// constraint and this view's own icon/frame changes share a single Core Animation
+  /// transaction; layering a second, differently-timed animation on top of the first
+  /// is what caused the visible "jump" between the pill and the keyboard. When the
+  /// change is keyboard-driven, `pendingKeyboardAnimation` supplies the exact system
+  /// curve so the morph rides the same timeline as the keyboard itself.
+  private func updateExpansionState(animated: Bool) {
+    let expanded = isExpanded
+    let sendVisible = isTaskActive || expanded
+    guard expanded != lastExpandedState || sendVisible != lastSendVisible else { return }
+    lastExpandedState = expanded
+    lastSendVisible = sendVisible
+    if expanded {
+      plusButton.isHidden = false
+      slashButton.isHidden = false
+      permissionButton.isHidden = false
+    }
+    if sendVisible {
+      sendButton.isHidden = false
+    }
+    let newHeight = preferredHeight
+    let apply = {
+      self.onHeightChanged?(newHeight)
+      self.plusButton.alpha = expanded ? 1 : 0
+      self.slashButton.alpha = expanded ? 1 : 0
+      self.permissionButton.alpha = expanded ? 1 : 0
+      self.sendButton.alpha = sendVisible ? 1 : 0
+      self.setNeedsLayout()
+      self.layoutIfNeeded()
+    }
+    let finish: (Bool) -> Void = { _ in
+      if !expanded {
+        self.plusButton.isHidden = true
+        self.slashButton.isHidden = true
+        self.permissionButton.isHidden = true
+      }
+      if !sendVisible {
+        self.sendButton.isHidden = true
+      }
+    }
+    guard animated else {
+      apply()
+      finish(true)
+      return
+    }
+    if let kb = pendingKeyboardAnimation {
+      pendingKeyboardAnimation = nil
+      UIView.animate(
+        withDuration: kb.duration, delay: 0,
+        options: kb.options.union([.beginFromCurrentState, .allowUserInteraction]),
+        animations: apply, completion: finish)
+    } else {
+      UIView.animate(
+        withDuration: 0.4, delay: 0, usingSpringWithDamping: 0.86, initialSpringVelocity: 0,
+        options: [.beginFromCurrentState, .allowUserInteraction], animations: apply, completion: finish)
+    }
+  }
+
+  // MARK: - `/` commands
 
   private var allCommands: [VibeAgentSlashCommand] {
     Self.defaultCommands + providerSlashCommands + providerCliCommands
@@ -4376,49 +4529,20 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
       return VibeAgentSlashCommand(name: n, subtitle: subtitle(n, isCli: true), kind: .cli, takesArgs: true)
     }
     updateSlashMenu()
-    if commandPaletteVisible { updateCommandPalette() }
-  }
-
-  /// Programmatically open the palette (from the "+" menu's "Slash commands" item).
-  func openCommandPalette() {
-    textView.text = "/"
-    placeholderLabel.isHidden = true
-    textView.becomeFirstResponder()
-    textViewDidChange(textView)
-  }
-
-  private func updateCommandPalette() {
-    // The slash command list is now the native UIMenu on the "/" button (expands in place
-    // like the +/model/repo pickers) — the custom drop-up table is retired so typing "/"
-    // no longer pops a separate overlay sheet.
-    setCommandPaletteVisible(false)
-  }
-
-  private func setCommandPaletteVisible(_ visible: Bool) {
-    if commandPaletteVisible == visible {
-      if visible { onHeightChanged?(preferredHeight); setNeedsLayout() }
-      return
-    }
-    commandPaletteVisible = visible
-    commandPaletteBlur.isHidden = !visible
-    onHeightChanged?(preferredHeight)
-    setNeedsLayout()
   }
 
   private func applyCommandSelection(_ cmd: VibeAgentSlashCommand) {
     if cmd.takesArgs {
-      // Let the user add arguments — insert and keep editing (palette hides on the space).
+      // Let the user add arguments — insert and keep editing.
       textView.text = cmd.display + " "
       placeholderLabel.isHidden = true
-      setCommandPaletteVisible(false)
       updateSendState(animated: true)
-      onHeightChanged?(preferredHeight)
+      updateExpansionState(animated: true)
       textView.becomeFirstResponder()
     } else {
       // No args → run immediately. handleSend() routes run-options locally and every
       // other command to the bridge for real output.
       textView.text = cmd.display
-      setCommandPaletteVisible(false)
       handleSend()
     }
   }
@@ -4439,38 +4563,6 @@ public final class VibeComposerView: UIView, UITextViewDelegate, UITableViewData
     case "mcp": return "server.rack"
     default: return cmd.kind == .cli ? "terminal" : "slash.circle"
     }
-  }
-
-  public func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-    filteredCommands.count
-  }
-
-  public func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
-    let cell = tableView.dequeueReusableCell(withIdentifier: "vibeCmd", for: indexPath)
-    guard indexPath.row < filteredCommands.count else { return cell }
-    let cmd = filteredCommands[indexPath.row]
-    cell.backgroundColor = .clear
-    var content = cell.defaultContentConfiguration()
-    content.text = cmd.display
-    content.secondaryText = cmd.subtitle
-    content.textProperties.color = appearance.text
-    content.textProperties.font = .systemFont(ofSize: 16, weight: .medium)
-    content.secondaryTextProperties.color = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.9)
-    content.secondaryTextProperties.font = .systemFont(ofSize: 12)
-    content.image = UIImage(systemName: paletteIcon(cmd))
-    content.imageProperties.tintColor = appearance.text
-    content.imageProperties.preferredSymbolConfiguration = UIImage.SymbolConfiguration(pointSize: 15, weight: .regular)
-    cell.contentConfiguration = content
-    let sel = UIView()
-    sel.backgroundColor = vibeAgentKitColorWithAlpha(appearance.text, 0.08)
-    cell.selectedBackgroundView = sel
-    return cell
-  }
-
-  public func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
-    tableView.deselectRow(at: indexPath, animated: false)
-    guard indexPath.row < filteredCommands.count else { return }
-    applyCommandSelection(filteredCommands[indexPath.row])
   }
 }
 
@@ -4714,6 +4806,10 @@ final class VibeAgentSubagentDetailViewController: UIViewController {
 final class VibeAgentAskSheetViewController: UIViewController {
   /// (decision, answer). decision ∈ "approve" | "reject" | "answer".
   var onResolve: ((String, [String: Any]?) -> Void)?
+  /// Fired when the sheet is dismissed WITHOUT a decision (user swiped it away). Lets
+  /// the presenter release its presentation claim so a still-pending ask re-shows when
+  /// the chat is reopened (the bridge re-emits it on history open).
+  var onDismissWithoutResolve: (() -> Void)?
 
   private let kind: String
   private let request: [String: Any]
@@ -5244,6 +5340,14 @@ final class VibeAgentAskSheetViewController: UIViewController {
     didResolve = true
     onResolve?(decision, answer)
     dismiss(animated: true)
+  }
+
+  override func viewDidDisappear(_ animated: Bool) {
+    super.viewDidDisappear(animated)
+    // Swiped away without answering → let the presenter re-arm this ask for reopen.
+    if !didResolve, isBeingDismissed || isMovingFromParent {
+      onDismissWithoutResolve?()
+    }
   }
 }
 

@@ -408,6 +408,13 @@ struct ChatListRow {
   let stickerPackId: String?
   let stickerBundleFileName: String?
 
+  // Stamped post-parse from ChatListView.isGroupOrChannel (not part of the raw row
+  // payload — no per-row group data exists yet). Lets the agent-turn renderer pick
+  // bubble vs full-page-only without threading a new parameter through every
+  // measurement/layout call site; defaults false so it's a no-op until a route
+  // actually sets a bridge-agent DM's isGroupOrChannel (none does today).
+  var isGroupOrChannel: Bool = false
+
   // Agent message fields
   let isAgentMessage: Bool
   let agentName: String?

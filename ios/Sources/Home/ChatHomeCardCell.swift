@@ -187,6 +187,8 @@ final class ChatHomeCardCell: UITableViewCell {
 
     titleLabel.text = row.title
     titleLabel.textColor = primary
+    rowContentContainer.isHidden = false
+    rowContentContainer.alpha = 1.0
     tierBadgeImageView.isHidden = !row.isGoldTier
     if row.isGoldTier {
       let goldColor = UIColor(red: 255 / 255, green: 205 / 255, blue: 84 / 255, alpha: 1)
@@ -717,10 +719,15 @@ final class ChatHomeCardCell: UITableViewCell {
 
   @objc private func handleSwipeActionButtonTap(_ sender: ChatHomeSwipeActionButton) {
     guard let row = currentRow, let spec = sender.spec else { return }
-    closeSwipe(animated: true, notifyDelegate: false)
-    DispatchQueue.main.async { [weak self] in
-      guard let self else { return }
-      self.swipeDelegate?.homeCardCell(self, didTriggerSwipeEvent: spec.eventType, chatId: row.chatId)
+    
+    if spec.eventType == "swipeDelete" {
+      performDeleteAnimation(spec: spec, row: row)
+    } else {
+      closeSwipe(animated: true, notifyDelegate: false)
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
+        self.swipeDelegate?.homeCardCell(self, didTriggerSwipeEvent: spec.eventType, chatId: row.chatId)
+      }
     }
   }
 
@@ -835,6 +842,11 @@ final class ChatHomeCardCell: UITableViewCell {
       largeSwipeHapticGenerator.impactOccurred(intensity: 0.92)
     }
 
+    if spec.eventType == "swipeDelete" {
+      performDeleteAnimation(spec: spec, row: row)
+      return
+    }
+
     let accentOffset = edge == .leading
       ? min(bounds.width * 0.28, leadingOpenWidth + 26)
       : -min(bounds.width * 0.28, trailingOpenWidth + 26)
@@ -849,6 +861,89 @@ final class ChatHomeCardCell: UITableViewCell {
       self.isPerformingSwipeAction = false
       self.didEmitLargeSwipeHaptic = false
     }
+  }
+
+  private func performDeleteAnimation(spec: ChatHomeSwipeActionSpec, row: ChatHomeListRow) {
+    swipePanGestureRecognizer.isEnabled = false
+
+    guard let snapshot = rowContentContainer.snapshotView(afterScreenUpdates: false) else {
+      notifySwipeEventAndClose(spec: spec, row: row)
+      return
+    }
+
+    snapshot.frame = rowContentContainer.frame
+    contentView.addSubview(snapshot)
+    rowContentContainer.isHidden = true
+    leadingActionsContainer.isHidden = true
+    trailingActionsContainer.isHidden = true
+
+    let emitter = CAEmitterLayer()
+    emitter.emitterPosition = CGPoint(x: bounds.midX, y: bounds.midY)
+    emitter.emitterSize = bounds.size
+    emitter.emitterShape = .rectangle
+
+    let cell = CAEmitterCell()
+    cell.contents = createParticleImage()?.cgImage
+    cell.birthRate = 1800
+    cell.lifetime = 0.8
+    cell.velocity = 180
+    cell.velocityRange = 100
+    cell.emissionRange = .pi * 2
+    cell.scale = 0.8
+    cell.scaleRange = 0.4
+    cell.scaleSpeed = -0.6
+    cell.alphaSpeed = -1.2
+    cell.yAcceleration = 400
+
+    emitter.emitterCells = [cell]
+    contentView.layer.addSublayer(emitter)
+
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+      emitter.birthRate = 0
+    }
+
+    var transform = CATransform3DIdentity
+    transform.m34 = -1.0 / 600.0
+    transform = CATransform3DTranslate(transform, 0, 50, -150)
+    transform = CATransform3DRotate(transform, -.pi / 3, 1, 0, 0)
+    transform = CATransform3DScale(transform, 0.1, 0.1, 0.1)
+
+    UIView.animate(withDuration: 0.45, delay: 0, options: .curveEaseIn, animations: {
+      snapshot.layer.transform = transform
+      snapshot.alpha = 0
+      self.selectionOverlayView.alpha = 0
+      self.dividerView.alpha = 0
+      self.backgroundColor = .clear
+      self.contentView.backgroundColor = .clear
+    }) { _ in
+      snapshot.removeFromSuperview()
+      emitter.removeFromSuperlayer()
+      self.rowContentContainer.isHidden = false
+      self.rowContentContainer.alpha = 0 // Hide until reused
+      self.notifySwipeEventAndClose(spec: spec, row: row)
+    }
+  }
+
+  private func notifySwipeEventAndClose(spec: ChatHomeSwipeActionSpec, row: ChatHomeListRow) {
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      self.swipeDelegate?.homeCardCell(self, didTriggerSwipeEvent: spec.eventType, chatId: row.chatId)
+      self.closeSwipe(animated: false, notifyDelegate: false)
+      self.swipePanGestureRecognizer.isEnabled = self.isSwipeEnabled
+      self.isPerformingSwipeAction = false
+      self.didEmitLargeSwipeHaptic = false
+    }
+  }
+
+  private func createParticleImage() -> UIImage? {
+    let size = CGSize(width: 8, height: 8)
+    UIGraphicsBeginImageContextWithOptions(size, false, 0)
+    guard let context = UIGraphicsGetCurrentContext() else { return nil }
+    context.setFillColor(UIColor.systemGray.withAlphaComponent(0.8).cgColor)
+    context.fillEllipse(in: CGRect(origin: .zero, size: size))
+    let image = UIGraphicsGetImageFromCurrentImageContext()
+    UIGraphicsEndImageContext()
+    return image
   }
 
   private func triggerFullSwipe(
@@ -1155,7 +1250,7 @@ private final class ChatHomeSwipeActionButton: UIButton {
     self.edge = edge
     currentRevealWidth = 0
     currentExpansionProgress = 0
-    backgroundColor = spec.backgroundColor
+    backgroundColor = .clear
     tileView.configure(spec: spec, edge: edge)
     setNeedsLayout()
   }
@@ -1169,6 +1264,7 @@ private final class ChatHomeSwipeActionButton: UIButton {
 }
 
 private final class ChatHomeSwipeActionTileView: UIView {
+  private let blurView = UIVisualEffectView(effect: nil)
   private let stackView = UIStackView()
   private let iconView = UIImageView()
   private let titleLabel = UILabel()
@@ -1184,6 +1280,16 @@ private final class ChatHomeSwipeActionTileView: UIView {
     isUserInteractionEnabled = false
     clipsToBounds = true
     layer.cornerRadius = 0
+
+    if #available(iOS 26.0, *) {
+      let glass = UIGlassEffect()
+      glass.isInteractive = true
+      blurView.effect = glass
+    } else {
+      blurView.effect = UIBlurEffect(style: .systemThinMaterial)
+    }
+    blurView.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(blurView)
 
     iconView.contentMode = .scaleAspectFit
     iconView.translatesAutoresizingMaskIntoConstraints = false
@@ -1226,6 +1332,10 @@ private final class ChatHomeSwipeActionTileView: UIView {
     stackTrailingConstraint.priority = .defaultHigh
 
     NSLayoutConstraint.activate([
+      blurView.leadingAnchor.constraint(equalTo: leadingAnchor),
+      blurView.trailingAnchor.constraint(equalTo: trailingAnchor),
+      blurView.topAnchor.constraint(equalTo: topAnchor),
+      blurView.bottomAnchor.constraint(equalTo: bottomAnchor),
       centerXConstraint,
       centerYConstraint,
       stackLeadingConstraint,
@@ -1242,10 +1352,10 @@ private final class ChatHomeSwipeActionTileView: UIView {
   func configure(spec: ChatHomeSwipeActionSpec, edge: ChatHomeSwipeEdge) {
     self.spec = spec
     self.edge = edge
-    backgroundColor = spec.backgroundColor
-    iconView.tintColor = spec.foregroundColor
+    backgroundColor = .clear
+    iconView.tintColor = UIColor.label
     titleLabel.text = spec.title
-    titleLabel.textColor = spec.foregroundColor
+    titleLabel.textColor = UIColor.label
     titleLabel.font = .systemFont(ofSize: 13.5, weight: .medium)
     let config = UIImage.SymbolConfiguration(pointSize: 28, weight: .medium)
     iconView.image = UIImage(systemName: spec.systemImageName, withConfiguration: config)?

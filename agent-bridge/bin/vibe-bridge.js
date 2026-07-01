@@ -900,12 +900,20 @@ const DEFAULT_CLAUDE_MOBILE_DISALLOWED_TOOLS = [
 
 function claudeDisallowedTools(task) {
   const override = splitEnvList(process.env.VIBE_CLAUDE_DISALLOWED_TOOLS);
-  if (override.length) return override;
   // Full access means the user explicitly asked for bypass behavior. All other
   // mobile modes keep destructive commands on the ask/block side while Claude's
   // own `auto` classifier can run low-risk inspection/build commands.
-  if (workModeFor(task) === "full_access") return [];
-  return DEFAULT_CLAUDE_MOBILE_DISALLOWED_TOOLS;
+  const base = override.length
+    ? [...override]
+    : workModeFor(task) === "full_access"
+      ? []
+      : [...DEFAULT_CLAUDE_MOBILE_DISALLOWED_TOOLS];
+  // CRITICAL: the NATIVE AskUserQuestion tool has no answer channel in a bridge run
+  // (no local TTY), so if the model calls it the run blocks FOREVER and nothing ever
+  // reaches the phone. Disable it whenever our MCP ask is on so the model is forced
+  // to use `mcp__vibeask__ask_user`, which relays to mobile and IS answerable.
+  if (ASK_MCP_ENABLED && !base.includes("AskUserQuestion")) base.push("AskUserQuestion");
+  return base;
 }
 
 function appendToolListArg(args, flag, values) {
@@ -2423,6 +2431,9 @@ async function runTask(channel, task) {
 
   const repo = repoResult.repo;
   const cwd = repo.cwd || repo.path || DEFAULT_CWD;
+  // Remember which mobile chat owns this repo/provider so an INTERACTIVE claude
+  // session in the same repo can route its ask/command approvals to this chat.
+  rememberAgentChat(provider, chatId, cwd);
   console.log(`[vibe-bridge] run ${provider} chat=${chatId} task=${taskId} cwd=${cwd}`);
 
   const startedAt = Date.now();
@@ -4231,6 +4242,10 @@ function handleHistoryRequest(channel, payload) {
       if (chatId && sessionId && result.mode === "detail") {
         startHistoryWatch(channel, { chatId, provider, sessionId, echo });
       }
+      // Opening the chat is also our chance to re-surface any ask/command the run
+      // is still blocked on but the phone never saw (missed the live broadcast, or
+      // the server's short-lived replay buffer already expired).
+      if (chatId) reemitPendingAskForChat(channel, chatId);
     })
     .catch((err) => {
       channel.push("history_result", { ok: false, ...echo, message: err && err.message ? err.message : "history_failed" });
@@ -4359,7 +4374,14 @@ function controlTask(channel, payload) {
 //
 // The request/answer bodies are E2E-sealed with the pairing runtime key (arte1),
 // exactly like the diff card — the server relays an opaque blob it cannot read.
-const pendingAsks = new Map(); // requestId -> { resolve, timer }
+const pendingAsks = new Map(); // requestId -> { resolve, timer, chatId }
+// chatId -> the latest genuinely-pending ask for that chat (so it can be RE-EMITTED
+// when the phone opens/reopens the chat from history — the server's ETS replay only
+// covers a 10-min TTL and only fires on a fresh chan join, so a phone that opens a
+// long-lived waiting chat, or after that TTL, otherwise never sees the outstanding
+// ask/command). Sourced from the bridge's real blocked-promise state, so re-emitting
+// the SAME requestId still resolves the live `requestAsk` promise when answered.
+const pendingAsksByChat = new Map(); // chatId -> { requestId, provider, taskId, replyToId, kind, body }
 let askSeq = 0;
 const ASK_TIMEOUT_MS = Number(process.env.VIBE_ASK_TIMEOUT_MS || 10 * 60 * 1000);
 
@@ -4402,15 +4424,45 @@ function requestAsk(channel, { provider, chatId, taskId, replyToId, kind, body }
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       if (pendingAsks.delete(requestId)) {
+        clearPendingAskForChat(chatId, requestId);
         console.log(`[vibe-bridge] ask ${requestId} timed out → auto-reject`);
         resolve({ decision: "reject", answer: null, timedOut: true });
       }
     }, ASK_TIMEOUT_MS);
     timer.unref?.();
-    pendingAsks.set(requestId, { resolve, timer });
+    pendingAsks.set(requestId, { resolve, timer, chatId });
+    // Remember it per-chat so opening this chat from history re-surfaces the ask.
+    if (chatId) {
+      pendingAsksByChat.set(chatId, { requestId, provider, taskId, replyToId, kind, body });
+    }
     pushAskRequest(channel, { provider, chatId, taskId, replyToId, requestId, kind, body });
     console.log(`[vibe-bridge] ask_request ${requestId} kind=${kind} chat=${chatId}`);
   });
+}
+
+// Drop the per-chat buffered ask once it's answered/timed out — but only if it still
+// points at THIS requestId (a newer outstanding ask on the same chat must survive).
+function clearPendingAskForChat(chatId, requestId) {
+  if (!chatId) return;
+  const rec = pendingAsksByChat.get(chatId);
+  if (rec && rec.requestId === requestId) pendingAsksByChat.delete(chatId);
+}
+
+// Re-push any genuinely-pending ask/command for a chat the phone just opened from
+// history. Reuses the SAME requestId + body, so the live blocked `requestAsk` promise
+// resolves normally when the phone answers. No-op when nothing is outstanding.
+function reemitPendingAskForChat(channel, chatId) {
+  if (!chatId) return;
+  const rec = pendingAsksByChat.get(chatId);
+  if (!rec) return;
+  // Only re-emit while the promise is actually still blocked (guards against a race
+  // where it resolved between lookups).
+  if (!pendingAsks.has(rec.requestId)) {
+    pendingAsksByChat.delete(chatId);
+    return;
+  }
+  console.log(`[vibe-bridge][ask] re-emit pending ask on history open requestId=${rec.requestId} kind=${rec.kind} chat=${chatId}`);
+  pushAskRequest(channel, { ...rec, chatId, requestId: rec.requestId });
 }
 
 // phone → server → bridge: an answer to an awaited ask.
@@ -4420,6 +4472,7 @@ function resolveAsk(payload) {
   const entry = pendingAsks.get(requestId);
   if (!entry) return;
   pendingAsks.delete(requestId);
+  clearPendingAskForChat(entry.chatId, requestId);
   clearTimeout(entry.timer);
   const decision = String(payload.decision || payload.action || "answer").trim().toLowerCase();
   let answer = null;
@@ -4520,10 +4573,18 @@ let askIpcServer = null;
 const ASK_MCP_SCRIPT = `#!/usr/bin/env node
 "use strict";
 const net = require("net");
+const os = require("os");
+const path = require("path");
 const readline = require("readline");
-const SOCK = process.env.VIBE_ASK_SOCK;
+// Bridge-spawned runs get VIBE_ASK_SOCK (+ VIBE_ASK_CHAT) in their env. A STANDALONE
+// (interactive desktop) claude session has neither, so fall back to the bridge's
+// stable socket and identify by cwd — the bridge routes the ask to the matching
+// mobile chat. This is what lets an interactive session's question reach the phone.
+const SOCK = process.env.VIBE_ASK_SOCK || path.join(os.homedir(), ".vibe", "ask.sock");
 const CHAT = process.env.VIBE_ASK_CHAT || "";
 const TASK = process.env.VIBE_ASK_TASK || "";
+const CWD = process.cwd();
+const SOURCE = CHAT ? "bridge" : "interactive";
 let proto = "2024-11-05";
 function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }
 function result(id, res) { send({ jsonrpc: "2.0", id, result: res }); }
@@ -4589,7 +4650,7 @@ function approveBridge(args) {
     let done = false;
     const finish = (fn, v) => { if (!done) { done = true; fn(v); } };
     const conn = net.createConnection(SOCK, () => {
-      conn.write(JSON.stringify({ type: "command", chatId: CHAT, taskId: TASK, tool_name: args && args.tool_name, input }) + "\\n");
+      conn.write(JSON.stringify({ type: "command", chatId: CHAT, taskId: TASK, cwd: CWD, source: SOURCE, tool_name: args && args.tool_name, input }) + "\\n");
     });
     conn.setEncoding("utf8");
     conn.on("data", (d) => {
@@ -4615,7 +4676,7 @@ function askBridge(questions) {
     let done = false;
     const finish = (val) => { if (!done) { done = true; resolve(val); } };
     const conn = net.createConnection(SOCK, () => {
-      conn.write(JSON.stringify({ chatId: CHAT, taskId: TASK, questions }) + "\\n");
+      conn.write(JSON.stringify({ chatId: CHAT, taskId: TASK, cwd: CWD, source: SOURCE, questions }) + "\\n");
     });
     conn.setEncoding("utf8");
     conn.on("data", (d) => {
@@ -4661,27 +4722,184 @@ rl.on("line", async (line) => {
 });
 `;
 
-// Lazily materialize the MCP server script + its --mcp-config file, and start the
-// unix-socket IPC server the script talks back through. Idempotent.
+// PreToolUse hook (interactive desktop sessions): the headless-only
+// `--permission-prompt-tool` can't gate an interactive `claude`, but a PreToolUse
+// hook CAN — it blocks, forwards the pending command to the bridge's stable socket,
+// and returns the phone's decision as a permissionDecision. FAIL-SAFE: anything but
+// a clear approve/deny (bridge down, timeout, parse error) returns "ask", which
+// falls back to the normal LOCAL prompt so the desktop is never worse off.
+const APPROVE_HOOK_SCRIPT = `#!/usr/bin/env node
+"use strict";
+const net = require("net");
+const os = require("os");
+const path = require("path");
+const SOCK = path.join(os.homedir(), ".vibe", "ask.sock");
+function emit(decision, reason, updatedInput) {
+  const hso = { hookEventName: "PreToolUse", permissionDecision: decision };
+  if (reason) hso.permissionDecisionReason = reason;
+  if (updatedInput) hso.updatedInput = updatedInput;
+  process.stdout.write(JSON.stringify({ hookSpecificOutput: hso }));
+  process.exit(0);
+}
+let raw = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (d) => { raw += d; });
+process.stdin.on("end", () => {
+  let ev = null;
+  try { ev = JSON.parse(raw); } catch (_) {}
+  if (!ev) emit("ask", "Vibe: could not read tool input — approve here.");
+  const toolName = ev.tool_name || "";
+  const input = ev.tool_input || {};
+  const cwd = ev.cwd || process.cwd();
+  let done = false;
+  const finish = (fn) => { if (!done) { done = true; fn(); } };
+  // AskUserQuestion has no answer channel off-device. If the bridge is up, DENY it and
+  // redirect the model to mcp__vibeask__ask_user (which reaches the phone). If the
+  // bridge is down, DEFER so the native question still works on the local TTY.
+  if (toolName === "AskUserQuestion") {
+    const probe = net.createConnection(SOCK, () => {
+      try { probe.end(); } catch (_) {}
+      finish(() => emit("deny", "Use the mcp__vibeask__ask_user tool instead — it delivers your question to the user's phone and returns their answer. Do not use AskUserQuestion here."));
+    });
+    probe.on("error", () => finish(() => emit("ask", "Vibe bridge unreachable — asking here.")));
+    return;
+  }
+  const timer = setTimeout(() => finish(() => emit("ask", "Vibe: no response from your phone — approve here.")), 180000);
+  if (timer.unref) timer.unref();
+  let buf = "";
+  const conn = net.createConnection(SOCK, () => {
+    conn.write(JSON.stringify({ type: "command", cwd: cwd, source: "hook", sessionId: ev.session_id || "", tool_name: toolName, input: input }) + "\\n");
+  });
+  conn.setEncoding("utf8");
+  conn.on("data", (d) => {
+    buf += d;
+    const nl = buf.indexOf("\\n");
+    if (nl < 0) return;
+    let parsed = null;
+    try { parsed = JSON.parse(buf.slice(0, nl)); } catch (_) {}
+    try { conn.end(); } catch (_) {}
+    clearTimeout(timer);
+    const ans = (parsed && parsed.answer) || {};
+    const decision = String(ans.decision || ans.action || "").toLowerCase();
+    if (decision === "approve" || decision === "allow") finish(() => emit("allow", ans.message || "Approved from phone.", ans.updatedInput));
+    else if (decision === "deny" || decision === "skip") finish(() => emit("deny", ans.message || (decision === "skip" ? "Skipped from your phone." : "Denied from your phone.")));
+    else finish(() => emit("ask", "Vibe: no clear decision — approve here."));
+  });
+  conn.on("error", () => { clearTimeout(timer); finish(() => emit("ask", "Vibe bridge unreachable — approve here.")); });
+  conn.on("close", () => { clearTimeout(timer); finish(() => emit("ask", "Vibe: connection closed — approve here.")); });
+});
+`;
+// NOTE: the embedded APPROVE_HOOK_SCRIPT above is only a FALLBACK. The authoritative,
+// config-driven hook lives at agent-bridge/assets/vibe-approve-hook.js and is copied to
+// ~/.vibe on every start (see ensureAskMcp). Edit the asset, not this string.
+
+// Default approval config, written to ~/.vibe/agent-config.toml ONLY if absent (user
+// edits are never overwritten). Defaults to "local" = approve on-device, no phone.
+const DEFAULT_AGENT_CONFIG_TOML = `# Vibe agent config — controls how Claude Code (interactive, in this repo) asks
+# you to approve tools. Edit this file and it takes effect on the next tool call.
+#
+# approval_mode:
+#   "local"  -> DEFAULT. Approve / answer everything on THIS device only (no phone).
+#   "mobile" -> Everything not auto-allowed is sent to your phone (falls back to a
+#               local prompt after 3 min or if the bridge is down, so nothing hangs).
+#   "auto"   -> Safe / allow-listed commands run WITHOUT asking; only blockers go to
+#               the phone. Closest to how Codex feels day to day.
+#   "both"   -> Like "auto", but a blocker shows on the desk AND the phone at once
+#               (first responder wins) in a real terminal session; a headless / IDE
+#               session just prompts locally so the agent never blocks on the phone.
+#   "full"   -> Allow everything EXCEPT the always-blocked dangerous commands.
+#
+# Always-blocked in mobile/auto/full (denied even in full): rm -rf, sudo, git push,
+# git reset --hard, dd, mkfs, curl|sh, npm publish, ...
+approval_mode = "local"
+
+# Extra Bash commands to auto-allow (substring match) on top of the built-in safe list
+# (ls/cat/grep/find/git status|diff|log/echo/... and any build — building is free).
+auto_allow = [
+  "xcrun simctl",
+]
+
+# Extra commands to always deny (substring match).
+deny = []
+`;
+
+// Interactive-session routing: an interactive claude's ask/command arrives on the
+// stable socket WITHOUT a chatId (it isn't a bridge run). Route it to the mobile
+// chat that most recently ran this provider in this repo (cwd), else the last chat
+// seen for the provider. Populated from run_task in runTask().
+const lastAgentChatByCwd = new Map(); // cwd -> { chatId, provider }
+const lastAgentChatByProvider = new Map(); // provider -> chatId
+const AGENT_CHATS_FILE = path.join(CONFIG_DIR, "agent-chats.json");
+// Persist the repo/provider→chat map so interactive routing works IMMEDIATELY after
+// a bridge restart (before any new phone run), since the phone rarely re-runs first.
+function loadAgentChats() {
+  try {
+    const data = JSON.parse(fs.readFileSync(AGENT_CHATS_FILE, "utf8"));
+    for (const [p, c] of Object.entries(data.byProvider || {})) lastAgentChatByProvider.set(p, c);
+    for (const [k, v] of Object.entries(data.byCwd || {})) lastAgentChatByCwd.set(k, v);
+  } catch (_) {}
+}
+function saveAgentChats() {
+  try {
+    fs.writeFileSync(
+      AGENT_CHATS_FILE,
+      JSON.stringify({
+        byProvider: Object.fromEntries(lastAgentChatByProvider),
+        byCwd: Object.fromEntries(lastAgentChatByCwd),
+      })
+    );
+  } catch (_) {}
+}
+function rememberAgentChat(provider, chatId, cwd) {
+  if (!chatId) return;
+  if (provider) lastAgentChatByProvider.set(provider, chatId);
+  const key = realDir(cwd || "") || cwd;
+  if (key) lastAgentChatByCwd.set(key, { chatId, provider });
+  saveAgentChats();
+}
+function resolveInteractiveChat(cwd, provider) {
+  const key = realDir(cwd || "") || cwd;
+  if (key && lastAgentChatByCwd.has(key)) return lastAgentChatByCwd.get(key).chatId;
+  if (provider && lastAgentChatByProvider.has(provider)) return lastAgentChatByProvider.get(provider);
+  // Last resort: any known agent chat (single-agent DM setups share one chatId).
+  const first = lastAgentChatByProvider.values().next();
+  return first && !first.done ? first.value : null;
+}
+
+// Lazily materialize the MCP server script, its --mcp-config file, and the approval
+// hook — all in ~/.vibe (STABLE paths, so an interactive claude session registered
+// against them keeps working across bridge restarts) — and start the unix-socket IPC
+// server on a stable path any claude session can reach. Idempotent.
 function ensureAskMcp(channel) {
   activeChannel = channel;
   if (!ASK_MCP_ENABLED || askIpcServer) return;
   try {
-    const dir = os.tmpdir();
+    const dir = CONFIG_DIR; // ~/.vibe (already used for bridge.log/bridge.json)
+    try { fs.mkdirSync(dir, { recursive: true }); } catch (_) {}
+    loadAgentChats(); // restore repo→chat routing from a prior run
     const scriptPath = path.join(dir, "vibe-ask-mcp.js");
     fs.writeFileSync(scriptPath, ASK_MCP_SCRIPT, { mode: 0o700 });
+    // Copy the authoritative, config-driven hook from the repo asset; fall back to the
+    // embedded template only if the asset can't be read.
+    let hookSrc = APPROVE_HOOK_SCRIPT;
+    try { hookSrc = fs.readFileSync(path.join(__dirname, "..", "assets", "vibe-approve-hook.js"), "utf8"); } catch (_) {}
+    fs.writeFileSync(path.join(dir, "vibe-approve-hook.js"), hookSrc, { mode: 0o700 });
+    // Seed a local-mode config on first run; NEVER overwrite the user's edits.
+    const agentCfgPath = path.join(dir, "agent-config.toml");
+    if (!fs.existsSync(agentCfgPath)) { try { fs.writeFileSync(agentCfgPath, DEFAULT_AGENT_CONFIG_TOML); } catch (_) {} }
     askMcpConfigPath = path.join(dir, "vibe-ask-mcp.json");
     fs.writeFileSync(
       askMcpConfigPath,
       JSON.stringify({ mcpServers: { vibeask: { command: process.execPath, args: [scriptPath] } } })
     );
-    // Short socket path — macOS caps the sun_path at ~104 bytes.
-    askIpcSockPath = path.join(dir, `vibe-ask-${process.pid}.sock`);
+    // Stable socket (~/.vibe/ask.sock, ~38 bytes — well under macOS's ~104 sun_path
+    // cap) so BOTH bridge-spawned and interactive sessions reach the same listener.
+    askIpcSockPath = path.join(dir, "ask.sock");
     try { fs.unlinkSync(askIpcSockPath); } catch (_) {}
     askIpcServer = net.createServer(handleAskIpcConnection);
     askIpcServer.on("error", (e) => console.error(`[vibe-bridge] ask IPC error: ${e.message}`));
     askIpcServer.listen(askIpcSockPath, () =>
-      console.log(`[vibe-bridge] ask_user MCP ready (sock=${askIpcSockPath})`)
+      console.log(`[vibe-bridge] ask_user MCP ready (sock=${askIpcSockPath}, hook=${path.join(dir, "vibe-approve-hook.js")})`)
     );
   } catch (e) {
     console.error(`[vibe-bridge] ask_user MCP setup failed: ${e.message}`);
@@ -4743,12 +4961,29 @@ function handleAskIpcConnection(conn) {
     try { req = JSON.parse(buf.slice(0, nl)); } catch (_) {}
     if (!req || !activeChannel) { try { conn.end(); } catch (_) {} return; }
 
-    // Command approval (Claude --permission-prompt-tool): relay the pending tool
-    // to the phone and map Approve/Skip/Deny back to the allow/deny contract.
+    // A bridge-spawned run supplies its own chatId. A standalone/interactive session
+    // (MCP fallback or the PreToolUse hook) has none — route it to the mobile chat
+    // that last ran this repo. If we can't (no chat ever seen), close WITHOUT an
+    // answer so the caller falls back to its LOCAL prompt (hook → "ask").
+    const chatId = req.chatId || resolveInteractiveChat(req.cwd, req.provider || "claude");
+    if (!chatId) {
+      console.log(
+        `[vibe-bridge][ask] no mobile chat to route interactive ${req.type === "command" ? "command" : "ask"} ` +
+          `(cwd=${req.cwd || "?"} source=${req.source || "?"}) — closing so caller falls back locally`
+      );
+      try { conn.end(); } catch (_) {}
+      return;
+    }
+    if (req.source && req.source !== "bridge") {
+      console.log(`[vibe-bridge][ask] interactive ${req.type === "command" ? "command" : "ask"} source=${req.source} cwd=${req.cwd || "?"} → chat=${chatId}`);
+    }
+
+    // Command approval (Claude --permission-prompt-tool OR the interactive PreToolUse
+    // hook): relay the pending tool to the phone and map Approve/Skip/Deny back.
     if (req.type === "command") {
       const verdict = await requestAsk(activeChannel, {
         provider: "claude",
-        chatId: req.chatId,
+        chatId,
         taskId: req.taskId,
         replyToId: null,
         kind: "command",
@@ -4774,7 +5009,7 @@ function handleAskIpcConnection(conn) {
 
     const result = await requestAsk(activeChannel, {
       provider: "claude",
-      chatId: req.chatId,
+      chatId,
       taskId: req.taskId,
       replyToId: null,
       kind: "ask",
@@ -4859,6 +5094,15 @@ function recoverAfterReconnect(channel) {
       rewatched++;
     } catch (_) {}
   }
+  // Re-emit any still-blocked ask/command whose live broadcast was lost during the
+  // outage (the run is still waiting on the phone; the ask never reached it).
+  let reasked = 0;
+  for (const chatId of pendingAsksByChat.keys()) {
+    try {
+      reemitPendingAskForChat(channel, chatId);
+      reasked++;
+    } catch (_) {}
+  }
   // Re-sync STILL-RUNNING tasks: their progress frames pushed during the outage went to
   // a dead socket and were lost, leaving the phone's live card frozen until the run ends.
   // Re-pushing the last frame re-asserts the turn is alive (the phone merges progress into
@@ -4873,7 +5117,7 @@ function recoverAfterReconnect(channel) {
     }
   }
   console.log(
-    `[vibe-bridge] reconnected after ${downMs}ms down — recovery: redelivered=${redelivered} result(s), rewatched=${rewatched} chat(s), resynced=${resynced} running`
+    `[vibe-bridge] reconnected after ${downMs}ms down — recovery: redelivered=${redelivered} result(s), rewatched=${rewatched} chat(s), resynced=${resynced} running, reasked=${reasked} pending`
   );
   socketDownSince = null;
 }

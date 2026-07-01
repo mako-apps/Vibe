@@ -253,12 +253,23 @@ defmodule VibeWeb.ChatController do
     end
   end
 
-  def delete(conn, %{"chat_id" => chat_id}) do
+  def delete(conn, %{"chat_id" => chat_id} = params) do
     user_id = conn.assigns.current_user.id
+    delete_for_everyone =
+      truthy?(
+        params["deleteForEveryone"] || params["delete_for_everyone"] || params["forEveryone"] ||
+          params["for_everyone"]
+      )
 
     if Chat.is_participant?(chat_id, user_id) do
-      case Chat.delete_chat(chat_id, user_id) do
-        {:ok, _} -> json(conn, %{success: true})
+      case Chat.delete_chat(chat_id, user_id, delete_for_everyone: delete_for_everyone) do
+        {:ok, result} ->
+          json(conn, %{
+            success: true,
+            deleteForEveryone: result.for_everyone,
+            deletedCount: result.deleted_count
+          })
+
         {:error, reason} -> conn |> put_status(400) |> json(%{error: reason})
       end
     else
@@ -277,4 +288,7 @@ defmodule VibeWeb.ChatController do
 
   defp parse_limit(limit) when is_integer(limit), do: limit
   defp parse_limit(_limit), do: nil
+
+  defp truthy?(value) when value in [true, "true", "1", 1, "yes", "on"], do: true
+  defp truthy?(_value), do: false
 end

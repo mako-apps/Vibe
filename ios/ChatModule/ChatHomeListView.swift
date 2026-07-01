@@ -343,7 +343,7 @@ public final class ChatNativeHomeListView: ExpoView, UITableViewDataSource, UITa
       tableView.bottomAnchor.constraint(equalTo: bottomAnchor),
       undoBannerView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
       undoBannerView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
-      undoBannerView.bottomAnchor.constraint(equalTo: safeAreaLayoutGuide.bottomAnchor, constant: -14),
+      undoBannerView.bottomAnchor.constraint(equalTo: safeAreaLayoutGuide.bottomAnchor, constant: -20),
       undoBannerView.heightAnchor.constraint(equalToConstant: ChatNativeHomeUndoBannerView.preferredHeight),
     ])
 

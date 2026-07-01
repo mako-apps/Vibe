@@ -29,32 +29,44 @@ struct ChatListAppearance {
   ///   3 = SpringBatch (UIView.animate with spring wrapping the batch)
   let insertionAnimationMode: Int
 
+  /// Shared brand accent fallback (soft teal, #2F9E93) used wherever code needs an
+  /// agent/accent color and no per-chat appearance is available yet — bubble tint,
+  /// agent border, reply/mention bars, profile default accent, progress rings, etc.
+  static let brandAccentFallback = UIColor(red: 0.1843, green: 0.6196, blue: 0.5765, alpha: 1.0)
+
+  // Soft teal-blue brand default (replaces the old flat "transparent" fallback,
+  // which skipped the wallpaper snapshot entirely and meant most untheme'd chats
+  // never got the wallpaper-to-bubble color harmonization that themed chats have).
   static let fallback = ChatListAppearance(
-    backgroundMode: "transparent",
+    backgroundMode: "gradient",
     wallpaperGradient: [
-      UIColor(red: 0.10, green: 0.10, blue: 0.18, alpha: 1.0),
-      UIColor(red: 0.07, green: 0.07, blue: 0.16, alpha: 1.0),
+      UIColor(red: 0.0510, green: 0.1020, blue: 0.1098, alpha: 1.0),  // #0D1A1C
+      UIColor(red: 0.0392, green: 0.0784, blue: 0.0863, alpha: 1.0),  // #0A1416
     ],
     wallpaperOpacity: 1.0,
-    wallpaperPatternGradient: [],
-    wallpaperPatternLocations: nil,
-    wallpaperPatternOpacity: 0.0,
-    wallpaperMaskKey: nil,
+    wallpaperPatternGradient: [
+      UIColor(red: 0.1216, green: 0.4314, blue: 0.4196, alpha: 1.0),  // #1F6E6B
+      UIColor(red: 0.1725, green: 0.5490, blue: 0.5255, alpha: 1.0),  // #2C8C86
+      UIColor(red: 0.2706, green: 0.6706, blue: 0.6275, alpha: 1.0),  // #45ABA0
+    ],
+    wallpaperPatternLocations: [0.0, 0.5, 1.0],
+    wallpaperPatternOpacity: 0.12,
+    wallpaperMaskKey: "doodles",
     bubbleMeGradient: [
-      UIColor(red: 0.49, green: 0.36, blue: 0.88, alpha: 1.0),
-      UIColor(red: 0.42, green: 0.31, blue: 0.81, alpha: 1.0),
+      brandAccentFallback,  // #2F9E93
+      UIColor(red: 0.1333, green: 0.4902, blue: 0.4549, alpha: 1.0),  // #227D74
     ],
     bubbleThemGradient: [
-      UIColor(red: 0.17, green: 0.17, blue: 0.29, alpha: 1.0),
-      UIColor(red: 0.17, green: 0.17, blue: 0.29, alpha: 1.0),
+      UIColor(red: 0.1412, green: 0.1412, blue: 0.1725, alpha: 1.0),  // #24242C
+      UIColor(red: 0.1412, green: 0.1412, blue: 0.1725, alpha: 1.0),
     ],
-    bubbleThemColor: UIColor(red: 0.17, green: 0.17, blue: 0.29, alpha: 1.0),
+    bubbleThemColor: UIColor(red: 0.1412, green: 0.1412, blue: 0.1725, alpha: 1.0),
     textColorMe: .white,
     textColorThem: UIColor(white: 0.87, alpha: 1.0),
     timeColorMe: UIColor(white: 1.0, alpha: 0.72),
     timeColorThem: UIColor(white: 1.0, alpha: 0.5),
     dayTextColor: UIColor(white: 0.93, alpha: 0.82),
-    dayBackgroundColor: UIColor(red: 0.08, green: 0.08, blue: 0.13, alpha: 0.42),
+    dayBackgroundColor: UIColor(red: 0.06, green: 0.10, blue: 0.10, alpha: 0.42),
     dayBorderColor: UIColor(white: 1.0, alpha: 0.16),
     insertionAnimationMode: 2
   )

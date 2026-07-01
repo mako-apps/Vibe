@@ -16,15 +16,15 @@ public enum TelegramSendMorphProfile {
   )
 
   // Keep the destination plate opaque; only the composer/source snapshot burns off.
-  static let bubbleFadeFrom: Float = 1.0
+  static let bubbleFadeFrom: Float = 0.0
   static let bubbleFadeDelay: CFTimeInterval = 0.0
-  static let bubbleFadeDuration: CFTimeInterval = 0.05
+  static let bubbleFadeDuration: CFTimeInterval = 0.12
 
   static let bubbleContentFadeDelay: CFTimeInterval = 0.035
   static let bubbleContentFadeDuration: CFTimeInterval = 0.09
 
   static let sourceBackgroundFadeDelay: CFTimeInterval = 0.0
-  static let sourceBackgroundFadeDuration: CFTimeInterval = 0.075
+  static let sourceBackgroundFadeDuration: CFTimeInterval = 0.12
 
   static let sourceTextFadeDelay: CFTimeInterval = 0.0
   static let sourceTextFadeDuration: CFTimeInterval = 0.065

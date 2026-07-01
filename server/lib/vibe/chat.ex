@@ -965,22 +965,51 @@ defmodule Vibe.Chat do
     result
   end
 
-  def delete_chat(chat_id, user_id) do
-    # Instead of deleting the chat, we mark the participant as deleted
-    # This way the other user can still see the chat
-    case from(p in Participant, where: p.chat_id == ^chat_id and p.user_id == ^user_id)
-         |> Repo.update_all(set: [deleted: true, messages_cleared_at: NaiveDateTime.utc_now()]) do
-      {1, _} ->
-        ChatHomeCache.invalidate_user(user_id)
-        {:ok, :deleted}
+  def delete_chat(chat_id, user_id, opts \\ []) do
+    delete_for_everyone = Keyword.get(opts, :delete_for_everyone, false)
 
-      {0, _} ->
-        {:error, "Chat not found"}
+    unless is_participant?(chat_id, user_id) do
+      {:error, "Chat not found"}
+    else
+      room = Repo.get(Room, chat_id)
 
-      _ ->
-        {:error, "Failed to delete"}
+      cond do
+        delete_for_everyone and not direct_room?(room) ->
+          {:error, "Delete for both sides is only available in direct chats"}
+
+        true ->
+          now = NaiveDateTime.utc_now()
+          target_user_ids = if delete_for_everyone, do: get_participant_ids(chat_id), else: [user_id]
+
+          target_query =
+            if delete_for_everyone do
+              from(p in Participant, where: p.chat_id == ^chat_id)
+            else
+              from(p in Participant, where: p.chat_id == ^chat_id and p.user_id == ^user_id)
+            end
+
+          case Repo.update_all(target_query,
+                 set: [deleted: true, archived: false, messages_cleared_at: now]
+               ) do
+            {count, _} when count > 0 ->
+              ChatHomeCache.invalidate_users(target_user_ids)
+              {:ok, %{deleted_count: count, for_everyone: delete_for_everyone}}
+
+            {0, _} ->
+              {:error, "Chat not found"}
+
+            _ ->
+              {:error, "Failed to delete"}
+          end
+      end
     end
   end
+
+  defp direct_room?(%Room{type: type, is_group: is_group}) do
+    (is_nil(type) or type == "dm") and is_group != true
+  end
+
+  defp direct_room?(_), do: false
 
   def restore_if_deleted(chat_id, user_id) do
     # Check if this user has deleted the chat

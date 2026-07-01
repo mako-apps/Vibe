@@ -112,7 +112,7 @@ final class VibeAgentKitMessageActionBarView: UIView {
   }
 }
 
-private final class VibeAgentKitAssistantMessageBodyView: UIView {
+final class VibeAgentKitAssistantMessageBodyView: UIView {
   private let stackView = UIStackView()
   private let loaderView = VibeAgentKitAgentLoaderView()
   // Inline, expandable step list that drops in directly under the "Worked · N
@@ -1487,7 +1487,7 @@ private final class VibeAgentKitStepRowView: UIView {
   }
 }
 
-private func resoloAssistantDisplayText(for message: VibeAgentKitChatMessage) -> String {
+func resoloAssistantDisplayText(for message: VibeAgentKitChatMessage) -> String {
   let finalText = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
   let initialText = message.hasInitialResponseText
     ? message.initialResponseText?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1675,7 +1675,9 @@ final class VibeAgentKitMessageCell: UITableViewCell {
   private let userAttachmentGrid = VibeAgentKitAttachmentGridView()
   private let userTextView = VibeAgentKitStreamingTextLabel()
   private let userExpandButton = UIButton(type: .system)
-  private let assistantBodyView = VibeAgentKitAssistantMessageBodyView()
+  // Owns VibeAgentKitAssistantMessageBodyView through the shape-agnostic wrapper so the
+  // same renderer can be reused full-width here or bubble-shelled in ChatListCell.
+  private let assistantBodyView = VibeAgentTurnContentView()
   private let progressStack = UIStackView()
   private let actionBar = VibeAgentKitMessageActionBarView()
 

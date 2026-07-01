@@ -1451,6 +1451,10 @@ private struct ChatHomeScreen: View {
   @State private var isShowingGroupCreation = false
   @State private var homeSearchQuery = ""
   @State private var isHomeSearchFocused = false
+  @State private var locallyHiddenChatIDs = Set<String>()
+  @State private var pendingDeleteConfirmation: ChatHomeDeleteConfirmation?
+  @State private var pendingDeletion: ChatHomePendingDeletion?
+  @State private var pendingDeletionTask: Task<Void, Never>?
   /// Global username/phone/ID lookups (incl. Claude/Codex) for the search drawer.
   @State private var globalResults: [ContactSearchUser] = []
   @State private var isGlobalSearching = false
@@ -1462,23 +1466,31 @@ private struct ChatHomeScreen: View {
   private var filteredRows: [ChatHomeListRow] {
     let query = homeSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !query.isEmpty else { return homeRowsWithArchiveEntry }
-    return model.rows.filter { row in
+    return visibleHomeRows.filter { row in
       row.title.localizedCaseInsensitiveContains(query)
         || row.preview.localizedCaseInsensitiveContains(query)
     }
   }
 
+  private var visibleHomeRows: [ChatHomeListRow] {
+    model.rows.filter { !locallyHiddenChatIDs.contains($0.chatId) }
+  }
+
+  private var visibleArchivedRows: [ChatHomeListRow] {
+    model.archivedRows.filter { !locallyHiddenChatIDs.contains($0.chatId) }
+  }
+
   private var homeRowsWithArchiveEntry: [ChatHomeListRow] {
-    guard !model.archivedRows.isEmpty else { return model.rows }
-    let archiveRow = Self.archiveEntryRow(count: model.archivedRows.count)
-    var rows = model.rows.filter { !$0.isArchiveEntry }
+    guard !visibleArchivedRows.isEmpty else { return visibleHomeRows }
+    let archiveRow = Self.archiveEntryRow(count: visibleArchivedRows.count)
+    var rows = visibleHomeRows.filter { !$0.isArchiveEntry }
     let insertionIndex = rows.first?.isSavedMessages == true ? 1 : 0
     rows.insert(archiveRow, at: insertionIndex)
     return rows
   }
 
   private var hasHomeRowsForAnyScope: Bool {
-    !model.rows.isEmpty || !model.archivedRows.isEmpty
+    !visibleHomeRows.isEmpty || !visibleArchivedRows.isEmpty
   }
 
   private var trimmedHomeQuery: String {
@@ -1578,9 +1590,48 @@ private struct ChatHomeScreen: View {
 
   var body: some View {
     NavigationStack {
-      listContent
-        .ignoresSafeArea(.container, edges: .top)
-        .background(palette.background.ignoresSafeArea())
+      ZStack {
+        listContent
+          .ignoresSafeArea(.container, edges: .top)
+          .background(palette.background.ignoresSafeArea())
+
+        if let pendingDeletion {
+          VStack {
+            Spacer()
+            ChatHomeDeletionUndoToast(
+              deletion: pendingDeletion,
+              palette: palette,
+              undo: undoPendingHomeDelete
+            )
+            .padding(.horizontal, 14)
+            .padding(.bottom, 86)
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+          }
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+          .allowsHitTesting(true)
+        }
+
+        if let confirmation = pendingDeleteConfirmation {
+          ChatHomeDeleteDialogView(
+            confirmation: confirmation,
+            palette: palette,
+            deleteForMe: {
+              beginPendingHomeDelete(row: confirmation.row, deleteForEveryone: false)
+            },
+            deleteForEveryone: confirmation.allowsDeleteForEveryone
+              ? {
+                beginPendingHomeDelete(row: confirmation.row, deleteForEveryone: true)
+              } : nil,
+            cancel: {
+              pendingDeleteConfirmation = nil
+            }
+          )
+          .transition(.opacity.combined(with: .scale(scale: 0.98)))
+          .zIndex(3)
+        }
+      }
+        .animation(.spring(response: 0.28, dampingFraction: 0.86), value: pendingDeletion?.id)
+        .animation(.spring(response: 0.22, dampingFraction: 0.9), value: pendingDeleteConfirmation?.id)
         .navigationBarTitleDisplayMode(.inline)
         // Let iOS 26 apply its native adaptive Liquid Glass to the nav bar and
         // toolbar items. An explicit .toolbarBackground / .sharedBackgroundVisibility(.hidden)
@@ -1663,6 +1714,7 @@ private struct ChatHomeScreen: View {
             model: model,
             palette: palette,
             isDark: colorScheme == .dark,
+            hiddenChatIDs: locallyHiddenChatIDs,
             openRow: openLocalChatRow,
             performAction: performHomeRowAction
           )
@@ -1692,7 +1744,7 @@ private struct ChatHomeScreen: View {
     .sheet(isPresented: $isShowingSearch) {
       if let config = AppSessionConfig.current {
         NavigationStack {
-          ContactSearchView(config: config, homeRows: model.rows) { payload in
+          ContactSearchView(config: config, homeRows: visibleHomeRows) { payload in
             handleSearchPayload(payload)
           }
         }
@@ -1700,7 +1752,7 @@ private struct ChatHomeScreen: View {
     }
     .sheet(isPresented: $isShowingGroupCreation) {
       if let config = AppSessionConfig.current {
-        ChatGroupCreationSheet(config: config, homeRows: model.rows) { route in
+        ChatGroupCreationSheet(config: config, homeRows: visibleHomeRows) { route in
           coordinator.openChat(route)
           Task { await model.refresh() }
         }
@@ -1890,6 +1942,11 @@ private struct ChatHomeScreen: View {
       return
     }
 
+    if action == .delete {
+      requestHomeDelete(row: row)
+      return
+    }
+
     guard let config = AppSessionConfig.current else {
       AppToastController.shared.show("The current session is unavailable.")
       return
@@ -1908,6 +1965,113 @@ private struct ChatHomeScreen: View {
         AppToastController.shared.show(error.localizedDescription)
       }
     }
+  }
+
+  private func requestHomeDelete(row: ChatHomeListRow) {
+    openPendingSwipeIfNeeded()
+    pendingDeleteConfirmation = ChatHomeDeleteConfirmation(row: row)
+  }
+
+  private func openPendingSwipeIfNeeded() {
+    UIApplication.shared.sendAction(
+      #selector(UIResponder.resignFirstResponder),
+      to: nil,
+      from: nil,
+      for: nil
+    )
+  }
+
+  private func beginPendingHomeDelete(row: ChatHomeListRow, deleteForEveryone: Bool) {
+    if let previous = pendingDeletion {
+      pendingDeletionTask?.cancel()
+      Task { @MainActor in
+        await commitHomeDelete(previous)
+      }
+    }
+
+    pendingDeleteConfirmation = nil
+    locallyHiddenChatIDs.insert(row.chatId)
+    selectedChatIDs.remove(row.chatId)
+    let deletion = ChatHomePendingDeletion(
+      row: row,
+      deleteForEveryone: deleteForEveryone,
+      duration: 5
+    )
+    pendingDeletion = deletion
+    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+    _ = ChatEngine.shared.clearChat([
+      "chatId": row.chatId,
+      "localOnly": true,
+    ])
+
+    pendingDeletionTask?.cancel()
+    pendingDeletionTask = Task { @MainActor in
+      try? await Task.sleep(nanoseconds: UInt64(deletion.duration * 1_000_000_000))
+      guard !Task.isCancelled else { return }
+      await commitHomeDelete(deletion)
+    }
+  }
+
+  private func undoPendingHomeDelete() {
+    guard let deletion = pendingDeletion else { return }
+    pendingDeletionTask?.cancel()
+    pendingDeletionTask = nil
+    pendingDeletion = nil
+    locallyHiddenChatIDs.remove(deletion.row.chatId)
+    if !deletion.row.initialMessages.isEmpty {
+      ChatEngine.shared.seedRecentChatHistory(
+        chatId: deletion.row.chatId,
+        messages: deletion.row.initialMessages,
+        limit: 5
+      )
+    }
+    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+  }
+
+  @MainActor
+  private func commitHomeDelete(_ deletion: ChatHomePendingDeletion) async {
+    guard let config = AppSessionConfig.current else {
+      restoreFailedHomeDelete(deletion, message: "The current session is unavailable.")
+      return
+    }
+
+    do {
+      try await ChatHomeEditService.deleteChat(
+        chatID: deletion.row.chatId,
+        config: config,
+        deleteForEveryone: deletion.deleteForEveryone
+      )
+      if pendingDeletion?.id == deletion.id {
+        pendingDeletion = nil
+        pendingDeletionTask = nil
+      }
+      selectedChatIDs.remove(deletion.row.chatId)
+      await model.refreshAll()
+      AppUITrace.notice(
+        "ChatHomeScreen delete committed chatId=\(String(deletion.row.chatId.prefix(12))) forEveryone=\(deletion.deleteForEveryone ? "Y" : "N")"
+      )
+    } catch {
+      restoreFailedHomeDelete(deletion, message: error.localizedDescription)
+      AppUITrace.error(
+        "ChatHomeScreen delete failed chatId=\(String(deletion.row.chatId.prefix(12))) error=\(error.localizedDescription)"
+      )
+    }
+  }
+
+  private func restoreFailedHomeDelete(_ deletion: ChatHomePendingDeletion, message: String) {
+    if pendingDeletion?.id == deletion.id {
+      pendingDeletion = nil
+      pendingDeletionTask = nil
+    }
+    locallyHiddenChatIDs.remove(deletion.row.chatId)
+    if !deletion.row.initialMessages.isEmpty {
+      ChatEngine.shared.seedRecentChatHistory(
+        chatId: deletion.row.chatId,
+        messages: deletion.row.initialMessages,
+        limit: 5
+      )
+    }
+    AppToastController.shared.show(message)
   }
 
   private func handleSearchPayload(_ payload: [String: Any]) {
@@ -2061,6 +2225,262 @@ private struct ChatHomeScreen: View {
 }
 
 
+private struct ChatHomeDeleteConfirmation: Identifiable {
+  let id = UUID()
+  let row: ChatHomeListRow
+
+  var allowsDeleteForEveryone: Bool {
+    row.peerUserId != nil && !row.isGroup && !row.isBuiltInAgentSurface
+  }
+}
+
+private struct ChatHomePendingDeletion: Identifiable {
+  let id = UUID()
+  let row: ChatHomeListRow
+  let deleteForEveryone: Bool
+  let startedAt: Date
+  let expiresAt: Date
+  let duration: TimeInterval
+
+  init(row: ChatHomeListRow, deleteForEveryone: Bool, duration: TimeInterval) {
+    let now = Date()
+    self.row = row
+    self.deleteForEveryone = deleteForEveryone
+    self.startedAt = now
+    self.duration = duration
+    self.expiresAt = now.addingTimeInterval(duration)
+  }
+}
+
+private struct ChatHomeDeleteDialogView: View {
+  let confirmation: ChatHomeDeleteConfirmation
+  let palette: AppThemePalette
+  let deleteForMe: () -> Void
+  let deleteForEveryone: (() -> Void)?
+  let cancel: () -> Void
+
+  var body: some View {
+    ZStack {
+      Color.black.opacity(0.28)
+        .ignoresSafeArea()
+        .onTapGesture(perform: cancel)
+
+      VStack(spacing: 16) {
+        ChatHomeDeleteAvatarView(row: confirmation.row, palette: palette)
+
+        VStack(spacing: 5) {
+          Text("Delete chat")
+            .font(.system(size: 18, weight: .semibold))
+            .foregroundStyle(palette.text)
+            .lineLimit(1)
+
+          Text("Are you sure you want to delete the chat with \(confirmation.row.title)?")
+            .font(.system(size: 14, weight: .regular))
+            .foregroundStyle(palette.secondaryText)
+            .multilineTextAlignment(.center)
+        }
+
+        VStack(spacing: 10) {
+          if let deleteForEveryone {
+            Button(role: .destructive, action: deleteForEveryone) {
+              Text("Delete for me and \(confirmation.row.title)")
+                .font(.system(size: 16, weight: .semibold))
+                .frame(maxWidth: .infinity)
+                .frame(height: 48)
+            }
+            .buttonStyle(ChatHomeDialogButtonStyle(
+              foreground: palette.danger,
+              background: palette.input,
+              border: palette.border
+            ))
+          }
+
+          Button(role: .destructive, action: deleteForMe) {
+            Text(deleteForEveryone != nil ? "Delete just for me" : "Delete for me")
+              .font(.system(size: 16, weight: .semibold))
+              .frame(maxWidth: .infinity)
+              .frame(height: 48)
+          }
+          .buttonStyle(ChatHomeDialogButtonStyle(
+            foreground: palette.danger,
+            background: palette.input,
+            border: palette.border
+          ))
+
+          Button(action: cancel) {
+            Text("Cancel")
+              .font(.system(size: 16, weight: .semibold))
+              .frame(maxWidth: .infinity)
+              .frame(height: 46)
+          }
+          .buttonStyle(ChatHomeDialogButtonStyle(
+            foreground: palette.text,
+            background: palette.input,
+            border: palette.border
+          ))
+        }
+      }
+      .padding(20)
+      .frame(maxWidth: 340)
+      .background(
+        RoundedRectangle(cornerRadius: 24, style: .continuous)
+          .fill(.ultraThinMaterial)
+      )
+      .overlay(
+        RoundedRectangle(cornerRadius: 24, style: .continuous)
+          .stroke(palette.border, lineWidth: 1)
+      )
+      .shadow(color: Color.black.opacity(0.18), radius: 30, y: 16)
+      .padding(.horizontal, 24)
+    }
+  }
+}
+
+private struct ChatHomeDialogButtonStyle: ButtonStyle {
+  let foreground: Color
+  let background: Color
+  let border: Color
+
+  func makeBody(configuration: Configuration) -> some View {
+    configuration.label
+      .foregroundStyle(foreground)
+      .background(
+        RoundedRectangle(cornerRadius: 14, style: .continuous)
+          .fill(configuration.isPressed ? background.opacity(0.74) : background)
+      )
+      .overlay(
+        RoundedRectangle(cornerRadius: 14, style: .continuous)
+          .stroke(border, lineWidth: 1)
+      )
+      .scaleEffect(configuration.isPressed ? 0.985 : 1)
+      .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+  }
+}
+
+private struct ChatHomeDeleteAvatarView: View {
+  let row: ChatHomeListRow
+  let palette: AppThemePalette
+
+  var body: some View {
+    ZStack {
+      Circle()
+        .fill(avatarGradient)
+
+      if let url = avatarURL {
+        AsyncImage(url: url) { phase in
+          if let image = phase.image {
+            image
+              .resizable()
+              .scaledToFill()
+          } else {
+            fallback
+          }
+        }
+      } else {
+        fallback
+      }
+    }
+    .frame(width: 72, height: 72)
+    .clipShape(Circle())
+    .overlay(Circle().stroke(Color.white.opacity(0.24), lineWidth: 1))
+  }
+
+  private var avatarURL: URL? {
+    guard let avatarUri = row.avatarUri else { return nil }
+    return URL(string: avatarUri)
+  }
+
+  private var fallback: some View {
+    Text(String(row.avatarFallback.prefix(2)).uppercased())
+      .font(.system(size: 24, weight: .bold))
+      .foregroundStyle(.white)
+  }
+
+  private var avatarGradient: LinearGradient {
+    let start = color(from: row.avatarGradientStartLight) ?? palette.accent
+    let end = color(from: row.avatarGradientEndLight) ?? palette.button
+    return LinearGradient(colors: [start, end], startPoint: .topLeading, endPoint: .bottomTrailing)
+  }
+
+  private func color(from raw: String?) -> Color? {
+    guard var hex = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !hex.isEmpty else {
+      return nil
+    }
+    if hex.hasPrefix("#") { hex.removeFirst() }
+    guard hex.count == 6, let value = UInt64(hex, radix: 16) else { return nil }
+    return Color(
+      red: Double((value >> 16) & 0xff) / 255.0,
+      green: Double((value >> 8) & 0xff) / 255.0,
+      blue: Double(value & 0xff) / 255.0
+    )
+  }
+}
+
+private struct ChatHomeDeletionUndoToast: View {
+  let deletion: ChatHomePendingDeletion
+  let palette: AppThemePalette
+  let undo: () -> Void
+
+  var body: some View {
+    TimelineView(.animation) { context in
+      let remaining = max(0, deletion.expiresAt.timeIntervalSince(context.date))
+      let progress = max(0, min(1, remaining / max(0.1, deletion.duration)))
+
+      HStack(spacing: 12) {
+        ZStack {
+          Circle()
+            .stroke(palette.border.opacity(0.65), lineWidth: 3)
+          Circle()
+            .trim(from: 0, to: progress)
+            .stroke(
+              palette.text.opacity(0.7),
+              style: StrokeStyle(lineWidth: 3, lineCap: .round)
+            )
+            .rotationEffect(.degrees(-90))
+          Text("\(Int(ceil(remaining)))")
+            .font(.system(size: 12, weight: .bold, design: .rounded))
+            .foregroundStyle(palette.text)
+            .monospacedDigit()
+        }
+        .frame(width: 34, height: 34)
+
+        Text("\(deletion.row.title) deleted")
+          .font(.system(size: 14, weight: .semibold))
+          .foregroundStyle(palette.text)
+          .lineLimit(1)
+          .frame(maxWidth: .infinity, alignment: .center)
+
+        Button(action: undo) {
+          Text("Undo")
+            .font(.system(size: 14, weight: .bold))
+            .foregroundStyle(palette.text)
+            .padding(.horizontal, 16)
+            .frame(height: 34)
+            .background(
+              RoundedRectangle(cornerRadius: 99, style: .continuous)
+                .fill(palette.text.opacity(0.12))
+            )
+        }
+        .buttonStyle(.plain)
+      }
+      .padding(.leading, 12)
+      .padding(.trailing, 10)
+      .frame(maxWidth: .infinity)
+      .frame(height: 58)
+      .background(
+        RoundedRectangle(cornerRadius: 99, style: .continuous)
+          .fill(.ultraThinMaterial)
+      )
+      .overlay(
+        RoundedRectangle(cornerRadius: 99, style: .continuous)
+          .stroke(palette.border, lineWidth: 1)
+      )
+      .shadow(color: Color.black.opacity(0.16), radius: 20, y: 10)
+    }
+  }
+}
+
+
 private struct SettingsRootView: View {
   @EnvironmentObject private var coordinator: AppShellCoordinator
   var body: some View {
@@ -2157,6 +2577,19 @@ private enum ChatHomeEditService {
     try await performRequest(endpoint: endpoint, method: method, body: body, config: config)
   }
 
+  static func deleteChat(
+    chatID: String,
+    config: AppSessionConfig,
+    deleteForEveryone: Bool
+  ) async throws {
+    try await performRequest(
+      endpoint: "/chats/\(chatID)",
+      method: "DELETE",
+      body: deleteForEveryone ? ["deleteForEveryone": true] : nil,
+      config: config
+    )
+  }
+
   private static func apply(
     action: ChatHomeEditBulkAction,
     chatID: String,
@@ -2238,18 +2671,23 @@ private struct ArchivedChatHomeListScreen: View {
   @ObservedObject var model: ChatsViewModel
   let palette: AppThemePalette
   let isDark: Bool
+  let hiddenChatIDs: Set<String>
   let openRow: (ChatHomeListRow) -> Void
   let performAction: (ChatHomeRowAction, ChatHomeListRow) -> Void
 
+  private var visibleRows: [ChatHomeListRow] {
+    model.archivedRows.filter { !hiddenChatIDs.contains($0.chatId) }
+  }
+
   var body: some View {
     Group {
-      if model.archivedRows.isEmpty && model.isLoadingArchived {
+      if visibleRows.isEmpty && model.isLoadingArchived {
         ProgressView()
           .controlSize(.regular)
           .tint(palette.secondaryText)
           .frame(maxWidth: .infinity, maxHeight: .infinity)
           .background(palette.background)
-      } else if model.archivedRows.isEmpty {
+      } else if visibleRows.isEmpty {
         VStack(spacing: 10) {
           Image(systemName: "archivebox")
             .font(.system(size: 28, weight: .medium))
@@ -2267,7 +2705,7 @@ private struct ArchivedChatHomeListScreen: View {
         .background(palette.background)
       } else {
         ChatHomeNativeListRepresentable(
-          rows: model.archivedRows,
+          rows: visibleRows,
           isDark: isDark,
           isEditing: false,
           showsRightCheckmark: false,
@@ -2507,10 +2945,23 @@ private struct ChatHomeNativeListRepresentable: UIViewControllerRepresentable {
 }
 
 private final class ChatHomeNativeListController: UIViewController, UITableViewDataSource,
-  UITableViewDelegate, ChatHomeCardCellSwipeDelegate
+  UITableViewDelegate, UIGestureRecognizerDelegate, ChatHomeCardCellSwipeDelegate
 {
   private let tableView = UITableView(frame: .zero, style: .plain)
   private let refreshControl = UIRefreshControl()
+  private lazy var previewLongPressRecognizer: UILongPressGestureRecognizer = {
+    let recognizer = UILongPressGestureRecognizer(
+      target: self,
+      action: #selector(handlePreviewLongPress(_:))
+    )
+    recognizer.minimumPressDuration = 0.24
+    recognizer.allowableMovement = 10.0
+    recognizer.delaysTouchesBegan = false
+    recognizer.delaysTouchesEnded = false
+    recognizer.cancelsTouchesInView = true
+    recognizer.delegate = self
+    return recognizer
+  }()
 
   fileprivate var onSelect: (ChatHomeListRow) -> Void = { _ in }
   fileprivate var onToggleSelection: (String) -> Void = { _ in }
@@ -2530,6 +2981,8 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
   private var isRunningRefresh = false
   private var lastAppliedSignature = ""
   private weak var openSwipeCell: ChatHomeCardCell?
+  private weak var heldPreviewCell: ChatHomeCardCell?
+  private var suppressSelectionUntil: CFTimeInterval = 0
 
   override func viewSafeAreaInsetsDidChange() {
     super.viewSafeAreaInsetsDidChange()
@@ -2567,6 +3020,7 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     tableView.delegate = self
     tableView.register(ChatHomeCardCell.self, forCellReuseIdentifier: ChatHomeCardCell.reuseIdentifier)
     tableView.refreshControl = refreshControl
+    tableView.addGestureRecognizer(previewLongPressRecognizer)
     refreshControl.addTarget(self, action: #selector(handleRefresh), for: .valueChanged)
 
     view.addSubview(tableView)
@@ -2626,6 +3080,7 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     )
     guard nextSignature != lastAppliedSignature else { return }
     let startedAt = ProcessInfo.processInfo.systemUptime
+    let previousRows = self.rows
     let previousRowCount = self.rows.count
     let previousContentOffset = tableView.contentOffset
     AppUITrace.notice(
@@ -2635,6 +3090,11 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       "ChatHomeNativeListController apply nextRows=\(rows.count) previousRows=\(previousRowCount)"
     )
     lastAppliedSignature = nextSignature
+    let rowDelta = Self.animatableRowDelta(from: previousRows, to: rows)
+    let canAnimateRowDelta = rowDelta != nil && isViewLoaded && view.window != nil && !isRunningRefresh
+    let deletionOverlays = canAnimateRowDelta
+      ? captureDeletionOverlays(for: rowDelta?.deletedIndexPaths ?? [])
+      : []
     self.rows = rows
     self.isDark = isDark
     self.isEditingMode = isEditing
@@ -2651,18 +3111,23 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       return
     }
 
-    let shouldPreserveOffset = previousRowCount == rows.count && !rows.isEmpty && view.window != nil
-    UIView.performWithoutAnimation {
-      tableView.reloadData()
-      if shouldPreserveOffset {
-        tableView.layoutIfNeeded()
-        let minY = -tableView.adjustedContentInset.top
-        let maxY = max(
-          minY,
-          tableView.contentSize.height - tableView.bounds.height + tableView.adjustedContentInset.bottom
-        )
-        let y = min(max(previousContentOffset.y, minY), maxY)
-        tableView.setContentOffset(CGPoint(x: previousContentOffset.x, y: y), animated: false)
+    if canAnimateRowDelta, let rowDelta {
+      performAnimatedRowDelta(rowDelta, deletionOverlays: deletionOverlays)
+    } else {
+      deletionOverlays.forEach { $0.removeFromSuperview() }
+      let shouldPreserveOffset = previousRowCount == rows.count && !rows.isEmpty && view.window != nil
+      UIView.performWithoutAnimation {
+        tableView.reloadData()
+        if shouldPreserveOffset {
+          tableView.layoutIfNeeded()
+          let minY = -tableView.adjustedContentInset.top
+          let maxY = max(
+            minY,
+            tableView.contentSize.height - tableView.bounds.height + tableView.adjustedContentInset.bottom
+          )
+          let y = min(max(previousContentOffset.y, minY), maxY)
+          tableView.setContentOffset(CGPoint(x: previousContentOffset.x, y: y), animated: false)
+        }
       }
     }
     AppUITrace.notice(
@@ -2671,6 +3136,70 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     AppUIStallWatchdog.shared.updateContext(
       "ChatHomeNativeListController apply done rows=\(rows.count)"
     )
+  }
+
+  private struct AnimatableRowDelta {
+    let deletedIndexPaths: [IndexPath]
+    let insertedIndexPaths: [IndexPath]
+  }
+
+  private static func animatableRowDelta(
+    from previousRows: [ChatHomeListRow],
+    to nextRows: [ChatHomeListRow]
+  ) -> AnimatableRowDelta? {
+    let previousIDs = previousRows.map(\.chatId)
+    let nextIDs = nextRows.map(\.chatId)
+    let previousSet = Set(previousIDs)
+    let nextSet = Set(nextIDs)
+
+    guard previousSet.count == previousIDs.count, nextSet.count == nextIDs.count else { return nil }
+
+    let deleted = previousIDs.enumerated().compactMap { index, chatId -> IndexPath? in
+      nextSet.contains(chatId) ? nil : IndexPath(row: index, section: 0)
+    }
+    let inserted = nextIDs.enumerated().compactMap { index, chatId -> IndexPath? in
+      previousSet.contains(chatId) ? nil : IndexPath(row: index, section: 0)
+    }
+
+    guard !deleted.isEmpty || !inserted.isEmpty else { return nil }
+    guard deleted.count + inserted.count <= 4 else { return nil }
+
+    let previousSharedOrder = previousIDs.filter { nextSet.contains($0) }
+    let nextSharedOrder = nextIDs.filter { previousSet.contains($0) }
+    guard previousSharedOrder == nextSharedOrder else { return nil }
+
+    return AnimatableRowDelta(deletedIndexPaths: deleted, insertedIndexPaths: inserted)
+  }
+
+  private func captureDeletionOverlays(for indexPaths: [IndexPath]) -> [ChatHomeDeletionWipeOverlayView] {
+    indexPaths.compactMap { indexPath in
+      guard let cell = tableView.cellForRow(at: indexPath) as? ChatHomeCardCell else { return nil }
+      let frame = tableView.convert(cell.frame, to: view)
+      guard frame.intersects(view.bounds) else { return nil }
+      let overlay = ChatHomeDeletionWipeOverlayView(
+        frame: frame,
+        snapshot: cell.contentView.snapshotView(afterScreenUpdates: false),
+        isDark: isDark
+      )
+      view.addSubview(overlay)
+      return overlay
+    }
+  }
+
+  private func performAnimatedRowDelta(
+    _ delta: AnimatableRowDelta,
+    deletionOverlays: [ChatHomeDeletionWipeOverlayView]
+  ) {
+    tableView.performBatchUpdates {
+      if !delta.deletedIndexPaths.isEmpty {
+        tableView.deleteRows(at: delta.deletedIndexPaths, with: .none)
+      }
+      if !delta.insertedIndexPaths.isEmpty {
+        tableView.insertRows(at: delta.insertedIndexPaths, with: .fade)
+      }
+    } completion: { _ in
+      deletionOverlays.forEach { $0.animateAndRemove() }
+    }
   }
 
   private static func signature(
@@ -2717,6 +3246,96 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     }
   }
 
+  @objc private func handlePreviewLongPress(_ recognizer: UILongPressGestureRecognizer) {
+    switch recognizer.state {
+    case .began:
+      guard !isEditingMode, presentedViewController == nil else { return }
+      let point = recognizer.location(in: tableView)
+      guard
+        let indexPath = tableView.indexPathForRow(at: point),
+        rows.indices.contains(indexPath.row)
+      else { return }
+
+      let row = rows[indexPath.row]
+      guard !row.isArchiveEntry else { return }
+      openSwipeCell?.closeSwipe(animated: true)
+      openSwipeCell = nil
+      suppressSelectionUntil = CACurrentMediaTime() + 1.0
+
+      guard let cell = tableView.cellForRow(at: indexPath) as? ChatHomeCardCell else { return }
+      heldPreviewCell = cell
+      UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+      setPreviewHoldFeedback(cell, held: true, animated: true)
+
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self, weak recognizer, weak cell] in
+        guard let self, let recognizer else { return }
+        guard recognizer.state == .began || recognizer.state == .changed else {
+          if let cell {
+            self.setPreviewHoldFeedback(cell, held: false, animated: true)
+          }
+          return
+        }
+        guard self.presentedViewController == nil else {
+          if let cell {
+            self.setPreviewHoldFeedback(cell, held: false, animated: false)
+          }
+          return
+        }
+        if let cell {
+          self.setPreviewHoldFeedback(cell, held: false, animated: false)
+        }
+        self.presentMiniPreview(for: row, sourceIndexPath: indexPath)
+      }
+
+    case .ended, .cancelled, .failed:
+      suppressSelectionUntil = CACurrentMediaTime() + 0.7
+      if presentedViewController == nil, let heldPreviewCell {
+        setPreviewHoldFeedback(heldPreviewCell, held: false, animated: true)
+      }
+      heldPreviewCell = nil
+
+    default:
+      break
+    }
+  }
+
+  private func setPreviewHoldFeedback(_ cell: ChatHomeCardCell, held: Bool, animated: Bool) {
+    let changes = {
+      cell.transform = held ? CGAffineTransform(scaleX: 0.965, y: 0.965) : .identity
+    }
+    if !animated {
+      changes()
+      return
+    }
+    UIView.animate(
+      withDuration: held ? 0.18 : 0.24,
+      delay: 0.0,
+      usingSpringWithDamping: held ? 0.96 : 0.86,
+      initialSpringVelocity: 0.0,
+      options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut],
+      animations: changes
+    )
+  }
+
+  private func presentMiniPreview(for row: ChatHomeListRow, sourceIndexPath: IndexPath) {
+    let sourceFrame = tableView.rectForRow(at: sourceIndexPath)
+    let sourceFrameInWindow = tableView.convert(sourceFrame, to: nil)
+    let overlay = ChatHomeMiniPreviewOverlayController(
+      row: row,
+      isDark: isDark,
+      sourceFrameInWindow: sourceFrameInWindow,
+      onOpen: { [weak self] row in
+        self?.onSelect(row)
+      },
+      onAction: { [weak self] action, row in
+        self?.onAction(action, row)
+      }
+    )
+    overlay.modalPresentationStyle = .overFullScreen
+    overlay.modalTransitionStyle = .crossDissolve
+    present(overlay, animated: false)
+  }
+
   func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
     rows.count
   }
@@ -2751,7 +3370,7 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
 
   func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
     guard rows.indices.contains(indexPath.row) else { return }
-    if presentedViewController != nil {
+    if CACurrentMediaTime() < suppressSelectionUntil || presentedViewController != nil {
       tableView.deselectRow(at: indexPath, animated: false)
       return
     }
@@ -2787,96 +3406,6 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
 
   func tableView(
     _ tableView: UITableView,
-    contextMenuConfigurationForRowAt indexPath: IndexPath,
-    point: CGPoint
-  ) -> UIContextMenuConfiguration? {
-    guard !isEditingMode, rows.indices.contains(indexPath.row) else { return nil }
-    let row = rows[indexPath.row]
-    guard !row.isArchiveEntry else { return nil }
-
-    openSwipeCell?.closeSwipe(animated: true)
-    openSwipeCell = nil
-    let currentIsDark = isDark
-
-    return UIContextMenuConfiguration(identifier: row.chatId as NSString) { [weak self] in
-      ChatHomeMiniPreviewController(row: row, isDark: self?.isDark ?? currentIsDark)
-    } actionProvider: { [weak self] _ in
-      let openAction = UIAction(
-        title: "Open Chat",
-        image: UIImage(systemName: "bubble.left.fill")
-      ) { [weak self] _ in
-        self?.onSelect(row)
-      }
-
-      var actions: [UIMenuElement] = [openAction]
-      if row.supportsRemoteHomeActions {
-        let hasUnread = row.hasUnreadState
-        let readAction = UIAction(
-          title: hasUnread ? "Mark as Read" : "Mark as Unread",
-          image: UIImage(systemName: hasUnread ? "envelope.open.fill" : "envelope.badge.fill")
-        ) { [weak self] _ in
-          self?.onAction(.markUnread(!hasUnread), row)
-        }
-
-        let pinAction = UIAction(
-          title: row.pinned ? "Unpin" : "Pin",
-          image: UIImage(systemName: row.pinned ? "pin.slash.fill" : "pin.fill")
-        ) { [weak self] _ in
-          self?.onAction(.pin(!row.pinned), row)
-        }
-
-        let muteAction = UIAction(
-          title: row.muted ? "Unmute" : "Mute",
-          image: UIImage(systemName: row.muted ? "speaker.wave.2.fill" : "speaker.slash.fill")
-        ) { [weak self] _ in
-          self?.onAction(.mute(!row.muted), row)
-        }
-
-        let archiveAction = UIAction(
-          title: row.archived ? "Unarchive" : "Archive",
-          image: UIImage(systemName: row.archived ? "tray.and.arrow.up.fill" : "archivebox.fill")
-        ) { [weak self] _ in
-          self?.onAction(.archive(!row.archived), row)
-        }
-
-        let deleteAction = UIAction(
-          title: "Delete",
-          image: UIImage(systemName: "trash.fill"),
-          attributes: .destructive
-        ) { [weak self] _ in
-          self?.onAction(.delete, row)
-        }
-
-        actions.append(contentsOf: [readAction, pinAction, muteAction, archiveAction, deleteAction])
-      }
-
-      return UIMenu(title: "", children: actions)
-    }
-  }
-
-  func tableView(
-    _ tableView: UITableView,
-    willPerformPreviewActionForMenuWith configuration: UIContextMenuConfiguration,
-    animator: UIContextMenuInteractionCommitAnimating
-  ) {
-    let chatId: String?
-    if let value = configuration.identifier as? String {
-      chatId = value
-    } else if let value = configuration.identifier as? NSString {
-      chatId = value as String
-    } else {
-      chatId = nil
-    }
-    guard let chatId,
-      let row = rows.first(where: { $0.chatId == chatId })
-    else { return }
-    animator.addCompletion { [weak self] in
-      self?.onSelect(row)
-    }
-  }
-
-  func tableView(
-    _ tableView: UITableView,
     leadingSwipeActionsConfigurationForRowAt indexPath: IndexPath
   ) -> UISwipeActionsConfiguration? {
     guard !isEditingMode, rows.indices.contains(indexPath.row) else { return nil }
@@ -2907,6 +3436,13 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     let configuration = UISwipeActionsConfiguration(actions: [pin, unread])
     configuration.performsFirstActionWithFullSwipe = true
     return configuration
+  }
+
+  func gestureRecognizer(
+    _ gestureRecognizer: UIGestureRecognizer,
+    shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+  ) -> Bool {
+    false
   }
 
   func tableView(
@@ -3051,6 +3587,604 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     let b = CGFloat((value >> 8) & 0xFF) / 255.0
     let a = CGFloat(value & 0xFF) / 255.0
     return UIColor(red: r, green: g, blue: b, alpha: a)
+  }
+}
+
+private final class ChatHomeDeletionWipeOverlayView: UIView {
+  private let snapshotContainer = UIView()
+  private let emitter = CAEmitterLayer()
+
+  init(frame: CGRect, snapshot: UIView?, isDark: Bool) {
+    super.init(frame: frame)
+    isUserInteractionEnabled = false
+    clipsToBounds = false
+    layer.cornerCurve = .continuous
+
+    snapshotContainer.frame = bounds
+    snapshotContainer.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    addSubview(snapshotContainer)
+
+    if let snapshot {
+      snapshot.frame = snapshotContainer.bounds
+      snapshot.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+      snapshotContainer.addSubview(snapshot)
+    }
+
+    emitter.emitterPosition = CGPoint(x: bounds.midX, y: bounds.midY)
+    emitter.emitterSize = bounds.size
+    emitter.emitterShape = .rectangle
+
+    let cell = CAEmitterCell()
+    cell.contents = createParticleImage()?.cgImage
+    cell.birthRate = 1800
+    cell.lifetime = 0.8
+    cell.velocity = 180
+    cell.velocityRange = 100
+    cell.emissionRange = .pi * 2
+    cell.scale = 0.8
+    cell.scaleRange = 0.4
+    cell.scaleSpeed = -0.6
+    cell.alphaSpeed = -1.2
+    cell.yAcceleration = 400
+
+    emitter.emitterCells = [cell]
+    layer.addSublayer(emitter)
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  func animateAndRemove() {
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+      self.emitter.birthRate = 0
+    }
+
+    var transform = CATransform3DIdentity
+    transform.m34 = -1.0 / 600.0
+    transform = CATransform3DTranslate(transform, 0, 50, -150)
+    transform = CATransform3DRotate(transform, -.pi / 3, 1, 0, 0)
+    transform = CATransform3DScale(transform, 0.1, 0.1, 0.1)
+
+    UIView.animate(withDuration: 0.45, delay: 0, options: .curveEaseIn, animations: {
+      self.snapshotContainer.layer.transform = transform
+      self.snapshotContainer.alpha = 0
+    }) { _ in
+      self.removeFromSuperview()
+    }
+  }
+
+  private func createParticleImage() -> UIImage? {
+    let size = CGSize(width: 8, height: 8)
+    UIGraphicsBeginImageContextWithOptions(size, false, 0)
+    guard let context = UIGraphicsGetCurrentContext() else { return nil }
+    context.setFillColor(UIColor.systemGray.withAlphaComponent(0.8).cgColor)
+    context.fillEllipse(in: CGRect(origin: .zero, size: size))
+    let image = UIGraphicsGetImageFromCurrentImageContext()
+    UIGraphicsEndImageContext()
+    return image
+  }
+}
+
+private protocol ChatHomePreviewActionMenuViewDelegate: AnyObject {
+  func homePreviewActionMenu(_ menu: ChatHomePreviewActionMenuView, didSelect action: ChatHomePreviewActionMenuView.Action)
+}
+
+private func makeHomePreviewGlassView(
+  style: UIBlurEffect.Style,
+  cornerRadius: CGFloat,
+  capsuleCorners: Bool = false,
+  interactive: Bool = false
+) -> UIVisualEffectView {
+  let view = UIVisualEffectView(effect: nil)
+  if #available(iOS 26.0, *) {
+    let effect = UIGlassEffect(style: .regular)
+    effect.isInteractive = interactive
+    view.effect = effect
+    if capsuleCorners {
+      view.cornerConfiguration = .capsule()
+    } else {
+      view.layer.cornerRadius = cornerRadius
+      view.layer.cornerCurve = .continuous
+    }
+  } else {
+    view.effect = UIBlurEffect(style: style)
+    view.layer.cornerRadius = cornerRadius
+    view.layer.cornerCurve = .continuous
+  }
+  view.clipsToBounds = true
+  return view
+}
+
+private final class ChatHomeMiniPreviewOverlayController: UIViewController,
+  UIGestureRecognizerDelegate, ChatHomePreviewActionMenuViewDelegate
+{
+  private let backgroundGlassView: UIVisualEffectView
+  private let colorOverlayView = UIView()
+  private let previewGroupView = UIView()
+  private let previewContainerView = UIView()
+  private let menuView: ChatHomePreviewActionMenuView
+  private let previewController: ChatHomeMiniPreviewController
+  private let row: ChatHomeListRow
+  private let isDark: Bool
+  private let sourceFrameInWindow: CGRect
+  private let onOpen: (ChatHomeListRow) -> Void
+  private let onAction: (ChatHomeRowAction, ChatHomeListRow) -> Void
+  private var isClosing = false
+  private var ignoreBackdropTapUntil: CFTimeInterval = 0
+
+  init(
+    row: ChatHomeListRow,
+    isDark: Bool,
+    sourceFrameInWindow: CGRect,
+    onOpen: @escaping (ChatHomeListRow) -> Void,
+    onAction: @escaping (ChatHomeRowAction, ChatHomeListRow) -> Void
+  ) {
+    self.row = row
+    self.isDark = isDark
+    self.sourceFrameInWindow = sourceFrameInWindow
+    self.onOpen = onOpen
+    self.onAction = onAction
+    self.backgroundGlassView = UIVisualEffectView(
+      effect: UIBlurEffect(style: isDark ? .systemMaterialDark : .systemMaterialLight)
+    )
+    self.menuView = ChatHomePreviewActionMenuView(row: row, isDark: isDark)
+    self.previewController = ChatHomeMiniPreviewController(row: row, isDark: isDark)
+    super.init(nibName: nil, bundle: nil)
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  override var preferredStatusBarStyle: UIStatusBarStyle {
+    isDark ? .lightContent : .darkContent
+  }
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    view.backgroundColor = .clear
+
+    backgroundGlassView.alpha = 0
+    backgroundGlassView.frame = view.bounds
+    backgroundGlassView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    view.addSubview(backgroundGlassView)
+
+    colorOverlayView.backgroundColor = (isDark ? UIColor.black : UIColor.white)
+      .withAlphaComponent(isDark ? 0.34 : 0.24)
+    colorOverlayView.frame = backgroundGlassView.contentView.bounds
+    colorOverlayView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    backgroundGlassView.contentView.addSubview(colorOverlayView)
+
+    previewGroupView.alpha = 0
+    view.addSubview(previewGroupView)
+
+    previewContainerView.clipsToBounds = true
+    previewContainerView.layer.cornerRadius = 22
+    previewContainerView.layer.cornerCurve = .continuous
+    previewContainerView.layer.shadowColor = UIColor.black.cgColor
+    previewContainerView.layer.shadowOpacity = isDark ? 0.28 : 0.18
+    previewContainerView.layer.shadowRadius = 24
+    previewContainerView.layer.shadowOffset = CGSize(width: 0, height: 14)
+    previewGroupView.addSubview(previewContainerView)
+
+    addChild(previewController)
+    previewController.view.frame = previewContainerView.bounds
+    previewController.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    previewContainerView.addSubview(previewController.view)
+    previewController.didMove(toParent: self)
+
+    menuView.delegate = self
+    menuView.alpha = 0
+    previewGroupView.addSubview(menuView)
+
+    let tapRecognizer = UITapGestureRecognizer(target: self, action: #selector(handleBackdropTap(_:)))
+    tapRecognizer.delegate = self
+    tapRecognizer.cancelsTouchesInView = false
+    tapRecognizer.delaysTouchesBegan = false
+    tapRecognizer.delaysTouchesEnded = false
+    view.addGestureRecognizer(tapRecognizer)
+  }
+
+  override func viewDidLayoutSubviews() {
+    super.viewDidLayoutSubviews()
+    guard !isClosing else { return }
+    backgroundGlassView.frame = view.bounds
+    colorOverlayView.frame = backgroundGlassView.contentView.bounds
+    layoutPreviewAndMenu()
+  }
+
+  override func viewDidAppear(_ animated: Bool) {
+    super.viewDidAppear(animated)
+    animateIn()
+  }
+
+  @discardableResult
+  private func layoutPreviewAndMenu() -> CGRect {
+    let bounds = view.bounds
+    guard bounds.width > 1, bounds.height > 1 else { return .zero }
+
+    let safeTop = view.safeAreaInsets.top + 14
+    let safeBottom = bounds.height - view.safeAreaInsets.bottom - 14
+    let safeLeft: CGFloat = 10
+    let safeRight = bounds.width - 10
+    let availableHeight = max(320, safeBottom - safeTop)
+
+    let menuWidth = min(max(220, bounds.width * 0.54), min(268, bounds.width - 32))
+    let menuHeight = menuView.systemLayoutSizeFitting(
+      CGSize(width: menuWidth, height: UIView.layoutFittingCompressedSize.height),
+      withHorizontalFittingPriority: .required,
+      verticalFittingPriority: .fittingSizeLevel
+    ).height
+    let menuGap: CGFloat = 4
+
+    let previewWidth = min(max(300, bounds.width - 20), 560)
+    let maxPreviewHeight = max(300, availableHeight - menuHeight - menuGap)
+    let minPreviewHeight = min(maxPreviewHeight, min(380, max(320, availableHeight * 0.48)))
+    let preferredPreviewHeight = min(bounds.height * 0.68, maxPreviewHeight)
+    let previewHeight = max(minPreviewHeight, preferredPreviewHeight)
+    let groupHeight = previewHeight + menuGap + menuHeight
+    let sourceFrame = view.convert(sourceFrameInWindow, from: nil)
+    let desiredGroupY = sourceFrame.midY - groupHeight * 0.22
+    let groupY = max(safeTop, min(safeBottom - groupHeight, desiredGroupY))
+    let previewX = max(safeLeft, min(safeRight - previewWidth, (bounds.width - previewWidth) * 0.5))
+    let previewFrame = CGRect(x: previewX, y: groupY, width: previewWidth, height: previewHeight)
+
+    let isRightAligned = sourceFrame.midX >= bounds.midX
+    let menuX: CGFloat
+    if isRightAligned {
+      menuX = previewFrame.maxX - menuWidth - 12
+    } else {
+      menuX = previewFrame.minX + 12
+    }
+    let menuFrame = CGRect(
+      x: max(safeLeft, min(safeRight - menuWidth, menuX)),
+      y: previewFrame.maxY + menuGap,
+      width: menuWidth,
+      height: menuHeight
+    )
+
+    previewGroupView.frame = CGRect(
+      x: 0,
+      y: 0,
+      width: bounds.width,
+      height: bounds.height
+    )
+    previewContainerView.frame = previewFrame
+    previewController.view.frame = previewContainerView.bounds
+    menuView.frame = menuFrame
+    previewContainerView.layer.shadowPath = UIBezierPath(
+      roundedRect: previewContainerView.bounds,
+      cornerRadius: previewContainerView.layer.cornerRadius
+    ).cgPath
+    return previewFrame
+  }
+
+  private func animateIn() {
+    view.layoutIfNeeded()
+    let finalPreviewFrame = layoutPreviewAndMenu()
+    guard finalPreviewFrame.width > 1, finalPreviewFrame.height > 1 else { return }
+
+    let sourceFrame = view.convert(sourceFrameInWindow, from: nil)
+    let finalCenter = CGPoint(x: finalPreviewFrame.midX, y: finalPreviewFrame.midY)
+    let sourceCenter = CGPoint(x: sourceFrame.midX, y: sourceFrame.midY)
+    let scaleX = max(0.12, min(1.0, sourceFrame.width / finalPreviewFrame.width))
+    let scaleY = max(0.12, min(1.0, sourceFrame.height / finalPreviewFrame.height))
+
+    previewGroupView.alpha = 1
+    previewContainerView.center = sourceCenter
+    previewContainerView.bounds = CGRect(origin: .zero, size: finalPreviewFrame.size)
+    previewContainerView.transform = CGAffineTransform(scaleX: scaleX, y: scaleY)
+    previewController.view.frame = previewContainerView.bounds
+
+    let finalMenuFrame = menuView.frame
+    menuView.frame = finalMenuFrame
+    menuView.layer.anchorPoint = CGPoint(x: finalMenuFrame.midX >= view.bounds.midX ? 1.0 : 0.0, y: 0.0)
+    menuView.center = CGPoint(x: finalMenuFrame.midX, y: finalMenuFrame.midY)
+    menuView.transform = CGAffineTransform(translationX: 0, y: -4).scaledBy(x: 0.92, y: 0.92)
+
+    menuView.isUserInteractionEnabled = false
+    ignoreBackdropTapUntil = CACurrentMediaTime() + 0.65
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.28) { [weak self] in
+      guard let self, !self.isClosing else { return }
+      self.menuView.isUserInteractionEnabled = true
+    }
+
+    UIView.animate(
+      withDuration: 0.20,
+      delay: 0.0,
+      options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut]
+    ) {
+      self.backgroundGlassView.alpha = 1
+    }
+
+    UIView.animate(
+      withDuration: 0.36,
+      delay: 0.0,
+      usingSpringWithDamping: 0.86,
+      initialSpringVelocity: 0.0,
+      options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut]
+    ) {
+      self.previewContainerView.transform = .identity
+      self.previewContainerView.center = finalCenter
+    }
+
+    UIView.animate(
+      withDuration: 0.20,
+      delay: 0.06,
+      options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut]
+    ) {
+      self.menuView.alpha = 1
+    }
+    UIView.animate(
+      withDuration: 0.34,
+      delay: 0.06,
+      usingSpringWithDamping: 0.84,
+      initialSpringVelocity: 0.0,
+      options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut]
+    ) {
+      self.menuView.transform = .identity
+    }
+  }
+
+  @objc private func handleBackdropTap(_ recognizer: UITapGestureRecognizer) {
+    guard CACurrentMediaTime() >= ignoreBackdropTapUntil else { return }
+    close()
+  }
+
+  func homePreviewActionMenu(
+    _ menu: ChatHomePreviewActionMenuView,
+    didSelect action: ChatHomePreviewActionMenuView.Action
+  ) {
+    switch action {
+    case .open:
+      close(after: { [row, onOpen] in onOpen(row) })
+    case .markUnread:
+      close(after: { [row, onAction] in onAction(.markUnread(!row.hasUnreadState), row) })
+    case .pin:
+      close(after: { [row, onAction] in onAction(.pin(!row.pinned), row) })
+    case .mute:
+      close(after: { [row, onAction] in onAction(.mute(!row.muted), row) })
+    case .archive:
+      close(after: { [row, onAction] in onAction(.archive(!row.archived), row) })
+    case .delete:
+      close(after: { [row, onAction] in onAction(.delete, row) })
+    }
+  }
+
+  private func close(after action: (() -> Void)? = nil) {
+    guard !isClosing else { return }
+    isClosing = true
+    menuView.isUserInteractionEnabled = false
+
+    let sourceFrame = view.convert(sourceFrameInWindow, from: nil)
+    let finalPreviewFrame = previewContainerView.frame
+    let scaleX = max(0.12, min(1.0, sourceFrame.width / max(1, finalPreviewFrame.width)))
+    let scaleY = max(0.12, min(1.0, sourceFrame.height / max(1, finalPreviewFrame.height)))
+
+    UIView.animate(
+      withDuration: 0.18,
+      delay: 0.0,
+      options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut]
+    ) {
+      self.backgroundGlassView.alpha = 0
+      self.menuView.alpha = 0
+      self.menuView.transform = CGAffineTransform(translationX: 0, y: -3).scaledBy(x: 0.94, y: 0.94)
+      self.previewContainerView.center = CGPoint(x: sourceFrame.midX, y: sourceFrame.midY)
+      self.previewContainerView.transform = CGAffineTransform(scaleX: scaleX, y: scaleY)
+      self.previewContainerView.alpha = 0.0
+    } completion: { _ in
+      self.dismiss(animated: false, completion: action)
+    }
+  }
+
+  func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch)
+    -> Bool
+  {
+    guard CACurrentMediaTime() >= ignoreBackdropTapUntil else { return false }
+    let point = touch.location(in: view)
+    if previewContainerView.frame.contains(point) { return false }
+    if menuView.frame.contains(point) { return false }
+    return true
+  }
+
+  func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+    guard CACurrentMediaTime() >= ignoreBackdropTapUntil else { return false }
+    let point = gestureRecognizer.location(in: view)
+    if previewContainerView.frame.contains(point) { return false }
+    if menuView.frame.contains(point) { return false }
+    return true
+  }
+}
+
+private final class ChatHomePreviewActionMenuView: UIView {
+  enum Action: String {
+    case open
+    case markUnread
+    case pin
+    case mute
+    case archive
+    case delete
+  }
+
+  weak var delegate: ChatHomePreviewActionMenuViewDelegate?
+
+  private let glassView: UIVisualEffectView
+  private let stackView = UIStackView()
+  private let row: ChatHomeListRow
+  private let isDark: Bool
+  private var displayScale: CGFloat {
+    let scale = window?.windowScene?.screen.scale ?? traitCollection.displayScale
+    return scale > 0 ? scale : 3
+  }
+
+  init(row: ChatHomeListRow, isDark: Bool) {
+    self.row = row
+    self.isDark = isDark
+    self.glassView = makeHomePreviewGlassView(
+      style: isDark ? .systemMaterialDark : .systemMaterialLight,
+      cornerRadius: 24
+    )
+    super.init(frame: .zero)
+    setup()
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  private func setup() {
+    clipsToBounds = false
+    glassView.translatesAutoresizingMaskIntoConstraints = false
+    glassView.layer.borderColor = UIColor.white.withAlphaComponent(isDark ? 0.14 : 0.18).cgColor
+    glassView.layer.borderWidth = 1.0 / displayScale
+    addSubview(glassView)
+
+    stackView.axis = .vertical
+    stackView.spacing = 0
+    stackView.translatesAutoresizingMaskIntoConstraints = false
+    glassView.contentView.addSubview(stackView)
+
+    NSLayoutConstraint.activate([
+      glassView.leadingAnchor.constraint(equalTo: leadingAnchor),
+      glassView.trailingAnchor.constraint(equalTo: trailingAnchor),
+      glassView.topAnchor.constraint(equalTo: topAnchor),
+      glassView.bottomAnchor.constraint(equalTo: bottomAnchor),
+      stackView.leadingAnchor.constraint(equalTo: glassView.contentView.leadingAnchor),
+      stackView.trailingAnchor.constraint(equalTo: glassView.contentView.trailingAnchor),
+      stackView.topAnchor.constraint(equalTo: glassView.contentView.topAnchor, constant: 8),
+      stackView.bottomAnchor.constraint(equalTo: glassView.contentView.bottomAnchor, constant: -8),
+    ])
+
+    let actions = actionItems()
+    for (index, item) in actions.enumerated() {
+      if index > 0 {
+        stackView.addArrangedSubview(separatorView())
+      }
+      let rowView = ChatHomePreviewActionRow(item: item, isDark: isDark)
+      rowView.addTarget(self, action: #selector(handleRowTap(_:)), for: .touchUpInside)
+      stackView.addArrangedSubview(rowView)
+    }
+  }
+
+  private func actionItems() -> [ChatHomePreviewActionRow.Item] {
+    var items: [ChatHomePreviewActionRow.Item] = [
+      .init(action: .open, title: "Open Chat", iconName: "bubble.left.fill", isDestructive: false)
+    ]
+    guard row.supportsRemoteHomeActions else { return items }
+    let hasUnread = row.hasUnreadState
+    items.append(contentsOf: [
+      .init(
+        action: .markUnread,
+        title: hasUnread ? "Mark as Read" : "Mark as Unread",
+        iconName: hasUnread ? "envelope.open.fill" : "envelope.badge.fill",
+        isDestructive: false
+      ),
+      .init(
+        action: .pin,
+        title: row.pinned ? "Unpin" : "Pin",
+        iconName: row.pinned ? "pin.slash.fill" : "pin.fill",
+        isDestructive: false
+      ),
+      .init(
+        action: .mute,
+        title: row.muted ? "Unmute" : "Mute",
+        iconName: row.muted ? "speaker.wave.2.fill" : "speaker.slash.fill",
+        isDestructive: false
+      ),
+      .init(
+        action: .archive,
+        title: row.archived ? "Unarchive" : "Archive",
+        iconName: row.archived ? "tray.and.arrow.up.fill" : "archivebox.fill",
+        isDestructive: false
+      ),
+      .init(action: .delete, title: "Delete", iconName: "trash.fill", isDestructive: true),
+    ])
+    return items
+  }
+
+  private func separatorView() -> UIView {
+    let container = UIView()
+    container.translatesAutoresizingMaskIntoConstraints = false
+    let line = UIView()
+    line.translatesAutoresizingMaskIntoConstraints = false
+    line.backgroundColor = UIColor.label.withAlphaComponent(isDark ? 0.13 : 0.10)
+    container.addSubview(line)
+    let height = container.heightAnchor.constraint(equalToConstant: 1.0 / displayScale)
+    height.priority = .defaultHigh
+    NSLayoutConstraint.activate([
+      height,
+      line.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 54),
+      line.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -14),
+      line.topAnchor.constraint(equalTo: container.topAnchor),
+      line.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+    ])
+    return container
+  }
+
+  @objc private func handleRowTap(_ sender: ChatHomePreviewActionRow) {
+    delegate?.homePreviewActionMenu(self, didSelect: sender.item.action)
+  }
+}
+
+private final class ChatHomePreviewActionRow: UIControl {
+  struct Item {
+    let action: ChatHomePreviewActionMenuView.Action
+    let title: String
+    let iconName: String
+    let isDestructive: Bool
+  }
+
+  let item: Item
+  private let iconView = UIImageView()
+  private let titleLabel = UILabel()
+
+  init(item: Item, isDark: Bool) {
+    self.item = item
+    super.init(frame: .zero)
+    backgroundColor = .clear
+
+    let textColor: UIColor = item.isDestructive ? .systemRed : (isDark ? .white : .label)
+    iconView.image = UIImage(
+      systemName: item.iconName,
+      withConfiguration: UIImage.SymbolConfiguration(pointSize: 16, weight: .semibold)
+    )
+    iconView.tintColor = textColor
+    iconView.contentMode = .scaleAspectFit
+    iconView.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(iconView)
+
+    titleLabel.text = item.title
+    titleLabel.font = .systemFont(ofSize: 16.5, weight: .regular)
+    titleLabel.textColor = textColor
+    titleLabel.lineBreakMode = .byTruncatingTail
+    titleLabel.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(titleLabel)
+
+    let height = heightAnchor.constraint(equalToConstant: 40)
+    height.priority = .defaultHigh
+    NSLayoutConstraint.activate([
+      height,
+      iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+      iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
+      iconView.widthAnchor.constraint(equalToConstant: 21),
+      iconView.heightAnchor.constraint(equalToConstant: 21),
+      titleLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 12),
+      titleLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+      titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+    ])
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  override var isHighlighted: Bool {
+    didSet {
+      UIView.animate(withDuration: 0.10) {
+        self.backgroundColor = self.isHighlighted ? UIColor.label.withAlphaComponent(0.08) : .clear
+      }
+    }
   }
 }
 
@@ -3213,7 +4347,9 @@ private final class ChatHomeMiniPreviewController: UIViewController {
   }
 
   private static func preferredContentSize() -> CGSize {
-    let screen = UIScreen.main.bounds.size
+    let screen = UIApplication.shared.connectedScenes
+      .compactMap { ($0 as? UIWindowScene)?.screen.bounds.size }
+      .first ?? CGSize(width: 390, height: 844)
     let width = max(320, min(screen.width - 10, 560))
     let maxHeight = max(420, screen.height - 190)
     let height = min(maxHeight, screen.height * 0.72)

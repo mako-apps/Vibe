@@ -267,30 +267,6 @@ enum AgentBridgeSpeedMode: String, CaseIterable, Identifiable {
   }
 }
 
-/// Which surface a Claude/Codex DM opens into. `.chat` is the classic bubble view
-/// (with wallpaper); `.agent` jumps straight to the full-page agent runtime view.
-/// Stored per provider so Claude and Codex can differ.
-enum AgentBridgeDefaultView: String, CaseIterable, Identifiable {
-  case chat
-  case agent
-
-  var id: String { rawValue }
-
-  var title: String {
-    switch self {
-    case .chat: return "Chat"
-    case .agent: return "Agent"
-    }
-  }
-
-  var subtitle: String {
-    switch self {
-    case .chat: return "Classic chat bubbles with wallpaper"
-    case .agent: return "Full-page agent runtime view"
-    }
-  }
-}
-
 struct AgentBridgeRunOptions: Equatable {
   let model: String?
   let intelligence: AgentBridgeIntelligenceLevel
@@ -354,6 +330,31 @@ struct AgentBridgeStatus {
   )
 }
 
+// MARK: - Default chat view preference (Chat vs Agent runtime) for Claude/Codex agents
+
+/// Whether opening an agent's DM conversation lands in the classic chat
+/// (bubbles + wallpaper) or jumps straight to the full-page agent runtime view.
+enum AgentBridgeDefaultView: String, CaseIterable, Identifiable {
+  case chat
+  case agent
+
+  var id: String { rawValue }
+
+  var title: String {
+    switch self {
+    case .chat: return "Default chat"
+    case .agent: return "Engine view"
+    }
+  }
+
+  var subtitle: String {
+    switch self {
+    case .chat: return "Open in the normal message thread"
+    case .agent: return "Open directly in the agent runtime view"
+    }
+  }
+}
+
 enum AgentBridgeSelectionStore {
   static let didChangeNotification = Notification.Name("AgentBridgeSelectionStoreDidChange")
 
@@ -364,10 +365,6 @@ enum AgentBridgeSelectionStore {
   private static func modelKey(_ provider: String) -> String {
     "agentBridge.model.\(provider.lowercased())"
   }
-  private static func defaultViewKey(_ provider: String) -> String {
-    "agentBridge.defaultView.\(provider.lowercased())"
-  }
-
   static func selectedRepository() -> AgentBridgeRepository? {
     guard
       let data = UserDefaults.standard.data(forKey: repositoryKey),
@@ -470,17 +467,6 @@ enum AgentBridgeSelectionStore {
     )
   }
 
-  /// Default view (chat vs agent) for a provider's DM. Defaults to `.chat`.
-  static func defaultView(provider: String) -> AgentBridgeDefaultView {
-    let raw = UserDefaults.standard.string(forKey: defaultViewKey(provider))
-    return raw.flatMap(AgentBridgeDefaultView.init(rawValue:)) ?? .chat
-  }
-
-  static func setDefaultView(provider: String, _ view: AgentBridgeDefaultView) {
-    UserDefaults.standard.set(view.rawValue, forKey: defaultViewKey(provider))
-    NotificationCenter.default.post(name: didChangeNotification, object: nil)
-  }
-
   // MARK: - Model catalog (shared title/menu source)
 
   /// Selectable models per provider. `value` is the canonical id stored/sent.
@@ -547,6 +533,26 @@ enum AgentBridgeSelectionStore {
         return model
       }
     }
+  }
+
+  // MARK: - Default view preference (per provider)
+  //
+  // Claude/Codex only: whether tapping the DM opens the classic chat (bubbles +
+  // wallpaper) or goes straight to the full-page agent runtime view. Defaults to .chat.
+
+  private static func defaultViewKey(_ provider: String) -> String {
+    "agentBridge.defaultView.\(provider.lowercased())"
+  }
+
+  static func defaultView(provider: String) -> AgentBridgeDefaultView {
+    guard !provider.isEmpty else { return .chat }
+    let raw = UserDefaults.standard.string(forKey: defaultViewKey(provider)) ?? AgentBridgeDefaultView.chat.rawValue
+    return AgentBridgeDefaultView(rawValue: raw) ?? .chat
+  }
+
+  static func setDefaultView(provider: String, _ view: AgentBridgeDefaultView) {
+    UserDefaults.standard.set(view.rawValue, forKey: defaultViewKey(provider))
+    NotificationCenter.default.post(name: didChangeNotification, object: nil)
   }
 
   // MARK: - Resume target (per provider)

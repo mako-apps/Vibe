@@ -1989,6 +1989,23 @@ final class ChatEngine {
     }
   }
 
+  /// Release a presentation claim for an ask that was shown but NOT answered (the user
+  /// swiped the sheet away, or the surface was torn down). Keeps the cached request so
+  /// the ask can be presented again — the bridge re-emits still-blocked asks when the
+  /// chat is reopened, and without releasing the claim `claimAgentBridgeAskPresentation`
+  /// would refuse to re-present it. A no-op once the ask has been answered (its cached
+  /// payload is already dropped in `sendAgentBridgeAskResponse`).
+  func releaseAgentBridgeAskPresentation(requestId rawRequestId: String) {
+    let requestId = normalizedString(rawRequestId) ?? rawRequestId
+    guard !requestId.isEmpty else { return }
+    syncOnQueue {
+      // Only release while the request is still outstanding; if it was answered the
+      // payload is gone and we must not re-arm a resolved ask.
+      guard agentBridgeAskByRequestId[requestId] != nil else { return }
+      presentedAskRequestIds.remove(requestId)
+    }
+  }
+
   /// Reply to a bridge-issued ask. `decision` ∈ "approve" | "reject" | "answer".
   /// `answer` (any JSON-serializable dict) is sealed E2E with the pairing key so
   /// the server only relays an opaque blob; the bridge resolves the pending ask.
@@ -3727,10 +3744,15 @@ final class ChatEngine {
     guard let chatId, !chatId.isEmpty else {
       return ["accepted": false, "reason": "invalid_chat"]
     }
+    let localOnly =
+      parseBooleanLike(
+        payload["localOnly"] ?? payload["local_only"] ?? payload["skipRemoteDelete"]
+          ?? payload["skip_remote_delete"])
+      ?? false
 
-    let requestContext: (URL, String)?
+    let requestContext: (URL?, String)?
     requestContext = syncOnQueue {
-      guard let apiBase = apiBaseURLLocked() else { return nil }
+      let apiBase = apiBaseURLLocked()
       let token = authHeaderTokenLocked() ?? ""
 
       historyRowsByChat.removeValue(forKey: chatId)
@@ -3776,9 +3798,14 @@ final class ChatEngine {
       return (apiBase, token)
     }
 
-    guard let (apiBase, token) = requestContext else {
+    if localOnly {
+      return ["accepted": true, "localOnly": true, "chatId": chatId]
+    }
+
+    guard let requestContext, let apiBase = requestContext.0 else {
       return ["accepted": false, "reason": "missing_config", "chatId": chatId]
     }
+    let token = requestContext.1
 
     var request = URLRequest(
       url: apiBase.appendingPathComponent("api").appendingPathComponent("chats")
