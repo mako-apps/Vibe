@@ -1793,7 +1793,8 @@ final class VibeAgentKitMessageCell: UITableViewCell {
     expandedStepIds: Set<String> = [],
     isTextExpanded: Bool = false,
     isRuntimeExpanded: Bool = false,
-    streamingStartDate: Date? = nil
+    streamingStartDate: Date? = nil,
+    availableWidth: CGFloat? = nil
   ) {
     let isUser = message.role.isUser
     currentIsUser = isUser
@@ -1871,9 +1872,10 @@ final class VibeAgentKitMessageCell: UITableViewCell {
         textColor: userBubbleTextColor(for: appearance),
         lineHeight: 27.5
       )
+      let baseWidth = availableWidth ?? (contentView.bounds.width > 0.0 ? contentView.bounds.width : fallbackWidth)
       let userWidth = max(
         140.0,
-        (contentView.bounds.width > 0.0 ? contentView.bounds.width : fallbackWidth) * 0.78
+        baseWidth * 0.78
       )
       let textWidth = userWidth - 32.0
       let hasText = !displayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -1996,9 +1998,10 @@ final class VibeAgentKitMessageCell: UITableViewCell {
       messageContainerView.layer.shadowRadius = 0.0
       messageContainerView.layer.shadowOffset = .zero
     } else {
-      let availableWidth = max(
+      let baseWidth = availableWidth ?? (contentView.bounds.width > 0.0 ? contentView.bounds.width : fallbackWidth)
+      let assistantAvailableWidth = max(
         160.0,
-        ((contentView.bounds.width > 0.0 ? contentView.bounds.width : fallbackWidth) - 64.0) * 0.92
+        (baseWidth - 64.0) * 0.92
       )
       assistantBodyView.isHidden = false
       assistantBodyView.onStepTap = onStepTap
@@ -2011,7 +2014,7 @@ final class VibeAgentKitMessageCell: UITableViewCell {
         isStreaming: message.isStreaming,
         hasFinalResponseText: message.hasFinalResponseText,
         appearance: appearance,
-        availableWidth: availableWidth,
+        availableWidth: assistantAvailableWidth,
         messageId: message.id,
         progressItems: message.progressItems,
         subagentChildren: message.subagentChildren,

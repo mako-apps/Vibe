@@ -1137,13 +1137,15 @@ private final class ChatNativeAgentProgressTreeView: UIView {
 
 final class ChatNativeAgentActionBarView: UIView {
   private let buttonSize: CGFloat = 28.0
-  private let stackView = UIStackView()
+  private let spacing: CGFloat = 2.0
   private let copyButton = UIButton(type: .system)
   private let thumbUpButton = UIButton(type: .system)
   private let thumbDownButton = UIButton(type: .system)
   private let regenerateButton = UIButton(type: .system)
-  private var regenerateWidthConstraint: NSLayoutConstraint?
-  private var cachedStackFrame: CGRect = .zero
+  private lazy var orderedButtons: [UIButton] = [
+    copyButton, thumbUpButton, thumbDownButton, regenerateButton,
+  ]
+  private var regenerateWidth: CGFloat = 28.0
   private var sourceMessageId: String = ""
   private var sourceText: String = ""
   private var regeneratePrompt: String = ""
@@ -1155,22 +1157,14 @@ final class ChatNativeAgentActionBarView: UIView {
     backgroundColor = .clear
     isOpaque = false
 
-    stackView.axis = .horizontal
-    stackView.alignment = .center
-    stackView.distribution = .fill
-    stackView.spacing = 2.0
-    addSubview(stackView)
-
     configureButton(copyButton, symbolName: "doc.on.doc", action: .copy)
     configureButton(thumbUpButton, symbolName: "hand.thumbsup", action: .thumbUp)
     configureButton(thumbDownButton, symbolName: "hand.thumbsdown", action: .thumbDown)
-    configureButton(regenerateButton, symbolName: "arrow.trianglehead.2.counterclockwise", action: .regenerate)
-    regenerateWidthConstraint = regenerateButton.widthAnchor.constraint(equalToConstant: buttonSize)
-    // Non-required so this bar can be laid out at zero size (e.g. inside the
-    // headless transport's collapsed cells) without flooding the console with
-    // unsatisfiable-constraint warnings.
-    regenerateWidthConstraint?.priority = .init(999)
-    regenerateWidthConstraint?.isActive = true
+    configureButton(
+      regenerateButton,
+      symbolName: "arrow.trianglehead.2.counterclockwise",
+      action: .regenerate
+    )
   }
 
   required init?(coder: NSCoder) {
@@ -1208,8 +1202,7 @@ final class ChatNativeAgentActionBarView: UIView {
       || normalizedSourceText.contains("timed out")
       || normalizedSourceText.contains("connection lost")
       || normalizedSourceText.contains("went wrong")
-    let regenerateWidth: CGFloat = hasRegeneratePrompt && isRetryState ? 76.0 : buttonSize
-    regenerateWidthConstraint?.constant = regenerateWidth
+    regenerateWidth = hasRegeneratePrompt && isRetryState ? 76.0 : buttonSize
     var regenerateConfiguration = UIButton.Configuration.plain()
     regenerateConfiguration.contentInsets = NSDirectionalEdgeInsets(
       top: 4.0,
@@ -1229,26 +1222,21 @@ final class ChatNativeAgentActionBarView: UIView {
     }
     regenerateButton.configuration = regenerateConfiguration
 
-    let visibleButtons = [copyButton, thumbUpButton, thumbDownButton, regenerateButton]
-      .filter { !$0.isHidden }
-    let contentWidth =
-      visibleButtons.reduce(CGFloat.zero) { partial, button in
-        partial + (button === regenerateButton ? regenerateWidth : buttonSize)
-      }
-      + CGFloat(max(0, visibleButtons.count - 1)) * stackView.spacing
-    cachedStackFrame = CGRect(
-      x: 8.0,
-      y: 0.0,
-      width: min(max(1.0, contentWidth), max(1.0, availableWidth - 40.0)),
-      height: buttonSize
-    )
     setNeedsLayout()
     return buttonSize + 4.0
   }
 
   override func layoutSubviews() {
     super.layoutSubviews()
-    stackView.frame = cachedStackFrame
+    // Frame-based layout (no UIStackView / Auto Layout) so the bar can collapse
+    // to zero width inside pre-layout / headless transport cells without ever
+    // emitting unsatisfiable-constraint warnings.
+    var x: CGFloat = 8.0
+    for button in orderedButtons where !button.isHidden {
+      let width = (button === regenerateButton) ? regenerateWidth : buttonSize
+      button.frame = CGRect(x: x, y: 0.0, width: width, height: buttonSize)
+      x += width + spacing
+    }
   }
 
   private func configureButton(
@@ -1257,7 +1245,6 @@ final class ChatNativeAgentActionBarView: UIView {
     action: ChatNativeAgentMessageAction
   ) {
     let config = UIImage.SymbolConfiguration(pointSize: 14.0, weight: .regular)
-    button.translatesAutoresizingMaskIntoConstraints = false
     var buttonConfiguration = UIButton.Configuration.plain()
     buttonConfiguration.contentInsets = NSDirectionalEdgeInsets(
       top: 4.0,
@@ -1268,19 +1255,9 @@ final class ChatNativeAgentActionBarView: UIView {
     buttonConfiguration.image = UIImage(systemName: symbolName, withConfiguration: config)
     button.configuration = buttonConfiguration
     button.frame.size = CGSize(width: buttonSize, height: buttonSize)
-    // Non-required (999) so the bar collapses cleanly at zero size without
-    // logging unsatisfiable-constraint warnings (headless transport cells).
-    if button !== regenerateButton {
-      let widthConstraint = button.widthAnchor.constraint(equalToConstant: buttonSize)
-      widthConstraint.priority = .init(999)
-      widthConstraint.isActive = true
-    }
-    let heightConstraint = button.heightAnchor.constraint(equalToConstant: buttonSize)
-    heightConstraint.priority = .init(999)
-    heightConstraint.isActive = true
     button.accessibilityIdentifier = action.rawValue
     button.addTarget(self, action: #selector(handleButtonTap(_:)), for: .touchUpInside)
-    stackView.addArrangedSubview(button)
+    addSubview(button)
   }
 
   @objc private func handleButtonTap(_ sender: UIButton) {

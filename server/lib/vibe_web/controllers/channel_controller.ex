@@ -5,8 +5,9 @@ defmodule VibeWeb.ChannelController do
   def create(conn, %{"name" => name} = params) do
     creator_id = conn.assigns.current_user.id
     description = params["description"]
+    avatar_url = params["avatarUrl"]
 
-    case Chat.create_channel(creator_id, name, description) do
+    case Chat.create_channel(creator_id, name, description, avatar_url) do
       {:ok, room} ->
         json(conn, %{
           chatId: room.id,

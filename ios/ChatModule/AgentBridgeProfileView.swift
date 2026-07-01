@@ -340,29 +340,38 @@ private struct AgentBridgeShimmerPill: View {
   
   var body: some View {
     let isDark = colorScheme == .dark
-    let baseColor = isDark ? Color.white.opacity(0.04) : Color.black.opacity(0.04)
-    let shineColor = isDark ? Color.white.opacity(0.12) : Color.black.opacity(0.12)
-    
-    let gradient = LinearGradient(
-      gradient: Gradient(colors: [baseColor, shineColor, baseColor]),
-      startPoint: .leading,
-      endPoint: .trailing
-    )
-    
+    // Soft monochrome base + a wide, feathered highlight that fades to clear at both
+    // ends, so the sweep reads as a gentle glow instead of a hard-edged bar.
+    let baseColor = isDark ? Color.white.opacity(0.06) : Color.black.opacity(0.05)
+    let shineColor = isDark ? Color.white.opacity(0.16) : Color.black.opacity(0.10)
+
     RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
       .fill(baseColor)
       .overlay(
         GeometryReader { geo in
-          RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-            .fill(gradient)
-            .offset(x: phase * geo.size.width * 2)
+          let w = max(geo.size.width, 1)
+          // ~70%-wide highlight band with clear, feathered ends — no visible edge.
+          LinearGradient(
+            stops: [
+              .init(color: .clear, location: 0.0),
+              .init(color: shineColor.opacity(0.35), location: 0.35),
+              .init(color: shineColor, location: 0.5),
+              .init(color: shineColor.opacity(0.35), location: 0.65),
+              .init(color: .clear, location: 1.0),
+            ],
+            startPoint: .leading,
+            endPoint: .trailing
+          )
+          .frame(width: w * 0.7)
+          .offset(x: phase * (w + w * 0.7))
         }
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
       )
       .frame(width: width, height: height)
       .frame(maxWidth: width == nil ? .infinity : nil, alignment: .leading)
       .onAppear {
-        withAnimation(.linear(duration: 1.6).repeatForever(autoreverses: false)) {
+        phase = -1.0
+        withAnimation(.linear(duration: 1.4).repeatForever(autoreverses: false)) {
           phase = 1.0
         }
       }
@@ -373,13 +382,13 @@ private struct AgentBridgeShimmerPill: View {
 private struct AgentBridgeHistoryListSkeleton: View {
   var body: some View {
     ScrollView(showsIndicators: false) {
-      VStack(spacing: 24) {
-        ForEach(0..<4, id: \.self) { _ in
+      VStack(spacing: 26) {
+        ForEach(0..<7, id: \.self) { _ in
           // Lines
-          VStack(alignment: .leading, spacing: 11) {
-            AgentBridgeShimmerPill(width: 140, height: 16, cornerRadius: 7)
+          VStack(alignment: .leading, spacing: 12) {
+            AgentBridgeShimmerPill(width: 180, height: 19, cornerRadius: 9)
               .padding(.top, 6)
-            AgentBridgeShimmerPill(width: 100, height: 16, cornerRadius: 7)
+            AgentBridgeShimmerPill(width: 120, height: 19, cornerRadius: 9)
           }
           .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -699,15 +708,9 @@ struct AgentBridgeHistoryInlineView: View {
               .lineLimit(2)
           }
           HStack(spacing: 6) {
-            if session.isRunning {
-              HStack(spacing: 4) {
-                Circle().fill(Color.green).frame(width: 6, height: 6)
-                Text("Live")
-                  .foregroundStyle(Color.green)
-              }
-            } else {
-              Text("\(session.messageCount) messages")
-            }
+            // The running state is shown by the spinner next to the title — keep the
+            // subtitle to a plain message count + timestamp (no "Live" pill).
+            Text("\(session.messageCount) messages")
             if let when = Self.relativeDate(session.updatedAt) {
               Text("·")
               Text(when)
@@ -748,8 +751,10 @@ struct AgentBridgeHistoryInlineView: View {
       pendingRequestId = reqId
       
       // Race condition recovery: if the WebSocket was still connecting when we pushed,
-      // or the response was dropped, retry after 4 seconds if we're still stuck in shimmer.
-      DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
+      // or the response was dropped, retry if we're still stuck in shimmer. The window
+      // is deliberately wider than a cold read of a large ~/.claude/projects so we don't
+      // mint a fresh requestId (and a duplicate bridge read) while a reply is in flight.
+      DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) {
         if self.loading && !self.hasReceivedResponse && self.requestStartAt == start {
           print("[AgentBridgeHistory] ⚠️ Timed out waiting for response! Retrying...")
           self.requestList()
@@ -768,11 +773,32 @@ struct AgentBridgeHistoryInlineView: View {
       let payload = ChatEngine.shared.latestAgentBridgeHistory(chatId: chatId)
     else { return }
 
-    // Only react to the list reply we asked for (transcripts use a different id).
-    if let pending = pendingRequestId, let rid = info["requestId"] as? String, rid != pending {
+    // A `detail` (transcript) reply is cached under the SAME chatId key, so the
+    // mode — not the requestId — is what tells a list reply apart from a detail one.
+    guard (payload["mode"] as? String ?? "list") == "list" else { return }
+
+    // On a shared agent DM a sibling provider's list reply can land on this chat;
+    // ignore anything that isn't for the provider this panel is showing.
+    if let replyProvider = (payload["provider"] as? String)?
+      .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+      !replyProvider.isEmpty,
+      replyProvider != provider.lowercased()
+    {
       return
     }
-    guard (payload["mode"] as? String ?? "list") == "list" else { return }
+
+    // Intentionally do NOT require the reply's requestId to equal our latest
+    // `pendingRequestId`. A cold history read on the bridge can take longer than the
+    // retry interval, so the retry timer mints fresh requestIds while a response is
+    // still in flight. Gating on an exact match rejected that valid, idempotent list
+    // reply and left us retrying forever — the bug this fixes. Any list reply for
+    // this chat+provider satisfies the load, so accept it regardless of requestId.
+    if let pending = pendingRequestId,
+      let rid = info["requestId"] as? String,
+      rid != pending
+    {
+      print("[AgentBridgeHistory] ↩️ Accepting list reply for an earlier request (rid=\(rid) pending=\(pending))")
+    }
 
     if let start = requestStartAt {
       let duration = Date().timeIntervalSince(start)
@@ -781,6 +807,7 @@ struct AgentBridgeHistoryInlineView: View {
 
     hasReceivedResponse = true
     loading = false
+    pendingRequestId = nil
     let raw = payload["sessions"] as? [[String: Any]] ?? []
     sessions = raw.compactMap { item in
       Self.parseSession(item)
@@ -1226,6 +1253,7 @@ struct AgentBridgeHistorySheet: View {
   let onPick: (AgentBridgeHistorySession) -> Void
 
   @Environment(\.dismiss) private var dismiss
+  @Environment(\.colorScheme) private var colorScheme
 
   var body: some View {
     NavigationStack {
@@ -1248,7 +1276,7 @@ struct AgentBridgeHistorySheet: View {
         }
       }
     }
-    .presentationBackground(.regularMaterial)
+    .presentationBackground(colorScheme == .dark ? Color.black : Color.white)
     .presentationDetents([.medium, .large])
   }
 }

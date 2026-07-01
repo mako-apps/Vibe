@@ -1007,9 +1007,20 @@ function buildCommand(provider, prompt, chatId, task) {
     const args = ["-p", "--output-format", "stream-json", "--permission-mode", mode, "--effort", effort];
     appendToolListArg(args, "--disallowedTools", claudeDisallowedTools(task));
     if (ASK_MCP_ENABLED && askMcpConfigPath) {
-      // Expose the ask_user MCP tool and pre-allow it so the mid-run question
-      // round-trip never trips a (headless-unanswerable) permission prompt.
-      args.push("--mcp-config", askMcpConfigPath, "--allowedTools", ASK_TOOL_NAME);
+      // Expose the ask_user + approve_command MCP tools and pre-allow them so the
+      // mid-run question and command-approval round-trips never themselves trip a
+      // (headless-unanswerable) permission prompt.
+      args.push(
+        "--mcp-config",
+        askMcpConfigPath,
+        "--allowedTools",
+        `${ASK_TOOL_NAME},${APPROVE_TOOL_NAME}`
+      );
+      // Live "ask" mode: route every other tool's permission request to the phone
+      // via the approve_command permission-prompt tool (Approve/Skip/Deny sheet).
+      if (workModeFor(task) === "ask") {
+        args.push("--permission-prompt-tool", APPROVE_TOOL_NAME);
+      }
     }
     const resumeId = resumeIdFor(task);
     if (resumeId) args.push("--resume", resumeId);
@@ -4494,6 +4505,10 @@ function maybeEmitPlanApproval(channel, { provider, task, chatId, taskId, replyT
 // chat/task the question belongs to. Disable with VIBE_ASK_MCP=0.
 const ASK_MCP_ENABLED = process.env.VIBE_ASK_MCP !== "0";
 const ASK_TOOL_NAME = "mcp__vibeask__ask_user";
+// Claude `--permission-prompt-tool`: in live "ask" mode every tool Claude wants to
+// use that needs approval is routed here, round-tripped to the phone, and the
+// user's Approve/Skip/Deny maps to the permission tool's allow/deny contract.
+const APPROVE_TOOL_NAME = "mcp__vibeask__approve_command";
 let activeChannel = null;
 let askMcpConfigPath = null;
 let askIpcSockPath = null;
@@ -4550,6 +4565,49 @@ const TOOL = {
     required: ["questions"]
   }
 };
+const APPROVE_TOOL = {
+  name: "approve_command",
+  description:
+    "Permission-prompt handler. The runtime calls this before a tool that needs approval; " +
+    "it relays the pending action to the user's phone and returns their decision.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      tool_name: { type: "string", description: "The tool awaiting approval." },
+      input: { type: "object", description: "The tool's proposed input." }
+    },
+    required: ["tool_name", "input"]
+  }
+};
+function approveBridge(args) {
+  return new Promise((resolve) => {
+    const input = (args && args.input) || {};
+    const allow = (updatedInput) => resolve({ behavior: "allow", updatedInput: updatedInput || input });
+    const deny = (message) => resolve({ behavior: "deny", message: message || "The user did not approve this action." });
+    if (!SOCK) { deny("Command approval is unavailable (no bridge socket)."); return; }
+    let buf = "";
+    let done = false;
+    const finish = (fn, v) => { if (!done) { done = true; fn(v); } };
+    const conn = net.createConnection(SOCK, () => {
+      conn.write(JSON.stringify({ type: "command", chatId: CHAT, taskId: TASK, tool_name: args && args.tool_name, input }) + "\\n");
+    });
+    conn.setEncoding("utf8");
+    conn.on("data", (d) => {
+      buf += d;
+      const nl = buf.indexOf("\\n");
+      if (nl < 0) return;
+      let parsed = null;
+      try { parsed = JSON.parse(buf.slice(0, nl)); } catch (_) {}
+      conn.end();
+      const ans = (parsed && parsed.answer) || {};
+      const decision = String(ans.decision || ans.action || "deny").toLowerCase();
+      if (decision === "approve" || decision === "allow") finish(allow, ans.updatedInput);
+      else finish(deny, ans.message);
+    });
+    conn.on("error", () => finish(deny, "Could not reach the user for approval."));
+    conn.on("close", () => finish(deny, "The user did not respond to the approval request."));
+  });
+}
 function askBridge(questions) {
   return new Promise((resolve) => {
     if (!SOCK) { resolve({ error: "ask_user is unavailable (no bridge socket)." }); return; }
@@ -4583,12 +4641,18 @@ rl.on("line", async (line) => {
     if (params && params.protocolVersion) proto = params.protocolVersion;
     result(id, { protocolVersion: proto, capabilities: { tools: {} }, serverInfo: { name: "vibeask", version: "1.0.0" } });
   } else if (method === "tools/list") {
-    result(id, { tools: [TOOL] });
+    result(id, { tools: [TOOL, APPROVE_TOOL] });
   } else if (method === "tools/call") {
     const args = (params && params.arguments) || {};
-    const questions = Array.isArray(args.questions) ? args.questions : [];
-    const answer = await askBridge(questions);
-    result(id, { content: [{ type: "text", text: JSON.stringify(answer) }] });
+    const toolName = params && params.name;
+    if (toolName === "approve_command") {
+      const verdict = await approveBridge(args);
+      result(id, { content: [{ type: "text", text: JSON.stringify(verdict) }] });
+    } else {
+      const questions = Array.isArray(args.questions) ? args.questions : [];
+      const answer = await askBridge(questions);
+      result(id, { content: [{ type: "text", text: JSON.stringify(answer) }] });
+    }
   } else if (method === "ping") {
     result(id, {});
   } else if (id !== undefined && id !== null) {
@@ -4626,8 +4690,46 @@ function ensureAskMcp(channel) {
   }
 }
 
-// The MCP child connected and sent {chatId, taskId, questions}. Relay to the phone
-// via requestAsk and write the answer back so the model's tool call returns.
+// Turn a Claude permission-prompt request ({tool_name, input}) into a phone-
+// friendly approval card: a short title of what's about to happen + the literal
+// command / file the action targets.
+function describeCommandApproval(req) {
+  const tool = (req && req.tool_name) || "command";
+  const input = (req && req.input) || {};
+  let title;
+  let command;
+  switch (tool) {
+    case "Bash":
+      title = "Run a terminal command";
+      command = input.command || "";
+      break;
+    case "Edit":
+    case "MultiEdit":
+    case "Write":
+    case "NotebookEdit":
+      title = `Edit a file (${tool})`;
+      command = input.file_path || input.path || input.notebook_path || "";
+      break;
+    case "Read":
+      title = "Read a file";
+      command = input.file_path || input.path || "";
+      break;
+    default:
+      title = `Use ${tool}`;
+      command = typeof input === "string" ? input : JSON.stringify(input, null, 2);
+  }
+  return {
+    toolName: tool,
+    title,
+    command: String(command || "").slice(0, 4000),
+    description: typeof input.description === "string" ? input.description : "",
+    input,
+  };
+}
+
+// The MCP child connected and sent {chatId, taskId, questions} (ask) or
+// {type:"command", chatId, taskId, tool_name, input} (approval). Relay to the
+// phone via requestAsk and write the answer back so the tool call returns.
 function handleAskIpcConnection(conn) {
   let buf = "";
   let handled = false;
@@ -4640,6 +4742,36 @@ function handleAskIpcConnection(conn) {
     let req = null;
     try { req = JSON.parse(buf.slice(0, nl)); } catch (_) {}
     if (!req || !activeChannel) { try { conn.end(); } catch (_) {} return; }
+
+    // Command approval (Claude --permission-prompt-tool): relay the pending tool
+    // to the phone and map Approve/Skip/Deny back to the allow/deny contract.
+    if (req.type === "command") {
+      const verdict = await requestAsk(activeChannel, {
+        provider: "claude",
+        chatId: req.chatId,
+        taskId: req.taskId,
+        replyToId: null,
+        kind: "command",
+        body: describeCommandApproval(req),
+      });
+      const vAns = (verdict && verdict.answer) || {};
+      const decision = String((verdict && verdict.decision) || "deny").toLowerCase();
+      const approved = decision === "approve" || decision === "allow";
+      const answer = approved
+        ? { decision: "approve", updatedInput: vAns.updatedInput || req.input || {} }
+        : {
+            decision: "deny",
+            message:
+              vAns.message ||
+              (decision === "skip"
+                ? "The user chose to skip this command — continue without it."
+                : "The user denied this command."),
+          };
+      try { conn.write(JSON.stringify({ answer }) + "\n"); } catch (_) {}
+      try { conn.end(); } catch (_) {}
+      return;
+    }
+
     const result = await requestAsk(activeChannel, {
       provider: "claude",
       chatId: req.chatId,
@@ -4746,6 +4878,29 @@ function recoverAfterReconnect(channel) {
   socketDownSince = null;
 }
 
+// Hard-kill a (likely half-open) transport so Phoenix runs its normal
+// reconnect+rejoin path — the same path a real network drop takes. We prefer
+// ws.terminate() because on a zombie socket ws.close() waits on a close
+// handshake the dead peer will never answer, leaving us deaf for minutes.
+function forceReconnect(socket) {
+  try {
+    if (socket.conn && typeof socket.conn.terminate === "function") {
+      socket.conn.terminate();
+      return;
+    }
+    if (socket.conn && typeof socket.conn.close === "function") {
+      socket.conn.close();
+      return;
+    }
+    socket.disconnect(() => socket.connect());
+  } catch (e) {
+    console.error(`[vibe-bridge] forceReconnect failed: ${(e && e.message) || e}`);
+    try {
+      socket.disconnect(() => socket.connect());
+    } catch (_) {}
+  }
+}
+
 function connect(server, token, userId) {
   const socket = new Phoenix.Socket(wsUrl(server), {
     params: { token },
@@ -4809,12 +4964,44 @@ function connect(server, token, userId) {
     })
     .receive("error", (e) => console.error("[vibe-bridge] join error:", JSON.stringify(e)));
 
-  // Lightweight heartbeat to keep last_seen fresh (socket also heartbeats).
+  // Heartbeat + zombie-socket watchdog.
+  //
+  // Cloudflare/Railway recycle WebSocket connections constantly (the recurring
+  // code=1006/1012 drops). Usually Phoenix's own socket heartbeat catches a dead
+  // conn, but on a half-open TCP socket the close frame can be lost so onClose
+  // never fires and the socket sits "joined" but DEAF — no run_task is ever
+  // delivered and the bridge goes silent indefinitely (observed: 8+ min dead
+  // while the phone got no response at all).
+  //
+  // So we run an APPLICATION-level liveness check independent of Phoenix's
+  // internal heartbeat: push a heartbeat that expects an :ok reply (the server
+  // replies :ok in agent_bridge_channel). If two in a row time out, hard-kill
+  // the transport so Phoenix reconnects+rejoins on its own.
+  let missedHeartbeats = 0;
   setInterval(() => {
-    if (channel.state === "joined") {
-      channel.push("heartbeat", {});
-      pushBridgeStatus(channel);
-    }
+    if (channel.state !== "joined") return;
+    channel
+      .push("heartbeat", {}, 10000)
+      .receive("ok", () => {
+        if (missedHeartbeats > 0) {
+          console.log(`[vibe-bridge] heartbeat recovered after ${missedHeartbeats} miss(es)`);
+        }
+        missedHeartbeats = 0;
+      })
+      .receive("timeout", () => {
+        missedHeartbeats += 1;
+        console.error(
+          `[vibe-bridge] heartbeat ack timeout (#${missedHeartbeats}) — socket may be a zombie`
+        );
+        if (missedHeartbeats >= 2) {
+          console.error(
+            "[vibe-bridge] forcing reconnect after repeated heartbeat timeouts (zombie socket)"
+          );
+          missedHeartbeats = 0;
+          forceReconnect(socket);
+        }
+      });
+    pushBridgeStatus(channel);
   }, 30000);
 }
 

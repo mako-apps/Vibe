@@ -1,4 +1,5 @@
 import SwiftUI
+import PhotosUI
 
 struct ChatGroupCreationSheet: View {
   @Environment(\.dismiss) private var dismiss
@@ -6,116 +7,225 @@ struct ChatGroupCreationSheet: View {
   @EnvironmentObject private var coordinator: AppShellCoordinator
 
   let config: AppSessionConfig
+  let homeRows: [ChatHomeListRow]
   let onCreated: (ChatRoute) -> Void
 
-  enum Step {
+  enum Step: Hashable {
     case info
-    case members
   }
 
-  @State private var currentStep: Step = .info
+  @State private var path = NavigationPath()
   @State private var groupName = ""
-  @State private var selectedMembers = Set<GroupMember>()
+  @State private var selectedMembers = Set<ContactSearchUser>()
   @State private var searchQuery = ""
+  @FocusState private var isQueryFieldFocused: Bool
+  @State private var isSearchPresented = false
   @State private var searchResults: [ContactSearchUser] = []
   @State private var isSearching = false
   @State private var searchTask: Task<Void, Never>?
   @State private var isCreating = false
   @State private var errorMessage: String?
-
-  @StateObject private var directoryModel = ContactDirectoryViewModel()
+  @State private var avatarItem: PhotosPickerItem?
+  @State private var avatarImage: Image?
+  @State private var avatarData: Data?
 
   private var palette: AppThemePalette {
     AppThemePalette.resolve(for: colorScheme)
   }
 
-  struct GroupMember: Identifiable, Hashable {
-    let id: String
-    let displayName: String
-    let username: String?
-    let avatarUri: String?
+  private func contactUser(for row: ChatHomeListRow) -> ContactSearchUser {
+    ContactSearchUser(payload: [
+      "userId": row.peerUserId ?? row.chatId,
+      "username": row.title,
+      "profileImage": row.avatarUri ?? "",
+      "isAgent": row.isBuiltInAgentSurface || row.isBridgeAgentSurface,
+      "tier": row.isGoldTier ? "gold" : "free"
+    ])!
   }
 
   var body: some View {
-    NavigationStack {
-      VStack(spacing: 0) {
-        if currentStep == .info {
-          infoStepView
-        } else {
-          membersStepView
-        }
-      }
-      .background(palette.background.ignoresSafeArea())
-      .navigationTitle(currentStep == .info ? "New Group" : "Add Members")
-      .navigationBarTitleDisplayMode(.inline)
-      .toolbar {
-        ToolbarItem(placement: .topBarLeading) {
-          if currentStep == .members {
+    NavigationStack(path: $path) {
+      membersStepView
+        .background(palette.background.ignoresSafeArea())
+        .navigationTitle("New Group")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+          ToolbarItem(placement: .topBarLeading) {
             Button {
-              withAnimation { currentStep = .info }
-            } label: {
-              HStack(spacing: 4) {
-                Image(systemName: "chevron.left")
-                Text("Back")
-              }
-            }
-          } else {
-            Button("Cancel") {
               dismiss()
+            } label: {
+              Image(systemName: "xmark")
+            }
+          }
+          ToolbarItem(placement: .topBarTrailing) {
+            Button("Next") {
+              path.append(Step.info)
+            }
+            .disabled(selectedMembers.isEmpty)
+          }
+        }
+        .navigationDestination(for: Step.self) { step in
+          if step == .info {
+            infoStepView
+              .background(palette.background.ignoresSafeArea())
+              .navigationTitle("New Group")
+              .navigationBarTitleDisplayMode(.inline)
+              .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                  Button("Create") {
+                    Task { await createGroup() }
+                  }
+                  .disabled(isCreating || groupName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+              }
+          }
+        }
+        .overlay {
+          if isCreating {
+            ZStack {
+              Color.black.opacity(0.3).ignoresSafeArea()
+              ProgressView()
+                .padding()
+                .background(palette.card)
+                .cornerRadius(8)
             }
           }
         }
-        ToolbarItem(placement: .topBarTrailing) {
-          if currentStep == .info {
-            Button("Next") {
-              withAnimation { currentStep = .members }
+    }
+  }
+
+  private var membersStepView: some View {
+    VStack(spacing: 0) {
+      if let errorMessage {
+        Text(errorMessage)
+          .font(.footnote)
+          .foregroundStyle(.red)
+          .padding()
+      }
+
+      List {
+        let trimmedQuery = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedQuery.isEmpty {
+          if isSearching {
+            HStack {
+              Spacer()
+              ProgressView()
+              Spacer()
             }
-            .disabled(groupName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .listRowBackground(Color.clear)
+          } else if searchResults.isEmpty {
+            Text("No users found.")
+              .foregroundStyle(palette.secondaryText)
+              .listRowBackground(Color.clear)
           } else {
-            Button("Create") {
-              Task { await createGroup() }
-            }
-            .disabled(isCreating)
+            groupedUsersSection(users: searchResults)
           }
+        } else {
+          groupedUsersSection(users: homeRows.map(contactUser(for:)))
         }
       }
-      .task {
-        await directoryModel.refresh()
+      .listStyle(.plain)
+      .searchable(
+        text: $searchQuery,
+        isPresented: $isSearchPresented,
+        placement: .navigationBarDrawer(displayMode: .automatic),
+        prompt: "Search friends to add..."
+      )
+      .onChange(of: searchQuery) { _, newValue in
+        scheduleSearch(query: newValue)
       }
     }
   }
 
+  private func groupedUsersSection(users: [ContactSearchUser]) -> some View {
+    var uniqueUsers: [ContactSearchUser] = []
+    var seenIDs = Set<String>()
+    for user in users {
+      if !seenIDs.contains(user.userID) {
+        seenIDs.insert(user.userID)
+        uniqueUsers.append(user)
+      }
+    }
+    let grouped = Dictionary(grouping: uniqueUsers) { user in
+      String(user.username.prefix(1)).uppercased()
+    }
+    let sortedKeys = grouped.keys.sorted()
+
+    return ForEach(sortedKeys, id: \.self) { letter in
+      Section(letter) {
+        ForEach(grouped[letter]!) { user in
+          memberRow(user: user)
+        }
+      }
+    }
+  }
+
+  @ViewBuilder
+  private func memberRow(user: ContactSearchUser) -> some View {
+    let isSelected = selectedMembers.contains(user)
+    Button {
+      if isSelected {
+        selectedMembers.remove(user)
+      } else {
+        selectedMembers.insert(user)
+      }
+    } label: {
+      ContactSearchResultRow(user: user, isSaved: isSelected, palette: palette)
+        .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+  }
+
   private var infoStepView: some View {
     VStack(alignment: .leading, spacing: 20) {
-      Text("Enter a name for the group and proceed to add members.")
+      Text("Enter a name and add a profile image for the group.")
         .font(.subheadline)
         .foregroundStyle(palette.secondaryText)
         .padding(.horizontal)
         .padding(.top)
 
       VStack(spacing: 0) {
-        HStack(spacing: 12) {
-          Image(systemName: "person.3.fill")
-            .font(.title2)
-            .foregroundStyle(palette.accent)
-            .frame(width: 50, height: 50)
-            .background(palette.accent.opacity(0.12))
-            .clipShape(Circle())
+        HStack(spacing: 16) {
+          PhotosPicker(selection: $avatarItem, matching: .images) {
+            if let avatarImage {
+              avatarImage
+                .resizable()
+                .scaledToFill()
+                .frame(width: 56, height: 56)
+                .clipShape(Circle())
+            } else {
+              Image(systemName: "camera.fill")
+                .font(.title2)
+                .foregroundStyle(palette.accent)
+                .frame(width: 56, height: 56)
+                .background(palette.accent.opacity(0.12))
+                .clipShape(Circle())
+            }
+          }
+          .buttonStyle(.plain)
 
           TextField("Group name", text: $groupName)
             .font(.body)
-            .submitLabel(.next)
-            .onSubmit {
-              if !groupName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                withAnimation { currentStep = .members }
-              }
-            }
+            .submitLabel(.done)
         }
         .padding()
         .background(palette.card)
         .cornerRadius(12)
       }
       .padding(.horizontal)
+      
+      Text("Selected Members")
+        .font(.headline)
+        .padding(.horizontal)
+        .padding(.top, 10)
+
+      List {
+        ForEach(Array(selectedMembers)) { user in
+          ContactSearchResultRow(user: user, isSaved: false, palette: palette)
+        }
+      }
+      .listStyle(.plain)
+      .frame(maxHeight: .infinity)
 
       if let errorMessage {
         Text(errorMessage)
@@ -123,152 +233,15 @@ struct ChatGroupCreationSheet: View {
           .foregroundStyle(.red)
           .padding(.horizontal)
       }
-
-      Spacer()
     }
-  }
-
-  private var membersStepView: some View {
-    VStack(spacing: 0) {
-      // Selected members chips
-      if !selectedMembers.isEmpty {
-        ScrollView(.horizontal, showsIndicators: false) {
-          HStack(spacing: 8) {
-            ForEach(Array(selectedMembers)) { member in
-              HStack(spacing: 6) {
-                Text(member.displayName)
-                  .font(.footnote)
-                  .fontWeight(.medium)
-                  .foregroundStyle(palette.text)
-                Button {
-                  selectedMembers.remove(member)
-                } label: {
-                  Image(systemName: "xmark.circle.fill")
-                    .foregroundStyle(palette.secondaryText)
-                }
-              }
-              .padding(.horizontal, 10)
-              .padding(.vertical, 6)
-              .background(palette.accent.opacity(0.15))
-              .cornerRadius(16)
-            }
-          }
-          .padding()
-        }
-        .frame(height: 56)
-        .background(palette.background)
-      }
-
-      // Search bar
-      HStack(spacing: 10) {
-        Image(systemName: "magnifyingglass")
-          .foregroundStyle(palette.secondaryText)
-        TextField("Search friends to add...", text: $searchQuery)
-          .textInputAutocapitalization(.never)
-          .autocorrectionDisabled()
-          .onChange(of: searchQuery) { _, newValue in
-            scheduleSearch(query: newValue)
-          }
-      }
-      .padding(10)
-      .background(palette.card)
-      .cornerRadius(10)
-      .padding(.horizontal)
-      .padding(.bottom, 10)
-
-      // List of members to select
-      List {
-        if !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-          Section("Search Results") {
-            if isSearching {
-              HStack {
-                Spacer()
-                ProgressView()
-                Spacer()
-              }
-              .listRowBackground(palette.card)
-            } else if searchResults.isEmpty {
-              Text("No users found.")
-                .foregroundStyle(palette.secondaryText)
-                .listRowBackground(palette.card)
-            } else {
-              ForEach(searchResults) { user in
-                let member = GroupMember(id: user.userID, displayName: user.username, username: user.handle, avatarUri: user.profileImage)
-                memberRow(member: member)
-              }
-            }
-          }
-        }
-
-        Section("Recent Contacts") {
-          let recentMembers = directoryModel.rows.compactMap { row -> GroupMember? in
-            guard let peerId = row.peerUserId else { return nil }
-            return GroupMember(id: peerId, displayName: row.title, username: nil, avatarUri: row.avatarUri)
-          }
-
-          if recentMembers.isEmpty {
-            Text("No recent contacts found.")
-              .foregroundStyle(palette.secondaryText)
-              .listRowBackground(palette.card)
-          } else {
-            ForEach(recentMembers) { member in
-              memberRow(member: member)
-            }
-          }
-        }
-      }
-      .listStyle(.insetGrouped)
-      .scrollContentBackground(.hidden)
-
-      if let errorMessage {
-        Text(errorMessage)
-          .font(.footnote)
-          .foregroundStyle(.red)
-          .padding()
+    .onChange(of: avatarItem) { _, newItem in
+      Task {
+        guard let data = try? await newItem?.loadTransferable(type: Data.self) else { return }
+        guard let uiImage = UIImage(data: data) else { return }
+        self.avatarData = data
+        self.avatarImage = Image(uiImage: uiImage)
       }
     }
-  }
-
-  @ViewBuilder
-  private func memberRow(member: GroupMember) -> some View {
-    let isSelected = selectedMembers.contains(member)
-    Button {
-      if isSelected {
-        selectedMembers.remove(member)
-      } else {
-        selectedMembers.insert(member)
-      }
-    } label: {
-      HStack(spacing: 12) {
-        Circle()
-          .fill(palette.accent.opacity(0.12))
-          .frame(width: 36, height: 36)
-          .overlay {
-            Text(String(member.displayName.prefix(1)).uppercased())
-              .font(.system(size: 14, weight: .semibold))
-              .foregroundStyle(palette.accent)
-          }
-
-        VStack(alignment: .leading, spacing: 2) {
-          Text(member.displayName)
-            .font(.body)
-            .foregroundStyle(palette.text)
-          if let username = member.username, !username.isEmpty {
-            Text("@\(username)")
-              .font(.footnote)
-              .foregroundStyle(palette.secondaryText)
-          }
-        }
-
-        Spacer()
-
-        Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-          .font(.title3)
-          .foregroundStyle(isSelected ? palette.accent : palette.border)
-      }
-    }
-    .buttonStyle(.plain)
-    .listRowBackground(palette.card)
   }
 
   private func scheduleSearch(query: String) {
@@ -307,18 +280,25 @@ struct ChatGroupCreationSheet: View {
     defer { isCreating = false }
 
     do {
-      let memberIds = Array(selectedMembers).map { $0.id }
+      var remoteAvatarUrl: String? = nil
+      if let avatarData {
+        remoteAvatarUrl = try await ChatRoomCreateService.uploadAvatar(imageData: avatarData, config: config)
+      }
+
+      let memberIds = Array(selectedMembers).map { $0.userID }
       let result = try await ChatRoomCreateService.create(
         kind: .group,
         config: config,
         name: groupName,
-        memberIds: memberIds
+        memberIds: memberIds,
+        avatarUrl: remoteAvatarUrl
       )
+      
       let route = ChatRoute(
         chatId: result.chatID,
         title: result.name,
         peerUserId: nil,
-        avatarURI: nil,
+        avatarURI: remoteAvatarUrl,
         isGroup: true,
         initialRows: []
       )

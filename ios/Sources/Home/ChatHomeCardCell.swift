@@ -222,12 +222,14 @@ final class ChatHomeCardCell: UITableViewCell {
     rightCheckmarkView.isHidden = !showsRightCheckmark
     rightCheckmarkView.tintColor = isEditSelected ? badgeBackground : secondary.withAlphaComponent(0.3)
 
-    avatarFallbackIconView.image = UIImage(systemName: row.isSavedMessages ? "bookmark.fill" : "person.fill")
+    let fallbackSystemImageName =
+      row.isArchiveEntry ? "archivebox.fill" : (row.isSavedMessages ? "bookmark.fill" : "person.fill")
+    avatarFallbackIconView.image = UIImage(systemName: fallbackSystemImageName)
     avatarFallbackIconView.tintColor = .white
 
     let resolvedAvatarGradientColors =
       avatarGradientColors
-      ?? (row.isSavedMessages ? Self.savedMessagesGradientColors(isDark: isDark) : nil)
+      ?? ((row.isSavedMessages || row.isArchiveEntry) ? Self.savedMessagesGradientColors(isDark: isDark) : nil)
     if let resolvedAvatarGradientColors {
       applyAvatarGradient(
         startColor: resolvedAvatarGradientColors.0,
@@ -405,8 +407,9 @@ final class ChatHomeCardCell: UITableViewCell {
     titleLabel.translatesAutoresizingMaskIntoConstraints = false
     titleLabel.font = .systemFont(ofSize: 17, weight: .medium)
     titleLabel.numberOfLines = 1
-    titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-    titleLabel.setContentHuggingPriority(.required, for: .horizontal)
+    titleLabel.lineBreakMode = .byTruncatingTail
+    titleLabel.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+    titleLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
     tierBadgeImageView.translatesAutoresizingMaskIntoConstraints = false
     tierBadgeImageView.contentMode = .scaleAspectFit
@@ -421,6 +424,8 @@ final class ChatHomeCardCell: UITableViewCell {
     timeLabel.translatesAutoresizingMaskIntoConstraints = false
     timeLabel.font = .systemFont(ofSize: 13, weight: .medium)
     timeLabel.textAlignment = .right
+    timeLabel.setContentHuggingPriority(.required, for: .horizontal)
+    timeLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
 
     unreadBadge.translatesAutoresizingMaskIntoConstraints = false
     unreadBadge.layer.cornerRadius = 10
@@ -466,6 +471,8 @@ final class ChatHomeCardCell: UITableViewCell {
     textStack.axis = .vertical
     textStack.spacing = 2
     textStack.alignment = .fill
+    textStack.setContentHuggingPriority(.defaultLow, for: .horizontal)
+    textStack.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
 
     let iconStack = UIStackView(arrangedSubviews: [muteIconView, pinIconView])
     iconStack.translatesAutoresizingMaskIntoConstraints = false
@@ -479,6 +486,8 @@ final class ChatHomeCardCell: UITableViewCell {
     metaStack.spacing = 5
     metaStack.alignment = .trailing
     metaStack.distribution = .equalSpacing
+    metaStack.setContentHuggingPriority(.required, for: .horizontal)
+    metaStack.setContentCompressionResistancePriority(.required, for: .horizontal)
 
     contentView.addSubview(leadingActionsContainer)
     contentView.addSubview(trailingActionsContainer)
@@ -571,7 +580,7 @@ final class ChatHomeCardCell: UITableViewCell {
 
       textStack.leadingAnchor.constraint(equalTo: avatarContainer.trailingAnchor, constant: 14),
       textStack.centerYAnchor.constraint(equalTo: rowContentContainer.centerYAnchor),
-      textStack.trailingAnchor.constraint(lessThanOrEqualTo: metaStack.leadingAnchor, constant: -8),
+      textStack.trailingAnchor.constraint(equalTo: metaStack.leadingAnchor, constant: -10),
 
       metaStack.trailingAnchor.constraint(equalTo: rowContentContainer.trailingAnchor, constant: -16),
       metaStack.centerYAnchor.constraint(equalTo: rowContentContainer.centerYAnchor),

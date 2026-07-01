@@ -1012,7 +1012,7 @@ defmodule Vibe.Chat do
 
   # ── Groups ──────────────────────────────────────────────────────
 
-  def create_group(creator_id, name, member_ids) do
+  def create_group(creator_id, name, member_ids, avatar_url \\ nil) do
     id = Ecto.UUID.generate() |> String.slice(0, 12)
     all_member_ids = Enum.uniq([creator_id | member_ids])
 
@@ -1024,6 +1024,7 @@ defmodule Vibe.Chat do
             is_group: true,
             type: "group",
             name: name,
+            avatar_url: avatar_url,
             creator_id: creator_id
           })
 
@@ -1068,7 +1069,7 @@ defmodule Vibe.Chat do
 
   # ── Channels ────────────────────────────────────────────────────
 
-  def create_channel(creator_id, name, description \\ nil) do
+  def create_channel(creator_id, name, description \\ nil, avatar_url \\ nil) do
     id = Ecto.UUID.generate() |> String.slice(0, 12)
 
     result =
@@ -1080,6 +1081,7 @@ defmodule Vibe.Chat do
             type: "channel",
             name: name,
             description: description,
+            avatar_url: avatar_url,
             creator_id: creator_id
           })
 

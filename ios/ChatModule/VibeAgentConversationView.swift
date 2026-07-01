@@ -458,6 +458,44 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   var avatarChatId: String?
   var avatarURI: String? { didSet { if isViewLoaded { refreshHeaderAvatar() } } }
 
+  /// History button — its own standalone trailing element, immediately to the left of
+  /// the profile avatar. Stays put when the new-chat button animates in/out.
+  private lazy var headerHistoryButton: UIButton = {
+    let btn = UIButton(type: .system)
+    btn.setImage(UIImage(systemName: "clock.arrow.circlepath"), for: .normal)
+    btn.addTarget(self, action: #selector(historyTapped), for: .touchUpInside)
+    btn.accessibilityLabel = "History"
+    btn.setContentHuggingPriority(.required, for: .horizontal)
+    btn.setContentCompressionResistancePriority(.required, for: .horizontal)
+    return btn
+  }()
+
+  /// New-chat button — only present once a history/turn is loaded. It animates IN next
+  /// to the history button (and out again) without disturbing history/profile.
+  private lazy var headerNewChatActionButton: UIButton = {
+    let btn = UIButton(type: .system)
+    btn.setImage(UIImage(systemName: "square.and.pencil"), for: .normal)
+    btn.addTarget(self, action: #selector(newChatTapped), for: .touchUpInside)
+    btn.accessibilityLabel = "New Chat"
+    btn.setContentHuggingPriority(.required, for: .horizontal)
+    btn.setContentCompressionResistancePriority(.required, for: .horizontal)
+    return btn
+  }()
+
+  /// Container for ONLY history + new chat — the cloud (profile) is deliberately NOT in
+  /// here; it stays its own standalone bar-button item. Arranged left→right as
+  /// new chat, history, so new chat animates in hugging the history button while the
+  /// cloud (a separate item further trailing) never shares a wrapper with them.
+  private lazy var headerHistoryActionsStack: UIStackView = {
+    let stack = UIStackView(arrangedSubviews: [
+      headerNewChatActionButton, headerHistoryButton,
+    ])
+    stack.axis = .horizontal
+    stack.alignment = .center
+    stack.spacing = 16
+    return stack
+  }()
+
   /// Floating "jump to latest" control above the composer; appears when the feed is
   /// scrolled away from the bottom and snaps it back on tap.
   private let jumpToBottomButton = UIButton(type: .system)
@@ -641,49 +679,62 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     }
   }
 
-  private func configureNewChatButton() {
+  private func configureNewChatButton(animated: Bool = false) {
     guard !isEmbeddedInSwiftUI, !embeddedInChatHost else { return }
-    navigationItem.rightBarButtonItems = rightBarButtonItems()
+    installHeaderActionsItem()
+    updateHeaderActionButtons(animated: animated)
   }
 
-  /// The trailing header items.
-  private func rightBarButtonItems() -> [UIBarButtonItem] {
-    var items: [UIBarButtonItem] = [makeProfileBarButtonItem()]
-
-    // Add History button next to the profile.
-    items.append(UIBarButtonItem(customView: makeHistoryButton()))
-
-    // If a historic conversation is loaded, also show the New Chat button.
-    if isHistoryPicked {
-      items.append(UIBarButtonItem(customView: makeNewChatButton()))
-    }
-    
-    return items
-  }
-
-  private func makeProfileBarButtonItem() -> UIBarButtonItem {
+  /// Install TWO separate trailing items: the cloud (profile) as its own standalone
+  /// element at the trailing edge, and — to its left, after a gap — the history + new
+  /// chat group. Keeping the cloud out of the group is what makes it read as a single
+  /// independent element instead of being warped together with the action buttons.
+  private func installHeaderActionsItem() {
     headerAvatarView.removeTarget(self, action: #selector(profileTapped), for: .touchUpInside)
     headerAvatarView.addTarget(self, action: #selector(profileTapped), for: .touchUpInside)
     refreshHeaderAvatar()
-    let item = UIBarButtonItem(customView: headerAvatarView)
-    item.accessibilityLabel = "Profile"
-    return item
+    // Already installed? The history/new-chat group is the trailing-most custom stack.
+    if navigationItem.rightBarButtonItems?.last?.customView === headerHistoryActionsStack {
+      return
+    }
+    let profileItem = UIBarButtonItem(customView: headerAvatarView)
+    profileItem.accessibilityLabel = "Profile"
+    let gap = UIBarButtonItem(barButtonSystemItem: .fixedSpace, target: nil, action: nil)
+    gap.width = 12
+    let actionsItem = UIBarButtonItem(customView: headerHistoryActionsStack)
+    actionsItem.accessibilityLabel = "Agent actions"
+    // Index 0 = trailing edge: cloud sits alone at the edge, gap, then history group.
+    navigationItem.rightBarButtonItems = [profileItem, gap, actionsItem]
   }
 
-  private func makeHistoryButton() -> UIButton {
-    let btn = UIButton(type: .system)
-    btn.setImage(UIImage(systemName: "clock.arrow.circlepath"), for: .normal)
-    btn.addTarget(self, action: #selector(historyTapped), for: .touchUpInside)
-    btn.accessibilityLabel = "History"
-    return btn
-  }
-
-  private func makeNewChatButton() -> UIButton {
-    let btn = UIButton(type: .system)
-    btn.setImage(UIImage(systemName: "square.and.pencil"), for: .normal)
-    btn.addTarget(self, action: #selector(newChatTapped), for: .touchUpInside)
-    btn.accessibilityLabel = "New Chat"
-    return btn
+  /// Show/hide the new-chat button next to history. Animating only this arranged
+  /// subview keeps the profile + history anchored to the trailing edge while new chat
+  /// slides/fades in beside the history button.
+  private func updateHeaderActionButtons(animated: Bool) {
+    let targetHidden = !isHistoryPicked
+    guard headerNewChatActionButton.isHidden != targetHidden else {
+      headerNewChatActionButton.alpha = targetHidden ? 0 : 1
+      return
+    }
+    if animated {
+      if !targetHidden { headerNewChatActionButton.alpha = 0 }
+      navigationController?.navigationBar.setNeedsLayout()
+      UIView.animate(
+        withDuration: 0.28, delay: 0,
+        usingSpringWithDamping: 0.86, initialSpringVelocity: 0.4,
+        options: [.curveEaseInOut, .allowUserInteraction]
+      ) {
+        self.headerNewChatActionButton.isHidden = targetHidden
+        self.headerNewChatActionButton.alpha = targetHidden ? 0 : 1
+        self.headerHistoryActionsStack.layoutIfNeeded()
+        // Let the nav bar re-place the (now wider/narrower) history group so the cloud
+        // and history stay put and only new chat moves.
+        self.navigationController?.navigationBar.layoutIfNeeded()
+      }
+    } else {
+      headerNewChatActionButton.isHidden = targetHidden
+      headerNewChatActionButton.alpha = targetHidden ? 0 : 1
+    }
   }
 
   /// Feed the header avatar the conversation's real identity so it renders the same
@@ -700,11 +751,15 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
 
   private func updateNavigationButtons() {
     if !isEmbeddedInSwiftUI && !embeddedInChatHost {
-      configureNewChatButton()
+      // Only animate if the view is already on screen (window != nil) so it doesn't
+      // animate on initial load.
+      let animated = viewIfLoaded?.window != nil
+      configureNewChatButton(animated: animated)
     } else {
       buildInViewHeader()
     }
   }
+
 
   @objc private func historyTapped() {
     onPresentHistory?()
@@ -1494,7 +1549,8 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       navigationItem.leftBarButtonItem = backButton
     }
 
-    navigationItem.rightBarButtonItems = rightBarButtonItems()
+    installHeaderActionsItem()
+    updateHeaderActionButtons(animated: false)
     updateHeaderTexts()
   }
 
@@ -1792,7 +1848,8 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       expandedStepIds: expandedStepIdsByMessage[message.id] ?? [],
       isTextExpanded: expandedTextMessageIds.contains(message.id),
       isRuntimeExpanded: expandedRuntimeMessageIds.contains(message.id),
-      streamingStartDate: message.isStreaming ? streamStartByMessageId[message.id] : nil
+      streamingStartDate: message.isStreaming ? streamStartByMessageId[message.id] : nil,
+      availableWidth: tableView.bounds.width
     )
     return cell
   }
@@ -1826,7 +1883,8 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       expandedStepIds: expandedStepIdsByMessage[message.id] ?? [],
       isTextExpanded: expandedTextMessageIds.contains(message.id),
       isRuntimeExpanded: expandedRuntimeMessageIds.contains(message.id),
-      streamingStartDate: message.isStreaming ? streamStartByMessageId[message.id] : nil
+      streamingStartDate: message.isStreaming ? streamStartByMessageId[message.id] : nil,
+      availableWidth: tableView.bounds.width
     )
   }
 
@@ -1965,7 +2023,8 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
           isProgressExpanded: expandedProgressMessageIds.contains(messageId),
           expandedStepIds: expandedStepIdsByMessage[messageId] ?? [],
           isTextExpanded: expandedTextMessageIds.contains(messageId),
-          streamingStartDate: tableMessages[row].isStreaming ? streamStartByMessageId[messageId] : nil
+          streamingStartDate: tableMessages[row].isStreaming ? streamStartByMessageId[messageId] : nil,
+          availableWidth: tableView.bounds.width
         )
       }
     }
@@ -2020,7 +2079,8 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
           isProgressExpanded: expandedProgressMessageIds.contains(messageId),
           expandedStepIds: expandedStepIdsByMessage[messageId] ?? [],
           isTextExpanded: expandedTextMessageIds.contains(messageId),
-          streamingStartDate: tableMessages[row].isStreaming ? streamStartByMessageId[messageId] : nil
+          streamingStartDate: tableMessages[row].isStreaming ? streamStartByMessageId[messageId] : nil,
+          availableWidth: tableView.bounds.width
         )
       }
     }
@@ -2108,7 +2168,8 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
           isProgressExpanded: true,
           expandedStepIds: expanded,
           isTextExpanded: expandedTextMessageIds.contains(messageId),
-          streamingStartDate: tableMessages[row].isStreaming ? streamStartByMessageId[messageId] : nil
+          streamingStartDate: tableMessages[row].isStreaming ? streamStartByMessageId[messageId] : nil,
+          availableWidth: tableView.bounds.width
         )
       }
     }
@@ -2132,7 +2193,8 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
           expandedStepIds: expandedStepIdsByMessage[messageId] ?? [],
           isTextExpanded: expandedTextMessageIds.contains(messageId),
           isRuntimeExpanded: expandedRuntimeMessageIds.contains(messageId),
-          streamingStartDate: tableMessages[row].isStreaming ? streamStartByMessageId[messageId] : nil
+          streamingStartDate: tableMessages[row].isStreaming ? streamStartByMessageId[messageId] : nil,
+          availableWidth: tableView.bounds.width
         )
       }
     }
@@ -4692,9 +4754,44 @@ final class VibeAgentAskSheetViewController: UIViewController {
 
   required init?(coder: NSCoder) { return nil }
 
+  // Off-mute neutral palette (no brand brown/orange) for the glass sheet.
+  private var neutralAccent: UIColor {
+    appearance.isDark ? UIColor(white: 0.95, alpha: 1.0) : UIColor(white: 0.13, alpha: 1.0)
+  }
+  private var neutralAccentText: UIColor {
+    appearance.isDark ? .black : .white
+  }
+  private var neutralFill: UIColor {
+    appearance.isDark
+      ? UIColor.white.withAlphaComponent(0.10) : UIColor.black.withAlphaComponent(0.05)
+  }
+  private var neutralStroke: UIColor {
+    appearance.isDark
+      ? UIColor.white.withAlphaComponent(0.18) : UIColor.black.withAlphaComponent(0.12)
+  }
+
   override func viewDidLoad() {
     super.viewDidLoad()
-    view.backgroundColor = appearance.background
+    // Glass sheet (mirrors the chat attachment/share sheet) instead of the solid
+    // warm/brown agent background. Neutral, off-mute palette is used throughout.
+    view.backgroundColor = .clear
+    let glassView = UIVisualEffectView(effect: nil)
+    if #available(iOS 26.0, *) {
+      let glass = UIGlassEffect()
+      glass.isInteractive = true
+      glassView.effect = glass
+    } else {
+      glassView.effect = UIBlurEffect(
+        style: appearance.isDark ? .systemChromeMaterialDark : .systemChromeMaterialLight)
+    }
+    glassView.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(glassView)
+    NSLayoutConstraint.activate([
+      glassView.topAnchor.constraint(equalTo: view.topAnchor),
+      glassView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      glassView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      glassView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+    ])
 
     scrollView.translatesAutoresizingMaskIntoConstraints = false
     scrollView.keyboardDismissMode = .interactive
@@ -4707,7 +4804,7 @@ final class VibeAgentAskSheetViewController: UIViewController {
     scrollView.addSubview(contentStack)
 
     // Parse questions before the bar so it can choose paged (Back/Next) vs single Submit.
-    if kind != "plan" { parseQuestions() }
+    if kind != "plan" && kind != "command" { parseQuestions() }
     let buttonBar = makeButtonBar()
     buttonBar.translatesAutoresizingMaskIntoConstraints = false
     view.addSubview(buttonBar)
@@ -4731,6 +4828,8 @@ final class VibeAgentAskSheetViewController: UIViewController {
 
     if kind == "plan" {
       buildPlanContent()
+    } else if kind == "command" {
+      buildCommandContent()
     } else {
       buildAskContent()
     }
@@ -4766,11 +4865,11 @@ final class VibeAgentAskSheetViewController: UIViewController {
 
     let planText = (request["plan"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "(no plan text)"
     let card = UIView()
-    card.backgroundColor = appearance.surface
+    card.backgroundColor = neutralFill
     card.layer.cornerRadius = 14
     card.layer.cornerCurve = .continuous
     card.layer.borderWidth = 1
-    card.layer.borderColor = appearance.border.cgColor
+    card.layer.borderColor = neutralStroke.cgColor
     let planLabel = UILabel()
     planLabel.text = planText
     planLabel.numberOfLines = 0
@@ -4787,6 +4886,56 @@ final class VibeAgentAskSheetViewController: UIViewController {
     contentStack.addArrangedSubview(card)
 
     contentStack.addArrangedSubview(bodyLabel("Notes for the agent (optional)", color: appearance.textTertiary))
+    contentStack.addArrangedSubview(makeFeedbackField())
+  }
+
+  /// Command-approval card: a placeholder describing what the agent wants to do +
+  /// the literal command/file it targets. Resolved via Approve / Skip / Deny.
+  private func buildCommandContent() {
+    let toolName = (request["toolName"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let title = (request["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    contentStack.addArrangedSubview(titleLabel(title?.isEmpty == false ? title! : "Approve this action"))
+
+    let repo = (request["repoName"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let subtitle =
+      toolName.isEmpty
+      ? "The agent is requesting permission to continue."
+      : "The agent wants to use \(toolName)."
+    contentStack.addArrangedSubview(
+      bodyLabel(repo?.isEmpty == false ? "\(repo!) · \(subtitle)" : subtitle, color: appearance.textTertiary))
+
+    let command = (request["command"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if !command.isEmpty {
+      let card = UIView()
+      card.backgroundColor = neutralFill
+      card.layer.cornerRadius = 14
+      card.layer.cornerCurve = .continuous
+      card.layer.borderWidth = 1
+      card.layer.borderColor = neutralStroke.cgColor
+      let mono = UILabel()
+      mono.text = command
+      mono.numberOfLines = 0
+      mono.font = .monospacedSystemFont(ofSize: 13.5, weight: .regular)
+      mono.textColor = appearance.text
+      mono.translatesAutoresizingMaskIntoConstraints = false
+      card.addSubview(mono)
+      NSLayoutConstraint.activate([
+        mono.topAnchor.constraint(equalTo: card.topAnchor, constant: 14),
+        mono.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+        mono.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+        mono.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14),
+      ])
+      contentStack.addArrangedSubview(card)
+    }
+
+    let description = (request["description"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if !description.isEmpty {
+      contentStack.addArrangedSubview(bodyLabel(description))
+    }
+    contentStack.addArrangedSubview(
+      bodyLabel(
+        "Approve runs it once · Skip continues without it · Deny stops the agent.",
+        color: appearance.textTertiary))
     contentStack.addArrangedSubview(makeFeedbackField())
   }
 
@@ -4850,8 +4999,8 @@ final class VibeAgentAskSheetViewController: UIViewController {
       let chip = UILabel()
       chip.text = "  \(q.header.uppercased())  "
       chip.font = .systemFont(ofSize: 11, weight: .bold)
-      chip.textColor = appearance.primary
-      chip.backgroundColor = appearance.primary.withAlphaComponent(0.14)
+      chip.textColor = appearance.text
+      chip.backgroundColor = neutralFill
       chip.layer.cornerRadius = 7
       chip.layer.masksToBounds = true
       chip.setContentHuggingPriority(.required, for: .horizontal)
@@ -4879,7 +5028,7 @@ final class VibeAgentAskSheetViewController: UIViewController {
     other.font = .systemFont(ofSize: 14.5)
     other.textColor = appearance.text
     other.borderStyle = .roundedRect
-    other.backgroundColor = appearance.surface
+    other.backgroundColor = neutralFill
     other.heightAnchor.constraint(equalToConstant: 40).isActive = true
     otherFields.append(other)
     block.addArrangedSubview(other)
@@ -4891,8 +5040,10 @@ final class VibeAgentAskSheetViewController: UIViewController {
     var config = UIButton.Configuration.bordered()
     config.title = label
     config.baseForegroundColor = appearance.text
-    config.background.backgroundColor = appearance.surface
-    config.background.cornerRadius = 11
+    config.background.backgroundColor = neutralFill
+    config.background.strokeColor = neutralStroke
+    config.background.strokeWidth = 1
+    config.background.cornerRadius = 12
     config.contentInsets = NSDirectionalEdgeInsets(top: 11, leading: 14, bottom: 11, trailing: 14)
     config.titleAlignment = .leading
     let button = UIButton(configuration: config)
@@ -4924,8 +5075,9 @@ final class VibeAgentAskSheetViewController: UIViewController {
     for (optIndex, button) in optionButtonsByQuestion[questionIndex].enumerated() {
       let isOn = selected[questionIndex].contains(optIndex)
       var config = button.configuration
-      config?.background.backgroundColor = isOn ? appearance.primary.withAlphaComponent(0.22) : appearance.surface
-      config?.background.strokeColor = isOn ? appearance.primary : appearance.border
+      config?.background.backgroundColor =
+        isOn ? neutralAccent.withAlphaComponent(appearance.isDark ? 0.20 : 0.12) : neutralFill
+      config?.background.strokeColor = isOn ? neutralAccent : neutralStroke
       config?.background.strokeWidth = isOn ? 1.5 : 1
       config?.baseForegroundColor = appearance.text
       button.configuration = config
@@ -4934,11 +5086,11 @@ final class VibeAgentAskSheetViewController: UIViewController {
 
   private func makeFeedbackField() -> UIView {
     let container = UIView()
-    container.backgroundColor = appearance.surface
+    container.backgroundColor = neutralFill
     container.layer.cornerRadius = 12
     container.layer.cornerCurve = .continuous
     container.layer.borderWidth = 1
-    container.layer.borderColor = appearance.border.cgColor
+    container.layer.borderColor = neutralStroke.cgColor
 
     feedbackView.translatesAutoresizingMaskIntoConstraints = false
     feedbackView.backgroundColor = .clear
@@ -4976,7 +5128,18 @@ final class VibeAgentAskSheetViewController: UIViewController {
     bar.isLayoutMarginsRelativeArrangement = true
     bar.layoutMargins = UIEdgeInsets(top: 8, left: 20, bottom: 0, right: 20)
 
-    if kind == "plan" {
+    if kind == "command" {
+      // Live command approval: Deny · Skip · Approve.
+      let deny = makeBarButton("Deny", primary: false)
+      deny.addTarget(self, action: #selector(denyCommandTapped), for: .touchUpInside)
+      let skip = makeBarButton("Skip", primary: false)
+      skip.addTarget(self, action: #selector(skipCommandTapped), for: .touchUpInside)
+      let approve = makeBarButton("Approve", primary: true)
+      approve.addTarget(self, action: #selector(approveCommandTapped), for: .touchUpInside)
+      bar.addArrangedSubview(deny)
+      bar.addArrangedSubview(skip)
+      bar.addArrangedSubview(approve)
+    } else if kind == "plan" {
       let reject = makeBarButton("Reject", primary: false)
       reject.addTarget(self, action: #selector(rejectTapped), for: .touchUpInside)
       let approve = makeBarButton("Approve & Implement", primary: true)
@@ -5020,10 +5183,11 @@ final class VibeAgentAskSheetViewController: UIViewController {
   private func makeBarButton(_ title: String, primary: Bool) -> UIButton {
     var config = UIButton.Configuration.filled()
     config.title = title
-    config.cornerStyle = .large
+    // Full-radius (capsule) buttons with neutral off-mute fills.
+    config.cornerStyle = .capsule
     config.contentInsets = NSDirectionalEdgeInsets(top: 14, leading: 16, bottom: 14, trailing: 16)
-    config.baseBackgroundColor = primary ? appearance.primary : appearance.surfaceElevated
-    config.baseForegroundColor = primary ? (appearance.isDark ? .black : .white) : appearance.text
+    config.baseBackgroundColor = primary ? neutralAccent : neutralFill
+    config.baseForegroundColor = primary ? neutralAccentText : appearance.text
     let button = UIButton(configuration: config)
     button.titleLabel?.adjustsFontSizeToFitWidth = true
     button.titleLabel?.minimumScaleFactor = 0.8
@@ -5041,6 +5205,20 @@ final class VibeAgentAskSheetViewController: UIViewController {
 
   @objc private func rejectTapped() {
     resolve("reject", answer: feedbackText.map { ["feedback": $0] })
+  }
+
+  // Command approval (kind == "command"). A typed note becomes the message handed
+  // back to the agent so it knows why a command was skipped/denied.
+  @objc private func approveCommandTapped() {
+    resolve("approve", answer: nil)
+  }
+
+  @objc private func skipCommandTapped() {
+    resolve("skip", answer: feedbackText.map { ["message": $0] })
+  }
+
+  @objc private func denyCommandTapped() {
+    resolve("deny", answer: feedbackText.map { ["message": $0] })
   }
 
   @objc private func submitTapped() {

@@ -2115,6 +2115,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let next = value.trimmingCharacters(in: .whitespacesAndNewlines)
     if engineChatId == next { return }
     engineChatId = next
+    // Heal a full-page agent view that was hosted BEFORE this chat bound: it would have
+    // been created with a nil chatId (its ask/plan handler then DROPs on the chatId guard,
+    // leaving the bubble surface to cover). Now that the chatId is known, wire it so the
+    // agent view owns its own asks (and plan re-runs route through its send path) again.
+    if !next.isEmpty, let agentVC = presentedBridgeAgentVC,
+      (agentVC.agentBridgeChatId ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    {
+      agentVC.agentBridgeChatId = next
+      NSLog("[ChatListView][ask] HEAL — wired full-page agent view chatId=%@", next)
+    }
     nativeEngineRowsById.removeAll()
     nativeEngineOrder.removeAll()
     nativeDeletedMessageIds.removeAll()
@@ -2937,11 +2947,33 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// surface is shown so an `ask_user` / plan still prompts. No-ops if the full-page agent
   /// view is hosting this DM (it owns the sheet then), or on a chat/provider/dedup mismatch.
   private func presentAgentBridgeAskIfNeeded(_ info: [AnyHashable: Any]) {
-    // Full-page agent view present → let it own the sheet (it also wires plan re-runs
-    // through its own send path). Avoids a double-present of the same requestId.
-    if presentedBridgeAgentVC != nil { return }
-
     let infoChatId = (info["chatId"] as? String) ?? ""
+    // All agent sessions share ONE DM chatId, so provider is what distinguishes runs.
+    let infoProvider =
+      (info["provider"] as? String)?
+      .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+    // Defer to the full-page agent view ONLY when it can actually handle THIS ask — i.e.
+    // it's alive AND wired to this DM's chatId AND not a different provider (then it owns
+    // the sheet + the plan re-run path). A stray/unconfigured agent controller (nil/empty/
+    // mismatched chatId — e.g. one still observing after a New Chat reset, or created before
+    // the chat bound) or one for the WRONG provider must NOT swallow the ask: its own
+    // handler DROPs on the chatId/provider guard, so a presence-only check here left BOTH
+    // surfaces declining and nothing presented. The shared atomic claim still prevents a
+    // double-present when both surfaces are genuinely valid.
+    if let agentVC = presentedBridgeAgentVC,
+      let vcChat = agentVC.agentBridgeChatId?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !vcChat.isEmpty, vcChat == infoChatId
+    {
+      let vcProv =
+        (agentVC.agentBridgeProvider ?? "")
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+      let providerConflict = !infoProvider.isEmpty && !vcProv.isEmpty && infoProvider != vcProv
+      if !providerConflict {
+        NSLog("[ChatListView][ask] DEFER — full-page agent view owns chat=%@ provider=%@", vcChat, vcProv)
+        return
+      }
+    }
+
     let requestId = (info["requestId"] as? String) ?? ""
     let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !chatId.isEmpty, infoChatId == chatId else {
@@ -2949,11 +2981,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       return
     }
     guard !requestId.isEmpty else { return }
-    // All agent sessions share ONE DM chatId, so scope by provider too — a Codex ask must
-    // not surface on a Claude chat (and vice-versa). Only drop on a definite mismatch.
-    let infoProvider =
-      (info["provider"] as? String)?
-      .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+    // Scope by provider too — a Codex ask must not surface on a Claude chat (and
+    // vice-versa). Only drop on a definite mismatch.
     let vcProvider =
       (currentBridgeProvider ?? "")
       .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()

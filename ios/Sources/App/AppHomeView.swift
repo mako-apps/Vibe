@@ -1435,22 +1435,6 @@ private struct CallsRootView: View {
   }
 }
 
-private enum ChatHomeListScope: String, CaseIterable, Identifiable {
-  case active
-  case archived
-
-  var id: String { rawValue }
-
-  var title: String {
-    switch self {
-    case .active:
-      return "Chats"
-    case .archived:
-      return "Archived"
-    }
-  }
-}
-
 private struct ChatHomeScreen: View {
   @EnvironmentObject private var coordinator: AppShellCoordinator
   @Environment(\.colorScheme) private var colorScheme
@@ -1458,11 +1442,11 @@ private struct ChatHomeScreen: View {
   @State private var isShowingSearch = false
   @State private var isShowingStoryCamera = false
   @State private var isEditingHome = false
-  @State private var selectedHomeScope: ChatHomeListScope = .active
+  @State private var isShowingArchivedChats = false
   @State private var selectedChatIDs = Set<String>()
   @State private var isStartingChat = false
   @State private var errorMessage: String?
-  @State private var pendingRoomCreationKind: ChatRoomCreationKind?
+  @State private var isShowingChannelCreation = false
   @State private var roomCreationName = ""
   @State private var isShowingGroupCreation = false
   @State private var homeSearchQuery = ""
@@ -1477,12 +1461,20 @@ private struct ChatHomeScreen: View {
 
   private var filteredRows: [ChatHomeListRow] {
     let query = homeSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-    let sourceRows = selectedHomeScope == .archived ? model.archivedRows : model.rows
-    guard !query.isEmpty else { return sourceRows }
-    return sourceRows.filter { row in
+    guard !query.isEmpty else { return homeRowsWithArchiveEntry }
+    return model.rows.filter { row in
       row.title.localizedCaseInsensitiveContains(query)
         || row.preview.localizedCaseInsensitiveContains(query)
     }
+  }
+
+  private var homeRowsWithArchiveEntry: [ChatHomeListRow] {
+    guard !model.archivedRows.isEmpty else { return model.rows }
+    let archiveRow = Self.archiveEntryRow(count: model.archivedRows.count)
+    var rows = model.rows.filter { !$0.isArchiveEntry }
+    let insertionIndex = rows.first?.isSavedMessages == true ? 1 : 0
+    rows.insert(archiveRow, at: insertionIndex)
+    return rows
   }
 
   private var hasHomeRowsForAnyScope: Bool {
@@ -1491,6 +1483,39 @@ private struct ChatHomeScreen: View {
 
   private var trimmedHomeQuery: String {
     homeSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  private static func archiveEntryRow(count: Int) -> ChatHomeListRow {
+    ChatHomeListRow(
+      chatId: "archive",
+      title: "Archived",
+      preview: count == 1 ? "1 archived chat" : "\(count) archived chats",
+      timeLabel: "",
+      unreadCount: 0,
+      markedUnread: false,
+      muted: false,
+      pinned: false,
+      archived: false,
+      isTyping: false,
+      isOnline: false,
+      peerUserId: nil,
+      avatarUri: nil,
+      avatarFallback: "A",
+      avatarGradientStartLight: nil,
+      avatarGradientEndLight: nil,
+      avatarGradientStartDark: nil,
+      avatarGradientEndDark: nil,
+      isSavedMessages: false,
+      isArchiveEntry: true,
+      type: "archive_entry",
+      isGroup: false,
+      isAgentFriend: false,
+      peerAgentId: nil,
+      agentEventInboxMode: nil,
+      peerTier: nil,
+      previewRows: [],
+      initialMessages: []
+    )
   }
 
   /// Claude/Codex surfaced instantly on a username prefix (no network). They are
@@ -1554,6 +1579,7 @@ private struct ChatHomeScreen: View {
   var body: some View {
     NavigationStack {
       listContent
+        .ignoresSafeArea(.container, edges: .top)
         .background(palette.background.ignoresSafeArea())
         .navigationBarTitleDisplayMode(.inline)
         // Let iOS 26 apply its native adaptive Liquid Glass to the nav bar and
@@ -1632,6 +1658,15 @@ private struct ChatHomeScreen: View {
             homeSearchQuery = ""
           }
         }
+        .navigationDestination(isPresented: $isShowingArchivedChats) {
+          ArchivedChatHomeListScreen(
+            model: model,
+            palette: palette,
+            isDark: colorScheme == .dark,
+            openRow: openLocalChatRow,
+            performAction: performHomeRowAction
+          )
+        }
     }
     .task {
       AppUITrace.notice("ChatHomeScreen task loadIfNeeded")
@@ -1640,12 +1675,6 @@ private struct ChatHomeScreen: View {
     }
     .task(id: homeSearchQuery) {
       await runGlobalSearch()
-    }
-    .onChange(of: selectedHomeScope) { _, scope in
-      selectedChatIDs.removeAll()
-      if scope == .archived {
-        Task { await model.loadArchivedIfNeeded() }
-      }
     }
     .onAppear {
       AppUITrace.notice(
@@ -1663,7 +1692,7 @@ private struct ChatHomeScreen: View {
     .sheet(isPresented: $isShowingSearch) {
       if let config = AppSessionConfig.current {
         NavigationStack {
-          ContactSearchView(config: config) { payload in
+          ContactSearchView(config: config, homeRows: model.rows) { payload in
             handleSearchPayload(payload)
           }
         }
@@ -1671,35 +1700,19 @@ private struct ChatHomeScreen: View {
     }
     .sheet(isPresented: $isShowingGroupCreation) {
       if let config = AppSessionConfig.current {
-        ChatGroupCreationSheet(config: config) { route in
+        ChatGroupCreationSheet(config: config, homeRows: model.rows) { route in
           coordinator.openChat(route)
           Task { await model.refresh() }
         }
       }
     }
-    .alert(
-      pendingRoomCreationKind?.title ?? "",
-      isPresented: Binding(
-        get: { pendingRoomCreationKind != nil },
-        set: { if !$0 { pendingRoomCreationKind = nil; roomCreationName = "" } }
-      )
-    ) {
-      TextField(pendingRoomCreationKind?.placeholder ?? "Name", text: $roomCreationName)
-      Button("Cancel", role: .cancel) {
-        pendingRoomCreationKind = nil
-        roomCreationName = ""
-      }
-      Button("Create") {
-        let kind = pendingRoomCreationKind
-        let name = roomCreationName
-        pendingRoomCreationKind = nil
-        roomCreationName = ""
-        if let kind {
-          Task { await createRoom(kind: kind, name: name) }
+    .sheet(isPresented: $isShowingChannelCreation) {
+      if let config = AppSessionConfig.current {
+        ChannelCreationSheet(config: config) { route in
+          coordinator.openChat(route)
+          Task { await model.refresh() }
         }
       }
-    } message: {
-      Text(pendingRoomCreationKind?.message ?? "")
     }
     .fullScreenCover(isPresented: $isShowingStoryCamera) {
       AppNativeStoryCameraPage {
@@ -1739,17 +1752,19 @@ private struct ChatHomeScreen: View {
       .frame(maxWidth: .infinity, maxHeight: .infinity)
       .background(palette.background)
     } else {
-      ChatHomeNativeScopedList(
+      ChatHomeNativeListRepresentable(
         rows: filteredRows,
-        scope: $selectedHomeScope,
-        activeCount: model.rows.count,
-        archivedCount: model.archivedRows.count,
-        isLoadingArchived: model.isLoadingArchived,
-        palette: palette,
         isDark: colorScheme == .dark,
         isEditing: isEditingHome,
+        showsRightCheckmark: false,
         selectedChatIDs: selectedChatIDs,
         onSelect: { row in
+          if row.isArchiveEntry {
+            selectedChatIDs.removeAll()
+            isShowingArchivedChats = true
+            Task { await model.loadArchivedIfNeeded() }
+            return
+          }
           AppUITrace.notice(
             "ChatHomeScreen select chatId=\(String(row.chatId.prefix(12))) title=\(row.title) rows=\(model.rows.count) initialMessages=\(row.initialMessages.count)"
           )
@@ -1772,15 +1787,11 @@ private struct ChatHomeScreen: View {
           performHomeRowAction(action, row: row)
         },
         onRefresh: {
-          if selectedHomeScope == .archived {
-            await model.refreshArchived()
-          } else {
-            await model.refresh()
-          }
-        }
+          await model.refreshAll()
+        },
+        onUnavailableAction: { AppToastController.shared.show($0) }
       )
       .frame(maxWidth: .infinity, maxHeight: .infinity)
-      .background(palette.background)
     }
   }
 
@@ -1921,7 +1932,7 @@ private struct ChatHomeScreen: View {
       if action == "newGroup" {
         isShowingGroupCreation = true
       } else {
-        pendingRoomCreationKind = .channel
+        isShowingChannelCreation = true
       }
       return
     }
@@ -1945,6 +1956,7 @@ private struct ChatHomeScreen: View {
 
     isShowingSearch = false
     Task {
+      try? await Task.sleep(nanoseconds: 300_000_000)
       let route = await openChat(for: user)
       if action == "call", let route {
         NativeCallRouteBridge.startOutgoing(route: route, callType: "voice")
@@ -2075,7 +2087,7 @@ private extension ChatHomeListRow {
   }
 
   var supportsRemoteHomeActions: Bool {
-    !isSavedMessages && !isBuiltInAgentSurface
+    !isSavedMessages && !isArchiveEntry && !isBuiltInAgentSurface
   }
 }
 
@@ -2219,6 +2231,65 @@ private enum ChatHomeEditService {
     }
     return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
       ?? "Chat action failed."
+  }
+}
+
+private struct ArchivedChatHomeListScreen: View {
+  @ObservedObject var model: ChatsViewModel
+  let palette: AppThemePalette
+  let isDark: Bool
+  let openRow: (ChatHomeListRow) -> Void
+  let performAction: (ChatHomeRowAction, ChatHomeListRow) -> Void
+
+  var body: some View {
+    Group {
+      if model.archivedRows.isEmpty && model.isLoadingArchived {
+        ProgressView()
+          .controlSize(.regular)
+          .tint(palette.secondaryText)
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+          .background(palette.background)
+      } else if model.archivedRows.isEmpty {
+        VStack(spacing: 10) {
+          Image(systemName: "archivebox")
+            .font(.system(size: 28, weight: .medium))
+            .foregroundStyle(palette.secondaryText.opacity(0.75))
+          Text("No Archived Chats")
+            .font(.system(size: 16, weight: .semibold))
+            .foregroundStyle(palette.text)
+          Text("Archived conversations will appear here.")
+            .font(.system(size: 14, weight: .regular))
+            .foregroundStyle(palette.secondaryText)
+            .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(.horizontal, 24)
+        .background(palette.background)
+      } else {
+        ChatHomeNativeListRepresentable(
+          rows: model.archivedRows,
+          isDark: isDark,
+          isEditing: false,
+          showsRightCheckmark: false,
+          selectedChatIDs: [],
+          onSelect: openRow,
+          onToggleSelection: { _ in },
+          onAction: performAction,
+          onRefresh: {
+            await model.refreshArchived()
+          },
+          onUnavailableAction: { AppToastController.shared.show($0) }
+        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(palette.background)
+      }
+    }
+    .ignoresSafeArea(.container, edges: .top)
+    .background(palette.background.ignoresSafeArea())
+    .navigationBarTitleDisplayMode(.inline)
+    .task {
+      await model.loadArchivedIfNeeded()
+    }
   }
 }
 
@@ -2390,84 +2461,6 @@ private struct ShareChatSelectionView: View {
   }
 }
 
-private struct ChatHomeNativeScopedList: View {
-  let rows: [ChatHomeListRow]
-  @Binding var scope: ChatHomeListScope
-  let activeCount: Int
-  let archivedCount: Int
-  let isLoadingArchived: Bool
-  let palette: AppThemePalette
-  let isDark: Bool
-  let isEditing: Bool
-  let selectedChatIDs: Set<String>
-  let onSelect: (ChatHomeListRow) -> Void
-  let onToggleSelection: (String) -> Void
-  let onAction: (ChatHomeRowAction, ChatHomeListRow) -> Void
-  let onRefresh: () async -> Void
-
-  var body: some View {
-    VStack(spacing: 0) {
-      scopePicker
-
-      if rows.isEmpty {
-        emptyState
-      } else {
-        ChatHomeNativeListRepresentable(
-          rows: rows,
-          isDark: isDark,
-          isEditing: isEditing,
-          showsRightCheckmark: false,
-          selectedChatIDs: selectedChatIDs,
-          onSelect: onSelect,
-          onToggleSelection: onToggleSelection,
-          onAction: onAction,
-          onRefresh: onRefresh,
-          onUnavailableAction: { AppToastController.shared.show($0) }
-        )
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-      }
-    }
-    .background(palette.background)
-  }
-
-  private var scopePicker: some View {
-    Picker("Chat list", selection: $scope) {
-      Text("Chats \(activeCount)").tag(ChatHomeListScope.active)
-      Text("Archived \(archivedCount)").tag(ChatHomeListScope.archived)
-    }
-    .pickerStyle(.segmented)
-    .padding(.horizontal, 16)
-    .padding(.top, 8)
-    .padding(.bottom, 6)
-    .background(palette.background)
-  }
-
-  private var emptyState: some View {
-    VStack(spacing: 10) {
-      if scope == .archived && isLoadingArchived {
-        ProgressView()
-          .tint(palette.secondaryText)
-      } else {
-        Image(systemName: scope == .archived ? "archivebox" : "bubble.left.and.bubble.right")
-          .font(.system(size: 28, weight: .medium))
-          .foregroundStyle(palette.secondaryText.opacity(0.75))
-      }
-
-      Text(scope == .archived ? "No Archived Chats" : "No Chats")
-        .font(.system(size: 16, weight: .semibold))
-        .foregroundStyle(palette.text)
-
-      Text(scope == .archived ? "Archived conversations will appear here." : "Start a conversation to catch the vibe.")
-        .font(.system(size: 14, weight: .regular))
-        .foregroundStyle(palette.secondaryText)
-        .multilineTextAlignment(.center)
-    }
-    .frame(maxWidth: .infinity, maxHeight: .infinity)
-    .padding(.horizontal, 24)
-    .background(palette.background)
-  }
-}
-
 private struct ChatHomeNativeListRepresentable: UIViewControllerRepresentable {
   let rows: [ChatHomeListRow]
   let isDark: Bool
@@ -2548,13 +2541,9 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     updateTopContentInset()
   }
 
-  // UIKit grows this controller's safe area to cover whatever the parent
-  // UINavigationController is currently showing above it (status bar + nav
-  // bar, plus the .searchable() drawer when it's visible) regardless of the
-  // sibling SwiftUI content's ignoresSafeArea(.top) — that modifier only
-  // affects SwiftUI's own layout, not this UIKit child's safeAreaInsets.
-  // So safeAreaInsets.top alone is already the correct top clearance; adding
-  // the nav bar height on top of it double-counts and pushes rows down.
+  // The SwiftUI host lets the table background extend under the transparent
+  // navigation area. The row content still needs UIKit's safe-area clearance so
+  // cells do not clip under the nav/search chrome.
   private func updateTopContentInset() {
     let topInset = view.safeAreaInsets.top
     guard tableView.contentInset.top != topInset else { return }
@@ -2762,6 +2751,10 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
 
   func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
     guard rows.indices.contains(indexPath.row) else { return }
+    if presentedViewController != nil {
+      tableView.deselectRow(at: indexPath, animated: false)
+      return
+    }
     openSwipeCell?.closeSwipe(animated: true)
     openSwipeCell = nil
     let row = rows[indexPath.row]
@@ -2799,55 +2792,64 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
   ) -> UIContextMenuConfiguration? {
     guard !isEditingMode, rows.indices.contains(indexPath.row) else { return nil }
     let row = rows[indexPath.row]
-    AppUITrace.notice(
-      "ChatHomeNativeListController contextMenu row=\(indexPath.row) chatId=\(String(row.chatId.prefix(12)))"
-    )
-    return UIContextMenuConfiguration(identifier: row.chatId as NSString) {
-      ChatHomeMiniPreviewController(row: row, isDark: self.isDark)
-    } actionProvider: {
-      [weak self] _ in
+    guard !row.isArchiveEntry else { return nil }
+
+    openSwipeCell?.closeSwipe(animated: true)
+    openSwipeCell = nil
+    let currentIsDark = isDark
+
+    return UIContextMenuConfiguration(identifier: row.chatId as NSString) { [weak self] in
+      ChatHomeMiniPreviewController(row: row, isDark: self?.isDark ?? currentIsDark)
+    } actionProvider: { [weak self] _ in
       let openAction = UIAction(
         title: "Open Chat",
-        image: UIImage(systemName: "bubble.left")
+        image: UIImage(systemName: "bubble.left.fill")
       ) { [weak self] _ in
         self?.onSelect(row)
       }
-      let hasUnread = row.unreadCount > 0 || row.markedUnread
-      let readAction = UIAction(
-        title: hasUnread ? "Mark as Read" : "Mark as Unread",
-        image: UIImage(systemName: hasUnread ? "message.fill" : "circle")
-      ) { [weak self] _ in
-        self?.onAction(.markUnread(!hasUnread), row)
-      }
-      let pinAction = UIAction(
-        title: row.pinned ? "Unpin" : "Pin",
-        image: UIImage(systemName: row.pinned ? "pin.slash" : "pin")
-      ) { [weak self] _ in
-        self?.onAction(.pin(!row.pinned), row)
-      }
-      let muteAction = UIAction(
-        title: row.muted ? "Unmute" : "Mute",
-        image: UIImage(systemName: row.muted ? "speaker.wave.2" : "speaker.slash")
-      ) { [weak self] _ in
-        self?.onAction(.mute(!row.muted), row)
-      }
-      let archiveAction = UIAction(
-        title: row.archived ? "Unarchive" : "Archive",
-        image: UIImage(systemName: row.archived ? "tray.and.arrow.up" : "archivebox")
-      ) { [weak self] _ in
-        self?.onAction(.archive(!row.archived), row)
-      }
-      let deleteAction = UIAction(
-        title: "Delete",
-        image: UIImage(systemName: "trash"),
-        attributes: .destructive
-      ) { [weak self] _ in
-        self?.onAction(.delete, row)
-      }
+
       var actions: [UIMenuElement] = [openAction]
       if row.supportsRemoteHomeActions {
+        let hasUnread = row.hasUnreadState
+        let readAction = UIAction(
+          title: hasUnread ? "Mark as Read" : "Mark as Unread",
+          image: UIImage(systemName: hasUnread ? "envelope.open.fill" : "envelope.badge.fill")
+        ) { [weak self] _ in
+          self?.onAction(.markUnread(!hasUnread), row)
+        }
+
+        let pinAction = UIAction(
+          title: row.pinned ? "Unpin" : "Pin",
+          image: UIImage(systemName: row.pinned ? "pin.slash.fill" : "pin.fill")
+        ) { [weak self] _ in
+          self?.onAction(.pin(!row.pinned), row)
+        }
+
+        let muteAction = UIAction(
+          title: row.muted ? "Unmute" : "Mute",
+          image: UIImage(systemName: row.muted ? "speaker.wave.2.fill" : "speaker.slash.fill")
+        ) { [weak self] _ in
+          self?.onAction(.mute(!row.muted), row)
+        }
+
+        let archiveAction = UIAction(
+          title: row.archived ? "Unarchive" : "Archive",
+          image: UIImage(systemName: row.archived ? "tray.and.arrow.up.fill" : "archivebox.fill")
+        ) { [weak self] _ in
+          self?.onAction(.archive(!row.archived), row)
+        }
+
+        let deleteAction = UIAction(
+          title: "Delete",
+          image: UIImage(systemName: "trash.fill"),
+          attributes: .destructive
+        ) { [weak self] _ in
+          self?.onAction(.delete, row)
+        }
+
         actions.append(contentsOf: [readAction, pinAction, muteAction, archiveAction, deleteAction])
       }
+
       return UIMenu(title: "", children: actions)
     }
   }
@@ -2857,7 +2859,15 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     willPerformPreviewActionForMenuWith configuration: UIContextMenuConfiguration,
     animator: UIContextMenuInteractionCommitAnimating
   ) {
-    guard let chatId = configuration.identifier as? String,
+    let chatId: String?
+    if let value = configuration.identifier as? String {
+      chatId = value
+    } else if let value = configuration.identifier as? NSString {
+      chatId = value as String
+    } else {
+      chatId = nil
+    }
+    guard let chatId,
       let row = rows.first(where: { $0.chatId == chatId })
     else { return }
     animator.addCompletion { [weak self] in
@@ -3003,7 +3013,7 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
   }
 
   private func resolvedAvatarGradientColors(for row: ChatHomeListRow) -> (UIColor, UIColor)? {
-    if !row.isSavedMessages {
+    if !row.isSavedMessages && !row.isArchiveEntry {
       return ChatProfileAppearanceStore.avatarColors(
         title: row.title,
         peerUserId: row.peerUserId,
@@ -3045,6 +3055,7 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
 }
 
 private final class ChatHomeMiniPreviewController: UIViewController {
+  private let backdropView: UIVisualEffectView
   private let mainView = ChatMainView()
   private let row: ChatHomeListRow
   private let isDark: Bool
@@ -3054,26 +3065,40 @@ private final class ChatHomeMiniPreviewController: UIViewController {
   init(row: ChatHomeListRow, isDark: Bool) {
     self.row = row
     self.isDark = isDark
+    let blurStyle: UIBlurEffect.Style = isDark ? .systemUltraThinMaterialDark : .systemUltraThinMaterialLight
+    self.backdropView = UIVisualEffectView(effect: UIBlurEffect(style: blurStyle))
     super.init(nibName: nil, bundle: nil)
 
     view.backgroundColor = .clear
     view.clipsToBounds = true
 
+    backdropView.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(backdropView)
     mainView.translatesAutoresizingMaskIntoConstraints = false
     view.addSubview(mainView)
     NSLayoutConstraint.activate([
-      mainView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 2),
-      mainView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -2),
+      backdropView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      backdropView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      backdropView.topAnchor.constraint(equalTo: view.topAnchor),
+      backdropView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+      mainView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      mainView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
       mainView.topAnchor.constraint(equalTo: view.topAnchor),
       mainView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
     ])
 
+    backdropView.layer.cornerRadius = 20
+    view.layer.cornerRadius = 20
     mainView.layer.cornerRadius = 20
     if #available(iOS 13.0, *) {
+      backdropView.layer.cornerCurve = .continuous
+      view.layer.cornerCurve = .continuous
       mainView.layer.cornerCurve = .continuous
     }
+    backdropView.clipsToBounds = true
     mainView.clipsToBounds = true
     mainView.setExternalNavigationHeaderEnabled(false)
+    mainView.setPreviewHeaderCenterOnly(true)
     mainView.setAppearance(Self.previewAppearance(isDark: isDark))
     mainView.surfaceId = "home_preview_\(row.chatId)"
     mainView.setEngineSurfaceId(mainView.surfaceId)
@@ -3094,6 +3119,7 @@ private final class ChatHomeMiniPreviewController: UIViewController {
     mainView.setIsGroupOrChannel(row.isGroup)
     mainView.setStatusAuthorityEnabled(true)
     mainView.setInputBarEnabled(false)
+    mainView.isUserInteractionEnabled = true
     mainView.setNativeSendEnabled(false)
     mainView.setPage(ChatConversationPage.chat.rawValue, animated: false)
     refreshPreviewRows()
@@ -3149,10 +3175,12 @@ private final class ChatHomeMiniPreviewController: UIViewController {
 
   private func configurePreviewScrollBehavior() {
     for scrollView in Self.collectScrollViews(in: mainView) {
+      scrollView.isScrollEnabled = true
+      scrollView.isDirectionalLockEnabled = true
       scrollView.bounces = false
       scrollView.alwaysBounceVertical = false
       scrollView.alwaysBounceHorizontal = false
-      scrollView.panGestureRecognizer.cancelsTouchesInView = false
+      scrollView.panGestureRecognizer.cancelsTouchesInView = true
       scrollView.delaysContentTouches = false
       scrollView.canCancelContentTouches = true
     }
@@ -3186,8 +3214,9 @@ private final class ChatHomeMiniPreviewController: UIViewController {
 
   private static func preferredContentSize() -> CGSize {
     let screen = UIScreen.main.bounds.size
-    let width = max(320, screen.width - 14)
-    let height = max(260, screen.height * 0.4)
+    let width = max(320, min(screen.width - 10, 560))
+    let maxHeight = max(420, screen.height - 190)
+    let height = min(maxHeight, screen.height * 0.72)
     return CGSize(width: width, height: height)
   }
 
@@ -3268,27 +3297,12 @@ private final class ChatHomeMiniPreviewController: UIViewController {
   }
 
   private static func previewAppearance(isDark: Bool) -> [String: Any] {
-    if isDark {
-      return [
-        "theme": "dark",
-        "backgroundMode": "gradient",
-        "wallpaperGradient": ["#131325", "#0D0D1F"],
-        "wallpaperOpacity": 1.0,
-        "wallpaperPatternGradient": ["#115E59", "#0891B2", "#0284C7"],
-        "wallpaperPatternLocations": [0.0, 0.5, 1.0],
-        "wallpaperPatternOpacity": 0.12,
-        "wallpaperMaskKey": "doodles",
-      ]
-    }
-    return [
-      "theme": "light",
+    [
+      "theme": isDark ? "dark" : "light",
       "backgroundMode": "gradient",
-      "wallpaperGradient": ["#F9F3EA", "#EFE6D9"],
       "wallpaperOpacity": 1.0,
-      "wallpaperPatternGradient": ["#5A8A66", "#5A6675", "#8A75A3"],
-      "wallpaperPatternLocations": [0.0, 0.5, 1.0],
-      "wallpaperPatternOpacity": 0.06,
-      "wallpaperMaskKey": "doodles",
+      "nativeThemeId": AppThemePlateController.currentOption.rawValue,
+      "nativeThemeIsDark": isDark,
     ]
   }
 
@@ -3323,7 +3337,7 @@ private struct ContactsPageView: View {
   @State private var isEditingContacts = false
   @State private var isStartingChat = false
   @State private var errorMessage: String?
-  @State private var pendingRoomCreationKind: ChatRoomCreationKind?
+  @State private var isShowingChannelCreation = false
   @State private var roomCreationName = ""
   @State private var isShowingGroupCreation = false
 
@@ -3431,7 +3445,7 @@ private struct ContactsPageView: View {
     .sheet(isPresented: $isShowingSearch) {
       if let config = AppSessionConfig.current {
         Group {
-          ContactSearchView(config: config) { payload in
+          ContactSearchView(config: config, homeRows: model.rows) { payload in
             handleSearchPayload(payload)
           }
         }
@@ -3439,35 +3453,19 @@ private struct ContactsPageView: View {
     }
     .sheet(isPresented: $isShowingGroupCreation) {
       if let config = AppSessionConfig.current {
-        ChatGroupCreationSheet(config: config) { route in
+        ChatGroupCreationSheet(config: config, homeRows: model.rows) { route in
           coordinator.openChat(route)
           Task { await model.refresh() }
         }
       }
     }
-    .alert(
-      pendingRoomCreationKind?.title ?? "",
-      isPresented: Binding(
-        get: { pendingRoomCreationKind != nil },
-        set: { if !$0 { pendingRoomCreationKind = nil; roomCreationName = "" } }
-      )
-    ) {
-      TextField(pendingRoomCreationKind?.placeholder ?? "Name", text: $roomCreationName)
-      Button("Cancel", role: .cancel) {
-        pendingRoomCreationKind = nil
-        roomCreationName = ""
-      }
-      Button("Create") {
-        let kind = pendingRoomCreationKind
-        let name = roomCreationName
-        pendingRoomCreationKind = nil
-        roomCreationName = ""
-        if let kind {
-          Task { await createRoom(kind: kind, name: name) }
+    .sheet(isPresented: $isShowingChannelCreation) {
+      if let config = AppSessionConfig.current {
+        ChannelCreationSheet(config: config) { route in
+          coordinator.openChat(route)
+          Task { await model.refresh() }
         }
       }
-    } message: {
-      Text(pendingRoomCreationKind?.message ?? "")
     }
   }
 
@@ -3493,7 +3491,7 @@ private struct ContactsPageView: View {
       if action == "newGroup" {
         isShowingGroupCreation = true
       } else {
-        pendingRoomCreationKind = .channel
+        isShowingChannelCreation = true
       }
       return
     }
@@ -5939,6 +5937,7 @@ private struct ContactSearchView: View {
   @Environment(\.colorScheme) private var colorScheme
 
   let config: AppSessionConfig
+  let homeRows: [ChatHomeListRow]
   let onResult: ([String: Any]) -> Void
   @State private var query = ""
   @State private var results: [ContactSearchUser] = []
@@ -5947,8 +5946,7 @@ private struct ContactSearchView: View {
   @State private var hasSearched = false
   @State private var statusText = ""
   @State private var searchTask: Task<Void, Never>?
-  @FocusState private var isQueryFieldFocused: Bool
-  @StateObject private var directoryModel = ContactDirectoryViewModel()
+  @State private var isSearchPresented = false
 
   private var palette: AppThemePalette {
     AppThemePalette.resolve(for: colorScheme)
@@ -5960,28 +5958,27 @@ private struct ContactSearchView: View {
 
   var body: some View {
     contactList
-      .listStyle(.insetGrouped)
-      .scrollContentBackground(.hidden)
+      .listStyle(.plain)
       .background(palette.background.ignoresSafeArea())
       .navigationTitle("New Message")
       .navigationBarTitleDisplayMode(.inline)
-      .onAppear {
-        DispatchQueue.main.async {
-          isQueryFieldFocused = true
-        }
-      }
-      .task {
-        await directoryModel.loadIfNeeded()
-      }
+      .searchable(
+        text: $query,
+        isPresented: $isSearchPresented,
+        placement: .navigationBarDrawer(displayMode: .automatic),
+        prompt: "Username, phone, or ID"
+      )
       .onChange(of: query) { _, _ in
         scheduleSearch(immediate: false)
       }
       .onDisappear { searchTask?.cancel() }
       .toolbar {
         ToolbarItem(placement: .topBarLeading) {
-          Button("Close") {
+          Button {
             onResult(["action": "cancel"])
             dismiss()
+          } label: {
+            Image(systemName: "xmark")
           }
         }
       }
@@ -5990,7 +5987,6 @@ private struct ContactSearchView: View {
   private var contactList: some View {
     List {
       actionSection
-      searchSection
       contentSection
     }
   }
@@ -6011,7 +6007,7 @@ private struct ContactSearchView: View {
         systemImage: "person.badge.plus",
         palette: palette
       ) {
-        isQueryFieldFocused = true
+        isSearchPresented = true
       }
 
       ContactSearchActionRow(
@@ -6023,95 +6019,69 @@ private struct ContactSearchView: View {
         dismiss()
       }
     }
+    .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
     .listRowBackground(Color.clear)
     .listRowSeparatorTint(palette.border)
   }
 
-  private var searchSection: some View {
-    Section {
-      HStack(spacing: 10) {
-        Image(systemName: "magnifyingglass")
-          .foregroundStyle(palette.secondaryText)
-        TextField("Username, phone, or ID", text: $query)
-          .focused($isQueryFieldFocused)
-          .textInputAutocapitalization(.never)
-          .autocorrectionDisabled()
-          .submitLabel(.search)
-          .onSubmit { scheduleSearch(immediate: true) }
-        if isLoading {
-          ProgressView().controlSize(.small)
-        } else if !query.isEmpty {
-          Button(action: clearSearch) {
-            Image(systemName: "xmark.circle.fill")
-              .foregroundStyle(palette.secondaryText)
-          }
-          .buttonStyle(.plain)
-        }
-      }
-    }
-    .listRowBackground(palette.card)
-  }
+
 
   @ViewBuilder
   private var contentSection: some View {
     if !results.isEmpty {
-      peopleSection
+      groupedUsersSection(users: results)
     } else if query.isEmpty {
-      recentAndAgentsSection
+      groupedUsersSection(users: homeRows.map(contactUser(for:)))
     } else {
       statusSection
     }
   }
 
-  private var peopleSection: some View {
-    Section("People") {
-      ForEach(results) { user in
-        ContactSearchResultRow(
-          user: user,
-          isSaved: savedUserIDs.contains(user.userID),
-          palette: palette
-        )
-        .contentShape(Rectangle())
-        .onTapGesture { open(user, action: "chat") }
-        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-          Button {
-            open(user, action: "call")
-          } label: {
-            Label("Call", systemImage: "phone.fill")
-          }
-          .tint(.green)
+  private func groupedUsersSection(users: [ContactSearchUser]) -> some View {
+    var uniqueUsers: [ContactSearchUser] = []
+    var seenIDs = Set<String>()
+    for user in users {
+      if !seenIDs.contains(user.userID) {
+        seenIDs.insert(user.userID)
+        uniqueUsers.append(user)
+      }
+    }
+    let grouped = Dictionary(grouping: uniqueUsers) { user in
+      String(user.username.prefix(1)).uppercased()
+    }
+    let sortedKeys = grouped.keys.sorted()
 
-          if !savedUserIDs.contains(user.userID) {
+    return ForEach(sortedKeys, id: \.self) { letter in
+      Section(letter) {
+        ForEach(grouped[letter]!) { user in
+          ContactSearchResultRow(
+            user: user,
+            isSaved: savedUserIDs.contains(user.userID),
+            palette: palette
+          )
+          .contentShape(Rectangle())
+          .onTapGesture { open(user, action: "chat") }
+          .swipeActions(edge: .trailing, allowsFullSwipe: false) {
             Button {
-              savedUserIDs.insert(user.userID)
-              onResult(["action": "saveContact", "user": user.payload])
+              open(user, action: "call")
             } label: {
-              Label("Add", systemImage: "person.badge.plus")
+              Label("Call", systemImage: "phone.fill")
             }
-            .tint(palette.accent)
+            .tint(.green)
+
+            if !savedUserIDs.contains(user.userID) {
+              Button {
+                savedUserIDs.insert(user.userID)
+                onResult(["action": "saveContact", "user": user.payload])
+              } label: {
+                Label("Add", systemImage: "person.badge.plus")
+              }
+              .tint(palette.accent)
+            }
           }
         }
       }
     }
-    .listRowBackground(palette.card)
-  }
-
-  private var recentAndAgentsSection: some View {
-    Section("Recent & Local Agents") {
-      ForEach(localAgentUsers) { user in
-        ContactSearchResultRow(user: user, isSaved: false, palette: palette)
-          .contentShape(Rectangle())
-          .onTapGesture { open(user, action: "chat") }
-      }
-
-      ForEach(directoryModel.rows, id: \.chatId) { row in
-        let user = contactUser(for: row)
-        ContactSearchResultRow(user: user, isSaved: false, palette: palette)
-          .contentShape(Rectangle())
-          .onTapGesture { open(user, action: "chat") }
-      }
-    }
-    .listRowBackground(palette.card)
   }
 
   private var statusSection: some View {
@@ -6128,26 +6098,7 @@ private struct ContactSearchView: View {
     }
   }
 
-  private var localAgentUsers: [ContactSearchUser] {
-    [
-      [
-        "userId": ChatRoute.claudeAgentUserId,
-        "username": "Claude",
-        "handle": "claude",
-        "isAgent": true,
-        "agentId": "claude",
-        "tier": "gold",
-      ],
-      [
-        "userId": ChatRoute.codexAgentUserId,
-        "username": "Codex",
-        "handle": "codex",
-        "isAgent": true,
-        "agentId": "codex",
-        "tier": "gold",
-      ],
-    ].compactMap(ContactSearchUser.init(payload:))
-  }
+
 
   private func contactUser(for row: ChatHomeListRow) -> ContactSearchUser {
     ContactSearchUser(payload: [
@@ -6165,11 +6116,10 @@ private struct ContactSearchView: View {
     query = ""
     results = []
     hasSearched = false
-    isQueryFieldFocused = true
+    isSearchPresented = true
   }
 
   private func open(_ user: ContactSearchUser, action: String) {
-    isQueryFieldFocused = false
     onResult(["action": action, "user": user.payload])
     dismiss()
   }
@@ -6253,21 +6203,26 @@ private struct HomeSearchChatRow: View {
   }
 }
 
-private struct ContactSearchResultRow: View {
+struct ContactSearchResultRow: View {
   let user: ContactSearchUser
   let isSaved: Bool
   let palette: AppThemePalette
 
   var body: some View {
     HStack(spacing: 12) {
-      Circle()
-        .fill(palette.background)
-        .frame(width: 44, height: 44)
-        .overlay {
-          Text(String(user.username.prefix(1)).uppercased())
-            .font(.system(size: 18, weight: .semibold))
-            .foregroundStyle(palette.accent)
+      if let profileImage = user.profileImage, let url = URL(string: profileImage) {
+        AsyncImage(url: url) { phase in
+          if let image = phase.image {
+            image.resizable().scaledToFill()
+          } else {
+            fallbackAvatar
+          }
         }
+        .frame(width: 44, height: 44)
+        .clipShape(Circle())
+      } else {
+        fallbackAvatar
+      }
 
       VStack(alignment: .leading, spacing: 2) {
         HStack(spacing: 6) {
@@ -6279,9 +6234,26 @@ private struct ContactSearchResultRow: View {
           }
         }
         .lineLimit(1)
-        Text(user.subtitle)
+
+        let lastSeenText: String = {
+          if user.isAgent {
+            return "Open and start session"
+          }
+          return ChatEngine.shared.lastSeenTimestampMs(userId: user.userID).flatMap { timestamp -> String? in
+            guard timestamp > 0 else { return nil }
+            let date = Date(timeIntervalSince1970: TimeInterval(timestamp) / 1000.0)
+            let formatter = RelativeDateTimeFormatter()
+            formatter.unitsStyle = .short
+            let relative = formatter.localizedString(for: date, relativeTo: Date())
+            let trimmed = relative.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : "last seen \(trimmed)"
+          } ?? "last seen recently"
+        }()
+
+        Text(lastSeenText)
           .font(.footnote)
           .foregroundStyle(palette.secondaryText)
+          .lineLimit(1)
       }
 
       Spacer(minLength: 8)
@@ -6290,11 +6262,36 @@ private struct ContactSearchResultRow: View {
         Image(systemName: "checkmark.circle.fill")
           .foregroundStyle(palette.accent)
       }
+
       Image(systemName: "chevron.right")
         .font(.system(size: 13, weight: .semibold))
         .foregroundStyle(palette.secondaryText.opacity(0.6))
     }
     .padding(.vertical, 4)
+    .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+    .listRowBackground(Color.clear)
+  }
+
+  private var fallbackAvatar: some View {
+    let colors = ChatProfileAppearanceStore.avatarColors(
+      title: user.username,
+      peerUserId: user.userID,
+      chatId: nil
+    )
+    return Circle()
+      .fill(
+        LinearGradient(
+          colors: [Color(uiColor: colors.0), Color(uiColor: colors.1)],
+          startPoint: .topLeading,
+          endPoint: .bottomTrailing
+        )
+      )
+      .frame(width: 44, height: 44)
+      .overlay {
+        Text(String(user.username.prefix(1)).uppercased())
+          .font(.system(size: 18, weight: .bold))
+          .foregroundStyle(.white)
+      }
   }
 }
 
@@ -6363,7 +6360,14 @@ private struct ContactSearchStatusView: View {
   }
 }
 
-struct ContactSearchUser: Identifiable {
+struct ContactSearchUser: Identifiable, Hashable, Equatable {
+  static func == (lhs: ContactSearchUser, rhs: ContactSearchUser) -> Bool {
+    lhs.userID == rhs.userID
+  }
+
+  func hash(into hasher: inout Hasher) {
+    hasher.combine(userID)
+  }
   let userID: String
   let username: String
   let handle: String?
@@ -6739,21 +6743,21 @@ struct ChatRoomCreateResult {
 }
 
 enum ChatRoomCreateService {
-  static func create(kind: ChatRoomCreationKind, config: AppSessionConfig, name: String, memberIds: [String] = []) async throws -> ChatRoomCreateResult {
+  static func create(kind: ChatRoomCreationKind, config: AppSessionConfig, name: String, memberIds: [String] = [], avatarUrl: String? = nil) async throws -> ChatRoomCreateResult {
     let activeConfig = AppSessionConfig.current ?? config
     do {
-      return try await createOnce(kind: kind, config: activeConfig, name: name, memberIds: memberIds)
+      return try await createOnce(kind: kind, config: activeConfig, name: name, memberIds: memberIds, avatarUrl: avatarUrl)
     } catch let error as ChatDirectMessageServiceError {
       guard error.isSessionExpired else {
         throw error
       }
       let refreshedConfig = try await AppSessionRefreshService.refresh(config: activeConfig)
-      return try await createOnce(kind: kind, config: refreshedConfig, name: name, memberIds: memberIds)
+      return try await createOnce(kind: kind, config: refreshedConfig, name: name, memberIds: memberIds, avatarUrl: avatarUrl)
     }
   }
 
-  private static func createOnce(kind: ChatRoomCreationKind, config: AppSessionConfig, name: String, memberIds: [String] = []) async throws -> ChatRoomCreateResult {
-    let request = try buildRequest(kind: kind, config: config, name: name, memberIds: memberIds)
+  private static func createOnce(kind: ChatRoomCreationKind, config: AppSessionConfig, name: String, memberIds: [String] = [], avatarUrl: String? = nil) async throws -> ChatRoomCreateResult {
+    let request = try buildRequest(kind: kind, config: config, name: name, memberIds: memberIds, avatarUrl: avatarUrl)
 
     switch config.transportMode {
     case .offline:
@@ -6783,7 +6787,7 @@ enum ChatRoomCreateService {
     }
   }
 
-  private static func buildRequest(kind: ChatRoomCreationKind, config: AppSessionConfig, name: String, memberIds: [String] = []) throws -> URLRequest {
+  private static func buildRequest(kind: ChatRoomCreationKind, config: AppSessionConfig, name: String, memberIds: [String] = [], avatarUrl: String? = nil) throws -> URLRequest {
     var base = config.apiBaseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
     while base.hasSuffix("/") {
       base.removeLast()
@@ -6802,6 +6806,9 @@ enum ChatRoomCreateService {
     }
 
     var body: [String: Any] = ["name": name]
+    if let avatarUrl {
+      body["avatarUrl"] = avatarUrl
+    }
     if case .group = kind {
       body["memberIds"] = memberIds
     }
@@ -6837,7 +6844,55 @@ enum ChatRoomCreateService {
     }
     let name = ChatDirectMessageService.normalizedString(payload["name"]) ?? fallbackName
     let type = ChatDirectMessageService.normalizedString(payload["type"]) ?? "group"
-    return ChatRoomCreateResult(chatID: chatID, name: name, type: type)
+    return ChatRoomCreateResult(
+      chatID: chatID,
+      name: name,
+      type: type
+    )
+  }
+
+  static func uploadAvatar(imageData: Data, config: AppSessionConfig) async throws -> String {
+    let base = config.apiBaseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+    let pathBase = base.hasSuffix("/") ? String(base.dropLast()) : base
+    let endpoint = pathBase.lowercased().hasSuffix("/api") ? "/media/upload" : "/api/media/upload"
+    guard let uploadURL = URL(string: "\(pathBase)\(endpoint)") else {
+      throw ChatDirectMessageServiceError.invalidURL
+    }
+
+    let boundary = "----VibeAvatarBoundary\(UUID().uuidString)"
+    var request = URLRequest(url: uploadURL)
+    request.httpMethod = "POST"
+    request.timeoutInterval = 45
+    request.setValue("Bearer \(config.authToken)", forHTTPHeaderField: "Authorization")
+    request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
+    request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+
+    var body = Data()
+    let appendField = { (name: String, value: String) in
+      body.append("--\(boundary)\r\n".data(using: .utf8) ?? Data())
+      body.append("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n".data(using: .utf8) ?? Data())
+      body.append("\(value)\r\n".data(using: .utf8) ?? Data())
+    }
+    appendField("user_id", config.userID)
+    appendField("type", "image")
+
+    body.append("--\(boundary)\r\n".data(using: .utf8) ?? Data())
+    body.append("Content-Disposition: form-data; name=\"file\"; filename=\"avatar.jpg\"\r\n".data(using: .utf8) ?? Data())
+    body.append("Content-Type: image/jpeg\r\n\r\n".data(using: .utf8) ?? Data())
+    body.append(imageData)
+    body.append("\r\n--\(boundary)--\r\n".data(using: .utf8) ?? Data())
+
+    let (data, response) = try await URLSession.shared.upload(for: request, from: body)
+    guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+      throw ChatDirectMessageServiceError.invalidResponse
+    }
+    guard
+      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+      let remoteURL = json["url"] as? String ?? json["media_url"] as? String ?? json["mediaUrl"] as? String
+    else {
+      throw ChatDirectMessageServiceError.invalidResponse
+    }
+    return remoteURL
   }
 }
 

@@ -294,6 +294,7 @@ struct ChatHomeListRow {
   let avatarGradientStartDark: String?
   let avatarGradientEndDark: String?
   let isSavedMessages: Bool
+  let isArchiveEntry: Bool
   let type: String?
   let isGroup: Bool
   /// True when the chat's friend is an AI agent's shadow user — i.e. this is a
@@ -378,6 +379,7 @@ struct ChatHomeListRow {
       "isOnline": isOnline,
       "avatarFallback": avatarFallback,
       "isSavedMessages": isSavedMessages,
+      "isArchiveEntry": isArchiveEntry,
       "isGroup": isGroup,
       "isAgentFriend": isAgentFriend,
       "previewRows": shouldIncludeMessagePayload ? previewRows : [],
@@ -418,6 +420,7 @@ struct ChatHomeListRow {
       avatarGradientStartDark: avatarGradientStartDark,
       avatarGradientEndDark: avatarGradientEndDark,
       isSavedMessages: isSavedMessages,
+      isArchiveEntry: isArchiveEntry,
       type: type,
       isGroup: isGroup,
       isAgentFriend: isAgentFriend,
@@ -434,6 +437,7 @@ struct ChatHomeListRow {
       return nil
     }
     let isSavedMessages = chatId == "saved_messages"
+    let isArchiveEntry = parseBool(raw["isArchiveEntry"] ?? raw["is_archive_entry"]) ?? false
     let serverMessages = parseServerMessages(raw["messages"])
     let names = [
       raw["name"], raw["title"], raw["chatName"], raw["chat_name"],
@@ -535,6 +539,7 @@ struct ChatHomeListRow {
       avatarGradientStartDark: avatarGradientStartDark ?? fallbackGradient?.darkStart,
       avatarGradientEndDark: avatarGradientEndDark ?? fallbackGradient?.darkEnd,
       isSavedMessages: isSavedMessages,
+      isArchiveEntry: isArchiveEntry,
       type: type,
       isGroup: isGroup,
       isAgentFriend: isAgentFriend,

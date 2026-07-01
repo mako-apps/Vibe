@@ -5,8 +5,9 @@ defmodule VibeWeb.GroupController do
   alias Vibe.Agents
   alias Vibe.Chat
 
-  def create(conn, %{"name" => name, "memberIds" => member_ids}) do
+  def create(conn, %{"name" => name, "memberIds" => member_ids} = params) do
     creator_id = conn.assigns.current_user.id
+    avatar_url = params["avatarUrl"]
     ensure_local_agent_users(member_ids)
 
     invalid_agent =
@@ -20,7 +21,7 @@ defmodule VibeWeb.GroupController do
     if invalid_agent do
       conn |> put_status(:forbidden) |> json(%{error: "Agent not available"})
     else
-      case Chat.create_group(creator_id, name, member_ids) do
+      case Chat.create_group(creator_id, name, member_ids, avatar_url) do
         {:ok, room} ->
           json(conn, %{
             chatId: room.id,

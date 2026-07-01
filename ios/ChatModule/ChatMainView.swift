@@ -271,6 +271,7 @@ public final class ChatMainView: UIView,
   private var standaloneProfileMode = false
   private var profileHierarchyAttached = false
   private var externalNavigationHeaderEnabled = false
+  private var previewHeaderCenterOnly = false
   private let engineStateRefreshQueue = DispatchQueue(
     label: "vibe.chat.main.engine-state",
     qos: .utility
@@ -556,6 +557,13 @@ public final class ChatMainView: UIView,
   func setExternalNavigationHeaderEnabled(_ enabled: Bool) {
     guard externalNavigationHeaderEnabled != enabled else { return }
     externalNavigationHeaderEnabled = enabled
+    updateChatModeHeaderControls()
+    setNeedsLayout()
+  }
+
+  func setPreviewHeaderCenterOnly(_ enabled: Bool) {
+    guard previewHeaderCenterOnly != enabled else { return }
+    previewHeaderCenterOnly = enabled
     updateChatModeHeaderControls()
     setNeedsLayout()
   }
@@ -1302,6 +1310,20 @@ public final class ChatMainView: UIView,
     headerContainer.isHidden = false
     let usesSavedMessagesHeader = headerMode == .savedMessages
     let searchActive = savedSearchExpanded && currentPage == .chat
+    if previewHeaderCenterOnly && !searchActive {
+      headerContainer.isUserInteractionEnabled = false
+      backGlassView.isHidden = true
+      avatarGlassView.isHidden = true
+      menuGlassView.isHidden = true
+      savedSearchCancelGlassView.isHidden = true
+      titleGlassView.isHidden = false
+      titleButton.isUserInteractionEnabled = false
+      titleButton.showsMenuAsPrimaryAction = false
+      titleButton.menu = nil
+      applyHeaderSearchPresentation()
+      return
+    }
+    headerContainer.isUserInteractionEnabled = true
     let usesBridgeHeader = !bridgeProvider.isEmpty && !usesSavedMessagesHeader && !searchActive
     avatarButton.isHidden = usesSavedMessagesHeader || searchActive
     avatarGlassView.isHidden = usesSavedMessagesHeader || searchActive
@@ -2822,7 +2844,9 @@ public final class ChatMainView: UIView,
         x: 12.0, y: contentY, width: max(0.0, bounds.width - 24.0), height: 44.0)
 
       let backWidth: CGFloat
-      if selectionModeActive {
+      if previewHeaderCenterOnly && !savedSearchExpanded {
+        backWidth = 0.0
+      } else if selectionModeActive {
         let size = backButton.sizeThatFits(CGSize(width: .greatestFiniteMagnitude, height: 44.0))
         backWidth = max(size.width + 24.0, 44.0)
       } else {
@@ -2832,7 +2856,11 @@ public final class ChatMainView: UIView,
       
       let trailingHeaderFrame = CGRect(
         x: max(0.0, headerContentView.bounds.width - 44.0), y: 0.0, width: 44.0, height: 44.0)
-      if headerMode == .savedMessages || savedSearchExpanded {
+      if previewHeaderCenterOnly && !savedSearchExpanded {
+        avatarGlassView.frame = .zero
+        menuGlassView.frame = .zero
+        savedSearchCancelGlassView.frame = .zero
+      } else if headerMode == .savedMessages || savedSearchExpanded {
         avatarGlassView.frame = savedSearchExpanded ? .zero : trailingHeaderFrame
         let cancelSpacing: CGFloat = savedSearchExpanded ? 8.0 : 0.0
         let cancelWidth: CGFloat = savedSearchExpanded ? 44.0 : 0.0
@@ -2863,11 +2891,13 @@ public final class ChatMainView: UIView,
       }
 
       let trailingSideInset =
-        headerContentView.bounds.width - avatarGlassView.frame.minX
-      let centerSideInset = max(
-        backGlassView.frame.maxX,
-        trailingSideInset
-      ) + 10.0
+        previewHeaderCenterOnly && !savedSearchExpanded
+        ? 0.0
+        : headerContentView.bounds.width - avatarGlassView.frame.minX
+      let centerSideInset =
+        previewHeaderCenterOnly && !savedSearchExpanded
+        ? 12.0
+        : max(backGlassView.frame.maxX, trailingSideInset) + 10.0
       let usesBridgeHeaderLayout =
         !bridgeProvider.isEmpty && headerMode != .savedMessages && !savedSearchExpanded
       let requestedHeaderWidth = max(
@@ -2875,7 +2905,12 @@ public final class ChatMainView: UIView,
         chatSubtitleLabel.intrinsicContentSize.width
       )
       let centerWidth: CGFloat
-      if usesBridgeHeaderLayout {
+      if previewHeaderCenterOnly && !savedSearchExpanded {
+        centerWidth = min(
+          max(140.0, requestedHeaderWidth + 32.0),
+          max(140.0, headerContentView.bounds.width - 48.0)
+        )
+      } else if usesBridgeHeaderLayout {
         centerWidth = min(
           172.0,
           max(108.0, min(requestedHeaderWidth + 36.0, headerContentView.bounds.width * 0.48))
@@ -2887,7 +2922,9 @@ public final class ChatMainView: UIView,
         )
       }
       let centerX: CGFloat
-      if usesBridgeHeaderLayout {
+      if previewHeaderCenterOnly && !savedSearchExpanded {
+        centerX = (headerContentView.bounds.width - centerWidth) * 0.5
+      } else if usesBridgeHeaderLayout {
         // Center the model/device pill between the back button and avatar — clamped so it
         // never overlaps either. The old code right-aligned it against the avatar, which
         // pushed the pill noticeably off to the right.
@@ -2999,6 +3036,21 @@ public final class ChatMainView: UIView,
     }
     let searchActive = savedSearchExpanded && currentPage == .chat
     let controlsAlpha: CGFloat = searchActive ? 0.0 : 1.0
+
+    if previewHeaderCenterOnly && !searchActive {
+      backGlassView.alpha = 0.0
+      menuGlassView.alpha = 0.0
+      avatarGlassView.alpha = 0.0
+      savedSearchCancelGlassView.alpha = 0.0
+      savedSearchField.alpha = 0.0
+      savedSearchField.isUserInteractionEnabled = false
+      savedSearchCancelButton.isUserInteractionEnabled = false
+      savedSearchCancelGlassView.isUserInteractionEnabled = false
+      titleGlassView.alpha = 1.0
+      chatHeaderStack.alpha = 1.0
+      chatHeaderStack.transform = .identity
+      return
+    }
 
     backGlassView.alpha = controlsAlpha
     titleGlassView.alpha = controlsAlpha
