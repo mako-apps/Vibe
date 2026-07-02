@@ -1,5 +1,6 @@
 import AudioToolbox
 import UIKit
+import SwiftUI
 
 private let swipeReplyTrigger: CGFloat = 56.0
 private let swipeReplyMaxOffset: CGFloat = 80.0
@@ -706,6 +707,15 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
     guard let overlay = customContextMenuOverlay else { return }
     let mid = overlay.messageId
 
+    if actionId == "delete" {
+      if let row = rows.first(where: { $0.messageId == mid }),
+         let hostCell = self.contextMenuHostCell as? ChatListCell {
+         self.showDeleteDialog(for: mid, row: row, cell: hostCell)
+      }
+      overlay.animateOut(reason: "action:\(actionId)", completion: nil)
+      return
+    }
+
     if actionId == "select" {
       self.beginMessageSelection(messageId: mid)
       overlay.animateOut(reason: "action:\(actionId)", completion: nil)
@@ -759,16 +769,228 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
     }
 
     if animated {
-      UIView.animate(
-        withDuration: 0.2, delay: 0, options: [.curveEaseOut],
-        animations: {
-          overlay.alpha = 0.0
-        },
-        completion: { _ in
-          cleanup()
-        })
+      overlay.animateOut(reason: "dismiss", completion: cleanup)
     } else {
       cleanup()
     }
+  }
+}
+
+// MARK: - Message Deletion Dialog & Wipe Overlay
+
+private var deleteDialogControllerKey: UInt8 = 0
+
+extension ChatListView {
+  private var deleteDialogController: UIViewController? {
+    get { objc_getAssociatedObject(self, &deleteDialogControllerKey) as? UIViewController }
+    set { objc_setAssociatedObject(self, &deleteDialogControllerKey, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
+  }
+
+  fileprivate func showDeleteDialog(for messageId: String, row: ChatListRow, cell: ChatListCell) {
+    let dialogView = ChatMessageDeleteDialogView(
+      isDark: self.resolvedAppearance().isDark,
+      deleteForMe: { [weak self] in
+        self?.executeMessageDeletion(messageId: messageId, row: row, cell: cell, deleteForEveryone: false)
+      },
+      deleteForEveryone: { [weak self] in
+        self?.executeMessageDeletion(messageId: messageId, row: row, cell: cell, deleteForEveryone: true)
+      },
+      cancel: { [weak self] in
+        self?.dismissDeleteDialog()
+      }
+    )
+    let hostingController = UIHostingController(rootView: dialogView)
+    hostingController.view.backgroundColor = .clear
+    hostingController.view.frame = self.bounds
+    hostingController.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    
+    self.addSubview(hostingController.view)
+    self.deleteDialogController = hostingController
+  }
+
+  private func dismissDeleteDialog() {
+    self.deleteDialogController?.view.removeFromSuperview()
+    self.deleteDialogController = nil
+  }
+
+  private func executeMessageDeletion(messageId: String, row: ChatListRow, cell: ChatListCell, deleteForEveryone: Bool) {
+    dismissDeleteDialog()
+
+    // 1. Show the wipe overlay
+    if let snapshot = cell.bubbleSnapshotView(in: self) {
+       let overlay = ChatMessageDeletionWipeOverlayView(frame: self.bounds, snapshot: snapshot, isDark: self.resolvedAppearance().isDark)
+       self.addSubview(overlay)
+       overlay.animateAndRemove()
+       
+       // Hide the actual cell content so it doesn't show behind the wipe
+       cell.isHidden = true
+       DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+           cell.isHidden = false
+       }
+    }
+
+    // 2. Perform deletion natively via ChatEngine
+    let chatId = row.chatId ?? ""
+    ChatEngine.shared.deleteMessage([
+      "chatId": chatId,
+      "messageId": messageId,
+      "skipRemoteDelete": !deleteForEveryone
+    ])
+  }
+}
+
+private struct ChatMessageDeleteDialogView: View {
+  let isDark: Bool
+  let deleteForMe: () -> Void
+  let deleteForEveryone: () -> Void
+  let cancel: () -> Void
+
+  var body: some View {
+    ZStack {
+      Color.black.opacity(0.3)
+        .ignoresSafeArea()
+        .onTapGesture { cancel() }
+      
+      VStack(spacing: 0) {
+        Text("Delete Message")
+          .font(.headline)
+          .foregroundColor(isDark ? .white : .black)
+          .padding(.top, 20)
+          .padding(.bottom, 12)
+        
+        Button(role: .destructive, action: deleteForEveryone) {
+          Text("Delete for everyone")
+            .foregroundColor(.red)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 14)
+        }
+        Divider()
+        Button(role: .destructive, action: deleteForMe) {
+          Text("Delete for me")
+            .foregroundColor(.red)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 14)
+        }
+        Divider()
+        Button(role: .cancel, action: cancel) {
+          Text("Cancel")
+            .foregroundColor(isDark ? .white : .black)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 14)
+        }
+      }
+      .background(ChatGlassEffectView(cornerRadius: 24))
+      .padding(40)
+    }
+  }
+}
+
+private struct ChatGlassEffectView: UIViewRepresentable {
+  let cornerRadius: CGFloat
+  func makeUIView(context: Context) -> UIVisualEffectView {
+    let view = UIVisualEffectView(effect: nil)
+    if #available(iOS 26.0, *) {
+      let glass = UIGlassEffect()
+      glass.isInteractive = true
+      view.effect = glass
+      view.contentView.backgroundColor = .clear
+    } else {
+      view.effect = UIBlurEffect(style: .systemThinMaterial)
+    }
+    view.layer.cornerRadius = cornerRadius
+    view.layer.cornerCurve = .continuous
+    view.clipsToBounds = true
+    return view
+  }
+  func updateUIView(_ uiView: UIVisualEffectView, context: Context) {}
+}
+
+private final class ChatMessageDeletionWipeOverlayView: UIView {
+  private let snapshotContainer = UIView()
+  private let emitter = CAEmitterLayer()
+
+  init(frame: CGRect, snapshot: UIView, isDark: Bool) {
+    super.init(frame: frame)
+    isUserInteractionEnabled = false
+    clipsToBounds = false
+
+    snapshotContainer.frame = snapshot.frame
+    addSubview(snapshotContainer)
+
+    snapshot.frame = snapshotContainer.bounds
+    snapshot.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    snapshotContainer.addSubview(snapshot)
+
+    emitter.emitterPosition = CGPoint(x: snapshotContainer.bounds.width, y: snapshotContainer.bounds.midY)
+    emitter.emitterSize = CGSize(width: 1, height: snapshotContainer.bounds.height)
+    emitter.emitterShape = .line
+
+    let cell = CAEmitterCell()
+    cell.contents = createParticleImage(isDark: isDark)?.cgImage
+    cell.birthRate = 6000
+    cell.lifetime = 0.55
+    cell.velocity = 500
+    cell.velocityRange = 250
+    cell.emissionLongitude = .pi // Point left
+    cell.emissionRange = .pi / 6 // Slight spread
+    cell.scale = 0.2
+    cell.scaleRange = 0.1
+    cell.scaleSpeed = -0.3
+    cell.alphaSpeed = -1.5
+    cell.yAcceleration = -400 // Go to top
+
+    emitter.emitterCells = [cell]
+    snapshotContainer.layer.addSublayer(emitter)
+  }
+
+  required init?(coder: NSCoder) { fatalError() }
+
+  func animateAndRemove() {
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+      self.emitter.birthRate = 0
+    }
+
+    let maskLayer = CAGradientLayer()
+    maskLayer.colors = [UIColor.black.cgColor, UIColor.clear.cgColor]
+    maskLayer.locations = [0.0, 0.05]
+    maskLayer.startPoint = CGPoint(x: 1.0, y: 0.5) // Start right
+    maskLayer.endPoint = CGPoint(x: 0.0, y: 0.5)   // End left
+    maskLayer.frame = snapshotContainer.bounds
+    snapshotContainer.layer.mask = maskLayer
+
+    let duration: TimeInterval = 0.55
+
+    let maskAnimation = CABasicAnimation(keyPath: "locations")
+    maskAnimation.fromValue = [-0.1, 0.0]
+    maskAnimation.toValue = [1.0, 1.1]
+    maskAnimation.duration = duration * 0.8
+    maskAnimation.fillMode = .forwards
+    maskAnimation.isRemovedOnCompletion = false
+    maskLayer.add(maskAnimation, forKey: "maskWipe")
+
+    let moveEmitterAnimation = CABasicAnimation(keyPath: "emitterPosition.x")
+    moveEmitterAnimation.fromValue = snapshotContainer.bounds.width
+    moveEmitterAnimation.toValue = 0
+    moveEmitterAnimation.duration = duration * 0.8
+    moveEmitterAnimation.fillMode = .forwards
+    moveEmitterAnimation.isRemovedOnCompletion = false
+    emitter.add(moveEmitterAnimation, forKey: "moveEmitter")
+
+    UIView.animate(withDuration: duration, delay: 0, options: .curveEaseOut, animations: {
+      // Dissolves perfectly in place, no transform
+    }) { _ in
+      self.removeFromSuperview()
+    }
+  }
+
+  private func createParticleImage(isDark: Bool) -> UIImage? {
+    let size = CGSize(width: 1, height: 4)
+    UIGraphicsBeginImageContextWithOptions(size, false, 0)
+    guard let context = UIGraphicsGetCurrentContext() else { return nil }
+    context.setFillColor(isDark ? UIColor.white.withAlphaComponent(0.9).cgColor : UIColor.black.withAlphaComponent(0.9).cgColor)
+    context.fill(CGRect(origin: .zero, size: size))
+    let image = UIGraphicsGetImageFromCurrentImageContext()
+    UIGraphicsEndImageContext()
+    return image
   }
 }

@@ -91,6 +91,41 @@ private func blendedWallpaperEdgeTint(color: UIColor, isDark: Bool) -> UIColor {
   )
 }
 
+private func chatListInterpolatedColor(
+  from: UIColor,
+  to: UIColor,
+  progress: CGFloat
+) -> UIColor {
+  let amount = max(0.0, min(1.0, progress))
+  var fr: CGFloat = 0.0
+  var fg: CGFloat = 0.0
+  var fb: CGFloat = 0.0
+  var fa: CGFloat = 0.0
+  var tr: CGFloat = 0.0
+  var tg: CGFloat = 0.0
+  var tb: CGFloat = 0.0
+  var ta: CGFloat = 0.0
+  guard from.getRed(&fr, green: &fg, blue: &fb, alpha: &fa),
+    to.getRed(&tr, green: &tg, blue: &tb, alpha: &ta)
+  else {
+    return from
+  }
+  let inverse = 1.0 - amount
+  return UIColor(
+    red: (fr * inverse) + (tr * amount),
+    green: (fg * inverse) + (tg * amount),
+    blue: (fb * inverse) + (tb * amount),
+    alpha: (fa * inverse) + (ta * amount)
+  )
+}
+
+private func chatListEvenGradientLocations(count: Int) -> [NSNumber] {
+  guard count > 1 else { return [0.0] }
+  return (0..<count).map { index in
+    NSNumber(value: Double(index) / Double(count - 1))
+  }
+}
+
 enum ChatWallpaperEdge {
   case top
   case bottom
@@ -548,6 +583,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private let gapDebugLabel = UILabel()
   var rows: [ChatListRow] = []
   private var appearance = ChatListAppearance.fallback
+  private var lastRawAppearance: [String: Any]?
   private var queuedAppearanceAfterSendTransition: ChatListAppearance?
   private var shouldAutoScroll = true
   private var previousOffsetY: CGFloat = 0.0
@@ -716,6 +752,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var wallpaperSnapshot: CGImage?
   private var wallpaperSnapshotSize: CGSize = .zero
   private var wallpaperSnapshotCacheKey: String = ""
+  private var wallpaperScrollPhaseBucket: Int = -1
 
   // Floating activity overlay (typing / agent progress) — lives OUTSIDE the collection view
   private let activityOverlay = UIView()
@@ -741,8 +778,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     super.init(frame: frame)
     clipsToBounds = false
 
-    if let cachedAppearance = Self.bootstrapCachedAppearance() {
-      appearance = cachedAppearance
+    if var cachedRawAppearance = Self.bootstrapCachedRawAppearance() {
+      cachedRawAppearance["nativeThemeIsDark"] = traitCollection.userInterfaceStyle == .dark
+      lastRawAppearance = cachedRawAppearance
+      appearance = ChatListAppearance.from(raw: cachedRawAppearance)
     }
 
     wallpaperPatternLayer.mask = wallpaperPatternMaskLayer
@@ -854,11 +893,25 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       name: AgentBridgeSelectionStore.didChangeNotification,
       object: nil
     )
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleAgentIntegrationPackOpenPanel(_:)),
+      name: Notification.Name("AgentIntegrationPackOpenPanelNotification"),
+      object: nil
+    )
 
   }
 
   required init?(coder: NSCoder) {
     fatalError("init(coder:) has not been implemented")
+  }
+
+  override public func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+    super.traitCollectionDidChange(previousTraitCollection)
+    guard previousTraitCollection?.userInterfaceStyle != traitCollection.userInterfaceStyle else {
+      return
+    }
+    reapplyNativeThemeForCurrentInterfaceStyle()
   }
 
   private func pixelAlignedValue(_ value: CGFloat) -> CGFloat {
@@ -925,6 +978,25 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       hydrateRowsFromNativeHistoryIfReady(trigger: "didMoveToWindow")
       presentPreferredAgentViewIfNeeded()
       prefetchBridgeHistoryIfNeeded()
+      replayOutstandingAgentBridgeAskIfNeeded()
+    }
+  }
+
+  /// When this chat comes on screen, re-present any ask/command that arrived while it was
+  /// off-screen (and was skipped by `isVisibleFrontmostChat`). A plain DM open doesn't reload
+  /// history, so the bridge won't re-emit — we re-surface from the engine's stored ask instead.
+  private func replayOutstandingAgentBridgeAskIfNeeded() {
+    guard !engineChatId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+    // Defer so the push/transition settles and this view is actually frontmost before the
+    // handler's visibility check runs; the provider often binds ~0.28s after the transition.
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+      guard let self, self.window != nil else { return }
+      let chatId = self.engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !chatId.isEmpty,
+        let info = ChatEngine.shared.outstandingAgentBridgeAskInfo(
+          chatId: chatId, provider: self.currentBridgeProvider)
+      else { return }
+      self.presentAgentBridgeAskIfNeeded(info)
     }
   }
 
@@ -940,8 +1012,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     wallpaperContainerView.frame = wallpaperFrame
     collectionView.sendSubviewToBack(wallpaperContainerView)
     scrollToneOverlay.frame = bounds
-    refreshWallpaperSnapshotIfNeeded()
     updateScrollToneOverlay(offsetY: collectionView.contentOffset.y)
+    refreshWallpaperSnapshotIfNeeded()
     updateVisibleWallpaperBackdropLayouts()
     transitionOverlayHost.frame = bounds
     layoutDebugPanel()
@@ -1491,6 +1563,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
     // Initial load or full replacement: use reloadData (no batch update needed).
     guard !previousRows.isEmpty else {
+      if parsed.count <= 4 {
+        NSLog(
+          "[FirstMsg] setRows INITIAL parsed=%d keys=[%@] hidden=%@ pending=%@ src=%d",
+          parsed.count,
+          parsed.map { String($0.key.prefix(16)) }.joined(separator: ","),
+          hiddenMessageId.map { String($0.prefix(12)) } ?? "nil",
+          pendingSendTransition != nil ? "Y" : "N",
+          nextRows.count)
+      }
       applyDataSource()
       UIView.performWithoutAnimation {
         collectionView.reloadData()
@@ -1500,6 +1581,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         CATransaction.setDisableActions(true)
         finalize(false)
         CATransaction.commit()
+      }
+      if parsed.count <= 4 {
+        NSLog(
+          "[FirstMsg] setRows INITIAL done offset=%.0f contentH=%.0f inset(t=%.0f,b=%.0f) visible=%d",
+          collectionView.contentOffset.y,
+          collectionView.contentSize.height,
+          flowLayout.sectionInset.top, flowLayout.sectionInset.bottom,
+          collectionView.indexPathsForVisibleItems.count)
       }
       return
     }
@@ -2377,6 +2466,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   func setAppearance(_ rawAppearance: [String: Any]) {
+    lastRawAppearance = rawAppearance
     Self.cacheNativeThemeSeed(from: rawAppearance)
     let next = ChatListAppearance.from(raw: rawAppearance)
     let visualChanged = appearance.visualKey != next.visualKey
@@ -2392,6 +2482,22 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
   func resolvedAppearance() -> ChatListAppearance {
     appearance
+  }
+
+  private func reapplyNativeThemeForCurrentInterfaceStyle() {
+    var rawAppearance: [String: Any]
+    if let lastRawAppearance,
+      lastRawAppearance["nativeThemeId"] != nil
+    {
+      rawAppearance = lastRawAppearance
+    } else if let cachedRawAppearance = Self.bootstrapCachedRawAppearance() {
+      rawAppearance = cachedRawAppearance
+    } else {
+      return
+    }
+
+    rawAppearance["nativeThemeIsDark"] = traitCollection.userInterfaceStyle == .dark
+    setAppearance(rawAppearance)
   }
 
   private func applyResolvedAppearance(_ next: ChatListAppearance) {
@@ -2444,18 +2550,17 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     defaults.set(isDark, forKey: cachedThemeIsDarkDefaultsKey)
   }
 
-  private static func bootstrapCachedAppearance() -> ChatListAppearance? {
+  private static func bootstrapCachedRawAppearance() -> [String: Any]? {
     let defaults = UserDefaults.standard
     guard let themeId = defaults.string(forKey: cachedThemeIdDefaultsKey), !themeId.isEmpty else {
       return nil
     }
     let isDark = defaults.bool(forKey: cachedThemeIsDarkDefaultsKey)
-    return ChatListAppearance.from(
-      raw: [
-        "backgroundMode": "transparent",
-        "nativeThemeId": themeId,
-        "nativeThemeIsDark": isDark,
-      ])
+    return [
+      "backgroundMode": "gradient",
+      "nativeThemeId": themeId,
+      "nativeThemeIsDark": isDark,
+    ]
   }
 
   func setContentPaddingBottom(_ value: Double) {
@@ -2703,6 +2808,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       self?.resolvedDisplayStatus(for: row)
     }
     let mediaDownloadState = remoteMediaDownloadState(for: row)
+    if let hid = hiddenMessageId, row.kind == .message, row.messageId == hid {
+      NSLog(
+        "[FirstMsg] cellForItemAt GHOST configure item=%d msgId=%@ rows=%d pending=%@ active=%@",
+        indexPath.item, String(hid.prefix(12)), rows.count,
+        pendingSendTransition != nil ? "Y" : "N",
+        activeSendTransition != nil ? "Y" : "N")
+    }
     cell.configure(
       row: row,
       hiddenMessageId: hiddenMessageId,
@@ -3133,7 +3245,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // handler DROPs on the chatId/provider guard, so a presence-only check here left BOTH
     // surfaces declining and nothing presented. The shared atomic claim still prevents a
     // double-present when both surfaces are genuinely valid.
+    // Only defer to the full-page agent view when it's actually ON SCREEN. A hosted-but-hidden
+    // agent VC (backed out to the bubble, or belonging to another page) must NOT swallow the
+    // ask — otherwise both surfaces decline and nothing presents until the next re-emit.
     if let agentVC = presentedBridgeAgentVC,
+      agentVC.viewIfLoaded?.window != nil,
       let vcChat = agentVC.agentBridgeChatId?.trimmingCharacters(in: .whitespacesAndNewlines),
       !vcChat.isEmpty, vcChat == infoChatId
     {
@@ -3166,6 +3282,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       return
     }
 
+    // Only present when THIS chat is the one actually on screen. A background/recycled chat
+    // view can still hold this chatId (window != nil, behind a pushed/presented page) and would
+    // otherwise pop the sheet over an unrelated screen. Dropping here is safe: the bridge
+    // re-emits a still-blocked ask when the chat is reopened, so it surfaces then.
+    guard isVisibleFrontmostChat() else {
+      NSLog("[ChatListView][ask] DROP — not the visible chat requestId=%@ chat=%@", requestId, chatId)
+      return
+    }
+
     guard let payload = ChatEngine.shared.latestAgentBridgeAsk(requestId: requestId) else {
       NSLog("[ChatListView][ask] DROP — no stored payload requestId=%@", requestId)
       return
@@ -3191,6 +3316,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // Cross-surface dedup: claim once so a full-page agent view doesn't also present it.
     guard ChatEngine.shared.claimAgentBridgeAskPresentation(requestId: requestId) else {
       NSLog("[ChatListView][ask] DROP — already claimed by another surface requestId=%@", requestId)
+      return
+    }
+    // If the presenter is mid-presentation (another sheet/picker/panel up), UIKit drops
+    // present() silently. Release the claim so a re-emit (the bridge re-pushes a still-blocked
+    // ask when the chat is reopened) can retry once the presenter is free — otherwise the claim
+    // leaks and every later re-emit is dropped as "already claimed", so the sheet never reappears.
+    if let busy = presenter.presentedViewController {
+      NSLog("[ChatListView][ask] RETRY-LATER — presenter busy (%@) requestId=%@",
+        String(describing: type(of: busy)), requestId)
+      ChatEngine.shared.releaseAgentBridgeAskPresentation(requestId: requestId)
       return
     }
     let kitAppearance: VibeAgentKitChatAppearance =
@@ -3424,6 +3559,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     _ = offsetY - previousOffsetY  // delta unused
     previousOffsetY = offsetY
     updateScrollToneOverlay(offsetY: offsetY)
+    refreshWallpaperSnapshotIfNeeded()
     updateVisibleWallpaperBackdropLayouts()
 
     if let activeSendTransition {
@@ -4034,7 +4170,18 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       if historyReady {
         let nativeRows = ChatEngine.shared.getChatRows(["chatId": engineChatId])
         if !nativeRows.isEmpty, nativeRows.count >= baseRows.count || baseRows.isEmpty {
+          if nativeRows.count <= 4 || baseRows.count <= 4 {
+            NSLog(
+              "[FirstMsg] mergedRows base=NATIVE native=%d js=%d outgoing=%d overlay=%d",
+              nativeRows.count, baseRows.count, nativeOutgoingOrder.count,
+              nativeEngineRowsById.count)
+          }
           return nativeRows
+        }
+        if nativeRows.isEmpty, baseRows.count <= 4 {
+          NSLog(
+            "[FirstMsg] mergedRows historyReady but native EMPTY js=%d outgoing=%d overlay=%d",
+            baseRows.count, nativeOutgoingOrder.count, nativeEngineRowsById.count)
         }
       }
       return baseRows
@@ -4115,6 +4262,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         continue
       }
       if effectiveBaseIds.contains(messageId) {
+        NSLog(
+          "[FirstMsg] mergedRows PRE-CLEAN drop outgoing msgId=%@ (present in base %d rows)",
+          String(messageId.prefix(12)), effectiveBaseIds.count)
         nativeOutgoingRowsById.removeValue(forKey: messageId)
         continue
       }
@@ -4687,12 +4837,34 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
     let revealedMessageId = hiddenMessageId
     hiddenMessageId = nil
+    if let revealedMessageId {
+      let rowIndex = indexForMessage(revealedMessageId)
+      let cellPresent =
+        rowIndex.map {
+          collectionView.cellForItem(at: IndexPath(item: $0, section: 0)) != nil
+        } ?? false
+      NSLog(
+        "[FirstMsg] reveal msgId=%@ rowIndex=%@ cellPresent=%@ rows=%d visible=%d offset=%.0f contentH=%.0f boundsH=%.0f",
+        String(revealedMessageId.prefix(12)),
+        rowIndex.map(String.init) ?? "nil",
+        cellPresent ? "Y" : "N",
+        rows.count,
+        collectionView.indexPathsForVisibleItems.count,
+        collectionView.contentOffset.y,
+        collectionView.contentSize.height,
+        collectionView.bounds.height)
+    }
     if let revealedMessageId, let rowIndex = indexForMessage(revealedMessageId),
       rowIndex < rows.count
     {
       let indexPath = IndexPath(item: rowIndex, section: 0)
-      if let cell = self.collectionView.cellForItem(at: indexPath) as? ChatListCell {
-        let row = self.rows[rowIndex]
+      let revealVisibleCell = { [weak self] in
+        guard let self,
+          let cell = self.collectionView.cellForItem(at: indexPath) as? ChatListCell,
+          indexPath.item < self.rows.count
+        else { return false }
+        let row = self.rows[indexPath.item]
+        cell.applyAppearance(self.appearance)
         cell.configure(
           row: row,
           hiddenMessageId: nil,
@@ -4700,14 +4872,98 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           selected: row.messageId.map { self.selectedMessageIds.contains($0) } ?? false,
           agentTurnState: self.agentTurnBubbleState(for: row)
         )
+        self.bindWallpaperBackdrop(to: cell)
+        cell.alpha = 1.0
+        cell.contentView.alpha = 1.0
+        cell.layer.opacity = 1.0
+        cell.contentView.layer.opacity = 1.0
+        cell.layer.removeAllAnimations()
+        cell.contentView.layer.removeAllAnimations()
+        cell.setNeedsLayout()
+        cell.layoutIfNeeded()
+        cell.updateWallpaperBackdropLayoutIfNeeded()
+        return true
+      }
+      if let cell = self.collectionView.cellForItem(at: indexPath) as? ChatListCell {
+        let row = self.rows[rowIndex]
+        cell.applyAppearance(self.appearance)
+        cell.configure(
+          row: row,
+          hiddenMessageId: nil,
+          selectionMode: self.selectionMode,
+          selected: row.messageId.map { self.selectedMessageIds.contains($0) } ?? false,
+          agentTurnState: self.agentTurnBubbleState(for: row)
+        )
+        bindWallpaperBackdrop(to: cell)
+        cell.alpha = 1.0
+        cell.contentView.alpha = 1.0
+        cell.layer.opacity = 1.0
+        cell.contentView.layer.opacity = 1.0
+        cell.layer.removeAllAnimations()
+        cell.contentView.layer.removeAllAnimations()
+        cell.setNeedsLayout()
+        cell.layoutIfNeeded()
+        cell.updateWallpaperBackdropLayoutIfNeeded()
       } else {
         UIView.performWithoutAnimation {
+          self.flowLayout.invalidateLayout()
+          self.collectionView.layoutIfNeeded()
           self.collectionView.reloadItems(at: [indexPath])
           self.collectionView.layoutIfNeeded()
+          _ = revealVisibleCell()
+        }
+      }
+      if rows.filter({ $0.kind == .message }).count == 1 {
+        DispatchQueue.main.async { [weak self] in
+          guard let self else { return }
+          UIView.performWithoutAnimation {
+            self.flowLayout.invalidateLayout()
+            self.collectionView.layoutIfNeeded()
+            if !revealVisibleCell() {
+              if indexPath.item < self.rows.count {
+                self.collectionView.reloadItems(at: [indexPath])
+                self.collectionView.layoutIfNeeded()
+                _ = revealVisibleCell()
+              }
+            }
+            self.updateVisibleWallpaperBackdropLayouts()
+          }
         }
       }
     } else if revealedMessageId != nil {
+      NSLog(
+        "[FirstMsg] reveal FALLBACK setRows(sourceRowsPayload) — row not found for msgId=%@ src=%d",
+        String((revealedMessageId ?? "").prefix(12)), sourceRowsPayload.count)
       setRows(sourceRowsPayload)
+    }
+    // Belt & braces: the indexPath-based reveal above can miss the on-screen cell
+    // when a rows update landed mid-transition (the cell UIKit has on screen no
+    // longer matches indexForMessage's index). Sweep the visible cells and
+    // un-ghost any that are still hidden for the revealed message.
+    if let revealedMessageId {
+      for case let cell as ChatListCell in collectionView.visibleCells
+      where cell.isConfiguredGhostHidden && cell.row?.messageId == revealedMessageId {
+        NSLog(
+          "[FirstMsg] reveal SWEEP un-ghosting stale visible cell msgId=%@",
+          String(revealedMessageId.prefix(12)))
+        guard let row = cell.row else { continue }
+        cell.applyAppearance(appearance)
+        cell.configure(
+          row: row,
+          hiddenMessageId: nil,
+          selectionMode: selectionMode,
+          selected: row.messageId.map { selectedMessageIds.contains($0) } ?? false,
+          agentTurnState: agentTurnBubbleState(for: row)
+        )
+        bindWallpaperBackdrop(to: cell)
+        cell.alpha = 1.0
+        cell.contentView.alpha = 1.0
+        cell.layer.opacity = 1.0
+        cell.contentView.layer.opacity = 1.0
+        cell.setNeedsLayout()
+        cell.layoutIfNeeded()
+        cell.updateWallpaperBackdropLayoutIfNeeded()
+      }
     }
     flushQueuedAppearanceAfterTransitionIfNeeded()
     if shouldSettleDeferredBottomScroll {
@@ -4837,6 +5093,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     wallpaperPatternMaskLayer.contents = maskImage
     wallpaperPatternMaskLayer.frame = wallpaperPatternLayer.bounds
     wallpaperPatternLayer.isHidden = false
+    applyWallpaperScrollPhase(offsetY: collectionView.contentOffset.y)
   }
 
   private func applyScrollToneTheme() {
@@ -4846,22 +5103,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
   private func updateScrollToneOverlay(offsetY: CGFloat) {
     guard bounds.width > 0.0, bounds.height > 0.0 else { return }
-    let _ = offsetY
-
-    let hasPattern =
-      appearance.backgroundMode != "transparent"
-      && appearance.wallpaperPatternGradient.count >= 2
-      && appearance.wallpaperPatternOpacity > 0.001
-      && (appearance.wallpaperMaskKey?.isEmpty == false)
-
-    let edgeAlpha: CGFloat = {
-      guard appearance.backgroundMode != "transparent" else { return 0.0 }
-      if hasPattern {
-        return appearance.isDark ? 0.04 : 0.03
-      } else {
-        return appearance.isDark ? 0.03 : 0.02
-      }
-    }()
+    applyWallpaperScrollPhase(offsetY: offsetY)
 
     let topHeight = min(bounds.height, max(100.0, contentPaddingTop + 34.0))
     let bottomHeight = min(bounds.height, max(100.0, contentPaddingBottom + 20.0))
@@ -4876,19 +5118,63 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     scrollToneTopView.frame = topFrame
     scrollToneBottomView.frame = bottomFrame
     scrollToneTopView.updateBackdrop(
-      snapshot: wallpaperSnapshot,
-      containerSize: wallpaperSnapshotSize,
+      snapshot: nil,
+      containerSize: .zero,
       sampleRect: topFrame,
-      alpha: edgeAlpha,
+      alpha: 0.0,
       blur: false
     )
     scrollToneBottomView.updateBackdrop(
-      snapshot: wallpaperSnapshot,
-      containerSize: wallpaperSnapshotSize,
+      snapshot: nil,
+      containerSize: .zero,
       sampleRect: bottomFrame,
-      alpha: edgeAlpha,
+      alpha: 0.0,
       blur: false
     )
+    scrollToneOverlay.alpha = 0.0
+    scrollToneOverlay.isHidden = true
+  }
+
+  private func applyWallpaperScrollPhase(offsetY: CGFloat) {
+    guard
+      appearance.backgroundMode != "transparent",
+      appearance.wallpaperPatternGradient.count >= 2,
+      appearance.wallpaperPatternOpacity > 0.001,
+      !wallpaperPatternLayer.isHidden
+    else {
+      return
+    }
+
+    let colors = appearance.wallpaperPatternGradient
+    let triggerDistance = max(360.0, min(620.0, bounds.height * 0.72))
+    let linearProgress = max(0.0, min(1.0, offsetY / triggerDistance))
+    let easedProgress = linearProgress * linearProgress * (3.0 - (2.0 * linearProgress))
+    let progress = easedProgress * 0.45
+    let phasedColors: [UIColor] = colors.enumerated().map { index, color in
+      let next = colors[(index + 1) % colors.count]
+      return chatListInterpolatedColor(from: color, to: next, progress: progress)
+    }
+    let locations: [NSNumber] = {
+      guard let configured = appearance.wallpaperPatternLocations,
+        configured.count == phasedColors.count
+      else {
+        return chatListEvenGradientLocations(count: phasedColors.count)
+      }
+      return configured
+    }()
+    let phaseBucket = Int((progress * 18.0).rounded())
+    if phaseBucket != wallpaperScrollPhaseBucket {
+      wallpaperScrollPhaseBucket = phaseBucket
+      wallpaperSnapshotCacheKey = ""
+    }
+
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    wallpaperPatternLayer.colors = phasedColors.map(\.cgColor)
+    wallpaperPatternLayer.locations = locations
+    wallpaperPatternLayer.startPoint = CGPoint(x: -0.14 + (0.08 * progress), y: -0.05)
+    wallpaperPatternLayer.endPoint = CGPoint(x: 1.10 - (0.06 * progress), y: 1.06)
+    CATransaction.commit()
   }
 
   private func refreshWallpaperSnapshotIfNeeded(force: Bool = false) {
@@ -4906,7 +5192,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
     let scale = max(window?.screen.scale ?? UIScreen.main.scale, 1.0)
     let cacheKey =
-      "\(appearance.visualKey)|\(Int(bounds.width.rounded() * scale))x\(Int(bounds.height.rounded() * scale))"
+      "\(appearance.visualKey)|phase:\(wallpaperScrollPhaseBucket)|\(Int(bounds.width.rounded() * scale))x\(Int(bounds.height.rounded() * scale))"
     if !force, wallpaperSnapshotCacheKey == cacheKey, wallpaperSnapshot != nil {
       return
     }
@@ -6478,6 +6764,22 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     return window?.rootViewController
   }
 
+  /// True only when this chat view is the one actually on screen — it's in the window, not
+  /// hidden, and frontmost at its own centre (nothing pushed/presented is covering it). Keeps
+  /// an agent ask/command sheet from popping over an unrelated screen when a background /
+  /// recycled chat view still holds this chatId. Structure-agnostic (works for push, modal,
+  /// custom container) because it asks the window who's actually on top at this view's centre.
+  private func isVisibleFrontmostChat() -> Bool {
+    guard let window = self.window, !isHidden, alpha > 0.01,
+      bounds.width > 1, bounds.height > 1
+    else { return false }
+    let probe = convert(CGPoint(x: bounds.midX, y: bounds.midY), to: window)
+    guard window.bounds.contains(probe), let hit = window.hitTest(probe, with: nil) else {
+      return false
+    }
+    return hit === self || hit.isDescendant(of: self)
+  }
+
   // MARK: - Native full-page agent surface (VibeAgentConversationViewController)
 
   /// Push the full-page agent view for the task that produced `messageId`, seeded
@@ -6966,6 +7268,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     collectionView.performBatchUpdates(nil) { [weak self] _ in
       self?.restoreStationaryDistance(distanceFromBottom)
     }
+  }
+
+  @objc private func handleAgentIntegrationPackOpenPanel(_ notification: Notification) {
+    guard let userInfo = notification.userInfo,
+          let agentId = userInfo["agentId"] as? String else {
+      return
+    }
+    onNativeEvent(["type": "openAgentPanel", "provider": agentId])
   }
 
   private func resolvedMediaPreviewHeaderTitle(for row: ChatListRow?) -> String {

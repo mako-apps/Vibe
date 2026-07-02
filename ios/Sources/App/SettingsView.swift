@@ -1024,7 +1024,7 @@ private struct AppearanceSettingsDetailView: View {
           .padding(.horizontal, 2)
         }
 
-        Text("Theme mode and color plate apply across the native shell.")
+        Text("Color plates tune chat wallpaper, bubbles, and native accents.")
           .font(.system(size: 13))
           .foregroundStyle(palette.secondaryText)
           .frame(maxWidth: .infinity, alignment: .leading)
@@ -1048,12 +1048,24 @@ private struct ThemePlateCard: View {
     AppThemePalette.resolve(for: colorScheme, plate: option)
   }
 
+  private var chatPreviewAppearance: ChatListAppearance {
+    ChatListAppearance.from(raw: [
+      "theme": colorScheme == .dark ? "dark" : "light",
+      "backgroundMode": "gradient",
+      "wallpaperOpacity": 1.0,
+      "nativeThemeId": option.rawValue,
+      "nativeThemeIsDark": colorScheme == .dark,
+    ])
+  }
+
   var body: some View {
+    let appearance = chatPreviewAppearance
+
     VStack(alignment: .leading, spacing: 14) {
       RoundedRectangle(cornerRadius: 18, style: .continuous)
         .fill(
           LinearGradient(
-            colors: [palette.background, palette.card],
+            colors: themeColors(appearance.wallpaperGradient, fallback: palette.backgroundUIColor),
             startPoint: .topLeading,
             endPoint: .bottomTrailing
           )
@@ -1070,10 +1082,28 @@ private struct ThemePlateCard: View {
         .overlay(alignment: .bottomLeading) {
           VStack(alignment: .leading, spacing: 6) {
             Capsule()
-              .fill(palette.bubbleThem)
+              .fill(
+                LinearGradient(
+                  colors: themeColors(
+                    appearance.bubbleThemGradient,
+                    fallback: appearance.bubbleThemColor
+                  ),
+                  startPoint: .leading,
+                  endPoint: .trailing
+                )
+              )
               .frame(width: 54, height: 8)
             Capsule()
-              .fill(palette.bubbleMe)
+              .fill(
+                LinearGradient(
+                  colors: themeColors(
+                    appearance.bubbleMeGradient,
+                    fallback: palette.bubbleMeUIColor
+                  ),
+                  startPoint: .leading,
+                  endPoint: .trailing
+                )
+              )
               .frame(width: 72, height: 8)
           }
           .padding(14)
@@ -1092,6 +1122,18 @@ private struct ThemePlateCard: View {
       RoundedRectangle(cornerRadius: 24, style: .continuous)
         .stroke(isSelected ? palette.accent : palette.border, lineWidth: isSelected ? 1.5 : 1)
     )
+  }
+
+  private func themeColors(_ colors: [UIColor], fallback: UIColor) -> [Color] {
+    let resolved: [UIColor]
+    if colors.count >= 2 {
+      resolved = colors
+    } else if let first = colors.first {
+      resolved = [first, first]
+    } else {
+      resolved = [fallback, fallback]
+    }
+    return resolved.map { Color(uiColor: $0) }
   }
 }
 

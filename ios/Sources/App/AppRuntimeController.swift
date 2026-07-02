@@ -97,19 +97,28 @@ enum AppThemePlateOption: String, CaseIterable, Identifiable {
   case zen
   case ocean
   case obsidian
+  case music
+  case terracotta
+  case leaf
 
   var id: String { rawValue }
 
   var title: String {
     switch self {
     case .glacier:
-      return "Glacier"
+      return "Aurora"
     case .zen:
-      return "Zen"
+      return "Mist"
     case .ocean:
-      return "Ocean"
+      return "Fresh"
     case .obsidian:
-      return "Obsidian"
+      return "Mono"
+    case .music:
+      return "Pulse"
+    case .terracotta:
+      return "Ember"
+    case .leaf:
+      return "Leaf"
     }
   }
 }
@@ -194,52 +203,88 @@ struct AppThemePalette {
 
     switch (plate, isDark) {
     case (.glacier, true):
-      accent = hex(0x2A8585)
-      accentMuted = rgba(42, 133, 133, 0.6)
-      button = hex(0x2A8585)
-      bubbleMe = hex(0x2A8585)
-      bubbleThem = hex(0x24242C)
+      accent = hex(0x12B8A7)
+      accentMuted = rgba(18, 184, 167, 0.6)
+      button = hex(0x12B8A7)
+      bubbleMe = hex(0x12B8A7)
+      bubbleThem = hex(0x242936)
     case (.glacier, false):
-      accent = hex(0x00838F)
-      accentMuted = rgba(0, 131, 143, 0.6)
-      button = hex(0x00838F)
-      bubbleMe = hex(0x00838F)
+      accent = hex(0x189DA8)
+      accentMuted = rgba(24, 157, 168, 0.6)
+      button = hex(0x189DA8)
+      bubbleMe = hex(0x3F6EF5)
       bubbleThem = hex(0xFFFFFF)
     case (.zen, true):
-      accent = hex(0x7C3AED)
-      accentMuted = rgba(124, 58, 237, 0.6)
-      button = hex(0x7C3AED)
-      bubbleMe = hex(0x7C3AED)
-      bubbleThem = hex(0x2B2335)
+      accent = hex(0x2F80ED)
+      accentMuted = rgba(47, 128, 237, 0.6)
+      button = hex(0x2F80ED)
+      bubbleMe = hex(0x2F80ED)
+      bubbleThem = hex(0x1E2732)
     case (.zen, false):
-      accent = hex(0x3F51B5)
-      accentMuted = rgba(63, 81, 181, 0.6)
-      button = hex(0x3F51B5)
-      bubbleMe = hex(0x3F51B5)
-      bubbleThem = hex(0xF3F4FB)
+      accent = hex(0x1976D2)
+      accentMuted = rgba(25, 118, 210, 0.6)
+      button = hex(0x1976D2)
+      bubbleMe = hex(0x1976D2)
+      bubbleThem = hex(0xFFFFFF)
     case (.ocean, true):
-      accent = hex(0x3A7DA8)
-      accentMuted = rgba(58, 125, 168, 0.6)
-      button = hex(0x3A7DA8)
-      bubbleMe = hex(0x3A7DA8)
-      bubbleThem = hex(0x23313A)
+      accent = hex(0x2EB872)
+      accentMuted = rgba(46, 184, 114, 0.6)
+      button = hex(0x2EB872)
+      bubbleMe = hex(0x2EB872)
+      bubbleThem = hex(0x1F2B28)
     case (.ocean, false):
-      accent = hex(0x0277BD)
-      accentMuted = rgba(2, 119, 189, 0.6)
-      button = hex(0x0277BD)
-      bubbleMe = hex(0x0277BD)
+      accent = hex(0x5FAD75)
+      accentMuted = rgba(95, 173, 117, 0.6)
+      button = hex(0x5FAD75)
+      bubbleMe = hex(0xDDF8C8)
       bubbleThem = hex(0xFFFFFF)
     case (.obsidian, true):
-      accent = hex(0x1565C0)
-      accentMuted = rgba(21, 101, 192, 0.6)
-      button = hex(0x1565C0)
-      bubbleMe = hex(0x1565C0)
-      bubbleThem = hex(0x24242C)
+      accent = hex(0xA9B2C3)
+      accentMuted = rgba(169, 178, 195, 0.6)
+      button = hex(0xA9B2C3)
+      bubbleMe = hex(0xD9DEE8)
+      bubbleThem = hex(0x20232B)
     case (.obsidian, false):
-      accent = hex(0x1565C0)
-      accentMuted = rgba(21, 101, 192, 0.6)
-      button = hex(0x1565C0)
-      bubbleMe = hex(0x1565C0)
+      accent = hex(0x4A5568)
+      accentMuted = rgba(74, 85, 104, 0.6)
+      button = hex(0x4A5568)
+      bubbleMe = hex(0x313A46)
+      bubbleThem = hex(0xFFFFFF)
+    case (.music, true):
+      accent = hex(0xE84AA8)
+      accentMuted = rgba(232, 74, 168, 0.6)
+      button = hex(0xE84AA8)
+      bubbleMe = hex(0xE84AA8)
+      bubbleThem = hex(0x2A202D)
+    case (.music, false):
+      accent = hex(0xD63D8C)
+      accentMuted = rgba(214, 61, 140, 0.6)
+      button = hex(0xD63D8C)
+      bubbleMe = hex(0xD63D8C)
+      bubbleThem = hex(0xFFFFFF)
+    case (.terracotta, true):
+      accent = hex(0xE86D32)
+      accentMuted = rgba(232, 109, 50, 0.6)
+      button = hex(0xE86D32)
+      bubbleMe = hex(0xE86D32)
+      bubbleThem = hex(0x29231F)
+    case (.terracotta, false):
+      accent = hex(0xD9632D)
+      accentMuted = rgba(217, 99, 45, 0.6)
+      button = hex(0xD9632D)
+      bubbleMe = hex(0xD9632D)
+      bubbleThem = hex(0xFFFFFF)
+    case (.leaf, true):
+      accent = hex(0x28B463)
+      accentMuted = rgba(40, 180, 99, 0.6)
+      button = hex(0x28B463)
+      bubbleMe = hex(0x28B463)
+      bubbleThem = hex(0x1F2A22)
+    case (.leaf, false):
+      accent = hex(0x66B879)
+      accentMuted = rgba(102, 184, 121, 0.6)
+      button = hex(0x66B879)
+      bubbleMe = hex(0xDBF8C4)
       bubbleThem = hex(0xFFFFFF)
     }
 

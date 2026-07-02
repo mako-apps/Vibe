@@ -29,45 +29,44 @@ struct ChatListAppearance {
   ///   3 = SpringBatch (UIView.animate with spring wrapping the batch)
   let insertionAnimationMode: Int
 
-  /// Shared brand accent fallback (soft teal, #2F9E93) used wherever code needs an
+  /// Shared brand accent fallback used wherever code needs an
   /// agent/accent color and no per-chat appearance is available yet — bubble tint,
   /// agent border, reply/mention bars, profile default accent, progress rings, etc.
   static let brandAccentFallback = UIColor(red: 0.1843, green: 0.6196, blue: 0.5765, alpha: 1.0)
 
-  // Soft teal-blue brand default (replaces the old flat "transparent" fallback,
-  // which skipped the wallpaper snapshot entirely and meant most untheme'd chats
-  // never got the wallpaper-to-bubble color harmonization that themed chats have).
+  // Vibe Aurora fallback: near-black base, low-contrast doodle ink, and a
+  // teal-leaning outgoing bubble so missing native payloads do not look Telegram-like.
   static let fallback = ChatListAppearance(
     backgroundMode: "gradient",
     wallpaperGradient: [
-      UIColor(red: 0.0510, green: 0.1020, blue: 0.1098, alpha: 1.0),  // #0D1A1C
-      UIColor(red: 0.0392, green: 0.0784, blue: 0.0863, alpha: 1.0),  // #0A1416
+      UIColor(red: 0.0196, green: 0.0196, blue: 0.0431, alpha: 1.0),  // #05050B
+      UIColor(red: 0.0196, green: 0.0196, blue: 0.0431, alpha: 1.0),  // #05050B
     ],
     wallpaperOpacity: 1.0,
     wallpaperPatternGradient: [
-      UIColor(red: 0.1216, green: 0.4314, blue: 0.4196, alpha: 1.0),  // #1F6E6B
-      UIColor(red: 0.1725, green: 0.5490, blue: 0.5255, alpha: 1.0),  // #2C8C86
-      UIColor(red: 0.2706, green: 0.6706, blue: 0.6275, alpha: 1.0),  // #45ABA0
+      UIColor(red: 0.4980, green: 0.3529, blue: 0.9412, alpha: 1.0),  // #7F5AF0
+      UIColor(red: 0.1137, green: 0.7216, blue: 0.6510, alpha: 1.0),  // #1DB8A6
+      UIColor(red: 0.8196, green: 0.4353, blue: 0.3451, alpha: 1.0),  // #D16F58
     ],
-    wallpaperPatternLocations: [0.0, 0.5, 1.0],
-    wallpaperPatternOpacity: 0.12,
+    wallpaperPatternLocations: [0.0, 0.50, 1.0],
+    wallpaperPatternOpacity: 0.17,
     wallpaperMaskKey: "doodles",
     bubbleMeGradient: [
-      brandAccentFallback,  // #2F9E93
-      UIColor(red: 0.1333, green: 0.4902, blue: 0.4549, alpha: 1.0),  // #227D74
+      UIColor(red: 0.5451, green: 0.4863, blue: 1.0, alpha: 1.0),  // #8B7CFF
+      UIColor(red: 0.0314, green: 0.7765, blue: 0.7059, alpha: 1.0),  // #08C6B4
     ],
     bubbleThemGradient: [
-      UIColor(red: 0.1412, green: 0.1412, blue: 0.1725, alpha: 1.0),  // #24242C
-      UIColor(red: 0.1412, green: 0.1412, blue: 0.1725, alpha: 1.0),
+      UIColor(red: 0.1451, green: 0.1608, blue: 0.2118, alpha: 1.0),  // #252936
+      UIColor(red: 0.1020, green: 0.1255, blue: 0.1725, alpha: 1.0),  // #1A202C
     ],
-    bubbleThemColor: UIColor(red: 0.1412, green: 0.1412, blue: 0.1725, alpha: 1.0),
+    bubbleThemColor: UIColor(red: 0.1451, green: 0.1608, blue: 0.2118, alpha: 1.0),
     textColorMe: .white,
-    textColorThem: UIColor(white: 0.87, alpha: 1.0),
-    timeColorMe: UIColor(white: 1.0, alpha: 0.72),
-    timeColorThem: UIColor(white: 1.0, alpha: 0.5),
-    dayTextColor: UIColor(white: 0.93, alpha: 0.82),
-    dayBackgroundColor: UIColor(red: 0.06, green: 0.10, blue: 0.10, alpha: 0.42),
-    dayBorderColor: UIColor(white: 1.0, alpha: 0.16),
+    textColorThem: UIColor(white: 0.94, alpha: 1.0),
+    timeColorMe: UIColor(white: 1.0, alpha: 0.68),
+    timeColorThem: UIColor(white: 1.0, alpha: 0.52),
+    dayTextColor: UIColor(white: 0.95, alpha: 0.88),
+    dayBackgroundColor: UIColor(red: 0.0706, green: 0.0824, blue: 0.1255, alpha: 0.74),
+    dayBorderColor: UIColor(white: 1.0, alpha: 0.14),
     insertionAnimationMode: 2
   )
 
@@ -209,7 +208,7 @@ struct ChatListAppearance {
   var incomingWallpaperSampleOpacity: CGFloat {
     guard backgroundMode != "transparent" else { return 0.0 }
     if hasPatternWallpaper {
-      return isDark ? 0.10 : 0.08
+      return isDark ? 0.10 : 0.045
     }
     return isDark ? 0.04 : 0.03
   }
@@ -217,14 +216,14 @@ struct ChatListAppearance {
   var outgoingWallpaperSampleOpacity: CGFloat {
     guard backgroundMode != "transparent" else { return 0.0 }
     if hasPatternWallpaper {
-      return isDark ? 0.06 : 0.05
+      return isDark ? 0.075 : 0.045
     }
     return isDark ? 0.03 : 0.02
   }
 
   var incomingPlateFillOpacity: CGFloat {
     if hasPatternWallpaper {
-      return isDark ? 0.985 : 0.98
+      return isDark ? 0.95 : 0.985
     }
     if backgroundMode != "transparent" {
       return isDark ? 0.985 : 0.98
@@ -234,7 +233,7 @@ struct ChatListAppearance {
 
   var outgoingPlateFillOpacity: CGFloat {
     if hasPatternWallpaper {
-      return isDark ? 0.985 : 0.98
+      return isDark ? 0.965 : 0.985
     }
     if backgroundMode != "transparent" {
       return isDark ? 0.99 : 0.985
@@ -268,12 +267,12 @@ struct ChatListAppearance {
       let tinted = blendColor(
         baseColor,
         with: wallpaperColor,
-        amount: hasPatternWallpaper ? (isDark ? 0.18 : 0.14) : (isDark ? 0.08 : 0.05)
+        amount: hasPatternWallpaper ? (isDark ? 0.30 : 0.14) : (isDark ? 0.10 : 0.04)
       )
       return blendColor(
         tinted,
-        with: UIColor.black,
-        amount: hasPatternWallpaper ? (isDark ? 0.12 : 0.06) : (isDark ? 0.08 : 0.03)
+        with: isDark ? UIColor.black : UIColor.white,
+        amount: hasPatternWallpaper ? (isDark ? 0.04 : 0.08) : (isDark ? 0.08 : 0.03)
       )
     }
 
@@ -287,25 +286,75 @@ struct ChatListAppearance {
       with: darkerIncomingReference,
       amount: hasPatternWallpaper ? 0.76 : 0.58
     )
-    let anchoredIncomingWallpaper = blendColor(
-      wallpaperColor,
-      with: wallpaperAnchorColor,
-      amount: hasPatternWallpaper ? 0.68 : 0.80
-    )
+    if hasPatternWallpaper && !isDark {
+      let softWallpaper = blendColor(wallpaperColor, with: UIColor.white, amount: 0.62)
+      let tinted = blendColor(isolatedIncomingBase, with: softWallpaper, amount: 0.12)
+      return blendColor(tinted, with: UIColor.white, amount: 0.18)
+    }
+    let anchoredIncomingWallpaper =
+      hasPatternWallpaper
+      ? blendColor(wallpaperColor, with: UIColor.black, amount: isDark ? 0.34 : 0.16)
+      : blendColor(wallpaperColor, with: wallpaperAnchorColor, amount: 0.80)
     let tinted = blendColor(
       isolatedIncomingBase,
       with: anchoredIncomingWallpaper,
-      amount: hasPatternWallpaper ? (isDark ? 0.13 : 0.10) : (isDark ? 0.06 : 0.04)
+      amount: hasPatternWallpaper ? (isDark ? 0.38 : 0.24) : (isDark ? 0.06 : 0.04)
     )
     let harmonized = blendColor(
       tinted,
       with: darkerIncomingReference,
-      amount: hasPatternWallpaper ? 0.18 : 0.10
+      amount: hasPatternWallpaper ? 0.30 : 0.10
     )
     return blendColor(
       harmonized,
       with: UIColor.black,
-      amount: hasPatternWallpaper ? (isDark ? 0.26 : 0.15) : (isDark ? 0.15 : 0.08)
+      amount: hasPatternWallpaper ? (isDark ? 0.14 : 0.09) : (isDark ? 0.15 : 0.08)
+    )
+  }
+
+  func agentWallpaperPlateColor(
+    isMe: Bool,
+    sampleRect: CGRect,
+    containerSize: CGSize,
+    accent: UIColor?
+  ) -> UIColor {
+    let baseColor = wallpaperPlateColor(
+      isMe: isMe,
+      sampleRect: sampleRect,
+      containerSize: containerSize
+    )
+    guard backgroundMode != "transparent" else {
+      return baseColor
+    }
+
+    let samplePoint = CGPoint(x: sampleRect.midX, y: sampleRect.midY)
+    let wallpaperColor = wallpaperToneColor(at: samplePoint, containerSize: containerSize)
+    let paletteAccent = blendColor(
+      bubbleMeGradient.first ?? baseColor,
+      with: bubbleMeGradient.last ?? baseColor,
+      amount: 0.46
+    )
+    let agentAccent = accent ?? paletteAccent
+    let syncedAccent = blendColor(
+      agentAccent,
+      with: wallpaperColor,
+      amount: hasPatternWallpaper ? (isDark ? 0.34 : 0.12) : (isDark ? 0.16 : 0.06)
+    )
+    let accentAmount: CGFloat
+    if isMe {
+      accentAmount = hasPatternWallpaper ? (isDark ? 0.20 : 0.10) : (isDark ? 0.14 : 0.06)
+    } else {
+      accentAmount = hasPatternWallpaper ? (isDark ? 0.20 : 0.07) : (isDark ? 0.12 : 0.04)
+    }
+    let balanced = blendColor(
+      baseColor,
+      with: syncedAccent,
+      amount: accentAmount
+    )
+    return blendColor(
+      balanced,
+      with: isDark ? UIColor.black : UIColor.white,
+      amount: isMe ? (isDark ? 0.02 : 0.08) : (isDark ? 0.08 : 0.14)
     )
   }
 
@@ -315,7 +364,7 @@ struct ChatListAppearance {
     }
     let normalizedX = clampUnit(point.x / containerSize.width)
     let normalizedY = clampUnit(point.y / containerSize.height)
-    let diagonalProgress = clampUnit((normalizedX * 0.38) + (normalizedY * 0.62))
+    let diagonalProgress = clampUnit((((normalizedX * 0.22) + (normalizedY * 0.78)) - 0.04) * 1.12)
     let samplingData = wallpaperToneSamplingData
     return interpolatedGradientColor(
       colors: samplingData.colors,
@@ -362,26 +411,12 @@ private func nativePresetAppearance(
     (raw["insertionAnimationMode"] as? NSNumber)?.intValue ?? fallback.insertionAnimationMode
 
   let variant = isDark ? preset.dark : preset.light
-  let resolvedBackgroundGradient: [String]
-  let resolvedPatternGradientColors: [String]
-  let resolvedPatternOpacity: Double
-
-  if isDark {
-    resolvedBackgroundGradient = variant.backgroundGradient
-    resolvedPatternGradientColors = variant.patternGradientColors
-    resolvedPatternOpacity = variant.patternOpacity
-  } else {
-    // Matches JS resolveThemeVariant() light overrides in wallpaper-store.ts
-    resolvedBackgroundGradient = ["#F9F3EA", "#EFE6D9"]
-    resolvedPatternGradientColors = ["#5A8A66", "#5A6675", "#8A75A3"]
-    resolvedPatternOpacity = 0.04
-  }
 
   let wallpaperGradient = parseGradient(
-    (raw["wallpaperGradient"] as? [String]) ?? resolvedBackgroundGradient,
+    (raw["wallpaperGradient"] as? [String]) ?? variant.backgroundGradient,
     fallback: fallback.wallpaperGradient)
   let patternGradient = parseGradient(
-    (raw["wallpaperPatternGradient"] as? [String]) ?? resolvedPatternGradientColors,
+    (raw["wallpaperPatternGradient"] as? [String]) ?? variant.patternGradientColors,
     fallback: [])
   let bubbleMeGradient = parseGradient(
     (raw["bubbleMeGradient"] as? [String]) ?? variant.bubbleMeGradient,
@@ -391,7 +426,7 @@ private func nativePresetAppearance(
     ?? parseColor(variant.bubbleThemGradient.first)
     ?? parseColor(variant.bubbleThem)
     ?? fallback.bubbleThemColor
-  let resolvedBubbleThemColor = isDark ? rawBubbleThemColor : UIColor.white
+  let resolvedBubbleThemColor = rawBubbleThemColor
   let textColorMe = parseColor(raw["textColorMe"] as? String) ?? parseColor(variant.textColorMe)
     ?? fallback.textColorMe
   let textColorThem =
@@ -410,7 +445,7 @@ private func nativePresetAppearance(
     wallpaperPatternLocations: parseNumberArray(raw["wallpaperPatternLocations"])
       ?? variant.patternGradientLocations.map { NSNumber(value: $0) },
     wallpaperPatternOpacity: CGFloat(
-      (raw["wallpaperPatternOpacity"] as? NSNumber)?.doubleValue ?? resolvedPatternOpacity),
+      (raw["wallpaperPatternOpacity"] as? NSNumber)?.doubleValue ?? variant.patternOpacity),
     wallpaperMaskKey: normalizedString(raw["wallpaperMaskKey"]) ?? preset.maskedImage,
     bubbleMeGradient: bubbleMeGradient,
     bubbleThemGradient: parseGradient(
@@ -440,27 +475,27 @@ private func nativePreset(for id: String) -> NativeThemePreset? {
       id: id,
       maskedImage: "doodles",
       light: NativeThemeVariant(
-        backgroundGradient: ["#FFFFFF", "#FFFFFF"],
-        bubbleMe: "#00838F",
-        bubbleMeGradient: ["#00ACC1", "#00838F"],
+        backgroundGradient: ["#F7FAFF", "#EEF7F8"],
+        bubbleMe: "#3F6EF5",
+        bubbleMeGradient: ["#6E5BFF", "#14C8B8"],
         bubbleThem: "#FFFFFF",
-        bubbleThemGradient: ["#FFFFFF", "#FFFFFF"],
-        patternGradientColors: ["#B2EBF2", "#80DEEA", "#4DD0E1"],
+        bubbleThemGradient: ["#FFFFFF", "#F6F8FC"],
+        patternGradientColors: ["#C7C0F6", "#9BDDD8", "#F0B8A7"],
         patternGradientLocations: [0, 0.5, 1],
-        patternOpacity: 0.12,
+        patternOpacity: 0.072,
         textColorMe: "#FFFFFF",
         textColorThem: "#000000"
       ),
       dark: NativeThemeVariant(
-        backgroundGradient: ["#000000", "#050507"],
-        bubbleMe: "#2A8585",
-        bubbleMeGradient: ["#3A9595", "#1A7575"],
-        bubbleThem: "#24242C",
-        bubbleThemGradient: ["#2F3338", "#20242A"],
-        patternGradientColors: ["#115E59", "#0891B2", "#0284C7"],
+        backgroundGradient: ["#05050B", "#05050B"],
+        bubbleMe: "#12B8A7",
+        bubbleMeGradient: ["#8B7CFF", "#08C6B4"],
+        bubbleThem: "#252936",
+        bubbleThemGradient: ["#252936", "#1A202C"],
+        patternGradientColors: ["#7F5AF0", "#1DB8A6", "#D16F58"],
         patternGradientLocations: [0, 0.5, 1],
-        patternOpacity: 0.12,
-        textColorMe: "#F0FCFC",
+        patternOpacity: 0.17,
+        textColorMe: "#FFFFFF",
         textColorThem: "#FFFFFF"
       )
     )
@@ -469,27 +504,27 @@ private func nativePreset(for id: String) -> NativeThemePreset? {
       id: id,
       maskedImage: "doodles",
       light: NativeThemeVariant(
-        backgroundGradient: ["#FFFFFF", "#FFFFFF"],
-        bubbleMe: "#3F51B5",
-        bubbleMeGradient: ["#5C6BC0", "#3949AB"],
-        bubbleThem: "#F3F4FB",
-        bubbleThemGradient: ["#FFFFFF", "#FFFFFF"],
-        patternGradientColors: ["#C5CAE9", "#9FA8DA", "#7986CB"],
+        backgroundGradient: ["#F4F8FA", "#E9F0F5"],
+        bubbleMe: "#1976D2",
+        bubbleMeGradient: ["#1976D2", "#1976D2"],
+        bubbleThem: "#FFFFFF",
+        bubbleThemGradient: ["#FFFFFF", "#F5F7FA"],
+        patternGradientColors: ["#B7C9D6", "#95B5C9", "#7FA3BA"],
         patternGradientLocations: [0, 0.5, 1],
-        patternOpacity: 0.12,
+        patternOpacity: 0.070,
         textColorMe: "#FFFFFF",
         textColorThem: "#000000"
       ),
       dark: NativeThemeVariant(
-        backgroundGradient: ["#000000", "#050507"],
-        bubbleMe: "#7C3AED",
-        bubbleMeGradient: ["#8B5CF6", "#6D28D9"],
-        bubbleThem: "#24242C",
-        bubbleThemGradient: ["#312B3B", "#231E2C"],
-        patternGradientColors: ["#2563EB", "#4F46E5", "#7C3AED", "#C026D3", "#DB2777"],
-        patternGradientLocations: [0, 0.25, 0.5, 0.75, 1],
-        patternOpacity: 0.12,
-        textColorMe: "#F4F6F7",
+        backgroundGradient: ["#03070C", "#03070C"],
+        bubbleMe: "#2F80ED",
+        bubbleMeGradient: ["#6BB7FF", "#2F80ED"],
+        bubbleThem: "#1E2732",
+        bubbleThemGradient: ["#1E2732", "#151D26"],
+        patternGradientColors: ["#70B7FF", "#2F80ED", "#6FE7D8"],
+        patternGradientLocations: [0, 0.5, 1],
+        patternOpacity: 0.17,
+        textColorMe: "#FFFFFF",
         textColorThem: "#FFFFFF"
       )
     )
@@ -498,27 +533,27 @@ private func nativePreset(for id: String) -> NativeThemePreset? {
       id: id,
       maskedImage: "doodles",
       light: NativeThemeVariant(
-        backgroundGradient: ["#FFFFFF", "#FFFFFF"],
-        bubbleMe: "#0277BD",
-        bubbleMeGradient: ["#039BE5", "#0277BD"],
+        backgroundGradient: ["#EAF8D8", "#EAF8D8"],
+        bubbleMe: "#DDF8C8",
+        bubbleMeGradient: ["#DDF8C8", "#DDF8C8"],
         bubbleThem: "#FFFFFF",
-        bubbleThemGradient: ["#FFFFFF", "#FFFFFF"],
-        patternGradientColors: ["#B3E5FC", "#81D4FA", "#4FC3F7"],
+        bubbleThemGradient: ["#FFFFFF", "#F9FCF4"],
+        patternGradientColors: ["#B9D486", "#82C891", "#70B9A2"],
         patternGradientLocations: [0, 0.5, 1],
-        patternOpacity: 0.12,
-        textColorMe: "#FFFFFF",
+        patternOpacity: 0.068,
+        textColorMe: "#061208",
         textColorThem: "#000000"
       ),
       dark: NativeThemeVariant(
-        backgroundGradient: ["#000000", "#050507"],
-        bubbleMe: "#3A7DA8",
-        bubbleMeGradient: ["#4A8DB8", "#2A6D98"],
-        bubbleThem: "#24242C",
-        bubbleThemGradient: ["#2A313A", "#1B232C"],
-        patternGradientColors: ["#1E3A8A", "#0F766E", "#06B6D4", "#22D3EE"],
-        patternGradientLocations: [0, 0.4, 0.8, 1],
-        patternOpacity: 0.15,
-        textColorMe: "#F4F8FC",
+        backgroundGradient: ["#020806", "#020806"],
+        bubbleMe: "#2EB872",
+        bubbleMeGradient: ["#7BEF8E", "#2EB872"],
+        bubbleThem: "#1F2B28",
+        bubbleThemGradient: ["#23302C", "#17231F"],
+        patternGradientColors: ["#A6E85F", "#2EB872", "#27C7A6"],
+        patternGradientLocations: [0, 0.5, 1],
+        patternOpacity: 0.17,
+        textColorMe: "#FFFFFF",
         textColorThem: "#FFFFFF"
       )
     )
@@ -527,27 +562,27 @@ private func nativePreset(for id: String) -> NativeThemePreset? {
       id: id,
       maskedImage: "doodles",
       light: NativeThemeVariant(
-        backgroundGradient: ["#FFFFFF", "#FFFFFF"],
-        bubbleMe: "#1565C0",
-        bubbleMeGradient: ["#1E88E5", "#1565C0"],
+        backgroundGradient: ["#F6F6F4", "#ECEEF1"],
+        bubbleMe: "#313A46",
+        bubbleMeGradient: ["#313A46", "#313A46"],
         bubbleThem: "#FFFFFF",
-        bubbleThemGradient: ["#FFFFFF", "#FFFFFF"],
-        patternGradientColors: ["#BBDEFB", "#90CAF9", "#64B5F6"],
+        bubbleThemGradient: ["#FFFFFF", "#F3F4F5"],
+        patternGradientColors: ["#BEC4CC", "#9FA9B7", "#818B9A"],
         patternGradientLocations: [0, 0.5, 1],
-        patternOpacity: 0.12,
+        patternOpacity: 0.064,
         textColorMe: "#FFFFFF",
         textColorThem: "#000000"
       ),
       dark: NativeThemeVariant(
-        backgroundGradient: ["#000000", "#050507"],
-        bubbleMe: "#4A7DC4",
-        bubbleMeGradient: ["#5A8FD4", "#3A6AB8"],
-        bubbleThem: "#24242C",
-        bubbleThemGradient: ["#2D313C", "#1F2430"],
-        patternGradientColors: ["#312E81", "#4338CA", "#4F46E5", "#818CF8"],
-        patternGradientLocations: [0, 0.3, 0.7, 1],
-        patternOpacity: 0.18,
-        textColorMe: "#F4F6F8",
+        backgroundGradient: ["#030304", "#050607"],
+        bubbleMe: "#D9DEE8",
+        bubbleMeGradient: ["#F4F7FB", "#A9B2C3"],
+        bubbleThem: "#20232B",
+        bubbleThemGradient: ["#23262E", "#171A20"],
+        patternGradientColors: ["#E5E7EB", "#94A3B8", "#64748B"],
+        patternGradientLocations: [0, 0.5, 1],
+        patternOpacity: 0.16,
+        textColorMe: "#11131A",
         textColorThem: "#FFFFFF"
       )
     )
@@ -556,27 +591,27 @@ private func nativePreset(for id: String) -> NativeThemePreset? {
       id: id,
       maskedImage: "music",
       light: NativeThemeVariant(
-        backgroundGradient: ["#FFFFFF", "#FFFFFF"],
-        bubbleMe: "#7B1FA2",
-        bubbleMeGradient: ["#9C27B0", "#7B1FA2"],
+        backgroundGradient: ["#FFF5FA", "#FFF0F1"],
+        bubbleMe: "#D63D8C",
+        bubbleMeGradient: ["#F43F8F", "#FF7A59"],
         bubbleThem: "#FFFFFF",
-        bubbleThemGradient: ["#FFFFFF", "#FFFFFF"],
-        patternGradientColors: ["#E1BEE7", "#CE93D8", "#BA68C8"],
+        bubbleThemGradient: ["#FFFFFF", "#FBF4F7"],
+        patternGradientColors: ["#F4A7C5", "#F7A57F", "#D9B4E8"],
         patternGradientLocations: [0, 0.5, 1],
-        patternOpacity: 0.14,
+        patternOpacity: 0.076,
         textColorMe: "#FFFFFF",
         textColorThem: "#000000"
       ),
       dark: NativeThemeVariant(
-        backgroundGradient: ["#000000", "#050507"],
-        bubbleMe: "#8B5CF6",
-        bubbleMeGradient: ["#A78BFA", "#7C3AED"],
-        bubbleThem: "#24242C",
-        bubbleThemGradient: ["#332A3E", "#251F30"],
-        patternGradientColors: ["#22D3EE", "#E879F9", "#8B5CF6"],
+        backgroundGradient: ["#070306", "#070306"],
+        bubbleMe: "#E84AA8",
+        bubbleMeGradient: ["#D946EF", "#FF5E7A"],
+        bubbleThem: "#2A202D",
+        bubbleThemGradient: ["#2D2230", "#1F1825"],
+        patternGradientColors: ["#D946EF", "#FF5E7A", "#7C5CFF"],
         patternGradientLocations: [0, 0.5, 1],
-        patternOpacity: 0.15,
-        textColorMe: "#F8F6FC",
+        patternOpacity: 0.17,
+        textColorMe: "#FFFFFF",
         textColorThem: "#FFFFFF"
       )
     )
@@ -585,27 +620,56 @@ private func nativePreset(for id: String) -> NativeThemePreset? {
       id: id,
       maskedImage: "doodles",
       light: NativeThemeVariant(
-        backgroundGradient: ["#FFFFFF", "#FFFFFF"],
-        bubbleMe: "#E65100",
-        bubbleMeGradient: ["#F57C00", "#E65100"],
+        backgroundGradient: ["#FFF7F0", "#F5ECE5"],
+        bubbleMe: "#D9632D",
+        bubbleMeGradient: ["#E85D2A", "#F6A13A"],
         bubbleThem: "#FFFFFF",
-        bubbleThemGradient: ["#FFFFFF", "#FFFFFF"],
-        patternGradientColors: ["#FFE0B2", "#FFCC80", "#FFB74D"],
+        bubbleThemGradient: ["#FFFFFF", "#FAF4EE"],
+        patternGradientColors: ["#E7B074", "#CF8F66", "#B5A889"],
         patternGradientLocations: [0, 0.5, 1],
-        patternOpacity: 0.14,
+        patternOpacity: 0.076,
         textColorMe: "#FFFFFF",
         textColorThem: "#000000"
       ),
       dark: NativeThemeVariant(
-        backgroundGradient: ["#000000", "#050507"],
-        bubbleMe: "#B87050",
-        bubbleMeGradient: ["#C88060", "#A86040"],
-        bubbleThem: "#24242C",
-        bubbleThemGradient: ["#3B2F2A", "#2B221F"],
-        patternGradientColors: ["#DC2626", "#EA580C", "#B45309"],
+        backgroundGradient: ["#060302", "#060302"],
+        bubbleMe: "#E86D32",
+        bubbleMeGradient: ["#FF9A3D", "#E85D2A"],
+        bubbleThem: "#29231F",
+        bubbleThemGradient: ["#2D2621", "#1E1A18"],
+        patternGradientColors: ["#FF9A3D", "#E85D2A", "#D6A34D"],
         patternGradientLocations: [0, 0.5, 1],
-        patternOpacity: 0.12,
-        textColorMe: "#FAF0E8",
+        patternOpacity: 0.17,
+        textColorMe: "#FFFFFF",
+        textColorThem: "#FFFFFF"
+      )
+    )
+  case "leaf":
+    return NativeThemePreset(
+      id: id,
+      maskedImage: "doodles",
+      light: NativeThemeVariant(
+        backgroundGradient: ["#EAF7CD", "#C8E8C5"],
+        bubbleMe: "#DBF8C4",
+        bubbleMeGradient: ["#DBF8C4", "#DBF8C4"],
+        bubbleThem: "#FFFFFF",
+        bubbleThemGradient: ["#FFFFFF", "#FAFDF5"],
+        patternGradientColors: ["#C5D777", "#88C98D", "#62B69E"],
+        patternGradientLocations: [0, 0.54, 1],
+        patternOpacity: 0.080,
+        textColorMe: "#061208",
+        textColorThem: "#000000"
+      ),
+      dark: NativeThemeVariant(
+        backgroundGradient: ["#030704", "#030704"],
+        bubbleMe: "#28B463",
+        bubbleMeGradient: ["#78E36B", "#28B463"],
+        bubbleThem: "#1F2A22",
+        bubbleThemGradient: ["#243028", "#18221C"],
+        patternGradientColors: ["#78E36B", "#28B463", "#40C7A0"],
+        patternGradientLocations: [0, 0.5, 1],
+        patternOpacity: 0.17,
+        textColorMe: "#FFFFFF",
         textColorThem: "#FFFFFF"
       )
     )

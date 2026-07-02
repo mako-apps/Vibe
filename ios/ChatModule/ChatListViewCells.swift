@@ -501,27 +501,55 @@ final class BubbleBackgroundView: UIView {
     let agentColor =
       accentOverride
       ?? appearance.bubbleMeGradient.first ?? UIColor(red: 0.49, green: 0.36, blue: 0.88, alpha: 1.0)
+    let hasWallpaperBackdrop =
+      wallpaperSnapshot != nil
+      && wallpaperContainerSize.width > 1.0
+      && wallpaperContainerSize.height > 1.0
+      && appearance.backgroundMode != "transparent"
     CATransaction.begin()
     CATransaction.setDisableActions(true)
 
     // For agent messages (!isMe), we make the fill translucent them-color
     if !isMe {
-      gradientLayer.isHidden = false
-      gradientLayer.colors = [
-        agentColor.withAlphaComponent(0.22).cgColor,
-        agentColor.withAlphaComponent(0.08).cgColor,
-      ]
-      gradientLayer.opacity = wallpaperLayer.isHidden ? 0.82 : 0.70
-      fillLayer.fillColor =
-        appearance.bubbleThemColor.withAlphaComponent(
-          wallpaperLayer.isHidden ? (appearance.isDark ? 0.86 : 1.0) : (appearance.isDark ? 0.62 : 1.0)
-        ).cgColor
-      blurView.alpha = wallpaperLayer.isHidden ? 0.42 : 0.0
+      if hasWallpaperBackdrop {
+        gradientLayer.isHidden = true
+        gradientLayer.opacity = 0.0
+        let plateColor = appearance.agentWallpaperPlateColor(
+          isMe: false,
+          sampleRect: wallpaperSampleRect,
+          containerSize: wallpaperContainerSize,
+          accent: agentColor
+        )
+        fillLayer.fillColor = plateColor.withAlphaComponent(appearance.incomingPlateFillOpacity).cgColor
+        blurView.alpha = 0.0
+      } else {
+        gradientLayer.isHidden = false
+        gradientLayer.colors = [
+          agentColor.withAlphaComponent(0.18).cgColor,
+          agentColor.withAlphaComponent(0.06).cgColor,
+        ]
+        gradientLayer.opacity = 0.62
+        fillLayer.fillColor =
+          appearance.bubbleThemColor.withAlphaComponent(appearance.isDark ? 0.86 : 1.0).cgColor
+        blurView.alpha = 0.38
+      }
     } else {
       // For my agent mentions, just add the glowing border and a slight tint
-      gradientLayer.isHidden = false
-      gradientLayer.colors = appearance.bubbleMeGradient.map { $0.cgColor }
-      gradientLayer.opacity = wallpaperLayer.isHidden ? 0.82 : 0.72
+      if hasWallpaperBackdrop {
+        gradientLayer.isHidden = true
+        gradientLayer.opacity = 0.0
+        let plateColor = appearance.agentWallpaperPlateColor(
+          isMe: true,
+          sampleRect: wallpaperSampleRect,
+          containerSize: wallpaperContainerSize,
+          accent: agentColor
+        )
+        fillLayer.fillColor = plateColor.withAlphaComponent(appearance.outgoingPlateFillOpacity).cgColor
+      } else {
+        gradientLayer.isHidden = false
+        gradientLayer.colors = appearance.bubbleMeGradient.map { $0.cgColor }
+        gradientLayer.opacity = 0.82
+      }
       blurView.alpha = 0.0
     }
 
@@ -530,7 +558,7 @@ final class BubbleBackgroundView: UIView {
       layer.addSublayer(agentBorderLayer)
     }
     agentBorderLayer.fillColor = UIColor.clear.cgColor
-    agentBorderLayer.strokeColor = agentColor.withAlphaComponent(isMe ? 0.6 : 0.28).cgColor
+    agentBorderLayer.strokeColor = agentColor.withAlphaComponent(isMe ? 0.46 : 0.24).cgColor
     agentBorderLayer.lineWidth = 1.5
     applyAgentBorderPath()
     CATransaction.commit()
@@ -913,11 +941,19 @@ private func colorLuminance(_ color: UIColor) -> CGFloat {
 private func resolvedIncomingVoiceButtonStyle(for appearance: ChatListAppearance)
   -> (fill: UIColor, accent: UIColor)
 {
-  let accent = appearance.bubbleThemColor.withAlphaComponent(0.98)
+  if appearance.isDark {
+    let accent = appearance.bubbleThemColor.withAlphaComponent(0.98)
+    let fill: UIColor =
+      colorLuminance(appearance.bubbleThemColor) > 0.72
+      ? UIColor(white: 0.08, alpha: 0.16)
+      : UIColor(white: 1.0, alpha: 0.90)
+    return (fill, accent)
+  }
+  let accent = (appearance.bubbleMeGradient.first ?? UIColor.systemBlue).withAlphaComponent(0.98)
   let fill: UIColor =
     colorLuminance(appearance.bubbleThemColor) > 0.72
-    ? UIColor(white: 0.08, alpha: 0.16)
-    : UIColor(white: 1.0, alpha: 0.90)
+    ? accent.withAlphaComponent(0.14)
+    : UIColor(white: 1.0, alpha: 0.78)
   return (fill, accent)
 }
 
@@ -1565,7 +1601,7 @@ private func bubbleCanPreviewURL(_ url: URL) -> Bool {
 
 private func bubblePreviewURL(for row: ChatListRow) -> URL? {
   guard row.kind == .message, row.visualKind == .text, row.messageType != "typing",
-    !hasInlineAttachment(row), !bubbleUsesAgentTurnContent(row)
+    !hasInlineAttachment(row), !row.isAgentMessage, !row.isAgentMention
   else {
     return nil
   }
@@ -5380,6 +5416,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private var selectionMode = false
   private var isSelectionChecked = false
   private var isGhostHidden = false
+  /// Whether the last configure() hid this cell as the send-morph ghost — lets the
+  /// host verify/repair the reveal after the transition without reconfiguring blindly.
+  var isConfiguredGhostHidden: Bool { isGhostHidden }
   private var isContextMenuExtracted = false
   private var isContextMenuHeld = false
   private var savedBubbleHiddenBeforeExtraction = false
@@ -6072,7 +6111,11 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
             visible: !isGhostHidden && row.shape.showTail,
             appearance: appearance
           )
-          tailView.applyAgentTailStyle(appearance: appearance, isMe: false)
+          tailView.applyAgentTailStyle(
+            appearance: appearance,
+            isMe: false,
+            accent: Self.agentWorkingAccent(for: row)
+          )
         }
       } else if row.isAgentMention {
         // Agent mention by ME uses "me" styling with glow
@@ -6840,6 +6883,19 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       )
     } else {
       tailView.applyWallpaperBackdrop(snapshot: nil, containerSize: .zero, sampleRect: .zero)
+    }
+
+    if row.isAgentMessage && !usesTransparentAgentStreamingLayout(row) {
+      let accent = Self.agentWorkingAccent(for: row)
+      bubbleView.applyAgentStyle(appearance: appearance, isMe: false, accent: accent)
+      if !tailView.isHidden, tailView.imageView.image == nil {
+        tailView.applyAgentTailStyle(appearance: appearance, isMe: false, accent: accent)
+      }
+    } else if row.isAgentMention {
+      bubbleView.applyAgentStyle(appearance: appearance, isMe: true)
+      if !tailView.isHidden, tailView.imageView.image == nil {
+        tailView.applyAgentTailStyle(appearance: appearance, isMe: true)
+      }
     }
   }
 
@@ -8198,16 +8254,16 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   }
 
   /// A per-task working tint for an in-flight agent bubble, or nil once the turn is
-  /// finished/errored (so the bubble settles back to the default agent purple). Seeded
-  /// from a stable id so one run keeps a single color across its live updates while
-  /// distinct runs read differently.
+  /// finished/errored (so the bubble settles back to the default chat accent). Seeded
+  /// from a stable id so one run keeps a single color across its live updates, but kept
+  /// inside the wallpaper's blue-violet family so it does not fight the chat palette.
   static func agentWorkingAccent(for row: ChatListRow) -> UIColor? {
     guard row.isAgentMessage, row.isStreamingText, !row.isAgentError else { return nil }
     let seed = row.agentActionSourceId ?? row.messageId ?? row.key
     var hash: UInt64 = 1_469_598_103_934_665_603
     for byte in seed.utf8 { hash = (hash ^ UInt64(byte)) &* 1_099_511_628_211 }
-    let hue = CGFloat(hash % 360) / 360.0
-    return UIColor(hue: hue, saturation: 0.58, brightness: 0.80, alpha: 1.0)
+    let hue = (224.0 + CGFloat(hash % 54)) / 360.0
+    return UIColor(hue: hue, saturation: 0.44, brightness: 0.88, alpha: 1.0)
   }
 
   /// The old outside-bubble "view agent" arrow is intentionally retired. Active
@@ -9006,24 +9062,60 @@ final class BubbleTailView: UIView {
     setNeedsLayout()
   }
 
-  func applyAgentTailStyle(appearance: ChatListAppearance, isMe: Bool) {
+  func applyAgentTailStyle(
+    appearance: ChatListAppearance,
+    isMe: Bool,
+    accent accentOverride: UIColor? = nil
+  ) {
     let agentColor =
-      appearance.bubbleMeGradient.first ?? UIColor(red: 0.49, green: 0.36, blue: 0.88, alpha: 1.0)
+      accentOverride
+      ?? appearance.bubbleMeGradient.first ?? UIColor(red: 0.49, green: 0.36, blue: 0.88, alpha: 1.0)
+    let hasWallpaperBackdrop =
+      wallpaperSnapshot != nil
+      && wallpaperContainerSize.width > 1.0
+      && wallpaperContainerSize.height > 1.0
+      && appearance.backgroundMode != "transparent"
+      && imageView.image == nil
     CATransaction.begin()
     CATransaction.setDisableActions(true)
 
     if !isMe {
-      gradientLayer.isHidden = false
-      gradientLayer.colors = [
-        agentColor.withAlphaComponent(0.22).cgColor,
-        agentColor.withAlphaComponent(0.08).cgColor,
-      ]
-      gradientLayer.opacity = wallpaperLayer.isHidden ? 0.82 : 0.70
-      blurView.alpha = wallpaperLayer.isHidden ? 0.42 : 0.0
+      if hasWallpaperBackdrop {
+        gradientLayer.isHidden = true
+        gradientLayer.opacity = 0.0
+        let plateColor = appearance.agentWallpaperPlateColor(
+          isMe: false,
+          sampleRect: wallpaperSampleRect,
+          containerSize: wallpaperContainerSize,
+          accent: agentColor
+        )
+        fillLayer.fillColor = plateColor.withAlphaComponent(appearance.incomingPlateFillOpacity).cgColor
+        blurView.alpha = 0.0
+      } else {
+        gradientLayer.isHidden = false
+        gradientLayer.colors = [
+          agentColor.withAlphaComponent(0.18).cgColor,
+          agentColor.withAlphaComponent(0.06).cgColor,
+        ]
+        gradientLayer.opacity = 0.62
+        blurView.alpha = 0.38
+      }
     } else {
-      gradientLayer.isHidden = false
-      gradientLayer.colors = appearance.bubbleMeGradient.map(\.cgColor)
-      gradientLayer.opacity = wallpaperLayer.isHidden ? 0.82 : 0.72
+      if hasWallpaperBackdrop {
+        gradientLayer.isHidden = true
+        gradientLayer.opacity = 0.0
+        let plateColor = appearance.agentWallpaperPlateColor(
+          isMe: true,
+          sampleRect: wallpaperSampleRect,
+          containerSize: wallpaperContainerSize,
+          accent: agentColor
+        )
+        fillLayer.fillColor = plateColor.withAlphaComponent(appearance.outgoingPlateFillOpacity).cgColor
+      } else {
+        gradientLayer.isHidden = false
+        gradientLayer.colors = appearance.bubbleMeGradient.map(\.cgColor)
+        gradientLayer.opacity = 0.82
+      }
       blurView.alpha = 0.0
     }
     CATransaction.commit()

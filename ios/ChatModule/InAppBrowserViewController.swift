@@ -1,5 +1,6 @@
 import UIKit
 import WebKit
+import SafariServices
 
 final class InAppBrowserViewController: UIViewController, WKNavigationDelegate {
   private let url: URL
@@ -86,10 +87,9 @@ final class InAppBrowserViewController: UIViewController, WKNavigationDelegate {
   static func present(url: URL) {
     DispatchQueue.main.async {
       guard let top = UIApplication.shared.topMostViewController() else { return }
-      let vc = InAppBrowserViewController(url: url)
-      let nav = UINavigationController(rootViewController: vc)
-      nav.modalPresentationStyle = .pageSheet
-      top.present(nav, animated: true, completion: nil)
+      let safariVC = SFSafariViewController(url: url)
+      safariVC.modalPresentationStyle = .pageSheet
+      top.present(safariVC, animated: true, completion: nil)
     }
   }
 }

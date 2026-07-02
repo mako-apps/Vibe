@@ -1162,7 +1162,13 @@ private final class ChatsViewModel: ObservableObject {
       object: nil,
       queue: .main
     ) { [weak self] note in
-      guard (note.userInfo?["reason"] as? String) == "remoteNewMessage" else { return }
+      // Refresh for BOTH a peer / other-device ping ("remoteNewMessage") AND a message
+      // inserted locally on THIS device ("chatMessageInserted"). Without the latter, a
+      // message the user sends here never nudges the home list — most visibly the very
+      // first message in a brand-new conversation, whose preview would otherwise stay
+      // blank until some unrelated remote nudge arrived.
+      let reason = note.userInfo?["reason"] as? String
+      guard reason == "remoteNewMessage" || reason == "chatMessageInserted" else { return }
       self?.scheduleRealtimeRefresh()
     }
   }
@@ -1604,8 +1610,8 @@ private struct ChatHomeScreen: View {
               undo: undoPendingHomeDelete
             )
             .padding(.horizontal, 14)
-            .padding(.bottom, 86)
-            .transition(.move(edge: .bottom).combined(with: .opacity))
+            .padding(.bottom, 0)
+            .transition(.scale(scale: 0.94).combined(with: .opacity).animation(.easeOut(duration: 0.25)))
           }
           .frame(maxWidth: .infinity, maxHeight: .infinity)
           .allowsHitTesting(true)
@@ -1997,7 +2003,9 @@ private struct ChatHomeScreen: View {
       deleteForEveryone: deleteForEveryone,
       duration: 5
     )
-    pendingDeletion = deletion
+    withAnimation(.spring(response: 0.4, dampingFraction: 0.75)) {
+      pendingDeletion = deletion
+    }
     UIImpactFeedbackGenerator(style: .medium).impactOccurred()
     _ = ChatEngine.shared.clearChat([
       "chatId": row.chatId,
@@ -2016,7 +2024,9 @@ private struct ChatHomeScreen: View {
     guard let deletion = pendingDeletion else { return }
     pendingDeletionTask?.cancel()
     pendingDeletionTask = nil
-    pendingDeletion = nil
+    withAnimation(.spring(response: 0.4, dampingFraction: 0.75)) {
+      pendingDeletion = nil
+    }
     locallyHiddenChatIDs.remove(deletion.row.chatId)
     if !deletion.row.initialMessages.isEmpty {
       ChatEngine.shared.seedRecentChatHistory(
@@ -2042,7 +2052,9 @@ private struct ChatHomeScreen: View {
         deleteForEveryone: deletion.deleteForEveryone
       )
       if pendingDeletion?.id == deletion.id {
-        pendingDeletion = nil
+        withAnimation(.spring(response: 0.4, dampingFraction: 0.75)) {
+          pendingDeletion = nil
+        }
         pendingDeletionTask = nil
       }
       selectedChatIDs.remove(deletion.row.chatId)
@@ -2060,7 +2072,9 @@ private struct ChatHomeScreen: View {
 
   private func restoreFailedHomeDelete(_ deletion: ChatHomePendingDeletion, message: String) {
     if pendingDeletion?.id == deletion.id {
-      pendingDeletion = nil
+      withAnimation(.spring(response: 0.4, dampingFraction: 0.75)) {
+        pendingDeletion = nil
+      }
       pendingDeletionTask = nil
     }
     locallyHiddenChatIDs.remove(deletion.row.chatId)
@@ -2322,10 +2336,7 @@ private struct ChatHomeDeleteDialogView: View {
       }
       .padding(20)
       .frame(maxWidth: 340)
-      .background(
-        RoundedRectangle(cornerRadius: 24, style: .continuous)
-          .fill(.ultraThinMaterial)
-      )
+      .background(AppHomeGlassEffectView(cornerRadius: 24))
       .overlay(
         RoundedRectangle(cornerRadius: 24, style: .continuous)
           .stroke(palette.border, lineWidth: 1)
@@ -2467,19 +2478,31 @@ private struct ChatHomeDeletionUndoToast: View {
       .padding(.trailing, 10)
       .frame(maxWidth: .infinity)
       .frame(height: 58)
-      .background(
-        RoundedRectangle(cornerRadius: 99, style: .continuous)
-          .fill(.ultraThinMaterial)
-      )
-      .overlay(
-        RoundedRectangle(cornerRadius: 99, style: .continuous)
-          .stroke(palette.border, lineWidth: 1)
-      )
-      .shadow(color: Color.black.opacity(0.16), radius: 20, y: 10)
+      .background(AppHomeGlassEffectView(cornerRadius: 99))
     }
   }
 }
 
+private struct AppHomeGlassEffectView: UIViewRepresentable {
+  let cornerRadius: CGFloat
+
+  func makeUIView(context: Context) -> UIVisualEffectView {
+    let view = UIVisualEffectView(effect: nil)
+    if #available(iOS 26.0, *) {
+      let glass = UIGlassEffect()
+      glass.isInteractive = true
+      view.effect = glass
+      view.contentView.backgroundColor = .clear
+    } else {
+      view.effect = UIBlurEffect(style: .systemThinMaterial)
+    }
+    view.layer.cornerRadius = cornerRadius
+    view.layer.cornerCurve = .continuous
+    view.clipsToBounds = true
+    return view
+  }
+  func updateUIView(_ uiView: UIVisualEffectView, context: Context) {}
+}
 
 private struct SettingsRootView: View {
   @EnvironmentObject private var coordinator: AppShellCoordinator
@@ -3610,22 +3633,23 @@ private final class ChatHomeDeletionWipeOverlayView: UIView {
       snapshotContainer.addSubview(snapshot)
     }
 
-    emitter.emitterPosition = CGPoint(x: bounds.midX, y: bounds.midY)
-    emitter.emitterSize = bounds.size
-    emitter.emitterShape = .rectangle
+    emitter.emitterPosition = CGPoint(x: bounds.width, y: bounds.midY)
+    emitter.emitterSize = CGSize(width: 1, height: bounds.height)
+    emitter.emitterShape = .line
 
     let cell = CAEmitterCell()
-    cell.contents = createParticleImage()?.cgImage
-    cell.birthRate = 1800
-    cell.lifetime = 0.8
-    cell.velocity = 180
-    cell.velocityRange = 100
-    cell.emissionRange = .pi * 2
-    cell.scale = 0.8
-    cell.scaleRange = 0.4
-    cell.scaleSpeed = -0.6
-    cell.alphaSpeed = -1.2
-    cell.yAcceleration = 400
+    cell.contents = createParticleImage(isDark: isDark)?.cgImage
+    cell.birthRate = 6000
+    cell.lifetime = 0.55
+    cell.velocity = 500
+    cell.velocityRange = 250
+    cell.emissionLongitude = .pi // Point left
+    cell.emissionRange = .pi / 6 // Slight spread
+    cell.scale = 0.2
+    cell.scaleRange = 0.1
+    cell.scaleSpeed = -0.3
+    cell.alphaSpeed = -1.5
+    cell.yAcceleration = -400 // Go to top
 
     emitter.emitterCells = [cell]
     layer.addSublayer(emitter)
@@ -3636,30 +3660,50 @@ private final class ChatHomeDeletionWipeOverlayView: UIView {
   }
 
   func animateAndRemove() {
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
       self.emitter.birthRate = 0
     }
 
-    var transform = CATransform3DIdentity
-    transform.m34 = -1.0 / 600.0
-    transform = CATransform3DTranslate(transform, 0, 50, -150)
-    transform = CATransform3DRotate(transform, -.pi / 3, 1, 0, 0)
-    transform = CATransform3DScale(transform, 0.1, 0.1, 0.1)
+    // Create a moving gradient mask so the cell image itself dissolves right-to-left
+    let maskLayer = CAGradientLayer()
+    maskLayer.colors = [UIColor.black.cgColor, UIColor.clear.cgColor]
+    maskLayer.locations = [0.0, 0.05]
+    maskLayer.startPoint = CGPoint(x: 1.0, y: 0.5) // Start right
+    maskLayer.endPoint = CGPoint(x: 0.0, y: 0.5)   // End left
+    maskLayer.frame = bounds
+    snapshotContainer.layer.mask = maskLayer
 
-    UIView.animate(withDuration: 0.45, delay: 0, options: .curveEaseIn, animations: {
-      self.snapshotContainer.layer.transform = transform
-      self.snapshotContainer.alpha = 0
+    let duration: TimeInterval = 0.55
+
+    let maskAnimation = CABasicAnimation(keyPath: "locations")
+    maskAnimation.fromValue = [-0.1, 0.0]
+    maskAnimation.toValue = [1.0, 1.1]
+    maskAnimation.duration = duration * 0.8
+    maskAnimation.fillMode = .forwards
+    maskAnimation.isRemovedOnCompletion = false
+    maskLayer.add(maskAnimation, forKey: "maskWipe")
+
+    let moveEmitterAnimation = CABasicAnimation(keyPath: "emitterPosition.x")
+    moveEmitterAnimation.fromValue = bounds.width
+    moveEmitterAnimation.toValue = 0
+    moveEmitterAnimation.duration = duration * 0.8
+    moveEmitterAnimation.fillMode = .forwards
+    moveEmitterAnimation.isRemovedOnCompletion = false
+    emitter.add(moveEmitterAnimation, forKey: "moveEmitter")
+
+    UIView.animate(withDuration: duration, delay: 0, options: .curveEaseOut, animations: {
+      // Dissolves perfectly in place, no transform
     }) { _ in
       self.removeFromSuperview()
     }
   }
 
-  private func createParticleImage() -> UIImage? {
-    let size = CGSize(width: 8, height: 8)
+  private func createParticleImage(isDark: Bool) -> UIImage? {
+    let size = CGSize(width: 1, height: 4) // Very thin slice
     UIGraphicsBeginImageContextWithOptions(size, false, 0)
     guard let context = UIGraphicsGetCurrentContext() else { return nil }
-    context.setFillColor(UIColor.systemGray.withAlphaComponent(0.8).cgColor)
-    context.fillEllipse(in: CGRect(origin: .zero, size: size))
+    context.setFillColor(isDark ? UIColor.white.withAlphaComponent(0.9).cgColor : UIColor.black.withAlphaComponent(0.9).cgColor)
+    context.fill(CGRect(origin: .zero, size: size))
     let image = UIGraphicsGetImageFromCurrentImageContext()
     UIGraphicsEndImageContext()
     return image
@@ -3726,7 +3770,7 @@ private final class ChatHomeMiniPreviewOverlayController: UIViewController,
     self.onOpen = onOpen
     self.onAction = onAction
     self.backgroundGlassView = UIVisualEffectView(
-      effect: UIBlurEffect(style: isDark ? .systemMaterialDark : .systemMaterialLight)
+      effect: UIBlurEffect(style: isDark ? .systemUltraThinMaterialDark : .systemUltraThinMaterialLight)
     )
     self.menuView = ChatHomePreviewActionMenuView(row: row, isDark: isDark)
     self.previewController = ChatHomeMiniPreviewController(row: row, isDark: isDark)
@@ -4021,10 +4065,12 @@ private final class ChatHomePreviewActionMenuView: UIView {
   init(row: ChatHomeListRow, isDark: Bool) {
     self.row = row
     self.isDark = isDark
-    self.glassView = makeHomePreviewGlassView(
-      style: isDark ? .systemMaterialDark : .systemMaterialLight,
-      cornerRadius: 24
-    )
+
+    let style: UIBlurEffect.Style = isDark ? .systemMaterialDark : .systemMaterialLight
+    self.glassView = UIVisualEffectView(effect: UIBlurEffect(style: style))
+    self.glassView.layer.cornerRadius = 18
+    self.glassView.clipsToBounds = true
+    self.glassView.layer.cornerCurve = .continuous
     super.init(frame: .zero)
     setup()
   }
@@ -4928,9 +4974,84 @@ final class ChatProfileRootController: UIViewController {
       NativeCallRouteBridge.startOutgoing(route: route, callType: "voice")
     case "headerVideoCallPressed":
       NativeCallRouteBridge.startOutgoing(route: route, callType: "video")
+    case "headerMenuAction":
+      let action = Self.normalizedString(payload["action"]) ?? ""
+      if action == "clearChat" {
+        presentClearChatOptions()
+      }
     default:
       break
     }
+  }
+
+  private func presentClearChatOptions() {
+    let presenter = topMostPresenter()
+    let canClearForEveryone = route.peerUserId != nil && !route.isGroup && route.chatId != "saved_messages"
+    let sheet = UIAlertController(
+      title: "Clear Chat",
+      message: nil,
+      preferredStyle: .actionSheet
+    )
+    if canClearForEveryone {
+      sheet.addAction(
+        UIAlertAction(title: "Clear for me and \(route.title)", style: .destructive) {
+          [weak self] _ in
+          self?.performClearChat(deleteForEveryone: true)
+        })
+    }
+    sheet.addAction(
+      UIAlertAction(
+        title: canClearForEveryone ? "Clear just for me" : "Clear for me",
+        style: .destructive
+      ) { [weak self] _ in
+        self?.performClearChat(deleteForEveryone: false)
+      })
+    sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+    if let popover = sheet.popoverPresentationController {
+      popover.sourceView = view
+      popover.sourceRect = CGRect(x: view.bounds.midX, y: view.safeAreaInsets.top + 44.0, width: 1.0, height: 1.0)
+      popover.permittedArrowDirections = []
+    }
+    presenter.present(sheet, animated: true)
+  }
+
+  private func topMostPresenter() -> UIViewController {
+    var presenter: UIViewController = self
+    while let presented = presenter.presentedViewController {
+      presenter = presented
+    }
+    return presenter
+  }
+
+  private func performClearChat(deleteForEveryone: Bool) {
+    if deleteForEveryone {
+      _ = ChatEngine.shared.clearChat([
+        "chatId": route.chatId,
+        "localOnly": true,
+      ])
+      profileView.setRows([])
+      guard let config = AppSessionConfig.current else {
+        AppToastController.shared.show("The current session is unavailable.")
+        return
+      }
+      Task { @MainActor in
+        do {
+          try await ChatHomeEditService.deleteChat(
+            chatID: route.chatId,
+            config: config,
+            deleteForEveryone: true
+          )
+          AppToastController.shared.show("Chat cleared for both sides.")
+        } catch {
+          AppToastController.shared.show(error.localizedDescription)
+        }
+      }
+      return
+    }
+
+    _ = ChatEngine.shared.clearChat(["chatId": route.chatId])
+    profileView.setRows([])
+    AppToastController.shared.show("Chat cleared.")
   }
 
   private static func backgroundColor(isDark: Bool) -> UIColor {
@@ -6260,6 +6381,11 @@ final class ChatConversationController: UIViewController {
       NativeCallRouteBridge.startOutgoing(route: route, callType: "voice")
     case "headerVideoCallPressed":
       NativeCallRouteBridge.startOutgoing(route: route, callType: "video")
+    case "headerMenuAction":
+      let action = Self.normalizedString(payload["action"]) ?? ""
+      if action == "clearChat" {
+        presentClearChatOptions()
+      }
     case "mainPageChanged":
       if let page = Self.normalizedString(payload["page"]),
         let resolved = ChatConversationPage(rawValue: page)
@@ -6352,6 +6478,80 @@ final class ChatConversationController: UIViewController {
     default:
       break
     }
+  }
+
+  private func presentClearChatOptions() {
+    let presenter = topMostPresenter()
+    let canClearForEveryone = route.peerUserId != nil && !route.isGroup && route.chatId != "saved_messages"
+    let sheet = UIAlertController(
+      title: "Clear Chat",
+      message: nil,
+      preferredStyle: .actionSheet
+    )
+    if canClearForEveryone {
+      sheet.addAction(
+        UIAlertAction(title: "Clear for me and \(route.title)", style: .destructive) {
+          [weak self] _ in
+          self?.performClearChat(deleteForEveryone: true)
+        })
+    }
+    sheet.addAction(
+      UIAlertAction(
+        title: canClearForEveryone ? "Clear just for me" : "Clear for me",
+        style: .destructive
+      ) { [weak self] _ in
+        self?.performClearChat(deleteForEveryone: false)
+      })
+    sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+    if let popover = sheet.popoverPresentationController {
+      popover.sourceView = view
+      popover.sourceRect = CGRect(x: view.bounds.midX, y: view.safeAreaInsets.top + 44.0, width: 1.0, height: 1.0)
+      popover.permittedArrowDirections = []
+    }
+    presenter.present(sheet, animated: true)
+  }
+
+  private func topMostPresenter() -> UIViewController {
+    var presenter: UIViewController = self
+    while let presented = presenter.presentedViewController {
+      presenter = presented
+    }
+    return presenter
+  }
+
+  private func performClearChat(deleteForEveryone: Bool) {
+    if deleteForEveryone {
+      _ = ChatEngine.shared.clearChat([
+        "chatId": route.chatId,
+        "localOnly": true,
+      ])
+      mainView.setRows([])
+      profileView?.setRows([])
+      latestProfileRows = []
+      guard let config = AppSessionConfig.current else {
+        AppToastController.shared.show("The current session is unavailable.")
+        return
+      }
+      Task { @MainActor in
+        do {
+          try await ChatHomeEditService.deleteChat(
+            chatID: route.chatId,
+            config: config,
+            deleteForEveryone: true
+          )
+          AppToastController.shared.show("Chat cleared for both sides.")
+        } catch {
+          AppToastController.shared.show(error.localizedDescription)
+        }
+      }
+      return
+    }
+
+    _ = ChatEngine.shared.clearChat(["chatId": route.chatId])
+    mainView.setRows([])
+    profileView?.setRows([])
+    latestProfileRows = []
+    AppToastController.shared.show("Chat cleared.")
   }
 
   @objc private func handleChatEngineChanged(_ notification: Notification) {

@@ -444,6 +444,11 @@ public final class ChatNativeHomeListView: ExpoView, UITableViewDataSource, UITa
     }
     
     let liveRows = ChatEngine.shared.getLiveMessageRows(["chatId": row.chatId])
+    if liveRows.isEmpty {
+      NSLog(
+        "[FirstMsg] homePreview no live rows chatId=%@ jsPreview='%@'",
+        String(row.chatId.prefix(12)), String(jsPreview.prefix(24)))
+    }
     if !liveRows.isEmpty {
       let sortedValues = liveRows.values.sorted { valA, valB -> Bool in
         let msgA = valA["message"] as? [String: Any]

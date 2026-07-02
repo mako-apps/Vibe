@@ -204,6 +204,7 @@ public final class ChatMainView: UIView,
   private var isGroupOrChannel = false
 
   private var appearance = ChatListAppearance.fallback
+  private var lastRawAppearance: [String: Any]?
   private var headerMode: ChatMainHeaderMode = .default
   private var bridgeProvider: String = ""
   private var isOnline = false
@@ -333,6 +334,14 @@ public final class ChatMainView: UIView,
 
   required init?(coder: NSCoder) {
     fatalError("init(coder:) has not been implemented")
+  }
+
+  override public func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+    super.traitCollectionDidChange(previousTraitCollection)
+    guard previousTraitCollection?.userInterfaceStyle != traitCollection.userInterfaceStyle else {
+      return
+    }
+    reapplyNativeThemeForCurrentInterfaceStyle()
   }
 
   deinit {
@@ -534,11 +543,26 @@ public final class ChatMainView: UIView,
   }
 
   func setAppearance(_ rawAppearance: [String: Any]) {
+    lastRawAppearance = rawAppearance
     appearance = ChatListAppearance.from(raw: rawAppearance)
     chatListView.setAppearance(rawAppearance)
     applyTheme()
     updateHeaderTexts()
     updateProfileTexts()
+  }
+
+  private func reapplyNativeThemeForCurrentInterfaceStyle() {
+    guard var rawAppearance = lastRawAppearance,
+      rawAppearance["nativeThemeId"] != nil
+    else {
+      applyTheme()
+      updateHeaderTexts()
+      updateProfileTexts()
+      return
+    }
+
+    rawAppearance["nativeThemeIsDark"] = traitCollection.userInterfaceStyle == .dark
+    setAppearance(rawAppearance)
   }
 
   func setContentPaddingBottom(_ value: Double) {

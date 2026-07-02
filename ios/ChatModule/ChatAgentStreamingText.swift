@@ -303,7 +303,6 @@ enum ChatNativeAgentTextRenderer {
       if let url = URL(string: urlString) {
         mutable.addAttribute(.link, value: url, range: replacedRange)
         mutable.addAttribute(.foregroundColor, value: UIColor.systemBlue, range: replacedRange)
-        mutable.addAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, range: replacedRange)
       }
     }
 
@@ -355,7 +354,7 @@ enum ChatNativeAgentTextRenderer {
           var linkAttrs = baseAttrs
           linkAttrs[.link] = url
           linkAttrs[.foregroundColor] = UIColor.systemBlue
-          linkAttrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
+          // Modern compact look without underline
           mutable.replaceCharacters(
             in: m.range,
             with: NSAttributedString(string: display, attributes: linkAttrs)
@@ -370,10 +369,7 @@ enum ChatNativeAgentTextRenderer {
   private static func cleanURLDisplay(_ url: URL) -> String {
     guard let host = url.host else { return url.absoluteString }
     let h = host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
-    let path = url.path
-    guard !path.isEmpty, path != "/" else { return h }
-    let p = path.count > 28 ? String(path.prefix(28)) + "\u{2026}" : path
-    return h + p
+    return "\(h) ↗"
   }
 
   static func measuredHeight(
@@ -1670,23 +1666,7 @@ final class AgentIntegrationPackView: UIControl, UIGestureRecognizerDelegate {
     availableWidth: CGFloat,
     storageKey: String? = nil
   ) -> CGFloat {
-    guard isExpanded(pack: pack, storageKey: storageKey) else { return collapsedHeight }
-
-    let horizontalPadding: CGFloat = 12.0
-    let environmentWidth = max(1.0, availableWidth - (horizontalPadding * 4.0) - 34.0)
-    let environmentFont = UIFont.monospacedSystemFont(ofSize: 12.0, weight: .regular)
-    let environmentHeight = ceil(
-      (pack.environment as NSString).boundingRect(
-        with: CGSize(width: environmentWidth, height: .greatestFiniteMagnitude),
-        options: [.usesLineFragmentOrigin, .usesFontLeading],
-        attributes: [.font: environmentFont],
-        context: nil
-      ).height
-    )
-    let endpointCount = [pack.eventsURL, pack.invokeURL].compactMap { $0 }.count
-    let endpointsHeight: CGFloat = endpointCount > 0 ? CGFloat(endpointCount) * 19.0 : 0.0
-    return collapsedHeight + 1.0 + 30.0 + max(42.0, environmentHeight + 20.0)
-      + (endpointCount > 0 ? 30.0 + endpointsHeight : 0.0) + 12.0
+    return collapsedHeight
   }
 
   private static func resolvedStorageKey(
@@ -1796,11 +1776,11 @@ final class AgentIntegrationPackView: UIControl, UIGestureRecognizerDelegate {
     let identity = pack.username.map { "@\($0)" } ?? pack.displayName
     subtitleLabel.text = "\(identity)  •  \(pack.status.capitalized)"
     subtitleLabel.textColor = textColor.withAlphaComponent(0.62)
-    actionLabel.text = isExpanded ? "Close" : "Open"
+    actionLabel.text = "Open"
     actionLabel.textColor = accent
     chevronView.tintColor = accent
     chevronView.image = UIImage(
-      systemName: isExpanded ? "chevron.up" : "chevron.down",
+      systemName: "chevron.right",
       withConfiguration: UIImage.SymbolConfiguration(pointSize: 10.0, weight: .semibold)
     )
     dividerView.backgroundColor = textColor.withAlphaComponent(0.10)
@@ -1817,11 +1797,12 @@ final class AgentIntegrationPackView: UIControl, UIGestureRecognizerDelegate {
     endpointsLabel.textColor = accent
 
     let hasEndpoints = !(endpointsLabel.text ?? "").isEmpty
-    dividerView.isHidden = !isExpanded
-    environmentTitleLabel.isHidden = !isExpanded
-    environmentView.isHidden = !isExpanded
-    endpointsTitleLabel.isHidden = !isExpanded || !hasEndpoints
-    endpointsLabel.isHidden = !isExpanded || !hasEndpoints
+    _ = hasEndpoints
+    dividerView.isHidden = true
+    environmentTitleLabel.isHidden = true
+    environmentView.isHidden = true
+    endpointsTitleLabel.isHidden = true
+    endpointsLabel.isHidden = true
 
     let height = Self.measuredHeight(
       pack: pack,
@@ -1898,21 +1879,12 @@ final class AgentIntegrationPackView: UIControl, UIGestureRecognizerDelegate {
 
   @objc private func handleToggle() {
     guard let pack = currentPack else { return }
-    isExpanded.toggle()
-    if isExpanded {
-      Self.expandedStorageKeys.insert(currentStorageKey)
-    } else {
-      Self.expandedStorageKeys.remove(currentStorageKey)
-    }
-    _ = configure(
-      pack: pack,
-      textColor: currentTextColor,
-      availableWidth: currentAvailableWidth,
-      storageKey: currentStorageKey
+    NotificationCenter.default.post(
+      name: Notification.Name("AgentIntegrationPackOpenPanelNotification"),
+      object: nil,
+      userInfo: ["agentId": pack.agentId, "username": pack.username ?? pack.displayName]
     )
     UIImpactFeedbackGenerator(style: .light).impactOccurred()
-    NotificationCenter.default.post(name: Notification.Name("AgentCodeBlockExpanded"), object: nil)
-    NotificationCenter.default.post(name: .chatNativeStreamingTextLayoutInvalidated, object: self)
   }
 
   @objc private func handleCopy() {
@@ -1938,6 +1910,7 @@ final class AgentCodeBlockView: UIView {
   private let cardView = UIView()
   private let topBarView = UIView()
   private let langLabel = UILabel()
+  private let scrollView = UIScrollView()
   private let codeLabel = UILabel()
   private let copyButton = UIButton(type: .system)
   private let expandButton = UIButton(type: .system)
@@ -1983,12 +1956,17 @@ final class AgentCodeBlockView: UIView {
     langLabel.textColor = UIColor(white: 0.65, alpha: 0.9)
     topBarView.addSubview(langLabel)
 
+    scrollView.showsHorizontalScrollIndicator = false
+    scrollView.showsVerticalScrollIndicator = false
+    scrollView.bounces = true
+    cardView.addSubview(scrollView)
+
     codeLabel.numberOfLines = 0
     codeLabel.backgroundColor = .clear
-    cardView.addSubview(codeLabel)
+    scrollView.addSubview(codeLabel)
 
     let cfg = UIImage.SymbolConfiguration(pointSize: 12.0, weight: .medium)
-    copyButton.setImage(UIImage(systemName: "doc.on.doc", withConfiguration: cfg), for: .normal)
+    copyButton.setImage(UIImage(systemName: "square.on.square", withConfiguration: cfg), for: .normal)
     copyButton.tintColor = UIColor(white: 0.65, alpha: 0.9)
     copyButton.addTarget(self, action: #selector(handleCopy), for: .touchUpInside)
     topBarView.addSubview(copyButton)
@@ -2061,10 +2039,12 @@ final class AgentCodeBlockView: UIView {
     }
     codeLabel.attributedText = attributed
 
-    let textHeight = ceil(attributed.boundingRect(
-      with: CGSize(width: labelWidth, height: .greatestFiniteMagnitude),
+    let textBounds = attributed.boundingRect(
+      with: CGSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude),
       options: [.usesLineFragmentOrigin, .usesFontLeading], context: nil
-    ).height)
+    )
+    let textWidth = ceil(textBounds.width)
+    let textHeight = ceil(textBounds.height)
     let bodyH = max(ceil(codeFont.lineHeight), textHeight)
     let cardH = barH + vPad + bodyH + vPad
 
@@ -2096,7 +2076,9 @@ final class AgentCodeBlockView: UIView {
     expandButton.setImage(UIImage(systemName: expandIcon, withConfiguration: expandCfg), for: .normal)
     expandButton.isHidden = totalLineCount <= maxCollapsedLines
 
-    codeLabel.frame = CGRect(x: hPad, y: barH + vPad, width: labelWidth, height: bodyH)
+    scrollView.frame = CGRect(x: 0, y: barH, width: cardWidth, height: cardH - barH)
+    scrollView.contentSize = CGSize(width: textWidth + hPad * 2, height: bodyH + vPad * 2)
+    codeLabel.frame = CGRect(x: hPad, y: vPad, width: textWidth, height: bodyH)
     return outerH + cardH + 8.0
   }
 

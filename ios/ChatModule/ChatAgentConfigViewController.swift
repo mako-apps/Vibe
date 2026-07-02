@@ -40,7 +40,7 @@ final class ChatAgentConfigViewController: UIViewController {
     static let cardBackground = UIColor(red: 0.17, green: 0.17, blue: 0.18, alpha: 1.0)
     static let primaryText = UIColor.white
     static let secondaryText = UIColor(white: 0.65, alpha: 1.0)
-    static let accent = UIColor(red: 0.49, green: 0.36, blue: 0.88, alpha: 1.0)
+    static let accent = ChatListAppearance.brandAccentFallback
   }
 
   private let toolOptions: [(id: String, title: String, subtitle: String)] = [

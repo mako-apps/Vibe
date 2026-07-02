@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "vibeask": {
+      "command": "node",
+      "args": ["/Users/mohammadshayani/.vibe/vibe-ask-mcp.js"]
+    }
+  }
+}

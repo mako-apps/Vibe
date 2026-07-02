@@ -2006,6 +2006,36 @@ final class ChatEngine {
     }
   }
 
+  /// The `agentBridgeAsk` userInfo for a still-outstanding, not-yet-claimed ask/command on
+  /// `chatId` (matching `provider` when both sides name one), or nil. A chat surface calls this
+  /// when it becomes visible to re-present an ask that arrived while it was off-screen: the
+  /// on-screen-chat presentation gate skips asks for a chat that isn't front, and a plain DM
+  /// open doesn't reload history, so the bridge's history-open re-emit never fires for it.
+  /// Typically at most one ask blocks a chat at a time; returns the first outstanding match.
+  func outstandingAgentBridgeAskInfo(chatId rawChatId: String, provider rawProvider: String?)
+    -> [AnyHashable: Any]?
+  {
+    let chatId = normalizedString(rawChatId) ?? ""
+    guard !chatId.isEmpty else { return nil }
+    let provider = (rawProvider ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return syncOnQueue {
+      for (rid, payload) in agentBridgeAskByRequestId {
+        guard (normalizedString(payload["chatId"]) ?? "") == chatId else { continue }
+        if presentedAskRequestIds.contains(rid) { continue }
+        let p = (normalizedString(payload["provider"]) ?? "").lowercased()
+        if !provider.isEmpty, !p.isEmpty, p != provider { continue }
+        return [
+          "chatId": chatId,
+          "requestId": rid,
+          "kind": normalizedString(payload["kind"]) ?? "ask",
+          "provider": normalizedString(payload["provider"]) ?? provider,
+          "reason": "agentBridgeAsk",
+        ]
+      }
+      return nil
+    }
+  }
+
   /// Reply to a bridge-issued ask. `decision` ∈ "approve" | "reject" | "answer".
   /// `answer` (any JSON-serializable dict) is sealed E2E with the pairing key so
   /// the server only relays an opaque blob; the bridge resolves the pending ask.

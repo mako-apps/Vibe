@@ -3535,6 +3535,17 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     return nil
   }
 
+  override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+    super.traitCollectionDidChange(previousTraitCollection)
+    guard previousTraitCollection?.userInterfaceStyle != traitCollection.userInterfaceStyle else {
+      return
+    }
+    applyTheme()
+    tableView.reloadData()
+    layoutHeroHeaderViewIfNeeded(force: true)
+    renderSwiftUIProfile()
+  }
+
   deinit {
     bridgeStatusTask?.cancel()
     bridgeStatusRefreshWorkItem?.cancel()

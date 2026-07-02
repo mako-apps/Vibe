@@ -221,7 +221,7 @@ private final class VideoNoteRecorderViewController: UIViewController,
     circleSpinner.startAnimating()
     circleContainer.addSubview(circleSpinner)
 
-    progressLayer.strokeColor = UIColor(red: 0.49, green: 0.36, blue: 0.88, alpha: 1.0).cgColor
+    progressLayer.strokeColor = ChatListAppearance.brandAccentFallback.cgColor
     progressLayer.lineWidth = 4
     progressLayer.fillColor = UIColor.clear.cgColor
     progressLayer.lineCap = .round
@@ -1148,7 +1148,7 @@ final class ChatInputBar: UIView {
     replyBanner.alpha = 0
     pillContainer.addSubview(replyBanner)
 
-    replyAccentBar.backgroundColor = UIColor(red: 0.49, green: 0.36, blue: 0.88, alpha: 1.0)
+    replyAccentBar.backgroundColor = ChatListAppearance.brandAccentFallback
     replyAccentBar.layer.cornerRadius = 1.5
     replyAccentBar.layer.cornerCurve = .continuous
     replyBanner.addSubview(replyAccentBar)
@@ -1179,7 +1179,7 @@ final class ChatInputBar: UIView {
     mentionBanner.addGestureRecognizer(mentionTap)
     pillContainer.addSubview(mentionBanner)
 
-    mentionAccentBar.backgroundColor = UIColor(red: 0.49, green: 0.36, blue: 0.88, alpha: 1.0)
+    mentionAccentBar.backgroundColor = ChatListAppearance.brandAccentFallback
     mentionAccentBar.layer.cornerRadius = 1.5
     mentionAccentBar.layer.cornerCurve = .continuous
     mentionBanner.addSubview(mentionAccentBar)
@@ -1290,7 +1290,7 @@ final class ChatInputBar: UIView {
     textView.tintColor = UIColor(white: 0.87, alpha: 0.9)
     placeholderLabel.textColor = UIColor(white: 0.87, alpha: 0.45)
     sendGradient.colors = [
-      UIColor(red: 0.49, green: 0.36, blue: 0.88, alpha: 1.0).cgColor,
+      ChatListAppearance.brandAccentFallback.cgColor,
       UIColor(red: 0.42, green: 0.31, blue: 0.81, alpha: 1.0).cgColor,
     ]
 
@@ -1355,7 +1355,7 @@ final class ChatInputBar: UIView {
     // Mention suggestion banner (inside pill)
     mentionBanner.backgroundColor = .clear
     mentionAccentBar.backgroundColor =
-      a.bubbleMeGradient.first ?? UIColor(red: 0.49, green: 0.36, blue: 0.88, alpha: 1.0)
+      a.bubbleMeGradient.first ?? ChatListAppearance.brandAccentFallback
     mentionNameLabel.textColor = a.textColorThem.withAlphaComponent(0.92)
     mentionDescLabel.textColor = a.textColorThem.withAlphaComponent(0.72)
 
@@ -2797,7 +2797,7 @@ final class ChatInputBar: UIView {
     guard mentionActive != active else { return }
     mentionActive = active
     let agentColor =
-      appearance.bubbleMeGradient.first ?? UIColor(red: 0.49, green: 0.36, blue: 0.88, alpha: 1.0)
+      appearance.bubbleMeGradient.first ?? ChatListAppearance.brandAccentFallback
     UIView.animate(withDuration: 0.25, delay: 0, options: [.curveEaseOut, .beginFromCurrentState]) {
       if active {
         self.pillGlass.layer.borderColor = agentColor.withAlphaComponent(0.55).cgColor
@@ -3779,7 +3779,7 @@ extension ChatInputBar: UITextViewDelegate {
         let matches = regex.matches(in: textString, options: [], range: fullRange)
         let highlightColor =
           appearance.bubbleMeGradient.last
-          ?? UIColor(red: 0.49, green: 0.36, blue: 0.88, alpha: 1.0)
+          ?? ChatListAppearance.brandAccentFallback
         for match in matches {
           textStorage.addAttribute(.foregroundColor, value: highlightColor, range: match.range)
         }

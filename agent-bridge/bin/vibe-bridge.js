@@ -3567,11 +3567,15 @@ function attachTurnActions(messages, host, uids, detailByUid, resultByUid) {
   for (const uid of uids) {
     const det = detailByUid.get(uid);
     if (!det) continue;
+    let hasResult = true;
     if (OUTPUT_KINDS.has(det.kind)) {
       const r = resultByUid.get(uid);
       if (r) { det.output = r.output; det.isError = r.isError; }
+      else hasResult = false;
     }
-    nodes.push(actionNode(det, uid, det.isError ? "error" : "done"));
+    // No tool_result yet = the tool is still executing. Shipping "done" here made
+    // the phone's expand sheet show an empty "Success" mid-run.
+    nodes.push(actionNode(det, uid, det.isError ? "error" : hasResult ? "done" : "running"));
     actions.push(Object.assign({ id: String(uid) }, det));
   }
   if (!nodes.length) return;
@@ -3634,11 +3638,15 @@ function foldTurnIntoHost(messages, turnItems, detailByUid, resultByUid, turnRea
     }
     const det = detailByUid.get(it.uid);
     if (!det) continue;
+    let hasResult = true;
     if (OUTPUT_KINDS.has(det.kind)) {
       const r = resultByUid.get(it.uid);
       if (r) { det.output = r.output; det.isError = r.isError; }
+      else hasResult = false;
     }
-    nodes.push(actionNode(det, it.uid, det.isError ? "error" : "done"));
+    // No tool_result yet = still executing (a live turn's trailing tool). "done"
+    // here rendered an empty "Success" in the phone's expand sheet mid-run.
+    nodes.push(actionNode(det, it.uid, det.isError ? "error" : hasResult ? "done" : "running"));
     actions.push(Object.assign({ id: String(it.uid) }, det));
   }
 
@@ -4069,7 +4077,24 @@ function markDetailLiveTurn(result, provider, sessionId, chatId) {
 function markMessageRunning(message) {
   if (!message || typeof message !== "object") return message;
   message.running = true;
-  const nodes = Array.isArray(message.progressNodes) ? message.progressNodes : [];
+  let nodes = Array.isArray(message.progressNodes) ? message.progressNodes : [];
+  // The phone SUPPRESSES the message body while a turn is live, and foldTurnIntoHost
+  // routes the turn's LAST text into that body (it's the "summary"). Mid-run the
+  // newest narration IS the last text, so it vanished from the live feed entirely
+  // (textNodes=0 while bodyLen>0). Move the body into a trailing text node while
+  // running; the post-close re-read re-folds and restores the body-outside-card shape.
+  const body = String(message.text || "").trim();
+  if (body) {
+    nodes = nodes.concat([{
+      id: "live-tail-" + String(message.uid || "0"),
+      label: clipText(body, 4000),
+      kind: "text",
+      status: "done",
+      depth: 0,
+    }]);
+    message.text = "";
+    message.progressNodes = nodes;
+  }
   for (let i = nodes.length - 1; i >= 0; i--) {
     const node = nodes[i];
     if (!node || typeof node !== "object") continue;
@@ -4181,11 +4206,19 @@ function startHistoryWatch(channel, { chatId, provider, sessionId, echo }) {
         // growing. Fold the node count into the dedup signature so each new step
         // re-pushes — keying on text length alone left the feed frozen between the
         // narration paragraphs that bracket a burst of tool calls.
+        // Node LABEL length rides the sig too: while live, the trailing narration
+        // grows inside a text node's label (markMessageRunning moves the body there),
+        // so text-length + node-count alone would freeze the feed mid-paragraph.
+        const nodeSig = (m) =>
+          Array.isArray(m && m.progressNodes)
+            ? m.progressNodes.length + "." +
+              m.progressNodes.reduce((a, n) => a + String((n && n.label) || "").length + (String((n && n.status) || "") === "running" ? 1 : 0), 0)
+            : "0";
         const sig =
           msgs.length + ":" +
           (last
             ? (last.uid || "") + ":" + String(last.text || "").length +
-              ":" + (Array.isArray(last.progressNodes) ? last.progressNodes.length : 0)
+              ":" + nodeSig(last)
             : 0) +
           ":" + (running ? "run" : "done");
         if (sig !== rec.lastSig) {
