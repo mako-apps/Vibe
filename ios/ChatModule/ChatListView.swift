@@ -1453,10 +1453,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       if let agentVC = self.presentedBridgeAgentVC {
         agentVC.setMessages(VibeAgentKitMap.messages(from: parsed))
       }
-      // Keep the DM agent composer's trailing control (SEND vs STOP) in sync with the
-      // live state of the rows — a streaming/running turn forces STOP so the user can
-      // interrupt it. The full-page runtime view drives its own composer separately.
-      self.agentComposerView?.setTaskActive(self.agentComposerHasLiveTask())
       self.pruneMessageSelection(for: parsed)
       let engineChatId = self.engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
       let resolvedChatId: String
@@ -2911,6 +2907,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           guard let nodeId = payload["nodeId"] as? String else { return }
           self.presentAgentTurnSubagentView(row: row, parentNodeId: nodeId)
           return
+        case "openAgentTurnDetail":
+          self.presentAgentTurnDetailView(row: row)
+          return
         case "agentReviewTapped":
           guard let runtime = row.agentRuntime else { return }
           self.presentAgentRuntimeTask(row: row, runtime: runtime)
@@ -3143,12 +3142,41 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       running: running,
       appearance: VibeAgentKitMap.appearance(for: traitCollection)
     )
-    detail.modalPresentationStyle = .pageSheet
-    if let sheet = detail.sheetPresentationController {
+    let nav = UINavigationController(rootViewController: detail)
+    nav.modalPresentationStyle = .pageSheet
+    if let sheet = nav.sheetPresentationController {
       sheet.detents = [.medium(), .large()]
       sheet.prefersGrabberVisible = true
     }
-    presenter.present(detail, animated: true)
+    presenter.present(nav, animated: true)
+  }
+
+  /// Open the WHOLE agent turn's progress in the same glass sheet — the "Worked for… /
+  /// Working" header tap. Reuses the subagent detail VC (glass + shared renderer) with the
+  /// full turn's step feed and answer body, so nothing renders through a second layout path.
+  private func presentAgentTurnDetailView(row: ChatListRow) {
+    guard let presenter = topPresentingViewController() else { return }
+    let message = VibeAgentKitMap.chatMessage(from: row)
+    let toolStepCount = message.progressItems.filter { $0.itemType != "text" }.count
+    let title = message.isStreaming
+      ? "Working…"
+      : VibeAgentKitAssistantMessageBodyView.workedSummary(
+        stepCount: toolStepCount, durationMs: message.runtime?.durationMs)
+    let detail = VibeAgentSubagentDetailViewController(
+      subagentType: "",
+      titleOverride: title,
+      bodyText: resoloAssistantDisplayText(for: message),
+      progressItems: message.progressItems,
+      running: message.isStreaming,
+      appearance: VibeAgentKitMap.appearance(for: traitCollection)
+    )
+    let nav = UINavigationController(rootViewController: detail)
+    nav.modalPresentationStyle = .pageSheet
+    if let sheet = nav.sheetPresentationController {
+      sheet.detents = [.medium(), .large()]
+      sheet.prefersGrabberVisible = true
+    }
+    presenter.present(nav, animated: true)
   }
 
   /// Re-runs the current row payload through `setRows` so a Stage-2 agent-turn state
@@ -5408,47 +5436,23 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         contentPaddingBottom = sectionBottomInset
         updateBottomAnchorInset()
       }
+      // The default chat list always uses the normal ChatInputBar. Agent chats
+      // (agentChatMode or an inline Claude/Codex bridge DM) get their agent-specific
+      // controls (repo chip, slash commands, Report/Permission/History menu, STOP-on-
+      // stream) via ChatInputBar.setAgentControlMode(true) — the dedicated VibeComposerView
+      // input stays exclusive to the full-page agent runtime view (VibeAgentConversationView).
       let isAgent = agentChatMode || currentBridgeProvider != nil
-      if isAgent {
-        let bar = VibeComposerView()
-        bar.placeholder = inputBarPlaceholder
-        bar.applyAppearance(appearance.isDark ? VibeAgentKitChatAppearance.fallback : VibeAgentKitChatAppearance.lightFallback)
-        bar.provider = currentBridgeProvider ?? "codex"
-        bar.onSend = { [weak self] text, options in
-            self?.inputBarDidSend(text: text)
-        }
-        bar.onAttach = { [weak self] in
-            self?.inputBarDidTapAttachment()
-        }
-        bar.onHeightChanged = { [weak self] height in
-            self?.inputBarHeightDidChange()
-        }
-        // While a bridge task is live the composer's trailing control becomes STOP — tapping
-        // it cancels the running run. Without this wiring (the agent surface uses this
-        // VibeComposerView, NOT `inputBar`) the STOP button never appeared and never fired.
-        bar.onStop = { [weak self] in
-            self?.agentComposerStopActiveTask()
-        }
-        agentComposerView = bar
-        addSubview(bar)
-        // Seed the trailing control immediately so a composer created mid-run shows STOP.
-        bar.setTaskActive(agentComposerHasLiveTask())
+      let bar = ChatInputBar()
+      bar.delegate = self
+      bar.placeholder = inputBarPlaceholder
+      bar.applyAppearance(appearance)
+      bar.setAgentStreaming(agentStreaming)
+      bar.setAgentControlMode(isAgent)
+      inputBar = bar
+      addSubview(bar)
 
-        inputBar?.removeFromSuperview()
-        inputBar = nil
-      } else {
-        let bar = ChatInputBar()
-        bar.delegate = self
-        bar.placeholder = inputBarPlaceholder
-        bar.applyAppearance(appearance)
-        bar.setAgentStreaming(agentStreaming)
-        bar.setAgentControlMode(false)
-        inputBar = bar
-        addSubview(bar)
-
-        agentComposerView?.removeFromSuperview()
-        agentComposerView = nil
-      }
+      agentComposerView?.removeFromSuperview()
+      agentComposerView = nil
       updateAgentBridgeControlTitle()
 
       positionTransitionOverlayHost()
@@ -5504,39 +5508,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
   }
 
-  /// True when this DM agent surface has a live/streaming turn — used to force the
-  /// composer's trailing control to STOP. Mirrors the full-page view's `isLive` check.
-  private func agentComposerHasLiveTask() -> Bool {
-    guard agentChatMode || currentBridgeProvider != nil else { return false }
-    if agentStreaming { return true }
-    return rows.contains { bridgeRowIsLive($0) }
-  }
-
-  /// Composer STOP tapped on the DM agent surface: cancel the running bridge run. Mirrors
-  /// the full-page runtime view's `stopActiveTask` (chatId + provider + the live task id).
-  private func agentComposerStopActiveTask() {
-    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !chatId.isEmpty else {
-      NSLog("[ChatListView] agentComposerStop skipped — no chatId")
-      return
-    }
-    let provider = currentBridgeProvider ?? "codex"
-    let taskId = rows.first { bridgeRowIsLive($0) }?.agentRuntime?.taskId
-    var payload: [String: Any] = [
-      "chatId": chatId,
-      "provider": provider,
-      "action": "cancel",
-    ]
-    if let taskId, !taskId.isEmpty { payload["taskId"] = taskId }
-    NSLog("[ChatListView] agentComposerStop chat=%@ provider=%@ taskId=%@", chatId, provider, taskId ?? "nil")
-    _ = ChatEngine.shared.sendAgentBridgeControl(payload)
-  }
-
   func setAgentStreaming(_ streaming: Bool) {
     guard agentStreaming != streaming else { return }
     agentStreaming = streaming
     inputBar?.setAgentStreaming(streaming)
-    agentComposerView?.setTaskActive(streaming || agentComposerHasLiveTask())
     // Note: we deliberately do NOT clear the push-to-top spacer when the answer
     // finishes. Clearing it would drop `maxOffset` below the pinned offset for a
     // short answer, and the collection view would clamp the content downward —

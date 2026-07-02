@@ -88,6 +88,10 @@ struct ChatListRow {
     // carries `subagentType` (e.g. "explore") so it renders as a "🤖 Subagent" row.
     var parentId: String? = nil
     var subagentType: String? = nil
+    // Thinking-node metrics: reasoning token count + how long the turn spent thinking,
+    // so a "thinking" row renders "Thinking · N tokens" / "Thought for Ns" like the CLI.
+    var tokens: Int? = nil
+    var durationMs: Int? = nil
   }
 
   struct AgentRuntimeCommand: Equatable {
@@ -1393,7 +1397,9 @@ private func parseAgentProgressNodes(_ raw: Any?) -> [ChatListRow.AgentProgressN
       start: parseLong(item["start"]).map { Int($0) },
       end: parseLong(item["end"]).map { Int($0) },
       parentId: parseNonEmptyString(item["parentId"]),
-      subagentType: parseNonEmptyString(item["subagentType"])
+      subagentType: parseNonEmptyString(item["subagentType"]),
+      tokens: parseLong(item["tokens"]).map { Int($0) },
+      durationMs: parseLong(item["durationMs"]).map { Int($0) }
     )
   }
 

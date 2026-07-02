@@ -220,6 +220,10 @@ struct VibeAgentKitProgressItem: Equatable {
   // `parentId` and live only in the read-only subagent view.
   var parentId: String? = nil
   var subagentType: String? = nil
+  // Thinking-node metrics: reasoning token count + how long the turn spent thinking,
+  // so a "thinking" row can render "Thinking · N tokens" / "Thought for Ns".
+  var tokens: Int? = nil
+  var durationMs: Int? = nil
 
   static func from(label: String, raw: [String: Any]?, eventType: String = "progress")
     -> VibeAgentKitProgressItem

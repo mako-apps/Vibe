@@ -1058,9 +1058,13 @@ function buildCommand(provider, prompt, chatId, task) {
     if (model) args.push("-c", `model="${model}"`);
     args.push("-c", `model_reasoning_effort="${reasoning}"`);
     if (!resumeId) {
-      // Fresh runs only: exec-specific flags the resume subcommand doesn't accept.
-      // Ephemeral runs leave nothing to resume, so they're never used on resume.
-      args.push("--skip-git-repo-check", "--ephemeral");
+      // Fresh runs only: --skip-git-repo-check is an exec-only flag the `resume`
+      // subcommand rejects. We deliberately do NOT pass --ephemeral: an ephemeral
+      // run persists NO rollout to disk, so a later `codex exec resume <thread>`
+      // fails with "thread/resume failed: no rollout found for thread id … (-32600)".
+      // That broke every Codex follow-up and history-resume (the adopt/resume flow
+      // resumes the prior thread). Persisting the rollout is what makes resume work.
+      args.push("--skip-git-repo-check");
     }
     if (resumeId) args.push(resumeId);
     args.push(cleaned);
@@ -2473,6 +2477,18 @@ async function runTask(channel, task) {
     channel.push("error", { provider, chatId, message: `Unknown provider: ${provider}` });
     return;
   }
+  // Resume diagnostics: whether this run resumes a prior session/thread and, if so,
+  // which id — the key signal for "history send started a new chat" bugs.
+  {
+    const rid = resumeIdFor(task);
+    const resumeFlag = provider === "claude"
+      ? built.args.includes("--resume")
+      : built.args.includes("resume");
+    console.log(
+      `[vibe-bridge] resume ${provider} chat=${chatId} task=${taskId} ` +
+        `resumeId=${rid || "(none/fresh)"} resumeInArgs=${resumeFlag}`
+    );
+  }
 
   let child;
   try {
@@ -2583,7 +2599,19 @@ async function runTask(channel, task) {
       lineBuf = lineBuf.slice(idx + 1);
       if (!line) continue;
       const sid = captureSessionId(line);
-      if (sid) sessionByChat.set(chatId, sid);
+      if (sid) {
+        // Fork detection: if the run REPORTS a session id different from the one we
+        // asked it to resume, the CLI forked a new session (the reply then lands
+        // under an id the phone's history filter doesn't recognize → "new chat").
+        const askedResume = resumeIdFor(task);
+        if (askedResume && sid !== askedResume && sessionByChat.get(chatId) !== sid) {
+          console.log(
+            `[vibe-bridge] session FORK ${provider} chat=${chatId} ` +
+              `resumeAsked=${askedResume} reported=${sid}`
+          );
+        }
+        sessionByChat.set(chatId, sid);
+      }
       if (progressCount < MAX_PROGRESS_LINES && line.length <= MAX_LINE_BYTES && streamable(line)) {
         progressCount++;
         const now = Date.now();
@@ -3564,6 +3592,11 @@ function actionNode(detail, uid, status) {
   // show "Read foo.swift (12–48)" without needing the decrypted blob.
   if (typeof d.start === "number" && d.start > 0) node.start = d.start;
   if (typeof d.end === "number" && d.end > 0) node.end = d.end;
+  // Thinking metrics (plaintext, not sensitive): reasoning token count + how long
+  // the turn spent thinking, so the phone renders "Thinking · N tokens" / "Thought
+  // for Ns" like the desktop CLI.
+  if (typeof d.tokens === "number" && d.tokens > 0) node.tokens = d.tokens;
+  if (typeof d.durationMs === "number" && d.durationMs > 0) node.durationMs = d.durationMs;
   return node;
 }
 // Build a turn's progress nodes + sealed detail array and attach them to the
@@ -3604,28 +3637,48 @@ function attachTurnActions(messages, host, uids, detailByUid, resultByUid) {
 // `turnItems` is the ordered list captured during the turn:
 //   { type:"text", text, uid, ts }  |  { type:"tool", uid, ts }
 // Returns the host (already pushed onto `messages`) or null if the turn was empty.
-function foldTurnIntoHost(messages, turnItems, detailByUid, resultByUid, turnReasoning, hostFallbackUid) {
-  // The LAST non-empty text is the answer; it rides OUTSIDE the card.
+function foldTurnIntoHost(messages, turnItems, detailByUid, resultByUid, turnReasoning, hostFallbackUid, thinkingMeta) {
+  // The LAST non-empty text is the answer — but ONLY if the turn actually ENDS on
+  // it. If any tool action runs AFTER the last text, that text is interim narration
+  // ("I'll look at X" → then does X), not a closing answer. Mid-run the newest
+  // narration is always the "last text" while the tools it introduces are still
+  // arriving, so treating it as the summary yanked it out of the feed and
+  // markMessageRunning re-appended it at the BOTTOM — the phone showed
+  // [tools…, text] instead of [text, tools…], "healing" only once the next text
+  // arrived. Keeping interim narration inline (host.text left empty) makes the live
+  // feed read chronologically. The finished turn (answer genuinely last) is unchanged.
   let lastTextIndex = -1;
   for (let i = 0; i < turnItems.length; i++) {
     if (turnItems[i].type === "text" && String(turnItems[i].text || "").trim()) lastTextIndex = i;
   }
-  const summary = lastTextIndex >= 0 ? turnItems[lastTextIndex] : null;
+  let toolAfterLastText = false;
+  for (let i = lastTextIndex + 1; i < turnItems.length; i++) {
+    if (turnItems[i].type === "tool") { toolAfterLastText = true; break; }
+  }
+  const summary = (lastTextIndex >= 0 && !toolAfterLastText) ? turnItems[lastTextIndex] : null;
 
   const nodes = [];
   const actions = [];
-  // ONE "Thinking" node leads the turn's feed (reasoning rides the encrypted blob;
-  // the label stays the generic, leak-free "Thinking").
+  // ONE "Thinking" node leads the turn's feed (reasoning text rides the encrypted
+  // blob; the label stays the generic, leak-free "Thinking"). Emit it whenever the
+  // turn actually THOUGHT — Claude Code persists thinking with empty text (signature
+  // only), so keying on reasoning-text alone hid the node entirely. thinkingMeta
+  // carries the reasoning token count + how long the turn spent thinking so the row
+  // renders "Thinking · N tokens" / "Thought for Ns" like the desktop CLI.
   const reasoning = String(turnReasoning || "").trim();
-  if (reasoning) {
+  const meta = thinkingMeta || {};
+  if (reasoning || meta.had) {
     const tid = "think-host";
-    const det = { kind: "thinking", output: clipText(reasoning, MAX_ACTION_OUTPUT) };
+    const det = { kind: "thinking" };
+    if (reasoning) det.output = clipText(reasoning, MAX_ACTION_OUTPUT);
+    if (typeof meta.tokens === "number" && meta.tokens > 0) det.tokens = meta.tokens;
+    if (typeof meta.durationMs === "number" && meta.durationMs > 0) det.durationMs = meta.durationMs;
     nodes.push(actionNode(det, tid, "done"));
     actions.push(Object.assign({ id: tid }, det));
   }
   let textSeq = 0;
   for (let i = 0; i < turnItems.length; i++) {
-    if (i === lastTextIndex) continue;   // the answer rides OUTSIDE the card
+    if (summary && i === lastTextIndex) continue;   // the answer rides OUTSIDE the card
     const it = turnItems[i];
     if (it.type === "text") {
       // Interior narration → an in-card text node (phone renders it as prose,
@@ -3702,6 +3755,12 @@ async function claudeDetail(id, limit) {
   // Turn timespan (user prompt → last assistant event) → "Worked for Xs".
   let turnStartTs = null;
   let turnEndTs = null;
+  // Thinking metrics for the turn's ONE "Thinking" node: whether it thought at all
+  // (Claude persists empty-text thinking → presence, not text, is the signal), the
+  // reasoning token total, and a best-effort thinking duration (gap from the prior
+  // event to the thinking message — the wall-clock the model spent producing it).
+  let turnThinking = { had: false, tokens: 0, durationMs: 0 };
+  let lastEventTs = null;
   // Structured tool detail join: uid → {kind, command, …} and
   // tool_use_id → {output, isError}.
   const actionDetailByUid = new Map();
@@ -3709,7 +3768,7 @@ async function claudeDetail(id, limit) {
   // One card per user-turn: fold the turn's prose + tool feed into ONE host
   // message, then seal the edits/diff card onto it.
   const flushTurn = () => {
-    const host = foldTurnIntoHost(messages, turnItems, actionDetailByUid, resultByUid, turnReasoning, null);
+    const host = foldTurnIntoHost(messages, turnItems, actionDetailByUid, resultByUid, turnReasoning, null, turnThinking);
     if (host && pending.order.length) {
       sealHistoryRuntime("claude", host, pending, turnDurationMs(turnStartTs, turnEndTs));
     }
@@ -3718,6 +3777,7 @@ async function claudeDetail(id, limit) {
     turnReasoning = "";
     turnStartTs = null;
     turnEndTs = null;
+    turnThinking = { had: false, tokens: 0, durationMs: 0 };
   };
   await readJsonl(match.file, (ev) => {
     if (ev.type === "ai-title" && ev.aiTitle) topic = ev.aiTitle;
@@ -3787,6 +3847,21 @@ async function claudeDetail(id, limit) {
           .join("\n\n")
           .trim();
         if (think) turnReasoning += (turnReasoning ? "\n\n" : "") + think;
+        // Thinking metrics: presence (any thinking block, even empty text), reasoning
+        // tokens (this message's output ≈ reasoning tokens for a think-heavy step),
+        // and a best-effort duration = gap from the previous event to this message.
+        if (Array.isArray(m.content) && m.content.some((b) => b && b.type === "thinking")) {
+          turnThinking.had = true;
+          const outTok = Number(m.usage && (m.usage.output_tokens || m.usage.reasoning_output_tokens)) || 0;
+          if (outTok > 0) turnThinking.tokens += outTok;
+          if (ev.timestamp && lastEventTs) {
+            const dt = Date.parse(ev.timestamp) - Date.parse(lastEventTs);
+            if (dt > 0 && dt < 600000) turnThinking.durationMs += dt;
+          }
+        }
+        // Advance the "previous event" marker across assistant messages so the next
+        // thinking step measures its gap from this one (≈ generation wall-clock).
+        if (ev.timestamp) lastEventTs = ev.timestamp;
         // Subagent (sidechain) events carry the parent Task's tool_use id; tag the
         // child detail so it groups under the Task (depth 1) like the live path.
         const parentToolUseId =
@@ -3921,6 +3996,9 @@ async function codexDetail(id, limit) {
   // Turn timespan (user prompt → last assistant message) → "Worked for Xs".
   let turnStartTs = null;
   let turnEndTs = null;
+  // Thinking metrics for the turn's ONE "Thinking" node (see claudeDetail).
+  let turnThinking = { had: false, tokens: 0, durationMs: 0 };
+  let lastEventTs = null;
   // Structured tool detail join. Codex references a call by `call_id` in the
   // separate output item, while the action entry is keyed by the message uid —
   // so callIdToUid bridges output → entry.
@@ -3928,7 +4006,7 @@ async function codexDetail(id, limit) {
   const resultByUid = new Map();
   const callIdToUid = new Map();
   const flushTurn = () => {
-    const host = foldTurnIntoHost(messages, turnItems, actionDetailByUid, resultByUid, turnReasoning, null);
+    const host = foldTurnIntoHost(messages, turnItems, actionDetailByUid, resultByUid, turnReasoning, null, turnThinking);
     if (host && pending.order.length) {
       sealHistoryRuntime("codex", host, pending, turnDurationMs(turnStartTs, turnEndTs));
     }
@@ -3937,6 +4015,7 @@ async function codexDetail(id, limit) {
     turnReasoning = "";
     turnStartTs = null;
     turnEndTs = null;
+    turnThinking = { had: false, tokens: 0, durationMs: 0 };
   };
   await readJsonl(match.file, (ev) => {
     if (ev.type === "session_meta" && ev.payload) project = ev.payload.cwd || "";
@@ -3972,6 +4051,14 @@ async function codexDetail(id, limit) {
         ? p.summary.map((s) => (s && s.text ? String(s.text) : "")).filter(Boolean).join("\n")
         : "").trim();
       if (think) turnReasoning += (turnReasoning ? "\n\n" : "") + think;
+      // Presence + best-effort duration for the turn's Thinking node (Codex reasoning
+      // items rarely carry per-item token counts, so tokens usually stay 0 → the row
+      // shows "Thinking" / "Thought for Ns" without a token suffix).
+      turnThinking.had = true;
+      if (ev.timestamp && lastEventTs) {
+        const dt = Date.parse(ev.timestamp) - Date.parse(lastEventTs);
+        if (dt > 0 && dt < 600000) turnThinking.durationMs += dt;
+      }
     } else if (p.type === "function_call" || p.type === "custom_tool_call") {
       // Collect the tool call for the current turn IN ORDER (output joins via call_id).
       turnItems.push({ type: "tool", uid: dkey, ts: ev.timestamp });
@@ -3981,6 +4068,8 @@ async function codexDetail(id, limit) {
       const uid = p.call_id ? callIdToUid.get(p.call_id) : null;
       if (uid) resultByUid.set(uid, { output: clipText(codexOutputText(p.output), MAX_ACTION_OUTPUT), isError: false });
     }
+    // Advance the "previous event" marker so the next reasoning step measures its gap.
+    if (ev.timestamp) lastEventTs = ev.timestamp;
   });
   flushTurn();
   // Topic from the FULL set (the opening message), then keep the most recent

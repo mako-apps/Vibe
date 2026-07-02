@@ -896,6 +896,10 @@ struct ChatMessageBubbleLayoutMetrics {
   let hasLinkPreview: Bool
   let usesBottomMetaLayout: Bool
   let usesRichTextLayout: Bool
+  // True only for a compact "thinking" agent turn (loader-only, no steps / text yet):
+  // the bubble hugs the shimmer line and is centered in the row instead of stretched to
+  // the full agent width. Defaulted so every existing call site is unaffected.
+  var agentTurnCentered: Bool = false
 }
 
 private struct ChatBubbleMetaWidths {
@@ -1405,8 +1409,41 @@ private struct BubbleLinkPreviewData {
 // Mirrors the agent view's `agentNodeDisplayLabel` so the in-bubble compact feed
 // reads identically to the full agent view. Kept at file scope (not private to a
 // cell) so history rendering can reuse the same parsing style.
+// "2s", "1m 5s" — thinking duration in the CLI's compact style.
+func chatAgentThinkingDurationText(_ ms: Int) -> String {
+  let totalSeconds = max(1, ms / 1000)
+  if totalSeconds < 60 { return "\(totalSeconds)s" }
+  let minutes = totalSeconds / 60
+  let seconds = totalSeconds % 60
+  return seconds > 0 ? "\(minutes)m \(seconds)s" : "\(minutes)m"
+}
+
+// "639 tokens", "12.3k tokens" — reasoning token count, compact.
+func chatAgentTokenCountText(_ tokens: Int) -> String {
+  if tokens >= 1000 {
+    let thousands = Double(tokens) / 1000.0
+    return String(format: "%.1fk tokens", thousands)
+  }
+  return "\(tokens) tokens"
+}
+
 func chatAgentNodeCompactLabel(_ node: ChatListRow.AgentProgressNode) -> String {
   guard let kind = node.kind, !kind.isEmpty else { return node.label }
+  // Thinking rows read like the desktop CLI: "Thinking · N tokens" while the model is
+  // still reasoning, "Thought for Ns · N tokens" once the step settles.
+  if kind == "thinking" {
+    let isRunning = ["running", "streaming"].contains(node.status.lowercased())
+    var parts: [String] = []
+    if !isRunning, let ms = node.durationMs, ms >= 1000 {
+      parts.append("Thought for \(chatAgentThinkingDurationText(ms))")
+    } else {
+      parts.append("Thinking")
+    }
+    if let tokens = node.tokens, tokens > 0 {
+      parts.append(chatAgentTokenCountText(tokens))
+    }
+    return parts.joined(separator: " · ")
+  }
   let verb: String
   switch kind {
   case "read": verb = "Read"
@@ -2198,6 +2235,41 @@ private final class BubbleLinkPreviewView: UIView {
   }
 }
 
+/// True while an agent turn is a bare "thinking" state — streaming, no final answer, and
+/// nothing renderable in the feed yet (no tool/task steps, no narration text nodes, no
+/// answer body). This is the only state that should hug + center; the moment a step or
+/// prose arrives the bubble expands to the full agent width like every other turn.
+func agentTurnBubbleIsCompactThinking(_ row: ChatListRow) -> Bool {
+  let message = VibeAgentKitMap.chatMessage(from: row)
+  guard message.isStreaming, !message.hasFinalResponseText else { return false }
+  let hasRenderableProgress = message.progressItems.contains { item in
+    if item.itemType == "text" {
+      return !item.label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+    return true
+  }
+  if hasRenderableProgress { return false }
+  return resoloAssistantDisplayText(for: message)
+    .trimmingCharacters(in: .whitespacesAndNewlines)
+    .isEmpty
+}
+
+/// Width the compact "thinking" bubble should hug: the shimmer line (icon + label) plus a
+/// little slack, capped by the caller at maxContentWidth. Mirrors the loader's own text
+/// choice + font (systemFont 14.5 medium) so the bubble tracks the shimmer without
+/// clipping it.
+func agentTurnCompactHugWidth(_ row: ChatListRow) -> CGFloat {
+  let message = VibeAgentKitMap.chatMessage(from: row)
+  let label = message.progressItems.last(where: { $0.itemType != "text" })?.label
+    ?? message.progress.last
+    ?? "Thinking"
+  let font = UIFont.systemFont(ofSize: 14.5, weight: .medium)
+  let textWidth = (label as NSString).size(withAttributes: [.font: font]).width
+  // activity icon (15) + stack spacing (6) + small slack so the shimmer never clips.
+  let affordance: CGFloat = 15.0 + 6.0 + 14.0
+  return ceil(textWidth) + affordance
+}
+
 func measureMessageBubbleLayout(
   row: ChatListRow, rowWidth: CGFloat, agentTurnState: AgentTurnBubbleState = AgentTurnBubbleState()
 )
@@ -2234,9 +2306,18 @@ func measureMessageBubbleLayout(
     // Agent turns get a wider, tighter-padded shell than a plain text bubble (see the
     // agentTurn* constants) so the dense step/narration/diff feed has room to breathe.
     let agentMaxBubbleWidth = floor(rowWidth * agentTurnMaxWidthFactor)
-    let contentWidth = max(1.0, agentMaxBubbleWidth - (agentTurnHorizontalPadding * 2.0))
+    let maxContentWidth = max(1.0, agentMaxBubbleWidth - (agentTurnHorizontalPadding * 2.0))
+    // A live turn that is only "thinking" (no tool steps, no narration, no answer body
+    // yet) shouldn't inflate to the full agent width — hug the shimmer line and center the
+    // bubble in the row so the tiny loader isn't marooned in a huge empty shell. As soon
+    // as real content streams in it stops being compact and expands to maxContentWidth.
+    let compact = agentTurnBubbleIsCompactThinking(row)
+    let contentWidth = compact
+      ? min(maxContentWidth, agentTurnCompactHugWidth(row))
+      : maxContentWidth
     // Colors don't affect layout metrics, so a fixed appearance is fine for measurement
-    // even though the live render uses the trait-matched one.
+    // even though the live render uses the trait-matched one. Measure at the SAME width we
+    // set below so the height matches what actually renders.
     let previewHeight = VibeAgentTurnContentView.measuredHeight(
       row: row,
       appearance: .fallback,
@@ -2270,7 +2351,8 @@ func measureMessageBubbleLayout(
       previewHeight: 0.0,
       hasLinkPreview: false,
       usesBottomMetaLayout: true,
-      usesRichTextLayout: false
+      usesRichTextLayout: false,
+      agentTurnCentered: compact
     )
   }
 
@@ -6383,8 +6465,16 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     }
     let bubbleWidth = metrics.bubbleWidth
     let bubbleHeight = metrics.bubbleHeight
-    let bubbleX =
-      (row.isMe ? layoutWidth - bubbleWidth - bubbleSideMargin : bubbleSideMargin) + selectionInset
+    let bubbleX: CGFloat
+    if metrics.agentTurnCentered {
+      // Compact "thinking" pill: center it in the row instead of pinning to the leading
+      // edge, so the tiny loader reads as a centered indicator rather than a marooned
+      // scrap in a full-width shell.
+      bubbleX = max(bubbleSideMargin, (layoutWidth - bubbleWidth) / 2.0) + selectionInset
+    } else {
+      bubbleX =
+        (row.isMe ? layoutWidth - bubbleWidth - bubbleSideMargin : bubbleSideMargin) + selectionInset
+    }
     let bubbleY = max(0.0, bounds.height - bubbleHeight)
     let bubbleFrame = pixelAlignedRect(
       CGRect(
@@ -6413,7 +6503,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     let isFullBleed = metrics.isMediaLayout && usesFullBleedMediaLayout(row)
     let metaTopSpacing = effectiveMetaTopSpacing(for: row)
 
-    let showTail = row.shape.showTail && !isGhostHidden
+    let showTail = row.shape.showTail && !isGhostHidden && !metrics.agentTurnCentered
       && !(row.messageType == "typing" || isTransparentStickerMessage(row) || usesTransparentAgentStreaming)
     if showTail {
       // IMPORTANT: tailView has a rotation+flip transform applied, so we MUST NOT
@@ -6554,7 +6644,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           streamingStartDate: agentTurnState.streamingStartDate,
           onLoaderTap: { [weak self] in
             guard let self, let messageId = row.messageId else { return }
-            self.onAgentAction?(["type": "toggleAgentProgress", "messageId": messageId])
+            // Tapping the "Working / Worked for…" header opens the full turn in the glass
+            // sheet (same renderer) rather than an inline expand — see presentAgentTurnDetailView.
+            self.onAgentAction?(["type": "openAgentTurnDetail", "messageId": messageId])
           }
         )
         agentTurnContentView.frame = pixelAlignedRect(

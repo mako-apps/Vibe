@@ -151,6 +151,15 @@ extension VibeAgentTurnContentView {
     streamingStartDate: Date?
   ) -> CGFloat {
     let template = sizingTemplate
+    // CRITICAL: clear any block / feed / loader views left over from measuring a
+    // DIFFERENT row on this shared template. `configure(...)` reuses cached subviews
+    // keyed by block-signature and node id, so without a reset the previously-measured
+    // (often taller) turn's views linger and inflate THIS row's fitting height. The live
+    // cell holds its OWN body-view instance with the real (shorter/empty) content, so the
+    // desync renders as a tall-but-empty bubble — and because the leftover state changes
+    // per measured row / per stream tick, the measured height swings between huge and the
+    // caller's floor. Resetting first makes each measurement reflect only this row.
+    template.reset()
     if let constraint = sizingWidthConstraint {
       constraint.constant = availableWidth
     } else {
