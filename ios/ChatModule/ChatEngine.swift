@@ -10,8 +10,8 @@ private let chatEngineUITraceLogger = Logger(
 )
 
 private func chatEngineUITrace(_ message: String) {
-  chatEngineUITraceLogger.notice("\(message, privacy: .public)")
-  NSLog("[VibeUITrace] %@", message)
+  VibeDebugLog.notice(logger: chatEngineUITraceLogger, message)
+  VibeDebugLog.log("[VibeUITrace] %@", message)
 }
 
 private struct ChatEngineHybridPayload: Decodable {
@@ -1368,7 +1368,7 @@ final class ChatEngine {
             event: "open-chat-channel-skip",
             payload: ["chatId": chatId, "reason": "built_in_agent_surface"]
           )
-          NSLog(
+          VibeDebugLog.log(
             "[ChatEngine][Route] skip normal chat channel for built-in agent chatId=%@",
             chatId
           )
@@ -1390,7 +1390,7 @@ final class ChatEngine {
         }
         let nextCount = (openChatChannels[chatId] ?? 0) + 1
         openChatChannels[chatId] = nextCount
-        NSLog(
+        VibeDebugLog.log(
           "[ChatEngine][Route] openChatChannel chatId=%@ peerUserId=%@ count=%d savedMessages=%@",
           chatId,
           peerUserIdHint ?? "",
@@ -3949,14 +3949,14 @@ final class ChatEngine {
     let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"]) ?? ""
     let shouldRefresh = parseBooleanLike(payload["refresh"]) ?? false
     guard !chatId.isEmpty else {
-      NSLog("[ChatEngine][Pin] getPinnedMessages ignored: empty chatId")
+      VibeDebugLog.log("[ChatEngine][Pin] getPinnedMessages ignored: empty chatId")
       return ["chatId": "", "loading": false, "data": []]
     }
 
     return syncOnQueue {
       if chatId == "saved_messages" {
         pinnedMessagesByChatId[chatId] = []
-        NSLog("[ChatEngine][Pin] getPinnedMessages skip saved_messages")
+        VibeDebugLog.log("[ChatEngine][Pin] getPinnedMessages skip saved_messages")
         return [
           "chatId": chatId,
           "loading": false,
@@ -3973,7 +3973,7 @@ final class ChatEngine {
       let cachedPins = pinnedMessagesByChatId[chatId] ?? []
       let isLoading = pinnedFetchInFlightChatIds.contains(chatId)
       if shouldRefresh || !hasCache || isLoading || !cachedPins.isEmpty {
-        NSLog(
+        VibeDebugLog.log(
           "[ChatEngine][Pin] getPinnedMessages chatId=%@ refresh=%@ hasCache=%@ loading=%@ count=%@",
           chatId,
           shouldRefresh ? "true" : "false",
@@ -3994,7 +3994,7 @@ final class ChatEngine {
     let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"])
     let messageId = normalizedString(payload["messageId"] ?? payload["message_id"])
     let pinned = parseBooleanLike(payload["pinned"]) ?? true
-    NSLog(
+    VibeDebugLog.log(
       "[ChatEngine][Pin] pinMessage request chatId=%@ messageId=%@ pinned=%@",
       chatId ?? "(nil)",
       messageId ?? "(nil)",
@@ -7078,11 +7078,11 @@ final class ChatEngine {
     guard !chatId.isEmpty else { return }
     guard chatId != "saved_messages" else {
       pinnedMessagesByChatId[chatId] = []
-      NSLog("[ChatEngine][Pin] fetchPinnedMessages skip saved_messages trigger=%@", trigger)
+      VibeDebugLog.log("[ChatEngine][Pin] fetchPinnedMessages skip saved_messages trigger=%@", trigger)
       return
     }
     guard !pinnedFetchInFlightChatIds.contains(chatId) else {
-      NSLog(
+      VibeDebugLog.log(
         "[ChatEngine][Pin] fetchPinnedMessages skipped (in-flight) chatId=%@ trigger=%@",
         chatId,
         trigger
@@ -7090,7 +7090,7 @@ final class ChatEngine {
       return
     }
     guard let apiBase = apiBaseURLLocked() else {
-      NSLog(
+      VibeDebugLog.log(
         "[ChatEngine][Pin] fetchPinnedMessages skipped (missing apiBase) chatId=%@ trigger=%@",
         chatId,
         trigger
@@ -7100,7 +7100,7 @@ final class ChatEngine {
     let token = authHeaderTokenLocked() ?? ""
 
     pinnedFetchInFlightChatIds.insert(chatId)
-    NSLog(
+    VibeDebugLog.log(
       "[ChatEngine][Pin] fetchPinnedMessages start chatId=%@ trigger=%@ tokenPresent=%@",
       chatId,
       trigger,
@@ -7177,7 +7177,7 @@ final class ChatEngine {
         let nextPinIds = nextPins.compactMap {
           self.normalizedString($0["messageId"] ?? $0["message_id"])
         }
-        NSLog(
+        VibeDebugLog.log(
           "[ChatEngine][Pin] fetchPinnedMessages ok chatId=%@ trigger=%@ status=%@ count=%@ ids=%@",
           chatId,
           trigger,
@@ -7348,15 +7348,15 @@ final class ChatEngine {
   private func joinNativeChatTopicIfNeededLocked(chatId: String) {
     guard !chatId.isEmpty else { return }
     guard !isBuiltInAgentChatId(chatId) else {
-      NSLog("[ChatEngine][Route] skip realtime join for built-in agent chatId=%@", chatId)
+      VibeDebugLog.log("[ChatEngine][Route] skip realtime join for built-in agent chatId=%@", chatId)
       return
     }
     guard chatId != "saved_messages" else {
-      NSLog("[ChatEngine][Route] skip realtime join for saved_messages")
+      VibeDebugLog.log("[ChatEngine][Route] skip realtime join for saved_messages")
       return
     }
     guard let client = phoenixClient else {
-      NSLog("[ChatEngine][Route] joinNativeChatTopic deferred chatId=%@ reason=no_socket", chatId)
+      VibeDebugLog.log("[ChatEngine][Route] joinNativeChatTopic deferred chatId=%@ reason=no_socket", chatId)
       scheduleReconnectLocked(reason: "join_chat_no_socket")
       DispatchQueue.global(qos: .utility).async { [weak self] in
         self?.ensureNativeTransport(trigger: "join_chat_no_socket")
@@ -7364,7 +7364,7 @@ final class ChatEngine {
       return
     }
     guard state["connected"] as? Bool == true else {
-      NSLog("[ChatEngine][Route] joinNativeChatTopic deferred chatId=%@ reason=not_connected", chatId)
+      VibeDebugLog.log("[ChatEngine][Route] joinNativeChatTopic deferred chatId=%@ reason=not_connected", chatId)
       scheduleReconnectLocked(reason: "join_chat_not_connected")
       DispatchQueue.global(qos: .utility).async { [weak self] in
         self?.ensureNativeTransport(trigger: "join_chat_not_connected")
@@ -7373,7 +7373,7 @@ final class ChatEngine {
     }
     if nativeJoinedChatIds.contains(chatId) { return }
     if nativeChatJoinRefsByRef.values.contains(chatId) { return }
-    NSLog("[ChatEngine][Route] joinNativeChatTopic start chatId=%@", chatId)
+    VibeDebugLog.log("[ChatEngine][Route] joinNativeChatTopic start chatId=%@", chatId)
     let ref = client.join(topic: chatTopic(for: chatId), payload: [:])
     nativeChatJoinRefsByRef[ref] = chatId
     appendJournalLocked(event: "native-chat-join-start", payload: ["chatId": chatId, "ref": ref])
@@ -8055,7 +8055,7 @@ final class ChatEngine {
     appendJournalLocked(
       event: "native-chat-history-cache-restore",
       payload: ["chatId": chatId, "rows": rows.count])
-    NSLog(
+    VibeDebugLog.log(
       "[ChatEngine] restored cached chat history chatId=%@ rows=%d",
       String(chatId.prefix(12)),
       rows.count
@@ -8085,7 +8085,7 @@ final class ChatEngine {
     appendJournalLocked(
       event: "native-chat-history-cache-store",
       payload: ["chatId": chatId, "rows": limitedRows.count])
-    NSLog(
+    VibeDebugLog.log(
       "[ChatEngine] stored cached chat history chatId=%@ rows=%d",
       String(chatId.prefix(12)),
       limitedRows.count
@@ -8144,7 +8144,7 @@ final class ChatEngine {
         event: "native-chat-history-skip",
         payload: ["chatId": chatId, "reason": "agent_surface"]
       )
-      NSLog("[ChatEngine] loadChatHistory SKIP chatId=%@ reason=agent_surface", chatId)
+      VibeDebugLog.log("[ChatEngine] loadChatHistory SKIP chatId=%@ reason=agent_surface", chatId)
       return
     }
     if historyLoadingChats.contains(chatId) { return }
@@ -8215,7 +8215,7 @@ final class ChatEngine {
       request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
     }
     let fetchStartMs = self.nowMs()
-    NSLog(
+    VibeDebugLog.log(
       "[ChatEngine] loadChatHistory START chatId=%@ limit=%d url=%@",
       String(chatId.prefix(12)),
       chatHistoryFetchLimit,
@@ -8270,7 +8270,7 @@ final class ChatEngine {
             ])
           return
         }
-        NSLog(
+        VibeDebugLog.log(
           "[ChatEngine] loadChatHistory OK chatId=%@ duration=%lldms bytes=%d",
           String(chatId.prefix(12)),
           durationMs, data.count)
@@ -8600,7 +8600,7 @@ final class ChatEngine {
         ""
       let chatId =
         rawChatId.count > 12 ? String(rawChatId.prefix(12)) + "..." : rawChatId
-      print(
+      VibeDebugLog.print(
         "[ChatEngine] didChange reason=\(reason) chatId=\(chatId.isEmpty ? "<empty>" : chatId)"
       )
       chatEngineUITrace(

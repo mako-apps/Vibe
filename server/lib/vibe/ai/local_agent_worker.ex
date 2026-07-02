@@ -1136,6 +1136,10 @@ defmodule Vibe.AI.LocalAgentWorker do
     interleaved_claude_progress_nodes(extracted.decoded, extracted.tool_events, "")
   end
 
+  defp live_progress_nodes(%{handle: "codex"}, extracted) do
+    interleaved_codex_progress_nodes(extracted.decoded, extracted.tool_events, "")
+  end
+
   defp live_progress_nodes(_worker, extracted), do: extracted.progress_nodes
 
   @doc "Mark a live stream finished. The final persisted message carries the content."
@@ -1628,18 +1632,17 @@ defmodule Vibe.AI.LocalAgentWorker do
     }
   end
 
-  # Progress nodes for the "Worked …" card. For Claude we INTERLEAVE the agent's
-  # working text (the running narration it emits between tool calls) with its tool
-  # steps in chronological order, so the collapsed card reads top-down exactly as
-  # the agent worked (text → edit → read → text …). The FINAL summary block is
-  # excluded — it renders as the message body OUTSIDE the card. Other providers
-  # keep the tool-only feed until their transcript shape is wired the same way.
+  # Progress nodes for the "Worked …" card. For Claude/Codex we INTERLEAVE the
+  # agent's working text (the running narration it emits between tool calls) with
+  # its tool steps in chronological order, so the collapsed card reads top-down
+  # exactly as the agent worked (text → edit → read → text …). The FINAL summary
+  # block is excluded — it renders as the message body OUTSIDE the card.
   defp build_progress_nodes(%{handle: "claude"}, decoded, tool_events, summary_text) do
     interleaved_claude_progress_nodes(decoded, tool_events, summary_text)
   end
 
-  defp build_progress_nodes(%{handle: "codex"}, decoded, tool_events, _summary_text) do
-    (codex_reasoning_progress_nodes(decoded) ++ progress_nodes_from_events(tool_events))
+  defp build_progress_nodes(%{handle: "codex"}, decoded, tool_events, summary_text) do
+    interleaved_codex_progress_nodes(decoded, tool_events, summary_text)
     |> Enum.take(@max_tool_events)
   end
 
@@ -1647,28 +1650,87 @@ defmodule Vibe.AI.LocalAgentWorker do
     progress_nodes_from_events(tool_events)
   end
 
-  defp codex_reasoning_progress_nodes(decoded) do
-    decoded
-    |> Enum.with_index()
-    |> Enum.flat_map(fn {event, index} ->
-      item = codex_event_item(event)
-      type = if is_map(item), do: codex_item_type(item) || "", else: ""
+  defp interleaved_codex_progress_nodes(decoded, tool_events, summary_text) do
+    tool_by_id = Map.new(tool_events, fn ev -> {ev["id"], ev} end)
+    summary_norm = summary_text |> to_string() |> String.trim()
 
-      if type == "reasoning" do
-        [
-          %{
-            "id" => "codex-thinking-#{index}",
-            "label" => "Thinking",
-            "status" => "done",
-            "depth" => 0,
-            "kind" => "thinking"
-          }
-        ]
-      else
-        []
-      end
-    end)
-    |> Enum.take(4)
+    {nodes, used, _text_index, _thinking_count} =
+      decoded
+      |> Enum.with_index()
+      |> Enum.reduce({[], MapSet.new(), 0, 0}, fn {event, index},
+                                                  {nodes, used, text_index, thinking_count} ->
+        item = codex_event_item(event)
+
+        cond do
+          is_map(item) ->
+            type = codex_item_type(item) || ""
+
+            cond do
+              type == "reasoning" ->
+                if thinking_count >= 4 do
+                  {nodes, used, text_index, thinking_count}
+                else
+                  node = %{
+                    "id" => "codex-thinking-#{index}",
+                    "label" => "Thinking",
+                    "status" => "done",
+                    "depth" => 0,
+                    "kind" => "thinking"
+                  }
+
+                  {[node | nodes], used, text_index, thinking_count + 1}
+                end
+
+              codex_agent_message?(item) ->
+                text = codex_item_text(item)
+                trimmed = text |> to_string() |> String.trim()
+
+                if trimmed == "" or trimmed == summary_norm do
+                  {nodes, used, text_index, thinking_count}
+                else
+                  node = %{
+                    "id" => "codex-text-#{text_index}",
+                    "label" => clip_text_node(text),
+                    "status" => "done",
+                    "depth" => 0,
+                    "kind" => "text"
+                  }
+
+                  {[node | nodes], used, text_index + 1, thinking_count}
+                end
+
+              type in ["agent_message", "message"] ->
+                {nodes, used, text_index, thinking_count}
+
+              true ->
+                id = codex_tool_event_id(event, item, index)
+
+                case Map.get(tool_by_id, id) do
+                  nil ->
+                    {nodes, used, text_index, thinking_count}
+
+                  tool_event ->
+                    if MapSet.member?(used, id) do
+                      {nodes, used, text_index, thinking_count}
+                    else
+                      node = tool_event_to_node(tool_event, length(nodes))
+                      {[node | nodes], MapSet.put(used, id), text_index, thinking_count}
+                    end
+                end
+            end
+
+          true ->
+            {nodes, used, text_index, thinking_count}
+        end
+      end)
+
+    remaining_tool_nodes =
+      tool_events
+      |> Enum.reject(fn event -> MapSet.member?(used, event["id"]) end)
+      |> Enum.with_index()
+      |> Enum.map(fn {event, index} -> tool_event_to_node(event, index) end)
+
+    Enum.reverse(nodes) ++ remaining_tool_nodes
   end
 
   defp interleaved_claude_progress_nodes(decoded, tool_events, summary_text) do
@@ -1809,14 +1871,11 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp extract_codex_text(decoded) do
     decoded
     |> Enum.reduce(nil, fn event, acc ->
-      item = map_value(event, "item") || event
+      item = codex_event_item(event) || event
 
       cond do
-        codex_agent_message?(item) and is_binary(item["text"]) ->
-          item["text"]
-
-        codex_agent_message?(item) and is_binary(item["message"]) ->
-          item["message"]
+        codex_agent_message?(item) ->
+          codex_item_text(item) || acc
 
         codex_envelope_error_message(event) != nil ->
           codex_envelope_error_message(event)
@@ -2015,6 +2074,10 @@ defmodule Vibe.AI.LocalAgentWorker do
       normalize_string(event["type"]) == "response_item" and is_map(event["payload"]) ->
         event["payload"]
 
+      normalize_string(event["type"]) != "event_msg" and is_map(event["payload"]) and
+          codex_known_item_type?(event["payload"]) ->
+        event["payload"]
+
       true ->
         nil
     end
@@ -2028,18 +2091,62 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   defp codex_item_type(_), do: nil
 
-  defp codex_agent_message?(item) when is_map(item), do: codex_item_type(item) == "agent_message"
+  defp codex_known_item_type?(item) when is_map(item) do
+    (codex_item_type(item) || "") in [
+      "agent_message",
+      "message",
+      "reasoning",
+      "command_execution",
+      "file_change",
+      "web_search",
+      "mcp_tool_call",
+      "function_call",
+      "function_call_output",
+      "custom_tool_call",
+      "custom_tool_call_output",
+      "todo_list",
+      "error"
+    ]
+  end
+
+  defp codex_known_item_type?(_), do: false
+
+  defp codex_agent_message?(item) when is_map(item) do
+    case codex_item_type(item) do
+      "agent_message" ->
+        true
+
+      "message" ->
+        role = item["role"] |> normalize_string() |> then(&(&1 && String.downcase(&1)))
+        role in ["assistant", "agent"]
+
+      _ ->
+        false
+    end
+  end
+
   defp codex_agent_message?(_), do: false
+
+  defp codex_item_text(item) when is_map(item) do
+    normalize_string(item["text"]) ||
+      normalize_string(item["message"]) ||
+      content_blocks_text(item["content"])
+  end
+
+  defp codex_item_text(_), do: nil
+
+  defp codex_tool_event_id(event, item, index) do
+    normalize_string(item["call_id"]) ||
+      normalize_string(item["id"]) ||
+      normalize_string(event["id"]) ||
+      unique_event_id("codex-tool", index)
+  end
 
   defp codex_tool_event(event, item, type, index) do
     {tool, input, output} = codex_item_fields(type, item)
 
     %{
-      "id" =>
-        normalize_string(item["call_id"]) ||
-          normalize_string(item["id"]) ||
-          normalize_string(event["id"]) ||
-          unique_event_id("codex-tool", index),
+      "id" => codex_tool_event_id(event, item, index),
       "provider" => "codex",
       "tool" => tool,
       "label" => tool_label("Codex", tool, input),
@@ -2125,6 +2232,17 @@ defmodule Vibe.AI.LocalAgentWorker do
     {"Tool result", %{}, output}
   end
 
+  defp codex_item_fields("custom_tool_call", item) do
+    name = normalize_string(item["name"]) || normalize_string(item["tool"]) || "tool"
+    input = codex_decode_arguments(item["input"] || item["arguments"])
+    {codex_function_tool_name(name, input), input, nil}
+  end
+
+  defp codex_item_fields("custom_tool_call_output", item) do
+    output = item["output"] || item["result"] || item["content"]
+    {"Tool result", %{}, output}
+  end
+
   defp codex_item_fields("todo_list", item) do
     {"TodoWrite", %{"todos" => item["items"] || item["todos"] || []}, nil}
   end
@@ -2181,9 +2299,15 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp codex_decode_arguments(arguments) when is_map(arguments), do: arguments
 
   defp codex_decode_arguments(arguments) when is_binary(arguments) do
-    case Jason.decode(arguments) do
-      {:ok, decoded} when is_map(decoded) -> decoded
-      _ -> %{"arguments" => arguments}
+    cond do
+      apply_patch_envelope?(arguments) ->
+        codex_apply_patch_input(arguments)
+
+      true ->
+        case Jason.decode(arguments) do
+          {:ok, decoded} when is_map(decoded) -> decoded
+          _ -> %{"arguments" => arguments}
+        end
     end
   end
 
@@ -2196,6 +2320,168 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp codex_function_tool_name("apply_patch", _input), do: "Edit"
   defp codex_function_tool_name("view_image", _input), do: "ViewImage"
   defp codex_function_tool_name(name, _input), do: name
+
+  defp apply_patch_envelope?(value) when is_binary(value) do
+    String.contains?(value, "*** Begin Patch") and String.contains?(value, "*** End Patch")
+  end
+
+  defp apply_patch_envelope?(_), do: false
+
+  defp codex_apply_patch_input(patch) when is_binary(patch) do
+    files = apply_patch_files(patch)
+    paths = files |> Enum.map(&normalize_string(&1["path"])) |> Enum.reject(&is_nil/1)
+
+    %{"patch" => patch}
+    |> maybe_put("file_path", List.first(paths))
+    |> maybe_put("files", if(paths == [], do: nil, else: paths))
+    |> maybe_put("patchFiles", if(files == [], do: nil, else: files))
+  end
+
+  defp apply_patch_files(patch) when is_binary(patch) do
+    {files, current} =
+      patch
+      |> String.split("\n")
+      |> Enum.reduce({[], nil}, fn line, {files, current} ->
+        cond do
+          path = apply_patch_header_path(line, "*** Add File: ") ->
+            {finish_patch_file(files, current), new_patch_file(path, "add")}
+
+          path = apply_patch_header_path(line, "*** Update File: ") ->
+            {finish_patch_file(files, current), new_patch_file(path, "update")}
+
+          path = apply_patch_header_path(line, "*** Delete File: ") ->
+            {finish_patch_file(files, current), new_patch_file(path, "delete")}
+
+          String.starts_with?(line, "*** End Patch") ->
+            {finish_patch_file(files, current), nil}
+
+          is_map(current) and String.starts_with?(line, "+") and
+              not String.starts_with?(line, "+++") ->
+            {files, Map.update!(current, "additions", &(&1 + 1))}
+
+          is_map(current) and String.starts_with?(line, "-") and
+              not String.starts_with?(line, "---") ->
+            {files, Map.update!(current, "deletions", &(&1 + 1))}
+
+          true ->
+            {files, current}
+        end
+      end)
+
+    files
+    |> finish_patch_file(current)
+    |> Enum.reverse()
+  end
+
+  defp apply_patch_files(_), do: []
+
+  defp apply_patch_header_path(line, prefix) do
+    if String.starts_with?(line, prefix) do
+      line
+      |> String.replace(prefix, "", global: false)
+      |> normalize_string()
+    end
+  end
+
+  defp new_patch_file(path, action) do
+    %{
+      "path" => path,
+      "action" => action,
+      "additions" => 0,
+      "deletions" => 0
+    }
+  end
+
+  defp finish_patch_file(files, %{"path" => path} = current) when is_binary(path) do
+    [current | files]
+  end
+
+  defp finish_patch_file(files, _), do: files
+
+  defp patch_files_from_input(input) when is_map(input) do
+    cond do
+      is_list(input["patchFiles"]) ->
+        input["patchFiles"]
+        |> Enum.map(&normalize_patch_file/1)
+        |> Enum.reject(&is_nil/1)
+
+      apply_patch_envelope?(input["patch"]) ->
+        apply_patch_files(input["patch"])
+
+      apply_patch_envelope?(input["arguments"]) ->
+        apply_patch_files(input["arguments"])
+
+      is_list(input["files"]) ->
+        input["files"]
+        |> Enum.map(&normalize_patch_file/1)
+        |> Enum.reject(&is_nil/1)
+
+      true ->
+        []
+    end
+  end
+
+  defp patch_files_from_input(_), do: []
+
+  defp normalize_patch_file(%{"path" => path} = file) do
+    case normalize_string(path) do
+      nil ->
+        nil
+
+      normalized_path ->
+        %{
+          "path" => normalized_path,
+          "action" => normalize_string(file["action"]),
+          "additions" => normalize_runtime_int(file["additions"]) || 0,
+          "deletions" => normalize_runtime_int(file["deletions"]) || 0
+        }
+    end
+  end
+
+  defp normalize_patch_file(path) when is_binary(path) do
+    case normalize_string(path) do
+      nil -> nil
+      normalized_path -> %{"path" => normalized_path, "additions" => 0, "deletions" => 0}
+    end
+  end
+
+  defp normalize_patch_file(_), do: nil
+
+  defp first_patch_path(input) do
+    input
+    |> patch_files_from_input()
+    |> Enum.find_value(&normalize_string(&1["path"]))
+  end
+
+  defp patch_target(input) do
+    files = patch_files_from_input(input)
+
+    case files do
+      [] ->
+        nil
+
+      [file] ->
+        file["path"] |> normalize_string() |> target_basename()
+
+      files ->
+        "#{length(files)} files"
+    end
+  end
+
+  defp apply_patch_stats(input) when is_map(input) do
+    files = patch_files_from_input(input)
+
+    if files == [] do
+      nil
+    else
+      Enum.reduce(files, {0, 0}, fn file, {added, removed} ->
+        {added + (normalize_runtime_int(file["additions"]) || 0),
+         removed + (normalize_runtime_int(file["deletions"]) || 0)}
+      end)
+    end
+  end
+
+  defp apply_patch_stats(_), do: nil
 
   defp codex_file_change_paths(item) do
     case item["changes"] do
@@ -2282,7 +2568,7 @@ defmodule Vibe.AI.LocalAgentWorker do
       envelope in ["turn.failed", "error", "thread.failed"] ->
         "failed"
 
-      item_type in ["function_call_output"] ->
+      item_type in ["function_call_output", "custom_tool_call_output"] ->
         "done"
 
       String.contains?(item_status, ["complete", "done", "success"]) ->
@@ -2638,7 +2924,14 @@ defmodule Vibe.AI.LocalAgentWorker do
   # (file basename, command, pattern, url…) for compact display.
   defp tool_kind_and_target(tool, input) when is_map(input) do
     t = tool |> to_string() |> String.downcase()
-    path = input["file_path"] || input["filePath"] || input["path"] || input["notebook_path"]
+    path =
+      input["file_path"] ||
+        input["filePath"] ||
+        input["path"] ||
+        input["notebook_path"] ||
+        first_patch_path(input)
+
+    parsed_patch_target = patch_target(input)
 
     cond do
       t in ["read", "notebookread", "view", "cat", "open"] ->
@@ -2654,10 +2947,10 @@ defmodule Vibe.AI.LocalAgentWorker do
         "apply_patch",
         "applypatch"
       ] ->
-        {"edit", target_basename(path)}
+        {"edit", parsed_patch_target || target_basename(path)}
 
       t in ["write", "create", "createfile", "new_file"] ->
-        {"write", target_basename(path)}
+        {"write", parsed_patch_target || target_basename(path)}
 
       t in ["bash", "shell", "exec", "run", "command", "terminal"] ->
         {"bash", short_target(input["command"] || input["cmd"])}
@@ -2704,8 +2997,13 @@ defmodule Vibe.AI.LocalAgentWorker do
   # Claude Code's +N/−M. nil for non-mutating tools.
   defp patch_stats(tool, input) when is_map(input) do
     t = tool |> to_string() |> String.downcase()
+    parsed_patch_stats = apply_patch_stats(input)
 
     cond do
+      parsed_patch_stats != nil and
+          t in ["edit", "multiedit", "update", "apply_patch", "applypatch"] ->
+        parsed_patch_stats
+
       t in ["write", "create", "createfile", "new_file"] ->
         {line_count(input["content"] || input["file_text"] || input["text"]), 0}
 

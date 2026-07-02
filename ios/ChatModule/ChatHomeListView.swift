@@ -8,8 +8,8 @@ private let chatHomeUITraceLogger = Logger(
 )
 
 private func chatHomeUITrace(_ message: String) {
-  chatHomeUITraceLogger.notice("\(message, privacy: .public)")
-  NSLog("[VibeUITrace] %@", message)
+  VibeDebugLog.notice(logger: chatHomeUITraceLogger, message)
+  VibeDebugLog.log("[VibeUITrace] %@", message)
 }
 
 private struct ChatNativeHomeUndoBannerPayload {

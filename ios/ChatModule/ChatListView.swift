@@ -15,8 +15,8 @@ private func chatListUITrace(_ message: String, fault: Bool = false) {
     chatListUITraceLogger.fault("\(message, privacy: .public)")
     NSLog("[VibeUITrace][fault] %@", message)
   } else {
-    chatListUITraceLogger.notice("\(message, privacy: .public)")
-    NSLog("[VibeUITrace] %@", message)
+    VibeDebugLog.notice(logger: chatListUITraceLogger, message)
+    VibeDebugLog.log("[VibeUITrace] %@", message)
   }
 }
 
@@ -1324,7 +1324,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let startedAt = ProcessInfo.processInfo.systemUptime
     sourceRowsPayload = nextRows
     let traceChatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
-    NSLog(
+    VibeDebugLog.log(
       "[ChatListView] setRows called — count: %d, isApplying: %@", nextRows.count,
       isApplyingRowsUpdate ? "true" : "false")
     chatListUITrace(
@@ -1564,7 +1564,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // Initial load or full replacement: use reloadData (no batch update needed).
     guard !previousRows.isEmpty else {
       if parsed.count <= 4 {
-        NSLog(
+        VibeDebugLog.log(
           "[FirstMsg] setRows INITIAL parsed=%d keys=[%@] hidden=%@ pending=%@ src=%d",
           parsed.count,
           parsed.map { String($0.key.prefix(16)) }.joined(separator: ","),
@@ -1583,7 +1583,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         CATransaction.commit()
       }
       if parsed.count <= 4 {
-        NSLog(
+        VibeDebugLog.log(
           "[FirstMsg] setRows INITIAL done offset=%.0f contentH=%.0f inset(t=%.0f,b=%.0f) visible=%d",
           collectionView.contentOffset.y,
           collectionView.contentSize.height,
@@ -5452,7 +5452,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       updateAgentBridgeControlTitle()
 
       positionTransitionOverlayHost()
-      NSLog("[ChatListView] native input bar ENABLED")
+      VibeDebugLog.log("[ChatListView] native input bar ENABLED")
     } else {
       inputBar?.removeFromSuperview()
       inputBar = nil
@@ -5463,7 +5463,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         contentPaddingBottom = requestedContentPaddingBottom
         updateBottomAnchorInset()
       }
-      NSLog("[ChatListView] native input bar DISABLED")
+      VibeDebugLog.log("[ChatListView] native input bar DISABLED")
     }
     setNeedsLayout()
   }
@@ -5846,7 +5846,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let next = normalized.isEmpty ? nil : normalized
     guard explicitBridgeProvider != next else { return }
     explicitBridgeProvider = next
-    NSLog("[AgentRoute] ChatListView setBridgeProvider=%@", next ?? "nil")
+    VibeDebugLog.log("[AgentRoute] ChatListView setBridgeProvider=%@", next ?? "nil")
     updateAgentBridgeControlTitle()
     inputBar?.setAgentControlMode(agentChatMode || currentBridgeProvider != nil)
     scheduleBridgeAgentPresenceRefresh()
@@ -6094,7 +6094,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       else { continue }
       if activeBridgeSessionId != sid {
         activeBridgeSessionId = sid
-        NSLog("[AgentRoute] adopt activeBridgeSessionId=%@", sid)
+        VibeDebugLog.log("[AgentRoute] adopt activeBridgeSessionId=%@", sid)
       }
       return
     }
@@ -6839,7 +6839,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     guard !p.isEmpty else { return }
     let hasHost = onHostBridgeAgentView != nil
     let defaultView = AgentBridgeSelectionStore.defaultView(provider: p)
-    NSLog(
+    VibeDebugLog.log(
       "[AgentRoute] presentPreferredAgentViewNow provider=%@ hasHost=%@ already=%@ default=%@",
       p, hasHost ? "true" : "false", didAutoPresentAgentView ? "true" : "false",
       "\(defaultView)")

@@ -1304,6 +1304,52 @@ func chatListRowContentEqual(_ lhs: ChatListRow, _ rhs: ChatListRow) -> Bool {
     && lhs.isAgentError == rhs.isAgentError
 }
 
+private func progressNodeLabel(from item: [String: Any]) -> String? {
+  let textKeys = ["label", "title", "text", "content", "message", "summary"]
+  for key in textKeys {
+    if let value = parseNonEmptyString(item[key]) {
+      return value
+    }
+  }
+
+  let kind = parseNonEmptyString(item["kind"] ?? item["itemType"])?.lowercased()
+  let target =
+    parseNonEmptyString(
+      item["target"] ?? item["path"] ?? item["file_path"] ?? item["filePath"])
+
+  func verbLabel(_ verb: String) -> String {
+    if let target, !target.isEmpty {
+      return "\(verb) \(target)"
+    }
+    return verb
+  }
+
+  switch kind {
+  case "thinking":
+    return "Thinking"
+  case "todo":
+    return "Planning"
+  case "read":
+    return verbLabel("Read")
+  case "edit":
+    return verbLabel("Edit")
+  case "write":
+    return verbLabel("Create")
+  case "bash":
+    return verbLabel("Run")
+  case "search":
+    return verbLabel("Search")
+  case "web":
+    return verbLabel("Fetch")
+  case "task":
+    return verbLabel("Step")
+  case let value? where !value.isEmpty:
+    return verbLabel(value.prefix(1).uppercased() + String(value.dropFirst()))
+  default:
+    return target
+  }
+}
+
 private func parseAgentProgressNodes(_ raw: Any?) -> [ChatListRow.AgentProgressNode] {
   guard let items = raw as? [[String: Any]] else {
     // DIAGNOSTIC (text-in-live-feed): the payload isn't even an array of dicts.
@@ -1315,22 +1361,20 @@ private func parseAgentProgressNodes(_ raw: Any?) -> [ChatListRow.AgentProgressN
     return []
   }
 
-  // DIAGNOSTIC (text-in-live-feed): a node with no `label` is dropped by the guard
-  // below. If the bridge carries narration prose in a different key (e.g. "text" /
-  // "content" / "message") and leaves `label` empty, every "text" step vanishes here
-  // — which reads on screen as "only commands, no text". Log each dropped node's kind
-  // + available keys so we can see exactly which field the prose is hiding in.
+  // DIAGNOSTIC (text-in-live-feed): keep logging malformed nodes, but first try
+  // the known Codex/bridge fallback fields so future payloads do not disappear.
   var dropped: [String] = []
   let nodes: [ChatListRow.AgentProgressNode] = items.compactMap { item in
-    guard let label = parseNonEmptyString(item["label"]) else {
+    guard let label = progressNodeLabel(from: item) else {
       let kind = parseNonEmptyString(item["kind"]) ?? "?"
       dropped.append(kind)
       NSLog(
-        "[AgentNodes] DROP kind=%@ keys=[%@] textKey=%@ contentKey=%@",
+        "[AgentNodes] DROP kind=%@ keys=[%@] textKey=%@ contentKey=%@ messageKey=%@",
         kind,
         item.keys.sorted().joined(separator: ","),
         String(describing: item["text"] ?? "—").prefix(48).description,
-        String(describing: item["content"] ?? "—").prefix(48).description)
+        String(describing: item["content"] ?? "—").prefix(48).description,
+        String(describing: item["message"] ?? "—").prefix(48).description)
       return nil
     }
     let id = parseNonEmptyString(item["id"]) ?? UUID().uuidString

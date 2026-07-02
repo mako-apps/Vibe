@@ -3798,6 +3798,14 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     renderSwiftUIProfile()
   }
 
+  func refreshProfileAppearance() {
+    applyTheme()
+    refreshAvatar()
+    renderSwiftUIProfile()
+    setNeedsLayout()
+    updateAvatarMorphProgress()
+  }
+
   func setIsOnline(_ value: Bool) {
     if isOnline == value { return }
     isOnline = value

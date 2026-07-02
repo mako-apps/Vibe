@@ -5,12 +5,46 @@ import OSLog
 import Darwin
 import Combine
 
+enum VibeDebugLog {
+  static let verboseEnabled: Bool = {
+    #if DEBUG
+      let environment = ProcessInfo.processInfo.environment
+      let arguments = ProcessInfo.processInfo.arguments
+      return environment["VIBE_VERBOSE_LOGS"] == "1"
+        || environment["VIBE_UI_TRACE_CONSOLE"] == "1"
+        || arguments.contains("-VibeVerboseLogs")
+        || arguments.contains("-VibeUITraceConsoleLogs")
+        || UserDefaults.standard.bool(forKey: "VibeVerboseLogs")
+        || UserDefaults.standard.bool(forKey: "VibeUITraceConsoleLogs")
+    #else
+      return false
+    #endif
+  }()
+
+  static func notice(logger: Logger, _ message: String) {
+    guard verboseEnabled else { return }
+    logger.notice("\(message, privacy: .public)")
+  }
+
+  static func log(_ format: String, _ args: CVarArg...) {
+    guard verboseEnabled else { return }
+    withVaList(args) { pointer in
+      NSLogv(format, pointer)
+    }
+  }
+
+  static func print(_ message: String) {
+    guard verboseEnabled else { return }
+    Swift.print(message)
+  }
+}
+
 enum AppUITrace {
   static let subsystem = "com.mohammadshayani.vibe.native"
   private static let logger = Logger(subsystem: subsystem, category: "UITrace")
 
   static func notice(_ message: String) {
-    logger.notice("\(message, privacy: .public)")
+    VibeDebugLog.notice(logger: logger, message)
   }
 
   static func error(_ message: String) {
@@ -444,7 +478,7 @@ struct ChatRoute: Identifiable, Hashable {
     let cachedRows = resolvedBridge == nil
       ? (row.initialMessages.isEmpty ? row.previewRows : row.initialMessages)
       : []
-    NSLog(
+    VibeDebugLog.log(
       "[AgentRoute] ChatRoute(row:) chatId=%@ title=%@ peerUserId=%@ peerAgentId=%@ isAgentFriend=%@ resolvedBridge=%@",
       row.chatId, row.title, row.peerUserId ?? "nil", row.peerAgentId ?? "nil",
       row.isAgentFriend ? "true" : "false", resolvedBridge ?? "nil")
@@ -4888,11 +4922,21 @@ final class ChatProfileRootController: UIViewController {
   private var route: ChatRoute
   private var isDark: Bool
   private var onClose: (() -> Void)?
+  private var onProfileAppearanceUpdated: (() -> Void)?
+  private var rowsRefreshGeneration: UInt = 0
 
-  init(route: ChatRoute, isDark: Bool, onClose: (() -> Void)?) {
+  var chatId: String { route.chatId }
+
+  init(
+    route: ChatRoute,
+    isDark: Bool,
+    onClose: (() -> Void)?,
+    onProfileAppearanceUpdated: (() -> Void)? = nil
+  ) {
     self.route = route
     self.isDark = isDark
     self.onClose = onClose
+    self.onProfileAppearanceUpdated = onProfileAppearanceUpdated
     super.init(nibName: nil, bundle: nil)
     appShellRouteLog("ChatProfileRootController init chatId=\(route.chatId) title=\(route.title)")
   }
@@ -4919,14 +4963,32 @@ final class ChatProfileRootController: UIViewController {
     profileView.onNativeEvent.handler = { [weak self] payload in
       self?.handleNativeEvent(payload)
     }
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleChatEngineChanged(_:)),
+      name: ChatEngine.didChangeNotification,
+      object: nil
+    )
     applyRoute()
+    refreshRows(preferInitialRows: true)
   }
 
-  func update(route: ChatRoute, isDark: Bool, onClose: (() -> Void)?) {
+  deinit {
+    NotificationCenter.default.removeObserver(self)
+  }
+
+  func update(
+    route: ChatRoute,
+    isDark: Bool,
+    onClose: (() -> Void)?,
+    onProfileAppearanceUpdated: (() -> Void)? = nil
+  ) {
     let routeChanged = self.route != route
     let themeChanged = self.isDark != isDark
     self.route = route
     self.isDark = isDark
+    self.onClose = onClose
+    self.onProfileAppearanceUpdated = onProfileAppearanceUpdated
 
     if themeChanged {
       setNeedsStatusBarAppearanceUpdate()
@@ -4934,6 +4996,7 @@ final class ChatProfileRootController: UIViewController {
     }
     if routeChanged || themeChanged {
       applyRoute()
+      refreshRows(preferInitialRows: true)
     }
   }
 
@@ -4962,12 +5025,60 @@ final class ChatProfileRootController: UIViewController {
     profileView.setRows(route.initialRows)
   }
 
+  private func refreshRows(preferInitialRows: Bool = false) {
+    rowsRefreshGeneration &+= 1
+    let generation = rowsRefreshGeneration
+    let chatID = route.chatId
+
+    if preferInitialRows {
+      profileView.setRows(route.initialRows)
+    }
+
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      let nativeRows = ChatEngine.shared.getChatRows(["chatId": chatID])
+      DispatchQueue.main.async { [weak self] in
+        guard let self, self.route.chatId == chatID, self.rowsRefreshGeneration == generation else {
+          return
+        }
+        self.profileView.setRows(nativeRows.isEmpty ? self.route.initialRows : nativeRows)
+      }
+    }
+  }
+
+  @objc private func handleChatEngineChanged(_ notification: Notification) {
+    if !Thread.isMainThread {
+      DispatchQueue.main.async { [weak self] in
+        self?.handleChatEngineChanged(notification)
+      }
+      return
+    }
+
+    let changedChatId = Self.normalizedString(notification.userInfo?["chatId"])
+    let changeReason = Self.normalizedString(notification.userInfo?["reason"]) ?? "unknown"
+    if route.chatId == "saved_messages", changedChatId == nil {
+      return
+    }
+    guard changedChatId == route.chatId || changedChatId == nil else { return }
+
+    switch changeReason {
+    case "chatRowsReloaded", "chatMessageInserted", "chatMessageEdited", "chatMessageDeleted",
+      "chatMessageChanged", "messageStatusChanged", "presenceChanged", "peerTyping",
+      "chatMuteChanged":
+      refreshRows()
+    default:
+      break
+    }
+  }
+
   private func handleNativeEvent(_ payload: [String: Any]) {
     let type = Self.normalizedString(payload["type"]) ?? ""
     appShellRouteLog("ChatProfileRootController nativeEvent chatId=\(route.chatId) type=\(type)")
     switch type {
     case "headerBack":
       onClose?()
+    case "profileAppearanceUpdated":
+      profileView.refreshProfileAppearance()
+      onProfileAppearanceUpdated?()
     case "headerSearchPressed":
       AppToastController.shared.show("Search stays in the chat page.")
     case "headerAudioCallPressed":
@@ -5318,8 +5429,7 @@ final class ChatConversationController: UIViewController {
   func handleNavigationAction(_ action: AppChatNavigationAction) {
     switch action {
     case .avatar:
-      guard route.chatId != "saved_messages", !route.isAgentChat else { return }
-      showProfileView(animated: true)
+      pushProfileView(animated: true)
     }
   }
 
@@ -6080,6 +6190,61 @@ final class ChatConversationController: UIViewController {
     profileView?.setProfileHandle(Self.profileHandle(for: route))
   }
 
+  private func profileRouteSnapshot() -> ChatRoute {
+    ChatRoute(
+      chatId: route.chatId,
+      title: route.title,
+      peerUserId: route.peerUserId,
+      peerAgentId: route.peerAgentId,
+      isAgent: route.isAgent,
+      avatarURI: route.avatarURI,
+      isGroup: route.isGroup,
+      unreadCount: route.unreadCount,
+      initialRows: latestProfileRows,
+      agentEventInboxMode: route.agentEventInboxMode,
+      bridgeProvider: route.bridgeProvider
+    )
+  }
+
+  private func pushProfileView(animated: Bool) {
+    guard route.chatId != "saved_messages" else { return }
+    let profileRoute = profileRouteSnapshot()
+    let onClose: () -> Void = { [weak self] in
+      guard let self, let navigationController = self.navigationController,
+        navigationController.viewControllers.count > 1
+      else { return }
+      navigationController.popViewController(animated: true)
+    }
+    let onProfileAppearanceUpdated: () -> Void = { [weak self] in
+      self?.mainView.refreshProfileAppearance()
+    }
+
+    guard let navigationController else {
+      showProfileView(animated: animated)
+      return
+    }
+
+    if let top = navigationController.topViewController as? ChatProfileRootController,
+      top.chatId == route.chatId
+    {
+      top.update(
+        route: profileRoute,
+        isDark: isDark,
+        onClose: onClose,
+        onProfileAppearanceUpdated: onProfileAppearanceUpdated
+      )
+      return
+    }
+
+    let controller = ChatProfileRootController(
+      route: profileRoute,
+      isDark: isDark,
+      onClose: onClose,
+      onProfileAppearanceUpdated: onProfileAppearanceUpdated
+    )
+    navigationController.pushViewController(controller, animated: animated)
+  }
+
   private func makeProfileViewIfNeeded() -> ChatProfileMainView {
     if let profileView {
       return profileView
@@ -6311,7 +6476,9 @@ final class ChatConversationController: UIViewController {
         showProfileView(animated: true)
       }
     case "headerAvatarPressed":
-      showProfileView(animated: true)
+      pushProfileView(animated: true)
+    case "profileAppearanceUpdated":
+      mainView.refreshProfileAppearance()
     case "headerAgentPressed":
       return
     case "agentChatPressed":
@@ -6328,13 +6495,17 @@ final class ChatConversationController: UIViewController {
       let agentUsername = Self.normalizedString(
         payload["agentUsername"] ?? payload["agent_username"]
           ?? payload["agentHandle"] ?? payload["agent_handle"])
+      let agentID = Self.normalizedString(payload["agentId"] ?? payload["agent_id"])
+      let bridgeProvider = Self.normalizedString(payload["provider"] ?? payload["agentBridgeProvider"])
       Task { @MainActor [weak self] in
         guard let self else { return }
         await openAgentDirectChat(
           from: self,
           agentUserId: agentUserId,
           agentName: agentName,
-          agentUsername: agentUsername
+          agentUsername: agentUsername,
+          agentId: agentID,
+          bridgeProvider: bridgeProvider
         )
       }
     case "agentInboxPressed":
@@ -8358,7 +8529,9 @@ private func openAgentDirectChat(
   from presenter: UIViewController,
   agentUserId: String,
   agentName: String,
-  agentUsername: String?
+  agentUsername: String?,
+  agentId: String? = nil,
+  bridgeProvider: String? = nil
 ) async {
   guard let config = AppSessionConfig.current else {
     AppToastController.shared.show("The current session is unavailable.")
@@ -8377,13 +8550,28 @@ private func openAgentDirectChat(
     let title =
       normalizedUsername.flatMap { $0.isEmpty ? nil : $0 }
       ?? agentName
+    let normalizedAgentId = ChatDirectMessageService.normalizedString(agentId)
+    let resolvedBridgeProvider =
+      ChatDirectMessageService.normalizedString(bridgeProvider)?.lowercased()
+      ?? ChatRoute.resolveBridgeProvider(
+        peerUserId: agentUserId,
+        name: title,
+        isAgent: true,
+        agentId: normalizedAgentId
+      )
+    let routeAgentId = resolvedBridgeProvider != nil
+      ? (normalizedAgentId ?? agentUserId)
+      : normalizedAgentId
     let route = ChatRoute(
       chatId: result.chatID,
       title: title,
       peerUserId: agentUserId,
+      peerAgentId: routeAgentId,
+      isAgent: routeAgentId != nil || resolvedBridgeProvider != nil,
       avatarURI: nil,
       isGroup: false,
-      initialRows: result.messages
+      initialRows: result.messages,
+      bridgeProvider: resolvedBridgeProvider
     )
     guard let navigation = presenter.navigationController else { return }
     let controller = ChatConversationController(
@@ -8945,6 +9133,10 @@ final class ChatAgentConversationController: UIViewController {
     switch type {
     case "headerBack":
       onClose?()
+    case "headerAvatarPressed":
+      pushAgentProfile(animated: true)
+    case "profileAppearanceUpdated":
+      mainView.refreshProfileAppearance()
     case "sendMessage":
       let text = ((payload["text"] as? String) ?? "")
         .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -8967,18 +9159,65 @@ final class ChatAgentConversationController: UIViewController {
       let agentUsername =
         (payload["agentUsername"] as? String)
         ?? (payload["agentHandle"] as? String)
+      let agentID = (payload["agentId"] as? String) ?? (payload["agent_id"] as? String)
+      let bridgeProvider = (payload["provider"] as? String) ?? (payload["agentBridgeProvider"] as? String)
       Task { @MainActor [weak self] in
         guard let self else { return }
         await openAgentDirectChat(
           from: self,
           agentUserId: agentUserId,
           agentName: agentName,
-          agentUsername: agentUsername
+          agentUsername: agentUsername,
+          agentId: agentID,
+          bridgeProvider: bridgeProvider
         )
       }
     default:
       agentView.handleHostEvent(payload)
     }
+  }
+
+  private func pushAgentProfile(animated: Bool) {
+    let route = ChatRoute(
+      chatId: "vibe_agent",
+      title: "Vibe AI",
+      peerUserId: nil,
+      peerAgentId: "vibe_agent",
+      isAgent: true,
+      avatarURI: nil,
+      isGroup: false,
+      initialRows: []
+    )
+    let onClose: () -> Void = { [weak self] in
+      guard let self, let navigationController = self.navigationController,
+        navigationController.viewControllers.count > 1
+      else { return }
+      navigationController.popViewController(animated: true)
+    }
+    let onProfileAppearanceUpdated: () -> Void = { [weak self] in
+      self?.mainView.refreshProfileAppearance()
+    }
+
+    guard let navigationController else { return }
+    if let top = navigationController.topViewController as? ChatProfileRootController,
+      top.chatId == route.chatId
+    {
+      top.update(
+        route: route,
+        isDark: isDark,
+        onClose: onClose,
+        onProfileAppearanceUpdated: onProfileAppearanceUpdated
+      )
+      return
+    }
+
+    let controller = ChatProfileRootController(
+      route: route,
+      isDark: isDark,
+      onClose: onClose,
+      onProfileAppearanceUpdated: onProfileAppearanceUpdated
+    )
+    navigationController.pushViewController(controller, animated: animated)
   }
 
   private func handleAgentEvent(_ payload: [String: Any]) {
@@ -9001,13 +9240,17 @@ final class ChatAgentConversationController: UIViewController {
       let agentUsername =
         (payload["agentUsername"] as? String)
         ?? (payload["agentHandle"] as? String)
+      let agentID = (payload["agentId"] as? String) ?? (payload["agent_id"] as? String)
+      let bridgeProvider = (payload["provider"] as? String) ?? (payload["agentBridgeProvider"] as? String)
       Task { @MainActor [weak self] in
         guard let self else { return }
         await openAgentDirectChat(
           from: self,
           agentUserId: agentUserId,
           agentName: agentName,
-          agentUsername: agentUsername
+          agentUsername: agentUsername,
+          agentId: agentID,
+          bridgeProvider: bridgeProvider
         )
       }
     default:

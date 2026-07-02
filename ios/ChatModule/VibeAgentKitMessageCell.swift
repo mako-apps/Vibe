@@ -1179,7 +1179,7 @@ private final class VibeAgentKitStepRowView: UIView {
     clearDetailStack()
     detailStack.alpha = 1.0
     detailStack.transform = .identity
-    buildDetail(item: item, kind: kind, isError: isError, appearance: appearance)
+    buildDetail(item: item, kind: kind, isError: isError, streaming: streaming, appearance: appearance)
     if streaming && detailStack.arrangedSubviews.isEmpty {
       detailStack.addArrangedSubview(caption("Waiting for details...", liveTextColor))
     }
@@ -1242,14 +1242,23 @@ private final class VibeAgentKitStepRowView: UIView {
     item: VibeAgentKitProgressItem,
     kind: String,
     isError: Bool,
+    streaming: Bool = false,
     appearance: VibeAgentKitChatAppearance
   ) {
+    // A step whose result hasn't arrived yet (live turn's trailing tool) must not
+    // read "✓ Success" over an empty output — verdicts only exist once the tool
+    // finished. `running` covers the bridge's result-less status; an empty output
+    // on a still-STREAMING row is the same in-flight state (a finished step with
+    // genuinely empty output — mkdir & co — still reads Success).
+    let isRunning = vibeAgentKitRunningStepStatuses.contains((item.status ?? "").lowercased())
     switch kind {
     case "bash":
       detailStack.addArrangedSubview(caption("Shell", appearance.textSecondary))
+      let output = item.messageContent
+      let pending = isRunning || (streaming && !isError && (output?.isEmpty ?? true))
       detailStack.addArrangedSubview(
         terminalCard(
-          command: item.command, output: item.messageContent, isError: isError,
+          command: item.command, output: output, isError: isError, pending: pending,
           appearance: appearance))
 
     case "edit", "write":
@@ -1300,6 +1309,7 @@ private final class VibeAgentKitStepRowView: UIView {
     command: String?,
     output: String?,
     isError: Bool,
+    pending: Bool = false,
     appearance: VibeAgentKitChatAppearance
   ) -> UIView {
     let dark = appearance.isDark
@@ -1361,8 +1371,14 @@ private final class VibeAgentKitStepRowView: UIView {
     let status = UILabel()
     status.translatesAutoresizingMaskIntoConstraints = false
     status.font = UIFont.systemFont(ofSize: 12.0, weight: .semibold)
-    status.textColor = isError ? VibeAgentDiffPalette.deletionText : VibeAgentDiffPalette.additionText
-    status.text = isError ? "✕ Failed" : "✓ Success"
+    if pending {
+      // No result yet — don't claim a verdict over an empty output.
+      status.textColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.8)
+      status.text = "Running…"
+    } else {
+      status.textColor = isError ? VibeAgentDiffPalette.deletionText : VibeAgentDiffPalette.additionText
+      status.text = isError ? "✕ Failed" : "✓ Success"
+    }
     status.textAlignment = .right
     inner.addArrangedSubview(status)
 
@@ -2546,11 +2562,17 @@ final class VibeAgentKitStepDetailViewController: UIViewController {
       stack.addArrangedSubview(sectionLabel(item.label, weight: .semibold, size: 16.0))
     }
 
+    // No verdict before the result arrives (see the step-row terminal card). The
+    // bridge marks result-less tools "running"; a finished step with genuinely
+    // empty output still reads Success.
+    let isRunning = vibeAgentKitRunningStepStatuses.contains((item.status ?? "").lowercased())
     switch kind {
     case "bash":
       stack.addArrangedSubview(caption("Shell", appearance.textSecondary))
       stack.addArrangedSubview(
-        terminalCard(command: item.command, output: item.messageContent, isError: isError))
+        terminalCard(
+          command: item.command, output: item.messageContent, isError: isError,
+          pending: isRunning))
 
     case "edit", "write":
       if let name = item.fileName, !name.isEmpty {
@@ -2606,7 +2628,7 @@ final class VibeAgentKitStepDetailViewController: UIViewController {
 
   /// One terminal-style card: the `$ command`, its output, and a right-aligned
   /// ✓ Success / ✕ Failed result — the shell-result look.
-  private func terminalCard(command: String?, output: String?, isError: Bool) -> UIView {
+  private func terminalCard(command: String?, output: String?, isError: Bool, pending: Bool = false) -> UIView {
     let dark = appearance.isDark
     let card = UIView()
     card.translatesAutoresizingMaskIntoConstraints = false
@@ -2666,8 +2688,13 @@ final class VibeAgentKitStepDetailViewController: UIViewController {
     let status = UILabel()
     status.translatesAutoresizingMaskIntoConstraints = false
     status.font = UIFont.systemFont(ofSize: 12.5, weight: .semibold)
-    status.textColor = isError ? VibeAgentDiffPalette.deletionText : VibeAgentDiffPalette.additionText
-    status.text = isError ? "✕ Failed" : "✓ Success"
+    if pending {
+      status.textColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.8)
+      status.text = "Running…"
+    } else {
+      status.textColor = isError ? VibeAgentDiffPalette.deletionText : VibeAgentDiffPalette.additionText
+      status.text = isError ? "✕ Failed" : "✓ Success"
+    }
     status.textAlignment = .right
     inner.addArrangedSubview(status)
 

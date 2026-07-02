@@ -168,7 +168,7 @@ public final class VibeNativeCallManager: NSObject {
       if let error {
         NSLog("[VibeNativeCall] reportNewIncomingCall failed callId=%@ error=%@", callId, error.localizedDescription)
       } else {
-        NSLog("[VibeNativeCall] reportNewIncomingCall ok callId=%@ uuid=%@", callId, uuid.uuidString)
+        VibeDebugLog.log("[VibeNativeCall] reportNewIncomingCall ok callId=%@ uuid=%@", callId, uuid.uuidString)
       }
     }
   }
@@ -176,7 +176,7 @@ public final class VibeNativeCallManager: NSObject {
   private func syncStoredPushTokensLocked(reason: String) {
     if pushSyncInFlight {
       pushSyncNeedsRetry = true
-      NSLog("[VibeNativeCall] push token sync skipped reason=%@ state=inFlight", reason)
+      VibeDebugLog.log("[VibeNativeCall] push token sync skipped reason=%@ state=inFlight", reason)
       return
     }
 
@@ -184,12 +184,12 @@ public final class VibeNativeCallManager: NSObject {
     let apns = normalizedString(tokens["apns"])
     let voip = normalizedString(tokens["voip"] ?? tokens["apns_voip"])
     guard apns != nil || voip != nil else {
-      NSLog("[VibeNativeCall] push token sync skipped reason=%@ missingTokens=true", reason)
+      VibeDebugLog.log("[VibeNativeCall] push token sync skipped reason=%@ missingTokens=true", reason)
       return
     }
 
     guard let config = resolvePushSyncConfig() else {
-      NSLog("[VibeNativeCall] push token sync skipped reason=%@ missingSession=true", reason)
+      VibeDebugLog.log("[VibeNativeCall] push token sync skipped reason=%@ missingSession=true", reason)
       return
     }
 
@@ -204,12 +204,12 @@ public final class VibeNativeCallManager: NSObject {
       voip ?? "",
     ].joined(separator: "|")
     if lastPushSyncSignature == signature {
-      NSLog("[VibeNativeCall] push token sync skipped reason=%@ unchanged=true", reason)
+      VibeDebugLog.log("[VibeNativeCall] push token sync skipped reason=%@ unchanged=true", reason)
       return
     }
 
     guard let url = URL(string: "\(config.apiBaseUrl)/api/user/profile") else {
-      NSLog("[VibeNativeCall] push token sync skipped reason=%@ invalidURL=true", reason)
+      VibeDebugLog.log("[VibeNativeCall] push token sync skipped reason=%@ invalidURL=true", reason)
       return
     }
 
@@ -223,7 +223,7 @@ public final class VibeNativeCallManager: NSObject {
     ])
 
     pushSyncInFlight = true
-    NSLog(
+    VibeDebugLog.log(
       "[VibeNativeCall] push token sync start reason=%@ userId=%@ apns=%@ voip=%@",
       reason,
       config.userId,
@@ -246,7 +246,7 @@ public final class VibeNativeCallManager: NSObject {
         }
         if (200...299).contains(status) {
           self.lastPushSyncSignature = signature
-          NSLog("[VibeNativeCall] push token sync ok reason=%@ status=%d", reason, status)
+          VibeDebugLog.log("[VibeNativeCall] push token sync ok reason=%@ status=%d", reason, status)
         } else {
           NSLog("[VibeNativeCall] push token sync failed reason=%@ status=%d", reason, status)
         }

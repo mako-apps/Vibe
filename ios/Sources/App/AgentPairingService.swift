@@ -474,9 +474,9 @@ enum AgentBridgeSelectionStore {
     switch provider.lowercased() {
     case "claude":
       return [
-        ("Haiku", "Fastest Claude alias", "haiku"),
-        ("Sonnet", "Balanced Claude alias", "sonnet"),
-        ("Opus", "Most capable Claude alias", "opus"),
+        ("Haiku 4.5", "Fastest Claude model", "haiku"),
+        ("Sonnet 5", "Balanced Claude model", "sonnet"),
+        ("Opus 4.8", "Most capable Claude model", "opus"),
       ]
     default:
       return [
@@ -502,7 +502,11 @@ enum AgentBridgeSelectionStore {
   /// for the header so the displayed model matches whatever a loaded run reports.
   static func modelTitle(provider: String, model: String?) -> String {
     guard let rawModel = normalizedString(model) else { return defaultModelTitle(provider: provider) }
-    if let match = modelChoices(provider: provider).first(where: { $0.value == rawModel.lowercased() }) {
+    // The bridge may report the CLI's fully-resolved model id (e.g.
+    // "claude-sonnet-5-20260101"), not the bare alias — canonicalize first so it still
+    // matches a catalog entry instead of falling through to the raw, ugly id string.
+    let canonical = normalizedModel(provider: provider, model: rawModel) ?? rawModel.lowercased()
+    if let match = modelChoices(provider: provider).first(where: { $0.value == canonical }) {
       return match.title
     }
     return rawModel

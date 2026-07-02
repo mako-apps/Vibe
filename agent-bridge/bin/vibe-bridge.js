@@ -2354,7 +2354,16 @@ function looksToolish(line) {
     line.includes("tool_use") ||
     line.includes("tool_result") ||
     line.includes('"command"') ||
+    line.includes('"response_item"') ||
     line.includes("function_call") ||
+    line.includes("custom_tool_call") ||
+    line.includes("function_call_output") ||
+    line.includes("custom_tool_call_output") ||
+    line.includes("command_execution") ||
+    line.includes("file_change") ||
+    line.includes("mcp_tool_call") ||
+    line.includes("todo_list") ||
+    line.includes("apply_patch") ||
     line.includes('"tool"')
   );
 }
@@ -3567,15 +3576,11 @@ function attachTurnActions(messages, host, uids, detailByUid, resultByUid) {
   for (const uid of uids) {
     const det = detailByUid.get(uid);
     if (!det) continue;
-    let hasResult = true;
     if (OUTPUT_KINDS.has(det.kind)) {
       const r = resultByUid.get(uid);
       if (r) { det.output = r.output; det.isError = r.isError; }
-      else hasResult = false;
     }
-    // No tool_result yet = the tool is still executing. Shipping "done" here made
-    // the phone's expand sheet show an empty "Success" mid-run.
-    nodes.push(actionNode(det, uid, det.isError ? "error" : hasResult ? "done" : "running"));
+    nodes.push(actionNode(det, uid, det.isError ? "error" : "done"));
     actions.push(Object.assign({ id: String(uid) }, det));
   }
   if (!nodes.length) return;
@@ -3638,15 +3643,14 @@ function foldTurnIntoHost(messages, turnItems, detailByUid, resultByUid, turnRea
     }
     const det = detailByUid.get(it.uid);
     if (!det) continue;
-    let hasResult = true;
     if (OUTPUT_KINDS.has(det.kind)) {
       const r = resultByUid.get(it.uid);
       if (r) { det.output = r.output; det.isError = r.isError; }
-      else hasResult = false;
     }
-    // No tool_result yet = still executing (a live turn's trailing tool). "done"
-    // here rendered an empty "Success" in the phone's expand sheet mid-run.
-    nodes.push(actionNode(det, it.uid, det.isError ? "error" : hasResult ? "done" : "running"));
+    // NOTE: a result-less trailing tool on the LIVE turn is flagged "running" by
+    // markMessageRunning (not here) — status set at fold time would also poison
+    // FINISHED sessions whose last tool never got a result (cancelled runs).
+    nodes.push(actionNode(det, it.uid, det.isError ? "error" : "done"));
     actions.push(Object.assign({ id: String(it.uid) }, det));
   }
 

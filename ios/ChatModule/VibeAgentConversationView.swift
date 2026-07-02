@@ -1200,6 +1200,8 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     if pushToTopUserId != nil, !turnStillLive, newUserSendId == nil {
       pushToTopUserId = nil
       pushToTopReserve = 0
+      pushToTopDetached = false
+      pinAnimationDeadline = nil
     }
     // A streaming delta to the SAME rows (ids unchanged) is the common live case.
     let isContentOnlyUpdate = !newTableIds.isEmpty && newTableIds == oldTableIds
@@ -1219,6 +1221,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
           // Pinned turn growing: the reserve shrinks passively in updateScrollInsets as the
           // answer streams in; just refresh the inset (no scroll move — the question holds).
           self.updateScrollInsets()
+          self.reassertPinnedOffsetIfNeeded()
         } else if wasNearBottom {
           self.scrollToBottom(animated: true)
         }
@@ -1254,9 +1257,20 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       updateScrollInsets()
       if pushToTopUserId == nil, wasNearBottom {
         scrollToBottom(animated: false)
+      } else {
+        reassertPinnedOffsetIfNeeded()
       }
     } else {
       tableView.reloadData()
+      // Materialize real self-sized heights BEFORE any reserve/offset math below.
+      // Right after reloadData the table only has ESTIMATED heights (96pt/row), which
+      // undercount the content below the pinned question — computedPushToTopReserve
+      // then re-inflates the bottom inset into a big scrollable dead gap on every
+      // update that lands on this branch (it collapsed again as soon as any inline
+      // toggle forced a real layout, which is exactly the reported flicker cycle).
+      if tableView.window != nil {
+        UIView.performWithoutAnimation { tableView.layoutIfNeeded() }
+      }
       if let id = newUserSendId {
         pinUserMessageToTop(id: id, animated: true)
       } else {
@@ -1265,6 +1279,8 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
         updateScrollInsets()
         if pushToTopUserId == nil, wasNearBottom {
           scrollToBottom(animated: true)
+        } else {
+          reassertPinnedOffsetIfNeeded()
         }
       }
     }
@@ -2374,9 +2390,19 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       // frame (the "push-to-top sometimes jumps back to bottom on agent start" bug). Consume
       // the one-shot but hold the pin.
       if pushToTopUserId == nil {
-        scrollToBottom(animated: false)
+        // Double pass: the first scroll positions against ESTIMATED self-sizing heights;
+        // materializing the real cells corrects contentSize, so scroll once more in the
+        // same (animation-free) pass. Otherwise the feed visibly settles a frame later —
+        // the "starts at the wrong place, then flicks to the bottom" open.
+        UIView.performWithoutAnimation {
+          scrollToBottom(animated: false)
+          tableView.layoutIfNeeded()
+          scrollToBottom(animated: false)
+        }
       }
     }
+    // Keep the pinned question rock-steady across self-sizing settles / row inserts.
+    reassertPinnedOffsetIfNeeded()
   }
 
   private func setupJumpToBottomButton() {
@@ -2422,6 +2448,11 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
 
   func scrollViewDidScroll(_ scrollView: UIScrollView) {
     setJumpButtonVisible(!isNearBottom())
+    // The user physically grabbed the list while a question was pinned — they own the
+    // scroll for the rest of the turn (stop re-asserting the pinned offset).
+    if pushToTopUserId != nil, scrollView.isTracking || scrollView.isDragging {
+      pushToTopDetached = true
+    }
   }
 
   private func setJumpButtonVisible(_ visible: Bool) {
@@ -3256,6 +3287,35 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   /// Extra bottom inset reserved so the pinned question can rise to the top; it shrinks
   /// toward zero as the answer fills the space below.
   private var pushToTopReserve: CGFloat = 0
+  /// The user grabbed the list after the pin — stop re-asserting the pinned offset so
+  /// they can scroll freely for the rest of the turn.
+  private var pushToTopDetached = false
+  /// While the animated pin scroll is in flight, the per-layout re-assert must not
+  /// snap the offset out from under the spring.
+  private var pinAnimationDeadline: Date?
+
+  /// Hold the pinned question exactly at its target offset across the passes that used
+  /// to nudge it (self-sizing estimates resolving, the answer row inserting below, inset
+  /// changes) — the "lands, then hops ~10px" bug. Never fights the user: bails while
+  /// they touch/fling the list or once they've detached, and stays quiet during the
+  /// pin's own spring animation and inline toggle updates.
+  private func reassertPinnedOffsetIfNeeded() {
+    guard let id = pushToTopUserId, !pushToTopDetached, toggleScrollLockDepth == 0,
+      !tableView.isTracking, !tableView.isDragging, !tableView.isDecelerating,
+      let idx = tableMessages.firstIndex(where: { $0.id == id })
+    else { return }
+    if let deadline = pinAnimationDeadline {
+      if Date() < deadline { return }
+      pinAnimationDeadline = nil
+    }
+    let rect = tableView.rectForRow(at: IndexPath(row: idx, section: 0))
+    guard rect.height > 0 else { return }
+    let topInset = tableView.adjustedContentInset.top
+    let targetY = pixelAlignedValue(max(-topInset, rect.minY - topInset))
+    if abs(tableView.contentOffset.y - targetY) > 0.5 {
+      tableView.setContentOffset(CGPoint(x: 0, y: targetY), animated: false)
+    }
+  }
 
   /// Pin a freshly-sent user message to the top. The room below is reserved passively by
   /// `updateScrollInsets`/`computedPushToTopReserve` (recomputed every layout pass, so it
@@ -3265,6 +3325,8 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   private func pinUserMessageToTop(id: String, animated: Bool) {
     guard let idx = tableMessages.firstIndex(where: { $0.id == id }) else { return }
     pushToTopUserId = id
+    pushToTopDetached = false
+    pinAnimationDeadline = animated ? Date().addingTimeInterval(0.55) : nil
     tableView.layoutIfNeeded()
     updateScrollInsets(force: true)
     tableView.layoutIfNeeded()

@@ -8,8 +8,8 @@ private let appRuntimeUITraceLogger = Logger(
 )
 
 private func appRuntimeUITrace(_ message: String) {
-  appRuntimeUITraceLogger.notice("\(message, privacy: .public)")
-  NSLog("[VibeUITrace] %@", message)
+  VibeDebugLog.notice(logger: appRuntimeUITraceLogger, message)
+  VibeDebugLog.log("[VibeUITrace] %@", message)
 }
 
 enum AppAppearanceOption: String, CaseIterable, Identifiable {

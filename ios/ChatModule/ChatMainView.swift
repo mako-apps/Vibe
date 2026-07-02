@@ -383,12 +383,12 @@ public final class ChatMainView: UIView,
   func setDefersEngineStateRefreshes(_ value: Bool) {
     if defersEngineStateRefreshes == value { return }
     defersEngineStateRefreshes = value
-    NSLog("[ChatMainView] defersEngineStateRefreshes=%@", value ? "true" : "false")
+    VibeDebugLog.log("[ChatMainView] defersEngineStateRefreshes=%@", value ? "true" : "false")
   }
 
   func setEngineChatId(_ value: String) {
     engineChatId = value.trimmingCharacters(in: .whitespacesAndNewlines)
-    NSLog("[ChatMainView][Pin] setEngineChatId=%@", engineChatId)
+    VibeDebugLog.log("[ChatMainView][Pin] setEngineChatId=%@", engineChatId)
     chatListView.setEngineChatId(value)
     guard !defersEngineStateRefreshes else {
       updateHeaderTexts()
@@ -549,6 +549,14 @@ public final class ChatMainView: UIView,
     applyTheme()
     updateHeaderTexts()
     updateProfileTexts()
+  }
+
+  func refreshProfileAppearance() {
+    applyTheme()
+    updateAvatarViews()
+    updateHeaderTexts()
+    updateProfileTexts()
+    setNeedsLayout()
   }
 
   private func reapplyNativeThemeForCurrentInterfaceStyle() {
@@ -1395,7 +1403,7 @@ public final class ChatMainView: UIView,
     if changeReason == "chatPinnedUpdated" || changeReason == "chatRowsReloaded"
       || changeReason == "chatMessageInserted" || changeReason == "chatMessageChanged"
     {
-      NSLog(
+      VibeDebugLog.log(
         "[ChatMainView][Pin] engineDidChange reason=%@ changedChatId=%@ engineChatId=%@",
         changeReason,
         changedChatId,
@@ -1638,7 +1646,7 @@ public final class ChatMainView: UIView,
     let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !chatId.isEmpty else {
       guard force || pinnedBannerMessageId != nil || pinnedBannerBody != nil || !pinnedBannerView.isHidden else { return }
-      NSLog("[ChatMainView][Pin] clear banner: empty engineChatId force=%@", force ? "true" : "false")
+      VibeDebugLog.log("[ChatMainView][Pin] clear banner: empty engineChatId force=%@", force ? "true" : "false")
       pinnedBannerMessageId = nil
       pinnedBannerTitle = nil
       pinnedBannerBody = nil
@@ -1682,7 +1690,7 @@ public final class ChatMainView: UIView,
       || nextFileName != pinnedBannerFileName
       || nextIsFile != pinnedBannerIsFile
       || pinnedBannerView.isHidden != shouldHide
-    NSLog(
+    VibeDebugLog.log(
       "[ChatMainView][Pin] refresh chatId=%@ force=%@ pins=%@ topMessageId=%@ title=%@ nextBody=%@ file=%@ url=%@ currentHidden=%@ shouldHide=%@ changed=%@ loading=%@",
       chatId,
       force ? "true" : "false",
@@ -1714,7 +1722,7 @@ public final class ChatMainView: UIView,
         animateIcon: bannerChanged
       )
       if pinnedBannerView.isHidden {
-        NSLog(
+        VibeDebugLog.log(
           "[ChatMainView][Pin] show banner messageId=%@ alphaTarget=%@",
           nextMessageId ?? "(nil)",
           currentPage == .chat ? "1.0" : "0.0"
@@ -1725,7 +1733,7 @@ public final class ChatMainView: UIView,
           self.pinnedBannerView.alpha = self.currentPage == .chat ? 1.0 : 0.0
         }
       } else {
-        NSLog(
+        VibeDebugLog.log(
           "[ChatMainView][Pin] update banner messageId=%@ alpha=%@",
           nextMessageId ?? "(nil)",
           currentPage == .chat ? "1.0" : "0.0"
@@ -1737,7 +1745,7 @@ public final class ChatMainView: UIView,
       if pinnedBannerView.isHidden {
         pinnedBannerView.alpha = 0.0
       } else {
-        NSLog("[ChatMainView][Pin] hide banner (no body)")
+        VibeDebugLog.log("[ChatMainView][Pin] hide banner (no body)")
         UIView.animate(
           withDuration: 0.18,
           animations: {
@@ -3753,12 +3761,7 @@ public final class ChatMainView: UIView,
   }
 
   private func bridgeCurrentModelTitle(_ options: AgentBridgeRunOptions, provider: String) -> String {
-    if let model = options.model?.trimmingCharacters(in: .whitespacesAndNewlines),
-      !model.isEmpty
-    {
-      return bridgeModelChoices(for: provider).first(where: { $0.value == model })?.title ?? model
-    }
-    return bridgeProviderDefaultModelTitle(provider)
+    AgentBridgeSelectionStore.modelTitle(provider: provider, model: options.model)
   }
 
   private func resolvedBridgeHeaderTitle() -> String? {
@@ -3767,7 +3770,7 @@ public final class ChatMainView: UIView,
     let modelTitle = bridgeCurrentModelTitle(options, provider: bridgeProvider)
     let hasExplicitModel = options.model?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
     guard options.intelligence != .low, hasExplicitModel else { return modelTitle }
-    return "\(modelTitle.lowercased())-thinking"
+    return "\(modelTitle) · Thinking"
   }
 
   private func resolvedBridgeRepositorySubtitle() -> String? {
@@ -3785,22 +3788,7 @@ public final class ChatMainView: UIView,
   }
 
   private func bridgeModelChoices(for provider: String) -> [(title: String, subtitle: String?, value: String?)] {
-    switch provider.lowercased() {
-    case "claude":
-      return [
-        ("Haiku", "Fastest Claude alias", "haiku"),
-        ("Sonnet", "Balanced Claude alias", "sonnet"),
-        ("Opus", "Most capable Claude alias", "opus"),
-      ]
-    default:
-      return [
-        ("GPT-5.5", nil, "gpt-5.5"),
-        ("GPT-5.5 Pro", nil, "gpt-5.5-pro"),
-        ("GPT-5.4", nil, "gpt-5.4"),
-        ("GPT-5.2", nil, "gpt-5.2"),
-        ("GPT-5", nil, "gpt-5"),
-      ]
-    }
+    AgentBridgeSelectionStore.modelChoices(provider: provider).map { ($0.title, $0.subtitle, $0.value) }
   }
 
   private func bridgeDefaultModelActions(
@@ -3821,11 +3809,7 @@ public final class ChatMainView: UIView,
   }
 
   private func bridgeProviderDefaultModelTitle(_ provider: String) -> String {
-    switch provider.lowercased() {
-    case "claude": return "Claude"
-    case "codex": return "Codex"
-    default: return provider.capitalized
-    }
+    AgentBridgeSelectionStore.defaultModelTitle(provider: provider)
   }
 
   private func updateBackButtonContent() {

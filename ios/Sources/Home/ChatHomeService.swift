@@ -350,11 +350,11 @@ private enum ChatHomeRowsCache {
     guard let data = defaults.data(forKey: cacheKey(userID: userID)),
       let object = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
     else {
-      NSLog("[ChatHomeRowsCache] restored rows=0 user=%@", String(userID.prefix(8)))
+      VibeDebugLog.log("[ChatHomeRowsCache] restored rows=0 user=%@", String(userID.prefix(8)))
       return []
     }
     let rows = object.compactMap(ChatHomeListRow.parse)
-    NSLog("[ChatHomeRowsCache] restored rows=%d user=%@", rows.count, String(userID.prefix(8)))
+    VibeDebugLog.log("[ChatHomeRowsCache] restored rows=%d user=%@", rows.count, String(userID.prefix(8)))
     return rows
   }
 
@@ -366,12 +366,12 @@ private enum ChatHomeRowsCache {
     guard JSONSerialization.isValidJSONObject(payload),
       let data = try? JSONSerialization.data(withJSONObject: payload, options: [])
     else {
-      NSLog("[ChatHomeRowsCache] skipped invalid payload rows=%d", rows.count)
+      VibeDebugLog.log("[ChatHomeRowsCache] skipped invalid payload rows=%d", rows.count)
       return
     }
     UserDefaults.standard.set(data, forKey: cacheKey(userID: userID))
     UserDefaults.standard.synchronize()
-    NSLog("[ChatHomeRowsCache] stored rows=%d user=%@", rows.count, String(userID.prefix(8)))
+    VibeDebugLog.log("[ChatHomeRowsCache] stored rows=%d user=%@", rows.count, String(userID.prefix(8)))
   }
 
   private static func cacheKey(userID: String) -> String {
