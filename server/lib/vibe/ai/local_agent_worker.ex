@@ -2612,6 +2612,7 @@ defmodule Vibe.AI.LocalAgentWorker do
       "tool", old, "Tool result" -> old
       "label", old, new -> if generic_tool_result_label?(new), do: old, else: new
       "input", old, new when is_map(new) and map_size(new) == 0 -> old
+      "kind", old, "tool" -> old
       "kind", old, nil -> old
       "target", old, nil -> old
       _key, _old, new -> new
