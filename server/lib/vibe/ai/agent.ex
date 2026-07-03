@@ -30,19 +30,25 @@ defmodule Vibe.AI.Agent do
   @tools [
     %{
       name: "search_music",
-      description: "Search for music tracks, albums, or artists. Returns streaming links from YouTube Music, Spotify, etc.",
+      description:
+        "Search for music tracks, albums, or artists. Returns streaming links from YouTube Music, Spotify, etc.",
       input_schema: %{
         type: "object",
         properties: %{
           query: %{type: "string", description: "Song name, artist, or album to search for"},
-          type: %{type: "string", enum: ["track", "album", "artist"], description: "Type of search"}
+          type: %{
+            type: "string",
+            enum: ["track", "album", "artist"],
+            description: "Type of search"
+          }
         },
         required: ["query"]
       }
     },
     %{
       name: "search_google",
-      description: "Search the web using Google. Returns relevant web results with titles, snippets, and URLs.",
+      description:
+        "Search the web using Google. Returns relevant web results with titles, snippets, and URLs.",
       input_schema: %{
         type: "object",
         properties: %{
@@ -53,38 +59,54 @@ defmodule Vibe.AI.Agent do
     },
     %{
       name: "analyze_image",
-      description: "Analyze an image URL. Can describe contents, read text (OCR), identify objects, etc.",
+      description:
+        "Analyze an image URL. Can describe contents, read text (OCR), identify objects, etc.",
       input_schema: %{
         type: "object",
         properties: %{
           image_url: %{type: "string", description: "URL of the image to analyze"},
-          task: %{type: "string", description: "What to do: describe, ocr, identify, or custom question"}
+          task: %{
+            type: "string",
+            description: "What to do: describe, ocr, identify, or custom question"
+          }
         },
         required: ["image_url"]
       }
     },
     %{
       name: "analyze_document",
-      description: "Analyze a document (PDF, text). Extract information, summarize, or answer questions about it.",
+      description:
+        "Analyze a document (PDF, text). Extract information, summarize, or answer questions about it.",
       input_schema: %{
         type: "object",
         properties: %{
           document_url: %{type: "string", description: "URL of the document"},
-          task: %{type: "string", description: "What to do: summarize, extract_key_points, answer_question"},
-          question: %{type: "string", description: "Optional specific question about the document"}
+          task: %{
+            type: "string",
+            description: "What to do: summarize, extract_key_points, answer_question"
+          },
+          question: %{
+            type: "string",
+            description: "Optional specific question about the document"
+          }
         },
         required: ["document_url", "task"]
       }
     },
     %{
       name: "post_to_channel",
-      description: "Post a message to the user's channel. Supports text, images, and media. The message will be broadcast to all channel subscribers.",
+      description:
+        "Post a message to the user's channel. Supports text, images, and media. The message will be broadcast to all channel subscribers.",
       input_schema: %{
         type: "object",
         properties: %{
           channel_id: %{type: "string", description: "The channel ID to post to"},
           content: %{type: "string", description: "The message content to post"},
-          type: %{type: "string", enum: ["text", "image", "media"], description: "Type of content"},
+          type: %{
+            type: "string",
+            enum: ["text", "image", "media"],
+            description: "Type of content"
+          },
           media_url: %{type: "string", description: "URL of the media (for image/media types)"}
         },
         required: ["channel_id", "content"]
@@ -92,7 +114,8 @@ defmodule Vibe.AI.Agent do
     },
     %{
       name: "get_channel_analytics",
-      description: "Get analytics for a channel the user owns: subscriber count, message count, recent joins.",
+      description:
+        "Get analytics for a channel the user owns: subscriber count, message count, recent joins.",
       input_schema: %{
         type: "object",
         properties: %{
@@ -109,9 +132,16 @@ defmodule Vibe.AI.Agent do
         properties: %{
           channel_id: %{type: "string", description: "The channel ID to post to"},
           content: %{type: "string", description: "The message content to post"},
-          type: %{type: "string", enum: ["text", "image", "media"], description: "Type of content"},
+          type: %{
+            type: "string",
+            enum: ["text", "image", "media"],
+            description: "Type of content"
+          },
           media_url: %{type: "string", description: "URL of the media (for image/media types)"},
-          scheduled_at: %{type: "string", description: "ISO8601 datetime when to publish (e.g. 2026-02-06T18:00:00Z)"}
+          scheduled_at: %{
+            type: "string",
+            description: "ISO8601 datetime when to publish (e.g. 2026-02-06T18:00:00Z)"
+          }
         },
         required: ["channel_id", "content", "scheduled_at"]
       }
@@ -125,13 +155,18 @@ defmodule Vibe.AI.Agent do
         properties: %{
           timeframe: %{
             type: "string",
-            description: "Time window to inspect, such as today, yesterday, last 4h, last 24h, last 7d, or last 30d"
+            description:
+              "Time window to inspect, such as today, yesterday, last 4h, last 24h, last 7d, or last 30d"
           },
           source: %{type: "string", description: "Optional source filter to a single sending app"},
-          event_type: %{type: "string", description: "Optional exact event type filter (use a value seen in the samples)"},
+          event_type: %{
+            type: "string",
+            description: "Optional exact event type filter (use a value seen in the samples)"
+          },
           event_type_prefix: %{
             type: "string",
-            description: "Optional event type prefix filter to match a whole family of event types"
+            description:
+              "Optional event type prefix filter to match a whole family of event types"
           },
           group_by: %{
             type: "string",
@@ -144,7 +179,10 @@ defmodule Vibe.AI.Agent do
             description:
               "Optional list of numeric payload paths to sum across matching events (use dotted paths seen in the sample events)."
           },
-          limit: %{type: "integer", description: "Maximum sample events to return alongside the aggregates, default 25"},
+          limit: %{
+            type: "integer",
+            description: "Maximum sample events to return alongside the aggregates, default 25"
+          },
           query: %{
             type: "string",
             description: "Optional free-form intent note for the lookup"
@@ -162,7 +200,8 @@ defmodule Vibe.AI.Agent do
           mode: %{
             type: "string",
             enum: ["per_event", "batched_summary"],
-            description: "per_event posts each event as it arrives; batched_summary stores events and posts summaries on the chosen cadence."
+            description:
+              "per_event posts each event as it arrives; batched_summary stores events and posts summaries on the chosen cadence."
           },
           cadence: %{
             type: "string",
@@ -182,7 +221,8 @@ defmodule Vibe.AI.Agent do
         properties: %{
           action: %{
             type: "string",
-            description: "The connected app action id, such as website.summary or waitlist.summary"
+            description:
+              "The connected app action id, such as website.summary or waitlist.summary"
           },
           params: %{
             type: "object",
@@ -191,11 +231,13 @@ defmodule Vibe.AI.Agent do
           },
           integration_id: %{
             type: "string",
-            description: "Optional specific integration id when multiple connected apps are configured"
+            description:
+              "Optional specific integration id when multiple connected apps are configured"
           },
           integration_name: %{
             type: "string",
-            description: "Optional specific integration name when multiple connected apps are configured"
+            description:
+              "Optional specific integration name when multiple connected apps are configured"
           }
         },
         required: ["action"]
@@ -249,7 +291,12 @@ defmodule Vibe.AI.Agent do
         properties: %{
           subagent_id: %{
             type: "string",
-            enum: ["builder_assistant", "integration_advisor", "music_specialist", "document_specialist"],
+            enum: [
+              "builder_assistant",
+              "integration_advisor",
+              "music_specialist",
+              "document_specialist"
+            ],
             description: "Which internal specialist should handle the task."
           },
           task: %{
@@ -400,7 +447,12 @@ defmodule Vibe.AI.Agent do
         max_depth: max_depth,
         system_prompt: system_prompt,
         tools: tools,
-        state: %{user_id: user_id, requester_user_id: requester_user_id, chat_id: chat_id, agent_id: agent_id},
+        state: %{
+          user_id: user_id,
+          requester_user_id: requester_user_id,
+          chat_id: chat_id,
+          agent_id: agent_id
+        },
         callback: callback,
         stream_text?: true,
         execute_tools: &execute_tools_runtime/3,
@@ -428,11 +480,12 @@ defmodule Vibe.AI.Agent do
     if is_nil(api_key) do
       {:error, "No API key configured"}
     else
-      body = Jason.encode!(%{
-        model: @claude_model,
-        max_tokens: 100,
-        messages: [%{role: "user", content: prompt}]
-      })
+      body =
+        Jason.encode!(%{
+          model: @claude_model,
+          max_tokens: 100,
+          messages: [%{role: "user", content: prompt}]
+        })
 
       headers = [
         {"content-type", "application/json"},
@@ -447,12 +500,15 @@ defmodule Vibe.AI.Agent do
           case Jason.decode(resp_body) do
             {:ok, %{"content" => [%{"text" => text} | _]}} ->
               {:ok, text}
+
             _ ->
               {:error, "Failed to parse response"}
           end
+
         {:ok, %{status: status, body: body}} ->
           Logger.error("Claude API error: #{status} - #{body}")
           {:error, "API error: #{status}"}
+
         {:error, reason} ->
           {:error, reason}
       end
@@ -461,31 +517,34 @@ defmodule Vibe.AI.Agent do
 
   defp build_messages(history, user_message, image_urls) do
     # Convert history to Claude format
-    history_messages = Enum.map(history, fn msg ->
-      %{
-        role: msg["role"] || msg[:role],
-        content: msg["content"] || msg[:content]
-      }
-    end)
-
-    # Build current message with optional images
-    current_content = if Enum.empty?(image_urls) do
-      user_message
-    else
-      # Multi-modal message with images
-      image_blocks = Enum.map(image_urls, fn url ->
+    history_messages =
+      Enum.map(history, fn msg ->
         %{
-          type: "image",
-          source: %{
-            type: "url",
-            url: url
-          }
+          role: msg["role"] || msg[:role],
+          content: msg["content"] || msg[:content]
         }
       end)
 
-      text_block = %{type: "text", text: user_message}
-      image_blocks ++ [text_block]
-    end
+    # Build current message with optional images
+    current_content =
+      if Enum.empty?(image_urls) do
+        user_message
+      else
+        # Multi-modal message with images
+        image_blocks =
+          Enum.map(image_urls, fn url ->
+            %{
+              type: "image",
+              source: %{
+                type: "url",
+                url: url
+              }
+            }
+          end)
+
+        text_block = %{type: "text", text: user_message}
+        image_blocks ++ [text_block]
+      end
 
     history_messages ++ [%{role: "user", content: current_content}]
   end
@@ -504,35 +563,80 @@ defmodule Vibe.AI.Agent do
       tool_name = tool["name"]
       tool_input = tool["input"] || %{}
 
-      label = case tool_name do
-        "search_music" ->
-           q = tool_input["query"] || "music"
-           "Searching for '#{q}'..."
-        "search_google" -> "Searching the web..."
-        "analyze_image" -> "Analyzing image..."
-        "analyze_document" -> "Reading document..."
-        "create_document" -> "Preparing document..."
-        "find_rows" -> "Inspecting rows..."
-        "edit_rows" -> "Updating rows..."
-        "delete_rows" -> "Deleting rows..."
-        "export_rows" -> "Exporting file..."
-        "delete_document" -> "Removing document..."
-        "post_to_channel" -> "Posting to channel..."
-        "get_channel_analytics" -> "Fetching channel analytics..."
-        "schedule_channel_post" -> "Scheduling post..."
-        "query_event_inbox" -> "Reviewing the inbox..."
-        "configure_event_inbox" -> "Updating inbox mode..."
-        "call_connected_app" -> "Checking the connected app..."
-        "get_current_agent_config" -> "Reading this agent's config..."
-        "update_current_agent_config" -> "Updating this agent..."
-        "delegate_to_subagent" ->
-          SubagentRegistry.progress_label(
-            tool_input["subagent_id"] || "",
-            tool_input["task"]
-          )
-        _ -> "Working..."
-      end
-      callback.(%{type: :progress, label: label, tool: tool_name, status: "running"})
+      label =
+        case tool_name do
+          "search_music" ->
+            q = tool_input["query"] || "music"
+            "Searching for '#{q}'..."
+
+          "search_google" ->
+            "Searching the web..."
+
+          "analyze_image" ->
+            "Analyzing image..."
+
+          "analyze_document" ->
+            "Reading document..."
+
+          "create_document" ->
+            "Preparing document..."
+
+          "find_rows" ->
+            "Inspecting rows..."
+
+          "edit_rows" ->
+            "Updating rows..."
+
+          "delete_rows" ->
+            "Deleting rows..."
+
+          "export_rows" ->
+            "Exporting file..."
+
+          "delete_document" ->
+            "Removing document..."
+
+          "post_to_channel" ->
+            "Posting to channel..."
+
+          "get_channel_analytics" ->
+            "Fetching channel analytics..."
+
+          "schedule_channel_post" ->
+            "Scheduling post..."
+
+          "query_event_inbox" ->
+            "Reviewing the inbox..."
+
+          "configure_event_inbox" ->
+            "Updating inbox mode..."
+
+          "call_connected_app" ->
+            "Checking the connected app..."
+
+          "get_current_agent_config" ->
+            "Reading this agent's config..."
+
+          "update_current_agent_config" ->
+            "Updating this agent..."
+
+          "delegate_to_subagent" ->
+            SubagentRegistry.progress_label(
+              tool_input["subagent_id"] || "",
+              tool_input["task"]
+            )
+
+          _ ->
+            "Working..."
+        end
+
+      callback.(%{
+        type: :progress,
+        label: label,
+        tool: tool_name,
+        tool_call_id: tool["id"],
+        status: "running"
+      })
     end)
 
     # Run tool calls in parallel using Task.async for concurrent execution
@@ -546,10 +650,17 @@ defmodule Vibe.AI.Agent do
     # Await all tasks with a generous timeout (120s per tool)
     Enum.map(tasks, fn task ->
       case Task.yield(task, 120_000) || Task.shutdown(task) do
-        {:ok, result} -> result
+        {:ok, result} ->
+          result
+
         nil ->
           Logger.error("[Agent] Tool execution timed out after 120s")
-          %{type: "tool_result", tool_use_id: "unknown", content: Jason.encode!(%{error: "Tool timed out"})}
+
+          %{
+            type: "tool_result",
+            tool_use_id: "unknown",
+            content: Jason.encode!(%{error: "Tool timed out"})
+          }
       end
     end)
   end
@@ -631,6 +742,7 @@ defmodule Vibe.AI.Agent do
     callback.(%{
       type: :tool_result,
       tool: tool_name,
+      tool_call_id: tool["id"],
       result: result,
       status: "complete",
       duration_ms: duration_ms
@@ -650,20 +762,26 @@ defmodule Vibe.AI.Agent do
 
   defp query_event_inbox(input, agent_id, requester_user_id) do
     with {:ok, agent} <- resolve_owned_agent(agent_id, requester_user_id) do
-      timeframe = resolve_event_timeframe(input["timeframe"] || input["window"] || input["period"])
+      timeframe =
+        resolve_event_timeframe(input["timeframe"] || input["window"] || input["period"])
+
       source_filter = normalize_tool_string(input["source"])
       event_type_filter = normalize_tool_string(input["event_type"] || input["eventType"])
-      event_type_prefix = normalize_tool_string(input["event_type_prefix"] || input["eventTypePrefix"])
+
+      event_type_prefix =
+        normalize_tool_string(input["event_type_prefix"] || input["eventTypePrefix"])
+
       group_by = normalize_tool_string(input["group_by"] || input["groupBy"])
       metrics = normalize_metric_paths(input["metrics"])
       limit = normalize_limit(input["limit"], 25, 60)
 
       base =
-        from e in AgentEvent,
+        from(e in AgentEvent,
           where:
             e.agent_id == ^agent.id and
               e.occurred_at >= ^timeframe.since and
               e.occurred_at <= ^timeframe.until
+        )
 
       base =
         if is_binary(source_filter),
@@ -712,7 +830,9 @@ defmodule Vibe.AI.Agent do
 
       events = Enum.take(sample, limit)
       aggregation_sampled = total_matching > length(sample)
-      related_message_ids = events |> Enum.map(& &1.message_id) |> Enum.filter(&is_binary/1) |> Enum.uniq()
+
+      related_message_ids =
+        events |> Enum.map(& &1.message_id) |> Enum.filter(&is_binary/1) |> Enum.uniq()
 
       base_result = %{
         "ok" => true,
@@ -744,7 +864,13 @@ defmodule Vibe.AI.Agent do
             }
           end),
         "summary" =>
-          build_event_inbox_summary(events, total_matching, timeframe.label, source_filter, event_type_filter),
+          build_event_inbox_summary(
+            events,
+            total_matching,
+            timeframe.label,
+            source_filter,
+            event_type_filter
+          ),
         "related_message_ids" => related_message_ids,
         "related_title" => related_messages_title(length(related_message_ids)),
         "related_subtitle" =>
@@ -911,7 +1037,8 @@ defmodule Vibe.AI.Agent do
   defp configure_event_inbox(input, agent_id, requester_user_id) do
     with {:ok, agent} <- resolve_owned_agent(agent_id, requester_user_id),
          mode <- normalize_event_inbox_mode(input["mode"]),
-         {:ok, next_rules} <- updated_event_inbox_rules(agent.approval_rules || %{}, mode, input["cadence"]) do
+         {:ok, next_rules} <-
+           updated_event_inbox_rules(agent.approval_rules || %{}, mode, input["cadence"]) do
       case Agents.update_agent(agent, %{"approval_rules" => next_rules}, requester_user_id) do
         {:ok, updated_agent} ->
           %{
@@ -1187,7 +1314,8 @@ defmodule Vibe.AI.Agent do
       "incoming_chat_enabled" => Agents.incoming_chat_enabled?(agent),
       "event_inbox_mode" => current_event_inbox_mode(agent),
       "summary_window_hours" => current_event_inbox_window_hours(agent),
-      "prompt_status" => if(String.trim(agent.system_prompt || "") == "", do: "Missing", else: "Custom"),
+      "prompt_status" =>
+        if(String.trim(agent.system_prompt || "") == "", do: "Missing", else: "Custom"),
       "prompt_preview" => condensed_prompt_preview(agent.system_prompt)
     }
     |> maybe_put("system_prompt", if(include_prompt, do: agent.system_prompt, else: nil))
@@ -1247,7 +1375,8 @@ defmodule Vibe.AI.Agent do
     end
   end
 
-  defp resolve_owned_agent(agent_id, requester_user_id) when is_binary(agent_id) and is_binary(requester_user_id) do
+  defp resolve_owned_agent(agent_id, requester_user_id)
+       when is_binary(agent_id) and is_binary(requester_user_id) do
     case Agents.get_agent(agent_id, requester_user_id) do
       %AgentSchema{} = agent -> {:ok, agent}
       nil -> {:error, :agent_not_available}
@@ -1305,7 +1434,13 @@ defmodule Vibe.AI.Agent do
     end
   end
 
-  defp build_event_inbox_summary(events, total_matching, timeframe_label, source_filter, event_type_filter) do
+  defp build_event_inbox_summary(
+         events,
+         total_matching,
+         timeframe_label,
+         source_filter,
+         event_type_filter
+       ) do
     headline =
       "Found #{total_matching} event#{if total_matching == 1, do: "", else: "s"} in #{timeframe_label}."
 
@@ -1395,8 +1530,11 @@ defmodule Vibe.AI.Agent do
 
   defp event_inbox_config_summary(%AgentSchema{} = agent) do
     case current_event_inbox_mode(agent) do
-      "batched_summary" -> "Inbox mode is batched_summary every #{current_event_inbox_window_hours(agent)}h."
-      _ -> "Inbox mode is per_event."
+      "batched_summary" ->
+        "Inbox mode is batched_summary every #{current_event_inbox_window_hours(agent)}h."
+
+      _ ->
+        "Inbox mode is per_event."
     end
   end
 
@@ -1415,11 +1553,21 @@ defmodule Vibe.AI.Agent do
 
   defp normalize_summary_window_hours(value) do
     case normalize_tool_string(value) do
-      "4h" -> 4
-      "4" -> 4
-      "daily" -> 24
-      "24h" -> 24
-      "24" -> 24
+      "4h" ->
+        4
+
+      "4" ->
+        4
+
+      "daily" ->
+        24
+
+      "24h" ->
+        24
+
+      "24" ->
+        24
+
       _ ->
         case normalize_limit(value, 24, 168) do
           hours when is_integer(hours) and hours > 0 -> hours
@@ -1453,8 +1601,12 @@ defmodule Vibe.AI.Agent do
   defp related_messages_title(count) when count <= 1, do: "Related message"
   defp related_messages_title(count), do: "#{count} related messages"
 
-  defp inbox_error_message(:owner_lookup_required), do: "Owner lookup is required for inbox tools."
-  defp inbox_error_message(:agent_not_available), do: "This inbox is not available in the current chat."
+  defp inbox_error_message(:owner_lookup_required),
+    do: "Owner lookup is required for inbox tools."
+
+  defp inbox_error_message(:agent_not_available),
+    do: "This inbox is not available in the current chat."
+
   defp inbox_error_message(:invalid_mode), do: "That inbox mode is not supported."
   defp inbox_error_message(reason), do: inspect(reason)
 

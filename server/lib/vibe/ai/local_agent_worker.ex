@@ -1134,6 +1134,7 @@ defmodule Vibe.AI.LocalAgentWorker do
   # body and shows this feed alone — so passing an empty summary keeps the tail visible.
   defp live_progress_nodes(%{handle: "claude"}, extracted) do
     interleaved_claude_progress_nodes(extracted.decoded, extracted.tool_events, "")
+    |> with_live_thinking(extracted.decoded)
   end
 
   defp live_progress_nodes(%{handle: "codex"}, extracted) do
@@ -1141,6 +1142,68 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   defp live_progress_nodes(_worker, extracted), do: extracted.progress_nodes
+
+  # Real-time thinking token counter. `claude --include-partial-messages` streams the
+  # reasoning as `thinking_delta` events (the persisted JSONL only ever gets the block
+  # once complete, so history can't tick). Forwarding every delta would flood the
+  # server's whole-buffer reparse, so the bridge coalesces them into a throttled
+  # `{"type":"vibe_thinking","tokens":N,"active":bool}` line. Here we fold the LAST such
+  # signal onto the turn's Thinking node so the DM shows "Thinking · N tokens" ticking
+  # live, exactly like the desktop CLI. Only on the live path — the finished/history
+  # render gets its settled token count + duration from the bridge history transcript.
+  defp with_live_thinking(nodes, decoded) do
+    case last_vibe_thinking(decoded) do
+      nil ->
+        nodes
+
+      {tokens, active} ->
+        status = if active, do: "streaming", else: "done"
+
+        case last_thinking_index(nodes) do
+          nil ->
+            # No completed-message thinking block yet (thinking is still streaming) —
+            # append a live node so the counter shows before the block finalizes.
+            nodes ++
+              [
+                %{
+                  "id" => "claude-thinking-live",
+                  "label" => "Thinking",
+                  "status" => status,
+                  "kind" => "thinking",
+                  "depth" => 0,
+                  "tokens" => tokens
+                }
+              ]
+
+          idx ->
+            node =
+              nodes
+              |> Enum.at(idx)
+              |> Map.put("tokens", tokens)
+              |> Map.put("status", status)
+
+            List.replace_at(nodes, idx, node)
+        end
+    end
+  end
+
+  defp last_vibe_thinking(decoded) do
+    Enum.reduce(decoded, nil, fn ev, acc ->
+      if is_map(ev) and ev["type"] == "vibe_thinking" do
+        {normalize_runtime_int(ev["tokens"]) || 0, ev["active"] == true}
+      else
+        acc
+      end
+    end)
+  end
+
+  defp last_thinking_index(nodes) do
+    nodes
+    |> Enum.with_index()
+    |> Enum.reduce(nil, fn {node, idx}, acc ->
+      if is_map(node) and node["kind"] == "thinking", do: idx, else: acc
+    end)
+  end
 
   @doc "Mark a live stream finished. The final persisted message carries the content."
   def finish_stream(provider, chat_id, stream_id) do

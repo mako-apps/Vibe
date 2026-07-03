@@ -243,6 +243,11 @@ defmodule VibeWeb.ChatChannel do
           "mode" => normalize_bridge_string(payload["mode"]) || "list"
         }
         |> put_optional_string("sessionId", normalize_bridge_string(payload["sessionId"]))
+        |> put_optional_string(
+          "before",
+          normalize_bridge_string(payload["before"] || payload["beforeCursor"])
+        )
+        |> put_optional_positive_integer("limit", payload["limit"])
 
       case AgentBridge.dispatch_history(user_id, request_payload) do
         :ok -> {:reply, {:ok, %{"requestId" => request_payload["requestId"]}}, socket}
@@ -1048,6 +1053,19 @@ defmodule VibeWeb.ChatChannel do
   end
 
   defp put_optional_string(map, _key, _value), do: map
+
+  defp put_optional_positive_integer(map, key, value) when is_integer(value) and value > 0 do
+    Map.put(map, key, min(value, 600))
+  end
+
+  defp put_optional_positive_integer(map, key, value) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {parsed, ""} when parsed > 0 -> put_optional_positive_integer(map, key, parsed)
+      _ -> map
+    end
+  end
+
+  defp put_optional_positive_integer(map, _key, _value), do: map
 
   defp put_optional_string_list(map, key, value) when is_list(value) do
     case Enum.filter(value, &(is_binary(&1) and &1 != "")) do

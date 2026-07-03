@@ -489,6 +489,57 @@ enum AgentBridgeSelectionStore {
     }
   }
 
+  // MARK: - Slash command catalog (shared source for the input bar's tools sheet)
+
+  struct SlashCommand: Identifiable, Hashable {
+    var id: String { name }
+    let name: String
+    let subtitle: String
+  }
+
+  struct SlashCommandGroup: Identifiable, Hashable {
+    var id: String { title }
+    let title: String
+    let commands: [SlashCommand]
+  }
+
+  /// Grouped Info / Tasks / Options slash commands for a provider. Selecting one drops
+  /// "/name " into the composer so the user can add args and send (bridge info commands
+  /// like /usage are answered in the glass overlay; task commands run as agent turns).
+  static func slashCommandGroups(provider: String) -> [SlashCommandGroup] {
+    let isCodex = provider.lowercased().contains("codex")
+    let info: [SlashCommand] = [
+      SlashCommand(name: "usage", subtitle: "Subscription limits + token usage"),
+      SlashCommand(name: "status", subtitle: "Account, model, remaining usage"),
+      SlashCommand(name: "commands", subtitle: "List available commands"),
+      SlashCommand(name: "model", subtitle: "Show / switch model"),
+      SlashCommand(name: "compact", subtitle: "Summarize to free context"),
+      SlashCommand(name: "doctor", subtitle: "Run the CLI health check"),
+    ]
+    let claudeTasks: [SlashCommand] = [
+      SlashCommand(name: "code-review", subtitle: "Review the diff for bugs"),
+      SlashCommand(name: "simplify", subtitle: "Cleanup-only review"),
+      SlashCommand(name: "security-review", subtitle: "Scan changes for security issues"),
+      SlashCommand(name: "debug", subtitle: "Investigate a failure"),
+      SlashCommand(name: "init", subtitle: "Set up project memory"),
+    ]
+    let codexTasks: [SlashCommand] = [
+      SlashCommand(name: "review", subtitle: "Review your working tree · desktop only"),
+      SlashCommand(name: "init", subtitle: "Set up project memory · desktop only"),
+    ]
+    let options: [SlashCommand] = [
+      SlashCommand(name: "plan", subtitle: "Plan mode: research, don't edit"),
+      SlashCommand(
+        name: isCodex ? "fast" : "reasoning",
+        subtitle: isCodex ? "Faster, lighter responses" : "Adjust thinking depth"),
+    ]
+    return [
+      SlashCommandGroup(title: "Info", commands: info),
+      SlashCommandGroup(title: "Tasks", commands: isCodex ? codexTasks : claudeTasks),
+      SlashCommandGroup(title: "Options", commands: options),
+    ]
+  }
+
   /// "Use the model active in the local CLI session" fallback label.
   static func defaultModelTitle(provider: String) -> String {
     switch provider.lowercased() {

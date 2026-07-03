@@ -914,7 +914,7 @@ private struct ChatBubbleMetaWidths {
 /// reused across scroll and can't hold this itself). Threaded into
 /// `measureMessageBubbleLayout` so a pre-layout height estimate (before any cell
 /// exists) matches what the cell will actually render.
-struct AgentTurnBubbleState {
+struct AgentTurnBubbleState: Equatable {
   var isProgressExpanded: Bool = false
   var isRuntimeExpanded: Bool = false
   var expandedStepIds: Set<String> = []
@@ -5447,6 +5447,15 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private let agentTurnContentView = VibeAgentTurnContentView()
   private var agentTurnState = AgentTurnBubbleState()
   private var agentTurnContentWidthConstraint: NSLayoutConstraint?
+  // Reconfigure gate for agentTurnContentView: `layoutSubviews` runs on every scroll
+  // tick / pin adjustment, but `configure(row:)` re-parses the FULL progress payload
+  // (all nodes) and rebuilds the body — far too heavy per layout pass on a large turn.
+  // Remember what the body was last configured with and skip the reconfigure when
+  // nothing it renders from has changed; frames are still (re)applied every pass.
+  private var lastAgentTurnConfiguredRow: ChatListRow?
+  private var lastAgentTurnConfiguredWidth: CGFloat = -1.0
+  private var lastAgentTurnConfiguredState: AgentTurnBubbleState?
+  private var lastAgentTurnConfiguredStyle: UIUserInterfaceStyle = .unspecified
   private let richTextView = BubbleRichTextView()
   private let replyPreviewView = BubbleReplyPreviewView()
   private let linkPreviewView = BubbleLinkPreviewView()
@@ -5978,7 +5987,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       resetStickerAnimation()
       stopTypingShimmer()
       richTextView.reset()
-      agentTurnContentView.reset()
+      resetAgentTurnContent()
       replyPreviewView.reset()
       linkPreviewView.reset()
       dayLabel.isHidden = true
@@ -6014,7 +6023,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     case .day:
       isGhostHidden = false
       resetStickerAnimation()
-      agentTurnContentView.reset()
+      resetAgentTurnContent()
       richTextView.reset()
       replyPreviewView.reset()
       linkPreviewView.reset()
@@ -6053,7 +6062,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       // always hidden now; agentTurnContentView carries the real interleaved feed.
       agentTurnContentView.isHidden = isGhostHidden || !usesAgentTurnContent
       if agentTurnContentView.isHidden {
-        agentTurnContentView.reset()
+        resetAgentTurnContent()
       }
       richTextView.isHidden = isGhostHidden || usesAgentTurnContent || !usesBlockLayout
       replyPreviewView.isHidden = isGhostHidden || !showsReplyPreview
@@ -6318,7 +6327,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     mediaProgressSizeLabel.text = nil
     richTextView.reset()
     richTextView.isHidden = true
-    agentTurnContentView.reset()
+    resetAgentTurnContent()
     agentTurnContentView.isHidden = true
     agentTurnContentView.alpha = 1.0
     replyPreviewView.reset()
@@ -6383,6 +6392,17 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     contentView.layer.removeAllAnimations()
     stopTypingShimmer()
     messageLabel.resetStreamingState()
+  }
+
+  /// Always clear the reconfigure gate alongside a body reset: after `reset()` the body
+  /// renders NOTHING, so a "row unchanged → skip configure" decision would leave the
+  /// bubble permanently empty when the same row becomes visible again.
+  private func resetAgentTurnContent() {
+    agentTurnContentView.reset()
+    lastAgentTurnConfiguredRow = nil
+    lastAgentTurnConfiguredWidth = -1.0
+    lastAgentTurnConfiguredState = nil
+    lastAgentTurnConfiguredStyle = .unspecified
   }
 
   private func startTypingShimmer() {
@@ -6634,21 +6654,33 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         // content frame lines up with the measured bubble height.
         let contentX = bubbleFrame.minX + agentTurnHorizontalPadding
         let contentY = bubbleFrame.minY + agentTurnVerticalPadding
-        agentTurnContentView.configure(
-          row: row,
-          appearance: VibeAgentKitMap.appearance(for: traitCollection),
-          availableWidth: metrics.messageWidth,
-          isProgressExpanded: agentTurnState.isProgressExpanded,
-          isRuntimeExpanded: agentTurnState.isRuntimeExpanded,
-          expandedStepIds: agentTurnState.expandedStepIds,
-          streamingStartDate: agentTurnState.streamingStartDate,
-          onLoaderTap: { [weak self] in
-            guard let self, let messageId = row.messageId else { return }
-            // Tapping the "Working / Worked for…" header opens the full turn in the glass
-            // sheet (same renderer) rather than an inline expand — see presentAgentTurnDetailView.
-            self.onAgentAction?(["type": "openAgentTurnDetail", "messageId": messageId])
-          }
-        )
+        let interfaceStyle = traitCollection.userInterfaceStyle
+        let bodyInputsUnchanged =
+          lastAgentTurnConfiguredWidth == metrics.messageWidth
+          && lastAgentTurnConfiguredState == agentTurnState
+          && lastAgentTurnConfiguredStyle == interfaceStyle
+          && lastAgentTurnConfiguredRow.map { chatListRowContentEqual($0, row) } == true
+        if !bodyInputsUnchanged {
+          agentTurnContentView.configure(
+            row: row,
+            appearance: VibeAgentKitMap.appearance(for: traitCollection),
+            availableWidth: metrics.messageWidth,
+            isProgressExpanded: agentTurnState.isProgressExpanded,
+            isRuntimeExpanded: agentTurnState.isRuntimeExpanded,
+            expandedStepIds: agentTurnState.expandedStepIds,
+            streamingStartDate: agentTurnState.streamingStartDate,
+            onLoaderTap: { [weak self] in
+              guard let self, let messageId = row.messageId else { return }
+              // Tapping the "Working / Worked for…" header opens the full turn in the glass
+              // sheet (same renderer) rather than an inline expand — see presentAgentTurnDetailView.
+              self.onAgentAction?(["type": "openAgentTurnDetail", "messageId": messageId])
+            }
+          )
+          lastAgentTurnConfiguredRow = row
+          lastAgentTurnConfiguredWidth = metrics.messageWidth
+          lastAgentTurnConfiguredState = agentTurnState
+          lastAgentTurnConfiguredStyle = interfaceStyle
+        }
         agentTurnContentView.frame = pixelAlignedRect(
           CGRect(
             x: contentX,

@@ -10,6 +10,7 @@ defmodule VibeWeb.AgentChannel do
 
   alias Vibe.AI.Agent
   alias Vibe.AI.AgentBuilder
+  alias Vibe.AI.AgenticEventShape
   alias Vibe.AgentConversation
 
   @doc """
@@ -20,7 +21,8 @@ defmodule VibeWeb.AgentChannel do
     if socket.assigns[:user_id] == user_id do
       conversation_id = params["conversation_id"]
 
-      socket = socket
+      socket =
+        socket
         |> assign(:conversation_history, [])
         |> assign(:active_conversation_id, conversation_id)
         |> reset_stream_ui_state()
@@ -48,7 +50,6 @@ defmodule VibeWeb.AgentChannel do
     # Get or create conversation
     {conv_id, history} = get_or_create_conversation(user_id, conversation_id, text)
 
-
     # Store conversation ID in socket
     socket =
       socket
@@ -70,15 +71,20 @@ defmodule VibeWeb.AgentChannel do
 
     Task.start(fn ->
       # Create placeholder assistant message
-      {:ok, _conv} = AgentConversation.add_message(conv_id, %{
-        "role" => "assistant",
-        "content" => "",
-        "isStreaming" => true
-      })
+      {:ok, _conv} =
+        AgentConversation.add_message(conv_id, %{
+          "role" => "assistant",
+          "content" => "",
+          "isStreaming" => true
+        })
 
       callback = streaming_callback(channel_pid, conv_id)
 
-      case Agent.stream_response(text, callback, history: history, images: images, user_id: user_id) do
+      case Agent.stream_response(text, callback,
+             history: history,
+             images: images,
+             user_id: user_id
+           ) do
         {:ok, full_response, _runtime_state} ->
           # Update the assistant message in database
           send(channel_pid, {:finalize_message, conv_id, full_response})
@@ -110,6 +116,7 @@ defmodule VibeWeb.AgentChannel do
         socket
         |> assign(:active_conversation_id, conv_id)
         |> reset_stream_ui_state()
+
       push(socket, "ack", %{status: "processing", conversation_id: conv_id})
 
       if is_binary(summary) do
@@ -205,6 +212,7 @@ defmodule VibeWeb.AgentChannel do
       {:ok, conv} ->
         socket = assign(socket, :active_conversation_id, conv.id)
         {:reply, {:ok, %{id: conv.id, title: conv.title}}, socket}
+
       {:error, _} ->
         {:reply, {:error, %{reason: "failed_to_create"}}, socket}
     end
@@ -333,11 +341,13 @@ defmodule VibeWeb.AgentChannel do
 
       conv ->
         # Convert stored messages to history format for Claude
-        history = Enum.map(conv.messages, fn msg ->
-          %{role: msg["role"], content: msg["content"] || ""}
-        end)
-        |> Enum.filter(fn msg -> msg.content != "" end)
-        |> Enum.take(-20)  # Keep last 20 for token limit
+        history =
+          Enum.map(conv.messages, fn msg ->
+            %{role: msg["role"], content: msg["content"] || ""}
+          end)
+          |> Enum.filter(fn msg -> msg.content != "" end)
+          # Keep last 20 for token limit
+          |> Enum.take(-20)
 
         {conv.id, history}
     end
@@ -346,56 +356,89 @@ defmodule VibeWeb.AgentChannel do
   defp streaming_callback(channel_pid, conversation_id) do
     fn
       %{type: :text, content: chunk} ->
-        send(channel_pid, {:push, "chunk", %{text: chunk, conversation_id: conversation_id}})
+        send(
+          channel_pid,
+          {:push, "chunk",
+           AgenticEventShape.enrich("chunk", %{text: chunk, conversation_id: conversation_id})}
+        )
+
         send(channel_pid, {:append_content, chunk})
 
       %{type: :progress, label: label} = payload ->
-        send(channel_pid, {:push, "progress", %{
-          label: label,
-          tool: payload[:tool],
-          status: payload[:status] || "running",
-          conversation_id: conversation_id
-        }})
+        send(
+          channel_pid,
+          {:push, "progress",
+           AgenticEventShape.enrich("progress", %{
+             label: label,
+             tool: payload[:tool],
+             tool_call_id: payload[:tool_call_id],
+             status: payload[:status] || "running",
+             conversation_id: conversation_id
+           })}
+        )
 
       %{type: :subagent} = payload ->
         send(
           channel_pid,
-          {:push, "subagent", Map.put(Map.delete(payload, :type), :conversation_id, conversation_id)}
+          {:push, "subagent",
+           Map.put(Map.delete(payload, :type), :conversation_id, conversation_id)}
         )
 
       %{type: :tool_result, tool: tool, result: result} = payload ->
-        send(channel_pid, {:push, "tool_result", %{
-          tool: tool,
-          result: result,
-          status: payload[:status] || "complete",
-          duration_ms: payload[:duration_ms],
-          conversation_id: conversation_id
-        }})
+        send(
+          channel_pid,
+          {:push, "tool_result",
+           AgenticEventShape.enrich("tool_result", %{
+             tool: tool,
+             tool_call_id: payload[:tool_call_id],
+             result: result,
+             status: payload[:status] || "complete",
+             duration_ms: payload[:duration_ms],
+             conversation_id: conversation_id
+           })}
+        )
+
         send(channel_pid, {:add_tool_result, %{tool: tool, result: result}})
 
       %{type: :agent_cards, cards: cards} = payload ->
-        send(channel_pid, {:push, "agent_cards", %{
-          cards: cards,
-          group_id: payload[:group_id] || payload["group_id"],
-          conversation_id: conversation_id
-        }})
+        send(
+          channel_pid,
+          {:push, "agent_cards",
+           %{
+             cards: cards,
+             group_id: payload[:group_id] || payload["group_id"],
+             conversation_id: conversation_id
+           }}
+        )
 
       %{type: :state} = payload ->
         send(
           channel_pid,
-          {:push, "builder_state", Map.put(Map.delete(payload, :type), :conversation_id, conversation_id)}
+          {:push, "builder_state",
+           AgenticEventShape.enrich(
+             "state",
+             Map.put(Map.delete(payload, :type), :conversation_id, conversation_id)
+           )}
         )
 
       %{type: :ui_request} = payload ->
         send(
           channel_pid,
-          {:push, "ui_request", Map.put(Map.delete(payload, :type), :conversation_id, conversation_id)}
+          {:push, "ui_request",
+           AgenticEventShape.enrich(
+             "ui_request",
+             Map.put(Map.delete(payload, :type), :conversation_id, conversation_id)
+           )}
         )
 
       %{type: :review_ready} = payload ->
         send(
           channel_pid,
-          {:push, "review_ready", Map.put(Map.delete(payload, :type), :conversation_id, conversation_id)}
+          {:push, "review_ready",
+           AgenticEventShape.enrich(
+             "review_ready",
+             Map.put(Map.delete(payload, :type), :conversation_id, conversation_id)
+           )}
         )
     end
   end
@@ -468,7 +511,8 @@ defmodule VibeWeb.AgentChannel do
 
     case Vibe.AI.Agent.quick_completion(prompt) do
       {:ok, title} ->
-        clean_title = title
+        clean_title =
+          title
           |> String.trim()
           |> String.replace(~r/^["']|["']$/, "")
           |> String.slice(0..50)

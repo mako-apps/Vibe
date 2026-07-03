@@ -3,13 +3,17 @@ defmodule VibeWeb.VibeagentController do
   require Logger
 
   alias Vibe.AI.AgentBuilder
+  alias Vibe.AI.AgenticEventShape
 
   def session(conn, _params) do
     user_id = conn.assigns.current_user.id
 
     case AgentBuilder.session_payload(user_id) do
-      {:ok, payload} -> json(conn, payload)
-      {:error, reason} -> conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
+      {:ok, payload} ->
+        json(conn, payload)
+
+      {:error, reason} ->
+        conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
     end
   end
 
@@ -27,8 +31,11 @@ defmodule VibeWeb.VibeagentController do
                active_agent_id: active_agent_id,
                ui_response: ui_response
              ) do
-          {:ok, payload} -> json(conn, payload)
-          {:error, reason} -> conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
+          {:ok, payload} ->
+            json(conn, payload)
+
+          {:error, reason} ->
+            conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
         end
 
       true ->
@@ -52,19 +59,33 @@ defmodule VibeWeb.VibeagentController do
 
       callback = fn
         %{type: :text, content: chunk} ->
-          send_sse_event(conn, "chunk", %{text: chunk})
+          send_sse_event(conn, "chunk", AgenticEventShape.enrich("chunk", %{text: chunk}))
+
+        %{type: :progress} = payload ->
+          send_sse_event(
+            conn,
+            "progress",
+            AgenticEventShape.enrich("progress", Map.delete(payload, :type))
+          )
+
+        %{type: :tool_result} = payload ->
+          send_sse_event(
+            conn,
+            "tool_result",
+            AgenticEventShape.enrich("tool_result", Map.delete(payload, :type))
+          )
 
         %{type: :state, data: data} ->
-          send_sse_event(conn, "state", data)
+          send_sse_event(conn, "state", AgenticEventShape.enrich("state", data))
 
         %{type: :ui_request, data: data} ->
-          send_sse_event(conn, "ui_request", data)
+          send_sse_event(conn, "ui_request", AgenticEventShape.enrich("ui_request", data))
 
         %{type: :draft_patch, data: data} ->
-          send_sse_event(conn, "draft_patch", data)
+          send_sse_event(conn, "draft_patch", AgenticEventShape.enrich("draft_patch", data))
 
         %{type: :review_ready, data: data} ->
-          send_sse_event(conn, "review_ready", data)
+          send_sse_event(conn, "review_ready", AgenticEventShape.enrich("review_ready", data))
       end
 
       case AgentBuilder.stream_message(
@@ -75,10 +96,14 @@ defmodule VibeWeb.VibeagentController do
              ui_response: ui_response
            ) do
         {:ok, payload} ->
-          send_sse_event(conn, "done", payload)
+          send_sse_event(conn, "done", AgenticEventShape.enrich("done", payload))
 
         {:error, reason} ->
-          send_sse_event(conn, "error", %{message: to_string(reason)})
+          send_sse_event(
+            conn,
+            "error",
+            AgenticEventShape.enrich("error", %{message: to_string(reason)})
+          )
       end
 
       conn

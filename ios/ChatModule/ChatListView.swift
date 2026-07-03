@@ -663,6 +663,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var agentTurnProgressExpandedRowIds = Set<String>()
   private var agentTurnRuntimeExpandedRowIds = Set<String>()
   private var agentTurnStreamStartByRow: [String: Date] = [:]
+  // Memoized measured heights for agent-turn rows (see estimateMessageHeight): the row
+  // struct is retained only for the cheap content-equality validity check — COW means it
+  // shares storage with the live `rows` array, not a payload copy.
+  private struct AgentTurnHeightCacheEntry {
+    let row: ChatListRow
+    let rowWidth: CGFloat
+    let state: AgentTurnBubbleState
+    let height: CGFloat
+  }
+  private var agentTurnHeightCache: [String: AgentTurnHeightCacheEntry] = [:]
   private var nativeHistoryHydrationGeneration: UInt = 0
   private var nativeOutgoingRowsById: [String: [String: Any]] = [:]
   private var nativeOutgoingOrder: [String] = []
@@ -975,10 +985,46 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     updateChatEngineBinding()
     updateChatEngineChannelBinding()
     if window != nil {
+      revalidateListRenderOnAttach()
       hydrateRowsFromNativeHistoryIfReady(trigger: "didMoveToWindow")
       presentPreferredAgentViewIfNeeded()
       prefetchBridgeHistoryIfNeeded()
       replayOutstandingAgentBridgeAskIfNeeded()
+    }
+  }
+
+  /// This view is REUSED across chat open/close (ChatHomeListView holds one ChatMainView).
+  /// A rows update that lands while the view is detached takes the reloadData path, but a
+  /// detached UICollectionView with unchanged bounds creates no cells — and re-attaching
+  /// alone never re-queries the data source, so the chat re-opens visually EMPTY until a
+  /// touch/scroll dirties the layout. Force the layout pass on attach and verify cells
+  /// actually materialized; reload if they didn't.
+  private func revalidateListRenderOnAttach() {
+    guard !rows.isEmpty else { return }
+    collectionView.collectionViewLayout.invalidateLayout()
+    collectionView.layoutIfNeeded()
+    let visibleCount = collectionView.indexPathsForVisibleItems.count
+    let contentH = collectionView.contentSize.height
+    let boundsH = collectionView.bounds.height
+    if visibleCount == 0, contentH > 0, boundsH > 0 {
+      NSLog(
+        "[FirstMsg] attach REVALIDATE reloading — rows=%d visible=0 offset=%.0f contentH=%.0f boundsH=%.0f",
+        rows.count, collectionView.contentOffset.y, contentH, boundsH)
+      collectionView.reloadData()
+      collectionView.layoutIfNeeded()
+    } else if rows.count <= 4 {
+      NSLog(
+        "[FirstMsg] attach revalidate ok rows=%d visible=%d offset=%.0f contentH=%.0f",
+        rows.count, visibleCount, collectionView.contentOffset.y, contentH)
+    }
+    // Stale send-morph ghost state must never survive a detach: if the morph never
+    // completed (chat closed mid-send) the only message would re-render hidden.
+    if activeSendTransition == nil, pendingSendTransition == nil, hiddenMessageId != nil {
+      NSLog(
+        "[FirstMsg] attach clearing stale hiddenMessageId=%@",
+        String(hiddenMessageId?.prefix(12) ?? "nil"))
+      hiddenMessageId = nil
+      collectionView.reloadData()
     }
   }
 
@@ -1109,6 +1155,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   // re-derived from rows (via `bridgeFreshHiddenIdsByChat`-filtered rows, now correctly
   // unhidden) on the very next `setRows`.
   private var activeBridgeSessionId: String?
+  private var lastOlderBridgeHistoryLoadAt: TimeInterval = 0
 
   /// Register an outgoing message id so the fresh-surface filter never hides it.
   func noteBridgeFreshOwnSentId(_ messageId: String) {
@@ -1148,14 +1195,22 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     guard currentBridgeProvider != nil else { return parsed }
     let chatKey = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !chatKey.isEmpty else { return parsed }
-    let loadedPrefix = bridgeLoadedSessionId.map { "bridge-\($0)" }
+    // Prefer this view's explicitly-picked session id, but fall back to the session the
+    // ENGINE is still live-tailing for this chat (retained across view-detach/background).
+    // A foreground rebind can wipe the per-instance `bridgeLoadedSessionId`, which would
+    // otherwise hide every `bridge-<sessionId>` row and collapse the loaded transcript to
+    // empty a few seconds after it rendered. Only pay the (cheap) engine read on the
+    // recovery path — when this view has no session id of its own.
+    let effectiveLoadedSessionId =
+      bridgeLoadedSessionId ?? ChatEngine.shared.liveBridgeSessionId(chatId: chatKey)
+    let loadedPrefix = effectiveLoadedSessionId.map { "bridge-\($0)" }
     let ownSentIds = Self.bridgeFreshOwnSentIdsByChat[chatKey] ?? []
     // Until the user actually engages this thread (sends a message, or explicitly opens a
     // history session), EVERY non-live row is prior history — keep accumulating it into the
     // hidden set, even rows that stream in late after the first page. A one-shot snapshot
     // missed those late arrivals, which is how a finished runtime card ("User task: Hi")
     // loaded itself on a clean open. Live rows still show so a resumed run stays visible.
-    let sessionEngaged = !ownSentIds.isEmpty || bridgeLoadedSessionId != nil
+    let sessionEngaged = !ownSentIds.isEmpty || effectiveLoadedSessionId != nil
     var hiddenIds = Self.bridgeFreshHiddenIdsByChat[chatKey] ?? []
     if !sessionEngaged {
       for row in parsed where !bridgeRowIsLive(row) {
@@ -1392,7 +1447,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // rendering a long transcript (hundreds of rows) blocks the main thread for seconds
     // and overheats the device. Only keep the latest window needed to continue; older
     // turns load on demand via History. (Normal chats keep their full list.)
-    if currentBridgeProvider != nil, parsed.count > Self.agentTranscriptWindow {
+    let effectiveBridgeLoadedSessionId =
+      bridgeLoadedSessionId
+      ?? ChatEngine.shared.liveBridgeSessionId(
+        chatId: engineChatId.trimmingCharacters(in: .whitespacesAndNewlines))
+    if currentBridgeProvider != nil, effectiveBridgeLoadedSessionId == nil,
+      parsed.count > Self.agentTranscriptWindow
+    {
       parsed = Array(parsed.suffix(Self.agentTranscriptWindow))
     }
     if isGroupOrChannel {
@@ -1474,6 +1535,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       }
     }
 
+    // Set to true (before calling finalize) by the reconfigure path when this update is
+    // ONLY a streaming agent turn growing in place — no inserts, no deletes, no other
+    // reloads. For that case the offset-management rules change: the content grows
+    // BELOW the viewport, so the right default is to not move the offset at all (the
+    // user owns the scroll), with a gentle animated follow only when they were already
+    // reading at the bottom. Snapping (scrollToBottom) or re-anchoring to a captured
+    // distance-from-bottom (restoreStationaryDistance) both read as the per-chunk
+    // "jumping" during long agent runs.
+    var inPlaceAgentTurnGrowth = false
+
     let finalize = { [weak self] (animated: Bool) in
       guard let self else {
         return
@@ -1527,7 +1598,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         }
         self.shouldAutoScroll = true
       } else if wasNearBottom || shouldForceBottomForPendingSend {
-        self.scrollToBottom(animated: shouldForceBottomForPendingSend ? false : animated)
+        if inPlaceAgentTurnGrowth && !shouldForceBottomForPendingSend {
+          self.followBottomForAgentTurnGrowth()
+        } else {
+          self.scrollToBottom(animated: shouldForceBottomForPendingSend ? false : animated)
+        }
       } else if let anchor = stationaryAnchor,
         let newIndex = parsed.firstIndex(where: { $0.key == anchor.key })
       {
@@ -1541,6 +1616,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
             self.collectionView.setContentOffset(CGPoint(x: 0.0, y: clampedOffset), animated: false)
           }
         }
+      } else if inPlaceAgentTurnGrowth {
+        // Pure in-place growth with the user scrolled up and no findable anchor: the
+        // growth is below them, so the offset is already stationary — re-anchoring to
+        // the captured distance-from-bottom would drag them DOWN by the growth delta.
       } else {
         self.restoreStationaryDistance(previousDistanceFromBottom)
       }
@@ -1560,13 +1639,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // Initial load or full replacement: use reloadData (no batch update needed).
     guard !previousRows.isEmpty else {
       if parsed.count <= 4 {
-        VibeDebugLog.log(
-          "[FirstMsg] setRows INITIAL parsed=%d keys=[%@] hidden=%@ pending=%@ src=%d",
+        NSLog(
+          "[FirstMsg] setRows INITIAL parsed=%d keys=[%@] hidden=%@ pending=%@ src=%d window=%@ bounds=%.0fx%.0f",
           parsed.count,
           parsed.map { String($0.key.prefix(16)) }.joined(separator: ","),
           hiddenMessageId.map { String($0.prefix(12)) } ?? "nil",
           pendingSendTransition != nil ? "Y" : "N",
-          nextRows.count)
+          nextRows.count,
+          window != nil ? "Y" : "N",
+          collectionView.bounds.width, collectionView.bounds.height)
       }
       applyDataSource()
       UIView.performWithoutAnimation {
@@ -1578,13 +1659,36 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         finalize(false)
         CATransaction.commit()
       }
+      // A single-message initial load never scrolls (maxOffsetY == 0, so scrollToBottom
+      // is a no-op), which means the HOST's own layoutSubviews — the pass that re-asserts
+      // wallpaper z-order, refreshes the snapshot, and rebinds the freshly-created cell's
+      // wallpaper backdrop — never runs after the cell exists. The bubble then stays
+      // unpainted until the user's touch dirties the host layout (the "empty until I
+      // tap/scroll" bug). Force that host layout pass now so the cell paints immediately.
+      // (finalize already ran finishRowsUpdate, so isApplyingRowsUpdate is clear here.)
+      if window != nil, !parsed.isEmpty, bounds.width > 1.0, bounds.height > 1.0 {
+        UIView.performWithoutAnimation {
+          setNeedsLayout()
+          layoutIfNeeded()
+          updateVisibleWallpaperBackdropLayouts()
+        }
+      }
       if parsed.count <= 4 {
-        VibeDebugLog.log(
-          "[FirstMsg] setRows INITIAL done offset=%.0f contentH=%.0f inset(t=%.0f,b=%.0f) visible=%d",
+        let cellDump = collectionView.visibleCells.compactMap { cell -> String? in
+          guard let ip = collectionView.indexPath(for: cell) else { return nil }
+          let ghost = (cell as? ChatListCell)?.isConfiguredGhostHidden == true
+          return String(
+            format: "i%d(y=%.0f h=%.0f a=%.2f%@)", ip.item, cell.frame.minY,
+            cell.frame.height, cell.alpha, ghost ? " GHOST" : "")
+        }.joined(separator: " ")
+        NSLog(
+          "[FirstMsg] setRows INITIAL done offset=%.0f contentH=%.0f inset(t=%.0f,b=%.0f) visible=%d window=%@ cells=[%@]",
           collectionView.contentOffset.y,
           collectionView.contentSize.height,
           flowLayout.sectionInset.top, flowLayout.sectionInset.bottom,
-          collectionView.indexPathsForVisibleItems.count)
+          collectionView.indexPathsForVisibleItems.count,
+          window != nil ? "Y" : "N",
+          cellDump)
       }
       return
     }
@@ -1775,6 +1879,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           return bubbleUsesAgentTurnContent(rows[indexPath.item])
         }
         let otherReloads = safeReloads.filter { !agentTurnReloads.contains($0) }
+        inPlaceAgentTurnGrowth = otherReloads.isEmpty && !agentTurnReloads.isEmpty
         UIView.performWithoutAnimation {
           CATransaction.begin()
           CATransaction.setDisableActions(true)
@@ -2247,6 +2352,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// VibeAgentKitMap.chatMessage(from:)'s `id`).
   private func pruneAgentTurnState(for currentRows: [ChatListRow]) {
     let liveIds = Set(currentRows.map { $0.messageId ?? $0.key })
+    let liveKeys = Set(currentRows.map(\.key))
+    agentTurnHeightCache = agentTurnHeightCache.filter { liveKeys.contains($0.key) }
     agentTurnExpandedStepIdsByRow = agentTurnExpandedStepIdsByRow.filter { liveIds.contains($0.key) }
     agentTurnProgressExpandedRowIds = agentTurnProgressExpandedRowIds.filter { liveIds.contains($0) }
     agentTurnRuntimeExpandedRowIds = agentTurnRuntimeExpandedRowIds.filter { liveIds.contains($0) }
@@ -3144,6 +3251,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     )
     let nav = UINavigationController(rootViewController: detail)
     nav.modalPresentationStyle = .pageSheet
+    // Clear the nav wrapper's opaque backing so the sheet's own UIGlassEffect refracts the
+    // chat behind it (real Liquid Glass) instead of frosting a solid nav background — the
+    // ask sheet looks glass precisely because it's presented WITHOUT this opaque layer.
+    nav.view.backgroundColor = .clear
     if let sheet = nav.sheetPresentationController {
       sheet.detents = [.medium(), .large()]
       sheet.prefersGrabberVisible = true
@@ -3172,6 +3283,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     )
     let nav = UINavigationController(rootViewController: detail)
     nav.modalPresentationStyle = .pageSheet
+    // Clear the nav wrapper's opaque backing so the sheet's own UIGlassEffect refracts the
+    // chat behind it (real Liquid Glass) instead of frosting a solid nav background — the
+    // ask sheet looks glass precisely because it's presented WITHOUT this opaque layer.
+    nav.view.backgroundColor = .clear
     if let sheet = nav.sheetPresentationController {
       sheet.detents = [.medium(), .large()]
       sheet.prefersGrabberVisible = true
@@ -3614,7 +3729,24 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
     scheduleVisibleAutoDownloads()
     maybeStartPendingSendTransition()
+    maybeLoadOlderBridgeHistoryIfNeeded(offsetY: offsetY)
     emitViewport()
+  }
+
+  private func maybeLoadOlderBridgeHistoryIfNeeded(offsetY: CGFloat) {
+    guard currentBridgeProvider != nil else { return }
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !chatId.isEmpty else { return }
+    let loadedSessionId = bridgeLoadedSessionId ?? ChatEngine.shared.liveBridgeSessionId(chatId: chatId)
+    guard loadedSessionId != nil else { return }
+    guard offsetY < 220.0 else { return }
+    guard collectionView.isDragging || collectionView.isTracking || collectionView.isDecelerating else { return }
+    let now = Date().timeIntervalSinceReferenceDate
+    guard now - lastOlderBridgeHistoryLoadAt > 0.75 else { return }
+    let result = ChatEngine.shared.loadOlderAgentBridgeSessionChunk(chatId: chatId)
+    if (result["accepted"] as? Bool) == true {
+      lastOlderBridgeHistoryLoadAt = now
+    }
   }
 
   public func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
@@ -3662,6 +3794,29 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   private func estimateMessageHeight(_ row: ChatListRow, rowWidth: CGFloat) -> CGFloat {
+    // Agent turns are the one row type whose measurement is genuinely expensive
+    // (`VibeAgentTurnContentView.measuredHeight` parses the FULL progress payload and
+    // runs an offscreen Auto Layout pass). A streaming chunk invalidates the whole
+    // layout, so without memoization every FINALIZED agent turn in the transcript gets
+    // fully re-measured on every chunk of the live one. Cache by row key and reuse
+    // while the row's content, width, and expand state are unchanged — the live
+    // streaming row misses the cache exactly once per chunk, which is the minimum.
+    if bubbleUsesAgentTurnContent(row) {
+      let state = agentTurnBubbleState(for: row)
+      if let cached = agentTurnHeightCache[row.key],
+        cached.rowWidth == rowWidth,
+        cached.state == state,
+        chatListRowContentEqual(cached.row, row)
+      {
+        return cached.height
+      }
+      let height = measureMessageBubbleLayout(
+        row: row, rowWidth: rowWidth, agentTurnState: state
+      ).bubbleHeight
+      agentTurnHeightCache[row.key] = AgentTurnHeightCacheEntry(
+        row: row, rowWidth: rowWidth, state: state, height: height)
+      return height
+    }
     return measureMessageBubbleLayout(
       row: row, rowWidth: rowWidth, agentTurnState: agentTurnBubbleState(for: row)
     ).bubbleHeight
@@ -3714,6 +3869,36 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
     previousOffsetY = collectionView.contentOffset.y
     shouldAutoScroll = false
+  }
+
+  /// Gentle stick-to-bottom for a streaming agent turn growing in place. Unlike
+  /// `scrollToBottom` this (a) also runs in a bridge DM (where scrollToBottom no-ops to
+  /// protect the user's scroll), because it is only reachable when the user was ALREADY
+  /// near the bottom before this growth tick; (b) never fires while the user's finger
+  /// owns the scroll; and (c) animates with `.beginFromCurrentState` so back-to-back
+  /// chunks chase the bottom as one continuous glide instead of a per-chunk snap.
+  private func followBottomForAgentTurnGrowth() {
+    guard !agentChatMode else { return }  // agent surface: pin logic owns the offset
+    guard
+      !collectionView.isTracking, !collectionView.isDragging, !collectionView.isDecelerating
+    else { return }
+    let maxOffsetY = pixelAlignedValue(
+      max(0.0, collectionView.contentSize.height - collectionView.bounds.height))
+    guard maxOffsetY - collectionView.contentOffset.y > 0.5 else { return }
+    shouldAutoScroll = true
+    isInternalScrollAdjustment = true
+    UIView.animate(
+      withDuration: 0.25,
+      delay: 0.0,
+      options: [.curveEaseOut, .allowUserInteraction, .beginFromCurrentState]
+    ) { [weak self] in
+      self?.collectionView.contentOffset = CGPoint(x: 0.0, y: maxOffsetY)
+    } completion: { [weak self] _ in
+      guard let self else { return }
+      self.isInternalScrollAdjustment = false
+      self.previousOffsetY = self.collectionView.contentOffset.y
+      self.emitViewport(force: true)
+    }
   }
 
   private func finishRowsUpdate() {
@@ -6911,6 +7096,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       self.activeBridgeSessionId = nil
       let chatKey = self.engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
       if !chatKey.isEmpty {
+        // Drop the retained live-tail subscription for the old session so returning to
+        // this chat (topic re-join) can't re-ingest the previous transcript into the
+        // fresh thread. Only a deliberate New Chat forgets it — plain detach retains it.
+        ChatEngine.shared.clearLiveBridgeSessionIngest(chatId: chatKey)
         Self.bridgeFreshOwnSentIdsByChat[chatKey] = []
         var hiddenIds = Set<String>()
         for row in self.sourceRowsPayload {

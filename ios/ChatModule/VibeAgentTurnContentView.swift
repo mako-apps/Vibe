@@ -1,4 +1,10 @@
+import OSLog
 import UIKit
+
+private let agentTurnContentLogger = Logger(
+  subsystem: "com.mohammadshayani.vibe.native",
+  category: "AgentTurn"
+)
 
 /// Shape-agnostic host for `VibeAgentKitAssistantMessageBodyView` — the real interleaved
 /// step/narration/diff renderer (live feed reuse, expand/collapse, diff card). This wrapper
@@ -36,11 +42,23 @@ final class VibeAgentTurnContentView: UIView {
     backgroundColor = .clear
     bodyView.translatesAutoresizingMaskIntoConstraints = false
     addSubview(bodyView)
+    // The chat-bubble cell positions this wrapper with MANUAL FRAMES (it never turns off
+    // translatesAutoresizingMaskIntoConstraints), so the wrapper's frame becomes a REQUIRED
+    // autoresizing height constraint — including `height == 0` while parked at `.zero`.
+    // If the bottom pin below were also required, any mismatch between that frame height
+    // and the body's own required content height (every stream tick, every `.zero` park)
+    // is unsatisfiable, and UIKit "recovers" by breaking a random internal stack
+    // constraint — collapsing the live feed to nothing (the mid-stream empty-bubble
+    // flicker). Priority 999 lets the bottom pin give way silently instead; it still
+    // outranks `.fittingSizeLevel`, so `measuredHeight`'s systemLayoutSizeFitting math
+    // is unaffected.
+    let bottomPin = bodyView.bottomAnchor.constraint(equalTo: bottomAnchor)
+    bottomPin.priority = UILayoutPriority(999)
     NSLayoutConstraint.activate([
       bodyView.topAnchor.constraint(equalTo: topAnchor),
       bodyView.leadingAnchor.constraint(equalTo: leadingAnchor),
       bodyView.trailingAnchor.constraint(equalTo: trailingAnchor),
-      bodyView.bottomAnchor.constraint(equalTo: bottomAnchor),
+      bottomPin,
     ])
   }
 
@@ -104,8 +122,31 @@ final class VibeAgentTurnContentView: UIView {
     onLoaderTap: (() -> Void)?
   ) {
     let message = VibeAgentKitMap.chatMessage(from: row)
+    var displayText = resoloAssistantDisplayText(for: message)
+
+    // Guard against the "stopped mid-stream → blank bubble" bug: when a turn is
+    // FINALIZED (not streaming) but maps to nothing renderable — no answer text, no
+    // progress steps, no runtime card — the body view produces zero height and the
+    // caller floors the shell to ~44pt, leaving a visible-but-empty bubble even though
+    // the message row still exists in the list. This happens when the user hits STOP
+    // before any assistant text/tool node was persisted (or the finalize dropped the
+    // in-flight nodes). Substitute a minimal "Stopped" placeholder so the turn is never
+    // invisible, and log it so we can spot any OTHER path that lands here.
+    if !message.isStreaming
+      && displayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      && message.progressItems.isEmpty
+      && message.runtime == nil
+    {
+      let statusText = row.status ?? "nil"
+      let kindText = row.agentMsgKind ?? "nil"
+      agentTurnContentLogger.notice(
+        "EMPTY finalized turn id=\(message.id, privacy: .public) status=\(statusText, privacy: .public) kind=\(kindText, privacy: .public) nodes=\(row.agentProgressNodes.count, privacy: .public) hasRuntime=N -> 'Stopped' placeholder"
+      )
+      displayText = "Stopped"
+    }
+
     configure(
-      text: resoloAssistantDisplayText(for: message),
+      text: displayText,
       isStreaming: message.isStreaming,
       hasFinalResponseText: message.hasFinalResponseText,
       appearance: appearance,

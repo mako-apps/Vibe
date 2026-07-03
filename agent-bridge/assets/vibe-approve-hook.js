@@ -62,22 +62,72 @@ const DANGEROUS = [
 ];
 function isDangerous(cmd) { return DANGEROUS.some((re) => re.test(cmd)); }
 
-// ---------- built-in safe Bash allow-list (read / search / build) -------------
+// ---------- built-in safe Bash allow-list (read / search / inspect / build) ---
+// Read-only, non-mutating commands that never need a human. Evaluated PER PIPELINE
+// SEGMENT so "grep foo | head", "cat f | sort | uniq -c", "find . | wc -l" all pass.
 const SAFE_BASH = [
-  /^(ls|pwd|cat|head|tail|less|wc|file|stat|du|df|tree|basename|dirname|realpath)\b/,
-  /^(grep|rg|ag|ack|find|fd|which|type|whereis|locate)\b/,
-  /^(echo|printf|true|false|date|whoami|hostname|uname|env|sw_vers|sleep)\b/,
-  /^git\s+(status|diff|log|show|branch|remote|blame|rev-parse|describe|ls-files|shortlog|config\s+--get)\b/,
-  /^(node|npm|npx|yarn|pnpm)\s+(--version|-v|list|ls|why|outdated|run\s+lint|run\s+test|test)\b/,
-  /^(xcodebuild|swift|swiftc)\b[^\n]*\bbuild\b/,          // building is free
-  /^xcrun\s+(simctl|xctrace|devicectl)\s+(list|help)\b/,  // querying devices is free
+  /^(ls|pwd|cat|bat|head|tail|less|more|wc|file|stat|du|df|tree|basename|dirname|realpath|readlink)\b/,
+  /^(grep|egrep|fgrep|rg|ag|ack|find|fd|which|type|whereis|locate|mdfind)\b/,
+  /^(echo|printf|true|false|date|whoami|hostname|uname|env|sw_vers|sleep|id|groups|uptime|arch|yes)\b/,
+  /^(sed|awk|cut|sort|uniq|tr|nl|column|comm|join|paste|rev|fold|fmt|tac|xxd|od|strings|hexdump|base64)\b/,
+  /^(jq|yq|xmllint|plutil\s+-(p|lint))\b/,
+  /^(diff|cmp|colordiff)\b/,
+  /^(ps|top\s+-l|lsof|pgrep|vm_stat|sysctl\s+-[na])\b/,
+  /^git\s+(status|diff|log|show|branch|remote|blame|rev-parse|rev-list|describe|ls-files|ls-tree|cat-file|shortlog|reflog|stash\s+list|tag(\s+-l|\s+--list)?|for-each-ref|show-ref|show-branch|name-rev|merge-base|count-objects|config\s+--(get|list)|whatchanged|grep)\b/,
+  /^(node|npm|npx|yarn|pnpm|bun)\s+(--version|-v|list|ls|why|outdated|view|info|run\s+lint|run\s+test|test)\b/,
+  /^(python3?|pip3?|ruby|gem|cargo|go|rustc|java|javac|kotlin|clang|gcc|deno)\s+(--version|-v|version|--help|-h)\b/,
+  /^(cargo|go)\s+(check|vet|fmt\s+--check|clippy)\b/,
+  /^(xcodebuild|swift|swiftc)\b[^\n]*\bbuild\b/,                    // building is free
+  /^xcodebuild\s+(-list|-showsdks|-showBuildSettings|-version)\b/,
+  /^xcrun\s+(simctl|xctrace|devicectl)\s+(list|help)\b/,           // querying devices is free
+  /^xcrun\s+(--find|--sdk|--show-sdk-path|--version)\b/,
+  /^(cd|pushd|popd)\b/,                                             // navigation only
 ];
-const CHAINY = /(;|&&|\|\||\$\(|`)/; // could chain past an allow-listed prefix
-function bashIsAutoSafe(cmd, cfg) {
-  if (CHAINY.test(cmd)) return false;
-  if (SAFE_BASH.some((re) => re.test(cmd.trim()))) return true;
-  for (const p of cfg.auto_allow) { if (p && cmd.includes(p)) return true; }
+// A segment matching any of these is treated as NOT safe (asks a human) even if a
+// SAFE_BASH prefix also matched — these mutate the filesystem / state.
+const MUTATING = [
+  /\bsed\b[^|;&]*\s-i\b/, /\bperl\b[^|;&]*\s-i\b/, /\btee\b/, /\btruncate\b/,
+  /\b(mv|cp|rm|mkdir|rmdir|touch|ln|chmod|chown|chgrp|install|unlink)\b/,
+  /\bgit\s+(add|commit|checkout|reset|rebase|merge|pull|fetch|clone|apply|am|mv|rm|restore|switch|cherry-pick|revert|push|clean|init|tag\s+(?!-l|--list))\b/,
+  /\b(npm|yarn|pnpm|bun)\s+(install|i|ci|add|remove|uninstall|update|upgrade|link|publish)\b/,
+  /\bpip3?\s+(install|uninstall)\b/, /\b(gem|cargo|go)\s+(install|publish)\b/,
+  /\bdefaults\s+write\b/, /\blaunchctl\b/, /\bkill(all)?\b/, /\bpkill\b/,
+  />{1,2}(?!\s*\/dev\/null)/, // output redirect that writes to a file
+];
+
+// Mask quoted regions (keep length) so a pipe/`&&` INSIDE quotes — e.g. grep -E 'a|b'
+// — is not mistaken for a pipeline separator.
+function maskQuotes(s) {
+  let out = "", q = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) { out += (c === q ? c : "X"); if (c === q) q = null; }
+    else if (c === '"' || c === "'" || c === "`") { q = c; out += c; }
+    else out += c;
+  }
+  return out;
+}
+function splitSegments(cmd) {
+  const masked = maskQuotes(cmd);
+  const re = /\|\||&&|;|\||\n/g;
+  const segs = []; let start = 0, m;
+  while ((m = re.exec(masked))) { segs.push(cmd.slice(start, m.index)); start = m.index + m[0].length; }
+  segs.push(cmd.slice(start));
+  return segs.map((x) => x.trim()).filter((x) => x.length);
+}
+function segmentIsSafe(seg, cfg) {
+  if (!seg) return true;
+  if (/\$\(|`|<\(/.test(maskQuotes(seg))) return false; // command / process substitution
+  if (MUTATING.some((re) => re.test(seg))) return false;
+  if (SAFE_BASH.some((re) => re.test(seg))) return true;
+  for (const p of cfg.auto_allow) { if (p && seg.includes(p)) return true; }
   return false;
+}
+function bashIsAutoSafe(cmd, cfg) {
+  // user auto_allow substrings may match the whole command (e.g. "xcrun simctl ...")
+  for (const p of cfg.auto_allow) { if (p && cmd.includes(p)) return true; }
+  const segs = splitSegments(cmd);
+  return segs.length > 0 && segs.every((seg) => segmentIsSafe(seg, cfg));
 }
 
 // ---------- output helpers ----------------------------------------------------
@@ -218,9 +268,11 @@ process.stdin.on("end", () => {
     return emit("deny", "Vibe: this command matches your configured deny list.");
   }
 
-  // 3) AskUserQuestion: deny native + redirect to the MCP tool that reaches the
-  //    phone (when the bridge is up); otherwise fall back to the native local prompt.
+  // 3) AskUserQuestion: only force the phone (deny native + redirect to the MCP tool)
+  //    in "mobile" mode. In auto/both/full the desk is present, so let Claude's native
+  //    in-app question render HERE — don't shove every question to the phone.
   if (toolName === "AskUserQuestion") {
+    if (mode !== "mobile") return passthrough(); // native question at the desk
     const probe = net.createConnection(SOCK, () => {
       try { probe.end(); } catch (_) {}
       emit("deny", "Use the mcp__vibeask__ask_user tool instead — it delivers your question to the user's phone and returns their answer. Do not use AskUserQuestion here.");

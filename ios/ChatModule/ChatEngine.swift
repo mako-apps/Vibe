@@ -340,6 +340,7 @@ private func chatEngineDecryptMediaData(_ encryptedData: Data, keyBase64: String
 final class ChatEngine {
   static let shared = ChatEngine()
   static let didChangeNotification = Notification.Name("Vibe.ChatEngine.didChange")
+  private static let bridgeSessionPageLimit = 40
 
   private struct SurfaceBinding: Equatable {
     let surfaceId: String
@@ -436,6 +437,9 @@ final class ChatEngine {
   // map above, this stays registered for the chat so every re-push upserts the
   // (now longer) transcript in place. Cleared when the chat channel closes.
   private var liveBridgeSessionIngestByChatId: [String: (provider: String, sessionId: String, requestId: String)] = [:]
+  private var bridgeSessionPagingByChatId: [String: (
+    provider: String, sessionId: String, nextBefore: String?, hasMoreBefore: Bool, loadingOlder: Bool
+  )] = [:]
   private var nativeRecordingStateByChatId: [String: Bool] = [:]
   private var pinnedMessagesByChatId: [String: [[String: Any]]] = [:]
   private var pinnedFetchInFlightChatIds = Set<String>()
@@ -1417,8 +1421,14 @@ final class ChatEngine {
           nativeJoinedChatIds.remove(chatId)
           peerTypingUserIdsByChatId.removeValue(forKey: chatId)
           agentProgressByChatId.removeValue(forKey: chatId)
-          // Stop accepting bridge live-tail re-pushes for this closed view.
-          liveBridgeSessionIngestByChatId.removeValue(forKey: chatId)
+          // Intentionally KEEP liveBridgeSessionIngestByChatId[chatId] here: the chat
+          // "remembers" the bridge session it had loaded for as long as the app is alive.
+          // Leaving the view (navigating away) or the socket dropping in the background used
+          // to silently kill the live tail, so returning showed a stale feed that only
+          // refreshed once the user manually re-opened History. Now the subscription
+          // survives the detach and is re-armed automatically the next time this chat's
+          // topic (re)joins — see rearmLiveBridgeSessionLocked. It is only dropped on a
+          // deliberate New Chat (clearLiveBridgeSessionIngest) or full teardown/logout.
           if let client = phoenixClient {
             client.leave(topic: chatTopic(for: chatId))
           }
@@ -1869,6 +1879,7 @@ final class ChatEngine {
     let mode = normalizedString(payload["mode"]) ?? "list"
     let sessionId = normalizedString(payload["sessionId"] ?? payload["session_id"])
     let requestId = normalizedString(payload["requestId"]) ?? UUID().uuidString
+    let before = normalizedString(payload["before"] ?? payload["beforeCursor"] ?? payload["before_cursor"])
 
     guard let chatId, !chatId.isEmpty else {
       return ["accepted": false, "reason": "invalid_chat"]
@@ -1900,6 +1911,14 @@ final class ChatEngine {
       if let sessionId, !sessionId.isEmpty {
         wirePayload["sessionId"] = sessionId
       }
+      if let before, !before.isEmpty {
+        wirePayload["before"] = before
+      }
+      if let limit = payload["limit"] as? Int, limit > 0 {
+        wirePayload["limit"] = limit
+      } else if let limit = normalizedString(payload["limit"]), let parsed = Int(limit), parsed > 0 {
+        wirePayload["limit"] = parsed
+      }
       let ref = client.push(
         topic: chatTopic(for: chatId),
         event: "agent-bridge-history",
@@ -1907,7 +1926,10 @@ final class ChatEngine {
       )
       appendJournalLocked(
         event: "native-agent-bridge-history-request",
-        payload: ["chatId": chatId, "provider": provider, "mode": mode, "ref": ref]
+        payload: [
+          "chatId": chatId, "provider": provider, "mode": mode, "before": before ?? "",
+          "ref": ref,
+        ]
       )
       return ["accepted": true, "transport": "native", "ref": ref, "requestId": requestId]
     }
@@ -2111,6 +2133,7 @@ final class ChatEngine {
       "mode": "detail",
       "sessionId": sessionId,
       "requestId": requestId,
+      "limit": Self.bridgeSessionPageLimit,
     ])
     if (result["accepted"] as? Bool) == true {
       syncOnQueue {
@@ -2118,9 +2141,117 @@ final class ChatEngine {
         // Stay subscribed: the bridge re-pushes this requestId as the transcript
         // grows, and each re-push upserts new turns in place (live tail).
         liveBridgeSessionIngestByChatId[chatId] = (provider: provider, sessionId: sessionId, requestId: requestId)
+        bridgeSessionPagingByChatId[chatId] = (
+          provider: provider, sessionId: sessionId, nextBefore: nil, hasMoreBefore: true,
+          loadingOlder: false
+        )
       }
     }
     return result
+  }
+
+  @discardableResult
+  func loadOlderAgentBridgeSessionChunk(chatId rawChatId: String) -> [String: Any] {
+    let chatId = normalizedString(rawChatId) ?? rawChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !chatId.isEmpty else { return ["accepted": false, "reason": "invalid_chat"] }
+
+    let spec: (provider: String, sessionId: String, before: String)? = syncOnQueue {
+      guard var paging = bridgeSessionPagingByChatId[chatId],
+        paging.hasMoreBefore,
+        !paging.loadingOlder,
+        let before = paging.nextBefore,
+        !before.isEmpty
+      else {
+        return nil
+      }
+      paging.loadingOlder = true
+      bridgeSessionPagingByChatId[chatId] = paging
+      return (provider: paging.provider, sessionId: paging.sessionId, before: before)
+    }
+    guard let spec else { return ["accepted": false, "reason": "no_older_page"] }
+
+    let requestId = UUID().uuidString
+    let result = requestAgentBridgeHistory([
+      "chatId": chatId,
+      "provider": spec.provider,
+      "mode": "detail",
+      "sessionId": spec.sessionId,
+      "before": spec.before,
+      "requestId": requestId,
+      "limit": Self.bridgeSessionPageLimit,
+    ])
+    if (result["accepted"] as? Bool) == true {
+      syncOnQueue {
+        pendingBridgeSessionIngestByRequestId[requestId] = (chatId: chatId, provider: spec.provider)
+      }
+    } else {
+      syncOnQueue {
+        if var paging = bridgeSessionPagingByChatId[chatId], paging.sessionId == spec.sessionId {
+          paging.loadingOlder = false
+          bridgeSessionPagingByChatId[chatId] = paging
+        }
+      }
+    }
+    return result
+  }
+
+  /// Forget the bridge history session a chat had loaded (its live-tail subscription).
+  /// Called on a deliberate New Chat so a subsequent topic re-join can't resurrect the
+  /// old transcript into the fresh thread. Normal view-detach / backgrounding does NOT
+  /// call this — the session is retained so the live tail resumes on return.
+  func clearLiveBridgeSessionIngest(chatId rawChatId: String) {
+    guard let chatId = normalizedString(rawChatId), !chatId.isEmpty else { return }
+    queue.async { [weak self] in
+      guard let self else { return }
+      self.liveBridgeSessionIngestByChatId.removeValue(forKey: chatId)
+      self.bridgeSessionPagingByChatId.removeValue(forKey: chatId)
+      self.pendingBridgeSessionIngestByRequestId = self.pendingBridgeSessionIngestByRequestId.filter {
+        $0.value.chatId != chatId
+      }
+    }
+  }
+
+  /// The bridge history session this chat is currently live-tailing, if any. Retained
+  /// across view-detach/background (only dropped by New Chat / logout), so the chat view
+  /// can keep the session's rows visible even when its own per-instance loaded-session id
+  /// was reset by a rebind — the root cause of the feed collapsing to empty on foreground.
+  func liveBridgeSessionId(chatId rawChatId: String) -> String? {
+    guard let chatId = normalizedString(rawChatId), !chatId.isEmpty else { return nil }
+    return syncOnQueue { liveBridgeSessionIngestByChatId[chatId]?.sessionId }
+  }
+
+  /// A chat that had a bridge history session loaded just (re)joined its topic — either
+  /// after the user returned to the view or after a socket reconnect in the background.
+  /// Re-issue the detail request so the bridge re-watches the transcript and re-pushes
+  /// the current turns; this resumes live updates and refreshes the feed in place
+  /// (upsert) rather than leaving it frozen until History is manually re-opened.
+  private func rearmLiveBridgeSessionLocked(chatId: String, trigger: String) {
+    guard let live = liveBridgeSessionIngestByChatId[chatId] else { return }
+    guard let client = phoenixClient, nativeJoinedChatIds.contains(chatId),
+      (state["connected"] as? Bool) == true
+    else { return }
+    let requestId = UUID().uuidString
+    liveBridgeSessionIngestByChatId[chatId] = (
+      provider: live.provider, sessionId: live.sessionId, requestId: requestId
+    )
+    var wirePayload: [String: Any] = [
+      "provider": live.provider,
+      "mode": "detail",
+      "requestId": requestId,
+      "limit": Self.bridgeSessionPageLimit,
+    ]
+    if !live.sessionId.isEmpty { wirePayload["sessionId"] = live.sessionId }
+    let ref = client.push(
+      topic: chatTopic(for: chatId),
+      event: "agent-bridge-history",
+      payload: wirePayload
+    )
+    appendJournalLocked(
+      event: "rearm-live-bridge-session",
+      payload: [
+        "chatId": chatId, "provider": live.provider, "trigger": trigger, "ref": ref,
+      ]
+    )
   }
 
   /// Render a bridge "detail" transcript payload into the chat as message rows.
@@ -2182,6 +2313,27 @@ final class ChatEngine {
     guard let session = payload["session"] as? [String: Any] else { return }
     let sessionId =
       normalizedString(session["id"]) ?? normalizedString(payload["sessionId"]) ?? UUID().uuidString
+    let hasMoreBefore =
+      (session["hasMoreBefore"] as? Bool)
+      ?? (session["has_more_before"] as? Bool)
+      ?? false
+    let nextBefore =
+      normalizedString(session["nextBefore"] ?? session["next_before"] ?? session["before"])
+    let responseBefore =
+      normalizedString(payload["before"] ?? payload["beforeCursor"] ?? payload["before_cursor"])
+    if var paging = bridgeSessionPagingByChatId[chatId], paging.sessionId == sessionId {
+      if responseBefore != nil || paging.nextBefore == nil || paging.loadingOlder {
+        paging.nextBefore = nextBefore
+        paging.hasMoreBefore = hasMoreBefore
+      }
+      paging.loadingOlder = false
+      bridgeSessionPagingByChatId[chatId] = paging
+    } else {
+      bridgeSessionPagingByChatId[chatId] = (
+        provider: provider, sessionId: sessionId, nextBefore: nextBefore,
+        hasMoreBefore: hasMoreBefore, loadingOlder: false
+      )
+    }
     let rawMessages = session["messages"] as? [[String: Any]] ?? []
     guard !rawMessages.isEmpty else { return }
 
@@ -5313,6 +5465,10 @@ final class ChatEngine {
             self.nativeJoinedChatIds.insert(chatId)
             self.appendJournalLocked(event: "native-chat-joined", payload: ["chatId": chatId])
             self.scheduleReplayQueuedOutboundLocked(chatId: chatId, trigger: "chat_joined")
+            // Resume the live tail for a bridge session this chat had loaded: the topic is
+            // freshly (re)joined after a view re-attach or background reconnect, so re-arm
+            // the transcript watch instead of leaving the agent feed frozen.
+            self.rearmLiveBridgeSessionLocked(chatId: chatId, trigger: "chat_joined")
           } else {
             self.appendJournalLocked(
               event: "native-chat-join-error",
@@ -5464,11 +5620,16 @@ final class ChatEngine {
               ingestProvider = provider.isEmpty ? live.provider : provider
             }
             if let ingestProvider {
-              self.ingestAgentBridgeSessionLocked(
-                chatId: chatId,
-                provider: ingestProvider,
-                payload: frame.payload
-              )
+              if frame.payload["session"] is [String: Any] {
+                self.ingestAgentBridgeSessionLocked(
+                  chatId: chatId,
+                  provider: ingestProvider,
+                  payload: frame.payload
+                )
+              } else if var paging = self.bridgeSessionPagingByChatId[chatId] {
+                paging.loadingOlder = false
+                self.bridgeSessionPagingByChatId[chatId] = paging
+              }
             }
           }
           self.postChangeLocked(
@@ -8113,11 +8274,35 @@ final class ChatEngine {
   }
 
   private func clearSocketResetLiveRowsLocked() {
-    liveMessageRowsByChat = liveMessageRowsByChat.filter { chatId, _ in
-      isVolatileBridgeAgentChatLocked(chatId: chatId)
+    // On a socket reset we only drop live rows that a history refetch can re-deliver.
+    // A live row NOT present in fetched history (an unsent/queued outbound, or any
+    // message in a chat whose history was never loaded — e.g. the very first message
+    // of a brand-new chat) is the ONLY copy the app has: wiping it makes the message
+    // vanish from the chat list and the home preview until a full history round-trip.
+    var nextLive: [String: [String: [String: Any]]] = [:]
+    for (chatId, perChat) in liveMessageRowsByChat {
+      if isVolatileBridgeAgentChatLocked(chatId: chatId) {
+        nextLive[chatId] = perChat
+        continue
+      }
+      let historyIds = Set((historyRowsByChat[chatId] ?? []).compactMap { messageId(fromRow: $0) })
+      var kept: [String: [String: Any]] = [:]
+      for (rowMessageId, row) in perChat {
+        // Agent stream fragments are transient by design — always drop on reset.
+        if rowMessageId.hasPrefix("stream-") { continue }
+        if historyIds.contains(rowMessageId) { continue }
+        kept[rowMessageId] = row
+      }
+      if !kept.isEmpty {
+        nextLive[chatId] = kept
+        NSLog(
+          "[FirstMsg] socketReset keeping %d live row(s) chatId=%@ (not in fetched history)",
+          kept.count, String(chatId.prefix(12)))
+      }
     }
+    liveMessageRowsByChat = nextLive
     deletedMessageIdsByChat = deletedMessageIdsByChat.filter { chatId, _ in
-      isVolatileBridgeAgentChatLocked(chatId: chatId)
+      isVolatileBridgeAgentChatLocked(chatId: chatId) || liveMessageRowsByChat[chatId] != nil
     }
   }
 

@@ -24,3 +24,13 @@ Interactive approvals for Claude Code in this repo are governed by
 
 Destructive commands (rm -rf, sudo, git push, git reset --hard, dd, mkfs, curl|sh,
 npm publish, ...) are blocked in every remote mode, even `full`.
+
+## Prefer commands that run without approval
+
+Read-only / search / inspect commands (and pipelines of them) auto-run; commands
+that mutate the filesystem or run arbitrary code stop for approval. Prefer the
+auto-allowed forms and don't reach for a mutating command unless the task needs the
+side effect — e.g. **don't `cp` a file just to read or diff it** (use Read / `cat` /
+`diff`), and edit files with the **Edit/Write** tools (auto-allowed) instead of
+`sed -i` / redirects. Full list of what runs free vs. asks:
+[docs/agent-command-guide.md](docs/agent-command-guide.md).

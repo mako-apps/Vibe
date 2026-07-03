@@ -291,7 +291,14 @@ defmodule Vibe.AI.AgentBuilder do
     trimmed_message = normalize_optional_string(message)
 
     with true <- is_binary(trimmed_message) or is_map(ui_response),
-         {:ok, result} <- delegate_builder_request(user_id, trimmed_message, active_agent_id, ui_response, callback) do
+         {:ok, result} <-
+           delegate_builder_request(
+             user_id,
+             trimmed_message,
+             active_agent_id,
+             ui_response,
+             callback
+           ) do
       selected_agent_id = result[:active_agent_id] || result[:activeAgentId]
       latest_secret = result[:latest_secret] || result[:latestSecret]
       selected_agent = resolve_owned_agent(user_id, nil, selected_agent_id)
@@ -479,6 +486,7 @@ defmodule Vibe.AI.AgentBuilder do
           type: :progress,
           label: builder_tool_progress_label(tool_name, tool_input),
           tool: tool_name,
+          tool_call_id: tool["id"],
           status: "running"
         })
       end
@@ -491,6 +499,7 @@ defmodule Vibe.AI.AgentBuilder do
         callback.(%{
           type: :tool_result,
           tool: tool_name,
+          tool_call_id: tool["id"],
           result: safe_result,
           status: "complete"
         })
@@ -1044,8 +1053,11 @@ defmodule Vibe.AI.AgentBuilder do
               "#{title} Agent"
           end
           |> case do
-            nil -> nil
-            inferred -> inferred |> String.slice(0, 48) |> String.trim() |> normalize_optional_string()
+            nil ->
+              nil
+
+            inferred ->
+              inferred |> String.slice(0, 48) |> String.trim() |> normalize_optional_string()
           end
       end
     else
@@ -1057,7 +1069,10 @@ defmodule Vibe.AI.AgentBuilder do
 
   defp strip_display_name_prefixes(text) do
     text
-    |> String.replace(~r/^(i\s+(need|want)\s+|please\s+)?(create|build|make|set\s*up|setup)\s+(me\s+|us\s+|a\s+|an\s+)?/i, "")
+    |> String.replace(
+      ~r/^(i\s+(need|want)\s+|please\s+)?(create|build|make|set\s*up|setup)\s+(me\s+|us\s+|a\s+|an\s+)?/i,
+      ""
+    )
     |> String.replace(~r/^(an?\s+)?(agent|assistant|bot)\s+(for|that|to)\s+/i, "")
     |> String.replace(~r/^(for|about)\s+/i, "")
     |> normalize_optional_string()
@@ -1895,7 +1910,8 @@ defmodule Vibe.AI.AgentBuilder do
     payload = Map.get(context, "agent", context)
 
     %{
-      "display_name" => payload[:displayName] || payload["displayName"] || payload["display_name"],
+      "display_name" =>
+        payload[:displayName] || payload["displayName"] || payload["display_name"],
       "username" => payload[:username] || payload["username"],
       "status" => payload[:status] || payload["status"]
     }

@@ -1012,7 +1012,12 @@ function buildCommand(provider, prompt, chatId, task) {
   if (provider === "claude") {
     const mode = claudePermissionMode(task);
     const effort = reasoningEffortFor(provider, task);
-    const args = ["-p", "--output-format", "stream-json", "--permission-mode", mode, "--effort", effort];
+    // `--include-partial-messages` makes the CLI stream `thinking_delta` events as the
+    // model reasons (the persisted JSONL only stores the block once complete), so the DM
+    // can show a live-ticking "Thinking · N tokens" counter. The raw deltas are NOT
+    // forwarded (they'd flood the server's whole-buffer reparse) — onChunk coalesces them
+    // into a throttled `vibe_thinking` progress line (see thinkingState below).
+    const args = ["-p", "--output-format", "stream-json", "--include-partial-messages", "--permission-mode", mode, "--effort", effort];
     appendToolListArg(args, "--disallowedTools", claudeDisallowedTools(task));
     if (ASK_MCP_ENABLED && askMcpConfigPath) {
       // Expose the ask_user + approve_command MCP tools and pre-allow them so the
@@ -2376,6 +2381,12 @@ function looksToolish(line) {
 // server can stream a live bubble (not just the final batch). System/init lines
 // are skipped. The server is the source of truth for parsing — we stay thin.
 function streamable(line) {
+  // `--include-partial-messages` emits per-token `stream_event` deltas (text_delta,
+  // message_start, …) that would otherwise match on "text"/"assistant" below and flood
+  // the server's whole-buffer reparse. They carry no new complete content (the completed
+  // assistant message follows), and the one signal we DO want from them — thinking token
+  // growth — is coalesced separately into the throttled vibe_thinking line (trackThinking).
+  if (line.includes("stream_event")) return false;
   return (
     looksToolish(line) ||
     line.includes('"text"') || // claude assistant text blocks
@@ -2579,6 +2590,69 @@ async function runTask(channel, task) {
   let lastChunkAt = Date.now();
   let keepaliveTimer = null;
   let lastProgressLogAt = 0;
+  // Live "Thinking · N tokens" counter. `--include-partial-messages` streams reasoning as
+  // `thinking_delta` events; we accumulate the current block's chars and push a THROTTLED
+  // synthetic `vibe_thinking` progress line (never the raw deltas — that would flood the
+  // server's whole-buffer reparse). Token estimate ≈ chars/4 (mirrors the desktop's live
+  // estimate; the settled count comes from the history transcript's usage once done).
+  const thinkingState = { chars: 0, active: false, lastEmitAt: 0, lastTokens: -1 };
+  const emitThinking = (force) => {
+    if (progressCount >= MAX_PROGRESS_LINES) return;
+    const tokens = Math.max(1, Math.round(thinkingState.chars / 4));
+    const now = Date.now();
+    if (!force && (now - thinkingState.lastEmitAt < 350 || tokens === thinkingState.lastTokens)) {
+      return;
+    }
+    thinkingState.lastEmitAt = now;
+    thinkingState.lastTokens = tokens;
+    progressCount++;
+    const progressPayload = {
+      provider,
+      chatId,
+      taskId,
+      sequence: progressCount,
+      sentAtMs: now,
+      replyToId,
+      repoId: repo.id,
+      repoName: repo.name,
+      cwd,
+      workMode: workModeFor(task),
+      model: modelFor(provider, chatId, task) || null,
+      line: JSON.stringify({ type: "vibe_thinking", tokens, active: thinkingState.active }),
+    };
+    channel.push("progress", progressPayload);
+    const liveEntry = runningTasks.get(key);
+    if (liveEntry) liveEntry.lastProgress = progressPayload;
+  };
+  // Fold one raw stream-json line into the thinking counter. Returns quietly for any line
+  // that isn't a partial thinking event. Gated on a cheap substring test so we only
+  // JSON.parse the (few) partial-message lines.
+  const trackThinking = (line) => {
+    if (!line.includes("stream_event")) return;
+    let obj;
+    try {
+      obj = JSON.parse(line);
+    } catch {
+      return;
+    }
+    const inner = obj && obj.type === "stream_event" ? obj.event : null;
+    if (!inner || typeof inner.type !== "string") return;
+    if (inner.type === "content_block_start" && inner.content_block && inner.content_block.type === "thinking") {
+      thinkingState.chars = 0;
+      thinkingState.active = true;
+    } else if (inner.type === "content_block_delta" && inner.delta && inner.delta.type === "thinking_delta") {
+      thinkingState.chars += String(inner.delta.thinking || "").length;
+      thinkingState.active = true;
+      emitThinking(false);
+    } else if (inner.type === "content_block_stop" && thinkingState.active) {
+      // The thinking block closed (a tool call / answer text follows) — one final tick so
+      // the counter settles, then the node stays until the completed message replaces it.
+      thinkingState.active = false;
+      emitThinking(true);
+    } else if (inner.type === "message_stop") {
+      thinkingState.active = false;
+    }
+  };
 
   const onChunk = (buf) => {
     const text = buf.toString();
@@ -2598,6 +2672,9 @@ async function runTask(channel, task) {
       const line = lineBuf.slice(0, idx).replace(/\r$/, "");
       lineBuf = lineBuf.slice(idx + 1);
       if (!line) continue;
+      // Coalesce partial thinking deltas into a throttled live token counter (does not
+      // itself forward the raw partial line — see streamable()).
+      trackThinking(line);
       const sid = captureSessionId(line);
       if (sid) {
         // Fork detection: if the run REPORTS a session id different from the one we
@@ -3119,6 +3196,27 @@ function sealHistoryRuntime(provider, message, acc, durationMs) {
   return true;
 }
 
+function windowHistoryMessages(messages, limit, before) {
+  const cap = Math.max(1, Math.min(Number(limit) || HISTORY_MSG_LIMIT, HISTORY_MSG_LIMIT));
+  const cursor = String(before || "").trim();
+  let end = messages.length;
+  if (cursor) {
+    const index = messages.findIndex((m) => String((m && (m.uid || m.id)) || "") === cursor);
+    if (index >= 0) end = index;
+  }
+  const start = Math.max(0, end - cap);
+  const window = messages.slice(start, end);
+  return {
+    messages: window,
+    truncated: start > 0 || end < messages.length,
+    hasMoreBefore: start > 0,
+    nextBefore: window.length ? String(window[0].uid || window[0].id || "") : null,
+    windowStart: start,
+    windowEnd: end,
+    totalMessages: messages.length,
+  };
+}
+
 // A real user prompt (not a tool_result/tool-output envelope) opens a new turn.
 function messageHasUserText(m) {
   if (!m) return false;
@@ -3135,7 +3233,8 @@ function messageHasUserText(m) {
 // in history (and open it as a live stream) for sessions started EITHER by the
 // bridge OR directly in the user's own desktop terminal (which never enter the
 // `runningTasks` Map, so mtime-freshness is the only signal we have for those).
-const LIVE_SESSION_WINDOW_MS = 75_000;
+const LIVE_SESSION_WINDOW_MS = Number(process.env.VIBE_HISTORY_LIVE_WINDOW_MS || 15_000);
+const CODEX_SUMMARY_HEAD_BYTES = Number(process.env.VIBE_CODEX_SUMMARY_HEAD_BYTES || 8 * 1024 * 1024);
 
 function runningSessionIdSet(provider) {
   const set = new Set();
@@ -3733,7 +3832,7 @@ function foldTurnIntoHost(messages, turnItems, detailByUid, resultByUid, turnRea
   return host;
 }
 
-async function claudeDetail(id, limit) {
+async function claudeDetail(id, limit, before) {
   const match = claudeSessionFiles().find((s) => s.id === id);
   if (!match) return null;
   const messages = [];
@@ -3849,7 +3948,13 @@ async function claudeDetail(id, limit) {
         if (think) turnReasoning += (turnReasoning ? "\n\n" : "") + think;
         // Thinking metrics: presence (any thinking block, even empty text), reasoning
         // tokens (this message's output ≈ reasoning tokens for a think-heavy step),
-        // and a best-effort duration = gap from the previous event to this message.
+        // and a best-effort duration = gap from the IMMEDIATELY-preceding event to this
+        // message. `lastEventTs` is advanced at the end of the callback for EVERY event
+        // (user prompt + tool_result too — see below), so this gap is ONLY the model's
+        // own reasoning wall-clock and excludes the preceding tool-execution time. (The
+        // old code advanced lastEventTs on assistant events only, so a thinking step that
+        // followed a long tool run counted the whole tool duration as "thinking" — the
+        // "Thought for 1m 42s, timing is wrong" bug.)
         if (Array.isArray(m.content) && m.content.some((b) => b && b.type === "thinking")) {
           turnThinking.had = true;
           const outTok = Number(m.usage && (m.usage.output_tokens || m.usage.reasoning_output_tokens)) || 0;
@@ -3859,9 +3964,6 @@ async function claudeDetail(id, limit) {
             if (dt > 0 && dt < 600000) turnThinking.durationMs += dt;
           }
         }
-        // Advance the "previous event" marker across assistant messages so the next
-        // thinking step measures its gap from this one (≈ generation wall-clock).
-        if (ev.timestamp) lastEventTs = ev.timestamp;
         // Subagent (sidechain) events carry the parent Task's tool_use id; tag the
         // child detail so it groups under the Task (depth 1) like the live path.
         const parentToolUseId =
@@ -3878,6 +3980,11 @@ async function claudeDetail(id, limit) {
         }
       }
     }
+    // Advance the "previous event" marker for EVERY event (user prompt, tool_result,
+    // and assistant alike — mirrors the Codex path) so the next thinking step measures
+    // ONLY its own gap. Because tool_result user events bump this too, the tool's own
+    // execution time is excluded from the following thinking node's duration.
+    if (ev.timestamp) lastEventTs = ev.timestamp;
   });
   flushTurn();
   // Keep the most RECENT `limit` messages (the tail), not the oldest — a long
@@ -3890,9 +3997,21 @@ async function claudeDetail(id, limit) {
   // Flag a windowed tail so the app only runs aggressive stale-row cleanup when it
   // received the WHOLE session — otherwise "absent" just means "older than the
   // window", and deleting those would erase valid scrollback.
-  const truncated = messages.length > limit;
-  if (truncated) messages.splice(0, messages.length - limit);
-  return { provider: "claude", id, topic: topicText, project: match.project, projectName: path.basename(match.project), truncated, messages };
+  const window = windowHistoryMessages(messages, limit, before);
+  return {
+    provider: "claude",
+    id,
+    topic: topicText,
+    project: match.project,
+    projectName: path.basename(match.project),
+    truncated: window.truncated,
+    hasMoreBefore: window.hasMoreBefore,
+    nextBefore: window.nextBefore,
+    windowStart: window.windowStart,
+    windowEnd: window.windowEnd,
+    totalMessages: window.totalMessages,
+    messages: window.messages,
+  };
 }
 
 // — Codex —
@@ -3903,6 +4022,11 @@ function codexText(content) {
     .map((b) => b.text)
     .join("\n")
     .trim();
+}
+
+function codexIdFromSessionFileName(name) {
+  const m = String(name || "").match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+  return m ? m[1] : "";
 }
 
 function codexSessionFiles() {
@@ -3918,14 +4042,75 @@ function codexSessionFiles() {
       else if (e.name.startsWith("rollout-") && e.name.endsWith(".jsonl")) {
         let st;
         try { st = fs.statSync(full); } catch { continue; }
-        out.push({ file: full, name: e.name, mtime: st.mtimeMs });
+        out.push({ id: codexIdFromSessionFileName(e.name), file: full, name: e.name, mtime: st.mtimeMs, size: st.size });
       }
     }
   })(root);
   return out;
 }
 
-async function codexSummary(file) {
+function readFileHead(file, maxBytes) {
+  let fd = null;
+  try {
+    fd = fs.openSync(file, "r");
+    const st = fs.fstatSync(fd);
+    const size = Math.min(st.size, Math.max(0, maxBytes || 0));
+    if (!size) return "";
+    const buf = Buffer.alloc(size);
+    const read = fs.readSync(fd, buf, 0, size, 0);
+    return buf.slice(0, read).toString("utf8");
+  } catch (_) {
+    return "";
+  } finally {
+    if (fd != null) {
+      try { fs.closeSync(fd); } catch (_) {}
+    }
+  }
+}
+
+function decodeJsonStringFragment(raw) {
+  if (typeof raw !== "string") return "";
+  try { return JSON.parse(`"${raw}"`); } catch (_) { return raw; }
+}
+
+function codexMetaFromHead(head) {
+  const meta = {};
+  const id = head.match(/"id"\s*:\s*"((?:\\.|[^"])*)"/) || head.match(/"session_id"\s*:\s*"((?:\\.|[^"])*)"/);
+  const cwd = head.match(/"cwd"\s*:\s*"((?:\\.|[^"])*)"/);
+  if (id) meta.id = decodeJsonStringFragment(id[1]);
+  if (cwd) meta.cwd = decodeJsonStringFragment(cwd[1]);
+  return Object.keys(meta).length ? meta : null;
+}
+
+function codexSummaryFromHead(file) {
+  const head = readFileHead(file, CODEX_SUMMARY_HEAD_BYTES);
+  const meta = codexMetaFromHead(head);
+  let topic = null, assistantTopic = null, messages = 0;
+  for (const line of head.split("\n")) {
+    if (!line.includes('"response_item"') || !line.includes('"type":"message"')) continue;
+    let ev;
+    try { ev = JSON.parse(line); } catch { continue; }
+    const p = ev.payload || {};
+    const role = p.role;
+    if (role !== "user" && role !== "assistant") continue;
+    const text = codexText(p.content);
+    if (!text) continue;
+    messages++;
+    if (role === "user" && !topic) {
+      const clean = cleanTopicCandidate(text);
+      if (clean) topic = clean;
+    } else if (role === "assistant" && !assistantTopic) {
+      const clean = cleanTopicCandidate(text);
+      if (clean) assistantTopic = clean;
+    }
+    if (topic && messages >= 2) break;
+  }
+  if (!messages && head.includes('"response_item"')) messages = 1;
+  return { meta, topic: topic || assistantTopic || "Codex session", lastTs: null, messages };
+}
+
+async function codexSummary(file, opts = {}) {
+  if (opts.fast) return codexSummaryFromHead(file);
   let meta = null, topic = null, assistantTopic = null, lastTs = null, messages = 0;
   await readJsonl(file, (ev) => {
     if (ev.type === "session_meta") meta = ev.payload || {};
@@ -3953,32 +4138,32 @@ async function listCodex(limit) {
   const runningIds = runningSessionIdSet("codex");
   const results = [];
   for (const f of files) {
-    const sum = await codexSummary(f.file);
+    const sum = await codexSummary(f.file, { fast: true });
     if (sum.messages === 0) continue;
     const project = (sum.meta && sum.meta.cwd) || "";
     if (isEphemeralProject(project)) continue;
-    const id = (sum.meta && sum.meta.id) || f.name;
+    const id = (sum.meta && sum.meta.id) || f.id || f.name;
     results.push({
       provider: "codex",
       id,
       topic: sum.topic,
       project,
       projectName: project ? path.basename(project) : "",
-      updatedAt: sum.lastTs || new Date(f.mtime).toISOString(),
-      messageCount: sum.messages,
+      updatedAt: new Date(f.mtime).toISOString(),
+      messageCount: Math.max(1, sum.messages || 0),
       live: sessionIsLive(f.mtime, id, runningIds),
     });
   }
   return results;
 }
 
-async function codexDetail(id, limit) {
+async function codexDetail(id, limit, before) {
   // The session id is embedded in the rollout filename; fall back to meta.id.
   const files = codexSessionFiles();
-  let match = files.find((f) => f.name.includes(id));
+  let match = files.find((f) => f.id === id || f.name.includes(id));
   if (!match) {
     for (const f of files) {
-      const sum = await codexSummary(f.file);
+      const sum = await codexSummary(f.file, { fast: true });
       if (sum.meta && sum.meta.id === id) { match = f; break; }
     }
   }
@@ -4005,6 +4190,7 @@ async function codexDetail(id, limit) {
   const actionDetailByUid = new Map();
   const resultByUid = new Map();
   const callIdToUid = new Map();
+  let eventSeq = 0;
   const flushTurn = () => {
     const host = foldTurnIntoHost(messages, turnItems, actionDetailByUid, resultByUid, turnReasoning, null, turnThinking);
     if (host && pending.order.length) {
@@ -4021,7 +4207,8 @@ async function codexDetail(id, limit) {
     if (ev.type === "session_meta" && ev.payload) project = ev.payload.cwd || "";
     if (ev.type !== "response_item" || !ev.payload) return;
     const p = ev.payload;
-    const dkey = p.id || ev.id;
+    const dkey = p.id || ev.id || `codex-${eventSeq}`;
+    eventSeq += 1;
     if (dkey) { if (seen.has(dkey)) return; seen.add(dkey); }
     collectCodexEdits(pending, p); // apply_patch items accumulate into the turn
     if (p.type === "message" && (p.role === "user" || p.role === "assistant")) {
@@ -4077,18 +4264,30 @@ async function codexDetail(id, limit) {
   const topic =
     messages.map((m) => cleanTopicCandidate(m.text)).find(Boolean) ||
     "Untitled";
-  const truncated = messages.length > limit;
-  if (truncated) messages.splice(0, messages.length - limit);
-  return { provider: "codex", id, topic, project, projectName: project ? path.basename(project) : "", truncated, messages };
+  const window = windowHistoryMessages(messages, limit, before);
+  return {
+    provider: "codex",
+    id,
+    topic,
+    project,
+    projectName: project ? path.basename(project) : "",
+    truncated: window.truncated,
+    hasMoreBefore: window.hasMoreBefore,
+    nextBefore: window.nextBefore,
+    windowStart: window.windowStart,
+    windowEnd: window.windowEnd,
+    totalMessages: window.totalMessages,
+    messages: window.messages,
+  };
 }
 
-async function readHistory({ provider, mode, sessionId, limit }) {
+async function readHistory({ provider, mode, sessionId, limit, before }) {
   const p = String(provider || "").trim().toLowerCase();
   const wantDetail = String(mode || "").toLowerCase() === "detail" || !!sessionId;
   if (wantDetail) {
     const cap = limit || HISTORY_MSG_LIMIT;
-    if (p === "codex") return { mode: "detail", session: await codexDetail(sessionId, cap) };
-    return { mode: "detail", session: await claudeDetail(sessionId, cap) };
+    if (p === "codex") return { mode: "detail", session: await codexDetail(sessionId, cap, before) };
+    return { mode: "detail", session: await claudeDetail(sessionId, cap, before) };
   }
   const cap = limit || HISTORY_LIST_LIMIT;
   if (p === "codex") return { mode: "list", sessions: await listCodex(cap) };
@@ -4111,7 +4310,7 @@ function sessionFilePath(provider, sessionId) {
   if (!sessionId) return null;
   const p = String(provider || "").trim().toLowerCase();
   const files = p === "codex" ? codexSessionFiles() : claudeSessionFiles();
-  const match = files.find((s) => s.id === sessionId);
+  const match = files.find((s) => s.id === sessionId || (p === "codex" && s.name && s.name.includes(sessionId)));
   return match ? match.file : null;
 }
 
@@ -4246,13 +4445,13 @@ function stopAllHistoryWatches() {
   for (const chatId of Array.from(historyWatchers.keys())) stopHistoryWatch(chatId);
 }
 
-function startHistoryWatch(channel, { chatId, provider, sessionId, echo }) {
+function startHistoryWatch(channel, { chatId, provider, sessionId, echo, limit }) {
   const file = sessionFilePath(provider, sessionId);
   if (!chatId || !sessionId || !file) return;
   // Remember the spec so the watch can be re-armed after a reconnect (the socket drop
   // calls stopAllHistoryWatches, which would otherwise leave the phone stuck on a stale
   // transcript until a full app restart).
-  historyWatchSpecs.set(chatId, { provider, sessionId, echo });
+  historyWatchSpecs.set(chatId, { provider, sessionId, echo, limit });
   while (historyWatchSpecs.size > MAX_HISTORY_WATCHERS) {
     const oldest = historyWatchSpecs.keys().next().value;
     if (oldest === chatId || !oldest) break;
@@ -4268,7 +4467,7 @@ function startHistoryWatch(channel, { chatId, provider, sessionId, echo }) {
     if (channel.state !== "joined") return;
     if (rec.busy) { rec.again = true; return; } // re-read once the in-flight read finishes
     rec.busy = true;
-    readHistory({ provider, mode: "detail", sessionId })
+    readHistory({ provider, mode: "detail", sessionId, limit })
       .then((result) => {
         const msgs = (result && result.session && result.session.messages) || [];
         const runningEntry = runningTaskForChat(chatId);
@@ -4351,22 +4550,44 @@ function startHistoryWatch(channel, { chatId, provider, sessionId, echo }) {
 
 function handleHistoryRequest(channel, payload) {
   const provider = payload.provider || payload.agentBridgeProvider || "claude";
+  const mode = payload.mode;
   const requestId = payload.requestId || payload.request_id || crypto.randomUUID();
   const chatId = payload.chatId || payload.chat_id || null;
   const sessionId = payload.sessionId || payload.session_id || null;
-  const echo = { requestId, provider, chatId, requesterUserId: payload.requesterUserId || payload.requester_user_id || null };
+  const before = payload.before || payload.beforeCursor || payload.before_cursor || null;
+  const echo = {
+    requestId,
+    provider,
+    chatId,
+    requesterUserId: payload.requesterUserId || payload.requester_user_id || null,
+    ...(before ? { before } : {}),
+  };
+  const start = Date.now();
+  const want = String(mode || "").toLowerCase() === "detail" || !!sessionId ? "detail" : "list";
+  console.log(
+    `[vibe-bridge][history] request provider=${provider} mode=${want} chat=${chatId || "-"} ` +
+      `session=${sessionId || "-"} before=${before || "-"} requestId=${requestId}`
+  );
 
-  readHistory({ provider, mode: payload.mode, sessionId, limit: payload.limit })
+  readHistory({ provider, mode, sessionId, limit: payload.limit, before })
     .then((result) => {
+      const count =
+        result && result.mode === "detail"
+          ? (((result.session || {}).messages || []).length)
+          : (((result || {}).sessions || []).length);
+      console.log(
+        `[vibe-bridge][history] result provider=${provider} mode=${result && result.mode} ` +
+          `chat=${chatId || "-"} requestId=${requestId} ms=${Date.now() - start} count=${count}`
+      );
       // Mark the trailing turn live on the FIRST detail push too (not just on watch
       // re-fires) so opening a live session lands directly in the working state with
       // no flash of the sealed "Worked · N steps" card.
-      markDetailLiveTurn(result, provider, sessionId, chatId);
+      if (!before) markDetailLiveTurn(result, provider, sessionId, chatId);
       channel.push("history_result", { ok: true, ...echo, ...result });
       // The phone opened a specific session → keep it live by tailing the
       // transcript and re-pushing as it grows.
-      if (chatId && sessionId && result.mode === "detail") {
-        startHistoryWatch(channel, { chatId, provider, sessionId, echo });
+      if (!before && chatId && sessionId && result.mode === "detail") {
+        startHistoryWatch(channel, { chatId, provider, sessionId, echo, limit: payload.limit });
       }
       // Opening the chat is also our chance to re-surface any ask/command the run
       // is still blocked on but the phone never saw (missed the live broadcast, or
@@ -4374,7 +4595,11 @@ function handleHistoryRequest(channel, payload) {
       if (chatId) reemitPendingAskForChat(channel, chatId);
     })
     .catch((err) => {
-      channel.push("history_result", { ok: false, ...echo, message: err && err.message ? err.message : "history_failed" });
+      console.log(
+        `[vibe-bridge][history] failed provider=${provider} mode=${want} chat=${chatId || "-"} ` +
+          `requestId=${requestId} ms=${Date.now() - start} error=${err && err.message ? err.message : "history_failed"}`
+      );
+      channel.push("history_result", { ok: false, ...echo, mode: want, message: err && err.message ? err.message : "history_failed" });
     });
 }
 
@@ -5590,6 +5815,9 @@ async function main() {
 module.exports = {
   claudeDetail,
   codexDetail,
+  codexSummary,
+  listCodex,
+  readHistory,
   buildHistoryRuntime,
   collectClaudeEdits,
 	  collectCodexEdits,
@@ -5603,6 +5831,8 @@ module.exports = {
 	  handleFileRequest,
 	  normalizeModel,
 	  runningPlaceholderMessage,
+	  sessionFilePath,
+	  sessionFileIsLive,
 	};
 
 // Only auto-run the daemon when invoked directly (so the module is requireable).

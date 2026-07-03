@@ -3110,6 +3110,10 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     }
     let nav = UINavigationController(rootViewController: detail)
     nav.modalPresentationStyle = .pageSheet
+    // Clear the nav wrapper's opaque backing so the sheet's own UIGlassEffect refracts the
+    // chat behind it (real Liquid Glass) instead of frosting a solid nav background — the
+    // ask sheet looks glass precisely because it's presented WITHOUT this opaque layer.
+    nav.view.backgroundColor = .clear
     if let sheet = nav.sheetPresentationController {
       sheet.detents = [.medium(), .large()]
       sheet.prefersGrabberVisible = true
@@ -4619,6 +4623,231 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
 
 // MARK: - Read-only subagent detail (Claude Task tool)
 
+/// Clean vertical activity timeline for a turn/subagent's progress items — a filled
+/// dot + connecting line per step, a bold label, and at most one muted detail line
+/// with NO status word ("Completed"/"Started"). Modeled on resolo.ai's
+/// ChatActivityStepRow/ChatAgentActivitySheet ("GPT-style" activity log): plain and
+/// scannable, in contrast to the denser interleaved step/narration feed renderer
+/// (VibeAgentKitAssistantMessageBodyView) used in the live bubble/full-page view.
+/// Read-only list; rows with raw command/patch/file detail stay tappable via
+/// `onToggleExpand`, forwarded by nodeId to the same expand-state the host already
+/// tracks, so the interaction contract is unchanged — only the collapsed look is new.
+final class VibeAgentActivityTimelineView: UIView {
+  var onToggleExpand: ((String) -> Void)?
+
+  private let stack = UIStackView()
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    stack.axis = .vertical
+    stack.spacing = 0
+    stack.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(stack)
+    NSLayoutConstraint.activate([
+      stack.topAnchor.constraint(equalTo: topAnchor),
+      stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+      stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+      stack.bottomAnchor.constraint(equalTo: bottomAnchor),
+    ])
+  }
+
+  required init?(coder: NSCoder) { return nil }
+
+  func configure(
+    items: [VibeAgentKitProgressItem],
+    expandedStepIds: Set<String>,
+    appearance: VibeAgentKitChatAppearance
+  ) {
+    stack.arrangedSubviews.forEach {
+      stack.removeArrangedSubview($0)
+      $0.removeFromSuperview()
+    }
+    for (index, item) in items.enumerated() {
+      let row = VibeAgentActivityStepRowView(appearance: appearance)
+      let isExpanded = item.nodeId.map { expandedStepIds.contains($0) } ?? false
+      row.configure(item: item, isLast: index == items.count - 1, isExpanded: isExpanded)
+      row.onTap = { [weak self] in
+        guard let nodeId = item.nodeId else { return }
+        self?.onToggleExpand?(nodeId)
+      }
+      stack.addArrangedSubview(row)
+    }
+  }
+}
+
+/// One timeline row: dot+line gutter on the left, bold label + optional muted detail
+/// line on the right. The connecting line is pinned to the ROW's padded bottom (not
+/// just the text content's bottom), so it visually runs through the inter-row gap
+/// into the next dot exactly like the reference's SwiftUI `.frame(maxHeight: .infinity)`
+/// trick. When the item carries `command`/`patch`/`fileContent`, the row is tappable
+/// and reveals that raw text in a monospaced block underneath.
+private final class VibeAgentActivityStepRowView: UIView {
+  var onTap: (() -> Void)?
+
+  private let appearance: VibeAgentKitChatAppearance
+  private let dot = UIView()
+  private let line = UIView()
+  private let gutter = UIView()
+  private let titleLabel = UILabel()
+  private let detailLabel = UILabel()
+  private let chevron = UIImageView()
+  private let expandedTextView = UITextView()
+  private let textStack = UIStackView()
+
+  private var isExpandable = false
+  private var bottomConstraint: NSLayoutConstraint!
+
+  init(appearance: VibeAgentKitChatAppearance) {
+    self.appearance = appearance
+    super.init(frame: .zero)
+    setUp()
+  }
+
+  required init?(coder: NSCoder) { return nil }
+
+  private func setUp() {
+    dot.backgroundColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.82)
+    dot.layer.cornerRadius = 4.0
+    dot.translatesAutoresizingMaskIntoConstraints = false
+
+    line.backgroundColor = vibeAgentKitColorWithAlpha(
+      appearance.border, appearance.isDark ? 0.55 : 0.7)
+    line.translatesAutoresizingMaskIntoConstraints = false
+
+    gutter.translatesAutoresizingMaskIntoConstraints = false
+    gutter.addSubview(line)
+    gutter.addSubview(dot)
+
+    titleLabel.font = UIFont.systemFont(ofSize: 15.5, weight: .semibold)
+    titleLabel.textColor = appearance.text
+    titleLabel.numberOfLines = 0
+
+    detailLabel.font = UIFont.systemFont(ofSize: 13.0, weight: .regular)
+    detailLabel.textColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.78)
+    detailLabel.numberOfLines = 0
+
+    chevron.image = UIImage(systemName: "chevron.down")
+    chevron.tintColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.55)
+    chevron.contentMode = .scaleAspectFit
+    chevron.setContentHuggingPriority(.required, for: .horizontal)
+
+    let titleRow = UIStackView(arrangedSubviews: [titleLabel, chevron])
+    titleRow.axis = .horizontal
+    titleRow.alignment = .top
+    titleRow.spacing = 6.0
+
+    expandedTextView.isEditable = false
+    expandedTextView.isSelectable = true
+    expandedTextView.isScrollEnabled = false
+    expandedTextView.backgroundColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.08)
+    expandedTextView.font = UIFont.monospacedSystemFont(ofSize: 12.0, weight: .regular)
+    expandedTextView.textColor = appearance.text
+    expandedTextView.textContainerInset = UIEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
+    expandedTextView.textContainer.lineFragmentPadding = 0
+    expandedTextView.layer.cornerRadius = 8.0
+    expandedTextView.clipsToBounds = true
+    expandedTextView.isHidden = true
+
+    textStack.axis = .vertical
+    textStack.spacing = 3.0
+    textStack.addArrangedSubview(titleRow)
+    textStack.addArrangedSubview(detailLabel)
+    textStack.addArrangedSubview(expandedTextView)
+    textStack.setCustomSpacing(8.0, after: detailLabel)
+    textStack.translatesAutoresizingMaskIntoConstraints = false
+
+    addSubview(gutter)
+    addSubview(textStack)
+
+    // `self` is taller than `textStack` by the row's bottom padding (18pt, 0 for the
+    // last row) so the gutter — pinned to `self`'s full height below — stretches the
+    // connecting line through that gap into the next row's dot.
+    bottomConstraint = bottomAnchor.constraint(equalTo: textStack.bottomAnchor, constant: 18.0)
+
+    NSLayoutConstraint.activate([
+      gutter.topAnchor.constraint(equalTo: topAnchor),
+      gutter.leadingAnchor.constraint(equalTo: leadingAnchor),
+      gutter.widthAnchor.constraint(equalToConstant: 8.0),
+      gutter.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+      dot.topAnchor.constraint(equalTo: gutter.topAnchor, constant: 5.0),
+      dot.leadingAnchor.constraint(equalTo: gutter.leadingAnchor),
+      dot.widthAnchor.constraint(equalToConstant: 8.0),
+      dot.heightAnchor.constraint(equalToConstant: 8.0),
+
+      line.topAnchor.constraint(equalTo: dot.bottomAnchor),
+      line.bottomAnchor.constraint(equalTo: gutter.bottomAnchor),
+      line.centerXAnchor.constraint(equalTo: gutter.centerXAnchor),
+      line.widthAnchor.constraint(equalToConstant: 1.5),
+
+      textStack.topAnchor.constraint(equalTo: topAnchor),
+      textStack.leadingAnchor.constraint(equalTo: gutter.trailingAnchor, constant: 12.0),
+      textStack.trailingAnchor.constraint(equalTo: trailingAnchor),
+      bottomConstraint,
+    ])
+
+    isUserInteractionEnabled = true
+    addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(handleTap)))
+  }
+
+  @objc private func handleTap() {
+    guard isExpandable else { return }
+    onTap?()
+  }
+
+  /// Single best "what happened" line — narrative first, then the richer node-detail
+  /// fields Vibe adds for tool steps (Resolo has no equivalent; those fields don't
+  /// exist there), then platform as a last resort. Deliberately ONE line, not a join:
+  /// the narrative usually already names the file/command, so concatenating both
+  /// tends to repeat itself rather than add information. `command` is deliberately
+  /// NOT a candidate here — it lives only in the expandable block below, so a
+  /// command-only step (no narrative/fileName) doesn't show it twice.
+  private static func detailText(for item: VibeAgentKitProgressItem) -> String? {
+    let normalizedLabel = item.label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    let narrative = (item.messageContent ?? item.messagePreview)?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    if let narrative, !narrative.isEmpty, narrative.lowercased() != normalizedLabel {
+      return narrative
+    }
+    if let fileName = item.fileName?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !fileName.isEmpty
+    {
+      return fileName
+    }
+    if let platform = item.platform?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !platform.isEmpty
+    {
+      return platform.capitalized
+    }
+    return nil
+  }
+
+  private static func expandedText(for item: VibeAgentKitProgressItem) -> String? {
+    let candidate = item.patch ?? item.fileContent ?? item.command
+    guard let text = candidate?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty
+    else { return nil }
+    return text
+  }
+
+  func configure(item: VibeAgentKitProgressItem, isLast: Bool, isExpanded: Bool) {
+    titleLabel.text = item.label
+    let detail = Self.detailText(for: item)
+    detailLabel.text = detail
+    detailLabel.isHidden = detail == nil
+
+    line.isHidden = isLast
+
+    let expandable = item.nodeId != nil ? Self.expandedText(for: item) : nil
+    isExpandable = expandable != nil
+    chevron.isHidden = !isExpandable
+    chevron.transform = isExpanded ? CGAffineTransform(rotationAngle: .pi) : .identity
+    expandedTextView.text = expandable
+    expandedTextView.isHidden = !(isExpandable && isExpanded)
+
+    bottomConstraint.constant = isLast ? 0.0 : 18.0
+  }
+}
+
 /// A read-only view of one subagent's steps — no composer, no send, just the live
 /// Read/Edit/Run feed. Opened from the "Subagent" feed row or its start toast;
 /// the host VC calls `update(children:running:)` each transcript tick so it streams.
@@ -4637,11 +4866,17 @@ final class VibeAgentSubagentDetailViewController: UIViewController {
   private let spinner = UIActivityIndicatorView(style: .medium)
   private let emptyLabel = UILabel()
   private let scrollView = UIScrollView()
-  // Reuses the EXACT interleaved step / narration / streaming renderer the main feed
-  // uses (VibeAgentKitAssistantMessageBodyView), so the sheet renders identically — same
-  // markdown parser, same live shimmer, same expandable step rows and diff card — with no
-  // second bespoke row layer to drift out of sync.
+  // Renders ONLY the turn's final response text now (progressItems: [] is always passed
+  // to it below) — the step feed itself renders via activityTimelineView instead, so the
+  // shared renderer's markdown/diff handling stays available for the "Worked for…" case
+  // (real bodyText) without duplicating the step list it also knows how to draw.
   private let turnContentView = VibeAgentTurnContentView()
+  // Clean vertical timeline (dot + line, bold label, single muted detail line) for the
+  // step list itself — see VibeAgentActivityTimelineView above.
+  private let activityTimelineView = VibeAgentActivityTimelineView()
+  private let activityHeaderLabel = UILabel()
+  private let responseHeaderLabel = UILabel()
+  private let contentStack = UIStackView()
   private var expandedStepIds: Set<String> = []
   private var lastConfiguredWidth: CGFloat = 0.0
 
@@ -4691,20 +4926,42 @@ final class VibeAgentSubagentDetailViewController: UIViewController {
     scrollView.alwaysBounceVertical = true
     view.addSubview(scrollView)
 
-    turnContentView.translatesAutoresizingMaskIntoConstraints = false
-    // Tapping a step in the sheet expands/collapses its detail inline, exactly like the
-    // main feed — the expand set lives here and we re-configure the shared renderer.
-    turnContentView.onStepTap = { [weak self] nodeId in
+    activityHeaderLabel.font = UIFont.systemFont(ofSize: 13.0, weight: .semibold)
+    activityHeaderLabel.textColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.65)
+    activityHeaderLabel.text = "ACTIVITY"
+
+    responseHeaderLabel.font = UIFont.systemFont(ofSize: 13.0, weight: .semibold)
+    responseHeaderLabel.textColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.65)
+    responseHeaderLabel.text = "RESPONSE"
+
+    // Tapping a step in the sheet expands/collapses its detail inline; the expand set
+    // lives here (shared with configureTurnContent's expandedStepIds, though that path
+    // no longer renders steps itself) and drives a re-configure of the timeline only.
+    activityTimelineView.onToggleExpand = { [weak self] nodeId in
       guard let self else { return }
       if self.expandedStepIds.contains(nodeId) {
         self.expandedStepIds.remove(nodeId)
       } else {
         self.expandedStepIds.insert(nodeId)
       }
-      if self.lastConfiguredWidth > 0 { self.configureTurnContent(width: self.lastConfiguredWidth) }
-      self.view.setNeedsLayout()
+      UIView.animate(withDuration: 0.22) {
+        self.refreshActivityTimeline()
+        self.view.layoutIfNeeded()
+      }
     }
-    scrollView.addSubview(turnContentView)
+
+    turnContentView.translatesAutoresizingMaskIntoConstraints = false
+
+    contentStack.axis = .vertical
+    contentStack.spacing = 20.0
+    contentStack.translatesAutoresizingMaskIntoConstraints = false
+    contentStack.addArrangedSubview(activityHeaderLabel)
+    contentStack.addArrangedSubview(activityTimelineView)
+    contentStack.addArrangedSubview(responseHeaderLabel)
+    contentStack.addArrangedSubview(turnContentView)
+    contentStack.setCustomSpacing(10.0, after: activityHeaderLabel)
+    contentStack.setCustomSpacing(10.0, after: responseHeaderLabel)
+    scrollView.addSubview(contentStack)
 
     emptyLabel.translatesAutoresizingMaskIntoConstraints = false
     emptyLabel.font = UIFont.systemFont(ofSize: 14.0, weight: .regular)
@@ -4720,13 +4977,13 @@ final class VibeAgentSubagentDetailViewController: UIViewController {
       scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
       scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
 
-      turnContentView.topAnchor.constraint(
+      contentStack.topAnchor.constraint(
         equalTo: scrollView.contentLayoutGuide.topAnchor, constant: 14.0),
-      turnContentView.leadingAnchor.constraint(
+      contentStack.leadingAnchor.constraint(
         equalTo: scrollView.frameLayoutGuide.leadingAnchor, constant: 18.0),
-      turnContentView.trailingAnchor.constraint(
+      contentStack.trailingAnchor.constraint(
         equalTo: scrollView.frameLayoutGuide.trailingAnchor, constant: -18.0),
-      turnContentView.bottomAnchor.constraint(
+      contentStack.bottomAnchor.constraint(
         equalTo: scrollView.contentLayoutGuide.bottomAnchor, constant: -24.0),
 
       emptyLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
@@ -4800,22 +5057,48 @@ final class VibeAgentSubagentDetailViewController: UIViewController {
     if isViewLoaded { rebuild() }
   }
 
-  private func rebuild() {
-    let toolChildren = progressItems.filter { $0.itemType != "text" }
-    let hasContent = !progressItems.isEmpty
-      || !bodyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    emptyLabel.isHidden = hasContent
-    turnContentView.isHidden = !hasContent
-    subtitleLabel.text = running
-      ? "Running · \(toolChildren.count) \(toolChildren.count == 1 ? "step" : "steps")"
-      : "\(toolChildren.count) \(toolChildren.count == 1 ? "step" : "steps")"
-    if running { spinner.startAnimating() } else { spinner.stopAnimating() }
-    if lastConfiguredWidth > 0.0 { configureTurnContent(width: lastConfiguredWidth) }
+  /// Progress items actually worth a timeline row: narration/diff-card `"text"` blocks
+  /// belong to the response renderer, not the step list, and a bare "Thinking" row with
+  /// no real detail is noise (real thinking narration, i.e. one with messageContent/
+  /// messagePreview, is kept) — same two filters resolo.ai's ChatAgentActivitySheet
+  /// applies before handing items to its own timeline row.
+  private var activityItems: [VibeAgentKitProgressItem] {
+    progressItems.filter { $0.itemType != "text" && !isPlaceholderThinking($0) }
   }
 
-  /// Feed the shared renderer this turn's items at the sheet's current content width. A
-  /// running turn streams (live shimmer + step feed); a finished turn shows the
-  /// "Worked · N steps" summary (expanded) plus any answer body — identical to the bubble.
+  private func isPlaceholderThinking(_ item: VibeAgentKitProgressItem) -> Bool {
+    let label = item.label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    let messageContent = item.messageContent?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let messagePreview = item.messagePreview?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let hasDetail = !messageContent.isEmpty || !messagePreview.isEmpty
+    return !hasDetail && (label == "thinking" || label == "thinking...")
+  }
+
+  private func refreshActivityTimeline() {
+    let items = activityItems
+    activityHeaderLabel.isHidden = items.isEmpty
+    activityTimelineView.isHidden = items.isEmpty
+    activityTimelineView.configure(
+      items: items, expandedStepIds: expandedStepIds, appearance: appearance)
+  }
+
+  private func rebuild() {
+    let items = activityItems
+    let hasBody = !bodyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    let hasContent = !items.isEmpty || hasBody
+    emptyLabel.isHidden = hasContent
+    responseHeaderLabel.isHidden = !hasBody
+    turnContentView.isHidden = !hasBody
+    subtitleLabel.text = running
+      ? "Running · \(items.count) \(items.count == 1 ? "step" : "steps")"
+      : "\(items.count) \(items.count == 1 ? "step" : "steps")"
+    if running { spinner.startAnimating() } else { spinner.stopAnimating() }
+    refreshActivityTimeline()
+    if hasBody, lastConfiguredWidth > 0.0 { configureTurnContent(width: lastConfiguredWidth) }
+  }
+
+  /// Feed the shared renderer this turn's final response text ONLY — `progressItems: []`
+  /// keeps it from also drawing the step feed, which now lives in activityTimelineView.
   private func configureTurnContent(width: CGFloat) {
     guard width > 0.0 else { return }
     let hasBody = !bodyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -4826,7 +5109,7 @@ final class VibeAgentSubagentDetailViewController: UIViewController {
       appearance: VibeAgentKitMap.appearance(for: traitCollection),
       availableWidth: width,
       messageId: "agent-detail-sheet",
-      progressItems: progressItems,
+      progressItems: [],
       fallbackProgressLabels: [],
       runtime: nil,
       onLoaderTap: nil,
