@@ -337,6 +337,7 @@ struct AgentBridgeStatus {
 enum AgentBridgeDefaultView: String, CaseIterable, Identifiable {
   case chat
   case agent
+  case visual
 
   var id: String { rawValue }
 
@@ -344,6 +345,7 @@ enum AgentBridgeDefaultView: String, CaseIterable, Identifiable {
     switch self {
     case .chat: return "Default chat"
     case .agent: return "Engine view"
+    case .visual: return "Visual workspace"
     }
   }
 
@@ -351,6 +353,7 @@ enum AgentBridgeDefaultView: String, CaseIterable, Identifiable {
     switch self {
     case .chat: return "Open in the normal message thread"
     case .agent: return "Open directly in the agent runtime view"
+    case .visual: return "Open in the live file, command, and problem workspace"
     }
   }
 }

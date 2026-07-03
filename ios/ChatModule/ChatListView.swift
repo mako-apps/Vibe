@@ -645,6 +645,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   var onTearDownBridgeAgentView: (() -> Void)?
   /// Provider of the currently embedded agent runtime view, or nil if none is shown.
   var hostedBridgeAgentProvider: (() -> String?)?
+  /// Surface mode of the currently embedded agent runtime view.
+  var hostedBridgeAgentSurfaceMode: (() -> VibeAgentConversationSurfaceMode?)?
   /// Route-provided bridge provider for Claude/Codex DMs. Some server rows carry the
   /// provider through `peerAgentId` rather than the reserved peer user id, so the list
   /// cannot rely only on `enginePeerUserId`.
@@ -3237,6 +3239,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     guard let presenter = topPresentingViewController() else { return }
     let message = VibeAgentKitMap.chatMessage(from: row)
     let children = message.subagentChildren[parentNodeId] ?? []
+    // Nothing to show for this subagent (yet) — presenting would just be empty glass
+    // chrome, the "messy empty sheet" symptom a stale/mid-recovery row could trigger.
+    guard !children.isEmpty else { return }
     let type = message.progressItems.first {
       (($0.nodeId ?? $0.label) == parentNodeId) && ($0.subagentType?.isEmpty == false)
     }?.subagentType ?? ""
@@ -3268,6 +3273,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private func presentAgentTurnDetailView(row: ChatListRow) {
     guard let presenter = topPresentingViewController() else { return }
     let message = VibeAgentKitMap.chatMessage(from: row)
+    let bodyText = resoloAssistantDisplayText(for: message)
+    // A turn with no steps, no answer body, and not actively running has nothing to
+    // show — presenting the glass sheet here would just be empty chrome (the "messy
+    // blank sheet" symptom a stale/mid-recovery row could trigger). Bail instead.
+    guard message.isStreaming || !message.progressItems.isEmpty
+      || !bodyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    else { return }
     let toolStepCount = message.progressItems.filter { $0.itemType != "text" }.count
     let title = message.isStreaming
       ? "Working…"
@@ -3276,7 +3288,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let detail = VibeAgentSubagentDetailViewController(
       subagentType: "",
       titleOverride: title,
-      bodyText: resoloAssistantDisplayText(for: message),
+      bodyText: bodyText,
       progressItems: message.progressItems,
       running: message.isStreaming,
       appearance: VibeAgentKitMap.appearance(for: traitCollection)
@@ -6127,12 +6139,24 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     ) { [weak self] _ in
       self?.presentLatestAgentReport()
     }
+    let engineAction = UIAction(
+      title: "Engine view", image: UIImage(systemName: "rectangle.stack")
+    ) { [weak self] _ in
+      self?.bridgeAgentManuallyShown = true
+      self?.presentBridgeAgentConversation(provider: provider, surfaceMode: .transcript)
+    }
+    let visualAction = UIAction(
+      title: "Visual workspace", image: UIImage(systemName: "rectangle.3.group.bubble.left")
+    ) { [weak self] _ in
+      self?.bridgeAgentManuallyShown = true
+      self?.presentBridgeAgentConversation(provider: provider, surfaceMode: .visual)
+    }
     let historyAction = UIAction(
       title: "History", image: UIImage(systemName: "clock.arrow.circlepath")
     ) { [weak self] _ in
       self?.presentBridgeHistorySurface(provider: provider)
     }
-    return UIMenu(children: [repoMenu, permissionMenu, reportAction, historyAction])
+    return UIMenu(children: [repoMenu, permissionMenu, engineAction, visualAction, reportAction, historyAction])
   }
 
   /// Report: open the most recent run's files-changed / diff report (its runtime card).
@@ -6175,7 +6199,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let sessionId = session.resolvedSessionId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !sessionId.isEmpty, !sessionId.hasPrefix("running:") else {
       // A running task with no session id yet: jump straight to the live agent view.
-      presentBridgeAgentConversation(provider: provider)
+      let preferredMode =
+        agentSurfaceMode(for: AgentBridgeSelectionStore.defaultView(provider: provider)) ?? .transcript
+      presentBridgeAgentConversation(provider: provider, surfaceMode: preferredMode)
       return
     }
     setBridgeLoadedSessionId(sessionId)
@@ -6962,9 +6988,20 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     didPrefetchBridgeHistory = true
   }
 
-  /// When the user set this Claude/Codex profile's default view to "Agent", show the
-  /// agent runtime view instead of the bubble chat. The one-shot guard ensures backing
-  /// out to the chat surface doesn't immediately re-present; "See progress" re-opens on demand.
+  private func agentSurfaceMode(for defaultView: AgentBridgeDefaultView) -> VibeAgentConversationSurfaceMode? {
+    switch defaultView {
+    case .chat:
+      return nil
+    case .agent:
+      return .transcript
+    case .visual:
+      return .visual
+    }
+  }
+
+  /// When the user set this Claude/Codex profile's default view to an agent surface,
+  /// show that surface instead of the bubble chat. The one-shot guard ensures backing
+  /// out to the chat surface doesn't immediately re-present; manual actions re-open on demand.
   private func presentPreferredAgentViewIfNeeded(retry: Int = 0) {
     // First, clear any agent surface left over from a DIFFERENT DM (the recycled view).
     scheduleBridgeAgentPresenceRefresh()
@@ -6972,7 +7009,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // agent surface once.
     guard !didAutoPresentAgentView else { return }
     guard let provider = currentBridgeProvider else { return }
-    guard AgentBridgeSelectionStore.defaultView(provider: provider) == .agent else { return }
+    let defaultView = AgentBridgeSelectionStore.defaultView(provider: provider)
+    guard let surfaceMode = agentSurfaceMode(for: defaultView) else { return }
     guard window != nil else {
       guard retry < 16 else { return }
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
@@ -6982,7 +7020,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
     didAutoPresentAgentView = true
     bridgeAgentManuallyShown = false
-    presentBridgeAgentConversation(provider: provider, animated: false)
+    presentBridgeAgentConversation(provider: provider, animated: false, surfaceMode: surfaceMode)
   }
 
   /// Mount the isolated agent surface for `provider` as this DM's PRIMARY page, driven by
@@ -7006,11 +7044,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // The in-place host path is idempotent and owns presentation here;
     // the legacy push/modal fallback owns presentation via presentPreferredAgentViewIfNeeded.
     guard !didAutoPresentAgentView else { return }
-    guard defaultView == .agent else { return }
+    guard let surfaceMode = agentSurfaceMode(for: defaultView) else { return }
     didAutoPresentAgentView = true
     bridgeAgentManuallyShown = false
     if hasHost {
-      presentBridgeAgentConversation(provider: p, animated: false)
+      presentBridgeAgentConversation(provider: p, animated: false, surfaceMode: surfaceMode)
     } else {
       presentPreferredAgentViewIfNeeded()
     }
@@ -7026,10 +7064,39 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// itself is one-shot per DM open (see presentPreferredAgentViewIfNeeded) and on-demand
   /// via "See progress", so this never re-presents (which would fight a user back-out).
   private func refreshBridgeAgentPresence() {
-    guard let hosted = hostedBridgeAgentProvider?() else { return }
-    if hosted != currentBridgeProvider {
+    let provider = currentBridgeProvider
+    let desiredMode = provider.flatMap {
+      agentSurfaceMode(for: AgentBridgeSelectionStore.defaultView(provider: $0))
+    }
+
+    guard let hosted = hostedBridgeAgentProvider?() else {
+      guard !bridgeAgentManuallyShown, !didAutoPresentAgentView,
+        let provider, let desiredMode
+      else { return }
+      didAutoPresentAgentView = true
+      bridgeAgentManuallyShown = false
+      presentBridgeAgentConversation(provider: provider, animated: false, surfaceMode: desiredMode)
+      return
+    }
+
+    guard let provider, hosted == provider else {
       onTearDownBridgeAgentView?()
       bridgeAgentManuallyShown = false
+      didAutoPresentAgentView = false
+      return
+    }
+
+    guard !bridgeAgentManuallyShown else { return }
+    guard let desiredMode else {
+      onTearDownBridgeAgentView?()
+      didAutoPresentAgentView = false
+      return
+    }
+
+    if hostedBridgeAgentSurfaceMode?() != desiredMode {
+      didAutoPresentAgentView = true
+      bridgeAgentManuallyShown = false
+      presentBridgeAgentConversation(provider: provider, animated: false, surfaceMode: desiredMode)
     }
   }
 
@@ -7037,10 +7104,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// the conversation's current rows and kept live via the provider, sending through the
   /// normal bridge path. Reserved for the group/multi-agent case (see
   /// bubbleUsesAgentTurnContent) — a 1:1 DM renders inline instead.
-  private func presentBridgeAgentConversation(provider: String, animated: Bool = true) {
+  private func presentBridgeAgentConversation(
+    provider: String,
+    animated: Bool = true,
+    surfaceMode: VibeAgentConversationSurfaceMode = .transcript
+  ) {
     // Idempotent for the isolated host path: if this provider's surface is already hosted, don't
     // tear it down and rebuild (that flashes and re-runs the slide).
-    if onHostBridgeAgentView != nil, hostedBridgeAgentProvider?() == provider {
+    if onHostBridgeAgentView != nil, hostedBridgeAgentProvider?() == provider,
+      hostedBridgeAgentSurfaceMode?() == surfaceMode
+    {
       return
     }
     let displayName = provider.capitalized
@@ -7050,6 +7123,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       subtitle: "",
       messages: initialMessages,
       inputPlaceholder: "Ask \(displayName)",
+      surfaceMode: surfaceMode,
       messagesProvider: { [weak self] in
         guard let self else { return [] }
         return VibeAgentKitMap.messages(from: self.rows)

@@ -149,6 +149,8 @@ public final class ChatMainView: UIView,
 
   private let chatHeaderStack = UIStackView()
   private let chatTitleLabel = UILabel()
+  private let chatSubtitleRow = UIStackView()
+  private let chatSubtitleDotView = UIView()
   private let chatSubtitleLabel = UILabel()
   private let profileHeaderStack = UIStackView()
   private let profileTitleLabel = UILabel()
@@ -164,6 +166,7 @@ public final class ChatMainView: UIView,
   var onPresentBridgeAgentSurface: ((VibeAgentConversationViewController) -> Void)?
   var onDismissBridgeAgentSurface: (() -> Void)?
   var hostedBridgeAgentProviderProvider: (() -> String?)?
+  var hostedBridgeAgentSurfaceModeProvider: (() -> VibeAgentConversationSurfaceMode?)?
   private let pinnedBannerView = ChatPinnedBannerView()
   private let inboxBannerView = ChatPinnedBannerView()
   private let profilePage = UIView()
@@ -222,6 +225,7 @@ public final class ChatMainView: UIView,
   private var groupTypingUserIds: [String] = []
   private var directPeerTypingActive = false
   private var agentProgressSubtitle: String?
+  private var agentAwaitingApproval = false
   private var defersEngineStateRefreshes = false
   private var pinnedBannerMessageId: String?
   private var pinnedBannerTitle: String?
@@ -917,6 +921,9 @@ public final class ChatMainView: UIView,
     chatListView.hostedBridgeAgentProvider = { [weak self] in
       self?.hostedBridgeAgentProviderProvider?()
     }
+    chatListView.hostedBridgeAgentSurfaceMode = { [weak self] in
+      self?.hostedBridgeAgentSurfaceModeProvider?()
+    }
 
     pagesHost.addSubview(profilePage)
     profilePage.addSubview(profileScrollView)
@@ -1113,8 +1120,22 @@ public final class ChatMainView: UIView,
       label.isHidden = true
     }
 
+    chatSubtitleDotView.layer.cornerRadius = 3
+    chatSubtitleDotView.layer.cornerCurve = .continuous
+    chatSubtitleDotView.isHidden = true
+    chatSubtitleDotView.translatesAutoresizingMaskIntoConstraints = false
+    NSLayoutConstraint.activate([
+      chatSubtitleDotView.widthAnchor.constraint(equalToConstant: 6),
+      chatSubtitleDotView.heightAnchor.constraint(equalToConstant: 6),
+    ])
+    chatSubtitleRow.axis = .horizontal
+    chatSubtitleRow.alignment = .center
+    chatSubtitleRow.spacing = 4
+    chatSubtitleRow.addArrangedSubview(chatSubtitleDotView)
+    chatSubtitleRow.addArrangedSubview(chatSubtitleLabel)
+
     chatHeaderStack.addArrangedSubview(chatTitleLabel)
-    chatHeaderStack.addArrangedSubview(chatSubtitleLabel)
+    chatHeaderStack.addArrangedSubview(chatSubtitleRow)
     profileHeaderStack.addArrangedSubview(profileTitleLabel)
     profileHeaderStack.addArrangedSubview(profileSubtitleLabel)
     chatHeaderStack.frame = CGRect(x: 12.0, y: 4.0, width: 160.0, height: 36.0)
@@ -1303,6 +1324,7 @@ public final class ChatMainView: UIView,
         self.backButton.accessibilityLabel = "Cancel selection"
         self.chatTitleLabel.text = "\(count) Selected"
         self.chatSubtitleLabel.isHidden = true
+        self.chatSubtitleDotView.isHidden = true
         self.avatarImageView.alpha = 0
         self.avatarFallbackIconView.alpha = 0
         self.checkmarkImageView.isHidden = false
@@ -1356,13 +1378,14 @@ public final class ChatMainView: UIView,
       return
     }
     headerContainer.isUserInteractionEnabled = true
-    let usesBridgeHeader = !bridgeProvider.isEmpty && !usesSavedMessagesHeader && !searchActive
     avatarButton.isHidden = usesSavedMessagesHeader || searchActive
     avatarGlassView.isHidden = usesSavedMessagesHeader || searchActive
     avatarButton.isUserInteractionEnabled = !usesSavedMessagesHeader && !searchActive
+    // The title is a plain tappable name (opens the profile) for every chat now — no
+    // per-chat dropdown menu, agent or not.
     titleButton.isUserInteractionEnabled = !usesSavedMessagesHeader && !searchActive
-    titleButton.showsMenuAsPrimaryAction = usesBridgeHeader
-    titleButton.menu = usesBridgeHeader ? bridgeHeaderMenu() : nil
+    titleButton.showsMenuAsPrimaryAction = false
+    titleButton.menu = nil
     menuButton.isHidden = !(usesSavedMessagesHeader || searchActive)
     menuGlassView.isHidden = !(usesSavedMessagesHeader || searchActive)
     savedSearchCancelGlassView.isHidden = !searchActive
@@ -1437,11 +1460,12 @@ public final class ChatMainView: UIView,
     let surfaceOnline = surfacePresenceOnline
     let groupMode = isGroupOrChannel
     let isSavedMessagesChat = chatId == "saved_messages"
+    let bridgeProviderSnapshot = bridgeProvider
     engineStateRefreshGeneration &+= 1
     let generation = engineStateRefreshGeneration
     engineStateRefreshWorkItem?.cancel()
 
-    let workItem = DispatchWorkItem { [chatId, peerUserId, surfaceOnline, groupMode, isSavedMessagesChat, generation, force, reason] in
+    let workItem = DispatchWorkItem { [chatId, peerUserId, surfaceOnline, groupMode, isSavedMessagesChat, bridgeProviderSnapshot, generation, force, reason] in
       let startedAt = CFAbsoluteTimeGetCurrent()
       let engine = ChatEngine.shared
       let engineOnline =
@@ -1460,6 +1484,10 @@ public final class ChatMainView: UIView,
         ? engine.typingUserIds(chatId: chatId)
         : []
       let agentPayload = !chatId.isEmpty && !isSavedMessagesChat ? engine.agentProgress(chatId: chatId) : nil
+      let hasOutstandingApproval =
+        !chatId.isEmpty && !isSavedMessagesChat && !bridgeProviderSnapshot.isEmpty
+        ? engine.hasOutstandingAgentBridgeAsk(chatId: chatId, provider: bridgeProviderSnapshot)
+        : false
       let pinnedPayload: [String: Any]?
       let pinnedContent: ChatMainPinnedBannerContent?
       if isSavedMessagesChat {
@@ -1488,6 +1516,7 @@ public final class ChatMainView: UIView,
           directTyping: directTyping,
           groupTyping: groupTyping,
           agentPayload: agentPayload,
+          hasOutstandingApproval: hasOutstandingApproval,
           pinnedPayload: pinnedPayload,
           pinnedContent: pinnedContent,
           force: force,
@@ -1509,6 +1538,7 @@ public final class ChatMainView: UIView,
     directTyping: Bool,
     groupTyping: [String],
     agentPayload: [String: Any]?,
+    hasOutstandingApproval: Bool,
     pinnedPayload: [String: Any]?,
     pinnedContent: ChatMainPinnedBannerContent?,
     force: Bool,
@@ -1544,11 +1574,17 @@ public final class ChatMainView: UIView,
     }
 
     let isAgentActive = (agentPayload?["isActive"] as? Bool) ?? false
-    let rawAgentLabel =
-      (agentPayload?["label"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-    let nextAgentLabel = (isAgentActive ? rawAgentLabel : nil)?.isEmpty == false ? rawAgentLabel : nil
+    let rawAgentLabel = agentPayload?["label"] as? String
+    let rawAgentTool = agentPayload?["tool"] as? String
+    let nextAgentLabel =
+      isAgentActive ? Self.friendlyAgentProgressLabel(rawLabel: rawAgentLabel, tool: rawAgentTool) : nil
     if force || nextAgentLabel != agentProgressSubtitle {
       agentProgressSubtitle = nextAgentLabel
+      shouldUpdateHeader = true
+    }
+
+    if force || hasOutstandingApproval != agentAwaitingApproval {
+      agentAwaitingApproval = hasOutstandingApproval
       shouldUpdateHeader = true
     }
 
@@ -1621,25 +1657,6 @@ public final class ChatMainView: UIView,
     directPeerTypingActive = false
     updateHeaderTexts()
     updateProfileTexts()
-  }
-
-  private func refreshAgentProgressFromEngine(force: Bool = false) {
-    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !chatId.isEmpty else {
-      guard force || agentProgressSubtitle != nil else { return }
-      agentProgressSubtitle = nil
-      updateHeaderTexts()
-      return
-    }
-
-    let payload = ChatEngine.shared.agentProgress(chatId: chatId)
-    let isActive = (payload?["isActive"] as? Bool) ?? false
-    let rawLabel = (payload?["label"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-    let nextLabel = (isActive ? rawLabel : nil)?.isEmpty == false ? rawLabel : nil
-
-    guard force || nextLabel != agentProgressSubtitle else { return }
-    agentProgressSubtitle = nextLabel
-    updateHeaderTexts()
   }
 
   private func refreshPinnedBannerFromEngine(force: Bool = false) {
@@ -2932,9 +2949,10 @@ public final class ChatMainView: UIView,
         : max(backGlassView.frame.maxX, trailingSideInset) + 10.0
       let usesBridgeHeaderLayout =
         !bridgeProvider.isEmpty && headerMode != .savedMessages && !savedSearchExpanded
+      let subtitleDotWidth: CGFloat = chatSubtitleDotView.isHidden ? 0.0 : 10.0
       let requestedHeaderWidth = max(
         chatTitleLabel.intrinsicContentSize.width,
-        chatSubtitleLabel.intrinsicContentSize.width
+        chatSubtitleLabel.intrinsicContentSize.width + subtitleDotWidth
       )
       let centerWidth: CGFloat
       if previewHeaderCenterOnly && !savedSearchExpanded {
@@ -3600,17 +3618,21 @@ public final class ChatMainView: UIView,
   }
 
   private func updateHeaderTexts() {
-    let bridgeTitle = resolvedBridgeHeaderTitle()
-    let bridgeSubtitle = resolvedBridgeRepositorySubtitle()
+    // The header title is always the plain contact/agent name — like any other DM, no
+    // model picker. Model/thinking/speed selection lives in the run-options surface, not
+    // here; the header's only job is to say who this chat is with and what's happening.
     let resolvedTitle: String =
-      if let bridgeTitle {
-        bridgeTitle
-      } else if headerMode == .savedMessages {
+      if headerMode == .savedMessages {
         chatTitleText.isEmpty ? "Saved Messages" : chatTitleText
       } else {
         chatTitleText.isEmpty ? "Chat" : chatTitleText
       }
+    // A pending command/plan approval outranks everything else in the subtitle — the
+    // agent is blocked on the user, which is the most actionable thing to surface.
+    let resolvedApproval =
+      (!bridgeProvider.isEmpty && agentAwaitingApproval) ? "Waiting for approval" : nil
     let resolvedAgentProgress = resolvedAgentProgressSubtitle()
+    let bridgeSubtitle = resolvedBridgeRepositorySubtitle()
     let resolvedDirectTyping = resolvedDirectTypingSubtitle()
     let groupTypingSubtitle = resolvedGroupTypingSubtitle()
     let connectionSubtitle = defersEngineStateRefreshes ? nil : resolvedEngineConnectionSubtitle()
@@ -3620,6 +3642,8 @@ public final class ChatMainView: UIView,
     let resolvedSubtitle: String
     if headerMode == .savedMessages {
       resolvedSubtitle = ""
+    } else if let resolvedApproval {
+      resolvedSubtitle = resolvedApproval
     } else if let resolvedAgentProgress {
       resolvedSubtitle = resolvedAgentProgress
     } else if let bridgeSubtitle {
@@ -3640,41 +3664,33 @@ public final class ChatMainView: UIView,
     } else {
       resolvedSubtitle = trimmedSubtitle
     }
-    if !bridgeProvider.isEmpty {
-      let chevronAttachment = NSTextAttachment()
-      let chevronConfig = UIImage.SymbolConfiguration(pointSize: 10, weight: .semibold)
-      chevronAttachment.image = UIImage(systemName: "chevron.up.chevron.down", withConfiguration: chevronConfig)?.withTintColor(chatTitleLabel.textColor, renderingMode: .alwaysOriginal)
-      chevronAttachment.bounds = CGRect(x: 0, y: 0, width: 12, height: 12)
-      let attributedTitle = NSMutableAttributedString(string: "\(resolvedTitle) ")
-      attributedTitle.append(NSAttributedString(attachment: chevronAttachment))
-      chatTitleLabel.attributedText = attributedTitle
 
-      // Subtitle with connection pip (green = connected, red = reconnecting) + device name
-      if !resolvedSubtitle.isEmpty {
-        let isConnected = AgentPairingService.lastConnected
-        let dotColor: UIColor = isConnected
-          ? UIColor(red: 83.0/255.0, green: 224.0/255.0, blue: 138.0/255.0, alpha: 1.0)
-          : UIColor(red: 1.0, green: 0.27, blue: 0.27, alpha: 1.0)
-        let dotImage = UIGraphicsImageRenderer(size: CGSize(width: 6, height: 6)).image { ctx in
-          dotColor.setFill()
-          ctx.cgContext.fillEllipse(in: CGRect(x: 0, y: 0, width: 6, height: 6))
-        }
-        let dotAttachment = NSTextAttachment()
-        dotAttachment.image = dotImage
-        dotAttachment.bounds = CGRect(x: 0, y: -0.5, width: 6, height: 6)
-        let attributed = NSMutableAttributedString(attachment: dotAttachment)
-        attributed.append(NSAttributedString(string: " \(resolvedSubtitle)"))
-        chatSubtitleLabel.attributedText = attributed
-        chatSubtitleLabel.isHidden = false
+    chatTitleLabel.text = resolvedTitle
+    chatSubtitleLabel.text = resolvedSubtitle
+    chatSubtitleLabel.isHidden = resolvedSubtitle.isEmpty
+
+    // Bridge (agent) chats get a small leading dot: pulsing while Claude/Codex is
+    // actively doing something or blocked on approval, solid green/red for a plain idle
+    // "device connected" read. Everything here is a friendly state, never the raw
+    // tool/command payload the bridge streams internally.
+    let isLiveAgentState = resolvedApproval != nil || resolvedAgentProgress != nil
+    let showsBridgeDot = !bridgeProvider.isEmpty && !resolvedSubtitle.isEmpty
+    chatSubtitleDotView.isHidden = !showsBridgeDot
+    if showsBridgeDot {
+      let dotColor: UIColor
+      if resolvedApproval != nil {
+        dotColor = UIColor(red: 1.0, green: 0.62, blue: 0.04, alpha: 1.0)
+      } else if resolvedAgentProgress != nil || AgentPairingService.lastConnected {
+        dotColor = UIColor(red: 83.0 / 255.0, green: 224.0 / 255.0, blue: 138.0 / 255.0, alpha: 1.0)
       } else {
-        chatSubtitleLabel.text = resolvedSubtitle
-        chatSubtitleLabel.isHidden = true
+        dotColor = UIColor(red: 1.0, green: 0.27, blue: 0.27, alpha: 1.0)
       }
+      chatSubtitleDotView.backgroundColor = dotColor
+      setSubtitleDotPulsing(isLiveAgentState)
     } else {
-      chatTitleLabel.text = resolvedTitle
-      chatSubtitleLabel.text = resolvedSubtitle
-      chatSubtitleLabel.isHidden = resolvedSubtitle.isEmpty
+      setSubtitleDotPulsing(false)
     }
+
     chatHeaderStack.spacing = resolvedSubtitle.isEmpty ? 0.0 : -1.0
     profileTitleLabel.text = profileNameText.isEmpty ? resolvedTitle : profileNameText
     profileSubtitleLabel.text = isGroupOrChannel ? "Group Profile" : "Profile"
@@ -3684,6 +3700,9 @@ public final class ChatMainView: UIView,
       {
         if headerMode == .savedMessages {
           return appearance.timeColorThem.withAlphaComponent(0.0)
+        }
+        if resolvedApproval != nil {
+          return UIColor(red: 1.0, green: 0.62, blue: 0.04, alpha: 1.0)
         }
         if resolvedAgentProgress != nil
           || resolvedDirectTyping != nil
@@ -3697,87 +3716,32 @@ public final class ChatMainView: UIView,
         }
         return appearance.timeColorThem.withAlphaComponent(0.85)
       }()
-    updateBridgeHeaderMenuIfNeeded()
   }
 
-  private func updateBridgeHeaderMenuIfNeeded() {
-    guard !bridgeProvider.isEmpty, titleButton.showsMenuAsPrimaryAction else { return }
-    titleButton.menu = bridgeHeaderMenu()
-  }
-
-  private func bridgeHeaderMenu() -> UIMenu {
-    let provider = bridgeProvider.isEmpty ? "codex" : bridgeProvider
-    let selectedOptions = AgentBridgeSelectionStore.selectedRunOptions(provider: provider)
-
-    let modelActions = bridgeModelChoices(for: provider).map { choice in
-      UIAction(
-        title: choice.title,
-        subtitle: choice.subtitle,
-        state: choice.value == selectedOptions.model ? .on : .off
-      ) { [weak self] _ in
-        guard let self else { return }
-        AgentBridgeSelectionStore.setModel(provider: provider, model: choice.value)
-        self.updateHeaderTexts()
-      }
+  /// Drives the header's leading status dot: a soft breathing opacity loop while the
+  /// agent is doing something live, a steady dot otherwise.
+  private func setSubtitleDotPulsing(_ pulsing: Bool) {
+    guard pulsing else {
+      chatSubtitleDotView.layer.removeAnimation(forKey: "pulse")
+      chatSubtitleDotView.layer.opacity = 1.0
+      return
     }
-
-    let thinkingActions = AgentBridgeIntelligenceLevel.allCases.map { level in
-      UIAction(
-        title: level.title,
-        state: selectedOptions.intelligence == level ? .on : .off
-      ) { [weak self] _ in
-        guard let self else { return }
-        AgentBridgeSelectionStore.setIntelligence(level)
-        self.updateHeaderTexts()
-      }
-    }
-
-    let speedActions = AgentBridgeSpeedMode.allCases.map { speed in
-      UIAction(
-        title: speed.title,
-        state: selectedOptions.speed == speed ? .on : .off
-      ) { [weak self] _ in
-        guard let self else { return }
-        AgentBridgeSelectionStore.setSpeed(speed)
-        self.updateHeaderTexts()
-      }
-    }
-
-    // The repository switcher now lives in the input bar's repo chip, so the header
-    // menu carries only run options (model / thinking / speed).
-    return UIMenu(
-      title: provider == "claude" ? "Claude" : "Codex",
-      children: [
-        UIMenu(
-          title: "Model",
-          subtitle: bridgeCurrentModelTitle(selectedOptions, provider: provider),
-          children: bridgeDefaultModelActions(provider: provider, selectedOptions: selectedOptions)
-            + modelActions
-        ),
-        UIMenu(title: "Thinking", subtitle: selectedOptions.intelligence.title, children: thinkingActions),
-        UIMenu(title: "Speed", subtitle: selectedOptions.speed.title, children: speedActions),
-      ]
-    )
-  }
-
-  private func bridgeCurrentModelTitle(_ options: AgentBridgeRunOptions, provider: String) -> String {
-    AgentBridgeSelectionStore.modelTitle(provider: provider, model: options.model)
-  }
-
-  private func resolvedBridgeHeaderTitle() -> String? {
-    guard !bridgeProvider.isEmpty else { return nil }
-    let options = AgentBridgeSelectionStore.selectedRunOptions(provider: bridgeProvider)
-    let modelTitle = bridgeCurrentModelTitle(options, provider: bridgeProvider)
-    let hasExplicitModel = options.model?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-    guard options.intelligence != .low, hasExplicitModel else { return modelTitle }
-    return "\(modelTitle) · Thinking"
+    guard chatSubtitleDotView.layer.animation(forKey: "pulse") == nil else { return }
+    let animation = CABasicAnimation(keyPath: "opacity")
+    animation.fromValue = 1.0
+    animation.toValue = 0.3
+    animation.duration = 0.6
+    animation.autoreverses = true
+    animation.repeatCount = .infinity
+    animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+    chatSubtitleDotView.layer.add(animation, forKey: "pulse")
   }
 
   private func resolvedBridgeRepositorySubtitle() -> String? {
     guard !bridgeProvider.isEmpty else { return nil }
-    // The header shows the connected computer beneath the model now; the repo moved to
-    // the input's repo switcher. Fall back to the repo name only if no device is known,
-    // and to nil (so connection/presence subtitles can show) when neither exists.
+    // The header shows the connected computer when nothing more specific (progress /
+    // approval) is happening. Fall back to the repo name only if no device is known, and
+    // to nil (so connection/presence subtitles can show) when neither exists.
     if let device = AgentPairingService.lastDeviceLabel, !device.isEmpty {
       return device
     }
@@ -3785,31 +3749,6 @@ public final class ChatMainView: UIView,
       AgentBridgeSelectionStore.selectedRepository()?.name
         .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     return repositoryName.isEmpty ? nil : repositoryName
-  }
-
-  private func bridgeModelChoices(for provider: String) -> [(title: String, subtitle: String?, value: String?)] {
-    AgentBridgeSelectionStore.modelChoices(provider: provider).map { ($0.title, $0.subtitle, $0.value) }
-  }
-
-  private func bridgeDefaultModelActions(
-    provider: String,
-    selectedOptions: AgentBridgeRunOptions
-  ) -> [UIAction] {
-    [
-      UIAction(
-        title: "\(bridgeProviderDefaultModelTitle(provider)) default",
-        subtitle: "Use the model active in the local CLI session",
-        state: selectedOptions.model == nil ? .on : .off
-      ) { [weak self] _ in
-        guard let self else { return }
-        AgentBridgeSelectionStore.setModel(provider: provider, model: nil)
-        self.updateHeaderTexts()
-      }
-    ]
-  }
-
-  private func bridgeProviderDefaultModelTitle(_ provider: String) -> String {
-    AgentBridgeSelectionStore.defaultModelTitle(provider: provider)
   }
 
   private func updateBackButtonContent() {
@@ -3977,6 +3916,28 @@ public final class ChatMainView: UIView,
   private func resolvedAgentProgressSubtitle() -> String? {
     let trimmed = agentProgressSubtitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     return trimmed.isEmpty ? nil : trimmed
+  }
+
+  /// Collapses the bridge's per-tool progress label — which can carry a full shell
+  /// command, file path, or search query for on-device context — into one of a handful
+  /// of user-facing verbs. The chat header shows what Claude/Codex is doing in general
+  /// terms, never the raw tool payload.
+  private static func friendlyAgentProgressLabel(rawLabel: String?, tool: String?) -> String? {
+    let label = (rawLabel ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    let tool = (tool ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !label.isEmpty || !tool.isEmpty else { return nil }
+
+    func matches(_ needles: [String]) -> Bool {
+      needles.contains { tool.contains($0) || label.contains($0) }
+    }
+
+    if matches(["approval", "awaiting", "permission"]) { return "Waiting for approval" }
+    if matches(["error", "fail"]) { return "Hit an error" }
+    if matches(["bash", "shell", "command", "exec"]) { return "Running…" }
+    if matches(["read", "grep", "glob", "search", "fetch", "look"]) { return "Reading…" }
+    if matches(["write", "edit", "patch", "notebook"]) { return "Editing…" }
+    if matches(["think", "reason", "plan"]) { return "Thinking…" }
+    return "Working…"
   }
 
   private func resolvedGroupMembersRowSubtitle() -> String {

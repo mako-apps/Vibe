@@ -51,3 +51,12 @@ targets:
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
         UIViewControllerBasedStatusBarAppearance: true
+schemes:
+  Vibe:
+    build:
+      targets:
+        Vibe: all
+    run:
+      config: Debug
+    archive:
+      config: Release

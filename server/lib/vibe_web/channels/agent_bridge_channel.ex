@@ -67,6 +67,11 @@ defmodule VibeWeb.AgentBridgeChannel do
   # broadcast a live `agent-stream` (partial text + inline tool/progress nodes)
   # so the reply renders as it is produced. The lightweight `agent-progress`
   # ping is kept for the typing indicator / backwards compatibility.
+  #
+  # Replies `:ok` (unlike most fire-and-forget events) because the bridge's
+  # per-task frame log (vibe-bridge.js: pushProgressFrame/ackProgressFrame) only
+  # prunes a frame once this ack lands — that's what lets a reconnect replay
+  # exactly the frames lost in a drop instead of just the latest one.
   @impl true
   def handle_in("progress", %{"provider" => provider, "chatId" => chat_id} = payload, socket) do
     received_at_ms = System.system_time(:millisecond)
@@ -156,7 +161,7 @@ defmodule VibeWeb.AgentBridgeChannel do
         state
       end
 
-    {:noreply, assign(socket, :streams, Map.put(streams, chat_id, state))}
+    {:reply, :ok, assign(socket, :streams, Map.put(streams, chat_id, state))}
   end
 
   # daemon → server: completed task (raw output + exit status)

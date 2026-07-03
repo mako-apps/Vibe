@@ -360,11 +360,17 @@ enum VibeAgentKitMap {
 
 // MARK: - Full-page agent conversation surface
 
+enum VibeAgentConversationSurfaceMode: String {
+  case transcript
+  case visual
+}
+
 final class VibeAgentConversationViewController: UIViewController, UITableViewDataSource,
   UITableViewDelegate, PHPickerViewControllerDelegate, UIGestureRecognizerDelegate
 {
 
   private let tableView = UITableView(frame: .zero, style: .plain)
+  private let workspaceView = VibeAgentWorkspaceView()
   private let progressSheet = VibeAgentKitAgentProgressSheetView()
   private let composerView = VibeComposerView()
   private let titleLabel = UILabel()
@@ -411,6 +417,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   private let runtimeSubtitle: String
   private let inputPlaceholder: String
   private let regeneratePrompt: String
+  let surfaceMode: VibeAgentConversationSurfaceMode
   private let messagesProvider: (() -> [VibeAgentKitChatMessage])?
   private let onSend: ((String, AgentBridgeRunOptions, [String]) -> Void)?
   private var tableBottomConstraint: NSLayoutConstraint?
@@ -536,6 +543,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       updateNavigationButtons()
       updateRepoPickerStyle()
       updateEmptyState()
+      updateWorkspace()
       tableView.reloadData()
       updateUsageBanner()
     }
@@ -640,7 +648,10 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   var agentBridgeProvider: String? {
     didSet {
       composerView.provider = agentBridgeProvider ?? "codex"
-      if isViewLoaded { updateHeaderTexts() }
+      if isViewLoaded {
+        updateHeaderTexts()
+        updateWorkspace()
+      }
     }
   }
 
@@ -650,6 +661,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     messages: [VibeAgentKitChatMessage],
     regeneratePrompt: String = "",
     inputPlaceholder: String? = nil,
+    surfaceMode: VibeAgentConversationSurfaceMode = .transcript,
     messagesProvider: (() -> [VibeAgentKitChatMessage])? = nil,
     onSend: ((String, AgentBridgeRunOptions, [String]) -> Void)? = nil
   ) {
@@ -658,6 +670,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     self.runtimeSubtitle = subtitle
     self.inputPlaceholder = inputPlaceholder ?? "Ask \(title)"
     self.regeneratePrompt = regeneratePrompt
+    self.surfaceMode = surfaceMode
     self.messagesProvider = messagesProvider
     self.onSend = onSend
     self.appearance = .fallback
@@ -823,6 +836,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     messages = []
     isLoadingTranscript = false
     isHistoryPicked = false
+    updateWorkspace()
     tableView.reloadData()
     updateNavigationLiveState()
     updateLoadingOverlay()
@@ -859,6 +873,12 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       VibeAgentKitCompactionCell.self,
       forCellReuseIdentifier: VibeAgentKitCompactionCell.reuseIdentifier)
     view.addSubview(tableView)
+
+    workspaceView.translatesAutoresizingMaskIntoConstraints = false
+    workspaceView.isHidden = surfaceMode != .visual
+    workspaceView.applyAppearance(appearance)
+    view.addSubview(workspaceView)
+    tableView.isHidden = surfaceMode == .visual
 
     // Tap anywhere outside the composer to dismiss the keyboard. Installed on the ROOT
     // view (not just the table) so a tap in the empty feed area or under the composer's
@@ -943,6 +963,10 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       tableView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       tableView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
       tableBottomConstraint,
+      workspaceView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+      workspaceView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      workspaceView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      workspaceView.bottomAnchor.constraint(equalTo: composerView.topAnchor),
       composerView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       composerView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
       composerBottomConstraint,
@@ -1007,6 +1031,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
 
     trackStreamStarts(messages)
     indexProgress()
+    updateWorkspace()
     observeKeyboard()
     observeLiveMessages()
     // First landing is handled in viewDidLayoutSubviews (once content + insets resolve)
@@ -1037,6 +1062,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       appearance = VibeAgentKitMap.appearance(for: traitCollection)
       view.backgroundColor = appearance.background
       tableView.backgroundColor = appearance.background
+      workspaceView.applyAppearance(appearance)
       progressSheet.applyAppearance(appearance)
       composerView.applyAppearance(appearance)
       commandOverlayView.applyAppearance(appearance)
@@ -1051,6 +1077,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       updateBottomEdgeFade()
       updateEmptyState()
       updateUsageBanner(force: true)
+      updateWorkspace()
       tableView.reloadData()
     }
   }
@@ -1170,6 +1197,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     let oldTableMessages = tableMessages
     let oldTableIds = oldTableMessages.map(\.id)
     messages = newMessages
+    updateWorkspace()
     let liveIds = Set(newMessages.map(\.id))
     expandedTextMessageIds = expandedTextMessageIds.filter { liveIds.contains($0) }
     expandedProgressMessageIds = expandedProgressMessageIds.filter { liveIds.contains($0) }
@@ -1327,6 +1355,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     isLoadingTranscript = loading
     updateRepoPickerStyle()
     updateEmptyState()
+    updateWorkspace()
     updateUsageBanner()
   }
 
@@ -1639,6 +1668,26 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       connectionDotView.isHidden = !hasDevice
       connectionDotView.backgroundColor = UIColor(red: 0.16, green: 0.78, blue: 0.45, alpha: 1)
     }
+  }
+
+  private func updateWorkspace() {
+    guard isViewLoaded else { return }
+    let provider = agentBridgeProvider ?? "codex"
+    let selected = AgentBridgeSelectionStore.selectedModel(provider: provider)
+    let modelTitle = AgentBridgeSelectionStore.modelTitle(
+      provider: provider, model: selected ?? runModel ?? latestRuntimeModel)
+    let device = (deviceLabel?.isEmpty == false) ? deviceLabel : AgentPairingService.lastDeviceLabel
+    let connected = (deviceLabel != nil) ? deviceConnected : AgentPairingService.lastConnected
+    workspaceView.configure(
+      messages: messages,
+      provider: provider,
+      displayTitle: runtimeTitle,
+      modelTitle: modelTitle,
+      deviceLabel: device,
+      deviceConnected: connected,
+      isHistoryPicked: isHistoryPicked,
+      isLoading: isLoadingTranscript
+    )
   }
 
   private func runOptionsMenu() -> UIMenu {
@@ -2339,7 +2388,8 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   }
 
   private func updateEmptyState() {
-    let show = (!isHistoryPicked) || (messages.isEmpty && !isLoadingTranscript && !isEmbeddedInSwiftUI)
+    let show = surfaceMode == .transcript
+      && ((!isHistoryPicked) || (messages.isEmpty && !isLoadingTranscript && !isEmbeddedInSwiftUI))
     emptyStateView.isHidden = !show
     guard show else { return }
     let repoName = AgentBridgeSelectionStore.selectedRepository()?.name
@@ -2458,7 +2508,8 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   }
 
   private func setJumpButtonVisible(_ visible: Bool) {
-    let shouldShow = visible && isHistoryPicked && tableView.numberOfRows(inSection: 0) > 0
+    let shouldShow = visible && surfaceMode == .transcript && isHistoryPicked
+      && tableView.numberOfRows(inSection: 0) > 0
     guard shouldShow != jumpButtonVisible else { return }
     jumpButtonVisible = shouldShow
     if shouldShow { jumpToBottomButton.isHidden = false }

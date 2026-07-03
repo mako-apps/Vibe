@@ -50,6 +50,13 @@ const MAX_LINE_BYTES = 8 * 1024;
 // a phone that missed a broadcast during a 1006/1012 drop re-syncs, and the live
 // turn never looks stalled. Carries no feed node (the server parser ignores it).
 const KEEPALIVE_MS = 10 * 1000;
+// ws-level (RFC 6455 control-frame) ping cadence used to detect a half-open TCP socket —
+// see attachSocketLivenessPing. This is deliberately independent of, and faster than, the
+// application-level "heartbeat" push/reply below: a raw ping/pong round-trips at the OS
+// socket layer without waiting on the Phoenix channel join state, so it catches a zombie
+// connection well before the app heartbeat's 2-miss threshold would.
+const WS_PING_INTERVAL_MS = 10 * 1000;
+const WS_PING_MAX_MISSES = 1;
 const MAX_DIFF_BYTES = 90 * 1024;
 const MAX_DIFF_FILES = 24;
 const MAX_UNTRACKED_FILE_BYTES = 220 * 1024;
@@ -617,8 +624,16 @@ async function scanToPair(server, label) {
 // ── Running claude / codex ──────────────────────────────────────────
 
 const sessionByChat = new Map(); // chatId -> claude session_id
-const runningTasks = new Map(); // taskKey -> { child, provider, chatId, taskId, startedAt }
+// taskKey -> { child, provider, chatId, taskId, startedAt, frameSeq, lastAckedSeq, frameLog, lastProgress }
+const runningTasks = new Map();
 const finishedTasks = new Map(); // taskKey -> { provider, chatId, taskId, repo, runtime, finishedAt, resultPayload }
+// Cap on unacked progress frames retained per running task for replay-on-reconnect.
+// The server's own live-card reconstruction only ever looks at its last @max_stream_lines
+// (160) lines, so keeping more than that here can never recover anything the server would
+// actually use — 400 just gives headroom above that before the oldest unacked frame is
+// dropped. In the steady (connected) state this stays near-empty: every push is pruned as
+// soon as its ack arrives (see ackProgressFrame), so it only backs up during a real outage.
+const MAX_PROGRESS_FRAME_LOG = 400;
 // Resilience state for surviving a dropped socket (code=1006 idle/proxy, 1012 server
 // restart) WITHOUT losing a turn. `socketDownSince` is the epoch ms of the drop (null
 // while connected); on rejoin we re-deliver any result that completed during the outage
@@ -1141,6 +1156,38 @@ function taskIdFor(task) {
 
 function taskKey(provider, chatId, taskId) {
   return `${provider || "agent"}:${chatId || "chat"}:${taskId || "-"}`;
+}
+
+// Push one progress frame for a running task, stamped with a per-task monotonic
+// `sequence`. The frame is appended to the task's frame log and only pruned once the
+// server acks it (see ackProgressFrame) — so if the socket drops before the ack lands,
+// the frame is still sitting in the log for recoverAfterReconnect to replay. This is what
+// makes reconnect repair a GAP in the middle of a run, not just resend the latest frame.
+function pushProgressFrame(channel, key, payload) {
+  const entry = runningTasks.get(key);
+  const seq = entry ? ++entry.frameSeq : (payload.sequence ?? 0);
+  const framed = { ...payload, sequence: seq };
+  if (entry) {
+    entry.lastProgress = framed;
+    entry.frameLog.push(framed);
+    if (entry.frameLog.length > MAX_PROGRESS_FRAME_LOG) entry.frameLog.shift();
+  }
+  try {
+    channel.push("progress", framed).receive("ok", () => ackProgressFrame(key, seq));
+  } catch (_) {}
+  return framed;
+}
+
+// Server → bridge ack for a delivered progress frame. Prunes every frame up through
+// `seq` from the log since the server has now folded it into its accumulated transcript —
+// replaying it again later would duplicate that line in the live card.
+function ackProgressFrame(key, seq) {
+  const entry = runningTasks.get(key);
+  if (!entry) return;
+  if (seq > entry.lastAckedSeq) entry.lastAckedSeq = seq;
+  while (entry.frameLog.length && entry.frameLog[0].sequence <= entry.lastAckedSeq) {
+    entry.frameLog.shift();
+  }
 }
 
 function sessionKey(provider, chatId) {
@@ -2543,9 +2590,13 @@ async function runTask(channel, task) {
         ? task.team_workers
         : [],
     startedAt,
+    frameSeq: 0,
+    lastAckedSeq: -1,
+    frameLog: [],
+    lastProgress: null,
   });
   pushBridgeStatus(channel);
-  channel.push("progress", {
+  pushProgressFrame(channel, key, {
     provider,
     chatId,
     taskId,
@@ -2606,11 +2657,10 @@ async function runTask(channel, task) {
     thinkingState.lastEmitAt = now;
     thinkingState.lastTokens = tokens;
     progressCount++;
-    const progressPayload = {
+    pushProgressFrame(channel, key, {
       provider,
       chatId,
       taskId,
-      sequence: progressCount,
       sentAtMs: now,
       replyToId,
       repoId: repo.id,
@@ -2619,10 +2669,7 @@ async function runTask(channel, task) {
       workMode: workModeFor(task),
       model: modelFor(provider, chatId, task) || null,
       line: JSON.stringify({ type: "vibe_thinking", tokens, active: thinkingState.active }),
-    };
-    channel.push("progress", progressPayload);
-    const liveEntry = runningTasks.get(key);
-    if (liveEntry) liveEntry.lastProgress = progressPayload;
+    });
   };
   // Fold one raw stream-json line into the thinking counter. Returns quietly for any line
   // that isn't a partial thinking event. Gated on a cheap substring test so we only
@@ -2699,11 +2746,10 @@ async function runTask(channel, task) {
               `spawn→push=${now - spawnAt}ms bytes=${output.length} chat=${chatId} task=${taskId}`
           );
         }
-        const progressPayload = {
+        pushProgressFrame(channel, key, {
           provider,
           chatId,
           taskId,
-          sequence: progressCount,
           sentAtMs: now,
           replyToId,
           repoId: repo.id,
@@ -2712,12 +2758,7 @@ async function runTask(channel, task) {
           workMode: workModeFor(task),
           model: modelFor(provider, chatId, task) || null,
           line,
-        };
-        channel.push("progress", progressPayload);
-        // Retain the latest frame so a reconnect can re-sync the live card (the socket
-        // drops constantly; frames pushed while down are lost — see recoverAfterReconnect).
-        const liveEntry = runningTasks.get(key);
-        if (liveEntry) liveEntry.lastProgress = progressPayload;
+        });
       }
     }
   };
@@ -2733,7 +2774,7 @@ async function runTask(channel, task) {
     if (canceled) return;
     if (Date.now() - lastChunkAt < KEEPALIVE_MS) return;
     const idleMs = Date.now() - spawnAt;
-    const keepalivePayload = {
+    pushProgressFrame(channel, key, {
       provider,
       chatId,
       taskId,
@@ -2746,10 +2787,7 @@ async function runTask(channel, task) {
       stage: "keepalive",
       sentAtMs: Date.now(),
       line: JSON.stringify({ type: "vibe_bridge_keepalive", provider, taskId, elapsedMs: idleMs }),
-    };
-    channel.push("progress", keepalivePayload);
-    const kaEntry = runningTasks.get(key);
-    if (kaEntry) kaEntry.lastProgress = keepalivePayload;
+    });
   }, KEEPALIVE_MS);
 
   child.on("error", (err) => {
@@ -2945,14 +2983,22 @@ function decodeClaudeProject(name) {
   return String(name || "").replace(/-/g, "/");
 }
 
-async function readJsonl(file, onEvent) {
+async function readJsonl(file, onEvent, maxBytes) {
   const rl = readline.createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity });
+  let bytes = 0;
   try {
     for await (const line of rl) {
-      if (!line.trim()) continue;
-      let ev;
-      try { ev = JSON.parse(line); } catch { continue; }
-      if (onEvent(ev) === false) break;
+      if (line.trim()) {
+        let ev = null;
+        try { ev = JSON.parse(line); } catch { ev = null; }
+        if (ev && onEvent(ev) === false) break;
+      }
+      // Optional head cap: stop once we've streamed maxBytes (roster head-scans pass
+      // this so an unbounded 700 MB rollout can't be read whole just for a topic).
+      // Counted AFTER the line is processed so a record straddling the cap is still
+      // seen. Streaming reads yield to the event loop between chunks, so unlike the
+      // old fs.readSync head-scan this never blocks the WebSocket heartbeat.
+      if (maxBytes) { bytes += Buffer.byteLength(line) + 1; if (bytes >= maxBytes) break; }
     }
   } finally {
     rl.close();
@@ -2995,7 +3041,7 @@ function claudeSessionFiles() {
       const full = path.join(projDir, f);
       let st;
       try { st = fs.statSync(full); } catch { continue; }
-      out.push({ id: f.replace(/\.jsonl$/, ""), file: full, project: projPath, mtime: st.mtimeMs });
+      out.push({ id: f.replace(/\.jsonl$/, ""), file: full, project: projPath, mtime: st.mtimeMs, size: st.size });
     }
   }
   return out;
@@ -3234,7 +3280,37 @@ function messageHasUserText(m) {
 // bridge OR directly in the user's own desktop terminal (which never enter the
 // `runningTasks` Map, so mtime-freshness is the only signal we have for those).
 const LIVE_SESSION_WINDOW_MS = Number(process.env.VIBE_HISTORY_LIVE_WINDOW_MS || 15_000);
-const CODEX_SUMMARY_HEAD_BYTES = Number(process.env.VIBE_CODEX_SUMMARY_HEAD_BYTES || 8 * 1024 * 1024);
+// Upper bound on how far a roster summary streams into a rollout before giving up on
+// finding a topic. With streaming early-exit (codexSummaryFromHead) a session with a
+// normal-sized preamble stops in the first few KB; this cap only bites resumed sessions
+// that bury their first real prompt under a giant history dump (they degrade to the
+// generic "Codex session" title — the session still opens and its detail still loads).
+// Was 8 MB read SYNCHRONOUSLY per file, which blocked the event loop for seconds across
+// a 40-file list — a primary cause of the socket drops + list-retry storm. Now async +
+// cached, so this is a one-time bound; raise via env for full topic parity at 8 MB.
+const CODEX_SUMMARY_HEAD_BYTES = Number(process.env.VIBE_CODEX_SUMMARY_HEAD_BYTES || 4 * 1024 * 1024);
+
+// Per-file roster-summary cache. Session/rollout files only ever APPEND, and every
+// field the list surfaces (topic, meta, first-message count) is derived from the file
+// HEAD, so a cached summary stays valid as long as the file's byte size is unchanged.
+// This is what collapses the phone's list-retry storm: dozens of identical `list`
+// requests re-use one scan per file, and an unchanged old session costs a single stat()
+// on re-list instead of a multi-MB read. A live/growing session changes size every
+// append → cache miss → recompute, which is exactly what we want.
+const historySummaryCache = new Map(); // file path -> { size, summary }
+const MAX_HISTORY_SUMMARY_CACHE = 240;
+
+function getCachedSummary(file, size) {
+  const hit = historySummaryCache.get(file);
+  return hit && hit.size === size ? hit.summary : null;
+}
+function setCachedSummary(file, size, summary) {
+  historySummaryCache.set(file, { size, summary });
+  if (historySummaryCache.size > MAX_HISTORY_SUMMARY_CACHE) {
+    const oldest = historySummaryCache.keys().next().value;
+    if (oldest !== undefined) historySummaryCache.delete(oldest);
+  }
+}
 
 function runningSessionIdSet(provider) {
   const set = new Set();
@@ -3256,7 +3332,8 @@ async function listClaude(limit) {
   const runningIds = runningSessionIdSet("claude");
   const results = [];
   for (const s of files) {
-    const sum = await claudeSummary(s.file);
+    let sum = getCachedSummary(s.file, s.size);
+    if (!sum) { sum = await claudeSummary(s.file); setCachedSummary(s.file, s.size, sum); }
     if (sum.messages === 0) continue;
     results.push({
       provider: "claude",
@@ -4049,52 +4126,23 @@ function codexSessionFiles() {
   return out;
 }
 
-function readFileHead(file, maxBytes) {
-  let fd = null;
-  try {
-    fd = fs.openSync(file, "r");
-    const st = fs.fstatSync(fd);
-    const size = Math.min(st.size, Math.max(0, maxBytes || 0));
-    if (!size) return "";
-    const buf = Buffer.alloc(size);
-    const read = fs.readSync(fd, buf, 0, size, 0);
-    return buf.slice(0, read).toString("utf8");
-  } catch (_) {
-    return "";
-  } finally {
-    if (fd != null) {
-      try { fs.closeSync(fd); } catch (_) {}
-    }
-  }
-}
-
-function decodeJsonStringFragment(raw) {
-  if (typeof raw !== "string") return "";
-  try { return JSON.parse(`"${raw}"`); } catch (_) { return raw; }
-}
-
-function codexMetaFromHead(head) {
-  const meta = {};
-  const id = head.match(/"id"\s*:\s*"((?:\\.|[^"])*)"/) || head.match(/"session_id"\s*:\s*"((?:\\.|[^"])*)"/);
-  const cwd = head.match(/"cwd"\s*:\s*"((?:\\.|[^"])*)"/);
-  if (id) meta.id = decodeJsonStringFragment(id[1]);
-  if (cwd) meta.cwd = decodeJsonStringFragment(cwd[1]);
-  return Object.keys(meta).length ? meta : null;
-}
-
-function codexSummaryFromHead(file) {
-  const head = readFileHead(file, CODEX_SUMMARY_HEAD_BYTES);
-  const meta = codexMetaFromHead(head);
-  let topic = null, assistantTopic = null, messages = 0;
-  for (const line of head.split("\n")) {
-    if (!line.includes('"response_item"') || !line.includes('"type":"message"')) continue;
-    let ev;
-    try { ev = JSON.parse(line); } catch { continue; }
-    const p = ev.payload || {};
-    const role = p.role;
-    if (role !== "user" && role !== "assistant") continue;
-    const text = codexText(p.content);
-    if (!text) continue;
+// Lightweight roster summary: stream just far enough to recover session_meta + the
+// first couple of real messages, then stop. Early-exits the instant we have a topic and
+// ≥2 messages; otherwise stops at CODEX_SUMMARY_HEAD_BYTES. Replaces the old
+// fs.readSync(8 MB)-per-file scan that blocked the event loop for seconds across a
+// 40-file list (starving the WebSocket heartbeat) — this streams async so the socket
+// stays alive, and stops after a few KB for the common case.
+async function codexSummaryFromHead(file) {
+  let meta = null, topic = null, assistantTopic = null, messages = 0, sawResponseItem = false;
+  await readJsonl(file, (ev) => {
+    if (ev.type === "session_meta") { meta = ev.payload || meta || {}; return; }
+    if (ev.type !== "response_item" || !ev.payload) return;
+    sawResponseItem = true;
+    if (ev.payload.type !== "message") return;
+    const role = ev.payload.role;
+    if (role !== "user" && role !== "assistant") return;
+    const text = codexText(ev.payload.content);
+    if (!text) return;
     messages++;
     if (role === "user" && !topic) {
       const clean = cleanTopicCandidate(text);
@@ -4103,9 +4151,9 @@ function codexSummaryFromHead(file) {
       const clean = cleanTopicCandidate(text);
       if (clean) assistantTopic = clean;
     }
-    if (topic && messages >= 2) break;
-  }
-  if (!messages && head.includes('"response_item"')) messages = 1;
+    if (topic && messages >= 2) return false; // enough to render the roster row
+  }, CODEX_SUMMARY_HEAD_BYTES);
+  if (!messages && sawResponseItem) messages = 1;
   return { meta, topic: topic || assistantTopic || "Codex session", lastTs: null, messages };
 }
 
@@ -4138,7 +4186,8 @@ async function listCodex(limit) {
   const runningIds = runningSessionIdSet("codex");
   const results = [];
   for (const f of files) {
-    const sum = await codexSummary(f.file, { fast: true });
+    let sum = getCachedSummary(f.file, f.size);
+    if (!sum) { sum = await codexSummary(f.file, { fast: true }); setCachedSummary(f.file, f.size, sum); }
     if (sum.messages === 0) continue;
     const project = (sum.meta && sum.meta.cwd) || "";
     if (isEphemeralProject(project)) continue;
@@ -5423,9 +5472,12 @@ function probeBridgeToken(server, token, timeoutMs = 6000) {
 // Called on every successful (re)join. On the FIRST join `socketDownSince` is null so
 // this is a no-op; on a REJOIN after a drop it (1) re-delivers any result that completed
 // while the socket was down — whose one-shot push was lost, leaving the phone's live
-// clock ticking forever until an app restart — and (2) re-arms the history watches the
-// drop tore down, so the transcript re-syncs in place. The finishedAt >= socketDownSince
-// window means only results that were NOT delivered get re-sent (no duplicates).
+// clock ticking forever until an app restart — (2) re-arms the history watches the
+// drop tore down, so the transcript re-syncs in place, and (3) replays every unacked
+// progress frame for still-running tasks, in order, so a gap torn out of the middle of a
+// live stream is repaired rather than leaving the phone's card stuck on stale content.
+// The finishedAt >= socketDownSince window means only results that were NOT delivered
+// get re-sent (no duplicates).
 function recoverAfterReconnect(channel) {
   if (socketDownSince == null) return;
   const downMs = Date.now() - socketDownSince;
@@ -5454,21 +5506,29 @@ function recoverAfterReconnect(channel) {
       reasked++;
     } catch (_) {}
   }
-  // Re-sync STILL-RUNNING tasks: their progress frames pushed during the outage went to
-  // a dead socket and were lost, leaving the phone's live card frozen until the run ends.
-  // Re-pushing the last frame re-asserts the turn is alive (the phone merges progress into
-  // the same runtime card by taskId, so this never duplicates steps).
+  // Re-sync STILL-RUNNING tasks: replay every frame still sitting in the task's frame log
+  // (i.e. every frame the server never acked), in order — not just the last one. A drop
+  // in the MIDDLE of a run loses a run of frames, not just the tail; resending only the
+  // latest one (the old behavior) left that gap permanently missing from the phone's live
+  // card, which is what read as a "frozen" UI. Acked frames are pruned as we go
+  // (see ackProgressFrame), so a frame the server already folded into its accumulated
+  // transcript is never resent — this can't duplicate steps.
   let resynced = 0;
-  for (const entry of runningTasks.values()) {
-    if (entry && entry.lastProgress) {
+  let framesReplayed = 0;
+  for (const [runningKey, entry] of runningTasks.entries()) {
+    if (!entry || !entry.frameLog || !entry.frameLog.length) continue;
+    for (const framed of entry.frameLog.slice()) {
       try {
-        channel.push("progress", { ...entry.lastProgress, sentAtMs: Date.now() });
-        resynced++;
+        channel
+          .push("progress", { ...framed, sentAtMs: Date.now() })
+          .receive("ok", () => ackProgressFrame(runningKey, framed.sequence));
+        framesReplayed++;
       } catch (_) {}
     }
+    resynced++;
   }
   console.log(
-    `[vibe-bridge] reconnected after ${downMs}ms down — recovery: redelivered=${redelivered} result(s), rewatched=${rewatched} chat(s), resynced=${resynced} running, reasked=${reasked} pending`
+    `[vibe-bridge] reconnected after ${downMs}ms down — recovery: redelivered=${redelivered} result(s), rewatched=${rewatched} chat(s), resynced=${resynced} running (${framesReplayed} frame(s)), reasked=${reasked} pending`
   );
   socketDownSince = null;
 }
@@ -5496,6 +5556,43 @@ function forceReconnect(socket) {
   }
 }
 
+// ws-level ping/pong watchdog attached to the RAW transport (socket.conn) on every
+// (re)connect. This is the fast path for detecting a half-open TCP connection — a dead
+// peer whose FIN/RST never arrives (common through Cloudflare/Railway's proxy layer)
+// leaves onClose unfired for minutes, but a ping control frame gets no pong back within
+// one interval, so we notice in ~WS_PING_INTERVAL_MS instead. Independent of the Phoenix
+// channel/app-heartbeat below (see WS_PING_INTERVAL_MS) — either one firing is enough to
+// force the reconnect.
+function attachSocketLivenessPing(conn) {
+  if (!conn || typeof conn.ping !== "function") return;
+  let awaitingPong = false;
+  let misses = 0;
+  const pingTimer = setInterval(() => {
+    if (conn.readyState !== WebSocket.OPEN) return;
+    if (awaitingPong) {
+      misses += 1;
+      console.error(`[vibe-bridge] ws ping timeout (#${misses}) — socket may be a zombie`);
+      if (misses > WS_PING_MAX_MISSES) {
+        console.error("[vibe-bridge] terminating zombie socket (ws ping got no pong)");
+        clearInterval(pingTimer);
+        try {
+          conn.terminate();
+        } catch (_) {}
+        return;
+      }
+    }
+    awaitingPong = true;
+    try {
+      conn.ping();
+    } catch (_) {}
+  }, WS_PING_INTERVAL_MS);
+  conn.on("pong", () => {
+    awaitingPong = false;
+    misses = 0;
+  });
+  conn.on("close", () => clearInterval(pingTimer));
+}
+
 function connect(server, token, userId) {
   const socket = new Phoenix.Socket(wsUrl(server), {
     params: { token },
@@ -5506,6 +5603,10 @@ function connect(server, token, userId) {
     // reconnect kicks in sooner.
     heartbeatIntervalMs: 15000,
   });
+
+  // Re-armed on every (re)connect — Phoenix opens a brand-new transport per attempt, so
+  // socket.conn is a different `ws` instance each time onOpen fires.
+  socket.onOpen(() => attachSocketLivenessPing(socket.conn));
 
   socket.onError((error) => {
     const detail =

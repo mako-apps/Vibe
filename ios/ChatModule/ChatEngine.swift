@@ -411,6 +411,15 @@ final class ChatEngine {
   // Stable first-seen timestamp for each live agent stream (keyed chatId -> streamId)
   // so the streaming bubble keeps its position while its text grows.
   private var agentStreamTimestampsByChat: [String: [String: Int64]] = [:]
+  // Canonical row id for each in-flight bridge task (chatId -> taskId -> first-seen
+  // streamId). The server's per-connection stream state is NOT durable across a
+  // bridge↔server reconnect (a fresh channel process has no memory of the prior
+  // stream), so a mid-run reconnect mints a brand-new streamId with a reset buffer for
+  // the SAME logical turn. taskId is assigned once at dispatch and stays stable across
+  // any reconnect on either side, so every frame for a taskId is folded into the row
+  // keyed by the FIRST streamId seen for it — never a second, duplicate row. Survives
+  // socket resets by design; only cleared when the task reaches a terminal status.
+  private var liveStreamTaskRowIdByChatId: [String: [String: String]] = [:]
   // Latest agent-bridge history payload (Claude/Codex local session logs) per
   // chat, keyed chatId -> payload. The Claude/Codex profile requests it and
   // observes `didChangeNotification` with reason "agentBridgeHistory".
@@ -2055,6 +2064,24 @@ final class ChatEngine {
         ]
       }
       return nil
+    }
+  }
+
+  /// Whether an ask/command approval is still outstanding (sent, not yet answered) for
+  /// `chatId` — unlike `outstandingAgentBridgeAskInfo`, this ignores the presentation
+  /// claim, so it stays true for the whole time a sheet could be showing, not just the
+  /// window before it's first claimed. Used by chat headers to show a lightweight
+  /// "Waiting for approval" status without racing the sheet-presentation dedup.
+  func hasOutstandingAgentBridgeAsk(chatId rawChatId: String, provider rawProvider: String?) -> Bool {
+    let chatId = normalizedString(rawChatId) ?? ""
+    guard !chatId.isEmpty else { return false }
+    let provider = (rawProvider ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return syncOnQueue {
+      agentBridgeAskByRequestId.values.contains { payload in
+        guard (normalizedString(payload["chatId"]) ?? "") == chatId else { return false }
+        let p = (normalizedString(payload["provider"]) ?? "").lowercased()
+        return provider.isEmpty || p.isEmpty || p == provider
+      }
     }
   }
 
@@ -4768,8 +4795,58 @@ final class ChatEngine {
     }
     let status = (normalizedString(payload["status"]) ?? "running").lowercased()
     let agentUserId = normalizedString(payload["userId"] ?? payload["user_id"] ?? payload["id"])
-    let text = normalizedString(payload["text"]) ?? ""
-    let progressNodes = (payload["progressNodes"] as? [[String: Any]]) ?? []
+    let taskId = normalizedString(payload["taskId"] ?? payload["task_id"])
+
+    // Resolve the row's canonical identity through taskId, not the raw streamId. The
+    // server's per-connection stream state isn't durable across a bridge↔server
+    // reconnect (a fresh channel process remembers nothing of the prior stream), so a
+    // mid-run reconnect mints a brand-new streamId with a reset (empty) buffer for the
+    // SAME logical turn. taskId is assigned once at dispatch and survives any reconnect
+    // on either side, so the FIRST streamId seen for a taskId becomes the row's
+    // permanent id; later frames for the same taskId fold into that same row instead of
+    // spawning a second, duplicate cell.
+    var effectiveRowId = streamId
+    if let taskId, !taskId.isEmpty {
+      var perTaskRowIds = liveStreamTaskRowIdByChatId[chatId] ?? [:]
+      if let existingRowId = perTaskRowIds[taskId] {
+        effectiveRowId = existingRowId
+      } else {
+        perTaskRowIds[taskId] = streamId
+        liveStreamTaskRowIdByChatId[chatId] = perTaskRowIds
+      }
+    }
+
+    // A live turn's sessionId (once the CLI's init/thread-start event has been parsed)
+    // registers this chat in the SAME map History uses, so a phone-side reconnect's
+    // existing rearmLiveBridgeSessionLocked (chat_joined) proactively re-syncs this
+    // turn too — not just turns the user happened to open History on.
+    if let sessionId = normalizedString(payload["sessionId"] ?? payload["session_id"]),
+      !sessionId.isEmpty,
+      liveBridgeSessionIngestByChatId[chatId]?.sessionId != sessionId
+    {
+      let provider = bridgeProviderForChatLocked(chatId: chatId) ?? ""
+      if !provider.isEmpty {
+        liveBridgeSessionIngestByChatId[chatId] = (
+          provider: provider, sessionId: sessionId, requestId: UUID().uuidString
+        )
+      }
+    }
+
+    var text = normalizedString(payload["text"]) ?? ""
+    var progressNodes = (payload["progressNodes"] as? [[String: Any]]) ?? []
+    // Never let the visible feed regress: a reconnect on either side can hand back a
+    // freshly-reset accumulation buffer for the SAME task. If this frame carries
+    // strictly less than what's already on screen for this row, keep showing the
+    // richer content already displayed until the new stream catches back up.
+    if let existingMessage = liveMessageRowsByChat[chatId]?[effectiveRowId]?["message"] as? [String: Any] {
+      let existingText = normalizedString(existingMessage["plainContent"]) ?? ""
+      let existingProgressNodes =
+        ((existingMessage["metadata"] as? [String: Any])?["progressNodes"] as? [[String: Any]]) ?? []
+      if progressNodes.count < existingProgressNodes.count, text.count <= existingText.count {
+        text = existingText
+        progressNodes = existingProgressNodes
+      }
+    }
     // Diagnostic: the chronological kind order the server sent for this live frame.
     // A healthy live turn interleaves (e.g. "text,read,text,edit,bash"); a regression
     // back to the old "grouped" bug reads as all tools then all text (or vice-versa).
@@ -4790,9 +4867,10 @@ final class ChatEngine {
       let serverToPhone = serverBroadcastAtMs.map { phoneReceivedAtMs - $0 }
       let endToEnd = bridgeSentAtMs.map { phoneReceivedAtMs - $0 }
       NSLog(
-        "[ChatEngine][AgentStream] chat=%@ stream=%@ seq=%@ text=%d nodes=%d order=[%@] bridgeToServer=%@ms serverToPhone=%@ms e2e=%@ms",
+        "[ChatEngine][AgentStream] chat=%@ stream=%@ row=%@ seq=%@ text=%d nodes=%d order=[%@] bridgeToServer=%@ms serverToPhone=%@ms e2e=%@ms",
         chatId,
         streamId,
+        effectiveRowId == streamId ? "-" : effectiveRowId,
         sequence.map(String.init) ?? "nil",
         text.count,
         progressNodes.count,
@@ -4805,9 +4883,15 @@ final class ChatEngine {
 
     if status == "done" || status == "error" || status == "stopped" {
       clearAgentProgressLocked(chatId: chatId, status: status)
+      if let taskId, !taskId.isEmpty {
+        liveStreamTaskRowIdByChatId[chatId]?.removeValue(forKey: taskId)
+        if liveStreamTaskRowIdByChatId[chatId]?.isEmpty == true {
+          liveStreamTaskRowIdByChatId.removeValue(forKey: chatId)
+        }
+      }
       // Keep the accumulated text but stop the live indicator. The persisted
       // message (or its absence, on failure) takes over from here.
-      mutateLiveMessagePayloadLocked(chatId: chatId, messageId: streamId) { message in
+      mutateLiveMessagePayloadLocked(chatId: chatId, messageId: effectiveRowId) { message in
         message["isStreaming"] = false
         var metadata = (message["metadata"] as? [String: Any]) ?? [:]
         metadata["isStreaming"] = false
@@ -4815,7 +4899,7 @@ final class ChatEngine {
       }
       postChangeLocked(
         reason: "chatMessageChanged",
-        userInfo: ["chatId": chatId, "messageId": streamId, "state": statusSnapshotLocked()]
+        userInfo: ["chatId": chatId, "messageId": effectiveRowId, "state": statusSnapshotLocked()]
       )
       return
     }
@@ -4840,8 +4924,8 @@ final class ChatEngine {
 
     // Stable timestamp so the bubble holds its position as text grows.
     var perChat = agentStreamTimestampsByChat[chatId] ?? [:]
-    let timestampMs = perChat[streamId] ?? Int64(nowMs())
-    perChat[streamId] = timestampMs
+    let timestampMs = perChat[effectiveRowId] ?? Int64(nowMs())
+    perChat[effectiveRowId] = timestampMs
     agentStreamTimestampsByChat[chatId] = perChat
 
     var metadata: [String: Any] = [
@@ -4853,7 +4937,7 @@ final class ChatEngine {
       metadata["sourceMessageId"] = sourceMessageId
       metadata["actionSourceId"] = sourceMessageId
     }
-    if let taskId = normalizedString(payload["taskId"] ?? payload["task_id"]) {
+    if let taskId {
       metadata["agentTaskId"] = taskId
     }
     if let repoName = normalizedString(payload["repoName"] ?? payload["repo_name"]) {
@@ -4881,9 +4965,9 @@ final class ChatEngine {
       metadata["agentServerBroadcastAtMs"] = serverBroadcastAtMs
     }
 
-    let hadExistingStreamRow = liveMessageRowsByChat[chatId]?[streamId] != nil
+    let hadExistingStreamRow = liveMessageRowsByChat[chatId]?[effectiveRowId] != nil
     var synthetic: [String: Any] = [
-      "id": streamId,
+      "id": effectiveRowId,
       "type": "text",
       "timestamp": timestampMs,
       "isAgentMessage": true,
@@ -4899,7 +4983,7 @@ final class ChatEngine {
     }
 
     _ = applyNativeIncomingMessageEventLocked(chatId: chatId, payload: synthetic)
-    mutateLiveMessagePayloadLocked(chatId: chatId, messageId: streamId) { message in
+    mutateLiveMessagePayloadLocked(chatId: chatId, messageId: effectiveRowId) { message in
       message["isStreaming"] = true
     }
     // This live row now owns the in-flight turn — drop any running session row that a
@@ -4907,7 +4991,7 @@ final class ChatEngine {
     removeRunningBridgeSessionRowsLocked(chatId: chatId)
     postChangeLocked(
       reason: hadExistingStreamRow ? "chatMessageChanged" : "chatMessageInserted",
-      userInfo: ["chatId": chatId, "messageId": streamId, "state": statusSnapshotLocked()]
+      userInfo: ["chatId": chatId, "messageId": effectiveRowId, "state": statusSnapshotLocked()]
     )
   }
 
@@ -4935,6 +5019,7 @@ final class ChatEngine {
       liveMessageRowsByChat[chatId] = perChat
     }
     agentStreamTimestampsByChat.removeValue(forKey: chatId)
+    liveStreamTaskRowIdByChatId.removeValue(forKey: chatId)
   }
 
   /// Drop any session `bridge-…` rows currently flagged running. The live `agent-stream`

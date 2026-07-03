@@ -5312,6 +5312,9 @@ final class ChatConversationController: UIViewController {
     mainView.hostedBridgeAgentProviderProvider = { [weak self] in
       self?.bridgeAgentSurfaceVC?.agentBridgeProvider
     }
+    mainView.hostedBridgeAgentSurfaceModeProvider = { [weak self] in
+      self?.bridgeAgentSurfaceVC?.surfaceMode
+    }
     // Draw the chat's own native header (back / title / avatar). The view fully
     // implements this; it was only disabled so a SwiftUI .toolbar could draw the
     // header instead — the source of the header flicker. Now that the

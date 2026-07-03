@@ -1047,6 +1047,12 @@ defmodule Vibe.AI.LocalAgentWorker do
       worker ->
         extracted = extract_result(worker, accumulated_output)
         text = normalize_string(extracted.text) || ""
+        # The CLI's init/system event (Claude) or thread.started (Codex) carries the
+        # session id and lands within the first few output lines, so it's available on
+        # nearly every tick. Threading it to the phone lets a reconnect re-arm the same
+        # live-tail path History uses (agent-bridge-history detail request) instead of
+        # only recovering turns the user happened to open History on.
+        session_id = session_id_from_output(accumulated_output)
 
         payload =
           %{
@@ -1068,6 +1074,7 @@ defmodule Vibe.AI.LocalAgentWorker do
             "status" => "running"
           }
           |> maybe_put("taskId", metadata["taskId"] || metadata[:task_id])
+          |> maybe_put("sessionId", session_id)
           |> maybe_put(
             "sourceMessageId",
             metadata["sourceMessageId"] || metadata[:source_message_id]
