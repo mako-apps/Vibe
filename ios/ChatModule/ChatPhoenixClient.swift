@@ -39,9 +39,11 @@ final class ChatPhoenixClient: NSObject, URLSessionWebSocketDelegate, URLSession
   private let refLock = NSLock()
   private let connectRequestTimeout: TimeInterval = 8.0
   private let heartbeatInterval: TimeInterval = 10.0
+  private let heartbeatReplyTimeout: TimeInterval = 5.0
   private var session: URLSession?
   private var task: URLSessionWebSocketTask?
   private var heartbeatTimer: DispatchSourceTimer?
+  private var pendingHeartbeatRef: String?
   private var nextRefValue: Int = 1
   private var isClosing = false
 
@@ -222,6 +224,10 @@ final class ChatPhoenixClient: NSObject, URLSessionWebSocketDelegate, URLSession
     }
     guard let data else { return }
 
+    // Any inbound frame proves the link is alive — settle the heartbeat probe.
+    // (Runs on the URLSession delegate queue; the ref is owned by `queue`.)
+    queue.async { self.pendingHeartbeatRef = nil }
+
     let parsed = try? JSONSerialization.jsonObject(with: data)
 
     // Phoenix V1 JSON format: {"topic":..., "event":..., "ref":..., "join_ref":..., "payload":...}
@@ -264,13 +270,30 @@ final class ChatPhoenixClient: NSObject, URLSessionWebSocketDelegate, URLSession
     timer.schedule(deadline: .now() + heartbeatInterval, repeating: heartbeatInterval)
     timer.setEventHandler { [weak self] in
       guard let self else { return }
+      // Previous heartbeat still unanswered when the next tick fires → the
+      // socket is dead even though the OS hasn't told us (backgrounding, NAT
+      // rebind, proxy reset). Without this, sends silently vanish for up to
+      // 15s before the push timeout marks them "error".
+      if self.pendingHeartbeatRef != nil {
+        self.failDeadSocketLocked(reason: "heartbeat_timeout")
+        return
+      }
+      let ref = self.nextRef()
+      self.pendingHeartbeatRef = ref
       self.sendFrame(
         joinRef: nil,
-        ref: self.nextRef(),
+        ref: ref,
         topic: "phoenix",
         event: "heartbeat",
         payload: [:]
       )
+      // Phoenix answers heartbeats from the transport process (no DB), so a
+      // healthy link replies in one RTT. Give it a generous window, then
+      // declare the socket dead instead of waiting a full extra interval.
+      self.queue.asyncAfter(deadline: .now() + self.heartbeatReplyTimeout) { [weak self] in
+        guard let self, self.pendingHeartbeatRef == ref else { return }
+        self.failDeadSocketLocked(reason: "heartbeat_reply_timeout")
+      }
     }
     heartbeatTimer = timer
     timer.resume()
@@ -279,6 +302,20 @@ final class ChatPhoenixClient: NSObject, URLSessionWebSocketDelegate, URLSession
   private func stopHeartbeatLocked() {
     heartbeatTimer?.cancel()
     heartbeatTimer = nil
+    pendingHeartbeatRef = nil
+  }
+
+  /// Tear down a socket that stopped answering heartbeats and surface it as a
+  /// close so the owner (ChatEngine) reconnects immediately and flushes its
+  /// outbound queue.
+  private func failDeadSocketLocked(reason: String) {
+    guard !isClosing else { return }
+    isClosing = true
+    stopHeartbeatLocked()
+    task?.cancel(with: .abnormalClosure, reason: nil)
+    cleanupLocked()
+    callbacks.onError(reason)
+    callbacks.onClose(4000, reason)
   }
 
   private func cleanupLocked() {

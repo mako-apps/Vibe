@@ -459,11 +459,14 @@ defmodule Vibe.Chat do
         {:error, :forbidden_sender}
 
       true ->
+        # Message ids are client-generated, and clients legitimately re-send the
+        # same id after a reconnect (the ack got lost, not the message). Treat a
+        # duplicate insert as a no-op instead of raising messages_pkey.
         result =
           RepoRLS.with_user(acting_user_id || from_id, fn ->
             %Message{}
             |> Message.changeset(attrs)
-            |> Repo.insert()
+            |> Repo.insert(on_conflict: :nothing, conflict_target: :id)
           end)
 
         case result do

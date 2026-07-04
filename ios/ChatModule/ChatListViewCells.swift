@@ -2698,7 +2698,7 @@ func measureMessageBubbleLayout(
   let replyPreviewHeight = showsReplyPreview ? bubbleReplyPreviewHeight : 0.0
   let replyPreviewBlockHeight =
     showsReplyPreview ? (bubbleReplyPreviewHeight + bubbleReplyPreviewSpacing) : 0.0
-  let usesBottomMetaLayout = usesRichTextLayout || previewHeight > 0.0
+  let usesBottomMetaLayout = usesRichTextLayout || previewHeight > 0.0 || usesRTLColumn
   let textMaxWidth: CGFloat =
     showsInlineAttachment || usesBottomMetaLayout
     ? maxContentWidth
@@ -7002,13 +7002,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           replyPreviewView.frame = .zero
         }
 
-        let isRTL = isRTL(row.text)
-
         messageLabel.frame = pixelAlignedRect(
           CGRect(
-            x: isRTL
-              ? bubbleFrame.maxX - 8.0 - metrics.messageWidth
-              : bubbleFrame.minX + bubbleHorizontalPadding,
+            x: bubbleFrame.minX + bubbleHorizontalPadding,
             y: bubbleFrame.minY + bubbleTopPadding
               + max(0.0, metrics.bodyHeight - metrics.textHeight),
             width: metrics.messageWidth,
@@ -7016,9 +7012,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           ))
         metaContainerView.frame = pixelAlignedRect(
           CGRect(
-            x: isRTL
-              ? bubbleFrame.minX + bubbleHorizontalPadding
-              : bubbleFrame.maxX - 8.0 - metrics.metaWidth,
+            x: bubbleFrame.maxX - 8.0 - metrics.metaWidth,
             y: bubbleFrame.maxY - 5.0 - bubbleMetaHeight,
             width: metrics.metaWidth,
             height: bubbleMetaHeight

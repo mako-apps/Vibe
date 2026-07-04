@@ -28,6 +28,32 @@ defmodule VibeWeb.ChatChannel do
         room_type = Chat.get_room_type(chat_id) || "dm"
         socket = assign(socket, :room_type, room_type)
         socket = assign(socket, :user_role, role)
+
+        # Resolve the standalone-agent gate ONCE here instead of on every message.
+        # These are 2-3 DB queries; on the send path they held the sender's "sent"
+        # ack hostage for ~1s+ per message. Staleness is acceptable: toggling an
+        # agent's incoming-chat setting takes effect on the next channel join.
+        standalone_agent =
+          case room_type do
+            "dm" ->
+              chat_id
+              |> Chat.get_participant_ids()
+              |> Enum.reject(&(&1 == user_id))
+              |> Enum.find_value(&Agents.get_agent_by_shadow_user/1)
+
+            _ ->
+              nil
+          end
+
+        socket = assign(socket, :standalone_agent, standalone_agent)
+
+        socket =
+          assign(
+            socket,
+            :standalone_agent_chat_enabled,
+            is_nil(standalone_agent) or Agents.incoming_chat_enabled?(standalone_agent)
+          )
+
         # Replay any ask the phone missed while it was offline/reconnecting.
         send(self(), {:replay_pending_ask, chat_id})
         {:ok, socket}
@@ -74,19 +100,11 @@ defmodule VibeWeb.ChatChannel do
       {:reply, {:error, %{reason: "not_allowed", message: "You cannot send messages here"}},
        socket}
     else
-      standalone_agent =
-        case socket.assigns.room_type do
-          "dm" ->
-            chat_id
-            |> Chat.get_participant_ids()
-            |> Enum.reject(&(&1 == user_id))
-            |> Enum.find_value(&Agents.get_agent_by_shadow_user/1)
+      # Cached at join — the send/ack path must stay DB-free so the sender's
+      # "sent" tick is pure network round-trip.
+      standalone_agent = socket.assigns[:standalone_agent]
 
-          _ ->
-            nil
-        end
-
-      if standalone_agent && !Agents.incoming_chat_enabled?(standalone_agent) do
+      if standalone_agent && !socket.assigns[:standalone_agent_chat_enabled] do
         {:reply,
          {:error,
           %{reason: "agent_chat_disabled", message: "Incoming chat is disabled for this agent"}},

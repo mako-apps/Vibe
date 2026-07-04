@@ -5459,6 +5459,7 @@ final class ChatEngine {
         || normalizedError.contains("receive_failed")
         || normalizedError.contains("network")
         || normalizedError.contains("timed out")
+        || normalizedError.contains("heartbeat")
         || normalizedError.contains("connection")
       if shouldForceReconnect {
         let inFlightMessages = Array(self.nativePendingMessagePushRefs.values)
