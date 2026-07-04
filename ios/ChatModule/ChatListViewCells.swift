@@ -894,7 +894,7 @@ private let bubbleMetaPendingFont = UIFont.systemFont(ofSize: 10.5, weight: .sem
 private let bubbleMetaStatusFont = UIFont.systemFont(ofSize: 11, weight: .semibold)
 private let bubbleMetaInlineSpacing: CGFloat = 4.0
 private let bubbleMetaItemGap: CGFloat = 2.0
-private let bubbleRTLTailSideReserve: CGFloat = 28.0
+private let bubbleRTLTailSideReserve: CGFloat = 0.0
 private let bubbleStatusSlotWidth: CGFloat = 17.0
 private let bubbleStatusSlotHeight: CGFloat = 14.0
 private let bubbleStatusCheckStrokeWidth: CGFloat = 1.0
@@ -9179,7 +9179,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   }
 
   func transitionBubbleCaptureRects() -> (
-    bubbleBodyRect: CGRect, fullBubbleRect: CGRect, contentRect: CGRect, metaRect: CGRect
+    bubbleBodyRect: CGRect, plateRect: CGRect, tailRect: CGRect, contentRect: CGRect,
+    metaRect: CGRect
   )? {
     guard row?.kind == .message else {
       return nil
@@ -9190,10 +9191,16 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     guard bubbleBodyRect.width > 1.0, bubbleBodyRect.height > 1.0 else {
       return nil
     }
-    var fullBubbleRect = bubbleRenderCaptureRect(in: contentView).integral
+    // The tail is kept OUT of the plate rect: the plate snapshot gets
+    // width/height-morphed from the composer pill, and a baked-in tail would
+    // stretch with it. The send morph overlays the tail as its own snapshot at
+    // final placement instead. (When the tail is drawn inside bubbleView —
+    // tailView hidden — plateRect already includes its overhang and there is
+    // no separate tail to hand out.)
+    let plateRect = bubbleRenderCaptureRect(in: contentView).integral
+    var tailRect = CGRect.null
     if !tailView.isHidden {
-      let tailRect = tailView.convert(tailView.bounds, to: contentView).integral
-      fullBubbleRect = fullBubbleRect.union(tailRect).integral
+      tailRect = tailView.convert(tailView.bounds, to: contentView).integral
     }
 
     var contentRect = CGRect.null
@@ -9232,7 +9239,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       )
     }
     contentRect = contentRect.integral
-    return (bubbleBodyRect, fullBubbleRect, contentRect, metaRect)
+    return (bubbleBodyRect, plateRect, tailRect, contentRect, metaRect)
   }
 
   func bubbleBackgroundSnapshotView(in view: UIView) -> UIView? {
@@ -9242,7 +9249,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     guard let capture = transitionBubbleCaptureRects() else {
       return nil
     }
-    let captureRect = capture.fullBubbleRect
+    // Plate only — the tail is snapshotted separately by the send morph so it
+    // is never stretched by the width/height animation.
+    let captureRect = capture.plateRect
     guard captureRect.width > 1.0, captureRect.height > 1.0 else {
       return nil
     }
@@ -9254,6 +9263,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     let mediaWasHidden = mediaContainerView.isHidden
     let attachmentWasHidden = inlineAttachmentView.isHidden
     let metaWasHidden = metaContainerView.isHidden
+    let tailWasHidden = tailView.isHidden
 
     CATransaction.begin()
     CATransaction.setDisableActions(true)
@@ -9264,6 +9274,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     mediaContainerView.isHidden = true
     inlineAttachmentView.isHidden = true
     metaContainerView.isHidden = true
+    tailView.isHidden = true
     contentView.layoutIfNeeded()
     CATransaction.commit()
 
@@ -9277,6 +9288,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       mediaContainerView.isHidden = mediaWasHidden
       inlineAttachmentView.isHidden = attachmentWasHidden
       metaContainerView.isHidden = metaWasHidden
+      tailView.isHidden = tailWasHidden
       contentView.layoutIfNeeded()
       CATransaction.commit()
     }

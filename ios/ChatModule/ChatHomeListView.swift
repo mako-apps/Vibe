@@ -962,7 +962,7 @@ private final class ChatPreviewViewController: UIViewController {
       "backgroundMode": "gradient",
       "wallpaperGradient": ["#F9F3EA", "#EFE6D9"],
       "wallpaperOpacity": 1.0,
-      "wallpaperPatternGradient": ["#5A8A66", "#5A6675", "#8A75A3"],
+      "wallpaperPatternGradient": ["#5A8A66", "#8A75A3", "#5A6675"],
       "wallpaperPatternLocations": [0.0, 0.5, 1.0],
       "wallpaperPatternOpacity": 0.06,
       "wallpaperMaskKey": "doodles",

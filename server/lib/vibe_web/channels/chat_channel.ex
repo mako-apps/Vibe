@@ -85,6 +85,11 @@ defmodule VibeWeb.ChatChannel do
 
   @impl true
   def handle_in("message", payload, socket) do
+    # Ack hold-time probe: the reply path is deliberately DB-free, so this
+    # should stay in the microseconds. If the client's wire timing spikes
+    # while this stays flat, the delay is network (client Wi-Fi / proxy /
+    # Cloudflare), not the server.
+    ack_started_at = System.monotonic_time(:microsecond)
     "chat:" <> chat_id = socket.topic
     user_id = socket.assigns.user_id
 
@@ -209,6 +214,12 @@ defmodule VibeWeb.ChatChannel do
         end)
 
         # Reply immediately - don't wait for DB
+        ack_held_us = System.monotonic_time(:microsecond) - ack_started_at
+
+        Logger.info(
+          "[ChatChannel] ⏱️ ack held #{ack_held_us}µs chat_id=#{chat_id} message_id=#{data["id"]}"
+        )
+
         {:reply, :ok, socket}
       end
     end

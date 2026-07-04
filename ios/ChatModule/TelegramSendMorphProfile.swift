@@ -43,6 +43,14 @@ public enum TelegramSendMorphProfile {
   // the plate rather than lagging visibly behind it.
   static let metaFadeDelay: CFTimeInterval = 0.155
   static let metaFadeDuration: CFTimeInterval = 0.07
+
+  // The tail never rides the width/height morph — baked into the plate it got
+  // stretched taller during flight and landed with a visible 1px jump. It sits
+  // at its final placement from the start and fades in as the envelope
+  // releases its uniform radius, the same moment the plate's baked asymmetric
+  // corners take over (clipRadiusReleaseFraction × duration ≈ 0.28).
+  static let tailFadeDelay: CFTimeInterval = 0.26
+  static let tailFadeDuration: CFTimeInterval = 0.10
 }
 
 final class SendTransitionState: NSObject {
@@ -55,6 +63,7 @@ final class SendTransitionState: NSObject {
   let destinationContentSnapshot: UIView
   let sourceTextSnapshot: UIView?
   let metaSnapshot: UIView?
+  let tailSnapshot: UIView?
   let sourceBackgroundStartFrame: CGRect
   let sourceBackgroundEndFrame: CGRect
   let sourceContentStartFrame: CGRect
@@ -71,6 +80,7 @@ final class SendTransitionState: NSObject {
     destinationContentSnapshot: UIView,
     sourceTextSnapshot: UIView?,
     metaSnapshot: UIView?,
+    tailSnapshot: UIView?,
     sourceBackgroundStartFrame: CGRect,
     sourceBackgroundEndFrame: CGRect,
     sourceContentStartFrame: CGRect,
@@ -86,6 +96,7 @@ final class SendTransitionState: NSObject {
     self.destinationContentSnapshot = destinationContentSnapshot
     self.sourceTextSnapshot = sourceTextSnapshot
     self.metaSnapshot = metaSnapshot
+    self.tailSnapshot = tailSnapshot
     self.sourceBackgroundStartFrame = sourceBackgroundStartFrame
     self.sourceBackgroundEndFrame = sourceBackgroundEndFrame
     self.sourceContentStartFrame = sourceContentStartFrame
@@ -372,6 +383,21 @@ final class SendTransitionState: NSObject {
         key: "metaFadeIn"
       )
     }
+
+    // Tail: pinned at its final placement outside the clipping envelope so
+    // the width/height morph can never stretch it; it fades in with the
+    // envelope's corner-radius release.
+    if let tailSnapshot {
+      addOpacityAnimation(
+        layer: tailSnapshot.layer,
+        from: 0.0,
+        to: 1.0,
+        delay: TelegramSendMorphProfile.tailFadeDelay,
+        duration: TelegramSendMorphProfile.tailFadeDuration,
+        timing: CAMediaTimingFunction(name: .easeIn),
+        key: "tailFadeIn"
+      )
+    }
   }
 
   func compensateScroll(targetRect: CGRect) {
@@ -389,6 +415,7 @@ final class SendTransitionState: NSObject {
     destinationContentSnapshot.layer.removeAllAnimations()
     sourceTextSnapshot?.layer.removeAllAnimations()
     metaSnapshot?.layer.removeAllAnimations()
+    tailSnapshot?.layer.removeAllAnimations()
   }
 }
 
@@ -407,6 +434,7 @@ enum SendTransitionOverlayFactory {
     let destinationContentSnapshot: UIView
     let sourceTextSnapshot: UIView?
     let metaSnapshot: UIView?
+    let tailSnapshot: UIView?
     let sourceBackgroundStartFrame: CGRect
     let sourceBackgroundEndFrame: CGRect
     let sourceContentStartFrame: CGRect
@@ -549,6 +577,7 @@ enum SendTransitionOverlayFactory {
         destinationContentSnapshot: fallbackContent,
         sourceTextSnapshot: nil,
         metaSnapshot: nil,
+        tailSnapshot: nil,
         sourceBackgroundStartFrame: fallbackBg.frame,
         sourceBackgroundEndFrame: fallbackBg.frame,
         sourceContentStartFrame: fallbackContentFrame,
@@ -559,7 +588,8 @@ enum SendTransitionOverlayFactory {
     }
 
     let bubbleBodyRect = captureRects.bubbleBodyRect
-    let fullCaptureRect = captureRects.fullBubbleRect
+    // Plate only — the tail is overlaid separately so the morph can't stretch it.
+    let fullCaptureRect = captureRects.plateRect
     var contentCaptureRect = captureRects.contentRect.intersection(fullCaptureRect)
     if contentCaptureRect.isNull || contentCaptureRect.width <= 1.0
       || contentCaptureRect.height <= 1.0
@@ -711,6 +741,25 @@ enum SendTransitionOverlayFactory {
         targetFrame: relativeMetaFrame, part: .meta)
     }()
 
+    // Tail lives OUTSIDE the clipping envelope at its exact final frame — it
+    // must never be part of the plate that gets width/height-morphed, or it
+    // stretches/shifts during the flight and lands with a jump.
+    let tailSnapshot: UIView? = {
+      let tailRect = captureRects.tailRect
+      guard !tailRect.isNull, tailRect.width > 1.0, tailRect.height > 1.0 else { return nil }
+      let relativeTailFrame = CGRect(
+        x: tailRect.minX - bubbleBodyRect.minX,
+        y: tailRect.minY - bubbleBodyRect.minY,
+        width: tailRect.width,
+        height: tailRect.height
+      )
+      return makeRenderedSnapshotView(
+        from: snapshotCell.tailView,
+        captureRect: snapshotCell.tailView.bounds,
+        targetFrame: relativeTailFrame
+      )
+    }()
+
     let clippingView = UIView(frame: sourceBackgroundStartFrame)
     clippingView.clipsToBounds = true
     clippingView.isUserInteractionEnabled = false
@@ -720,6 +769,11 @@ enum SendTransitionOverlayFactory {
     clippingView.addSubview(sourceBackgroundSnapshot)
     clippingView.addSubview(bubbleBackgroundSnapshot)
     container.addSubview(clippingView)
+
+    if let tailSnapshot {
+      tailSnapshot.layer.opacity = 0.0
+      container.addSubview(tailSnapshot)
+    }
 
     if let sourceTextSnapshot {
       sourceTextSnapshot.layer.opacity = 1.0
@@ -742,6 +796,7 @@ enum SendTransitionOverlayFactory {
       destinationContentSnapshot: destinationContentSnapshot,
       sourceTextSnapshot: sourceTextSnapshot,
       metaSnapshot: metaSnapshot,
+      tailSnapshot: tailSnapshot,
       sourceBackgroundStartFrame: sourceBackgroundStartFrame,
       sourceBackgroundEndFrame: bubbleBackgroundEndFrame,
       sourceContentStartFrame: sourceContentStartFrame,
