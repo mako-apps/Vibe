@@ -774,14 +774,7 @@ final class BubbleBackgroundView: UIView {
         endAngle: .pi / 2, clockwise: true)
     }
     if tailOnRight == false {
-      addAndroidTail(
-        onRight: false,
-        to: path,
-        width: width,
-        height: height,
-        radius: bl,
-        topRadius: tl
-      )
+      addAndroidTail(onRight: false, to: path, width: width, height: height, radius: bl)
     } else {
       path.addLine(to: CGPoint(x: bl, y: height))
       path.addArc(
@@ -801,14 +794,13 @@ final class BubbleBackgroundView: UIView {
     to path: UIBezierPath,
     width: CGFloat,
     height: CGFloat,
-    radius: CGFloat,
-    topRadius: CGFloat = 0.0
+    radius: CGFloat
   ) {
     guard radius > 0.5 else {
       if onRight {
         path.addLine(to: CGPoint(x: width, y: height))
       } else {
-        path.addLine(to: CGPoint(x: 0.0, y: topRadius))
+        path.addLine(to: CGPoint(x: 0.0, y: height))
       }
       return
     }
@@ -838,27 +830,13 @@ final class BubbleBackgroundView: UIView {
         endAngle: outerAngle,
         clockwise: true
       )
-      let outerTangent = CGPoint(x: -sin(outerAngle), y: cos(outerAngle))
-      let innerTangent = CGPoint(x: -sin(innerAngle), y: cos(innerAngle))
-      let outerC1 = CGPoint(
-        x: outerPoint.x + outerTangent.x * 4.8 * s,
-        y: outerPoint.y + outerTangent.y * 4.8 * s
-      )
-      let outerC2 = CGPoint(x: width + 5.8 * s, y: height - 7.6 * s)
-      let innerC1 = CGPoint(x: width + 4.8 * s, y: height - 2.2 * s)
-      let innerC2 = CGPoint(
-        x: innerPoint.x - innerTangent.x * 4.8 * s,
-        y: innerPoint.y - innerTangent.y * 4.8 * s
-      )
-      path.addCurve(
+      path.addQuadCurve(
         to: CGPoint(x: width + tip.x, y: height + tip.y),
-        controlPoint1: outerC1,
-        controlPoint2: outerC2
+        controlPoint: CGPoint(x: width + outerControl.x, y: height + outerControl.y)
       )
-      path.addCurve(
+      path.addQuadCurve(
         to: innerPoint,
-        controlPoint1: innerC1,
-        controlPoint2: innerC2
+        controlPoint: CGPoint(x: width + innerControl.x, y: height + innerControl.y)
       )
       path.addArc(
         withCenter: center,
@@ -882,27 +860,13 @@ final class BubbleBackgroundView: UIView {
         endAngle: innerAngle,
         clockwise: true
       )
-      let innerTangent = CGPoint(x: -sin(innerAngle), y: cos(innerAngle))
-      let outerTangent = CGPoint(x: -sin(outerAngle), y: cos(outerAngle))
-      let innerC2 = CGPoint(x: -4.8 * s, y: height - 2.2 * s)
-      let innerC1 = CGPoint(
-        x: innerPoint.x + innerTangent.x * 4.8 * s,
-        y: innerPoint.y - innerTangent.y * 4.8 * s
-      )
-      let outerC1 = CGPoint(x: -5.8 * s, y: height - 7.6 * s)
-      let outerC2 = CGPoint(
-        x: outerPoint.x - outerTangent.x * 4.8 * s,
-        y: outerPoint.y - outerTangent.y * 4.8 * s
-      )
-      path.addCurve(
+      path.addQuadCurve(
         to: CGPoint(x: -tip.x, y: height + tip.y),
-        controlPoint1: innerC1,
-        controlPoint2: innerC2
+        controlPoint: CGPoint(x: -innerControl.x, y: height + innerControl.y)
       )
-      path.addCurve(
+      path.addQuadCurve(
         to: outerPoint,
-        controlPoint1: outerC1,
-        controlPoint2: outerC2
+        controlPoint: CGPoint(x: -outerControl.x, y: height + outerControl.y)
       )
       path.addArc(
         withCenter: center,
@@ -911,8 +875,12 @@ final class BubbleBackgroundView: UIView {
         endAngle: .pi,
         clockwise: true
       )
-      path.addLine(to: CGPoint(x: 0.0, y: topRadius))
+      path.addLine(to: CGPoint(x: 0.0, y: tlSafeTop(radius: radius, height: height)))
     }
+  }
+
+  private func tlSafeTop(radius: CGFloat, height: CGFloat) -> CGFloat {
+    min(radius, height)
   }
 }
 
@@ -926,6 +894,7 @@ private let bubbleMetaPendingFont = UIFont.systemFont(ofSize: 10.5, weight: .sem
 private let bubbleMetaStatusFont = UIFont.systemFont(ofSize: 11, weight: .semibold)
 private let bubbleMetaInlineSpacing: CGFloat = 4.0
 private let bubbleMetaItemGap: CGFloat = 2.0
+private let bubbleRTLTailSideReserve: CGFloat = 28.0
 private let bubbleStatusSlotWidth: CGFloat = 17.0
 private let bubbleStatusSlotHeight: CGFloat = 14.0
 private let bubbleStatusCheckStrokeWidth: CGFloat = 1.0
@@ -1047,7 +1016,7 @@ private func bubbleStatusCheckImage(double: Bool, color: UIColor) -> UIImage? {
       firstPath.addLine(to: point(19.5572, 6.34326))
     }
     // Heavier strokes so the double-tick reads clearly at this small size (was 1.5/2.0).
-    firstPath.lineWidth = (double ? 2.0 : 2.2) * scale
+    firstPath.lineWidth = (double ? 1.5 : 1.7) * scale
     firstPath.lineCapStyle = .round
     firstPath.lineJoinStyle = .round
     firstPath.stroke()
@@ -1057,7 +1026,7 @@ private func bubbleStatusCheckImage(double: Bool, color: UIColor) -> UIImage? {
       secondPath.move(to: point(20.0, 7.5625))
       secondPath.addLine(to: point(11.4283, 16.5625))
       secondPath.addLine(to: point(11.0, 16.0))
-      secondPath.lineWidth = 2.0 * scale
+      secondPath.lineWidth = 1.5 * scale
       secondPath.lineCapStyle = .round
       secondPath.lineJoinStyle = .round
       secondPath.stroke()
@@ -2729,7 +2698,7 @@ func measureMessageBubbleLayout(
   let replyPreviewHeight = showsReplyPreview ? bubbleReplyPreviewHeight : 0.0
   let replyPreviewBlockHeight =
     showsReplyPreview ? (bubbleReplyPreviewHeight + bubbleReplyPreviewSpacing) : 0.0
-  let usesBottomMetaLayout = usesRichTextLayout || previewHeight > 0.0 || usesRTLColumn
+  let usesBottomMetaLayout = usesRichTextLayout || previewHeight > 0.0
   let textMaxWidth: CGFloat =
     showsInlineAttachment || usesBottomMetaLayout
     ? maxContentWidth
@@ -2780,19 +2749,28 @@ func measureMessageBubbleLayout(
       )
     desiredContentWidth = max(textWidth, attachmentWidth, replyPreviewWidth)
   } else if usesBottomMetaLayout {
-    desiredContentWidth = max(
+    let rtlTailSideReserve = usesRTLColumn && row.isMe ? bubbleRTLTailSideReserve : 0.0
+    let coreContentWidth = max(
       textWidth,
       usesRTLColumn ? meta.total : 0.0,
       previewHeight > 0.0 ? bubbleLinkPreviewMinWidth : 0.0,
       replyPreviewWidth
     )
+    desiredContentWidth = max(
+      coreContentWidth + rtlTailSideReserve,
+      coreContentWidth
+    )
   } else {
     desiredContentWidth = max(textWidth + bubbleMetaInlineSpacing + meta.total, replyPreviewWidth)
   }
   let contentWidth = max(meta.total, min(maxContentWidth, desiredContentWidth))
+  let appliedRTLTailSideReserve =
+    usesRTLColumn && row.isMe
+    ? min(bubbleRTLTailSideReserve, max(0.0, contentWidth - max(textWidth, meta.total, replyPreviewWidth)))
+    : 0.0
   let messageWidth =
     showsInlineAttachment || usesBottomMetaLayout
-    ? contentWidth
+    ? max(1.0, contentWidth - appliedRTLTailSideReserve)
     : max(1.0, contentWidth - meta.total - bubbleMetaInlineSpacing)
   let bodyHeight =
     showsInlineAttachment
@@ -2805,9 +2783,9 @@ func measureMessageBubbleLayout(
     : replyPreviewBlockHeight + max(textHeight, bubbleMetaHeight)
   let hasReaction = row.reactionEmoji != nil && row.reactionEmoji?.isEmpty == false
   let reactionHeightOffset: CGFloat = hasReaction ? 28.0 : 0.0
-  let bubbleWidth = max(bubbleMinWidth, contentWidth + (bubbleHorizontalPadding * 2.0))
+  let bubbleWidth = max(bubbleMinWidth, contentWidth + (bubbleHorizontalPadding * 2.0) - 4.0)
   let bubbleHeight = max(
-    36.0, bodyHeight + bubbleTopPadding + bubbleBottomPadding + reactionHeightOffset)
+    34.0, bodyHeight + bubbleTopPadding + bubbleBottomPadding + reactionHeightOffset)
   return ChatMessageBubbleLayoutMetrics(
     bubbleWidth: bubbleWidth,
     bubbleHeight: bubbleHeight,
@@ -6996,13 +6974,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         let metaTop = metrics.hasLinkPreview
           ? linkPreviewView.frame.maxY + bubbleMetaTopSpacing
           : textBottom + bubbleMetaTopSpacing
-        // RTL text bubbles mirror the meta row to the LEFT edge (Telegram behavior:
-        // time+checks sit on the reading-trailing side of RTL content); LTR bottom-meta
-        // layouts (rich text / link preview) keep the right anchor.
-        let metaX =
-          usesRTLColumnLayout(row)
-          ? bubbleFrame.minX + bubbleHorizontalPadding
-          : bubbleFrame.maxX - bubbleHorizontalPadding - metrics.metaWidth
+        // Always place the meta block at the bottom right, matching Telegram's RTL behavior
+        let metaX = bubbleFrame.maxX - bubbleHorizontalPadding - metrics.metaWidth
         metaContainerView.frame = pixelAlignedRect(
           CGRect(
             x: metaX,
@@ -7029,9 +7002,13 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           replyPreviewView.frame = .zero
         }
 
+        let isRTL = isRTL(row.text)
+
         messageLabel.frame = pixelAlignedRect(
           CGRect(
-            x: bubbleFrame.minX + bubbleHorizontalPadding,
+            x: isRTL
+              ? bubbleFrame.maxX - 8.0 - metrics.messageWidth
+              : bubbleFrame.minX + bubbleHorizontalPadding,
             y: bubbleFrame.minY + bubbleTopPadding
               + max(0.0, metrics.bodyHeight - metrics.textHeight),
             width: metrics.messageWidth,
@@ -7039,8 +7016,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           ))
         metaContainerView.frame = pixelAlignedRect(
           CGRect(
-            x: messageLabel.frame.maxX + bubbleMetaInlineSpacing,
-            y: bubbleFrame.minY + bubbleTopPadding + metrics.bodyHeight - bubbleMetaHeight,
+            x: isRTL
+              ? bubbleFrame.minX + bubbleHorizontalPadding
+              : bubbleFrame.maxX - 8.0 - metrics.metaWidth,
+            y: bubbleFrame.maxY - 5.0 - bubbleMetaHeight,
             width: metrics.metaWidth,
             height: bubbleMetaHeight
           ))
@@ -8785,21 +8764,20 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       return
     }
 
+    let checkColor: UIColor = .white
+
     switch newStatus {
     case "pending", "sending":
       pendingStatusView.configure(color: baseColor)
       pendingStatusView.isHidden = false
     case "sent":
-      statusImageView.image = bubbleStatusCheckImage(double: false, color: baseColor)
+      statusImageView.image = bubbleStatusCheckImage(double: false, color: checkColor)
       statusImageView.isHidden = false
     case "delivered":
-      statusImageView.image = bubbleStatusCheckImage(double: true, color: baseColor)
+      statusImageView.image = bubbleStatusCheckImage(double: true, color: checkColor)
       statusImageView.isHidden = false
     case "read":
-      statusImageView.image = bubbleStatusCheckImage(
-        double: true,
-        color: UIColor(red: 0.0, green: 163.0 / 255.0, blue: 1.0, alpha: 1.0)  // #00A3FF
-      )
+      statusImageView.image = bubbleStatusCheckImage(double: true, color: checkColor)
       statusImageView.isHidden = false
     case "error":
       statusLabel.text = "!"
@@ -9207,7 +9185,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   }
 
   func transitionBubbleCaptureRects() -> (
-    bubbleBodyRect: CGRect, fullBubbleRect: CGRect, contentRect: CGRect
+    bubbleBodyRect: CGRect, fullBubbleRect: CGRect, contentRect: CGRect, metaRect: CGRect
   )? {
     guard row?.kind == .message else {
       return nil
@@ -9246,8 +9224,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     if !inlineAttachmentView.isHidden {
       contentRect = contentRect.union(inlineAttachmentView.frame)
     }
+    // Meta (timestamp/status) is kept out of the content rect: the send morph
+    // moves and crossfades the text, while meta fades in separately at its
+    // final placement.
+    var metaRect = CGRect.null
     if !metaContainerView.isHidden {
-      contentRect = contentRect.union(metaContainerView.frame)
+      metaRect = metaContainerView.frame.integral
     }
     if contentRect.isNull || contentRect.width <= 1.0 || contentRect.height <= 1.0 {
       contentRect = bubbleBodyRect.insetBy(
@@ -9256,7 +9238,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       )
     }
     contentRect = contentRect.integral
-    return (bubbleBodyRect, fullBubbleRect, contentRect)
+    return (bubbleBodyRect, fullBubbleRect, contentRect, metaRect)
   }
 
   func bubbleBackgroundSnapshotView(in view: UIView) -> UIView? {

@@ -395,6 +395,9 @@ final class ChatEngine {
   private var nativeChatJoinRefsByRef: [String: String] = [:]
   private var nativeJoinedChatIds = Set<String>()
   private var nativePendingMessagePushRefs: [String: (chatId: String, messageId: String)] = [:]
+  /// Wall-clock ms at which each outbound message push was handed to the socket,
+  /// keyed by push ref. Lets us log the true send→server-ack (checkmark) latency.
+  private var nativeMessagePushSentAtMs: [String: Int] = [:]
   private var nativePendingEditPushRefs: [String: (chatId: String, messageId: String)] = [:]
   private var nativePendingDeletePushRefs: [String: (chatId: String, messageId: String)] = [:]
   private var nativePendingCallSignals: [PendingCallSignal] = []
@@ -3522,10 +3525,12 @@ final class ChatEngine {
           let ref = client.push(
             topic: self.chatTopic(for: chatId), event: "message", payload: threadWirePayload)
           self.nativePendingMessagePushRefs[ref] = (chatId: chatId, messageId: messageId)
+          self.nativeMessagePushSentAtMs[ref] = self.nowMs()
 
           let timeoutRef = ref
           self.queue.asyncAfter(deadline: .now() + 15.0) { [weak self] in
             guard let self = self else { return }
+            self.nativeMessagePushSentAtMs.removeValue(forKey: timeoutRef)
             if let pending = self.nativePendingMessagePushRefs.removeValue(forKey: timeoutRef) {
               let timeoutProvider = self.bridgeProviderForChatLocked(chatId: pending.chatId)
               if let timeoutProvider {
@@ -3622,10 +3627,12 @@ final class ChatEngine {
       let ref = client.push(
         topic: chatTopic(for: chatId), event: "message", payload: messagePayload)
       nativePendingMessagePushRefs[ref] = (chatId: chatId, messageId: messageId)
+      nativeMessagePushSentAtMs[ref] = nowMs()
 
       let timeoutRef = ref
       queue.asyncAfter(deadline: .now() + 15.0) { [weak self] in
         guard let self = self else { return }
+        self.nativeMessagePushSentAtMs.removeValue(forKey: timeoutRef)
         if let pending = self.nativePendingMessagePushRefs.removeValue(forKey: timeoutRef) {
           self.appendJournalLocked(
             event: "native-send-timeout",
@@ -5588,6 +5595,10 @@ final class ChatEngine {
 
   @available(iOS 13.0, *)
   private func handleNativeSocketFrame(_ frame: ChatTransportFrame) {
+    // Captured off-queue, the instant the frame arrives from the socket, so we
+    // can separate true wire round-trip from time spent waiting behind other
+    // work on the serial engine queue when diagnosing send→ack latency.
+    let frameArrivalMs = nowMs()
     queue.async {
       if frame.event == "phx_reply",
         frame.topic == self.nativeUserTopic,
@@ -5632,6 +5643,14 @@ final class ChatEngine {
         if let pending = self.nativePendingMessagePushRefs.removeValue(forKey: ref) {
           let status = (frame.payload["status"] as? String)?.lowercased() ?? ""
           let nextStatus = status == "ok" ? "sent" : "error"
+          if let sentAtMs = self.nativeMessagePushSentAtMs.removeValue(forKey: ref) {
+            let wireRTT = frameArrivalMs - sentAtMs
+            let queueWait = self.nowMs() - frameArrivalMs
+            NSLog(
+              "[ChatEngine] ⏱️ send→%@ ack %dms (wire %dms + engineQueueWait %dms) chatId=%@ messageId=%@",
+              nextStatus, Int(wireRTT + queueWait), Int(wireRTT), Int(queueWait),
+              pending.chatId, pending.messageId)
+          }
           if status == "ok" {
             self.removeQueuedOutboundDraftLocked(
               chatId: pending.chatId, messageId: pending.messageId, dropDraft: true)

@@ -32,13 +32,24 @@ enum AgentRuntimeCrypto {
     }
   }
 
+  /// Tail of the active keychain account, for diagnostics only (never logs the key).
+  static func debugActiveAccountTail() -> String {
+    String(activeKeychainAccount().suffix(12))
+  }
+
   /// Persist a runtime key (base64, 32 bytes) handed over by the bridge.
   @discardableResult
   static func storeKey(_ base64Key: String) -> Bool {
     let trimmed = base64Key.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard let data = Data(base64Encoded: trimmed), data.count == 32 else { return false }
+    guard let data = Data(base64Encoded: trimmed), data.count == 32 else {
+      NSLog(
+        "[KeySync] storeKey reject: decoded=\(Data(base64Encoded: trimmed)?.count ?? -1) bytes (need 32), b64Len=\(trimmed.count)"
+      )
+      return false
+    }
     let account = activeKeychainAccount()
     let ok = SecureKeyStore.shared.storeSecret(key: account, value: trimmed)
+    NSLog("[KeySync] storeSecret ok=\(ok) accountTail=\(String(account.suffix(12))) scoped=\(currentScopedKeychainAccount() != nil)")
     if ok {
       if account != keychainAccount {
         SecureKeyStore.shared.deleteSecret(key: keychainAccount)
@@ -806,6 +817,9 @@ enum AgentPairingService {
     lastDeviceLabel = result.devices.first?.label
     lastConnected = result.connected
     lastStatusSnapshot = result
+    NSLog(
+      "[BridgeStatus] connected=\(result.connected) paired=\(result.paired) devices=\(result.devices.count) repos=\(result.repositories.count) userTail=\(String(config.userID.suffix(6))) serverBase=\(serverBase(config: config))"
+    )
     await MainActor.run { lastStatus = result }
     return result
   }

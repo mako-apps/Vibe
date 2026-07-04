@@ -82,6 +82,19 @@ const SAFE_BASH = [
   /^xcrun\s+(simctl|xctrace|devicectl)\s+(list|help)\b/,           // querying devices is free
   /^xcrun\s+(--find|--sdk|--show-sdk-path|--version)\b/,
   /^(cd|pushd|popd)\b/,                                             // navigation only
+  // building / compiling / running the project's own build+test scripts is free —
+  // it only produces artifacts under the repo (never installs deps or touches git).
+  /^make\s+.*\b(build|test|check|lint|all)\b/,                     // bare "make" (default target) still asks
+  /^(cargo)\s+(build|test|run)\b/,
+  /^go\s+(build|test|run)\b/,
+  /^(tsc|webpack|vite|rollup|esbuild|parcel)\b/,
+  /^(gradle|gradlew|\.\/gradlew)\s+(build|test|assemble|check)\b/,
+  /^mvn\b[^\n]*\b(compile|test|package|verify)\b/,
+  /^(node|npm|npx|yarn|pnpm|bun)\s+(run\s+)?(build|dev|start|test|typecheck|type-check|lint)\b/,
+  /^swift\s+test\b/,
+  // read-only network fetch — no upload, no piping into a shell (those are still
+  // caught by MUTATING / DANGEROUS below).
+  /^curl\b/, /^wget\b/, /^http(ie)?\b/,
 ];
 // A segment matching any of these is treated as NOT safe (asks a human) even if a
 // SAFE_BASH prefix also matched — these mutate the filesystem / state.
@@ -93,6 +106,8 @@ const MUTATING = [
   /\bpip3?\s+(install|uninstall)\b/, /\b(gem|cargo|go)\s+(install|publish)\b/,
   /\bdefaults\s+write\b/, /\blaunchctl\b/, /\bkill(all)?\b/, /\bpkill\b/,
   />{1,2}(?!\s*\/dev\/null)/, // output redirect that writes to a file
+  /\bcurl\b[^|;&\n]*(-o\b|--output\b|-O\b|--remote-name\b|-X\s*(POST|PUT|PATCH|DELETE)|--upload-file)/i,
+  /\bwget\b[^|;&\n]*(-O\b|--output-document\b)/i,
 ];
 
 // Mask quoted regions (keep length) so a pipe/`&&` INSIDE quotes — e.g. grep -E 'a|b'

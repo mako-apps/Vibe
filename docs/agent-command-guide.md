@@ -22,6 +22,16 @@ needs it — e.g. **don't `cp` a file just to read or compare it**.
   `pgrep`, `sysctl -n`
 - **Build/query (free):** `xcodebuild … build`, `xcodebuild -list|-showBuildSettings`,
   `swift build`, `xcrun simctl list`, `xcrun --find`
+- **Build/test tools (free):** `make <target>` (build/test/check/lint/all only —
+  bare `make` with no target still asks, since the default target is unknown),
+  `cargo build|test|run`, `go build|test|run`, `tsc`, `vite`/`webpack`/`rollup`/
+  `esbuild`/`parcel`, `gradle(w) build|test|assemble|check`, `mvn compile|test|`
+  `package|verify`, `swift test`, and `npm|yarn|pnpm|bun run build|dev|start|test|`
+  `typecheck|lint` — running/building/testing the project's own code never installs
+  a dependency or touches git, so it's free.
+- **Read-only network fetch (free):** `curl`/`wget` with no `-o`/`-O`/`--output`/
+  `--upload-file`/`-X POST|PUT|PATCH|DELETE` — a plain GET that prints to stdout.
+  Writing the response to a file, or piping into a shell, still asks.
 - **Pipelines are fine:** each segment is checked independently, so
   `grep foo src | head`, `cat f | sort | uniq -c`, `find . | wc -l` all run.
   Quotes are respected — `grep -E 'a|b'` is not split on the `|`.

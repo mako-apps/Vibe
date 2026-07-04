@@ -15,19 +15,34 @@ public enum TelegramSendMorphProfile {
     Float(0.27920937042459737), Float(0.91025390625)
   )
 
-  // Keep the destination plate opaque; only the composer/source snapshot burns off.
+  // The bubble plate comes in early but with a short beat of delay and a
+  // gentle build, so the morph neither reads as a transparent glass shape
+  // waiting for the real cell nor snaps to a hard solid block. The envelope's
+  // uniform corner radius keeps masking the plate's baked corners being
+  // stretched by the width morph until the shape has settled.
   static let bubbleFadeFrom: Float = 0.0
-  static let bubbleFadeDelay: CFTimeInterval = 0.0
-  static let bubbleFadeDuration: CFTimeInterval = 0.12
+  static let bubbleFadeDelay: CFTimeInterval = 0.045
+  static let bubbleFadeDuration: CFTimeInterval = 0.15
 
-  static let bubbleContentFadeDelay: CFTimeInterval = 0.035
-  static let bubbleContentFadeDuration: CFTimeInterval = 0.09
+  static let sourceBackgroundFadeDelay: CFTimeInterval = 0.045
+  static let sourceBackgroundFadeDuration: CFTimeInterval = 0.15
 
-  static let sourceBackgroundFadeDelay: CFTimeInterval = 0.0
-  static let sourceBackgroundFadeDuration: CFTimeInterval = 0.12
+  // The envelope holds the bubble's uniform radius through the crossfade and
+  // only releases to the plate's baked asymmetric corners + tail at the end.
+  static let clipRadiusSettleFraction: Float = 0.45
+  static let clipRadiusReleaseFraction: Float = 0.78
 
-  static let sourceTextFadeDelay: CFTimeInterval = 0.0
-  static let sourceTextFadeDuration: CFTimeInterval = 0.065
+  // Composer text and bubble text ride the same path and crossfade midway,
+  // top-left coincident, so the glyphs appear to morph in place.
+  static let textCrossfadeDelay: CFTimeInterval = 0.10
+  static let textCrossfadeMaxDelay: CFTimeInterval = 0.16
+  static let textCrossfadeDuration: CFTimeInterval = 0.12
+
+  // Timestamp + status tick never travel: they fade in at their final
+  // placement while the bubble is settling. Kept quick so they snap in with
+  // the plate rather than lagging visibly behind it.
+  static let metaFadeDelay: CFTimeInterval = 0.155
+  static let metaFadeDuration: CFTimeInterval = 0.07
 }
 
 final class SendTransitionState: NSObject {
@@ -39,6 +54,7 @@ final class SendTransitionState: NSObject {
   let bubbleBackgroundSnapshot: UIView
   let destinationContentSnapshot: UIView
   let sourceTextSnapshot: UIView?
+  let metaSnapshot: UIView?
   let sourceBackgroundStartFrame: CGRect
   let sourceBackgroundEndFrame: CGRect
   let sourceContentStartFrame: CGRect
@@ -54,6 +70,7 @@ final class SendTransitionState: NSObject {
     bubbleBackgroundSnapshot: UIView,
     destinationContentSnapshot: UIView,
     sourceTextSnapshot: UIView?,
+    metaSnapshot: UIView?,
     sourceBackgroundStartFrame: CGRect,
     sourceBackgroundEndFrame: CGRect,
     sourceContentStartFrame: CGRect,
@@ -68,6 +85,7 @@ final class SendTransitionState: NSObject {
     self.bubbleBackgroundSnapshot = bubbleBackgroundSnapshot
     self.destinationContentSnapshot = destinationContentSnapshot
     self.sourceTextSnapshot = sourceTextSnapshot
+    self.metaSnapshot = metaSnapshot
     self.sourceBackgroundStartFrame = sourceBackgroundStartFrame
     self.sourceBackgroundEndFrame = sourceBackgroundEndFrame
     self.sourceContentStartFrame = sourceContentStartFrame
@@ -229,76 +247,98 @@ final class SendTransitionState: NSObject {
       to: 1.0,
       delay: TelegramSendMorphProfile.bubbleFadeDelay,
       duration: TelegramSendMorphProfile.bubbleFadeDuration,
-      timing: CAMediaTimingFunction(name: .easeIn),
+      // easeOut: the plate rises quickly then settles gently into full
+      // opacity, so it reads as color right away without a hard pop at the end.
+      timing: CAMediaTimingFunction(name: .easeOut),
       key: "destBgFadeIn"
     )
 
-    // Source text fade out
-    if let sourceTextSnapshot {
-      sourceTextSnapshot.frame = sourceContentStartFrame
-      addOpacityAnimation(
-        layer: sourceTextSnapshot.layer,
-        from: 1.0,
-        to: 0.0,
-        delay: TelegramSendMorphProfile.sourceTextFadeDelay,
-        duration: TelegramSendMorphProfile.sourceTextFadeDuration,
-        timing: CAMediaTimingFunction(name: .easeIn),
-        key: "sourceTextFadeOut"
-      )
-    }
-
+    // The envelope's uniform cornerRadius owns the visible rounding for most
+    // of the flight: it eases from the composer capsule to the bubble radius,
+    // holds it there while the plate crossfades in (hiding the plate's baked
+    // corners being stretched), and only releases to zero at the end so the
+    // real asymmetric corners and tail take over un-clipped.
     let startRadius = min(sourceBackgroundStartFrame.height / 2.0, 22.0)
-
-    // The destination snapshot already contains the asymmetric bubble corners
-    // and tail. End with no uniform clipping radius so it does not impose an
-    // averaged corner over the real bubble shape.
+    let destRadius = min(sourceBackgroundEndFrame.height / 2.0, 18.0)
     clippingView.layer.cornerRadius = 0
     clippingView.layer.cornerCurve = .continuous
-    addScalarAnimation(
-      layer: clippingView.layer, keyPath: "cornerRadius", from: startRadius, to: 0,
-      duration: TelegramSendMorphProfile.duration,
-      timing: TelegramSendMorphProfile.horizontalTiming, key: "clipEnvelope.radius")
+    let radiusAnim = CAKeyframeAnimation(keyPath: "cornerRadius")
+    radiusAnim.values = [startRadius, destRadius, destRadius, 0.0]
+    radiusAnim.keyTimes = [
+      0.0,
+      NSNumber(value: TelegramSendMorphProfile.clipRadiusSettleFraction),
+      NSNumber(value: TelegramSendMorphProfile.clipRadiusReleaseFraction),
+      1.0,
+    ]
+    radiusAnim.timingFunctions = [
+      TelegramSendMorphProfile.horizontalTiming,
+      CAMediaTimingFunction(name: .linear),
+      CAMediaTimingFunction(name: .easeInEaseOut),
+    ]
+    radiusAnim.duration = TelegramSendMorphProfile.duration
+    radiusAnim.isRemovedOnCompletion = true
+    clippingView.layer.add(radiusAnim, forKey: "clipEnvelope.radius")
 
-    if let sourceTextSnapshot {
-      let srcStartRelativePos = CGPoint(
-        x: sourceContentStartFrame.midX - sourceBackgroundStartFrame.minX,
-        y: sourceContentStartFrame.midY - sourceBackgroundStartFrame.minY
-      )
-      let srcEndRelativePos = CGPoint(
-        x: sourceContentStartFrame.midX - sourceBackgroundEndFrame.minX,
-        y: sourceContentStartFrame.midY - sourceBackgroundEndFrame.minY - sourceScrollOffset
-      )
+    // Composer text and bubble text ride the same path, top-left aligned, and
+    // crossfade midway so the glyphs appear to morph in place instead of the
+    // source dying at the composer while the destination flies off alone.
+    let srcSize = sourceContentStartFrame.size
+    let destSize = destinationContentFrame.size
 
-      sourceTextSnapshot.bounds = CGRect(origin: .zero, size: sourceContentStartFrame.size)
-      sourceTextSnapshot.center = srcEndRelativePos
-      
-      addScalarAnimation(
-        layer: sourceTextSnapshot.layer, keyPath: "position.x", from: srcStartRelativePos.x, to: srcEndRelativePos.x,
-        duration: TelegramSendMorphProfile.duration,
-        timing: TelegramSendMorphProfile.horizontalTiming, key: "sourceText.posX")
-      addScalarAnimation(
-        layer: sourceTextSnapshot.layer, keyPath: "position.y", from: srcStartRelativePos.y, to: srcEndRelativePos.y,
-        duration: TelegramSendMorphProfile.duration, timing: TelegramSendMorphProfile.verticalTiming,
-        key: "sourceText.posY")
-    }
-
-    let destStartRelativePos = CGPoint(
+    let srcStartRelativePos = CGPoint(
       x: sourceContentStartFrame.midX - sourceBackgroundStartFrame.minX,
-      y: sourceContentStartFrame.midY - sourceBackgroundStartFrame.minY - sourceScrollOffset
+      y: sourceContentStartFrame.midY - sourceBackgroundStartFrame.minY
     )
     let destEndRelativePos = CGPoint(
       x: destinationContentFrame.midX - sourceBackgroundEndFrame.minX,
       y: destinationContentFrame.midY - sourceBackgroundEndFrame.minY
     )
+    let srcEndRelativePos = CGPoint(
+      x: destEndRelativePos.x - destSize.width / 2.0 + srcSize.width / 2.0,
+      y: destEndRelativePos.y - destSize.height / 2.0 + srcSize.height / 2.0
+    )
+    let destStartRelativePos = CGPoint(
+      x: srcStartRelativePos.x - srcSize.width / 2.0 + destSize.width / 2.0,
+      y: srcStartRelativePos.y - srcSize.height / 2.0 + destSize.height / 2.0 - sourceScrollOffset
+    )
 
-    destinationContentSnapshot.bounds = CGRect(origin: .zero, size: destinationContentFrame.size)
+    // Tall sends push the crossfade slightly later so the incoming text is
+    // not readable outside the still-short envelope.
+    let heightExpansion = max(
+      0.0, sourceBackgroundEndFrame.height - sourceBackgroundStartFrame.height)
+    let textCrossfadeDelay = min(
+      TelegramSendMorphProfile.textCrossfadeMaxDelay,
+      TelegramSendMorphProfile.textCrossfadeDelay
+        + CFTimeInterval(min(1.0, heightExpansion / 180.0)) * 0.05
+    )
+
+    if let sourceTextSnapshot {
+      sourceTextSnapshot.bounds = CGRect(origin: .zero, size: srcSize)
+      sourceTextSnapshot.center = srcEndRelativePos
+      addScalarAnimation(
+        layer: sourceTextSnapshot.layer, keyPath: "position.x", from: srcStartRelativePos.x,
+        to: srcEndRelativePos.x,
+        duration: TelegramSendMorphProfile.duration,
+        timing: TelegramSendMorphProfile.horizontalTiming, key: "sourceText.posX")
+      addScalarAnimation(
+        layer: sourceTextSnapshot.layer, keyPath: "position.y", from: srcStartRelativePos.y,
+        to: srcEndRelativePos.y,
+        duration: TelegramSendMorphProfile.duration, timing: TelegramSendMorphProfile.verticalTiming,
+        key: "sourceText.posY")
+      addOpacityAnimation(
+        layer: sourceTextSnapshot.layer,
+        from: 1.0,
+        to: 0.0,
+        delay: textCrossfadeDelay,
+        duration: TelegramSendMorphProfile.textCrossfadeDuration,
+        timing: CAMediaTimingFunction(name: .easeInEaseOut),
+        key: "sourceTextFadeOut"
+      )
+    }
+
+    destinationContentSnapshot.bounds = CGRect(origin: .zero, size: destSize)
     destinationContentSnapshot.center = destEndRelativePos
     destinationContentSnapshot.layer.opacity = 0.0
-    let heightExpansion = max(0.0, sourceBackgroundEndFrame.height - sourceBackgroundStartFrame.height)
-    let contentFadeDelay =
-      TelegramSendMorphProfile.bubbleContentFadeDelay
-      + CFTimeInterval(min(1.0, heightExpansion / 180.0)) * 0.11
-    let dynamicContentFadeDelay = min(0.155, contentFadeDelay)
 
     addScalarAnimation(
       layer: destinationContentSnapshot.layer, keyPath: "position.x", from: destStartRelativePos.x, to: destEndRelativePos.x,
@@ -313,11 +353,25 @@ final class SendTransitionState: NSObject {
       layer: destinationContentSnapshot.layer,
       from: 0.0,
       to: 1.0,
-      delay: dynamicContentFadeDelay,
-      duration: TelegramSendMorphProfile.bubbleContentFadeDuration,
-      timing: CAMediaTimingFunction(name: .easeIn),
+      delay: textCrossfadeDelay,
+      duration: TelegramSendMorphProfile.textCrossfadeDuration,
+      timing: CAMediaTimingFunction(name: .easeInEaseOut),
       key: "destContentFadeIn"
     )
+
+    // Timestamp + status tick: no travel — they fade in at their final
+    // placement once the bubble has essentially settled.
+    if let metaSnapshot {
+      addOpacityAnimation(
+        layer: metaSnapshot.layer,
+        from: 0.0,
+        to: 1.0,
+        delay: TelegramSendMorphProfile.metaFadeDelay,
+        duration: TelegramSendMorphProfile.metaFadeDuration,
+        timing: CAMediaTimingFunction(name: .easeIn),
+        key: "metaFadeIn"
+      )
+    }
   }
 
   func compensateScroll(targetRect: CGRect) {
@@ -334,6 +388,7 @@ final class SendTransitionState: NSObject {
     bubbleBackgroundSnapshot.layer.removeAllAnimations()
     destinationContentSnapshot.layer.removeAllAnimations()
     sourceTextSnapshot?.layer.removeAllAnimations()
+    metaSnapshot?.layer.removeAllAnimations()
   }
 }
 
@@ -351,6 +406,7 @@ enum SendTransitionOverlayFactory {
     let bubbleBackgroundSnapshot: UIView
     let destinationContentSnapshot: UIView
     let sourceTextSnapshot: UIView?
+    let metaSnapshot: UIView?
     let sourceBackgroundStartFrame: CGRect
     let sourceBackgroundEndFrame: CGRect
     let sourceContentStartFrame: CGRect
@@ -393,25 +449,41 @@ enum SendTransitionOverlayFactory {
     return imageView
   }
 
+  private enum BubbleSnapshotPart {
+    case text
+    case meta
+  }
+
   private static func makeContentSnapshot(
-    snapshotCell: ChatListCell, captureRect: CGRect, targetFrame: CGRect
+    snapshotCell: ChatListCell, captureRect: CGRect, targetFrame: CGRect,
+    part: BubbleSnapshotPart
   ) -> UIView? {
-    // Hide only the bubble shape & tail, NOT meta (timestamp/status icons)
-    // so that status icons are part of the destination content and fade in
-    // smoothly instead of popping in when the transition completes.
-    let wasBubbleHidden = snapshotCell.bubbleView.isHidden
-    let wasTailHidden = snapshotCell.tailView.isHidden
+    // Text and meta (timestamp/status icons) are captured separately: the
+    // text travels with the composer text and crossfades mid-flight, while
+    // meta fades in at its final placement at the end of the morph.
+    let hiddenViews: [UIView]
+    switch part {
+    case .text:
+      hiddenViews = [
+        snapshotCell.bubbleView, snapshotCell.tailView, snapshotCell.metaContainerView,
+      ]
+    case .meta:
+      // The capture rect is confined to metaContainerView's frame, which the
+      // cell layout reserves for meta alone, so only the plate needs hiding.
+      hiddenViews = [snapshotCell.bubbleView, snapshotCell.tailView]
+    }
+    let savedHidden = hiddenViews.map(\.isHidden)
     CATransaction.begin()
     CATransaction.setDisableActions(true)
-    snapshotCell.bubbleView.isHidden = true
-    snapshotCell.tailView.isHidden = true
+    hiddenViews.forEach { $0.isHidden = true }
     snapshotCell.contentView.layoutIfNeeded()
     CATransaction.commit()
     defer {
       CATransaction.begin()
       CATransaction.setDisableActions(true)
-      snapshotCell.bubbleView.isHidden = wasBubbleHidden
-      snapshotCell.tailView.isHidden = wasTailHidden
+      for (view, wasHidden) in zip(hiddenViews, savedHidden) {
+        view.isHidden = wasHidden
+      }
       snapshotCell.contentView.layoutIfNeeded()
       CATransaction.commit()
     }
@@ -476,6 +548,7 @@ enum SendTransitionOverlayFactory {
         bubbleBackgroundSnapshot: fallbackBg,
         destinationContentSnapshot: fallbackContent,
         sourceTextSnapshot: nil,
+        metaSnapshot: nil,
         sourceBackgroundStartFrame: fallbackBg.frame,
         sourceBackgroundEndFrame: fallbackBg.frame,
         sourceContentStartFrame: fallbackContentFrame,
@@ -571,7 +644,7 @@ enum SendTransitionOverlayFactory {
     let destinationContentSnapshot: UIView = {
       if let contentOnly = makeContentSnapshot(
         snapshotCell: snapshotCell, captureRect: contentCaptureRect,
-        targetFrame: relativeDestinationContentFrame)
+        targetFrame: relativeDestinationContentFrame, part: .text)
       {
         return contentOnly
       }
@@ -599,7 +672,8 @@ enum SendTransitionOverlayFactory {
       if let contentFallback = makeContentSnapshot(
         snapshotCell: snapshotCell,
         captureRect: contentCaptureRect,
-        targetFrame: relativeSourceContentFrame
+        targetFrame: relativeSourceContentFrame,
+        part: .text
       ) {
         return contentFallback
       }
@@ -615,6 +689,26 @@ enum SendTransitionOverlayFactory {
       label.lineBreakMode = .byTruncatingTail
       label.text = trimmedText
       return label
+    }()
+
+    // Meta (timestamp + status tick) is anchored at its end placement
+    // relative to the envelope so it never travels with the text; it just
+    // fades in there once the bubble has essentially settled.
+    let metaSnapshot: UIView? = {
+      let metaCaptureRect = captureRects.metaRect
+      guard !metaCaptureRect.isNull, metaCaptureRect.width > 1.0, metaCaptureRect.height > 1.0
+      else {
+        return nil
+      }
+      let relativeMetaFrame = CGRect(
+        x: metaCaptureRect.minX - bubbleBodyRect.minX - bubbleBackgroundEndFrame.minX,
+        y: metaCaptureRect.minY - bubbleBodyRect.minY - bubbleBackgroundEndFrame.minY,
+        width: metaCaptureRect.width,
+        height: metaCaptureRect.height
+      )
+      return makeContentSnapshot(
+        snapshotCell: snapshotCell, captureRect: metaCaptureRect.integral,
+        targetFrame: relativeMetaFrame, part: .meta)
     }()
 
     let clippingView = UIView(frame: sourceBackgroundStartFrame)
@@ -635,6 +729,11 @@ enum SendTransitionOverlayFactory {
     destinationContentSnapshot.layer.opacity = 0.0
     clippingView.addSubview(destinationContentSnapshot)
 
+    if let metaSnapshot {
+      metaSnapshot.layer.opacity = 0.0
+      clippingView.addSubview(metaSnapshot)
+    }
+
     return Result(
       container: container,
       clippingView: clippingView,
@@ -642,6 +741,7 @@ enum SendTransitionOverlayFactory {
       bubbleBackgroundSnapshot: bubbleBackgroundSnapshot,
       destinationContentSnapshot: destinationContentSnapshot,
       sourceTextSnapshot: sourceTextSnapshot,
+      metaSnapshot: metaSnapshot,
       sourceBackgroundStartFrame: sourceBackgroundStartFrame,
       sourceBackgroundEndFrame: bubbleBackgroundEndFrame,
       sourceContentStartFrame: sourceContentStartFrame,

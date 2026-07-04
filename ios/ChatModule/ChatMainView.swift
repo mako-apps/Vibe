@@ -3695,6 +3695,17 @@ public final class ChatMainView: UIView,
         || subtitleLower == "offline")
     {
       resolvedSubtitle = "online"
+    } else if trimmedSubtitle.isEmpty
+      && headerMode != .savedMessages
+      && bridgeProvider.isEmpty
+      && !isGroupOrChannel
+      && !enginePeerUserId.isEmpty
+    {
+      // shouldShowDirectPresence() stays closed until the peer has actually replied — that
+      // gate is intentional (don't hand a stranger your precise online/last-seen status
+      // before the conversation is mutual). But a totally empty subtitle reads as broken,
+      // not private, so fall back to a vague "last seen recently" instead of real presence.
+      resolvedSubtitle = "last seen recently"
     } else {
       resolvedSubtitle = trimmedSubtitle
     }

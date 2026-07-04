@@ -1420,11 +1420,9 @@ private func parseAgentProgressNodes(_ raw: Any?) -> [ChatListRow.AgentProgressN
 // reuse it to parse the decrypted runtime card for locally-run sessions.
 func parseAgentRuntimeSummary(_ raw: Any?) -> ChatListRow.AgentRuntimeSummary? {
   guard let object = raw as? [String: Any] else {
-    NSLog("[AgentView] parseRuntime: raw is NOT a dict (type=\(raw.map { String(describing: type(of: $0)) } ?? "nil")) -> nil (no card)")
     return nil
   }
   let diff = parseAgentRuntimeDiff(object["diff"])
-  NSLog("[AgentView] parseRuntime: keys=\(object.keys.sorted()) status=\(object["status"] ?? "nil") diff?=\(diff != nil) files=\(diff?.files.count ?? -1) +\(diff?.additions ?? -1)/-\(diff?.deletions ?? -1) patchLen=\(diff?.patch?.count ?? -1) rawDiffType=\(object["diff"].map { String(describing: type(of: $0)) } ?? "nil")")
   let command = parseAgentRuntimeCommand(object["command"])
   let controls = parseAgentRuntimeControls(object["controls"])
   let usage = parseAgentRuntimeUsage(object["usage"])

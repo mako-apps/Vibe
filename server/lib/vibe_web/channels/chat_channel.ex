@@ -128,8 +128,13 @@ defmodule VibeWeb.ChatChannel do
           self_echo: true
         })
 
-        # Check for @vibe agent mention and dispatch to group agent
-        maybe_dispatch_agent(chat_id, data, user_id)
+        # Check for @vibe agent mention and dispatch to group agent.
+        # Run async: resolution does several synchronous DB reads (room type,
+        # participant ids ×2, shadow-agent lookup, local-worker + attachment
+        # context) that previously blocked the sender's "sent" ack by ~2s even
+        # for a plain no-agent DM. It's pure fire-and-forget fan-out (spawns
+        # workers / logs) with an unused return value, so defer it past the reply.
+        Task.start(fn -> maybe_dispatch_agent(chat_id, data, user_id) end)
 
         # Persist to database asynchronously (don't block message delivery)
         Task.start(fn ->

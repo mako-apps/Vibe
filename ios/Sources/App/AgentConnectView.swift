@@ -118,10 +118,20 @@ final class AgentConnectModel: ObservableObject {
     // key for an already-paired computer. Keep the result inside the scanner so
     // the compact connect sheet never grows/clips around long status text.
     let trimmed = payload.trimmingCharacters(in: .whitespacesAndNewlines)
-    if trimmed.hasPrefix("vibegram-rk:"),
-      let key = AgentRuntimeCrypto.runtimeKey(fromScanned: payload)
-    {
-      if AgentRuntimeCrypto.storeKey(key) {
+    NSLog(
+      "[KeySync] scanned len=\(trimmed.count) prefix=\(String(trimmed.prefix(14))) isRK=\(trimmed.hasPrefix("vibegram-rk:")) isPair=\(trimmed.hasPrefix("vibegram-pair:"))"
+    )
+    if trimmed.hasPrefix("vibegram-rk:") {
+      guard let key = AgentRuntimeCrypto.runtimeKey(fromScanned: payload) else {
+        NSLog("[KeySync] runtimeKey(fromScanned:) returned nil — empty/malformed rk payload")
+        showScannerMessage("That key QR could not be read. Show a fresh key QR and scan again.", style: .error)
+        return
+      }
+      let stored = AgentRuntimeCrypto.storeKey(key)
+      NSLog(
+        "[KeySync] storeKey=\(stored) keyB64Len=\(key.count) hasKeyNow=\(AgentRuntimeCrypto.hasKey) account=\(AgentRuntimeCrypto.debugActiveAccountTail())"
+      )
+      if stored {
         showScannerMessage(
           "Encryption key synced. This QR only syncs encrypted file changes; scan the pairing QR too if this computer is still offline.",
           style: .success,
@@ -641,6 +651,10 @@ final class AgentQRScannerController: UIViewController, AVCaptureMetadataOutputO
   private let sessionQueue = DispatchQueue(label: "vibe.agent.qr.scanner")
   private var hasEmitted = false
   private var lastResetToken = 0
+  /// When the visible action button represents a completed success (e.g. the E2E
+  /// key finished syncing) it should dismiss the scanner rather than re-arm the
+  /// camera — otherwise a finished flow looks like it still wants another scan.
+  private var actionDismisses = false
   private let messageLabel = UILabel()
   private let retryButton = UIButton(type: .system)
   private let activityIndicator = UIActivityIndicatorView(style: .large)
@@ -895,6 +909,11 @@ final class AgentQRScannerController: UIViewController, AVCaptureMetadataOutputO
     } else {
       activityIndicator.stopAnimating()
     }
+    // A success state that offers a button is a finished flow (the key synced),
+    // so the button closes the sheet and is labelled accordingly; every other
+    // state re-arms the camera for another attempt.
+    actionDismisses = (style == .success)
+    retryButton.setTitle(actionDismisses ? "Done" : "Scan again", for: .normal)
     retryButton.isHidden = !canRetry
   }
 
@@ -922,6 +941,10 @@ final class AgentQRScannerController: UIViewController, AVCaptureMetadataOutputO
   }
 
   @objc private func handleRetry() {
+    if actionDismisses {
+      onCancel?()
+      return
+    }
     onRetry?()
     resetScan()
   }
