@@ -352,6 +352,9 @@ struct SettingsView: View {
     switch rowID {
     case "push-notifications":
       notificationsEnabled = value
+      if value {
+        VibeNativeCallManager.shared.refreshNotificationRegistration(reason: "settings-toggle-enable")
+      }
     default:
       break
     }

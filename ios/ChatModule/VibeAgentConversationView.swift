@@ -554,9 +554,16 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   /// Closure called when the user taps the agent profile button.
   var onPresentProfile: (() -> Void)?
 
-  /// A single centered spinner shown while a session's transcript is loading, instead
-  /// of a fake "Loading conversation…" message bubble. Cleared as soon as rows render.
-  private let loadingSpinner = VibeAgentArcSpinner()
+  /// A chat-shaped skeleton (alternating agent/user placeholder bubbles with a soft
+  /// low-contrast shimmer) shown while a session's transcript is loading, instead of a
+  /// bare spinner or a fake "Loading conversation…" bubble. It COVERS the feed until the
+  /// real rows are materialized underneath and then cross-fades away, so the transition
+  /// reads skeleton → chat with no blank flash in between.
+  private let loadingSkeleton = VibeAgentTranscriptSkeletonView()
+  private var skeletonVisible = false
+  /// Safety fallback: if a transcript never lands, fade the skeleton out to the empty
+  /// state rather than covering the feed forever.
+  private var skeletonSafetyTimeout: DispatchWorkItem?
   private let repoPickerButton = UIButton(type: .system)
 
   /// Menu assigned by the host (ChatListView) to display Repo/Permission/Report/History options.
@@ -644,10 +651,13 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
 
   /// Chat + provider context (history surface) so a runtime card can route a
   /// full-file-open request to the user's bridge. Nil in the live agent view.
-  var agentBridgeChatId: String?
+  var agentBridgeChatId: String? {
+    didSet { composerView.bridgeChatId = agentBridgeChatId }
+  }
   var agentBridgeProvider: String? {
     didSet {
       composerView.provider = agentBridgeProvider ?? "codex"
+      composerView.bridgeChatId = agentBridgeChatId
       if isViewLoaded {
         updateHeaderTexts()
         updateWorkspace()
@@ -865,6 +875,10 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     tableView.rowHeight = UITableView.automaticDimension
     tableView.estimatedRowHeight = 96.0
     tableView.keyboardDismissMode = .interactive
+    if #available(iOS 26.0, *) {
+      tableView.topEdgeEffect.style = .soft
+      tableView.bottomEdgeEffect.style = .soft
+    }
     // Bottom is driven by `updateScrollInsets()` (tracks the composer + keyboard); top
     // keeps a little breathing room under the translucent nav bar.
     tableView.contentInset = UIEdgeInsets(top: 12, left: 0, bottom: 12, right: 0)
@@ -894,6 +908,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     composerView.applyAppearance(appearance)
     composerView.placeholder = inputPlaceholder
     composerView.provider = agentBridgeProvider ?? "codex"
+    composerView.bridgeChatId = agentBridgeChatId
     composerView.onSend = { [weak self] text, options in
       guard let self else { return }
       self.isHistoryPicked = true
@@ -907,6 +922,9 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     }
     composerView.onAttach = { [weak self] in
       self?.presentImageAttachmentPicker()
+    }
+    composerView.onOpenToolsSheet = { [weak self] vc in
+      self?.present(vc, animated: true)
     }
     composerView.onStop = { [weak self] in
       self?.stopActiveTask()
@@ -928,10 +946,12 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     progressSheet.isHidden = true
     view.addSubview(progressSheet)
 
-    loadingSpinner.translatesAutoresizingMaskIntoConstraints = false
-    loadingSpinner.color = appearance.textSecondary
-    loadingSpinner.isHidden = true
-    view.addSubview(loadingSpinner)
+    loadingSkeleton.translatesAutoresizingMaskIntoConstraints = false
+    loadingSkeleton.applyAppearance(appearance)
+    loadingSkeleton.isHidden = true
+    // Above the feed but below the floating composer / workspace chrome (both added after
+    // the table), so the placeholder covers the message area while the composer stays live.
+    view.insertSubview(loadingSkeleton, aboveSubview: tableView)
 
     setupEmptyState()
     setupUsageBanner()
@@ -983,8 +1003,10 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       progressSheet.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       progressSheet.trailingAnchor.constraint(equalTo: view.trailingAnchor),
       progressSheet.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-      loadingSpinner.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-      loadingSpinner.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+      loadingSkeleton.topAnchor.constraint(equalTo: tableView.topAnchor),
+      loadingSkeleton.leadingAnchor.constraint(equalTo: tableView.leadingAnchor),
+      loadingSkeleton.trailingAnchor.constraint(equalTo: tableView.trailingAnchor),
+      loadingSkeleton.bottomAnchor.constraint(equalTo: tableView.bottomAnchor),
       usageBannerView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 18.0),
       usageBannerView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -18.0),
       usageBannerView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8.0),
@@ -1066,7 +1088,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       progressSheet.applyAppearance(appearance)
       composerView.applyAppearance(appearance)
       commandOverlayView.applyAppearance(appearance)
-      loadingSpinner.color = appearance.textSecondary
+      loadingSkeleton.applyAppearance(appearance)
       updateEditToastAppearance()
       updateInfoToastAppearance()
       if !isEmbeddedInSwiftUI {
@@ -1313,6 +1335,13 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
           reassertPinnedOffsetIfNeeded()
         }
       }
+    }
+
+    // Rows are now materialized and laid out underneath (every branch above commits its
+    // cells before returning). If the loading skeleton is still covering the feed, cross-
+    // fade it away NOW — revealing real content, never an empty gap.
+    if skeletonVisible, !messages.isEmpty {
+      revealTranscriptFromSkeleton()
     }
   }
 
@@ -2337,10 +2366,73 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   }
 
   private func updateLoadingOverlay() {
-    let show = isLoadingTranscript && messages.isEmpty
-    loadingSpinner.isHidden = !show
-    if show { loadingSpinner.startAnimating() } else { loadingSpinner.stopAnimating() }
+    if isLoadingTranscript && messages.isEmpty {
+      showSkeleton()
+    } else if skeletonVisible && messages.isEmpty {
+      // Loading ended with nothing to show (a fresh / genuinely empty chat) → fade the
+      // skeleton straight to the empty-state placeholder.
+      hideSkeleton(animated: true)
+    }
+    // When messages ARE present the skeleton is dismissed by revealTranscriptFromSkeleton()
+    // — only AFTER the table has committed its rows — so we never blink skeleton → empty →
+    // chat. (Called at the end of updateMessages.)
     updateEmptyState()
+  }
+
+  /// Cover the feed with the shimmer skeleton and (re)start the safety fallback.
+  private func showSkeleton() {
+    guard loadingSkeleton.superview != nil, !skeletonVisible else { return }
+    skeletonVisible = true
+    loadingSkeleton.layer.removeAllAnimations()
+    loadingSkeleton.isHidden = false
+    loadingSkeleton.alpha = 1.0
+    loadingSkeleton.startShimmer()
+
+    skeletonSafetyTimeout?.cancel()
+    let work = DispatchWorkItem { [weak self] in
+      guard let self, self.skeletonVisible, self.messages.isEmpty else { return }
+      // Transcript never arrived — stop covering the feed forever; reveal the empty state.
+      self.hideSkeleton(animated: true)
+    }
+    skeletonSafetyTimeout = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + 12.0, execute: work)
+  }
+
+  private func hideSkeleton(animated: Bool) {
+    guard skeletonVisible else { return }
+    skeletonVisible = false
+    skeletonSafetyTimeout?.cancel()
+    skeletonSafetyTimeout = nil
+    guard animated else {
+      loadingSkeleton.isHidden = true
+      loadingSkeleton.alpha = 1.0
+      loadingSkeleton.stopShimmer()
+      return
+    }
+    UIView.animate(
+      withDuration: 0.28,
+      delay: 0,
+      options: [.beginFromCurrentState, .curveEaseOut]
+    ) {
+      self.loadingSkeleton.alpha = 0.0
+    } completion: { _ in
+      // A new load may have re-shown the skeleton mid-fade — don't clobber it.
+      guard !self.skeletonVisible else { return }
+      self.loadingSkeleton.isHidden = true
+      self.loadingSkeleton.alpha = 1.0
+      self.loadingSkeleton.stopShimmer()
+    }
+  }
+
+  /// Reveal the freshly-loaded transcript from under the skeleton with no blank flash:
+  /// force the table to commit its rows first, then cross-fade the cover away over the
+  /// now-laid-out content. Safe to call every update — it no-ops once the skeleton is gone.
+  private func revealTranscriptFromSkeleton() {
+    guard skeletonVisible, !messages.isEmpty else { return }
+    if tableView.window != nil {
+      UIView.performWithoutAnimation { tableView.layoutIfNeeded() }
+    }
+    hideSkeleton(animated: true)
   }
 
   private var agentDisplayName: String {
@@ -3547,53 +3639,187 @@ private struct VibeAgentImagePreview: View {
   }
 }
 
-private final class VibeAgentArcSpinner: UIView {
-  private let arcLayer = CAShapeLayer()
-
-  var color: UIColor = .secondaryLabel {
-    didSet { arcLayer.strokeColor = color.cgColor }
-  }
+/// A single low-contrast shimmer placeholder. The base is a faint tint of the theme's
+/// text color (so the block reads as part of the same warm surface as the real feed, not
+/// a generic grey), and the sweep is a wide, feathered highlight — a gentle glow, never a
+/// hard-edged bar. Used to assemble the transcript loading skeleton.
+private final class VibeAgentSkeletonPillView: UIView {
+  private let gradientLayer = CAGradientLayer()
+  private var animating = false
+  private var lastAnimatedWidth: CGFloat = 0
 
   override init(frame: CGRect) {
     super.init(frame: frame)
-    arcLayer.fillColor = UIColor.clear.cgColor
-    arcLayer.strokeColor = color.cgColor
-    arcLayer.lineCap = .round
-    arcLayer.lineWidth = 1.5
-    layer.addSublayer(arcLayer)
+    translatesAutoresizingMaskIntoConstraints = false
+    layer.cornerCurve = .continuous
+    clipsToBounds = true
+    gradientLayer.startPoint = CGPoint(x: 0.0, y: 0.5)
+    gradientLayer.endPoint = CGPoint(x: 1.0, y: 0.5)
+    layer.addSublayer(gradientLayer)
   }
 
   required init?(coder: NSCoder) { return nil }
 
-  override var intrinsicContentSize: CGSize { CGSize(width: 30, height: 30) }
+  func apply(base: UIColor, highlight: UIColor, cornerRadius: CGFloat) {
+    layer.cornerRadius = cornerRadius
+    backgroundColor = base
+    // Clear → soft highlight → clear so only a narrow band brightens as it sweeps; the
+    // pill's own base color shows through the feathered ends (no visible edge).
+    gradientLayer.colors = [UIColor.clear.cgColor, highlight.cgColor, UIColor.clear.cgColor]
+    gradientLayer.locations = [0.2, 0.5, 0.8]
+  }
 
-  public override func layoutSubviews() {
+  override func layoutSubviews() {
     super.layoutSubviews()
-    arcLayer.frame = bounds
-    let inset = arcLayer.lineWidth / 2
-    let rect = bounds.insetBy(dx: inset, dy: inset)
-    arcLayer.path = UIBezierPath(
-      arcCenter: CGPoint(x: rect.midX, y: rect.midY),
-      radius: max(0, rect.width / 2),
-      startAngle: -.pi / 2,
-      endAngle: .pi * 1.15,
-      clockwise: true
-    ).cgPath
+    // Extend well past the bounds so the band enters/exits cleanly off-screen.
+    gradientLayer.frame = CGRect(x: -bounds.width, y: 0, width: bounds.width * 3.0, height: bounds.height)
+    if animating { addShimmerIfNeeded() }
   }
 
   func startAnimating() {
-    guard layer.animation(forKey: "spin") == nil else { return }
-    let spin = CABasicAnimation(keyPath: "transform.rotation.z")
-    spin.fromValue = 0
-    spin.toValue = 2 * Double.pi
-    spin.duration = 0.85
-    spin.repeatCount = .infinity
-    spin.isRemovedOnCompletion = false
-    layer.add(spin, forKey: "spin")
+    animating = true
+    addShimmerIfNeeded()
   }
 
   func stopAnimating() {
-    layer.removeAnimation(forKey: "spin")
+    animating = false
+    gradientLayer.removeAnimation(forKey: "shimmer")
+  }
+
+  private func addShimmerIfNeeded() {
+    guard animating, bounds.width > 1.0 else { return }
+    // Skip if an equivalent animation is already running (avoids restarting every layout).
+    if gradientLayer.animation(forKey: "shimmer") != nil,
+      abs(lastAnimatedWidth - bounds.width) < 0.5 { return }
+    lastAnimatedWidth = bounds.width
+    let animation = CABasicAnimation(keyPath: "transform.translation.x")
+    animation.fromValue = 0
+    animation.toValue = bounds.width
+    animation.duration = 1.5
+    animation.repeatCount = .infinity
+    animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+    gradientLayer.add(animation, forKey: "shimmer")
+  }
+}
+
+/// Chat-shaped loading skeleton for the agent transcript (Claude / Codex). Renders an
+/// alternating cadence of agent (left, multi-line) and user (right, bubble) placeholders
+/// on the SAME background as the live feed, so a loading conversation reads as chat rather
+/// than a bare spinner. Soft, low-contrast shimmer only.
+final class VibeAgentTranscriptSkeletonView: UIView {
+  private enum RowKind { case user, agent, agentShort }
+
+  private let stack = UIStackView()
+  private var pills: [VibeAgentSkeletonPillView] = []
+  private var appearance: VibeAgentKitChatAppearance = .fallback
+
+  private let pattern: [RowKind] = [.user, .agent, .user, .agentShort, .agent]
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    isUserInteractionEnabled = false
+    stack.translatesAutoresizingMaskIntoConstraints = false
+    stack.axis = .vertical
+    stack.alignment = .fill
+    stack.spacing = 24.0
+    addSubview(stack)
+    NSLayoutConstraint.activate([
+      stack.topAnchor.constraint(equalTo: safeAreaLayoutGuide.topAnchor, constant: 20.0),
+      stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 18.0),
+      stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -18.0),
+    ])
+  }
+
+  required init?(coder: NSCoder) { return nil }
+
+  func applyAppearance(_ appearance: VibeAgentKitChatAppearance) {
+    self.appearance = appearance
+    backgroundColor = appearance.background
+    rebuild()
+  }
+
+  func startShimmer() {
+    layoutIfNeeded()
+    pills.forEach { $0.startAnimating() }
+  }
+
+  func stopShimmer() {
+    pills.forEach { $0.stopAnimating() }
+  }
+
+  override func didMoveToWindow() {
+    super.didMoveToWindow()
+    if window != nil, !isHidden { startShimmer() } else { stopShimmer() }
+  }
+
+  private func rebuild() {
+    pills.forEach { $0.stopAnimating() }
+    pills.removeAll()
+    stack.arrangedSubviews.forEach {
+      stack.removeArrangedSubview($0)
+      $0.removeFromSuperview()
+    }
+
+    let base = appearance.text.withAlphaComponent(appearance.isDark ? 0.07 : 0.06)
+    let highlight = appearance.text.withAlphaComponent(appearance.isDark ? 0.11 : 0.09)
+    let userBase = appearance.userBubbleBackground
+    let userHighlight = appearance.text.withAlphaComponent(appearance.isDark ? 0.08 : 0.06)
+
+    for kind in pattern {
+      switch kind {
+      case .user:
+        stack.addArrangedSubview(makeUserRow(base: userBase, highlight: userHighlight))
+      case .agent:
+        stack.addArrangedSubview(
+          makeAgentRow(fractions: [0.94, 0.86, 0.62], base: base, highlight: highlight))
+      case .agentShort:
+        stack.addArrangedSubview(
+          makeAgentRow(fractions: [0.78, 0.44], base: base, highlight: highlight))
+      }
+    }
+    if window != nil, !isHidden { startShimmer() }
+  }
+
+  private func makeAgentRow(fractions: [CGFloat], base: UIColor, highlight: UIColor) -> UIView {
+    let container = UIView()
+    container.translatesAutoresizingMaskIntoConstraints = false
+    var previous: UIView?
+    for fraction in fractions {
+      let pill = VibeAgentSkeletonPillView()
+      pill.apply(base: base, highlight: highlight, cornerRadius: 7.0)
+      container.addSubview(pill)
+      pills.append(pill)
+      NSLayoutConstraint.activate([
+        pill.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+        pill.widthAnchor.constraint(equalTo: container.widthAnchor, multiplier: fraction),
+        pill.heightAnchor.constraint(equalToConstant: 13.0),
+      ])
+      if let previous {
+        pill.topAnchor.constraint(equalTo: previous.bottomAnchor, constant: 9.0).isActive = true
+      } else {
+        pill.topAnchor.constraint(equalTo: container.topAnchor).isActive = true
+      }
+      previous = pill
+    }
+    previous?.bottomAnchor.constraint(equalTo: container.bottomAnchor).isActive = true
+    return container
+  }
+
+  private func makeUserRow(base: UIColor, highlight: UIColor) -> UIView {
+    let container = UIView()
+    container.translatesAutoresizingMaskIntoConstraints = false
+    let bubble = VibeAgentSkeletonPillView()
+    bubble.apply(base: base, highlight: highlight, cornerRadius: 18.0)
+    container.addSubview(bubble)
+    pills.append(bubble)
+    NSLayoutConstraint.activate([
+      bubble.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+      bubble.topAnchor.constraint(equalTo: container.topAnchor),
+      bubble.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+      bubble.widthAnchor.constraint(equalTo: container.widthAnchor, multiplier: 0.52),
+      bubble.heightAnchor.constraint(equalToConstant: 42.0),
+    ])
+    return container
   }
 }
 
@@ -3734,9 +3960,14 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
   /// bridge run (SIGTERM). Distinct from `onSend` so an active turn can never send.
   var onStop: (() -> Void)?
   var onHeightChanged: ((CGFloat) -> Void)?
-  /// Tapped the "+" — the controller presents an image picker and stages the result
-  /// via `addAttachment(blob:)`. The composer can't present, so it delegates up.
+  /// Picked "Photo Library / Camera" from the tools sheet — the controller presents an
+  /// image picker and stages the result via `addAttachment(blob:)`. The composer can't
+  /// present, so it delegates up.
   var onAttach: (() -> Void)?
+  /// Tapped "+" (or selected Permission from the tools sheet) — the composer built the
+  /// sheet's content but can't present it itself, so it hands the finished
+  /// `UIViewController` up for the host to `present(_:animated:)`.
+  var onOpenToolsSheet: ((UIViewController) -> Void)?
   /// Agent bridge command shortcuts (`/usage`, `/compact`, ...). These are local
   /// control panels in the agent surface, not chat messages.
   var onCommand: ((String) -> Void)? {
@@ -3747,6 +3978,9 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
   var placeholder: String = "Ask Codex" {
     didSet { placeholderLabel.text = placeholder }
   }
+  /// The agent-bridge chat id for this surface — used by the tools sheet's Usage panel
+  /// to request a live usage snapshot from the bridge (round-trip, no chat bubble).
+  var bridgeChatId: String?
   /// Drives which run options are read at send time (Claude vs Codex ladders).
   var provider: String = "codex" {
     didSet {
@@ -3760,6 +3994,10 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
   }
 
   // MARK: Subviews — one glass surface that grows in height on focus.
+  private let backgroundMaskView = UIView()
+  private let backgroundBlurView = UIVisualEffectView(effect: UIBlurEffect(style: .regular))
+  private let backgroundOverlayView = UIView()
+  private let backgroundGradientLayer = CAGradientLayer()
   private let pillGlass = UIVisualEffectView(effect: nil)
   private let pillContainer = UIView()
   private let plusButton = UIButton(type: .system)
@@ -3783,7 +4021,7 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
     .init(name: "commands", subtitle: "List every available command", kind: .bridge, takesArgs: false),
     .init(name: "skills", subtitle: "Skills, agents, MCP servers, and tools", kind: .bridge, takesArgs: false),
     .init(name: "doctor", subtitle: "Run the CLI health check", kind: .bridge, takesArgs: false),
-    .init(name: "compact", subtitle: "Start the next run without resume state", kind: .bridge, takesArgs: false),
+    .init(name: "compact", subtitle: "Summarize this conversation to free context", kind: .bridge, takesArgs: false),
     .init(name: "model", subtitle: "Show or set the model for this chat", kind: .bridge, takesArgs: true),
     .init(name: "plan", subtitle: "Plan only — analyze without editing", kind: .runOption, takesArgs: false),
     .init(name: "reasoning", subtitle: "Thinking / speed for this chat", kind: .runOption, takesArgs: false),
@@ -3887,6 +4125,7 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
   /// keystroke.
   private var lastExpandedState = false
   private var lastSendVisible = false
+  private var lastKeyboardPaddingProgress: CGFloat = -1
   /// The most recent keyboard show/hide curve, consumed once by the next expand/collapse
   /// so the pill's own morph rides the SAME timeline as the keyboard instead of a
   /// separately-timed spring — a mismatch there was the visible "jump".
@@ -3906,18 +4145,29 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
   // MARK: Layout constants
   private let sideSize: CGFloat = 46
   private let topVPad: CGFloat = 6
-  private let bottomVPad: CGFloat = 6
+  // Matches ChatInputBar's idle bottom margin (5pt) so the two composers sit at the
+  // same height above the safe area.
+  private let bottomVPad: CGFloat = 5
   private let minPillH: CGFloat = 46
   private let maxPillH: CGFloat = 160
-  private let textInsetH: CGFloat = 14
+  private let textInsetH: CGFloat = 12
   private let textInsetV: CGFloat = 11
-  private let pagePadding: CGFloat = 14
   private let sendButtonSize: CGFloat = 30
   // The plus/slash/permission row that appears underneath the text once expanded.
   private let bottomRowHeight: CGFloat = 34
   private let bottomIconSize: CGFloat = 32
   private let bottomRowGap: CGFloat = 8
   private var modeObserver: NSObjectProtocol?
+
+  /// Left/right inset from the composer's own bounds — a touch wider than the chat bar
+  /// when idle (30pt) and tightening to 10pt while the keyboard is up. The host drives
+  /// this because once the composer is moved above the keyboard, intersecting the
+  /// keyboard frame with the composer's own bounds reads as zero and the padding never
+  /// changes.
+  private var keyboardPaddingProgress: CGFloat = 0
+  private func currentPagePadding() -> CGFloat {
+    30.0 - (20.0 * keyboardPaddingProgress)
+  }
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -3936,10 +4186,9 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
     NotificationCenter.default.removeObserver(self, name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
   }
 
-  /// Keeps the permission icon (and the slash icon's plan-mode accent) in sync whether
-  /// the mode was set via /plan, the header permission picker, or this composer's menu.
+  /// Keeps the slash icon's plan-mode accent in sync whether the mode was set via
+  /// /plan, the header permission picker, or the tools sheet's Permission row.
   private func refreshModePill() {
-    updateAttachmentMenu()
     updateSlashAccent()
   }
 
@@ -3977,7 +4226,7 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
   /// beside it (which used to eat into every wrapped line, not just the last one).
   private func measuredTextHeight() -> CGFloat {
     let w = bounds.width > 0 ? bounds.width : (window?.bounds.width ?? UIScreen.main.bounds.width)
-    let pillW = max(1, w - pagePadding * 2)
+    let pillW = max(1, w - currentPagePadding() * 2)
     let textW = max(1, pillW - textInsetH * 2)
     return textView.sizeThatFits(CGSize(width: textW, height: .greatestFiniteMagnitude)).height
   }
@@ -4004,6 +4253,17 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
       self, selector: #selector(handleKeyboardWillChangeFrame(_:)),
       name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
 
+    backgroundMaskView.isUserInteractionEnabled = false
+    backgroundGradientLayer.colors = [
+      UIColor.clear.cgColor,
+      UIColor.black.withAlphaComponent(0.92).cgColor,
+    ]
+    backgroundGradientLayer.locations = [0.1, 1.0]
+    backgroundMaskView.layer.mask = backgroundGradientLayer
+    addSubview(backgroundMaskView)
+    backgroundMaskView.addSubview(backgroundBlurView)
+    backgroundBlurView.contentView.addSubview(backgroundOverlayView)
+
     // One glass pill hosts everything; only its height changes (focus/text driven).
     configureGlass(pillGlass)
     addSubview(pillGlass)
@@ -4012,13 +4272,13 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
     pillContainer.layer.cornerCurve = .continuous
     pillGlass.contentView.addSubview(pillContainer)
 
-    // The bottom row — plus / slash / permission — is its own independent tap
-    // target per icon. Each opens its own menu/picker and is hidden entirely at
-    // rest, appearing only once the composer expands.
+    // The same "+" button stays mounted in both states: closed on the leading side of
+    // the pill, expanded in the lower tool row. Keeping one view lets the position
+    // animate instead of disappearing and reappearing.
     configureIconButton(plusButton, systemName: "plus")
-    plusButton.showsMenuAsPrimaryAction = true
-    plusButton.isHidden = true
-    plusButton.alpha = 0
+    plusButton.addTarget(self, action: #selector(handlePlusTap), for: .touchUpInside)
+    plusButton.isHidden = false
+    plusButton.alpha = 1
     pillContainer.addSubview(plusButton)
 
     configureIconButton(slashButton, systemName: "slash.circle")
@@ -4095,44 +4355,47 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
     }
   }
 
-  private func updateAttachmentMenu() {
-    let currentMode = AgentBridgeSelectionStore.selectedWorkMode()
-    let modeColor = Self.color(for: currentMode)
-    let permissionChildren = AgentBridgeWorkMode.allCases.map { mode in
-      UIAction(
-        title: mode.title,
-        subtitle: mode.subtitle,
-        image: UIImage(systemName: mode.icon)?.withTintColor(Self.color(for: mode), renderingMode: .alwaysOriginal),
-        state: mode == currentMode ? .on : .off
-      ) { [weak self] _ in
-        AgentBridgeSelectionStore.setWorkMode(mode)
-        self?.refreshModePill()
-      }
-    }
-    
-    let permissionMenu = UIMenu(
-      title: "Permission",
-      subtitle: currentMode.title,
-      image: UIImage(systemName: "hand.raised")?.withTintColor(modeColor, renderingMode: .alwaysOriginal),
-      children: permissionChildren)
+  /// "+" opens a bottom sheet instead of a native UIMenu — same actions (attachment,
+  /// model, thinking, permission) plus every slash command in one place, styled after
+  /// resolo.ai's `ChatComposerOptionsSheet` tool selector.
+  @objc private func handlePlusTap() {
+    onOpenToolsSheet?(buildToolsSheetViewController())
+  }
 
-    let attachAction = UIAction(title: "Photo Library / Camera", image: UIImage(systemName: "photo")) { [weak self] _ in
-      self?.onAttach?()
+  private func buildToolsSheetViewController() -> UIViewController {
+    let host = UIHostingController(rootView: AnyView(EmptyView()))
+    host.rootView = AnyView(
+      VibeAgentToolsSheet(
+        appearance: appearance,
+        provider: provider,
+        chatId: bridgeChatId,
+        allCommands: allCommands,
+        onAttach: { [weak self] in self?.onAttach?() },
+        onCamera: { /* add camera logic later if needed */ },
+        onFile: { /* add file logic later if needed */ },
+        onSelectCommand: { [weak self] cmd in self?.applyCommandSelection(cmd) },
+        onDismiss: { [weak host] in host?.dismiss(animated: true) }
+      )
+    )
+
+    // Dark mode: the bare system-sheet material renders too light/gray. Back it with a
+    // near-black fill so the sheet reads as a proper dark glass surface (matching the
+    // Claude tool sheet). Light mode keeps the native light material.
+    host.view.backgroundColor = appearance.isDark
+      ? UIColor(red: 0.02, green: 0.02, blue: 0.025, alpha: 1.0)
+      : nil
+
+    if let sheet = host.sheetPresentationController {
+      sheet.detents = [.medium(), .large()]
+      sheet.prefersGrabberVisible = true
+      sheet.preferredCornerRadius = 30
+      sheet.prefersScrollingExpandsWhenScrolledToEdge = false
+      // Don't let the sheet resize/expand from a scroll-edge drag — keeps the "tab"
+      // bounce off; the sheet only moves via the grabber.
+      sheet.prefersEdgeAttachedInCompactHeight = false
     }
     
-    let modelAction = UIAction(title: "Model Picker", image: UIImage(systemName: "cpu")) { [weak self] _ in
-      self?.applyCommandSelection(VibeAgentSlashCommand(name: "model", subtitle: "", kind: .bridge, takesArgs: true))
-    }
-    
-    let thinkingAction = UIAction(title: "Thinking Handling", image: UIImage(systemName: "brain")) { [weak self] _ in
-      self?.applyCommandSelection(VibeAgentSlashCommand(name: "reasoning", subtitle: "", kind: .runOption, takesArgs: false))
-    }
-    
-    plusButton.menu = UIMenu(title: "Attachment", children: [
-      UIMenu(options: .displayInline, children: [attachAction]),
-      permissionMenu,
-      UIMenu(options: .displayInline, children: [modelAction, thinkingAction])
-    ])
+    return host
   }
 
   /// The slash icon picks up the plan-mode blue too — a persistent cue that plan mode
@@ -4150,9 +4413,10 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
     textView.textColor = appearance.text
     textView.tintColor = appearance.text
     placeholderLabel.textColor = appearance.textTertiary
+    backgroundBlurView.effect = UIBlurEffect(style: appearance.isDark ? .dark : .light)
+    backgroundOverlayView.backgroundColor = appearance.background.withAlphaComponent(0.88)
     plusButton.tintColor = appearance.text.withAlphaComponent(0.6)
     updateSlashAccent()
-    updateAttachmentMenu()
     micButton.tintColor = isDictating ? .systemRed : appearance.text.withAlphaComponent(0.6)
     applySendButtonGlyph()
     updateAttachmentIndicator()
@@ -4168,17 +4432,27 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
     guard w > 0 else { return }
 
     let expanded = isExpanded
+    // Single-line height shared by the text view and the placeholder so the placeholder
+    // sits on the exact same baseline as typed text (both top-aligned within one line),
+    // rather than being vertically centred in a taller box.
+    let lineH = ceil(textView.font?.lineHeight ?? 21)
     // While a task is running, STOP must stay reachable even if the composer is
     // collapsed/unfocused — so its collapsed layout reserves room for it too.
     let stopReserve: CGFloat = (!expanded && isTaskActive) ? sendButtonSize + 10 : 0
 
-    let leftEdge = pagePadding
-    let rightEdge = w - pagePadding
+    let leftEdge = currentPagePadding()
+    let rightEdge = w - currentPagePadding()
     let pillW = max(1, rightEdge - leftEdge)
+    backgroundMaskView.frame = bounds
+    backgroundBlurView.frame = backgroundMaskView.bounds
+    backgroundOverlayView.frame = backgroundBlurView.bounds
 
-    // Text always gets the full width — the icon row lives underneath it instead
-    // of squeezed in beside it, so nothing eats into the text on any wrapped line.
-    let textW = max(1, pillW - textInsetH * 2)
+    // Closed state reserves the same leading "+" footprint as the native composer
+    // reference (44pt), then releases that inset on expansion so the text visibly
+    // grows into the freed space.
+    let collapsedLeadingTextInset = textInsetH + 44.0
+    let leadingTextInset = expanded ? textInsetH : collapsedLeadingTextInset
+    let textW = max(1, pillW - leadingTextInset - textInsetH)
     let measured = textView.sizeThatFits(CGSize(width: textW, height: .greatestFiniteMagnitude)).height
     let minTextH = minPillH - textInsetV * 2
     let maxTextHeight = max(minTextH, maxPillH - textInsetV * 2 - bottomRowReserve)
@@ -4197,8 +4471,8 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
 
     if expanded {
       // Row 1: the text spans the full width, top-aligned.
-      textView.frame = CGRect(x: textInsetH, y: textInsetV, width: textW, height: clampedTextH)
-      placeholderLabel.frame = CGRect(x: textInsetH + 2, y: textInsetV, width: textW - 4, height: clampedTextH)
+      textView.frame = CGRect(x: leadingTextInset, y: textInsetV, width: textW, height: clampedTextH)
+      placeholderLabel.frame = CGRect(x: leadingTextInset, y: textInsetV, width: textW, height: lineH)
 
       // Row 2: plus / slash on the left (each padded from the edge and
       // from one another), mic + send together on the right — each its own tap
@@ -4221,10 +4495,18 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
       sendButton.center = CGPoint(x: pillW - textInsetH - sendButtonSize / 2, y: rowCenterY)
     } else {
       // Collapsed: one line — placeholder on the left, mic (+ STOP, if a task is
-      // running) on the right.
+      // running) on the right, and the "+" visible at the leading side.
       let centerY = pillH / 2
       let textRight = pillW - sideSize - stopReserve
-      textView.frame = CGRect(x: textInsetH, y: centerY - minTextH / 2, width: max(1, textRight - textInsetH), height: minTextH)
+      plusButton.bounds = bottomIconBounds
+      plusButton.center = CGPoint(x: textInsetH + bottomIconSize / 2, y: centerY)
+
+      textView.frame = CGRect(
+        x: leadingTextInset,
+        y: centerY - lineH / 2,
+        width: max(1, textRight - leadingTextInset),
+        height: lineH
+      )
       placeholderLabel.frame = textView.frame
 
       micButton.bounds = squareBounds
@@ -4237,6 +4519,7 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
 
     CATransaction.begin()
     CATransaction.setDisableActions(true)
+    backgroundGradientLayer.frame = backgroundMaskView.bounds
     pillGlass.cornerConfiguration = .uniformCorners(radius: .fixed(cornerR))
     CATransaction.commit()
 
@@ -4251,6 +4534,19 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
     super.safeAreaInsetsDidChange()
     onHeightChanged?(preferredHeight)
     setNeedsLayout()
+  }
+
+  func setKeyboardPaddingProgress(
+    _ progress: CGFloat,
+    animation: (duration: TimeInterval, options: UIView.AnimationOptions)? = nil
+  ) {
+    let clamped = max(0.0, min(1.0, progress))
+    guard abs(clamped - keyboardPaddingProgress) > 0.01 else { return }
+    if let animation {
+      pendingKeyboardAnimation = animation
+    }
+    keyboardPaddingProgress = clamped
+    updateExpansionState(animated: true)
   }
 
   // MARK: - Send
@@ -4529,13 +4825,24 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
   }
 
   @objc private func handleKeyboardWillChangeFrame(_ note: Notification) {
-    guard let info = note.userInfo,
+    let keyboardVisible: Bool
+    if let endFrame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect,
+      let window
+    {
+      let endFrameInWindow = window.convert(endFrame, from: nil)
+      keyboardVisible = window.bounds.intersects(endFrameInWindow)
+        && endFrameInWindow.minY < window.bounds.maxY
+    } else {
+      keyboardVisible = false
+    }
+    if let info = note.userInfo,
       let duration = (info[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?.doubleValue,
       duration > 0,
       let curveRaw = (info[UIResponder.keyboardAnimationCurveUserInfoKey] as? NSNumber)?.uintValue
-    else { return }
-    pendingKeyboardAnimation = (duration, UIView.AnimationOptions(rawValue: curveRaw << 16))
-    updateExpansionState(animated: true)
+    {
+      pendingKeyboardAnimation = (duration, UIView.AnimationOptions(rawValue: curveRaw << 16))
+    }
+    setKeyboardPaddingProgress(keyboardVisible ? 1.0 : 0.0)
   }
 
   /// Cross-fades the plus/slash/permission row (visible while `isExpanded`) and the
@@ -4550,11 +4857,15 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
   private func updateExpansionState(animated: Bool) {
     let expanded = isExpanded
     let sendVisible = isTaskActive || expanded
-    guard expanded != lastExpandedState || sendVisible != lastSendVisible else { return }
+    guard
+      expanded != lastExpandedState || sendVisible != lastSendVisible
+        || abs(keyboardPaddingProgress - lastKeyboardPaddingProgress) > 0.01
+    else { return }
     lastExpandedState = expanded
     lastSendVisible = sendVisible
+    lastKeyboardPaddingProgress = keyboardPaddingProgress
+    plusButton.isHidden = false
     if expanded {
-      plusButton.isHidden = false
       slashButton.isHidden = false
     }
     if sendVisible {
@@ -4563,7 +4874,7 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
     let newHeight = preferredHeight
     let apply = {
       self.onHeightChanged?(newHeight)
-      self.plusButton.alpha = expanded ? 1 : 0
+      self.plusButton.alpha = 1
       self.slashButton.alpha = expanded ? 1 : 0
       self.sendButton.alpha = sendVisible ? (self.sendButton.isEnabled ? 1 : 0.35) : 0
       self.setNeedsLayout()
@@ -4571,7 +4882,6 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
     }
     let finish: (Bool) -> Void = { _ in
       if !expanded {
-        self.plusButton.isHidden = true
         self.slashButton.isHidden = true
       }
       if !sendVisible {
@@ -4670,6 +4980,473 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
     default: return cmd.kind == .cli ? "terminal" : "slash.circle"
     }
   }
+}
+
+// MARK: - Composer "+" tools sheet
+
+/// Consolidated bottom sheet for the composer's "+" button, styled after the reference
+/// "Add to Chat" sheet: a circular close button + centered title, an optional row of big
+/// attachment cards, then grouped rounded sections whose rows carry a leading icon, a
+/// title (+ optional subtitle) and a trailing accessory (chevron / value+chevron /
+/// checkmark / switch). Reused for the top-level tools list, the resolo-style
+/// "Chat Settings" model+thinking picker, and the Permission drill-down.
+///
+/// Two selection behaviours: a normal row dismisses the sheet then fires its action (so it
+/// can hand a second sheet back up through `onOpenToolsSheet` without a presentation
+/// conflict); a `keepsOpen` row runs its action and refreshes the sheet in place so its
+/// checkmark updates immediately (model / thinking / permission selection).
+final class VibeAgentComposerToolsSheet: UIViewController {
+  struct Card {
+    let title: String
+    let systemImage: String
+    let action: () -> Void
+  }
+
+  enum Trailing {
+    case none
+    case chevron
+    case checkmark
+    case value(String)
+    case valueChevron(String)
+    case toggle(Bool, (Bool) -> Void)
+  }
+
+  struct Row {
+    let title: String
+    let subtitle: String?
+    let systemImage: String?
+    let tint: UIColor?
+    let trailing: Trailing
+    /// When true, tapping runs the action and rebuilds the sheet in place (updating this
+    /// row's checkmark) instead of dismissing.
+    let keepsOpen: Bool
+    let action: (() -> Void)?
+
+    init(
+      title: String, subtitle: String? = nil, systemImage: String? = nil, tint: UIColor? = nil,
+      trailing: Trailing = .chevron, keepsOpen: Bool = false, action: (() -> Void)? = nil
+    ) {
+      self.title = title
+      self.subtitle = subtitle
+      self.systemImage = systemImage
+      self.tint = tint
+      self.trailing = trailing
+      self.keepsOpen = keepsOpen
+      self.action = action
+    }
+  }
+
+  struct Section {
+    let title: String?
+    let rows: [Row]
+  }
+
+  private let appearance: VibeAgentKitChatAppearance
+  private let sheetTitle: String
+  private let detents: [UISheetPresentationController.Detent]
+  private let cards: [Card]
+  private let sectionsProvider: () -> [Section]
+
+  private let scrollView = UIScrollView()
+  private let contentStack = UIStackView()
+
+  init(
+    appearance: VibeAgentKitChatAppearance, title: String,
+    detents: [UISheetPresentationController.Detent], cards: [Card] = [],
+    sectionsProvider: @escaping () -> [Section]
+  ) {
+    self.appearance = appearance
+    self.sheetTitle = title
+    self.detents = detents
+    self.cards = cards
+    self.sectionsProvider = sectionsProvider
+    super.init(nibName: nil, bundle: nil)
+  }
+
+  /// Convenience for a fixed set of sections.
+  convenience init(
+    appearance: VibeAgentKitChatAppearance, title: String,
+    detents: [UISheetPresentationController.Detent], cards: [Card] = [], sections: [Section]
+  ) {
+    self.init(
+      appearance: appearance, title: title, detents: detents, cards: cards,
+      sectionsProvider: { sections })
+  }
+
+  required init?(coder: NSCoder) { return nil }
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    view.backgroundColor = appearance.background
+
+    let header = UIView()
+    header.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(header)
+
+    let closeButton = UIButton(type: .system)
+    closeButton.setImage(
+      UIImage(
+        systemName: "xmark",
+        withConfiguration: UIImage.SymbolConfiguration(pointSize: 13, weight: .semibold)),
+      for: .normal)
+    closeButton.tintColor = appearance.text.withAlphaComponent(0.85)
+    closeButton.backgroundColor = appearance.surface
+    closeButton.layer.cornerRadius = 17
+    closeButton.translatesAutoresizingMaskIntoConstraints = false
+    closeButton.addTarget(self, action: #selector(handleClose), for: .touchUpInside)
+    header.addSubview(closeButton)
+
+    let titleLabel = UILabel()
+    titleLabel.text = sheetTitle
+    titleLabel.font = .systemFont(ofSize: 18, weight: .semibold)
+    titleLabel.textColor = appearance.text
+    titleLabel.textAlignment = .center
+    titleLabel.translatesAutoresizingMaskIntoConstraints = false
+    header.addSubview(titleLabel)
+
+    scrollView.translatesAutoresizingMaskIntoConstraints = false
+    scrollView.showsVerticalScrollIndicator = false
+    scrollView.alwaysBounceVertical = true
+    view.addSubview(scrollView)
+
+    contentStack.axis = .vertical
+    contentStack.spacing = 22
+    contentStack.translatesAutoresizingMaskIntoConstraints = false
+    scrollView.addSubview(contentStack)
+
+    NSLayoutConstraint.activate([
+      header.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 6),
+      header.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      header.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      header.heightAnchor.constraint(equalToConstant: 40),
+
+      closeButton.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 18),
+      closeButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+      closeButton.widthAnchor.constraint(equalToConstant: 34),
+      closeButton.heightAnchor.constraint(equalToConstant: 34),
+
+      titleLabel.centerXAnchor.constraint(equalTo: header.centerXAnchor),
+      titleLabel.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+      titleLabel.leadingAnchor.constraint(greaterThanOrEqualTo: closeButton.trailingAnchor, constant: 8),
+
+      scrollView.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 8),
+      scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+
+      contentStack.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor, constant: 8),
+      contentStack.bottomAnchor.constraint(
+        equalTo: scrollView.contentLayoutGuide.bottomAnchor, constant: -24),
+      contentStack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 18),
+      contentStack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -18),
+      contentStack.widthAnchor.constraint(equalTo: view.widthAnchor, constant: -36),
+    ])
+
+    if let sheet = sheetPresentationController {
+      sheet.detents = detents
+      sheet.prefersGrabberVisible = true
+      sheet.preferredCornerRadius = 30
+      sheet.prefersScrollingExpandsWhenScrolledToEdge = false
+    }
+
+    rebuild()
+  }
+
+  @objc private func handleClose() { dismiss(animated: true) }
+
+  private func rebuild() {
+    contentStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+    if !cards.isEmpty {
+      contentStack.addArrangedSubview(makeCardRow(cards))
+    }
+    for section in sectionsProvider() {
+      contentStack.addArrangedSubview(makeSectionView(section))
+    }
+  }
+
+  private func makeCardRow(_ cards: [Card]) -> UIView {
+    let row = UIStackView()
+    row.axis = .horizontal
+    row.distribution = .fillEqually
+    row.spacing = 10
+    for card in cards {
+      let cardView = VibeToolsSheetCardView(card: card, appearance: appearance)
+      cardView.onTap = { [weak self] in self?.dismiss(animated: true) { card.action() } }
+      row.addArrangedSubview(cardView)
+    }
+    return row
+  }
+
+  private func makeSectionView(_ section: Section) -> UIView {
+    let wrapper = UIStackView()
+    wrapper.axis = .vertical
+    wrapper.spacing = 8
+
+    if let title = section.title, !title.isEmpty {
+      let label = UILabel()
+      label.text = title.uppercased()
+      label.font = .systemFont(ofSize: 12, weight: .semibold)
+      label.textColor = appearance.textSecondary.withAlphaComponent(0.7)
+      label.translatesAutoresizingMaskIntoConstraints = false
+      let inset = UIView()
+      inset.addSubview(label)
+      NSLayoutConstraint.activate([
+        label.topAnchor.constraint(equalTo: inset.topAnchor),
+        label.bottomAnchor.constraint(equalTo: inset.bottomAnchor),
+        label.leadingAnchor.constraint(equalTo: inset.leadingAnchor, constant: 6),
+        label.trailingAnchor.constraint(equalTo: inset.trailingAnchor),
+      ])
+      wrapper.addArrangedSubview(inset)
+    }
+
+    let card = UIView()
+    card.backgroundColor = appearance.surface
+    card.layer.cornerRadius = 16
+    card.clipsToBounds = true
+
+    let rowsStack = UIStackView()
+    rowsStack.axis = .vertical
+    rowsStack.spacing = 0
+    rowsStack.translatesAutoresizingMaskIntoConstraints = false
+    card.addSubview(rowsStack)
+    NSLayoutConstraint.activate([
+      rowsStack.topAnchor.constraint(equalTo: card.topAnchor),
+      rowsStack.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+      rowsStack.trailingAnchor.constraint(equalTo: card.trailingAnchor),
+      rowsStack.bottomAnchor.constraint(equalTo: card.bottomAnchor),
+    ])
+
+    for (index, row) in section.rows.enumerated() {
+      let rowView = VibeToolsSheetRowView(row: row, appearance: appearance)
+      rowView.onTap = { [weak self] in self?.handleRowTap(row) }
+      rowsStack.addArrangedSubview(rowView)
+      if index < section.rows.count - 1 {
+        rowsStack.addArrangedSubview(makeSeparator())
+      }
+    }
+
+    wrapper.addArrangedSubview(card)
+    return wrapper
+  }
+
+  private func makeSeparator() -> UIView {
+    let sep = UIView()
+    sep.backgroundColor = appearance.border.withAlphaComponent(0.5)
+    sep.translatesAutoresizingMaskIntoConstraints = false
+    let wrap = UIView()
+    wrap.addSubview(sep)
+    NSLayoutConstraint.activate([
+      sep.topAnchor.constraint(equalTo: wrap.topAnchor),
+      sep.bottomAnchor.constraint(equalTo: wrap.bottomAnchor),
+      sep.heightAnchor.constraint(equalToConstant: 0.5),
+      sep.leadingAnchor.constraint(equalTo: wrap.leadingAnchor, constant: 16),
+      sep.trailingAnchor.constraint(equalTo: wrap.trailingAnchor),
+    ])
+    return wrap
+  }
+
+  private func handleRowTap(_ row: Row) {
+    if case .toggle = row.trailing { return }  // driven by the switch
+    if row.keepsOpen {
+      row.action?()
+      rebuild()
+    } else {
+      dismiss(animated: true) { row.action?() }
+    }
+  }
+}
+
+/// One tappable list row inside `VibeAgentComposerToolsSheet`: leading icon, title (+
+/// optional subtitle), and a right-aligned accessory. A `UIControl` so it highlights on
+/// touch; a toggle's `UISwitch` sits outside the (non-interactive) content stack so it
+/// captures its own touches while the rest of the row still fires `onTap`.
+private final class VibeToolsSheetRowView: UIControl {
+  var onTap: (() -> Void)?
+  private let highlightBg: UIColor
+
+  init(row: VibeAgentComposerToolsSheet.Row, appearance: VibeAgentKitChatAppearance) {
+    highlightBg = appearance.text.withAlphaComponent(appearance.isDark ? 0.08 : 0.06)
+    super.init(frame: .zero)
+    heightAnchor.constraint(greaterThanOrEqualToConstant: 52).isActive = true
+
+    let hstack = UIStackView()
+    hstack.axis = .horizontal
+    hstack.alignment = .center
+    hstack.spacing = 12
+    hstack.isUserInteractionEnabled = false
+    hstack.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(hstack)
+
+    if let systemImage = row.systemImage {
+      let icon = UIImageView(
+        image: UIImage(
+          systemName: systemImage,
+          withConfiguration: UIImage.SymbolConfiguration(pointSize: 16, weight: .regular)))
+      icon.tintColor = row.tint ?? appearance.text.withAlphaComponent(0.85)
+      icon.contentMode = .scaleAspectFit
+      icon.setContentHuggingPriority(.required, for: .horizontal)
+      icon.widthAnchor.constraint(equalToConstant: 24).isActive = true
+      hstack.addArrangedSubview(icon)
+    }
+
+    let textStack = UIStackView()
+    textStack.axis = .vertical
+    textStack.spacing = 2
+    let titleLabel = UILabel()
+    titleLabel.text = row.title
+    titleLabel.font = .systemFont(ofSize: 16)
+    titleLabel.textColor = appearance.text
+    titleLabel.numberOfLines = 1
+    textStack.addArrangedSubview(titleLabel)
+    if let subtitle = row.subtitle, !subtitle.isEmpty {
+      let sub = UILabel()
+      sub.text = subtitle
+      sub.font = .systemFont(ofSize: 12.5)
+      sub.textColor = appearance.textSecondary
+      sub.numberOfLines = 1
+      textStack.addArrangedSubview(sub)
+    }
+    hstack.addArrangedSubview(textStack)
+
+    let spacer = UIView()
+    spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+    spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    hstack.addArrangedSubview(spacer)
+
+    var isToggle = false
+    var switchControl: UISwitch?
+    switch row.trailing {
+    case .none:
+      break
+    case .chevron:
+      hstack.addArrangedSubview(Self.makeChevron(appearance))
+    case .checkmark:
+      let check = UIImageView(
+        image: UIImage(
+          systemName: "checkmark",
+          withConfiguration: UIImage.SymbolConfiguration(pointSize: 14, weight: .semibold)))
+      check.tintColor = appearance.primary
+      check.setContentHuggingPriority(.required, for: .horizontal)
+      hstack.addArrangedSubview(check)
+    case .value(let text):
+      hstack.addArrangedSubview(Self.makeValueLabel(text, appearance))
+    case .valueChevron(let text):
+      hstack.addArrangedSubview(Self.makeValueLabel(text, appearance))
+      hstack.addArrangedSubview(Self.makeChevron(appearance))
+    case .toggle(let isOn, let onChange):
+      isToggle = true
+      let toggle = UISwitch()
+      toggle.isOn = isOn
+      toggle.onTintColor = appearance.primary
+      toggle.addAction(UIAction { _ in onChange(toggle.isOn) }, for: .valueChanged)
+      switchControl = toggle
+    }
+
+    let trailingInset: CGFloat
+    if let toggle = switchControl {
+      toggle.translatesAutoresizingMaskIntoConstraints = false
+      addSubview(toggle)
+      NSLayoutConstraint.activate([
+        toggle.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+        toggle.centerYAnchor.constraint(equalTo: centerYAnchor),
+      ])
+      trailingInset = 62
+    } else {
+      trailingInset = 16
+    }
+
+    NSLayoutConstraint.activate([
+      hstack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+      hstack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -trailingInset),
+      hstack.topAnchor.constraint(equalTo: topAnchor, constant: 11),
+      hstack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -11),
+    ])
+
+    if !isToggle {
+      addTarget(self, action: #selector(fire), for: .touchUpInside)
+    }
+  }
+
+  required init?(coder: NSCoder) { return nil }
+
+  override var isHighlighted: Bool {
+    didSet { backgroundColor = isHighlighted ? highlightBg : .clear }
+  }
+
+  @objc private func fire() { onTap?() }
+
+  private static func makeChevron(_ appearance: VibeAgentKitChatAppearance) -> UIImageView {
+    let chevron = UIImageView(
+      image: UIImage(
+        systemName: "chevron.right",
+        withConfiguration: UIImage.SymbolConfiguration(pointSize: 12, weight: .semibold)))
+    chevron.tintColor = appearance.textTertiary
+    chevron.setContentHuggingPriority(.required, for: .horizontal)
+    return chevron
+  }
+
+  private static func makeValueLabel(_ text: String, _ appearance: VibeAgentKitChatAppearance)
+    -> UILabel
+  {
+    let label = UILabel()
+    label.text = text
+    label.font = .systemFont(ofSize: 15)
+    label.textColor = appearance.textSecondary
+    label.setContentHuggingPriority(.required, for: .horizontal)
+    label.setContentCompressionResistancePriority(.required, for: .horizontal)
+    return label
+  }
+}
+
+/// One big attachment card at the top of the tools sheet (icon over label), matching the
+/// reference "Add to Chat" card row.
+private final class VibeToolsSheetCardView: UIControl {
+  var onTap: (() -> Void)?
+  private let highlightBg: UIColor
+  private let normalBg: UIColor
+
+  init(card: VibeAgentComposerToolsSheet.Card, appearance: VibeAgentKitChatAppearance) {
+    normalBg = appearance.surface
+    highlightBg = appearance.surfaceElevated
+    super.init(frame: .zero)
+    backgroundColor = normalBg
+    layer.cornerRadius = 16
+    heightAnchor.constraint(equalToConstant: 92).isActive = true
+
+    let icon = UIImageView(
+      image: UIImage(
+        systemName: card.systemImage,
+        withConfiguration: UIImage.SymbolConfiguration(pointSize: 22, weight: .regular)))
+    icon.tintColor = appearance.text.withAlphaComponent(0.9)
+    icon.contentMode = .scaleAspectFit
+
+    let label = UILabel()
+    label.text = card.title
+    label.font = .systemFont(ofSize: 15, weight: .medium)
+    label.textColor = appearance.text
+
+    let stack = UIStackView(arrangedSubviews: [icon, label])
+    stack.axis = .vertical
+    stack.alignment = .center
+    stack.spacing = 10
+    stack.isUserInteractionEnabled = false
+    stack.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(stack)
+    NSLayoutConstraint.activate([
+      stack.centerXAnchor.constraint(equalTo: centerXAnchor),
+      stack.centerYAnchor.constraint(equalTo: centerYAnchor),
+    ])
+
+    addTarget(self, action: #selector(fire), for: .touchUpInside)
+  }
+
+  required init?(coder: NSCoder) { return nil }
+
+  override var isHighlighted: Bool {
+    didSet { backgroundColor = isHighlighted ? highlightBg : normalBg }
+  }
+
+  @objc private func fire() { onTap?() }
 }
 
 // MARK: - Read-only subagent detail (Claude Task tool)

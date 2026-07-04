@@ -262,7 +262,7 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
       }
     }
     guard customContextMenuOverlay == nil else { return }
-    guard inputBar != nil else { return }
+    guard activeNativeInputView != nil else { return }
     _ = endEditing(true)
   }
 

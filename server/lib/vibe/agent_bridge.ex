@@ -445,6 +445,21 @@ defmodule Vibe.AgentBridge do
   end
 
   @doc """
+  Ask a user's connected bridge daemon for a structured usage snapshot (Claude
+  subscription 5h/7-day limits + this chat's last-run tokens). The daemon replies
+  with a `usage_result` over the bridge channel, relayed back to the requesting
+  phone as `agent-bridge-usage`.
+  """
+  def dispatch_usage(user_id, payload) when is_binary(user_id) and is_map(payload) do
+    if online?(user_id) do
+      VibeWeb.Endpoint.broadcast(topic(user_id), "usage_request", payload)
+      :ok
+    else
+      {:error, :offline}
+    end
+  end
+
+  @doc """
   Relay the phone's answer to a bridge-issued `ask_request` (plan approval or a
   mid-run question) back to the user's connected bridge daemon. The `answerEnc`
   blob is sealed with the pairing runtime key — the server never reads it.

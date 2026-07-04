@@ -224,6 +224,7 @@ public final class ChatMainView: UIView,
   private var groupMemberCount: Int?
   private var groupTypingUserIds: [String] = []
   private var directPeerTypingActive = false
+  private var hasPeerResponseInCurrentRows = false
   private var agentProgressSubtitle: String?
   private var agentAwaitingApproval = false
   private var defersEngineStateRefreshes = false
@@ -378,6 +379,13 @@ public final class ChatMainView: UIView,
 
   func setRows(_ rows: [[String: Any]]) {
     chatListView.setRows(rows)
+    let nextHasPeerResponse = Self.rowsContainPeerResponse(rows, peerUserId: enginePeerUserId)
+    if nextHasPeerResponse != hasPeerResponseInCurrentRows {
+      hasPeerResponseInCurrentRows = nextHasPeerResponse
+      applyTheme()
+      updateHeaderTexts()
+      updateProfileTexts()
+    }
   }
 
   func setEngineSurfaceId(_ value: String) {
@@ -397,10 +405,12 @@ public final class ChatMainView: UIView,
     guard !defersEngineStateRefreshes else {
       updateHeaderTexts()
       updateProfileTexts()
+      updateAvatarViews()
       return
     }
     scheduleEngineStateRefresh(force: true, reason: "setEngineChatId")
     fetchAgentConfigForCurrentChat()
+    updateAvatarViews()
   }
 
   func setEngineMyUserId(_ value: String) {
@@ -411,6 +421,7 @@ public final class ChatMainView: UIView,
     enginePeerUserIdRaw = value.trimmingCharacters(in: .whitespacesAndNewlines)
     enginePeerUserId = enginePeerUserIdRaw.uppercased()
     surfacePresenceOnline = nil
+    hasPeerResponseInCurrentRows = false
     chatListView.setEnginePeerUserId(value)
     if enginePeerUserId.isEmpty {
       engineLastSeenTimestampMs = nil
@@ -692,6 +703,7 @@ public final class ChatMainView: UIView,
     }
     updateHeaderTexts()
     updateProfileTexts()
+    updateAvatarViews()
   }
 
   func setHeaderUnreadCount(_ value: Int) {
@@ -1035,7 +1047,7 @@ public final class ChatMainView: UIView,
     backButton.titleLabel?.lineBreakMode = .byClipping
     updateBackButtonContent()
     backButton.addTarget(self, action: #selector(handleBackPressed), for: .touchUpInside)
-    titleButton.addTarget(self, action: #selector(handleAvatarPressed), for: .touchUpInside)
+    titleButton.addTarget(self, action: #selector(handleTitlePressed), for: .touchUpInside)
     menuButton.setImage(UIImage(systemName: "ellipsis"), for: .normal)
     menuButton.addTarget(self, action: #selector(handleMenuPressed), for: .touchUpInside)
     menuButton.isHidden = true
@@ -2795,29 +2807,41 @@ public final class ChatMainView: UIView,
       headerMaskView.isHidden = true
       profileHeaderMaskView.isHidden = true
 
+      // Liquid Glass samples/tints itself from whatever's rendered behind or inside it —
+      // the title glass in particular was picking up a blue cast once the subtitle started
+      // carrying colored (green/red) live-agent text and an animated shimmer mask. Pin
+      // every header glass effect's tint explicitly so the chrome always reads as neutral,
+      // regardless of what content sits on top of it.
       let backEffect = UIGlassEffect()
       backEffect.isInteractive = true
+      backEffect.tintColor = .clear
       backGlassView.effect = backEffect
 
       let titleEffect = UIGlassEffect()
       titleEffect.isInteractive = true
+      titleEffect.tintColor = .clear
       titleGlassView.effect = titleEffect
 
       let avatarEffect = UIGlassEffect()
       avatarEffect.isInteractive = true
+      avatarEffect.tintColor = .clear
       avatarGlassView.effect = avatarEffect
 
       let menuEffect = UIGlassEffect()
       menuEffect.isInteractive = true
+      menuEffect.tintColor = .clear
       menuGlassView.effect = menuEffect
       let searchCancelEffect = UIGlassEffect()
       searchCancelEffect.isInteractive = true
+      searchCancelEffect.tintColor = .clear
       savedSearchCancelGlassView.effect = searchCancelEffect
       let profileBackEffect = UIGlassEffect()
       profileBackEffect.isInteractive = true
+      profileBackEffect.tintColor = .clear
       profileBackGlassView.effect = profileBackEffect
       let profileMenuEffect = UIGlassEffect()
       profileMenuEffect.isInteractive = true
+      profileMenuEffect.tintColor = .clear
       profileMenuGlassView.effect = profileMenuEffect
     } else {
       backGlassView.effect = UIBlurEffect(style: .systemMaterial)
@@ -2853,7 +2877,7 @@ public final class ChatMainView: UIView,
   }
 
   private func layoutChrome() {
-    let safeTop = safeAreaInsets.top
+    let safeTop = window?.safeAreaInsets.top ?? safeAreaInsets.top
     let headerHeight = safeTop + 60.0
     let contentY = safeTop + 8.0
     let headerContentWidth = max(0.0, bounds.width - 24.0)
@@ -2960,12 +2984,11 @@ public final class ChatMainView: UIView,
           max(140.0, requestedHeaderWidth + 32.0),
           max(140.0, headerContentView.bounds.width - 48.0)
         )
-      } else if usesBridgeHeaderLayout {
-        centerWidth = min(
-          172.0,
-          max(108.0, min(requestedHeaderWidth + 36.0, headerContentView.bounds.width * 0.48))
-        )
       } else {
+        // Bridge (Claude/Codex) chats used to hug their content width here, which read
+        // noticeably narrower than every other chat's header pill. Size it exactly like the
+        // default header — fill the available space up to maxCenterWidth — so agent chats
+        // don't stand out as smaller.
         centerWidth = min(
           maxCenterWidth,
           max(120.0, headerContentView.bounds.width - (centerSideInset * 2.0))
@@ -3032,6 +3055,10 @@ public final class ChatMainView: UIView,
         ? titleButton.bounds.insetBy(dx: 12.0, dy: 0.0)
         : titleButton.bounds.insetBy(dx: 12.0, dy: 4.0)
       chatHeaderStack.frame = titleBounds
+      if subtitleShimmerActive {
+        chatHeaderStack.layoutIfNeeded()
+        applySubtitleShimmerFrame()
+      }
       applyHeaderSearchPresentation()
     }
 
@@ -3175,7 +3202,7 @@ public final class ChatMainView: UIView,
   }
 
   private func layoutPages() {
-    let safeTop = safeAreaInsets.top
+    let safeTop = window?.safeAreaInsets.top ?? safeAreaInsets.top
     let headerHeight =
       externalNavigationHeaderEnabled && !savedSearchExpanded
       ? 0.0
@@ -3260,7 +3287,7 @@ public final class ChatMainView: UIView,
 
   private func layoutProfileContent() {
     let width = max(1.0, profileScrollView.bounds.width)
-    let headerHeight = safeAreaInsets.top + 60.0
+    let headerHeight = (window?.safeAreaInsets.top ?? safeAreaInsets.top) + 60.0
     let sideInset: CGFloat = 16.0
     let textInset: CGFloat = 24.0
 
@@ -3405,7 +3432,7 @@ public final class ChatMainView: UIView,
 
   private func layoutProfileMembersContent() {
     profileMembersNode.frame = profilePage.bounds
-    profileMembersNode.setTopInset(safeAreaInsets.top)
+    profileMembersNode.setTopInset(window?.safeAreaInsets.top ?? safeAreaInsets.top)
     syncProfileMembersLayoutState()
   }
 
@@ -3499,8 +3526,10 @@ public final class ChatMainView: UIView,
     applyProfileWallpaperAppearance()
     profileAvatarView.backgroundColor = profileCardBg
     profileAvatarFallbackIconView.tintColor = text
+    let showsProfilePresence = shouldShowDirectPresence()
+    profileOnlineDotView.isHidden = !showsProfilePresence
     profileOnlineDotView.backgroundColor =
-      isOnline
+      showsProfilePresence && isOnline
       ? UIColor(red: 83.0 / 255.0, green: 224.0 / 255.0, blue: 138.0 / 255.0, alpha: 1.0)
       : appearance.timeColorThem.withAlphaComponent(0.32)
     profileOnlineDotView.layer.borderColor = profileBackground.cgColor
@@ -3508,7 +3537,7 @@ public final class ChatMainView: UIView,
     profileNameLabel.textColor = bridgeProvider.isEmpty ? text : profileGoldColor
     if !bridgeProvider.isEmpty {
       profileHandleLabel.textColor = profileGoldColor.withAlphaComponent(0.92)
-    } else if isOnline {
+    } else if showsProfilePresence && isOnline {
       profileHandleLabel.textColor =
         UIColor(red: 83.0 / 255.0, green: 224.0 / 255.0, blue: 138.0 / 255.0, alpha: 1.0)
     } else {
@@ -3632,7 +3661,12 @@ public final class ChatMainView: UIView,
     let resolvedApproval =
       (!bridgeProvider.isEmpty && agentAwaitingApproval) ? "Waiting for approval" : nil
     let resolvedAgentProgress = resolvedAgentProgressSubtitle()
-    let bridgeSubtitle = resolvedBridgeRepositorySubtitle()
+    // Idle bridge chats get a constant "Start session" action instead of the old
+    // device-name subtitle. It doubles as the entry point into the same history sheet the
+    // live/approval states open on tap (see handleTitlePressed) — there's no separate
+    // "device connected" read anymore, the leading dot already carries that as a color.
+    let bridgeIdleAction: String? =
+      (!bridgeProvider.isEmpty && headerMode != .savedMessages) ? "Start session" : nil
     let resolvedDirectTyping = resolvedDirectTypingSubtitle()
     let groupTypingSubtitle = resolvedGroupTypingSubtitle()
     let connectionSubtitle = defersEngineStateRefreshes ? nil : resolvedEngineConnectionSubtitle()
@@ -3646,8 +3680,8 @@ public final class ChatMainView: UIView,
       resolvedSubtitle = resolvedApproval
     } else if let resolvedAgentProgress {
       resolvedSubtitle = resolvedAgentProgress
-    } else if let bridgeSubtitle {
-      resolvedSubtitle = bridgeSubtitle
+    } else if let bridgeIdleAction {
+      resolvedSubtitle = bridgeIdleAction
     } else if let resolvedDirectTyping {
       resolvedSubtitle = resolvedDirectTyping
     } else if let groupTypingSubtitle {
@@ -3656,7 +3690,7 @@ public final class ChatMainView: UIView,
       resolvedSubtitle = connectionSubtitle
     } else if let engineSubtitle {
       resolvedSubtitle = engineSubtitle
-    } else if isOnline
+    } else if isOnline && shouldShowDirectPresence()
       && (trimmedSubtitle.isEmpty || subtitleLower.hasPrefix("last seen")
         || subtitleLower == "offline")
     {
@@ -3669,11 +3703,12 @@ public final class ChatMainView: UIView,
     chatSubtitleLabel.text = resolvedSubtitle
     chatSubtitleLabel.isHidden = resolvedSubtitle.isEmpty
 
-    // Bridge (agent) chats get a small leading dot: pulsing while Claude/Codex is
-    // actively doing something or blocked on approval, solid green/red for a plain idle
-    // "device connected" read. Everything here is a friendly state, never the raw
-    // tool/command payload the bridge streams internally.
-    let isLiveAgentState = resolvedApproval != nil || resolvedAgentProgress != nil
+    // Bridge (agent) chats get a small leading dot: solid green/red for connected state,
+    // breathing while blocked on an approval (a static state that needs the user). Live
+    // agent progress instead shimmers the subtitle text itself (see
+    // setSubtitleTextShimmering) so the dot stays a steady "still connected" read.
+    // Everything here is a friendly state, never the raw tool/command payload the bridge
+    // streams internally.
     let showsBridgeDot = !bridgeProvider.isEmpty && !resolvedSubtitle.isEmpty
     chatSubtitleDotView.isHidden = !showsBridgeDot
     if showsBridgeDot {
@@ -3686,10 +3721,11 @@ public final class ChatMainView: UIView,
         dotColor = UIColor(red: 1.0, green: 0.27, blue: 0.27, alpha: 1.0)
       }
       chatSubtitleDotView.backgroundColor = dotColor
-      setSubtitleDotPulsing(isLiveAgentState)
+      setSubtitleDotPulsing(resolvedApproval != nil)
     } else {
       setSubtitleDotPulsing(false)
     }
+    setSubtitleTextShimmering(resolvedAgentProgress != nil)
 
     chatHeaderStack.spacing = resolvedSubtitle.isEmpty ? 0.0 : -1.0
     profileTitleLabel.text = profileNameText.isEmpty ? resolvedTitle : profileNameText
@@ -3704,12 +3740,22 @@ public final class ChatMainView: UIView,
         if resolvedApproval != nil {
           return UIColor(red: 1.0, green: 0.62, blue: 0.04, alpha: 1.0)
         }
-        if resolvedAgentProgress != nil
-          || resolvedDirectTyping != nil
+        // Red/green is reserved for an actually-live session (progress streaming in) —
+        // the idle "Start session" label and everything else below stays plain text, no
+        // status color, so green doesn't leak onto a state that isn't live.
+        if resolvedAgentProgress != nil {
+          return AgentPairingService.lastConnected
+            ? UIColor(red: 83.0 / 255.0, green: 224.0 / 255.0, blue: 138.0 / 255.0, alpha: 1.0)
+            : UIColor(red: 1.0, green: 0.27, blue: 0.27, alpha: 1.0)
+        }
+        if resolvedDirectTyping != nil
           || groupTypingSubtitle != nil
-          || (connectionSubtitle == nil && isOnline)
+          || (connectionSubtitle == nil && bridgeIdleAction == nil && isOnline && shouldShowDirectPresence())
         {
           return UIColor(red: 83.0 / 255.0, green: 224.0 / 255.0, blue: 138.0 / 255.0, alpha: 1.0)
+        }
+        if bridgeIdleAction != nil, resolvedSubtitle == bridgeIdleAction {
+          return appearance.timeColorThem.withAlphaComponent(0.85)
         }
         if connectionSubtitle != nil {
           return appearance.textColorThem.withAlphaComponent(0.9)
@@ -3737,18 +3783,56 @@ public final class ChatMainView: UIView,
     chatSubtitleDotView.layer.add(animation, forKey: "pulse")
   }
 
-  private func resolvedBridgeRepositorySubtitle() -> String? {
-    guard !bridgeProvider.isEmpty else { return nil }
-    // The header shows the connected computer when nothing more specific (progress /
-    // approval) is happening. Fall back to the repo name only if no device is known, and
-    // to nil (so connection/presence subtitles can show) when neither exists.
-    if let device = AgentPairingService.lastDeviceLabel, !device.isEmpty {
-      return device
+  /// Whether the subtitle should be shimmering — the actual mask/animation is (re)applied
+  /// from `layoutChrome()` against the label's real post-layout bounds, same as
+  /// `subtitleShimmerActive` drives `applySubtitleShimmerFrame()`.
+  private var subtitleShimmerActive = false
+
+  /// Sweeps a gradient mask across the subtitle label while live agent progress is showing
+  /// ("Thinking…" etc.) — the exact same shimmer the chat list uses for the "thinking" /
+  /// `agent_progress_tree` typing row (see the `messageLabel.layer.mask` block in
+  /// `ChatListCell` in ChatListViewCells.swift), just retargeted at this label.
+  private func setSubtitleTextShimmering(_ shimmering: Bool) {
+    subtitleShimmerActive = shimmering
+    guard shimmering else {
+      chatSubtitleLabel.layer.mask = nil
+      return
     }
-    let repositoryName =
-      AgentBridgeSelectionStore.selectedRepository()?.name
-        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    return repositoryName.isEmpty ? nil : repositoryName
+    if !(chatSubtitleLabel.layer.mask is CAGradientLayer) {
+      let gradientLayer = CAGradientLayer()
+      gradientLayer.colors = [
+        UIColor.white.withAlphaComponent(0.35).cgColor,
+        UIColor.white.withAlphaComponent(1.0).cgColor,
+        UIColor.white.withAlphaComponent(0.35).cgColor,
+      ]
+      gradientLayer.locations = [0.0, 0.5, 1.0]
+      gradientLayer.startPoint = CGPoint(x: 0.0, y: 0.5)
+      gradientLayer.endPoint = CGPoint(x: 1.0, y: 0.5)
+      chatSubtitleLabel.layer.mask = gradientLayer
+    }
+    applySubtitleShimmerFrame()
+  }
+
+  /// Re-syncs the shimmer mask to the label's current bounds — must run after
+  /// `chatHeaderStack` has actually laid out (bounds are wrong/zero right after just setting
+  /// text, which is why the old intrinsicContentSize-based sizing produced a broken/invisible
+  /// shimmer). Called from `layoutChrome()` every layout pass, matching how the chat list
+  /// re-applies its shimmer frame on every cell layout rather than once.
+  private func applySubtitleShimmerFrame() {
+    guard subtitleShimmerActive,
+      let mask = chatSubtitleLabel.layer.mask as? CAGradientLayer,
+      chatSubtitleLabel.bounds.width > 0
+    else { return }
+    mask.frame = CGRect(
+      x: -chatSubtitleLabel.bounds.width * 2, y: 0,
+      width: chatSubtitleLabel.bounds.width * 5, height: chatSubtitleLabel.bounds.height)
+    let animation = CABasicAnimation(keyPath: "transform.translation.x")
+    animation.fromValue = -chatSubtitleLabel.bounds.width * 2
+    animation.toValue = chatSubtitleLabel.bounds.width * 2
+    animation.duration = 1.5
+    animation.repeatCount = .infinity
+    animation.isRemovedOnCompletion = false
+    mask.add(animation, forKey: "shimmerTranslation")
   }
 
   private func updateBackButtonContent() {
@@ -3778,7 +3862,10 @@ public final class ChatMainView: UIView,
       }()
       profileHandleLabel.text = profileHandleText.isEmpty ? fallbackGroupHandle : profileHandleText
     } else {
-      let fallbackHandle = resolvedEnginePresenceSubtitle() ?? (isOnline ? "online" : "offline")
+      let fallbackHandle =
+        shouldShowDirectPresence()
+        ? (resolvedEnginePresenceSubtitle() ?? (isOnline ? "online" : "offline"))
+        : ""
       profileHandleLabel.text =
         profileHandleText.isEmpty ? fallbackHandle : profileHandleText
     }
@@ -3959,15 +4046,66 @@ public final class ChatMainView: UIView,
     return "\(totalCount) members: \(shown.joined(separator: ", "))\(suffix)"
   }
 
+  private func shouldShowDirectPresence() -> Bool {
+    headerMode != .savedMessages
+      && bridgeProvider.isEmpty
+      && !isGroupOrChannel
+      && !enginePeerUserId.isEmpty
+      && hasPeerResponseInCurrentRows
+  }
+
+  private static func rowsContainPeerResponse(
+    _ rows: [[String: Any]],
+    peerUserId: String
+  ) -> Bool {
+    let normalizedPeer = peerUserId.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+    guard !normalizedPeer.isEmpty else { return false }
+    return rows.contains { row in
+      let message = (row["message"] as? [String: Any]) ?? row
+      if boolValue(message["isMe"]) == false {
+        return true
+      }
+      let fromId = normalizedString(message["fromId"] ?? message["from_id"])?.uppercased()
+      return fromId == normalizedPeer
+    }
+  }
+
+  private static func normalizedString(_ value: Any?) -> String? {
+    if let value = value as? String {
+      let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+      return trimmed.isEmpty ? nil : trimmed
+    }
+    if let value = value as? NSNumber {
+      return value.stringValue
+    }
+    return nil
+  }
+
+  private static func boolValue(_ value: Any?) -> Bool? {
+    if let value = value as? Bool { return value }
+    if let value = value as? NSNumber { return value.boolValue }
+    if let value = value as? String {
+      switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+      case "1", "true", "yes", "on":
+        return true
+      case "0", "false", "no", "off":
+        return false
+      default:
+        return nil
+      }
+    }
+    return nil
+  }
+
   private func resolvedEnginePresenceSubtitle() -> String? {
-    guard !enginePeerUserId.isEmpty else { return nil }
+    guard shouldShowDirectPresence() else { return nil }
     if isOnline { return "online" }
     guard let lastSeen = engineLastSeenTimestampMs else { return "last seen recently" }
     return formatLastSeenSubtitle(lastSeen)
   }
 
   private func resolvedEngineConnectionSubtitle() -> String? {
-    guard !enginePeerUserId.isEmpty else { return nil }
+    guard shouldShowDirectPresence() else { return nil }
     if isOnline { return nil }
 
     let status = ChatEngine.shared.getStatus()
@@ -4480,6 +4618,24 @@ public final class ChatMainView: UIView,
     guard headerMode != .savedMessages else { return }
     guard currentPage == .chat else { return }
     onNativeEvent(["type": "headerAvatarPressed"])
+  }
+
+  /// Bridge chats repurpose the title/subtitle tap: instead of opening the profile (still
+  /// reachable via the avatar), it opens the session history sheet — live task or a picked
+  /// past session, or just a place to land when the header reads "Start session". Non-agent
+  /// chats keep the old behavior of the title opening the profile like the avatar does.
+  @objc private func handleTitlePressed() {
+    if selectionModeActive {
+      chatListView.clearMessageSelection()
+      return
+    }
+    guard headerMode != .savedMessages else { return }
+    guard currentPage == .chat else { return }
+    if !bridgeProvider.isEmpty {
+      onNativeEvent(["type": "agentSessionPressed", "provider": bridgeProvider])
+    } else {
+      onNativeEvent(["type": "headerAvatarPressed"])
+    }
   }
 
   @objc private func handleMenuPressed() {

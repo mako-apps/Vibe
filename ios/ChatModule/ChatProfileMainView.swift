@@ -3513,6 +3513,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   )
   private var swiftUIScrollOffset: CGFloat = 0.0
   private var swiftUINavigationActive = false
+  private var swiftUIRenderBatchDepth = 0
+  private var needsBatchedSwiftUIRender = false
   private static let listDateFormatter: DateFormatter = {
     let formatter = DateFormatter()
     formatter.dateStyle = .medium
@@ -3652,6 +3654,15 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
 
   func setEngineSurfaceId(_ value: String) {
     _ = value
+  }
+
+  func performBatchedProfileUpdate(_ updates: () -> Void) {
+    swiftUIRenderBatchDepth += 1
+    updates()
+    swiftUIRenderBatchDepth -= 1
+    guard swiftUIRenderBatchDepth == 0, needsBatchedSwiftUIRender else { return }
+    needsBatchedSwiftUIRender = false
+    renderSwiftUIProfile()
   }
 
   func setEngineChatId(_ value: String) {
@@ -3987,6 +3998,11 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   }
 
   private func renderSwiftUIProfile() {
+    guard swiftUIRenderBatchDepth == 0 else {
+      needsBatchedSwiftUIRender = true
+      return
+    }
+
     let resolvedName =
       profileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
       ? (headerTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "User" : headerTitle)
@@ -4312,10 +4328,17 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     [muteActionButton, searchActionButton, audioActionButton, videoActionButton].forEach { button in
       button.translatesAutoresizingMaskIntoConstraints = false
       actionsStack.addArrangedSubview(button)
-      NSLayoutConstraint.activate([
-        button.widthAnchor.constraint(equalToConstant: 68.0),
-        button.heightAnchor.constraint(equalToConstant: 70.0),
-      ])
+      // Priority 999 (not required): this stack lives in a tableHeaderView, which
+      // AutoLayout sizes to 0×0 for a transient pass before the header gets its real
+      // width. At width 0, four REQUIRED 68pt buttons + spacing + margins are
+      // unsatisfiable → the "Unable to simultaneously satisfy constraints" storm. At
+      // 999 AutoLayout can momentarily collapse them for that pass, then restore the
+      // exact 68×70 once the header has a real width — same final layout, no console spam.
+      let widthConstraint = button.widthAnchor.constraint(equalToConstant: 68.0)
+      let heightConstraint = button.heightAnchor.constraint(equalToConstant: 70.0)
+      widthConstraint.priority = .defaultHigh + 1
+      heightConstraint.priority = .defaultHigh + 1
+      NSLayoutConstraint.activate([widthConstraint, heightConstraint])
     }
 
     tableView.tableHeaderView = heroHeaderView

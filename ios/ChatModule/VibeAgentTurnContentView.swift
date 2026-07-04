@@ -87,7 +87,8 @@ final class VibeAgentTurnContentView: UIView {
     isProgressExpanded: Bool = false,
     isRuntimeExpanded: Bool = false,
     expandedStepIds: Set<String> = [],
-    streamingStartDate: Date? = nil
+    streamingStartDate: Date? = nil,
+    showsLoaderView: Bool = true
   ) {
     bodyView.configure(
       text: text,
@@ -104,7 +105,8 @@ final class VibeAgentTurnContentView: UIView {
       isProgressExpanded: isProgressExpanded,
       isRuntimeExpanded: isRuntimeExpanded,
       expandedStepIds: expandedStepIds,
-      streamingStartDate: streamingStartDate
+      streamingStartDate: streamingStartDate,
+      showsLoaderView: showsLoaderView
     )
   }
 
@@ -119,7 +121,8 @@ final class VibeAgentTurnContentView: UIView {
     isRuntimeExpanded: Bool,
     expandedStepIds: Set<String>,
     streamingStartDate: Date?,
-    onLoaderTap: (() -> Void)?
+    onLoaderTap: (() -> Void)?,
+    showsLoaderView: Bool = true
   ) {
     let message = VibeAgentKitMap.chatMessage(from: row)
     var displayText = resoloAssistantDisplayText(for: message)
@@ -160,7 +163,8 @@ final class VibeAgentTurnContentView: UIView {
       isProgressExpanded: isProgressExpanded,
       isRuntimeExpanded: isRuntimeExpanded,
       expandedStepIds: expandedStepIds,
-      streamingStartDate: streamingStartDate
+      streamingStartDate: streamingStartDate,
+      showsLoaderView: showsLoaderView
     )
   }
 }
@@ -189,7 +193,8 @@ extension VibeAgentTurnContentView {
     isProgressExpanded: Bool,
     isRuntimeExpanded: Bool,
     expandedStepIds: Set<String>,
-    streamingStartDate: Date?
+    streamingStartDate: Date?,
+    showsLoaderView: Bool = true
   ) -> CGFloat {
     let template = sizingTemplate
     // CRITICAL: clear any block / feed / loader views left over from measuring a
@@ -216,7 +221,8 @@ extension VibeAgentTurnContentView {
       isRuntimeExpanded: isRuntimeExpanded,
       expandedStepIds: expandedStepIds,
       streamingStartDate: streamingStartDate,
-      onLoaderTap: nil
+      onLoaderTap: nil,
+      showsLoaderView: showsLoaderView
     )
     // Force a layout pass so intrinsic-size-driven subviews (e.g. the loader, which
     // relies on `intrinsicContentSize`/`sizeThatFits` rather than an explicit height

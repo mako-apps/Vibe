@@ -2,6 +2,13 @@ import AVFoundation
 import SwiftUI
 import UIKit
 
+enum AgentQRScannerStatusStyle: Equatable {
+  case idle
+  case progress
+  case success
+  case error
+}
+
 /// Drives the "connect your computer" flow shown inside a Claude/Codex chat while
 /// no paired computer is online. The desktop daemon shows a QR; the phone scans it
 /// and authorizes the pairing, then waits for the computer to come online.
@@ -16,8 +23,11 @@ final class AgentConnectModel: ObservableObject {
   @Published var isScanning = false
   @Published var isAuthorizing = false
   @Published var didAuthorize = false
-  @Published var didSyncRuntimeKey = false
   @Published var errorMessage: String?
+  @Published var scannerMessage: String?
+  @Published var scannerStatusStyle: AgentQRScannerStatusStyle = .idle
+  @Published var scannerCanRetry = false
+  @Published var scannerResetToken = 0
   @Published var selectedRepository: AgentBridgeRepository?
 
   /// Invoked once a computer comes online so the host can reveal the input bar.
@@ -63,6 +73,7 @@ final class AgentConnectModel: ObservableObject {
       status = next
       selectedRepository = AgentBridgeSelectionStore.ensureValidSelection(from: next.repositories)
       if next.connected {
+        isScanning = false
         stopPolling()
         onConnected?()
       }
@@ -78,6 +89,11 @@ final class AgentConnectModel: ObservableObject {
 
   func beginScan() {
     errorMessage = nil
+    didAuthorize = false
+    scannerMessage = nil
+    scannerStatusStyle = .idle
+    scannerCanRetry = false
+    scannerResetToken += 1
     isScanning = true
   }
 
@@ -85,46 +101,95 @@ final class AgentConnectModel: ObservableObject {
     isScanning = false
   }
 
+  func retryScan() {
+    errorMessage = nil
+    didAuthorize = false
+    isAuthorizing = false
+    scannerMessage = nil
+    scannerStatusStyle = .idle
+    scannerCanRetry = false
+    scannerResetToken += 1
+  }
+
   /// A QR was scanned. Parse the pairing request and authorize it against this
   /// (authenticated) account, binding the computer to the user.
   func handleScanned(_ payload: String) {
-    isScanning = false
-    // A dedicated key-sync QR (`vibegram-rk:…`) only hands over the E2E runtime
-    // key for an already-paired computer — store it, no authorize needed.
+    // A dedicated key-sync QR (`vibegram-rk:...`) only hands over the E2E runtime
+    // key for an already-paired computer. Keep the result inside the scanner so
+    // the compact connect sheet never grows/clips around long status text.
     let trimmed = payload.trimmingCharacters(in: .whitespacesAndNewlines)
     if trimmed.hasPrefix("vibegram-rk:"),
       let key = AgentRuntimeCrypto.runtimeKey(fromScanned: payload)
     {
       if AgentRuntimeCrypto.storeKey(key) {
-        errorMessage = nil
-        didSyncRuntimeKey = true
+        showScannerMessage(
+          "Encryption key synced. This QR only syncs encrypted file changes; scan the pairing QR too if this computer is still offline.",
+          style: .success,
+          canRetry: true
+        )
       } else {
-        errorMessage = "That key QR couldn't be read. Re-run the bridge with --show-key."
+        showScannerMessage("That key QR could not be read. Show a fresh key QR and scan again.", style: .error)
       }
       return
     }
     guard let requestId = AgentPairingService.requestId(fromScanned: payload) else {
-      errorMessage =
-        "That isn't a Vibe pairing code. On your computer run the bridge and scan the QR it shows."
+      showScannerMessage("That is not a Vibe pairing QR. Show the bridge pairing QR and scan again.", style: .error)
       return
     }
-    guard let config = AppSessionConfig.current else {
-      errorMessage = AgentPairingError.noSession.localizedDescription
+    guard AppSessionConfig.current != nil else {
+      showScannerMessage(AgentPairingError.noSession.localizedDescription, style: .error, canRetry: false)
       return
     }
     isAuthorizing = true
-    errorMessage = nil
+    showScannerMessage("Authorizing this computer...", style: .progress, canRetry: false)
     Task { [weak self] in
       guard let self else { return }
       defer { self.isAuthorizing = false }
       do {
-        try await AgentPairingService.authorize(config: config, requestId: requestId)
+        try await self.authorizeWithCurrentSession(requestId: requestId)
         self.didAuthorize = true
+        self.showScannerMessage(
+          "Authorized. Waiting for your computer to come online...",
+          style: .success,
+          canRetry: false
+        )
+        await self.refreshStatusOnce()
         self.startPolling()
       } catch {
-        self.errorMessage = error.localizedDescription
+        self.didAuthorize = false
+        self.showScannerMessage(error.localizedDescription, style: .error)
       }
     }
+  }
+
+  private func authorizeWithCurrentSession(requestId: String) async throws {
+    guard let config = AppSessionConfig.current else {
+      throw AgentPairingError.noSession
+    }
+    do {
+      try await AgentPairingService.authorize(config: config, requestId: requestId)
+    } catch let pairingError as AgentPairingError {
+      if case .http(401, _) = pairingError {
+        await AppSessionGuard.shared.recover(reason: "agent-connect-authorize")
+        if let refreshed = AppSessionConfig.current,
+          refreshed.authToken != config.authToken || refreshed.userID != config.userID
+        {
+          try await AgentPairingService.authorize(config: refreshed, requestId: requestId)
+          return
+        }
+      }
+      throw pairingError
+    }
+  }
+
+  private func showScannerMessage(
+    _ message: String,
+    style: AgentQRScannerStatusStyle,
+    canRetry: Bool? = nil
+  ) {
+    scannerMessage = message
+    scannerStatusStyle = style
+    scannerCanRetry = canRetry ?? (style == .error)
   }
 }
 
@@ -134,6 +199,11 @@ struct AgentConnectPanel: View {
   @Environment(\.colorScheme) private var colorScheme
 
   private var palette: AppThemePalette { AppThemePalette.resolve(for: colorScheme) }
+  private var scanButtonTitle: String {
+    if model.didAuthorize { return "Waiting for computer…" }
+    if model.isAuthorizing { return "Connecting…" }
+    return "Scan to connect"
+  }
 
   var body: some View {
     UIGlassWrapper(cornerRadius: 20) {
@@ -171,57 +241,35 @@ struct AgentConnectPanel: View {
         Spacer(minLength: 0)
       }
 
-      if model.didAuthorize {
-        UIGlassWrapper(cornerRadius: 12) {
-          HStack(spacing: 10) {
-            ProgressView().controlSize(.small)
-            Text("Auth is done — waiting for your computer…")
-              .font(.system(size: 13, weight: .medium))
-              .foregroundStyle(palette.text)
-            Spacer(minLength: 0)
-          }
-          .padding(12)
-          .frame(maxWidth: .infinity)
-        }
-        .fixedSize(horizontal: false, vertical: true)
-      } else {
-        Text(
-          "On your computer run the bridge — it shows a QR. Scan it here to connect."
-        )
-        .font(.system(size: 11.5))
-        .foregroundStyle(palette.secondaryText)
-        .frame(maxWidth: .infinity, alignment: .leading)
+      Text(
+        "On your computer run the bridge — it shows a QR. Scan it here to connect."
+      )
+      .font(.system(size: 11.5))
+      .foregroundStyle(palette.secondaryText)
+      .frame(maxWidth: .infinity, alignment: .leading)
 
-        Button(action: { model.beginScan() }) {
-          HStack(spacing: 8) {
-            if model.isAuthorizing {
-              ProgressView().tint(.white)
-            } else {
-              Image(systemName: "qrcode.viewfinder")
-            }
-            Text(model.isAuthorizing ? "Connecting…" : "Scan to connect")
-              .font(.system(size: 16, weight: .semibold))
+      Button(action: { model.beginScan() }) {
+        HStack(spacing: 8) {
+          if model.isAuthorizing || model.didAuthorize {
+            ProgressView().tint(.white)
+          } else {
+            Image(systemName: "qrcode.viewfinder")
           }
-          .frame(maxWidth: .infinity)
-          .frame(height: 48)
-          .foregroundStyle(.white)
-          .background(palette.accent)
-          .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+          Text(scanButtonTitle)
+            .font(.system(size: 16, weight: .semibold))
         }
-        .disabled(model.isAuthorizing)
+        .frame(maxWidth: .infinity)
+        .frame(height: 48)
+        .foregroundStyle(.white)
+        .background(palette.accent)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
       }
+      .disabled(model.isAuthorizing || model.didAuthorize)
 
       if let errorMessage = model.errorMessage {
         Text(errorMessage)
           .font(.system(size: 12))
           .foregroundStyle(.red)
-          .frame(maxWidth: .infinity, alignment: .leading)
-      }
-
-      if model.didSyncRuntimeKey {
-        Text("Encryption key synced — agent file-changes will now show on this phone.")
-          .font(.system(size: 12))
-          .foregroundStyle(.green)
           .frame(maxWidth: .infinity, alignment: .leading)
       }
 
@@ -239,7 +287,13 @@ struct AgentConnectPanel: View {
     .fullScreenCover(isPresented: $model.isScanning) {
       AgentQRScannerView(
         instruction: "Scan the QR shown on your computer",
+        message: model.scannerMessage,
+        statusStyle: model.scannerStatusStyle,
+        isProcessing: model.isAuthorizing,
+        canRetry: model.scannerCanRetry,
+        resetToken: model.scannerResetToken,
         onResult: { model.handleScanned($0) },
+        onRetry: { model.retryScan() },
         onCancel: { model.cancelScan() }
       )
       .ignoresSafeArea()
@@ -535,23 +589,50 @@ struct AgentBridgeRepositoryPickerView: View {
 /// SwiftUI wrapper over an AVFoundation QR scanner used to pair a computer.
 struct AgentQRScannerView: UIViewControllerRepresentable {
   let instruction: String
+  let message: String?
+  let statusStyle: AgentQRScannerStatusStyle
+  let isProcessing: Bool
+  let canRetry: Bool
+  let resetToken: Int
   let onResult: (String) -> Void
+  let onRetry: () -> Void
   let onCancel: () -> Void
 
   func makeUIViewController(context: Context) -> AgentQRScannerController {
     let controller = AgentQRScannerController()
     controller.instruction = instruction
+    controller.onRetry = onRetry
     controller.onResult = onResult
     controller.onCancel = onCancel
+    controller.applyStatus(
+      message: message,
+      style: statusStyle,
+      isProcessing: isProcessing,
+      canRetry: canRetry
+    )
+    controller.applyResetToken(resetToken)
     return controller
   }
 
-  func updateUIViewController(_ controller: AgentQRScannerController, context: Context) {}
+  func updateUIViewController(_ controller: AgentQRScannerController, context: Context) {
+    controller.instruction = instruction
+    controller.onRetry = onRetry
+    controller.onResult = onResult
+    controller.onCancel = onCancel
+    controller.applyStatus(
+      message: message,
+      style: statusStyle,
+      isProcessing: isProcessing,
+      canRetry: canRetry
+    )
+    controller.applyResetToken(resetToken)
+  }
 }
 
 final class AgentQRScannerController: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
   var instruction: String = "Scan the QR"
   var onResult: ((String) -> Void)?
+  var onRetry: (() -> Void)?
   var onCancel: (() -> Void)?
 
   private let session = AVCaptureSession()
@@ -559,7 +640,10 @@ final class AgentQRScannerController: UIViewController, AVCaptureMetadataOutputO
   private var metadataOutput: AVCaptureMetadataOutput?
   private let sessionQueue = DispatchQueue(label: "vibe.agent.qr.scanner")
   private var hasEmitted = false
+  private var lastResetToken = 0
   private let messageLabel = UILabel()
+  private let retryButton = UIButton(type: .system)
+  private let activityIndicator = UIActivityIndicatorView(style: .large)
   
   private let overlayEffectView = UIVisualEffectView()
   private let overlayMaskLayer = CAShapeLayer()
@@ -742,6 +826,23 @@ final class AgentQRScannerController: UIViewController, AVCaptureMetadataOutputO
     messageLabel.translatesAutoresizingMaskIntoConstraints = false
     view.addSubview(messageLabel)
 
+    activityIndicator.color = .white
+    activityIndicator.hidesWhenStopped = true
+    activityIndicator.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(activityIndicator)
+
+    retryButton.setTitle("Scan again", for: .normal)
+    retryButton.titleLabel?.font = .systemFont(ofSize: 15, weight: .semibold)
+    retryButton.tintColor = .black
+    retryButton.backgroundColor = .white
+    retryButton.layer.cornerCurve = .continuous
+    retryButton.layer.cornerRadius = 18
+    retryButton.contentEdgeInsets = UIEdgeInsets(top: 9, left: 18, bottom: 9, right: 18)
+    retryButton.isHidden = true
+    retryButton.translatesAutoresizingMaskIntoConstraints = false
+    retryButton.addTarget(self, action: #selector(handleRetry), for: .touchUpInside)
+    view.addSubview(retryButton)
+
     NSLayoutConstraint.activate([
       close.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
       close.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
@@ -752,9 +853,15 @@ final class AgentQRScannerController: UIViewController, AVCaptureMetadataOutputO
       title.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 56),
       title.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -56),
 
-      messageLabel.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+      activityIndicator.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+      activityIndicator.bottomAnchor.constraint(equalTo: messageLabel.topAnchor, constant: -14),
+
+      messageLabel.centerYAnchor.constraint(equalTo: view.centerYAnchor, constant: 170),
       messageLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 32),
       messageLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -32),
+
+      retryButton.topAnchor.constraint(equalTo: messageLabel.bottomAnchor, constant: 16),
+      retryButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
     ])
   }
 
@@ -763,12 +870,60 @@ final class AgentQRScannerController: UIViewController, AVCaptureMetadataOutputO
     messageLabel.isHidden = false
   }
 
+  func applyStatus(
+    message: String?,
+    style: AgentQRScannerStatusStyle,
+    isProcessing: Bool,
+    canRetry: Bool
+  ) {
+    loadViewIfNeeded()
+    if let message, !message.isEmpty {
+      showMessage(message)
+    } else {
+      hideMessage()
+    }
+    switch style {
+    case .idle, .progress:
+      messageLabel.textColor = .white
+    case .success:
+      messageLabel.textColor = .systemGreen
+    case .error:
+      messageLabel.textColor = .systemRed
+    }
+    if isProcessing || style == .progress {
+      activityIndicator.startAnimating()
+    } else {
+      activityIndicator.stopAnimating()
+    }
+    retryButton.isHidden = !canRetry
+  }
+
+  func applyResetToken(_ token: Int) {
+    loadViewIfNeeded()
+    guard token != lastResetToken else { return }
+    lastResetToken = token
+    resetScan()
+  }
+
   private func hideMessage() {
     messageLabel.isHidden = true
+    retryButton.isHidden = true
+    activityIndicator.stopAnimating()
+  }
+
+  private func resetScan() {
+    hasEmitted = false
+    hideMessage()
+    startRunning()
   }
 
   @objc private func handleClose() {
     onCancel?()
+  }
+
+  @objc private func handleRetry() {
+    onRetry?()
+    resetScan()
   }
 }
 

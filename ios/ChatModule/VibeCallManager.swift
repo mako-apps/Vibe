@@ -27,6 +27,7 @@ public final class VibeNativeCallManager: NSObject {
   private var lastPushSyncSignature: String?
   private var pushSyncInFlight = false
   private var pushSyncNeedsRetry = false
+  private var pushSyncRetryForce = false
 
   private override init() {
     super.init()
@@ -34,20 +35,44 @@ public final class VibeNativeCallManager: NSObject {
 
   public func start() {
     DispatchQueue.main.async {
-      guard !self.started else {
-        NSLog("[VibeNativeCall] start skipped alreadyStarted=true")
-        return
+      self.startOnMain()
+    }
+  }
+
+  public func refreshNotificationRegistration(reason: String) {
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      self.startOnMain()
+      self.syncStoredPushTokens(reason: "\(reason)-preflight", force: true)
+
+      let center = UNUserNotificationCenter.current()
+      center.getNotificationSettings { [weak self] settings in
+        guard let self else { return }
+        switch settings.authorizationStatus {
+        case .authorized, .provisional, .ephemeral:
+          self.registerForRemoteNotifications(reason: reason, authorization: "\(settings.authorizationStatus.rawValue)")
+        case .notDetermined:
+          center.requestAuthorization(options: [.alert, .sound]) { [weak self] granted, error in
+            guard let self else { return }
+            NSLog(
+              "[VibeNativeCall] notification refresh auth reason=%@ granted=%@ error=%@",
+              reason,
+              granted ? "true" : "false",
+              error?.localizedDescription ?? "nil"
+            )
+            guard granted else { return }
+            self.registerForRemoteNotifications(reason: reason, authorization: "granted")
+          }
+        case .denied:
+          NSLog("[VibeNativeCall] notification refresh skipped reason=%@ authorization=denied", reason)
+        @unknown default:
+          NSLog(
+            "[VibeNativeCall] notification refresh skipped reason=%@ authorization=unknown:%ld",
+            reason,
+            settings.authorizationStatus.rawValue
+          )
+        }
       }
-      self.started = true
-      NSLog("[VibeNativeCall] start begin mainThread=%@", Thread.isMainThread ? "true" : "false")
-      self.provider.setDelegate(self, queue: nil)
-      NSLog("[VibeNativeCall] CXProvider delegate set")
-      let registry = PKPushRegistry(queue: DispatchQueue.main)
-      registry.delegate = self
-      registry.desiredPushTypes = [.voIP]
-      self.pushRegistry = registry
-      NSLog("[VibeNativeCall] PKPushRegistry configured desiredPushTypes=%@", String(describing: registry.desiredPushTypes))
-      self.syncStoredPushTokens(reason: "start")
     }
   }
 
@@ -136,9 +161,38 @@ public final class VibeNativeCallManager: NSObject {
     syncStoredPushTokens(reason: "apns-token-invalidated")
   }
 
-  public func syncStoredPushTokens(reason: String) {
+  public func syncStoredPushTokens(reason: String, force: Bool = false) {
     pushSyncQueue.async { [weak self] in
-      self?.syncStoredPushTokensLocked(reason: reason)
+      self?.syncStoredPushTokensLocked(reason: reason, force: force)
+    }
+  }
+
+  private func startOnMain() {
+    guard !started else {
+      NSLog("[VibeNativeCall] start skipped alreadyStarted=true")
+      return
+    }
+    started = true
+    NSLog("[VibeNativeCall] start begin mainThread=%@", Thread.isMainThread ? "true" : "false")
+    provider.setDelegate(self, queue: nil)
+    NSLog("[VibeNativeCall] CXProvider delegate set")
+    let registry = PKPushRegistry(queue: DispatchQueue.main)
+    registry.delegate = self
+    registry.desiredPushTypes = [.voIP]
+    pushRegistry = registry
+    NSLog("[VibeNativeCall] PKPushRegistry configured desiredPushTypes=%@", String(describing: registry.desiredPushTypes))
+    syncStoredPushTokens(reason: "start")
+  }
+
+  private func registerForRemoteNotifications(reason: String, authorization: String) {
+    DispatchQueue.main.async { [weak self] in
+      NSLog(
+        "[VibeNativeCall] notification registration refresh reason=%@ authorization=%@",
+        reason,
+        authorization
+      )
+      UIApplication.shared.registerForRemoteNotifications()
+      self?.syncStoredPushTokens(reason: "\(reason)-register", force: true)
     }
   }
 
@@ -173,9 +227,10 @@ public final class VibeNativeCallManager: NSObject {
     }
   }
 
-  private func syncStoredPushTokensLocked(reason: String) {
+  private func syncStoredPushTokensLocked(reason: String, force: Bool) {
     if pushSyncInFlight {
       pushSyncNeedsRetry = true
+      pushSyncRetryForce = pushSyncRetryForce || force
       VibeDebugLog.log("[VibeNativeCall] push token sync skipped reason=%@ state=inFlight", reason)
       return
     }
@@ -203,7 +258,7 @@ public final class VibeNativeCallManager: NSObject {
       apns ?? "",
       voip ?? "",
     ].joined(separator: "|")
-    if lastPushSyncSignature == signature {
+    if !force && lastPushSyncSignature == signature {
       VibeDebugLog.log("[VibeNativeCall] push token sync skipped reason=%@ unchanged=true", reason)
       return
     }
@@ -236,11 +291,13 @@ public final class VibeNativeCallManager: NSObject {
       self.pushSyncQueue.async {
         self.pushSyncInFlight = false
         let shouldRetry = self.pushSyncNeedsRetry
+        let shouldRetryForce = self.pushSyncRetryForce
         self.pushSyncNeedsRetry = false
+        self.pushSyncRetryForce = false
         if let error {
           NSLog("[VibeNativeCall] push token sync failed reason=%@ error=%@", reason, error.localizedDescription)
           if shouldRetry {
-            self.syncStoredPushTokensLocked(reason: "queued-after-\(reason)")
+            self.syncStoredPushTokensLocked(reason: "queued-after-\(reason)", force: shouldRetryForce)
           }
           return
         }
@@ -251,7 +308,7 @@ public final class VibeNativeCallManager: NSObject {
           NSLog("[VibeNativeCall] push token sync failed reason=%@ status=%d", reason, status)
         }
         if shouldRetry {
-          self.syncStoredPushTokensLocked(reason: "queued-after-\(reason)")
+          self.syncStoredPushTokensLocked(reason: "queued-after-\(reason)", force: shouldRetryForce)
         }
       }
     }.resume()

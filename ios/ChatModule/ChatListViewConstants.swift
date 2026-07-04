@@ -1,16 +1,16 @@
 import UIKit
 
 let listBottomThreshold: CGFloat = 88.0
-let messageHorizontalInset: CGFloat = 16.0
+let messageHorizontalInset: CGFloat = 10.0
 let messageSelectionLeadingInset: CGFloat = 38.0
 let sectionTopInset: CGFloat = 10.0
 let sectionBottomInset: CGFloat = 14.0
-let bubbleSideMargin: CGFloat = 8.0
-let bubbleHorizontalPadding: CGFloat = 10.0
-let bubbleTopPadding: CGFloat = 7.0
-let bubbleBottomPadding: CGFloat = 7.0
+let bubbleSideMargin: CGFloat = 4.0
+let bubbleHorizontalPadding: CGFloat = 8.0
+let bubbleTopPadding: CGFloat = 5.0
+let bubbleBottomPadding: CGFloat = 4.5
 let bubbleMetaTopSpacing: CGFloat = 2.0
-let bubbleMetaHeight: CGFloat = 15.0
+let bubbleMetaHeight: CGFloat = 14.0
 let bubbleMinWidth: CGFloat = 26.0
 let bubbleMaxWidthFactor: CGFloat = 0.85
 // The inline agent-turn bubble packs a rich, already-padded step/narration/diff feed, so

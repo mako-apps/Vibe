@@ -250,6 +250,23 @@ defmodule VibeWeb.AgentBridgeChannel do
     {:reply, :ok, socket}
   end
 
+  # daemon → server: a structured usage snapshot (Claude 5h/7-day limits + this
+  # chat's last-run tokens) in reply to a phone-issued `agent-bridge-usage`. We
+  # relay it to the requesting chat for the inline Usage panel.
+  def handle_in("usage_result", payload, socket) when is_map(payload) do
+    chat_id = payload["chatId"] || payload["chat_id"]
+
+    if is_binary(chat_id) and chat_id != "" do
+      VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-bridge-usage", payload)
+    else
+      Logger.info(
+        "[AgentBridge] usage_result without chatId user=#{socket.assigns.user_id} requestId=#{inspect(payload["requestId"])}"
+      )
+    end
+
+    {:reply, :ok, socket}
+  end
+
   # daemon → server: the agent (or the bridge's plan gate) needs the phone to
   # decide something — approve a plan, or answer a question. We relay it verbatim
   # to the requesting chat; the `askEnc` blob is opaque to us (sealed with the

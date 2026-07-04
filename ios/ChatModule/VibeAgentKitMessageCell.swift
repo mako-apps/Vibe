@@ -277,8 +277,8 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
     stepsStack.spacing = 9.0
     stepsStack.layoutMargins = UIEdgeInsets(top: 4.0, left: 8.0, bottom: 5.0, right: 0.0)
 
-    let font = UIFont.systemFont(ofSize: 18.0, weight: .regular)
-    let lineHeight: CGFloat = 27.5
+    let font = UIFont.systemFont(ofSize: 16.0, weight: .regular)
+    let lineHeight: CGFloat = 24.0
     let color = appearance.text
     let contentWidth = max(
       120.0, availableWidth - stepsStack.layoutMargins.left - stepsStack.layoutMargins.right)
@@ -406,9 +406,9 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
       ? UIEdgeInsets(top: 0.0, left: 0.0, bottom: 0.0, right: 0.0)
       : UIEdgeInsets(top: 0.0, left: 0.0, bottom: 2.0, right: 0.0)
 
-    let font = UIFont.systemFont(ofSize: 18.0, weight: .regular)
+    let font = UIFont.systemFont(ofSize: 16.0, weight: .regular)
     let color = appearance.text
-    let lineHeight: CGFloat = 27.5
+    let lineHeight: CGFloat = 24.0
     let contentWidth = max(120.0, availableWidth - stepsStack.layoutMargins.left - stepsStack.layoutMargins.right)
     let blocks = VibeAgentKitTextRenderer.parseBlocks(text)
 
@@ -521,12 +521,13 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
     isProgressExpanded: Bool = false,
     isRuntimeExpanded: Bool = false,
     expandedStepIds: Set<String> = [],
-    streamingStartDate: Date? = nil
+    streamingStartDate: Date? = nil,
+    showsLoaderView: Bool = true
   ) {
     self.expandedStepIds = expandedStepIds
     self.subagentChildren = subagentChildren
-    let font = UIFont.systemFont(ofSize: 18.0, weight: .regular)
-    let lineHeight: CGFloat = 27.5
+    let font = UIFont.systemFont(ofSize: 16.0, weight: .regular)
+    let lineHeight: CGFloat = 24.0
     let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
     let hasDisplayText = !trimmedText.isEmpty
     let hasToolProgressItems = progressItems.contains { $0.itemType != "text" }
@@ -554,7 +555,7 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
     loaderView.applyAppearance(appearance)
     loaderView.onTap = onLoaderTap
 
-    let shouldShowLoader = showsLoader || canShowCompletedWork
+    let shouldShowLoader = showsLoaderView && (showsLoader || canShowCompletedWork)
     // Only a finished turn can expand its step list inline; a live turn shows the
     // shimmer, not a static list.
     let stepsExpanded = isProgressExpanded && canShowCompletedWork
@@ -1886,9 +1887,9 @@ final class VibeAgentKitMessageCell: UITableViewCell {
     if isUser {
       let attributed = VibeAgentKitTextRenderer.makeAttributedText(
         text: displayText,
-        font: UIFont.systemFont(ofSize: 18.0, weight: .regular),
+        font: UIFont.systemFont(ofSize: 16.0, weight: .regular),
         textColor: userBubbleTextColor(for: appearance),
-        lineHeight: 27.5
+        lineHeight: 24.0
       )
       let baseWidth = availableWidth ?? (contentView.bounds.width > 0.0 ? contentView.bounds.width : fallbackWidth)
       let userWidth = max(
@@ -1901,7 +1902,7 @@ final class VibeAgentKitMessageCell: UITableViewCell {
         ? VibeAgentKitTextRenderer.measuredSize(for: attributed, width: textWidth)
         : .zero
       let fullTextHeight = hasText
-        ? max(ceil(UIFont.systemFont(ofSize: 18.0, weight: .regular).lineHeight), measured.height)
+        ? max(ceil(UIFont.systemFont(ofSize: 16.0, weight: .regular).lineHeight), measured.height)
         : 0.0
       let attachmentHeight = userAttachmentGrid.configure(
         attachments: message.attachments,
@@ -2133,11 +2134,11 @@ final class VibeAgentKitMessageCell: UITableViewCell {
     trailingConstraint = messageContainerView.trailingAnchor.constraint(equalTo: rowContainer.trailingAnchor, constant: -8.0)
     assistantMaxWidthConstraint = messageContainerView.widthAnchor.constraint(
       lessThanOrEqualTo: rowContainer.widthAnchor,
-      multiplier: 0.92
+      multiplier: 0.85
     )
     assistantWidthConstraint = messageContainerView.widthAnchor.constraint(
       equalTo: rowContainer.widthAnchor,
-      multiplier: 0.92
+      multiplier: 0.85
     )
     userMaxWidthConstraint = messageContainerView.widthAnchor.constraint(
       lessThanOrEqualTo: rowContainer.widthAnchor,
@@ -2171,10 +2172,10 @@ final class VibeAgentKitMessageCell: UITableViewCell {
     userExpandHeightConstraint = userExpandButton.heightAnchor.constraint(equalToConstant: 26.0)
     userExpandWidthConstraint = userExpandButton.widthAnchor.constraint(equalToConstant: 42.0)
 
-    assistantTopConstraint = assistantBodyView.topAnchor.constraint(equalTo: messageContainerView.topAnchor)
-    assistantLeadingConstraint = assistantBodyView.leadingAnchor.constraint(equalTo: messageContainerView.leadingAnchor)
-    assistantTrailingConstraint = assistantBodyView.trailingAnchor.constraint(equalTo: messageContainerView.trailingAnchor)
-    assistantBottomConstraint = assistantBodyView.bottomAnchor.constraint(equalTo: messageContainerView.bottomAnchor)
+    assistantTopConstraint = assistantBodyView.topAnchor.constraint(equalTo: messageContainerView.topAnchor, constant: 4.0)
+    assistantLeadingConstraint = assistantBodyView.leadingAnchor.constraint(equalTo: messageContainerView.leadingAnchor, constant: 12.0)
+    assistantTrailingConstraint = assistantBodyView.trailingAnchor.constraint(equalTo: messageContainerView.trailingAnchor, constant: -12.0)
+    assistantBottomConstraint = assistantBodyView.bottomAnchor.constraint(equalTo: messageContainerView.bottomAnchor, constant: -4.0)
 
     userTextHeightConstraint.priority = .defaultHigh
     userAttachmentHeightConstraint.priority = .defaultHigh

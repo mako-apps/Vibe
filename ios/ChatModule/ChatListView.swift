@@ -696,6 +696,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       atBottom: Bool
     )?
   private let viewportEmitMinInterval: CFTimeInterval = 1.0 / 30.0
+  /// Newest incoming message id we've already sent a read-receipt for on this chat.
+  /// Read is cumulative (reading the newest incoming implies all earlier ones read, and
+  /// the sender collapses their own outgoing statuses off their latest message — see
+  /// `resolvedDisplayStatus`), so we only ever receipt the newest incoming row. Reset in
+  /// `setEngineChatId`.
+  private var lastReadReceiptSentMessageId: String?
   private var documentPreviewDataSource: ChatListDocumentPreviewDataSource?
   private var documentPreviewCacheByRemoteURL: [String: URL] = [:]
   private var documentPreviewInFlightURLs = Set<String>()
@@ -734,6 +740,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var inputBarEnabled = false
   private var inputBarPlaceholder = "Message"
   var keyboardHeight: CGFloat = 0
+
+  /// The bottom input surface currently mounted over the list. Default chat uses
+  /// `ChatInputBar`; agent chat can swap in `VibeComposerView`. Any edge/overlay
+  /// positioning should key off this shared value so the bottom effect does not
+  /// disappear when the input implementation changes.
+  var activeNativeInputView: UIView? {
+    agentComposerView ?? inputBar
+  }
   /// Persistent overlay container that sits above the list but below the composer.
   private let transitionOverlayHost = UIView()
   private let nativeSendMorphTopRightRadius: CGFloat = 8.0
@@ -1401,7 +1415,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let mergedRows = mergedRowsPayload(from: nextRows)
     let visibleRows = filterRowsForSearch(mergedRows)
     let parsedAll = visibleRows.compactMap(ChatListRow.init).filter { row in
-      row.messageType != "agent_progress"
+      guard row.messageType != "agent_progress" else { return false }
+      // A live agent turn with nothing renderable yet (no tool/step, no narration, no
+      // answer text) is held out of the transcript entirely — the header already shows
+      // "Thinking…" for this state. The row appears the moment the first real chunk
+      // streams in, landing directly at its normal full-width layout instead of a
+      // centered placeholder pill that then grows.
+      if bubbleUsesAgentTurnContent(row), agentTurnBubbleIsCompactThinking(row) {
+        return false
+      }
+      return true
     }
     // Inbox mode: split raw agent event notifications out of the transcript and
     // report them to the host so they surface via the Inbox banner/view. Batched
@@ -1516,6 +1539,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       if let agentVC = self.presentedBridgeAgentVC {
         agentVC.setMessages(VibeAgentKitMap.messages(from: parsed))
       }
+      // Keep the DM agent composer's trailing control (SEND vs STOP) in sync with the
+      // live state of the rows — a streaming/running turn forces STOP so the user can
+      // interrupt it. The full-page runtime view drives its own composer separately.
+      self.agentComposerView?.setTaskActive(self.agentComposerHasLiveTask())
       self.pruneMessageSelection(for: parsed)
       let engineChatId = self.engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
       let resolvedChatId: String
@@ -2409,6 +2436,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     nativeEngineRowsById.removeAll()
     nativeEngineOrder.removeAll()
     nativeDeletedMessageIds.removeAll()
+    lastReadReceiptSentMessageId = nil
     // NOTE: bridge-agent fresh-surface tracking (bridgeFreshHiddenIdsByChat /
     // bridgeFreshOwnSentIdsByChat) is intentionally NOT cleared here — it's keyed by
     // chatId in a process-lifetime static store precisely so that switching away from
@@ -4365,7 +4393,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
     let bubbleYInHost: CGFloat = {
       let listMinY = collectionView.frame.minY
-      if inputBarEnabled, let bar = inputBar {
+      if inputBarEnabled, let bar = activeNativeInputView {
         let barMinYInHost = bar.frame.minY
         return max(listMinY + contentPaddingTop, barMinYInHost - metrics.bubbleHeight - 2.0)
       }
@@ -5281,6 +5309,55 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       "distanceFromBottom": distanceFromBottom,
       "atBottom": atBottom,
     ])
+
+    if atBottom {
+      sendReadReceiptForNewestIncomingIfNeeded()
+    }
+  }
+
+  /// Emit a read-receipt for the newest incoming message when the user is actually looking
+  /// at the bottom of an open chat. This is the ONLY place this native client tells the peer
+  /// "read" — without it the peer's bubble never turns blue (it only ever auto-sends the
+  /// *delivery* receipt on message insert). Best-effort + deduped by message id, so it's safe
+  /// to call on every viewport tick.
+  private func sendReadReceiptForNewestIncomingIfNeeded() {
+    guard window != nil else { return }
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !chatId.isEmpty else { return }
+
+    // Newest incoming human message = last non-me `.message` row with a real id.
+    guard
+      let newest = rows.reversed().first(where: { row in
+        row.isMe == false
+          && row.kind == .message
+          && row.isAgentMessage == false
+          && (row.messageId?.isEmpty == false)
+      }),
+      let messageId = newest.messageId
+    else {
+      return
+    }
+    guard messageId != lastReadReceiptSentMessageId else { return }
+    lastReadReceiptSentMessageId = messageId
+
+    chatListEngineBindingQueue.async { [weak self] in
+      let result = ChatEngine.shared.sendReadReceipt([
+        "chatId": chatId,
+        "messageId": messageId,
+      ])
+      // Not actually pushed (chat topic not joined yet — common on first open before the
+      // join lands). Drop the dedupe so the next viewport tick retries; otherwise the very
+      // first incoming message can get stuck never-read on the peer's side.
+      let accepted = (result["accepted"] as? Bool) ?? false
+      if !accepted {
+        DispatchQueue.main.async {
+          guard let self else { return }
+          if self.lastReadReceiptSentMessageId == messageId {
+            self.lastReadReceiptSentMessageId = nil
+          }
+        }
+      }
+    }
   }
 
   private func applyWallpaperAppearance() {
@@ -5633,23 +5710,57 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         contentPaddingBottom = sectionBottomInset
         updateBottomAnchorInset()
       }
-      // The default chat list always uses the normal ChatInputBar. Agent chats
-      // (agentChatMode or an inline Claude/Codex bridge DM) get their agent-specific
-      // controls (repo chip, slash commands, Report/Permission/History menu, STOP-on-
-      // stream) via ChatInputBar.setAgentControlMode(true) — the dedicated VibeComposerView
-      // input stays exclusive to the full-page agent runtime view (VibeAgentConversationView).
-      let isAgent = agentChatMode || currentBridgeProvider != nil
-      let bar = ChatInputBar()
-      bar.delegate = self
-      bar.placeholder = inputBarPlaceholder
-      bar.applyAppearance(appearance)
-      bar.setAgentStreaming(agentStreaming)
-      bar.setAgentControlMode(isAgent)
-      inputBar = bar
-      addSubview(bar)
+      // The glass agent composer is only for the Claude/Codex bridge DMs. The default
+      // "Vibe AI" agent (agentChatMode without a bridge provider) and every normal DM use
+      // the standard ChatInputBar instead.
+      let bridgeProvider = currentBridgeProvider?.lowercased()
+      let useAgentComposer = bridgeProvider == "claude" || bridgeProvider == "codex"
+      if useAgentComposer {
+        let bar = VibeComposerView()
+        bar.placeholder = inputBarPlaceholder
+        bar.applyAppearance(appearance.isDark ? VibeAgentKitChatAppearance.fallback : VibeAgentKitChatAppearance.lightFallback)
+        bar.provider = currentBridgeProvider ?? "codex"
+        bar.onSend = { [weak self] text, options in
+            self?.inputBarDidSend(text: text)
+        }
+        bar.onAttach = { [weak self] in
+            self?.inputBarDidTapAttachment()
+        }
+        bar.onOpenToolsSheet = { [weak self] vc in
+            guard let self, let presenter = self.topPresentingViewController() else { return }
+            presenter.present(vc, animated: true)
+        }
+        bar.onHeightChanged = { [weak self] height in
+            self?.inputBarHeightDidChange()
+        }
+        // While a bridge task is live the composer's trailing control becomes STOP — tapping
+        // it cancels the running run. Without this wiring (the agent surface uses this
+        // VibeComposerView, NOT `inputBar`) the STOP button never appeared and never fired.
+        bar.onStop = { [weak self] in
+            self?.agentComposerStopActiveTask()
+        }
+        agentComposerView = bar
+        addSubview(bar)
+        // Seed the trailing control immediately so a composer created mid-run shows STOP.
+        bar.setTaskActive(agentComposerHasLiveTask())
 
-      agentComposerView?.removeFromSuperview()
-      agentComposerView = nil
+        inputBar?.removeFromSuperview()
+        inputBar = nil
+      } else {
+        let bar = ChatInputBar()
+        bar.delegate = self
+        bar.placeholder = inputBarPlaceholder
+        bar.applyAppearance(appearance)
+        bar.setAgentStreaming(agentStreaming)
+        // The default "Vibe AI" agent still wants ChatInputBar's dormant agent-control
+        // machinery (repo chip / slash menu / STOP); normal DMs don't.
+        bar.setAgentControlMode(agentChatMode || currentBridgeProvider != nil)
+        inputBar = bar
+        addSubview(bar)
+
+        agentComposerView?.removeFromSuperview()
+        agentComposerView = nil
+      }
       updateAgentBridgeControlTitle()
 
       positionTransitionOverlayHost()
@@ -5705,10 +5816,39 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
   }
 
+  /// True when this DM agent surface has a live/streaming turn — used to force the
+  /// composer's trailing control to STOP. Mirrors the full-page view's `isLive` check.
+  private func agentComposerHasLiveTask() -> Bool {
+    guard agentChatMode || currentBridgeProvider != nil else { return false }
+    if agentStreaming { return true }
+    return rows.contains { bridgeRowIsLive($0) }
+  }
+
+  /// Composer STOP tapped on the DM agent surface: cancel the running bridge run. Mirrors
+  /// the full-page runtime view's `stopActiveTask` (chatId + provider + the live task id).
+  private func agentComposerStopActiveTask() {
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !chatId.isEmpty else {
+      NSLog("[ChatListView] agentComposerStop skipped — no chatId")
+      return
+    }
+    let provider = currentBridgeProvider ?? "codex"
+    let taskId = rows.first { bridgeRowIsLive($0) }?.agentRuntime?.taskId
+    var payload: [String: Any] = [
+      "chatId": chatId,
+      "provider": provider,
+      "action": "cancel",
+    ]
+    if let taskId, !taskId.isEmpty { payload["taskId"] = taskId }
+    NSLog("[ChatListView] agentComposerStop chat=%@ provider=%@ taskId=%@", chatId, provider, taskId ?? "nil")
+    _ = ChatEngine.shared.sendAgentBridgeControl(payload)
+  }
+
   func setAgentStreaming(_ streaming: Bool) {
     guard agentStreaming != streaming else { return }
     agentStreaming = streaming
     inputBar?.setAgentStreaming(streaming)
+    agentComposerView?.setTaskActive(streaming || agentComposerHasLiveTask())
     // Note: we deliberately do NOT clear the push-to-top spacer when the answer
     // finishes. Clearing it would drop `maxOffset` below the pinned offset for a
     // short answer, and the collection view would clamp the content downward —
@@ -5832,9 +5972,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     keyboardHeight = kbHeight
     inputBar?.keyboardHeightForPanels = kbHeight
     inputBar?.keyboardProgress = kbHeight > 0 ? 1.0 : 0.0
+    agentComposerView?.setKeyboardPaddingProgress(
+      kbHeight > 0 ? 1.0 : 0.0,
+      animation: (duration, options)
+    )
     UIView.animate(withDuration: duration, delay: 0, options: options) { [weak self] in
       self?.layoutInputBarAndInset()
       self?.inputBar?.layoutIfNeeded()
+      self?.agentComposerView?.layoutIfNeeded()
     }
   }
 
@@ -5850,9 +5995,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     keyboardHeight = 0
     inputBar?.keyboardHeightForPanels = 0
     inputBar?.keyboardProgress = 0.0
+    agentComposerView?.setKeyboardPaddingProgress(
+      0.0,
+      animation: (duration, options)
+    )
     UIView.animate(withDuration: duration, delay: 0, options: options) { [weak self] in
       self?.layoutInputBarAndInset()
       self?.inputBar?.layoutIfNeeded()
+      self?.agentComposerView?.layoutIfNeeded()
     }
   }
 
@@ -5872,6 +6022,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         let finalY = h - effectiveKeyboardHeight - finalHeight
 
         agentBar.frame = CGRect(x: 0, y: finalY, width: w, height: finalHeight)
+        agentBar.alpha = 1
+        agentBar.isUserInteractionEnabled = true
+        agentBar.layoutIfNeeded()
 
         let desiredBottomPadding = effectiveKeyboardHeight + finalHeight
         if abs(contentPaddingBottom - desiredBottomPadding) > 0.5 {
@@ -5883,6 +6036,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
             restoreStationaryDistance(distanceBeforeInsetChange)
           }
         }
+        positionTransitionOverlayHost()
+        layoutActivityOverlay()
         return
     }
 
@@ -9470,7 +9625,7 @@ extension ChatListView: ChatInputBarDelegate {
 
     // Position overlay just above the content padding (input bar area)
     let bottomY: CGFloat
-    if inputBarEnabled, let bar = inputBar {
+    if inputBarEnabled, let bar = activeNativeInputView {
       bottomY = bar.frame.minY - 6
     } else {
       bottomY = bounds.height - contentPaddingBottom - 6

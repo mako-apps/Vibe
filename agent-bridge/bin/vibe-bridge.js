@@ -151,6 +151,7 @@ function parseArgs(argv) {
     else if (a === "--repo-root") out.repoRoots.push(argv[++i]);
     else if (a === "--label") out.label = argv[++i];
     else if (a === "--logout") out.logout = true;
+    else if (a === "--pair" || a === "--reconnect") out.pair = true;
     else if (a === "--pick") out.pick = true;
     else if (a === "--no-pick") out.noPick = true;
     else if (a === "--all") out.all = true;
@@ -692,7 +693,7 @@ const CLAUDE_SLASH_INFO = [
   { name: "config", desc: "View or set a setting (key=value)", kind: "task" },
   { name: "skills", desc: "Browse and use skills", kind: "bridge" },
   { name: "clear", desc: "Start a fresh conversation (new task)", kind: "task" },
-  { name: "compact", desc: "Drop the resumed session for the next run", kind: "bridge" },
+  { name: "compact", desc: "Summarize this conversation to free context", kind: "bridge" },
   { name: "usage", desc: "Plan limits + this chat's token/cost usage", kind: "bridge" },
   { name: "usage-credits", desc: "Configure extra usage credits", kind: "task" },
   { name: "status", desc: "Account, model, and remaining usage", kind: "bridge" },
@@ -1660,6 +1661,54 @@ function runCliCapture(cmd, args, timeoutMs = 12000) {
   }
 }
 
+// REAL Claude conversation compaction. The interactive `/compact` summarizes the
+// running conversation and continues in a fresh, compacted session. Headless
+// `claude -p "/compact" --resume <sid> --output-format json` does the same thing and
+// returns a single JSON envelope carrying the new `session_id` + the summary in
+// `result`. We run it, capture the new session id (so the next resume continues the
+// compacted thread), and hand back the summary text. Bounded + never throws.
+async function runClaudeCompact(cwd, sessionId) {
+  const cmd = process.env.VIBE_CLAUDE_COMMAND || "claude";
+  const args = ["-p", "/compact", "--resume", sessionId, "--output-format", "json"];
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(cmd, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    } catch (err) {
+      resolve({ ok: false, error: `Could not start ${cmd}: ${err.message}` });
+      return;
+    }
+    let out = "";
+    let err = "";
+    const timer = setTimeout(() => {
+      try { child.kill("SIGTERM"); } catch (_) {}
+    }, 120000);
+    child.stdout.on("data", (d) => { if (out.length < 512 * 1024) out += d.toString(); });
+    child.stderr.on("data", (d) => { if (err.length < 64 * 1024) err += d.toString(); });
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      resolve({ ok: false, error: e.message });
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      let parsed = null;
+      try { parsed = JSON.parse(out.trim()); } catch (_) {}
+      if (parsed && (parsed.subtype === "success" || parsed.result != null)) {
+        resolve({
+          ok: true,
+          newSessionId: parsed.session_id || null,
+          summary: String(parsed.result || "").trim(),
+        });
+        return;
+      }
+      resolve({
+        ok: false,
+        error: (err.trim() || out.trim() || `claude exited ${code}`).slice(0, 400),
+      });
+    });
+  });
+}
+
 // Real account/login status from the provider CLI. Codex exposes `codex login
 // status`; Claude has no headless account command, so we return null and let the
 // caller fall back to the model/usage context it already has.
@@ -1782,13 +1831,33 @@ async function bridgeCommandOutput(provider, chatId, task, repo, command) {
       modelBySession.set(key, normalizedModel);
       return `${provider} model set to ${normalizedModel} for this chat.`;
     }
-    case "compact":
-      sessionByChat.delete(chatId);
+    case "compact": {
+      if (provider === "codex") {
+        // `codex exec` can't run /compact (TUI-only). Be honest about it and drop any
+        // captured thread so the next run starts clean.
+        sessionByChat.delete(chatId);
+        return [
+          "Codex can't compact headless — /compact is an interactive command in the Codex app/terminal.",
+          "The bridge cleared this chat's resume thread, so the next Codex run starts fresh.",
+        ].join("\n");
+      }
+      // Claude: run the REAL compaction against the last captured session, then point
+      // this chat's resume at the new, compacted session so follow-ups continue it.
+      const sid = sessionByChat.get(chatId) || resumeIdFor(task);
+      if (!sid) {
+        return "Nothing to compact yet — run a Claude task in this chat first, then /compact summarizes it.";
+      }
+      const cwd = repo.cwd || repo.path || DEFAULT_CWD;
+      const res = await runClaudeCompact(cwd, sid);
+      if (!res.ok) {
+        return `Couldn't compact this conversation: ${res.error || "unknown error"}`;
+      }
+      if (res.newSessionId) sessionByChat.set(chatId, res.newSessionId);
       return [
-        "Bridge context compacted for this chat.",
-        "The next Claude request will start without the previous --resume session.",
-        "Codex bridge runs are already ephemeral in this noninteractive path.",
-      ].join("\n");
+        "Conversation compacted. The next Claude request continues from the summarized session.",
+        res.summary ? `\n${res.summary}` : "",
+      ].join("").trim();
+    }
     case "doctor": {
       const out = runCliCapture(provider === "codex" ? "codex" : "claude", ["doctor"], 25000);
       return out || `${providerTitle} doctor produced no output.`;
@@ -4709,6 +4778,56 @@ function handleFileRequest(channel, payload) {
   }
 }
 
+// Structured usage snapshot for the phone's inline Usage panel. Same data /usage
+// prints as text, but as machine-readable buckets so iOS can draw progress bars:
+// Claude subscription limits (5h + 7-day, from the OAuth utilization endpoint) plus
+// this chat's last-run token/cost. Never throws; missing pieces are just omitted.
+async function buildUsageReport(provider, chatId, task) {
+  const currentModel = modelFor(provider, chatId, task);
+  const report = { provider, model: currentModel || null, buckets: [], chat: null };
+  if (provider === "claude") {
+    const util = await fetchClaudeUtilization();
+    if (util && typeof util === "object") {
+      const add = (label, b) => {
+        if (b && typeof b === "object" && b.utilization != null) {
+          report.buckets.push({
+            label,
+            utilization: Math.round(Number(b.utilization)),
+            resetsAt: b.resets_at || null,
+          });
+        }
+      };
+      add("5-hour session", util.five_hour);
+      add("7-day (all models)", util.seven_day);
+      add("7-day Opus", util.seven_day_opus);
+      add("7-day Sonnet", util.seven_day_sonnet);
+    }
+  }
+  const usage = (lastRuntimeBySession.get(sessionKey(provider, chatId)) || {}).usage;
+  if (usage && typeof usage === "object") {
+    report.chat = {
+      inputTokens: usage.inputTokens ?? null,
+      cachedInputTokens: usage.cachedInputTokens ?? null,
+      outputTokens: usage.outputTokens ?? null,
+      totalCostUsd: usage.totalCostUsd ?? null,
+    };
+  }
+  return report;
+}
+
+async function handleUsageRequest(channel, payload) {
+  const requestId = payload.requestId || payload.request_id || crypto.randomUUID();
+  const chatId = payload.chatId || payload.chat_id || null;
+  const provider = payload.provider || payload.agentBridgeProvider || "claude";
+  const echo = { requestId, chatId, provider };
+  try {
+    const report = await buildUsageReport(provider, chatId, { chatId, provider });
+    channel.push("usage_result", { ok: true, ...echo, report });
+  } catch (err) {
+    channel.push("usage_result", { ok: false, ...echo, message: (err && err.message) || "usage_failed" });
+  }
+}
+
 function controlTask(channel, payload) {
   const provider = payload.provider || payload.agentWorkerProvider || payload.agentBridgeProvider;
   const chatId = payload.chatId || payload.chat_id;
@@ -5636,6 +5755,11 @@ function connect(server, token, userId) {
   channel.on("control_task", (payload) => controlTask(channel, payload || {}));
   channel.on("history_request", (payload) => handleHistoryRequest(channel, payload || {}));
   channel.on("file_request", (payload) => handleFileRequest(channel, payload || {}));
+  channel.on("usage_request", (payload) =>
+    handleUsageRequest(channel, payload || {}).catch((err) =>
+      console.error(`[vibe-bridge] usage_request error: ${(err && err.message) || err}`)
+    )
+  );
   channel.on("ask_response", (payload) => resolveAsk(payload || {}));
   ensureAskMcp(channel); // start the ask_user MCP IPC server; refresh active channel
 
@@ -5801,6 +5925,7 @@ async function main() {
         "  vibegram-bridge --pick            re-choose which project(s) to link\n" +
         "  vibegram-bridge --all             link every git repo found near your home folder\n" +
         "  vibegram-bridge --foreground      run in this terminal instead of the background service\n" +
+        "  vibegram-bridge --pair            show a fresh QR and replace the cached account\n" +
         "  vibegram-bridge --install         install/restart the background service\n" +
         "  vibegram-bridge --uninstall       stop & remove the background service\n" +
         "  vibegram-bridge --status          show background-service state + log path\n" +
@@ -5854,6 +5979,16 @@ async function main() {
   // Background-service management (no socket needed).
   if (ARGS.uninstall) return uninstallService();
   if (ARGS.status) return serviceStatus();
+  if (ARGS.pair) {
+    if (config.user_id) {
+      console.log(`[vibe-bridge] replacing cached pairing for user ${config.user_id}...`);
+    }
+    const result = await scanToPair(server, ARGS.label);
+    config.bridge_token = result.bridge_token;
+    config.user_id = result.user_id;
+    persist();
+    console.log("[vibe-bridge] paired ✓ (token cached in ~/.vibe/bridge.json)");
+  }
   if (ARGS.install) {
     if (!config.bridge_token || !config.user_id) return installService(server, config);
     await resolveRepositories(config, persist);

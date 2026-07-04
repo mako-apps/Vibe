@@ -8,25 +8,25 @@ import Foundation
 /// sees. We keep that key in the Keychain and decrypt locally so the
 /// "files changed" card can render. The server only ever holds opaque ciphertext.
 enum AgentRuntimeCrypto {
-  /// Keychain account for the shared runtime key (base64 of 32 bytes).
+  /// Legacy Keychain account for the shared runtime key (base64 of 32 bytes).
   static let keychainAccount = "agentBridge.runtimeKey"
+  private static let scopedKeychainAccountPrefix = "agentBridge.runtimeKey.v2"
   private static let blobPrefix = "arte1"
 
   // The key is read on a hot path (every agent row with an encrypted blob), so
   // cache it in memory and only fall back to the Keychain on a cold miss.
   private static let cacheQueue = DispatchQueue(label: "agentRuntimeCrypto.key")
   private static var cachedKey: Data?
+  private static var cachedKeychainAccount: String?
   private static var cacheLoaded = false
 
   private static func keyData() -> Data? {
-    cacheQueue.sync {
-      if !cacheLoaded {
+    let account = activeKeychainAccount()
+    return cacheQueue.sync {
+      if !cacheLoaded || cachedKeychainAccount != account {
         cacheLoaded = true
-        if let b64 = SecureKeyStore.shared.retrieveSecret(key: keychainAccount),
-          let data = Data(base64Encoded: b64), data.count == 32
-        {
-          cachedKey = data
-        }
+        cachedKeychainAccount = account
+        cachedKey = loadKey(account: account)
       }
       return cachedKey
     }
@@ -37,12 +37,59 @@ enum AgentRuntimeCrypto {
   static func storeKey(_ base64Key: String) -> Bool {
     let trimmed = base64Key.trimmingCharacters(in: .whitespacesAndNewlines)
     guard let data = Data(base64Encoded: trimmed), data.count == 32 else { return false }
-    let ok = SecureKeyStore.shared.storeSecret(key: keychainAccount, value: trimmed)
-    if ok { cacheQueue.sync { cachedKey = data; cacheLoaded = true } }
+    let account = activeKeychainAccount()
+    let ok = SecureKeyStore.shared.storeSecret(key: account, value: trimmed)
+    if ok {
+      if account != keychainAccount {
+        SecureKeyStore.shared.deleteSecret(key: keychainAccount)
+      }
+      cacheQueue.sync {
+        cachedKey = data
+        cachedKeychainAccount = account
+        cacheLoaded = true
+      }
+    }
     return ok
   }
 
   static var hasKey: Bool { keyData() != nil }
+
+  /// Drop the stored runtime key for the active account. Used by repair/reset flows
+  /// so a stale Keychain value cannot keep decrypting with an old desktop key.
+  static func clearStoredKeyForCurrentSession() {
+    let account = activeKeychainAccount()
+    SecureKeyStore.shared.deleteSecret(key: account)
+    if account != keychainAccount {
+      SecureKeyStore.shared.deleteSecret(key: keychainAccount)
+    }
+    cacheQueue.sync {
+      cachedKey = nil
+      cachedKeychainAccount = account
+      cacheLoaded = true
+    }
+  }
+
+  private static func activeKeychainAccount() -> String {
+    currentScopedKeychainAccount() ?? keychainAccount
+  }
+
+  private static func currentScopedKeychainAccount() -> String? {
+    guard let config = AppSessionConfig.current else { return nil }
+    let server = AgentPairingService.serverBase(config: config)
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased()
+    let userID = config.userID.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !server.isEmpty, !userID.isEmpty else { return nil }
+    let digest = SHA256.hash(data: Data("\(server)|\(userID)".utf8))
+    return "\(scopedKeychainAccountPrefix).\(base64urlEncode(Data(digest)))"
+  }
+
+  private static func loadKey(account: String) -> Data? {
+    guard let b64 = SecureKeyStore.shared.retrieveSecret(key: account),
+      let data = Data(base64Encoded: b64), data.count == 32
+    else { return nil }
+    return data
+  }
 
   /// Extract a runtime key from a scanned QR payload, if one is present: the
   /// dedicated `vibegram-rk:<b64>` sync QR, or the `#<b64>` fragment of a

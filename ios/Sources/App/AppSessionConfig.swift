@@ -213,6 +213,7 @@ struct AppSessionConfig {
   static func store(_ config: AppSessionConfig) {
     ChatEngineStore.shared.clearConfig()
     ChatEngineStore.shared.setConfig(config.payload)
+    VibeNativeCallManager.shared.syncStoredPushTokens(reason: "app-session-store", force: true)
   }
 
   private static func normalizedString(_ value: Any?) -> String? {

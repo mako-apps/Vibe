@@ -5,6 +5,35 @@ enum ChatHomeService {
     rowsIncludingBuiltInAgent(ChatHomeRowsCache.rows(userID: config.userID))
   }
 
+  static func storeCachedRows(_ rows: [ChatHomeListRow], config: AppSessionConfig) {
+    ChatHomeRowsCache.store(rowsIncludingBuiltInAgent(rows), userID: config.userID)
+  }
+
+  static func removeCachedChat(chatID: String, config: AppSessionConfig) {
+    let normalizedChatID = chatID.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !normalizedChatID.isEmpty else { return }
+    let nextRows = ChatHomeRowsCache.rows(userID: config.userID)
+      .filter { $0.chatId != normalizedChatID }
+    ChatHomeRowsCache.store(rowsIncludingBuiltInAgent(nextRows), userID: config.userID)
+  }
+
+  static func upsertCachedRow(_ row: ChatHomeListRow, config: AppSessionConfig) {
+    guard !row.isArchiveEntry else { return }
+    var nextRows = ChatHomeRowsCache.rows(userID: config.userID)
+      .filter { $0.chatId != row.chatId && !$0.isArchiveEntry }
+    let insertionIndex: Int
+    if row.isSavedMessages {
+      insertionIndex = 0
+    } else {
+      insertionIndex =
+        nextRows
+        .prefix { $0.isSavedMessages || $0.isBuiltInAgentSurface || $0.pinned }
+        .count
+    }
+    nextRows.insert(row, at: min(insertionIndex, nextRows.count))
+    ChatHomeRowsCache.store(rowsIncludingBuiltInAgent(nextRows), userID: config.userID)
+  }
+
   static func isOfflineError(_ error: Error) -> Bool {
     if let homeError = error as? ChatHomeServiceError {
       switch homeError {

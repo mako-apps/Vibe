@@ -289,6 +289,32 @@ defmodule VibeWeb.ChatChannel do
     end
   end
 
+  # phone → server: fetch the connected bridge's live usage snapshot (Claude
+  # subscription 5h/7-day limits + this chat's last-run tokens) for the inline
+  # Usage panel. The daemon replies with `usage_result`, relayed back as
+  # `agent-bridge-usage`.
+  def handle_in("agent-bridge-usage", payload, socket) when is_map(payload) do
+    "chat:" <> chat_id = socket.topic
+    user_id = socket.assigns.user_id
+    provider = normalize_bridge_provider(payload["provider"] || payload["agentBridgeProvider"])
+
+    if is_nil(provider) do
+      {:reply, {:error, %{reason: "invalid_provider"}}, socket}
+    else
+      request_payload = %{
+        "requestId" => normalize_bridge_string(payload["requestId"]) || Ecto.UUID.generate(),
+        "provider" => provider,
+        "chatId" => chat_id,
+        "requesterUserId" => user_id
+      }
+
+      case AgentBridge.dispatch_usage(user_id, request_payload) do
+        :ok -> {:reply, {:ok, %{"requestId" => request_payload["requestId"]}}, socket}
+        {:error, :offline} -> {:reply, {:error, %{reason: "offline"}}, socket}
+      end
+    end
+  end
+
   # phone → server: the user's answer to a bridge-issued `ask_request` (plan
   # approval or a mid-run question). We relay it to the user's bridge, which
   # resolves the pending ask. The `answerEnc` blob is sealed with the runtime key

@@ -429,6 +429,16 @@ final class BubbleBackgroundView: UIView {
     gradientLayer.startPoint = CGPoint(x: 0.0, y: 0.0)
     gradientLayer.endPoint = CGPoint(x: 1.0, y: 1.0)
     layer.mask = bubbleMaskLayer
+
+    let screenScale = UIScreen.main.scale
+    agentBorderLayer.contentsScale = screenScale
+    gradientLayer.contentsScale = screenScale
+    fillLayer.contentsScale = screenScale
+    bubbleMaskLayer.contentsScale = screenScale
+    layer.allowsEdgeAntialiasing = true
+    fillLayer.allowsEdgeAntialiasing = true
+    bubbleMaskLayer.allowsEdgeAntialiasing = true
+    agentBorderLayer.allowsEdgeAntialiasing = true
   }
 
   required init?(coder: NSCoder) {
@@ -463,10 +473,13 @@ final class BubbleBackgroundView: UIView {
     self.appearance = appearance
     self.shape = shape
 
-    // Check if only the corner radii changed (sequence boundary update).
+    // Check if only the corner radii changed (sequence boundary update). Tail presence must
+    // match too: the integrated tail changes the path's segment structure, and CAShapeLayer
+    // path animations between structurally different paths glitch.
     let shapeOnlyChange =
       bounds.width > 0 && bounds.height > 0
       && previousShape.isMe == shape.isMe
+      && previousShape.showTail == shape.showTail
       && !hidden
       && (abs(previousShape.borderTopLeftRadius - shape.borderTopLeftRadius) > 0.5
         || abs(previousShape.borderTopRightRadius - shape.borderTopRightRadius) > 0.5
@@ -588,6 +601,27 @@ final class BubbleBackgroundView: UIView {
     setNeedsLayout()
   }
 
+  /// nil = no integrated tail; otherwise the side flag passed to `bubblePath`.
+  private var integratedTailSide: Bool? {
+    (shape.showTail && integratedTailEnabled) ? shape.isMe : nil
+  }
+
+  /// Cell-level suppression (ghost rows, typing, stickers, full-bleed media, centered agent
+  /// "thinking" bubble) on top of `shape.showTail` — the shape says a tail belongs to this
+  /// row, the cell says whether this particular presentation may draw it.
+  private var integratedTailEnabled = true
+
+  func setIntegratedTailEnabled(_ enabled: Bool) {
+    guard integratedTailEnabled != enabled else { return }
+    integratedTailEnabled = enabled
+    guard bounds.width > 0, bounds.height > 0 else { return }
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    applyShapePath()
+    applyAgentBorderPath()
+    CATransaction.commit()
+  }
+
   private func applyAgentBorderPath() {
     guard bounds.width > 0, bounds.height > 0 else { return }
     let path = bubblePath(
@@ -595,7 +629,8 @@ final class BubbleBackgroundView: UIView {
       topLeft: shape.borderTopLeftRadius,
       topRight: shape.borderTopRightRadius,
       bottomRight: shape.borderBottomRightRadius,
-      bottomLeft: shape.borderBottomLeftRadius
+      bottomLeft: shape.borderBottomLeftRadius,
+      tailOnRight: integratedTailSide
     )
     agentBorderLayer.frame = bounds
     agentBorderLayer.path = path.cgPath
@@ -607,19 +642,22 @@ final class BubbleBackgroundView: UIView {
       topLeft: shape.borderTopLeftRadius,
       topRight: shape.borderTopRightRadius,
       bottomRight: shape.borderBottomRightRadius,
-      bottomLeft: shape.borderBottomLeftRadius
+      bottomLeft: shape.borderBottomLeftRadius,
+      tailOnRight: integratedTailSide
     )
-    wallpaperLayer.frame = bounds
-    blurView.frame = bounds
+    // The tail path extends past the horizontal bounds, so bounded-content layers
+    // (gradient, wallpaper sample, blur) must paint wider than the view; the view-level
+    // bubbleMaskLayer clips everything back to the bubble+tail silhouette. CAShapeLayers
+    // (mask + fill) render their full path regardless of bounds, so they stay at bounds.
+    let paintRect = bounds.insetBy(dx: -(bubbleTailOverhang + 2.0), dy: 0.0)
+    wallpaperLayer.frame = paintRect
+    blurView.frame = paintRect
     bubbleMaskLayer.frame = bounds
     bubbleMaskLayer.path = path.cgPath
-    gradientLayer.frame = bounds
-    gradientLayer.mask = {
-      let mask = CAShapeLayer()
-      mask.frame = bounds
-      mask.path = path.cgPath
-      return mask
-    }()
+    gradientLayer.frame = paintRect
+    // No per-layer gradient mask: the view-level mask already clips the gradient to the
+    // bubble+tail path (a bounds-anchored sub-mask would mis-register against paintRect).
+    gradientLayer.mask = nil
     fillLayer.frame = bounds
     fillLayer.path = path.cgPath
   }
@@ -648,8 +686,10 @@ final class BubbleBackgroundView: UIView {
     }
 
     wallpaperLayer.contents = wallpaperSnapshot
+    // wallpaperLayer paints wider than bounds (tail overhang — see applyShapePath), so the
+    // sample rect must widen by the same amount to stay registered with the backdrop.
     wallpaperLayer.contentsRect = normalizedWallpaperSampleRect(
-      wallpaperSampleRect,
+      wallpaperSampleRect.insetBy(dx: -(bubbleTailOverhang + 2.0), dy: 0.0),
       containerSize: wallpaperContainerSize
     )
   }
@@ -700,8 +740,17 @@ final class BubbleBackgroundView: UIView {
     }
   }
 
+  /// Bubble outline, optionally with the Telegram-style tail hook drawn INTO the path.
+  /// `tailOnRight`: nil = no tail; true = tail at bottom-right (me); false = bottom-left
+  /// (them). The tail is spliced into that side's bottom corner arc and extends up to
+  /// ~`bubbleTailOverhang`pt beyond `rect` horizontally — callers' paint layers must cover
+  /// that overhang (see `applyShapePath`). Drawing the tail as part of the ONE body path is
+  /// what guarantees tail and body share the exact same fill/gradient/blur/wallpaper plate:
+  /// no color seam, no sliver poking outside the corner curve, no separate-view resolution
+  /// issues (all previous failure modes of the rotated `BubbleTailView` approach).
   private func bubblePath(
-    rect: CGRect, topLeft: CGFloat, topRight: CGFloat, bottomRight: CGFloat, bottomLeft: CGFloat
+    rect: CGRect, topLeft: CGFloat, topRight: CGFloat, bottomRight: CGFloat, bottomLeft: CGFloat,
+    tailOnRight: Bool? = nil
   ) -> UIBezierPath {
     let width = max(1.0, rect.width)
     let height = max(1.0, rect.height)
@@ -716,29 +765,167 @@ final class BubbleBackgroundView: UIView {
     path.addArc(
       withCenter: CGPoint(x: width - tr, y: tr), radius: tr, startAngle: 3 * .pi / 2, endAngle: 0.0,
       clockwise: true)
-    path.addLine(to: CGPoint(x: width, y: height - br))
-    path.addArc(
-      withCenter: CGPoint(x: width - br, y: height - br), radius: br, startAngle: 0.0,
-      endAngle: .pi / 2, clockwise: true)
-    path.addLine(to: CGPoint(x: bl, y: height))
-    path.addArc(
-      withCenter: CGPoint(x: bl, y: height - bl), radius: bl, startAngle: .pi / 2, endAngle: .pi,
-      clockwise: true)
-    path.addLine(to: CGPoint(x: 0.0, y: tl))
+    if tailOnRight == true {
+      addAndroidTail(onRight: true, to: path, width: width, height: height, radius: br)
+    } else {
+      path.addLine(to: CGPoint(x: width, y: height - br))
+      path.addArc(
+        withCenter: CGPoint(x: width - br, y: height - br), radius: br, startAngle: 0.0,
+        endAngle: .pi / 2, clockwise: true)
+    }
+    if tailOnRight == false {
+      addAndroidTail(
+        onRight: false,
+        to: path,
+        width: width,
+        height: height,
+        radius: bl,
+        topRadius: tl
+      )
+    } else {
+      path.addLine(to: CGPoint(x: bl, y: height))
+      path.addArc(
+        withCenter: CGPoint(x: bl, y: height - bl), radius: bl, startAngle: .pi / 2, endAngle: .pi,
+        clockwise: true)
+      path.addLine(to: CGPoint(x: 0.0, y: tl))
+    }
     path.addArc(
       withCenter: CGPoint(x: tl, y: tl), radius: tl, startAngle: .pi, endAngle: 3 * .pi / 2,
       clockwise: true)
     path.close()
     return path
   }
+
+  private func addAndroidTail(
+    onRight: Bool,
+    to path: UIBezierPath,
+    width: CGFloat,
+    height: CGFloat,
+    radius: CGFloat,
+    topRadius: CGFloat = 0.0
+  ) {
+    guard radius > 0.5 else {
+      if onRight {
+        path.addLine(to: CGPoint(x: width, y: height))
+      } else {
+        path.addLine(to: CGPoint(x: 0.0, y: topRadius))
+      }
+      return
+    }
+
+    // Android's visible tail is a clipped 29x29 two-quad glyph rotated 24 degrees and
+    // placed under the bubble. These points are that contour after clipping/rotation,
+    // spliced into the 18pt corner arc so the body corner still hides the tail stem.
+    let s = min(1.0, radius / 18.0)
+    let outerJoin = CGPoint(x: -0.3375 * s, y: -14.5308 * s)
+    let outerControl = CGPoint(x: 1.4197 * s, y: -9.2324 * s)
+    let tip = CGPoint(x: 7.7725 * s, y: -5.1111 * s)
+    let innerControl = CGPoint(x: 3.5312 * s, y: -3.1501 * s)
+    let innerJoin = CGPoint(x: -4.3952 * s, y: -6.2140 * s)
+
+    if onRight {
+      let center = CGPoint(x: width - radius, y: height - radius)
+      let outerPoint = CGPoint(x: width + outerJoin.x, y: height + outerJoin.y)
+      let innerPoint = CGPoint(x: width + innerJoin.x, y: height + innerJoin.y)
+      let outerAngle = atan2(outerPoint.y - center.y, outerPoint.x - center.x)
+      let innerAngle = atan2(innerPoint.y - center.y, innerPoint.x - center.x)
+
+      path.addLine(to: CGPoint(x: width, y: height - radius))
+      path.addArc(
+        withCenter: center,
+        radius: radius,
+        startAngle: 0.0,
+        endAngle: outerAngle,
+        clockwise: true
+      )
+      let outerTangent = CGPoint(x: -sin(outerAngle), y: cos(outerAngle))
+      let innerTangent = CGPoint(x: -sin(innerAngle), y: cos(innerAngle))
+      let outerC1 = CGPoint(
+        x: outerPoint.x + outerTangent.x * 4.8 * s,
+        y: outerPoint.y + outerTangent.y * 4.8 * s
+      )
+      let outerC2 = CGPoint(x: width + 5.8 * s, y: height - 7.6 * s)
+      let innerC1 = CGPoint(x: width + 4.8 * s, y: height - 2.2 * s)
+      let innerC2 = CGPoint(
+        x: innerPoint.x - innerTangent.x * 4.8 * s,
+        y: innerPoint.y - innerTangent.y * 4.8 * s
+      )
+      path.addCurve(
+        to: CGPoint(x: width + tip.x, y: height + tip.y),
+        controlPoint1: outerC1,
+        controlPoint2: outerC2
+      )
+      path.addCurve(
+        to: innerPoint,
+        controlPoint1: innerC1,
+        controlPoint2: innerC2
+      )
+      path.addArc(
+        withCenter: center,
+        radius: radius,
+        startAngle: innerAngle,
+        endAngle: .pi / 2.0,
+        clockwise: true
+      )
+    } else {
+      let center = CGPoint(x: radius, y: height - radius)
+      let innerPoint = CGPoint(x: -innerJoin.x, y: height + innerJoin.y)
+      let outerPoint = CGPoint(x: -outerJoin.x, y: height + outerJoin.y)
+      let innerAngle = atan2(innerPoint.y - center.y, innerPoint.x - center.x)
+      let outerAngle = atan2(outerPoint.y - center.y, outerPoint.x - center.x)
+
+      path.addLine(to: CGPoint(x: radius, y: height))
+      path.addArc(
+        withCenter: center,
+        radius: radius,
+        startAngle: .pi / 2.0,
+        endAngle: innerAngle,
+        clockwise: true
+      )
+      let innerTangent = CGPoint(x: -sin(innerAngle), y: cos(innerAngle))
+      let outerTangent = CGPoint(x: -sin(outerAngle), y: cos(outerAngle))
+      let innerC2 = CGPoint(x: -4.8 * s, y: height - 2.2 * s)
+      let innerC1 = CGPoint(
+        x: innerPoint.x + innerTangent.x * 4.8 * s,
+        y: innerPoint.y - innerTangent.y * 4.8 * s
+      )
+      let outerC1 = CGPoint(x: -5.8 * s, y: height - 7.6 * s)
+      let outerC2 = CGPoint(
+        x: outerPoint.x - outerTangent.x * 4.8 * s,
+        y: outerPoint.y - outerTangent.y * 4.8 * s
+      )
+      path.addCurve(
+        to: CGPoint(x: -tip.x, y: height + tip.y),
+        controlPoint1: innerC1,
+        controlPoint2: innerC2
+      )
+      path.addCurve(
+        to: outerPoint,
+        controlPoint1: outerC1,
+        controlPoint2: outerC2
+      )
+      path.addArc(
+        withCenter: center,
+        radius: radius,
+        startAngle: outerAngle,
+        endAngle: .pi,
+        clockwise: true
+      )
+      path.addLine(to: CGPoint(x: 0.0, y: topRadius))
+    }
+  }
 }
+
+/// How far the integrated bubble tail extends beyond the bubble body's edge
+/// (Android-derived tip reaches 7.7725pt out at full scale).
+let bubbleTailOverhang: CGFloat = 7.8
 
 private let bubbleMessageFont = UIFont.systemFont(ofSize: 16)
 private let bubbleMetaFont = UIFont.systemFont(ofSize: 10, weight: .medium)
 private let bubbleMetaPendingFont = UIFont.systemFont(ofSize: 10.5, weight: .semibold)
 private let bubbleMetaStatusFont = UIFont.systemFont(ofSize: 11, weight: .semibold)
-private let bubbleMetaInlineSpacing: CGFloat = 6.0
-private let bubbleMetaItemGap: CGFloat = 3.0
+private let bubbleMetaInlineSpacing: CGFloat = 4.0
+private let bubbleMetaItemGap: CGFloat = 2.0
 private let bubbleStatusSlotWidth: CGFloat = 17.0
 private let bubbleStatusSlotHeight: CGFloat = 14.0
 private let bubbleStatusCheckStrokeWidth: CGFloat = 1.0
@@ -839,7 +1026,7 @@ private func bubbleStatusCheckImage(double: Bool, color: UIColor) -> UIImage? {
   let size = CGSize(width: bubbleStatusSlotWidth, height: bubbleStatusSlotHeight)
   let renderer = UIGraphicsImageRenderer(size: size)
   return renderer.image { ctx in
-    let scale: CGFloat = 0.63
+    let scale: CGFloat = 0.66
     let baseX = size.width - (24.0 * scale) - 0.5
     let baseY = (size.height - (24.0 * scale)) * 0.5
 
@@ -859,7 +1046,8 @@ private func bubbleStatusCheckImage(double: Bool, color: UIColor) -> UIImage? {
       firstPath.addLine(to: point(8.94975, 16.9497))
       firstPath.addLine(to: point(19.5572, 6.34326))
     }
-    firstPath.lineWidth = (double ? 1.5 : 2.0) * scale
+    // Heavier strokes so the double-tick reads clearly at this small size (was 1.5/2.0).
+    firstPath.lineWidth = (double ? 2.0 : 2.2) * scale
     firstPath.lineCapStyle = .round
     firstPath.lineJoinStyle = .round
     firstPath.stroke()
@@ -869,7 +1057,7 @@ private func bubbleStatusCheckImage(double: Bool, color: UIColor) -> UIImage? {
       secondPath.move(to: point(20.0, 7.5625))
       secondPath.addLine(to: point(11.4283, 16.5625))
       secondPath.addLine(to: point(11.0, 16.0))
-      secondPath.lineWidth = 1.5 * scale
+      secondPath.lineWidth = 2.0 * scale
       secondPath.lineCapStyle = .round
       secondPath.lineJoinStyle = .round
       secondPath.stroke()
@@ -2325,7 +2513,8 @@ func measureMessageBubbleLayout(
       isProgressExpanded: agentTurnState.isProgressExpanded,
       isRuntimeExpanded: agentTurnState.isRuntimeExpanded,
       expandedStepIds: agentTurnState.expandedStepIds,
-      streamingStartDate: agentTurnState.streamingStartDate
+      streamingStartDate: agentTurnState.streamingStartDate,
+      showsLoaderView: false
     )
     let hasReaction = row.reactionEmoji != nil && row.reactionEmoji?.isEmpty == false
     let reactionHeightOffset: CGFloat = hasReaction ? 28.0 : 0.0
@@ -6525,7 +6714,11 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
     let showTail = row.shape.showTail && !isGhostHidden && !metrics.agentTurnCentered
       && !(row.messageType == "typing" || isTransparentStickerMessage(row) || usesTransparentAgentStreaming)
-    if showTail {
+    // Normal bubbles draw the tail INSIDE BubbleBackgroundView's own path (one shape, one
+    // fill — no color seam, no sliver outside the corner curve). The separate rotated
+    // tailView remains only for full-bleed media, where the tail must show image content.
+    bubbleView.setIntegratedTailEnabled(showTail && !isFullBleed)
+    if showTail && isFullBleed {
       // IMPORTANT: tailView has a rotation+flip transform applied, so we MUST NOT
       // set .frame (undefined behavior per Apple docs). Use bounds + center instead.
       let tailSize: CGFloat = 29
@@ -6533,16 +6726,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       let tailY = bubbleFrame.maxY - tailSize + 1.0
       tailView.bounds = CGRect(origin: .zero, size: CGSize(width: tailSize, height: tailSize))
       tailView.center = CGPoint(x: tailX + tailSize * 0.5, y: tailY + tailSize * 0.5)
-      tailView.isHidden = false
-      if isFullBleed {
-        let img = mediaImageView.image
-        tailView.setImage(img)
-        // Hide tail until media image loads to avoid bubble-colored tail flash
-        if img == nil { tailView.isHidden = true }
-      } else {
-        tailView.setImage(nil)
-        tailView.configure(isMe: row.isMe, visible: true, appearance: appearance)
-      }
+      let img = mediaImageView.image
+      tailView.setImage(img)
+      // Hide tail until media image loads to avoid bubble-colored tail flash
+      tailView.isHidden = img == nil
     } else {
       tailView.setImage(nil)
       tailView.isHidden = true
@@ -6674,7 +6861,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
               // Tapping the "Working / Worked for…" header opens the full turn in the glass
               // sheet (same renderer) rather than an inline expand — see presentAgentTurnDetailView.
               self.onAgentAction?(["type": "openAgentTurnDetail", "messageId": messageId])
-            }
+            },
+            showsLoaderView: false
           )
           lastAgentTurnConfiguredRow = row
           lastAgentTurnConfiguredWidth = metrics.messageWidth
@@ -6808,9 +6996,16 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         let metaTop = metrics.hasLinkPreview
           ? linkPreviewView.frame.maxY + bubbleMetaTopSpacing
           : textBottom + bubbleMetaTopSpacing
+        // RTL text bubbles mirror the meta row to the LEFT edge (Telegram behavior:
+        // time+checks sit on the reading-trailing side of RTL content); LTR bottom-meta
+        // layouts (rich text / link preview) keep the right anchor.
+        let metaX =
+          usesRTLColumnLayout(row)
+          ? bubbleFrame.minX + bubbleHorizontalPadding
+          : bubbleFrame.maxX - bubbleHorizontalPadding - metrics.metaWidth
         metaContainerView.frame = pixelAlignedRect(
           CGRect(
-            x: bubbleFrame.maxX - bubbleHorizontalPadding - metrics.metaWidth,
+            x: metaX,
             y: metaTop,
             width: metrics.metaWidth,
             height: bubbleMetaHeight
@@ -8925,6 +9120,27 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     return bubbleView.convert(bubbleView.bounds, to: view)
   }
 
+  private func bubbleRenderCaptureRect(in view: UIView) -> CGRect {
+    var captureRect = bubbleView.convert(bubbleView.bounds, to: view)
+    guard let row,
+      row.kind == .message,
+      row.shape.showTail,
+      !bubbleView.isHidden,
+      tailView.isHidden
+    else {
+      return captureRect
+    }
+
+    let overhang = ceil(bubbleTailOverhang + 2.0)
+    if row.shape.isMe {
+      captureRect.size.width += overhang
+    } else {
+      captureRect.origin.x -= overhang
+      captureRect.size.width += overhang
+    }
+    return captureRect
+  }
+
   func reactionBadgeCenter(in view: UIView) -> CGPoint? {
     guard row?.kind == .message else {
       return nil
@@ -8940,7 +9156,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       return nil
     }
 
-    var captureRect = bubbleView.convert(bubbleView.bounds, to: contentView)
+    var captureRect = bubbleRenderCaptureRect(in: contentView)
     if !tailView.isHidden {
       let tailRect = tailView.convert(tailView.bounds, to: contentView)
       captureRect = captureRect.union(tailRect)
@@ -9002,7 +9218,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     guard bubbleBodyRect.width > 1.0, bubbleBodyRect.height > 1.0 else {
       return nil
     }
-    var fullBubbleRect = bubbleBodyRect
+    var fullBubbleRect = bubbleRenderCaptureRect(in: contentView).integral
     if !tailView.isHidden {
       let tailRect = tailView.convert(tailView.bounds, to: contentView).integral
       fullBubbleRect = fullBubbleRect.union(tailRect).integral
@@ -9156,6 +9372,15 @@ final class BubbleTailView: UIView {
     gradientLayer.endPoint = CGPoint(x: 1.0, y: 1.0)
     layer.addSublayer(fillLayer)
     layer.mask = tailMaskLayer
+
+    // Shape layers (and layer masks) rasterize at contentsScale 1.0 by default, so on a
+    // 2x/3x display the tail's curved edge is drawn at 1px then scaled up — that's the
+    // jagged/low-res tail. Pin every shaping layer to the screen scale for a crisp edge.
+    let screenScale = UIScreen.main.scale
+    fillLayer.contentsScale = screenScale
+    tailMaskLayer.contentsScale = screenScale
+    clipMaskLayer.contentsScale = screenScale
+    gradientLayer.contentsScale = screenScale
   }
 
   func setImage(_ image: UIImage?) {
@@ -9164,11 +9389,11 @@ final class BubbleTailView: UIView {
     blurView.isHidden = image != nil
     fillLayer.isHidden = image != nil
     wallpaperLayer.isHidden = image != nil || wallpaperSnapshot == nil
-    if image != nil {
-      gradientLayer.isHidden = true
-    } else {
-      gradientLayer.isHidden = !currentIsMe
-    }
+    // The normal me/them tail is a solid fillLayer now (see applyTailChrome); only the agent
+    // tail uses gradientLayer, and it re-enables that itself in applyAgentTailStyle. So keep
+    // the gradient hidden here regardless of sender — a stale reveal would re-introduce the
+    // rotated-gradient color seam we removed.
+    gradientLayer.isHidden = true
   }
 
   required init?(coder: NSCoder) {
@@ -9311,6 +9536,7 @@ final class BubbleTailView: UIView {
 
     // Also clip to bottom portion
     let clipLayer = CAShapeLayer()
+    clipLayer.contentsScale = UIScreen.main.scale
     clipLayer.frame = bounds
     clipLayer.path =
       UIBezierPath(
@@ -9322,6 +9548,7 @@ final class BubbleTailView: UIView {
     // Gradient mask for me bubbles
     if !gradientLayer.isHidden {
       let gradMask = CAShapeLayer()
+      gradMask.contentsScale = UIScreen.main.scale
       gradMask.frame = bounds
       gradMask.path = basePath.cgPath
       gradientLayer.mask = gradMask
@@ -9391,13 +9618,25 @@ final class BubbleTailView: UIView {
       let plateAlpha = isMe ? appearance.outgoingPlateFillOpacity : appearance.incomingPlateFillOpacity
       fillLayer.fillColor = plateColor.withAlphaComponent(plateAlpha).cgColor
     } else {
-      gradientLayer.isHidden = !isMe
-      gradientLayer.colors = appearance.bubbleMeGradient.map(\.cgColor)
-      gradientLayer.opacity = Float(isMe ? 0.88 : 0.0)
-      fillLayer.fillColor =
-        isMe
-        ? UIColor.clear.cgColor
-        : appearance.bubbleThemColor.withAlphaComponent(appearance.isDark ? 0.86 : 1.0).cgColor
+      // Fill the tail with a SOLID color that matches the bubble body at the tail junction
+      // instead of giving the tail its own gradient. The tail view is rotated 26.5°, so a
+      // gradient painted in its local space samples a *different* point of the ramp than the
+      // body edge it butts against — that mismatch is the visible color seam + washed /
+      // "reduced opacity" look. The junction sits at the body's gradient end (bottom-right
+      // for me → last stop), so a solid last-stop color at the body's own 0.88 gradient
+      // opacity, over the same blur, reads as one continuous shape.
+      gradientLayer.isHidden = true
+      gradientLayer.opacity = 0.0
+      if isMe {
+        let junction =
+          appearance.bubbleMeGradient.last
+          ?? appearance.bubbleMeGradient.first
+          ?? UIColor(red: 0.49, green: 0.36, blue: 0.88, alpha: 1.0)
+        fillLayer.fillColor = junction.withAlphaComponent(0.88).cgColor
+      } else {
+        fillLayer.fillColor =
+          appearance.bubbleThemColor.withAlphaComponent(appearance.isDark ? 0.86 : 1.0).cgColor
+      }
     }
 
     // For 'me': rotate CW 26.565° (tail curves right at bottom-right of bubble)

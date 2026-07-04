@@ -165,7 +165,13 @@ struct AgentBridgeConnectionSheet: View {
     .fullScreenCover(isPresented: $model.isScanning) {
       AgentQRScannerView(
         instruction: "Scan the QR shown on your computer",
+        message: model.scannerMessage,
+        statusStyle: model.scannerStatusStyle,
+        isProcessing: model.isAuthorizing,
+        canRetry: model.scannerCanRetry,
+        resetToken: model.scannerResetToken,
         onResult: { model.handleScanned($0) },
+        onRetry: { model.retryScan() },
         onCancel: { model.cancelScan() }
       )
       .ignoresSafeArea()

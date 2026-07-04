@@ -434,6 +434,59 @@ struct ChatRoute: Identifiable, Hashable {
     chatId == "saved_messages" || isBuiltInAgentSurface
   }
 
+  var hasPeerResponse: Bool {
+    Self.rowsContainPeerResponse(initialRows, peerUserId: peerUserId, isGroup: isGroup, isAgent: isAgent)
+  }
+
+  static func rowsContainPeerResponse(
+    _ rows: [[String: Any]],
+    peerUserId: String?,
+    isGroup: Bool,
+    isAgent: Bool
+  ) -> Bool {
+    if isGroup || isAgent {
+      return true
+    }
+    guard let peer = normalizedString(peerUserId)?.uppercased(), !peer.isEmpty else {
+      return false
+    }
+    return rows.contains { row in
+      let message = (row["message"] as? [String: Any]) ?? row
+      if boolValue(message["isMe"]) == false {
+        return true
+      }
+      let fromId = normalizedString(message["fromId"] ?? message["from_id"])?.uppercased()
+      return fromId == peer
+    }
+  }
+
+  private static func normalizedString(_ value: Any?) -> String? {
+    if let value = value as? String {
+      let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+      return trimmed.isEmpty ? nil : trimmed
+    }
+    if let value = value as? NSNumber {
+      return value.stringValue
+    }
+    return nil
+  }
+
+  private static func boolValue(_ value: Any?) -> Bool? {
+    if let value = value as? Bool { return value }
+    if let value = value as? NSNumber { return value.boolValue }
+    if let value = value as? String {
+      switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+      case "1", "true", "yes", "on":
+        return true
+      case "0", "false", "no", "off":
+        return false
+      default:
+        return nil
+      }
+    }
+    return nil
+  }
+
   init(
     chatId: String,
     title: String,
@@ -1174,6 +1227,8 @@ private final class ChatsViewModel: ObservableObject {
   private var agentConversationObserver: NSObjectProtocol?
   private var realtimeMessageObserver: NSObjectProtocol?
   private var realtimeRefreshTask: Task<Void, Never>?
+  private var locallyRemovedChatIDs = Set<String>()
+  private var projectedMessageIDsByChat = [String: String]()
 
   init() {
     agentConversationObserver = NotificationCenter.default.addObserver(
@@ -1196,14 +1251,29 @@ private final class ChatsViewModel: ObservableObject {
       object: nil,
       queue: .main
     ) { [weak self] note in
-      // Refresh for BOTH a peer / other-device ping ("remoteNewMessage") AND a message
-      // inserted locally on THIS device ("chatMessageInserted"). Without the latter, a
-      // message the user sends here never nudges the home list — most visibly the very
-      // first message in a brand-new conversation, whose preview would otherwise stay
-      // blank until some unrelated remote nudge arrived.
-      let reason = note.userInfo?["reason"] as? String
-      guard reason == "remoteNewMessage" || reason == "chatMessageInserted" else { return }
-      self?.scheduleRealtimeRefresh()
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+        let reason = note.userInfo?["reason"] as? String
+        let chatID = Self.normalizedString(note.userInfo?["chatId"])
+        switch reason {
+        case "chatCleared":
+          if let chatID {
+            self.removeLocalChat(chatID: chatID, persist: true)
+          }
+        case "remoteNewMessage":
+          if let chatID {
+            self.applyRemoteNewMessage(chatID: chatID)
+          }
+          self.scheduleRealtimeRefresh()
+        case "chatMessageInserted", "chatMessageEdited", "chatMessageDeleted", "chatMessageChanged":
+          if let chatID {
+            self.applyEngineProjection(chatID: chatID, reason: reason ?? "")
+          }
+          self.scheduleRealtimeRefresh()
+        default:
+          break
+        }
+      }
     }
   }
 
@@ -1225,9 +1295,107 @@ private final class ChatsViewModel: ObservableObject {
     guard hasLoaded else { return }
     realtimeRefreshTask?.cancel()
     realtimeRefreshTask = Task { @MainActor [weak self] in
-      try? await Task.sleep(nanoseconds: 400_000_000)
+      try? await Task.sleep(nanoseconds: 180_000_000)
       guard !Task.isCancelled, let self else { return }
       await self.refresh(preserveRows: true)
+    }
+  }
+
+  func removeLocalChat(chatID: String, persist: Bool) {
+    let normalizedChatID = chatID.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !normalizedChatID.isEmpty else { return }
+    locallyRemovedChatIDs.insert(normalizedChatID)
+    projectedMessageIDsByChat.removeValue(forKey: normalizedChatID)
+
+    let previousRows = rows.count
+    let previousArchivedRows = archivedRows.count
+    rows.removeAll { $0.chatId == normalizedChatID }
+    archivedRows.removeAll { $0.chatId == normalizedChatID }
+    if persist, let config = AppSessionConfig.current {
+      ChatHomeService.removeCachedChat(chatID: normalizedChatID, config: config)
+    }
+    if previousRows != rows.count || previousArchivedRows != archivedRows.count {
+      AppUITrace.notice(
+        "ChatsViewModel localRemove chatId=\(String(normalizedChatID.prefix(12))) rows=\(rows.count) archived=\(archivedRows.count)"
+      )
+    }
+  }
+
+  func restoreLocalRow(_ row: ChatHomeListRow) {
+    locallyRemovedChatIDs.remove(row.chatId)
+    projectedMessageIDsByChat.removeValue(forKey: row.chatId)
+    rows = Self.upserting(row, into: rows)
+    if let config = AppSessionConfig.current {
+      ChatHomeService.upsertCachedRow(row, config: config)
+    }
+  }
+
+  func markLocalRead(chatID: String) {
+    let normalizedChatID = chatID.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !normalizedChatID.isEmpty else { return }
+    let changed = mutateRow(chatID: normalizedChatID) { row in
+      guard row.unreadCount > 0 || row.markedUnread else { return row }
+      return row.withHomeState(unreadCount: 0, markedUnread: false)
+    }
+    if changed {
+      persistHomeRows()
+    }
+  }
+
+  private func applyRemoteNewMessage(chatID: String) {
+    let normalizedChatID = chatID.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !normalizedChatID.isEmpty else { return }
+    locallyRemovedChatIDs.remove(normalizedChatID)
+    let changed = mutateRow(chatID: normalizedChatID) { row in
+      row.withHomeState(unreadCount: row.unreadCount + 1, markedUnread: true)
+    }
+    if changed {
+      persistHomeRows()
+    }
+  }
+
+  private func applyEngineProjection(chatID: String, reason: String) {
+    let normalizedChatID = chatID.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !normalizedChatID.isEmpty, !locallyRemovedChatIDs.contains(normalizedChatID) else {
+      return
+    }
+
+    let engineRows = ChatEngine.shared.getChatRows(["chatId": normalizedChatID])
+    guard let latestRow = engineRows.last else {
+      if reason == "chatMessageDeleted" || reason == "chatRowsReloaded" {
+        let changed = mutateRow(chatID: normalizedChatID) { row in
+          row.withHomeState(previewRows: [], initialMessages: [])
+        }
+        if changed {
+          persistHomeRows()
+        }
+      }
+      return
+    }
+
+    let message = Self.messagePayload(from: latestRow)
+    let messageID = Self.messageID(from: message) ?? Self.messageID(from: latestRow)
+    let isIncoming = (Self.boolValue(message["isMe"]) == false)
+    let didAlreadyProject = messageID.flatMap { projectedMessageIDsByChat[normalizedChatID] == $0 } ?? false
+    let shouldIncrementUnread = reason == "chatMessageInserted" && isIncoming && !didAlreadyProject
+    let preview = ChatHomeListRow.homePreviewText(from: message)
+    let timeLabel = ChatHomeListRow.homeTimeLabel(from: message)
+
+    let changed = mutateRow(chatID: normalizedChatID) { row in
+      row.withHomeState(
+        preview: preview,
+        timeLabel: timeLabel.isEmpty ? row.timeLabel : timeLabel,
+        unreadCount: shouldIncrementUnread ? row.unreadCount + 1 : row.unreadCount,
+        markedUnread: shouldIncrementUnread ? true : row.markedUnread,
+        previewRows: engineRows,
+        initialMessages: engineRows
+      )
+    }
+    if let messageID {
+      projectedMessageIDsByChat[normalizedChatID] = messageID
+    }
+    if changed {
+      persistHomeRows()
     }
   }
 
@@ -1303,7 +1471,8 @@ private final class ChatsViewModel: ObservableObject {
     defer { isLoading = false }
 
     do {
-      let nextRows = try await ChatHomeService.fetchChats(config: config)
+      let fetchedRows = try await ChatHomeService.fetchChats(config: config)
+      let nextRows = fetchedRows.filter { !locallyRemovedChatIDs.contains($0.chatId) }
       if Self.rowsSnapshotSignature(nextRows) != Self.rowsSnapshotSignature(rows) {
         rows = nextRows
         AppUITrace.notice(
@@ -1346,7 +1515,8 @@ private final class ChatsViewModel: ObservableObject {
     defer { isLoadingArchived = false }
 
     do {
-      let nextRows = try await ChatHomeService.fetchArchivedChats(config: config)
+      let fetchedRows = try await ChatHomeService.fetchArchivedChats(config: config)
+      let nextRows = fetchedRows.filter { !locallyRemovedChatIDs.contains($0.chatId) }
       if Self.rowsSnapshotSignature(nextRows) != Self.rowsSnapshotSignature(archivedRows) {
         archivedRows = nextRows
       }
@@ -1393,6 +1563,83 @@ private final class ChatsViewModel: ObservableObject {
     ChatEngine.shared.prefetchChatHistories(chatIds: preloadChatIds)
   }
 
+  private func mutateRow(
+    chatID: String,
+    transform: (ChatHomeListRow) -> ChatHomeListRow
+  ) -> Bool {
+    var changed = false
+    rows = rows.map { row in
+      guard row.chatId == chatID else { return row }
+      changed = true
+      return transform(row)
+    }
+    archivedRows = archivedRows.map { row in
+      guard row.chatId == chatID else { return row }
+      changed = true
+      return transform(row)
+    }
+    return changed
+  }
+
+  private func persistHomeRows() {
+    guard let config = AppSessionConfig.current else { return }
+    ChatHomeService.storeCachedRows(rows, config: config)
+  }
+
+  private static func upserting(
+    _ row: ChatHomeListRow,
+    into existingRows: [ChatHomeListRow]
+  ) -> [ChatHomeListRow] {
+    guard !row.isArchiveEntry else { return existingRows }
+    var nextRows = existingRows.filter { $0.chatId != row.chatId && !$0.isArchiveEntry }
+    let insertionIndex: Int
+    if row.isSavedMessages {
+      insertionIndex = 0
+    } else {
+      insertionIndex =
+        nextRows
+        .prefix { $0.isSavedMessages || $0.isBuiltInAgentSurface || $0.pinned }
+        .count
+    }
+    nextRows.insert(row, at: min(insertionIndex, nextRows.count))
+    return ChatHomeService.rowsIncludingBuiltInAgent(nextRows)
+  }
+
+  private static func messagePayload(from row: [String: Any]) -> [String: Any] {
+    (row["message"] as? [String: Any]) ?? row
+  }
+
+  private static func messageID(from payload: [String: Any]) -> String? {
+    normalizedString(payload["id"] ?? payload["messageId"] ?? payload["message_id"] ?? payload["key"])
+  }
+
+  private static func normalizedString(_ value: Any?) -> String? {
+    if let value = value as? String {
+      let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+      return trimmed.isEmpty ? nil : trimmed
+    }
+    if let value = value as? NSNumber {
+      return value.stringValue
+    }
+    return nil
+  }
+
+  private static func boolValue(_ value: Any?) -> Bool? {
+    if let value = value as? Bool { return value }
+    if let value = value as? NSNumber { return value.boolValue }
+    if let value = value as? String {
+      switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+      case "1", "true", "yes", "on":
+        return true
+      case "0", "false", "no", "off":
+        return false
+      default:
+        return nil
+      }
+    }
+    return nil
+  }
+
   private static func rowsSnapshotSignature(_ rows: [ChatHomeListRow]) -> String {
     rows.map { row in
       [
@@ -1411,6 +1658,48 @@ private final class ChatsViewModel: ObservableObject {
         row.peerTier ?? "",
       ].joined(separator: "\u{1F}")
     }.joined(separator: "\u{1E}")
+  }
+}
+
+private extension ChatHomeListRow {
+  func withHomeState(
+    preview: String? = nil,
+    timeLabel: String? = nil,
+    unreadCount: Int? = nil,
+    markedUnread: Bool? = nil,
+    previewRows: [[String: Any]]? = nil,
+    initialMessages: [[String: Any]]? = nil
+  ) -> ChatHomeListRow {
+    ChatHomeListRow(
+      chatId: chatId,
+      title: title,
+      preview: preview ?? self.preview,
+      timeLabel: timeLabel ?? self.timeLabel,
+      unreadCount: max(0, unreadCount ?? self.unreadCount),
+      markedUnread: markedUnread ?? self.markedUnread,
+      muted: muted,
+      pinned: pinned,
+      archived: archived,
+      isTyping: isTyping,
+      isOnline: isOnline,
+      peerUserId: peerUserId,
+      avatarUri: avatarUri,
+      avatarFallback: avatarFallback,
+      avatarGradientStartLight: avatarGradientStartLight,
+      avatarGradientEndLight: avatarGradientEndLight,
+      avatarGradientStartDark: avatarGradientStartDark,
+      avatarGradientEndDark: avatarGradientEndDark,
+      isSavedMessages: isSavedMessages,
+      isArchiveEntry: isArchiveEntry,
+      type: type,
+      isGroup: isGroup,
+      isAgentFriend: isAgentFriend,
+      peerAgentId: peerAgentId,
+      agentEventInboxMode: agentEventInboxMode,
+      peerTier: peerTier,
+      previewRows: previewRows ?? self.previewRows,
+      initialMessages: initialMessages ?? self.initialMessages
+    )
   }
 }
 
@@ -1616,6 +1905,7 @@ private struct ChatHomeScreen: View {
   }
 
   private func openLocalChatRow(_ row: ChatHomeListRow) {
+    model.markLocalRead(chatID: row.chatId)
     if !row.isBuiltInAgentSurface, !row.isBridgeAgentSurface, !row.initialMessages.isEmpty {
       ChatEngine.shared.seedRecentChatHistory(
         chatId: row.chatId, messages: row.initialMessages, limit: 3)
@@ -1870,6 +2160,7 @@ private struct ChatHomeScreen: View {
               limit: 3
             )
           }
+          model.markLocalRead(chatID: row.chatId)
           coordinator.openChat(ChatRoute(row: row))
         },
         onToggleSelection: { chatID in
@@ -2031,6 +2322,7 @@ private struct ChatHomeScreen: View {
 
     pendingDeleteConfirmation = nil
     locallyHiddenChatIDs.insert(row.chatId)
+    model.removeLocalChat(chatID: row.chatId, persist: true)
     selectedChatIDs.remove(row.chatId)
     let deletion = ChatHomePendingDeletion(
       row: row,
@@ -2062,6 +2354,7 @@ private struct ChatHomeScreen: View {
       pendingDeletion = nil
     }
     locallyHiddenChatIDs.remove(deletion.row.chatId)
+    model.restoreLocalRow(deletion.row)
     if !deletion.row.initialMessages.isEmpty {
       ChatEngine.shared.seedRecentChatHistory(
         chatId: deletion.row.chatId,
@@ -2112,6 +2405,7 @@ private struct ChatHomeScreen: View {
       pendingDeletionTask = nil
     }
     locallyHiddenChatIDs.remove(deletion.row.chatId)
+    model.restoreLocalRow(deletion.row)
     if !deletion.row.initialMessages.isEmpty {
       ChatEngine.shared.seedRecentChatHistory(
         chatId: deletion.row.chatId,
@@ -2462,6 +2756,7 @@ private struct ChatHomeDeleteAvatarView: View {
 }
 
 private struct ChatHomeDeletionUndoToast: View {
+  @Environment(\.colorScheme) private var colorScheme
   let deletion: ChatHomePendingDeletion
   let palette: AppThemePalette
   let undo: () -> Void
@@ -2512,7 +2807,15 @@ private struct ChatHomeDeletionUndoToast: View {
       .padding(.trailing, 10)
       .frame(maxWidth: .infinity)
       .frame(height: 58)
-      .background(AppHomeGlassEffectView(cornerRadius: 99))
+      .background(
+        RoundedRectangle(cornerRadius: 22, style: .continuous)
+          .fill(palette.card)
+      )
+      .overlay(
+        RoundedRectangle(cornerRadius: 22, style: .continuous)
+          .stroke(palette.border.opacity(0.55), lineWidth: 1)
+      )
+      .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.28 : 0.12), radius: 14, y: 8)
     }
   }
 }
@@ -4488,10 +4791,21 @@ private final class ChatHomeMiniPreviewController: UIViewController {
     if ChatEngine.shared.isTyping(["chatId": row.chatId]) {
       return "typing..."
     }
+    if row.isGroup {
+      return "group"
+    }
+    guard ChatRoute.rowsContainPeerResponse(
+      row.initialMessages.isEmpty ? row.previewRows : row.initialMessages,
+      peerUserId: row.peerUserId,
+      isGroup: row.isGroup,
+      isAgent: row.isAgentFriend
+    ) else {
+      return ""
+    }
     if isOnline(for: row) {
       return "online"
     }
-    return row.isGroup ? "group" : "last seen recently"
+    return "last seen recently"
   }
 
   private static func isOnline(for row: ChatHomeListRow) -> Bool {
@@ -4970,7 +5284,7 @@ final class ChatProfileRootController: UIViewController {
       object: nil
     )
     applyRoute()
-    refreshRows(preferInitialRows: true)
+    refreshRows()
   }
 
   deinit {
@@ -4996,33 +5310,35 @@ final class ChatProfileRootController: UIViewController {
     }
     if routeChanged || themeChanged {
       applyRoute()
-      refreshRows(preferInitialRows: true)
+      refreshRows()
     }
   }
 
   private func applyRoute() {
     let surfaceId = "native_profile_\(route.chatId)"
     view.backgroundColor = Self.backgroundColor(isDark: isDark)
-    profileView.surfaceId = surfaceId
-    profileView.setProfileOnly(true)
-    profileView.setEngineSurfaceId(surfaceId)
-    profileView.setEngineChatId(route.chatId)
-    profileView.setEnginePeerUserId(route.peerUserId ?? "")
-    if let myUserId = Self.normalizedString(
-      ChatEngineStore.shared.getConfig()["myUserId"] ?? ChatEngineStore.shared.getConfig()["userId"]
-    ) {
-      profileView.setEngineMyUserId(myUserId)
+    profileView.performBatchedProfileUpdate {
+      profileView.surfaceId = surfaceId
+      profileView.setProfileOnly(true)
+      profileView.setEngineSurfaceId(surfaceId)
+      profileView.setEngineChatId(route.chatId)
+      profileView.setEnginePeerUserId(route.peerUserId ?? "")
+      if let myUserId = Self.normalizedString(
+        ChatEngineStore.shared.getConfig()["myUserId"] ?? ChatEngineStore.shared.getConfig()["userId"]
+      ) {
+        profileView.setEngineMyUserId(myUserId)
+      }
+      profileView.setAppearance(Self.resolvedAppearance(isDark: isDark))
+      profileView.setHeaderTitle(route.title)
+      profileView.setHeaderSubtitle(Self.routeOnlyHeaderSubtitle(for: route))
+      profileView.setProfileName(route.title)
+      profileView.setBridgeProvider(route.bridgeProvider ?? "")
+      profileView.setProfileHandle(Self.profileHandle(for: route))
+      profileView.setProfileBio("")
+      profileView.setAvatarUri(route.avatarURI)
+      profileView.setIsGroupOrChannel(route.isGroup)
+      profileView.setRows(route.initialRows)
     }
-    profileView.setAppearance(Self.resolvedAppearance(isDark: isDark))
-    profileView.setHeaderTitle(route.title)
-    profileView.setHeaderSubtitle(Self.routeOnlyHeaderSubtitle(for: route))
-    profileView.setProfileName(route.title)
-    profileView.setBridgeProvider(route.bridgeProvider ?? "")
-    profileView.setProfileHandle(Self.profileHandle(for: route))
-    profileView.setProfileBio("")
-    profileView.setAvatarUri(route.avatarURI)
-    profileView.setIsGroupOrChannel(route.isGroup)
-    profileView.setRows(route.initialRows)
   }
 
   private func refreshRows(preferInitialRows: Bool = false) {
@@ -5135,6 +5451,9 @@ final class ChatProfileRootController: UIViewController {
   }
 
   private func performClearChat(deleteForEveryone: Bool) {
+    if let config = AppSessionConfig.current {
+      ChatHomeService.removeCachedChat(chatID: route.chatId, config: config)
+    }
     if deleteForEveryone {
       _ = ChatEngine.shared.clearChat([
         "chatId": route.chatId,
@@ -5188,7 +5507,7 @@ final class ChatProfileRootController: UIViewController {
     if route.isGroup {
       return "group"
     }
-    return route.peerUserId == nil ? "" : "last seen recently"
+    return route.peerUserId == nil || !route.hasPeerResponse ? "" : "last seen recently"
   }
 
   private static func profileHandle(for route: ChatRoute) -> String {
@@ -5469,6 +5788,11 @@ final class ChatConversationController: UIViewController {
     lastAppliedRowsToSurfaceCount = 0
     mainView.surfaceId = surfaceId
     mainView.setDefersEngineStateRefreshes(true)
+    // Seed route identity before any header/avatar paint. The chat header fallback
+    // color is keyed by peer/chat identity, and waiting for the deferred engine
+    // binding lets it briefly render from the title-only default seed.
+    mainView.setEngineChatId(route.chatId)
+    mainView.setEnginePeerUserId(route.peerUserId ?? "")
     mainView.setStatusAuthorityEnabled(false)
     mainView.setEngineChannelBindingEnabled(false)
     if deferSurfaceUntilAttached {
@@ -5776,6 +6100,42 @@ final class ChatConversationController: UIViewController {
       sheet.preferredCornerRadius = 28
     }
     present(host, animated: true)
+  }
+
+  /// The bubble chat header's title/subtitle tap for bridge chats — live or idle — opens
+  /// this instead of the profile (see `handleTitlePressed`/`agentSessionPressed` in
+  /// ChatMainView). Picking a past session loads its transcript into THIS chat via the same
+  /// `loadAgentBridgeSessionIntoChat` ingestion the full-page agent view uses; the bubble
+  /// view has no "fresh session only" filter, so the rows land through the normal
+  /// `ChatEngine.didChangeNotification` → `refreshRows()` path.
+  private func presentAgentSessionHistorySheet(provider: String) {
+    let status = AgentPairingService.lastStatusSnapshot
+    let host = UIHostingController(
+      rootView: AgentBridgeHistorySheet(
+        provider: provider,
+        chatId: route.chatId,
+        runningTasks: status?.runningTasks ?? [],
+        deviceLabel: AgentPairingService.lastDeviceLabel ?? "",
+        connected: AgentPairingService.lastConnected,
+        paired: status?.paired ?? false,
+        onPick: { [weak self] session in
+          self?.loadBridgeSessionIntoChat(provider: provider, session: session)
+        }
+      )
+      .preferredColorScheme(isDark ? .dark : .light)
+    )
+    host.view.backgroundColor = .clear
+    present(host, animated: true)
+  }
+
+  private func loadBridgeSessionIntoChat(provider: String, session: AgentBridgeHistorySession) {
+    let sessionId = session.resolvedSessionId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !sessionId.isEmpty, !sessionId.hasPrefix("running:") else { return }
+    _ = ChatEngine.shared.loadAgentBridgeSessionIntoChat([
+      "chatId": route.chatId,
+      "provider": provider,
+      "sessionId": sessionId,
+    ])
   }
 
   /// Clears any active connect gate (used when the host is reused for another chat).
@@ -6171,7 +6531,7 @@ final class ChatConversationController: UIViewController {
     let handle = Self.profileHandle(for: route)
     DispatchQueue.global(qos: .utility).async { [weak self] in
       let subtitle = Self.headerSubtitle(for: route)
-      let isOnline = Self.isOnline(for: route)
+      let isOnline = route.hasPeerResponse ? Self.isOnline(for: route) : false
       DispatchQueue.main.async { [weak self] in
         guard let self, self.route == route else { return }
         self.mainView.setHeaderSubtitle(subtitle)
@@ -6273,26 +6633,28 @@ final class ChatConversationController: UIViewController {
 
   private func configureProfileView(_ profileView: ChatProfileMainView, rows: [[String: Any]]) {
     let surfaceId = "native_profile_\(route.chatId)"
-    profileView.surfaceId = surfaceId
-    profileView.setProfileOnly(true)
-    profileView.setEngineSurfaceId(surfaceId)
-    profileView.setEngineChatId(route.chatId)
-    profileView.setEnginePeerUserId(route.peerUserId ?? "")
-    if let myUserId = Self.normalizedString(
-      ChatEngineStore.shared.getConfig()["myUserId"] ?? ChatEngineStore.shared.getConfig()["userId"]
-    ) {
-      profileView.setEngineMyUserId(myUserId)
+    profileView.performBatchedProfileUpdate {
+      profileView.surfaceId = surfaceId
+      profileView.setProfileOnly(true)
+      profileView.setEngineSurfaceId(surfaceId)
+      profileView.setEngineChatId(route.chatId)
+      profileView.setEnginePeerUserId(route.peerUserId ?? "")
+      if let myUserId = Self.normalizedString(
+        ChatEngineStore.shared.getConfig()["myUserId"] ?? ChatEngineStore.shared.getConfig()["userId"]
+      ) {
+        profileView.setEngineMyUserId(myUserId)
+      }
+      profileView.setAppearance(Self.resolvedAppearance(isDark: isDark))
+      profileView.setHeaderTitle(route.title)
+      profileView.setHeaderSubtitle(Self.routeOnlyHeaderSubtitle(for: route))
+      profileView.setProfileName(route.title)
+      profileView.setBridgeProvider(route.bridgeProvider ?? "")
+      profileView.setProfileHandle(Self.profileHandle(for: route))
+      profileView.setProfileBio("")
+      profileView.setAvatarUri(route.avatarURI)
+      profileView.setIsGroupOrChannel(route.isGroup)
+      profileView.setRows(rows)
     }
-    profileView.setAppearance(Self.resolvedAppearance(isDark: isDark))
-    profileView.setHeaderTitle(route.title)
-    profileView.setHeaderSubtitle(Self.routeOnlyHeaderSubtitle(for: route))
-    profileView.setProfileName(route.title)
-    profileView.setBridgeProvider(route.bridgeProvider ?? "")
-    profileView.setProfileHandle(Self.profileHandle(for: route))
-    profileView.setProfileBio("")
-    profileView.setAvatarUri(route.avatarURI)
-    profileView.setIsGroupOrChannel(route.isGroup)
-    profileView.setRows(rows)
   }
 
   private func showProfileView(animated: Bool) {
@@ -6532,6 +6894,12 @@ final class ChatConversationController: UIViewController {
       if let provider = payloadProvider ?? route.bridgeProvider, !provider.isEmpty {
         presentBridgeRepositoryPicker(provider: provider)
       }
+    case "agentSessionPressed":
+      let payloadProvider =
+        Self.normalizedString(payload["provider"] ?? payload["agentBridgeProvider"])
+      if let provider = payloadProvider ?? route.bridgeProvider, !provider.isEmpty {
+        presentAgentSessionHistorySheet(provider: provider)
+      }
     case "agentStopStreaming":
       if let provider = route.bridgeProvider, !provider.isEmpty {
         let result = ChatEngine.shared.sendAgentBridgeControl([
@@ -6694,6 +7062,9 @@ final class ChatConversationController: UIViewController {
   }
 
   private func performClearChat(deleteForEveryone: Bool) {
+    if let config = AppSessionConfig.current {
+      ChatHomeService.removeCachedChat(chatID: route.chatId, config: config)
+    }
     if deleteForEveryone {
       _ = ChatEngine.shared.clearChat([
         "chatId": route.chatId,
@@ -6818,11 +7189,12 @@ final class ChatConversationController: UIViewController {
     if let bridgeSubtitle = bridgeHeaderSubtitle(for: route) {
       return bridgeSubtitle
     }
-    if isOnline(for: route) {
-      return "online"
-    }
     if route.isGroup {
       return "group"
+    }
+    guard route.hasPeerResponse else { return "" }
+    if isOnline(for: route) {
+      return "online"
     }
     if let lastSeen = ChatEngine.shared.lastSeenTimestampMs(userId: route.peerUserId),
       let label = lastSeenLabel(from: lastSeen)
@@ -6842,7 +7214,7 @@ final class ChatConversationController: UIViewController {
     if route.isGroup {
       return "group"
     }
-    return route.peerUserId == nil ? "" : "last seen recently"
+    return route.peerUserId == nil || !route.hasPeerResponse ? "" : "last seen recently"
   }
 
   private func logLifecycle(_ event: String) {
@@ -7131,7 +7503,7 @@ struct AppChatNavigationHeaderView: View {
     if route.isGroup {
       return "group"
     }
-    return route.peerUserId == nil ? "" : "last seen recently"
+    return route.peerUserId == nil || !route.hasPeerResponse ? "" : "last seen recently"
   }
 
   var body: some View {

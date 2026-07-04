@@ -428,6 +428,11 @@ final class ChatEngine {
   // sealed `agentFileEnc`). Observers watch `didChangeNotification` reason
   // "agentBridgeFile" and read it via `latestAgentBridgeFile(requestId:)`.
   private var agentBridgeFileByRequestId: [String: [String: Any]] = [:]
+  // Structured usage-snapshot replies from the bridge, keyed requestId -> payload
+  // (holds the plaintext `report`: Claude 5h/7-day buckets + this chat's tokens).
+  // Observers watch `didChangeNotification` reason "agentBridgeUsage" and read it
+  // via `latestAgentBridgeUsage(requestId:)`.
+  private var agentBridgeUsageByRequestId: [String: [String: Any]] = [:]
   // Pending "ask" requests from the bridge (plan approval / mid-run question),
   // keyed requestId -> payload (holds the sealed `askEnc`). Observers watch
   // `didChangeNotification` reason "agentBridgeAsk" and read it via
@@ -1996,6 +2001,53 @@ final class ChatEngine {
   func latestAgentBridgeFile(requestId rawRequestId: String) -> [String: Any]? {
     let requestId = normalizedString(rawRequestId) ?? rawRequestId
     return syncOnQueue { agentBridgeFileByRequestId[requestId] }
+  }
+
+  /// Ask the connected bridge for a structured usage snapshot (Claude 5h/7-day
+  /// limits + this chat's last-run tokens) for the inline Usage panel. The reply
+  /// arrives over the chat topic as `agent-bridge-usage`; observe
+  /// `didChangeNotification` reason "agentBridgeUsage" and read it via
+  /// `latestAgentBridgeUsage(requestId:)`.
+  func requestAgentBridgeUsage(_ payload: [String: Any]) -> [String: Any] {
+    let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"])
+    let provider = normalizedString(payload["provider"] ?? payload["agentBridgeProvider"])
+    let requestId = normalizedString(payload["requestId"]) ?? UUID().uuidString
+
+    guard let chatId, !chatId.isEmpty else { return ["accepted": false, "reason": "invalid_chat"] }
+    guard let provider, !provider.isEmpty else { return ["accepted": false, "reason": "invalid_provider"] }
+
+    return syncOnQueue {
+      guard let client = phoenixClient else {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+          self?.ensureNativeTransport(trigger: "bridge_usage_no_socket")
+        }
+        return ["accepted": false, "reason": "no_native_socket"]
+      }
+      guard nativeJoinedChatIds.contains(chatId), (state["connected"] as? Bool) == true else {
+        joinNativeChatTopicIfNeededLocked(chatId: chatId)
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+          self?.ensureNativeTransport(trigger: "bridge_usage_chat_not_joined")
+        }
+        return ["accepted": false, "reason": "chat_not_joined"]
+      }
+
+      let ref = client.push(
+        topic: chatTopic(for: chatId),
+        event: "agent-bridge-usage",
+        payload: ["provider": provider, "requestId": requestId]
+      )
+      appendJournalLocked(
+        event: "native-agent-bridge-usage-request",
+        payload: ["chatId": chatId, "provider": provider, "ref": ref]
+      )
+      return ["accepted": true, "transport": "native", "ref": ref, "requestId": requestId]
+    }
+  }
+
+  /// The most recent usage snapshot reply for a requestId, if it has arrived.
+  func latestAgentBridgeUsage(requestId rawRequestId: String) -> [String: Any]? {
+    let requestId = normalizedString(rawRequestId) ?? rawRequestId
+    return syncOnQueue { agentBridgeUsageByRequestId[requestId] }
   }
 
   /// The most recent ask request (plan approval / question) for a requestId.
@@ -4534,6 +4586,14 @@ final class ChatEngine {
 
       if let localStatus {
         switch localStatus {
+        // `localStatusIndex` is a monotonic high-water mark (see `upsertLocalStatusLocked`
+        // → `strongerDisplayStatus`). Honor a retained read/delivered here so display never
+        // downgrades to raw "sent" when `receiptIndex` was cleared (reconnect / chat reload)
+        // but the local high-water still remembers the peer reached read/delivered.
+        case "read":
+          return "read"
+        case "delivered":
+          return "delivered"
         case "error":
           return "error"
         case "sent":
@@ -4906,7 +4966,10 @@ final class ChatEngine {
 
     // Prefer the most recent TOOL/step node for the working indicator — the feed now
     // carries narration "text" nodes inline, and echoing a wall of prose in the
-    // typing/working label reads wrong. Fall back to any label, then a generic.
+    // typing/working label reads wrong. Fall back to any label, then to "Thinking" —
+    // the bare pre-first-token state (no progress nodes at all yet) — so the chat
+    // header reads "Thinking…" instead of a generic "Working…" the instant a turn
+    // starts, before anything is renderable in the transcript body.
     let streamProgressLabel =
       progressNodes.reversed().first(where: { node in
         ((normalizedString(node["kind"] ?? node["itemType"]) ?? "").lowercased()) != "text"
@@ -4914,7 +4977,7 @@ final class ChatEngine {
       ?? progressNodes.reversed().compactMap { node in
         normalizedString(node["label"] ?? node["title"])
       }.first
-      ?? "Running task"
+      ?? "Thinking"
     setAgentProgressLocked(
       chatId: chatId,
       label: streamProgressLabel,
@@ -5735,6 +5798,21 @@ final class ChatEngine {
           }
           self.postChangeLocked(
             reason: "agentBridgeFile",
+            userInfo: [
+              "chatId": chatId,
+              "requestId": requestId,
+              "ok": (frame.payload["ok"] as? Bool) ?? true,
+            ]
+          )
+          return
+        }
+        if frame.event == "agent-bridge-usage" {
+          let requestId = self.normalizedString(frame.payload["requestId"]) ?? ""
+          if !requestId.isEmpty {
+            self.agentBridgeUsageByRequestId[requestId] = frame.payload
+          }
+          self.postChangeLocked(
+            reason: "agentBridgeUsage",
             userInfo: [
               "chatId": chatId,
               "requestId": requestId,
