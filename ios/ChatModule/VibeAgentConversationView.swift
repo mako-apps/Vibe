@@ -456,14 +456,15 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   // In-view header (the app hides the system nav bar, so this VC carries its own):
   // model name centered (tappable → model/thinking/speed), connected device beneath,
   // plus back / new-chat / overflow. Shown only when NOT embedded in a SwiftUI nav.
-  private let headerBar = UIView()
-  private let headerBlur = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterial))
+  private let headerContentView = UIView()
+  private let backGlassView = UIVisualEffectView(effect: nil)
   private let headerBackButton = UIButton(type: .system)
+  private let avatarGlassView = UIVisualEffectView(effect: nil)
+  private let titleGlassView = UIView()
+  private let customTitleStack = UIStackView()
   private let headerModelButton = UIButton(type: .system)
-  private let headerNewChatButton = UIButton(type: .system)
-  private let headerMenuButton = UIButton(type: .system)
-  private let headerSeparator = UIView()
-  private var headerHeightConstraint: NSLayoutConstraint?
+  private let rightActionsGlassView = UIVisualEffectView(effect: nil)
+  private let rightActionsStack = UIStackView()
   private var usesInViewHeader: Bool { !isEmbeddedInSwiftUI && !embeddedInChatHost }
 
   /// The header profile avatar — the SAME avatar as the main chat view (gradient +
@@ -726,6 +727,9 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     headerAvatarView.removeTarget(self, action: #selector(profileTapped), for: .touchUpInside)
     headerAvatarView.addTarget(self, action: #selector(profileTapped), for: .touchUpInside)
     refreshHeaderAvatar()
+    
+    guard !usesInViewHeader else { return }
+    
     // Already installed? The history/new-chat group is the trailing-most custom stack.
     if navigationItem.rightBarButtonItems?.last?.customView === headerHistoryActionsStack {
       return
@@ -751,7 +755,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     }
     if animated {
       if !targetHidden { headerNewChatActionButton.alpha = 0 }
-      navigationController?.navigationBar.setNeedsLayout()
+      view.setNeedsLayout()
       UIView.animate(
         withDuration: 0.28, delay: 0,
         usingSpringWithDamping: 0.86, initialSpringVelocity: 0.4,
@@ -759,14 +763,17 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       ) {
         self.headerNewChatActionButton.isHidden = targetHidden
         self.headerNewChatActionButton.alpha = targetHidden ? 0 : 1
-        self.headerHistoryActionsStack.layoutIfNeeded()
-        // Let the nav bar re-place the (now wider/narrower) history group so the cloud
-        // and history stay put and only new chat moves.
-        self.navigationController?.navigationBar.layoutIfNeeded()
+        if self.usesInViewHeader {
+          self.layoutCustomHeaderViews()
+        } else {
+          self.headerHistoryActionsStack.layoutIfNeeded()
+          self.navigationController?.navigationBar.layoutIfNeeded()
+        }
       }
     } else {
       headerNewChatActionButton.isHidden = targetHidden
       headerNewChatActionButton.alpha = targetHidden ? 0 : 1
+      view.setNeedsLayout()
     }
   }
 
@@ -1062,12 +1069,18 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
 
   override func viewWillAppear(_ animated: Bool) {
     super.viewWillAppear(animated)
+    if usesInViewHeader {
+      navigationController?.setNavigationBarHidden(true, animated: animated)
+    }
     applyNavigationAppearance()
   }
 
   override func viewWillDisappear(_ animated: Bool) {
     super.viewWillDisappear(animated)
     view.endEditing(true)
+    if usesInViewHeader {
+      navigationController?.setNavigationBarHidden(false, animated: animated)
+    }
   }
 
   override func viewIsAppearing(_ animated: Bool) {
@@ -1590,64 +1603,215 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   }
 
   private func buildInViewHeader() {
-    navigationController?.setNavigationBarHidden(false, animated: false)
+    navigationController?.setNavigationBarHidden(true, animated: false)
+    if headerContentView.superview == nil {
+      setupCustomHeaderViews()
+    }
+    updateHeaderActionButtons(animated: false)
+    updateHeaderTexts()
+  }
 
-    let titleStack = UIStackView()
-    titleStack.axis = .vertical
-    titleStack.alignment = .center
-
-    let subtitleStack = UIStackView(arrangedSubviews: [connectionDotView, connectionSpinner, subtitleLabel])
-    subtitleStack.spacing = 4
-    subtitleStack.alignment = .center
-
+  private func setupCustomHeaderViews() {
+    headerContentView.backgroundColor = .clear
+    view.addSubview(headerContentView)
+    
+    headerContentView.addSubview(backGlassView)
+    headerContentView.addSubview(avatarGlassView)
+    headerContentView.addSubview(titleGlassView)
+    headerContentView.addSubview(rightActionsGlassView)
+    
+    let backEffect = UIGlassEffect()
+    backEffect.isInteractive = true
+    backEffect.tintColor = .clear
+    backGlassView.effect = backEffect
+    
+    headerBackButton.setTitle(nil, for: .normal)
+    headerBackButton.setImage(UIImage(systemName: "chevron.backward"), for: .normal)
+    let backSymbolConfig = UIImage.SymbolConfiguration(pointSize: 18, weight: .semibold)
+    headerBackButton.setPreferredSymbolConfiguration(backSymbolConfig, forImageIn: .normal)
+    headerBackButton.tintColor = appearance.text
+    headerBackButton.addTarget(self, action: #selector(closeTapped), for: .touchUpInside)
+    backGlassView.contentView.addSubview(headerBackButton)
+    
+    let avatarEffect = UIGlassEffect()
+    avatarEffect.isInteractive = true
+    avatarEffect.tintColor = .clear
+    avatarGlassView.effect = avatarEffect
+    
+    headerAvatarView.translatesAutoresizingMaskIntoConstraints = true
+    headerAvatarView.constraints.forEach { constraint in
+      if constraint.firstAttribute == .width || constraint.firstAttribute == .height {
+        constraint.isActive = false
+      }
+    }
+    headerAvatarView.removeTarget(self, action: #selector(profileTapped), for: .touchUpInside)
+    headerAvatarView.addTarget(self, action: #selector(profileTapped), for: .touchUpInside)
+    avatarGlassView.contentView.addSubview(headerAvatarView)
+    
+    customTitleStack.axis = .vertical
+    customTitleStack.alignment = .leading
+    customTitleStack.spacing = -1
+    
+    let modelSymbolConfig = UIImage.SymbolConfiguration(pointSize: 10, weight: .semibold)
     var modelCfg = UIButton.Configuration.plain()
-    modelCfg.contentInsets = NSDirectionalEdgeInsets(top: 2, leading: 6, bottom: 2, trailing: 6)
+    modelCfg.contentInsets = NSDirectionalEdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0)
     modelCfg.imagePlacement = .trailing
     modelCfg.imagePadding = 4
-    modelCfg.image = UIImage(systemName: "chevron.up.chevron.down", withConfiguration: UIImage.SymbolConfiguration(pointSize: 10, weight: .semibold))
-    // Keep the model name on ONE line — the nav bar's centered title slot is narrow
-    // (back + 2–3 right items), so a wrapping title char-breaks ("Op / us"). Truncate
-    // instead of wrapping, and let the label resist compression so it keeps its width.
+    modelCfg.image = UIImage(systemName: "chevron.up.chevron.down", withConfiguration: modelSymbolConfig)
     modelCfg.titleLineBreakMode = .byTruncatingTail
     headerModelButton.configuration = modelCfg
     headerModelButton.titleLabel?.numberOfLines = 1
     headerModelButton.titleLabel?.lineBreakMode = .byTruncatingTail
     headerModelButton.titleLabel?.adjustsFontSizeToFitWidth = true
     headerModelButton.titleLabel?.minimumScaleFactor = 0.85
-    headerModelButton.setContentCompressionResistancePriority(.required, for: .horizontal)
     headerModelButton.showsMenuAsPrimaryAction = true
-    headerModelButton.accessibilityLabel = "Model and run options"
-
-    titleStack.addArrangedSubview(headerModelButton)
-    titleStack.addArrangedSubview(subtitleStack)
-
-    // Connection pip + spinner
+    headerModelButton.tintColor = appearance.text
+    
     connectionDotView.layer.cornerRadius = 3
     connectionDotView.layer.cornerCurve = .continuous
     connectionDotView.translatesAutoresizingMaskIntoConstraints = false
     connectionSpinner.translatesAutoresizingMaskIntoConstraints = false
     connectionSpinner.hidesWhenStopped = true
     connectionSpinner.transform = CGAffineTransform(scaleX: 0.62, y: 0.62)
-
     subtitleLabel.font = UIFont.systemFont(ofSize: 11.5, weight: .medium)
+    subtitleLabel.textColor = appearance.textSecondary
     subtitleLabel.textAlignment = .left
     subtitleLabel.lineBreakMode = .byTruncatingTail
-
-    NSLayoutConstraint.activate([
-      connectionDotView.widthAnchor.constraint(equalToConstant: 6),
-      connectionDotView.heightAnchor.constraint(equalToConstant: 6)
-    ])
-
-    navigationItem.titleView = titleStack
-
-    if onClose != nil {
-      let backButton = UIBarButtonItem(image: UIImage(systemName: "chevron.left"), style: .plain, target: self, action: #selector(closeTapped))
-      navigationItem.leftBarButtonItem = backButton
+    
+    let subtitleStack = UIStackView(arrangedSubviews: [connectionDotView, connectionSpinner, subtitleLabel])
+    subtitleStack.spacing = 4
+    subtitleStack.alignment = .center
+    
+    customTitleStack.addArrangedSubview(headerModelButton)
+    customTitleStack.addArrangedSubview(subtitleStack)
+    titleGlassView.addSubview(customTitleStack)
+    
+    let actionsEffect = UIGlassEffect()
+    actionsEffect.isInteractive = true
+    actionsEffect.tintColor = .clear
+    rightActionsGlassView.effect = actionsEffect
+    
+    rightActionsStack.axis = .horizontal
+    rightActionsStack.alignment = .fill
+    rightActionsStack.distribution = .fillEqually
+    rightActionsStack.spacing = 0
+    rightActionsGlassView.contentView.addSubview(rightActionsStack)
+    
+    let actionSymbolConfig = UIImage.SymbolConfiguration(pointSize: 17, weight: .medium)
+    headerNewChatActionButton.setTitle(nil, for: .normal)
+    headerNewChatActionButton.setImage(UIImage(systemName: "square.and.pencil"), for: .normal)
+    headerNewChatActionButton.setPreferredSymbolConfiguration(actionSymbolConfig, forImageIn: .normal)
+    headerNewChatActionButton.tintColor = appearance.text
+    
+    headerHistoryButton.setTitle(nil, for: .normal)
+    headerHistoryButton.setImage(createHistoryIcon(), for: .normal)
+    headerHistoryButton.tintColor = appearance.text
+    
+    rightActionsStack.addArrangedSubview(headerNewChatActionButton)
+    rightActionsStack.addArrangedSubview(headerHistoryButton)
+    
+    [headerBackButton, headerModelButton, headerNewChatActionButton, headerHistoryButton].forEach { button in
+      button.backgroundColor = .clear
+      button.contentHorizontalAlignment = .center
+      button.contentVerticalAlignment = .center
+      button.clipsToBounds = true
     }
+  }
 
-    installHeaderActionsItem()
-    updateHeaderActionButtons(animated: false)
-    updateHeaderTexts()
+  private func layoutCustomHeaderViews() {
+    guard usesInViewHeader else { return }
+    let safeTop = view.safeAreaInsets.top
+    headerContentView.frame = CGRect(x: 12.0, y: safeTop + 8.0, width: view.bounds.width - 24.0, height: 44.0)
+    
+    backGlassView.frame = CGRect(x: 0.0, y: 0.0, width: 44.0, height: 44.0)
+    avatarGlassView.frame = CGRect(x: backGlassView.frame.maxX + 8.0, y: 0.0, width: 44.0, height: 44.0)
+    
+    var visibleActionCount = 0
+    if !headerNewChatActionButton.isHidden { visibleActionCount += 1 }
+    if !headerHistoryButton.isHidden { visibleActionCount += 1 }
+    
+    let actionWidth: CGFloat = 44.0
+    let totalActionsWidth = CGFloat(visibleActionCount) * actionWidth
+    
+    rightActionsGlassView.frame = CGRect(
+      x: headerContentView.bounds.width - totalActionsWidth,
+      y: 0.0,
+      width: totalActionsWidth,
+      height: 44.0
+    )
+    
+    rightActionsStack.frame = rightActionsGlassView.bounds
+    
+    let titleMinX = avatarGlassView.frame.maxX + 12.0
+    let titleMaxX = rightActionsGlassView.frame.minX > 0 ? rightActionsGlassView.frame.minX - 8.0 : headerContentView.bounds.width - 8.0
+    let availableWidth = max(0, titleMaxX - titleMinX)
+    
+    titleGlassView.frame = CGRect(
+      x: titleMinX,
+      y: 0.0,
+      width: availableWidth,
+      height: 44.0
+    )
+    
+    headerBackButton.frame = backGlassView.bounds
+    headerAvatarView.frame = avatarGlassView.bounds.insetBy(dx: 4.0, dy: 4.0)
+    headerAvatarView.layer.cornerRadius = headerAvatarView.bounds.height / 2.0
+    headerAvatarView.clipsToBounds = true
+    
+    [headerBackButton, headerNewChatActionButton, headerHistoryButton].forEach { button in
+      button.layer.cornerRadius = button.bounds.height / 2.0
+    }
+    [backGlassView, avatarGlassView, titleGlassView, rightActionsGlassView].forEach { glass in
+      glass.layer.cornerRadius = glass.bounds.height / 2.0
+    }
+    
+    let horizontalInset: CGFloat = 4.0
+    let stackSize = customTitleStack.systemLayoutSizeFitting(
+      CGSize(width: titleGlassView.bounds.width - (horizontalInset * 2.0), height: UIView.layoutFittingCompressedSize.height),
+      withHorizontalFittingPriority: .required,
+      verticalFittingPriority: .fittingSizeLevel
+    )
+    customTitleStack.frame = CGRect(
+      x: horizontalInset,
+      y: (titleGlassView.bounds.height - stackSize.height) * 0.5,
+      width: titleGlassView.bounds.width - (horizontalInset * 2.0),
+      height: stackSize.height
+    )
+  }
+
+  private func createHistoryIcon(strokeWidth: CGFloat = 1.8) -> UIImage {
+    let size = CGSize(width: 24, height: 24)
+    let scale = 24.0 / 64.0
+    let renderer = UIGraphicsImageRenderer(size: size)
+    return renderer.image { context in
+      let cgContext = context.cgContext
+      cgContext.setLineWidth(strokeWidth)
+      cgContext.setLineCap(.round)
+      cgContext.setLineJoin(.round)
+      UIColor.black.setStroke()
+      
+      let center = CGPoint(x: 35.6 * scale, y: 30.73 * scale)
+      let radius: CGFloat = 21.91 * scale
+      
+      let path = UIBezierPath()
+      path.addArc(withCenter: center, radius: radius, startAngle: CGFloat.pi / 2.0, endAngle: CGFloat.pi, clockwise: false)
+      cgContext.addPath(path.cgPath)
+      cgContext.strokePath()
+      
+      let arrow = UIBezierPath()
+      arrow.move(to: CGPoint(x: 5.79 * scale, y: 21.06 * scale))
+      arrow.addLine(to: CGPoint(x: 13.67 * scale, y: 31.35 * scale))
+      arrow.addLine(to: CGPoint(x: 23.96 * scale, y: 23.48 * scale))
+      cgContext.addPath(arrow.cgPath)
+      cgContext.strokePath()
+      
+      let hands = UIBezierPath()
+      hands.move(to: CGPoint(x: 34.95 * scale, y: 14.04 * scale))
+      hands.addLine(to: CGPoint(x: 34.95 * scale, y: 32.35 * scale))
+      hands.addLine(to: CGPoint(x: 43.26 * scale, y: 38.72 * scale))
+      cgContext.addPath(hands.cgPath)
+      cgContext.strokePath()
+    }.withRenderingMode(.alwaysTemplate)
   }
 
   /// Latest model a run in this conversation reported (the bridge sends
@@ -1696,6 +1860,10 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       connectionSpinner.stopAnimating()
       connectionDotView.isHidden = !hasDevice
       connectionDotView.backgroundColor = UIColor(red: 0.16, green: 0.78, blue: 0.45, alpha: 1)
+    }
+    
+    if isViewLoaded {
+      view.setNeedsLayout()
     }
   }
 
@@ -1779,6 +1947,10 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     var cfg = headerModelButton.configuration ?? .plain()
     cfg.baseForegroundColor = appearance.text
     headerModelButton.configuration = cfg
+
+    headerBackButton.tintColor = appearance.text
+    headerNewChatActionButton.tintColor = appearance.text
+    headerHistoryButton.tintColor = appearance.text
 
     // Embedded (SwiftUI nav) path — keep the bar fully transparent so the feed flows
     // under it edge-to-edge.
@@ -2522,6 +2694,9 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
 
   override func viewDidLayoutSubviews() {
     super.viewDidLayoutSubviews()
+    if usesInViewHeader {
+      layoutCustomHeaderViews()
+    }
     updateScrollInsets()
     updateBottomEdgeFadeFrame()
     // Land at the bottom exactly once, after the first layout pass that actually has
@@ -3392,7 +3567,10 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     // token that measured a not-yet-grown contentSize.
     pushToTopReserve = computedPushToTopReserve()
     let bottom = max(baseBottom, pushToTopReserve)
-    let top = usageBannerVisible ? ChatPinnedBannerView.preferredHeight + 24.0 : 12.0
+    var top = usageBannerVisible ? ChatPinnedBannerView.preferredHeight + 24.0 : 12.0
+    if usesInViewHeader {
+      top += view.safeAreaInsets.top + 44.0 + 8.0
+    }
     guard force || abs(tableView.contentInset.bottom - bottom) > 0.5
       || abs(tableView.contentInset.top - top) > 0.5
     else { return }

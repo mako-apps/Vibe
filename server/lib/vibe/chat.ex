@@ -1132,6 +1132,140 @@ defmodule Vibe.Chat do
     result
   end
 
+  # ── Group administration (owner/admin) ──────────────────────────
+
+  @doc """
+  Owner/admin edit of a group's name / description / avatar. `attrs` may carry
+  any of "name", "description", "avatarUrl" (camel or snake case); only present,
+  non-empty keys are applied. Returns `{:ok, room}` or a `{:error, reason}` where
+  reason is `:not_found`, `:not_authorized`, or an `Ecto.Changeset`.
+  """
+  def update_group(chat_id, actor_id, attrs) do
+    settings = get_participant_settings(chat_id, actor_id)
+    room = Repo.get(Room, chat_id)
+
+    cond do
+      is_nil(room) or room.type not in ["group", "channel"] ->
+        {:error, :not_found}
+
+      is_nil(settings) or settings.role not in ["owner", "admin"] ->
+        {:error, :not_authorized}
+
+      true ->
+        changes =
+          %{}
+          |> put_group_change(:name, attrs["name"] || attrs[:name])
+          |> put_group_change(:description, attrs["description"] || attrs[:description])
+          |> put_group_change(
+            :avatar_url,
+            attrs["avatarUrl"] || attrs["avatar_url"] || attrs[:avatar_url]
+          )
+
+        case room |> Room.changeset(changes) |> Repo.update() do
+          {:ok, updated} ->
+            ChatHomeCache.invalidate_users(group_member_ids(chat_id))
+            {:ok, updated}
+
+          error ->
+            error
+        end
+    end
+  end
+
+  @doc """
+  Owner-only promote/demote of a member between "admin" and "member". The room
+  owner's role can never be changed.
+  """
+  def set_member_role(chat_id, actor_id, target_id, role) when role in ["admin", "member"] do
+    actor = get_participant_settings(chat_id, actor_id)
+    target = get_participant_settings(chat_id, target_id)
+
+    cond do
+      is_nil(actor) or actor.role != "owner" ->
+        {:error, :not_authorized}
+
+      is_nil(target) ->
+        {:error, :not_found}
+
+      target.role == "owner" ->
+        {:error, :cannot_change_owner}
+
+      true ->
+        case target |> Participant.changeset(%{role: role}) |> Repo.update() do
+          {:ok, updated} ->
+            invalidate_chat_home_cache(chat_id)
+            ChatHomeCache.invalidate_user(target_id)
+            {:ok, updated}
+
+          error ->
+            error
+        end
+    end
+  end
+
+  def set_member_role(_chat_id, _actor_id, _target_id, _role), do: {:error, :invalid_role}
+
+  @doc """
+  Owner-only hard delete of a group. FK cascades (`on_delete: :delete_all`) remove
+  participants, messages, pinned/scheduled rows and any group agent.
+  """
+  def delete_group(chat_id, actor_id) do
+    settings = get_participant_settings(chat_id, actor_id)
+    room = Repo.get(Room, chat_id)
+
+    cond do
+      is_nil(room) or room.type not in ["group", "channel"] ->
+        {:error, :not_found}
+
+      is_nil(settings) or settings.role != "owner" ->
+        {:error, :not_authorized}
+
+      true ->
+        member_ids = group_member_ids(chat_id)
+
+        case Repo.delete(room) do
+          {:ok, _} ->
+            ChatHomeCache.invalidate_users(member_ids)
+            {:ok, chat_id}
+
+          error ->
+            error
+        end
+    end
+  end
+
+  @doc """
+  A non-owner member leaves a group. The owner cannot leave (they delete instead).
+  """
+  def leave_group(chat_id, user_id) do
+    case get_participant_settings(chat_id, user_id) do
+      %Participant{role: "owner"} ->
+        {:error, :owner_cannot_leave}
+
+      %Participant{} = participant ->
+        result = Repo.delete(participant)
+        invalidate_chat_home_cache(chat_id)
+        ChatHomeCache.invalidate_user(user_id)
+        result
+
+      nil ->
+        {:error, :not_member}
+    end
+  end
+
+  defp group_member_ids(chat_id) do
+    Repo.all(from(p in Participant, where: p.chat_id == ^chat_id, select: p.user_id))
+  end
+
+  defp put_group_change(map, _key, nil), do: map
+
+  defp put_group_change(map, key, value) when is_binary(value) do
+    trimmed = String.trim(value)
+    if trimmed == "", do: map, else: Map.put(map, key, trimmed)
+  end
+
+  defp put_group_change(map, key, value), do: Map.put(map, key, value)
+
   # ── Channels ────────────────────────────────────────────────────
 
   def create_channel(creator_id, name, description \\ nil, avatar_url \\ nil) do

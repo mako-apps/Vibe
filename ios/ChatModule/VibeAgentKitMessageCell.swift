@@ -1,5 +1,27 @@
 import UIKit
 
+/// Desktop-CLI-style display label for a thinking progress item: "Thinking · 1.2k tokens"
+/// ticking while the model is still reasoning (the bridge streams a throttled live token
+/// count), "Thought for 23s · 1.7k tokens" once the block settles. Every other kind keeps
+/// its wire label. Shared by the shimmer line, the live feed rows and the finished step
+/// list so all three read identically.
+func vibeAgentKitProgressDisplayLabel(_ item: VibeAgentKitProgressItem) -> String {
+  let kind = (item.itemType ?? item.tool ?? "").lowercased()
+  guard kind == "thinking" else { return item.label }
+  let status = (item.status ?? "").lowercased()
+  let isRunning = ["running", "streaming", "in_progress", "active"].contains(status)
+  var parts: [String] = []
+  if !isRunning, let ms = item.durationMs, ms >= 1000 {
+    parts.append("Thought for \(chatAgentThinkingDurationText(ms))")
+  } else {
+    parts.append("Thinking")
+  }
+  if let tokens = item.tokens, tokens > 0 {
+    parts.append(chatAgentTokenCountText(tokens))
+  }
+  return parts.joined(separator: " · ")
+}
+
 final class VibeAgentKitMessageActionBarView: UIView {
   private let buttonSize: CGFloat = 26.0
   private let buttonSpacing: CGFloat = 8.0
@@ -566,8 +588,11 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
         // Live turn: shimmer the tool action in flight ("Edit chat.ex", "Run …"). Prefer
         // the last NON-text node so the shimmer never echoes the narration prose that is
         // already rendered (in full) inline in the interleaved feed below; fall back to a
-        // generic "Thinking" while the agent is only producing prose.
-        loaderText = progressItems.last(where: { $0.itemType != "text" })?.label
+        // generic "Thinking" while the agent is only producing prose. Thinking nodes get
+        // the live token counter ("Thinking · 1.2k tokens") so reasoning stretches read
+        // like the desktop CLI instead of a frozen label.
+        loaderText = progressItems.last(where: { $0.itemType != "text" })
+          .map { vibeAgentKitProgressDisplayLabel($0) }
           ?? fallbackProgressLabels.last ?? "Thinking"
       } else {
         // Completed turn: collapse the whole run into one tappable summary line
@@ -625,7 +650,8 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
         messageId, progressItems.count, feedOrder,
         textNodes.count, textChars, bodyTrimmed.count, hasFinalResponseText ? "Y" : "N",
         String(bodyTrimmed.prefix(48)).replacingOccurrences(of: "\n", with: "⏎"),
-        progressItems.last(where: { $0.itemType != "text" })?.label ?? "Thinking")
+        progressItems.last(where: { $0.itemType != "text" })
+          .map { vibeAgentKitProgressDisplayLabel($0) } ?? "Thinking")
       updateStreamingStepsList(
         progressItems,
         appearance: appearance,
@@ -1131,7 +1157,7 @@ private final class VibeAgentKitStepRowView: UIView {
     } else {
       titleLabel.numberOfLines = 2
       titleLabel.lineBreakMode = .byTruncatingTail
-      var labelText = item.label
+      var labelText = vibeAgentKitProgressDisplayLabel(item)
       if kind == "read", let start = item.lineStart {
         let range = item.lineEnd.map { "\(start)–\($0)" } ?? "\(start)"
         labelText += "  (\(range))"

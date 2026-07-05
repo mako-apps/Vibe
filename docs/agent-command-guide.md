@@ -38,18 +38,31 @@ needs it — e.g. **don't `cp` a file just to read or compare it**.
   Writing the response to a file, or piping into a shell, still asks.
 - **Pipelines are fine:** each segment is checked independently, so
   `grep foo src | head`, `cat f | sort | uniq -c`, `find . | wc -l` all run.
-  Quotes are respected — `grep -E 'a|b'` is not split on the `|`.
+  Quotes are respected — `grep -E 'a|b'` is not split on the `|`, even nested inside
+  a command substitution or behind an escaped quote (`grep "case \"x\|y"`).
+- **Variable assignment + command substitution:** `f=$(grep -rln "..." | head -1)`,
+  `echo "$f"`, and `grep -n "..." "$(grep -rln "..." | head -1)"` all run — the
+  substituted command is checked by the same rules recursively (so `f=$(rm -rf /)`
+  still asks, because the *inner* command isn't safe, not because `$(...)` exists).
+  A literal `$(...)` written inside single quotes (never expanded by bash) is left
+  alone. `VAR=value some-safe-command` (env-prefixed) also runs, e.g.
+  `NODE_ENV=production npm run build`.
+- **Multi-line commands:** a command split across lines with trailing `\` (for
+  readability, e.g. a multi-flag `xcodebuild` invocation) is treated as one logical
+  command, not several.
 
 ## Asks a human (mutating / sensitive)
 
 Use only when the task needs the side effect:
 
 - **Filesystem writes:** `cp`, `mv`, `rm`, `mkdir`, `touch`, `ln`, `chmod`,
-  `sed -i`, `tee`, and any `>`/`>>` redirect to a file
+  `sed -i`, `tee`, and any `>`/`>>` redirect to a file (not `2>&1` — that's just
+  merging stderr into stdout, no file is written)
 - **Git writes:** `git add|commit|checkout|reset|rebase|merge|pull|fetch|apply|restore`
 - **Package installs:** `npm install`, `pip install`, `gem/cargo/go install`
-- **Arbitrary code / substitution:** `python3 -c …`, `node -e …`,
-  `$(…)`, backticks, `<(…)`
+- **Arbitrary code:** `python3 -c …`, `node -e …`, backticks, `<(…)` process
+  substitution — these stay conservative (always ask) rather than being
+  recursively evaluated like `$(...)` is.
 
 ## Prefer the tools over Bash for edits
 

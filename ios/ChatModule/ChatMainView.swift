@@ -1062,7 +1062,7 @@ public final class ChatMainView: UIView,
       glassView.contentView.backgroundColor = .clear
     }
 
-    backButton.setImage(UIImage(systemName: "chevron.left"), for: .normal)
+    backButton.setImage(UIImage(systemName: "chevron.backward"), for: .normal)
     backButton.semanticContentAttribute = .forceLeftToRight
     backButton.titleLabel?.font = UIFont.systemFont(ofSize: 15, weight: .semibold)
     backButton.titleLabel?.lineBreakMode = .byClipping
@@ -1099,8 +1099,7 @@ public final class ChatMainView: UIView,
     callButton.setPreferredSymbolConfiguration(actionSymbolConfig, forImageIn: .normal)
     videoCallButton.setImage(UIImage(systemName: "video"), for: .normal)
     videoCallButton.setPreferredSymbolConfiguration(actionSymbolConfig, forImageIn: .normal)
-    historyButton.setImage(UIImage(systemName: "clock"), for: .normal)
-    historyButton.setPreferredSymbolConfiguration(actionSymbolConfig, forImageIn: .normal)
+    historyButton.setImage(createHistoryIcon(), for: .normal)
     newChatButton.setImage(UIImage(systemName: "plus"), for: .normal)
     newChatButton.setPreferredSymbolConfiguration(actionSymbolConfig, forImageIn: .normal)
 
@@ -1142,7 +1141,7 @@ public final class ChatMainView: UIView,
       for: .touchUpInside
     )
 
-    profileBackButton.setImage(UIImage(systemName: "chevron.left"), for: .normal)
+    profileBackButton.setImage(UIImage(systemName: "chevron.backward"), for: .normal)
     profileBackButton.addTarget(self, action: #selector(handleBackPressed), for: .touchUpInside)
     applyProfileHeaderMenuButtonStyle(profileMenuButton)
     profileMenuButton.addTarget(self, action: #selector(handleMenuPressed), for: .touchUpInside)
@@ -1404,7 +1403,7 @@ public final class ChatMainView: UIView,
         self.checkmarkImageView.alpha = 1
       } else {
         self.backButton.setTitle(nil, for: .normal)
-        self.backButton.setImage(UIImage(systemName: "chevron.left"), for: .normal)
+        self.backButton.setImage(UIImage(systemName: "chevron.backward"), for: .normal)
         self.backButton.accessibilityLabel = "Back"
         self.updateHeaderTexts() // restores chatTitleLabel and chatSubtitleLabel
         self.avatarImageView.alpha = 1
@@ -1516,6 +1515,25 @@ public final class ChatMainView: UIView,
         changedChatId,
         engineChatId
       )
+    }
+    // Live agent status fast-path: the agentProgress notification itself carries the
+    // label/tool/isActive, so update the header subtitle directly — no engine round-trip,
+    // and it works even while engine-state refreshes are deferred (which previously left
+    // a live run's header stuck on "Start session" until the deferred snapshot ran).
+    if changeReason == "agentProgress", !engineChatId.isEmpty,
+      changedChatId.trimmingCharacters(in: .whitespacesAndNewlines) == engineChatId
+    {
+      let isActive = (notification.userInfo?["isActive"] as? Bool) ?? false
+      let nextLabel =
+        isActive
+        ? Self.friendlyAgentProgressLabel(
+          rawLabel: notification.userInfo?["label"] as? String,
+          tool: notification.userInfo?["tool"] as? String)
+        : nil
+      if nextLabel != agentProgressSubtitle {
+        agentProgressSubtitle = nextLabel
+        updateHeaderTexts()
+      }
     }
     guard !defersEngineStateRefreshes else {
       updateHeaderTexts()
@@ -3602,7 +3620,7 @@ public final class ChatMainView: UIView,
     profileBackButton.tintColor = text
     profileMenuButton.tintColor = text
     
-    let actionTint = secondary.withAlphaComponent(0.74)
+    let actionTint = text
     [callButton, videoCallButton, historyButton, newChatButton].forEach { btn in
       btn.tintColor = actionTint
     }
@@ -4133,6 +4151,13 @@ public final class ChatMainView: UIView,
 
     func matches(_ needles: [String]) -> Bool {
       needles.contains { tool.contains($0) || label.contains($0) }
+    }
+
+    // Live thinking carries its streamed token counter ("Thinking · 1.2k tokens") — keep
+    // it verbatim; it's the one label meant to tick in real time like the desktop CLI,
+    // and a token count is not on-device context.
+    if label.hasPrefix("thinking"), label.contains("token") {
+      return (rawLabel ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     if matches(["approval", "awaiting", "permission"]) { return "Waiting for approval" }
@@ -5078,6 +5103,41 @@ public final class ChatMainView: UIView,
         return nil
       }
     return normalized
+  }
+
+  private func createHistoryIcon(strokeWidth: CGFloat = 1.8) -> UIImage {
+    let size = CGSize(width: 24, height: 24)
+    let scale = 24.0 / 64.0
+    let renderer = UIGraphicsImageRenderer(size: size)
+    return renderer.image { context in
+      let cgContext = context.cgContext
+      cgContext.setLineWidth(strokeWidth)
+      cgContext.setLineCap(.round)
+      cgContext.setLineJoin(.round)
+      UIColor.black.setStroke()
+      
+      let center = CGPoint(x: 35.6 * scale, y: 30.73 * scale)
+      let radius: CGFloat = 21.91 * scale
+      
+      let path = UIBezierPath()
+      path.addArc(withCenter: center, radius: radius, startAngle: CGFloat.pi / 2.0, endAngle: CGFloat.pi, clockwise: false)
+      cgContext.addPath(path.cgPath)
+      cgContext.strokePath()
+      
+      let arrow = UIBezierPath()
+      arrow.move(to: CGPoint(x: 5.79 * scale, y: 21.06 * scale))
+      arrow.addLine(to: CGPoint(x: 13.67 * scale, y: 31.35 * scale))
+      arrow.addLine(to: CGPoint(x: 23.96 * scale, y: 23.48 * scale))
+      cgContext.addPath(arrow.cgPath)
+      cgContext.strokePath()
+      
+      let hands = UIBezierPath()
+      hands.move(to: CGPoint(x: 34.95 * scale, y: 14.04 * scale))
+      hands.addLine(to: CGPoint(x: 34.95 * scale, y: 32.35 * scale))
+      hands.addLine(to: CGPoint(x: 43.26 * scale, y: 38.72 * scale))
+      cgContext.addPath(hands.cgPath)
+      cgContext.strokePath()
+    }.withRenderingMode(.alwaysTemplate)
   }
 
   private func topMostViewController() -> UIViewController? {

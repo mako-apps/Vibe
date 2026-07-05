@@ -436,6 +436,10 @@ final class ChatEngine {
   // Observers watch `didChangeNotification` reason "agentBridgeUsage" and read it
   // via `latestAgentBridgeUsage(requestId:)`.
   private var agentBridgeUsageByRequestId: [String: [String: Any]] = [:]
+  // Agent-bridge DM row persistence (see storeVolatileBridgeRowsLocked): pending
+  // debounced store per chatId + chats already seeded from disk this launch.
+  private var volatileBridgeRowsStoreTimers: [String: DispatchWorkItem] = [:]
+  private var volatileBridgeRowsRestoredChats: Set<String> = []
   // Pending "ask" requests from the bridge (plan approval / mid-run question),
   // keyed requestId -> payload (holds the sealed `askEnc`). Observers watch
   // `didChangeNotification` reason "agentBridgeAsk" and read it via
@@ -4514,6 +4518,7 @@ final class ChatEngine {
     guard let chatId else { return [] }
     return syncOnQueue {
       _ = restoreCachedHistoryRowsLocked(chatId: chatId)
+      restoreVolatileBridgeRowsIfNeededLocked(chatId: chatId)
       return mergedChatRowsLocked(chatId: chatId)
     }
   }
@@ -5031,10 +5036,27 @@ final class ChatEngine {
     // the bare pre-first-token state (no progress nodes at all yet) — so the chat
     // header reads "Thinking…" instead of a generic "Working…" the instant a turn
     // starts, before anything is renderable in the transcript body.
+    let latestActionNode = progressNodes.reversed().first(where: { node in
+      ((normalizedString(node["kind"] ?? node["itemType"]) ?? "").lowercased()) != "text"
+    })
+    var latestActionLabel = latestActionNode.flatMap {
+      normalizedString($0["label"] ?? $0["title"])
+    }
+    // A live thinking node carries the streamed reasoning-token counter — surface it in
+    // the working label ("Thinking · 1.2k tokens") so the chat header ticks in real time
+    // like the desktop CLI instead of a frozen "Thinking".
+    if let node = latestActionNode,
+      (normalizedString(node["kind"] ?? node["itemType"]) ?? "").lowercased() == "thinking",
+      let tokens = parseLongValue(node["tokens"]), tokens > 0
+    {
+      let count =
+        tokens >= 1000
+        ? String(format: "%.1fk tokens", Double(tokens) / 1000.0)
+        : "\(tokens) tokens"
+      latestActionLabel = "Thinking · \(count)"
+    }
     let streamProgressLabel =
-      progressNodes.reversed().first(where: { node in
-        ((normalizedString(node["kind"] ?? node["itemType"]) ?? "").lowercased()) != "text"
-      }).flatMap { normalizedString($0["label"] ?? $0["title"]) }
+      latestActionLabel
       ?? progressNodes.reversed().compactMap { node in
         normalizedString(node["label"] ?? node["title"])
       }.first
@@ -8496,6 +8518,104 @@ final class ChatEngine {
     UserDefaults.standard.synchronize()
   }
 
+  // MARK: - Agent-bridge DM row persistence
+  //
+  // Agent DMs are excluded from the normal server-history cache (the "agent_surface"
+  // skip in loadChatHistoryIfNeededLocked), which left their transcript existing ONLY
+  // in memory + on the wire: every cold open — and every long reconnect on a bad
+  // link — rendered an empty surface until a server/bridge round-trip landed. Persist
+  // the SETTLED rows (finished turns + real messages; `stream-` fragments and rows
+  // still flagged streaming are skipped — the mid-run current-session request owns
+  // re-delivering those) so the last-known transcript paints instantly on open and
+  // survives connection loss without depending on the socket.
+
+  private func volatileBridgeRowsCacheURL(chatId: String) -> URL? {
+    guard
+      let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+        .first
+    else { return nil }
+    let dir = base.appendingPathComponent("VibeBridgeRows", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir.appendingPathComponent("rows-\(cacheKeyComponent(chatId)).json")
+  }
+
+  private func scheduleVolatileBridgeRowsStoreLocked(chatId: String) {
+    guard !chatId.isEmpty, volatileBridgeRowsStoreTimers[chatId] == nil,
+      isVolatileBridgeAgentChatLocked(chatId: chatId)
+    else { return }
+    let work = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      self.volatileBridgeRowsStoreTimers.removeValue(forKey: chatId)
+      self.storeVolatileBridgeRowsLocked(chatId: chatId)
+    }
+    volatileBridgeRowsStoreTimers[chatId] = work
+    queue.asyncAfter(deadline: .now() + 1.5, execute: work)
+  }
+
+  private func storeVolatileBridgeRowsLocked(chatId: String) {
+    guard let url = volatileBridgeRowsCacheURL(chatId: chatId) else { return }
+    let perChat = liveMessageRowsByChat[chatId] ?? [:]
+    var settled: [String: [String: Any]] = [:]
+    for (rowMessageId, row) in perChat {
+      // Stream fragments and running turns are transient — the live pipeline owns them.
+      if rowMessageId.hasPrefix("stream-") { continue }
+      let message = row["message"] as? [String: Any]
+      let metaStreaming = (message?["metadata"] as? [String: Any])?["isStreaming"] as? Bool
+      let topStreaming = message?["isStreaming"] as? Bool
+      if metaStreaming == true || topStreaming == true { continue }
+      settled[rowMessageId] = row
+    }
+    guard !settled.isEmpty else { return }
+    if settled.count > 80 {
+      let newest = settled.sorted {
+        messageTimestampMs(fromRow: $0.value) < messageTimestampMs(fromRow: $1.value)
+      }.suffix(80)
+      settled = Dictionary(uniqueKeysWithValues: Array(newest))
+    }
+    guard JSONSerialization.isValidJSONObject(settled),
+      let data = try? JSONSerialization.data(withJSONObject: settled, options: [])
+    else {
+      appendJournalLocked(
+        event: "bridge-rows-cache-skip",
+        payload: ["chatId": chatId, "reason": "invalid_json"])
+      return
+    }
+    try? data.write(to: url, options: [.atomic])
+    appendJournalLocked(
+      event: "bridge-rows-cache-store",
+      payload: ["chatId": chatId, "rows": settled.count])
+  }
+
+  private func restoreVolatileBridgeRowsIfNeededLocked(chatId: String) {
+    // Keyed on the cache file's existence, not on isVolatileBridgeAgentChatLocked: at
+    // cold open the peer→provider maps may not be populated yet, and a present file
+    // proves the chat WAS an agent DM when it was stored.
+    guard !chatId.isEmpty, !volatileBridgeRowsRestoredChats.contains(chatId) else { return }
+    volatileBridgeRowsRestoredChats.insert(chatId)
+    guard let url = volatileBridgeRowsCacheURL(chatId: chatId),
+      let data = try? Data(contentsOf: url),
+      let object = try? JSONSerialization.jsonObject(with: data, options: []),
+      let cached = object as? [String: [String: Any]],
+      !cached.isEmpty
+    else { return }
+    var perChat = liveMessageRowsByChat[chatId] ?? [:]
+    let deletedIds = deletedMessageIdsByChat[chatId] ?? []
+    var seeded = 0
+    for (rowMessageId, row) in cached {
+      guard perChat[rowMessageId] == nil, !deletedIds.contains(rowMessageId) else { continue }
+      perChat[rowMessageId] = row
+      seeded += 1
+    }
+    guard seeded > 0 else { return }
+    liveMessageRowsByChat[chatId] = perChat
+    NSLog(
+      "[ChatEngine] bridge-rows cache seeded chatId=%@ rows=%d",
+      String(chatId.prefix(12)), seeded)
+    appendJournalLocked(
+      event: "bridge-rows-cache-restore",
+      payload: ["chatId": chatId, "rows": seeded])
+  }
+
   private func clearVolatileBridgeHistoryLocked(chatId: String, reason: String) {
     guard !chatId.isEmpty else { return }
     historyLoadingChats.remove(chatId)
@@ -9013,6 +9133,15 @@ final class ChatEngine {
     var info = userInfo
     info["reason"] = reason
     info["timestamp"] = nowMs()
+    // Agent-bridge DM rows are excluded from the server-history cache, so persist
+    // their settled rows whenever the chat's row set changes (debounced).
+    if ["chatMessageInserted", "chatMessageChanged", "chatRowsReloaded"].contains(reason),
+      let changedChatId = (userInfo["chatId"] as? String)?.trimmingCharacters(
+        in: .whitespacesAndNewlines),
+      !changedChatId.isEmpty
+    {
+      scheduleVolatileBridgeRowsStoreLocked(chatId: changedChatId)
+    }
     if ["chatMessageInserted", "chatMessageChanged", "chatRowsReloaded", "presenceChanged"]
       .contains(reason)
     {

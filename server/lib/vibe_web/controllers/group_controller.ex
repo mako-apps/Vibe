@@ -94,4 +94,70 @@ defmodule VibeWeb.GroupController do
       conn |> put_status(:forbidden) |> json(%{error: "Not authorized"})
     end
   end
+
+  # PUT /group/:id — owner/admin edit of name / description / avatar.
+  def update(conn, %{"id" => chat_id} = params) do
+    actor_id = conn.assigns.current_user.id
+
+    case Chat.update_group(chat_id, actor_id, params) do
+      {:ok, room} ->
+        json(conn, %{
+          chatId: room.id,
+          name: room.name,
+          description: room.description,
+          avatarUrl: room.avatar_url
+        })
+
+      {:error, reason} ->
+        respond_group_error(conn, reason)
+    end
+  end
+
+  # DELETE /group/:id — owner-only hard delete of the whole group.
+  def delete(conn, %{"id" => chat_id}) do
+    actor_id = conn.assigns.current_user.id
+
+    case Chat.delete_group(chat_id, actor_id) do
+      {:ok, _} -> json(conn, %{success: true})
+      {:error, reason} -> respond_group_error(conn, reason)
+    end
+  end
+
+  # POST /group/:id/leave — a non-owner member leaves.
+  def leave(conn, %{"id" => chat_id}) do
+    actor_id = conn.assigns.current_user.id
+
+    case Chat.leave_group(chat_id, actor_id) do
+      {:ok, _} -> json(conn, %{success: true})
+      {:error, reason} -> respond_group_error(conn, reason)
+    end
+  end
+
+  # PUT /group/:id/members/:user_id/role — owner-only promote/demote.
+  def set_role(conn, %{"id" => chat_id, "user_id" => user_id, "role" => role}) do
+    actor_id = conn.assigns.current_user.id
+
+    case Chat.set_member_role(chat_id, actor_id, user_id, role) do
+      {:ok, participant} ->
+        json(conn, %{success: true, userId: user_id, role: participant.role})
+
+      {:error, reason} ->
+        respond_group_error(conn, reason)
+    end
+  end
+
+  defp respond_group_error(conn, reason) do
+    {status, message} =
+      case reason do
+        :not_found -> {:not_found, "Group not found"}
+        :not_authorized -> {:forbidden, "Not authorized"}
+        :not_member -> {:forbidden, "Not a member"}
+        :owner_cannot_leave -> {:forbidden, "Owner can't leave — delete the group instead"}
+        :cannot_change_owner -> {:forbidden, "The owner's role can't be changed"}
+        :invalid_role -> {:bad_request, "Invalid role"}
+        _ -> {:bad_request, "Group update failed"}
+      end
+
+    conn |> put_status(status) |> json(%{error: message})
+  end
 end

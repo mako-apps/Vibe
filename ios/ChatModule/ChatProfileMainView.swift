@@ -1137,6 +1137,8 @@ private struct ChatProfileSwiftUIRootView: View {
   let hasProfileImage: Bool
   let avatarUri: String?
   let isGroupOrChannel: Bool
+  let isGroupOwner: Bool
+  let memberCount: Int?
   let groupMembersSubtitle: String
   let groupMembers: [[String: Any]]
   let canManageGroupMembers: Bool
@@ -1208,6 +1210,16 @@ private struct ChatProfileSwiftUIRootView: View {
     return glyph.isEmpty ? profileInitial : glyph
   }
 
+  /// "N members" under the group name in the header. Prefers the server member
+  /// count, falling back to the loaded roster so it still shows before the count
+  /// lands. Nil for a 1:1 DM (which shows no subtitle here).
+  private var groupHeaderSubtitle: String? {
+    guard isGroupOrChannel else { return nil }
+    let count = (memberCount ?? 0) > 0 ? (memberCount ?? 0) : groupMembers.count
+    guard count > 0 else { return nil }
+    return count == 1 ? "1 member" : "\(count) members"
+  }
+
   var body: some View {
     GeometryReader { geometry in
       NavigationStack(path: $navCoordinator.path) {
@@ -1240,14 +1252,17 @@ private struct ChatProfileSwiftUIRootView: View {
                     defaultViewSection
                   }
                   if bridgeProvider.isEmpty {
-                    historySection
-                  }
-                  if bridgeProvider.isEmpty {
                     appearanceSection
                   }
+                  // Shared media / attachments replace the old "Chat History" row —
+                  // for both DMs and groups we surface photos/voice/files, not a
+                  // scroll-back-through-messages entry.
                   sharedContentSection
-                  contactActionsSection
-                  emergencySection
+                  // Contact-book actions only make sense for a 1:1 with a real person.
+                  if !isGroupOrChannel {
+                    contactActionsSection
+                    emergencySection
+                  }
                   dangerSection
                 }
                 .frame(width: max(0, geometry.size.width - 32))
@@ -1255,18 +1270,27 @@ private struct ChatProfileSwiftUIRootView: View {
                 .padding(.bottom, 66)
               } header: {
                 VStack(spacing: 20) {
-                  HStack(spacing: 8) {
-                    Text(profileName)
-                      .font(.system(size: max(17, 34 - (max(0, localScrollOffset) / 8)), weight: .bold))
-                      .foregroundStyle(.primary)
-                      .lineLimit(1)
-                      .minimumScaleFactor(0.72)
+                  VStack(spacing: 3) {
+                    HStack(spacing: 8) {
+                      Text(profileName)
+                        .font(.system(size: max(17, 34 - (max(0, localScrollOffset) / 8)), weight: .bold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.72)
 
-                    if showsGoldTier {
-                      ChatProfileSwiftUITierBadge(label: "Gold")
+                      if showsGoldTier {
+                        ChatProfileSwiftUITierBadge(label: "Gold")
+                      }
+                    }
+                    .frame(maxWidth: .infinity)
+
+                    if let groupHeaderSubtitle {
+                      Text(groupHeaderSubtitle)
+                        .font(.system(size: 14, weight: .regular))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                     }
                   }
-                  .frame(maxWidth: .infinity)
 
                   actionRow
                 }
@@ -1319,8 +1343,19 @@ private struct ChatProfileSwiftUIRootView: View {
               Menu {
                 Button(isChatMuted ? "Unmute" : "Mute") { onAction("muteToggle") }
                 Button("Search") { onAction("search") }
-                Button("Share Contact") { onAction("shareContact") }
-                Button("Block Contact", role: .destructive) { onAction("block") }
+                if isGroupOrChannel {
+                  if canManageGroupMembers {
+                    Button("Edit Group") { onAction("editGroup") }
+                  }
+                  if isGroupOwner {
+                    Button("Delete Group", role: .destructive) { onAction("deleteGroup") }
+                  } else {
+                    Button("Leave Group", role: .destructive) { onAction("leaveGroup") }
+                  }
+                } else {
+                  Button("Share Contact") { onAction("shareContact") }
+                  Button("Block Contact", role: .destructive) { onAction("block") }
+                }
               } label: {
                 Image(systemName: "ellipsis")
                   .font(.system(size: 18, weight: .semibold))
@@ -1535,6 +1570,21 @@ private struct ChatProfileSwiftUIRootView: View {
       }
     } else if isGroupOrChannel {
       ChatProfileSwiftUISection(fill: rowFill) {
+        // Admins get a first-class edit entry (name / photo / description).
+        if canManageGroupMembers {
+          Button { onAction("editGroup") } label: {
+            ChatProfileSwiftUIRow(
+              title: "Edit group",
+              subtitle: "Name, photo, description",
+              trailingSystemImage: "chevron.right",
+              showsChevron: true,
+              separatorColor: separatorColor,
+              isLast: false
+            )
+          }
+          .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+        }
+
         NavigationLink(value: ChatProfileSwiftUIDestination.members) {
           ChatProfileSwiftUIRow(
             title: "Members",
@@ -1829,17 +1879,46 @@ private struct ChatProfileSwiftUIRootView: View {
     }
   }
 
+  @ViewBuilder
   private var dangerSection: some View {
-    ChatProfileSwiftUISection(fill: rowFill) {
-      Button { onAction("block") } label: {
-        ChatProfileSwiftUIRow(
-          title: "Block Contact",
-          titleColor: .red,
-          separatorColor: separatorColor,
-          isLast: true
-        )
+    if isGroupOrChannel {
+      // The owner can't just leave — they tear the whole group down. Everyone
+      // else leaves.
+      ChatProfileSwiftUISection(fill: rowFill) {
+        if isGroupOwner {
+          Button(role: .destructive) { onAction("deleteGroup") } label: {
+            ChatProfileSwiftUIRow(
+              title: "Delete Group",
+              titleColor: .red,
+              separatorColor: separatorColor,
+              isLast: true
+            )
+          }
+          .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+        } else {
+          Button(role: .destructive) { onAction("leaveGroup") } label: {
+            ChatProfileSwiftUIRow(
+              title: "Leave Group",
+              titleColor: .red,
+              separatorColor: separatorColor,
+              isLast: true
+            )
+          }
+          .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+        }
       }
-      .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+    } else {
+      ChatProfileSwiftUISection(fill: rowFill) {
+        Button { onAction("block") } label: {
+          ChatProfileSwiftUIRow(
+            title: "Block Contact",
+            titleColor: .red,
+            separatorColor: separatorColor,
+            isLast: true
+          )
+        }
+        .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+      }
     }
   }
 
@@ -1954,7 +2033,15 @@ private struct ChatProfileSwiftUIRootView: View {
         title: (name?.isEmpty ?? true) ? userId : name!,
         subtitle: role == "owner" ? "Owner" : (role == "admin" ? "Admin" : "Member"),
         systemImage: isAdmin ? "star.circle.fill" : "person.circle",
-        payload: ["type": "groupMemberTapped", "userId": userId]
+        payload: [
+          "type": "groupMemberTapped",
+          "userId": userId,
+          "role": role,
+          "name": (name?.isEmpty ?? true) ? userId : name!,
+          // Admin-only actions (promote/demote/remove) are gated in the host by
+          // this flag plus the actor's own role vs. the target.
+          "canManage": canManageGroupMembers,
+        ]
       )
     }
   }
@@ -3973,16 +4060,23 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     refreshHeroContent()
     refreshAvatar()
     tableView.reloadData()
+    // The live profile is the SwiftUI view — it must re-render when group-ness
+    // flips, otherwise it keeps the DM layout (contact actions, no member rows).
+    renderSwiftUIProfile()
   }
 
   func setGroupMembers(_ members: [[String: Any]]) {
     groupMembers = members
     tableView.reloadData()
+    // Without this the members roster / header count never appear in the live
+    // SwiftUI profile — it was only re-rendered by unrelated later setters.
+    renderSwiftUIProfile()
   }
 
   func setGroupMemberCount(_ value: Int?) {
     groupMemberCount = value
     tableView.reloadData()
+    renderSwiftUIProfile()
   }
 
   func setAgentConfig(_ config: [String: Any]?) {
@@ -4154,6 +4248,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       hasProfileImage: hasResolvedProfileImage,
       avatarUri: resolvedAvatarImageUriForSwiftUI(),
       isGroupOrChannel: isGroupOrChannel,
+      isGroupOwner: isGroupOwner,
+      memberCount: groupMemberCount ?? (groupMembers.isEmpty ? nil : groupMembers.count),
       groupMembersSubtitle: groupMembersSummary(),
       groupMembers: groupMembers,
       canManageGroupMembers: canManageGroupMembers,
@@ -4296,6 +4392,15 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       onNativeEvent(["type": "profileContactAction", "action": "addToEmergency"])
     case "block":
       onNativeEvent(["type": "profileContactAction", "action": "block"])
+    case "editGroup", "leaveGroup", "deleteGroup":
+      onNativeEvent([
+        "type": "profileGroupAction",
+        "action": action,
+        "chatId": engineChatId,
+        "name": profileName,
+        "avatarUri": resolvedAvatarImageUriForSwiftUI() ?? "",
+        "description": profileBio,
+      ])
     default:
       break
     }
@@ -5041,6 +5146,18 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     }
     let role = (mine?["role"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
     return role == "owner" || role == "admin"
+  }
+
+  /// True when the signed-in user is the group's owner (creator). Owners see
+  /// "Delete Group" instead of "Leave Group" and can manage admin roles.
+  private var isGroupOwner: Bool {
+    guard isGroupOrChannel, !engineMyUserId.isEmpty else { return false }
+    let mine = groupMembers.first { entry in
+      let id = (entry["userId"] as? String) ?? (entry["id"] as? String) ?? (entry["memberId"] as? String)
+      return id?.caseInsensitiveCompare(engineMyUserId) == .orderedSame
+    }
+    let role = (mine?["role"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+    return role == "owner"
   }
 
   private func groupBridgeProviderFromMembers() -> String? {

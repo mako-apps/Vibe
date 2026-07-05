@@ -133,33 +133,126 @@ function maskQuotes(s) {
   }
   return out;
 }
+// Recursively walks `s` from index `i`, matching real shell quoting: single quotes are
+// fully literal; double quotes may contain $(...) — which starts a FRESH, independent
+// quote-tracking context (so a nested "..." inside a substitution does NOT prematurely
+// close an outer double quote it happens to sit inside) and respect backslash-escapes
+// (\" \\ etc, so an escaped quote doesn't end the string early); backtick spans are
+// opaque; $(...)/<(...) nest to any depth. Calls `onChar(idx, ch)` for every character
+// that is genuinely TOP-LEVEL (not inside any quote/substitution) and `onSub(start,end)`
+// for every top-level $(...) span's inner [start,end) range. When `inParen`, returns the
+// index of the matching unquoted ")"; otherwise returns s.length.
+function walk(s, i, inParen, onChar, onSub) {
+  while (i < s.length) {
+    const c = s[i];
+    if (inParen && c === ")") return i;
+    if (c === "'") {
+      i++; while (i < s.length && s[i] !== "'") i++;
+      if (i < s.length) i++;
+      continue;
+    }
+    if (c === '"') {
+      i++;
+      while (i < s.length && s[i] !== '"') {
+        if (s[i] === "\\" && i + 1 < s.length) { i += 2; continue; }
+        if (s[i] === "$" && s[i + 1] === "(") {
+          const innerStart = i + 2;
+          const innerEnd = walk(s, innerStart, true, null, null);
+          if (onSub) onSub(innerStart, innerEnd);
+          i = innerEnd + 1;
+          continue;
+        }
+        i++;
+      }
+      if (i < s.length) i++;
+      continue;
+    }
+    if (c === "`") {
+      i++; while (i < s.length && s[i] !== "`") i++;
+      if (i < s.length) i++;
+      continue;
+    }
+    if ((c === "$" || c === "<") && s[i + 1] === "(") {
+      const innerStart = i + 2;
+      const innerEnd = walk(s, innerStart, true, null, null);
+      if (c === "$" && onSub) onSub(innerStart, innerEnd);
+      i = innerEnd + 1;
+      continue;
+    }
+    if (onChar) onChar(i, c);
+    i++;
+  }
+  return i;
+}
+// Mask every character that is inside a quote or a $(...)/<(...) span, so only
+// TOP-LEVEL pipeline separators survive for splitSegments to find.
+function maskGroups(s) {
+  const keep = new Array(s.length).fill(false);
+  walk(s, 0, false, (idx) => { keep[idx] = true; }, null);
+  let out = "";
+  for (let i = 0; i < s.length; i++) out += keep[i] ? s[i] : "X";
+  return out;
+}
+// Raw inner text of every top-level $(...) command substitution in `s` (one written
+// literally inside single quotes is skipped — bash doesn't expand it there).
+function extractSubstitutions(s) {
+  const out = [];
+  walk(s, 0, false, null, (start, end) => out.push(s.slice(start, end)));
+  return out;
+}
+// Replace every top-level $(...) span (delimiters included) with a neutral placeholder
+// so the surrounding command can be pattern-matched normally; the substitution's own
+// safety was already checked (recursively) by the caller before this is used.
+function stripSubstitutions(s) {
+  const cuts = [];
+  walk(s, 0, false, null, (start, end) => cuts.push([start - 2, end + 1]));
+  if (!cuts.length) return s;
+  let out = "", pos = 0;
+  for (const [a, b] of cuts) { out += s.slice(pos, a) + "SUBOK"; pos = b; }
+  out += s.slice(pos);
+  return out;
+}
 function splitSegments(cmd) {
   // Join backslash-newline line continuations FIRST — a multi-line command written
   // for readability (xcodebuild with one flag per line, "\" at end-of-line) is one
   // logical command, not several piped/sequential ones.
   const joined = cmd.replace(/\\\r?\n[ \t]*/g, " ");
-  const masked = maskQuotes(joined);
+  const masked = maskGroups(joined); // hide separators inside quotes AND $(...)/<(...)
   const re = /\|\||&&|;|\||\n/g;
   const segs = []; let start = 0, m;
   while ((m = re.exec(masked))) { segs.push(joined.slice(start, m.index)); start = m.index + m[0].length; }
   segs.push(joined.slice(start));
   return segs.map((x) => x.trim()).filter((x) => x.length);
 }
-function segmentIsSafe(seg, cfg) {
+// A segment that's ONLY one or more "VAR=value" assignments (nothing left to run) has
+// no side effect on its own — e.g. `f=$(...)` or `x=5`. An assignment PREFIXING a real
+// command (`NODE_ENV=production npm run build`) is not this — it falls through to the
+// normal prefix-stripped SAFE_BASH check below.
+const PURE_ASSIGNMENT = /^(?:export\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s*)+$/;
+function stripLeadingAssignments(s) {
+  return s.replace(/^(?:export\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, "");
+}
+function segmentIsSafe(seg, cfg, depth) {
   if (!seg) return true;
-  const masked = maskQuotes(seg); // so `>`/`&&`/etc INSIDE quotes (awk/grep exprs) aren't
-                                   // mistaken for a redirect or command substitution.
-  if (/\$\(|`|<\(/.test(masked)) return false; // command / process substitution
-  if (MUTATING.some((re) => re.test(masked))) return false;
-  if (SAFE_BASH.some((re) => re.test(seg))) return true;
+  if ((depth || 0) > 8) return false; // guard against pathological nesting
+  if (/`|<\(/.test(maskQuotes(seg))) return false; // backticks / process-substitution: stay conservative
+  const subs = extractSubstitutions(seg);
+  for (const inner of subs) {
+    if (!bashIsAutoSafe(inner, cfg, (depth || 0) + 1)) return false; // substituted command must itself be safe
+  }
+  const outer = subs.length ? stripSubstitutions(seg) : seg;
+  const maskedOuter = maskQuotes(outer);
+  if (MUTATING.some((re) => re.test(maskedOuter))) return false;
+  if (PURE_ASSIGNMENT.test(outer.trim())) return true; // e.g. f=$(...) with nothing else to run
+  if (SAFE_BASH.some((re) => re.test(stripLeadingAssignments(outer)))) return true;
   for (const p of cfg.auto_allow) { if (p && seg.includes(p)) return true; }
   return false;
 }
-function bashIsAutoSafe(cmd, cfg) {
+function bashIsAutoSafe(cmd, cfg, depth) {
   // user auto_allow substrings may match the whole command (e.g. "xcrun simctl ...")
   for (const p of cfg.auto_allow) { if (p && cmd.includes(p)) return true; }
   const segs = splitSegments(cmd);
-  return segs.length > 0 && segs.every((seg) => segmentIsSafe(seg, cfg));
+  return segs.length > 0 && segs.every((seg) => segmentIsSafe(seg, cfg, depth));
 }
 
 // ---------- output helpers ----------------------------------------------------

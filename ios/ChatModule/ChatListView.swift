@@ -1299,6 +1299,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     layoutActivityOverlay()
     layoutGapDebugOverlay()
     layoutBridgeCommandOverlay()
+    layoutBridgeUsageBanner()
 
     let currentHeight = collectionView.bounds.height
     let currentWidth = collectionView.bounds.width
@@ -1432,14 +1433,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     return status == "running" || status == "streaming"
   }
 
-  /// A Claude/Codex DM opens as a fresh scratch surface the first time it's engaged in
-  /// this app process: the engine's stored transcript is hidden so the chat starts clean
-  /// (no "phantom" prior history loading itself). Visible: live/streaming rows, messages
-  /// sent from this thread since it was engaged, and — only when the user explicitly
-  /// picks one from the History surface — that session's rows (ingested under this
-  /// chatId keyed `bridge-<sessionId>-…`). Once engaged, the thread stays visible across
-  /// nav back/reopen and backgrounding (state is process-lifetime, keyed by chatId — see
-  /// `bridgeFreshHiddenIdsByChat`) — only an actual app relaunch goes back to scratch.
+  /// A Claude/Codex DM opens showing its persisted transcript (seeded instantly from the
+  /// engine's on-disk row cache), like any other chat. Hidden rows exist only after an
+  /// explicit "New Chat": startNewBridgeSession snapshots the then-visible row ids into
+  /// `bridgeFreshHiddenIdsByChat`, so the deliberate fresh thread starts clean while a
+  /// plain open keeps its history. Session-transcript rows (`bridge-<sessionId>-…`) are
+  /// still scoped: shown only for the explicitly-loaded/live session, never leaked from
+  /// other sessions.
   private func bridgeFreshFiltered(_ parsed: [ChatListRow]) -> [ChatListRow] {
     guard currentBridgeProvider != nil else { return parsed }
     let chatKey = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1454,19 +1454,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       bridgeLoadedSessionId ?? ChatEngine.shared.liveBridgeSessionId(chatId: chatKey)
     let loadedPrefix = effectiveLoadedSessionId.map { "bridge-\($0)" }
     let ownSentIds = Self.bridgeFreshOwnSentIdsByChat[chatKey] ?? []
-    // Until the user actually engages this thread (sends a message, or explicitly opens a
-    // history session), EVERY non-live row is prior history — keep accumulating it into the
-    // hidden set, even rows that stream in late after the first page. A one-shot snapshot
-    // missed those late arrivals, which is how a finished runtime card ("User task: Hi")
-    // loaded itself on a clean open. Live rows still show so a resumed run stays visible.
-    let sessionEngaged = !ownSentIds.isEmpty || effectiveLoadedSessionId != nil
-    var hiddenIds = Self.bridgeFreshHiddenIdsByChat[chatKey] ?? []
-    if !sessionEngaged {
-      for row in parsed where !bridgeRowIsLive(row) {
-        if let id = row.messageId, !id.isEmpty { hiddenIds.insert(id) }
-      }
-      Self.bridgeFreshHiddenIdsByChat[chatKey] = hiddenIds
-    }
+    // The DM opens showing its persisted transcript, like any other chat — the
+    // "open as a blank scratch surface" auto-hide that used to accumulate every
+    // non-live row here is gone (it fought the on-disk row cache: the engine seeded
+    // the last-known transcript instantly and this filter dropped all of it,
+    // re-creating the empty-on-open the cache exists to kill). `hiddenIds` is now
+    // written ONLY by the explicit "New Chat" action (startNewBridgeSession
+    // snapshots the rows visible at that moment), so a deliberate fresh thread
+    // still starts clean while a plain open keeps its history.
+    let hiddenIds = Self.bridgeFreshHiddenIdsByChat[chatKey] ?? []
     return parsed.filter { row in
       let id = row.messageId ?? ""
       // Session transcripts opened from History are ingested under this DM chatId keyed
@@ -1572,6 +1568,19 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   // input bar — bridge info commands are answered here, never added to the transcript.
   private var bridgeCommandOverlay: VibeAgentCommandOverlayView?
 
+  // Near-limit usage banner (agent DMs): slim pill above the composer, mirroring the
+  // desktop CLI's "You've used 99% of your session limit · resets in 3h" warning. Fed by
+  // the bridge's structured usage report (requestAgentBridgeUsage), refreshed on DM open
+  // and after each finished run; shown only when the worst subscription bucket crosses
+  // the threshold. Dismissing remembers the bucket+level so the same warning doesn't
+  // re-pop until usage climbs further.
+  private var bridgeUsageBanner: UIView?
+  private var bridgeUsageBannerLabel: UILabel?
+  private var lastBridgeUsageRequestId: String?
+  private var lastBridgeUsageRequestAt: TimeInterval = 0
+  private var dismissedBridgeUsageKey: String?
+  private var hadLiveBridgeRun = false
+
   private func showBridgeCommandOverlay(name: String, body: String) {
     let overlay: VibeAgentCommandOverlayView
     if let existing = bridgeCommandOverlay {
@@ -1627,6 +1636,211 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     )
     let height = max(60.0, targetSize.height)
     overlay.frame = CGRect(x: 18.0, y: barMinY - height - 10.0, width: width, height: height)
+  }
+
+  // MARK: - Near-limit usage banner
+
+  /// Ask the bridge for a fresh structured usage snapshot. Throttled; a rejected push
+  /// (socket/join not ready) clears the throttle so the channel-join retry fires freely.
+  private func requestBridgeUsageSnapshot(reason: String) {
+    guard let provider = currentBridgeProvider else { return }
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !chatId.isEmpty else { return }
+    let now = ProcessInfo.processInfo.systemUptime
+    guard now - lastBridgeUsageRequestAt > 30.0 else { return }
+    lastBridgeUsageRequestAt = now
+    let requestId = UUID().uuidString
+    let result = ChatEngine.shared.requestAgentBridgeUsage([
+      "chatId": chatId, "provider": provider, "requestId": requestId,
+    ])
+    let accepted = (result["accepted"] as? Bool) == true
+    if accepted {
+      lastBridgeUsageRequestId = (result["requestId"] as? String) ?? requestId
+    } else {
+      // Socket/join not ready — allow a retry after a short backoff (the fallback poll
+      // and engine-change activity below re-call this) without spamming every frame.
+      lastBridgeUsageRequestAt = now - 25.0
+    }
+    NSLog(
+      "[ChatUsage] request chat=%@ reason=%@ accepted=%@ result=%@",
+      String(chatId.prefix(12)), reason, accepted ? "Y" : "N",
+      (result["reason"] as? String) ?? "-")
+  }
+
+  /// Parse the usage reply this surface requested; show the banner when the worst
+  /// subscription bucket is at/over the threshold, hide it when usage dropped back.
+  private func applyBridgeUsageReply(requestId: String) {
+    guard requestId == lastBridgeUsageRequestId,
+      let payload = ChatEngine.shared.latestAgentBridgeUsage(requestId: requestId),
+      (payload["ok"] as? Bool) ?? true,
+      let report = payload["report"] as? [String: Any],
+      let buckets = report["buckets"] as? [[String: Any]]
+    else { return }
+    var worstLabel: String?
+    var worstUtil = 0
+    var worstResetsAt: String?
+    for bucket in buckets {
+      guard let label = bucket["label"] as? String, !label.isEmpty else { continue }
+      let util = (bucket["utilization"] as? NSNumber)?.intValue ?? 0
+      if util > worstUtil {
+        worstUtil = util
+        worstLabel = label
+        worstResetsAt = bucket["resetsAt"] as? String
+      }
+    }
+    NSLog("[ChatUsage] reply buckets=%d worst=%@ %d%%", buckets.count, worstLabel ?? "-", worstUtil)
+    guard let label = worstLabel, worstUtil >= 75 else {
+      hideBridgeUsageBanner()
+      return
+    }
+    // Bucket + 5%-step level: dismissing 92% suppresses 90–94, but 95 re-warns.
+    let key = "\(label)#\(worstUtil / 5)"
+    guard key != dismissedBridgeUsageKey else { return }
+    var text = "You've used \(worstUtil)% of your \(label) limit"
+    if let reset = Self.bridgeUsageResetText(worstResetsAt) {
+      text += " · resets in \(reset)"
+    }
+    showBridgeUsageBanner(text: text, key: key)
+  }
+
+  /// "2h 15m" / "45m" / "3d" until the bucket resets, from the report's ISO timestamp.
+  private static func bridgeUsageResetText(_ iso: String?) -> String? {
+    guard let iso, !iso.isEmpty else { return nil }
+    let withFraction = ISO8601DateFormatter()
+    withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let date = withFraction.date(from: iso) ?? ISO8601DateFormatter().date(from: iso)
+    guard let date else { return nil }
+    let seconds = date.timeIntervalSinceNow
+    guard seconds > 0 else { return nil }
+    let hours = Int(seconds) / 3600
+    let minutes = (Int(seconds) % 3600) / 60
+    if hours > 48 { return "\(hours / 24)d" }
+    if hours > 0 { return minutes > 0 ? "\(hours)h \(minutes)m" : "\(hours)h" }
+    return "\(max(1, minutes))m"
+  }
+
+  private func showBridgeUsageBanner(text: String, key: String) {
+    let banner: UIView
+    let label: UILabel
+    if let existing = bridgeUsageBanner, let existingLabel = bridgeUsageBannerLabel {
+      banner = existing
+      label = existingLabel
+    } else {
+      let created = UIView()
+      created.layer.cornerRadius = 14.0
+      created.layer.cornerCurve = .continuous
+      created.backgroundColor = UIColor { trait in
+        trait.userInterfaceStyle == .dark
+          ? UIColor(red: 0.32, green: 0.22, blue: 0.05, alpha: 0.96)
+          : UIColor(red: 1.0, green: 0.95, blue: 0.82, alpha: 0.98)
+      }
+      created.layer.borderWidth = 1.0
+      created.layer.borderColor = UIColor { trait in
+        trait.userInterfaceStyle == .dark
+          ? UIColor(red: 0.85, green: 0.62, blue: 0.18, alpha: 0.35)
+          : UIColor(red: 0.75, green: 0.55, blue: 0.12, alpha: 0.35)
+      }.cgColor
+
+      let icon = UIImageView(
+        image: UIImage(systemName: "gauge.with.dots.needle.bottom.100percent"))
+      icon.tintColor = UIColor { trait in
+        trait.userInterfaceStyle == .dark
+          ? UIColor(red: 0.98, green: 0.78, blue: 0.35, alpha: 1.0)
+          : UIColor(red: 0.65, green: 0.45, blue: 0.05, alpha: 1.0)
+      }
+      icon.contentMode = .scaleAspectFit
+      icon.translatesAutoresizingMaskIntoConstraints = false
+
+      let textLabel = UILabel()
+      textLabel.font = .systemFont(ofSize: 13.5, weight: .medium)
+      textLabel.numberOfLines = 2
+      textLabel.textColor = UIColor { trait in
+        trait.userInterfaceStyle == .dark
+          ? UIColor(red: 0.99, green: 0.92, blue: 0.75, alpha: 1.0)
+          : UIColor(red: 0.45, green: 0.32, blue: 0.02, alpha: 1.0)
+      }
+      textLabel.translatesAutoresizingMaskIntoConstraints = false
+
+      let close = UIButton(type: .system)
+      close.setImage(UIImage(systemName: "xmark"), for: .normal)
+      close.tintColor = icon.tintColor.withAlphaComponent(0.75)
+      close.translatesAutoresizingMaskIntoConstraints = false
+      close.addAction(
+        UIAction { [weak self] _ in
+          self?.dismissedBridgeUsageKey = self?.bridgeUsageBanner?.accessibilityValue
+          self?.hideBridgeUsageBanner()
+        }, for: .touchUpInside)
+
+      created.addSubview(icon)
+      created.addSubview(textLabel)
+      created.addSubview(close)
+      NSLayoutConstraint.activate([
+        icon.leadingAnchor.constraint(equalTo: created.leadingAnchor, constant: 12.0),
+        icon.centerYAnchor.constraint(equalTo: created.centerYAnchor),
+        icon.widthAnchor.constraint(equalToConstant: 18.0),
+        icon.heightAnchor.constraint(equalToConstant: 18.0),
+        textLabel.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 9.0),
+        textLabel.topAnchor.constraint(equalTo: created.topAnchor, constant: 9.0),
+        textLabel.bottomAnchor.constraint(equalTo: created.bottomAnchor, constant: -9.0),
+        close.leadingAnchor.constraint(equalTo: textLabel.trailingAnchor, constant: 8.0),
+        close.trailingAnchor.constraint(equalTo: created.trailingAnchor, constant: -10.0),
+        close.centerYAnchor.constraint(equalTo: created.centerYAnchor),
+        close.widthAnchor.constraint(equalToConstant: 22.0),
+        close.heightAnchor.constraint(equalToConstant: 22.0),
+      ])
+      addSubview(created)
+      bridgeUsageBanner = created
+      bridgeUsageBannerLabel = textLabel
+      banner = created
+      label = textLabel
+    }
+    label.text = text
+    // The dismiss action reads the key back from here (avoids one more stored property).
+    banner.accessibilityValue = key
+    banner.isHidden = false
+    bringSubviewToFront(banner)
+    setNeedsLayout()
+    layoutIfNeeded()
+    banner.alpha = 0.0
+    banner.transform = CGAffineTransform(translationX: 0, y: 8)
+    UIView.animate(
+      withDuration: 0.22, delay: 0,
+      options: [.beginFromCurrentState, .allowUserInteraction]
+    ) {
+      banner.alpha = 1.0
+      banner.transform = .identity
+    }
+  }
+
+  private func hideBridgeUsageBanner() {
+    guard let banner = bridgeUsageBanner, !banner.isHidden else { return }
+    UIView.animate(
+      withDuration: 0.16, delay: 0,
+      options: [.beginFromCurrentState, .allowUserInteraction]
+    ) {
+      banner.alpha = 0.0
+      banner.transform = CGAffineTransform(translationX: 0, y: 8)
+    } completion: { _ in
+      if banner.alpha <= 0.01 { banner.isHidden = true }
+    }
+  }
+
+  /// Position the usage banner just above the input bar — and above the command overlay
+  /// when that is showing, so the two never overlap.
+  private func layoutBridgeUsageBanner() {
+    guard let banner = bridgeUsageBanner, !banner.isHidden else { return }
+    var baseY = agentComposerView?.frame.minY ?? inputBar?.frame.minY ?? bounds.height
+    if let overlay = bridgeCommandOverlay, !overlay.isHidden {
+      baseY = min(baseY, overlay.frame.minY)
+    }
+    let width = max(0.0, bounds.width - 36.0)
+    let targetSize = banner.systemLayoutSizeFitting(
+      CGSize(width: width, height: UIView.layoutFittingCompressedSize.height),
+      withHorizontalFittingPriority: .required,
+      verticalFittingPriority: .fittingSizeLevel
+    )
+    let height = max(38.0, targetSize.height)
+    banner.frame = CGRect(x: 18.0, y: baseY - height - 8.0, width: width, height: height)
   }
 
   func setRows(_ nextRows: [[String: Any]]) {
@@ -3642,6 +3856,35 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       let chatKey = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
       if !chatKey.isEmpty, changed == nil || changed?.isEmpty == true || changed == chatKey {
         requestCurrentBridgeSession(reason: "channelJoined")
+        requestBridgeUsageSnapshot(reason: "channelJoined")
+      }
+    }
+    // Usage banner plumbing — also ahead of the statusAuthority gate (bridge DMs keep
+    // statusAuthority OFF, so these reasons would never be observed below).
+    if currentBridgeProvider != nil {
+      let reason = (note.userInfo?["reason"] as? String) ?? ""
+      if reason == "agentBridgeUsage" {
+        if let requestId = note.userInfo?["requestId"] as? String, !requestId.isEmpty {
+          applyBridgeUsageReply(requestId: requestId)
+        }
+      } else if ["chatMessageChanged", "chatMessageInserted"].contains(reason) {
+        let changed = (note.userInfo?["chatId"] as? String)?.trimmingCharacters(
+          in: .whitespacesAndNewlines)
+        let chatKey = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !chatKey.isEmpty, changed == chatKey {
+          // Detect a run finishing (live session registration dropped) → the bridge now
+          // has fresh utilization + this run's tokens, the moment the warning matters.
+          let liveNow = ChatEngine.shared.liveBridgeSessionId(chatId: chatKey) != nil
+          if hadLiveBridgeRun, !liveNow {
+            lastBridgeUsageRequestAt = 0
+            requestBridgeUsageSnapshot(reason: "runFinished")
+          } else {
+            // Any DM activity (a result landing, a limit-hit message) refreshes usage;
+            // the 30s throttle keeps this quiet during streaming.
+            requestBridgeUsageSnapshot(reason: "activity")
+          }
+          hadLiveBridgeRun = liveNow
+        }
       }
     }
     guard statusAuthorityEnabled else { return }
@@ -7616,6 +7859,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // requestAgentBridgeHistory itself nudges connect+join on each miss.
     requestCurrentBridgeSession(reason: "open")
     scheduleCurrentBridgeSessionFallback(attempt: 0)
+    let chatKey = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    hadLiveBridgeRun =
+      !chatKey.isEmpty && ChatEngine.shared.liveBridgeSessionId(chatId: chatKey) != nil
+    requestBridgeUsageSnapshot(reason: "open")
   }
 
   /// Ask the engine for whatever session is live for this DM right now. Throttled +
@@ -7647,6 +7894,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let provider = currentBridgeProvider
     DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
       guard let self, self.window != nil, self.currentBridgeProvider == provider else { return }
+      // The usage snapshot rides the same join-readiness window — retry it here too
+      // (throttled internally; the first attempts at open usually lose to chat_not_joined).
+      self.requestBridgeUsageSnapshot(reason: "poll#\(attempt + 1)")
       let chatId = self.engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
       guard !chatId.isEmpty, ChatEngine.shared.liveBridgeSessionId(chatId: chatId) == nil else {
         return

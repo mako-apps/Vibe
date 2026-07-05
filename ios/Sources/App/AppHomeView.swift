@@ -5515,6 +5515,19 @@ final class ChatProfileRootController: UIViewController {
       if action == "clearChat" {
         presentClearChatOptions()
       }
+    case "profileGroupAction", "groupMemberTapped":
+      _ = GroupProfileActionRouter.handle(
+        payload: payload,
+        route: route,
+        presenter: topMostPresenter(),
+        onClose: { [weak self] in self?.onClose?() },
+        onEdited: { [weak self] name, avatarUrl, description in
+          guard let self else { return }
+          self.profileView.setProfileName(name)
+          self.profileView.setHeaderTitle(name)
+          self.profileView.setProfileBio(description)
+          if let avatarUrl, !avatarUrl.isEmpty { self.profileView.setAvatarUri(avatarUrl) }
+        })
     default:
       break
     }
@@ -7230,6 +7243,29 @@ final class ChatConversationController: UIViewController {
       default:
         break
       }
+    case "profileGroupAction", "groupMemberTapped":
+      var presenter: UIViewController = self
+      while let presented = presenter.presentedViewController { presenter = presented }
+      _ = GroupProfileActionRouter.handle(
+        payload: payload,
+        route: route,
+        presenter: presenter,
+        onClose: { [weak self] in
+          guard let self else { return }
+          if let close = self.onClose { close() } else { self.dismiss(animated: true) }
+        },
+        onEdited: { [weak self] name, avatarUrl, description in
+          guard let self else { return }
+          self.mainView.setHeaderTitle(name)
+          self.mainView.setProfileName(name)
+          self.profileView?.setProfileName(name)
+          self.profileView?.setHeaderTitle(name)
+          self.profileView?.setProfileBio(description)
+          if let avatarUrl, !avatarUrl.isEmpty {
+            self.mainView.setAvatarUri(avatarUrl)
+            self.profileView?.setAvatarUri(avatarUrl)
+          }
+        })
     default:
       break
     }
@@ -9087,6 +9123,343 @@ enum GroupMembersUpdateService {
       let added = (entry["added"] as? Bool) ?? false
       return GroupMemberAddResult(userId: userId, added: added)
     }
+  }
+}
+
+struct GroupUpdateResult {
+  let chatId: String
+  let name: String?
+  let description: String?
+  let avatarUrl: String?
+}
+
+/// Owner/admin group mutations: `PUT /group/:id` (name/description/avatar),
+/// `DELETE /group/:id` (owner delete), `POST /group/:id/leave`,
+/// `DELETE /group/:id/members/:user_id` (remove) and
+/// `PUT /group/:id/members/:user_id/role` (promote/demote). Mirrors the
+/// transport-aware handling (direct → packet-mesh fallback, session refresh on
+/// expiry) used by `GroupMembersUpdateService`.
+enum GroupUpdateService {
+  static func update(
+    chatId: String, name: String?, description: String?, avatarUrl: String?,
+    config: AppSessionConfig
+  ) async throws -> GroupUpdateResult {
+    var body: [String: Any] = [:]
+    if let name = name?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
+      body["name"] = name
+    }
+    if let description, !description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      body["description"] = description
+    }
+    if let avatarUrl, !avatarUrl.isEmpty {
+      body["avatarUrl"] = avatarUrl
+    }
+    let payload = try await send(
+      method: "PUT", path: "/group/\(encoded(chatId))", body: body, config: config)
+    return GroupUpdateResult(
+      chatId: (payload?["chatId"] as? String) ?? chatId,
+      name: payload?["name"] as? String,
+      description: payload?["description"] as? String,
+      avatarUrl: payload?["avatarUrl"] as? String
+    )
+  }
+
+  static func delete(chatId: String, config: AppSessionConfig) async throws {
+    _ = try await send(
+      method: "DELETE", path: "/group/\(encoded(chatId))", body: nil, config: config)
+  }
+
+  static func leave(chatId: String, config: AppSessionConfig) async throws {
+    _ = try await send(
+      method: "POST", path: "/group/\(encoded(chatId))/leave", body: [:], config: config)
+  }
+
+  static func removeMember(chatId: String, userId: String, config: AppSessionConfig) async throws {
+    _ = try await send(
+      method: "DELETE",
+      path: "/group/\(encoded(chatId))/members/\(encoded(userId))", body: nil, config: config)
+  }
+
+  static func setRole(
+    chatId: String, userId: String, role: String, config: AppSessionConfig
+  ) async throws {
+    _ = try await send(
+      method: "PUT",
+      path: "/group/\(encoded(chatId))/members/\(encoded(userId))/role",
+      body: ["role": role], config: config)
+  }
+
+  private static func encoded(_ value: String) -> String {
+    value.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? value
+  }
+
+  @discardableResult
+  private static func send(
+    method: String, path: String, body: [String: Any]?, config: AppSessionConfig
+  ) async throws -> [String: Any]? {
+    let activeConfig = AppSessionConfig.current ?? config
+    do {
+      return try await sendOnce(method: method, path: path, body: body, config: activeConfig)
+    } catch let error as ChatDirectMessageServiceError {
+      guard error.isSessionExpired else { throw error }
+      let refreshed = try await AppSessionRefreshService.refresh(config: activeConfig)
+      return try await sendOnce(method: method, path: path, body: body, config: refreshed)
+    }
+  }
+
+  private static func sendOnce(
+    method: String, path: String, body: [String: Any]?, config: AppSessionConfig
+  ) async throws -> [String: Any]? {
+    let request = try buildRequest(method: method, path: path, body: body, config: config)
+    switch config.transportMode {
+    case .offline:
+      throw ChatDirectMessageServiceError.transportUnavailable("offline")
+    case .bridgeText:
+      throw ChatDirectMessageServiceError.transportUnavailable("bridge_text")
+    case .packetMesh:
+      let snapshot = try await PacketRuntime.shared.ensureStarted(config: config)
+      let session = PacketRuntime.shared.makeURLSession(snapshot: snapshot)
+      return try await perform(request, session: session)
+    case .direct:
+      do {
+        return try await perform(request, session: .shared)
+      } catch {
+        guard ChatDirectMessageService.shouldAttemptPacketFallback(for: error) else { throw error }
+        let snapshot = try await PacketRuntime.shared.ensureStarted(config: config)
+        let session = PacketRuntime.shared.makeURLSession(snapshot: snapshot)
+        return try await perform(request, session: session)
+      }
+    }
+  }
+
+  private static func buildRequest(
+    method: String, path: String, body: [String: Any]?, config: AppSessionConfig
+  ) throws -> URLRequest {
+    var base = config.apiBaseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+    while base.hasSuffix("/") { base.removeLast() }
+    let pathBase = base.lowercased().hasSuffix("/api") ? base : "\(base)/api"
+    guard let url = URL(string: "\(pathBase)\(path)") else {
+      throw ChatDirectMessageServiceError.invalidURL
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = method
+    request.timeoutInterval = 20
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
+    request.setValue("Bearer \(config.authToken)", forHTTPHeaderField: "Authorization")
+    if let body {
+      request.httpBody = try JSONSerialization.data(withJSONObject: body)
+    }
+    return request
+  }
+
+  private static func perform(
+    _ request: URLRequest, session: URLSession
+  ) async throws -> [String: Any]? {
+    let (data, response) = try await session.data(for: request)
+    guard let http = response as? HTTPURLResponse else {
+      throw ChatDirectMessageServiceError.invalidResponse
+    }
+    guard (200...299).contains(http.statusCode) else {
+      let bodyString = String(data: data, encoding: .utf8) ?? ""
+      throw ChatDirectMessageServiceError.http(http.statusCode, bodyString)
+    }
+    let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+    return object as? [String: Any]
+  }
+}
+
+/// Routes group-profile actions (edit / leave / delete / member management)
+/// emitted by `ChatProfileMainView`, shared by the standalone profile controller
+/// and the in-conversation profile page. Returns true when it consumed the event.
+/// `@MainActor` since every path touches UIKit / toasts; the callers are
+/// `UIViewController` handlers (already main-actor isolated), so `handle` is a
+/// plain synchronous call for them.
+@MainActor
+enum GroupProfileActionRouter {
+  static func handle(
+    payload: [String: Any],
+    route: ChatRoute,
+    presenter: UIViewController,
+    onClose: (() -> Void)?,
+    onEdited: ((_ name: String, _ avatarUrl: String?, _ description: String) -> Void)?
+  ) -> Bool {
+    let type = str(payload["type"]) ?? ""
+    let chatId = str(payload["chatId"]) ?? route.chatId
+
+    switch type {
+    case "profileGroupAction":
+      switch str(payload["action"]) ?? "" {
+      case "editGroup":
+        presentEditor(payload: payload, chatId: chatId, route: route, presenter: presenter, onEdited: onEdited)
+      case "leaveGroup":
+        confirmDestructive(
+          title: "Leave Group",
+          message: "You'll stop receiving messages from \(route.title).",
+          confirmTitle: "Leave Group",
+          presenter: presenter
+        ) {
+          await perform(chatId: chatId, onClose: onClose, success: "You left the group.") { config in
+            try await GroupUpdateService.leave(chatId: chatId, config: config)
+          }
+        }
+      case "deleteGroup":
+        confirmDestructive(
+          title: "Delete Group",
+          message: "This deletes \(route.title) for everyone. This can't be undone.",
+          confirmTitle: "Delete Group",
+          presenter: presenter
+        ) {
+          await perform(chatId: chatId, onClose: onClose, success: "Group deleted.") { config in
+            try await GroupUpdateService.delete(chatId: chatId, config: config)
+          }
+        }
+      default:
+        break
+      }
+      return true
+
+    case "groupMemberTapped":
+      presentMemberActions(payload: payload, chatId: chatId, presenter: presenter)
+      return true
+
+    default:
+      return false
+    }
+  }
+
+  private static func presentEditor(
+    payload: [String: Any], chatId: String, route: ChatRoute,
+    presenter: UIViewController,
+    onEdited: ((String, String?, String) -> Void)?
+  ) {
+    guard let config = AppSessionConfig.current else {
+      AppToastController.shared.show("The current session is unavailable.")
+      return
+    }
+    let name = str(payload["name"]) ?? route.title
+    let description = str(payload["description"]) ?? ""
+    let avatarUri = str(payload["avatarUri"])
+    let sheet = GroupEditSheet(
+      config: config,
+      chatId: chatId,
+      initialName: name,
+      initialDescription: description,
+      initialAvatarUri: avatarUri
+    ) { newName, newDescription, newAvatarUrl in
+      onEdited?(newName, newAvatarUrl, newDescription)
+      AppToastController.shared.show("Group updated.")
+    }
+    presenter.present(UIHostingController(rootView: sheet), animated: true)
+  }
+
+  private static func presentMemberActions(
+    payload: [String: Any], chatId: String, presenter: UIViewController
+  ) {
+    let userId = str(payload["userId"]) ?? ""
+    let name = str(payload["name"]) ?? userId
+    let role = (str(payload["role"]) ?? "member").lowercased()
+    let canManage = (payload["canManage"] as? Bool) ?? false
+    let myId = AppSessionConfig.current?.userID ?? ""
+
+    // No admin actions for a non-admin viewer, yourself, or the owner.
+    guard canManage, !userId.isEmpty,
+      userId.caseInsensitiveCompare(myId) != .orderedSame,
+      role != "owner"
+    else { return }
+
+    let sheet = UIAlertController(title: name, message: nil, preferredStyle: .actionSheet)
+    if role == "admin" {
+      sheet.addAction(
+        UIAlertAction(title: "Dismiss as Admin", style: .default) { _ in
+          Task { await setRole(chatId: chatId, userId: userId, role: "member", success: "\(name) is no longer an admin.") }
+        })
+    } else {
+      sheet.addAction(
+        UIAlertAction(title: "Make Admin", style: .default) { _ in
+          Task { await setRole(chatId: chatId, userId: userId, role: "admin", success: "\(name) is now an admin.") }
+        })
+    }
+    sheet.addAction(
+      UIAlertAction(title: "Remove from Group", style: .destructive) { _ in
+        Task { await removeMember(chatId: chatId, userId: userId, success: "Removed \(name).") }
+      })
+    sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+    presentSheet(sheet, on: presenter)
+  }
+
+  private static func confirmDestructive(
+    title: String, message: String, confirmTitle: String,
+    presenter: UIViewController, action: @escaping () async -> Void
+  ) {
+    let sheet = UIAlertController(title: title, message: message, preferredStyle: .actionSheet)
+    sheet.addAction(
+      UIAlertAction(title: confirmTitle, style: .destructive) { _ in
+        Task { await action() }
+      })
+    sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+    presentSheet(sheet, on: presenter)
+  }
+
+  @MainActor
+  private static func perform(
+    chatId: String, onClose: (() -> Void)?, success: String,
+    _ call: @escaping (AppSessionConfig) async throws -> Void
+  ) async {
+    guard let config = AppSessionConfig.current else {
+      AppToastController.shared.show("The current session is unavailable.")
+      return
+    }
+    do {
+      try await call(config)
+      ChatHomeService.removeCachedChat(chatID: chatId, config: config)
+      AppToastController.shared.show(success)
+      onClose?()
+    } catch {
+      AppToastController.shared.show(error.localizedDescription)
+    }
+  }
+
+  @MainActor
+  private static func setRole(chatId: String, userId: String, role: String, success: String) async {
+    guard let config = AppSessionConfig.current else { return }
+    do {
+      try await GroupUpdateService.setRole(chatId: chatId, userId: userId, role: role, config: config)
+      AppToastController.shared.show(success)
+    } catch {
+      AppToastController.shared.show(error.localizedDescription)
+    }
+  }
+
+  @MainActor
+  private static func removeMember(chatId: String, userId: String, success: String) async {
+    guard let config = AppSessionConfig.current else { return }
+    do {
+      try await GroupUpdateService.removeMember(chatId: chatId, userId: userId, config: config)
+      AppToastController.shared.show(success)
+    } catch {
+      AppToastController.shared.show(error.localizedDescription)
+    }
+  }
+
+  private static func presentSheet(_ sheet: UIAlertController, on presenter: UIViewController) {
+    if let popover = sheet.popoverPresentationController {
+      popover.sourceView = presenter.view
+      popover.sourceRect = CGRect(
+        x: presenter.view.bounds.midX, y: presenter.view.bounds.midY, width: 1, height: 1)
+      popover.permittedArrowDirections = []
+    }
+    presenter.present(sheet, animated: true)
+  }
+
+  private static func str(_ value: Any?) -> String? {
+    if let s = value as? String {
+      let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+      return t.isEmpty ? nil : t
+    }
+    if let n = value as? NSNumber { return n.stringValue }
+    return nil
   }
 }
 

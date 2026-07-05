@@ -495,3 +495,174 @@ struct AddGroupMembersSheet: View {
     }
   }
 }
+
+/// Owner/admin editor for an existing group's identity — name, photo and
+/// description. Saves via `GroupUpdateService.update` (PUT /group/:id) and hands
+/// the fresh values back so the open profile + home row update without waiting
+/// for a home reload.
+struct GroupEditSheet: View {
+  @Environment(\.dismiss) private var dismiss
+  @Environment(\.colorScheme) private var colorScheme
+
+  let config: AppSessionConfig
+  let chatId: String
+  let initialAvatarUri: String?
+  let onSaved: (_ name: String, _ description: String, _ avatarUrl: String?) -> Void
+
+  @State private var name: String
+  @State private var descriptionText: String
+  @State private var avatarItem: PhotosPickerItem?
+  @State private var avatarImage: Image?
+  @State private var avatarData: Data?
+  @State private var isSaving = false
+  @State private var errorMessage: String?
+
+  init(
+    config: AppSessionConfig,
+    chatId: String,
+    initialName: String,
+    initialDescription: String,
+    initialAvatarUri: String?,
+    onSaved: @escaping (String, String, String?) -> Void
+  ) {
+    self.config = config
+    self.chatId = chatId
+    self.initialAvatarUri = initialAvatarUri
+    self.onSaved = onSaved
+    _name = State(initialValue: initialName)
+    _descriptionText = State(initialValue: initialDescription)
+  }
+
+  private var palette: AppThemePalette { AppThemePalette.resolve(for: colorScheme) }
+
+  var body: some View {
+    NavigationStack {
+      VStack(alignment: .leading, spacing: 20) {
+        HStack(spacing: 16) {
+          PhotosPicker(selection: $avatarItem, matching: .images) {
+            avatarThumb
+          }
+          .buttonStyle(.plain)
+
+          TextField("Group name", text: $name)
+            .font(.body)
+            .submitLabel(.done)
+        }
+        .padding()
+        .background(palette.card)
+        .cornerRadius(12)
+        .padding(.horizontal)
+
+        VStack(alignment: .leading, spacing: 6) {
+          Text("Description")
+            .font(.headline)
+            .padding(.horizontal, 4)
+          TextField("What's this group about?", text: $descriptionText, axis: .vertical)
+            .lineLimit(2...5)
+            .padding()
+            .background(palette.card)
+            .cornerRadius(12)
+        }
+        .padding(.horizontal)
+
+        if let errorMessage {
+          Text(errorMessage)
+            .font(.footnote)
+            .foregroundStyle(.red)
+            .padding(.horizontal)
+        }
+
+        Spacer()
+      }
+      .padding(.top)
+      .background(palette.background.ignoresSafeArea())
+      .navigationTitle("Edit Group")
+      .navigationBarTitleDisplayMode(.inline)
+      .toolbar {
+        ToolbarItem(placement: .topBarLeading) {
+          Button { dismiss() } label: { Image(systemName: "xmark") }
+        }
+        ToolbarItem(placement: .topBarTrailing) {
+          Button("Save") { Task { await save() } }
+            .disabled(isSaving || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+      }
+      .overlay {
+        if isSaving {
+          ZStack {
+            Color.black.opacity(0.3).ignoresSafeArea()
+            ProgressView()
+              .padding()
+              .background(palette.card)
+              .cornerRadius(8)
+          }
+        }
+      }
+      .onChange(of: avatarItem) { _, newItem in
+        Task {
+          guard let data = try? await newItem?.loadTransferable(type: Data.self) else { return }
+          guard let uiImage = UIImage(data: data) else { return }
+          self.avatarData = data
+          self.avatarImage = Image(uiImage: uiImage)
+        }
+      }
+    }
+  }
+
+  @ViewBuilder
+  private var avatarThumb: some View {
+    if let avatarImage {
+      avatarImage
+        .resizable()
+        .scaledToFill()
+        .frame(width: 56, height: 56)
+        .clipShape(Circle())
+    } else if let uri = initialAvatarUri?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !uri.isEmpty, let url = URL(string: uri) {
+      AsyncImage(url: url) { image in
+        image.resizable().scaledToFill()
+      } placeholder: {
+        Image(systemName: "camera.fill")
+          .font(.title2)
+          .foregroundStyle(palette.accent)
+      }
+      .frame(width: 56, height: 56)
+      .clipShape(Circle())
+    } else {
+      Image(systemName: "camera.fill")
+        .font(.title2)
+        .foregroundStyle(palette.accent)
+        .frame(width: 56, height: 56)
+        .background(palette.accent.opacity(0.12))
+        .clipShape(Circle())
+    }
+  }
+
+  private func save() async {
+    isSaving = true
+    errorMessage = nil
+    defer { isSaving = false }
+    do {
+      var remoteAvatarUrl: String? = nil
+      if let avatarData {
+        remoteAvatarUrl = try await ChatRoomCreateService.uploadAvatar(
+          imageData: avatarData, config: config)
+      }
+      let result = try await GroupUpdateService.update(
+        chatId: chatId,
+        name: name,
+        description: descriptionText,
+        avatarUrl: remoteAvatarUrl,
+        config: config
+      )
+      onSaved(
+        result.name ?? name.trimmingCharacters(in: .whitespacesAndNewlines),
+        result.description ?? descriptionText,
+        result.avatarUrl ?? remoteAvatarUrl ?? initialAvatarUri
+      )
+      dismiss()
+    } catch {
+      errorMessage = error.localizedDescription
+    }
+  }
+}

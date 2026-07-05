@@ -164,7 +164,11 @@ defmodule VibeWeb.Router do
 
     # Groups
     post "/group", GroupController, :create
+    put "/group/:id", GroupController, :update
+    delete "/group/:id", GroupController, :delete
+    post "/group/:id/leave", GroupController, :leave
     post "/group/:id/members", GroupController, :add_members
+    put "/group/:id/members/:user_id/role", GroupController, :set_role
     delete "/group/:id/members/:user_id", GroupController, :remove_member
 
     # Group Agent

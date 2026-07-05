@@ -2527,7 +2527,10 @@ func isPlaceholderThinkingProgressItem(_ item: VibeAgentKitProgressItem) -> Bool
 /// clipping it.
 func agentTurnCompactHugWidth(_ row: ChatListRow) -> CGFloat {
   let message = VibeAgentKitMap.chatMessage(from: row)
-  let label = message.progressItems.last(where: { $0.itemType != "text" })?.label
+  // Same display mapping the shimmer uses — a live thinking node reads
+  // "Thinking · 1.2k tokens", so the hug width must measure that full string.
+  let label = message.progressItems.last(where: { $0.itemType != "text" })
+    .map { vibeAgentKitProgressDisplayLabel($0) }
     ?? message.progress.last
     ?? "Thinking"
   let font = UIFont.systemFont(ofSize: 14.5, weight: .medium)
