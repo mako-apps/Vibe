@@ -39,7 +39,7 @@ public final class VibeNativeCallManager: NSObject {
     }
   }
 
-  public func refreshNotificationRegistration(reason: String) {
+  public func refreshNotificationRegistration(reason: String, completion: ((Bool) -> Void)? = nil) {
     DispatchQueue.main.async { [weak self] in
       guard let self else { return }
       self.startOnMain()
@@ -51,6 +51,7 @@ public final class VibeNativeCallManager: NSObject {
         switch settings.authorizationStatus {
         case .authorized, .provisional, .ephemeral:
           self.registerForRemoteNotifications(reason: reason, authorization: "\(settings.authorizationStatus.rawValue)")
+          DispatchQueue.main.async { completion?(true) }
         case .notDetermined:
           center.requestAuthorization(options: [.alert, .sound]) { [weak self] granted, error in
             guard let self else { return }
@@ -60,17 +61,21 @@ public final class VibeNativeCallManager: NSObject {
               granted ? "true" : "false",
               error?.localizedDescription ?? "nil"
             )
-            guard granted else { return }
-            self.registerForRemoteNotifications(reason: reason, authorization: "granted")
+            if granted {
+              self.registerForRemoteNotifications(reason: reason, authorization: "granted")
+            }
+            DispatchQueue.main.async { completion?(granted) }
           }
         case .denied:
           NSLog("[VibeNativeCall] notification refresh skipped reason=%@ authorization=denied", reason)
+          DispatchQueue.main.async { completion?(false) }
         @unknown default:
           NSLog(
             "[VibeNativeCall] notification refresh skipped reason=%@ authorization=unknown:%ld",
             reason,
             settings.authorizationStatus.rawValue
           )
+          DispatchQueue.main.async { completion?(false) }
         }
       }
     }

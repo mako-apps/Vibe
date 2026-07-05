@@ -882,6 +882,73 @@ final class BubbleBackgroundView: UIView {
   private func tlSafeTop(radius: CGFloat, height: CGFloat) -> CGFloat {
     min(radius, height)
   }
+
+  /// The region the integrated tail ADDS on top of the plain rounded-rect body:
+  /// bounded by the bottom corner arc on the inside and the tail's two quad
+  /// curves on the outside. The joins sit ON the corner arc (see
+  /// addAndroidTail), so with-tail silhouette = plain silhouette ∪ this lobe,
+  /// exactly. The send morph snapshots the lobe separately from the plate so
+  /// the width/height morph can never stretch the tail. nil when this bubble
+  /// draws no integrated tail.
+  func integratedTailLobePath() -> UIBezierPath? {
+    guard let onRight = integratedTailSide, bounds.width > 1.0, bounds.height > 1.0 else {
+      return nil
+    }
+    let width = max(1.0, bounds.width)
+    let height = max(1.0, bounds.height)
+    let rawRadius = onRight ? shape.borderBottomRightRadius : shape.borderBottomLeftRadius
+    let radius = min(max(0.0, rawRadius), min(width, height) * 0.5)
+    guard radius > 0.5 else { return nil }
+
+    // Same Android-derived contour constants as addAndroidTail.
+    let s = min(1.0, radius / 18.0)
+    let outerJoin = CGPoint(x: -0.3375 * s, y: -14.5308 * s)
+    let outerControl = CGPoint(x: 1.4197 * s, y: -9.2324 * s)
+    let tip = CGPoint(x: 7.7725 * s, y: -5.1111 * s)
+    let innerControl = CGPoint(x: 3.5312 * s, y: -3.1501 * s)
+    let innerJoin = CGPoint(x: -4.3952 * s, y: -6.2140 * s)
+
+    let path = UIBezierPath()
+    if onRight {
+      let center = CGPoint(x: width - radius, y: height - radius)
+      let outerPoint = CGPoint(x: width + outerJoin.x, y: height + outerJoin.y)
+      let innerPoint = CGPoint(x: width + innerJoin.x, y: height + innerJoin.y)
+      let outerAngle = atan2(outerPoint.y - center.y, outerPoint.x - center.x)
+      let innerAngle = atan2(innerPoint.y - center.y, innerPoint.x - center.x)
+      path.move(to: outerPoint)
+      path.addQuadCurve(
+        to: CGPoint(x: width + tip.x, y: height + tip.y),
+        controlPoint: CGPoint(x: width + outerControl.x, y: height + outerControl.y)
+      )
+      path.addQuadCurve(
+        to: innerPoint,
+        controlPoint: CGPoint(x: width + innerControl.x, y: height + innerControl.y)
+      )
+      path.addArc(
+        withCenter: center, radius: radius, startAngle: innerAngle, endAngle: outerAngle,
+        clockwise: false)
+    } else {
+      let center = CGPoint(x: radius, y: height - radius)
+      let innerPoint = CGPoint(x: -innerJoin.x, y: height + innerJoin.y)
+      let outerPoint = CGPoint(x: -outerJoin.x, y: height + outerJoin.y)
+      let innerAngle = atan2(innerPoint.y - center.y, innerPoint.x - center.x)
+      let outerAngle = atan2(outerPoint.y - center.y, outerPoint.x - center.x)
+      path.move(to: innerPoint)
+      path.addQuadCurve(
+        to: CGPoint(x: -tip.x, y: height + tip.y),
+        controlPoint: CGPoint(x: -innerControl.x, y: height + innerControl.y)
+      )
+      path.addQuadCurve(
+        to: outerPoint,
+        controlPoint: CGPoint(x: -outerControl.x, y: height + outerControl.y)
+      )
+      path.addArc(
+        withCenter: center, radius: radius, startAngle: outerAngle, endAngle: innerAngle,
+        clockwise: false)
+    }
+    path.close()
+    return path
+  }
 }
 
 /// How far the integrated bubble tail extends beyond the bubble body's edge
@@ -1231,11 +1298,37 @@ func bubbleUsesAgentTurnContent(_ row: ChatListRow) -> Bool {
     && row.kind == .message
     && row.visualKind == .text
     && row.isAgentMessage
+    && agentSystemDividerText(for: row) == nil
     && (row.isStreamingText
       || row.messageType == "agent_progress_tree"
       || !row.agentProgressNodes.isEmpty
       || row.agentRuntime != nil
       || (row.agentActionsEnc?.isEmpty == false))
+}
+
+/// A Claude/Codex control/context event that must render as a centered, muted mid-chat
+/// divider (styled like a day/time separator) rather than a user or assistant bubble.
+/// Covers the `/compact` summary ("Context compacted") and the synthetic
+/// "[Request interrupted by user]" turn Claude Code inserts when a run is stopped — both
+/// otherwise leak into the transcript as ordinary message bubbles (the interrupt lands as
+/// a right-side USER bubble because Claude records it as a user turn). Mirrors the
+/// full-page agent view's classification in `VibeAgentKitMap.chatMessage(from:)`
+/// (`isCompactionSummary` / `systemDividerText`) so both surfaces treat these the same.
+/// Returns the short divider label, or nil for an ordinary row.
+func agentSystemDividerText(for row: ChatListRow) -> String? {
+  guard row.kind == .message else { return nil }
+  if row.isAgentMessage && row.agentMsgKind == "summary" {
+    return "Context compacted"
+  }
+  let body = (row.isAgentMessage ? (row.plainContent ?? row.text) : row.text)
+    .trimmingCharacters(in: .whitespacesAndNewlines)
+  guard !body.isEmpty else { return nil }
+  if body == "[Request interrupted by user]"
+    || body.localizedCaseInsensitiveContains("request interrupted by user")
+  {
+    return "Interrupted"
+  }
+  return nil
 }
 
 private func bubbleMetaWidths(for row: ChatListRow) -> ChatBubbleMetaWidths {
@@ -2403,12 +2496,29 @@ func agentTurnBubbleIsCompactThinking(_ row: ChatListRow) -> Bool {
     if item.itemType == "text" {
       return !item.label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
-    return true
+    // A bare "Thinking" placeholder node (no command / output detail) is NOT real content:
+    // the chat header already shows the thinking state, so the row stays suppressed until an
+    // actual tool step or narration arrives. This kills the momentary "Thinking" bubble that
+    // pops in for a few seconds and then vanishes + shifts the layout when the first real
+    // chunk lands (mirrors the full-page view's isPlaceholderThinking filter).
+    return !isPlaceholderThinkingProgressItem(item)
   }
   if hasRenderableProgress { return false }
   return resoloAssistantDisplayText(for: message)
     .trimmingCharacters(in: .whitespacesAndNewlines)
     .isEmpty
+}
+
+/// A no-detail "Thinking"/"Thinking…" progress node — the placeholder the CLI emits while
+/// the model is only reasoning. Real thinking narration (one carrying messageContent /
+/// messagePreview) is NOT a placeholder and stays renderable. Mirrors
+/// `VibeAgentConversationViewController.isPlaceholderThinking`.
+func isPlaceholderThinkingProgressItem(_ item: VibeAgentKitProgressItem) -> Bool {
+  let label = item.label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+  let messageContent = item.messageContent?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+  let messagePreview = item.messagePreview?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+  let hasDetail = !messageContent.isEmpty || !messagePreview.isEmpty
+  return !hasDetail && (label == "thinking" || label == "thinking...")
 }
 
 /// Width the compact "thinking" bubble should hug: the shimmer line (icon + label) plus a
@@ -5608,6 +5718,16 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   let bubbleView = BubbleBackgroundView()
   let tailView = BubbleTailView()
 
+  /// Group/channel sender name, shown above the FIRST bubble of an incoming sender-run
+  /// (Telegram-style), tinted with the sender's colour (Claude ≈ orange, Codex ≈ white).
+  private let groupSenderNameLabel = UILabel()
+  /// Leading avatar-gutter width the view asked us to reserve for incoming group bubbles
+  /// (0 for DMs and outgoing). Narrows the bubble + shifts it right so the floating avatar
+  /// overlay has a column; kept in sync with the height measurement in `sizeForItemAt`.
+  private var groupExtraLeading: CGFloat = 0.0
+  /// Reserved top space for the name label when it is shown (0 otherwise).
+  private var groupNameReservedHeight: CGFloat = 0.0
+
   private let messageLabel = AgentStreamingLabel()
   // The real interleaved step/narration/diff renderer, bubble-shelled — the live content
   // for a 1:1 agent turn (see bubbleUsesAgentTurnContent).
@@ -5674,6 +5794,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private var selectionMode = false
   private var isSelectionChecked = false
   private var isGhostHidden = false
+  /// Whether the last configure() rendered this row as a centered agent system divider
+  /// (interrupt / compaction) reusing `dayLabel` — lets `layoutSubviews` position it with
+  /// the day-pill centering path instead of the bubble path.
+  private var isConfiguredAgentDivider = false
   /// Whether the last configure() hid this cell as the send-morph ghost — lets the
   /// host verify/repair the reveal after the transition without reconfiguring blindly.
   var isConfiguredGhostHidden: Bool { isGhostHidden }
@@ -5743,6 +5867,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     contentView.addSubview(bubbleView)
     contentView.addSubview(tailView)
 
+    contentView.addSubview(groupSenderNameLabel)
     contentView.addSubview(messageLabel)
     contentView.addSubview(agentTurnContentView)
     contentView.addSubview(richTextView)
@@ -5819,6 +5944,16 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     messageLabel.numberOfLines = 0
     messageLabel.font = bubbleMessageFont
     messageLabel.textColor = .white
+
+    groupSenderNameLabel.numberOfLines = 1
+    groupSenderNameLabel.font = .systemFont(ofSize: 12.5, weight: .semibold)
+    groupSenderNameLabel.lineBreakMode = .byTruncatingTail
+    groupSenderNameLabel.isHidden = true
+    // Legible over any wallpaper tone (esp. the near-white Codex tint).
+    groupSenderNameLabel.layer.shadowColor = UIColor.black.cgColor
+    groupSenderNameLabel.layer.shadowOpacity = 0.35
+    groupSenderNameLabel.layer.shadowRadius = 1.5
+    groupSenderNameLabel.layer.shadowOffset = CGSize(width: 0, height: 0.5)
 
     mediaContainerView.clipsToBounds = true
     mediaContainerView.layer.cornerCurve = .continuous
@@ -6125,14 +6260,34 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     preferredLocalMediaURLOverride: String? = nil,
     selectionMode: Bool = false,
     selected: Bool = false,
-    agentTurnState: AgentTurnBubbleState = AgentTurnBubbleState()
+    agentTurnState: AgentTurnBubbleState = AgentTurnBubbleState(),
+    groupExtraLeading: CGFloat = 0.0,
+    groupSenderName: String? = nil,
+    groupSenderColor: UIColor? = nil,
+    groupSenderNameHeight: CGFloat = 0.0
   ) {
     self.agentTurnState = agentTurnState
+    isConfiguredAgentDivider = false
     let activeVoiceSnapshot = VoiceBubblePlaybackCoordinator.shared.currentSnapshot
     self.row = row
     self.selectionMode = selectionMode
     self.isSelectionChecked = selected
     cachedLayoutMetrics = nil
+
+    // Group sender decoration (name label + reserved avatar gutter). A name is only passed
+    // for the first message of a sender-run; the gutter is reserved for every incoming
+    // group message so consecutive bubbles stay aligned under the floating avatar.
+    self.groupExtraLeading = max(0.0, groupExtraLeading)
+    if let groupSenderName, !groupSenderName.isEmpty {
+      groupSenderNameLabel.text = groupSenderName
+      groupSenderNameLabel.textColor = groupSenderColor ?? .secondaryLabel
+      groupSenderNameLabel.isHidden = false
+      groupNameReservedHeight = groupSenderNameHeight
+    } else {
+      groupSenderNameLabel.text = nil
+      groupSenderNameLabel.isHidden = true
+      groupNameReservedHeight = 0.0
+    }
     if row.visualKind == .voice, activeVoiceSnapshot.messageId == row.messageId {
       mediaNeedsDownload = activeVoiceSnapshot.isDownloading
       mediaIsDownloading = activeVoiceSnapshot.isDownloading
@@ -6212,6 +6367,42 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       mediaProgressSizeLabel.isHidden = true
       selectionCircleView.isHidden = true
     case .message:
+      // Agent control/context events (interrupt, /compact) render as a centered muted
+      // divider — reusing the day-pill so they look exactly like the mid-chat time/day
+      // separators the user already knows — instead of leaking into the transcript as a
+      // user or assistant bubble. Bypass all the bubble machinery below.
+      if let dividerText = agentSystemDividerText(for: row) {
+        isConfiguredAgentDivider = true
+        self.isGhostHidden = false
+        VoiceBubblePlaybackCoordinator.shared.unbind(cell: self)
+        resetStickerAnimation()
+        stopTypingShimmer()
+        richTextView.reset()
+        resetAgentTurnContent()
+        replyPreviewView.reset()
+        linkPreviewView.reset()
+        dayLabel.text = dividerText
+        dayLabel.isHidden = false
+        bubbleView.isHidden = true
+        tailView.isHidden = true
+        messageLabel.isHidden = true
+        agentTurnContentView.isHidden = true
+        richTextView.isHidden = true
+        replyPreviewView.isHidden = true
+        linkPreviewView.isHidden = true
+        mediaContainerView.isHidden = true
+        inlineAttachmentView.isHidden = true
+        metaContainerView.isHidden = true
+        reactionPillView.isHidden = true
+        retryButton.isHidden = true
+        agentActionBarView.isHidden = true
+        mediaProgressSpinner.stopAnimating()
+        mediaProgressOverlayView.isHidden = true
+        mediaProgressSizeLabel.isHidden = true
+        selectionCircleView.isHidden = true
+        setNeedsLayout()
+        return
+      }
       let isGhostHidden = hiddenMessageId == row.messageId
       let usesTransparentAgentStreaming = usesTransparentAgentStreamingLayout(row)
       let usesAgentTurnContent = bubbleUsesAgentTurnContent(row)
@@ -6296,8 +6487,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       let resolveTextColor = row.isMe ? appearance.textColorMe : appearance.textColorThem
       let displayText = bubbleDisplayAttributedString(
         for: row, font: messageFont, textColor: resolveTextColor)
-      messageLabel.textAlignment = usesRTLColumnLayout(row) ? .right : .natural
-      messageLabel.semanticContentAttribute = usesRTLColumnLayout(row) ? .forceRightToLeft : .unspecified
+      messageLabel.textAlignment = .natural
+      messageLabel.semanticContentAttribute = .unspecified
       if messageLabel.isHidden {
         messageLabel.resetStreamingState()
       } else {
@@ -6609,7 +6800,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     }
 
     let bounds = contentView.bounds
-    if row.kind == .day {
+    if row.kind == .day || isConfiguredAgentDivider {
       let textSize = dayLabel.sizeThatFits(CGSize(width: bounds.width - 16, height: 24))
       let width = min(bounds.width - 8, ceil(textSize.width) + (dayPillHorizontalPadding * 2.0))
       let height = ceil(textSize.height) + (dayPillVerticalPadding * 2.0)
@@ -6639,7 +6830,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     }
 
     let selectionInset = selectionMode ? messageSelectionLeadingInset : 0.0
-    let layoutWidth = max(1.0, bounds.width)
+    // Incoming group messages reserve a leading avatar gutter: measure the bubble against
+    // the narrowed width and shift it right by the same amount, so it never sits under the
+    // floating avatar. Outgoing / DM rows keep groupExtraLeading == 0 (no change).
+    let layoutWidth = max(1.0, bounds.width - groupExtraLeading)
     let metrics: ChatMessageBubbleLayoutMetrics
     if let cached = cachedLayoutMetrics, cachedLayoutWidth == layoutWidth, !cached.usesRichTextLayout {
       metrics = cached
@@ -6657,10 +6851,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       // Compact "thinking" pill: center it in the row instead of pinning to the leading
       // edge, so the tiny loader reads as a centered indicator rather than a marooned
       // scrap in a full-width shell.
-      bubbleX = max(bubbleSideMargin, (layoutWidth - bubbleWidth) / 2.0) + selectionInset
+      bubbleX = max(bubbleSideMargin, (layoutWidth - bubbleWidth) / 2.0) + selectionInset + groupExtraLeading
     } else {
       bubbleX =
-        (row.isMe ? layoutWidth - bubbleWidth - bubbleSideMargin : bubbleSideMargin) + selectionInset
+        (row.isMe
+          ? layoutWidth - bubbleWidth - bubbleSideMargin
+          : bubbleSideMargin + groupExtraLeading) + selectionInset
     }
     let bubbleY = max(0.0, bounds.height - bubbleHeight)
     let bubbleFrame = pixelAlignedRect(
@@ -6671,12 +6867,25 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         height: ceil(bubbleHeight)
       ))
 
-    // Agent sender label removed (now using inline icon)
-
     CATransaction.begin()
     CATransaction.setDisableActions(true)
 
     bubbleView.frame = bubbleFrame
+
+    // Group sender name sits in the reserved top strip, left-aligned to the bubble.
+    if !groupSenderNameLabel.isHidden, groupNameReservedHeight > 0 {
+      let nameX = bubbleFrame.minX + 6.0
+      let nameMaxX = bounds.width - bubbleSideMargin
+      groupSenderNameLabel.frame = pixelAlignedRect(
+        CGRect(
+          x: nameX,
+          y: 1.0,
+          width: max(0.0, nameMaxX - nameX),
+          height: max(0.0, groupNameReservedHeight - 2.0)
+        ))
+    } else {
+      groupSenderNameLabel.frame = .zero
+    }
     let selectionSize: CGFloat = 26.0
     selectionCircleView.frame = pixelAlignedRect(
       CGRect(
@@ -9193,14 +9402,21 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     }
     // The tail is kept OUT of the plate rect: the plate snapshot gets
     // width/height-morphed from the composer pill, and a baked-in tail would
-    // stretch with it. The send morph overlays the tail as its own snapshot at
-    // final placement instead. (When the tail is drawn inside bubbleView —
-    // tailView hidden — plateRect already includes its overhang and there is
-    // no separate tail to hand out.)
-    let plateRect = bubbleRenderCaptureRect(in: contentView).integral
+    // stretch with it — visible as the tail growing until the very end of the
+    // morph. Integrated-tail bubbles (normal text) hand out a body-only plate
+    // (the plate render suppresses the tail from the bubble path, see
+    // renderBubbleChromeImage) and the tail lobe is snapshotted separately by
+    // transitionTailSnapshotView.
+    var plateRect = bubbleRenderCaptureRect(in: contentView).integral
+    // Tail rect is kept at its TRUE (sub-pixel) frame — no .integral. Rounding
+    // it up expands the height by up to a full pixel, which stretches the tail
+    // raster during the morph and lands with a ~1px height snap when the real
+    // vector tail is revealed.
     var tailRect = CGRect.null
     if !tailView.isHidden {
-      tailRect = tailView.convert(tailView.bounds, to: contentView).integral
+      tailRect = tailView.convert(tailView.bounds, to: contentView)
+    } else if bubbleView.integratedTailLobePath() != nil {
+      plateRect = bubbleBodyRect
     }
 
     var contentRect = CGRect.null
@@ -9250,12 +9466,79 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       return nil
     }
     // Plate only — the tail is snapshotted separately by the send morph so it
-    // is never stretched by the width/height animation.
+    // is never stretched by the width/height animation. For integrated-tail
+    // bubbles the render below suppresses the tail from the bubble path itself.
     let captureRect = capture.plateRect
     guard captureRect.width > 1.0, captureRect.height > 1.0 else {
       return nil
     }
+    let image = renderBubbleChromeImage(captureRect: captureRect, suppressIntegratedTail: true)
+    let imageView = UIImageView(image: image)
+    imageView.frame = contentView.convert(captureRect, to: view)
+    imageView.contentMode = .scaleToFill
+    imageView.backgroundColor = .clear
+    imageView.isOpaque = false
+    imageView.clipsToBounds = false
+    return imageView
+  }
 
+  /// Send-morph tail snapshot for integrated-tail bubbles (normal text). The
+  /// plate raster is captured with the tail suppressed so the morph stretches a
+  /// clean rounded plate; this returns the missing piece — the cell rendered
+  /// WITH the tail, masked to the lobe the tail adds outside the plain corner
+  /// arc. Plate ∪ lobe reproduces the real bubble render exactly, so revealing
+  /// the real cell at completion cannot shift a single pixel. The returned
+  /// frame is in contentView coordinates; the morph pins it at final placement.
+  func transitionTailSnapshotView() -> (view: UIView, frameInContent: CGRect)? {
+    guard row?.kind == .message else {
+      return nil
+    }
+    guard tailView.isHidden, let lobePath = bubbleView.integratedTailLobePath() else {
+      return nil
+    }
+    contentView.layoutIfNeeded()
+    let lobeBoundsInBubble = lobePath.bounds.insetBy(dx: -2.0, dy: -2.0)
+    let captureRect = pixelAlignedRect(bubbleView.convert(lobeBoundsInBubble, to: contentView))
+    guard captureRect.width > 1.0, captureRect.height > 1.0 else {
+      return nil
+    }
+    let image = renderBubbleChromeImage(captureRect: captureRect, suppressIntegratedTail: false)
+    let imageView = UIImageView(image: image)
+    imageView.frame = captureRect
+    imageView.contentMode = .scaleToFill
+    imageView.backgroundColor = .clear
+    imageView.isOpaque = false
+    imageView.clipsToBounds = false
+    // Mask to the lobe so these pixels never double-paint over the
+    // (tail-suppressed) plate snapshot; the hairline stroke widens the mask by
+    // ~0.75pt so it covers the plate raster's anti-aliased arc edge instead of
+    // meeting it in a see-through seam.
+    let bubbleOrigin = bubbleView.convert(CGPoint.zero, to: contentView)
+    let maskPath = UIBezierPath(cgPath: lobePath.cgPath)
+    maskPath.apply(
+      CGAffineTransform(
+        translationX: bubbleOrigin.x - captureRect.minX,
+        y: bubbleOrigin.y - captureRect.minY
+      ))
+    let mask = CAShapeLayer()
+    mask.contentsScale = UIScreen.main.scale
+    mask.frame = CGRect(origin: .zero, size: captureRect.size)
+    mask.path = maskPath.cgPath
+    mask.fillColor = UIColor.black.cgColor
+    mask.strokeColor = UIColor.black.cgColor
+    mask.lineWidth = 1.5
+    imageView.layer.mask = mask
+    return (imageView, captureRect)
+  }
+
+  /// Renders the bubble chrome (plate, wallpaper backdrop, gradient) with every
+  /// content view hidden. `suppressIntegratedTail` re-applies the bubble path
+  /// WITHOUT the integrated tail for the duration of the render — the send
+  /// morph width/height-stretches that raster, and a baked-in tail would
+  /// stretch (and land with a visible shift) along with it.
+  private func renderBubbleChromeImage(
+    captureRect: CGRect, suppressIntegratedTail: Bool
+  ) -> UIImage {
     let messageWasHidden = messageLabel.isHidden
     let richTextWasHidden = richTextView.isHidden
     let replyWasHidden = replyPreviewView.isHidden
@@ -9278,7 +9561,17 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     contentView.layoutIfNeeded()
     CATransaction.commit()
 
+    // After the layout flush, so a pending layout pass can't re-enable the
+    // integrated tail (the cell layout owns setIntegratedTailEnabled).
+    let suppressTail = suppressIntegratedTail && bubbleView.integratedTailLobePath() != nil
+    if suppressTail {
+      bubbleView.setIntegratedTailEnabled(false)
+    }
+
     defer {
+      if suppressTail {
+        bubbleView.setIntegratedTailEnabled(true)
+      }
       CATransaction.begin()
       CATransaction.setDisableActions(true)
       messageLabel.isHidden = messageWasHidden
@@ -9317,13 +9610,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         contentView.layer.render(in: context.cgContext)
       }
     }
-    let imageView = UIImageView(image: image)
-    imageView.frame = contentView.convert(captureRect, to: view)
-    imageView.contentMode = .scaleToFill
-    imageView.backgroundColor = .clear
-    imageView.isOpaque = false
-    imageView.clipsToBounds = false
-    return imageView
+    return image
   }
 }
 

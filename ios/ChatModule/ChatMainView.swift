@@ -129,8 +129,16 @@ public final class ChatMainView: UIView,
   private let avatarButton = UIButton(type: .system)
   private let avatarImageView = UIImageView()
   private let avatarFallbackIconView = UIImageView()
+
+  private let rightActionsStack = UIStackView()
+  private let callButton = UIButton(type: .system)
+  private let videoCallButton = UIButton(type: .system)
+  private let historyButton = UIButton(type: .system)
+  private let newChatButton = UIButton(type: .system)
+
   private let menuGlassView = UIVisualEffectView(effect: nil)
   private let savedSearchCancelGlassView = UIVisualEffectView(effect: nil)
+  private let rightActionsGlassView = UIVisualEffectView(effect: nil)
   private let menuButton = UIButton(type: .system)
   private let savedSearchField = UITextField()
   private let savedSearchCancelButton = UIButton(type: .system)
@@ -771,6 +779,9 @@ public final class ChatMainView: UIView,
     groupMemberDisplayNameByUserId = nextNamesByUserId
     groupMemberRoleByUserId = nextRolesByUserId
     groupMemberOrder = nextOrder
+    // Feed the message list its sender directory (name + avatar + agent provider) so
+    // incoming group bubbles can show the sender's name label and floating avatar.
+    chatListView.setGroupSenderDirectory(rawMembers)
     if !defersEngineStateRefreshes {
       scheduleEngineStateRefresh(force: true, reason: "setGroupMembers")
     }
@@ -1016,13 +1027,23 @@ public final class ChatMainView: UIView,
     menuGlassView.contentView.addSubview(menuButton)
     menuGlassView.contentView.addSubview(savedSearchField)
     savedSearchCancelGlassView.contentView.addSubview(savedSearchCancelButton)
+    headerContentView.addSubview(rightActionsGlassView)
+    
+    rightActionsGlassView.contentView.addSubview(rightActionsStack)
+    rightActionsStack.translatesAutoresizingMaskIntoConstraints = false
+    NSLayoutConstraint.activate([
+      rightActionsStack.leadingAnchor.constraint(equalTo: rightActionsGlassView.contentView.leadingAnchor),
+      rightActionsStack.trailingAnchor.constraint(equalTo: rightActionsGlassView.contentView.trailingAnchor),
+      rightActionsStack.topAnchor.constraint(equalTo: rightActionsGlassView.contentView.topAnchor),
+      rightActionsStack.bottomAnchor.constraint(equalTo: rightActionsGlassView.contentView.bottomAnchor)
+    ])
 
     profileHeaderContentView.addSubview(profileBackGlassView)
     profileHeaderContentView.addSubview(profileMenuGlassView)
     profileBackGlassView.contentView.addSubview(profileBackButton)
     profileMenuGlassView.contentView.addSubview(profileMenuButton)
 
-    [backButton, titleButton, avatarButton, menuButton, profileBackButton, profileMenuButton].forEach
+    [backButton, titleButton, avatarButton, menuButton, profileBackButton, profileMenuButton, callButton, videoCallButton, historyButton, newChatButton].forEach
     { button in
       button.backgroundColor = .clear
       button.contentHorizontalAlignment = .center
@@ -1034,7 +1055,7 @@ public final class ChatMainView: UIView,
 
     [
       backGlassView, titleGlassView, avatarGlassView, menuGlassView, profileBackGlassView,
-      savedSearchCancelGlassView, profileMenuGlassView,
+      savedSearchCancelGlassView, profileMenuGlassView, rightActionsGlassView,
     ].forEach { glassView in
       glassView.clipsToBounds = true
       glassView.layer.cornerCurve = .continuous
@@ -1053,6 +1074,43 @@ public final class ChatMainView: UIView,
     menuButton.isHidden = true
     menuGlassView.isHidden = true
     savedSearchCancelGlassView.isHidden = true
+    rightActionsGlassView.isHidden = true
+
+    rightActionsStack.axis = .horizontal
+    rightActionsStack.alignment = .center
+    rightActionsStack.distribution = .fill
+    rightActionsStack.spacing = 4
+
+    rightActionsStack.addArrangedSubview(callButton)
+    rightActionsStack.addArrangedSubview(videoCallButton)
+    rightActionsStack.addArrangedSubview(historyButton)
+    rightActionsStack.addArrangedSubview(newChatButton)
+
+    [callButton, videoCallButton, historyButton, newChatButton].forEach { button in
+      button.translatesAutoresizingMaskIntoConstraints = false
+      NSLayoutConstraint.activate([
+        button.widthAnchor.constraint(equalToConstant: 44.0),
+        button.heightAnchor.constraint(equalToConstant: 44.0)
+      ])
+    }
+
+    let actionSymbolConfig = UIImage.SymbolConfiguration(pointSize: 17, weight: .medium)
+    callButton.setImage(UIImage(systemName: "phone"), for: .normal)
+    callButton.setPreferredSymbolConfiguration(actionSymbolConfig, forImageIn: .normal)
+    videoCallButton.setImage(UIImage(systemName: "video"), for: .normal)
+    videoCallButton.setPreferredSymbolConfiguration(actionSymbolConfig, forImageIn: .normal)
+    historyButton.setImage(UIImage(systemName: "clock"), for: .normal)
+    historyButton.setPreferredSymbolConfiguration(actionSymbolConfig, forImageIn: .normal)
+    newChatButton.setImage(UIImage(systemName: "plus"), for: .normal)
+    newChatButton.setPreferredSymbolConfiguration(actionSymbolConfig, forImageIn: .normal)
+
+    historyButton.addTarget(self, action: #selector(handleHistoryPressed), for: .touchUpInside)
+    newChatButton.addTarget(self, action: #selector(handleNewChatPressed), for: .touchUpInside)
+
+    // TODO: Add actual targets for call/videoCall/history/newChat.
+    // historyButton.addTarget(self, action: #selector(handleHistoryPressed), for: .touchUpInside)
+    // newChatButton.addTarget(self, action: #selector(handleNewChatPressed), for: .touchUpInside)
+
     savedSearchField.borderStyle = .none
     savedSearchField.backgroundColor = .clear
     savedSearchField.alpha = 0.0
@@ -1113,21 +1171,24 @@ public final class ChatMainView: UIView,
     avatarFallbackIconView.image = UIImage(systemName: "person.fill")
     avatarFallbackIconView.isHidden = false
 
-    [chatHeaderStack, profileHeaderStack].forEach { stack in
-      stack.axis = .vertical
-      stack.alignment = .center
-      stack.distribution = .fill
-      stack.spacing = -1
-    }
+    chatHeaderStack.axis = .vertical
+    chatHeaderStack.alignment = .leading
+    chatHeaderStack.distribution = .fill
+    chatHeaderStack.spacing = -1
+
+    profileHeaderStack.axis = .vertical
+    profileHeaderStack.alignment = .center
+    profileHeaderStack.distribution = .fill
+    profileHeaderStack.spacing = -1
 
     [chatTitleLabel, profileTitleLabel].forEach { label in
       label.font = UIFont.systemFont(ofSize: 16, weight: .semibold)
-      label.textAlignment = .center
+      label.textAlignment = .left
       label.lineBreakMode = .byTruncatingTail
     }
     [chatSubtitleLabel, profileSubtitleLabel].forEach { label in
       label.font = UIFont.systemFont(ofSize: 12, weight: .medium)
-      label.textAlignment = .center
+      label.textAlignment = .left
       label.lineBreakMode = .byTruncatingTail
       label.isHidden = true
     }
@@ -1368,6 +1429,7 @@ public final class ChatMainView: UIView,
       avatarGlassView.isHidden = true
       menuGlassView.isHidden = true
       savedSearchCancelGlassView.isHidden = true
+      rightActionsGlassView.isHidden = true
       titleButton.isUserInteractionEnabled = false
       titleButton.showsMenuAsPrimaryAction = false
       titleButton.menu = nil
@@ -1382,6 +1444,7 @@ public final class ChatMainView: UIView,
       avatarGlassView.isHidden = true
       menuGlassView.isHidden = true
       savedSearchCancelGlassView.isHidden = true
+      rightActionsGlassView.isHidden = true
       titleGlassView.isHidden = false
       titleButton.isUserInteractionEnabled = false
       titleButton.showsMenuAsPrimaryAction = false
@@ -1401,6 +1464,15 @@ public final class ChatMainView: UIView,
     menuButton.isHidden = !(usesSavedMessagesHeader || searchActive)
     menuGlassView.isHidden = !(usesSavedMessagesHeader || searchActive)
     savedSearchCancelGlassView.isHidden = !searchActive
+
+    let isAgent = !bridgeProvider.isEmpty
+    let isNewChat = engineChatId.isEmpty
+    callButton.isHidden = isAgent || usesSavedMessagesHeader || searchActive
+    videoCallButton.isHidden = isAgent || usesSavedMessagesHeader || searchActive
+    historyButton.isHidden = !isAgent || usesSavedMessagesHeader || searchActive
+    newChatButton.isHidden = !isAgent || !isNewChat || usesSavedMessagesHeader || searchActive
+    rightActionsGlassView.isHidden = usesSavedMessagesHeader || searchActive
+
     menuButton.setImage(
       UIImage(
         systemName: searchActive ? "magnifyingglass" : (usesSavedMessagesHeader ? "magnifyingglass" : "ellipsis"),
@@ -2820,7 +2892,7 @@ public final class ChatMainView: UIView,
       let titleEffect = UIGlassEffect()
       titleEffect.isInteractive = true
       titleEffect.tintColor = .clear
-      titleGlassView.effect = titleEffect
+      titleGlassView.effect = nil // Explicitly remove glass effect for title
 
       let avatarEffect = UIGlassEffect()
       avatarEffect.isInteractive = true
@@ -2835,6 +2907,12 @@ public final class ChatMainView: UIView,
       searchCancelEffect.isInteractive = true
       searchCancelEffect.tintColor = .clear
       savedSearchCancelGlassView.effect = searchCancelEffect
+      
+      let rightActionsEffect = UIGlassEffect()
+      rightActionsEffect.isInteractive = true
+      rightActionsEffect.tintColor = .clear
+      rightActionsGlassView.effect = rightActionsEffect
+      
       let profileBackEffect = UIGlassEffect()
       profileBackEffect.isInteractive = true
       profileBackEffect.tintColor = .clear
@@ -2849,6 +2927,7 @@ public final class ChatMainView: UIView,
       avatarGlassView.effect = UIBlurEffect(style: .systemMaterial)
       menuGlassView.effect = UIBlurEffect(style: .systemMaterial)
       savedSearchCancelGlassView.effect = UIBlurEffect(style: .systemMaterial)
+      rightActionsGlassView.effect = UIBlurEffect(style: .systemMaterial)
       profileBackGlassView.effect = UIBlurEffect(style: .systemMaterial)
       profileMenuGlassView.effect = UIBlurEffect(style: .systemMaterial)
     }
@@ -2897,6 +2976,7 @@ public final class ChatMainView: UIView,
       avatarGlassView.frame = .zero
       menuGlassView.frame = .zero
       savedSearchCancelGlassView.frame = .zero
+      rightActionsGlassView.frame = .zero
       backButton.frame = .zero
       titleButton.frame = titleGlassView.bounds
       avatarButton.frame = .zero
@@ -2929,10 +3009,26 @@ public final class ChatMainView: UIView,
       
       let trailingHeaderFrame = CGRect(
         x: max(0.0, headerContentView.bounds.width - 44.0), y: 0.0, width: 44.0, height: 44.0)
+        
+      let subtitleDotWidth: CGFloat = chatSubtitleDotView.isHidden ? 0.0 : 10.0
+      let requestedHeaderWidth = max(
+        chatTitleLabel.intrinsicContentSize.width,
+        chatSubtitleLabel.intrinsicContentSize.width + subtitleDotWidth
+      )
+        
       if previewHeaderCenterOnly && !savedSearchExpanded {
         avatarGlassView.frame = .zero
         menuGlassView.frame = .zero
         savedSearchCancelGlassView.frame = .zero
+        rightActionsGlassView.frame = .zero
+        
+        let centerWidth = min(
+          max(140.0, requestedHeaderWidth + 32.0),
+          max(140.0, headerContentView.bounds.width - 48.0)
+        )
+        let centerX = (headerContentView.bounds.width - centerWidth) * 0.5
+        titleGlassView.frame = CGRect(x: centerX, y: 0.0, width: centerWidth, height: 44.0)
+        
       } else if headerMode == .savedMessages || savedSearchExpanded {
         avatarGlassView.frame = savedSearchExpanded ? .zero : trailingHeaderFrame
         let cancelSpacing: CGFloat = savedSearchExpanded ? 8.0 : 0.0
@@ -2957,63 +3053,58 @@ public final class ChatMainView: UIView,
             height: 44.0
           )
           : .zero
-      } else {
-        avatarGlassView.frame = trailingHeaderFrame
-        menuGlassView.frame = .zero
-        savedSearchCancelGlassView.frame = .zero
-      }
-
-      let trailingSideInset =
-        previewHeaderCenterOnly && !savedSearchExpanded
-        ? 0.0
-        : headerContentView.bounds.width - avatarGlassView.frame.minX
-      let centerSideInset =
-        previewHeaderCenterOnly && !savedSearchExpanded
-        ? 12.0
-        : max(backGlassView.frame.maxX, trailingSideInset) + 10.0
-      let usesBridgeHeaderLayout =
-        !bridgeProvider.isEmpty && headerMode != .savedMessages && !savedSearchExpanded
-      let subtitleDotWidth: CGFloat = chatSubtitleDotView.isHidden ? 0.0 : 10.0
-      let requestedHeaderWidth = max(
-        chatTitleLabel.intrinsicContentSize.width,
-        chatSubtitleLabel.intrinsicContentSize.width + subtitleDotWidth
-      )
-      let centerWidth: CGFloat
-      if previewHeaderCenterOnly && !savedSearchExpanded {
-        centerWidth = min(
-          max(140.0, requestedHeaderWidth + 32.0),
-          max(140.0, headerContentView.bounds.width - 48.0)
-        )
-      } else {
-        // Bridge (Claude/Codex) chats used to hug their content width here, which read
-        // noticeably narrower than every other chat's header pill. Size it exactly like the
-        // default header — fill the available space up to maxCenterWidth — so agent chats
-        // don't stand out as smaller.
-        centerWidth = min(
+        rightActionsGlassView.frame = .zero
+        
+        let centerSideInset = max(backGlassView.frame.maxX, headerContentView.bounds.width - avatarGlassView.frame.minX) + 10.0
+        let centerWidth = min(
           maxCenterWidth,
           max(120.0, headerContentView.bounds.width - (centerSideInset * 2.0))
         )
-      }
-      let centerX: CGFloat
-      if previewHeaderCenterOnly && !savedSearchExpanded {
-        centerX = (headerContentView.bounds.width - centerWidth) * 0.5
-      } else if usesBridgeHeaderLayout {
-        // Center the model/device pill between the back button and avatar — clamped so it
-        // never overlaps either. The old code right-aligned it against the avatar, which
-        // pushed the pill noticeably off to the right.
-        let centered = (headerContentView.bounds.width - centerWidth) * 0.5
-        let minX = backGlassView.frame.maxX + 8.0
-        let maxX = max(minX, avatarGlassView.frame.minX - centerWidth - 8.0)
-        centerX = min(max(centered, minX), maxX)
+        let centerX = (headerContentView.bounds.width - centerWidth) * 0.5
+        titleGlassView.frame = CGRect(x: centerX, y: 0.0, width: centerWidth, height: 44.0)
+        
       } else {
-        centerX = (headerContentView.bounds.width - centerWidth) * 0.5
+        // Move avatar to the left side
+        avatarGlassView.frame = CGRect(x: backGlassView.frame.maxX + 8.0, y: 0.0, width: 44.0, height: 44.0)
+        menuGlassView.frame = .zero
+        savedSearchCancelGlassView.frame = .zero
+        
+        // Setup right actions
+        var visibleActionCount = 0
+        if !callButton.isHidden { visibleActionCount += 1 }
+        if !videoCallButton.isHidden { visibleActionCount += 1 }
+        if !historyButton.isHidden { visibleActionCount += 1 }
+        if !newChatButton.isHidden { visibleActionCount += 1 }
+        
+        let actionWidth: CGFloat = 44.0
+        let actionSpacing: CGFloat = 0.0
+        let totalActionsWidth = CGFloat(visibleActionCount) * actionWidth + CGFloat(max(0, visibleActionCount - 1)) * actionSpacing
+        
+        rightActionsGlassView.frame = CGRect(
+          x: headerContentView.bounds.width - totalActionsWidth,
+          y: 0.0,
+          width: totalActionsWidth,
+          height: 44.0
+        )
+        
+        callButton.frame.size = CGSize(width: 44.0, height: 44.0)
+        videoCallButton.frame.size = CGSize(width: 44.0, height: 44.0)
+        historyButton.frame.size = CGSize(width: 44.0, height: 44.0)
+        newChatButton.frame.size = CGSize(width: 44.0, height: 44.0)
+        
+        // Setup title outside of glass, right next to the avatar
+        let titleMinX = avatarGlassView.frame.maxX + 12.0
+        let titleMaxX = rightActionsGlassView.frame.minX > 0 ? rightActionsGlassView.frame.minX - 8.0 : headerContentView.bounds.width - 8.0
+        let availableWidth = max(0, titleMaxX - titleMinX)
+        let centerWidth = availableWidth
+        
+        titleGlassView.frame = CGRect(
+          x: titleMinX,
+          y: 0.0,
+          width: centerWidth,
+          height: 44.0
+        )
       }
-      titleGlassView.frame = CGRect(
-        x: centerX,
-        y: 0.0,
-        width: centerWidth,
-        height: 44.0
-      )
 
       backButton.frame = backGlassView.bounds
       titleButton.frame = titleGlassView.bounds
@@ -3037,24 +3128,33 @@ public final class ChatMainView: UIView,
         savedSearchCancelButton.frame = .zero
       }
 
-      [backButton, avatarButton, titleButton, menuButton, savedSearchCancelButton].forEach {
+      [backButton, avatarButton, titleButton, menuButton, savedSearchCancelButton, callButton, videoCallButton, historyButton, newChatButton].forEach {
         control in
         control.layer.cornerRadius = control.bounds.height / 2.0
       }
-      [backGlassView, avatarGlassView, titleGlassView, menuGlassView, savedSearchCancelGlassView]
+      [backGlassView, avatarGlassView, titleGlassView, menuGlassView, savedSearchCancelGlassView, rightActionsGlassView]
         .forEach { view in
           view.layer.cornerRadius = view.bounds.height / 2.0
         }
 
-      avatarImageView.frame = avatarButton.bounds
+      avatarImageView.frame = avatarButton.bounds.insetBy(dx: 4.0, dy: 4.0)
+      avatarImageView.layer.cornerRadius = avatarImageView.bounds.height / 2.0
+      avatarImageView.clipsToBounds = true
       avatarFallbackIconView.frame = avatarButton.bounds.insetBy(dx: 12.0, dy: 12.0)
       checkmarkImageView.frame = avatarButton.bounds.insetBy(dx: 4.0, dy: 4.0)
 
-      let titleBounds =
-        headerMode == .savedMessages || savedSearchExpanded
-        ? titleButton.bounds.insetBy(dx: 12.0, dy: 0.0)
-        : titleButton.bounds.insetBy(dx: 12.0, dy: 4.0)
-      chatHeaderStack.frame = titleBounds
+      let horizontalInset: CGFloat = (headerMode == .savedMessages || savedSearchExpanded) ? 12.0 : 4.0
+      let stackSize = chatHeaderStack.systemLayoutSizeFitting(
+        CGSize(width: titleButton.bounds.width - (horizontalInset * 2.0), height: UIView.layoutFittingCompressedSize.height),
+        withHorizontalFittingPriority: .required,
+        verticalFittingPriority: .fittingSizeLevel
+      )
+      chatHeaderStack.frame = CGRect(
+        x: horizontalInset,
+        y: (titleButton.bounds.height - stackSize.height) * 0.5,
+        width: titleButton.bounds.width - (horizontalInset * 2.0),
+        height: stackSize.height
+      )
       if subtitleShimmerActive {
         chatHeaderStack.layoutIfNeeded()
         applySubtitleShimmerFrame()
@@ -3501,6 +3601,12 @@ public final class ChatMainView: UIView,
     savedSearchCancelButton.tintColor = text.withAlphaComponent(0.84)
     profileBackButton.tintColor = text
     profileMenuButton.tintColor = text
+    
+    let actionTint = secondary.withAlphaComponent(0.74)
+    [callButton, videoCallButton, historyButton, newChatButton].forEach { btn in
+      btn.tintColor = actionTint
+    }
+    
     chatTitleLabel.textColor = text
     profileTitleLabel.textColor = text
     chatSubtitleLabel.textColor = secondary
@@ -4207,17 +4313,7 @@ public final class ChatMainView: UIView,
         ? UIColor(red: 43 / 255, green: 165 / 255, blue: 181 / 255, alpha: 1)
         : UIColor(red: 0 / 255, green: 122 / 255, blue: 124 / 255, alpha: 1)
 
-      // Header Gradient
-      var hGradient = avatarGlassView.contentView.layer.sublayers?.first(where: { $0.name == "savedMessagesGradient" }) as? CAGradientLayer
-      if hGradient == nil {
-        hGradient = CAGradientLayer()
-        hGradient?.name = "savedMessagesGradient"
-        avatarGlassView.contentView.layer.insertSublayer(hGradient!, at: 0)
-      }
-      hGradient?.colors = [gradientStart.cgColor, gradientEnd.cgColor]
-      hGradient?.startPoint = CGPoint(x: 0.5, y: 0)
-      hGradient?.endPoint = CGPoint(x: 0.5, y: 1)
-      avatarGlassView.contentView.backgroundColor = .clear
+      // Header Gradient - Removed so header avatar stays translucent glass
 
       // Profile Gradient
       var pGradient = profileAvatarView.layer.sublayers?.first(where: { $0.name == "savedMessagesGradient" }) as? CAGradientLayer
@@ -4273,18 +4369,7 @@ public final class ChatMainView: UIView,
 
   private func applyUserAvatarGradient() {
     let colors = userAvatarGradientColors()
-    var headerGradient =
-      avatarGlassView.contentView.layer.sublayers?.first(where: { $0.name == "userAvatarGradient" })
-      as? CAGradientLayer
-    if headerGradient == nil {
-      headerGradient = CAGradientLayer()
-      headerGradient?.name = "userAvatarGradient"
-      avatarGlassView.contentView.layer.insertSublayer(headerGradient!, at: 0)
-    }
-    headerGradient?.colors = [colors.0.cgColor, colors.1.cgColor]
-    headerGradient?.startPoint = CGPoint(x: 0.0, y: 0.0)
-    headerGradient?.endPoint = CGPoint(x: 1.0, y: 1.0)
-    headerGradient?.frame = avatarGlassView.contentView.bounds
+    // Header Gradient - Removed so header avatar stays translucent glass
     avatarGlassView.contentView.backgroundColor = .clear
 
     var profileGradient =
@@ -4647,6 +4732,14 @@ public final class ChatMainView: UIView,
     } else {
       onNativeEvent(["type": "headerAvatarPressed"])
     }
+  }
+
+  @objc private func handleHistoryPressed() {
+    chatListView.presentBridgeHistorySurface(provider: bridgeProvider)
+  }
+
+  @objc private func handleNewChatPressed() {
+    chatListView.startNewBridgeSession()
   }
 
   @objc private func handleMenuPressed() {

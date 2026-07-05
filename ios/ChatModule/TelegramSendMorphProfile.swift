@@ -44,13 +44,15 @@ public enum TelegramSendMorphProfile {
   static let metaFadeDelay: CFTimeInterval = 0.155
   static let metaFadeDuration: CFTimeInterval = 0.07
 
-  // The tail never rides the width/height morph — baked into the plate it got
-  // stretched taller during flight and landed with a visible 1px jump. It sits
-  // at its final placement from the start and fades in as the envelope
-  // releases its uniform radius, the same moment the plate's baked asymmetric
-  // corners take over (clipRadiusReleaseFraction × duration ≈ 0.28).
-  static let tailFadeDelay: CFTimeInterval = 0.26
-  static let tailFadeDuration: CFTimeInterval = 0.10
+  // The tail is a constant-size, vector-matched lobe that RIDES the plate's
+  // bottom-trailing corner as the bubble forms — it never gets width/height
+  // morphed (no stretch) and it is present-and-moving while the bubble is still
+  // forming (no end-of-flight pop). It eases in mid-morph, once the clip
+  // envelope has settled to the bubble's 18pt corner radius (clipRadiusSettle
+  // ≈ 0.45× → 0.16s), which is exactly the corner the Android tail contour is
+  // designed to splice into, then glides into final placement with the corner.
+  static let tailFadeDelay: CFTimeInterval = 0.15
+  static let tailFadeDuration: CFTimeInterval = 0.12
 }
 
 final class SendTransitionState: NSObject {
@@ -64,6 +66,12 @@ final class SendTransitionState: NSObject {
   let sourceTextSnapshot: UIView?
   let metaSnapshot: UIView?
   let tailSnapshot: UIView?
+  // Additive from-offset that makes the tail ride the plate's bottom-trailing
+  // corner: at t=0 the tail sits at (final + this offset) = the plate's START
+  // corner, and it animates the offset to zero on the same timing as the plate
+  // frame, so it stays glued to the moving corner. nil = a separate-view media
+  // tail (pinned at final placement, opacity-only, old behavior).
+  let tailCornerTravel: CGSize?
   let sourceBackgroundStartFrame: CGRect
   let sourceBackgroundEndFrame: CGRect
   let sourceContentStartFrame: CGRect
@@ -81,6 +89,7 @@ final class SendTransitionState: NSObject {
     sourceTextSnapshot: UIView?,
     metaSnapshot: UIView?,
     tailSnapshot: UIView?,
+    tailCornerTravel: CGSize?,
     sourceBackgroundStartFrame: CGRect,
     sourceBackgroundEndFrame: CGRect,
     sourceContentStartFrame: CGRect,
@@ -97,6 +106,7 @@ final class SendTransitionState: NSObject {
     self.sourceTextSnapshot = sourceTextSnapshot
     self.metaSnapshot = metaSnapshot
     self.tailSnapshot = tailSnapshot
+    self.tailCornerTravel = tailCornerTravel
     self.sourceBackgroundStartFrame = sourceBackgroundStartFrame
     self.sourceBackgroundEndFrame = sourceBackgroundEndFrame
     self.sourceContentStartFrame = sourceContentStartFrame
@@ -384,17 +394,34 @@ final class SendTransitionState: NSObject {
       )
     }
 
-    // Tail: pinned at its final placement outside the clipping envelope so
-    // the width/height morph can never stretch it; it fades in with the
-    // envelope's corner-radius release.
+    // Tail: a constant-size vector lobe outside the clip envelope. For
+    // integrated-tail bubbles it RIDES the plate's bottom-trailing corner
+    // (additive position on the plate's own timing) so it is glued to the
+    // forming bubble instead of popping in at a fixed final spot; it just eases
+    // its opacity in mid-morph once the corner has settled to 18pt. Media tails
+    // (no corner travel) keep the pinned opacity-only reveal.
     if let tailSnapshot {
+      if let travel = tailCornerTravel {
+        addScalarAnimation(
+          layer: tailSnapshot.layer, keyPath: "position.x",
+          from: travel.width, to: 0.0,
+          duration: TelegramSendMorphProfile.duration,
+          timing: TelegramSendMorphProfile.horizontalTiming, key: "tail.trackX",
+          additive: true)
+        addScalarAnimation(
+          layer: tailSnapshot.layer, keyPath: "position.y",
+          from: travel.height, to: 0.0,
+          duration: TelegramSendMorphProfile.duration,
+          timing: TelegramSendMorphProfile.verticalTiming, key: "tail.trackY",
+          additive: true)
+      }
       addOpacityAnimation(
         layer: tailSnapshot.layer,
         from: 0.0,
         to: 1.0,
         delay: TelegramSendMorphProfile.tailFadeDelay,
         duration: TelegramSendMorphProfile.tailFadeDuration,
-        timing: CAMediaTimingFunction(name: .easeIn),
+        timing: CAMediaTimingFunction(name: .easeOut),
         key: "tailFadeIn"
       )
     }
@@ -435,6 +462,7 @@ enum SendTransitionOverlayFactory {
     let sourceTextSnapshot: UIView?
     let metaSnapshot: UIView?
     let tailSnapshot: UIView?
+    let tailCornerTravel: CGSize?
     let sourceBackgroundStartFrame: CGRect
     let sourceBackgroundEndFrame: CGRect
     let sourceContentStartFrame: CGRect
@@ -569,7 +597,7 @@ enum SendTransitionOverlayFactory {
       container.addSubview(clippingView)
       container.addSubview(fallbackContent)
 
-      return Result(
+      return SendTransitionOverlayFactory.Result(
         container: container,
         clippingView: clippingView,
         sourceBackgroundSnapshot: sourceBg,
@@ -578,6 +606,7 @@ enum SendTransitionOverlayFactory {
         sourceTextSnapshot: nil,
         metaSnapshot: nil,
         tailSnapshot: nil,
+        tailCornerTravel: nil,
         sourceBackgroundStartFrame: fallbackBg.frame,
         sourceBackgroundEndFrame: fallbackBg.frame,
         sourceContentStartFrame: fallbackContentFrame,
@@ -744,21 +773,52 @@ enum SendTransitionOverlayFactory {
     // Tail lives OUTSIDE the clipping envelope at its exact final frame — it
     // must never be part of the plate that gets width/height-morphed, or it
     // stretches/shifts during the flight and lands with a jump.
-    let tailSnapshot: UIView? = {
+    let tailBuild: (view: UIView, cornerTravel: CGSize?)? = {
+      // Integrated-tail bubbles (normal text sends): the cell hands out the
+      // tail lobe as a masked snapshot complementary to the tail-suppressed
+      // plate raster — plate ∪ lobe equals the real bubble render exactly, so
+      // revealing the real cell at completion cannot shift the tail. The lobe
+      // rides the plate's bottom-trailing corner (cornerTravel) as it forms.
+      if let integrated = snapshotCell.transitionTailSnapshotView() {
+        integrated.view.frame = integrated.frameInContent.offsetBy(
+          dx: -bubbleBodyRect.minX, dy: -bubbleBodyRect.minY)
+        let isMe = snapshotCell.row?.isMe ?? true
+        let travel: CGSize
+        if isMe {
+          travel = CGSize(
+            width: sourceBackgroundStartFrame.maxX - bubbleBackgroundEndFrame.maxX,
+            height: sourceBackgroundStartFrame.maxY - bubbleBackgroundEndFrame.maxY)
+        } else {
+          travel = CGSize(
+            width: sourceBackgroundStartFrame.minX - bubbleBackgroundEndFrame.minX,
+            height: sourceBackgroundStartFrame.maxY - bubbleBackgroundEndFrame.maxY)
+        }
+        return (integrated.view, travel)
+      }
+      // Separate BubbleTailView (full-bleed media): render + display it at its
+      // EXACT bounds size so the raster is shown 1:1 — any width/height
+      // difference between render and frame scales the image and produces a
+      // ~1px height snap when the real tail is revealed at completeTransition.
       let tailRect = captureRects.tailRect
       guard !tailRect.isNull, tailRect.width > 1.0, tailRect.height > 1.0 else { return nil }
+      let tailBounds = snapshotCell.tailView.bounds
       let relativeTailFrame = CGRect(
         x: tailRect.minX - bubbleBodyRect.minX,
         y: tailRect.minY - bubbleBodyRect.minY,
-        width: tailRect.width,
-        height: tailRect.height
+        width: tailBounds.width,
+        height: tailBounds.height
       )
-      return makeRenderedSnapshotView(
-        from: snapshotCell.tailView,
-        captureRect: snapshotCell.tailView.bounds,
-        targetFrame: relativeTailFrame
-      )
+      guard
+        let view = makeRenderedSnapshotView(
+          from: snapshotCell.tailView,
+          captureRect: tailBounds,
+          targetFrame: relativeTailFrame
+        )
+      else { return nil }
+      return (view, nil)
     }()
+    let tailSnapshot = tailBuild?.view
+    let tailCornerTravel = tailBuild?.cornerTravel
 
     let clippingView = UIView(frame: sourceBackgroundStartFrame)
     clippingView.clipsToBounds = true
@@ -797,6 +857,7 @@ enum SendTransitionOverlayFactory {
       sourceTextSnapshot: sourceTextSnapshot,
       metaSnapshot: metaSnapshot,
       tailSnapshot: tailSnapshot,
+      tailCornerTravel: tailCornerTravel,
       sourceBackgroundStartFrame: sourceBackgroundStartFrame,
       sourceBackgroundEndFrame: bubbleBackgroundEndFrame,
       sourceContentStartFrame: sourceContentStartFrame,

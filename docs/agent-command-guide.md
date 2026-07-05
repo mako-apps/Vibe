@@ -22,6 +22,10 @@ needs it — e.g. **don't `cp` a file just to read or compare it**.
   `pgrep`, `sysctl -n`
 - **Build/query (free):** `xcodebuild … build`, `xcodebuild -list|-showBuildSettings`,
   `swift build`, `xcrun simctl list`, `xcrun --find`
+- **Install to device (free):** `xcrun devicectl device install app …` — copies the
+  built .app onto the phone, no observable effect until it's run. **Launching it**
+  (`xcrun devicectl device process launch …`) is the consequential step and still
+  asks — see [docs/run-on-device.md](run-on-device.md).
 - **Build/test tools (free):** `make <target>` (build/test/check/lint/all only —
   bare `make` with no target still asks, since the default target is unknown),
   `cargo build|test|run`, `go build|test|run`, `tsc`, `vite`/`webpack`/`rollup`/

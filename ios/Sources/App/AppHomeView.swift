@@ -364,6 +364,9 @@ struct ChatRoute: Identifiable, Hashable {
   /// the connect-state gate in the chat view: when no paired computer is online the
   /// composer is hidden and a Connect panel is shown instead.
   let bridgeProvider: String?
+  /// Group/channel participant list, carried straight from `ChatHomeListRow.members`.
+  /// Empty for DMs and for routes built before that data was available.
+  let members: [[String: Any]]
 
   var id: String { chatId }
 
@@ -498,13 +501,18 @@ struct ChatRoute: Identifiable, Hashable {
     unreadCount: Int = 0,
     initialRows: [[String: Any]],
     agentEventInboxMode: String? = nil,
-    bridgeProvider: String? = nil
+    bridgeProvider: String? = nil,
+    members: [[String: Any]] = []
   ) {
     self.chatId = chatId
     self.title = title
     self.peerUserId = peerUserId
     self.peerAgentId = peerAgentId
-    let resolvedIsAgent = isAgent || (peerAgentId.map { !$0.isEmpty } ?? false)
+    // A group is NEVER an agent DM. Old groups created before the server-side friend_*
+    // fix still carry a leaked `peerUserId`/`peerAgentId` (Codex/Claude) in their cached
+    // home row; without this guard the whole group opens the agent's DM surface. Gating on
+    // isGroup here repairs those stale rows without needing to recreate the group.
+    let resolvedIsAgent = !isGroup && (isAgent || (peerAgentId.map { !$0.isEmpty } ?? false))
     self.isAgent = resolvedIsAgent
     self.avatarURI = avatarURI
     self.isGroup = isGroup
@@ -513,28 +521,36 @@ struct ChatRoute: Identifiable, Hashable {
     self.agentEventInboxMode = agentEventInboxMode
     self.bridgeProvider =
       bridgeProvider
-      ?? Self.resolveBridgeProvider(
-        peerUserId: peerUserId,
-        name: title,
-        isAgent: resolvedIsAgent,
-        agentId: peerAgentId
-      )
+      ?? (isGroup
+        ? nil
+        : Self.resolveBridgeProvider(
+          peerUserId: peerUserId,
+          name: title,
+          isAgent: resolvedIsAgent,
+          agentId: peerAgentId
+        ))
+    self.members = members
   }
 
   init(row: ChatHomeListRow) {
-    let resolvedBridge = ChatRoute.resolveBridgeProvider(
-      peerUserId: row.peerUserId,
-      name: row.title,
-      isAgent: row.isAgentFriend,
-      agentId: row.peerAgentId
-    )
+    // Groups never resolve to a bridge agent — even if a stale/cached row leaked an
+    // agent peerUserId (pre-fix "group opens Codex" bug). See the designated init.
+    let resolvedBridge =
+      row.isGroup
+      ? nil
+      : ChatRoute.resolveBridgeProvider(
+        peerUserId: row.peerUserId,
+        name: row.title,
+        isAgent: row.isAgentFriend,
+        agentId: row.peerAgentId
+      )
     let cachedRows = resolvedBridge == nil
       ? (row.initialMessages.isEmpty ? row.previewRows : row.initialMessages)
       : []
-    VibeDebugLog.log(
-      "[AgentRoute] ChatRoute(row:) chatId=%@ title=%@ peerUserId=%@ peerAgentId=%@ isAgentFriend=%@ resolvedBridge=%@",
-      row.chatId, row.title, row.peerUserId ?? "nil", row.peerAgentId ?? "nil",
-      row.isAgentFriend ? "true" : "false", resolvedBridge ?? "nil")
+    NSLog(
+      "[AgentRoute] ChatRoute(row:) chatId=%@ title=%@ isGroup=%@ peerUserId=%@ peerAgentId=%@ isAgentFriend=%@ resolvedBridge=%@",
+      row.chatId, row.title, row.isGroup ? "Y" : "N", row.peerUserId ?? "nil",
+      row.peerAgentId ?? "nil", row.isAgentFriend ? "true" : "false", resolvedBridge ?? "nil")
     self.init(
       chatId: row.chatId,
       title: row.title,
@@ -546,7 +562,8 @@ struct ChatRoute: Identifiable, Hashable {
       unreadCount: row.unreadCount,
       initialRows: cachedRows,
       agentEventInboxMode: row.agentEventInboxMode,
-      bridgeProvider: resolvedBridge
+      bridgeProvider: resolvedBridge,
+      members: row.members
     )
   }
 
@@ -1346,8 +1363,9 @@ private final class ChatsViewModel: ObservableObject {
     let normalizedChatID = chatID.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !normalizedChatID.isEmpty else { return }
     locallyRemovedChatIDs.remove(normalizedChatID)
+    let now = Date().timeIntervalSince1970 * 1000
     let changed = mutateRow(chatID: normalizedChatID) { row in
-      row.withHomeState(unreadCount: row.unreadCount + 1, markedUnread: true)
+      row.withHomeState(unreadCount: row.unreadCount + 1, markedUnread: true, lastMessageAt: now)
     }
     if changed {
       persistHomeRows()
@@ -1380,6 +1398,11 @@ private final class ChatsViewModel: ObservableObject {
     let shouldIncrementUnread = reason == "chatMessageInserted" && isIncoming && !didAlreadyProject
     let preview = ChatHomeListRow.homePreviewText(from: message)
     let timeLabel = ChatHomeListRow.homeTimeLabel(from: message)
+    let messageAt =
+      (message["timestamp"] as? NSNumber)?.doubleValue
+      ?? (message["timestampMs"] as? NSNumber)?.doubleValue
+      ?? (message["timestamp_ms"] as? NSNumber)?.doubleValue
+      ?? Date().timeIntervalSince1970 * 1000
 
     let changed = mutateRow(chatID: normalizedChatID) { row in
       row.withHomeState(
@@ -1388,7 +1411,8 @@ private final class ChatsViewModel: ObservableObject {
         unreadCount: shouldIncrementUnread ? row.unreadCount + 1 : row.unreadCount,
         markedUnread: shouldIncrementUnread ? true : row.markedUnread,
         previewRows: engineRows,
-        initialMessages: engineRows
+        initialMessages: engineRows,
+        lastMessageAt: max(row.lastMessageAt, messageAt)
       )
     }
     if let messageID {
@@ -1668,7 +1692,8 @@ private extension ChatHomeListRow {
     unreadCount: Int? = nil,
     markedUnread: Bool? = nil,
     previewRows: [[String: Any]]? = nil,
-    initialMessages: [[String: Any]]? = nil
+    initialMessages: [[String: Any]]? = nil,
+    lastMessageAt: Double? = nil
   ) -> ChatHomeListRow {
     ChatHomeListRow(
       chatId: chatId,
@@ -1698,7 +1723,9 @@ private extension ChatHomeListRow {
       agentEventInboxMode: agentEventInboxMode,
       peerTier: peerTier,
       previewRows: previewRows ?? self.previewRows,
-      initialMessages: initialMessages ?? self.initialMessages
+      initialMessages: initialMessages ?? self.initialMessages,
+      members: members,
+      lastMessageAt: lastMessageAt ?? self.lastMessageAt
     )
   }
 }
@@ -1802,7 +1829,31 @@ private struct ChatHomeScreen: View {
   }
 
   private var visibleHomeRows: [ChatHomeListRow] {
-    model.rows.filter { !locallyHiddenChatIDs.contains($0.chatId) }
+    Self.sortedForHome(model.rows.filter { !locallyHiddenChatIDs.contains($0.chatId) })
+  }
+
+  /// Home ordering: Saved Messages, then the built-in agent quick-access row, then
+  /// user-pinned chats, then everything else — each bucket newest-activity-first.
+  /// Stable within equal keys via the original index so equal-timestamp rows don't
+  /// jitter between refreshes.
+  private static func sortedForHome(_ rows: [ChatHomeListRow]) -> [ChatHomeListRow] {
+    rows.enumerated().sorted { lhs, rhs in
+      let lRank = homeSortRank(lhs.element)
+      let rRank = homeSortRank(rhs.element)
+      if lRank != rRank { return lRank < rRank }
+      if lhs.element.lastMessageAt != rhs.element.lastMessageAt {
+        return lhs.element.lastMessageAt > rhs.element.lastMessageAt
+      }
+      return lhs.offset < rhs.offset
+    }
+    .map(\.element)
+  }
+
+  private static func homeSortRank(_ row: ChatHomeListRow) -> Int {
+    if row.isSavedMessages { return 0 }
+    if row.isBuiltInAgentSurface { return 1 }
+    if row.pinned { return 2 }
+    return 3
   }
 
   private var visibleArchivedRows: [ChatHomeListRow] {
@@ -1855,7 +1906,8 @@ private struct ChatHomeScreen: View {
       agentEventInboxMode: nil,
       peerTier: nil,
       previewRows: [],
-      initialMessages: []
+      initialMessages: [],
+      members: []
     )
   }
 
@@ -2031,7 +2083,10 @@ private struct ChatHomeScreen: View {
         .searchable(
           text: $homeSearchQuery,
           isPresented: $isHomeSearchFocused,
-          placement: .navigationBarDrawer(displayMode: .automatic),
+          // `.always` keeps the search field pinned in the nav-bar drawer instead
+          // of collapsing it away on scroll (which read as the search bar
+          // "disappearing"/getting screwed when the list moved).
+          placement: .navigationBarDrawer(displayMode: .always),
           prompt: "Search Chats"
         )
         .onChange(of: isHomeSearchFocused) { _, isPresented in
@@ -2063,6 +2118,13 @@ private struct ChatHomeScreen: View {
         "ChatHomeScreen onAppear rows=\(model.rows.count) searchRequest=\(coordinator.chatSearchPresentationRequestID)"
       )
       AppUIStallWatchdog.shared.updateContext("ChatHomeScreen appear rows=\(model.rows.count)")
+      // Warm the agent-bridge connection status NOW, while the user is still reading the
+      // chat list, so opening a Claude/Codex DM resolves the composer-vs-connect-panel
+      // gate instantly instead of hiding the input for a network round-trip (the 4–5s
+      // late-input + flicker). Throttled, background, non-throwing.
+      if let config = AppSessionConfig.current {
+        AgentPairingService.warmStatusIfStale(config: config)
+      }
       // We no longer present the modal on appear, as we now use search focus
     }
     .onChange(of: coordinator.chatSearchPresentationRequestID) { _, _ in
@@ -3453,7 +3515,7 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     let rowDelta = Self.animatableRowDelta(from: previousRows, to: rows)
     let canAnimateRowDelta = rowDelta != nil && isViewLoaded && view.window != nil && !isRunningRefresh
     let deletionOverlays = canAnimateRowDelta
-      ? captureDeletionOverlays(for: rowDelta?.deletedIndexPaths ?? [])
+      ? captureDeletionOverlays(for: rowDelta?.removedIndexPaths ?? [])
       : []
     self.rows = rows
     self.isDark = isDark
@@ -3499,10 +3561,21 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
   }
 
   private struct AnimatableRowDelta {
+    /// Old-index rows to delete: true removals *and* the source slots of rows that
+    /// moved (a move is modelled as delete-at-old + insert-at-new so intermediate
+    /// rows slide smoothly and the moved row lands with fresh content).
     let deletedIndexPaths: [IndexPath]
+    /// New-index rows to insert: true additions *and* the destination slots of moves.
     let insertedIndexPaths: [IndexPath]
+    /// Subset of `deletedIndexPaths` that are genuine removals — only these get the
+    /// deletion "wipe" overlay; a row merely floating to the top must not wipe.
+    let removedIndexPaths: [IndexPath]
   }
 
+  /// Ids that keep their relative order between the two snapshots stay put; every
+  /// other row (added, removed, or reordered) is expressed as a delete+insert. This
+  /// makes a chat that jumps to the top on a new message animate instead of doing a
+  /// hard `reloadData`, while still animating plain inserts/deletes as before.
   private static func animatableRowDelta(
     from previousRows: [ChatHomeListRow],
     to nextRows: [ChatHomeListRow]
@@ -3514,21 +3587,56 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
 
     guard previousSet.count == previousIDs.count, nextSet.count == nextIDs.count else { return nil }
 
+    let stable = Set(longestCommonSubsequence(previousIDs, nextIDs))
+
     let deleted = previousIDs.enumerated().compactMap { index, chatId -> IndexPath? in
-      nextSet.contains(chatId) ? nil : IndexPath(row: index, section: 0)
+      stable.contains(chatId) ? nil : IndexPath(row: index, section: 0)
     }
     let inserted = nextIDs.enumerated().compactMap { index, chatId -> IndexPath? in
-      previousSet.contains(chatId) ? nil : IndexPath(row: index, section: 0)
+      stable.contains(chatId) ? nil : IndexPath(row: index, section: 0)
+    }
+    let removed = previousIDs.enumerated().compactMap { index, chatId -> IndexPath? in
+      nextSet.contains(chatId) ? nil : IndexPath(row: index, section: 0)
     }
 
     guard !deleted.isEmpty || !inserted.isEmpty else { return nil }
-    guard deleted.count + inserted.count <= 4 else { return nil }
+    // Keep the animation to a handful of rows; a wholesale reshuffle (initial load,
+    // big refresh) still snaps via reloadData rather than animating dozens of rows.
+    guard deleted.count + inserted.count <= 8 else { return nil }
 
-    let previousSharedOrder = previousIDs.filter { nextSet.contains($0) }
-    let nextSharedOrder = nextIDs.filter { previousSet.contains($0) }
-    guard previousSharedOrder == nextSharedOrder else { return nil }
+    return AnimatableRowDelta(
+      deletedIndexPaths: deleted,
+      insertedIndexPaths: inserted,
+      removedIndexPaths: removed
+    )
+  }
 
-    return AnimatableRowDelta(deletedIndexPaths: deleted, insertedIndexPaths: inserted)
+  /// Ids common to both snapshots that preserve relative order (standard LCS).
+  private static func longestCommonSubsequence(_ a: [String], _ b: [String]) -> [String] {
+    let n = a.count
+    let m = b.count
+    guard n > 0, m > 0 else { return [] }
+    var dp = Array(repeating: Array(repeating: 0, count: m + 1), count: n + 1)
+    for i in stride(from: n - 1, through: 0, by: -1) {
+      for j in stride(from: m - 1, through: 0, by: -1) {
+        dp[i][j] = a[i] == b[j] ? dp[i + 1][j + 1] + 1 : max(dp[i + 1][j], dp[i][j + 1])
+      }
+    }
+    var result: [String] = []
+    var i = 0
+    var j = 0
+    while i < n, j < m {
+      if a[i] == b[j] {
+        result.append(a[i])
+        i += 1
+        j += 1
+      } else if dp[i + 1][j] >= dp[i][j + 1] {
+        i += 1
+      } else {
+        j += 1
+      }
+    }
+    return result
   }
 
   private func captureDeletionOverlays(for indexPaths: [IndexPath]) -> [ChatHomeDeletionWipeOverlayView] {
@@ -5337,6 +5445,7 @@ final class ChatProfileRootController: UIViewController {
       profileView.setProfileBio("")
       profileView.setAvatarUri(route.avatarURI)
       profileView.setIsGroupOrChannel(route.isGroup)
+      profileView.setGroupMembers(route.members)
       profileView.setRows(route.initialRows)
     }
   }
@@ -5544,6 +5653,7 @@ final class ChatConversationController: UIViewController {
   private var openedChatId: String?
   private var openedChatIdUsesEngineChannel = false
   private var didInitialScroll = false
+  private var loggedFirstRealLayout = false
   private var rowsRefreshGeneration: UInt = 0
   private var lastLayoutSignature: String?
   private var hasAppeared = false
@@ -5667,6 +5777,17 @@ final class ChatConversationController: UIViewController {
     // agent in over it. ChatListView gates on the per-provider Default-view setting and is
     // one-shot + idempotent, so calling this on every appear is safe.
     mountPreferredAgentSurfaceIfNeeded(reason: "viewWillAppear")
+    // Flush deferred appearance + rows BEFORE the push animation runs (viewWillAppear
+    // fires while the view is already in the window but pre-transition), so the wallpaper
+    // and the seeded messages are painted as the chat slides in — not applied a beat later
+    // in viewDidAppear, which reads as an empty flash + a soft wallpaper color shift.
+    applyPendingAppearanceAfterAttachment(reason: "viewWillAppear")
+    applyPendingRowsAfterAttachment(reason: "viewWillAppear")
+    // Resolve the composer/connect-gate as early as possible too: for a Claude/Codex DM
+    // this reads the (now proactively warmed) bridge status and lands on a stable input
+    // or connect panel before the chat is even fully on screen, instead of activating a
+    // beat later in viewDidAppear and visibly swapping in.
+    applyPendingInputActivationAfterAttachment(reason: "viewWillAppear")
   }
 
   override func viewDidAppear(_ animated: Bool) {
@@ -5685,6 +5806,13 @@ final class ChatConversationController: UIViewController {
 
   override func viewDidLayoutSubviews() {
     super.viewDidLayoutSubviews()
+    if !loggedFirstRealLayout, view.bounds.width > 1, view.bounds.height > 1 {
+      loggedFirstRealLayout = true
+      NSLog(
+        "[ChatOpen] host viewDidLayoutSubviews FIRST-REAL-BOUNDS chatId=%@ view=%.0fx%.0f hasAppeared=%@ pendingRows=%@",
+        String(route.chatId.prefix(12)), view.bounds.width, view.bounds.height,
+        hasAppeared ? "Y" : "N", pendingRowsForAttachment != nil ? "Y" : "N")
+    }
     applyPendingAppearanceAfterAttachment(reason: "viewDidLayoutSubviews")
     applyPendingInputActivationAfterAttachment(reason: "viewDidLayoutSubviews")
     applyPendingRowsAfterAttachment(reason: "viewDidLayoutSubviews")
@@ -5951,8 +6079,17 @@ final class ChatConversationController: UIViewController {
     // the composer. This is the fix for the "we're connected but it shows Connect,
     // then jumps to no panel" flicker on reopen.
     if latestBridgeStatusConnected() {
+      let fresh = AgentPairingService.statusIsFresh()
+      NSLog(
+        "[ChatOpen] connectGate WARM-CONNECTED→input chatId=%@ provider=%@ fresh=%@ reverify=%@",
+        String(route.chatId.prefix(12)), provider, fresh ? "Y" : "N", fresh ? "N" : "Y")
       handleBridgeConnected()
-      verifyWarmBridgeConnection(provider: provider, reason: reason)
+      // Only re-verify when the cached status is STALE. If it was just warmed (home
+      // appear / a recent open), a redundant poll here is the very thing that flips the
+      // composer back to the connect panel for a beat — trust the fresh snapshot.
+      if !fresh {
+        verifyWarmBridgeConnection(provider: provider, reason: reason)
+      }
       return
     }
 
@@ -5982,6 +6119,26 @@ final class ChatConversationController: UIViewController {
       return
     }
     model.startPolling()
+
+    // Fresh warm status that says OFFLINE → present the connect panel immediately from
+    // the cached snapshot instead of hiding the composer and awaiting another network
+    // poll (the second source of open-time latency). The model keeps polling and flips
+    // to the composer the moment the computer comes online.
+    if AgentPairingService.statusIsFresh(), AgentPairingService.lastConnected == false {
+      if let snapshot = AgentPairingService.lastStatusSnapshot {
+        model.status = snapshot
+        model.selectedRepository = AgentBridgeSelectionStore.ensureValidSelection(
+          from: snapshot.repositories)
+      }
+      NSLog(
+        "[ChatOpen] connectGate FRESH-OFFLINE→panel chatId=%@ provider=%@",
+        String(route.chatId.prefix(12)), provider)
+      presentAgentConnectPanel(model: model)
+      return
+    }
+    NSLog(
+      "[ChatOpen] connectGate COLD→hideInput+poll chatId=%@ provider=%@ (no fresh status)",
+      String(route.chatId.prefix(12)), provider)
 
     let chatId = route.chatId
     let normalizedProvider = provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -6328,16 +6485,40 @@ final class ChatConversationController: UIViewController {
     let chatId = route.chatId
     let initialRows = route.initialRows
     if preferInitialRows {
+      // Seed rows synchronously so the conversation paints WITH the push instead of
+      // flashing empty for ~1s until the background getChatRows below round-trips and
+      // lands after viewDidAppear. When the route carries no initial rows (the common
+      // case from the home list), pull the on-device cached history NOW — a bounded
+      // disk-cache read on the engine queue, the exact call the async block makes — and
+      // use it as the immediate seed.
+      var seedRows = initialRows
+      var seedSource = "initial"
+      // Always consult the on-device cache, not just when the route seed is empty: the
+      // home row usually carries a 1-row preview, and seeding with that instead of the
+      // full cached transcript left the chat visually empty until the async getChatRows
+      // below landed mid-push. The cache read is the same synchronous engine call the
+      // async block makes; prefer whichever source has the fuller transcript.
+      let seedReadStart = CFAbsoluteTimeGetCurrent()
+      let cachedRows = ChatEngine.shared.getChatRows(["chatId": chatId])
+      if cachedRows.count > seedRows.count {
+        seedRows = cachedRows
+        seedSource = "nativeSync"
+      }
+      NSLog(
+        "[ChatOpen] refreshRows seed chatId=%@ initialRows=%d cached=%d usedSeed=%@ readMs=%d window=%@ up=%.2f",
+        String(chatId.prefix(12)), initialRows.count, cachedRows.count, seedSource,
+        Int((CFAbsoluteTimeGetCurrent() - seedReadStart) * 1000),
+        view.window != nil ? "Y" : "N", ProcessInfo.processInfo.systemUptime)
       let firstRowID =
-        Self.normalizedString(initialRows.first?["id"])
-        ?? Self.normalizedString(initialRows.first?["messageId"])
+        Self.normalizedString(seedRows.first?["id"])
+        ?? Self.normalizedString(seedRows.first?["messageId"])
         ?? "nil"
       appShellRouteLog(
-        "ChatConversationController refreshRows immediate chatId=\(chatId) rows=\(initialRows.count) source=initial firstRowId=\(firstRowID)")
+        "ChatConversationController refreshRows immediate chatId=\(chatId) rows=\(seedRows.count) source=\(seedSource) firstRowId=\(firstRowID)")
       let didApply = applyRowsToSurface(
-        initialRows,
+        seedRows,
         chatId: chatId,
-        source: "initial",
+        source: seedSource,
         firstRowID: firstRowID,
         allowDeferUntilAttached: true
       )
@@ -6424,21 +6605,40 @@ final class ChatConversationController: UIViewController {
       pendingRowsForAttachment = rows
       pendingRowsForAttachmentChatId = chatId
       pendingRowsForAttachmentSource = source
-      appShellRouteLog(
-        "ChatConversationController deferRowsUntilAttached chatId=\(chatId) rows=\(rows.count) source=\(source) firstRowId=\(firstRowID) hasAppeared=\(hasAppeared)")
+      NSLog(
+        "[ChatOpen] applyRows DEFER chatId=%@ rows=%d source=%@ hasAppeared=%@ (window nil)",
+        String(chatId.prefix(12)), rows.count, source, hasAppeared ? "Y" : "N")
       return false
     }
+    NSLog(
+      "[ChatOpen] applyRows APPLY chatId=%@ rows=%d source=%@ window=%@ hasAppeared=%@ up=%.2f",
+      String(chatId.prefix(12)), rows.count, source, view.window != nil ? "Y" : "N",
+      hasAppeared ? "Y" : "N", ProcessInfo.processInfo.systemUptime)
 
     let startedAt = CFAbsoluteTimeGetCurrent()
     AppUIStallWatchdog.shared.updateContext(
       "ChatConversationController setRows chatId=\(chatId) rows=\(rows.count) source=\(source)"
     )
+    // UIKit lays out top-down one level per pass, so the host view can already be at
+    // full size while the deep collectionView inside the list is still 0×0 (its own
+    // layoutSubviews hasn't run yet). A setRows into a 0×0 list reloads zero cells and
+    // computes contentSize=0 — the transcript then stays blank until a later layout pass
+    // finally sizes the list (the "empty for ~1s then pops in" flash). Force the whole
+    // subtree to adopt the host's real bounds NOW so the rows render into a correctly
+    // sized list on this runloop.
+    if view.window != nil, view.bounds.width > 1, view.bounds.height > 1 {
+      view.layoutIfNeeded()
+    }
     mainView.setRows(rows)
     lastAppliedRowsToSurfaceCount = rows.count
     if currentPage == .profile {
       profileView?.setRows(rows)
     }
     let durationMs = Int((CFAbsoluteTimeGetCurrent() - startedAt) * 1000)
+    NSLog(
+      "[ChatOpen] applyRows DONE chatId=%@ rows=%d source=%@ durationMs=%d up=%.2f",
+      String(chatId.prefix(12)), rows.count, source, durationMs,
+      ProcessInfo.processInfo.systemUptime)
     appShellRouteLog(
       "ChatConversationController setRowsApplied chatId=\(chatId) rows=\(rows.count) source=\(source) durationMs=\(durationMs) firstRowId=\(firstRowID)")
     return true
@@ -6446,6 +6646,18 @@ final class ChatConversationController: UIViewController {
 
   private func applyPendingRowsAfterAttachment(reason: String) {
     guard view.window != nil else { return }
+    // Hold the pending payload until the host actually has a real size. viewWillAppear
+    // fires while the view is in the window but still 0×0 (pre-transition); applying
+    // rows there would render into an unsized list AND consume the payload, so the
+    // later viewDidLayoutSubviews pass (real bounds) would have nothing to apply. Wait
+    // for that real-bounds pass so the rows land in a correctly-sized list.
+    guard view.bounds.width > 1, view.bounds.height > 1 else {
+      NSLog(
+        "[ChatOpen] applyPendingRows WAIT reason=%@ chatId=%@ (host not sized %.0fx%.0f) pending=%@",
+        reason, String(route.chatId.prefix(12)), view.bounds.width, view.bounds.height,
+        pendingRowsForAttachment != nil ? "Y" : "N")
+      return
+    }
     guard let rows = pendingRowsForAttachment,
       let chatId = pendingRowsForAttachmentChatId,
       chatId == route.chatId
@@ -6653,6 +6865,7 @@ final class ChatConversationController: UIViewController {
       profileView.setProfileBio("")
       profileView.setAvatarUri(route.avatarURI)
       profileView.setIsGroupOrChannel(route.isGroup)
+      profileView.setGroupMembers(route.members)
       profileView.setRows(rows)
     }
   }
@@ -8775,6 +8988,105 @@ enum ChatRoomCreateService {
       throw ChatDirectMessageServiceError.invalidResponse
     }
     return remoteURL
+  }
+}
+
+struct GroupMemberAddResult {
+  let userId: String
+  let added: Bool
+}
+
+/// `POST /api/group/:id/members` — mirrors `ChatRoomCreateService`'s
+/// transport-aware request handling (direct → packet-mesh fallback, session
+/// refresh on expiry).
+enum GroupMembersUpdateService {
+  static func addMembers(
+    chatId: String, memberIds: [String], config: AppSessionConfig
+  ) async throws -> [GroupMemberAddResult] {
+    let activeConfig = AppSessionConfig.current ?? config
+    do {
+      return try await addOnce(chatId: chatId, memberIds: memberIds, config: activeConfig)
+    } catch let error as ChatDirectMessageServiceError {
+      guard error.isSessionExpired else {
+        throw error
+      }
+      let refreshedConfig = try await AppSessionRefreshService.refresh(config: activeConfig)
+      return try await addOnce(chatId: chatId, memberIds: memberIds, config: refreshedConfig)
+    }
+  }
+
+  private static func addOnce(
+    chatId: String, memberIds: [String], config: AppSessionConfig
+  ) async throws -> [GroupMemberAddResult] {
+    let request = try buildRequest(chatId: chatId, memberIds: memberIds, config: config)
+
+    switch config.transportMode {
+    case .offline:
+      throw ChatDirectMessageServiceError.transportUnavailable("offline")
+    case .bridgeText:
+      throw ChatDirectMessageServiceError.transportUnavailable("bridge_text")
+    case .packetMesh:
+      let packetSnapshot = try await PacketRuntime.shared.ensureStarted(config: config)
+      let session = PacketRuntime.shared.makeURLSession(snapshot: packetSnapshot)
+      return try await perform(request, session: session)
+    case .direct:
+      do {
+        return try await perform(request, session: .shared)
+      } catch {
+        guard ChatDirectMessageService.shouldAttemptPacketFallback(for: error) else {
+          throw error
+        }
+        let packetSnapshot = try await PacketRuntime.shared.ensureStarted(config: config)
+        let session = PacketRuntime.shared.makeURLSession(snapshot: packetSnapshot)
+        return try await perform(request, session: session)
+      }
+    }
+  }
+
+  private static func buildRequest(
+    chatId: String, memberIds: [String], config: AppSessionConfig
+  ) throws -> URLRequest {
+    var base = config.apiBaseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+    while base.hasSuffix("/") {
+      base.removeLast()
+    }
+    let pathBase = base.lowercased().hasSuffix("/api") ? base : "\(base)/api"
+    let encodedId = chatId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? chatId
+    guard let url = URL(string: "\(pathBase)/group/\(encodedId)/members") else {
+      throw ChatDirectMessageServiceError.invalidURL
+    }
+
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.timeoutInterval = 20
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
+    request.setValue("Bearer \(config.authToken)", forHTTPHeaderField: "Authorization")
+    request.httpBody = try JSONSerialization.data(withJSONObject: ["memberIds": memberIds])
+    return request
+  }
+
+  private static func perform(_ request: URLRequest, session: URLSession) async throws -> [GroupMemberAddResult] {
+    let (data, response) = try await session.data(for: request)
+
+    guard let httpResponse = response as? HTTPURLResponse else {
+      throw ChatDirectMessageServiceError.invalidResponse
+    }
+    guard (200...299).contains(httpResponse.statusCode) else {
+      let body = String(data: data, encoding: .utf8) ?? ""
+      throw ChatDirectMessageServiceError.http(httpResponse.statusCode, body)
+    }
+
+    let object = try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+    guard let payload = object as? [String: Any], let results = payload["results"] as? [[String: Any]] else {
+      throw ChatDirectMessageServiceError.invalidPayload
+    }
+    return results.compactMap { entry in
+      guard let userId = entry["userId"] as? String else { return nil }
+      let added = (entry["added"] as? Bool) ?? false
+      return GroupMemberAddResult(userId: userId, added: added)
+    }
   }
 }
 

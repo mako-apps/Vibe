@@ -13,13 +13,17 @@ let bubbleMetaTopSpacing: CGFloat = 2.0
 let bubbleMetaHeight: CGFloat = 14.0
 let bubbleMinWidth: CGFloat = 26.0
 let bubbleMaxWidthFactor: CGFloat = 0.85
-// The inline agent-turn bubble packs a rich, already-padded step/narration/diff feed, so
-// the surrounding chat-bubble shell wants a tighter inset than a plain text bubble (whose
-// content is a bare label) — otherwise the doubled padding reads as too much air.
-let agentTurnHorizontalPadding: CGFloat = 6.0
-let agentTurnVerticalPadding: CGFloat = 4.0
-// Agent turns render wide, information-dense content; give them more of the row than the
-// 0.85 a chat bubble uses so steps/diffs aren't cramped.
-let agentTurnMaxWidthFactor: CGFloat = 0.92
+// The inline agent-turn bubble must read as a NORMAL them-bubble: its answer prose is a
+// bare edge-to-edge label inside the body view (no internal leading inset), so the shell
+// has to supply the SAME inset a plain text bubble uses or the text hugs the bubble edge
+// and looks misaligned against every other incoming message. Keep these equal to the
+// plain-bubble constants — do not tighten them (the earlier 6/4 tightening is what made the
+// agent text sit ~6pt further left + higher than a real them-bubble).
+let agentTurnHorizontalPadding: CGFloat = bubbleHorizontalPadding
+let agentTurnVerticalPadding: CGFloat = bubbleTopPadding
+// Match the plain-bubble width so an agent turn is the same shape as any other incoming
+// message. Rich content (diff cards / step lists) scrolls/wraps inside this width rather
+// than widening the whole bubble past its neighbours.
+let agentTurnMaxWidthFactor: CGFloat = bubbleMaxWidthFactor
 let dayPillHorizontalPadding: CGFloat = 11.0
 let dayPillVerticalPadding: CGFloat = 4.0

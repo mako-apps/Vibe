@@ -207,7 +207,8 @@ enum ChatHomeService {
       agentEventInboxMode: nil,
       peerTier: nil,
       previewRows: [],
-      initialMessages: []
+      initialMessages: [],
+      members: []
     )
   }
 
@@ -272,7 +273,8 @@ enum ChatHomeService {
         agentEventInboxMode: nil,
         peerTier: nil,
         previewRows: [],
-        initialMessages: ChatHomeListRow.parseServerMessages(messages)
+        initialMessages: ChatHomeListRow.parseServerMessages(messages),
+        members: []
       )
     } catch {
       return nil

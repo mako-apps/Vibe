@@ -241,7 +241,19 @@ defmodule Vibe.Chat do
 
         Enum.map(results, fn {chat_id, my_settings} ->
           room = Map.get(rooms, chat_id)
-          friend_p = List.first(Map.get(friend_participants, chat_id, []))
+          room_type = if(room, do: room.type, else: "dm")
+
+          # "Friend" fields (friendId/friendName/friendImage/friendIsAgent/…) describe
+          # the *other party* of a 1:1 DM. For groups/channels the client must render
+          # the room's own name/avatar and treat every participant as a member — if we
+          # leak a participant here (e.g. Codex), the client mistakes the whole group
+          # for that agent's DM and opens the wrong surface.
+          friend_p =
+            if room_type == "dm" do
+              List.first(Map.get(friend_participants, chat_id, []))
+            else
+              nil
+            end
 
           friend_agent =
             if(friend_p, do: Map.get(agent_friends_by_user_id, friend_p.user_id), else: nil)
@@ -261,15 +273,16 @@ defmodule Vibe.Chat do
               chat_messages
             end
 
-          room_type = if(room, do: room.type, else: "dm")
-
           members =
             if room_type in ["group", "channel"] do
               Map.get(group_members, chat_id, [])
               |> Enum.map(fn member ->
                 %{
                   userId: member.user_id,
-                  name: if(member.user, do: member.user.username, else: nil),
+                  name:
+                    present_string(member.user && member.user.name) ||
+                      present_string(member.user && member.user.username),
+                  avatarUrl: present_string(member.user && member.user.profile_image),
                   role: member.role || "member"
                 }
               end)
@@ -279,9 +292,29 @@ defmodule Vibe.Chat do
 
           messages_for_client = Enum.map(chat_messages, &to_client_message/1)
 
+          # A single comparable "last activity" instant (epoch ms) so the client can
+          # sort the home list newest-first. Newest visible message wins; an empty
+          # chat (e.g. a just-created group) falls back to the room's creation time
+          # so it still surfaces near the top instead of sinking to the bottom.
+          last_activity_at =
+            case List.last(chat_messages) do
+              %{timestamp: ts} when is_integer(ts) ->
+                ts
+
+              _ ->
+                if room && room.inserted_at do
+                  room.inserted_at
+                  |> DateTime.from_naive!("Etc/UTC")
+                  |> DateTime.to_unix(:millisecond)
+                else
+                  0
+                end
+            end
+
           %{
             chatId: chat_id,
             type: room_type,
+            lastMessageAt: last_activity_at,
             name: if(room, do: room.name, else: nil),
             description: if(room, do: room.description, else: nil),
             avatarUrl: if(room, do: room.avatar_url, else: nil),

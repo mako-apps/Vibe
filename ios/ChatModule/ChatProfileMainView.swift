@@ -1081,6 +1081,7 @@ private enum ChatProfileSwiftUIDestination: Hashable {
   case bridgeSession(AgentBridgeHistorySession)
   case appearance
   case tab(ChatProfileTab)
+  case members
 
   var transitionID: String {
     switch self {
@@ -1094,6 +1095,8 @@ private enum ChatProfileSwiftUIDestination: Hashable {
       return "contact-photo-poster"
     case .tab(let tab):
       return "shared-\(tab.rawValue)"
+    case .members:
+      return "group-members"
     }
   }
 }
@@ -1135,6 +1138,8 @@ private struct ChatProfileSwiftUIRootView: View {
   let avatarUri: String?
   let isGroupOrChannel: Bool
   let groupMembersSubtitle: String
+  let groupMembers: [[String: Any]]
+  let canManageGroupMembers: Bool
   let groupBridgeProvider: String?
   let selectedRepositoryName: String?
   // Bridge (Claude/Codex paired-computer) state. `bridgeProvider` is empty for a
@@ -1151,6 +1156,7 @@ private struct ChatProfileSwiftUIRootView: View {
   let onAction: (String) -> Void
   let onSaveAppearance: (ChatProfileAppearanceSelection) -> Void
   let onContentPressed: ([String: Any]) -> Void
+  let onMembersAdded: ([[String: Any]]) -> Void
 
   @Namespace private var morphNamespace
   @StateObject private var navCoordinator = ChatProfileNavigationCoordinator()
@@ -1158,6 +1164,7 @@ private struct ChatProfileSwiftUIRootView: View {
   @State private var lastReportedScrollOffset: CGFloat = -1
   @State private var stickyTitleVisible = false
   @State private var newChatTrigger = false
+  @State private var isShowingAddMembers = false
   /// Per-agent default view (chat vs agent runtime) for Claude/Codex. Seeded from the
   /// store when the section appears; the picker writes back through the store.
   @State private var bridgeDefaultView: AgentBridgeDefaultView = .chat
@@ -1208,7 +1215,11 @@ private struct ChatProfileSwiftUIRootView: View {
           // Use the full geometry size to ensure it covers the safe areas properly
           let fullWidth = geometry.size.width + geometry.safeAreaInsets.leading + geometry.safeAreaInsets.trailing
           let fullHeight = geometry.size.height + geometry.safeAreaInsets.top + geometry.safeAreaInsets.bottom
-          profileBackdrop(width: fullWidth, height: fullHeight)
+          profileBackdrop(
+            width: fullWidth,
+            height: fullHeight,
+            contentHeight: heroContentHeight(for: geometry)
+          )
 
           ScrollView(.vertical, showsIndicators: true) {
             LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
@@ -1262,7 +1273,16 @@ private struct ChatProfileSwiftUIRootView: View {
                 .padding(.horizontal, 28)
                 .padding(.top, 22)
                 .padding(.bottom, 18)
-                .background(Color.clear)
+                .background {
+                  // Transparent while the name sits over the hero; fades to a frosted
+                  // bar once it collapses and sticks under the nav bar so the scrolling
+                  // rows don't bleed through behind it.
+                  Rectangle()
+                    .fill(.ultraThinMaterial)
+                    .opacity(stickyTitleVisible ? 1 : 0)
+                    .animation(.easeInOut(duration: 0.18), value: stickyTitleVisible)
+                    .ignoresSafeArea(edges: .top)
+                }
               }
             }
           }
@@ -1274,32 +1294,28 @@ private struct ChatProfileSwiftUIRootView: View {
         }
         .background(Color.clear)
         .ignoresSafeArea(edges: .top)
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar(.visible, for: .navigationBar)
-        .toolbarBackground(.hidden, for: .navigationBar)
-        .toolbar {
-          if navCoordinator.path.isEmpty {
-            ToolbarItem(placement: .topBarLeading) {
+        .toolbar(.hidden, for: .navigationBar)
+
+        // Custom Overlay Header to avoid NavigationStack jumping
+        if navCoordinator.path.isEmpty {
+          VStack {
+            HStack {
               Button {
                 onAction("headerBack")
               } label: {
                 Image(systemName: "chevron.left")
                   .font(.system(size: 18, weight: .semibold))
+                  .padding(12)
               }
-            }
-
-            ToolbarItem(placement: .principal) {
+              Spacer()
               Text(profileName)
                 .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(.primary)
                 .lineLimit(1)
                 .minimumScaleFactor(0.78)
                 .opacity(stickyTitleVisible ? 1 : 0)
                 .animation(.easeInOut(duration: 0.16), value: stickyTitleVisible)
                 .accessibilityHidden(!stickyTitleVisible)
-            }
-
-            ToolbarItem(placement: .topBarTrailing) {
+              Spacer()
               Menu {
                 Button(isChatMuted ? "Unmute" : "Mute") { onAction("muteToggle") }
                 Button("Search") { onAction("search") }
@@ -1308,30 +1324,46 @@ private struct ChatProfileSwiftUIRootView: View {
               } label: {
                 Image(systemName: "ellipsis")
                   .font(.system(size: 18, weight: .semibold))
+                  .padding(12)
               }
             }
+            .padding(.horizontal, 4)
+            // Dynamically adapt color: white over the dark hero image, primary over the sticky material
+            .foregroundStyle(stickyTitleVisible ? AnyShapeStyle(.primary) : AnyShapeStyle(.white))
+            .animation(.easeInOut(duration: 0.16), value: stickyTitleVisible)
+            Spacer()
           }
+          .zIndex(100) // Ensure it draws over the ScrollView
         }
-        .navigationDestination(for: ChatProfileSwiftUIDestination.self) { destination in
-          if case .bridgeSession = destination {
-            destinationView(for: destination)
-          } else {
-            destinationView(for: destination)
-              .navigationTransition(.zoom(sourceID: destination.transitionID, in: morphNamespace))
-          }
+      }
+      .navigationDestination(for: ChatProfileSwiftUIDestination.self) { destination in
+        if case .bridgeSession = destination {
+          destinationView(for: destination)
+        } else {
+          destinationView(for: destination)
+            .navigationTransition(.zoom(sourceID: destination.transitionID, in: morphNamespace))
         }
       }
       .background(Color.clear)
       .tint(.primary)
-      .preferredColorScheme(.light)
       .onChange(of: navCoordinator.path.isEmpty) { _, isEmpty in
         onNavigationActiveChanged(!isEmpty)
+      }
+      .sheet(isPresented: $isShowingAddMembers) {
+        if let config = AppSessionConfig.current {
+          AddGroupMembersSheet(
+            config: config,
+            chatId: bridgeChatId,
+            excludedUserIds: Set(groupMembers.compactMap { $0["userId"] as? String }),
+            onAdded: onMembersAdded
+          )
+        }
       }
     }
   }
 
   @ViewBuilder
-  private func profileBackdrop(width: CGFloat, height: CGFloat) -> some View {
+  private func profileBackdrop(width: CGFloat, height: CGFloat, contentHeight: CGFloat) -> some View {
     ZStack {
       if let posterImage {
         let isSquare = posterImage.size.width > 0 && posterImage.size.height > 0 &&
@@ -1344,6 +1376,7 @@ private struct ChatProfileSwiftUIRootView: View {
             .resizable()
             .scaledToFill()
             .frame(width: width, height: height)
+            .clipped()
             .rotationEffect(.degrees(180))
             .blur(radius: 60)
             .opacity(0.8)
@@ -1370,6 +1403,7 @@ private struct ChatProfileSwiftUIRootView: View {
           let img = Image(uiImage: posterImage).resizable().scaledToFill()
 
           img.frame(width: width, height: height)
+            .clipped()
 
           img.frame(width: width, height: height)
             .blur(radius: min(40, 15 + max(0, localScrollOffset / 5)))
@@ -1385,37 +1419,27 @@ private struct ChatProfileSwiftUIRootView: View {
             )
         }
       } else {
-        // Fallback Avatar
-        let scale = max(0.6, 1.0 - max(0, localScrollOffset / 500))
-        let hero = ChatProfileHeroInlineView(
+        // No custom poster: render the profile photo as a circular avatar parked just
+        // above the name, with a soft reflection bloom (or a gradient + glyph when
+        // there's no photo at all).
+        let scale = max(0.62, 1.0 - max(0, localScrollOffset / 460))
+        let collapseBlur = min(14, max(0, localScrollOffset) / 22)
+        ChatProfileHeroInlineView(
           text: avatarDisplayText,
           fontStyleID: appearanceSelection.avatarFontStyleID,
           gradientColors: avatarGradientColors,
           imageUri: hasProfileImage ? avatarUri : nil,
           width: width,
           height: height,
-          avatarScale: scale
+          contentHeight: contentHeight,
+          avatarScale: scale,
+          avatarBlur: collapseBlur
         )
-
-        hero.frame(width: width, height: height)
-
-        hero.frame(width: width, height: height)
-          .blur(radius: 20)
-          .mask(
-            LinearGradient(
-              stops: [
-                .init(color: .black, location: 0.3),
-                .init(color: .clear, location: 0.5)
-              ],
-              startPoint: .top,
-              endPoint: .bottom
-            )
-          )
+        .frame(width: width, height: height)
       }
     }
     .frame(width: width, height: height)
     .scaleEffect(1.05 + max(0, -localScrollOffset / 500))
-    .clipped()
     .ignoresSafeArea()
   }
 
@@ -1459,25 +1483,27 @@ private struct ChatProfileSwiftUIRootView: View {
   }
 
   private var actionRow: some View {
-    HStack(spacing: 18) {
-      ChatProfileSwiftUIActionButton(
-        title: isChatMuted ? "Unmute" : "Mute",
-        systemImage: isChatMuted ? "bell" : "bell.slash",
-        fill: rowFill
-      ) {
-        onAction("muteToggle")
-      }
+    GlassEffectContainer(spacing: 18) {
+      HStack(spacing: 18) {
+        ChatProfileSwiftUIActionButton(
+          title: isChatMuted ? "Unmute" : "Mute",
+          systemImage: isChatMuted ? "bell" : "bell.slash",
+          fill: rowFill
+        ) {
+          onAction("muteToggle")
+        }
 
-      ChatProfileSwiftUIActionButton(title: "Search", systemImage: "magnifyingglass", fill: rowFill) {
-        onAction("search")
-      }
+        ChatProfileSwiftUIActionButton(title: "Search", systemImage: "magnifyingglass", fill: rowFill) {
+          onAction("search")
+        }
 
-      ChatProfileSwiftUIActionButton(title: "Call", systemImage: "phone", fill: rowFill) {
-        onAction("audio")
-      }
+        ChatProfileSwiftUIActionButton(title: "Call", systemImage: "phone", fill: rowFill) {
+          onAction("audio")
+        }
 
-      ChatProfileSwiftUIActionButton(title: "Video", systemImage: "video", fill: rowFill) {
-        onAction("video")
+        ChatProfileSwiftUIActionButton(title: "Video", systemImage: "video", fill: rowFill) {
+          onAction("video")
+        }
       }
     }
   }
@@ -1509,9 +1535,7 @@ private struct ChatProfileSwiftUIRootView: View {
       }
     } else if isGroupOrChannel {
       ChatProfileSwiftUISection(fill: rowFill) {
-        Button {
-          onAction("members")
-        } label: {
+        NavigationLink(value: ChatProfileSwiftUIDestination.members) {
           ChatProfileSwiftUIRow(
             title: "Members",
             subtitle: groupMembersSubtitle,
@@ -1520,6 +1544,7 @@ private struct ChatProfileSwiftUIRootView: View {
             separatorColor: separatorColor,
             isLast: groupBridgeProvider == nil
           )
+          .matchedTransitionSource(id: ChatProfileSwiftUIDestination.members.transitionID, in: morphNamespace)
         }
         .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
 
@@ -1895,6 +1920,42 @@ private struct ChatProfileSwiftUIRootView: View {
         separatorColor: separatorColor,
         onContentPressed: onContentPressed
       )
+    case .members:
+      ChatProfileSwiftUIExpandedContentView(
+        title: "Members",
+        items: swiftUIMemberItems(),
+        fill: rowFill,
+        separatorColor: separatorColor,
+        onContentPressed: onContentPressed,
+        trailingToolbarSystemImage: canManageGroupMembers ? "person.badge.plus" : nil,
+        onTrailingToolbarPressed: canManageGroupMembers ? { isShowingAddMembers = true } : nil
+      )
+    }
+  }
+
+  private func swiftUIMemberItems() -> [ChatProfileSwiftUIContentItem] {
+    groupMembers.compactMap { entry -> ChatProfileSwiftUIContentItem? in
+      let userId =
+        (entry["userId"] as? String)
+        ?? (entry["id"] as? String)
+        ?? (entry["memberId"] as? String)
+      guard let userId, !userId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return nil
+      }
+      let rawName =
+        (entry["name"] as? String)
+        ?? (entry["displayName"] as? String)
+        ?? (entry["username"] as? String)
+      let name = rawName?.trimmingCharacters(in: .whitespacesAndNewlines)
+      let role = (entry["role"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "member"
+      let isAdmin = role == "owner" || role == "admin"
+      return ChatProfileSwiftUIContentItem(
+        id: userId,
+        title: (name?.isEmpty ?? true) ? userId : name!,
+        subtitle: role == "owner" ? "Owner" : (role == "admin" ? "Admin" : "Member"),
+        systemImage: isAdmin ? "star.circle.fill" : "person.circle",
+        payload: ["type": "groupMemberTapped", "userId": userId]
+      )
     }
   }
 }
@@ -1914,11 +1975,11 @@ private struct ChatProfileAvatarGlyph: View {
   }
 }
 
-/// Full-width hero banner inline in the profile scroll content (replaces the old
-/// circular avatar overlay). No image: gradient fill + bare glyph, no circle.
-/// With image: image is top-anchored (cropped portion always at top) and a bottom
-/// gradient fades into the content; square/portrait images are never stretched —
-/// the gradient shows through as letterbox instead of zooming.
+/// Full-width hero backdrop inline in the profile scroll content. No image:
+/// gradient fill + bare glyph. With image: the profile's 1:1 photo is shown as a
+/// circular avatar (never stretched/zoomed to fill the screen) with a soft, blurred
+/// reflection of the same photo glowing behind it; the profile gradient still shows
+/// through everywhere the glow fades out.
 private struct ChatProfileHeroInlineView: View {
   let text: String
   let fontStyleID: String?
@@ -1926,14 +1987,20 @@ private struct ChatProfileHeroInlineView: View {
   let imageUri: String?
   let width: CGFloat
   let height: CGFloat
+  /// Y (from the top of this backdrop) where the scrolling name/actions begin; the
+  /// avatar is parked just above it instead of centered in the whole screen.
+  var contentHeight: CGFloat = 0
   var avatarScale: CGFloat = 1.0
+  /// Blur applied to the avatar as the header collapses on scroll.
+  var avatarBlur: CGFloat = 0
 
   @State private var image: UIImage?
   @State private var loadedUri: String?
 
   init(
     text: String, fontStyleID: String?, gradientColors: (UIColor, UIColor),
-    imageUri: String?, width: CGFloat, height: CGFloat, avatarScale: CGFloat = 1.0
+    imageUri: String?, width: CGFloat, height: CGFloat,
+    contentHeight: CGFloat = 0, avatarScale: CGFloat = 1.0, avatarBlur: CGFloat = 0
   ) {
     self.text = text
     self.fontStyleID = fontStyleID
@@ -1941,7 +2008,9 @@ private struct ChatProfileHeroInlineView: View {
     self.imageUri = imageUri
     self.width = width
     self.height = height
+    self.contentHeight = contentHeight
     self.avatarScale = avatarScale
+    self.avatarBlur = avatarBlur
     let normalized = imageUri?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
     let primed = normalized.flatMap { ChatAvatarImageStore.cached(for: $0) }
     _image = State(initialValue: primed)
@@ -1949,32 +2018,30 @@ private struct ChatProfileHeroInlineView: View {
   }
 
   var body: some View {
-    ZStack(alignment: .bottom) {
-      LinearGradient(
-        colors: [Color(uiColor: gradientColors.0), Color(uiColor: gradientColors.1)],
-        startPoint: .top,
-        endPoint: .bottom
-      )
+    let avatarSize = min(width, height) * 0.42
+    let anchorY = contentHeight > 0 ? contentHeight : height * 0.42
+    let avatarCenterY = max(avatarSize * 0.5 + 44, anchorY - avatarSize * 0.5 - 40)
 
-      Group {
-        if loadedUri == normalizedUri, let image {
-          bannerImage(image)
-        } else if normalizedUri == nil {
-          Text(text)
-            .font(.system(
-              size: max(56, height * 0.26),
-              weight: .bold,
-              design: ChatProfileAvatarFontStyle.style(id: fontStyleID).design
-            ))
-            .foregroundStyle(.white.opacity(0.94))
-            .minimumScaleFactor(0.4)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
+    return ZStack {
+      // Background: black behind a real photo (so the reflection reads like the
+      // Spotify-style ambient bloom); gradient only when there's no photo at all.
+      if normalizedUri != nil {
+        Color.black
+      } else {
+        LinearGradient(
+          colors: [Color(uiColor: gradientColors.0), Color(uiColor: gradientColors.1)],
+          startPoint: .top,
+          endPoint: .bottom
+        )
       }
-      .scaleEffect(avatarScale, anchor: .center)
+
+      if loadedUri == normalizedUri, let image {
+        avatarReflectionHero(image, avatarSize: avatarSize, avatarCenterY: avatarCenterY)
+      } else if normalizedUri == nil {
+        avatarFallbackHero(avatarSize: avatarSize, avatarCenterY: avatarCenterY)
+      }
     }
     .frame(width: width, height: height)
-    .clipped()
     .allowsHitTesting(false)
     .task(id: normalizedUri ?? "") {
       await loadImage()
@@ -1982,12 +2049,64 @@ private struct ChatProfileHeroInlineView: View {
   }
 
   @ViewBuilder
-  private func bannerImage(_ image: UIImage) -> some View {
-    Image(uiImage: image)
-      .resizable()
-      .scaledToFill()
-      .frame(width: width, height: height)
-      .clipped()
+  private func avatarReflectionHero(_ image: UIImage, avatarSize: CGFloat, avatarCenterY: CGFloat) -> some View {
+    let reflectionOpacity = max(0, 0.45 - max(0, avatarBlur) / 28)
+    let screenHeight = UIScreen.main.bounds.height
+    let bloomHeight = screenHeight * 0.45
+
+    ZStack {
+      Image(uiImage: image)
+        .resizable()
+        .scaledToFill()
+        .frame(width: width, height: bloomHeight)
+        .blur(radius: 40)
+        .opacity(reflectionOpacity)
+        .mask(
+          LinearGradient(
+            stops: [
+              .init(color: .black, location: 0.0),
+              .init(color: .black.opacity(0.8), location: 0.6),
+              .init(color: .clear, location: 1.0)
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+          )
+        )
+        .position(x: width * 0.5, y: bloomHeight * 0.5)
+
+      Image(uiImage: image)
+        .resizable()
+        .scaledToFill()
+        .frame(width: avatarSize, height: avatarSize)
+        .clipShape(Circle())
+        .overlay(Circle().strokeBorder(Color.white.opacity(0.16), lineWidth: 1))
+        .shadow(color: .black.opacity(0.38), radius: 26, y: 12)
+        .scaleEffect(avatarScale, anchor: .center)
+        .blur(radius: avatarBlur)
+        .position(x: width * 0.5, y: avatarCenterY)
+    }
+    .frame(width: width, height: height)
+  }
+
+  @ViewBuilder
+  private func avatarFallbackHero(avatarSize: CGFloat, avatarCenterY: CGFloat) -> some View {
+    ZStack {
+      Text(text)
+        .font(.system(
+          size: max(24, avatarSize * 0.4),
+          weight: .bold,
+          design: ChatProfileAvatarFontStyle.style(id: fontStyleID).design
+        ))
+        .foregroundStyle(.white.opacity(0.94))
+        .minimumScaleFactor(0.4)
+      
+      Circle()
+        .strokeBorder(Color.white.opacity(0.3), lineWidth: 1)
+    }
+    .frame(width: avatarSize, height: avatarSize)
+    .scaleEffect(avatarScale, anchor: .center)
+    .blur(radius: avatarBlur)
+    .position(x: width * 0.5, y: avatarCenterY)
   }
 
   private var normalizedUri: String? {
@@ -2703,7 +2822,10 @@ private extension View {
   @ViewBuilder
   func chatProfileBounceBehavior() -> some View {
     if #available(iOS 16.4, *) {
-      self.scrollBounceBehavior(.basedOnSize)
+      // `.always` (not `.basedOnSize`) so the header's overscroll stretch and the
+      // sticky name/action-row collapse both work even when the profile body is
+      // short enough to fit on one screen without scrolling.
+      self.scrollBounceBehavior(.always)
     } else {
       self
     }
@@ -2835,9 +2957,7 @@ private struct ChatProfileSwiftUIActionButton: View {
         Image(systemName: systemImage)
           .font(.system(size: 22, weight: .semibold))
           .frame(width: 52, height: 52)
-          .background {
-            Circle().fill(.thinMaterial)
-          }
+          .glassEffect(.regular.tint(fill).interactive(), in: .circle)
           .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.18 : 0.08), radius: 10, x: 0, y: 5)
 
         Text(title)
@@ -2858,6 +2978,8 @@ private struct ChatProfileSwiftUIExpandedContentView: View {
   let fill: Color
   let separatorColor: Color
   let onContentPressed: ([String: Any]) -> Void
+  var trailingToolbarSystemImage: String? = nil
+  var onTrailingToolbarPressed: (() -> Void)? = nil
 
   var body: some View {
     List {
@@ -2911,6 +3033,15 @@ private struct ChatProfileSwiftUIExpandedContentView: View {
     .background(Color(uiColor: UIColor.systemGroupedBackground))
     .navigationTitle(title)
     .navigationBarTitleDisplayMode(.inline)
+    .toolbar {
+      if let trailingToolbarSystemImage, let onTrailingToolbarPressed {
+        ToolbarItem(placement: .topBarTrailing) {
+          Button(action: onTrailingToolbarPressed) {
+            Image(systemName: trailingToolbarSystemImage)
+          }
+        }
+      }
+    }
   }
 }
 
@@ -3484,6 +3615,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   private var groupMembers: [[String: Any]] = []
 
   private var engineChatId = ""
+  private var engineMyUserId = ""
   private var enginePeerUserId = ""
   private var agentConfig: [String: Any]?
   // Non-empty ("claude"/"codex") when this profile is a paired-computer bridge
@@ -3674,7 +3806,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   }
 
   func setEngineMyUserId(_ value: String) {
-    _ = value
+    engineMyUserId = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    renderSwiftUIProfile()
   }
 
   func setEnginePeerUserId(_ value: String) {
@@ -3867,7 +4000,6 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
 
   private func configureView() {
     clipsToBounds = false
-    overrideUserInterfaceStyle = .light
 
     // Background gradient
     backgroundGradientLayer.startPoint = CGPoint(x: 0.5, y: 0.0)
@@ -4023,6 +4155,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       avatarUri: resolvedAvatarImageUriForSwiftUI(),
       isGroupOrChannel: isGroupOrChannel,
       groupMembersSubtitle: groupMembersSummary(),
+      groupMembers: groupMembers,
+      canManageGroupMembers: canManageGroupMembers,
       groupBridgeProvider: groupBridgeProviderFromMembers(),
       selectedRepositoryName: AgentBridgeSelectionStore.selectedRepository()?.name,
       bridgeProvider: bridgeProvider,
@@ -4057,6 +4191,17 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       },
       onContentPressed: { [weak self] payload in
         self?.onNativeEvent(payload)
+      },
+      onMembersAdded: { [weak self] added in
+        guard let self else { return }
+        let existingIds = Set(self.groupMembers.compactMap { $0["userId"] as? String })
+        let newOnes = added.filter { entry in
+          guard let uid = entry["userId"] as? String else { return false }
+          return !existingIds.contains(uid)
+        }
+        guard !newOnes.isEmpty else { return }
+        self.setGroupMembers(self.groupMembers + newOnes)
+        self.renderSwiftUIProfile()
       }
     )
     let erasedRoot = AnyView(rootView)
@@ -4141,8 +4286,6 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     case let value where value.hasPrefix("bridgeRepository:"):
       let provider = String(value.dropFirst("bridgeRepository:".count))
       onNativeEvent(["type": "openAgentPanel", "provider": provider])
-    case "members":
-      onNativeEvent(["type": "profileMembersPressed"])
     case "agentConfig":
       presentAgentConfigEditor()
     case "headerBack":
@@ -4890,6 +5033,16 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     return names.prefix(3).joined(separator: ", ")
   }
 
+  private var canManageGroupMembers: Bool {
+    guard isGroupOrChannel, !engineMyUserId.isEmpty else { return false }
+    let mine = groupMembers.first { entry in
+      let id = (entry["userId"] as? String) ?? (entry["id"] as? String) ?? (entry["memberId"] as? String)
+      return id?.caseInsensitiveCompare(engineMyUserId) == .orderedSame
+    }
+    let role = (mine?["role"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+    return role == "owner" || role == "admin"
+  }
+
   private func groupBridgeProviderFromMembers() -> String? {
     for member in groupMembers {
       let values = [
@@ -4912,14 +5065,16 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
         return nil
       }
 
-      if values.contains("00000000-0000-0000-0000-0000000000c1")
+      if values.contains("11111111-1111-1111-1111-111111111111")
+        || values.contains("00000000-0000-0000-0000-0000000000c1")
         || values.contains("claude")
         || values.contains("@claude")
       {
         return "claude"
       }
 
-      if values.contains("00000000-0000-0000-0000-0000000000c2")
+      if values.contains("22222222-2222-2222-2222-222222222222")
+        || values.contains("00000000-0000-0000-0000-0000000000c2")
         || values.contains("codex")
         || values.contains("@codex")
       {

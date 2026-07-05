@@ -43,16 +43,23 @@ xcodebuild -project ios/Vibe.xcodeproj -scheme Vibe \
 Output app bundle:
 `/tmp/vibe-device-build/Build/Products/Debug-iphoneos/Vibe.app`
 
-### 2. Install + launch on the phone — ASKS FIRST (needs approval)
+### 2. Install onto the phone — FREE (auto-approved)
 
-Installing/launching on the physical phone is **not** auto-approved on purpose —
-the agent must get a yes before the app lands/opens on the device.
+Copying the built app onto the device has no observable effect until it's run, so
+it's auto-allowed same as build:
 
 ```bash
 xcrun devicectl device install app \
   --device 00008140-000935000288801C \
   /tmp/vibe-device-build/Build/Products/Debug-iphoneos/Vibe.app
+```
 
+### 3. Launch on the phone — ASKS FIRST (needs approval)
+
+Actually running the app on the physical phone is **not** auto-approved on purpose —
+the agent must get a yes before it opens on the device.
+
+```bash
 xcrun devicectl device process launch \
   --device 00008140-000935000288801C \
   com.vibegram.app
@@ -63,9 +70,11 @@ xcrun devicectl device process launch \
 ## Approval policy (ties into ~/.vibe/agent-config.toml)
 
 - **Build** (`xcodebuild ... build`, `swift build`) → auto-allowed (built-in safe list).
-- **Install / launch on device** (`devicectl device install|process launch`,
-  `ios-deploy`) → intentionally NOT in the allow-list → prompts for approval.
-- The user's rule: *"the build is free — just ask before launching on my phone."*
+- **Install onto device** (`devicectl device install app`) → auto-allowed (just
+  copies files, no running app is affected).
+- **Launch on device** (`devicectl device process launch`, `ios-deploy -L`) →
+  intentionally NOT in the allow-list → prompts for approval.
+- The user's rule: *"the build and install are free — just ask before launching on my phone."*
 
 ## Notes
 

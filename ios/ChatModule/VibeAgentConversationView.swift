@@ -5984,8 +5984,7 @@ final class VibeAgentAskSheetViewController: UIViewController {
 
   private let scrollView = UIScrollView()
   private let contentStack = UIStackView()
-  private let feedbackView = UITextView()
-  private let feedbackPlaceholder = UILabel()
+  private let feedbackField = UITextField()
 
   // ask-mode question state, parallel to `questions`.
   private struct AskQuestion {
@@ -6065,11 +6064,13 @@ final class VibeAgentAskSheetViewController: UIViewController {
     contentStack.alignment = .fill
     scrollView.addSubview(contentStack)
 
-    // Parse questions before the bar so it can choose paged (Back/Next) vs single Submit.
     if kind != "plan" && kind != "command" { parseQuestions() }
     let buttonBar = makeButtonBar()
     buttonBar.translatesAutoresizingMaskIntoConstraints = false
     view.addSubview(buttonBar)
+
+    let tap = UITapGestureRecognizer(target: self, action: #selector(dismissKeyboard))
+    view.addGestureRecognizer(tap)
 
     NSLayoutConstraint.activate([
       scrollView.topAnchor.constraint(equalTo: view.topAnchor),
@@ -6196,7 +6197,7 @@ final class VibeAgentAskSheetViewController: UIViewController {
     }
     contentStack.addArrangedSubview(
       bodyLabel(
-        "Approve runs it once · Skip continues without it · Deny stops the agent.",
+        "Approve runs it once · No stops the agent.",
         color: appearance.textTertiary))
     contentStack.addArrangedSubview(makeFeedbackField())
   }
@@ -6349,33 +6350,48 @@ final class VibeAgentAskSheetViewController: UIViewController {
   private func makeFeedbackField() -> UIView {
     let container = UIView()
     container.backgroundColor = neutralFill
-    container.layer.cornerRadius = 12
+    container.layer.cornerRadius = 20
     container.layer.cornerCurve = .continuous
     container.layer.borderWidth = 1
     container.layer.borderColor = neutralStroke.cgColor
 
-    feedbackView.translatesAutoresizingMaskIntoConstraints = false
-    feedbackView.backgroundColor = .clear
-    feedbackView.font = .systemFont(ofSize: 14.5)
-    feedbackView.textColor = appearance.text
-    feedbackView.delegate = self
-    feedbackView.textContainerInset = UIEdgeInsets(top: 10, left: 8, bottom: 10, right: 8)
-    container.addSubview(feedbackView)
+    feedbackField.translatesAutoresizingMaskIntoConstraints = false
+    feedbackField.backgroundColor = .clear
+    feedbackField.font = .systemFont(ofSize: 14.5)
+    feedbackField.textColor = appearance.text
+    feedbackField.delegate = self
+    feedbackField.attributedPlaceholder = NSAttributedString(
+      string: "Add notes or changes…",
+      attributes: [.foregroundColor: appearance.textTertiary]
+    )
 
-    feedbackPlaceholder.text = "Add notes or changes…"
-    feedbackPlaceholder.font = .systemFont(ofSize: 14.5)
-    feedbackPlaceholder.textColor = appearance.textTertiary
-    feedbackPlaceholder.translatesAutoresizingMaskIntoConstraints = false
-    container.addSubview(feedbackPlaceholder)
+    let paddingView = UIView(frame: CGRect(x: 0, y: 0, width: 16, height: 40))
+    feedbackField.leftView = paddingView
+    feedbackField.leftViewMode = .always
+
+    if kind == "command" {
+      let skipBtn = UIButton(type: .system)
+      skipBtn.setTitle("Skip", for: .normal)
+      skipBtn.titleLabel?.font = .systemFont(ofSize: 14.5, weight: .semibold)
+      skipBtn.setTitleColor(appearance.textSecondary, for: .normal)
+      skipBtn.addTarget(self, action: #selector(skipCommandTapped), for: .touchUpInside)
+      skipBtn.contentEdgeInsets = UIEdgeInsets(top: 0, left: 14, bottom: 0, right: 14)
+      feedbackField.rightView = skipBtn
+      feedbackField.rightViewMode = .always
+    } else {
+      let rightPadding = UIView(frame: CGRect(x: 0, y: 0, width: 16, height: 40))
+      feedbackField.rightView = rightPadding
+      feedbackField.rightViewMode = .always
+    }
+
+    container.addSubview(feedbackField)
 
     NSLayoutConstraint.activate([
-      feedbackView.topAnchor.constraint(equalTo: container.topAnchor),
-      feedbackView.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 4),
-      feedbackView.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -4),
-      feedbackView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-      feedbackView.heightAnchor.constraint(equalToConstant: 72),
-      feedbackPlaceholder.topAnchor.constraint(equalTo: feedbackView.topAnchor, constant: 11),
-      feedbackPlaceholder.leadingAnchor.constraint(equalTo: feedbackView.leadingAnchor, constant: 12),
+      feedbackField.topAnchor.constraint(equalTo: container.topAnchor),
+      feedbackField.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+      feedbackField.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+      feedbackField.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+      feedbackField.heightAnchor.constraint(equalToConstant: 40)
     ])
     return container
   }
@@ -6391,15 +6407,12 @@ final class VibeAgentAskSheetViewController: UIViewController {
     bar.layoutMargins = UIEdgeInsets(top: 8, left: 20, bottom: 0, right: 20)
 
     if kind == "command" {
-      // Live command approval: Deny · Skip · Approve.
-      let deny = makeBarButton("Deny", primary: false)
+      // Live command approval: No · Approve.
+      let deny = makeBarButton("No", primary: false)
       deny.addTarget(self, action: #selector(denyCommandTapped), for: .touchUpInside)
-      let skip = makeBarButton("Skip", primary: false)
-      skip.addTarget(self, action: #selector(skipCommandTapped), for: .touchUpInside)
       let approve = makeBarButton("Approve", primary: true)
       approve.addTarget(self, action: #selector(approveCommandTapped), for: .touchUpInside)
       bar.addArrangedSubview(deny)
-      bar.addArrangedSubview(skip)
       bar.addArrangedSubview(approve)
     } else if kind == "plan" {
       let reject = makeBarButton("Reject", primary: false)
@@ -6457,7 +6470,7 @@ final class VibeAgentAskSheetViewController: UIViewController {
   }
 
   private var feedbackText: String? {
-    let t = feedbackView.text?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let t = feedbackField.text?.trimmingCharacters(in: .whitespacesAndNewlines)
     return (t?.isEmpty == false) ? t : nil
   }
 
@@ -6515,10 +6528,25 @@ final class VibeAgentAskSheetViewController: UIViewController {
       onDismissWithoutResolve?()
     }
   }
+  @objc private func dismissKeyboard() {
+    view.endEditing(true)
+  }
 }
 
-extension VibeAgentAskSheetViewController: UITextViewDelegate {
-  func textViewDidChange(_ textView: UITextView) {
-    feedbackPlaceholder.isHidden = !(textView.text?.isEmpty ?? true)
+extension VibeAgentAskSheetViewController: UITextFieldDelegate {
+  func textFieldDidBeginEditing(_ textField: UITextField) {
+    if let presentation = sheetPresentationController {
+      presentation.animateChanges {
+        presentation.selectedDetentIdentifier = .large
+      }
+    }
+  }
+
+  func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+    textField.resignFirstResponder()
+    if kind == "command" {
+      skipCommandTapped()
+    }
+    return true
   }
 }

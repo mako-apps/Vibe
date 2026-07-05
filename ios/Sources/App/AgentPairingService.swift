@@ -800,6 +800,18 @@ enum AgentPairingService {
   /// UIKit surfaces (the chat's repo chip + History) can read it synchronously.
   nonisolated(unsafe) static var lastStatusSnapshot: AgentBridgeStatus?
 
+  /// Wall-clock time of the last successful `status()` fetch. Lets the connect gate tell
+  /// a JUST-warmed snapshot (trustworthy → skip the redundant re-verify that causes the
+  /// input↔panel flip) from a stale one.
+  nonisolated(unsafe) static var lastStatusFetchedAt: Date?
+
+  /// True when the cached status was fetched within `maxAge` seconds — i.e. fresh enough
+  /// to drive the gate without another network round-trip.
+  static func statusIsFresh(maxAge: TimeInterval = 8) -> Bool {
+    guard let at = lastStatusFetchedAt else { return false }
+    return Date().timeIntervalSince(at) < maxAge
+  }
+
   /// GET /api/agent-bridge/status
   static func status(config: AppSessionConfig) async throws -> AgentBridgeStatus {
     let request = try buildRequest(config: config, path: "/agent-bridge/status", method: "GET")
@@ -817,11 +829,28 @@ enum AgentPairingService {
     lastDeviceLabel = result.devices.first?.label
     lastConnected = result.connected
     lastStatusSnapshot = result
-    NSLog(
-      "[BridgeStatus] connected=\(result.connected) paired=\(result.paired) devices=\(result.devices.count) repos=\(result.repositories.count) userTail=\(String(config.userID.suffix(6))) serverBase=\(serverBase(config: config))"
-    )
+    lastStatusFetchedAt = Date()
+
     await MainActor.run { lastStatus = result }
     return result
+  }
+
+  /// Timestamp of the last successful (or attempted) warm-up, so `warmStatusIfStale`
+  /// coalesces the many surfaces that want fresh status (home appear, foreground) into
+  /// at most one request per `maxAge` window.
+  @MainActor private static var lastWarmAttemptAt: Date?
+
+  /// Proactively fetch bridge status in the background so the connect gate can decide
+  /// SYNCHRONOUSLY (via `lastConnected` / `lastStatusSnapshot`) the instant an agent DM
+  /// opens — no per-open network round-trip, no hidden-composer wait, no input↔panel
+  /// flicker. Safe to call liberally (home appear, foreground): it throttles itself and
+  /// never throws. Skips entirely when there is nothing paired to poll for is handled
+  /// server-side (the endpoint returns quickly).
+  @MainActor
+  static func warmStatusIfStale(config: AppSessionConfig, maxAge: TimeInterval = 8) {
+    if let last = lastWarmAttemptAt, Date().timeIntervalSince(last) < maxAge { return }
+    lastWarmAttemptAt = Date()
+    Task { _ = try? await status(config: config) }
   }
 
   /// POST /api/agent-bridge/pairing

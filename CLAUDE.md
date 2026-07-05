@@ -7,8 +7,10 @@ The user means: **build + install + launch the iOS app on their attached iPhone.
 - Target device: **"iPhone" — iPhone 16 Pro Max**, UDID `00008140-000935000288801C`
 - Bundle id: `com.vibegram.app` · Project `ios/Vibe.xcodeproj` · Scheme `Vibe`
 - **Building is free** — just build it (no need to ask).
-- **Installing / launching on the phone asks first** — confirm before the app lands
-  on the real device.
+- **Installing the build onto the phone is free** (`xcrun devicectl device install app`
+  — just copies the binary over, no observable effect until it's run).
+- **Launching it asks first** (`xcrun devicectl device process launch`) — confirm
+  before the app actually runs on the real device.
 
 Exact commands + device table: [docs/run-on-device.md](docs/run-on-device.md).
 

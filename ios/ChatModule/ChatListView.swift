@@ -790,6 +790,206 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     isGroupOrChannel = value
   }
 
+  // MARK: - Group sender identity (per-sender name label + floating avatar)
+
+  /// One group participant, resolved from the room member list. Powers the name label
+  /// + avatar shown on incoming group messages. Agents (Claude/Codex) carry a `provider`
+  /// so their name renders in the brand colour (Claude ≈ orange, Codex ≈ white).
+  struct GroupSenderInfo {
+    let userId: String
+    let name: String
+    let avatarUrl: String?
+    let provider: String?  // "claude" / "codex" / nil for a human
+  }
+
+  /// Per-run decoration decisions for a single cell (computed in the view, which knows
+  /// the neighbours + directory, then handed to the cell).
+  struct GroupCellContext {
+    var reservesGutter: Bool = false
+    var showsName: Bool = false
+    var senderName: String? = nil
+    var senderColor: UIColor? = nil
+    var isLastOfRun: Bool = false
+    var senderKey: String? = nil
+    var avatarUrl: String? = nil
+    var provider: String? = nil
+    static let none = GroupCellContext()
+  }
+
+  /// Directory keyed by UPPERCASED user id.
+  private var groupSenderDirectory: [String: GroupSenderInfo] = [:]
+
+  /// Floating avatars live in this non-interactive overlay (above the cells, over the
+  /// reserved gutter) so a single avatar per sender-run tracks scroll — instead of one
+  /// baked into every cell. Keyed by run id (the run's last message id).
+  private let senderAvatarOverlay = UIView()
+  private var senderAvatarViews: [String: SenderRunAvatarView] = [:]
+
+  /// Avatar column reserved on the leading edge of incoming group bubbles.
+  static let groupAvatarSize: CGFloat = 29.0
+  static let groupAvatarGap: CGFloat = 6.0
+  static var groupIncomingExtraLeading: CGFloat { groupAvatarSize + groupAvatarGap }
+  /// Vertical space reserved above a bubble for the sender's name (first msg of a run).
+  static let groupSenderNameHeight: CGFloat = 17.0
+
+  /// Known local-agent shadow-user ids (also matched by name/handle) so an agent's
+  /// messages render in its brand colour even before the directory loads.
+  private static let claudeAgentUserId = "11111111-1111-1111-1111-111111111111"
+  private static let codexAgentUserId = "22222222-2222-2222-2222-222222222222"
+
+  func setGroupSenderDirectory(_ rawMembers: [[String: Any]]) {
+    var next: [String: GroupSenderInfo] = [:]
+    for raw in rawMembers {
+      let rawId =
+        (raw["userId"] as? String) ?? (raw["id"] as? String) ?? (raw["memberId"] as? String)
+      let id = rawId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      guard !id.isEmpty else { continue }
+      let name =
+        ((raw["name"] as? String) ?? (raw["username"] as? String) ?? (raw["label"] as? String) ?? "")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      let avatarRaw =
+        ((raw["avatarUrl"] as? String) ?? (raw["avatar_url"] as? String)
+          ?? (raw["profileImage"] as? String) ?? (raw["profile_image"] as? String))?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      let provider = Self.resolveGroupSenderProvider(
+        userId: id, name: name, username: raw["username"] as? String)
+      let resolvedName = name.isEmpty ? (provider?.capitalized ?? id) : name
+      next[id.uppercased()] = GroupSenderInfo(
+        userId: id,
+        name: resolvedName,
+        avatarUrl: (avatarRaw?.isEmpty ?? true) ? nil : avatarRaw,
+        provider: provider
+      )
+    }
+    let changed = next.count != groupSenderDirectory.count
+      || next.contains { key, value in groupSenderDirectory[key]?.name != value.name }
+    groupSenderDirectory = next
+    guard changed, isGroupOrChannel else { return }
+    // Directory can land after the rows do — re-decorate what's on screen.
+    if !rows.isEmpty {
+      flowLayout.invalidateLayout()
+      let visible = collectionView.indexPathsForVisibleItems
+      if !visible.isEmpty {
+        UIView.performWithoutAnimation {
+          collectionView.reconfigureItems(at: visible)
+        }
+      }
+    }
+    updateFloatingSenderAvatars()
+  }
+
+  private func groupNonEmpty(_ value: String?) -> String? {
+    guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty
+    else { return nil }
+    return trimmed
+  }
+
+  /// Stable identity for run-grouping: an agent by its shadow-user id, a human by `from_id`.
+  private func resolvedSenderKey(_ row: ChatListRow) -> String? {
+    let raw: String? =
+      row.isAgentMessage
+      ? (row.agentUserId ?? row.agentUsername ?? row.agentName)
+      : row.senderUserId
+    return groupNonEmpty(raw)?.uppercased()
+  }
+
+  /// The previous/next *incoming attributable* message row (a day divider or a "me"
+  /// message breaks the run, so the name reappears after them — like Telegram).
+  private func adjacentGroupMessageRow(from index: Int, delta: Int) -> ChatListRow? {
+    let j = index + delta
+    guard j >= 0, j < rows.count else { return nil }
+    let r = rows[j]
+    guard r.kind == .message, !r.isMe, r.messageType != "agent_actions" else { return nil }
+    return r
+  }
+
+  func groupCellContext(at indexPath: IndexPath) -> GroupCellContext {
+    guard isGroupOrChannel, indexPath.item < rows.count else { return .none }
+    let row = rows[indexPath.item]
+    guard row.kind == .message, !row.isMe,
+      row.messageType != "agent_actions", row.messageType != "typing"
+    else { return .none }
+    guard let key = resolvedSenderKey(row) else { return .none }
+
+    let prev = adjacentGroupMessageRow(from: indexPath.item, delta: -1)
+    let next = adjacentGroupMessageRow(from: indexPath.item, delta: 1)
+    let isFirst = prev == nil || resolvedSenderKey(prev!) != key
+    let isLast = next == nil || resolvedSenderKey(next!) != key
+
+    let info = groupSenderDirectory[key]
+    let provider =
+      (row.isAgentMessage
+        ? Self.resolveGroupSenderProvider(
+          userId: row.agentUserId, name: row.agentName, username: row.agentUsername)
+        : nil) ?? info?.provider
+    // "check if the member added a name → use that instead of the raw id."
+    let name =
+      (row.isAgentMessage ? (groupNonEmpty(row.agentName) ?? info?.name) : info?.name)
+      ?? provider?.capitalized
+      ?? shortenedIdentifier(key)
+    let color = groupSenderColor(key: key, name: name, provider: provider)
+
+    var ctx = GroupCellContext()
+    ctx.reservesGutter = true
+    ctx.showsName = isFirst
+    ctx.senderName = isFirst ? name : nil
+    ctx.senderColor = color
+    ctx.isLastOfRun = isLast
+    ctx.senderKey = key
+    ctx.avatarUrl = info?.avatarUrl
+    ctx.provider = provider
+    return ctx
+  }
+
+  private func shortenedIdentifier(_ key: String) -> String {
+    let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.count <= 8 { return trimmed }
+    return "Member"
+  }
+
+  private func groupSenderColor(key: String, name: String, provider: String?) -> UIColor {
+    switch provider {
+    case "claude":
+      // Claude terracotta / warm orange.
+      return UIColor(red: 0.85, green: 0.44, blue: 0.29, alpha: 1.0)
+    case "codex":
+      // Codex reads as near-white (kept legible on the wallpaper via the label shadow).
+      return UIColor(white: 0.96, alpha: 1.0)
+    default:
+      let base = ChatProfileAppearanceStore.avatarColors(
+        title: name, peerUserId: key, chatId: engineChatId
+      ).0
+      // Nudge toward a legible, saturated author tint regardless of the source gradient.
+      var hue: CGFloat = 0
+      var sat: CGFloat = 0
+      var bri: CGFloat = 0
+      var alpha: CGFloat = 0
+      if base.getHue(&hue, saturation: &sat, brightness: &bri, alpha: &alpha) {
+        return UIColor(
+          hue: hue, saturation: max(0.5, sat), brightness: max(0.72, bri), alpha: 1.0)
+      }
+      return base
+    }
+  }
+
+  static func resolveGroupSenderProvider(userId: String?, name: String?, username: String?)
+    -> String?
+  {
+    let idLower = userId?.lowercased() ?? ""
+    let hay = [name, username].compactMap { $0?.lowercased() }
+    if idLower == claudeAgentUserId || idLower == "00000000-0000-0000-0000-0000000000c1"
+      || hay.contains(where: { $0.contains("claude") })
+    {
+      return "claude"
+    }
+    if idLower == codexAgentUserId || idLower == "00000000-0000-0000-0000-0000000000c2"
+      || hay.contains(where: { $0.contains("codex") })
+    {
+      return "codex"
+    }
+    return nil
+  }
+
   override init(frame: CGRect) {
     let layout = ChatCollectionFlowLayout()
     layout.minimumLineSpacing = 2
@@ -826,6 +1026,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       collectionView.topAnchor.constraint(equalTo: topAnchor),
       collectionView.bottomAnchor.constraint(equalTo: bottomAnchor),
     ])
+
+    senderAvatarOverlay.isUserInteractionEnabled = false
+    senderAvatarOverlay.clipsToBounds = true
+    addSubview(senderAvatarOverlay)
 
     collectionView.backgroundColor = .clear
     collectionView.clipsToBounds = false
@@ -1078,6 +1282,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     refreshWallpaperSnapshotIfNeeded()
     updateVisibleWallpaperBackdropLayouts()
     transitionOverlayHost.frame = bounds
+    senderAvatarOverlay.frame = bounds
+    updateFloatingSenderAvatars()
     layoutDebugPanel()
 
     // Layout native input bar if enabled
@@ -1109,6 +1315,33 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         collectionView.layoutIfNeeded()
         // First layout of the chat: land on the latest message even in agent mode.
         scrollToBottom(animated: false, force: true)
+      }
+      // Rows are frequently applied while this list is still 0×0 (the host defers
+      // setRows to viewWillAppear/attach, but the conversation VC's view isn't sized
+      // by the nav controller until this first real layout pass). A reloadData issued
+      // at 0×0 builds zero cells and computes contentSize=0; the width-change
+      // invalidateLayout above recomputes item metrics, but the cells were never
+      // created, so the transcript can stay blank until a later touch/scroll. Force a
+      // reloadData HERE — the first pass with real bounds — so the already-applied rows
+      // materialize immediately as the chat appears, closing the "empty for ~1s then
+      // pops in" gap.
+      if !rows.isEmpty, collectionView.indexPathsForVisibleItems.isEmpty {
+        NSLog(
+          "[ChatOpen] firstRealBounds RENDER surface=%@ rows=%d bounds=%.0fx%.0f contentH=%.0f — forcing reloadData (0 cells materialized)",
+          surfaceId.isEmpty ? "<none>" : surfaceId, rows.count,
+          collectionView.bounds.width, collectionView.bounds.height,
+          collectionView.contentSize.height)
+        UIView.performWithoutAnimation {
+          collectionView.reloadData()
+          collectionView.layoutIfNeeded()
+          scrollToBottom(animated: false, force: true)
+        }
+      } else if !rows.isEmpty {
+        NSLog(
+          "[ChatOpen] firstRealBounds ok surface=%@ rows=%d bounds=%.0fx%.0f visible=%d contentH=%.0f",
+          surfaceId.isEmpty ? "<none>" : surfaceId, rows.count,
+          collectionView.bounds.width, collectionView.bounds.height,
+          collectionView.indexPathsForVisibleItems.count, collectionView.contentSize.height)
       }
       emitViewport(force: true)
       maybeStartPendingSendTransition()
@@ -1241,6 +1474,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       // surface other sessions in the fresh default chat.
       if id.hasPrefix("bridge-") {
         if let loadedPrefix, id.hasPrefix(loadedPrefix) { return true }
+        // A RUNNING/streaming session row is never "phantom history" — it's the run
+        // in flight right now. Opening the DM mid-run must show it immediately (the
+        // engine registers its session as live on ingest, which flips loadedPrefix
+        // above on the next pass; this covers the first render before that lands).
+        if bridgeRowIsLive(row) { return true }
         return false
       }
       // Drop prior-history rows AND non-message rows (stale date separators); a new
@@ -1468,6 +1706,17 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // here by the bridge (runtime.command.executable == "vibe-bridge"). They must NOT
     // land in the transcript — route them to the host (banner/overlay) and drop them.
     parsed = extractBridgeCommandRows(parsed)
+    if parsed.isEmpty, !nextRows.isEmpty {
+      // Incoming rows all dropped before render — dump the first raw row's shape so
+      // the drop point (ChatListRow.init vs a filter) is identifiable from device logs.
+      let firstRow = nextRows[0]
+      NSLog(
+        "[ChatOpen] setRows ALL-DROPPED incoming=%d merged=%d parsedAll=%d keys=[%@] kind=%@ type=%@",
+        nextRows.count, mergedRows.count, parsedAll.count,
+        firstRow.keys.sorted().joined(separator: ","),
+        (firstRow["kind"] as? String) ?? "nil",
+        ((firstRow["message"] as? [String: Any])?["type"] as? String) ?? "nil")
+    }
     // Agent DMs decrypt per-row (E2E actions/attachments) and self-size every bubble —
     // rendering a long transcript (hundreds of rows) blocks the main thread for seconds
     // and overheats the device. Only keep the latest window needed to continue; older
@@ -1669,7 +1918,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     guard !previousRows.isEmpty else {
       if parsed.count <= 4 {
         NSLog(
-          "[FirstMsg] setRows INITIAL parsed=%d keys=[%@] hidden=%@ pending=%@ src=%d window=%@ bounds=%.0fx%.0f",
+          "[FirstMsg] setRows INITIAL surface=%@ chatId=%@ statusAuth=%@ parsed=%d keys=[%@] hidden=%@ pending=%@ src=%d window=%@ bounds=%.0fx%.0f",
+          surfaceId.isEmpty ? "<none>" : surfaceId,
+          traceChatId.isEmpty ? "<empty>" : String(traceChatId.prefix(12)),
+          statusAuthorityEnabled ? "Y" : "N",
           parsed.count,
           parsed.map { String($0.key.prefix(16)) }.joined(separator: ","),
           hiddenMessageId.map { String($0.prefix(12)) } ?? "nil",
@@ -1718,6 +1970,19 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           collectionView.indexPathsForVisibleItems.count,
           window != nil ? "Y" : "N",
           cellDump)
+      } else {
+        // The large-transcript initial render (the one that matters for chat-open
+        // latency) previously logged nothing — make its outcome and cost visible.
+        NSLog(
+          "[ChatOpen] setRows INITIAL done surface=%@ parsed=%d visible=%d contentH=%.0f offset=%.0f bounds=%.0fx%.0f durationMs=%d up=%.2f",
+          surfaceId.isEmpty ? "<none>" : surfaceId,
+          parsed.count,
+          collectionView.indexPathsForVisibleItems.count,
+          collectionView.contentSize.height,
+          collectionView.contentOffset.y,
+          collectionView.bounds.width, collectionView.bounds.height,
+          Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000),
+          ProcessInfo.processInfo.systemUptime)
       }
       return
     }
@@ -2948,6 +3213,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         pendingSendTransition != nil ? "Y" : "N",
         activeSendTransition != nil ? "Y" : "N")
     }
+    let groupContext = groupCellContext(at: indexPath)
     cell.configure(
       row: row,
       hiddenMessageId: hiddenMessageId,
@@ -2955,7 +3221,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       preferredLocalMediaURLOverride: preferredLocalMediaURLOverride,
       selectionMode: selectionMode,
       selected: row.messageId.map { selectedMessageIds.contains($0) } ?? false,
-      agentTurnState: agentTurnBubbleState(for: row)
+      agentTurnState: agentTurnBubbleState(for: row),
+      groupExtraLeading: groupContext.reservesGutter ? Self.groupIncomingExtraLeading : 0.0,
+      groupSenderName: groupContext.senderName,
+      groupSenderColor: groupContext.senderColor,
+      groupSenderNameHeight: Self.groupSenderNameHeight
     )
     bindWallpaperBackdrop(to: cell)
     cell.applyMediaDownloadState(
@@ -3359,6 +3629,21 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       presentAgentBridgeAskIfNeeded(note.userInfo ?? [:])
       return
     }
+    // The chat channel just (re)joined its topic. For a bridge DM opened mid-run this is
+    // the exact gate the current-session request was failing on at cold launch (socket /
+    // join not ready) — fire it NOW instead of waiting for the next fallback-poll tick.
+    // Runs BEFORE the statusAuthority gate below because bridge DMs keep statusAuthority
+    // OFF, so this reason would otherwise never be observed here. Idempotent + throttled.
+    if (note.userInfo?["reason"] as? String) == "chatChannelStateChanged",
+      currentBridgeProvider != nil
+    {
+      let changed = (note.userInfo?["chatId"] as? String)?.trimmingCharacters(
+        in: .whitespacesAndNewlines)
+      let chatKey = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !chatKey.isEmpty, changed == nil || changed?.isEmpty == true || changed == chatKey {
+        requestCurrentBridgeSession(reason: "channelJoined")
+      }
+    }
     guard statusAuthorityEnabled else { return }
     let changedChatId = (note.userInfo?["chatId"] as? String)?.trimmingCharacters(
       in: .whitespacesAndNewlines)
@@ -3474,6 +3759,25 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       return
     }
 
+    // Every agent run shares this ONE DM chatId, so a chatId match is NOT enough to say
+    // the ask belongs to the conversation on screen. A fresh New-Chat surface (nothing
+    // sent from it, no live session adopted) receiving an ask means the ask belongs to a
+    // PREVIOUS conversation's still-running task — popping it over the clean page is the
+    // "approval lands in an unrelated chat" bug. Drop it here; the bridge re-emits a
+    // still-blocked ask on the next open of the owning conversation (and the engine's
+    // pending-ask cache re-surfaces it once this surface engages the running session).
+    let chatKey = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    let surfaceEngaged =
+      !(Self.bridgeFreshOwnSentIdsByChat[chatKey] ?? []).isEmpty
+      || bridgeLoadedSessionId != nil
+      || ChatEngine.shared.liveBridgeSessionId(chatId: chatKey) != nil
+    guard surfaceEngaged else {
+      NSLog(
+        "[ChatListView][ask] DROP — fresh un-engaged surface, ask belongs to a prior conversation requestId=%@ chat=%@",
+        requestId, chatId)
+      return
+    }
+
     guard let payload = ChatEngine.shared.latestAgentBridgeAsk(requestId: requestId) else {
       NSLog("[ChatListView][ask] DROP — no stored payload requestId=%@", requestId)
       return
@@ -3568,9 +3872,40 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   private func hydrateRowsFromNativeHistoryIfReady(trigger: String) {
-    guard statusAuthorityEnabled else { return }
+    guard statusAuthorityEnabled else {
+      NSLog("[ChatOpen] hydrate SKIP trigger=%@ reason=statusAuthorityDisabled", trigger)
+      return
+    }
     let resolvedChatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !resolvedChatId.isEmpty else { return }
+    guard !resolvedChatId.isEmpty else {
+      NSLog("[ChatOpen] hydrate SKIP trigger=%@ reason=noChatId", trigger)
+      return
+    }
+
+    // FAST PATH (synchronous, main thread): when the list is still empty but native
+    // history is already available on-device (cached in memory or restorable from the
+    // disk cache), paint it on THIS runloop — the same runloop as the trigger (chatId
+    // bound / view attached). Previously the first render only happened after the async
+    // probe below bounced to a background queue and back, so a chat with cached history
+    // still flashed EMPTY through the whole push animation while the JS setRows
+    // round-trip caught up. `mergedRowsPayload` already performs exactly this engine
+    // read synchronously on the main thread, so this adds no new main-thread contract —
+    // it just does it a beat earlier, before the chat is on screen.
+    if rows.isEmpty {
+      let historyReadyNow = ChatEngine.shared.isChatHistoryLoaded(chatId: resolvedChatId)
+      if historyReadyNow || !nativeEngineRowsById.isEmpty {
+        NSLog(
+          "[ChatOpen] hydrate FAST-PATH trigger=%@ chatId=%@ historyReady=%@ overlay=%d sourceRows=%d — rendering synchronously",
+          trigger, resolvedChatId, historyReadyNow ? "Y" : "N",
+          nativeEngineRowsById.count, sourceRowsPayload.count)
+        setRows(sourceRowsPayload)
+      } else {
+        NSLog(
+          "[ChatOpen] hydrate fast-path unavailable trigger=%@ chatId=%@ (no cached history, no overlay) — awaiting JS setRows",
+          trigger, resolvedChatId)
+      }
+    }
+
     nativeHistoryHydrationGeneration &+= 1
     let generation = nativeHistoryHydrationGeneration
     let shouldRestoreLiveRows = nativeEngineRowsById.isEmpty
@@ -3605,11 +3940,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           )
         }
 
-        if !historyLoaded && self.nativeEngineRowsById.isEmpty { return }
+        if !historyLoaded && self.nativeEngineRowsById.isEmpty {
+          NSLog(
+            "[ChatOpen] hydrate async BAIL trigger=%@ chatId=%@ historyLoaded=N overlay=0 rows=%d — chat stays as-is until JS setRows arrives",
+            trigger, resolvedChatId, self.rows.count)
+          return
+        }
         NSLog(
-          "[ChatListView] hydrateRowsFromNativeHistoryIfReady trigger=%@ chatId=%@ sourceRows=%d overlay=%d historyLoaded=%@",
+          "[ChatOpen] hydrate async APPLY trigger=%@ chatId=%@ sourceRows=%d overlay=%d historyLoaded=%@ rows=%d",
           trigger, resolvedChatId, self.sourceRowsPayload.count, self.nativeEngineRowsById.count,
-          historyLoaded ? "Y" : "N"
+          historyLoaded ? "Y" : "N", self.rows.count
         )
         self.setRows(self.sourceRowsPayload)
       }
@@ -3724,8 +4064,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if row.kind == .day {
       return CGSize(width: width, height: 30.0)
     }
-    let measurementWidth = width
-    return CGSize(width: width, height: estimateMessageHeight(row, rowWidth: measurementWidth))
+    // Group rows reserve a leading avatar gutter (narrows the bubble) and, on the first
+    // message of a sender-run, extra top space for the name label. Both must match what
+    // the cell lays out, so the same context drives measurement and layout.
+    let ctx = groupCellContext(at: indexPath)
+    let extraLeading = ctx.reservesGutter ? Self.groupIncomingExtraLeading : 0.0
+    let extraTop = ctx.showsName ? Self.groupSenderNameHeight : 0.0
+    let measurementWidth = max(1.0, width - extraLeading)
+    let bubbleHeight = estimateMessageHeight(row, rowWidth: measurementWidth)
+    return CGSize(width: width, height: bubbleHeight + extraTop)
   }
 
   public func scrollViewDidScroll(_ scrollView: UIScrollView) {
@@ -3770,7 +4117,91 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     scheduleVisibleAutoDownloads()
     maybeStartPendingSendTransition()
     maybeLoadOlderBridgeHistoryIfNeeded(offsetY: offsetY)
+    updateFloatingSenderAvatars()
     emitViewport()
+  }
+
+  /// Position one floating avatar per visible incoming sender-run in the reserved gutter.
+  /// The avatar bottom-aligns to the run's last message but stays clamped inside the run's
+  /// vertical span, so it "follows" the run up/down as you scroll instead of duplicating
+  /// per message. Cheap: only touches currently-visible runs.
+  private func updateFloatingSenderAvatars() {
+    guard isGroupOrChannel, !rows.isEmpty else {
+      if !senderAvatarViews.isEmpty {
+        senderAvatarViews.values.forEach { $0.removeFromSuperview() }
+        senderAvatarViews.removeAll()
+      }
+      return
+    }
+
+    let visible = collectionView.indexPathsForVisibleItems.sorted { $0.item < $1.item }
+    guard let firstVisible = visible.first?.item, let lastVisible = visible.last?.item else {
+      senderAvatarViews.values.forEach { $0.isHidden = true }
+      return
+    }
+
+    let offsetY = collectionView.contentOffset.y
+    let size = Self.groupAvatarSize
+    let avatarX = messageHorizontalInset + bubbleSideMargin
+    let viewportBottom = offsetY + collectionView.bounds.height - collectionView.adjustedContentInset.bottom
+    var liveRunIds = Set<String>()
+
+    // Walk each visible row; when it's the LAST message of an incoming run, resolve the
+    // run's [top, bottom] span and place the run's single avatar.
+    var item = firstVisible
+    while item <= lastVisible {
+      defer { item += 1 }
+      let ctx = groupCellContext(at: IndexPath(item: item, section: 0))
+      guard ctx.reservesGutter, ctx.isLastOfRun, let key = ctx.senderKey else { continue }
+
+      // Find the run's first index (walk back while same sender).
+      var firstIndex = item
+      while firstIndex > 0 {
+        let prev = adjacentGroupMessageRow(from: firstIndex, delta: -1)
+        if let prev, resolvedSenderKey(prev) == key {
+          firstIndex -= 1
+        } else {
+          break
+        }
+      }
+      guard
+        let lastAttrs = collectionView.layoutAttributesForItem(at: IndexPath(item: item, section: 0)),
+        let firstAttrs = collectionView.layoutAttributesForItem(
+          at: IndexPath(item: firstIndex, section: 0))
+      else { continue }
+
+      let runTop = firstAttrs.frame.minY
+      let runBottom = lastAttrs.frame.maxY
+      // Bottom-align to the last bubble, but never let the avatar leave the run's span and
+      // keep it inside the viewport when the whole run is taller than the screen.
+      let desiredBottom = min(runBottom, max(runTop + size, viewportBottom))
+      let avatarContentY = max(runTop, min(runBottom, desiredBottom) - size)
+      let runId = rows[item].messageId ?? "\(key)-\(item)"
+      liveRunIds.insert(runId)
+
+      let avatarView: SenderRunAvatarView
+      if let existing = senderAvatarViews[runId] {
+        avatarView = existing
+      } else {
+        avatarView = SenderRunAvatarView()
+        senderAvatarOverlay.addSubview(avatarView)
+        senderAvatarViews[runId] = avatarView
+      }
+      avatarView.isHidden = false
+      avatarView.frame = CGRect(x: avatarX, y: avatarContentY - offsetY, width: size, height: size)
+      let info = ctx.senderKey.flatMap { groupSenderDirectory[$0] }
+      avatarView.configure(
+        name: info?.name ?? ctx.senderName ?? "",
+        avatarUrl: ctx.avatarUrl,
+        tint: ctx.senderColor ?? .systemGray,
+        provider: ctx.provider)
+    }
+
+    // Retire avatars whose run scrolled away.
+    for (runId, view) in senderAvatarViews where !liveRunIds.contains(runId) {
+      view.removeFromSuperview()
+      senderAvatarViews.removeValue(forKey: runId)
+    }
   }
 
   private func maybeLoadOlderBridgeHistoryIfNeeded(offsetY: CGFloat) {
@@ -3834,6 +4265,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   private func estimateMessageHeight(_ row: ChatListRow, rowWidth: CGFloat) -> CGFloat {
+    // Agent control/context events (interrupt, /compact) render as a centered divider
+    // pill, not a bubble — give them a fixed compact height like the day separator.
+    if agentSystemDividerText(for: row) != nil {
+      return 36.0
+    }
     // Agent turns are the one row type whose measurement is genuinely expensive
     // (`VibeAgentTurnContentView.measuredHeight` parses the FULL progress payload and
     // runs an offscreen Auto Layout pass). A streaming chunk invalidates the whole
@@ -5017,6 +5453,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       sourceTextSnapshot: overlayParts.sourceTextSnapshot,
       metaSnapshot: overlayParts.metaSnapshot,
       tailSnapshot: overlayParts.tailSnapshot,
+      tailCornerTravel: overlayParts.tailCornerTravel,
       sourceBackgroundStartFrame: overlayParts.sourceBackgroundStartFrame,
       sourceBackgroundEndFrame: overlayParts.sourceBackgroundEndFrame,
       sourceContentStartFrame: overlayParts.sourceContentStartFrame,
@@ -6328,7 +6765,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// History: full-screen slide-in list of this agent's past/running conversations
   /// (reusing the profile's `AgentBridgeHistoryInlineView`). Picking one loads it into
   /// THIS chat view (not the agent view) — see `loadBridgeSessionIntoChat`.
-  private func presentBridgeHistorySurface(provider: String) {
+  func presentBridgeHistorySurface(provider: String) {
     guard let presenter = topPresentingViewController() else { return }
     let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
     let status = AgentPairingService.lastStatusSnapshot
@@ -6346,6 +6783,27 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       ))
     host.view.backgroundColor = .clear
     presenter.present(host, animated: true)
+  }
+
+  func startNewBridgeSession() {
+    self.setBridgeLoadedSessionId(nil)
+    self.activeBridgeSessionId = nil
+    let chatKey = self.engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !chatKey.isEmpty {
+      ChatEngine.shared.clearLiveBridgeSessionIngest(chatId: chatKey)
+      Self.bridgeFreshOwnSentIdsByChat[chatKey] = []
+      var hiddenIds = Set<String>()
+      for row in self.sourceRowsPayload {
+        if let id = self.messageId(fromRawRow: row), !id.isEmpty {
+          hiddenIds.insert(id)
+        }
+      }
+      Self.bridgeFreshHiddenIdsByChat[chatKey] = hiddenIds
+    }
+    presentedBridgeAgentVC?.setTranscriptLoading(false)
+    presentedBridgeAgentVC?.isHistoryPicked = false
+    presentedBridgeAgentVC?.setMessages([])
+    if !self.sourceRowsPayload.isEmpty { self.setRows(self.sourceRowsPayload) }
   }
 
   /// Ingest a picked history session's transcript into THIS chat (keyed
@@ -7130,6 +7588,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// page is never empty. The default chat list stays the multiplexing surface;
   /// this view is single-task.
   private var didPrefetchBridgeHistory = false
+  private var lastCurrentBridgeSessionRequestAt: TimeInterval = 0
   /// True when the in-place agent view was opened manually ("See progress") rather than by
   /// the Default view = Agent setting. A manual view is left alone by unrelated selection
   /// changes; an auto view follows a live flip of the Default-view setting.
@@ -7141,8 +7600,60 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
   /// Claude/Codex DMs open as fresh sessions. History is loaded only after the user
   /// explicitly opens History, so relaunch/open never pulls old sessions into view.
+  /// Opening a Claude/Codex DM mid-run must land in the RUNNING conversation, not an
+  /// empty surface that only fills in when the next stream frame happens to arrive.
+  /// Ask the bridge for this chat's current session (it resolves the id — the phone
+  /// doesn't know it yet). An idle chat answers `no_current_session` and the DM stays
+  /// a fresh scratch surface. Retries cover the two real-world misses: the chat topic
+  /// isn't joined yet at open, and the bridge is offline at open and connects a few
+  /// seconds later (the connect-gate case from the device logs).
   private func prefetchBridgeHistoryIfNeeded() {
+    guard !didPrefetchBridgeHistory else { return }
     didPrefetchBridgeHistory = true
+    // Fire once now (covers the already-connected case), then let the channel-join event
+    // (handleChatEngineChanged → chatChannelStateChanged) and a short fallback poll cover
+    // the cold-launch case where the socket/join aren't ready yet at open —
+    // requestAgentBridgeHistory itself nudges connect+join on each miss.
+    requestCurrentBridgeSession(reason: "open")
+    scheduleCurrentBridgeSessionFallback(attempt: 0)
+  }
+
+  /// Ask the engine for whatever session is live for this DM right now. Throttled +
+  /// idempotent: no-ops once a live session is adopted, so the open call, the channel-join
+  /// event, and the fallback poll can all call it freely without stacking requests.
+  private func requestCurrentBridgeSession(reason: String) {
+    guard let provider = currentBridgeProvider else { return }
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !chatId.isEmpty else { return }
+    // Already adopted this chat's live session — done.
+    guard ChatEngine.shared.liveBridgeSessionId(chatId: chatId) == nil else { return }
+    let now = ProcessInfo.processInfo.systemUptime
+    guard now - lastCurrentBridgeSessionRequestAt > 1.2 else { return }
+    lastCurrentBridgeSessionRequestAt = now
+    let result = ChatEngine.shared.loadCurrentAgentBridgeSessionIntoChat(
+      chatId: chatId, provider: provider)
+    NSLog(
+      "[ChatOpen] currentSession request chat=%@ provider=%@ reason=%@ accepted=%@ result=%@",
+      String(chatId.prefix(12)), provider, reason,
+      (result["accepted"] as? Bool) == true ? "Y" : "N",
+      (result["reason"] as? String) ?? "-")
+  }
+
+  /// Bounded fallback poll — covers the case where no channel-join notification lands (the
+  /// topic was already joined before this view bound). Stops as soon as a live session is
+  /// adopted, the DM changes, or the view detaches.
+  private func scheduleCurrentBridgeSessionFallback(attempt: Int) {
+    guard attempt < 6 else { return }
+    let provider = currentBridgeProvider
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+      guard let self, self.window != nil, self.currentBridgeProvider == provider else { return }
+      let chatId = self.engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !chatId.isEmpty, ChatEngine.shared.liveBridgeSessionId(chatId: chatId) == nil else {
+        return
+      }
+      self.requestCurrentBridgeSession(reason: "poll#\(attempt + 1)")
+      self.scheduleCurrentBridgeSessionFallback(attempt: attempt + 1)
+    }
   }
 
   private func agentSurfaceMode(for defaultView: AgentBridgeDefaultView) -> VibeAgentConversationSurfaceMode? {
@@ -7316,34 +7827,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     vc.onPresentProfile = { [weak self] in
       self?.onNativeEvent(["type": "headerAvatarPressed"])
     }
-    vc.onNewChat = { [weak self, weak vc] in
-      guard let self else { return }
-      // A deliberate New Chat: forget the session the previous thread resumed AND re-arm
-      // the fresh-surface filter so the old transcript (and its runtime rows) is hidden.
-      // Otherwise the next setRows would re-adopt the old session id via
-      // adoptActiveBridgeSessionId and the new chat's first message would resume the wrong
-      // history — the very leak this is meant to prevent.
-      self.setBridgeLoadedSessionId(nil)
-      self.activeBridgeSessionId = nil
-      let chatKey = self.engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
-      if !chatKey.isEmpty {
-        // Drop the retained live-tail subscription for the old session so returning to
-        // this chat (topic re-join) can't re-ingest the previous transcript into the
-        // fresh thread. Only a deliberate New Chat forgets it — plain detach retains it.
-        ChatEngine.shared.clearLiveBridgeSessionIngest(chatId: chatKey)
-        Self.bridgeFreshOwnSentIdsByChat[chatKey] = []
-        var hiddenIds = Set<String>()
-        for row in self.sourceRowsPayload {
-          if let id = self.messageId(fromRawRow: row), !id.isEmpty {
-            hiddenIds.insert(id)
-          }
-        }
-        Self.bridgeFreshHiddenIdsByChat[chatKey] = hiddenIds
-      }
-      vc?.setTranscriptLoading(false)
-      vc?.isHistoryPicked = false
-      vc?.setMessages([])
-      if !self.sourceRowsPayload.isEmpty { self.setRows(self.sourceRowsPayload) }
+    vc.onNewChat = { [weak self] in
+      self?.startNewBridgeSession()
     }
     vc.repoPickerMenu = agentControlMenu(provider: provider)
 
@@ -9704,5 +10189,103 @@ extension ChatListView: ChatInputBarDelegate {
 
   private func updateActivityOverlayState() {
     hideActivityOverlay()
+  }
+}
+
+/// Small circular avatar used by the floating group-sender overlay. Shows the member's
+/// photo when there is one, otherwise a coloured initials tile in the sender's tint.
+final class SenderRunAvatarView: UIView {
+  private let imageView = UIImageView()
+  private let initialsLabel = UILabel()
+  private var loadedURL: String?
+  private var loadToken = UUID()
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    clipsToBounds = true
+    isUserInteractionEnabled = false
+    imageView.contentMode = .scaleAspectFill
+    imageView.clipsToBounds = true
+    initialsLabel.textAlignment = .center
+    initialsLabel.textColor = .white
+    initialsLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+    initialsLabel.adjustsFontSizeToFitWidth = true
+    initialsLabel.minimumScaleFactor = 0.6
+    addSubview(imageView)
+    addSubview(initialsLabel)
+    layer.borderWidth = 1.0 / UIScreen.main.scale
+    layer.borderColor = UIColor.white.withAlphaComponent(0.18).cgColor
+  }
+
+  required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    layer.cornerRadius = bounds.height / 2.0
+    imageView.frame = bounds
+    initialsLabel.frame = bounds
+  }
+
+  func configure(name: String, avatarUrl: String?, tint: UIColor, provider: String?) {
+    let trimmedURL = avatarUrl?.trimmingCharacters(in: .whitespacesAndNewlines)
+    initialsLabel.text = SenderRunAvatarView.initials(from: name)
+    // The tile colour behind initials should stay readable even for the near-white Codex
+    // name tint, so fall back to a mid grey when the tint is too light for a white glyph.
+    backgroundColor = SenderRunAvatarView.tileColor(for: tint, provider: provider)
+
+    guard let url = trimmedURL, !url.isEmpty else {
+      loadedURL = nil
+      imageView.image = nil
+      imageView.isHidden = true
+      initialsLabel.isHidden = false
+      return
+    }
+
+    if url == loadedURL, imageView.image != nil {
+      imageView.isHidden = false
+      initialsLabel.isHidden = true
+      return
+    }
+
+    if let cached = ChatAvatarImageStore.cached(for: url) {
+      loadedURL = url
+      imageView.image = cached
+      imageView.isHidden = false
+      initialsLabel.isHidden = true
+      return
+    }
+
+    // No cached image yet: show the initials tile now, swap in the photo when it lands.
+    imageView.isHidden = true
+    initialsLabel.isHidden = false
+    let token = UUID()
+    loadToken = token
+    loadedURL = url
+    Task { [weak self] in
+      let image = await ChatAvatarImageStore.load(from: url)
+      await MainActor.run {
+        guard let self, self.loadToken == token, let image else { return }
+        self.imageView.image = image
+        self.imageView.isHidden = false
+        self.initialsLabel.isHidden = true
+      }
+    }
+  }
+
+  private static func tileColor(for tint: UIColor, provider: String?) -> UIColor {
+    if provider == "codex" { return UIColor(white: 0.32, alpha: 1.0) }
+    var white: CGFloat = 0
+    var alpha: CGFloat = 0
+    if tint.getWhite(&white, alpha: &alpha), white > 0.82 {
+      return UIColor(white: 0.4, alpha: 1.0)
+    }
+    return tint
+  }
+
+  private static func initials(from name: String) -> String {
+    let parts = name.split(whereSeparator: { $0 == " " || $0 == "-" || $0 == "_" })
+    if parts.isEmpty { return "?" }
+    if parts.count == 1 { return String(parts[0].prefix(1)).uppercased() }
+    return (String(parts[0].prefix(1)) + String(parts[1].prefix(1))).uppercased()
   }
 }

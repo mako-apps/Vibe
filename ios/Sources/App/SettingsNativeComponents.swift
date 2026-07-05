@@ -219,7 +219,7 @@ final class SettingsNativeRowView: UIControl {
       chevronImageView.isHidden = true
       valueLabel.isHidden = true
       switchControl.isHidden = false
-      switchControl.onTintColor = theme.primary
+      switchControl.onTintColor = .systemGreen
       switchControl.setOn(row.toggleValue, animated: false)
     }
 

@@ -285,7 +285,8 @@ struct ChatGroupCreationSheet: View {
         remoteAvatarUrl = try await ChatRoomCreateService.uploadAvatar(imageData: avatarData, config: config)
       }
 
-      let memberIds = Array(selectedMembers).map { $0.userID }
+      let members = Array(selectedMembers)
+      let memberIds = members.map { $0.userID }
       let result = try await ChatRoomCreateService.create(
         kind: .group,
         config: config,
@@ -293,16 +294,201 @@ struct ChatGroupCreationSheet: View {
         memberIds: memberIds,
         avatarUrl: remoteAvatarUrl
       )
-      
+
+      // Known immediately from what we just picked — no need to wait for the next
+      // home-list refresh before the group profile shows real members.
+      let ownMember: [String: Any] = [
+        "userId": config.userID,
+        "name": config.name ?? config.username ?? "You",
+        "role": "owner"
+      ]
+      let otherMembers: [[String: Any]] = members.map {
+        ["userId": $0.userID, "name": $0.username, "role": "member"]
+      }
+
       let route = ChatRoute(
         chatId: result.chatID,
         title: result.name,
         peerUserId: nil,
         avatarURI: remoteAvatarUrl,
         isGroup: true,
-        initialRows: []
+        initialRows: [],
+        members: [ownMember] + otherMembers
       )
       onCreated(route)
+      dismiss()
+    } catch {
+      errorMessage = error.localizedDescription
+    }
+  }
+}
+
+/// Member picker for an *existing* group, pushed from the group profile's
+/// "Members" screen. Same search/selection building blocks as
+/// `ChatGroupCreationSheet` above, minus the name/avatar step — adding
+/// members doesn't create a new room.
+struct AddGroupMembersSheet: View {
+  @Environment(\.dismiss) private var dismiss
+  @Environment(\.colorScheme) private var colorScheme
+
+  let config: AppSessionConfig
+  let chatId: String
+  let excludedUserIds: Set<String>
+  let onAdded: ([[String: Any]]) -> Void
+
+  @State private var selectedMembers = Set<ContactSearchUser>()
+  @State private var searchQuery = ""
+  @State private var searchResults: [ContactSearchUser] = []
+  @State private var isSearching = false
+  @State private var searchTask: Task<Void, Never>?
+  @State private var isSaving = false
+  @State private var errorMessage: String?
+
+  private var palette: AppThemePalette {
+    AppThemePalette.resolve(for: colorScheme)
+  }
+
+  private var candidates: [ContactSearchUser] {
+    searchResults.filter { !excludedUserIds.contains($0.userID) }
+  }
+
+  var body: some View {
+    NavigationStack {
+      VStack(spacing: 0) {
+        if let errorMessage {
+          Text(errorMessage)
+            .font(.footnote)
+            .foregroundStyle(.red)
+            .padding()
+        }
+
+        List {
+          if searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            Text("Search for someone to add.")
+              .foregroundStyle(palette.secondaryText)
+              .listRowBackground(Color.clear)
+          } else if isSearching {
+            HStack {
+              Spacer()
+              ProgressView()
+              Spacer()
+            }
+            .listRowBackground(Color.clear)
+          } else if candidates.isEmpty {
+            Text("No users found.")
+              .foregroundStyle(palette.secondaryText)
+              .listRowBackground(Color.clear)
+          } else {
+            ForEach(candidates) { user in
+              memberRow(user: user)
+            }
+          }
+        }
+        .listStyle(.plain)
+      }
+      .background(palette.background.ignoresSafeArea())
+      .navigationTitle("Add Members")
+      .navigationBarTitleDisplayMode(.inline)
+      .searchable(text: $searchQuery, prompt: "Search people...")
+      .onChange(of: searchQuery) { _, newValue in
+        scheduleSearch(query: newValue)
+      }
+      .toolbar {
+        ToolbarItem(placement: .topBarLeading) {
+          Button {
+            dismiss()
+          } label: {
+            Image(systemName: "xmark")
+          }
+        }
+        ToolbarItem(placement: .topBarTrailing) {
+          Button("Add") {
+            Task { await addSelectedMembers() }
+          }
+          .disabled(selectedMembers.isEmpty || isSaving)
+        }
+      }
+      .overlay {
+        if isSaving {
+          ZStack {
+            Color.black.opacity(0.3).ignoresSafeArea()
+            ProgressView()
+              .padding()
+              .background(palette.card)
+              .cornerRadius(8)
+          }
+        }
+      }
+    }
+  }
+
+  @ViewBuilder
+  private func memberRow(user: ContactSearchUser) -> some View {
+    let isSelected = selectedMembers.contains(user)
+    Button {
+      if isSelected {
+        selectedMembers.remove(user)
+      } else {
+        selectedMembers.insert(user)
+      }
+    } label: {
+      ContactSearchResultRow(user: user, isSaved: isSelected, palette: palette)
+        .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+  }
+
+  private func scheduleSearch(query: String) {
+    searchTask?.cancel()
+    let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else {
+      searchResults = []
+      isSearching = false
+      return
+    }
+
+    isSearching = true
+    searchTask = Task { @MainActor in
+      try? await Task.sleep(nanoseconds: 300_000_000)
+      if Task.isCancelled { return }
+
+      do {
+        let results = try await ContactSearchService.search(config: config, query: trimmed)
+        if !Task.isCancelled {
+          self.searchResults = results
+          self.isSearching = false
+        }
+      } catch {
+        if !Task.isCancelled {
+          self.searchResults = []
+          self.isSearching = false
+        }
+      }
+    }
+  }
+
+  @MainActor
+  private func addSelectedMembers() async {
+    isSaving = true
+    errorMessage = nil
+    defer { isSaving = false }
+
+    let selected = Array(selectedMembers)
+    do {
+      let results = try await GroupMembersUpdateService.addMembers(
+        chatId: chatId,
+        memberIds: selected.map(\.userID),
+        config: config
+      )
+      let addedIds = Set(results.filter(\.added).map(\.userId))
+      guard !addedIds.isEmpty else {
+        errorMessage = "Couldn't add the selected members."
+        return
+      }
+      let addedRaw: [[String: Any]] = selected
+        .filter { addedIds.contains($0.userID) }
+        .map { ["userId": $0.userID, "name": $0.username, "role": "member"] }
+      onAdded(addedRaw)
       dismiss()
     } catch {
       errorMessage = error.localizedDescription

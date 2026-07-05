@@ -4682,12 +4682,30 @@ function handleHistoryRequest(channel, payload) {
   };
   const start = Date.now();
   const want = String(mode || "").toLowerCase() === "detail" || !!sessionId ? "detail" : "list";
+  // "Current session" request: detail for a chat without naming a session. Opening a
+  // Claude/Codex DM mid-run must land directly in the running conversation, but the
+  // phone doesn't know the session id yet (it only learns it from stream frames that
+  // may be minutes apart). Resolve it here: the running task's session, else the last
+  // session this chat's stream reported. No session → answer ok:false and the phone
+  // just stays on the fresh surface.
+  let effectiveSessionId = sessionId;
+  if (want === "detail" && !effectiveSessionId && chatId) {
+    const running = runningTaskForChat(chatId);
+    effectiveSessionId = (running && running.sessionId) || sessionByChat.get(chatId) || null;
+    if (!effectiveSessionId) {
+      console.log(
+        `[vibe-bridge][history] current-session request chat=${chatId} → no session, requestId=${requestId}`
+      );
+      channel.push("history_result", { ok: false, ...echo, mode: want, message: "no_current_session" });
+      return;
+    }
+  }
   console.log(
     `[vibe-bridge][history] request provider=${provider} mode=${want} chat=${chatId || "-"} ` +
-      `session=${sessionId || "-"} before=${before || "-"} requestId=${requestId}`
+      `session=${effectiveSessionId || "-"} before=${before || "-"} requestId=${requestId}`
   );
 
-  readHistory({ provider, mode, sessionId, limit: payload.limit, before })
+  readHistory({ provider, mode, sessionId: effectiveSessionId, limit: payload.limit, before })
     .then((result) => {
       const count =
         result && result.mode === "detail"
@@ -4700,12 +4718,12 @@ function handleHistoryRequest(channel, payload) {
       // Mark the trailing turn live on the FIRST detail push too (not just on watch
       // re-fires) so opening a live session lands directly in the working state with
       // no flash of the sealed "Worked · N steps" card.
-      if (!before) markDetailLiveTurn(result, provider, sessionId, chatId);
+      if (!before) markDetailLiveTurn(result, provider, effectiveSessionId, chatId);
       channel.push("history_result", { ok: true, ...echo, ...result });
       // The phone opened a specific session → keep it live by tailing the
       // transcript and re-pushing as it grows.
-      if (!before && chatId && sessionId && result.mode === "detail") {
-        startHistoryWatch(channel, { chatId, provider, sessionId, echo, limit: payload.limit });
+      if (!before && chatId && effectiveSessionId && result.mode === "detail") {
+        startHistoryWatch(channel, { chatId, provider, sessionId: effectiveSessionId, echo, limit: payload.limit });
       }
       // Opening the chat is also our chance to re-surface any ask/command the run
       // is still blocked on but the phone never saw (missed the live broadcast, or

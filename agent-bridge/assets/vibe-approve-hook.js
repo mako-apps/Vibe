@@ -77,10 +77,18 @@ const SAFE_BASH = [
   /^(node|npm|npx|yarn|pnpm|bun)\s+(--version|-v|list|ls|why|outdated|view|info|run\s+lint|run\s+test|test)\b/,
   /^(python3?|pip3?|ruby|gem|cargo|go|rustc|java|javac|kotlin|clang|gcc|deno)\s+(--version|-v|version|--help|-h)\b/,
   /^(cargo|go)\s+(check|vet|fmt\s+--check|clippy)\b/,
+  // syntax-check only (parses, never executes/writes) — safe on any file.
+  /^node\s+(--check|-c)\b/,
+  /^python3?\s+(-m\s+py_compile|-m\s+compileall\s+-q)\b/,
+  /^(ruby|perl)\s+-c\b/,
+  /^php\s+-l\b/,
   /^(xcodebuild|swift|swiftc)\b[^\n]*\bbuild\b/,                    // building is free
   /^xcodebuild\s+(-list|-showsdks|-showBuildSettings|-version)\b/,
   /^xcrun\s+(simctl|xctrace|devicectl)\s+(list|help)\b/,           // querying devices is free
   /^xcrun\s+(--find|--sdk|--show-sdk-path|--version)\b/,
+  /^xcrun\s+devicectl\s+device\s+install\b/,                       // copying the build to the
+    // phone is free (no side effect on the running app); LAUNCHING it still asks —
+    // see "xcrun devicectl device process ..." which is intentionally NOT matched here.
   /^(cd|pushd|popd)\b/,                                             // navigation only
   // building / compiling / running the project's own build+test scripts is free —
   // it only produces artifacts under the repo (never installs deps or touches git).
@@ -100,12 +108,15 @@ const SAFE_BASH = [
 // SAFE_BASH prefix also matched — these mutate the filesystem / state.
 const MUTATING = [
   /\bsed\b[^|;&]*\s-i\b/, /\bperl\b[^|;&]*\s-i\b/, /\btee\b/, /\btruncate\b/,
-  /\b(mv|cp|rm|mkdir|rmdir|touch|ln|chmod|chown|chgrp|install|unlink)\b/,
+  /\b(mv|cp|rm|mkdir|rmdir|touch|ln|chmod|chown|chgrp|unlink)\b/,
+  /^install\b/, // the standalone install(1) utility (copies+chmods) — anchored so it
+                // doesn't false-positive on "devicectl device install", "brew install", etc.
+                // used as a SUBCOMMAND of something else (those have their own rules).
   /\bgit\s+(add|commit|checkout|reset|rebase|merge|pull|fetch|clone|apply|am|mv|rm|restore|switch|cherry-pick|revert|push|clean|init|tag\s+(?!-l|--list))\b/,
   /\b(npm|yarn|pnpm|bun)\s+(install|i|ci|add|remove|uninstall|update|upgrade|link|publish)\b/,
   /\bpip3?\s+(install|uninstall)\b/, /\b(gem|cargo|go)\s+(install|publish)\b/,
   /\bdefaults\s+write\b/, /\blaunchctl\b/, /\bkill(all)?\b/, /\bpkill\b/,
-  />{1,2}(?!\s*\/dev\/null)/, // output redirect that writes to a file
+  />{1,2}(?!\s*\/dev\/null)(?!&)/, // output redirect that writes to a file (not fd-dup like 2>&1)
   /\bcurl\b[^|;&\n]*(-o\b|--output\b|-O\b|--remote-name\b|-X\s*(POST|PUT|PATCH|DELETE)|--upload-file)/i,
   /\bwget\b[^|;&\n]*(-O\b|--output-document\b)/i,
 ];
@@ -123,17 +134,23 @@ function maskQuotes(s) {
   return out;
 }
 function splitSegments(cmd) {
-  const masked = maskQuotes(cmd);
+  // Join backslash-newline line continuations FIRST — a multi-line command written
+  // for readability (xcodebuild with one flag per line, "\" at end-of-line) is one
+  // logical command, not several piped/sequential ones.
+  const joined = cmd.replace(/\\\r?\n[ \t]*/g, " ");
+  const masked = maskQuotes(joined);
   const re = /\|\||&&|;|\||\n/g;
   const segs = []; let start = 0, m;
-  while ((m = re.exec(masked))) { segs.push(cmd.slice(start, m.index)); start = m.index + m[0].length; }
-  segs.push(cmd.slice(start));
+  while ((m = re.exec(masked))) { segs.push(joined.slice(start, m.index)); start = m.index + m[0].length; }
+  segs.push(joined.slice(start));
   return segs.map((x) => x.trim()).filter((x) => x.length);
 }
 function segmentIsSafe(seg, cfg) {
   if (!seg) return true;
-  if (/\$\(|`|<\(/.test(maskQuotes(seg))) return false; // command / process substitution
-  if (MUTATING.some((re) => re.test(seg))) return false;
+  const masked = maskQuotes(seg); // so `>`/`&&`/etc INSIDE quotes (awk/grep exprs) aren't
+                                   // mistaken for a redirect or command substitution.
+  if (/\$\(|`|<\(/.test(masked)) return false; // command / process substitution
+  if (MUTATING.some((re) => re.test(masked))) return false;
   if (SAFE_BASH.some((re) => re.test(seg))) return true;
   for (const p of cfg.auto_allow) { if (p && seg.includes(p)) return true; }
   return false;

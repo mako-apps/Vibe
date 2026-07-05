@@ -2232,6 +2232,44 @@ final class ChatEngine {
     return result
   }
 
+  /// Load whatever session is CURRENTLY live for this chat — used when a Claude/Codex DM
+  /// opens mid-run. The phone doesn't know the running session's id yet (it only learns
+  /// it from stream frames that can be minutes apart while the agent works a long tool
+  /// phase), so the request names only the chat; the bridge resolves it to the running
+  /// task's session (or the chat's last-reported one) and answers `no_current_session`
+  /// when the chat is idle — that reply is simply ignored and the DM stays a fresh
+  /// surface. On success the detail reply flows through the normal ingest path, which
+  /// also registers the live-tail subscription (see ingestAgentBridgeSessionLocked).
+  @discardableResult
+  func loadCurrentAgentBridgeSessionIntoChat(chatId rawChatId: String, provider rawProvider: String) -> [String: Any] {
+    let chatId = normalizedString(rawChatId) ?? ""
+    let provider = normalizedString(rawProvider)?.lowercased() ?? ""
+    guard !chatId.isEmpty, !provider.isEmpty else {
+      return ["accepted": false, "reason": "invalid_chat"]
+    }
+    let alreadyLive: Bool = syncOnQueue { liveBridgeSessionIngestByChatId[chatId] != nil }
+    if alreadyLive {
+      // A live-tail subscription already exists (History load or a stream frame set it);
+      // re-arm rather than double-subscribe.
+      syncOnQueue { rearmLiveBridgeSessionLocked(chatId: chatId, trigger: "current_session_load") }
+      return ["accepted": true, "reason": "already_live"]
+    }
+    let requestId = UUID().uuidString
+    let result = requestAgentBridgeHistory([
+      "chatId": chatId,
+      "provider": provider,
+      "mode": "detail",
+      "requestId": requestId,
+      "limit": Self.bridgeSessionPageLimit,
+    ])
+    if (result["accepted"] as? Bool) == true {
+      syncOnQueue {
+        pendingBridgeSessionIngestByRequestId[requestId] = (chatId: chatId, provider: provider)
+      }
+    }
+    return result
+  }
+
   @discardableResult
   func loadOlderAgentBridgeSessionChunk(chatId rawChatId: String) -> [String: Any] {
     let chatId = normalizedString(rawChatId) ?? rawChatId.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2567,6 +2605,22 @@ final class ChatEngine {
       // Pass nil: a bridge DM has a single agent, so clear every live stream bubble
       // for this chat rather than depending on the stream payload's userId matching.
       removeAgentStreamRowsLocked(chatId: chatId, agentUserId: nil)
+    }
+
+    // A transcript with a RUNNING turn is this chat's live session — register it in the
+    // live-tail map so (a) `liveBridgeSessionId(chatId:)` reports it and the chat view's
+    // fresh-surface filter shows the running conversation instead of hiding it as
+    // "phantom history" (the open-mid-run empty-screen bug), and (b) a topic rejoin
+    // re-arms this watch. Keyed to THIS reply's requestId — the bridge's transcript
+    // watcher re-pushes under the same id, which is what the history handler matches.
+    if sawRunningAgentItem {
+      let requestId = normalizedString(payload["requestId"]) ?? UUID().uuidString
+      let existing = liveBridgeSessionIngestByChatId[chatId]
+      if existing?.sessionId != sessionId || existing?.requestId != requestId {
+        liveBridgeSessionIngestByChatId[chatId] = (
+          provider: provider, sessionId: sessionId, requestId: requestId
+        )
+      }
     }
 
     // Clear rows left over from a PRIOR transcript shape. A previously-ingested row

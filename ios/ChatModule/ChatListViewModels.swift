@@ -388,6 +388,11 @@ struct ChatListRow {
   let isPinned: Bool
   let messageId: String?
   let chatId: String?
+  /// Sender's user id (`from_id`) for a group/channel message. Used to resolve the
+  /// per-sender name label + avatar from the group member directory, and to detect
+  /// consecutive same-sender runs. Nil for day dividers and "me" messages we don't
+  /// need to attribute. Agent messages also carry `agentUserId`.
+  let senderUserId: String?
   let replyToId: String?
   let replyPreviewTitle: String?
   let replyPreviewText: String?
@@ -641,6 +646,7 @@ struct ChatListRow {
       isPinned = false
       messageId = nil
       chatId = nil
+      senderUserId = nil
       replyToId = nil
       replyPreviewTitle = nil
       replyPreviewText = nil
@@ -722,6 +728,15 @@ struct ChatListRow {
       ?? parseNonEmptyString(message["chat_id"])
       ?? parseNonEmptyString(metadata?["chatId"])
       ?? parseNonEmptyString(metadata?["chat_id"])
+    senderUserId =
+      parseNonEmptyString(message["from_id"])
+      ?? parseNonEmptyString(message["fromId"])
+      ?? parseNonEmptyString(message["senderId"])
+      ?? parseNonEmptyString(message["sender_id"])
+      ?? parseNonEmptyString(message["userId"])
+      ?? parseNonEmptyString(message["user_id"])
+      ?? parseNonEmptyString(metadata?["from_id"])
+      ?? parseNonEmptyString(metadata?["senderId"])
     let replyPreview =
       (message["replyPreview"] as? [String: Any])
       ?? (message["reply_preview"] as? [String: Any])

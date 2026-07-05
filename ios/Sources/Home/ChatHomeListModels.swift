@@ -313,6 +313,80 @@ struct ChatHomeListRow {
   let peerTier: String?
   let previewRows: [[String: Any]]
   let initialMessages: [[String: Any]]
+  /// Group/channel participant list (`[{userId, name, avatarUrl, role}]`), sent by
+  /// the server for `isGroup` rows. Empty for DMs.
+  let members: [[String: Any]]
+  /// Epoch-millisecond timestamp of this chat's most recent activity (newest
+  /// visible message, else room creation). Drives newest-first home ordering.
+  /// Mirrors the server's `lastMessageAt`.
+  let lastMessageAt: Double
+
+  /// Explicit initializer (replaces the synthesized memberwise init) so
+  /// `lastMessageAt` can default — every pre-existing `ChatHomeListRow(...)` call
+  /// site keeps compiling and only the recency-aware paths pass a real value.
+  init(
+    chatId: String,
+    title: String,
+    preview: String,
+    timeLabel: String,
+    unreadCount: Int,
+    markedUnread: Bool,
+    muted: Bool,
+    pinned: Bool,
+    archived: Bool,
+    isTyping: Bool,
+    isOnline: Bool,
+    peerUserId: String?,
+    avatarUri: String?,
+    avatarFallback: String,
+    avatarGradientStartLight: String?,
+    avatarGradientEndLight: String?,
+    avatarGradientStartDark: String?,
+    avatarGradientEndDark: String?,
+    isSavedMessages: Bool,
+    isArchiveEntry: Bool,
+    type: String?,
+    isGroup: Bool,
+    isAgentFriend: Bool,
+    peerAgentId: String?,
+    agentEventInboxMode: String?,
+    peerTier: String?,
+    previewRows: [[String: Any]],
+    initialMessages: [[String: Any]],
+    members: [[String: Any]],
+    lastMessageAt: Double = 0
+  ) {
+    self.chatId = chatId
+    self.title = title
+    self.preview = preview
+    self.timeLabel = timeLabel
+    self.unreadCount = unreadCount
+    self.markedUnread = markedUnread
+    self.muted = muted
+    self.pinned = pinned
+    self.archived = archived
+    self.isTyping = isTyping
+    self.isOnline = isOnline
+    self.peerUserId = peerUserId
+    self.avatarUri = avatarUri
+    self.avatarFallback = avatarFallback
+    self.avatarGradientStartLight = avatarGradientStartLight
+    self.avatarGradientEndLight = avatarGradientEndLight
+    self.avatarGradientStartDark = avatarGradientStartDark
+    self.avatarGradientEndDark = avatarGradientEndDark
+    self.isSavedMessages = isSavedMessages
+    self.isArchiveEntry = isArchiveEntry
+    self.type = type
+    self.isGroup = isGroup
+    self.isAgentFriend = isAgentFriend
+    self.peerAgentId = peerAgentId
+    self.agentEventInboxMode = agentEventInboxMode
+    self.peerTier = peerTier
+    self.previewRows = previewRows
+    self.initialMessages = initialMessages
+    self.members = members
+    self.lastMessageAt = lastMessageAt
+  }
 
   var isBuiltInAgentSurface: Bool {
     Self.isBuiltInAgentChatId(chatId)
@@ -384,6 +458,7 @@ struct ChatHomeListRow {
       "isAgentFriend": isAgentFriend,
       "previewRows": shouldIncludeMessagePayload ? previewRows : [],
       "messages": shouldIncludeMessagePayload ? Array(initialMessages.suffix(messageLimit)) : [],
+      "lastMessageAt": lastMessageAt,
     ]
     if let peerUserId { payload["peerUserId"] = peerUserId }
     if let peerAgentId { payload["peerAgentId"] = peerAgentId }
@@ -428,7 +503,9 @@ struct ChatHomeListRow {
       agentEventInboxMode: agentEventInboxMode,
       peerTier: peerTier,
       previewRows: bridgeSurface ? [] : previewRows,
-      initialMessages: bridgeSurface ? [] : initialMessages
+      initialMessages: bridgeSurface ? [] : initialMessages,
+      members: members,
+      lastMessageAt: lastMessageAt
     )
   }
 
@@ -468,12 +545,25 @@ struct ChatHomeListRow {
     let archived = parseBool(raw["archived"]) ?? false
     let isTyping = parseBool(raw["isTyping"] ?? raw["is_typing"]) ?? false
     let isOnline = parseBool(raw["isOnline"] ?? raw["is_online"]) ?? false
-    let friendId = normalizedString(
-      raw["friendId"] ?? raw["friend_id"] ?? raw["peerUserId"] ?? raw["peer_user_id"]
-        ?? raw["userId"] ?? raw["user_id"])
+    let type = normalizedString(raw["type"] ?? raw["chatType"] ?? raw["chat_type"])
+    let isGroup =
+      parseBool(raw["isGroup"] ?? raw["is_group"]) ?? (type == "group" || type == "channel")
+    // Groups/channels are never a 1:1 with a "friend": ignore any friend_* fields. A stale
+    // pre-fix cached row can still carry a leaked agent friendId/friendImage — that's what
+    // made an old group open Codex AND show Codex's avatar instead of the uploaded photo.
+    // Prefer the room's own avatar_url and never fall back to a member/friend image.
+    let friendId =
+      isGroup
+      ? nil
+      : normalizedString(
+        raw["friendId"] ?? raw["friend_id"] ?? raw["peerUserId"] ?? raw["peer_user_id"]
+          ?? raw["userId"] ?? raw["user_id"])
     let peerUserId = friendId
     let rawAvatar =
-      normalizedString(
+      isGroup
+      ? normalizedString(
+        raw["avatarUrl"] ?? raw["avatar_url"] ?? raw["avatarUri"] ?? raw["avatar_uri"])
+      : normalizedString(
         raw["avatarUri"] ?? raw["avatar_uri"] ?? raw["friendImage"] ?? raw["friend_image"]
           ?? raw["profileImage"] ?? raw["profile_image"] ?? raw["avatarUrl"] ?? raw["avatar_url"])
     let avatarUri = resolveAvatarURI(rawAvatar: rawAvatar, friendId: friendId, chatId: chatId)
@@ -494,14 +584,15 @@ struct ChatHomeListRow {
       chatId: chatId,
       isSavedMessages: isSavedMessages
     )
-    let type = normalizedString(raw["type"] ?? raw["chatType"] ?? raw["chat_type"])
-    let isGroup =
-      parseBool(raw["isGroup"] ?? raw["is_group"]) ?? (type == "group" || type == "channel")
-    let peerAgentId = normalizedString(
-      raw["friendAgentId"] ?? raw["friend_agent_id"] ?? raw["agentId"] ?? raw["agent_id"])
+    let peerAgentId =
+      isGroup
+      ? nil
+      : normalizedString(
+        raw["friendAgentId"] ?? raw["friend_agent_id"] ?? raw["agentId"] ?? raw["agent_id"])
     let isAgentFriend =
-      Self.isBuiltInAgentChatId(chatId)
-      || (parseBool(raw["friendIsAgent"] ?? raw["friend_is_agent"]) ?? (peerAgentId != nil))
+      !isGroup
+      && (Self.isBuiltInAgentChatId(chatId)
+        || (parseBool(raw["friendIsAgent"] ?? raw["friend_is_agent"]) ?? (peerAgentId != nil)))
     let agentEventInboxMode = normalizedString(
       raw["friendAgentEventInboxMode"] ?? raw["friend_agent_event_inbox_mode"]
         ?? raw["agentEventInboxMode"] ?? raw["agent_event_inbox_mode"] ?? raw["eventInboxMode"]
@@ -518,6 +609,19 @@ struct ChatHomeListRow {
     let preview = isBridgeAgent ? "Start session" : (previewRaw ?? previewMessage ?? "")
     let initialMessages = isBridgeAgent ? [] : serverMessages
     let previewRows = isBridgeAgent ? [] : parsePreviewRows(raw["previewRows"] ?? raw["preview_rows"])
+
+    let lastMessageAt: Double = {
+      if let value = raw["lastMessageAt"] as? NSNumber { return value.doubleValue }
+      if let value = raw["last_message_at"] as? NSNumber { return value.doubleValue }
+      if let text = normalizedString(raw["lastMessageAt"] ?? raw["last_message_at"]),
+        let parsed = Double(text)
+      {
+        return parsed
+      }
+      // Cache/legacy payloads without the field: derive from the newest message.
+      if let newest = serverMessages.last { return Double(parseTimestamp(newest)) }
+      return 0
+    }()
 
     return ChatHomeListRow(
       chatId: chatId,
@@ -547,7 +651,9 @@ struct ChatHomeListRow {
       agentEventInboxMode: agentEventInboxMode,
       peerTier: peerTier,
       previewRows: previewRows,
-      initialMessages: initialMessages
+      initialMessages: initialMessages,
+      members: parsePreviewRows(raw["members"]),
+      lastMessageAt: lastMessageAt
     )
   }
 

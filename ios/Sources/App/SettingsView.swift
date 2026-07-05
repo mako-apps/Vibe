@@ -3,6 +3,7 @@ import CoreImage.CIFilterBuiltins
 import LocalAuthentication
 import SwiftUI
 import UIKit
+import UserNotifications
 
 private enum SettingsRoute: String, Identifiable {
   case profile
@@ -32,6 +33,8 @@ struct SettingsView: View {
 
   @State private var activeRoute: SettingsRoute?
   @State private var activeModal: SettingsModal?
+  @State private var systemNotificationsAuthorized = false
+  @State private var notificationSettingsAlertMessage: String?
 
   private var palette: AppThemePalette {
     _ = themePlateRaw
@@ -177,7 +180,7 @@ struct SettingsView: View {
             icon: "bell.fill",
             label: "Push Notifications",
             detailText: nil,
-            toggleValue: notificationsEnabled,
+            toggleValue: notificationsEnabled && systemNotificationsAuthorized,
             kind: .toggle,
             iconColor: UIColor.systemRed,
             divider: false,
@@ -267,6 +270,26 @@ struct SettingsView: View {
         "SettingsView onAppear hasProfile=\(profileController.profile != nil) hasImage=\(currentProfile.profileImage != nil)"
       )
       AppUIStallWatchdog.shared.updateContext("SettingsView appear")
+      refreshSystemNotificationStatus()
+    }
+    .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+      refreshSystemNotificationStatus()
+    }
+    .alert(
+      "Notifications Off",
+      isPresented: Binding(
+        get: { notificationSettingsAlertMessage != nil },
+        set: { if !$0 { notificationSettingsAlertMessage = nil } }
+      )
+    ) {
+      Button("Open Settings") {
+        if let url = URL(string: UIApplication.openSettingsURLString) {
+          UIApplication.shared.open(url)
+        }
+      }
+      Button("Cancel", role: .cancel) {}
+    } message: {
+      Text(notificationSettingsAlertMessage ?? "")
     }
     .task {
       AppUITrace.notice("SettingsView task profile load start")
@@ -351,12 +374,38 @@ struct SettingsView: View {
   private func handleRowToggle(_ rowID: String, _ value: Bool) {
     switch rowID {
     case "push-notifications":
-      notificationsEnabled = value
-      if value {
-        VibeNativeCallManager.shared.refreshNotificationRegistration(reason: "settings-toggle-enable")
+      guard value else {
+        notificationsEnabled = false
+        return
+      }
+      UNUserNotificationCenter.current().getNotificationSettings { settings in
+        DispatchQueue.main.async {
+          switch settings.authorizationStatus {
+          case .denied:
+            notificationSettingsAlertMessage =
+              "Vibe notifications are turned off in iOS Settings. Turn them on there to enable this."
+          default:
+            notificationsEnabled = true
+            VibeNativeCallManager.shared.refreshNotificationRegistration(reason: "settings-toggle-enable") { authorized in
+              systemNotificationsAuthorized = authorized
+            }
+          }
+        }
       }
     default:
       break
+    }
+  }
+
+  private func refreshSystemNotificationStatus() {
+    UNUserNotificationCenter.current().getNotificationSettings { settings in
+      let authorized =
+        settings.authorizationStatus == .authorized
+        || settings.authorizationStatus == .provisional
+        || settings.authorizationStatus == .ephemeral
+      DispatchQueue.main.async {
+        systemNotificationsAuthorized = authorized
+      }
     }
   }
 

@@ -251,7 +251,14 @@ final class ChatHomeCardCell: UITableViewCell {
     updateEditingLayout(isEditing, animated: true)
     configureSwipeActions(for: row, isEditing: isEditing)
 
-    loadAvatarImage(urlString: row.avatarUri)
+    // Telegram-style group rows: when the group has no photo of its own, build a
+    // mosaic from its members' avatars so you see who's in it right from the list.
+    let ownAvatar = (row.avatarUri ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    if row.isGroup, ownAvatar.isEmpty, row.members.count >= 2 {
+      loadGroupCompositeAvatar(members: row.members, isDark: isDark)
+    } else {
+      loadAvatarImage(urlString: row.avatarUri)
+    }
   }
 
   private func updateEditingLayout(_ isEditing: Bool, animated: Bool) {
@@ -1216,6 +1223,189 @@ final class ChatHomeCardCell: UITableViewCell {
       }
     }
     avatarLoadTask = task
+  }
+
+  private struct GroupAvatarSlot {
+    let id: String
+    let name: String
+    let url: String?
+  }
+
+  /// Build (and cache) a mosaic avatar from up to four group members. Members with
+  /// a photo show it; the rest show a coloured initials tile.
+  private func loadGroupCompositeAvatar(members: [[String: Any]], isDark: Bool) {
+    let slots: [GroupAvatarSlot] = members.compactMap { member in
+      let id =
+        (member["userId"] as? String) ?? (member["id"] as? String)
+        ?? (member["memberId"] as? String)
+      guard let id, !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+      let name =
+        ((member["name"] as? String) ?? (member["displayName"] as? String)
+          ?? (member["username"] as? String) ?? "")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      let rawURL =
+        (member["avatarUrl"] as? String) ?? (member["avatar_url"] as? String)
+        ?? (member["profileImage"] as? String) ?? (member["profile_image"] as? String)
+      let url = rawURL?.trimmingCharacters(in: .whitespacesAndNewlines)
+      return GroupAvatarSlot(id: id, name: name, url: (url?.isEmpty ?? true) ? nil : url)
+    }
+    let usable = Array(slots.prefix(4))
+    guard usable.count >= 2 else {
+      loadAvatarImage(urlString: nil)
+      return
+    }
+
+    let cacheKey = "group-composite:" + usable.map(\.id).joined(separator: ",")
+    if cacheKey == lastAvatarURLString, avatarImageView.image != nil { return }
+    avatarLoadTask?.cancel()
+    avatarLoadTask = nil
+    lastAvatarURLString = cacheKey
+
+    if let cached = ChatAvatarImageStore.cached(for: cacheKey) {
+      avatarImageView.image = cached
+      avatarFallbackIconView.isHidden = true
+      return
+    }
+
+    avatarImageView.image = nil
+    avatarFallbackIconView.isHidden = true
+    let token = UUID().uuidString
+    avatarToken = token
+    let side: CGFloat = 60
+
+    let task = Task { [weak self] in
+      var images: [String: UIImage] = [:]
+      await withTaskGroup(of: (String, UIImage?).self) { group in
+        for slot in usable {
+          guard let url = slot.url else { continue }
+          group.addTask { (slot.id, await ChatAvatarImageStore.load(from: url)) }
+        }
+        for await (id, image) in group {
+          if let image { images[id] = image }
+        }
+      }
+      guard !Task.isCancelled else { return }
+      let composite = ChatHomeCardCell.renderGroupComposite(
+        slots: usable, images: images, side: side, isDark: isDark)
+      ChatAvatarImageStore.cache(composite, for: cacheKey)
+      await MainActor.run {
+        guard let self, token == self.avatarToken else { return }
+        self.avatarLoadTask = nil
+        self.avatarImageView.image = composite
+        self.avatarFallbackIconView.isHidden = true
+      }
+    }
+    avatarLoadTask = task
+  }
+
+  private static func renderGroupComposite(
+    slots: [GroupAvatarSlot], images: [String: UIImage], side: CGFloat, isDark: Bool
+  ) -> UIImage {
+    let format = UIGraphicsImageRendererFormat.default()
+    format.scale = UIScreen.main.scale
+    let size = CGSize(width: side, height: side)
+    let renderer = UIGraphicsImageRenderer(size: size, format: format)
+    let rects = compositeRects(count: slots.count, side: side)
+    let seam = (isDark ? UIColor.black : UIColor.white).withAlphaComponent(0.7)
+
+    return renderer.image { rendererContext in
+      let cg = rendererContext.cgContext
+      for (index, slot) in slots.enumerated() where index < rects.count {
+        let rect = rects[index]
+        cg.saveGState()
+        cg.addRect(rect)
+        cg.clip()
+        if let image = images[slot.id] {
+          drawAspectFill(image, in: rect, context: cg)
+        } else {
+          colorForName(slot.name.isEmpty ? slot.id : slot.name).setFill()
+          cg.fill(rect)
+          drawInitials(
+            initials(from: slot.name), in: rect, context: rendererContext, side: side)
+        }
+        cg.restoreGState()
+      }
+      // Thin seams between tiles.
+      seam.setStroke()
+      cg.setLineWidth(1)
+      for rect in rects {
+        cg.stroke(rect)
+      }
+    }
+  }
+
+  private static func compositeRects(count: Int, side: CGFloat) -> [CGRect] {
+    let half = side / 2
+    switch count {
+    case 2:
+      return [
+        CGRect(x: 0, y: 0, width: half, height: side),
+        CGRect(x: half, y: 0, width: half, height: side),
+      ]
+    case 3:
+      return [
+        CGRect(x: 0, y: 0, width: half, height: side),
+        CGRect(x: half, y: 0, width: half, height: half),
+        CGRect(x: half, y: half, width: half, height: half),
+      ]
+    default:
+      return [
+        CGRect(x: 0, y: 0, width: half, height: half),
+        CGRect(x: half, y: 0, width: half, height: half),
+        CGRect(x: 0, y: half, width: half, height: half),
+        CGRect(x: half, y: half, width: half, height: half),
+      ]
+    }
+  }
+
+  private static func drawAspectFill(_ image: UIImage, in rect: CGRect, context cg: CGContext) {
+    let imageSize = image.size
+    guard imageSize.width > 0, imageSize.height > 0 else { return }
+    let scale = max(rect.width / imageSize.width, rect.height / imageSize.height)
+    let drawWidth = imageSize.width * scale
+    let drawHeight = imageSize.height * scale
+    let drawRect = CGRect(
+      x: rect.midX - drawWidth / 2,
+      y: rect.midY - drawHeight / 2,
+      width: drawWidth,
+      height: drawHeight)
+    image.draw(in: drawRect)
+    _ = cg
+  }
+
+  private static func drawInitials(
+    _ text: String, in rect: CGRect, context: UIGraphicsImageRendererContext, side: CGFloat
+  ) {
+    guard !text.isEmpty else { return }
+    let fontSize = min(rect.width, rect.height) * 0.42
+    let attributes: [NSAttributedString.Key: Any] = [
+      .font: UIFont.systemFont(ofSize: fontSize, weight: .semibold),
+      .foregroundColor: UIColor.white,
+    ]
+    let attributed = NSAttributedString(string: text, attributes: attributes)
+    let textSize = attributed.size()
+    let origin = CGPoint(x: rect.midX - textSize.width / 2, y: rect.midY - textSize.height / 2)
+    attributed.draw(at: origin)
+  }
+
+  private static func initials(from name: String) -> String {
+    let parts = name.split(whereSeparator: { $0 == " " || $0 == "-" || $0 == "_" })
+    if parts.isEmpty { return "" }
+    if parts.count == 1 {
+      return String(parts[0].prefix(1)).uppercased()
+    }
+    let first = parts[0].prefix(1)
+    let second = parts[1].prefix(1)
+    return (String(first) + String(second)).uppercased()
+  }
+
+  private static func colorForName(_ seed: String) -> UIColor {
+    var hash: UInt64 = 5381
+    for byte in seed.utf8 {
+      hash = (hash &* 33) &+ UInt64(byte)
+    }
+    let hue = CGFloat(hash % 360) / 360.0
+    return UIColor(hue: hue, saturation: 0.55, brightness: 0.72, alpha: 1)
   }
 }
 

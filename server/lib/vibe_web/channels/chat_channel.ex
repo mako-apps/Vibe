@@ -590,12 +590,19 @@ defmodule VibeWeb.ChatChannel do
         do: LocalAgentWorker.strip_team_trigger(dispatch_text),
         else: dispatch_text
 
-    team_workers =
-      if room_type != "dm" and team_trigger? do
+    # The AI workers that are members of this group (empty in a DM). Reused for both
+    # an explicit `@team`/`/team` run and the implicit default-team fan-out below.
+    group_agent_workers =
+      if room_type != "dm" do
         LocalAgentWorker.team_workers_for_participants(participant_ids)
       else
         []
       end
+
+    team_workers = if team_trigger?, do: group_agent_workers, else: []
+
+    # Guard against an agent's own posted reply re-triggering a default fan-out.
+    sender_is_agent? = not is_nil(LocalAgentWorker.resolve_by_agent_user_id(user_id))
 
     attachment_context = extract_agent_attachment_context(chat_id, data, user_id)
 
@@ -662,6 +669,35 @@ defmodule VibeWeb.ChatChannel do
           data,
           attachment_context,
           trigger_type,
+          user_id
+        )
+
+      # Default team behaviour: a plain group message (no @team / @claude / @codex,
+      # no reply-to-agent) in a group that has the AI workers as members fans out to
+      # all of them as one coordinated team run. The agents decide amongst themselves
+      # who takes the work (see agent_operating_rules) — a simple ask can be handled
+      # by one while the other defers; complex work gets split.
+      room_type != "dm" and not sender_is_agent? and is_nil(standalone_agent) and
+        is_nil(local_worker) and reserved_workers == [] and is_binary(dispatch_text) and
+          length(group_agent_workers) > 1 ->
+        spawn_team_worker_dispatches(
+          chat_id,
+          group_agent_workers,
+          dispatch_text,
+          data,
+          user_id
+        )
+
+      # Same default, but a group that only has one AI member — dispatch to it alone.
+      room_type != "dm" and not sender_is_agent? and is_nil(standalone_agent) and
+        is_nil(local_worker) and reserved_workers == [] and is_binary(dispatch_text) and
+          length(group_agent_workers) == 1 ->
+        spawn_local_worker_dispatch(
+          chat_id,
+          hd(group_agent_workers),
+          dispatch_text,
+          data,
+          "group_default",
           user_id
         )
 
