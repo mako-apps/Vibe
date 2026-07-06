@@ -459,7 +459,9 @@ final class BubbleBackgroundView: UIView {
   }
 
   func renderToImage() -> UIImage? {
-    let format = UIGraphicsImageRendererFormat()
+    // Screen-matched color space (P3) — this raster crossfades against live
+    // bubble rendering in the send morph; sRGB baking shifts the gradient tint.
+    let format = UIGraphicsImageRendererFormat.preferred()
     format.opaque = false
     format.scale = UIScreen.main.scale
     let renderer = UIGraphicsImageRenderer(bounds: bounds, format: format)
@@ -7016,7 +7018,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     let isFullBleed = metrics.isMediaLayout && usesFullBleedMediaLayout(row)
     let metaTopSpacing = effectiveMetaTopSpacing(for: row)
 
-    let showTail = row.shape.showTail && !isGhostHidden && !metrics.agentTurnCentered
+    // NOTE: ghost-hidden rows keep their TRUE tail geometry — visibility is
+    // handled entirely by the hidden flags in configure(). Stripping the tail
+    // from the hidden bubble's path made the send-morph reveal a structural
+    // path swap (tail-less silhouette → tailed) at the exact landing frame,
+    // seen as "the tail appears after the bubble is in the list".
+    let showTail = row.shape.showTail && !metrics.agentTurnCentered
       && !(row.messageType == "typing" || isTransparentStickerMessage(row) || usesTransparentAgentStreaming)
     // Normal bubbles draw the tail INSIDE BubbleBackgroundView's own path (one shape, one
     // fill — no color seam, no sliver outside the corner curve). The separate rotated
@@ -7032,8 +7039,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       tailView.center = CGPoint(x: tailX + tailSize * 0.5, y: tailY + tailSize * 0.5)
       let img = mediaImageView.image
       tailView.setImage(img)
-      // Hide tail until media image loads to avoid bubble-colored tail flash
-      tailView.isHidden = img == nil
+      // Hide tail until media image loads to avoid bubble-colored tail flash.
+      // Ghost rows: unlike the integrated tail (part of an already-hidden
+      // bubble's path), this is a standalone view — it must stay hidden.
+      tailView.isHidden = img == nil || isGhostHidden
     } else {
       tailView.setImage(nil)
       tailView.isHidden = true
@@ -9548,14 +9557,21 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   }
 
   func transitionBubbleCaptureRects() -> (
-    bubbleBodyRect: CGRect, plateRect: CGRect, tailRect: CGRect, contentRect: CGRect,
-    metaRect: CGRect
+    bubbleBodyRect: CGRect, bubbleAnchor: CGPoint, plateRect: CGRect, tailRect: CGRect,
+    contentRect: CGRect, metaRect: CGRect
   )? {
     guard row?.kind == .message else {
       return nil
     }
     contentView.layoutIfNeeded()
 
+    // `bubbleAnchor` is the TRUE (un-rounded) bubble origin. The morph maps
+    // overlay content into the container by subtracting this — NOT the
+    // integral box origin — because the container lands on the real cell's
+    // true bubble rect. Anchoring to the integral box shifts everything by
+    // the floor/ceil fringe (≤1px), which showed up as the tail sitting ~1px
+    // low against the revealed cell during the completion crossfade.
+    let bubbleAnchor = bubbleView.convert(CGPoint.zero, to: contentView)
     let bubbleBodyRect = bubbleView.convert(bubbleView.bounds, to: contentView).integral
     guard bubbleBodyRect.width > 1.0, bubbleBodyRect.height > 1.0 else {
       return nil
@@ -9615,7 +9631,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       )
     }
     contentRect = contentRect.integral
-    return (bubbleBodyRect, plateRect, tailRect, contentRect, metaRect)
+    return (bubbleBodyRect, bubbleAnchor, plateRect, tailRect, contentRect, metaRect)
   }
 
   func bubbleBackgroundSnapshotView(in view: UIView) -> UIView? {
@@ -9692,7 +9708,14 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     guard captureRect.width > 1.0, captureRect.height > 1.0 else {
       return nil
     }
-    let image = renderBubbleChromeImage(captureRect: captureRect, suppressIntegratedTail: false)
+    // The lobe overhangs the cell's trailing edge (tail tip ≈ bubble.maxX + 8pt,
+    // past contentView.bounds) and drawHierarchy clips at the canvas bounds —
+    // rendering from contentView shipped a raster with the tail's outer hook
+    // MISSING, so the morph flew a visibly clipped tail that "completed" only
+    // when the real cell was revealed. The snapshot cell lives alone inside the
+    // full-width transition overlay host during capture; render from there.
+    let image = renderBubbleChromeImage(
+      captureRect: captureRect, suppressIntegratedTail: false, canvasView: superview)
     let imageView = UIImageView(image: image)
     imageView.frame = captureRect
     imageView.contentMode = .scaleToFill
@@ -9727,7 +9750,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   /// morph width/height-stretches that raster, and a baked-in tail would
   /// stretch (and land with a visible shift) along with it.
   private func renderBubbleChromeImage(
-    captureRect: CGRect, suppressIntegratedTail: Bool
+    captureRect: CGRect, suppressIntegratedTail: Bool, canvasView: UIView? = nil
   ) -> UIImage {
     let messageWasHidden = messageLabel.isHidden
     let richTextWasHidden = richTextView.isHidden
@@ -9776,28 +9799,39 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       CATransaction.commit()
     }
 
-    let format = UIGraphicsImageRendererFormat()
+    // captureRect is in contentView coordinates; the raster is drawn from
+    // `canvas` — drawHierarchy CLIPS at the canvas view's bounds, and the
+    // integrated tail overhangs the cell's trailing edge by ~8pt, so the tail
+    // snapshot must render from a wider ancestor (see transitionTailSnapshotView)
+    // or the raster ships with the tail's outer hook cut off.
+    let canvas = canvasView ?? contentView
+    let rectInCanvas = contentView.convert(captureRect, to: canvas)
+    // .preferred() matches the main screen's color space (Display P3 on device).
+    // The plain default bakes to sRGB, which visibly dulls the saturated bubble
+    // gradient — seen as a soft whole-bubble color jump when the raster overlay
+    // is swapped for the live cell at the end of the send morph.
+    let format = UIGraphicsImageRendererFormat.preferred()
     format.opaque = false
     format.scale = UIScreen.main.scale
-    let renderer = UIGraphicsImageRenderer(size: captureRect.size, format: format)
+    let renderer = UIGraphicsImageRenderer(size: rectInCanvas.size, format: format)
     let image = renderer.image { context in
       // drawHierarchy fails (returns false, leaving the image fully
       // transparent) when the cell hasn't been committed to the screen yet —
       // e.g. the very first message in a chat, where the transition starts
       // right after the initial reloadData. Fall back to layer.render so the
       // bubble plate is never blank during the send morph.
-      let drewHierarchy = contentView.drawHierarchy(
+      let drewHierarchy = canvas.drawHierarchy(
         in: CGRect(
-          x: -captureRect.minX,
-          y: -captureRect.minY,
-          width: contentView.bounds.width,
-          height: contentView.bounds.height
+          x: -rectInCanvas.minX,
+          y: -rectInCanvas.minY,
+          width: canvas.bounds.width,
+          height: canvas.bounds.height
         ),
         afterScreenUpdates: true
       )
       if !drewHierarchy {
-        context.cgContext.translateBy(x: -captureRect.minX, y: -captureRect.minY)
-        contentView.layer.render(in: context.cgContext)
+        context.cgContext.translateBy(x: -rectInCanvas.minX, y: -rectInCanvas.minY)
+        canvas.layer.render(in: context.cgContext)
       }
     }
     return image

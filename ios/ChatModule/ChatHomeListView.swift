@@ -837,6 +837,12 @@ private final class ChatPreviewViewController: UIViewController {
     mainView.setProfileName(row.title)
     mainView.setProfileHandle(Self.resolvedProfileHandle(for: row))
     mainView.setAvatarUri(row.avatarUri)
+    mainView.setAvatarGradientColors(
+      startLight: row.avatarGradientStartLight,
+      endLight: row.avatarGradientEndLight,
+      startDark: row.avatarGradientStartDark,
+      endDark: row.avatarGradientEndDark
+    )
     mainView.setIsOnline(Self.resolvedIsOnline(for: row))
     mainView.setIsChatMuted(row.muted)
     mainView.setIsGroupOrChannel(Self.resolvedIsGroupOrChannel(for: row))

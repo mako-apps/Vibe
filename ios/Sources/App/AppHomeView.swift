@@ -4752,6 +4752,12 @@ private final class ChatHomeMiniPreviewController: UIViewController {
     mainView.setProfileName(row.title)
     mainView.setProfileHandle(Self.profileHandle(for: row))
     mainView.setAvatarUri(row.avatarUri)
+    mainView.setAvatarGradientColors(
+      startLight: row.avatarGradientStartLight,
+      endLight: row.avatarGradientEndLight,
+      startDark: row.avatarGradientStartDark,
+      endDark: row.avatarGradientEndDark
+    )
     mainView.setIsOnline(Self.isOnline(for: row))
     mainView.setIsChatMuted(row.muted)
     mainView.setIsGroupOrChannel(row.isGroup)

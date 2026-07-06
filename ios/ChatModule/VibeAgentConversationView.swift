@@ -3904,7 +3904,8 @@ private struct VibeAgentImagePreview: View {
 /// a generic grey), and the sweep is a wide, feathered highlight — a gentle glow, never a
 /// hard-edged bar. Used to assemble the transcript loading skeleton.
 private final class VibeAgentSkeletonPillView: UIView {
-  private let gradientLayer = CAGradientLayer()
+  private let backgroundGradientLayer = CAGradientLayer()
+  private let shimmerGradientLayer = CAGradientLayer()
   private var animating = false
   private var lastAnimatedWidth: CGFloat = 0
 
@@ -3913,26 +3914,41 @@ private final class VibeAgentSkeletonPillView: UIView {
     translatesAutoresizingMaskIntoConstraints = false
     layer.cornerCurve = .continuous
     clipsToBounds = true
-    gradientLayer.startPoint = CGPoint(x: 0.0, y: 0.5)
-    gradientLayer.endPoint = CGPoint(x: 1.0, y: 0.5)
-    layer.addSublayer(gradientLayer)
+    
+    backgroundGradientLayer.startPoint = CGPoint(x: 0.0, y: 0.0)
+    backgroundGradientLayer.endPoint = CGPoint(x: 1.0, y: 1.0)
+    layer.addSublayer(backgroundGradientLayer)
+    
+    shimmerGradientLayer.startPoint = CGPoint(x: 0.0, y: 0.5)
+    shimmerGradientLayer.endPoint = CGPoint(x: 1.0, y: 0.5)
+    layer.addSublayer(shimmerGradientLayer)
   }
 
   required init?(coder: NSCoder) { return nil }
 
-  func apply(base: UIColor, highlight: UIColor, cornerRadius: CGFloat) {
+  func apply(base: UIColor, highlight: UIColor, cornerRadius: CGFloat, userGradient: [UIColor]? = nil) {
     layer.cornerRadius = cornerRadius
-    backgroundColor = base
+    
+    if let userGradient = userGradient {
+      backgroundColor = .clear
+      backgroundGradientLayer.colors = userGradient.map { $0.cgColor }
+      backgroundGradientLayer.isHidden = false
+    } else {
+      backgroundColor = base
+      backgroundGradientLayer.isHidden = true
+    }
+    
     // Clear → soft highlight → clear so only a narrow band brightens as it sweeps; the
     // pill's own base color shows through the feathered ends (no visible edge).
-    gradientLayer.colors = [UIColor.clear.cgColor, highlight.cgColor, UIColor.clear.cgColor]
-    gradientLayer.locations = [0.2, 0.5, 0.8]
+    shimmerGradientLayer.colors = [UIColor.clear.cgColor, highlight.cgColor, UIColor.clear.cgColor]
+    shimmerGradientLayer.locations = [0.2, 0.5, 0.8]
   }
 
   override func layoutSubviews() {
     super.layoutSubviews()
+    backgroundGradientLayer.frame = bounds
     // Extend well past the bounds so the band enters/exits cleanly off-screen.
-    gradientLayer.frame = CGRect(x: -bounds.width, y: 0, width: bounds.width * 3.0, height: bounds.height)
+    shimmerGradientLayer.frame = CGRect(x: -bounds.width, y: 0, width: bounds.width * 3.0, height: bounds.height)
     if animating { addShimmerIfNeeded() }
   }
 
@@ -3943,22 +3959,12 @@ private final class VibeAgentSkeletonPillView: UIView {
 
   func stopAnimating() {
     animating = false
-    gradientLayer.removeAnimation(forKey: "shimmer")
+    shimmerGradientLayer.removeAnimation(forKey: "shimmer")
   }
 
   private func addShimmerIfNeeded() {
-    guard animating, bounds.width > 1.0 else { return }
-    // Skip if an equivalent animation is already running (avoids restarting every layout).
-    if gradientLayer.animation(forKey: "shimmer") != nil,
-      abs(lastAnimatedWidth - bounds.width) < 0.5 { return }
-    lastAnimatedWidth = bounds.width
-    let animation = CABasicAnimation(keyPath: "transform.translation.x")
-    animation.fromValue = 0
-    animation.toValue = bounds.width
-    animation.duration = 1.5
-    animation.repeatCount = .infinity
-    animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-    gradientLayer.add(animation, forKey: "shimmer")
+    // Disabled hard shimmer per user request. 
+    // The gradient and cell style are now applied statically.
   }
 }
 
@@ -3972,8 +3978,9 @@ final class VibeAgentTranscriptSkeletonView: UIView {
   private let stack = UIStackView()
   private var pills: [VibeAgentSkeletonPillView] = []
   private var appearance: VibeAgentKitChatAppearance = .fallback
+  private var userBubbleGradient: [UIColor]?
 
-  private let pattern: [RowKind] = [.user, .agent, .user, .agentShort, .agent]
+  private let pattern: [RowKind] = [.user, .agent, .user, .agent]
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -3984,7 +3991,7 @@ final class VibeAgentTranscriptSkeletonView: UIView {
     stack.spacing = 24.0
     addSubview(stack)
     NSLayoutConstraint.activate([
-      stack.topAnchor.constraint(equalTo: safeAreaLayoutGuide.topAnchor, constant: 20.0),
+      stack.bottomAnchor.constraint(equalTo: safeAreaLayoutGuide.bottomAnchor, constant: -20.0),
       stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 18.0),
       stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -18.0),
     ])
@@ -3992,9 +3999,10 @@ final class VibeAgentTranscriptSkeletonView: UIView {
 
   required init?(coder: NSCoder) { return nil }
 
-  func applyAppearance(_ appearance: VibeAgentKitChatAppearance) {
+  func applyAppearance(_ appearance: VibeAgentKitChatAppearance, userBubbleGradient: [UIColor]? = nil) {
     self.appearance = appearance
-    backgroundColor = appearance.background
+    self.userBubbleGradient = userBubbleGradient
+    backgroundColor = .clear
     rebuild()
   }
 
@@ -4028,48 +4036,44 @@ final class VibeAgentTranscriptSkeletonView: UIView {
     for kind in pattern {
       switch kind {
       case .user:
-        stack.addArrangedSubview(makeUserRow(base: userBase, highlight: userHighlight))
+        stack.addArrangedSubview(makeUserRow(base: userBase, highlight: userHighlight, userGradient: userBubbleGradient))
       case .agent:
         stack.addArrangedSubview(
-          makeAgentRow(fractions: [0.94, 0.86, 0.62], base: base, highlight: highlight))
+          makeAgentRow(base: base, highlight: highlight, height: 76.0, widthMultiplier: 0.75))
       case .agentShort:
         stack.addArrangedSubview(
-          makeAgentRow(fractions: [0.78, 0.44], base: base, highlight: highlight))
+          makeAgentRow(base: base, highlight: highlight, height: 48.0, widthMultiplier: 0.55))
       }
     }
     if window != nil, !isHidden { startShimmer() }
   }
 
-  private func makeAgentRow(fractions: [CGFloat], base: UIColor, highlight: UIColor) -> UIView {
+  private func makeAgentRow(base: UIColor, highlight: UIColor, height: CGFloat, widthMultiplier: CGFloat) -> UIView {
     let container = UIView()
     container.translatesAutoresizingMaskIntoConstraints = false
-    var previous: UIView?
-    for fraction in fractions {
-      let pill = VibeAgentSkeletonPillView()
-      pill.apply(base: base, highlight: highlight, cornerRadius: 7.0)
-      container.addSubview(pill)
-      pills.append(pill)
-      NSLayoutConstraint.activate([
-        pill.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-        pill.widthAnchor.constraint(equalTo: container.widthAnchor, multiplier: fraction),
-        pill.heightAnchor.constraint(equalToConstant: 13.0),
-      ])
-      if let previous {
-        pill.topAnchor.constraint(equalTo: previous.bottomAnchor, constant: 9.0).isActive = true
-      } else {
-        pill.topAnchor.constraint(equalTo: container.topAnchor).isActive = true
-      }
-      previous = pill
-    }
-    previous?.bottomAnchor.constraint(equalTo: container.bottomAnchor).isActive = true
+    
+    let bubble = VibeAgentSkeletonPillView()
+    // Agent chat bubbles also share the 18.0 corner radius
+    bubble.apply(base: base, highlight: highlight, cornerRadius: 18.0)
+    container.addSubview(bubble)
+    pills.append(bubble)
+    
+    NSLayoutConstraint.activate([
+      bubble.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+      bubble.topAnchor.constraint(equalTo: container.topAnchor),
+      bubble.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+      bubble.widthAnchor.constraint(equalTo: container.widthAnchor, multiplier: widthMultiplier),
+      bubble.heightAnchor.constraint(equalToConstant: height),
+    ])
+    
     return container
   }
 
-  private func makeUserRow(base: UIColor, highlight: UIColor) -> UIView {
+  private func makeUserRow(base: UIColor, highlight: UIColor, userGradient: [UIColor]?) -> UIView {
     let container = UIView()
     container.translatesAutoresizingMaskIntoConstraints = false
     let bubble = VibeAgentSkeletonPillView()
-    bubble.apply(base: base, highlight: highlight, cornerRadius: 18.0)
+    bubble.apply(base: base, highlight: highlight, cornerRadius: 18.0, userGradient: userGradient)
     container.addSubview(bubble)
     pills.append(bubble)
     NSLayoutConstraint.activate([

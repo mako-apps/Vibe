@@ -2534,29 +2534,17 @@ final class VibeAgentKitStepDetailViewController: UIViewController {
     super.viewDidLoad()
     view.backgroundColor = .clear
 
-    let glassView = UIVisualEffectView(effect: nil)
-    if #available(iOS 26.0, *) {
-      let glass = UIGlassEffect()
-      glass.isInteractive = true
-      glassView.effect = glass
-    } else {
-      glassView.effect = UIBlurEffect(
-        style: appearance.isDark ? .systemChromeMaterialDark : .systemChromeMaterialLight)
-    }
-    glassView.translatesAutoresizingMaskIntoConstraints = false
-    view.insertSubview(glassView, at: 0)
-    NSLayoutConstraint.activate([
-      glassView.topAnchor.constraint(equalTo: view.topAnchor),
-      glassView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-      glassView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-      glassView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-    ])
-
     let kind = (item.itemType ?? item.tool ?? "").lowercased()
     navigationItem.title = stepTitle(kind: kind)
     navigationItem.leftBarButtonItem = UIBarButtonItem(
       barButtonSystemItem: .close, target: self, action: #selector(closeTapped))
-    navigationItem.leftBarButtonItem?.tintColor = appearance.primary
+    navigationItem.leftBarButtonItem?.tintColor = appearance.text
+
+    let navBarAppearance = UINavigationBarAppearance()
+    navBarAppearance.configureWithTransparentBackground()
+    navigationController?.navigationBar.standardAppearance = navBarAppearance
+    navigationController?.navigationBar.scrollEdgeAppearance = navBarAppearance
+    navigationController?.navigationBar.compactAppearance = navBarAppearance
 
     scrollView.translatesAutoresizingMaskIntoConstraints = false
     scrollView.alwaysBounceVertical = true
@@ -2572,7 +2560,7 @@ final class VibeAgentKitStepDetailViewController: UIViewController {
     scrollView.addSubview(stack)
 
     NSLayoutConstraint.activate([
-      scrollView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+      scrollView.topAnchor.constraint(equalTo: view.topAnchor),
       scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
       scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),

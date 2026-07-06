@@ -21,6 +21,19 @@ final class ChatHomeCardCell: UITableViewCell {
     ChatAvatarImageStore.cache(image, for: key)
   }
 
+  static func getFallbackInitials(from name: String) -> String {
+    let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !cleanName.isEmpty else { return "" }
+    let components = cleanName.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+    if components.count >= 2 {
+      let first = components[0].prefix(1)
+      let second = components[1].prefix(1)
+      return (first + second).uppercased()
+    } else {
+      return String(cleanName.prefix(2)).uppercased()
+    }
+  }
+
   private let pressOverlayView = UIView()
   private let selectionOverlayView = UIView()
   private let dividerView = UIView()
@@ -35,6 +48,7 @@ final class ChatHomeCardCell: UITableViewCell {
   private let avatarContainer = UIView()
   private let avatarImageView = UIImageView()
   private let avatarFallbackIconView = UIImageView()
+  private let avatarFallbackLabel = UILabel()
   private let editSelectionBackgroundView = UIView()
   private let editSelectionCheckView = UIImageView()
   private let onlineDot = UIView()
@@ -107,6 +121,7 @@ final class ChatHomeCardCell: UITableViewCell {
     lastAvatarURLString = nil
     avatarImageView.image = nil
     avatarFallbackIconView.isHidden = false
+    avatarFallbackLabel.isHidden = false
     avatarContainer.layer.sublayers?.removeAll(where: { $0.name == self.avatarGradientLayerName })
     unreadBadge.isHidden = true
     tierBadgeImageView.isHidden = true
@@ -238,10 +253,17 @@ final class ChatHomeCardCell: UITableViewCell {
     rightCheckmarkView.isHidden = !showsRightCheckmark
     rightCheckmarkView.tintColor = isEditSelected ? badgeBackground : secondary.withAlphaComponent(0.3)
 
-    let fallbackSystemImageName =
-      row.isArchiveEntry ? "archivebox.fill" : (row.isSavedMessages ? "bookmark.fill" : "person.fill")
-    avatarFallbackIconView.image = UIImage(systemName: fallbackSystemImageName)
-    avatarFallbackIconView.tintColor = .white
+    if row.isArchiveEntry || row.isSavedMessages {
+      let fallbackSystemImageName = row.isArchiveEntry ? "archivebox.fill" : "bookmark.fill"
+      avatarFallbackIconView.image = UIImage(systemName: fallbackSystemImageName)
+      avatarFallbackIconView.tintColor = .white
+      avatarFallbackIconView.isHidden = false
+      avatarFallbackLabel.isHidden = true
+    } else {
+      avatarFallbackIconView.isHidden = true
+      avatarFallbackLabel.isHidden = false
+      avatarFallbackLabel.text = Self.getFallbackInitials(from: row.title)
+    }
 
     let resolvedAvatarGradientColors =
       avatarGradientColors
@@ -409,6 +431,13 @@ final class ChatHomeCardCell: UITableViewCell {
     avatarFallbackIconView.image = UIImage(systemName: "person.fill")
     avatarFallbackIconView.tintColor = UIColor.white
 
+    avatarFallbackLabel.translatesAutoresizingMaskIntoConstraints = false
+    avatarFallbackLabel.textAlignment = .center
+    avatarFallbackLabel.textColor = .white
+    avatarFallbackLabel.font = UIFont.systemFont(ofSize: 22, weight: .semibold)
+    avatarFallbackLabel.adjustsFontSizeToFitWidth = true
+    avatarFallbackLabel.minimumScaleFactor = 0.8
+
     editSelectionBackgroundView.translatesAutoresizingMaskIntoConstraints = false
     editSelectionBackgroundView.backgroundColor = .clear
     editSelectionBackgroundView.layer.cornerRadius = 11
@@ -524,6 +553,7 @@ final class ChatHomeCardCell: UITableViewCell {
     rowContentContainer.addSubview(avatarContainer)
     avatarContainer.addSubview(avatarImageView)
     avatarContainer.addSubview(avatarFallbackIconView)
+    avatarContainer.addSubview(avatarFallbackLabel)
     editSelectionContainer.addSubview(editSelectionBackgroundView)
     editSelectionBackgroundView.addSubview(editSelectionCheckView)
     rowContentContainer.addSubview(onlineDot)
@@ -586,6 +616,11 @@ final class ChatHomeCardCell: UITableViewCell {
       avatarFallbackIconView.centerYAnchor.constraint(equalTo: avatarContainer.centerYAnchor),
       avatarFallbackIconView.widthAnchor.constraint(equalToConstant: 24),
       avatarFallbackIconView.heightAnchor.constraint(equalToConstant: 24),
+
+      avatarFallbackLabel.centerXAnchor.constraint(equalTo: avatarContainer.centerXAnchor),
+      avatarFallbackLabel.centerYAnchor.constraint(equalTo: avatarContainer.centerYAnchor),
+      avatarFallbackLabel.widthAnchor.constraint(equalTo: avatarContainer.widthAnchor, constant: -8),
+      avatarFallbackLabel.heightAnchor.constraint(equalTo: avatarContainer.heightAnchor, constant: -8),
 
       editSelectionBackgroundView.centerXAnchor.constraint(equalTo: editSelectionContainer.centerXAnchor),
       editSelectionBackgroundView.centerYAnchor.constraint(equalTo: editSelectionContainer.centerYAnchor),

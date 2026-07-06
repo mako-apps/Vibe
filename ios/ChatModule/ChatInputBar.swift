@@ -1628,7 +1628,9 @@ final class ChatInputBar: UIView {
 
     let captureRectInGlass = pillContainer.convert(captureRect, to: pillGlass)
 
-    let format = UIGraphicsImageRendererFormat()
+    // Screen-matched color space (P3): this capsule ghost crossfades into the
+    // live-rendered bubble during the send morph — an sRGB bake tints it.
+    let format = UIGraphicsImageRendererFormat.preferred()
     format.opaque = false
     format.scale = UIScreen.main.scale
     let renderer = UIGraphicsImageRenderer(size: captureRect.size, format: format)

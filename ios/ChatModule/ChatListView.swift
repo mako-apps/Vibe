@@ -669,16 +669,25 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   // measureMessageBubbleLayout (tallBubble* constants).
   private var tallBubbleExpandedRowIds = Set<String>()
   private var agentTurnStreamStartByRow: [String: Date] = [:]
-  // Memoized measured heights for agent-turn rows (see estimateMessageHeight): the row
-  // struct is retained only for the cheap content-equality validity check — COW means it
-  // shares storage with the live `rows` array, not a payload copy.
-  private struct AgentTurnHeightCacheEntry {
+  // Memoized measured heights (see estimateMessageHeight): the row struct is retained only
+  // for the cheap content-equality validity check — COW means it shares storage with the
+  // live `rows` array, not a payload copy.
+  private struct RowHeightCacheEntry {
     let row: ChatListRow
     let rowWidth: CGFloat
     let state: AgentTurnBubbleState
     let height: CGFloat
   }
-  private var agentTurnHeightCache: [String: AgentTurnHeightCacheEntry] = [:]
+  private var agentTurnHeightCache: [String: RowHeightCacheEntry] = [:]
+  // Same memoization for ordinary message rows. Their height is an
+  // NSAttributedString.boundingRect measurement that was recomputed from scratch on every
+  // layout pass — and one chat open drives several full passes (deferred-rows flush, the
+  // forced subtree layout before setRows, the initial bottom-scroll double pass, the
+  // wallpaper-snapshot relayout). For a 120-row transcript that meant measuring 120 bubbles
+  // several times over on the main thread during the push — the bulk of the open-latency
+  // hitch. Caching collapses it to one measurement per row. `tallExpanded` rides in `state`,
+  // so a "Show more" toggle correctly misses the cache and re-measures.
+  private var messageHeightCache: [String: RowHeightCacheEntry] = [:]
   private var nativeHistoryHydrationGeneration: UInt = 0
   private var nativeOutgoingRowsById: [String: [String: Any]] = [:]
   private var nativeOutgoingOrder: [String] = []
@@ -723,6 +732,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var selectedMessageIds = Set<String>()
   private var pendingSendTransition: SendTransitionPayload?
   private var activeSendTransition: SendTransitionState?
+  // The overlay outlives activeSendTransition by the ~55ms reveal crossfade.
+  // Scroll/rows updates landing inside that window still move the real cell, so
+  // the fading overlay must keep tracking it or the two paint ~1px apart
+  // (visible as the tail gaining a pixel at the very end of the send morph).
+  private var fadingSendTransition: SendTransitionState?
   private var projectedSendTransitionMessageId: String?
   private var deferredPendingSendBottomScrollMessageId: String?
   var swipeReplyPanGesture: UIPanGestureRecognizer?
@@ -1852,6 +1866,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   func setRows(_ nextRows: [[String: Any]]) {
     let startedAt = ProcessInfo.processInfo.systemUptime
     sourceRowsPayload = nextRows
+    // [GroupCellOverlap] Fire settle-time overlap probes after this update lands (covers the
+    // static finalize case where no scroll happens). Silent unless an overlap is detected.
+    if isGroupOrChannel {
+      for delay in [0.12, 0.45, 0.9] {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+          self?.probeGroupCellOverlap(reason: "setRows+\(delay)s", force: true)
+        }
+      }
+    }
     let traceChatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
     VibeDebugLog.log(
       "[ChatListView] setRows called — count: %d, isApplying: %@", nextRows.count,
@@ -2130,6 +2153,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       // flying at the real cell instead of a stale rect.
       if let transition = self.activeSendTransition {
         self.updateTransitionFrame(transition)
+      } else if let fading = self.fadingSendTransition {
+        // Same for a rows update landing inside the ~55ms reveal crossfade
+        // (e.g. the pending→sent status flip): the overlay ghost must follow
+        // the cell it is fading out over.
+        self.updateTransitionFrame(fading)
       }
       self.maybeStartPendingSendTransition()
     }
@@ -2875,6 +2903,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let liveIds = Set(currentRows.map { $0.messageId ?? $0.key })
     let liveKeys = Set(currentRows.map(\.key))
     agentTurnHeightCache = agentTurnHeightCache.filter { liveKeys.contains($0.key) }
+    messageHeightCache = messageHeightCache.filter { liveKeys.contains($0.key) }
     agentTurnExpandedStepIdsByRow = agentTurnExpandedStepIdsByRow.filter { liveIds.contains($0.key) }
     agentTurnProgressExpandedRowIds = agentTurnProgressExpandedRowIds.filter { liveIds.contains($0) }
     agentTurnRuntimeExpandedRowIds = agentTurnRuntimeExpandedRowIds.filter { liveIds.contains($0) }
@@ -3214,6 +3243,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       return
     }
     contentPaddingTop = next
+    setNeedsLayout()
     updateBottomAnchorInset()
     emitViewport(force: true)
   }
@@ -3579,7 +3609,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
               )
               let nav = UINavigationController(rootViewController: detail)
               nav.modalPresentationStyle = .pageSheet
-              nav.view.backgroundColor = .clear
+              let vibeAppearance = VibeAgentKitMap.appearance(for: self.traitCollection)
+              nav.view.backgroundColor = vibeAppearance.isDark
+                ? UIColor.black.withAlphaComponent(0.3)
+                : .clear
               if let sheet = nav.sheetPresentationController {
                 sheet.detents = [.medium(), .large()]
                 sheet.prefersGrabberVisible = true
@@ -4420,6 +4453,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
     _ = offsetY - previousOffsetY  // delta unused
     previousOffsetY = offsetY
+    probeGroupCellOverlap(reason: "scroll")
     updateScrollToneOverlay(offsetY: offsetY)
     refreshWallpaperSnapshotIfNeeded()
     updateVisibleWallpaperBackdropLayouts()
@@ -4432,6 +4466,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         // follow the real cell. The additive offset decays independently.
         updateTransitionFrame(activeSendTransition)
       }
+    } else if let fadingSendTransition {
+      // Reveal crossfade in progress: the overlay is a static ghost on top of
+      // the real cell — keep it glued if this scroll moved the cell.
+      updateTransitionFrame(fadingSendTransition)
     }
 
     if !isInternalScrollAdjustment {
@@ -4537,6 +4575,63 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
   }
 
+  // [GroupCellOverlap] Debug probe for the "messy overlapping Codex cell" report. Logs
+  // (via NSLog so it shows in Console) only when two ADJACENT group rows are laid out with
+  // overlapping frames — silent otherwise. Captures each row's identity (agent kind / error
+  // / notice), assigned frame Y+height, and a text prefix so we can tell whether it's a
+  // notice+result pair or a single row that grew without reflow. Remove once fixed.
+  private var lastOverlapProbeAt: TimeInterval = 0
+  private func probeGroupCellOverlap(reason: String, force: Bool = false) {
+    guard isGroupOrChannel else { return }
+    let now = Date().timeIntervalSinceReferenceDate
+    if !force {
+      guard now - lastOverlapProbeAt > 0.15 else { return }
+    }
+    lastOverlapProbeAt = now
+    let visible = collectionView.indexPathsForVisibleItems.sorted { $0.item < $1.item }
+    guard visible.count >= 2 else { return }
+    for i in 0..<(visible.count - 1) {
+      let a = visible[i], b = visible[i + 1]
+      guard b.item == a.item + 1 else { continue }
+      guard
+        let fa = collectionView.layoutAttributesForItem(at: a)?.frame,
+        let fb = collectionView.layoutAttributesForItem(at: b)?.frame
+      else { continue }
+      let overlap = fa.maxY - fb.minY
+      guard overlap > 0.5 else { continue }
+      let ra = a.item < rows.count ? rows[a.item] : nil
+      let rb = b.item < rows.count ? rows[b.item] : nil
+      let line = String(
+        format:
+          "[GroupCellOverlap] %@ overlap=%.1fpt a[%d]{key=%@ agent=%@ kind=%@ err=%@ y=%.0f h=%.0f \"%@\"} b[%d]{key=%@ agent=%@ kind=%@ err=%@ y=%.0f h=%.0f \"%@\"}",
+        reason, overlap,
+        a.item, String((ra?.key ?? "?").prefix(10)), (ra?.isAgentMessage ?? false) ? "y" : "n",
+        ra?.agentMsgKind ?? "-", (ra?.isAgentError ?? false) ? "y" : "n", fa.minY, fa.height,
+        String((ra?.text ?? "").prefix(22)),
+        b.item, String((rb?.key ?? "?").prefix(10)), (rb?.isAgentMessage ?? false) ? "y" : "n",
+        rb?.agentMsgKind ?? "-", (rb?.isAgentError ?? false) ? "y" : "n", fb.minY, fb.height,
+        String((rb?.text ?? "").prefix(22)))
+      NSLog("%@", line)
+      Self.appendOverlapProbeLine(line)
+    }
+  }
+
+  // Mirror overlap-probe lines to a file in the app's tmp dir so they can be pulled off the
+  // device without root: `devicectl device copy from --domain-type temporary
+  // --domain-identifier com.vibegram.app --source group_overlap_probe.log ...`.
+  private static func appendOverlapProbeLine(_ line: String) {
+    let path = (NSTemporaryDirectory() as NSString).appendingPathComponent("group_overlap_probe.log")
+    let stamped = ISO8601DateFormatter().string(from: Date()) + " " + line + "\n"
+    guard let data = stamped.data(using: .utf8) else { return }
+    if let handle = FileHandle(forWritingAtPath: path) {
+      handle.seekToEndOfFile()
+      handle.write(data)
+      try? handle.close()
+    } else {
+      try? data.write(to: URL(fileURLWithPath: path))
+    }
+  }
+
   private func maybeLoadOlderBridgeHistoryIfNeeded(offsetY: CGFloat) {
     guard currentBridgeProvider != nil else { return }
     let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -4622,13 +4717,27 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       let height = measureMessageBubbleLayout(
         row: row, rowWidth: rowWidth, agentTurnState: state
       ).bubbleHeight
-      agentTurnHeightCache[row.key] = AgentTurnHeightCacheEntry(
+      agentTurnHeightCache[row.key] = RowHeightCacheEntry(
         row: row, rowWidth: rowWidth, state: state, height: height)
       return height
     }
-    return measureMessageBubbleLayout(
-      row: row, rowWidth: rowWidth, agentTurnState: agentTurnBubbleState(for: row)
+    // Ordinary message rows: reuse the last measured height while the row's content, width,
+    // and tall-expand state are unchanged. This is the hot path on chat open — a long
+    // transcript re-measured across several layout passes — see messageHeightCache.
+    let state = agentTurnBubbleState(for: row)
+    if let cached = messageHeightCache[row.key],
+      cached.rowWidth == rowWidth,
+      cached.state == state,
+      chatListRowContentEqual(cached.row, row)
+    {
+      return cached.height
+    }
+    let height = measureMessageBubbleLayout(
+      row: row, rowWidth: rowWidth, agentTurnState: state
     ).bubbleHeight
+    messageHeightCache[row.key] = RowHeightCacheEntry(
+      row: row, rowWidth: rowWidth, state: state, height: height)
+    return height
   }
 
   private func shouldDeferBottomScrollForPendingSend(
@@ -5172,12 +5281,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         listVisibleBottom - contentPaddingBottom - metrics.bubbleHeight)
     }()
 
+    // TRUE (un-rounded) rect: the flight's landing target must not be
+    // integer-rounded away from the real cell's fractional bubble rect, or the
+    // completion snap onto the real rect shows up as a ≤1px jump at reveal.
     return CGRect(
       x: collectionView.frame.minX + messageHorizontalInset + bubbleXInRow,
       y: bubbleYInHost,
       width: metrics.bubbleWidth,
       height: metrics.bubbleHeight
-    ).integral
+    )
   }
 
   private func mergedRowsPayload(from baseRows: [[String: Any]]) -> [[String: Any]] {
@@ -5831,6 +5943,41 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     transition.compensateScroll(targetRect: targetRect)
   }
 
+  /// One-line landing report: where the overlay snapped vs where the real
+  /// cell's bubble/tail actually are at the reveal instant. Sub-pixel deltas
+  /// here are exactly the "tail grows a pixel at the end" class of artifact.
+  private func logSendMorphLanding(_ transition: SendTransitionState, finalTargetRect: CGRect) {
+    func fmt(_ r: CGRect) -> String {
+      String(format: "(%.3f,%.3f %.3fx%.3f)", r.minX, r.minY, r.width, r.height)
+    }
+    var realRectText = "nil"
+    var lobeText = "nil"
+    var statusText = "?"
+    var cellFrameText = "nil"
+    if let rowIndex = indexForMessage(transition.payload.messageId), rowIndex < rows.count,
+      let cell = collectionView.cellForItem(at: IndexPath(item: rowIndex, section: 0))
+        as? ChatListCell
+    {
+      if let rect = cell.bubbleRect(in: self) {
+        realRectText = fmt(rect)
+      }
+      if let lobe = cell.bubbleView.integratedTailLobePath() {
+        lobeText = fmt(cell.bubbleView.convert(lobe.bounds, to: self))
+      }
+      statusText = rows[rowIndex].status ?? "nil"
+      cellFrameText = fmt(cell.frame)
+    }
+    let overlayTailText =
+      transition.tailSnapshot.map {
+        fmt(transition.overlayContainer.convert($0.frame, to: self))
+      } ?? "nil"
+    NSLog(
+      "[SendMorphDiag] target=%@ real=%@ plateEnd=%@ overlayTail=%@ realLobe=%@ status=%@ cell=%@ offsetY=%.3f",
+      fmt(finalTargetRect), realRectText, fmt(transition.sourceBackgroundEndFrame),
+      overlayTailText, lobeText, statusText, cellFrameText,
+      collectionView.contentOffset.y)
+  }
+
   func completeTransition(_ transition: SendTransitionState) {
     guard activeSendTransition === transition else {
       NSLog("[ChatListView] completeTransition — ignoring stale transition")
@@ -5851,19 +5998,27 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       messageId: transition.payload.messageId, fallbackPayload: transition.payload)
     {
       transition.compensateScroll(targetRect: finalTargetRect)
+      logSendMorphLanding(transition, finalTargetRect: finalTargetRect)
     }
     let shouldSettleDeferredBottomScroll =
       deferredPendingSendBottomScrollMessageId == transition.payload.messageId
 
-    // Finish almost immediately so status/check glyphs do not linger between states.
+    // Hard swap — NO crossfade. The landing is pixel-exact ([SendMorphDiag]
+    // shows overlay == revealed cell to the third decimal), so any frame where
+    // both are visible BLENDS two identical anti-aliased silhouettes: every
+    // curved edge composites denser, and the small tail curve visibly gains
+    // ~1px of weight for the fade duration, then settles ("tail grows at the
+    // end"). Instead the reveal below and the overlay removal commit in the
+    // SAME frame; only the rare async reveal paths keep the overlay one tick
+    // so the swap never shows a one-frame hole.
     let overlay = transition.overlayContainer
-    UIView.animate(
-      withDuration: 0.055, delay: 0, options: [.curveEaseOut, .beginFromCurrentState],
-      animations: {
-        overlay.alpha = 0.0
-      }
-    ) { _ in
+    fadingSendTransition = transition
+    var revealCellWasPresent = false
+    let dropOverlay = { [weak self] in
       overlay.removeFromSuperview()
+      if let self, self.fadingSendTransition === transition {
+        self.fadingSendTransition = nil
+      }
     }
 
     activeSendTransition = nil
@@ -5940,14 +6095,26 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         cell.setNeedsLayout()
         cell.layoutIfNeeded()
         cell.updateWallpaperBackdropLayoutIfNeeded()
+        revealCellWasPresent = true
       } else {
         UIView.performWithoutAnimation {
           self.flowLayout.invalidateLayout()
           self.collectionView.layoutIfNeeded()
           self.collectionView.reloadItems(at: [indexPath])
           self.collectionView.layoutIfNeeded()
-          _ = revealVisibleCell()
+          revealCellWasPresent = revealVisibleCell()
         }
+      }
+      if let cell = collectionView.cellForItem(at: indexPath) as? ChatListCell {
+        let lobeText = cell.bubbleView.integratedTailLobePath().map { lobe -> String in
+          let r = cell.bubbleView.convert(lobe.bounds, to: self)
+          return String(format: "(%.3f,%.3f %.3fx%.3f)", r.minX, r.minY, r.width, r.height)
+        }
+        NSLog(
+          "[SendMorphDiag] postReveal lobe=%@ ghost=%@ showTail=%@",
+          lobeText ?? "nil",
+          cell.isConfiguredGhostHidden ? "Y" : "N",
+          (cell.row?.shape.showTail ?? false) ? "Y" : "N")
       }
       if rows.filter({ $0.kind == .message }).count == 1 {
         DispatchQueue.main.async { [weak self] in
@@ -6002,6 +6169,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       }
     }
     flushQueuedAppearanceAfterTransitionIfNeeded()
+    if revealCellWasPresent {
+      // Common path: the cell above is configured, visible, and pixel-identical
+      // under the overlay — drop the overlay in the same frame (zero overlap).
+      dropOverlay()
+    } else {
+      // Async reveal path (cell not realized yet): keep the overlay one tick so
+      // the swap never shows a one-frame hole where the bubble disappears.
+      DispatchQueue.main.async(execute: dropOverlay)
+    }
     if shouldSettleDeferredBottomScroll {
       DispatchQueue.main.async { [weak self] in
         self?.scrollToBottom(animated: true)
@@ -6891,24 +7067,39 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     text: String,
     mentionedAgentUsername: String?
   ) -> [String: Any] {
-    guard let provider = resolvedBridgeProviderForOutgoing(
+    let provider = resolvedBridgeProviderForOutgoing(
       text: text,
       mentionedAgentUsername: mentionedAgentUsername
-    ) else {
+    )
+    // A plain group message (no @mention, not an agent DM) still fans out to the
+    // group's Claude/Codex members server-side — so it must carry the selected repo
+    // too, otherwise the agents run with no working directory (the repo picked in the
+    // group profile was never reaching them). Detect that group-with-agents case.
+    let isGroupAgentSend = provider == nil && groupHasBridgeAgents()
+    guard provider != nil || isGroupAgentSend else {
       return [:]
     }
     guard let repository = AgentBridgeSelectionStore.selectedRepository() else {
       return [:]
     }
 
+    // Repo + work mode are provider-agnostic and apply to whichever worker runs.
     var metadata: [String: Any] = [
-      "agentBridgeProvider": provider,
       "agentBridgeRepoId": repository.id,
       "agentBridgeRepoName": repository.name,
       "agentBridgeRepoPath": repository.path,
       "agentBridgeCwd": repository.cwd,
       "agentBridgeWorkMode": AgentBridgeSelectionStore.selectedWorkMode().rawValue,
     ]
+
+    guard let provider else {
+      // Group fan-out to both agents: no single provider, no per-provider run options,
+      // and no resume target (each parallel agent starts its own fresh session, matching
+      // the new-task-per-message default). Repo + work mode is exactly what was missing.
+      return metadata
+    }
+
+    metadata["agentBridgeProvider"] = provider
     metadata.merge(
       AgentBridgeSelectionStore.selectedRunOptions(provider: provider).payload(provider: provider)
     ) { _, new in new }
@@ -6928,6 +7119,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       metadata["agentBridgeResumeSessionId"] = resumeSessionId
     }
     return metadata
+  }
+
+  /// True when the current chat is a group that has Claude/Codex as members (their
+  /// group-sender entries carry a resolved bridge `provider`). Used so a plain group
+  /// message still ships the selected repo to the agents.
+  private func groupHasBridgeAgents() -> Bool {
+    guard isGroupOrChannel else { return false }
+    return groupSenderDirectory.values.contains { $0.provider != nil }
   }
 
   private func resolvedBridgeProviderForOutgoing(
@@ -7210,7 +7409,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       ])
     }
     bringSubviewToFront(bridgeSessionSkeleton)
-    bridgeSessionSkeleton.applyAppearance(VibeAgentKitMap.appearance(for: self.traitCollection))
+    bridgeSessionSkeleton.applyAppearance(
+      VibeAgentKitMap.appearance(for: self.traitCollection),
+      userBubbleGradient: appearance.bubbleMeGradient
+    )
     bridgeSessionSkeleton.isHidden = false
     bridgeSessionSkeleton.alpha = 1.0
     bridgeSessionSkeleton.startShimmer()
@@ -10571,13 +10773,29 @@ extension ChatListView: ChatInputBarDelegate {
 final class SenderRunAvatarView: UIView {
   private let imageView = UIImageView()
   private let initialsLabel = UILabel()
+  private let gradientLayer = CAGradientLayer()
   private var loadedURL: String?
   private var loadToken = UUID()
+
+  // Claude/Codex always have a profile image even when the group members payload omits
+  // the avatar URL — resolve it from the provider so agents never fall back to a letter.
+  static func agentAvatarURL(for provider: String?) -> String? {
+    switch provider {
+    case "claude": return "https://media.vibegram.io/chat-media/agent-profiles/claude.png"
+    case "codex": return "https://media.vibegram.io/chat-media/agent-profiles/codex.png"
+    default: return nil
+    }
+  }
 
   override init(frame: CGRect) {
     super.init(frame: frame)
     clipsToBounds = true
     isUserInteractionEnabled = false
+    // Gradient tile behind the initials (matches the home-list fallback look) instead of
+    // a flat fill. The photo (imageView) covers it whenever one is available.
+    gradientLayer.startPoint = CGPoint(x: 0.5, y: 0.0)
+    gradientLayer.endPoint = CGPoint(x: 0.5, y: 1.0)
+    layer.insertSublayer(gradientLayer, at: 0)
     imageView.contentMode = .scaleAspectFill
     imageView.clipsToBounds = true
     initialsLabel.textAlignment = .center
@@ -10596,16 +10814,25 @@ final class SenderRunAvatarView: UIView {
   override func layoutSubviews() {
     super.layoutSubviews()
     layer.cornerRadius = bounds.height / 2.0
+    gradientLayer.frame = bounds
     imageView.frame = bounds
     initialsLabel.frame = bounds
   }
 
   func configure(name: String, avatarUrl: String?, tint: UIColor, provider: String?) {
-    let trimmedURL = avatarUrl?.trimmingCharacters(in: .whitespacesAndNewlines)
-    initialsLabel.text = SenderRunAvatarView.initials(from: name)
-    // The tile colour behind initials should stay readable even for the near-white Codex
-    // name tint, so fall back to a mid grey when the tint is too light for a white glyph.
-    backgroundColor = SenderRunAvatarView.tileColor(for: tint, provider: provider)
+    let explicitURL = avatarUrl?.trimmingCharacters(in: .whitespacesAndNewlines)
+    // Fall back to the known agent image when the payload carried no URL (root cause of
+    // Claude/Codex showing a "C" tile even though their profile images exist).
+    let trimmedURL =
+      (explicitURL?.isEmpty ?? true)
+      ? SenderRunAvatarView.agentAvatarURL(for: provider)
+      : explicitURL
+    initialsLabel.text = SenderRunAvatarView.initials(from: name, provider: provider)
+    // Home-style gradient behind the initials, seeded from the sender colour.
+    let base = SenderRunAvatarView.tileColor(for: tint, provider: provider)
+    let (top, bottom) = SenderRunAvatarView.gradientColors(base: base)
+    gradientLayer.colors = [top.cgColor, bottom.cgColor]
+    backgroundColor = .clear
 
     guard let url = trimmedURL, !url.isEmpty else {
       loadedURL = nil
@@ -10656,10 +10883,28 @@ final class SenderRunAvatarView: UIView {
     return tint
   }
 
-  private static func initials(from name: String) -> String {
+  /// Two shades of the base colour for the fallback gradient (slightly lighter on top,
+  /// darker on the bottom) — the same soft top-down look the home list uses.
+  private static func gradientColors(base: UIColor) -> (UIColor, UIColor) {
+    var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+    guard base.getHue(&h, saturation: &s, brightness: &b, alpha: &a) else {
+      return (base, base)
+    }
+    let top = UIColor(hue: h, saturation: s, brightness: min(1.0, b * 1.16), alpha: a)
+    let bottom = UIColor(hue: h, saturation: s, brightness: max(0.0, b * 0.82), alpha: a)
+    return (top, bottom)
+  }
+
+  private static func initials(from name: String, provider: String?) -> String {
     let parts = name.split(whereSeparator: { $0 == " " || $0 == "-" || $0 == "_" })
-    if parts.isEmpty { return "?" }
-    if parts.count == 1 { return String(parts[0].prefix(1)).uppercased() }
+    if parts.isEmpty {
+      // Never a bare "?": prefer the provider name's first two letters, else nothing
+      // (a clean gradient tile reads better than a question mark).
+      if let provider, !provider.isEmpty { return String(provider.prefix(2)).uppercased() }
+      return ""
+    }
+    // Single-word names (e.g. "Codex") show two letters, not one.
+    if parts.count == 1 { return String(parts[0].prefix(2)).uppercased() }
     return (String(parts[0].prefix(1)) + String(parts[1].prefix(1))).uppercased()
   }
 }

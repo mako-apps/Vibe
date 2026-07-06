@@ -129,6 +129,7 @@ public final class ChatMainView: UIView,
   private let avatarButton = UIButton(type: .system)
   private let avatarImageView = UIImageView()
   private let avatarFallbackIconView = UIImageView()
+  private let avatarFallbackLabel = UILabel()
 
   private let rightActionsStack = UIStackView()
   private let callButton = UIButton(type: .system)
@@ -192,6 +193,7 @@ public final class ChatMainView: UIView,
   private let profileAvatarView = UIView()
   private let profileAvatarImageView = UIImageView()
   private let profileAvatarFallbackIconView = UIImageView()
+  private let profileAvatarFallbackLabel = UILabel()
   private let profileOnlineDotView = UIView()
   private let profileNameLabel = UILabel()
   private let profileHandleLabel = UILabel()
@@ -251,6 +253,10 @@ public final class ChatMainView: UIView,
   private var builderSetupNavigationController: UINavigationController?
   private var lastPresentedBuilderRequestId: String?
   private var lastPresentedBuilderReviewSignature: String?
+  private var avatarGradientStartLight: String?
+  private var avatarGradientEndLight: String?
+  private var avatarGradientStartDark: String?
+  private var avatarGradientEndDark: String?
   private var avatarUri: String = ""
   private var isChatMuted = false
   private var engineChatId: String = ""
@@ -818,6 +824,14 @@ public final class ChatMainView: UIView,
     updateAvatarViews()
   }
 
+  func setAvatarGradientColors(startLight: String?, endLight: String?, startDark: String?, endDark: String?) {
+    avatarGradientStartLight = startLight
+    avatarGradientEndLight = endLight
+    avatarGradientStartDark = startDark
+    avatarGradientEndDark = endDark
+    updateAvatarViews()
+  }
+
   func setIsOnline(_ value: Bool) {
     surfacePresenceOnline = value
     if enginePeerUserId.isEmpty {
@@ -1163,6 +1177,7 @@ public final class ChatMainView: UIView,
     avatarButton.addTarget(self, action: #selector(handleAvatarPressed), for: .touchUpInside)
     avatarButton.addSubview(avatarImageView)
     avatarButton.addSubview(avatarFallbackIconView)
+    avatarButton.addSubview(avatarFallbackLabel)
     avatarButton.addSubview(checkmarkImageView)
     checkmarkImageView.contentMode = .scaleAspectFit
     checkmarkImageView.image = UIImage(systemName: "checkmark.circle.fill")
@@ -1183,6 +1198,13 @@ public final class ChatMainView: UIView,
     avatarFallbackIconView.contentMode = .scaleAspectFit
     avatarFallbackIconView.image = UIImage(systemName: "person.fill")
     avatarFallbackIconView.isHidden = false
+
+    avatarFallbackLabel.textAlignment = .center
+    avatarFallbackLabel.textColor = .white
+    avatarFallbackLabel.font = UIFont.systemFont(ofSize: 20, weight: .semibold)
+    avatarFallbackLabel.adjustsFontSizeToFitWidth = true
+    avatarFallbackLabel.minimumScaleFactor = 0.8
+    avatarFallbackLabel.isHidden = false
 
     chatHeaderStack.axis = .vertical
     chatHeaderStack.alignment = .leading
@@ -3141,6 +3163,7 @@ public final class ChatMainView: UIView,
       backButton.frame = backGlassView.bounds
       titleButton.frame = titleGlassView.bounds
       avatarButton.frame = avatarGlassView.bounds
+      avatarFallbackLabel.frame = avatarButton.bounds
       if headerMode == .savedMessages {
         menuButton.frame = savedSearchExpanded
           ? CGRect(x: 10.0, y: 0.0, width: 20.0, height: 44.0)
@@ -3435,6 +3458,7 @@ public final class ChatMainView: UIView,
     profileAvatarView.layer.cornerRadius = avatarSize * 0.5
     profileAvatarImageView.frame = profileAvatarView.bounds
     profileAvatarFallbackIconView.frame = profileAvatarView.bounds.insetBy(dx: 30.0, dy: 30.0)
+    profileAvatarFallbackLabel.frame = profileAvatarView.bounds
     let onlineDotSize: CGFloat = 20.0
     profileOnlineDotView.frame = CGRect(
       x: profileAvatarView.bounds.width - onlineDotSize - 4.0,
@@ -4391,7 +4415,9 @@ public final class ChatMainView: UIView,
       avatarImageView.isHidden = true
       profileAvatarImageView.isHidden = true
       avatarFallbackIconView.isHidden = false
+      avatarFallbackLabel.isHidden = true
       profileAvatarFallbackIconView.isHidden = false
+      profileAvatarFallbackLabel.isHidden = true
       
       avatarFallbackIconView.image = UIImage(systemName: "bookmark.fill")
       avatarFallbackIconView.tintColor = .white
@@ -4430,12 +4456,16 @@ public final class ChatMainView: UIView,
     profileAvatarView.layer.sublayers?.removeAll(where: { $0.name == "savedMessagesGradient" })
     profileAvatarView.layer.sublayers?.removeAll(where: { $0.name == "userAvatarGradient" })
 
-    avatarFallbackIconView.image = UIImage(systemName: "person.fill")
-    avatarFallbackIconView.tintColor = .white
+    avatarFallbackIconView.isHidden = true
+    avatarFallbackLabel.isHidden = false
+    let initials = ChatHomeCardCell.getFallbackInitials(from: chatTitleLabel.text ?? "")
+    avatarFallbackLabel.text = initials
+    
     applyUserAvatarGradient()
 
-    profileAvatarFallbackIconView.image = UIImage(systemName: "person.fill")
-    profileAvatarFallbackIconView.tintColor = .white
+    profileAvatarFallbackIconView.isHidden = true
+    profileAvatarFallbackLabel.isHidden = false
+    profileAvatarFallbackLabel.text = initials
 
     let rawAvatar = avatarUri
     let peerUserId = enginePeerUserIdRaw
@@ -4482,9 +4512,45 @@ public final class ChatMainView: UIView,
     profileAvatarView.backgroundColor = .clear
   }
 
+  private static func color(fromHex hex: String) -> UIColor? {
+    var hexSanitized = hex.trimmingCharacters(in: .whitespacesAndNewlines)
+    hexSanitized = hexSanitized.replacingOccurrences(of: "#", with: "")
+
+    var rgb: UInt64 = 0
+    guard Scanner(string: hexSanitized).scanHexInt64(&rgb) else { return nil }
+
+    let r, g, b, a: CGFloat
+    if hexSanitized.count == 6 {
+      r = CGFloat((rgb & 0xFF0000) >> 16) / 255.0
+      g = CGFloat((rgb & 0x00FF00) >> 8) / 255.0
+      b = CGFloat(rgb & 0x0000FF) / 255.0
+      a = 1.0
+    } else if hexSanitized.count == 8 {
+      r = CGFloat((rgb & 0xFF000000) >> 24) / 255.0
+      g = CGFloat((rgb & 0x00FF0000) >> 16) / 255.0
+      b = CGFloat((rgb & 0x0000FF00) >> 8) / 255.0
+      a = CGFloat(rgb & 0x000000FF) / 255.0
+    } else {
+      return nil
+    }
+    return UIColor(red: r, green: g, blue: b, alpha: a)
+  }
+
   private func userAvatarGradientColors() -> (UIColor, UIColor) {
-    ChatProfileAppearanceStore.avatarColors(
-      title: chatTitleText,
+    if appearance.isDark {
+      if let start = avatarGradientStartDark, let startColor = Self.color(fromHex: start),
+         let end = avatarGradientEndDark, let endColor = Self.color(fromHex: end) {
+        return (startColor, endColor)
+      }
+    } else {
+      if let start = avatarGradientStartLight, let startColor = Self.color(fromHex: start),
+         let end = avatarGradientEndLight, let endColor = Self.color(fromHex: end) {
+        return (startColor, endColor)
+      }
+    }
+    
+    return ChatProfileAppearanceStore.avatarColors(
+      title: chatTitleLabel.text ?? "",
       peerUserId: enginePeerUserIdRaw,
       chatId: engineChatId
     )

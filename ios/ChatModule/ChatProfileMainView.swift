@@ -1152,6 +1152,16 @@ private struct ChatProfileSwiftUIRootView: View {
   let appearanceSelection: ChatProfileAppearanceSelection
   let hasProfileImage: Bool
   let avatarUri: String?
+  // The REAL top safe-area inset (status bar / Dynamic Island height), passed in
+  // from the hosting UIView. The hosting controller runs with `safeAreaRegions =
+  // []` so the hero backdrop can bleed full-screen under the notch — but that
+  // also zeroes `geometry.safeAreaInsets.top`, which every piece of chrome (the
+  // overlay header, the hero top offset, the sticky-title threshold) needs to
+  // clear the status bar. Reading `geometry.safeAreaInsets.top` here returns 0
+  // and collapses all that chrome up behind the notch (invisible header) while
+  // the UIKit floating avatar — which uses the real inset — stays put, producing
+  // the header-missing + content-shift bugs. Use THIS value for chrome instead.
+  let safeAreaTop: CGFloat
   let isGroupOrChannel: Bool
   let isGroupOwner: Bool
   let memberCount: Int?
@@ -1252,7 +1262,7 @@ private struct ChatProfileSwiftUIRootView: View {
           ScrollView(.vertical, showsIndicators: true) {
             LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
               offsetReader(
-                safeTop: geometry.safeAreaInsets.top,
+                safeTop: safeAreaTop,
                 heroHeight: heroContentHeight(for: geometry)
               )
 
@@ -1335,57 +1345,15 @@ private struct ChatProfileSwiftUIRootView: View {
         .background(Color.clear)
         .ignoresSafeArea(edges: .top)
         .toolbar(.hidden, for: .navigationBar)
-
-        // Custom Overlay Header to avoid NavigationStack jumping
-        if navCoordinator.path.isEmpty {
-          VStack {
-            HStack {
-              Button {
-                onAction("headerBack")
-              } label: {
-                Image(systemName: "chevron.left")
-                  .font(.system(size: 18, weight: .semibold))
-                  .padding(12)
-              }
-              Spacer()
-              Text(profileName)
-                .font(.system(size: 17, weight: .semibold))
-                .lineLimit(1)
-                .minimumScaleFactor(0.78)
-                .opacity(stickyTitleVisible ? 1 : 0)
-                .animation(.easeInOut(duration: 0.16), value: stickyTitleVisible)
-                .accessibilityHidden(!stickyTitleVisible)
-              Spacer()
-              Menu {
-                Button(isChatMuted ? "Unmute" : "Mute") { onAction("muteToggle") }
-                Button("Search") { onAction("search") }
-                if isGroupOrChannel {
-                  if canManageGroupMembers {
-                    Button("Edit Group") { onAction("editGroup") }
-                  }
-                  if isGroupOwner {
-                    Button("Delete Group", role: .destructive) { onAction("deleteGroup") }
-                  } else {
-                    Button("Leave Group", role: .destructive) { onAction("leaveGroup") }
-                  }
-                } else {
-                  Button("Share Contact") { onAction("shareContact") }
-                  Button("Block Contact", role: .destructive) { onAction("block") }
-                }
-              } label: {
-                Image(systemName: "ellipsis")
-                  .font(.system(size: 18, weight: .semibold))
-                  .padding(12)
-              }
-            }
-            .padding(.horizontal, 4)
-            // Dynamically adapt color: white over the dark hero image, primary over the sticky material
-            .foregroundStyle(stickyTitleVisible ? AnyShapeStyle(.primary) : AnyShapeStyle(.white))
-            .animation(.easeInOut(duration: 0.16), value: stickyTitleVisible)
-            Spacer()
-          }
-          .zIndex(100) // Ensure it draws over the ScrollView
-        }
+        // Header is a top-anchored OVERLAY on the (safe-area-ignoring) ZStack,
+        // NOT a second sibling view inside the NavigationStack root. Two bare
+        // siblings in a NavigationStack builder don't reliably z-stack — the
+        // header was getting mis-laid-out / swallowed, which is why it "didn't
+        // show at all." An overlay is guaranteed to draw over its target and is
+        // anchored to the screen top; `.padding(.top, safeAreaTop)` then drops it
+        // below the notch (the host strips the safe area, so there's no automatic
+        // inset to rely on).
+        .overlay(alignment: .top) { overlayHeader }
       }
       .navigationDestination(for: ChatProfileSwiftUIDestination.self) { destination in
         if case .bridgeSession = destination {
@@ -1520,9 +1488,72 @@ private struct ChatProfileSwiftUIRootView: View {
     }
   }
 
+  // The floating nav header (back / sticky title / menu). Only shown at the
+  // profile root — hidden once a destination is pushed onto the NavigationStack.
+  @ViewBuilder
+  private var overlayHeader: some View {
+    if navCoordinator.path.isEmpty {
+      HStack {
+        Button {
+          onAction("headerBack")
+        } label: {
+          Image(systemName: "chevron.left")
+            .font(.system(size: 18, weight: .semibold))
+            .padding(12)
+            .contentShape(Rectangle())
+        }
+        Spacer()
+        Text(profileName)
+          .font(.system(size: 17, weight: .semibold))
+          .lineLimit(1)
+          .minimumScaleFactor(0.78)
+          .opacity(stickyTitleVisible ? 1 : 0)
+          .animation(.easeInOut(duration: 0.16), value: stickyTitleVisible)
+          .accessibilityHidden(!stickyTitleVisible)
+        Spacer()
+        Menu {
+          Button(isChatMuted ? "Unmute" : "Mute") { onAction("muteToggle") }
+          Button("Search") { onAction("search") }
+          if isGroupOrChannel {
+            if canManageGroupMembers {
+              Button("Edit Group") { onAction("editGroup") }
+            }
+            if isGroupOwner {
+              Button("Delete Group", role: .destructive) { onAction("deleteGroup") }
+            } else {
+              Button("Leave Group", role: .destructive) { onAction("leaveGroup") }
+            }
+          } else {
+            Button("Share Contact") { onAction("shareContact") }
+            Button("Block Contact", role: .destructive) { onAction("block") }
+          }
+        } label: {
+          Image(systemName: "ellipsis")
+            .font(.system(size: 18, weight: .semibold))
+            .padding(12)
+            .contentShape(Rectangle())
+        }
+      }
+      .padding(.horizontal, 4)
+      // The top overlay already lands below the status bar / Dynamic Island (it
+      // honors the real safe area, unlike the scroll view which explicitly
+      // ignores it), so only a small breathing gap is needed here — adding the
+      // full safeAreaTop again pushed the row a whole inset too far down.
+      .padding(.top, 4)
+      .frame(maxWidth: .infinity)
+      // Dynamically adapt color: white over the dark hero image, primary over the sticky material
+      .foregroundStyle(stickyTitleVisible ? AnyShapeStyle(.primary) : AnyShapeStyle(.white))
+      .animation(.easeInOut(duration: 0.16), value: stickyTitleVisible)
+    }
+  }
+
   private func heroContentHeight(for geometry: GeometryProxy) -> CGFloat {
     guard hasProfileImage else {
-      return NativeProfileAvatarHeroMetrics.expandedTop(for: geometry.safeAreaInsets.top)
+      // Use the real inset (safeAreaTop), not geometry.safeAreaInsets.top — the
+      // latter is 0 here (host strips safe area) so the hero would sit too high
+      // and diverge from the UIKit floating avatar by exactly the status-bar
+      // height, which is the visible "inner element shift" on chat→profile.
+      return NativeProfileAvatarHeroMetrics.expandedTop(for: safeAreaTop)
         + NativeProfileAvatarHeroMetrics.expandedSize
         + 18
     }
@@ -1534,29 +1565,29 @@ private struct ChatProfileSwiftUIRootView: View {
   }
 
   private var actionRow: some View {
-    GlassEffectContainer(spacing: 18) {
-      HStack(spacing: 18) {
-        ChatProfileSwiftUIActionButton(
-          title: isChatMuted ? "Unmute" : "Mute",
-          systemImage: isChatMuted ? "bell" : "bell.slash",
-          fill: rowFill
-        ) {
-          onAction("muteToggle")
-        }
+    HStack(spacing: 24) {
+      ChatProfileSwiftUIActionButton(
+        title: isChatMuted ? "Unmute" : "Mute",
+        systemImage: isChatMuted ? "bell" : "bell.slash",
+        fill: rowFill
+      ) {
+        onAction("muteToggle")
+      }
 
-        ChatProfileSwiftUIActionButton(title: "Search", systemImage: "magnifyingglass", fill: rowFill) {
-          onAction("search")
-        }
+      ChatProfileSwiftUIActionButton(title: "Search", systemImage: "magnifyingglass", fill: rowFill) {
+        onAction("search")
+      }
 
-        ChatProfileSwiftUIActionButton(title: "Call", systemImage: "phone", fill: rowFill) {
-          onAction("audio")
-        }
+      ChatProfileSwiftUIActionButton(title: "Call", systemImage: "phone", fill: rowFill) {
+        onAction("audio")
+      }
 
-        ChatProfileSwiftUIActionButton(title: "Video", systemImage: "video", fill: rowFill) {
-          onAction("video")
-        }
+      ChatProfileSwiftUIActionButton(title: "Video", systemImage: "video", fill: rowFill) {
+        onAction("video")
       }
     }
+    .padding(.horizontal, 24)
+    .padding(.vertical, 8)
   }
 
   @ViewBuilder
@@ -3056,20 +3087,12 @@ private struct ChatProfileSwiftUIActionButton: View {
 
   var body: some View {
     Button(action: action) {
-      VStack(spacing: 7) {
-        Image(systemName: systemImage)
-          .font(.system(size: 22, weight: .semibold))
-          .frame(width: 52, height: 52)
-          .glassEffect(.regular.tint(fill).interactive(), in: .circle)
-          .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.18 : 0.08), radius: 10, x: 0, y: 5)
-
-        Text(title)
-          .font(.system(size: 12, weight: .semibold))
-          .lineLimit(1)
-          .minimumScaleFactor(0.75)
-      }
-      .foregroundStyle(.primary)
-      .frame(maxWidth: .infinity)
+      Image(systemName: systemImage)
+        .font(.system(size: 22, weight: .regular))
+        .frame(width: 52, height: 52)
+        .glassEffect(.regular.tint(fill).interactive(), in: .circle)
+        .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.18 : 0.08), radius: 10, x: 0, y: 5)
+        .foregroundStyle(.primary)
     }
     .buttonStyle(.plain)
   }
@@ -3681,6 +3704,10 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   private let tableView = UITableView(frame: .zero, style: .insetGrouped)
   private let swiftUIContainerView = UIView()
   private var swiftUIHostingController: UIHostingController<AnyView>?
+  // Top safe-area inset handed to the SwiftUI root at the last render. Tracked so
+  // safeAreaInsetsDidChange can re-render only when the real inset actually
+  // arrives (first render often runs pre-window with a 0 inset).
+  private var lastRenderedSafeAreaTop: CGFloat = -1.0
   private let floatingAvatarView: NativeProfileAvatarView
 
   private let heroHeaderView = UIView()
@@ -3792,6 +3819,31 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     super.safeAreaInsetsDidChange()
     updateAvatarMetrics()
     setNeedsLayout()
+    // The SwiftUI root is handed the real top inset (safeAreaTop) explicitly —
+    // if the first render happened before the view had a window (inset == 0),
+    // the header/hero were positioned for a 0 inset. Re-render now that the real
+    // inset has landed so the header drops below the notch and the hero lines up
+    // with the UIKit floating avatar.
+    if lastRenderedSafeAreaTop != resolvedSafeAreaTop() {
+      renderSwiftUIProfile()
+    }
+  }
+
+  /// The real top safe-area inset to hand the SwiftUI root. Prefers this view's
+  /// own inset; falls back to the key window's while the view isn't yet in a
+  /// window (its own inset is still 0 then). Chrome positioning depends on this
+  /// being the true status-bar/Dynamic-Island height, not the host-stripped 0.
+  private func resolvedSafeAreaTop() -> CGFloat {
+    if safeAreaInsets.top > 0 { return safeAreaInsets.top }
+    return Self.keyWindowSafeAreaTop()
+  }
+
+  private static func keyWindowSafeAreaTop() -> CGFloat {
+    UIApplication.shared.connectedScenes
+      .compactMap { $0 as? UIWindowScene }
+      .flatMap { $0.windows }
+      .first { $0.isKeyWindow }?
+      .safeAreaInsets.top ?? 0.0
   }
 
   override func didMoveToWindow() {
@@ -4248,6 +4300,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       return
     }
 
+    lastRenderedSafeAreaTop = resolvedSafeAreaTop()
+
     let resolvedName =
       profileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
       ? (headerTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "User" : headerTitle)
@@ -4266,6 +4320,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       appearanceSelection: currentAppearanceSelection(resolvedName: resolvedName),
       hasProfileImage: hasResolvedProfileImage,
       avatarUri: resolvedAvatarImageUriForSwiftUI(),
+      safeAreaTop: resolvedSafeAreaTop(),
       isGroupOrChannel: isGroupOrChannel,
       isGroupOwner: isGroupOwner,
       memberCount: groupMemberCount ?? (groupMembers.isEmpty ? nil : groupMembers.count),
