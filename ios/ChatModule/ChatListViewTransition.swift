@@ -1,2 +1,2 @@
 import UIKit
-// Moved to TelegramSendMorphProfile.swift
+// Moved to SendMorphProfile.swift

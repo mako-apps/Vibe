@@ -299,6 +299,34 @@ defmodule VibeWeb.AgentBridgeChannel do
     {:reply, :ok, socket}
   end
 
+  # daemon → server: a previously-issued `ask_request` was resolved elsewhere (answered
+  # at the desk, or the caller timed out/disconnected). Tell the phone to dismiss the
+  # now-stale ask/command sheet and drop the buffered pending ask so it isn't replayed.
+  def handle_in("ask_cancel", payload, socket) when is_map(payload) do
+    chat_id = payload["chatId"] || payload["chat_id"]
+    request_id = payload["requestId"] || payload["request_id"]
+
+    if is_binary(chat_id) and chat_id != "" do
+      Logger.info(
+        "[AgentBridge][ask] cancel user=#{socket.assigns.user_id} chat=#{chat_id} " <>
+          "requestId=#{inspect(request_id)} reason=#{inspect(payload["reason"])} " <>
+          "→ broadcast chat:#{chat_id}/agent-bridge-ask-cancel"
+      )
+
+      if is_binary(request_id) do
+        Vibe.AgentBridge.clear_pending_ask(chat_id, request_id)
+      end
+
+      VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-bridge-ask-cancel", payload)
+    else
+      Logger.info(
+        "[AgentBridge][ask] cancel DROPPED — no chatId user=#{socket.assigns.user_id} requestId=#{inspect(request_id)}"
+      )
+    end
+
+    {:reply, :ok, socket}
+  end
+
   # daemon → server: acknowledgement for a phone-issued task control action.
   def handle_in("control_result", payload, socket) do
     Logger.info(

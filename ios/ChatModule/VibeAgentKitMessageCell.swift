@@ -2156,8 +2156,8 @@ final class VibeAgentKitMessageCell: UITableViewCell {
 
     rowTopConstraint = rowContainer.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 6.0)
     rowBottomConstraint = rowContainer.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -6.0)
-    leadingConstraint = messageContainerView.leadingAnchor.constraint(equalTo: rowContainer.leadingAnchor, constant: 8.0)
-    trailingConstraint = messageContainerView.trailingAnchor.constraint(equalTo: rowContainer.trailingAnchor, constant: -8.0)
+    leadingConstraint = messageContainerView.leadingAnchor.constraint(equalTo: rowContainer.leadingAnchor, constant: 4.0)
+    trailingConstraint = messageContainerView.trailingAnchor.constraint(equalTo: rowContainer.trailingAnchor, constant: -4.0)
     assistantMaxWidthConstraint = messageContainerView.widthAnchor.constraint(
       lessThanOrEqualTo: rowContainer.widthAnchor,
       multiplier: 0.85
@@ -2199,8 +2199,8 @@ final class VibeAgentKitMessageCell: UITableViewCell {
     userExpandWidthConstraint = userExpandButton.widthAnchor.constraint(equalToConstant: 42.0)
 
     assistantTopConstraint = assistantBodyView.topAnchor.constraint(equalTo: messageContainerView.topAnchor, constant: 4.0)
-    assistantLeadingConstraint = assistantBodyView.leadingAnchor.constraint(equalTo: messageContainerView.leadingAnchor, constant: 12.0)
-    assistantTrailingConstraint = assistantBodyView.trailingAnchor.constraint(equalTo: messageContainerView.trailingAnchor, constant: -12.0)
+    assistantLeadingConstraint = assistantBodyView.leadingAnchor.constraint(equalTo: messageContainerView.leadingAnchor, constant: 8.0)
+    assistantTrailingConstraint = assistantBodyView.trailingAnchor.constraint(equalTo: messageContainerView.trailingAnchor, constant: -8.0)
     assistantBottomConstraint = assistantBodyView.bottomAnchor.constraint(equalTo: messageContainerView.bottomAnchor, constant: -4.0)
 
     userTextHeightConstraint.priority = .defaultHigh
@@ -2212,8 +2212,8 @@ final class VibeAgentKitMessageCell: UITableViewCell {
 
     NSLayoutConstraint.activate([
       rowTopConstraint,
-      rowContainer.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20.0),
-      rowContainer.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20.0),
+      rowContainer.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 8.0),
+      rowContainer.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -8.0),
       rowBottomConstraint,
 
       messageContainerView.topAnchor.constraint(equalTo: rowContainer.topAnchor),
@@ -2422,8 +2422,8 @@ final class VibeAgentKitCompactionCell: UITableViewCell {
 
     NSLayoutConstraint.activate([
       headerControl.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 10.0),
-      headerControl.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20.0),
-      headerControl.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20.0),
+      headerControl.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 8.0),
+      headerControl.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -8.0),
       headerControl.heightAnchor.constraint(equalToConstant: 24.0),
 
       pill.centerXAnchor.constraint(equalTo: headerControl.centerXAnchor),
@@ -2455,8 +2455,8 @@ final class VibeAgentKitCompactionCell: UITableViewCell {
       rightRule.heightAnchor.constraint(equalToConstant: 1.0),
 
       summaryTopConstraint,
-      summaryLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20.0),
-      summaryLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20.0),
+      summaryLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 8.0),
+      summaryLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -8.0),
       summaryLabel.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -10.0),
     ])
   }
@@ -2532,7 +2532,25 @@ final class VibeAgentKitStepDetailViewController: UIViewController {
 
   override func viewDidLoad() {
     super.viewDidLoad()
-    view.backgroundColor = appearance.background
+    view.backgroundColor = .clear
+
+    let glassView = UIVisualEffectView(effect: nil)
+    if #available(iOS 26.0, *) {
+      let glass = UIGlassEffect()
+      glass.isInteractive = true
+      glassView.effect = glass
+    } else {
+      glassView.effect = UIBlurEffect(
+        style: appearance.isDark ? .systemChromeMaterialDark : .systemChromeMaterialLight)
+    }
+    glassView.translatesAutoresizingMaskIntoConstraints = false
+    view.insertSubview(glassView, at: 0)
+    NSLayoutConstraint.activate([
+      glassView.topAnchor.constraint(equalTo: view.topAnchor),
+      glassView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      glassView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      glassView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+    ])
 
     let kind = (item.itemType ?? item.tool ?? "").lowercased()
     navigationItem.title = stepTitle(kind: kind)
@@ -2542,6 +2560,7 @@ final class VibeAgentKitStepDetailViewController: UIViewController {
 
     scrollView.translatesAutoresizingMaskIntoConstraints = false
     scrollView.alwaysBounceVertical = true
+    scrollView.backgroundColor = .clear
     view.addSubview(scrollView)
 
     stack.translatesAutoresizingMaskIntoConstraints = false
@@ -2561,9 +2580,9 @@ final class VibeAgentKitStepDetailViewController: UIViewController {
       stack.bottomAnchor.constraint(
         equalTo: scrollView.contentLayoutGuide.bottomAnchor, constant: -28.0),
       stack.leadingAnchor.constraint(
-        equalTo: scrollView.frameLayoutGuide.leadingAnchor, constant: 20.0),
+        equalTo: scrollView.frameLayoutGuide.leadingAnchor, constant: 8.0),
       stack.trailingAnchor.constraint(
-        equalTo: scrollView.frameLayoutGuide.trailingAnchor, constant: -20.0),
+        equalTo: scrollView.frameLayoutGuide.trailingAnchor, constant: -8.0),
     ])
 
     buildContent(kind: kind)

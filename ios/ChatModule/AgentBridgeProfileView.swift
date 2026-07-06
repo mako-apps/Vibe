@@ -53,6 +53,8 @@ struct AgentBridgeConnectionSheet: View {
 
   @State private var isWorking = false
   @State private var errorMessage: String?
+  @State private var transportPreference: AgentBridgeTransportPreference = AgentBridgeTransport.preference
+  @State private var lanState: LanBridgeService.State = LanBridgeService.shared.currentState
 
   private var palette: AppThemePalette { AppThemePalette.resolve(for: colorScheme) }
 
@@ -71,6 +73,8 @@ struct AgentBridgeConnectionSheet: View {
           }
 
           connectionCard
+
+          transportCard
 
           VStack(alignment: .leading, spacing: 11) {
             infoRow(
@@ -160,8 +164,16 @@ struct AgentBridgeConnectionSheet: View {
         }
       }
     }
-    .onAppear { model.startPolling() }
+    .onAppear {
+      model.startPolling()
+      // Kick off local-network discovery of the paired Mac. First run here triggers the
+      // iOS local-network permission prompt; thereafter it finds + authenticates the bridge.
+      LanBridgeService.shared.start(userId: nil)
+    }
     .onDisappear { model.stopPolling() }
+    .onReceive(NotificationCenter.default.publisher(for: LanBridgeService.stateChangedNotification)) { _ in
+      lanState = LanBridgeService.shared.currentState
+    }
     .fullScreenCover(isPresented: $model.isScanning) {
       AgentQRScannerView(
         instruction: "Scan the QR shown on your computer",
@@ -218,6 +230,84 @@ struct AgentBridgeConnectionSheet: View {
       RoundedRectangle(cornerRadius: 20, style: .continuous)
         .stroke(palette.border.opacity(0.75), lineWidth: 0.7)
     )
+  }
+
+  // Auto / Local / Cloud transport control. Auto uses the direct Wi-Fi link to the Mac when
+  // reachable and the cloud relay otherwise; the status line reflects live LAN discovery.
+  @ViewBuilder
+  private var transportCard: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      Text("Connection")
+        .font(.system(size: 13, weight: .semibold))
+        .foregroundStyle(palette.secondaryText)
+
+      Picker("Connection", selection: $transportPreference) {
+        Text("Auto").tag(AgentBridgeTransportPreference.auto)
+        Text("Local").tag(AgentBridgeTransportPreference.local)
+        Text("Cloud").tag(AgentBridgeTransportPreference.cloud)
+      }
+      .pickerStyle(.segmented)
+      .onChange(of: transportPreference) { newValue in
+        AgentBridgeTransport.preference = newValue
+        LanBridgeService.shared.applyPreference(newValue)
+      }
+
+      HStack(spacing: 8) {
+        Circle()
+          .fill(lanStatusColor)
+          .frame(width: 8, height: 8)
+        Text(lanStatusText)
+          .font(.system(size: 13, weight: .medium))
+          .foregroundStyle(palette.text)
+      }
+
+      Text(transportHintText)
+        .font(.system(size: 12))
+        .foregroundStyle(palette.secondaryText)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+    .padding(16)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(
+      RoundedRectangle(cornerRadius: 20, style: .continuous)
+        .fill(palette.card)
+    )
+    .overlay(
+      RoundedRectangle(cornerRadius: 20, style: .continuous)
+        .stroke(palette.border.opacity(0.75), lineWidth: 0.7)
+    )
+  }
+
+  private var lanStatusColor: Color {
+    switch lanState {
+    case .authenticated: return .green
+    case .found, .connecting: return .orange
+    case .failed: return palette.danger
+    default: return palette.secondaryText.opacity(0.6)
+    }
+  }
+
+  private var lanStatusText: String {
+    switch lanState {
+    case .unavailable: return "Local link needs the sync key"
+    case .idle: return transportPreference == .cloud ? "Cloud relay (Local off)" : "Local link idle"
+    case .searching: return "Searching for your Mac on Wi-Fi…"
+    case .found(let name): return "Found \(name) — connecting…"
+    case .connecting: return "Connecting to your Mac…"
+    case .authenticated(let name): return "Local link ready · \(name)"
+    case .failed: return "Local link unavailable — using cloud"
+    }
+  }
+
+  private var transportHintText: String {
+    switch transportPreference {
+    case .auto:
+      return "Uses the direct Wi-Fi link to your Mac when you're on the same network, and the cloud relay when you're away."
+    case .local:
+      return "Direct to your Mac on the same Wi-Fi only — fastest and most private. Won't connect when you're away."
+    case .cloud:
+      return "Always via the cloud relay. Works from anywhere, at the cost of a round-trip through the server."
+    }
   }
 
   private func statusRow(

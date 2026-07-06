@@ -883,6 +883,24 @@ final class BubbleBackgroundView: UIView {
     min(radius, height)
   }
 
+  /// Clamped per-corner radii of the current shape at the current bounds. The
+  /// send morph builds the plate raster's stretch-safe cap insets and the clip
+  /// envelope's settled rounding from these (a grouped consecutive send has a
+  /// reduced top-trailing radius that must be honored during the flight, not
+  /// snapped in at reveal).
+  func transitionCornerRadii() -> (
+    topLeft: CGFloat, topRight: CGFloat, bottomLeft: CGFloat, bottomRight: CGFloat
+  ) {
+    let width = max(1.0, bounds.width)
+    let height = max(1.0, bounds.height)
+    let limit = min(width, height) * 0.5
+    func clamp(_ value: CGFloat) -> CGFloat { min(max(0.0, value), limit) }
+    return (
+      clamp(shape.borderTopLeftRadius), clamp(shape.borderTopRightRadius),
+      clamp(shape.borderBottomLeftRadius), clamp(shape.borderBottomRightRadius)
+    )
+  }
+
   /// The region the integrated tail ADDS on top of the plain rounded-rect body:
   /// bounded by the bottom corner arc on the inside and the tail's two quad
   /// curves on the outside. The joins sit ON the corner arc (see
@@ -1124,6 +1142,12 @@ struct ChatMessageBubbleLayoutMetrics {
   // the bubble hugs the shimmer line and is centered in the row instead of stretched to
   // the full agent width. Defaulted so every existing call site is unaffected.
   var agentTurnCentered: Bool = false
+  // Tall-content collapse — one shared rule for user text, agent text and settled
+  // agent-turn bubbles. `tallToggleVisible` means the bubble reserves the
+  // "Show more"/"Show less" bar; `tallCollapsed` means the content is currently capped
+  // to `tallBubbleCollapsedContentHeight`. Defaulted so existing call sites compile.
+  var tallToggleVisible: Bool = false
+  var tallCollapsed: Bool = false
 }
 
 private struct ChatBubbleMetaWidths {
@@ -1143,6 +1167,10 @@ struct AgentTurnBubbleState: Equatable {
   var isRuntimeExpanded: Bool = false
   var expandedStepIds: Set<String> = []
   var streamingStartDate: Date? = nil
+  // Tall-bubble expand state. Despite living in the agent-turn struct (it rides the
+  // existing measure/configure threading), this applies to ANY tall bubble — user
+  // text included — via the shared tall-content collapse in measureMessageBubbleLayout.
+  var tallExpanded: Bool = false
 }
 
 private func measuredTextWidth(_ text: String, font: UIFont) -> CGFloat {
@@ -2521,6 +2549,18 @@ func isPlaceholderThinkingProgressItem(_ item: VibeAgentKitProgressItem) -> Bool
   return !hasDetail && (label == "thinking" || label == "thinking...")
 }
 
+/// Whether the agent bubble should render the body view's loader line. Only a SETTLED
+/// turn shows it — the tappable "Worked for Xs · N steps" summary (same affordance as
+/// the full agent view; tap opens the glass detail sheet via `onLoaderTap` →
+/// `openAgentTurnDetail`). Mid-run the loader stays hidden: the bubble's live feed
+/// already carries the working state at its edge, so a second shimmer line at the top
+/// would duplicate it. Must be passed identically to `measuredHeight` and
+/// `configure(row:)` or the measured bubble height won't match what renders.
+func agentTurnBubbleShowsWorkedSummary(_ row: ChatListRow) -> Bool {
+  let message = VibeAgentKitMap.chatMessage(from: row)
+  return !(message.isStreaming && !message.hasFinalResponseText)
+}
+
 /// Width the compact "thinking" bubble should hug: the shimmer line (icon + label) plus a
 /// little slack, capped by the caller at maxContentWidth. Mirrors the loader's own text
 /// choice + font (systemFont 14.5 medium) so the bubble tracks the shimmer without
@@ -2596,21 +2636,43 @@ func measureMessageBubbleLayout(
       isRuntimeExpanded: agentTurnState.isRuntimeExpanded,
       expandedStepIds: agentTurnState.expandedStepIds,
       streamingStartDate: agentTurnState.streamingStartDate,
-      showsLoaderView: false
+      showsLoaderView: agentTurnBubbleShowsWorkedSummary(row)
     )
     let hasReaction = row.reactionEmoji != nil && row.reactionEmoji?.isEmpty == false
     let reactionHeightOffset: CGFloat = hasReaction ? 28.0 : 0.0
     let bubbleWidth = max(bubbleMinWidth, contentWidth + (agentTurnHorizontalPadding * 2.0))
+    // Same tall-content collapse as plain text bubbles, but only once the turn SETTLES —
+    // a live feed keeps growing and pinning it to the cap would fight the stream (and the
+    // list's bottom pin). Collapsed content is clipped by the cell (clipsToBounds).
+    let tallToggleVisible =
+      previewHeight > tallBubbleCollapseTriggerHeight && agentTurnBubbleShowsWorkedSummary(row)
+    let tallCollapsed = tallToggleVisible && !agentTurnState.tallExpanded
+    let contentHeight = tallCollapsed ? tallBubbleCollapsedContentHeight : previewHeight
+    let tallToggleReserve: CGFloat =
+      tallToggleVisible ? (tallBubbleToggleSpacing + tallBubbleToggleHeight) : 0.0
     let bubbleHeight = max(
       44.0,
-      previewHeight + agentTurnVerticalPadding + agentTurnVerticalPadding + reactionHeightOffset
+      contentHeight + tallToggleReserve
+        + agentTurnVerticalPadding + agentTurnVerticalPadding + reactionHeightOffset
     )
-    return ChatMessageBubbleLayoutMetrics(
+    // DIAGNOSTIC (live-turn empty-bubble): compare what the sizing pass measured against
+    // what the render pass draws. An empty on-screen bubble with items>0 here means the
+    // content exists but is clipped/misplaced; h≈44 with items>0 means the measurement
+    // itself collapsed.
+    if row.isStreamingText || (row.status ?? "").lowercased() == "running" {
+      NSLog(
+        "[AgentMeasure] id=%@ compact=%@ items=%d width=%.0f previewH=%.1f bubbleH=%.1f",
+        String((row.messageId ?? "-").suffix(14)),
+        compact ? "Y" : "N",
+        row.agentProgressNodes.count,
+        contentWidth, previewHeight, bubbleHeight)
+    }
+    var metrics = ChatMessageBubbleLayoutMetrics(
       bubbleWidth: bubbleWidth,
       bubbleHeight: bubbleHeight,
       messageWidth: contentWidth,
-      textHeight: previewHeight,
-      bodyHeight: previewHeight,
+      textHeight: contentHeight,
+      bodyHeight: contentHeight,
       metaWidth: 0.0,
       contentWidth: contentWidth,
       mediaHeight: 0.0,
@@ -2625,6 +2687,9 @@ func measureMessageBubbleLayout(
       usesRichTextLayout: false,
       agentTurnCentered: compact
     )
+    metrics.tallToggleVisible = tallToggleVisible
+    metrics.tallCollapsed = tallCollapsed
+    return metrics
   }
 
   if usesTransparentAgentStreamingLayout(row) {
@@ -2811,30 +2876,56 @@ func measureMessageBubbleLayout(
   let replyPreviewHeight = showsReplyPreview ? bubbleReplyPreviewHeight : 0.0
   let replyPreviewBlockHeight =
     showsReplyPreview ? (bubbleReplyPreviewHeight + bubbleReplyPreviewSpacing) : 0.0
-  let usesBottomMetaLayout = usesRichTextLayout || previewHeight > 0.0 || usesRTLColumn
+  var usesBottomMetaLayout = usesRichTextLayout || previewHeight > 0.0 || usesRTLColumn
+  let font =
+    row.messageType == "typing"
+    ? UIFont.systemFont(ofSize: 13, weight: .regular) : bubbleMessageFont
+  let measureText: (CGFloat) -> (width: CGFloat, height: CGFloat) = { availableWidth in
+    if usesRichTextLayout {
+      let measured = measureBubbleRichText(for: row, availableWidth: availableWidth)
+      return (
+        min(availableWidth, max(measured.maxWidth, previewHeight > 0.0 ? bubbleLinkPreviewMinWidth : 0.0)),
+        measured.height
+      )
+    }
+    let displayText = bubbleDisplayAttributedString(for: row, font: font)
+    let textRect = displayText.boundingRect(
+      with: CGSize(width: availableWidth, height: .greatestFiniteMagnitude),
+      options: [.usesLineFragmentOrigin, .usesFontLeading],
+      context: nil
+    )
+    return (min(availableWidth, ceil(textRect.width)), ceil(textRect.height))
+  }
   let textMaxWidth: CGFloat =
     showsInlineAttachment || usesBottomMetaLayout
     ? maxContentWidth
     : max(1.0, maxContentWidth - meta.total - bubbleMetaInlineSpacing)
-  let font =
-    row.messageType == "typing"
-    ? UIFont.systemFont(ofSize: 13, weight: .regular) : bubbleMessageFont
-  let textWidth: CGFloat
-  let textHeight: CGFloat
-  if usesRichTextLayout {
-    let measured = measureBubbleRichText(for: row, availableWidth: textMaxWidth)
-    textWidth = min(textMaxWidth, max(measured.maxWidth, previewHeight > 0.0 ? bubbleLinkPreviewMinWidth : 0.0))
-    textHeight = measured.height
-  } else {
-    let displayText = bubbleDisplayAttributedString(for: row, font: font)
-    let textRect = displayText.boundingRect(
-      with: CGSize(width: textMaxWidth, height: .greatestFiniteMagnitude),
-      options: [.usesLineFragmentOrigin, .usesFontLeading],
-      context: nil
-    )
-    textWidth = min(textMaxWidth, ceil(textRect.width))
-    textHeight = ceil(textRect.height)
+  var (textWidth, fullTextHeight) = measureText(textMaxWidth)
+  // One shared tall-content rule for user AND agent text bubbles: past the trigger the
+  // bubble collapses to the cap and gains a "Show more"/"Show less" bar (see the
+  // tallBubble* constants). Typing placeholders and inline-attachment rows are exempt
+  // (the attachment body-height arm below doesn't reserve the bar).
+  let tallToggleVisible =
+    fullTextHeight > tallBubbleCollapseTriggerHeight
+    && row.messageType != "typing"
+    && !showsInlineAttachment
+  if tallToggleVisible && !usesBottomMetaLayout {
+    // A tall bubble puts its meta UNDER the toggle bar (bottom-meta layout) so the bar
+    // never fights the inline timestamp — re-measure at the full width that layout
+    // grants the text (the collapse decision can't flip: the trigger dwarfs the few
+    // points of width difference).
+    usesBottomMetaLayout = true
+    (textWidth, fullTextHeight) = measureText(maxContentWidth)
   }
+  let tallCollapsed = tallToggleVisible && !agentTurnState.tallExpanded
+  // Cap to a whole line count so the truncated label (numberOfLines) fills the capped
+  // frame exactly instead of cutting a line mid-glyph.
+  let tallCollapsedLineCount = max(1.0, (tallBubbleCollapsedContentHeight / font.lineHeight).rounded(.down))
+  let textHeight = tallCollapsed
+    ? min(fullTextHeight, ceil(tallCollapsedLineCount * font.lineHeight))
+    : fullTextHeight
+  let tallToggleReserve: CGFloat =
+    tallToggleVisible ? (tallBubbleToggleSpacing + tallBubbleToggleHeight) : 0.0
   let attachmentBodyHeight: CGFloat = showsInlineAttachment ? inlineAttachmentHeight : 0.0
   let desiredContentWidth: CGFloat
   let replyPreviewWidth: CGFloat
@@ -2890,7 +2981,7 @@ func measureMessageBubbleLayout(
     ? replyPreviewBlockHeight + max(textHeight, 0.0) + inlineAttachmentSpacing
       + attachmentBodyHeight + bubbleMetaTopSpacing + bubbleMetaHeight
     : usesBottomMetaLayout
-    ? replyPreviewBlockHeight + max(textHeight, 0.0)
+    ? replyPreviewBlockHeight + max(textHeight, 0.0) + tallToggleReserve
       + (previewHeight > 0.0 ? (bubbleLinkPreviewSpacing + previewHeight) : 0.0)
       + bubbleMetaTopSpacing + bubbleMetaHeight
     : replyPreviewBlockHeight + max(textHeight, bubbleMetaHeight)
@@ -2899,7 +2990,7 @@ func measureMessageBubbleLayout(
   let bubbleWidth = max(bubbleMinWidth, contentWidth + (bubbleHorizontalPadding * 2.0) - 4.0)
   let bubbleHeight = max(
     34.0, bodyHeight + bubbleTopPadding + bubbleBottomPadding + reactionHeightOffset)
-  return ChatMessageBubbleLayoutMetrics(
+  var metrics = ChatMessageBubbleLayoutMetrics(
     bubbleWidth: bubbleWidth,
     bubbleHeight: bubbleHeight,
     messageWidth: messageWidth,
@@ -2918,6 +3009,9 @@ func measureMessageBubbleLayout(
     usesBottomMetaLayout: usesBottomMetaLayout,
     usesRichTextLayout: usesRichTextLayout
   )
+  metrics.tallToggleVisible = tallToggleVisible
+  metrics.tallCollapsed = tallCollapsed
+  return metrics
 }
 
 private func bubbleRoundedPath(
@@ -5785,6 +5879,11 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   // "View agent" side button on completed agent bubbles — opens the native
   // full-page agent surface (progress/thinking/tools) for that single task.
   private let agentViewButton = UIButton(type: .system)
+  // "Show more"/"Show less" bar for tall-collapsed bubbles (user text, agent text and
+  // settled agent turns share the rule — see the tallBubble* constants). Placed by the
+  // layout branches below; hidden for every other row.
+  private let tallToggleButton = UIButton(type: .system)
+  private var tallToggleRowMessageId: String?
   private let notSentIndicator = UIImageView()
   private var notSentIndicatorShown = false
   private let agentActionBarView = ChatNativeAgentActionBarView()
@@ -5915,6 +6014,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     contentView.addSubview(agentViewButton)
     contentView.addSubview(notSentIndicator)
     contentView.addSubview(agentActionBarView)
+    tallToggleButton.titleLabel?.font = UIFont.systemFont(ofSize: 13.0, weight: .semibold)
+    tallToggleButton.isHidden = true
+    tallToggleButton.addTarget(self, action: #selector(handleTallToggleTap), for: .touchUpInside)
+    contentView.addSubview(tallToggleButton)
     agentActionBarView.onNativeEvent = { [weak self] payload in
       self?.onAgentAction?(payload)
     }
@@ -6802,6 +6905,17 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       return
     }
 
+    // Tall-content toggle defaults: hidden and unclamped unless one of the bubble layout
+    // branches below places the bar (a reused cell must never keep the previous row's
+    // line cap, clipping, or a stray visible bar — every early-return path above the
+    // bubble branches skips them).
+    tallToggleButton.isHidden = true
+    tallToggleButton.frame = .zero
+    tallToggleRowMessageId = row.messageId
+    messageLabel.numberOfLines = 0
+    richTextView.clipsToBounds = false
+    agentTurnContentView.clipsToBounds = false
+
     let bounds = contentView.bounds
     if row.kind == .day || isConfiguredAgentDivider {
       let textSize = dayLabel.sizeThatFits(CGSize(width: bounds.width - 16, height: 24))
@@ -7052,7 +7166,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
               // sheet (same renderer) rather than an inline expand — see presentAgentTurnDetailView.
               self.onAgentAction?(["type": "openAgentTurnDetail", "messageId": messageId])
             },
-            showsLoaderView: false
+            showsLoaderView: agentTurnBubbleShowsWorkedSummary(row)
           )
           lastAgentTurnConfiguredRow = row
           lastAgentTurnConfiguredWidth = metrics.messageWidth
@@ -7067,6 +7181,21 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
             height: metrics.textHeight
           )
         )
+        if metrics.tallToggleVisible {
+          // Collapsed: metrics.textHeight is the cap — clip the overflowing body.
+          // Expanded: full height, just show the "Show less" bar under the content.
+          agentTurnContentView.clipsToBounds = metrics.tallCollapsed
+          tallToggleButton.setTitle(metrics.tallCollapsed ? "Show more" : "Show less", for: .normal)
+          tallToggleButton.setTitleColor(tintColor, for: .normal)
+          tallToggleButton.isHidden = false
+          tallToggleButton.frame = pixelAlignedRect(
+            CGRect(
+              x: bubbleFrame.minX,
+              y: agentTurnContentView.frame.maxY + tallBubbleToggleSpacing,
+              width: bubbleFrame.width,
+              height: tallBubbleToggleHeight
+            ))
+        }
       } else if metrics.hasInlineAttachment {
         agentTurnContentView.frame = .zero
         richTextView.frame = .zero
@@ -7147,16 +7276,26 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
             textColor: bubbleTextColor,
             availableWidth: metrics.messageWidth
           )
+          // Tall-collapsed: metrics.textHeight is the cap — clip the overflow instead of
+          // letting the block layout blow past the measured bubble.
+          richTextView.clipsToBounds = metrics.tallCollapsed
           richTextView.frame = pixelAlignedRect(
             CGRect(
               x: contentX,
               y: contentY,
               width: metrics.messageWidth,
-              height: max(metrics.textHeight, richTextHeight)
+              height: metrics.tallCollapsed
+                ? metrics.textHeight
+                : max(metrics.textHeight, richTextHeight)
             )
           )
         } else {
           richTextView.frame = .zero
+          // Tall-collapsed: cap the label to the same whole-line count the measurement
+          // used so the truncation is clean (ellipsis on the last visible line).
+          messageLabel.numberOfLines = metrics.tallCollapsed
+            ? Int(max(1.0, (tallBubbleCollapsedContentHeight / bubbleMessageFont.lineHeight).rounded(.down)))
+            : 0
           messageLabel.frame = pixelAlignedRect(
             CGRect(
               x: contentX,
@@ -7167,7 +7306,20 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           )
         }
 
-        let textBottom = metrics.usesRichTextLayout ? richTextView.frame.maxY : messageLabel.frame.maxY
+        var textBottom = metrics.usesRichTextLayout ? richTextView.frame.maxY : messageLabel.frame.maxY
+        if metrics.tallToggleVisible {
+          tallToggleButton.setTitle(metrics.tallCollapsed ? "Show more" : "Show less", for: .normal)
+          tallToggleButton.setTitleColor(row.isMe ? appearance.textColorMe : tintColor, for: .normal)
+          tallToggleButton.isHidden = false
+          tallToggleButton.frame = pixelAlignedRect(
+            CGRect(
+              x: bubbleFrame.minX + bubbleHorizontalPadding,
+              y: textBottom + tallBubbleToggleSpacing,
+              width: metrics.contentWidth,
+              height: tallBubbleToggleHeight
+            ))
+          textBottom = tallToggleButton.frame.maxY
+        }
 
         if metrics.hasLinkPreview {
           let previewTop = textBottom + bubbleLinkPreviewSpacing
@@ -8697,6 +8849,11 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     }
   }
 
+  @objc private func handleTallToggleTap() {
+    guard let messageId = tallToggleRowMessageId, !messageId.isEmpty else { return }
+    onAgentAction?(["type": "toggleTallBubble", "messageId": messageId])
+  }
+
   @objc private func handleInlineVideoMuteTap() {
     guard mediaVideoHasAudio else { return }
     mediaVideoIsMuted.toggle()
@@ -9476,13 +9633,43 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       return nil
     }
     let image = renderBubbleChromeImage(captureRect: captureRect, suppressIntegratedTail: true)
-    let imageView = UIImageView(image: image)
+    let imageView = UIImageView(image: resizableTransitionPlateImage(image))
     imageView.frame = contentView.convert(captureRect, to: view)
     imageView.contentMode = .scaleToFill
     imageView.backgroundColor = .clear
     imageView.isOpaque = false
     imageView.clipsToBounds = false
     return imageView
+  }
+
+  /// 9-part version of the plate raster: cap insets cover the corner radii so
+  /// the send morph's width/height animation stretches only the flat middle
+  /// bands — the baked corners (including a grouped 8pt top-trailing one) stay
+  /// pixel-true at every intermediate size instead of being scaled with the
+  /// bounds. This is also what keeps the tail lobe's splice arc stable: the
+  /// bottom corner it rides is the real 18pt arc for the whole flight.
+  private func resizableTransitionPlateImage(_ image: UIImage) -> UIImage {
+    let radii = bubbleView.transitionCornerRadii()
+    var top = max(radii.topLeft, radii.topRight) + 1.0
+    var bottom = max(radii.bottomLeft, radii.bottomRight) + 1.0
+    var left = max(radii.topLeft, radii.bottomLeft) + 1.0
+    var right = max(radii.topRight, radii.bottomRight) + 1.0
+    let maxVertical = max(0.0, image.size.height - 1.0)
+    let maxHorizontal = max(0.0, image.size.width - 1.0)
+    if top + bottom > maxVertical, top + bottom > 0.0 {
+      let scale = maxVertical / (top + bottom)
+      top *= scale
+      bottom *= scale
+    }
+    if left + right > maxHorizontal, left + right > 0.0 {
+      let scale = maxHorizontal / (left + right)
+      left *= scale
+      right *= scale
+    }
+    return image.resizableImage(
+      withCapInsets: UIEdgeInsets(top: top, left: left, bottom: bottom, right: right),
+      resizingMode: .stretch
+    )
   }
 
   /// Send-morph tail snapshot for integrated-tail bubbles (normal text). The

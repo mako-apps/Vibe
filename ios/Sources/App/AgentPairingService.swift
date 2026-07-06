@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import Network
 
 /// End-to-end decryption for the agent runtime payload (file diffs / patches).
 ///
@@ -1041,5 +1042,287 @@ enum AgentPairingService {
       model: normalizedString(object["model"]),
       startedAt: normalizedString(object["startedAt"] ?? object["started_at"])
     )
+  }
+}
+
+// MARK: - Direct-LAN transport (phone side)
+
+/// The user-visible transport preference (see the connection sheet's Auto/Local/Cloud
+/// control). Auto prefers the local Wi-Fi link when the Mac is reachable and falls back to
+/// the cloud relay when it isn't; Local pins the direct link; Cloud pins the relay.
+enum AgentBridgeTransportPreference: String, CaseIterable {
+  case auto
+  case local
+  case cloud
+}
+
+enum AgentBridgeTransport {
+  private static let key = "agentBridge.transportPreference"
+  static var preference: AgentBridgeTransportPreference {
+    get { AgentBridgeTransportPreference(rawValue: UserDefaults.standard.string(forKey: key) ?? "") ?? .auto }
+    set { UserDefaults.standard.set(newValue.rawValue, forKey: key) }
+  }
+}
+
+/// Discovers the paired Mac's bridge on the local network (Bonjour `_vibegram-bridge._tcp`)
+/// and opens a direct, authenticated WebSocket to it — the fast path that bypasses the
+/// cloud relay when phone and Mac share a Wi-Fi. This NEVER replaces the cloud connection
+/// (remote access needs it); it's an additive accelerator. Auth is the same arte1
+/// challenge-response the bridge enforces: the bridge sends a nonce, we return it sealed
+/// with the shared pairing key (AgentRuntimeCrypto), proving we're the paired phone before
+/// any traffic flows. Phase 3a here = discovery + authenticated link + observable state;
+/// routing real history/stream traffic over it is the next phase.
+@available(iOS 13.0, *)
+final class LanBridgeService {
+  static let shared = LanBridgeService()
+
+  enum State: Equatable {
+    case unavailable        // no pairing key on this device → LAN link impossible
+    case idle               // not searching (e.g. Cloud pinned)
+    case searching          // browsing Bonjour, Mac not seen yet
+    case found(String)      // service discovered, not yet authenticated
+    case connecting
+    case authenticated(String)
+    case failed(String)
+  }
+
+  static let stateChangedNotification = Notification.Name("LanBridgeStateChanged")
+
+  private let queue = DispatchQueue(label: "vibe.lan.bridge")
+  private var browser: NWBrowser?
+  private var connection: NWConnection?
+  private var handshakeNonce: String?
+  private var connectedName: String?
+  private var authed = false
+  private var desiredUserId: String?
+  private var _state: State = .idle
+
+  /// Last known state — safe to read from the main thread for a UI hint.
+  var currentState: State { queue.sync { _state } }
+
+  private init() {}
+
+  var isAuthenticated: Bool {
+    if case .authenticated = currentState { return true }
+    return false
+  }
+
+  /// Begin (or resume) discovery. Respects the saved preference: Cloud → stays idle.
+  func start(userId: String?) {
+    queue.async {
+      self.desiredUserId = userId
+      guard AgentRuntimeCrypto.hasKey else {
+        self.setStateLocked(.unavailable)
+        NSLog("[LanBridge] no pairing key — direct LAN link unavailable (cloud relay only)")
+        return
+      }
+      guard AgentBridgeTransport.preference != .cloud else {
+        self.setStateLocked(.idle)
+        return
+      }
+      guard self.browser == nil else { return } // already searching / connected
+      self.startBrowseLocked()
+    }
+  }
+
+  func stop() {
+    queue.async { self.teardownAllLocked(state: .idle) }
+  }
+
+  /// React to the user flipping the Auto/Local/Cloud control.
+  func applyPreference(_ pref: AgentBridgeTransportPreference) {
+    queue.async {
+      guard AgentRuntimeCrypto.hasKey else { self.setStateLocked(.unavailable); return }
+      if pref == .cloud {
+        self.teardownAllLocked(state: .idle)
+      } else if self.browser == nil {
+        self.startBrowseLocked()
+      }
+    }
+  }
+
+  // MARK: Discovery
+
+  private func startBrowseLocked() {
+    let params = NWParameters()
+    params.includePeerToPeer = true
+    let browser = NWBrowser(
+      for: .bonjour(type: "_vibegram-bridge._tcp", domain: nil), using: params)
+    browser.stateUpdateHandler = { [weak self] st in
+      guard let self else { return }
+      self.queue.async {
+        switch st {
+        case .ready:
+          NSLog("[LanBridge] browsing _vibegram-bridge._tcp on the local network")
+        case .failed(let error):
+          NSLog("[LanBridge] browse failed: \(error)")
+          self.setStateLocked(.failed("browse: \(error)"))
+        case .cancelled:
+          break
+        default:
+          break
+        }
+      }
+    }
+    browser.browseResultsChangedHandler = { [weak self] results, _ in
+      guard let self else { return }
+      self.queue.async { self.handleBrowseResultsLocked(results) }
+    }
+    self.browser = browser
+    setStateLocked(.searching)
+    browser.start(queue: queue)
+  }
+
+  private func handleBrowseResultsLocked(_ results: Set<NWBrowser.Result>) {
+    guard !authed, connection == nil else { return }
+    guard let pick = pickResultLocked(results) else {
+      if results.isEmpty { setStateLocked(.searching) }
+      return
+    }
+    var name = "your Mac"
+    if case let .service(svcName, _, _, _) = pick.endpoint { name = svcName }
+    connectedName = name
+    setStateLocked(.found(name))
+    NSLog("[LanBridge] discovered bridge \"\(name)\" — connecting")
+    connectLocked(to: pick.endpoint, name: name)
+  }
+
+  /// Prefer the bridge advertising OUR account's uid (TXT record); fall back to the first.
+  private func pickResultLocked(_ results: Set<NWBrowser.Result>) -> NWBrowser.Result? {
+    let all = Array(results)
+    if let uid = desiredUserId, !uid.isEmpty {
+      let match = all.first { result in
+        if case let .bonjour(txt) = result.metadata { return txt["uid"] == uid }
+        return false
+      }
+      if let match { return match }
+    }
+    return all.first
+  }
+
+  // MARK: Connection + handshake
+
+  private func connectLocked(to endpoint: NWEndpoint, name: String) {
+    let ws = NWProtocolWebSocket.Options()
+    ws.autoReplyPing = true
+    let params = NWParameters.tcp
+    params.includePeerToPeer = true
+    params.defaultProtocolStack.applicationProtocols.insert(ws, at: 0)
+    let conn = NWConnection(to: endpoint, using: params)
+    connection = conn
+    setStateLocked(.connecting)
+    conn.stateUpdateHandler = { [weak self] st in
+      guard let self else { return }
+      self.queue.async {
+        switch st {
+        case .ready:
+          NSLog("[LanBridge] socket ready to \(name) — starting handshake")
+          self.receiveLocked()
+        case .failed(let error):
+          self.teardownConnectionLocked(reason: "connect: \(error)")
+        case .cancelled:
+          break
+        default:
+          break
+        }
+      }
+    }
+    conn.start(queue: queue)
+  }
+
+  private func receiveLocked() {
+    connection?.receiveMessage { [weak self] data, _, _, error in
+      guard let self else { return }
+      self.queue.async {
+        if let error {
+          self.teardownConnectionLocked(reason: "recv: \(error)")
+          return
+        }
+        if let data, !data.isEmpty { self.handleFrameLocked(data) }
+        if self.connection != nil { self.receiveLocked() }
+      }
+    }
+  }
+
+  private func handleFrameLocked(_ data: Data) {
+    guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+      let type = obj["type"] as? String
+    else { return }
+
+    if !authed {
+      switch type {
+      case "lan_challenge":
+        guard let nonce = obj["nonce"] as? String else { return }
+        handshakeNonce = nonce
+        guard let proof = AgentRuntimeCrypto.encrypt(["nonce": nonce, "role": "phone"]) else {
+          teardownConnectionLocked(reason: "no key to seal proof")
+          return
+        }
+        sendLocked(["type": "lan_auth", "proof": proof])
+      case "lan_ready":
+        let opened = AgentRuntimeCrypto.decrypt(obj["proof"])
+        if let opened, opened["role"] as? String == "bridge",
+          (opened["nonce"] as? String) == handshakeNonce
+        {
+          authed = true
+          let name = connectedName ?? "your Mac"
+          setStateLocked(.authenticated(name))
+          NSLog("[LanBridge] authenticated with \(name) ✓ — direct LAN link ready")
+        } else {
+          teardownConnectionLocked(reason: "bridge proof invalid — not the paired Mac")
+        }
+      default:
+        break
+      }
+      return
+    }
+
+    // Authenticated. Phase 3b routes history_result / progress / result frames into the
+    // ChatEngine ingest here; for now, prove the link stays live.
+    NSLog("[LanBridge] frame over LAN: type=\(type)")
+  }
+
+  private func sendLocked(_ obj: [String: Any]) {
+    guard let conn = connection,
+      let data = try? JSONSerialization.data(withJSONObject: obj)
+    else { return }
+    let meta = NWProtocolWebSocket.Metadata(opcode: .text)
+    let ctx = NWConnection.ContentContext(identifier: "lan-send", metadata: [meta])
+    conn.send(content: data, contentContext: ctx, isComplete: true, completion: .contentProcessed { _ in })
+  }
+
+  // MARK: Teardown
+
+  private func teardownConnectionLocked(reason: String) {
+    NSLog("[LanBridge] link down: \(reason)")
+    connection?.cancel()
+    connection = nil
+    authed = false
+    handshakeNonce = nil
+    // Keep browsing so the link re-establishes when the Mac reappears.
+    if browser != nil {
+      setStateLocked(.searching)
+    } else {
+      setStateLocked(.failed(reason))
+    }
+  }
+
+  private func teardownAllLocked(state: State) {
+    browser?.cancel()
+    browser = nil
+    connection?.cancel()
+    connection = nil
+    authed = false
+    handshakeNonce = nil
+    connectedName = nil
+    setStateLocked(state)
+  }
+
+  private func setStateLocked(_ next: State) {
+    guard _state != next else { return }
+    _state = next
+    DispatchQueue.main.async {
+      NotificationCenter.default.post(name: Self.stateChangedNotification, object: nil)
+    }
   }
 }

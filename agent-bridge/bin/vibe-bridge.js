@@ -51,12 +51,18 @@ const MAX_LINE_BYTES = 8 * 1024;
 // turn never looks stalled. Carries no feed node (the server parser ignores it).
 const KEEPALIVE_MS = 10 * 1000;
 // ws-level (RFC 6455 control-frame) ping cadence used to detect a half-open TCP socket —
-// see attachSocketLivenessPing. This is deliberately independent of, and faster than, the
-// application-level "heartbeat" push/reply below: a raw ping/pong round-trips at the OS
-// socket layer without waiting on the Phoenix channel join state, so it catches a zombie
-// connection well before the app heartbeat's 2-miss threshold would.
-const WS_PING_INTERVAL_MS = 10 * 1000;
-const WS_PING_MAX_MISSES = 1;
+// see attachSocketLivenessPing. This is deliberately independent of the application-level
+// "heartbeat" push/reply below: a raw ping/pong round-trips at the OS socket layer without
+// waiting on the Phoenix channel join state, so it catches a zombie connection well before
+// the app heartbeat's 2-miss threshold would.
+//
+// TUNING (2026-07-05): the old 10s / 1-miss setting terminated the transport after a single
+// late pong — on a jittery mobile/QUIC-edge path one delayed pong is NOT a dead socket, and
+// this self-inflicted terminate() was a prime suspect for the ~50s reconnect flapping
+// (137 drops / 2h observed). Widened to 15s / 2-miss so only a socket that is genuinely
+// silent for ~45s is killed; the Phoenix 15s heartbeat + app-heartbeat remain as backstops.
+const WS_PING_INTERVAL_MS = 15 * 1000;
+const WS_PING_MAX_MISSES = 2;
 const MAX_DIFF_BYTES = 90 * 1024;
 const MAX_DIFF_FILES = 24;
 const MAX_UNTRACKED_FILE_BYTES = 220 * 1024;
@@ -3349,6 +3355,14 @@ function messageHasUserText(m) {
 // bridge OR directly in the user's own desktop terminal (which never enter the
 // `runningTasks` Map, so mtime-freshness is the only signal we have for those).
 const LIVE_SESSION_WINDOW_MS = Number(process.env.VIBE_HISTORY_LIVE_WINDOW_MS || 15_000);
+// How long a STRUCTURALLY unfinished Claude turn (last assistant stop_reason is
+// tool_use/absent, i.e. a tool is executing or the model is thinking) stays flagged
+// live after the transcript's last write. Thinking blocks and long tools (builds)
+// write NOTHING for minutes, so the 15s mtime window alone flips `running` off
+// mid-turn — the phone then blanks the working cell until the next write ("list
+// jumps to empty" during thinking). stop_reason=end_turn settles instantly, so this
+// generous cap only ever lingers after a mid-turn crash/kill.
+const DETAIL_MIDTURN_STALE_MS = Number(process.env.VIBE_DETAIL_MIDTURN_STALE_MS || 15 * 60_000);
 // Upper bound on how far a roster summary streams into a rollout before giving up on
 // finding a topic. With streaming early-exit (codexSummaryFromHead) a session with a
 // normal-sized preamble stops in the first few KB; this cap only bites resumed sessions
@@ -3537,6 +3551,117 @@ function claudeActionDetail(b) {
   }
 }
 
+// Codex only has a raw shell, so a bare `rg …` / `sed -n …` / `cat …` would render
+// as low-level "Run <shell>" noise — unlike Claude, whose high-level Read/Grep tools
+// map to clean "Read foo.swift" / "Search pattern" rows. Classify the command's lead
+// program into the SAME read/search progress kinds so a Codex turn's feed reads like
+// Claude's. Anything we don't recognize stays a plain "Run <command>" (kind "bash").
+const CODEX_READ_CMDS = new Set(["cat", "head", "tail", "less", "more", "bat", "nl", "sed"]);
+const CODEX_SEARCH_CMDS = new Set(["rg", "grep", "egrep", "fgrep", "ag", "ack", "ripgrep"]);
+
+// Minimal shell tokenizer: splits on unquoted whitespace and strips one layer of
+// single/double quotes (so `rg -n "A|B" path` → ["rg","-n","A|B","path"]).
+function codexShellTokens(command) {
+  const tokens = [];
+  let cur = "";
+  let quote = null;
+  let started = false;
+  for (const c of String(command || "")) {
+    if (quote) {
+      if (c === quote) quote = null;
+      else cur += c;
+    } else if (c === '"' || c === "'") {
+      quote = c;
+      started = true;
+    } else if (c === " " || c === "\t") {
+      if (started) tokens.push(cur);
+      cur = "";
+      started = false;
+    } else {
+      cur += c;
+      started = true;
+    }
+  }
+  if (started) tokens.push(cur);
+  return tokens;
+}
+
+// Last positional (non-flag, non-numeric-range) argument → the file a read touches.
+function codexLastPathArg(args) {
+  for (let i = args.length - 1; i >= 0; i--) {
+    const a = args[i];
+    if (!a || a.startsWith("-")) continue;
+    if (/^\d+(,\d+)?[a-z]?$/i.test(a)) continue; // skip sed ranges like 1,220p
+    return a;
+  }
+  return "";
+}
+
+// First positional argument → the pattern a grep/rg searches for (respect `-e PAT`).
+function codexSearchPattern(args) {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "-e" || a === "--regexp" || a === "--regex") return args[i + 1] || "";
+    if (a && !a.startsWith("-")) return a;
+  }
+  return "";
+}
+
+// Turn a raw Codex shell command into a friendly progress detail (read/search),
+// falling back to a plain "Run <command>" (kind "bash") when unrecognized.
+function codexShellDetail(rawCmd) {
+  const command = String(rawCmd || "").replace(/\s+/g, " ").trim();
+  const bash = { kind: "bash", command, description: "" };
+  if (!command) return bash;
+
+  // Unwrap a `bash -lc '<inner>'` / `sh -c "<inner>"` wrapper (and strip the inner
+  // command's surrounding quotes), then classify the first pipeline segment
+  // (`rg … | head` is still a search).
+  let work = command;
+  const wrap = work.match(/^(?:\/\S+\/)?(?:bash|sh|zsh)\s+-[a-z]*c\s+(.+)$/i);
+  if (wrap) {
+    work = wrap[1].trim();
+    const q = work[0];
+    if ((q === '"' || q === "'") && work[work.length - 1] === q) work = work.slice(1, -1).trim();
+  }
+  const firstSeg = work.split(/\s*(?:&&|\|\||[|;])\s*/)[0] || work;
+
+  let tokens = codexShellTokens(firstSeg);
+  while (tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) tokens = tokens.slice(1);
+  while (tokens.length && (tokens[0] === "sudo" || tokens[0] === "command")) tokens = tokens.slice(1);
+  if (!tokens.length) return bash;
+
+  const prog = String(tokens[0]).split("/").pop().toLowerCase();
+  const args = tokens.slice(1);
+
+  if (CODEX_READ_CMDS.has(prog)) {
+    // sed is a "read" only in its common `-n 'A,Bp'` print form; an editing sed
+    // (e.g. `sed -i …`) stays a plain command.
+    if (prog === "sed") {
+      const range = args.find((a) => /^\d+,\d+p?$/.test(a));
+      if (!args.includes("-n") && !range) return bash;
+    }
+    const file = codexLastPathArg(args);
+    if (!file) return bash;
+    const detail = { kind: "read", name: safeBase(file), path: file };
+    const range = prog === "sed" ? args.find((a) => /^\d+,\d+p?$/.test(a)) : null;
+    const m = range && range.match(/^(\d+),(\d+)/);
+    if (m) {
+      detail.start = Number(m[1]);
+      detail.end = Number(m[2]);
+    }
+    return detail;
+  }
+
+  if (CODEX_SEARCH_CMDS.has(prog)) {
+    const pattern = codexSearchPattern(args);
+    if (!pattern) return bash;
+    return { kind: "search", pattern };
+  }
+
+  return bash;
+}
+
 function codexActionDetail(p) {
   const name = String(p.name || "");
   if (/apply_patch/i.test(name)) {
@@ -3552,8 +3677,7 @@ function codexActionDetail(p) {
     };
   }
   if (isCodexShellToolName(name)) {
-    const cmd = codexCommandFromPayload(p);
-    return { kind: "bash", command: String(cmd || ""), description: "" };
+    return codexShellDetail(codexCommandFromPayload(p));
   }
   return { kind: "tool", name: name || "tool" };
 }
@@ -3710,7 +3834,7 @@ function codexCommandExecutionDetail(item) {
   let cmd = item.command || item.cmd;
   if (Array.isArray(cmd)) cmd = cmd.join(" ");
   if (!cmd && item.input && typeof item.input === "object") cmd = item.input.command || item.input.cmd;
-  return { kind: "bash", command: String(cmd || "").replace(/\s+/g, " ").trim(), description: "" };
+  return codexShellDetail(cmd);
 }
 
 function liveCodexActions(output) {
@@ -3882,7 +4006,7 @@ function attachTurnActions(messages, host, uids, detailByUid, resultByUid) {
 // `turnItems` is the ordered list captured during the turn:
 //   { type:"text", text, uid, ts }  |  { type:"tool", uid, ts }
 // Returns the host (already pushed onto `messages`) or null if the turn was empty.
-function foldTurnIntoHost(messages, turnItems, detailByUid, resultByUid, turnReasoning, hostFallbackUid, thinkingMeta) {
+function foldTurnIntoHost(messages, turnItems, detailByUid, resultByUid, turnReasoning, hostFallbackUid, thinkingMeta, interrupted) {
   // The LAST non-empty text is the answer — but ONLY if the turn actually ENDS on
   // it. If any tool action runs AFTER the last text, that text is interim narration
   // ("I'll look at X" → then does X), not a closing answer. Mid-run the newest
@@ -3892,6 +4016,10 @@ function foldTurnIntoHost(messages, turnItems, detailByUid, resultByUid, turnRea
   // [tools…, text] instead of [text, tools…], "healing" only once the next text
   // arrived. Keeping interim narration inline (host.text left empty) makes the live
   // feed read chronologically. The finished turn (answer genuinely last) is unchanged.
+  // EXCEPT when the turn was INTERRUPTED (a stop sealed it mid-tool): its closing
+  // answer will never come, so an empty body would blank the bubble and bury
+  // everything the user already watched inside the collapsed card. Promote the last
+  // narration to the body — keep what already arrived visible.
   let lastTextIndex = -1;
   for (let i = 0; i < turnItems.length; i++) {
     if (turnItems[i].type === "text" && String(turnItems[i].text || "").trim()) lastTextIndex = i;
@@ -3900,7 +4028,7 @@ function foldTurnIntoHost(messages, turnItems, detailByUid, resultByUid, turnRea
   for (let i = lastTextIndex + 1; i < turnItems.length; i++) {
     if (turnItems[i].type === "tool") { toolAfterLastText = true; break; }
   }
-  const summary = (lastTextIndex >= 0 && !toolAfterLastText) ? turnItems[lastTextIndex] : null;
+  const summary = (lastTextIndex >= 0 && (!toolAfterLastText || interrupted)) ? turnItems[lastTextIndex] : null;
 
   const nodes = [];
   const actions = [];
@@ -3912,7 +4040,12 @@ function foldTurnIntoHost(messages, turnItems, detailByUid, resultByUid, turnRea
   // renders "Thinking · N tokens" / "Thought for Ns" like the desktop CLI.
   const reasoning = String(turnReasoning || "").trim();
   const meta = thinkingMeta || {};
-  if (reasoning || meta.had) {
+  // When the caller captured per-step {type:"think"} items (claudeDetail), each one
+  // renders at its real chronological position below — the coalesced top node would
+  // double-count the same reasoning, so it only fires for callers that still
+  // aggregate (codexDetail).
+  const hasInterleavedThinking = turnItems.some((it) => it && it.type === "think");
+  if ((reasoning || meta.had) && !hasInterleavedThinking) {
     const tid = "think-host";
     const det = { kind: "thinking" };
     if (reasoning) det.output = clipText(reasoning, MAX_ACTION_OUTPUT);
@@ -3925,6 +4058,19 @@ function foldTurnIntoHost(messages, turnItems, detailByUid, resultByUid, turnRea
   for (let i = 0; i < turnItems.length; i++) {
     if (summary && i === lastTextIndex) continue;   // the answer rides OUTSIDE the card
     const it = turnItems[i];
+    if (it.type === "think") {
+      // Per-step thinking → an in-card node at its real chronological position,
+      // matching the desktop CLI's interleaved "Thought for Ns" rows (the phone
+      // formats label+durationMs+tokens; reasoning text rides the encrypted blob).
+      const det = { kind: "thinking" };
+      if (it.text) det.output = clipText(String(it.text), MAX_ACTION_OUTPUT);
+      if (typeof it.tokens === "number" && it.tokens > 0) det.tokens = it.tokens;
+      if (typeof it.durationMs === "number" && it.durationMs > 0) det.durationMs = it.durationMs;
+      const tid = it.uid ? "think-" + String(it.uid) : "think-" + i;
+      nodes.push(actionNode(det, tid, "done"));
+      actions.push(Object.assign({ id: tid }, det));
+      continue;
+    }
     if (it.type === "text") {
       // Interior narration → an in-card text node (phone renders it as prose,
       // interleaved with the tool rows, via VibeAgentKitMessageCell).
@@ -3969,6 +4115,18 @@ function foldTurnIntoHost(messages, turnItems, detailByUid, resultByUid, turnRea
     ts: (summary && summary.ts) || (turnItems.length && turnItems[turnItems.length - 1].ts) || null,
     uid: hostUid,
   };
+  // Does the turn end awaiting a tool verdict? If the LAST tool item has no result
+  // yet, that tool is still executing and the live running mark belongs on its
+  // node. Otherwise the model is BETWEEN steps (reading the result / reasoning /
+  // streaming) — markMessageRunning uses this to put a "Thinking" node at the live
+  // edge instead of re-flagging the finished last tool (the stale "Reading…" header).
+  let trailingToolPending = false;
+  for (let i = turnItems.length - 1; i >= 0; i--) {
+    if (turnItems[i].type !== "tool") continue;
+    trailingToolPending = !resultByUid.has(turnItems[i].uid);
+    break;
+  }
+  host.trailingToolPending = trailingToolPending;
   if (nodes.length) {
     host.progressNodes = nodes.slice(-60);
     const enc = encryptRuntimeBlob({ actions: actions.slice(-60) });
@@ -3995,8 +4153,9 @@ async function claudeDetail(id, limit, before) {
   // card), every earlier text + all tools = interleaved progress nodes (inside the
   // "Worked" card). One compact, expandable turn — never a pile of text bubbles.
   let turnItems = [];      // ordered [{type:"text",text,uid,ts}|{type:"tool",uid,ts}]
-  let turnReasoning = "";  // accumulated thinking for the current turn → ONE node
-  let thinkSeq = 0;
+  let turnReasoning = "";  // stays empty here — Claude thinking is interleaved per-step (type:"think" items)
+  // stop_reason of the LAST assistant entry in the file (see the assistant branch).
+  let lastStopReason = null;
   // Turn timespan (user prompt → last assistant event) → "Worked for Xs".
   let turnStartTs = null;
   let turnEndTs = null;
@@ -4012,8 +4171,8 @@ async function claudeDetail(id, limit, before) {
   const resultByUid = new Map();
   // One card per user-turn: fold the turn's prose + tool feed into ONE host
   // message, then seal the edits/diff card onto it.
-  const flushTurn = () => {
-    const host = foldTurnIntoHost(messages, turnItems, actionDetailByUid, resultByUid, turnReasoning, null, turnThinking);
+  const flushTurn = (interrupted) => {
+    const host = foldTurnIntoHost(messages, turnItems, actionDetailByUid, resultByUid, turnReasoning, null, turnThinking, interrupted);
     if (host && pending.order.length) {
       sealHistoryRuntime("claude", host, pending, turnDurationMs(turnStartTs, turnEndTs));
     }
@@ -4065,51 +4224,59 @@ async function claudeDetail(id, limit, before) {
       return;
     }
     if (ev.type === "user" && messageHasUserText(m)) {
-      flushTurn();                  // seal prior turn's card + action feed
+      // A stop writes "[Request interrupted by user…]" as the next user message.
+      // The turn it closes ended mid-tool and will never get its answer text —
+      // flag the flush so the fold promotes the last narration to the visible
+      // body instead of sealing an empty-bodied bubble.
+      flushTurn(/^\s*\[request interrupted/i.test(rawText)); // seal prior turn's card + action feed
       turnStartTs = ev.timestamp || null;   // new turn opens at this prompt
     }
     if (ev.type === "assistant") {
       collectClaudeEdits(pending, m.content);
       if (ev.timestamp) turnEndTs = ev.timestamp;   // extend turn end to last assistant event
+      // The turn's structural state: end_turn = genuinely finished; tool_use/null =
+      // a tool is executing or the model is still thinking. markDetailLiveTurn uses
+      // this so `running` survives long write gaps (thinking, builds) without making
+      // finished turns linger.
+      lastStopReason = typeof m.stop_reason === "string" ? m.stop_reason : null;
     }
     let text = cleanMessageText(rawText);
     if (ev.type === "user") {
       // User prompts stay their own right-side bubble (each one is a turn boundary).
       if (text) messages.push({ role: "user", text: clipText(text, 4000), ts: ev.timestamp, uid: ev.uuid });
     } else if (ev.type === "assistant") {
-      // Fold this assistant event into the current turn IN ORDER: its prose first
-      // (an interior text becomes an in-card narration node; the turn's LAST text
-      // becomes the summary), then its tool calls — so the card reads chronologically.
-      if (text) turnItems.push({ type: "text", text, uid: ev.uuid, ts: ev.timestamp });
-      if (Array.isArray(m.content)) {
-        // Coalesce this message's reasoning into the turn's single "Thinking" node.
-        // (Claude Code usually persists thinking with EMPTY text — only the
-        // signature — so this is typically a no-op; it lights up if a session ever
-        // stores summarized reasoning.)
+      // Fold this assistant event into the current turn IN ORDER: its reasoning
+      // first (the thinking that produced this step), then its prose (an interior
+      // text becomes an in-card narration node; the turn's LAST text becomes the
+      // summary), then its tool calls — so the card reads chronologically.
+      if (Array.isArray(m.content) && m.content.some((b) => b && b.type === "thinking")) {
+        // Each thinking message becomes its OWN ordered turn item so the fold
+        // renders interleaved "Thought for Ns" rows at their real positions like
+        // the desktop CLI (the old single coalesced top node hid WHERE the turn
+        // thought — "the cell only shows thinking at top"). Presence, not text, is
+        // the signal (Claude Code usually persists thinking with EMPTY text — only
+        // the signature). tokens ≈ this message's output tokens; duration = gap
+        // from the IMMEDIATELY-preceding event (`lastEventTs` advances on EVERY
+        // event incl. tool_results — see below — so the preceding tool's execution
+        // time is excluded from the thinking duration).
         const think = m.content
           .filter((b) => b && b.type === "thinking" && b.thinking)
           .map((b) => String(b.thinking))
           .join("\n\n")
           .trim();
-        if (think) turnReasoning += (turnReasoning ? "\n\n" : "") + think;
-        // Thinking metrics: presence (any thinking block, even empty text), reasoning
-        // tokens (this message's output ≈ reasoning tokens for a think-heavy step),
-        // and a best-effort duration = gap from the IMMEDIATELY-preceding event to this
-        // message. `lastEventTs` is advanced at the end of the callback for EVERY event
-        // (user prompt + tool_result too — see below), so this gap is ONLY the model's
-        // own reasoning wall-clock and excludes the preceding tool-execution time. (The
-        // old code advanced lastEventTs on assistant events only, so a thinking step that
-        // followed a long tool run counted the whole tool duration as "thinking" — the
-        // "Thought for 1m 42s, timing is wrong" bug.)
-        if (Array.isArray(m.content) && m.content.some((b) => b && b.type === "thinking")) {
-          turnThinking.had = true;
-          const outTok = Number(m.usage && (m.usage.output_tokens || m.usage.reasoning_output_tokens)) || 0;
-          if (outTok > 0) turnThinking.tokens += outTok;
-          if (ev.timestamp && lastEventTs) {
-            const dt = Date.parse(ev.timestamp) - Date.parse(lastEventTs);
-            if (dt > 0 && dt < 600000) turnThinking.durationMs += dt;
-          }
+        const outTok = Number(m.usage && (m.usage.output_tokens || m.usage.reasoning_output_tokens)) || 0;
+        let thoughtMs = 0;
+        if (ev.timestamp && lastEventTs) {
+          const dt = Date.parse(ev.timestamp) - Date.parse(lastEventTs);
+          if (dt > 0 && dt < 600000) thoughtMs = dt;
         }
+        turnItems.push({
+          type: "think", uid: ev.uuid, ts: ev.timestamp,
+          text: think, tokens: outTok, durationMs: thoughtMs,
+        });
+      }
+      if (text) turnItems.push({ type: "text", text, uid: ev.uuid, ts: ev.timestamp });
+      if (Array.isArray(m.content)) {
         // Subagent (sidechain) events carry the parent Task's tool_use id; tag the
         // child detail so it groups under the Task (depth 1) like the live path.
         const parentToolUseId =
@@ -4157,6 +4324,7 @@ async function claudeDetail(id, limit, before) {
     windowEnd: window.windowEnd,
     totalMessages: window.totalMessages,
     messages: window.messages,
+    lastStopReason,
   };
 }
 
@@ -4295,7 +4463,6 @@ async function codexDetail(id, limit, before) {
   // Per-turn prose+action collection, folded into ONE host message (see claudeDetail).
   let turnItems = [];      // ordered [{type:"text",text,uid,ts}|{type:"tool",uid,ts}]
   let turnReasoning = "";  // accumulated reasoning for the current turn → ONE node
-  let thinkSeq = 0;
   // Turn timespan (user prompt → last assistant message) → "Worked for Xs".
   let turnStartTs = null;
   let turnEndTs = null;
@@ -4309,8 +4476,8 @@ async function codexDetail(id, limit, before) {
   const resultByUid = new Map();
   const callIdToUid = new Map();
   let eventSeq = 0;
-  const flushTurn = () => {
-    const host = foldTurnIntoHost(messages, turnItems, actionDetailByUid, resultByUid, turnReasoning, null, turnThinking);
+  const flushTurn = (interrupted) => {
+    const host = foldTurnIntoHost(messages, turnItems, actionDetailByUid, resultByUid, turnReasoning, null, turnThinking, interrupted);
     if (host && pending.order.length) {
       sealHistoryRuntime("codex", host, pending, turnDurationMs(turnStartTs, turnEndTs));
     }
@@ -4450,11 +4617,11 @@ function runningTaskForChat(chatId) {
 // True when the session's transcript file was appended to within the live window —
 // the signal that a turn is in flight for a session the bridge did NOT spawn (a
 // run the user started directly in their own desktop terminal).
-function sessionFileIsLive(provider, sessionId) {
+function sessionFileIsLive(provider, sessionId, windowMs) {
   const file = sessionFilePath(provider, sessionId);
   if (!file) return false;
   try {
-    return Date.now() - fs.statSync(file).mtimeMs < LIVE_SESSION_WINDOW_MS;
+    return Date.now() - fs.statSync(file).mtimeMs < (windowMs || LIVE_SESSION_WINDOW_MS);
   } catch (_) {
     return false;
   }
@@ -4465,11 +4632,55 @@ function sessionFileIsLive(provider, sessionId) {
 // finalized "Worked · N steps" card. Live = a bridge task is running for this chat
 // OR the transcript file is still growing (desktop-terminal run). Returns true if
 // the turn was marked.
+// The trailing "[Request interrupted by user…]" user message a stop leaves in the
+// transcript. A session ending on it is SETTLED — nothing more is coming until the
+// next real prompt — even though the last assistant stop_reason still reads
+// mid-turn (tool_use/null), so the structural check alone would keep it "running"
+// for the whole mid-turn window (phantom Thinking after every stop).
+function isInterruptMarkerMessage(m) {
+  return !!m && m.role === "user" && /^\s*\[request interrupted/i.test(String(m.text || ""));
+}
+
 function markDetailLiveTurn(result, provider, sessionId, chatId) {
   if (!result || result.mode !== "detail") return false;
   const msgs = result.session && result.session.messages;
   if (!Array.isArray(msgs) || !msgs.length) return false;
-  if (!runningTaskForChat(chatId) && !sessionFileIsLive(provider, sessionId)) return false;
+  if (isInterruptMarkerMessage(msgs[msgs.length - 1])) return false; // stopped → settled
+  const spawnedRunning = !!runningTaskForChat(chatId);
+  // Structural turn state (Claude only): the transcript's last assistant entry says
+  // whether the turn truly ended (end_turn / stop_sequence) or is mid-flight
+  // (tool_use, or null while an entry is being written). mtime alone can't tell a
+  // finished turn from one silently thinking or running a long build — both write
+  // nothing for minutes — which is why the 15s window blanked live cells mid-turn.
+  const stop = String((result.session && result.session.lastStopReason) || "").toLowerCase();
+  const structurallyDone = stop === "end_turn" || stop === "stop_sequence";
+  // Codex rollouts carry no stop_reason — only Claude gets the wide mid-turn cap;
+  // Codex keeps the plain freshness window so finished sessions settle as before.
+  const midturnWindowMs = provider === "claude" ? DETAIL_MIDTURN_STALE_MS : LIVE_SESSION_WINDOW_MS;
+  const last0 = msgs[msgs.length - 1];
+  // A fresh user prompt with no assistant reply yet = the model is thinking before
+  // its first token — the phone otherwise shows nothing "live" until the first
+  // entry lands. Synthesize a running thinking turn so the chat goes live at send.
+  if (!spawnedRunning && last0 && last0.role === "user"
+      && sessionFileIsLive(provider, sessionId, midturnWindowMs)) {
+    msgs.push({
+      role: "assistant",
+      text: "",
+      uid: `running-mirror-${sessionId}`,
+      ts: new Date().toISOString(),
+      running: true,
+      progressNodes: [
+        { id: `running-mirror-${sessionId}`, label: "Thinking", kind: "thinking", status: "running", depth: 0 },
+      ],
+    });
+    return true;
+  }
+  if (!spawnedRunning) {
+    if (structurallyDone) return false;
+    // Mid-turn by structure: stay live through long write gaps (thinking, builds)
+    // up to the stale cap; a mid-turn crash/kill is the only thing that lingers.
+    if (!sessionFileIsLive(provider, sessionId, midturnWindowMs)) return false;
+  }
   const last = msgs[msgs.length - 1];
   if (last && last.role === "assistant") {
     markMessageRunning(last);
@@ -4505,14 +4716,29 @@ function markMessageRunning(message) {
     message.text = "";
     message.progressNodes = nodes;
   }
-  for (let i = nodes.length - 1; i >= 0; i--) {
-    const node = nodes[i];
-    if (!node || typeof node !== "object") continue;
-    if (String(node.kind || "").trim().toLowerCase() === "text") continue;
-    const status = String(node.status || "").trim().toLowerCase();
-    if (["failed", "error", "cancelled", "canceled", "stopped"].includes(status)) continue;
-    node.status = "running";
-    break;
+  // The live edge must mirror what is actually happening NOW. If the trailing tool
+  // is still executing (no result yet), the running mark belongs on its node — the
+  // header reads "Read foo.swift" while the Read truly runs. But once that tool's
+  // result has landed (or the turn has no pending tool), the model is between
+  // steps — reading output / reasoning / composing — so append a running
+  // "Thinking" edge node instead: re-flagging the finished last tool left the
+  // header stuck on "Reading…" while the desktop showed "Thinking · N tokens".
+  if (message.trailingToolPending) {
+    for (let i = nodes.length - 1; i >= 0; i--) {
+      const node = nodes[i];
+      if (!node || typeof node !== "object") continue;
+      if (String(node.kind || "").trim().toLowerCase() === "text") continue;
+      const status = String(node.status || "").trim().toLowerCase();
+      if (["failed", "error", "cancelled", "canceled", "stopped"].includes(status)) continue;
+      node.status = "running";
+      break;
+    }
+    return message;
+  }
+  const edgeId = "live-think-" + String(message.uid || "0");
+  if (!nodes.length || String(nodes[nodes.length - 1].id || "") !== edgeId) {
+    nodes = nodes.concat([{ id: edgeId, label: "Thinking", kind: "thinking", status: "running", depth: 0 }]);
+    message.progressNodes = nodes;
   }
   return message;
 }
@@ -4596,9 +4822,23 @@ function startHistoryWatch(channel, { chatId, provider, sessionId, echo, limit }
         // instead of collapsing to a "Worked · N steps" card. For bridge tasks the
         // flag clears on close (refireHistoryWatch); for desktop runs a settle timer
         // below re-fires once the file goes quiet so the final card seals.
-        const liveByFile = sessionFileIsLive(provider, sessionId);
-        const running = !!runningEntry || liveByFile;
+        // Structural override (Claude): stop_reason=end_turn settles NOW even if the
+        // file was just written; tool_use/null keeps the turn live through long write
+        // gaps (thinking, builds) up to the mid-turn cap — the bare 15s mtime window
+        // flipped `running` off during those gaps and blanked the phone's live cell.
+        // Codex has no stop_reason and keeps the plain freshness window.
+        const stop = String((result && result.session && result.session.lastStopReason) || "").toLowerCase();
+        const structurallyDone = stop === "end_turn" || stop === "stop_sequence";
+        const midturnWindowMs = provider === "claude" ? DETAIL_MIDTURN_STALE_MS : LIVE_SESSION_WINDOW_MS;
         let last = msgs.length ? msgs[msgs.length - 1] : null;
+        // A trailing interrupt marker means the user STOPPED the turn: settle now.
+        // stop_reason still reads mid-turn after a stop, so without this the session
+        // would stay "running" for the whole mid-turn window.
+        const stoppedByUser = isInterruptMarkerMessage(last);
+        const liveByFile = structurallyDone || stoppedByUser
+          ? false
+          : sessionFileIsLive(provider, sessionId, midturnWindowMs);
+        let running = !!runningEntry || liveByFile;
         if (running && last && last.role === "assistant") {
           markMessageRunning(last);
           // Keep narration "text" nodes inside progressNodes (see markDetailLiveTurn):
@@ -4610,6 +4850,25 @@ function startHistoryWatch(channel, { chatId, provider, sessionId, echo, limit }
             msgs.push(placeholder);
             last = placeholder;
           }
+        } else if (last && last.role === "user" && !stoppedByUser
+            && sessionFileIsLive(provider, sessionId, midturnWindowMs)) {
+          // Fresh user prompt, no assistant entry yet: the model is thinking before
+          // its first token. Synthesize a running thinking turn so the phone goes
+          // live at send instead of at the first streamed text. (Not after a stop —
+          // the interrupt marker is a user message too, but nothing is coming.)
+          const placeholder = {
+            role: "assistant",
+            text: "",
+            uid: `running-mirror-${sessionId}`,
+            ts: new Date().toISOString(),
+            running: true,
+            progressNodes: [
+              { id: `running-mirror-${sessionId}`, label: "Thinking", kind: "thinking", status: "running", depth: 0 },
+            ],
+          };
+          msgs.push(placeholder);
+          last = placeholder;
+          running = true;
         }
         // The live feed grows by appending progress NODES (a new Read/Edit/Run step or
         // an interior narration "text" node) as well as by the trailing summary text
@@ -4956,9 +5215,14 @@ function pushAskRequest(channel, { provider, chatId, taskId, replyToId, requestI
 }
 
 // Awaited ask (MCP ask_user). Resolves { decision, answer } from `ask_response`.
-function requestAsk(channel, { provider, chatId, taskId, replyToId, kind, body }) {
+// `register`, if given, is called synchronously with { requestId, cancel } so the
+// caller can dismiss the still-pending phone sheet if its own side resolves first
+// (e.g. the desktop PreToolUse hook answered at the desk, or the hook timed out and
+// disconnected). Cancelling both drops the blocked promise AND tells the phone to
+// close the stale sheet.
+function requestAsk(channel, { provider, chatId, taskId, replyToId, kind, body }, register) {
   const requestId = newAskId(chatId);
-  return new Promise((resolve) => {
+  const promise = new Promise((resolve) => {
     const timer = setTimeout(() => {
       if (pendingAsks.delete(requestId)) {
         clearPendingAskForChat(chatId, requestId);
@@ -4975,6 +5239,33 @@ function requestAsk(channel, { provider, chatId, taskId, replyToId, kind, body }
     pushAskRequest(channel, { provider, chatId, taskId, replyToId, requestId, kind, body });
     console.log(`[vibe-bridge] ask_request ${requestId} kind=${kind} chat=${chatId}`);
   });
+  if (typeof register === "function") {
+    register({ requestId, cancel: (reason) => cancelAsk(channel, chatId, requestId, reason) });
+  }
+  return promise;
+}
+
+// Tell the phone to close a still-outstanding ask/command sheet — the request was
+// resolved somewhere else (desk keypress, hook timeout/disconnect) so the sheet is
+// now stale. No-op once the ask has already been answered or timed out.
+function pushAskCancel(channel, chatId, requestId, reason) {
+  try {
+    channel.push("ask_cancel", { chatId, requestId, reason: reason || "resolved_elsewhere" });
+    console.log(`[vibe-bridge][ask] push ask_cancel requestId=${requestId} chat=${chatId} reason=${reason || "resolved_elsewhere"}`);
+  } catch (e) {
+    console.log(`[vibe-bridge][ask] ask_cancel push THREW requestId=${requestId} ${e && e.message}`);
+  }
+}
+
+function cancelAsk(channel, chatId, requestId, reason) {
+  const entry = pendingAsks.get(requestId);
+  if (!entry) return false; // already answered / timed out — nothing to dismiss
+  pendingAsks.delete(requestId);
+  clearPendingAskForChat(chatId, requestId);
+  clearTimeout(entry.timer);
+  if (channel) pushAskCancel(channel, chatId, requestId, reason);
+  entry.resolve({ decision: "cancel", answer: null, cancelled: true });
+  return true;
 }
 
 // Drop the per-chat buffered ask once it's answered/timed out — but only if it still
@@ -5488,6 +5779,14 @@ function describeCommandApproval(req) {
 function handleAskIpcConnection(conn) {
   let buf = "";
   let handled = false;
+  let settled = false; // true once we've written the phone's answer back to the caller
+  let askHandle = null; // { requestId, cancel } for the outstanding phone sheet
+  // The caller (PreToolUse hook or MCP child) disconnected. If it happened BEFORE the
+  // phone answered, the request was resolved on its side (a desk keypress, or the hook
+  // timed out and fell back to a local prompt) — so dismiss the now-stale phone sheet.
+  conn.on("close", () => {
+    if (!settled && askHandle) askHandle.cancel("caller_disconnected");
+  });
   conn.setEncoding("utf8");
   conn.on("data", async (d) => {
     buf += d;
@@ -5518,14 +5817,18 @@ function handleAskIpcConnection(conn) {
     // Command approval (Claude --permission-prompt-tool OR the interactive PreToolUse
     // hook): relay the pending tool to the phone and map Approve/Skip/Deny back.
     if (req.type === "command") {
-      const verdict = await requestAsk(activeChannel, {
-        provider: "claude",
-        chatId,
-        taskId: req.taskId,
-        replyToId: null,
-        kind: "command",
-        body: describeCommandApproval(req),
-      });
+      const verdict = await requestAsk(
+        activeChannel,
+        {
+          provider: "claude",
+          chatId,
+          taskId: req.taskId,
+          replyToId: null,
+          kind: "command",
+          body: describeCommandApproval(req),
+        },
+        (handle) => { askHandle = handle; }
+      );
       const vAns = (verdict && verdict.answer) || {};
       const decision = String((verdict && verdict.decision) || "deny").toLowerCase();
       const approved = decision === "approve" || decision === "allow";
@@ -5539,20 +5842,26 @@ function handleAskIpcConnection(conn) {
                 ? "The user chose to skip this command — continue without it."
                 : "The user denied this command."),
           };
+      settled = true;
       try { conn.write(JSON.stringify({ answer }) + "\n"); } catch (_) {}
       try { conn.end(); } catch (_) {}
       return;
     }
 
-    const result = await requestAsk(activeChannel, {
-      provider: "claude",
-      chatId,
-      taskId: req.taskId,
-      replyToId: null,
-      kind: "ask",
-      body: { questions: Array.isArray(req.questions) ? req.questions : [] },
-    });
+    const result = await requestAsk(
+      activeChannel,
+      {
+        provider: "claude",
+        chatId,
+        taskId: req.taskId,
+        replyToId: null,
+        kind: "ask",
+        body: { questions: Array.isArray(req.questions) ? req.questions : [] },
+      },
+      (handle) => { askHandle = handle; }
+    );
     const answer = result && result.answer != null ? result.answer : { decision: result && result.decision };
+    settled = true;
     try { conn.write(JSON.stringify({ answer }) + "\n"); } catch (_) {}
     try { conn.end(); } catch (_) {}
   });
@@ -5728,6 +6037,205 @@ function attachSocketLivenessPing(conn) {
     misses = 0;
   });
   conn.on("close", () => clearInterval(pingTimer));
+}
+
+// ── Direct-LAN transport (phase 1: discovery + authenticated channel) ───────────────
+// The phone↔cloud↔Mac relay (WSS) is what makes Claude reachable from ANY network, so it
+// STAYS — remote access depends on it. But when the phone and Mac share a Wi-Fi, the relay
+// only adds latency and rides the flappy Cloudflare edge. This optional direct path lets a
+// co-located phone reach the bridge straight over the LAN. It is fully ADDITIVE: it never
+// touches the cloud socket, and any failure here is swallowed so the relay keeps working.
+//
+// SECURITY: a direct listening socket on the bridge is a remote-code-execution surface (the
+// bridge runs Claude with the user's shell). So a connection is UNTRUSTED until it proves it
+// holds the shared arte1 pairing key — the same 32-byte secret handed to the phone over the
+// pairing QR, which the server never sees. The bridge sends a random nonce; the phone must
+// return it sealed with the pairing key (encryptRuntimeBlob). A device on the same Wi-Fi
+// WITHOUT the key cannot forge that, so it is rejected before any task routing is reachable.
+// The bridge also proves ITS possession of the key in the ready frame (mutual auth).
+const LAN_ENABLED = process.env.VIBE_LAN_DISABLE !== "1";
+const LAN_SERVICE_TYPE = "_vibegram-bridge._tcp";
+const LAN_AUTH_TIMEOUT_MS = 6000;
+let lanServer = null;
+let lanAdvertiseProc = null;
+const lanClients = new Set();
+
+function startLanServer(userId) {
+  if (!LAN_ENABLED) {
+    console.log("[vibe-bridge] LAN transport disabled (VIBE_LAN_DISABLE=1) — cloud relay only");
+    return;
+  }
+  if (lanServer) return; // started once at boot; independent of the cloud socket's lifecycle
+  if (!RUNTIME_KEY_B64) {
+    console.warn("[vibe-bridge] LAN transport skipped — no pairing key established yet");
+    return;
+  }
+  const WSServer = WebSocket && (WebSocket.Server || WebSocket.WebSocketServer);
+  if (!WSServer) {
+    console.warn("[vibe-bridge] LAN transport unavailable — ws server class missing");
+    return;
+  }
+  try {
+    // port 0 → OS assigns a free ephemeral port; the actual port is advertised via Bonjour
+    // so there is never a fixed-port conflict. Bind all interfaces so the Mac's LAN IP works.
+    lanServer = new WSServer({ host: "0.0.0.0", port: 0 });
+    lanServer.on("listening", () => {
+      const port = lanServer.address() && lanServer.address().port;
+      console.log(`[vibe-bridge] LAN transport listening on 0.0.0.0:${port}`);
+      advertiseLanService(port, userId);
+    });
+    lanServer.on("connection", (sock, req) => {
+      try {
+        handleLanConnection(sock, req, userId);
+      } catch (err) {
+        console.error(`[vibe-bridge] LAN connection handler error: ${(err && err.message) || err}`);
+        try { sock.close(); } catch (_) {}
+      }
+    });
+    lanServer.on("error", (err) => {
+      console.error(`[vibe-bridge] LAN server error: ${(err && err.message) || err}`);
+    });
+  } catch (err) {
+    console.error(`[vibe-bridge] failed to start LAN transport: ${(err && err.message) || err}`);
+    lanServer = null;
+  }
+}
+
+// A Phoenix-channel-shaped adapter over a raw authed LAN socket, so the EXISTING request
+// handlers (runTask / handleHistoryRequest / …) push their replies straight to the phone
+// over the LAN with zero changes. Replies ride as {type, payload}; `.state` mirrors the
+// socket so a watcher's `channel.state !== "joined"` guard stops pushing to a dead LAN peer.
+// `.push().receive("ok")` fulfils immediately — a direct reliable socket needs no server
+// round-trip, and the progress frame-log prunes on "ok" exactly as over the cloud channel.
+function makeLanTransport(sock) {
+  const okApi = {
+    receive(status, cb) {
+      if (status === "ok") { try { cb({}); } catch (_) {} }
+      return okApi;
+    },
+  };
+  return {
+    get state() {
+      return sock.readyState === WebSocket.OPEN ? "joined" : "closed";
+    },
+    push(event, payload) {
+      if (sock.readyState === WebSocket.OPEN) {
+        try {
+          sock.send(JSON.stringify({ type: event, payload: payload == null ? {} : payload }));
+        } catch (_) {}
+      }
+      return okApi;
+    },
+    on() {}, // inbound is dispatched explicitly by handleLanConnection, not via channel.on
+  };
+}
+
+function handleLanConnection(sock, req, userId) {
+  const peer = (req && req.socket && req.socket.remoteAddress) || "?";
+  let authed = false;
+  let lanTransport = null;
+  const nonce = crypto.randomBytes(24).toString("base64url");
+  const send = (obj) => { try { sock.send(JSON.stringify(obj)); } catch (_) {} };
+  const authTimer = setTimeout(() => {
+    if (!authed) {
+      console.warn(`[vibe-bridge] LAN auth timeout from ${peer} — closing`);
+      try { sock.close(4401, "auth_timeout"); } catch (_) {}
+    }
+  }, LAN_AUTH_TIMEOUT_MS);
+  // Challenge first: the client must echo this nonce back sealed with the pairing key.
+  send({ type: "lan_challenge", nonce, bridgeUser: userId, proto: 1 });
+  sock.on("message", (raw) => {
+    let msg = null;
+    try { msg = JSON.parse(String(raw)); } catch (_) { return; }
+    if (!msg || typeof msg !== "object") return;
+    if (!authed) {
+      if (msg.type === "lan_auth" && typeof msg.proof === "string") {
+        const opened = decryptRuntimeBlob(msg.proof);
+        if (opened && opened.nonce === nonce) {
+          authed = true;
+          clearTimeout(authTimer);
+          lanClients.add(sock);
+          lanTransport = makeLanTransport(sock);
+          console.log(`[vibe-bridge] LAN client authenticated from ${peer}`);
+          // Prove the bridge holds the key too (mutual), hand over identity, and push the
+          // current bridge status (linked repos etc.) so the LAN client is immediately usable.
+          send({ type: "lan_ready", proof: encryptRuntimeBlob({ nonce, role: "bridge" }), user: userId });
+          try { pushBridgeStatus(lanTransport); } catch (_) {}
+        } else {
+          console.warn(`[vibe-bridge] LAN auth REJECTED from ${peer} (bad or missing proof)`);
+          try { sock.close(4403, "auth_failed"); } catch (_) {}
+        }
+      }
+      return;
+    }
+    // Authenticated LAN channel: route the SAME requests the cloud Phoenix channel serves,
+    // through the exact same handlers via the transport adapter. Replies + live history/
+    // progress stream straight back over the LAN. Ask emission intentionally still rides the
+    // cloud channel (the phone keeps its cloud socket up for regular messaging), so approval
+    // cards keep working regardless of which transport is carrying the agent stream.
+    const p = (msg.payload && typeof msg.payload === "object") ? msg.payload : {};
+    switch (msg.type) {
+      case "lan_ping":
+        send({ type: "lan_pong", ts: Date.now() });
+        break;
+      case "run_task":
+        runTask(lanTransport, p).catch((err) =>
+          console.error(`[vibe-bridge] LAN runTask error: ${(err && err.message) || err}`)
+        );
+        break;
+      case "control_task":
+        controlTask(lanTransport, p);
+        break;
+      case "history_request":
+        handleHistoryRequest(lanTransport, p);
+        break;
+      case "file_request":
+        handleFileRequest(lanTransport, p);
+        break;
+      case "usage_request":
+        handleUsageRequest(lanTransport, p).catch((err) =>
+          console.error(`[vibe-bridge] LAN usage_request error: ${(err && err.message) || err}`)
+        );
+        break;
+      case "ask_response":
+        resolveAsk(p);
+        break;
+      default:
+        break;
+    }
+  });
+  sock.on("close", () => { clearTimeout(authTimer); lanClients.delete(sock); });
+  sock.on("error", () => { clearTimeout(authTimer); lanClients.delete(sock); });
+}
+
+function advertiseLanService(port, userId) {
+  if (!port) return;
+  stopLanAdvertise();
+  try {
+    const label = `Vibe Bridge (${os.hostname()})`;
+    // macOS ships `dns-sd`, so Bonjour registration needs no npm dependency. The uid TXT
+    // record lets the phone pick the bridge for THIS account when several share a network.
+    lanAdvertiseProc = spawn(
+      "dns-sd",
+      ["-R", label, LAN_SERVICE_TYPE, ".", String(port), `uid=${userId}`],
+      { stdio: "ignore" }
+    );
+    lanAdvertiseProc.on("error", (err) => {
+      console.warn(
+        `[vibe-bridge] Bonjour advertise failed (${(err && err.message) || err}) — LAN still reachable by direct IP`
+      );
+    });
+    console.log(`[vibe-bridge] advertising ${LAN_SERVICE_TYPE} on port ${port} via Bonjour`);
+  } catch (err) {
+    console.warn(`[vibe-bridge] Bonjour advertise error: ${(err && err.message) || err}`);
+  }
+}
+
+function stopLanAdvertise() {
+  if (lanAdvertiseProc) {
+    try { lanAdvertiseProc.kill(); } catch (_) {}
+    lanAdvertiseProc = null;
+  }
 }
 
 function connect(server, token, userId) {
@@ -6062,6 +6570,14 @@ async function main() {
     return installService(server, config);
   }
 
+  // Bring up the optional direct-LAN path alongside the cloud relay. Guarded + additive:
+  // if it can't bind or advertise, the cloud connection below is entirely unaffected.
+  try {
+    startLanServer(config.user_id);
+  } catch (err) {
+    console.error(`[vibe-bridge] startLanServer failed (continuing cloud-only): ${(err && err.message) || err}`);
+  }
+
   connect(server, config.bridge_token, config.user_id);
 }
 
@@ -6085,6 +6601,7 @@ module.exports = {
 	  handleFileRequest,
 	  normalizeModel,
 	  runningPlaceholderMessage,
+	  markMessageRunning,
 	  sessionFilePath,
 	  sessionFileIsLive,
 	};

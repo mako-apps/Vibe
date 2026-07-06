@@ -39,7 +39,13 @@ final class ChatPhoenixClient: NSObject, URLSessionWebSocketDelegate, URLSession
   private let refLock = NSLock()
   private let connectRequestTimeout: TimeInterval = 8.0
   private let heartbeatInterval: TimeInterval = 10.0
-  private let heartbeatReplyTimeout: TimeInterval = 5.0
+  // A heartbeat reply that lands late is not a dead socket. The old 5s window
+  // false-positived on a degraded/high-latency path (mobile, congested Wi-Fi, the
+  // Cloudflare edge under load), tearing down a still-alive socket and forcing a
+  // reconnect + full history re-request — the same churn the bridge saw. 8s keeps
+  // send-dead detection responsive while tolerating ordinary jitter. Paired with the
+  // bridge's widened ws-ping watchdog (WS_PING_INTERVAL_MS / WS_PING_MAX_MISSES).
+  private let heartbeatReplyTimeout: TimeInterval = 8.0
   private var session: URLSession?
   private var task: URLSessionWebSocketTask?
   private var heartbeatTimer: DispatchSourceTimer?

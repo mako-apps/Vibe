@@ -27,3 +27,11 @@ let agentTurnVerticalPadding: CGFloat = bubbleTopPadding
 let agentTurnMaxWidthFactor: CGFloat = bubbleMaxWidthFactor
 let dayPillHorizontalPadding: CGFloat = 11.0
 let dayPillVerticalPadding: CGFloat = 4.0
+// One shared tall-content rule for BOTH user and agent bubbles: content taller than
+// the trigger collapses to the capped height and gains a tappable "Show more" /
+// "Show less" bar under the text. The trigger sits well above the cap so borderline
+// content never gets a bar that saves almost nothing (no collapse-for-20pt churn).
+let tallBubbleCollapseTriggerHeight: CGFloat = 560.0
+let tallBubbleCollapsedContentHeight: CGFloat = 420.0
+let tallBubbleToggleHeight: CGFloat = 28.0
+let tallBubbleToggleSpacing: CGFloat = 4.0

@@ -1034,14 +1034,19 @@ final class VibeAgentKitStreamingTextLabel: UITextView {
     }
 
     if previousTargetLength == 0, currentRenderedString.isEmpty, newAttributedText.length > 0 {
+      // First paint of THIS label instance — fresh, recycled, or a measurement pass.
+      // Render the whole thing immediately at full opacity; NEVER fade the initial
+      // content up from transparent. A cell recycle or a full-transcript re-push (the
+      // bridge re-pushes the whole session every watch tick) hands a fresh label the
+      // already-known text with previousTargetLength == 0 — revealing it from alpha 0
+      // each time IS the "cell blanks, then the text fades back in" flicker the user
+      // sees mid-stream. The gentle reveal is reserved for genuinely APPENDED deltas on
+      // a persistent label (the isAppendOnly path below), so streamed content only ever
+      // grows, never blinks out. Content stays on screen regardless of the connection.
       cancelChunkFade()
-      displayedCharacterLength = 0
-      committedCharacterLength = 0
-      enqueueAppendedReveal(
-        attributedText: newAttributedText,
-        targetString: targetString,
-        appendedStart: 0
-      )
+      displayedCharacterLength = newAttributedText.length
+      committedCharacterLength = newAttributedText.length
+      setDisplayedText(newAttributedText, animated: false)
       lastLoggedTargetLength = newAttributedText.length
       return
     }

@@ -1287,6 +1287,11 @@ private final class ChatsViewModel: ObservableObject {
             self.applyEngineProjection(chatID: chatID, reason: reason ?? "")
           }
           self.scheduleRealtimeRefresh()
+        case "agentProgress":
+          // A bridge run's live state changed — re-render so the agent row's preview
+          // tracks the current working label (or reverts to "Start session" when it
+          // clears). Debounced via scheduleRealtimeRefresh so token-rate frames coalesce.
+          self.scheduleRealtimeRefresh()
         default:
           break
         }
@@ -1498,6 +1503,14 @@ private final class ChatsViewModel: ObservableObject {
       let fetchedRows = try await ChatHomeService.fetchChats(config: config)
       let nextRows = fetchedRows.filter { !locallyRemovedChatIDs.contains($0.chatId) }
       if Self.rowsSnapshotSignature(nextRows) != Self.rowsSnapshotSignature(rows) {
+        // [EmptyTrace] Main (home) list jumps to empty here: a fetch that returned nothing
+        // (or everything filtered out) replaces a populated list. Log the transition so the
+        // device log shows whether the server returned 0 chats vs. a local filter wiped them.
+        if nextRows.isEmpty && !rows.isEmpty {
+          NSLog(
+            "[EmptyTrace] mainList EMPTY replace was=%d fetched=%d locallyRemoved=%d preserveRows=%@",
+            rows.count, fetchedRows.count, locallyRemovedChatIDs.count, preserveRows ? "Y" : "N")
+        }
         rows = nextRows
         AppUITrace.notice(
           "ChatsViewModel refresh applied rows=\(nextRows.count) preserveRows=\(preserveRows ? "Y" : "N") durationMs=\(Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000))"
@@ -6498,40 +6511,25 @@ final class ChatConversationController: UIViewController {
     let chatId = route.chatId
     let initialRows = route.initialRows
     if preferInitialRows {
-      // Seed rows synchronously so the conversation paints WITH the push instead of
-      // flashing empty for ~1s until the background getChatRows below round-trips and
-      // lands after viewDidAppear. When the route carries no initial rows (the common
-      // case from the home list), pull the on-device cached history NOW — a bounded
-      // disk-cache read on the engine queue, the exact call the async block makes — and
-      // use it as the immediate seed.
-      var seedRows = initialRows
-      var seedSource = "initial"
-      // Always consult the on-device cache, not just when the route seed is empty: the
-      // home row usually carries a 1-row preview, and seeding with that instead of the
-      // full cached transcript left the chat visually empty until the async getChatRows
-      // below landed mid-push. The cache read is the same synchronous engine call the
-      // async block makes; prefer whichever source has the fuller transcript.
-      let seedReadStart = CFAbsoluteTimeGetCurrent()
-      let cachedRows = ChatEngine.shared.getChatRows(["chatId": chatId])
-      if cachedRows.count > seedRows.count {
-        seedRows = cachedRows
-        seedSource = "nativeSync"
-      }
-      NSLog(
-        "[ChatOpen] refreshRows seed chatId=%@ initialRows=%d cached=%d usedSeed=%@ readMs=%d window=%@ up=%.2f",
-        String(chatId.prefix(12)), initialRows.count, cachedRows.count, seedSource,
-        Int((CFAbsoluteTimeGetCurrent() - seedReadStart) * 1000),
-        view.window != nil ? "Y" : "N", ProcessInfo.processInfo.systemUptime)
+      // Seed ONLY from the route's in-memory initialRows here — NEVER a synchronous
+      // engine read. getChatRows() blocks on the engine's serial queue, which is busy
+      // loading history when a chat opens, so calling it here (viewDidLoad, before the
+      // push animation) stalled the push by 1–2s for content-heavy chats. The full
+      // cached transcript is fetched OFF-THREAD by the async block below and rendered
+      // immediately on arrival via applyRowsToSurface's forced-layout path — so the push
+      // stays instant and warm chats still fill in without an empty flash.
       let firstRowID =
-        Self.normalizedString(seedRows.first?["id"])
-        ?? Self.normalizedString(seedRows.first?["messageId"])
+        Self.normalizedString(initialRows.first?["id"])
+        ?? Self.normalizedString(initialRows.first?["messageId"])
         ?? "nil"
-      appShellRouteLog(
-        "ChatConversationController refreshRows immediate chatId=\(chatId) rows=\(seedRows.count) source=\(seedSource) firstRowId=\(firstRowID)")
+      NSLog(
+        "[ChatOpen] refreshRows seed chatId=%@ initialRows=%d source=initial window=%@ up=%.2f",
+        String(chatId.prefix(12)), initialRows.count, view.window != nil ? "Y" : "N",
+        ProcessInfo.processInfo.systemUptime)
       let didApply = applyRowsToSurface(
-        seedRows,
+        initialRows,
         chatId: chatId,
-        source: seedSource,
+        source: "initial",
         firstRowID: firstRowID,
         allowDeferUntilAttached: true
       )
@@ -6790,7 +6788,10 @@ final class ChatConversationController: UIViewController {
       unreadCount: route.unreadCount,
       initialRows: latestProfileRows,
       agentEventInboxMode: route.agentEventInboxMode,
-      bridgeProvider: route.bridgeProvider
+      bridgeProvider: route.bridgeProvider,
+      // Forward the group participant list — without this the pushed profile
+      // always rendered 0 members (header→profile route dropped `members`).
+      members: route.members
     )
   }
 
@@ -9351,7 +9352,11 @@ enum GroupProfileActionRouter {
       onEdited?(newName, newAvatarUrl, newDescription)
       AppToastController.shared.show("Group updated.")
     }
-    presenter.present(UIHostingController(rootView: sheet), animated: true)
+    let host = UIHostingController(rootView: sheet)
+    // Clear the hosting backing so the sheet's `.presentationBackground(.ultraThinMaterial)`
+    // reads as true frosted glass rather than a material over an opaque view.
+    host.view.backgroundColor = .clear
+    presenter.present(host, animated: true)
   }
 
   private static func presentMemberActions(

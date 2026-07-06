@@ -134,6 +134,33 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   def extract_reserved_mentions(_), do: []
 
+  @doc """
+  Whether a message is a short greeting / acknowledgement / chit-chat with no
+  actionable task. Used to skip the "read AGENTS.md / inspect the repo" operating
+  rules so a plain "hi" doesn't make the agents start crawling the codebase before
+  the user has actually asked for any work.
+  """
+  def casual_message?(text) when is_binary(text) do
+    normalized = text |> String.downcase() |> String.trim()
+
+    cond do
+      normalized == "" ->
+        true
+
+      String.length(normalized) <= 40 and
+          Regex.match?(
+            ~r/^(hi+|hey+|hello+|yo|gm|gn|good (morning|afternoon|evening|night)|sup|what'?s up|howdy|hiya|hola|greetings|thanks|thank you|ty|thx|cheers|ok|okay|k|cool|nice|great|awesome|got it|gotcha|lol+|haha+|hehe|👋|🙏|👍|🙂|😄)[\s!.,?👋🙏👍🙂😄]*$/u,
+            normalized
+          ) ->
+        true
+
+      true ->
+        false
+    end
+  end
+
+  def casual_message?(_), do: false
+
   @doc "Whether a message is explicitly asking the local AI workers to run as a team."
   def team_trigger?(text) when is_binary(text) do
     Regex.match?(~r/(?:^|\s)(?:@team|\/team)\b/i, text) or
@@ -506,18 +533,36 @@ defmodule Vibe.AI.LocalAgentWorker do
     if group_chat?(chat_id) do
       context = group_collaboration_context(chat_id, requester_user_id)
 
-      """
-      #{group_framing(worker)}
+      if casual_message?(dispatch_text) do
+        # Greeting / chit-chat: no operating rules, no "read AGENTS.md". Vanilla
+        # claude/codex don't touch the repo unprompted — it was our injected rules
+        # that made a plain "hi" kick off file reads. Keep it conversational.
+        """
+        #{group_framing(worker)}
 
-      #{agent_operating_rules(worker)}
+        The latest message is casual conversation, not a work request. Reply briefly and in a friendly, human way. Do NOT read repo files (AGENTS.md, CLAUDE.md, etc.), inspect the codebase, or run any tools — only start doing real work once the user actually asks for it.
 
-      Shared conversation so far (you can see everyone's recent messages and the other agents' work; build on it and do not repeat completed work):
-      #{context_or_empty(context)}
+        Shared conversation so far:
+        #{context_or_empty(context)}
 
-      Latest request for you (#{worker.label}):
-      #{dispatch_text}
-      """
-      |> String.trim()
+        Latest message for you (#{worker.label}):
+        #{dispatch_text}
+        """
+        |> String.trim()
+      else
+        """
+        #{group_framing(worker)}
+
+        #{agent_operating_rules(worker)}
+
+        Shared conversation so far (you can see everyone's recent messages and the other agents' work; build on it and do not repeat completed work):
+        #{context_or_empty(context)}
+
+        Latest request for you (#{worker.label}):
+        #{dispatch_text}
+        """
+        |> String.trim()
+      end
     else
       dispatch_text
     end
@@ -2261,7 +2306,8 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp codex_item_fields("command_execution", item) do
     command = codex_command_string(item)
     output = item["aggregated_output"] || item["stdout"] || item["output"]
-    {"Bash", %{"command" => command}, output}
+    {tool, input} = codex_shell_tool(command)
+    {tool, input, output}
   end
 
   defp codex_item_fields("file_change", item) do
@@ -2294,7 +2340,7 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp codex_item_fields("function_call", item) do
     name = normalize_string(item["name"]) || normalize_string(item["tool"]) || "tool"
     input = codex_decode_arguments(item["arguments"])
-    {codex_function_tool_name(name, input), input, nil}
+    codex_function_fields(name, input)
   end
 
   defp codex_item_fields("function_call_output", item) do
@@ -2305,7 +2351,7 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp codex_item_fields("custom_tool_call", item) do
     name = normalize_string(item["name"]) || normalize_string(item["tool"]) || "tool"
     input = codex_decode_arguments(item["input"] || item["arguments"])
-    {codex_function_tool_name(name, input), input, nil}
+    codex_function_fields(name, input)
   end
 
   defp codex_item_fields("custom_tool_call_output", item) do
@@ -2323,25 +2369,44 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   # Unknown / future item types: best-effort generic mapping.
   defp codex_item_fields(type, item) do
-    tool =
-      cond do
-        codex_command_string(item) != nil -> "Bash"
-        normalize_string(item["name"]) -> normalize_string(item["name"])
-        normalize_string(item["tool"]) -> normalize_string(item["tool"])
-        type not in [nil, ""] -> codex_titlecase(type)
-        true -> "Tool"
-      end
+    output = item["output"] || item["result"] || item["content"] || item["text"]
 
-    input =
-      cond do
-        is_map(item["input"]) -> item["input"]
-        is_map(item["arguments"]) -> item["arguments"]
-        is_binary(item["arguments"]) -> %{"arguments" => item["arguments"]}
-        codex_command_string(item) != nil -> %{"command" => codex_command_string(item)}
-        true -> %{}
-      end
+    case codex_command_string(item) do
+      nil ->
+        tool =
+          cond do
+            normalize_string(item["name"]) -> normalize_string(item["name"])
+            normalize_string(item["tool"]) -> normalize_string(item["tool"])
+            type not in [nil, ""] -> codex_titlecase(type)
+            true -> "Tool"
+          end
 
-    {tool, input, item["output"] || item["result"] || item["content"] || item["text"]}
+        input =
+          cond do
+            is_map(item["input"]) -> item["input"]
+            is_map(item["arguments"]) -> item["arguments"]
+            is_binary(item["arguments"]) -> %{"arguments" => item["arguments"]}
+            true -> %{}
+          end
+
+        {tool, input, output}
+
+      command ->
+        {tool, input} = codex_shell_tool(command)
+        {tool, input, output}
+    end
+  end
+
+  # A function/custom tool call: shell tool names (`exec_command`, …) route through
+  # the shell classifier so `cat`/`rg`/`sed` read like Claude's Read/Grep; everything
+  # else keeps its name-based mapping (apply_patch → Edit, view_image → ViewImage, …).
+  defp codex_function_fields(name, input) do
+    if codex_shell_tool_name?(name) do
+      {tool, shell_input} = codex_shell_tool(codex_command_string(input))
+      {tool, shell_input, nil}
+    else
+      {codex_function_tool_name(name, input), input, nil}
+    end
   end
 
   defp codex_command_string(item) do
@@ -2363,6 +2428,153 @@ defmodule Vibe.AI.LocalAgentWorker do
 
       true ->
         nil
+    end
+  end
+
+  # Codex only has a raw shell, so a bare `rg …` / `sed -n …` / `cat …` renders as
+  # low-level "Run <shell>" noise — unlike Claude, whose high-level Read/Grep tools
+  # give clean "Read foo.swift" / "Search pattern" rows. Classify the command's lead
+  # program into the SAME Read/Grep tool shapes so a Codex feed reads like Claude's.
+  # Anything unrecognized stays a plain "Run <command>" ({"Bash", …}). Mirrors
+  # codexShellDetail in the bridge (agent-bridge/bin/vibe-bridge.js).
+  @codex_read_cmds ~w(cat head tail less more bat nl sed)
+  @codex_search_cmds ~w(rg grep egrep fgrep ag ack ripgrep)
+  @codex_shell_tool_names ~w(exec_command shell local_shell container.exec bash run_command)
+
+  defp codex_shell_tool(command) do
+    cmd = command |> to_string() |> String.replace(~r/\s+/, " ") |> String.trim()
+    bash = {"Bash", %{"command" => cmd}}
+
+    if cmd == "" do
+      bash
+    else
+      first =
+        cmd
+        |> codex_unwrap_shell()
+        |> String.split(~r/\s*(?:&&|\|\||[|;])\s*/, parts: 2)
+        |> List.first()
+        |> to_string()
+
+      case first |> codex_shell_tokens() |> codex_strip_shell_prefixes() do
+        [] ->
+          bash
+
+        [prog | args] ->
+          base = prog |> String.split("/") |> List.last() |> String.downcase()
+
+          cond do
+            base in @codex_read_cmds -> codex_shell_read_tool(base, args, bash)
+            base in @codex_search_cmds -> codex_shell_search_tool(args, bash)
+            true -> bash
+          end
+      end
+    end
+  end
+
+  defp codex_shell_tool_name?(name), do: to_string(name) in @codex_shell_tool_names
+
+  # `sed` is a "read" only in its common `-n 'A,Bp'` print form; an editing sed
+  # (e.g. `sed -i …`) stays a plain command.
+  defp codex_shell_read_tool("sed", args, bash) do
+    has_range = Enum.any?(args, &Regex.match?(~r/^\d+,\d+p?$/, &1))
+
+    if "-n" in args or has_range do
+      codex_shell_read_tool(nil, args, bash)
+    else
+      bash
+    end
+  end
+
+  defp codex_shell_read_tool(_prog, args, bash) do
+    case codex_last_path_arg(args) do
+      nil -> bash
+      file -> {"Read", %{"file_path" => file}}
+    end
+  end
+
+  defp codex_shell_search_tool(args, bash) do
+    case codex_search_pattern(args, false) do
+      nil -> bash
+      pattern -> {"Grep", %{"pattern" => pattern}}
+    end
+  end
+
+  # Unwrap `bash -lc '<inner>'` / `sh -c "<inner>"` (and strip the inner command's
+  # surrounding quotes) so the wrapped program can be classified.
+  defp codex_unwrap_shell(cmd) do
+    case Regex.run(~r/^(?:\/\S+\/)?(?:bash|sh|zsh)\s+-[a-z]*c\s+(.+)$/i, cmd) do
+      [_, inner] -> inner |> String.trim() |> codex_unquote()
+      _ -> cmd
+    end
+  end
+
+  defp codex_unquote(s) do
+    first = String.first(s)
+
+    if first in ["\"", "'"] and String.last(s) == first and String.length(s) >= 2 do
+      s |> String.slice(1, String.length(s) - 2) |> String.trim()
+    else
+      s
+    end
+  end
+
+  # Minimal shell tokenizer: split on unquoted whitespace, strip one layer of
+  # single/double quotes (so `rg -n "A|B" path` → ["rg", "-n", "A|B", "path"]).
+  defp codex_shell_tokens(command) do
+    {toks, cur, started, _quote} =
+      command
+      |> to_string()
+      |> String.graphemes()
+      |> Enum.reduce({[], "", false, nil}, fn ch, {toks, cur, started, quote} ->
+        cond do
+          quote != nil ->
+            if ch == quote, do: {toks, cur, true, nil}, else: {toks, cur <> ch, true, quote}
+
+          ch == "\"" or ch == "'" ->
+            {toks, cur, true, ch}
+
+          ch == " " or ch == "\t" ->
+            if started, do: {[cur | toks], "", false, nil}, else: {toks, cur, false, nil}
+
+          true ->
+            {toks, cur <> ch, true, nil}
+        end
+      end)
+
+    toks = if started, do: [cur | toks], else: toks
+    Enum.reverse(toks)
+  end
+
+  # Drop leading env assignments (FOO=bar) and `sudo`/`command` prefixes.
+  defp codex_strip_shell_prefixes([tok | rest] = tokens) do
+    cond do
+      Regex.match?(~r/^[A-Za-z_][A-Za-z0-9_]*=/, tok) -> codex_strip_shell_prefixes(rest)
+      tok in ["sudo", "command"] -> codex_strip_shell_prefixes(rest)
+      true -> tokens
+    end
+  end
+
+  defp codex_strip_shell_prefixes([]), do: []
+
+  # Last positional (non-flag, non-numeric-range) argument → the file a read touches.
+  defp codex_last_path_arg(args) do
+    args
+    |> Enum.reverse()
+    |> Enum.find(fn a ->
+      a != "" and not String.starts_with?(a, "-") and
+        not Regex.match?(~r/^\d+(,\d+)?[a-z]?$/i, a)
+    end)
+  end
+
+  # First positional argument → the pattern a grep/rg searches for (respect `-e PAT`).
+  defp codex_search_pattern([], _take_next), do: nil
+
+  defp codex_search_pattern([a | rest], take_next) do
+    cond do
+      take_next -> a
+      a in ["-e", "--regexp", "--regex"] -> codex_search_pattern(rest, true)
+      a != "" and not String.starts_with?(a, "-") -> a
+      true -> codex_search_pattern(rest, false)
     end
   end
 

@@ -11,6 +11,7 @@ final class ChatPinnedBannerView: UIControl {
   private let bodyLabel = UILabel()
   private let textStack = UIStackView()
   private var isFilePinned = false
+  private var iconAccentColor: UIColor?
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -59,11 +60,17 @@ final class ChatPinnedBannerView: UIControl {
       blurView.contentView.backgroundColor = surfaceColor.withAlphaComponent(isDark ? 0.16 : 0.10)
     }
     blurView.alpha = isDark ? 0.98 : 0.94
-    iconContainer.backgroundColor = surfaceColor.withAlphaComponent(isDark ? 0.24 : 0.16)
-    iconGlowView.backgroundColor = textColor.withAlphaComponent(isDark ? 0.30 : 0.20)
-    iconImageView.tintColor = textColor.withAlphaComponent(0.95)
+    let iconColor = iconAccentColor ?? textColor
+    let iconFillColor = iconAccentColor ?? surfaceColor
+    iconContainer.backgroundColor = iconFillColor.withAlphaComponent(isDark ? 0.24 : 0.16)
+    iconGlowView.backgroundColor = iconColor.withAlphaComponent(isDark ? 0.30 : 0.20)
+    iconImageView.tintColor = iconColor.withAlphaComponent(0.95)
     titleLabel.textColor = textColor.withAlphaComponent(0.96)
     bodyLabel.textColor = textColor.withAlphaComponent(0.82)
+  }
+
+  func applyIconAccent(_ color: UIColor?) {
+    iconAccentColor = color
   }
 
   private func setup() {

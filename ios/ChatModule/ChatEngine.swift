@@ -411,6 +411,21 @@ final class ChatEngine {
   private var nativeTypingStateByChatId: [String: Bool] = [:]
   private var peerTypingUserIdsByChatId: [String: Set<String>] = [:]
   private var agentProgressByChatId: [String: AgentProgressState] = [:]
+  // Last time this chat's transcript showed a RUNNING agent turn (ms). A watch-mirrored
+  // session (e.g. one running in the IDE) re-pushes its whole transcript every watch
+  // tick, and the bridge's `running` flag flip-flops across those pushes; without a
+  // grace window a single non-running push would idle the header to "Start session" and
+  // collapse the live row, only to snap back on the next push. We hold the working state
+  // for a short grace after the last running push so a transient blip doesn't blank it.
+  private var agentTurnRunningAtMsByChatId: [String: Int64] = [:]
+  private static let agentTurnRunningGraceMs: Int64 = 12_000
+  // Signature of the last agent-bridge session transcript applied per chat. The bridge
+  // already dedups identical pushes WITHIN a watch (rec.lastSig), but a socket flap resets
+  // that and forces a full re-push of unchanged state on every reconnect — which on the
+  // client meant re-decrypting all N rows + a reloadData storm every ~50s. When the incoming
+  // transcript matches what we already applied we skip that churn (and only re-assert the
+  // live header, cheaply). Mirrors the bridge's sig granularity so a genuine change never skips.
+  private var lastIngestedBridgeSessionSigByChatId: [String: String] = [:]
   // Stable first-seen timestamp for each live agent stream (keyed chatId -> streamId)
   // so the streaming bubble keeps its position while its text grows.
   private var agentStreamTimestampsByChat: [String: [String: Int64]] = [:]
@@ -2169,8 +2184,13 @@ final class ChatEngine {
     }
 
     // The ask is resolved once; drop the cached request so a stale sheet can't
-    // re-answer it.
-    syncOnQueue { _ = agentBridgeAskByRequestId.removeValue(forKey: requestId) }
+    // re-answer it. Refresh the running mark too: the CLI takes a beat to resume
+    // streaming after an approval, and the outstanding-ask hold just ended — without
+    // this the settle-clear's grace could expire in that resume gap.
+    syncOnQueue {
+      _ = agentBridgeAskByRequestId.removeValue(forKey: requestId)
+      agentTurnRunningAtMsByChatId[chatId] = Int64(nowMs())
+    }
 
     return syncOnQueue {
       guard let client = phoenixClient else {
@@ -2429,6 +2449,33 @@ final class ChatEngine {
     return nil
   }
 
+  private func bridgeSessionSignatureText(_ raw: Any?) -> String {
+    let text = normalizedString(raw) ?? ""
+    guard !text.isEmpty else { return "0" }
+    let head = String(text.prefix(32))
+    let tail = String(text.suffix(32))
+    return "\(text.count):\(head):\(tail)"
+  }
+
+  private func bridgeSessionProgressNodesSignature(_ raw: Any?) -> String {
+    guard let nodes = raw as? [[String: Any]], !nodes.isEmpty else { return "0" }
+    return nodes.enumerated().map { index, node in
+      let id = normalizedString(node["id"]) ?? "\(index)"
+      let kind = normalizedString(node["kind"] ?? node["itemType"]) ?? ""
+      let status = normalizedString(node["status"]) ?? ""
+      let label = bridgeSessionSignatureText(
+        node["label"] ?? node["title"] ?? node["text"] ?? node["content"] ?? node["message"]
+          ?? node["summary"])
+      let target = bridgeSessionSignatureText(
+        node["target"] ?? node["path"] ?? node["file_path"] ?? node["filePath"])
+      let tokens = parseLongValue(node["tokens"]).map(String.init) ?? ""
+      let duration = parseLongValue(node["durationMs"] ?? node["duration_ms"]).map(String.init) ?? ""
+      let added = parseLongValue(node["added"]).map(String.init) ?? ""
+      let removed = parseLongValue(node["removed"]).map(String.init) ?? ""
+      return "\(id)|\(kind)|\(status)|\(label)|\(target)|\(tokens)|\(duration)|\(added)|\(removed)"
+    }.joined(separator: "||")
+  }
+
   private func ingestAgentBridgeSessionLocked(
     chatId: String,
     provider: String,
@@ -2461,6 +2508,52 @@ final class ChatEngine {
     let rawMessages = session["messages"] as? [[String: Any]] ?? []
     guard !rawMessages.isEmpty else { return }
 
+    // Idempotent-ingest gate: if this transcript is identical to the last one we applied
+    // for this chat (the common case on a socket-flap reconnect re-push), skip the whole
+    // per-row re-decrypt + tombstone + reloadData churn. We still cheaply re-assert the
+    // live header, in case a socket reset cleared agentProgress while we were down. The
+    // signature mirrors the bridge's own dedup granularity (count + last turn identity +
+    // progress-node content/status + running), so genuine text growth falls through and
+    // re-applies instead of freezing an older/empty cell.
+    let lastRaw = rawMessages.last
+    let lastRawUid = normalizedString(lastRaw?["uid"] ?? lastRaw?["id"]) ?? ""
+    let lastRawTextSig = bridgeSessionSignatureText(lastRaw?["text"])
+    let lastRawNodeSig = bridgeSessionProgressNodesSignature(
+      lastRaw?["progressNodes"] ?? lastRaw?["progress_nodes"])
+    let lastRawRunning = (lastRaw?["running"] as? Bool) == true
+    let ingestSig =
+      "\(rawMessages.count):\(sessionId):\(lastRawUid):\(lastRawTextSig):\(lastRawNodeSig):\(lastRawRunning)"
+    if lastIngestedBridgeSessionSigByChatId[chatId] == ingestSig {
+      if lastRawRunning {
+        agentTurnRunningAtMsByChatId[chatId] = Int64(nowMs())
+        let nodes =
+          (lastRaw?["progressNodes"] as? [[String: Any]])
+          ?? (lastRaw?["progress_nodes"] as? [[String: Any]]) ?? []
+        setAgentProgressLocked(
+          chatId: chatId,
+          label: agentProgressLabelFromNodes(nodes) ?? "Thinking",
+          tool: nil,
+          status: "running")
+      }
+      return
+    }
+    // Transcript GROWTH is proof of life, independent of the watcher's flaky `running`
+    // flag. A watch-mirrored session (IDE-run; the bridge never spawned it) produces no
+    // agent-stream frames at all, and its `running` flag flip-flops across re-pushes —
+    // so during a long thinking/tool gap the flag can sit false past the grace and the
+    // settle-clear wipes a turn whose content is visibly growing push-over-push. If this
+    // push differs from the previous one for the SAME session and its newest item is an
+    // agent item, refresh the running mark. First ingest (no prior sig) doesn't count —
+    // opening an old, finished chat must not light the working header.
+    let previousIngestSig = lastIngestedBridgeSessionSigByChatId[chatId]
+    let lastRawRole = (normalizedString(lastRaw?["role"]) ?? "").lowercased()
+    if let previousIngestSig, previousIngestSig.contains(":\(sessionId):"),
+      previousIngestSig != ingestSig, lastRawRole != "user"
+    {
+      agentTurnRunningAtMsByChatId[chatId] = Int64(nowMs())
+    }
+    lastIngestedBridgeSessionSigByChatId[chatId] = ingestSig
+
     let agentName: String = {
       switch provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
       case "claude": return "Claude"
@@ -2480,6 +2573,7 @@ final class ChatEngine {
       (liveMessageRowsByChat[chatId] ?? [:]).keys.contains { $0.hasPrefix("stream-") }
     var sawRunningAgentItem = false
     var ingestedAgentRow = false
+    var runningTurnProgressNodes: [[String: Any]] = []
 
     for (index, item) in rawMessages.enumerated() {
       let role = (normalizedString(item["role"]) ?? "").lowercased()
@@ -2494,6 +2588,9 @@ final class ChatEngine {
       let isRunningTranscriptItem = role != "user" && (item["running"] as? Bool) == true
       if isRunningTranscriptItem {
         sawRunningAgentItem = true
+        runningTurnProgressNodes =
+          (item["progressNodes"] as? [[String: Any]])
+          ?? (item["progress_nodes"] as? [[String: Any]]) ?? []
         // A live stream row already shows this turn — skip the parallel session row
         // (and let the tombstone below drop any previously-ingested running row) so
         // the chat list never shows two "working" cards for one turn.
@@ -2606,9 +2703,33 @@ final class ChatEngine {
     // it. Drop it so the finished turn isn't shown twice (mirrors the persisted-message
     // path's removeAgentStreamRowsLocked at the "message" frame).
     if ingestedAgentRow, !sawRunningAgentItem {
-      // Pass nil: a bridge DM has a single agent, so clear every live stream bubble
-      // for this chat rather than depending on the stream payload's userId matching.
-      removeAgentStreamRowsLocked(chatId: chatId, agentUserId: nil)
+      // The transcript settled — the header's working indicator must not linger. BUT a
+      // watch-mirrored session's `running` flag flip-flops across the bridge's per-tick
+      // re-pushes: a single non-running push does NOT mean the run finished. Hold the
+      // working state AND the synthetic live row through a short grace after the last
+      // running push so a stale detail snapshot cannot blank the bubble/header and then
+      // snap back when the next live tick arrives.
+      let sinceRunningMs = Int64(nowMs()) - (agentTurnRunningAtMsByChatId[chatId] ?? 0)
+      // An outstanding ask/command approval means the run is PAUSED waiting on the user:
+      // the CLI is blocked, so no stream frames flow and no transcript push shows a
+      // running turn — the grace expires "legitimately" and would wipe the live turn
+      // mid-approval (header flips to "Start session", the working cell collapses, and
+      // it all snaps back after Approve). The run is not dead, it's waiting — hold.
+      let hasOutstandingAskLocked = agentBridgeAskByRequestId.values.contains { payload in
+        (normalizedString(payload["chatId"]) ?? "") == chatId
+      }
+      if hasOutstandingAskLocked {
+        NSLog(
+          "[EmptyTrace] ingestSettle HOLD chatId=%@ reason=outstandingAsk sinceRunningMs=%lld",
+          String(chatId.suffix(12)), sinceRunningMs)
+        agentTurnRunningAtMsByChatId[chatId] = Int64(nowMs())
+      } else if sinceRunningMs >= Self.agentTurnRunningGraceMs {
+        // Pass nil: a bridge DM has a single agent, so clear every live stream bubble
+        // for this chat rather than depending on the stream payload's userId matching.
+        removeAgentStreamRowsLocked(chatId: chatId, agentUserId: nil)
+        agentTurnRunningAtMsByChatId.removeValue(forKey: chatId)
+        clearAgentProgressLocked(chatId: chatId, reason: "ingestSettle(noRunningTurn)")
+      }
     }
 
     // A transcript with a RUNNING turn is this chat's live session — register it in the
@@ -2618,6 +2739,9 @@ final class ChatEngine {
     // re-arms this watch. Keyed to THIS reply's requestId — the bridge's transcript
     // watcher re-pushes under the same id, which is what the history handler matches.
     if sawRunningAgentItem {
+      // Remember when we last saw this chat actively running so the settle-clear branch
+      // above can distinguish a transient non-running re-push from a genuine finish.
+      agentTurnRunningAtMsByChatId[chatId] = Int64(nowMs())
       let requestId = normalizedString(payload["requestId"]) ?? UUID().uuidString
       let existing = liveBridgeSessionIngestByChatId[chatId]
       if existing?.sessionId != sessionId || existing?.requestId != requestId {
@@ -2625,6 +2749,16 @@ final class ChatEngine {
           provider: provider, sessionId: sessionId, requestId: requestId
         )
       }
+      // Drive the chat header's working state from the ingest too: a watch-driven
+      // session (e.g. one running in the IDE, never spawned by the bridge) produces no
+      // agent-stream frames, so this is its ONLY live signal. Same label logic as the
+      // stream path — latest tool action, or "Thinking · N tokens" for a thinking node.
+      setAgentProgressLocked(
+        chatId: chatId,
+        label: agentProgressLabelFromNodes(runningTurnProgressNodes) ?? "Thinking",
+        tool: nil,
+        status: "running"
+      )
     }
 
     // Clear rows left over from a PRIOR transcript shape. A previously-ingested row
@@ -2648,7 +2782,29 @@ final class ChatEngine {
         }
       }
       let alreadyDeleted = deletedMessageIdsByChat[chatId] ?? []
-      let staleIds = cachedSessionIds.subtracting(ingestedIds).subtracting(alreadyDeleted)
+      var staleIds = cachedSessionIds.subtracting(ingestedIds).subtracting(alreadyDeleted)
+      if !staleIds.isEmpty {
+        NSLog(
+          "[EmptyTrace] tombstone chatId=%@ stale=%d cached=%d ingested=%d truncated=N",
+          String(chatId.suffix(12)), staleIds.count, cachedSessionIds.count, ingestedIds.count)
+        // Mid-run mass-removal guard: while this chat's turn is live (running mark within
+        // grace, or an ask outstanding), the only legitimate tombstone is the running row
+        // superseded by its live stream twin — one or two ids. A push that suddenly lacks
+        // MANY previously-ingested rows mid-run is a bad/windowed snapshot missing its
+        // `truncated` flag, and honoring it wipes the whole visible transcript. Skip it;
+        // the next complete push reconciles for real.
+        let sinceRunningMs = Int64(nowMs()) - (agentTurnRunningAtMsByChatId[chatId] ?? 0)
+        let askOutstanding = agentBridgeAskByRequestId.values.contains { payload in
+          (normalizedString(payload["chatId"]) ?? "") == chatId
+        }
+        let runIsLive = askOutstanding || sinceRunningMs < Self.agentTurnRunningGraceMs
+        if runIsLive, staleIds.count > 2 {
+          NSLog(
+            "[EmptyTrace] tombstone SKIP chatId=%@ stale=%d (live run — refusing mass removal)",
+            String(chatId.suffix(12)), staleIds.count)
+          staleIds.removeAll()
+        }
+      }
       if !staleIds.isEmpty {
         var perChat = liveMessageRowsByChat[chatId] ?? [:]
         var deleted = deletedMessageIdsByChat[chatId] ?? Set<String>()
@@ -4519,7 +4675,19 @@ final class ChatEngine {
     return syncOnQueue {
       _ = restoreCachedHistoryRowsLocked(chatId: chatId)
       restoreVolatileBridgeRowsIfNeededLocked(chatId: chatId)
-      return mergedChatRowsLocked(chatId: chatId)
+      let merged = mergedChatRowsLocked(chatId: chatId)
+      // [EmptyTrace] The view pulls its rows here. Log when this returns EMPTY — that's the
+      // "list jumps to empty" moment. The live/hist breakdown says WHERE the content went:
+      // live=0 & hist=0 → both stores wiped (a reset), live=0 & hist>0 → merge/filter drop.
+      if merged.isEmpty {
+        NSLog(
+          "[EmptyTrace] getChatRows EMPTY chatId=%@ live=%d hist=%d progress=%@",
+          String(chatId.suffix(12)),
+          liveMessageRowsByChat[chatId]?.count ?? 0,
+          historyRowsByChat[chatId]?.count ?? 0,
+          agentProgressByChatId[chatId] != nil ? "active" : "cleared")
+      }
+      return merged
     }
   }
 
@@ -4875,7 +5043,8 @@ final class ChatEngine {
     ]).contains(normalizedStatus)
 
     if shouldClear {
-      clearAgentProgressLocked(chatId: chatId, status: normalizedStatus)
+      clearAgentProgressLocked(
+        chatId: chatId, status: normalizedStatus, reason: "setProgress(status=\(normalizedStatus))")
       return
     }
 
@@ -4896,8 +5065,16 @@ final class ChatEngine {
     emitAgentProgressChangeLocked(chatId: chatId, state: next)
   }
 
-  private func clearAgentProgressLocked(chatId: String, status: String = "done") {
+  private func clearAgentProgressLocked(
+    chatId: String, status: String = "done", reason: String = "-"
+  ) {
     guard let previous = agentProgressByChatId.removeValue(forKey: chatId) else { return }
+    // [EmptyTrace] The header flipping to "Start session" mid-stream = this firing. Log WHO
+    // cleared it (reason) + what was showing, so a device log pins the trigger. Pair with
+    // the [EmptyTrace] getChatRows/reset lines to see if the row wipe rides the same event.
+    NSLog(
+      "[EmptyTrace] clearAgentProgress chatId=%@ reason=%@ hadLabel=%@ status=%@",
+      String(chatId.suffix(12)), reason, previous.label, status)
     let normalizedStatus =
       status.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
       ? "done"
@@ -5008,7 +5185,11 @@ final class ChatEngine {
     }
 
     if status == "done" || status == "error" || status == "stopped" {
-      clearAgentProgressLocked(chatId: chatId, status: status)
+      clearAgentProgressLocked(chatId: chatId, status: status, reason: "streamFrame(status=\(status))")
+      // The LIVE stream declared this turn finished — drop the running-window mark so the
+      // ingest settle-clear can promptly retire the stale stream row once the transcript
+      // confirms done, instead of waiting out the full grace.
+      agentTurnRunningAtMsByChatId.removeValue(forKey: chatId)
       if let taskId, !taskId.isEmpty {
         liveStreamTaskRowIdByChatId[chatId]?.removeValue(forKey: taskId)
         if liveStreamTaskRowIdByChatId[chatId]?.isEmpty == true {
@@ -5036,37 +5217,20 @@ final class ChatEngine {
     // the bare pre-first-token state (no progress nodes at all yet) — so the chat
     // header reads "Thinking…" instead of a generic "Working…" the instant a turn
     // starts, before anything is renderable in the transcript body.
-    let latestActionNode = progressNodes.reversed().first(where: { node in
-      ((normalizedString(node["kind"] ?? node["itemType"]) ?? "").lowercased()) != "text"
-    })
-    var latestActionLabel = latestActionNode.flatMap {
-      normalizedString($0["label"] ?? $0["title"])
-    }
-    // A live thinking node carries the streamed reasoning-token counter — surface it in
-    // the working label ("Thinking · 1.2k tokens") so the chat header ticks in real time
-    // like the desktop CLI instead of a frozen "Thinking".
-    if let node = latestActionNode,
-      (normalizedString(node["kind"] ?? node["itemType"]) ?? "").lowercased() == "thinking",
-      let tokens = parseLongValue(node["tokens"]), tokens > 0
-    {
-      let count =
-        tokens >= 1000
-        ? String(format: "%.1fk tokens", Double(tokens) / 1000.0)
-        : "\(tokens) tokens"
-      latestActionLabel = "Thinking · \(count)"
-    }
-    let streamProgressLabel =
-      latestActionLabel
-      ?? progressNodes.reversed().compactMap { node in
-        normalizedString(node["label"] ?? node["title"])
-      }.first
-      ?? "Thinking"
+    let streamProgressLabel = agentProgressLabelFromNodes(progressNodes) ?? "Thinking"
     setAgentProgressLocked(
       chatId: chatId,
       label: streamProgressLabel,
       tool: nil,
       status: "running"
     )
+    // Refresh the running-window mark from the LIVE stream too — not just the ingest path.
+    // A watch-mirrored transcript re-push can momentarily report the turn as not-running
+    // while agent-stream frames are still flowing; without this, the ingest settle-clear's
+    // grace (previously measured only from the last INGEST-observed running turn) expires
+    // mid-run and wipes the live header → "Start session" flicker + collapsed cell. Every
+    // stream frame is proof the turn is alive, so it keeps the grace fresh.
+    agentTurnRunningAtMsByChatId[chatId] = Int64(nowMs())
 
     // Stable timestamp so the bubble holds its position as text grows.
     var perChat = agentStreamTimestampsByChat[chatId] ?? [:]
@@ -5141,6 +5305,33 @@ final class ChatEngine {
     )
   }
 
+  /// Working label for a turn's latest activity — the last non-text node's label, with a
+  /// live thinking node formatted as "Thinking · 1.2k tokens" so the chat header ticks in
+  /// real time like the desktop CLI. Shared by the agent-stream path and the
+  /// session-ingest (watch) path: watch-driven sessions (including IDE-owned ones the
+  /// bridge never spawned) get no agent-stream frames at all, so the header state must be
+  /// derivable from the ingested transcript too.
+  private func agentProgressLabelFromNodes(_ progressNodes: [[String: Any]]) -> String? {
+    let latestActionNode = progressNodes.reversed().first(where: { node in
+      ((normalizedString(node["kind"] ?? node["itemType"]) ?? "").lowercased()) != "text"
+    })
+    var label = latestActionNode.flatMap { normalizedString($0["label"] ?? $0["title"]) }
+    if let node = latestActionNode,
+      (normalizedString(node["kind"] ?? node["itemType"]) ?? "").lowercased() == "thinking",
+      let tokens = parseLongValue(node["tokens"]), tokens > 0
+    {
+      let count =
+        tokens >= 1000
+        ? String(format: "%.1fk tokens", Double(tokens) / 1000.0)
+        : "\(tokens) tokens"
+      label = "Thinking · \(count)"
+    }
+    return label
+      ?? progressNodes.reversed().compactMap { node in
+        normalizedString(node["label"] ?? node["title"])
+      }.first
+  }
+
   private func removeAgentStreamRowsLocked(chatId: String, agentUserId: String?) {
     guard var perChat = liveMessageRowsByChat[chatId], !perChat.isEmpty else { return }
     let targetAgent = normalizedUpper(agentUserId)
@@ -5159,6 +5350,11 @@ final class ChatEngine {
       removedAny = true
     }
     guard removedAny else { return }
+    // [EmptyTrace] This wipes the live streaming bubble(s). If it fires mid-stream and leaves
+    // the live store empty, the agent list can jump to empty until history rehydrates.
+    NSLog(
+      "[EmptyTrace] removeAgentStreamRows chatId=%@ removed=%d liveLeft=%d",
+      String(chatId.suffix(12)), streamIds.count, perChat.isEmpty ? 0 : perChat.count)
     if perChat.isEmpty {
       liveMessageRowsByChat.removeValue(forKey: chatId)
     } else {
@@ -5925,6 +6121,10 @@ final class ChatEngine {
           if !requestId.isEmpty {
             self.agentBridgeAskByRequestId[requestId] = frame.payload
           }
+          // An ask IS proof the run is alive (paused on the user) — refresh the running
+          // mark so the ingest settle-clear / typing-stop paths hold the working header
+          // instead of flipping to "Start session" while the approval sheet is up.
+          self.agentTurnRunningAtMsByChatId[chatId] = Int64(self.nowMs())
           NSLog(
             "[ChatEngine][ask] RECEIVED chat=%@ requestId=%@ kind=%@ provider=%@ sealed=%@ stored=%@ → post agentBridgeAsk",
             chatId, requestId, kind, provider, sealed ? "Y" : "N", requestId.isEmpty ? "N(empty-requestId)" : "Y"
@@ -5936,6 +6136,26 @@ final class ChatEngine {
               "requestId": requestId,
               "kind": kind,
               "provider": provider,
+            ]
+          )
+          return
+        }
+        if frame.event == "agent-bridge-ask-cancel" {
+          // The bridge resolved this ask/command elsewhere (answered at the desk, or the
+          // caller timed out/disconnected). Drop the cached request + presentation claim
+          // and tell any presented sheet to dismiss — so a stale "waiting for approval"
+          // sheet doesn't linger after the command already left the device.
+          let requestId = self.normalizedString(frame.payload["requestId"]) ?? ""
+          if !requestId.isEmpty {
+            self.agentBridgeAskByRequestId.removeValue(forKey: requestId)
+            self.presentedAskRequestIds.remove(requestId)
+          }
+          NSLog("[ChatEngine][ask] CANCEL chat=%@ requestId=%@ → post agentBridgeAskCancel", chatId, requestId)
+          self.postChangeLocked(
+            reason: "agentBridgeAskCancel",
+            userInfo: [
+              "chatId": chatId,
+              "requestId": requestId,
             ]
           )
           return
@@ -5962,7 +6182,22 @@ final class ChatEngine {
             typingUsers.removeAll()
           }
           if !typing, payloadUserId?.lowercased() == Self.agentUserId {
-            self.clearAgentProgressLocked(chatId: chatId, status: "done")
+            // A bridge run that pauses (command approval, thinking gap) can emit the agent
+            // user's typing:false while the turn is very much alive — the run's OWN signals
+            // (stream frames / running transcript / outstanding ask) refresh the grace mark,
+            // so only let a typing stop clear the header once those have gone quiet too.
+            let sinceRunningMs =
+              Int64(self.nowMs()) - (self.agentTurnRunningAtMsByChatId[chatId] ?? 0)
+            let askOutstanding = self.agentBridgeAskByRequestId.values.contains { payload in
+              (self.normalizedString(payload["chatId"]) ?? "") == chatId
+            }
+            if askOutstanding || sinceRunningMs < Self.agentTurnRunningGraceMs {
+              NSLog(
+                "[EmptyTrace] agentTypingStopped HOLD chatId=%@ ask=%@ sinceRunningMs=%lld",
+                String(chatId.suffix(12)), askOutstanding ? "Y" : "N", sinceRunningMs)
+            } else {
+              self.clearAgentProgressLocked(chatId: chatId, status: "done", reason: "agentTypingStopped(A)")
+            }
           }
           let typingUserIds = Array(typingUsers).sorted()
           let isAnyTyping = !typingUserIds.isEmpty || (typing && payloadUserId == nil)
@@ -6018,7 +6253,7 @@ final class ChatEngine {
             (frame.payload["isAgentMessage"] as? Bool == true)
             || fromId?.lowercased() == Self.agentUserId
           if isAgentMessage {
-            self.clearAgentProgressLocked(chatId: chatId, status: "done")
+            self.clearAgentProgressLocked(chatId: chatId, status: "done", reason: "agentPersistedMessage")
             // The persisted message supersedes any live streaming bubble for this agent.
             self.removeAgentStreamRowsLocked(chatId: chatId, agentUserId: fromId)
           }
@@ -8631,6 +8866,12 @@ final class ChatEngine {
   }
 
   private func clearSocketResetLiveRowsLocked() {
+    // [EmptyTrace] This ONLY runs on a socket reset. The user's hypothesis is the list jumps
+    // to empty WITHOUT a drop — so if this line is ABSENT from the log at the empty moment,
+    // the connection did not reset and the wipe came from elsewhere (ingest/typing/message).
+    NSLog(
+      "[EmptyTrace] socketReset clearLiveRows — chats=%d (connection DID reset)",
+      liveMessageRowsByChat.count)
     // On a socket reset we only drop live rows that a history refetch can re-deliver.
     // A live row NOT present in fetched history (an unsent/queued outbound, or any
     // message in a chat whose history was never loaded — e.g. the very first message

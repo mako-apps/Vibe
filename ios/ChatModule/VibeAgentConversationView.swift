@@ -327,10 +327,10 @@ enum VibeAgentKitMap {
     var result: [VibeAgentKitChatMessage] = []
     for row in windowed {
       guard case .message = row.kind else { continue }
-      // Skip empty system/placeholder rows — but KEEP a freshly-started streaming
-      // row even before it has text/steps/runtime, so the live "Working…" loader
-      // appears the instant a run begins instead of the view looking like nothing
-      // is happening.
+      // Skip empty system/placeholder rows. A freshly-started streaming row with no
+      // renderable text/tool/runtime is represented by the header/STOP state instead;
+      // keeping it here draws an empty rounded assistant bubble until the first real
+      // chunk lands.
       let m = chatMessage(from: row)
       // A runtime with only metadata (status, provider, model) but no diff is not
       // renderable — the cell's assistant body view hides everything, producing an
@@ -342,7 +342,18 @@ enum VibeAgentKitMap {
         return diff.filesChanged > 0 || diff.additions > 0 || diff.deletions > 0
           || !diff.files.isEmpty || hasPatch
       }()
-      if m.text.isEmpty && m.progressItems.isEmpty && !hasRenderableRuntime && m.attachments.isEmpty && !m.isStreaming {
+      let hasRenderableProgress = m.progressItems.contains { item in
+        if item.itemType == "text" {
+          return !item.label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        return !isPlaceholderThinkingProgressItem(item)
+      }
+      let emptyStreamingPlaceholder =
+        m.isStreaming && m.text.isEmpty && !hasRenderableProgress && !hasRenderableRuntime
+          && m.attachments.isEmpty
+      if m.text.isEmpty && !hasRenderableProgress && !hasRenderableRuntime && m.attachments.isEmpty
+        && (!m.isStreaming || emptyStreamingPlaceholder)
+      {
         continue
       }
       if m.role == .user, m.attachments.isEmpty {
@@ -460,7 +471,8 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   private let backGlassView = UIVisualEffectView(effect: nil)
   private let headerBackButton = UIButton(type: .system)
   private let avatarGlassView = UIVisualEffectView(effect: nil)
-  private let titleGlassView = UIView()
+  private let titleGlassView = UIVisualEffectView(effect: nil)
+  private let titleButton = UIButton(type: .custom)
   private let customTitleStack = UIStackView()
   private let headerModelButton = UIButton(type: .system)
   private let rightActionsGlassView = UIVisualEffectView(effect: nil)
@@ -617,6 +629,9 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   private var localMessageOrder: [String] = []
   private var localMessagesById: [String: VibeAgentKitChatMessage] = [:]
   private var localWorkingMessageIdBySourceId: [String: String] = [:]
+  private var lastLiveHeaderStatusText: String?
+  private var lastLiveHeaderStatusAt: TimeInterval = 0
+  private static let liveHeaderStatusGrace: TimeInterval = 12.0
 
   /// Start a fresh conversation with the agent (clears the on-screen transcript and
   /// begins a new, non-resumed task). When nil the trailing "new chat" button is
@@ -1500,7 +1515,8 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   }
 
   private func presentAskSheet(requestId: String, kind: String, provider: String?, request: [String: Any]) {
-    let sheet = VibeAgentAskSheetViewController(kind: kind, request: request, appearance: appearance)
+    let sheet = VibeAgentAskSheetViewController(
+      kind: kind, request: request, appearance: appearance, requestId: requestId)
     sheet.onResolve = { [weak self] decision, answer in
       self?.resolveAgentBridgeAsk(
         requestId: requestId,
@@ -1647,69 +1663,70 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     headerAvatarView.removeTarget(self, action: #selector(profileTapped), for: .touchUpInside)
     headerAvatarView.addTarget(self, action: #selector(profileTapped), for: .touchUpInside)
     avatarGlassView.contentView.addSubview(headerAvatarView)
-    
+
+    titleGlassView.effect = nil
+
+    titleButton.addTarget(self, action: #selector(profileTapped), for: .touchUpInside)
+    titleGlassView.contentView.addSubview(titleButton)
+
     customTitleStack.axis = .vertical
     customTitleStack.alignment = .leading
     customTitleStack.spacing = -1
-    
-    let modelSymbolConfig = UIImage.SymbolConfiguration(pointSize: 10, weight: .semibold)
-    var modelCfg = UIButton.Configuration.plain()
-    modelCfg.contentInsets = NSDirectionalEdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0)
-    modelCfg.imagePlacement = .trailing
-    modelCfg.imagePadding = 4
-    modelCfg.image = UIImage(systemName: "chevron.up.chevron.down", withConfiguration: modelSymbolConfig)
-    modelCfg.titleLineBreakMode = .byTruncatingTail
-    headerModelButton.configuration = modelCfg
+    customTitleStack.isUserInteractionEnabled = false
+
+    headerModelButton.configuration = nil
+    headerModelButton.titleLabel?.font = UIFont.systemFont(ofSize: 16, weight: .semibold)
     headerModelButton.titleLabel?.numberOfLines = 1
     headerModelButton.titleLabel?.lineBreakMode = .byTruncatingTail
     headerModelButton.titleLabel?.adjustsFontSizeToFitWidth = true
     headerModelButton.titleLabel?.minimumScaleFactor = 0.85
-    headerModelButton.showsMenuAsPrimaryAction = true
+    headerModelButton.isUserInteractionEnabled = false
     headerModelButton.tintColor = appearance.text
-    
+
     connectionDotView.layer.cornerRadius = 3
     connectionDotView.layer.cornerCurve = .continuous
     connectionDotView.translatesAutoresizingMaskIntoConstraints = false
     connectionSpinner.translatesAutoresizingMaskIntoConstraints = false
     connectionSpinner.hidesWhenStopped = true
     connectionSpinner.transform = CGAffineTransform(scaleX: 0.62, y: 0.62)
-    subtitleLabel.font = UIFont.systemFont(ofSize: 11.5, weight: .medium)
+    subtitleLabel.font = UIFont.systemFont(ofSize: 12, weight: .medium)
     subtitleLabel.textColor = appearance.textSecondary
     subtitleLabel.textAlignment = .left
     subtitleLabel.lineBreakMode = .byTruncatingTail
-    
+
     let subtitleStack = UIStackView(arrangedSubviews: [connectionDotView, connectionSpinner, subtitleLabel])
     subtitleStack.spacing = 4
     subtitleStack.alignment = .center
-    
+    subtitleStack.isUserInteractionEnabled = false
+
     customTitleStack.addArrangedSubview(headerModelButton)
     customTitleStack.addArrangedSubview(subtitleStack)
-    titleGlassView.addSubview(customTitleStack)
-    
+    titleButton.addSubview(customTitleStack)
+
     let actionsEffect = UIGlassEffect()
     actionsEffect.isInteractive = true
     actionsEffect.tintColor = .clear
     rightActionsGlassView.effect = actionsEffect
-    
+
     rightActionsStack.axis = .horizontal
     rightActionsStack.alignment = .fill
     rightActionsStack.distribution = .fillEqually
     rightActionsStack.spacing = 0
     rightActionsGlassView.contentView.addSubview(rightActionsStack)
-    
+
     let actionSymbolConfig = UIImage.SymbolConfiguration(pointSize: 17, weight: .medium)
     headerNewChatActionButton.setTitle(nil, for: .normal)
     headerNewChatActionButton.setImage(UIImage(systemName: "square.and.pencil"), for: .normal)
     headerNewChatActionButton.setPreferredSymbolConfiguration(actionSymbolConfig, forImageIn: .normal)
     headerNewChatActionButton.tintColor = appearance.text
-    
+
     headerHistoryButton.setTitle(nil, for: .normal)
     headerHistoryButton.setImage(createHistoryIcon(), for: .normal)
     headerHistoryButton.tintColor = appearance.text
-    
+
     rightActionsStack.addArrangedSubview(headerNewChatActionButton)
     rightActionsStack.addArrangedSubview(headerHistoryButton)
-    
+
     [headerBackButton, headerModelButton, headerNewChatActionButton, headerHistoryButton].forEach { button in
       button.backgroundColor = .clear
       button.contentHorizontalAlignment = .center
@@ -1720,40 +1737,45 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
 
   private func layoutCustomHeaderViews() {
     guard usesInViewHeader else { return }
+    // The header is added in configureNavigationTitle (viewDidLoad) BEFORE tableView,
+    // composerView, etc. are added — so it ends up buried beneath them. Bring it to
+    // the front on every layout pass so the glass pills are always visible.
+    view.bringSubviewToFront(headerContentView)
     let safeTop = view.safeAreaInsets.top
     headerContentView.frame = CGRect(x: 12.0, y: safeTop + 8.0, width: view.bounds.width - 24.0, height: 44.0)
-    
+
     backGlassView.frame = CGRect(x: 0.0, y: 0.0, width: 44.0, height: 44.0)
     avatarGlassView.frame = CGRect(x: backGlassView.frame.maxX + 8.0, y: 0.0, width: 44.0, height: 44.0)
-    
+
     var visibleActionCount = 0
     if !headerNewChatActionButton.isHidden { visibleActionCount += 1 }
     if !headerHistoryButton.isHidden { visibleActionCount += 1 }
-    
+
     let actionWidth: CGFloat = 44.0
     let totalActionsWidth = CGFloat(visibleActionCount) * actionWidth
-    
+
     rightActionsGlassView.frame = CGRect(
       x: headerContentView.bounds.width - totalActionsWidth,
       y: 0.0,
       width: totalActionsWidth,
       height: 44.0
     )
-    
+
     rightActionsStack.frame = rightActionsGlassView.bounds
-    
+
     let titleMinX = avatarGlassView.frame.maxX + 12.0
     let titleMaxX = rightActionsGlassView.frame.minX > 0 ? rightActionsGlassView.frame.minX - 8.0 : headerContentView.bounds.width - 8.0
     let availableWidth = max(0, titleMaxX - titleMinX)
-    
+
     titleGlassView.frame = CGRect(
       x: titleMinX,
       y: 0.0,
       width: availableWidth,
       height: 44.0
     )
-    
+
     headerBackButton.frame = backGlassView.bounds
+    titleButton.frame = titleGlassView.bounds
     headerAvatarView.frame = avatarGlassView.bounds.insetBy(dx: 4.0, dy: 4.0)
     headerAvatarView.layer.cornerRadius = headerAvatarView.bounds.height / 2.0
     headerAvatarView.clipsToBounds = true
@@ -1765,16 +1787,16 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       glass.layer.cornerRadius = glass.bounds.height / 2.0
     }
     
-    let horizontalInset: CGFloat = 4.0
+    let horizontalInset: CGFloat = 4.0 // matches main header inset when not inside glass
     let stackSize = customTitleStack.systemLayoutSizeFitting(
-      CGSize(width: titleGlassView.bounds.width - (horizontalInset * 2.0), height: UIView.layoutFittingCompressedSize.height),
+      CGSize(width: titleButton.bounds.width - (horizontalInset * 2.0), height: UIView.layoutFittingCompressedSize.height),
       withHorizontalFittingPriority: .required,
       verticalFittingPriority: .fittingSizeLevel
     )
     customTitleStack.frame = CGRect(
       x: horizontalInset,
-      y: (titleGlassView.bounds.height - stackSize.height) * 0.5,
-      width: titleGlassView.bounds.width - (horizontalInset * 2.0),
+      y: (titleButton.bounds.height - stackSize.height) * 0.5,
+      width: titleButton.bounds.width - (horizontalInset * 2.0),
       height: stackSize.height
     )
   }
@@ -1829,27 +1851,91 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   }
 
   /// Refresh the header's model title + run-options menu and the device subline.
+  /// The current "what's happening now" line for the header subtitle while a turn is live:
+  /// the latest running progress step ("Reading …", "bash …") or the thinking token count.
+  private func messageLiveHeaderStatusText() -> String? {
+    guard let live = messages.last(where: { $0.isStreaming || $0.runtime?.status == "running" })
+    else { return nil }
+    let items = live.progressItems
+    if let running = items.last(where: {
+      vibeAgentKitRunningStepStatuses.contains(($0.status ?? "").lowercased())
+    }) {
+      return vibeAgentKitProgressDisplayLabel(running)
+    }
+    if let last = items.last {
+      return vibeAgentKitProgressDisplayLabel(last)
+    }
+    return "Thinking"
+  }
+
+  private func engineLiveHeaderStatusText() -> String? {
+    let chatId = agentBridgeChatId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard !chatId.isEmpty, let progress = ChatEngine.shared.agentProgress(chatId: chatId) else {
+      return nil
+    }
+    let label = (progress["label"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return label.isEmpty ? "Thinking" : label
+  }
+
+  private func liveHeaderStatusText() -> String? {
+    if let current = messageLiveHeaderStatusText() ?? engineLiveHeaderStatusText() {
+      lastLiveHeaderStatusText = current
+      lastLiveHeaderStatusAt = ProcessInfo.processInfo.systemUptime
+      return current
+    }
+
+    let chatId = agentBridgeChatId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let hasLiveSession = !chatId.isEmpty && ChatEngine.shared.liveBridgeSessionId(chatId: chatId) != nil
+    let canUseCachedLiveText = !messages.isEmpty || hasLiveSession
+    if canUseCachedLiveText,
+      let cached = lastLiveHeaderStatusText,
+      ProcessInfo.processInfo.systemUptime - lastLiveHeaderStatusAt <= Self.liveHeaderStatusGrace
+    {
+      return cached
+    }
+    return nil
+  }
+
+  private func isLiveTurnActive() -> Bool {
+    if messages.contains(where: { $0.isStreaming || $0.runtime?.status == "running" }) {
+      return true
+    }
+    let chatId = agentBridgeChatId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if !chatId.isEmpty, ChatEngine.shared.agentProgress(chatId: chatId) != nil {
+      return true
+    }
+    return false
+  }
+
+  /// Header subtitle contents: live status while a turn is running, the chat/history title
+  /// when a transcript is open and idle, otherwise a "start a session" prompt. The header
+  /// title itself always stays the agent's name (Claude / Codex).
+  private func headerSubtitleText() -> String {
+    if let live = liveHeaderStatusText() { return live }
+    let title = runtimeTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !title.isEmpty && (isHistoryPicked || !tableMessages.isEmpty) { return title }
+    if !tableMessages.isEmpty { return "Session" }
+    return "Start a session"
+  }
+
   private func updateHeaderTexts() {
     guard usesInViewHeader else { return }
-    let provider = agentBridgeProvider ?? "codex"
-    let selected = AgentBridgeSelectionStore.selectedModel(provider: provider)
-    let modelTitle = AgentBridgeSelectionStore.modelTitle(
-      provider: provider, model: selected ?? runModel ?? latestRuntimeModel)
 
-    headerModelButton.setTitle(modelTitle, for: .normal)
+    // Title is always the agent's name (Claude / Codex) — never the model / "Cloud".
+    headerModelButton.setTitle(agentDisplayName, for: .normal)
     let color = vibeAgentKitColorWithAlpha(appearance.text, 0.8)
     headerModelButton.setTitleColor(color, for: .normal)
     headerModelButton.tintColor = color
-    headerModelButton.menu = runOptionsMenu()
 
-    // Compact device name; the connection state is shown by the pip/spinner, not text.
-    let device = (deviceLabel?.isEmpty == false) ? deviceLabel : AgentPairingService.lastDeviceLabel
-    let connected = (deviceLabel != nil) ? deviceConnected : AgentPairingService.lastConnected
-    let deviceText = (device?.isEmpty == false) ? device : runtimeSubtitle
-    subtitleLabel.text = deviceText
+    // Subtitle carries the live state: current thinking/tool step while running, the
+    // history/chat name when a transcript is open and idle, else "Start a session".
+    subtitleLabel.text = headerSubtitleText()
     subtitleLabel.textColor = appearance.textSecondary
 
-    let hasDevice = (deviceText ?? "").isEmpty == false
+    // Connection is shown by the pip/spinner regardless of what the subtitle text says.
+    let device = (deviceLabel?.isEmpty == false) ? deviceLabel : AgentPairingService.lastDeviceLabel
+    let connected = (deviceLabel != nil) ? deviceConnected : AgentPairingService.lastConnected
+    let hasDevice = (device ?? "").isEmpty == false
     let isReconnecting = !connected && hasDevice
 
     if isReconnecting {
@@ -1936,7 +2022,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   }
 
   private func refreshModelMenu() {
-    headerModelButton.menu = runOptionsMenu()
+    // Menu removed: tapping title now pushes to profile
   }
 
   private func applyNavigationAppearance() {
@@ -1944,9 +2030,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     subtitleLabel.textColor = appearance.textSecondary
 
     headerModelButton.tintColor = appearance.text
-    var cfg = headerModelButton.configuration ?? .plain()
-    cfg.baseForegroundColor = appearance.text
-    headerModelButton.configuration = cfg
+    headerModelButton.setTitleColor(appearance.text, for: .normal)
 
     headerBackButton.tintColor = appearance.text
     headerNewChatActionButton.tintColor = appearance.text
@@ -1969,9 +2053,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   }
 
   private func updateNavigationLiveState() {
-    let isLive = messages.contains { message in
-      message.isStreaming || message.runtime?.status == "running"
-    }
+    let isLive = isLiveTurnActive()
     // The composer's trailing control becomes STOP while a task is live (cancel the
     // running bridge run) and reverts to send/mic once it finishes — so an active turn
     // can never be sent over, and the user can always interrupt it.
@@ -6158,6 +6240,7 @@ final class VibeAgentAskSheetViewController: UIViewController {
   private let kind: String
   private let request: [String: Any]
   private let appearance: VibeAgentKitChatAppearance
+  private let requestId: String
   private var didResolve = false
 
   private let scrollView = UIScrollView()
@@ -6184,14 +6267,28 @@ final class VibeAgentAskSheetViewController: UIViewController {
   private weak var askBackButton: UIButton?
   private weak var askNextButton: UIButton?
 
-  init(kind: String, request: [String: Any], appearance: VibeAgentKitChatAppearance) {
+  init(
+    kind: String, request: [String: Any], appearance: VibeAgentKitChatAppearance,
+    requestId: String = ""
+  ) {
     self.kind = kind
     self.request = request
     self.appearance = appearance
+    self.requestId = requestId
     super.init(nibName: nil, bundle: nil)
   }
 
   required init?(coder: NSCoder) { return nil }
+
+  /// The bridge cancelled this ask/command (resolved at the desk, or timed out). Close
+  /// the sheet without re-arming it — the request no longer exists.
+  @objc private func handleBridgeAskCancel(_ note: Notification) {
+    guard (note.userInfo?["reason"] as? String) == "agentBridgeAskCancel" else { return }
+    let cancelledId = (note.userInfo?["requestId"] as? String) ?? ""
+    guard !cancelledId.isEmpty, cancelledId == requestId, !didResolve else { return }
+    didResolve = true  // suppress the swiped-away re-arm path in viewDidDisappear
+    if presentingViewController != nil { dismiss(animated: true) }
+  }
 
   // Off-mute neutral palette (no brand brown/orange) for the glass sheet.
   private var neutralAccent: UIColor {
@@ -6211,6 +6308,12 @@ final class VibeAgentAskSheetViewController: UIViewController {
 
   override func viewDidLoad() {
     super.viewDidLoad()
+    // Auto-dismiss if the bridge cancels this ask (answered elsewhere / timed out).
+    if !requestId.isEmpty {
+      NotificationCenter.default.addObserver(
+        self, selector: #selector(handleBridgeAskCancel(_:)),
+        name: ChatEngine.didChangeNotification, object: nil)
+    }
     // Glass sheet (mirrors the chat attachment/share sheet) instead of the solid
     // warm/brown agent background. Neutral, off-mute palette is used throughout.
     view.backgroundColor = .clear

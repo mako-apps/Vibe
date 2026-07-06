@@ -664,6 +664,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var agentTurnExpandedStepIdsByRow: [String: Set<String>] = [:]
   private var agentTurnProgressExpandedRowIds = Set<String>()
   private var agentTurnRuntimeExpandedRowIds = Set<String>()
+  // Rows whose tall-collapsed bubble (user text, agent text or settled agent turn) the
+  // user expanded via the "Show more" bar — see the shared tall-content rule in
+  // measureMessageBubbleLayout (tallBubble* constants).
+  private var tallBubbleExpandedRowIds = Set<String>()
   private var agentTurnStreamStartByRow: [String: Date] = [:]
   // Memoized measured heights for agent-turn rows (see estimateMessageHeight): the row
   // struct is retained only for the cheap content-equality validity check — COW means it
@@ -750,6 +754,48 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
   /// Persistent overlay container that sits above the list but below the composer.
   private let transitionOverlayHost = UIView()
+  private lazy var jumpToBottomButton: UIButton = {
+    let button = UIButton(type: .system)
+    button.translatesAutoresizingMaskIntoConstraints = false
+    button.alpha = 0.0
+    button.isHidden = true
+    button.transform = CGAffineTransform(scaleX: 0.6, y: 0.6)
+    button.accessibilityLabel = "Jump to latest"
+    button.addTarget(self, action: #selector(jumpToBottomTapped), for: .touchUpInside)
+
+    button.backgroundColor = .clear
+
+    let blurEffect = UIBlurEffect(style: .systemThinMaterial)
+    let blurView = UIVisualEffectView(effect: blurEffect)
+    blurView.translatesAutoresizingMaskIntoConstraints = false
+    blurView.isUserInteractionEnabled = false
+    button.insertSubview(blurView, at: 0)
+
+    NSLayoutConstraint.activate([
+      blurView.topAnchor.constraint(equalTo: button.topAnchor),
+      blurView.leadingAnchor.constraint(equalTo: button.leadingAnchor),
+      blurView.trailingAnchor.constraint(equalTo: button.trailingAnchor),
+      blurView.bottomAnchor.constraint(equalTo: button.bottomAnchor),
+    ])
+
+    button.layer.cornerRadius = 19.0
+    button.layer.cornerCurve = .continuous
+    button.clipsToBounds = true
+    button.layer.borderWidth = 0.5
+    button.layer.borderColor = UIColor.white.withAlphaComponent(0.2).cgColor
+    button.layer.shadowColor = UIColor.black.cgColor
+    button.layer.shadowOpacity = 0.15
+    button.layer.shadowRadius = 8.0
+    button.layer.shadowOffset = CGSize(width: 0, height: 3)
+
+    button.setImage(
+      UIImage(
+        systemName: "chevron.down",
+        withConfiguration: UIImage.SymbolConfiguration(pointSize: 15, weight: .semibold)),
+      for: .normal)
+    button.tintColor = .label
+    return button
+  }()
   private let nativeSendMorphTopRightRadius: CGFloat = 8.0
 
   // --- Debug animation tuning ---
@@ -1295,6 +1341,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         contentPaddingBottom = desiredBottomPadding
         updateBottomAnchorInset()
       }
+      layoutJumpToBottomButton()
     }
     layoutActivityOverlay()
     layoutGapDebugOverlay()
@@ -1572,10 +1619,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   // desktop CLI's "You've used 99% of your session limit · resets in 3h" warning. Fed by
   // the bridge's structured usage report (requestAgentBridgeUsage), refreshed on DM open
   // and after each finished run; shown only when the worst subscription bucket crosses
-  // the threshold. Dismissing remembers the bucket+level so the same warning doesn't
+  // the threshold. Tapping remembers the bucket+level so the same warning doesn't
   // re-pop until usage climbs further.
-  private var bridgeUsageBanner: UIView?
-  private var bridgeUsageBannerLabel: UILabel?
+  var onBridgeUsageBannerVisibilityChanged: (() -> Void)?
+  var isBridgeUsageBannerVisible: Bool {
+    guard let banner = bridgeUsageBanner else { return false }
+    return !banner.isHidden && banner.alpha > 0.01
+  }
+  private var bridgeUsageBanner: ChatPinnedBannerView?
   private var lastBridgeUsageRequestId: String?
   private var lastBridgeUsageRequestAt: TimeInterval = 0
   private var dismissedBridgeUsageKey: String?
@@ -1720,89 +1771,44 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   private func showBridgeUsageBanner(text: String, key: String) {
-    let banner: UIView
-    let label: UILabel
-    if let existing = bridgeUsageBanner, let existingLabel = bridgeUsageBannerLabel {
+    let banner: ChatPinnedBannerView
+    if let existing = bridgeUsageBanner {
       banner = existing
-      label = existingLabel
     } else {
-      let created = UIView()
-      created.layer.cornerRadius = 14.0
-      created.layer.cornerCurve = .continuous
-      created.backgroundColor = UIColor { trait in
-        trait.userInterfaceStyle == .dark
-          ? UIColor(red: 0.32, green: 0.22, blue: 0.05, alpha: 0.96)
-          : UIColor(red: 1.0, green: 0.95, blue: 0.82, alpha: 0.98)
-      }
-      created.layer.borderWidth = 1.0
-      created.layer.borderColor = UIColor { trait in
-        trait.userInterfaceStyle == .dark
-          ? UIColor(red: 0.85, green: 0.62, blue: 0.18, alpha: 0.35)
-          : UIColor(red: 0.75, green: 0.55, blue: 0.12, alpha: 0.35)
-      }.cgColor
-
-      let icon = UIImageView(
-        image: UIImage(systemName: "gauge.with.dots.needle.bottom.100percent"))
-      icon.tintColor = UIColor { trait in
-        trait.userInterfaceStyle == .dark
-          ? UIColor(red: 0.98, green: 0.78, blue: 0.35, alpha: 1.0)
-          : UIColor(red: 0.65, green: 0.45, blue: 0.05, alpha: 1.0)
-      }
-      icon.contentMode = .scaleAspectFit
-      icon.translatesAutoresizingMaskIntoConstraints = false
-
-      let textLabel = UILabel()
-      textLabel.font = .systemFont(ofSize: 13.5, weight: .medium)
-      textLabel.numberOfLines = 2
-      textLabel.textColor = UIColor { trait in
-        trait.userInterfaceStyle == .dark
-          ? UIColor(red: 0.99, green: 0.92, blue: 0.75, alpha: 1.0)
-          : UIColor(red: 0.45, green: 0.32, blue: 0.02, alpha: 1.0)
-      }
-      textLabel.translatesAutoresizingMaskIntoConstraints = false
-
-      let close = UIButton(type: .system)
-      close.setImage(UIImage(systemName: "xmark"), for: .normal)
-      close.tintColor = icon.tintColor.withAlphaComponent(0.75)
-      close.translatesAutoresizingMaskIntoConstraints = false
-      close.addAction(
-        UIAction { [weak self] _ in
-          self?.dismissedBridgeUsageKey = self?.bridgeUsageBanner?.accessibilityValue
-          self?.hideBridgeUsageBanner()
-        }, for: .touchUpInside)
-
-      created.addSubview(icon)
-      created.addSubview(textLabel)
-      created.addSubview(close)
-      NSLayoutConstraint.activate([
-        icon.leadingAnchor.constraint(equalTo: created.leadingAnchor, constant: 12.0),
-        icon.centerYAnchor.constraint(equalTo: created.centerYAnchor),
-        icon.widthAnchor.constraint(equalToConstant: 18.0),
-        icon.heightAnchor.constraint(equalToConstant: 18.0),
-        textLabel.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 9.0),
-        textLabel.topAnchor.constraint(equalTo: created.topAnchor, constant: 9.0),
-        textLabel.bottomAnchor.constraint(equalTo: created.bottomAnchor, constant: -9.0),
-        close.leadingAnchor.constraint(equalTo: textLabel.trailingAnchor, constant: 8.0),
-        close.trailingAnchor.constraint(equalTo: created.trailingAnchor, constant: -10.0),
-        close.centerYAnchor.constraint(equalTo: created.centerYAnchor),
-        close.widthAnchor.constraint(equalToConstant: 22.0),
-        close.heightAnchor.constraint(equalToConstant: 22.0),
-      ])
+      let created = ChatPinnedBannerView()
+      created.addTarget(self, action: #selector(handleBridgeUsageBannerTapped), for: .touchUpInside)
       addSubview(created)
       bridgeUsageBanner = created
-      bridgeUsageBannerLabel = textLabel
       banner = created
-      label = textLabel
     }
-    label.text = text
-    // The dismiss action reads the key back from here (avoids one more stored property).
+    let accent = UIColor { trait in
+      trait.userInterfaceStyle == .dark
+        ? UIColor(red: 0.98, green: 0.76, blue: 0.28, alpha: 1.0)
+        : UIColor(red: 0.70, green: 0.48, blue: 0.04, alpha: 1.0)
+    }
+    banner.applyIconAccent(accent)
+    banner.applyTheme(
+      textColor: appearance.textColorThem,
+      surfaceColor: appearance.bubbleThemColor,
+      isDark: appearance.isDark
+    )
+    banner.configure(
+      title: "Usage",
+      body: text,
+      systemImage: "gauge.with.dots.needle.bottom.50percent",
+      animateIcon: banner.accessibilityValue != nil
+    )
     banner.accessibilityValue = key
+    let wasHidden = banner.isHidden
     banner.isHidden = false
     bringSubviewToFront(banner)
     setNeedsLayout()
     layoutIfNeeded()
+    if wasHidden {
+      onBridgeUsageBannerVisibilityChanged?()
+    }
     banner.alpha = 0.0
-    banner.transform = CGAffineTransform(translationX: 0, y: 8)
+    banner.transform = CGAffineTransform(translationX: 0, y: -8)
     UIView.animate(
       withDuration: 0.22, delay: 0,
       options: [.beginFromCurrentState, .allowUserInteraction]
@@ -1812,6 +1818,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
   }
 
+  @objc private func handleBridgeUsageBannerTapped() {
+    dismissedBridgeUsageKey = bridgeUsageBanner?.accessibilityValue
+    hideBridgeUsageBanner()
+  }
+
   private func hideBridgeUsageBanner() {
     guard let banner = bridgeUsageBanner, !banner.isHidden else { return }
     UIView.animate(
@@ -1819,28 +1830,23 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       options: [.beginFromCurrentState, .allowUserInteraction]
     ) {
       banner.alpha = 0.0
-      banner.transform = CGAffineTransform(translationX: 0, y: 8)
-    } completion: { _ in
-      if banner.alpha <= 0.01 { banner.isHidden = true }
+      banner.transform = CGAffineTransform(translationX: 0, y: -8)
+    } completion: { [weak self] _ in
+      if banner.alpha <= 0.01 {
+        banner.isHidden = true
+        self?.onBridgeUsageBannerVisibilityChanged?()
+      }
     }
   }
 
-  /// Position the usage banner just above the input bar — and above the command overlay
-  /// when that is showing, so the two never overlap.
+  /// Position the usage banner in the reserved top/header band, matching the pinned
+  /// message banner instead of floating over the composer.
   private func layoutBridgeUsageBanner() {
     guard let banner = bridgeUsageBanner, !banner.isHidden else { return }
-    var baseY = agentComposerView?.frame.minY ?? inputBar?.frame.minY ?? bounds.height
-    if let overlay = bridgeCommandOverlay, !overlay.isHidden {
-      baseY = min(baseY, overlay.frame.minY)
-    }
-    let width = max(0.0, bounds.width - 36.0)
-    let targetSize = banner.systemLayoutSizeFitting(
-      CGSize(width: width, height: UIView.layoutFittingCompressedSize.height),
-      withHorizontalFittingPriority: .required,
-      verticalFittingPriority: .fittingSizeLevel
-    )
-    let height = max(38.0, targetSize.height)
-    banner.frame = CGRect(x: 18.0, y: baseY - height - 8.0, width: width, height: height)
+    let width = max(0.0, bounds.width - 32.0)
+    let height = ChatPinnedBannerView.preferredHeight
+    let topY = max(8.0, contentPaddingTop - height - 12.0)
+    banner.frame = CGRect(x: 16.0, y: topY, width: width, height: height)
   }
 
   func setRows(_ nextRows: [[String: Any]]) {
@@ -2118,6 +2124,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       self.previousOffsetY = self.collectionView.contentOffset.y
       self.emitViewport(force: true)
       self.finishRowsUpdate()
+      // Rows updates that land mid-send-morph (server echo, grouping patch on
+      // the previous bubble, height settle) can move the target cell without
+      // any scroll event firing — re-sync the overlay's model frame so it keeps
+      // flying at the real cell instead of a stale rect.
+      if let transition = self.activeSendTransition {
+        self.updateTransitionFrame(transition)
+      }
       self.maybeStartPendingSendTransition()
     }
 
@@ -2865,6 +2878,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     agentTurnExpandedStepIdsByRow = agentTurnExpandedStepIdsByRow.filter { liveIds.contains($0.key) }
     agentTurnProgressExpandedRowIds = agentTurnProgressExpandedRowIds.filter { liveIds.contains($0) }
     agentTurnRuntimeExpandedRowIds = agentTurnRuntimeExpandedRowIds.filter { liveIds.contains($0) }
+    tallBubbleExpandedRowIds = tallBubbleExpandedRowIds.filter { liveIds.contains($0) }
     let streamingIds = Set(currentRows.filter { $0.isStreamingText }.map { $0.messageId ?? $0.key })
     for id in streamingIds where agentTurnStreamStartByRow[id] == nil {
       agentTurnStreamStartByRow[id] = Date()
@@ -2881,7 +2895,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       isProgressExpanded: agentTurnProgressExpandedRowIds.contains(id),
       isRuntimeExpanded: agentTurnRuntimeExpandedRowIds.contains(id),
       expandedStepIds: agentTurnExpandedStepIdsByRow[id] ?? [],
-      streamingStartDate: agentTurnStreamStartByRow[id]
+      streamingStartDate: agentTurnStreamStartByRow[id],
+      tallExpanded: tallBubbleExpandedRowIds.contains(id)
     )
   }
 
@@ -3264,7 +3279,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // bottom on every link-preview / markdown relayout once a turn had ended). The
     // only exception is `force` (first open of the chat), where we genuinely want to
     // land at the latest message.
-    if (agentChatMode || currentBridgeProvider != nil), !force {
+    if agentChatMode, !force {
       return
     }
     let maxOffsetY = pixelAlignedValue(
@@ -3295,6 +3310,44 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       shouldAutoScroll = true
       emitViewport(force: true)
     }
+  }
+
+  private func updateJumpToBottomButtonVisibility() {
+    let dist = currentDistanceFromBottom()
+    let isFar = dist > listBottomThreshold
+    setJumpButtonVisible(isFar)
+  }
+
+  private func setJumpButtonVisible(_ visible: Bool) {
+    let shouldShow = visible && !rows.isEmpty
+    guard shouldShow != (jumpToBottomButton.alpha > 0.0) else { return }
+
+    if jumpToBottomButton.superview == nil {
+      addSubview(jumpToBottomButton)
+      setNeedsLayout()
+      layoutIfNeeded()
+    }
+
+    if shouldShow {
+      jumpToBottomButton.isHidden = false
+      UIView.animate(withDuration: 0.22, delay: 0.0, options: [.beginFromCurrentState]) {
+        self.jumpToBottomButton.alpha = 1.0
+        self.jumpToBottomButton.transform = .identity
+      }
+    } else {
+      UIView.animate(withDuration: 0.22, delay: 0.0, options: [.beginFromCurrentState]) {
+        self.jumpToBottomButton.alpha = 0.0
+        self.jumpToBottomButton.transform = CGAffineTransform(scaleX: 0.6, y: 0.6)
+      } completion: { finished in
+        if finished && self.jumpToBottomButton.alpha == 0.0 {
+          self.jumpToBottomButton.isHidden = true
+        }
+      }
+    }
+  }
+
+  @objc private func jumpToBottomTapped() {
+    scrollToBottom(animated: true, force: true)
   }
 
   func scrollToMessage(messageId: String, animated: Bool, viewPosition: Double) {
@@ -3503,10 +3556,38 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         switch actionType {
         case "toggleAgentStep":
           guard let nodeId = payload["nodeId"] as? String else { return }
-          var ids = self.agentTurnExpandedStepIdsByRow[messageId] ?? []
-          if ids.contains(nodeId) { ids.remove(nodeId) } else { ids.insert(nodeId) }
-          self.agentTurnExpandedStepIdsByRow[messageId] = ids
-          self.refreshAgentTurnRows()
+          let message = VibeAgentKitMap.chatMessage(from: row)
+          var foundItem: VibeAgentKitProgressItem? = nil
+          if let item = message.progressItems.first(where: { ($0.nodeId ?? $0.label) == nodeId }) {
+            foundItem = item
+          } else {
+            for (_, children) in message.subagentChildren {
+              if let item = children.first(where: { ($0.nodeId ?? $0.label) == nodeId }) {
+                foundItem = item
+                break
+              }
+            }
+          }
+
+          if let item = foundItem {
+            let kind = (item.itemType ?? item.tool ?? "").lowercased()
+            if kind == "bash" || kind == "edit" || kind == "write" || kind == "read" {
+              guard let presenter = self.topPresentingViewController() else { return }
+              let detail = VibeAgentKitStepDetailViewController(
+                item: item,
+                appearance: VibeAgentKitMap.appearance(for: self.traitCollection)
+              )
+              let nav = UINavigationController(rootViewController: detail)
+              nav.modalPresentationStyle = .pageSheet
+              nav.view.backgroundColor = .clear
+              if let sheet = nav.sheetPresentationController {
+                sheet.detents = [.medium(), .large()]
+                sheet.prefersGrabberVisible = true
+              }
+              presenter.present(nav, animated: true)
+              return
+            }
+          }
           return
         case "toggleAgentProgress":
           if self.agentTurnProgressExpandedRowIds.contains(messageId) {
@@ -3521,6 +3602,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
             self.agentTurnRuntimeExpandedRowIds.remove(messageId)
           } else {
             self.agentTurnRuntimeExpandedRowIds.insert(messageId)
+          }
+          self.refreshAgentTurnRows()
+          return
+        case "toggleTallBubble":
+          // Shared tall-content collapse (user text, agent text, settled agent turns):
+          // flip this row's expand state and re-measure via the setRows re-apply path.
+          if self.tallBubbleExpandedRowIds.contains(messageId) {
+            self.tallBubbleExpandedRowIds.remove(messageId)
+          } else {
+            self.tallBubbleExpandedRowIds.insert(messageId)
           }
           self.refreshAgentTurnRows()
           return
@@ -3623,10 +3714,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       toggleMessageSelection(row: row)
       return
     }
-    if let runtime = row.agentRuntime {
-      presentAgentRuntimeTask(row: row, runtime: runtime)
-      return
-    }
+
     if row.isAgentMessage,
       row.visualKind == .text,
       let agentUserId = row.agentUserId,
@@ -4060,7 +4148,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
     let kitAppearance: VibeAgentKitChatAppearance =
       traitCollection.userInterfaceStyle == .light ? .lightFallback : .fallback
-    let sheet = VibeAgentAskSheetViewController(kind: kind, request: request, appearance: kitAppearance)
+    let sheet = VibeAgentAskSheetViewController(
+      kind: kind, request: request, appearance: kitAppearance, requestId: requestId)
     sheet.onResolve = { [weak self] decision, answer in
       self?.resolveAgentBridgeAsk(
         requestId: requestId, kind: kind, provider: provider,
@@ -4362,6 +4451,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     maybeLoadOlderBridgeHistoryIfNeeded(offsetY: offsetY)
     updateFloatingSenderAvatars()
     emitViewport()
+    updateJumpToBottomButtonVisibility()
   }
 
   /// Position one floating avatar per visible incoming sender-run in the reserved gutter.
@@ -5697,6 +5787,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       metaSnapshot: overlayParts.metaSnapshot,
       tailSnapshot: overlayParts.tailSnapshot,
       tailCornerTravel: overlayParts.tailCornerTravel,
+      clipSettleRadius: overlayParts.clipSettleRadius,
       sourceBackgroundStartFrame: overlayParts.sourceBackgroundStartFrame,
       sourceBackgroundEndFrame: overlayParts.sourceBackgroundEndFrame,
       sourceContentStartFrame: overlayParts.sourceContentStartFrame,
@@ -5716,7 +5807,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       bounds.width, bounds.height)
     state.start(sourceRect: overlayParts.sourceRect, targetRect: settledTargetRect)
     DispatchQueue.main.asyncAfter(
-      deadline: .now() + TelegramSendMorphProfile.duration + 0.22
+      deadline: .now() + SendMorphProfile.duration + 0.22
     ) { [weak self, weak state] in
       guard let self, let state else { return }
       guard self.activeSendTransition === state else { return }
@@ -5748,6 +5839,19 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     NSLog(
       "[ChatListView] completeTransition — revealing message '%@'", transition.payload.messageId)
     transition.invalidate()
+    // Final alignment: the flight may have been tracking a projected/estimated
+    // rect, and rows updates can land without a scroll event. Clear the
+    // projection first so the REAL cell's rect wins, then snap the overlay onto
+    // it — the short crossfade below then starts pixel-aligned with the cell it
+    // reveals instead of the bubble shifting at the hand-off into the list.
+    if projectedSendTransitionMessageId == transition.payload.messageId {
+      projectedSendTransitionMessageId = nil
+    }
+    if let finalTargetRect = resolveTransitionTargetRect(
+      messageId: transition.payload.messageId, fallbackPayload: transition.payload)
+    {
+      transition.compensateScroll(targetRect: finalTargetRect)
+    }
     let shouldSettleDeferredBottomScroll =
       deferredPendingSendBottomScrollMessageId == transition.payload.messageId
 
@@ -5763,9 +5867,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
 
     activeSendTransition = nil
-    if projectedSendTransitionMessageId == transition.payload.messageId {
-      projectedSendTransitionMessageId = nil
-    }
     if shouldSettleDeferredBottomScroll {
       deferredPendingSendBottomScrollMessageId = nil
     }
@@ -6688,6 +6789,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
   }
 
+  private func layoutJumpToBottomButton() {
+    guard jumpToBottomButton.superview != nil else { return }
+    let activeBarFrame = agentComposerView?.frame ?? inputBar?.frame ?? .zero
+    let buttonW: CGFloat = 38.0
+    let buttonH: CGFloat = 38.0
+    let buttonX = (bounds.width - buttonW) / 2.0
+    let buttonY = (activeBarFrame != .zero ? activeBarFrame.minY : bounds.height) - buttonH - 12.0
+    jumpToBottomButton.frame = CGRect(x: buttonX, y: buttonY, width: buttonW, height: buttonH)
+  }
+
   private func layoutInputBarAndInset() {
     if let agentBar = agentComposerView {
         let w = bounds.width
@@ -6720,6 +6831,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         }
         positionTransitionOverlayHost()
         layoutActivityOverlay()
+        layoutJumpToBottomButton()
         return
     }
 
@@ -6770,6 +6882,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // Keep transition overlay host above messages but behind the composer.
     positionTransitionOverlayHost()
     layoutActivityOverlay()
+    layoutJumpToBottomButton()
   }
 
   // MARK: - Native Send (synchronous, no bridge delay)
@@ -7079,24 +7192,29 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
   }
 
-  private lazy var bridgeSessionSpinner: UIActivityIndicatorView = {
-    let spinner = UIActivityIndicatorView(style: .large)
-    spinner.hidesWhenStopped = true
-    spinner.translatesAutoresizingMaskIntoConstraints = false
-    return spinner
+  private lazy var bridgeSessionSkeleton: VibeAgentTranscriptSkeletonView = {
+    let skeleton = VibeAgentTranscriptSkeletonView()
+    skeleton.translatesAutoresizingMaskIntoConstraints = false
+    return skeleton
   }()
   private var bridgeSessionSpinnerTimeout: DispatchWorkItem?
 
   private func showBridgeSessionLoadingSpinner() {
-    if bridgeSessionSpinner.superview == nil {
-      addSubview(bridgeSessionSpinner)
+    if bridgeSessionSkeleton.superview == nil {
+      addSubview(bridgeSessionSkeleton)
       NSLayoutConstraint.activate([
-        bridgeSessionSpinner.centerXAnchor.constraint(equalTo: centerXAnchor),
-        bridgeSessionSpinner.centerYAnchor.constraint(equalTo: centerYAnchor),
+        bridgeSessionSkeleton.topAnchor.constraint(equalTo: collectionView.topAnchor),
+        bridgeSessionSkeleton.leadingAnchor.constraint(equalTo: leadingAnchor),
+        bridgeSessionSkeleton.trailingAnchor.constraint(equalTo: trailingAnchor),
+        bridgeSessionSkeleton.bottomAnchor.constraint(equalTo: collectionView.bottomAnchor),
       ])
     }
-    bringSubviewToFront(bridgeSessionSpinner)
-    bridgeSessionSpinner.startAnimating()
+    bringSubviewToFront(bridgeSessionSkeleton)
+    bridgeSessionSkeleton.applyAppearance(VibeAgentKitMap.appearance(for: self.traitCollection))
+    bridgeSessionSkeleton.isHidden = false
+    bridgeSessionSkeleton.alpha = 1.0
+    bridgeSessionSkeleton.startShimmer()
+
     bridgeSessionSpinnerTimeout?.cancel()
     let work = DispatchWorkItem { [weak self] in self?.hideBridgeSessionLoadingSpinner() }
     bridgeSessionSpinnerTimeout = work
@@ -7106,12 +7224,18 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private func hideBridgeSessionLoadingSpinner() {
     bridgeSessionSpinnerTimeout?.cancel()
     bridgeSessionSpinnerTimeout = nil
-    bridgeSessionSpinner.stopAnimating()
+    guard !bridgeSessionSkeleton.isHidden else { return }
+    UIView.animate(withDuration: 0.2, animations: {
+      self.bridgeSessionSkeleton.alpha = 0.0
+    }) { _ in
+      self.bridgeSessionSkeleton.isHidden = true
+      self.bridgeSessionSkeleton.stopShimmer()
+    }
   }
 
   /// Once a picked session's rows land, drop the loading spinner.
   private func dismissBridgeSpinnerIfSessionLoaded(_ parsed: [ChatListRow]) {
-    guard bridgeSessionSpinner.isAnimating, let sessionId = bridgeLoadedSessionId else { return }
+    guard !bridgeSessionSkeleton.isHidden, let sessionId = bridgeLoadedSessionId else { return }
     let prefix = "bridge-\(sessionId)"
     if parsed.contains(where: { ($0.messageId ?? "").hasPrefix(prefix) }) {
       hideBridgeSessionLoadingSpinner()

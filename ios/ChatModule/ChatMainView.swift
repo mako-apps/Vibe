@@ -386,6 +386,17 @@ public final class ChatMainView: UIView,
   // MARK: - Forwarded chat-list APIs
 
   func setRows(_ rows: [[String: Any]]) {
+    // [EmptyTrace] The chat view gets its rows here. Log an empty apply together with the
+    // current header progress subtitle — if this prints "EMPTY … progress=<label>" mid-run,
+    // the engine handed the view an empty list while a run was live (the reported bug). Pair
+    // with the engine's [EmptyTrace] lines to see which clear/reset produced it.
+    if rows.isEmpty {
+      NSLog(
+        "[EmptyTrace] ChatMainView.setRows EMPTY chatId=%@ progress=%@ bridge=%@",
+        engineChatId.isEmpty ? "-" : String(engineChatId.suffix(12)),
+        agentProgressSubtitle ?? "nil",
+        bridgeProvider.isEmpty ? "-" : bridgeProvider)
+    }
     chatListView.setRows(rows)
     let nextHasPeerResponse = Self.rowsContainPeerResponse(rows, peerUserId: enginePeerUserId)
     if nextHasPeerResponse != hasPeerResponseInCurrentRows {
@@ -932,6 +943,10 @@ public final class ChatMainView: UIView,
     chatListView.onEventInboxChanged = { [weak self] count, latestPreview in
       self?.updateInboxBanner(count: count, latestPreview: latestPreview)
     }
+    chatListView.onBridgeUsageBannerVisibilityChanged = { [weak self] in
+      self?.setNeedsLayout()
+      self?.layoutIfNeeded()
+    }
 
     // The DM-level agent runtime view is hosted FULL-SCREEN by the owning controller;
     // forward ChatListView's present/teardown/presence to it (no in-view nesting).
@@ -1078,8 +1093,8 @@ public final class ChatMainView: UIView,
 
     rightActionsStack.axis = .horizontal
     rightActionsStack.alignment = .center
-    rightActionsStack.distribution = .fill
-    rightActionsStack.spacing = 4
+    rightActionsStack.distribution = .fillEqually
+    rightActionsStack.spacing = 0
 
     rightActionsStack.addArrangedSubview(callButton)
     rightActionsStack.addArrangedSubview(videoCallButton)
@@ -1089,7 +1104,6 @@ public final class ChatMainView: UIView,
     [callButton, videoCallButton, historyButton, newChatButton].forEach { button in
       button.translatesAutoresizingMaskIntoConstraints = false
       NSLayoutConstraint.activate([
-        button.widthAnchor.constraint(equalToConstant: 44.0),
         button.heightAnchor.constraint(equalToConstant: 44.0)
       ])
     }
@@ -3327,7 +3341,7 @@ public final class ChatMainView: UIView,
       : safeTop + 60.0
     let externalHeaderInset =
       externalNavigationHeaderEnabled && !savedSearchExpanded
-      ? safeTop
+      ? safeTop + 44.0
       : headerHeight
     let pinnedBannerVisible =
       pinnedBannerView.isHidden || pinnedBannerView.alpha <= 0.01
@@ -3340,8 +3354,12 @@ public final class ChatMainView: UIView,
     let inboxBannerInset: CGFloat = inboxBannerVisible
       ? (ChatPinnedBannerView.preferredHeight + 12.0)
       : 0.0
+    let usageBannerVisible = chatListView.isBridgeUsageBannerVisible
+    let usageBannerInset: CGFloat = usageBannerVisible
+      ? (ChatPinnedBannerView.preferredHeight + 24.0)
+      : 0.0
     chatListView.setContentPaddingTop(
-      Double(externalHeaderInset + 8.0 + pinnedBannerInset + inboxBannerInset))
+      Double(externalHeaderInset + 8.0 + pinnedBannerInset + inboxBannerInset + usageBannerInset))
     pagesHost.frame = CGRect(
       x: 0.0,
       y: headerHeight,
@@ -3802,6 +3820,11 @@ public final class ChatMainView: UIView,
       resolvedSubtitle = ""
     } else if let resolvedApproval {
       resolvedSubtitle = resolvedApproval
+    } else if isGroupOrChannel, let groupTypingSubtitle {
+      // In a group the agents run in parallel, so surface "Claude & Codex typing…"
+      // (all active participants) instead of a single agent's working/thinking label.
+      // DMs keep the detailed agent-progress subtitle (the branch just below).
+      resolvedSubtitle = groupTypingSubtitle
     } else if let resolvedAgentProgress {
       resolvedSubtitle = resolvedAgentProgress
     } else if let bridgeIdleAction {
@@ -3935,12 +3958,16 @@ public final class ChatMainView: UIView,
     }
     if !(chatSubtitleLabel.layer.mask is CAGradientLayer) {
       let gradientLayer = CAGradientLayer()
+      let shimmerColor = appearance.isDark ? UIColor.black : UIColor.white
+      let baseColor = shimmerColor.withAlphaComponent(0.35).cgColor
+      let highlightColor = shimmerColor.withAlphaComponent(1.0).cgColor
       gradientLayer.colors = [
-        UIColor.white.withAlphaComponent(0.35).cgColor,
-        UIColor.white.withAlphaComponent(1.0).cgColor,
-        UIColor.white.withAlphaComponent(0.35).cgColor,
+        baseColor,
+        baseColor,
+        highlightColor,
+        baseColor,
+        baseColor,
       ]
-      gradientLayer.locations = [0.0, 0.5, 1.0]
       gradientLayer.startPoint = CGPoint(x: 0.0, y: 0.5)
       gradientLayer.endPoint = CGPoint(x: 1.0, y: 0.5)
       chatSubtitleLabel.layer.mask = gradientLayer
@@ -3958,12 +3985,32 @@ public final class ChatMainView: UIView,
       let mask = chatSubtitleLabel.layer.mask as? CAGradientLayer,
       chatSubtitleLabel.bounds.width > 0
     else { return }
-    mask.frame = CGRect(
-      x: -chatSubtitleLabel.bounds.width * 2, y: 0,
-      width: chatSubtitleLabel.bounds.width * 5, height: chatSubtitleLabel.bounds.height)
+    
+    let labelWidth = chatSubtitleLabel.bounds.width
+    let bandWidth: CGFloat = 80.0
+    // Make the mask wide enough so it always covers the label during translation
+    let maskWidth = max(labelWidth * 3.0 + bandWidth * 3.0, 500.0)
+    
+    // Calculate the fractional width of the band relative to the huge mask
+    let halfBand = (bandWidth / 2.0) / maskWidth
+    mask.locations = [
+      0.0,
+      NSNumber(value: 0.5 - halfBand),
+      0.5,
+      NSNumber(value: 0.5 + halfBand),
+      1.0
+    ]
+    
+    mask.frame = CGRect(x: 0, y: 0, width: maskWidth, height: chatSubtitleLabel.bounds.height)
+    
+    // We want the center of the mask (which is at maskWidth / 2) to sweep from 0 to labelWidth.
+    // We add some padding so the highlight band fully enters and exits the text.
+    let sweepStart = -maskWidth / 2.0 - bandWidth
+    let sweepEnd = labelWidth - maskWidth / 2.0 + bandWidth
+    
     let animation = CABasicAnimation(keyPath: "transform.translation.x")
-    animation.fromValue = -chatSubtitleLabel.bounds.width * 2
-    animation.toValue = chatSubtitleLabel.bounds.width * 2
+    animation.fromValue = sweepStart
+    animation.toValue = sweepEnd
     animation.duration = 1.5
     animation.repeatCount = .infinity
     animation.isRemovedOnCompletion = false
@@ -3972,14 +4019,17 @@ public final class ChatMainView: UIView,
 
   private func updateBackButtonContent() {
     let title = headerUnreadCount > 0 ? "\(min(headerUnreadCount, 99))" : nil
-    var configuration = UIButton.Configuration.plain()
-    configuration.image = UIImage(systemName: "chevron.left")
-    configuration.title = title
-    configuration.imagePlacement = .leading
-    configuration.imagePadding = headerUnreadCount > 0 ? 1.0 : 0.0
-    configuration.contentInsets = NSDirectionalEdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0)
-    configuration.baseForegroundColor = backButton.tintColor
-    backButton.configuration = configuration
+    // Match the agent view's header back button exactly: a plain system button with a
+    // template image + optional count title. Using UIButton.Configuration here made the
+    // icon read larger and added the automatic press "bounce"/scale that lingered on
+    // pop — the classic setImage/setTitle path has neither.
+    backButton.configuration = nil
+    backButton.setImage(UIImage(systemName: "chevron.backward"), for: .normal)
+    backButton.setPreferredSymbolConfiguration(
+      UIImage.SymbolConfiguration(pointSize: 18, weight: .semibold), forImageIn: .normal)
+    backButton.setTitle(title, for: .normal)
+    backButton.titleLabel?.font = UIFont.systemFont(ofSize: 15, weight: .semibold)
+    backButton.titleEdgeInsets = UIEdgeInsets(top: 0, left: title == nil ? 0 : 2, bottom: 0, right: 0)
     backButton.accessibilityLabel =
       headerUnreadCount > 0
       ? "Back, \(headerUnreadCount) unread messages"
@@ -4125,9 +4175,29 @@ public final class ChatMainView: UIView,
   }
 
   private func resolvedGroupTypingSubtitle() -> String? {
-    let normalizedTypingUsers = Array(Set(groupTypingUserIds.map { $0.uppercased() })).sorted()
+    let normalizedTypingUsers = Array(Set(groupTypingUserIds.map { $0.uppercased() }))
     guard !normalizedTypingUsers.isEmpty else { return nil }
-    return "typing..."
+    // Name the typers (Claude / Codex / people) instead of a bare "typing…", so a
+    // group where both agents are running in parallel reads "Claude & Codex typing…".
+    let names: [String] =
+      normalizedTypingUsers
+      .compactMap { id -> String? in
+        let name = groupMemberDisplayNameByUserId[id]?
+          .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (name?.isEmpty ?? true) ? nil : name
+      }
+      .sorted()
+
+    switch names.count {
+    case 0:
+      return "typing…"
+    case 1:
+      return "\(names[0]) typing…"
+    case 2:
+      return "\(names[0]) & \(names[1]) typing…"
+    default:
+      return "\(names[0]), \(names[1]) +\(names.count - 2) typing…"
+    }
   }
 
   private func resolvedDirectTypingSubtitle() -> String? {

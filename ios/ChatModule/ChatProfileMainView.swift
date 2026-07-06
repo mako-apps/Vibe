@@ -346,6 +346,16 @@ private final class NativeProfileAvatarModel: ObservableObject {
       }
     }
   }
+
+  /// Directly set a locally-rendered image that has no source URL — e.g. the group
+  /// mosaic composed from member avatars. Clears any pending URL load and the
+  /// tracked `imageUri` so a later `setImageUri(nil)` on the same (group) refresh
+  /// path is a no-op and doesn't wipe the composite.
+  func setComposedImage(_ image: UIImage?) {
+    imageTask?.cancel()
+    imageUri = nil
+    loadedImage = image
+  }
 }
 
 extension String {
@@ -581,6 +591,12 @@ final class NativeProfileAvatarView: UIView {
     guard currentImageUri != nextValue else { return }
     currentImageUri = nextValue
     publishModelChange { $0.setImageUri(nextValue) }
+  }
+
+  /// Show a locally-composed image (the group mosaic) with no backing URL.
+  func setComposedImage(_ image: UIImage?) {
+    currentImageUri = nil
+    publishModelChange { $0.setComposedImage(image) }
   }
 
   func setFallbackText(_ value: String?) {
@@ -1576,7 +1592,7 @@ private struct ChatProfileSwiftUIRootView: View {
             ChatProfileSwiftUIRow(
               title: "Edit group",
               subtitle: "Name, photo, description",
-              trailingSystemImage: "chevron.right",
+              trailingSystemImage: nil,
               showsChevron: true,
               separatorColor: separatorColor,
               isLast: false
@@ -1589,7 +1605,7 @@ private struct ChatProfileSwiftUIRootView: View {
           ChatProfileSwiftUIRow(
             title: "Members",
             subtitle: groupMembersSubtitle,
-            trailingSystemImage: "chevron.right",
+            trailingSystemImage: nil,
             showsChevron: true,
             separatorColor: separatorColor,
             isLast: groupBridgeProvider == nil
@@ -1605,7 +1621,7 @@ private struct ChatProfileSwiftUIRootView: View {
             ChatProfileSwiftUIRow(
               title: "Repository",
               subtitle: selectedRepositoryName ?? "Pick repo for Claude/Codex",
-              trailingSystemImage: "chevron.right",
+              trailingSystemImage: nil,
               showsChevron: true,
               separatorColor: separatorColor,
               isLast: false
@@ -1619,7 +1635,7 @@ private struct ChatProfileSwiftUIRootView: View {
             ChatProfileSwiftUIRow(
               title: "Configuration",
               subtitle: "Agent and group settings",
-              trailingSystemImage: "chevron.right",
+              trailingSystemImage: nil,
               showsChevron: true,
               separatorColor: separatorColor,
               isLast: true
@@ -4071,6 +4087,9 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     // Without this the members roster / header count never appear in the live
     // SwiftUI profile — it was only re-rendered by unrelated later setters.
     renderSwiftUIProfile()
+    // The group hero is a mosaic composed from these members, so it must rebuild
+    // when the roster arrives (members often land after the initial avatar set).
+    refreshAvatar()
   }
 
   func setGroupMemberCount(_ value: Int?) {
@@ -4966,7 +4985,14 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       rawAvatar?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
     let hasPeerUser = !peerUserId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     guard hasRawAvatar || (preferPushAvatar && hasPeerUser) else {
-      floatingAvatarView.setImageUri(nil)
+      // No single avatar. For a group we compose the SAME member-mosaic the home
+      // list shows (from the members' avatar URLs we already have) rather than
+      // dropping to a bare initials tile.
+      if isGroupOrChannel {
+        loadGroupCompositeAvatar(generation: generation)
+      } else {
+        floatingAvatarView.setImageUri(nil)
+      }
       return
     }
 
@@ -4980,6 +5006,32 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       DispatchQueue.main.async { [weak self] in
         guard let self, self.avatarResolveGeneration == generation else { return }
         self.floatingAvatarView.setImageUri(resolvedUri)
+      }
+    }
+  }
+
+  /// Build the group mosaic hero from the current members and show it. Falls back
+  /// to the initials tile when there aren't at least two members with avatars.
+  /// Guarded by `avatarResolveGeneration` so a stale build can't overwrite a newer
+  /// avatar (e.g. after the group photo is set).
+  private func loadGroupCompositeAvatar(generation: UInt) {
+    let members = groupMembers
+    let isDark = traitCollection.userInterfaceStyle == .dark
+    guard GroupCompositeAvatar.slots(from: members).count >= 2 else {
+      floatingAvatarView.setImageUri(nil)
+      return
+    }
+    let side = NativeProfileAvatarHeroMetrics.expandedSize
+    Task { [weak self] in
+      let image = await GroupCompositeAvatar.composedImage(
+        members: members, side: side, isDark: isDark)
+      await MainActor.run {
+        guard let self, self.avatarResolveGeneration == generation else { return }
+        if let image {
+          self.floatingAvatarView.setComposedImage(image)
+        } else {
+          self.floatingAvatarView.setImageUri(nil)
+        }
       }
     }
   }

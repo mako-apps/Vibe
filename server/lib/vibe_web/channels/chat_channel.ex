@@ -672,21 +672,33 @@ defmodule VibeWeb.ChatChannel do
           user_id
         )
 
-      # Default team behaviour: a plain group message (no @team / @claude / @codex,
+      # Default group behaviour: a plain group message (no @team / @claude / @codex,
       # no reply-to-agent) in a group that has the AI workers as members fans out to
-      # all of them as one coordinated team run. The agents decide amongst themselves
-      # who takes the work (see agent_operating_rules) — a simple ask can be handled
-      # by one while the other defers; complex work gets split.
+      # ALL of them in PARALLEL — two independent runtimes that both start
+      # immediately, each with its own "typing" activity and message stream. This is
+      # what makes a group feel like two coworkers rather than a relay. (An explicit
+      # `@team` / `/team` run above stays a coordinated *sequential* handoff instead,
+      # where the agents build on each other's work.)
       room_type != "dm" and not sender_is_agent? and is_nil(standalone_agent) and
         is_nil(local_worker) and reserved_workers == [] and is_binary(dispatch_text) and
           length(group_agent_workers) > 1 ->
-        spawn_team_worker_dispatches(
-          chat_id,
-          group_agent_workers,
-          dispatch_text,
-          data,
-          user_id
-        )
+        group_agent_workers
+        |> Enum.with_index()
+        |> Enum.each(fn {worker, index} ->
+          spawn_local_worker_dispatch(
+            chat_id,
+            worker,
+            dispatch_text,
+            data,
+            "group_default_parallel",
+            user_id,
+            # First dispatch takes the rate-limit slot; the parallel sibling skips it
+            # so the pair always starts together. Record the human's turn in the
+            # shared group memory once (both workers read the same thread).
+            skip_rate_limit: index > 0,
+            note_user_turn: index == 0
+          )
+        end)
 
       # Same default, but a group that only has one AI member — dispatch to it alone.
       room_type != "dm" and not sender_is_agent? and is_nil(standalone_agent) and

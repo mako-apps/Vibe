@@ -575,7 +575,9 @@ struct GroupEditSheet: View {
         Spacer()
       }
       .padding(.top)
-      .background(palette.background.ignoresSafeArea())
+      // Glass sheet: let the frosted material (below) show through instead of a
+      // flat solid fill. The inner cards keep their tint for text contrast.
+      .background(Color.clear)
       .navigationTitle("Edit Group")
       .navigationBarTitleDisplayMode(.inline)
       .toolbar {
@@ -607,6 +609,8 @@ struct GroupEditSheet: View {
         }
       }
     }
+    // Frosted-glass sheet surface (replaces the old solid dark background).
+    .presentationBackground(.ultraThinMaterial)
   }
 
   @ViewBuilder
