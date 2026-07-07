@@ -21,6 +21,17 @@ final class ChatHomeCardCell: UITableViewCell {
     ChatAvatarImageStore.cache(image, for: key)
   }
 
+  /// Whether the last bridge-status snapshot reports a task actively running for `chatId`.
+  /// Read synchronously so a home row can show "Working…" even before its chat channel is
+  /// joined (a run started on the Mac/IDE, or a cold launch) — the status poll owns this
+  /// signal, independent of the per-chat agent-stream frames that drive `agentProgress`.
+  static func hasRunningBridgeTask(chatId: String) -> Bool {
+    let key = chatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !key.isEmpty else { return false }
+    return (AgentPairingService.lastStatusSnapshot?.runningTasks ?? [])
+      .contains { $0.chatId.trimmingCharacters(in: .whitespacesAndNewlines) == key }
+  }
+
   static func getFallbackInitials(from name: String) -> String {
     let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !cleanName.isEmpty else { return "" }
@@ -66,6 +77,10 @@ final class ChatHomeCardCell: UITableViewCell {
   private var avatarLoadTask: Task<Void, Never>?
   private var avatarToken = UUID().uuidString
   private var lastAvatarURLString: String?
+  // Archive / Saved Messages rows use a glyph fallback (archivebox / bookmark);
+  // every other row falls back to gradient + initials. Tracked so the async
+  // image-load completion knows which fallback to reveal when there's no photo.
+  private var usesIconFallback = false
   private var rowContentLeadingConstraint: NSLayoutConstraint?
   private var currentEditingLayout = false
   private lazy var swipePanGestureRecognizer: UIPanGestureRecognizer = {
@@ -120,7 +135,8 @@ final class ChatHomeCardCell: UITableViewCell {
     avatarToken = UUID().uuidString
     lastAvatarURLString = nil
     avatarImageView.image = nil
-    avatarFallbackIconView.isHidden = false
+    usesIconFallback = false
+    avatarFallbackIconView.isHidden = true
     avatarFallbackLabel.isHidden = false
     avatarContainer.layer.sublayers?.removeAll(where: { $0.name == self.avatarGradientLayerName })
     unreadBadge.isHidden = true
@@ -222,6 +238,13 @@ final class ChatHomeCardCell: UITableViewCell {
     {
       previewLabel.text = liveLabel
       previewLabel.textColor = typingColor
+    } else if row.isBridgeAgentSurface, Self.hasRunningBridgeTask(chatId: row.chatId) {
+      // No live agent-stream label yet (a run started on the Mac / IDE, or a cold launch
+      // before this chat's channel is joined) — but the bridge status snapshot reports a
+      // task running for this chat. Show the working state instead of the idle
+      // "Start session" preview so home reflects the in-flight session.
+      previewLabel.text = "Working…"
+      previewLabel.textColor = typingColor
     } else {
       previewLabel.text = row.isTyping ? "typing..." : row.preview
       previewLabel.textColor = row.isTyping ? typingColor : secondary
@@ -253,35 +276,32 @@ final class ChatHomeCardCell: UITableViewCell {
     rightCheckmarkView.isHidden = !showsRightCheckmark
     rightCheckmarkView.tintColor = isEditSelected ? badgeBackground : secondary.withAlphaComponent(0.3)
 
-    if row.isArchiveEntry || row.isSavedMessages {
+    usesIconFallback = row.isArchiveEntry || row.isSavedMessages
+    if usesIconFallback {
       let fallbackSystemImageName = row.isArchiveEntry ? "archivebox.fill" : "bookmark.fill"
       avatarFallbackIconView.image = UIImage(systemName: fallbackSystemImageName)
       avatarFallbackIconView.tintColor = .white
-      avatarFallbackIconView.isHidden = false
-      avatarFallbackLabel.isHidden = true
     } else {
-      avatarFallbackIconView.isHidden = true
-      avatarFallbackLabel.isHidden = false
       avatarFallbackLabel.text = Self.getFallbackInitials(from: row.title)
     }
+    // Reveal the fallback for now; the async image load hides it if a photo lands.
+    showAvatarFallback(true)
 
+    // Every row now has a gradient behind the fallback: an explicit one if the
+    // caller passed it, the Saved/Archive teal, else the SAME deterministic
+    // gradient the profile hero and chat header derive — so a photoless avatar
+    // is a coloured initials tile everywhere (never a flat grey block, never an
+    // icon).
     let resolvedAvatarGradientColors =
       avatarGradientColors
-      ?? ((row.isSavedMessages || row.isArchiveEntry) ? Self.savedMessagesGradientColors(isDark: isDark) : nil)
-    if let resolvedAvatarGradientColors {
-      applyAvatarGradient(
-        startColor: resolvedAvatarGradientColors.0,
-        endColor: resolvedAvatarGradientColors.1
-      )
-    } else {
-      avatarContainer.layer.sublayers?.removeAll(where: { $0.name == avatarGradientLayerName })
-      let avatarBackground =
-        avatarBackgroundColor
-        ?? (isDark
-          ? UIColor(red: 63 / 255, green: 70 / 255, blue: 85 / 255, alpha: 1)
-          : UIColor(red: 222 / 255, green: 230 / 255, blue: 243 / 255, alpha: 1))
-      avatarContainer.backgroundColor = avatarBackground
-    }
+      ?? (usesIconFallback
+        ? Self.savedMessagesGradientColors(isDark: isDark)
+        : ChatProfileAppearanceStore.avatarColors(
+          title: row.title, peerUserId: row.peerUserId, chatId: row.chatId))
+    applyAvatarGradient(
+      startColor: resolvedAvatarGradientColors.0,
+      endColor: resolvedAvatarGradientColors.1
+    )
     pressOverlayView.backgroundColor = pressedColor
     dividerView.backgroundColor = dividerColor
     updateEditingLayout(isEditing, animated: true)
@@ -1222,15 +1242,23 @@ final class ChatHomeCardCell: UITableViewCell {
     min(1, max(0, value))
   }
 
+  /// Show/hide the no-photo fallback as one unit: the glyph for archive/saved
+  /// rows, the gradient+initials label for everything else. Photo present ⇒ both
+  /// hidden, so a loaded avatar never has a letter sitting on top of it.
+  private func showAvatarFallback(_ show: Bool) {
+    avatarFallbackIconView.isHidden = !(show && usesIconFallback)
+    avatarFallbackLabel.isHidden = !(show && !usesIconFallback)
+  }
+
   private func loadAvatarImage(urlString: String?) {
     let normalizedURL = (urlString ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     if normalizedURL == lastAvatarURLString {
       if avatarImageView.image != nil {
-        avatarFallbackIconView.isHidden = true
+        showAvatarFallback(false)
         return
       }
       if avatarLoadTask != nil {
-        avatarFallbackIconView.isHidden = false
+        showAvatarFallback(true)
         return
       }
     }
@@ -1244,19 +1272,20 @@ final class ChatHomeCardCell: UITableViewCell {
 
     guard !normalizedURL.isEmpty else {
       avatarImageView.image = nil
-      avatarFallbackIconView.isHidden = false
+      showAvatarFallback(true)
       lastAvatarURLString = nil
       return
     }
 
     if let cached = ChatAvatarImageStore.cached(for: normalizedURL) {
       avatarImageView.image = cached
-      avatarFallbackIconView.isHidden = true
+      showAvatarFallback(false)
       return
     }
 
+    // No cached photo yet — keep the gradient+initials (or glyph) up while it loads.
     avatarImageView.image = nil
-    avatarFallbackIconView.isHidden = false
+    showAvatarFallback(true)
 
     let token = avatarToken
     let task = Task { [weak self] in
@@ -1267,7 +1296,7 @@ final class ChatHomeCardCell: UITableViewCell {
         self.avatarLoadTask = nil
         if let image {
           self.avatarImageView.image = image
-          self.avatarFallbackIconView.isHidden = true
+          self.showAvatarFallback(false)
         }
       }
     }
@@ -1292,12 +1321,13 @@ final class ChatHomeCardCell: UITableViewCell {
 
     if let cached = ChatAvatarImageStore.cached(for: cacheKey) {
       avatarImageView.image = cached
-      avatarFallbackIconView.isHidden = true
+      showAvatarFallback(false)
       return
     }
 
+    // Keep the gradient+initials tile up while the mosaic renders.
     avatarImageView.image = nil
-    avatarFallbackIconView.isHidden = true
+    showAvatarFallback(true)
     let token = UUID().uuidString
     avatarToken = token
     let side: CGFloat = 60
@@ -1321,7 +1351,7 @@ final class ChatHomeCardCell: UITableViewCell {
         guard let self, token == self.avatarToken else { return }
         self.avatarLoadTask = nil
         self.avatarImageView.image = composite
-        self.avatarFallbackIconView.isHidden = true
+        self.showAvatarFallback(false)
       }
     }
     avatarLoadTask = task

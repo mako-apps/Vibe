@@ -9,6 +9,8 @@ import UniformTypeIdentifiers
 
 final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate {
   var onSelectImage: ((String, String?, ChatAttachmentTransitionCapture?) -> Void)?
+  /// Multi-select send: all picked image uris (selection order) + the shared caption.
+  var onSelectImages: (([String], String?, ChatAttachmentTransitionCapture?) -> Void)?
   var onSelectFile: ((String, String) -> Void)?
   var onSelectLocation: ((Double, Double) -> Void)?
 
@@ -49,7 +51,11 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
   private var captionWidthConstraint: NSLayoutConstraint?
   private var captionHeightConstraint: NSLayoutConstraint?
   private var isCaptionMode = false
-  private var selectedAssetIndex: Int? = nil
+  // Multi-select: gallery indices in selection order. Images can be combined (up to
+  // `maxMultiSelect`); a video always sends alone, so picking one clears the rest.
+  private var selectedAssetIndices: [Int] = []
+  private static let maxMultiSelect = 6
+  private var tabBarContainerBottomConstraint: NSLayoutConstraint?
 
   // ── Tab bar container ──
   // A transparent container that holds the tab bar + caption chrome side-by-side,
@@ -144,6 +150,36 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
     setupHeader()  // header on top of mask
     setupTabBarAndCaption()  // tab bar on top of mask
     setActiveSection(.gallery, animated: false)
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleKeyboardWillChangeFrame(_:)),
+      name: UIResponder.keyboardWillChangeFrameNotification,
+      object: nil
+    )
+  }
+
+  /// Lift the caption bar above the keyboard while a caption is being typed —
+  /// without this the field stays pinned to the sheet bottom, hidden behind the
+  /// keyboard. Frame math is done in this view's coordinates so it stays correct
+  /// even when the sheet itself shifts for the keyboard.
+  @objc private func handleKeyboardWillChangeFrame(_ note: Notification) {
+    guard isViewLoaded,
+      let endFrame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect
+    else { return }
+    let endFrameInView = view.convert(endFrame, from: nil)
+    let overlap = max(0.0, view.bounds.maxY - endFrameInView.minY)
+    let duration =
+      (note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double) ?? 0.25
+    let curveRaw =
+      (note.userInfo?[UIResponder.keyboardAnimationCurveUserInfoKey] as? UInt) ?? 7
+    tabBarContainerBottomConstraint?.constant = -(10.0 + overlap)
+    UIView.animate(
+      withDuration: duration,
+      delay: 0,
+      options: [UIView.AnimationOptions(rawValue: curveRaw << 16), .beginFromCurrentState]
+    ) {
+      self.view.layoutIfNeeded()
+    }
   }
 
   override func viewDidLayoutSubviews() {
@@ -344,6 +380,10 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
     let hC = captionChromeView.heightAnchor.constraint(equalToConstant: 0)
     captionWidthConstraint = wC
     captionHeightConstraint = hC
+    // Kept as a var so the caption bar can ride above the keyboard while typing.
+    let tabBarContainerBottom = tabBarContainer.bottomAnchor.constraint(
+      equalTo: view.bottomAnchor, constant: -10)
+    tabBarContainerBottomConstraint = tabBarContainerBottom
 
     // ── Constraints (exact ChatNativeTabBarModule pattern) ──
     NSLayoutConstraint.activate([
@@ -352,7 +392,7 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
       // The floating UITabBar draws its own glass pill; no safe area padding needed.
       tabBarContainer.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 10),
       tabBarContainer.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10),
-      tabBarContainer.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -10),
+      tabBarContainerBottom,
       tabBarContainer.heightAnchor.constraint(equalToConstant: 64),
 
       // Tab bar: shift bounding box outward by -16 lead / +8 trail (Apple internal padding fix)
@@ -685,29 +725,46 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
 
   /// Called when the selection toggle on a cell is tapped.
   func handleSelectToggle(assetIndex: Int) {
-    if selectedAssetIndex == assetIndex {
-      // Deselect
-      exitCaptionMode()
-    } else {
-      // Select (or switch selection)
-      if isCaptionMode { exitCaptionMode() }
-      enterCaptionMode(assetIndex: assetIndex)
+    guard assetIndex < galleryAssets.count else { return }
+    if let position = selectedAssetIndices.firstIndex(of: assetIndex) {
+      // Deselect this one; caption mode collapses when nothing is left.
+      selectedAssetIndices.remove(at: position)
+      setCellChecked(assetIndex: assetIndex, checked: false)
+      selectionFeedback.selectionChanged()
+      selectionFeedback.prepare()
+      if selectedAssetIndices.isEmpty { exitCaptionMode() }
+      return
+    }
+    // A video sends alone: picking one clears any prior picks, and picking an image
+    // while a video is selected drops the video.
+    let tappedIsVideo = galleryAssets[assetIndex].mediaType == .video
+    let hasVideoSelected = selectedAssetIndices.contains {
+      $0 < galleryAssets.count && galleryAssets[$0].mediaType == .video
+    }
+    if tappedIsVideo || hasVideoSelected {
+      let previous = selectedAssetIndices
+      selectedAssetIndices = []
+      previous.forEach { setCellChecked(assetIndex: $0, checked: false) }
+    }
+    guard selectedAssetIndices.count < Self.maxMultiSelect else { return }
+    selectedAssetIndices.append(assetIndex)
+    setCellChecked(assetIndex: assetIndex, checked: true)
+    selectionFeedback.selectionChanged()
+    selectionFeedback.prepare()
+    enterCaptionMode()
+  }
+
+  private func setCellChecked(assetIndex: Int, checked: Bool) {
+    let ip = IndexPath(item: assetIndex + 1, section: 0)
+    if let cell = galleryCollectionView.cellForItem(at: ip) as? ChatAttachmentAssetCell {
+      cell.setChecked(checked, animated: true)
     }
   }
 
-  private func enterCaptionMode(assetIndex: Int) {
+  private func enterCaptionMode() {
     guard !isCaptionMode else { return }
     isCaptionMode = true
-    selectedAssetIndex = assetIndex
     captionChromeView.isHidden = false
-    selectionFeedback.selectionChanged()
-    selectionFeedback.prepare()
-
-    // Mark cell as selected
-    let ip = IndexPath(item: assetIndex + 1, section: 0)
-    if let cell = galleryCollectionView.cellForItem(at: ip) as? ChatAttachmentAssetCell {
-      cell.setChecked(true, animated: true)
-    }
 
     UIView.animate(
       withDuration: 0.4, delay: 0, usingSpringWithDamping: 0.8, initialSpringVelocity: 0.2,
@@ -752,14 +809,9 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
     captionField.resignFirstResponder()
     captionField.text = ""
 
-    // Uncheck cell
-    if let idx = selectedAssetIndex {
-      let ip = IndexPath(item: idx + 1, section: 0)
-      if let cell = galleryCollectionView.cellForItem(at: ip) as? ChatAttachmentAssetCell {
-        cell.setChecked(false, animated: true)
-      }
-    }
-    selectedAssetIndex = nil
+    let previous = selectedAssetIndices
+    selectedAssetIndices = []
+    previous.forEach { setCellChecked(assetIndex: $0, checked: false) }
 
     UIView.animate(
       withDuration: 0.4, delay: 0, usingSpringWithDamping: 0.8, initialSpringVelocity: 0.2,
@@ -787,8 +839,63 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
   }
 
   @objc private func sendSelectedItem() {
-    guard let assetIdx = selectedAssetIndex, assetIdx < galleryAssets.count else { return }
-    sendSelectedAsset(galleryAssets[assetIdx], skipEditor: true)
+    let indices = selectedAssetIndices.filter { $0 < galleryAssets.count }
+    guard !indices.isEmpty else { return }
+    if indices.count == 1 {
+      sendSelectedAsset(galleryAssets[indices[0]], skipEditor: true)
+      return
+    }
+    sendSelectedImages(indices.map { galleryAssets[$0] }.filter { $0.mediaType == .image })
+  }
+
+  /// Export every selected image to a temp file, then hand ALL uris (selection order)
+  /// + the shared caption to the host in one callback, so an agent DM can dispatch a
+  /// single task carrying the whole set.
+  private func sendSelectedImages(_ assets: [PHAsset]) {
+    guard !assets.isEmpty, !isSelectingAsset else { return }
+    isSelectingAsset = true
+    let caption = currentCaption()
+    let group = DispatchGroup()
+    let lock = NSLock()
+    var urisByIndex: [Int: String] = [:]
+    for (index, asset) in assets.enumerated() {
+      group.enter()
+      let options = PHImageRequestOptions()
+      options.isNetworkAccessAllowed = true
+      options.deliveryMode = .highQualityFormat
+      options.version = .current
+      PHImageManager.default().requestImageDataAndOrientation(for: asset, options: options) {
+        data, uti, _, _ in
+        defer { group.leave() }
+        guard let data else { return }
+        let ext: String = {
+          if let uti, let type = UTType(uti) { return type.preferredFilenameExtension ?? "jpg" }
+          return "jpg"
+        }()
+        let url = FileManager.default.temporaryDirectory
+          .appendingPathComponent("gallery-\(UUID().uuidString)")
+          .appendingPathExtension(ext)
+        do {
+          try data.write(to: url, options: .atomic)
+          lock.lock()
+          urisByIndex[index] = url.absoluteString
+          lock.unlock()
+        } catch {}
+      }
+    }
+    group.notify(queue: .main) { [weak self] in
+      guard let self else { return }
+      self.isSelectingAsset = false
+      let uris = urisByIndex.keys.sorted().compactMap { urisByIndex[$0] }
+      guard !uris.isEmpty else { return }
+      self.finishAndDismiss {
+        if uris.count == 1 {
+          self.onSelectImage?(uris[0], caption, nil)
+        } else {
+          self.onSelectImages?(uris, caption, nil)
+        }
+      }
+    }
   }
 
   func textFieldShouldReturn(_ textField: UITextField) -> Bool {
@@ -1293,7 +1400,7 @@ extension ChatAttachmentMenuController:
       self?.handleSelectToggle(assetIndex: assetIdx)
     }
     // Show checked state if this cell matches current selection
-    cell.setChecked(selectedAssetIndex == assetIdx, animated: false)
+    cell.setChecked(selectedAssetIndices.contains(assetIdx), animated: false)
 
     let targetSize = galleryThumbSize == .zero ? CGSize(width: 300, height: 300) : galleryThumbSize
     let opts = PHImageRequestOptions()

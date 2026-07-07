@@ -16,6 +16,16 @@ enum AgentParsedBlock: Equatable {
   case agentRuntime(ChatListRow.AgentRuntimeSummary)
 }
 
+/// Whether a finished turn's runtime actually changed anything. Turns that ran without
+/// touching a file (greetings, Q&A, failed runs) must not render the "N files changed
+/// +X −Y · Review" card — there is no diff to review.
+func agentRuntimeHasDiff(_ runtime: ChatListRow.AgentRuntimeSummary?) -> Bool {
+  guard let diff = runtime?.diff else { return false }
+  let hasPatch = diff.patch?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+  return diff.filesChanged > 0 || diff.additions > 0 || diff.deletions > 0
+    || !diff.files.isEmpty || hasPatch
+}
+
 struct AgentIntegrationPack: Equatable {
   let agentId: String
   let displayName: String
@@ -747,7 +757,7 @@ final class AgentRuntimeSummaryView: UIView {
 
 // MARK: - AgentRuntimeTaskViewController
 
-final class AgentRuntimeTaskViewController: UIViewController {
+final class AgentRuntimeTaskViewController: UITabBarController {
   private let row: ChatListRow
   private let runtime: ChatListRow.AgentRuntimeSummary
   private let appearance: ChatListAppearance
@@ -755,12 +765,6 @@ final class AgentRuntimeTaskViewController: UIViewController {
   private let fallbackProvider: String?
 
   private let messagesView = ChatNativeAgentMessagesView()
-  private let actionBar = UIVisualEffectView(effect: UIBlurEffect(style: .systemMaterial))
-  private let actionStack = UIStackView()
-  private let filesButton = UIButton(type: .system)
-  private let copyPatchButton = UIButton(type: .system)
-  private let stopButton = UIButton(type: .system)
-  private let revertButton = UIButton(type: .system)
   private let statusLabel = UILabel()
 
   init(
@@ -784,86 +788,44 @@ final class AgentRuntimeTaskViewController: UIViewController {
 
   override func viewDidLoad() {
     super.viewDidLoad()
-    view.backgroundColor = appearance.isDark ? .black : .systemBackground
-    title = runtime.provider?.capitalized ?? fallbackProvider?.capitalized ?? "Agent"
-    navigationItem.leftBarButtonItem = UIBarButtonItem(
-      barButtonSystemItem: .done,
-      target: self,
-      action: #selector(handleDone)
+    view.backgroundColor = .clear
+
+    let tabAppearance = UITabBarAppearance()
+    tabAppearance.configureWithTransparentBackground()
+    tabBar.standardAppearance = tabAppearance
+    tabBar.scrollEdgeAppearance = tabAppearance
+    tabBar.tintColor = appearance.isDark ? .white : .black
+    tabBar.unselectedItemTintColor = (appearance.isDark ? UIColor.white : UIColor.black).withAlphaComponent(0.4)
+
+    let reviewVC = AgentRuntimeTabReviewViewController(patch: runtime.diff?.patch ?? "", appearance: appearance)
+    reviewVC.tabBarItem = UITabBarItem(title: "Review", image: UIImage(systemName: "doc.text.magnifyingglass"), tag: 0)
+
+    let filesVC = AgentRuntimeFilesViewController(
+      runtime: runtime,
+      appearance: appearance,
+      chatId: chatId,
+      provider: providerForControl()
     )
+    filesVC.tabBarItem = UITabBarItem(title: "Files", image: UIImage(systemName: "folder"), tag: 1)
 
-    messagesView.translatesAutoresizingMaskIntoConstraints = false
+    let consoleVC = AgentRuntimeTabConsoleViewController(messagesView: messagesView)
+    consoleVC.tabBarItem = UITabBarItem(title: "Terminal", image: UIImage(systemName: "terminal"), tag: 2)
+
+    self.viewControllers = [reviewVC, filesVC, consoleVC]
+
+    let navBarAppearance = UINavigationBarAppearance()
+    navBarAppearance.configureWithTransparentBackground()
+    navigationController?.navigationBar.standardAppearance = navBarAppearance
+    navigationController?.navigationBar.scrollEdgeAppearance = navBarAppearance
+    navigationController?.navigationBar.tintColor = appearance.isDark ? .white : .black
+
+    navigationItem.leftBarButtonItem = UIBarButtonItem(
+      barButtonSystemItem: .close, target: self, action: #selector(handleDone))
+
+    updateNavigationButtons()
+    updateTitle(for: 0)
+
     messagesView.applyAppearance(appearance)
-    view.addSubview(messagesView)
-
-    actionBar.translatesAutoresizingMaskIntoConstraints = false
-    actionBar.layer.cornerRadius = 20
-    actionBar.layer.cornerCurve = .continuous
-    actionBar.clipsToBounds = true
-    view.addSubview(actionBar)
-
-    actionStack.axis = .horizontal
-    actionStack.alignment = .fill
-    actionStack.distribution = .fillEqually
-    actionStack.spacing = 8
-    actionStack.translatesAutoresizingMaskIntoConstraints = false
-    actionBar.contentView.addSubview(actionStack)
-
-    statusLabel.translatesAutoresizingMaskIntoConstraints = false
-    statusLabel.font = .systemFont(ofSize: 12, weight: .medium)
-    statusLabel.textColor = appearance.isDark ? UIColor.white.withAlphaComponent(0.58) : .secondaryLabel
-    statusLabel.textAlignment = .center
-    actionBar.contentView.addSubview(statusLabel)
-
-    configureActionButton(filesButton, title: "Files", symbolName: "doc.text.magnifyingglass")
-    configureActionButton(copyPatchButton, title: "Patch", symbolName: "doc.on.doc")
-    configureActionButton(stopButton, title: "Stop", symbolName: "stop.fill")
-    configureActionButton(revertButton, title: "Revert", symbolName: "arrow.uturn.backward")
-
-    filesButton.addTarget(self, action: #selector(handleFiles), for: .touchUpInside)
-    copyPatchButton.addTarget(self, action: #selector(handleCopyPatch), for: .touchUpInside)
-    stopButton.addTarget(self, action: #selector(handleStop), for: .touchUpInside)
-    revertButton.addTarget(self, action: #selector(handleRevert), for: .touchUpInside)
-
-    actionStack.addArrangedSubview(filesButton)
-    actionStack.addArrangedSubview(copyPatchButton)
-    actionStack.addArrangedSubview(stopButton)
-    actionStack.addArrangedSubview(revertButton)
-
-    let hasPatch = runtime.diff?.patch?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-    let hasFiles = !(runtime.diff?.files ?? []).isEmpty
-    filesButton.isEnabled = hasFiles
-    filesButton.alpha = hasFiles ? 1.0 : 0.42
-    copyPatchButton.isEnabled = hasPatch
-    copyPatchButton.alpha = hasPatch ? 1.0 : 0.42
-    stopButton.isEnabled = runtime.controls?.canCancel == true || runtime.status == "running"
-    stopButton.alpha = stopButton.isEnabled ? 1.0 : 0.42
-    revertButton.isEnabled = runtime.controls?.canRevert == true
-    revertButton.alpha = revertButton.isEnabled ? 1.0 : 0.42
-
-    NSLayoutConstraint.activate([
-      messagesView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-      messagesView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-      messagesView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-      messagesView.bottomAnchor.constraint(equalTo: actionBar.topAnchor, constant: -10),
-
-      actionBar.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
-      actionBar.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
-      actionBar.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -10),
-      actionBar.heightAnchor.constraint(equalToConstant: 86),
-
-      statusLabel.leadingAnchor.constraint(equalTo: actionBar.contentView.leadingAnchor, constant: 12),
-      statusLabel.trailingAnchor.constraint(equalTo: actionBar.contentView.trailingAnchor, constant: -12),
-      statusLabel.topAnchor.constraint(equalTo: actionBar.contentView.topAnchor, constant: 8),
-      statusLabel.heightAnchor.constraint(equalToConstant: 16),
-
-      actionStack.leadingAnchor.constraint(equalTo: actionBar.contentView.leadingAnchor, constant: 10),
-      actionStack.trailingAnchor.constraint(equalTo: actionBar.contentView.trailingAnchor, constant: -10),
-      actionStack.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 8),
-      actionStack.bottomAnchor.constraint(equalTo: actionBar.contentView.bottomAnchor, constant: -10),
-    ])
-
-    statusLabel.text = statusText()
     messagesView.setRows(
       buildRawRows(),
       topPadding: 10,
@@ -879,19 +841,151 @@ final class AgentRuntimeTaskViewController: UIViewController {
     messagesView.scrollToBottom(animated: false)
   }
 
-  private func configureActionButton(_ button: UIButton, title: String, symbolName: String) {
-    var config = UIButton.Configuration.filled()
-    config.title = title
-    config.image = UIImage(systemName: symbolName)
-    config.imagePadding = 5
-    config.cornerStyle = .large
-    config.baseForegroundColor = appearance.isDark ? .white : .label
-    config.baseBackgroundColor =
-      appearance.isDark
-      ? UIColor.white.withAlphaComponent(0.10)
-      : UIColor.black.withAlphaComponent(0.06)
-    button.configuration = config
-    button.titleLabel?.font = .systemFont(ofSize: 12, weight: .semibold)
+  override func tabBar(_ tabBar: UITabBar, didSelect item: UITabBarItem) {
+    updateTitle(for: item.tag)
+  }
+
+  private func updateTitle(for tag: Int) {
+    switch tag {
+    case 0:
+      title = "Review"
+    case 1:
+      title = "Files"
+    case 2:
+      title = "Terminal"
+    default:
+      title = runtime.provider?.capitalized ?? fallbackProvider?.capitalized ?? "Agent"
+    }
+  }
+
+  private func updateNavigationButtons() {
+    var rightItems: [UIBarButtonItem] = []
+
+    let isRunning = runtime.status == "running" || runtime.controls?.canCancel == true
+    if isRunning {
+      let stopItem = UIBarButtonItem(
+        image: UIImage(systemName: "stop.fill"),
+        style: .plain,
+        target: self,
+        action: #selector(handleStop)
+      )
+      rightItems.append(stopItem)
+    }
+
+    if runtime.controls?.canRevert == true {
+      let revertItem = UIBarButtonItem(
+        image: UIImage(systemName: "arrow.uturn.backward"),
+        style: .plain,
+        target: self,
+        action: #selector(handleRevert)
+      )
+      rightItems.append(revertItem)
+    }
+
+    let hasPatch = runtime.diff?.patch?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    if hasPatch {
+      let copyItem = UIBarButtonItem(
+        image: UIImage(systemName: "doc.on.doc"),
+        style: .plain,
+        target: self,
+        action: #selector(handleCopyPatch)
+      )
+      rightItems.append(copyItem)
+    }
+
+    navigationItem.rightBarButtonItems = rightItems
+  }
+
+  private func providerForControl() -> String? {
+    let provider = runtime.provider ?? fallbackProvider
+    let trimmed = provider?.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed?.isEmpty == false ? trimmed : nil
+  }
+
+  @objc private func handleDone() {
+    dismiss(animated: true)
+  }
+
+  @objc private func handleCopyPatch() {
+    guard let patch = runtime.diff?.patch, !patch.isEmpty else { return }
+    UIPasteboard.general.string = patch
+    statusLabel.text = "Patch copied"
+    title = "Patch copied"
+    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+      if let self {
+        self.updateTitle(for: self.selectedIndex)
+      }
+    }
+  }
+
+  @objc private func handleStop() {
+    sendControl(
+      action: "cancel",
+      item: navigationItem.rightBarButtonItems?.first { $0.action == #selector(AgentRuntimeTaskViewController.handleStop) },
+      pendingTitle: "Stopping",
+      doneTitle: "Stop Sent"
+    )
+  }
+
+  @objc private func handleRevert() {
+    let alert = UIAlertController(
+      title: "Revert Task Changes",
+      message: "This asks the bridge to revert only the files reported by this task.",
+      preferredStyle: .actionSheet
+    )
+    alert.addAction(UIAlertAction(title: "Revert", style: .destructive) { [weak self] _ in
+      self?.sendControl(
+        action: "revert",
+        item: self?.navigationItem.rightBarButtonItems?.first { $0.action == #selector(AgentRuntimeTaskViewController.handleRevert) },
+        pendingTitle: "Reverting",
+        doneTitle: "Revert Sent"
+      )
+    })
+    alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+    if let popover = alert.popoverPresentationController {
+      popover.barButtonItem = navigationItem.rightBarButtonItems?.first { $0.action == #selector(AgentRuntimeTaskViewController.handleRevert) }
+    }
+    present(alert, animated: true)
+  }
+
+  private func sendControl(
+    action: String,
+    item: UIBarButtonItem?,
+    pendingTitle: String,
+    doneTitle: String
+  ) {
+    guard let provider = providerForControl(), !chatId.isEmpty else {
+      statusLabel.text = "Bridge control unavailable"
+      title = "Control unavailable"
+      return
+    }
+    item?.isEnabled = false
+    statusLabel.text = pendingTitle
+    title = pendingTitle
+    var payload: [String: Any] = [
+      "chatId": chatId,
+      "provider": provider,
+      "action": action,
+    ]
+    if let taskId = runtime.taskId, !taskId.isEmpty {
+      payload["taskId"] = taskId
+    }
+    let result = ChatEngine.shared.sendAgentBridgeControl(payload)
+    if (result["accepted"] as? Bool) == true {
+      statusLabel.text = doneTitle
+      title = doneTitle
+    } else {
+      let reason = (result["reason"] as? String) ?? "not accepted"
+      statusLabel.text = "Control failed: \(reason)"
+      title = "Control failed"
+      item?.isEnabled = true
+    }
+
+    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+      if let self {
+        self.updateTitle(for: self.selectedIndex)
+      }
+    }
   }
 
   private func buildRawRows() -> [[String: Any]] {
@@ -948,13 +1042,13 @@ final class AgentRuntimeTaskViewController: UIViewController {
   ) -> [String: Any] {
     var message: [String: Any] = [
       "id": id,
+      "key": key,
       "text": text,
-      "plainContent": text,
+      "senderId": "agent",
+      "senderName": runtime.provider?.capitalized ?? "Agent",
       "timestamp": timestamp,
-      "isMe": false,
-      "type": "text",
-      "isAgentMessage": true,
-      "agentName": runtime.provider?.capitalized ?? fallbackProvider?.capitalized ?? "Agent",
+      "me": false,
+      "type": 0,
       "metadata": metadata,
       "bubbleShape": [
         "showTail": true,
@@ -1114,98 +1208,217 @@ final class AgentRuntimeTaskViewController: UIViewController {
     }
     return sections.joined(separator: "\n\n")
   }
+}
 
-  private func usageText(_ usage: ChatListRow.AgentRuntimeUsage?) -> String? {
-    guard let usage else { return nil }
-    var parts: [String] = []
-    if let value = usage.inputTokens { parts.append("input \(value)") }
-    if let value = usage.cachedInputTokens { parts.append("cached \(value)") }
-    if let value = usage.outputTokens { parts.append("output \(value)") }
-    if let value = usage.reasoningOutputTokens { parts.append("reasoning \(value)") }
-    if let value = usage.totalCostUsd { parts.append(String(format: "cost $%.4f", value)) }
-    if let value = usage.ttftMs { parts.append(String(format: "ttft %.1fs", Double(value) / 1000.0)) }
-    if let value = usage.durationMs { parts.append(String(format: "duration %.1fs", Double(value) / 1000.0)) }
-    return parts.isEmpty ? nil : parts.joined(separator: "  ")
+fileprivate func shortId(_ value: String) -> String {
+  guard value.count > 12 else { return value }
+  return "\(value.prefix(8))...\(value.suffix(4))"
+}
+
+fileprivate func usageText(_ usage: ChatListRow.AgentRuntimeUsage?) -> String? {
+  guard let usage else { return nil }
+  var parts: [String] = []
+  if let value = usage.inputTokens { parts.append("input \(value)") }
+  if let value = usage.cachedInputTokens { parts.append("cached \(value)") }
+  if let value = usage.outputTokens { parts.append("output \(value)") }
+  if let value = usage.reasoningOutputTokens { parts.append("reasoning \(value)") }
+  if let value = usage.totalCostUsd { parts.append(String(format: "cost $%.4f", value)) }
+  if let value = usage.ttftMs { parts.append(String(format: "ttft %.1fs", Double(value) / 1000.0)) }
+  if let value = usage.durationMs { parts.append(String(format: "duration %.1fs", Double(value) / 1000.0)) }
+  return parts.isEmpty ? nil : parts.joined(separator: "  ")
+}
+
+// MARK: - Tab Sub-controllers
+
+class AgentRuntimeTabReviewViewController: UIViewController {
+  private let patch: String
+  private let appearance: ChatListAppearance
+  private let textView = UITextView()
+
+  init(patch: String, appearance: ChatListAppearance) {
+    self.patch = patch
+    self.appearance = appearance
+    super.init(nibName: nil, bundle: nil)
   }
 
-  private func shortId(_ value: String) -> String {
-    guard value.count > 12 else { return value }
-    return "\(value.prefix(8))...\(value.suffix(4))"
-  }
+  required init?(coder: NSCoder) { return nil }
 
-  private func providerForControl() -> String? {
-    let provider = runtime.provider ?? fallbackProvider
-    let trimmed = provider?.trimmingCharacters(in: .whitespacesAndNewlines)
-    return trimmed?.isEmpty == false ? trimmed : nil
-  }
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    view.backgroundColor = .clear
 
-  @objc private func handleDone() {
-    dismiss(animated: true)
-  }
+    textView.translatesAutoresizingMaskIntoConstraints = false
+    textView.isEditable = false
+    textView.alwaysBounceVertical = true
+    textView.backgroundColor = .clear
+    textView.textColor = appearance.isDark ? .white : .label
+    textView.font = .monospacedSystemFont(ofSize: 12.5, weight: .regular)
+    textView.textContainerInset = UIEdgeInsets(top: 16, left: 12, bottom: 24, right: 12)
+    view.addSubview(textView)
 
-  @objc private func handleFiles() {
-    guard let diff = runtime.diff, !diff.files.isEmpty else { return }
-    let controller = AgentRuntimeFilesViewController(runtime: runtime, appearance: appearance)
-    navigationController?.pushViewController(controller, animated: true)
-  }
+    NSLayoutConstraint.activate([
+      textView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      textView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      textView.topAnchor.constraint(equalTo: view.topAnchor),
+      textView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+    ])
 
-  @objc private func handleCopyPatch() {
-    guard let patch = runtime.diff?.patch, !patch.isEmpty else { return }
-    UIPasteboard.general.string = patch
-    statusLabel.text = "Patch copied"
-  }
+    if !patch.isEmpty {
+      let isDark = appearance.isDark
+      let font = UIFont.monospacedSystemFont(ofSize: 13.0, weight: .regular)
+      let customDiffView = diffLayoutViewForAppearance(
+        patch: patch,
+        isDark: isDark,
+        textColor: appearance.isDark ? .white : .black,
+        primaryColor: ChatListAppearance.brandAccentFallback,
+        textSecondary: .lightGray,
+        font: font
+      )
+      customDiffView.translatesAutoresizingMaskIntoConstraints = false
 
-  @objc private func handleStop() {
-    sendControl(action: "cancel", button: stopButton, pendingTitle: "Stopping", doneTitle: "Stop Sent")
-  }
+      let scrollView = UIScrollView()
+      scrollView.translatesAutoresizingMaskIntoConstraints = false
+      scrollView.backgroundColor = .clear
+      scrollView.alwaysBounceVertical = true
+      view.addSubview(scrollView)
 
-  @objc private func handleRevert() {
-    let alert = UIAlertController(
-      title: "Revert Task Changes",
-      message: "This asks the bridge to revert only the files reported by this task.",
-      preferredStyle: .actionSheet
-    )
-    alert.addAction(UIAlertAction(title: "Revert", style: .destructive) { [weak self] _ in
-      self?.sendControl(action: "revert", button: self?.revertButton, pendingTitle: "Reverting", doneTitle: "Revert Sent")
-    })
-    alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-    if let popover = alert.popoverPresentationController {
-      popover.sourceView = revertButton
-      popover.sourceRect = revertButton.bounds
-    }
-    present(alert, animated: true)
-  }
+      scrollView.addSubview(customDiffView)
 
-  private func sendControl(
-    action: String,
-    button: UIButton?,
-    pendingTitle: String,
-    doneTitle: String
-  ) {
-    guard let provider = providerForControl(), !chatId.isEmpty else {
-      statusLabel.text = "Bridge control unavailable"
-      return
-    }
-    button?.isEnabled = false
-    statusLabel.text = pendingTitle
-    var payload: [String: Any] = [
-      "chatId": chatId,
-      "provider": provider,
-      "action": action,
-    ]
-    if let taskId = runtime.taskId, !taskId.isEmpty {
-      payload["taskId"] = taskId
-    }
-    let result = ChatEngine.shared.sendAgentBridgeControl(payload)
-    if (result["accepted"] as? Bool) == true {
-      statusLabel.text = doneTitle
+      NSLayoutConstraint.activate([
+        scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+        scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+        scrollView.topAnchor.constraint(equalTo: view.topAnchor),
+        scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+
+        customDiffView.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor),
+        customDiffView.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor),
+        customDiffView.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor, constant: 16),
+        customDiffView.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor, constant: -24),
+        customDiffView.widthAnchor.constraint(equalTo: scrollView.frameLayoutGuide.widthAnchor)
+      ])
+
+      textView.isHidden = true
     } else {
-      let reason = (result["reason"] as? String) ?? "not accepted"
-      statusLabel.text = "Control failed: \(reason)"
-      button?.isEnabled = true
+      textView.text = "No diff available."
     }
   }
 }
+
+class AgentRuntimeTabConsoleViewController: UIViewController {
+  private let messagesView: ChatNativeAgentMessagesView
+
+  init(messagesView: ChatNativeAgentMessagesView) {
+    self.messagesView = messagesView
+    super.init(nibName: nil, bundle: nil)
+  }
+
+  required init?(coder: NSCoder) { return nil }
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    view.backgroundColor = .clear
+
+    messagesView.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(messagesView)
+
+    NSLayoutConstraint.activate([
+      messagesView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      messagesView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      messagesView.topAnchor.constraint(equalTo: view.topAnchor),
+      messagesView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+    ])
+  }
+}
+
+fileprivate func diffLayoutViewForAppearance(
+  patch: String,
+  isDark: Bool,
+  textColor: UIColor,
+  primaryColor: UIColor,
+  textSecondary: UIColor,
+  font: UIFont
+) -> UIView {
+  let box = UIView()
+  box.translatesAutoresizingMaskIntoConstraints = false
+  box.backgroundColor = .clear
+
+  let stack = UIStackView()
+  stack.translatesAutoresizingMaskIntoConstraints = false
+  stack.axis = .vertical
+  stack.spacing = 0
+  box.addSubview(stack)
+
+  NSLayoutConstraint.activate([
+    stack.topAnchor.constraint(equalTo: box.topAnchor),
+    stack.bottomAnchor.constraint(equalTo: box.bottomAnchor),
+    stack.leadingAnchor.constraint(equalTo: box.leadingAnchor),
+    stack.trailingAnchor.constraint(equalTo: box.trailingAnchor),
+  ])
+
+  var lines = patch.components(separatedBy: "\n")
+  if lines.last?.isEmpty == true {
+    lines.removeLast()
+  }
+
+  let faint = textSecondary.withAlphaComponent(0.55)
+
+  for line in lines {
+    if line.hasPrefix("diff ") || line.hasPrefix("---") || line.hasPrefix("+++") || line.hasPrefix("@@") || line.hasPrefix("index ") || line.hasPrefix("new file ") || line.hasPrefix("deleted file ") {
+      continue
+    }
+
+    let lineRow = UIView()
+    lineRow.translatesAutoresizingMaskIntoConstraints = false
+
+    let isAddition = line.hasPrefix("+")
+    let isDeletion = line.hasPrefix("-")
+
+    if isAddition {
+      lineRow.backgroundColor = VibeAgentDiffPalette.additionBackground(isDark: isDark)
+    } else if isDeletion {
+      lineRow.backgroundColor = VibeAgentDiffPalette.deletionBackground(isDark: isDark)
+    }
+
+    let label = UILabel()
+    label.translatesAutoresizingMaskIntoConstraints = false
+    label.font = font
+    label.numberOfLines = 0
+    label.lineBreakMode = .byCharWrapping
+
+    if isAddition || isDeletion {
+      label.textColor = .white
+    } else {
+      label.textColor = textColor
+    }
+
+    let displayLine: String
+    if line.isEmpty {
+      displayLine = line
+    } else {
+      let firstChar = line.first!
+      if firstChar == "+" || firstChar == "-" || firstChar == " " {
+        displayLine = String(line.dropFirst())
+      } else {
+        displayLine = line
+      }
+    }
+
+    label.text = displayLine
+    lineRow.addSubview(label)
+
+    NSLayoutConstraint.activate([
+      label.topAnchor.constraint(equalTo: lineRow.topAnchor, constant: 4.0),
+      label.bottomAnchor.constraint(equalTo: lineRow.bottomAnchor, constant: -4.0),
+      label.leadingAnchor.constraint(equalTo: lineRow.leadingAnchor, constant: 16.0),
+      label.trailingAnchor.constraint(equalTo: lineRow.trailingAnchor, constant: -16.0),
+    ])
+
+    stack.addArrangedSubview(lineRow)
+  }
+
+  return box
+}
+
 
 final class AgentRuntimeFilesViewController: UITableViewController {
   private let runtime: ChatListRow.AgentRuntimeSummary
@@ -1322,7 +1535,14 @@ private final class AgentRuntimePatchPreviewController: UIViewController {
   override func viewDidLoad() {
     super.viewDidLoad()
     title = file.name
-    view.backgroundColor = appearance.isDark ? .black : .systemBackground
+    view.backgroundColor = .clear
+
+    let navBarAppearance = UINavigationBarAppearance()
+    navBarAppearance.configureWithTransparentBackground()
+    navigationController?.navigationBar.standardAppearance = navBarAppearance
+    navigationController?.navigationBar.scrollEdgeAppearance = navBarAppearance
+    navigationController?.navigationBar.tintColor = appearance.isDark ? .white : .black
+
     var rightItems = [
       UIBarButtonItem(
         image: UIImage(systemName: "doc.on.doc"),
@@ -1358,13 +1578,13 @@ private final class AgentRuntimePatchPreviewController: UIViewController {
     textView.backgroundColor = .clear
     textView.textColor = appearance.isDark ? .white : .label
     textView.font = .monospacedSystemFont(ofSize: 12.5, weight: .regular)
-    textView.textContainerInset = UIEdgeInsets(top: 16, left: 12, bottom: 24, right: 12)
+    textView.textContainerInset = UIEdgeInsets(top: 64, left: 12, bottom: 24, right: 12)
     view.addSubview(textView)
 
     NSLayoutConstraint.activate([
       textView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       textView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-      textView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+      textView.topAnchor.constraint(equalTo: view.topAnchor),
       textView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
     ])
 
@@ -1413,10 +1633,10 @@ private final class AgentRuntimePatchPreviewController: UIViewController {
       } else if line.hasPrefix("@@") {
         attrs[.foregroundColor] = hunkColor
       } else if line.hasPrefix("+") {
-        attrs[.foregroundColor] = addText
+        attrs[.foregroundColor] = baseColor
         attrs[.backgroundColor] = addBg
       } else if line.hasPrefix("-") {
-        attrs[.foregroundColor] = delText
+        attrs[.foregroundColor] = baseColor
         attrs[.backgroundColor] = delBg
       } else if line.hasPrefix("[Patch truncated]") {
         attrs[.foregroundColor] = muted

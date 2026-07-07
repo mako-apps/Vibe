@@ -696,6 +696,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var nativeDeletedMessageIds = Set<String>()
   private var isInternalScrollAdjustment = false
   private var isUpdatingBottomInset = false
+  // Coalescing for agent-stream-tick driven setRows (see scheduleStreamCoalescedSetRows).
+  private var streamSyncCoalesceWorkItem: DispatchWorkItem?
+  private var lastStreamSyncApplyAt: CFTimeInterval = 0
   private var activeVoicePlaybackMessageId: String?
   private var activeVoicePlaybackIsPlaying = false
   private var activeVoicePlaybackProgress: CGFloat = 0.0
@@ -1511,8 +1514,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // otherwise hide every `bridge-<sessionId>` row and collapse the loaded transcript to
     // empty a few seconds after it rendered. Only pay the (cheap) engine read on the
     // recovery path — when this view has no session id of its own.
+    // Also fall back to the session ADOPTED from this thread's own finished turns
+    // (`activeBridgeSessionId`): when a run finishes, the engine drops its live-session
+    // registration, and without this fallback the just-settled `bridge-<sid>` cards were
+    // filtered right back out — the "whole list clears when the response lands" flicker.
     let effectiveLoadedSessionId =
       bridgeLoadedSessionId ?? ChatEngine.shared.liveBridgeSessionId(chatId: chatKey)
+      ?? activeBridgeSessionId
     let loadedPrefix = effectiveLoadedSessionId.map { "bridge-\($0)" }
     let ownSentIds = Self.bridgeFreshOwnSentIdsByChat[chatKey] ?? []
     // The DM opens showing its persisted transcript, like any other chat — the
@@ -1524,6 +1532,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // snapshots the rows visible at that moment), so a deliberate fresh thread
     // still starts clean while a plain open keeps its history.
     let hiddenIds = Self.bridgeFreshHiddenIdsByChat[chatKey] ?? []
+    // An EXPLICITLY-picked History session (`bridgeLoadedSessionId` is only ever set by
+    // loadBridgeSessionIntoChat, cleared by New Chat — the resume-adoption path uses the
+    // separate `activeBridgeSessionId`, so this stays nil in the default continuous view).
+    // Because every session ingests into ONE shared DM chatId, the live `stream-…` rows,
+    // the user's own just-sent rows, and other sessions' `bridge-…` rows all coexist in
+    // the same store. Without isolation, opening an old session renders that session's
+    // transcript COMBINED with all of that current-thread activity (and the same turn can
+    // appear twice — once as its live stream row, once as its `bridge-` card). When a
+    // historical session is picked, show ONLY that session's rows.
+    let historicalSessionPicked = bridgeLoadedSessionId != nil
     return parsed.filter { row in
       let id = row.messageId ?? ""
       // Session transcripts opened from History are ingested under this DM chatId keyed
@@ -1531,6 +1549,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       // surface other sessions in the fresh default chat.
       if id.hasPrefix("bridge-") {
         if let loadedPrefix, id.hasPrefix(loadedPrefix) { return true }
+        // A picked historical session is isolated: another session's rows never bleed in,
+        // even a currently-live one — the whole point is to view that one past thread.
+        if historicalSessionPicked { return false }
         // A RUNNING/streaming session row is never "phantom history" — it's the run
         // in flight right now. Opening the DM mid-run must show it immediately (the
         // engine registers its session as live on ingest, which flips loadedPrefix
@@ -1538,6 +1559,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         if bridgeRowIsLive(row) { return true }
         return false
       }
+      // Non-`bridge-` rows are the CURRENT thread's live stream rows / native rows / the
+      // user's own sends — all keyed in the shared chatId. In a picked historical session
+      // they are not part of that past transcript, so suppress them to keep the view
+      // isolated (otherwise the historical view shows live activity combined in).
+      if historicalSessionPicked { return false }
       // Drop prior-history rows AND non-message rows (stale date separators); a new
       // thread renders only the messages exchanged since it was engaged.
       guard !id.isEmpty else { return false }
@@ -2086,9 +2112,20 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       self.collectionView.layoutIfNeeded()
       let postInsetContentH = self.collectionView.contentSize.height
       let postInsetOffset = self.collectionView.contentOffset.y
+      let setRowsDurationMs = Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000)
       chatListUITrace(
-        "ChatListView setRows finalize chatId=\(traceChatId.isEmpty ? "<empty>" : String(traceChatId.prefix(12))) parsed=\(parsed.count) animated=\(animated ? "Y" : "N") wasNearBottom=\(wasNearBottom ? "Y" : "N") queued=\(self.pendingRowsPayload != nil ? "Y" : "N") durationMs=\(Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000)) contentH=\(Int(postInsetContentH)) offsetY=\(Int(postInsetOffset))"
+        "ChatListView setRows finalize chatId=\(traceChatId.isEmpty ? "<empty>" : String(traceChatId.prefix(12))) parsed=\(parsed.count) animated=\(animated ? "Y" : "N") wasNearBottom=\(wasNearBottom ? "Y" : "N") queued=\(self.pendingRowsPayload != nil ? "Y" : "N") durationMs=\(setRowsDurationMs) contentH=\(Int(postInsetContentH)) offsetY=\(Int(postInsetOffset))"
       )
+      // Main-thread watchdog: one setRows pass owning the thread past a frame-ish budget
+      // is exactly what the user feels as "can't start scrolling while it streams". Keep
+      // this visible in plain device logs (chatListUITrace is silent by default).
+      if setRowsDurationMs > 48 {
+        NSLog(
+          "[MainThreadStall] setRows took %dms rows=%d streaming=%@ tracking=%@",
+          setRowsDurationMs, parsed.count,
+          parsed.contains(where: { $0.isStreamingText }) ? "Y" : "N",
+          self.collectionView.isTracking ? "Y" : "N")
+      }
       // Only the dedicated "Vibe AI" surface (agentChatMode) uses the ChatGPT-style
       // pin-question-to-top / reserve-room-below scroll strategy. An inline Claude/Codex
       // bridge DM (currentBridgeProvider != nil) now renders in the NORMAL chat list and
@@ -2529,6 +2566,38 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // Determine animation mode from appearance (0=none, 1=slideUpNew, 2=telegramOffset, 3=springBatch)
     let animMode = appearance.insertionAnimationMode
 
+    // A finishing agent turn swaps its live `stream-…` row for the settled
+    // `bridge-<sessionId>-…` card (and a late-arriving history snapshot swaps the other
+    // way): same message to the user, but a NEW key to the differ. Rendered as a normal
+    // delete+insert this replays the arrival animation — translate-Y slide + scroll —
+    // on a bubble the user is already reading (the "cell re-animates a second later"
+    // jump). Detect the swap and apply it as an instant, animation-free frame.
+    let isAgentRowSwapRow = { (row: ChatListRow) -> Bool in
+      guard row.isAgentMessage else { return false }
+      let id = row.messageId ?? row.key
+      return id.hasPrefix("stream-") || id.hasPrefix("bridge-")
+        || row.key.hasPrefix("stream-") || row.key.hasPrefix("bridge-")
+    }
+    let isAgentSettleSwap =
+      !deletions.isEmpty && !insertions.isEmpty
+      && deletions.allSatisfy { ip in
+        ip.item < previousRows.count && isAgentRowSwapRow(previousRows[ip.item])
+      }
+      && insertions.allSatisfy { ip in
+        ip.item < parsed.count && isAgentRowSwapRow(parsed[ip.item])
+      }
+    if isAgentSettleSwap {
+      NSLog(
+        "[SettleSwap] agent stream↔session swap — applying without animation del=%d ins=%d delKeys=[%@] insKeys=[%@]",
+        deletions.count, insertions.count,
+        deletions.prefix(2).compactMap { ip -> String? in
+          ip.item < previousRows.count ? String(previousRows[ip.item].key.prefix(20)) : nil
+        }.joined(separator: ","),
+        insertions.prefix(2).compactMap { ip -> String? in
+          ip.item < parsed.count ? String(parsed[ip.item].key.prefix(20)) : nil
+        }.joined(separator: ","))
+    }
+
     // Animate insertions and deletions for small incremental appends near the bottom.
     // During a send transition, we still animate EXISTING cells shifting
     // (so the list moves smoothly) but skip fade-in on the new cell
@@ -2539,6 +2608,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       isSmallUpdate
       && wasNearBottom
       && animMode > 0  // mode 0 = no animation
+      && !isAgentSettleSwap
 
     let insertedKeysSummary = insertions.prefix(3).compactMap { ip -> String? in
       guard ip.item < parsed.count else { return nil }
@@ -2561,6 +2631,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       isSmallUpdate
       && wasNearBottom
       && !hasPendingSend
+      && !isAgentSettleSwap
 
     // --- Telegram-style frame recording (mode 2 only) ---
     // Record SCREEN-SPACE Y (center.y - contentOffset.y) so additive
@@ -3601,7 +3672,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
           if let item = foundItem {
             let kind = (item.itemType ?? item.tool ?? "").lowercased()
-            if kind == "bash" || kind == "edit" || kind == "write" || kind == "read" {
+            if kind == "bash" || kind == "edit" || kind == "write" || kind == "read" || kind == "todo" || kind == "planning" {
               guard let presenter = self.topPresentingViewController() else { return }
               let detail = VibeAgentKitStepDetailViewController(
                 item: item,
@@ -3628,7 +3699,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           } else {
             self.agentTurnProgressExpandedRowIds.insert(messageId)
           }
-          self.refreshAgentTurnRows()
+          self.reloadAgentTurnStateRow(messageId: messageId, reason: "toggleAgentProgress")
           return
         case "toggleAgentRuntime":
           if self.agentTurnRuntimeExpandedRowIds.contains(messageId) {
@@ -3636,17 +3707,18 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           } else {
             self.agentTurnRuntimeExpandedRowIds.insert(messageId)
           }
-          self.refreshAgentTurnRows()
+          self.reloadAgentTurnStateRow(messageId: messageId, reason: "toggleAgentRuntime")
           return
         case "toggleTallBubble":
           // Shared tall-content collapse (user text, agent text, settled agent turns):
-          // flip this row's expand state and re-measure via the setRows re-apply path.
+          // flip this row's expand state and reload just that row (a full setRows pass
+          // diffs row CONTENT, which is unchanged here, and would no-op).
           if self.tallBubbleExpandedRowIds.contains(messageId) {
             self.tallBubbleExpandedRowIds.remove(messageId)
           } else {
             self.tallBubbleExpandedRowIds.insert(messageId)
           }
-          self.refreshAgentTurnRows()
+          self.reloadAgentTurnStateRow(messageId: messageId, reason: "toggleTallBubble")
           return
         case "openAgentSubagent":
           guard let nodeId = payload["nodeId"] as? String else { return }
@@ -3662,6 +3734,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         default:
           break
         }
+      } else if let actionType, actionType.hasPrefix("toggle") {
+        // A toggle that can't find its row is a silent dead tap — make it visible.
+        NSLog(
+          "[TallToggle] %@ DROPPED — row lookup failed id=%@ rows=%d",
+          actionType, ((payload["messageId"] as? String) ?? "<nil>"), self.rows.count)
       }
       self.onNativeEvent(payload)
     }
@@ -3944,8 +4021,66 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// engine round-trip — the same "re-apply sourceRowsPayload" idiom already used by
   /// `presentBridgeAgentConversation`'s onNewChat handler.
   private func refreshAgentTurnRows() {
-    guard !sourceRowsPayload.isEmpty else { return }
+    // Bridge-agent DMs render entirely from the native engine overlay — their
+    // sourceRowsPayload is often EMPTY, and setRows([]) still merges the overlay
+    // (mergedRowsPayload). Bailing on an empty payload made every expand toggle
+    // ("Show more", step expand) a silent no-op on those chats.
+    guard
+      !sourceRowsPayload.isEmpty || !nativeEngineRowsById.isEmpty || !nativeOutgoingRowsById.isEmpty
+    else { return }
     setRows(sourceRowsPayload)
+  }
+
+  /// Targeted re-render for a purely LOCAL expand/collapse flip (Show more, progress
+  /// expand, runtime expand). These flips change NO row content, so routing them through
+  /// setRows is a guaranteed no-op: the diff compares row payloads (`chatListRowContentEqual`),
+  /// finds zero reloads, and short-circuits before any reconfigure or layout invalidation —
+  /// the flipped state is never re-read. Reload the one row directly instead: drop its
+  /// cached height (keyed on the expand state), invalidate layout, reconfigure the cell.
+  private func reloadAgentTurnStateRow(messageId: String, reason: String) {
+    guard let index = rows.firstIndex(where: { ($0.messageId ?? $0.key) == messageId }) else {
+      NSLog(
+        "[TallToggle] %@ row NOT FOUND id=%@ rows=%d", reason, String(messageId.prefix(24)),
+        rows.count)
+      return
+    }
+    let row = rows[index]
+    let rowWidth = max(1.0, collectionView.bounds.width - (messageHorizontalInset * 2.0))
+    let oldHeight =
+      agentTurnHeightCache[row.key]?.height ?? messageHeightCache[row.key]?.height ?? -1.0
+    agentTurnHeightCache.removeValue(forKey: row.key)
+    messageHeightCache.removeValue(forKey: row.key)
+    let indexPath = IndexPath(item: index, section: 0)
+    UIView.performWithoutAnimation {
+      CATransaction.begin()
+      CATransaction.setDisableActions(true)
+      flowLayout.invalidateLayout()
+      collectionView.performBatchUpdates(
+        {
+          if #available(iOS 15.0, *), rows.count > 1 {
+            collectionView.reconfigureItems(at: [indexPath])
+          } else {
+            collectionView.reloadItems(at: [indexPath])
+          }
+        },
+        completion: nil)
+      collectionView.layoutIfNeeded()
+      // A collapse near the bottom shrinks content above the viewport floor — clamp the
+      // offset back into range so the list doesn't hang past its own end.
+      let maxOffset = max(
+        0.0, collectionView.contentSize.height - collectionView.bounds.height)
+      if collectionView.contentOffset.y > maxOffset {
+        performInternalScrollAdjustment {
+          collectionView.setContentOffset(CGPoint(x: 0.0, y: maxOffset), animated: false)
+        }
+      }
+      CATransaction.commit()
+    }
+    let newHeight = estimateMessageHeight(row, rowWidth: rowWidth)
+    NSLog(
+      "[TallToggle] %@ id=%@ index=%d height %.0f→%.0f expanded=%@",
+      reason, String(messageId.prefix(24)), index, oldHeight, newHeight,
+      tallBubbleExpandedRowIds.contains(messageId) ? "Y" : "N")
   }
 
   @objc private func handleChatEngineChanged(_ note: Notification) {
@@ -4060,6 +4195,60 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   /// Present a mid-run agent ask / plan-approval sheet from the bubble (chat) surface.
+  /// The session ids identifying the CONVERSATION this DM page currently shows: the
+  /// explicitly-picked History session and/or the session adopted from its visible turns.
+  /// Deliberately excludes the engine's chatId-scoped live session — that is always the
+  /// asker's own session, so consulting it would neuter ask scoping. Empty ⇒ the page has
+  /// no session identity yet (fresh thread pre-first-turn) ⇒ callers fail open.
+  func bridgePageSessionIds() -> Set<String> {
+    Set(
+      [bridgeLoadedSessionId, activeBridgeSessionId].compactMap {
+        $0?.trimmingCharacters(in: .whitespacesAndNewlines)
+      }.filter { !$0.isEmpty }
+    )
+  }
+
+  /// Decide whether an ask naming `askSessionIds` (the CLI session that raised it, plus any
+  /// id it resumed FROM) belongs to the conversation this shared-DM page is currently
+  /// showing. Every session lives under one chatId, so the session — not the chatId — is
+  /// the real scope.
+  /// - `owns`: this page represents one of those sessions. That is the explicitly-loaded
+  ///   History session, the adopted active session, the engine's live session for this
+  ///   chat, OR a `bridge-<sid>-` transcript row actually on screen. The row check is what
+  ///   `bridgePageSessionIds()` alone missed: plain-text history rows carry no runtime
+  ///   metadata (nothing to adopt), so a cold-opened thread had an EMPTY session set and
+  ///   the old disjoint test failed open — popping another conversation's approval here.
+  /// - `hasIdentity`: this page represents SOME bridge session (a picked/adopted id, or any
+  ///   `bridge-` row on screen). When true but `owns` is false the ask is a definite
+  ///   cross-conversation leak → drop. When false the surface has no session identity yet
+  ///   (fresh thread, nothing rendered) → the caller fails open (the send / live-session
+  ///   engagement guard upstream still covers a truly un-engaged surface). The engine's
+  ///   live session is a positive `owns` signal but deliberately NOT an identity signal:
+  ///   it's chatId-scoped and ambiguous across concurrent runs, so it must never force a
+  ///   drop by itself.
+  func bridgeAskSessionScope(_ askSessionIds: Set<String>) -> (owns: Bool, hasIdentity: Bool) {
+    let chatKey = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    let loaded = bridgeLoadedSessionId?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let active = activeBridgeSessionId?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let live = ChatEngine.shared.liveBridgeSessionId(chatId: chatKey)?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    func rowsShow(session sid: String) -> Bool {
+      let prefix = "bridge-\(sid)-"
+      return rows.contains { ($0.messageId ?? "").hasPrefix(prefix) }
+    }
+    let owns = askSessionIds.contains { sid in
+      if let loaded, !loaded.isEmpty, loaded == sid { return true }
+      if let active, !active.isEmpty, active == sid { return true }
+      if let live, !live.isEmpty, live == sid { return true }
+      return rowsShow(session: sid)
+    }
+    let hasIdentity =
+      (loaded?.isEmpty == false)
+      || (active?.isEmpty == false)
+      || rows.contains { ($0.messageId ?? "").hasPrefix("bridge-") }
+    return (owns, hasIdentity)
+  }
+
   /// Mirrors VibeAgentConversationView.handleAgentBridgeAsk, but runs when only the chat
   /// surface is shown so an `ask_user` / plan still prompts. No-ops if the full-page agent
   /// view is hosting this DM (it owns the sheet then), or on a chat/provider/dedup mismatch.
@@ -4142,6 +4331,31 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       return
     }
 
+    // CONVERSATION scoping (beyond chatId+provider, which every session shares): the ask
+    // carries the CLI session that raised it (+ the id it resumed from — a resume mints a
+    // new session id but the page still knows the conversation by the old one). This
+    // page's identity is the explicitly-picked History session and/or the session adopted
+    // from its visible turns. The ENGINE's live session is deliberately NOT consulted —
+    // it's chatId-scoped, so it always equals the asker's session and would neuter the
+    // guard. When both sides name sessions and none intersect, the ask belongs to a
+    // DIFFERENT conversation → drop; it surfaces on the owning page (bridge re-emits on
+    // open) and meanwhile shows as the header/History "waiting for approval" state.
+    let askSessionIds = Set(
+      [
+        (info["sessionId"] as? String) ?? "",
+        (info["resumedFromSessionId"] as? String) ?? "",
+      ].map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+    )
+    if !askSessionIds.isEmpty {
+      let scope = bridgeAskSessionScope(askSessionIds)
+      if !scope.owns, scope.hasIdentity {
+        NSLog(
+          "[ChatListView][ask] DROP — session mismatch ask=%@ (this page shows a different conversation) requestId=%@",
+          askSessionIds.joined(separator: ","), requestId)
+        return
+      }
+    }
+
     guard let payload = ChatEngine.shared.latestAgentBridgeAsk(requestId: requestId) else {
       NSLog("[ChatListView][ask] DROP — no stored payload requestId=%@", requestId)
       return
@@ -4191,13 +4405,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     sheet.onDismissWithoutResolve = {
       ChatEngine.shared.releaseAgentBridgeAskPresentation(requestId: requestId)
     }
-    if let presentation = sheet.sheetPresentationController {
+    let nav = UINavigationController(rootViewController: sheet)
+    nav.modalPresentationStyle = .pageSheet
+    nav.view.backgroundColor = .clear
+    if let presentation = nav.sheetPresentationController {
       presentation.detents = [.medium(), .large()]
       presentation.prefersGrabberVisible = true
       presentation.preferredCornerRadius = 22
     }
     NSLog("[ChatListView][ask] PRESENT sheet kind=%@ requestId=%@ chat=%@", kind, requestId, chatId)
-    presenter.present(sheet, animated: true)
+    presenter.present(nav, animated: true)
   }
 
   /// Send the ask answer back to the bridge; for an approved/rejected plan, continue the
@@ -5509,7 +5726,41 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       "[ChatListEngine] syncMutation reason:%@ msgId:%@ action:%@ isAgent:%@ engineRows:%d engineOrder:%d",
       reason, String(resolvedMessageId.prefix(12)), normalizedAction ?? "nil",
       isAgent ? "Y" : "N", nativeEngineRowsById.count, nativeEngineOrder.count)
-    setRows(sourceRowsPayload)
+    if reason == "chatMessageChanged" && isAgent {
+      // Agent stream ticks land many times per second, and every one of them was doing a
+      // FULL setRows (merge + per-row decrypt/parse + measure) synchronously on the main
+      // thread — starving touch delivery, which the user feels as the list refusing to
+      // scroll while a turn streams. Coalesce these to a bounded cadence; inserts/deletes
+      // and non-agent edits still apply immediately.
+      scheduleStreamCoalescedSetRows()
+    } else {
+      streamSyncCoalesceWorkItem?.cancel()
+      streamSyncCoalesceWorkItem = nil
+      lastStreamSyncApplyAt = CACurrentMediaTime()
+      setRows(sourceRowsPayload)
+    }
+  }
+
+  private static let streamSyncMinInterval: CFTimeInterval = 0.12
+  private func scheduleStreamCoalescedSetRows() {
+    guard streamSyncCoalesceWorkItem == nil else { return }
+    let now = CACurrentMediaTime()
+    let elapsed = now - lastStreamSyncApplyAt
+    if elapsed >= Self.streamSyncMinInterval {
+      lastStreamSyncApplyAt = now
+      setRows(sourceRowsPayload)
+      return
+    }
+    // Trailing edge: always ends with a refresh carrying the final state.
+    let work = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      self.streamSyncCoalesceWorkItem = nil
+      self.lastStreamSyncApplyAt = CACurrentMediaTime()
+      self.setRows(self.sourceRowsPayload)
+    }
+    streamSyncCoalesceWorkItem = work
+    DispatchQueue.main.asyncAfter(
+      deadline: .now() + (Self.streamSyncMinInterval - elapsed), execute: work)
   }
 
   private func queueNativeOutgoingMessage(
@@ -7093,9 +7344,19 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     ]
 
     guard let provider else {
-      // Group fan-out to both agents: no single provider, no per-provider run options,
-      // and no resume target (each parallel agent starts its own fresh session, matching
-      // the new-task-per-message default). Repo + work mode is exactly what was missing.
+      // Group fan-out to both agents: no single provider and no resume target (each
+      // parallel agent starts its own fresh session, matching the new-task-per-message
+      // default). Model choices ARE per-provider — ship them as a map the server
+      // resolves per worker at dispatch (see chat_channel.ex resolve_provider_model).
+      var models: [String: String] = [:]
+      for agentProvider in ["claude", "codex"] {
+        if let model = AgentBridgeSelectionStore.selectedModel(provider: agentProvider) {
+          models[agentProvider] = model
+        }
+      }
+      if !models.isEmpty {
+        metadata["agentBridgeModels"] = models
+      }
       return metadata
     }
 
@@ -7111,13 +7372,26 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     //     a new one that lands in a different history.
     // A brand-new chat (no History pick, no completed turn) resolves to nil → the bridge
     // starts a fresh session and the message is never filed under a stale one.
-    let resumeSessionId = bridgeLoadedSessionId ?? activeBridgeSessionId
+    //  3. The session the ENGINE is still live-tailing for this chat (a History session
+    //     opened before the view was closed/reopened, or a still-running task). The two
+    //     per-instance ids above die with the view instance, so without this fallback a
+    //     reopen + send silently spawned a brand-new session even though the open
+    //     conversation was still on screen.
+    let chatKey = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    let resumeSessionId =
+      bridgeLoadedSessionId ?? activeBridgeSessionId
+      ?? ChatEngine.shared.liveBridgeSessionId(chatId: chatKey)
     if let resumeSessionId,
       !resumeSessionId.isEmpty,
       !resumeSessionId.hasPrefix("running:")
     {
       metadata["agentBridgeResumeSessionId"] = resumeSessionId
     }
+    NSLog(
+      "[AgentRoute] outgoing resume id=%@ (loaded=%@ adopted=%@ engineLive=%@)",
+      resumeSessionId ?? "<new-session>",
+      bridgeLoadedSessionId ?? "-", activeBridgeSessionId ?? "-",
+      ChatEngine.shared.liveBridgeSessionId(chatId: chatKey) ?? "-")
     return metadata
   }
 
@@ -7391,24 +7665,23 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
   }
 
-  private lazy var bridgeSessionSkeleton: VibeAgentTranscriptSkeletonView = {
-    let skeleton = VibeAgentTranscriptSkeletonView()
-    skeleton.translatesAutoresizingMaskIntoConstraints = false
-    return skeleton
-  }()
+  private lazy var bridgeSessionSkeleton = VibeAgentTranscriptSkeletonView()
   private var bridgeSessionSpinnerTimeout: DispatchWorkItem?
 
   private func showBridgeSessionLoadingSpinner() {
-    if bridgeSessionSkeleton.superview == nil {
-      addSubview(bridgeSessionSkeleton)
-      NSLayoutConstraint.activate([
-        bridgeSessionSkeleton.topAnchor.constraint(equalTo: collectionView.topAnchor),
-        bridgeSessionSkeleton.leadingAnchor.constraint(equalTo: leadingAnchor),
-        bridgeSessionSkeleton.trailingAnchor.constraint(equalTo: trailingAnchor),
-        bridgeSessionSkeleton.bottomAnchor.constraint(equalTo: collectionView.bottomAnchor),
-      ])
+    // The skeleton lives INSIDE the list as its backgroundView — behind the cells, never
+    // over them. Rows already on screen (the user's own just-sent message, live rows)
+    // stay fully visible while the loading placeholders fill the empty space, and the
+    // moment real rows land they simply cover it.
+    if collectionView.backgroundView !== bridgeSessionSkeleton {
+      collectionView.backgroundView = bridgeSessionSkeleton
     }
-    bringSubviewToFront(bridgeSessionSkeleton)
+    // Bottom clearance = the list's real bottom padding: this surface floats the
+    // composer over the feed and reserves room via the flow layout's section inset
+    // (contentPaddingBottom), NOT contentInset — using only contentInset left the
+    // lowest placeholder hidden behind the composer.
+    bridgeSessionSkeleton.contentBottomInset = max(
+      20.0, contentPaddingBottom + collectionView.contentInset.bottom + 8.0)
     bridgeSessionSkeleton.applyAppearance(
       VibeAgentKitMap.appearance(for: self.traitCollection),
       userBubbleGradient: appearance.bubbleMeGradient
@@ -7432,6 +7705,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }) { _ in
       self.bridgeSessionSkeleton.isHidden = true
       self.bridgeSessionSkeleton.stopShimmer()
+      if self.collectionView.backgroundView === self.bridgeSessionSkeleton {
+        self.collectionView.backgroundView = nil
+      }
     }
   }
 
@@ -7885,10 +8161,45 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     )
   }
 
+  /// Multi-image send. Agent (Claude/Codex) DMs get ONE message carrying every image
+  /// as a sealed bridge blob (single dispatched task, agent-view grid renders all);
+  /// normal chats fall back to one media message per image, caption on the last.
+  private func handleNativeAttachmentSend(
+    uris: [String],
+    caption: String?,
+    transitionCapture: ChatAttachmentTransitionCapture?
+  ) {
+    let cleaned = uris
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .filter { !$0.isEmpty }
+    guard let first = cleaned.first else { return }
+    if cleaned.count == 1 {
+      handleNativeAttachmentSend(uri: first, caption: caption, transitionCapture: transitionCapture)
+      return
+    }
+    if currentBridgeProvider != nil {
+      handleNativeAttachmentSend(
+        uri: first,
+        caption: caption,
+        transitionCapture: transitionCapture,
+        extraImageURIs: Array(cleaned.dropFirst())
+      )
+      return
+    }
+    for (index, uri) in cleaned.enumerated() {
+      handleNativeAttachmentSend(
+        uri: uri,
+        caption: index == cleaned.count - 1 ? caption : nil,
+        transitionCapture: index == 0 ? transitionCapture : nil
+      )
+    }
+  }
+
   private func handleNativeAttachmentSend(
     uri: String,
     caption: String?,
-    transitionCapture: ChatAttachmentTransitionCapture?
+    transitionCapture: ChatAttachmentTransitionCapture?,
+    extraImageURIs: [String] = []
   ) {
     let messageId = UUID().uuidString.lowercased()
     let now = Date()
@@ -7962,25 +8273,35 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if let thumbnailBase64, !thumbnailBase64.isEmpty {
       metadata["thumbnailBase64"] = thumbnailBase64
     }
+    if !effectiveText.isEmpty {
+      metadata["caption"] = effectiveText
+    }
 
     // Bridge-agent DM: a plain media message never reaches the agent — the daemon only
     // sees a task when the message carries the bridge run metadata + sealed attachment
-    // blob. Seal the picked image (arte1, same format as the runtime composer) and fold
-    // in the provider/repo/run metadata so this image send dispatches a task. The server
-    // requires non-empty dispatch text, so an image-only send gets a default caption.
+    // blobs. Seal every picked image (arte1, same format as the runtime composer) into
+    // ONE message and fold in the provider/repo/run metadata so this send dispatches a
+    // single task carrying the whole set. The server requires non-empty dispatch text,
+    // so an image-only send gets a default caption.
     var bridgeImageBody = effectiveText
-    if type == "image", currentBridgeProvider != nil,
-      let blob = sealedBridgeImageBlob(forLocalURI: uri)
-    {
-      if bridgeImageBody.isEmpty { bridgeImageBody = "Please take a look at the attached image." }
-      let bridgeMeta = agentBridgeMetadataForOutgoing(
-        text: bridgeImageBody,
-        mentionedAgentUsername: currentBridgeProvider
-      )
-      if !bridgeMeta.isEmpty {
-        metadata.merge(bridgeMeta) { _, new in new }
-        metadata["agentBridgeAttachmentsEnc"] = [blob]
-        noteBridgeFreshOwnSentId(messageId)
+    if type == "image", currentBridgeProvider != nil {
+      let blobs = ([uri] + extraImageURIs).compactMap { sealedBridgeImageBlob(forLocalURI: $0) }
+      if !blobs.isEmpty {
+        if bridgeImageBody.isEmpty {
+          bridgeImageBody =
+            blobs.count == 1
+            ? "Please take a look at the attached image."
+            : "Please take a look at the \(blobs.count) attached images."
+        }
+        let bridgeMeta = agentBridgeMetadataForOutgoing(
+          text: bridgeImageBody,
+          mentionedAgentUsername: currentBridgeProvider
+        )
+        if !bridgeMeta.isEmpty {
+          metadata.merge(bridgeMeta) { _, new in new }
+          metadata["agentBridgeAttachmentsEnc"] = blobs
+          noteBridgeFreshOwnSentId(messageId)
+        }
       }
     }
     let isBridgeMediaSend =
@@ -8386,6 +8707,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // The runtime view belongs to this chat — wire its chatId so the composer's STOP
     // button (and the hold-menu Edit/revert) can reach the live bridge run.
     vc.agentBridgeChatId = engineChatId.isEmpty ? nil : engineChatId
+    // Conversation identity for ask/command scoping — read live from this host so the
+    // agent page tracks History picks / adopted sessions without extra plumbing.
+    vc.agentBridgeAskSessionScope = { [weak self] ids in
+      self?.bridgeAskSessionScope(ids) ?? (owns: false, hasIdentity: false)
+    }
     vc.isHistoryPicked = !initialMessages.isEmpty
     vc.runModel = AgentBridgeSelectionStore.selectedModel(provider: provider)
     vc.deviceLabel = AgentPairingService.lastDeviceLabel
@@ -8475,6 +8801,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // The runtime view belongs to this chat — wire its chatId so the composer's STOP
     // button (and the hold-menu Edit/revert) can reach the live bridge run.
     vc.agentBridgeChatId = engineChatId.isEmpty ? nil : engineChatId
+    // Conversation identity for ask/command scoping (see the other present site).
+    vc.agentBridgeAskSessionScope = { [weak self] ids in
+      self?.bridgeAskSessionScope(ids) ?? (owns: false, hasIdentity: false)
+    }
     // Seed the header so it shows this run's real model + the connected computer.
     vc.runModel = agentRow.agentRuntime?.model
     vc.deviceLabel = AgentPairingService.lastDeviceLabel
@@ -10251,6 +10581,28 @@ extension ChatListView: ChatInputBarDelegate {
       }
     }
     onNativeEvent(payload)
+  }
+
+  func inputBarDidSelectImages(
+    uris: [String],
+    caption: String?,
+    transitionCapture: ChatAttachmentTransitionCapture?
+  ) {
+    if nativeSendEnabled {
+      handleNativeAttachmentSend(
+        uris: uris,
+        caption: caption,
+        transitionCapture: transitionCapture
+      )
+      return
+    }
+    for (index, uri) in uris.enumerated() {
+      inputBarDidSelectImage(
+        uri: uri,
+        caption: index == uris.count - 1 ? caption : nil,
+        transitionCapture: nil
+      )
+    }
   }
 
   func inputBarDidSelectGif(

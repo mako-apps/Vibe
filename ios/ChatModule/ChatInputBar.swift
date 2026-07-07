@@ -1,6 +1,7 @@
 import AVFoundation
 import CoreLocation
 import PhotosUI
+import Speech
 import UIKit
 import UniformTypeIdentifiers
 
@@ -27,6 +28,12 @@ protocol ChatInputBarDelegate: AnyObject {
   // Rich attachment callbacks (mirrors AttachmentMenu.tsx)
   func inputBarDidSelectImage(
     uri: String,
+    caption: String?,
+    transitionCapture: ChatAttachmentTransitionCapture?
+  )
+  // Multi-select: all picked image uris (selection order) + the shared caption.
+  func inputBarDidSelectImages(
+    uris: [String],
     caption: String?,
     transitionCapture: ChatAttachmentTransitionCapture?
   )
@@ -775,6 +782,15 @@ final class ChatInputBar: UIView {
   private var audioRecorder: AVAudioRecorder?
   private var recordingFileURL: URL?
   private var recordingWaveformSamples: [CGFloat] = []
+
+  // Agent (Claude/Codex) DMs never send a voice message — the mic live-transcribes
+  // into the composer text instead (the agent consumes text, not audio).
+  private let dictationRecognizer = SFSpeechRecognizer(locale: Locale.current)
+  private let dictationAudioEngine = AVAudioEngine()
+  private var dictationRequest: SFSpeechAudioBufferRecognitionRequest?
+  private var dictationTask: SFSpeechRecognitionTask?
+  private var isDictating = false
+  private var dictationBaseText = ""
 
   private let cancelOverlayButton = UIButton(type: .custom)
 
@@ -2580,6 +2596,14 @@ final class ChatInputBar: UIView {
         transitionCapture: transitionCapture
       )
     }
+    sheet.onSelectImages = { [weak self] uris, caption, transitionCapture in
+      self?.attachmentSheet = nil
+      self?.delegate?.inputBarDidSelectImages(
+        uris: uris,
+        caption: caption,
+        transitionCapture: transitionCapture
+      )
+    }
     sheet.onSelectFile = { [weak self] uri, name in
       self?.attachmentSheet = nil
       self?.delegate?.inputBarDidSelectFile(uri: uri, name: name)
@@ -2598,6 +2622,12 @@ final class ChatInputBar: UIView {
       return
     }
     setGifPanelVisible(false, animated: true)
+    // Agent DM: the mic is a dictation toggle — transcribe speech into the composer
+    // text instead of recording a voice message the agent can't consume.
+    if agentControlMode {
+      toggleAgentDictation()
+      return
+    }
     if isRecording && isLocked {
       finishActiveRecording()
       return
@@ -3025,6 +3055,8 @@ final class ChatInputBar: UIView {
   }
 
   @objc private func handleMicGesture(_ g: UILongPressGestureRecognizer) {
+    // Agent DM: no hold-to-record — a plain tap toggles dictation (see micTapped).
+    guard !agentControlMode else { return }
     switch g.state {
     case .began:
       suppressNextMicTap = true
@@ -3096,6 +3128,107 @@ final class ChatInputBar: UIView {
   private func startVoiceRecording() {
     recordingMode = .voice
     startRecording()
+  }
+
+  // MARK: - Agent dictation (speech → composer text)
+
+  private func toggleAgentDictation() {
+    if isDictating {
+      stopAgentDictation()
+      return
+    }
+    SFSpeechRecognizer.requestAuthorization { [weak self] status in
+      DispatchQueue.main.async {
+        guard let self, status == .authorized else { return }
+        AVAudioSession.sharedInstance().requestRecordPermission { granted in
+          DispatchQueue.main.async {
+            guard granted else { return }
+            self.startAgentDictation()
+          }
+        }
+      }
+    }
+  }
+
+  private func startAgentDictation() {
+    guard let recognizer = dictationRecognizer, recognizer.isAvailable, !isDictating else { return }
+    dictationTask?.cancel()
+    dictationTask = nil
+
+    let session = AVAudioSession.sharedInstance()
+    do {
+      try session.setCategory(.record, mode: .measurement, options: .duckOthers)
+      try session.setActive(true, options: .notifyOthersOnDeactivation)
+    } catch {
+      return
+    }
+
+    let request = SFSpeechAudioBufferRecognitionRequest()
+    request.shouldReportPartialResults = true
+    dictationRequest = request
+    // Preserve anything already typed; append dictated text after it.
+    let existing = textView.text.trimmingCharacters(in: .whitespacesAndNewlines)
+    dictationBaseText = existing.isEmpty ? "" : existing + " "
+
+    let inputNode = dictationAudioEngine.inputNode
+    dictationTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
+      // The recognition handler is called on an arbitrary queue; touch UI/audio on main.
+      DispatchQueue.main.async {
+        guard let self else { return }
+        if let result {
+          self.textView.text = self.dictationBaseText + result.bestTranscription.formattedString
+          self.textViewDidChange(self.textView)
+        }
+        if error != nil || (result?.isFinal ?? false) {
+          self.stopAgentDictation()
+        }
+      }
+    }
+
+    let format = inputNode.outputFormat(forBus: 0)
+    inputNode.removeTap(onBus: 0)
+    inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+      self?.dictationRequest?.append(buffer)
+    }
+
+    dictationAudioEngine.prepare()
+    do {
+      try dictationAudioEngine.start()
+      isDictating = true
+      updateAgentDictationAppearance()
+    } catch {
+      stopAgentDictation()
+    }
+  }
+
+  private func stopAgentDictation() {
+    if dictationAudioEngine.isRunning {
+      dictationAudioEngine.stop()
+      dictationAudioEngine.inputNode.removeTap(onBus: 0)
+    }
+    dictationRequest?.endAudio()
+    dictationRequest = nil
+    dictationTask?.cancel()
+    dictationTask = nil
+    try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    if isDictating {
+      isDictating = false
+      updateAgentDictationAppearance()
+    }
+  }
+
+  private func updateAgentDictationAppearance() {
+    UIView.transition(with: micButton, duration: 0.2, options: .transitionCrossDissolve) {
+      let cfg = UIImage.SymbolConfiguration(pointSize: 13, weight: .medium)
+      self.applyControlGlyph(
+        button: self.micButton,
+        symbolName: self.isDictating ? "mic.fill" : "mic",
+        symbolConfig: cfg,
+        tintColor: self.isDictating
+          ? .systemRed
+          : self.appearance.textColorThem.withAlphaComponent(0.9)
+      )
+    }
   }
 
   private func startVideoRecording() {

@@ -1169,6 +1169,8 @@ private struct ChatProfileSwiftUIRootView: View {
   let groupMembers: [[String: Any]]
   let canManageGroupMembers: Bool
   let groupBridgeProvider: String?
+  /// All bridge agents in the group ("claude"/"codex") — one model row each.
+  var groupBridgeProviders: [String] = []
   let selectedRepositoryName: String?
   // Bridge (Claude/Codex paired-computer) state. `bridgeProvider` is empty for a
   // normal contact/group profile.
@@ -1196,9 +1198,27 @@ private struct ChatProfileSwiftUIRootView: View {
   /// Per-agent default view (chat vs agent runtime) for Claude/Codex. Seeded from the
   /// store when the section appears; the picker writes back through the store.
   @State private var bridgeDefaultView: AgentBridgeDefaultView = .chat
+  /// Local echo of per-agent model picks so the row subtitle refreshes immediately
+  /// ("" = explicitly cleared to Default). Source of truth stays the selection store.
+  @State private var groupModelSelections: [String: String] = [:]
 
   private var rowFill: Color {
     Color(uiColor: posterGradientColors.0).opacity(isDark ? 0.055 : 0.11)
+  }
+
+  /// Effective model pick for an agent: the in-view echo wins ("" = cleared), else the
+  /// stored selection.
+  private func groupSelectedModel(_ provider: String) -> String? {
+    if let local = groupModelSelections[provider] {
+      return local.isEmpty ? nil : local
+    }
+    return AgentBridgeSelectionStore.selectedModel(provider: provider)
+  }
+
+  private func groupModelSubtitle(_ provider: String) -> String {
+    guard let selected = groupSelectedModel(provider) else { return "Default model" }
+    return AgentBridgeSelectionStore.modelChoices(provider: provider)
+      .first(where: { $0.value == selected })?.title ?? selected
   }
 
   private var separatorColor: Color {
@@ -1262,7 +1282,7 @@ private struct ChatProfileSwiftUIRootView: View {
           ScrollView(.vertical, showsIndicators: true) {
             LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
               offsetReader(
-                safeTop: safeAreaTop,
+                safeTop: max(geometry.safeAreaInsets.top, safeAreaTop),
                 heroHeight: heroContentHeight(for: geometry)
               )
 
@@ -1350,10 +1370,14 @@ private struct ChatProfileSwiftUIRootView: View {
         // siblings in a NavigationStack builder don't reliably z-stack — the
         // header was getting mis-laid-out / swallowed, which is why it "didn't
         // show at all." An overlay is guaranteed to draw over its target and is
-        // anchored to the screen top; `.padding(.top, safeAreaTop)` then drops it
-        // below the notch (the host strips the safe area, so there's no automatic
-        // inset to rely on).
-        .overlay(alignment: .top) { overlayHeader }
+        // anchored to the screen top. The top inset comes LIVE from the
+        // GeometryReader (`geometry.safeAreaInsets.top`) so SwiftUI lays the
+        // header out in the same pass the push settles — no snapshot, no
+        // re-render, no visible shift. `safeAreaTop` is only a fallback for the
+        // (rare) case the host ever reports a 0 inset.
+        .overlay(alignment: .top) {
+          overlayHeader(safeTop: max(geometry.safeAreaInsets.top, safeAreaTop))
+        }
       }
       .navigationDestination(for: ChatProfileSwiftUIDestination.self) { destination in
         if case .bridgeSession = destination {
@@ -1491,7 +1515,7 @@ private struct ChatProfileSwiftUIRootView: View {
   // The floating nav header (back / sticky title / menu). Only shown at the
   // profile root — hidden once a destination is pushed onto the NavigationStack.
   @ViewBuilder
-  private var overlayHeader: some View {
+  private func overlayHeader(safeTop: CGFloat) -> some View {
     if navCoordinator.path.isEmpty {
       HStack {
         Button {
@@ -1535,11 +1559,10 @@ private struct ChatProfileSwiftUIRootView: View {
         }
       }
       .padding(.horizontal, 4)
-      // The top overlay already lands below the status bar / Dynamic Island (it
-      // honors the real safe area, unlike the scroll view which explicitly
-      // ignores it), so only a small breathing gap is needed here — adding the
-      // full safeAreaTop again pushed the row a whole inset too far down.
-      .padding(.top, 4)
+      // The overlay anchors at the very top of the screen (the ZStack ignores
+      // the top safe area), so the header must clear the status bar / Dynamic
+      // Island itself — sit it at the real (live) inset, standard nav-bar spot.
+      .padding(.top, safeTop)
       .frame(maxWidth: .infinity)
       // Dynamically adapt color: white over the dark hero image, primary over the sticky material
       .foregroundStyle(stickyTitleVisible ? AnyShapeStyle(.primary) : AnyShapeStyle(.white))
@@ -1549,11 +1572,12 @@ private struct ChatProfileSwiftUIRootView: View {
 
   private func heroContentHeight(for geometry: GeometryProxy) -> CGFloat {
     guard hasProfileImage else {
-      // Use the real inset (safeAreaTop), not geometry.safeAreaInsets.top — the
-      // latter is 0 here (host strips safe area) so the hero would sit too high
-      // and diverge from the UIKit floating avatar by exactly the status-bar
-      // height, which is the visible "inner element shift" on chat→profile.
-      return NativeProfileAvatarHeroMetrics.expandedTop(for: safeAreaTop)
+      // Read the inset LIVE from geometry (host no longer strips the safe area),
+      // falling back to the snapshot only if it ever reports 0. Using the same
+      // live value the header uses keeps the hero and the floating avatar aligned
+      // in the same layout pass — this is what removes the chat→profile shift.
+      let safeTop = max(geometry.safeAreaInsets.top, safeAreaTop)
+      return NativeProfileAvatarHeroMetrics.expandedTop(for: safeTop)
         + NativeProfileAvatarHeroMetrics.expandedSize
         + 18
     }
@@ -1659,6 +1683,48 @@ private struct ChatProfileSwiftUIRootView: View {
             )
           }
           .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+
+          // One model row per agent in the group. The pick is stored per provider
+          // (AgentBridgeSelectionStore) and rides group sends as agentBridgeModels,
+          // resolved to each worker at dispatch.
+          ForEach(groupBridgeProviders, id: \.self) { agentProvider in
+            Menu {
+              ForEach(
+                AgentBridgeSelectionStore.modelChoices(provider: agentProvider), id: \.value
+              ) { choice in
+                Button {
+                  AgentBridgeSelectionStore.setModel(provider: agentProvider, model: choice.value)
+                  groupModelSelections[agentProvider] = choice.value
+                } label: {
+                  if groupSelectedModel(agentProvider) == choice.value {
+                    Label(choice.title, systemImage: "checkmark")
+                  } else {
+                    Text(choice.title)
+                  }
+                }
+              }
+              Button {
+                AgentBridgeSelectionStore.setModel(provider: agentProvider, model: nil)
+                groupModelSelections[agentProvider] = ""
+              } label: {
+                if groupSelectedModel(agentProvider) == nil {
+                  Label("Default", systemImage: "checkmark")
+                } else {
+                  Text("Default")
+                }
+              }
+            } label: {
+              ChatProfileSwiftUIRow(
+                title: "\(agentProvider.lowercased() == "claude" ? "Claude" : "Codex") model",
+                subtitle: groupModelSubtitle(agentProvider),
+                trailingSystemImage: nil,
+                showsChevron: true,
+                separatorColor: separatorColor,
+                isLast: false
+              )
+            }
+            .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+          }
 
           Button {
             onAction("agentConfig")
@@ -4328,6 +4394,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       groupMembers: groupMembers,
       canManageGroupMembers: canManageGroupMembers,
       groupBridgeProvider: groupBridgeProviderFromMembers(),
+      groupBridgeProviders: groupBridgeProvidersFromMembers(),
       selectedRepositoryName: AgentBridgeSelectionStore.selectedRepository()?.name,
       bridgeProvider: bridgeProvider,
       bridgeChatId: engineChatId,
@@ -4382,9 +4449,11 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       swiftUIContainerView.bringSubviewToFront(host.view)
     } else {
       let host = UIHostingController(rootView: erasedRoot)
-      if #available(iOS 16.4, *) {
-        host.safeAreaRegions = []
-      }
+      // NOTE: we deliberately do NOT strip the safe area here anymore. Keeping
+      // the host's real safe area lets the SwiftUI root read `geometry
+      // .safeAreaInsets.top` live, so the header and hero settle in one layout
+      // pass on push — eliminating the snapshot-driven re-render "shift". The
+      // backdrop/scroll still reach the screen edges via `.ignoresSafeArea`.
       host.view.backgroundColor = .clear
       host.view.isOpaque = false
       host.view.frame = swiftUIContainerView.bounds
@@ -5265,6 +5334,49 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     }
     let role = (mine?["role"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
     return role == "owner"
+  }
+
+  /// Every bridge agent present in this group ("claude"/"codex"), for the per-agent
+  /// settings rows. `groupBridgeProviderFromMembers()` stays the single-value variant
+  /// used by rows that only need to know "this group has agents at all".
+  private func groupBridgeProvidersFromMembers() -> [String] {
+    var providers: [String] = []
+    for member in groupMembers {
+      let values = [
+        member["userId"],
+        member["user_id"],
+        member["id"],
+        member["name"],
+        member["displayName"],
+        member["username"],
+        member["handle"],
+        member["label"]
+      ]
+      .compactMap { value -> String? in
+        if let string = value as? String {
+          return string.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }
+        if let number = value as? NSNumber {
+          return number.stringValue.lowercased()
+        }
+        return nil
+      }
+
+      if values.contains("11111111-1111-1111-1111-111111111111")
+        || values.contains("00000000-0000-0000-0000-0000000000c1")
+        || values.contains("claude")
+        || values.contains("@claude")
+      {
+        if !providers.contains("claude") { providers.append("claude") }
+      } else if values.contains("22222222-2222-2222-2222-222222222222")
+        || values.contains("00000000-0000-0000-0000-0000000000c2")
+        || values.contains("codex")
+        || values.contains("@codex")
+      {
+        if !providers.contains("codex") { providers.append("codex") }
+      }
+    }
+    return providers
   }
 
   private func groupBridgeProviderFromMembers() -> String? {

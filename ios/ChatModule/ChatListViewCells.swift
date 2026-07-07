@@ -1733,7 +1733,11 @@ func chatAgentNodeCompactLabel(_ node: ChatListRow.AgentProgressNode) -> String 
   case "search": verb = "Search"
   case "web": verb = "Fetch"
   case "task": verb = "Step"
-  case "todo": return "Planning"
+  case "todo":
+    let a = node.action?.lowercased() ?? ""
+    if a == "create" || a == "created" { return "Created Task" }
+    if a == "update" || a == "updated" { return "Updated Task" }
+    return "Create Task or Update Task"
   default: return node.label
   }
   var text = verb
@@ -1802,7 +1806,12 @@ private func bubbleDisplayText(for row: ChatListRow) -> String {
 
 private func bubbleParsedBlocks(for row: ChatListRow) -> [AgentParsedBlock] {
   let payload = bubbleBaseText(for: row)
-  var blocks = ChatNativeAgentTextRenderer.parseBlocks(payload.text)
+  var blocks = ChatNativeAgentTextRenderer.parseBlocks(payload.text).filter { block in
+    // Same no-diff rule as appendRuntimeIfNeeded below, applied to runtime cards the
+    // text parser itself produced.
+    if case .agentRuntime(let runtime) = block { return agentRuntimeHasDiff(runtime) }
+    return true
+  }
   func appendRuntimeIfNeeded() {
     // Never surface the finished runtime/diff card while the turn is still
     // streaming — the card is the END-of-turn summary; showing it mid-stream is
@@ -1815,6 +1824,10 @@ private func bubbleParsedBlocks(for row: ChatListRow) -> [AgentParsedBlock] {
       }
       return
     }
+    // A turn that changed nothing has nothing to review — an empty "0 files changed
+    // +0 -0 · Review" card is pure noise (typical for greeting/Q&A turns, especially
+    // in group fan-out where every agent answers).
+    guard agentRuntimeHasDiff(runtime) else { return }
     if blocks.contains(where: { block in
       if case .agentRuntime = block { return true }
       return false
@@ -6913,10 +6926,15 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     // bubble branches skips them).
     tallToggleButton.isHidden = true
     tallToggleButton.frame = .zero
-    tallToggleRowMessageId = row.messageId
+    // Match the host's row lookup key (messageId ?? key) — a nil messageId here made
+    // the toggle tap a silent no-op on rows addressed only by their key.
+    tallToggleRowMessageId = row.messageId ?? row.key
     messageLabel.numberOfLines = 0
     richTextView.clipsToBounds = false
     agentTurnContentView.clipsToBounds = false
+    applyTallFadeMask(to: messageLabel, enabled: false)
+    applyTallFadeMask(to: richTextView, enabled: false)
+    applyTallFadeMask(to: agentTurnContentView, enabled: false)
 
     let bounds = contentView.bounds
     if row.kind == .day || isConfiguredAgentDivider {
@@ -7191,11 +7209,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           )
         )
         if metrics.tallToggleVisible {
-          // Collapsed: metrics.textHeight is the cap — clip the overflowing body.
-          // Expanded: full height, just show the "Show less" bar under the content.
+          // Collapsed: metrics.textHeight is the cap — clip the overflowing body and
+          // fade its bottom out softly (the cut must read as "there's more below", not
+          // a hard chop). Expanded: full height, just the "Show less" bar underneath.
           agentTurnContentView.clipsToBounds = metrics.tallCollapsed
-          tallToggleButton.setTitle(metrics.tallCollapsed ? "Show more" : "Show less", for: .normal)
-          tallToggleButton.setTitleColor(tintColor, for: .normal)
+          applyTallFadeMask(to: agentTurnContentView, enabled: metrics.tallCollapsed)
+          styleTallToggle(collapsed: metrics.tallCollapsed, color: bubbleTextColor)
           tallToggleButton.isHidden = false
           tallToggleButton.frame = pixelAlignedRect(
             CGRect(
@@ -7317,8 +7336,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
         var textBottom = metrics.usesRichTextLayout ? richTextView.frame.maxY : messageLabel.frame.maxY
         if metrics.tallToggleVisible {
-          tallToggleButton.setTitle(metrics.tallCollapsed ? "Show more" : "Show less", for: .normal)
-          tallToggleButton.setTitleColor(row.isMe ? appearance.textColorMe : tintColor, for: .normal)
+          applyTallFadeMask(
+            to: metrics.usesRichTextLayout ? richTextView : messageLabel,
+            enabled: metrics.tallCollapsed)
+          styleTallToggle(collapsed: metrics.tallCollapsed, color: bubbleTextColor)
           tallToggleButton.isHidden = false
           tallToggleButton.frame = pixelAlignedRect(
             CGRect(
@@ -8859,8 +8880,70 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   }
 
   @objc private func handleTallToggleTap() {
-    guard let messageId = tallToggleRowMessageId, !messageId.isEmpty else { return }
+    guard let messageId = tallToggleRowMessageId, !messageId.isEmpty else {
+      NSLog("[TallToggle] tap DROPPED in cell — no row id (row=%@)", row?.key ?? "<nil>")
+      return
+    }
+    NSLog(
+      "[TallToggle] tap id=%@ handler=%@", String(messageId.prefix(24)),
+      onAgentAction == nil ? "MISSING" : "ok")
     onAgentAction?(["type": "toggleTallBubble", "messageId": messageId])
+  }
+
+  /// "Show more ⌄" / "Show less ⌃" in the bubble's own text color (the old accent-blue
+  /// link text was invisible against some bubble fills and looked like an inert label).
+  private func styleTallToggle(collapsed: Bool, color: UIColor) {
+    tallToggleButton.setTitle(collapsed ? "Show more" : "Show less", for: .normal)
+    tallToggleButton.setTitleColor(color, for: .normal)
+    tallToggleButton.tintColor = color
+    let symbolConfig = UIImage.SymbolConfiguration(pointSize: 10.0, weight: .semibold)
+    tallToggleButton.setImage(
+      UIImage(systemName: collapsed ? "chevron.down" : "chevron.up", withConfiguration: symbolConfig),
+      for: .normal)
+    // Chevron trails the label.
+    tallToggleButton.semanticContentAttribute = .forceRightToLeft
+    tallToggleButton.imageEdgeInsets = UIEdgeInsets(top: 0.0, left: 5.0, bottom: 0.0, right: -5.0)
+  }
+
+  /// Soft bottom fade on a tall-collapsed bubble's clipped content, so the cap reads as
+  /// "content continues below" instead of a hard chop against the Show-more bar.
+  private func applyTallFadeMask(to view: UIView, enabled: Bool) {
+    guard enabled, view.bounds.height > 1.0 else {
+      if view.layer.mask != nil { view.layer.mask = nil }
+      return
+    }
+    let mask = (view.layer.mask as? CAGradientLayer) ?? CAGradientLayer()
+    let height = view.bounds.height
+    // Eased (not linear) fade: content stays fully readable until the last ~80pt, then
+    // melts out gently, hitting fully transparent only at the very bottom lip — right
+    // where the Show more bar sits below. A linear ramp reads as a smoked-glass band;
+    // this reads as paper trailing off.
+    let fadeHeight: CGFloat = min(80.0, height * 0.35)
+    let start = Double(max(0.0, 1.0 - fadeHeight / height))
+    let span = 1.0 - start
+    mask.colors = [
+      UIColor.black.cgColor,
+      UIColor.black.cgColor,
+      UIColor.black.withAlphaComponent(0.88).cgColor,
+      UIColor.black.withAlphaComponent(0.62).cgColor,
+      UIColor.black.withAlphaComponent(0.30).cgColor,
+      UIColor.black.withAlphaComponent(0.08).cgColor,
+      UIColor.clear.cgColor,
+    ]
+    mask.locations = [
+      0.0,
+      NSNumber(value: start),
+      NSNumber(value: start + span * 0.30),
+      NSNumber(value: start + span * 0.55),
+      NSNumber(value: start + span * 0.75),
+      NSNumber(value: start + span * 0.90),
+      1.0,
+    ]
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    mask.frame = view.bounds
+    CATransaction.commit()
+    view.layer.mask = mask
   }
 
   @objc private func handleInlineVideoMuteTap() {

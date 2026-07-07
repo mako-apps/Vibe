@@ -479,10 +479,15 @@ private final class ChatNativeAgentPlainTextView: UIView {
       let lineHeight: CGFloat = 26.0
       let textColor = appearance.textColorThem
       let isStreaming = row.isStreamingText
-      var blocks = ChatNativeAgentTextRenderer.parseBlocks(text)
+      var blocks = ChatNativeAgentTextRenderer.parseBlocks(text).filter { block in
+        // No diff → no "0 files changed · Review" card (see agentRuntimeHasDiff).
+        if case .agentRuntime(let runtime) = block { return agentRuntimeHasDiff(runtime) }
+        return true
+      }
       // The runtime/diff card is the end-of-turn summary — never render it while
       // the turn is still streaming (it reappears once the row is no longer live).
       if !isStreaming, let runtime = row.agentRuntime,
+        agentRuntimeHasDiff(runtime),
         !blocks.contains(where: {
           if case .agentRuntime = $0 { return true }
           return false
@@ -1000,7 +1005,11 @@ private final class ChatNativeAgentProgressTreeView: UIView {
     case "search": verb = "Search"
     case "web": verb = "Fetch"
     case "task": verb = "Step"
-    case "todo": return "Planning"
+    case "todo":
+      let a = node.action?.lowercased() ?? ""
+      if a == "create" || a == "created" { return "Created Task" }
+      if a == "update" || a == "updated" { return "Updated Task" }
+      return "Create Task or Update Task"
     default: return node.label
     }
     var text = verb

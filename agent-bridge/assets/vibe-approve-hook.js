@@ -104,14 +104,17 @@ const SAFE_BASH = [
   // caught by MUTATING / DANGEROUS below).
   /^curl\b/, /^wget\b/, /^http(ie)?\b/,
 ];
-// A segment matching any of these is treated as NOT safe (asks a human) even if a
-// SAFE_BASH prefix also matched — these mutate the filesystem / state.
-const MUTATING = [
-  /\bsed\b[^|;&]*\s-i\b/, /\bperl\b[^|;&]*\s-i\b/, /\btee\b/, /\btruncate\b/,
-  /\b(mv|cp|rm|mkdir|rmdir|touch|ln|chmod|chown|chgrp|unlink)\b/,
-  /^install\b/, // the standalone install(1) utility (copies+chmods) — anchored so it
-                // doesn't false-positive on "devicectl device install", "brew install", etc.
-                // used as a SUBCOMMAND of something else (those have their own rules).
+// Filesystem-mutating COMMANDS — matched only when they're the command WORD being run
+// (start of the segment, after leading VAR= assignments are stripped), NOT anywhere in
+// the line. Anchoring matters: a bare /\bln\b/ would wrongly fire on `grep -ln`, /\bcp\b/
+// on a `cp` search term, /\btee\b/ on `grep tee`, etc. As the child of a runner
+// (xargs/command/…) they're still caught, because the recursive check re-anchors on the
+// child command.
+const MUTATING_CMD = /^(mv|cp|rm|mkdir|rmdir|touch|ln|chmod|chown|chgrp|unlink|install|tee|truncate|dd|shred)\b/;
+// Mutations recognised by a fuller pattern (subcommand, flag, or redirect) — specific
+// enough to test anywhere in the segment without false-positiving on an argument.
+const MUTATING_ANY = [
+  /\bsed\b[^|;&]*\s-i\b/, /\bperl\b[^|;&]*\s-i\b/,
   /\bgit\s+(add|commit|checkout|reset|rebase|merge|pull|fetch|clone|apply|am|mv|rm|restore|switch|cherry-pick|revert|push|clean|init|tag\s+(?!-l|--list))\b/,
   /\b(npm|yarn|pnpm|bun)\s+(install|i|ci|add|remove|uninstall|update|upgrade|link|publish)\b/,
   /\bpip3?\s+(install|uninstall)\b/, /\b(gem|cargo|go)\s+(install|publish)\b/,
@@ -119,6 +122,7 @@ const MUTATING = [
   />{1,2}(?!\s*\/dev\/null)(?!&)/, // output redirect that writes to a file (not fd-dup like 2>&1)
   /\bcurl\b[^|;&\n]*(-o\b|--output\b|-O\b|--remote-name\b|-X\s*(POST|PUT|PATCH|DELETE)|--upload-file)/i,
   /\bwget\b[^|;&\n]*(-O\b|--output-document\b)/i,
+  /\bfind\b[^|;&\n]*\s-(delete|exec|execdir|fprint|fprintf|fls|ok|okdir)\b/, // find that runs/deletes
 ];
 
 // Mask quoted regions (keep length) so a pipe/`&&` INSIDE quotes — e.g. grep -E 'a|b'
@@ -232,6 +236,43 @@ const PURE_ASSIGNMENT = /^(?:export\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s*)+$/;
 function stripLeadingAssignments(s) {
   return s.replace(/^(?:export\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, "");
 }
+// Command PREFIXES that just run ANOTHER command — the real safety is the child, not the
+// wrapper word. Return the child command string ("" if the wrapper runs nothing on its
+// own, e.g. bare `env`/`xargs`), or null if `s` isn't one of these wrappers.
+//   xargs [opts] CHILD...          (`find | xargs grep` safe; `find | xargs rm` not)
+//   command|builtin|nohup|time CHILD
+//   nice [-n N] CHILD  ·  stdbuf -oL CHILD  ·  env [-i][-u N][VAR=v]... CHILD
+const XARGS_OPT_WITH_ARG = /^(-n|-P|-L|-s|-I|-J|-E|-e|-d|-a|--max-args|--max-procs|--max-lines|--replace|--delimiter|--arg-file|--eof)$/;
+function runnerChild(s) {
+  const sp = s.indexOf(" ");
+  const head = sp < 0 ? s : s.slice(0, sp);
+  const rest = sp < 0 ? "" : s.slice(sp + 1).trim();
+  switch (head) {
+    case "xargs": {
+      const toks = s.split(/\s+/);
+      let i = 1;
+      while (i < toks.length) {
+        const t = toks[i];
+        if (t === "--") { i++; break; }
+        if (t.startsWith("--") && t.includes("=")) { i++; continue; } // --replace=R
+        if (XARGS_OPT_WITH_ARG.test(t)) { i += 2; continue; }         // option consumes next token
+        if (t.startsWith("-")) { i++; continue; }                     // bundled no-arg flag(s)
+        break;                                                        // first non-flag token = child
+      }
+      return toks.slice(i).join(" ");
+    }
+    case "command": case "builtin": case "nohup": case "time":
+      return rest.replace(/^-[pvV]\s+/, ""); // e.g. `command -p grep ...`
+    case "nice":
+      return rest.replace(/^(-n\s+\S+\s+|-\d+\s+)/, "");
+    case "stdbuf":
+      return rest.replace(/^(-\S+\s+)*/, "");
+    case "env":
+      return rest.replace(/^(-i\s+|-[uS]\s+\S+\s+|[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*/, "");
+    default:
+      return null;
+  }
+}
 function segmentIsSafe(seg, cfg, depth) {
   if (!seg) return true;
   if ((depth || 0) > 8) return false; // guard against pathological nesting
@@ -242,9 +283,18 @@ function segmentIsSafe(seg, cfg, depth) {
   }
   const outer = subs.length ? stripSubstitutions(seg) : seg;
   const maskedOuter = maskQuotes(outer);
-  if (MUTATING.some((re) => re.test(maskedOuter))) return false;
+  if (MUTATING_ANY.some((re) => re.test(maskedOuter))) return false;
   if (PURE_ASSIGNMENT.test(outer.trim())) return true; // e.g. f=$(...) with nothing else to run
-  if (SAFE_BASH.some((re) => re.test(stripLeadingAssignments(outer)))) return true;
+  const stripped = stripLeadingAssignments(outer).trim();
+  // Prefix-runner (xargs/command/env/…): safety is determined by the CHILD command.
+  const child = runnerChild(stripped);
+  if (child !== null) {
+    if (child === "") return true;                       // bare wrapper (env/xargs alone) is read-only
+    return bashIsAutoSafe(child, cfg, (depth || 0) + 1); // safe iff the child command is safe
+  }
+  // A filesystem-mutating command WORD (rm/cp/mv/ln/tee/…) at the command position.
+  if (MUTATING_CMD.test(stripped)) return false;
+  if (SAFE_BASH.some((re) => re.test(stripped))) return true;
   for (const p of cfg.auto_allow) { if (p && seg.includes(p)) return true; }
   return false;
 }

@@ -3887,6 +3887,20 @@ function liveCodexActions(output) {
         : [item.path || item.file_path].filter(Boolean);
       detailByUid.set(uid, { kind: "edit", name: paths.map(safeBase).join(", "), path: paths[0] || "" });
       order.push(uid);
+      return;
+    }
+
+    if (type === "todo_list") {
+      const rawTodos = item.items || item.todos || [];
+      detailByUid.set(uid, {
+        kind: "todo",
+        todos: Array.isArray(rawTodos) ? rawTodos.map((t) => ({
+          content: String((t && t.content) || ""),
+          status: String((t && t.status) || ""),
+          activeForm: String((t && t.activeForm) || "")
+        })) : []
+      });
+      order.push(uid);
     }
   });
   return actionListFromMaps(order, detailByUid, resultByUid);
@@ -4978,6 +4992,18 @@ function handleHistoryRequest(channel, payload) {
       // re-fires) so opening a live session lands directly in the working state with
       // no flash of the sealed "Worked · N steps" card.
       if (!before) markDetailLiveTurn(result, provider, effectiveSessionId, chatId);
+      // Badge the session(s) blocked on a still-pending ask/command so the History
+      // list shows a "waiting for approval" marker (the phone renders it from
+      // `pendingAskKind`). Only genuinely-pending asks count (live blocked promise).
+      if (result && result.mode === "list" && Array.isArray(result.sessions)) {
+        for (const rec of pendingAsksByChat.values()) {
+          if (!pendingAsks.has(rec.requestId)) continue;
+          if (!rec.sessionId) continue;
+          for (const s of result.sessions) {
+            if (s && s.id === rec.sessionId) s.pendingAskKind = rec.kind || "ask";
+          }
+        }
+      }
       channel.push("history_result", { ok: true, ...echo, ...result });
       // The phone opened a specific session → keep it live by tailing the
       // transcript and re-pushing as it grows.
@@ -5186,8 +5212,15 @@ function newAskId(chatId) {
   return `ask-${chatId}-${Date.now()}-${askSeq}`;
 }
 
-function pushAskRequest(channel, { provider, chatId, taskId, replyToId, requestId, kind, body }) {
+function pushAskRequest(channel, { provider, chatId, taskId, replyToId, requestId, kind, body, sessionId, resumedFromSessionId, expiresAtMs }) {
+  // sessionId scopes the ask to the CONVERSATION that raised it: one shared DM chatId
+  // hosts every session, so chatId+provider alone can't tell the phone WHICH page owns
+  // the approval. expiresAtMs lets the phone auto-dismiss a sheet whose ask has timed
+  // out bridge-side (the timeout auto-rejects; a stale sheet would answer a dead ask).
   const base = { provider, chatId, taskId, replyToId, requestId, kind };
+  if (sessionId) base.sessionId = sessionId;
+  if (resumedFromSessionId) base.resumedFromSessionId = resumedFromSessionId;
+  if (expiresAtMs) base.expiresAtMs = expiresAtMs;
   const askEnc = encryptRuntimeBlob({ kind, request: body });
   // Seal when a key exists; otherwise send plaintext (the phone can't decrypt
   // without the key anyway, and a keyless pairing has no confidentiality to lose).
@@ -5222,11 +5255,37 @@ function pushAskRequest(channel, { provider, chatId, taskId, replyToId, requestI
 // close the stale sheet.
 function requestAsk(channel, { provider, chatId, taskId, replyToId, kind, body }, register) {
   const requestId = newAskId(chatId);
+  // Resolve WHICH conversation (CLI session) raised this ask — rides the wire so the
+  // phone can scope the sheet to the owning conversation page (one shared DM chatId
+  // hosts every session, so chatId alone can't name the conversation). Prefer the EXACT
+  // task by its taskId: a shared chatId can host two concurrent runs, and
+  // runningTaskForChat picks the FIRST match by chatId — which may be the wrong run.
+  const exactKey =
+    provider && chatId && taskId ? taskKey(provider, chatId, taskId) : null;
+  const running =
+    (exactKey && runningTasks.get(exactKey)) ||
+    (chatId ? runningTaskForChat(chatId) : null);
+  // Only borrow the chat's last-known session when there is NO running task. A fresh run
+  // whose session id isn't captured yet must NOT inherit the previous conversation's id —
+  // that mis-scopes its approval onto the old thread's page (the "approval landed in the
+  // wrong chat" bug). Sending null there is correct: the phone fails open to the surface
+  // that actually started the run.
+  const sessionId =
+    (running && running.sessionId) ||
+    (running ? null : chatId ? sessionByChat.get(chatId) : null) ||
+    null;
+  // A resumed run mints a NEW session id, but the phone's page still identifies the
+  // conversation by the id it resumed FROM — send both so the page can claim its ask.
+  const resumedFromSessionId = running ? resumeIdFor(running.task || running) : null;
+  const expiresAtMs = Date.now() + ASK_TIMEOUT_MS;
   const promise = new Promise((resolve) => {
     const timer = setTimeout(() => {
       if (pendingAsks.delete(requestId)) {
         clearPendingAskForChat(chatId, requestId);
         console.log(`[vibe-bridge] ask ${requestId} timed out → auto-reject`);
+        // The ask is dead — tell the phone so a still-up sheet / waiting badge is
+        // dismissed rather than lingering (answering it later would be a no-op).
+        pushAskCancel(activeChannel || channel, chatId, requestId, "timeout");
         resolve({ decision: "reject", answer: null, timedOut: true });
       }
     }, ASK_TIMEOUT_MS);
@@ -5234,10 +5293,10 @@ function requestAsk(channel, { provider, chatId, taskId, replyToId, kind, body }
     pendingAsks.set(requestId, { resolve, timer, chatId });
     // Remember it per-chat so opening this chat from history re-surfaces the ask.
     if (chatId) {
-      pendingAsksByChat.set(chatId, { requestId, provider, taskId, replyToId, kind, body });
+      pendingAsksByChat.set(chatId, { requestId, provider, taskId, replyToId, kind, body, sessionId, resumedFromSessionId, expiresAtMs });
     }
-    pushAskRequest(channel, { provider, chatId, taskId, replyToId, requestId, kind, body });
-    console.log(`[vibe-bridge] ask_request ${requestId} kind=${kind} chat=${chatId}`);
+    pushAskRequest(channel, { provider, chatId, taskId, replyToId, requestId, kind, body, sessionId, resumedFromSessionId, expiresAtMs });
+    console.log(`[vibe-bridge] ask_request ${requestId} kind=${kind} chat=${chatId} session=${sessionId || "-"}`);
   });
   if (typeof register === "function") {
     register({ requestId, cancel: (reason) => cancelAsk(channel, chatId, requestId, reason) });
@@ -5358,6 +5417,7 @@ function maybeEmitPlanApproval(channel, { provider, task, chatId, taskId, replyT
   const plan = extractPlan(output);
   if (!plan) return;
   const requestId = newAskId(chatId);
+  const planSessionId = sessionByChat.get(chatId) || resumeIdFor(task) || null;
   pushAskRequest(channel, {
     provider,
     chatId,
@@ -5365,7 +5425,10 @@ function maybeEmitPlanApproval(channel, { provider, task, chatId, taskId, replyT
     replyToId,
     requestId,
     kind: "plan",
-    body: { plan, sessionId: sessionByChat.get(chatId) || resumeIdFor(task) || null, repoName: repo && repo.name },
+    // sessionId also rides top-level so the phone can scope the plan sheet to the
+    // conversation page that owns it (same shared-chatId problem as ask/command).
+    sessionId: planSessionId,
+    body: { plan, sessionId: planSessionId, repoName: repo && repo.name },
   });
   console.log(`[vibe-bridge] ask_request(plan) ${requestId} chat=${chatId} planLen=${plan.length}`);
 }

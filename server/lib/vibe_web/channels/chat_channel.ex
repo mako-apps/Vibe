@@ -782,7 +782,9 @@ defmodule VibeWeb.ChatChannel do
     note_team_user_turn? = Keyword.get(opts, :note_team_user_turn, false)
     team_run_id = Keyword.get(opts, :team_run_id)
     team_workers = Keyword.get(opts, :team_workers, [])
-    bridge_metadata = Keyword.get(opts, :bridge_metadata) || bridge_task_metadata(data)
+    bridge_metadata =
+      (Keyword.get(opts, :bridge_metadata) || bridge_task_metadata(data))
+      |> resolve_provider_model(worker.handle)
 
     cond do
       not LocalAgentWorker.user_allowed?(requester_user_id) ->
@@ -1094,6 +1096,12 @@ defmodule VibeWeb.ChatChannel do
       "model",
       metadata["agentBridgeModel"] || metadata["agent_bridge_model"] || data["agentBridgeModel"]
     )
+    # Per-provider model map for group fan-outs (one message → Claude AND Codex, each
+    # with its own model choice). Resolved to "model" per worker at dispatch time.
+    |> put_provider_models(
+      metadata["agentBridgeModels"] || metadata["agent_bridge_models"] ||
+        data["agentBridgeModels"]
+    )
     |> put_optional_string(
       "intelligence",
       metadata["agentBridgeIntelligence"] || metadata["agent_bridge_intelligence"] ||
@@ -1161,6 +1169,39 @@ defmodule VibeWeb.ChatChannel do
   end
 
   defp put_optional_string(map, _key, _value), do: map
+
+  # %{"claude" => "opus", "codex" => "gpt-5.5"} — per-provider model choices for a
+  # group fan-out. Kept under an internal "models" key; never forwarded to the bridge
+  # directly (see resolve_provider_model/2).
+  defp put_provider_models(map, models) when is_map(models) do
+    cleaned =
+      models
+      |> Enum.flat_map(fn {provider, model} ->
+        with true <- is_binary(provider),
+             model when is_binary(model) <- model,
+             trimmed when trimmed != "" <- String.trim(model) do
+          [{String.downcase(provider), trimmed}]
+        else
+          _ -> []
+        end
+      end)
+      |> Map.new()
+
+    if map_size(cleaned) > 0, do: Map.put(map, "models", cleaned), else: map
+  end
+
+  defp put_provider_models(map, _models), do: map
+
+  # Collapse the per-provider "models" map onto this worker's "model" (the per-provider
+  # choice wins over a generic one) and drop the map so it never reaches the bridge.
+  defp resolve_provider_model(bridge_metadata, provider) do
+    {models, rest} = Map.pop(bridge_metadata, "models")
+
+    case is_map(models) && models[String.downcase(to_string(provider))] do
+      model when is_binary(model) and model != "" -> Map.put(rest, "model", model)
+      _ -> rest
+    end
+  end
 
   defp put_optional_positive_integer(map, key, value) when is_integer(value) and value > 0 do
     Map.put(map, key, min(value, 600))

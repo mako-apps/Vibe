@@ -390,6 +390,9 @@ struct AgentBridgeHistorySession: Identifiable, Hashable {
   let isRunning: Bool
   let taskId: String?
   let sessionId: String?
+  /// Non-nil when this session's run is blocked on a still-pending ask/command
+  /// approval ("ask" | "command" | "plan") — the bridge badges it in the list reply.
+  var pendingAskKind: String? = nil
 
   var resolvedSessionId: String {
     if let sessionId, !sessionId.isEmpty { return sessionId }
@@ -438,8 +441,8 @@ private struct AgentBridgeShimmerPill: View {
     let isDark = colorScheme == .dark
     // Soft monochrome base + a wide, feathered highlight that fades to clear at both
     // ends, so the sweep reads as a gentle glow instead of a hard-edged bar.
-    let baseColor = isDark ? Color.white.opacity(0.06) : Color.black.opacity(0.05)
-    let shineColor = isDark ? Color.white.opacity(0.16) : Color.black.opacity(0.10)
+    let baseColor = isDark ? Color.white.opacity(0.04) : Color.black.opacity(0.03)
+    let shineColor = isDark ? Color.white.opacity(0.08) : Color.black.opacity(0.05)
 
     RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
       .fill(baseColor)
@@ -450,9 +453,9 @@ private struct AgentBridgeShimmerPill: View {
           LinearGradient(
             stops: [
               .init(color: .clear, location: 0.0),
-              .init(color: shineColor.opacity(0.35), location: 0.35),
+              .init(color: shineColor.opacity(0.15), location: 0.25),
               .init(color: shineColor, location: 0.5),
-              .init(color: shineColor.opacity(0.35), location: 0.65),
+              .init(color: shineColor.opacity(0.15), location: 0.75),
               .init(color: .clear, location: 1.0),
             ],
             startPoint: .leading,
@@ -467,57 +470,160 @@ private struct AgentBridgeShimmerPill: View {
       .frame(maxWidth: width == nil ? .infinity : nil, alignment: .leading)
       .onAppear {
         phase = -1.0
-        withAnimation(.linear(duration: 1.4).repeatForever(autoreverses: false)) {
+        withAnimation(.linear(duration: 1.8).repeatForever(autoreverses: false)) {
           phase = 1.0
         }
       }
   }
 }
 
-/// Shimmer skeleton matching the CSS: 2 lines
 private struct AgentBridgeHistoryListSkeleton: View {
+  @Environment(\.colorScheme) private var colorScheme
+
   var body: some View {
+    let isDark = colorScheme == .dark
+    let baseColor = isDark ? Color(red: 40/255, green: 40/255, blue: 40/255) : Color(red: 221/255, green: 219/255, blue: 221/255)
+    
     ScrollView(showsIndicators: false) {
       VStack(spacing: 26) {
         ForEach(0..<7, id: \.self) { _ in
-          // Lines
           VStack(alignment: .leading, spacing: 12) {
-            AgentBridgeShimmerPill(width: 180, height: 19, cornerRadius: 9)
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+              .fill(baseColor)
+              .frame(width: 180, height: 19)
               .padding(.top, 6)
-            AgentBridgeShimmerPill(width: 120, height: 19, cornerRadius: 9)
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+              .fill(baseColor)
+              .frame(width: 120, height: 19)
           }
           .frame(maxWidth: .infinity, alignment: .leading)
         }
       }
       .padding(.horizontal, 20)
       .padding(.top, 16)
+      .modifier(WholeShimmerModifier())
     }
     .allowsHitTesting(false)
     .transition(.opacity.animation(.easeInOut(duration: 0.3)))
   }
 }
 
+private struct WholeShimmerModifier: ViewModifier {
+  @State private var phase: CGFloat = -1.0
+  
+  func body(content: Content) -> some View {
+    content
+      .overlay(
+        GeometryReader { geo in
+          let w = geo.size.width
+          LinearGradient(
+            stops: [
+              .init(color: Color.white.opacity(0), location: 0.0),
+              .init(color: Color.white.opacity(0.2), location: 0.2),
+              .init(color: Color.white.opacity(0.5), location: 0.6),
+              .init(color: Color.white.opacity(0), location: 1.0),
+            ],
+            startPoint: .leading,
+            endPoint: .trailing
+          )
+          .frame(width: w)
+          .offset(x: phase * (w * 2))
+        }
+        .mask(content)
+      )
+      .onAppear {
+        phase = -1.0
+        withAnimation(.linear(duration: 5.0).repeatForever(autoreverses: false)) {
+          phase = 1.0
+        }
+      }
+  }
+}
+
+
 /// Skeleton for the transcript DETAIL: alternating role label + text-line bubbles,
 /// so a loading conversation reads as chat bubbles rather than a spinner.
 private struct AgentBridgeTranscriptSkeleton: View {
+  @State private var phase: CGFloat = -1.0
+  @Environment(\.colorScheme) private var colorScheme
+
   var body: some View {
+    let isDark = colorScheme == .dark
+    let baseColor = isDark ? Color.white.opacity(0.04) : Color.black.opacity(0.03)
+    let shineColor = isDark ? Color.white.opacity(0.08) : Color.black.opacity(0.05)
+
     ScrollView {
       VStack(alignment: .leading, spacing: 18) {
         ForEach(0..<5, id: \.self) { index in
           VStack(alignment: .leading, spacing: 6) {
-            AgentBridgeShimmerPill(width: 54, height: 11, cornerRadius: 6)
-            AgentBridgeShimmerPill(height: 13, cornerRadius: 8)
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+              .fill(baseColor)
+              .frame(width: 54, height: 11)
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+              .fill(baseColor)
+              .frame(height: 13)
             if index % 2 == 0 {
-              AgentBridgeShimmerPill(height: 13, cornerRadius: 8)
+              RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(baseColor)
+                .frame(height: 13)
             }
-            AgentBridgeShimmerPill(width: 220, height: 13, cornerRadius: 8)
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+              .fill(baseColor)
+              .frame(width: 220, height: 13)
           }
           .frame(maxWidth: .infinity, alignment: .leading)
         }
       }
       .padding(18)
+      .overlay(
+        GeometryReader { geo in
+          let w = geo.size.width
+          LinearGradient(
+            stops: [
+              .init(color: .clear, location: 0.0),
+              .init(color: shineColor.opacity(0.15), location: 0.25),
+              .init(color: shineColor, location: 0.5),
+              .init(color: shineColor.opacity(0.15), location: 0.75),
+              .init(color: .clear, location: 1.0),
+            ],
+            startPoint: .leading,
+            endPoint: .trailing
+          )
+          .frame(width: w * 0.7)
+          .offset(x: phase * (w + w * 0.7))
+        }
+        .mask(
+          VStack(alignment: .leading, spacing: 18) {
+            ForEach(0..<5, id: \.self) { index in
+              VStack(alignment: .leading, spacing: 6) {
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                  .fill(Color.black)
+                  .frame(width: 54, height: 11)
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                  .fill(Color.black)
+                  .frame(height: 13)
+                if index % 2 == 0 {
+                  RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.black)
+                    .frame(height: 13)
+                }
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                  .fill(Color.black)
+                  .frame(width: 220, height: 13)
+              }
+              .frame(maxWidth: .infinity, alignment: .leading)
+            }
+          }
+        )
+      )
     }
     .allowsHitTesting(false)
+    .onAppear {
+      phase = -1.0
+      withAnimation(.linear(duration: 1.8).repeatForever(autoreverses: false)) {
+        phase = 1.0
+      }
+    }
     .transition(.opacity)
   }
 }
@@ -543,6 +649,12 @@ struct AgentBridgeHistoryInlineView: View {
   
   @State private var requestStartAt: Date?
   @State private var hasReceivedResponse = false
+  /// How many times the history push was refused because the transport/bridge topic
+  /// wasn't ready yet (cold launch). We keep the skeleton and retry a few times rather
+  /// than immediately flashing a "not connected" state — the fix for "reopen History
+  /// several times before it loads." Reset on a successful reply and on each fresh open.
+  @State private var notReadyRetries = 0
+  private static let maxNotReadyRetries = 6
 
   /// Pre-state: read from AgentPairingService snapshot before the panel opens
   /// so we never flash a stale disconnected state on first open.
@@ -583,6 +695,14 @@ struct AgentBridgeHistoryInlineView: View {
   /// The effective connection state: true if either the passed-in prop OR the
   /// pre-state snapshot says connected. This closes the race window.
   private var effectiveConnected: Bool { connected || resolvedConnected }
+  /// True while we genuinely don't KNOW the connection state yet — a cold launch where no
+  /// status has ever been fetched, or we're still retrying because the transport hasn't
+  /// come up. Drives a spinner instead of a hard red "offline" dot, so the panel never
+  /// asserts "not connected" before it has actually checked.
+  private var isCheckingConnection: Bool {
+    if AgentPairingService.lastStatusFetchedAt == nil { return true }
+    return (loading && !hasReceivedResponse) || notReadyRetries > 0
+  }
   private var effectiveDeviceLabel: String {
     let passed = deviceLabel.trimmingCharacters(in: .whitespacesAndNewlines)
     return passed.isEmpty ? resolvedDeviceLabel : passed
@@ -590,10 +710,10 @@ struct AgentBridgeHistoryInlineView: View {
 
   var body: some View {
     Group {
-      if visibleSessions.isEmpty && loading {
+      if visibleSessions.isEmpty && (loading || isCheckingConnection) {
         AgentBridgeHistoryListSkeleton()
       } else if visibleSessions.isEmpty {
-        // Empty state
+        // Empty state (only after we've actually checked — see isCheckingConnection)
         VStack(spacing: 12) {
           Spacer()
           Image(systemName: "clock.badge.exclamationmark")
@@ -611,9 +731,11 @@ struct AgentBridgeHistoryInlineView: View {
             Section {
               ForEach(group.sessions) { session in
                 sessionRow(session)
+                  .listRowBackground(Color.clear)
               }
             } header: {
               projectHeader(group)
+                .listRowBackground(Color.clear)
             }
           }
         }
@@ -640,8 +762,8 @@ struct AgentBridgeHistoryInlineView: View {
                   .foregroundStyle(palette.secondaryText)
                   .lineLimit(1)
               }
-            } else if paired || hasConnectedBefore {
-              // Spinner + device name (connecting / recovering)
+            } else if paired || hasConnectedBefore || isCheckingConnection {
+              // Spinner + device name (connecting / recovering / first-check on cold open)
               ProgressView().controlSize(.mini)
               if !effectiveDeviceLabel.isEmpty {
                 Text(effectiveDeviceLabel)
@@ -769,6 +891,7 @@ struct AgentBridgeHistoryInlineView: View {
         print("[AgentBridgeHistory] ⚡️ Seeded \(sessions.count) sessions instantly from cache")
       }
     }
+    notReadyRetries = 0
     requestList()
   }
 
@@ -804,6 +927,18 @@ struct AgentBridgeHistoryInlineView: View {
               .lineLimit(2)
           }
           HStack(spacing: 6) {
+            // A run blocked on an Approve/Deny (ask/command/plan) outranks the plain
+            // subtitle — surface it so the user knows WHICH conversation is waiting.
+            if session.pendingAskKind != nil {
+              HStack(spacing: 4) {
+                Image(systemName: "exclamationmark.circle.fill")
+                  .font(.system(size: 11, weight: .semibold))
+                Text("Waiting for approval")
+                  .font(.system(size: 12, weight: .semibold))
+              }
+              .foregroundStyle(.orange)
+              Text("·")
+            }
             // The running state is shown by the spinner next to the title — keep the
             // subtitle to a plain message count + timestamp (no "Live" pill).
             Text("\(session.messageCount) messages")
@@ -845,7 +980,8 @@ struct AgentBridgeHistoryInlineView: View {
     ])
     if (result["accepted"] as? Bool) == true {
       pendingRequestId = reqId
-      
+      notReadyRetries = 0
+
       // Race condition recovery: if the WebSocket was still connecting when we pushed,
       // or the response was dropped, retry if we're still stuck in shimmer. The window
       // is deliberately wider than a cold read of a large ~/.claude/projects so we don't
@@ -856,6 +992,19 @@ struct AgentBridgeHistoryInlineView: View {
           self.requestList()
         }
       }
+    } else if notReadyRetries < Self.maxNotReadyRetries {
+      // The push was refused because the transport/bridge topic isn't joined YET (a cold
+      // launch connects async) — NOT because the computer is offline. Hold the skeleton
+      // and retry as the transport warms up, instead of flashing a disconnected/empty
+      // state the user has to escape by reopening the panel. Give up (surface the real
+      // not-connected message) only after several attempts.
+      notReadyRetries += 1
+      loading = visibleSessions.isEmpty
+      print("[AgentBridgeHistory] ⏳ Transport not ready (attempt \(notReadyRetries)) — keeping skeleton, retrying")
+      DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+        guard self.requestStartAt == start, !self.hasReceivedResponse else { return }
+        self.requestList()
+      }
     } else {
       loading = false
       errorMessage = "Your computer isn't connected right now. Connect it, then try again."
@@ -863,6 +1012,23 @@ struct AgentBridgeHistoryInlineView: View {
   }
 
   private func handle(_ note: Notification) {
+    let reason = (note.userInfo?["reason"] as? String) ?? ""
+    // The chat topic just (re)joined, or the connection came up. A cold-launch socket flap
+    // can exhaust our not-ready retries BEFORE a push can land — the panel then sits on the
+    // skeleton or the "isn't connected" message until the user reopens it. Re-fire the list
+    // now that the transport is usable. Guarded so it only rescues a STALLED load: skip while
+    // a retry cycle is mid-flight (`loading`) so the connection flap can't spawn parallel
+    // request chains, and skip once we already have a reply (`hasReceivedResponse`).
+    if reason == "chatChannelStateChanged" || reason == "connectionStateChanged" {
+      let changed = (note.userInfo?["chatId"] as? String)?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      let mine = changed == nil || changed?.isEmpty == true || changed == chatId
+      if mine, !loading, (errorMessage != nil || !hasReceivedResponse) {
+        notReadyRetries = 0
+        requestList()
+      }
+      return
+    }
     guard
       let info = note.userInfo,
       (info["reason"] as? String) == "agentBridgeHistory",
@@ -903,6 +1069,7 @@ struct AgentBridgeHistoryInlineView: View {
 
     hasReceivedResponse = true
     loading = false
+    notReadyRetries = 0
     pendingRequestId = nil
     let raw = payload["sessions"] as? [[String: Any]] ?? []
     sessions = raw.compactMap { item in
@@ -931,8 +1098,20 @@ struct AgentBridgeHistoryInlineView: View {
         sessionId: task.sessionId
       )
     }
-    var seen = Set(running.map(\.id))
-    return running + sessions.filter { session in
+    // A running-task entry shadows its badged list twin (dedup below keeps the running
+    // one) — carry the pending-approval badge over so it isn't lost in the merge.
+    let pendingKindById = Dictionary(
+      sessions.compactMap { s in s.pendingAskKind.map { (s.id, $0) } },
+      uniquingKeysWith: { first, _ in first }
+    )
+    let badgedRunning = running.map { entry -> AgentBridgeHistorySession in
+      guard entry.pendingAskKind == nil, let kind = pendingKindById[entry.id] else { return entry }
+      var badged = entry
+      badged.pendingAskKind = kind
+      return badged
+    }
+    var seen = Set(badgedRunning.map(\.id))
+    return badgedRunning + sessions.filter { session in
       if seen.contains(session.id) { return false }
       seen.insert(session.id)
       return true
@@ -960,7 +1139,12 @@ struct AgentBridgeHistoryInlineView: View {
       messageCount: (item["messageCount"] as? NSNumber)?.intValue ?? (item["messageCount"] as? Int) ?? 0,
       isRunning: live,
       taskId: nil,
-      sessionId: id
+      sessionId: id,
+      pendingAskKind: {
+        let kind = ((item["pendingAskKind"] as? String) ?? "")
+          .trimmingCharacters(in: .whitespacesAndNewlines)
+        return kind.isEmpty ? nil : kind
+      }()
     )
   }
 
@@ -1365,13 +1549,18 @@ struct AgentBridgeHistorySheet: View {
           onPick(session)
         }
       )
-      .background(.clear)
+      .background(colorScheme == .dark ? Color.black : Color.white)
       .toolbar {
         ToolbarItem(placement: .topBarLeading) {
-          Button("Done") { dismiss() }
+          Button(action: { dismiss() }) {
+            Image(systemName: "xmark")
+              .font(.system(size: 18, weight: .semibold))
+              .foregroundStyle(colorScheme == .dark ? Color.white : Color.black)
+          }
         }
       }
     }
+    .background(colorScheme == .dark ? Color.black : Color.white)
     .presentationBackground(colorScheme == .dark ? Color.black : Color.white)
     .presentationDetents([.medium, .large])
   }

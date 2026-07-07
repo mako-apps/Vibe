@@ -92,6 +92,7 @@ struct ChatListRow {
     // so a "thinking" row renders "Thinking · N tokens" / "Thought for Ns" like the CLI.
     var tokens: Int? = nil
     var durationMs: Int? = nil
+    var action: String? = nil
   }
 
   struct AgentRuntimeCommand: Equatable {
@@ -1347,7 +1348,13 @@ private func progressNodeLabel(from item: [String: Any]) -> String? {
   case "thinking":
     return "Thinking"
   case "todo":
-    return "Planning"
+    let action = (item["action"] as? String)?.lowercased() ?? ""
+    if action == "create" || action == "created" {
+      return "Created Task"
+    } else if action == "update" || action == "updated" {
+      return "Updated Task"
+    }
+    return "Create Task or Update Task"
   case "read":
     return verbLabel("Read")
   case "edit":
@@ -1414,7 +1421,8 @@ private func parseAgentProgressNodes(_ raw: Any?) -> [ChatListRow.AgentProgressN
       parentId: parseNonEmptyString(item["parentId"]),
       subagentType: parseNonEmptyString(item["subagentType"]),
       tokens: parseLong(item["tokens"]).map { Int($0) },
-      durationMs: parseLong(item["durationMs"]).map { Int($0) }
+      durationMs: parseLong(item["durationMs"]).map { Int($0) },
+      action: parseNonEmptyString(item["action"])
     )
   }
 

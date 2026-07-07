@@ -50,6 +50,12 @@ needs it — e.g. **don't `cp` a file just to read or compare it**.
 - **Multi-line commands:** a command split across lines with trailing `\` (for
   readability, e.g. a multi-flag `xcodebuild` invocation) is treated as one logical
   command, not several.
+- **Prefix-runners are unwrapped:** `xargs`, `command`, `env`, `nohup`, `time`, `nice`,
+  `stdbuf` run *another* command — the child is what's checked, not the wrapper. So
+  `find … | xargs grep …`, `command grep …`, `env FOO=bar grep …` all run, while
+  `… | xargs rm`, `command rm x`, `env node -e …` still ask (the child isn't safe).
+  A flag on a read-only tool is never mistaken for a mutator — `grep -ln`, `grep tee`,
+  `grep -rn cp` all run (the `ln`/`tee`/`cp` there are flags/search-terms, not commands).
 
 ## Asks a human (mutating / sensitive)
 

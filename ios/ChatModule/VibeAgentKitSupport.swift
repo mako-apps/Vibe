@@ -184,6 +184,12 @@ struct VibeAgentKitProgressBadge: Equatable {
   }
 }
 
+struct VibeAgentKitTodoItem: Equatable {
+  let content: String
+  let status: String
+  let activeForm: String?
+}
+
 struct VibeAgentKitProgressItem: Equatable {
   let label: String
   let badges: [VibeAgentKitProgressBadge]
@@ -224,6 +230,7 @@ struct VibeAgentKitProgressItem: Equatable {
   // so a "thinking" row can render "Thinking · N tokens" / "Thought for Ns".
   var tokens: Int? = nil
   var durationMs: Int? = nil
+  var todos: [VibeAgentKitTodoItem]? = nil
 
   static func from(label: String, raw: [String: Any]?, eventType: String = "progress")
     -> VibeAgentKitProgressItem
@@ -543,14 +550,14 @@ enum VibeAgentDiffPalette {
 
   static func additionBackground(isDark: Bool) -> UIColor {
     isDark
-      ? UIColor(red: 0.10, green: 0.30, blue: 0.15, alpha: 0.88)
-      : UIColor(red: 0.18, green: 0.74, blue: 0.25, alpha: 0.12)
+      ? UIColor(red: 0.12, green: 0.28, blue: 0.16, alpha: 1.0)
+      : UIColor(red: 0.88, green: 0.97, blue: 0.90, alpha: 1.0)
   }
 
   static func deletionBackground(isDark: Bool) -> UIColor {
     isDark
-      ? UIColor(red: 0.32, green: 0.10, blue: 0.14, alpha: 0.88)
-      : UIColor(red: 0.92, green: 0.24, blue: 0.34, alpha: 0.12)
+      ? UIColor(red: 0.35, green: 0.13, blue: 0.15, alpha: 1.0)
+      : UIColor(red: 0.99, green: 0.88, blue: 0.89, alpha: 1.0)
   }
 }
 

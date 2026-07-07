@@ -384,7 +384,13 @@ public final class ChatMainView: UIView,
     applyPageState(animated: false, emitEvent: false)
 
     avatarGlassView.contentView.layer.sublayers?.first(where: { $0.name == "savedMessagesGradient" })?.frame = avatarGlassView.contentView.bounds
-    avatarGlassView.contentView.layer.sublayers?.first(where: { $0.name == "userAvatarGradient" })?.frame = avatarGlassView.contentView.bounds
+    // Inset to match avatarImageView's sizing (avatarButton.bounds.insetBy(dx: 4, dy: 4))
+    // so the gradient reads as the same size as the photo, not the full glass wrapper.
+    if let headerGradientLayer = avatarGlassView.contentView.layer.sublayers?.first(where: { $0.name == "userAvatarGradient" }) {
+      let insetBounds = avatarGlassView.contentView.bounds.insetBy(dx: 4.0, dy: 4.0)
+      headerGradientLayer.frame = insetBounds
+      headerGradientLayer.cornerRadius = insetBounds.height / 2.0
+    }
     profileAvatarView.layer.sublayers?.first(where: { $0.name == "savedMessagesGradient" })?.frame = profileAvatarView.bounds
     profileAvatarView.layer.sublayers?.first(where: { $0.name == "userAvatarGradient" })?.frame = profileAvatarView.bounds
   }
@@ -3849,7 +3855,7 @@ public final class ChatMainView: UIView,
       // (all active participants) instead of a single agent's working/thinking label.
       // DMs keep the detailed agent-progress subtitle (the branch just below).
       resolvedSubtitle = groupTypingSubtitle
-    } else if let resolvedAgentProgress {
+    } else if !isGroupOrChannel, let resolvedAgentProgress {
       resolvedSubtitle = resolvedAgentProgress
     } else if let bridgeIdleAction {
       resolvedSubtitle = bridgeIdleAction
@@ -3907,7 +3913,9 @@ public final class ChatMainView: UIView,
     } else {
       setSubtitleDotPulsing(false)
     }
-    setSubtitleTextShimmering(resolvedAgentProgress != nil)
+    // Groups shimmer on the named typing label (their live signal); DMs on agent progress.
+    setSubtitleTextShimmering(
+      isGroupOrChannel ? groupTypingSubtitle != nil : resolvedAgentProgress != nil)
 
     chatHeaderStack.spacing = resolvedSubtitle.isEmpty ? 0.0 : -1.0
     profileTitleLabel.text = profileNameText.isEmpty ? resolvedTitle : profileNameText
@@ -4203,12 +4211,27 @@ public final class ChatMainView: UIView,
     guard !normalizedTypingUsers.isEmpty else { return nil }
     // Name the typers (Claude / Codex / people) instead of a bare "typing…", so a
     // group where both agents are running in parallel reads "Claude & Codex typing…".
+    // An agent typer with an explicitly picked model shows it ("Claude · Opus 4.8").
     let names: [String] =
       normalizedTypingUsers
       .compactMap { id -> String? in
         let name = groupMemberDisplayNameByUserId[id]?
           .trimmingCharacters(in: .whitespacesAndNewlines)
-        return (name?.isEmpty ?? true) ? nil : name
+        guard let name, !name.isEmpty else { return nil }
+        let provider: String? =
+          switch id {
+          case "11111111-1111-1111-1111-111111111111": "claude"
+          case "22222222-2222-2222-2222-222222222222": "codex"
+          default: nil
+          }
+        if let provider,
+          let model = AgentBridgeSelectionStore.selectedModel(provider: provider),
+          let title = AgentBridgeSelectionStore.modelChoices(provider: provider)
+            .first(where: { $0.value == model })?.title
+        {
+          return "\(name) · \(title)"
+        }
+        return name
       }
       .sorted()
 
@@ -4477,8 +4500,7 @@ public final class ChatMainView: UIView,
       profileAvatarImageView.image = nil
       avatarImageView.isHidden = true
       profileAvatarImageView.isHidden = true
-      avatarFallbackIconView.isHidden = false
-      profileAvatarFallbackIconView.isHidden = false
+      showHeaderAvatarFallback(true)
       return
     }
 
@@ -4494,7 +4516,32 @@ public final class ChatMainView: UIView,
 
   private func applyUserAvatarGradient() {
     let colors = userAvatarGradientColors()
-    // Header Gradient - Removed so header avatar stays translucent glass
+
+    // Header avatar: a filled gradient circle with initials — the SAME gradient
+    // source as the home cell / profile (`userAvatarGradientColors()` →
+    // `ChatProfileAppearanceStore.avatarColors`). Sits in the glass view's
+    // contentView (clipped to the circle by the glass view) so in the no-photo
+    // fallback the whole tile reads as gradient + letters, not a bare letter on
+    // glass. Hidden whenever a photo is showing (see `showHeaderAvatarFallback`)
+    // so a loaded picture keeps its clean glass ring instead of a gradient one.
+    var headerGradient =
+      avatarGlassView.contentView.layer.sublayers?.first(where: { $0.name == "userAvatarGradient" })
+      as? CAGradientLayer
+    if headerGradient == nil {
+      headerGradient = CAGradientLayer()
+      headerGradient?.name = "userAvatarGradient"
+      headerGradient?.masksToBounds = true
+      avatarGlassView.contentView.layer.insertSublayer(headerGradient!, at: 0)
+    }
+    headerGradient?.colors = [colors.0.cgColor, colors.1.cgColor]
+    headerGradient?.startPoint = CGPoint(x: 0.0, y: 0.0)
+    headerGradient?.endPoint = CGPoint(x: 1.0, y: 1.0)
+    // Inset to match avatarImageView's sizing (avatarButton.bounds.insetBy(dx: 4, dy: 4))
+    // so the gradient circle matches the photo size, not the full glass wrapper.
+    let insetBounds = avatarGlassView.contentView.bounds.insetBy(dx: 4.0, dy: 4.0)
+    headerGradient?.frame = insetBounds
+    headerGradient?.cornerRadius = insetBounds.height / 2.0
+    headerGradient?.isHidden = avatarFallbackLabel.isHidden
     avatarGlassView.contentView.backgroundColor = .clear
 
     var profileGradient =
@@ -4510,6 +4557,22 @@ public final class ChatMainView: UIView,
     profileGradient?.endPoint = CGPoint(x: 1.0, y: 1.0)
     profileGradient?.frame = profileAvatarView.bounds
     profileAvatarView.backgroundColor = .clear
+  }
+
+  /// Toggle the no-photo fallback for the header + profile avatars as one unit.
+  /// Outside Saved Messages the fallback is ALWAYS gradient + initials — the
+  /// person glyph is never used — and the initials hide whenever a photo shows,
+  /// so an avatar is never a letter sitting on top of a picture.
+  private func showHeaderAvatarFallback(_ show: Bool) {
+    avatarFallbackIconView.isHidden = true
+    profileAvatarFallbackIconView.isHidden = true
+    avatarFallbackLabel.isHidden = !show
+    profileAvatarFallbackLabel.isHidden = !show
+    // Header gradient tile shows only in the no-photo fallback (behind the
+    // initials); a loaded photo hides it so the glass ring stays clean.
+    avatarGlassView.contentView.layer.sublayers?
+      .first(where: { $0.name == "userAvatarGradient" })?
+      .isHidden = !show
   }
 
   private static func color(fromHex hex: String) -> UIColor? {
@@ -4564,8 +4627,7 @@ public final class ChatMainView: UIView,
       profileAvatarImageView.image = nil
       avatarImageView.isHidden = true
       profileAvatarImageView.isHidden = true
-      avatarFallbackIconView.isHidden = false
-      profileAvatarFallbackIconView.isHidden = false
+      showHeaderAvatarFallback(true)
       return
     }
 
@@ -4575,18 +4637,17 @@ public final class ChatMainView: UIView,
       profileAvatarImageView.image = cached
       avatarImageView.isHidden = false
       profileAvatarImageView.isHidden = false
-      avatarFallbackIconView.isHidden = true
-      profileAvatarFallbackIconView.isHidden = true
+      showHeaderAvatarFallback(false)
       return
     }
 
     if displayedAvatarUri != resolvedUri {
+      // Keep gradient + initials up while the photo loads.
       avatarImageView.image = nil
       profileAvatarImageView.image = nil
       avatarImageView.isHidden = true
       profileAvatarImageView.isHidden = true
-      avatarFallbackIconView.isHidden = false
-      profileAvatarFallbackIconView.isHidden = false
+      showHeaderAvatarFallback(true)
     }
 
     let task = Task { [weak self] in
@@ -4601,8 +4662,7 @@ public final class ChatMainView: UIView,
         self.profileAvatarImageView.image = image
         self.avatarImageView.isHidden = false
         self.profileAvatarImageView.isHidden = false
-        self.avatarFallbackIconView.isHidden = true
-        self.profileAvatarFallbackIconView.isHidden = true
+        self.showHeaderAvatarFallback(false)
       }
     }
     avatarLoadTask = task

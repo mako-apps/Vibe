@@ -52,6 +52,18 @@ enum VibeAgentKitMap {
     let patch = (detail?["patch"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
     let rawOutput = (detail?["output"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
     let fileName = node.target ?? (detail?["name"] as? String)
+
+    var parsedTodos: [VibeAgentKitTodoItem]? = nil
+    if let rawTodos = detail?["todos"] as? [[String: Any]] {
+      parsedTodos = rawTodos.map { t in
+        VibeAgentKitTodoItem(
+          content: (t["content"] as? String) ?? "",
+          status: (t["status"] as? String) ?? "",
+          activeForm: t["activeForm"] as? String
+        )
+      }
+    }
+
     return VibeAgentKitProgressItem(
       label: chatAgentNodeCompactLabel(node),
       badges: [],
@@ -80,7 +92,8 @@ enum VibeAgentKitMap {
       parentId: node.parentId,
       subagentType: node.subagentType,
       tokens: node.tokens,
-      durationMs: node.durationMs
+      durationMs: node.durationMs,
+      todos: parsedTodos
     )
   }
 
@@ -101,35 +114,11 @@ enum VibeAgentKitMap {
   private static func imageAttachments(from row: ChatListRow) -> [VibeAgentKitImageAttachment] {
     var attachments: [VibeAgentKitImageAttachment] = []
     let rowId = row.messageId ?? row.key
-    let sourceURI = (row.localMediaUrl?.isEmpty == false ? row.localMediaUrl : row.mediaUrl)?
-      .trimmingCharacters(in: .whitespacesAndNewlines)
-    let isImageMessage =
-      row.visualKind == .media
-      && (row.messageType == "image"
-        || row.messageType == "gif"
-        || isImageReference(uri: sourceURI, fileName: row.fileName))
-    if isImageMessage, let sourceURI, !sourceURI.isEmpty {
-      attachments.append(
-        VibeAgentKitImageAttachment(
-          id: "\(rowId)#media",
-          name: row.fileName,
-          mime: mimeType(for: row.fileName ?? sourceURI),
-          sourceURI: sourceURI,
-          dataBase64: row.thumbnailBase64
-        )
-      )
-    } else if isImageMessage, let thumb = row.thumbnailBase64, !thumb.isEmpty {
-      attachments.append(
-        VibeAgentKitImageAttachment(
-          id: "\(rowId)#thumb",
-          name: row.fileName,
-          mime: "image/jpeg",
-          sourceURI: nil,
-          dataBase64: thumb
-        )
-      )
-    }
-
+    // The sealed bridge blobs are the canonical attachment set — exactly the images the
+    // agent received, in order. A picker send also carries the first image in the row's
+    // media fields, so when any blob decrypts we render blobs ONLY (the media entry
+    // would duplicate blob #0). The media/thumb fallback below still covers rows whose
+    // blobs can't be decrypted here (no pairing key on this device) or plain media rows.
     for (index, blob) in row.agentBridgeAttachmentsEnc.enumerated() {
       guard let object = AgentRuntimeCrypto.decrypt(blob) else { continue }
       let mime =
@@ -161,6 +150,36 @@ enum VibeAgentKitMap {
           mime: mime ?? mimeType(for: name ?? uri ?? ""),
           sourceURI: uri,
           dataBase64: dataBase64
+        )
+      )
+    }
+    if !attachments.isEmpty { return attachments }
+
+    let sourceURI = (row.localMediaUrl?.isEmpty == false ? row.localMediaUrl : row.mediaUrl)?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    let isImageMessage =
+      row.visualKind == .media
+      && (row.messageType == "image"
+        || row.messageType == "gif"
+        || isImageReference(uri: sourceURI, fileName: row.fileName))
+    if isImageMessage, let sourceURI, !sourceURI.isEmpty {
+      attachments.append(
+        VibeAgentKitImageAttachment(
+          id: "\(rowId)#media",
+          name: row.fileName,
+          mime: mimeType(for: row.fileName ?? sourceURI),
+          sourceURI: sourceURI,
+          dataBase64: row.thumbnailBase64
+        )
+      )
+    } else if isImageMessage, let thumb = row.thumbnailBase64, !thumb.isEmpty {
+      attachments.append(
+        VibeAgentKitImageAttachment(
+          id: "\(rowId)#thumb",
+          name: row.fileName,
+          mime: "image/jpeg",
+          sourceURI: nil,
+          dataBase64: thumb
         )
       )
     }
@@ -681,6 +700,13 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     }
   }
 
+  /// The session ids identifying the CONVERSATION this page shows (History-picked and/or
+  /// adopted-from-turns), supplied live by the hosting ChatListView. Used to scope
+  /// ask/command sheets: every session shares one DM chatId, so without this an ask from
+  /// a different conversation would pop over this page. Empty/nil ⇒ no session identity
+  /// yet ⇒ present (fail-open, matching the bubble surface's fallback).
+  var agentBridgeAskSessionScope: ((Set<String>) -> (owns: Bool, hasIdentity: Bool))?
+
   init(
     title: String,
     subtitle: String = "",
@@ -968,12 +994,12 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     progressSheet.isHidden = true
     view.addSubview(progressSheet)
 
-    loadingSkeleton.translatesAutoresizingMaskIntoConstraints = false
     loadingSkeleton.applyAppearance(appearance)
     loadingSkeleton.isHidden = true
-    // Above the feed but below the floating composer / workspace chrome (both added after
-    // the table), so the placeholder covers the message area while the composer stays live.
-    view.insertSubview(loadingSkeleton, aboveSubview: tableView)
+    // The skeleton is the table's OWN backgroundView — inside the list, behind its rows —
+    // so any row that does render sits on top of it instead of being covered by an
+    // absolute overlay; the composer/chrome stay live above the table as before.
+    tableView.backgroundView = loadingSkeleton
 
     setupEmptyState()
     setupUsageBanner()
@@ -1025,10 +1051,6 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       progressSheet.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       progressSheet.trailingAnchor.constraint(equalTo: view.trailingAnchor),
       progressSheet.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-      loadingSkeleton.topAnchor.constraint(equalTo: tableView.topAnchor),
-      loadingSkeleton.leadingAnchor.constraint(equalTo: tableView.leadingAnchor),
-      loadingSkeleton.trailingAnchor.constraint(equalTo: tableView.trailingAnchor),
-      loadingSkeleton.bottomAnchor.constraint(equalTo: tableView.bottomAnchor),
       usageBannerView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 18.0),
       usageBannerView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -18.0),
       usageBannerView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8.0),
@@ -1477,6 +1499,24 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       NSLog("[AgentView][ask] DROP — empty requestId")
       return
     }
+    // CONVERSATION scoping: chatId+provider still match every session in this shared DM.
+    // When the ask names its session (or the one it resumed from) and this page has a
+    // session identity, drop on no intersection — the ask belongs to a different
+    // conversation and surfaces on its own page (mirrors ChatListView's guard).
+    let askSessionIds = Set(
+      [
+        (info["sessionId"] as? String) ?? "",
+        (info["resumedFromSessionId"] as? String) ?? "",
+      ].map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+    )
+    if !askSessionIds.isEmpty, let scope = agentBridgeAskSessionScope?(askSessionIds),
+      !scope.owns, scope.hasIdentity
+    {
+      NSLog(
+        "[AgentView][ask] DROP — session mismatch ask=%@ (this page shows a different conversation) requestId=%@",
+        askSessionIds.joined(separator: ","), infoRequestId)
+      return
+    }
     let requestId = infoRequestId
     guard let payload = ChatEngine.shared.latestAgentBridgeAsk(requestId: requestId) else {
       NSLog("[AgentView][ask] DROP — no stored payload for requestId=%@", requestId)
@@ -1530,7 +1570,10 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     sheet.onDismissWithoutResolve = {
       ChatEngine.shared.releaseAgentBridgeAskPresentation(requestId: requestId)
     }
-    if let presentation = sheet.sheetPresentationController {
+    let nav = UINavigationController(rootViewController: sheet)
+    nav.modalPresentationStyle = .pageSheet
+    nav.view.backgroundColor = .clear
+    if let presentation = nav.sheetPresentationController {
       presentation.detents = [.medium(), .large()]
       presentation.prefersGrabberVisible = true
       presentation.preferredCornerRadius = 22
@@ -1539,13 +1582,13 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     // new present() is dropped silently — surface that so we can see it in the logs.
     if let existing = presentedViewController {
       NSLog(
-        "[AgentView][ask] WARN already presenting %@ — presenting ask sheet on top may fail",
+        "[VibeAgentConversationView][ask] DROP present — already presenting: %@",
         String(describing: type(of: existing))
       )
+      sheet.onDismissWithoutResolve?()
+      return
     }
-    NSLog("[AgentView][ask] calling present() inWindow=%@ requestId=%@",
-      view.window != nil ? "Y" : "N", requestId)
-    present(sheet, animated: true) {
+    present(nav, animated: true) {
       NSLog("[AgentView][ask] present() completed requestId=%@", requestId)
     }
   }
@@ -2638,6 +2681,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     guard loadingSkeleton.superview != nil, !skeletonVisible else { return }
     skeletonVisible = true
     loadingSkeleton.layer.removeAllAnimations()
+    loadingSkeleton.contentBottomInset = max(20.0, tableView.contentInset.bottom + 8.0)
     loadingSkeleton.isHidden = false
     loadingSkeleton.alpha = 1.0
     loadingSkeleton.startShimmer()
@@ -3963,8 +4007,21 @@ private final class VibeAgentSkeletonPillView: UIView {
   }
 
   private func addShimmerIfNeeded() {
-    // Disabled hard shimmer per user request. 
-    // The gradient and cell style are now applied statically.
+    // Very soft, slow sweep — a narrow low-alpha highlight band drifts across each
+    // pill; the pill's own fill (them-tone / user gradient) stays the dominant read.
+    guard animating, bounds.width > 0 else { return }
+    if lastAnimatedWidth == bounds.width, shimmerGradientLayer.animation(forKey: "shimmer") != nil {
+      return
+    }
+    lastAnimatedWidth = bounds.width
+    shimmerGradientLayer.removeAnimation(forKey: "shimmer")
+    let sweep = CABasicAnimation(keyPath: "transform.translation.x")
+    sweep.fromValue = -bounds.width
+    sweep.toValue = bounds.width
+    sweep.duration = 2.4
+    sweep.repeatCount = .infinity
+    sweep.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+    shimmerGradientLayer.add(sweep, forKey: "shimmer")
   }
 }
 
@@ -3973,28 +4030,42 @@ private final class VibeAgentSkeletonPillView: UIView {
 /// on the SAME background as the live feed, so a loading conversation reads as chat rather
 /// than a bare spinner. Soft, low-contrast shimmer only.
 final class VibeAgentTranscriptSkeletonView: UIView {
-  private enum RowKind { case user, agent, agentShort }
+  private struct RowSpec {
+    let height: CGFloat
+    let widthMultiplier: CGFloat
+    let isUser: Bool
+  }
 
-  private let stack = UIStackView()
+  // Four distinct row shapes, cycled bottom-up until the FULL visible height is covered
+  // (the topmost row overflows the top edge and is clipped). Layout is manual frame
+  // math in layoutSubviews — as a UICollectionView/UITableView backgroundView this view
+  // is frame-managed by UIKit, and a constraint stack inside it proved unreliable
+  // (rows hugging the top / not filling). Frames recompute on every bounds change.
+  private let cycle: [RowSpec] = [
+    RowSpec(height: 92.0, widthMultiplier: 0.80, isUser: false),
+    RowSpec(height: 44.0, widthMultiplier: 0.46, isUser: true),
+    RowSpec(height: 136.0, widthMultiplier: 0.84, isUser: false),
+    RowSpec(height: 64.0, widthMultiplier: 0.56, isUser: true),
+  ]
+  private let rowSpacing: CGFloat = 16.0
+
   private var pills: [VibeAgentSkeletonPillView] = []
+  private var pillIsUser: [Bool] = []
   private var appearance: VibeAgentKitChatAppearance = .fallback
   private var userBubbleGradient: [UIColor]?
 
-  private let pattern: [RowKind] = [.user, .agent, .user, .agent]
+  /// Extra bottom clearance (floating composer / keyboard inset) so the lowest
+  /// placeholder row sits where the newest real message would. Hosts set this from the
+  /// list's own bottom content inset.
+  var contentBottomInset: CGFloat = 20.0 {
+    didSet { if oldValue != contentBottomInset { setNeedsLayout() } }
+  }
 
   override init(frame: CGRect) {
     super.init(frame: frame)
     isUserInteractionEnabled = false
-    stack.translatesAutoresizingMaskIntoConstraints = false
-    stack.axis = .vertical
-    stack.alignment = .fill
-    stack.spacing = 24.0
-    addSubview(stack)
-    NSLayoutConstraint.activate([
-      stack.bottomAnchor.constraint(equalTo: safeAreaLayoutGuide.bottomAnchor, constant: -20.0),
-      stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 18.0),
-      stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -18.0),
-    ])
+    clipsToBounds = true
+    backgroundColor = .clear
   }
 
   required init?(coder: NSCoder) { return nil }
@@ -4002,8 +4073,8 @@ final class VibeAgentTranscriptSkeletonView: UIView {
   func applyAppearance(_ appearance: VibeAgentKitChatAppearance, userBubbleGradient: [UIColor]? = nil) {
     self.appearance = appearance
     self.userBubbleGradient = userBubbleGradient
-    backgroundColor = .clear
-    rebuild()
+    restylePills()
+    setNeedsLayout()
   }
 
   func startShimmer() {
@@ -4020,70 +4091,65 @@ final class VibeAgentTranscriptSkeletonView: UIView {
     if window != nil, !isHidden { startShimmer() } else { stopShimmer() }
   }
 
-  private func rebuild() {
-    pills.forEach { $0.stopAnimating() }
-    pills.removeAll()
-    stack.arrangedSubviews.forEach {
-      stack.removeArrangedSubview($0)
-      $0.removeFromSuperview()
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    guard bounds.width > 1.0, bounds.height > 1.0 else { return }
+    // Match the real bubble rail: messageHorizontalInset + bubbleSideMargin.
+    let sideInset = messageHorizontalInset + bubbleSideMargin
+    let contentWidth = max(1.0, bounds.width - sideInset * 2.0)
+
+    // Walk the cycle bottom-up from just above the composer inset until the frames
+    // spill past the top edge — full coverage on any screen height.
+    var frames: [(frame: CGRect, isUser: Bool)] = []
+    var bottomY = bounds.height - contentBottomInset
+    var index = 0
+    while bottomY > 0.0 {
+      let spec = cycle[index % cycle.count]
+      let width = (contentWidth * spec.widthMultiplier).rounded()
+      let x = spec.isUser ? bounds.width - sideInset - width : sideInset
+      let frame = CGRect(x: x, y: bottomY - spec.height, width: width, height: spec.height)
+      frames.append((frame, spec.isUser))
+      bottomY = frame.minY - rowSpacing
+      index += 1
     }
 
-    let base = appearance.text.withAlphaComponent(appearance.isDark ? 0.07 : 0.06)
-    let highlight = appearance.text.withAlphaComponent(appearance.isDark ? 0.11 : 0.09)
-    let userBase = appearance.userBubbleBackground
-    let userHighlight = appearance.text.withAlphaComponent(appearance.isDark ? 0.08 : 0.06)
+    while pills.count < frames.count {
+      let pill = VibeAgentSkeletonPillView()
+      pill.translatesAutoresizingMaskIntoConstraints = true
+      addSubview(pill)
+      pills.append(pill)
+      pillIsUser.append(false)
+    }
+    while pills.count > frames.count {
+      pills.removeLast().removeFromSuperview()
+      pillIsUser.removeLast()
+    }
 
-    for kind in pattern {
-      switch kind {
-      case .user:
-        stack.addArrangedSubview(makeUserRow(base: userBase, highlight: userHighlight, userGradient: userBubbleGradient))
-      case .agent:
-        stack.addArrangedSubview(
-          makeAgentRow(base: base, highlight: highlight, height: 76.0, widthMultiplier: 0.75))
-      case .agentShort:
-        stack.addArrangedSubview(
-          makeAgentRow(base: base, highlight: highlight, height: 48.0, widthMultiplier: 0.55))
+    for (idx, entry) in frames.enumerated() {
+      pillIsUser[idx] = entry.isUser
+      pills[idx].frame = entry.frame
+    }
+    restylePills()
+    if window != nil, !isHidden { pills.forEach { $0.startAnimating() } }
+  }
+
+  private func restylePills() {
+    // Solid enough to read as bubbles at a glance (the old 0.06 text-tint fills looked
+    // like nothing was there); the shimmer band rides on top of these.
+    let agentBase = appearance.text.withAlphaComponent(appearance.isDark ? 0.12 : 0.09)
+    let agentHighlight = appearance.text.withAlphaComponent(appearance.isDark ? 0.20 : 0.15)
+    let userBase = appearance.userBubbleBackground
+    let userHighlight = UIColor.white.withAlphaComponent(appearance.isDark ? 0.16 : 0.22)
+    for (idx, pill) in pills.enumerated() {
+      guard idx < pillIsUser.count else { break }
+      if pillIsUser[idx] {
+        pill.apply(
+          base: userBase, highlight: userHighlight, cornerRadius: 18.0,
+          userGradient: userBubbleGradient)
+      } else {
+        pill.apply(base: agentBase, highlight: agentHighlight, cornerRadius: 18.0)
       }
     }
-    if window != nil, !isHidden { startShimmer() }
-  }
-
-  private func makeAgentRow(base: UIColor, highlight: UIColor, height: CGFloat, widthMultiplier: CGFloat) -> UIView {
-    let container = UIView()
-    container.translatesAutoresizingMaskIntoConstraints = false
-    
-    let bubble = VibeAgentSkeletonPillView()
-    // Agent chat bubbles also share the 18.0 corner radius
-    bubble.apply(base: base, highlight: highlight, cornerRadius: 18.0)
-    container.addSubview(bubble)
-    pills.append(bubble)
-    
-    NSLayoutConstraint.activate([
-      bubble.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-      bubble.topAnchor.constraint(equalTo: container.topAnchor),
-      bubble.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-      bubble.widthAnchor.constraint(equalTo: container.widthAnchor, multiplier: widthMultiplier),
-      bubble.heightAnchor.constraint(equalToConstant: height),
-    ])
-    
-    return container
-  }
-
-  private func makeUserRow(base: UIColor, highlight: UIColor, userGradient: [UIColor]?) -> UIView {
-    let container = UIView()
-    container.translatesAutoresizingMaskIntoConstraints = false
-    let bubble = VibeAgentSkeletonPillView()
-    bubble.apply(base: base, highlight: highlight, cornerRadius: 18.0, userGradient: userGradient)
-    container.addSubview(bubble)
-    pills.append(bubble)
-    NSLayoutConstraint.activate([
-      bubble.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-      bubble.topAnchor.constraint(equalTo: container.topAnchor),
-      bubble.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-      bubble.widthAnchor.constraint(equalTo: container.widthAnchor, multiplier: 0.52),
-      bubble.heightAnchor.constraint(equalToConstant: 42.0),
-    ])
-    return container
   }
 }
 
@@ -5996,21 +6062,6 @@ final class VibeAgentSubagentDetailViewController: UIViewController {
     // Glass sheet body (mirrors VibeAgentAskSheetViewController / the chat share sheet)
     // instead of the solid warm agent background — native material, blurs the chat behind it.
     view.backgroundColor = .clear
-    let glassView = UIVisualEffectView(effect: nil)
-    if #available(iOS 26.0, *) {
-      glassView.effect = UIGlassEffect()
-    } else {
-      glassView.effect = UIBlurEffect(
-        style: appearance.isDark ? .systemChromeMaterialDark : .systemChromeMaterialLight)
-    }
-    glassView.translatesAutoresizingMaskIntoConstraints = false
-    view.addSubview(glassView)
-    NSLayoutConstraint.activate([
-      glassView.topAnchor.constraint(equalTo: view.topAnchor),
-      glassView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-      glassView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-      glassView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-    ])
 
     configureNavigationBar()
 
@@ -6064,7 +6115,7 @@ final class VibeAgentSubagentDetailViewController: UIViewController {
     view.addSubview(emptyLabel)
 
     NSLayoutConstraint.activate([
-      scrollView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+      scrollView.topAnchor.constraint(equalTo: view.topAnchor),
       scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
       scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
@@ -6124,9 +6175,13 @@ final class VibeAgentSubagentDetailViewController: UIViewController {
 
     navigationItem.rightBarButtonItem = UIBarButtonItem(
       barButtonSystemItem: .close, target: self, action: #selector(handleClose))
-    // Deliberately do NOT set standardAppearance/scrollEdgeAppearance: the system default
-    // bar background IS Liquid Glass on iOS 26+ (translucent material below it) — a custom
-    // UINavigationBarAppearance here would suppress that automatic chrome.
+    navigationItem.rightBarButtonItem?.tintColor = appearance.text
+
+    let navBarAppearance = UINavigationBarAppearance()
+    navBarAppearance.configureWithTransparentBackground()
+    navigationController?.navigationBar.standardAppearance = navBarAppearance
+    navigationController?.navigationBar.scrollEdgeAppearance = navBarAppearance
+    navigationController?.navigationBar.compactAppearance = navBarAppearance
   }
 
   @objc private func handleClose() {
@@ -6246,6 +6301,8 @@ final class VibeAgentAskSheetViewController: UIViewController {
   private let appearance: VibeAgentKitChatAppearance
   private let requestId: String
   private var didResolve = false
+  private var isCommandExpanded = false
+  private var commandHeightConstraint: NSLayoutConstraint?
 
   private let scrollView = UIScrollView()
   private let contentStack = UIStackView()
@@ -6294,6 +6351,11 @@ final class VibeAgentAskSheetViewController: UIViewController {
     if presentingViewController != nil { dismiss(animated: true) }
   }
 
+  @objc private func handleCloseTapped() {
+    onDismissWithoutResolve?()
+    dismiss(animated: true)
+  }
+
   // Off-mute neutral palette (no brand brown/orange) for the glass sheet.
   private var neutralAccent: UIColor {
     appearance.isDark ? UIColor(white: 0.95, alpha: 1.0) : UIColor(white: 0.13, alpha: 1.0)
@@ -6318,26 +6380,28 @@ final class VibeAgentAskSheetViewController: UIViewController {
         self, selector: #selector(handleBridgeAskCancel(_:)),
         name: ChatEngine.didChangeNotification, object: nil)
     }
-    // Glass sheet (mirrors the chat attachment/share sheet) instead of the solid
-    // warm/brown agent background. Neutral, off-mute palette is used throughout.
-    view.backgroundColor = .clear
-    let glassView = UIVisualEffectView(effect: nil)
-    if #available(iOS 26.0, *) {
-      let glass = UIGlassEffect()
-      glass.isInteractive = true
-      glassView.effect = glass
+
+    if kind == "command" {
+      title = ">_ Terminal"
+    } else if kind == "plan" {
+      title = "Review Plan"
     } else {
-      glassView.effect = UIBlurEffect(
-        style: appearance.isDark ? .systemChromeMaterialDark : .systemChromeMaterialLight)
+      title = "Ask"
     }
-    glassView.translatesAutoresizingMaskIntoConstraints = false
-    view.addSubview(glassView)
-    NSLayoutConstraint.activate([
-      glassView.topAnchor.constraint(equalTo: view.topAnchor),
-      glassView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-      glassView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-      glassView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-    ])
+
+    navigationItem.leftBarButtonItem = UIBarButtonItem(
+      barButtonSystemItem: .close,
+      target: self,
+      action: #selector(handleCloseTapped)
+    )
+
+    let navBarAppearance = UINavigationBarAppearance()
+    navBarAppearance.configureWithTransparentBackground()
+    navigationController?.navigationBar.standardAppearance = navBarAppearance
+    navigationController?.navigationBar.scrollEdgeAppearance = navBarAppearance
+    navigationController?.navigationBar.tintColor = appearance.isDark ? .white : .black
+
+    view.backgroundColor = .clear
 
     scrollView.translatesAutoresizingMaskIntoConstraints = false
     scrollView.keyboardDismissMode = .interactive
@@ -6358,7 +6422,7 @@ final class VibeAgentAskSheetViewController: UIViewController {
     view.addGestureRecognizer(tap)
 
     NSLayoutConstraint.activate([
-      scrollView.topAnchor.constraint(equalTo: view.topAnchor),
+      scrollView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
       scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
       scrollView.bottomAnchor.constraint(equalTo: buttonBar.topAnchor),
@@ -6442,44 +6506,62 @@ final class VibeAgentAskSheetViewController: UIViewController {
   private func buildCommandContent() {
     let toolName = (request["toolName"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     let title = (request["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-    contentStack.addArrangedSubview(titleLabel(title?.isEmpty == false ? title! : "Approve this action"))
+    
+    let titleText = title?.isEmpty == false ? title! : (toolName.isEmpty ? "Run Command" : "Use \(toolName)")
+    contentStack.addArrangedSubview(titleLabel(titleText))
 
     let repo = (request["repoName"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
     let subtitle =
       toolName.isEmpty
       ? "The agent is requesting permission to continue."
-      : "The agent wants to use \(toolName)."
+      : "The agent wants to run a command using \(toolName)."
     contentStack.addArrangedSubview(
       bodyLabel(repo?.isEmpty == false ? "\(repo!) · \(subtitle)" : subtitle, color: appearance.textTertiary))
-
-    let command = (request["command"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    if !command.isEmpty {
-      let card = UIView()
-      card.backgroundColor = neutralFill
-      card.layer.cornerRadius = 14
-      card.layer.cornerCurve = .continuous
-      card.layer.borderWidth = 1
-      card.layer.borderColor = neutralStroke.cgColor
-      let mono = UILabel()
-      mono.text = command
-      mono.numberOfLines = 0
-      mono.font = .monospacedSystemFont(ofSize: 13.5, weight: .regular)
-      mono.textColor = appearance.text
-      mono.translatesAutoresizingMaskIntoConstraints = false
-      card.addSubview(mono)
-      NSLayoutConstraint.activate([
-        mono.topAnchor.constraint(equalTo: card.topAnchor, constant: 14),
-        mono.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
-        mono.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
-        mono.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14),
-      ])
-      contentStack.addArrangedSubview(card)
-    }
 
     let description = (request["description"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     if !description.isEmpty {
       contentStack.addArrangedSubview(bodyLabel(description))
     }
+
+    let command = (request["command"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if !command.isEmpty {
+      let card = UIView()
+      card.backgroundColor = UIColor(white: 0.08, alpha: 1.0)
+      card.layer.cornerRadius = 14
+      card.layer.cornerCurve = .continuous
+      card.layer.borderWidth = 1
+      card.layer.borderColor = UIColor(white: 0.2, alpha: 1.0).cgColor
+      card.clipsToBounds = true
+      
+      let mono = UILabel()
+      mono.text = "$ " + command
+      mono.numberOfLines = 0
+      mono.font = .monospacedSystemFont(ofSize: 13.0, weight: .medium)
+      mono.textColor = .white
+      mono.translatesAutoresizingMaskIntoConstraints = false
+      card.addSubview(mono)
+      
+      let heightConstraint = card.heightAnchor.constraint(equalToConstant: 80)
+      self.commandHeightConstraint = heightConstraint
+      heightConstraint.isActive = !isCommandExpanded
+      
+      let bottomConstraint = mono.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14)
+      bottomConstraint.priority = .defaultHigh
+      
+      NSLayoutConstraint.activate([
+        mono.topAnchor.constraint(equalTo: card.topAnchor, constant: 14),
+        mono.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+        mono.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+        bottomConstraint
+      ])
+      
+      let tap = UITapGestureRecognizer(target: self, action: #selector(toggleCommandExpansion))
+      card.addGestureRecognizer(tap)
+      card.isUserInteractionEnabled = true
+      
+      contentStack.addArrangedSubview(card)
+    }
+
     contentStack.addArrangedSubview(
       bodyLabel(
         "Approve runs it once · No stops the agent.",
@@ -6797,6 +6879,14 @@ final class VibeAgentAskSheetViewController: UIViewController {
     var answer: [String: Any] = ["selections": selections]
     if questions.isEmpty, let note = feedbackText { answer["feedback"] = note }
     resolve("answer", answer: answer)
+  }
+
+  @objc private func toggleCommandExpansion() {
+    isCommandExpanded.toggle()
+    UIView.animate(withDuration: 0.25) {
+      self.commandHeightConstraint?.isActive = !self.isCommandExpanded
+      self.view.layoutIfNeeded()
+    }
   }
 
   private func resolve(_ decision: String, answer: [String: Any]?) {

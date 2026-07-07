@@ -938,10 +938,7 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
   }
 
   private static func hasRuntimeDiff(_ runtime: ChatListRow.AgentRuntimeSummary?) -> Bool {
-    guard let diff = runtime?.diff else { return false }
-    let hasPatch = diff.patch?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-    return diff.filesChanged > 0 || diff.additions > 0 || diff.deletions > 0
-      || !diff.files.isEmpty || hasPatch
+    agentRuntimeHasDiff(runtime)
   }
 }
 
@@ -1463,71 +1460,85 @@ private final class VibeAgentKitStepRowView: UIView {
   /// A padded box rendering a unified diff with per-line coloring (+ green, − red,
   /// @@ hunks muted) — the edit/write patch layer.
   private func patchBox(_ patch: String, appearance: VibeAgentKitChatAppearance) -> UIView {
-    let box = UIView()
-    box.translatesAutoresizingMaskIntoConstraints = false
-    box.backgroundColor = vibeAgentKitColorWithAlpha(
-      appearance.isDark ? UIColor.white : UIColor.black, appearance.isDark ? 0.05 : 0.04)
-    box.layer.cornerRadius = 10.0
-    box.layer.cornerCurve = .continuous
+    let font = UIFont.monospacedSystemFont(ofSize: 11.5, weight: .regular)
+    return diffLayoutView(patch: patch, appearance: appearance, font: font)
+  }
+}
+
+fileprivate func diffLayoutView(patch: String, appearance: VibeAgentKitChatAppearance, font: UIFont) -> UIView {
+  let box = UIView()
+  box.translatesAutoresizingMaskIntoConstraints = false
+  box.backgroundColor = vibeAgentKitColorWithAlpha(
+    appearance.isDark ? UIColor.white : UIColor.black, appearance.isDark ? 0.05 : 0.04)
+  box.layer.cornerRadius = 10.0
+  box.layer.cornerCurve = .continuous
+  box.clipsToBounds = true
+  
+  let stack = UIStackView()
+  stack.translatesAutoresizingMaskIntoConstraints = false
+  stack.axis = .vertical
+  stack.spacing = 0
+  box.addSubview(stack)
+  
+  NSLayoutConstraint.activate([
+    stack.topAnchor.constraint(equalTo: box.topAnchor, constant: 8.0),
+    stack.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -8.0),
+    stack.leadingAnchor.constraint(equalTo: box.leadingAnchor),
+    stack.trailingAnchor.constraint(equalTo: box.trailingAnchor),
+  ])
+  
+  var lines = patch.components(separatedBy: "\n")
+  if lines.last?.isEmpty == true {
+    lines.removeLast()
+  }
+  
+  let faint = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.55)
+  
+  for line in lines {
+    let lineRow = UIView()
+    lineRow.translatesAutoresizingMaskIntoConstraints = false
+    
+    let isAddition = line.hasPrefix("+") && !line.hasPrefix("+++")
+    let isDeletion = line.hasPrefix("-") && !line.hasPrefix("---")
+    
+    if isAddition {
+      lineRow.backgroundColor = VibeAgentDiffPalette.additionBackground(isDark: appearance.isDark)
+    } else if isDeletion {
+      lineRow.backgroundColor = VibeAgentDiffPalette.deletionBackground(isDark: appearance.isDark)
+    }
+    
     let label = UILabel()
     label.translatesAutoresizingMaskIntoConstraints = false
+    label.font = font
     label.numberOfLines = 0
     label.lineBreakMode = .byCharWrapping
-    label.attributedText = Self.diffAttributed(patch, appearance: appearance)
-    box.addSubview(label)
-    NSLayoutConstraint.activate([
-      label.topAnchor.constraint(equalTo: box.topAnchor, constant: 11.0),
-      label.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 13.0),
-      label.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -13.0),
-      label.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -11.0),
-    ])
-    return box
-  }
-
-  private static func diffAttributed(
-    _ patch: String,
-    appearance: VibeAgentKitChatAppearance
-  ) -> NSAttributedString {
-    let mono = UIFont.monospacedSystemFont(ofSize: 12.5, weight: .regular)
-    let para = NSMutableParagraphStyle()
-    para.lineBreakMode = .byCharWrapping
-    para.lineSpacing = 1.0
-    let muted = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.85)
-    let faint = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.55)
-    let result = NSMutableAttributedString()
-    let lines = patch.components(separatedBy: "\n")
-    for (index, line) in lines.enumerated() {
-      let color: UIColor
-      if line.hasPrefix("+") && !line.hasPrefix("+++") {
-        color = VibeAgentDiffPalette.additionText
-      } else if line.hasPrefix("-") && !line.hasPrefix("---") {
-        color = VibeAgentDiffPalette.deletionText
-      } else if line.hasPrefix("@@") {
-        color = muted
-      } else if line.hasPrefix("diff ") || line.hasPrefix("---") || line.hasPrefix("+++")
-        || line.hasPrefix("new file") || line.hasPrefix("deleted file")
-      {
-        color = faint
-      } else {
-        color = appearance.text
-      }
-      let suffix = index == lines.count - 1 ? "" : "\n"
-      var attributes: [NSAttributedString.Key: Any] = [
-        .font: mono,
-        .foregroundColor: color,
-        .paragraphStyle: para,
-      ]
-      if line.hasPrefix("+") && !line.hasPrefix("+++") {
-        attributes[.backgroundColor] = VibeAgentDiffPalette.additionBackground(
-          isDark: appearance.isDark)
-      } else if line.hasPrefix("-") && !line.hasPrefix("---") {
-        attributes[.backgroundColor] = VibeAgentDiffPalette.deletionBackground(
-          isDark: appearance.isDark)
-      }
-      result.append(NSAttributedString(string: line + suffix, attributes: attributes))
+    
+    if isAddition || isDeletion {
+      label.textColor = .white
+    } else if line.hasPrefix("@@") {
+      label.textColor = appearance.primary
+    } else if line.hasPrefix("diff ") || line.hasPrefix("---") || line.hasPrefix("+++")
+      || line.hasPrefix("new file") || line.hasPrefix("deleted file")
+    {
+      label.textColor = faint
+    } else {
+      label.textColor = appearance.text
     }
-    return result
+    
+    label.text = line
+    lineRow.addSubview(label)
+    
+    NSLayoutConstraint.activate([
+      label.topAnchor.constraint(equalTo: lineRow.topAnchor, constant: 4.0),
+      label.bottomAnchor.constraint(equalTo: lineRow.bottomAnchor, constant: -4.0),
+      label.leadingAnchor.constraint(equalTo: lineRow.leadingAnchor, constant: 16.0),
+      label.trailingAnchor.constraint(equalTo: lineRow.trailingAnchor, constant: -16.0),
+    ])
+    
+    stack.addArrangedSubview(lineRow)
   }
+  
+  return box
 }
 
 func resoloAssistantDisplayText(for message: VibeAgentKitChatMessage) -> String {
@@ -2631,6 +2642,16 @@ final class VibeAgentKitStepDetailViewController: UIViewController {
           caption("No file slice available.", vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.7)))
       }
 
+    case "todo", "planning":
+      if let todos = item.todos, !todos.isEmpty {
+        stack.addArrangedSubview(todoListCard(todos: todos))
+      } else if let output = item.messageContent, !output.isEmpty {
+        stack.addArrangedSubview(monoBox(output))
+      } else {
+        stack.addArrangedSubview(
+          caption("No planning details available.", vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.7)))
+      }
+
     default:
       if let output = item.messageContent, !output.isEmpty {
         stack.addArrangedSubview(monoBox(output))
@@ -2640,6 +2661,115 @@ final class VibeAgentKitStepDetailViewController: UIViewController {
             vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.7)))
       }
     }
+  }
+
+  private func todoListCard(todos: [VibeAgentKitTodoItem]) -> UIView {
+    let container = UIView()
+    container.translatesAutoresizingMaskIntoConstraints = false
+    container.backgroundColor = .clear
+    
+    let listStack = UIStackView()
+    listStack.translatesAutoresizingMaskIntoConstraints = false
+    listStack.axis = .vertical
+    listStack.spacing = 14.0
+    container.addSubview(listStack)
+    
+    NSLayoutConstraint.activate([
+      listStack.topAnchor.constraint(equalTo: container.topAnchor, constant: 0.0),
+      listStack.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: 0.0),
+      listStack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 0.0),
+      listStack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: 0.0),
+    ])
+    
+    for todo in todos {
+      let row = UIStackView()
+      row.axis = .horizontal
+      row.spacing = 12.0
+      row.alignment = .top
+      
+      let iconView = UIImageView()
+      iconView.translatesAutoresizingMaskIntoConstraints = false
+      iconView.contentMode = .scaleAspectFit
+      
+      let status = todo.status.lowercased()
+      let isCompleted = status == "completed" || status == "done" || status == "success"
+      let isInProgress = status == "in_progress" || status == "in-progress" || status == "running" || status == "active"
+      
+      if isCompleted {
+        iconView.image = UIImage(systemName: "checkmark.circle.fill")
+        iconView.tintColor = UIColor.systemGreen
+      } else if isInProgress {
+        iconView.image = UIImage(systemName: "arrow.triangle.2.circlepath")
+        iconView.tintColor = appearance.primary
+        
+        let rotation = CABasicAnimation(keyPath: "transform.rotation")
+        rotation.fromValue = 0
+        rotation.toValue = Float.pi * 2
+        rotation.duration = 1.5
+        rotation.repeatCount = .infinity
+        iconView.layer.add(rotation, forKey: "rotate")
+      } else {
+        iconView.image = UIImage(systemName: "circle")
+        iconView.tintColor = appearance.textTertiary
+      }
+      
+      NSLayoutConstraint.activate([
+        iconView.widthAnchor.constraint(equalToConstant: 18.0),
+        iconView.heightAnchor.constraint(equalToConstant: 18.0)
+      ])
+      
+      row.addArrangedSubview(iconView)
+      
+      let textStack = UIStackView()
+      textStack.axis = .vertical
+      textStack.spacing = 4.0
+      
+      let font = UIFont.systemFont(ofSize: 14.5, weight: isCompleted ? .regular : (isInProgress ? .semibold : .medium))
+      
+      if isCompleted {
+        let titleLabel = UILabel()
+        titleLabel.numberOfLines = 0
+        titleLabel.font = font
+        titleLabel.textColor = appearance.textTertiary
+        let attributeString = NSMutableAttributedString(string: todo.content)
+        attributeString.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: NSMakeRange(0, attributeString.length))
+        titleLabel.attributedText = attributeString
+        textStack.addArrangedSubview(titleLabel)
+      } else if isInProgress {
+        let isDark = appearance.isDark
+        let baseColor: UIColor = isDark ? UIColor.white.withAlphaComponent(0.4) : UIColor.black.withAlphaComponent(0.3)
+        let shimmerColor: UIColor = isDark ? .white : .black
+        let shimmerView = VibeTodoShimmerLabel(
+          text: todo.content,
+          font: font,
+          baseColor: baseColor,
+          shimmerColor: shimmerColor
+        )
+        textStack.addArrangedSubview(shimmerView)
+      } else {
+        let titleLabel = UILabel()
+        titleLabel.numberOfLines = 0
+        titleLabel.font = font
+        titleLabel.textColor = appearance.text
+        titleLabel.text = todo.content
+        textStack.addArrangedSubview(titleLabel)
+      }
+      
+      if let activeForm = todo.activeForm, !activeForm.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        let formLabel = UILabel()
+        formLabel.numberOfLines = 0
+        formLabel.font = UIFont.monospacedSystemFont(ofSize: 12.0, weight: .regular)
+        formLabel.textColor = appearance.textSecondary
+        formLabel.text = activeForm
+        
+        textStack.addArrangedSubview(formLabel)
+      }
+      
+      row.addArrangedSubview(textStack)
+      listStack.addArrangedSubview(row)
+    }
+    
+    return container
   }
 
   private func sectionLabel(_ text: String, weight: UIFont.Weight, size: CGFloat) -> UILabel {
@@ -2743,6 +2873,11 @@ final class VibeAgentKitStepDetailViewController: UIViewController {
 
   /// A padded monospace box. `isPatch` colours +/− diff lines green/red.
   private func monoBox(_ text: String, accent: UIColor? = nil, isPatch: Bool = false) -> UIView {
+    let font = UIFont.monospacedSystemFont(ofSize: 11.5, weight: .regular)
+    if isPatch {
+      return diffLayoutView(patch: text, appearance: appearance, font: font)
+    }
+    
     let box = UIView()
     box.translatesAutoresizingMaskIntoConstraints = false
     box.backgroundColor = vibeAgentKitColorWithAlpha(
@@ -2757,17 +2892,12 @@ final class VibeAgentKitStepDetailViewController: UIViewController {
     label.translatesAutoresizingMaskIntoConstraints = false
     label.numberOfLines = 0
     label.lineBreakMode = .byCharWrapping
-    let font = UIFont.monospacedSystemFont(ofSize: 13.0, weight: .regular)
-    if isPatch {
-      label.attributedText = patchAttributed(text, font: font)
-    } else {
-      let para = NSMutableParagraphStyle()
-      para.lineBreakMode = .byCharWrapping
-      para.lineSpacing = 1.5
-      label.attributedText = NSAttributedString(
-        string: text,
-        attributes: [.font: font, .foregroundColor: appearance.text, .paragraphStyle: para])
-    }
+    let para = NSMutableParagraphStyle()
+    para.lineBreakMode = .byCharWrapping
+    para.lineSpacing = 1.5
+    label.attributedText = NSAttributedString(
+      string: text,
+      attributes: [.font: font, .foregroundColor: appearance.text, .paragraphStyle: para])
     box.addSubview(label)
     NSLayoutConstraint.activate([
       label.topAnchor.constraint(equalTo: box.topAnchor, constant: 12.0),
@@ -2777,39 +2907,75 @@ final class VibeAgentKitStepDetailViewController: UIViewController {
     ])
     return box
   }
+}
 
-  private func patchAttributed(_ patch: String, font: UIFont) -> NSAttributedString {
-    let para = NSMutableParagraphStyle()
-    para.lineBreakMode = .byCharWrapping
-    para.lineSpacing = 1.5
-    let result = NSMutableAttributedString()
-    let lines = patch.components(separatedBy: "\n")
-    for (idx, line) in lines.enumerated() {
-      let color: UIColor
-      if line.hasPrefix("+") && !line.hasPrefix("+++") {
-        color = VibeAgentDiffPalette.additionText
-      } else if line.hasPrefix("-") && !line.hasPrefix("---") {
-        color = VibeAgentDiffPalette.deletionText
-      } else if line.hasPrefix("@@") {
-        color = appearance.primary
-      } else {
-        color = appearance.text
-      }
-      let suffix = idx == lines.count - 1 ? "" : "\n"
-      var attributes: [NSAttributedString.Key: Any] = [
-        .font: font,
-        .foregroundColor: color,
-        .paragraphStyle: para,
-      ]
-      if line.hasPrefix("+") && !line.hasPrefix("+++") {
-        attributes[.backgroundColor] = VibeAgentDiffPalette.additionBackground(
-          isDark: appearance.isDark)
-      } else if line.hasPrefix("-") && !line.hasPrefix("---") {
-        attributes[.backgroundColor] = VibeAgentDiffPalette.deletionBackground(
-          isDark: appearance.isDark)
-      }
-      result.append(NSAttributedString(string: line + suffix, attributes: attributes))
+private final class VibeTodoShimmerLabel: UIView {
+  let baseLabel = UILabel()
+  let shimmerLabel = UILabel()
+  let gradientLayer = CAGradientLayer()
+
+  init(text: String, font: UIFont, baseColor: UIColor, shimmerColor: UIColor) {
+    super.init(frame: .zero)
+    self.translatesAutoresizingMaskIntoConstraints = false
+
+    baseLabel.numberOfLines = 0
+    baseLabel.font = font
+    baseLabel.textColor = baseColor
+    baseLabel.text = text
+    baseLabel.translatesAutoresizingMaskIntoConstraints = false
+
+    shimmerLabel.numberOfLines = 0
+    shimmerLabel.font = font
+    shimmerLabel.textColor = shimmerColor
+    shimmerLabel.text = text
+    shimmerLabel.translatesAutoresizingMaskIntoConstraints = false
+
+    addSubview(baseLabel)
+    addSubview(shimmerLabel)
+
+    NSLayoutConstraint.activate([
+      baseLabel.topAnchor.constraint(equalTo: topAnchor),
+      baseLabel.bottomAnchor.constraint(equalTo: bottomAnchor),
+      baseLabel.leadingAnchor.constraint(equalTo: leadingAnchor),
+      baseLabel.trailingAnchor.constraint(equalTo: trailingAnchor),
+
+      shimmerLabel.topAnchor.constraint(equalTo: topAnchor),
+      shimmerLabel.bottomAnchor.constraint(equalTo: bottomAnchor),
+      shimmerLabel.leadingAnchor.constraint(equalTo: leadingAnchor),
+      shimmerLabel.trailingAnchor.constraint(equalTo: trailingAnchor),
+    ])
+
+    gradientLayer.startPoint = CGPoint(x: 0, y: 0.5)
+    gradientLayer.endPoint = CGPoint(x: 1, y: 0.5)
+    gradientLayer.locations = [0.0, 0.3, 0.5, 0.7, 1.0]
+    gradientLayer.colors = [
+      UIColor.clear.cgColor,
+      UIColor.white.withAlphaComponent(0.4).cgColor,
+      UIColor.white.cgColor,
+      UIColor.white.withAlphaComponent(0.4).cgColor,
+      UIColor.clear.cgColor,
+    ]
+    shimmerLabel.layer.mask = gradientLayer
+  }
+
+  required init?(coder: NSCoder) { return nil }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    let w = max(bounds.width, 200.0)
+    gradientLayer.frame = CGRect(x: -w, y: 0, width: w * 3, height: bounds.height)
+    if gradientLayer.animation(forKey: "shimmer") == nil {
+      startShimmer()
     }
-    return result
+  }
+
+  func startShimmer() {
+    let w = max(bounds.width, 200.0)
+    let anim = CABasicAnimation(keyPath: "transform.translation.x")
+    anim.fromValue = 0
+    anim.toValue = w * 2
+    anim.duration = 2.0
+    anim.repeatCount = .infinity
+    gradientLayer.add(anim, forKey: "shimmer")
   }
 }

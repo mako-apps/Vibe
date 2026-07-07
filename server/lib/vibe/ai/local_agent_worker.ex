@@ -814,7 +814,7 @@ defmodule Vibe.AI.LocalAgentWorker do
             "teamWorker" => next_worker.handle,
             "teamWorkers" => Enum.map(team_workers, & &1.handle)
           }
-          |> Map.merge(state.bridge_metadata || %{})
+          |> Map.merge(resolve_provider_model(state.bridge_metadata || %{}, next_worker.handle))
 
         case AgentBridge.dispatch_task(requester_user_id, task_payload) do
           :ok ->
@@ -1272,6 +1272,18 @@ defmodule Vibe.AI.LocalAgentWorker do
       "isAgent" => true,
       "status" => "done"
     })
+  end
+
+  # Collapse a per-provider "models" map (group fan-out metadata) onto this worker's
+  # "model" and drop the map so it never reaches the bridge. Mirrors
+  # VibeWeb.ChatChannel.resolve_provider_model/2 for the chained team dispatch path.
+  defp resolve_provider_model(bridge_metadata, provider) do
+    {models, rest} = Map.pop(bridge_metadata, "models")
+
+    case is_map(models) && models[String.downcase(to_string(provider))] do
+      model when is_binary(model) and model != "" -> Map.put(rest, "model", model)
+      _ -> rest
+    end
   end
 
   @doc "Broadcast that an agent has finished working in a chat."

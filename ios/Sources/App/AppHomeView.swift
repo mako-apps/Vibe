@@ -5547,9 +5547,34 @@ final class ChatProfileRootController: UIViewController {
           self.profileView.setProfileBio(description)
           if let avatarUrl, !avatarUrl.isEmpty { self.profileView.setAvatarUri(avatarUrl) }
         })
+    case "openAgentPanel":
+      // The group profile's Repository row lands here (the standalone profile push,
+      // not ChatConversationController) — without this case the tap did nothing.
+      let provider =
+        Self.normalizedString(payload["provider"] ?? payload["agentBridgeProvider"])
+        ?? route.bridgeProvider
+      if let provider, !provider.isEmpty {
+        presentBridgeRepositoryPicker(provider: provider)
+      }
     default:
       break
     }
+  }
+
+  private func presentBridgeRepositoryPicker(provider: String) {
+    let displayName = ChatRoute.bridgeDisplayName(for: provider)
+    let root = AgentBridgeRepositoryPickerView(
+      provider: provider, displayName: displayName, chatId: route.chatId)
+      .preferredColorScheme(isDark ? .dark : .light)
+    let host = UIHostingController(rootView: root)
+    host.modalPresentationStyle = .pageSheet
+    host.view.backgroundColor = .clear
+    if let sheet = host.sheetPresentationController {
+      sheet.detents = [.medium(), .large()]
+      sheet.prefersGrabberVisible = true
+      sheet.preferredCornerRadius = 28
+    }
+    topMostPresenter().present(host, animated: true)
   }
 
   private func presentClearChatOptions() {

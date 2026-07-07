@@ -79,10 +79,15 @@ defmodule VibeWeb.AgentBridgeChannel do
     line = payload["line"] || ""
     streams = Map.get(socket.assigns, :streams, %{})
 
+    # Keyed by {chat, provider} — a group chat runs Claude AND Codex concurrently
+    # through this one daemon socket; keying by chat_id alone merged both agents'
+    # lines into one buffer/stream_id (identity-flipping row + duplicate cells).
+    stream_key = stream_key(chat_id, provider)
+
     state =
-      Map.get(streams, chat_id, %{
+      Map.get(streams, stream_key, %{
         lines: [],
-        stream_id: new_stream_id(chat_id),
+        stream_id: new_stream_id(chat_id, provider),
         progress_count: 0,
         last_latency_log_at: 0
       })
@@ -161,7 +166,7 @@ defmodule VibeWeb.AgentBridgeChannel do
         state
       end
 
-    {:reply, :ok, assign(socket, :streams, Map.put(streams, chat_id, state))}
+    {:reply, :ok, assign(socket, :streams, Map.put(streams, stream_key, state))}
   end
 
   # daemon → server: completed task (raw output + exit status)
@@ -370,15 +375,22 @@ defmodule VibeWeb.AgentBridgeChannel do
 
   defp bridge_lag_ms(_, _), do: nil
 
-  defp new_stream_id(chat_id) do
-    "stream-" <> chat_id <> "-" <> Integer.to_string(System.system_time(:millisecond))
+  defp stream_key(chat_id, provider) when is_binary(provider) and provider != "",
+    do: chat_id <> "|" <> provider
+
+  defp stream_key(chat_id, _provider), do: chat_id
+
+  defp new_stream_id(chat_id, provider) do
+    suffix = if is_binary(provider) and provider != "", do: provider <> "-", else: ""
+    "stream-" <> chat_id <> "-" <> suffix <> Integer.to_string(System.system_time(:millisecond))
   end
 
-  # Finish + drop the live stream for a chat once the task ends.
+  # Finish + drop the live stream for ONE provider's task in a chat. Must not touch
+  # the other provider's still-running stream in the same (group) chat.
   defp clear_stream(socket, chat_id, provider) when is_binary(chat_id) do
     streams = Map.get(socket.assigns, :streams, %{})
 
-    case Map.pop(streams, chat_id) do
+    case Map.pop(streams, stream_key(chat_id, provider)) do
       {nil, _streams} ->
         socket
 
