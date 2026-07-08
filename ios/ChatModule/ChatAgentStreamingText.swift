@@ -1082,6 +1082,7 @@ final class AgentRuntimeTaskViewController: UITabBarController {
     put(runtime.cwd, into: &payload, key: "cwd")
     put(runtime.workMode, into: &payload, key: "workMode")
     put(runtime.model, into: &payload, key: "model")
+    put(runtime.advisor, into: &payload, key: "advisor")
     put(runtime.permissionMode, into: &payload, key: "permissionMode")
     put(runtime.sessionId, into: &payload, key: "sessionId")
     put(runtime.threadId, into: &payload, key: "threadId")
@@ -1176,6 +1177,7 @@ final class AgentRuntimeTaskViewController: UITabBarController {
     var sections: [String] = []
     var overview: [String] = []
     if let model = runtime.model, !model.isEmpty { overview.append("model: \(model)") }
+    if let advisor = runtime.advisor, !advisor.isEmpty { overview.append("advisor: \(advisor)") }
     if let permission = runtime.permissionMode, !permission.isEmpty { overview.append("permission: \(permission)") }
     if let cli = runtime.cliVersion, !cli.isEmpty { overview.append("cli: \(cli)") }
     if let session = runtime.sessionId, !session.isEmpty { overview.append("session: \(shortId(session))") }

@@ -113,6 +113,7 @@ defmodule VibeWeb.AgentBridgeChannel do
         cwd: payload["cwd"] || Map.get(state, :cwd),
         work_mode: payload["workMode"] || payload["work_mode"] || Map.get(state, :work_mode),
         model: payload["model"] || Map.get(state, :model),
+        advisor: payload["advisor"] || Map.get(state, :advisor),
         progress_count: progress_count,
         bridge_sent_at_ms:
           payload["sentAtMs"] || payload["sent_at_ms"] || Map.get(state, :bridge_sent_at_ms),
@@ -137,6 +138,7 @@ defmodule VibeWeb.AgentBridgeChannel do
       cwd: state.cwd,
       work_mode: state.work_mode,
       model: state.model,
+      advisor: state.advisor,
       bridge_sent_at_ms: state.bridge_sent_at_ms,
       server_received_at_ms: received_at_ms,
       sequence: state.sequence,

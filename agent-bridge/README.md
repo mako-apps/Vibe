@@ -45,7 +45,8 @@ Escalate explicitly with env vars (only on machines you control):
 | `VIBE_CLAUDE_PERMISSION_MODE` | per task | `plan`, `auto`, `acceptEdits`, `dontAsk`, or `bypassPermissions` |
 | `VIBE_CODEX_SANDBOX` | `read-only` | `workspace-write` / `danger-full-access` |
 | `VIBE_CODEX_APPROVAL_POLICY` | per task | `untrusted`, `on-request`, or `never` |
-| `VIBE_CLAUDE_MODEL`, `VIBE_CODEX_MODEL` | — | model override |
+| `VIBE_CLAUDE_MODEL`, `VIBE_CODEX_MODEL` | — | executor model override |
+| `VIBE_CLAUDE_ADVISOR`, `VIBE_CLAUDE_ADVISOR_MODEL` | `fable` for installed service | Claude advisor model override |
 | `VIBE_CLAUDE_COMMAND`, `VIBE_CODEX_COMMAND` | `claude` / `codex` | binary path override |
 
 Mobile work modes map to CLI safety settings:

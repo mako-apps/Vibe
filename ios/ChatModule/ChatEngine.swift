@@ -3309,8 +3309,11 @@ final class ChatEngine {
                 "messageId": messageId,
                 "type": type,
               ])
+            // Seed 0 (not a fake fraction): the cell shows an indeterminate spinner
+            // until real bytes flow, so the size label never claims progress that
+            // hasn't happened.
             self.setLiveMessageUploadProgressLocked(
-              chatId: chatId, messageId: messageId, progress: 0.027)
+              chatId: chatId, messageId: messageId, progress: 0.0)
             self.postChangeLocked(
               reason: "chatMessageChanged",
               userInfo: ["chatId": chatId, "messageId": messageId, "action": "updated"]
@@ -3329,7 +3332,7 @@ final class ChatEngine {
             self.queue.async { [weak self] in
               guard let self else { return }
               if self.canceledOutboundMessageIds.contains(messageId) { return }
-              let scaledProgress = max(0.027, min(1.0, Double(progress)))
+              let scaledProgress = max(0.0, min(1.0, Double(progress)))
               if self.setLiveMessageUploadProgressLocked(
                 chatId: chatId,
                 messageId: messageId,
@@ -3348,6 +3351,18 @@ final class ChatEngine {
             if finalFileName == nil { finalFileName = uploadResult.fileName }
             if finalFileSize == nil { finalFileSize = uploadResult.fileSize }
             if finalMediaKey == nil { finalMediaKey = uploadResult.mediaKey }
+
+            // Seed the remote-media disk cache with the file we just uploaded so the
+            // sender never re-downloads its own media after a restart/history reload
+            // (the echo row keeps only the remote URL). Voice has its own seeding in
+            // VoiceBubblePlaybackCoordinator.
+            if ["image", "gif", "video"].contains(type) {
+              chatMediaSeedRemoteCacheFromLocalFile(
+                localURI: localMediaUrl,
+                remoteURL: uploadResult.remoteUrl,
+                mediaKey: finalMediaKey
+              )
+            }
 
             var nextMetadata = (localEffectivePayload["metadata"] as? [String: Any]) ?? [:]
             nextMetadata["mediaUrl"] = uploadResult.remoteUrl
@@ -5317,6 +5332,9 @@ final class ChatEngine {
     }
     if let model = normalizedString(payload["model"]) {
       metadata["agentRuntimeModel"] = model
+    }
+    if let advisor = normalizedString(payload["advisor"] ?? payload["advisorModel"] ?? payload["advisor_model"]) {
+      metadata["agentRuntimeAdvisor"] = advisor
     }
     if let sequence {
       metadata["agentStreamSequence"] = sequence
@@ -10078,6 +10096,13 @@ final class ChatEngine {
             ])
           }
           return
+        }
+        if ["image", "gif", "video"].contains(type) {
+          chatMediaSeedRemoteCacheFromLocalFile(
+            localURI: currentMediaUrl,
+            remoteURL: uploadResult.remoteUrl,
+            mediaKey: mediaKey ?? uploadResult.mediaKey
+          )
         }
         mediaUrl = uploadResult.remoteUrl
         if fileName == nil { fileName = uploadResult.fileName }

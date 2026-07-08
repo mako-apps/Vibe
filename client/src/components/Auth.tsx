@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { User, Key, Loader2 } from 'lucide-react';
+import { ContourField } from './vfx/ContourField';
 import {
     deriveKeyFromPassphrase, decryptPrivateKey, importPublicKey
 } from '../crypto';
@@ -185,91 +185,121 @@ const Auth: React.FC<AuthProps> = ({ onSuccess }) => {
 
     return (
         <div className="auth-container">
-            <AnimatePresence mode="wait">
-                <motion.div
-                    key={formType}
-                    initial={{ opacity: 0, x: formType === 'register' ? 20 : -20 }}
-                    animate={{ opacity: 1, x: 0 }}
-                    exit={{ opacity: 0, x: formType === 'register' ? -20 : 20 }}
-                    transition={{ duration: 0.2 }}
-                    className="auth-content-wrapper" // Changed class to avoid card styling if needed
-                >
-                    {formType === 'register' ? (
-                        <>
-                            <div className="auth-header">
-                                <h1 className="auth-title">Create Account</h1>
-                                <p className="auth-subtitle">Choose a username. We'll generate a secure key for you.</p>
-                            </div>
+            <ContourField className="auth-shader" intensity={0.55} seed={3.7} />
+            <div className="auth-veil" aria-hidden="true" />
 
-                            <form onSubmit={(e) => { e.preventDefault(); handleRegister(); }} className="auth-form">
-                                <div className="input-group">
-                                    <label>Username</label>
-                                    <div className="liquid-input-container">
-                                        <User size={20} className="input-icon" />
+            <div className="auth-panel">
+                <div className="auth-brand" aria-hidden="true">
+                    <svg width="22" height="22" viewBox="0 0 18 18">
+                        <circle cx="9" cy="9" r="7.4" fill="none" stroke="currentColor" strokeWidth="1.1" opacity="0.55" />
+                        <circle cx="9" cy="9" r="2.4" fill="currentColor" />
+                        <circle cx="14.6" cy="4.2" r="1.5" fill="currentColor" opacity="0.85" />
+                    </svg>
+                    <span>vibe</span>
+                </div>
+
+                <AnimatePresence mode="wait">
+                    <motion.div
+                        key={formType}
+                        initial={{ opacity: 0, y: 14 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: -10 }}
+                        transition={{ duration: 0.28, ease: [0.22, 1, 0.36, 1] }}
+                        className="auth-content-wrapper"
+                    >
+                        {formType === 'register' ? (
+                            <>
+                                <div className="auth-header">
+                                    <p className="auth-kicker">[ NEW IDENTITY ]</p>
+                                    <h1 className="auth-title">Enter the <em>mesh.</em></h1>
+                                    <p className="auth-subtitle">
+                                        Pick a name. A 256-bit secret key is generated on your device — no phone
+                                        number, no email, nothing to trace.
+                                    </p>
+                                </div>
+
+                                <form onSubmit={(e) => { e.preventDefault(); handleRegister(); }} className="auth-form">
+                                    <div className="auth-field">
+                                        <label htmlFor="auth-username">USERNAME</label>
                                         <input
+                                            id="auth-username"
                                             type="text"
-                                            placeholder="Choose a username"
+                                            placeholder="how peers will know you"
+                                            autoComplete="off"
+                                            autoCapitalize="none"
                                             value={username}
                                             onChange={e => setUsername(e.target.value)}
                                             disabled={isLoading}
                                         />
                                     </div>
+
+                                    <button className="auth-submit" disabled={isLoading || !username}>
+                                        {isLoading ? <span className="auth-spinner" aria-label="Loading" /> : (
+                                            <>Generate my key <span aria-hidden="true">→</span></>
+                                        )}
+                                    </button>
+                                </form>
+
+                                <div className="auth-switch">
+                                    <span>Already hold a key?</span>
+                                    <button className="auth-switch-link" onClick={() => setFormType('login')}>
+                                        Sign in
+                                    </button>
+                                </div>
+                            </>
+                        ) : (
+                            <>
+                                <div className="auth-header">
+                                    <p className="auth-kicker">[ RESTORE IDENTITY ]</p>
+                                    <h1 className="auth-title">Welcome <em>back.</em></h1>
+                                    <p className="auth-subtitle">
+                                        Your secret key decrypts everything locally. It never leaves this device.
+                                    </p>
                                 </div>
 
-                                <button className="liquid-button primary" disabled={isLoading || !username}>
-                                    {isLoading ? <Loader2 className="spinner" /> : 'Sign Up'}
-                                </button>
-                            </form>
-
-                            <div className="switch-auth-container">
-                                <span>Already have an account? </span>
-                                <button className="switch-link" onClick={() => setFormType('login')}>
-                                    Sign In
-                                </button>
-                            </div>
-                        </>
-                    ) : (
-                        <>
-                            <div className="auth-header">
-                                <h1 className="auth-title">Welcome Back</h1>
-                                <p className="auth-subtitle">Enter your Secret Key to sign in</p>
-                            </div>
-
-                            <form onSubmit={(e) => { e.preventDefault(); handleLogin(); }} className="auth-form">
-                                <div className="input-group">
-                                    <label>Secret Key</label>
-                                    <div className="liquid-input-container">
-                                        <Key size={20} className="input-icon" />
+                                <form onSubmit={(e) => { e.preventDefault(); handleLogin(); }} className="auth-form">
+                                    <div className="auth-field">
+                                        <label htmlFor="auth-secret">SECRET KEY</label>
                                         <input
+                                            id="auth-secret"
                                             type="password"
+                                            placeholder="XXXX-XXXX-XXXX-…"
+                                            autoComplete="off"
                                             value={secretKey}
                                             onChange={e => setSecretKey(e.target.value)}
                                             disabled={isLoading}
                                         />
                                     </div>
+
+                                    <button className="auth-submit" disabled={isLoading || !secretKey}>
+                                        {isLoading ? <span className="auth-spinner" aria-label="Loading" /> : (
+                                            <>Decrypt &amp; sign in <span aria-hidden="true">→</span></>
+                                        )}
+                                    </button>
+                                </form>
+
+                                <div className="auth-switch">
+                                    <span>No identity yet?</span>
+                                    <button className="auth-switch-link" onClick={() => setFormType('register')}>
+                                        Create one
+                                    </button>
                                 </div>
+                            </>
+                        )}
 
-                                <button className="liquid-button primary" disabled={isLoading || !secretKey}>
-                                    {isLoading ? <Loader2 className="spinner" /> : 'Restore & Sign In'}
-                                </button>
-                            </form>
+                        {error && (
+                            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="auth-error">
+                                {error}
+                            </motion.div>
+                        )}
+                    </motion.div>
+                </AnimatePresence>
 
-                            <div className="switch-auth-container">
-                                <span>Don't have an account? </span>
-                                <button className="switch-link" onClick={() => setFormType('register')}>
-                                    Sign Up
-                                </button>
-                            </div>
-                        </>
-                    )}
-
-                    {error && (
-                        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="auth-error">
-                            {error}
-                        </motion.div>
-                    )}
-                </motion.div>
-            </AnimatePresence>
+                <div className="auth-meta" aria-hidden="true">
+                    <span>E2E · AES-256-GCM</span>
+                    <span>KEYS NEVER LEAVE DEVICE</span>
+                </div>
+            </div>
         </div>
     );
 };

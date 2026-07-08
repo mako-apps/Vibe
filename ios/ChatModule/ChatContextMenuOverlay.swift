@@ -94,7 +94,8 @@ public final class ChatContextMenuOverlay: UIView {
     bubbleIsMe: Bool,
     appearance: ChatListAppearance,
     showResendAction: Bool,
-    showRegenerateAction: Bool = false
+    showRegenerateAction: Bool = false,
+    showEditAction: Bool = false
   ) {
     self.messageId = messageId
     self.bubbleSnapshot = bubbleSnapshot
@@ -131,7 +132,8 @@ public final class ChatContextMenuOverlay: UIView {
       appearance: appearance,
       messageId: messageId,
       showResendAction: showResendAction,
-      showRegenerateAction: showRegenerateAction
+      showRegenerateAction: showRegenerateAction,
+      showEditAction: showEditAction
     )
 
     super.init(frame: .zero)
@@ -760,7 +762,8 @@ final class ContextMenuView: UIView {
     appearance: ChatListAppearance,
     messageId: String,
     showResendAction: Bool,
-    showRegenerateAction: Bool = false
+    showRegenerateAction: Bool = false,
+    showEditAction: Bool = false
   ) {
     self.messageId = messageId
     var resolvedActions: [ActionItem] = [
@@ -772,6 +775,14 @@ final class ContextMenuView: UIView {
       ActionItem(id: "pin", title: "Pin", iconName: "pin", isDestructive: false),
       ActionItem(id: "delete", title: "Delete", iconName: "trash", isDestructive: true),
     ]
+    if showEditAction {
+      // Own text bubbles edit their content; own media bubbles edit (or add) the
+      // caption/description.
+      resolvedActions.insert(
+        ActionItem(id: "edit", title: "Edit", iconName: "pencil", isDestructive: false),
+        at: 1
+      )
+    }
     if showResendAction {
       resolvedActions.insert(
         ActionItem(

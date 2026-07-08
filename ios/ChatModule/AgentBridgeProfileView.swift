@@ -509,25 +509,30 @@ private struct AgentBridgeHistoryListSkeleton: View {
 }
 
 private struct WholeShimmerModifier: ViewModifier {
+  @Environment(\.colorScheme) private var colorScheme
   @State private var phase: CGFloat = -1.0
   
   func body(content: Content) -> some View {
-    content
+    let isDark = colorScheme == .dark
+    let shimmerColor = isDark ? Color.white.opacity(0.18) : Color.white.opacity(0.55)
+    
+    return content
       .overlay(
         GeometryReader { geo in
           let w = geo.size.width
           LinearGradient(
             stops: [
-              .init(color: Color.white.opacity(0), location: 0.0),
-              .init(color: Color.white.opacity(0.2), location: 0.2),
-              .init(color: Color.white.opacity(0.5), location: 0.6),
-              .init(color: Color.white.opacity(0), location: 1.0),
+              .init(color: .clear, location: 0.0),
+              .init(color: shimmerColor.opacity(0.4), location: 0.3),
+              .init(color: shimmerColor, location: 0.5),
+              .init(color: shimmerColor.opacity(0.4), location: 0.7),
+              .init(color: .clear, location: 1.0),
             ],
             startPoint: .leading,
             endPoint: .trailing
           )
-          .frame(width: w)
-          .offset(x: phase * (w * 2))
+          .frame(width: w * 0.8)
+          .offset(x: phase * (w * 1.8))
         }
         .mask(content)
       )

@@ -320,6 +320,30 @@ func chatMediaDiskCacheSave(_ data: Data, forKey urlString: String) {
   }
 }
 
+/// Seed the remote-media disk cache with the just-uploaded local file so the sender
+/// never re-downloads its own media after a restart/history reload (the echo row keeps
+/// only the remote URL). Mirrors VoiceBubblePlaybackCoordinator.seedRemoteVoiceCacheFromLocal.
+/// The key must match the remote-load path: chatMediaCacheKey(remoteURL, mediaKey:).
+func chatMediaSeedRemoteCacheFromLocalFile(localURI: String, remoteURL: String, mediaKey: String?) {
+  let trimmedRemote = remoteURL.trimmingCharacters(in: .whitespacesAndNewlines)
+  guard !trimmedRemote.isEmpty else { return }
+  chatMediaDiskCacheQueue.async {
+    let path: String
+    if let parsed = URL(string: localURI), parsed.isFileURL {
+      path = parsed.path
+    } else {
+      path = localURI
+    }
+    let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+    let bytes = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+    guard bytes > 0, bytes <= 25 * 1024 * 1024 else { return }
+    let cacheKey = chatMediaCacheKey(trimmedRemote, mediaKey: mediaKey)
+    let destination = chatMediaDiskCacheDir().appendingPathComponent(chatMediaDiskCacheKey(cacheKey))
+    guard !FileManager.default.fileExists(atPath: destination.path) else { return }
+    try? FileManager.default.copyItem(at: URL(fileURLWithPath: path), to: destination)
+  }
+}
+
 func chatMediaDiskCacheLoad(_ urlString: String) -> Data? {
   let dir = chatMediaDiskCacheDir()
   let filename = chatMediaDiskCacheKey(urlString)
@@ -1649,6 +1673,66 @@ private func usesFullBleedMediaLayout(_ row: ChatListRow) -> Bool {
     || row.visualKind == .videoNote
 }
 
+/// Media-with-caption bubbles (image/video + description) draw the media nearly
+/// edge-to-edge — a hairline inset instead of the full text-bubble padding — with the
+/// caption block hugging the bubble bottom. Files keep the padded document layout and
+/// video notes stay circular.
+let mediaCaptionEdgeInset: CGFloat = 1.5
+let mediaCaptionTopGap: CGFloat = 6.0
+let mediaCaptionBottomPadding: CGFloat = 4.0
+
+func usesEdgeMediaCaptionLayout(_ row: ChatListRow) -> Bool {
+  guard hasMediaCaptionLayout(row), !isTransparentStickerMessage(row) else { return false }
+  return (row.visualKind == .media && row.messageType != "file") || row.visualKind == .video
+}
+
+/// Bridge multi-image sends carry every picked image as a sealed blob on ONE message —
+/// two or more render as an inline tile grid instead of the single hero image.
+let chatMediaGridMaxTiles = 6
+let chatMediaGridGap: CGFloat = 2.0
+
+func chatMediaGridImageCount(_ row: ChatListRow) -> Int {
+  guard row.kind == .message, row.visualKind == .media, row.messageType != "file" else {
+    return 0
+  }
+  let count = row.agentBridgeAttachmentsEnc.count
+  return count > 1 ? count : 0
+}
+
+private func chatMediaGridColumns(_ tiles: Int) -> Int {
+  tiles <= 4 ? 2 : 3
+}
+
+/// Row-major tile frames (origin 0,0). Tiles in a full row are square; a short final
+/// row stretches its tiles to share the full width, so more images = smaller tiles and
+/// the grid always fills the bubble.
+func chatMediaGridLayout(count: Int, width: CGFloat) -> (frames: [CGRect], height: CGFloat) {
+  let tiles = min(max(count, 0), chatMediaGridMaxTiles)
+  guard tiles > 1, width > 1.0 else { return ([], 0.0) }
+  let cols = chatMediaGridColumns(tiles)
+  let rowCount = Int(ceil(Double(tiles) / Double(cols)))
+  let rowHeight = (width - CGFloat(cols - 1) * chatMediaGridGap) / CGFloat(cols)
+  var frames: [CGRect] = []
+  var index = 0
+  for rowIdx in 0..<rowCount {
+    let inRow = min(cols, tiles - index)
+    let tileWidth = (width - CGFloat(inRow - 1) * chatMediaGridGap) / CGFloat(inRow)
+    let y = CGFloat(rowIdx) * (rowHeight + chatMediaGridGap)
+    for col in 0..<inRow {
+      frames.append(
+        CGRect(
+          x: CGFloat(col) * (tileWidth + chatMediaGridGap),
+          y: y,
+          width: tileWidth,
+          height: rowHeight
+        ))
+    }
+    index += inRow
+  }
+  let height = CGFloat(rowCount) * rowHeight + CGFloat(rowCount - 1) * chatMediaGridGap
+  return (frames, height)
+}
+
 private func usesTransparentAgentStreamingLayout(_ row: ChatListRow) -> Bool {
   // Streaming agent text now renders inside a normal bubble that grows smoothly
   // as chunks arrive (the old behaviour floated transparent text with no
@@ -2781,7 +2865,11 @@ func measureMessageBubbleLayout(
       targetWidth = 200.0
       mediaHeight = 200.0
     case .video, .media, .sticker:
-      if let naturalSize = resolvedMediaNaturalSize(for: row),
+      let gridCount = chatMediaGridImageCount(row)
+      if gridCount > 1 {
+        targetWidth = maxContentWidth
+        mediaHeight = chatMediaGridLayout(count: gridCount, width: targetWidth).height
+      } else if let naturalSize = resolvedMediaNaturalSize(for: row),
         naturalSize.width > 1.0,
         naturalSize.height > 1.0
       {
@@ -2814,19 +2902,30 @@ func measureMessageBubbleLayout(
     let metaTopSpacing = effectiveMetaTopSpacing(for: row)
     let contentWidth = min(maxContentWidth, targetWidth)
     let hasMediaCaption = hasMediaCaptionLayout(row) && !isTransparentSticker
+    let isEdgeCaption = usesEdgeMediaCaptionLayout(row)
     let captionAttributedText =
       hasMediaCaption
       ? bubbleDisplayAttributedString(for: row, font: bubbleMessageFont)
       : nil
+    // Edge layout: the bubble hugs the media (hairline inset), so the caption must wrap
+    // inside the media width minus the regular horizontal text padding — otherwise a
+    // long line would spill past the bubble edge.
+    let captionMaxWidth =
+      isEdgeCaption
+      ? max(1.0, contentWidth + mediaCaptionEdgeInset * 2.0 - bubbleHorizontalPadding * 2.0)
+      : contentWidth
     let captionRect =
       captionAttributedText?.boundingRect(
-        with: CGSize(width: contentWidth, height: .greatestFiniteMagnitude),
+        with: CGSize(width: captionMaxWidth, height: .greatestFiniteMagnitude),
         options: [.usesLineFragmentOrigin, .usesFontLeading],
         context: nil
       ) ?? .zero
-    let captionWidth = min(contentWidth, ceil(captionRect.width))
+    let captionWidth = min(captionMaxWidth, ceil(captionRect.width))
     let captionHeight = ceil(captionRect.height)
-    let messageWidth = hasMediaCaption ? max(contentWidth, captionWidth) : contentWidth
+    let messageWidth =
+      hasMediaCaption
+      ? (isEdgeCaption ? captionMaxWidth : max(contentWidth, captionWidth))
+      : contentWidth
     let hasReaction = row.reactionEmoji != nil && row.reactionEmoji?.isEmpty == false
     let reactionHeightOffset: CGFloat = hasReaction ? 28.0 : 0.0
     let bodyHeight: CGFloat
@@ -2840,7 +2939,9 @@ func measureMessageBubbleLayout(
       let isVoice = row.visualKind == .voice
       let captionBlockHeight: CGFloat
       if hasMediaCaption && !isVoice && !isFullBleed {
-        captionBlockHeight = 8.0 + captionHeight + bubbleMetaTopSpacing + bubbleMetaHeight
+        captionBlockHeight =
+          (isEdgeCaption ? mediaCaptionTopGap : 8.0) + captionHeight + bubbleMetaTopSpacing
+          + bubbleMetaHeight
       } else if isFullBleed || isVoice {
         captionBlockHeight = 0.0
       } else {
@@ -2848,12 +2949,18 @@ func measureMessageBubbleLayout(
       }
       bodyHeight =
         (isFullBleed || isVoice) ? mediaHeight : (mediaHeight + captionBlockHeight)
-      bubbleWidth =
-        isFullBleed
-        ? max(bubbleMinWidth, contentWidth)
-        : max(bubbleMinWidth, max(contentWidth, messageWidth) + (bubbleHorizontalPadding * 2.0))
-      let topPad = isVoice ? 2.0 : bubbleTopPadding
-      let bottomPad = isVoice ? 7.0 : bubbleBottomPadding
+      if isEdgeCaption {
+        // Edge-to-edge media: the bubble is the image plus a hairline border.
+        bubbleWidth = max(bubbleMinWidth, contentWidth + mediaCaptionEdgeInset * 2.0)
+      } else {
+        bubbleWidth =
+          isFullBleed
+          ? max(bubbleMinWidth, contentWidth)
+          : max(bubbleMinWidth, max(contentWidth, messageWidth) + (bubbleHorizontalPadding * 2.0))
+      }
+      let topPad = isVoice ? 2.0 : (isEdgeCaption ? mediaCaptionEdgeInset : bubbleTopPadding)
+      let bottomPad =
+        isVoice ? 7.0 : (isEdgeCaption ? mediaCaptionBottomPadding : bubbleBottomPadding)
       bubbleHeight =
         isFullBleed
         ? max(56.0, bodyHeight + reactionHeightOffset)
@@ -3160,6 +3267,9 @@ final class BubbleUploadProgressView: UIView {
     )
   }
 
+  /// `progress == nil` (or no real bytes yet) renders an indeterminate smooth arc
+  /// spinner; a real fraction renders a rotating determinate ring. Never fakes a
+  /// minimum "already sent" fraction — the old seed made the size label lie.
   func setUploadState(isUploading: Bool, progress: Double?) {
     if isUploading {
       needsDownload = false
@@ -3169,16 +3279,15 @@ final class BubbleUploadProgressView: UIView {
     }
     let resolvedProgress: CGFloat?
     if isUploading {
-      if let normalizedProgress = quantizedTransferProgress(
-        progress.map { CGFloat($0) }, minimum: minimumUploadProgress)
-      {
-        lastResolvedUploadProgress = normalizedProgress
-        resolvedProgress = normalizedProgress
+      if let raw = progress.map({ CGFloat($0) }), raw.isFinite, raw > 0.004 {
+        let clamped = max(0.0, min(1.0, raw))
+        lastResolvedUploadProgress = clamped
+        resolvedProgress = clamped
       } else if let lastResolvedUploadProgress {
+        // Don't flicker back to indeterminate once real progress has shown.
         resolvedProgress = lastResolvedUploadProgress
       } else {
-        lastResolvedUploadProgress = minimumUploadProgress
-        resolvedProgress = minimumUploadProgress
+        resolvedProgress = nil
       }
     } else {
       resolvedProgress = nil
@@ -3199,16 +3308,14 @@ final class BubbleUploadProgressView: UIView {
 
     let resolvedProgress: CGFloat?
     if isDownloading {
-      if let normalizedProgress = quantizedTransferProgress(
-        progress.map { CGFloat($0) }, minimum: minimumUploadProgress)
-      {
-        lastResolvedDownloadProgress = normalizedProgress
-        resolvedProgress = normalizedProgress
+      if let raw = progress.map({ CGFloat($0) }), raw.isFinite, raw > 0.004 {
+        let clamped = max(0.0, min(1.0, raw))
+        lastResolvedDownloadProgress = clamped
+        resolvedProgress = clamped
       } else if let lastResolvedDownloadProgress {
         resolvedProgress = lastResolvedDownloadProgress
       } else {
-        lastResolvedDownloadProgress = minimumUploadProgress
-        resolvedProgress = minimumUploadProgress
+        resolvedProgress = nil
       }
     } else {
       resolvedProgress = nil
@@ -3229,11 +3336,7 @@ final class BubbleUploadProgressView: UIView {
 
   private func updateUploadRingVisual() {
     guard isUploading else {
-      progressLayer.removeAnimation(forKey: uploadProgressAnimationKey)
-      progressLayer.removeAnimation(forKey: uploadSpinAnimationKey)
-      progressLayer.strokeStart = 0.0
-      progressLayer.strokeEnd = 0.0
-      iconView.isHidden = true
+      resetRingVisual()
       return
     }
 
@@ -3242,85 +3345,50 @@ final class BubbleUploadProgressView: UIView {
     iconView.tintColor = .white
     iconView.isHidden = false
 
-    let targetProgress = max(
-      minimumUploadProgress,
-      min(1.0, uploadProgress ?? minimumUploadProgress)
-    )
-    let currentProgress = progressLayer.presentation()?.strokeEnd ?? progressLayer.strokeEnd
-    let shouldAnimate =
-      abs(currentProgress - targetProgress) >= chatTransferProgressAnimationThreshold
-      || targetProgress >= 0.999
-
-    CATransaction.begin()
-    CATransaction.setDisableActions(true)
-    progressLayer.strokeStart = 0.0
-    progressLayer.strokeEnd = targetProgress
-    CATransaction.commit()
-
-    if shouldAnimate {
-      let progressAnimation = CABasicAnimation(keyPath: "strokeEnd")
-      progressAnimation.fromValue = currentProgress
-      progressAnimation.toValue = targetProgress
-      progressAnimation.duration = 0.16
-      progressAnimation.timingFunction = CAMediaTimingFunction(name: .easeOut)
-      progressLayer.add(progressAnimation, forKey: uploadProgressAnimationKey)
-    } else {
-      progressLayer.removeAnimation(forKey: uploadProgressAnimationKey)
-    }
-
-    if progressLayer.animation(forKey: uploadSpinAnimationKey) == nil {
-      let spin = CABasicAnimation(keyPath: "transform.rotation.z")
-      spin.fromValue = 0.0
-      spin.toValue = (2.0 * CGFloat.pi)
-      spin.duration = 1.57
-      spin.repeatCount = .infinity
-      spin.timingFunction = CAMediaTimingFunction(name: .linear)
-      spin.isRemovedOnCompletion = true
-      progressLayer.add(spin, forKey: uploadSpinAnimationKey)
-    }
+    applyRingProgress(uploadProgress)
   }
 
   private func updateDownloadRingVisual() {
-    guard needsDownload else {
-      progressLayer.removeAnimation(forKey: uploadProgressAnimationKey)
-      progressLayer.removeAnimation(forKey: uploadSpinAnimationKey)
-      progressLayer.strokeStart = 0.0
-      progressLayer.strokeEnd = 0.0
-      iconView.isHidden = true
-      return
-    }
-
-    guard isDownloading else {
-      progressLayer.removeAnimation(forKey: uploadProgressAnimationKey)
-      progressLayer.removeAnimation(forKey: uploadSpinAnimationKey)
-      progressLayer.strokeStart = 0.0
-      progressLayer.strokeEnd = 0.0
-      iconView.isHidden = true
+    guard needsDownload, isDownloading else {
+      resetRingVisual()
       return
     }
 
     iconView.isHidden = true
+    applyRingProgress(downloadProgress)
+  }
 
-    let targetProgress = max(
-      minimumUploadProgress,
-      min(1.0, downloadProgress ?? minimumUploadProgress)
-    )
+  private func resetRingVisual() {
+    progressLayer.removeAnimation(forKey: uploadProgressAnimationKey)
+    progressLayer.removeAnimation(forKey: uploadSpinAnimationKey)
+    progressLayer.strokeStart = 0.0
+    progressLayer.strokeEnd = 0.0
+    iconView.isHidden = true
+  }
+
+  /// nil → indeterminate: a fixed arc sweeping smoothly around the ring.
+  /// value → determinate: the arc fills to the true fraction while still rotating,
+  /// so the transition from "connecting" to "sending bytes" has no visual jump.
+  private func applyRingProgress(_ progress: CGFloat?) {
+    let targetProgress: CGFloat
+    if let progress {
+      targetProgress = max(0.08, min(1.0, progress))
+    } else {
+      targetProgress = 0.26
+    }
+
     let currentProgress = progressLayer.presentation()?.strokeEnd ?? progressLayer.strokeEnd
-    let shouldAnimate =
-      abs(currentProgress - targetProgress) >= chatTransferProgressAnimationThreshold
-      || targetProgress >= 0.999
-
     CATransaction.begin()
     CATransaction.setDisableActions(true)
     progressLayer.strokeStart = 0.0
     progressLayer.strokeEnd = targetProgress
     CATransaction.commit()
 
-    if shouldAnimate {
+    if abs(currentProgress - targetProgress) >= 0.002 {
       let progressAnimation = CABasicAnimation(keyPath: "strokeEnd")
       progressAnimation.fromValue = currentProgress
       progressAnimation.toValue = targetProgress
-      progressAnimation.duration = 0.16
+      progressAnimation.duration = 0.3
       progressAnimation.timingFunction = CAMediaTimingFunction(name: .easeOut)
       progressLayer.add(progressAnimation, forKey: uploadProgressAnimationKey)
     } else {
@@ -3331,7 +3399,7 @@ final class BubbleUploadProgressView: UIView {
       let spin = CABasicAnimation(keyPath: "transform.rotation.z")
       spin.fromValue = 0.0
       spin.toValue = (2.0 * CGFloat.pi)
-      spin.duration = 1.57
+      spin.duration = 1.1
       spin.repeatCount = .infinity
       spin.timingFunction = CAMediaTimingFunction(name: .linear)
       spin.isRemovedOnCompletion = true
@@ -5876,6 +5944,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private let mediaDurationBadge = UILabel()
   private let mediaProgressOverlayView = UIView()
   private let mediaProgressRingView = BubbleUploadProgressView()
+  // Multi-image bridge sends: tile views for the inline grid (created lazily, max 6).
+  private var mediaGridTileViews: [UIImageView] = []
+  private var mediaGridRowKey: String?
+  private static let bridgeGridImageCache = NSCache<NSString, UIImage>()
+  private static let bridgeGridDecodeQueue = DispatchQueue(
+    label: "chat.media.grid-decode", qos: .userInitiated)
   private let mediaProgressSpinner = UIActivityIndicatorView(style: .medium)
   private let mediaProgressSizeLabel = UILabel()
   private let inlineAttachmentView = UIView()
@@ -7084,6 +7158,15 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
             width: metrics.contentWidth,
             height: metrics.mediaHeight
           ))
+      } else if usesEdgeMediaCaptionLayout(row) {
+        // Edge-to-edge media above the caption: hairline inset on all media sides.
+        mediaFrame = pixelAlignedRect(
+          CGRect(
+            x: bubbleFrame.minX + mediaCaptionEdgeInset,
+            y: bubbleFrame.minY + mediaCaptionEdgeInset,
+            width: bubbleFrame.width - mediaCaptionEdgeInset * 2.0,
+            height: metrics.mediaHeight
+          ))
       } else {
         let mediaTopInset: CGFloat = row.visualKind == .voice ? 2.0 : bubbleTopPadding
         let mediaLeftInset: CGFloat =
@@ -7115,7 +7198,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         messageLabel.frame = pixelAlignedRect(
           CGRect(
             x: bubbleFrame.minX + bubbleHorizontalPadding,
-            y: mediaFrame.maxY + 8.0,
+            y: mediaFrame.maxY + (usesEdgeMediaCaptionLayout(row) ? mediaCaptionTopGap : 8.0),
             width: metrics.messageWidth,
             height: metrics.textHeight
           ))
@@ -7916,6 +7999,103 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     updateInlineVideoAudioIcon()
   }
 
+  /// Multi-image bridge message → populate the tile grid from the sealed blobs and
+  /// hide the single hero image (the grid owns the whole media canvas). Runs after the
+  /// visualKind switch so hiding mediaImageView also skips the hero-image load path.
+  private func configureMediaGrid(for row: ChatListRow) {
+    let count = chatMediaGridImageCount(row)
+    guard count > 1 else {
+      mediaGridRowKey = nil
+      for tile in mediaGridTileViews {
+        tile.isHidden = true
+        tile.image = nil
+      }
+      return
+    }
+
+    let tiles = min(count, chatMediaGridMaxTiles)
+    while mediaGridTileViews.count < tiles {
+      let tile = UIImageView()
+      tile.contentMode = .scaleAspectFill
+      tile.clipsToBounds = true
+      tile.layer.cornerRadius = 4.0
+      tile.layer.cornerCurve = .continuous
+      tile.backgroundColor = UIColor(white: 0.0, alpha: 0.22)
+      mediaContainerView.insertSubview(tile, aboveSubview: mediaImageView)
+      mediaGridTileViews.append(tile)
+    }
+
+    mediaImageView.isHidden = true
+    mediaPrimaryIconView.isHidden = true
+    let rowKey = row.messageId ?? row.key
+    mediaGridRowKey = rowKey
+    for (index, tile) in mediaGridTileViews.enumerated() {
+      tile.isHidden = index >= tiles
+      if index < tiles { tile.image = nil }
+    }
+
+    for (index, blob) in row.agentBridgeAttachmentsEnc.prefix(tiles).enumerated() {
+      let cacheKey = "\(rowKey)#grid-\(index)" as NSString
+      if let cached = ChatListCell.bridgeGridImageCache.object(forKey: cacheKey) {
+        mediaGridTileViews[index].image = cached
+        continue
+      }
+      ChatListCell.bridgeGridDecodeQueue.async { [weak self] in
+        guard let image = ChatListCell.decodeBridgeGridImage(blob: blob) else { return }
+        ChatListCell.bridgeGridImageCache.setObject(image, forKey: cacheKey)
+        DispatchQueue.main.async {
+          guard let self,
+            self.mediaGridRowKey == rowKey,
+            index < self.mediaGridTileViews.count
+          else { return }
+          self.mediaGridTileViews[index].image = image
+        }
+      }
+    }
+  }
+
+  /// Open one sealed arte1 image blob into a tile-sized UIImage. Returns nil when the
+  /// pairing key is missing on this device (tile keeps its placeholder fill).
+  private static func decodeBridgeGridImage(blob: String) -> UIImage? {
+    guard let object = AgentRuntimeCrypto.decrypt(blob) else { return nil }
+    func str(_ any: Any?) -> String? {
+      guard let s = any as? String else { return nil }
+      let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+      return trimmed.isEmpty ? nil : trimmed
+    }
+    if let b64 = str(object["dataB64"]) ?? str(object["data_b64"]) ?? str(object["base64"]),
+      let data = Data(base64Encoded: b64, options: [.ignoreUnknownCharacters]),
+      let image = UIImage(data: data)
+    {
+      return downscaledGridImage(image)
+    }
+    if let uri = str(object["uri"]) ?? str(object["url"]) ?? str(object["path"]) {
+      let path: String
+      if let parsed = URL(string: uri), parsed.isFileURL {
+        path = parsed.path
+      } else {
+        path = uri
+      }
+      if FileManager.default.fileExists(atPath: path),
+        let image = UIImage(contentsOfFile: path)
+      {
+        return downscaledGridImage(image)
+      }
+    }
+    return nil
+  }
+
+  private static func downscaledGridImage(_ image: UIImage) -> UIImage {
+    let maxDimension: CGFloat = 700.0
+    let size = image.size
+    let longest = max(size.width, size.height, 1.0)
+    guard longest > maxDimension else { return image }
+    let scale = maxDimension / longest
+    let target = CGSize(width: size.width * scale, height: size.height * scale)
+    let renderer = UIGraphicsImageRenderer(size: target)
+    return renderer.image { _ in image.draw(in: CGRect(origin: .zero, size: target)) }
+  }
+
   private func updateMediaTransferChrome(for row: ChatListRow) {
     let hasActiveTransfer = row.shouldShowUploadOverlay || mediaIsDownloading
     mediaProgressOverlayView.backgroundColor = .clear
@@ -7924,30 +8104,47 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     mediaProgressSpinner.stopAnimating()
 
     if row.shouldShowUploadOverlay {
+      // Only real byte progress counts — until the first upload callback the ring is an
+      // indeterminate spinner and the badge shows just the total size, never a fake
+      // "already sent" fraction.
+      let realProgress: Double? = {
+        guard let value = row.uploadProgress, value.isFinite, value > 0.004 else { return nil }
+        return max(0.0, min(1.0, value))
+      }()
       mediaProgressRingView.setDownloadState(needsDownload: false, isDownloading: false, progress: nil)
-      mediaProgressRingView.setUploadState(isUploading: true, progress: row.uploadProgress)
-      if let totalBytes = row.fileSize, totalBytes > 0, let progress = row.uploadProgress {
-        let sentBytes = Int64(Double(totalBytes) * max(0.0, min(1.0, progress)))
-        let sentStr = formatMediaByteSize(sentBytes)
+      mediaProgressRingView.setUploadState(isUploading: true, progress: realProgress)
+      if let totalBytes = row.fileSize, totalBytes > 0 {
         let totalStr = formatMediaByteSize(totalBytes)
-        mediaProgressSizeLabel.text = "  \(sentStr) / \(totalStr)  "
+        if let progress = realProgress {
+          let sentBytes = Int64(Double(totalBytes) * progress)
+          mediaProgressSizeLabel.text = "  \(formatMediaByteSize(sentBytes)) / \(totalStr)  "
+        } else {
+          mediaProgressSizeLabel.text = "  \(totalStr)  "
+        }
         mediaProgressSizeLabel.isHidden = false
       } else {
-        mediaProgressSizeLabel.text = "  Processing  "
+        mediaProgressSizeLabel.text = "  Uploading  "
         mediaProgressSizeLabel.isHidden = false
       }
     } else if mediaIsDownloading {
+      let realProgress: Double? = {
+        guard let value = mediaDownloadProgress, value.isFinite, value > 0.004 else { return nil }
+        return max(0.0, min(1.0, value))
+      }()
       mediaProgressRingView.setUploadState(isUploading: false, progress: nil)
       mediaProgressRingView.setDownloadState(
         needsDownload: true,
         isDownloading: true,
-        progress: mediaDownloadProgress
+        progress: realProgress
       )
-      if let totalBytes = row.fileSize, totalBytes > 0, let progress = mediaDownloadProgress {
-        let receivedBytes = Int64(Double(totalBytes) * max(0.0, min(1.0, progress)))
-        let receivedStr = formatMediaByteSize(receivedBytes)
+      if let totalBytes = row.fileSize, totalBytes > 0 {
         let totalStr = formatMediaByteSize(totalBytes)
-        mediaProgressSizeLabel.text = "  \(receivedStr) / \(totalStr)  "
+        if let progress = realProgress {
+          let receivedBytes = Int64(Double(totalBytes) * progress)
+          mediaProgressSizeLabel.text = "  \(formatMediaByteSize(receivedBytes)) / \(totalStr)  "
+        } else {
+          mediaProgressSizeLabel.text = "  \(totalStr)  "
+        }
         mediaProgressSizeLabel.isHidden = false
       } else {
         mediaProgressSizeLabel.text = "  Downloading  "
@@ -8234,6 +8431,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     case .text:
       break
     }
+
+    configureMediaGrid(for: row)
 
     chatCellDebugLog(
       chatCellMediaDebugLogs,
@@ -8583,6 +8782,20 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           ).cgPath
         mediaContainerView.layer.mask = fullBleedMaskLayer
       }
+    } else if usesEdgeMediaCaptionLayout(row) {
+      // Media reads as the bubble's top face: outer top corners follow the bubble's own
+      // radii minus the hairline inset; bottom corners stay tight above the caption.
+      mediaContainerView.layer.cornerRadius = 0.0
+      fullBleedMaskLayer.frame = mediaContainerView.bounds
+      fullBleedMaskLayer.path =
+        bubbleRoundedPath(
+          rect: mediaContainerView.bounds,
+          topLeft: max(4.0, row.shape.borderTopLeftRadius - mediaCaptionEdgeInset),
+          topRight: max(4.0, row.shape.borderTopRightRadius - mediaCaptionEdgeInset),
+          bottomRight: 5.0,
+          bottomLeft: 5.0
+        ).cgPath
+      mediaContainerView.layer.mask = fullBleedMaskLayer
     } else {
       mediaContainerView.layer.cornerRadius = cornerRadius
       mediaContainerView.layer.mask = nil
@@ -8742,6 +8955,18 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       break
     }
 
+    let gridCount = chatMediaGridImageCount(row)
+    if gridCount > 1 {
+      let grid = chatMediaGridLayout(count: gridCount, width: width)
+      for (index, tile) in mediaGridTileViews.enumerated() {
+        tile.frame = index < grid.frames.count ? grid.frames[index] : .zero
+      }
+    } else {
+      for tile in mediaGridTileViews {
+        tile.frame = .zero
+      }
+    }
+
     if !mediaProgressOverlayView.isHidden {
       let isUploading = row.shouldShowUploadOverlay
 
@@ -8756,13 +8981,15 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         mediaProgressRingView.frame = CGRect(x: ringX, y: ringY, width: ringSize, height: ringSize)
         mediaProgressSpinner.center = CGPoint(x: width * 0.5, y: height * 0.5)
 
+        // Size/progress badge sits top-left (like the video duration badge); the
+        // spinner alone owns the center.
         if !mediaProgressSizeLabel.isHidden {
           let labelText = mediaProgressSizeLabel.text ?? ""
           let labelHeight: CGFloat = 20.0
           let labelWidth = measuredTextWidth(labelText, font: mediaProgressSizeLabel.font) + 8.0
           mediaProgressSizeLabel.frame = CGRect(
-             x: floor((width - labelWidth) * 0.5),
-             y: ringY + ringSize + 8.0,
+             x: 8.0,
+             y: 8.0,
              width: labelWidth,
              height: labelHeight
           )

@@ -11,6 +11,8 @@ private let chatGapDebugOverlayEnabled = false
 
 protocol ChatInputBarDelegate: AnyObject {
   func inputBarDidSend(text: String)
+  // Hold-menu Edit: composer submits new text/caption for an already-sent message.
+  func inputBarDidSubmitEdit(messageId: String, text: String)
   func inputBarDidRequestStopStreaming()
   func inputBarDidSendWithAgentMention(text: String, agentText: String)
   func inputBarDidSendWithStandaloneAgentMention(
@@ -839,6 +841,9 @@ final class ChatInputBar: UIView {
     }
   }
   var activeReplyToMessageId: String?
+  // When set, the composer is editing this already-sent message instead of composing a
+  // new one; the banner UI is shared with reply.
+  var activeEditMessageId: String?
 
   // Mention suggestion banner (inside pill, above text row — like reply banner)
   private let mentionBanner = UIView()
@@ -894,9 +899,21 @@ final class ChatInputBar: UIView {
     }
   }
 
+  /// Enter edit mode for an already-sent message: shared banner UI with reply, the
+  /// composer prefilled with the current text so the user tweaks and re-sends.
+  func showEditBanner(messageId: String, text: String) {
+    showReplyBanner(messageId: messageId, text: text.isEmpty ? "Add a description" : text, isMe: true)
+    activeReplyToMessageId = nil
+    activeEditMessageId = messageId
+    replySenderLabel.text = "Edit message"
+    textView.text = text
+    textViewDidChange(textView)
+  }
+
   func showReplyBanner(messageId: String, text: String, isMe: Bool) {
     replyBanner.layer.removeAllAnimations()
     restorePillGlassVisualState()
+    activeEditMessageId = nil
     activeReplyToMessageId = messageId
     replySenderLabel.text = isMe ? "You" : "Reply"
     replyPreviewLabel.text = text
@@ -928,9 +945,11 @@ final class ChatInputBar: UIView {
   }
 
   func dismissReplyBanner(animated: Bool) {
-    guard activeReplyToMessageId != nil || replyBannerVisible else { return }
+    guard activeReplyToMessageId != nil || activeEditMessageId != nil || replyBannerVisible
+    else { return }
     replyBanner.layer.removeAllAnimations()
     activeReplyToMessageId = nil
+    activeEditMessageId = nil
     replyBannerVisible = false
     replyBannerAnimatingOut = false
 
@@ -997,7 +1016,10 @@ final class ChatInputBar: UIView {
   }
 
   @objc private func replyDismissTapped() {
+    // Canceling an edit also discards the old message text sitting in the composer.
+    let wasEditing = activeEditMessageId != nil
     dismissReplyBanner(animated: true)
+    if wasEditing { clearText() }
     delegate?.inputBarReplyDismissed()
   }
 
@@ -2686,6 +2708,14 @@ final class ChatInputBar: UIView {
 
     let t = currentText
     guard !t.isEmpty else { return }
+
+    if let editId = activeEditMessageId {
+      setMentionBannerVisible(false, animated: false)
+      delegate?.inputBarDidSubmitEdit(messageId: editId, text: t)
+      clearText()
+      dismissReplyBanner(animated: true)
+      return
+    }
 
     switch resolveMentionIntent(in: t) {
     case .builder:

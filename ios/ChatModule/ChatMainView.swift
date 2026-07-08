@@ -4223,9 +4223,9 @@ public final class ChatMainView: UIView,
           case "11111111-1111-1111-1111-111111111111": "claude"
           case "22222222-2222-2222-2222-222222222222": "codex"
           default: nil
-          }
+        }
         if let provider,
-          let model = AgentBridgeSelectionStore.selectedModel(provider: provider),
+          let model = AgentBridgeSelectionStore.selectedRunOptions(provider: provider).model,
           let title = AgentBridgeSelectionStore.modelChoices(provider: provider)
             .first(where: { $0.value == model })?.title
         {

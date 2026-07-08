@@ -649,6 +649,7 @@ const MAX_PROGRESS_FRAME_LOG = 400;
 let socketDownSince = null;
 const historyWatchSpecs = new Map(); // chatId -> { provider, sessionId, echo } (survives reconnect)
 const modelBySession = new Map(); // provider:chatId -> model selected from mobile
+const advisorBySession = new Map(); // provider:chatId -> advisor selected from mobile
 const lastRuntimeBySession = new Map(); // provider:chatId -> last completed runtime payload
 const capabilitiesByProvider = new Map(); // provider -> latest tools/slash/MCP metadata
 
@@ -658,6 +659,7 @@ const BRIDGE_COMMANDS = [
   "/usage",
   "/skills",
   "/model [name|default]",
+  "/advisor [fable|opus|off]",
   "/compact",
   "/status",
   "/doctor",
@@ -705,6 +707,7 @@ const CLAUDE_SLASH_INFO = [
   { name: "status", desc: "Account, model, and remaining usage", kind: "bridge" },
   { name: "doctor", desc: "Diagnose the Claude Code install", kind: "bridge" },
   { name: "model", desc: "Show or switch the model", kind: "bridge" },
+  { name: "advisor", desc: "Show or switch the advisor model", kind: "bridge" },
   { name: "plan", desc: "Plan mode: research & propose, don't edit", kind: "option" },
   { name: "help", desc: "List bridge, slash, and CLI commands", kind: "bridge" },
 ];
@@ -949,6 +952,7 @@ function normalizeModel(provider, value) {
   if (!raw) return null;
   const normalized = raw.toLowerCase().replace(/_/g, "-");
   if (provider === "claude") {
+    if (normalized.includes("fable")) return "fable";
     if (normalized.includes("haiku")) return "haiku";
     if (normalized.includes("sonnet")) return "sonnet";
     if (normalized.includes("opus")) return "opus";
@@ -961,6 +965,18 @@ function normalizeModel(provider, value) {
   return raw;
 }
 
+function normalizeAdvisor(provider, value) {
+  if (provider !== "claude") return null;
+  const raw = value == null ? "" : String(value).trim();
+  if (!raw) return null;
+  const normalized = raw.toLowerCase().replace(/_/g, "-");
+  if (["off", "none", "no", "false", "0", "default", "reset"].includes(normalized)) return null;
+  if (normalized.includes("fable")) return "fable";
+  if (normalized.includes("opus")) return "opus";
+  if (normalized.includes("sonnet")) return "sonnet";
+  return raw;
+}
+
 function modelFor(provider, chatId, task) {
   const requested = task && (task.model || task.agentModel || task.agentBridgeModel);
   if (requested && String(requested).trim()) return normalizeModel(provider, requested);
@@ -968,6 +984,16 @@ function modelFor(provider, chatId, task) {
   if (stored && String(stored).trim()) return normalizeModel(provider, stored);
   const envModel = provider === "claude" ? process.env.VIBE_CLAUDE_MODEL : process.env.VIBE_CODEX_MODEL;
   return envModel && String(envModel).trim() ? normalizeModel(provider, envModel) : null;
+}
+
+function advisorFor(provider, chatId, task) {
+  if (provider !== "claude") return null;
+  const requested = task && (task.advisor || task.agentAdvisor || task.agentBridgeAdvisor);
+  if (requested != null && String(requested).trim()) return normalizeAdvisor(provider, requested);
+  const stored = advisorBySession.get(sessionKey(provider, chatId));
+  if (stored != null && String(stored).trim()) return normalizeAdvisor(provider, stored);
+  const envAdvisor = process.env.VIBE_CLAUDE_ADVISOR || process.env.VIBE_CLAUDE_ADVISOR_MODEL;
+  return envAdvisor && String(envAdvisor).trim() ? normalizeAdvisor(provider, envAdvisor) : null;
 }
 
 function intelligenceFor(task) {
@@ -1031,6 +1057,7 @@ function reasoningEffortFor(provider, task) {
 function buildCommand(provider, prompt, chatId, task) {
   const cleaned = stripReservedMention(prompt, provider);
   const model = modelFor(provider, chatId, task);
+  const advisor = advisorFor(provider, chatId, task);
   if (provider === "claude") {
     const mode = claudePermissionMode(task);
     const effort = reasoningEffortFor(provider, task);
@@ -1061,6 +1088,7 @@ function buildCommand(provider, prompt, chatId, task) {
     if (resumeId) args.push("--resume", resumeId);
     args.push("--verbose");
     if (model) args.push("--model", model);
+    if (advisor) args.push("--advisor", advisor);
     args.push("--", cleaned);
     return { cmd: process.env.VIBE_CLAUDE_COMMAND || "claude", args };
   }
@@ -1514,6 +1542,7 @@ function providerMetadataFromOutput(provider, output, task, chatId) {
     const assistantEvents = events.filter((event) => event && event.message && event.message.usage);
     const assistant = assistantEvents[assistantEvents.length - 1] || null;
     metadata.model = (result && result.model) || (init && init.model) || modelFor(provider, chatId, task);
+    metadata.advisor = advisorFor(provider, chatId, task);
     metadata.permissionMode = init && init.permissionMode;
     metadata.sessionId = (result && result.session_id) || (init && init.session_id);
     metadata.cliVersion = init && init.claude_code_version;
@@ -1546,7 +1575,17 @@ function providerMetadataFromOutput(provider, output, task, chatId) {
 }
 
 // Bridge-intercepted slash commands answered locally (real data, no agent turn).
-const BRIDGE_INTERCEPT_COMMANDS = ["commands", "help", "usage", "skills", "model", "compact", "status", "doctor"];
+const BRIDGE_INTERCEPT_COMMANDS = [
+  "commands",
+  "help",
+  "usage",
+  "skills",
+  "model",
+  "advisor",
+  "compact",
+  "status",
+  "doctor",
+];
 
 function parseBridgeCommand(prompt, provider) {
   const text = String(prompt || "").trim();
@@ -1792,6 +1831,7 @@ function formatClaudeUtilization(util) {
 async function bridgeCommandOutput(provider, chatId, task, repo, command) {
   const key = sessionKey(provider, chatId);
   const currentModel = modelFor(provider, chatId, task);
+  const currentAdvisor = advisorFor(provider, chatId, task);
   const lastRuntime = lastRuntimeBySession.get(key);
   const providerTitle = provider === "claude" ? "Claude" : provider === "codex" ? "Codex" : provider;
   if (command.desktopOnly) {
@@ -1824,6 +1864,7 @@ async function bridgeCommandOutput(provider, chatId, task, repo, command) {
       lines.push("This chat (last run):");
       lines.push(formatUsage(lastRuntime));
       lines.push(currentModel ? `Model: ${currentModel}` : "Model: provider default");
+      if (provider === "claude") lines.push(`Advisor: ${currentAdvisor || "off"}`);
       return lines.join("\n");
     }
     case "model": {
@@ -1836,6 +1877,22 @@ async function bridgeCommandOutput(provider, chatId, task, repo, command) {
       const normalizedModel = normalizeModel(provider, next);
       modelBySession.set(key, normalizedModel);
       return `${provider} model set to ${normalizedModel} for this chat.`;
+    }
+    case "advisor": {
+      if (provider !== "claude") return "Advisor mode is only available for Claude.";
+      const next = command.args.trim();
+      if (!next) return `Current Claude advisor: ${currentAdvisor || "off"}`;
+      if (["default", "reset", "off", "none", "disable", "disabled"].includes(next.toLowerCase())) {
+        advisorBySession.delete(key);
+        return "Claude advisor disabled for this chat.";
+      }
+      const normalizedAdvisor = normalizeAdvisor(provider, next);
+      if (!normalizedAdvisor) {
+        advisorBySession.delete(key);
+        return "Claude advisor disabled for this chat.";
+      }
+      advisorBySession.set(key, normalizedAdvisor);
+      return `Claude advisor set to ${normalizedAdvisor} for this chat.`;
     }
     case "compact": {
       if (provider === "codex") {
@@ -1880,6 +1937,7 @@ async function bridgeCommandOutput(provider, chatId, task, repo, command) {
         if (util) lines.push(util);
       }
       lines.push(`model: ${currentModel || "provider default"}`);
+      if (provider === "claude") lines.push(`advisor: ${currentAdvisor || "off"}`);
       lines.push(`usage (last run): ${formatUsage(lastRuntime)}`);
       lines.push(`repo: ${repo.name} · mode: ${workModeFor(task)}`);
       return lines.join("\n");
@@ -1909,6 +1967,7 @@ async function runBridgeCommand(channel, task, repo, beforeGit, command) {
     cwd: repo.cwd || repo.path,
     workMode: workModeFor(task),
     model: modelFor(provider, chatId, task) || null,
+    advisor: advisorFor(provider, chatId, task) || null,
     stage: "bridge_command",
     command: command.raw,
     line: JSON.stringify({
@@ -1916,6 +1975,8 @@ async function runBridgeCommand(channel, task, repo, beforeGit, command) {
       provider,
       taskId,
       command: command.raw,
+      model: modelFor(provider, chatId, task) || null,
+      advisor: advisorFor(provider, chatId, task) || null,
     }),
   });
 
@@ -2063,7 +2124,9 @@ function runtimePayload({
   };
 
   const resolvedPayloadModel = metadata.model || modelFor(provider, task && task.chatId, task);
+  const resolvedPayloadAdvisor = metadata.advisor || advisorFor(provider, task && task.chatId, task);
   if (resolvedPayloadModel) payload.model = resolvedPayloadModel;
+  if (resolvedPayloadAdvisor) payload.advisor = resolvedPayloadAdvisor;
   if (metadata.permissionMode) payload.permissionMode = metadata.permissionMode;
   if (metadata.sessionId) payload.sessionId = metadata.sessionId;
   if (metadata.threadId) payload.threadId = metadata.threadId;
@@ -2179,6 +2242,8 @@ function bridgeStatusPayload() {
       claude: {
         permissionMode: process.env.VIBE_CLAUDE_PERMISSION_MODE || "per-task",
         command: process.env.VIBE_CLAUDE_COMMAND || "claude",
+        model: process.env.VIBE_CLAUDE_MODEL || "settings/default",
+        advisor: process.env.VIBE_CLAUDE_ADVISOR || process.env.VIBE_CLAUDE_ADVISOR_MODEL || "settings/default",
 	      },
 	      codex: {
 	        sandbox: process.env.VIBE_CODEX_SANDBOX || "per-task",
@@ -2205,6 +2270,7 @@ function runningTaskSummaries() {
     cwd: entry.cwd,
     workMode: entry.workMode,
     model: entry.model || null,
+    advisor: entry.advisor || null,
     intelligence: entry.intelligence || null,
     speed: entry.speed || null,
     reasoningEffort: entry.reasoningEffort || null,
@@ -2396,6 +2462,9 @@ function installService(server, config) {
   fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
 
   const args = [process.execPath, __filename, "--server", server, "--service-run"];
+  const claudeModel = process.env.VIBE_CLAUDE_MODEL || "sonnet";
+  const claudeAdvisor =
+    process.env.VIBE_CLAUDE_ADVISOR || process.env.VIBE_CLAUDE_ADVISOR_MODEL || "fable";
   const xml =
     '<?xml version="1.0" encoding="UTF-8"?>\n' +
     '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n' +
@@ -2415,6 +2484,8 @@ function installService(server, config) {
     `    <key>PATH</key><string>${escapeXml(
       process.env.PATH || "/usr/local/bin:/usr/bin:/bin"
     )}</string>\n` +
+    `    <key>VIBE_CLAUDE_MODEL</key><string>${escapeXml(claudeModel)}</string>\n` +
+    `    <key>VIBE_CLAUDE_ADVISOR</key><string>${escapeXml(claudeAdvisor)}</string>\n` +
     "  </dict>\n" +
     "</dict>\n</plist>\n";
 
@@ -2652,6 +2723,7 @@ async function runTask(channel, task) {
     cwd,
     workMode: workModeFor(task),
     model: modelFor(provider, chatId, task),
+    advisor: advisorFor(provider, chatId, task),
     intelligence: intelligenceFor(task),
     speed: speedFor(task),
     reasoningEffort: reasoningEffortFor(provider, task),
@@ -2681,6 +2753,7 @@ async function runTask(channel, task) {
     cwd,
     workMode: workModeFor(task),
     model: modelFor(provider, chatId, task) || null,
+    advisor: advisorFor(provider, chatId, task) || null,
     intelligence: intelligenceFor(task),
     speed: speedFor(task),
     reasoningEffort: reasoningEffortFor(provider, task),
@@ -2702,6 +2775,8 @@ async function runTask(channel, task) {
       repoName: repo.name,
       cwd,
       workMode: workModeFor(task),
+      model: modelFor(provider, chatId, task) || null,
+      advisor: advisorFor(provider, chatId, task) || null,
       intelligence: intelligenceFor(task),
       speed: speedFor(task),
       reasoningEffort: reasoningEffortFor(provider, task),
@@ -2743,6 +2818,7 @@ async function runTask(channel, task) {
       cwd,
       workMode: workModeFor(task),
       model: modelFor(provider, chatId, task) || null,
+      advisor: advisorFor(provider, chatId, task) || null,
       line: JSON.stringify({ type: "vibe_thinking", tokens, active: thinkingState.active }),
     });
   };
@@ -2832,6 +2908,7 @@ async function runTask(channel, task) {
           cwd,
           workMode: workModeFor(task),
           model: modelFor(provider, chatId, task) || null,
+          advisor: advisorFor(provider, chatId, task) || null,
           line,
         });
       }
@@ -2859,6 +2936,7 @@ async function runTask(channel, task) {
       cwd,
       workMode: workModeFor(task),
       model: modelFor(provider, chatId, task) || null,
+      advisor: advisorFor(provider, chatId, task) || null,
       stage: "keepalive",
       sentAtMs: Date.now(),
       line: JSON.stringify({ type: "vibe_bridge_keepalive", provider, taskId, elapsedMs: idleMs }),
@@ -5087,7 +5165,13 @@ function handleFileRequest(channel, payload) {
 // this chat's last-run token/cost. Never throws; missing pieces are just omitted.
 async function buildUsageReport(provider, chatId, task) {
   const currentModel = modelFor(provider, chatId, task);
-  const report = { provider, model: currentModel || null, buckets: [], chat: null };
+  const report = {
+    provider,
+    model: currentModel || null,
+    advisor: advisorFor(provider, chatId, task) || null,
+    buckets: [],
+    chat: null,
+  };
   if (provider === "claude") {
     const util = await fetchClaudeUtilization();
     if (util && typeof util === "object") {
@@ -6526,7 +6610,8 @@ async function main() {
         "Non-interactive repo selection: --cwd <dir>, --repo <dir> (repeatable),\n" +
 	        "     --repo-root <dir> (scans 2 levels for .git). Env: VIBE_BRIDGE_REPOS,\n" +
 	        "     VIBE_BRIDGE_REPO_ROOTS, VIBE_CLAUDE_PERMISSION_MODE, VIBE_CODEX_SANDBOX,\n" +
-	        "     VIBE_CODEX_APPROVAL_POLICY, VIBE_CLAUDE_MODEL, VIBE_CODEX_MODEL,\n" +
+	        "     VIBE_CODEX_APPROVAL_POLICY, VIBE_CLAUDE_MODEL, VIBE_CLAUDE_ADVISOR,\n" +
+	        "     VIBE_CLAUDE_ADVISOR_MODEL, VIBE_CODEX_MODEL,\n" +
 	        "     VIBE_CLAUDE_COMMAND, VIBE_CODEX_COMMAND"
 	  );
     return;

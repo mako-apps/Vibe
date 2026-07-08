@@ -1096,11 +1096,20 @@ defmodule VibeWeb.ChatChannel do
       "model",
       metadata["agentBridgeModel"] || metadata["agent_bridge_model"] || data["agentBridgeModel"]
     )
+    |> put_optional_string(
+      "advisor",
+      metadata["agentBridgeAdvisor"] || metadata["agent_bridge_advisor"] ||
+        data["agentBridgeAdvisor"]
+    )
     # Per-provider model map for group fan-outs (one message → Claude AND Codex, each
     # with its own model choice). Resolved to "model" per worker at dispatch time.
     |> put_provider_models(
       metadata["agentBridgeModels"] || metadata["agent_bridge_models"] ||
         data["agentBridgeModels"]
+    )
+    |> put_provider_advisors(
+      metadata["agentBridgeAdvisors"] || metadata["agent_bridge_advisors"] ||
+        data["agentBridgeAdvisors"]
     )
     |> put_optional_string(
       "intelligence",
@@ -1192,13 +1201,42 @@ defmodule VibeWeb.ChatChannel do
 
   defp put_provider_models(map, _models), do: map
 
+  # %{"claude" => "fable"} — per-provider advisor choices for group fan-outs.
+  # Kept under an internal "advisors" key and collapsed before the bridge sees it.
+  defp put_provider_advisors(map, advisors) when is_map(advisors) do
+    cleaned =
+      advisors
+      |> Enum.flat_map(fn {provider, advisor} ->
+        with true <- is_binary(provider),
+             advisor when is_binary(advisor) <- advisor,
+             trimmed when trimmed != "" <- String.trim(advisor) do
+          [{String.downcase(provider), trimmed}]
+        else
+          _ -> []
+        end
+      end)
+      |> Map.new()
+
+    if map_size(cleaned) > 0, do: Map.put(map, "advisors", cleaned), else: map
+  end
+
+  defp put_provider_advisors(map, _advisors), do: map
+
   # Collapse the per-provider "models" map onto this worker's "model" (the per-provider
-  # choice wins over a generic one) and drop the map so it never reaches the bridge.
+  # choice wins over a generic one) and do the same for advisor choices.
   defp resolve_provider_model(bridge_metadata, provider) do
     {models, rest} = Map.pop(bridge_metadata, "models")
+    {advisors, rest} = Map.pop(rest, "advisors")
+    provider_key = String.downcase(to_string(provider))
 
-    case is_map(models) && models[String.downcase(to_string(provider))] do
-      model when is_binary(model) and model != "" -> Map.put(rest, "model", model)
+    rest =
+      case is_map(models) && models[provider_key] do
+        model when is_binary(model) and model != "" -> Map.put(rest, "model", model)
+        _ -> rest
+      end
+
+    case is_map(advisors) && advisors[provider_key] do
+      advisor when is_binary(advisor) and advisor != "" -> Map.put(rest, "advisor", advisor)
       _ -> rest
     end
   end

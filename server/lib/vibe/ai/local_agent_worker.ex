@@ -1129,6 +1129,7 @@ defmodule Vibe.AI.LocalAgentWorker do
           |> maybe_put("cwd", metadata["cwd"] || metadata[:cwd])
           |> maybe_put("workMode", metadata["workMode"] || metadata[:work_mode])
           |> maybe_put("model", metadata["model"] || metadata[:model])
+          |> maybe_put("advisor", metadata["advisor"] || metadata[:advisor])
           |> maybe_put(
             "bridgeSentAtMs",
             metadata["bridgeSentAtMs"] || metadata["bridge_sent_at_ms"] ||
@@ -1274,14 +1275,22 @@ defmodule Vibe.AI.LocalAgentWorker do
     })
   end
 
-  # Collapse a per-provider "models" map (group fan-out metadata) onto this worker's
-  # "model" and drop the map so it never reaches the bridge. Mirrors
+  # Collapse per-provider "models"/"advisors" maps (group fan-out metadata) onto
+  # this worker's single options and drop the maps so they never reach the bridge. Mirrors
   # VibeWeb.ChatChannel.resolve_provider_model/2 for the chained team dispatch path.
   defp resolve_provider_model(bridge_metadata, provider) do
     {models, rest} = Map.pop(bridge_metadata, "models")
+    {advisors, rest} = Map.pop(rest, "advisors")
+    provider_key = String.downcase(to_string(provider))
 
-    case is_map(models) && models[String.downcase(to_string(provider))] do
-      model when is_binary(model) and model != "" -> Map.put(rest, "model", model)
+    rest =
+      case is_map(models) && models[provider_key] do
+        model when is_binary(model) and model != "" -> Map.put(rest, "model", model)
+        _ -> rest
+      end
+
+    case is_map(advisors) && advisors[provider_key] do
+      advisor when is_binary(advisor) and advisor != "" -> Map.put(rest, "advisor", advisor)
       _ -> rest
     end
   end
@@ -1373,6 +1382,7 @@ defmodule Vibe.AI.LocalAgentWorker do
         claude_session_args(bridge_options) ++
         maybe_claude_verbose_args(output_format) ++
         maybe_model_args(bridge_options, "VIBE_CLAUDE_MODEL", "--model") ++
+        maybe_advisor_args(bridge_options) ++
         maybe_single_arg("VIBE_CLAUDE_MCP_CONFIG", "--mcp-config") ++
         maybe_single_arg("VIBE_CLAUDE_ALLOWED_TOOLS", "--allowedTools") ++
         maybe_single_arg("VIBE_CLAUDE_DISALLOWED_TOOLS", "--disallowedTools") ++ ["--", prompt]
@@ -1675,6 +1685,15 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
+  defp maybe_advisor_args(options) do
+    case normalize_string(option_value(options, "advisor")) ||
+           normalize_string(System.get_env("VIBE_CLAUDE_ADVISOR")) ||
+           normalize_string(System.get_env("VIBE_CLAUDE_ADVISOR_MODEL")) do
+      nil -> []
+      advisor -> ["--advisor", advisor]
+    end
+  end
+
   defp claude_effort_args(options) do
     case normalize_reasoning_effort(option_value(options, "reasoningEffort"), :claude) do
       nil -> []
@@ -1727,6 +1746,7 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   defp camelize_key("reasoningEffort"), do: "agentBridgeReasoningEffort"
   defp camelize_key("model"), do: "agentBridgeModel"
+  defp camelize_key("advisor"), do: "agentBridgeAdvisor"
   defp camelize_key("resumeSessionId"), do: "agentBridgeResumeSessionId"
   defp camelize_key("sessionId"), do: "agentBridgeSessionId"
   defp camelize_key(key), do: key

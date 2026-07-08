@@ -1893,6 +1893,17 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     return nil
   }
 
+  private var latestRuntimeAdvisor: String? {
+    for message in messages.reversed() {
+      if let advisor = message.runtime?.advisor?.trimmingCharacters(in: .whitespacesAndNewlines),
+        !advisor.isEmpty
+      {
+        return advisor
+      }
+    }
+    return nil
+  }
+
   /// Refresh the header's model title + run-options menu and the device subline.
   /// The current "what's happening now" line for the header subtitle while a turn is live:
   /// the latest running progress step ("Reading …", "bash …") or the thinking token count.
@@ -1999,9 +2010,9 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   private func updateWorkspace() {
     guard isViewLoaded else { return }
     let provider = agentBridgeProvider ?? "codex"
-    let selected = AgentBridgeSelectionStore.selectedModel(provider: provider)
+    let options = AgentBridgeSelectionStore.selectedRunOptions(provider: provider)
     let modelTitle = AgentBridgeSelectionStore.modelTitle(
-      provider: provider, model: selected ?? runModel ?? latestRuntimeModel)
+      provider: provider, model: options.model ?? runModel ?? latestRuntimeModel)
     let device = (deviceLabel?.isEmpty == false) ? deviceLabel : AgentPairingService.lastDeviceLabel
     let connected = (deviceLabel != nil) ? deviceConnected : AgentPairingService.lastConnected
     workspaceView.configure(
@@ -2055,13 +2066,32 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
         self?.updateHeaderTexts()
       }
     }
+    let advisorActions = AgentBridgeSelectionStore.advisorChoices(provider: provider).map { choice in
+      UIAction(
+        title: choice.title,
+        subtitle: choice.subtitle,
+        state: choice.value == options.advisor ? .on : .off
+      ) { [weak self] _ in
+        AgentBridgeSelectionStore.setAdvisor(provider: provider, advisor: choice.value ?? "off")
+        self?.updateHeaderTexts()
+      }
+    }
     let currentTitle = AgentBridgeSelectionStore.modelTitle(
       provider: provider, model: options.model ?? runModel ?? latestRuntimeModel)
-    return UIMenu(children: [
+    var children: [UIMenuElement] = [
       UIMenu(title: "Model", subtitle: currentTitle, children: [defaultAction] + modelActions),
       UIMenu(title: "Thinking", subtitle: options.intelligence.title, children: intelligenceActions),
       UIMenu(title: "Speed", subtitle: options.speed.title, children: speedActions),
-    ])
+    ]
+    if provider.lowercased() == "claude" {
+      let advisorTitle = AgentBridgeSelectionStore.advisorTitle(
+        provider: provider, advisor: options.advisor ?? latestRuntimeAdvisor)
+      children.insert(
+        UIMenu(title: "Advisor", subtitle: advisorTitle, children: advisorActions),
+        at: 1
+      )
+    }
+    return UIMenu(children: children)
   }
 
   private func refreshModelMenu() {
@@ -3196,27 +3226,31 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       ?? AgentBridgeSelectionStore.selectedRepository()?.name
       ?? "No repository selected"
     let cwd = runtime?.cwd ?? AgentBridgeSelectionStore.selectedRepository()?.path ?? "-"
-    let model = runtime?.model
-      ?? AgentBridgeSelectionStore.selectedModel(provider: provider)
-      ?? "Provider default"
+    let options = AgentBridgeSelectionStore.selectedRunOptions(provider: provider)
+    let model = runtime?.model ?? options.model ?? "Provider default"
+    let advisor = runtime?.advisor ?? options.advisor
     let mode = runtime?.workMode ?? AgentBridgeSelectionStore.selectedWorkMode().rawValue
     let status = runtime?.status ?? (messages.contains { $0.isStreaming } ? "running" : "idle")
     let device = deviceLabel?.trimmingCharacters(in: .whitespacesAndNewlines)
-    return [
+    var lines = [
       "\(provider.isEmpty ? agentDisplayName : provider) bridge status: \(status)",
       "repo: \(repo)",
       "cwd: \(cwd)",
       "work mode: \(mode)",
       "model: \(model)",
-      "device: \(device?.isEmpty == false ? device! : "not reported")",
-      "connection: \(deviceConnected ? "connected" : "reconnecting")",
-    ].joined(separator: "\n")
+    ]
+    if provider.lowercased() == "claude" {
+      lines.append("advisor: \(advisor ?? "off")")
+    }
+    lines.append("device: \(device?.isEmpty == false ? device! : "not reported")")
+    lines.append("connection: \(deviceConnected ? "connected" : "reconnecting")")
+    return lines.joined(separator: "\n")
   }
 
   private func commandsCommandBody() -> String {
     let runtime = latestRuntimeSummary()
     var sections: [String] = []
-    let bridgeCommands = ["/usage", "/status", "/commands", "/skills", "/reasoning", "/plan", "/compact"]
+    let bridgeCommands = ["/usage", "/status", "/commands", "/skills", "/model", "/advisor", "/reasoning", "/plan", "/compact"]
     sections.append("Vibe controls\n" + bridgeCommands.joined(separator: "  "))
     if let runtime {
       let providerSlash = runtime.slashCommands.map { $0.hasPrefix("/") ? $0 : "/\($0)" }

@@ -7349,13 +7349,21 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       // default). Model choices ARE per-provider — ship them as a map the server
       // resolves per worker at dispatch (see chat_channel.ex resolve_provider_model).
       var models: [String: String] = [:]
+      var advisors: [String: String] = [:]
       for agentProvider in ["claude", "codex"] {
-        if let model = AgentBridgeSelectionStore.selectedModel(provider: agentProvider) {
+        let options = AgentBridgeSelectionStore.selectedRunOptions(provider: agentProvider)
+        if let model = options.model {
           models[agentProvider] = model
+        }
+        if let advisor = options.advisor {
+          advisors[agentProvider] = advisor
         }
       }
       if !models.isEmpty {
         metadata["agentBridgeModels"] = models
+      }
+      if !advisors.isEmpty {
+        metadata["agentBridgeAdvisors"] = advisors
       }
       return metadata
     }
@@ -8713,7 +8721,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       self?.bridgeAskSessionScope(ids) ?? (owns: false, hasIdentity: false)
     }
     vc.isHistoryPicked = !initialMessages.isEmpty
-    vc.runModel = AgentBridgeSelectionStore.selectedModel(provider: provider)
+    vc.runModel = AgentBridgeSelectionStore.selectedRunOptions(provider: provider).model
     vc.deviceLabel = AgentPairingService.lastDeviceLabel
     vc.deviceConnected = AgentPairingService.lastConnected
     // Seed the header avatar identity so it renders the SAME avatar as the main chat
@@ -10430,6 +10438,27 @@ extension ChatListView: ChatInputBarDelegate {
 
   func inputBarDidSend(text: String) {
     handleNativeSend(text: text)
+  }
+
+  func inputBarDidSubmitEdit(messageId: String, text: String) {
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !chatId.isEmpty else {
+      NSLog("[ChatListView] editMessage skipped — no engineChatId (mid=%@)", messageId)
+      return
+    }
+    let result = ChatEngine.shared.editMessage([
+      "chatId": chatId,
+      "messageId": messageId,
+      "text": text,
+    ])
+    let accepted = (result["accepted"] as? Bool) ?? false
+    if !accepted {
+      NSLog(
+        "[ChatListView] editMessage rejected mid=%@ reason=%@",
+        messageId,
+        (result["reason"] as? String) ?? "-"
+      )
+    }
   }
 
 	  func inputBarDidRequestStopStreaming() {

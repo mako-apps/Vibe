@@ -14,6 +14,7 @@ struct VibeAgentToolsSheet: View {
   var onDismiss: (() -> Void)?
 
   @State private var selectedModel: String?
+  @State private var selectedAdvisor: String?
   @State private var selectedIntelligence: AgentBridgeIntelligenceLevel = .medium
   @State private var selectedWorkMode: AgentBridgeWorkMode = .askAuto
 
@@ -40,6 +41,7 @@ struct VibeAgentToolsSheet: View {
 
     let opts = AgentBridgeSelectionStore.selectedRunOptions(provider: provider)
     _selectedModel = State(initialValue: opts.model)
+    _selectedAdvisor = State(initialValue: opts.advisor)
     _selectedIntelligence = State(initialValue: opts.intelligence)
     _selectedWorkMode = State(initialValue: AgentBridgeSelectionStore.selectedWorkMode())
   }
@@ -118,6 +120,19 @@ struct VibeAgentToolsSheet: View {
             )
           }
           .listRowBackground(rowFill)
+
+          if provider.lowercased() == "claude" {
+            NavigationLink {
+              advisorPage
+            } label: {
+              settingRowLabel(
+                title: "Advisor",
+                systemImage: "person.crop.circle.badge.checkmark",
+                value: AgentBridgeSelectionStore.advisorTitle(provider: provider, advisor: selectedAdvisor)
+              )
+            }
+            .listRowBackground(rowFill)
+          }
 
           NavigationLink {
             thinkingPage
@@ -252,6 +267,27 @@ struct VibeAgentToolsSheet: View {
     .scrollContentBackground(.hidden)
     .background(Color.clear)
     .navigationTitle("Thinking")
+    .navigationBarTitleDisplayMode(.inline)
+  }
+
+  private var advisorPage: some View {
+    List {
+      Section {
+        ForEach(AgentBridgeSelectionStore.advisorChoices(provider: provider), id: \.title) { choice in
+          selectRow(title: choice.title, isSelected: selectedAdvisor == choice.value) {
+            AgentBridgeSelectionStore.setAdvisor(
+              provider: provider,
+              advisor: choice.value ?? "off"
+            )
+            selectedAdvisor = choice.value
+          }
+        }
+      }
+    }
+    .listStyle(.insetGrouped)
+    .scrollContentBackground(.hidden)
+    .background(Color.clear)
+    .navigationTitle("Advisor")
     .navigationBarTitleDisplayMode(.inline)
   }
 

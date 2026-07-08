@@ -504,6 +504,16 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
       && !row.isStreamingText
       && (row.agentActionSourceId?.isEmpty == false)
       && (row.agentRegeneratePrompt?.isEmpty == false)
+    // Own sent bubbles: text edits its content, media edits (or later adds) the
+    // caption. Voice/sticker have no editable text and uploads aren't settled yet.
+    let showEditAction =
+      row.isMe
+      && !row.isAgentMessage
+      && row.messageType != "typing"
+      && row.visualKind != .voice
+      && row.visualKind != .sticker
+      && !row.shouldShowUploadOverlay
+      && row.status?.lowercased() != "error"
 
     holdDebugLog(
       "openContextMenu begin mid=\(messageId) cellTransform=\(NSCoder.string(for: cell.transform)) contentTransform=\(NSCoder.string(for: cell.contentView.transform))"
@@ -537,7 +547,8 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
       bubbleIsMe: isMe,
       appearance: self.resolvedAppearance(),
       showResendAction: showResendAction,
-      showRegenerateAction: showRegenerateAction
+      showRegenerateAction: showRegenerateAction,
+      showEditAction: showEditAction
     )
     overlay.delegate = self
 
@@ -733,6 +744,8 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
     if let row = rows.first(where: { $0.messageId == mid }) {
       if actionId == "reply" {
         inputBar?.showReplyBanner(messageId: mid, text: row.text, isMe: row.isMe)
+      } else if actionId == "edit" {
+        inputBar?.showEditBanner(messageId: mid, text: row.text)
       } else if actionId == "copy" {
         UIPasteboard.general.string = row.plainContent ?? row.text
       } else if actionId == "resend" {

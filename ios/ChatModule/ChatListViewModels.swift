@@ -149,6 +149,7 @@ struct ChatListRow {
     let cwd: String?
     let workMode: String?
     let model: String?
+    let advisor: String?
     let permissionMode: String?
     let sessionId: String?
     let threadId: String?
@@ -1460,6 +1461,7 @@ func parseAgentRuntimeSummary(_ raw: Any?) -> ChatListRow.AgentRuntimeSummary? {
     cwd: parseNonEmptyString(object["cwd"]),
     workMode: parseNonEmptyString(object["workMode"] ?? object["work_mode"]),
     model: parseNonEmptyString(object["model"]),
+    advisor: parseNonEmptyString(object["advisor"] ?? object["advisorModel"] ?? object["advisor_model"]),
     permissionMode: parseNonEmptyString(object["permissionMode"] ?? object["permission_mode"]),
     sessionId: parseNonEmptyString(object["sessionId"] ?? object["session_id"]),
     threadId: parseNonEmptyString(object["threadId"] ?? object["thread_id"]),

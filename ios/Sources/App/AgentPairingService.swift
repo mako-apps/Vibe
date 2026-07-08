@@ -328,6 +328,7 @@ enum AgentBridgeSpeedMode: String, CaseIterable, Identifiable {
 
 struct AgentBridgeRunOptions: Equatable {
   let model: String?
+  let advisor: String?
   let intelligence: AgentBridgeIntelligenceLevel
   let speed: AgentBridgeSpeedMode
 
@@ -343,6 +344,11 @@ struct AgentBridgeRunOptions: Equatable {
     ]
     if let model, !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
       out["agentBridgeModel"] = model
+    }
+    if provider.lowercased() == "claude",
+      let advisor, !advisor.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    {
+      out["agentBridgeAdvisor"] = advisor
     }
     return out
   }
@@ -426,6 +432,9 @@ enum AgentBridgeSelectionStore {
   private static let speedKey = "agentBridge.speed"
   private static func modelKey(_ provider: String) -> String {
     "agentBridge.model.\(provider.lowercased())"
+  }
+  private static func advisorKey(_ provider: String) -> String {
+    "agentBridge.advisor.\(provider.lowercased())"
   }
   static func selectedRepository() -> AgentBridgeRepository? {
     guard
@@ -523,7 +532,8 @@ enum AgentBridgeSelectionStore {
 
   static func selectedRunOptions(provider: String) -> AgentBridgeRunOptions {
     AgentBridgeRunOptions(
-      model: selectedModel(provider: provider),
+      model: selectedModel(provider: provider) ?? defaultRunModel(provider: provider),
+      advisor: selectedAdvisor(provider: provider),
       intelligence: selectedIntelligence(),
       speed: selectedSpeed()
     )
@@ -551,6 +561,63 @@ enum AgentBridgeSelectionStore {
     }
   }
 
+  static func selectedAdvisor(provider: String) -> String? {
+    guard provider.lowercased() == "claude" else { return nil }
+    guard let advisor = normalizedString(UserDefaults.standard.string(forKey: advisorKey(provider))) else {
+      return defaultAdvisor(provider: provider)
+    }
+    if advisor.lowercased() == "off" { return nil }
+    let normalized = normalizedAdvisor(provider: provider, advisor: advisor)
+    if normalized != advisor {
+      if let normalized {
+        UserDefaults.standard.set(normalized, forKey: advisorKey(provider))
+      } else {
+        UserDefaults.standard.set("off", forKey: advisorKey(provider))
+      }
+    }
+    return normalized
+  }
+
+  static func setAdvisor(provider: String, advisor: String?) {
+    guard provider.lowercased() == "claude" else { return }
+    if let advisor = normalizedString(advisor) {
+      if let normalized = normalizedAdvisor(provider: provider, advisor: advisor) {
+        UserDefaults.standard.set(normalized, forKey: advisorKey(provider))
+      } else {
+        UserDefaults.standard.set("off", forKey: advisorKey(provider))
+      }
+    } else {
+      UserDefaults.standard.removeObject(forKey: advisorKey(provider))
+    }
+    NotificationCenter.default.post(name: didChangeNotification, object: nil)
+  }
+
+  static func advisorChoices(provider: String) -> [(title: String, subtitle: String?, value: String?)] {
+    guard provider.lowercased() == "claude" else { return [] }
+    return [
+      ("Fable 5", "Advisor for hard calls", "fable"),
+      ("Off", "Use only the executor model", nil),
+      ("Opus 4.8", "Legacy high-capability advisor", "opus"),
+    ]
+  }
+
+  static func advisorTitle(provider: String, advisor: String?) -> String {
+    guard let rawAdvisor = normalizedString(advisor) else { return "Off" }
+    let canonical = normalizedAdvisor(provider: provider, advisor: rawAdvisor) ?? rawAdvisor.lowercased()
+    if let match = advisorChoices(provider: provider).first(where: { $0.value == canonical }) {
+      return match.title
+    }
+    return rawAdvisor
+  }
+
+  private static func defaultRunModel(provider: String) -> String? {
+    provider.lowercased() == "claude" ? "sonnet" : nil
+  }
+
+  private static func defaultAdvisor(provider: String) -> String? {
+    provider.lowercased() == "claude" ? "fable" : nil
+  }
+
   // MARK: - Slash command catalog (shared source for the input bar's tools sheet)
 
   struct SlashCommand: Identifiable, Hashable {
@@ -575,6 +642,7 @@ enum AgentBridgeSelectionStore {
       SlashCommand(name: "status", subtitle: "Account, model, remaining usage"),
       SlashCommand(name: "commands", subtitle: "List available commands"),
       SlashCommand(name: "model", subtitle: "Show / switch model"),
+      SlashCommand(name: "advisor", subtitle: "Show / switch Claude advisor"),
       SlashCommand(name: "compact", subtitle: "Summarize to free context"),
       SlashCommand(name: "doctor", subtitle: "Run the CLI health check"),
     ]
@@ -650,6 +718,16 @@ enum AgentBridgeSelectionStore {
         return model
       }
     }
+  }
+
+  private static func normalizedAdvisor(provider: String, advisor: String?) -> String? {
+    guard provider.lowercased() == "claude", let advisor = normalizedString(advisor) else { return nil }
+    let normalized = advisor.lowercased().replacingOccurrences(of: "_", with: "-")
+    if ["off", "none", "no", "false", "0", "disable", "disabled"].contains(normalized) { return nil }
+    if normalized.contains("fable") { return "fable" }
+    if normalized.contains("opus") { return "opus" }
+    if normalized.contains("sonnet") { return "sonnet" }
+    return advisor
   }
 
   // MARK: - Default view preference (per provider)

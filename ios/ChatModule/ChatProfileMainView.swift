@@ -1212,7 +1212,7 @@ private struct ChatProfileSwiftUIRootView: View {
     if let local = groupModelSelections[provider] {
       return local.isEmpty ? nil : local
     }
-    return AgentBridgeSelectionStore.selectedModel(provider: provider)
+    return AgentBridgeSelectionStore.selectedRunOptions(provider: provider).model
   }
 
   private func groupModelSubtitle(_ provider: String) -> String {
