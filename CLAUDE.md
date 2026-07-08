@@ -27,6 +27,12 @@ Interactive approvals for Claude Code in this repo are governed by
 Destructive commands (rm -rf, sudo, git push, git reset --hard, dd, mkfs, curl|sh,
 npm publish, ...) are blocked in every remote mode, even `full`.
 
+## Ask advisor on complex tasks
+
+When a task is complex (multi-step, ambiguous, or touches unfamiliar/risky code),
+call the `advisor` tool before committing to an approach. Skip it for simple,
+obvious fixes.
+
 ## Prefer commands that run without approval
 
 Read-only / search / inspect commands (and pipelines of them) auto-run; commands

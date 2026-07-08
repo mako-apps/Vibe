@@ -14,8 +14,8 @@
  *   # subsequent runs (token cached in ~/.vibe/bridge.json):
  *   npx @vibegram/agent-bridge --server https://your-vibe-server
  *
- * Safety: defaults to read-only execution (claude --permission-mode plan,
- * codex --sandbox read-only). Escalate explicitly via the env vars below.
+ * Safety: defaults to safe-auto execution; plan/read-only/full-access are explicit
+ * task modes. Escalate explicitly via the env vars below.
  */
 
 const fs = require("fs");
@@ -872,11 +872,12 @@ function claudePermissionMode(task) {
       return "plan";
     case "ask":
       // Live per-action approval routed to the phone via the permission-prompt
-      // tool; claude's "default" mode raises a permission request per tool.
-      return "default";
+      // tool; manual mode can still call allowed MCP tools, unlike plan mode.
+      return "manual";
     default:
-      // read_only — propose-only, never edits.
-      return "plan";
+      // read_only — inspect/propose only. Plan mode blocks MCP tools entirely, so
+      // use manual mode and deny write/shell tools in claudeDisallowedTools().
+      return "manual";
   }
 }
 
@@ -933,6 +934,11 @@ function claudeDisallowedTools(task) {
     : workModeFor(task) === "full_access"
       ? []
       : [...DEFAULT_CLAUDE_MOBILE_DISALLOWED_TOOLS];
+  if (!override.length && workModeFor(task) === "read_only") {
+    for (const tool of ["Bash", "Edit", "MultiEdit", "Write", "NotebookEdit"]) {
+      if (!base.includes(tool)) base.push(tool);
+    }
+  }
   // CRITICAL: the NATIVE AskUserQuestion tool has no answer channel in a bridge run
   // (no local TTY), so if the model calls it the run blocks FOREVER and nothing ever
   // reaches the phone. Disable it whenever our MCP ask is on so the model is forced
@@ -1072,11 +1078,13 @@ function buildCommand(provider, prompt, chatId, task) {
       // Expose the ask_user + approve_command MCP tools and pre-allow them so the
       // mid-run question and command-approval round-trips never themselves trip a
       // (headless-unanswerable) permission prompt.
+      const allowedMcpTools = [ASK_TOOL_NAME, APPROVE_TOOL_NAME];
+      if (FABLE_MCP_ENABLED) allowedMcpTools.push(FABLE_TOOL_NAME);
       args.push(
         "--mcp-config",
         askMcpConfigPath,
         "--allowedTools",
-        `${ASK_TOOL_NAME},${APPROVE_TOOL_NAME}`
+        allowedMcpTools.join(",")
       );
       // Live "ask" mode: route every other tool's permission request to the phone
       // via the approve_command permission-prompt tool (Approve/Skip/Deny sheet).
@@ -2648,6 +2656,7 @@ async function runTask(channel, task) {
 
   const repo = repoResult.repo;
   const cwd = repo.cwd || repo.path || DEFAULT_CWD;
+  if (provider === "claude") ensureAskMcp(channel);
   // Remember which mobile chat owns this repo/provider so an INTERACTIVE claude
   // session in the same repo can route its ask/command approvals to this chat.
   rememberAgentChat(provider, chatId, cwd);
@@ -4315,6 +4324,21 @@ async function claudeDetail(id, limit, before) {
     if (ev.type === "user" && /<command-name>|<command-message>|<local-command-stdout>/i.test(rawText)) {
       return;
     }
+    // Claude Code writes SYNTHETIC assistant frames (message.model === "<synthetic>")
+    // as CLI chrome: "No response requested." after a rate-limit resume, "You've hit
+    // your session limit · resets 1am", API-error notices. They are not agent output.
+    // Ingesting them painted phantom "No response requested." bubbles/card bodies and
+    // stretched turnEndTs across the idle gap to the next resume (the
+    // "Worked for 11h56m" card). Keep an informative one (limit/error) as an in-card
+    // narration line; drop the no-op filler; never let either advance turn timing,
+    // stop_reason, or the diff accumulator.
+    if (ev.type === "assistant" && String(m.model || "") === "<synthetic>") {
+      const st = cleanMessageText(rawText);
+      if (st && !/^no response requested\.?$/i.test(st)) {
+        turnItems.push({ type: "text", text: st, uid: ev.uuid, ts: ev.timestamp });
+      }
+      return;
+    }
     if (ev.type === "user" && messageHasUserText(m)) {
       // A stop writes "[Request interrupted by user…]" as the next user message.
       // The turn it closes ended mid-tool and will never get its answer text —
@@ -4847,9 +4871,14 @@ function runningPlaceholderMessage(entry) {
     running: true,
     progressNodes: [
       {
+        // kind MUST NOT be "task": the phone reserves task-kind nodes for real
+        // Claude Task-tool subagents and renders them as a spinning "Subagent"
+        // row (the label is never shown) — this placeholder painted phantom
+        // "Subagent" cells while a run was merely pending. "thinking" renders
+        // the normal working shimmer.
         id: `running-${entry.taskId}`,
         label: `${providerTitle} is working`,
-        kind: "task",
+        kind: "thinking",
         status: "running",
         depth: 0,
         ...(target ? { target } : {}),
@@ -5533,6 +5562,8 @@ function maybeEmitPlanApproval(channel, { provider, task, chatId, taskId, replyT
 // chat/task the question belongs to. Disable with VIBE_ASK_MCP=0.
 const ASK_MCP_ENABLED = process.env.VIBE_ASK_MCP !== "0";
 const ASK_TOOL_NAME = "mcp__vibeask__ask_user";
+const FABLE_MCP_ENABLED = process.env.VIBE_FABLE_MCP !== "0";
+const FABLE_TOOL_NAME = "mcp__vibeask__ask_fable";
 // Claude `--permission-prompt-tool`: in live "ask" mode every tool Claude wants to
 // use that needs approval is routed here, round-tripped to the phone, and the
 // user's Approve/Skip/Deny maps to the permission tool's allow/deny contract.
@@ -5551,6 +5582,7 @@ const net = require("net");
 const os = require("os");
 const path = require("path");
 const readline = require("readline");
+const { spawn } = require("child_process");
 // Bridge-spawned runs get VIBE_ASK_SOCK (+ VIBE_ASK_CHAT) in their env. A STANDALONE
 // (interactive desktop) claude session has neither, so fall back to the bridge's
 // stable socket and identify by cwd — the bridge routes the ask to the matching
@@ -5560,9 +5592,34 @@ const CHAT = process.env.VIBE_ASK_CHAT || "";
 const TASK = process.env.VIBE_ASK_TASK || "";
 const CWD = process.cwd();
 const SOURCE = CHAT ? "bridge" : "interactive";
+const ADVISOR_ENABLED = process.env.VIBE_FABLE_MCP !== "0";
+const ADVISOR_MODEL = normalizeAdvisorModel(process.env.VIBE_FABLE_MODEL || process.env.VIBE_CLAUDE_ADVISOR || process.env.VIBE_CLAUDE_ADVISOR_MODEL || "fable");
+const ADVISOR_TIMEOUT_MS = Math.max(10000, Number(process.env.VIBE_FABLE_MCP_TIMEOUT_MS || 240000) || 240000);
+const ADVISOR_CONTEXT_CHARS = Math.max(4000, Number(process.env.VIBE_FABLE_MCP_CONTEXT_CHARS || 120000) || 120000);
 let proto = "2024-11-05";
 function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }
 function result(id, res) { send({ jsonrpc: "2.0", id, result: res }); }
+function normalizeAdvisorModel(value) {
+  const raw = value == null ? "" : String(value).trim();
+  if (!raw) return "fable";
+  const normalized = raw.toLowerCase().replace(/_/g, "-");
+  if (normalized.includes("fable")) return "fable";
+  if (normalized.includes("opus")) return "opus";
+  if (normalized.includes("sonnet")) return "sonnet";
+  return raw;
+}
+function compactText(value, limit) {
+  let text = "";
+  if (value == null) text = "";
+  else if (typeof value === "string") text = value;
+  else {
+    try { text = JSON.stringify(value, null, 2); } catch (_) { text = String(value); }
+  }
+  if (!limit || text.length <= limit) return text;
+  const head = Math.floor(limit * 0.65);
+  const tail = Math.max(0, limit - head - 80);
+  return text.slice(0, head) + "\\n\\n[...truncated for advisor context...]\\n\\n" + text.slice(text.length - tail);
+}
 const TOOL = {
   name: "ask_user",
   description:
@@ -5599,6 +5656,40 @@ const TOOL = {
       }
     },
     required: ["questions"]
+  }
+};
+const ADVISOR_TOOL = {
+  name: "ask_fable",
+  description:
+    "Ask Fable for explicit second-opinion advice during the current run. Pass the concrete " +
+    "question plus relevant context, snippets, diffs, constraints, and current assumptions. " +
+    "Use this when the built-in advisor is unavailable or when you need a deliberate critique. " +
+    "Fable returns advice only; the calling model remains responsible for implementation and verification.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      question: { type: "string", description: "The exact advice question for Fable." },
+      context: { type: "string", description: "Relevant run context, findings, errors, and assumptions." },
+      diff: { type: "string", description: "Optional patch or git diff to review." },
+      constraints: {
+        type: "array",
+        description: "Important constraints Fable must respect.",
+        items: { type: "string" }
+      },
+      files: {
+        type: "array",
+        description: "Relevant file snippets to include.",
+        items: {
+          type: "object",
+          properties: {
+            path: { type: "string" },
+            content: { type: "string" },
+            note: { type: "string" }
+          }
+        }
+      }
+    },
+    required: ["question"]
   }
 };
 const APPROVE_TOOL = {
@@ -5667,6 +5758,101 @@ function askBridge(questions) {
     conn.on("close", () => finish({ error: "The user did not answer." }));
   });
 }
+function buildAdvisorPrompt(args) {
+  args = args || {};
+  const question = compactText(args.question || "", 8000).trim();
+  if (!question) return null;
+  const parts = [
+    "You are Claude Fable acting as an adviser to an executor model mid-run.",
+    "Do not make tool calls, do not assume hidden context, and do not rewrite the task. Give concise, actionable advice the executor can apply.",
+    "Return the answer in four short sections when useful: assessment, risks, recommended next steps, and verification.",
+    "Question:\\n" + question
+  ];
+  if (args.context) parts.push("Current context:\\n" + compactText(args.context, ADVISOR_CONTEXT_CHARS));
+  if (Array.isArray(args.constraints) && args.constraints.length) {
+    parts.push("Constraints:\\n" + args.constraints.map((c) => "- " + compactText(c, 1000)).join("\\n"));
+  }
+  if (Array.isArray(args.files) && args.files.length) {
+    const perFile = Math.max(2000, Math.floor(ADVISOR_CONTEXT_CHARS / Math.min(args.files.length, 20)));
+    const snippets = args.files.slice(0, 20).map((file, index) => {
+      const label = compactText(file && (file.path || file.name) || ("snippet-" + (index + 1)), 400);
+      const note = file && file.note ? "\\nNote: " + compactText(file.note, 1000) : "";
+      const body = compactText(file && (file.content || file.text || ""), perFile);
+      return "File: " + label + note + "\\n" + body;
+    }).join("\\n\\n---\\n\\n");
+    parts.push("File snippets:\\n" + snippets);
+  }
+  if (args.diff) parts.push("Diff or proposed patch:\\n" + compactText(args.diff, ADVISOR_CONTEXT_CHARS));
+  return compactText(parts.join("\\n\\n"), ADVISOR_CONTEXT_CHARS);
+}
+function runAdvisor(prompt) {
+  return new Promise((resolve) => {
+    const cmd = process.env.VIBE_CLAUDE_COMMAND || "claude";
+    const args = [
+      "-p",
+      prompt,
+      "--model",
+      ADVISOR_MODEL,
+      "--output-format",
+      "json",
+      "--permission-mode",
+      "plan",
+      "--tools",
+      "",
+      "--strict-mcp-config",
+      "--mcp-config",
+      "{\\"mcpServers\\":{}}",
+      "--setting-sources",
+      "user"
+    ];
+    let stdout = "";
+    let stderr = "";
+    let done = false;
+    const finish = (text) => {
+      if (done) return;
+      done = true;
+      resolve(text);
+    };
+    const child = spawn(cmd, args, {
+      cwd: CWD,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        VIBE_ASK_MCP: "0",
+        VIBE_FABLE_MCP: "0",
+        VIBE_CLAUDE_ADVISOR: "",
+        VIBE_CLAUDE_ADVISOR_MODEL: ""
+      }
+    });
+    const timer = setTimeout(() => {
+      try { child.kill("SIGTERM"); } catch (_) {}
+      finish("Fable advisor unavailable: timed out.");
+    }, ADVISOR_TIMEOUT_MS);
+    if (timer.unref) timer.unref();
+    child.stdout.on("data", (d) => { stdout += d.toString("utf8"); });
+    child.stderr.on("data", (d) => { stderr += d.toString("utf8"); });
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      finish("Fable advisor unavailable: " + (err && err.message ? err.message : "spawn failed"));
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (done) return;
+      const raw = stdout.trim();
+      let parsed = null;
+      try { parsed = raw ? JSON.parse(raw.split("\\n").pop()) : null; } catch (_) {}
+      const text = parsed && typeof parsed.result === "string" ? parsed.result.trim() : raw;
+      if (code === 0 && text) finish(text);
+      else finish("Fable advisor unavailable: " + compactText((stderr || raw || ("claude exited " + code)).trim(), 2000));
+    });
+  });
+}
+async function askFable(args) {
+  if (!ADVISOR_ENABLED) return "Fable advisor MCP is disabled by VIBE_FABLE_MCP=0.";
+  const prompt = buildAdvisorPrompt(args);
+  if (!prompt) return "Fable advisor unavailable: missing question.";
+  return await runAdvisor(prompt);
+}
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", async (line) => {
   let msg = null;
@@ -5677,13 +5863,17 @@ rl.on("line", async (line) => {
     if (params && params.protocolVersion) proto = params.protocolVersion;
     result(id, { protocolVersion: proto, capabilities: { tools: {} }, serverInfo: { name: "vibeask", version: "1.0.0" } });
   } else if (method === "tools/list") {
-    result(id, { tools: [TOOL, APPROVE_TOOL] });
+    const tools = ADVISOR_ENABLED ? [TOOL, APPROVE_TOOL, ADVISOR_TOOL] : [TOOL, APPROVE_TOOL];
+    result(id, { tools });
   } else if (method === "tools/call") {
     const args = (params && params.arguments) || {};
     const toolName = params && params.name;
     if (toolName === "approve_command") {
       const verdict = await approveBridge(args);
       result(id, { content: [{ type: "text", text: JSON.stringify(verdict) }] });
+    } else if (toolName === "ask_fable") {
+      const answer = await askFable(args);
+      result(id, { content: [{ type: "text", text: answer }] });
     } else {
       const questions = Array.isArray(args.questions) ? args.questions : [];
       const answer = await askBridge(questions);
@@ -6611,7 +6801,8 @@ async function main() {
 	        "     --repo-root <dir> (scans 2 levels for .git). Env: VIBE_BRIDGE_REPOS,\n" +
 	        "     VIBE_BRIDGE_REPO_ROOTS, VIBE_CLAUDE_PERMISSION_MODE, VIBE_CODEX_SANDBOX,\n" +
 	        "     VIBE_CODEX_APPROVAL_POLICY, VIBE_CLAUDE_MODEL, VIBE_CLAUDE_ADVISOR,\n" +
-	        "     VIBE_CLAUDE_ADVISOR_MODEL, VIBE_CODEX_MODEL,\n" +
+	        "     VIBE_CLAUDE_ADVISOR_MODEL, VIBE_FABLE_MCP, VIBE_FABLE_MODEL,\n" +
+          "     VIBE_FABLE_MCP_CONTEXT_CHARS, VIBE_CODEX_MODEL,\n" +
 	        "     VIBE_CLAUDE_COMMAND, VIBE_CODEX_COMMAND"
 	  );
     return;

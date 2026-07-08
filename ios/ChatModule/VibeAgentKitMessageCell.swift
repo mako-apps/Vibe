@@ -245,7 +245,9 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
       // A subagent (Claude Task tool) node renders as a compact, always-tappable row
       // that opens the read-only subagent view — never an inline expand. Its own
       // Read/Edit/Run steps live only in that view (subagentChildren).
-      if item.itemType == "task" {
+      // Gated on isRealSubagent: a task-kind node WITHOUT a subagentType is a
+      // synthetic working placeholder and falls through to a plain step row.
+      if item.isRealSubagent {
         let subagentRow = VibeAgentKitSubagentRowView()
         subagentRow.translatesAutoresizingMaskIntoConstraints = false
         let running = vibeAgentKitRunningStepStatuses.contains((item.status ?? "").lowercased())
@@ -341,7 +343,9 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
       }
 
       let nodeId = item.nodeId ?? item.label
-      if item.itemType == "task" {
+      // isRealSubagent: synthetic task-kind placeholders (no subagentType) render
+      // as plain step rows, never as a phantom "Subagent" row.
+      if item.isRealSubagent {
         let key = "task#\(nodeId)"
         orderedKeys.append(key)
         let subagentRow: VibeAgentKitSubagentRowView

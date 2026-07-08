@@ -2759,7 +2759,7 @@ func measureMessageBubbleLayout(
     // content exists but is clipped/misplaced; h≈44 with items>0 means the measurement
     // itself collapsed.
     if row.isStreamingText || (row.status ?? "").lowercased() == "running" {
-      NSLog(
+      VibeDebugLog.log(
         "[AgentMeasure] id=%@ compact=%@ items=%d width=%.0f previewH=%.1f bubbleH=%.1f",
         String((row.messageId ?? "-").suffix(14)),
         compact ? "Y" : "N",

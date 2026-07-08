@@ -1507,7 +1507,7 @@ private final class ChatsViewModel: ObservableObject {
         // (or everything filtered out) replaces a populated list. Log the transition so the
         // device log shows whether the server returned 0 chats vs. a local filter wiped them.
         if nextRows.isEmpty && !rows.isEmpty {
-          NSLog(
+          VibeDebugLog.log(
             "[EmptyTrace] mainList EMPTY replace was=%d fetched=%d locallyRemoved=%d preserveRows=%@",
             rows.count, fetchedRows.count, locallyRemovedChatIDs.count, preserveRows ? "Y" : "N")
         }
@@ -5865,7 +5865,7 @@ final class ChatConversationController: UIViewController {
     super.viewDidLayoutSubviews()
     if !loggedFirstRealLayout, view.bounds.width > 1, view.bounds.height > 1 {
       loggedFirstRealLayout = true
-      NSLog(
+      VibeDebugLog.log(
         "[ChatOpen] host viewDidLayoutSubviews FIRST-REAL-BOUNDS chatId=%@ view=%.0fx%.0f hasAppeared=%@ pendingRows=%@",
         String(route.chatId.prefix(12)), view.bounds.width, view.bounds.height,
         hasAppeared ? "Y" : "N", pendingRowsForAttachment != nil ? "Y" : "N")
@@ -6137,7 +6137,7 @@ final class ChatConversationController: UIViewController {
     // then jumps to no panel" flicker on reopen.
     if latestBridgeStatusConnected() {
       let fresh = AgentPairingService.statusIsFresh()
-      NSLog(
+      VibeDebugLog.log(
         "[ChatOpen] connectGate WARM-CONNECTED→input chatId=%@ provider=%@ fresh=%@ reverify=%@",
         String(route.chatId.prefix(12)), provider, fresh ? "Y" : "N", fresh ? "N" : "Y")
       handleBridgeConnected()
@@ -6187,13 +6187,13 @@ final class ChatConversationController: UIViewController {
         model.selectedRepository = AgentBridgeSelectionStore.ensureValidSelection(
           from: snapshot.repositories)
       }
-      NSLog(
+      VibeDebugLog.log(
         "[ChatOpen] connectGate FRESH-OFFLINE→panel chatId=%@ provider=%@",
         String(route.chatId.prefix(12)), provider)
       presentAgentConnectPanel(model: model)
       return
     }
-    NSLog(
+    VibeDebugLog.log(
       "[ChatOpen] connectGate COLD→hideInput+poll chatId=%@ provider=%@ (no fresh status)",
       String(route.chatId.prefix(12)), provider)
 
@@ -6553,7 +6553,7 @@ final class ChatConversationController: UIViewController {
         Self.normalizedString(initialRows.first?["id"])
         ?? Self.normalizedString(initialRows.first?["messageId"])
         ?? "nil"
-      NSLog(
+      VibeDebugLog.log(
         "[ChatOpen] refreshRows seed chatId=%@ initialRows=%d source=initial window=%@ up=%.2f",
         String(chatId.prefix(12)), initialRows.count, view.window != nil ? "Y" : "N",
         ProcessInfo.processInfo.systemUptime)
@@ -6647,12 +6647,12 @@ final class ChatConversationController: UIViewController {
       pendingRowsForAttachment = rows
       pendingRowsForAttachmentChatId = chatId
       pendingRowsForAttachmentSource = source
-      NSLog(
+      VibeDebugLog.log(
         "[ChatOpen] applyRows DEFER chatId=%@ rows=%d source=%@ hasAppeared=%@ (window nil)",
         String(chatId.prefix(12)), rows.count, source, hasAppeared ? "Y" : "N")
       return false
     }
-    NSLog(
+    VibeDebugLog.log(
       "[ChatOpen] applyRows APPLY chatId=%@ rows=%d source=%@ window=%@ hasAppeared=%@ up=%.2f",
       String(chatId.prefix(12)), rows.count, source, view.window != nil ? "Y" : "N",
       hasAppeared ? "Y" : "N", ProcessInfo.processInfo.systemUptime)
@@ -6677,7 +6677,7 @@ final class ChatConversationController: UIViewController {
       profileView?.setRows(rows)
     }
     let durationMs = Int((CFAbsoluteTimeGetCurrent() - startedAt) * 1000)
-    NSLog(
+    VibeDebugLog.log(
       "[ChatOpen] applyRows DONE chatId=%@ rows=%d source=%@ durationMs=%d up=%.2f",
       String(chatId.prefix(12)), rows.count, source, durationMs,
       ProcessInfo.processInfo.systemUptime)
@@ -6694,7 +6694,7 @@ final class ChatConversationController: UIViewController {
     // later viewDidLayoutSubviews pass (real bounds) would have nothing to apply. Wait
     // for that real-bounds pass so the rows land in a correctly-sized list.
     guard view.bounds.width > 1, view.bounds.height > 1 else {
-      NSLog(
+      VibeDebugLog.log(
         "[ChatOpen] applyPendingRows WAIT reason=%@ chatId=%@ (host not sized %.0fx%.0f) pending=%@",
         reason, String(route.chatId.prefix(12)), view.bounds.width, view.bounds.height,
         pendingRowsForAttachment != nil ? "Y" : "N")

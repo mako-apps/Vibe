@@ -33,10 +33,10 @@ token. `--cwd <path>` overrides the working directory.
 
 ## Safety
 
-Defaults to **read-only** execution:
+Default mobile sends use **safe auto** execution:
 
-- `claude --permission-mode plan`
-- `codex --sandbox read-only -c approval_policy="untrusted"`
+- `claude --permission-mode auto`
+- `codex --sandbox workspace-write -c approval_policy="never"`
 
 Escalate explicitly with env vars (only on machines you control):
 
@@ -47,12 +47,16 @@ Escalate explicitly with env vars (only on machines you control):
 | `VIBE_CODEX_APPROVAL_POLICY` | per task | `untrusted`, `on-request`, or `never` |
 | `VIBE_CLAUDE_MODEL`, `VIBE_CODEX_MODEL` | — | executor model override |
 | `VIBE_CLAUDE_ADVISOR`, `VIBE_CLAUDE_ADVISOR_MODEL` | `fable` for installed service | Claude advisor model override |
+| `VIBE_FABLE_MCP` | enabled | Exposes `mcp__vibeask__ask_fable` so Claude can explicitly ask Fable with mid-run context |
+| `VIBE_FABLE_MODEL` | `fable` | Model used by the explicit Fable MCP advisor tool |
+| `VIBE_FABLE_MCP_CONTEXT_CHARS` | `120000` | Max packaged context sent through the Fable MCP advisor tool |
 | `VIBE_CLAUDE_COMMAND`, `VIBE_CODEX_COMMAND` | `claude` / `codex` | binary path override |
 
 Mobile work modes map to CLI safety settings:
 
-- `read_only`: Claude `plan`; Codex `read-only` + `untrusted`.
-- `ask`: Claude `plan`; Codex `read-only` + `on-request`.
+- `plan`: Claude `plan`; Codex `read-only` + `untrusted`.
+- `read_only`: Claude `manual` with write/shell tools denied; Codex `read-only` + `untrusted`.
+- `ask`: Claude `manual` with phone approvals; Codex `read-only` + `on-request`.
 - `ask_auto`: Claude `auto`; Codex `workspace-write` + `never`.
 - `allow_edits`: Claude `acceptEdits`; Codex `workspace-write` + `never`.
 - `full_access`: Claude `bypassPermissions`; Codex `danger-full-access` + `never`.

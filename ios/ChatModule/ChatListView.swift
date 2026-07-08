@@ -1290,20 +1290,20 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let contentH = collectionView.contentSize.height
     let boundsH = collectionView.bounds.height
     if visibleCount == 0, contentH > 0, boundsH > 0 {
-      NSLog(
+      VibeDebugLog.log(
         "[FirstMsg] attach REVALIDATE reloading — rows=%d visible=0 offset=%.0f contentH=%.0f boundsH=%.0f",
         rows.count, collectionView.contentOffset.y, contentH, boundsH)
       collectionView.reloadData()
       collectionView.layoutIfNeeded()
     } else if rows.count <= 4 {
-      NSLog(
+      VibeDebugLog.log(
         "[FirstMsg] attach revalidate ok rows=%d visible=%d offset=%.0f contentH=%.0f",
         rows.count, visibleCount, collectionView.contentOffset.y, contentH)
     }
     // Stale send-morph ghost state must never survive a detach: if the morph never
     // completed (chat closed mid-send) the only message would re-render hidden.
     if activeSendTransition == nil, pendingSendTransition == nil, hiddenMessageId != nil {
-      NSLog(
+      VibeDebugLog.log(
         "[FirstMsg] attach clearing stale hiddenMessageId=%@",
         String(hiddenMessageId?.prefix(12) ?? "nil"))
       hiddenMessageId = nil
@@ -1391,7 +1391,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       // materialize immediately as the chat appears, closing the "empty for ~1s then
       // pops in" gap.
       if !rows.isEmpty, collectionView.indexPathsForVisibleItems.isEmpty {
-        NSLog(
+        VibeDebugLog.log(
           "[ChatOpen] firstRealBounds RENDER surface=%@ rows=%d bounds=%.0fx%.0f contentH=%.0f — forcing reloadData (0 cells materialized)",
           surfaceId.isEmpty ? "<none>" : surfaceId, rows.count,
           collectionView.bounds.width, collectionView.bounds.height,
@@ -1402,7 +1402,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           scrollToBottom(animated: false, force: true)
         }
       } else if !rows.isEmpty {
-        NSLog(
+        VibeDebugLog.log(
           "[ChatOpen] firstRealBounds ok surface=%@ rows=%d bounds=%.0fx%.0f visible=%d contentH=%.0f",
           surfaceId.isEmpty ? "<none>" : surfaceId, rows.count,
           collectionView.bounds.width, collectionView.bounds.height,
@@ -1752,7 +1752,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       // and engine-change activity below re-call this) without spamming every frame.
       lastBridgeUsageRequestAt = now - 25.0
     }
-    NSLog(
+    VibeDebugLog.log(
       "[ChatUsage] request chat=%@ reason=%@ accepted=%@ result=%@",
       String(chatId.prefix(12)), reason, accepted ? "Y" : "N",
       (result["reason"] as? String) ?? "-")
@@ -1779,7 +1779,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         worstResetsAt = bucket["resetsAt"] as? String
       }
     }
-    NSLog("[ChatUsage] reply buckets=%d worst=%@ %d%%", buckets.count, worstLabel ?? "-", worstUtil)
+    VibeDebugLog.log("[ChatUsage] reply buckets=%d worst=%@ %d%%", buckets.count, worstLabel ?? "-", worstUtil)
     guard let label = worstLabel, worstUtil >= 75 else {
       hideBridgeUsageBanner()
       return
@@ -1979,7 +1979,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       // Incoming rows all dropped before render — dump the first raw row's shape so
       // the drop point (ChatListRow.init vs a filter) is identifiable from device logs.
       let firstRow = nextRows[0]
-      NSLog(
+      VibeDebugLog.log(
         "[ChatOpen] setRows ALL-DROPPED incoming=%d merged=%d parsedAll=%d keys=[%@] kind=%@ type=%@",
         nextRows.count, mergedRows.count, parsedAll.count,
         firstRow.keys.sorted().joined(separator: ","),
@@ -2209,7 +2209,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // Initial load or full replacement: use reloadData (no batch update needed).
     guard !previousRows.isEmpty else {
       if parsed.count <= 4 {
-        NSLog(
+        VibeDebugLog.log(
           "[FirstMsg] setRows INITIAL surface=%@ chatId=%@ statusAuth=%@ parsed=%d keys=[%@] hidden=%@ pending=%@ src=%d window=%@ bounds=%.0fx%.0f",
           surfaceId.isEmpty ? "<none>" : surfaceId,
           traceChatId.isEmpty ? "<empty>" : String(traceChatId.prefix(12)),
@@ -2254,7 +2254,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
             format: "i%d(y=%.0f h=%.0f a=%.2f%@)", ip.item, cell.frame.minY,
             cell.frame.height, cell.alpha, ghost ? " GHOST" : "")
         }.joined(separator: " ")
-        NSLog(
+        VibeDebugLog.log(
           "[FirstMsg] setRows INITIAL done offset=%.0f contentH=%.0f inset(t=%.0f,b=%.0f) visible=%d window=%@ cells=[%@]",
           collectionView.contentOffset.y,
           collectionView.contentSize.height,
@@ -2265,7 +2265,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       } else {
         // The large-transcript initial render (the one that matters for chat-open
         // latency) previously logged nothing — make its outcome and cost visible.
-        NSLog(
+        VibeDebugLog.log(
           "[ChatOpen] setRows INITIAL done surface=%@ parsed=%d visible=%d contentH=%.0f offset=%.0f bounds=%.0fx%.0f durationMs=%d up=%.2f",
           surfaceId.isEmpty ? "<none>" : surfaceId,
           parsed.count,
@@ -3575,7 +3575,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
     let mediaDownloadState = remoteMediaDownloadState(for: row)
     if let hid = hiddenMessageId, row.kind == .message, row.messageId == hid {
-      NSLog(
+      VibeDebugLog.log(
         "[FirstMsg] cellForItemAt GHOST configure item=%d msgId=%@ rows=%d pending=%@ active=%@",
         indexPath.item, String(hid.prefix(12)), rows.count,
         pendingSendTransition != nil ? "Y" : "N",
@@ -4455,12 +4455,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
   private func hydrateRowsFromNativeHistoryIfReady(trigger: String) {
     guard statusAuthorityEnabled else {
-      NSLog("[ChatOpen] hydrate SKIP trigger=%@ reason=statusAuthorityDisabled", trigger)
+      VibeDebugLog.log("[ChatOpen] hydrate SKIP trigger=%@ reason=statusAuthorityDisabled", trigger)
       return
     }
     let resolvedChatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !resolvedChatId.isEmpty else {
-      NSLog("[ChatOpen] hydrate SKIP trigger=%@ reason=noChatId", trigger)
+      VibeDebugLog.log("[ChatOpen] hydrate SKIP trigger=%@ reason=noChatId", trigger)
       return
     }
 
@@ -4476,13 +4476,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if rows.isEmpty {
       let historyReadyNow = ChatEngine.shared.isChatHistoryLoaded(chatId: resolvedChatId)
       if historyReadyNow || !nativeEngineRowsById.isEmpty {
-        NSLog(
+        VibeDebugLog.log(
           "[ChatOpen] hydrate FAST-PATH trigger=%@ chatId=%@ historyReady=%@ overlay=%d sourceRows=%d — rendering synchronously",
           trigger, resolvedChatId, historyReadyNow ? "Y" : "N",
           nativeEngineRowsById.count, sourceRowsPayload.count)
         setRows(sourceRowsPayload)
       } else {
-        NSLog(
+        VibeDebugLog.log(
           "[ChatOpen] hydrate fast-path unavailable trigger=%@ chatId=%@ (no cached history, no overlay) — awaiting JS setRows",
           trigger, resolvedChatId)
       }
@@ -4523,12 +4523,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         }
 
         if !historyLoaded && self.nativeEngineRowsById.isEmpty {
-          NSLog(
+          VibeDebugLog.log(
             "[ChatOpen] hydrate async BAIL trigger=%@ chatId=%@ historyLoaded=N overlay=0 rows=%d — chat stays as-is until JS setRows arrives",
             trigger, resolvedChatId, self.rows.count)
           return
         }
-        NSLog(
+        VibeDebugLog.log(
           "[ChatOpen] hydrate async APPLY trigger=%@ chatId=%@ sourceRows=%d overlay=%d historyLoaded=%@ rows=%d",
           trigger, resolvedChatId, self.sourceRowsPayload.count, self.nativeEngineRowsById.count,
           historyLoaded ? "Y" : "N", self.rows.count
@@ -5522,7 +5522,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         let nativeRows = ChatEngine.shared.getChatRows(["chatId": engineChatId])
         if !nativeRows.isEmpty, nativeRows.count >= baseRows.count || baseRows.isEmpty {
           if nativeRows.count <= 4 || baseRows.count <= 4 {
-            NSLog(
+            VibeDebugLog.log(
               "[FirstMsg] mergedRows base=NATIVE native=%d js=%d outgoing=%d overlay=%d",
               nativeRows.count, baseRows.count, nativeOutgoingOrder.count,
               nativeEngineRowsById.count)
@@ -5530,7 +5530,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           return nativeRows
         }
         if nativeRows.isEmpty, baseRows.count <= 4 {
-          NSLog(
+          VibeDebugLog.log(
             "[FirstMsg] mergedRows historyReady but native EMPTY js=%d outgoing=%d overlay=%d",
             baseRows.count, nativeOutgoingOrder.count, nativeEngineRowsById.count)
         }
@@ -5613,7 +5613,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         continue
       }
       if effectiveBaseIds.contains(messageId) {
-        NSLog(
+        VibeDebugLog.log(
           "[FirstMsg] mergedRows PRE-CLEAN drop outgoing msgId=%@ (present in base %d rows)",
           String(messageId.prefix(12)), effectiveBaseIds.count)
         nativeOutgoingRowsById.removeValue(forKey: messageId)
@@ -6285,7 +6285,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         rowIndex.map {
           collectionView.cellForItem(at: IndexPath(item: $0, section: 0)) != nil
         } ?? false
-      NSLog(
+      VibeDebugLog.log(
         "[FirstMsg] reveal msgId=%@ rowIndex=%@ cellPresent=%@ rows=%d visible=%d offset=%.0f contentH=%.0f boundsH=%.0f",
         String(revealedMessageId.prefix(12)),
         rowIndex.map(String.init) ?? "nil",
@@ -6385,7 +6385,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         }
       }
     } else if revealedMessageId != nil {
-      NSLog(
+      VibeDebugLog.log(
         "[FirstMsg] reveal FALLBACK setRows(sourceRowsPayload) — row not found for msgId=%@ src=%d",
         String((revealedMessageId ?? "").prefix(12)), sourceRowsPayload.count)
       setRows(sourceRowsPayload)
@@ -6397,7 +6397,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if let revealedMessageId {
       for case let cell as ChatListCell in collectionView.visibleCells
       where cell.isConfiguredGhostHidden && cell.row?.messageId == revealedMessageId {
-        NSLog(
+        VibeDebugLog.log(
           "[FirstMsg] reveal SWEEP un-ghosting stale visible cell msgId=%@",
           String(revealedMessageId.prefix(12)))
         guard let row = cell.row else { continue }
@@ -8534,7 +8534,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     lastCurrentBridgeSessionRequestAt = now
     let result = ChatEngine.shared.loadCurrentAgentBridgeSessionIntoChat(
       chatId: chatId, provider: provider)
-    NSLog(
+    VibeDebugLog.log(
       "[ChatOpen] currentSession request chat=%@ provider=%@ reason=%@ accepted=%@ result=%@",
       String(chatId.prefix(12)), provider, reason,
       (result["accepted"] as? Bool) == true ? "Y" : "N",

@@ -445,7 +445,7 @@ public final class ChatNativeHomeListView: ExpoView, UITableViewDataSource, UITa
     
     let liveRows = ChatEngine.shared.getLiveMessageRows(["chatId": row.chatId])
     if liveRows.isEmpty {
-      NSLog(
+      VibeDebugLog.log(
         "[FirstMsg] homePreview no live rows chatId=%@ jsPreview='%@'",
         String(row.chatId.prefix(12)), String(jsPreview.prefix(24)))
     }

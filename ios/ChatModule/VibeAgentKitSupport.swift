@@ -226,6 +226,15 @@ struct VibeAgentKitProgressItem: Equatable {
   // `parentId` and live only in the read-only subagent view.
   var parentId: String? = nil
   var subagentType: String? = nil
+  // True only for a REAL Claude Task-tool subagent: task-kind nodes always carry
+  // `subagentType` when they come from an actual Task tool call (bridge + server
+  // both set it from the tool's subagent_type). A "task" node WITHOUT one is a
+  // synthetic working placeholder (e.g. the bridge's running-task node) — rendering
+  // those as "Subagent" rows painted phantom spinning Subagent cells in the chat.
+  var isRealSubagent: Bool {
+    guard (itemType ?? "") == "task" else { return false }
+    return !(subagentType ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+  }
   // Thinking-node metrics: reasoning token count + how long the turn spent thinking,
   // so a "thinking" row can render "Thinking · N tokens" / "Thought for Ns".
   var tokens: Int? = nil

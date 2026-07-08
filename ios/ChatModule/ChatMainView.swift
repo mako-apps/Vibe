@@ -403,7 +403,7 @@ public final class ChatMainView: UIView,
     // the engine handed the view an empty list while a run was live (the reported bug). Pair
     // with the engine's [EmptyTrace] lines to see which clear/reset produced it.
     if rows.isEmpty {
-      NSLog(
+      VibeDebugLog.log(
         "[EmptyTrace] ChatMainView.setRows EMPTY chatId=%@ progress=%@ bridge=%@",
         engineChatId.isEmpty ? "-" : String(engineChatId.suffix(12)),
         agentProgressSubtitle ?? "nil",

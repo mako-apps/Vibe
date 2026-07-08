@@ -505,6 +505,10 @@ final class ChatEngine {
   private static let fallbackApiBaseURL = "https://api.vibegram.io"
   private let nativeConnectStaleTimeoutMs = 5_000
   private let queuedOutboundVisibleErrorDelayMs = 20_000
+  /// Oldest a queued bridge-agent draft may be and still auto-send on reconnect.
+  /// Past this, replay marks it failed instead — a prompt from minutes ago must
+  /// not silently dispatch an agent run the user is no longer watching for.
+  private let bridgeQueuedReplayMaxAgeMs = 120_000
   /// Time-to-live for the cached private key in memory (seconds).
   /// After this period of inactivity the key is cleared and re-derived from Keychain on next use.
   private let keyTTL: TimeInterval = 300
@@ -675,32 +679,26 @@ final class ChatEngine {
     )
   }
 
-  @discardableResult
-  private func failVolatileBridgeSendLocked(
+  /// A bridge send that may already have reached the wire failed (ack timeout,
+  /// socket drop mid-flight, server rejection). Keep the user's bubble with an
+  /// error badge — tap-to-retry re-arms the same id — instead of deleting their
+  /// text, and never auto-replay: re-dispatching an agent prompt the server may
+  /// have already run must stay a user decision.
+  private func markVolatileBridgeSendErrorLocked(
     chatId: String,
     messageId: String,
     reason: String,
-    provider: String?,
-    removeRow: Bool = true
-  ) -> [String: Any] {
-    if var ids = pendingOutboundQueueByChat[chatId] {
-      ids.removeAll { $0 == messageId }
-      if ids.isEmpty {
-        pendingOutboundQueueByChat.removeValue(forKey: chatId)
-      } else {
-        pendingOutboundQueueByChat[chatId] = ids
-      }
-    }
-    pendingOutboundDraftsByMessageId.removeValue(forKey: messageId)
+    provider: String?
+  ) {
+    // Leave the queue (no auto-replay) but KEEP the draft: tap-to-retry goes
+    // through retryOutgoingMessage, which needs it. A draft outside the queue
+    // never auto-sends, and bridge drafts are never persisted to disk.
+    removeQueuedOutboundDraftLocked(chatId: chatId, messageId: messageId, dropDraft: false)
     nativePendingMessagePushRefs = nativePendingMessagePushRefs.filter { _, pending in
       !(pending.chatId == chatId && pending.messageId == messageId)
     }
-    removeMessageIndicesLocked(chatId: chatId, messageId: messageId)
     setLiveMessageUploadProgressLocked(chatId: chatId, messageId: messageId, progress: nil)
-    if removeRow {
-      markLiveMessageDeletedLocked(chatId: chatId, messageId: messageId)
-    }
-    persistOutboundStateLocked()
+    upsertLocalStatusLocked(chatId: chatId, messageId: messageId, status: "error")
     appendJournalLocked(
       event: "native-bridge-send-failed",
       payload: [
@@ -708,16 +706,17 @@ final class ChatEngine {
         "messageId": messageId,
         "provider": provider ?? "",
         "reason": reason,
+        "rowKept": true,
       ]
     )
     let displayProvider = provider.map { $0.capitalized } ?? "Bridge"
     let snapshot = statusSnapshotLocked()
     postChangeLocked(
-      reason: "chatMessageDeleted",
+      reason: "messageStatusChanged",
       userInfo: [
         "chatId": chatId,
         "messageId": messageId,
-        "action": "deleted",
+        "status": "error",
         "state": snapshot,
       ])
     postChangeLocked(
@@ -728,16 +727,9 @@ final class ChatEngine {
         "category": "bridgeSendFailed",
         "provider": provider ?? "",
         "reason": reason,
-        "error": "\(displayProvider) message did not reach the bridge.",
+        "error": "\(displayProvider) message did not reach the bridge. Tap it to retry.",
         "state": snapshot,
       ])
-    return [
-      "accepted": false,
-      "reason": reason,
-      "messageId": messageId,
-      "state": "error",
-      "bridgeProvider": provider ?? "",
-    ]
   }
 
   private func clearCachedKeyOnBackground() {
@@ -2731,7 +2723,7 @@ final class ChatEngine {
         (normalizedString(payload["chatId"]) ?? "") == chatId
       }
       if hasOutstandingAskLocked {
-        NSLog(
+        VibeDebugLog.log(
           "[EmptyTrace] ingestSettle HOLD chatId=%@ reason=outstandingAsk sinceRunningMs=%lld",
           String(chatId.suffix(12)), sinceRunningMs)
         agentTurnRunningAtMsByChatId[chatId] = Int64(nowMs())
@@ -2799,7 +2791,7 @@ final class ChatEngine {
       let alreadyDeleted = deletedMessageIdsByChat[chatId] ?? []
       var staleIds = cachedSessionIds.subtracting(ingestedIds).subtracting(alreadyDeleted)
       if !staleIds.isEmpty {
-        NSLog(
+        VibeDebugLog.log(
           "[EmptyTrace] tombstone chatId=%@ stale=%d cached=%d ingested=%d truncated=N",
           String(chatId.suffix(12)), staleIds.count, cachedSessionIds.count, ingestedIds.count)
         // Mid-run mass-removal guard: while this chat's turn is live (running mark within
@@ -2814,7 +2806,7 @@ final class ChatEngine {
         }
         let runIsLive = askOutstanding || sinceRunningMs < Self.agentTurnRunningGraceMs
         if runIsLive, staleIds.count > 2 {
-          NSLog(
+          VibeDebugLog.log(
             "[EmptyTrace] tombstone SKIP chatId=%@ stale=%d (live run — refusing mass removal)",
             String(chatId.suffix(12)), staleIds.count)
           staleIds.removeAll()
@@ -3092,31 +3084,26 @@ final class ChatEngine {
         metadata: metadata
       )
       let isVolatileBridgeSend = bridgeProvider != nil
+      // Connection still warming up (cold chat open): don't fail the bridge send —
+      // emit the optimistic bubble below, then hold the draft in the in-memory
+      // outbound queue. chat_joined replays it; the visible-error timer expires it
+      // if the link never comes up. Bridge drafts never persist to disk, so a stale
+      // prompt can't dispatch an agent run on a later app launch.
+      var deferredBridgeSendReason: String? = nil
       if isVolatileBridgeSend {
         clearVolatileBridgeHistoryLocked(chatId: chatId, reason: "bridge_send_start")
-        dropQueuedOutboundForChatLocked(chatId: chatId, reason: "bridge_send_start")
-        guard phoenixClient != nil, (state["connected"] as? Bool) == true else {
+        if phoenixClient == nil || (state["connected"] as? Bool) != true {
+          deferredBridgeSendReason = "no_native_socket"
+          scheduleReconnectLocked(reason: "bridge_send_no_socket")
           DispatchQueue.global(qos: .utility).async { [weak self] in
             self?.ensureNativeTransport(trigger: "bridge_send_no_socket")
           }
-          return failVolatileBridgeSendLocked(
-            chatId: chatId,
-            messageId: messageId,
-            reason: "no_native_socket",
-            provider: bridgeProvider
-          )
-        }
-        guard nativeJoinedChatIds.contains(chatId) else {
+        } else if !nativeJoinedChatIds.contains(chatId) {
+          deferredBridgeSendReason = "chat_not_joined"
           joinNativeChatTopicIfNeededLocked(chatId: chatId)
           DispatchQueue.global(qos: .utility).async { [weak self] in
             self?.ensureNativeTransport(trigger: "bridge_send_chat_not_joined")
           }
-          return failVolatileBridgeSendLocked(
-            chatId: chatId,
-            messageId: messageId,
-            reason: "chat_not_joined",
-            provider: bridgeProvider
-          )
         }
       }
 
@@ -3175,6 +3162,24 @@ final class ChatEngine {
       NSLog(
         "[ChatEngine] sendMessage optimistic row emitted in %dms chatId=%@ messageId=%@",
         Int(nowMs() - optimisticStartMs), chatId, messageId)
+
+      if let deferReason = deferredBridgeSendReason {
+        upsertLocalStatusLocked(chatId: chatId, messageId: messageId, status: "pending")
+        queueOutboundDraftLocked(
+          chatId: chatId, messageId: messageId, payload: effectivePayload, reason: deferReason)
+        NSLog(
+          "[ChatEngine] sendMessage bridge deferred (warm-up) chatId=%@ messageId=%@ reason=%@",
+          chatId, messageId, deferReason)
+        postChangeLocked(
+          reason: "messageStatusChanged",
+          userInfo: ["chatId": chatId, "messageId": messageId, "status": "pending"])
+        return [
+          "accepted": true, "queued": true, "reason": deferReason,
+          "messageId": messageId,
+          "state": "pending",
+          "bridgeProvider": bridgeProvider ?? "",
+        ]
+      }
 
       // ── Now resolve friend public key (may do synchronous HTTP — no longer blocks UI) ──
       let keyResolveStartMs = nowMs()
@@ -3713,19 +3718,8 @@ final class ChatEngine {
           self.pendingOutboundDraftsByMessageId[messageId] = threadEffectivePayload
 
           guard let client = self.phoenixClient else {
-            if isVolatileBridgeSend {
-              _ = self.failVolatileBridgeSendLocked(
-                chatId: chatId,
-                messageId: messageId,
-                reason: "no_native_socket",
-                provider: bridgeProvider
-              )
-              self.scheduleReconnectLocked(reason: "bridge_send_no_socket")
-              DispatchQueue.global(qos: .utility).async { [weak self] in
-                self?.ensureNativeTransport(trigger: "bridge_send_no_socket")
-              }
-              return
-            }
+            // Bridge sends queue here too — the draft replays on chat_joined and the
+            // visible-error timer expires it (queueOutboundDraftLocked stamps it).
             self.upsertLocalStatusLocked(chatId: chatId, messageId: messageId, status: "pending")
             self.queueOutboundDraftLocked(
               chatId: chatId, messageId: messageId, payload: threadEffectivePayload,
@@ -3742,19 +3736,6 @@ final class ChatEngine {
 
           guard self.nativeJoinedChatIds.contains(chatId) else {
             self.joinNativeChatTopicIfNeededLocked(chatId: chatId)
-            if isVolatileBridgeSend {
-              _ = self.failVolatileBridgeSendLocked(
-                chatId: chatId,
-                messageId: messageId,
-                reason: "chat_not_joined",
-                provider: bridgeProvider
-              )
-              self.scheduleReconnectLocked(reason: "bridge_send_chat_not_joined")
-              DispatchQueue.global(qos: .utility).async { [weak self] in
-                self?.ensureNativeTransport(trigger: "bridge_send_chat_not_joined")
-              }
-              return
-            }
             self.upsertLocalStatusLocked(chatId: chatId, messageId: messageId, status: "pending")
             self.queueOutboundDraftLocked(
               chatId: chatId, messageId: messageId, payload: threadEffectivePayload,
@@ -3782,7 +3763,9 @@ final class ChatEngine {
             if let pending = self.nativePendingMessagePushRefs.removeValue(forKey: timeoutRef) {
               let timeoutProvider = self.bridgeProviderForChatLocked(chatId: pending.chatId)
               if let timeoutProvider {
-                _ = self.failVolatileBridgeSendLocked(
+                // The push was on the wire — the server may have dispatched the agent
+                // run. Keep the bubble, mark it failed, let the user decide on retry.
+                self.markVolatileBridgeSendErrorLocked(
                   chatId: pending.chatId,
                   messageId: pending.messageId,
                   reason: "send_timeout",
@@ -4733,7 +4716,7 @@ final class ChatEngine {
       // "list jumps to empty" moment. The live/hist breakdown says WHERE the content went:
       // live=0 & hist=0 → both stores wiped (a reset), live=0 & hist>0 → merge/filter drop.
       if merged.isEmpty {
-        NSLog(
+        VibeDebugLog.log(
           "[EmptyTrace] getChatRows EMPTY chatId=%@ live=%d hist=%d progress=%@",
           String(chatId.suffix(12)),
           liveMessageRowsByChat[chatId]?.count ?? 0,
@@ -5125,7 +5108,7 @@ final class ChatEngine {
     // [EmptyTrace] The header flipping to "Start session" mid-stream = this firing. Log WHO
     // cleared it (reason) + what was showing, so a device log pins the trigger. Pair with
     // the [EmptyTrace] getChatRows/reset lines to see if the row wipe rides the same event.
-    NSLog(
+    VibeDebugLog.log(
       "[EmptyTrace] clearAgentProgress chatId=%@ reason=%@ hadLabel=%@ status=%@",
       String(chatId.suffix(12)), reason, previous.label, status)
     let normalizedStatus =
@@ -5451,7 +5434,7 @@ final class ChatEngine {
     guard !removedIds.isEmpty else { return }
     // [EmptyTrace] This wipes the live streaming bubble(s). If it fires mid-stream and leaves
     // the live store empty, the agent list can jump to empty until history rehydrates.
-    NSLog(
+    VibeDebugLog.log(
       "[EmptyTrace] removeAgentStreamRows chatId=%@ removed=%d liveLeft=%d",
       String(chatId.suffix(12)), removedIds.count, perChat.isEmpty ? 0 : perChat.count)
     if perChat.isEmpty {
@@ -5804,7 +5787,10 @@ final class ChatEngine {
       let inFlightMessages = Array(self.nativePendingMessagePushRefs.values)
       for pending in inFlightMessages {
         if let provider = self.bridgeProviderForChatLocked(chatId: pending.chatId) {
-          _ = self.failVolatileBridgeSendLocked(
+          // In-flight when the socket died — may or may not have reached the server.
+          // Keep the bubble with an error badge; retrying an agent dispatch that
+          // might already be running stays a user decision.
+          self.markVolatileBridgeSendErrorLocked(
             chatId: pending.chatId,
             messageId: pending.messageId,
             reason: "socket_closed",
@@ -5864,7 +5850,8 @@ final class ChatEngine {
         let inFlightMessages = Array(self.nativePendingMessagePushRefs.values)
         for pending in inFlightMessages {
           if let provider = self.bridgeProviderForChatLocked(chatId: pending.chatId) {
-            _ = self.failVolatileBridgeSendLocked(
+            // Same as socket_closed: wire state unknown, keep the bubble + error badge.
+            self.markVolatileBridgeSendErrorLocked(
               chatId: pending.chatId,
               messageId: pending.messageId,
               reason: "socket_error",
@@ -6063,7 +6050,9 @@ final class ChatEngine {
             self.removeQueuedOutboundDraftLocked(
               chatId: pending.chatId, messageId: pending.messageId, dropDraft: true)
           } else if let provider = self.bridgeProviderForChatLocked(chatId: pending.chatId) {
-            _ = self.failVolatileBridgeSendLocked(
+            // Server rejected the push — keep the user's text visible with an error
+            // badge (tap-to-retry) instead of deleting the bubble.
+            self.markVolatileBridgeSendErrorLocked(
               chatId: pending.chatId,
               messageId: pending.messageId,
               reason: "push_\(status.isEmpty ? "error" : status)",
@@ -6363,7 +6352,7 @@ final class ChatEngine {
               (self.normalizedString(payload["chatId"]) ?? "") == chatId
             }
             if askOutstanding || sinceRunningMs < Self.agentTurnRunningGraceMs {
-              NSLog(
+              VibeDebugLog.log(
                 "[EmptyTrace] agentTypingStopped HOLD chatId=%@ ask=%@ sinceRunningMs=%lld",
                 String(chatId.suffix(12)), askOutstanding ? "Y" : "N", sinceRunningMs)
             } else {
@@ -7296,6 +7285,39 @@ final class ChatEngine {
     for (messageId, row) in liveRows {
       guard !deletedIds.contains(messageId), mergedById[messageId] == nil else { continue }
       mergedById[messageId] = row
+    }
+
+    // Mirrored-prompt dedup: a session transcript records the user's OWN prompt as a
+    // user turn, and the bridge ingest re-emits it as a `bridge-…` user row — while
+    // the phone already renders the real sent message (server row, its own UUID).
+    // Same text, two ids → duplicate "Continue" bubbles. Drop the mirrored copy
+    // whenever a non-bridge own-user row with identical text exists nearby in time.
+    // (When a History session is viewed in isolation the server rows are absent from
+    // this merge, so the mirrored user rows survive there — as they must.)
+    let ownUserTexts: [(text: String, ts: Int64)] = mergedById.compactMap { id, row in
+      guard !id.hasPrefix("bridge-"), !id.hasPrefix("stream-"),
+        messageIsMe(fromRow: row),
+        let message = row["message"] as? [String: Any],
+        let text = normalizedString(message["text"])?
+          .trimmingCharacters(in: .whitespacesAndNewlines),
+        !text.isEmpty
+      else { return nil }
+      return (text, messageTimestampMs(fromRow: row))
+    }
+    if !ownUserTexts.isEmpty {
+      let mirrorDedupWindowMs: Int64 = 48 * 3600 * 1000
+      for (id, row) in mergedById {
+        guard id.hasPrefix("bridge-"), messageIsMe(fromRow: row),
+          let message = row["message"] as? [String: Any],
+          let text = normalizedString(message["text"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+          !text.isEmpty
+        else { continue }
+        let ts = messageTimestampMs(fromRow: row)
+        if ownUserTexts.contains(where: { $0.text == text && abs($0.ts - ts) <= mirrorDedupWindowMs }) {
+          mergedById.removeValue(forKey: id)
+        }
+      }
     }
 
     var mergedRows = Array(mergedById.values)
@@ -8279,14 +8301,13 @@ final class ChatEngine {
         ])
       return
     }
-    if let provider = bridgeProviderForOutboundDraftLocked(payload, fallbackChatId: chatId) {
-      _ = failVolatileBridgeSendLocked(
-        chatId: chatId,
-        messageId: messageId,
-        reason: reason,
-        provider: provider
-      )
-      return
+    var payload = payload
+    let isBridgeDraft = bridgeProviderForOutboundDraftLocked(payload, fallbackChatId: chatId) != nil
+    if isBridgeDraft {
+      // Stamp the (re)queue time — replay refuses bridge drafts older than
+      // bridgeQueuedReplayMaxAgeMs. Lives in the draft so it dies with it;
+      // bridge drafts are never persisted (see persistOutboundStateLocked).
+      payload["__bridgeQueuedAtMs"] = nowMs()
     }
     pendingOutboundDraftsByMessageId[messageId] = payload
     var ids = pendingOutboundQueueByChat[chatId] ?? []
@@ -8317,7 +8338,17 @@ final class ChatEngine {
       if currentStatus == "sent" || currentStatus == "delivered" || currentStatus == "read" {
         return
       }
+      let expiredDraft = self.pendingOutboundDraftsByMessageId[messageId] ?? [:]
+      let isBridgeDraft =
+        self.bridgeProviderForOutboundDraftLocked(expiredDraft, fallbackChatId: chatId) != nil
       self.upsertLocalStatusLocked(chatId: chatId, messageId: messageId, status: "error")
+      if isBridgeDraft {
+        // The user now sees this bridge send as failed — drop it from the queue so
+        // a later reconnect can't ghost-dispatch an agent run behind their back.
+        // The draft stays (out of the queue it never auto-sends) so tap-to-retry
+        // via retryOutgoingMessage still works.
+        self.removeQueuedOutboundDraftLocked(chatId: chatId, messageId: messageId, dropDraft: false)
+      }
       self.appendJournalLocked(
         event: "native-outgoing-visible-error",
         payload: ["chatId": chatId, "messageId": messageId, "reason": reason]
@@ -8349,10 +8380,6 @@ final class ChatEngine {
       dropQueuedOutboundForChatLocked(chatId: chatId, reason: "built_in_agent_replay_\(trigger)")
       return
     }
-    if isVolatileBridgeAgentChatLocked(chatId: chatId) {
-      dropQueuedOutboundForChatLocked(chatId: chatId, reason: "replay_\(trigger)")
-      return
-    }
     let ids = pendingOutboundQueueByChat[chatId] ?? []
     guard !ids.isEmpty else { return }
     NSLog(
@@ -8365,9 +8392,23 @@ final class ChatEngine {
       }) {
         continue
       }
-      if let draft = pendingOutboundDraftsByMessageId[messageId] {
-        drafts.append(draft)
+      guard let draft = pendingOutboundDraftsByMessageId[messageId] else { continue }
+      if let provider = bridgeProviderForOutboundDraftLocked(draft, fallbackChatId: chatId) {
+        // Bridge-agent drafts only auto-send while they're fresh (connection
+        // warm-up). Anything older — e.g. the app sat backgrounded — fails
+        // visibly instead of silently dispatching a stale agent prompt.
+        let queuedAtMs = parseLongValue(draft["__bridgeQueuedAtMs"]) ?? 0
+        if Int64(nowMs()) - queuedAtMs > Int64(bridgeQueuedReplayMaxAgeMs) {
+          markVolatileBridgeSendErrorLocked(
+            chatId: chatId,
+            messageId: messageId,
+            reason: "queued_expired_\(trigger)",
+            provider: provider
+          )
+          continue
+        }
       }
+      drafts.append(draft)
     }
     guard !drafts.isEmpty else { return }
     appendJournalLocked(
@@ -9111,7 +9152,7 @@ final class ChatEngine {
     // [EmptyTrace] This ONLY runs on a socket reset. The user's hypothesis is the list jumps
     // to empty WITHOUT a drop — so if this line is ABSENT from the log at the empty moment,
     // the connection did not reset and the wipe came from elsewhere (ingest/typing/message).
-    NSLog(
+    VibeDebugLog.log(
       "[EmptyTrace] socketReset clearLiveRows — chats=%d (connection DID reset)",
       liveMessageRowsByChat.count)
     // On a socket reset we only drop live rows that a history refetch can re-deliver.
@@ -9135,7 +9176,7 @@ final class ChatEngine {
       }
       if !kept.isEmpty {
         nextLive[chatId] = kept
-        NSLog(
+        VibeDebugLog.log(
           "[FirstMsg] socketReset keeping %d live row(s) chatId=%@ (not in fetched history)",
           kept.count, String(chatId.prefix(12)))
       }

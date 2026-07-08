@@ -3513,7 +3513,10 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     var out: [(messageId: String, nodeId: String, type: String)] = []
     for message in msgs {
       for item in message.progressItems {
-        guard item.itemType == "task" || (item.subagentType?.isEmpty == false) else { continue }
+        // Strict: only REAL Task-tool subagents (task-kind + subagentType). The old
+        // `task-kind OR has-subagentType` let the bridge's synthetic running-task
+        // placeholder (task-kind, no subagentType) fire phantom "Subagent" toasts.
+        guard item.isRealSubagent else { continue }
         let nodeId = item.nodeId ?? item.label
         let running = vibeAgentKitRunningStepStatuses.contains((item.status ?? "").lowercased())
         guard running else { continue }
