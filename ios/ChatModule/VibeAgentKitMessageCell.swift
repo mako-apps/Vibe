@@ -456,15 +456,21 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
           label.backgroundColor = .clear
           label.applyStreamingText(attributed, rawText: content, isStreaming: true)
           let heightConstraint = label.heightAnchor.constraint(equalToConstant: height)
-          heightConstraint.priority = .defaultHigh
+          heightConstraint.priority = .required
           heightConstraint.isActive = true
+          label.setContentCompressionResistancePriority(.required, for: .vertical)
           stack.addArrangedSubview(label)
         } else {
           let label = UILabel()
           label.translatesAutoresizingMaskIntoConstraints = false
           label.numberOfLines = 0
           label.backgroundColor = .clear
+          label.preferredMaxLayoutWidth = contentWidth
           label.attributedText = attributed
+          let heightConstraint = label.heightAnchor.constraint(equalToConstant: height)
+          heightConstraint.priority = .required
+          heightConstraint.isActive = true
+          label.setContentCompressionResistancePriority(.required, for: .vertical)
           stack.addArrangedSubview(label)
         }
 
@@ -480,8 +486,10 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
           storageKey: "worklog-\(text.hashValue)-\(index)"
         )
         let heightConstraint = codeView.heightAnchor.constraint(equalToConstant: height)
-        heightConstraint.priority = .defaultHigh
+        heightConstraint.priority = .required
         heightConstraint.isActive = true
+        codeView.setContentCompressionResistancePriority(.required, for: .vertical)
+        codeView.setContentHuggingPriority(.required, for: .vertical)
         stack.addArrangedSubview(codeView)
       }
     }
@@ -548,7 +556,8 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
     isRuntimeExpanded: Bool = false,
     expandedStepIds: Set<String> = [],
     streamingStartDate: Date? = nil,
-    showsLoaderView: Bool = true
+    showsLoaderView: Bool = true,
+    isContentCollapsed: Bool = false
   ) {
     self.expandedStepIds = expandedStepIds
     self.subagentChildren = subagentChildren
@@ -573,9 +582,11 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
       else { return false }
       return runningStatuses.contains(status)
     }()
+    // Tools-only finished turns still get the Worked card (hasDisplayText can be false
+    // after bridge restart recovery when body text lags the progressNodes payload).
     let canShowCompletedWork =
-      !isStreaming && hasFinalResponseText && hasDisplayText && hasToolProgressItems
-      && !hasRunningProgressItem && !runtimeIsRunning
+      !isStreaming && hasToolProgressItems && !hasRunningProgressItem && !runtimeIsRunning
+      && (hasFinalResponseText || hasDisplayText || hasToolProgressItems)
     isLiveTurn = showsLoader
 
     loaderView.applyAppearance(appearance)
@@ -583,8 +594,9 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
 
     let shouldShowLoader = showsLoaderView && (showsLoader || canShowCompletedWork)
     // Only a finished turn can expand its step list inline; a live turn shows the
-    // shimmer, not a static list.
-    let stepsExpanded = isProgressExpanded && canShowCompletedWork
+    // shimmer, not a static list. Never expand steps while the bubble is tall-collapsed
+    // (the cap is too short for a multi-block feed — crushing it overlaps glass cards).
+    let stepsExpanded = isProgressExpanded && canShowCompletedWork && !isContentCollapsed
 
     if shouldShowLoader {
       let loaderText: String
@@ -672,8 +684,10 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
     // The file-change / diff card belongs to a FINISHED turn only — the agent works
     // top-down and the consolidated patch isn't meaningful until it's done, so don't
     // flash an "edited file" card mid-stream. Live turns show the step feed instead.
+    // Also hide under tall-collapse (no room for a second card under the preview).
     configureRuntimeSummary(
-      (!isStreaming && hasDisplayText && !runtimeIsRunning && Self.hasRuntimeDiff(runtime))
+      (!isContentCollapsed && !isStreaming && hasDisplayText && !runtimeIsRunning
+        && Self.hasRuntimeDiff(runtime))
         ? runtime
         : nil,
       textColor: appearance.text,
@@ -700,7 +714,58 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
       return
     }
 
-
+    // Tall-collapsed bubble: only a single plain text preview fits under the 420pt
+    // cap. Multi-block code cards with required heights fight the cap and paint over
+    // each other (table+bash glass overlap). Expand ("Show more") restores full blocks.
+    if isContentCollapsed {
+      for (index, view) in blockViews.enumerated() {
+        if let label = view as? VibeAgentKitStreamingTextLabel {
+          label.resetStreamingState()
+        }
+        view.isHidden = true
+        blockHeightConstraints[index].constant = 0.0
+      }
+      let preview = Self.collapsedBodyPreview(from: text)
+      let previewBlocks: [VibeAgentKitParsedBlock] = [.text(preview)]
+      // Reuse the normal block path with a single text block only.
+      let signature = "T_collapsed"
+      if signature != lastBlockSignature || blockViews.count != 1 {
+        removeBlockViews()
+        let label = VibeAgentKitStreamingTextLabel()
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.numberOfLines = 0
+        label.backgroundColor = .clear
+        stackView.insertArrangedSubview(
+          label,
+          at: max(1, stackView.arrangedSubviews.count - 1)
+        )
+        let heightConstraint = label.heightAnchor.constraint(equalToConstant: 0.0)
+        heightConstraint.priority = .required
+        heightConstraint.isActive = true
+        label.setContentCompressionResistancePriority(.required, for: .vertical)
+        blockViews = [label]
+        blockHeightConstraints = [heightConstraint]
+        lastBlockSignature = signature
+      }
+      if let label = blockViews.first as? VibeAgentKitStreamingTextLabel {
+        let attributed = VibeAgentKitTextRenderer.makeAttributedText(
+          text: preview,
+          font: font,
+          textColor: appearance.text,
+          lineHeight: lineHeight
+        )
+        // Leave room for the Worked loader (~36) + padding inside the collapse cap.
+        let maxPreviewHeight = max(80.0, tallBubbleCollapsedContentHeight - 72.0)
+        let measured = VibeAgentKitTextRenderer.measuredSize(for: attributed, width: availableWidth)
+        let height = min(maxPreviewHeight, max(ceil(font.lineHeight), measured.height))
+        label.isHidden = false
+        label.applyStreamingText(attributed, rawText: preview, isStreaming: false)
+        blockHeightConstraints[0].constant = height
+      }
+      _ = previewBlocks
+      positionSummaryViews(belowText: false)
+      return
+    }
 
     let blocks = VibeAgentKitTextRenderer.parseBlocks(text)
     let signature = blocks.map { block -> String in
@@ -734,9 +799,13 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
           view,
           at: max(1, stackView.arrangedSubviews.count - 1)
         )
+        // Required height: `.defaultHigh` was compressible, so UIStackView crushed
+        // text/code blocks and their frame-drawn glass cards painted on top of each other.
         let heightConstraint = view.heightAnchor.constraint(equalToConstant: 0.0)
-        heightConstraint.priority = .defaultHigh
+        heightConstraint.priority = .required
         heightConstraint.isActive = true
+        view.setContentCompressionResistancePriority(.required, for: .vertical)
+        view.setContentHuggingPriority(.required, for: .vertical)
         blockViews.append(view)
         blockHeightConstraints.append(heightConstraint)
       }
@@ -770,6 +839,7 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
           isStreaming: isStreaming && index == lastTextIndex
         )
         blockHeightConstraints[index].constant = height
+        blockHeightConstraints[index].priority = .required
 
       case .code(let code, let language):
         let codeView = view as! VibeAgentKitCodeBlockView
@@ -782,12 +852,40 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
           storageKey: "\(messageId)#\(index)"
         )
         blockHeightConstraints[index].constant = height
+        blockHeightConstraints[index].priority = .required
       }
     }
 
     // The work wrapper stays at the top; when expanded, its own stack owns the
     // progress/timeline. The answer body below is only for finished/non-live text.
     positionSummaryViews(belowText: false)
+  }
+
+  /// Plain preview for tall-collapsed agent bubbles: drop fenced code (it needs a
+  /// full-height glass card) and trim to a short readable lead-in.
+  private static func collapsedBodyPreview(from text: String) -> String {
+    var lines: [String] = []
+    var inFence = false
+    for line in text.components(separatedBy: "\n") {
+      if line.hasPrefix("```") {
+        inFence.toggle()
+        continue
+      }
+      if inFence { continue }
+      let trimmed = line.trimmingCharacters(in: .whitespaces)
+      // Skip pure markdown table separator rows in the compact preview.
+      if trimmed.hasPrefix("|") && trimmed.contains("---") { continue }
+      lines.append(line)
+      if lines.joined(separator: "\n").count > 900 { break }
+    }
+    let joined = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    if joined.isEmpty {
+      return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    if joined.count > 900 {
+      return String(joined.prefix(900)).trimmingCharacters(in: .whitespacesAndNewlines) + "…"
+    }
+    return joined
   }
 
   /// Place the loader/work log at the top. For live turns, `stepsStack` owns the

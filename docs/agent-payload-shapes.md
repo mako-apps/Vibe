@@ -380,3 +380,52 @@ Each **user turn** folds into **one** assistant host via `foldTurnIntoHost` (Wor
 | mention | `@grok` |
 | agent user id | `33333333-3333-3333-3333-333333333333` |
 | avatar | `https://media.vibegram.io/chat-media/agent-profiles/grok-v2.png` |
+
+---
+
+## Agy / Antigravity CLI (plain stdout + transcript.jsonl)
+
+Headless command (bridge):
+
+```bash
+agy -p "<prompt>" \
+  [--conversation <id>] \
+  [--model "Gemini 3.1 Pro (High)"] \
+  [--mode accept-edits|plan] \
+  [--dangerously-skip-permissions] \
+  [--print-timeout 30m]
+```
+
+Binary: `agy` (Google Antigravity CLI). Env override: `VIBE_AGY_COMMAND`.
+
+### Source split (critical)
+
+| Source | Authoritative for | Notes |
+|---|---|---|
+| **stdout** | final answer only (plain text) | No tools / no thinking |
+| **`~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl`** | thinking, tool_calls, tool results, narration | Bridge tails while process runs |
+| **`conversation_summaries.db` + `history.jsonl`** | history list metadata | title, workspace, step_count |
+
+### Bridge synthesis
+
+The bridge converts each transcript step into **Grok-compatible NDJSON** so the server reuses the same progress parsers:
+
+| transcript `type` | synthetic line |
+|---|---|
+| `PLANNER_RESPONSE.thinking` | `{"type":"thought","data":"…"}` |
+| `PLANNER_RESPONSE.content` | `{"type":"text","data":"…"}` |
+| `PLANNER_RESPONSE.tool_calls[]` | `{"type":"tool_use", id, name, input}` |
+| `VIEW_FILE` / `RUN_COMMAND` / `CODE_ACTION` / `GREP_SEARCH` / … DONE | `{"type":"tool_result", tool_use_id, content}` |
+| process exit | `{"type":"end","stopReason":"end_turn","sessionId":…}` + plain stdout as `text` |
+
+Tool name map: `view_file`→`read_file`, `run_command`→`run_terminal_command`, `write_to_file`→`write`, `grep_search`→`grep`, etc.
+
+### Agent identity
+
+| field | value |
+|---|---|
+| handle | `agy` |
+| mention | `@agy` (alias `@antigravity`) |
+| agent user id | `44444444-4444-4444-4444-444444444444` |
+| avatar | `https://media.vibegram.io/chat-media/agent-profiles/agy.png` |
+

@@ -16,15 +16,17 @@ defmodule Vibe.AI.LocalAgentWorker do
   @group_context_messages 12
 
   @agent_user_id Vibe.AI.GroupAgent.agent_user_id()
-  # Distinct agent user identities so @claude / @codex / @grok are separate,
+  # Distinct agent user identities so @claude / @codex / @grok / @agy are separate,
   # searchable users you can DM, each with their own avatar — instead of one
   # shared bot user.
   @claude_agent_user_id "11111111-1111-1111-1111-111111111111"
   @codex_agent_user_id "22222222-2222-2222-2222-222222222222"
   @grok_agent_user_id "33333333-3333-3333-3333-333333333333"
+  @agy_agent_user_id "44444444-4444-4444-4444-444444444444"
   @claude_avatar_data_url "https://media.vibegram.io/chat-media/agent-profiles/claude.png"
   @codex_avatar_data_url "https://media.vibegram.io/chat-media/agent-profiles/codex.png"
   @grok_avatar_data_url "https://media.vibegram.io/chat-media/agent-profiles/grok-v2.png"
+  @agy_avatar_data_url "https://media.vibegram.io/chat-media/agent-profiles/agy.png"
   @default_timeout_ms 120_000
   @max_prompt_length 8_000
   @max_tool_events 16
@@ -36,7 +38,7 @@ defmodule Vibe.AI.LocalAgentWorker do
   @session_table :local_agent_worker_sessions
   @team_run_table :local_agent_worker_team_runs
   @default_cooldown_ms 8_000
-  @worker_order ["claude", "codex", "grok"]
+  @worker_order ["claude", "codex", "grok", "agy"]
 
   @workers %{
     "codex" => %{
@@ -70,6 +72,17 @@ defmodule Vibe.AI.LocalAgentWorker do
       username: "grok",
       name: "Grok",
       avatar_url: @grok_avatar_data_url,
+      tier: "gold"
+    },
+    "agy" => %{
+      handle: "agy",
+      label: "Agy",
+      command_env: "VIBE_AGY_COMMAND",
+      default_command: "agy",
+      agent_user_id: @agy_agent_user_id,
+      username: "agy",
+      name: "Agy",
+      avatar_url: @agy_avatar_data_url,
       tier: "gold"
     }
   }
@@ -127,20 +140,28 @@ defmodule Vibe.AI.LocalAgentWorker do
   def resolve_from_message(_), do: nil
 
   def extract_reserved_mention(text) when is_binary(text) do
-    case Regex.run(~r/(?:^|\s)@(codex|claude|grok)\b/i, text) do
-      [_, handle] -> resolve_handle(handle)
-      _ -> nil
+    case Regex.run(~r/(?:^|\s)@(codex|claude|grok|agy|antigravity)\b/i, text) do
+      [_, handle] ->
+        h = String.downcase(handle)
+        resolve_handle(if(h == "antigravity", do: "agy", else: h))
+
+      _ ->
+        nil
     end
   end
 
   def extract_reserved_mention(_), do: nil
 
   def extract_reserved_mentions(text) when is_binary(text) do
-    ~r/(?:^|\s)@(codex|claude|grok)\b/i
+    ~r/(?:^|\s)@(codex|claude|grok|agy|antigravity)\b/i
     |> Regex.scan(text)
     |> Enum.map(fn
-      [_, handle] -> resolve_handle(handle)
-      _ -> nil
+      [_, handle] ->
+        h = String.downcase(handle)
+        resolve_handle(if(h == "antigravity", do: "agy", else: h))
+
+      _ ->
+        nil
     end)
     |> Enum.reject(&is_nil/1)
     |> Enum.uniq_by(& &1.handle)
@@ -872,6 +893,7 @@ defmodule Vibe.AI.LocalAgentWorker do
         "claude" -> "CLAUDE.md"
         "codex" -> "CODEX.md"
         "grok" -> "AGENTS.md"
+        "agy" -> "AGENTS.md"
         _ -> nil
       end
 
@@ -996,7 +1018,7 @@ defmodule Vibe.AI.LocalAgentWorker do
   # scrubber never mangles our context labels, and labels stay clean.
   defp clean_for_memory(text) when is_binary(text) do
     text
-    |> String.replace(~r/(^|\s)@(claude|codex|grok|team)\b/iu, "\\1")
+    |> String.replace(~r/(^|\s)@(claude|codex|grok|agy|antigravity|team)\b/iu, "\\1")
     |> String.replace(~r/(^|\s)\/team\b/iu, "\\1")
     |> String.replace(~r/^\s*team\s*:\s*/iu, "")
     |> String.trim()
@@ -1021,7 +1043,7 @@ defmodule Vibe.AI.LocalAgentWorker do
     |> Enum.map(&"@#{&1.handle}")
     |> Enum.reject(&(&1 == "@"))
     |> case do
-      [] -> "@claude, @codex, @grok"
+      [] -> "@claude, @codex, @grok, @agy"
       handles -> Enum.join(handles, ", ")
     end
   end
@@ -1212,6 +1234,13 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp live_progress_nodes(%{handle: "grok"}, extracted) do
     interleaved_grok_progress_nodes(extracted.decoded, extracted.tool_events, "")
     |> with_live_thinking(extracted.decoded)
+  end
+
+  # Agy reuses the Grok NDJSON contract (bridge synthesizes thought/text/tool_use).
+  defp live_progress_nodes(%{handle: "agy"}, extracted) do
+    interleaved_grok_progress_nodes(extracted.decoded, extracted.tool_events, "")
+    |> with_live_thinking(extracted.decoded)
+    |> rewrite_progress_node_provider_prefix("grok", "agy")
   end
 
   defp live_progress_nodes(_worker, extracted), do: extracted.progress_nodes
@@ -1408,6 +1437,45 @@ defmodule Vibe.AI.LocalAgentWorker do
         maybe_single_arg("VIBE_CLAUDE_DISALLOWED_TOOLS", "--disallowedTools") ++ ["--", prompt]
 
     run_command(worker, executable, args, opts)
+  end
+
+  # Antigravity CLI (`agy -p`): plain final text on stdout; bridge injects full
+  # payload from transcript.jsonl as Grok-shaped NDJSON.
+  defp do_run(%{handle: "agy"} = worker, executable, prompt, opts) do
+    bridge_options = Keyword.get(opts, :bridge_metadata) || %{}
+
+    args =
+      ["-p", prompt, "--print-timeout", System.get_env("VIBE_AGY_PRINT_TIMEOUT") || "30m"] ++
+        agy_mode_args(bridge_options) ++
+        agy_session_args(bridge_options) ++
+        maybe_model_args(bridge_options, "VIBE_AGY_MODEL", "--model")
+
+    run_command(worker, executable, args, opts)
+  end
+
+  defp agy_session_args(bridge_options) do
+    case explicit_resume_session_id(bridge_options) do
+      session_id when is_binary(session_id) -> ["--conversation", session_id]
+      _ -> []
+    end
+  end
+
+  defp agy_mode_args(bridge_options) do
+    mode =
+      bridge_options
+      |> option_value("workMode")
+      |> normalize_string()
+      |> case do
+        value when value in ["plan", "read_only"] -> "plan"
+        value when value in ["full_access", "full", "danger"] -> "full"
+        _ -> "accept"
+      end
+
+    case mode do
+      "plan" -> ["--mode", "plan"]
+      "full" -> ["--dangerously-skip-permissions"]
+      _ -> ["--mode", "accept-edits", "--dangerously-skip-permissions"]
+    end
   end
 
   # Grok Build TUI headless: `grok -p <prompt> --output-format streaming-json`
@@ -1880,9 +1948,26 @@ defmodule Vibe.AI.LocalAgentWorker do
     interleaved_grok_progress_nodes(decoded, tool_events, summary_text)
   end
 
+  defp build_progress_nodes(%{handle: "agy"}, decoded, tool_events, summary_text) do
+    interleaved_grok_progress_nodes(decoded, tool_events, summary_text)
+    |> rewrite_progress_node_provider_prefix("grok", "agy")
+  end
+
   defp build_progress_nodes(_worker, _decoded, tool_events, _summary_text) do
     progress_nodes_from_events(tool_events)
   end
+
+  defp rewrite_progress_node_provider_prefix(nodes, from, to) when is_list(nodes) do
+    Enum.map(nodes, fn
+      %{"id" => id} = node when is_binary(id) ->
+        Map.put(node, "id", String.replace_prefix(id, from <> "-", to <> "-"))
+
+      other ->
+        other
+    end)
+  end
+
+  defp rewrite_progress_node_provider_prefix(nodes, _from, _to), do: nodes
 
   # Grok live stream is a MIX of:
   #   stdout streaming-json: {"type":"thought"|"text"|"end", "data":...}
@@ -2292,6 +2377,10 @@ defmodule Vibe.AI.LocalAgentWorker do
     extract_grok_text(decoded) || plain_output_text(decoded, output)
   end
 
+  defp extract_worker_text(%{handle: "agy"}, decoded, output) do
+    extract_grok_text(decoded) || plain_output_text(decoded, output)
+  end
+
   defp extract_worker_text(_worker, decoded, output), do: plain_output_text(decoded, output)
 
   defp extract_grok_text(decoded) do
@@ -2439,6 +2528,20 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp tool_events_from_decoded(%{handle: "grok"}, decoded) do
     decoded
     |> grok_tool_events()
+    |> Enum.take(@max_tool_events)
+  end
+
+  defp tool_events_from_decoded(%{handle: "agy"}, decoded) do
+    decoded
+    |> grok_tool_events()
+    |> Enum.map(fn ev ->
+      ev
+      |> Map.put("provider", "agy")
+      |> Map.update("label", nil, fn
+        label when is_binary(label) -> String.replace(label, "Grok", "Agy")
+        other -> other
+      end)
+    end)
     |> Enum.take(@max_tool_events)
   end
 
@@ -4035,6 +4138,10 @@ defmodule Vibe.AI.LocalAgentWorker do
     |> String.trim()
     |> String.trim_leading("@")
     |> String.downcase()
+    |> case do
+      "antigravity" -> "agy"
+      other -> other
+    end
   end
 
   defp normalize_string(value) when is_binary(value) do

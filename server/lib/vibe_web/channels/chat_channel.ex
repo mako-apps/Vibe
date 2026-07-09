@@ -1156,7 +1156,8 @@ defmodule VibeWeb.ChatChannel do
     value = normalize_bridge_string(value)
 
     case value && String.downcase(value) do
-      provider when provider in ["claude", "codex", "grok"] -> provider
+      provider when provider in ["claude", "codex", "grok", "agy"] -> provider
+      "antigravity" -> "agy"
       _ -> nil
     end
   end

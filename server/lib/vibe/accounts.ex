@@ -16,7 +16,7 @@ defmodule Vibe.Accounts do
   @legacy_pbkdf2_iterations 1_000
   @phone_min_digits 7
   @phone_max_digits 15
-  @reserved_usernames ["vibeagent", "claude", "codex", "grok"]
+  @reserved_usernames ["vibeagent", "claude", "codex", "grok", "agy"]
 
   # SECURITY: Session token validity window — must match AuthController.
   @token_validity_seconds 30 * 24 * 60 * 60

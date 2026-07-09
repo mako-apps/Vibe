@@ -1,6 +1,6 @@
 # @vibegram/agent-bridge
 
-Run `@claude` / `@codex` / `@grok` / `@grok` / `@grok` on **your own computer**, driven from the Vibe app.
+Run `@claude` / `@codex` / `@grok` / `@agy` on **your own computer**, driven from the Vibe app.
 
 The bridge dials *out* to the Vibe server (no inbound ports). When you mention
 `@claude` or `@codex` in Vibe, the task runs here, on your machine, using your own
@@ -50,7 +50,8 @@ Escalate explicitly with env vars (only on machines you control):
 | `VIBE_CLAUDE_ADVISOR`, `VIBE_CLAUDE_ADVISOR_MODEL` | `fable` for installed service | Claude advisor model override |
 | `VIBE_FABLE_MCP` | enabled | Exposes `mcp__vibeask__ask_fable` so Claude can explicitly ask Fable with mid-run context |
 | `VIBE_FABLE_MODEL` | `fable` | Model used by the explicit Fable MCP advisor tool |
-| `VIBE_FABLE_MCP_CONTEXT_CHARS` | `120000` | Max packaged context sent through the Fable MCP advisor tool |
+| `VIBE_FABLE_MCP_CONTEXT_CHARS` | `24000` | Max packaged prompt chars for Fable (raise only when needed) |
+| `VIBE_FABLE_MCP_TIMEOUT_MS` | `240000` | Timeout for the one-shot Fable `claude -p` spawn |
 | `VIBE_CLAUDE_COMMAND`, `VIBE_CODEX_COMMAND`, `VIBE_GROK_COMMAND` | `claude` / `codex` / `grok` | binary path override |
 | `VIBE_GROK_MODEL` | — | Grok model override |
 | `VIBE_GROK_PERMISSION_MODE` | per task | Grok `--permission-mode` |

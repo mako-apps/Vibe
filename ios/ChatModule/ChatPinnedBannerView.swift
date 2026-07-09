@@ -35,11 +35,14 @@ final class ChatPinnedBannerView: UIControl {
       || titleLabel.text != title
       || bodyLabel.text != body
       || isFilePinned != isFile
+      
+    guard shouldAnimate else { return }
+    
     titleLabel.text = title
     bodyLabel.text = body
     isFilePinned = isFile
     iconImageView.image = UIImage(systemName: isFile ? "pin.circle.fill" : "pin.fill")
-    if shouldAnimate {
+    if animateIcon {
       animatePinIcon()
     }
   }

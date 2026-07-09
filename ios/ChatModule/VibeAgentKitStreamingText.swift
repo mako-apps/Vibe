@@ -595,6 +595,9 @@ final class VibeAgentKitCodeBlockView: UIView {
     super.init(frame: frame)
     backgroundColor = .clear
     isOpaque = false
+    // Outer clips so frame-based card children never paint outside the AL height
+    // the stack assigns (otherwise text/code blocks overlap when height is compressed).
+    clipsToBounds = true
 
     cardView.layer.cornerRadius = 10.0
     cardView.layer.cornerCurve = .continuous
@@ -751,7 +754,35 @@ final class VibeAgentKitCodeBlockView: UIView {
       height: bodyHeight
     )
 
-    return cardHeight + 8.0
+    // Cache the intrinsic height so Auto Layout / stack views cannot crush this
+    // card under a sibling text block (root cause of table+code overlap).
+    preferredCardHeight = cardHeight + 8.0
+    invalidateIntrinsicContentSize()
+    return preferredCardHeight
+  }
+
+  private var preferredCardHeight: CGFloat = 1.0
+
+  override var intrinsicContentSize: CGSize {
+    CGSize(width: UIView.noIntrinsicMetric, height: max(1.0, preferredCardHeight))
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    // When the stack sets our width after configure, re-flow the frame-based card
+    // so the glass box matches the real bounds (prevents misaligned / overlapping paint).
+    let w = bounds.width
+    guard w > 1.0, !codeContent.isEmpty else { return }
+    if abs(w - currentAvailableWidth) > 0.5 {
+      _ = configure(
+        code: codeContent,
+        language: codeLanguage,
+        textColor: baseTextColor,
+        baseFont: originalBaseFont,
+        availableWidth: w,
+        storageKey: expansionStorageKey
+      )
+    }
   }
 
   @objc private func handleExpand() {
@@ -767,7 +798,7 @@ final class VibeAgentKitCodeBlockView: UIView {
       language: codeLanguage,
       textColor: baseTextColor,
       baseFont: originalBaseFont,
-      availableWidth: currentAvailableWidth,
+      availableWidth: max(currentAvailableWidth, bounds.width),
       storageKey: expansionStorageKey
     )
 

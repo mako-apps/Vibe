@@ -2407,6 +2407,11 @@ final class ChatEngine {
     liveBridgeSessionIngestByChatId[chatId] = (
       provider: live.provider, sessionId: live.sessionId, requestId: requestId
     )
+    // Force a full re-apply when the history reply lands. Without this, a stuck
+    // "Thinking…" empty shell can match the last ingest signature and skip the
+    // merge (reopen-later-heals was the only recovery path).
+    lastIngestedBridgeSessionSigByChatId.removeValue(forKey: chatId)
+    pendingBridgeSessionIngestByRequestId[requestId] = (chatId: chatId, provider: live.provider)
     var wirePayload: [String: Any] = [
       "provider": live.provider,
       "mode": "detail",
@@ -2563,6 +2568,10 @@ final class ChatEngine {
     let ingestSig =
       "\(rawMessages.count):\(sessionId):\(lastRawUid):\(lastRawTextSig):\(lastRawNodeSig):\(lastRawRunning)"
     if lastIngestedBridgeSessionSigByChatId[chatId] == ingestSig {
+      // Derive header from THIS payload only — never re-assert Thinking from a
+      // stale lastRawRunning when the bridge has sealed the turn. Re-asserting on
+      // every identical re-push was a root cause of the stuck "Thinking…" header
+      // after settle (reopen-later-heals).
       if lastRawRunning {
         agentTurnRunningAtMsByChatId[chatId] = Int64(nowMs())
         let nodes =
@@ -2573,6 +2582,13 @@ final class ChatEngine {
           label: agentProgressLabelFromNodes(nodes) ?? "Thinking",
           tool: nil,
           status: "running")
+      } else {
+        // Settled identical payload: clear the working header if it is still lit.
+        // Do not wipe stream rows mid-grace here — the full settle branch below
+        // only runs on a non-matching sig; identical settled re-pushes still need
+        // the header cleared after bridge restart recovery.
+        agentTurnRunningAtMsByChatId.removeValue(forKey: chatId)
+        clearAgentProgressLocked(chatId: chatId, reason: "ingestSigMatch(settled)")
       }
       return
     }
@@ -2598,6 +2614,7 @@ final class ChatEngine {
       case "claude": return "Claude"
       case "codex": return "Codex"
       case "grok": return "Grok"
+      case "agy", "antigravity": return "Agy"
       default: return provider.capitalized
       }
     }()
@@ -2686,9 +2703,11 @@ final class ChatEngine {
         // that turn as the streaming "working" state (shimmer + step feed), NOT a
         // collapsed "Worked · N steps" card — the card only belongs to a finished turn
         // (once the run's result lands the flag clears and it collapses).
-        if isRunningTranscriptItem {
-          meta["isStreaming"] = true
-        }
+        // Always write the flag (true or false) so a settle re-ingest cannot leave a
+        // prior `isStreaming=true` stuck on the same bridge-… id (empty cell + Thinking
+        // header after the session is already done).
+        meta["isStreaming"] = isRunningTranscriptItem
+        synthetic["isStreaming"] = isRunningTranscriptItem
         // Carry the per-message E2E runtime card forward so the ingested history
         // shows the same "N files changed +X −Y" card as the live path. The blob
         // stays opaque here; ChatListRow decrypts it with the phone-held key.
@@ -6802,16 +6821,19 @@ final class ChatEngine {
   private static let claudeBridgeAgentUserId = "11111111-1111-1111-1111-111111111111"
   private static let codexBridgeAgentUserId = "22222222-2222-2222-2222-222222222222"
   private static let grokBridgeAgentUserId = "33333333-3333-3333-3333-333333333333"
+  private static let agyBridgeAgentUserId = "44444444-4444-4444-4444-444444444444"
   private static let reservedBridgeAgentUserIds: Set<String> = [
     claudeBridgeAgentUserId,
     codexBridgeAgentUserId,
     grokBridgeAgentUserId,
+    agyBridgeAgentUserId,
   ]
 
   private static let bridgeAgentProvidersByUserId: [String: String] = [
     claudeBridgeAgentUserId: "claude",
     codexBridgeAgentUserId: "codex",
     grokBridgeAgentUserId: "grok",
+    agyBridgeAgentUserId: "agy",
   ]
 
   private static func bridgeAgentUserId(forProvider provider: String) -> String? {
@@ -6819,6 +6841,7 @@ final class ChatEngine {
     case "claude": return claudeBridgeAgentUserId
     case "codex": return codexBridgeAgentUserId
     case "grok": return grokBridgeAgentUserId
+    case "agy", "antigravity": return agyBridgeAgentUserId
     default: return nil
     }
   }
@@ -6832,6 +6855,8 @@ final class ChatEngine {
       return "codex"
     case "grok", Self.grokBridgeAgentUserId:
       return "grok"
+    case "agy", "antigravity", Self.agyBridgeAgentUserId:
+      return "agy"
     default:
       return nil
     }
@@ -7359,6 +7384,79 @@ final class ChatEngine {
         if ownUserTexts.contains(where: { $0.text == text && abs($0.ts - ts) <= mirrorDedupWindowMs }) {
           mergedById.removeValue(forKey: id)
         }
+      }
+    }
+
+    // Agent DM hygiene (Grok desktop + bridge restart):
+    // 1) Drop fully empty agent shells (settled OR streaming with no body/nodes) —
+    //    blank bubbles corrupt height layout and overlap neighbors.
+    // 2) Drop settled stream- rows when a finished bridge- agent card exists for the
+    //    same agent — the classic empty "Worked" duplicate after reconnect.
+    // 3) Drop synthetic running-mirror hosts that are empty (or settled under a card).
+    let hasFinishedAgentCard = mergedById.contains { id, row in
+      guard id.hasPrefix("bridge-") else { return false }
+      guard let message = row["message"] as? [String: Any] else { return false }
+      guard (message["isAgentMessage"] as? Bool) == true else { return false }
+      let meta = message["metadata"] as? [String: Any]
+      let streaming =
+        (message["isStreaming"] as? Bool) == true || (meta?["isStreaming"] as? Bool) == true
+      return !streaming
+    }
+    for (id, row) in mergedById {
+      guard let message = row["message"] as? [String: Any] else { continue }
+      let isAgent = (message["isAgentMessage"] as? Bool) == true
+      guard isAgent else { continue }
+      let meta = message["metadata"] as? [String: Any]
+      let streaming =
+        (message["isStreaming"] as? Bool) == true || (meta?["isStreaming"] as? Bool) == true
+      let text = (
+        normalizedString(message["plainContent"])
+          ?? normalizedString(message["text"])
+          ?? ""
+      ).trimmingCharacters(in: .whitespacesAndNewlines)
+      let nodes =
+        (meta?["progressNodes"] as? [[String: Any]])
+        ?? (message["progressNodes"] as? [[String: Any]])
+        ?? []
+      let hasNodes = !nodes.isEmpty
+      let onlyPlaceholderThinking = hasNodes && nodes.allSatisfy { node in
+        let kind = (normalizedString(node["kind"] ?? node["itemType"]) ?? "").lowercased()
+        let label = (normalizedString(node["label"] ?? node["title"]) ?? "")
+          .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let detail = (
+          normalizedString(node["detail"] ?? node["messageContent"] ?? node["messagePreview"]) ?? ""
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard kind == "thinking" || label == "thinking" || label == "thinking..." else {
+          return false
+        }
+        // Tokens-only / bare Thinking with no detail is still a placeholder shell.
+        return detail.isEmpty
+      }
+      // Empty agent shell — no body, no real steps (settled or streaming placeholder).
+      // Streaming with only a bare Thinking node is held out of the list (header shows
+      // Thinking…); leaving it as a row paints a zero/44pt empty bubble that overlaps.
+      if text.isEmpty, (!hasNodes || onlyPlaceholderThinking) {
+        mergedById.removeValue(forKey: id)
+        VibeDebugLog.log(
+          "[EmptyTrace] dropEmptyAgentShell id=%@ chat=%@ streaming=%@ nodes=%d placeholder=%@",
+          String(id.suffix(20)), String(chatId.suffix(12)),
+          streaming ? "Y" : "N", nodes.count, onlyPlaceholderThinking ? "Y" : "N")
+        continue
+      }
+      // Stale stream row after finished session card arrived (bridge restart recovery).
+      if id.hasPrefix("stream-"), !streaming, hasFinishedAgentCard {
+        // Keep if it still has unique body text the finished card lacks — rare.
+        // Default: drop so the rich bridge- card is the only bubble.
+        mergedById.removeValue(forKey: id)
+        VibeDebugLog.log(
+          "[EmptyTrace] dropStaleStreamRow id=%@ chat=%@ textLen=%d nodes=%d",
+          String(id.suffix(20)), String(chatId.suffix(12)), text.count, nodes.count)
+        continue
+      }
+      // Synthetic running-mirror hosts that settled empty under a real finished card.
+      if id.contains("running-mirror"), text.isEmpty, hasFinishedAgentCard || !streaming {
+        mergedById.removeValue(forKey: id)
+        continue
       }
     }
 

@@ -677,6 +677,21 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let rowWidth: CGFloat
     let state: AgentTurnBubbleState
     let height: CGFloat
+    /// Extra fingerprint for agent turns (progress/text growth). Empty for plain bubbles.
+    let contentVersion: String
+    init(
+      row: ChatListRow,
+      rowWidth: CGFloat,
+      state: AgentTurnBubbleState,
+      height: CGFloat,
+      contentVersion: String = ""
+    ) {
+      self.row = row
+      self.rowWidth = rowWidth
+      self.state = state
+      self.height = height
+      self.contentVersion = contentVersion
+    }
   }
   private var agentTurnHeightCache: [String: RowHeightCacheEntry] = [:]
   // Same memoization for ordinary message rows. Their height is an
@@ -900,6 +915,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private static let claudeAgentUserId = "11111111-1111-1111-1111-111111111111"
   private static let codexAgentUserId = "22222222-2222-2222-2222-222222222222"
   private static let grokAgentUserId = "33333333-3333-3333-3333-333333333333"
+  private static let agyAgentUserId = "44444444-4444-4444-4444-444444444444"
 
   func setGroupSenderDirectory(_ rawMembers: [[String: Any]]) {
     var next: [String: GroupSenderInfo] = [:]
@@ -928,6 +944,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let changed = next.count != groupSenderDirectory.count
       || next.contains { key, value in groupSenderDirectory[key]?.name != value.name }
     groupSenderDirectory = next
+    // Group agent membership drives the repo chip on the composer — refresh it
+    // when the roster lands so Claude/Codex groups get a working picker.
+    updateAgentBridgeControlTitle()
     guard changed, isGroupOrChannel else { return }
     // Directory can land after the rows do — re-decorate what's on screen.
     if !rows.isEmpty {
@@ -1022,6 +1041,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     case "grok":
       // Grok / xAI near-black with slight blue lift.
       return UIColor(red: 0.55, green: 0.72, blue: 0.95, alpha: 1.0)
+    case "agy", "antigravity":
+      // Antigravity / Agy purple-blue.
+      return UIColor(red: 0.62, green: 0.48, blue: 0.98, alpha: 1.0)
     default:
       let base = ChatProfileAppearanceStore.avatarColors(
         title: name, peerUserId: key, chatId: engineChatId
@@ -1058,6 +1080,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       || hay.contains(where: { $0.contains("grok") })
     {
       return "grok"
+    }
+    if idLower == agyAgentUserId || idLower == "00000000-0000-0000-0000-0000000000c4"
+      || hay.contains(where: { $0.contains("agy") || $0.contains("antigravity") })
+    {
+      return "agy"
     }
     return nil
   }
@@ -4949,10 +4976,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // streaming row misses the cache exactly once per chunk, which is the minimum.
     if bubbleUsesAgentTurnContent(row) {
       let state = agentTurnBubbleState(for: row)
+      // Content-version fingerprint: progress node count + label lengths + text length
+      // so settle / history upsert / live ticks never reuse a stale height (overlap).
+      let contentVersion =
+        "\(row.plainContent?.count ?? row.text.count).\(row.agentProgressNodes.count)."
+        + "\(row.agentProgressNodes.reduce(0) { $0 + $1.label.count }).\(row.isStreamingText)"
       if let cached = agentTurnHeightCache[row.key],
         cached.rowWidth == rowWidth,
         cached.state == state,
-        chatListRowContentEqual(cached.row, row)
+        chatListRowContentEqual(cached.row, row),
+        cached.contentVersion == contentVersion
       {
         return cached.height
       }
@@ -4960,7 +4993,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         row: row, rowWidth: rowWidth, agentTurnState: state
       ).bubbleHeight
       agentTurnHeightCache[row.key] = RowHeightCacheEntry(
-        row: row, rowWidth: rowWidth, state: state, height: height)
+        row: row, rowWidth: rowWidth, state: state, height: height,
+        contentVersion: contentVersion)
       return height
     }
     // Ordinary message rows: reuse the last measured height while the row's content, width,
@@ -7355,7 +7389,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     guard provider != nil || isGroupAgentSend else {
       return [:]
     }
-    guard let repository = AgentBridgeSelectionStore.selectedRepository() else {
+    guard
+      let repository = AgentBridgeSelectionStore.selectedRepository(
+        chatId: engineChatId.isEmpty ? nil : engineChatId
+      )
+    else {
       return [:]
     }
 
@@ -7375,7 +7413,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       // resolves per worker at dispatch (see chat_channel.ex resolve_provider_model).
       var models: [String: String] = [:]
       var advisors: [String: String] = [:]
-      for agentProvider in ["claude", "codex", "grok"] {
+      for agentProvider in ["claude", "codex", "grok", "agy"] {
         let options = AgentBridgeSelectionStore.selectedRunOptions(provider: agentProvider)
         if let model = options.model {
           models[agentProvider] = model
@@ -7444,6 +7482,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if peer == "11111111-1111-1111-1111-111111111111" { return "claude" }
     if peer == "22222222-2222-2222-2222-222222222222" { return "codex" }
     if peer == "33333333-3333-3333-3333-333333333333" { return "grok" }
+    if peer == "44444444-4444-4444-4444-444444444444" { return "agy" }
 
     let mention =
       mentionedAgentUsername?
@@ -7451,6 +7490,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       .lowercased()
     if mention == "claude" || mention == "codex" || mention == "grok" {
       return mention
+    }
+    if mention == "agy" || mention == "antigravity" {
+      return "agy"
     }
 
     if text.range(of: "(^|\\s)@claude\\b", options: [.regularExpression, .caseInsensitive]) != nil {
@@ -7462,6 +7504,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if text.range(of: "(^|\\s)@grok\\b", options: [.regularExpression, .caseInsensitive]) != nil {
       return "grok"
     }
+    if text.range(of: "(^|\\s)@(agy|antigravity)\\b", options: [.regularExpression, .caseInsensitive]) != nil {
+      return "agy"
+    }
     return nil
   }
 
@@ -7471,6 +7516,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if peer == "11111111-1111-1111-1111-111111111111" { return "claude" }
     if peer == "22222222-2222-2222-2222-222222222222" { return "codex" }
     if peer == "33333333-3333-3333-3333-333333333333" { return "grok" }
+    if peer == "44444444-4444-4444-4444-444444444444" { return "agy" }
     return nil
   }
 
@@ -7494,19 +7540,64 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
   private func updateAgentBridgeControlTitle() {
     // Bridge-agent DMs (Claude/Codex/Grok) drive the repo chip + agent menu regardless of the
-    // legacy `agentChatMode` surface. "Open" is the fallback for the Vibe AI panel.
-    guard let provider = currentBridgeProvider else {
-      inputBar?.setAgentControlMenu(nil)
-      inputBar?.setSlashCommandMenu(nil)
-      inputBar?.setAgentControlTitle("Open")
+    // legacy `agentChatMode` surface. Groups that include Claude/Codex also need the repo
+    // chip so a pick in the group profile (or here) is visible and changeable mid-chat.
+    // "Open" is the fallback for the Vibe AI panel.
+    let chatScopedRepo =
+      AgentBridgeSelectionStore.selectedRepository(
+        chatId: engineChatId.isEmpty ? nil : engineChatId
+      )
+    let repoName = chatScopedRepo?.name.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+    if let provider = currentBridgeProvider {
+      inputBar?.setAgentControlMode(true)
+      inputBar?.setAgentControlRepoTitle(repoName)
+      inputBar?.setAgentControlMenu(agentControlMenu(provider: provider))
+      inputBar?.setSlashCommandMenu(slashCommandMenu(provider: provider))
       return
     }
-    let repoName =
-      AgentBridgeSelectionStore.selectedRepository()?.name
-        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    inputBar?.setAgentControlRepoTitle(repoName)
-    inputBar?.setAgentControlMenu(agentControlMenu(provider: provider))
-    inputBar?.setSlashCommandMenu(slashCommandMenu(provider: provider))
+
+    if groupHasBridgeAgents() {
+      // No single DM provider — repo menu only (model/work-mode stay on profile).
+      let provider = groupSenderDirectory.values.compactMap(\.provider).first ?? "claude"
+      inputBar?.setAgentControlMode(true)
+      inputBar?.setAgentControlRepoTitle(repoName.isEmpty ? "Repo" : repoName)
+      inputBar?.setAgentControlMenu(groupRepositoryMenu(fallbackProvider: provider))
+      inputBar?.setSlashCommandMenu(nil)
+      return
+    }
+
+    inputBar?.setAgentControlMenu(nil)
+    inputBar?.setSlashCommandMenu(nil)
+    inputBar?.setAgentControlTitle("Open")
+  }
+
+  /// Repo-only menu for group chats that have Claude/Codex members. Selecting a
+  /// repo stores it under this chat id so the next group send carries the cwd.
+  private func groupRepositoryMenu(fallbackProvider: String) -> UIMenu {
+    let repos = AgentPairingService.lastStatusSnapshot?.repositories ?? []
+    let selectedRepo = AgentBridgeSelectionStore.selectedRepository(
+      chatId: engineChatId.isEmpty ? nil : engineChatId
+    )
+    var children: [UIMenuElement] = repos.map { repo in
+      UIAction(
+        title: repo.name,
+        subtitle: repo.path,
+        image: UIImage(systemName: repo.isGitRepository ? "shippingbox" : "folder"),
+        state: (repo.id == selectedRepo?.id || repo.cwd == selectedRepo?.cwd) ? .on : .off
+      ) { [weak self] _ in
+        guard let self else { return }
+        AgentBridgeSelectionStore.select(
+          repo, chatId: self.engineChatId.isEmpty ? nil : self.engineChatId)
+        self.updateAgentBridgeControlTitle()
+      }
+    }
+    children.append(
+      UIAction(title: "Browse repositories…", image: UIImage(systemName: "folder.badge.plus")) {
+        [weak self] _ in
+        self?.onNativeEvent(["type": "openAgentPanel", "provider": fallbackProvider])
+      })
+    return UIMenu(title: "Repository", children: children)
   }
 
   /// Build the "/" command menu for the input bar's slash button, grouped Info / Tasks /
@@ -7516,6 +7607,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private func slashCommandMenu(provider: String) -> UIMenu {
     let isCodex = provider.lowercased().contains("codex")
     let isGrok = provider.lowercased().contains("grok")
+    let isAgy = provider.lowercased().contains("agy") || provider.lowercased().contains("antigravity")
     // (name, subtitle)
     let info: [(String, String)] = [
       ("usage", "Subscription limits + token usage"),
@@ -7539,6 +7631,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let grokTasks: [(String, String)] = [
       ("init", "Set up project memory"),
     ]
+    let agyTasks: [(String, String)] = [
+      ("init", "Set up project memory"),
+    ]
     let options: [(String, String)] = [
       ("plan", "Plan mode: research, don't edit"),
       (isCodex ? "fast" : "reasoning", isCodex ? "Faster, lighter responses" : "Adjust thinking depth"),
@@ -7550,7 +7645,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         }
       }
     }
-    let tasks = isCodex ? codexTasks : (isGrok ? grokTasks : claudeTasks)
+    let tasks = isCodex ? codexTasks : (isGrok ? grokTasks : (isAgy ? agyTasks : claudeTasks))
     let infoMenu = UIMenu(title: "Info", options: .displayInline, children: actions(info))
     let taskMenu = UIMenu(
       title: "Tasks", options: .displayInline,
@@ -7564,7 +7659,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// are distinct items so History no longer bundles permission/report.
   private func agentControlMenu(provider: String) -> UIMenu {
     let repos = AgentPairingService.lastStatusSnapshot?.repositories ?? []
-    let selectedRepo = AgentBridgeSelectionStore.selectedRepository()
+    let chatId = engineChatId.isEmpty ? nil : engineChatId
+    let selectedRepo = AgentBridgeSelectionStore.selectedRepository(chatId: chatId)
     var repoChildren: [UIMenuElement] = repos.map { repo in
       UIAction(
         title: repo.name,
@@ -7572,7 +7668,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         image: UIImage(systemName: repo.isGitRepository ? "shippingbox" : "folder"),
         state: (repo.id == selectedRepo?.id || repo.cwd == selectedRepo?.cwd) ? .on : .off
       ) { [weak self] _ in
-        AgentBridgeSelectionStore.select(repo)
+        AgentBridgeSelectionStore.select(repo, chatId: chatId)
         self?.updateAgentBridgeControlTitle()
       }
     }
@@ -11207,6 +11303,7 @@ final class SenderRunAvatarView: UIView {
     case "claude": return "https://media.vibegram.io/chat-media/agent-profiles/claude.png"
     case "codex": return "https://media.vibegram.io/chat-media/agent-profiles/codex.png"
     case "grok": return "https://media.vibegram.io/chat-media/agent-profiles/grok-v2.png"
+    case "agy", "antigravity": return "https://media.vibegram.io/chat-media/agent-profiles/agy.png"
     default: return nil
     }
   }
@@ -11300,6 +11397,7 @@ final class SenderRunAvatarView: UIView {
   private static func tileColor(for tint: UIColor, provider: String?) -> UIColor {
     if provider == "codex" { return UIColor(white: 0.32, alpha: 1.0) }
     if provider == "grok" { return UIColor(red: 0.12, green: 0.14, blue: 0.18, alpha: 1.0) }
+    if provider == "agy" || provider == "antigravity" { return UIColor(red: 0.18, green: 0.10, blue: 0.32, alpha: 1.0) }
     var white: CGFloat = 0
     var alpha: CGFloat = 0
     if tint.getWhite(&white, alpha: &alpha), white > 0.82 {

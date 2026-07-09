@@ -7012,7 +7012,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     tallToggleRowMessageId = row.messageId ?? row.key
     messageLabel.numberOfLines = 0
     richTextView.clipsToBounds = false
-    agentTurnContentView.clipsToBounds = false
+    // Agent turns: ALWAYS clip. A stale layout height (common after live→settle or
+    // bridge-restart history upsert) must never paint the body over the next cell.
+    agentTurnContentView.clipsToBounds = true
     applyTallFadeMask(to: messageLabel, enabled: false)
     applyTallFadeMask(to: richTextView, enabled: false)
     applyTallFadeMask(to: agentTurnContentView, enabled: false)
@@ -7283,7 +7285,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
               // sheet (same renderer) rather than an inline expand — see presentAgentTurnDetailView.
               self.onAgentAction?(["type": "openAgentTurnDetail", "messageId": messageId])
             },
-            showsLoaderView: agentTurnBubbleShowsWorkedSummary(row)
+            showsLoaderView: agentTurnBubbleShowsWorkedSummary(row),
+            // Tall-collapse: plain text preview only — full multi-block (table+code glass)
+            // must not be laid out into the 420pt cap (causes overlapping boxes).
+            isContentCollapsed: metrics.tallCollapsed
           )
           lastAgentTurnConfiguredRow = row
           lastAgentTurnConfiguredWidth = metrics.messageWidth
@@ -7299,10 +7304,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           )
         )
         if metrics.tallToggleVisible {
-          // Collapsed: metrics.textHeight is the cap — clip the overflowing body and
-          // fade its bottom out softly (the cut must read as "there's more below", not
-          // a hard chop). Expanded: full height, just the "Show less" bar underneath.
-          agentTurnContentView.clipsToBounds = metrics.tallCollapsed
+          // Collapsed: metrics.textHeight is the cap — fade the bottom so the cut
+          // reads as "there's more below". clipsToBounds is already on (above).
           applyTallFadeMask(to: agentTurnContentView, enabled: metrics.tallCollapsed)
           styleTallToggle(collapsed: metrics.tallCollapsed, color: bubbleTextColor)
           tallToggleButton.isHidden = false

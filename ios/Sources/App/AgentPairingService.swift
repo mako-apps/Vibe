@@ -426,7 +426,7 @@ enum AgentBridgeDefaultView: String, CaseIterable, Identifiable {
 enum AgentBridgeSelectionStore {
   static let didChangeNotification = Notification.Name("AgentBridgeSelectionStoreDidChange")
 
-  private static let repositoryKey = "agentBridge.selectedRepository"
+  private static let globalRepositoryKey = "agentBridge.selectedRepository"
   private static let workModeKey = "agentBridge.workMode"
   private static let intelligenceKey = "agentBridge.intelligence"
   private static let speedKey = "agentBridge.speed"
@@ -436,9 +436,52 @@ enum AgentBridgeSelectionStore {
   private static func advisorKey(_ provider: String) -> String {
     "agentBridge.advisor.\(provider.lowercased())"
   }
-  static func selectedRepository() -> AgentBridgeRepository? {
+  /// Per-chat repo selection so each group can keep its own working directory
+  /// without clobbering a Claude/Codex DM pick (and vice versa).
+  private static func repositoryStorageKey(chatId: String?) -> String {
+    let trimmed = chatId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard !trimmed.isEmpty else { return globalRepositoryKey }
+    return "\(globalRepositoryKey).chat.\(trimmed)"
+  }
+
+  /// Resolve the selected repository. When `chatId` is set, prefers that chat's
+  /// stored pick and falls back to the global selection so older installs keep working.
+  static func selectedRepository(chatId: String? = nil) -> AgentBridgeRepository? {
+    if let chatId, !chatId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+      let scoped = decodeRepository(forKey: repositoryStorageKey(chatId: chatId))
+    {
+      return scoped
+    }
+    return decodeRepository(forKey: globalRepositoryKey)
+  }
+
+  static func select(_ repository: AgentBridgeRepository, chatId: String? = nil) {
+    var object: [String: Any] = [
+      "id": repository.id,
+      "name": repository.name,
+      "path": repository.path,
+      "cwd": repository.cwd,
+      "git": repository.isGitRepository,
+    ]
+    if let source = repository.source {
+      object["source"] = source
+    }
+    guard let data = try? JSONSerialization.data(withJSONObject: object) else { return }
+    // Always keep the global key in sync so legacy callers without chatId still work.
+    UserDefaults.standard.set(data, forKey: globalRepositoryKey)
+    if let chatId, !chatId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      UserDefaults.standard.set(data, forKey: repositoryStorageKey(chatId: chatId))
+    }
+    NotificationCenter.default.post(
+      name: didChangeNotification,
+      object: nil,
+      userInfo: chatId.map { ["chatId": $0] }
+    )
+  }
+
+  private static func decodeRepository(forKey key: String) -> AgentBridgeRepository? {
     guard
-      let data = UserDefaults.standard.data(forKey: repositoryKey),
+      let data = UserDefaults.standard.data(forKey: key),
       let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
       let id = normalizedString(object["id"]),
       let path = normalizedString(object["path"])
@@ -454,23 +497,6 @@ enum AgentBridgeSelectionStore {
       source: normalizedString(object["source"]),
       isGitRepository: boolValue(object["git"])
     )
-  }
-
-  static func select(_ repository: AgentBridgeRepository) {
-    var object: [String: Any] = [
-      "id": repository.id,
-      "name": repository.name,
-      "path": repository.path,
-      "cwd": repository.cwd,
-      "git": repository.isGitRepository,
-    ]
-    if let source = repository.source {
-      object["source"] = source
-    }
-    if let data = try? JSONSerialization.data(withJSONObject: object) {
-      UserDefaults.standard.set(data, forKey: repositoryKey)
-      NotificationCenter.default.post(name: didChangeNotification, object: nil)
-    }
   }
 
   static func selectedWorkMode() -> AgentBridgeWorkMode {
@@ -555,6 +581,17 @@ enum AgentBridgeSelectionStore {
         ("Grok 4.5", "Default Grok Build model", "grok-4.5"),
         ("Composer 2.5 Fast", "Faster Grok coding model", "grok-composer-2.5-fast"),
       ]
+    case "agy", "antigravity":
+      return [
+        ("Gemini 3.1 Pro (High)", "Default Antigravity model", "Gemini 3.1 Pro (High)"),
+        ("Gemini 3.1 Pro (Low)", "Faster Pro tier", "Gemini 3.1 Pro (Low)"),
+        ("Gemini 3.5 Flash (High)", "Fast Flash model", "Gemini 3.5 Flash (High)"),
+        ("Gemini 3.5 Flash (Medium)", "Balanced Flash", "Gemini 3.5 Flash (Medium)"),
+        ("Gemini 3.5 Flash (Low)", "Fastest Flash", "Gemini 3.5 Flash (Low)"),
+        ("Claude Sonnet 4.6 (Thinking)", "Claude Sonnet via Agy", "Claude Sonnet 4.6 (Thinking)"),
+        ("Claude Opus 4.6 (Thinking)", "Claude Opus via Agy", "Claude Opus 4.6 (Thinking)"),
+        ("GPT-OSS 120B (Medium)", "Open weights medium", "GPT-OSS 120B (Medium)"),
+      ]
     default:
       return [
         ("GPT-5.5", nil, "gpt-5.5"),
@@ -619,6 +656,7 @@ enum AgentBridgeSelectionStore {
     switch provider.lowercased() {
     case "claude": return "sonnet"
     case "grok": return "grok-4.5"
+    case "agy", "antigravity": return "Gemini 3.1 Pro (High)"
     default: return nil
     }
   }
@@ -647,6 +685,7 @@ enum AgentBridgeSelectionStore {
   static func slashCommandGroups(provider: String) -> [SlashCommandGroup] {
     let isCodex = provider.lowercased().contains("codex")
     let isGrok = provider.lowercased().contains("grok")
+    let isAgy = provider.lowercased().contains("agy") || provider.lowercased().contains("antigravity")
     let info: [SlashCommand] = [
       SlashCommand(name: "usage", subtitle: "Subscription limits + token usage"),
       SlashCommand(name: "status", subtitle: "Account, model, remaining usage"),
@@ -667,8 +706,11 @@ enum AgentBridgeSelectionStore {
       SlashCommand(name: "review", subtitle: "Review your working tree · desktop only"),
       SlashCommand(name: "init", subtitle: "Set up project memory · desktop only"),
     ]
-    // Grok headless does not parse Claude/Codex slash tasks — keep the palette light.
+    // Grok/Agy headless do not parse Claude/Codex slash tasks — keep the palette light.
     let grokTasks: [SlashCommand] = [
+      SlashCommand(name: "init", subtitle: "Set up project memory"),
+    ]
+    let agyTasks: [SlashCommand] = [
       SlashCommand(name: "init", subtitle: "Set up project memory"),
     ]
     let options: [SlashCommand] = [
@@ -677,7 +719,7 @@ enum AgentBridgeSelectionStore {
         name: isCodex ? "fast" : "reasoning",
         subtitle: isCodex ? "Faster, lighter responses" : "Adjust thinking depth"),
     ]
-    let tasks = isCodex ? codexTasks : (isGrok ? grokTasks : claudeTasks)
+    let tasks = isCodex ? codexTasks : (isGrok ? grokTasks : (isAgy ? agyTasks : claudeTasks))
     return [
       SlashCommandGroup(title: "Info", commands: info),
       SlashCommandGroup(title: "Tasks", commands: tasks),
@@ -691,6 +733,7 @@ enum AgentBridgeSelectionStore {
     case "claude": return "Claude"
     case "codex": return "Codex"
     case "grok": return "Grok"
+    case "agy", "antigravity": return "Agy"
     default: return provider.capitalized
     }
   }
@@ -727,6 +770,9 @@ enum AgentBridgeSelectionStore {
     case "grok":
       if normalized.contains("composer") { return "grok-composer-2.5-fast" }
       if normalized.contains("grok-4") || normalized == "grok" { return "grok-4.5" }
+      return model
+    case "agy", "antigravity":
+      // Agy model labels are human-readable and passed through as-is.
       return model
     default:
       switch normalized {
@@ -808,11 +854,14 @@ enum AgentBridgeSelectionStore {
   }
 
   @discardableResult
-  static func ensureValidSelection(from repositories: [AgentBridgeRepository]) -> AgentBridgeRepository? {
+  static func ensureValidSelection(
+    from repositories: [AgentBridgeRepository],
+    chatId: String? = nil
+  ) -> AgentBridgeRepository? {
     // Keep the stored choice only while it still exists on the connected computer.
     // Never auto-pick a repo the user didn't choose — this previously defaulted to
     // the first repo, which silently routed every task to e.g. "vibe".
-    guard let selected = selectedRepository() else { return nil }
+    guard let selected = selectedRepository(chatId: chatId) else { return nil }
     if repositories.isEmpty { return selected }
     return repositories.contains(where: { $0.id == selected.id || $0.cwd == selected.cwd })
       ? selected : nil

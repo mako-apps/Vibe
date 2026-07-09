@@ -54,12 +54,13 @@ Interactive approvals for agents in this repo are governed by
 Destructive commands (rm -rf, sudo, git push, git reset --hard, dd, mkfs, curl|sh,
 npm publish, ...) are blocked in every remote mode, even `full`.
 
-## Ask advisor on complex tasks
+## Ask Fable (advisor) on complex tasks
 
-**Required:** on complex tasks, ask the advisor **before** you commit to an approach
-or start a large implementation.
+**Required:** on complex tasks, ask **Fable** **before** you commit to an approach
+or start a large implementation. Fable is a second-opinion advisor only — it does
+not edit code; you still implement and verify.
 
-Use the Fable MCP tool **`vibeask__ask_fable`** (search tools / `use_tool` if needed).
+### When to ask
 
 Treat a task as complex when any of these apply:
 - multi-step or multi-file design/implementation
@@ -67,15 +68,102 @@ Treat a task as complex when any of these apply:
 - unfamiliar, risky, or security-sensitive code
 - debugging a hard failure after your first fix attempt
 - architecture, API, or data-model decisions
+- payload / stream / bridge / server / iOS chain design
 
-What to send:
-- `question` — the concrete decision or review you need
-- `context` — goal, constraints, findings, errors, current assumptions
-- optional `files` / `diff` — relevant snippets or proposed patch
+Skip Fable for simple, obvious one-liners (typos, renames, trivial edits).
 
-Skip the advisor for simple, obvious one-liners (typos, renames, trivial edits).
-Fable returns advice only — you still implement and verify. If the advisor is
-unavailable (rate limit / error), note that and continue with your best judgment.
+### How to call Fable (Grok Build)
+
+1. Discover the tool schema (do **not** guess parameter names):
+   - `search_tool` with query like `vibeask ask fable` (or `ask_fable`).
+2. Call the qualified tool via `use_tool`:
+   - **tool_name:** `vibeask__ask_fable`
+   - **tool_input:** object below.
+
+If the built-in `advisor` tool is available in this environment, you may use that
+instead — same purpose. Prefer `vibeask__ask_fable` when you need an explicit
+mid-run critique with packaged context.
+
+### Parameters (`vibeask__ask_fable`)
+
+| field | required | meaning |
+|---|---|---|
+| `question` | **yes** | Exact decision or review you need (one concrete ask) |
+| `context` | no | Goal, constraints, findings, errors, assumptions |
+| `diff` | no | Proposed patch / git diff to critique |
+| `constraints` | no | Array of hard rules Fable must respect |
+| `files` | no | Array of `{ path, content, note? }` snippets |
+
+### Example
+
+```json
+{
+  "question": "Should we lazy-load ChatGifPanelView or defer setupUI only?",
+  "context": "Main-thread stall ~3s on chat open. Stack points at ChatGifPanelView.init during setInputBarEnabled. GIF panel is unused on open.",
+  "constraints": [
+    "Minimal iOS change",
+    "Keep GIF panel working on first tap"
+  ],
+  "files": [
+    {
+      "path": "ios/ChatModule/ChatInputBar.swift",
+      "note": "Eager gifPanel property",
+      "content": "private let gifPanel = ChatGifPanelView()"
+    }
+  ]
+}
+```
+
+### How Fable’s response gets back to you
+
+```
+you (executor agent)
+  → MCP tools/call  ask_fable { question, context?, files?, diff? }
+       → vibe-ask-mcp.js builds ONE text prompt (budgeted / truncated)
+       → spawns: claude -p <prompt> --model fable --tools "" --output-format json
+       → Fable model answers as plain text (no tools)
+  ← MCP tool result: { content: [{ type: "text", text: "<advice>" }] }
+you read the text and implement
+```
+
+- Response shape is **plain text** (not a structured JSON decision object).
+- Typical sections: **Assessment / Risks / Next steps / Verification**.
+- Fable does **not** call tools, edit files, or run shell — advice only.
+- You remain responsible for implementation, tests/build, and verification.
+- If Fable is unavailable (rate limit / MCP error / 429 / timeout), **note that**
+  and continue with your best judgment — do not block the whole task forever.
+
+### Optimize usage (keep Fable calls cheap)
+
+Fable billing scales with **prompt size + reply size**. Default package budget is
+~**24k chars** (`VIBE_FABLE_MCP_CONTEXT_CHARS`, was 120k).
+
+**Do:**
+- One **sharp** `question` (decision, not a dump of the whole task).
+- Short `context` (5–15 lines: goal, error, what you already tried).
+- 1–3 file snippets with **only the relevant lines**, not whole files.
+- Small `diff` of the proposed change when reviewing a patch.
+- **One call** at the decision point; don’t re-ask with the same payload.
+
+**Don’t:**
+- Paste full chat logs, entire modules, or multi-MB diffs.
+- Attach 10+ files “just in case.”
+- Call Fable on every tiny edit or after every failed shell command.
+- Re-send the same huge context when a follow-up is only a yes/no.
+
+**Env knobs (bridge / MCP child):**
+
+| env | default | meaning |
+|---|---|---|
+| `VIBE_FABLE_MCP` | on (`0` disables) | Expose `ask_fable` |
+| `VIBE_FABLE_MODEL` | `fable` | Advisor model |
+| `VIBE_FABLE_MCP_CONTEXT_CHARS` | `24000` | Max packaged prompt chars |
+| `VIBE_FABLE_MCP_TIMEOUT_MS` | `240000` | Kill hung advisor spawn |
+
+### Claude Code / bridge note
+
+Claude in this repo may see the same tool as `mcp__vibeask__ask_fable` (or the
+built-in `advisor` tool). Same contract: concrete `question` + lean `context`.
 
 ## Prefer commands that run without approval
 

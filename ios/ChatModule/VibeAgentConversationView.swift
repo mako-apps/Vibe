@@ -303,6 +303,12 @@ enum VibeAgentKitMap {
     let hasRunningNode = row.agentProgressNodes.contains { $0.status.lowercased() == "running" }
     let isLiveTurn = row.isAgentMessage && !isCompaction && !isInterrupted
       && (row.isStreamingText || hasRunningNode)
+    // Tools-only finished turns (common for Grok mid-recovery) still count as "final"
+    // so the Worked · N steps card renders instead of a blank bubble.
+    let hasToolSteps = !items.isEmpty && items.contains { $0.itemType != "text" }
+    let hasFinal =
+      row.isAgentMessage && !isLiveTurn && !isCompaction && !isInterrupted
+      && (hasBodyText || hasToolSteps)
     return VibeAgentKitChatMessage(
       id: row.messageId ?? row.key,
       role: (isUser && !isInterrupted) ? .user : .assistant,
@@ -311,7 +317,7 @@ enum VibeAgentKitMap {
       timestampMs: 0,
       isStreaming: isLiveTurn,
       isError: row.status == "failed",
-      hasFinalResponseText: row.isAgentMessage && !isLiveTurn && !isCompaction && !isInterrupted && hasBodyText,
+      hasFinalResponseText: hasFinal,
       progress: [],
       progressItems: (isCompaction || isInterrupted) ? [] : items,
       subagentChildren: (isCompaction || isInterrupted) ? [:] : subagentChildren,

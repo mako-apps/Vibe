@@ -777,6 +777,7 @@ public final class ChatMainView: UIView,
     for raw in rawMembers {
       let rawId =
         (raw["userId"] as? String)
+        ?? (raw["user_id"] as? String)
         ?? (raw["id"] as? String)
         ?? (raw["memberId"] as? String)
       let trimmedId = rawId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -785,6 +786,7 @@ public final class ChatMainView: UIView,
       let rawName =
         (raw["name"] as? String)
         ?? (raw["username"] as? String)
+        ?? (raw["displayName"] as? String)
         ?? (raw["label"] as? String)
         ?? trimmedId
       let displayName = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -795,13 +797,23 @@ public final class ChatMainView: UIView,
       if let rawRole =
         (raw["role"] as? String)
         ?? (raw["memberRole"] as? String)
+        ?? (raw["member_role"] as? String)
         ?? (raw["participantRole"] as? String)
       {
         let normalizedRole = rawRole.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if !normalizedRole.isEmpty {
           nextRolesByUserId[normalizedId] = normalizedRole
         }
+      } else if let previousRole = groupMemberRoleByUserId[normalizedId], !previousRole.isEmpty {
+        // Preserve last-known role when an incomplete payload omits it — stops
+        // admin ↔ member flicker when home/list refreshes without role fields.
+        nextRolesByUserId[normalizedId] = previousRole
       }
+    }
+    // If this payload was empty/partial, keep prior roles for ids we already knew
+    // that didn't appear — but only when the new list is empty (don't invent).
+    if nextOrder.isEmpty, !groupMemberOrder.isEmpty {
+      return
     }
     groupMemberDisplayNameByUserId = nextNamesByUserId
     groupMemberRoleByUserId = nextRolesByUserId
@@ -1960,20 +1972,29 @@ public final class ChatMainView: UIView,
     var mediaUrl = normalizedPinnedString(pin["mediaUrl"] ?? pin["media_url"])
 
     if let messageId {
-      let rows = ChatEngine.shared.getChatRows(["chatId": chatId])
-      for row in rows.reversed() {
-        guard (row["kind"] as? String) == "message" else { continue }
-        guard let message = row["message"] as? [String: Any] else { continue }
-        guard normalizedPinnedString(message["id"]) == messageId else { continue }
-
-        type =
-          normalizedPinnedString(message["type"] ?? message["messageType"] ?? message["message_type"])?
+      if let message = ChatEngine.shared.getLiveMessageRow(["chatId": chatId, "messageId": messageId]) {
+        type = normalizedPinnedString(message["type"] ?? message["messageType"] ?? message["message_type"])?
           .lowercased() ?? type
         text = text ?? normalizedPinnedString(message["text"] ?? message["plainContent"] ?? message["plain_content"])
         caption = caption ?? normalizedPinnedString(message["caption"])
         fileName = fileName ?? normalizedPinnedString(message["fileName"] ?? message["file_name"])
         mediaUrl = mediaUrl ?? normalizedPinnedString(message["mediaUrl"] ?? message["media_url"])
-        break
+      } else {
+        let rows = ChatEngine.shared.getChatRows(["chatId": chatId])
+        for row in rows.reversed() {
+          guard (row["kind"] as? String) == "message" else { continue }
+          guard let message = row["message"] as? [String: Any] else { continue }
+          guard normalizedPinnedString(message["id"]) == messageId else { continue }
+
+          type =
+            normalizedPinnedString(message["type"] ?? message["messageType"] ?? message["message_type"])?
+            .lowercased() ?? type
+          text = text ?? normalizedPinnedString(message["text"] ?? message["plainContent"] ?? message["plain_content"])
+          caption = caption ?? normalizedPinnedString(message["caption"])
+          fileName = fileName ?? normalizedPinnedString(message["fileName"] ?? message["file_name"])
+          mediaUrl = mediaUrl ?? normalizedPinnedString(message["mediaUrl"] ?? message["media_url"])
+          break
+        }
       }
     }
 

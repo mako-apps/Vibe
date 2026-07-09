@@ -88,7 +88,8 @@ final class VibeAgentTurnContentView: UIView {
     isRuntimeExpanded: Bool = false,
     expandedStepIds: Set<String> = [],
     streamingStartDate: Date? = nil,
-    showsLoaderView: Bool = true
+    showsLoaderView: Bool = true,
+    isContentCollapsed: Bool = false
   ) {
     bodyView.configure(
       text: text,
@@ -106,7 +107,8 @@ final class VibeAgentTurnContentView: UIView {
       isRuntimeExpanded: isRuntimeExpanded,
       expandedStepIds: expandedStepIds,
       streamingStartDate: streamingStartDate,
-      showsLoaderView: showsLoaderView
+      showsLoaderView: showsLoaderView,
+      isContentCollapsed: isContentCollapsed
     )
   }
 
@@ -122,7 +124,8 @@ final class VibeAgentTurnContentView: UIView {
     expandedStepIds: Set<String>,
     streamingStartDate: Date?,
     onLoaderTap: (() -> Void)?,
-    showsLoaderView: Bool = true
+    showsLoaderView: Bool = true,
+    isContentCollapsed: Bool = false
   ) {
     let message = VibeAgentKitMap.chatMessage(from: row)
     var displayText = resoloAssistantDisplayText(for: message)
@@ -143,9 +146,25 @@ final class VibeAgentTurnContentView: UIView {
       let statusText = row.status ?? "nil"
       let kindText = row.agentMsgKind ?? "nil"
       agentTurnContentLogger.notice(
-        "EMPTY finalized turn id=\(message.id, privacy: .public) status=\(statusText, privacy: .public) kind=\(kindText, privacy: .public) nodes=\(row.agentProgressNodes.count, privacy: .public) hasRuntime=N -> 'Stopped' placeholder"
+        "EMPTY finalized turn id=\(message.id, privacy: .public) status=\(statusText, privacy: .public) kind=\(kindText, privacy: .public) nodes=\(row.agentProgressNodes.count, privacy: .public) hasRuntime=N -> drop shell (no Stopped placeholder)"
       )
-      displayText = "Stopped"
+      // Prefer leaving body empty: ChatEngine drops fully-empty agent shells from the
+      // merge. A "Stopped" placeholder was painting blank-looking Worked cells that
+      // overlapped neighbors when height recovery raced after bridge restart.
+      displayText = ""
+    }
+
+    // Tools-only finished turn with empty body: surface a short line so the Worked
+    // card isn't a zero-height empty shell while steps remain expandable.
+    if !message.isStreaming
+      && displayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      && !message.progressItems.isEmpty
+      && message.hasFinalResponseText
+    {
+      let toolCount = message.progressItems.filter { $0.itemType != "text" }.count
+      if toolCount > 0 {
+        displayText = ""  // Worked · N steps loader carries the summary; no fake body
+      }
     }
 
     configure(
@@ -164,7 +183,8 @@ final class VibeAgentTurnContentView: UIView {
       isRuntimeExpanded: isRuntimeExpanded,
       expandedStepIds: expandedStepIds,
       streamingStartDate: streamingStartDate,
-      showsLoaderView: showsLoaderView
+      showsLoaderView: showsLoaderView,
+      isContentCollapsed: isContentCollapsed
     )
   }
 }

@@ -6,7 +6,7 @@
  *
  * Runs on the user's OWN computer. Pairs to a Vibe account with a one-time code,
  * then connects (outbound only) to the Vibe server and waits for `run_task`
- * events. For each task it runs `claude` / `codex` locally and streams the raw
+ * events. For each task it runs `claude` / `codex` / `grok` / `agy` locally and streams the raw
  * output back — the Vibe server parses it and posts the result into the chat.
  *
  * Usage:
@@ -25,6 +25,7 @@ const crypto = require("crypto");
 const readline = require("readline");
 const net = require("net");
 const { spawn, execFileSync } = require("child_process");
+const agySupport = require("./agy-support");
 
 let WebSocket, Phoenix;
 try {
@@ -349,6 +350,7 @@ function bridgeInstructionRelativeFiles(provider) {
   if (provider === "claude") files.push(path.join(BRIDGE_INSTRUCTION_DIR, "CLAUDE.md"));
   else if (provider === "codex") files.push(path.join(BRIDGE_INSTRUCTION_DIR, "CODEX.md"));
   else if (provider === "grok") files.push(path.join(BRIDGE_INSTRUCTION_DIR, "AGENTS.md"));
+  else if (provider === "agy") files.push(path.join(BRIDGE_INSTRUCTION_DIR, "AGENTS.md"));
   else {
     files.push(path.join(BRIDGE_INSTRUCTION_DIR, "CLAUDE.md"));
     files.push(path.join(BRIDGE_INSTRUCTION_DIR, "CODEX.md"));
@@ -423,7 +425,7 @@ function taskWantsBridgeInstructions(task, prompt) {
     if (Array.isArray(task.teamWorkers) && task.teamWorkers.length) return true;
     if (Array.isArray(task.teamWorker) && task.teamWorker.length) return true;
   }
-  return /(^|\s)@(codex|claude|grok|team|vibe)\b/i.test(String(prompt || ""));
+  return /(^|\s)@(codex|claude|grok|agy|antigravity|team|vibe)\b/i.test(String(prompt || ""));
 }
 
 function taskPromptWithBridgeInstructions(provider, prompt, repo) {
@@ -786,7 +788,7 @@ const CODEX_DESKTOP_ONLY = new Set(CODEX_SLASH_INFO.filter((c) => c.kind === "de
 
 function stripReservedMention(prompt, provider) {
   return String(prompt || "")
-    .replace(/(^|\s)@(codex|claude|grok)\b/ig, " ")
+    .replace(/(^|\s)@(codex|claude|grok|agy|antigravity)\b/ig, " ")
     .trim();
 }
 
@@ -910,6 +912,11 @@ function codexApprovalPolicy(task) {
   }
 }
 
+function agyPermissionMode(task) {
+  // Agy uses --mode / --dangerously-skip-permissions (see agy-support.agyWorkModeFlags).
+  return workModeFor(task);
+}
+
 function grokPermissionMode(task) {
   if (process.env.VIBE_GROK_PERMISSION_MODE) return process.env.VIBE_GROK_PERMISSION_MODE;
   switch (workModeFor(task)) {
@@ -1016,7 +1023,9 @@ function modelFor(provider, chatId, task) {
         ? process.env.VIBE_CODEX_MODEL
         : provider === "grok"
           ? process.env.VIBE_GROK_MODEL
-          : null;
+          : provider === "agy"
+            ? process.env.VIBE_AGY_MODEL
+            : null;
   return envModel && String(envModel).trim() ? normalizeModel(provider, envModel) : null;
 }
 
@@ -1186,6 +1195,23 @@ function buildCommand(provider, prompt, chatId, task) {
       cmd: process.env.VIBE_GROK_COMMAND || "grok",
       args,
       sessionId: assignedSessionId,
+    };
+  }
+
+  if (provider === "agy") {
+    // Antigravity CLI (`agy`): plain stdout final answer; tools/thinking in
+    // ~/.gemini/antigravity-cli/brain/<id>/…/transcript.jsonl (see agy-support).
+    const resumeId = resumeIdFor(task);
+    const args = agySupport.buildAgyArgs({
+      prompt: cleaned,
+      resumeId,
+      model,
+      workMode: workModeFor(task),
+    });
+    return {
+      cmd: process.env.VIBE_AGY_COMMAND || "agy",
+      args,
+      sessionId: resumeId || null,
     };
   }
   return null;
@@ -1686,7 +1712,16 @@ function formatUsage(runtime) {
 function formatCommands(provider) {
   const caps = capabilitiesByProvider.get(provider) || {};
   const catalog = providerCommandCatalog(provider, caps);
-  const title = provider === "claude" ? "Claude" : provider === "codex" ? "Codex" : provider === "grok" ? "Grok" : provider;
+  const title =
+    provider === "claude"
+      ? "Claude"
+      : provider === "codex"
+        ? "Codex"
+        : provider === "grok"
+          ? "Grok"
+          : provider === "agy"
+            ? "Agy"
+            : provider;
   const descOf = provider === "claude" ? CLAUDE_COMMAND_DESC : CODEX_COMMAND_DESC;
   const desktopOnly = provider === "claude" ? CLAUDE_DESKTOP_ONLY : CODEX_DESKTOP_ONLY;
   const slashLine = (cmd) => {
@@ -1719,7 +1754,16 @@ function formatCommands(provider) {
 
 function formatSkills(provider) {
   const caps = capabilitiesByProvider.get(provider) || {};
-  const title = provider === "claude" ? "Claude" : provider === "codex" ? "Codex" : provider === "grok" ? "Grok" : provider;
+  const title =
+    provider === "claude"
+      ? "Claude"
+      : provider === "codex"
+        ? "Codex"
+        : provider === "grok"
+          ? "Grok"
+          : provider === "agy"
+            ? "Agy"
+            : provider;
   const sections = [];
   const addList = (label, values) => {
     const list = compactStringList(values || [], 80);
@@ -1896,7 +1940,16 @@ async function bridgeCommandOutput(provider, chatId, task, repo, command) {
   const currentModel = modelFor(provider, chatId, task);
   const currentAdvisor = advisorFor(provider, chatId, task);
   const lastRuntime = lastRuntimeBySession.get(key);
-  const providerTitle = provider === "claude" ? "Claude" : provider === "codex" ? "Codex" : provider === "grok" ? "Grok" : provider;
+  const providerTitle =
+    provider === "claude"
+      ? "Claude"
+      : provider === "codex"
+        ? "Codex"
+        : provider === "grok"
+          ? "Grok"
+          : provider === "agy"
+            ? "Agy"
+            : provider;
   if (command.desktopOnly) {
     const desc = (provider === "claude" ? CLAUDE_COMMAND_DESC : CODEX_COMMAND_DESC)[command.name];
     return [
@@ -1990,8 +2043,11 @@ async function bridgeCommandOutput(provider, chatId, task, repo, command) {
           ? "codex"
           : provider === "grok"
             ? (process.env.VIBE_GROK_COMMAND || "grok")
-            : (process.env.VIBE_CLAUDE_COMMAND || "claude");
-      const doctorArgs = provider === "grok" ? ["--version"] : ["doctor"];
+            : provider === "agy"
+              ? (process.env.VIBE_AGY_COMMAND || "agy")
+              : (process.env.VIBE_CLAUDE_COMMAND || "claude");
+      const doctorArgs =
+        provider === "grok" || provider === "agy" ? ["--version"] : ["doctor"];
       const out = runCliCapture(doctorCmd, doctorArgs, 25000);
       return out || `${providerTitle} doctor produced no output.`;
     }
@@ -2324,6 +2380,11 @@ function bridgeStatusPayload() {
         permissionMode: process.env.VIBE_GROK_PERMISSION_MODE || "per-task",
         command: process.env.VIBE_GROK_COMMAND || "grok",
         model: process.env.VIBE_GROK_MODEL || "settings/default",
+      },
+      agy: {
+        permissionMode: process.env.VIBE_AGY_PERMISSION_MODE || "per-task",
+        command: process.env.VIBE_AGY_COMMAND || "agy",
+        model: process.env.VIBE_AGY_MODEL || "settings/default",
       },
       workModes: ["ask", "ask_auto", "read_only", "allow_edits", "full_access"],
     },
@@ -2769,7 +2830,9 @@ async function runTask(channel, task) {
     const rid = resumeIdFor(task);
     const resumeFlag = provider === "codex"
       ? built.args.includes("resume")
-      : built.args.includes("--resume");
+      : provider === "agy"
+        ? built.args.includes("--conversation")
+        : built.args.includes("--resume");
     console.log(
       `[vibe-bridge] resume ${provider} chat=${chatId} task=${taskId} ` +
         `resumeId=${rid || "(none/fresh)"} resumeInArgs=${resumeFlag}`
@@ -2937,8 +3000,8 @@ async function runTask(channel, task) {
       }
       return;
     }
-    // Grok: streaming-json thought chunks — coalesce into the same vibe_thinking ticker.
-    if (provider === "grok" && line.includes('"thought"')) {
+    // Grok/Agy: thought chunks — coalesce into the same vibe_thinking ticker.
+    if ((provider === "grok" || provider === "agy") && line.includes('"thought"')) {
       let obj;
       try {
         obj = JSON.parse(line);
@@ -3028,31 +3091,42 @@ async function runTask(channel, task) {
   // updates.jsonl. With a pinned --session-id we can tail that file live and
   // inject Claude-compatible tool_use/tool_result lines into the same progress
   // buffer the server reparses (so progressNodes grow like Claude/Codex).
+  // Agy: stdout is plain final text; tools/thinking live in transcript.jsonl.
   let grokTail = null;
+  let agyTail = null;
+  const injectSynthetic = (line) => {
+    if (!line || canceled) return;
+    lastChunkAt = Date.now();
+    const bare = line.endsWith("\n") ? line.slice(0, -1) : line;
+    output += bare + "\n";
+    // Reuse Grok thought ticker for Agy transcript thought injections.
+    if (provider === "agy" || provider === "grok") {
+      try {
+        trackThinking(bare);
+      } catch {
+        /* */
+      }
+    }
+    if (progressCount >= MAX_PROGRESS_LINES) return;
+    if (bare.length > MAX_LINE_BYTES) return;
+    progressCount++;
+    const now = Date.now();
+    pushProgressFrame(channel, key, {
+      provider,
+      chatId,
+      taskId,
+      sentAtMs: now,
+      replyToId,
+      repoId: repo.id,
+      repoName: repo.name,
+      cwd,
+      workMode: workModeFor(task),
+      model: modelFor(provider, chatId, task) || null,
+      advisor: advisorFor(provider, chatId, task) || null,
+      line: bare,
+    });
+  };
   if (provider === "grok" && initialSessionId) {
-    const injectSynthetic = (line) => {
-      if (!line || canceled) return;
-      lastChunkAt = Date.now();
-      output += line.endsWith("\n") ? line : line + "\n";
-      if (progressCount >= MAX_PROGRESS_LINES) return;
-      if (line.length > MAX_LINE_BYTES) return;
-      progressCount++;
-      const now = Date.now();
-      pushProgressFrame(channel, key, {
-        provider,
-        chatId,
-        taskId,
-        sentAtMs: now,
-        replyToId,
-        repoId: repo.id,
-        repoName: repo.name,
-        cwd,
-        workMode: workModeFor(task),
-        model: modelFor(provider, chatId, task) || null,
-        advisor: advisorFor(provider, chatId, task) || null,
-        line: line.endsWith("\n") ? line.slice(0, -1) : line,
-      });
-    };
     grokTail = startGrokUpdatesTail({
       cwd,
       sessionId: initialSessionId,
@@ -3060,6 +3134,22 @@ async function runTask(channel, task) {
     });
     const entry = runningTasks.get(key);
     if (entry) entry.grokTail = grokTail;
+  }
+  if (provider === "agy") {
+    agyTail = agySupport.startAgyTranscriptTail({
+      cwd,
+      sessionId: initialSessionId || null,
+      startedAtMs: startedAt,
+      onLine: injectSynthetic,
+      onSessionId: (sid) => {
+        if (!sid) return;
+        sessionByChat.set(chatId, sid);
+        const entry = runningTasks.get(key);
+        if (entry) entry.sessionId = sid;
+      },
+    });
+    const entry = runningTasks.get(key);
+    if (entry) entry.agyTail = agyTail;
   }
 
   // Keepalive: while the CLI is mid-run but silent (long thinking / a quiet
@@ -3096,11 +3186,32 @@ async function runTask(channel, task) {
       clearInterval(keepaliveTimer);
       keepaliveTimer = null;
     }
-    // Final drain of Grok updates.jsonl so the last tool_call_update isn't lost
-    // when stdout's end frame races the file flush.
+    // Final drain of Grok updates.jsonl / Agy transcript so the last tool
+    // update isn't lost when stdout's end frame races the file flush.
     try {
       if (grokTail && typeof grokTail.stop === "function") grokTail.stop();
     } catch (_) {}
+    try {
+      if (agyTail && typeof agyTail.stop === "function") agyTail.stop();
+    } catch (_) {}
+    // Agy print mode only prints the final answer as plain text — fold it into
+    // a text NDJSON event so the server extract path matches Grok.
+    if (provider === "agy" && output && !output.includes('"type":"text"') && !output.includes('"type": "text"')) {
+      const plain = String(output)
+        .split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l && !l.startsWith("{"))
+        .join("\n")
+        .trim();
+      if (plain) {
+        const textLine = JSON.stringify({ type: "text", data: plain });
+        output += (output.endsWith("\n") ? "" : "\n") + textLine + "\n";
+        const sid = sessionByChat.get(chatId) || (agyTail && agyTail.sessionId) || null;
+        if (sid) {
+          output += JSON.stringify({ type: "end", stopReason: "end_turn", sessionId: sid }) + "\n";
+        }
+      }
+    }
     runningTasks.delete(key);
     pushBridgeStatus(channel);
     // The run is done — re-push this chat's transcript so the live "running" flag on
@@ -3591,6 +3702,13 @@ const LIVE_SESSION_WINDOW_MS = Number(process.env.VIBE_HISTORY_LIVE_WINDOW_MS ||
 // jumps to empty" during thinking). stop_reason=end_turn settles instantly, so this
 // generous cap only ever lingers after a mid-turn crash/kill.
 const DETAIL_MIDTURN_STALE_MS = Number(process.env.VIBE_DETAIL_MIDTURN_STALE_MS || 15 * 60_000);
+// Grok is chatty during tools (updates.jsonl ticks often). Using Claude's 15-minute
+// mid-turn window left finished Grok turns marked running for up to 15 minutes after
+// the last write — phone stuck on "Thinking…" with an empty/suppressed body until a
+// full chat reopen. Quiet for ~30s ⇒ settled; turn_completed seals immediately.
+const GROK_DETAIL_MIDTURN_STALE_MS = Number(
+  process.env.VIBE_GROK_DETAIL_MIDTURN_STALE_MS || 30_000
+);
 // Upper bound on how far a roster summary streams into a rollout before giving up on
 // finding a topic. With streaming early-exit (codexSummaryFromHead) a session with a
 // normal-sized preamble stops in the first few KB; this cap only bites resumed sessions
@@ -4003,7 +4121,7 @@ function liveAgentActionsField(provider, output) {
   let actions = [];
   if (provider === "codex") actions = liveCodexActions(output);
   else if (provider === "claude") actions = liveClaudeActions(output);
-  else if (provider === "grok") actions = liveGrokActions(output);
+  else if (provider === "grok" || provider === "agy") actions = liveGrokActions(output);
   if (!actions.length) return {};
   const enc = encryptRuntimeBlob({ actions });
   return enc ? { agentActionsEnc: enc } : {};
@@ -5145,11 +5263,13 @@ async function readHistory({ provider, mode, sessionId, limit, before }) {
     const cap = limit || HISTORY_MSG_LIMIT;
     if (p === "codex") return { mode: "detail", session: await codexDetail(sessionId, cap, before) };
     if (p === "grok") return { mode: "detail", session: await grokDetail(sessionId, cap, before) };
+    if (p === "agy") return { mode: "detail", session: await agyDetail(sessionId, cap, before) };
     return { mode: "detail", session: await claudeDetail(sessionId, cap, before) };
   }
   const cap = limit || HISTORY_LIST_LIMIT;
   if (p === "codex") return { mode: "list", sessions: await listCodex(cap) };
   if (p === "grok") return { mode: "list", sessions: await listGrok(cap) };
+  if (p === "agy") return { mode: "list", sessions: await listAgy(cap) };
   return { mode: "list", sessions: await listClaude(cap) };
 }
 
@@ -5158,6 +5278,20 @@ async function readHistory({ provider, mode, sessionId, limit, before }) {
 // matches Claude/Codex. Live run_task still streams separately.
 function grokSessionsRoot() {
   return path.join(os.homedir(), ".grok", "sessions");
+}
+
+/** Freshest Grok session id for current-session adopt (desktop or bridge-spawned). */
+function latestGrokSessionIdForChat() {
+  const files = grokSessionFiles().sort((a, b) => b.mtime - a.mtime);
+  if (!files.length) return null;
+  const defaultCwd = realDir(DEFAULT_CWD) || DEFAULT_CWD;
+  const preferred = files.find((f) => {
+    const proj = realDir(f.project) || f.project;
+    return proj === defaultCwd || String(f.project || "") === String(DEFAULT_CWD || "");
+  });
+  // Prefer a session still being written (live desktop run).
+  const live = files.find((f) => Date.now() - f.mtime < LIVE_SESSION_WINDOW_MS * 4);
+  return (live && live.id) || (preferred && preferred.id) || files[0].id;
 }
 
 function grokSessionFiles() {
@@ -5260,6 +5394,203 @@ function grokHistoryContentText(content) {
     return content.text;
   }
   return "";
+}
+
+async function listAgy(limit) {
+  const files = agySupport
+    .agySessionFiles()
+    .sort((a, b) => b.mtime - a.mtime)
+    .slice(0, limit || HISTORY_LIST_LIMIT);
+  const runningIds = runningSessionIdSet("agy");
+  const results = [];
+  for (const s of files) {
+    const { steps } = agySupport.loadTranscriptSteps(s.id);
+    const userSteps = steps.filter((st) => st && st.type === "USER_INPUT");
+    if (!userSteps.length && !(s.messages > 0)) continue;
+    let topic = s.topic || null;
+    if (!topic && userSteps[0]) {
+      topic = cleanTopicCandidate(agySupport.extractUserRequest(userSteps[0].content));
+    }
+    results.push({
+      provider: "agy",
+      id: s.id,
+      topic: topic || "Agy session",
+      project: s.project || "",
+      projectName: path.basename(s.project || "") || "Computer",
+      updatedAt: s.lastTs || new Date(s.mtime).toISOString(),
+      messageCount: s.messages || userSteps.length || 1,
+      live: sessionIsLive(s.mtime, s.id, runningIds),
+    });
+  }
+  return results;
+}
+
+async function agyDetail(sessionId, limit, before) {
+  const match = agySupport.agySessionFiles().find((s) => s.id === sessionId);
+  if (!match) return null;
+  const { steps } = agySupport.loadTranscriptSteps(sessionId);
+  const messages = [];
+  let topic = match.topic || null;
+  let idx = 0;
+  let turnItems = [];
+  let turnReasoning = "";
+  let turnThinking = { had: false, tokens: 0, durationMs: 0 };
+  let turnStartTs = null;
+  let turnEndTs = null;
+  const actionDetailByUid = new Map();
+  const resultByUid = new Map();
+  const toolCtx = { pendingTools: new Map(), pendingByName: new Map() };
+
+  const flushTurn = (interrupted) => {
+    foldTurnIntoHost(
+      messages,
+      turnItems,
+      actionDetailByUid,
+      resultByUid,
+      turnReasoning,
+      null,
+      turnThinking,
+      interrupted
+    );
+    turnItems = [];
+    turnReasoning = "";
+    turnThinking = { had: false, tokens: 0, durationMs: 0 };
+    turnStartTs = null;
+    turnEndTs = null;
+  };
+
+  for (const step of steps) {
+    if (!step || typeof step !== "object") continue;
+    const type = String(step.type || "");
+    const ts = step.created_at || null;
+
+    if (type === "USER_INPUT") {
+      const text = agySupport.extractUserRequest(step.content);
+      if (!text) continue;
+      flushTurn(false);
+      turnStartTs = ts;
+      if (!topic) {
+        const clean = cleanTopicCandidate(text);
+        if (clean) topic = clean;
+      }
+      messages.push({
+        role: "user",
+        text: clipText(text, 4000),
+        ts,
+        uid: `agy-user-${step.step_index != null ? step.step_index : idx++}`,
+      });
+      continue;
+    }
+
+    // Skip system scaffolding
+    if (
+      type === "CONVERSATION_HISTORY" ||
+      type === "EPHEMERAL_MESSAGE" ||
+      type === "CHECKPOINT" ||
+      type === "SYSTEM_MESSAGE"
+    ) {
+      continue;
+    }
+
+    if (type === "PLANNER_RESPONSE") {
+      if (ts) turnEndTs = ts;
+      if (typeof step.thinking === "string" && step.thinking.trim()) {
+        const think = cleanMessageText(step.thinking).trim();
+        turnThinking.had = true;
+        const tokens = Math.max(1, Math.round(think.length / 4));
+        turnThinking.tokens += tokens;
+        turnItems.push({
+          type: "think",
+          text: think,
+          uid: `agy-think-${step.step_index != null ? step.step_index : idx++}`,
+          ts,
+          tokens,
+        });
+        turnReasoning = turnReasoning ? turnReasoning + "\n" + think : think;
+      }
+      if (typeof step.content === "string" && step.content.trim()) {
+        turnItems.push({
+          type: "text",
+          text: cleanMessageText(step.content).trim(),
+          uid: `agy-text-${step.step_index != null ? step.step_index : idx++}`,
+          ts,
+        });
+      }
+      const calls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
+      calls.forEach((tc, i) => {
+        if (!tc || typeof tc !== "object") return;
+        const rawName = tc.name || "tool";
+        const id = `agy-${step.step_index != null ? step.step_index : idx}-${rawName}-${i}`;
+        const list = toolCtx.pendingByName.get(rawName) || [];
+        list.push(id);
+        toolCtx.pendingByName.set(rawName, list);
+        const mapped = agySupport.mapAgyToolName(rawName);
+        const input = agySupport.mapAgyToolInput(rawName, tc.args || {});
+        actionDetailByUid.set(id, grokActionDetail(mapped, input));
+        turnItems.push({ type: "tool", uid: id, ts });
+      });
+      continue;
+    }
+
+    // Tool result steps — attach output to pending tool ids
+    const resultTypes = {
+      VIEW_FILE: "view_file",
+      RUN_COMMAND: "run_command",
+      CODE_ACTION: "write_to_file",
+      GREP_SEARCH: "grep_search",
+      MCP_TOOL: "mcp_tool",
+      ERROR_MESSAGE: "tool",
+    };
+    if (resultTypes[type] || type === "GENERIC") {
+      const mapped = resultTypes[type] || "tool";
+      let id = null;
+      const candidates = [mapped, agySupport.mapAgyToolName(mapped), "view_file", "run_command", "write_to_file", "grep_search"];
+      for (const c of candidates) {
+        const q = toolCtx.pendingByName.get(c);
+        if (q && q.length) {
+          id = q.shift();
+          break;
+        }
+      }
+      if (!id) continue;
+      const isError = type === "ERROR_MESSAGE" || String(step.status || "").toUpperCase() === "ERROR";
+      resultByUid.set(id, {
+        output: clipText(String(step.content || step.error || ""), MAX_ACTION_OUTPUT),
+        isError,
+      });
+    }
+  }
+  flushTurn(false);
+
+  // Windowing
+  const cap = limit || HISTORY_MSG_LIMIT;
+  let end = messages.length;
+  let start = Math.max(0, end - cap);
+  if (before) {
+    const bi = messages.findIndex((m) => String(m.uid) === String(before));
+    if (bi > 0) end = bi;
+    start = Math.max(0, end - cap);
+  }
+  const window = messages.slice(start, end);
+  const live =
+    match && Date.now() - (match.mtime || 0) < agySupport.AGY_DETAIL_MIDTURN_STALE_MS;
+
+  return {
+    id: sessionId,
+    provider: "agy",
+    topic: topic || "Agy session",
+    project: match.project || "",
+    projectName: path.basename(match.project || "") || "Computer",
+    cwd: match.project || "",
+    messages: window,
+    lastStopReason: live ? null : "end_turn",
+    truncated: start > 0 || end < messages.length,
+    hasMoreBefore: start > 0,
+    nextBefore: window.length ? String(window[0].uid || "") : null,
+    windowStart: start,
+    windowEnd: end,
+    totalMessages: messages.length,
+  };
 }
 
 async function listGrok(limit) {
@@ -5485,6 +5816,11 @@ async function grokDetail(sessionId, limit, before) {
 
   flushTurn(false);
 
+  // Live desktop runs write tools/thinking to updates.jsonl BEFORE chat_history
+  // catches up. Overlay those onto the trailing assistant host so the phone feed
+  // ticks (Read/Edit/Run/Thinking) while the turn is still open.
+  mergeGrokLiveUpdatesIntoMessages(match, messages);
+
   // Optional before-cursor windowing (same contract as Claude/Codex).
   const cap = Math.max(1, Number(limit) || HISTORY_MSG_LIMIT);
   let start = 0;
@@ -5495,6 +5831,27 @@ async function grokDetail(sessionId, limit, before) {
   }
   start = Math.max(0, end - cap);
   const window = messages.slice(start, end);
+
+  // Grok has no Claude-style stop_reason. NEVER default to "end_turn" while the
+  // session is still being written — that made markDetailLiveTurn always settle
+  // and the phone never showed live thinking/tool ticks for desktop Grok runs.
+  // Order: explicit turn_completed (authoritative) → short quiet window → else live.
+  const inferredStop = (() => {
+    if (lastStopReason) return lastStopReason;
+    const turnState = grokUpdatesTurnState(match);
+    // Event-driven seal: turn_completed after the last live activity → done now,
+    // including bridge restart after the event was already written to disk.
+    if (turnState.completedAfterActivity) return "end_turn";
+    const live = grokSessionIsLive(match, GROK_DETAIL_MIDTURN_STALE_MS);
+    // Quiet past the Grok mid-turn window → settled (stale trailingToolPending too).
+    if (!live) return "end_turn";
+    const last = messages.length ? messages[messages.length - 1] : null;
+    if (last && last.trailingToolPending) return "tool_use";
+    if (turnState.lastKind === "turn_completed") return "end_turn";
+    // File still hot → mid-turn (thinking / tools).
+    return null;
+  })();
+
   return {
     id: sessionId,
     provider: "grok",
@@ -5503,7 +5860,7 @@ async function grokDetail(sessionId, limit, before) {
     projectName: path.basename(match.project || "") || "Computer",
     cwd: match.project,
     messages: window,
-    lastStopReason: lastStopReason || "end_turn",
+    lastStopReason: inferredStop,
     truncated: start > 0 || end < messages.length,
     hasMoreBefore: start > 0,
     nextBefore: window.length ? String(window[0].uid || "") : null,
@@ -5511,6 +5868,285 @@ async function grokDetail(sessionId, limit, before) {
     windowEnd: end,
     totalMessages: messages.length,
   };
+}
+
+/** True when chat_history or updates.jsonl was written within the live window. */
+function grokSessionIsLive(match, windowMs) {
+  if (!match || !match.file) return false;
+  const win = windowMs || LIVE_SESSION_WINDOW_MS;
+  const now = Date.now();
+  try {
+    if (now - fs.statSync(match.file).mtimeMs < win) return true;
+  } catch (_) {}
+  try {
+    const updates = path.join(path.dirname(match.file), "updates.jsonl");
+    if (fs.existsSync(updates) && now - fs.statSync(updates).mtimeMs < win) return true;
+  } catch (_) {}
+  try {
+    const events = path.join(path.dirname(match.file), "events.jsonl");
+    if (fs.existsSync(events) && now - fs.statSync(events).mtimeMs < win) return true;
+  } catch (_) {}
+  return false;
+}
+
+/**
+ * Scan the tail of updates.jsonl for turn-boundary events.
+ * completedAfterActivity: the last boundary-ish event is turn_completed (no newer
+ * tool/thought/message activity after it) — seal even if mtime is still "fresh"
+ * from the turn_completed write itself or a trailing recap.
+ */
+function grokUpdatesTurnState(match) {
+  const empty = { lastKind: "", completedAfterActivity: false };
+  if (!match || !match.file) return empty;
+  const updatesFile = path.join(path.dirname(match.file), "updates.jsonl");
+  if (!fs.existsSync(updatesFile)) return empty;
+  let text = "";
+  try {
+    const st = fs.statSync(updatesFile);
+    const maxBytes = Math.min(st.size, 96 * 1024);
+    const fd = fs.openSync(updatesFile, "r");
+    const buf = Buffer.alloc(maxBytes);
+    const n = fs.readSync(fd, buf, 0, maxBytes, Math.max(0, st.size - maxBytes));
+    fs.closeSync(fd);
+    text = buf.slice(0, n).toString("utf8");
+  } catch (_) {
+    return empty;
+  }
+  // Activity that means a turn is still (or again) in flight.
+  const liveKinds = new Set([
+    "tool_call",
+    "tool_call_update",
+    "agent_thought_chunk",
+    "agent_message_chunk",
+    "user_message_chunk",
+    "turn_started",
+  ]);
+  let lastKind = "";
+  let lastLiveOrComplete = "";
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    let rec = null;
+    try {
+      rec = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const u = (rec && rec.params && rec.params.update) || (rec && rec.update) || null;
+    if (!u || typeof u !== "object") continue;
+    const kind = String(u.sessionUpdate || "");
+    if (!kind) continue;
+    lastKind = kind;
+    if (liveKinds.has(kind) || kind === "turn_completed") lastLiveOrComplete = kind;
+  }
+  return {
+    lastKind,
+    completedAfterActivity: lastLiveOrComplete === "turn_completed",
+  };
+}
+
+/** Provider-scoped mid-turn quiet window (Claude long silence vs Grok chatty tools). */
+function detailMidturnWindowMs(provider) {
+  const p = String(provider || "").trim().toLowerCase();
+  if (p === "grok") return GROK_DETAIL_MIDTURN_STALE_MS;
+  if (p === "agy") return agySupport.AGY_DETAIL_MIDTURN_STALE_MS;
+  if (p === "claude") return DETAIL_MIDTURN_STALE_MS;
+  return LIVE_SESSION_WINDOW_MS;
+}
+
+/**
+ * Fold recent updates.jsonl tool/thinking/message chunks into the trailing
+ * assistant host. Source split: chat_history is authoritative when settled;
+ * updates are the live edge for desktop Grok tool ticks.
+ */
+function mergeGrokLiveUpdatesIntoMessages(match, messages) {
+  if (!match || !Array.isArray(messages) || !messages.length) return;
+  if (!grokSessionIsLive(match, LIVE_SESSION_WINDOW_MS * 6)) return;
+  const updatesFile = path.join(path.dirname(match.file), "updates.jsonl");
+  if (!fs.existsSync(updatesFile)) return;
+
+  let last = messages[messages.length - 1];
+  // Fresh user prompt, no assistant yet — seed a running host so tools can attach.
+  if (last && last.role === "user") {
+    last = {
+      role: "assistant",
+      text: "",
+      uid: `grok-live-${match.id || "host"}`,
+      ts: new Date().toISOString(),
+      running: true,
+      progressNodes: [],
+      trailingToolPending: false,
+    };
+    messages.push(last);
+  }
+  if (!last || last.role !== "assistant") return;
+
+  // Tail the last ~768KB of updates (full file can be multi-MB).
+  let text = "";
+  try {
+    const st = fs.statSync(updatesFile);
+    const maxBytes = Math.min(st.size, 768 * 1024);
+    const fd = fs.openSync(updatesFile, "r");
+    const buf = Buffer.alloc(maxBytes);
+    const start = Math.max(0, st.size - maxBytes);
+    const n = fs.readSync(fd, buf, 0, maxBytes, start);
+    fs.closeSync(fd);
+    text = buf.slice(0, n).toString("utf8");
+  } catch (_) {
+    return;
+  }
+
+  const nodesById = new Map();
+  // Seed from existing host nodes so we upsert instead of wipe.
+  if (Array.isArray(last.progressNodes)) {
+    for (const n of last.progressNodes) {
+      if (n && n.id) nodesById.set(String(n.id), n);
+    }
+  }
+  let thoughtAcc = "";
+  let textAcc = String(last.text || "").trim();
+  let order = Array.from(nodesById.keys());
+  const ensureOrder = (id) => {
+    if (!order.includes(id)) order.push(id);
+  };
+
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    let rec = null;
+    try {
+      rec = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const u = (rec && rec.params && rec.params.update) || (rec && rec.update) || null;
+    if (!u || typeof u !== "object") continue;
+    const kind = String(u.sessionUpdate || "");
+
+    if (kind === "agent_thought_chunk") {
+      const chunk =
+        (u.content && (u.content.text || (typeof u.content === "string" ? u.content : ""))) || "";
+      if (chunk) {
+        thoughtAcc += chunk;
+        const id = "grok-thinking-live";
+        const tokens = Math.max(1, Math.round(thoughtAcc.length / 4));
+        nodesById.set(id, {
+          id,
+          label: "Thinking",
+          kind: "thinking",
+          status: "streaming",
+          depth: 0,
+          tokens,
+          detail: clipText(thoughtAcc, 4000),
+        });
+        ensureOrder(id);
+      }
+      continue;
+    }
+
+    if (kind === "agent_message_chunk") {
+      const chunk =
+        (u.content && (u.content.text || (typeof u.content === "string" ? u.content : ""))) || "";
+      if (chunk) {
+        textAcc += chunk;
+        // Live: keep body empty and ride text as a feed node (phone suppresses body mid-run).
+        const id = "grok-text-live";
+        nodesById.set(id, {
+          id,
+          label: clipText(textAcc, 4000),
+          kind: "text",
+          status: "streaming",
+          depth: 0,
+          detail: clipText(textAcc, 4000),
+        });
+        ensureOrder(id);
+        last.text = "";
+      }
+      continue;
+    }
+
+    if (kind === "tool_call") {
+      const id = String(u.toolCallId || u.tool_call_id || u.id || "");
+      if (!id) continue;
+      const meta = (u._meta && (u._meta["x.ai/tool"] || u._meta.xAiTool)) || {};
+      const name = meta.name || u.title || "tool";
+      let input = u.rawInput != null ? u.rawInput : u.input || {};
+      if (typeof input === "string") {
+        try {
+          input = JSON.parse(input);
+        } catch {
+          input = { raw: input };
+        }
+      }
+      const det = grokActionDetail(name, input || {});
+      const node = actionNode(det, id, "running");
+      nodesById.set(id, node);
+      ensureOrder(id);
+      continue;
+    }
+
+    if (kind === "tool_call_update") {
+      const id = String(u.toolCallId || u.tool_call_id || u.id || "");
+      if (!id) continue;
+      const status = String(u.status || "").toLowerCase();
+      const existing = nodesById.get(id);
+      if (status === "completed" || status === "failed" || status === "error" || status === "cancelled") {
+        if (existing) {
+          existing.status = status === "completed" ? "done" : "error";
+        } else {
+          const meta = (u._meta && (u._meta["x.ai/tool"] || u._meta.xAiTool)) || {};
+          const name = meta.name || u.title || "tool";
+          let input = u.rawInput != null ? u.rawInput : u.input || {};
+          if (typeof input === "string") {
+            try {
+              input = JSON.parse(input);
+            } catch {
+              input = {};
+            }
+          }
+          const det = grokActionDetail(name, input || {});
+          nodesById.set(id, actionNode(det, id, status === "completed" ? "done" : "error"));
+          ensureOrder(id);
+        }
+      } else if (!existing) {
+        const meta = (u._meta && (u._meta["x.ai/tool"] || u._meta.xAiTool)) || {};
+        const name = meta.name || u.title || "tool";
+        let input = u.rawInput != null ? u.rawInput : u.input || {};
+        if (typeof input === "string") {
+          try {
+            input = JSON.parse(input);
+          } catch {
+            input = {};
+          }
+        }
+        const det = grokActionDetail(name, input || {});
+        nodesById.set(id, actionNode(det, id, "running"));
+        ensureOrder(id);
+      }
+      continue;
+    }
+
+    if (kind === "turn_completed") {
+      // Settle live edge markers.
+      for (const n of nodesById.values()) {
+        if (n && (n.status === "streaming" || n.status === "running")) {
+          if (n.kind === "thinking" || n.kind === "text") n.status = "done";
+          else if (String(n.status || "") === "running") n.status = "done";
+        }
+      }
+      last.running = false;
+      last.trailingToolPending = false;
+    }
+  }
+
+  const nodes = order.map((id) => nodesById.get(id)).filter(Boolean).slice(-60);
+  if (nodes.length) {
+    last.progressNodes = nodes;
+    // Pending tool = still live (unless turn_completed already cleared it).
+    if (last.running !== false) {
+      last.trailingToolPending = nodes.some(
+        (n) => n && n.kind !== "text" && n.kind !== "thinking" && String(n.status || "") === "running"
+      );
+    }
+  }
 }
 
 // ── Live transcript tail (directly-run sessions) ─────────────────────
@@ -5531,6 +6167,7 @@ function sessionFilePath(provider, sessionId) {
   const files =
     p === "codex" ? codexSessionFiles()
     : p === "grok" ? grokSessionFiles()
+    : p === "agy" ? agySupport.agySessionFiles()
     : claudeSessionFiles();
   const match = files.find((s) => s.id === sessionId || (p === "codex" && s.name && s.name.includes(sessionId)));
   return match ? match.file : null;
@@ -5555,10 +6192,27 @@ function runningTaskForChat(chatId) {
 // the signal that a turn is in flight for a session the bridge did NOT spawn (a
 // run the user started directly in their own desktop terminal).
 function sessionFileIsLive(provider, sessionId, windowMs) {
+  const p = String(provider || "").trim().toLowerCase();
+  const win = windowMs || LIVE_SESSION_WINDOW_MS;
+  // Grok: tools/thinking often land in updates.jsonl / events.jsonl while
+  // chat_history is quiet for long stretches — check all three.
+  if (p === "grok") {
+    const match = grokSessionFiles().find((s) => s.id === sessionId);
+    return match ? grokSessionIsLive(match, win) : false;
+  }
+  if (p === "agy") {
+    const match = agySupport.agySessionFiles().find((s) => s.id === sessionId);
+    if (!match) return false;
+    try {
+      return Date.now() - (match.mtime || 0) < win;
+    } catch {
+      return false;
+    }
+  }
   const file = sessionFilePath(provider, sessionId);
   if (!file) return false;
   try {
-    return Date.now() - fs.statSync(file).mtimeMs < (windowMs || LIVE_SESSION_WINDOW_MS);
+    return Date.now() - fs.statSync(file).mtimeMs < win;
   } catch (_) {
     return false;
   }
@@ -5591,9 +6245,10 @@ function markDetailLiveTurn(result, provider, sessionId, chatId) {
   // nothing for minutes — which is why the 15s window blanked live cells mid-turn.
   const stop = String((result.session && result.session.lastStopReason) || "").toLowerCase();
   const structurallyDone = stop === "end_turn" || stop === "stop_sequence";
-  // Codex rollouts carry no stop_reason — only Claude gets the wide mid-turn cap;
-  // Codex keeps the plain freshness window so finished sessions settle as before.
-  const midturnWindowMs = provider === "claude" ? DETAIL_MIDTURN_STALE_MS : LIVE_SESSION_WINDOW_MS;
+  // Claude: long thinking / tool gaps write nothing for minutes → wide window.
+  // Grok: tools tick updates.jsonl often → short window (see GROK_DETAIL_MIDTURN_STALE_MS).
+  // Codex: plain freshness window.
+  const midturnWindowMs = detailMidturnWindowMs(provider);
   const last0 = msgs[msgs.length - 1];
   // A fresh user prompt with no assistant reply yet = the model is thinking before
   // its first token — the phone otherwise shows nothing "live" until the first
@@ -5682,7 +6337,16 @@ function markMessageRunning(message) {
 
 function runningPlaceholderMessage(entry) {
   if (!entry || !entry.taskId) return null;
-  const providerTitle = entry.provider === "claude" ? "Claude" : entry.provider === "codex" ? "Codex" : entry.provider === "grok" ? "Grok" : "Agent";
+  const providerTitle =
+    entry.provider === "claude"
+      ? "Claude"
+      : entry.provider === "codex"
+        ? "Codex"
+        : entry.provider === "grok"
+          ? "Grok"
+          : entry.provider === "agy"
+            ? "Agy"
+            : "Agent";
   const target = entry.repo && entry.repo.name ? entry.repo.name : "";
   return {
     role: "assistant",
@@ -5721,9 +6385,20 @@ function stopHistoryWatch(chatId) {
   const rec = historyWatchers.get(chatId);
   if (!rec) return;
   try { if (rec.watcher) rec.watcher.close(); } catch (_) {}
+  if (Array.isArray(rec.extraWatchers)) {
+    for (const w of rec.extraWatchers) {
+      try { if (w) w.close(); } catch (_) {}
+    }
+  }
   try { if (rec.listener) fs.unwatchFile(rec.file, rec.listener); } catch (_) {}
+  if (Array.isArray(rec.listeners)) {
+    for (const entry of rec.listeners) {
+      try { if (entry && entry.file && entry.fn) fs.unwatchFile(entry.file, entry.fn); } catch (_) {}
+    }
+  }
   try { if (rec.debounce) clearTimeout(rec.debounce); } catch (_) {}
   try { if (rec.settle) clearTimeout(rec.settle); } catch (_) {}
+  try { if (rec.missingPoll) clearInterval(rec.missingPoll); } catch (_) {}
   historyWatchers.delete(chatId);
 }
 
@@ -5748,7 +6423,34 @@ function startHistoryWatch(channel, { chatId, provider, sessionId, echo, limit }
     const oldest = historyWatchers.keys().next().value;
     if (oldest) stopHistoryWatch(oldest);
   }
-  const rec = { file, watcher: null, listener: null, debounce: null, lastSig: "", busy: false, again: false, schedule: null };
+  // Grok desktop: tool_call ticks land in updates.jsonl (and phase_changed in
+  // events.jsonl) while chat_history is quiet — watch those too so live tool rows
+  // re-push without waiting for the next history append.
+  const extraWatchFiles = [];
+  if (String(provider || "").toLowerCase() === "grok") {
+    const dir = path.dirname(file);
+    for (const name of ["updates.jsonl", "events.jsonl"]) {
+      const p = path.join(dir, name);
+      if (fs.existsSync(p)) extraWatchFiles.push(p);
+    }
+  }
+  if (String(provider || "").toLowerCase() === "agy") {
+    // Prefer full transcript when present (same content, sometimes written first).
+    const full = agySupport.agyTranscriptFullPath(sessionId);
+    if (full && fs.existsSync(full) && full !== file) extraWatchFiles.push(full);
+  }
+  const rec = {
+    file,
+    extraWatchFiles,
+    watcher: null,
+    listener: null,
+    listeners: [],
+    debounce: null,
+    lastSig: "",
+    busy: false,
+    again: false,
+    schedule: null,
+  };
   const fire = () => {
     if (channel.state !== "joined") return;
     if (rec.busy) { rec.again = true; return; } // re-read once the in-flight read finishes
@@ -5771,7 +6473,7 @@ function startHistoryWatch(channel, { chatId, provider, sessionId, echo, limit }
         // Codex has no stop_reason and keeps the plain freshness window.
         const stop = String((result && result.session && result.session.lastStopReason) || "").toLowerCase();
         const structurallyDone = stop === "end_turn" || stop === "stop_sequence";
-        const midturnWindowMs = provider === "claude" ? DETAIL_MIDTURN_STALE_MS : LIVE_SESSION_WINDOW_MS;
+        const midturnWindowMs = detailMidturnWindowMs(provider);
         let last = msgs.length ? msgs[msgs.length - 1] : null;
         // A trailing interrupt marker means the user STOPPED the turn: settle now.
         // stop_reason still reads mid-turn after a stop, so without this the session
@@ -5811,6 +6513,10 @@ function startHistoryWatch(channel, { chatId, provider, sessionId, echo, limit }
           msgs.push(placeholder);
           last = placeholder;
           running = true;
+        } else if (last && last.role === "assistant") {
+          // Settled: clear any leftover running flag from a prior live overlay so the
+          // phone's ingest never re-asserts Thinking from a stale host.
+          last.running = false;
         }
         // The live feed grows by appending progress NODES (a new Read/Edit/Run step or
         // an interior narration "text" node) as well as by the trailing summary text
@@ -5836,12 +6542,14 @@ function startHistoryWatch(channel, { chatId, provider, sessionId, echo, limit }
           rec.lastSig = sig;
           channel.push("history_result", { ok: true, ...echo, ...result });
         }
-        // Desktop-terminal runs have no close event to seal the final card. Once the
-        // file goes quiet past the live window, fire once more: liveByFile flips false,
-        // the trailing turn seals, and the run→done sig change pushes the final state.
+        // Desktop-terminal runs have no close event to seal the final card. Re-check
+        // on the SAME mid-turn window the live flag uses (Grok ~30s, not the 15s
+        // LIVE window that never flipped liveByFile off under the old 15-min check).
+        // Reschedule until sealed so a premature quiet blip self-heals on the next tick.
         if (rec.settle) { clearTimeout(rec.settle); rec.settle = null; }
-        if (liveByFile && !runningEntry && channel.state === "joined") {
-          rec.settle = setTimeout(() => { rec.settle = null; fire(); }, LIVE_SESSION_WINDOW_MS + 1500);
+        if (running && !runningEntry && channel.state === "joined") {
+          const settleIn = Math.min(midturnWindowMs, LIVE_SESSION_WINDOW_MS) + 1500;
+          rec.settle = setTimeout(() => { rec.settle = null; fire(); }, settleIn);
         }
       })
       .catch(() => {})
@@ -5855,13 +6563,46 @@ function startHistoryWatch(channel, { chatId, provider, sessionId, echo, limit }
     rec.debounce = setTimeout(() => { rec.debounce = null; fire(); }, HISTORY_WATCH_DEBOUNCE_MS);
   };
   rec.schedule = schedule;
-  try {
-    // Event-based: fires within ms of claude/codex appending to the transcript.
-    rec.watcher = fs.watch(file, { persistent: true }, () => schedule());
-  } catch (_) {
-    // Fallback to polling if fs.watch is unavailable on this filesystem.
-    rec.listener = () => schedule();
-    fs.watchFile(file, { interval: 1000 }, rec.listener);
+  rec.extraWatchers = [];
+  rec.listeners = [];
+  const armWatch = (targetFile, isPrimary) => {
+    if (!targetFile) return;
+    try {
+      // Event-based: fires within ms of appends (transcript OR Grok updates.jsonl).
+      const w = fs.watch(targetFile, { persistent: true }, () => schedule());
+      if (isPrimary) rec.watcher = w;
+      else rec.extraWatchers.push(w);
+    } catch (_) {
+      // Fallback to polling if fs.watch is unavailable on this filesystem.
+      const fn = () => schedule();
+      try {
+        fs.watchFile(targetFile, { interval: 400 }, fn);
+        if (isPrimary) rec.listener = fn;
+        else rec.listeners.push({ file: targetFile, fn });
+      } catch (__) {}
+    }
+  };
+  armWatch(file, true);
+  for (const extra of extraWatchFiles) armWatch(extra, false);
+  // Grok: updates.jsonl may not exist at watch start — poll until it appears, then arm.
+  if (String(provider || "").toLowerCase() === "grok") {
+    const dir = path.dirname(file);
+    const pollMissing = setInterval(() => {
+      if (!historyWatchers.has(chatId)) {
+        clearInterval(pollMissing);
+        return;
+      }
+      for (const name of ["updates.jsonl", "events.jsonl"]) {
+        const p = path.join(dir, name);
+        if (!fs.existsSync(p)) continue;
+        if (rec.extraWatchFiles.includes(p)) continue;
+        rec.extraWatchFiles.push(p);
+        armWatch(p, false);
+        schedule();
+      }
+    }, 1000);
+    if (pollMissing.unref) pollMissing.unref();
+    rec.missingPoll = pollMissing;
   }
   historyWatchers.set(chatId, rec);
   schedule(); // catch anything appended between the initial read and now
@@ -5893,6 +6634,37 @@ function handleHistoryRequest(channel, payload) {
   if (want === "detail" && !effectiveSessionId && chatId) {
     const running = runningTaskForChat(chatId);
     effectiveSessionId = (running && running.sessionId) || sessionByChat.get(chatId) || null;
+    // Grok desktop sessions often run outside phone-spawned run_task, so sessionByChat
+    // stays empty. Fall back to the freshest non-ephemeral Grok session (preferring the
+    // default repo cwd) so opening the Grok DM mid-run can live-tail thinking/tools.
+    if (!effectiveSessionId && String(provider || "").toLowerCase() === "grok") {
+      effectiveSessionId = latestGrokSessionIdForChat();
+      if (effectiveSessionId) {
+        sessionByChat.set(chatId, effectiveSessionId);
+        console.log(
+          `[vibe-bridge][history] current-session grok fallback chat=${chatId} → ${effectiveSessionId}`
+        );
+      }
+    }
+    if (!effectiveSessionId && String(provider || "").toLowerCase() === "agy") {
+      const files = agySupport.agySessionFiles().sort((a, b) => b.mtime - a.mtime);
+      const defCwd = DEFAULT_CWD;
+      const prefer = files.find((s) => {
+        if (!s.project) return false;
+        try {
+          return fs.realpathSync(s.project) === fs.realpathSync(defCwd);
+        } catch {
+          return s.project === defCwd;
+        }
+      });
+      effectiveSessionId = (prefer || files[0] || {}).id || null;
+      if (effectiveSessionId) {
+        sessionByChat.set(chatId, effectiveSessionId);
+        console.log(
+          `[vibe-bridge][history] current-session agy fallback chat=${chatId} → ${effectiveSessionId}`
+        );
+      }
+    }
     if (!effectiveSessionId) {
       console.log(
         `[vibe-bridge][history] current-session request chat=${chatId} → no session, requestId=${requestId}`
@@ -6416,7 +7188,9 @@ const SOURCE = CHAT ? "bridge" : "interactive";
 const ADVISOR_ENABLED = process.env.VIBE_FABLE_MCP !== "0";
 const ADVISOR_MODEL = normalizeAdvisorModel(process.env.VIBE_FABLE_MODEL || process.env.VIBE_CLAUDE_ADVISOR || process.env.VIBE_CLAUDE_ADVISOR_MODEL || "fable");
 const ADVISOR_TIMEOUT_MS = Math.max(10000, Number(process.env.VIBE_FABLE_MCP_TIMEOUT_MS || 240000) || 240000);
-const ADVISOR_CONTEXT_CHARS = Math.max(4000, Number(process.env.VIBE_FABLE_MCP_CONTEXT_CHARS || 120000) || 120000);
+// Keep advisor prompts lean by default — large dumps burn Fable tokens without
+// better advice. Override with VIBE_FABLE_MCP_CONTEXT_CHARS when you truly need more.
+const ADVISOR_CONTEXT_CHARS = Math.max(4000, Number(process.env.VIBE_FABLE_MCP_CONTEXT_CHARS || 24000) || 24000);
 let proto = "2024-11-05";
 function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }
 function result(id, res) { send({ jsonrpc: "2.0", id, result: res }); }
@@ -6581,30 +7355,45 @@ function askBridge(questions) {
 }
 function buildAdvisorPrompt(args) {
   args = args || {};
-  const question = compactText(args.question || "", 8000).trim();
+  const question = compactText(args.question || "", 2000).trim();
   if (!question) return null;
+  // Budget the prompt: question + short system rules + remaining for context/files/diff.
+  const budget = ADVISOR_CONTEXT_CHARS;
+  const maxFiles = 6;
+  const maxConstraints = 8;
+  const contextBudget = Math.max(1500, Math.floor(budget * 0.35));
+  const filesBudget = Math.max(2000, Math.floor(budget * 0.40));
+  const diffBudget = Math.max(1500, Math.floor(budget * 0.20));
   const parts = [
-    "You are Claude Fable acting as an adviser to an executor model mid-run.",
-    "Do not make tool calls, do not assume hidden context, and do not rewrite the task. Give concise, actionable advice the executor can apply.",
-    "Return the answer in four short sections when useful: assessment, risks, recommended next steps, and verification.",
+    "You are Fable, a second-opinion adviser to an executor agent mid-run.",
+    "No tools. No task rewrite. Keep the reply SHORT (aim <= 400 words).",
+    "Use these headings only: Assessment / Risks / Next steps / Verification.",
+    "Prefer concrete steps over theory. Skip fluff.",
     "Question:\\n" + question
   ];
-  if (args.context) parts.push("Current context:\\n" + compactText(args.context, ADVISOR_CONTEXT_CHARS));
+  if (args.context) parts.push("Current context:\\n" + compactText(args.context, contextBudget));
   if (Array.isArray(args.constraints) && args.constraints.length) {
-    parts.push("Constraints:\\n" + args.constraints.map((c) => "- " + compactText(c, 1000)).join("\\n"));
+    parts.push(
+      "Constraints:\\n" +
+        args.constraints
+          .slice(0, maxConstraints)
+          .map((c) => "- " + compactText(c, 400))
+          .join("\\n")
+    );
   }
   if (Array.isArray(args.files) && args.files.length) {
-    const perFile = Math.max(2000, Math.floor(ADVISOR_CONTEXT_CHARS / Math.min(args.files.length, 20)));
-    const snippets = args.files.slice(0, 20).map((file, index) => {
-      const label = compactText(file && (file.path || file.name) || ("snippet-" + (index + 1)), 400);
-      const note = file && file.note ? "\\nNote: " + compactText(file.note, 1000) : "";
+    const fileCount = Math.min(args.files.length, maxFiles);
+    const perFile = Math.max(800, Math.floor(filesBudget / fileCount));
+    const snippets = args.files.slice(0, maxFiles).map((file, index) => {
+      const label = compactText(file && (file.path || file.name) || ("snippet-" + (index + 1)), 200);
+      const note = file && file.note ? "\\nNote: " + compactText(file.note, 300) : "";
       const body = compactText(file && (file.content || file.text || ""), perFile);
       return "File: " + label + note + "\\n" + body;
     }).join("\\n\\n---\\n\\n");
     parts.push("File snippets:\\n" + snippets);
   }
-  if (args.diff) parts.push("Diff or proposed patch:\\n" + compactText(args.diff, ADVISOR_CONTEXT_CHARS));
-  return compactText(parts.join("\\n\\n"), ADVISOR_CONTEXT_CHARS);
+  if (args.diff) parts.push("Diff or proposed patch:\\n" + compactText(args.diff, diffBudget));
+  return compactText(parts.join("\\n\\n"), budget);
 }
 function runAdvisor(prompt) {
   return new Promise((resolve) => {

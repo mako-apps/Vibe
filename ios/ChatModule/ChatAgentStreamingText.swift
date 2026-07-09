@@ -2165,6 +2165,7 @@ final class AgentCodeBlockView: UIView {
     super.init(frame: frame)
     backgroundColor = .clear
     isOpaque = false
+    clipsToBounds = true
 
     cardView.layer.cornerRadius = 10.0
     cardView.layer.cornerCurve = .continuous
@@ -2206,6 +2207,28 @@ final class AgentCodeBlockView: UIView {
   }
 
   required init?(coder: NSCoder) { return nil }
+
+  private var preferredCardHeight: CGFloat = 1.0
+
+  override var intrinsicContentSize: CGSize {
+    CGSize(width: UIView.noIntrinsicMetric, height: max(1.0, preferredCardHeight))
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    let w = bounds.width
+    guard w > 1.0, !codeContent.isEmpty else { return }
+    if abs(w - currentAvailableWidth) > 0.5 {
+      _ = configure(
+        code: codeContent,
+        language: codeLang,
+        textColor: baseTextColor,
+        baseFont: originalBaseFont,
+        availableWidth: w,
+        storageKey: expansionStorageKey
+      )
+    }
+  }
 
   @discardableResult
   func configure(
@@ -2301,7 +2324,9 @@ final class AgentCodeBlockView: UIView {
     scrollView.frame = CGRect(x: 0, y: barH, width: cardWidth, height: cardH - barH)
     scrollView.contentSize = CGSize(width: textWidth + hPad * 2, height: bodyH + vPad * 2)
     codeLabel.frame = CGRect(x: hPad, y: vPad, width: textWidth, height: bodyH)
-    return outerH + cardH + 8.0
+    preferredCardHeight = outerH + cardH + 8.0
+    invalidateIntrinsicContentSize()
+    return preferredCardHeight
   }
 
   // MARK: - Syntax highlighting (only used in expanded mode)

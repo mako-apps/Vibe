@@ -419,6 +419,7 @@ struct ChatHomeListRow {
     if peer == "11111111-1111-1111-1111-111111111111" { return "claude" }
     if peer == "22222222-2222-2222-2222-222222222222" { return "codex" }
     if peer == "33333333-3333-3333-3333-333333333333" { return "grok" }
+    if peer == "44444444-4444-4444-4444-444444444444" { return "agy" }
 
     let agent = agentId?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     switch agent {
@@ -428,6 +429,8 @@ struct ChatHomeListRow {
       return "codex"
     case "grok", "33333333-3333-3333-3333-333333333333":
       return "grok"
+    case "agy", "antigravity", "44444444-4444-4444-4444-444444444444":
+      return "agy"
     default:
       break
     }
@@ -437,6 +440,7 @@ struct ChatHomeListRow {
     case "claude": return "claude"
     case "codex": return "codex"
     case "grok": return "grok"
+    case "agy", "antigravity": return "agy"
     default: return nil
     }
   }

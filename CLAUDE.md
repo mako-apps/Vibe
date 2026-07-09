@@ -27,11 +27,33 @@ Interactive approvals for Claude Code in this repo are governed by
 Destructive commands (rm -rf, sudo, git push, git reset --hard, dd, mkfs, curl|sh,
 npm publish, ...) are blocked in every remote mode, even `full`.
 
-## Ask advisor on complex tasks
+## Ask Fable (advisor) on complex tasks
 
-When a task is complex (multi-step, ambiguous, or touches unfamiliar/risky code),
-call the `advisor` tool before committing to an approach. Skip it for simple,
-obvious fixes.
+**Required** on complex tasks (multi-step, ambiguous, unfamiliar/risky, hard debug,
+architecture). Skip for simple one-liners.
+
+### How to call
+
+1. Prefer the built-in **`advisor`** tool when available.
+2. Otherwise use the Fable MCP tool:
+   - **`mcp__vibeask__ask_fable`** (Claude Code / bridge MCP name), or
+   - **`vibeask__ask_fable`** (qualified `server__tool` form).
+
+Pass at least:
+- `question` — concrete decision/review (required)
+- `context` — goal, findings, errors, assumptions
+- optional `diff`, `constraints[]`, `files[{path,content,note}]`
+
+Fable returns **plain-text advice only** (Assessment / Risks / Next steps /
+Verification) via the MCP tool result — you still implement and verify. If
+unavailable (rate limit / error), note it and continue.
+
+**Usage:** keep calls lean — sharp `question`, short `context`, tiny snippets.
+Default package budget is ~24k chars (`VIBE_FABLE_MCP_CONTEXT_CHARS`). Do not
+paste whole files or re-ask with the same dump.
+
+Full how-to (response path + optimise tips): see [Agents.md](Agents.md)
+→ **Ask Fable (advisor) on complex tasks**.
 
 ## Prefer commands that run without approval
 

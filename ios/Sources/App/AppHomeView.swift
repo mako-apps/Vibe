@@ -360,7 +360,7 @@ struct ChatRoute: Identifiable, Hashable {
   /// Attached agent's event-inbox mode (`per_event` / `batched_summary`). Drives
   /// whether the chat view hides agent event notifications behind the Inbox banner.
   let agentEventInboxMode: String?
-  /// `"claude"` / `"codex"` / `"grok"` when this chat talks to a computer-bridge agent. Drives
+  /// `"claude"` / `"codex"` / `"grok"` / `"agy"` when this chat talks to a computer-bridge agent. Drives
   /// the connect-state gate in the chat view: when no paired computer is online the
   /// composer is hidden and a Connect panel is shown instead.
   let bridgeProvider: String?
@@ -370,10 +370,11 @@ struct ChatRoute: Identifiable, Hashable {
 
   var id: String { chatId }
 
-  /// Reserved shadow-user ids for the two computer-bridge agents (seeded server-side).
+  /// Reserved shadow-user ids for the computer-bridge agents (seeded server-side).
   static let claudeAgentUserId = "11111111-1111-1111-1111-111111111111"
   static let codexAgentUserId = "22222222-2222-2222-2222-222222222222"
   static let grokAgentUserId = "33333333-3333-3333-3333-333333333333"
+  static let agyAgentUserId = "44444444-4444-4444-4444-444444444444"
 
   /// Resolves the bridge provider for a chat. The reserved user ids are the strong
   /// signal; the name is only consulted for confirmed agent users so a human named
@@ -388,6 +389,7 @@ struct ChatRoute: Identifiable, Hashable {
     if pid == claudeAgentUserId { return "claude" }
     if pid == codexAgentUserId { return "codex" }
     if pid == grokAgentUserId { return "grok" }
+    if pid == agyAgentUserId { return "agy" }
     let aid = agentId?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     switch aid {
     case "claude", claudeAgentUserId:
@@ -396,6 +398,8 @@ struct ChatRoute: Identifiable, Hashable {
       return "codex"
     case "grok", grokAgentUserId:
       return "grok"
+    case "agy", "antigravity", agyAgentUserId:
+      return "agy"
     default:
       break
     }
@@ -404,6 +408,7 @@ struct ChatRoute: Identifiable, Hashable {
     case "claude": return "claude"
     case "codex": return "codex"
     case "grok": return "grok"
+    case "agy", "antigravity": return "agy"
     default: return nil
     }
   }
@@ -414,6 +419,7 @@ struct ChatRoute: Identifiable, Hashable {
     case "claude": return "Claude"
     case "codex": return "Codex"
     case "grok": return "Grok"
+    case "agy", "antigravity": return "Agy"
     default: return provider.capitalized
     }
   }
@@ -1940,6 +1946,7 @@ private struct ChatHomeScreen: View {
       (ChatRoute.claudeAgentUserId, "claude", "https://media.vibegram.io/chat-media/agent-profiles/claude.png"),
       (ChatRoute.codexAgentUserId, "codex", "https://media.vibegram.io/chat-media/agent-profiles/codex.png"),
       (ChatRoute.grokAgentUserId, "grok", "https://media.vibegram.io/chat-media/agent-profiles/grok-v2.png"),
+      (ChatRoute.agyAgentUserId, "agy", "https://media.vibegram.io/chat-media/agent-profiles/agy.png"),
     ]
     return agents.compactMap { uid, uname, avatar in
       guard uname.hasPrefix(q) else { return nil }
@@ -6083,6 +6090,18 @@ final class ChatConversationController: UIViewController {
     mainView.setAvatarUri(route.avatarURI)
     markRouteSurfaceStep("groupAndInput")
     mainView.setIsGroupOrChannel(route.isGroup)
+    // Group roster must land on the chat surface too (not only the profile push).
+    // Without this, sender directory / role / agent-membership stay empty until
+    // something else re-binds, and the profile's admin/member state flickers.
+    if route.isGroup {
+      mainView.setGroupMembers(route.members)
+      if !route.members.isEmpty {
+        mainView.setGroupMemberCount(route.members.count)
+      }
+    } else {
+      mainView.setGroupMembers([])
+      mainView.setGroupMemberCount(nil)
+    }
     // When the chat talks to an AI agent, bind the agent id so the engine routes
     // sends to the agent backend (peerAgentId) instead of E2E-encrypting to a
     // human peer. Empty string clears it for normal peer/group chats.
@@ -8507,6 +8526,7 @@ private struct HomeSearchChatRow: View {
     case "claude": return "https://media.vibegram.io/chat-media/agent-profiles/claude.png"
     case "codex": return "https://media.vibegram.io/chat-media/agent-profiles/codex.png"
     case "grok": return "https://media.vibegram.io/chat-media/agent-profiles/grok-v2.png"
+    case "agy", "antigravity": return "https://media.vibegram.io/chat-media/agent-profiles/agy.png"
     default: return nil
     }
   }
@@ -9586,30 +9606,56 @@ enum GroupProfileActionRouter {
     let role = (str(payload["role"]) ?? "member").lowercased()
     let canManage = (payload["canManage"] as? Bool) ?? false
     let myId = AppSessionConfig.current?.userID ?? ""
+    guard !userId.isEmpty else { return }
 
-    // No admin actions for a non-admin viewer, yourself, or the owner.
-    guard canManage, !userId.isEmpty,
-      userId.caseInsensitiveCompare(myId) != .orderedSame,
-      role != "owner"
-    else { return }
+    let roleLabel: String = {
+      switch role {
+      case "owner": return "Owner"
+      case "admin": return "Admin"
+      default: return "Member"
+      }
+    }()
+    let isSelf = !myId.isEmpty && userId.caseInsensitiveCompare(myId) == .orderedSame
+    let sheet = UIAlertController(
+      title: name,
+      message: isSelf ? "You · \(roleLabel)" : roleLabel,
+      preferredStyle: .actionSheet
+    )
 
-    let sheet = UIAlertController(title: name, message: nil, preferredStyle: .actionSheet)
-    if role == "admin" {
+    // Admin actions only for managers acting on non-self, non-owner targets.
+    if canManage, !isSelf, role != "owner" {
+      if role == "admin" {
+        sheet.addAction(
+          UIAlertAction(title: "Dismiss as Admin", style: .default) { _ in
+            Task {
+              await setRole(
+                chatId: chatId, userId: userId, role: "member",
+                success: "\(name) is no longer an admin.")
+            }
+          })
+      } else {
+        sheet.addAction(
+          UIAlertAction(title: "Make Admin", style: .default) { _ in
+            Task {
+              await setRole(
+                chatId: chatId, userId: userId, role: "admin",
+                success: "\(name) is now an admin.")
+            }
+          })
+      }
       sheet.addAction(
-        UIAlertAction(title: "Dismiss as Admin", style: .default) { _ in
-          Task { await setRole(chatId: chatId, userId: userId, role: "member", success: "\(name) is no longer an admin.") }
-        })
-    } else {
-      sheet.addAction(
-        UIAlertAction(title: "Make Admin", style: .default) { _ in
-          Task { await setRole(chatId: chatId, userId: userId, role: "admin", success: "\(name) is now an admin.") }
+        UIAlertAction(title: "Remove from Group", style: .destructive) { _ in
+          Task { await removeMember(chatId: chatId, userId: userId, success: "Removed \(name).") }
         })
     }
-    sheet.addAction(
-      UIAlertAction(title: "Remove from Group", style: .destructive) { _ in
-        Task { await removeMember(chatId: chatId, userId: userId, success: "Removed \(name).") }
-      })
-    sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+
+    // Always give feedback — previously non-manager taps returned silently so
+    // member rows looked like dead placeholders.
+    if sheet.actions.isEmpty {
+      sheet.addAction(UIAlertAction(title: "OK", style: .cancel))
+    } else {
+      sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+    }
     presentSheet(sheet, on: presenter)
   }
 

@@ -4055,7 +4055,7 @@ extension ChatInputBar: UITextViewDelegate {
     let textString = tv.text ?? ""
     delegate?.inputBarTextDidChange(text: textString)
 
-    let isCloudOrCodex = provider?.lowercased().contains("claude") == true || provider?.lowercased().contains("codex") == true || provider?.lowercased().contains("grok") == true || agentControlMode
+    let isCloudOrCodex = provider?.lowercased().contains("claude") == true || provider?.lowercased().contains("codex") == true || provider?.lowercased().contains("grok") == true || provider?.lowercased().contains("agy") == true || provider?.lowercased().contains("antigravity") == true || agentControlMode
     if isCloudOrCodex && textString.hasPrefix("/") {
       populateSlashSuggestions(filter: textString)
       setSlashSuggestionVisible(true, animated: true)
@@ -4637,7 +4637,7 @@ extension ChatInputBar: PHPickerViewControllerDelegate, UIImagePickerControllerD
 
   public func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
     guard let url = urls.first else { return }
-    let isCloudOrCodex = provider?.lowercased().contains("claude") == true || provider?.lowercased().contains("codex") == true || provider?.lowercased().contains("grok") == true || agentControlMode
+    let isCloudOrCodex = provider?.lowercased().contains("claude") == true || provider?.lowercased().contains("codex") == true || provider?.lowercased().contains("grok") == true || provider?.lowercased().contains("agy") == true || provider?.lowercased().contains("antigravity") == true || agentControlMode
     if isCloudOrCodex {
       if let data = try? Data(contentsOf: url), let image = UIImage(data: data) {
         stageImage(image)

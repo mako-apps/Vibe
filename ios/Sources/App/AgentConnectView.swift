@@ -321,7 +321,7 @@ struct AgentBridgeRepositoryPickerView: View {
   @Environment(\.dismiss) private var dismiss
   @Environment(\.colorScheme) private var colorScheme
   @State private var status: AgentBridgeStatus = .disconnected
-  @State private var selected: AgentBridgeRepository? = AgentBridgeSelectionStore.selectedRepository()
+  @State private var selected: AgentBridgeRepository?
   @State private var workMode: AgentBridgeWorkMode = AgentBridgeSelectionStore.selectedWorkMode()
   @State private var isLoading = false
   @State private var errorMessage: String?
@@ -432,7 +432,8 @@ struct AgentBridgeRepositoryPickerView: View {
             Section {
               ForEach(status.repositories) { repo in
                 Button {
-                  AgentBridgeSelectionStore.select(repo)
+                  AgentBridgeSelectionStore.select(
+                    repo, chatId: chatId.isEmpty ? nil : chatId)
                   selected = repo
                   dismiss()
                 } label: {
@@ -487,6 +488,10 @@ struct AgentBridgeRepositoryPickerView: View {
         }
       }
       .task {
+        if selected == nil {
+          selected = AgentBridgeSelectionStore.selectedRepository(
+            chatId: chatId.isEmpty ? nil : chatId)
+        }
         resumeSelectionId = AgentBridgeSelectionStore.selectedResumeSession(provider: provider)?.id
         applyCachedHistory()
         loadHistory()

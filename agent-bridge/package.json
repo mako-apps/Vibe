@@ -1,7 +1,7 @@
 {
   "name": "@vibegram/agent-bridge",
   "version": "0.1.0",
-  "description": "Vibe agent bridge \u2014 run @claude / @codex / @grok on your own computer, driven from the Vibe app.",
+  "description": "Vibe agent bridge \u2014 run @claude / @codex / @grok / @agy on your own computer, driven from the Vibe app.",
   "bin": {
     "vibegram-bridge": "bin/vibe-bridge.js"
   },
