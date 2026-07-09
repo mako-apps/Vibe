@@ -3724,7 +3724,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
           if let item = foundItem {
             let kind = (item.itemType ?? item.tool ?? "").lowercased()
-            if kind == "bash" || kind == "edit" || kind == "write" || kind == "read" || kind == "todo" || kind == "planning" {
+            // Tools + Grok exposed thinking (compact row → sheet with full CoT) +
+            // compacting notes. Thinking is slightly different from Claude's
+            // encrypted CoT: Grok ships plaintext detail on the node.
+            if kind == "bash" || kind == "edit" || kind == "write" || kind == "read"
+              || kind == "todo" || kind == "planning" || kind == "thinking" || kind == "compacting"
+            {
               guard let presenter = self.topPresentingViewController() else { return }
               let detail = VibeAgentKitStepDetailViewController(
                 item: item,

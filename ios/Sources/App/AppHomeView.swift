@@ -2583,7 +2583,7 @@ private struct ChatHomeScreen: View {
 
     isShowingSearch = false
     Task {
-      try? await Task.sleep(nanoseconds: 300_000_000)
+      // No artificial 300ms delay — open as soon as DM create returns.
       let route = await openChat(for: user)
       if action == "call", let route {
         NativeCallRouteBridge.startOutgoing(route: route, callType: "voice")
@@ -2648,12 +2648,28 @@ private struct ChatHomeScreen: View {
       return nil
     }
 
+    // Instant path: chat already on the home list — don't wait on POST /chat
+    // (was ~20–30s when packet fallback ran after a flaky create).
+    let peerKey = user.userID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if let existing = model.rows.first(where: {
+      ($0.peerUserId ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == peerKey
+        && !$0.isGroup
+    }) {
+      openLocalChatRow(existing)
+      return ChatRoute(row: existing)
+    }
+
     isStartingChat = true
     errorMessage = nil
     defer { isStartingChat = false }
 
+    let isBridgeAgent = user.bridgeProvider != nil || user.isAgent
     do {
-      let result = try await ChatDirectMessageService.startChat(config: config, friendID: user.userID)
+      let result = try await ChatDirectMessageService.startChat(
+        config: config,
+        friendID: user.userID,
+        allowPacketFallback: !isBridgeAgent
+      )
       if let publicKey = user.publicKey, !publicKey.isEmpty {
         _ = ChatEngine.shared.cachePeerPublicKey([
           "chatId": result.chatID,
@@ -2671,14 +2687,19 @@ private struct ChatHomeScreen: View {
           rawAvatar: user.profileImage,
           peerUserId: user.userID,
           chatId: result.chatID,
-          preferPushAvatar: true
+          preferPushAvatar: false,
+          isAgent: user.isAgent || user.bridgeProvider != nil,
+          agentId: user.agentId ?? user.bridgeAgentRouteId,
+          displayName: user.handle ?? user.username
         ),
         isGroup: false,
         initialRows: result.messages,
         bridgeProvider: user.bridgeProvider
       )
+      // Open immediately — refresh home in the background so a slow list reload
+      // never blocks navigation (chat used to land only after refresh).
       coordinator.openChat(route)
-      await model.refresh()
+      Task { await model.refresh() }
       return route
     } catch {
       errorMessage = error.localizedDescription
@@ -5324,8 +5345,13 @@ private struct ContactsPageView: View {
     errorMessage = nil
     defer { isStartingChat = false }
 
+    let isBridgeAgent = user.bridgeProvider != nil || user.isAgent
     do {
-      let result = try await ChatDirectMessageService.startChat(config: config, friendID: user.userID)
+      let result = try await ChatDirectMessageService.startChat(
+        config: config,
+        friendID: user.userID,
+        allowPacketFallback: !isBridgeAgent
+      )
       if let publicKey = user.publicKey, !publicKey.isEmpty {
         _ = ChatEngine.shared.cachePeerPublicKey([
           "chatId": result.chatID,
@@ -5343,13 +5369,17 @@ private struct ContactsPageView: View {
           rawAvatar: user.profileImage,
           peerUserId: user.userID,
           chatId: result.chatID,
-          preferPushAvatar: true
+          preferPushAvatar: false,
+          isAgent: user.isAgent || user.bridgeProvider != nil,
+          agentId: user.agentId ?? user.bridgeAgentRouteId,
+          displayName: user.handle ?? user.username
         ),
         isGroup: false,
         initialRows: result.messages,
         bridgeProvider: user.bridgeProvider
       )
       coordinator.openChat(route)
+      Task { await model.refresh() }
       return route
     } catch {
       errorMessage = error.localizedDescription
@@ -5476,8 +5506,11 @@ final class ChatProfileRootController: UIViewController {
 
   override func viewDidLoad() {
     super.viewDidLoad()
-    view.backgroundColor = Self.backgroundColor(isDark: isDark)
+    // Black first paint — matches the profile hero soft-black gradient so the
+    // push transition never flashes a light/grouped background.
+    view.backgroundColor = .black
     profileView.translatesAutoresizingMaskIntoConstraints = false
+    profileView.backgroundColor = .black
     view.addSubview(profileView)
     NSLayoutConstraint.activate([
       profileView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
@@ -8510,30 +8543,24 @@ private struct HomeSearchChatRow: View {
   }
 
   private var resolvedAvatarURI: String? {
-    if let uri = row.avatarUri?.trimmingCharacters(in: .whitespacesAndNewlines), !uri.isEmpty {
-      return uri
-    }
-    if let provider = ChatHomeListRow.bridgeProvider(
-      peerUserId: row.peerUserId, name: row.title, isAgent: row.isAgentFriend, agentId: row.peerAgentId
-    ) {
-      return Self.agentAvatarURL(for: provider)
-    }
-    return nil
+    ChatAvatarURLResolver.resolve(
+      rawAvatar: row.avatarUri,
+      peerUserId: row.peerUserId,
+      chatId: row.chatId,
+      preferPushAvatar: false,
+      isAgent: row.isAgentFriend,
+      agentId: row.peerAgentId,
+      displayName: row.title
+    )
   }
 
   static func agentAvatarURL(for provider: String) -> String? {
-    switch provider.lowercased() {
-    case "claude": return "https://media.vibegram.io/chat-media/agent-profiles/claude.png"
-    case "codex": return "https://media.vibegram.io/chat-media/agent-profiles/codex.png"
-    case "grok": return "https://media.vibegram.io/chat-media/agent-profiles/grok-v2.png"
-    case "agy", "antigravity": return "https://media.vibegram.io/chat-media/agent-profiles/agy.png"
-    default: return nil
-    }
+    ChatAvatarURLResolver.bridgeAgentAvatarURL(for: provider)
   }
 }
 
 /// Shared circular avatar used by home search rows — same gradient seed + CDN
-/// image path as the native home list cells.
+/// fetch path as the native home list cells (`ChatAvatarImageStore`, not AsyncImage).
 private struct HomeListStyleAvatar: View {
   let title: String
   let peerUserId: String?
@@ -8543,6 +8570,8 @@ private struct HomeListStyleAvatar: View {
   let isDark: Bool
   let palette: AppThemePalette
   var size: CGFloat = 56
+
+  @State private var loadedImage: UIImage?
 
   var body: some View {
     ZStack {
@@ -8554,21 +8583,19 @@ private struct HomeListStyleAvatar: View {
             endPoint: .bottom
           )
         )
-      if let avatarURI, let url = URL(string: avatarURI) {
-        AsyncImage(url: url) { phase in
-          switch phase {
-          case .success(let image):
-            image.resizable().scaledToFill()
-          default:
-            initials
-          }
-        }
+      if let loadedImage {
+        Image(uiImage: loadedImage)
+          .resizable()
+          .scaledToFill()
       } else {
         initials
       }
     }
     .frame(width: size, height: size)
     .clipShape(Circle())
+    .task(id: avatarURI) {
+      await loadAvatar()
+    }
   }
 
   private var gradient: (UIColor, UIColor) {
@@ -8583,6 +8610,25 @@ private struct HomeListStyleAvatar: View {
     Text(String((fallback.isEmpty ? title : fallback).prefix(2)).uppercased())
       .font(.system(size: size * 0.34, weight: .bold))
       .foregroundStyle(.white)
+  }
+
+  @MainActor
+  private func loadAvatar() async {
+    let uri = avatarURI?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard !uri.isEmpty else {
+      loadedImage = nil
+      return
+    }
+    if let cached = ChatAvatarImageStore.cached(for: uri) {
+      loadedImage = cached
+      return
+    }
+    loadedImage = nil
+    let image = await ChatAvatarImageStore.load(from: uri)
+    // Ignore stale loads if URI changed mid-flight.
+    let current = avatarURI?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard current == uri else { return }
+    loadedImage = image
   }
 }
 
@@ -8651,18 +8697,18 @@ struct ContactSearchResultRow: View {
     } ?? "last seen recently"
   }
 
-  /// Prefer payload image; for bridge agents always resolve the known CDN avatar
-  /// so search never shows initials when Claude/Codex/Grok have a profile photo.
+  /// Same resolver as the home list: agent CDN mark when the peer is Claude/Codex/
+  /// Grok/Agy, otherwise payload image / push-avatar.
   private var resolvedProfileImage: String? {
-    if let profileImage = user.profileImage?.trimmingCharacters(in: .whitespacesAndNewlines),
-      !profileImage.isEmpty
-    {
-      return profileImage
-    }
-    if let provider = user.bridgeProvider {
-      return HomeSearchChatRow.agentAvatarURL(for: provider)
-    }
-    return nil
+    ChatAvatarURLResolver.resolve(
+      rawAvatar: user.profileImage,
+      peerUserId: user.userID,
+      chatId: nil,
+      preferPushAvatar: false,
+      isAgent: user.isAgent || user.bridgeProvider != nil,
+      agentId: user.agentId ?? user.bridgeAgentRouteId,
+      displayName: user.handle ?? user.username
+    )
   }
 }
 
@@ -9734,20 +9780,30 @@ enum GroupProfileActionRouter {
 }
 
 private enum ChatDirectMessageService {
-  static func startChat(config: AppSessionConfig, friendID: String) async throws -> ChatCreateResult {
+  static func startChat(
+    config: AppSessionConfig,
+    friendID: String,
+    allowPacketFallback: Bool = true
+  ) async throws -> ChatCreateResult {
     let activeConfig = AppSessionConfig.current ?? config
     do {
-      return try await startChatOnce(config: activeConfig, friendID: friendID)
+      return try await startChatOnce(
+        config: activeConfig, friendID: friendID, allowPacketFallback: allowPacketFallback)
     } catch let error as ChatDirectMessageServiceError {
       guard error.isSessionExpired else {
         throw error
       }
       let refreshedConfig = try await AppSessionRefreshService.refresh(config: activeConfig)
-      return try await startChatOnce(config: refreshedConfig, friendID: friendID)
+      return try await startChatOnce(
+        config: refreshedConfig, friendID: friendID, allowPacketFallback: allowPacketFallback)
     }
   }
 
-  private static func startChatOnce(config: AppSessionConfig, friendID: String) async throws -> ChatCreateResult {
+  private static func startChatOnce(
+    config: AppSessionConfig,
+    friendID: String,
+    allowPacketFallback: Bool
+  ) async throws -> ChatCreateResult {
     let request = try buildRequest(config: config, friendID: friendID)
 
     switch config.transportMode {
@@ -9756,6 +9812,10 @@ private enum ChatDirectMessageService {
     case .bridgeText:
       throw ChatDirectMessageServiceError.transportUnavailable("bridge_text")
     case .packetMesh:
+      guard allowPacketFallback else {
+        // Agent DMs must not hang on mesh bootstrap when direct is preferred.
+        throw ChatDirectMessageServiceError.transportUnavailable("packet_mesh_disabled")
+      }
       let packetSnapshot = try await PacketRuntime.shared.ensureStarted(config: config)
       let session = PacketRuntime.shared.makeURLSession(snapshot: packetSnapshot)
       return try await perform(request, session: session)
@@ -9768,7 +9828,7 @@ private enum ChatDirectMessageService {
         }
         return result
       } catch {
-        guard shouldAttemptPacketFallback(for: error) else {
+        guard allowPacketFallback, shouldAttemptPacketFallback(for: error) else {
           throw error
         }
         let packetSnapshot = try await PacketRuntime.shared.ensureStarted(config: config)
@@ -9796,7 +9856,8 @@ private enum ChatDirectMessageService {
 
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
-    request.timeoutInterval = 20
+    // Agent open-chat should fail fast — 20s + packet mesh was feeling like ~30s.
+    request.timeoutInterval = 12
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.setValue("application/json", forHTTPHeaderField: "Accept")
     request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
@@ -9898,7 +9959,15 @@ private func openAgentDirectChat(
       peerUserId: agentUserId,
       peerAgentId: routeAgentId,
       isAgent: routeAgentId != nil || resolvedBridgeProvider != nil,
-      avatarURI: nil,
+      avatarURI: ChatAvatarURLResolver.resolve(
+        rawAvatar: nil,
+        peerUserId: agentUserId,
+        chatId: result.chatID,
+        preferPushAvatar: false,
+        isAgent: true,
+        agentId: routeAgentId,
+        displayName: title
+      ),
       isGroup: false,
       initialRows: result.messages,
       bridgeProvider: resolvedBridgeProvider

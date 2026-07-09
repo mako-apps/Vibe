@@ -1827,6 +1827,11 @@ func chatAgentNodeCompactLabel(_ node: ChatListRow.AgentProgressNode) -> String 
     }
     return parts.joined(separator: " · ")
   }
+  if kind == "compacting" {
+    let isRunning = ["running", "streaming", "in_progress", "active"].contains(node.status.lowercased())
+    if isRunning { return "Compacting conversation…" }
+    return node.label.isEmpty ? "Compacted conversation" : node.label
+  }
   let verb: String
   switch kind {
   case "read": verb = "Read"

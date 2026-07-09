@@ -5232,8 +5232,7 @@ final class ChatEngine {
 
     var text = normalizedString(payload["text"]) ?? ""
     var progressNodes = (payload["progressNodes"] as? [[String: Any]]) ?? []
-    // Live frames: one text node only (latest narration). Prevents stacked prior
-    // answers in the Worked feed while status is still running.
+    // Live frames: merge only *adjacent* text streams (not “last text wins globally”).
     if status != "done", status != "error", status != "stopped" {
       progressNodes = Self.collapseLiveTextProgressNodes(progressNodes)
     }
@@ -5241,16 +5240,35 @@ final class ChatEngine {
     // freshly-reset accumulation buffer for the SAME task. If this frame carries
     // strictly less than what's already on screen for this row, keep showing the
     // richer content already displayed until the new stream catches back up.
+    // Also covers STOP mid-stream: a settle/cancel frame with empty body+nodes must
+    // not wipe partial Grok content the user already watched.
     if let existingMessage = liveMessageRowsByChat[chatId]?[effectiveRowId]?["message"] as? [String: Any] {
       let existingText = normalizedString(existingMessage["plainContent"]) ?? ""
       let existingProgressNodes =
         ((existingMessage["metadata"] as? [String: Any])?["progressNodes"] as? [[String: Any]]) ?? []
+      let existingHasContent =
+        !existingText.isEmpty
+        || existingProgressNodes.contains { node in
+          let kind = (normalizedString(node["kind"] ?? node["itemType"]) ?? "").lowercased()
+          let label = normalizedString(node["label"]) ?? ""
+          return kind == "text" || kind == "thinking" || kind == "compacting" || label.count > 2
+        }
+      let nextHasContent =
+        !text.isEmpty
+        || progressNodes.contains { node in
+          let kind = (normalizedString(node["kind"] ?? node["itemType"]) ?? "").lowercased()
+          let label = normalizedString(node["label"]) ?? ""
+          return kind == "text" || kind == "thinking" || kind == "compacting" || label.count > 2
+        }
       if progressNodes.count < existingProgressNodes.count, text.count <= existingText.count {
         text = existingText
         progressNodes = existingProgressNodes
         if status != "done", status != "error", status != "stopped" {
           progressNodes = Self.collapseLiveTextProgressNodes(progressNodes)
         }
+      } else if existingHasContent, !nextHasContent {
+        text = existingText.isEmpty ? text : existingText
+        progressNodes = existingProgressNodes.isEmpty ? progressNodes : existingProgressNodes
       }
     }
     // Diagnostic: the chronological kind order the server sent for this live frame.
@@ -5268,19 +5286,34 @@ final class ChatEngine {
     let serverReceivedAtMs = parseLongValue(payload["serverReceivedAtMs"] ?? payload["server_received_at_ms"])
     let serverBroadcastAtMs = parseLongValue(payload["serverBroadcastAtMs"] ?? payload["server_broadcast_at_ms"])
     let phoneReceivedAtMs = Int64(nowMs())
-    if sequence == nil || sequence ?? 0 <= 3 || (sequence ?? 0) % 10 == 0 {
+    // Always log first few frames + every 5th + any settle/compacting so layout
+    // jumps and Grok interleave order are visible while debugging on device.
+    let shouldLogFrame =
+      sequence == nil
+      || (sequence ?? 0) <= 5
+      || (sequence ?? 0) % 5 == 0
+      || status == "done" || status == "error" || status == "stopped"
+      || progressKindOrder.contains("compacting")
+      || progressKindOrder.contains("thinking")
+    if shouldLogFrame {
       let bridgeToServer = bridgeSentAtMs.flatMap { sent in serverReceivedAtMs.map { $0 - sent } }
       let serverToPhone = serverBroadcastAtMs.map { phoneReceivedAtMs - $0 }
       let endToEnd = bridgeSentAtMs.map { phoneReceivedAtMs - $0 }
+      let mode = transportModeLocked()
+      let wsConnected = (state["connected"] as? Bool) == true
+      let transport =
+        "mode=\(mode) phoenix=\(phoenixClient == nil ? "nil" : (wsConnected ? "ws-up" : "ws-down"))"
       NSLog(
-        "[ChatEngine][AgentStream] chat=%@ stream=%@ row=%@ seq=%@ text=%d nodes=%d order=[%@] bridgeToServer=%@ms serverToPhone=%@ms e2e=%@ms",
+        "[ChatEngine][AgentStream] chat=%@ stream=%@ row=%@ seq=%@ status=%@ text=%d nodes=%d order=[%@] transport=%@ bridgeToServer=%@ms serverToPhone=%@ms e2e=%@ms",
         chatId,
         streamId,
         effectiveRowId == streamId ? "-" : effectiveRowId,
         sequence.map(String.init) ?? "nil",
+        status,
         text.count,
         progressNodes.count,
         progressKindOrder,
+        transport,
         bridgeToServer.map(String.init) ?? "nil",
         serverToPhone.map(String.init) ?? "nil",
         endToEnd.map(String.init) ?? "nil"
@@ -5435,39 +5468,58 @@ final class ChatEngine {
   /// session-ingest (watch) path: watch-driven sessions (including IDE-owned ones the
   /// bridge never spawned) get no agent-stream frames at all, so the header state must be
   /// derivable from the ingested transcript too.
-  /// Keep only the latest `kind:text` node while a turn is live. Multiple interim
-  /// narrations (or a leaked previous-turn answer) stack into one Worked cell.
+  /// Merge only *adjacent* `kind:text` nodes (same continuous stream). Never drop
+  /// text that sits between tools — that was the "all tools on top, all text at
+  /// bottom" Grok regression. Callers used to keep only the global last text node.
   private static func collapseLiveTextProgressNodes(_ nodes: [[String: Any]]) -> [[String: Any]] {
     func kindOf(_ node: [String: Any]) -> String {
       let raw = (node["kind"] as? String) ?? (node["itemType"] as? String) ?? ""
       return raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
     guard nodes.count > 1 else { return nodes }
-    var lastTextIdx = -1
-    for (idx, node) in nodes.enumerated() {
-      if kindOf(node) == "text" { lastTextIdx = idx }
+    var out: [[String: Any]] = []
+    for node in nodes {
+      let kind = kindOf(node)
+      if kind == "text", let last = out.last, kindOf(last) == "text" {
+        let label = (node["label"] as? String) ?? ""
+        let prev = (last["label"] as? String) ?? ""
+        // Prefer the longer (growing) stream chunk when adjacent.
+        if label.count >= prev.count {
+          out[out.count - 1] = node
+        }
+        continue
+      }
+      out.append(node)
     }
-    guard lastTextIdx >= 0 else { return nodes }
-    return nodes.enumerated().compactMap { idx, node in
-      if kindOf(node) == "text", idx != lastTextIdx { return nil }
-      return node
-    }
+    return out
   }
 
   private func agentProgressLabelFromNodes(_ progressNodes: [[String: Any]]) -> String? {
+    // Prefer a live compacting node so the chat header reads "Compacting…" mid-run.
+    if let compacting = progressNodes.reversed().first(where: { node in
+      let kind = (normalizedString(node["kind"] ?? node["itemType"]) ?? "").lowercased()
+      let status = (normalizedString(node["status"]) ?? "").lowercased()
+      return kind == "compacting" && ["running", "streaming", "in_progress", "active"].contains(status)
+    }) {
+      return normalizedString(compacting["label"] ?? compacting["title"]) ?? "Compacting conversation…"
+    }
     let latestActionNode = progressNodes.reversed().first(where: { node in
       ((normalizedString(node["kind"] ?? node["itemType"]) ?? "").lowercased()) != "text"
     })
     var label = latestActionNode.flatMap { normalizedString($0["label"] ?? $0["title"]) }
-    if let node = latestActionNode,
-      (normalizedString(node["kind"] ?? node["itemType"]) ?? "").lowercased() == "thinking",
-      let tokens = parseLongValue(node["tokens"]), tokens > 0
-    {
-      let count =
-        tokens >= 1000
-        ? String(format: "%.1fk tokens", Double(tokens) / 1000.0)
-        : "\(tokens) tokens"
-      label = "Thinking · \(count)"
+    if let node = latestActionNode {
+      let kind = (normalizedString(node["kind"] ?? node["itemType"]) ?? "").lowercased()
+      if kind == "thinking",
+        let tokens = parseLongValue(node["tokens"]), tokens > 0
+      {
+        let count =
+          tokens >= 1000
+          ? String(format: "%.1fk tokens", Double(tokens) / 1000.0)
+          : "\(tokens) tokens"
+        label = "Thinking · \(count)"
+      } else if kind == "compacting" {
+        label = normalizedString(node["label"] ?? node["title"]) ?? "Compacting conversation…"
+      }
     }
     return label
       ?? progressNodes.reversed().compactMap { node in

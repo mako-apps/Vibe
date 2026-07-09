@@ -7,6 +7,12 @@ import UIKit
 /// list so all three read identically.
 func vibeAgentKitProgressDisplayLabel(_ item: VibeAgentKitProgressItem) -> String {
   let kind = (item.itemType ?? item.tool ?? "").lowercased()
+  if kind == "compacting" {
+    let status = (item.status ?? "").lowercased()
+    let isRunning = ["running", "streaming", "in_progress", "active"].contains(status)
+    if isRunning { return "Compacting conversation…" }
+    return item.label.isEmpty ? "Compacted conversation" : item.label
+  }
   guard kind == "thinking" else { return item.label }
   let status = (item.status ?? "").lowercased()
   let isRunning = ["running", "streaming", "in_progress", "active"].contains(status)
@@ -2697,6 +2703,7 @@ final class VibeAgentKitStepDetailViewController: UIViewController {
     case "edit", "write": return item.fileName ?? "Edit"
     case "read": return item.fileName ?? "Read"
     case "thinking": return "Thinking"
+    case "compacting": return "Compacting"
     default: return item.label.isEmpty ? "Step" : item.label
     }
   }

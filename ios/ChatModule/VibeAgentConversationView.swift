@@ -64,6 +64,19 @@ enum VibeAgentKitMap {
       }
     }
 
+    // Prefer encrypted action blob; fall back to plaintext node.detail (Grok CoT live).
+    // Thinking keeps a larger body so the sheet can show the full CoT (not a 1.4k clip).
+    let bodyFromEnc = actionDetailBody(kind: kind, detail: detail)
+    let bodyFromNode: String? = {
+      guard let d = node.detail?.trimmingCharacters(in: .whitespacesAndNewlines), !d.isEmpty else {
+        return nil
+      }
+      let limit = (kind == "thinking") ? 12000 : 1400
+      if d.count > limit { return String(d.prefix(limit)) + "\n… (truncated)" }
+      return d
+    }()
+    let messageContent = bodyFromEnc ?? bodyFromNode
+
     return VibeAgentKitProgressItem(
       label: chatAgentNodeCompactLabel(node),
       badges: [],
@@ -71,7 +84,7 @@ enum VibeAgentKitMap {
       recipient: nil,
       platform: nil,
       format: nil,
-      messageContent: actionDetailBody(kind: kind, detail: detail),
+      messageContent: messageContent,
       messagePreview: nil,
       voiceUrl: nil,
       voiceDuration: nil,

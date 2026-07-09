@@ -1973,8 +1973,10 @@ defmodule Vibe.AI.LocalAgentWorker do
   #   stdout streaming-json: {"type":"thought"|"text"|"end", "data":...}
   #   bridge-injected tools from updates.jsonl: {"type":"tool_use"|"tool_result", ...}
   #   throttled vibe_thinking ticker lines
-  # Walk chronologically and emit STABLE-id nodes (one thinking, one text, one
-  # per tool id) so the phone upserts a single bubble instead of one cell per chunk.
+  # Walk chronologically. Text/thinking use *segment* ids (`grok-text-0`,
+  # `grok-thinking-1`, …) so a tool between narrations does not pin later prose
+  # back to the first text slot (the "all tools on top, all text at bottom" bug).
+  # Bump `seg` after each tool so the next thought/text segment appends after it.
   defp interleaved_grok_progress_nodes(decoded, tool_events, summary_text) do
     summary_norm = summary_text |> to_string() |> String.trim()
     tool_by_id = Map.new(tool_events || [], fn ev -> {ev["id"], ev} end)
@@ -1993,7 +1995,11 @@ defmodule Vibe.AI.LocalAgentWorker do
       thought: "",
       answer: "",
       used_tools: MapSet.new(),
-      thought_flushed: false
+      thought_flushed: false,
+      # Segment counter: same seg for continuous thought+text; tools bump it.
+      seg: 0,
+      # True after a tool/compacting node so the next thought/text starts a new seg.
+      need_new_seg: false
     }
 
     state =
@@ -2003,11 +2009,15 @@ defmodule Vibe.AI.LocalAgentWorker do
             st
 
           event["type"] == "thought" and is_binary(event["data"]) ->
-            %{st | thought: st.thought <> event["data"], thought_flushed: false}
+            st
+            |> grok_begin_thought_phase()
+            |> Map.update!(:thought, &(&1 <> event["data"]))
+            |> Map.put(:thought_flushed, false)
 
           event["type"] == "text" and is_binary(event["data"]) ->
             st
             |> grok_flush_thought_node(think_status)
+            |> grok_begin_text_phase()
             |> Map.update!(:answer, &join_grok_text_chunks([&1, event["data"]]))
 
           event["type"] == "tool_use" ->
@@ -2022,12 +2032,23 @@ defmodule Vibe.AI.LocalAgentWorker do
             id = normalize_string(event["tool_use_id"] || event["id"])
             grok_mark_tool_result(st, id, event)
 
+          # Live compacting signals (bridge may inject these from updates.jsonl).
+          event["type"] in ["compacting", "auto_compact_started"] ->
+            grok_put_compacting_node(st, "running", event)
+
+          event["type"] in ["compacted", "auto_compact_completed"] ->
+            grok_put_compacting_node(st, "done", event)
+
           is_binary(event["thought"]) and event["type"] not in ["text", "end"] ->
-            %{st | thought: st.thought <> event["thought"], thought_flushed: false}
+            st
+            |> grok_begin_thought_phase()
+            |> Map.update!(:thought, &(&1 <> event["thought"]))
+            |> Map.put(:thought_flushed, false)
 
           is_binary(event["text"]) and event["type"] not in ["thought", "end", "tool_use", "tool_result"] ->
             st
             |> grok_flush_thought_node(think_status)
+            |> grok_begin_text_phase()
             |> Map.update!(:answer, &join_grok_text_chunks([&1, event["text"]]))
 
           true ->
@@ -2051,11 +2072,15 @@ defmodule Vibe.AI.LocalAgentWorker do
                   grok_mark_tool_result(inner, id, result_block)
 
                 %{"type" => "thinking", "thinking" => body} when is_binary(body) ->
-                  %{inner | thought: inner.thought <> body, thought_flushed: false}
+                  inner
+                  |> grok_begin_thought_phase()
+                  |> Map.update!(:thought, &(&1 <> body))
+                  |> Map.put(:thought_flushed, false)
 
                 %{"type" => "text", "text" => body} when is_binary(body) ->
                   inner
                   |> grok_flush_thought_node(think_status)
+                  |> grok_begin_text_phase()
                   |> Map.update!(:answer, &join_grok_text_chunks([&1, body]))
 
                 _ ->
@@ -2065,44 +2090,42 @@ defmodule Vibe.AI.LocalAgentWorker do
         end
       end)
 
-    # Live: only one text node (latest). Finished: keep interleaved interim text
-    # nodes; final body equals summary_norm and is dropped from the feed above.
-    nodes =
-      state
-      |> grok_flush_thought_node(think_status)
-      |> grok_flush_answer_node(summary_norm, text_status)
-      |> Map.get(:nodes)
+    # Keep multi-segment interleave live AND settled. Final summary body (when equal
+    # to summary_norm) is still dropped inside grok_flush_answer_node.
+    state
+    |> grok_flush_thought_node(think_status)
+    |> grok_flush_answer_node(summary_norm, text_status)
+    |> Map.get(:nodes)
+  end
 
-    if settled do
-      nodes
+  # After tools (or when re-entering thought after flushed narration), advance seg
+  # so the next thought/text node appends instead of upserting an earlier slot.
+  defp grok_begin_thought_phase(st) do
+    st =
+      if String.trim(st.answer) != "" do
+        # Thought after open text without a tool — seal text on current seg, then bump.
+        st
+        |> grok_flush_answer_node("", "done")
+        |> Map.put(:answer, "")
+        |> Map.put(:need_new_seg, true)
+      else
+        st
+      end
+
+    if st.need_new_seg or (st.thought_flushed and String.trim(st.thought) == "") do
+      %{st | seg: st.seg + 1, need_new_seg: false, thought_flushed: false}
     else
-      collapse_live_text_progress_nodes(nodes)
+      st
     end
   end
 
-  defp collapse_live_text_progress_nodes(nodes) when is_list(nodes) do
-    last_text_idx =
-      nodes
-      |> Enum.with_index()
-      |> Enum.reduce(-1, fn {node, idx}, acc ->
-        kind = node |> Map.get("kind") |> to_string() |> String.downcase()
-        if kind == "text", do: idx, else: acc
-      end)
-
-    if last_text_idx < 0 do
-      nodes
+  defp grok_begin_text_phase(st) do
+    if st.need_new_seg do
+      %{st | seg: st.seg + 1, need_new_seg: false}
     else
-      nodes
-      |> Enum.with_index()
-      |> Enum.filter(fn {node, idx} ->
-        kind = node |> Map.get("kind") |> to_string() |> String.downcase()
-        kind != "text" or idx == last_text_idx
-      end)
-      |> Enum.map(&elem(&1, 0))
+      st
     end
   end
-
-  defp collapse_live_text_progress_nodes(nodes), do: nodes
 
   defp grok_flush_thought_node(st, status) do
     body = String.trim(st.thought)
@@ -2116,15 +2139,18 @@ defmodule Vibe.AI.LocalAgentWorker do
 
       true ->
         tokens = max(1, div(String.length(body), 4))
+        seg = st.seg
 
         node = %{
-          "id" => "grok-thinking",
+          "id" => "grok-thinking-#{seg}",
           "label" => "Thinking",
           "status" => status,
           "kind" => "thinking",
           "depth" => 0,
           "tokens" => tokens,
-          "detail" => clip_text_node(body)
+          # Full CoT for the phone thinking sheet (tap compact row → expand/sheet).
+          "detail" => clip_text_node(body),
+          "output" => clip_text_node(body)
         }
 
         nodes = upsert_progress_node(st.nodes, node)
@@ -2139,13 +2165,15 @@ defmodule Vibe.AI.LocalAgentWorker do
       body == "" ->
         st
 
-      body == summary_norm ->
+      body == summary_norm and summary_norm != "" ->
         # Finished summary re-renders as the message body outside the card.
         st
 
       true ->
+        seg = st.seg
+
         node = %{
-          "id" => "grok-text",
+          "id" => "grok-text-#{seg}",
           "label" => clip_text_node(body),
           "status" => status,
           "kind" => "text",
@@ -2182,9 +2210,57 @@ defmodule Vibe.AI.LocalAgentWorker do
           )
 
       node = tool_event_to_node(event, length(st.nodes))
-      %{st | nodes: st.nodes ++ [node], used_tools: MapSet.put(st.used_tools, id)}
+      # Next thought/text must not upsert into the pre-tool segment.
+      %{
+        st
+        | nodes: st.nodes ++ [node],
+          used_tools: MapSet.put(st.used_tools, id),
+          need_new_seg: true,
+          thought: "",
+          answer: "",
+          thought_flushed: false
+      }
     end
   end
+
+  defp grok_put_compacting_node(st, status, event) when is_map(event) do
+    id = normalize_string(event["id"]) || "grok-compacting-#{st.seg}"
+    before = event["tokens_before"] || event["tokensBefore"]
+    after = event["tokens_after"] || event["tokensAfter"]
+
+    label =
+      cond do
+        status == "done" and is_integer(before) and is_integer(after) ->
+          "Compacted context · #{before} → #{after} tokens"
+
+        status == "done" ->
+          "Compacted conversation"
+
+        true ->
+          "Compacting conversation…"
+      end
+
+    node = %{
+      "id" => id,
+      "label" => label,
+      "status" => status,
+      "kind" => "compacting",
+      "depth" => 0
+    }
+
+    nodes = upsert_progress_node(st.nodes, node)
+
+    %{
+      st
+      | nodes: nodes,
+        need_new_seg: true,
+        thought: "",
+        answer: "",
+        thought_flushed: false
+    }
+  end
+
+  defp grok_put_compacting_node(st, _status, _event), do: st
 
   defp grok_mark_tool_result(st, nil, _event), do: st
 
@@ -2309,6 +2385,44 @@ defmodule Vibe.AI.LocalAgentWorker do
     tool_by_id = Map.new(tool_events, fn ev -> {ev["id"], ev} end)
     summary_norm = summary_text |> to_string() |> String.trim()
 
+    # Surface bridge-injected compacting events (Claude /compact headless).
+    compact_nodes =
+      decoded
+      |> Enum.reduce([], fn event, acc ->
+        cond do
+          not is_map(event) ->
+            acc
+
+          event["type"] in ["auto_compact_started", "compacting"] ->
+            [
+              %{
+                "id" => normalize_string(event["id"]) || "claude-compacting",
+                "label" => "Compacting conversation…",
+                "status" => "running",
+                "kind" => "compacting",
+                "depth" => 0
+              }
+              | acc
+            ]
+
+          event["type"] in ["auto_compact_completed", "compacted"] ->
+            [
+              %{
+                "id" => normalize_string(event["id"]) || "claude-compacting",
+                "label" => "Compacted conversation",
+                "status" => "done",
+                "kind" => "compacting",
+                "depth" => 0
+              }
+              | acc
+            ]
+
+          true ->
+            acc
+        end
+      end)
+      |> Enum.reverse()
+
     {nodes, _used, _text_index} =
       decoded
       |> Enum.flat_map(fn event ->
@@ -2373,7 +2487,8 @@ defmodule Vibe.AI.LocalAgentWorker do
         end
       end)
 
-    Enum.reverse(nodes)
+    # Compacting nodes lead (or trail) so the header/cell can show the state.
+    compact_nodes ++ Enum.reverse(nodes)
   end
 
   # The agent's working text can be long; keep enough to read the card without

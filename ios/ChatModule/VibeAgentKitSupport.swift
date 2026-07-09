@@ -583,6 +583,7 @@ func vibeAgentKitToolSymbol(forKind kind: String?) -> String {
   case "task": return "sparkles"
   case "todo", "planning": return "checklist"
   case "thinking": return "brain"
+  case "compacting": return "arrow.down.right.and.arrow.up.left"
   default: return "wrench.and.screwdriver"
   }
 }

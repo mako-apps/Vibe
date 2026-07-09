@@ -57,5 +57,12 @@ defmodule SetAgentProfiles do
   end
 end
 
-SetAgentProfiles.run()
+# railway run SET_AGENT_ONLY=agy mix run set_agent_profiles.exs
+# (same env as Claude/Codex; defaults to all profiles)
+case System.get_env("SET_AGENT_ONLY") do
+  "agy" -> SetAgentProfiles.run_agy_only()
+  "grok" -> SetAgentProfiles.run_grok_only()
+  _ -> SetAgentProfiles.run()
+end
+
 IO.puts("\nDone.")

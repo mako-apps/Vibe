@@ -5,17 +5,51 @@ enum ChatAvatarURLResolver {
   private static let fallbackAPIBaseURL =
     "https://api.vibegram.io"
 
+  /// Known bridge-agent CDN avatars (same assets as server `LocalAgentWorker`).
+  static func bridgeAgentAvatarURL(for provider: String?) -> String? {
+    guard let provider = normalizedString(provider)?.lowercased() else { return nil }
+    switch provider {
+    case "claude": return "https://media.vibegram.io/chat-media/agent-profiles/claude.png"
+    case "codex": return "https://media.vibegram.io/chat-media/agent-profiles/codex.png"
+    case "grok": return "https://media.vibegram.io/chat-media/agent-profiles/grok-v2.png"
+    case "agy", "antigravity": return "https://media.vibegram.io/chat-media/agent-profiles/agy.png"
+    default: return nil
+    }
+  }
+
+  /// Resolve avatar for a peer, injecting the official agent CDN photo for
+  /// Claude/Codex/Grok/Agy even when `profile_image` / push avatar is empty.
   static func resolve(
     rawAvatar: String?,
     peerUserId: String? = nil,
     chatId: String? = nil,
-    preferPushAvatar: Bool = false
+    preferPushAvatar: Bool = false,
+    isAgent: Bool = false,
+    agentId: String? = nil,
+    displayName: String? = nil
   ) -> String? {
     if chatId == "saved_messages" {
       return nil
     }
 
     let apiBaseURL = resolvedAPIBaseURL()
+
+    // Bridge agents (Claude/Codex/Grok/Agy): reserved UUIDs resolve without isAgent;
+    // username match only when isAgent is true (so a human named "claude" is safe).
+    let agentProvider = ChatHomeListRow.bridgeProvider(
+      peerUserId: peerUserId,
+      name: displayName,
+      isAgent: isAgent,
+      agentId: agentId
+    )
+    if let agentURL = bridgeAgentAvatarURL(for: agentProvider) {
+      // Prefer explicit HTTPS profile when present; otherwise official CDN mark so
+      // home list + search never fall back to initials for known agents.
+      if let trimmed = normalizedString(rawAvatar), isHTTPURL(trimmed) {
+        return trimmed
+      }
+      return agentURL
+    }
 
     // Prefer the raw avatar when it's already a direct HTTPS URL — it carries its
     // own cache key so a changed image URL automatically busts the in-app cache.
@@ -584,7 +618,32 @@ struct ChatHomeListRow {
       : normalizedString(
         raw["avatarUri"] ?? raw["avatar_uri"] ?? raw["friendImage"] ?? raw["friend_image"]
           ?? raw["profileImage"] ?? raw["profile_image"] ?? raw["avatarUrl"] ?? raw["avatar_url"])
-    let avatarUri = resolveAvatarURI(rawAvatar: rawAvatar, friendId: friendId, chatId: chatId)
+    let peerAgentId =
+      isGroup
+      ? nil
+      : normalizedString(
+        raw["friendAgentId"] ?? raw["friend_agent_id"] ?? raw["agentId"] ?? raw["agent_id"])
+    // Bridge agents (Claude/Codex/Grok) are real users with is_agent=true but NO
+    // Agent record (`peerAgentId` is nil). Treat reserved shadow-user ids as agents
+    // even when the payload omits friendIsAgent, so Grok DMs route into the agent view.
+    let isReservedBridgeAgent =
+      Self.bridgeProvider(peerUserId: peerUserId, name: title, isAgent: true, agentId: peerAgentId)
+      != nil
+    let isAgentFriend =
+      !isGroup
+      && (Self.isBuiltInAgentChatId(chatId)
+        || isReservedBridgeAgent
+        || (parseBool(raw["friendIsAgent"] ?? raw["friend_is_agent"]) ?? (peerAgentId != nil)))
+    // Resolve avatar AFTER isAgentFriend so bridge agents get CDN marks when the
+    // server omits friendImage (search/home used to show initials only).
+    let avatarUri = resolveAvatarURI(
+      rawAvatar: rawAvatar,
+      friendId: friendId,
+      chatId: chatId,
+      isAgent: isAgentFriend,
+      agentId: peerAgentId,
+      displayName: title
+    )
     let avatarFallback =
       normalizedString(raw["avatarFallback"] ?? raw["avatar_fallback"])
       ?? String(title.prefix(1)).uppercased()
@@ -602,22 +661,6 @@ struct ChatHomeListRow {
       chatId: chatId,
       isSavedMessages: isSavedMessages
     )
-    let peerAgentId =
-      isGroup
-      ? nil
-      : normalizedString(
-        raw["friendAgentId"] ?? raw["friend_agent_id"] ?? raw["agentId"] ?? raw["agent_id"])
-    // Bridge agents (Claude/Codex/Grok) are real users with is_agent=true but NO
-    // Agent record (`peerAgentId` is nil). Treat reserved shadow-user ids as agents
-    // even when the payload omits friendIsAgent, so Grok DMs route into the agent view.
-    let isReservedBridgeAgent =
-      Self.bridgeProvider(peerUserId: peerUserId, name: title, isAgent: true, agentId: peerAgentId)
-      != nil
-    let isAgentFriend =
-      !isGroup
-      && (Self.isBuiltInAgentChatId(chatId)
-        || isReservedBridgeAgent
-        || (parseBool(raw["friendIsAgent"] ?? raw["friend_is_agent"]) ?? (peerAgentId != nil)))
     let agentEventInboxMode = normalizedString(
       raw["friendAgentEventInboxMode"] ?? raw["friend_agent_event_inbox_mode"]
         ?? raw["agentEventInboxMode"] ?? raw["agent_event_inbox_mode"] ?? raw["eventInboxMode"]
@@ -761,14 +804,22 @@ struct ChatHomeListRow {
     return HomeTimeFormatters.shortDate.string(from: date)
   }
 
-  private static func resolveAvatarURI(rawAvatar: String?, friendId: String?, chatId: String)
-    -> String?
-  {
+  private static func resolveAvatarURI(
+    rawAvatar: String?,
+    friendId: String?,
+    chatId: String,
+    isAgent: Bool = false,
+    agentId: String? = nil,
+    displayName: String? = nil
+  ) -> String? {
     return ChatAvatarURLResolver.resolve(
       rawAvatar: rawAvatar,
       peerUserId: friendId,
       chatId: chatId,
-      preferPushAvatar: true
+      preferPushAvatar: true,
+      isAgent: isAgent,
+      agentId: agentId,
+      displayName: displayName
     )
   }
 

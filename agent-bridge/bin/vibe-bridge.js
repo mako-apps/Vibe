@@ -637,6 +637,18 @@ const sessionByChat = new Map(); // chatId -> claude session_id
 // taskKey -> { child, provider, chatId, taskId, startedAt, frameSeq, lastAckedSeq, frameLog, lastProgress }
 const runningTasks = new Map();
 const finishedTasks = new Map(); // taskKey -> { provider, chatId, taskId, repo, runtime, finishedAt, resultPayload }
+// Duplicate-delivery guard. The SAME run_task can reach runTask() more than once —
+// it arrives on both the cloud channel and the LAN transport, and reconnect-recovery
+// re-delivers tasks that completed while the socket was down (code 1006/1012). Because
+// `runningTasks` isn't populated until AFTER the pre-run git snapshot (~300ms), two
+// near-simultaneous deliveries both slip past it and spawn the CLI twice → duplicate
+// "Worked" cards + corrupted before/after diff attribution. This map reserves the taskId
+// SYNCHRONOUSLY at the very top of runTask (before any await), keyed by taskKey, and keeps
+// the reservation for RUN_TASK_DEDUP_TTL_MS so a post-completion re-delivery is dropped too.
+// A taskId maps 1:1 to a single sent message, so it never legitimately runs twice (a real
+// re-run / edit carries a fresh taskId) — deduping on it is safe.
+const recentRunTaskKeys = new Map(); // taskKey -> lastSeenMs
+const RUN_TASK_DEDUP_TTL_MS = Number(process.env.VIBE_RUN_TASK_DEDUP_TTL_MS || 30 * 60 * 1000);
 // Cap on unacked progress frames retained per running task for replay-on-reconnect.
 // The server's own live-card reconstruction only ever looks at its last @max_stream_lines
 // (160) lines, so keeping more than that here can never recover anything the server would
@@ -1338,6 +1350,33 @@ function rememberFinishedTask(key, record) {
   }
 }
 
+// Synchronous duplicate-delivery guard for run_task. Returns true (→ caller should DROP the
+// run) if this exact task was already seen within the TTL; otherwise records it and returns
+// false. Called at the very top of runTask() before any await/spawn so a second delivery in a
+// later tick sees the reservation even though `runningTasks` isn't set until after the git
+// snapshot. See recentRunTaskKeys for why deduping on taskId is safe.
+function isDuplicateRunTask(provider, chatId, taskId) {
+  const key = taskKey(provider, chatId, taskId);
+  const now = Date.now();
+  // Opportunistic prune of expired reservations (keeps the map from growing unbounded).
+  if (recentRunTaskKeys.size > 256) {
+    for (const [k, ts] of recentRunTaskKeys) {
+      if (now - ts > RUN_TASK_DEDUP_TTL_MS) recentRunTaskKeys.delete(k);
+    }
+  }
+  const prev = recentRunTaskKeys.get(key);
+  recentRunTaskKeys.set(key, now);
+  return prev != null && now - prev < RUN_TASK_DEDUP_TTL_MS;
+}
+
+// Undo a reservation made by isDuplicateRunTask when the run never actually started
+// (repo refused, unknown provider, spawn threw). Without this, a legit server
+// re-delivery of the same task after a transient failure would be dropped for the
+// whole TTL and the task would be silently lost.
+function releaseRunTaskReservation(provider, chatId, taskId) {
+  recentRunTaskKeys.delete(taskKey(provider, chatId, taskId));
+}
+
 function rememberRuntime(provider, chatId, runtime) {
   if (!provider || !chatId || !runtime) return;
   lastRuntimeBySession.set(sessionKey(provider, chatId), runtime);
@@ -2020,6 +2059,14 @@ async function bridgeCommandOutput(provider, chatId, task, repo, command) {
           "The bridge cleared this chat's resume thread, so the next Codex run starts fresh.",
         ].join("\n");
       }
+      if (provider === "grok") {
+        // Grok auto-compacts itself; manual /compact is a TUI slash. Point the user
+        // at the live compacting nodes when auto_compact_* fires in updates.jsonl.
+        return [
+          "Grok auto-compacts when the context window fills (you'll see “Compacting conversation…” in the feed).",
+          "For a manual compact, use `/compact` in the Grok terminal/TUI for this session.",
+        ].join("\n");
+      }
       // Claude: run the REAL compaction against the last captured session, then point
       // this chat's resume at the new, compacted session so follow-ups continue it.
       const sid = sessionByChat.get(chatId) || resumeIdFor(task);
@@ -2077,6 +2124,30 @@ async function runBridgeCommand(channel, task, repo, beforeGit, command) {
   const { provider, chatId, replyToId, requesterUserId } = task;
   const taskId = taskIdFor(task || {});
   const startedAt = Date.now();
+  // While Claude /compact runs (can take tens of seconds), show compacting in the
+  // live feed so the phone doesn't look frozen or jump empty.
+  if (command && command.name === "compact" && provider === "claude") {
+    try {
+      channel.push("progress", {
+        provider,
+        chatId,
+        taskId,
+        sequence: 0,
+        sentAtMs: Date.now(),
+        replyToId,
+        repoId: repo.id,
+        repoName: repo.name,
+        cwd: repo.cwd || repo.path,
+        workMode: workModeFor(task),
+        stage: "compacting",
+        line: JSON.stringify({
+          type: "auto_compact_started",
+          id: "claude-compacting",
+          status: "running",
+        }),
+      });
+    } catch (_) {}
+  }
   const output = await bridgeCommandOutput(provider, chatId, task, repo, command);
   if (output == null) return false;
   const lastRuntime = lastRuntimeBySession.get(sessionKey(provider, chatId));
@@ -2192,6 +2263,30 @@ function runAttributedDiff(cwd, before, after) {
   return { ...after, files, additions, deletions, patch, patchTruncated };
 }
 
+// True if this run's raw output stream contains any tool event that could modify
+// files (edit / write / shell). Used to reject a diff card built purely from the
+// repo's PRE-EXISTING dirty state: on a dirty repo a turn that ran no file-modifying
+// work (e.g. a plain "Hi") must not be credited with the user's own in-progress edits
+// (or a concurrent agent's). Covers Claude tool_use names, Codex thread items, and the
+// Grok/Agy synthetic (mapped) tool names.
+function runMayHaveModifiedFiles(provider, output) {
+  const s = String(output || "");
+  if (!s) return false;
+  // Claude tool_use blocks (nested in assistant message.content).
+  if (/"name"\s*:\s*"(Edit|Write|MultiEdit|NotebookEdit|Bash)"/.test(s)) return true;
+  // Codex thread items.
+  if (/"item_type"\s*:\s*"(file_change|command_execution)"/.test(s)) return true;
+  // Grok / Agy synthetic + raw tool names (mapped by grokActionDetail / mapAgyToolName).
+  if (
+    /"name"\s*:\s*"(search_replace|write|write_to_file|create_file|run_terminal_command|run_command|replace_file_content|multi_replace_file_content|edit|apply_patch)"/i.test(
+      s
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
 function runtimePayload({
   provider,
   task,
@@ -2206,8 +2301,21 @@ function runtimePayload({
   output,
 }) {
   const attributed = runAttributedDiff(repo.cwd || repo.path, before, after);
-  const fileSummary =
+  let fileSummary =
     attributed && attributed.git ? attributed : { files: [], additions: 0, deletions: 0, patch: "" };
+  // Ambient-diff guard: if the repo was ALREADY dirty and this run emitted no
+  // file-modifying tool event, the git delta is the user's own in-progress work (or a
+  // concurrent agent's), not this turn's — drop it so a no-edit turn shows no diff card.
+  // Only fires in the dirty-before path, so a real edit on a clean repo is never hidden.
+  if (
+    before &&
+    before.dirty &&
+    fileSummary.files &&
+    fileSummary.files.length &&
+    !runMayHaveModifiedFiles(provider, output)
+  ) {
+    fileSummary = { files: [], additions: 0, deletions: 0, patch: "" };
+  }
   const metadata = providerMetadataFromOutput(provider, output || "", task, task && task.chatId);
   const payload = {
     taskId,
@@ -2777,8 +2885,18 @@ async function runTask(channel, task) {
       `workMode=${task.workMode || task.agentBridgeWorkMode || "-"} promptLen=${(prompt || "").length}`
   );
 
+  // Drop duplicate deliveries of the same task (cloud+LAN double-send, reconnect
+  // re-delivery) BEFORE the git snapshot / spawn, so we never run the CLI twice.
+  if (isDuplicateRunTask(provider, chatId, taskId)) {
+    console.log(
+      `[vibe-bridge] run_task DUPLICATE dropped provider=${provider} chat=${chatId} task=${taskId}`
+    );
+    return;
+  }
+
   const repoResult = resolveTaskRepository(task || {});
   if (!repoResult.ok) {
+    releaseRunTaskReservation(provider, chatId, taskId);
     channel.push("error", {
       provider,
       chatId,
@@ -2821,6 +2939,7 @@ async function runTask(channel, task) {
     : effectivePrompt;
   const built = buildCommand(provider, promptForCli, chatId, task);
   if (!built) {
+    releaseRunTaskReservation(provider, chatId, taskId);
     channel.push("error", { provider, chatId, message: `Unknown provider: ${provider}` });
     return;
   }
@@ -2847,6 +2966,7 @@ async function runTask(channel, task) {
       env: { ...process.env, ...askMcpEnv(provider, chatId, taskId) },
     });
   } catch (err) {
+    releaseRunTaskReservation(provider, chatId, taskId);
     channel.push("error", { provider, chatId, message: `Could not start ${built.cmd}: ${err.message}`, replyToId });
     return;
   }
@@ -4304,7 +4424,7 @@ function grokUpdateContentText(content) {
 }
 
 // Convert one updates.jsonl record into synthetic NDJSON lines the server understands.
-// Source split (Fable): tools only from this file; thought/text stay on stdout.
+// Source split (Fable): tools + compacting from this file; thought/text stay on stdout.
 function grokUpdateRecordToSyntheticLines(rec) {
   if (!rec || typeof rec !== "object") return [];
   const u = (rec.params && rec.params.update) || rec.update || rec;
@@ -4358,6 +4478,29 @@ function grokUpdateRecordToSyntheticLines(rec) {
         })
       );
     }
+    return out;
+  }
+  // Auto-compact mid-session — phone shows "Compacting conversation…" instead of empty jump.
+  if (kind === "auto_compact_started" || kind === "compaction_checkpoint") {
+    out.push(
+      JSON.stringify({
+        type: "auto_compact_started",
+        id: "grok-compacting",
+        status: "running",
+      })
+    );
+    return out;
+  }
+  if (kind === "auto_compact_completed") {
+    out.push(
+      JSON.stringify({
+        type: "auto_compact_completed",
+        id: "grok-compacting",
+        status: "done",
+        tokens_before: u.tokens_before != null ? u.tokens_before : u.tokensBefore,
+        tokens_after: u.tokens_after != null ? u.tokens_after : u.tokensAfter,
+      })
+    );
     return out;
   }
   return out;
@@ -4641,6 +4784,15 @@ function actionNode(detail, uid, status) {
   // for Ns" like the desktop CLI.
   if (typeof d.tokens === "number" && d.tokens > 0) node.tokens = d.tokens;
   if (typeof d.durationMs === "number" && d.durationMs > 0) node.durationMs = d.durationMs;
+  // Grok exposes full CoT — ride it on the node so the phone can open a thinking
+  // sheet without waiting for encrypted agentActionsEnc (live path has no seal yet).
+  if (kind === "thinking") {
+    const cot = d.output || d.detail || d.text;
+    if (typeof cot === "string" && cot.trim()) {
+      node.detail = clipText(cot.trim(), MAX_ACTION_OUTPUT);
+      node.output = node.detail;
+    }
+  }
   return node;
 }
 // Build a turn's progress nodes + sealed detail array and attach them to the
@@ -4807,8 +4959,53 @@ function foldTurnIntoHost(messages, turnItems, detailByUid, resultByUid, turnRea
     const enc = encryptRuntimeBlob({ actions: actions.slice(-60) });
     if (enc) host.agentActionsEnc = enc;
   }
+  // Empty turn (no body, no tool/text nodes) — never push a glass shell. Thinking-
+  // only presence without tools is also dropped (no paint without substance).
+  const hasBody = String(host.text || "").trim().length > 0;
+  const hasPaint =
+    hasBody ||
+    (Array.isArray(host.progressNodes) &&
+      host.progressNodes.some((n) => {
+        if (!n) return false;
+        const k = String(n.kind || "").toLowerCase();
+        return k !== "thinking" && k !== "";
+      }));
+  if (!hasPaint) return null;
   messages.push(host);
   return host;
+}
+
+/** Grok history hosts: force settled tool/thinking status so the phone's
+ * canShowCompletedWork can render a solid Worked card (Grok stop_reason is often null). */
+function settleGrokHistoryHost(host) {
+  if (!host || typeof host !== "object") return host;
+  host.running = false;
+  host.trailingToolPending = false;
+  if (Array.isArray(host.progressNodes)) {
+    for (const n of host.progressNodes) {
+      if (!n || typeof n !== "object") continue;
+      const st = String(n.status || "").toLowerCase();
+      if (!st || st === "running" || st === "streaming" || st === "pending" || st === "active") {
+        n.status = "done";
+      }
+    }
+  }
+  return host;
+}
+
+function grokStableTurnUid(sessionId, turnIndex, userText) {
+  const prefix = String(userText || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 48);
+  // FNV-1a 32-bit over session+index+prefix — stable across re-ingest/window slides.
+  let h = 0x811c9dc5;
+  const s = `${sessionId || ""}|${turnIndex}|${prefix}`;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return `grok-turn-${(h >>> 0).toString(16)}`;
 }
 
 async function claudeDetail(id, limit, before) {
@@ -5671,23 +5868,37 @@ async function grokDetail(sessionId, limit, before) {
   let turnStartTs = null;
   let turnEndTs = null;
   let lastStopReason = null;
+  let userTurnIndex = 0;
+  let currentUserText = "";
   const actionDetailByUid = new Map();
   const resultByUid = new Map();
   let pending = newRuntimeAccumulator();
 
   const flushTurn = (interrupted) => {
+    // Grok has no assistant uuids — host uid must NOT be window-relative or re-ingest
+    // mints duplicate bridge-… rows (stacked empty Worked glass cards on the phone).
+    const hostUid = currentUserText
+      ? grokStableTurnUid(sessionId, userTurnIndex, currentUserText)
+      : null;
+    // Structurally finalized history turns: promote last narration even when tools
+    // trailed it (Grok often ends mid-tool sequence then settles without stop_reason).
     const host = foldTurnIntoHost(
       messages,
       turnItems,
       actionDetailByUid,
       resultByUid,
       turnReasoning,
-      null,
+      hostUid,
       turnThinking,
-      interrupted
+      interrupted || true // history flush is always structural finalize
     );
-    if (host && pending.order.length) {
-      sealHistoryRuntime("grok", host, pending, turnDurationMs(turnStartTs, turnEndTs));
+    if (host) {
+      settleGrokHistoryHost(host);
+      // Override uid after fold if fold used first-item uid.
+      if (hostUid) host.uid = hostUid;
+      if (pending.order.length) {
+        sealHistoryRuntime("grok", host, pending, turnDurationMs(turnStartTs, turnEndTs));
+      }
     }
     pending = newRuntimeAccumulator();
     // Tool maps must not leak across user turns — same tool-call ids are rare but
@@ -5699,6 +5910,7 @@ async function grokDetail(sessionId, limit, before) {
     turnThinking = { had: false, tokens: 0, durationMs: 0 };
     turnStartTs = null;
     turnEndTs = null;
+    currentUserText = "";
   };
 
   await readJsonl(match.file, (ev) => {
@@ -5713,6 +5925,8 @@ async function grokDetail(sessionId, limit, before) {
       const text = (queryMatch ? queryMatch[1] : body).trim();
       if (!grokIsRealUserPrompt(ev, text)) return;
       flushTurn(false);
+      userTurnIndex += 1;
+      currentUserText = text;
       turnStartTs = ev.timestamp || ev.ts || null;
       if (!topic) {
         const clean = cleanTopicCandidate(text);
@@ -5722,7 +5936,7 @@ async function grokDetail(sessionId, limit, before) {
         role: "user",
         text: clipText(text, 4000),
         ts: ev.timestamp || ev.ts || null,
-        uid: ev.id || ev.uuid || `grok-user-${idx++}`,
+        uid: ev.id || ev.uuid || `grok-user-${userTurnIndex}`,
       });
       return;
     }
@@ -5984,22 +6198,34 @@ function sliceGrokUpdatesLinesToCurrentTurn(lines) {
 }
 
 /**
- * Live hosts must not stack every interim narration as a separate text node —
- * that rendered as "duplicate responses" (old 3k Verdict + new 175-char reply).
- * Keep tools/thinking; keep only the latest kind:text node.
+ * Collapse only *adjacent trailing* text nodes (same continuous stream), never
+ * text that is separated by tools/thinking. The old "keep only last text anywhere"
+ * policy forced [tools…, finalText] and broke Grok chronological interleave.
  */
 function collapseLiveTextNodes(nodes) {
   if (!Array.isArray(nodes) || nodes.length < 2) return nodes || [];
-  let lastTextIdx = -1;
+  const out = [];
   for (let i = 0; i < nodes.length; i++) {
-    if (nodes[i] && String(nodes[i].kind || "").toLowerCase() === "text") lastTextIdx = i;
+    const n = nodes[i];
+    if (!n) continue;
+    const kind = String(n.kind || "").toLowerCase();
+    const prev = out.length ? out[out.length - 1] : null;
+    const prevKind = prev ? String(prev.kind || "").toLowerCase() : "";
+    // Merge consecutive text nodes (growing stream chunks with different ids).
+    if (kind === "text" && prevKind === "text") {
+      const label = String(n.label || n.detail || "").trim();
+      const prevLabel = String(prev.label || prev.detail || "").trim();
+      if (label && label.length >= prevLabel.length) {
+        out[out.length - 1] = Object.assign({}, prev, n, {
+          label: n.label || prev.label,
+          detail: n.detail || prev.detail,
+        });
+      }
+      continue;
+    }
+    out.push(n);
   }
-  if (lastTextIdx < 0) return nodes;
-  return nodes.filter((n, i) => {
-    if (!n) return false;
-    if (String(n.kind || "").toLowerCase() !== "text") return true;
-    return i === lastTextIdx;
-  });
+  return out;
 }
 
 /**
@@ -6048,24 +6274,49 @@ function mergeGrokLiveUpdatesIntoMessages(match, messages) {
   if (!turnLines.length) return;
 
   const nodesById = new Map();
-  // Seed HISTORY-folded tool/thinking nodes only (not prior-turn live text blobs).
-  // Live text is rebuilt from this turn's agent_message_chunk stream alone.
+  // Seed prior history-folded nodes (tools + thinking + interim text segments).
+  // Segmented live ids (grok-text-live-N) replace legacy single-slot live blobs.
   if (Array.isArray(last.progressNodes)) {
     for (const n of last.progressNodes) {
       if (!n || !n.id) continue;
       const id = String(n.id);
       if (id === "grok-text-live" || id === "grok-thinking-live") continue;
-      if (String(n.kind || "").toLowerCase() === "text") continue;
       nodesById.set(id, n);
     }
   }
   let thoughtAcc = "";
   let textAcc = "";
+  let seg = 0;
+  // If seeded nodes already exist, start after the highest live segment.
+  for (const id of nodesById.keys()) {
+    const m = String(id).match(/^grok-(?:text|thinking)-live-(\d+)$/);
+    if (m) seg = Math.max(seg, parseInt(m[1], 10));
+  }
+  let needNewSeg = false;
   let order = Array.from(nodesById.keys());
   const ensureOrder = (id) => {
     if (!order.includes(id)) order.push(id);
   };
+  const bumpSegAfterTool = () => {
+    needNewSeg = true;
+    thoughtAcc = "";
+    textAcc = "";
+  };
+  const ensureSegForPhase = (phase) => {
+    // phase: "thought" | "text"
+    if (needNewSeg) {
+      seg += 1;
+      needNewSeg = false;
+      thoughtAcc = "";
+      textAcc = "";
+    } else if (phase === "thought" && textAcc.trim()) {
+      // Thought after open text without a tool — seal text, new segment.
+      textAcc = "";
+      seg += 1;
+    }
+  };
   let sawTurnCompleted = false;
+  let compactingId = null;
 
   for (const line of turnLines) {
     if (!line.trim()) continue;
@@ -6079,13 +6330,50 @@ function mergeGrokLiveUpdatesIntoMessages(match, messages) {
     if (!u || typeof u !== "object") continue;
     const kind = String(u.sessionUpdate || "");
 
+    // Grok auto-compact (and manual compact) — show live in header/cell, not blank jump.
+    if (kind === "auto_compact_started" || kind === "compaction_checkpoint") {
+      compactingId = compactingId || `grok-compacting-${seg}`;
+      nodesById.set(compactingId, {
+        id: compactingId,
+        label: "Compacting conversation…",
+        kind: "compacting",
+        status: "running",
+        depth: 0,
+      });
+      ensureOrder(compactingId);
+      last.running = true;
+      continue;
+    }
+    if (kind === "auto_compact_completed") {
+      const id = compactingId || `grok-compacting-${seg}`;
+      const before = u.tokens_before != null ? u.tokens_before : u.tokensBefore;
+      const after = u.tokens_after != null ? u.tokens_after : u.tokensAfter;
+      let label = "Compacted conversation";
+      if (typeof before === "number" && typeof after === "number") {
+        label = `Compacted context · ${before} → ${after} tokens`;
+      }
+      nodesById.set(id, {
+        id,
+        label,
+        kind: "compacting",
+        status: "done",
+        depth: 0,
+      });
+      ensureOrder(id);
+      compactingId = null;
+      bumpSegAfterTool();
+      continue;
+    }
+
     if (kind === "agent_thought_chunk") {
       const chunk =
         (u.content && (u.content.text || (typeof u.content === "string" ? u.content : ""))) || "";
       if (chunk) {
+        ensureSegForPhase("thought");
         thoughtAcc += chunk;
-        const id = "grok-thinking-live";
+        const id = `grok-thinking-live-${seg}`;
         const tokens = Math.max(1, Math.round(thoughtAcc.length / 4));
+        const detail = clipText(thoughtAcc, 8000);
         nodesById.set(id, {
           id,
           label: "Thinking",
@@ -6093,7 +6381,9 @@ function mergeGrokLiveUpdatesIntoMessages(match, messages) {
           status: "streaming",
           depth: 0,
           tokens,
-          detail: clipText(thoughtAcc, 4000),
+          detail,
+          // History fold puts CoT on encrypted actions; live path rides plaintext detail.
+          output: detail,
         });
         ensureOrder(id);
       }
@@ -6104,6 +6394,7 @@ function mergeGrokLiveUpdatesIntoMessages(match, messages) {
       const chunk =
         (u.content && (u.content.text || (typeof u.content === "string" ? u.content : ""))) || "";
       if (chunk) {
+        ensureSegForPhase("text");
         // Smart join: avoid "issue.This" when chunks are sentence-sized.
         if (textAcc && chunk) {
           const a = textAcc[textAcc.length - 1];
@@ -6115,7 +6406,7 @@ function mergeGrokLiveUpdatesIntoMessages(match, messages) {
         }
         textAcc += chunk;
         // Live: keep body empty and ride text as a feed node (phone suppresses body mid-run).
-        const id = "grok-text-live";
+        const id = `grok-text-live-${seg}`;
         nodesById.set(id, {
           id,
           label: clipText(textAcc, 4000),
@@ -6147,6 +6438,7 @@ function mergeGrokLiveUpdatesIntoMessages(match, messages) {
       const node = actionNode(det, id, "running");
       nodesById.set(id, node);
       ensureOrder(id);
+      bumpSegAfterTool();
       continue;
     }
 
@@ -6172,6 +6464,7 @@ function mergeGrokLiveUpdatesIntoMessages(match, messages) {
           const det = grokActionDetail(name, input || {});
           nodesById.set(id, actionNode(det, id, status === "completed" ? "done" : "error"));
           ensureOrder(id);
+          bumpSegAfterTool();
         }
       } else if (!existing) {
         const meta = (u._meta && (u._meta["x.ai/tool"] || u._meta.xAiTool)) || {};
@@ -6187,6 +6480,7 @@ function mergeGrokLiveUpdatesIntoMessages(match, messages) {
         const det = grokActionDetail(name, input || {});
         nodesById.set(id, actionNode(det, id, "running"));
         ensureOrder(id);
+        bumpSegAfterTool();
       }
       continue;
     }
@@ -6196,34 +6490,65 @@ function mergeGrokLiveUpdatesIntoMessages(match, messages) {
       // Settle live edge markers.
       for (const n of nodesById.values()) {
         if (n && (n.status === "streaming" || n.status === "running")) {
-          if (n.kind === "thinking" || n.kind === "text") n.status = "done";
+          if (n.kind === "thinking" || n.kind === "text" || n.kind === "compacting") n.status = "done";
           else if (String(n.status || "") === "running") n.status = "done";
         }
       }
       last.running = false;
       last.trailingToolPending = false;
-      // Promote live text into the message body so the phone shows a settled answer
-      // outside the Worked card instead of a forever-streaming text node.
+      // Promote ONLY the last text segment into the message body (final answer);
+      // keep earlier text segments interleaved with tools inside the Worked card.
       if (textAcc.trim()) {
         last.text = clipText(textAcc.trim(), 4000);
-        nodesById.delete("grok-text-live");
-        order = order.filter((id) => id !== "grok-text-live");
+        const lastTextId = `grok-text-live-${seg}`;
+        nodesById.delete(lastTextId);
+        order = order.filter((id) => id !== lastTextId);
       }
     }
   }
 
   let nodes = order.map((id) => nodesById.get(id)).filter(Boolean);
-  // While the turn is still open, never stack multiple text narrations.
-  if (last.running !== false && !sawTurnCompleted) {
-    nodes = collapseLiveTextNodes(nodes);
-  }
+  // Adjacent text-only merge; never collapse text across tools.
+  nodes = collapseLiveTextNodes(nodes);
   nodes = nodes.slice(-60);
   if (nodes.length || sawTurnCompleted) {
+    // Stop-loss: never replace a rich live host with an empty settled payload.
+    const prevNodes = Array.isArray(last.progressNodes) ? last.progressNodes : [];
+    const prevBody = String(last.text || "").trim();
+    const nextBody = String(last.text || "").trim();
+    const prevHas =
+      prevBody.length > 0 ||
+      prevNodes.some((n) => n && (n.kind === "text" || n.kind === "thinking" || (n.label && n.label.length > 2)));
+    const nextHas =
+      nextBody.length > 0 ||
+      nodes.some((n) => n && (n.kind === "text" || n.kind === "thinking" || n.kind === "compacting" || (n.label && n.label.length > 2)));
+    if (sawTurnCompleted && prevHas && !nextHas) {
+      // Keep prior content; just clear running flags on existing nodes.
+      for (const n of prevNodes) {
+        if (n && (n.status === "streaming" || n.status === "running")) {
+          if (n.kind === "thinking" || n.kind === "text" || n.kind === "compacting") n.status = "done";
+          else if (String(n.status || "") === "running") n.status = "done";
+        }
+      }
+      last.progressNodes = prevNodes;
+      if (!String(last.text || "").trim()) {
+        const lastText = [...prevNodes].reverse().find((n) => n && n.kind === "text");
+        if (lastText && lastText.label) last.text = String(lastText.label);
+      }
+      last.running = false;
+      last.trailingToolPending = false;
+      return;
+    }
     last.progressNodes = nodes;
     // Pending tool = still live (unless turn_completed already cleared it).
     if (last.running !== false) {
       last.trailingToolPending = nodes.some(
-        (n) => n && n.kind !== "text" && n.kind !== "thinking" && String(n.status || "") === "running"
+        (n) =>
+          n &&
+          n.kind !== "text" &&
+          n.kind !== "thinking" &&
+          n.kind !== "compacting" &&
+          String(n.status || "") === "running"
       );
     }
   }
@@ -6371,25 +6696,34 @@ function markMessageRunning(message) {
   if (!message || typeof message !== "object") return message;
   message.running = true;
   let nodes = Array.isArray(message.progressNodes) ? message.progressNodes : [];
-  // Drop stacked interim narrations so the live cell shows one text stream, not
-  // every prior paragraph of the turn (or a leaked previous answer).
+  // Only merge *adjacent* text streams — never drop text that sits between tools
+  // (Grok chronological interleave depends on multi-segment text nodes).
   nodes = collapseLiveTextNodes(nodes);
   // The phone SUPPRESSES the message body while a turn is live, and foldTurnIntoHost
   // routes the turn's LAST text into that body (it's the "summary"). Mid-run the
   // newest narration IS the last text, so it vanished from the live feed entirely
   // (textNodes=0 while bodyLen>0). Move the body into a trailing text node while
-  // running; the post-close re-read re-folds and restores the body-outside-card shape.
+  // running; keep earlier interim text nodes that sit between tools.
   const body = String(message.text || "").trim();
   if (body) {
-    // Replace any existing text node with the body (latest summary), don't append.
-    nodes = nodes.filter((n) => !n || String(n.kind || "").toLowerCase() !== "text");
-    nodes = nodes.concat([{
-      id: "live-tail-" + String(message.uid || "0"),
-      label: clipText(body, 4000),
-      kind: "text",
-      status: "done",
-      depth: 0,
-    }]);
+    const liveTailId = "live-tail-" + String(message.uid || "0");
+    // Remove only a previous live-tail placeholder — not every kind:text node.
+    nodes = nodes.filter((n) => !n || String(n.id || "") !== liveTailId);
+    // If the last node is already this body text, just ensure status; else append.
+    const last = nodes.length ? nodes[nodes.length - 1] : null;
+    const lastIsSameText =
+      last &&
+      String(last.kind || "").toLowerCase() === "text" &&
+      String(last.label || "").trim() === body;
+    if (!lastIsSameText) {
+      nodes = nodes.concat([{
+        id: liveTailId,
+        label: clipText(body, 4000),
+        kind: "text",
+        status: "done",
+        depth: 0,
+      }]);
+    }
     message.text = "";
     message.progressNodes = nodes;
   } else {
@@ -6406,7 +6740,8 @@ function markMessageRunning(message) {
     for (let i = nodes.length - 1; i >= 0; i--) {
       const node = nodes[i];
       if (!node || typeof node !== "object") continue;
-      if (String(node.kind || "").trim().toLowerCase() === "text") continue;
+      const kind = String(node.kind || "").trim().toLowerCase();
+      if (kind === "text" || kind === "thinking") continue;
       const status = String(node.status || "").trim().toLowerCase();
       if (["failed", "error", "cancelled", "canceled", "stopped"].includes(status)) continue;
       node.status = "running";

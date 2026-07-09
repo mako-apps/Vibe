@@ -93,6 +93,9 @@ struct ChatListRow {
     var tokens: Int? = nil
     var durationMs: Int? = nil
     var action: String? = nil
+    /// Plaintext detail body (Grok exposed CoT, compacting notes). Live path may ship
+    /// this without encrypted agentActionsEnc; tap thinking opens a sheet with it.
+    var detail: String? = nil
   }
 
   struct AgentRuntimeCommand: Equatable {
@@ -1408,6 +1411,10 @@ private func parseAgentProgressNodes(_ raw: Any?) -> [ChatListRow.AgentProgressN
     let status = parseNonEmptyString(item["status"]) ?? "running"
     let depth = Int(parseLong(item["depth"]) ?? 0)
 
+    let detail =
+      parseNonEmptyString(item["detail"])
+      ?? parseNonEmptyString(item["output"])
+      ?? parseNonEmptyString(item["messageContent"])
     return ChatListRow.AgentProgressNode(
       id: id,
       label: label,
@@ -1423,7 +1430,8 @@ private func parseAgentProgressNodes(_ raw: Any?) -> [ChatListRow.AgentProgressN
       subagentType: parseNonEmptyString(item["subagentType"]),
       tokens: parseLong(item["tokens"]).map { Int($0) },
       durationMs: parseLong(item["durationMs"]).map { Int($0) },
-      action: parseNonEmptyString(item["action"])
+      action: parseNonEmptyString(item["action"]),
+      detail: detail
     )
   }
 

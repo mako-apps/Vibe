@@ -365,12 +365,20 @@ Each **user turn** folds into **one** assistant host via `foldTurnIntoHost` (Wor
 
 ### Server mapping (`LocalAgentWorker`)
 
-- Stable node ids: `grok-thinking`, `grok-text`, tool ids from `tool_use.id`
-- All `thought` chunks upsert one thinking node (`detail` = full thought for the progress sheet)
-- All `text` chunks upsert one text node (dropped when equal to finished summary body)
+- **Segmented** node ids (critical for chronological interleave): `grok-thinking-{seg}`,
+  `grok-text-{seg}`, tool ids from `tool_use.id`. A tool (or compacting) between
+  narrations bumps `seg` so later text appends after tools instead of upserting the
+  first text slot (the old “all tools on top, all text at bottom” bug).
+- Continuous `thought` chunks upsert the current thinking segment (`detail`/`output` =
+  full exposed CoT for the phone thinking sheet).
+- Continuous `text` chunks upsert the current text segment (dropped when equal to
+  finished summary body).
 - Injected `tool_use` / `tool_result` → progress kind + status running→done
+- Compacting: `auto_compact_started` / `auto_compact_completed` from `updates.jsonl` →
+  `kind:compacting` node (“Compacting conversation…”)
 - `vibe_thinking` ticker still drives live "Thinking · N tokens" like Claude
 - `end.sessionId` / bridge-assigned `--session-id` for resume
+- iOS: thinking rows are compact (“Thought for Ns”); tap opens sheet with full CoT
 
 ### Agent identity
 

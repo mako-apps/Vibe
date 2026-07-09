@@ -19,6 +19,13 @@ const AGY_DETAIL_MIDTURN_STALE_MS = Number(
   process.env.VIBE_AGY_DETAIL_MIDTURN_STALE_MS || 30_000
 );
 
+// How far before the run's start a transcript step may be dated and still count as
+// part of THIS run (guards the live tail against replaying prior turns from a reused
+// conversation file — see the created_at filter in startAgyTranscriptTail).
+const AGY_TAIL_STEP_SKEW_MS = Number(
+  process.env.VIBE_AGY_TAIL_STEP_SKEW_MS || 15_000
+);
+
 function agyHome() {
   if (process.env.VIBE_AGY_HOME) return process.env.VIBE_AGY_HOME;
   return path.join(os.homedir(), ".gemini", "antigravity-cli");
@@ -520,6 +527,16 @@ function startAgyTranscriptTail({ cwd, sessionId, startedAtMs, onLine, onSession
         try {
           step = JSON.parse(line);
         } catch {
+          continue;
+        }
+        // Only stream steps from THIS run. A resolved conversation file usually holds
+        // PRIOR turns (agy reuses / forks conversation context, and we read from offset
+        // 0), so without this guard every past PLANNER_RESPONSE.content replays and the
+        // server folds them into one text node — e.g. an "ok" turn + a "hi" turn render
+        // as "okhi". Steps created before the run started are history; skip them. Skew
+        // tolerates minor clock/backdating differences between spawn and the CLI's writes.
+        const createdMs = Date.parse(step.created_at || step.createdAt || "");
+        if (Number.isFinite(createdMs) && createdMs < afterMs - AGY_TAIL_STEP_SKEW_MS) {
           continue;
         }
         const sig = `${step.step_index}:${step.type}:${step.status}:${String(step.content || "").slice(0, 40)}`;

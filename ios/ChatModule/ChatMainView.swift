@@ -774,6 +774,7 @@ public final class ChatMainView: UIView,
     var nextNamesByUserId: [String: String] = [:]
     var nextRolesByUserId: [String: String] = [:]
     var nextOrder: [String] = []
+    var roleSources: [String: String] = [:]
     for raw in rawMembers {
       let rawId =
         (raw["userId"] as? String)
@@ -803,18 +804,61 @@ public final class ChatMainView: UIView,
         let normalizedRole = rawRole.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if !normalizedRole.isEmpty {
           nextRolesByUserId[normalizedId] = normalizedRole
+          if raw["role"] != nil {
+            roleSources[normalizedId] = "role"
+          } else if raw["memberRole"] != nil {
+            roleSources[normalizedId] = "memberRole"
+          } else if raw["member_role"] != nil {
+            roleSources[normalizedId] = "member_role"
+          } else {
+            roleSources[normalizedId] = "participantRole"
+          }
         }
       } else if let previousRole = groupMemberRoleByUserId[normalizedId], !previousRole.isEmpty {
         // Preserve last-known role when an incomplete payload omits it — stops
         // admin ↔ member flicker when home/list refreshes without role fields.
         nextRolesByUserId[normalizedId] = previousRole
+        roleSources[normalizedId] = "preserved"
+      } else {
+        roleSources[normalizedId] = "missing"
       }
     }
     // If this payload was empty/partial, keep prior roles for ids we already knew
     // that didn't appear — but only when the new list is empty (don't invent).
     if nextOrder.isEmpty, !groupMemberOrder.isEmpty {
+      NSLog(
+        "[WhoAmI] ChatMainView.setGroupMembers EMPTY-PAYLOAD ignored — keep prior members=%d",
+        groupMemberOrder.count
+      )
       return
     }
+    let config = ChatEngineStore.shared.getConfig()
+    let me =
+      (config["userId"] as? String)
+      ?? (config["myUserId"] as? String)
+      ?? (config["user_id"] as? String)
+      ?? ""
+    let meKey = me.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+    let myPrev = meKey.isEmpty ? nil : groupMemberRoleByUserId[meKey]
+    let myNext = meKey.isEmpty ? nil : nextRolesByUserId[meKey]
+    let mySource = meKey.isEmpty ? "no-me" : (roleSources[meKey] ?? "not-in-roster")
+    let flipped =
+      (myPrev ?? "") != (myNext ?? "")
+      && !(myPrev ?? "").isEmpty
+      && !(myNext ?? "").isEmpty
+    NSLog(
+      "[WhoAmI] ChatMainView.setGroupMembers chatMembers=%d me=%@ prevRole=%@ nextRole=%@ source=%@ flipped=%@ isAdmin=%@ sample=[%@]",
+      nextOrder.count,
+      meKey.isEmpty ? "<unknown>" : String(meKey.prefix(8)),
+      myPrev ?? "<nil>",
+      myNext ?? "<nil>",
+      mySource,
+      flipped ? "Y" : "N",
+      (myNext == "owner" || myNext == "admin") ? "Y" : "N",
+      nextOrder.prefix(6).map { id in
+        "\(String(id.prefix(6))):\(nextRolesByUserId[id] ?? "?")/\(roleSources[id] ?? "?")"
+      }.joined(separator: " ")
+    )
     groupMemberDisplayNameByUserId = nextNamesByUserId
     groupMemberRoleByUserId = nextRolesByUserId
     groupMemberOrder = nextOrder

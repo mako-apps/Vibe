@@ -1189,6 +1189,16 @@ private struct ChatProfileSwiftUIRootView: View {
   @State private var stickyTitleVisible = false
   @State private var newChatTrigger = false
   @State private var isShowingAddMembers = false
+  /// Discrete shared value: false = compact circle hero, true = tall banner hero.
+  /// Not scroll-linked in real time — only flips with spring + haptic.
+  @State private var heroExpanded = false
+  /// True after the user has scrolled into content while the banner is open;
+  /// returning to the top then collapses back to the circle.
+  @State private var hasScrolledAwayWhileExpanded = false
+  /// Arms a single overscroll→expand per pull (re-arms when offset ≥ 0).
+  @State private var expandGestureArmed = true
+  /// Blocks offset feedback while the spring morph is in flight.
+  @State private var heroMorphInFlight = false
   /// Local echo of the selected repo name so the Repository row subtitle updates
   /// immediately when the native Menu picks a repo (without a full host re-render).
   @State private var selectedRepoNameLocal: String?
@@ -1263,100 +1273,207 @@ private struct ChatProfileSwiftUIRootView: View {
     return count == 1 ? "1 member" : "\(count) members"
   }
 
-  /// Constant hero height — never derived from GeometryReader / safe-area, so a
-  /// second layout pass cannot reflow the scroll content (the open-time jump).
-  private var fixedHeroHeight: CGFloat {
-    if hasProfileImage {
-      return 280
-    }
-    return NativeProfileAvatarHeroMetrics.topOffset
-      + NativeProfileAvatarHeroMetrics.expandedSize
-      + 18
+  /// Slot height for the avatar band (spacer in scroll + fixed overlay size).
+  private var avatarScrollSlotHeight: CGFloat {
+    heroExpanded
+      ? min(max(UIScreen.main.bounds.height * 0.52, 400), 520)
+      : 300
   }
 
+  /// Fixed page-level reflection band (does NOT scroll).
+  private var pageReflectionHeight: CGFloat {
+    min(max(UIScreen.main.bounds.height * 0.58, 420), 560)
+  }
+
+  /// Avatar expand shared value 0…1 (only the avatar morphs — not the reflection).
+  private var avatarExpand: CGFloat { heroExpanded ? 1 : 0 }
+
+  /// Scroll-driven scale applied to the avatar image (circle OR pinned hero).
+  /// When expanded, scroll scales the image *inner* — the hero band stays fixed.
+  private var scrollImageScale: CGFloat {
+    let progress = min(1, max(0, localScrollOffset / 220))
+    if heroExpanded {
+      // Scale the banner image in place; do not translate the hero with the body.
+      return max(0.88, 1.0 - progress * 0.12)
+    }
+    return max(0.68, 1.0 - progress * 0.32)
+  }
+
+  private var scrollImageBlur: CGFloat {
+    let progress = min(1, max(0, localScrollOffset / 220))
+    if heroExpanded {
+      return progress * 4
+    }
+    return progress * 8
+  }
+
+  private static let heroMorphSpring = Animation.spring(response: 0.34, dampingFraction: 0.90)
+
   var body: some View {
-    // NavigationStack is the OUTERMOST container (not nested in GeometryReader).
-    // Nesting stack-in-GeometryReader made geometry.height shrink once the bar
-    // installed, which resized the hero and produced the header-down / content-up jump.
     NavigationStack(path: $navCoordinator.path) {
-      ScrollView(.vertical, showsIndicators: false) {
-        VStack(spacing: 0) {
-          offsetReader(heroHeight: fixedHeroHeight)
+      // Page-level: fixed reflection + fixed avatar overlay; scroll body never
+      // carries the hero when expanded.
+      ZStack(alignment: .top) {
+        Color.black.ignoresSafeArea()
 
-          Color.clear
-            .frame(height: fixedHeroHeight)
+        ChatProfilePageReflection(
+          imageUri: hasProfileImage ? avatarUri : nil,
+          fallbackGlyph: avatarDisplayText,
+          fontStyleID: appearanceSelection.avatarFontStyleID,
+          height: pageReflectionHeight
+        )
+        .frame(maxWidth: .infinity)
+        .frame(height: pageReflectionHeight)
+        .ignoresSafeArea(edges: .top)
+        .allowsHitTesting(false)
 
-          VStack(spacing: 20) {
-            VStack(spacing: 3) {
-              HStack(spacing: 8) {
-                Text(profileName)
-                  .font(.system(size: 28, weight: .bold))
-                  .foregroundStyle(.primary)
-                  .lineLimit(1)
-                  .minimumScaleFactor(0.72)
+        ScrollView(.vertical, showsIndicators: false) {
+          VStack(spacing: 0) {
+            offsetReader(heroHeight: avatarScrollSlotHeight)
 
-                if showsGoldTier {
-                  ChatProfileSwiftUITierBadge(label: "Gold")
+            // Spacer only — the real avatar is overlaid fixed so the hero does
+            // not ride the scroll body when expanded.
+            Color.clear
+              .frame(height: avatarScrollSlotHeight)
+              .contentShape(Rectangle())
+              .onTapGesture(count: 2) {
+                if localScrollOffset < 24 {
+                  setHeroExpanded(!heroExpanded)
                 }
               }
-              .frame(maxWidth: .infinity)
+              .simultaneousGesture(
+                DragGesture(minimumDistance: 28)
+                  .onEnded { value in
+                    let dy = value.translation.height
+                    if !heroExpanded, dy > 48, localScrollOffset < 30 {
+                      setHeroExpanded(true)
+                    } else if heroExpanded, dy < -48, localScrollOffset < 48 {
+                      setHeroExpanded(false)
+                    }
+                  }
+              )
 
-              if let groupHeaderSubtitle {
-                Text(groupHeaderSubtitle)
-                  .font(.system(size: 14, weight: .regular))
-                  .foregroundStyle(.secondary)
-                  .lineLimit(1)
+            // Circle mode: name + actions under the avatar in the scroll content.
+            VStack(spacing: 18) {
+              identityHeader(compact: false)
+              actionRow
+            }
+            .padding(.horizontal, 28)
+            .padding(.top, 12)
+            .padding(.bottom, 18)
+            .opacity(heroExpanded ? 0 : 1)
+            .allowsHitTesting(!heroExpanded)
+
+            VStack(spacing: 18) {
+              profileInfoSection
+              if !bridgeProvider.isEmpty {
+                defaultViewSection
               }
+              if bridgeProvider.isEmpty {
+                appearanceSection
+              }
+              sharedContentSection
+              if !isGroupOrChannel {
+                contactActionsSection
+                emergencySection
+              }
+              dangerSection
             }
-
-            actionRow
+            .padding(.horizontal, 16)
+            .padding(.bottom, 66)
           }
-          .padding(.horizontal, 28)
-          .padding(.top, 16)
-          .padding(.bottom, 18)
-
-          VStack(spacing: 18) {
-            profileInfoSection
-            if !bridgeProvider.isEmpty {
-              defaultViewSection
-            }
-            if bridgeProvider.isEmpty {
-              appearanceSection
-            }
-            sharedContentSection
-            if !isGroupOrChannel {
-              contactActionsSection
-              emergencySection
-            }
-            dangerSection
-          }
-          .padding(.horizontal, 16)
-          .padding(.bottom, 66)
         }
-      }
-      .coordinateSpace(name: "profile-scroll")
-      .scrollIndicators(.never)
-      .chatProfileBounceBehavior()
-      // Backdrop is a BACKGROUND only — its GeometryReader size must never feed
-      // back into the scroll content's hero spacer height.
-      .background {
+        .coordinateSpace(name: "profile-scroll")
+        .scrollIndicators(.never)
+        .chatProfileBounceBehavior()
+        .ignoresSafeArea(edges: .top)
+        .background(Color.clear)
+
+        // FIXED avatar layer — never scrolls with the list body.
+        // Scroll only drives scale/blur on the image, not translation.
         GeometryReader { geo in
-          profileBackdrop(
+          ChatProfileAvatarMorphView(
+            text: avatarDisplayText,
+            fontStyleID: appearanceSelection.avatarFontStyleID,
+            imageUri: hasProfileImage ? avatarUri : nil,
             width: geo.size.width,
-            height: max(geo.size.height, fixedHeroHeight + 200),
-            contentHeight: fixedHeroHeight
+            slotHeight: avatarScrollSlotHeight,
+            expand: avatarExpand,
+            collapseScale: scrollImageScale,
+            collapseBlur: scrollImageBlur
+          ) {
+            VStack(spacing: 12) {
+              identityHeader(compact: true)
+              actionRow
+            }
+          }
+          .frame(width: geo.size.width, height: avatarScrollSlotHeight, alignment: .top)
+          .allowsHitTesting(true)
+          .onTapGesture(count: 2) {
+            if localScrollOffset < 24 {
+              setHeroExpanded(!heroExpanded)
+            }
+          }
+          .simultaneousGesture(
+            DragGesture(minimumDistance: 28)
+              .onEnded { value in
+                let dy = value.translation.height
+                if !heroExpanded, dy > 48, localScrollOffset < 30 {
+                  setHeroExpanded(true)
+                } else if heroExpanded, dy < -48, localScrollOffset < 48 {
+                  setHeroExpanded(false)
+                }
+              }
           )
-          .frame(width: geo.size.width, height: max(geo.size.height, fixedHeroHeight + 200))
         }
-        .ignoresSafeArea()
+        .frame(height: avatarScrollSlotHeight)
+        .allowsHitTesting(true)
       }
-      // Fixed Material chrome via safeAreaInset — same height on first and later
-      // frames (unlike NavigationStack's system bar, which can install one pass late).
-      .safeAreaInset(edge: .top, spacing: 0) {
-        profileMaterialChrome
-      }
-      .toolbar(.hidden, for: .navigationBar)
+      .navigationBarTitleDisplayMode(.inline)
       .navigationBarBackButtonHidden(true)
+      .toolbar {
+        ToolbarItem(placement: .topBarLeading) {
+          Button {
+            onAction("headerBack")
+          } label: {
+            Image(systemName: "chevron.left")
+              .font(.system(size: 17, weight: .semibold))
+          }
+        }
+        ToolbarItem(placement: .principal) {
+          Text(profileName)
+            .font(.system(size: 17, weight: .semibold))
+            .lineLimit(1)
+            .minimumScaleFactor(0.78)
+            .opacity(stickyTitleVisible ? 1 : 0)
+            .accessibilityHidden(!stickyTitleVisible)
+        }
+        ToolbarItem(placement: .topBarTrailing) {
+          Menu {
+            Button(isChatMuted ? "Unmute" : "Mute") { onAction("muteToggle") }
+            Button("Search") { onAction("search") }
+            if isGroupOrChannel {
+              if canManageGroupMembers {
+                Button("Edit Group") { onAction("editGroup") }
+                Button("Add Members") { isShowingAddMembers = true }
+              }
+              if isGroupOwner {
+                Button("Delete Group", role: .destructive) { onAction("deleteGroup") }
+              } else {
+                Button("Leave Group", role: .destructive) { onAction("leaveGroup") }
+              }
+            } else {
+              Button("Share Contact") { onAction("shareContact") }
+              Button("Block Contact", role: .destructive) { onAction("block") }
+            }
+          } label: {
+            Image(systemName: "ellipsis")
+              .font(.system(size: 17, weight: .semibold))
+          }
+        }
+      }
+      .toolbarBackground(.automatic, for: .navigationBar)
+      .toolbarColorScheme(.dark, for: .navigationBar)
     }
     .navigationDestination(for: ChatProfileSwiftUIDestination.self) { destination in
       if case .bridgeSession = destination {
@@ -1366,8 +1483,8 @@ private struct ChatProfileSwiftUIRootView: View {
           .navigationTransition(.zoom(sourceID: destination.transitionID, in: morphNamespace))
       }
     }
-    .background(Color.clear)
-    .tint(.primary)
+    .background(Color.black)
+    .tint(.white)
     .onAppear {
       if selectedRepoNameLocal == nil {
         selectedRepoNameLocal = selectedRepositoryName
@@ -1398,147 +1515,52 @@ private struct ChatProfileSwiftUIRootView: View {
     }
   }
 
-  /// Stable 44pt Material bar. Height never depends on scroll state or geometry
-  /// measurements — only the title opacity fades in (no layout change).
-  private var profileMaterialChrome: some View {
-    HStack(spacing: 0) {
-      Button {
-        onAction("headerBack")
-      } label: {
-        Image(systemName: "chevron.left")
-          .font(.system(size: 17, weight: .semibold))
-          .foregroundStyle(.primary)
-          .frame(width: 44, height: 44)
-          .contentShape(Rectangle())
-      }
-      .buttonStyle(.plain)
-
-      Spacer(minLength: 8)
-
-      Text(profileName)
-        .font(.system(size: 17, weight: .semibold))
-        .foregroundStyle(.primary)
-        .lineLimit(1)
-        .minimumScaleFactor(0.78)
-        // Opacity only — never remove the text or change bar height.
-        .opacity(stickyTitleVisible ? 1 : 0)
-        .accessibilityHidden(!stickyTitleVisible)
-
-      Spacer(minLength: 8)
-
-      Menu {
-        Button(isChatMuted ? "Unmute" : "Mute") { onAction("muteToggle") }
-        Button("Search") { onAction("search") }
-        if isGroupOrChannel {
-          if canManageGroupMembers {
-            Button("Edit Group") { onAction("editGroup") }
-            Button("Add Members") { isShowingAddMembers = true }
-          }
-          if isGroupOwner {
-            Button("Delete Group", role: .destructive) { onAction("deleteGroup") }
-          } else {
-            Button("Leave Group", role: .destructive) { onAction("leaveGroup") }
-          }
-        } else {
-          Button("Share Contact") { onAction("shareContact") }
-          Button("Block Contact", role: .destructive) { onAction("block") }
-        }
-      } label: {
-        Image(systemName: "ellipsis")
-          .font(.system(size: 17, weight: .semibold))
-          .foregroundStyle(.primary)
-          .frame(width: 44, height: 44)
-          .contentShape(Rectangle())
-      }
+  /// Flip the discrete shared value (never half-states from scroll).
+  private func setHeroExpanded(_ expanded: Bool) {
+    guard heroExpanded != expanded else { return }
+    heroMorphInFlight = true
+    if !expanded {
+      hasScrolledAwayWhileExpanded = false
     }
-    .frame(maxWidth: .infinity)
-    .frame(height: 44)
-    .background {
-      Rectangle()
-        .fill(.ultraThinMaterial)
-        .ignoresSafeArea(edges: .top)
+    if expanded {
+      UIImpactFeedbackGenerator(style: .soft).impactOccurred()
+    } else {
+      UIImpactFeedbackGenerator(style: .light).impactOccurred(intensity: 0.55)
+    }
+    withAnimation(Self.heroMorphSpring) {
+      heroExpanded = expanded
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.42) {
+      heroMorphInFlight = false
+      if !expanded {
+        expandGestureArmed = true
+      }
     }
   }
 
   @ViewBuilder
-  private func profileBackdrop(width: CGFloat, height: CGFloat, contentHeight: CGFloat) -> some View {
-    ZStack {
-      if let posterImage {
-        let isSquare = posterImage.size.width > 0 && posterImage.size.height > 0 &&
-                       (posterImage.size.width / posterImage.size.height) > 0.95 &&
-                       (posterImage.size.width / posterImage.size.height) < 1.05
+  private func identityHeader(compact: Bool) -> some View {
+    VStack(spacing: compact ? 2 : 3) {
+      HStack(spacing: 8) {
+        Text(profileName)
+          .font(.system(size: compact ? 22 : 28, weight: .bold))
+          .foregroundStyle(.white)
+          .lineLimit(1)
+          .minimumScaleFactor(0.72)
 
-        if isSquare {
-          // Reflection Background
-          Image(uiImage: posterImage)
-            .resizable()
-            .scaledToFill()
-            .frame(width: width, height: height)
-            .clipped()
-            .rotationEffect(.degrees(180))
-            .blur(radius: 60)
-            .opacity(0.8)
-
-          // Original Image at top
-          let img = Image(uiImage: posterImage).resizable().scaledToFit()
-          img.frame(width: width, height: height, alignment: .top)
-
-          // Blurred overlay
-          img.frame(width: width, height: height, alignment: .top)
-            .blur(radius: min(40, 15 + max(0, localScrollOffset / 5)))
-            .mask(
-              LinearGradient(
-                stops: [
-                  .init(color: .clear, location: max(0, 0.4 - max(0, localScrollOffset) / height)),
-                  .init(color: .black, location: max(0.1, 0.6 - max(0, localScrollOffset) / height))
-                ],
-                startPoint: .top,
-                endPoint: .bottom
-              )
-            )
-        } else {
-          // Standard Image
-          let img = Image(uiImage: posterImage).resizable().scaledToFill()
-
-          img.frame(width: width, height: height)
-            .clipped()
-
-          img.frame(width: width, height: height)
-            .blur(radius: min(40, 15 + max(0, localScrollOffset / 5)))
-            .mask(
-              LinearGradient(
-                stops: [
-                  .init(color: .clear, location: max(0, 0.4 - max(0, localScrollOffset) / height)),
-                  .init(color: .black, location: max(0.1, 0.6 - max(0, localScrollOffset) / height))
-                ],
-                startPoint: .top,
-                endPoint: .bottom
-              )
-            )
+        if showsGoldTier {
+          ChatProfileSwiftUITierBadge(label: "Gold")
         }
-      } else {
-        // No custom poster: render the profile photo as a circular avatar parked just
-        // above the name, with a soft reflection bloom (or a gradient + glyph when
-        // there's no photo at all).
-        let scale = max(0.62, 1.0 - max(0, localScrollOffset / 460))
-        let collapseBlur = min(14, max(0, localScrollOffset) / 22)
-        ChatProfileHeroInlineView(
-          text: avatarDisplayText,
-          fontStyleID: appearanceSelection.avatarFontStyleID,
-          gradientColors: avatarGradientColors,
-          imageUri: hasProfileImage ? avatarUri : nil,
-          width: width,
-          height: height,
-          contentHeight: contentHeight,
-          avatarScale: scale,
-          avatarBlur: collapseBlur
-        )
-        .frame(width: width, height: height)
+      }
+      .frame(maxWidth: .infinity)
+
+      if let groupHeaderSubtitle {
+        Text(groupHeaderSubtitle)
+          .font(.system(size: 14, weight: .regular))
+          .foregroundStyle(.white.opacity(0.72))
+          .lineLimit(1)
       }
     }
-    .frame(width: width, height: height)
-    .scaleEffect(1.05 + max(0, -localScrollOffset / 500))
-    .ignoresSafeArea()
   }
 
   private func offsetReader(heroHeight: CGFloat) -> some View {
@@ -1552,13 +1574,36 @@ private struct ChatProfileSwiftUIRootView: View {
     .frame(height: 0)
     .onPreferenceChange(ChatProfileScrollOffsetPreferenceKey.self) { value in
       let nextValue = (value * 2.0).rounded() / 2.0
-      // Threshold high enough that tiny safe-area settling noise doesn't
-      // thrash `@State` (which re-renders the backdrop and looks like a jump).
-      guard abs(localScrollOffset - nextValue) >= 2.0 else { return }
+      guard abs(localScrollOffset - nextValue) >= 1.5 else { return }
       localScrollOffset = nextValue
+
+      // Discrete expand / collapse. Hero is pinned — scroll offset is pure content.
+      if !heroMorphInFlight {
+        if !heroExpanded {
+          if expandGestureArmed, nextValue < -40 {
+            expandGestureArmed = false
+            setHeroExpanded(true)
+          }
+          if nextValue >= 0 {
+            expandGestureArmed = true
+          }
+        } else {
+          // Mark that the user left the top while expanded.
+          if nextValue > 24 {
+            hasScrolledAwayWhileExpanded = true
+          }
+          // Single return to top → circle (no second reverse-scroll required).
+          // Also collapse if they pull slightly upward near the top.
+          if hasScrolledAwayWhileExpanded, nextValue <= 14 {
+            setHeroExpanded(false)
+          } else if nextValue < -12 {
+            setHeroExpanded(false)
+          }
+        }
+      }
+
       let shouldShowTitle = nextValue >= stickyTitleThreshold(heroHeight: heroHeight)
       if stickyTitleVisible != shouldShowTitle {
-        // Title opacity only — chrome frame stays 44pt either way.
         stickyTitleVisible = shouldShowTitle
       }
       if lastReportedScrollOffset < 0 || abs(lastReportedScrollOffset - nextValue) >= 6.0 {
@@ -1569,7 +1614,7 @@ private struct ChatProfileSwiftUIRootView: View {
   }
 
   private func stickyTitleThreshold(heroHeight: CGFloat) -> CGFloat {
-    max(100, heroHeight * 0.55)
+    max(90, heroHeight * 0.5)
   }
 
   private var resolvedRepositorySubtitle: String {
@@ -1590,24 +1635,26 @@ private struct ChatProfileSwiftUIRootView: View {
   }
 
   private var actionRow: some View {
-    HStack(spacing: 24) {
+    // On the black hero, keep the glass fill light enough to read over soft black.
+    let fill = Color.white.opacity(isDark ? 0.12 : 0.16)
+    return HStack(spacing: 24) {
       ChatProfileSwiftUIActionButton(
         title: isChatMuted ? "Unmute" : "Mute",
         systemImage: isChatMuted ? "bell" : "bell.slash",
-        fill: rowFill
+        fill: fill
       ) {
         onAction("muteToggle")
       }
 
-      ChatProfileSwiftUIActionButton(title: "Search", systemImage: "magnifyingglass", fill: rowFill) {
+      ChatProfileSwiftUIActionButton(title: "Search", systemImage: "magnifyingglass", fill: fill) {
         onAction("search")
       }
 
-      ChatProfileSwiftUIActionButton(title: "Call", systemImage: "phone", fill: rowFill) {
+      ChatProfileSwiftUIActionButton(title: "Call", systemImage: "phone", fill: fill) {
         onAction("audio")
       }
 
-      ChatProfileSwiftUIActionButton(title: "Video", systemImage: "video", fill: rowFill) {
+      ChatProfileSwiftUIActionButton(title: "Video", systemImage: "video", fill: fill) {
         onAction("video")
       }
     }
@@ -2228,42 +2275,24 @@ private struct ChatProfileAvatarGlyph: View {
   }
 }
 
-/// Full-width hero backdrop inline in the profile scroll content. No image:
-/// gradient fill + bare glyph. With image: the profile's 1:1 photo is shown as a
-/// circular avatar (never stretched/zoomed to fill the screen) with a soft, blurred
-/// reflection of the same photo glowing behind it; the profile gradient still shows
-/// through everywhere the glow fades out.
-private struct ChatProfileHeroInlineView: View {
-  let text: String
-  let fontStyleID: String?
-  let gradientColors: (UIColor, UIColor)
+// MARK: - Page-level fixed reflection (never scrolls)
+
+/// Soft ambient + blurred image bloom pinned to the top of the profile page.
+/// Lives OUTSIDE the ScrollView so scrolling content never moves the reflection.
+private struct ChatProfilePageReflection: View {
   let imageUri: String?
-  let width: CGFloat
+  let fallbackGlyph: String
+  let fontStyleID: String?
   let height: CGFloat
-  /// Y (from the top of this backdrop) where the scrolling name/actions begin; the
-  /// avatar is parked just above it instead of centered in the whole screen.
-  var contentHeight: CGFloat = 0
-  var avatarScale: CGFloat = 1.0
-  /// Blur applied to the avatar as the header collapses on scroll.
-  var avatarBlur: CGFloat = 0
 
   @State private var image: UIImage?
   @State private var loadedUri: String?
 
-  init(
-    text: String, fontStyleID: String?, gradientColors: (UIColor, UIColor),
-    imageUri: String?, width: CGFloat, height: CGFloat,
-    contentHeight: CGFloat = 0, avatarScale: CGFloat = 1.0, avatarBlur: CGFloat = 0
-  ) {
-    self.text = text
-    self.fontStyleID = fontStyleID
-    self.gradientColors = gradientColors
+  init(imageUri: String?, fallbackGlyph: String, fontStyleID: String?, height: CGFloat) {
     self.imageUri = imageUri
-    self.width = width
+    self.fallbackGlyph = fallbackGlyph
+    self.fontStyleID = fontStyleID
     self.height = height
-    self.contentHeight = contentHeight
-    self.avatarScale = avatarScale
-    self.avatarBlur = avatarBlur
     let normalized = imageUri?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
     let primed = normalized.flatMap { ChatAvatarImageStore.cached(for: $0) }
     _image = State(initialValue: primed)
@@ -2271,95 +2300,228 @@ private struct ChatProfileHeroInlineView: View {
   }
 
   var body: some View {
-    let avatarSize = min(width, height) * 0.42
-    let anchorY = contentHeight > 0 ? contentHeight : height * 0.42
-    let avatarCenterY = max(avatarSize * 0.5 + 44, anchorY - avatarSize * 0.5 - 40)
-
-    return ZStack {
-      // Background: black behind a real photo (so the reflection reads like the
-      // Spotify-style ambient bloom); gradient only when there's no photo at all.
-      if normalizedUri != nil {
+    GeometryReader { geo in
+      let w = geo.size.width
+      ZStack(alignment: .top) {
         Color.black
-      } else {
+
         LinearGradient(
-          colors: [Color(uiColor: gradientColors.0), Color(uiColor: gradientColors.1)],
+          stops: [
+            .init(color: Color.white.opacity(0.07), location: 0.0),
+            .init(color: Color.black.opacity(0.15), location: 0.35),
+            .init(color: Color.black, location: 0.85),
+            .init(color: Color.black, location: 1.0),
+          ],
           startPoint: .top,
           endPoint: .bottom
         )
-      }
 
-      if loadedUri == normalizedUri, let image {
-        avatarReflectionHero(image, avatarSize: avatarSize, avatarCenterY: avatarCenterY)
-      } else if normalizedUri == nil {
-        avatarFallbackHero(avatarSize: avatarSize, avatarCenterY: avatarCenterY)
-      }
-    }
-    .frame(width: width, height: height)
-    .allowsHitTesting(false)
-    .task(id: normalizedUri ?? "") {
-      await loadImage()
-    }
-  }
+        if let image, loadedUri == normalizedUri {
+          Image(uiImage: image)
+            .resizable()
+            .scaledToFill()
+            .frame(width: w, height: height)
+            .blur(radius: 46)
+            .opacity(0.42)
+            .mask(
+              LinearGradient(
+                stops: [
+                  .init(color: .black.opacity(0.9), location: 0.0),
+                  .init(color: .black.opacity(0.65), location: 0.45),
+                  .init(color: .black.opacity(0.25), location: 0.78),
+                  .init(color: .clear, location: 1.0),
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+              )
+            )
+        }
 
-  @ViewBuilder
-  private func avatarReflectionHero(_ image: UIImage, avatarSize: CGFloat, avatarCenterY: CGFloat) -> some View {
-    let reflectionOpacity = max(0, 0.45 - max(0, avatarBlur) / 28)
-    let screenHeight = UIScreen.main.bounds.height
-    let bloomHeight = screenHeight * 0.45
-
-    ZStack {
-      Image(uiImage: image)
-        .resizable()
-        .scaledToFill()
-        .frame(width: width, height: bloomHeight)
-        .blur(radius: 40)
-        .opacity(reflectionOpacity)
-        .mask(
-          LinearGradient(
-            stops: [
-              .init(color: .black, location: 0.0),
-              .init(color: .black.opacity(0.8), location: 0.6),
-              .init(color: .clear, location: 1.0)
-            ],
-            startPoint: .top,
-            endPoint: .bottom
-          )
+        // Soft top scrim under system nav — no hard edge.
+        LinearGradient(
+          colors: [Color.black.opacity(0.3), Color.clear],
+          startPoint: .top,
+          endPoint: .bottom
         )
-        .position(x: width * 0.5, y: bloomHeight * 0.5)
-
-      Image(uiImage: image)
-        .resizable()
-        .scaledToFill()
-        .frame(width: avatarSize, height: avatarSize)
-        .clipShape(Circle())
-        .overlay(Circle().strokeBorder(Color.white.opacity(0.16), lineWidth: 1))
-        .shadow(color: .black.opacity(0.38), radius: 26, y: 12)
-        .scaleEffect(avatarScale, anchor: .center)
-        .blur(radius: avatarBlur)
-        .position(x: width * 0.5, y: avatarCenterY)
+        .frame(height: 96)
+      }
+      .frame(width: w, height: height)
+      .clipped()
     }
-    .frame(width: width, height: height)
+    .frame(height: height)
+    .task(id: normalizedUri ?? "") { await loadImage() }
   }
 
-  @ViewBuilder
-  private func avatarFallbackHero(avatarSize: CGFloat, avatarCenterY: CGFloat) -> some View {
-    ZStack {
-      Text(text)
-        .font(.system(
-          size: max(24, avatarSize * 0.4),
-          weight: .bold,
-          design: ChatProfileAvatarFontStyle.style(id: fontStyleID).design
-        ))
-        .foregroundStyle(.white.opacity(0.94))
-        .minimumScaleFactor(0.4)
-      
-      Circle()
-        .strokeBorder(Color.white.opacity(0.3), lineWidth: 1)
+  private var normalizedUri: String? {
+    let value = imageUri?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return value.isEmpty ? nil : value
+  }
+
+  @MainActor
+  private func loadImage() async {
+    let normalized = normalizedUri
+    if loadedUri != normalized {
+      loadedUri = normalized
+      image = normalized.flatMap { ChatAvatarImageStore.cached(for: $0) }
     }
-    .frame(width: avatarSize, height: avatarSize)
-    .scaleEffect(avatarScale, anchor: .center)
-    .blur(radius: avatarBlur)
-    .position(x: width * 0.5, y: avatarCenterY)
+    guard let normalized else {
+      image = nil
+      return
+    }
+    if let cached = ChatAvatarImageStore.cached(for: normalized) {
+      image = cached
+      return
+    }
+    let loaded = await ChatAvatarImageStore.load(from: normalized)
+    guard !Task.isCancelled, loadedUri == normalized else { return }
+    image = loaded
+  }
+}
+
+// MARK: - Avatar-only 0…1 morph (scrolls with content)
+
+/// The **avatar** is the only element driven by expand 0…1.
+/// - 0: circle under the nav (near username)
+/// - 1: full-width banner with name/actions inside the bottom material band
+/// Reflection is page-level and is not drawn here.
+private struct ChatProfileAvatarMorphView<NameAndActions: View>: View {
+  let text: String
+  let fontStyleID: String?
+  let imageUri: String?
+  let width: CGFloat
+  let slotHeight: CGFloat
+  /// Discrete shared value 0 = circle, 1 = full-width banner.
+  var expand: CGFloat = 0
+  var collapseScale: CGFloat = 1.0
+  var collapseBlur: CGFloat = 0
+  @ViewBuilder var nameAndActions: () -> NameAndActions
+
+  @State private var image: UIImage?
+  @State private var loadedUri: String?
+
+  init(
+    text: String,
+    fontStyleID: String?,
+    imageUri: String?,
+    width: CGFloat,
+    slotHeight: CGFloat,
+    expand: CGFloat = 0,
+    collapseScale: CGFloat = 1.0,
+    collapseBlur: CGFloat = 0,
+    @ViewBuilder nameAndActions: @escaping () -> NameAndActions
+  ) {
+    self.text = text
+    self.fontStyleID = fontStyleID
+    self.imageUri = imageUri
+    self.width = width
+    self.slotHeight = slotHeight
+    self.expand = expand
+    self.collapseScale = collapseScale
+    self.collapseBlur = collapseBlur
+    self.nameAndActions = nameAndActions
+    let normalized = imageUri?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+    let primed = normalized.flatMap { ChatAvatarImageStore.cached(for: $0) }
+    _image = State(initialValue: primed)
+    _loadedUri = State(initialValue: primed != nil ? normalized : nil)
+  }
+
+  private var p: CGFloat { min(1, max(0, expand)) }
+
+  private var circleSize: CGFloat { min(width * 0.44, 176) }
+
+  private var mediaWidth: CGFloat {
+    circleSize + (width - circleSize) * p
+  }
+
+  private var mediaHeight: CGFloat {
+    // Banner fills most of the scroll slot so bottom chrome lives inside the image.
+    circleSize + (slotHeight - circleSize) * p
+  }
+
+  private var mediaCorner: CGFloat {
+    (mediaHeight * 0.5) * (1 - p)
+  }
+
+  /// Circle sits lower (more top margin). Banner fills the slot from top.
+  private var mediaCenterY: CGFloat {
+    let topClearance: CGFloat = 112
+    let bottomGap: CGFloat = 24
+    let circleY = max(
+      topClearance + circleSize * 0.5,
+      slotHeight - circleSize * collapseScale * 0.5 - bottomGap
+    )
+    let bannerY = slotHeight * 0.5
+    return circleY + (bannerY - circleY) * p
+  }
+
+  var body: some View {
+    ZStack {
+      // Avatar media only — reflection is page-fixed. Scale is applied to the
+      // image itself (inner), never by translating this layer with the list.
+      mediaCard
+        .frame(width: mediaWidth, height: mediaHeight)
+        .scaleEffect(collapseScale, anchor: p > 0.5 ? .top : .center)
+        .blur(radius: collapseBlur)
+        .position(x: width * 0.5, y: mediaCenterY)
+    }
+    .frame(width: width, height: slotHeight)
+    .clipped()
+    .task(id: normalizedUri ?? "") { await loadImage() }
+  }
+
+  private var mediaCard: some View {
+    let shape = RoundedRectangle(cornerRadius: mediaCorner, style: .continuous)
+    return ZStack {
+      if let image, loadedUri == normalizedUri {
+        Image(uiImage: image)
+          .resizable()
+          .scaledToFill()
+          .frame(width: mediaWidth, height: mediaHeight)
+          .clipped()
+      } else {
+        Text(text)
+          .font(.system(
+            size: max(28, mediaHeight * 0.36),
+            weight: .bold,
+            design: ChatProfileAvatarFontStyle.style(id: fontStyleID).design
+          ))
+          .foregroundStyle(.white.opacity(0.92))
+          .minimumScaleFactor(0.4)
+          .frame(width: mediaWidth, height: mediaHeight)
+      }
+    }
+    .frame(width: mediaWidth, height: mediaHeight)
+    .overlay(alignment: .bottom) {
+      if p > 0.2 {
+        ZStack(alignment: .bottom) {
+          // Transparent material blur — no black/color tint; taller band.
+          Rectangle()
+            .fill(.ultraThinMaterial)
+            .frame(height: max(mediaHeight * 0.36, 120))
+            .mask(
+              LinearGradient(
+                stops: [
+                  .init(color: .clear, location: 0.0),
+                  .init(color: .black.opacity(0.3), location: 0.3),
+                  .init(color: .black, location: 0.7),
+                  .init(color: .black, location: 1.0),
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+              )
+            )
+            .allowsHitTesting(false)
+
+          nameAndActions()
+            .padding(.horizontal, 18)
+            .padding(.bottom, 18)
+            .opacity(Double(min(1, (p - 0.2) / 0.4)))
+        }
+        .frame(maxWidth: .infinity)
+      }
+    }
+    .clipShape(shape)
+    // No bottom shadow — hard edge / floating band under the morph was unwanted.
   }
 
   private var normalizedUri: String? {
@@ -3211,7 +3373,9 @@ private struct ChatProfileSwiftUIActionButton: View {
         .frame(width: 52, height: 52)
         .glassEffect(.regular.tint(fill).interactive(), in: .circle)
         .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.18 : 0.08), radius: 10, x: 0, y: 5)
-        .foregroundStyle(.primary)
+        // White icons read on the soft-black hero; system .primary flips with theme
+        // and can vanish on the dark banner.
+        .foregroundStyle(.white)
     }
     .buttonStyle(.plain)
   }
@@ -4266,8 +4430,43 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   func setGroupMembers(_ members: [[String: Any]]) {
     // Merge so a partial/stale payload that omits `role` cannot flip admin → member
     // (the admin/member subtitle flicker). Explicit roles always win.
+    let prevRole = myGroupRole()
     let merged = Self.mergeGroupMemberPayloads(previous: groupMembers, incoming: members)
-    guard !Self.groupMembersSemanticallyEqual(groupMembers, merged) else {
+    let config = ChatEngineStore.shared.getConfig()
+    let me =
+      (config["userId"] as? String)
+      ?? (config["myUserId"] as? String)
+      ?? ""
+    let meKey = me.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+    // Resolve role from merged payload for logging (myGroupRole uses groupMembers).
+    let mergedMine = merged.first { entry in
+      let id =
+        (entry["userId"] as? String)
+        ?? (entry["user_id"] as? String)
+        ?? (entry["id"] as? String)
+        ?? (entry["memberId"] as? String)
+      return id?.caseInsensitiveCompare(meKey) == .orderedSame
+    }
+    let nextRoleRaw =
+      (mergedMine?["role"] as? String)
+      ?? (mergedMine?["memberRole"] as? String)
+      ?? (mergedMine?["member_role"] as? String)
+      ?? ""
+    let nextRole = nextRoleRaw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    let equal = Self.groupMembersSemanticallyEqual(groupMembers, merged)
+    NSLog(
+      "[WhoAmI] ChatProfile.setGroupMembers incoming=%d merged=%d equal=%@ me=%@ prevRole=%@ nextRole=%@ isAdmin=%@ isOwner=%@ engineMyUserId=%@",
+      members.count,
+      merged.count,
+      equal ? "Y" : "N",
+      meKey.isEmpty ? "<unknown>" : String(meKey.prefix(8)),
+      prevRole.isEmpty ? "<empty>" : prevRole,
+      nextRole.isEmpty ? "<empty>" : nextRole,
+      (nextRole == "owner" || nextRole == "admin") ? "Y" : "N",
+      nextRole == "owner" ? "Y" : "N",
+      engineMyUserId.isEmpty ? "<unset>" : String(engineMyUserId.prefix(8))
+    )
+    guard !equal else {
       // Still re-render once if this is the first non-empty roster after empty.
       if groupMembers.isEmpty, !merged.isEmpty {
         groupMembers = merged
@@ -4501,7 +4700,10 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     floatingAvatarView.clipsToBounds = false
     floatingAvatarView.isUserInteractionEnabled = false
 
-    swiftUIContainerView.backgroundColor = .clear
+    // Pre-mount black so the first frame never flashes a system grouped /
+    // high-contrast gradient before the SwiftUI soft-black hero paints.
+    backgroundColor = .black
+    swiftUIContainerView.backgroundColor = .black
     swiftUIContainerView.clipsToBounds = false
     swiftUIContainerView.layer.zPosition = 30.0
     addSubview(swiftUIContainerView)
@@ -4684,16 +4886,11 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       swiftUIContainerView.bringSubviewToFront(host.view)
     } else {
       let host = UIHostingController(rootView: erasedRoot)
-      // Keep the host's real safe area so the Material chrome safeAreaInset is
-      // correct on the first frame. Do not strip safeAreaRegions — that was a
-      // major source of chrome/content mismatch jumps.
-      host.view.backgroundColor = .clear
-      host.view.isOpaque = false
+      // Pre-paint black (matches soft-black hero) so open never shows a white or
+      // high-contrast gradient flash while the tree settles.
+      host.view.backgroundColor = .black
+      host.view.isOpaque = true
       host.view.frame = swiftUIContainerView.bounds
-      // Avoid UIKit automatically animating content-inset changes into a jump.
-      if let scrollViews = host.view.subviews as [UIView]? {
-        _ = scrollViews
-      }
       swiftUIContainerView.addSubview(host.view)
       swiftUIContainerView.bringSubviewToFront(host.view)
       swiftUIHostingController = host
