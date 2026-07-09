@@ -7093,16 +7093,19 @@ function handleHistoryRequest(channel, payload) {
       }
     }
     if (!effectiveSessionId) {
-      // Throttle noisy idle polls (phone used to re-ask every ~1.5s).
+      // Hard throttle idle current-session polls (phone can re-ask every ~1.5s).
+      // Still answer the first; suppress wire + log for 45s so the phone stops thrashing.
       const idleKey = String(chatId);
       const nowIdle = Date.now();
       const lastIdle = noCurrentSessionLogAtByChat.get(idleKey) || 0;
-      if (nowIdle - lastIdle > 15000) {
-        noCurrentSessionLogAtByChat.set(idleKey, nowIdle);
-        console.log(
-          `[vibe-bridge][history] current-session request chat=${chatId} → no session, requestId=${requestId}`
-        );
+      if (nowIdle - lastIdle < 45000 && lastIdle > 0) {
+        // Quiet drop — phone already got no_current_session recently.
+        return;
       }
+      noCurrentSessionLogAtByChat.set(idleKey, nowIdle);
+      console.log(
+        `[vibe-bridge][history] current-session request chat=${chatId} → no session, requestId=${requestId}`
+      );
       channel.push("history_result", { ok: false, ...echo, mode: want, message: "no_current_session" });
       return;
     }
