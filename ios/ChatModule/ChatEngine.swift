@@ -6398,16 +6398,26 @@ final class ChatEngine {
           let mode = self.normalizedString(frame.payload["mode"]) ?? "list"
           let provider = self.normalizedString(frame.payload["provider"]) ?? ""
           let requestId = self.normalizedString(frame.payload["requestId"]) ?? ""
-          let ok = (frame.payload["ok"] as? Bool) ?? true
+          let okFlag = frame.payload["ok"]
+          let ok: Bool = {
+            if let b = okFlag as? Bool { return b }
+            if let n = okFlag as? NSNumber { return n.boolValue }
+            if let s = okFlag as? String { return s.lowercased() != "false" && s != "0" }
+            return true
+          }()
           let message = (self.normalizedString(frame.payload["message"]) ?? "").lowercased()
-          if !ok, message.contains("no_current_session") {
+          let isNoCurrent =
+            !ok
+            && (message.contains("no_current_session") || message.contains("no session") || message.isEmpty)
+          if isNoCurrent, mode == "detail", frame.payload["session"] == nil {
             // Idle DM: bridge has nothing live — stop re-polling for 90s.
             self.noCurrentSessionUntilMsByChatId[chatId] = Int64(self.nowMs()) + 90_000
             self.currentSessionLoadInflightByChatId.removeValue(forKey: chatId)
             self.pendingBridgeSessionIngestByRequestId.removeValue(forKey: requestId)
             NSLog(
-              "[ChatEngine][BridgeMount] no_current_session chat=%@ — suppress polls 90s",
-              String(chatId.suffix(12))
+              "[ChatEngine][BridgeMount] no_current_session chat=%@ msg=%@ — suppress polls 90s",
+              String(chatId.suffix(12)),
+              message.isEmpty ? "<empty>" : message
             )
             self.postChangeLocked(
               reason: "agentBridgeHistory",

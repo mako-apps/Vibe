@@ -663,6 +663,8 @@ const MAX_PROGRESS_FRAME_LOG = 400;
 // instead of showing a stale "connected" / needing an app restart.
 let socketDownSince = null;
 const historyWatchSpecs = new Map(); // chatId -> { provider, sessionId, echo } (survives reconnect)
+const noCurrentSessionLogAtByChat = new Map(); // chatId -> last log ms (throttle idle spam)
+
 const modelBySession = new Map(); // provider:chatId -> model selected from mobile
 const advisorBySession = new Map(); // provider:chatId -> advisor selected from mobile
 const lastRuntimeBySession = new Map(); // provider:chatId -> last completed runtime payload
@@ -7091,9 +7093,16 @@ function handleHistoryRequest(channel, payload) {
       }
     }
     if (!effectiveSessionId) {
-      console.log(
-        `[vibe-bridge][history] current-session request chat=${chatId} → no session, requestId=${requestId}`
-      );
+      // Throttle noisy idle polls (phone used to re-ask every ~1.5s).
+      const idleKey = String(chatId);
+      const nowIdle = Date.now();
+      const lastIdle = noCurrentSessionLogAtByChat.get(idleKey) || 0;
+      if (nowIdle - lastIdle > 15000) {
+        noCurrentSessionLogAtByChat.set(idleKey, nowIdle);
+        console.log(
+          `[vibe-bridge][history] current-session request chat=${chatId} → no session, requestId=${requestId}`
+        );
+      }
       channel.push("history_result", { ok: false, ...echo, mode: want, message: "no_current_session" });
       return;
     }
