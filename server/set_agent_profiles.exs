@@ -6,11 +6,11 @@ defmodule SetAgentProfiles do
   def run do
     upload_and_set("claude", @claude_image, "agent-profiles/claude.png")
     upload_and_set("codex", @gpt_image, "agent-profiles/codex.png")
-    upload_and_set("grok", @grok_image, "agent-profiles/grok.png")
+    upload_and_set("grok", @grok_image, "agent-profiles/grok-v2.png")
   end
 
   def run_grok_only do
-    upload_and_set("grok", @grok_image, "agent-profiles/grok.png")
+    upload_and_set("grok", @grok_image, "agent-profiles/grok-v2.png")
   end
 
   defp upload_and_set(username, local_path, remote_path) do

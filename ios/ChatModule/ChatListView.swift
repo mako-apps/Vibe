@@ -7493,7 +7493,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   private func updateAgentBridgeControlTitle() {
-    // Bridge-agent DMs (Claude/Codex) drive the repo chip + agent menu regardless of the
+    // Bridge-agent DMs (Claude/Codex/Grok) drive the repo chip + agent menu regardless of the
     // legacy `agentChatMode` surface. "Open" is the fallback for the Vibe AI panel.
     guard let provider = currentBridgeProvider else {
       inputBar?.setAgentControlMenu(nil)
@@ -7515,6 +7515,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// commands run as agent turns). Provider-aware: Codex's desktop-only ones are labelled.
   private func slashCommandMenu(provider: String) -> UIMenu {
     let isCodex = provider.lowercased().contains("codex")
+    let isGrok = provider.lowercased().contains("grok")
     // (name, subtitle)
     let info: [(String, String)] = [
       ("usage", "Subscription limits + token usage"),
@@ -7535,6 +7536,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       ("review", "Review your working tree · desktop only"),
       ("init", "Set up project memory · desktop only"),
     ]
+    let grokTasks: [(String, String)] = [
+      ("init", "Set up project memory"),
+    ]
     let options: [(String, String)] = [
       ("plan", "Plan mode: research, don't edit"),
       (isCodex ? "fast" : "reasoning", isCodex ? "Faster, lighter responses" : "Adjust thinking depth"),
@@ -7546,10 +7550,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         }
       }
     }
+    let tasks = isCodex ? codexTasks : (isGrok ? grokTasks : claudeTasks)
     let infoMenu = UIMenu(title: "Info", options: .displayInline, children: actions(info))
     let taskMenu = UIMenu(
       title: "Tasks", options: .displayInline,
-      children: actions(isCodex ? codexTasks : claudeTasks))
+      children: actions(tasks))
     let optionMenu = UIMenu(title: "Options", options: .displayInline, children: actions(options))
     return UIMenu(title: "Slash commands", children: [infoMenu, taskMenu, optionMenu])
   }
@@ -8533,9 +8538,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// refresh instead and ignores this flag.
   private var didAutoPresentAgentView = false
 
-  /// Claude/Codex DMs open as fresh sessions. History is loaded only after the user
+  /// Claude/Codex/Grok DMs open as fresh sessions. History is loaded only after the user
   /// explicitly opens History, so relaunch/open never pulls old sessions into view.
-  /// Opening a Claude/Codex DM mid-run must land in the RUNNING conversation, not an
+  /// Opening a bridge-agent DM mid-run must land in the RUNNING conversation, not an
   /// empty surface that only fills in when the next stream frame happens to arrive.
   /// Ask the bridge for this chat's current session (it resolves the id — the phone
   /// doesn't know it yet). An idle chat answers `no_current_session` and the DM stays
@@ -8609,7 +8614,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
   }
 
-  /// When the user set this Claude/Codex profile's default view to an agent surface,
+  /// When the user set this Claude/Codex/Grok profile's default view to an agent surface,
   /// show that surface instead of the bubble chat. The one-shot guard ensures backing
   /// out to the chat surface doesn't immediately re-present; manual actions re-open on demand.
   private func presentPreferredAgentViewIfNeeded(retry: Int = 0) {
@@ -8726,7 +8731,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     {
       return
     }
-    let displayName = provider.capitalized
+    let displayName = AgentBridgeProfile.displayName(for: provider)
     let initialMessages = VibeAgentKitMap.messages(from: rows)
     let vc = VibeAgentConversationViewController(
       title: displayName,
@@ -11201,7 +11206,7 @@ final class SenderRunAvatarView: UIView {
     switch provider {
     case "claude": return "https://media.vibegram.io/chat-media/agent-profiles/claude.png"
     case "codex": return "https://media.vibegram.io/chat-media/agent-profiles/codex.png"
-    case "grok": return "https://media.vibegram.io/chat-media/agent-profiles/grok.png"
+    case "grok": return "https://media.vibegram.io/chat-media/agent-profiles/grok-v2.png"
     default: return nil
     }
   }

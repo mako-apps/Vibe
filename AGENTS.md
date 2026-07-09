@@ -22,6 +22,25 @@ The user means: **build + install + launch the iOS app on their attached iPhone.
 
 Exact commands + device table: [docs/run-on-device.md](docs/run-on-device.md).
 
+## After any iOS code change — build and fix
+
+**Required:** whenever you patch, add, or refactor files under `ios/`, run an
+`xcodebuild` for scheme `Vibe` and **fix compile errors before considering the
+task done**. Do not leave a broken build for the user.
+
+```bash
+xcodebuild -project ios/Vibe.xcodeproj -scheme Vibe \
+  -configuration Debug \
+  -destination 'platform=iOS,id=00008140-000935000288801C' \
+  -derivedDataPath /tmp/vibe-device-build \
+  -allowProvisioningUpdates \
+  build
+```
+
+If the physical phone is offline, use a simulator destination instead
+(`platform=iOS Simulator,name=iPhone 16`). On failure: read the error, fix the
+Swift, rebuild, and repeat until green. Building is free (no approval needed).
+
 ## Tool approval config
 
 Interactive approvals for agents in this repo are governed by

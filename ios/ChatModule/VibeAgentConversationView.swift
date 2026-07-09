@@ -5424,6 +5424,7 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
     }
     // Fall back to the provider's full catalog until a run delivers the real one, so the
     // palette is complete from the first `/` in a brand-new chat.
+    // Grok headless has no Claude slash catalog; reuse the info-command fallback set.
     let slashSource = slash.isEmpty ? (isCodex ? Self.codexFallbackSlash : Self.claudeFallbackSlash) : slash
     let cliSource = cli.isEmpty ? (isCodex ? Self.codexFallbackCli : Self.claudeFallbackCli) : cli
     var seen = Set(Self.defaultCommands.map { $0.name.lowercased() })

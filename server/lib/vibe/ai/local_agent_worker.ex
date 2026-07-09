@@ -24,7 +24,7 @@ defmodule Vibe.AI.LocalAgentWorker do
   @grok_agent_user_id "33333333-3333-3333-3333-333333333333"
   @claude_avatar_data_url "https://media.vibegram.io/chat-media/agent-profiles/claude.png"
   @codex_avatar_data_url "https://media.vibegram.io/chat-media/agent-profiles/codex.png"
-  @grok_avatar_data_url "https://media.vibegram.io/chat-media/agent-profiles/grok.png"
+  @grok_avatar_data_url "https://media.vibegram.io/chat-media/agent-profiles/grok-v2.png"
   @default_timeout_ms 120_000
   @max_prompt_length 8_000
   @max_tool_events 16
@@ -1210,7 +1210,8 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   defp live_progress_nodes(%{handle: "grok"}, extracted) do
-    interleaved_grok_progress_nodes(extracted.decoded, "")
+    interleaved_grok_progress_nodes(extracted.decoded, extracted.tool_events, "")
+    |> with_live_thinking(extracted.decoded)
   end
 
   defp live_progress_nodes(_worker, extracted), do: extracted.progress_nodes
@@ -1875,23 +1876,23 @@ defmodule Vibe.AI.LocalAgentWorker do
     |> Enum.take(@max_tool_events)
   end
 
-  defp build_progress_nodes(%{handle: "grok"}, decoded, _tool_events, summary_text) do
-    interleaved_grok_progress_nodes(decoded, summary_text)
+  defp build_progress_nodes(%{handle: "grok"}, decoded, tool_events, summary_text) do
+    interleaved_grok_progress_nodes(decoded, tool_events, summary_text)
   end
 
   defp build_progress_nodes(_worker, _decoded, tool_events, _summary_text) do
     progress_nodes_from_events(tool_events)
   end
 
-  # Grok Build `--output-format streaming-json` emits NDJSON:
-  #   {"type":"thought","data":"..."}  reasoning chunks
-  #   {"type":"text","data":"..."}     answer chunks
-  #   {"type":"end","stopReason":...,"sessionId":...,"requestId":...}
-  # Final `--output-format json` is a single object with text/thought fields.
-  # Coalesce all thought chunks into one thinking node and all text into one
-  # text node (dropped when it equals the finished summary body).
-  defp interleaved_grok_progress_nodes(decoded, summary_text) do
+  # Grok live stream is a MIX of:
+  #   stdout streaming-json: {"type":"thought"|"text"|"end", "data":...}
+  #   bridge-injected tools from updates.jsonl: {"type":"tool_use"|"tool_result", ...}
+  #   throttled vibe_thinking ticker lines
+  # Walk chronologically and emit STABLE-id nodes (one thinking, one text, one
+  # per tool id) so the phone upserts a single bubble instead of one cell per chunk.
+  defp interleaved_grok_progress_nodes(decoded, tool_events, summary_text) do
     summary_norm = summary_text |> to_string() |> String.trim()
+    tool_by_id = Map.new(tool_events || [], fn ev -> {ev["id"], ev} end)
 
     settled =
       Enum.any?(decoded, fn
@@ -1899,80 +1900,209 @@ defmodule Vibe.AI.LocalAgentWorker do
         _ -> false
       end)
 
-    {thought, answer} =
-      Enum.reduce(decoded, {"", ""}, fn event, {thought_acc, text_acc} ->
+    think_status = if settled, do: "done", else: "streaming"
+    text_status = if settled, do: "done", else: "streaming"
+
+    initial = %{
+      nodes: [],
+      thought: "",
+      answer: "",
+      used_tools: MapSet.new(),
+      thought_flushed: false
+    }
+
+    state =
+      Enum.reduce(decoded, initial, fn event, st ->
         cond do
           not is_map(event) ->
-            {thought_acc, text_acc}
+            st
 
           event["type"] == "thought" and is_binary(event["data"]) ->
-            {thought_acc <> event["data"], text_acc}
+            %{st | thought: st.thought <> event["data"], thought_flushed: false}
 
           event["type"] == "text" and is_binary(event["data"]) ->
-            {thought_acc, text_acc <> event["data"]}
+            st
+            |> grok_flush_thought_node(think_status)
+            |> Map.update!(:answer, &(&1 <> event["data"]))
 
-          is_binary(event["thought"]) and event["type"] != "text" ->
-            {thought_acc <> event["thought"], text_acc}
+          event["type"] == "tool_use" ->
+            id = normalize_string(event["id"]) || unique_event_id("grok-tool", length(st.nodes))
 
-          is_binary(event["text"]) and event["type"] not in ["thought", "end"] ->
-            {thought_acc, text_acc <> event["text"]}
+            st
+            |> grok_flush_thought_node(think_status)
+            |> grok_flush_answer_node(summary_norm, text_status)
+            |> grok_put_tool_node(id, event, tool_by_id)
+
+          event["type"] == "tool_result" ->
+            id = normalize_string(event["tool_use_id"] || event["id"])
+            grok_mark_tool_result(st, id, event)
+
+          is_binary(event["thought"]) and event["type"] not in ["text", "end"] ->
+            %{st | thought: st.thought <> event["thought"], thought_flushed: false}
+
+          is_binary(event["text"]) and event["type"] not in ["thought", "end", "tool_use", "tool_result"] ->
+            st
+            |> grok_flush_thought_node(think_status)
+            |> Map.update!(:answer, &(&1 <> event["text"]))
 
           true ->
-            {thought_acc, text_acc}
+            # Claude-shaped content blocks injected for tools (optional path).
+            blocks = content_blocks_from_event(event)
+
+            Enum.reduce(blocks, st, fn block, inner ->
+              case block do
+                %{"type" => "tool_use"} = tool_block ->
+                  id =
+                    normalize_string(tool_block["id"]) ||
+                      unique_event_id("grok-tool", length(inner.nodes))
+
+                  inner
+                  |> grok_flush_thought_node(think_status)
+                  |> grok_flush_answer_node(summary_norm, text_status)
+                  |> grok_put_tool_node(id, tool_block, tool_by_id)
+
+                %{"type" => "tool_result"} = result_block ->
+                  id = normalize_string(result_block["tool_use_id"] || result_block["id"])
+                  grok_mark_tool_result(inner, id, result_block)
+
+                %{"type" => "thinking", "thinking" => body} when is_binary(body) ->
+                  %{inner | thought: inner.thought <> body, thought_flushed: false}
+
+                %{"type" => "text", "text" => body} when is_binary(body) ->
+                  inner
+                  |> grok_flush_thought_node(think_status)
+                  |> Map.update!(:answer, &(&1 <> body))
+
+                _ ->
+                  inner
+              end
+            end)
         end
       end)
 
-    think_status = if settled, do: "done", else: "streaming"
-    text_status = if settled, do: "done", else: "streaming"
-    nodes = []
-
-    nodes =
-      case String.trim(thought) do
-        "" ->
-          nodes
-
-        body ->
-          tokens = max(1, div(String.length(body), 4))
-
-          nodes ++
-            [
-              %{
-                "id" => "grok-thinking",
-                "label" => "Thinking",
-                "status" => think_status,
-                "kind" => "thinking",
-                "depth" => 0,
-                "tokens" => tokens,
-                "detail" => clip_text_node(body)
-              }
-            ]
-      end
-
-    nodes =
-      case String.trim(answer) do
-        "" ->
-          nodes
-
-        body ->
-          if body == summary_norm do
-            nodes
-          else
-            nodes ++
-              [
-                %{
-                  "id" => "grok-text",
-                  "label" => clip_text_node(body),
-                  "status" => text_status,
-                  "kind" => "text",
-                  "depth" => 0,
-                  "detail" => clip_text_node(body)
-                }
-              ]
-          end
-      end
-
-    nodes
+    state
+    |> grok_flush_thought_node(think_status)
+    |> grok_flush_answer_node(summary_norm, text_status)
+    |> Map.get(:nodes)
   end
+
+  defp grok_flush_thought_node(st, status) do
+    body = String.trim(st.thought)
+
+    cond do
+      body == "" and not st.thought_flushed ->
+        st
+
+      body == "" ->
+        st
+
+      true ->
+        tokens = max(1, div(String.length(body), 4))
+
+        node = %{
+          "id" => "grok-thinking",
+          "label" => "Thinking",
+          "status" => status,
+          "kind" => "thinking",
+          "depth" => 0,
+          "tokens" => tokens,
+          "detail" => clip_text_node(body)
+        }
+
+        nodes = upsert_progress_node(st.nodes, node)
+        %{st | nodes: nodes, thought_flushed: true}
+    end
+  end
+
+  defp grok_flush_answer_node(st, summary_norm, status) do
+    body = String.trim(st.answer)
+
+    cond do
+      body == "" ->
+        st
+
+      body == summary_norm ->
+        # Finished summary re-renders as the message body outside the card.
+        st
+
+      true ->
+        node = %{
+          "id" => "grok-text",
+          "label" => clip_text_node(body),
+          "status" => status,
+          "kind" => "text",
+          "depth" => 0,
+          "detail" => clip_text_node(body)
+        }
+
+        %{st | nodes: upsert_progress_node(st.nodes, node)}
+    end
+  end
+
+  defp grok_put_tool_node(st, id, tool_block, tool_by_id) do
+    if MapSet.member?(st.used_tools, id) do
+      st
+    else
+      event =
+        Map.get(tool_by_id, id) ||
+          %{
+            "id" => id,
+            "tool" => normalize_string(tool_block["name"]) || "tool",
+            "label" =>
+              tool_label(
+                "Grok",
+                normalize_string(tool_block["name"]) || "tool",
+                tool_block["input"] || %{}
+              ),
+            "status" => "running",
+            "input" => safe_payload(tool_block["input"] || %{}),
+            "providerEventType" => "tool_use"
+          }
+          |> put_node_shape(
+            normalize_string(tool_block["name"]) || "tool",
+            tool_block["input"] || %{}
+          )
+
+      node = tool_event_to_node(event, length(st.nodes))
+      %{st | nodes: st.nodes ++ [node], used_tools: MapSet.put(st.used_tools, id)}
+    end
+  end
+
+  defp grok_mark_tool_result(st, nil, _event), do: st
+
+  defp grok_mark_tool_result(st, id, event) do
+    failed =
+      event["is_error"] == true || event["isError"] == true ||
+        to_string(event["status"] || "") in ["error", "failed", "cancelled"]
+
+    status = if failed, do: "error", else: "done"
+
+    nodes =
+      Enum.map(st.nodes, fn node ->
+        if to_string(node["id"] || "") == id do
+          Map.put(node, "status", status)
+        else
+          node
+        end
+      end)
+
+    %{st | nodes: nodes}
+  end
+
+  # Replace same-id node in place (stable thinking/text across chunks); append if new.
+  defp upsert_progress_node(nodes, node) when is_list(nodes) and is_map(node) do
+    id = to_string(node["id"] || "")
+
+    case Enum.find_index(nodes, fn n -> to_string(n["id"] || "") == id end) do
+      nil ->
+        nodes ++ [node]
+
+      idx ->
+        List.replace_at(nodes, idx, node)
+    end
+  end
+
+  defp upsert_progress_node(nodes, _node), do: nodes
 
   defp interleaved_codex_progress_nodes(decoded, tool_events, summary_text) do
     tool_by_id = Map.new(tool_events, fn ev -> {ev["id"], ev} end)
@@ -2306,7 +2436,78 @@ defmodule Vibe.AI.LocalAgentWorker do
     |> Enum.take(@max_tool_events)
   end
 
+  defp tool_events_from_decoded(%{handle: "grok"}, decoded) do
+    decoded
+    |> grok_tool_events()
+    |> Enum.take(@max_tool_events)
+  end
+
   defp tool_events_from_decoded(_worker, _decoded), do: []
+
+  # Bridge injects tool_use / tool_result NDJSON from the Grok session updates tail.
+  defp grok_tool_events(decoded) do
+    {events_by_id, order} =
+      Enum.reduce(decoded, {%{}, []}, fn event, {events_by_id, order} = acc ->
+        cond do
+          not is_map(event) ->
+            acc
+
+          event["type"] == "tool_use" ->
+            id = normalize_string(event["id"]) || unique_event_id("grok-tool", length(order))
+            tool = normalize_string(event["name"]) || "tool"
+            input = event["input"] || %{}
+
+            ev =
+              %{
+                "id" => id,
+                "provider" => "grok",
+                "tool" => tool,
+                "label" => tool_label("Grok", tool, input),
+                "status" => "running",
+                "input" => safe_payload(input),
+                "providerEventType" => "tool_use"
+              }
+              |> put_node_shape(tool, input)
+
+            {Map.put(events_by_id, id, ev), append_once(order, id)}
+
+          event["type"] == "tool_result" ->
+            id = normalize_string(event["tool_use_id"] || event["id"])
+
+            if id && Map.has_key?(events_by_id, id) do
+              failed =
+                event["is_error"] == true || event["isError"] == true ||
+                  to_string(event["status"] || "") in ["error", "failed", "cancelled"]
+
+              prev = Map.fetch!(events_by_id, id)
+
+              updated =
+                prev
+                |> Map.put("status", if(failed, do: "error", else: "done"))
+                |> Map.put(
+                  "output",
+                  event["content"] || event["output"] || prev["output"]
+                )
+
+              {Map.put(events_by_id, id, updated), order}
+            else
+              acc
+            end
+
+          true ->
+            # Also accept Claude-shaped content blocks if the bridge ever emits them.
+            event
+            |> content_blocks_from_event()
+            |> Enum.reduce(acc, fn block, inner ->
+              accumulate_claude_tool_block(block, nil, inner)
+            end)
+        end
+      end)
+
+    order
+    |> Enum.uniq()
+    |> Enum.map(&Map.fetch!(events_by_id, &1))
+  end
 
   defp claude_tool_events(decoded) do
     {events_by_id, order} =
@@ -3454,6 +3655,8 @@ defmodule Vibe.AI.LocalAgentWorker do
     path =
       input["file_path"] ||
         input["filePath"] ||
+        input["target_file"] ||
+        input["targetFile"] ||
         input["path"] ||
         input["notebook_path"] ||
         first_patch_path(input)
@@ -3461,11 +3664,12 @@ defmodule Vibe.AI.LocalAgentWorker do
     parsed_patch_target = patch_target(input)
 
     cond do
-      t in ["read", "notebookread", "view", "cat", "open"] ->
+      t in ["read", "read_file", "notebookread", "view", "cat", "open"] ->
         {"read", target_basename(path)}
 
       t in [
         "edit",
+        "search_replace",
         "multiedit",
         "notebookedit",
         "str_replace",
@@ -3476,23 +3680,46 @@ defmodule Vibe.AI.LocalAgentWorker do
       ] ->
         {"edit", parsed_patch_target || target_basename(path)}
 
-      t in ["write", "create", "createfile", "new_file"] ->
+      t in ["write", "write_file", "create", "createfile", "new_file"] ->
         {"write", parsed_patch_target || target_basename(path)}
 
-      t in ["bash", "shell", "exec", "run", "command", "terminal"] ->
+      t in [
+        "bash",
+        "shell",
+        "exec",
+        "run",
+        "command",
+        "terminal",
+        "run_terminal_command"
+      ] ->
         {"bash", short_target(input["command"] || input["cmd"])}
 
-      t in ["grep", "search", "glob", "find", "ripgrep", "rg"] ->
-        {"search", short_target(input["pattern"] || input["query"] || path)}
+      t in [
+        "grep",
+        "search",
+        "glob",
+        "find",
+        "ripgrep",
+        "rg",
+        "list_dir",
+        "list_dir_tree"
+      ] ->
+        {"search",
+         short_target(
+           input["pattern"] || input["query"] || input["target_directory"] || path
+         )}
 
-      t in ["webfetch", "websearch", "fetch", "web_search", "web_fetch", "browse"] ->
+      t in ["webfetch", "websearch", "fetch", "web_search", "web_fetch", "browse", "open_page"] ->
         {"web", short_target(input["url"] || input["query"] || input["domain"])}
 
-      t in ["task", "agent", "dispatch_agent"] ->
-        {"task", short_target(input["description"] || input["prompt"])}
+      t in ["task", "agent", "dispatch_agent", "spawn_subagent", "get_command_or_subagent_output"] ->
+        {"task", short_target(input["description"] || input["prompt"] || input["command"])}
 
-      t in ["todowrite", "todo"] ->
+      t in ["todowrite", "todo", "todo_write"] ->
         {"todo", nil}
+
+      t in ["use_tool", "search_tool"] ->
+        {"tool", short_target(input["tool_name"] || input["query"] || input["name"])}
 
       true ->
         {"tool", target_basename(path) || short_target(input["command"])}
@@ -3528,13 +3755,20 @@ defmodule Vibe.AI.LocalAgentWorker do
 
     cond do
       parsed_patch_stats != nil and
-          t in ["edit", "multiedit", "update", "apply_patch", "applypatch"] ->
+          t in ["edit", "search_replace", "multiedit", "update", "apply_patch", "applypatch"] ->
         parsed_patch_stats
 
-      t in ["write", "create", "createfile", "new_file"] ->
+      t in ["write", "write_file", "create", "createfile", "new_file"] ->
         {line_count(input["content"] || input["file_text"] || input["text"]), 0}
 
-      t in ["edit", "notebookedit", "str_replace", "str_replace_editor", "update"] ->
+      t in [
+        "edit",
+        "search_replace",
+        "notebookedit",
+        "str_replace",
+        "str_replace_editor",
+        "update"
+      ] ->
         {line_count(
            input["new_string"] || input["newString"] || input["new_str"] || input["new_source"]
          ),

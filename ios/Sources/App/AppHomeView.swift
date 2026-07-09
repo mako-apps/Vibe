@@ -1853,19 +1853,19 @@ private struct ChatHomeScreen: View {
 
   /// Home ordering: Saved Messages, then the built-in agent quick-access row, then
   /// user-pinned chats, then everything else — each bucket newest-activity-first.
-  /// Stable within equal keys via the original index so equal-timestamp rows don't
-  /// jitter between refreshes.
+  /// Stable within equal keys via `chatId` (not the transient source index) so a
+  /// full refresh with the same timestamps cannot reshuffle rows and "jump" the list.
   private static func sortedForHome(_ rows: [ChatHomeListRow]) -> [ChatHomeListRow] {
-    rows.enumerated().sorted { lhs, rhs in
-      let lRank = homeSortRank(lhs.element)
-      let rRank = homeSortRank(rhs.element)
+    rows.sorted { lhs, rhs in
+      let lRank = homeSortRank(lhs)
+      let rRank = homeSortRank(rhs)
       if lRank != rRank { return lRank < rRank }
-      if lhs.element.lastMessageAt != rhs.element.lastMessageAt {
-        return lhs.element.lastMessageAt > rhs.element.lastMessageAt
+      if lhs.lastMessageAt != rhs.lastMessageAt {
+        return lhs.lastMessageAt > rhs.lastMessageAt
       }
-      return lhs.offset < rhs.offset
+      // Deterministic tie-break so equal-timestamp rows never swap between refreshes.
+      return lhs.chatId < rhs.chatId
     }
-    .map(\.element)
   }
 
   private static func homeSortRank(_ row: ChatHomeListRow) -> Int {
@@ -1930,20 +1930,27 @@ private struct ChatHomeScreen: View {
     )
   }
 
-  /// Claude/Codex surfaced instantly on a username prefix (no network). They are
+  /// Claude/Codex/Grok surfaced instantly on a username prefix (no network). They are
   /// real users but the exact-match `/user/name/:username` lookup only hits on the
-  /// full handle, so we offer them as soon as the user starts typing "cl"/"co".
+  /// full handle, so we offer them as soon as the user starts typing "cl"/"co"/"gr".
   private func agentSuggestions(for query: String) -> [ContactSearchUser] {
     let q = query.lowercased()
     guard !q.isEmpty else { return [] }
-    let agents = [
-      (ChatRoute.claudeAgentUserId, "claude"),
-      (ChatRoute.codexAgentUserId, "codex"),
-      (ChatRoute.grokAgentUserId, "grok"),
+    let agents: [(String, String, String)] = [
+      (ChatRoute.claudeAgentUserId, "claude", "https://media.vibegram.io/chat-media/agent-profiles/claude.png"),
+      (ChatRoute.codexAgentUserId, "codex", "https://media.vibegram.io/chat-media/agent-profiles/codex.png"),
+      (ChatRoute.grokAgentUserId, "grok", "https://media.vibegram.io/chat-media/agent-profiles/grok-v2.png"),
     ]
-    return agents.compactMap { uid, uname in
+    return agents.compactMap { uid, uname, avatar in
       guard uname.hasPrefix(q) else { return nil }
-      return ContactSearchUser(payload: ["userId": uid, "username": uname, "isAgent": true])
+      return ContactSearchUser(payload: [
+        "userId": uid,
+        "username": uname,
+        "displayName": uname.capitalized,
+        "isAgent": true,
+        "profileImage": avatar,
+        "tier": "gold",
+      ])
     }
   }
 
@@ -1993,9 +2000,18 @@ private struct ChatHomeScreen: View {
   var body: some View {
     NavigationStack {
       ZStack {
-        listContent
-          .ignoresSafeArea(.container, edges: .top)
-          .background(palette.background.ignoresSafeArea())
+        // Home UITableView extends under the transparent nav/search chrome and
+        // manages its own top contentInset. Search results use a native SwiftUI
+        // List that must KEEP safe-area padding so rows don't sit under the bar.
+        Group {
+          if trimmedHomeQuery.isEmpty {
+            listContent
+              .ignoresSafeArea(.container, edges: .top)
+          } else {
+            listContent
+          }
+        }
+        .background(palette.background.ignoresSafeArea())
 
         if let pendingDeletion {
           VStack {
@@ -2035,24 +2051,25 @@ private struct ChatHomeScreen: View {
         .animation(.spring(response: 0.28, dampingFraction: 0.86), value: pendingDeletion?.id)
         .animation(.spring(response: 0.22, dampingFraction: 0.9), value: pendingDeleteConfirmation?.id)
         .navigationBarTitleDisplayMode(.inline)
-        // Let iOS 26 apply its native adaptive Liquid Glass to the nav bar and
-        // toolbar items. An explicit .toolbarBackground / .sharedBackgroundVisibility(.hidden)
-        // suppressed that glass, which is what the user saw as "removed glass".
+        // Keep toolbar slots stable so Edit ↔ Done and trailing icons animate
+        // inside SwiftUI's navigation chrome (no custom overlay / no slot teardown).
         .toolbar {
           ToolbarItem(placement: .topBarLeading) {
             Button(isEditingHome ? "Done" : "Edit") {
-              withAnimation { isEditingHome.toggle() }
-              if !isEditingHome {
-                selectedChatIDs.removeAll()
+              withAnimation(.snappy(duration: 0.22)) {
+                isEditingHome.toggle()
+                if !isEditingHome {
+                  selectedChatIDs.removeAll()
+                }
               }
             }
             .font(.system(size: 17, weight: .semibold))
             .tint(
-              filteredRows.isEmpty
+              (filteredRows.isEmpty && !isEditingHome)
                 ? (colorScheme == .dark ? Color.white.opacity(0.3) : Color.black.opacity(0.3))
                 : (colorScheme == .dark ? .white : .black)
             )
-            .disabled(filteredRows.isEmpty)
+            .disabled(filteredRows.isEmpty && !isEditingHome)
           }
 
           ToolbarItem(placement: .principal) {
@@ -2062,9 +2079,8 @@ private struct ChatHomeScreen: View {
             )
           }
 
-          if !isEditingHome {
-            ToolbarItem(placement: .topBarTrailing) {
-            HStack(spacing: 18) {
+          ToolbarItemGroup(placement: .topBarTrailing) {
+            if !isEditingHome {
               Button {
                 openAgentChat()
               } label: {
@@ -2096,16 +2112,13 @@ private struct ChatHomeScreen: View {
               .buttonStyle(.plain)
               .contentShape(Rectangle())
             }
-            .padding(.horizontal, 6)
-          }
           }
         }
+        .animation(.snappy(duration: 0.22), value: isEditingHome)
         .searchable(
           text: $homeSearchQuery,
           isPresented: $isHomeSearchFocused,
-          // `.always` keeps the search field pinned in the nav-bar drawer instead
-          // of collapsing it away on scroll (which read as the search bar
-          // "disappearing"/getting screwed when the list moved).
+          // Native nav-bar drawer search (SwiftUI owns Cancel / focus animation).
           placement: .navigationBarDrawer(displayMode: .always),
           prompt: "Search Chats"
         )
@@ -2277,31 +2290,50 @@ private struct ChatHomeScreen: View {
     } else {
       List {
         if !chats.isEmpty {
-          Section(header: Text("Chats").foregroundStyle(palette.secondaryText)) {
+          Section {
             ForEach(chats, id: \.chatId) { row in
               Button { openLocalChatRow(row) } label: {
-                HomeSearchChatRow(row: row, palette: palette)
+                HomeSearchChatRow(row: row, palette: palette, isDark: colorScheme == .dark)
               }
               .buttonStyle(.plain)
+              .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+              .listRowSeparator(.hidden)
               .listRowBackground(palette.background)
             }
+          } header: {
+            Text("Chats")
+              .font(.system(size: 13, weight: .semibold))
+              .foregroundStyle(palette.secondaryText)
+              .textCase(nil)
           }
         }
         if !people.isEmpty {
-          Section(header: Text("People").foregroundStyle(palette.secondaryText)) {
+          Section {
             ForEach(people) { user in
               Button { handleGlobalUserTap(user) } label: {
                 ContactSearchResultRow(user: user, isSaved: false, palette: palette)
               }
               .buttonStyle(.plain)
+              .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+              .listRowSeparator(.hidden)
               .listRowBackground(palette.background)
             }
+          } header: {
+            Text("People")
+              .font(.system(size: 13, weight: .semibold))
+              .foregroundStyle(palette.secondaryText)
+              .textCase(nil)
           }
         }
       }
       .listStyle(.plain)
+      .listSectionSpacing(8)
       .scrollContentBackground(.hidden)
       .background(palette.background)
+      // Match the home list's bottom breathing room; top is handled by the
+      // NavigationStack safe area (search results deliberately do NOT ignore it).
+      .contentMargins(.bottom, 24, for: .scrollContent)
+      .contentMargins(.top, 4, for: .scrollContent)
     }
   }
 
@@ -3532,7 +3564,10 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       "ChatHomeNativeListController apply nextRows=\(rows.count) previousRows=\(previousRowCount)"
     )
     lastAppliedSignature = nextSignature
-    let rowDelta = Self.animatableRowDelta(from: previousRows, to: rows)
+    let previousIDs = previousRows.map(\.chatId)
+    let nextIDs = rows.map(\.chatId)
+    let orderUnchanged = previousIDs == nextIDs
+    let rowDelta = orderUnchanged ? nil : Self.animatableRowDelta(from: previousRows, to: rows)
     let canAnimateRowDelta = rowDelta != nil && isViewLoaded && view.window != nil && !isRunningRefresh
     let deletionOverlays = canAnimateRowDelta
       ? captureDeletionOverlays(for: rowDelta?.removedIndexPaths ?? [])
@@ -3553,7 +3588,11 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       return
     }
 
-    if canAnimateRowDelta, let rowDelta {
+    if orderUnchanged, previousRowCount == rows.count, !rows.isEmpty {
+      // Same identity order — reconfigure visible cells in place so previews /
+      // unread / online dots update without a full reload that jumps the list.
+      reconfigureVisibleCellsInPlace()
+    } else if canAnimateRowDelta, let rowDelta {
       performAnimatedRowDelta(rowDelta, deletionOverlays: deletionOverlays)
     } else {
       deletionOverlays.forEach { $0.removeFromSuperview() }
@@ -3685,8 +3724,39 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       if !delta.insertedIndexPaths.isEmpty {
         tableView.insertRows(at: delta.insertedIndexPaths, with: .fade)
       }
-    } completion: { _ in
+    } completion: { [weak self] _ in
       deletionOverlays.forEach { $0.animateAndRemove() }
+      // After moves settle, refresh any surviving visible rows so previews match.
+      self?.reconfigureVisibleCellsInPlace()
+    }
+  }
+
+  /// Update visible cells without `reloadData` so scroll position and cell
+  /// identity stay put when only content (preview/unread/online) changed.
+  private func reconfigureVisibleCellsInPlace() {
+    guard let visible = tableView.indexPathsForVisibleRows, !visible.isEmpty else {
+      // Nothing on screen yet (or empty) — still need dataSource count in sync.
+      if tableView.numberOfRows(inSection: 0) != rows.count {
+        UIView.performWithoutAnimation { tableView.reloadData() }
+      }
+      return
+    }
+    UIView.performWithoutAnimation {
+      for indexPath in visible {
+        guard rows.indices.contains(indexPath.row),
+          let cell = tableView.cellForRow(at: indexPath) as? ChatHomeCardCell
+        else { continue }
+        let row = rows[indexPath.row]
+        cell.configure(
+          row: row,
+          isDark: isDark,
+          avatarBackgroundColor: nil,
+          avatarGradientColors: resolvedAvatarGradientColors(for: row),
+          isEditing: isEditingMode,
+          isEditSelected: selectedChatIDs.contains(row.chatId),
+          showsRightCheckmark: showsRightCheckmark
+        )
+      }
     }
   }
 
@@ -6037,7 +6107,7 @@ final class ChatConversationController: UIViewController {
     markRouteSurfaceStep("page")
     mainView.setStandaloneProfileMode(false)
     // setStandaloneProfileMode(false) re-enables the composer — re-assert the
-    // bridge-agent gate so an unconnected Claude/Codex chat stays input-less.
+    // bridge-agent gate so an unconnected Claude/Codex/Grok chat stays input-less.
     if !deferSurfaceUntilAttached, let provider = route.bridgeProvider, !provider.isEmpty,
       !bridgeConnectedThisSession
     {
@@ -8337,39 +8407,162 @@ private struct ContactSearchView: View {
 }
 
 /// Compact existing-chat row for the Home search drawer ("Chats" section).
+/// Home-list style row used in the searchable drawer. Matches the native
+/// `ChatHomeCardCell` layout: 56pt avatar, title/preview/time, same gradient
+/// fallback via `ChatProfileAppearanceStore`, and agent CDN avatars when known.
 private struct HomeSearchChatRow: View {
   let row: ChatHomeListRow
   let palette: AppThemePalette
+  let isDark: Bool
 
   var body: some View {
     HStack(spacing: 12) {
-      Circle()
-        .fill(palette.background)
-        .frame(width: 44, height: 44)
-        .overlay {
-          Text(String(row.title.prefix(1)).uppercased())
-            .font(.system(size: 18, weight: .semibold))
-            .foregroundStyle(palette.accent)
+      HomeListStyleAvatar(
+        title: row.title,
+        peerUserId: row.peerUserId,
+        chatId: row.chatId,
+        avatarURI: resolvedAvatarURI,
+        fallback: row.avatarFallback,
+        isDark: isDark,
+        palette: palette
+      )
+
+      VStack(alignment: .leading, spacing: 3) {
+        HStack(spacing: 6) {
+          Text(row.title)
+            .font(.system(size: 16, weight: .semibold))
+            .foregroundStyle(palette.text)
+            .lineLimit(1)
+          if row.isGoldTier {
+            Image(systemName: "checkmark.seal.fill")
+              .font(.system(size: 12, weight: .semibold))
+              .foregroundStyle(Color(red: 1.0, green: 205 / 255, blue: 84 / 255))
+          }
+          Spacer(minLength: 8)
+          if !row.timeLabel.isEmpty {
+            Text(row.timeLabel)
+              .font(.system(size: 13, weight: .regular))
+              .foregroundStyle(palette.secondaryText)
+          }
         }
 
-      VStack(alignment: .leading, spacing: 2) {
-        Text(row.title)
-          .font(.system(size: 16, weight: .medium))
-          .foregroundStyle(palette.text)
-          .lineLimit(1)
-        Text(row.preview)
-          .font(.footnote)
-          .foregroundStyle(palette.secondaryText)
-          .lineLimit(1)
+        HStack(spacing: 6) {
+          Text(row.isTyping ? "typing..." : row.preview)
+            .font(.system(size: 14, weight: .regular))
+            .foregroundStyle(
+              row.isTyping
+                ? Color(red: 43 / 255, green: 135 / 255, blue: 210 / 255)
+                : palette.secondaryText
+            )
+            .lineLimit(1)
+          Spacer(minLength: 4)
+          if row.muted {
+            Image(systemName: "bell.slash.fill")
+              .font(.system(size: 11, weight: .semibold))
+              .foregroundStyle(palette.secondaryText.opacity(0.75))
+          }
+          if row.pinned {
+            Image(systemName: "pin.fill")
+              .font(.system(size: 11, weight: .semibold))
+              .foregroundStyle(palette.secondaryText.opacity(0.75))
+          }
+          if row.unreadCount > 0 || row.markedUnread {
+            Text(row.unreadCount > 0 ? "\(row.unreadCount)" : " ")
+              .font(.system(size: 12, weight: .bold))
+              .foregroundStyle(isDark ? Color.black : Color.white)
+              .padding(.horizontal, row.unreadCount > 0 ? 7 : 5)
+              .padding(.vertical, 2)
+              .background(
+                Capsule(style: .continuous)
+                  .fill(
+                    isDark
+                      ? Color(red: 157 / 255, green: 216 / 255, blue: 255 / 255)
+                      : Color(red: 23 / 255, green: 132 / 255, blue: 209 / 255)
+                  )
+              )
+          }
+        }
       }
-
-      Spacer(minLength: 8)
-      Image(systemName: "chevron.right")
-        .font(.system(size: 13, weight: .semibold))
-        .foregroundStyle(palette.secondaryText.opacity(0.6))
     }
-    .padding(.vertical, 4)
+    .padding(.horizontal, 16)
+    .padding(.vertical, 12)
+    .frame(minHeight: 76)
     .contentShape(Rectangle())
+  }
+
+  private var resolvedAvatarURI: String? {
+    if let uri = row.avatarUri?.trimmingCharacters(in: .whitespacesAndNewlines), !uri.isEmpty {
+      return uri
+    }
+    if let provider = ChatHomeListRow.bridgeProvider(
+      peerUserId: row.peerUserId, name: row.title, isAgent: row.isAgentFriend, agentId: row.peerAgentId
+    ) {
+      return Self.agentAvatarURL(for: provider)
+    }
+    return nil
+  }
+
+  static func agentAvatarURL(for provider: String) -> String? {
+    switch provider.lowercased() {
+    case "claude": return "https://media.vibegram.io/chat-media/agent-profiles/claude.png"
+    case "codex": return "https://media.vibegram.io/chat-media/agent-profiles/codex.png"
+    case "grok": return "https://media.vibegram.io/chat-media/agent-profiles/grok-v2.png"
+    default: return nil
+    }
+  }
+}
+
+/// Shared circular avatar used by home search rows — same gradient seed + CDN
+/// image path as the native home list cells.
+private struct HomeListStyleAvatar: View {
+  let title: String
+  let peerUserId: String?
+  let chatId: String?
+  let avatarURI: String?
+  let fallback: String
+  let isDark: Bool
+  let palette: AppThemePalette
+  var size: CGFloat = 56
+
+  var body: some View {
+    ZStack {
+      Circle()
+        .fill(
+          LinearGradient(
+            colors: [Color(uiColor: gradient.0), Color(uiColor: gradient.1)],
+            startPoint: .top,
+            endPoint: .bottom
+          )
+        )
+      if let avatarURI, let url = URL(string: avatarURI) {
+        AsyncImage(url: url) { phase in
+          switch phase {
+          case .success(let image):
+            image.resizable().scaledToFill()
+          default:
+            initials
+          }
+        }
+      } else {
+        initials
+      }
+    }
+    .frame(width: size, height: size)
+    .clipShape(Circle())
+  }
+
+  private var gradient: (UIColor, UIColor) {
+    ChatProfileAppearanceStore.avatarColors(
+      title: title,
+      peerUserId: peerUserId,
+      chatId: chatId
+    )
+  }
+
+  private var initials: some View {
+    Text(String((fallback.isEmpty ? title : fallback).prefix(2)).uppercased())
+      .font(.system(size: size * 0.34, weight: .bold))
+      .foregroundStyle(.white)
   }
 }
 
@@ -8377,51 +8570,35 @@ struct ContactSearchResultRow: View {
   let user: ContactSearchUser
   let isSaved: Bool
   let palette: AppThemePalette
+  @Environment(\.colorScheme) private var colorScheme
 
   var body: some View {
     HStack(spacing: 12) {
-      if let profileImage = user.profileImage, let url = URL(string: profileImage) {
-        AsyncImage(url: url) { phase in
-          if let image = phase.image {
-            image.resizable().scaledToFill()
-          } else {
-            fallbackAvatar
-          }
-        }
-        .frame(width: 44, height: 44)
-        .clipShape(Circle())
-      } else {
-        fallbackAvatar
-      }
+      HomeListStyleAvatar(
+        title: user.username,
+        peerUserId: user.userID,
+        chatId: nil,
+        avatarURI: resolvedProfileImage,
+        fallback: String(user.username.prefix(2)),
+        isDark: colorScheme == .dark,
+        palette: palette
+      )
 
-      VStack(alignment: .leading, spacing: 2) {
+      VStack(alignment: .leading, spacing: 3) {
         HStack(spacing: 6) {
           Text(user.username)
-            .font(.system(size: 16, weight: .medium))
+            .font(.system(size: 16, weight: .semibold))
             .foregroundStyle(palette.text)
           if user.isGoldTier {
-            ChatHomeTierBadgeView(label: "Gold")
+            Image(systemName: "checkmark.seal.fill")
+              .font(.system(size: 12, weight: .semibold))
+              .foregroundStyle(Color(red: 1.0, green: 205 / 255, blue: 84 / 255))
           }
         }
         .lineLimit(1)
 
-        let lastSeenText: String = {
-          if user.isAgent {
-            return "Open and start session"
-          }
-          return ChatEngine.shared.lastSeenTimestampMs(userId: user.userID).flatMap { timestamp -> String? in
-            guard timestamp > 0 else { return nil }
-            let date = Date(timeIntervalSince1970: TimeInterval(timestamp) / 1000.0)
-            let formatter = RelativeDateTimeFormatter()
-            formatter.unitsStyle = .short
-            let relative = formatter.localizedString(for: date, relativeTo: Date())
-            let trimmed = relative.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : "last seen \(trimmed)"
-          } ?? "last seen recently"
-        }()
-
-        Text(lastSeenText)
-          .font(.footnote)
+        Text(subtitleText)
+          .font(.system(size: 14, weight: .regular))
           .foregroundStyle(palette.secondaryText)
           .lineLimit(1)
       }
@@ -8432,36 +8609,40 @@ struct ContactSearchResultRow: View {
         Image(systemName: "checkmark.circle.fill")
           .foregroundStyle(palette.accent)
       }
-
-      Image(systemName: "chevron.right")
-        .font(.system(size: 13, weight: .semibold))
-        .foregroundStyle(palette.secondaryText.opacity(0.6))
     }
-    .padding(.vertical, 4)
-    .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
-    .listRowBackground(Color.clear)
+    .padding(.horizontal, 16)
+    .padding(.vertical, 12)
+    .frame(minHeight: 76)
+    .contentShape(Rectangle())
   }
 
-  private var fallbackAvatar: some View {
-    let colors = ChatProfileAppearanceStore.avatarColors(
-      title: user.username,
-      peerUserId: user.userID,
-      chatId: nil
-    )
-    return Circle()
-      .fill(
-        LinearGradient(
-          colors: [Color(uiColor: colors.0), Color(uiColor: colors.1)],
-          startPoint: .topLeading,
-          endPoint: .bottomTrailing
-        )
-      )
-      .frame(width: 44, height: 44)
-      .overlay {
-        Text(String(user.username.prefix(1)).uppercased())
-          .font(.system(size: 18, weight: .bold))
-          .foregroundStyle(.white)
-      }
+  private var subtitleText: String {
+    if user.isAgent || user.bridgeProvider != nil {
+      return "Open and start session"
+    }
+    return ChatEngine.shared.lastSeenTimestampMs(userId: user.userID).flatMap { timestamp -> String? in
+      guard timestamp > 0 else { return nil }
+      let date = Date(timeIntervalSince1970: TimeInterval(timestamp) / 1000.0)
+      let formatter = RelativeDateTimeFormatter()
+      formatter.unitsStyle = .short
+      let relative = formatter.localizedString(for: date, relativeTo: Date())
+      let trimmed = relative.trimmingCharacters(in: .whitespacesAndNewlines)
+      return trimmed.isEmpty ? nil : "last seen \(trimmed)"
+    } ?? "last seen recently"
+  }
+
+  /// Prefer payload image; for bridge agents always resolve the known CDN avatar
+  /// so search never shows initials when Claude/Codex/Grok have a profile photo.
+  private var resolvedProfileImage: String? {
+    if let profileImage = user.profileImage?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !profileImage.isEmpty
+    {
+      return profileImage
+    }
+    if let provider = user.bridgeProvider {
+      return HomeSearchChatRow.agentAvatarURL(for: provider)
+    }
+    return nil
   }
 }
 

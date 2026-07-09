@@ -593,9 +593,16 @@ struct ChatHomeListRow {
       ? nil
       : normalizedString(
         raw["friendAgentId"] ?? raw["friend_agent_id"] ?? raw["agentId"] ?? raw["agent_id"])
+    // Bridge agents (Claude/Codex/Grok) are real users with is_agent=true but NO
+    // Agent record (`peerAgentId` is nil). Treat reserved shadow-user ids as agents
+    // even when the payload omits friendIsAgent, so Grok DMs route into the agent view.
+    let isReservedBridgeAgent =
+      Self.bridgeProvider(peerUserId: peerUserId, name: title, isAgent: true, agentId: peerAgentId)
+      != nil
     let isAgentFriend =
       !isGroup
       && (Self.isBuiltInAgentChatId(chatId)
+        || isReservedBridgeAgent
         || (parseBool(raw["friendIsAgent"] ?? raw["friend_is_agent"]) ?? (peerAgentId != nil)))
     let agentEventInboxMode = normalizedString(
       raw["friendAgentEventInboxMode"] ?? raw["friend_agent_event_inbox_mode"]

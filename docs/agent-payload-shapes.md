@@ -291,17 +291,31 @@ approval) — kept in reserve for the future direct-LAN per-action approval phas
 
 ---
 
-## Grok (`streaming-json`)
+## Grok (`streaming-json` + session files)
 
-Headless command:
+Headless command (bridge):
 
 ```bash
-grok -p "<prompt>" --output-format streaming-json [--permission-mode <mode>] [--model <id>] [--resume <sessionId>]
+grok -p "<prompt>" --output-format streaming-json \
+  --permission-mode <mode> \
+  [--session-id <uuid>]   # fresh runs — pin path for live tool tail
+  [--resume <sessionId>]  # follow-ups
+  [--model <id>] [--reasoning-effort low|medium|high] [--always-approve]
 ```
 
 Also available: `--output-format json` (single final object) and `plain`.
 
-### Live NDJSON lines
+### Source split (critical)
+
+| Source | Authoritative for | Notes |
+|---|---|---|
+| **stdout** `streaming-json` | `thought`, `text`, `end` | Lowest latency; **no tools** |
+| **`~/.grok/sessions/<enc-cwd>/<id>/updates.jsonl`** | live `tool_call` / `tool_call_update` | Bridge tails while the process runs |
+| **`chat_history.jsonl`** | history detail (full turn fold) | `reasoning`, `assistant`+`tool_calls`, `tool_result`, user prompts |
+
+Do **not** double-ingest thought from both stdout and `agent_thought_chunk` in updates — live thinking is stdout-only; history uses `reasoning` rows in chat_history.
+
+### Live stdout NDJSON
 
 | type | meaning | key fields |
 |---|---|---|
@@ -317,24 +331,46 @@ Example:
 {"type":"end","stopReason":"EndTurn","sessionId":"…","requestId":"…"}
 ```
 
-### Final JSON mode
+### Bridge-injected tool lines (from updates.jsonl)
 
 ```json
-{
-  "text": "hi",
-  "stopReason": "EndTurn",
-  "sessionId": "…",
-  "requestId": "…",
-  "thought": "full thought string"
-}
+{"type":"tool_use","id":"call-…","name":"read_file","input":{"target_file":"…"},"status":"running"}
+{"type":"tool_result","tool_use_id":"call-…","content":"…","is_error":false,"status":"done"}
 ```
+
+Grok tool names map to the same progress kinds as Claude/Codex:
+
+| Grok tool | kind |
+|---|---|
+| `read_file` | `read` |
+| `search_replace` | `edit` |
+| `write` | `write` |
+| `run_terminal_command` | `bash` |
+| `grep` / `list_dir` | `search` |
+| `todo_write` | `todo` |
+| `web_search` / `web_fetch` / `open_page` | `web` |
+| `use_tool` / `search_tool` | `tool` |
+
+### History (`chat_history.jsonl`)
+
+| type | role in fold |
+|---|---|
+| `user` (no `synthetic_reason`) | turn boundary — right-side user bubble |
+| `reasoning` | `kind:thinking` node (`summary[].text` when present) |
+| `assistant` | narration `text` + `tool_calls[]` → tool nodes |
+| `tool_result` | join output onto tool id |
+| `system` / synthetic user scaffolding | skip |
+
+Each **user turn** folds into **one** assistant host via `foldTurnIntoHost` (Worked card + summary body), not one bubble per intermediate assistant line.
 
 ### Server mapping (`LocalAgentWorker`)
 
-- All `thought` chunks → one `progressNodes` entry `{ kind: "thinking", tokens: len/4 }`
-- All `text` chunks → live text node; finished summary body is the joined text
-- `end.sessionId` captured by the bridge for optional `--resume`
-- Tool action encryption (`agentActionsEnc`) is empty for Grok in v1 (no tool blocks in this stream shape)
+- Stable node ids: `grok-thinking`, `grok-text`, tool ids from `tool_use.id`
+- All `thought` chunks upsert one thinking node (`detail` = full thought for the progress sheet)
+- All `text` chunks upsert one text node (dropped when equal to finished summary body)
+- Injected `tool_use` / `tool_result` → progress kind + status running→done
+- `vibe_thinking` ticker still drives live "Thinking · N tokens" like Claude
+- `end.sessionId` / bridge-assigned `--session-id` for resume
 
 ### Agent identity
 
@@ -343,4 +379,4 @@ Example:
 | handle | `grok` |
 | mention | `@grok` |
 | agent user id | `33333333-3333-3333-3333-333333333333` |
-| avatar | `https://media.vibegram.io/chat-media/agent-profiles/grok.png` |
+| avatar | `https://media.vibegram.io/chat-media/agent-profiles/grok-v2.png` |

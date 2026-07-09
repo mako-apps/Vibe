@@ -314,6 +314,7 @@ final class ChatGifPanelView: UIView {
         panelVisible = visible
 
         if visible {
+            // First presentation builds strip buttons / emoji sections / tab content.
             applyActiveTabState(animated: false)
             if activeTab == .gifs {
                 installEmbeddedPickerIfNeeded()
@@ -543,10 +544,10 @@ final class ChatGifPanelView: UIView {
         selectionFeedback.prepare()
         refreshChrome()
         rebuildSearchChrome()
-        rebuildTopStripButtons()
-        rebuildEmojiSections()
+        // Defer strip buttons + emoji catalog work until the panel is shown —
+        // building them at zero height caused multi-second main-thread stalls
+        // and unsatisfiable constraints when ChatInputBar opened a chat.
         updateContentInsets()
-        applyActiveTabState(animated: false)
     }
 
     private func updateContentInsets() {
@@ -568,7 +569,9 @@ final class ChatGifPanelView: UIView {
     private func applyFrameLayout() {
         let w = bounds.width
         let h = bounds.height
-        guard w > 0, h > 0 else { return }
+        // Skip zero-size layout: Auto Layout inside the strip fights a height-0
+        // visual-effect container and floods the console with broken constraints.
+        guard w > 1, h > 1 else { return }
 
         let hInset: CGFloat = 10
         let stripTop: CGFloat = 8
@@ -775,8 +778,10 @@ final class ChatGifPanelView: UIView {
 
         button.layer.cornerRadius = 17
         button.layer.cornerCurve = .continuous
+        // Priority < required so a transient zero-height host (or collapse
+        // animation) can break this cleanly instead of thrashing Auto Layout.
         let heightConstraint = button.heightAnchor.constraint(equalToConstant: 34)
-        heightConstraint.priority = .defaultHigh
+        heightConstraint.priority = UILayoutPriority(999)
         heightConstraint.isActive = true
 
         if showsAddBadge {

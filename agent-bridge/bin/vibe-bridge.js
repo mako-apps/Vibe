@@ -1167,15 +1167,26 @@ function buildCommand(provider, prompt, chatId, task) {
     const effort = reasoningEffortFor(provider, task);
     const resumeId = resumeIdFor(task);
     // Headless: `grok -p <prompt> --output-format streaming-json`
-    // emits thought/text/end NDJSON (see docs/agent-payload-shapes.md).
+    // emits thought/text/end NDJSON only — tools live in session updates.jsonl.
+    // Fresh runs pin a session UUID so the bridge can tail tools live (see
+    // startGrokUpdatesTail). Resume keeps the existing id via --resume.
+    const assignedSessionId = resumeId || crypto.randomUUID();
     const args = ["-p", cleaned, "--output-format", "streaming-json", "--permission-mode", mode];
     if (effort) args.push("--reasoning-effort", effort);
-    if (resumeId) args.push("--resume", resumeId);
+    if (resumeId) {
+      args.push("--resume", resumeId);
+    } else {
+      args.push("--session-id", assignedSessionId);
+    }
     if (model) args.push("--model", model);
     if (mode === "bypassPermissions" || mode === "auto" || workModeFor(task) === "full_access") {
       args.push("--always-approve");
     }
-    return { cmd: process.env.VIBE_GROK_COMMAND || "grok", args };
+    return {
+      cmd: process.env.VIBE_GROK_COMMAND || "grok",
+      args,
+      sessionId: assignedSessionId,
+    };
   }
   return null;
 }
@@ -2622,6 +2633,7 @@ function looksToolish(line) {
   return (
     line.includes("tool_use") ||
     line.includes("tool_result") ||
+    line.includes("tool_call") ||
     line.includes('"command"') ||
     line.includes('"response_item"') ||
     line.includes("function_call") ||
@@ -2782,12 +2794,16 @@ async function runTask(channel, task) {
   );
 
   const key = taskKey(provider, chatId, taskId);
+  // Prefer an explicit resume id; for Grok also honor the UUID we assigned at spawn
+  // so history watch + updates.jsonl tail can bind before the end frame.
+  const initialSessionId = resumeIdFor(task) || built.sessionId || null;
+  if (initialSessionId) sessionByChat.set(chatId, initialSessionId);
   runningTasks.set(key, {
     child,
     provider,
     chatId,
     taskId,
-    sessionId: resumeIdFor(task),
+    sessionId: initialSessionId,
     prompt,
     repo,
     cwd,
@@ -2896,29 +2912,49 @@ async function runTask(channel, task) {
   // that isn't a partial thinking event. Gated on a cheap substring test so we only
   // JSON.parse the (few) partial-message lines.
   const trackThinking = (line) => {
-    if (!line.includes("stream_event")) return;
-    let obj;
-    try {
-      obj = JSON.parse(line);
-    } catch {
+    // Claude: partial stream_event thinking_delta.
+    if (line.includes("stream_event")) {
+      let obj;
+      try {
+        obj = JSON.parse(line);
+      } catch {
+        return;
+      }
+      const inner = obj && obj.type === "stream_event" ? obj.event : null;
+      if (!inner || typeof inner.type !== "string") return;
+      if (inner.type === "content_block_start" && inner.content_block && inner.content_block.type === "thinking") {
+        thinkingState.chars = 0;
+        thinkingState.active = true;
+      } else if (inner.type === "content_block_delta" && inner.delta && inner.delta.type === "thinking_delta") {
+        thinkingState.chars += String(inner.delta.thinking || "").length;
+        thinkingState.active = true;
+        emitThinking(false);
+      } else if (inner.type === "content_block_stop" && thinkingState.active) {
+        thinkingState.active = false;
+        emitThinking(true);
+      } else if (inner.type === "message_stop") {
+        thinkingState.active = false;
+      }
       return;
     }
-    const inner = obj && obj.type === "stream_event" ? obj.event : null;
-    if (!inner || typeof inner.type !== "string") return;
-    if (inner.type === "content_block_start" && inner.content_block && inner.content_block.type === "thinking") {
-      thinkingState.chars = 0;
-      thinkingState.active = true;
-    } else if (inner.type === "content_block_delta" && inner.delta && inner.delta.type === "thinking_delta") {
-      thinkingState.chars += String(inner.delta.thinking || "").length;
-      thinkingState.active = true;
-      emitThinking(false);
-    } else if (inner.type === "content_block_stop" && thinkingState.active) {
-      // The thinking block closed (a tool call / answer text follows) — one final tick so
-      // the counter settles, then the node stays until the completed message replaces it.
-      thinkingState.active = false;
-      emitThinking(true);
-    } else if (inner.type === "message_stop") {
-      thinkingState.active = false;
+    // Grok: streaming-json thought chunks — coalesce into the same vibe_thinking ticker.
+    if (provider === "grok" && line.includes('"thought"')) {
+      let obj;
+      try {
+        obj = JSON.parse(line);
+      } catch {
+        return;
+      }
+      if (obj && obj.type === "thought" && typeof obj.data === "string") {
+        thinkingState.chars += obj.data.length;
+        thinkingState.active = true;
+        emitThinking(false);
+      } else if (obj && (obj.type === "text" || obj.type === "end" || obj.type === "tool_use")) {
+        if (thinkingState.active) {
+          thinkingState.active = false;
+          emitThinking(true);
+        }
+      }
     }
   };
 
@@ -2988,6 +3024,44 @@ async function runTask(channel, task) {
   child.stdout.on("data", onChunk);
   child.stderr.on("data", onChunk);
 
+  // Grok tools are NOT in streaming-json stdout — they land in the session's
+  // updates.jsonl. With a pinned --session-id we can tail that file live and
+  // inject Claude-compatible tool_use/tool_result lines into the same progress
+  // buffer the server reparses (so progressNodes grow like Claude/Codex).
+  let grokTail = null;
+  if (provider === "grok" && initialSessionId) {
+    const injectSynthetic = (line) => {
+      if (!line || canceled) return;
+      lastChunkAt = Date.now();
+      output += line.endsWith("\n") ? line : line + "\n";
+      if (progressCount >= MAX_PROGRESS_LINES) return;
+      if (line.length > MAX_LINE_BYTES) return;
+      progressCount++;
+      const now = Date.now();
+      pushProgressFrame(channel, key, {
+        provider,
+        chatId,
+        taskId,
+        sentAtMs: now,
+        replyToId,
+        repoId: repo.id,
+        repoName: repo.name,
+        cwd,
+        workMode: workModeFor(task),
+        model: modelFor(provider, chatId, task) || null,
+        advisor: advisorFor(provider, chatId, task) || null,
+        line: line.endsWith("\n") ? line.slice(0, -1) : line,
+      });
+    };
+    grokTail = startGrokUpdatesTail({
+      cwd,
+      sessionId: initialSessionId,
+      onLine: injectSynthetic,
+    });
+    const entry = runningTasks.get(key);
+    if (entry) entry.grokTail = grokTail;
+  }
+
   // Keepalive: while the CLI is mid-run but silent (long thinking / a quiet
   // tool), re-push the current snapshot so the phone's live turn never appears
   // frozen and a phone that missed a broadcast during a socket drop re-syncs.
@@ -3022,6 +3096,11 @@ async function runTask(channel, task) {
       clearInterval(keepaliveTimer);
       keepaliveTimer = null;
     }
+    // Final drain of Grok updates.jsonl so the last tool_call_update isn't lost
+    // when stdout's end frame races the file flush.
+    try {
+      if (grokTail && typeof grokTail.stop === "function") grokTail.stop();
+    } catch (_) {}
     runningTasks.delete(key);
     pushBridgeStatus(channel);
     // The run is done — re-push this chat's transcript so the live "running" flag on
@@ -3199,7 +3278,8 @@ function cleanMessageText(text) {
 
 // Skip ephemeral scratch/test working dirs so the list shows real work.
 function isEphemeralProject(p) {
-  return /(^|\/)(private\/)?tmp\//.test(p) || /vibe-(bridge|agent)-/.test(p) || /self-test/.test(p);
+  // Match /tmp, /private/tmp, and any nested path under them (with or without trailing slash).
+  return /(^|\/)(private\/)?tmp(\/|$)/.test(p) || /vibe-(bridge|agent)-/.test(p) || /self-test/.test(p);
 }
 
 function decodeClaudeProject(name) {
@@ -3929,11 +4009,316 @@ function liveAgentActionsField(provider, output) {
   return enc ? { agentActionsEnc: enc } : {};
 }
 
-// Grok headless streaming-json does not emit tool_use blocks yet — thinking/text
-// ride progressNodes on the server. Keep an empty action list so the field stays
-// consistent with Claude/Codex payloads.
-function liveGrokActions(_output) {
-  return [];
+// Grok stdout is only thought/text/end; the bridge also injects tool_use /
+// tool_result lines from the session updates.jsonl tail. Parse those (plus any
+// Claude-shaped content blocks) into the same action list shape as Claude.
+function liveGrokActions(output) {
+  const detailByUid = new Map();
+  const resultByUid = new Map();
+  const order = [];
+  for (const event of parsedJsonlEvents(output)) {
+    if (!event || typeof event !== "object") continue;
+    const type = String(event.type || "").toLowerCase();
+    if (type === "tool_use") {
+      const id = event.id || event.toolCallId || `grok-tool-${order.length}`;
+      order.push(id);
+      detailByUid.set(id, grokActionDetail(event.name || event.tool || "tool", event.input || event.rawInput || {}));
+      continue;
+    }
+    if (type === "tool_result") {
+      const id = event.tool_use_id || event.toolCallId || event.id;
+      if (id) {
+        resultByUid.set(id, {
+          output: clipText(toolResultText(event.content || event.output || event.result), MAX_ACTION_OUTPUT),
+          isError: !!(event.is_error || event.isError || String(event.status || "").toLowerCase() === "error"),
+        });
+      }
+      continue;
+    }
+    for (const block of eventContentBlocks(event)) {
+      if (block.type === "tool_use") {
+        const id = block.id || `grok-tool-${order.length}`;
+        order.push(id);
+        detailByUid.set(id, grokActionDetail(block.name, block.input || {}));
+      } else if (block.type === "tool_result") {
+        const id = block.tool_use_id || block.id;
+        if (id) {
+          resultByUid.set(id, {
+            output: clipText(toolResultText(block.content || block.text || block.result), MAX_ACTION_OUTPUT),
+            isError: !!block.is_error,
+          });
+        }
+      }
+    }
+  }
+  return actionListFromMaps(order, detailByUid, resultByUid);
+}
+
+// Map Grok Build tool names → the same progress-node kinds Claude/Codex use so
+// the phone renders Read / Edit / Run / Search rows instead of opaque "tool".
+function grokActionDetail(name, rawInput) {
+  let input = rawInput;
+  if (typeof rawInput === "string") {
+    try {
+      input = JSON.parse(rawInput);
+    } catch {
+      input = {};
+    }
+  }
+  if (!input || typeof input !== "object") input = {};
+  const n = String(name || "").trim();
+  const lower = n.toLowerCase();
+
+  if (lower === "run_terminal_command" || lower === "bash" || lower === "shell") {
+    return {
+      kind: "bash",
+      command: String(input.command || input.cmd || ""),
+      description: input.description ? String(input.description) : "",
+    };
+  }
+  if (lower === "read_file" || lower === "read") {
+    const fp = input.target_file || input.file_path || input.path || "";
+    const d = { kind: "read", path: diffFilePath(fp), name: safeBase(fp) };
+    const offset = Number(input.offset);
+    const limit = Number(input.limit);
+    if (Number.isFinite(offset) && offset > 0) {
+      d.start = offset;
+      if (Number.isFinite(limit) && limit > 0) d.end = offset + limit - 1;
+    }
+    return d;
+  }
+  if (lower === "search_replace" || lower === "edit" || lower === "str_replace") {
+    const fp = input.file_path || input.path || "";
+    return {
+      kind: "edit",
+      path: diffFilePath(fp),
+      name: safeBase(fp),
+      additions: countTextLines(input.new_string || input.new_str || ""),
+      deletions: countTextLines(input.old_string || input.old_str || ""),
+      patch: clipText(
+        unifiedDiffBlock(fp, input.old_string || input.old_str || "", input.new_string || input.new_str || "", "M"),
+        MAX_NODE_PATCH
+      ),
+    };
+  }
+  if (lower === "write" || lower === "write_file") {
+    const fp = input.file_path || input.path || "";
+    return {
+      kind: "write",
+      path: diffFilePath(fp),
+      name: safeBase(fp),
+      additions: countTextLines(input.content || ""),
+      patch: clipText(unifiedDiffBlock(fp, "", input.content || "", "A"), MAX_NODE_PATCH),
+    };
+  }
+  if (lower === "grep" || lower === "search") {
+    return {
+      kind: "search",
+      tool: "grep",
+      pattern: String(input.pattern || input.query || ""),
+      path: input.path ? String(input.path) : "",
+      glob: input.glob ? String(input.glob) : "",
+    };
+  }
+  if (lower === "list_dir" || lower === "glob" || lower === "list_dir_tree") {
+    return {
+      kind: "search",
+      tool: lower === "glob" ? "glob" : "list",
+      pattern: String(input.target_directory || input.pattern || input.path || ""),
+      path: input.target_directory ? String(input.target_directory) : "",
+    };
+  }
+  if (lower === "todo_write" || lower === "todowrite") {
+    const todos = Array.isArray(input.todos)
+      ? input.todos.map((t) => ({
+          content: String((t && t.content) || ""),
+          status: String((t && t.status) || ""),
+          activeForm: String((t && t.activeForm) || ""),
+        }))
+      : [];
+    return { kind: "todo", todos };
+  }
+  if (lower === "web_search" || lower === "websearch") {
+    return { kind: "web", query: String(input.query || "") };
+  }
+  if (lower === "web_fetch" || lower === "webfetch" || lower === "open_page") {
+    return { kind: "web", url: String(input.url || ""), prompt: clip(String(input.prompt || ""), 200) };
+  }
+  if (lower === "use_tool" || lower === "search_tool") {
+    return { kind: "tool", name: n || "mcp" };
+  }
+  if (lower === "get_command_or_subagent_output" || lower === "spawn_subagent") {
+    return { kind: "task", description: String(input.description || n) };
+  }
+  return { kind: "tool", name: n || "tool" };
+}
+
+function grokSessionDir(cwd, sessionId) {
+  return path.join(os.homedir(), ".grok", "sessions", encodeURIComponent(String(cwd || "")), String(sessionId || ""));
+}
+
+// Extract plain text from a Grok updates.jsonl tool_call_update content block.
+function grokUpdateContentText(content) {
+  if (content == null) return "";
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((block) => {
+        if (!block) return "";
+        if (typeof block === "string") return block;
+        if (block.type === "content" && block.content) {
+          if (typeof block.content === "string") return block.content;
+          if (block.content.type === "text" && typeof block.content.text === "string") return block.content.text;
+          if (typeof block.content.text === "string") return block.content.text;
+        }
+        if (block.type === "text" && typeof block.text === "string") return block.text;
+        if (typeof block.text === "string") return block.text;
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (typeof content === "object") {
+    if (typeof content.text === "string") return content.text;
+    if (content.content) return grokUpdateContentText(content.content);
+  }
+  return "";
+}
+
+// Convert one updates.jsonl record into synthetic NDJSON lines the server understands.
+// Source split (Fable): tools only from this file; thought/text stay on stdout.
+function grokUpdateRecordToSyntheticLines(rec) {
+  if (!rec || typeof rec !== "object") return [];
+  const u = (rec.params && rec.params.update) || rec.update || rec;
+  if (!u || typeof u !== "object") return [];
+  const kind = String(u.sessionUpdate || u.type || "");
+  const out = [];
+  if (kind === "tool_call") {
+    const id = u.toolCallId || u.tool_call_id || u.id;
+    if (!id) return out;
+    const meta = (u._meta && (u._meta["x.ai/tool"] || u._meta.xAiTool)) || {};
+    const name = meta.name || u.title || "tool";
+    let input = u.rawInput != null ? u.rawInput : u.input || {};
+    if (typeof input === "string") {
+      try {
+        input = JSON.parse(input);
+      } catch {
+        input = { raw: input };
+      }
+    }
+    out.push(JSON.stringify({ type: "tool_use", id, name, input, status: "running" }));
+    return out;
+  }
+  if (kind === "tool_call_update") {
+    const id = u.toolCallId || u.tool_call_id || u.id;
+    if (!id) return out;
+    const status = String(u.status || "").toLowerCase();
+    // Mid-flight title/status updates: re-assert tool_use so the label can refresh.
+    if (status && status !== "completed" && status !== "failed" && status !== "error" && status !== "cancelled") {
+      const meta = (u._meta && (u._meta["x.ai/tool"] || u._meta.xAiTool)) || {};
+      const name = meta.name || u.title || "tool";
+      let input = u.rawInput != null ? u.rawInput : u.input || {};
+      if (typeof input === "string") {
+        try {
+          input = JSON.parse(input);
+        } catch {
+          input = { raw: input };
+        }
+      }
+      out.push(JSON.stringify({ type: "tool_use", id, name, input, status: "running" }));
+      return out;
+    }
+    if (status === "completed" || status === "failed" || status === "error" || status === "cancelled") {
+      const content = grokUpdateContentText(u.content);
+      out.push(
+        JSON.stringify({
+          type: "tool_result",
+          tool_use_id: id,
+          content: clipText(content, MAX_ACTION_OUTPUT),
+          is_error: status !== "completed",
+          status: status === "completed" ? "done" : "error",
+        })
+      );
+    }
+    return out;
+  }
+  return out;
+}
+
+// Tail ~/.grok/sessions/<cwd>/<sessionId>/updates.jsonl while a Grok run is live.
+function startGrokUpdatesTail({ cwd, sessionId, onLine }) {
+  const dir = grokSessionDir(cwd, sessionId);
+  const file = path.join(dir, "updates.jsonl");
+  let offset = 0;
+  let partial = "";
+  let stopped = false;
+  let timer = null;
+  const seenSynthetic = new Set();
+
+  const drain = () => {
+    if (stopped && !fs.existsSync(file)) return;
+    try {
+      if (!fs.existsSync(file)) return;
+      const st = fs.statSync(file);
+      if (st.size < offset) {
+        // File was truncated/rotated — rescan from start.
+        offset = 0;
+        partial = "";
+      }
+      if (st.size === offset) return;
+      const fd = fs.openSync(file, "r");
+      const len = st.size - offset;
+      const buf = Buffer.alloc(Math.min(len, 4 * 1024 * 1024));
+      const n = fs.readSync(fd, buf, 0, buf.length, offset);
+      fs.closeSync(fd);
+      offset += n;
+      partial += buf.slice(0, n).toString("utf8");
+      let idx;
+      while ((idx = partial.indexOf("\n")) >= 0) {
+        const line = partial.slice(0, idx);
+        partial = partial.slice(idx + 1);
+        if (!line.trim()) continue;
+        let rec = null;
+        try {
+          rec = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        for (const syn of grokUpdateRecordToSyntheticLines(rec)) {
+          // Dedupe identical synthetic lines so repeated updates don't flood.
+          const sig = syn.length > 240 ? syn.slice(0, 240) : syn;
+          if (seenSynthetic.has(sig)) continue;
+          seenSynthetic.add(sig);
+          if (seenSynthetic.size > 4000) {
+            // Bound memory on very long runs.
+            const first = seenSynthetic.values().next().value;
+            seenSynthetic.delete(first);
+          }
+          try {
+            onLine(syn);
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+  };
+
+  timer = setInterval(drain, 300);
+  // Kick once immediately in case the file already has content.
+  drain();
+  return {
+    file,
+    dir,
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+      // One last drain after end so trailing tool_call_update isn't lost.
+      drain();
+    },
+  };
 }
 
 function liveClaudeActions(output) {
@@ -4768,14 +5153,364 @@ async function readHistory({ provider, mode, sessionId, limit, before }) {
   return { mode: "list", sessions: await listClaude(cap) };
 }
 
-// Grok session history (v1): list/detail stubs so the phone History panel does not
-// crash. Live runs still stream via run_task; full ~/.grok/sessions replay can land later.
-async function listGrok(_cap) {
-  return [];
+// Grok Build sessions live under ~/.grok/sessions/<url-encoded-cwd>/<sessionId>/.
+// List/detail read summary.json + chat_history.jsonl so the phone History panel
+// matches Claude/Codex. Live run_task still streams separately.
+function grokSessionsRoot() {
+  return path.join(os.homedir(), ".grok", "sessions");
 }
 
-async function grokDetail(_sessionId, _cap, _before) {
-  return null;
+function grokSessionFiles() {
+  const root = grokSessionsRoot();
+  const out = [];
+  if (!fs.existsSync(root)) return out;
+  let cwdDirs;
+  try { cwdDirs = fs.readdirSync(root, { withFileTypes: true }); } catch { return out; }
+  for (const cwdDir of cwdDirs) {
+    if (!cwdDir.isDirectory()) continue;
+    if (cwdDir.name === "session_search.sqlite" || cwdDir.name.startsWith(".")) continue;
+    const cwdPath = (() => {
+      try { return decodeURIComponent(cwdDir.name); } catch { return cwdDir.name; }
+    })();
+    if (isEphemeralProject(cwdPath)) continue;
+    const absCwd = path.join(root, cwdDir.name);
+    let sessions;
+    try { sessions = fs.readdirSync(absCwd, { withFileTypes: true }); } catch { continue; }
+    for (const sess of sessions) {
+      if (!sess.isDirectory()) continue;
+      const sessionDir = path.join(absCwd, sess.name);
+      const histFile = path.join(sessionDir, "chat_history.jsonl");
+      const summaryFile = path.join(sessionDir, "summary.json");
+      let st;
+      try { st = fs.statSync(histFile); } catch { continue; }
+      out.push({
+        id: sess.name,
+        file: histFile,
+        summaryFile,
+        project: cwdPath,
+        mtime: st.mtimeMs,
+        size: st.size,
+      });
+    }
+  }
+  return out;
+}
+
+function grokSummaryFromFiles(entry) {
+  let topic = null;
+  let lastTs = null;
+  let messages = 0;
+  let firstUser = null;
+  try {
+    if (entry.summaryFile && fs.existsSync(entry.summaryFile)) {
+      const raw = JSON.parse(fs.readFileSync(entry.summaryFile, "utf8"));
+      topic = raw.generated_title || raw.session_summary || null;
+      lastTs = raw.updated_at || raw.last_active_at || raw.created_at || null;
+      messages = Number(raw.num_chat_messages || raw.num_messages || 0) || 0;
+    }
+  } catch (_) {}
+  // Fall back to a quick history head scan for topic when summary is missing.
+  if (!topic || !messages) {
+    try {
+      const fd = fs.openSync(entry.file, "r");
+      const buf = Buffer.alloc(Math.min(entry.size || 64000, 64000));
+      const n = fs.readSync(fd, buf, 0, buf.length, 0);
+      fs.closeSync(fd);
+      const text = buf.slice(0, n).toString("utf8");
+      for (const line of text.split("\n")) {
+        if (!line.trim()) continue;
+        let ev = null;
+        try { ev = JSON.parse(line); } catch { continue; }
+        if (!ev || typeof ev !== "object") continue;
+        if (ev.type === "user") {
+          messages = Math.max(messages, 1);
+          const body = grokHistoryContentText(ev.content);
+          if (!firstUser) {
+            const clean = cleanTopicCandidate(body);
+            if (clean) firstUser = clean;
+          }
+        } else if (ev.type === "assistant") {
+          messages = Math.max(messages, 1);
+        }
+      }
+    } catch (_) {}
+  }
+  return {
+    topic: topic || firstUser || "Grok session",
+    lastTs,
+    messages: messages || 1,
+  };
+}
+
+function grokHistoryContentText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((b) => {
+        if (!b) return "";
+        if (typeof b === "string") return b;
+        if (b.type === "text" && typeof b.text === "string") return b.text;
+        if (typeof b.text === "string") return b.text;
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (content && typeof content === "object" && typeof content.text === "string") {
+    return content.text;
+  }
+  return "";
+}
+
+async function listGrok(limit) {
+  const files = grokSessionFiles().sort((a, b) => b.mtime - a.mtime).slice(0, limit || HISTORY_LIST_LIMIT);
+  const runningIds = runningSessionIdSet("grok");
+  const results = [];
+  for (const s of files) {
+    let sum = getCachedSummary(s.file, s.size);
+    if (!sum) {
+      sum = grokSummaryFromFiles(s);
+      setCachedSummary(s.file, s.size, sum);
+    }
+    if (sum.messages === 0) continue;
+    results.push({
+      provider: "grok",
+      id: s.id,
+      topic: sum.topic,
+      project: s.project,
+      projectName: path.basename(s.project || "") || "Computer",
+      updatedAt: sum.lastTs || new Date(s.mtime).toISOString(),
+      messageCount: sum.messages,
+      live: sessionIsLive(s.mtime, s.id, runningIds),
+    });
+  }
+  return results;
+}
+
+// True when a chat_history user row is a real human prompt (not scaffolding).
+function grokIsRealUserPrompt(ev, body) {
+  if (!body) return false;
+  if (ev && ev.synthetic_reason) return false;
+  const text = String(body).trim();
+  if (!text) return false;
+  if (/^<user_info>|^<system-reminder>|^system-reminder/i.test(text)) return false;
+  if (/^This session is being continued from a previous conversation/i.test(text)) return false;
+  return true;
+}
+
+function grokReasoningSummaryText(ev) {
+  if (!ev || typeof ev !== "object") return "";
+  const summary = ev.summary;
+  if (Array.isArray(summary)) {
+    return summary
+      .map((b) => {
+        if (!b) return "";
+        if (typeof b === "string") return b;
+        if (b.type === "summary_text" && typeof b.text === "string") return b.text;
+        if (typeof b.text === "string") return b.text;
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (typeof summary === "string") return summary;
+  if (typeof ev.content === "string") return ev.content;
+  return grokHistoryContentText(ev.content);
+}
+
+// History detail: fold each user turn into ONE assistant host (Worked card) with
+// interleaved thinking / tool / narration nodes — same contract as claudeDetail.
+// Source of truth is chat_history.jsonl (reasoning + assistant.tool_calls + tool_result).
+async function grokDetail(sessionId, limit, before) {
+  const match = grokSessionFiles().find((s) => s.id === sessionId);
+  if (!match) return null;
+  const messages = [];
+  let topic = null;
+  let idx = 0;
+  try {
+    if (fs.existsSync(match.summaryFile)) {
+      const raw = JSON.parse(fs.readFileSync(match.summaryFile, "utf8"));
+      topic = raw.generated_title || raw.session_summary || null;
+    }
+  } catch (_) {}
+
+  let turnItems = [];
+  let turnReasoning = "";
+  let turnThinking = { had: false, tokens: 0, durationMs: 0 };
+  let turnStartTs = null;
+  let turnEndTs = null;
+  let lastStopReason = null;
+  const actionDetailByUid = new Map();
+  const resultByUid = new Map();
+  let pending = newRuntimeAccumulator();
+
+  const flushTurn = (interrupted) => {
+    const host = foldTurnIntoHost(
+      messages,
+      turnItems,
+      actionDetailByUid,
+      resultByUid,
+      turnReasoning,
+      null,
+      turnThinking,
+      interrupted
+    );
+    if (host && pending.order.length) {
+      sealHistoryRuntime("grok", host, pending, turnDurationMs(turnStartTs, turnEndTs));
+    }
+    pending = newRuntimeAccumulator();
+    turnItems = [];
+    turnReasoning = "";
+    turnThinking = { had: false, tokens: 0, durationMs: 0 };
+    turnStartTs = null;
+    turnEndTs = null;
+  };
+
+  await readJsonl(match.file, (ev) => {
+    if (!ev || typeof ev !== "object") return;
+    const type = String(ev.type || "").toLowerCase();
+
+    if (type === "system") return;
+
+    if (type === "user") {
+      const body = cleanMessageText(grokHistoryContentText(ev.content));
+      const queryMatch = body.match(/<user_query>\s*([\s\S]*?)\s*<\/user_query>/i);
+      const text = (queryMatch ? queryMatch[1] : body).trim();
+      if (!grokIsRealUserPrompt(ev, text)) return;
+      flushTurn(false);
+      turnStartTs = ev.timestamp || ev.ts || null;
+      if (!topic) {
+        const clean = cleanTopicCandidate(text);
+        if (clean) topic = clean;
+      }
+      messages.push({
+        role: "user",
+        text: clipText(text, 4000),
+        ts: ev.timestamp || ev.ts || null,
+        uid: ev.id || ev.uuid || `grok-user-${idx++}`,
+      });
+      return;
+    }
+
+    if (type === "reasoning") {
+      const think = cleanMessageText(grokReasoningSummaryText(ev)).trim();
+      if (!think) {
+        // Encrypted CoT only — still surface a Thinking node (presence, not text).
+        turnThinking.had = true;
+        turnItems.push({
+          type: "think",
+          text: "",
+          uid: ev.id || `grok-think-${idx++}`,
+          ts: ev.timestamp || ev.ts || null,
+          tokens: 0,
+        });
+        return;
+      }
+      turnThinking.had = true;
+      const tokens = Math.max(1, Math.round(think.length / 4));
+      turnThinking.tokens += tokens;
+      turnItems.push({
+        type: "think",
+        text: think,
+        uid: ev.id || `grok-think-${idx++}`,
+        ts: ev.timestamp || ev.ts || null,
+        tokens,
+      });
+      // Keep aggregate reasoning text for the host meta path (encrypted blob).
+      turnReasoning = turnReasoning ? turnReasoning + "\n" + think : think;
+      return;
+    }
+
+    if (type === "tool_result") {
+      const id = ev.tool_call_id || ev.toolCallId || ev.id;
+      if (!id) return;
+      resultByUid.set(id, {
+        output: clipText(toolResultText(ev.content), MAX_ACTION_OUTPUT),
+        isError: !!(ev.is_error || ev.isError),
+      });
+      return;
+    }
+
+    if (type === "assistant") {
+      const ts = ev.timestamp || ev.ts || null;
+      if (ts) turnEndTs = ts;
+      lastStopReason = typeof ev.stop_reason === "string" ? ev.stop_reason : lastStopReason;
+
+      const text = cleanMessageText(grokHistoryContentText(ev.content)).trim();
+      if (text) {
+        turnItems.push({
+          type: "text",
+          text,
+          uid: ev.id || ev.uuid || `grok-asst-${idx++}`,
+          ts,
+        });
+      }
+
+      const toolCalls = Array.isArray(ev.tool_calls) ? ev.tool_calls : [];
+      for (const tc of toolCalls) {
+        if (!tc || typeof tc !== "object") continue;
+        const id = tc.id || `grok-tool-${idx++}`;
+        let args = tc.arguments != null ? tc.arguments : tc.input;
+        if (typeof args === "string") {
+          try {
+            args = JSON.parse(args);
+          } catch {
+            args = {};
+          }
+        }
+        const det = grokActionDetail(tc.name || tc.function?.name || "tool", args || {});
+        actionDetailByUid.set(id, det);
+        turnItems.push({ type: "tool", uid: id, ts });
+        // Seal file edits into the runtime/diff card when possible.
+        if (det.kind === "edit" || det.kind === "write") {
+          try {
+            collectClaudeEdits(pending, [
+              {
+                type: det.kind === "write" ? "tool_use" : "tool_use",
+                name: det.kind === "write" ? "Write" : "Edit",
+                id,
+                input: {
+                  file_path: det.path || det.name,
+                  old_string: args && args.old_string,
+                  new_string: args && args.new_string,
+                  content: args && args.content,
+                },
+              },
+            ]);
+          } catch (_) {}
+        }
+      }
+    }
+  });
+
+  flushTurn(false);
+
+  // Optional before-cursor windowing (same contract as Claude/Codex).
+  const cap = Math.max(1, Number(limit) || HISTORY_MSG_LIMIT);
+  let start = 0;
+  let end = messages.length;
+  if (before) {
+    const bi = messages.findIndex((m) => String(m.uid || "") === String(before));
+    if (bi > 0) end = bi;
+  }
+  start = Math.max(0, end - cap);
+  const window = messages.slice(start, end);
+  return {
+    id: sessionId,
+    provider: "grok",
+    topic: topic || "Grok session",
+    project: match.project,
+    projectName: path.basename(match.project || "") || "Computer",
+    cwd: match.project,
+    messages: window,
+    lastStopReason: lastStopReason || "end_turn",
+    truncated: start > 0 || end < messages.length,
+    hasMoreBefore: start > 0,
+    nextBefore: window.length ? String(window[0].uid || "") : null,
+    windowStart: start,
+    windowEnd: end,
+    totalMessages: messages.length,
+  };
 }
 
 // ── Live transcript tail (directly-run sessions) ─────────────────────
@@ -4793,7 +5528,10 @@ const historyWatchers = new Map(); // chatId -> watcher record
 function sessionFilePath(provider, sessionId) {
   if (!sessionId) return null;
   const p = String(provider || "").trim().toLowerCase();
-  const files = p === "codex" ? codexSessionFiles() : claudeSessionFiles();
+  const files =
+    p === "codex" ? codexSessionFiles()
+    : p === "grok" ? grokSessionFiles()
+    : claudeSessionFiles();
   const match = files.find((s) => s.id === sessionId || (p === "codex" && s.name && s.name.includes(sessionId)));
   return match ? match.file : null;
 }

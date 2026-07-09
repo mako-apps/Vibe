@@ -438,7 +438,7 @@ final class ChatEngine {
   // keyed by the FIRST streamId seen for it — never a second, duplicate row. Survives
   // socket resets by design; only cleared when the task reaches a terminal status.
   private var liveStreamTaskRowIdByChatId: [String: [String: String]] = [:]
-  // Latest agent-bridge history payload (Claude/Codex local session logs) per
+  // Latest agent-bridge history payload (Claude/Codex/Grok local session logs) per
   // chat, keyed chatId -> payload. The Claude/Codex profile requests it and
   // observes `didChangeNotification` with reason "agentBridgeHistory".
   private var agentBridgeHistoryByChat: [String: [String: Any]] = [:]
@@ -2231,7 +2231,7 @@ final class ChatEngine {
     }
   }
 
-  /// Open a Claude/Codex past session into the DEFAULT chat as bubbles: request
+  /// Open a Claude/Codex/Grok past session into the DEFAULT chat as bubbles: request
   /// the session transcript over the bridge and, when it arrives, synthesize it
   /// into chat rows (user prompt -> right bubble, agent reply -> agent cell) via
   /// the normal incoming-message path. Replaces the old in-profile transcript.
@@ -2274,7 +2274,7 @@ final class ChatEngine {
     return result
   }
 
-  /// Load whatever session is CURRENTLY live for this chat — used when a Claude/Codex DM
+  /// Load whatever session is CURRENTLY live for this chat — used when a Claude/Codex/Grok DM
   /// opens mid-run. The phone doesn't know the running session's id yet (it only learns
   /// it from stream frames that can be minutes apart while the agent works a long tool
   /// phase), so the request names only the chat; the bridge resolves it to the running

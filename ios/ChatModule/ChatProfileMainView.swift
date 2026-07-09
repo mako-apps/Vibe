@@ -1715,7 +1715,7 @@ private struct ChatProfileSwiftUIRootView: View {
               }
             } label: {
               ChatProfileSwiftUIRow(
-                title: "\(agentProvider.lowercased() == "claude" ? "Claude" : "Codex") model",
+                title: "\(AgentBridgeProfile.displayName(for: agentProvider)) model",
                 subtitle: groupModelSubtitle(agentProvider),
                 trailingSystemImage: nil,
                 showsChevron: true,
@@ -1888,6 +1888,7 @@ private struct ChatProfileSwiftUIRootView: View {
     switch bridgeProvider.lowercased() {
     case "claude": return "Claude"
     case "codex": return "Codex"
+    case "grok": return "Grok"
     default: return bridgeProvider.capitalized
     }
   }
