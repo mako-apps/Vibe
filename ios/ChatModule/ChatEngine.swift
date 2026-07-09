@@ -2247,6 +2247,23 @@ final class ChatEngine {
     guard !chatId.isEmpty, !provider.isEmpty, !sessionId.isEmpty else {
       return ["accepted": false, "reason": "invalid_session"]
     }
+    // Same session already mounted and ingested — don't re-fetch (history sheet
+    // re-taps and open-path races were reloading 019f45b0 repeatedly).
+    let already: [String: Any]? = syncOnQueue {
+      if let live = liveBridgeSessionIngestByChatId[chatId],
+        live.sessionId == sessionId,
+        lastIngestedBridgeSessionSigByChatId[chatId] != nil
+      {
+        NSLog(
+          "[ChatEngine][BridgeMount] loadSession SKIP same session chat=%@ session=%@",
+          String(chatId.suffix(12)), String(sessionId.prefix(12))
+        )
+        return ["accepted": true, "reason": "already_loaded"]
+      }
+      return nil
+    }
+    if let already { return already }
+
     let requestId = UUID().uuidString
     let result = requestAgentBridgeHistory([
       "chatId": chatId,
@@ -2433,10 +2450,25 @@ final class ChatEngine {
     guard let client = phoenixClient, nativeJoinedChatIds.contains(chatId),
       (state["connected"] as? Bool) == true
     else { return }
-    // Throttle re-arm: chat_joined + openChat + stream frame can stack 5–10 detail
-    // requests for the same session in under a second → setRows thrash / layout jump.
     let now = Int64(nowMs())
     let lastArm = lastBridgeRearmAtMsByChatId[chatId] ?? 0
+    // Soft triggers (open / join / already_live) must not re-download an already
+    // ingested transcript — each detail re-push was remounting the Grok feed.
+    // Only force_recover / socket recovery re-pull when content may have changed.
+    let softTriggers: Set<String> = [
+      "current_session_load", "chat_joined", "open", "poll", "already_live",
+    ]
+    let soft = softTriggers.contains(trigger) || trigger.hasPrefix("poll#")
+    if soft, trigger != "force_recover" {
+      if lastIngestedBridgeSessionSigByChatId[chatId] != nil, !live.sessionId.isEmpty {
+        NSLog(
+          "[ChatEngine][BridgeMount] rearm SKIP soft chat=%@ trigger=%@ session=%@ (already ingested)",
+          String(chatId.suffix(12)), trigger, String(live.sessionId.prefix(12))
+        )
+        return
+      }
+    }
+    // Hard throttle for any remaining path (reconnect recovery still allowed after 1.2s).
     if now - lastArm < 1200, trigger != "force_recover" {
       NSLog(
         "[ChatEngine][BridgeMount] rearm SKIPPED chat=%@ trigger=%@ ageMs=%lld (coalesce)",
