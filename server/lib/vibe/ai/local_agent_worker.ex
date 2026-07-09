@@ -2225,13 +2225,13 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   defp grok_put_compacting_node(st, status, event) when is_map(event) do
     id = normalize_string(event["id"]) || "grok-compacting-#{st.seg}"
-    before = event["tokens_before"] || event["tokensBefore"]
-    after = event["tokens_after"] || event["tokensAfter"]
+    tokens_before = event["tokens_before"] || event["tokensBefore"]
+    tokens_after = event["tokens_after"] || event["tokensAfter"]
 
     label =
       cond do
-        status == "done" and is_integer(before) and is_integer(after) ->
-          "Compacted context · #{before} → #{after} tokens"
+        status == "done" and is_integer(tokens_before) and is_integer(tokens_after) ->
+          "Compacted context · #{tokens_before} → #{tokens_after} tokens"
 
         status == "done" ->
           "Compacted conversation"
