@@ -1,10 +1,16 @@
 defmodule SetAgentProfiles do
   @claude_image "/Users/mohammadshayani/Vibe/claude_full_orange_bg_4k.png"
   @gpt_image "/Users/mohammadshayani/Vibe/gbp.png"
+  @grok_image "/Users/mohammadshayani/Vibe/grok_profile.png"
 
   def run do
     upload_and_set("claude", @claude_image, "agent-profiles/claude.png")
     upload_and_set("codex", @gpt_image, "agent-profiles/codex.png")
+    upload_and_set("grok", @grok_image, "agent-profiles/grok.png")
+  end
+
+  def run_grok_only do
+    upload_and_set("grok", @grok_image, "agent-profiles/grok.png")
   end
 
   defp upload_and_set(username, local_path, remote_path) do

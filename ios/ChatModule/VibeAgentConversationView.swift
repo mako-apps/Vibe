@@ -971,6 +971,12 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     composerView.onAttach = { [weak self] in
       self?.presentImageAttachmentPicker()
     }
+    composerView.onCamera = { [weak self] in
+      self?.presentCameraPicker()
+    }
+    composerView.onFile = { [weak self] in
+      self?.presentFilePicker()
+    }
     composerView.onOpenToolsSheet = { [weak self] vc in
       self?.present(vc, animated: true)
     }
@@ -2178,6 +2184,22 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     present(picker, animated: true)
   }
 
+  private func presentCameraPicker() {
+    guard UIImagePickerController.isSourceTypeAvailable(.camera) else { return }
+    let picker = UIImagePickerController()
+    picker.sourceType = .camera
+    picker.mediaTypes = ["public.image"]
+    picker.delegate = self
+    present(picker, animated: true)
+  }
+
+  private func presentFilePicker() {
+    let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.item])
+    picker.delegate = self
+    picker.allowsMultipleSelection = false
+    present(picker, animated: true)
+  }
+
   func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
     picker.dismiss(animated: true)
     for result in results {
@@ -2767,6 +2789,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     switch (agentBridgeProvider ?? "").lowercased() {
     case "claude": return "Claude"
     case "codex": return "Codex"
+    case "grok": return "Grok"
     default: return "your agent"
     }
   }
@@ -2835,6 +2858,18 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
         emptyStateTitle.text = "What should we build?"
       }
       emptyStateSubtitle.text = "Pick a repo, describe the change, and Codex will work from your computer."
+    case "grok":
+      let grokBlue = UIColor(red: 0.45, green: 0.70, blue: 0.95, alpha: 1.0)
+      let img = VibeAgentKitChatVectorIcon.image(.claudeAgent, color: grokBlue, size: 48)
+      emptyStateIcon.image = img
+      emptyStateIcon.isHidden = false
+      emptyStateSubtitle.isHidden = false
+      if let repoName, !repoName.isEmpty {
+        emptyStateTitle.text = "What should we build on \(repoName)?"
+      } else {
+        emptyStateTitle.text = "What should we build?"
+      }
+      emptyStateSubtitle.text = "Pick a repo, describe the change, and Grok will work from your computer."
     default:
       emptyStateIcon.isHidden = true
       emptyStateSubtitle.isHidden = false
@@ -4090,12 +4125,20 @@ final class VibeAgentTranscriptSkeletonView: UIView {
   private var pillIsUser: [Bool] = []
   private var appearance: VibeAgentKitChatAppearance = .fallback
   private var userBubbleGradient: [UIColor]?
+  private var agentBubbleColor: UIColor?
 
   /// Extra bottom clearance (floating composer / keyboard inset) so the lowest
   /// placeholder row sits where the newest real message would. Hosts set this from the
   /// list's own bottom content inset.
   var contentBottomInset: CGFloat = 20.0 {
     didSet { if oldValue != contentBottomInset { setNeedsLayout() } }
+  }
+
+  /// Top clearance (header band). Rows stop here instead of running under a transparent
+  /// navigation header to the very top of the screen; the topmost row is trimmed to the
+  /// line like real content scrolled under the header.
+  var contentTopInset: CGFloat = 0.0 {
+    didSet { if oldValue != contentTopInset { setNeedsLayout() } }
   }
 
   override init(frame: CGRect) {
@@ -4107,9 +4150,14 @@ final class VibeAgentTranscriptSkeletonView: UIView {
 
   required init?(coder: NSCoder) { return nil }
 
-  func applyAppearance(_ appearance: VibeAgentKitChatAppearance, userBubbleGradient: [UIColor]? = nil) {
+  func applyAppearance(
+    _ appearance: VibeAgentKitChatAppearance,
+    userBubbleGradient: [UIColor]? = nil,
+    agentBubbleColor: UIColor? = nil
+  ) {
     self.appearance = appearance
     self.userBubbleGradient = userBubbleGradient
+    self.agentBubbleColor = agentBubbleColor
     restylePills()
     setNeedsLayout()
   }
@@ -4135,16 +4183,24 @@ final class VibeAgentTranscriptSkeletonView: UIView {
     let sideInset = messageHorizontalInset + bubbleSideMargin
     let contentWidth = max(1.0, bounds.width - sideInset * 2.0)
 
-    // Walk the cycle bottom-up from just above the composer inset until the frames
-    // spill past the top edge — full coverage on any screen height.
+    // Walk the cycle bottom-up from just above the composer inset until the header
+    // band (`contentTopInset`) — full coverage of the visible feed on any screen
+    // height. The topmost row is trimmed to the header line so nothing pokes out
+    // under a transparent navigation header at the very top of the screen.
     var frames: [(frame: CGRect, isUser: Bool)] = []
     var bottomY = bounds.height - contentBottomInset
     var index = 0
-    while bottomY > 0.0 {
+    while bottomY > contentTopInset + 8.0 {
       let spec = cycle[index % cycle.count]
       let width = (contentWidth * spec.widthMultiplier).rounded()
       let x = spec.isUser ? bounds.width - sideInset - width : sideInset
-      let frame = CGRect(x: x, y: bottomY - spec.height, width: width, height: spec.height)
+      var frame = CGRect(x: x, y: bottomY - spec.height, width: width, height: spec.height)
+      if frame.minY < contentTopInset {
+        let trimmed = frame.maxY - contentTopInset
+        guard trimmed >= 24.0 else { break }
+        frame.origin.y = contentTopInset
+        frame.size.height = trimmed
+      }
       frames.append((frame, spec.isUser))
       bottomY = frame.minY - rowSpacing
       index += 1
@@ -4171,12 +4227,22 @@ final class VibeAgentTranscriptSkeletonView: UIView {
   }
 
   private func restylePills() {
-    // Solid enough to read as bubbles at a glance (the old 0.06 text-tint fills looked
-    // like nothing was there); the shimmer band rides on top of these.
-    let agentBase = appearance.text.withAlphaComponent(appearance.isDark ? 0.12 : 0.09)
-    let agentHighlight = appearance.text.withAlphaComponent(appearance.isDark ? 0.20 : 0.15)
+    // When the host hands us its REAL incoming-bubble color, use it solid so the
+    // placeholders read as the actual cells of the list (not translucent tint shapes);
+    // the shimmer stays a very soft, low-alpha band drifting on top. Hosts that don't
+    // pass one (the full-page agent view, whose replies have no bubble) keep the
+    // text-tint fallback.
+    let agentBase =
+      agentBubbleColor
+      ?? appearance.text.withAlphaComponent(appearance.isDark ? 0.12 : 0.09)
+    let agentHighlight =
+      agentBubbleColor != nil
+      ? (appearance.isDark
+        ? UIColor.white.withAlphaComponent(0.08)
+        : UIColor.black.withAlphaComponent(0.05))
+      : appearance.text.withAlphaComponent(appearance.isDark ? 0.20 : 0.15)
     let userBase = appearance.userBubbleBackground
-    let userHighlight = UIColor.white.withAlphaComponent(appearance.isDark ? 0.16 : 0.22)
+    let userHighlight = UIColor.white.withAlphaComponent(appearance.isDark ? 0.12 : 0.16)
     for (idx, pill) in pills.enumerated() {
       guard idx < pillIsUser.count else { break }
       if pillIsUser[idx] {
@@ -4331,6 +4397,8 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
   /// image picker and stages the result via `addAttachment(blob:)`. The composer can't
   /// present, so it delegates up.
   var onAttach: (() -> Void)?
+  var onCamera: (() -> Void)?
+  var onFile: (() -> Void)?
   /// Tapped "+" (or selected Permission from the tools sheet) — the composer built the
   /// sheet's content but can't present it itself, so it hands the finished
   /// `UIViewController` up for the host to `present(_:animated:)`.
@@ -4557,6 +4625,66 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
   /// /plan, the header permission picker, or the tools sheet's Permission row.
   private func refreshModePill() {
     updateSlashAccent()
+    updatePlusButtonMenu()
+  }
+
+  private func updatePlusButtonMenu() {
+    let cameraAction = UIAction(title: "Camera", image: UIImage(systemName: "camera")) { [weak self] _ in
+      self?.onCamera?()
+    }
+    let photoAction = UIAction(title: "Photos", image: UIImage(systemName: "photo")) { [weak self] _ in
+      self?.onAttach?()
+    }
+    let fileAction = UIAction(title: "Files", image: UIImage(systemName: "paperclip")) { [weak self] _ in
+      self?.onFile?()
+    }
+
+    var menuChildren: [UIMenuElement] = [cameraAction, photoAction, fileAction]
+
+    // Repository choices
+    let repos = AgentPairingService.lastStatusSnapshot?.repositories ?? []
+    let selectedRepo = AgentBridgeSelectionStore.selectedRepository()
+    var repoChildren: [UIMenuElement] = repos.map { repo in
+      UIAction(
+        title: repo.name,
+        subtitle: repo.path,
+        image: UIImage(systemName: repo.isGitRepository ? "shippingbox" : "folder"),
+        state: (repo.id == selectedRepo?.id || repo.cwd == selectedRepo?.cwd) ? .on : .off
+      ) { [weak self] _ in
+        AgentBridgeSelectionStore.select(repo)
+        self?.updatePlusButtonMenu()
+      }
+    }
+    repoChildren.append(
+      UIAction(title: "Pick repository…", image: UIImage(systemName: "folder.badge.plus")) { _ in
+        NotificationCenter.default.post(name: NSNotification.Name("OpenAgentPanel"), object: nil)
+      })
+    let repoMenu = UIMenu(title: "Repository", children: repoChildren)
+    menuChildren.append(repoMenu)
+
+    // Permission choices
+    let currentMode = AgentBridgeSelectionStore.selectedWorkMode()
+    let permissionChildren = AgentBridgeWorkMode.allCases.map { mode in
+      UIAction(
+        title: mode.title,
+        subtitle: mode.subtitle,
+        image: UIImage(systemName: mode.icon),
+        state: mode == currentMode ? .on : .off
+      ) { [weak self] _ in
+        AgentBridgeSelectionStore.setWorkMode(mode)
+        self?.updatePlusButtonMenu()
+      }
+    }
+    let permissionMenu = UIMenu(
+      title: "Permission",
+      subtitle: currentMode.title,
+      image: UIImage(systemName: "hand.raised"),
+      children: permissionChildren)
+    menuChildren.append(permissionMenu)
+
+    let menu = UIMenu(title: "", children: menuChildren)
+    plusButton.menu = menu
+    plusButton.showsMenuAsPrimaryAction = true
   }
 
   /// Total height the host should give this view.
@@ -4643,10 +4771,10 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
     // the pill, expanded in the lower tool row. Keeping one view lets the position
     // animate instead of disappearing and reappearing.
     configureIconButton(plusButton, systemName: "plus")
-    plusButton.addTarget(self, action: #selector(handlePlusTap), for: .touchUpInside)
     plusButton.isHidden = false
     plusButton.alpha = 1
     pillContainer.addSubview(plusButton)
+    updatePlusButtonMenu()
 
     configureIconButton(slashButton, systemName: "slash.circle")
     slashButton.showsMenuAsPrimaryAction = true
@@ -6960,5 +7088,30 @@ extension VibeAgentAskSheetViewController: UITextFieldDelegate {
       skipCommandTapped()
     }
     return true
+  }
+}
+
+extension VibeAgentConversationViewController: UIImagePickerControllerDelegate, UINavigationControllerDelegate, UIDocumentPickerDelegate {
+  public func imagePickerController(
+    _ picker: UIImagePickerController,
+    didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]
+  ) {
+    picker.dismiss(animated: true)
+    if let image = info[.originalImage] as? UIImage,
+       let blob = Self.sealedImageBlob(from: image) {
+      self.composerView.addAttachment(blob: blob)
+    }
+  }
+
+  public func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
+    picker.dismiss(animated: true)
+  }
+
+  public func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+    guard let url = urls.first else { return }
+    if let data = try? Data(contentsOf: url), let image = UIImage(data: data),
+       let blob = Self.sealedImageBlob(from: image) {
+      self.composerView.addAttachment(blob: blob)
+    }
   }
 }

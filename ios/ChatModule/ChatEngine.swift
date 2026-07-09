@@ -476,6 +476,13 @@ final class ChatEngine {
   private var bridgeSessionPagingByChatId: [String: (
     provider: String, sessionId: String, nextBefore: String?, hasMoreBefore: Bool, loadingOlder: Bool
   )] = [:]
+  // The current session's human title ("topic") per chat — the same label the History
+  // panel shows for it. Seeded from a History pick's row and refreshed by every detail
+  // (re-)push (the bridge derives it from the transcript's ai-title / first user turn),
+  // so an IDE-mirrored or resumed session names itself too. The chat header shows it
+  // while the session is idle instead of the bare "Start session"; cleared with the
+  // live-tail registration on New Chat.
+  private var bridgeSessionTopicByChatId: [String: String] = [:]
   private var nativeRecordingStateByChatId: [String: Bool] = [:]
   private var pinnedMessagesByChatId: [String: [[String: Any]]] = [:]
   private var pinnedFetchInFlightChatIds = Set<String>()
@@ -2246,6 +2253,7 @@ final class ChatEngine {
       "limit": Self.bridgeSessionPageLimit,
     ])
     if (result["accepted"] as? Bool) == true {
+      let topicHint = normalizedString(payload["topic"]) ?? ""
       syncOnQueue {
         pendingBridgeSessionIngestByRequestId[requestId] = (chatId: chatId, provider: provider)
         // Stay subscribed: the bridge re-pushes this requestId as the transcript
@@ -2255,6 +2263,12 @@ final class ChatEngine {
           provider: provider, sessionId: sessionId, nextBefore: nil, hasMoreBefore: true,
           loadingOlder: false
         )
+        // A History pick already knows its row's title — seed it now so the header
+        // renames instantly; the detail reply re-asserts (or corrects) it on landing.
+        if !topicHint.isEmpty, bridgeSessionTopicByChatId[chatId] != topicHint {
+          bridgeSessionTopicByChatId[chatId] = topicHint
+          postChangeLocked(reason: "agentBridgeSessionTopic", userInfo: ["chatId": chatId])
+        }
       }
     }
     return result
@@ -2356,7 +2370,18 @@ final class ChatEngine {
       self.pendingBridgeSessionIngestByRequestId = self.pendingBridgeSessionIngestByRequestId.filter {
         $0.value.chatId != chatId
       }
+      if self.bridgeSessionTopicByChatId.removeValue(forKey: chatId) != nil {
+        self.postChangeLocked(reason: "agentBridgeSessionTopic", userInfo: ["chatId": chatId])
+      }
     }
+  }
+
+  /// The History-panel title of the session this chat is currently on (loaded, resumed,
+  /// or live-tailed), if known. The chat header shows it as the idle subtitle in place
+  /// of "Start session".
+  func agentBridgeSessionTopic(chatId rawChatId: String) -> String? {
+    guard let chatId = normalizedString(rawChatId), !chatId.isEmpty else { return nil }
+    return syncOnQueue { bridgeSessionTopicByChatId[chatId] }
   }
 
   /// The bridge history session this chat is currently live-tailing, if any. Retained
@@ -2509,6 +2534,16 @@ final class ChatEngine {
         hasMoreBefore: hasMoreBefore, loadingOlder: false
       )
     }
+    // The bridge names every detail payload with the session's History-panel title
+    // (ai-title / first user turn). Keep it per chat so the idle header can show which
+    // session this thread is on. Captured before the empty-window guard: a topic is
+    // meaningful even when no new messages rode along.
+    if let topic = normalizedString(session["topic"]), !topic.isEmpty,
+      bridgeSessionTopicByChatId[chatId] != topic
+    {
+      bridgeSessionTopicByChatId[chatId] = topic
+      postChangeLocked(reason: "agentBridgeSessionTopic", userInfo: ["chatId": chatId])
+    }
     let rawMessages = session["messages"] as? [[String: Any]] ?? []
     guard !rawMessages.isEmpty else { return }
 
@@ -2562,6 +2597,7 @@ final class ChatEngine {
       switch provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
       case "claude": return "Claude"
       case "codex": return "Codex"
+      case "grok": return "Grok"
       default: return provider.capitalized
       }
     }()
@@ -6765,20 +6801,24 @@ final class ChatEngine {
   /// a non-existent friend key, which silently drops the prompt into the chat.
   private static let claudeBridgeAgentUserId = "11111111-1111-1111-1111-111111111111"
   private static let codexBridgeAgentUserId = "22222222-2222-2222-2222-222222222222"
+  private static let grokBridgeAgentUserId = "33333333-3333-3333-3333-333333333333"
   private static let reservedBridgeAgentUserIds: Set<String> = [
     claudeBridgeAgentUserId,
     codexBridgeAgentUserId,
+    grokBridgeAgentUserId,
   ]
 
   private static let bridgeAgentProvidersByUserId: [String: String] = [
     claudeBridgeAgentUserId: "claude",
     codexBridgeAgentUserId: "codex",
+    grokBridgeAgentUserId: "grok",
   ]
 
   private static func bridgeAgentUserId(forProvider provider: String) -> String? {
     switch provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
     case "claude": return claudeBridgeAgentUserId
     case "codex": return codexBridgeAgentUserId
+    case "grok": return grokBridgeAgentUserId
     default: return nil
     }
   }
@@ -6790,6 +6830,8 @@ final class ChatEngine {
       return "claude"
     case "codex", Self.codexBridgeAgentUserId:
       return "codex"
+    case "grok", Self.grokBridgeAgentUserId:
+      return "grok"
     default:
       return nil
     }

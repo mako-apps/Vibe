@@ -9,14 +9,14 @@ enum AgentQRScannerStatusStyle: Equatable {
   case error
 }
 
-/// Drives the "connect your computer" flow shown inside a Claude/Codex chat while
+/// Drives the "connect your computer" flow shown inside a Claude/Codex/Grok chat while
 /// no paired computer is online. The desktop daemon shows a QR; the phone scans it
 /// and authorizes the pairing, then waits for the computer to come online.
 @MainActor
 final class AgentConnectModel: ObservableObject {
-  /// `"claude"` / `"codex"`.
+  /// `"claude"` / `"codex"` / `"grok"`.
   let provider: String
-  /// Display name shown in copy ("Claude" / "Codex").
+  /// Display name shown in copy ("Claude" / "Codex" / "Grok").
   let displayName: String
 
   @Published var status: AgentBridgeStatus = .disconnected

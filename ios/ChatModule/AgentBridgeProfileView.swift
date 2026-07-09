@@ -1,17 +1,17 @@
 import SwiftUI
 import UIKit
 
-// Profile surfaces for a Claude/Codex bridge agent:
+// Profile surfaces for a Claude/Codex/Grok bridge agent:
 //   * AgentBridgeConnectionSheet — which computer is connected, Disconnect, and
 //     Reconnect / Add connection (scan the QR the daemon prints).
-//   * AgentBridgeHistoryInlineView — the agent's OWN past Claude/Codex
+//   * AgentBridgeHistoryInlineView — the agent's OWN past Claude/Codex/Grok
 //     conversations (topic list), read from the connected computer via the
 //     bridge. Pushed into `ChatProfileMainView`'s NavigationStack so it
 //     morph-expands from the "Chat History" row. Tapping a topic pushes the
 //     dedicated agent runtime surface with the topic header and composer.
 //
 // The connection sheet is presented; the history is pushed (morph) from
-// `ChatProfileMainView` for Claude/Codex profiles.
+// `ChatProfileMainView` for Claude/Codex/Grok profiles.
 //
 // `AgentBridgeTranscriptView` below is retained as a standalone fallback
 // renderer but is no longer wired into the profile navigation.
@@ -21,6 +21,7 @@ enum AgentBridgeProfile {
     switch provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
     case "claude": return "Claude"
     case "codex": return "Codex"
+    case "grok": return "Grok"
     default: return provider.capitalized
     }
   }

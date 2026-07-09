@@ -16,12 +16,15 @@ defmodule Vibe.AI.LocalAgentWorker do
   @group_context_messages 12
 
   @agent_user_id Vibe.AI.GroupAgent.agent_user_id()
-  # Distinct agent user identities so @claude and @codex are separate, searchable
-  # users you can DM, each with their own avatar — instead of one shared bot user.
+  # Distinct agent user identities so @claude / @codex / @grok are separate,
+  # searchable users you can DM, each with their own avatar — instead of one
+  # shared bot user.
   @claude_agent_user_id "11111111-1111-1111-1111-111111111111"
   @codex_agent_user_id "22222222-2222-2222-2222-222222222222"
+  @grok_agent_user_id "33333333-3333-3333-3333-333333333333"
   @claude_avatar_data_url "https://media.vibegram.io/chat-media/agent-profiles/claude.png"
   @codex_avatar_data_url "https://media.vibegram.io/chat-media/agent-profiles/codex.png"
+  @grok_avatar_data_url "https://media.vibegram.io/chat-media/agent-profiles/grok.png"
   @default_timeout_ms 120_000
   @max_prompt_length 8_000
   @max_tool_events 16
@@ -33,7 +36,7 @@ defmodule Vibe.AI.LocalAgentWorker do
   @session_table :local_agent_worker_sessions
   @team_run_table :local_agent_worker_team_runs
   @default_cooldown_ms 8_000
-  @worker_order ["claude", "codex"]
+  @worker_order ["claude", "codex", "grok"]
 
   @workers %{
     "codex" => %{
@@ -56,6 +59,17 @@ defmodule Vibe.AI.LocalAgentWorker do
       username: "claude",
       name: "Claude",
       avatar_url: @claude_avatar_data_url,
+      tier: "gold"
+    },
+    "grok" => %{
+      handle: "grok",
+      label: "Grok",
+      command_env: "VIBE_GROK_COMMAND",
+      default_command: "grok",
+      agent_user_id: @grok_agent_user_id,
+      username: "grok",
+      name: "Grok",
+      avatar_url: @grok_avatar_data_url,
       tier: "gold"
     }
   }
@@ -113,7 +127,7 @@ defmodule Vibe.AI.LocalAgentWorker do
   def resolve_from_message(_), do: nil
 
   def extract_reserved_mention(text) when is_binary(text) do
-    case Regex.run(~r/(?:^|\s)@(codex|claude)\b/i, text) do
+    case Regex.run(~r/(?:^|\s)@(codex|claude|grok)\b/i, text) do
       [_, handle] -> resolve_handle(handle)
       _ -> nil
     end
@@ -122,7 +136,7 @@ defmodule Vibe.AI.LocalAgentWorker do
   def extract_reserved_mention(_), do: nil
 
   def extract_reserved_mentions(text) when is_binary(text) do
-    ~r/(?:^|\s)@(codex|claude)\b/i
+    ~r/(?:^|\s)@(codex|claude|grok)\b/i
     |> Regex.scan(text)
     |> Enum.map(fn
       [_, handle] -> resolve_handle(handle)
@@ -857,6 +871,7 @@ defmodule Vibe.AI.LocalAgentWorker do
       case worker.handle do
         "claude" -> "CLAUDE.md"
         "codex" -> "CODEX.md"
+        "grok" -> "AGENTS.md"
         _ -> nil
       end
 
@@ -981,7 +996,7 @@ defmodule Vibe.AI.LocalAgentWorker do
   # scrubber never mangles our context labels, and labels stay clean.
   defp clean_for_memory(text) when is_binary(text) do
     text
-    |> String.replace(~r/(^|\s)@(claude|codex|team)\b/iu, "\\1")
+    |> String.replace(~r/(^|\s)@(claude|codex|grok|team)\b/iu, "\\1")
     |> String.replace(~r/(^|\s)\/team\b/iu, "\\1")
     |> String.replace(~r/^\s*team\s*:\s*/iu, "")
     |> String.trim()
@@ -995,7 +1010,7 @@ defmodule Vibe.AI.LocalAgentWorker do
     |> Enum.map(& &1.label)
     |> Enum.reject(&(is_nil(&1) or &1 == ""))
     |> case do
-      [] -> "Claude, Codex"
+      [] -> "Claude, Codex, Grok"
       names -> Enum.join(names, ", ")
     end
   end
@@ -1006,7 +1021,7 @@ defmodule Vibe.AI.LocalAgentWorker do
     |> Enum.map(&"@#{&1.handle}")
     |> Enum.reject(&(&1 == "@"))
     |> case do
-      [] -> "@claude, @codex"
+      [] -> "@claude, @codex, @grok"
       handles -> Enum.join(handles, ", ")
     end
   end
@@ -1192,6 +1207,10 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   defp live_progress_nodes(%{handle: "codex"}, extracted) do
     interleaved_codex_progress_nodes(extracted.decoded, extracted.tool_events, "")
+  end
+
+  defp live_progress_nodes(%{handle: "grok"}, extracted) do
+    interleaved_grok_progress_nodes(extracted.decoded, "")
   end
 
   defp live_progress_nodes(_worker, extracted), do: extracted.progress_nodes
@@ -1390,6 +1409,48 @@ defmodule Vibe.AI.LocalAgentWorker do
     run_command(worker, executable, args, opts)
   end
 
+  # Grok Build TUI headless: `grok -p <prompt> --output-format streaming-json`
+  # emits NDJSON thought/text/end lines (see docs/agent-payload-shapes.md).
+  defp do_run(%{handle: "grok"} = worker, executable, prompt, opts) do
+    bridge_options = Keyword.get(opts, :bridge_metadata) || %{}
+
+    permission_mode =
+      System.get_env("VIBE_GROK_PERMISSION_MODE")
+      |> normalize_string()
+      |> case do
+        value
+        when value in ["default", "acceptEdits", "auto", "dontAsk", "bypassPermissions", "plan"] ->
+          value
+
+        _ ->
+          "default"
+      end
+
+    output_format =
+      System.get_env("VIBE_GROK_OUTPUT_FORMAT")
+      |> normalize_string()
+      |> case do
+        value when value in ["json", "streaming-json", "plain"] -> value
+        _ -> "streaming-json"
+      end
+
+    args =
+      [
+        "-p",
+        prompt,
+        "--output-format",
+        output_format,
+        "--permission-mode",
+        permission_mode
+      ] ++
+        grok_effort_args(bridge_options) ++
+        grok_session_args(bridge_options) ++
+        maybe_model_args(bridge_options, "VIBE_GROK_MODEL", "--model") ++
+        maybe_grok_always_approve_args(permission_mode)
+
+    run_command(worker, executable, args, opts)
+  end
+
   # Fresh by default: mobile Claude/Codex chats are scratch sessions unless the user
   # explicitly opens a History session, which carries `agentBridgeResumeSessionId`.
   defp claude_session_args(bridge_options) do
@@ -1398,6 +1459,25 @@ defmodule Vibe.AI.LocalAgentWorker do
       _ -> []
     end
   end
+
+  defp grok_session_args(bridge_options) do
+    case explicit_resume_session_id(bridge_options) do
+      session_id when is_binary(session_id) -> ["--resume", session_id]
+      _ -> []
+    end
+  end
+
+  defp grok_effort_args(options) do
+    case normalize_reasoning_effort(option_value(options, "reasoningEffort"), :grok) do
+      nil -> []
+      effort -> ["--reasoning-effort", effort]
+    end
+  end
+
+  defp maybe_grok_always_approve_args(mode) when mode in ["bypassPermissions", "auto"],
+    do: ["--always-approve"]
+
+  defp maybe_grok_always_approve_args(_), do: []
 
   defp run_command(worker, executable, args, opts) do
     start = System.monotonic_time(:millisecond)
@@ -1639,7 +1719,7 @@ defmodule Vibe.AI.LocalAgentWorker do
     cleaned =
       prompt
       |> to_string()
-      |> String.replace(~r/(?:^|\s)@(codex|claude)\b/i, " ")
+      |> String.replace(~r/(?:^|\s)@(codex|claude|grok)\b/i, " ")
       |> String.trim()
 
     cond do
@@ -1723,6 +1803,8 @@ defmodule Vibe.AI.LocalAgentWorker do
       {:claude, value} when value in ["extra_high", "max"] -> "xhigh"
       {:codex, value} when value in ["low", "medium", "high"] -> value
       {:codex, value} when value in ["xhigh", "extra_high", "max"] -> "high"
+      {:grok, value} when value in ["low", "medium", "high"] -> value
+      {:grok, value} when value in ["xhigh", "extra_high", "max"] -> "high"
       _ -> nil
     end
   end
@@ -1793,8 +1875,103 @@ defmodule Vibe.AI.LocalAgentWorker do
     |> Enum.take(@max_tool_events)
   end
 
+  defp build_progress_nodes(%{handle: "grok"}, decoded, _tool_events, summary_text) do
+    interleaved_grok_progress_nodes(decoded, summary_text)
+  end
+
   defp build_progress_nodes(_worker, _decoded, tool_events, _summary_text) do
     progress_nodes_from_events(tool_events)
+  end
+
+  # Grok Build `--output-format streaming-json` emits NDJSON:
+  #   {"type":"thought","data":"..."}  reasoning chunks
+  #   {"type":"text","data":"..."}     answer chunks
+  #   {"type":"end","stopReason":...,"sessionId":...,"requestId":...}
+  # Final `--output-format json` is a single object with text/thought fields.
+  # Coalesce all thought chunks into one thinking node and all text into one
+  # text node (dropped when it equals the finished summary body).
+  defp interleaved_grok_progress_nodes(decoded, summary_text) do
+    summary_norm = summary_text |> to_string() |> String.trim()
+
+    settled =
+      Enum.any?(decoded, fn
+        %{"type" => "end"} -> true
+        _ -> false
+      end)
+
+    {thought, answer} =
+      Enum.reduce(decoded, {"", ""}, fn event, {thought_acc, text_acc} ->
+        cond do
+          not is_map(event) ->
+            {thought_acc, text_acc}
+
+          event["type"] == "thought" and is_binary(event["data"]) ->
+            {thought_acc <> event["data"], text_acc}
+
+          event["type"] == "text" and is_binary(event["data"]) ->
+            {thought_acc, text_acc <> event["data"]}
+
+          is_binary(event["thought"]) and event["type"] != "text" ->
+            {thought_acc <> event["thought"], text_acc}
+
+          is_binary(event["text"]) and event["type"] not in ["thought", "end"] ->
+            {thought_acc, text_acc <> event["text"]}
+
+          true ->
+            {thought_acc, text_acc}
+        end
+      end)
+
+    think_status = if settled, do: "done", else: "streaming"
+    text_status = if settled, do: "done", else: "streaming"
+    nodes = []
+
+    nodes =
+      case String.trim(thought) do
+        "" ->
+          nodes
+
+        body ->
+          tokens = max(1, div(String.length(body), 4))
+
+          nodes ++
+            [
+              %{
+                "id" => "grok-thinking",
+                "label" => "Thinking",
+                "status" => think_status,
+                "kind" => "thinking",
+                "depth" => 0,
+                "tokens" => tokens,
+                "detail" => clip_text_node(body)
+              }
+            ]
+      end
+
+    nodes =
+      case String.trim(answer) do
+        "" ->
+          nodes
+
+        body ->
+          if body == summary_norm do
+            nodes
+          else
+            nodes ++
+              [
+                %{
+                  "id" => "grok-text",
+                  "label" => clip_text_node(body),
+                  "status" => text_status,
+                  "kind" => "text",
+                  "depth" => 0,
+                  "detail" => clip_text_node(body)
+                }
+              ]
+          end
+      end
+
+    nodes
   end
 
   defp interleaved_codex_progress_nodes(decoded, tool_events, summary_text) do
@@ -1981,7 +2158,42 @@ defmodule Vibe.AI.LocalAgentWorker do
     extract_claude_text(decoded) || plain_output_text(decoded, output)
   end
 
+  defp extract_worker_text(%{handle: "grok"}, decoded, output) do
+    extract_grok_text(decoded) || plain_output_text(decoded, output)
+  end
+
   defp extract_worker_text(_worker, decoded, output), do: plain_output_text(decoded, output)
+
+  defp extract_grok_text(decoded) do
+    streaming =
+      decoded
+      |> Enum.filter(fn
+        %{"type" => "text", "data" => data} when is_binary(data) -> true
+        _ -> false
+      end)
+      |> Enum.map(& &1["data"])
+      |> Enum.join()
+      |> normalize_string()
+
+    streaming ||
+      decoded
+      |> Enum.reduce(nil, fn event, acc ->
+        cond do
+          not is_map(event) ->
+            acc
+
+          is_binary(event["text"]) and event["type"] not in ["thought", "end"] ->
+            event["text"]
+
+          is_binary(event["result"]) ->
+            event["result"]
+
+          true ->
+            acc
+        end
+      end)
+      |> normalize_string()
+  end
 
   defp plain_output_text([], output), do: normalize_string(output)
   defp plain_output_text(_decoded, _output), do: nil

@@ -10,7 +10,7 @@ private let chatGapDebugOverlayEnabled = false
 // MARK: - Delegate
 
 protocol ChatInputBarDelegate: AnyObject {
-  func inputBarDidSend(text: String)
+  func inputBarDidSend(text: String, attachments: [String])
   // Hold-menu Edit: composer submits new text/caption for an already-sent message.
   func inputBarDidSubmitEdit(messageId: String, text: String)
   func inputBarDidRequestStopStreaming()
@@ -799,6 +799,57 @@ final class ChatInputBar: UIView {
   // Attachment sheet
   private var attachmentSheet: ChatAttachmentMenuController?
 
+  // Staged image attachments for Claude/Codex
+  var provider: String? {
+    didSet {
+      updatePlusButtonMenu()
+    }
+  }
+  private var pendingImages: [UIImage] = []
+  private var pendingAttachmentBlobs: [String] = []
+
+  // Attachment Preview Scroll View (inside pill, above text row)
+  private let attachmentPreviewScroll = UIScrollView()
+  private let attachmentPreviewContainer = UIStackView()
+  private var attachmentPreviewVisible = false
+  private let attachmentPreviewContentH: CGFloat = 50
+  private let attachmentPreviewGap: CGFloat = 4
+
+  // Slash commands horizontal suggestion list (inside pill, above text row)
+  private let slashSuggestionScroll = UIScrollView()
+  private let slashSuggestionContainer = UIStackView()
+  private var slashSuggestionVisible = false
+  private let slashSuggestionContentH: CGFloat = 36
+  private let slashSuggestionGap: CGFloat = 4
+
+  struct SlashCommandInfo {
+    let name: String
+    let description: String
+  }
+  private static let defaultSlashCommands: [SlashCommandInfo] = [
+    .init(name: "/usage", description: "Subscription limits + this chat's tokens"),
+    .init(name: "/status", description: "Account, model, and remaining usage"),
+    .init(name: "/commands", description: "List every available command"),
+    .init(name: "/skills", description: "Skills, agents, MCP servers, and tools"),
+    .init(name: "/doctor", description: "Run the CLI health check"),
+    .init(name: "/compact", description: "Summarize this conversation to free context"),
+    .init(name: "/model", description: "Show or set the model for this chat"),
+    .init(name: "/plan", description: "Plan only — analyze without editing"),
+    .init(name: "/reasoning", description: "Thinking / speed for this chat"),
+    .init(name: "/code-review", description: "Review the diff for bugs and cleanups"),
+    .init(name: "/simplify", description: "Cleanup-only review; apply fixes"),
+    .init(name: "/security-review", description: "Scan changes for security issues"),
+    .init(name: "/review", description: "Review a GitHub pull request"),
+    .init(name: "/batch", description: "Split a large change into parallel units"),
+    .init(name: "/deep-research", description: "Web research into a cited report"),
+    .init(name: "/debug", description: "Troubleshoot via the debug log"),
+    .init(name: "/run", description: "Launch and drive your app"),
+    .init(name: "/verify", description: "Build, run, and observe a change"),
+    .init(name: "/loop", description: "Run a prompt repeatedly"),
+    .init(name: "/schedule", description: "Create or run a cloud routine"),
+    .init(name: "/goal", description: "Keep working until a goal is met")
+  ]
+
   // Background Mask (for fade-out blur behind input)
   private let backgroundMaskView = UIView()
   private let backgroundBlurView = UIVisualEffectView(effect: UIBlurEffect(style: .regular))
@@ -1121,7 +1172,6 @@ final class ChatInputBar: UIView {
       symbolConfig: plusCfg,
       tintColor: UIColor(white: 0.85, alpha: 1.0)
     )
-    attachButton.addTarget(self, action: #selector(attachTapped), for: .touchUpInside)
     contentRow.addSubview(attachGlass)
 
     // ── Pill container ────────────────────────────────────────────────────
@@ -1206,6 +1256,48 @@ final class ChatInputBar: UIView {
     replyDismissButton.tintColor = UIColor(white: 0.87, alpha: 0.5)
     replyDismissButton.addTarget(self, action: #selector(replyDismissTapped), for: .touchUpInside)
     replyBanner.addSubview(replyDismissButton)
+
+    // ── Attachment preview scroll view (inside pill, above text row) ──────
+    attachmentPreviewScroll.clipsToBounds = true
+    attachmentPreviewScroll.isHidden = true
+    attachmentPreviewScroll.alpha = 0
+    attachmentPreviewScroll.showsHorizontalScrollIndicator = false
+    pillContainer.addSubview(attachmentPreviewScroll)
+
+    attachmentPreviewContainer.axis = .horizontal
+    attachmentPreviewContainer.spacing = 8
+    attachmentPreviewContainer.alignment = .center
+    attachmentPreviewContainer.translatesAutoresizingMaskIntoConstraints = false
+    attachmentPreviewScroll.addSubview(attachmentPreviewContainer)
+
+    NSLayoutConstraint.activate([
+      attachmentPreviewContainer.topAnchor.constraint(equalTo: attachmentPreviewScroll.topAnchor),
+      attachmentPreviewContainer.bottomAnchor.constraint(equalTo: attachmentPreviewScroll.bottomAnchor),
+      attachmentPreviewContainer.leadingAnchor.constraint(equalTo: attachmentPreviewScroll.leadingAnchor, constant: 8),
+      attachmentPreviewContainer.trailingAnchor.constraint(equalTo: attachmentPreviewScroll.trailingAnchor, constant: -8),
+      attachmentPreviewContainer.heightAnchor.constraint(equalTo: attachmentPreviewScroll.heightAnchor)
+    ])
+
+    // ── Slash suggestion scroll view (inside pill, above text row) ────────
+    slashSuggestionScroll.clipsToBounds = true
+    slashSuggestionScroll.isHidden = true
+    slashSuggestionScroll.alpha = 0
+    slashSuggestionScroll.showsHorizontalScrollIndicator = false
+    pillContainer.addSubview(slashSuggestionScroll)
+
+    slashSuggestionContainer.axis = .horizontal
+    slashSuggestionContainer.spacing = 8
+    slashSuggestionContainer.alignment = .center
+    slashSuggestionContainer.translatesAutoresizingMaskIntoConstraints = false
+    slashSuggestionScroll.addSubview(slashSuggestionContainer)
+
+    NSLayoutConstraint.activate([
+      slashSuggestionContainer.topAnchor.constraint(equalTo: slashSuggestionScroll.topAnchor),
+      slashSuggestionContainer.bottomAnchor.constraint(equalTo: slashSuggestionScroll.bottomAnchor),
+      slashSuggestionContainer.leadingAnchor.constraint(equalTo: slashSuggestionScroll.leadingAnchor, constant: 8),
+      slashSuggestionContainer.trailingAnchor.constraint(equalTo: slashSuggestionScroll.trailingAnchor, constant: -8),
+      slashSuggestionContainer.heightAnchor.constraint(equalTo: slashSuggestionScroll.heightAnchor)
+    ])
 
     // ── Mention suggestion banner (INSIDE pill, above text row — like reply banner) ──
     mentionBanner.backgroundColor = .clear
@@ -1422,14 +1514,7 @@ final class ChatInputBar: UIView {
       symbolConfig: plusConfiguration,
       tintColor: controlTint
     )
-    applyControlGlyph(
-      button: slashButton,
-      symbolName: "slash.circle",
-      symbolConfig: UIImage.SymbolConfiguration(pointSize: 16, weight: .regular),
-      tintColor: controlTint
-    )
-    slashButton.menu = slashCommandMenu
-    slashButton.isHidden = !agentControlMode || slashCommandMenu == nil || isRecording
+    slashButton.isHidden = true
 
     if agentControlMode {
       // Repo switcher chip (📁 <repo> ⌄). When the host has supplied a menu (Repository
@@ -1485,6 +1570,7 @@ final class ChatInputBar: UIView {
       )
       attachButton.accessibilityLabel = "Add attachment"
     }
+    updatePlusButtonMenu()
   }
 
   // MARK: - Input State Reset
@@ -1862,9 +1948,10 @@ final class ChatInputBar: UIView {
     let dynamicHPad = accessoryHorizontalPadding()
 
     // Measure text height
-    let leftControlWidth: CGFloat = agentControlMode ? agentControlButtonWidth() : sideSize
-    let recordingLeftExpansion = (leftControlWidth + sideGap) * clampedRecordingExpand
-    let pillX = dynamicHPad + leftControlWidth + sideGap - recordingLeftExpansion
+    let leftControlWidth: CGFloat = sideSize
+    let leftSideGap: CGFloat = sideGap
+    let recordingLeftExpansion = (leftControlWidth + leftSideGap) * clampedRecordingExpand
+    let pillX = dynamicHPad + leftControlWidth + leftSideGap - recordingLeftExpansion
     let pillRight = w - dynamicHPad - (sideSize * micVisibility) - (sideGap * micVisibility)
     let sendW: CGFloat = 44
     let sendH: CGFloat = 32
@@ -1873,8 +1960,8 @@ final class ChatInputBar: UIView {
       isRecording ? 0 : max(24, gifButtonSize - (8 * clampedSendProgress))
     let pillW = max(1, pillRight - pillX)
     let sendActionReserve = (sendW + 2) * clampedSendProgress
-    let slashVisible = agentControlMode && slashCommandMenu != nil && !isRecording
-    let inlineAttachReserve: CGFloat = (agentControlMode ? 40.0 : 0.0) + (slashVisible ? 34.0 : 0.0)
+    let slashVisible = false
+    let inlineAttachReserve: CGFloat = 0.0
     let textW = max(
       1,
       pillW - textInsetH * 2 - inlineAttachReserve - sendActionReserve - gifTextReserve
@@ -1884,7 +1971,9 @@ final class ChatInputBar: UIView {
     let replyBannerExtra: CGFloat = replyBannerVisible ? (replyBannerContentH + replyBannerGap) : 0
     let mentionBannerExtra: CGFloat =
       mentionBannerVisible ? (mentionBannerContentH + mentionBannerGap) : 0
-    let bannerExtra: CGFloat = replyBannerExtra + mentionBannerExtra
+    let attachmentPreviewExtra: CGFloat = attachmentPreviewVisible ? (attachmentPreviewContentH + attachmentPreviewGap) : 0
+    let slashSuggestionExtra: CGFloat = slashSuggestionVisible ? (slashSuggestionContentH + slashSuggestionGap) : 0
+    let bannerExtra: CGFloat = replyBannerExtra + mentionBannerExtra + attachmentPreviewExtra + slashSuggestionExtra
     let pillH = clampedTextH + textInsetV * 2 + bannerExtra
 
     let composerBottomVPad = keyboardHeightForPanels > 0 || keyboardProgress > 0.01 ? 6.0 : bottomVPad
@@ -2008,6 +2097,20 @@ final class ChatInputBar: UIView {
       layoutReplyBannerContents()
     }
 
+    // ── Attachment preview layout (inside pill, below reply banner if present) ──
+    if attachmentPreviewVisible {
+      let attachmentPreviewY: CGFloat = 6 + mentionBannerExtra + replyBannerExtra
+      let bannerW = max(1, actualPillW - 16)
+      attachmentPreviewScroll.frame = CGRect(x: 8, y: attachmentPreviewY, width: bannerW, height: attachmentPreviewContentH)
+    }
+
+    // ── Slash suggestion layout (inside pill, below attachment preview if present) ──
+    if slashSuggestionVisible {
+      let slashSuggestionY: CGFloat = 6 + mentionBannerExtra + replyBannerExtra + attachmentPreviewExtra
+      let bannerW = max(1, actualPillW - 16)
+      slashSuggestionScroll.frame = CGRect(x: 8, y: slashSuggestionY, width: bannerW, height: slashSuggestionContentH)
+    }
+
     let tfX = textInsetH + inlineAttachReserve
     let tfW = max(
       1,
@@ -2023,15 +2126,9 @@ final class ChatInputBar: UIView {
       width: 36.0,
       height: 36.0
     )
-    inlineAttachButton.isHidden = !agentControlMode || isRecording
-    // Slash-command button sits just right of the inline "+" attach button.
-    slashButton.frame = CGRect(
-      x: 40.0,
-      y: inlineButtonY,
-      width: 34.0,
-      height: 36.0
-    )
-    slashButton.isHidden = !(agentControlMode && slashCommandMenu != nil && !isRecording)
+    inlineAttachButton.isHidden = true
+    // Slash-command button is removed in the new UI.
+    slashButton.isHidden = true
     let gifTrailingInsetCollapsed: CGFloat = textInsetH
     let gifTrailingInsetExpanded: CGFloat = 2
     let gifTrailingInset =
@@ -2247,7 +2344,7 @@ final class ChatInputBar: UIView {
 
   private func updateButtonStates(animated: Bool = false) {
     let has = !(textView.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    let showSend = has || isAgentStreaming
+    let showSend = has || !pendingAttachmentBlobs.isEmpty || isAgentStreaming
     let sendSymbol = isAgentStreaming ? "stop.fill" : "paperplane.fill"
     let sendPointSize: CGFloat = isAgentStreaming ? 11 : 13
     sendButton.setImage(
@@ -2707,7 +2804,7 @@ final class ChatInputBar: UIView {
     }
 
     let t = currentText
-    guard !t.isEmpty else { return }
+    guard !t.isEmpty || !pendingAttachmentBlobs.isEmpty else { return }
 
     if let editId = activeEditMessageId {
       setMentionBannerVisible(false, animated: false)
@@ -2745,7 +2842,12 @@ final class ChatInputBar: UIView {
 
     case .none:
       setMentionBannerVisible(false, animated: false)
-      delegate?.inputBarDidSend(text: t)
+      let attachments = pendingAttachmentBlobs
+      pendingImages.removeAll()
+      pendingAttachmentBlobs.removeAll()
+      updateAttachmentPreviewVisibility()
+      delegate?.inputBarDidSend(text: t, attachments: attachments)
+      clearText()
     }
   }
 
@@ -2880,7 +2982,7 @@ final class ChatInputBar: UIView {
 
   private func updateMentionBorderGlow(pillFrame: CGRect) {
     let textString = (textView.text ?? "").lowercased()
-    let hasMention = textString.contains("@vibe") || textString.contains("@vibeagent")
+    let hasMention = textString.contains("@vibe") || textString.contains("@vibeagent") || textString.hasPrefix("/")
     if hasMention != mentionActive {
       setMentionActive(hasMention)
     }
@@ -3927,9 +4029,17 @@ extension ChatInputBar: UITextViewDelegate {
     let textString = tv.text ?? ""
     delegate?.inputBarTextDidChange(text: textString)
 
-    setReadyBannerAction(resolveReadyBannerAction(in: textString), animated: true)
+    let isCloudOrCodex = provider?.lowercased().contains("claude") == true || provider?.lowercased().contains("codex") == true || provider?.lowercased().contains("grok") == true || agentControlMode
+    if isCloudOrCodex && textString.hasPrefix("/") {
+      populateSlashSuggestions(filter: textString)
+      setSlashSuggestionVisible(true, animated: true)
+      setReadyBannerAction(.none, animated: true)
+    } else {
+      setSlashSuggestionVisible(false, animated: true)
+      setReadyBannerAction(resolveReadyBannerAction(in: textString), animated: true)
+    }
 
-    // Highlight @vibe in real-time
+    // Highlight @vibe and slash commands in real-time
     if let textStorage = tv.textStorage as NSTextStorage? {
       let fullRange = NSRange(location: 0, length: textStorage.length)
       let selectedRange = tv.selectedRange
@@ -3940,11 +4050,19 @@ extension ChatInputBar: UITextViewDelegate {
       textStorage.addAttribute(.foregroundColor, value: appearance.textColorThem, range: fullRange)
       textStorage.addAttribute(.font, value: UIFont.systemFont(ofSize: 16), range: fullRange)
 
+      let highlightColor =
+        appearance.bubbleMeGradient.last
+        ?? ChatListAppearance.brandAccentFallback
+
       if let regex = try? NSRegularExpression(pattern: "@vibe", options: .caseInsensitive) {
         let matches = regex.matches(in: textString, options: [], range: fullRange)
-        let highlightColor =
-          appearance.bubbleMeGradient.last
-          ?? ChatListAppearance.brandAccentFallback
+        for match in matches {
+          textStorage.addAttribute(.foregroundColor, value: highlightColor, range: match.range)
+        }
+      }
+      
+      if let regex = try? NSRegularExpression(pattern: "^/[A-Za-z0-9-]+", options: []) {
+        let matches = regex.matches(in: textString, options: [], range: fullRange)
         for match in matches {
           textStorage.addAttribute(.foregroundColor, value: highlightColor, range: match.range)
         }
@@ -4213,5 +4331,295 @@ private final class CLLocationManagerWrapper: NSObject, CLLocationManagerDelegat
 
   func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
     callback = nil
+  }
+}
+
+// MARK: - ChatInputBar Pickers and Custom Menus Extension
+extension ChatInputBar: PHPickerViewControllerDelegate, UIImagePickerControllerDelegate, UINavigationControllerDelegate, UIDocumentPickerDelegate {
+  
+  private func updatePlusButtonMenu() {
+
+    let cameraAction = UIAction(title: "Camera", image: UIImage(systemName: "camera")) { [weak self] _ in
+      self?.openCamera()
+    }
+    let photoAction = UIAction(title: "Photos", image: UIImage(systemName: "photo")) { [weak self] _ in
+      self?.openPhotoLibrary()
+    }
+    let fileAction = UIAction(title: "Files", image: UIImage(systemName: "paperclip")) { [weak self] _ in
+      self?.openFilePicker()
+    }
+
+    let attachGroup = UIMenu(title: "", options: .displayInline, children: [cameraAction, photoAction, fileAction])
+    var menuChildren: [UIMenuElement] = [attachGroup]
+
+    if let agentMenu = agentControlMenu {
+      let agentGroup = UIMenu(title: "", options: .displayInline, children: agentMenu.children)
+      menuChildren.append(agentGroup)
+    }
+
+    let menu = UIMenu(title: "", children: menuChildren)
+    attachButton.menu = menu
+    attachButton.showsMenuAsPrimaryAction = true
+    inlineAttachButton.menu = nil
+    inlineAttachButton.showsMenuAsPrimaryAction = false
+  }
+
+  private func openCamera() {
+    guard let vc = findViewController() else { return }
+    guard UIImagePickerController.isSourceTypeAvailable(.camera) else { return }
+    let picker = UIImagePickerController()
+    picker.sourceType = .camera
+    picker.mediaTypes = ["public.image"]
+    picker.delegate = self
+    vc.present(picker, animated: true)
+  }
+
+  private func openPhotoLibrary() {
+    guard let vc = findViewController() else { return }
+    var config = PHPickerConfiguration(photoLibrary: .shared())
+    config.selectionLimit = 4
+    config.filter = .images
+    config.preferredAssetRepresentationMode = .current
+    let picker = PHPickerViewController(configuration: config)
+    picker.delegate = self
+    vc.present(picker, animated: true)
+  }
+
+  private func openFilePicker() {
+    guard let vc = findViewController() else { return }
+    let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.item])
+    picker.delegate = self
+    picker.allowsMultipleSelection = false
+    vc.present(picker, animated: true)
+  }
+
+  private func stageImage(_ image: UIImage) {
+    let scaled = ChatInputBar.scaledImage(image, maxDimension: 1024)
+    guard let data = scaled.jpegData(compressionQuality: 0.55) else { return }
+    let object: [String: Any] = [
+      "name": "image-\(Int(Date().timeIntervalSince1970 * 1000)).jpg",
+      "mime": "image/jpeg",
+      "dataB64": data.base64EncodedString(),
+    ]
+    guard let blob = AgentRuntimeCrypto.encrypt(object) else { return }
+    
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      self.pendingImages.append(image)
+      self.pendingAttachmentBlobs.append(blob)
+      self.updateAttachmentPreviewVisibility()
+      self.updateButtonStates(animated: true)
+    }
+  }
+
+  private static func scaledImage(_ image: UIImage, maxDimension: CGFloat) -> UIImage {
+    let longest = max(image.size.width, image.size.height)
+    guard longest > maxDimension, longest > 0 else { return image }
+    let scale = maxDimension / longest
+    let newSize = CGSize(width: image.size.width * scale, height: image.size.height * scale)
+    let renderer = UIGraphicsImageRenderer(size: newSize)
+    return renderer.image { _ in image.draw(in: CGRect(origin: .zero, size: newSize)) }
+  }
+
+  private func updateAttachmentPreviewVisibility() {
+    for subview in attachmentPreviewContainer.arrangedSubviews {
+      attachmentPreviewContainer.removeArrangedSubview(subview)
+      subview.removeFromSuperview()
+    }
+
+    attachmentPreviewVisible = !pendingImages.isEmpty
+    attachmentPreviewScroll.isHidden = !attachmentPreviewVisible
+    attachmentPreviewScroll.alpha = attachmentPreviewVisible ? 1.0 : 0.0
+
+    for (index, image) in pendingImages.enumerated() {
+      let container = UIView()
+      container.translatesAutoresizingMaskIntoConstraints = false
+      
+      let imgView = UIImageView(image: image)
+      imgView.contentMode = .scaleAspectFill
+      imgView.clipsToBounds = true
+      imgView.layer.cornerRadius = 8
+      imgView.translatesAutoresizingMaskIntoConstraints = false
+      container.addSubview(imgView)
+      
+      let closeBtn = UIButton(type: .custom)
+      let closeCfg = UIImage.SymbolConfiguration(pointSize: 12, weight: .bold)
+      closeBtn.setImage(UIImage(systemName: "xmark.circle.fill", withConfiguration: closeCfg), for: .normal)
+      closeBtn.tintColor = .systemGray
+      closeBtn.translatesAutoresizingMaskIntoConstraints = false
+      closeBtn.tag = index
+      closeBtn.addTarget(self, action: #selector(removeAttachmentTapped(_:)), for: .touchUpInside)
+      container.addSubview(closeBtn)
+      
+      NSLayoutConstraint.activate([
+        container.widthAnchor.constraint(equalToConstant: 44),
+        container.heightAnchor.constraint(equalToConstant: 44),
+        
+        imgView.topAnchor.constraint(equalTo: container.topAnchor, constant: 4),
+        imgView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        imgView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+        imgView.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -4),
+        
+        closeBtn.topAnchor.constraint(equalTo: container.topAnchor),
+        closeBtn.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+        closeBtn.widthAnchor.constraint(equalToConstant: 16),
+        closeBtn.heightAnchor.constraint(equalToConstant: 16)
+      ])
+      
+      attachmentPreviewContainer.addArrangedSubview(container)
+    }
+    
+    UIView.animate(withDuration: 0.25) {
+      self.setNeedsLayout()
+      self.layoutIfNeeded()
+      self.superview?.setNeedsLayout()
+      self.superview?.layoutIfNeeded()
+    }
+  }
+
+  @objc private func removeAttachmentTapped(_ sender: UIButton) {
+    let index = sender.tag
+    guard index < pendingImages.count else { return }
+    pendingImages.remove(at: index)
+    pendingAttachmentBlobs.remove(at: index)
+    updateAttachmentPreviewVisibility()
+    updateButtonStates(animated: true)
+  }
+
+  // MARK: - Slash Suggestions Helpers
+  private func populateSlashSuggestions(filter: String?) {
+    for subview in slashSuggestionContainer.arrangedSubviews {
+      slashSuggestionContainer.removeArrangedSubview(subview)
+      subview.removeFromSuperview()
+    }
+    
+    let commands = ChatInputBar.defaultSlashCommands
+    let filtered = filter == nil ? commands : commands.filter { $0.name.hasPrefix(filter!) }
+    
+    guard !filtered.isEmpty else {
+      setSlashSuggestionVisible(false, animated: true)
+      return
+    }
+    
+    for cmd in filtered {
+      let btn = UIButton(type: .system)
+      btn.setTitle(cmd.name, for: .normal)
+      btn.titleLabel?.font = .systemFont(ofSize: 13, weight: .semibold)
+      btn.setTitleColor(appearance.textColorThem.withAlphaComponent(0.9), for: .normal)
+      btn.backgroundColor = appearance.textColorThem.withAlphaComponent(0.08)
+      btn.layer.cornerRadius = 14
+      btn.contentEdgeInsets = UIEdgeInsets(top: 6, left: 12, bottom: 6, right: 12)
+      btn.addTarget(self, action: #selector(slashSuggestionTapped(_:)), for: .touchUpInside)
+      
+      btn.accessibilityLabel = "\(cmd.name): \(cmd.description)"
+      slashSuggestionContainer.addArrangedSubview(btn)
+    }
+  }
+
+  @objc private func slashSuggestionTapped(_ sender: UIButton) {
+    guard let title = sender.currentTitle else { return }
+    let text = textView.text ?? ""
+    
+    if let lastSlashRange = text.range(of: "/", options: .backwards) {
+      let beforeSlash = text[text.startIndex..<lastSlashRange.lowerBound]
+      textView.text = beforeSlash + title + " "
+    } else {
+      textView.text = title + " "
+    }
+    
+    setSlashSuggestionVisible(false, animated: true)
+    textViewDidChange(textView)
+    textView.becomeFirstResponder()
+  }
+
+  private func setSlashSuggestionVisible(_ visible: Bool, animated: Bool) {
+    guard slashSuggestionVisible != visible else { return }
+    slashSuggestionVisible = visible
+    
+    if visible {
+      slashSuggestionScroll.isHidden = false
+      slashSuggestionScroll.alpha = 0
+      
+      if animated {
+        UIView.animate(
+          withDuration: 0.28, delay: 0,
+          usingSpringWithDamping: 0.82, initialSpringVelocity: 0.5,
+          options: [.curveEaseOut, .allowUserInteraction, .beginFromCurrentState]
+        ) {
+          self.slashSuggestionScroll.alpha = 1
+          self.setNeedsLayout()
+          self.layoutIfNeeded()
+          self.superview?.setNeedsLayout()
+          self.superview?.layoutIfNeeded()
+        }
+      } else {
+        slashSuggestionScroll.alpha = 1
+        setNeedsLayout()
+        layoutIfNeeded()
+      }
+    } else {
+      if animated {
+        UIView.animate(
+          withDuration: 0.22, delay: 0, options: [.curveEaseIn, .beginFromCurrentState]
+        ) {
+          self.slashSuggestionScroll.alpha = 0
+          self.setNeedsLayout()
+          self.layoutIfNeeded()
+          self.superview?.setNeedsLayout()
+          self.superview?.layoutIfNeeded()
+        } completion: { _ in
+          if !self.slashSuggestionVisible {
+            self.slashSuggestionScroll.isHidden = true
+          }
+        }
+      } else {
+        slashSuggestionScroll.alpha = 0
+        slashSuggestionScroll.isHidden = true
+        setNeedsLayout()
+        layoutIfNeeded()
+      }
+    }
+  }
+
+  // MARK: - Picker delegates
+  public func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+    picker.dismiss(animated: true)
+    for result in results {
+      let provider = result.itemProvider
+      if provider.canLoadObject(ofClass: UIImage.self) {
+        provider.loadObject(ofClass: UIImage.self) { [weak self] object, _ in
+          guard let self, let image = object as? UIImage else { return }
+          self.stageImage(image)
+        }
+      }
+    }
+  }
+
+  public func imagePickerController(
+    _ picker: UIImagePickerController,
+    didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]
+  ) {
+    picker.dismiss(animated: true)
+    if let image = info[.originalImage] as? UIImage {
+      stageImage(image)
+    }
+  }
+
+  public func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
+    picker.dismiss(animated: true)
+  }
+
+  public func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+    guard let url = urls.first else { return }
+    let isCloudOrCodex = provider?.lowercased().contains("claude") == true || provider?.lowercased().contains("codex") == true || provider?.lowercased().contains("grok") == true || agentControlMode
+    if isCloudOrCodex {
+      if let data = try? Data(contentsOf: url), let image = UIImage(data: data) {
+        stageImage(image)
+      } else {
+        delegate?.inputBarDidSelectFile(uri: url.absoluteString, name: url.lastPathComponent)
+      }
+    } else {
+      delegate?.inputBarDidSelectFile(uri: url.absoluteString, name: url.lastPathComponent)
+    }
   }
 }

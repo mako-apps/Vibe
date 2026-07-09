@@ -10,8 +10,15 @@ final class ChatPinnedBannerView: UIControl {
   private let titleLabel = UILabel()
   private let bodyLabel = UILabel()
   private let textStack = UIStackView()
+  private let closeButton = UIButton(type: .system)
   private var isFilePinned = false
   private var iconAccentColor: UIColor?
+
+  /// When set, a trailing ✕ appears and taps on it call this instead of the banner's
+  /// own touch-up action (the button swallows its touches as a UIControl subview).
+  var onClose: (() -> Void)? {
+    didSet { closeButton.isHidden = onClose == nil }
+  }
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -67,6 +74,7 @@ final class ChatPinnedBannerView: UIControl {
     iconImageView.tintColor = iconColor.withAlphaComponent(0.95)
     titleLabel.textColor = textColor.withAlphaComponent(0.96)
     bodyLabel.textColor = textColor.withAlphaComponent(0.82)
+    closeButton.tintColor = textColor.withAlphaComponent(0.55)
   }
 
   func applyIconAccent(_ color: UIColor?) {
@@ -114,6 +122,14 @@ final class ChatPinnedBannerView: UIControl {
     textStack.spacing = 0.0
     textStack.addArrangedSubview(titleLabel)
     textStack.addArrangedSubview(bodyLabel)
+
+    closeButton.setImage(UIImage(systemName: "xmark"), for: .normal)
+    closeButton.setPreferredSymbolConfiguration(
+      UIImage.SymbolConfiguration(pointSize: 11, weight: .semibold), forImageIn: .normal)
+    closeButton.isHidden = true
+    closeButton.addAction(
+      UIAction { [weak self] _ in self?.onClose?() }, for: .touchUpInside)
+    blurView.contentView.addSubview(closeButton)
   }
 
   override func layoutSubviews() {
@@ -134,11 +150,19 @@ final class ChatPinnedBannerView: UIControl {
       return
     }
 
+    let closeSize: CGFloat = 32.0
+    closeButton.frame = CGRect(
+      x: bounds.width - closeSize - 6.0,
+      y: (bounds.height - closeSize) * 0.5,
+      width: closeSize,
+      height: closeSize
+    )
+    let trailingReserve: CGFloat = closeButton.isHidden ? 12.0 : closeSize + 8.0
     let textX = iconContainer.frame.maxX + 10.0
     textStack.frame = CGRect(
       x: textX,
       y: 6.0,
-      width: max(0.0, bounds.width - textX - 12.0),
+      width: max(0.0, bounds.width - textX - trailingReserve),
       height: max(0.0, bounds.height - 12.0)
     )
   }

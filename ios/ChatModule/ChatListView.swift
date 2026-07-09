@@ -862,7 +862,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let userId: String
     let name: String
     let avatarUrl: String?
-    let provider: String?  // "claude" / "codex" / nil for a human
+    let provider: String?  // "claude" / "codex" / "grok" / nil for a human
   }
 
   /// Per-run decoration decisions for a single cell (computed in the view, which knows
@@ -899,6 +899,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// messages render in its brand colour even before the directory loads.
   private static let claudeAgentUserId = "11111111-1111-1111-1111-111111111111"
   private static let codexAgentUserId = "22222222-2222-2222-2222-222222222222"
+  private static let grokAgentUserId = "33333333-3333-3333-3333-333333333333"
 
   func setGroupSenderDirectory(_ rawMembers: [[String: Any]]) {
     var next: [String: GroupSenderInfo] = [:]
@@ -1018,6 +1019,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     case "codex":
       // Codex reads as near-white (kept legible on the wallpaper via the label shadow).
       return UIColor(white: 0.96, alpha: 1.0)
+    case "grok":
+      // Grok / xAI near-black with slight blue lift.
+      return UIColor(red: 0.55, green: 0.72, blue: 0.95, alpha: 1.0)
     default:
       let base = ChatProfileAppearanceStore.avatarColors(
         title: name, peerUserId: key, chatId: engineChatId
@@ -1049,6 +1053,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       || hay.contains(where: { $0.contains("codex") })
     {
       return "codex"
+    }
+    if idLower == grokAgentUserId || idLower == "00000000-0000-0000-0000-0000000000c3"
+      || hay.contains(where: { $0.contains("grok") })
+    {
+      return "grok"
     }
     return nil
   }
@@ -1364,6 +1373,18 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     layoutGapDebugOverlay()
     layoutBridgeCommandOverlay()
     layoutBridgeUsageBanner()
+    // The transcript skeleton's clearances are snapshotted when it's shown; keyboard /
+    // composer / header changes after that would strand its rows mid-screen (the
+    // "placeholders glued to the top" read), so re-assert them every layout pass.
+    // Checked via the installed backgroundView so the lazy skeleton isn't instantiated
+    // on chats that never show it.
+    if let skeleton = collectionView.backgroundView as? VibeAgentTranscriptSkeletonView,
+      !skeleton.isHidden
+    {
+      skeleton.contentTopInset = contentPaddingTop
+      skeleton.contentBottomInset = max(
+        20.0, contentPaddingBottom + collectionView.contentInset.bottom + 8.0)
+    }
 
     let currentHeight = collectionView.bounds.height
     let currentWidth = collectionView.bounds.width
@@ -1817,6 +1838,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     } else {
       let created = ChatPinnedBannerView()
       created.addTarget(self, action: #selector(handleBridgeUsageBannerTapped), for: .touchUpInside)
+      created.onClose = { [weak self] in self?.handleBridgeUsageBannerTapped() }
       addSubview(created)
       bridgeUsageBanner = created
       banner = created
@@ -1879,13 +1901,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
   }
 
-  /// Position the usage banner in the reserved top/header band, matching the pinned
-  /// message banner instead of floating over the composer.
+  /// Float the usage banner as an absolute overlay pinned just below the header (and
+  /// below any pinned/inbox banners that reserve space in `contentPaddingTop`). It
+  /// deliberately reserves NO list inset of its own — it slides in over the feed and
+  /// out again without shifting a single row (the old reserved-band placement first
+  /// drew it behind the header, then pushed the whole list down when the inset landed).
   private func layoutBridgeUsageBanner() {
     guard let banner = bridgeUsageBanner, !banner.isHidden else { return }
     let width = max(0.0, bounds.width - 32.0)
     let height = ChatPinnedBannerView.preferredHeight
-    let topY = max(8.0, contentPaddingTop - height - 12.0)
+    let topY = contentPaddingTop + 4.0
     banner.frame = CGRect(x: 16.0, y: topY, width: width, height: height)
   }
 
@@ -6923,15 +6948,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       // The glass agent composer is only for the Claude/Codex bridge DMs. The default
       // "Vibe AI" agent (agentChatMode without a bridge provider) and every normal DM use
       // the standard ChatInputBar instead.
-      let bridgeProvider = currentBridgeProvider?.lowercased()
-      let useAgentComposer = bridgeProvider == "claude" || bridgeProvider == "codex"
+      let useAgentComposer = false
       if useAgentComposer {
         let bar = VibeComposerView()
         bar.placeholder = inputBarPlaceholder
         bar.applyAppearance(appearance.isDark ? VibeAgentKitChatAppearance.fallback : VibeAgentKitChatAppearance.lightFallback)
         bar.provider = currentBridgeProvider ?? "codex"
         bar.onSend = { [weak self] text, options in
-            self?.inputBarDidSend(text: text)
+            self?.inputBarDidSend(text: text, attachments: [])
         }
         bar.onAttach = { [weak self] in
             self?.inputBarDidTapAttachment()
@@ -6959,6 +6983,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       } else {
         let bar = ChatInputBar()
         bar.delegate = self
+        bar.provider = currentBridgeProvider
         bar.placeholder = inputBarPlaceholder
         bar.applyAppearance(appearance)
         bar.setAgentStreaming(agentStreaming)
@@ -7350,7 +7375,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       // resolves per worker at dispatch (see chat_channel.ex resolve_provider_model).
       var models: [String: String] = [:]
       var advisors: [String: String] = [:]
-      for agentProvider in ["claude", "codex"] {
+      for agentProvider in ["claude", "codex", "grok"] {
         let options = AgentBridgeSelectionStore.selectedRunOptions(provider: agentProvider)
         if let model = options.model {
           models[agentProvider] = model
@@ -7418,12 +7443,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let peer = enginePeerUserId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     if peer == "11111111-1111-1111-1111-111111111111" { return "claude" }
     if peer == "22222222-2222-2222-2222-222222222222" { return "codex" }
+    if peer == "33333333-3333-3333-3333-333333333333" { return "grok" }
 
     let mention =
       mentionedAgentUsername?
       .trimmingCharacters(in: .whitespacesAndNewlines)
       .lowercased()
-    if mention == "claude" || mention == "codex" {
+    if mention == "claude" || mention == "codex" || mention == "grok" {
       return mention
     }
 
@@ -7433,6 +7459,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if text.range(of: "(^|\\s)@codex\\b", options: [.regularExpression, .caseInsensitive]) != nil {
       return "codex"
     }
+    if text.range(of: "(^|\\s)@grok\\b", options: [.regularExpression, .caseInsensitive]) != nil {
+      return "grok"
+    }
     return nil
   }
 
@@ -7441,6 +7470,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let peer = enginePeerUserId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     if peer == "11111111-1111-1111-1111-111111111111" { return "claude" }
     if peer == "22222222-2222-2222-2222-222222222222" { return "codex" }
+    if peer == "33333333-3333-3333-3333-333333333333" { return "grok" }
     return nil
   }
 
@@ -7664,6 +7694,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       "chatId": chatId,
       "provider": provider,
       "sessionId": sessionId,
+      // Seed the header's session title from the picked row; the detail reply
+      // re-asserts it once the transcript lands.
+      "topic": session.topic,
     ])
     if (result["accepted"] as? Bool) != true {
       hideBridgeSessionLoadingSpinner()
@@ -7690,9 +7723,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // lowest placeholder hidden behind the composer.
     bridgeSessionSkeleton.contentBottomInset = max(
       20.0, contentPaddingBottom + collectionView.contentInset.bottom + 8.0)
+    bridgeSessionSkeleton.contentTopInset = contentPaddingTop
+    // Hand the skeleton the list's REAL bubble palette (them-bubble fill + user
+    // gradient) so the placeholders match the cells that will replace them.
     bridgeSessionSkeleton.applyAppearance(
       VibeAgentKitMap.appearance(for: self.traitCollection),
-      userBubbleGradient: appearance.bubbleMeGradient
+      userBubbleGradient: appearance.bubbleMeGradient,
+      agentBubbleColor: appearance.bubbleThemColor
     )
     bridgeSessionSkeleton.isHidden = false
     bridgeSessionSkeleton.alpha = 1.0
@@ -10436,8 +10473,8 @@ extension ChatListView: ChatInputBarDelegate {
     }
   }
 
-  func inputBarDidSend(text: String) {
-    handleNativeSend(text: text)
+  func inputBarDidSend(text: String, attachments: [String]) {
+    handleNativeSend(text: text, agentBridgeAttachmentsEnc: attachments)
   }
 
   func inputBarDidSubmitEdit(messageId: String, text: String) {
@@ -11164,6 +11201,7 @@ final class SenderRunAvatarView: UIView {
     switch provider {
     case "claude": return "https://media.vibegram.io/chat-media/agent-profiles/claude.png"
     case "codex": return "https://media.vibegram.io/chat-media/agent-profiles/codex.png"
+    case "grok": return "https://media.vibegram.io/chat-media/agent-profiles/grok.png"
     default: return nil
     }
   }
@@ -11256,6 +11294,7 @@ final class SenderRunAvatarView: UIView {
 
   private static func tileColor(for tint: UIColor, provider: String?) -> UIColor {
     if provider == "codex" { return UIColor(white: 0.32, alpha: 1.0) }
+    if provider == "grok" { return UIColor(red: 0.12, green: 0.14, blue: 0.18, alpha: 1.0) }
     var white: CGFloat = 0
     var alpha: CGFloat = 0
     if tint.getWhite(&white, alpha: &alpha), white > 0.82 {

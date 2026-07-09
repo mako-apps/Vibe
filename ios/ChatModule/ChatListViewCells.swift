@@ -1357,7 +1357,14 @@ func bubbleUsesAgentTurnContent(_ row: ChatListRow) -> Bool {
       || row.messageType == "agent_progress_tree"
       || !row.agentProgressNodes.isEmpty
       || row.agentRuntime != nil
-      || (row.agentActionsEnc?.isEmpty == false))
+      || (row.agentActionsEnc?.isEmpty == false)
+      // Session-ingested bridge rows (ids "bridge-<sessionId>-…") stay on this path
+      // even when a turn carried no runtime card / progress feed (a plain no-tool
+      // answer). Otherwise the LIVE version of the turn renders via the agent-turn
+      // layout and its settled replacement falls back to the default text bubble —
+      // a few points of measurement drift (meta reserve, body renderer) that showed
+      // up as the cell subtly shifting and re-padding seconds after it landed.
+      || (row.messageId ?? "").hasPrefix("bridge-"))
 }
 
 /// A Claude/Codex control/context event that must render as a centered, muted mid-chat

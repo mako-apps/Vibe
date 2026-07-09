@@ -348,6 +348,7 @@ function bridgeInstructionRelativeFiles(provider) {
   const files = [path.join(BRIDGE_INSTRUCTION_DIR, "AGENTS.md")];
   if (provider === "claude") files.push(path.join(BRIDGE_INSTRUCTION_DIR, "CLAUDE.md"));
   else if (provider === "codex") files.push(path.join(BRIDGE_INSTRUCTION_DIR, "CODEX.md"));
+  else if (provider === "grok") files.push(path.join(BRIDGE_INSTRUCTION_DIR, "AGENTS.md"));
   else {
     files.push(path.join(BRIDGE_INSTRUCTION_DIR, "CLAUDE.md"));
     files.push(path.join(BRIDGE_INSTRUCTION_DIR, "CODEX.md"));
@@ -422,7 +423,7 @@ function taskWantsBridgeInstructions(task, prompt) {
     if (Array.isArray(task.teamWorkers) && task.teamWorkers.length) return true;
     if (Array.isArray(task.teamWorker) && task.teamWorker.length) return true;
   }
-  return /(^|\s)@(codex|claude|team|vibe)\b/i.test(String(prompt || ""));
+  return /(^|\s)@(codex|claude|grok|team|vibe)\b/i.test(String(prompt || ""));
 }
 
 function taskPromptWithBridgeInstructions(provider, prompt, repo) {
@@ -785,7 +786,7 @@ const CODEX_DESKTOP_ONLY = new Set(CODEX_SLASH_INFO.filter((c) => c.kind === "de
 
 function stripReservedMention(prompt, provider) {
   return String(prompt || "")
-    .replace(/(^|\s)@(codex|claude)\b/ig, " ")
+    .replace(/(^|\s)@(codex|claude|grok)\b/ig, " ")
     .trim();
 }
 
@@ -909,6 +910,26 @@ function codexApprovalPolicy(task) {
   }
 }
 
+function grokPermissionMode(task) {
+  if (process.env.VIBE_GROK_PERMISSION_MODE) return process.env.VIBE_GROK_PERMISSION_MODE;
+  switch (workModeFor(task)) {
+    case "full_access":
+      return "bypassPermissions";
+    case "ask_auto":
+      return "auto";
+    case "allow_edits":
+      return "acceptEdits";
+    case "plan":
+      return "plan";
+    case "ask":
+      // No phone permission-prompt tool for Grok yet — default mode.
+      return "default";
+    default:
+      return "default";
+  }
+}
+
+
 const DEFAULT_CLAUDE_MOBILE_DISALLOWED_TOOLS = [
   "Bash(git push*)",
   "Bash(git checkout*)",
@@ -988,7 +1009,14 @@ function modelFor(provider, chatId, task) {
   if (requested && String(requested).trim()) return normalizeModel(provider, requested);
   const stored = modelBySession.get(sessionKey(provider, chatId));
   if (stored && String(stored).trim()) return normalizeModel(provider, stored);
-  const envModel = provider === "claude" ? process.env.VIBE_CLAUDE_MODEL : process.env.VIBE_CODEX_MODEL;
+  const envModel =
+    provider === "claude"
+      ? process.env.VIBE_CLAUDE_MODEL
+      : provider === "codex"
+        ? process.env.VIBE_CODEX_MODEL
+        : provider === "grok"
+          ? process.env.VIBE_GROK_MODEL
+          : null;
   return envModel && String(envModel).trim() ? normalizeModel(provider, envModel) : null;
 }
 
@@ -1132,6 +1160,22 @@ function buildCommand(provider, prompt, chatId, task) {
     if (resumeId) args.push(resumeId);
     args.push(cleaned);
     return { cmd: process.env.VIBE_CODEX_COMMAND || "codex", args };
+  }
+
+  if (provider === "grok") {
+    const mode = grokPermissionMode(task);
+    const effort = reasoningEffortFor(provider, task);
+    const resumeId = resumeIdFor(task);
+    // Headless: `grok -p <prompt> --output-format streaming-json`
+    // emits thought/text/end NDJSON (see docs/agent-payload-shapes.md).
+    const args = ["-p", cleaned, "--output-format", "streaming-json", "--permission-mode", mode];
+    if (effort) args.push("--reasoning-effort", effort);
+    if (resumeId) args.push("--resume", resumeId);
+    if (model) args.push("--model", model);
+    if (mode === "bypassPermissions" || mode === "auto" || workModeFor(task) === "full_access") {
+      args.push("--always-approve");
+    }
+    return { cmd: process.env.VIBE_GROK_COMMAND || "grok", args };
   }
   return null;
 }
@@ -1631,7 +1675,7 @@ function formatUsage(runtime) {
 function formatCommands(provider) {
   const caps = capabilitiesByProvider.get(provider) || {};
   const catalog = providerCommandCatalog(provider, caps);
-  const title = provider === "claude" ? "Claude" : provider === "codex" ? "Codex" : provider;
+  const title = provider === "claude" ? "Claude" : provider === "codex" ? "Codex" : provider === "grok" ? "Grok" : provider;
   const descOf = provider === "claude" ? CLAUDE_COMMAND_DESC : CODEX_COMMAND_DESC;
   const desktopOnly = provider === "claude" ? CLAUDE_DESKTOP_ONLY : CODEX_DESKTOP_ONLY;
   const slashLine = (cmd) => {
@@ -1664,7 +1708,7 @@ function formatCommands(provider) {
 
 function formatSkills(provider) {
   const caps = capabilitiesByProvider.get(provider) || {};
-  const title = provider === "claude" ? "Claude" : provider === "codex" ? "Codex" : provider;
+  const title = provider === "claude" ? "Claude" : provider === "codex" ? "Codex" : provider === "grok" ? "Grok" : provider;
   const sections = [];
   const addList = (label, values) => {
     const list = compactStringList(values || [], 80);
@@ -1841,7 +1885,7 @@ async function bridgeCommandOutput(provider, chatId, task, repo, command) {
   const currentModel = modelFor(provider, chatId, task);
   const currentAdvisor = advisorFor(provider, chatId, task);
   const lastRuntime = lastRuntimeBySession.get(key);
-  const providerTitle = provider === "claude" ? "Claude" : provider === "codex" ? "Codex" : provider;
+  const providerTitle = provider === "claude" ? "Claude" : provider === "codex" ? "Codex" : provider === "grok" ? "Grok" : provider;
   if (command.desktopOnly) {
     const desc = (provider === "claude" ? CLAUDE_COMMAND_DESC : CODEX_COMMAND_DESC)[command.name];
     return [
@@ -1930,7 +1974,14 @@ async function bridgeCommandOutput(provider, chatId, task, repo, command) {
       ].join("").trim();
     }
     case "doctor": {
-      const out = runCliCapture(provider === "codex" ? "codex" : "claude", ["doctor"], 25000);
+      const doctorCmd =
+        provider === "codex"
+          ? "codex"
+          : provider === "grok"
+            ? (process.env.VIBE_GROK_COMMAND || "grok")
+            : (process.env.VIBE_CLAUDE_COMMAND || "claude");
+      const doctorArgs = provider === "grok" ? ["--version"] : ["doctor"];
+      const out = runCliCapture(doctorCmd, doctorArgs, 25000);
       return out || `${providerTitle} doctor produced no output.`;
     }
     case "status": {
@@ -2258,6 +2309,11 @@ function bridgeStatusPayload() {
 	        approvalPolicy: process.env.VIBE_CODEX_APPROVAL_POLICY || "per-task",
 	        command: process.env.VIBE_CODEX_COMMAND || "codex",
 	      },
+      grok: {
+        permissionMode: process.env.VIBE_GROK_PERMISSION_MODE || "per-task",
+        command: process.env.VIBE_GROK_COMMAND || "grok",
+        model: process.env.VIBE_GROK_MODEL || "settings/default",
+      },
       workModes: ["ask", "ask_auto", "read_only", "allow_edits", "full_access"],
     },
   };
@@ -2553,7 +2609,10 @@ function serviceStatus() {
 function captureSessionId(line) {
   try {
     const ev = JSON.parse(line);
-    if (ev && typeof ev.session_id === "string") return ev.session_id;
+    if (!ev || typeof ev !== "object") return null;
+    if (typeof ev.session_id === "string") return ev.session_id;
+    // Grok streaming-json / json use camelCase sessionId on the end frame.
+    if (typeof ev.sessionId === "string") return ev.sessionId;
   } catch (_) {}
   return null;
 }
@@ -2590,7 +2649,9 @@ function streamable(line) {
   if (line.includes("stream_event")) return false;
   return (
     looksToolish(line) ||
-    line.includes('"text"') || // claude assistant text blocks
+    line.includes('"text"') || // claude assistant text blocks + grok type:text
+    line.includes('"thought"') || // grok reasoning chunks
+    line.includes('"type":"end"') || // grok turn complete
     line.includes('"assistant"') ||
     line.includes('"agent_message"') || // codex agent text
     line.includes('"item"') // codex item events
@@ -2694,9 +2755,9 @@ async function runTask(channel, task) {
   // which id — the key signal for "history send started a new chat" bugs.
   {
     const rid = resumeIdFor(task);
-    const resumeFlag = provider === "claude"
-      ? built.args.includes("--resume")
-      : built.args.includes("resume");
+    const resumeFlag = provider === "codex"
+      ? built.args.includes("resume")
+      : built.args.includes("--resume");
     console.log(
       `[vibe-bridge] resume ${provider} chat=${chatId} task=${taskId} ` +
         `resumeId=${rid || "(none/fresh)"} resumeInArgs=${resumeFlag}`
@@ -3859,10 +3920,20 @@ function actionListFromMaps(order, detailByUid, resultByUid) {
 }
 
 function liveAgentActionsField(provider, output) {
-  const actions = provider === "codex" ? liveCodexActions(output) : liveClaudeActions(output);
+  let actions = [];
+  if (provider === "codex") actions = liveCodexActions(output);
+  else if (provider === "claude") actions = liveClaudeActions(output);
+  else if (provider === "grok") actions = liveGrokActions(output);
   if (!actions.length) return {};
   const enc = encryptRuntimeBlob({ actions });
   return enc ? { agentActionsEnc: enc } : {};
+}
+
+// Grok headless streaming-json does not emit tool_use blocks yet — thinking/text
+// ride progressNodes on the server. Keep an empty action list so the field stays
+// consistent with Claude/Codex payloads.
+function liveGrokActions(_output) {
+  return [];
 }
 
 function liveClaudeActions(output) {
@@ -4688,11 +4759,23 @@ async function readHistory({ provider, mode, sessionId, limit, before }) {
   if (wantDetail) {
     const cap = limit || HISTORY_MSG_LIMIT;
     if (p === "codex") return { mode: "detail", session: await codexDetail(sessionId, cap, before) };
+    if (p === "grok") return { mode: "detail", session: await grokDetail(sessionId, cap, before) };
     return { mode: "detail", session: await claudeDetail(sessionId, cap, before) };
   }
   const cap = limit || HISTORY_LIST_LIMIT;
   if (p === "codex") return { mode: "list", sessions: await listCodex(cap) };
+  if (p === "grok") return { mode: "list", sessions: await listGrok(cap) };
   return { mode: "list", sessions: await listClaude(cap) };
+}
+
+// Grok session history (v1): list/detail stubs so the phone History panel does not
+// crash. Live runs still stream via run_task; full ~/.grok/sessions replay can land later.
+async function listGrok(_cap) {
+  return [];
+}
+
+async function grokDetail(_sessionId, _cap, _before) {
+  return null;
 }
 
 // ── Live transcript tail (directly-run sessions) ─────────────────────
@@ -4861,7 +4944,7 @@ function markMessageRunning(message) {
 
 function runningPlaceholderMessage(entry) {
   if (!entry || !entry.taskId) return null;
-  const providerTitle = entry.provider === "claude" ? "Claude" : entry.provider === "codex" ? "Codex" : "Agent";
+  const providerTitle = entry.provider === "claude" ? "Claude" : entry.provider === "codex" ? "Codex" : entry.provider === "grok" ? "Grok" : "Agent";
   const target = entry.repo && entry.repo.name ? entry.repo.name : "";
   return {
     role: "assistant",

@@ -1,14 +1,14 @@
 # @vibegram/agent-bridge
 
-Run `@claude` / `@codex` on **your own computer**, driven from the Vibe app.
+Run `@claude` / `@codex` / `@grok` / `@grok` / `@grok` on **your own computer**, driven from the Vibe app.
 
 The bridge dials *out* to the Vibe server (no inbound ports). When you mention
 `@claude` or `@codex` in Vibe, the task runs here, on your machine, using your own
-Claude/Codex subscription — and the result streams back into the chat.
+Claude/Codex/Grok subscription — and the result streams back into the chat.
 
 ## Use
 
-In the Vibe app, open **Claude** or **Codex**, tap **Connect**, and copy the
+In the Vibe app, open **Claude**, **Codex**, or **Grok**, tap **Connect**, and copy the
 command shown. On your computer:
 
 ```bash
@@ -37,6 +37,7 @@ Default mobile sends use **safe auto** execution:
 
 - `claude --permission-mode auto`
 - `codex --sandbox workspace-write -c approval_policy="never"`
+- `grok -p … --output-format streaming-json --permission-mode auto --always-approve`
 
 Escalate explicitly with env vars (only on machines you control):
 
@@ -45,12 +46,14 @@ Escalate explicitly with env vars (only on machines you control):
 | `VIBE_CLAUDE_PERMISSION_MODE` | per task | `plan`, `auto`, `acceptEdits`, `dontAsk`, or `bypassPermissions` |
 | `VIBE_CODEX_SANDBOX` | `read-only` | `workspace-write` / `danger-full-access` |
 | `VIBE_CODEX_APPROVAL_POLICY` | per task | `untrusted`, `on-request`, or `never` |
-| `VIBE_CLAUDE_MODEL`, `VIBE_CODEX_MODEL` | — | executor model override |
+| `VIBE_CLAUDE_MODEL`, `VIBE_CODEX_MODEL`, `VIBE_GROK_MODEL` | — | executor model override |
 | `VIBE_CLAUDE_ADVISOR`, `VIBE_CLAUDE_ADVISOR_MODEL` | `fable` for installed service | Claude advisor model override |
 | `VIBE_FABLE_MCP` | enabled | Exposes `mcp__vibeask__ask_fable` so Claude can explicitly ask Fable with mid-run context |
 | `VIBE_FABLE_MODEL` | `fable` | Model used by the explicit Fable MCP advisor tool |
 | `VIBE_FABLE_MCP_CONTEXT_CHARS` | `120000` | Max packaged context sent through the Fable MCP advisor tool |
-| `VIBE_CLAUDE_COMMAND`, `VIBE_CODEX_COMMAND` | `claude` / `codex` | binary path override |
+| `VIBE_CLAUDE_COMMAND`, `VIBE_CODEX_COMMAND`, `VIBE_GROK_COMMAND` | `claude` / `codex` / `grok` | binary path override |
+| `VIBE_GROK_MODEL` | — | Grok model override |
+| `VIBE_GROK_PERMISSION_MODE` | per task | Grok `--permission-mode` |
 
 Mobile work modes map to CLI safety settings:
 

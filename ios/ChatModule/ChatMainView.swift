@@ -237,6 +237,10 @@ public final class ChatMainView: UIView,
   private var hasPeerResponseInCurrentRows = false
   private var agentProgressSubtitle: String?
   private var agentAwaitingApproval = false
+  // The current bridge session's History-panel title, prefetched with the engine-state
+  // snapshot. Shown as the idle header subtitle so the user knows WHICH session this
+  // thread is on; nil (no session yet / New Chat) falls back to "Start session".
+  private var bridgeSessionTopic: String?
   private var defersEngineStateRefreshes = false
   private var pinnedBannerMessageId: String?
   private var pinnedBannerTitle: String?
@@ -1632,6 +1636,10 @@ public final class ChatMainView: UIView,
         !chatId.isEmpty && !isSavedMessagesChat && !bridgeProviderSnapshot.isEmpty
         ? engine.hasOutstandingAgentBridgeAsk(chatId: chatId, provider: bridgeProviderSnapshot)
         : false
+      let sessionTopic =
+        !chatId.isEmpty && !isSavedMessagesChat && !bridgeProviderSnapshot.isEmpty
+        ? engine.agentBridgeSessionTopic(chatId: chatId)
+        : nil
       let pinnedPayload: [String: Any]?
       let pinnedContent: ChatMainPinnedBannerContent?
       if isSavedMessagesChat {
@@ -1661,6 +1669,7 @@ public final class ChatMainView: UIView,
           groupTyping: groupTyping,
           agentPayload: agentPayload,
           hasOutstandingApproval: hasOutstandingApproval,
+          sessionTopic: sessionTopic,
           pinnedPayload: pinnedPayload,
           pinnedContent: pinnedContent,
           force: force,
@@ -1683,6 +1692,7 @@ public final class ChatMainView: UIView,
     groupTyping: [String],
     agentPayload: [String: Any]?,
     hasOutstandingApproval: Bool,
+    sessionTopic: String?,
     pinnedPayload: [String: Any]?,
     pinnedContent: ChatMainPinnedBannerContent?,
     force: Bool,
@@ -1729,6 +1739,11 @@ public final class ChatMainView: UIView,
 
     if force || hasOutstandingApproval != agentAwaitingApproval {
       agentAwaitingApproval = hasOutstandingApproval
+      shouldUpdateHeader = true
+    }
+
+    if force || sessionTopic != bridgeSessionTopic {
+      bridgeSessionTopic = sessionTopic
       shouldUpdateHeader = true
     }
 
@@ -3383,12 +3398,11 @@ public final class ChatMainView: UIView,
     let inboxBannerInset: CGFloat = inboxBannerVisible
       ? (ChatPinnedBannerView.preferredHeight + 12.0)
       : 0.0
-    let usageBannerVisible = chatListView.isBridgeUsageBannerVisible
-    let usageBannerInset: CGFloat = usageBannerVisible
-      ? (ChatPinnedBannerView.preferredHeight + 24.0)
-      : 0.0
+    // The usage banner intentionally contributes NO inset here: it floats over the feed
+    // below the header (see ChatListView.layoutBridgeUsageBanner), so showing/hiding it
+    // never shifts the list content.
     chatListView.setContentPaddingTop(
-      Double(externalHeaderInset + 8.0 + pinnedBannerInset + inboxBannerInset + usageBannerInset))
+      Double(externalHeaderInset + 8.0 + pinnedBannerInset + inboxBannerInset))
     pagesHost.frame = CGRect(
       x: 0.0,
       y: headerHeight,
@@ -3833,12 +3847,20 @@ public final class ChatMainView: UIView,
     let resolvedApproval =
       (!bridgeProvider.isEmpty && agentAwaitingApproval) ? "Waiting for approval" : nil
     let resolvedAgentProgress = resolvedAgentProgressSubtitle()
-    // Idle bridge chats get a constant "Start session" action instead of the old
-    // device-name subtitle. It doubles as the entry point into the same history sheet the
-    // live/approval states open on tap (see handleTitlePressed) — there's no separate
-    // "device connected" read anymore, the leading dot already carries that as a color.
+    // Idle bridge chats name the session this thread is on (the History panel's title
+    // for it) so the user knows where they are; only a truly fresh thread — no session
+    // loaded, resumed, or live-tailed — falls back to the "Start session" action. Both
+    // double as the entry point into the same history sheet the live/approval states
+    // open on tap (see handleTitlePressed) — there's no separate "device connected"
+    // read anymore, the leading dot already carries that as a color. While a run is
+    // active this branch never wins: the live agent-progress subtitle above it renders
+    // the working payload (Thinking / Reading …) as before.
+    let trimmedSessionTopic =
+      (bridgeSessionTopic ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     let bridgeIdleAction: String? =
-      (!bridgeProvider.isEmpty && headerMode != .savedMessages) ? "Start session" : nil
+      (!bridgeProvider.isEmpty && headerMode != .savedMessages)
+      ? (trimmedSessionTopic.isEmpty ? "Start session" : trimmedSessionTopic)
+      : nil
     let resolvedDirectTyping = resolvedDirectTypingSubtitle()
     let groupTypingSubtitle = resolvedGroupTypingSubtitle()
     let connectionSubtitle = defersEngineStateRefreshes ? nil : resolvedEngineConnectionSubtitle()
@@ -4222,6 +4244,7 @@ public final class ChatMainView: UIView,
           switch id {
           case "11111111-1111-1111-1111-111111111111": "claude"
           case "22222222-2222-2222-2222-222222222222": "codex"
+          case "33333333-3333-3333-3333-333333333333": "grok"
           default: nil
         }
         if let provider,

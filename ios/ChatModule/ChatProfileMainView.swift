@@ -1169,7 +1169,7 @@ private struct ChatProfileSwiftUIRootView: View {
   let groupMembers: [[String: Any]]
   let canManageGroupMembers: Bool
   let groupBridgeProvider: String?
-  /// All bridge agents in the group ("claude"/"codex") — one model row each.
+  /// All bridge agents in the group ("claude"/"codex"/"grok") — one model row each.
   var groupBridgeProviders: [String] = []
   let selectedRepositoryName: String?
   // Bridge (Claude/Codex paired-computer) state. `bridgeProvider` is empty for a
@@ -3814,7 +3814,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   private var engineMyUserId = ""
   private var enginePeerUserId = ""
   private var agentConfig: [String: Any]?
-  // Non-empty ("claude"/"codex") when this profile is a paired-computer bridge
+  // Non-empty ("claude"/"codex"/"grok") when this profile is a paired-computer bridge
   // agent. Drives the "Computer" connection card + the agent-history browser.
   private var bridgeProvider = ""
   private var bridgeConnected = false
@@ -4077,7 +4077,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     // explicit provider wasn't supplied by the host.
     if bridgeProvider.isEmpty {
       let handle = profileHandle.lowercased().replacingOccurrences(of: "@", with: "")
-      if handle == "claude" || handle == "codex" {
+      if handle == "claude" || handle == "codex" || handle == "grok" {
         setBridgeProvider(handle)
       }
     }
@@ -4091,7 +4091,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   /// agent's own conversation history from the connected computer.
   func setBridgeProvider(_ value: String) {
     let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    guard normalized == "claude" || normalized == "codex" else {
+    guard normalized == "claude" || normalized == "codex" || normalized == "grok" else {
       if !bridgeProvider.isEmpty {
         bridgeProvider = ""
         renderSwiftUIProfile()
@@ -5336,7 +5336,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     return role == "owner"
   }
 
-  /// Every bridge agent present in this group ("claude"/"codex"), for the per-agent
+  /// Every bridge agent present in this group ("claude"/"codex"/"grok"), for the per-agent
   /// settings rows. `groupBridgeProviderFromMembers()` stays the single-value variant
   /// used by rows that only need to know "this group has agents at all".
   private func groupBridgeProvidersFromMembers() -> [String] {
@@ -5368,12 +5368,20 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
         || values.contains("@claude")
       {
         if !providers.contains("claude") { providers.append("claude") }
-      } else if values.contains("22222222-2222-2222-2222-222222222222")
+      }
+      if values.contains("22222222-2222-2222-2222-222222222222")
         || values.contains("00000000-0000-0000-0000-0000000000c2")
         || values.contains("codex")
         || values.contains("@codex")
       {
         if !providers.contains("codex") { providers.append("codex") }
+      }
+      if values.contains("33333333-3333-3333-3333-333333333333")
+        || values.contains("00000000-0000-0000-0000-0000000000c3")
+        || values.contains("grok")
+        || values.contains("@grok")
+      {
+        if !providers.contains("grok") { providers.append("grok") }
       }
     }
     return providers
@@ -5415,6 +5423,14 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
         || values.contains("@codex")
       {
         return "codex"
+      }
+
+      if values.contains("33333333-3333-3333-3333-333333333333")
+        || values.contains("00000000-0000-0000-0000-0000000000c3")
+        || values.contains("grok")
+        || values.contains("@grok")
+      {
+        return "grok"
       }
     }
 

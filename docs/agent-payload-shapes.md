@@ -1,17 +1,19 @@
-# Claude & Codex agent payload shapes
+# Claude, Codex & Grok agent payload shapes
 
-Authoritative reference for the real wire shapes Claude Code and Codex emit, and
-how they flow through the bridge → server → iOS agent view. Captured from live
-session logs on 2026-06-25 (`~/.claude/projects/**/*.jsonl`,
-`~/.codex/sessions/**/rollout-*.jsonl`). Build and verify the parsing layer
-(bridge `vibe-bridge.js`, server `LocalAgentWorker`, iOS `ChatAgentMessagesView`)
-against this — do not guess node shapes.
+Authoritative reference for the real wire shapes Claude Code, Codex, and Grok
+Build emit, and how they flow through the bridge → server → iOS agent view.
+Claude/Codex shapes captured from live session logs on 2026-06-25
+(`~/.claude/projects/**/*.jsonl`, `~/.codex/sessions/**/rollout-*.jsonl`).
+Grok `streaming-json` captured 2026-07-09 against Grok Build **0.2.93**.
+Build and verify the parsing layer (bridge `vibe-bridge.js`, server
+`LocalAgentWorker`, iOS agent views) against this — do not guess node shapes.
 
 ## Pipeline
 
 ```
 claude -p --output-format stream-json --verbose   (one JSON object per line)
 codex exec --json                                  (one JSON object per line)
+grok -p <prompt> --output-format streaming-json    (one JSON object per line)
         │  raw stdout lines
         ▼
 vibe-bridge.js  ── progress {provider, chatId, line} ──▶ server
@@ -285,3 +287,60 @@ Alternative not taken: `claude --input-format stream-json` feeding tool_result
 over stdin (also enables `--permission-prompt-tool` for live per-tool `ask`
 approval) — kept in reserve for the future direct-LAN per-action approval phase.
 
+
+
+---
+
+## Grok (`streaming-json`)
+
+Headless command:
+
+```bash
+grok -p "<prompt>" --output-format streaming-json [--permission-mode <mode>] [--model <id>] [--resume <sessionId>]
+```
+
+Also available: `--output-format json` (single final object) and `plain`.
+
+### Live NDJSON lines
+
+| type | meaning | key fields |
+|---|---|---|
+| `thought` | reasoning token/chunk | `data` (string) |
+| `text` | assistant answer chunk | `data` (string) |
+| `end` | turn complete | `stopReason`, `sessionId`, `requestId` |
+
+Example:
+
+```json
+{"type":"thought","data":"The"}
+{"type":"text","data":"hi"}
+{"type":"end","stopReason":"EndTurn","sessionId":"…","requestId":"…"}
+```
+
+### Final JSON mode
+
+```json
+{
+  "text": "hi",
+  "stopReason": "EndTurn",
+  "sessionId": "…",
+  "requestId": "…",
+  "thought": "full thought string"
+}
+```
+
+### Server mapping (`LocalAgentWorker`)
+
+- All `thought` chunks → one `progressNodes` entry `{ kind: "thinking", tokens: len/4 }`
+- All `text` chunks → live text node; finished summary body is the joined text
+- `end.sessionId` captured by the bridge for optional `--resume`
+- Tool action encryption (`agentActionsEnc`) is empty for Grok in v1 (no tool blocks in this stream shape)
+
+### Agent identity
+
+| field | value |
+|---|---|
+| handle | `grok` |
+| mention | `@grok` |
+| agent user id | `33333333-3333-3333-3333-333333333333` |
+| avatar | `https://media.vibegram.io/chat-media/agent-profiles/grok.png` |

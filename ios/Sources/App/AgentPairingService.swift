@@ -550,6 +550,11 @@ enum AgentBridgeSelectionStore {
         ("Sonnet 5", "Balanced Claude model", "sonnet"),
         ("Opus 4.8", "Most capable Claude model", "opus"),
       ]
+    case "grok":
+      return [
+        ("Grok 4.5", "Default Grok Build model", "grok-4.5"),
+        ("Composer 2.5 Fast", "Faster Grok coding model", "grok-composer-2.5-fast"),
+      ]
     default:
       return [
         ("GPT-5.5", nil, "gpt-5.5"),
@@ -611,7 +616,11 @@ enum AgentBridgeSelectionStore {
   }
 
   private static func defaultRunModel(provider: String) -> String? {
-    provider.lowercased() == "claude" ? "sonnet" : nil
+    switch provider.lowercased() {
+    case "claude": return "sonnet"
+    case "grok": return "grok-4.5"
+    default: return nil
+    }
   }
 
   private static func defaultAdvisor(provider: String) -> String? {
@@ -637,6 +646,7 @@ enum AgentBridgeSelectionStore {
   /// like /usage are answered in the glass overlay; task commands run as agent turns).
   static func slashCommandGroups(provider: String) -> [SlashCommandGroup] {
     let isCodex = provider.lowercased().contains("codex")
+    let isGrok = provider.lowercased().contains("grok")
     let info: [SlashCommand] = [
       SlashCommand(name: "usage", subtitle: "Subscription limits + token usage"),
       SlashCommand(name: "status", subtitle: "Account, model, remaining usage"),
@@ -657,15 +667,20 @@ enum AgentBridgeSelectionStore {
       SlashCommand(name: "review", subtitle: "Review your working tree · desktop only"),
       SlashCommand(name: "init", subtitle: "Set up project memory · desktop only"),
     ]
+    // Grok headless does not parse Claude/Codex slash tasks — keep the palette light.
+    let grokTasks: [SlashCommand] = [
+      SlashCommand(name: "init", subtitle: "Set up project memory"),
+    ]
     let options: [SlashCommand] = [
       SlashCommand(name: "plan", subtitle: "Plan mode: research, don't edit"),
       SlashCommand(
         name: isCodex ? "fast" : "reasoning",
         subtitle: isCodex ? "Faster, lighter responses" : "Adjust thinking depth"),
     ]
+    let tasks = isCodex ? codexTasks : (isGrok ? grokTasks : claudeTasks)
     return [
       SlashCommandGroup(title: "Info", commands: info),
-      SlashCommandGroup(title: "Tasks", commands: isCodex ? codexTasks : claudeTasks),
+      SlashCommandGroup(title: "Tasks", commands: tasks),
       SlashCommandGroup(title: "Options", commands: options),
     ]
   }
@@ -675,6 +690,7 @@ enum AgentBridgeSelectionStore {
     switch provider.lowercased() {
     case "claude": return "Claude"
     case "codex": return "Codex"
+    case "grok": return "Grok"
     default: return provider.capitalized
     }
   }
@@ -707,6 +723,10 @@ enum AgentBridgeSelectionStore {
       if normalized.contains("haiku") { return "haiku" }
       if normalized.contains("sonnet") { return "sonnet" }
       if normalized.contains("opus") { return "opus" }
+      return model
+    case "grok":
+      if normalized.contains("composer") { return "grok-composer-2.5-fast" }
+      if normalized.contains("grok-4") || normalized == "grok" { return "grok-4.5" }
       return model
     default:
       switch normalized {

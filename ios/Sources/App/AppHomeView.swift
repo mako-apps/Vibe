@@ -360,7 +360,7 @@ struct ChatRoute: Identifiable, Hashable {
   /// Attached agent's event-inbox mode (`per_event` / `batched_summary`). Drives
   /// whether the chat view hides agent event notifications behind the Inbox banner.
   let agentEventInboxMode: String?
-  /// `"claude"` / `"codex"` when this chat talks to a computer-bridge agent. Drives
+  /// `"claude"` / `"codex"` / `"grok"` when this chat talks to a computer-bridge agent. Drives
   /// the connect-state gate in the chat view: when no paired computer is online the
   /// composer is hidden and a Connect panel is shown instead.
   let bridgeProvider: String?
@@ -373,6 +373,7 @@ struct ChatRoute: Identifiable, Hashable {
   /// Reserved shadow-user ids for the two computer-bridge agents (seeded server-side).
   static let claudeAgentUserId = "11111111-1111-1111-1111-111111111111"
   static let codexAgentUserId = "22222222-2222-2222-2222-222222222222"
+  static let grokAgentUserId = "33333333-3333-3333-3333-333333333333"
 
   /// Resolves the bridge provider for a chat. The reserved user ids are the strong
   /// signal; the name is only consulted for confirmed agent users so a human named
@@ -386,12 +387,15 @@ struct ChatRoute: Identifiable, Hashable {
     let pid = peerUserId?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     if pid == claudeAgentUserId { return "claude" }
     if pid == codexAgentUserId { return "codex" }
+    if pid == grokAgentUserId { return "grok" }
     let aid = agentId?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     switch aid {
     case "claude", claudeAgentUserId:
       return "claude"
     case "codex", codexAgentUserId:
       return "codex"
+    case "grok", grokAgentUserId:
+      return "grok"
     default:
       break
     }
@@ -399,6 +403,7 @@ struct ChatRoute: Identifiable, Hashable {
     switch name?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
     case "claude": return "claude"
     case "codex": return "codex"
+    case "grok": return "grok"
     default: return nil
     }
   }
@@ -408,6 +413,7 @@ struct ChatRoute: Identifiable, Hashable {
     switch provider.lowercased() {
     case "claude": return "Claude"
     case "codex": return "Codex"
+    case "grok": return "Grok"
     default: return provider.capitalized
     }
   }
@@ -1933,6 +1939,7 @@ private struct ChatHomeScreen: View {
     let agents = [
       (ChatRoute.claudeAgentUserId, "claude"),
       (ChatRoute.codexAgentUserId, "codex"),
+      (ChatRoute.grokAgentUserId, "grok"),
     ]
     return agents.compactMap { uid, uname in
       guard uname.hasPrefix(q) else { return nil }
@@ -8549,7 +8556,7 @@ struct ContactSearchUser: Identifiable, Hashable, Equatable {
     tier?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "gold"
   }
 
-  /// `"claude"` / `"codex"` when this search result is a computer-bridge agent.
+  /// `"claude"` / `"codex"` / `"grok"` when this search result is a computer-bridge agent.
   var bridgeProvider: String? {
     ChatRoute.resolveBridgeProvider(
       peerUserId: userID,
