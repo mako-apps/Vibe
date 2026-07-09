@@ -6563,7 +6563,10 @@ function mergeGrokLiveUpdatesIntoMessages(match, messages) {
 // down on disconnect. Re-pushes reuse the ORIGINAL requestId so the app's
 // existing ingest upserts in place — no server change needed.
 const MAX_HISTORY_WATCHERS = 8;
-const HISTORY_WATCH_DEBOUNCE_MS = 200; // coalesce rapid appends, then re-read
+// Coalesce rapid transcript/updates appends before re-read. Grok updates.jsonl
+// ticks very often during tools — 200ms caused full history re-pushes every
+// couple hundred ms and phone layout thrash. 450ms still feels live.
+const HISTORY_WATCH_DEBOUNCE_MS = 450;
 const historyWatchers = new Map(); // chatId -> watcher record
 
 function sessionFilePath(provider, sessionId) {

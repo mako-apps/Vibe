@@ -473,6 +473,8 @@ final class ChatEngine {
   // map above, this stays registered for the chat so every re-push upserts the
   // (now longer) transcript in place. Cleared when the chat channel closes.
   private var liveBridgeSessionIngestByChatId: [String: (provider: String, sessionId: String, requestId: String)] = [:]
+  /// Throttle rearmLiveBridgeSession so open/join/stream don't spam detail reloads.
+  private var lastBridgeRearmAtMsByChatId: [String: Int64] = [:]
   private var bridgeSessionPagingByChatId: [String: (
     provider: String, sessionId: String, nextBefore: String?, hasMoreBefore: Bool, loadingOlder: Bool
   )] = [:]
@@ -2403,14 +2405,27 @@ final class ChatEngine {
     guard let client = phoenixClient, nativeJoinedChatIds.contains(chatId),
       (state["connected"] as? Bool) == true
     else { return }
+    // Throttle re-arm: chat_joined + openChat + stream frame can stack 5–10 detail
+    // requests for the same session in under a second → setRows thrash / layout jump.
+    let now = Int64(nowMs())
+    let lastArm = lastBridgeRearmAtMsByChatId[chatId] ?? 0
+    if now - lastArm < 1200, trigger != "force_recover" {
+      NSLog(
+        "[ChatEngine][BridgeMount] rearm SKIPPED chat=%@ trigger=%@ ageMs=%lld (coalesce)",
+        String(chatId.suffix(12)), trigger, now - lastArm
+      )
+      return
+    }
+    lastBridgeRearmAtMsByChatId[chatId] = now
     let requestId = UUID().uuidString
     liveBridgeSessionIngestByChatId[chatId] = (
       provider: live.provider, sessionId: live.sessionId, requestId: requestId
     )
-    // Force a full re-apply when the history reply lands. Without this, a stuck
-    // "Thinking…" empty shell can match the last ingest signature and skip the
-    // merge (reopen-later-heals was the only recovery path).
-    lastIngestedBridgeSessionSigByChatId.removeValue(forKey: chatId)
+    // Keep lastIngestedBridgeSessionSig so an identical re-push is a no-op (avoids
+    // reloadData / layout jump). Only force_recover clears the sig for stuck shells.
+    if trigger == "force_recover" {
+      lastIngestedBridgeSessionSigByChatId.removeValue(forKey: chatId)
+    }
     pendingBridgeSessionIngestByRequestId[requestId] = (chatId: chatId, provider: live.provider)
     var wirePayload: [String: Any] = [
       "provider": live.provider,
@@ -2423,6 +2438,15 @@ final class ChatEngine {
       topic: chatTopic(for: chatId),
       event: "agent-bridge-history",
       payload: wirePayload
+    )
+    NSLog(
+      "[ChatEngine][BridgeMount] rearm chat=%@ provider=%@ session=%@ trigger=%@ transport=%@ phoenix=%@",
+      String(chatId.suffix(12)),
+      live.provider,
+      String(live.sessionId.prefix(12)),
+      trigger,
+      transportModeLocked(),
+      (state["connected"] as? Bool) == true ? "ws-up" : "ws-down"
     )
     appendJournalLocked(
       event: "rearm-live-bridge-session",
