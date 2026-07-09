@@ -480,6 +480,8 @@ final class ChatEngine {
   /// After bridge answers no_current_session, don't re-poll for a while (idle DMs were
   /// spamming the bridge every ~1.5s with no useful work).
   private var noCurrentSessionUntilMsByChatId: [String: Int64] = [:]
+  /// In-flight explicit history session load (by chat) — coalesces triple-fire picks.
+  private var sessionLoadInflightByChatId: [String: (sessionId: String, requestId: String, atMs: Int64)] = [:]
   private var bridgeSessionPagingByChatId: [String: (
     provider: String, sessionId: String, nextBefore: String?, hasMoreBefore: Bool, loadingOlder: Bool
   )] = [:]
@@ -2263,11 +2265,27 @@ final class ChatEngine {
         )
         return ["accepted": true, "reason": "already_loaded"]
       }
+      // Single-flight: history UI can fire pick + open + join for the same session
+      // before the first detail returns (3 concurrent details for 019f4644).
+      let now = Int64(nowMs())
+      if let inflight = sessionLoadInflightByChatId[chatId],
+        inflight.sessionId == sessionId,
+        now - inflight.atMs < 5000
+      {
+        NSLog(
+          "[ChatEngine][BridgeMount] loadSession SKIP inflight chat=%@ session=%@",
+          String(chatId.suffix(12)), String(sessionId.prefix(12))
+        )
+        return ["accepted": true, "reason": "inflight"]
+      }
       return nil
     }
     if let already { return already }
 
     let requestId = UUID().uuidString
+    syncOnQueue {
+      sessionLoadInflightByChatId[chatId] = (sessionId: sessionId, requestId: requestId, atMs: Int64(nowMs()))
+    }
     let result = requestAgentBridgeHistory([
       "chatId": chatId,
       "provider": provider,
@@ -2283,6 +2301,8 @@ final class ChatEngine {
         // Stay subscribed: the bridge re-pushes this requestId as the transcript
         // grows, and each re-push upserts new turns in place (live tail).
         liveBridgeSessionIngestByChatId[chatId] = (provider: provider, sessionId: sessionId, requestId: requestId)
+        // Switching sessions invalidates prior ingest sig so the new transcript applies.
+        lastIngestedBridgeSessionSigByChatId.removeValue(forKey: chatId)
         bridgeSessionPagingByChatId[chatId] = (
           provider: provider, sessionId: sessionId, nextBefore: nil, hasMoreBefore: true,
           loadingOlder: false
@@ -2292,6 +2312,12 @@ final class ChatEngine {
         if !topicHint.isEmpty, bridgeSessionTopicByChatId[chatId] != topicHint {
           bridgeSessionTopicByChatId[chatId] = topicHint
           postChangeLocked(reason: "agentBridgeSessionTopic", userInfo: ["chatId": chatId])
+        }
+      }
+    } else {
+      syncOnQueue {
+        if sessionLoadInflightByChatId[chatId]?.requestId == requestId {
+          sessionLoadInflightByChatId.removeValue(forKey: chatId)
         }
       }
     }
@@ -6453,14 +6479,9 @@ final class ChatEngine {
                   provider: ingestProvider,
                   payload: frame.payload
                 )
-                // Clear single-flight gate once a detail payload landed for this chat.
-                if let inflight = self.currentSessionLoadInflightByChatId[chatId],
-                  inflight.requestId == requestId || requestId.isEmpty
-                {
-                  self.currentSessionLoadInflightByChatId.removeValue(forKey: chatId)
-                } else {
-                  self.currentSessionLoadInflightByChatId.removeValue(forKey: chatId)
-                }
+                // Clear single-flight gates once a detail payload landed for this chat.
+                self.currentSessionLoadInflightByChatId.removeValue(forKey: chatId)
+                self.sessionLoadInflightByChatId.removeValue(forKey: chatId)
               } else if var paging = self.bridgeSessionPagingByChatId[chatId] {
                 paging.loadingOlder = false
                 self.bridgeSessionPagingByChatId[chatId] = paging
