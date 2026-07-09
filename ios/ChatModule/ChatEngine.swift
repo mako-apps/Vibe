@@ -475,6 +475,8 @@ final class ChatEngine {
   private var liveBridgeSessionIngestByChatId: [String: (provider: String, sessionId: String, requestId: String)] = [:]
   /// Throttle rearmLiveBridgeSession so open/join/stream don't spam detail reloads.
   private var lastBridgeRearmAtMsByChatId: [String: Int64] = [:]
+  /// In-flight loadCurrentAgentBridgeSession (before live-tail registration lands).
+  private var currentSessionLoadInflightByChatId: [String: (requestId: String, atMs: Int64)] = [:]
   private var bridgeSessionPagingByChatId: [String: (
     provider: String, sessionId: String, nextBefore: String?, hasMoreBefore: Bool, loadingOlder: Bool
   )] = [:]
@@ -2291,14 +2293,30 @@ final class ChatEngine {
     guard !chatId.isEmpty, !provider.isEmpty else {
       return ["accepted": false, "reason": "invalid_chat"]
     }
-    let alreadyLive: Bool = syncOnQueue { liveBridgeSessionIngestByChatId[chatId] != nil }
-    if alreadyLive {
-      // A live-tail subscription already exists (History load or a stream frame set it);
-      // re-arm rather than double-subscribe.
-      syncOnQueue { rearmLiveBridgeSessionLocked(chatId: chatId, trigger: "current_session_load") }
-      return ["accepted": true, "reason": "already_live"]
+    // Single-flight + already-live: open / poll / join used to race and fire 2–3
+    // concurrent current-session detail loads → full transcript remounts / layout jump.
+    let gate: [String: Any]? = syncOnQueue {
+      if liveBridgeSessionIngestByChatId[chatId] != nil {
+        rearmLiveBridgeSessionLocked(chatId: chatId, trigger: "current_session_load")
+        return ["accepted": true, "reason": "already_live"]
+      }
+      let now = Int64(nowMs())
+      if let inflight = currentSessionLoadInflightByChatId[chatId], now - inflight.atMs < 4000 {
+        NSLog(
+          "[ChatEngine][BridgeMount] current-session SKIP inflight chat=%@ ageMs=%lld",
+          String(chatId.suffix(12)), now - inflight.atMs
+        )
+        return ["accepted": true, "reason": "inflight"]
+      }
+      return nil
     }
+    if let gate { return gate }
+
     let requestId = UUID().uuidString
+    // Reserve before the wire push so a concurrent open cannot start a second load.
+    syncOnQueue {
+      currentSessionLoadInflightByChatId[chatId] = (requestId: requestId, atMs: Int64(nowMs()))
+    }
     let result = requestAgentBridgeHistory([
       "chatId": chatId,
       "provider": provider,
@@ -2309,6 +2327,16 @@ final class ChatEngine {
     if (result["accepted"] as? Bool) == true {
       syncOnQueue {
         pendingBridgeSessionIngestByRequestId[requestId] = (chatId: chatId, provider: provider)
+      }
+      NSLog(
+        "[ChatEngine][BridgeMount] current-session START chat=%@ provider=%@ requestId=%@",
+        String(chatId.suffix(12)), provider, String(requestId.prefix(8))
+      )
+    } else {
+      syncOnQueue {
+        if currentSessionLoadInflightByChatId[chatId]?.requestId == requestId {
+          currentSessionLoadInflightByChatId.removeValue(forKey: chatId)
+        }
       }
     }
     return result
@@ -6352,9 +6380,18 @@ final class ChatEngine {
                   provider: ingestProvider,
                   payload: frame.payload
                 )
+                // Clear single-flight gate once a detail payload landed for this chat.
+                if let inflight = self.currentSessionLoadInflightByChatId[chatId],
+                  inflight.requestId == requestId || requestId.isEmpty
+                {
+                  self.currentSessionLoadInflightByChatId.removeValue(forKey: chatId)
+                } else {
+                  self.currentSessionLoadInflightByChatId.removeValue(forKey: chatId)
+                }
               } else if var paging = self.bridgeSessionPagingByChatId[chatId] {
                 paging.loadingOlder = false
                 self.bridgeSessionPagingByChatId[chatId] = paging
+                self.currentSessionLoadInflightByChatId.removeValue(forKey: chatId)
               }
             }
           }
