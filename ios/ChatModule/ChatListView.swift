@@ -8648,7 +8648,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// topic was already joined before this view bound). Stops as soon as a live session is
   /// adopted, the DM changes, or the view detaches.
   private func scheduleCurrentBridgeSessionFallback(attempt: Int) {
-    guard attempt < 6 else { return }
+    // Two retries is enough to cover join lag; six was spamming no_current_session
+    // on idle agent DMs every 1.5s.
+    guard attempt < 2 else { return }
     let provider = currentBridgeProvider
     DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
       guard let self, self.window != nil, self.currentBridgeProvider == provider else { return }

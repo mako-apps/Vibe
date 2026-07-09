@@ -477,6 +477,9 @@ final class ChatEngine {
   private var lastBridgeRearmAtMsByChatId: [String: Int64] = [:]
   /// In-flight loadCurrentAgentBridgeSession (before live-tail registration lands).
   private var currentSessionLoadInflightByChatId: [String: (requestId: String, atMs: Int64)] = [:]
+  /// After bridge answers no_current_session, don't re-poll for a while (idle DMs were
+  /// spamming the bridge every ~1.5s with no useful work).
+  private var noCurrentSessionUntilMsByChatId: [String: Int64] = [:]
   private var bridgeSessionPagingByChatId: [String: (
     provider: String, sessionId: String, nextBefore: String?, hasMoreBefore: Bool, loadingOlder: Bool
   )] = [:]
@@ -2318,6 +2321,9 @@ final class ChatEngine {
         return ["accepted": true, "reason": "already_live"]
       }
       let now = Int64(nowMs())
+      if let until = noCurrentSessionUntilMsByChatId[chatId], now < until {
+        return ["accepted": false, "reason": "no_current_session_cached"]
+      }
       if let inflight = currentSessionLoadInflightByChatId[chatId], now - inflight.atMs < 4000 {
         NSLog(
           "[ChatEngine][BridgeMount] current-session SKIP inflight chat=%@ ageMs=%lld",
@@ -6392,6 +6398,31 @@ final class ChatEngine {
           let mode = self.normalizedString(frame.payload["mode"]) ?? "list"
           let provider = self.normalizedString(frame.payload["provider"]) ?? ""
           let requestId = self.normalizedString(frame.payload["requestId"]) ?? ""
+          let ok = (frame.payload["ok"] as? Bool) ?? true
+          let message = (self.normalizedString(frame.payload["message"]) ?? "").lowercased()
+          if !ok, message.contains("no_current_session") {
+            // Idle DM: bridge has nothing live — stop re-polling for 90s.
+            self.noCurrentSessionUntilMsByChatId[chatId] = Int64(self.nowMs()) + 90_000
+            self.currentSessionLoadInflightByChatId.removeValue(forKey: chatId)
+            self.pendingBridgeSessionIngestByRequestId.removeValue(forKey: requestId)
+            NSLog(
+              "[ChatEngine][BridgeMount] no_current_session chat=%@ — suppress polls 90s",
+              String(chatId.suffix(12))
+            )
+            self.postChangeLocked(
+              reason: "agentBridgeHistory",
+              userInfo: [
+                "chatId": chatId,
+                "provider": provider,
+                "mode": mode,
+                "requestId": requestId,
+                "message": "no_current_session",
+              ]
+            )
+            return
+          }
+          // Successful current-session load clears the idle suppress.
+          if ok { self.noCurrentSessionUntilMsByChatId.removeValue(forKey: chatId) }
           // If this detail reply was requested to be opened into the chat, render
           // its transcript as bubbles (the profile no longer shows a transcript).
           if mode == "detail" {
