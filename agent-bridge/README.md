@@ -52,7 +52,7 @@ Escalate explicitly with env vars (only on machines you control):
 | `VIBE_FABLE_MODEL` | `fable` | Model used by the explicit Fable MCP advisor tool |
 | `VIBE_FABLE_MCP_CONTEXT_CHARS` | `24000` | Max packaged prompt chars for Fable (raise only when needed) |
 | `VIBE_FABLE_MCP_TIMEOUT_MS` | `240000` | Timeout for the one-shot Fable `claude -p` spawn |
-| `VIBE_CLAUDE_COMMAND`, `VIBE_CODEX_COMMAND`, `VIBE_GROK_COMMAND` | `claude` / `codex` / `grok` | binary path override |
+| `VIBE_CLAUDE_COMMAND`, `VIBE_CODEX_COMMAND`, `VIBE_GROK_COMMAND`, `VIBE_AGY_COMMAND` | `claude` / `codex` / `grok` / `agy` | binary path override |
 | `VIBE_GROK_MODEL` | — | Grok model override |
 | `VIBE_GROK_PERMISSION_MODE` | per task | Grok `--permission-mode` |
 

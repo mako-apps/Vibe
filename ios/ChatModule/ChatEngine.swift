@@ -2731,6 +2731,10 @@ final class ChatEngine {
         // tap-to-open tool sheet — same path as the live stream.
         if let nodes = progressNodesPayload {
           if isRunningTranscriptItem, var mutableNodes = nodes as? [[String: Any]] {
+            // Live Grok/Agy can stack every interim narration as kind:text — phone
+            // logs showed textNodes=2–3 (old Verdict + new reply) in one cell.
+            // Keep only the latest text node while the turn is running.
+            mutableNodes = Self.collapseLiveTextProgressNodes(mutableNodes)
             for index in mutableNodes.indices.reversed() {
               let kind = (normalizedString(mutableNodes[index]["kind"]) ?? "").lowercased()
               if kind == "text" { continue }
@@ -5228,6 +5232,11 @@ final class ChatEngine {
 
     var text = normalizedString(payload["text"]) ?? ""
     var progressNodes = (payload["progressNodes"] as? [[String: Any]]) ?? []
+    // Live frames: one text node only (latest narration). Prevents stacked prior
+    // answers in the Worked feed while status is still running.
+    if status != "done", status != "error", status != "stopped" {
+      progressNodes = Self.collapseLiveTextProgressNodes(progressNodes)
+    }
     // Never let the visible feed regress: a reconnect on either side can hand back a
     // freshly-reset accumulation buffer for the SAME task. If this frame carries
     // strictly less than what's already on screen for this row, keep showing the
@@ -5239,6 +5248,9 @@ final class ChatEngine {
       if progressNodes.count < existingProgressNodes.count, text.count <= existingText.count {
         text = existingText
         progressNodes = existingProgressNodes
+        if status != "done", status != "error", status != "stopped" {
+          progressNodes = Self.collapseLiveTextProgressNodes(progressNodes)
+        }
       }
     }
     // Diagnostic: the chronological kind order the server sent for this live frame.
@@ -5423,6 +5435,25 @@ final class ChatEngine {
   /// session-ingest (watch) path: watch-driven sessions (including IDE-owned ones the
   /// bridge never spawned) get no agent-stream frames at all, so the header state must be
   /// derivable from the ingested transcript too.
+  /// Keep only the latest `kind:text` node while a turn is live. Multiple interim
+  /// narrations (or a leaked previous-turn answer) stack into one Worked cell.
+  private static func collapseLiveTextProgressNodes(_ nodes: [[String: Any]]) -> [[String: Any]] {
+    func kindOf(_ node: [String: Any]) -> String {
+      let raw = (node["kind"] as? String) ?? (node["itemType"] as? String) ?? ""
+      return raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+    guard nodes.count > 1 else { return nodes }
+    var lastTextIdx = -1
+    for (idx, node) in nodes.enumerated() {
+      if kindOf(node) == "text" { lastTextIdx = idx }
+    }
+    guard lastTextIdx >= 0 else { return nodes }
+    return nodes.enumerated().compactMap { idx, node in
+      if kindOf(node) == "text", idx != lastTextIdx { return nil }
+      return node
+    }
+  }
+
   private func agentProgressLabelFromNodes(_ progressNodes: [[String: Any]]) -> String? {
     let latestActionNode = progressNodes.reversed().first(where: { node in
       ((normalizedString(node["kind"] ?? node["itemType"]) ?? "").lowercased()) != "text"
@@ -7444,13 +7475,14 @@ final class ChatEngine {
         continue
       }
       // Stale stream row after finished session card arrived (bridge restart recovery).
-      if id.hasPrefix("stream-"), !streaming, hasFinishedAgentCard {
-        // Keep if it still has unique body text the finished card lacks — rare.
-        // Default: drop so the rich bridge- card is the only bubble.
+      // Also drop when still marked streaming if a finished bridge- card already owns
+      // the turn — otherwise logs show dual apply of the same prose (stream + bridge).
+      if id.hasPrefix("stream-"), hasFinishedAgentCard {
         mergedById.removeValue(forKey: id)
         VibeDebugLog.log(
-          "[EmptyTrace] dropStaleStreamRow id=%@ chat=%@ textLen=%d nodes=%d",
-          String(id.suffix(20)), String(chatId.suffix(12)), text.count, nodes.count)
+          "[EmptyTrace] dropStaleStreamRow id=%@ chat=%@ textLen=%d nodes=%d streaming=%@",
+          String(id.suffix(20)), String(chatId.suffix(12)), text.count, nodes.count,
+          streaming ? "Y" : "N")
         continue
       }
       // Synthetic running-mirror hosts that settled empty under a real finished card.

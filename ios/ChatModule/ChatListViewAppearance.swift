@@ -1,4 +1,112 @@
+import ImageIO
 import UIKit
+
+/// Shared, downsampled wallpaper pattern masks.
+///
+/// Bundle PNGs are ~1312×3232 (~16 MB decoded RGBA each). Loading them full-size
+/// into static caches was a leading jetsam (SIGKILL) contributor when opening
+/// chats / Vibe AI under memory pressure or Xcode debug.
+enum ChatWallpaperMaskStore {
+  private final class CGImageBox: NSObject {
+    let image: CGImage
+    init(_ image: CGImage) { self.image = image }
+  }
+
+  private static let cache: NSCache<NSString, CGImageBox> = {
+    let cache = NSCache<NSString, CGImageBox>()
+    cache.countLimit = 6
+    // Cap total decoded mask pixels (~12 MB).
+    cache.totalCostLimit = 12 * 1024 * 1024
+    return cache
+  }()
+
+  /// Long-edge cap for pattern masks (aspect-fill backdrop, not photography).
+  private static let maxPixelSize = 1024
+
+  static func image(forKey key: String, bundles: [Bundle] = [.main]) -> CGImage? {
+    let normalized = key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !normalized.isEmpty else { return nil }
+    if let cached = cache.object(forKey: normalized as NSString) {
+      return cached.image
+    }
+    guard let baseName = baseName(for: normalized) else { return nil }
+
+    for bundle in bundles {
+      if let path = bundle.path(forResource: baseName, ofType: "png"),
+        let image = loadDownsampled(path: path)
+      {
+        store(image, key: normalized)
+        return image
+      }
+      if let uiImage =
+        UIImage(named: baseName, in: bundle, compatibleWith: nil)
+        ?? UIImage(named: "\(baseName).png", in: bundle, compatibleWith: nil),
+        let image = downsample(uiImage: uiImage)
+      {
+        store(image, key: normalized)
+        return image
+      }
+    }
+    return nil
+  }
+
+  static func purge() {
+    cache.removeAllObjects()
+  }
+
+  private static func store(_ image: CGImage, key: String) {
+    let cost = image.width * image.height * 4
+    cache.setObject(CGImageBox(image), forKey: key as NSString, cost: cost)
+  }
+
+  private static func baseName(for key: String) -> String? {
+    switch key {
+    case "doodles", "hearts":
+      return "doodle_transparent"
+    case "music":
+      return "music_transparent"
+    case "music2":
+      return "music2_transparent"
+    case "food":
+      return "food_transparent"
+    case "animals":
+      return "animals_transparent"
+    default:
+      return nil
+    }
+  }
+
+  private static func loadDownsampled(path: String) -> CGImage? {
+    let url = URL(fileURLWithPath: path) as CFURL
+    guard let source = CGImageSourceCreateWithURL(url, nil) else { return nil }
+    let options: [CFString: Any] = [
+      kCGImageSourceCreateThumbnailFromImageAlways: true,
+      kCGImageSourceCreateThumbnailWithTransform: true,
+      kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+      kCGImageSourceShouldCacheImmediately: true,
+    ]
+    return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+  }
+
+  private static func downsample(uiImage: UIImage) -> CGImage? {
+    guard let cg = uiImage.cgImage else { return nil }
+    let maxDim = max(cg.width, cg.height)
+    if maxDim <= maxPixelSize { return cg }
+    let scale = CGFloat(maxPixelSize) / CGFloat(maxDim)
+    let size = CGSize(
+      width: max(1.0, CGFloat(cg.width) * scale),
+      height: max(1.0, CGFloat(cg.height) * scale)
+    )
+    let format = UIGraphicsImageRendererFormat.default()
+    format.scale = 1
+    format.opaque = false
+    let renderer = UIGraphicsImageRenderer(size: size, format: format)
+    let rendered = renderer.image { _ in
+      uiImage.draw(in: CGRect(origin: .zero, size: size))
+    }
+    return rendered.cgImage
+  }
+}
 
 struct ChatListAppearance {
   let backgroundMode: String

@@ -9,9 +9,21 @@ private let chatCellReactionDebugLogs = false
 private let chatCellMediaDebugLogs = false
 private let chatCellInlineVideoDebugLogs = false
 private let bubbleBoldRegex = try! NSRegularExpression(pattern: "\\*\\*(.+?)\\*\\*")
-private let chatMediaImageCache = NSCache<NSString, UIImage>()
+private let chatMediaImageCache: NSCache<NSString, UIImage> = {
+  let cache = NSCache<NSString, UIImage>()
+  cache.countLimit = 96
+  cache.totalCostLimit = 48 * 1024 * 1024
+  return cache
+}()
 private let chatMediaNaturalSizeCache = NSCache<NSString, NSValue>()
 private let chatMediaAudioAvailabilityCache = NSCache<NSString, NSNumber>()
+
+/// Drop decoded chat media under memory pressure (called from AppDelegate).
+func chatMediaImageCachePurgeForMemoryWarning() {
+  chatMediaImageCache.removeAllObjects()
+  chatMediaNaturalSizeCache.removeAllObjects()
+  chatMediaAudioAvailabilityCache.removeAllObjects()
+}
 
 // MARK: - Disk-backed image cache
 

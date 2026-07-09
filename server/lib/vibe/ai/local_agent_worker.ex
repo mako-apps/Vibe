@@ -2008,7 +2008,7 @@ defmodule Vibe.AI.LocalAgentWorker do
           event["type"] == "text" and is_binary(event["data"]) ->
             st
             |> grok_flush_thought_node(think_status)
-            |> Map.update!(:answer, &(&1 <> event["data"]))
+            |> Map.update!(:answer, &join_grok_text_chunks([&1, event["data"]]))
 
           event["type"] == "tool_use" ->
             id = normalize_string(event["id"]) || unique_event_id("grok-tool", length(st.nodes))
@@ -2028,7 +2028,7 @@ defmodule Vibe.AI.LocalAgentWorker do
           is_binary(event["text"]) and event["type"] not in ["thought", "end", "tool_use", "tool_result"] ->
             st
             |> grok_flush_thought_node(think_status)
-            |> Map.update!(:answer, &(&1 <> event["text"]))
+            |> Map.update!(:answer, &join_grok_text_chunks([&1, event["text"]]))
 
           true ->
             # Claude-shaped content blocks injected for tools (optional path).
@@ -2056,7 +2056,7 @@ defmodule Vibe.AI.LocalAgentWorker do
                 %{"type" => "text", "text" => body} when is_binary(body) ->
                   inner
                   |> grok_flush_thought_node(think_status)
-                  |> Map.update!(:answer, &(&1 <> body))
+                  |> Map.update!(:answer, &join_grok_text_chunks([&1, body]))
 
                 _ ->
                   inner
@@ -2065,11 +2065,44 @@ defmodule Vibe.AI.LocalAgentWorker do
         end
       end)
 
-    state
-    |> grok_flush_thought_node(think_status)
-    |> grok_flush_answer_node(summary_norm, text_status)
-    |> Map.get(:nodes)
+    # Live: only one text node (latest). Finished: keep interleaved interim text
+    # nodes; final body equals summary_norm and is dropped from the feed above.
+    nodes =
+      state
+      |> grok_flush_thought_node(think_status)
+      |> grok_flush_answer_node(summary_norm, text_status)
+      |> Map.get(:nodes)
+
+    if settled do
+      nodes
+    else
+      collapse_live_text_progress_nodes(nodes)
+    end
   end
+
+  defp collapse_live_text_progress_nodes(nodes) when is_list(nodes) do
+    last_text_idx =
+      nodes
+      |> Enum.with_index()
+      |> Enum.reduce(-1, fn {node, idx}, acc ->
+        kind = node |> Map.get("kind") |> to_string() |> String.downcase()
+        if kind == "text", do: idx, else: acc
+      end)
+
+    if last_text_idx < 0 do
+      nodes
+    else
+      nodes
+      |> Enum.with_index()
+      |> Enum.filter(fn {node, idx} ->
+        kind = node |> Map.get("kind") |> to_string() |> String.downcase()
+        kind != "text" or idx == last_text_idx
+      end)
+      |> Enum.map(&elem(&1, 0))
+    end
+  end
+
+  defp collapse_live_text_progress_nodes(nodes), do: nodes
 
   defp grok_flush_thought_node(st, status) do
     body = String.trim(st.thought)
@@ -2391,7 +2424,7 @@ defmodule Vibe.AI.LocalAgentWorker do
         _ -> false
       end)
       |> Enum.map(& &1["data"])
-      |> Enum.join()
+      |> join_grok_text_chunks()
       |> normalize_string()
 
     streaming ||
@@ -2412,6 +2445,45 @@ defmodule Vibe.AI.LocalAgentWorker do
         end
       end)
       |> normalize_string()
+  end
+
+  # Grok often emits sentence-sized `text` chunks. Blind join produced
+  # "issue.This is not…" in the phone body. Insert space or paragraph break
+  # when adjacent chunks lack whitespace at the boundary.
+  defp join_grok_text_chunks([]), do: ""
+  defp join_grok_text_chunks(chunks) when is_list(chunks) do
+    Enum.reduce(chunks, "", fn chunk, acc ->
+      chunk = to_string(chunk)
+
+      cond do
+        chunk == "" ->
+          acc
+
+        acc == "" ->
+          chunk
+
+        true ->
+          a = String.last(acc) || ""
+          b = String.first(chunk) || ""
+          a_ws? = a != "" and String.trim(a) == ""
+          b_ws? = b != "" and String.trim(b) == ""
+          punct_b? = b in [".", ",", ";", ":", "!", "?", ")", "]", "}"]
+          open_b? = b in ["(", "[", "{", "/", "-"]
+          upper_b? = b >= "A" and b <= "Z"
+
+          sentence_break? = a in [".", "!", "?"] and upper_b?
+
+          sep =
+            cond do
+              a_ws? or b_ws? -> ""
+              sentence_break? -> "\n\n"
+              punct_b? or open_b? -> ""
+              true -> " "
+            end
+
+          acc <> sep <> chunk
+      end
+    end)
   end
 
   defp plain_output_text([], output), do: normalize_string(output)

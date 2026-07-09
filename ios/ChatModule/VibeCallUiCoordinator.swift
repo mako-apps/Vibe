@@ -238,7 +238,7 @@ final class VibeNativeCallScreenController: UIViewController {
   private var buttonStacks: [String: UIView] = [:]
   private var actionChips: [String: NativeCallActionChip] = [:]
 
-  private static var wallpaperMaskImageCache: [String: CGImage] = [:]
+
   private static let avatarImageCache = NSCache<NSString, UIImage>()
 
   init(coordinator: VibeNativeCallUiCoordinator) {
@@ -1217,50 +1217,10 @@ final class VibeNativeCallScreenController: UIViewController {
   }
 
   private func resolvedWallpaperMaskImage(for key: String) -> CGImage? {
-    let normalizedKey = key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    guard !normalizedKey.isEmpty else { return nil }
-    if let cached = Self.wallpaperMaskImageCache[normalizedKey] {
-      return cached
-    }
-    guard let baseName = Self.wallpaperMaskBaseName(for: normalizedKey) else {
-      return nil
-    }
-
-    let bundles = [Bundle.main, Bundle(for: VibeNativeCallScreenController.self)]
-    for bundle in bundles {
-      if let image = UIImage(named: baseName, in: bundle, compatibleWith: nil)?.cgImage {
-        Self.wallpaperMaskImageCache[normalizedKey] = image
-        return image
-      }
-      if let image = UIImage(named: "\(baseName).png", in: bundle, compatibleWith: nil)?.cgImage {
-        Self.wallpaperMaskImageCache[normalizedKey] = image
-        return image
-      }
-      if let path = bundle.path(forResource: baseName, ofType: "png"),
-        let image = UIImage(contentsOfFile: path)?.cgImage
-      {
-        Self.wallpaperMaskImageCache[normalizedKey] = image
-        return image
-      }
-    }
-    return nil
-  }
-
-  private static func wallpaperMaskBaseName(for key: String) -> String? {
-    switch key {
-    case "doodles", "hearts":
-      return "doodle_transparent"
-    case "music":
-      return "music_transparent"
-    case "music2":
-      return "music2_transparent"
-    case "food":
-      return "food_transparent"
-    case "animals":
-      return "animals_transparent"
-    default:
-      return nil
-    }
+    ChatWallpaperMaskStore.image(
+      forKey: key,
+      bundles: [Bundle.main, Bundle(for: VibeNativeCallScreenController.self)]
+    )
   }
 
   private func makeButtonStack(key: String, label: String, size: CGFloat, showLabel: Bool = true)

@@ -295,6 +295,12 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
   /// send/stop button.
   public var onStreamingStateChanged: ((Bool) -> Void)?
 
+  /// When true, this view is only the agent socket + row source for a host
+  /// (`ChatMainView`). Skip local message rendering, full-screen layout work,
+  /// and expensive blur effects so opening Vibe AI does not double the memory
+  /// footprint of two full chat UIs (observed as SIGKILL / jetsam).
+  private var isTransportOnly = false
+
   @objc public var surfaceId: String = "" {
     didSet {
       let trimmed = surfaceId.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -411,8 +417,44 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
     joinedTopic = false
   }
 
+  /// Configure this instance as a hidden transport for a host chat surface.
+  /// Call before attaching to a window when `onRowsChanged` drives `ChatMainView`.
+  public func prepareForTransportOnly() {
+    isTransportOnly = true
+    isHidden = true
+    isUserInteractionEnabled = false
+    clipsToBounds = true
+    // Tiny frame: no full-screen layer trees / cell dequeues for the hidden UI.
+    frame = CGRect(x: 0, y: 0, width: 1, height: 1)
+    autoresizingMask = []
+    // Drop blur backing stores — costly even when the view is hidden.
+    headerMaskBlurView.effect = nil
+    footerMaskBlurView.effect = nil
+    backGlassView.effect = nil
+    titleGlassView.effect = nil
+    actionGlassView.effect = nil
+    messagesView.isHidden = true
+    historyTableView.isHidden = true
+    pageScrollView.isHidden = true
+    headerContainer.isHidden = true
+    footerMaskView.isHidden = true
+    // Clear any rows the init path may have built into the local list.
+    messagesView.setRows(
+      [],
+      topPadding: 0,
+      spacerHeight: 0,
+      bottomPadding: 0,
+      scrollToBottom: false,
+      animated: false
+    )
+  }
+
   public override func layoutSubviews() {
     super.layoutSubviews()
+    if isTransportOnly {
+      // Host owns all visible layout; skip header/pages/message geometry.
+      return
+    }
 
     let safeTop = safeAreaInsets.top
     let bounds = self.bounds
@@ -2165,30 +2207,36 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
     let bottomPadding: CGFloat = 140.0
 
     guard let activeConversation = activeConversationId.flatMap({ conversation(for: $0) }) else {
-      messagesView.setRows(
-        [],
-        topPadding: topPadding,
-        spacerHeight: currentSpacerHeight,
-        bottomPadding: bottomPadding,
-        scrollToBottom: false,
-        animated: false
-      )
+      if !isTransportOnly {
+        messagesView.setRows(
+          [],
+          topPadding: topPadding,
+          spacerHeight: currentSpacerHeight,
+          bottomPadding: bottomPadding,
+          scrollToBottom: false,
+          animated: false
+        )
+      }
       onRowsChanged?([])
       return
     }
 
     let rows = makeRawRows(for: activeConversation)
-    messagesView.setRows(
-      rows,
-      topPadding: topPadding,
-      spacerHeight: currentSpacerHeight,
-      bottomPadding: bottomPadding,
-      scrollToBottom: false,
-      animated: animated
-    )
+    // Hosted transport path: only push rows to ChatMainView — do not also
+    // materialize a second full message list in this hidden view.
+    if !isTransportOnly {
+      messagesView.setRows(
+        rows,
+        topPadding: topPadding,
+        spacerHeight: currentSpacerHeight,
+        bottomPadding: bottomPadding,
+        scrollToBottom: false,
+        animated: animated
+      )
+    }
     onRowsChanged?(rows)
 
-    guard scrollToBottom else { return }
+    guard scrollToBottom, !isTransportOnly else { return }
     DispatchQueue.main.async { [weak self] in
       self?.messagesView.scrollToBottom(animated: animated)
     }

@@ -5690,6 +5690,10 @@ async function grokDetail(sessionId, limit, before) {
       sealHistoryRuntime("grok", host, pending, turnDurationMs(turnStartTs, turnEndTs));
     }
     pending = newRuntimeAccumulator();
+    // Tool maps must not leak across user turns — same tool-call ids are rare but
+    // residual detail/result joins poisoned later hosts (prior-turn tools on new cell).
+    actionDetailByUid.clear();
+    resultByUid.clear();
     turnItems = [];
     turnReasoning = "";
     turnThinking = { had: false, tokens: 0, durationMs: 0 };
@@ -5954,9 +5958,54 @@ function detailMidturnWindowMs(provider) {
 }
 
 /**
+ * Keep only updates belonging to the CURRENT turn.
+ * Cut after the last turn_completed / turn_started / user_message_chunk so a
+ * multi-MB updates.jsonl tail cannot re-inject prior-turn text/tools into the
+ * trailing host (phone showed previous "Verdict" + current answer in one cell).
+ */
+function sliceGrokUpdatesLinesToCurrentTurn(lines) {
+  let cut = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line || !line.trim()) continue;
+    let rec = null;
+    try {
+      rec = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const u = (rec && rec.params && rec.params.update) || (rec && rec.update) || null;
+    if (!u || typeof u !== "object") continue;
+    const kind = String(u.sessionUpdate || "");
+    if (kind === "turn_completed") cut = i + 1;
+    else if (kind === "turn_started" || kind === "user_message_chunk") cut = i;
+  }
+  return lines.slice(cut);
+}
+
+/**
+ * Live hosts must not stack every interim narration as a separate text node —
+ * that rendered as "duplicate responses" (old 3k Verdict + new 175-char reply).
+ * Keep tools/thinking; keep only the latest kind:text node.
+ */
+function collapseLiveTextNodes(nodes) {
+  if (!Array.isArray(nodes) || nodes.length < 2) return nodes || [];
+  let lastTextIdx = -1;
+  for (let i = 0; i < nodes.length; i++) {
+    if (nodes[i] && String(nodes[i].kind || "").toLowerCase() === "text") lastTextIdx = i;
+  }
+  if (lastTextIdx < 0) return nodes;
+  return nodes.filter((n, i) => {
+    if (!n) return false;
+    if (String(n.kind || "").toLowerCase() !== "text") return true;
+    return i === lastTextIdx;
+  });
+}
+
+/**
  * Fold recent updates.jsonl tool/thinking/message chunks into the trailing
  * assistant host. Source split: chat_history is authoritative when settled;
- * updates are the live edge for desktop Grok tool ticks.
+ * updates are the live edge for desktop Grok tool ticks — CURRENT TURN ONLY.
  */
 function mergeGrokLiveUpdatesIntoMessages(match, messages) {
   if (!match || !Array.isArray(messages) || !messages.length) return;
@@ -5995,21 +6044,30 @@ function mergeGrokLiveUpdatesIntoMessages(match, messages) {
     return;
   }
 
+  const turnLines = sliceGrokUpdatesLinesToCurrentTurn(text.split("\n"));
+  if (!turnLines.length) return;
+
   const nodesById = new Map();
-  // Seed from existing host nodes so we upsert instead of wipe.
+  // Seed HISTORY-folded tool/thinking nodes only (not prior-turn live text blobs).
+  // Live text is rebuilt from this turn's agent_message_chunk stream alone.
   if (Array.isArray(last.progressNodes)) {
     for (const n of last.progressNodes) {
-      if (n && n.id) nodesById.set(String(n.id), n);
+      if (!n || !n.id) continue;
+      const id = String(n.id);
+      if (id === "grok-text-live" || id === "grok-thinking-live") continue;
+      if (String(n.kind || "").toLowerCase() === "text") continue;
+      nodesById.set(id, n);
     }
   }
   let thoughtAcc = "";
-  let textAcc = String(last.text || "").trim();
+  let textAcc = "";
   let order = Array.from(nodesById.keys());
   const ensureOrder = (id) => {
     if (!order.includes(id)) order.push(id);
   };
+  let sawTurnCompleted = false;
 
-  for (const line of text.split("\n")) {
+  for (const line of turnLines) {
     if (!line.trim()) continue;
     let rec = null;
     try {
@@ -6046,6 +6104,15 @@ function mergeGrokLiveUpdatesIntoMessages(match, messages) {
       const chunk =
         (u.content && (u.content.text || (typeof u.content === "string" ? u.content : ""))) || "";
       if (chunk) {
+        // Smart join: avoid "issue.This" when chunks are sentence-sized.
+        if (textAcc && chunk) {
+          const a = textAcc[textAcc.length - 1];
+          const b = chunk[0];
+          if (/\S/.test(a) && /\S/.test(b) && !/[(\[{/-]/.test(b) && !/[.,;:!?)\]}]/.test(b)) {
+            if (/[.!?:]$/.test(textAcc) && /[A-Z]/.test(b)) textAcc += "\n\n";
+            else if (!/\s$/.test(textAcc) && !/^\s/.test(chunk)) textAcc += " ";
+          }
+        }
         textAcc += chunk;
         // Live: keep body empty and ride text as a feed node (phone suppresses body mid-run).
         const id = "grok-text-live";
@@ -6125,6 +6192,7 @@ function mergeGrokLiveUpdatesIntoMessages(match, messages) {
     }
 
     if (kind === "turn_completed") {
+      sawTurnCompleted = true;
       // Settle live edge markers.
       for (const n of nodesById.values()) {
         if (n && (n.status === "streaming" || n.status === "running")) {
@@ -6134,11 +6202,23 @@ function mergeGrokLiveUpdatesIntoMessages(match, messages) {
       }
       last.running = false;
       last.trailingToolPending = false;
+      // Promote live text into the message body so the phone shows a settled answer
+      // outside the Worked card instead of a forever-streaming text node.
+      if (textAcc.trim()) {
+        last.text = clipText(textAcc.trim(), 4000);
+        nodesById.delete("grok-text-live");
+        order = order.filter((id) => id !== "grok-text-live");
+      }
     }
   }
 
-  const nodes = order.map((id) => nodesById.get(id)).filter(Boolean).slice(-60);
-  if (nodes.length) {
+  let nodes = order.map((id) => nodesById.get(id)).filter(Boolean);
+  // While the turn is still open, never stack multiple text narrations.
+  if (last.running !== false && !sawTurnCompleted) {
+    nodes = collapseLiveTextNodes(nodes);
+  }
+  nodes = nodes.slice(-60);
+  if (nodes.length || sawTurnCompleted) {
     last.progressNodes = nodes;
     // Pending tool = still live (unless turn_completed already cleared it).
     if (last.running !== false) {
@@ -6291,6 +6371,9 @@ function markMessageRunning(message) {
   if (!message || typeof message !== "object") return message;
   message.running = true;
   let nodes = Array.isArray(message.progressNodes) ? message.progressNodes : [];
+  // Drop stacked interim narrations so the live cell shows one text stream, not
+  // every prior paragraph of the turn (or a leaked previous answer).
+  nodes = collapseLiveTextNodes(nodes);
   // The phone SUPPRESSES the message body while a turn is live, and foldTurnIntoHost
   // routes the turn's LAST text into that body (it's the "summary"). Mid-run the
   // newest narration IS the last text, so it vanished from the live feed entirely
@@ -6298,6 +6381,8 @@ function markMessageRunning(message) {
   // running; the post-close re-read re-folds and restores the body-outside-card shape.
   const body = String(message.text || "").trim();
   if (body) {
+    // Replace any existing text node with the body (latest summary), don't append.
+    nodes = nodes.filter((n) => !n || String(n.kind || "").toLowerCase() !== "text");
     nodes = nodes.concat([{
       id: "live-tail-" + String(message.uid || "0"),
       label: clipText(body, 4000),
@@ -6306,6 +6391,8 @@ function markMessageRunning(message) {
       depth: 0,
     }]);
     message.text = "";
+    message.progressNodes = nodes;
+  } else {
     message.progressNodes = nodes;
   }
   // The live edge must mirror what is actually happening NOW. If the trailing tool

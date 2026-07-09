@@ -10399,16 +10399,10 @@ final class ChatAgentConversationController: UIViewController {
       "nativeThemeIsDark": isDark,
     ]
 
-    // Headless transport: hidden but in the hierarchy so it gets a window and
-    // connects the agent socket. It produces rows + streaming state. It must be
-    // given a real (non-zero) frame even while hidden — at width 0 its internal
-    // messages view floods the console with unsatisfiable-constraint warnings.
-    agentView.isHidden = true
-    agentView.isUserInteractionEnabled = false
-    agentView.frame = UIScreen.main.bounds
-    agentView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-    agentView.surfaceId = "native_agent_transport"
-    agentView.setAppearance(appearance)
+    // Headless transport: in the hierarchy so it gets a window and connects the
+    // agent socket, but not a second full-screen chat UI. Full-screen + local
+    // message list + blur layers here previously doubled memory with ChatMainView
+    // and contributed to SIGKILL (jetsam) when opening Vibe AI.
     agentView.onRowsChanged = { [weak self] rows in
       self?.mainView.setRows(rows)
     }
@@ -10418,6 +10412,9 @@ final class ChatAgentConversationController: UIViewController {
     agentView.onNativeEvent.handler = { [weak self] payload in
       self?.handleAgentEvent(payload)
     }
+    agentView.surfaceId = "native_agent_transport"
+    agentView.prepareForTransportOnly()
+    // Skip expensive wallpaper/blur styling on the transport-only instance.
     view.addSubview(agentView)
 
     // Visible chat surface — the real chat UI, driven directly (no engine).

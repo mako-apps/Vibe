@@ -64,6 +64,9 @@ final class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationC
 
   @objc private func handleDidReceiveMemoryWarning() {
     appDelegateUITrace("AppDelegate didReceiveMemoryWarning")
+    ChatWallpaperMaskStore.purge()
+    ChatAvatarImageStore.purge()
+    chatMediaImageCachePurgeForMemoryWarning()
   }
 
   func application(

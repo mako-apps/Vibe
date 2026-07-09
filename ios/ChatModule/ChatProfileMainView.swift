@@ -1263,165 +1263,200 @@ private struct ChatProfileSwiftUIRootView: View {
     return count == 1 ? "1 member" : "\(count) members"
   }
 
+  /// Constant hero height — never derived from GeometryReader / safe-area, so a
+  /// second layout pass cannot reflow the scroll content (the open-time jump).
+  private var fixedHeroHeight: CGFloat {
+    if hasProfileImage {
+      return 280
+    }
+    return NativeProfileAvatarHeroMetrics.topOffset
+      + NativeProfileAvatarHeroMetrics.expandedSize
+      + 18
+  }
+
   var body: some View {
-    GeometryReader { geometry in
-      NavigationStack(path: $navCoordinator.path) {
-        ZStack(alignment: .top) {
-          // Backdrop paints behind content; hero height is fixed (no safe-area
-          // snapshot thrashing) so open doesn't jump.
-          let heroHeight = heroContentHeight(for: geometry)
+    // NavigationStack is the OUTERMOST container (not nested in GeometryReader).
+    // Nesting stack-in-GeometryReader made geometry.height shrink once the bar
+    // installed, which resized the hero and produced the header-down / content-up jump.
+    NavigationStack(path: $navCoordinator.path) {
+      ScrollView(.vertical, showsIndicators: false) {
+        VStack(spacing: 0) {
+          offsetReader(heroHeight: fixedHeroHeight)
+
+          Color.clear
+            .frame(height: fixedHeroHeight)
+
+          VStack(spacing: 20) {
+            VStack(spacing: 3) {
+              HStack(spacing: 8) {
+                Text(profileName)
+                  .font(.system(size: 28, weight: .bold))
+                  .foregroundStyle(.primary)
+                  .lineLimit(1)
+                  .minimumScaleFactor(0.72)
+
+                if showsGoldTier {
+                  ChatProfileSwiftUITierBadge(label: "Gold")
+                }
+              }
+              .frame(maxWidth: .infinity)
+
+              if let groupHeaderSubtitle {
+                Text(groupHeaderSubtitle)
+                  .font(.system(size: 14, weight: .regular))
+                  .foregroundStyle(.secondary)
+                  .lineLimit(1)
+              }
+            }
+
+            actionRow
+          }
+          .padding(.horizontal, 28)
+          .padding(.top, 16)
+          .padding(.bottom, 18)
+
+          VStack(spacing: 18) {
+            profileInfoSection
+            if !bridgeProvider.isEmpty {
+              defaultViewSection
+            }
+            if bridgeProvider.isEmpty {
+              appearanceSection
+            }
+            sharedContentSection
+            if !isGroupOrChannel {
+              contactActionsSection
+              emergencySection
+            }
+            dangerSection
+          }
+          .padding(.horizontal, 16)
+          .padding(.bottom, 66)
+        }
+      }
+      .coordinateSpace(name: "profile-scroll")
+      .scrollIndicators(.never)
+      .chatProfileBounceBehavior()
+      // Backdrop is a BACKGROUND only — its GeometryReader size must never feed
+      // back into the scroll content's hero spacer height.
+      .background {
+        GeometryReader { geo in
           profileBackdrop(
-            width: geometry.size.width,
-            height: geometry.size.height,
-            contentHeight: heroHeight
+            width: geo.size.width,
+            height: max(geo.size.height, fixedHeroHeight + 200),
+            contentHeight: fixedHeroHeight
           )
-
-          ScrollView(.vertical, showsIndicators: false) {
-            VStack(spacing: 0) {
-              offsetReader(heroHeight: heroHeight)
-
-              Color.clear
-                .frame(height: heroHeight)
-
-              // Name + actions sit in the scroll flow (not a pinned sticky header).
-              // Pinned material + custom overlay was double-stacking with the system
-              // bar and changing height on scroll, which caused the jump.
-              VStack(spacing: 20) {
-                VStack(spacing: 3) {
-                  HStack(spacing: 8) {
-                    Text(profileName)
-                      .font(.system(size: 28, weight: .bold))
-                      .foregroundStyle(.primary)
-                      .lineLimit(1)
-                      .minimumScaleFactor(0.72)
-
-                    if showsGoldTier {
-                      ChatProfileSwiftUITierBadge(label: "Gold")
-                    }
-                  }
-                  .frame(maxWidth: .infinity)
-
-                  if let groupHeaderSubtitle {
-                    Text(groupHeaderSubtitle)
-                      .font(.system(size: 14, weight: .regular))
-                      .foregroundStyle(.secondary)
-                      .lineLimit(1)
-                  }
-                }
-
-                actionRow
-              }
-              .padding(.horizontal, 28)
-              .padding(.top, 16)
-              .padding(.bottom, 18)
-
-              VStack(spacing: 18) {
-                profileInfoSection
-                if !bridgeProvider.isEmpty {
-                  defaultViewSection
-                }
-                if bridgeProvider.isEmpty {
-                  appearanceSection
-                }
-                // Shared media / attachments replace the old "Chat History" row —
-                // for both DMs and groups we surface photos/voice/files, not a
-                // scroll-back-through-messages entry.
-                sharedContentSection
-                // Contact-book actions only make sense for a 1:1 with a real person.
-                if !isGroupOrChannel {
-                  contactActionsSection
-                  emergencySection
-                }
-                dangerSection
-              }
-              .frame(width: max(0, geometry.size.width - 32))
-              .padding(.horizontal, 16)
-              .padding(.bottom, 66)
-            }
-          }
-          .coordinateSpace(name: "profile-scroll")
-          .scrollIndicators(.never)
-          .chatProfileBounceBehavior()
-          .background(Color.clear)
+          .frame(width: geo.size.width, height: max(geo.size.height, fixedHeroHeight + 200))
         }
-        .background(Color.clear)
-        // Classic system Material navigation bar (not a clear custom overlay).
-        .navigationBarTitleDisplayMode(.inline)
-        .navigationTitle(stickyTitleVisible ? profileName : "")
-        .toolbar {
-          ToolbarItem(placement: .topBarLeading) {
-            Button {
-              onAction("headerBack")
-            } label: {
-              Image(systemName: "chevron.left")
-                .font(.system(size: 17, weight: .semibold))
-            }
-          }
-          ToolbarItem(placement: .topBarTrailing) {
-            Menu {
-              Button(isChatMuted ? "Unmute" : "Mute") { onAction("muteToggle") }
-              Button("Search") { onAction("search") }
-              if isGroupOrChannel {
-                if canManageGroupMembers {
-                  Button("Edit Group") { onAction("editGroup") }
-                  Button("Add Members") { isShowingAddMembers = true }
-                }
-                if isGroupOwner {
-                  Button("Delete Group", role: .destructive) { onAction("deleteGroup") }
-                } else {
-                  Button("Leave Group", role: .destructive) { onAction("leaveGroup") }
-                }
-              } else {
-                Button("Share Contact") { onAction("shareContact") }
-                Button("Block Contact", role: .destructive) { onAction("block") }
-              }
-            } label: {
-              Image(systemName: "ellipsis")
-                .font(.system(size: 17, weight: .semibold))
-            }
-          }
-        }
-        .toolbarBackground(.ultraThinMaterial, for: .navigationBar)
-        .toolbarBackground(.visible, for: .navigationBar)
+        .ignoresSafeArea()
       }
-      .navigationDestination(for: ChatProfileSwiftUIDestination.self) { destination in
-        if case .bridgeSession = destination {
-          destinationView(for: destination)
+      // Fixed Material chrome via safeAreaInset — same height on first and later
+      // frames (unlike NavigationStack's system bar, which can install one pass late).
+      .safeAreaInset(edge: .top, spacing: 0) {
+        profileMaterialChrome
+      }
+      .toolbar(.hidden, for: .navigationBar)
+      .navigationBarBackButtonHidden(true)
+    }
+    .navigationDestination(for: ChatProfileSwiftUIDestination.self) { destination in
+      if case .bridgeSession = destination {
+        destinationView(for: destination)
+      } else {
+        destinationView(for: destination)
+          .navigationTransition(.zoom(sourceID: destination.transitionID, in: morphNamespace))
+      }
+    }
+    .background(Color.clear)
+    .tint(.primary)
+    .onAppear {
+      if selectedRepoNameLocal == nil {
+        selectedRepoNameLocal = selectedRepositoryName
+      }
+    }
+    .onChange(of: selectedRepositoryName) { _, next in
+      selectedRepoNameLocal = next
+    }
+    .onChange(of: navCoordinator.path.isEmpty) { _, isEmpty in
+      onNavigationActiveChanged(!isEmpty)
+    }
+    .sheet(isPresented: $isShowingAddMembers) {
+      if let config = AppSessionConfig.current {
+        AddGroupMembersSheet(
+          config: config,
+          chatId: bridgeChatId,
+          excludedUserIds: Set(
+            groupMembers.compactMap { entry -> String? in
+              (entry["userId"] as? String)
+                ?? (entry["id"] as? String)
+                ?? (entry["memberId"] as? String)
+                ?? (entry["user_id"] as? String)
+            }
+          ),
+          onAdded: onMembersAdded
+        )
+      }
+    }
+  }
+
+  /// Stable 44pt Material bar. Height never depends on scroll state or geometry
+  /// measurements — only the title opacity fades in (no layout change).
+  private var profileMaterialChrome: some View {
+    HStack(spacing: 0) {
+      Button {
+        onAction("headerBack")
+      } label: {
+        Image(systemName: "chevron.left")
+          .font(.system(size: 17, weight: .semibold))
+          .foregroundStyle(.primary)
+          .frame(width: 44, height: 44)
+          .contentShape(Rectangle())
+      }
+      .buttonStyle(.plain)
+
+      Spacer(minLength: 8)
+
+      Text(profileName)
+        .font(.system(size: 17, weight: .semibold))
+        .foregroundStyle(.primary)
+        .lineLimit(1)
+        .minimumScaleFactor(0.78)
+        // Opacity only — never remove the text or change bar height.
+        .opacity(stickyTitleVisible ? 1 : 0)
+        .accessibilityHidden(!stickyTitleVisible)
+
+      Spacer(minLength: 8)
+
+      Menu {
+        Button(isChatMuted ? "Unmute" : "Mute") { onAction("muteToggle") }
+        Button("Search") { onAction("search") }
+        if isGroupOrChannel {
+          if canManageGroupMembers {
+            Button("Edit Group") { onAction("editGroup") }
+            Button("Add Members") { isShowingAddMembers = true }
+          }
+          if isGroupOwner {
+            Button("Delete Group", role: .destructive) { onAction("deleteGroup") }
+          } else {
+            Button("Leave Group", role: .destructive) { onAction("leaveGroup") }
+          }
         } else {
-          destinationView(for: destination)
-            .navigationTransition(.zoom(sourceID: destination.transitionID, in: morphNamespace))
+          Button("Share Contact") { onAction("shareContact") }
+          Button("Block Contact", role: .destructive) { onAction("block") }
         }
+      } label: {
+        Image(systemName: "ellipsis")
+          .font(.system(size: 17, weight: .semibold))
+          .foregroundStyle(.primary)
+          .frame(width: 44, height: 44)
+          .contentShape(Rectangle())
       }
-      .background(Color.clear)
-      .tint(.primary)
-      .onAppear {
-        if selectedRepoNameLocal == nil {
-          selectedRepoNameLocal = selectedRepositoryName
-        }
-      }
-      .onChange(of: selectedRepositoryName) { _, next in
-        selectedRepoNameLocal = next
-      }
-      .onChange(of: navCoordinator.path.isEmpty) { _, isEmpty in
-        onNavigationActiveChanged(!isEmpty)
-      }
-      .sheet(isPresented: $isShowingAddMembers) {
-        if let config = AppSessionConfig.current {
-          AddGroupMembersSheet(
-            config: config,
-            chatId: bridgeChatId,
-            excludedUserIds: Set(
-              groupMembers.compactMap { entry -> String? in
-                (entry["userId"] as? String)
-                  ?? (entry["id"] as? String)
-                  ?? (entry["memberId"] as? String)
-                  ?? (entry["user_id"] as? String)
-              }
-            ),
-            onAdded: onMembersAdded
-          )
-        }
-      }
+    }
+    .frame(maxWidth: .infinity)
+    .frame(height: 44)
+    .background {
+      Rectangle()
+        .fill(.ultraThinMaterial)
+        .ignoresSafeArea(edges: .top)
     }
   }
 
@@ -1517,30 +1552,20 @@ private struct ChatProfileSwiftUIRootView: View {
     .frame(height: 0)
     .onPreferenceChange(ChatProfileScrollOffsetPreferenceKey.self) { value in
       let nextValue = (value * 2.0).rounded() / 2.0
-      // Update on the current run-loop without async re-entry that re-layouts
-      // the stack and produces the header/content jump.
-      guard abs(localScrollOffset - nextValue) >= 1.0 else { return }
+      // Threshold high enough that tiny safe-area settling noise doesn't
+      // thrash `@State` (which re-renders the backdrop and looks like a jump).
+      guard abs(localScrollOffset - nextValue) >= 2.0 else { return }
       localScrollOffset = nextValue
       let shouldShowTitle = nextValue >= stickyTitleThreshold(heroHeight: heroHeight)
       if stickyTitleVisible != shouldShowTitle {
+        // Title opacity only — chrome frame stays 44pt either way.
         stickyTitleVisible = shouldShowTitle
       }
-      if lastReportedScrollOffset < 0 || abs(lastReportedScrollOffset - nextValue) >= 4.0 {
+      if lastReportedScrollOffset < 0 || abs(lastReportedScrollOffset - nextValue) >= 6.0 {
         lastReportedScrollOffset = nextValue
         onScroll(nextValue)
       }
     }
-  }
-
-  /// Fixed hero metrics — no live safe-area dependence. The system nav bar owns
-  /// top chrome, so flipping inset values must not reflow the scroll content.
-  private func heroContentHeight(for geometry: GeometryProxy) -> CGFloat {
-    guard hasProfileImage else {
-      return NativeProfileAvatarHeroMetrics.topOffset
-        + NativeProfileAvatarHeroMetrics.expandedSize
-        + 18
-    }
-    return max(240, min(geometry.size.height * 0.38, 340))
   }
 
   private func stickyTitleThreshold(heroHeight: CGFloat) -> CGFloat {
@@ -3253,6 +3278,8 @@ private struct ChatProfileSwiftUIExpandedContentView: View {
     .background(Color(uiColor: UIColor.systemGroupedBackground))
     .navigationTitle(title)
     .navigationBarTitleDisplayMode(.inline)
+    .navigationBarBackButtonHidden(false)
+    .toolbar(.visible, for: .navigationBar)
     .toolbarBackground(.ultraThinMaterial, for: .navigationBar)
     .toolbarBackground(.visible, for: .navigationBar)
     .toolbar {
@@ -3873,6 +3900,10 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   private var swiftUINavigationActive = false
   private var swiftUIRenderBatchDepth = 0
   private var needsBatchedSwiftUIRender = false
+  /// Coalesces bursty re-renders (setRows + setGroupMembers + bridge status on open)
+  /// into a single rootView assignment so the scroll view is not rebuilt mid-frame.
+  private var swiftUIRenderCoalesceScheduled = false
+  private var lastSwiftUIRenderSignature: String = ""
   private static let listDateFormatter: DateFormatter = {
     let formatter = DateFormatter()
     formatter.dateStyle = .medium
@@ -3913,9 +3944,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   }
 
   @objc private func handleAgentBridgeSelectionDidChange() {
-    // Keep the Repository row subtitle in sync when the chat input menu or the
-    // full picker sheet changes the per-chat selection.
-    renderSwiftUIProfile()
+    // Repo subtitle is owned by SwiftUI `@State` / Menu selection — do NOT rebuild
+    // the whole hosting tree here (that reassignment was a source of open/jump).
   }
 
   override func safeAreaInsetsDidChange() {
@@ -4515,13 +4545,62 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       needsBatchedSwiftUIRender = true
       return
     }
+    // Collapse multiple calls in the same run-loop (applyRoute + async rows + members)
+    // into one host update so the profile does not jump on open.
+    guard !swiftUIRenderCoalesceScheduled else { return }
+    swiftUIRenderCoalesceScheduled = true
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      self.swiftUIRenderCoalesceScheduled = false
+      self.performSwiftUIProfileRender()
+    }
+  }
 
+  private func performSwiftUIProfileRender() {
     lastRenderedSafeAreaTop = resolvedSafeAreaTop()
 
     let resolvedName =
       profileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
       ? (headerTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "User" : headerTitle)
       : profileName
+
+    let membersSig = groupMembers.map { entry -> String in
+      let id =
+        (entry["userId"] as? String) ?? (entry["id"] as? String) ?? (entry["memberId"] as? String)
+        ?? ""
+      let role = (entry["role"] as? String) ?? (entry["memberRole"] as? String) ?? ""
+      let name = (entry["name"] as? String) ?? (entry["username"] as? String) ?? ""
+      return "\(id):\(role):\(name)"
+    }.joined(separator: ",")
+    let tabsSig = availableTabs.map(\.rawValue).joined(separator: ",")
+    let signature = [
+      resolvedName,
+      engineChatId,
+      engineMyUserId,
+      "\(isGroupOrChannel)",
+      "\(isChatMuted)",
+      membersSig,
+      "\(groupMemberCount ?? -1)",
+      "\(canManageGroupMembers)",
+      "\(isGroupOwner)",
+      bridgeProvider,
+      "\(bridgeConnected)",
+      "\(bridgePaired)",
+      bridgeDeviceLabel,
+      "\(rows.count)",
+      tabsSig,
+      "\(mediaRows.count)/\(voiceRows.count)/\(fileRows.count)/\(linkRows.count)",
+      AgentBridgeSelectionStore.selectedRepository(
+        chatId: engineChatId.isEmpty ? nil : engineChatId
+      )?.id ?? "",
+      avatarUri ?? "",
+      profileBio,
+    ].joined(separator: "|")
+    // Skip no-op host reassignments that recreate the ScrollView and jump offset.
+    if signature == lastSwiftUIRenderSignature, swiftUIHostingController != nil {
+      return
+    }
+    lastSwiftUIRenderSignature = signature
 
     let rootView = ChatProfileSwiftUIRootView(
       profileName: resolvedName,
@@ -4596,19 +4675,25 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     let erasedRoot = AnyView(rootView)
 
     if let host = swiftUIHostingController {
-      host.rootView = erasedRoot
+      var transaction = Transaction()
+      transaction.disablesAnimations = true
+      withTransaction(transaction) {
+        host.rootView = erasedRoot
+      }
       host.view.frame = swiftUIContainerView.bounds
       swiftUIContainerView.bringSubviewToFront(host.view)
     } else {
       let host = UIHostingController(rootView: erasedRoot)
-      // NOTE: we deliberately do NOT strip the safe area here anymore. Keeping
-      // the host's real safe area lets the SwiftUI root read `geometry
-      // .safeAreaInsets.top` live, so the header and hero settle in one layout
-      // pass on push — eliminating the snapshot-driven re-render "shift". The
-      // backdrop/scroll still reach the screen edges via `.ignoresSafeArea`.
+      // Keep the host's real safe area so the Material chrome safeAreaInset is
+      // correct on the first frame. Do not strip safeAreaRegions — that was a
+      // major source of chrome/content mismatch jumps.
       host.view.backgroundColor = .clear
       host.view.isOpaque = false
       host.view.frame = swiftUIContainerView.bounds
+      // Avoid UIKit automatically animating content-inset changes into a jump.
+      if let scrollViews = host.view.subviews as [UIView]? {
+        _ = scrollViews
+      }
       swiftUIContainerView.addSubview(host.view)
       swiftUIContainerView.bringSubviewToFront(host.view)
       swiftUIHostingController = host

@@ -93,7 +93,9 @@ enum ChatAvatarURLResolver {
 enum ChatAvatarImageStore {
   private static let imageCache: NSCache<NSString, UIImage> = {
     let cache = NSCache<NSString, UIImage>()
-    cache.countLimit = 384
+    cache.countLimit = 128
+    // ~24 MB of decoded avatar pixels (cost ≈ width*height*4 when known).
+    cache.totalCostLimit = 24 * 1024 * 1024
     return cache
   }()
   private static let inFlightCoordinator = ChatAvatarImageLoadCoordinator()
@@ -105,7 +107,13 @@ enum ChatAvatarImageStore {
 
   static func cache(_ image: UIImage, for rawValue: String?) {
     guard let key = cacheKey(rawValue) else { return }
-    imageCache.setObject(image, forKey: key as NSString)
+    let pixelW = max(1, Int(image.size.width * image.scale))
+    let pixelH = max(1, Int(image.size.height * image.scale))
+    imageCache.setObject(image, forKey: key as NSString, cost: pixelW * pixelH * 4)
+  }
+
+  static func purge() {
+    imageCache.removeAllObjects()
   }
 
   static func load(from rawValue: String?) async -> UIImage? {
@@ -124,7 +132,9 @@ enum ChatAvatarImageStore {
     await inFlightCoordinator.finish(key: key)
 
     if let image {
-      imageCache.setObject(image, forKey: key as NSString)
+      let pixelW = max(1, Int(image.size.width * image.scale))
+      let pixelH = max(1, Int(image.size.height * image.scale))
+      imageCache.setObject(image, forKey: key as NSString, cost: pixelW * pixelH * 4)
     }
     return image
   }
