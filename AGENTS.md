@@ -22,6 +22,27 @@ The user means: **build + install + launch the iOS app on their attached iPhone.
 
 Exact commands + device table: [docs/run-on-device.md](docs/run-on-device.md).
 
+## Deploying server changes (production git remote)
+
+**Required after server-side edits** under `server/` (Elixir controllers, `chat.ex`,
+channels, migrations, etc.): commit on `main`, then push to the **mako** remote so
+the production server can pull/deploy from that repo.
+
+```bash
+# After commit on main:
+git push mako main
+```
+
+- Remote: `mako` → `https://github.com/mako-apps/Vibe.git`
+- Branch: **`main`** (do not invent another deploy branch unless the user says so)
+- Also push `origin` only if the user asks; production deploy path for this workspace
+  is **`git push mako main`**
+- Migrations and runtime config land with whatever deploy pull/hook the mako host uses
+  after that push — agents should **not** SSH/deploy by hand unless explicitly asked
+
+If the push needs auth or is rejected, stop and report the error; do not force-push
+(`--force` / `--force-with-lease`) without explicit user approval.
+
 ## After any iOS code change — build and fix
 
 **Required:** whenever you patch, add, or refactor files under `ios/`, run an
