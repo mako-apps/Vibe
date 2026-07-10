@@ -181,6 +181,8 @@ function parseArgs(argv) {
 }
 
 const ARGS = parseArgs(process.argv);
+let ACTIVE_COMPUTER_ID = null;
+let ACTIVE_COMPUTER_LABEL = null;
 
 function loadConfig() {
   try {
@@ -193,6 +195,37 @@ function loadConfig() {
 function saveConfig(obj) {
   fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(obj, null, 2), { mode: 0o600 });
+}
+
+function adoptComputerIdentity(identity, persist = false) {
+  if (!identity || typeof identity !== "object") return;
+  const computerId = String(identity.computerId || identity.computer_id || "").trim();
+  const computerLabel = String(identity.computerLabel || identity.deviceLabel || identity.device_label || "").trim();
+  if (computerId) ACTIVE_COMPUTER_ID = computerId;
+  if (computerLabel) ACTIVE_COMPUTER_LABEL = computerLabel;
+  if (!persist || !computerId) return;
+  const config = loadConfig();
+  if (config.computer_id === computerId && (!computerLabel || config.device_label === computerLabel)) return;
+  config.computer_id = computerId;
+  if (computerLabel) config.device_label = computerLabel;
+  saveConfig(config);
+}
+
+function payloadTargetsThisComputer(payload, eventName) {
+  const target = String((payload && (payload.computerId || payload.computer_id)) || "").trim();
+  if (!target) return true; // Backwards-compatible server or LAN request.
+  if (ACTIVE_COMPUTER_ID && target === ACTIVE_COMPUTER_ID) return true;
+  console.log(
+    `[vibe-bridge] ignored ${eventName || "request"} for computer=${target}; this computer=${ACTIVE_COMPUTER_ID || "unknown"}`
+  );
+  return false;
+}
+
+function computerFields() {
+  return {
+    ...(ACTIVE_COMPUTER_ID ? { computerId: ACTIVE_COMPUTER_ID } : {}),
+    ...(ACTIVE_COMPUTER_LABEL ? { computerLabel: ACTIVE_COMPUTER_LABEL } : {}),
+  };
 }
 
 // ── End-to-end runtime encryption (zero-knowledge server) ────────────
@@ -1304,7 +1337,12 @@ function taskKey(provider, chatId, taskId) {
 function pushProgressFrame(channel, key, payload) {
   const entry = runningTasks.get(key);
   const seq = entry ? ++entry.frameSeq : (payload.sequence ?? 0);
-  const framed = { ...payload, sequence: seq };
+  const framed = {
+    ...payload,
+    sequence: seq,
+    ...(ACTIVE_COMPUTER_ID ? { computerId: ACTIVE_COMPUTER_ID } : {}),
+    ...(ACTIVE_COMPUTER_LABEL ? { computerLabel: ACTIVE_COMPUTER_LABEL } : {}),
+  };
   if (entry) {
     entry.lastProgress = framed;
     entry.frameLog.push(framed);
@@ -2131,6 +2169,7 @@ async function runBridgeCommand(channel, task, repo, beforeGit, command) {
   if (command && command.name === "compact" && provider === "claude") {
     try {
       channel.push("progress", {
+        ...computerFields(),
         provider,
         chatId,
         taskId,
@@ -2155,6 +2194,7 @@ async function runBridgeCommand(channel, task, repo, beforeGit, command) {
   const lastRuntime = lastRuntimeBySession.get(sessionKey(provider, chatId));
 
   channel.push("progress", {
+    ...computerFields(),
     provider,
     chatId,
     taskId,
@@ -2204,6 +2244,7 @@ async function runBridgeCommand(channel, task, repo, beforeGit, command) {
   ).bridge;
   rememberRuntime(provider, chatId, agentRuntime);
   channel.push("result", {
+    ...computerFields(),
     provider,
     chatId,
     taskId,
@@ -2470,6 +2511,7 @@ function revertFinishedTask(channel, payload) {
 
 function bridgeStatusPayload() {
   return {
+    computerId: ACTIVE_COMPUTER_ID,
     deviceLabel: ARGS.label || os.hostname(),
     cwd: DEFAULT_CWD,
     repositories: ADVERTISED_REPOSITORIES,
@@ -2900,8 +2942,11 @@ async function runTask(channel, task) {
   if (!repoResult.ok) {
     releaseRunTaskReservation(provider, chatId, taskId);
     channel.push("error", {
+      ...computerFields(),
+      ...teamFieldsForTask(task),
       provider,
       chatId,
+      taskId,
       message: `Refused to run ${provider}: ${repoResult.reason}. Add it with --repo or VIBE_BRIDGE_REPOS on your computer.`,
       replyToId,
     });
@@ -2942,7 +2987,14 @@ async function runTask(channel, task) {
   const built = buildCommand(provider, promptForCli, chatId, task);
   if (!built) {
     releaseRunTaskReservation(provider, chatId, taskId);
-    channel.push("error", { provider, chatId, message: `Unknown provider: ${provider}` });
+    channel.push("error", {
+      ...computerFields(),
+      ...teamFieldsForTask(task),
+      provider,
+      chatId,
+      taskId,
+      message: `Unknown provider: ${provider}`,
+    });
     return;
   }
   // Resume diagnostics: whether this run resumes a prior session/thread and, if so,
@@ -2969,7 +3021,15 @@ async function runTask(channel, task) {
     });
   } catch (err) {
     releaseRunTaskReservation(provider, chatId, taskId);
-    channel.push("error", { provider, chatId, message: `Could not start ${built.cmd}: ${err.message}`, replyToId });
+    channel.push("error", {
+      ...computerFields(),
+      ...teamFieldsForTask(task),
+      provider,
+      chatId,
+      taskId,
+      message: `Could not start ${built.cmd}: ${err.message}`,
+      replyToId,
+    });
     return;
   }
   const spawnAt = Date.now();
@@ -3062,6 +3122,36 @@ async function runTask(channel, task) {
   let lastChunkAt = Date.now();
   let keepaliveTimer = null;
   let lastProgressLogAt = 0;
+  let progressFlushTimer = null;
+  const pendingProgressLines = [];
+  const flushProgressLines = () => {
+    if (progressFlushTimer) {
+      clearTimeout(progressFlushTimer);
+      progressFlushTimer = null;
+    }
+    if (pendingProgressLines.length === 0) return;
+    const lines = pendingProgressLines.splice(0, pendingProgressLines.length);
+    pushProgressFrame(channel, key, {
+      provider,
+      chatId,
+      taskId,
+      sentAtMs: Date.now(),
+      replyToId,
+      repoId: repo.id,
+      repoName: repo.name,
+      cwd,
+      workMode: workModeFor(task),
+      model: modelFor(provider, chatId, task) || null,
+      advisor: advisorFor(provider, chatId, task) || null,
+      line: lines.join("\n"),
+    });
+  };
+  const enqueueProgressLine = (line) => {
+    pendingProgressLines.push(line);
+    if (!progressFlushTimer) {
+      progressFlushTimer = setTimeout(flushProgressLines, 75);
+    }
+  };
   // Live "Thinking · N tokens" counter. `--include-partial-messages` streams reasoning as
   // `thinking_delta` events; we accumulate the current block's chars and push a THROTTLED
   // synthetic `vibe_thinking` progress line (never the raw deltas — that would flood the
@@ -3078,20 +3168,9 @@ async function runTask(channel, task) {
     thinkingState.lastEmitAt = now;
     thinkingState.lastTokens = tokens;
     progressCount++;
-    pushProgressFrame(channel, key, {
-      provider,
-      chatId,
-      taskId,
-      sentAtMs: now,
-      replyToId,
-      repoId: repo.id,
-      repoName: repo.name,
-      cwd,
-      workMode: workModeFor(task),
-      model: modelFor(provider, chatId, task) || null,
-      advisor: advisorFor(provider, chatId, task) || null,
-      line: JSON.stringify({ type: "vibe_thinking", tokens, active: thinkingState.active }),
-    });
+    enqueueProgressLine(
+      JSON.stringify({ type: "vibe_thinking", tokens, active: thinkingState.active })
+    );
   };
   // Fold one raw stream-json line into the thinking counter. Returns quietly for any line
   // that isn't a partial thinking event. Gated on a cheap substring test so we only
@@ -3188,20 +3267,7 @@ async function runTask(channel, task) {
               `spawn→push=${now - spawnAt}ms bytes=${output.length} chat=${chatId} task=${taskId}`
           );
         }
-        pushProgressFrame(channel, key, {
-          provider,
-          chatId,
-          taskId,
-          sentAtMs: now,
-          replyToId,
-          repoId: repo.id,
-          repoName: repo.name,
-          cwd,
-          workMode: workModeFor(task),
-          model: modelFor(provider, chatId, task) || null,
-          advisor: advisorFor(provider, chatId, task) || null,
-          line,
-        });
+        enqueueProgressLine(line);
       }
     }
   };
@@ -3232,21 +3298,7 @@ async function runTask(channel, task) {
     if (progressCount >= MAX_PROGRESS_LINES) return;
     if (bare.length > MAX_LINE_BYTES) return;
     progressCount++;
-    const now = Date.now();
-    pushProgressFrame(channel, key, {
-      provider,
-      chatId,
-      taskId,
-      sentAtMs: now,
-      replyToId,
-      repoId: repo.id,
-      repoName: repo.name,
-      cwd,
-      workMode: workModeFor(task),
-      model: modelFor(provider, chatId, task) || null,
-      advisor: advisorFor(provider, chatId, task) || null,
-      line: bare,
-    });
+    enqueueProgressLine(bare);
   };
   if (provider === "grok" && initialSessionId) {
     grokTail = startGrokUpdatesTail({
@@ -3300,7 +3352,15 @@ async function runTask(channel, task) {
   }, KEEPALIVE_MS);
 
   child.on("error", (err) => {
-    channel.push("error", { provider, chatId, message: `${built.cmd} failed: ${err.message}`, replyToId });
+    channel.push("error", {
+      ...computerFields(),
+      ...teamFieldsForTask(task),
+      provider,
+      chatId,
+      taskId,
+      message: `${built.cmd} failed: ${err.message}`,
+      replyToId,
+    });
   });
 
   child.on("close", (code) => {
@@ -3316,6 +3376,9 @@ async function runTask(channel, task) {
     try {
       if (agyTail && typeof agyTail.stop === "function") agyTail.stop();
     } catch (_) {}
+    // Deliver any coalesced burst before the final result. The server processes
+    // channel pushes in order, so the phone sees the last live state first.
+    flushProgressLines();
     // Agy print mode only prints the final answer as plain text — fold it into
     // a text NDJSON event so the server extract path matches Grok.
     if (provider === "agy" && output && !output.includes('"type":"text"') && !output.includes('"type": "text"')) {
@@ -3366,6 +3429,7 @@ async function runTask(channel, task) {
       output,
     });
     const resultPayload = {
+      ...computerFields(),
       provider,
       chatId,
       taskId,
@@ -3951,8 +4015,40 @@ function codexActionLine(p) {
 // `read` is included so the file slice Claude read rides the encrypted blob and
 // powers the read row's "expand to full file" layer (line range still shows in the
 // plaintext preview via the node's start/end).
-const OUTPUT_KINDS = new Set(["bash", "search", "task", "web", "tool", "read"]);
+const OUTPUT_KINDS = new Set(["bash", "search", "task", "web", "tool", "mcp", "read"]);
 const MAX_ACTION_OUTPUT = 4000;
+
+// Claude: mcp__server__tool · Grok use_tool: vibeask__ask_fable · Codex: server+tool fields.
+function parseMcpToolRef(nameOrId) {
+  const raw = String(nameOrId || "").trim();
+  if (!raw) return null;
+  let m = raw.match(/^mcp__(.+?)__(.+)$/i);
+  if (m) return { server: m[1], tool: m[2], raw };
+  // Grok MCP tools often omit the mcp__ prefix: vibeask__ask_fable
+  m = raw.match(/^([a-z][a-z0-9_-]*)__([a-z0-9_-]+)$/i);
+  if (m) return { server: m[1], tool: m[2], raw };
+  return null;
+}
+
+function mcpActionDetail(name, input) {
+  const inp = input && typeof input === "object" ? input : {};
+  const fromName = parseMcpToolRef(name);
+  const fromInput = parseMcpToolRef(inp.tool_name || inp.toolName || inp.name);
+  const p = fromName || fromInput;
+  if (!p) return null;
+  const prettyTool = String(p.tool || "").replace(/_/g, " ");
+  return {
+    kind: "mcp",
+    name: p.raw,
+    server: p.server,
+    tool: p.tool,
+    // Compact target for the phone: "vibeask · ask fable"
+    target: p.server + " · " + prettyTool,
+    // Question / query rides encrypted output path when result arrives; keep a
+    // short prompt preview on the action for the sheet header.
+    prompt: clip(String(inp.question || inp.query || inp.prompt || ""), 200),
+  };
+}
 // Per-edit unified-diff cap (rides the encrypted blob for the edit row's patch layer).
 const MAX_NODE_PATCH = 6000;
 
@@ -4014,8 +4110,11 @@ function claudeActionDetail(b) {
       return { kind: "web", url: String(inp.url || ""), prompt: clip(String(inp.prompt || ""), 200) };
     case "WebSearch":
       return { kind: "web", query: String(inp.query || "") };
-    default:
+    default: {
+      const mcp = mcpActionDetail(b.name, inp);
+      if (mcp) return mcp;
       return { kind: "tool", name: String(b.name || "tool") };
+    }
   }
 }
 
@@ -4147,6 +4246,16 @@ function codexActionDetail(p) {
   if (isCodexShellToolName(name)) {
     return codexShellDetail(codexCommandFromPayload(p));
   }
+  // Codex mcp_tool_call / MCP-ish function names.
+  const itemType = String(p.item_type || p.type || p.kind || "").toLowerCase();
+  if (itemType === "mcp_tool_call" || /mcp/i.test(name)) {
+    const server = String(p.server || p.mcp_server || "").trim() || "mcp";
+    const tool = String(p.tool || p.name || "tool").replace(/^mcp__/i, "");
+    const mcp = mcpActionDetail("mcp__" + server + "__" + tool.replace(/^.*__/, ""), p.arguments || p.input || {});
+    if (mcp) return mcp;
+  }
+  const mcp = mcpActionDetail(name, p.arguments || p.input || {});
+  if (mcp) return mcp;
   return { kind: "tool", name: name || "tool" };
 }
 
@@ -4385,7 +4494,10 @@ function grokActionDetail(name, rawInput) {
     return { kind: "web", url: String(input.url || ""), prompt: clip(String(input.prompt || ""), 200) };
   }
   if (lower === "use_tool" || lower === "search_tool") {
-    return { kind: "tool", name: n || "mcp" };
+    const mcp = mcpActionDetail(n, input);
+    if (mcp) return mcp;
+    const toolName = String(input.tool_name || input.toolName || input.name || n || "tool");
+    return { kind: "tool", name: toolName, target: toolName };
   }
   if (lower === "get_command_or_subagent_output" || lower === "spawn_subagent") {
     return { kind: "task", description: String(input.description || n) };
@@ -4739,7 +4851,9 @@ function actionNodeTarget(kind, d) {
     case "search": return clip(String(d.pattern || ""), 72);
     case "web": return d.url || d.query || "";
     case "task": return clip(String(d.description || ""), 72);
-    default: return "";
+    case "mcp":
+      return d.target || (d.server && d.tool ? d.server + " · " + String(d.tool).replace(/_/g, " ") : "") || d.name || "";
+    default: return d.target || "";
   }
 }
 function cleanNodeLabel(kind, target, d) {
@@ -4753,6 +4867,12 @@ function cleanNodeLabel(kind, target, d) {
     case "task": return "Task" + (target ? " " + target : "");
     case "todo": return "Planning";
     case "thinking": return "Thinking";
+    case "mcp": {
+      // "MCP · ask fable" — stable base (duration is appended client-side at settle).
+      const tool = d.tool ? String(d.tool).replace(/_/g, " ") : "";
+      if (tool) return "MCP · " + tool;
+      return target ? "MCP · " + target : "MCP tool";
+    }
     default: return d.name || "Tool";
   }
 }
@@ -4918,7 +5038,15 @@ function foldTurnIntoHost(messages, turnItems, detailByUid, resultByUid, turnRea
     if (!det) continue;
     if (OUTPUT_KINDS.has(det.kind)) {
       const r = resultByUid.get(it.uid);
-      if (r) { det.output = r.output; det.isError = r.isError; }
+      if (r) {
+        det.output = r.output;
+        det.isError = r.isError;
+        // Tool wall time: tool_use ts → tool_result ts (MCP Ask Fable can be minutes).
+        if (it.ts && r.ts) {
+          const dt = Date.parse(r.ts) - Date.parse(it.ts);
+          if (Number.isFinite(dt) && dt > 0 && dt < 30 * 60 * 1000) det.durationMs = dt;
+        }
+      }
     }
     // NOTE: a result-less trailing tool on the LIVE turn is flagged "running" by
     // markMessageRunning (not here) — status set at fold time would also poison
@@ -5077,7 +5205,11 @@ async function claudeDetail(id, limit, before) {
     if (ev.type === "user" && Array.isArray(m.content)) {
       for (const b of m.content) {
         if (b && b.type === "tool_result" && b.tool_use_id) {
-          resultByUid.set(b.tool_use_id, { output: clipText(toolResultText(b.content), MAX_ACTION_OUTPUT), isError: !!b.is_error });
+          resultByUid.set(b.tool_use_id, {
+            output: clipText(toolResultText(b.content), MAX_ACTION_OUTPUT),
+            isError: !!b.is_error,
+            ts: ev.timestamp || null,
+          });
         }
       }
     }
@@ -6438,6 +6570,13 @@ function mergeGrokLiveUpdatesIntoMessages(match, messages) {
       }
       const det = grokActionDetail(name, input || {});
       const node = actionNode(det, id, "running");
+      // Wall-clock start for duration (MCP Ask Fable can run minutes).
+      node._startedAtMs =
+        Number(rec.timestamp) > 1e12
+          ? Number(rec.timestamp)
+          : Number(rec.timestamp) > 0
+            ? Number(rec.timestamp) * 1000
+            : Date.now();
       nodesById.set(id, node);
       ensureOrder(id);
       bumpSegAfterTool();
@@ -6452,6 +6591,22 @@ function mergeGrokLiveUpdatesIntoMessages(match, messages) {
       if (status === "completed" || status === "failed" || status === "error" || status === "cancelled") {
         if (existing) {
           existing.status = status === "completed" ? "done" : "error";
+          const endMs =
+            Number(rec.timestamp) > 1e12
+              ? Number(rec.timestamp)
+              : Number(rec.timestamp) > 0
+                ? Number(rec.timestamp) * 1000
+                : Date.now();
+          if (existing._startedAtMs && endMs > existing._startedAtMs) {
+            const dt = endMs - existing._startedAtMs;
+            if (dt > 0 && dt < 30 * 60 * 1000) existing.durationMs = dt;
+          }
+          // Attach tool result text for MCP/generic tools (sheet body).
+          const content = grokUpdateContentText(u.content);
+          if (content && (existing.kind === "mcp" || existing.kind === "tool")) {
+            existing.detail = clipText(content, 4000);
+            existing.output = existing.detail;
+          }
         } else {
           const meta = (u._meta && (u._meta["x.ai/tool"] || u._meta.xAiTool)) || {};
           const name = meta.name || u.title || "tool";
@@ -6512,6 +6667,12 @@ function mergeGrokLiveUpdatesIntoMessages(match, messages) {
   let nodes = order.map((id) => nodesById.get(id)).filter(Boolean);
   // Adjacent text-only merge; never collapse text across tools.
   nodes = collapseLiveTextNodes(nodes);
+  // Strip private timing fields before shipping to the phone.
+  nodes = nodes.map((n) => {
+    if (!n || n._startedAtMs == null) return n;
+    const { _startedAtMs, ...rest } = n;
+    return rest;
+  });
   nodes = nodes.slice(-60);
   if (nodes.length || sawTurnCompleted) {
     // Stop-loss: never replace a rich live host with an empty settled payload.
@@ -7035,6 +7196,23 @@ function startHistoryWatch(channel, { chatId, provider, sessionId, echo, limit }
   schedule(); // catch anything appended between the initial read and now
 }
 
+// Home/chat rebinds can briefly issue the same History-list request several times per
+// render pass. Keep the wire contract (each caller still receives its own requestId),
+// but avoid rescanning every provider's on-disk session roster for an identical list.
+const HISTORY_LIST_CACHE_MS = Number(process.env.VIBE_HISTORY_LIST_CACHE_MS || 750);
+const historyListCache = new Map();
+
+function historyListCacheKey(provider, chatId, limit) {
+  return [String(provider || "").toLowerCase(), String(chatId || ""), String(limit || "")].join("|");
+}
+
+function clonedHistoryListResult(result) {
+  return {
+    ...result,
+    sessions: Array.isArray(result && result.sessions) ? result.sessions.map((session) => ({ ...session })) : [],
+  };
+}
+
 function handleHistoryRequest(channel, payload) {
   const provider = payload.provider || payload.agentBridgeProvider || "claude";
   const mode = payload.mode;
@@ -7051,6 +7229,21 @@ function handleHistoryRequest(channel, payload) {
   };
   const start = Date.now();
   const want = String(mode || "").toLowerCase() === "detail" || !!sessionId ? "detail" : "list";
+  const listCacheKey = want === "list" && !before
+    ? historyListCacheKey(provider, chatId, payload.limit)
+    : null;
+  if (listCacheKey) {
+    const cached = historyListCache.get(listCacheKey);
+    if (cached && Date.now() - cached.at < HISTORY_LIST_CACHE_MS) {
+      const result = clonedHistoryListResult(cached.result);
+      console.log(
+        `[vibe-bridge][history] cache provider=${provider} mode=list chat=${chatId || "-"} ` +
+          `requestId=${requestId} age=${Date.now() - cached.at}ms count=${result.sessions.length}`
+      );
+      channel.push("history_result", { ok: true, ...echo, ...result });
+      return;
+    }
+  }
   // "Current session" request: detail for a chat without naming a session. Opening a
   // Claude/Codex DM mid-run must land directly in the running conversation, but the
   // phone doesn't know the session id yet (it only learns it from stream frames that
@@ -7117,6 +7310,12 @@ function handleHistoryRequest(channel, payload) {
 
   readHistory({ provider, mode, sessionId: effectiveSessionId, limit: payload.limit, before })
     .then((result) => {
+      if (listCacheKey && result && result.mode === "list") {
+        historyListCache.set(listCacheKey, {
+          at: Date.now(),
+          result: clonedHistoryListResult(result),
+        });
+      }
       const count =
         result && result.mode === "detail"
           ? (((result.session || {}).messages || []).length)
@@ -7348,7 +7547,11 @@ const pendingAsks = new Map(); // requestId -> { resolve, timer, chatId }
 // the SAME requestId still resolves the live `requestAsk` promise when answered.
 const pendingAsksByChat = new Map(); // chatId -> { requestId, provider, taskId, replyToId, kind, body }
 let askSeq = 0;
-const ASK_TIMEOUT_MS = Number(process.env.VIBE_ASK_TIMEOUT_MS || 10 * 60 * 1000);
+// Mobile is the control surface for bridge runs. A request must remain pending until
+// the user answers or the originating process explicitly cancels it; timing it out
+// breaks the run while the phone is backgrounded or briefly offline. Set a positive
+// VIBE_ASK_TIMEOUT_MS only when an installation deliberately wants legacy expiry.
+const ASK_TIMEOUT_MS = Number(process.env.VIBE_ASK_TIMEOUT_MS || 0);
 
 function newAskId(chatId) {
   askSeq += 1;
@@ -7360,7 +7563,15 @@ function pushAskRequest(channel, { provider, chatId, taskId, replyToId, requestI
   // hosts every session, so chatId+provider alone can't tell the phone WHICH page owns
   // the approval. expiresAtMs lets the phone auto-dismiss a sheet whose ask has timed
   // out bridge-side (the timeout auto-rejects; a stale sheet would answer a dead ask).
-  const base = { provider, chatId, taskId, replyToId, requestId, kind };
+  const base = {
+    provider,
+    chatId,
+    taskId,
+    replyToId,
+    requestId,
+    kind,
+    ...(ACTIVE_COMPUTER_ID ? { computerId: ACTIVE_COMPUTER_ID } : {}),
+  };
   if (sessionId) base.sessionId = sessionId;
   if (resumedFromSessionId) base.resumedFromSessionId = resumedFromSessionId;
   if (expiresAtMs) base.expiresAtMs = expiresAtMs;
@@ -7420,19 +7631,19 @@ function requestAsk(channel, { provider, chatId, taskId, replyToId, kind, body }
   // A resumed run mints a NEW session id, but the phone's page still identifies the
   // conversation by the id it resumed FROM — send both so the page can claim its ask.
   const resumedFromSessionId = running ? resumeIdFor(running.task || running) : null;
-  const expiresAtMs = Date.now() + ASK_TIMEOUT_MS;
+  const expiresAtMs = ASK_TIMEOUT_MS > 0 ? Date.now() + ASK_TIMEOUT_MS : null;
   const promise = new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      if (pendingAsks.delete(requestId)) {
-        clearPendingAskForChat(chatId, requestId);
-        console.log(`[vibe-bridge] ask ${requestId} timed out → auto-reject`);
-        // The ask is dead — tell the phone so a still-up sheet / waiting badge is
-        // dismissed rather than lingering (answering it later would be a no-op).
-        pushAskCancel(activeChannel || channel, chatId, requestId, "timeout");
-        resolve({ decision: "reject", answer: null, timedOut: true });
-      }
-    }, ASK_TIMEOUT_MS);
-    timer.unref?.();
+    const timer = ASK_TIMEOUT_MS > 0
+      ? setTimeout(() => {
+          if (pendingAsks.delete(requestId)) {
+            clearPendingAskForChat(chatId, requestId);
+            console.log(`[vibe-bridge] ask ${requestId} timed out → auto-reject`);
+            pushAskCancel(activeChannel || channel, chatId, requestId, "timeout");
+            resolve({ decision: "reject", answer: null, timedOut: true });
+          }
+        }, ASK_TIMEOUT_MS)
+      : null;
+    timer?.unref?.();
     pendingAsks.set(requestId, { resolve, timer, chatId });
     // Remember it per-chat so opening this chat from history re-surfaces the ask.
     if (chatId) {
@@ -7452,7 +7663,12 @@ function requestAsk(channel, { provider, chatId, taskId, replyToId, kind, body }
 // now stale. No-op once the ask has already been answered or timed out.
 function pushAskCancel(channel, chatId, requestId, reason) {
   try {
-    channel.push("ask_cancel", { chatId, requestId, reason: reason || "resolved_elsewhere" });
+    channel.push("ask_cancel", {
+      chatId,
+      requestId,
+      reason: reason || "resolved_elsewhere",
+      ...(ACTIVE_COMPUTER_ID ? { computerId: ACTIVE_COMPUTER_ID } : {}),
+    });
     console.log(`[vibe-bridge][ask] push ask_cancel requestId=${requestId} chat=${chatId} reason=${reason || "resolved_elsewhere"}`);
   } catch (e) {
     console.log(`[vibe-bridge][ask] ask_cancel push THREW requestId=${requestId} ${e && e.message}`);
@@ -7481,6 +7697,10 @@ function clearPendingAskForChat(chatId, requestId) {
 // Re-push any genuinely-pending ask/command for a chat the phone just opened from
 // history. Reuses the SAME requestId + body, so the live blocked `requestAsk` promise
 // resolves normally when the phone answers. No-op when nothing is outstanding.
+// Debounced: history list+detail + watch ticks used to re-push the same sheet on
+// every request (layout flash + “ask spam” while the user browses Grok History).
+const lastAskReemitAtByChat = new Map();
+const ASK_REEMIT_MIN_MS = Number(process.env.VIBE_ASK_REEMIT_MIN_MS || 8000);
 function reemitPendingAskForChat(channel, chatId) {
   if (!chatId) return;
   const rec = pendingAsksByChat.get(chatId);
@@ -7491,6 +7711,12 @@ function reemitPendingAskForChat(channel, chatId) {
     pendingAsksByChat.delete(chatId);
     return;
   }
+  const now = Date.now();
+  const last = lastAskReemitAtByChat.get(chatId) || 0;
+  if (now - last < ASK_REEMIT_MIN_MS) {
+    return;
+  }
+  lastAskReemitAtByChat.set(chatId, now);
   console.log(`[vibe-bridge][ask] re-emit pending ask on history open requestId=${rec.requestId} kind=${rec.kind} chat=${chatId}`);
   pushAskRequest(channel, { ...rec, chatId, requestId: rec.requestId });
 }
@@ -8563,25 +8789,31 @@ function handleLanConnection(sock, req, userId) {
         send({ type: "lan_pong", ts: Date.now() });
         break;
       case "run_task":
+        if (!payloadTargetsThisComputer(p, msg.type)) break;
         runTask(lanTransport, p).catch((err) =>
           console.error(`[vibe-bridge] LAN runTask error: ${(err && err.message) || err}`)
         );
         break;
       case "control_task":
+        if (!payloadTargetsThisComputer(p, msg.type)) break;
         controlTask(lanTransport, p);
         break;
       case "history_request":
+        if (!payloadTargetsThisComputer(p, msg.type)) break;
         handleHistoryRequest(lanTransport, p);
         break;
       case "file_request":
+        if (!payloadTargetsThisComputer(p, msg.type)) break;
         handleFileRequest(lanTransport, p);
         break;
       case "usage_request":
+        if (!payloadTargetsThisComputer(p, msg.type)) break;
         handleUsageRequest(lanTransport, p).catch((err) =>
           console.error(`[vibe-bridge] LAN usage_request error: ${(err && err.message) || err}`)
         );
         break;
       case "ask_response":
+        if (!payloadTargetsThisComputer(p, msg.type)) break;
         resolveAsk(p);
         break;
       default:
@@ -8657,20 +8889,42 @@ function connect(server, token, userId) {
   socket.connect();
 
   const channel = socket.channel(`bridge:${userId}`, {});
-  channel.on("run_task", (task) =>
+  channel.on("bridge_identity", (payload) => {
+    adoptComputerIdentity(payload || {}, true);
+    console.log(
+      `[vibe-bridge] identity computer=${ACTIVE_COMPUTER_ID || "unknown"} label=${ACTIVE_COMPUTER_LABEL || ARGS.label || os.hostname()}`
+    );
+    pushBridgeStatus(channel);
+  });
+  channel.on("run_task", (task) => {
+    if (!payloadTargetsThisComputer(task, "run_task")) return;
     runTask(channel, task).catch((err) =>
       console.error(`[vibe-bridge] runTask error: ${(err && err.message) || err}`)
-    )
-  );
-  channel.on("control_task", (payload) => controlTask(channel, payload || {}));
-  channel.on("history_request", (payload) => handleHistoryRequest(channel, payload || {}));
-  channel.on("file_request", (payload) => handleFileRequest(channel, payload || {}));
+    );
+  });
+  channel.on("control_task", (payload) => {
+    if (!payloadTargetsThisComputer(payload, "control_task")) return;
+    controlTask(channel, payload || {});
+  });
+  channel.on("history_request", (payload) => {
+    if (!payloadTargetsThisComputer(payload, "history_request")) return;
+    handleHistoryRequest(channel, payload || {});
+  });
+  channel.on("file_request", (payload) => {
+    if (!payloadTargetsThisComputer(payload, "file_request")) return;
+    handleFileRequest(channel, payload || {});
+  });
   channel.on("usage_request", (payload) =>
-    handleUsageRequest(channel, payload || {}).catch((err) =>
-      console.error(`[vibe-bridge] usage_request error: ${(err && err.message) || err}`)
-    )
+    payloadTargetsThisComputer(payload, "usage_request")
+      ? handleUsageRequest(channel, payload || {}).catch((err) =>
+          console.error(`[vibe-bridge] usage_request error: ${(err && err.message) || err}`)
+        )
+      : undefined
   );
-  channel.on("ask_response", (payload) => resolveAsk(payload || {}));
+  channel.on("ask_response", (payload) => {
+    if (!payloadTargetsThisComputer(payload, "ask_response")) return;
+    resolveAsk(payload || {});
+  });
   ensureAskMcp(channel); // start the ask_user MCP IPC server; refresh active channel
 
   channel
@@ -8867,6 +9121,10 @@ async function main() {
 
   const config = loadConfig();
   const persist = () => saveConfig(config);
+  adoptComputerIdentity(
+    { computerId: config.computer_id, computerLabel: config.device_label || ARGS.label },
+    false
+  );
   const server = normalizeServer(ARGS.server || config.server || "https://api.vibegram.io");
   if (!server) {
     console.error("[vibe-bridge] Missing --server <https://your-vibe-server>");
@@ -8898,6 +9156,8 @@ async function main() {
     const result = await scanToPair(server, ARGS.label);
     config.bridge_token = result.bridge_token;
     config.user_id = result.user_id;
+    config.computer_id = result.computer_id || config.computer_id;
+    adoptComputerIdentity(result, false);
     persist();
     console.log("[vibe-bridge] paired ✓ (token cached in ~/.vibe/bridge.json)");
   }
@@ -8912,6 +9172,8 @@ async function main() {
     const result = await redeemPairing(server, ARGS.code, ARGS.label);
     config.bridge_token = result.bridge_token;
     config.user_id = result.user_id;
+    config.computer_id = result.computer_id || config.computer_id;
+    adoptComputerIdentity(result, false);
     persist();
     console.log("[vibe-bridge] paired ✓ (token cached in ~/.vibe/bridge.json)");
     if (!ARGS.rk) {
@@ -8943,6 +9205,8 @@ async function main() {
     const result = await scanToPair(server, ARGS.label);
     config.bridge_token = result.bridge_token;
     config.user_id = result.user_id;
+    config.computer_id = result.computer_id || config.computer_id;
+    adoptComputerIdentity(result, false);
     persist();
     console.log("[vibe-bridge] paired ✓ (token cached in ~/.vibe/bridge.json)");
   }

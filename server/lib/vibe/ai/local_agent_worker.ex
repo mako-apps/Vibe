@@ -2,6 +2,7 @@ defmodule Vibe.AI.LocalAgentWorker do
   @moduledoc false
 
   require Logger
+  import Ecto.Query
 
   alias Vibe.AgentBridge
   alias Vibe.Badges
@@ -10,6 +11,7 @@ defmodule Vibe.AI.LocalAgentWorker do
   alias Vibe.Chat.GroupAgentMemory
   alias Vibe.Notifications
   alias Vibe.Repo
+  alias Vibe.AI.TeamRun
 
   # How many recent shared-thread turns to inject as collaboration context when
   # dispatching a bridge agent inside a group.
@@ -464,7 +466,10 @@ defmodule Vibe.AI.LocalAgentWorker do
       worker ->
         reply_to_id = Keyword.get(opts, :reply_to_id)
         requester_user_id = Keyword.get(opts, :requester_user_id)
-        runtime = normalize_runtime_payload(Keyword.get(opts, :runtime))
+        runtime =
+          Keyword.get(opts, :runtime)
+          |> normalize_runtime_payload()
+          |> merge_team_runtime(opts)
         # End-to-end encrypted runtime blob. Opaque to the server: stored and
         # served verbatim, never decrypted, parsed, or logged. The key lives
         # only on the user's bridge and phone.
@@ -624,6 +629,9 @@ defmodule Vibe.AI.LocalAgentWorker do
       teammate_names = team_workers_label(team_workers)
       teammate_handles = team_workers_handles(team_workers)
       handoff_path = ".vibe/team/#{safe_team_run_id(team_run_id)}.md"
+      worker_index = Enum.find_index(team_workers, &(&1.handle == worker.handle)) || 0
+      worker_number = worker_index + 1
+      default_focus = team_worker_default_focus(worker.handle)
 
       """
       You are #{worker.label} in a Vibe team run.
@@ -631,6 +639,18 @@ defmodule Vibe.AI.LocalAgentWorker do
       Team run id: #{team_run_id || "unknown"}
       Teammates in this run: #{teammate_names}
       Team handles: #{teammate_handles}
+      Your step: #{worker_number} of #{length(team_workers)}
+      Default focus: #{default_focus}
+
+      The server gives edit ownership to one worker at a time. You currently own
+      this step; later workers will build on your result. Read #{handoff_path}
+      before editing. Do not reset, stash, revert, or overwrite pre-existing user
+      changes. If another worker already owns a file or completed a slice, take a
+      non-overlapping slice. Append your ownership, findings, exact files changed,
+      verification, blockers, and recommended next owner to the handoff before
+      finishing. The first worker should record a short decomposition; later
+      workers should update it rather than replace it. If a configured advisor is
+      unavailable, record that fact and continue with the executor's best judgment.
 
       Collaboration rules:
       #{agent_operating_rules(worker, handoff_path)}
@@ -650,7 +670,7 @@ defmodule Vibe.AI.LocalAgentWorker do
   def build_team_bridge_prompt(_chat_id, _worker, dispatch_text, _requester, _workers, _run_id),
     do: dispatch_text
 
-  @doc "Start an in-memory bridge team run and return the first worker to dispatch."
+  @doc "Persist a coordinated bridge team run and return its first owner."
   def register_bridge_team_run(
         chat_id,
         team_run_id,
@@ -669,24 +689,40 @@ defmodule Vibe.AI.LocalAgentWorker do
 
       [first | remaining] ->
         ensure_team_run_table()
+        state = %{
+          chat_id: chat_id,
+          team_run_id: team_run_id,
+          workers: handles,
+          remaining: remaining,
+          dispatch_text: dispatch_text,
+          requester_user_id: requester_user_id,
+          reply_to_id: reply_to_id,
+          bridge_metadata: bridge_metadata || %{},
+          started_at: System.system_time(:millisecond)
+        }
 
-        :ets.insert(
-          @team_run_table,
-          {{chat_id, team_run_id},
-           %{
-             chat_id: chat_id,
-             team_run_id: team_run_id,
-             workers: handles,
-             remaining: remaining,
-             dispatch_text: dispatch_text,
-             requester_user_id: requester_user_id,
-             reply_to_id: reply_to_id,
-             bridge_metadata: bridge_metadata || %{},
-             started_at: System.system_time(:millisecond)
-           }}
-        )
+        case persist_team_run(state, first) do
+          :created ->
+            :ets.insert(@team_run_table, {{chat_id, team_run_id}, state})
+            resolve_handle(first)
 
-        resolve_handle(first)
+          :duplicate ->
+            Logger.info(
+              "[LocalAgentWorker] duplicate team registration ignored chat=#{chat_id} run=#{team_run_id}"
+            )
+
+            nil
+
+          {:error, reason} ->
+            # Preserve availability during a rolling deploy before the migration is
+            # applied, but make the durability loss explicit in logs.
+            Logger.error(
+              "[LocalAgentWorker] durable team registration failed; using ETS fallback chat=#{chat_id} run=#{team_run_id} reason=#{inspect(reason)}"
+            )
+
+            :ets.insert(@team_run_table, {{chat_id, team_run_id}, state})
+            resolve_handle(first)
+        end
     end
   end
 
@@ -696,7 +732,123 @@ defmodule Vibe.AI.LocalAgentWorker do
   def clear_bridge_team_run(chat_id, team_run_id) do
     ensure_team_run_table()
     :ets.delete(@team_run_table, {chat_id, team_run_id})
+    now = DateTime.utc_now()
+
+    Repo.update_all(
+      from(run in TeamRun,
+        where: run.id == ^team_run_id and run.chat_id == ^chat_id and run.status == "running"
+      ),
+      set: [status: "completed", updated_at: now]
+    )
+
     :ok
+  rescue
+    error ->
+      Logger.warning(
+        "[LocalAgentWorker] could not finalize durable team run chat=#{chat_id} run=#{team_run_id}: #{Exception.message(error)}"
+      )
+
+      :ok
+  end
+
+  defp persist_team_run(state, first_worker) do
+    attrs = %{
+      id: state.team_run_id,
+      chat_id: state.chat_id,
+      requester_user_id: state.requester_user_id,
+      computer_id: state.bridge_metadata["computerId"],
+      reply_to_id: state.reply_to_id,
+      workers: state.workers,
+      current_index: 0,
+      current_worker: first_worker,
+      status: "running",
+      dispatch_ciphertext: AgentMessageCrypto.encrypt_for_storage(state.dispatch_text),
+      bridge_metadata: state.bridge_metadata
+    }
+
+    %TeamRun{}
+    |> TeamRun.changeset(attrs)
+    |> Repo.insert()
+    |> case do
+      {:ok, _run} ->
+        :created
+
+      {:error, changeset} ->
+        if Keyword.has_key?(changeset.errors, :id),
+          do: :duplicate,
+          else: {:error, changeset}
+    end
+  rescue
+    error -> {:error, error}
+  end
+
+  # Row locking makes a repeated final result or two Phoenix nodes racing to
+  # continue the same run harmless: only the current owner may advance once.
+  defp advance_durable_team_run(chat_id, team_run_id, completed_handle) do
+    Repo.transaction(fn ->
+      run =
+        Repo.one(
+          from(run in TeamRun,
+            where: run.id == ^team_run_id and run.chat_id == ^chat_id,
+            lock: "FOR UPDATE"
+          )
+        )
+
+      cond do
+        is_nil(run) ->
+          {:error, :not_found}
+
+        run.status != "running" ->
+          :done
+
+        run.current_worker != completed_handle ->
+          :noop
+
+        true ->
+          next_index = run.current_index + 1
+
+          case Enum.at(run.workers, next_index) do
+            nil ->
+              run
+              |> TeamRun.changeset(%{status: "completed"})
+              |> Repo.update!()
+
+              :done
+
+            next_handle ->
+              updated =
+                run
+                |> TeamRun.changeset(%{
+                  current_index: next_index,
+                  current_worker: next_handle,
+                  status: "running"
+                })
+                |> Repo.update!()
+
+              {:next, durable_team_state(updated), next_handle}
+          end
+      end
+    end)
+    |> case do
+      {:ok, value} -> value
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    error -> {:error, error}
+  end
+
+  defp durable_team_state(%TeamRun{} = run) do
+    %{
+      chat_id: to_string(run.chat_id),
+      team_run_id: to_string(run.id),
+      workers: run.workers || [],
+      remaining: Enum.drop(run.workers || [], run.current_index + 1),
+      dispatch_text: AgentMessageCrypto.decrypt_from_storage(run.dispatch_ciphertext || ""),
+      requester_user_id: to_string(run.requester_user_id),
+      reply_to_id: run.reply_to_id,
+      bridge_metadata: run.bridge_metadata || %{},
+      started_at: DateTime.to_unix(run.inserted_at, :millisecond)
+    }
   end
 
   @doc "Record a human's prompt to a worker into the shared group memory (no-op in DMs)."
@@ -784,6 +936,39 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp dispatch_next_team_worker(chat_id, team_run_id, completed_worker, requester_user_id) do
     ensure_team_run_table()
 
+    case advance_durable_team_run(chat_id, team_run_id, completed_worker.handle) do
+      {:next, state, next_handle} ->
+        :ets.insert(@team_run_table, {{chat_id, team_run_id}, state})
+        dispatch_team_worker_from_state(state, next_handle, completed_worker, requester_user_id)
+
+      :done ->
+        :ets.delete(@team_run_table, {chat_id, team_run_id})
+        :ok
+
+      :noop ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "[LocalAgentWorker] durable team advance failed; using ETS fallback chat=#{chat_id} run=#{team_run_id} reason=#{inspect(reason)}"
+        )
+
+        dispatch_next_team_worker_from_cache(
+          chat_id,
+          team_run_id,
+          completed_worker,
+          requester_user_id
+        )
+    end
+  end
+
+  defp dispatch_next_team_worker_from_cache(
+         chat_id,
+         team_run_id,
+         completed_worker,
+         requester_user_id
+       ) do
+
     case :ets.lookup(@team_run_table, {chat_id, team_run_id}) do
       [{{^chat_id, ^team_run_id}, state}] ->
         remaining = Map.get(state, :remaining, [])
@@ -857,13 +1042,25 @@ defmodule Vibe.AI.LocalAgentWorker do
               "[LocalAgentWorker] chained team dispatch chat=#{state.chat_id} run=#{state.team_run_id} from=#{completed_worker.handle} to=#{next_worker.handle}"
             )
 
-          {:error, :offline} ->
+          {:error, reason} ->
             stop_activity(state.chat_id, next_worker.agent_user_id)
+
+            notice =
+              case reason do
+                :computer_required ->
+                  "Choose which connected computer should continue this team run."
+
+                :computer_offline ->
+                  "The selected computer went offline before @#{next_worker.handle} could continue the team run."
+
+                _ ->
+                  "Your computer went offline before @#{next_worker.handle} could continue the team run."
+              end
 
             post_notice(
               next_worker,
               state.chat_id,
-              "Your computer went offline before @#{next_worker.handle} could continue the team run.",
+              notice,
               requester_user_id,
               state.reply_to_id
             )
@@ -1048,6 +1245,12 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
+  defp team_worker_default_focus("claude"), do: "lead review, debugging, risk analysis, and handoff quality"
+  defp team_worker_default_focus("codex"), do: "focused implementation, backend/data work, and verification"
+  defp team_worker_default_focus("grok"), do: "fast investigation, current-context checks, and independent review"
+  defp team_worker_default_focus("agy"), do: "UI, visual/product behavior, and cross-platform review"
+  defp team_worker_default_focus(_), do: "the highest-value unowned slice"
+
   defp context_or_empty(""), do: "No previous shared group memory yet."
   defp context_or_empty(nil), do: "No previous shared group memory yet."
   defp context_or_empty(context), do: context
@@ -1186,6 +1389,8 @@ defmodule Vibe.AI.LocalAgentWorker do
             "teamWorkers",
             normalize_team_workers(metadata["teamWorkers"] || metadata[:team_workers])
           )
+          |> maybe_put("computerId", metadata["computerId"] || metadata[:computer_id])
+          |> maybe_put("computerLabel", metadata["computerLabel"] || metadata[:computer_label])
 
         VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-stream", payload)
 
@@ -2504,13 +2709,25 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   defp tool_event_to_node(event, index) do
-    %{
+    node = %{
       "id" => event["id"] || unique_event_id("worker-progress", index),
       "label" => event["label"] || event["tool"] || "Working...",
       "status" => event["status"] || "running",
       "depth" => 0
     }
     |> copy_node_shape(event)
+
+    # MCP / generic tool results: plaintext detail for the phone sheet when the
+    # encrypted action blob is not yet joined (live stream path).
+    case Map.get(event, "outputPreview") || Map.get(event, "output") do
+      preview when is_binary(preview) and preview != "" ->
+        node
+        |> Map.put("detail", clip_text_node(preview))
+        |> Map.put("output", clip_text_node(preview))
+
+      _ ->
+        node
+    end
   end
 
   defp extract_worker_text(%{handle: "codex"}, decoded, output) do
@@ -2562,43 +2779,14 @@ defmodule Vibe.AI.LocalAgentWorker do
       |> normalize_string()
   end
 
-  # Grok often emits sentence-sized `text` chunks. Blind join produced
-  # "issue.This is not…" in the phone body. Insert space or paragraph break
-  # when adjacent chunks lack whitespace at the boundary.
+  # Grok's streaming JSON emits token deltas. Their boundaries are arbitrary,
+  # so adding separators here corrupts exact text (for example IDs and code).
+  # Whitespace that belongs in the answer is already present in the deltas.
   defp join_grok_text_chunks([]), do: ""
   defp join_grok_text_chunks(chunks) when is_list(chunks) do
-    Enum.reduce(chunks, "", fn chunk, acc ->
-      chunk = to_string(chunk)
-
-      cond do
-        chunk == "" ->
-          acc
-
-        acc == "" ->
-          chunk
-
-        true ->
-          a = String.last(acc) || ""
-          b = String.first(chunk) || ""
-          a_ws? = a != "" and String.trim(a) == ""
-          b_ws? = b != "" and String.trim(b) == ""
-          punct_b? = b in [".", ",", ";", ":", "!", "?", ")", "]", "}"]
-          open_b? = b in ["(", "[", "{", "/", "-"]
-          upper_b? = b >= "A" and b <= "Z"
-
-          sentence_break? = a in [".", "!", "?"] and upper_b?
-
-          sep =
-            cond do
-              a_ws? or b_ws? -> ""
-              sentence_break? -> "\n\n"
-              punct_b? or open_b? -> ""
-              true -> " "
-            end
-
-          acc <> sep <> chunk
-      end
-    end)
+    chunks
+    |> Enum.map(&to_string/1)
+    |> Enum.join("")
   end
 
   defp plain_output_text([], output), do: normalize_string(output)
@@ -3058,15 +3246,21 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   defp codex_item_fields("mcp_tool_call", item) do
-    tool = normalize_string(item["tool"]) || normalize_string(item["name"]) || "MCP"
-    server = normalize_string(item["server"])
-    label = if server, do: "#{server}.#{tool}", else: tool
+    tool = normalize_string(item["tool"]) || normalize_string(item["name"]) || "tool"
+    server = normalize_string(item["server"]) || "mcp"
+    # Fake mcp__ name so put_node_shape → kind:mcp + "server · tool" target.
+    label = "mcp__#{server}__#{tool}"
 
     input =
       cond do
-        is_map(item["arguments"]) -> item["arguments"]
-        is_binary(item["arguments"]) -> %{"arguments" => item["arguments"]}
-        true -> %{}
+        is_map(item["arguments"]) ->
+          Map.merge(item["arguments"], %{"server" => server, "tool" => tool})
+
+        is_binary(item["arguments"]) ->
+          %{"arguments" => item["arguments"], "server" => server, "tool" => tool}
+
+        true ->
+          %{"server" => server, "tool" => tool}
       end
 
     {label, input, item["result"] || item["output"] || item["content"]}
@@ -3862,6 +4056,24 @@ defmodule Vibe.AI.LocalAgentWorker do
       "agentWorkerTeamWorkers",
       normalize_team_workers(Keyword.get(opts, :team_workers))
     )
+    |> maybe_put("agentBridgeComputerId", normalize_string(Keyword.get(opts, :computer_id)))
+    |> maybe_put("agentBridgeComputerLabel", normalize_string(Keyword.get(opts, :computer_label)))
+  end
+
+  defp merge_team_runtime(runtime, opts) do
+    team = %{}
+    |> maybe_put("teamMode", normalize_string(Keyword.get(opts, :team_mode)))
+    |> maybe_put("teamRunId", normalize_string(Keyword.get(opts, :team_run_id)))
+    |> maybe_put("teamWorker", normalize_string(Keyword.get(opts, :team_worker)))
+    |> maybe_put("teamWorkers", normalize_team_workers(Keyword.get(opts, :team_workers)))
+    |> maybe_put("computerId", normalize_string(Keyword.get(opts, :computer_id)))
+    |> maybe_put("computerLabel", normalize_string(Keyword.get(opts, :computer_label)))
+
+    cond do
+      map_size(team) == 0 -> runtime
+      is_map(runtime) -> Map.merge(runtime, team)
+      true -> Map.put(team, "status", "done")
+    end
   end
 
   defp normalize_team_workers(values) when is_list(values) do
@@ -4008,8 +4220,15 @@ defmodule Vibe.AI.LocalAgentWorker do
       t in ["todowrite", "todo", "todo_write"] ->
         {"todo", nil}
 
+      # Claude: mcp__vibeask__ask_fable · Grok use_tool → vibeask__ask_fable
+      not is_nil(mcp_progress_target(t, input)) ->
+        {"mcp", mcp_progress_target(t, input)}
+
       t in ["use_tool", "search_tool"] ->
-        {"tool", short_target(input["tool_name"] || input["query"] || input["name"])}
+        case mcp_progress_target(to_string(input["tool_name"] || input["toolName"] || ""), input) do
+          nil -> {"tool", short_target(input["tool_name"] || input["query"] || input["name"])}
+          target -> {"mcp", target}
+        end
 
       true ->
         {"tool", target_basename(path) || short_target(input["command"])}
@@ -4017,6 +4236,38 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   defp tool_kind_and_target(tool, _input), do: {to_string(tool) |> String.downcase(), nil}
+
+  # "vibeask · ask fable" for mcp__server__tool or server__tool names.
+  defp mcp_progress_target(tool_name, input) when is_binary(tool_name) do
+    t = String.trim(tool_name)
+
+    cond do
+      t == "" ->
+        nil
+
+      String.match?(t, ~r/^mcp__/i) or String.contains?(t, "__") ->
+        cleaned = t |> String.replace_prefix("mcp__", "") |> String.replace_prefix("MCP__", "")
+        parts = String.split(cleaned, "__", parts: 2)
+
+        case parts do
+          [server, tool] when server != "" and tool != "" ->
+            pretty = tool |> String.replace("_", " ")
+            "#{server} · #{pretty}"
+
+          _ ->
+            short_target(t)
+        end
+
+      is_map(input) and is_binary(input["server"]) and is_binary(input["tool"]) ->
+        pretty = String.replace(input["tool"], "_", " ")
+        "#{input["server"]} · #{pretty}"
+
+      true ->
+        nil
+    end
+  end
+
+  defp mcp_progress_target(_, _), do: nil
 
   defp target_basename(path) when is_binary(path) do
     case Path.basename(String.trim(path)) do
@@ -4154,9 +4405,18 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   defp tool_label(provider, tool, input) do
-    case tool_detail(input) do
-      nil -> "#{provider} #{tool}"
-      detail -> "#{provider} #{tool}: #{truncate(detail, 96)}"
+    t = tool |> to_string()
+    mcp = mcp_progress_target(t, input || %{})
+
+    cond do
+      is_binary(mcp) and mcp != "" ->
+        "MCP · #{mcp}"
+
+      true ->
+        case tool_detail(input) do
+          nil -> "#{provider} #{tool}"
+          detail -> "#{provider} #{tool}: #{truncate(detail, 96)}"
+        end
     end
   end
 

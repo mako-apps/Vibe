@@ -349,7 +349,10 @@ Grok tool names map to the same progress kinds as Claude/Codex:
 | `grep` / `list_dir` | `search` |
 | `todo_write` | `todo` |
 | `web_search` / `web_fetch` / `open_page` | `web` |
-| `use_tool` / `search_tool` | `tool` |
+| `use_tool` / `search_tool` (MCP) | `mcp` when name is `server__tool` / `mcp__server__tool` (e.g. Ask Fable) |
+| `use_tool` (non-MCP) | `tool` |
+| Claude `mcp__server__tool` | `mcp` — label `MCP · tool name`, duration when result ts known, result in sheet |
+| Codex `mcp_tool_call` | `mcp` |
 
 ### History (`chat_history.jsonl`)
 

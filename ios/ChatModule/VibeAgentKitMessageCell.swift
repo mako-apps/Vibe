@@ -13,6 +13,17 @@ func vibeAgentKitProgressDisplayLabel(_ item: VibeAgentKitProgressItem) -> Strin
     if isRunning { return "Compacting conversation…" }
     return item.label.isEmpty ? "Compacted conversation" : item.label
   }
+  if kind == "mcp" {
+    var base = item.label
+    if base.isEmpty { base = "MCP tool" }
+    let status = (item.status ?? "").lowercased()
+    let isRunning = ["running", "streaming", "in_progress", "active"].contains(status)
+    if !isRunning, let ms = item.durationMs, ms >= 500 {
+      return "\(base) · \(chatAgentThinkingDurationText(ms))"
+    }
+    if isRunning { return "\(base)…" }
+    return base
+  }
   guard kind == "thinking" else { return item.label }
   let status = (item.status ?? "").lowercased()
   let isRunning = ["running", "streaming", "in_progress", "active"].contains(status)
@@ -142,6 +153,7 @@ final class VibeAgentKitMessageActionBarView: UIView {
 
 final class VibeAgentKitAssistantMessageBodyView: UIView {
   private let stackView = UIStackView()
+  private let teamHeaderLabel = UILabel()
   private let loaderView = VibeAgentKitAgentLoaderView()
   // Inline, expandable step list that drops in directly under the "Worked · N
   // steps" line when the user taps it (Claude-Code style) — no separate sheet.
@@ -185,6 +197,8 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
   }
 
   func reset() {
+    teamHeaderLabel.text = nil
+    teamHeaderLabel.isHidden = true
     loaderView.configure(text: "", isStreaming: false, progressItems: [])
     loaderView.onTap = nil
     loaderView.isHidden = true
@@ -410,13 +424,22 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
       liveFeedViewsByKey.removeValue(forKey: key)
       liveFeedHeightByKey.removeValue(forKey: key)
     }
-    // Sync the stack's arranged order to the node order, reusing views in place.
-    for (index, key) in orderedKeys.enumerated() {
-      guard let view = liveFeedViewsByKey[key] else { continue }
-      if index < stepsStack.arrangedSubviews.count, stepsStack.arrangedSubviews[index] === view {
-        continue
+    // Rebuild arranged order from `orderedKeys` (chronological progressNodes).
+    // Incremental insertArrangedSubview reordering was unstable under Grok's
+    // multi-segment text/tool interleave: text views could end up pinned under
+    // every tool/note row even when progressNodes order was correct ("streaming
+    // text always at the bottom, notes on top").
+    let desiredViews: [UIView] = orderedKeys.compactMap { liveFeedViewsByKey[$0] }
+    let current = stepsStack.arrangedSubviews
+    if current.count != desiredViews.count
+      || !zip(current, desiredViews).allSatisfy({ $0 === $1 })
+    {
+      for view in current {
+        stepsStack.removeArrangedSubview(view)
       }
-      stepsStack.insertArrangedSubview(view, at: min(index, stepsStack.arrangedSubviews.count))
+      for view in desiredViews {
+        stepsStack.addArrangedSubview(view)
+      }
     }
     stepsStack.isHidden = false
   }
@@ -572,7 +595,10 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
     let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
     let hasDisplayText = !trimmedText.isEmpty
     let hasToolProgressItems = progressItems.contains { $0.itemType != "text" }
-    let showsLoader = isStreaming && !hasFinalResponseText
+    // A live turn stays one interleaved feed even after its first prose arrives.
+    // Using hasFinalResponseText here switched to the settled layout mid-stream,
+    // rendering the same assistant text once as a progress node and again as body.
+    let showsLoader = isStreaming
     let runningStatuses: Set<String> = [
       "active", "in-progress", "in_progress", "pending", "queued", "running", "streaming", "working",
     ]
@@ -593,7 +619,8 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
     let canShowCompletedWork =
       !isStreaming && hasToolProgressItems && !hasRunningProgressItem && !runtimeIsRunning
       && (hasFinalResponseText || hasDisplayText || hasToolProgressItems)
-    isLiveTurn = showsLoader
+    isLiveTurn = isStreaming
+    configureTeamHeader(runtime: runtime, appearance: appearance)
 
     loaderView.applyAppearance(appearance)
     loaderView.onTap = onLoaderTap
@@ -980,6 +1007,11 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
     stackView.alignment = .fill
     stackView.distribution = .fill
     stackView.spacing = 8.0
+    teamHeaderLabel.translatesAutoresizingMaskIntoConstraints = false
+    teamHeaderLabel.isHidden = true
+    teamHeaderLabel.numberOfLines = 1
+    teamHeaderLabel.lineBreakMode = .byTruncatingTail
+    teamHeaderLabel.setContentCompressionResistancePriority(.required, for: .vertical)
     loaderView.translatesAutoresizingMaskIntoConstraints = false
     loaderView.isHidden = true
     stepsStack.translatesAutoresizingMaskIntoConstraints = false
@@ -996,8 +1028,9 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
     runtimeSummaryView.translatesAutoresizingMaskIntoConstraints = false
     runtimeSummaryView.isHidden = true
     addSubview(stackView)
-    // Order: loader ("Worked …"), inline steps (expand target), response text
+    // Order: team identity, loader ("Worked …"), inline steps (expand target), response text
     // blocks (inserted between here and the runtime card), then the diff card.
+    stackView.addArrangedSubview(teamHeaderLabel)
     stackView.addArrangedSubview(loaderView)
     stackView.addArrangedSubview(stepsStack)
     stackView.addArrangedSubview(runtimeSummaryView)
@@ -1012,6 +1045,35 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
       stackView.trailingAnchor.constraint(equalTo: trailingAnchor),
       stackView.bottomAnchor.constraint(equalTo: bottomAnchor),
     ])
+  }
+
+  private func configureTeamHeader(
+    runtime: ChatListRow.AgentRuntimeSummary?,
+    appearance: VibeAgentKitChatAppearance
+  ) {
+    guard let runtime,
+      runtime.teamRunId != nil || runtime.teamMode?.lowercased() == "group_team"
+    else {
+      teamHeaderLabel.text = nil
+      teamHeaderLabel.isHidden = true
+      return
+    }
+
+    let worker = (runtime.teamWorker ?? runtime.provider ?? "Agent").capitalized
+    var parts = ["TEAM", worker]
+    if let index = runtime.teamWorkers.firstIndex(where: {
+      $0.caseInsensitiveCompare(runtime.teamWorker ?? runtime.provider ?? "") == .orderedSame
+    }), runtime.teamWorkers.count > 1 {
+      parts.append("\(index + 1) of \(runtime.teamWorkers.count)")
+    }
+    if let computer = runtime.computerLabel, !computer.isEmpty {
+      parts.append(computer)
+    }
+    teamHeaderLabel.text = parts.joined(separator: "  ·  ")
+    teamHeaderLabel.font = UIFont.systemFont(ofSize: 11.5, weight: .bold)
+    teamHeaderLabel.textColor = vibeAgentKitColorWithAlpha(appearance.primary, 0.92)
+    teamHeaderLabel.accessibilityLabel = "Team run, \(worker)"
+    teamHeaderLabel.isHidden = false
   }
 
   var onToggleRuntimeExpand: (() -> Void)?
@@ -1995,6 +2057,13 @@ final class VibeAgentKitMessageCell: UITableViewCell {
       actionBarTopToMessageConstraint,
     ])
 
+    let usesCompactAssistantWidth = !isUser
+      && !message.isStreaming
+      && message.progressItems.isEmpty
+      && message.runtime == nil
+      && displayText.count <= 180
+      && !displayText.contains("\n\n")
+
     if isUser {
       NSLayoutConstraint.activate([
         trailingConstraint,
@@ -2006,7 +2075,7 @@ final class VibeAgentKitMessageCell: UITableViewCell {
     } else {
       NSLayoutConstraint.activate([
         leadingConstraint,
-        assistantWidthConstraint,
+        usesCompactAssistantWidth ? assistantMaxWidthConstraint : assistantWidthConstraint,
         assistantTopConstraint,
         assistantLeadingConstraint,
         assistantTrailingConstraint,
@@ -2704,6 +2773,10 @@ final class VibeAgentKitStepDetailViewController: UIViewController {
     case "read": return item.fileName ?? "Read"
     case "thinking": return "Thinking"
     case "compacting": return "Compacting"
+    case "mcp":
+      if let tool = item.fileName, !tool.isEmpty { return "MCP · \(tool)" }
+      return item.label.isEmpty ? "MCP tool" : item.label
+    case "tool": return item.label.isEmpty ? "Tool" : item.label
     default: return item.label.isEmpty ? "Step" : item.label
     }
   }

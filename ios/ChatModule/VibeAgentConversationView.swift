@@ -264,7 +264,7 @@ enum VibeAgentKitMap {
         default: return "• \(content)"
         }
       }.joined(separator: "\n")
-    case "bash", "search", "web", "task", "tool", "thinking":
+    case "bash", "search", "web", "task", "tool", "mcp", "thinking":
       return clipped.isEmpty ? nil : clipped
     default:
       return nil
@@ -925,6 +925,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
 
   override func viewDidLoad() {
     super.viewDidLoad()
+    view.accessibilityIdentifier = "agent.ask.sheet"
     // Let the feed extend under the (now translucent) nav bar and the bottom edge so
     // content flows edge-to-edge and the bars read as seamless blur — no opaque block.
     edgesForExtendedLayout = .all
@@ -6862,6 +6863,7 @@ final class VibeAgentAskSheetViewController: UIViewController {
     config.contentInsets = NSDirectionalEdgeInsets(top: 11, leading: 14, bottom: 11, trailing: 14)
     config.titleAlignment = .leading
     let button = UIButton(configuration: config)
+    button.accessibilityIdentifier = "agent.ask.option.\(questionIndex).\(optionIndex)"
     button.contentHorizontalAlignment = .leading
     button.tag = questionIndex * 1000 + optionIndex
     button.addTarget(self, action: #selector(optionTapped(_:)), for: .touchUpInside)
@@ -6961,24 +6963,30 @@ final class VibeAgentAskSheetViewController: UIViewController {
     if kind == "command" {
       // Live command approval: No · Approve.
       let deny = makeBarButton("No", primary: false)
+      deny.accessibilityIdentifier = "agent.ask.deny"
       deny.addTarget(self, action: #selector(denyCommandTapped), for: .touchUpInside)
       let approve = makeBarButton("Approve", primary: true)
+      approve.accessibilityIdentifier = "agent.ask.approve"
       approve.addTarget(self, action: #selector(approveCommandTapped), for: .touchUpInside)
       bar.addArrangedSubview(deny)
       bar.addArrangedSubview(approve)
     } else if kind == "plan" {
       let reject = makeBarButton("Reject", primary: false)
+      reject.accessibilityIdentifier = "agent.ask.reject"
       reject.addTarget(self, action: #selector(rejectTapped), for: .touchUpInside)
       let approve = makeBarButton("Approve & Implement", primary: true)
+      approve.accessibilityIdentifier = "agent.ask.approve"
       approve.addTarget(self, action: #selector(approveTapped), for: .touchUpInside)
       bar.addArrangedSubview(reject)
       bar.addArrangedSubview(approve)
     } else if questions.count > 1 {
       // Paged ask: Back (hidden on page 1) + Next/Submit.
       let back = makeBarButton("Back", primary: false)
+      back.accessibilityIdentifier = "agent.ask.back"
       back.addTarget(self, action: #selector(backTapped), for: .touchUpInside)
       back.isHidden = true
       let next = makeBarButton("Next", primary: true)
+      next.accessibilityIdentifier = "agent.ask.submit"
       next.addTarget(self, action: #selector(nextTapped), for: .touchUpInside)
       askBackButton = back
       askNextButton = next
@@ -6986,6 +6994,7 @@ final class VibeAgentAskSheetViewController: UIViewController {
       bar.addArrangedSubview(next)
     } else {
       let submit = makeBarButton("Submit", primary: true)
+      submit.accessibilityIdentifier = "agent.ask.submit"
       submit.addTarget(self, action: #selector(submitTapped), for: .touchUpInside)
       askNextButton = submit
       bar.addArrangedSubview(submit)

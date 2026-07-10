@@ -1832,6 +1832,23 @@ func chatAgentNodeCompactLabel(_ node: ChatListRow.AgentProgressNode) -> String 
     if isRunning { return "Compacting conversation…" }
     return node.label.isEmpty ? "Compacted conversation" : node.label
   }
+  // MCP tools (Ask Fable, ask_user, …): "MCP · ask fable · 12s"
+  if kind == "mcp" {
+    var base = node.label
+    if base.isEmpty {
+      if let target = node.target, !target.isEmpty {
+        base = "MCP · \(target)"
+      } else {
+        base = "MCP tool"
+      }
+    }
+    let isRunning = ["running", "streaming", "in_progress", "active"].contains(node.status.lowercased())
+    if !isRunning, let ms = node.durationMs, ms >= 500 {
+      return "\(base) · \(chatAgentThinkingDurationText(ms))"
+    }
+    if isRunning { return "\(base)…" }
+    return base
+  }
   let verb: String
   switch kind {
   case "read": verb = "Read"
@@ -1846,6 +1863,18 @@ func chatAgentNodeCompactLabel(_ node: ChatListRow.AgentProgressNode) -> String 
     if a == "create" || a == "created" { return "Created Task" }
     if a == "update" || a == "updated" { return "Updated Task" }
     return "Create Task or Update Task"
+  case "tool":
+    // Fallback generic tools (non-MCP): keep label, append duration when settled.
+    var base = node.label.isEmpty ? "Tool" : node.label
+    if let target = node.target, !target.isEmpty, !base.localizedCaseInsensitiveContains(target) {
+      base = "\(base) · \(target)"
+    }
+    if let ms = node.durationMs, ms >= 500,
+      !["running", "streaming"].contains(node.status.lowercased())
+    {
+      return "\(base) · \(chatAgentThinkingDurationText(ms))"
+    }
+    return base
   default: return node.label
   }
   var text = verb

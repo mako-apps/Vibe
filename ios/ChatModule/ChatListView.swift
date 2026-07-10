@@ -1518,6 +1518,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   // unhidden) on the very next `setRows`.
   private var activeBridgeSessionId: String?
   private var lastOlderBridgeHistoryLoadAt: TimeInterval = 0
+  // Outgoing message ids the user typed WHILE a History session is open. Cleared on
+  // every history pick / New Chat so prior-session own-sends never leak into the
+  // isolated historical view (process-lifetime `bridgeFreshOwnSentIdsByChat` alone
+  // would re-surface every earlier follow-up on this DM).
+  private var bridgeHistoryFollowUpSentIds: Set<String> = []
 
   /// Register an outgoing message id so the fresh-surface filter never hides it.
   func noteBridgeFreshOwnSentId(_ messageId: String) {
@@ -1526,6 +1531,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let chatKey = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !chatKey.isEmpty else { return }
     Self.bridgeFreshOwnSentIdsByChat[chatKey, default: []].insert(id)
+    // If a History session is currently open, also tag this id as a follow-up so
+    // bridgeFreshFiltered keeps it under historical isolation.
+    if bridgeLoadedSessionId != nil {
+      bridgeHistoryFollowUpSentIds.insert(id)
+    }
   }
 
   /// Load (or clear, when nil) an explicitly-picked history session into this chat
@@ -1536,6 +1546,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let resolved = (next?.isEmpty == false) ? next : nil
     guard bridgeLoadedSessionId != resolved else { return }
     bridgeLoadedSessionId = resolved
+    // New history pick (or clear) starts a clean follow-up window.
+    bridgeHistoryFollowUpSentIds = []
     if !sourceRowsPayload.isEmpty { setRows(sourceRowsPayload) }
   }
 
@@ -1543,6 +1555,23 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if row.isStreamingText { return true }
     let status = (row.status ?? "").lowercased()
     return status == "running" || status == "streaming"
+  }
+
+  /// Session id a row claims (live stream / finished agent turn). Used to keep
+  /// historical isolation scoped to the resumed session when follow-ups stream in
+  /// as non-`bridge-` rows that share the DM chatId with every other session.
+  private func bridgeRowSessionId(_ row: ChatListRow) -> String? {
+    if let sid = row.agentRuntime?.sessionId?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !sid.isEmpty, !sid.hasPrefix("running:")
+    {
+      return sid
+    }
+    if let tid = row.agentRuntime?.threadId?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !tid.isEmpty, !tid.hasPrefix("running:")
+    {
+      return tid
+    }
+    return nil
   }
 
   /// A Claude/Codex DM opens showing its persisted transcript (seeded instantly from the
@@ -1609,9 +1638,36 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       }
       // Non-`bridge-` rows are the CURRENT thread's live stream rows / native rows / the
       // user's own sends — all keyed in the shared chatId. In a picked historical session
-      // they are not part of that past transcript, so suppress them to keep the view
-      // isolated (otherwise the historical view shows live activity combined in).
-      if historicalSessionPicked { return false }
+      // they are not part of that past transcript, so suppress foreign activity to keep
+      // the view isolated.
+      //
+      // CRITICAL exception: follow-ups typed WHILE a History session is open must still
+      // appear. The send was reaching the bridge, but the list filtered the optimistic
+      // user row (and the live stream response) before `ownSentIds` could keep them —
+      // the "message goes nowhere" bug. Scope exceptions to THIS history pick only:
+      //   • follow-up own-sent ids registered after the history session opened
+      //   • non-bridge rows that claim the loaded session id (live or just-settled)
+      //   • live rows while the engine is live-tailing THAT same session
+      // Never re-open the full process-lifetime ownSent set (would mix prior threads).
+      if historicalSessionPicked {
+        if bridgeHistoryFollowUpSentIds.contains(id) { return true }
+        if let loaded = bridgeLoadedSessionId,
+          let rowSid = bridgeRowSessionId(row),
+          rowSid == loaded
+        {
+          return true
+        }
+        if bridgeRowIsLive(row) {
+          let liveSid = ChatEngine.shared.liveBridgeSessionId(chatId: chatKey)
+          if let loaded = bridgeLoadedSessionId, let liveSid {
+            return liveSid == loaded
+          }
+          // Resume just started: engine has not registered the live session yet.
+          // Allow the in-flight stream so the first frame is not blank.
+          return true
+        }
+        return false
+      }
       // Drop prior-history rows AND non-message rows (stale date separators); a new
       // thread renders only the messages exchanged since it was engaged.
       guard !id.isEmpty else { return false }
@@ -2656,11 +2712,18 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // (the overlay handles that).
     let isSmallUpdate =
       (insertions.count + deletions.count) > 0 && (insertions.count + deletions.count) <= 5
+    let containsAgentInsertion = insertions.contains { indexPath in
+      indexPath.item < parsed.count && parsed[indexPath.item].isAgentMessage
+    }
     let shouldAnimateUpdate =
       isSmallUpdate
       && wasNearBottom
       && animMode > 0  // mode 0 = no animation
       && !isAgentSettleSwap
+      // Agent rows already grow through their in-place streaming renderer. A
+      // second generic collection animation at settle time transforms every
+      // visible cell and can tear a user bubble that just completed send morph.
+      && !containsAgentInsertion
 
     let insertedKeysSummary = insertions.prefix(3).compactMap { ip -> String? in
       guard ip.item < parsed.count else { return nil }
@@ -3093,6 +3156,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     reportedBridgeCommandIds.removeAll()
     bridgeLoadedSessionId = nil
     activeBridgeSessionId = nil
+    bridgeHistoryFollowUpSentIds = []
     bridgeAgentManuallyShown = false
     agentTurnExpandedStepIdsByRow.removeAll()
     agentTurnProgressExpandedRowIds.removeAll()
@@ -3729,6 +3793,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
             // encrypted CoT: Grok ships plaintext detail on the node.
             if kind == "bash" || kind == "edit" || kind == "write" || kind == "read"
               || kind == "todo" || kind == "planning" || kind == "thinking" || kind == "compacting"
+              || kind == "mcp" || kind == "tool" || kind == "web" || kind == "search" || kind == "task"
             {
               guard let presenter = self.topPresentingViewController() else { return }
               let detail = VibeAgentKitStepDetailViewController(
@@ -7370,6 +7435,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       "agentBridgeCwd": repository.cwd,
       "agentBridgeWorkMode": AgentBridgeSelectionStore.selectedWorkMode().rawValue,
     ]
+    if let computerId = repository.computerId, !computerId.isEmpty {
+      metadata["agentBridgeComputerId"] = computerId
+    }
+    if let computerLabel = repository.computerLabel, !computerLabel.isEmpty {
+      metadata["agentBridgeComputerLabel"] = computerLabel
+    }
 
     guard let provider else {
       // Group fan-out to both agents: no single provider and no resume target (each
@@ -7977,8 +8048,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       if !bridgeMetadata.isEmpty {
         noteBridgeFreshOwnSentId(outgoingMessageId)
       }
-      // Pin the freshly-sent question to the top (ChatGPT-style) like the bridge path did.
-      pendingAgentPushToTop = true
+      // Bridge-agent conversations are chronological chat timelines. Pinning a new
+      // question to the top made it appear before the earlier conversation instead of
+      // after it, and could hide the sender's context while the response streamed.
+      pendingAgentPushToTop = false
       presentedBridgeAgentVC?.appendLocalPendingTurn(messageId: outgoingMessageId, body: text)
       dispatchOutgoingSend(
         messageId: outgoingMessageId,
@@ -9010,6 +9083,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   private func agentConversationTopic(agentRow: ChatListRow, taskRows: [ChatListRow]) -> String {
+    // A bridge DM is a persistent Claude/Codex/Grok/Agy conversation, not a
+    // one-off task sheet. The first prompt is content and must not replace the
+    // agent's navigation title (for example, a raw Codex command in the header).
+    if let provider = currentBridgeProvider?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !provider.isEmpty
+    {
+      return provider.capitalized
+    }
     let candidates = [
       taskRows.first(where: { $0.isMe && !$0.isAgentMessage })?.text,
       agentRow.agentActionSourceText,
