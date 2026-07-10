@@ -2089,9 +2089,21 @@ defmodule Vibe.AI.LocalAgentWorker do
     case normalize_string(option_value(options, "model")) ||
            normalize_string(System.get_env(env_name)) do
       nil -> []
-      model -> [flag, model]
+      model -> [flag, compatible_model(env_name, model)]
     end
   end
+
+  # The installed headless Codex binary rejects the 5.6 family. Keep server-side
+  # fallback runs aligned with the bridge so a mobile-selected model never becomes
+  # an unrecoverable terminal error.
+  defp compatible_model("VIBE_CODEX_MODEL", model) do
+    case String.downcase(model) |> String.replace("_", "-") do
+      value when value in ["gpt-5.6-sol", "gpt-5-6-sol", "gpt-5.6", "gpt-5-6"] -> "gpt-5.5"
+      _ -> model
+    end
+  end
+
+  defp compatible_model(_env_name, model), do: model
 
   defp maybe_advisor_args(options) do
     case normalize_string(option_value(options, "advisor")) ||

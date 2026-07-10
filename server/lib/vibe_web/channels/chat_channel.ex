@@ -14,6 +14,9 @@ defmodule VibeWeb.ChatChannel do
   # bridge dispatch; they are stripped from the broadcast + persisted row so devices
   # never ingest a 270KB+ metadata blob. The bridge reads them off the untouched data.
   @inline_attachment_keys ~w(agentBridgeAttachmentsEnc agent_bridge_attachments_enc attachmentsEnc)
+  # Presence briefly drops while the desktop bridge reconnects. A paired bridge is
+  # still a valid task target, so absorb that short gap before showing an offline notice.
+  @bridge_dispatch_retry_delays [0, 400, 1_000, 2_000]
 
   @impl true
   def join("chat:" <> chat_id, _payload, socket) do
@@ -804,6 +807,7 @@ defmodule VibeWeb.ChatChannel do
     note_team_user_turn? = Keyword.get(opts, :note_team_user_turn, false)
     team_run_id = Keyword.get(opts, :team_run_id)
     team_workers = Keyword.get(opts, :team_workers, [])
+
     bridge_metadata =
       (Keyword.get(opts, :bridge_metadata) || bridge_task_metadata(data))
       |> resolve_provider_model(worker.handle)
@@ -830,14 +834,10 @@ defmodule VibeWeb.ChatChannel do
         )
 
       # Preferred path: run on the user's OWN paired computer (their subscription).
-      AgentBridge.online?(requester_user_id) ->
-        broadcast_agent_activity(
-          chat_id,
-          worker.agent_user_id,
-          "#{worker.label} working...",
-          "running"
-        )
-
+      # A bridge can be paired but temporarily absent from Presence while its socket
+      # reconnects. Do not convert a valid mobile message into a connect notice in
+      # that small window; retry the actual dispatch before declaring it unavailable.
+      AgentBridge.paired?(requester_user_id) ->
         bridge_prompt =
           if is_binary(team_run_id) do
             LocalAgentWorker.build_team_bridge_prompt(
@@ -869,61 +869,59 @@ defmodule VibeWeb.ChatChannel do
           |> Map.merge(local_worker_team_metadata(worker, team_run_id, team_workers))
           |> Map.merge(bridge_metadata)
 
-        case AgentBridge.dispatch_task(requester_user_id, task_payload) do
-          :ok ->
-            # Record the human's prompt in the shared group thread (no-op in DMs)
-            # only once we know it was actually dispatched.
-            cond do
-              note_team_user_turn? ->
-                LocalAgentWorker.note_bridge_team_user_turn(
-                  chat_id,
-                  team_workers,
-                  dispatch_text,
-                  requester_user_id,
-                  team_run_id
-                )
+        run = fn ->
+          broadcast_agent_activity(
+            chat_id,
+            worker.agent_user_id,
+            "#{worker.label} working...",
+            "running"
+          )
 
-              note_user_turn? ->
-                LocalAgentWorker.note_bridge_user_turn(
-                  chat_id,
-                  worker,
-                  dispatch_text,
-                  requester_user_id
-                )
+          case dispatch_bridge_task_with_reconnect_grace(requester_user_id, task_payload) do
+            :ok ->
+              note_bridge_dispatch_turn(
+                chat_id,
+                worker,
+                dispatch_text,
+                requester_user_id,
+                note_user_turn?,
+                note_team_user_turn?,
+                team_run_id,
+                team_workers
+              )
 
-              true ->
-                :ok
-            end
+              Logger.info(
+                "[ChatChannel] dispatched @#{worker.handle} to bridge user=#{requester_user_id} chat=#{chat_id}"
+              )
 
-            Logger.info(
-              "[ChatChannel] dispatched @#{worker.handle} to bridge user=#{requester_user_id} chat=#{chat_id}"
-            )
+            {:error, reason} ->
+              maybe_clear_team_run(chat_id, team_run_id)
+              stop_agent_activity(chat_id, worker.agent_user_id)
 
-          {:error, reason} ->
+              LocalAgentWorker.post_notice(
+                worker,
+                chat_id,
+                bridge_dispatch_failure_notice(worker, reason),
+                requester_user_id,
+                data["id"]
+              )
+          end
+        end
+
+        case Task.Supervisor.start_child(Vibe.AI.WorkerTaskSupervisor, run) do
+          {:error, :max_children} ->
             maybe_clear_team_run(chat_id, team_run_id)
-
-            # Raced with a disconnect — re-lock to the connect prompt.
-            stop_agent_activity(chat_id, worker.agent_user_id)
-
-            notice =
-              case reason do
-                :computer_required ->
-                  "Choose which connected computer should run this task before sending."
-
-                :computer_offline ->
-                  "The selected computer is offline. Pick another connected computer or reconnect it."
-
-                _ ->
-                  "Your computer just went offline. Reconnect it to run @#{worker.handle} tasks."
-              end
 
             LocalAgentWorker.post_notice(
               worker,
               chat_id,
-              notice,
+              "#{worker.label} is busy with other tasks right now. Please try again in a moment.",
               requester_user_id,
               data["id"]
             )
+
+          _ ->
+            :ok
         end
 
       # Dev fallback: run on the server itself (VIBE_LOCAL_AGENT_WORKERS=1).
@@ -999,6 +997,64 @@ defmodule VibeWeb.ChatChannel do
 
   defp maybe_clear_team_run(chat_id, team_run_id),
     do: LocalAgentWorker.clear_bridge_team_run(chat_id, team_run_id)
+
+  defp dispatch_bridge_task_with_reconnect_grace(requester_user_id, task_payload) do
+    Enum.reduce_while(@bridge_dispatch_retry_delays, {:error, :offline}, fn delay, _result ->
+      if delay > 0, do: Process.sleep(delay)
+
+      case AgentBridge.dispatch_task(requester_user_id, task_payload) do
+        :ok -> {:halt, :ok}
+        {:error, :offline} = offline -> {:cont, offline}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp note_bridge_dispatch_turn(
+         chat_id,
+         worker,
+         dispatch_text,
+         requester_user_id,
+         note_user_turn?,
+         note_team_user_turn?,
+         team_run_id,
+         team_workers
+       ) do
+    cond do
+      note_team_user_turn? ->
+        LocalAgentWorker.note_bridge_team_user_turn(
+          chat_id,
+          team_workers,
+          dispatch_text,
+          requester_user_id,
+          team_run_id
+        )
+
+      note_user_turn? ->
+        LocalAgentWorker.note_bridge_user_turn(
+          chat_id,
+          worker,
+          dispatch_text,
+          requester_user_id
+        )
+
+      true ->
+        :ok
+    end
+  end
+
+  defp bridge_dispatch_failure_notice(_worker, :computer_required),
+    do: "Choose which connected computer should run this task before sending."
+
+  defp bridge_dispatch_failure_notice(_worker, :computer_offline),
+    do: "The selected computer is offline. Pick another connected computer or reconnect it."
+
+  defp bridge_dispatch_failure_notice(_worker, :offline),
+    do:
+      "Your paired computer is still reconnecting, so this task was not sent. Keep the chat open and try again in a moment."
+
+  defp bridge_dispatch_failure_notice(worker, _reason),
+    do: "Your computer just went offline. Reconnect it to run @#{worker.handle} tasks."
 
   defp local_worker_team_metadata(_worker, nil, _team_workers), do: %{}
 
