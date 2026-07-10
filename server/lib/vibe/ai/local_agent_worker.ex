@@ -539,7 +539,16 @@ defmodule Vibe.AI.LocalAgentWorker do
             )
         end
 
-        maybe_dispatch_next_team_worker(chat_id, worker, requester_user_id, opts)
+        if ok do
+          maybe_dispatch_next_team_worker(chat_id, worker, requester_user_id, opts)
+        else
+          fail_bridge_team_run(
+            chat_id,
+            Keyword.get(opts, :team_run_id),
+            worker.handle,
+            "@#{worker.handle} exited with status #{exit_status}: #{base_text}"
+          )
+        end
 
         result
     end
@@ -750,6 +759,46 @@ defmodule Vibe.AI.LocalAgentWorker do
 
       :ok
   end
+
+  @doc "Stop a durable team run after its current owner fails; never advance past a missing handoff."
+  def fail_bridge_team_run(chat_id, team_run_id, worker_handle, reason)
+      when is_binary(chat_id) and is_binary(team_run_id) do
+    ensure_team_run_table()
+    :ets.delete(@team_run_table, {chat_id, team_run_id})
+    now = DateTime.utc_now()
+    normalized_worker = normalize_string(worker_handle)
+
+    query =
+      from(run in TeamRun,
+        where: run.id == ^team_run_id and run.chat_id == ^chat_id and run.status == "running"
+      )
+
+    query =
+      if is_binary(normalized_worker) do
+        from(run in query, where: run.current_worker == ^normalized_worker)
+      else
+        query
+      end
+
+    Repo.update_all(query,
+      set: [
+        status: "failed",
+        last_error: reason |> to_string() |> String.slice(0, 2_000),
+        updated_at: now
+      ]
+    )
+
+    :ok
+  rescue
+    error ->
+      Logger.warning(
+        "[LocalAgentWorker] could not fail durable team run chat=#{chat_id} run=#{team_run_id}: #{Exception.message(error)}"
+      )
+
+      :ok
+  end
+
+  def fail_bridge_team_run(_chat_id, _team_run_id, _worker_handle, _reason), do: :ok
 
   defp persist_team_run(state, first_worker) do
     attrs = %{
@@ -1065,7 +1114,12 @@ defmodule Vibe.AI.LocalAgentWorker do
               state.reply_to_id
             )
 
-            clear_bridge_team_run(state.chat_id, state.team_run_id)
+            fail_bridge_team_run(
+              state.chat_id,
+              state.team_run_id,
+              next_worker.handle,
+              "Could not dispatch @#{next_worker.handle}: #{inspect(reason)}"
+            )
         end
     end
   end

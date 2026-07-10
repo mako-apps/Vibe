@@ -383,6 +383,13 @@ defmodule VibeWeb.AgentBridgeChannel do
       payload["replyToId"]
     )
 
+    LocalAgentWorker.fail_bridge_team_run(
+      chat_id,
+      payload["teamRunId"] || payload["team_run_id"],
+      payload["teamWorker"] || payload["team_worker"] || provider,
+      message
+    )
+
     LocalAgentWorker.stop_activity(chat_id, agent_user_id_for(provider))
     {:reply, :ok, clear_stream(socket, chat_id, provider, payload)}
   end

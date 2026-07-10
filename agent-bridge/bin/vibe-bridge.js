@@ -1954,6 +1954,66 @@ function decodedOutputEvents(output) {
   return events;
 }
 
+// Some provider CLIs can exit 0 after emitting a terminal failure frame. In
+// particular Grok has returned `{type:"end", stopReason:"Cancelled"}` on a
+// timed-out turn. Treating that as success advances the team to the next owner
+// with a missing handoff. Normalize those semantic failures before constructing
+// the final bridge result.
+function providerTerminalFailure(provider, output) {
+  const events = decodedOutputEvents(output);
+  const normalizedProvider = String(provider || "").trim().toLowerCase();
+  let codexCompleted = false;
+  let codexItemError = null;
+
+  for (const event of events) {
+    const type = String(event.type || event.event || "").trim().toLowerCase();
+    const subtype = String(event.subtype || "").trim().toLowerCase();
+    const stopReason = String(
+      event.stopReason || event.stop_reason || event.terminal_reason || ""
+    ).trim().toLowerCase();
+    const status = String(event.status || "").trim().toLowerCase();
+
+    if (normalizedProvider === "codex" && type === "turn.completed") {
+      codexCompleted = true;
+    }
+    if (
+      normalizedProvider === "codex" &&
+      type === "item.completed" &&
+      event.item &&
+      String(event.item.type || "").toLowerCase() === "error"
+    ) {
+      codexItemError = String(event.item.message || "codex_item_error");
+    }
+
+    if ([stopReason, status].some((value) =>
+      ["cancel", "cancelled", "canceled", "stopped", "timed_out", "timeout"].includes(value)
+    )) {
+      return { failed: true, canceled: true, reason: stopReason || status };
+    }
+
+    if (
+      type === "turn.failed" ||
+      type === "turn_failed" ||
+      type === "fatal" ||
+      (type === "result" && (event.is_error === true || ["error", "failed"].includes(subtype)))
+    ) {
+      return { failed: true, canceled: false, reason: subtype || type };
+    }
+
+    // Provider-level error frames are terminal. Tool-result errors are nested
+    // under other event types and remain ordinary agent observations.
+    if (type === "error" && normalizedProvider !== "claude") {
+      return { failed: true, canceled: false, reason: "provider_error" };
+    }
+  }
+
+  if (normalizedProvider === "codex" && !codexCompleted && codexItemError) {
+    return { failed: true, canceled: false, reason: codexItemError };
+  }
+
+  return null;
+}
+
 function compactStringList(value, limit = 40) {
   if (!Array.isArray(value)) return [];
   return value
@@ -3754,9 +3814,17 @@ async function runTask(channel, task) {
       } catch (_) {}
     }
     const durationMs = Date.now() - startedAt;
-    canceled = canceled || child.signalCode === "SIGTERM" || child.signalCode === "SIGKILL";
+    const terminalFailure = providerTerminalFailure(provider, output);
+    canceled =
+      canceled ||
+      child.signalCode === "SIGTERM" ||
+      child.signalCode === "SIGKILL" ||
+      !!(terminalFailure && terminalFailure.canceled);
     const afterGit = gitSnapshot(cwd);
-    const exitStatus = code == null ? (canceled ? 130 : 1) : code;
+    let exitStatus = code == null ? (canceled ? 130 : 1) : code;
+    if (exitStatus === 0 && terminalFailure && terminalFailure.failed) {
+      exitStatus = terminalFailure.canceled ? 130 : 1;
+    }
     console.log(
       `[vibe-bridge] done ${provider} chat=${chatId} task=${taskId} exit=${exitStatus} ${durationMs}ms`
     );
@@ -9585,21 +9653,22 @@ module.exports = {
   readHistory,
   buildHistoryRuntime,
   collectClaudeEdits,
-	  collectCodexEdits,
-	  parseApplyPatchEnvelope,
-	  newRuntimeAccumulator,
-	  ensureRuntimeKey,
-	  liveAgentActionsField,
-	  liveClaudeActions,
-	  liveCodexActions,
-	  fileWithinLinkedRepo,
-	  handleFileRequest,
-	  normalizeModel,
-	  runningPlaceholderMessage,
-	  markMessageRunning,
-	  sessionFilePath,
-	  sessionFileIsLive,
-	};
+  collectCodexEdits,
+  parseApplyPatchEnvelope,
+  newRuntimeAccumulator,
+  ensureRuntimeKey,
+  liveAgentActionsField,
+  liveClaudeActions,
+  liveCodexActions,
+  fileWithinLinkedRepo,
+  handleFileRequest,
+  normalizeModel,
+  runningPlaceholderMessage,
+  markMessageRunning,
+  sessionFilePath,
+  sessionFileIsLive,
+  providerTerminalFailure,
+};
 
 // Only auto-run the daemon when invoked directly (so the module is requireable).
 if (require.main === module) {
