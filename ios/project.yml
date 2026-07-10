@@ -51,12 +51,43 @@ targets:
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
         UIViewControllerBasedStatusBarAppearance: true
+    settings:
+      base:
+        DEVELOPMENT_TEAM: BXY4DH6H7D
+        CODE_SIGN_STYLE: Automatic
+  VibeUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: VibeUITests
+    dependencies:
+      - target: Vibe
+    settings:
+      base:
+        PRODUCT_NAME: VibeUITests
+        PRODUCT_MODULE_NAME: VibeUITests
+        PRODUCT_BUNDLE_IDENTIFIER: com.vibegram.app.uitests
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: BXY4DH6H7D
+        TEST_TARGET_NAME: Vibe
+        IPHONEOS_DEPLOYMENT_TARGET: "26.0"
+        # Do not inherit app PRODUCT_NAME "Vibe" or swiftmodules collide.
+        SWIFT_OBJC_BRIDGING_HEADER: ""
+        OTHER_LDFLAGS: ""
 schemes:
   Vibe:
     build:
       targets:
         Vibe: all
+        VibeUITests: [test]
     run:
       config: Debug
+    test:
+      config: Debug
+      targets:
+        - VibeUITests
     archive:
       config: Release

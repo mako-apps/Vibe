@@ -711,7 +711,9 @@ final class ChatInputBar: UIView {
   private let attachGlass = UIVisualEffectView(effect: nil)
 
   private let pillContainer = UIView()
-  private let pillButton = UIButton(type: .system)
+  // Pure layout shell for the composer. This must not be a UIControl: UIKit
+  // collapses an editable descendant of a UIButton in the accessibility tree.
+  private let pillButton = UIView()
   private let pillGlass = UIVisualEffectView(effect: nil)
   private let textView = ChatComposerTextView()
   private let placeholderLabel = UILabel()
@@ -1228,6 +1230,10 @@ final class ChatInputBar: UIView {
     textView.returnKeyType = .default
     textView.delegate = self
     textView.showsVerticalScrollIndicator = false
+    // Stable hook for XCUITest device control. Keep UITextView's native traits
+    // so it remains a direct-interaction, keyboard-focusable editor.
+    textView.accessibilityIdentifier = "chat.composer"
+    textView.accessibilityLabel = "Message"
     pillContainer.addSubview(textView)
 
     // GIF button (inside pill, trailing side before Send)
@@ -1345,6 +1351,10 @@ final class ChatInputBar: UIView {
     sendGradient.cornerRadius = 16
     sendButton.layer.insertSublayer(sendGradient, at: 0)
     sendButton.addTarget(self, action: #selector(sendTapped), for: .touchUpInside)
+    sendButton.accessibilityIdentifier = "chat.send"
+    sendButton.accessibilityLabel = "Send"
+    sendButton.accessibilityTraits = .button
+    sendButton.isAccessibilityElement = true
     pillContainer.addSubview(sendButton)
 
     cancelOverlayButton.addTarget(self, action: #selector(cancelOverlayTapped), for: .touchUpInside)
@@ -2854,6 +2864,15 @@ final class ChatInputBar: UIView {
       setMentionBannerVisible(false, animated: false)
       delegate?.inputBarDidSendWithAgentMention(text: t, agentText: agentText)
 
+    case .team:
+      setMentionBannerVisible(false, animated: false)
+      let attachments = pendingAttachmentBlobs
+      pendingImages.removeAll()
+      pendingAttachmentBlobs.removeAll()
+      updateAttachmentPreviewVisibility()
+      delegate?.inputBarDidSend(text: t, attachments: attachments)
+      clearText()
+
     case .standalone(let username, let agentText):
       guard !agentText.isEmpty else {
         textView.becomeFirstResponder()
@@ -2882,13 +2901,13 @@ final class ChatInputBar: UIView {
     case .none:
       return
 
-    case .mention:
+    case .mention(let suggestion):
       let text = textView.text ?? ""
       if let lastAtRange = text.range(of: "@", options: .backwards) {
         let beforeAt = text[text.startIndex..<lastAtRange.lowerBound]
-        textView.text = beforeAt + "@vibe "
+        textView.text = beforeAt + suggestion.insertion
       } else {
-        textView.text = (text.isEmpty ? "" : text + " ") + "@vibe "
+        textView.text = (text.isEmpty ? "" : text + " ") + suggestion.insertion
       }
       setMentionActive(true)
 
@@ -2958,9 +2977,9 @@ final class ChatInputBar: UIView {
     case .none:
       setMentionBannerVisible(false, animated: animated)
 
-    case .mention:
-      mentionNameLabel.text = "@vibe"
-      mentionDescLabel.text = "Ask AI"
+    case .mention(let suggestion):
+      mentionNameLabel.text = suggestion.token
+      mentionDescLabel.text = suggestion.description
       setMentionBannerVisible(true, animated: animated)
 
     case .slash(let suggestion):
@@ -3008,7 +3027,9 @@ final class ChatInputBar: UIView {
 
   private func updateMentionBorderGlow(pillFrame: CGRect) {
     let textString = (textView.text ?? "").lowercased()
-    let hasMention = textString.contains("@vibe") || textString.contains("@vibeagent") || textString.hasPrefix("/")
+    let hasMention =
+      textString.contains("@vibe") || textString.contains("@vibeagent")
+      || textString.contains("@team") || textString.hasPrefix("/")
     if hasMention != mentionActive {
       setMentionActive(hasMention)
     }
@@ -3017,8 +3038,15 @@ final class ChatInputBar: UIView {
   private enum MentionIntent {
     case none
     case group(String)
+    case team
     case builder
     case standalone(username: String, agentText: String)
+  }
+
+  private struct ReadyMentionSuggestion {
+    let token: String
+    let insertion: String
+    let description: String
   }
 
   private struct ReadyCommandSuggestion {
@@ -3029,9 +3057,18 @@ final class ChatInputBar: UIView {
 
   private enum ReadyBannerAction {
     case none
-    case mention
+    case mention(ReadyMentionSuggestion)
     case slash(ReadyCommandSuggestion)
   }
+
+  private static let readyMentionSuggestions: [ReadyMentionSuggestion] = [
+    ReadyMentionSuggestion(
+      token: "@team", insertion: "@team ", description: "Coordinate all agents"
+    ),
+    ReadyMentionSuggestion(
+      token: "@vibe", insertion: "@vibe ", description: "Ask the group agent"
+    ),
+  ]
 
   private static let builderSlashSuggestions: [ReadyCommandSuggestion] = [
     ReadyCommandSuggestion(command: "/newagent", insertion: "/newagent ", description: "Create a new agent"),
@@ -3083,6 +3120,9 @@ final class ChatInputBar: UIView {
     if username == "vibe" {
       return stripped.isEmpty ? .none : .group(stripped)
     }
+    if username == "team" {
+      return stripped.isEmpty ? .none : .team
+    }
 
     return stripped.isEmpty ? .none : .standalone(username: username, agentText: stripped)
   }
@@ -3092,18 +3132,21 @@ final class ChatInputBar: UIView {
       return .slash(suggestion)
     }
 
-    let shouldShowMention: Bool = {
-      guard !text.isEmpty else { return false }
-      guard let lastAtIndex = text.lastIndex(of: "@") else { return false }
+    let mentionSuggestion: ReadyMentionSuggestion? = {
+      guard !text.isEmpty else { return nil }
+      guard let lastAtIndex = text.lastIndex(of: "@") else { return nil }
       let afterAt = text[text.index(after: lastAtIndex)...].lowercased()
       let isAtStart = lastAtIndex == text.startIndex
       let isPrecededBySpace = !isAtStart && text[text.index(before: lastAtIndex)] == " "
-      guard isAtStart || isPrecededBySpace else { return false }
-      guard !afterAt.contains(" ") else { return false }
-      return "vibe".hasPrefix(afterAt) || afterAt.isEmpty
+      guard isAtStart || isPrecededBySpace else { return nil }
+      guard !afterAt.contains(" ") else { return nil }
+      return Self.readyMentionSuggestions.first {
+        let name = String($0.token.dropFirst()).lowercased()
+        return name.hasPrefix(afterAt) || afterAt.isEmpty
+      }
     }()
 
-    return shouldShowMention ? .mention : .none
+    return mentionSuggestion.map(ReadyBannerAction.mention) ?? .none
   }
 
   private func resolveSlashSuggestion(in text: String) -> ReadyCommandSuggestion? {

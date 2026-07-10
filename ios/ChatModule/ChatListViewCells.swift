@@ -1395,11 +1395,50 @@ func agentSystemDividerText(for row: ChatListRow) -> String? {
   }
   let body = (row.isAgentMessage ? (row.plainContent ?? row.text) : row.text)
     .trimmingCharacters(in: .whitespacesAndNewlines)
+
+  // Group membership notices — centered transparent text (not a bubble).
+  if let notice = groupSystemNoticeText(for: row, body: body) {
+    return notice
+  }
+
   guard !body.isEmpty else { return nil }
   if body == "[Request interrupted by user]"
     || body.localizedCaseInsensitiveContains("request interrupted by user")
   {
     return "Interrupted"
+  }
+  return nil
+}
+
+/// Formats "Alice added Bob", "Carol left the group", "Dave joined the group".
+/// Prefers structured metadata; falls back to system-type body / plain patterns.
+func groupSystemNoticeText(for row: ChatListRow, body: String) -> String? {
+  let type = row.messageType.lowercased()
+  let isSystemType =
+    type == "system"
+    || type == "group_event"
+    || type == "group_system"
+    || type == "system_message"
+
+  // Metadata may ride on the raw message via plainContent JSON or body prefix.
+  // Prefer explicit body when the server already composed a notice.
+  if isSystemType, !body.isEmpty {
+    return body
+  }
+
+  // Heuristic for older/local payloads that used freeform text.
+  let lower = body.lowercased()
+  if lower.contains(" added ") && (lower.contains(" to the group") || lower.contains(" to group")) {
+    return body
+  }
+  if lower.contains(" left the group") || lower.hasSuffix(" left") {
+    return body
+  }
+  if lower.contains(" joined the group") || lower.hasSuffix(" joined") {
+    return body
+  }
+  if lower.contains(" removed ") && lower.contains(" from the group") {
+    return body
   }
   return nil
 }

@@ -2055,6 +2055,8 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
 
   private func runOptionsMenu() -> UIMenu {
     let provider = agentBridgeProvider ?? "codex"
+    // Force-refresh live provider catalogs so new models appear without an app release.
+    AgentBridgeSelectionStore.refreshModelsIfPossible()
     let options = AgentBridgeSelectionStore.selectedRunOptions(provider: provider)
     let effectiveModelId =
       options.model
@@ -2062,10 +2064,14 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
         provider: provider, model: runModel ?? latestRuntimeModel)
 
     let modelActions = AgentBridgeSelectionStore.modelChoices(provider: provider).map { choice in
-      UIAction(
+      let selected =
+        effectiveModelId.map {
+          $0.caseInsensitiveCompare(choice.value) == .orderedSame
+        } ?? false
+      return UIAction(
         title: choice.title,
         subtitle: choice.subtitle,
-        state: choice.value == effectiveModelId ? .on : .off
+        state: selected ? .on : .off
       ) { [weak self] _ in
         AgentBridgeSelectionStore.setModel(provider: provider, model: choice.value)
         self?.updateHeaderTexts()
@@ -2080,7 +2086,9 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       self?.runModel = nil
       self?.updateHeaderTexts()
     }
-    let intelligenceActions = AgentBridgeIntelligenceLevel.allCases.map { level in
+    let thinkingLevels = AgentBridgeSelectionStore.intelligenceChoices(
+      provider: provider, model: effectiveModelId ?? options.model)
+    let intelligenceActions = thinkingLevels.map { level in
       UIAction(title: level.title, state: options.intelligence == level ? .on : .off) { [weak self] _ in
         AgentBridgeSelectionStore.setIntelligence(level)
         self?.updateHeaderTexts()

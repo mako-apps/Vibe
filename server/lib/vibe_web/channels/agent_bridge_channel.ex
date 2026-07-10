@@ -34,22 +34,33 @@ defmodule VibeWeb.AgentBridgeChannel do
 
   @impl true
   def handle_info(:after_join, socket) do
+    computer_id = to_string(socket.assigns.computer_id)
+
     {:ok, _ref} =
-      Presence.track(socket, to_string(socket.assigns.user_id), %{
+      Presence.track(socket, computer_id, %{
         "online_at" => System.system_time(:second),
+        "id" => computer_id,
+        "computerId" => computer_id,
+        "deviceLabel" => socket.assigns[:device_label] || "computer",
         "repositories" => []
       })
 
+    push(socket, "bridge_identity", %{
+      "computerId" => computer_id,
+      "deviceLabel" => socket.assigns[:device_label] || "computer"
+    })
     push(socket, "presence_state", Presence.list(socket))
-    Logger.info("[AgentBridge] computer online user=#{socket.assigns.user_id}")
+    Logger.info(
+      "[AgentBridge] computer online user=#{socket.assigns.user_id} computer=#{computer_id}"
+    )
     {:noreply, socket}
   end
 
   # daemon → server: connected device capabilities and allowed working trees
   @impl true
   def handle_in("status", payload, socket) do
-    meta = AgentBridge.presence_meta(payload)
-    key = to_string(socket.assigns.user_id)
+    key = to_string(socket.assigns.computer_id)
+    meta = AgentBridge.presence_meta(payload, key)
 
     case Presence.update(socket, key, meta) do
       {:ok, _ref} ->
@@ -79,22 +90,26 @@ defmodule VibeWeb.AgentBridgeChannel do
     line = payload["line"] || ""
     streams = Map.get(socket.assigns, :streams, %{})
 
-    # Keyed by {chat, provider} — a group chat runs Claude AND Codex concurrently
-    # through this one daemon socket; keying by chat_id alone merged both agents'
-    # lines into one buffer/stream_id (identity-flipping row + duplicate cells).
-    stream_key = stream_key(chat_id, provider)
+    task_id = payload["taskId"] || payload["task_id"]
+    team_run_id = payload["teamRunId"] || payload["team_run_id"]
+    team_worker = payload["teamWorker"] || payload["team_worker"]
+
+    # A shared chat can host multiple runs from the same provider. Scope the live
+    # buffer to the durable task/team identity so progress from adjacent team runs
+    # can never merge into one cell or clear each other on settle.
+    stream_key = stream_key(chat_id, provider, task_id, team_run_id, team_worker)
 
     state =
       Map.get(streams, stream_key, %{
         lines: [],
-        stream_id: new_stream_id(chat_id, provider),
+        stream_id: new_stream_id(chat_id, provider, task_id),
         progress_count: 0,
         last_latency_log_at: 0
       })
 
     lines = Enum.take([line | state.lines], @max_stream_lines)
     accumulated = lines |> Enum.reverse() |> Enum.join("\n")
-    task_id = payload["taskId"] || payload["task_id"] || Map.get(state, :task_id)
+    task_id = task_id || Map.get(state, :task_id)
     progress_count = (Map.get(state, :progress_count) || 0) + 1
 
     source_message_id =
@@ -124,7 +139,12 @@ defmodule VibeWeb.AgentBridgeChannel do
         team_worker:
           payload["teamWorker"] || payload["team_worker"] || Map.get(state, :team_worker),
         team_workers:
-          payload["teamWorkers"] || payload["team_workers"] || Map.get(state, :team_workers)
+          payload["teamWorkers"] || payload["team_workers"] || Map.get(state, :team_workers),
+        computer_id:
+          payload["computerId"] || payload["computer_id"] || Map.get(state, :computer_id),
+        computer_label:
+          payload["computerLabel"] || payload["computer_label"] ||
+            Map.get(state, :computer_label)
       })
 
     # The live tool/execution feed now renders INSIDE the chat bubble (via the
@@ -145,7 +165,9 @@ defmodule VibeWeb.AgentBridgeChannel do
       team_mode: state.team_mode,
       team_run_id: state.team_run_id,
       team_worker: state.team_worker,
-      team_workers: state.team_workers
+      team_workers: state.team_workers,
+      computer_id: state.computer_id,
+      computer_label: state.computer_label
     })
 
     parse_ms = System.monotonic_time(:millisecond) - parse_start_ms
@@ -207,7 +229,9 @@ defmodule VibeWeb.AgentBridgeChannel do
             team_mode: payload["teamMode"] || payload["team_mode"],
             team_run_id: payload["teamRunId"] || payload["team_run_id"],
             team_worker: payload["teamWorker"] || payload["team_worker"],
-            team_workers: payload["teamWorkers"] || payload["team_workers"]
+            team_workers: payload["teamWorkers"] || payload["team_workers"],
+            computer_id: payload["computerId"] || payload["computer_id"],
+            computer_label: payload["computerLabel"] || payload["computer_label"]
           )
         rescue
           err ->
@@ -220,7 +244,7 @@ defmodule VibeWeb.AgentBridgeChannel do
       end)
     end
 
-    {:reply, :ok, clear_stream(socket, chat_id, provider)}
+    {:reply, :ok, clear_stream(socket, chat_id, provider, payload)}
   end
 
   # daemon → server: the agent's local conversation history (Claude/Codex
@@ -360,7 +384,7 @@ defmodule VibeWeb.AgentBridgeChannel do
     )
 
     LocalAgentWorker.stop_activity(chat_id, agent_user_id_for(provider))
-    {:reply, :ok, clear_stream(socket, chat_id, provider)}
+    {:reply, :ok, clear_stream(socket, chat_id, provider, payload)}
   end
 
   def handle_in("heartbeat", _payload, socket), do: {:reply, :ok, socket}
@@ -377,22 +401,38 @@ defmodule VibeWeb.AgentBridgeChannel do
 
   defp bridge_lag_ms(_, _), do: nil
 
-  defp stream_key(chat_id, provider) when is_binary(provider) and provider != "",
-    do: chat_id <> "|" <> provider
+  defp stream_key(chat_id, provider, task_id, team_run_id, team_worker) do
+    [chat_id, provider, task_id || team_run_id, team_worker]
+    |> Enum.map(&to_string(&1 || "-"))
+    |> Enum.join("|")
+  end
 
-  defp stream_key(chat_id, _provider), do: chat_id
-
-  defp new_stream_id(chat_id, provider) do
+  defp new_stream_id(chat_id, provider, task_id) do
     suffix = if is_binary(provider) and provider != "", do: provider <> "-", else: ""
-    "stream-" <> chat_id <> "-" <> suffix <> Integer.to_string(System.system_time(:millisecond))
+    task_suffix =
+      case task_id do
+        value when is_binary(value) and value != "" -> String.slice(value, -12, 12) <> "-"
+        _ -> ""
+      end
+
+    "stream-" <> chat_id <> "-" <> suffix <> task_suffix <>
+      Integer.to_string(System.system_time(:millisecond))
   end
 
   # Finish + drop the live stream for ONE provider's task in a chat. Must not touch
   # the other provider's still-running stream in the same (group) chat.
-  defp clear_stream(socket, chat_id, provider) when is_binary(chat_id) do
+  defp clear_stream(socket, chat_id, provider, payload) when is_binary(chat_id) do
     streams = Map.get(socket.assigns, :streams, %{})
+    key =
+      stream_key(
+        chat_id,
+        provider,
+        payload["taskId"] || payload["task_id"],
+        payload["teamRunId"] || payload["team_run_id"],
+        payload["teamWorker"] || payload["team_worker"]
+      )
 
-    case Map.pop(streams, stream_key(chat_id, provider)) do
+    case Map.pop(streams, key) do
       {nil, _streams} ->
         socket
 
@@ -404,7 +444,7 @@ defmodule VibeWeb.AgentBridgeChannel do
     end
   end
 
-  defp clear_stream(socket, _chat_id, _provider), do: socket
+  defp clear_stream(socket, _chat_id, _provider, _payload), do: socket
 
   defp agent_user_id_for(provider) do
     case LocalAgentWorker.resolve_handle(provider) do

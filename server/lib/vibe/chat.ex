@@ -2,6 +2,7 @@ defmodule Vibe.Chat do
   import Ecto.Query, warn: false
   require Logger
   alias Vibe.ChatHomeCache
+  alias Vibe.Accounts
   alias Vibe.Agent
   alias Vibe.Repo
   alias Vibe.RepoRLS
@@ -231,7 +232,9 @@ defmodule Vibe.Chat do
         group_members =
           if group_channel_ids != [] do
             from(p in Participant,
-              where: p.chat_id in ^group_channel_ids,
+              where:
+                p.chat_id in ^group_channel_ids and
+                  (is_nil(p.deleted) or p.deleted == false),
               preload: [:user],
               order_by: [asc: p.inserted_at]
             )
@@ -1113,21 +1116,51 @@ defmodule Vibe.Chat do
     end
   end
 
-  def add_member(chat_id, user_id, role \\ "member") do
+  def add_member(chat_id, user_id, role \\ "member", opts \\ []) do
+    actor_id = opts[:actor_id]
+
     result =
       %Participant{}
       |> Participant.changeset(%{chat_id: chat_id, user_id: user_id, role: role})
       |> Repo.insert(on_conflict: :nothing)
+
+    case result do
+      {:ok, %Participant{}} ->
+        maybe_insert_group_system_notice(
+          chat_id,
+          actor_id || user_id,
+          user_id,
+          if(actor_id && actor_id != user_id, do: "member_added", else: "member_joined")
+        )
+
+      _ ->
+        :ok
+    end
 
     invalidate_chat_home_cache(chat_id)
     ChatHomeCache.invalidate_user(user_id)
     result
   end
 
-  def remove_member(chat_id, user_id) do
+  def remove_member(chat_id, user_id, opts \\ []) do
+    actor_id = opts[:actor_id]
+
     result =
       from(p in Participant, where: p.chat_id == ^chat_id and p.user_id == ^user_id)
       |> Repo.delete_all()
+
+    case result do
+      {n, _} when is_integer(n) and n > 0 ->
+        maybe_insert_group_system_notice(
+          chat_id,
+          actor_id || user_id,
+          user_id,
+          if(actor_id && actor_id != user_id, do: "member_removed", else: "member_left")
+        )
+
+      _ ->
+        :ok
+    end
 
     invalidate_chat_home_cache(chat_id)
     ChatHomeCache.invalidate_user(user_id)
@@ -1246,6 +1279,15 @@ defmodule Vibe.Chat do
 
       %Participant{} = participant ->
         result = Repo.delete(participant)
+
+        case result do
+          {:ok, _} ->
+            maybe_insert_group_system_notice(chat_id, user_id, user_id, "member_left")
+
+          _ ->
+            :ok
+        end
+
         invalidate_chat_home_cache(chat_id)
         ChatHomeCache.invalidate_user(user_id)
         result
@@ -1257,6 +1299,105 @@ defmodule Vibe.Chat do
 
   defp group_member_ids(chat_id) do
     Repo.all(from(p in Participant, where: p.chat_id == ^chat_id, select: p.user_id))
+  end
+
+  # System notice after membership change. Plaintext body in encrypted_content
+  # (non-hybrid) so clients parse it as text; type "system" for centered UI.
+  defp maybe_insert_group_system_notice(chat_id, actor_id, target_id, action)
+       when is_binary(chat_id) and is_binary(actor_id) and is_binary(target_id) and
+              is_binary(action) do
+    actor_name = display_name_for_user(actor_id)
+    target_name = display_name_for_user(target_id)
+
+    body =
+      case action do
+        "member_added" -> "#{actor_name} added #{target_name}"
+        "member_joined" -> "#{target_name} joined the group"
+        "member_removed" -> "#{actor_name} removed #{target_name}"
+        "member_left" -> "#{target_name} left the group"
+        _ -> nil
+      end
+
+    if is_binary(body) do
+      # Client decrypt path treats non-hybrid ciphertext as parseable payload JSON.
+      payload =
+        Jason.encode!(%{
+          "text" => body,
+          "systemAction" => action,
+          "actorId" => actor_id,
+          "targetId" => target_id,
+          "actorName" => actor_name,
+          "targetName" => target_name
+        })
+
+      msg_id = Ecto.UUID.generate()
+      ts = System.system_time(:millisecond)
+
+      attrs = %{
+        id: msg_id,
+        chat_id: chat_id,
+        from_id: actor_id,
+        encrypted_content: payload,
+        type: "system",
+        timestamp: ts,
+        metadata: %{
+          "systemAction" => action,
+          "actorId" => actor_id,
+          "targetId" => target_id,
+          "actorName" => actor_name,
+          "targetName" => target_name,
+          "text" => body
+        },
+        status: "sent"
+      }
+
+      case add_message(attrs, acting_user_id: actor_id) do
+        {:ok, _} ->
+          broadcast_payload = %{
+            "id" => msg_id,
+            "chatId" => chat_id,
+            "fromId" => actor_id,
+            "from_id" => actor_id,
+            "type" => "system",
+            "timestamp" => ts,
+            "encryptedContent" => payload,
+            "text" => body,
+            "metadata" => attrs.metadata,
+            "status" => "sent"
+          }
+
+          VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "message", broadcast_payload)
+
+          Enum.each(group_member_ids(chat_id), fn uid ->
+            VibeWeb.Endpoint.broadcast!("user:#{uid}", "new_message", %{
+              chat_id: chat_id,
+              from_id: actor_id,
+              message_id: msg_id,
+              timestamp: ts,
+              type: "system"
+            })
+          end)
+
+          :ok
+
+        _ ->
+          :ok
+      end
+    else
+      :ok
+    end
+  rescue
+    _ -> :ok
+  end
+
+  defp maybe_insert_group_system_notice(_, _, _, _), do: :ok
+
+  defp display_name_for_user(user_id) do
+    case Accounts.get_user(user_id) do
+      %{name: name} when is_binary(name) and name != "" -> name
+      %{username: name} when is_binary(name) and name != "" -> name
+      _ -> "Someone"
+    end
   end
 
   defp put_group_change(map, _key, nil), do: map

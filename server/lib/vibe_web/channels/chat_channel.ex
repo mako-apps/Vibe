@@ -251,10 +251,14 @@ defmodule VibeWeb.ChatChannel do
             "requesterUserId" => user_id
           }
           |> put_optional_string("taskId", task_id)
+          |> put_optional_string(
+            "computerId",
+            normalize_bridge_string(payload["computerId"] || payload["agentBridgeComputerId"])
+          )
 
         case AgentBridge.dispatch_control(user_id, control_payload) do
           :ok -> {:reply, :ok, socket}
-          {:error, :offline} -> {:reply, {:error, %{reason: "offline"}}, socket}
+          {:error, reason} -> {:reply, {:error, %{reason: to_string(reason)}}, socket}
         end
     end
   end
@@ -282,10 +286,14 @@ defmodule VibeWeb.ChatChannel do
           normalize_bridge_string(payload["before"] || payload["beforeCursor"])
         )
         |> put_optional_positive_integer("limit", payload["limit"])
+        |> put_optional_string(
+          "computerId",
+          normalize_bridge_string(payload["computerId"] || payload["agentBridgeComputerId"])
+        )
 
       case AgentBridge.dispatch_history(user_id, request_payload) do
         :ok -> {:reply, {:ok, %{"requestId" => request_payload["requestId"]}}, socket}
-        {:error, :offline} -> {:reply, {:error, %{reason: "offline"}}, socket}
+        {:error, reason} -> {:reply, {:error, %{reason: to_string(reason)}}, socket}
       end
     end
   end
@@ -308,17 +316,22 @@ defmodule VibeWeb.ChatChannel do
         {:reply, {:error, %{reason: "invalid_path"}}, socket}
 
       true ->
-        request_payload = %{
-          "requestId" => normalize_bridge_string(payload["requestId"]) || Ecto.UUID.generate(),
-          "provider" => provider,
-          "chatId" => chat_id,
-          "requesterUserId" => user_id,
-          "path" => file_path
-        }
+        request_payload =
+          %{
+            "requestId" => normalize_bridge_string(payload["requestId"]) || Ecto.UUID.generate(),
+            "provider" => provider,
+            "chatId" => chat_id,
+            "requesterUserId" => user_id,
+            "path" => file_path
+          }
+          |> put_optional_string(
+            "computerId",
+            normalize_bridge_string(payload["computerId"] || payload["agentBridgeComputerId"])
+          )
 
         case AgentBridge.dispatch_file(user_id, request_payload) do
           :ok -> {:reply, {:ok, %{"requestId" => request_payload["requestId"]}}, socket}
-          {:error, :offline} -> {:reply, {:error, %{reason: "offline"}}, socket}
+          {:error, reason} -> {:reply, {:error, %{reason: to_string(reason)}}, socket}
         end
     end
   end
@@ -335,16 +348,21 @@ defmodule VibeWeb.ChatChannel do
     if is_nil(provider) do
       {:reply, {:error, %{reason: "invalid_provider"}}, socket}
     else
-      request_payload = %{
-        "requestId" => normalize_bridge_string(payload["requestId"]) || Ecto.UUID.generate(),
-        "provider" => provider,
-        "chatId" => chat_id,
-        "requesterUserId" => user_id
-      }
+      request_payload =
+        %{
+          "requestId" => normalize_bridge_string(payload["requestId"]) || Ecto.UUID.generate(),
+          "provider" => provider,
+          "chatId" => chat_id,
+          "requesterUserId" => user_id
+        }
+        |> put_optional_string(
+          "computerId",
+          normalize_bridge_string(payload["computerId"] || payload["agentBridgeComputerId"])
+        )
 
       case AgentBridge.dispatch_usage(user_id, request_payload) do
         :ok -> {:reply, {:ok, %{"requestId" => request_payload["requestId"]}}, socket}
-        {:error, :offline} -> {:reply, {:error, %{reason: "offline"}}, socket}
+        {:error, reason} -> {:reply, {:error, %{reason: to_string(reason)}}, socket}
       end
     end
   end
@@ -379,13 +397,17 @@ defmodule VibeWeb.ChatChannel do
           "provider",
           normalize_bridge_provider(payload["provider"] || payload["agentBridgeProvider"])
         )
+        |> put_optional_string(
+          "computerId",
+          normalize_bridge_string(payload["computerId"] || payload["agentBridgeComputerId"])
+        )
 
       # The phone answered — drop the buffered ask so it isn't replayed on rejoin.
       AgentBridge.clear_pending_ask(chat_id, request_id)
 
       case AgentBridge.dispatch_ask_response(user_id, response_payload) do
         :ok -> {:reply, :ok, socket}
-        {:error, :offline} -> {:reply, {:error, %{reason: "offline"}}, socket}
+        {:error, reason} -> {:reply, {:error, %{reason: to_string(reason)}}, socket}
       end
     end
   end
@@ -877,16 +899,28 @@ defmodule VibeWeb.ChatChannel do
               "[ChatChannel] dispatched @#{worker.handle} to bridge user=#{requester_user_id} chat=#{chat_id}"
             )
 
-          {:error, :offline} ->
+          {:error, reason} ->
             maybe_clear_team_run(chat_id, team_run_id)
 
             # Raced with a disconnect — re-lock to the connect prompt.
             stop_agent_activity(chat_id, worker.agent_user_id)
 
+            notice =
+              case reason do
+                :computer_required ->
+                  "Choose which connected computer should run this task before sending."
+
+                :computer_offline ->
+                  "The selected computer is offline. Pick another connected computer or reconnect it."
+
+                _ ->
+                  "Your computer just went offline. Reconnect it to run @#{worker.handle} tasks."
+              end
+
             LocalAgentWorker.post_notice(
               worker,
               chat_id,
-              "Your computer just went offline. Reconnect it to run @#{worker.handle} tasks.",
+              notice,
               requester_user_id,
               data["id"]
             )
@@ -1086,6 +1120,11 @@ defmodule VibeWeb.ChatChannel do
       "repoName",
       metadata["agentBridgeRepoName"] || metadata["agent_bridge_repo_name"] ||
         data["agentBridgeRepoName"]
+    )
+    |> put_optional_string(
+      "computerId",
+      metadata["agentBridgeComputerId"] || metadata["agent_bridge_computer_id"] ||
+        data["agentBridgeComputerId"] || data["computerId"]
     )
     |> put_optional_string(
       "workMode",

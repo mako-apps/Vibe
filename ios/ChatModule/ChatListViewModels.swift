@@ -172,6 +172,12 @@ struct ChatListRow {
     let mcpServers: [AgentRuntimeMCPServer]
     let agents: [String]
     let skills: [String]
+    let teamMode: String?
+    let teamRunId: String?
+    let teamWorker: String?
+    let teamWorkers: [String]
+    let computerId: String?
+    let computerLabel: String?
   }
 
   struct AgentCardDestination: Codable, Equatable {
@@ -721,7 +727,13 @@ struct ChatListRow {
       ?? parseNonEmptyString(metadata?["caption"])
       ?? parseNonEmptyString(extra?["caption"])
       ?? ""
-    text = primaryText.isEmpty ? captionText : primaryText
+    // System notices may only carry body in metadata.text.
+    let systemMetaText = parseNonEmptyString(metadata?["text"])
+    text = {
+      if !primaryText.isEmpty { return primaryText }
+      if !captionText.isEmpty { return captionText }
+      return systemMetaText ?? ""
+    }()
     timestamp = (message["timestamp"] as? String) ?? ""
     isMe = (message["isMe"] as? Bool) ?? false
     status = message["status"] as? String
@@ -1488,7 +1500,13 @@ func parseAgentRuntimeSummary(_ raw: Any?) -> ChatListRow.AgentRuntimeSummary? {
     providerCommands: parseStringArray(object["providerCommands"] ?? object["provider_commands"]),
     mcpServers: mcpServers,
     agents: parseStringArray(object["agents"]),
-    skills: parseStringArray(object["skills"])
+    skills: parseStringArray(object["skills"]),
+    teamMode: parseNonEmptyString(object["teamMode"] ?? object["team_mode"]),
+    teamRunId: parseNonEmptyString(object["teamRunId"] ?? object["team_run_id"]),
+    teamWorker: parseNonEmptyString(object["teamWorker"] ?? object["team_worker"]),
+    teamWorkers: parseStringArray(object["teamWorkers"] ?? object["team_workers"]),
+    computerId: parseNonEmptyString(object["computerId"] ?? object["computer_id"]),
+    computerLabel: parseNonEmptyString(object["computerLabel"] ?? object["computer_label"])
   )
 }
 

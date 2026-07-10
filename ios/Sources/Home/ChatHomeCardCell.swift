@@ -454,7 +454,8 @@ final class ChatHomeCardCell: UITableViewCell {
     avatarFallbackLabel.translatesAutoresizingMaskIntoConstraints = false
     avatarFallbackLabel.textAlignment = .center
     avatarFallbackLabel.textColor = .white
-    avatarFallbackLabel.font = UIFont.systemFont(ofSize: 22, weight: .semibold)
+    // Modest letter size — oversized initials look broken and flash too hard.
+    avatarFallbackLabel.font = UIFont.systemFont(ofSize: 16, weight: .semibold)
     avatarFallbackLabel.adjustsFontSizeToFitWidth = true
     avatarFallbackLabel.minimumScaleFactor = 0.8
 
@@ -1283,9 +1284,12 @@ final class ChatHomeCardCell: UITableViewCell {
       return
     }
 
-    // No cached photo yet — keep the gradient+initials (or glyph) up while it loads.
+    // No cached photo yet. Prefer a quiet gradient (no letter) while loading so a
+    // chat that already has a remote avatar never flashes initials on top.
     avatarImageView.image = nil
     showAvatarFallback(true)
+    // Hide the letter glyph specifically; keep gradient from showAvatarFallback(true).
+    avatarFallbackLabel.isHidden = true
 
     let token = avatarToken
     let task = Task { [weak self] in
@@ -1297,6 +1301,9 @@ final class ChatHomeCardCell: UITableViewCell {
         if let image {
           self.avatarImageView.image = image
           self.showAvatarFallback(false)
+        } else {
+          // Load failed — restore letter only when there is truly no photo.
+          self.showAvatarFallback(true)
         }
       }
     }

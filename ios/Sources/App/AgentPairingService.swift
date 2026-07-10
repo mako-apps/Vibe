@@ -184,6 +184,12 @@ struct AgentBridgeRepository: Hashable, Identifiable {
   let cwd: String
   let source: String?
   let isGitRepository: Bool
+  var computerId: String? = nil
+  var computerLabel: String? = nil
+
+  var selectionIdentity: String {
+    "\(computerId ?? "legacy"):\(id)"
+  }
 }
 
 struct AgentBridgeDevice: Hashable {
@@ -191,6 +197,7 @@ struct AgentBridgeDevice: Hashable {
   let cwd: String?
   let repositories: [AgentBridgeRepository]
   let runningTasks: [AgentBridgeRunningTask]
+  var id: String = ""
 }
 
 struct AgentBridgeRunningTask: Hashable, Identifiable {
@@ -280,6 +287,7 @@ enum AgentBridgeIntelligenceLevel: String, CaseIterable, Identifiable {
   case medium
   case high
   case extraHigh = "extra_high"
+  case max
 
   var id: String { rawValue }
 
@@ -289,23 +297,44 @@ enum AgentBridgeIntelligenceLevel: String, CaseIterable, Identifiable {
     case .medium: return "Medium"
     case .high: return "High"
     case .extraHigh: return "Extra High"
+    case .max: return "Max"
     }
   }
 
-  var claudeEffort: String {
+  /// Provider-native effort token (Claude / Codex / Grok spawn args).
+  var providerEffort: String {
     switch self {
     case .low: return "low"
     case .medium: return "medium"
     case .high: return "high"
     case .extraHigh: return "xhigh"
+    case .max: return "max"
     }
   }
 
+  var claudeEffort: String { providerEffort }
+
   var codexEffort: String {
+    // Codex historically lacked max; map max → xhigh when unsupported.
     switch self {
     case .low: return "low"
     case .medium: return "medium"
-    case .high, .extraHigh: return "high"
+    case .high: return "high"
+    case .extraHigh, .max: return "xhigh"
+    }
+  }
+
+  static func fromProviderEffort(_ raw: String?) -> AgentBridgeIntelligenceLevel? {
+    guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+      !raw.isEmpty
+    else { return nil }
+    switch raw.replacingOccurrences(of: "_", with: "-") {
+    case "low", "minimal", "none": return .low
+    case "medium", "med", "standard": return .medium
+    case "high": return .high
+    case "xhigh", "extra-high", "extrahigh", "extra_high": return .extraHigh
+    case "max", "maximum", "ultrathink": return .max
+    default: return nil
     }
   }
 }
@@ -358,10 +387,30 @@ struct AgentBridgeRunOptions: Equatable {
     intelligence: AgentBridgeIntelligenceLevel,
     speed: AgentBridgeSpeedMode
   ) -> String {
-    let ladder = provider.lowercased() == "claude"
-      ? ["low", "medium", "high", "xhigh"]
-      : ["low", "medium", "high"]
-    let base = provider.lowercased() == "claude" ? intelligence.claudeEffort : intelligence.codexEffort
+    let key = provider.lowercased()
+    // Prefer live ladder for the selected model when the bridge advertised it.
+    let live = AgentBridgeSelectionStore.effortChoices(provider: key)
+    let ladder: [String]
+    if !live.isEmpty {
+      ladder = live
+    } else if key == "claude" {
+      ladder = ["low", "medium", "high", "xhigh", "max"]
+    } else if key == "codex" || key == "gpt" {
+      ladder = ["low", "medium", "high", "xhigh"]
+    } else if key == "agy" || key == "antigravity" {
+      // Effort is part of the agy model name; spawn does not take a separate flag.
+      return intelligence.providerEffort
+    } else {
+      ladder = ["low", "medium", "high"]
+    }
+    let base: String
+    if key == "claude" {
+      base = intelligence.claudeEffort
+    } else if key == "codex" || key == "gpt" {
+      base = intelligence.codexEffort
+    } else {
+      base = intelligence.providerEffort
+    }
     let baseIndex = ladder.firstIndex(of: base) ?? min(1, ladder.count - 1)
     let offset: Int
     switch speed {
@@ -371,6 +420,21 @@ struct AgentBridgeRunOptions: Equatable {
     }
     return ladder[min(max(baseIndex + offset, 0), ladder.count - 1)]
   }
+}
+
+/// One selectable model from the paired bridge (live provider catalog).
+struct AgentBridgeModelChoice: Hashable, Identifiable {
+  var id: String { value }
+  let title: String
+  let subtitle: String?
+  /// Exact provider id stored/sent as agentBridgeModel (never invent aliases).
+  let value: String
+  let isDefault: Bool
+  /// Provider-native effort/thinking levels for this model (e.g. low…max).
+  let efforts: [String]
+  let defaultEffort: String?
+  /// `live` | `cache` | `seed` — display/debug only.
+  let source: String?
 }
 
 /// Whether a paired computer (the `vibe-bridge` daemon) is connected right now.
@@ -385,13 +449,16 @@ struct AgentBridgeStatus {
   let devices: [AgentBridgeDevice]
   /// Flattened list of tasks currently running on connected bridge daemons.
   let runningTasks: [AgentBridgeRunningTask]
+  /// Live model catalogs keyed by provider (`claude`, `codex`, `grok`, `agy`).
+  let models: [String: [AgentBridgeModelChoice]]
 
   static let disconnected = AgentBridgeStatus(
     connected: false,
     paired: false,
     repositories: [],
     devices: [],
-    runningTasks: []
+    runningTasks: [],
+    models: [:]
   )
 }
 
@@ -466,6 +533,12 @@ enum AgentBridgeSelectionStore {
     if let source = repository.source {
       object["source"] = source
     }
+    if let computerId = repository.computerId {
+      object["computerId"] = computerId
+    }
+    if let computerLabel = repository.computerLabel {
+      object["computerLabel"] = computerLabel
+    }
     guard let data = try? JSONSerialization.data(withJSONObject: object) else { return }
     // Always keep the global key in sync so legacy callers without chatId still work.
     UserDefaults.standard.set(data, forKey: globalRepositoryKey)
@@ -495,7 +568,9 @@ enum AgentBridgeSelectionStore {
       path: path,
       cwd: normalizedString(object["cwd"]) ?? path,
       source: normalizedString(object["source"]),
-      isGitRepository: boolValue(object["git"])
+      isGitRepository: boolValue(object["git"]),
+      computerId: normalizedString(object["computerId"] ?? object["computer_id"]),
+      computerLabel: normalizedString(object["computerLabel"] ?? object["computer_label"])
     )
   }
 
@@ -567,38 +642,212 @@ enum AgentBridgeSelectionStore {
 
   // MARK: - Model catalog (shared title/menu source)
 
-  /// Selectable models per provider. `value` is the canonical id stored/sent.
+  /// Live catalogs from the last bridge status (provider CLI/API). Empty until status lands.
+  nonisolated(unsafe) private static var liveModelsByProvider: [String: [AgentBridgeModelChoice]] = [:]
+  private static let liveModelsCacheKey = "agentBridge.liveModelsByProvider.v1"
+
+  /// Selectable models per provider. Prefers live catalog from the paired bridge
+  /// (refreshed on status); falls back to a built-in seed so the picker never empties.
   static func modelChoices(provider: String) -> [(title: String, subtitle: String?, value: String)] {
+    hydrateLiveModelsFromDisk()
+    let key = provider.lowercased()
+    let liveKey = key == "antigravity" ? "agy" : key
+    if let live = liveModelsByProvider[liveKey], !live.isEmpty {
+      return live.map { ($0.title, $0.subtitle, $0.value) }
+    }
+    return hardcodedModelChoices(provider: key)
+  }
+
+  static func liveModelChoices(provider: String) -> [AgentBridgeModelChoice] {
+    hydrateLiveModelsFromDisk()
+    let key = provider.lowercased()
+    let liveKey = key == "antigravity" ? "agy" : key
+    return liveModelsByProvider[liveKey] ?? []
+  }
+
+  /// Provider-native effort/thinking levels for the selected (or default) model.
+  /// Empty for Agy (effort is part of the model label).
+  static func effortChoices(provider: String, model: String? = nil) -> [String] {
+    hydrateLiveModelsFromDisk()
+    let key = provider.lowercased()
+    let liveKey = key == "antigravity" ? "agy" : key
+    if liveKey == "agy" { return [] }
+    let rows = liveModelsByProvider[liveKey] ?? []
+    let wanted = model.flatMap { normalizedString($0) }
+    if let wanted,
+      let match = rows.first(where: {
+        $0.value.caseInsensitiveCompare(wanted) == .orderedSame
+      }),
+      !match.efforts.isEmpty
+    {
+      return match.efforts
+    }
+    if let selected = selectedModel(provider: provider),
+      let match = rows.first(where: { $0.value.caseInsensitiveCompare(selected) == .orderedSame }),
+      !match.efforts.isEmpty
+    {
+      return match.efforts
+    }
+    var seen = Set<String>()
+    var ordered: [String] = []
+    for row in rows {
+      for effort in row.efforts where seen.insert(effort).inserted {
+        ordered.append(effort)
+      }
+    }
+    if !ordered.isEmpty { return ordered }
+    switch liveKey {
+    case "claude": return ["low", "medium", "high", "xhigh", "max"]
+    case "codex", "gpt": return ["low", "medium", "high", "xhigh"]
+    case "grok": return ["low", "medium", "high"]
+    default: return ["low", "medium", "high"]
+    }
+  }
+
+  /// Thinking picker rows derived from live provider effort ladders.
+  static func intelligenceChoices(provider: String, model: String? = nil) -> [AgentBridgeIntelligenceLevel] {
+    let efforts = effortChoices(provider: provider, model: model)
+    let mapped = efforts.compactMap { AgentBridgeIntelligenceLevel.fromProviderEffort($0) }
+    if !mapped.isEmpty { return mapped }
+    return Array(AgentBridgeIntelligenceLevel.allCases)
+  }
+
+  /// Force-refresh model catalogs from the bridge (call when opening the model picker).
+  @MainActor
+  static func refreshModelsIfPossible(config: AppSessionConfig? = nil) {
+    hydrateLiveModelsFromDisk()
+    guard let config = config ?? AppSessionConfig.current else { return }
+    AgentPairingService.warmStatusIfStale(config: config, maxAge: 0)
+  }
+
+  /// Update in-memory model catalogs from a bridge status payload and persist last-good.
+  static func ingestLiveModels(_ models: [String: [AgentBridgeModelChoice]]) {
+    guard !models.isEmpty else { return }
+    var next = liveModelsByProvider
+    for (key, list) in models where !list.isEmpty {
+      next[key.lowercased()] = list
+    }
+    liveModelsByProvider = next
+    persistLiveModels(next)
+    NotificationCenter.default.post(name: didChangeNotification, object: nil)
+  }
+
+  /// Load last-good live catalogs so cold start does not flash seed until status returns.
+  static func hydrateLiveModelsFromDisk() {
+    guard liveModelsByProvider.isEmpty else { return }
+    guard let data = UserDefaults.standard.data(forKey: liveModelsCacheKey),
+      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return }
+    let parsed = parseProviderModelsMap(object)
+    if !parsed.isEmpty { liveModelsByProvider = parsed }
+  }
+
+  private static func persistLiveModels(_ models: [String: [AgentBridgeModelChoice]]) {
+    var out: [String: [[String: Any]]] = [:]
+    for (key, rows) in models {
+      out[key] = rows.map { row in
+        var dict: [String: Any] = [
+          "id": row.value,
+          "title": row.title,
+          "isDefault": row.isDefault,
+          "efforts": row.efforts,
+        ]
+        if let subtitle = row.subtitle { dict["subtitle"] = subtitle }
+        if let defaultEffort = row.defaultEffort { dict["defaultEffort"] = defaultEffort }
+        if let source = row.source { dict["source"] = source }
+        return dict
+      }
+    }
+    if let data = try? JSONSerialization.data(withJSONObject: out) {
+      UserDefaults.standard.set(data, forKey: liveModelsCacheKey)
+    }
+  }
+
+  /// Parse `status.models` map: `{ "claude": [ {id,title,...}, … ], … }`.
+  static func parseProviderModelsMap(_ value: Any?) -> [String: [AgentBridgeModelChoice]] {
+    guard let object = value as? [String: Any] else { return [:] }
+    var out: [String: [AgentBridgeModelChoice]] = [:]
+    for (rawKey, rawRows) in object {
+      let key = rawKey.lowercased()
+      let rows: [[String: Any]]
+      if let list = rawRows as? [[String: Any]] {
+        rows = list
+      } else if let wrapped = rawRows as? [String: Any],
+        let items = wrapped["items"] as? [[String: Any]]
+      {
+        rows = items
+      } else {
+        continue
+      }
+      let choices = rows.compactMap(parseModelChoice)
+      if !choices.isEmpty { out[key] = choices }
+    }
+    return out
+  }
+
+  private static func parseModelChoice(_ object: [String: Any]) -> AgentBridgeModelChoice? {
+    guard
+      let value = normalizedString(
+        object["id"] ?? object["value"] ?? object["apiId"] ?? object["api_id"])
+    else { return nil }
+    let title =
+      normalizedString(
+        object["title"] ?? object["name"] ?? object["display_name"] ?? object["displayName"])
+      ?? value
+    let efforts: [String]
+    if let list = object["efforts"] as? [String] {
+      efforts = list.compactMap { normalizedString($0) }
+    } else if let list = object["efforts"] as? [Any] {
+      efforts = list.compactMap { normalizedString($0) }
+    } else {
+      efforts = []
+    }
+    return AgentBridgeModelChoice(
+      title: title,
+      subtitle: normalizedString(object["subtitle"]),
+      value: value,
+      isDefault: boolValue(object["isDefault"] ?? object["is_default"] ?? object["default"]),
+      efforts: efforts,
+      defaultEffort: normalizedString(object["defaultEffort"] ?? object["default_effort"]),
+      source: normalizedString(object["source"])
+    )
+  }
+
+  private static func hardcodedModelChoices(provider: String) -> [(title: String, subtitle: String?, value: String)] {
+    // LAST RESORT only — live Anthropic / grok / agy / codex catalogs supersede these.
     switch provider.lowercased() {
     case "claude":
       return [
-        ("Haiku 4.5", "Fastest Claude model", "haiku"),
-        ("Sonnet 5", "Balanced Claude model", "sonnet"),
-        ("Opus 4.8", "Most capable Claude model", "opus"),
+        ("Claude Haiku 4.5", "Seed fallback", "claude-haiku-4-5-20251001"),
+        ("Claude Sonnet 5", "Seed fallback", "claude-sonnet-5"),
+        ("Claude Opus 4.8", "Seed fallback", "claude-opus-4-8"),
+        ("Claude Fable 5", "Seed fallback", "claude-fable-5"),
       ]
     case "grok":
       return [
-        ("Grok 4.5", "Default Grok Build model", "grok-4.5"),
-        ("Composer 2.5 Fast", "Faster Grok coding model", "grok-composer-2.5-fast"),
+        ("Grok 4.5", "Seed fallback", "grok-4.5"),
+        ("Composer 2.5 Fast", "Seed fallback", "grok-composer-2.5-fast"),
       ]
     case "agy", "antigravity":
       return [
-        ("Gemini 3.1 Pro (High)", "Default Antigravity model", "Gemini 3.1 Pro (High)"),
-        ("Gemini 3.1 Pro (Low)", "Faster Pro tier", "Gemini 3.1 Pro (Low)"),
-        ("Gemini 3.5 Flash (High)", "Fast Flash model", "Gemini 3.5 Flash (High)"),
-        ("Gemini 3.5 Flash (Medium)", "Balanced Flash", "Gemini 3.5 Flash (Medium)"),
-        ("Gemini 3.5 Flash (Low)", "Fastest Flash", "Gemini 3.5 Flash (Low)"),
-        ("Claude Sonnet 4.6 (Thinking)", "Claude Sonnet via Agy", "Claude Sonnet 4.6 (Thinking)"),
-        ("Claude Opus 4.6 (Thinking)", "Claude Opus via Agy", "Claude Opus 4.6 (Thinking)"),
-        ("GPT-OSS 120B (Medium)", "Open weights medium", "GPT-OSS 120B (Medium)"),
+        ("Gemini 3.1 Pro (High)", "Seed fallback", "Gemini 3.1 Pro (High)"),
+        ("Gemini 3.1 Pro (Low)", "Seed fallback", "Gemini 3.1 Pro (Low)"),
+        ("Gemini 3.5 Flash (High)", "Seed fallback", "Gemini 3.5 Flash (High)"),
+        ("Gemini 3.5 Flash (Medium)", "Seed fallback", "Gemini 3.5 Flash (Medium)"),
+        ("Gemini 3.5 Flash (Low)", "Seed fallback", "Gemini 3.5 Flash (Low)"),
+        ("Claude Sonnet 4.6 (Thinking)", "Seed fallback", "Claude Sonnet 4.6 (Thinking)"),
+        ("Claude Opus 4.6 (Thinking)", "Seed fallback", "Claude Opus 4.6 (Thinking)"),
+        ("GPT-OSS 120B (Medium)", "Seed fallback", "GPT-OSS 120B (Medium)"),
       ]
     default:
       return [
-        ("GPT-5.5", nil, "gpt-5.5"),
-        ("GPT-5.5 Pro", nil, "gpt-5.5-pro"),
-        ("GPT-5.4", nil, "gpt-5.4"),
-        ("GPT-5.2", nil, "gpt-5.2"),
-        ("GPT-5", nil, "gpt-5"),
+        ("GPT-5.6 Sol", "Seed fallback", "gpt-5.6-sol"),
+        ("GPT-5.6", "Seed fallback", "gpt-5.6"),
+        ("GPT-5.5", "Seed fallback", "gpt-5.5"),
+        ("GPT-5.5 Pro", "Seed fallback", "gpt-5.5-pro"),
+        ("GPT-5.4", "Seed fallback", "gpt-5.4"),
+        ("GPT-5.2", "Seed fallback", "gpt-5.2"),
+        ("GPT-5", "Seed fallback", "gpt-5"),
       ]
     }
   }
@@ -653,10 +902,15 @@ enum AgentBridgeSelectionStore {
   }
 
   private static func defaultRunModel(provider: String) -> String? {
+    // Prefer bridge-marked default from live catalog when present.
+    if let liveDefault = liveModelChoices(provider: provider).first(where: { $0.isDefault }) {
+      return liveDefault.value
+    }
     switch provider.lowercased() {
-    case "claude": return "sonnet"
+    case "claude": return "claude-sonnet-5"
     case "grok": return "grok-4.5"
     case "agy", "antigravity": return "Gemini 3.1 Pro (High)"
+    case "codex": return "gpt-5.6-sol"
     default: return nil
     }
   }
@@ -742,13 +996,15 @@ enum AgentBridgeSelectionStore {
   /// for the header so the displayed model matches whatever a loaded run reports.
   static func modelTitle(provider: String, model: String?) -> String {
     guard let rawModel = normalizedString(model) else { return defaultModelTitle(provider: provider) }
-    // The bridge may report the CLI's fully-resolved model id (e.g.
-    // "claude-sonnet-5-20260101"), not the bare alias — canonicalize first so it still
-    // matches a catalog entry instead of falling through to the raw, ugly id string.
-    let canonical = normalizedModel(provider: provider, model: rawModel) ?? rawModel.lowercased()
-    if let match = modelChoices(provider: provider).first(where: { $0.value == canonical }) {
+    // Prefer live display_name; fall back to canonical match then raw id.
+    let canonical = normalizedModel(provider: provider, model: rawModel) ?? rawModel
+    if let match = modelChoices(provider: provider).first(where: {
+      $0.value.caseInsensitiveCompare(canonical) == .orderedSame
+        || $0.value.caseInsensitiveCompare(rawModel) == .orderedSame
+    }) {
       return match.title
     }
+    // Strip common "Claude " prefix noise only for display of raw ids.
     return rawModel
   }
 
@@ -760,29 +1016,41 @@ enum AgentBridgeSelectionStore {
 
   private static func normalizedModel(provider: String, model: String?) -> String? {
     guard let model = normalizedString(model) else { return nil }
+    hydrateLiveModelsFromDisk()
+    let key = provider.lowercased()
+    let liveKey = key == "antigravity" ? "agy" : key
+    // Prefer exact match against the live catalog so new models (alpha, fable-5, …)
+    // round-trip unchanged without alias collapse.
+    if let live = liveModelsByProvider[liveKey] {
+      if let exact = live.first(where: { $0.value.caseInsensitiveCompare(model) == .orderedSame }) {
+        return exact.value
+      }
+    }
     let normalized = model.lowercased().replacingOccurrences(of: "_", with: "-")
-    switch provider.lowercased() {
+    switch key {
     case "claude":
-      if normalized.contains("haiku") { return "haiku" }
-      if normalized.contains("sonnet") { return "sonnet" }
-      if normalized.contains("opus") { return "opus" }
+      // Exact Anthropic ids pass through (claude-fable-5, claude-sonnet-5, …).
+      if normalized.starts(with: "claude-") { return model }
+      // Legacy short aliases → current API ids so old UserDefaults keep working.
+      if normalized == "fable" || normalized.contains("fable") { return "claude-fable-5" }
+      if normalized == "haiku" || normalized.contains("haiku-4-5") {
+        return "claude-haiku-4-5-20251001"
+      }
+      if normalized == "sonnet" || (normalized.contains("sonnet-5") && !normalized.contains("sonnet-4")) {
+        return "claude-sonnet-5"
+      }
+      if normalized == "opus" || normalized.contains("opus-4-8") { return "claude-opus-4-8" }
+      if normalized.contains("sonnet") { return "claude-sonnet-5" }
+      if normalized.contains("opus") { return "claude-opus-4-8" }
       return model
     case "grok":
-      if normalized.contains("composer") { return "grok-composer-2.5-fast" }
-      if normalized.contains("grok-4") || normalized == "grok" { return "grok-4.5" }
       return model
     case "agy", "antigravity":
-      // Agy model labels are human-readable and passed through as-is.
+      // Agy model labels are human-readable and passed through as-is (effort in name).
       return model
     default:
-      switch normalized {
-      case "gpt-5.3-codex", "gpt-5-3-codex":
-        return "gpt-5.5"
-      case "gpt-5.5", "gpt-5.5-pro", "gpt-5.4", "gpt-5.2", "gpt-5":
-        return normalized
-      default:
-        return model
-      }
+      if normalized == "gpt-5.3-codex" || normalized == "gpt-5-3-codex" { return "gpt-5.5" }
+      return model
     }
   }
 
@@ -863,8 +1131,15 @@ enum AgentBridgeSelectionStore {
     // the first repo, which silently routed every task to e.g. "vibe".
     guard let selected = selectedRepository(chatId: chatId) else { return nil }
     if repositories.isEmpty { return selected }
-    return repositories.contains(where: { $0.id == selected.id || $0.cwd == selected.cwd })
-      ? selected : nil
+    let match = repositories.first(where: {
+      let sameRepository = $0.id == selected.id || $0.cwd == selected.cwd
+      let sameComputer = selected.computerId == nil || $0.computerId == selected.computerId
+      return sameRepository && sameComputer
+    })
+    if let match, match != selected {
+      select(match, chatId: chatId)
+    }
+    return match
   }
 
   private static func boolValue(_ value: Any?) -> Bool {
@@ -967,20 +1242,31 @@ enum AgentPairingService {
     let repositories = repositoryList(object["repositories"])
     let devices = deviceList(object["devices"])
     let runningTasks = runningTaskList(object["runningTasks"] ?? object["running_tasks"])
+    let models = modelCatalogMap(object["models"] ?? object["modelCatalog"] ?? object["model_catalog"])
     let result = AgentBridgeStatus(
       connected: boolValue(object["connected"]),
       paired: boolValue(object["paired"]),
       repositories: repositories.isEmpty ? devices.flatMap(\.repositories) : repositories,
       devices: devices,
-      runningTasks: runningTasks.isEmpty ? devices.flatMap(\.runningTasks) : runningTasks
+      runningTasks: runningTasks.isEmpty ? devices.flatMap(\.runningTasks) : runningTasks,
+      models: models
     )
     lastDeviceLabel = result.devices.first?.label
     lastConnected = result.connected
     lastStatusSnapshot = result
     lastStatusFetchedAt = Date()
+    if !models.isEmpty {
+      AgentBridgeSelectionStore.ingestLiveModels(models)
+    }
 
     await MainActor.run { lastStatus = result }
     return result
+  }
+
+  /// Parse `{ "claude": [ { title, value/id, efforts, ... } ], ... }` model catalogs from status.
+  private static func modelCatalogMap(_ raw: Any?) -> [String: [AgentBridgeModelChoice]] {
+    // Shared parser on the selection store (also used for disk hydrate).
+    AgentBridgeSelectionStore.parseProviderModelsMap(raw)
   }
 
   /// Timestamp of the last successful (or attempted) warm-up, so `warmStatusIfStale`
@@ -1146,7 +1432,9 @@ enum AgentPairingService {
       path: path,
       cwd: cwd,
       source: normalizedString(object["source"]),
-      isGitRepository: boolValue(object["git"])
+      isGitRepository: boolValue(object["git"]),
+      computerId: normalizedString(object["computerId"] ?? object["computer_id"]),
+      computerLabel: normalizedString(object["computerLabel"] ?? object["computer_label"])
     )
   }
 
@@ -1157,7 +1445,8 @@ enum AgentPairingService {
         label: normalizedString(object["deviceLabel"] ?? object["device_label"]) ?? "Computer",
         cwd: normalizedString(object["cwd"]),
         repositories: repositoryList(object["repositories"]),
-        runningTasks: runningTaskList(object["runningTasks"] ?? object["running_tasks"])
+        runningTasks: runningTaskList(object["runningTasks"] ?? object["running_tasks"]),
+        id: normalizedString(object["computerId"] ?? object["computer_id"] ?? object["id"]) ?? ""
       )
     }
   }

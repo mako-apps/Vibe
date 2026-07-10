@@ -327,6 +327,231 @@ struct ChatGroupCreationSheet: View {
 /// "Members" screen. Same search/selection building blocks as
 /// `ChatGroupCreationSheet` above, minus the name/avatar step — adding
 /// members doesn't create a new room.
+/// Push destination (NavigationStack) for adding members — same material/API as
+/// New Chat / `ContactSearchView`: plain List, A–Z sections, home-style rows.
+struct AddGroupMembersPickerView: View {
+  @Environment(\.colorScheme) private var colorScheme
+
+  let config: AppSessionConfig
+  let chatId: String
+  let excludedUserIds: Set<String>
+  let onAdded: ([[String: Any]]) -> Void
+
+  @State private var selectedMembers = Set<ContactSearchUser>()
+  @State private var searchQuery = ""
+  @State private var searchResults: [ContactSearchUser] = []
+  @State private var isSearching = false
+  @State private var hasSearched = false
+  @State private var searchTask: Task<Void, Never>?
+  @State private var isSaving = false
+  @State private var errorMessage: String?
+  @State private var isSearchPresented = false
+
+  private var palette: AppThemePalette {
+    AppThemePalette.resolve(for: colorScheme)
+  }
+
+  private var candidates: [ContactSearchUser] {
+    searchResults.filter { !excludedUserIds.contains($0.userID) }
+  }
+
+  private var selectedOrdered: [ContactSearchUser] {
+    Array(selectedMembers).sorted {
+      $0.username.localizedCaseInsensitiveCompare($1.username) == .orderedAscending
+    }
+  }
+
+  var body: some View {
+    List {
+      if !selectedOrdered.isEmpty {
+        Section("Selected") {
+          ForEach(selectedOrdered) { user in
+            ContactSearchResultRow(user: user, isSaved: true, palette: palette)
+              .contentShape(Rectangle())
+              .onTapGesture { selectedMembers.remove(user) }
+              .listRowInsets(EdgeInsets(top: 0, leading: 16, bottom: 0, trailing: 16))
+              .listRowBackground(Color.clear)
+          }
+        }
+      }
+
+      if let errorMessage {
+        Section {
+          Text(errorMessage)
+            .font(.footnote)
+            .foregroundStyle(.red)
+            .listRowBackground(Color.clear)
+        }
+      }
+
+      if !candidates.isEmpty {
+        groupedUsersSection(users: candidates)
+      } else if searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        Section {
+          Text("Search for people to add. They join as members.")
+            .font(.system(size: 14))
+            .foregroundStyle(palette.secondaryText)
+            .listRowBackground(Color.clear)
+            .listRowSeparator(.hidden)
+        }
+      } else if isSearching {
+        Section {
+          HStack {
+            Spacer()
+            ProgressView()
+            Spacer()
+          }
+          .listRowBackground(Color.clear)
+          .listRowSeparator(.hidden)
+        }
+      } else if hasSearched {
+        Section {
+          Text("No people found.")
+            .foregroundStyle(palette.secondaryText)
+            .listRowBackground(Color.clear)
+            .listRowSeparator(.hidden)
+        }
+      }
+    }
+    .listStyle(.plain)
+    .scrollContentBackground(.hidden)
+    .background(palette.background.ignoresSafeArea())
+    .navigationTitle("Add Members")
+    .navigationBarTitleDisplayMode(.inline)
+    .toolbarBackground(.hidden, for: .navigationBar)
+    .searchable(
+      text: $searchQuery,
+      isPresented: $isSearchPresented,
+      placement: .navigationBarDrawer(displayMode: .automatic),
+      prompt: "Username, phone, or ID"
+    )
+    .onChange(of: searchQuery) { _, newValue in
+      scheduleSearch(query: newValue)
+    }
+    .onAppear { isSearchPresented = true }
+    .toolbar {
+      ToolbarItem(placement: .topBarTrailing) {
+        Button(selectedOrdered.isEmpty ? "Add" : "Add (\(selectedOrdered.count))") {
+          Task { await addSelectedMembers() }
+        }
+        .fontWeight(.semibold)
+        .disabled(selectedMembers.isEmpty || isSaving)
+      }
+    }
+    .overlay {
+      if isSaving {
+        ZStack {
+          Color.black.opacity(0.25).ignoresSafeArea()
+          ProgressView()
+            .padding(16)
+            .background(palette.card)
+            .cornerRadius(10)
+        }
+      }
+    }
+  }
+
+  @ViewBuilder
+  private func groupedUsersSection(users: [ContactSearchUser]) -> some View {
+    var unique: [ContactSearchUser] = []
+    var seen = Set<String>()
+    for user in users {
+      if seen.insert(user.userID).inserted {
+        unique.append(user)
+      }
+    }
+    let grouped = Dictionary(grouping: unique) { user in
+      String(user.username.prefix(1)).uppercased()
+    }
+    let keys = grouped.keys.sorted()
+
+    return ForEach(keys, id: \.self) { letter in
+      Section(letter) {
+        ForEach(grouped[letter] ?? []) { user in
+          let selected = selectedMembers.contains(user)
+          ContactSearchResultRow(user: user, isSaved: selected, palette: palette)
+            .contentShape(Rectangle())
+            .onTapGesture {
+              if selected {
+                selectedMembers.remove(user)
+              } else {
+                selectedMembers.insert(user)
+              }
+            }
+            .listRowInsets(EdgeInsets(top: 0, leading: 16, bottom: 0, trailing: 16))
+            .listRowBackground(Color.clear)
+            .listRowSeparatorTint(palette.border)
+        }
+      }
+    }
+  }
+
+  private func scheduleSearch(query: String) {
+    searchTask?.cancel()
+    let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else {
+      searchResults = []
+      isSearching = false
+      hasSearched = false
+      return
+    }
+    isSearching = true
+    searchTask = Task { @MainActor in
+      try? await Task.sleep(nanoseconds: 350_000_000)
+      if Task.isCancelled { return }
+      do {
+        let results = try await ContactSearchService.search(config: config, query: trimmed)
+        if !Task.isCancelled {
+          searchResults = results
+          isSearching = false
+          hasSearched = true
+        }
+      } catch {
+        if !Task.isCancelled {
+          searchResults = []
+          isSearching = false
+          hasSearched = true
+        }
+      }
+    }
+  }
+
+  @MainActor
+  private func addSelectedMembers() async {
+    isSaving = true
+    errorMessage = nil
+    defer { isSaving = false }
+    let selected = Array(selectedMembers)
+    do {
+      let results = try await GroupMembersUpdateService.addMembers(
+        chatId: chatId,
+        memberIds: selected.map(\.userID),
+        config: config
+      )
+      let addedIds = Set(results.filter(\.added).map(\.userId))
+      guard !addedIds.isEmpty else {
+        errorMessage = "Couldn't add the selected members."
+        return
+      }
+      let addedRaw: [[String: Any]] = selected
+        .filter { addedIds.contains($0.userID) }
+        .map {
+          [
+            "userId": $0.userID,
+            "name": $0.username,
+            "role": "member",
+            "profileImage": $0.profileImage ?? "",
+            "avatarUri": $0.profileImage ?? "",
+          ]
+        }
+      onAdded(addedRaw)
+    } catch {
+      errorMessage = error.localizedDescription
+    }
+  }
+}
+
+/// Legacy sheet entry point — still multi-select; prefer `AddGroupMembersPickerView` push.
 struct AddGroupMembersSheet: View {
   @Environment(\.dismiss) private var dismiss
   @Environment(\.colorScheme) private var colorScheme
@@ -343,6 +568,7 @@ struct AddGroupMembersSheet: View {
   @State private var searchTask: Task<Void, Never>?
   @State private var isSaving = false
   @State private var errorMessage: String?
+  @FocusState private var isSearchFocused: Bool
 
   private var palette: AppThemePalette {
     AppThemePalette.resolve(for: colorScheme)
@@ -352,46 +578,121 @@ struct AddGroupMembersSheet: View {
     searchResults.filter { !excludedUserIds.contains($0.userID) }
   }
 
+  private var selectedOrdered: [ContactSearchUser] {
+    Array(selectedMembers).sorted {
+      $0.username.localizedCaseInsensitiveCompare($1.username) == .orderedAscending
+    }
+  }
+
   var body: some View {
     NavigationStack {
       VStack(spacing: 0) {
+        // In-sheet search (not .searchable) — avoids detent jumps with keyboard.
+        HStack(spacing: 10) {
+          Image(systemName: "magnifyingglass")
+            .foregroundStyle(palette.secondaryText)
+          TextField("Search people…", text: $searchQuery)
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+            .focused($isSearchFocused)
+          if !searchQuery.isEmpty {
+            Button {
+              searchQuery = ""
+              scheduleSearch(query: "")
+            } label: {
+              Image(systemName: "xmark.circle.fill")
+                .foregroundStyle(palette.secondaryText)
+            }
+            .buttonStyle(.plain)
+          }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(
+          RoundedRectangle(cornerRadius: 12, style: .continuous)
+            .fill(palette.card)
+        )
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
+        .padding(.bottom, 10)
+
+        if !selectedOrdered.isEmpty {
+          ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+              ForEach(selectedOrdered) { user in
+                Button {
+                  selectedMembers.remove(user)
+                } label: {
+                  HStack(spacing: 6) {
+                    Text(user.username)
+                      .font(.system(size: 13, weight: .semibold))
+                      .lineLimit(1)
+                    Image(systemName: "xmark")
+                      .font(.system(size: 10, weight: .bold))
+                  }
+                  .foregroundStyle(palette.buttonText)
+                  .padding(.horizontal, 10)
+                  .padding(.vertical, 7)
+                  .background(Capsule(style: .continuous).fill(palette.accent))
+                }
+                .buttonStyle(.plain)
+              }
+            }
+            .padding(.horizontal, 16)
+          }
+          .padding(.bottom, 8)
+        }
+
         if let errorMessage {
           Text(errorMessage)
             .font(.footnote)
             .foregroundStyle(.red)
-            .padding()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 16)
+            .padding(.bottom, 6)
         }
 
-        List {
-          if searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            Text("Search for someone to add.")
-              .foregroundStyle(palette.secondaryText)
-              .listRowBackground(Color.clear)
-          } else if isSearching {
-            HStack {
-              Spacer()
+        ScrollView {
+          LazyVStack(spacing: 0) {
+            if searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+              Text(selectedOrdered.isEmpty
+                ? "Search for people to add. They join as members — promote later if needed."
+                : "\(selectedOrdered.count) selected. Tap Add when ready.")
+                .font(.system(size: 14, weight: .regular))
+                .foregroundStyle(palette.secondaryText)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(16)
+            } else if isSearching {
               ProgressView()
-              Spacer()
-            }
-            .listRowBackground(Color.clear)
-          } else if candidates.isEmpty {
-            Text("No users found.")
-              .foregroundStyle(palette.secondaryText)
-              .listRowBackground(Color.clear)
-          } else {
-            ForEach(candidates) { user in
-              memberRow(user: user)
+                .padding(.vertical, 36)
+                .frame(maxWidth: .infinity)
+            } else if candidates.isEmpty {
+              Text("No people found.")
+                .font(.system(size: 14, weight: .regular))
+                .foregroundStyle(palette.secondaryText)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(16)
+            } else {
+              ForEach(candidates) { user in
+                memberRow(user: user)
+                if user.userID != candidates.last?.userID {
+                  Divider()
+                    .padding(.leading, 76)
+                }
+              }
             }
           }
         }
-        .listStyle(.plain)
       }
       .background(palette.background.ignoresSafeArea())
       .navigationTitle("Add Members")
       .navigationBarTitleDisplayMode(.inline)
-      .searchable(text: $searchQuery, prompt: "Search people...")
+      .toolbarBackground(.hidden, for: .navigationBar)
       .onChange(of: searchQuery) { _, newValue in
         scheduleSearch(query: newValue)
+      }
+      .onAppear {
+        isSearchFocused = true
       }
       .toolbar {
         ToolbarItem(placement: .topBarLeading) {
@@ -402,9 +703,10 @@ struct AddGroupMembersSheet: View {
           }
         }
         ToolbarItem(placement: .topBarTrailing) {
-          Button("Add") {
+          Button(selectedOrdered.isEmpty ? "Add" : "Add (\(selectedOrdered.count))") {
             Task { await addSelectedMembers() }
           }
+          .fontWeight(.semibold)
           .disabled(selectedMembers.isEmpty || isSaving)
         }
       }
@@ -487,7 +789,15 @@ struct AddGroupMembersSheet: View {
       }
       let addedRaw: [[String: Any]] = selected
         .filter { addedIds.contains($0.userID) }
-        .map { ["userId": $0.userID, "name": $0.username, "role": "member"] }
+        .map {
+          [
+            "userId": $0.userID,
+            "name": $0.username,
+            "role": "member",
+            "profileImage": $0.profileImage ?? "",
+            "avatarUri": $0.profileImage ?? "",
+          ]
+        }
       onAdded(addedRaw)
       dismiss()
     } catch {

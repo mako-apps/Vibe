@@ -341,6 +341,15 @@ struct ChatHomeListRow {
   let isArchiveEntry: Bool
   let type: String?
   let isGroup: Bool
+  /// True when `type == "channel"`. Channels are group-like rooms but must NOT
+  /// expose a members roster in the profile (groups do).
+  var isChannel: Bool {
+    (type ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "channel"
+  }
+  /// Group chats where every participant can open the Members list.
+  var showsMemberList: Bool { isGroup && !isChannel }
+  /// Signed-in user's role in this room (`owner`/`admin`/`member`), from home list.
+  let myRole: String?
   /// True when the chat's friend is an AI agent's shadow user — i.e. this is a
   /// 1:1 "talk to the agent" chat. Mirrors the server's `friendIsAgent` flag.
   let isAgentFriend: Bool
@@ -391,6 +400,7 @@ struct ChatHomeListRow {
     isArchiveEntry: Bool,
     type: String?,
     isGroup: Bool,
+    myRole: String? = nil,
     isAgentFriend: Bool,
     peerAgentId: String?,
     agentEventInboxMode: String?,
@@ -422,6 +432,7 @@ struct ChatHomeListRow {
     self.isArchiveEntry = isArchiveEntry
     self.type = type
     self.isGroup = isGroup
+    self.myRole = myRole
     self.isAgentFriend = isAgentFriend
     self.peerAgentId = peerAgentId
     self.agentEventInboxMode = agentEventInboxMode
@@ -490,11 +501,14 @@ struct ChatHomeListRow {
   }
 
   func cachePayload(messageLimit: Int = 5) -> [String: Any] {
-    let shouldIncludeMessagePayload = messageLimit > 0 && !isBridgeAgentSurface
+    // Bridge-agent DMs are ordinary conversations from Home's perspective. Keeping
+    // their latest row lets Home show the actual session/activity after a relaunch
+    // instead of permanently replacing every preview with "Start session".
+    let shouldIncludeMessagePayload = messageLimit > 0
     var payload: [String: Any] = [
       "chatId": chatId,
       "title": title,
-      "preview": isBridgeAgentSurface ? "Start session" : preview,
+      "preview": preview,
       "timeLabel": timeLabel,
       "unreadCount": unreadCount,
       "markedUnread": markedUnread,
@@ -522,15 +536,21 @@ struct ChatHomeListRow {
     if let avatarGradientStartDark { payload["avatarGradientStartDark"] = avatarGradientStartDark }
     if let avatarGradientEndDark { payload["avatarGradientEndDark"] = avatarGradientEndDark }
     if let type { payload["type"] = type }
+    if let myRole { payload["role"] = myRole }
+    // Group roster must survive cold start. Without this, opening a group from
+    // cache always showed 0 members (profile "No members yet") until a live
+    // home refresh happened to re-open the chat.
+    if !members.isEmpty {
+      payload["members"] = members
+    }
     return payload
   }
 
   func withPresence(isTyping: Bool, isOnline: Bool, preview: String? = nil) -> ChatHomeListRow {
-    let bridgeSurface = isBridgeAgentSurface
     return ChatHomeListRow(
       chatId: chatId,
       title: title,
-      preview: bridgeSurface ? "Start session" : (preview ?? self.preview),
+      preview: preview ?? self.preview,
       timeLabel: timeLabel,
       unreadCount: unreadCount,
       markedUnread: markedUnread,
@@ -550,12 +570,13 @@ struct ChatHomeListRow {
       isArchiveEntry: isArchiveEntry,
       type: type,
       isGroup: isGroup,
+      myRole: myRole,
       isAgentFriend: isAgentFriend,
       peerAgentId: peerAgentId,
       agentEventInboxMode: agentEventInboxMode,
       peerTier: peerTier,
-      previewRows: bridgeSurface ? [] : previewRows,
-      initialMessages: bridgeSurface ? [] : initialMessages,
+      previewRows: previewRows,
+      initialMessages: initialMessages,
       members: members,
       lastMessageAt: lastMessageAt
     )
@@ -600,6 +621,11 @@ struct ChatHomeListRow {
     let type = normalizedString(raw["type"] ?? raw["chatType"] ?? raw["chat_type"])
     let isGroup =
       parseBool(raw["isGroup"] ?? raw["is_group"]) ?? (type == "group" || type == "channel")
+    // Per-user role for this room (owner/admin/member). Stabilizes admin chrome
+    // without re-deriving only from the members array (which can arrive incomplete).
+    let myRole = normalizedString(
+      raw["role"] ?? raw["myRole"] ?? raw["my_role"] ?? raw["memberRole"] ?? raw["member_role"]
+    )?.lowercased()
     // Groups/channels are never a 1:1 with a "friend": ignore any friend_* fields. A stale
     // pre-fix cached row can still carry a leaked agent friendId/friendImage — that's what
     // made an old group open Codex AND show Codex's avatar instead of the uploaded photo.
@@ -668,15 +694,11 @@ struct ChatHomeListRow {
     let peerTier = normalizedString(
       raw["friendTier"] ?? raw["friend_tier"] ?? raw["peerTier"] ?? raw["peer_tier"]
         ?? raw["tier"] ?? raw["badge"] ?? raw["badgeTier"] ?? raw["badge_tier"])
-    let isBridgeAgent = Self.bridgeProvider(
-      peerUserId: peerUserId,
-      name: title,
-      isAgent: isAgentFriend,
-      agentId: peerAgentId
-    ) != nil
-    let preview = isBridgeAgent ? "Start session" : (previewRaw ?? previewMessage ?? "")
-    let initialMessages = isBridgeAgent ? [] : serverMessages
-    let previewRows = isBridgeAgent ? [] : parsePreviewRows(raw["previewRows"] ?? raw["preview_rows"])
+    // Do not erase real bridge-agent activity. The server supplies the newest
+    // transcript row, which is the source of truth for Home's preview and order.
+    let preview = previewRaw ?? previewMessage ?? ""
+    let initialMessages = serverMessages
+    let previewRows = parsePreviewRows(raw["previewRows"] ?? raw["preview_rows"])
 
     let lastMessageAt: Double = {
       if let value = raw["lastMessageAt"] as? NSNumber { return value.doubleValue }
@@ -714,6 +736,7 @@ struct ChatHomeListRow {
       isArchiveEntry: isArchiveEntry,
       type: type,
       isGroup: isGroup,
+      myRole: myRole,
       isAgentFriend: isAgentFriend,
       peerAgentId: peerAgentId,
       agentEventInboxMode: agentEventInboxMode,

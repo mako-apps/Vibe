@@ -17,6 +17,8 @@ struct VibeAgentToolsSheet: View {
   @State private var selectedAdvisor: String?
   @State private var selectedIntelligence: AgentBridgeIntelligenceLevel = .medium
   @State private var selectedWorkMode: AgentBridgeWorkMode = .askAuto
+  /// Bumps when live model catalogs arrive so model/thinking lists re-render.
+  @State private var catalogEpoch: Int = 0
 
   init(
     appearance: VibeAgentKitChatAppearance,
@@ -183,6 +185,17 @@ struct VibeAgentToolsSheet: View {
         }
       }
       .tint(text)
+      .onAppear {
+        AgentBridgeSelectionStore.refreshModelsIfPossible()
+      }
+      .onReceive(NotificationCenter.default.publisher(for: AgentBridgeSelectionStore.didChangeNotification)) { _ in
+        catalogEpoch &+= 1
+        // Re-sync selection titles if the live catalog remapped ids.
+        let opts = AgentBridgeSelectionStore.selectedRunOptions(provider: provider)
+        selectedModel = opts.model
+        selectedAdvisor = opts.advisor
+        selectedIntelligence = opts.intelligence
+      }
     }
   }
 
@@ -237,12 +250,20 @@ struct VibeAgentToolsSheet: View {
           AgentBridgeSelectionStore.setModel(provider: provider, model: nil)
           selectedModel = nil
         }
+        // catalogEpoch forces refresh when bridge status lands mid-sheet.
         ForEach(AgentBridgeSelectionStore.modelChoices(provider: provider), id: \.value) { choice in
-          selectRow(title: choice.title, isSelected: selectedModel == choice.value) {
+          selectRow(
+            title: choice.title,
+            isSelected: selectedModel == choice.value || (selectedModel != nil && selectedModel?.caseInsensitiveCompare(choice.value) == .orderedSame)
+          ) {
             AgentBridgeSelectionStore.setModel(provider: provider, model: choice.value)
             selectedModel = choice.value
           }
         }
+      } footer: {
+        Text(modelCatalogFooter)
+          .font(.system(size: 12))
+          .foregroundStyle(textTertiary)
       }
     }
     .listStyle(.insetGrouped)
@@ -250,17 +271,43 @@ struct VibeAgentToolsSheet: View {
     .background(Color.clear)
     .navigationTitle("Model")
     .navigationBarTitleDisplayMode(.inline)
+    .id(catalogEpoch)
+    .onAppear {
+      // Force status re-fetch so provider updates (new models) appear immediately.
+      AgentBridgeSelectionStore.refreshModelsIfPossible()
+    }
+  }
+
+  private var modelCatalogFooter: String {
+    let live = AgentBridgeSelectionStore.liveModelChoices(provider: provider)
+    if live.isEmpty {
+      return "Showing seed list until the paired computer reports live models."
+    }
+    let source = live.first?.source ?? "live"
+    return "Live from provider (\(source)) · \(live.count) models"
   }
 
   private var thinkingPage: some View {
-    List {
+    let levels = AgentBridgeSelectionStore.intelligenceChoices(
+      provider: provider, model: selectedModel)
+    return List {
       Section {
-        ForEach(AgentBridgeIntelligenceLevel.allCases, id: \.self) { level in
-          selectRow(title: level.title, isSelected: selectedIntelligence == level) {
-            AgentBridgeSelectionStore.setIntelligence(level)
-            selectedIntelligence = level
+        if levels.isEmpty {
+          Text("This model bakes thinking into the model name (pick another model row).")
+            .font(.system(size: 14))
+            .foregroundStyle(textSecondary)
+        } else {
+          ForEach(levels, id: \.self) { level in
+            selectRow(title: level.title, isSelected: selectedIntelligence == level) {
+              AgentBridgeSelectionStore.setIntelligence(level)
+              selectedIntelligence = level
+            }
           }
         }
+      } footer: {
+        Text("Thinking levels come from the provider for the selected model when available.")
+          .font(.system(size: 12))
+          .foregroundStyle(textTertiary)
       }
     }
     .listStyle(.insetGrouped)
@@ -268,6 +315,10 @@ struct VibeAgentToolsSheet: View {
     .background(Color.clear)
     .navigationTitle("Thinking")
     .navigationBarTitleDisplayMode(.inline)
+    .id(catalogEpoch)
+    .onAppear {
+      AgentBridgeSelectionStore.refreshModelsIfPossible()
+    }
   }
 
   private var advisorPage: some View {

@@ -652,6 +652,11 @@ struct AgentBridgeHistoryInlineView: View {
   @State private var loading = true
   @State private var errorMessage: String?
   @State private var pendingRequestId: String?
+  /// Connection notifications and SwiftUI lifecycle updates can arrive together when
+  /// History opens. Keep one list request active so they do not fan out into dozens of
+  /// identical bridge reads before the first reply settles the view.
+  @State private var listRequestInFlight = false
+  @State private var lastListRequestAt: Date?
   
   @State private var requestStartAt: Date?
   @State private var hasReceivedResponse = false
@@ -968,6 +973,22 @@ struct AgentBridgeHistoryInlineView: View {
   }
 
   private func requestList() {
+    let now = Date()
+    if listRequestInFlight {
+      // A missing reply must still be recoverable; anything newer is the same load.
+      if let started = requestStartAt, now.timeIntervalSince(started) < 8.0 {
+        return
+      }
+      listRequestInFlight = false
+    }
+    // A few adjacent lifecycle callbacks can arrive after a reply. One short cooldown
+    // keeps those callbacks from immediately issuing another identical list request.
+    if let previous = lastListRequestAt, now.timeIntervalSince(previous) < 0.75 {
+      return
+    }
+    listRequestInFlight = true
+    lastListRequestAt = now
+
     // Only show the skeleton on a cold load. With rows already on screen (cached or a
     // prior fetch) we refresh silently so re-opening never flashes back to a spinner.
     if visibleSessions.isEmpty { loading = true }
@@ -993,8 +1014,9 @@ struct AgentBridgeHistoryInlineView: View {
       // is deliberately wider than a cold read of a large ~/.claude/projects so we don't
       // mint a fresh requestId (and a duplicate bridge read) while a reply is in flight.
       DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) {
-        if self.loading && !self.hasReceivedResponse && self.requestStartAt == start {
+        if !self.hasReceivedResponse && self.requestStartAt == start {
           print("[AgentBridgeHistory] ⚠️ Timed out waiting for response! Retrying...")
+          self.listRequestInFlight = false
           self.requestList()
         }
       }
@@ -1006,12 +1028,14 @@ struct AgentBridgeHistoryInlineView: View {
       // not-connected message) only after several attempts.
       notReadyRetries += 1
       loading = visibleSessions.isEmpty
+      listRequestInFlight = false
       print("[AgentBridgeHistory] ⏳ Transport not ready (attempt \(notReadyRetries)) — keeping skeleton, retrying")
       DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
         guard self.requestStartAt == start, !self.hasReceivedResponse else { return }
         self.requestList()
       }
     } else {
+      listRequestInFlight = false
       loading = false
       errorMessage = "Your computer isn't connected right now. Connect it, then try again."
     }
@@ -1076,6 +1100,7 @@ struct AgentBridgeHistoryInlineView: View {
     hasReceivedResponse = true
     loading = false
     notReadyRetries = 0
+    listRequestInFlight = false
     pendingRequestId = nil
     let raw = payload["sessions"] as? [[String: Any]] ?? []
     sessions = raw.compactMap { item in
@@ -1303,6 +1328,12 @@ struct AgentBridgeRuntimeView: UIViewControllerRepresentable {
       metadata["agentBridgeRepoName"] = repo.name
       metadata["agentBridgeRepoPath"] = repo.path
       metadata["agentBridgeCwd"] = repo.cwd
+      if let computerId = repo.computerId, !computerId.isEmpty {
+        metadata["agentBridgeComputerId"] = computerId
+      }
+      if let computerLabel = repo.computerLabel, !computerLabel.isEmpty {
+        metadata["agentBridgeComputerLabel"] = computerLabel
+      }
     }
     metadata["agentBridgeWorkMode"] = AgentBridgeSelectionStore.selectedWorkMode().rawValue
     metadata.merge(

@@ -355,6 +355,10 @@ struct ChatRoute: Identifiable, Hashable {
   let isAgent: Bool
   let avatarURI: String?
   let isGroup: Bool
+  /// `type == "channel"` — profile must not list members (groups still do).
+  let isChannel: Bool
+  /// Signed-in role in this room when known (`owner`/`admin`/`member`).
+  let myRole: String?
   let unreadCount: Int
   let initialRows: [[String: Any]]
   /// Attached agent's event-inbox mode (`per_event` / `batched_summary`). Drives
@@ -367,6 +371,9 @@ struct ChatRoute: Identifiable, Hashable {
   /// Group/channel participant list, carried straight from `ChatHomeListRow.members`.
   /// Empty for DMs and for routes built before that data was available.
   let members: [[String: Any]]
+
+  /// Groups expose a Members list; channels do not.
+  var showsMemberList: Bool { isGroup && !isChannel }
 
   var id: String { chatId }
 
@@ -510,6 +517,8 @@ struct ChatRoute: Identifiable, Hashable {
     isAgent: Bool = false,
     avatarURI: String?,
     isGroup: Bool,
+    isChannel: Bool = false,
+    myRole: String? = nil,
     unreadCount: Int = 0,
     initialRows: [[String: Any]],
     agentEventInboxMode: String? = nil,
@@ -528,6 +537,9 @@ struct ChatRoute: Identifiable, Hashable {
     self.isAgent = resolvedIsAgent
     self.avatarURI = avatarURI
     self.isGroup = isGroup
+    self.isChannel = isChannel && isGroup
+    let role = myRole?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+    self.myRole = role.isEmpty ? nil : role
     self.unreadCount = max(0, unreadCount)
     self.initialRows = initialRows
     self.agentEventInboxMode = agentEventInboxMode
@@ -560,9 +572,11 @@ struct ChatRoute: Identifiable, Hashable {
       ? (row.initialMessages.isEmpty ? row.previewRows : row.initialMessages)
       : []
     NSLog(
-      "[AgentRoute] ChatRoute(row:) chatId=%@ title=%@ isGroup=%@ peerUserId=%@ peerAgentId=%@ isAgentFriend=%@ resolvedBridge=%@",
-      row.chatId, row.title, row.isGroup ? "Y" : "N", row.peerUserId ?? "nil",
-      row.peerAgentId ?? "nil", row.isAgentFriend ? "true" : "false", resolvedBridge ?? "nil")
+      "[AgentRoute] ChatRoute(row:) chatId=%@ title=%@ isGroup=%@ isChannel=%@ peerUserId=%@ peerAgentId=%@ isAgentFriend=%@ resolvedBridge=%@ members=%d myRole=%@",
+      row.chatId, row.title, row.isGroup ? "Y" : "N", row.isChannel ? "Y" : "N",
+      row.peerUserId ?? "nil",
+      row.peerAgentId ?? "nil", row.isAgentFriend ? "true" : "false", resolvedBridge ?? "nil",
+      row.members.count, row.myRole ?? "<nil>")
     self.init(
       chatId: row.chatId,
       title: row.title,
@@ -571,6 +585,8 @@ struct ChatRoute: Identifiable, Hashable {
       isAgent: row.isAgentFriend,
       avatarURI: row.avatarUri,
       isGroup: row.isGroup,
+      isChannel: row.isChannel,
+      myRole: row.myRole,
       unreadCount: row.unreadCount,
       initialRows: cachedRows,
       agentEventInboxMode: row.agentEventInboxMode,
@@ -589,6 +605,42 @@ struct ChatRoute: Identifiable, Hashable {
       isGroup: false,
       unreadCount: 0,
       initialRows: initialRows
+    )
+  }
+
+  /// Prefer the route's roster; if empty (stale cache / opened before home refresh),
+  /// fall back to the on-disk home row so group profile/members still populate.
+  static func resolvedMembers(chatId: String, routeMembers: [[String: Any]]) -> [[String: Any]] {
+    if !routeMembers.isEmpty { return routeMembers }
+    guard let config = AppSessionConfig.current else { return routeMembers }
+    let cached = ChatHomeService.cachedRows(config: config)
+    if let row = cached.first(where: { $0.chatId == chatId }), !row.members.isEmpty {
+      NSLog(
+        "[WhoAmI] ChatRoute.resolvedMembers hydrated chatId=%@ fromCache=%d",
+        String(chatId.prefix(12)),
+        row.members.count
+      )
+      return row.members
+    }
+    return routeMembers
+  }
+
+  func withMembers(_ members: [[String: Any]]) -> ChatRoute {
+    ChatRoute(
+      chatId: chatId,
+      title: title,
+      peerUserId: peerUserId,
+      peerAgentId: peerAgentId,
+      isAgent: isAgent,
+      avatarURI: avatarURI,
+      isGroup: isGroup,
+      isChannel: isChannel,
+      myRole: myRole,
+      unreadCount: unreadCount,
+      initialRows: initialRows,
+      agentEventInboxMode: agentEventInboxMode,
+      bridgeProvider: bridgeProvider,
+      members: members
     )
   }
 
@@ -1291,7 +1343,10 @@ private final class ChatsViewModel: ObservableObject {
           }
         case "remoteNewMessage":
           if let chatID {
-            self.applyRemoteNewMessage(chatID: chatID)
+            // The user topic also receives mirrors of messages sent from this
+            // device/another device. Project the actual latest row before changing
+            // the badge so a self-send never creates a fake "1" on an agent DM.
+            self.applyEngineProjection(chatID: chatID, reason: "remoteNewMessage")
           }
           self.scheduleRealtimeRefresh()
         case "chatMessageInserted", "chatMessageEdited", "chatMessageDeleted", "chatMessageChanged":
@@ -1300,9 +1355,12 @@ private final class ChatsViewModel: ObservableObject {
           }
           self.scheduleRealtimeRefresh()
         case "agentProgress":
-          // A bridge run's live state changed — re-render so the agent row's preview
-          // tracks the current working label (or reverts to "Start session" when it
-          // clears). Debounced via scheduleRealtimeRefresh so token-rate frames coalesce.
+          // Render active bridge work from the local engine immediately. Fetching Home
+          // here races the stream and replaces it with an older server preview, which is
+          // why every agent row used to remain on "Start session" while it was working.
+          if let chatID, self.applyAgentProgress(chatID: chatID) {
+            break
+          }
           self.scheduleRealtimeRefresh()
         default:
           break
@@ -1376,19 +1434,6 @@ private final class ChatsViewModel: ObservableObject {
     }
   }
 
-  private func applyRemoteNewMessage(chatID: String) {
-    let normalizedChatID = chatID.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !normalizedChatID.isEmpty else { return }
-    locallyRemovedChatIDs.remove(normalizedChatID)
-    let now = Date().timeIntervalSince1970 * 1000
-    let changed = mutateRow(chatID: normalizedChatID) { row in
-      row.withHomeState(unreadCount: row.unreadCount + 1, markedUnread: true, lastMessageAt: now)
-    }
-    if changed {
-      persistHomeRows()
-    }
-  }
-
   private func applyEngineProjection(chatID: String, reason: String) {
     let normalizedChatID = chatID.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !normalizedChatID.isEmpty, !locallyRemovedChatIDs.contains(normalizedChatID) else {
@@ -1412,7 +1457,9 @@ private final class ChatsViewModel: ObservableObject {
     let messageID = Self.messageID(from: message) ?? Self.messageID(from: latestRow)
     let isIncoming = (Self.boolValue(message["isMe"]) == false)
     let didAlreadyProject = messageID.flatMap { projectedMessageIDsByChat[normalizedChatID] == $0 } ?? false
-    let shouldIncrementUnread = reason == "chatMessageInserted" && isIncoming && !didAlreadyProject
+    let shouldIncrementUnread = (reason == "chatMessageInserted" || reason == "remoteNewMessage")
+      && isIncoming
+      && !didAlreadyProject
     let preview = ChatHomeListRow.homePreviewText(from: message)
     let timeLabel = ChatHomeListRow.homeTimeLabel(from: message)
     let messageAt =
@@ -1438,6 +1485,57 @@ private final class ChatsViewModel: ObservableObject {
     if changed {
       persistHomeRows()
     }
+  }
+
+  /// Projects a live bridge status into Home without exposing a raw command/path.
+  /// Returns false once the task has settled, allowing the normal debounced refresh to
+  /// restore the server's final response preview.
+  private func applyAgentProgress(chatID: String) -> Bool {
+    let normalizedChatID = chatID.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !normalizedChatID.isEmpty,
+      let progress = ChatEngine.shared.agentProgress(chatId: normalizedChatID),
+      (progress["isActive"] as? Bool) == true
+    else {
+      return false
+    }
+
+    let label = Self.friendlyAgentProgressLabel(
+      rawLabel: progress["label"] as? String,
+      tool: progress["tool"] as? String
+    )
+    guard !label.isEmpty else { return false }
+
+    let changed = mutateRow(chatID: normalizedChatID) { row in
+      guard row.isBridgeAgentSurface else { return row }
+      let provider = ChatHomeListRow.bridgeProvider(
+        peerUserId: row.peerUserId,
+        name: row.title,
+        isAgent: row.isAgentFriend,
+        agentId: row.peerAgentId
+      ) ?? row.title
+      return row.withHomeState(preview: "\(ChatRoute.bridgeDisplayName(for: provider)) is \(label)")
+    }
+    if changed {
+      persistHomeRows()
+    }
+    return changed
+  }
+
+  private static func friendlyAgentProgressLabel(rawLabel: String?, tool: String?) -> String {
+    let label = (rawLabel ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    let tool = (tool ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !label.isEmpty || !tool.isEmpty else { return "working…" }
+
+    func matches(_ values: [String]) -> Bool {
+      values.contains { tool.contains($0) || label.contains($0) }
+    }
+    if matches(["approval", "awaiting", "permission"]) { return "waiting for approval" }
+    if matches(["error", "fail"]) { return "working on an error" }
+    if matches(["read", "grep", "glob", "search", "fetch", "look"]) { return "reading…" }
+    if matches(["write", "edit", "patch", "notebook"]) { return "editing…" }
+    if matches(["think", "reason", "plan"]) { return "thinking…" }
+    if matches(["bash", "shell", "command", "exec"]) { return "running…" }
+    return "working…"
   }
 
   func loadIfNeeded() async {
@@ -1743,6 +1841,7 @@ private extension ChatHomeListRow {
       isArchiveEntry: isArchiveEntry,
       type: type,
       isGroup: isGroup,
+      myRole: myRole,
       isAgentFriend: isAgentFriend,
       peerAgentId: peerAgentId,
       agentEventInboxMode: agentEventInboxMode,
@@ -5581,7 +5680,29 @@ final class ChatProfileRootController: UIViewController {
       profileView.setProfileBio("")
       profileView.setAvatarUri(route.avatarURI)
       profileView.setIsGroupOrChannel(route.isGroup)
-      profileView.setGroupMembers(route.members)
+      profileView.setRouteMembership(isChannel: route.isChannel, myRole: route.myRole)
+      let routeMemberCount = route.members.count
+      // Channels intentionally have no client-facing members list.
+      let resolvedMembers =
+        route.showsMemberList
+        ? ChatRoute.resolvedMembers(chatId: route.chatId, routeMembers: route.members)
+        : []
+      if route.showsMemberList, route.members.isEmpty, !resolvedMembers.isEmpty {
+        self.route = route.withMembers(resolvedMembers)
+      }
+      profileView.setGroupMembers(resolvedMembers)
+      if !resolvedMembers.isEmpty {
+        profileView.setGroupMemberCount(resolvedMembers.count)
+      }
+      NSLog(
+        "[WhoAmI] ChatProfileRoot.applyRoute groupMembers chatId=%@ route=%d resolved=%d isChannel=%@ myRole=%@ showsMembers=%@",
+        String(route.chatId.prefix(12)),
+        routeMemberCount,
+        resolvedMembers.count,
+        route.isChannel ? "Y" : "N",
+        route.myRole ?? "<nil>",
+        route.showsMemberList ? "Y" : "N"
+      )
       profileView.setRows(route.initialRows)
     }
   }
@@ -6127,10 +6248,23 @@ final class ChatConversationController: UIViewController {
     // Without this, sender directory / role / agent-membership stay empty until
     // something else re-binds, and the profile's admin/member state flickers.
     if route.isGroup {
-      mainView.setGroupMembers(route.members)
-      if !route.members.isEmpty {
-        mainView.setGroupMemberCount(route.members.count)
+      let routeMemberCount = route.members.count
+      let resolvedMembers = ChatRoute.resolvedMembers(
+        chatId: route.chatId, routeMembers: route.members)
+      if route.members.isEmpty, !resolvedMembers.isEmpty {
+        // Keep route in sync so the profile push doesn't re-open with 0 members.
+        self.route = route.withMembers(resolvedMembers)
       }
+      mainView.setGroupMembers(resolvedMembers)
+      if !resolvedMembers.isEmpty {
+        mainView.setGroupMemberCount(resolvedMembers.count)
+      }
+      NSLog(
+        "[WhoAmI] ChatConversation.applyRoute groupMembers chatId=%@ route=%d resolved=%d",
+        String(route.chatId.prefix(12)),
+        routeMemberCount,
+        resolvedMembers.count
+      )
     } else {
       mainView.setGroupMembers([])
       mainView.setGroupMemberCount(nil)
@@ -6474,10 +6608,14 @@ final class ChatConversationController: UIViewController {
   private func loadBridgeSessionIntoChat(provider: String, session: AgentBridgeHistorySession) {
     let sessionId = session.resolvedSessionId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !sessionId.isEmpty, !sessionId.hasPrefix("running:") else { return }
+    // Scope the chat list's fresh-surface filter to THIS session so follow-ups
+    // stay visible and other sessions' bridge rows do not mix into the list.
+    mainView.setBridgeLoadedSessionId(sessionId)
     _ = ChatEngine.shared.loadAgentBridgeSessionIntoChat([
       "chatId": route.chatId,
       "provider": provider,
       "sessionId": sessionId,
+      "topic": session.topic,
     ])
   }
 
@@ -7039,7 +7177,22 @@ final class ChatConversationController: UIViewController {
       profileView.setProfileBio("")
       profileView.setAvatarUri(route.avatarURI)
       profileView.setIsGroupOrChannel(route.isGroup)
-      profileView.setGroupMembers(route.members)
+      let routeMemberCount = route.members.count
+      let resolvedMembers = ChatRoute.resolvedMembers(
+        chatId: route.chatId, routeMembers: route.members)
+      if route.members.isEmpty, !resolvedMembers.isEmpty {
+        self.route = route.withMembers(resolvedMembers)
+      }
+      profileView.setGroupMembers(resolvedMembers)
+      if !resolvedMembers.isEmpty {
+        profileView.setGroupMemberCount(resolvedMembers.count)
+      }
+      NSLog(
+        "[WhoAmI] configureProfileView groupMembers chatId=%@ route=%d resolved=%d",
+        String(route.chatId.prefix(12)),
+        routeMemberCount,
+        resolvedMembers.count
+      )
       profileView.setRows(rows)
     }
   }
@@ -7810,9 +7963,14 @@ private struct ChatAvatarView: View {
 
   @ViewBuilder
   private var avatarContent: some View {
+    let hasPhoto =
+      avatarImageURI == normalizedAvatarURI(row.avatarUri) && avatarImage != nil
     ZStack {
-      fallbackAvatar
-      if avatarImageURI == normalizedAvatarURI(row.avatarUri), let avatarImage {
+      // Only show letter/glyph when there is no photo — never under a loaded image.
+      if !hasPhoto {
+        fallbackAvatar
+      }
+      if hasPhoto, let avatarImage {
         Image(uiImage: avatarImage)
           .resizable()
           .scaledToFill()
@@ -7826,6 +7984,10 @@ private struct ChatAvatarView: View {
   @ViewBuilder
   private var fallbackAvatar: some View {
     let gradientColors = rowAvatarGradientColors(row: row, palette: palette)
+    // While a real avatar URL is loading, keep a quiet gradient (no giant letter)
+    // so we don't flash initials over a chat that already has a photo.
+    let uri = normalizedAvatarURI(row.avatarUri)
+    let quietWhileLoading = uri != nil && avatarImage == nil
     Circle()
       .fill(
         LinearGradient(
@@ -7838,13 +8000,15 @@ private struct ChatAvatarView: View {
         Group {
           if row.isSavedMessages {
             Image(systemName: "bookmark.fill")
-              .font(.system(size: 20, weight: .semibold))
+              .font(.system(size: 18, weight: .semibold))
+          } else if quietWhileLoading {
+            EmptyView()
           } else {
             Text(row.avatarFallback)
-              .font(.system(size: 20, weight: .bold))
+              .font(.system(size: 16, weight: .semibold))
           }
         }
-        .foregroundStyle(palette.buttonText)
+        .foregroundStyle(palette.buttonText.opacity(0.95))
       )
   }
 
@@ -7884,7 +8048,13 @@ private struct ChatAvatarView: View {
     let normalized = normalizedAvatarURI(rawValue)
     if avatarImageURI != normalized {
       avatarImageURI = normalized
-      avatarImage = normalized.flatMap { ChatAvatarImageStore.cached(for: $0) }
+      // Prefer cache; keep previous image while the new URI loads so letters
+      // never flash over a known photo.
+      if let normalized, let cached = ChatAvatarImageStore.cached(for: normalized) {
+        avatarImage = cached
+      } else if normalized == nil {
+        avatarImage = nil
+      }
     }
     guard let normalized else {
       avatarImage = nil
@@ -8075,7 +8245,11 @@ struct AppChatNavigationAvatarButton: View {
     let normalized = normalizedAvatarURI(rawValue)
     if avatarImageURI != normalized {
       avatarImageURI = normalized
-      avatarImage = normalized.flatMap { ChatAvatarImageStore.cached(for: $0) }
+      if let normalized, let cached = ChatAvatarImageStore.cached(for: normalized) {
+        avatarImage = cached
+      } else if normalized == nil {
+        avatarImage = nil
+      }
     }
     guard let normalized else {
       avatarImage = nil

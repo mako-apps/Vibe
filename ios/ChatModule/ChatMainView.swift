@@ -498,6 +498,13 @@ public final class ChatMainView: UIView,
     setNeedsLayout()
   }
 
+  /// Scope the chat list to an explicitly-picked History session (or clear with nil).
+  /// Required so follow-ups appear under historical isolation and multi-session
+  /// bridge rows do not combine on the shared agent DM chatId.
+  func setBridgeLoadedSessionId(_ sessionId: String?) {
+    chatListView.setBridgeLoadedSessionId(sessionId)
+  }
+
   /// Enables agent inbox mode: event notifications are filtered out of the
   /// transcript and surfaced via the Inbox banner.
   func setAgentEventInboxMode(enabled: Bool) {
@@ -1196,6 +1203,10 @@ public final class ChatMainView: UIView,
     historyButton.setImage(createHistoryIcon(), for: .normal)
     newChatButton.setImage(UIImage(systemName: "plus"), for: .normal)
     newChatButton.setPreferredSymbolConfiguration(actionSymbolConfig, forImageIn: .normal)
+    historyButton.accessibilityIdentifier = "chat.history"
+    historyButton.accessibilityLabel = "History"
+    newChatButton.accessibilityIdentifier = "chat.new"
+    newChatButton.accessibilityLabel = "New Chat"
 
     historyButton.addTarget(self, action: #selector(handleHistoryPressed), for: .touchUpInside)
     newChatButton.addTarget(self, action: #selector(handleNewChatPressed), for: .touchUpInside)
@@ -1267,9 +1278,9 @@ public final class ChatMainView: UIView,
 
     avatarFallbackLabel.textAlignment = .center
     avatarFallbackLabel.textColor = .white
-    avatarFallbackLabel.font = UIFont.systemFont(ofSize: 20, weight: .semibold)
+    avatarFallbackLabel.font = UIFont.systemFont(ofSize: 15, weight: .semibold)
     avatarFallbackLabel.adjustsFontSizeToFitWidth = true
-    avatarFallbackLabel.minimumScaleFactor = 0.8
+    avatarFallbackLabel.minimumScaleFactor = 0.7
     avatarFallbackLabel.isHidden = false
 
     chatHeaderStack.axis = .vertical
@@ -1567,11 +1578,12 @@ public final class ChatMainView: UIView,
     savedSearchCancelGlassView.isHidden = !searchActive
 
     let isAgent = !bridgeProvider.isEmpty
-    let isNewChat = engineChatId.isEmpty
     callButton.isHidden = isAgent || usesSavedMessagesHeader || searchActive
     videoCallButton.isHidden = isAgent || usesSavedMessagesHeader || searchActive
     historyButton.isHidden = !isAgent || usesSavedMessagesHeader || searchActive
-    newChatButton.isHidden = !isAgent || !isNewChat || usesSavedMessagesHeader || searchActive
+    // Agent DMs always have a transport chat id. Gating this control on an empty
+    // engineChatId made New Chat unreachable in normal Grok/Claude/Codex sessions.
+    newChatButton.isHidden = !isAgent || usesSavedMessagesHeader || searchActive
     rightActionsGlassView.isHidden = usesSavedMessagesHeader || searchActive
 
     menuButton.setImage(
@@ -4690,12 +4702,16 @@ public final class ChatMainView: UIView,
     }
 
     if displayedAvatarUri != resolvedUri {
-      // Keep gradient + initials up while the photo loads.
-      avatarImageView.image = nil
-      profileAvatarImageView.image = nil
-      avatarImageView.isHidden = true
-      profileAvatarImageView.isHidden = true
-      showHeaderAvatarFallback(true)
+      // If we already show a photo for another URI, keep it until the new one
+      // lands (no letter flash). Only clear when nothing is on screen yet.
+      if avatarImageView.image == nil {
+        avatarImageView.isHidden = true
+        profileAvatarImageView.isHidden = true
+        showHeaderAvatarFallback(true)
+        // Quiet load: hide letter while a real URL is in flight.
+        avatarFallbackLabel.isHidden = true
+        profileAvatarFallbackLabel.isHidden = true
+      }
     }
 
     let task = Task { [weak self] in
@@ -4704,7 +4720,13 @@ public final class ChatMainView: UIView,
       await MainActor.run {
         guard let self, self.avatarResolveGeneration == generation else { return }
         self.avatarLoadTask = nil
-        guard let image else { return }
+        guard let image else {
+          // No photo — show modest initials only if nothing else is displayed.
+          if self.avatarImageView.image == nil {
+            self.showHeaderAvatarFallback(true)
+          }
+          return
+        }
         self.displayedAvatarUri = resolvedUri
         self.avatarImageView.image = image
         self.profileAvatarImageView.image = image
@@ -5009,6 +5031,11 @@ public final class ChatMainView: UIView,
 
   @objc private func handleNewChatPressed() {
     chatListView.startNewBridgeSession()
+    // A history session can be opened while the bridge-connect gate owns the input
+    // state. Starting a fresh session from that already-connected chat must restore
+    // the native composer; otherwise the view is left as an unusable blank surface.
+    chatListView.setInputBarEnabled(true)
+    chatListView.setNativeSendEnabled(true)
   }
 
   @objc private func handleMenuPressed() {

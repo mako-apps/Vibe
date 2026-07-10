@@ -1883,6 +1883,11 @@ final class ChatEngine {
     if let taskId, !taskId.isEmpty {
       wirePayload["taskId"] = taskId
     }
+    if let computerId = AgentBridgeSelectionStore.selectedRepository(chatId: chatId)?.computerId,
+      !computerId.isEmpty
+    {
+      wirePayload["computerId"] = computerId
+    }
     let ref = client.push(
       topic: chatTopic(for: chatId),
       event: "agent-bridge-control",
@@ -1972,6 +1977,11 @@ final class ChatEngine {
       } else if let limit = normalizedString(payload["limit"]), let parsed = Int(limit), parsed > 0 {
         wirePayload["limit"] = parsed
       }
+      if let computerId = AgentBridgeSelectionStore.selectedRepository(chatId: chatId)?.computerId,
+        !computerId.isEmpty
+      {
+        wirePayload["computerId"] = computerId
+      }
       let ref = client.push(
         topic: chatTopic(for: chatId),
         event: "agent-bridge-history",
@@ -2023,10 +2033,18 @@ final class ChatEngine {
         return ["accepted": false, "reason": "chat_not_joined"]
       }
 
+      var wirePayload: [String: Any] = [
+        "provider": provider, "path": filePath, "requestId": requestId,
+      ]
+      if let computerId = AgentBridgeSelectionStore.selectedRepository(chatId: chatId)?.computerId,
+        !computerId.isEmpty
+      {
+        wirePayload["computerId"] = computerId
+      }
       let ref = client.push(
         topic: chatTopic(for: chatId),
         event: "agent-bridge-file",
-        payload: ["provider": provider, "path": filePath, "requestId": requestId]
+        payload: wirePayload
       )
       appendJournalLocked(
         event: "native-agent-bridge-file-request",
@@ -2070,10 +2088,16 @@ final class ChatEngine {
         return ["accepted": false, "reason": "chat_not_joined"]
       }
 
+      var wirePayload: [String: Any] = ["provider": provider, "requestId": requestId]
+      if let computerId = AgentBridgeSelectionStore.selectedRepository(chatId: chatId)?.computerId,
+        !computerId.isEmpty
+      {
+        wirePayload["computerId"] = computerId
+      }
       let ref = client.push(
         topic: chatTopic(for: chatId),
         event: "agent-bridge-usage",
-        payload: ["provider": provider, "requestId": requestId]
+        payload: wirePayload
       )
       appendJournalLocked(
         event: "native-agent-bridge-usage-request",
@@ -2197,6 +2221,11 @@ final class ChatEngine {
 
     var wirePayload: [String: Any] = ["requestId": requestId, "decision": decision]
     if let provider, !provider.isEmpty { wirePayload["provider"] = provider }
+    if let computerId = AgentBridgeSelectionStore.selectedRepository(chatId: chatId)?.computerId,
+      !computerId.isEmpty
+    {
+      wirePayload["computerId"] = computerId
+    }
     if let answer = payload["answer"] as? [String: Any], !answer.isEmpty,
       let sealed = AgentRuntimeCrypto.encrypt(["answer": answer])
     {
@@ -5535,6 +5564,30 @@ final class ChatEngine {
     if let advisor = normalizedString(payload["advisor"] ?? payload["advisorModel"] ?? payload["advisor_model"]) {
       metadata["agentRuntimeAdvisor"] = advisor
     }
+    var liveRuntime: [String: Any] = [
+      "status": "running",
+    ]
+    if let taskId { liveRuntime["taskId"] = taskId }
+    if let provider = bridgeProviderForChatLocked(chatId: chatId) {
+      liveRuntime["provider"] = provider
+    }
+    for (wireKey, snakeKey, runtimeKey) in [
+      ("repoName", "repo_name", "repoName"), ("cwd", "cwd", "cwd"),
+      ("workMode", "work_mode", "workMode"), ("model", "model", "model"),
+      ("advisor", "advisor_model", "advisor"), ("teamMode", "team_mode", "teamMode"),
+      ("teamRunId", "team_run_id", "teamRunId"),
+      ("teamWorker", "team_worker", "teamWorker"),
+      ("computerId", "computer_id", "computerId"),
+      ("computerLabel", "computer_label", "computerLabel"),
+    ] {
+      if let value = normalizedString(payload[wireKey] ?? payload[snakeKey]) {
+        liveRuntime[runtimeKey] = value
+      }
+    }
+    if let workers = payload["teamWorkers"] as? [String], !workers.isEmpty {
+      liveRuntime["teamWorkers"] = workers
+    }
+    metadata["agentRuntime"] = liveRuntime
     if let sequence {
       metadata["agentStreamSequence"] = sequence
     }
@@ -6547,26 +6600,23 @@ final class ChatEngine {
           // so the last streamed action would otherwise sit there misleadingly.
           self.setAgentProgressLocked(
             chatId: chatId, label: "Waiting for approval", tool: nil, status: "running")
-          // The bridge auto-rejects an unanswered ask at its deadline and pushes an
-          // ask_cancel — but that push can be lost (offline phone, WS flap). Mirror the
-          // expiry locally: once past the deadline, drop the cached ask and post the
-          // SAME cancel change so sheets/badges dismiss instead of lingering forever.
-          let expiresAtMs =
-            self.parseLongValue(frame.payload["expiresAtMs"] ?? frame.payload["expires_at_ms"])
-            ?? (Int64(self.nowMs()) + 10 * 60 * 1000)
-          let expiryDelaySeconds = max(1.0, Double(expiresAtMs - Int64(self.nowMs())) / 1000.0)
-          self.queue.asyncAfter(deadline: .now() + expiryDelaySeconds) { [weak self] in
-            guard let self else { return }
-            guard self.agentBridgeAskByRequestId[requestId] != nil else { return }
-            self.agentBridgeAskByRequestId.removeValue(forKey: requestId)
-            self.presentedAskRequestIds.remove(requestId)
-            NSLog(
-              "[ChatEngine][ask] LOCAL-EXPIRE chat=%@ requestId=%@ → post agentBridgeAskCancel",
-              chatId, requestId)
-            self.postChangeLocked(
-              reason: "agentBridgeAskCancel",
-              userInfo: ["chatId": chatId, "requestId": requestId]
-            )
+          // New bridge requests intentionally have no expiry: mobile remains the
+          // control surface until the user answers. Preserve compatibility with an
+          // explicitly configured legacy bridge timeout when it sends expiresAtMs.
+          if let expiresAtMs = self.parseLongValue(
+            frame.payload["expiresAtMs"] ?? frame.payload["expires_at_ms"])
+          {
+            let expiryDelaySeconds = max(1.0, Double(expiresAtMs - Int64(self.nowMs())) / 1000.0)
+            self.queue.asyncAfter(deadline: .now() + expiryDelaySeconds) { [weak self] in
+              guard let self else { return }
+              guard self.agentBridgeAskByRequestId[requestId] != nil else { return }
+              self.agentBridgeAskByRequestId.removeValue(forKey: requestId)
+              self.presentedAskRequestIds.remove(requestId)
+              self.postChangeLocked(
+                reason: "agentBridgeAskCancel",
+                userInfo: ["chatId": chatId, "requestId": requestId]
+              )
+            }
           }
           NSLog(
             "[ChatEngine][ask] RECEIVED chat=%@ requestId=%@ kind=%@ provider=%@ sealed=%@ stored=%@ → post agentBridgeAsk",
@@ -7620,6 +7670,47 @@ final class ChatEngine {
         else { continue }
         let ts = messageTimestampMs(fromRow: row)
         if ownUserTexts.contains(where: { $0.text == text && abs($0.ts - ts) <= mirrorDedupWindowMs }) {
+          mergedById.removeValue(forKey: id)
+        }
+      }
+    }
+
+    // The final bridge result is persisted as the canonical server message while the
+    // local session watcher mirrors that same assistant turn as a `bridge-…` row.
+    // Their ids differ, so id-based merging alone renders two identical responses.
+    // Keep the persisted row (it carries delivery state/runtime metadata) and suppress
+    // only an exact-text, same-agent transcript mirror nearby in time. A History-only
+    // view has no persisted twin, so its bridge rows remain untouched.
+    let persistedAgentResponses: [(text: String, from: String, ts: Int64)] =
+      mergedById.compactMap { id, row in
+        guard !id.hasPrefix("bridge-"), !id.hasPrefix("stream-"),
+          let message = row["message"] as? [String: Any],
+          (message["isAgentMessage"] as? Bool) == true,
+          let text = normalizedString(message["plainContent"] ?? message["text"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+          !text.isEmpty
+        else { return nil }
+        return (
+          text,
+          normalizedUpper(message["agentUserId"] ?? message["fromId"]) ?? "",
+          messageTimestampMs(fromRow: row)
+        )
+      }
+    if !persistedAgentResponses.isEmpty {
+      let mirrorWindowMs: Int64 = 5 * 60 * 1000
+      for (id, row) in mergedById where id.hasPrefix("bridge-") {
+        guard let message = row["message"] as? [String: Any],
+          (message["isAgentMessage"] as? Bool) == true,
+          let text = normalizedString(message["plainContent"] ?? message["text"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+          !text.isEmpty
+        else { continue }
+        let from = normalizedUpper(message["agentUserId"] ?? message["fromId"]) ?? ""
+        let ts = messageTimestampMs(fromRow: row)
+        if persistedAgentResponses.contains(where: {
+          $0.text == text && ($0.from.isEmpty || from.isEmpty || $0.from == from)
+            && abs($0.ts - ts) <= mirrorWindowMs
+        }) {
           mergedById.removeValue(forKey: id)
         }
       }

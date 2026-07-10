@@ -430,7 +430,7 @@ struct AgentBridgeRepositoryPickerView: View {
             .listRowBackground(palette.card)
 
             Section {
-              ForEach(status.repositories) { repo in
+              ForEach(status.repositories, id: \.selectionIdentity) { repo in
                 Button {
                   AgentBridgeSelectionStore.select(
                     repo, chatId: chatId.isEmpty ? nil : chatId)
@@ -447,13 +447,22 @@ struct AgentBridgeRepositoryPickerView: View {
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundStyle(palette.text)
                         .lineLimit(1)
-                      Text(repo.path)
+                      Text(
+                        [repo.computerLabel, repo.path]
+                          .compactMap { value in
+                            guard let value, !value.isEmpty else { return nil }
+                            return value
+                          }
+                          .joined(separator: " · ")
+                      )
                         .font(.system(size: 12))
                         .foregroundStyle(palette.secondaryText)
                         .lineLimit(1)
                     }
                     Spacer(minLength: 0)
-                    if selected?.id == repo.id || selected?.cwd == repo.cwd {
+                    if (selected?.id == repo.id || selected?.cwd == repo.cwd)
+                      && (selected?.computerId == nil || selected?.computerId == repo.computerId)
+                    {
                       Image(systemName: "checkmark.circle.fill")
                         .font(.system(size: 18, weight: .semibold))
                         .foregroundStyle(palette.accent)
@@ -462,6 +471,12 @@ struct AgentBridgeRepositoryPickerView: View {
                   .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+              }
+            } header: {
+              Text(status.devices.count > 1 ? "Computer and repository" : "Repository")
+            } footer: {
+              if status.devices.count > 1 {
+                Text("Each repository is tied to its computer. Your team runs only on the computer you select here.")
               }
             }
             .listRowBackground(palette.card)

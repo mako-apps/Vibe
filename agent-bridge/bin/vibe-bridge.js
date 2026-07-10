@@ -1033,17 +1033,337 @@ function normalizeModel(provider, value) {
   if (!raw) return null;
   const normalized = raw.toLowerCase().replace(/_/g, "-");
   if (provider === "claude") {
-    if (normalized.includes("fable")) return "fable";
-    if (normalized.includes("haiku")) return "haiku";
-    if (normalized.includes("sonnet")) return "sonnet";
-    if (normalized.includes("opus")) return "opus";
+    // Production: pass exact Anthropic model ids through unchanged so picker
+    // selections (claude-fable-5, tomorrow's alpha, …) reach `claude --model`.
+    if (normalized.startsWith("claude-")) return raw;
+    // Legacy short aliases still accepted from older phone builds / env defaults.
+    if (normalized === "fable" || normalized.includes("fable")) return "claude-fable-5";
+    if (normalized === "haiku" || normalized.includes("haiku-4-5")) return "claude-haiku-4-5-20251001";
+    if (normalized === "sonnet" || (normalized.includes("sonnet-5") && !normalized.includes("sonnet-4"))) {
+      return "claude-sonnet-5";
+    }
+    if (normalized === "opus" || normalized.includes("opus-4-8")) return "claude-opus-4-8";
+    if (normalized.includes("sonnet")) return "claude-sonnet-5";
+    if (normalized.includes("opus")) return "claude-opus-4-8";
     return raw;
   }
-  if (normalized === "gpt-5.3-codex" || normalized === "gpt-5-3-codex") return "gpt-5.5";
-  if (["gpt-5.5", "gpt-5.5-pro", "gpt-5.4", "gpt-5.2", "gpt-5"].includes(normalized)) {
-    return normalized;
+  if (provider === "codex" || provider === "gpt") {
+    if (normalized === "gpt-5.3-codex" || normalized === "gpt-5-3-codex") return "gpt-5.5";
+    return raw;
   }
+  // Grok / Agy: exact CLI selector strings (Agy effort is part of the name).
   return raw;
+}
+
+// ── Live model catalog (per provider) ────────────────────────────────
+// Phone model pickers used to ship hardcoded lists that went stale (missing
+// Claude Fable 5, old Codex ids, etc.). The bridge discovers models from the
+// provider CLI / API on this machine and advertises them in bridge status so
+// iOS/web refresh without an app release.
+let providerModelsCache = { at: 0, models: null };
+const PROVIDER_MODELS_TTL_MS = 5 * 60 * 1000;
+
+// Seed catalogs are LAST RESORT only (offline / discovery failure). Live
+// discovery is the production source of truth so new models (e.g. Fable 5,
+// tomorrow's "alpha") appear without an app release.
+const CLAUDE_EFFORTS_DEFAULT = ["low", "medium", "high", "xhigh", "max"];
+const CODEX_EFFORTS_DEFAULT = ["low", "medium", "high", "xhigh"];
+const GROK_EFFORTS_DEFAULT = ["low", "medium", "high"];
+
+function fallbackProviderModels() {
+  return {
+    claude: [
+      {
+        id: "claude-haiku-4-5-20251001",
+        title: "Claude Haiku 4.5",
+        subtitle: "Seed fallback",
+        isDefault: false,
+        efforts: [],
+        defaultEffort: null,
+        source: "seed",
+      },
+      {
+        id: "claude-sonnet-5",
+        title: "Claude Sonnet 5",
+        subtitle: "Seed fallback",
+        isDefault: true,
+        efforts: CLAUDE_EFFORTS_DEFAULT.slice(),
+        defaultEffort: "high",
+        source: "seed",
+      },
+      {
+        id: "claude-opus-4-8",
+        title: "Claude Opus 4.8",
+        subtitle: "Seed fallback",
+        isDefault: false,
+        efforts: CLAUDE_EFFORTS_DEFAULT.slice(),
+        defaultEffort: "high",
+        source: "seed",
+      },
+      {
+        id: "claude-fable-5",
+        title: "Claude Fable 5",
+        subtitle: "Seed fallback",
+        isDefault: false,
+        efforts: CLAUDE_EFFORTS_DEFAULT.slice(),
+        defaultEffort: "high",
+        source: "seed",
+      },
+    ],
+    codex: [
+      { id: "gpt-5.6-sol", title: "GPT-5.6 Sol", subtitle: "Seed fallback", isDefault: true, efforts: CODEX_EFFORTS_DEFAULT.slice(), defaultEffort: "medium", source: "seed" },
+      { id: "gpt-5.6", title: "GPT-5.6", subtitle: "Seed fallback", isDefault: false, efforts: CODEX_EFFORTS_DEFAULT.slice(), defaultEffort: "medium", source: "seed" },
+      { id: "gpt-5.5", title: "GPT-5.5", subtitle: "Seed fallback", isDefault: false, efforts: CODEX_EFFORTS_DEFAULT.slice(), defaultEffort: "medium", source: "seed" },
+      { id: "gpt-5.5-pro", title: "GPT-5.5 Pro", subtitle: "Seed fallback", isDefault: false, efforts: CODEX_EFFORTS_DEFAULT.slice(), defaultEffort: "high", source: "seed" },
+      { id: "gpt-5.4", title: "GPT-5.4", subtitle: "Seed fallback", isDefault: false, efforts: CODEX_EFFORTS_DEFAULT.slice(), defaultEffort: "medium", source: "seed" },
+      { id: "gpt-5.2", title: "GPT-5.2", subtitle: "Seed fallback", isDefault: false, efforts: CODEX_EFFORTS_DEFAULT.slice(), defaultEffort: "medium", source: "seed" },
+      { id: "gpt-5", title: "GPT-5", subtitle: "Seed fallback", isDefault: false, efforts: CODEX_EFFORTS_DEFAULT.slice(), defaultEffort: "medium", source: "seed" },
+    ],
+    grok: [
+      { id: "grok-4.5", title: "Grok 4.5", subtitle: "Seed fallback", isDefault: true, efforts: GROK_EFFORTS_DEFAULT.slice(), defaultEffort: "medium", source: "seed" },
+      { id: "grok-composer-2.5-fast", title: "Composer 2.5 Fast", subtitle: "Seed fallback", isDefault: false, efforts: GROK_EFFORTS_DEFAULT.slice(), defaultEffort: "low", source: "seed" },
+    ],
+    agy: [
+      // Agy bakes effort into the model label (High/Medium/Low); do not split.
+      { id: "Gemini 3.1 Pro (High)", title: "Gemini 3.1 Pro (High)", subtitle: "Seed fallback", isDefault: true, efforts: [], defaultEffort: null, source: "seed" },
+      { id: "Gemini 3.1 Pro (Low)", title: "Gemini 3.1 Pro (Low)", subtitle: "Seed fallback", isDefault: false, efforts: [], defaultEffort: null, source: "seed" },
+      { id: "Gemini 3.5 Flash (High)", title: "Gemini 3.5 Flash (High)", subtitle: "Seed fallback", isDefault: false, efforts: [], defaultEffort: null, source: "seed" },
+      { id: "Gemini 3.5 Flash (Medium)", title: "Gemini 3.5 Flash (Medium)", subtitle: "Seed fallback", isDefault: false, efforts: [], defaultEffort: null, source: "seed" },
+      { id: "Gemini 3.5 Flash (Low)", title: "Gemini 3.5 Flash (Low)", subtitle: "Seed fallback", isDefault: false, efforts: [], defaultEffort: null, source: "seed" },
+      { id: "Claude Sonnet 4.6 (Thinking)", title: "Claude Sonnet 4.6 (Thinking)", subtitle: "Seed fallback", isDefault: false, efforts: [], defaultEffort: null, source: "seed" },
+      { id: "Claude Opus 4.6 (Thinking)", title: "Claude Opus 4.6 (Thinking)", subtitle: "Seed fallback", isDefault: false, efforts: [], defaultEffort: null, source: "seed" },
+      { id: "GPT-OSS 120B (Medium)", title: "GPT-OSS 120B (Medium)", subtitle: "Seed fallback", isDefault: false, efforts: [], defaultEffort: null, source: "seed" },
+    ],
+  };
+}
+
+function effortLevelsFromClaudeCapabilities(caps) {
+  const effort = caps && caps.effort;
+  if (!effort || effort.supported === false) return [];
+  const order = ["low", "medium", "high", "xhigh", "max"];
+  const out = [];
+  for (const key of order) {
+    const row = effort[key];
+    if (row && row.supported === true) out.push(key);
+  }
+  // If API only says effort.supported without per-level flags, expose full ladder.
+  if (!out.length && effort.supported === true) return CLAUDE_EFFORTS_DEFAULT.slice();
+  return out;
+}
+
+async function fetchClaudeModelsLive() {
+  let token = null;
+  try {
+    const raw = execFileSync(
+      "security",
+      ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
+      { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"] }
+    );
+    const parsed = JSON.parse(raw);
+    token = parsed && parsed.claudeAiOauth && parsed.claudeAiOauth.accessToken;
+  } catch (_) {
+    token = null;
+  }
+  if (!token) return null;
+  try {
+    // Anthropic Models API — production source of truth (id + display_name + effort caps).
+    // https://platform.claude.com/docs/en/api/models/list
+    const res = await fetch("https://api.anthropic.com/v1/models?limit=1000", {
+      headers: {
+        Authorization: "Bearer " + token,
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "oauth-2025-04-20",
+      },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const rows = Array.isArray(data && data.data) ? data.data : [];
+    if (!rows.length) return null;
+    // Newest first (API already roughly newest-first). Pass EVERY model through —
+    // filtering would hide tomorrow's "alpha" the same way hardcoding did.
+    return rows
+      .map((m, i) => {
+        const apiId = String((m && m.id) || "").trim();
+        if (!apiId) return null;
+        const title = String((m && m.display_name) || apiId).trim() || apiId;
+        const efforts = effortLevelsFromClaudeCapabilities(m && m.capabilities);
+        const isSonnet5 = apiId === "claude-sonnet-5" || /^claude-sonnet-5($|-)/.test(apiId);
+        return {
+          // EXACT provider id for --model / run_task — never invent short aliases here.
+          id: apiId,
+          title,
+          subtitle: null,
+          isDefault: isSonnet5 || (i === 0 && !rows.some((x) => String(x.id || "") === "claude-sonnet-5")),
+          apiId,
+          efforts,
+          defaultEffort: efforts.includes("high")
+            ? "high"
+            : efforts.includes("medium")
+              ? "medium"
+              : efforts[0] || null,
+          source: "live",
+        };
+      })
+      .filter(Boolean);
+  } catch (_) {
+    return null;
+  }
+}
+
+function fetchGrokModelsLive() {
+  try {
+    const out = execFileSync(process.env.VIBE_GROK_COMMAND || "grok", ["models"], {
+      encoding: "utf8",
+      timeout: 10000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const lines = String(out || "").split("\n");
+    const models = [];
+    let defaultId = null;
+    for (const line of lines) {
+      const star = line.match(/^\s*\*\s+(\S+)/);
+      const dash = line.match(/^\s*-\s+(\S+)/);
+      const m = star || dash;
+      if (!m) continue;
+      const id = m[1];
+      if (star) defaultId = id;
+      models.push({
+        id,
+        title: id,
+        subtitle: star ? "Default" : null,
+        isDefault: !!star,
+        efforts: GROK_EFFORTS_DEFAULT.slice(),
+        defaultEffort: "medium",
+        source: "live",
+      });
+    }
+    if (defaultId) {
+      for (const m of models) m.isDefault = m.id === defaultId;
+    }
+    return models.length ? models : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function fetchAgyModelsLive() {
+  try {
+    // `agy models` prints the exact selector strings the CLI accepts (effort is
+    // part of the label: "Gemini 3.1 Pro (High)"). Keep id === full line.
+    const out = execFileSync(process.env.VIBE_AGY_COMMAND || "agy", ["models"], {
+      encoding: "utf8",
+      timeout: 10000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const models = String(out || "")
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .map((id, i) => ({
+        id,
+        title: id,
+        subtitle: null,
+        isDefault: i === 0 || /3\.1 Pro \(High\)/i.test(id),
+        // Effort is baked into the model name — do not expose a separate ladder.
+        efforts: [],
+        defaultEffort: null,
+        source: "live",
+      }));
+    if (models.length) {
+      const pref = models.find((m) => /3\.1 Pro \(High\)/i.test(m.id));
+      if (pref) {
+        for (const m of models) m.isDefault = m.id === pref.id;
+      }
+    }
+    return models.length ? models : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function fetchCodexModelsLive() {
+  // No stable headless `codex models` yet. Prefer config.toml model + family seed;
+  // always surface the machine's configured model first so local defaults win.
+  const fallback = fallbackProviderModels().codex.map((row) => ({ ...row }));
+  try {
+    const cfgPath = path.join(os.homedir(), ".codex", "config.toml");
+    if (!fs.existsSync(cfgPath)) return fallback;
+    const text = fs.readFileSync(cfgPath, "utf8");
+    const m = text.match(/^\s*model\s*=\s*"([^"]+)"/m);
+    const effortMatch = text.match(/^\s*model_reasoning_effort\s*=\s*"([^"]+)"/m);
+    const defaultEffort = (effortMatch && effortMatch[1].trim()) || "medium";
+    if (!m) return fallback;
+    const current = m[1].trim();
+    if (!current) return fallback;
+    const list = fallback.slice();
+    for (const row of list) {
+      row.efforts = CODEX_EFFORTS_DEFAULT.slice();
+      row.defaultEffort = defaultEffort;
+      row.source = "live";
+    }
+    if (!list.some((x) => x.id === current)) {
+      list.unshift({
+        id: current,
+        title: current,
+        subtitle: "From Codex config",
+        isDefault: true,
+        efforts: CODEX_EFFORTS_DEFAULT.slice(),
+        defaultEffort,
+        source: "live",
+      });
+      for (let i = 1; i < list.length; i++) list[i].isDefault = false;
+    } else {
+      for (const row of list) row.isDefault = row.id === current;
+    }
+    return list;
+  } catch (_) {
+    return fallback;
+  }
+}
+
+function preferLiveOrLastGood(live, seed, lastGood) {
+  if (live && live.length) return live;
+  if (lastGood && lastGood.length) {
+    return lastGood.map((row) => ({ ...row, source: row.source === "live" ? "cache" : row.source || "cache" }));
+  }
+  return seed;
+}
+
+async function discoverProviderModels(force) {
+  if (
+    !force &&
+    providerModelsCache.models &&
+    Date.now() - providerModelsCache.at < PROVIDER_MODELS_TTL_MS
+  ) {
+    return providerModelsCache.models;
+  }
+  const base = fallbackProviderModels();
+  const prev = (providerModelsCache && providerModelsCache.models) || null;
+  try {
+    const [claude, grok, agy] = await Promise.all([
+      fetchClaudeModelsLive(),
+      Promise.resolve(fetchGrokModelsLive()),
+      Promise.resolve(fetchAgyModelsLive()),
+    ]);
+    const models = {
+      claude: preferLiveOrLastGood(claude, base.claude, prev && prev.claude),
+      codex: preferLiveOrLastGood(fetchCodexModelsLive(), base.codex, prev && prev.codex),
+      grok: preferLiveOrLastGood(grok, base.grok, prev && prev.grok),
+      agy: preferLiveOrLastGood(agy, base.agy, prev && prev.agy),
+    };
+    providerModelsCache = { at: Date.now(), models };
+    return models;
+  } catch (_) {
+    const models = {
+      claude: preferLiveOrLastGood(null, base.claude, prev && prev.claude),
+      codex: preferLiveOrLastGood(null, base.codex, prev && prev.codex),
+      grok: preferLiveOrLastGood(null, base.grok, prev && prev.grok),
+      agy: preferLiveOrLastGood(null, base.agy, prev && prev.agy),
+    };
+    providerModelsCache = { at: Date.now(), models };
+    return models;
+  }
 }
 
 function normalizeAdvisor(provider, value) {
@@ -2510,12 +2830,24 @@ function revertFinishedTask(channel, payload) {
 }
 
 function bridgeStatusPayload() {
+  // Kick a background refresh when cache is empty/stale so the next status push
+  // carries live provider catalogs (Claude API / grok models / agy models).
+  if (
+    !providerModelsCache.models ||
+    Date.now() - providerModelsCache.at > PROVIDER_MODELS_TTL_MS
+  ) {
+    discoverProviderModels(false).catch(() => {});
+  }
+  const models = providerModelsCache.models || fallbackProviderModels();
   return {
     computerId: ACTIVE_COMPUTER_ID,
     deviceLabel: ARGS.label || os.hostname(),
     cwd: DEFAULT_CWD,
     repositories: ADVERTISED_REPOSITORIES,
     runningTasks: runningTaskSummaries(),
+    // Live model pickers for the phone (refreshed from provider CLIs/APIs).
+    models,
+    modelsUpdatedAt: providerModelsCache.at || null,
     permissions: {
       claude: {
         permissionMode: process.env.VIBE_CLAUDE_PERMISSION_MODE || "per-task",
@@ -2589,10 +2921,23 @@ function teamFieldsForTask(task) {
   };
 }
 
-function pushBridgeStatus(channel) {
-  if (channel.state === "joined") {
-    channel.push("status", bridgeStatusPayload());
-  }
+function pushBridgeStatus(channel, forceModels) {
+  if (channel.state !== "joined") return;
+  // Ensure models are populated before the first status after connect when possible.
+  // forceModels=true on connect so the phone sees a fresh provider catalog immediately.
+  discoverProviderModels(!!forceModels)
+    .then((models) => {
+      try {
+        const counts = Object.fromEntries(
+          Object.entries(models || {}).map(([k, v]) => [k, Array.isArray(v) ? v.length : 0])
+        );
+        console.log(`[vibe-bridge] provider models ready ${JSON.stringify(counts)}`);
+      } catch (_) {}
+    })
+    .catch(() => {})
+    .finally(() => {
+      if (channel.state === "joined") channel.push("status", bridgeStatusPayload());
+    });
 }
 
 // ── Interactive repo pick ───────────────────────────────────────────

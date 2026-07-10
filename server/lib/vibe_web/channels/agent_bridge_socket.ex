@@ -11,8 +11,14 @@ defmodule VibeWeb.AgentBridgeSocket do
   def connect(params, socket, connect_info) do
     token = extract_bearer(connect_info) || params["token"]
 
-    case token && Vibe.AgentBridge.verify_token(token) do
-      {:ok, user_id} -> {:ok, assign(socket, :user_id, user_id)}
+    case token && Vibe.AgentBridge.verify_connection(token) do
+      {:ok, identity} ->
+        {:ok,
+         socket
+         |> assign(:user_id, identity.user_id)
+         |> assign(:computer_id, identity.computer_id)
+         |> assign(:device_label, identity.device_label)}
+
       _ -> :error
     end
   end
@@ -27,5 +33,6 @@ defmodule VibeWeb.AgentBridgeSocket do
   defp extract_bearer(_), do: nil
 
   @impl true
-  def id(socket), do: "agent_bridge_socket:#{socket.assigns.user_id}"
+  def id(socket),
+    do: "agent_bridge_socket:#{socket.assigns.user_id}:#{socket.assigns.computer_id}"
 end
