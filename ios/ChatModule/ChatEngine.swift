@@ -451,6 +451,9 @@ final class ChatEngine {
   // Observers watch `didChangeNotification` reason "agentBridgeUsage" and read it
   // via `latestAgentBridgeUsage(requestId:)`.
   private var agentBridgeUsageByRequestId: [String: [String: Any]] = [:]
+  /// Latest OK usage report per `chatId|provider` so the Usage sheet can open
+  /// pre-filled (prefetch) instead of blank-then-fetch.
+  private var agentBridgeUsageByChatProvider: [String: [String: Any]] = [:]
   // Agent-bridge DM row persistence (see storeVolatileBridgeRowsLocked): pending
   // debounced store per chatId + chats already seeded from disk this launch.
   private var volatileBridgeRowsStoreTimers: [String: DispatchWorkItem] = [:]
@@ -2111,6 +2114,15 @@ final class ChatEngine {
   func latestAgentBridgeUsage(requestId rawRequestId: String) -> [String: Any]? {
     let requestId = normalizedString(rawRequestId) ?? rawRequestId
     return syncOnQueue { agentBridgeUsageByRequestId[requestId] }
+  }
+
+  /// Prefetched usage payload for a chat+provider (report already inside).
+  func cachedAgentBridgeUsage(chatId rawChatId: String, provider rawProvider: String) -> [String: Any]? {
+    let chatId = normalizedString(rawChatId) ?? rawChatId
+    let provider = (normalizedString(rawProvider) ?? rawProvider).lowercased()
+    guard !chatId.isEmpty, !provider.isEmpty else { return nil }
+    let key = "\(chatId)|\(provider)"
+    return syncOnQueue { agentBridgeUsageByChatProvider[key] }
   }
 
   /// The most recent ask request (plan approval / question) for a requestId.
@@ -6663,11 +6675,22 @@ final class ChatEngine {
           if !requestId.isEmpty {
             self.agentBridgeUsageByRequestId[requestId] = frame.payload
           }
+          // Cache by chat+provider for sheet prefill (even if requestId is empty).
+          let provider =
+            (self.normalizedString(frame.payload["provider"])
+              ?? self.normalizedString(frame.payload["agentBridgeProvider"])
+              ?? "")
+            .lowercased()
+          if !provider.isEmpty, (frame.payload["ok"] as? Bool) ?? true {
+            let key = "\(chatId)|\(provider)"
+            self.agentBridgeUsageByChatProvider[key] = frame.payload
+          }
           self.postChangeLocked(
             reason: "agentBridgeUsage",
             userInfo: [
               "chatId": chatId,
               "requestId": requestId,
+              "provider": provider,
               "ok": (frame.payload["ok"] as? Bool) ?? true,
             ]
           )

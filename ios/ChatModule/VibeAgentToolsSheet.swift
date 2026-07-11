@@ -521,42 +521,52 @@ struct VibeAgentUsageBucket: Identifiable {
   let resetsAt: String?
 }
 
-/// Glass-sheet wrapper matching agent progress / ask sheets: clear chrome so the
-/// system pageSheet Liquid Glass material shows through.
+/// Glass-sheet wrapper matching agent progress / ask sheets.
 struct VibeAgentUsageSheetRoot: View {
   let chatId: String
   let provider: String
   let appearance: VibeAgentKitChatAppearance
+  /// Prefetched payload so the first frame is not empty.
+  var seedPayload: [String: Any]? = nil
+  /// In-flight request id kicked off by the presenter (quiet refresh).
+  var pendingRequestId: String? = nil
   @Environment(\.dismiss) private var dismiss
+  @Environment(\.colorScheme) private var colorScheme
 
   var body: some View {
     NavigationStack {
-      VibeAgentUsagePanel(chatId: chatId, provider: provider, appearance: appearance)
-        .toolbar {
-          ToolbarItem(placement: .topBarTrailing) {
-            Button {
-              dismiss()
-            } label: {
-              Image(systemName: "xmark")
-                .font(.system(size: 15, weight: .semibold))
-            }
+      VibeAgentUsagePanel(
+        chatId: chatId,
+        provider: provider,
+        appearance: appearance,
+        seedPayload: seedPayload,
+        pendingRequestId: pendingRequestId
+      )
+      .toolbar {
+        ToolbarItem(placement: .topBarTrailing) {
+          Button { dismiss() } label: {
+            Image(systemName: "xmark")
+              .font(.system(size: 15, weight: .semibold))
+              .foregroundStyle(Color(uiColor: appearance.textSecondary))
           }
         }
+      }
     }
     .presentationDetents([.medium, .large])
     .presentationDragIndicator(.visible)
-    // Same as ask/progress sheets — no solid fill behind the list.
-    .presentationBackground(.clear)
+    // Progress-node sheet tint: ultra-thin material light/dark (not solid, not pure clear).
+    .presentationBackground(.ultraThinMaterial)
   }
 }
 
-/// Live usage detail for one provider. Fetches bridge `usage_result` only — buckets,
-/// chat tokens, model, limitHit/limitMessage come from the payload. Never invents %.
-/// Shared by tools-sheet Usage rows and the chat usage-banner tap.
+/// Live usage detail for one provider. Prefers a prefetched `seedPayload`, then
+/// quietly refreshes from the bridge. Buckets + reset times are payload-only.
 struct VibeAgentUsagePanel: View {
   let chatId: String
   let provider: String
   let appearance: VibeAgentKitChatAppearance
+  var seedPayload: [String: Any]? = nil
+  var pendingRequestId: String? = nil
 
   @State private var requestId: String?
   @State private var buckets: [VibeAgentUsageBucket] = []
@@ -570,8 +580,9 @@ struct VibeAgentUsagePanel: View {
 
   private var text: Color { Color(uiColor: appearance.text) }
   private var textSecondary: Color { Color(uiColor: appearance.textSecondary) }
+  /// Soft elevated row over glass — mirrors progress/ask sheet neutral fills.
   private var rowFill: Color {
-    appearance.isDark ? Color.white.opacity(0.05) : Color(uiColor: appearance.surface)
+    appearance.isDark ? Color.white.opacity(0.06) : Color.black.opacity(0.04)
   }
 
   private var providerTitle: String {
@@ -593,24 +604,8 @@ struct VibeAgentUsagePanel: View {
         Section {
           HStack(spacing: 12) {
             ProgressView()
-            Text("Fetching \(providerTitle) usage from your Mac…")
+            Text("Fetching \(providerTitle) usage…")
               .font(.system(size: 15))
-              .foregroundStyle(textSecondary)
-          }
-          .padding(.vertical, 6)
-          .listRowBackground(rowFill)
-        }
-      }
-
-      // Hard limit — only the bridge's own message, never invented copy.
-      if limitHit, let limitMessage, !limitMessage.isEmpty {
-        Section {
-          VStack(alignment: .leading, spacing: 6) {
-            Text("Rate limit hit")
-              .font(.system(size: 15, weight: .semibold))
-              .foregroundStyle(Color.red.opacity(0.9))
-            Text(limitMessage)
-              .font(.system(size: 14))
               .foregroundStyle(textSecondary)
           }
           .padding(.vertical, 4)
@@ -618,41 +613,79 @@ struct VibeAgentUsagePanel: View {
         }
       }
 
-      // Gauges only when the payload actually sent buckets — never a fake 0% bar.
-      if !buckets.isEmpty {
-        Section("SUBSCRIPTION LIMITS") {
-          ForEach(buckets) { bucket in
-            VibeUsageBar(bucket: bucket, appearance: appearance)
-              .listRowBackground(rowFill)
+      if limitHit, let limitMessage, !limitMessage.isEmpty {
+        Section {
+          VStack(alignment: .leading, spacing: 6) {
+            Label("Rate limit hit", systemImage: "exclamationmark.triangle.fill")
+              .font(.system(size: 15, weight: .semibold))
+              .foregroundStyle(Color.orange)
+            Text(limitMessage)
+              .font(.system(size: 14))
+              .foregroundStyle(textSecondary)
+              .fixedSize(horizontal: false, vertical: true)
           }
-        }
-      } else if !loading, errorText == nil {
-        Section("SUBSCRIPTION LIMITS") {
-          Text(
-            emptyHint
-              ?? "No rate-limit windows reported for \(providerTitle) yet. Run a task on this provider, or sign in on your Mac."
-          )
-          .font(.system(size: 14))
-          .foregroundStyle(textSecondary)
+          .padding(.vertical, 4)
           .listRowBackground(rowFill)
         }
       }
 
-      if let modelLabel, !modelLabel.isEmpty {
-        Section("MODEL") {
-          Text(modelLabel)
-            .font(.system(size: 14))
+      if !buckets.isEmpty {
+        Section {
+          ForEach(buckets) { bucket in
+            VibeUsageBar(bucket: bucket, appearance: appearance)
+              .listRowBackground(rowFill)
+          }
+        } header: {
+          Text("LIMITS & RESET")
+            .font(.system(size: 12, weight: .semibold))
             .foregroundStyle(textSecondary)
-            .listRowBackground(rowFill)
+        }
+      } else if !loading, errorText == nil {
+        Section {
+          Text(
+            emptyHint
+              ?? "No rate-limit windows reported for \(providerTitle) yet."
+          )
+          .font(.system(size: 14))
+          .foregroundStyle(textSecondary)
+          .listRowBackground(rowFill)
+        } header: {
+          Text("LIMITS & RESET")
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(textSecondary)
         }
       }
 
-      if let chatTokens {
-        Section("THIS CHAT (LAST RUN)") {
-          Text(chatTokens)
+      if modelLabel != nil || chatTokens != nil {
+        Section {
+          if let modelLabel, !modelLabel.isEmpty {
+            HStack {
+              Text("Model")
+                .foregroundStyle(textSecondary)
+              Spacer()
+              Text(modelLabel)
+                .foregroundStyle(text)
+                .lineLimit(1)
+            }
             .font(.system(size: 14))
-            .foregroundStyle(textSecondary)
             .listRowBackground(rowFill)
+          }
+          if let chatTokens {
+            VStack(alignment: .leading, spacing: 4) {
+              Text("This chat (last run)")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(textSecondary)
+              Text(chatTokens)
+                .font(.system(size: 14))
+                .foregroundStyle(text)
+            }
+            .padding(.vertical, 2)
+            .listRowBackground(rowFill)
+          }
+        } header: {
+          Text("DETAILS")
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(textSecondary)
         }
       }
 
@@ -666,92 +699,129 @@ struct VibeAgentUsagePanel: View {
       }
     }
     .listStyle(.insetGrouped)
-    // Glass sheet body like chat progress/ask sheets — no solid fill.
     .scrollContentBackground(.hidden)
     .background(Color.clear)
     .navigationTitle("\(providerTitle) usage")
     .navigationBarTitleDisplayMode(.inline)
     .toolbarBackground(.hidden, for: .navigationBar)
-    .onAppear(perform: start)
+    .onAppear(perform: bootstrap)
     .onReceive(NotificationCenter.default.publisher(for: ChatEngine.didChangeNotification)) { note in
       guard
         let info = note.userInfo,
-        (info["reason"] as? String) == "agentBridgeUsage",
-        let rid = requestId,
-        (info["requestId"] as? String) == rid
+        (info["reason"] as? String) == "agentBridgeUsage"
       else { return }
-      ingest()
+      let rid = info["requestId"] as? String
+      if let requestId, let rid, rid == requestId {
+        ingest(requestId: requestId)
+        return
+      }
+      // Also accept provider-keyed cache updates while the sheet is open.
+      if let p = (info["provider"] as? String)?.lowercased(),
+        p == provider.lowercased()
+      {
+        if let cached = ChatEngine.shared.cachedAgentBridgeUsage(chatId: chatId, provider: provider) {
+          applyPayload(cached)
+        }
+      }
     }
   }
 
-  private func start() {
+  private func bootstrap() {
+    // 1) Seed from prefetched cache / presenter seed so first paint has data.
+    if let seedPayload {
+      applyPayload(seedPayload)
+    } else if let cached = ChatEngine.shared.cachedAgentBridgeUsage(chatId: chatId, provider: provider) {
+      applyPayload(cached)
+    }
+
+    // 2) Quiet refresh (or use presenter's pending request).
+    if let pendingRequestId, !pendingRequestId.isEmpty {
+      requestId = pendingRequestId
+      ingest(requestId: pendingRequestId)
+      // If not yet arrived, wait on notification (already loading if no seed).
+      if buckets.isEmpty && chatTokens == nil && !limitHit {
+        loading = true
+      }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
+        if loading && buckets.isEmpty && limitMessage == nil {
+          loading = false
+          if errorText == nil {
+            errorText = "Couldn't reach the bridge for usage. Make sure your Mac bridge is connected."
+          }
+        }
+      }
+      return
+    }
+
     let result = ChatEngine.shared.requestAgentBridgeUsage([
       "chatId": chatId,
       "provider": provider,
     ])
     if let rid = result["requestId"] as? String, (result["accepted"] as? Bool) == true {
       requestId = rid
+      if buckets.isEmpty && chatTokens == nil && !limitHit {
+        loading = true
+      }
       DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
         if loading && buckets.isEmpty && limitMessage == nil {
           loading = false
           if errorText == nil {
-            errorText =
-              "Couldn't reach the bridge for usage. Make sure your Mac bridge is connected."
+            errorText = "Couldn't reach the bridge for usage. Make sure your Mac bridge is connected."
           }
         }
       }
-    } else {
+    } else if buckets.isEmpty {
       loading = false
       errorText =
         "Usage is unavailable right now (\(result["reason"] as? String ?? "not connected"))."
+    } else {
+      loading = false
     }
   }
 
-  private func ingest() {
-    guard let rid = requestId,
-      let payload = ChatEngine.shared.latestAgentBridgeUsage(requestId: rid)
-    else { return }
+  private func ingest(requestId rid: String) {
+    guard let payload = ChatEngine.shared.latestAgentBridgeUsage(requestId: rid) else { return }
+    applyPayload(payload)
+  }
+
+  private func applyPayload(_ payload: [String: Any]) {
     loading = false
     errorText = nil
     emptyHint = nil
     if (payload["ok"] as? Bool) == false {
-      errorText = (payload["message"] as? String) ?? "Usage request failed."
+      // Keep any seed data; only set error if we have nothing useful.
+      if buckets.isEmpty && chatTokens == nil {
+        errorText = (payload["message"] as? String) ?? "Usage request failed."
+      }
       return
     }
     guard let report = payload["report"] as? [String: Any] else {
-      errorText = "The bridge returned no usage data."
+      if buckets.isEmpty {
+        errorText = "The bridge returned no usage data."
+      }
       return
     }
 
-    // All fields below are payload-only — never synthesize utilization.
     limitHit = (report["limitHit"] as? Bool) == true
     if let msg = report["limitMessage"] as? String, !msg.isEmpty {
       limitMessage = msg
-    } else {
+    } else if !limitHit {
       limitMessage = nil
     }
 
     if let model = report["model"] as? String, !model.isEmpty {
       modelLabel = model
-    } else {
-      modelLabel = nil
     }
 
     var parsed: [VibeAgentUsageBucket] = []
     if let rawBuckets = report["buckets"] as? [[String: Any]] {
       for b in rawBuckets {
         guard let label = b["label"] as? String, !label.isEmpty else { continue }
-        // Only accept a utilization the bridge actually sent.
         let util: Int?
-        if let i = b["utilization"] as? Int {
-          util = i
-        } else if let d = b["utilization"] as? Double, d.isFinite {
-          util = Int(d.rounded())
-        } else if let n = b["utilization"] as? NSNumber {
-          util = n.intValue
-        } else {
-          util = nil
-        }
+        if let i = b["utilization"] as? Int { util = i }
+        else if let d = b["utilization"] as? Double, d.isFinite { util = Int(d.rounded()) }
+        else if let n = b["utilization"] as? NSNumber { util = n.intValue }
+        else { util = nil }
         guard let util else { continue }
         parsed.append(
           VibeAgentUsageBucket(
@@ -762,20 +832,22 @@ struct VibeAgentUsagePanel: View {
         )
       }
     }
-    buckets = parsed
+    if !parsed.isEmpty {
+      buckets = parsed
+    }
 
     if let chat = report["chat"] as? [String: Any] {
       chatTokens = Self.formatChatTokens(chat)
-    } else {
-      chatTokens = nil
     }
 
-    if parsed.isEmpty && chatTokens == nil && !limitHit {
+    if buckets.isEmpty && chatTokens == nil && !limitHit {
       let p = provider.lowercased()
       emptyHint =
         p == "claude"
         ? "No subscription usage yet — sign in to Claude on your Mac, or run a task first."
-        : "No rate-limit windows reported yet for \(providerTitle). Run a task first so the bridge can capture limits."
+        : p == "codex"
+          ? "No Codex rate-limit windows found yet. Run a Codex task so the bridge can read limits."
+          : "No rate-limit windows reported yet for \(providerTitle)."
     }
   }
 
@@ -812,14 +884,14 @@ private struct VibeUsageBar: View {
   }
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 8) {
-      HStack {
+    VStack(alignment: .leading, spacing: 10) {
+      HStack(alignment: .firstTextBaseline) {
         Text(bucket.label)
-          .font(.system(size: 15, weight: .medium))
+          .font(.system(size: 15, weight: .semibold))
           .foregroundStyle(Color(uiColor: appearance.text))
         Spacer()
-        Text("\(bucket.utilization)%")
-          .font(.system(size: 15, weight: .semibold))
+        Text("\(bucket.utilization)% used")
+          .font(.system(size: 14, weight: .semibold))
           .foregroundStyle(tint)
       }
       GeometryReader { geo in
@@ -832,27 +904,45 @@ private struct VibeUsageBar: View {
         }
       }
       .frame(height: 8)
-      if let reset = Self.resetText(bucket.resetsAt) {
-        Text(reset)
-          .font(.system(size: 12.5))
-          .foregroundStyle(Color(uiColor: appearance.textSecondary))
+      // Always surface reset timing when the payload provides it.
+      if let reset = Self.resetDetail(bucket.resetsAt) {
+        HStack(spacing: 6) {
+          Image(systemName: "clock")
+            .font(.system(size: 12, weight: .medium))
+          Text(reset)
+            .font(.system(size: 13, weight: .medium))
+        }
+        .foregroundStyle(Color(uiColor: appearance.textSecondary))
       }
     }
-    .padding(.vertical, 6)
+    .padding(.vertical, 8)
   }
 
-  private static func resetText(_ iso: String?) -> String? {
+  /// "Resets in 3h 12m · Fri 3:49 PM" from ISO / fractional ISO.
+  private static func resetDetail(_ iso: String?) -> String? {
     guard let iso, !iso.isEmpty else { return nil }
     let withFraction = ISO8601DateFormatter()
     withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     let date = withFraction.date(from: iso) ?? ISO8601DateFormatter().date(from: iso)
     guard let date else { return nil }
     let secs = date.timeIntervalSinceNow
-    if secs <= 0 { return "resetting now" }
-    let h = Int(secs) / 3600
-    let m = (Int(secs) % 3600) / 60
-    if h >= 24 { return "resets in \(h / 24)d \(h % 24)h" }
-    if h >= 1 { return "resets in \(h)h \(m)m" }
-    return "resets in \(m)m"
+    let relative: String
+    if secs <= 0 {
+      relative = "resetting now"
+    } else {
+      let h = Int(secs) / 3600
+      let m = (Int(secs) % 3600) / 60
+      if h >= 24 {
+        relative = "resets in \(h / 24)d \(h % 24)h"
+      } else if h >= 1 {
+        relative = m > 0 ? "resets in \(h)h \(m)m" : "resets in \(h)h"
+      } else {
+        relative = "resets in \(max(1, m))m"
+      }
+    }
+    let absFmt = DateFormatter()
+    absFmt.dateStyle = .short
+    absFmt.timeStyle = .short
+    return "\(relative) · \(absFmt.string(from: date))"
   }
 }

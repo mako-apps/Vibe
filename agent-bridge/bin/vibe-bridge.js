@@ -2501,6 +2501,114 @@ function fmtResetIn(iso) {
   return `resets in ${m}m`;
 }
 
+// Read the latest Codex rate_limits snapshot from on-disk session logs under
+// ~/.codex/sessions (and archived_sessions). Codex has no headless OAuth usage
+// endpoint like Claude; windows are written into every token_count event.
+// Returns { buckets: [...] } or null. Never throws.
+function fetchCodexUtilizationFromDisk() {
+  try {
+    const home = process.env.HOME || process.env.USERPROFILE || "";
+    const roots = [
+      path.join(home, ".codex", "sessions"),
+      path.join(home, ".codex", "archived_sessions"),
+    ];
+    const files = [];
+    const walk = (dir, depth) => {
+      if (depth > 6) return;
+      let entries;
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const ent of entries) {
+        const full = path.join(dir, ent.name);
+        if (ent.isDirectory()) walk(full, depth + 1);
+        else if (ent.isFile() && ent.name.endsWith(".jsonl")) {
+          try {
+            files.push({ full, mtime: fs.statSync(full).mtimeMs });
+          } catch {
+            /* */
+          }
+        }
+      }
+    };
+    for (const root of roots) walk(root, 0);
+    // Sort by mtime first — directory walk order is not chronological.
+    files.sort((a, b) => b.mtime - a.mtime);
+    const newest = files.slice(0, 20);
+    // Walk newest → oldest; first rate_limits wins.
+    for (const { full } of newest) {
+      let text;
+      try {
+        // Tail-read last ~256KB — rate_limits appear on every token_count near the end.
+        const st = fs.statSync(full);
+        const fd = fs.openSync(full, "r");
+        const size = Math.min(st.size, 256 * 1024);
+        const buf = Buffer.alloc(size);
+        fs.readSync(fd, buf, 0, size, Math.max(0, st.size - size));
+        fs.closeSync(fd);
+        text = buf.toString("utf8");
+      } catch {
+        continue;
+      }
+      const lines = text.split("\n");
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i];
+        if (!line || !line.includes("rate_limits") || !line.includes("used_percent")) continue;
+        let obj;
+        try {
+          obj = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        const rl =
+          (obj && obj.rate_limits) ||
+          (obj && obj.payload && obj.payload.rate_limits) ||
+          null;
+        if (!rl || typeof rl !== "object") continue;
+        const buckets = [];
+        const add = (label, win) => {
+          if (!win || typeof win !== "object") return;
+          const util = Number(win.used_percent ?? win.utilization ?? win.usedPercent);
+          if (!Number.isFinite(util)) return;
+          let resetsAt = null;
+          const raw = win.resets_at ?? win.resetsAt;
+          if (typeof raw === "number" && Number.isFinite(raw)) {
+            resetsAt = new Date(raw * 1000).toISOString();
+          } else if (typeof raw === "string" && raw) {
+            resetsAt = raw;
+          }
+          buckets.push({
+            label,
+            utilization: Math.round(util),
+            resetsAt,
+            windowMinutes: Number(win.window_minutes ?? win.windowMinutes) || null,
+          });
+        };
+        // 300 min = 5h, 10080 min = 7d — always label that way for the phone sheet.
+        const primaryLabel =
+          Number(rl.primary && (rl.primary.window_minutes || rl.primary.windowMinutes)) === 10080
+            ? "7-day (weekly)"
+            : "5-hour session";
+        const secondaryLabel =
+          Number(rl.secondary && (rl.secondary.window_minutes || rl.secondary.windowMinutes)) === 300
+            ? "5-hour session"
+            : "7-day (weekly)";
+        add(primaryLabel, rl.primary);
+        add(secondaryLabel, rl.secondary);
+        if (buckets.length) {
+          lastRateLimitsByProvider.set("codex", { at: Date.now(), buckets });
+          return { buckets, planType: rl.plan_type || rl.planType || null };
+        }
+      }
+    }
+  } catch (_) {
+    /* never throw */
+  }
+  return null;
+}
+
 function formatClaudeUtilization(util) {
   if (!util || typeof util !== "object") return null;
   const lines = [];
@@ -2557,8 +2665,23 @@ async function bridgeCommandOutput(provider, chatId, task, repo, command) {
           lines.push("(Subscription limits unavailable — sign in to Claude on this computer.)");
           lines.push("");
         }
+      } else if (provider === "codex") {
+        let buckets = (lastRateLimitsByProvider.get("codex") || {}).buckets;
+        if (!buckets || !buckets.length) {
+          const disk = fetchCodexUtilizationFromDisk();
+          buckets = disk && disk.buckets;
+        }
+        if (buckets && buckets.length) {
+          lines.push("Subscription limits:");
+          for (const b of buckets) {
+            const reset = b.resetsAt ? fmtResetIn(b.resetsAt) : "";
+            lines.push(
+              `${b.label}: ${Math.round(Number(b.utilization) || 0)}% used${reset ? ` · ${reset}` : ""}`
+            );
+          }
+          lines.push("");
+        }
       } else {
-        // Codex/Grok/Agy: prefer the last streamed rate_limits / limit-hit snapshot.
         const cached = lastRateLimitsByProvider.get(provider);
         if (cached && Array.isArray(cached.buckets) && cached.buckets.length) {
           lines.push("Subscription limits:");
@@ -8135,17 +8258,21 @@ async function buildUsageReport(provider, chatId, task) {
         }
       };
       add("5-hour session", util.five_hour);
-      add("7-day (all models)", util.seven_day);
+      add("7-day (weekly)", util.seven_day);
       add("7-day Opus", util.seven_day_opus);
       add("7-day Sonnet", util.seven_day_sonnet);
     }
-  }
-  // Codex (and any provider that streamed rate_limits) — reuse the last snapshot.
-  // Also fills Grok/Agy when a hard limit-hit was recorded from an error string.
-  const cached = lastRateLimitsByProvider.get(provider);
-  if (cached && Array.isArray(cached.buckets) && cached.buckets.length) {
-    // Prefer live Claude OAuth when present; otherwise use cached windows.
-    if (report.buckets.length === 0) {
+  } else if (provider === "codex") {
+    // Prefer a live stream cache; otherwise scan recent Codex session logs so
+    // the phone sheet works even before a Vibe-spawned run this process.
+    let cached = lastRateLimitsByProvider.get("codex");
+    if (!cached || !Array.isArray(cached.buckets) || !cached.buckets.length) {
+      const disk = fetchCodexUtilizationFromDisk();
+      if (disk && disk.buckets && disk.buckets.length) {
+        cached = { at: Date.now(), buckets: disk.buckets };
+      }
+    }
+    if (cached && Array.isArray(cached.buckets)) {
       for (const b of cached.buckets) {
         if (!b || !b.label) continue;
         report.buckets.push({
@@ -8154,10 +8281,28 @@ async function buildUsageReport(provider, chatId, task) {
           resetsAt: b.resetsAt || null,
         });
       }
+      if (cached.hit) {
+        report.limitHit = true;
+        report.limitMessage = cached.message || null;
+      }
     }
-    if (cached.hit) {
-      report.limitHit = true;
-      report.limitMessage = cached.message || null;
+  } else {
+    // Grok / Agy — no public headless utilization endpoint. Use last stream /
+    // limit-hit cache when present; otherwise report only chat tokens.
+    const cached = lastRateLimitsByProvider.get(provider);
+    if (cached && Array.isArray(cached.buckets) && cached.buckets.length) {
+      for (const b of cached.buckets) {
+        if (!b || !b.label) continue;
+        report.buckets.push({
+          label: b.label,
+          utilization: Math.round(Number(b.utilization) || 0),
+          resetsAt: b.resetsAt || null,
+        });
+      }
+      if (cached.hit) {
+        report.limitHit = true;
+        report.limitMessage = cached.message || null;
+      }
     }
   }
   const usage = (lastRuntimeBySession.get(sessionKey(provider, chatId)) || {}).usage;

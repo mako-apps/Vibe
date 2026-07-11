@@ -1894,6 +1894,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var groupUsageSnapshotsByProvider: [String: (util: Int, label: String, resetsAt: String?, limitHit: Bool)] = [:]
   private var groupUsageCarouselIndex: Int = 0
   private var groupUsageCarouselTimer: Timer?
+  /// Ordered providers currently represented by banner dots (manual swipe target).
+  private var lastUsageCarouselProviders: [String] = []
 
   /// Ask the bridge for a fresh structured usage snapshot. Throttled; a rejected push
   /// (socket/join not ready) clears the throttle so the channel-join retry fires freely.
@@ -1998,15 +2000,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       stopGroupUsageCarousel()
       return
     }
-    if candidates.count == 1 {
-      stopGroupUsageCarousel()
-      let (provider, snap) = candidates[0]
-      presentUsageBanner(provider: provider, snap: snap, pageCount: 1, pageIndex: 0)
-      return
-    }
-    // Multi-agent near/at limit: auto-carousel between them; left dots show page count.
-    groupUsageCarouselIndex = min(groupUsageCarouselIndex, candidates.count - 1)
-    let pageIndex = groupUsageCarouselIndex % candidates.count
+    // Manual paging only (no auto-switch). Dots on the left; swipe to change.
+    stopGroupUsageCarousel()
+    groupUsageCarouselIndex = min(max(0, groupUsageCarouselIndex), candidates.count - 1)
+    let pageIndex = groupUsageCarouselIndex
     let (provider, snap) = candidates[pageIndex]
     presentUsageBanner(
       provider: provider,
@@ -2014,7 +2011,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       pageCount: candidates.count,
       pageIndex: pageIndex
     )
-    startGroupUsageCarousel(candidates: candidates)
+    // Remember ordered providers so swipe can advance.
+    lastUsageCarouselProviders = candidates.map(\.key)
   }
 
   private func presentUsageBanner(
@@ -2051,20 +2049,22 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private func startGroupUsageCarousel(
     candidates: [(key: String, value: (util: Int, label: String, resetsAt: String?, limitHit: Bool))]
   ) {
+    // Auto-rotate disabled — user pages via swipe / dots only.
     stopGroupUsageCarousel()
-    guard candidates.count > 1 else { return }
-    groupUsageCarouselTimer = Timer.scheduledTimer(withTimeInterval: 4.0, repeats: true) {
-      [weak self] _ in
-      guard let self else { return }
-      self.groupUsageCarouselIndex =
-        (self.groupUsageCarouselIndex + 1) % max(1, candidates.count)
-      self.refreshUsageBannerFromSnapshots()
-    }
+    lastUsageCarouselProviders = candidates.map(\.key)
   }
 
   private func stopGroupUsageCarousel() {
     groupUsageCarouselTimer?.invalidate()
     groupUsageCarouselTimer = nil
+  }
+
+  /// Advance the multi-agent usage banner by one page (manual swipe).
+  private func pageUsageBanner(by delta: Int) {
+    let n = lastUsageCarouselProviders.count
+    guard n > 1 else { return }
+    groupUsageCarouselIndex = (groupUsageCarouselIndex + delta + n) % n
+    refreshUsageBannerFromSnapshots()
   }
 
   /// Force-show a hard limit banner (from `agent-usage-limit` event) and refresh buckets.
@@ -2139,6 +2139,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       let created = ChatPinnedBannerView()
       created.addTarget(self, action: #selector(handleBridgeUsageBannerTapped), for: .touchUpInside)
       created.onClose = { [weak self] in self?.dismissBridgeUsageBanner() }
+      // Horizontal swipe pages multi-agent usage without auto-rotate.
+      let swipeL = UISwipeGestureRecognizer(target: self, action: #selector(handleUsageBannerSwipe(_:)))
+      swipeL.direction = .left
+      created.addGestureRecognizer(swipeL)
+      let swipeR = UISwipeGestureRecognizer(target: self, action: #selector(handleUsageBannerSwipe(_:)))
+      swipeR.direction = .right
+      created.addGestureRecognizer(swipeR)
       addSubview(created)
       bridgeUsageBanner = created
       banner = created
@@ -2183,6 +2190,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
   }
 
+  @objc private func handleUsageBannerSwipe(_ gr: UISwipeGestureRecognizer) {
+    // Left swipe → next agent; right swipe → previous.
+    pageUsageBanner(by: gr.direction == .left ? 1 : -1)
+  }
+
   /// Tap opens the structured Usage sheet (5h / weekly + reset). Close (✕) only dismisses.
   @objc private func handleBridgeUsageBannerTapped() {
     let provider =
@@ -2196,6 +2208,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         ?? "claude")
       : provider
     NSLog("[ChatUsage] banner tapped provider=%@", resolved)
+    // Prefetch before present so the sheet opens with data, not a spinner.
+    lastBridgeUsageRequestAt = 0
+    requestBridgeUsageSnapshot(reason: "usageLimit:preopen")
     presentUsageSheet(provider: resolved)
   }
 
@@ -2216,19 +2231,28 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       NSLog("[ChatUsage] presentUsageSheet skipped — no presenter")
       return
     }
-    // Don't stack if something is already mid-present.
     if presenter.presentedViewController != nil {
       presenter.dismiss(animated: false)
     }
+    // Kick a fresh bridge fetch, but seed the sheet from any prefetched cache so
+    // the first frame already shows buckets/reset times.
+    let prefresh = ChatEngine.shared.requestAgentBridgeUsage([
+      "chatId": chatId, "provider": provider,
+    ])
+    let seedRequestId = (prefresh["requestId"] as? String)
+    let cached = ChatEngine.shared.cachedAgentBridgeUsage(chatId: chatId, provider: provider)
     let kitAppearance = VibeAgentKitMap.appearance(for: traitCollection)
-    // Same glass pageSheet stack as presentAgentTurnDetailView (progress / "Worked for…").
     let root = VibeAgentUsageSheetRoot(
       chatId: chatId,
       provider: provider,
-      appearance: kitAppearance
+      appearance: kitAppearance,
+      seedPayload: cached,
+      pendingRequestId: seedRequestId
     )
     let host = UIHostingController(rootView: root)
+    // Match progress-sheet glass: clear host so ultra-thin material (light/dark) shows.
     host.view.backgroundColor = .clear
+    host.overrideUserInterfaceStyle = kitAppearance.isDark ? .dark : .light
     host.modalPresentationStyle = .pageSheet
     if let sheet = host.sheetPresentationController {
       sheet.detents = [.medium(), .large()]
@@ -2239,8 +2263,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
     presenter.present(host, animated: true)
     NSLog(
-      "[ChatUsage] presentUsageSheet presented provider=%@ chat=%@", provider,
-      String(chatId.prefix(12)))
+      "[ChatUsage] presentUsageSheet presented provider=%@ chat=%@ cached=%@",
+      provider, String(chatId.prefix(12)), cached != nil ? "Y" : "N")
   }
 
   /// Multi-agent: pick which provider's usage sheet to open (each sheet fetches that

@@ -69,16 +69,32 @@ final class ChatPinnedBannerView: UIControl {
   }
 
   /// Multi-agent usage carousel: left-side vertical dots for page count/index.
-  /// `count <= 1` hides the dots.
-  func setPageIndicator(count: Int, index: Int) {
+  /// Active dot expands in height (smooth pill). `count <= 1` hides the dots.
+  func setPageIndicator(count: Int, index: Int, animated: Bool = true) {
     let nextCount = max(0, count)
     let nextIndex = nextCount == 0 ? 0 : min(max(0, index), nextCount - 1)
+    let changed = pageCount != nextCount || pageIndex != nextIndex
     pageCount = nextCount
     pageIndex = nextIndex
     rebuildPageDotsIfNeeded()
-    applyPageDotStyles()
     pageDotsStack.isHidden = nextCount <= 1
-    setNeedsLayout()
+    let apply = { [weak self] in
+      self?.applyPageDotStyles()
+      self?.setNeedsLayout()
+      self?.layoutIfNeeded()
+    }
+    if animated, changed, !pageDotsStack.isHidden {
+      UIView.animate(
+        withDuration: 0.28,
+        delay: 0,
+        usingSpringWithDamping: 0.78,
+        initialSpringVelocity: 0.5,
+        options: [.beginFromCurrentState, .allowUserInteraction],
+        animations: apply
+      )
+    } else {
+      apply()
+    }
   }
 
   /// Slide only the inner content (icon + text) along Y — glass shell stays put, no fade.
@@ -200,29 +216,38 @@ final class ChatPinnedBannerView: UIControl {
       height: closeSize
     )
 
+    // Dots sit on the trailing edge (before close), matching iOS page-control order
+    // where the active indicator is next to content rather than competing with LTR icon.
+    // Active pill is taller, so reserve vertical room around midY.
     let showsDots = pageCount > 1
-    let dotsWidth: CGFloat = showsDots ? 10.0 : 0.0
-    let dotsLeading: CGFloat = showsDots ? 10.0 : 0.0
+    let dotsColumnWidth: CGFloat = showsDots ? 8.0 : 0.0
+    let dotsTrailingGap: CGFloat = showsDots ? 8.0 : 0.0
+    let trailingReserve: CGFloat =
+      (closeButton.isHidden ? 12.0 : closeSize + 8.0) + dotsColumnWidth + dotsTrailingGap
+
+    contentContainer.frame = CGRect(
+      x: 0,
+      y: 0,
+      width: max(0, bounds.width - trailingReserve),
+      height: bounds.height
+    )
+
     if showsDots {
-      let dotsHeight = CGFloat(pageCount) * 5.0 + CGFloat(max(0, pageCount - 1)) * 4.0
+      var totalH: CGFloat = 0
+      for i in 0..<pageCount {
+        totalH += (i == pageIndex ? 12.0 : 5.0)
+        if i < pageCount - 1 { totalH += 4.0 }
+      }
+      let dotsX = contentContainer.frame.maxX + 4.0
       pageDotsStack.frame = CGRect(
-        x: dotsLeading,
-        y: (bounds.height - dotsHeight) * 0.5,
-        width: dotsWidth,
-        height: dotsHeight
+        x: dotsX,
+        y: (bounds.height - totalH) * 0.5,
+        width: dotsColumnWidth,
+        height: totalH
       )
     } else {
       pageDotsStack.frame = .zero
     }
-
-    let contentLeading = showsDots ? (pageDotsStack.frame.maxX + 6.0) : 0.0
-    let trailingReserve: CGFloat = closeButton.isHidden ? 12.0 : closeSize + 8.0
-    contentContainer.frame = CGRect(
-      x: contentLeading,
-      y: 0,
-      width: max(0, bounds.width - contentLeading - trailingReserve + (closeButton.isHidden ? 0 : 6)),
-      height: bounds.height
-    )
 
     let iconSize: CGFloat = 28.0
     iconContainer.frame = CGRect(
@@ -262,10 +287,19 @@ final class ChatPinnedBannerView: UIControl {
     return self
   }
 
+  private var pageDotWidthConstraints: [NSLayoutConstraint] = []
+  private var pageDotHeightConstraints: [NSLayoutConstraint] = []
+
   private func rebuildPageDotsIfNeeded() {
     while pageDotViews.count < pageCount {
       let dot = UIView()
       dot.layer.cornerCurve = .continuous
+      dot.translatesAutoresizingMaskIntoConstraints = false
+      let w = dot.widthAnchor.constraint(equalToConstant: 5)
+      let h = dot.heightAnchor.constraint(equalToConstant: 5)
+      NSLayoutConstraint.activate([w, h])
+      pageDotWidthConstraints.append(w)
+      pageDotHeightConstraints.append(h)
       pageDotsStack.addArrangedSubview(dot)
       pageDotViews.append(dot)
     }
@@ -273,24 +307,20 @@ final class ChatPinnedBannerView: UIControl {
       let last = pageDotViews.removeLast()
       pageDotsStack.removeArrangedSubview(last)
       last.removeFromSuperview()
-    }
-    for (i, dot) in pageDotViews.enumerated() {
-      let size: CGFloat = i == pageIndex ? 6.0 : 5.0
-      dot.bounds = CGRect(x: 0, y: 0, width: size, height: size)
-      dot.layer.cornerRadius = size * 0.5
-      // Fixed size via constraints so stack spacing is stable.
-      dot.translatesAutoresizingMaskIntoConstraints = false
-      NSLayoutConstraint.deactivate(dot.constraints)
-      NSLayoutConstraint.activate([
-        dot.widthAnchor.constraint(equalToConstant: size),
-        dot.heightAnchor.constraint(equalToConstant: size),
-      ])
+      if !pageDotWidthConstraints.isEmpty { pageDotWidthConstraints.removeLast() }
+      if !pageDotHeightConstraints.isEmpty { pageDotHeightConstraints.removeLast() }
     }
   }
 
   private func applyPageDotStyles() {
     for (i, dot) in pageDotViews.enumerated() {
       let active = i == pageIndex
+      // Active = taller pill (height expands); inactive = small circle.
+      let w: CGFloat = 5.0
+      let h: CGFloat = active ? 12.0 : 5.0
+      if i < pageDotWidthConstraints.count { pageDotWidthConstraints[i].constant = w }
+      if i < pageDotHeightConstraints.count { pageDotHeightConstraints[i].constant = h }
+      dot.layer.cornerRadius = w * 0.5
       dot.backgroundColor = textColor.withAlphaComponent(active ? 0.92 : 0.28)
     }
   }
