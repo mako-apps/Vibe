@@ -31,6 +31,24 @@ iOS ChatEngine → ChatNativeAgentView / ChatAgentMessagesView  (parsed rows)
 `toolEvents`, `status` ("running" | "done"). The final `result` carries the full output;
 progress lines are capped (`@max_stream_lines 500`) so only the result is authoritative.
 
+### Supervisor team runs (`@team`)
+
+Default `@team` / `/team` uses **supervisor** mode (override with `VIBE_TEAM_MODE=sequential`):
+
+| Field | Meaning |
+|---|---|
+| `teamMode` | `"supervisor"` (or legacy `"group_team"` sequential) |
+| `teamRunId` | Durable run id (also `TeamRun` primary key) |
+| `teamWorker` | This frame’s handle |
+| `teamWorkers` | All handles in the run |
+| `leadWorker` | Responsible agent (default preference: Codex → Claude → Grok → Agy) |
+| `teamRole` | `"lead"` \| `"worker"` |
+| `suppressVisible` | `true` for under-hood workers — **no list bubble** |
+| `teamWorkersStatus` | `[{ worker, label, status, durationMs, lastLabel, … }]` for the lead cell strip |
+
+Under-hood workers also emit `agent-team-worker` so the lead cell’s compact strip updates
+without inserting a second synthetic row. iOS pins the visible cell by `teamRunId`.
+
 ---
 
 ## Claude (`stream-json`)

@@ -2,8 +2,14 @@ defmodule Vibe.AI.TeamRun do
   @moduledoc """
   Durable control-plane state for one coordinated bridge team run.
 
+  Modes:
+  - `supervisor` (default): one lead worker owns the visible reply; sibling
+    workers run under the hood with suppressed bubbles and fold progress into
+    the lead cell.
+  - `sequential`: legacy one-owner-at-a-time chain with a full bubble per step.
+
   The selected repository remains on the user's computer and prompt text is
-  encrypted at rest. This row only coordinates ownership and sequencing; the
+  encrypted at rest. This row only coordinates ownership and status; the
   human-readable `.vibe/team/<run>.md` file is a handoff artifact, not state.
   """
 
@@ -21,6 +27,9 @@ defmodule Vibe.AI.TeamRun do
     field :workers, {:array, :string}, default: []
     field :current_index, :integer, default: 0
     field :current_worker, :string
+    field :mode, :string, default: "supervisor"
+    field :lead_worker, :string
+    field :worker_states, :map, default: %{}
     field :status, :string, default: "running"
     field :dispatch_ciphertext, :string
     field :bridge_metadata, :map, default: %{}
@@ -40,6 +49,9 @@ defmodule Vibe.AI.TeamRun do
       :workers,
       :current_index,
       :current_worker,
+      :mode,
+      :lead_worker,
+      :worker_states,
       :status,
       :dispatch_ciphertext,
       :bridge_metadata,
@@ -55,6 +67,7 @@ defmodule Vibe.AI.TeamRun do
       :dispatch_ciphertext
     ])
     |> validate_inclusion(:status, ["running", "completed", "failed", "cancelled"])
+    |> validate_inclusion(:mode, ["supervisor", "sequential"])
     |> validate_number(:current_index, greater_than_or_equal_to: 0)
     |> unique_constraint(:id, name: :agent_team_runs_pkey)
   end

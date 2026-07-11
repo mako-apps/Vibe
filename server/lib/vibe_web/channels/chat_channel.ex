@@ -771,8 +771,9 @@ defmodule VibeWeb.ChatChannel do
   defp spawn_team_worker_dispatches(chat_id, workers, dispatch_text, data, requester_user_id) do
     team_run_id = data["id"] || Ecto.UUID.generate()
     bridge_metadata = bridge_task_metadata(data)
+    mode = if(LocalAgentWorker.team_supervisor_mode?(), do: "supervisor", else: "sequential")
 
-    first_worker =
+    lead_worker =
       LocalAgentWorker.register_bridge_team_run(
         chat_id,
         team_run_id,
@@ -780,17 +781,23 @@ defmodule VibeWeb.ChatChannel do
         dispatch_text,
         requester_user_id,
         data["id"],
-        bridge_metadata
+        bridge_metadata,
+        mode: mode
       )
 
-    case first_worker do
+    case lead_worker do
       nil ->
         :ok
 
-      worker ->
+      lead ->
+        Logger.info(
+          "[ChatChannel] team_run mode=#{mode} chat=#{chat_id} run=#{team_run_id} lead=#{lead.handle} workers=#{Enum.map_join(workers, ",", & &1.handle)}"
+        )
+
+        # Lead owns the single user-visible cell.
         spawn_local_worker_dispatch(
           chat_id,
-          worker,
+          lead,
           dispatch_text,
           data,
           "reserved_worker_team",
@@ -799,8 +806,45 @@ defmodule VibeWeb.ChatChannel do
           note_user_turn: false,
           note_team_user_turn: true,
           team_run_id: team_run_id,
-          team_workers: workers
+          team_workers: workers,
+          team_mode: mode,
+          lead_worker: lead.handle,
+          team_role: "lead",
+          suppress_visible: false,
+          task_id_suffix: if(mode == "supervisor", do: "lead:#{lead.handle}", else: nil)
         )
+
+        # Supervisor: fan out sibling workers under the hood (no list bubbles).
+        if mode == "supervisor" do
+          workers
+          |> Enum.reject(&(&1.handle == lead.handle))
+          |> Enum.with_index()
+          |> Enum.each(fn {worker, index} ->
+            spawn_local_worker_dispatch(
+              chat_id,
+              worker,
+              dispatch_text,
+              data,
+              "supervisor_worker",
+              requester_user_id,
+              bridge_metadata: bridge_metadata,
+              note_user_turn: false,
+              note_team_user_turn: false,
+              skip_rate_limit: true,
+              team_run_id: team_run_id,
+              team_workers: workers,
+              team_mode: mode,
+              lead_worker: lead.handle,
+              team_role: "worker",
+              suppress_visible: true,
+              task_id_suffix: "worker:#{worker.handle}"
+            )
+
+            _ = index
+          end)
+        end
+
+        :ok
     end
   end
 
@@ -819,6 +863,10 @@ defmodule VibeWeb.ChatChannel do
     team_run_id = Keyword.get(opts, :team_run_id)
     team_workers = Keyword.get(opts, :team_workers, [])
     task_id_suffix = Keyword.get(opts, :task_id_suffix)
+    team_mode = Keyword.get(opts, :team_mode)
+    lead_worker_handle = Keyword.get(opts, :lead_worker)
+    team_role = Keyword.get(opts, :team_role)
+    suppress_visible? = Keyword.get(opts, :suppress_visible, false) == true
 
     bridge_metadata =
       (Keyword.get(opts, :bridge_metadata) || bridge_task_metadata(data))
@@ -872,7 +920,17 @@ defmodule VibeWeb.ChatChannel do
       # start building + dispatch at the same time.
       AgentBridge.paired?(requester_user_id) ->
         reply_to_id = data["id"]
-        team_meta = local_worker_team_metadata(worker, team_run_id, team_workers)
+
+        team_meta =
+          local_worker_team_metadata(
+            worker,
+            team_run_id,
+            team_workers,
+            team_mode: team_mode,
+            lead_worker: lead_worker_handle,
+            team_role: team_role,
+            suppress_visible: suppress_visible?
+          )
 
         run = fn ->
           bridge_prompt =
@@ -883,7 +941,10 @@ defmodule VibeWeb.ChatChannel do
                 dispatch_text,
                 requester_user_id,
                 team_workers,
-                team_run_id
+                team_run_id,
+                team_mode: team_mode || "supervisor",
+                lead_worker: lead_worker_handle,
+                team_role: team_role
               )
             else
               LocalAgentWorker.build_bridge_prompt(
@@ -1093,15 +1154,23 @@ defmodule VibeWeb.ChatChannel do
   defp bridge_dispatch_failure_notice(worker, _reason),
     do: "Your computer just went offline. Reconnect it to run @#{worker.handle} tasks."
 
-  defp local_worker_team_metadata(_worker, nil, _team_workers), do: %{}
+  defp local_worker_team_metadata(_worker, nil, _team_workers, _opts), do: %{}
 
-  defp local_worker_team_metadata(worker, team_run_id, team_workers) do
+  defp local_worker_team_metadata(worker, team_run_id, team_workers, opts \\ []) do
+    mode = Keyword.get(opts, :team_mode) || "group_team"
+    lead = Keyword.get(opts, :lead_worker)
+    role = Keyword.get(opts, :team_role)
+    suppress? = Keyword.get(opts, :suppress_visible, false) == true
+
     %{
-      "teamMode" => "group_team",
+      "teamMode" => mode,
       "teamRunId" => team_run_id,
       "teamWorker" => worker.handle,
       "teamWorkers" => Enum.map(team_workers, & &1.handle)
     }
+    |> then(fn m -> if is_binary(lead), do: Map.put(m, "leadWorker", lead), else: m end)
+    |> then(fn m -> if is_binary(role), do: Map.put(m, "teamRole", role), else: m end)
+    |> then(fn m -> if suppress?, do: Map.put(m, "suppressVisible", true), else: m end)
   end
 
   defp spawn_standalone_dispatch(

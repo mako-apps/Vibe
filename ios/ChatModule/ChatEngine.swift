@@ -445,6 +445,8 @@ final class ChatEngine {
   // keyed by the FIRST streamId seen for it — never a second, duplicate row. Survives
   // socket resets by design; only cleared when the task reaches a terminal status.
   private var liveStreamTaskRowIdByChatId: [String: [String: String]] = [:]
+  /// teamRunId → teamWorkersStatus list when under-hood workers report before the lead cell exists.
+  private var pendingTeamWorkersStatusByChatId: [String: [String: [[String: Any]]]] = [:]
   // Latest agent-bridge history payload (Claude/Codex/Grok local session logs) per
   // chat, keyed chatId -> payload. The Claude/Codex profile requests it and
   // observes `didChangeNotification` with reason "agentBridgeHistory".
@@ -5090,6 +5092,26 @@ final class ChatEngine {
     }
   }
 
+  /// True when the bridge CLI is actively working or paused for user input in this chat.
+  /// This intentionally does NOT use `liveBridgeSessionIngestByChatId`: that map also
+  /// represents a mounted History transcript subscription, and treating it as "busy"
+  /// strands mobile follow-ups in the pending queue for already-settled sessions.
+  func bridgeRunIsActive(chatId: String?) -> Bool {
+    guard let chatId = normalizedString(chatId), !chatId.isEmpty else { return false }
+    return syncOnQueue {
+      if agentProgressByChatId[chatId] != nil { return true }
+      let now = Int64(nowMs())
+      if let lastRunningAt = agentTurnRunningAtMsByChatId[chatId],
+        now - lastRunningAt < Self.agentTurnRunningGraceMs
+      {
+        return true
+      }
+      return agentBridgeAskByRequestId.values.contains { payload in
+        (normalizedString(payload["chatId"]) ?? "") == chatId
+      }
+    }
+  }
+
   /// Returns true only if native chat history has been successfully fetched
   /// from the server for this chatId. Used by ChatListView to decide whether
   /// native rows can fully replace JS rows.
@@ -5562,6 +5584,28 @@ final class ChatEngine {
     let status = (normalizedString(payload["status"]) ?? "running").lowercased()
     let agentUserId = normalizedString(payload["userId"] ?? payload["user_id"] ?? payload["id"])
     let taskId = normalizedString(payload["taskId"] ?? payload["task_id"])
+    let teamRunId = normalizedString(payload["teamRunId"] ?? payload["team_run_id"])
+    let teamMode = (normalizedString(payload["teamMode"] ?? payload["team_mode"]) ?? "")
+      .lowercased()
+    let suppressVisible =
+      (payload["suppressVisible"] as? Bool) == true
+      || (payload["suppress_visible"] as? Bool) == true
+      || (normalizedString(payload["teamRole"] ?? payload["team_role"]) ?? "").lowercased()
+        == "worker"
+    let isSupervisorTeam =
+      teamMode == "supervisor" || teamMode == "group_supervisor"
+
+    // Under-hood supervisor workers never get their own list cell. Fold status
+    // into the lead row keyed by teamRunId and keep full nodes for the sheet
+    // store only.
+    if suppressVisible, isSupervisorTeam, let teamRunId, !teamRunId.isEmpty {
+      mergeSuppressedTeamWorkerStreamLocked(
+        chatId: chatId,
+        teamRunId: teamRunId,
+        payload: payload
+      )
+      return
+    }
 
     // Cloud and LAN both carry sequence; advance the high-water mark so the other
     // path cannot re-apply a staler frame as a second bubble update.
@@ -5591,15 +5635,28 @@ final class ChatEngine {
     // on either side, so the FIRST streamId seen for a taskId becomes the row's
     // permanent id; later frames for the same taskId fold into that same row instead of
     // spawning a second, duplicate cell.
+    // Supervisor lead: pin by teamRunId so worker status merges and reconnects
+    // never spawn a second lead cell.
     var effectiveRowId = streamId
-    if let taskId, !taskId.isEmpty {
-      var perTaskRowIds = liveStreamTaskRowIdByChatId[chatId] ?? [:]
+    var perTaskRowIds = liveStreamTaskRowIdByChatId[chatId] ?? [:]
+    if isSupervisorTeam, let teamRunId, !teamRunId.isEmpty {
+      let teamKey = "team:\(teamRunId)"
+      if let existingRowId = perTaskRowIds[teamKey] {
+        effectiveRowId = existingRowId
+      } else {
+        perTaskRowIds[teamKey] = streamId
+        effectiveRowId = streamId
+      }
+    } else if let taskId, !taskId.isEmpty {
       if let existingRowId = perTaskRowIds[taskId] {
         effectiveRowId = existingRowId
       } else {
         perTaskRowIds[taskId] = streamId
-        liveStreamTaskRowIdByChatId[chatId] = perTaskRowIds
+        effectiveRowId = streamId
       }
+    }
+    if !perTaskRowIds.isEmpty {
+      liveStreamTaskRowIdByChatId[chatId] = perTaskRowIds
     }
 
     // A live turn's sessionId (once the CLI's init/thread-start event has been parsed)
@@ -5830,6 +5887,28 @@ final class ChatEngine {
     if let workers = payload["teamWorkers"] as? [String], !workers.isEmpty {
       liveRuntime["teamWorkers"] = workers
     }
+    if let lead = normalizedString(payload["leadWorker"] ?? payload["lead_worker"]) {
+      liveRuntime["leadWorker"] = lead
+    }
+    if let role = normalizedString(payload["teamRole"] ?? payload["team_role"]) {
+      liveRuntime["teamRole"] = role
+    }
+    var statusList = payload["teamWorkersStatus"] as? [[String: Any]]
+    if (statusList == nil || statusList?.isEmpty == true),
+      let teamRunId,
+      let stashed = pendingTeamWorkersStatusByChatId[chatId]?[teamRunId],
+      !stashed.isEmpty
+    {
+      statusList = stashed
+      pendingTeamWorkersStatusByChatId[chatId]?.removeValue(forKey: teamRunId)
+      if pendingTeamWorkersStatusByChatId[chatId]?.isEmpty == true {
+        pendingTeamWorkersStatusByChatId.removeValue(forKey: chatId)
+      }
+    }
+    if let statusList, !statusList.isEmpty {
+      liveRuntime["teamWorkersStatus"] = statusList
+      metadata["teamWorkersStatus"] = statusList
+    }
     metadata["agentRuntime"] = liveRuntime
     if let sequence {
       metadata["agentStreamSequence"] = sequence
@@ -5900,6 +5979,68 @@ final class ChatEngine {
     postChangeLocked(
       reason: hadExistingStreamRow ? "chatMessageChanged" : "chatMessageInserted",
       userInfo: ["chatId": chatId, "messageId": effectiveRowId, "state": statusSnapshotLocked()]
+    )
+  }
+
+  /// Fold an under-hood supervisor worker's stream into the lead row for `teamRunId`.
+  /// Does not insert a second list cell; updates `teamWorkersStatus` (and optional
+  /// per-worker progress cache) on the existing lead synthetic message.
+  private func mergeSuppressedTeamWorkerStreamLocked(
+    chatId: String,
+    teamRunId: String,
+    payload: [String: Any]
+  ) {
+    let teamKey = "team:\(teamRunId)"
+    let rowId = liveStreamTaskRowIdByChatId[chatId]?[teamKey]
+    let statusList =
+      (payload["teamWorkersStatus"] as? [[String: Any]])
+      ?? (payload["team_workers_status"] as? [[String: Any]])
+      ?? []
+
+    // Keep header typing multi-agent aware even before lead row exists.
+    if let worker = normalizedString(payload["teamWorker"] ?? payload["team_worker"]),
+      let lastLabel = normalizedString(payload["lastLabel"] ?? payload["last_label"])
+        ?? normalizedString(payload["status"])
+    {
+      let label = "\(worker.capitalized) · \(lastLabel)"
+      setAgentProgressLocked(chatId: chatId, label: label, tool: nil, status: "running")
+    }
+
+    guard let rowId else {
+      // Lead cell not yet created — stash status so the first lead frame can adopt it.
+      var stash = pendingTeamWorkersStatusByChatId[chatId] ?? [:]
+      if !statusList.isEmpty {
+        stash[teamRunId] = statusList
+        pendingTeamWorkersStatusByChatId[chatId] = stash
+      }
+      return
+    }
+
+    mutateLiveMessagePayloadLocked(chatId: chatId, messageId: rowId) { message in
+      var metadata = (message["metadata"] as? [String: Any]) ?? [:]
+      if !statusList.isEmpty {
+        metadata["teamWorkersStatus"] = statusList
+        var runtime = (metadata["agentRuntime"] as? [String: Any]) ?? [:]
+        runtime["teamWorkersStatus"] = statusList
+        runtime["teamRunId"] = teamRunId
+        runtime["teamMode"] = normalizedString(payload["teamMode"] ?? payload["team_mode"])
+          ?? runtime["teamMode"] as? String ?? "supervisor"
+        metadata["agentRuntime"] = runtime
+      }
+      // Cache full worker progress nodes for the multi-agent sheet (keyed by handle).
+      if let worker = normalizedString(payload["teamWorker"] ?? payload["team_worker"]),
+        let nodes = payload["progressNodes"] as? [[String: Any]], !nodes.isEmpty
+      {
+        var byWorker = (metadata["teamWorkerProgressNodes"] as? [String: Any]) ?? [:]
+        byWorker[worker] = nodes
+        metadata["teamWorkerProgressNodes"] = byWorker
+      }
+      message["metadata"] = metadata
+    }
+
+    postChangeLocked(
+      reason: "chatMessageChanged",
+      userInfo: ["chatId": chatId, "messageId": rowId, "state": statusSnapshotLocked()]
     )
   }
 
@@ -6747,6 +6888,19 @@ final class ChatEngine {
         }
         if frame.event == "agent-stream" {
           self.applyAgentStreamLocked(chatId: chatId, payload: frame.payload)
+          return
+        }
+        // Supervisor under-hood worker progress folded into the lead cell strip.
+        if frame.event == "agent-team-worker" {
+          if let teamRunId = self.normalizedString(
+            frame.payload["teamRunId"] ?? frame.payload["team_run_id"])
+          {
+            self.mergeSuppressedTeamWorkerStreamLocked(
+              chatId: chatId,
+              teamRunId: teamRunId,
+              payload: frame.payload
+            )
+          }
           return
         }
         // Subscription/rate-limit hit: no transcript row — refresh the usage banner.

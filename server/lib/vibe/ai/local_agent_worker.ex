@@ -506,10 +506,33 @@ defmodule Vibe.AI.LocalAgentWorker do
 
         # Add the agent's answer to the shared group thread so the other agent can
         # build on it next turn. Only on success — don't pollute memory with errors.
+        # Under-hood supervisor workers still write memory so the lead can synthesize.
         if ok, do: note_bridge_agent_turn(chat_id, worker, base_text, requester_user_id)
 
+        suppress_visible? =
+          Keyword.get(opts, :suppress_visible) == true or
+            Keyword.get(opts, :suppressVisible) == true or
+            truthy_opt?(Keyword.get(opts, :suppress_visible)) or
+            truthy_opt?(team_metadata["suppressVisible"]) or
+            truthy_opt?(team_metadata["agentWorkerSuppressVisible"])
+
+        team_run_id = normalize_string(Keyword.get(opts, :team_run_id))
+        team_mode = normalize_string(Keyword.get(opts, :team_mode))
+
+        worker_status_list =
+          if is_binary(team_run_id) do
+            update_team_worker_state(chat_id, team_run_id, worker.handle, %{
+              "status" => if(ok, do: "done", else: "failed"),
+              "summary" => String.slice(base_text || "", 0, 400),
+              "last_label" => if(ok, do: "done", else: "failed"),
+              "task_id" => Keyword.get(opts, :task_id)
+            })
+          else
+            []
+          end
+
         Logger.info(
-          "[AgentBridge] deliver chat=#{chat_id} provider=#{worker.handle} ok=#{ok} usageLimit=#{usage_limit_hit?} rawEvents=#{extracted.raw_event_count} baseTextLen=#{String.length(base_text || "")} bodyLen=#{String.length(body || "")}"
+          "[AgentBridge] deliver chat=#{chat_id} provider=#{worker.handle} ok=#{ok} usageLimit=#{usage_limit_hit?} suppressVisible=#{suppress_visible?} rawEvents=#{extracted.raw_event_count} baseTextLen=#{String.length(base_text || "")} bodyLen=#{String.length(body || "")}"
         )
 
         metadata =
@@ -529,6 +552,8 @@ defmodule Vibe.AI.LocalAgentWorker do
           |> maybe_put("agentRuntimeEnc", runtime_enc)
           |> maybe_put("agentActionsEnc", agent_actions_enc)
           |> maybe_put("agentRuntimeCanRevert", if(runtime_can_revert, do: true))
+          |> maybe_put("suppressVisible", if(suppress_visible?, do: true))
+          |> maybe_put("teamWorkersStatus", worker_status_list)
           |> then(fn meta ->
             if usage_limit_hit? do
               meta
@@ -559,6 +584,24 @@ defmodule Vibe.AI.LocalAgentWorker do
 
               {:ok, %{message_id: nil, suppressed: true, usage_limit: true}}
 
+            # Supervisor under-hood workers: memory + team status only, no list bubble.
+            suppress_visible? ->
+              Logger.info(
+                "[AgentBridge] suppress under-hood worker row chat=#{chat_id} provider=#{worker.handle} run=#{inspect(team_run_id)}"
+              )
+
+              broadcast_team_worker_settled(
+                chat_id,
+                worker,
+                team_run_id,
+                team_mode,
+                worker_status_list,
+                ok,
+                base_text
+              )
+
+              {:ok, %{message_id: nil, suppressed: true, under_hood: true}}
+
             # Two bridge daemons both finishing the same human message → same provider
             # would otherwise post two near-identical bubbles. Claim once per
             # (chat, provider, reply_to, body-fingerprint) within the TTL.
@@ -586,6 +629,11 @@ defmodule Vibe.AI.LocalAgentWorker do
               "[AgentBridge] deliver suppressed usage-limit chat=#{chat_id} provider=#{worker.handle}"
             )
 
+          {:ok, %{suppressed: true, under_hood: true}} ->
+            Logger.info(
+              "[AgentBridge] deliver suppressed under-hood chat=#{chat_id} provider=#{worker.handle}"
+            )
+
           {:ok, %{message_id: mid}} ->
             Logger.info("[AgentBridge] deliver posted chat=#{chat_id} message_id=#{inspect(mid)}")
 
@@ -600,10 +648,11 @@ defmodule Vibe.AI.LocalAgentWorker do
         else
           # Usage-limit is not a team-chain failure that needs a list notice — siblings
           # keep going; the phone shows a banner for the limited agent.
-          unless usage_limit_hit? do
+          # Under-hood supervisor workers also must not fail the whole team run.
+          unless usage_limit_hit? or suppress_visible? do
             fail_bridge_team_run(
               chat_id,
-              Keyword.get(opts, :team_run_id),
+              team_run_id,
               worker.handle,
               "@#{worker.handle} exited with status #{exit_status}: #{base_text}"
             )
@@ -613,6 +662,40 @@ defmodule Vibe.AI.LocalAgentWorker do
         result
     end
   end
+
+  defp truthy_opt?(true), do: true
+  defp truthy_opt?("true"), do: true
+  defp truthy_opt?("1"), do: true
+  defp truthy_opt?(1), do: true
+  defp truthy_opt?(_), do: false
+
+  defp broadcast_team_worker_settled(
+         chat_id,
+         worker,
+         team_run_id,
+         team_mode,
+         worker_status_list,
+         ok,
+         summary
+       )
+       when is_binary(chat_id) and is_binary(team_run_id) do
+    VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-team-worker", %{
+      "chatId" => chat_id,
+      "teamRunId" => team_run_id,
+      "teamMode" => team_mode || "supervisor",
+      "teamWorker" => worker.handle,
+      "agentUserId" => worker.agent_user_id,
+      "agentName" => worker.label,
+      "status" => if(ok, do: "done", else: "failed"),
+      "summary" => String.slice(summary || "", 0, 400),
+      "teamWorkersStatus" => worker_status_list,
+      "suppressVisible" => true
+    })
+
+    :ok
+  end
+
+  defp broadcast_team_worker_settled(_, _, _, _, _, _, _), do: :ok
 
   defp usage_limit_text?(text) when is_binary(text) do
     t = String.downcase(text)
@@ -761,9 +844,34 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp selected_repo_prompt_line(_), do: ""
 
   @doc """
-  Build a team-run prompt for a worker. The server remains the coordinator and
-  the selected repo remains on the user's bridge machine; the prompt gives both
-  agents a stable team run id plus an optional shared repo handoff file.
+  Pick the responsible lead for a supervisor team run.
+
+  Preference: Codex → Claude → Grok → Agy among members present.
+  """
+  def pick_supervisor_lead(workers) when is_list(workers) do
+    preferred = ["codex", "claude", "grok", "agy"]
+
+    Enum.find_value(preferred, fn handle ->
+      Enum.find(workers, &(&1.handle == handle))
+    end) || List.first(workers)
+  end
+
+  def pick_supervisor_lead(_), do: nil
+
+  @doc "Whether team runs default to supervisor mode (one visible lead cell)."
+  def team_supervisor_mode? do
+    case System.get_env("VIBE_TEAM_MODE") do
+      value when is_binary(value) ->
+        String.downcase(String.trim(value)) not in ["sequential", "legacy", "chain"]
+
+      _ ->
+        true
+    end
+  end
+
+  @doc """
+  Build a team-run prompt for a worker. In supervisor mode the lead owns the
+  user-visible reply and sibling workers run focused under-hood slices.
   """
   def build_team_bridge_prompt(
         chat_id,
@@ -771,56 +879,235 @@ defmodule Vibe.AI.LocalAgentWorker do
         dispatch_text,
         requester_user_id,
         team_workers,
-        team_run_id
+        team_run_id,
+        opts \\ []
+      )
+
+  def build_team_bridge_prompt(
+        chat_id,
+        worker,
+        dispatch_text,
+        requester_user_id,
+        team_workers,
+        team_run_id,
+        opts
       )
       when is_binary(chat_id) and is_map(worker) and is_binary(dispatch_text) do
     if group_chat?(chat_id) do
+      mode = team_mode_from_opts(opts)
+      lead_handle = Keyword.get(opts, :lead_worker) || lead_handle_from_workers(team_workers)
+      role = Keyword.get(opts, :team_role) || if(worker.handle == lead_handle, do: "lead", else: "worker")
       context = group_collaboration_context(chat_id, requester_user_id)
       teammate_names = team_workers_label(team_workers)
       teammate_handles = team_workers_handles(team_workers)
       handoff_path = ".vibe/team/#{safe_team_run_id(team_run_id)}.md"
-      worker_index = Enum.find_index(team_workers, &(&1.handle == worker.handle)) || 0
-      worker_number = worker_index + 1
       default_focus = team_worker_default_focus(worker.handle)
 
-      """
-      You are #{worker.label} in a Vibe team run.
+      case {mode, role} do
+        {"supervisor", "lead"} ->
+          build_supervisor_lead_prompt(
+            worker,
+            dispatch_text,
+            teammate_names,
+            teammate_handles,
+            handoff_path,
+            default_focus,
+            team_run_id,
+            context
+          )
 
-      Team run id: #{team_run_id || "unknown"}
-      Teammates in this run: #{teammate_names}
-      Team handles: #{teammate_handles}
-      Your step: #{worker_number} of #{length(team_workers)}
-      Default focus: #{default_focus}
+        {"supervisor", _} ->
+          build_supervisor_worker_prompt(
+            worker,
+            dispatch_text,
+            teammate_names,
+            teammate_handles,
+            handoff_path,
+            default_focus,
+            team_run_id,
+            lead_handle,
+            context
+          )
 
-      The server gives edit ownership to one worker at a time. You currently own
-      this step; later workers will build on your result. Read #{handoff_path}
-      before editing. Do not reset, stash, revert, or overwrite pre-existing user
-      changes. If another worker already owns a file or completed a slice, take a
-      non-overlapping slice. Append your ownership, findings, exact files changed,
-      verification, blockers, and recommended next owner to the handoff before
-      finishing. The first worker should record a short decomposition; later
-      workers should update it rather than replace it. If a configured advisor is
-      unavailable, record that fact and continue with the executor's best judgment.
-
-      Collaboration rules:
-      #{agent_operating_rules(worker, handoff_path)}
-
-      Shared Vibe group memory:
-      #{context_or_empty(context)}
-
-      Latest team request:
-      #{dispatch_text}
-      """
-      |> String.trim()
+        _ ->
+          build_sequential_team_prompt(
+            worker,
+            dispatch_text,
+            team_workers,
+            teammate_names,
+            teammate_handles,
+            handoff_path,
+            default_focus,
+            team_run_id,
+            context
+          )
+      end
     else
       dispatch_text
     end
   end
 
-  def build_team_bridge_prompt(_chat_id, _worker, dispatch_text, _requester, _workers, _run_id),
+  def build_team_bridge_prompt(_chat_id, _worker, dispatch_text, _requester, _workers, _run_id, _opts),
     do: dispatch_text
 
-  @doc "Persist a coordinated bridge team run and return its first owner."
+  defp build_supervisor_lead_prompt(
+         worker,
+         dispatch_text,
+         teammate_names,
+         teammate_handles,
+         handoff_path,
+         default_focus,
+         team_run_id,
+         context
+       ) do
+    """
+    You are #{worker.label}, the RESPONSIBLE LEAD for a Vibe supervisor team run.
+
+    Team run id: #{team_run_id || "unknown"}
+    Teammates running under the hood: #{teammate_names}
+    Team handles: #{teammate_handles}
+    Your default focus: #{default_focus}
+    Shared handoff board: #{handoff_path}
+
+    Your job:
+    1. Own the single user-visible reply for this team turn.
+    2. Classify the request: if it is trivial chat with no coding work, answer alone briefly.
+    3. For real work, decompose into non-overlapping slices (backend/data, review/debug,
+       investigation, UI/frontend) and coordinate via the handoff file.
+    4. Teammates may already be running their focus slices in parallel — read #{handoff_path}
+       for their findings, files changed, and blockers before you finalize.
+    5. Prefer non-overlapping file ownership. Do not reset, stash, revert, or overwrite
+       pre-existing user changes.
+    6. Advisors: consult Fable when available for complex decisions; if Fable fails, use
+       Sol (GPT) as fallback advisor. For frontend/JSX/UI returns only, use Gemini/Agy as a
+       UI-only advisor. Advisors never edit files.
+    7. When work is done, write ONE concise summary for the user: what each agent did,
+       approximate time/effort if known, what landed, and remaining risks. Do not dump
+       raw tool logs into the user reply.
+
+    Collaboration rules:
+    #{agent_operating_rules(worker, handoff_path)}
+
+    Shared Vibe group memory:
+    #{context_or_empty(context)}
+
+    Latest team request:
+    #{dispatch_text}
+    """
+    |> String.trim()
+  end
+
+  defp build_supervisor_worker_prompt(
+         worker,
+         dispatch_text,
+         teammate_names,
+         teammate_handles,
+         handoff_path,
+         default_focus,
+         team_run_id,
+         lead_handle,
+         context
+       ) do
+    """
+    You are #{worker.label} in a Vibe supervisor team run (UNDER THE HOOD).
+
+    Team run id: #{team_run_id || "unknown"}
+    Lead (user-visible owner): @#{lead_handle || "lead"}
+    Teammates: #{teammate_names}
+    Team handles: #{teammate_handles}
+    Your focus: #{default_focus}
+    Shared handoff board: #{handoff_path}
+
+    Rules:
+    - You are NOT posting a chat bubble. The lead synthesizes the user-facing answer.
+    - Read #{handoff_path} first. Take a non-overlapping slice matching your focus.
+    - Do focused work only. Avoid rewriting the whole repo or duplicating the lead.
+    - Append ownership, findings, exact files changed, verification, and blockers to
+      #{handoff_path}. Do not replace other agents' sections.
+    - Do not reset, stash, revert, or overwrite pre-existing user changes.
+    - Keep final stdout short (handoff summary only) — not a long user essay.
+    - If your work is UI/JSX/frontend, note that for Gemini UI review in the handoff.
+    - If a configured advisor is unavailable, continue with best judgment.
+
+    Collaboration rules:
+    #{agent_operating_rules(worker, handoff_path)}
+
+    Shared Vibe group memory:
+    #{context_or_empty(context)}
+
+    Latest team request:
+    #{dispatch_text}
+    """
+    |> String.trim()
+  end
+
+  defp build_sequential_team_prompt(
+         worker,
+         dispatch_text,
+         team_workers,
+         teammate_names,
+         teammate_handles,
+         handoff_path,
+         default_focus,
+         team_run_id,
+         context
+       ) do
+    worker_index = Enum.find_index(team_workers, &(&1.handle == worker.handle)) || 0
+    worker_number = worker_index + 1
+
+    """
+    You are #{worker.label} in a Vibe team run.
+
+    Team run id: #{team_run_id || "unknown"}
+    Teammates in this run: #{teammate_names}
+    Team handles: #{teammate_handles}
+    Your step: #{worker_number} of #{length(team_workers)}
+    Default focus: #{default_focus}
+
+    The server gives edit ownership to one worker at a time. You currently own
+    this step; later workers will build on your result. Read #{handoff_path}
+    before editing. Do not reset, stash, revert, or overwrite pre-existing user
+    changes. If another worker already owns a file or completed a slice, take a
+    non-overlapping slice. Append your ownership, findings, exact files changed,
+    verification, blockers, and recommended next owner to the handoff before
+    finishing. The first worker should record a short decomposition; later
+    workers should update it rather than replace it. If a configured advisor is
+    unavailable, record that fact and continue with the executor's best judgment.
+
+    Collaboration rules:
+    #{agent_operating_rules(worker, handoff_path)}
+
+    Shared Vibe group memory:
+    #{context_or_empty(context)}
+
+    Latest team request:
+    #{dispatch_text}
+    """
+    |> String.trim()
+  end
+
+  defp team_mode_from_opts(opts) do
+    case Keyword.get(opts, :team_mode) || Keyword.get(opts, :mode) do
+      mode when is_binary(mode) -> String.downcase(String.trim(mode))
+      _ -> if(team_supervisor_mode?(), do: "supervisor", else: "sequential")
+    end
+  end
+
+  defp lead_handle_from_workers(workers) when is_list(workers) do
+    case pick_supervisor_lead(workers) do
+      %{handle: handle} -> handle
+      _ -> nil
+    end
+  end
+
+  defp lead_handle_from_workers(_), do: nil
+
+  @doc """
+  Persist a coordinated bridge team run and return the lead worker.
+
+  Default mode is supervisor (Codex-preferred lead). Set opts `mode: "sequential"`
+  or env `VIBE_TEAM_MODE=sequential` for the legacy chain.
+  """
   def register_bridge_team_run(
         chat_id,
         team_run_id,
@@ -828,17 +1115,61 @@ defmodule Vibe.AI.LocalAgentWorker do
         dispatch_text,
         requester_user_id,
         reply_to_id,
-        bridge_metadata
+        bridge_metadata,
+        opts \\ []
+      )
+
+  def register_bridge_team_run(
+        chat_id,
+        team_run_id,
+        workers,
+        dispatch_text,
+        requester_user_id,
+        reply_to_id,
+        bridge_metadata,
+        opts
       )
       when is_binary(chat_id) and is_binary(team_run_id) and is_list(workers) do
     handles = Enum.map(workers, & &1.handle)
+    mode = team_mode_from_opts(opts)
 
-    case handles do
-      [] ->
+    lead =
+      case mode do
+        "supervisor" -> pick_supervisor_lead(workers)
+        _ -> List.first(workers)
+      end
+
+    case {handles, lead} do
+      {[], _} ->
         nil
 
-      [first | remaining] ->
+      {_, nil} ->
+        nil
+
+      {handles, lead_worker} ->
+        lead_handle = lead_worker.handle
+        remaining = Enum.reject(handles, &(&1 == lead_handle))
+        now_ms = System.system_time(:millisecond)
+
+        worker_states =
+          handles
+          |> Enum.map(fn handle ->
+            status = if handle == lead_handle, do: "running", else: "pending"
+
+            {handle,
+             %{
+               "status" => status,
+               "started_at" => if(status == "running", do: now_ms),
+               "finished_at" => nil,
+               "summary" => nil,
+               "task_id" => nil,
+               "last_label" => if(status == "running", do: "starting", else: "queued")
+             }}
+          end)
+          |> Map.new()
+
         ensure_team_run_table()
+
         state = %{
           chat_id: chat_id,
           team_run_id: team_run_id,
@@ -848,13 +1179,16 @@ defmodule Vibe.AI.LocalAgentWorker do
           requester_user_id: requester_user_id,
           reply_to_id: reply_to_id,
           bridge_metadata: bridge_metadata || %{},
-          started_at: System.system_time(:millisecond)
+          started_at: now_ms,
+          mode: mode,
+          lead_worker: lead_handle,
+          worker_states: worker_states
         }
 
-        case persist_team_run(state, first) do
+        case persist_team_run(state, lead_handle) do
           :created ->
             :ets.insert(@team_run_table, {{chat_id, team_run_id}, state})
-            resolve_handle(first)
+            lead_worker
 
           :duplicate ->
             Logger.info(
@@ -864,19 +1198,153 @@ defmodule Vibe.AI.LocalAgentWorker do
             nil
 
           {:error, reason} ->
-            # Preserve availability during a rolling deploy before the migration is
-            # applied, but make the durability loss explicit in logs.
             Logger.error(
               "[LocalAgentWorker] durable team registration failed; using ETS fallback chat=#{chat_id} run=#{team_run_id} reason=#{inspect(reason)}"
             )
 
             :ets.insert(@team_run_table, {{chat_id, team_run_id}, state})
-            resolve_handle(first)
+            lead_worker
         end
     end
   end
 
-  def register_bridge_team_run(_, _, _, _, _, _, _), do: nil
+  def register_bridge_team_run(_, _, _, _, _, _, _, _), do: nil
+
+  @doc "Return current worker_states list for a team run (for stream payloads)."
+  def team_workers_status(chat_id, team_run_id)
+      when is_binary(chat_id) and is_binary(team_run_id) do
+    ensure_team_run_table()
+
+    case :ets.lookup(@team_run_table, {chat_id, team_run_id}) do
+      [{{^chat_id, ^team_run_id}, state}] ->
+        worker_states_to_list(Map.get(state, :worker_states) || %{})
+
+      _ ->
+        case Repo.get(TeamRun, team_run_id) do
+          %TeamRun{chat_id: ^chat_id, worker_states: states} when is_map(states) ->
+            worker_states_to_list(states)
+
+          _ ->
+            []
+        end
+    end
+  rescue
+    _ -> []
+  end
+
+  def team_workers_status(_, _), do: []
+
+  @doc "Update one worker's live status on a team run and return the full status list."
+  def update_team_worker_state(chat_id, team_run_id, worker_handle, patch)
+      when is_binary(chat_id) and is_binary(team_run_id) and is_binary(worker_handle) and
+             is_map(patch) do
+    ensure_team_run_table()
+    handle = normalize_handle(worker_handle) || worker_handle
+    now_ms = System.system_time(:millisecond)
+
+    case :ets.lookup(@team_run_table, {chat_id, team_run_id}) do
+      [{{^chat_id, ^team_run_id}, state}] ->
+        states = Map.get(state, :worker_states) || %{}
+        current = Map.get(states, handle) || %{}
+
+        merged =
+          current
+          |> Map.merge(stringify_keys(patch))
+          |> then(fn m ->
+            status = m["status"] || m[:status]
+
+            cond do
+              status in ["running", "pending"] and is_nil(m["started_at"]) ->
+                Map.put(m, "started_at", now_ms)
+
+              status in ["done", "failed", "skipped"] and is_nil(m["finished_at"]) ->
+                Map.put(m, "finished_at", now_ms)
+
+              true ->
+                m
+            end
+          end)
+          |> put_duration_ms()
+
+        new_states = Map.put(states, handle, merged)
+        new_state = Map.put(state, :worker_states, new_states)
+        :ets.insert(@team_run_table, {{chat_id, team_run_id}, new_state})
+        maybe_persist_worker_states(chat_id, team_run_id, new_states)
+        worker_states_to_list(new_states)
+
+      _ ->
+        []
+    end
+  rescue
+    _ -> []
+  end
+
+  def update_team_worker_state(_, _, _, _), do: []
+
+  defp put_duration_ms(state) when is_map(state) do
+    started = state["started_at"] || state[:started_at]
+    finished = state["finished_at"] || state[:finished_at] || System.system_time(:millisecond)
+
+    if is_integer(started) do
+      Map.put(state, "duration_ms", max(0, finished - started))
+    else
+      state
+    end
+  end
+
+  defp put_duration_ms(state), do: state
+
+  defp worker_states_to_list(states) when is_map(states) do
+    preferred = @worker_order
+
+    handles =
+      preferred
+      |> Enum.filter(&Map.has_key?(states, &1))
+      |> Kernel.++(Map.keys(states) |> Enum.reject(&(&1 in preferred)))
+
+    Enum.map(handles, fn handle ->
+      entry = Map.get(states, handle) || %{}
+      worker = resolve_handle(handle)
+
+      %{
+        "worker" => handle,
+        "label" => (worker && worker.label) || handle,
+        "status" => entry["status"] || entry[:status] || "pending",
+        "startedAt" => entry["started_at"] || entry["startedAt"] || entry[:started_at],
+        "finishedAt" => entry["finished_at"] || entry["finishedAt"] || entry[:finished_at],
+        "durationMs" => entry["duration_ms"] || entry["durationMs"] || entry[:duration_ms],
+        "summary" => entry["summary"] || entry[:summary],
+        "taskId" => entry["task_id"] || entry["taskId"] || entry[:task_id],
+        "lastLabel" => entry["last_label"] || entry["lastLabel"] || entry[:last_label]
+      }
+    end)
+  end
+
+  defp worker_states_to_list(_), do: []
+
+  defp maybe_persist_worker_states(chat_id, team_run_id, states) do
+    now = DateTime.utc_now()
+
+    Repo.update_all(
+      from(run in TeamRun,
+        where: run.id == ^team_run_id and run.chat_id == ^chat_id and run.status == "running"
+      ),
+      set: [worker_states: states, updated_at: now]
+    )
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp stringify_keys(map) when is_map(map) do
+    Map.new(map, fn
+      {k, v} when is_atom(k) -> {Atom.to_string(k), v}
+      {k, v} -> {to_string(k), v}
+    end)
+  end
+
+  defp stringify_keys(_), do: %{}
 
   @doc "Remove stale or completed team sequencing state."
   def clear_bridge_team_run(chat_id, team_run_id) do
@@ -951,6 +1419,9 @@ defmodule Vibe.AI.LocalAgentWorker do
       workers: state.workers,
       current_index: 0,
       current_worker: first_worker,
+      mode: Map.get(state, :mode) || "supervisor",
+      lead_worker: Map.get(state, :lead_worker) || first_worker,
+      worker_states: Map.get(state, :worker_states) || %{},
       status: "running",
       dispatch_ciphertext: AgentMessageCrypto.encrypt_for_storage(state.dispatch_text),
       bridge_metadata: state.bridge_metadata
@@ -1037,7 +1508,10 @@ defmodule Vibe.AI.LocalAgentWorker do
       requester_user_id: to_string(run.requester_user_id),
       reply_to_id: run.reply_to_id,
       bridge_metadata: run.bridge_metadata || %{},
-      started_at: DateTime.to_unix(run.inserted_at, :millisecond)
+      started_at: DateTime.to_unix(run.inserted_at, :millisecond),
+      mode: run.mode || "sequential",
+      lead_worker: run.lead_worker || run.current_worker,
+      worker_states: run.worker_states || %{}
     }
   end
 
@@ -1110,10 +1584,20 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   defp maybe_dispatch_next_team_worker(chat_id, worker, requester_user_id, opts) do
     team_run_id = normalize_string(Keyword.get(opts, :team_run_id))
+    team_mode = normalize_string(Keyword.get(opts, :team_mode)) || team_run_mode(chat_id, team_run_id)
 
     cond do
       is_nil(team_run_id) ->
         :ok
+
+      # Supervisor mode never chains sequential peer bubbles — workers are
+      # already under-hood (or lead-only). Completing the lead finishes the run.
+      team_mode in ["supervisor", "group_supervisor"] ->
+        if supervisor_lead?(chat_id, team_run_id, worker.handle) do
+          clear_bridge_team_run(chat_id, team_run_id)
+        else
+          :ok
+        end
 
       is_nil(requester_user_id) ->
         clear_bridge_team_run(chat_id, team_run_id)
@@ -1122,6 +1606,43 @@ defmodule Vibe.AI.LocalAgentWorker do
         dispatch_next_team_worker(chat_id, team_run_id, worker, requester_user_id)
     end
   end
+
+  defp team_run_mode(chat_id, team_run_id) when is_binary(chat_id) and is_binary(team_run_id) do
+    ensure_team_run_table()
+
+    case :ets.lookup(@team_run_table, {chat_id, team_run_id}) do
+      [{{^chat_id, ^team_run_id}, state}] -> Map.get(state, :mode)
+      _ ->
+        case Repo.get(TeamRun, team_run_id) do
+          %TeamRun{mode: mode} -> mode
+          _ -> nil
+        end
+    end
+  rescue
+    _ -> nil
+  end
+
+  defp team_run_mode(_, _), do: nil
+
+  defp supervisor_lead?(chat_id, team_run_id, handle)
+       when is_binary(chat_id) and is_binary(team_run_id) and is_binary(handle) do
+    ensure_team_run_table()
+
+    case :ets.lookup(@team_run_table, {chat_id, team_run_id}) do
+      [{{^chat_id, ^team_run_id}, state}] ->
+        Map.get(state, :lead_worker) == handle
+
+      _ ->
+        case Repo.get(TeamRun, team_run_id) do
+          %TeamRun{lead_worker: lead} -> lead == handle
+          _ -> false
+        end
+    end
+  rescue
+    _ -> false
+  end
+
+  defp supervisor_lead?(_, _, _), do: false
 
   defp dispatch_next_team_worker(chat_id, team_run_id, completed_worker, requester_user_id) do
     ensure_team_run_table()
@@ -1440,10 +1961,18 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
-  defp team_worker_default_focus("claude"), do: "lead review, debugging, risk analysis, and handoff quality"
-  defp team_worker_default_focus("codex"), do: "focused implementation, backend/data work, and verification"
-  defp team_worker_default_focus("grok"), do: "fast investigation, current-context checks, and independent review"
-  defp team_worker_default_focus("agy"), do: "UI, visual/product behavior, and cross-platform review"
+  defp team_worker_default_focus("codex"),
+    do: "lead coordination, focused implementation, backend/data work, and verification"
+
+  defp team_worker_default_focus("claude"),
+    do: "review, debugging, risk analysis, and handoff quality"
+
+  defp team_worker_default_focus("grok"),
+    do: "fast investigation, current-context checks, and independent review"
+
+  defp team_worker_default_focus("agy"),
+    do: "UI, visual/product behavior, JSX/frontend polish, and cross-platform review"
+
   defp team_worker_default_focus(_), do: "the highest-value unowned slice"
 
   defp context_or_empty(""), do: "No previous shared group memory yet."
@@ -1534,6 +2063,34 @@ defmodule Vibe.AI.LocalAgentWorker do
         # only recovering turns the user happened to open History on.
         session_id = session_id_from_output(accumulated_output)
 
+        team_run_id = metadata["teamRunId"] || metadata[:team_run_id]
+        team_mode = metadata["teamMode"] || metadata[:team_mode]
+        suppress_visible? =
+          truthy_opt?(metadata["suppressVisible"] || metadata[:suppress_visible])
+
+        live_nodes =
+          live_progress_nodes(worker, extracted)
+          |> mark_latest_progress_node_running()
+
+        last_label =
+          live_nodes
+          |> List.last()
+          |> case do
+            %{"label" => label} when is_binary(label) and label != "" -> label
+            _ -> "working"
+          end
+
+        worker_status_list =
+          if is_binary(team_run_id) do
+            update_team_worker_state(chat_id, team_run_id, worker.handle, %{
+              "status" => "running",
+              "last_label" => String.slice(last_label, 0, 80),
+              "task_id" => metadata["taskId"] || metadata[:task_id]
+            })
+          else
+            []
+          end
+
         payload =
           %{
             "chatId" => chat_id,
@@ -1551,9 +2108,7 @@ defmodule Vibe.AI.LocalAgentWorker do
             # renders this feed as the single source of truth and suppresses the separate
             # answer body, so the in-progress answer tail must ride here too (hence
             # live_progress_nodes, which keeps the tail the finished path drops).
-            "progressNodes" =>
-              live_progress_nodes(worker, extracted)
-              |> mark_latest_progress_node_running(),
+            "progressNodes" => live_nodes,
             "toolEvents" => extracted.tool_events,
             "status" => "running"
           }
@@ -1581,17 +2136,41 @@ defmodule Vibe.AI.LocalAgentWorker do
           )
           |> maybe_put("serverBroadcastAtMs", System.system_time(:millisecond))
           |> maybe_put("sequence", metadata["sequence"] || metadata[:sequence])
-          |> maybe_put("teamMode", metadata["teamMode"] || metadata[:team_mode])
-          |> maybe_put("teamRunId", metadata["teamRunId"] || metadata[:team_run_id])
+          |> maybe_put("teamMode", team_mode)
+          |> maybe_put("teamRunId", team_run_id)
           |> maybe_put("teamWorker", metadata["teamWorker"] || metadata[:team_worker])
           |> maybe_put(
             "teamWorkers",
             normalize_team_workers(metadata["teamWorkers"] || metadata[:team_workers])
           )
+          |> maybe_put("leadWorker", metadata["leadWorker"] || metadata[:lead_worker])
+          |> maybe_put("teamRole", metadata["teamRole"] || metadata[:team_role])
+          |> maybe_put("suppressVisible", if(suppress_visible?, do: true))
+          |> maybe_put("teamWorkersStatus", worker_status_list)
           |> maybe_put("computerId", metadata["computerId"] || metadata[:computer_id])
           |> maybe_put("computerLabel", metadata["computerLabel"] || metadata[:computer_label])
 
+        # Under-hood workers still emit agent-stream so the sheet can show their
+        # full payload when opened, but iOS must not insert a second list cell.
         VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-stream", payload)
+
+        if suppress_visible? and is_binary(team_run_id) do
+          VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-team-worker", %{
+            "chatId" => chat_id,
+            "teamRunId" => team_run_id,
+            "teamMode" => team_mode || "supervisor",
+            "teamWorker" => worker.handle,
+            "leadWorker" => metadata["leadWorker"] || metadata[:lead_worker],
+            "agentUserId" => worker.agent_user_id,
+            "agentName" => worker.label,
+            "status" => "running",
+            "lastLabel" => last_label,
+            "teamWorkersStatus" => worker_status_list,
+            "suppressVisible" => true,
+            "progressNodes" => live_nodes,
+            "taskId" => metadata["taskId"] || metadata[:task_id]
+          })
+        end
 
         :ok
     end
@@ -4331,6 +4910,10 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp normalize_runtime_controls(_), do: nil
 
   defp normalize_team_metadata(opts) do
+    suppress? =
+      Keyword.get(opts, :suppress_visible) == true or
+        truthy_opt?(Keyword.get(opts, :suppress_visible))
+
     %{}
     |> maybe_put("agentWorkerTeamMode", normalize_string(Keyword.get(opts, :team_mode)))
     |> maybe_put("agentWorkerTeamRunId", normalize_string(Keyword.get(opts, :team_run_id)))
@@ -4339,18 +4922,30 @@ defmodule Vibe.AI.LocalAgentWorker do
       "agentWorkerTeamWorkers",
       normalize_team_workers(Keyword.get(opts, :team_workers))
     )
+    |> maybe_put("agentWorkerLeadWorker", normalize_string(Keyword.get(opts, :lead_worker)))
+    |> maybe_put("agentWorkerTeamRole", normalize_string(Keyword.get(opts, :team_role)))
+    |> maybe_put("suppressVisible", if(suppress?, do: true))
+    |> maybe_put("agentWorkerSuppressVisible", if(suppress?, do: true))
     |> maybe_put("agentBridgeComputerId", normalize_string(Keyword.get(opts, :computer_id)))
     |> maybe_put("agentBridgeComputerLabel", normalize_string(Keyword.get(opts, :computer_label)))
   end
 
   defp merge_team_runtime(runtime, opts) do
-    team = %{}
-    |> maybe_put("teamMode", normalize_string(Keyword.get(opts, :team_mode)))
-    |> maybe_put("teamRunId", normalize_string(Keyword.get(opts, :team_run_id)))
-    |> maybe_put("teamWorker", normalize_string(Keyword.get(opts, :team_worker)))
-    |> maybe_put("teamWorkers", normalize_team_workers(Keyword.get(opts, :team_workers)))
-    |> maybe_put("computerId", normalize_string(Keyword.get(opts, :computer_id)))
-    |> maybe_put("computerLabel", normalize_string(Keyword.get(opts, :computer_label)))
+    suppress? =
+      Keyword.get(opts, :suppress_visible) == true or
+        truthy_opt?(Keyword.get(opts, :suppress_visible))
+
+    team =
+      %{}
+      |> maybe_put("teamMode", normalize_string(Keyword.get(opts, :team_mode)))
+      |> maybe_put("teamRunId", normalize_string(Keyword.get(opts, :team_run_id)))
+      |> maybe_put("teamWorker", normalize_string(Keyword.get(opts, :team_worker)))
+      |> maybe_put("teamWorkers", normalize_team_workers(Keyword.get(opts, :team_workers)))
+      |> maybe_put("leadWorker", normalize_string(Keyword.get(opts, :lead_worker)))
+      |> maybe_put("teamRole", normalize_string(Keyword.get(opts, :team_role)))
+      |> maybe_put("suppressVisible", if(suppress?, do: true))
+      |> maybe_put("computerId", normalize_string(Keyword.get(opts, :computer_id)))
+      |> maybe_put("computerLabel", normalize_string(Keyword.get(opts, :computer_label)))
 
     cond do
       map_size(team) == 0 -> runtime

@@ -689,6 +689,15 @@ defmodule Vibe.AgentBridge do
             task["teamWorkers"] || task[:teamWorkers] || task["team_workers"] ||
               task[:team_workers]
           ),
+        "leadWorker" =>
+          normalize(
+            task["leadWorker"] || task[:leadWorker] || task["lead_worker"] || task[:lead_worker]
+          ),
+        "teamRole" =>
+          normalize(task["teamRole"] || task[:teamRole] || task["team_role"] || task[:team_role]),
+        "suppressVisible" =>
+          task["suppressVisible"] == true or task[:suppressVisible] == true or
+            task["suppress_visible"] == true or task[:suppress_visible] == true,
         "computerId" =>
           normalize(
             task["computerId"] || task[:computerId] || task["computer_id"] ||

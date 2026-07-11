@@ -3547,7 +3547,15 @@ async function refreshExternalCodexActivity() {
 
 function teamFieldsForTask(task) {
   if (!task || typeof task !== "object") {
-    return { teamMode: null, teamRunId: null, teamWorker: null, teamWorkers: [] };
+    return {
+      teamMode: null,
+      teamRunId: null,
+      teamWorker: null,
+      teamWorkers: [],
+      leadWorker: null,
+      teamRole: null,
+      suppressVisible: false,
+    };
   }
   return {
     teamMode: task.teamMode || task.team_mode || null,
@@ -3558,6 +3566,13 @@ function teamFieldsForTask(task) {
       : Array.isArray(task.team_workers)
         ? task.team_workers
         : [],
+    leadWorker: task.leadWorker || task.lead_worker || null,
+    teamRole: task.teamRole || task.team_role || null,
+    suppressVisible:
+      task.suppressVisible === true ||
+      task.suppress_visible === true ||
+      task.teamRole === "worker" ||
+      task.team_role === "worker",
   };
 }
 
@@ -4072,14 +4087,7 @@ async function runTask(channel, task) {
     speed: speedFor(task),
     reasoningEffort: reasoningEffortFor(provider, task),
     command: compactCommand(built.cmd, built.args),
-    teamMode: task.teamMode || task.team_mode || null,
-    teamRunId: task.teamRunId || task.team_run_id || null,
-    teamWorker: task.teamWorker || task.team_worker || null,
-    teamWorkers: Array.isArray(task.teamWorkers)
-      ? task.teamWorkers
-      : Array.isArray(task.team_workers)
-        ? task.team_workers
-        : [],
+    ...teamFieldsForTask(task),
     startedAt,
     frameSeq: 0,
     lastAckedSeq: -1,
@@ -4101,14 +4109,7 @@ async function runTask(channel, task) {
     intelligence: intelligenceFor(task),
     speed: speedFor(task),
     reasoningEffort: reasoningEffortFor(provider, task),
-    teamMode: task.teamMode || task.team_mode || null,
-    teamRunId: task.teamRunId || task.team_run_id || null,
-    teamWorker: task.teamWorker || task.team_worker || null,
-    teamWorkers: Array.isArray(task.teamWorkers)
-      ? task.teamWorkers
-      : Array.isArray(task.team_workers)
-        ? task.team_workers
-        : [],
+    ...teamFieldsForTask(task),
     stage: "started",
     command: compactCommand(built.cmd, built.args),
     line: JSON.stringify({
@@ -4125,6 +4126,7 @@ async function runTask(channel, task) {
       speed: speedFor(task),
       reasoningEffort: reasoningEffortFor(provider, task),
       command: compactCommand(built.cmd, built.args),
+      ...teamFieldsForTask(task),
     }),
   });
   let output = "";
@@ -9384,8 +9386,9 @@ process.stdin.on("end", () => {
     probe.on("error", () => finish(() => emit("ask", "Vibe bridge unreachable — asking here.")));
     return;
   }
-  const timer = setTimeout(() => finish(() => emit("ask", "Vibe: no response from your phone — approve here.")), 180000);
-  if (timer.unref) timer.unref();
+  // Wait for an explicit phone decision. A local timeout silently turns a mobile
+  // approval into a desktop prompt while the phone is backgrounded/reconnecting.
+  const timer = null;
   let buf = "";
   const conn = net.createConnection(SOCK, () => {
     conn.write(JSON.stringify({ type: "command", cwd: cwd, source: "hook", sessionId: ev.session_id || "", tool_name: toolName, input: input }) + "\\n");
@@ -9420,8 +9423,8 @@ const DEFAULT_AGENT_CONFIG_TOML = `# Vibe agent config — controls how Claude C
 #
 # approval_mode:
 #   "local"  -> DEFAULT. Approve / answer everything on THIS device only (no phone).
-#   "mobile" -> Everything not auto-allowed is sent to your phone (falls back to a
-#               local prompt after 3 min or if the bridge is down, so nothing hangs).
+#   "mobile" -> Everything not auto-allowed is sent to your phone and stays pending
+#               until answered; if the bridge is down it falls back locally.
 #   "auto"   -> Safe / allow-listed commands run WITHOUT asking; only blockers go to
 #               the phone. Closest to how Codex feels day to day.
 #   "both"   -> Like "auto", but a blocker shows on the desk AND the phone at once
@@ -9447,7 +9450,7 @@ deny = []
 // stable socket WITHOUT a chatId (it isn't a bridge run). Route it to the mobile
 // chat that most recently ran this provider in this repo (cwd), else the last chat
 // seen for the provider. Populated from run_task in runTask().
-const lastAgentChatByCwd = new Map(); // cwd -> { chatId, provider }
+const lastAgentChatByCwd = new Map(); // cwd -> { chatId, provider, byProvider }
 const lastAgentChatByProvider = new Map(); // provider -> chatId
 const AGENT_CHATS_FILE = path.join(CONFIG_DIR, "agent-chats.json");
 // Persist the repo/provider→chat map so interactive routing works IMMEDIATELY after
@@ -9474,13 +9477,36 @@ function rememberAgentChat(provider, chatId, cwd) {
   if (!chatId) return;
   if (provider) lastAgentChatByProvider.set(provider, chatId);
   const key = realDir(cwd || "") || cwd;
-  if (key) lastAgentChatByCwd.set(key, { chatId, provider });
+  if (key) {
+    const existing = lastAgentChatByCwd.get(key) || {};
+    const byProvider =
+      existing.byProvider && typeof existing.byProvider === "object"
+        ? { ...existing.byProvider }
+        : {};
+    if (existing.provider && existing.chatId && !byProvider[existing.provider]) {
+      byProvider[existing.provider] = existing.chatId;
+    }
+    if (provider) byProvider[provider] = chatId;
+    lastAgentChatByCwd.set(key, { chatId, provider, byProvider });
+  }
   saveAgentChats();
 }
 function resolveInteractiveChat(cwd, provider) {
   const key = realDir(cwd || "") || cwd;
-  if (key && lastAgentChatByCwd.has(key)) return lastAgentChatByCwd.get(key).chatId;
-  if (provider && lastAgentChatByProvider.has(provider)) return lastAgentChatByProvider.get(provider);
+  const wantedProvider = provider ? String(provider).toLowerCase() : "";
+  const cwdRecord = key && lastAgentChatByCwd.has(key) ? lastAgentChatByCwd.get(key) : null;
+  if (cwdRecord && wantedProvider) {
+    const byProvider =
+      cwdRecord.byProvider && typeof cwdRecord.byProvider === "object"
+        ? cwdRecord.byProvider
+        : {};
+    if (byProvider[wantedProvider]) return byProvider[wantedProvider];
+    if (String(cwdRecord.provider || "").toLowerCase() === wantedProvider && cwdRecord.chatId) {
+      return cwdRecord.chatId;
+    }
+  }
+  if (wantedProvider && lastAgentChatByProvider.has(wantedProvider)) return lastAgentChatByProvider.get(wantedProvider);
+  if (cwdRecord && cwdRecord.chatId) return cwdRecord.chatId;
   // Last resort: any known agent chat (single-agent DM setups share one chatId).
   const first = lastAgentChatByProvider.values().next();
   return first && !first.done ? first.value : null;

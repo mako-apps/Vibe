@@ -143,6 +143,12 @@ defmodule VibeWeb.AgentBridgeChannel do
           payload["teamWorker"] || payload["team_worker"] || Map.get(state, :team_worker),
         team_workers:
           payload["teamWorkers"] || payload["team_workers"] || Map.get(state, :team_workers),
+        lead_worker:
+          payload["leadWorker"] || payload["lead_worker"] || Map.get(state, :lead_worker),
+        team_role: payload["teamRole"] || payload["team_role"] || Map.get(state, :team_role),
+        suppress_visible:
+          payload["suppressVisible"] == true or payload["suppress_visible"] == true or
+            Map.get(state, :suppress_visible) == true,
         computer_id:
           payload["computerId"] || payload["computer_id"] || Map.get(state, :computer_id),
         computer_label:
@@ -169,6 +175,9 @@ defmodule VibeWeb.AgentBridgeChannel do
       team_run_id: state.team_run_id,
       team_worker: state.team_worker,
       team_workers: state.team_workers,
+      lead_worker: state.lead_worker,
+      team_role: state.team_role,
+      suppress_visible: state.suppress_visible,
       computer_id: state.computer_id,
       computer_label: state.computer_label
     })
@@ -239,6 +248,11 @@ defmodule VibeWeb.AgentBridgeChannel do
             team_run_id: payload["teamRunId"] || payload["team_run_id"],
             team_worker: payload["teamWorker"] || payload["team_worker"],
             team_workers: payload["teamWorkers"] || payload["team_workers"],
+            lead_worker: payload["leadWorker"] || payload["lead_worker"],
+            team_role: payload["teamRole"] || payload["team_role"],
+            suppress_visible:
+              payload["suppressVisible"] == true or payload["suppress_visible"] == true,
+            task_id: payload["taskId"] || payload["task_id"],
             computer_id: payload["computerId"] || payload["computer_id"],
             computer_label: payload["computerLabel"] || payload["computer_label"],
             usage_limit_hit:

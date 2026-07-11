@@ -144,6 +144,58 @@ struct ChatListRow {
     let status: String?
   }
 
+  /// Compact status for one under-hood (or lead) worker in a supervisor team run.
+  struct TeamWorkerStatus: Equatable {
+    let worker: String
+    let label: String
+    let status: String
+    let startedAt: Int64?
+    let finishedAt: Int64?
+    let durationMs: Int?
+    let summary: String?
+    let taskId: String?
+    let lastLabel: String?
+
+    var isRunning: Bool {
+      let s = status.lowercased()
+      return s == "running" || s == "pending" || s == "starting"
+    }
+
+    /// Compact chip text: "Claude · running · reading" or "Grok · done · 2m".
+    var compactLine: String {
+      let name = label.isEmpty ? worker.capitalized : label
+      let s = status.lowercased()
+      if s == "done" || s == "completed" {
+        if let ms = durationMs, ms > 0 {
+          return "\(name) · done · \(Self.formatDuration(ms))"
+        }
+        return "\(name) · done"
+      }
+      if s == "failed" || s == "error" {
+        return "\(name) · failed"
+      }
+      if s == "skipped" {
+        return "\(name) · skipped"
+      }
+      if let last = lastLabel, !last.isEmpty {
+        let short = last.count > 28 ? String(last.prefix(28)) + "…" : last
+        return "\(name) · \(s.isEmpty ? "running" : s) · \(short)"
+      }
+      return "\(name) · \(s.isEmpty ? "running" : s)"
+    }
+
+    static func formatDuration(_ ms: Int) -> String {
+      let totalSec = max(0, ms / 1000)
+      if totalSec < 60 { return "\(totalSec)s" }
+      let m = totalSec / 60
+      let s = totalSec % 60
+      if m < 60 { return s == 0 ? "\(m)m" : "\(m)m \(s)s" }
+      let h = m / 60
+      let rm = m % 60
+      return rm == 0 ? "\(h)h" : "\(h)h \(rm)m"
+    }
+  }
+
   struct AgentRuntimeSummary: Equatable {
     let taskId: String?
     let provider: String?
@@ -176,8 +228,19 @@ struct ChatListRow {
     let teamRunId: String?
     let teamWorker: String?
     let teamWorkers: [String]
+    let leadWorker: String?
+    let teamRole: String?
+    let suppressVisible: Bool
+    let teamWorkersStatus: [TeamWorkerStatus]
     let computerId: String?
     let computerLabel: String?
+
+    /// One-line strip for the lead cell: "Claude · running · … · Grok · done · 2m"
+    var teamProgressStrip: String? {
+      guard !teamWorkersStatus.isEmpty else { return nil }
+      let parts = teamWorkersStatus.map(\.compactLine)
+      return parts.joined(separator: "  ·  ")
+    }
   }
 
   struct AgentCardDestination: Codable, Equatable {
@@ -951,7 +1014,10 @@ struct ChatListRow {
     let rawAgentRuntimeForLog =
       metadata?["agentRuntime"] ?? metadata?["agent_runtime"] ?? message["agentRuntime"]
         ?? message["agent_runtime"]
-    if metadata?["agentWorker"] != nil || rawAgentRuntimeForLog != nil {
+    // Probe only under -VibeVerboseLogs: this init runs for EVERY agent row on EVERY
+    // setRows pass, and an always-on NSLog here (hundreds per streamed frame) is a
+    // measurable share of the main-thread stall users feel as list jank.
+    if VibeDebugLog.verboseEnabled, metadata?["agentWorker"] != nil || rawAgentRuntimeForLog != nil {
       NSLog(
         "[AgentView] rowparse msg=\(parseNonEmptyString(message["id"] ?? message["messageId"]) ?? "?") "
           + "agentWorker=\(metadata?["agentWorker"] ?? "nil") via=\(metadata?["agentWorkerVia"] ?? "nil") "
@@ -963,7 +1029,9 @@ struct ChatListRow {
     // Falls back to the legacy plaintext `agentRuntime` for older messages.
     let decryptedRuntime = AgentRuntimeCrypto.decrypt(
       metadata?["agentRuntimeEnc"] ?? message["agentRuntimeEnc"])
-    if metadata?["agentRuntimeEnc"] != nil || message["agentRuntimeEnc"] != nil {
+    if VibeDebugLog.verboseEnabled,
+      metadata?["agentRuntimeEnc"] != nil || message["agentRuntimeEnc"] != nil
+    {
       NSLog(
         "[AgentView] rowparse enc present decrypted=\(decryptedRuntime != nil) hasKey=\(AgentRuntimeCrypto.hasKey)"
       )
@@ -1450,8 +1518,8 @@ private func parseAgentProgressNodes(_ raw: Any?) -> [ChatListRow.AgentProgressN
   // DIAGNOSTIC (text-in-live-feed): one summary per parse — how many text nodes
   // survived vs. were dropped. textKept=0 with raw>0 means the prose never arrives
   // as a node at all (it's in the message body, suppressed mid-stream).
-  let textKept = nodes.filter { $0.kind == "text" }.count
-  if !items.isEmpty {
+  if VibeDebugLog.verboseEnabled, !items.isEmpty {
+    let textKept = nodes.filter { $0.kind == "text" }.count
     NSLog(
       "[AgentNodes] parsed raw=%d kept=%d textKept=%d dropped=[%@] kinds=[%@]",
       items.count, nodes.count, textKept, dropped.joined(separator: ","),
@@ -1505,9 +1573,36 @@ func parseAgentRuntimeSummary(_ raw: Any?) -> ChatListRow.AgentRuntimeSummary? {
     teamRunId: parseNonEmptyString(object["teamRunId"] ?? object["team_run_id"]),
     teamWorker: parseNonEmptyString(object["teamWorker"] ?? object["team_worker"]),
     teamWorkers: parseStringArray(object["teamWorkers"] ?? object["team_workers"]),
+    leadWorker: parseNonEmptyString(object["leadWorker"] ?? object["lead_worker"]),
+    teamRole: parseNonEmptyString(object["teamRole"] ?? object["team_role"]),
+    suppressVisible: parseBool(object["suppressVisible"] ?? object["suppress_visible"]) ?? false,
+    teamWorkersStatus: parseTeamWorkersStatus(
+      object["teamWorkersStatus"] ?? object["team_workers_status"]),
     computerId: parseNonEmptyString(object["computerId"] ?? object["computer_id"]),
     computerLabel: parseNonEmptyString(object["computerLabel"] ?? object["computer_label"])
   )
+}
+
+func parseTeamWorkersStatus(_ raw: Any?) -> [ChatListRow.TeamWorkerStatus] {
+  guard let list = raw as? [[String: Any]] else { return [] }
+  return list.compactMap { object in
+    guard let worker = parseNonEmptyString(object["worker"] ?? object["handle"]) else {
+      return nil
+    }
+    let label =
+      parseNonEmptyString(object["label"] ?? object["name"]) ?? worker.capitalized
+    return ChatListRow.TeamWorkerStatus(
+      worker: worker,
+      label: label,
+      status: parseNonEmptyString(object["status"]) ?? "pending",
+      startedAt: parseLong(object["startedAt"] ?? object["started_at"]),
+      finishedAt: parseLong(object["finishedAt"] ?? object["finished_at"]),
+      durationMs: parseLong(object["durationMs"] ?? object["duration_ms"]).map { Int($0) },
+      summary: parseNonEmptyString(object["summary"]),
+      taskId: parseNonEmptyString(object["taskId"] ?? object["task_id"]),
+      lastLabel: parseNonEmptyString(object["lastLabel"] ?? object["last_label"])
+    )
+  }
 }
 
 private func parseAgentRuntimeCommand(_ raw: Any?) -> ChatListRow.AgentRuntimeCommand? {

@@ -512,6 +512,7 @@ final class AgentRuntimeSummaryView: UIView {
   private let commandLabel = UILabel()
   private let dirtyLabel = UILabel()
   private let moreLabel = UILabel()
+  private let teamStripLabel = UILabel()
   private var fileRows: [FileRowView] = []
   private var runtime: ChatListRow.AgentRuntimeSummary?
   private var textColor: UIColor = .label
@@ -532,10 +533,13 @@ final class AgentRuntimeSummaryView: UIView {
     backgroundView.layer.borderColor = UIColor.separator.withAlphaComponent(0.25).cgColor
     addSubview(backgroundView)
 
-    [headerContainer, separatorView, commandLabel, dirtyLabel, moreLabel].forEach {
+    [headerContainer, separatorView, commandLabel, dirtyLabel, moreLabel, teamStripLabel].forEach {
       $0.backgroundColor = .clear
       addSubview($0)
     }
+    teamStripLabel.font = UIFont.systemFont(ofSize: 12, weight: .medium)
+    teamStripLabel.numberOfLines = 2
+    teamStripLabel.lineBreakMode = .byTruncatingTail
     
     [titleLabel, titleStatsLabel, chevronImageView, reviewContainer].forEach {
       $0.backgroundColor = .clear
@@ -583,11 +587,13 @@ final class AgentRuntimeSummaryView: UIView {
 
   static func measuredHeight(runtime: ChatListRow.AgentRuntimeSummary, availableWidth: CGFloat, isExpanded: Bool) -> CGFloat {
     _ = availableWidth
+    let teamStripExtra: CGFloat =
+      (runtime.teamProgressStrip?.isEmpty == false) ? 28 : 0
     if !isExpanded {
-      return 12 + 36 + 12
+      return 12 + 36 + teamStripExtra + 12
     }
     let files = runtime.diff?.files ?? []
-    var height: CGFloat = 12 + 36 + 1 + 9
+    var height: CGFloat = 12 + 36 + teamStripExtra + 1 + 9
     height += CGFloat(min(files.count, 4)) * 32
     height += 3
     
@@ -617,7 +623,16 @@ final class AgentRuntimeSummaryView: UIView {
     let diff = runtime.diff
     let filesChanged = diff?.filesChanged ?? 0
     
-    titleLabel.text = filesChanged == 1 ? "1 file changed" : "\(filesChanged) files changed"
+    if let strip = runtime.teamProgressStrip, !strip.isEmpty {
+      titleLabel.text = runtime.status == "running" ? "Team working" : "Team finished"
+      teamStripLabel.text = strip
+      teamStripLabel.isHidden = false
+      teamStripLabel.textColor = textColor.withAlphaComponent(0.72)
+    } else {
+      titleLabel.text = filesChanged == 1 ? "1 file changed" : "\(filesChanged) files changed"
+      teamStripLabel.text = nil
+      teamStripLabel.isHidden = true
+    }
     titleLabel.textColor = textColor.withAlphaComponent(0.8)
     
     let font = UIFont.systemFont(ofSize: 14, weight: .regular)
@@ -709,6 +724,15 @@ final class AgentRuntimeSummaryView: UIView {
     reviewLabel.frame = CGRect(x: reviewIcon.frame.maxX + 6, y: 0, width: reviewLabel.frame.width, height: reviewH)
     
     y += 36
+
+    if !teamStripLabel.isHidden {
+      let stripH = teamStripLabel.sizeThatFits(CGSize(width: width, height: 40)).height
+      let h = max(18, min(36, stripH))
+      teamStripLabel.frame = CGRect(x: inset, y: y + 2, width: width, height: h)
+      y += h + 6
+    } else {
+      teamStripLabel.frame = .zero
+    }
     
     if !isExpanded { return }
     
