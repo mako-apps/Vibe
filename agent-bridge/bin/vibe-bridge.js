@@ -2501,6 +2501,256 @@ function fmtResetIn(iso) {
   return `resets in ${m}m`;
 }
 
+// ── Grok (xAI) subscription usage ────────────────────────────────────
+// Live: GET https://cli-chat-proxy.grok.com/v1/billing?format=credits
+// with Bearer from ~/.grok/auth.json (same token the CLI uses). Fallback:
+// parse the latest "billing: fetched credits config" line from
+// ~/.grok/logs/unified.jsonl. Returns { buckets, tier } or null.
+let grokUtilCache = { at: 0, data: null };
+async function fetchGrokUtilization() {
+  if (grokUtilCache.data && Date.now() - grokUtilCache.at < 45000) return grokUtilCache.data;
+  let token = null;
+  try {
+    const raw = fs.readFileSync(path.join(os.homedir(), ".grok", "auth.json"), "utf8");
+    const parsed = JSON.parse(raw);
+    const entry = parsed && typeof parsed === "object" ? Object.values(parsed)[0] : null;
+    token = entry && (entry.key || entry.access_token || entry.accessToken);
+  } catch (_) {
+    token = null;
+  }
+  if (token) {
+    try {
+      const res = await fetch("https://cli-chat-proxy.grok.com/v1/billing?format=credits", {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/json",
+          "User-Agent": "GrokBuild/0.2.93",
+          "x-grok-client-version": "0.2.93",
+        },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const cfg = (data && data.config) || data || {};
+        const buckets = grokConfigToBuckets(cfg);
+        if (buckets.length) {
+          const out = {
+            buckets,
+            tier: (data && data.ctx && data.ctx.subscriptionTier) || null,
+          };
+          // subscriptionTier is on log lines; API may put it elsewhere
+          if (data && data.subscriptionTier) out.tier = data.subscriptionTier;
+          grokUtilCache = { at: Date.now(), data: out };
+          lastRateLimitsByProvider.set("grok", { at: Date.now(), buckets });
+          return out;
+        }
+      }
+    } catch (_) {
+      /* fall through to log parse */
+    }
+  }
+  const disk = fetchGrokUtilizationFromLog();
+  if (disk) {
+    grokUtilCache = { at: Date.now(), data: disk };
+    lastRateLimitsByProvider.set("grok", { at: Date.now(), buckets: disk.buckets });
+    return disk;
+  }
+  return null;
+}
+
+function grokConfigToBuckets(cfg) {
+  if (!cfg || typeof cfg !== "object") return [];
+  const buckets = [];
+  const period = cfg.currentPeriod || {};
+  const resetsAt = period.end || cfg.billingPeriodEnd || null;
+  const periodType = String(period.type || "").toUpperCase();
+  let periodLabel = "7-day (weekly)";
+  if (periodType.includes("MONTH")) periodLabel = "Monthly";
+  else if (periodType.includes("DAY") && !periodType.includes("WEEK")) periodLabel = "Daily";
+  else if (periodType.includes("HOUR") || periodType.includes("5H")) periodLabel = "5-hour session";
+
+  const pct = Number(cfg.creditUsagePercent);
+  if (Number.isFinite(pct)) {
+    buckets.push({
+      label: periodLabel,
+      utilization: Math.round(pct),
+      resetsAt: typeof resetsAt === "string" ? resetsAt : null,
+    });
+  }
+  // Per-product breakdown when present (e.g. GrokBuild vs Api).
+  if (Array.isArray(cfg.productUsage)) {
+    for (const p of cfg.productUsage) {
+      if (!p || typeof p !== "object") continue;
+      const name = String(p.product || "").trim();
+      const up = Number(p.usagePercent);
+      if (!name || !Number.isFinite(up)) continue;
+      // Skip if same as overall weekly already pushed.
+      if (name.toLowerCase() === "grokbuild" && buckets.length) continue;
+      buckets.push({
+        label: `${name} usage`,
+        utilization: Math.round(up),
+        resetsAt: typeof resetsAt === "string" ? resetsAt : null,
+      });
+    }
+  }
+  return buckets;
+}
+
+function fetchGrokUtilizationFromLog() {
+  try {
+    const logPath = path.join(os.homedir(), ".grok", "logs", "unified.jsonl");
+    if (!fs.existsSync(logPath)) return null;
+    const st = fs.statSync(logPath);
+    const size = Math.min(st.size, 512 * 1024);
+    const fd = fs.openSync(logPath, "r");
+    const buf = Buffer.alloc(size);
+    fs.readSync(fd, buf, 0, size, Math.max(0, st.size - size));
+    fs.closeSync(fd);
+    const lines = buf.toString("utf8").split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i];
+      if (!line || !line.includes("creditUsagePercent")) continue;
+      let obj;
+      try {
+        obj = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const cfg =
+        (obj && obj.ctx && obj.ctx.config) ||
+        (obj && obj.config) ||
+        null;
+      if (!cfg) continue;
+      const buckets = grokConfigToBuckets(cfg);
+      if (!buckets.length) continue;
+      return {
+        buckets,
+        tier: (obj.ctx && obj.ctx.subscriptionTier) || null,
+      };
+    }
+  } catch (_) {
+    /* */
+  }
+  return null;
+}
+
+// ── Agy / Antigravity (Google Cloud Code) quota ──────────────────────
+// Live: POST cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary
+// with the consumer OAuth token from macOS Keychain service "gemini" /
+// account "antigravity" (go-keyring-base64 JSON). Summary groups expose
+// "Five Hour Limit" + "Weekly Limit" with remainingFraction + resetTime.
+let agyUtilCache = { at: 0, data: null };
+async function fetchAgyUtilization() {
+  if (agyUtilCache.data && Date.now() - agyUtilCache.at < 45000) return agyUtilCache.data;
+  const token = readAgyAccessToken();
+  if (!token) return null;
+  try {
+    const res = await fetch(
+      "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          "User-Agent": "antigravity",
+        },
+        body: "{}",
+        signal: AbortSignal.timeout(12000),
+      }
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const buckets = agySummaryToBuckets(data);
+    if (!buckets.length) return null;
+    const out = { buckets };
+    agyUtilCache = { at: Date.now(), data: out };
+    lastRateLimitsByProvider.set("agy", { at: Date.now(), buckets });
+    return out;
+  } catch (_) {
+    return null;
+  }
+}
+
+function readAgyAccessToken() {
+  // 1) Keychain (preferred — live CLI session token)
+  try {
+    const raw = execFileSync(
+      "security",
+      ["find-generic-password", "-s", "gemini", "-a", "antigravity", "-w"],
+      { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"] }
+    ).trim();
+    let jsonStr = raw;
+    if (raw.startsWith("go-keyring-base64:")) {
+      jsonStr = Buffer.from(raw.slice("go-keyring-base64:".length), "base64").toString("utf8");
+    }
+    const parsed = JSON.parse(jsonStr);
+    const tok = (parsed && parsed.token) || parsed || {};
+    if (tok.access_token) return tok.access_token;
+  } catch (_) {
+    /* */
+  }
+  // 2) ~/.gemini/oauth_creds.json fallback
+  try {
+    const raw = fs.readFileSync(path.join(os.homedir(), ".gemini", "oauth_creds.json"), "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.access_token) return parsed.access_token;
+  } catch (_) {
+    /* */
+  }
+  return null;
+}
+
+function agySummaryToBuckets(data) {
+  if (!data || typeof data !== "object") return [];
+  const buckets = [];
+  const seen = new Set();
+  const push = (label, remainingFraction, resetTime) => {
+    const rem = Number(remainingFraction);
+    if (!Number.isFinite(rem)) return;
+    const util = Math.round(Math.max(0, Math.min(100, (1 - rem) * 100)));
+    const key = `${label}|${resetTime || ""}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    buckets.push({
+      label,
+      utilization: util,
+      resetsAt: typeof resetTime === "string" && resetTime ? resetTime : null,
+    });
+  };
+
+  // Preferred: grouped summary (Gemini Models / 3p models with 5h + weekly).
+  const groups = Array.isArray(data.groups) ? data.groups : [];
+  for (const g of groups) {
+    const groupName = String((g && g.displayName) || "").trim();
+    const list = (g && Array.isArray(g.buckets) && g.buckets) || [];
+    for (const b of list) {
+      if (!b || typeof b !== "object") continue;
+      const display = String(b.displayName || b.bucketId || "").trim();
+      const window = String(b.window || "").toLowerCase();
+      let label = display || "Usage";
+      if (window === "5h" || /five.?hour|5.?hour/i.test(display)) {
+        label = groupName ? `${groupName} · 5-hour` : "5-hour session";
+      } else if (window === "weekly" || /week/i.test(display)) {
+        label = groupName ? `${groupName} · weekly` : "7-day (weekly)";
+      } else if (groupName) {
+        label = `${groupName} · ${display || window || "limit"}`;
+      }
+      push(label, b.remainingFraction ?? b.remaining_fraction, b.resetTime || b.reset_time);
+    }
+  }
+
+  // Fallback: flat buckets from retrieveUserQuota (per-model).
+  if (!buckets.length && Array.isArray(data.buckets)) {
+    for (const b of data.buckets) {
+      if (!b || typeof b !== "object") continue;
+      const model = String(b.modelId || b.model_id || "").trim() || "model";
+      push(model, b.remainingFraction ?? b.remaining_fraction, b.resetTime || b.reset_time);
+    }
+  }
+  return buckets;
+}
+
 // Read the latest Codex rate_limits snapshot from on-disk session logs under
 // ~/.codex/sessions (and archived_sessions). Codex has no headless OAuth usage
 // endpoint like Claude; windows are written into every token_count event.
@@ -2665,15 +2915,12 @@ async function bridgeCommandOutput(provider, chatId, task, repo, command) {
           lines.push("(Subscription limits unavailable — sign in to Claude on this computer.)");
           lines.push("");
         }
-      } else if (provider === "codex") {
-        let buckets = (lastRateLimitsByProvider.get("codex") || {}).buckets;
-        if (!buckets || !buckets.length) {
-          const disk = fetchCodexUtilizationFromDisk();
-          buckets = disk && disk.buckets;
-        }
-        if (buckets && buckets.length) {
+      } else if (provider === "codex" || provider === "grok" || provider === "agy") {
+        // Reuse structured report so /usage text matches the phone sheet.
+        const structured = await buildUsageReport(provider, chatId, { chatId, provider });
+        if (structured.buckets && structured.buckets.length) {
           lines.push("Subscription limits:");
-          for (const b of buckets) {
+          for (const b of structured.buckets) {
             const reset = b.resetsAt ? fmtResetIn(b.resetsAt) : "";
             lines.push(
               `${b.label}: ${Math.round(Number(b.utilization) || 0)}% used${reset ? ` · ${reset}` : ""}`
@@ -8286,9 +8533,33 @@ async function buildUsageReport(provider, chatId, task) {
         report.limitMessage = cached.message || null;
       }
     }
+  } else if (provider === "grok") {
+    const util = await fetchGrokUtilization();
+    if (util && Array.isArray(util.buckets)) {
+      for (const b of util.buckets) {
+        if (!b || !b.label) continue;
+        report.buckets.push({
+          label: b.label,
+          utilization: Math.round(Number(b.utilization) || 0),
+          resetsAt: b.resetsAt || null,
+        });
+      }
+      if (util.tier) report.model = report.model || util.tier;
+    }
+  } else if (provider === "agy") {
+    const util = await fetchAgyUtilization();
+    if (util && Array.isArray(util.buckets)) {
+      for (const b of util.buckets) {
+        if (!b || !b.label) continue;
+        report.buckets.push({
+          label: b.label,
+          utilization: Math.round(Number(b.utilization) || 0),
+          resetsAt: b.resetsAt || null,
+        });
+      }
+    }
   } else {
-    // Grok / Agy — no public headless utilization endpoint. Use last stream /
-    // limit-hit cache when present; otherwise report only chat tokens.
+    // Unknown provider — stream / limit-hit cache only.
     const cached = lastRateLimitsByProvider.get(provider);
     if (cached && Array.isArray(cached.buckets) && cached.buckets.length) {
       for (const b of cached.buckets) {
