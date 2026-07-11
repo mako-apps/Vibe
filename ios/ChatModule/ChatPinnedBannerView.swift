@@ -1,5 +1,11 @@
 import UIKit
 
+/// Floating glass chip used for pin / usage banners.
+///
+/// Important for Liquid Glass (iOS 26+): a **single** `UIGlassEffect` owns the shell.
+/// Content (icon, labels, dots, close) lives inside `blurView.contentView` — never as
+/// sibling overlays outside the glass, and never as a second nested glass layer.
+/// Nesting or sibling chrome breaks the interactive "tab" refraction.
 final class ChatPinnedBannerView: UIControl {
   static let preferredHeight: CGFloat = 44.0
 
@@ -13,7 +19,7 @@ final class ChatPinnedBannerView: UIControl {
   private let bodyLabel = UILabel()
   private let textStack = UIStackView()
   private let closeButton = UIButton(type: .system)
-  /// Vertical page dots (left edge) for multi-agent usage carousel.
+  /// Vertical page dots (leading edge) for multi-agent usage carousel.
   private let pageDotsStack = UIStackView()
   private var pageDotViews: [UIView] = []
   private var isFilePinned = false
@@ -68,8 +74,8 @@ final class ChatPinnedBannerView: UIControl {
     setNeedsLayout()
   }
 
-  /// Multi-agent usage carousel: left-side vertical dots for page count/index.
-  /// Active dot expands in height (smooth pill). `count <= 1` hides the dots.
+  /// Multi-agent usage carousel: leading vertical dots for page count/index.
+  /// Active dot expands in height (thin pill). `count <= 1` hides the dots.
   func setPageIndicator(count: Int, index: Int, animated: Bool = true) {
     let nextCount = max(0, count)
     let nextIndex = nextCount == 0 ? 0 : min(max(0, index), nextCount - 1)
@@ -97,7 +103,7 @@ final class ChatPinnedBannerView: UIControl {
     }
   }
 
-  /// Slide only the inner content (icon + text) along Y — glass shell stays put, no fade.
+  /// Slide only the inner content (icon + text + dots) along Y — glass shell stays put, no fade.
   func animateContentTranslateY(from dy: CGFloat) {
     contentContainer.layer.removeAllAnimations()
     contentContainer.transform = CGAffineTransform(translationX: 0, y: dy)
@@ -114,8 +120,9 @@ final class ChatPinnedBannerView: UIControl {
 
   func applyTheme(textColor: UIColor, surfaceColor: UIColor, isDark: Bool) {
     self.textColor = textColor
+    // One glass shell only — never nest another effect or opaque fill under it.
     if #available(iOS 26.0, *) {
-      let glass = UIGlassEffect()
+      let glass = UIGlassEffect(style: .regular)
       glass.isInteractive = true
       blurView.effect = glass
       blurView.contentView.backgroundColor = .clear
@@ -123,13 +130,14 @@ final class ChatPinnedBannerView: UIControl {
       blurView.effect = UIBlurEffect(style: .systemThinMaterial)
       blurView.contentView.backgroundColor = surfaceColor.withAlphaComponent(isDark ? 0.16 : 0.10)
     }
-    // Glass shell stays fully opaque; only content may animate.
+    backgroundColor = .clear
     blurView.alpha = 1.0
     alpha = 1.0
     let iconColor = iconAccentColor ?? textColor
     let iconFillColor = iconAccentColor ?? surfaceColor
-    iconContainer.backgroundColor = iconFillColor.withAlphaComponent(isDark ? 0.24 : 0.16)
-    iconGlowView.backgroundColor = iconColor.withAlphaComponent(isDark ? 0.30 : 0.20)
+    // Soft tint disc, not a second glass material.
+    iconContainer.backgroundColor = iconFillColor.withAlphaComponent(isDark ? 0.22 : 0.14)
+    iconGlowView.backgroundColor = iconColor.withAlphaComponent(isDark ? 0.28 : 0.18)
     iconImageView.tintColor = iconColor.withAlphaComponent(0.95)
     titleLabel.textColor = textColor.withAlphaComponent(0.96)
     bodyLabel.textColor = textColor.withAlphaComponent(0.82)
@@ -144,27 +152,34 @@ final class ChatPinnedBannerView: UIControl {
   private func setup() {
     backgroundColor = .clear
     isUserInteractionEnabled = true
-    // Important: blur must not steal touches from UIControl hit-tracking.
+    // Blur must not steal UIControl hit-tracking; close is handled via hitTest.
     blurView.isUserInteractionEnabled = false
     contentContainer.isUserInteractionEnabled = false
     pageDotsStack.isUserInteractionEnabled = false
 
+    // Single glass shell as the only material layer.
     addSubview(blurView)
     blurView.layer.cornerCurve = .continuous
     blurView.layer.cornerRadius = ChatPinnedBannerView.preferredHeight / 2.0
+    // Clip only the material to the capsule — content is inside contentView so
+    // the interactive glass "tab" refraction still applies to the whole chip.
     blurView.clipsToBounds = true
+    blurView.contentView.clipsToBounds = true
+    blurView.contentView.backgroundColor = .clear
 
-    addSubview(contentContainer)
+    // All chrome lives INSIDE the glass contentView (not as external siblings).
+    blurView.contentView.addSubview(contentContainer)
+    contentContainer.addSubview(pageDotsStack)
     contentContainer.addSubview(iconContainer)
     iconContainer.addSubview(iconGlowView)
     iconContainer.addSubview(iconImageView)
     contentContainer.addSubview(textStack)
+    contentContainer.addSubview(closeButton)
 
-    addSubview(pageDotsStack)
     pageDotsStack.axis = .vertical
     pageDotsStack.alignment = .center
     pageDotsStack.distribution = .equalSpacing
-    pageDotsStack.spacing = 4.0
+    pageDotsStack.spacing = 3.0
     pageDotsStack.isHidden = true
 
     iconImageView.image = UIImage(systemName: "pin.fill")
@@ -193,55 +208,47 @@ final class ChatPinnedBannerView: UIControl {
     textStack.addArrangedSubview(titleLabel)
     textStack.addArrangedSubview(bodyLabel)
 
-    // Close sits above blur as a real control so it receives taps without killing
-    // the banner's own touchUpInside on the rest of the chrome.
     closeButton.setImage(UIImage(systemName: "xmark"), for: .normal)
     closeButton.setPreferredSymbolConfiguration(
       UIImage.SymbolConfiguration(pointSize: 11, weight: .semibold), forImageIn: .normal)
     closeButton.isHidden = true
+    closeButton.isUserInteractionEnabled = true
     closeButton.addAction(
       UIAction { [weak self] _ in self?.onClose?() }, for: .touchUpInside)
-    addSubview(closeButton)
   }
 
   override func layoutSubviews() {
     super.layoutSubviews()
     blurView.frame = bounds
+    // contentView always fills blurView.
+    let host = blurView.contentView.bounds
+    contentContainer.frame = host
 
     let closeSize: CGFloat = 32.0
     closeButton.frame = CGRect(
-      x: bounds.width - closeSize - 6.0,
-      y: (bounds.height - closeSize) * 0.5,
+      x: host.width - closeSize - 6.0,
+      y: (host.height - closeSize) * 0.5,
       width: closeSize,
       height: closeSize
     )
 
-    // Dots sit on the trailing edge (before close), matching iOS page-control order
-    // where the active indicator is next to content rather than competing with LTR icon.
-    // Active pill is taller, so reserve vertical room around midY.
+    // Dots on the LEADING edge (thinner column).
     let showsDots = pageCount > 1
-    let dotsColumnWidth: CGFloat = showsDots ? 8.0 : 0.0
-    let dotsTrailingGap: CGFloat = showsDots ? 8.0 : 0.0
-    let trailingReserve: CGFloat =
-      (closeButton.isHidden ? 12.0 : closeSize + 8.0) + dotsColumnWidth + dotsTrailingGap
-
-    contentContainer.frame = CGRect(
-      x: 0,
-      y: 0,
-      width: max(0, bounds.width - trailingReserve),
-      height: bounds.height
-    )
+    let dotsColumnWidth: CGFloat = showsDots ? 5.0 : 0.0
+    let dotsLeading: CGFloat = showsDots ? 8.0 : 0.0
+    let dotsTrailingGap: CGFloat = showsDots ? 6.0 : 0.0
+    let leadingContentX: CGFloat = showsDots ? (dotsLeading + dotsColumnWidth + dotsTrailingGap) : 0.0
+    let trailingReserve: CGFloat = closeButton.isHidden ? 12.0 : closeSize + 8.0
 
     if showsDots {
       var totalH: CGFloat = 0
       for i in 0..<pageCount {
-        totalH += (i == pageIndex ? 12.0 : 5.0)
-        if i < pageCount - 1 { totalH += 4.0 }
+        totalH += (i == pageIndex ? 9.0 : 3.0)
+        if i < pageCount - 1 { totalH += 3.0 }
       }
-      let dotsX = contentContainer.frame.maxX + 4.0
       pageDotsStack.frame = CGRect(
-        x: dotsX,
-        y: (bounds.height - totalH) * 0.5,
+        x: dotsLeading,
+        y: (host.height - totalH) * 0.5,
         width: dotsColumnWidth,
         height: totalH
       )
@@ -250,12 +257,17 @@ final class ChatPinnedBannerView: UIControl {
     }
 
     let iconSize: CGFloat = 28.0
+    let iconX = leadingContentX + 10.0
     iconContainer.frame = CGRect(
-      x: 10.0, y: (contentContainer.bounds.height - iconSize) * 0.5, width: iconSize, height: iconSize)
+      x: iconX,
+      y: (host.height - iconSize) * 0.5,
+      width: iconSize,
+      height: iconSize
+    )
     iconGlowView.frame = iconContainer.bounds
     iconImageView.frame = iconContainer.bounds.insetBy(dx: 7.0, dy: 7.0)
 
-    let hasTextLayoutSpace = contentContainer.bounds.width > 40.0 && contentContainer.bounds.height > 12.0
+    let hasTextLayoutSpace = host.width > 40.0 && host.height > 12.0
     textStack.isHidden = !hasTextLayoutSpace
     titleLabel.isHidden = !hasTextLayoutSpace
     bodyLabel.isHidden = !hasTextLayoutSpace
@@ -268,8 +280,8 @@ final class ChatPinnedBannerView: UIControl {
     textStack.frame = CGRect(
       x: textX,
       y: 6.0,
-      width: max(0.0, contentContainer.bounds.width - textX - 4.0),
-      height: max(0.0, contentContainer.bounds.height - 12.0)
+      width: max(0.0, host.width - textX - trailingReserve),
+      height: max(0.0, host.height - 12.0)
     )
   }
 
@@ -295,8 +307,8 @@ final class ChatPinnedBannerView: UIControl {
       let dot = UIView()
       dot.layer.cornerCurve = .continuous
       dot.translatesAutoresizingMaskIntoConstraints = false
-      let w = dot.widthAnchor.constraint(equalToConstant: 5)
-      let h = dot.heightAnchor.constraint(equalToConstant: 5)
+      let w = dot.widthAnchor.constraint(equalToConstant: 3)
+      let h = dot.heightAnchor.constraint(equalToConstant: 3)
       NSLayoutConstraint.activate([w, h])
       pageDotWidthConstraints.append(w)
       pageDotHeightConstraints.append(h)
@@ -315,13 +327,13 @@ final class ChatPinnedBannerView: UIControl {
   private func applyPageDotStyles() {
     for (i, dot) in pageDotViews.enumerated() {
       let active = i == pageIndex
-      // Active = taller pill (height expands); inactive = small circle.
-      let w: CGFloat = 5.0
-      let h: CGFloat = active ? 12.0 : 5.0
+      // Thin vertical pill when active; small circle when idle.
+      let w: CGFloat = 3.0
+      let h: CGFloat = active ? 9.0 : 3.0
       if i < pageDotWidthConstraints.count { pageDotWidthConstraints[i].constant = w }
       if i < pageDotHeightConstraints.count { pageDotHeightConstraints[i].constant = h }
       dot.layer.cornerRadius = w * 0.5
-      dot.backgroundColor = textColor.withAlphaComponent(active ? 0.92 : 0.28)
+      dot.backgroundColor = textColor.withAlphaComponent(active ? 0.90 : 0.28)
     }
   }
 

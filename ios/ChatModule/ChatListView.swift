@@ -2067,7 +2067,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       .trimmingCharacters(in: .whitespacesAndNewlines)
       .lowercased()
     let buckets = report["buckets"] as? [[String: Any]] ?? []
-    let limitHit = (report["limitHit"] as? Bool) == true
+    let limitHitFlag = (report["limitHit"] as? Bool) == true
     var worstLabel: String?
     var worstUtil = 0
     var worstResetsAt: String?
@@ -2081,19 +2081,36 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         worstResetsAt = bucket["resetsAt"] as? String
       }
     }
-    if limitHit {
+    // Don't trust a sticky limitHit alone — live utilization wins. A settled
+    // "hit" flag after buckets recover was showing "Rate limit hit" forever.
+    let effectiveLimitHit: Bool = {
+      if worstUtil >= 100 { return true }
+      if buckets.isEmpty { return limitHitFlag }
+      // Only honor the flag when the live worst bucket is still near the ceiling.
+      return limitHitFlag && worstUtil >= 95
+    }()
+    if effectiveLimitHit, worstLabel == nil {
+      worstLabel = "5-hour session"
       worstUtil = max(worstUtil, 100)
-      if worstLabel == nil { worstLabel = "5-hour session" }
     }
     pendingGroupUsageRequestIds.removeValue(forKey: requestId)
-    if !provider.isEmpty, let label = worstLabel {
-      groupUsageSnapshotsByProvider[provider] = (
-        util: worstUtil, label: label, resetsAt: worstResetsAt, limitHit: limitHit || worstUtil >= 100
-      )
+    if !provider.isEmpty {
+      if let label = worstLabel {
+        groupUsageSnapshotsByProvider[provider] = (
+          util: worstUtil,
+          label: label,
+          resetsAt: worstResetsAt,
+          limitHit: effectiveLimitHit
+        )
+      } else if !effectiveLimitHit {
+        // Fresh report with no near-limit buckets → clear a sticky prior hit.
+        groupUsageSnapshotsByProvider.removeValue(forKey: provider)
+      }
     }
     VibeDebugLog.log(
-      "[ChatUsage] reply provider=%@ buckets=%d worst=%@ %d%% hit=%@",
-      provider, buckets.count, worstLabel ?? "-", worstUtil, limitHit ? "Y" : "N")
+      "[ChatUsage] reply provider=%@ buckets=%d worst=%@ %d%% flag=%@ effectiveHit=%@",
+      provider, buckets.count, worstLabel ?? "-", worstUtil,
+      limitHitFlag ? "Y" : "N", effectiveLimitHit ? "Y" : "N")
 
     refreshUsageBannerFromSnapshots()
   }
@@ -2140,9 +2157,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       ? "Usage"
       : provider.prefix(1).uppercased() + provider.dropFirst()
     var text: String
-    if snap.limitHit || snap.util >= 100 {
+    if snap.util >= 100 || (snap.limitHit && snap.util >= 95) {
       text = "Rate limit hit · \(snap.label)"
     } else {
+      // Always prefer live % when we're not actually at the ceiling.
       text = "You've used \(snap.util)% of your \(snap.label) limit"
     }
     if let reset = Self.bridgeUsageResetText(snap.resetsAt) {

@@ -8549,9 +8549,27 @@ async function buildUsageReport(provider, chatId, task) {
           resetsAt: b.resetsAt || null,
         });
       }
+      // Sticky `hit` from an earlier rate-limit event must not survive forever —
+      // only surface it while utilization is still at/near the ceiling, or the
+      // event is very recent (< 3 min). Otherwise the phone banner freezes on
+      // "Rate limit hit" after the window has recovered.
       if (cached.hit) {
-        report.limitHit = true;
-        report.limitMessage = cached.message || null;
+        const maxUtil = Math.max(
+          0,
+          ...cached.buckets.map((b) => Number(b && b.utilization) || 0)
+        );
+        const ageMs = Date.now() - (cached.at || 0);
+        if (maxUtil >= 95 || ageMs < 3 * 60 * 1000) {
+          report.limitHit = true;
+          report.limitMessage = cached.message || null;
+        } else {
+          // Clear sticky hit so subsequent /usage replies are honest.
+          lastRateLimitsByProvider.set("codex", {
+            at: cached.at,
+            buckets: cached.buckets,
+            hit: false,
+          });
+        }
       }
     }
   } else if (provider === "grok") {
@@ -8592,8 +8610,23 @@ async function buildUsageReport(provider, chatId, task) {
         });
       }
       if (cached.hit) {
-        report.limitHit = true;
-        report.limitMessage = cached.message || null;
+        const maxUtil = Math.max(
+          0,
+          ...(Array.isArray(cached.buckets)
+            ? cached.buckets.map((b) => Number(b && b.utilization) || 0)
+            : [0])
+        );
+        const ageMs = Date.now() - (cached.at || 0);
+        if (maxUtil >= 95 || ageMs < 3 * 60 * 1000) {
+          report.limitHit = true;
+          report.limitMessage = cached.message || null;
+        } else {
+          lastRateLimitsByProvider.set(provider, {
+            at: cached.at,
+            buckets: cached.buckets,
+            hit: false,
+          });
+        }
       }
     }
   }
