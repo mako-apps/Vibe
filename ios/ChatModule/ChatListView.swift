@@ -2176,19 +2176,18 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     hideBridgeUsageBanner()
   }
 
-  /// Present the existing per-provider Usage panel (buckets + reset times).
+  /// Present the existing per-provider Usage panel (buckets + reset times from payload).
   private func presentUsageSheet(provider: String) {
     let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !chatId.isEmpty, let presenter = topPresentingViewController() else { return }
     let appearance = VibeAgentKitMap.appearance(for: traitCollection)
-    let panel = NavigationView {
+    let panel = NavigationStack {
       VibeAgentUsagePanel(
         chatId: chatId,
         provider: provider,
         appearance: appearance
       )
     }
-    .navigationViewStyle(.stack)
     let host = UIHostingController(rootView: panel)
     host.modalPresentationStyle = .pageSheet
     if let sheet = host.sheetPresentationController {
@@ -2196,6 +2195,38 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       sheet.prefersGrabberVisible = true
     }
     presenter.present(host, animated: true)
+  }
+
+  /// Multi-agent: pick which provider's usage sheet to open (each sheet fetches that
+  /// provider's real bridge payload). Single provider opens directly.
+  private func presentUsageMenuOrSheet(providers: [String]? = nil) {
+    let list = (providers?.isEmpty == false ? providers! : usageBannerProviders())
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+      .filter { !$0.isEmpty }
+    guard !list.isEmpty else { return }
+    if list.count == 1 {
+      presentUsageSheet(provider: list[0])
+      return
+    }
+    guard let presenter = topPresentingViewController() else { return }
+    let sheet = UIAlertController(
+      title: "Usage",
+      message: "Open subscription limits for…",
+      preferredStyle: .actionSheet
+    )
+    for provider in list {
+      let title = provider.prefix(1).uppercased() + provider.dropFirst()
+      sheet.addAction(
+        UIAlertAction(title: title, style: .default) { [weak self] _ in
+          self?.presentUsageSheet(provider: provider)
+        })
+    }
+    sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+    if let pop = sheet.popoverPresentationController {
+      pop.sourceView = presenter.view
+      pop.sourceRect = CGRect(x: presenter.view.bounds.midX, y: 80, width: 1, height: 1)
+    }
+    presenter.present(sheet, animated: true)
   }
 
   private func hideBridgeUsageBanner() {
@@ -8555,12 +8586,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
 
     if groupHasBridgeAgents() {
-      // No single DM provider — repo menu only (model/work-mode stay on profile).
+      // No single DM provider — repo menu + per-agent usage slash menu (payload sheets).
       let provider = groupSenderDirectory.values.compactMap(\.provider).first ?? "claude"
       inputBar?.setAgentControlMode(true)
       inputBar?.setAgentControlRepoTitle(repoName.isEmpty ? "Repo" : repoName)
       inputBar?.setAgentControlMenu(groupRepositoryMenu(fallbackProvider: provider))
-      inputBar?.setSlashCommandMenu(nil)
+      inputBar?.setSlashCommandMenu(groupUsageSlashMenu())
       return
     }
 
@@ -8605,7 +8636,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let isCodex = provider.lowercased().contains("codex")
     let isGrok = provider.lowercased().contains("grok")
     let isAgy = provider.lowercased().contains("agy") || provider.lowercased().contains("antigravity")
-    // (name, subtitle)
+    // (name, subtitle) — `usage` is special: opens the real bridge usage sheet instead
+    // of inserting a /usage chat command.
     let info: [(String, String)] = [
       ("usage", "Subscription limits + token usage"),
       ("status", "Account, model, remaining usage"),
@@ -8638,7 +8670,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     func actions(_ items: [(String, String)]) -> [UIMenuElement] {
       items.map { item in
         UIAction(title: "/\(item.0)", subtitle: item.1) { [weak self] _ in
-          self?.inputBar?.insertSlashCommand(item.0)
+          guard let self else { return }
+          if item.0 == "usage" {
+            // Open payload-backed detail (or multi-provider picker in groups).
+            self.presentUsageMenuOrSheet(providers: self.usageBannerProviders())
+            return
+          }
+          self.inputBar?.insertSlashCommand(item.0)
         }
       }
     }
@@ -8649,6 +8687,36 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       children: actions(tasks))
     let optionMenu = UIMenu(title: "Options", options: .displayInline, children: actions(options))
     return UIMenu(title: "Slash commands", children: [infoMenu, taskMenu, optionMenu])
+  }
+
+  /// Group-with-agents slash menu: Usage opens per-provider detail sheets from payload.
+  private func groupUsageSlashMenu() -> UIMenu {
+    let providers = usageBannerProviders()
+    var children: [UIMenuElement] = []
+    if providers.count <= 1 {
+      children.append(
+        UIAction(
+          title: "/usage",
+          subtitle: "Subscription limits + token usage",
+          image: UIImage(systemName: "gauge.with.dots.needle.bottom.50percent")
+        ) { [weak self] _ in
+          self?.presentUsageMenuOrSheet(providers: providers)
+        })
+    } else {
+      // One action per agent so the menu itself is the per-provider tab list.
+      for provider in providers {
+        let title = provider.prefix(1).uppercased() + provider.dropFirst()
+        children.append(
+          UIAction(
+            title: "\(title) usage",
+            subtitle: "5h / weekly limits from bridge",
+            image: UIImage(systemName: "gauge.with.dots.needle.bottom.50percent")
+          ) { [weak self] _ in
+            self?.presentUsageSheet(provider: provider)
+          })
+      }
+    }
+    return UIMenu(title: "Usage", children: children)
   }
 
   /// Agent composer menu. Attachments are prepended by `ChatInputBar`; this menu owns

@@ -3195,6 +3195,23 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     let content: (title: String, body: String)
     switch normalized {
     case "/usage", "usage":
+      // Prefer the payload-backed usage sheet (same as tools-menu Usage row).
+      if let chatId = agentBridgeChatId, !chatId.isEmpty {
+        let provider = (agentBridgeProvider ?? composerView.provider)
+          .trimmingCharacters(in: .whitespacesAndNewlines)
+        let appearance = self.appearance
+        let panel = NavigationStack {
+          VibeAgentUsagePanel(chatId: chatId, provider: provider.isEmpty ? "claude" : provider, appearance: appearance)
+        }
+        let host = UIHostingController(rootView: panel)
+        host.modalPresentationStyle = .pageSheet
+        if let sheet = host.sheetPresentationController {
+          sheet.detents = [.medium(), .large()]
+          sheet.prefersGrabberVisible = true
+        }
+        present(host, animated: true)
+        return
+      }
       content = ("Usage", usageCommandBody())
     case "/status", "status":
       content = ("Status", statusCommandBody())
@@ -4892,6 +4909,8 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
         appearance: appearance,
         provider: provider,
         chatId: bridgeChatId,
+        // Agent surface is always one provider; detail panel still fetches real payload.
+        usageProviders: [provider].filter { !$0.isEmpty },
         allCommands: allCommands,
         onAttach: { [weak self] in self?.onAttach?() },
         onCamera: { /* add camera logic later if needed */ },

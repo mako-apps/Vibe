@@ -5,6 +5,9 @@ struct VibeAgentToolsSheet: View {
   var appearance: VibeAgentKitChatAppearance
   var provider: String
   var chatId: String?
+  /// Providers whose Usage row should appear (DM: current only; multi-agent group:
+  /// each member agent). Each row opens a real bridge-backed detail panel.
+  var usageProviders: [String]
   var allCommands: [VibeAgentSlashCommand]
 
   var onAttach: (() -> Void)?
@@ -24,6 +27,7 @@ struct VibeAgentToolsSheet: View {
     appearance: VibeAgentKitChatAppearance,
     provider: String,
     chatId: String? = nil,
+    usageProviders: [String] = [],
     allCommands: [VibeAgentSlashCommand],
     onAttach: (() -> Void)? = nil,
     onCamera: (() -> Void)? = nil,
@@ -34,6 +38,17 @@ struct VibeAgentToolsSheet: View {
     self.appearance = appearance
     self.provider = provider
     self.chatId = chatId
+    // Prefer an explicit list; fall back to the sheet's run provider so DMs still work.
+    let normalized = usageProviders
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+      .filter { !$0.isEmpty }
+    let ordered = ["claude", "codex", "grok", "agy"].filter { normalized.contains($0) }
+    let rest = normalized.filter { !["claude", "codex", "grok", "agy"].contains($0) }
+    let resolved = ordered + rest
+    let fallback = provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    self.usageProviders = resolved.isEmpty
+      ? (fallback.isEmpty ? [] : [fallback])
+      : resolved
     self.allCommands = allCommands
     self.onAttach = onAttach
     self.onCamera = onCamera
@@ -151,16 +166,27 @@ struct VibeAgentToolsSheet: View {
           .listRowBackground(rowFill)
         }
 
-        // Usage — pushes a live panel (5h + weekly bars), fetched from the bridge with
-        // no chat bubble. Only meaningful when we have a chat id to query against.
-        if let chatId, !chatId.isEmpty {
+        // Usage — one row per provider. Each pushes a detail panel that fetches the
+        // real bridge `usage_result` payload (buckets + chat tokens + limitHit). No
+        // synthetic percentages. DM: single row; multi-agent group: Claude/Codex/…
+        if let chatId, !chatId.isEmpty, !usageProviders.isEmpty {
           Section {
-            NavigationLink {
-              VibeAgentUsagePanel(chatId: chatId, provider: provider, appearance: appearance)
-            } label: {
-              settingRowLabel(title: "Usage", systemImage: "gauge.with.dots.needle.bottom.50percent", value: "")
+            ForEach(usageProviders, id: \.self) { p in
+              NavigationLink {
+                VibeAgentUsagePanel(chatId: chatId, provider: p, appearance: appearance)
+              } label: {
+                settingRowLabel(
+                  title: Self.providerDisplayName(p),
+                  systemImage: "gauge.with.dots.needle.bottom.50percent",
+                  value: usageProviders.count == 1 ? "Usage" : "Limits"
+                )
+              }
+              .listRowBackground(rowFill)
             }
-            .listRowBackground(rowFill)
+          } header: {
+            Text(usageProviders.count == 1 ? "USAGE" : "USAGE BY AGENT")
+              .font(.system(size: 12, weight: .semibold))
+              .foregroundStyle(textSecondary)
           }
         }
 
@@ -196,6 +222,19 @@ struct VibeAgentToolsSheet: View {
         selectedAdvisor = opts.advisor
         selectedIntelligence = opts.intelligence
       }
+    }
+  }
+
+  private static func providerDisplayName(_ provider: String) -> String {
+    let p = provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    switch p {
+    case "claude": return "Claude"
+    case "codex": return "Codex"
+    case "grok": return "Grok"
+    case "agy", "antigravity": return "Agy"
+    default:
+      guard !p.isEmpty else { return "Usage" }
+      return p.prefix(1).uppercased() + p.dropFirst()
     }
   }
 
@@ -482,12 +521,9 @@ struct VibeAgentUsageBucket: Identifiable {
   let resetsAt: String?
 }
 
-/// Live usage panel pushed from the tools sheet. Requests a structured snapshot from
-/// the bridge (Claude subscription 5h/7-day limits + this chat's last-run tokens) and
-/// renders it as progress bars — no chat bubble. Polls `ChatEngine` for the reply that
-/// arrives as `agent-bridge-usage` keyed by our requestId.
-/// Live usage panel (5h + weekly bars). Shared by the tools sheet and the chat
-/// usage banner tap target so rate-limit hits open the same sheet for every agent.
+/// Live usage detail for one provider. Fetches bridge `usage_result` only — buckets,
+/// chat tokens, model, limitHit/limitMessage come from the payload. Never invents %.
+/// Shared by tools-sheet Usage rows and the chat usage-banner tap.
 struct VibeAgentUsagePanel: View {
   let chatId: String
   let provider: String
@@ -496,8 +532,12 @@ struct VibeAgentUsagePanel: View {
   @State private var requestId: String?
   @State private var buckets: [VibeAgentUsageBucket] = []
   @State private var chatTokens: String?
+  @State private var modelLabel: String?
+  @State private var limitHit = false
+  @State private var limitMessage: String?
   @State private var loading = true
   @State private var errorText: String?
+  @State private var emptyHint: String?
 
   private var text: Color { Color(uiColor: appearance.text) }
   private var textSecondary: Color { Color(uiColor: appearance.textSecondary) }
@@ -505,13 +545,26 @@ struct VibeAgentUsagePanel: View {
     appearance.isDark ? Color.white.opacity(0.05) : Color(uiColor: appearance.surface)
   }
 
+  private var providerTitle: String {
+    let p = provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    switch p {
+    case "claude": return "Claude"
+    case "codex": return "Codex"
+    case "grok": return "Grok"
+    case "agy", "antigravity": return "Agy"
+    default:
+      guard !p.isEmpty else { return "Usage" }
+      return p.prefix(1).uppercased() + p.dropFirst()
+    }
+  }
+
   var body: some View {
     List {
-      if loading && buckets.isEmpty && errorText == nil {
+      if loading && buckets.isEmpty && errorText == nil && limitMessage == nil {
         Section {
           HStack(spacing: 12) {
             ProgressView()
-            Text("Fetching usage from your Mac…")
+            Text("Fetching \(providerTitle) usage from your Mac…")
               .font(.system(size: 15))
               .foregroundStyle(textSecondary)
           }
@@ -520,12 +573,48 @@ struct VibeAgentUsagePanel: View {
         }
       }
 
+      // Hard limit — only the bridge's own message, never invented copy.
+      if limitHit, let limitMessage, !limitMessage.isEmpty {
+        Section {
+          VStack(alignment: .leading, spacing: 6) {
+            Text("Rate limit hit")
+              .font(.system(size: 15, weight: .semibold))
+              .foregroundStyle(Color.red.opacity(0.9))
+            Text(limitMessage)
+              .font(.system(size: 14))
+              .foregroundStyle(textSecondary)
+          }
+          .padding(.vertical, 4)
+          .listRowBackground(rowFill)
+        }
+      }
+
+      // Gauges only when the payload actually sent buckets — never a fake 0% bar.
       if !buckets.isEmpty {
         Section("SUBSCRIPTION LIMITS") {
           ForEach(buckets) { bucket in
             VibeUsageBar(bucket: bucket, appearance: appearance)
               .listRowBackground(rowFill)
           }
+        }
+      } else if !loading, errorText == nil {
+        Section("SUBSCRIPTION LIMITS") {
+          Text(
+            emptyHint
+              ?? "No rate-limit windows reported for \(providerTitle) yet. Run a task on this provider, or sign in on your Mac."
+          )
+          .font(.system(size: 14))
+          .foregroundStyle(textSecondary)
+          .listRowBackground(rowFill)
+        }
+      }
+
+      if let modelLabel, !modelLabel.isEmpty {
+        Section("MODEL") {
+          Text(modelLabel)
+            .font(.system(size: 14))
+            .foregroundStyle(textSecondary)
+            .listRowBackground(rowFill)
         }
       }
 
@@ -550,7 +639,7 @@ struct VibeAgentUsagePanel: View {
     .listStyle(.insetGrouped)
     .scrollContentBackground(.hidden)
     .background(Color.clear)
-    .navigationTitle("Usage")
+    .navigationTitle("\(providerTitle) usage")
     .navigationBarTitleDisplayMode(.inline)
     .onAppear(perform: start)
     .onReceive(NotificationCenter.default.publisher(for: ChatEngine.didChangeNotification)) { note in
@@ -571,24 +660,29 @@ struct VibeAgentUsagePanel: View {
     ])
     if let rid = result["requestId"] as? String, (result["accepted"] as? Bool) == true {
       requestId = rid
-      // Fallback: if no reply lands, stop the spinner and explain.
       DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
-        if loading && buckets.isEmpty {
+        if loading && buckets.isEmpty && limitMessage == nil {
           loading = false
           if errorText == nil {
-            errorText = "Couldn't reach the bridge for usage. Make sure your Mac bridge is connected."
+            errorText =
+              "Couldn't reach the bridge for usage. Make sure your Mac bridge is connected."
           }
         }
       }
     } else {
       loading = false
-      errorText = "Usage is unavailable right now (\(result["reason"] as? String ?? "not connected"))."
+      errorText =
+        "Usage is unavailable right now (\(result["reason"] as? String ?? "not connected"))."
     }
   }
 
   private func ingest() {
-    guard let rid = requestId, let payload = ChatEngine.shared.latestAgentBridgeUsage(requestId: rid) else { return }
+    guard let rid = requestId,
+      let payload = ChatEngine.shared.latestAgentBridgeUsage(requestId: rid)
+    else { return }
     loading = false
+    errorText = nil
+    emptyHint = nil
     if (payload["ok"] as? Bool) == false {
       errorText = (payload["message"] as? String) ?? "Usage request failed."
       return
@@ -597,22 +691,60 @@ struct VibeAgentUsagePanel: View {
       errorText = "The bridge returned no usage data."
       return
     }
+
+    // All fields below are payload-only — never synthesize utilization.
+    limitHit = (report["limitHit"] as? Bool) == true
+    if let msg = report["limitMessage"] as? String, !msg.isEmpty {
+      limitMessage = msg
+    } else {
+      limitMessage = nil
+    }
+
+    if let model = report["model"] as? String, !model.isEmpty {
+      modelLabel = model
+    } else {
+      modelLabel = nil
+    }
+
     var parsed: [VibeAgentUsageBucket] = []
     if let rawBuckets = report["buckets"] as? [[String: Any]] {
       for b in rawBuckets {
-        guard let label = b["label"] as? String else { continue }
-        let util = (b["utilization"] as? Int) ?? Int((b["utilization"] as? Double) ?? 0)
-        parsed.append(VibeAgentUsageBucket(label: label, utilization: util, resetsAt: b["resetsAt"] as? String))
+        guard let label = b["label"] as? String, !label.isEmpty else { continue }
+        // Only accept a utilization the bridge actually sent.
+        let util: Int?
+        if let i = b["utilization"] as? Int {
+          util = i
+        } else if let d = b["utilization"] as? Double, d.isFinite {
+          util = Int(d.rounded())
+        } else if let n = b["utilization"] as? NSNumber {
+          util = n.intValue
+        } else {
+          util = nil
+        }
+        guard let util else { continue }
+        parsed.append(
+          VibeAgentUsageBucket(
+            label: label,
+            utilization: util,
+            resetsAt: b["resetsAt"] as? String ?? b["resets_at"] as? String
+          )
+        )
       }
     }
     buckets = parsed
+
     if let chat = report["chat"] as? [String: Any] {
       chatTokens = Self.formatChatTokens(chat)
+    } else {
+      chatTokens = nil
     }
-    if parsed.isEmpty && chatTokens == nil {
-      errorText = provider == "claude"
+
+    if parsed.isEmpty && chatTokens == nil && !limitHit {
+      let p = provider.lowercased()
+      emptyHint =
+        p == "claude"
         ? "No subscription usage yet — sign in to Claude on your Mac, or run a task first."
-        : "No usage recorded for this chat yet. Run a task first."
+        : "No rate-limit windows reported yet for \(providerTitle). Run a task first so the bridge can capture limits."
     }
   }
 
@@ -620,13 +752,18 @@ struct VibeAgentUsagePanel: View {
     func n(_ key: String) -> Int? {
       if let i = chat[key] as? Int { return i }
       if let d = chat[key] as? Double { return Int(d) }
+      if let n = chat[key] as? NSNumber { return n.intValue }
       return nil
     }
     var parts: [String] = []
     if let i = n("inputTokens") { parts.append("input \(i)") }
     if let c = n("cachedInputTokens") { parts.append("cached \(c)") }
     if let o = n("outputTokens") { parts.append("output \(o)") }
-    if let cost = chat["totalCostUsd"] as? Double { parts.append(String(format: "cost $%.4f", cost) ) }
+    if let cost = chat["totalCostUsd"] as? Double {
+      parts.append(String(format: "cost $%.4f", cost))
+    } else if let cost = chat["totalCostUsd"] as? NSNumber {
+      parts.append(String(format: "cost $%.4f", cost.doubleValue))
+    }
     return parts.isEmpty ? nil : parts.joined(separator: " · ")
   }
 }
@@ -674,7 +811,11 @@ private struct VibeUsageBar: View {
   }
 
   private static func resetText(_ iso: String?) -> String? {
-    guard let iso, let date = ISO8601DateFormatter().date(from: iso) else { return nil }
+    guard let iso, !iso.isEmpty else { return nil }
+    let withFraction = ISO8601DateFormatter()
+    withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let date = withFraction.date(from: iso) ?? ISO8601DateFormatter().date(from: iso)
+    guard let date else { return nil }
     let secs = date.timeIntervalSinceNow
     if secs <= 0 { return "resetting now" }
     let h = Int(secs) / 3600
