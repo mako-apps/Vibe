@@ -10,6 +10,31 @@ private let chatListUITraceLogger = Logger(
   category: "UITrace"
 )
 
+/// Always-on layout diagnostics (not gated by VIBE_VERBOSE_LOGS). Writes to
+/// stderr (console attach) + Documents/layout-shift.log for pull after a run.
+private func layoutShiftLog(_ format: String, _ args: CVarArg...) {
+  let message = String(format: format, arguments: args)
+  NSLog("%@", message)
+  fputs(message + "\n", stderr)
+  fflush(stderr)
+  // Append to Documents so we can pull even if console isn't attached.
+  let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+  let url = dir?.appendingPathComponent("layout-shift.log")
+  guard let url else { return }
+  let line = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"
+  if let data = line.data(using: .utf8) {
+    if FileManager.default.fileExists(atPath: url.path) {
+      if let handle = try? FileHandle(forWritingTo: url) {
+        defer { try? handle.close() }
+        _ = try? handle.seekToEnd()
+        try? handle.write(contentsOf: data)
+      }
+    } else {
+      try? data.write(to: url)
+    }
+  }
+}
+
 private func chatListUITrace(_ message: String, fault: Bool = false) {
   if fault {
     chatListUITraceLogger.fault("\(message, privacy: .public)")
@@ -2073,12 +2098,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     var worstResetsAt: String?
     for bucket in buckets {
       guard let label = bucket["label"] as? String, !label.isEmpty else { continue }
+      // Skip closed windows — their utilization is stale until the source refreshes.
+      let resetsAt = bucket["resetsAt"] as? String
+      if Self.bridgeUsageWindowExpired(resetsAt) { continue }
       let util = (bucket["utilization"] as? NSNumber)?.intValue
         ?? Int((bucket["utilization"] as? Double) ?? 0)
       if util > worstUtil {
         worstUtil = util
         worstLabel = label
-        worstResetsAt = bucket["resetsAt"] as? String
+        worstResetsAt = resetsAt
       }
     }
     // Don't trust a sticky limitHit alone — live utilization wins. A settled
@@ -2117,12 +2145,23 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
   /// Rebuild the floating usage banner from the latest per-provider snapshots.
   private func refreshUsageBannerFromSnapshots() {
-    // Prefer limit-hit agents, then highest utilization ≥ 75%.
+    // A snapshot whose window already reset is stale — drop it instead of showing
+    // yesterday's "Rate limit hit" on a recovered account.
+    groupUsageSnapshotsByProvider = groupUsageSnapshotsByProvider.filter {
+      !Self.bridgeUsageWindowExpired($0.value.resetsAt)
+    }
+    // Prefer limit-hit agents, then highest utilization ≥ 75%. The final provider-rank
+    // tiebreak keeps the order DETERMINISTIC — dictionary enumeration order would
+    // otherwise flip the banner between equal-utilization providers on every refresh.
+    let rank: (String) -> Int = {
+      ["claude": 0, "codex": 1, "grok": 2, "agy": 3][$0] ?? 4
+    }
     let candidates = groupUsageSnapshotsByProvider
       .filter { $0.value.limitHit || $0.value.util >= 75 }
       .sorted { a, b in
         if a.value.limitHit != b.value.limitHit { return a.value.limitHit && !b.value.limitHit }
-        return a.value.util > b.value.util
+        if a.value.util != b.value.util { return a.value.util > b.value.util }
+        return rank(a.key) < rank(b.key)
       }
     guard !candidates.isEmpty else {
       hideBridgeUsageBanner()
@@ -2130,7 +2169,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       return
     }
     // Manual paging only (no auto-switch). Dots on the left; swipe to change.
+    // Keep the page pinned to the provider currently shown — a refresh must not
+    // silently swap the banner's identity out from under the reader.
     stopGroupUsageCarousel()
+    if let shown = lastUsageBannerProvider,
+      let pinned = candidates.firstIndex(where: { $0.key == shown })
+    {
+      groupUsageCarouselIndex = pinned
+    }
     groupUsageCarouselIndex = min(max(0, groupUsageCarouselIndex), candidates.count - 1)
     let pageIndex = groupUsageCarouselIndex
     let (provider, snap) = candidates[pageIndex]
@@ -2142,6 +2188,30 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     )
     // Remember ordered providers so swipe can advance.
     lastUsageCarouselProviders = candidates.map(\.key)
+    scheduleUsageBannerRefreshPoll()
+  }
+
+  /// While a usage banner is visible, re-request fresh reports periodically so the
+  /// banner recovers on its own (countdown advances, resets clear it) instead of
+  /// freezing on whatever snapshot happened to be current at send time.
+  private func scheduleUsageBannerRefreshPoll() {
+    guard groupUsageCarouselTimer == nil else { return }
+    groupUsageCarouselTimer = Timer.scheduledTimer(
+      withTimeInterval: 60.0, repeats: true
+    ) { [weak self] timer in
+      guard let self else {
+        timer.invalidate()
+        return
+      }
+      guard self.bridgeUsageBanner != nil else {
+        self.stopGroupUsageCarousel()
+        return
+      }
+      self.requestBridgeUsageSnapshot(reason: "bannerRefresh")
+      // Re-render even without a reply so the "resets in Xm" countdown and
+      // expired-window purge stay honest.
+      self.refreshUsageBannerFromSnapshots()
+    }
   }
 
   private func presentUsageBanner(
@@ -2234,12 +2304,22 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   /// "2h 15m" / "45m" / "3d" until the bucket resets, from the report's ISO timestamp.
-  private static func bridgeUsageResetText(_ iso: String?) -> String? {
+  private static func bridgeUsageResetDate(_ iso: String?) -> Date? {
     guard let iso, !iso.isEmpty else { return nil }
     let withFraction = ISO8601DateFormatter()
     withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    let date = withFraction.date(from: iso) ?? ISO8601DateFormatter().date(from: iso)
-    guard let date else { return nil }
+    return withFraction.date(from: iso) ?? ISO8601DateFormatter().date(from: iso)
+  }
+
+  /// A snapshot whose reset moment already passed describes a closed window — its
+  /// utilization is stale by definition (the source cache just hasn't refreshed yet).
+  private static func bridgeUsageWindowExpired(_ iso: String?) -> Bool {
+    guard let date = bridgeUsageResetDate(iso) else { return false }
+    return date.timeIntervalSinceNow < 0
+  }
+
+  private static func bridgeUsageResetText(_ iso: String?) -> String? {
+    guard let date = bridgeUsageResetDate(iso) else { return nil }
     let seconds = date.timeIntervalSinceNow
     guard seconds > 0 else { return nil }
     let hours = Int(seconds) / 3600
@@ -2628,216 +2708,36 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     performPendingBridgeSend(item)
   }
 
-  /// Rebuild the "waiting" strip above the input bar: one compact card per queued
-  /// message (preview + Steer ⚡ + ✕), inner-scrollable when several stack up.
+  /// Push the pending-queue strip into the input bar (preview + Steer + ✕).
+  /// No separate floating overlay over the list.
   private func refreshPendingBridgeQueueUI(animated: Bool) {
+    // Tear down any legacy floating overlay if it still exists.
+    if let container = pendingBridgeQueueContainer {
+      container.removeFromSuperview()
+      pendingBridgeQueueContainer = nil
+      pendingBridgeQueueScroll = nil
+      pendingBridgeQueueStack = nil
+      pendingBridgeQueueHeader = nil
+    }
+
+    guard let inputBar else { return }
     let queue = pendingBridgeSends
-    guard !queue.isEmpty, currentBridgeProvider != nil else {
-      if let container = pendingBridgeQueueContainer {
-        let hide = {
-          container.alpha = 0.0
-          container.transform = CGAffineTransform(translationX: 0, y: 8)
-        }
-        if animated {
-          UIView.animate(
-            withDuration: 0.16, delay: 0,
-            options: [.beginFromCurrentState, .allowUserInteraction],
-            animations: hide
-          ) { _ in
-            if container.alpha <= 0.01 { container.isHidden = true }
-          }
-        } else {
-          hide()
-          container.isHidden = true
-        }
-      }
-      return
+    let show = !queue.isEmpty && currentBridgeProvider != nil
+    let items: [ChatInputBar.PendingQueueItem] =
+      show
+      ? queue.map { ChatInputBar.PendingQueueItem(messageId: $0.messageId, text: $0.text) }
+      : []
+    inputBar.onPendingQueueCancel = { [weak self] id in
+      self?.cancelPendingBridgeSend(messageId: id)
     }
-
-    let container: UIView
-    let stack: UIStackView
-    if let existing = pendingBridgeQueueContainer, let existingStack = pendingBridgeQueueStack {
-      container = existing
-      stack = existingStack
-    } else {
-      container = UIView()
-      container.layer.cornerRadius = 18.0
-      container.layer.cornerCurve = .continuous
-      container.layer.borderWidth = 1.0 / UIScreen.main.scale
-      container.clipsToBounds = true
-      addSubview(container)
-
-      let header = UILabel()
-      header.font = .systemFont(ofSize: 12.0, weight: .semibold)
-      header.translatesAutoresizingMaskIntoConstraints = false
-      container.addSubview(header)
-      pendingBridgeQueueHeader = header
-
-      let scroll = UIScrollView()
-      scroll.translatesAutoresizingMaskIntoConstraints = false
-      scroll.showsVerticalScrollIndicator = true
-      scroll.alwaysBounceVertical = false
-      container.addSubview(scroll)
-      pendingBridgeQueueScroll = scroll
-
-      let itemsStack = UIStackView()
-      itemsStack.axis = .vertical
-      itemsStack.spacing = 8.0
-      itemsStack.translatesAutoresizingMaskIntoConstraints = false
-      scroll.addSubview(itemsStack)
-
-      NSLayoutConstraint.activate([
-        header.topAnchor.constraint(equalTo: container.topAnchor, constant: 10.0),
-        header.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14.0),
-        header.trailingAnchor.constraint(
-          lessThanOrEqualTo: container.trailingAnchor, constant: -14.0),
-        scroll.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 8.0),
-        scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10.0),
-        scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -10.0),
-        scroll.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -10.0),
-        itemsStack.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor),
-        itemsStack.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
-        itemsStack.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor),
-        itemsStack.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor),
-        itemsStack.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor),
-      ])
-      pendingBridgeQueueContainer = container
-      pendingBridgeQueueStack = itemsStack
-      stack = itemsStack
+    inputBar.onPendingQueueSteer = { [weak self] id in
+      self?.steerPendingBridgeSend(messageId: id)
     }
-
-    container.backgroundColor = appearance.bubbleThemColor
-    container.layer.borderColor =
-      appearance.textColorThem.withAlphaComponent(appearance.isDark ? 0.14 : 0.10).cgColor
-    pendingBridgeQueueHeader?.textColor = appearance.textColorThem.withAlphaComponent(0.55)
-    pendingBridgeQueueHeader?.text =
-      queue.count == 1
-      ? "Waiting for the current run to finish"
-      : "Waiting for the current run to finish · \(queue.count) queued"
-
-    for view in stack.arrangedSubviews {
-      stack.removeArrangedSubview(view)
-      view.removeFromSuperview()
-    }
-    for item in queue {
-      stack.addArrangedSubview(makePendingBridgeSendItemView(item))
-    }
-
-    let wasHidden = container.isHidden || container.alpha <= 0.01
-    container.isHidden = false
-    bringSubviewToFront(container)
-    setNeedsLayout()
-    layoutIfNeeded()
-    if wasHidden, animated {
-      container.alpha = 0.0
-      container.transform = CGAffineTransform(translationX: 0, y: 8)
-      UIView.animate(
-        withDuration: 0.22, delay: 0,
-        options: [.beginFromCurrentState, .allowUserInteraction]
-      ) {
-        container.alpha = 1.0
-        container.transform = .identity
-      }
-    } else {
-      container.alpha = 1.0
-      container.transform = .identity
-    }
+    inputBar.setPendingQueueItems(items, animated: animated)
   }
 
-  private func makePendingBridgeSendItemView(_ item: PendingBridgeSend) -> UIView {
-    let card = UIView()
-    card.layer.cornerRadius = 12.0
-    card.layer.cornerCurve = .continuous
-    card.backgroundColor =
-      appearance.textColorThem.withAlphaComponent(appearance.isDark ? 0.06 : 0.045)
-
-    let icon = UIImageView(
-      image: UIImage(
-        systemName: "clock",
-        withConfiguration: UIImage.SymbolConfiguration(pointSize: 13.0, weight: .medium)))
-    icon.tintColor = appearance.textColorThem.withAlphaComponent(0.45)
-    icon.translatesAutoresizingMaskIntoConstraints = false
-    icon.setContentHuggingPriority(.required, for: .horizontal)
-
-    let label = UILabel()
-    label.font = .systemFont(ofSize: 14.0)
-    label.textColor = appearance.textColorThem.withAlphaComponent(0.9)
-    label.numberOfLines = 2
-    label.text = item.text
-    label.translatesAutoresizingMaskIntoConstraints = false
-    label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
-    // Steer: stop the live run and send this prompt right away.
-    var steerConfig = UIButton.Configuration.plain()
-    steerConfig.image = UIImage(
-      systemName: "bolt.fill",
-      withConfiguration: UIImage.SymbolConfiguration(pointSize: 12.0, weight: .semibold))
-    steerConfig.title = "Steer"
-    steerConfig.imagePadding = 3.0
-    steerConfig.contentInsets = NSDirectionalEdgeInsets(
-      top: 5.0, leading: 8.0, bottom: 5.0, trailing: 8.0)
-    let steerButton = UIButton(configuration: steerConfig)
-    steerButton.titleLabel?.font = .systemFont(ofSize: 12.0, weight: .semibold)
-    steerButton.tintColor = appearance.isDark
-      ? UIColor(red: 0.98, green: 0.76, blue: 0.28, alpha: 1.0)
-      : UIColor(red: 0.70, green: 0.48, blue: 0.04, alpha: 1.0)
-    steerButton.translatesAutoresizingMaskIntoConstraints = false
-    steerButton.setContentHuggingPriority(.required, for: .horizontal)
-    steerButton.accessibilityIdentifier = "bridge-queue-steer-\(item.messageId)"
-    steerButton.addAction(
-      UIAction { [weak self] _ in self?.steerPendingBridgeSend(messageId: item.messageId) },
-      for: .touchUpInside)
-
-    // ✕ = cancel this queued send entirely.
-    let closeButton = UIButton(type: .system)
-    closeButton.setImage(
-      UIImage(
-        systemName: "xmark",
-        withConfiguration: UIImage.SymbolConfiguration(pointSize: 11.0, weight: .semibold)),
-      for: .normal)
-    closeButton.tintColor = appearance.textColorThem.withAlphaComponent(0.45)
-    closeButton.translatesAutoresizingMaskIntoConstraints = false
-    closeButton.setContentHuggingPriority(.required, for: .horizontal)
-    closeButton.accessibilityIdentifier = "bridge-queue-cancel-\(item.messageId)"
-    closeButton.addAction(
-      UIAction { [weak self] _ in self?.cancelPendingBridgeSend(messageId: item.messageId) },
-      for: .touchUpInside)
-
-    card.addSubview(icon)
-    card.addSubview(label)
-    card.addSubview(steerButton)
-    card.addSubview(closeButton)
-    NSLayoutConstraint.activate([
-      icon.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 10.0),
-      icon.centerYAnchor.constraint(equalTo: card.centerYAnchor),
-      label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 8.0),
-      label.topAnchor.constraint(equalTo: card.topAnchor, constant: 8.0),
-      label.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -8.0),
-      steerButton.leadingAnchor.constraint(equalTo: label.trailingAnchor, constant: 8.0),
-      steerButton.centerYAnchor.constraint(equalTo: card.centerYAnchor),
-      closeButton.leadingAnchor.constraint(equalTo: steerButton.trailingAnchor, constant: 2.0),
-      closeButton.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -10.0),
-      closeButton.centerYAnchor.constraint(equalTo: card.centerYAnchor),
-      closeButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 28.0),
-      card.heightAnchor.constraint(greaterThanOrEqualToConstant: 40.0),
-    ])
-    return card
-  }
-
-  /// Float the queue strip just above the input bar (mirrors the command overlay's
-  /// placement); caps its height so long queues scroll inside the strip instead of
-  /// covering the conversation.
   private func layoutPendingBridgeQueue() {
-    guard let container = pendingBridgeQueueContainer, !container.isHidden else { return }
-    let barMinY = agentComposerView?.frame.minY ?? inputBar?.frame.minY ?? bounds.height
-    let width = max(0.0, bounds.width - 24.0)
-    let targetSize = container.systemLayoutSizeFitting(
-      CGSize(width: width, height: UIView.layoutFittingCompressedSize.height),
-      withHorizontalFittingPriority: .required,
-      verticalFittingPriority: .fittingSizeLevel
-    )
-    let height = min(max(58.0, targetSize.height), 190.0)
-    container.frame = CGRect(x: 12.0, y: barMinY - height - 8.0, width: width, height: height)
+    // Queue UI lives inside ChatInputBar now — nothing to layout on the list.
   }
 
   // MARK: - Live background-task banner (bridge runs)
@@ -3211,9 +3111,21 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // Drop height cache for rows that left the list (stream-… / lan-… → final UUID).
     // Stale heights after that swap are a primary cause of empty gaps + overlaps.
     let nextKeys = Set(parsed.map(\.key))
+    var removedKeys: [String] = []
     for row in previousRows where !nextKeys.contains(row.key) {
       messageHeightCache.removeValue(forKey: row.key)
       agentTurnHeightCache.removeValue(forKey: row.key)
+      removedKeys.append(row.key)
+    }
+    let insertedKeys = parsed.filter { prev in !previousRows.contains(where: { $0.key == prev.key }) }
+      .map(\.key)
+    if isGroupOrChannel, !removedKeys.isEmpty || !insertedKeys.isEmpty {
+      layoutShiftLog(
+        "[LayoutShift] setRows group swap removed=%d inserted=%d rem=[%@] ins=[%@] prevCount=%d nextCount=%d",
+        removedKeys.count, insertedKeys.count,
+        removedKeys.prefix(4).map { String($0.suffix(14)) }.joined(separator: ","),
+        insertedKeys.prefix(4).map { String($0.suffix(14)) }.joined(separator: ","),
+        previousRows.count, parsed.count)
     }
     let previousContentOffsetY = collectionView.contentOffset.y
     let previousDistanceFromBottom = currentDistanceFromBottom()
@@ -3669,6 +3581,39 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         let otherReloads = safeReloads.filter { !inPlaceStreamReloads.contains($0) }
         inPlaceAgentTurnGrowth = otherReloads.isEmpty && !inPlaceStreamReloads.isEmpty
         let wasNearBottom = currentDistanceFromBottom() <= listBottomThreshold
+        let contentHBefore = collectionView.contentSize.height
+        let offsetBefore = collectionView.contentOffset.y
+        // DIAG: which rows grew and by how much (layout shift root-cause).
+        var heightDeltas: [String] = []
+        for ip in safeReloads where ip.item < previousRows.count && ip.item < rows.count {
+          let prev = previousRows[ip.item]
+          let next = rows[ip.item]
+          let extras = groupMeasurementExtras(at: ip)
+          let h0 = estimateMessageHeight(prev, rowWidth: extras.measurementWidth)
+          // Bust cache for next so we measure fresh
+          messageHeightCache.removeValue(forKey: next.key)
+          agentTurnHeightCache.removeValue(forKey: next.key)
+          let h1 = estimateMessageHeight(next, rowWidth: extras.measurementWidth)
+          if abs(h1 - h0) > 0.5 {
+            heightDeltas.append(
+              String(
+                format: "%@ Δ%.0f (%.0f→%.0f) stream=%@ agent=%@",
+                String((next.messageId ?? next.key).suffix(10)),
+                h1 - h0, h0, h1,
+                next.isStreamingText ? "Y" : "N",
+                next.isAgentMessage ? "Y" : "N"))
+          }
+        }
+        layoutShiftLog(
+          "[LayoutShift] path=heightReload group=%@ nearBottom=%@ inPlace=%@ otherReloads=%d streamReloads=%d offset=%.0f contentH=%.0f deltas=[%@]",
+          isGroupOrChannel ? "Y" : "N",
+          wasNearBottom ? "Y" : "N",
+          inPlaceAgentTurnGrowth ? "Y" : "N",
+          otherReloads.count,
+          inPlaceStreamReloads.count,
+          offsetBefore,
+          contentHBefore,
+          heightDeltas.prefix(6).joined(separator: "; "))
         UIView.performWithoutAnimation {
           CATransaction.begin()
           CATransaction.setDisableActions(true)
@@ -3697,6 +3642,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           }
           CATransaction.commit()
         }
+        layoutShiftLog(
+          "[LayoutShift] after heightReload offset=%.0f→%.0f contentH=%.0f→%.0f scrolledBottom=%@",
+          offsetBefore, collectionView.contentOffset.y,
+          contentHBefore, collectionView.contentSize.height,
+          wasNearBottom ? "Y" : "N")
         UIView.performWithoutAnimation {
           CATransaction.begin()
           CATransaction.setDisableActions(true)
@@ -6035,6 +5985,26 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     lastOverlapProbeAt = now
     let visible = collectionView.indexPathsForVisibleItems.sorted { $0.item < $1.item }
     guard visible.count >= 2 else { return }
+    // Also log large vertical GAPS (empty space after a cell "went nowhere").
+    for i in 0..<(visible.count - 1) {
+      let a = visible[i], b = visible[i + 1]
+      guard b.item == a.item + 1 else { continue }
+      guard
+        let fa = collectionView.layoutAttributesForItem(at: a)?.frame,
+        let fb = collectionView.layoutAttributesForItem(at: b)?.frame
+      else { continue }
+      let gap = fb.minY - fa.maxY
+      if gap > 40 {
+        let ra = a.item < rows.count ? rows[a.item] : nil
+        let rb = b.item < rows.count ? rows[b.item] : nil
+        layoutShiftLog(
+          "[LayoutShift] GAP reason=%@ gap=%.0fpt a[%d] h=%.0f id=%@ b[%d] h=%.0f id=%@",
+          reason, gap, a.item, fa.height,
+          String((ra?.messageId ?? ra?.key ?? "?").suffix(12)),
+          b.item, fb.height,
+          String((rb?.messageId ?? rb?.key ?? "?").suffix(12)))
+      }
+    }
     for i in 0..<(visible.count - 1) {
       let a = visible[i], b = visible[i + 1]
       guard b.item == a.item + 1 else { continue }
@@ -8557,27 +8527,31 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     guard provider != nil || isGroupAgentSend else {
       return [:]
     }
-    guard
-      let repository = AgentBridgeSelectionStore.selectedRepository(
-        chatId: engineChatId.isEmpty ? nil : engineChatId
-      )
-    else {
-      return [:]
-    }
+    let repository = AgentBridgeSelectionStore.selectedRepository(
+      chatId: engineChatId.isEmpty ? nil : engineChatId
+    )
 
-    // Repo + work mode are provider-agnostic and apply to whichever worker runs.
+    // Repo + work mode are provider-agnostic and apply to whichever worker runs. A
+    // missing per-chat repo must not suppress the provider/resume metadata: history
+    // follow-ups should still dispatch, and the bridge can fall back to its default cwd.
     var metadata: [String: Any] = [
-      "agentBridgeRepoId": repository.id,
-      "agentBridgeRepoName": repository.name,
-      "agentBridgeRepoPath": repository.path,
-      "agentBridgeCwd": repository.cwd,
-      "agentBridgeWorkMode": AgentBridgeSelectionStore.selectedWorkMode().rawValue,
+      "agentBridgeWorkMode": AgentBridgeSelectionStore.selectedWorkMode().rawValue
     ]
-    if let computerId = repository.computerId, !computerId.isEmpty {
-      metadata["agentBridgeComputerId"] = computerId
-    }
-    if let computerLabel = repository.computerLabel, !computerLabel.isEmpty {
-      metadata["agentBridgeComputerLabel"] = computerLabel
+    if let repository {
+      metadata["agentBridgeRepoId"] = repository.id
+      metadata["agentBridgeRepoName"] = repository.name
+      metadata["agentBridgeRepoPath"] = repository.path
+      metadata["agentBridgeCwd"] = repository.cwd
+      if let computerId = repository.computerId, !computerId.isEmpty {
+        metadata["agentBridgeComputerId"] = computerId
+      }
+      if let computerLabel = repository.computerLabel, !computerLabel.isEmpty {
+        metadata["agentBridgeComputerLabel"] = computerLabel
+      }
+    } else {
+      NSLog(
+        "[AgentRoute] outgoing bridge metadata without repo provider=%@ chat=%@",
+        provider ?? "<group>", engineChatId.isEmpty ? "-" : engineChatId)
     }
 
     guard let provider else {
@@ -8730,11 +8704,29 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if text.range(of: "(^|\\s)@(agy|antigravity)\\b", options: [.regularExpression, .caseInsensitive]) != nil {
       return "agy"
     }
+    if let currentBridgeProvider {
+      return currentBridgeProvider
+    }
     return nil
   }
 
   private var currentBridgeProvider: String? {
     if let explicitBridgeProvider { return explicitBridgeProvider }
+    let peerAgent = enginePeerAgentId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if peerAgent == "claude" || peerAgent == "11111111-1111-1111-1111-111111111111" {
+      return "claude"
+    }
+    if peerAgent == "codex" || peerAgent == "22222222-2222-2222-2222-222222222222" {
+      return "codex"
+    }
+    if peerAgent == "grok" || peerAgent == "33333333-3333-3333-3333-333333333333" {
+      return "grok"
+    }
+    if peerAgent == "agy" || peerAgent == "antigravity"
+      || peerAgent == "44444444-4444-4444-4444-444444444444"
+    {
+      return "agy"
+    }
     let peer = enginePeerUserId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     if peer == "11111111-1111-1111-1111-111111111111" { return "claude" }
     if peer == "22222222-2222-2222-2222-222222222222" { return "codex" }

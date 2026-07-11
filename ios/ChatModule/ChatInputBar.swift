@@ -773,6 +773,22 @@ final class ChatInputBar: UIView {
   private let replyBannerContentH: CGFloat = 36
   private let replyBannerGap: CGFloat = 4
 
+  // Bridge pending-queue strip (above composer pill): preview + Steer + close.
+  // Lives inside the input bar — not a floating overlay over the chat list.
+  struct PendingQueueItem {
+    let messageId: String
+    let text: String
+  }
+  private let pendingQueueStrip = UIView()
+  private let pendingQueueStack = UIStackView()
+  private var pendingQueueItems: [PendingQueueItem] = []
+  private var pendingQueueStripVisible = false
+  private let pendingQueueRowH: CGFloat = 40
+  private let pendingQueueHeaderH: CGFloat = 18
+  private let pendingQueueGap: CGFloat = 6
+  var onPendingQueueCancel: ((String) -> Void)?
+  var onPendingQueueSteer: ((String) -> Void)?
+
   // Recording UI
   private let lockView = UIImageView(image: UIImage(systemName: "lock.fill"))
   private let lockPill = UIVisualEffectView(effect: nil)
@@ -1159,6 +1175,22 @@ final class ChatInputBar: UIView {
 
     // GIF panel is created lazily on first open (see loadGifPanelIfNeeded).
 
+    // ── Pending queue strip (above content row; part of input chrome) ─────
+    pendingQueueStrip.isHidden = true
+    pendingQueueStrip.alpha = 0
+    pendingQueueStrip.backgroundColor = .clear
+    addSubview(pendingQueueStrip)
+    pendingQueueStack.axis = .vertical
+    pendingQueueStack.spacing = 6
+    pendingQueueStack.translatesAutoresizingMaskIntoConstraints = false
+    pendingQueueStrip.addSubview(pendingQueueStack)
+    NSLayoutConstraint.activate([
+      pendingQueueStack.topAnchor.constraint(equalTo: pendingQueueStrip.topAnchor),
+      pendingQueueStack.leadingAnchor.constraint(equalTo: pendingQueueStrip.leadingAnchor, constant: 12),
+      pendingQueueStack.trailingAnchor.constraint(equalTo: pendingQueueStrip.trailingAnchor, constant: -12),
+      pendingQueueStack.bottomAnchor.constraint(equalTo: pendingQueueStrip.bottomAnchor),
+    ])
+
     // ── 1. Content row ────────────────────────────────────────────────────
     // No full-bar glass. The bar background is transparent; each element
     // has its own glass surface.
@@ -1512,9 +1544,6 @@ final class ChatInputBar: UIView {
 
   private func refreshAgentControlModeAppearance() {
     let controlTint = appearance.textColorThem.withAlphaComponent(0.9)
-    let agentAccent =
-      appearance.bubbleMeGradient.first
-      ?? UIColor(red: 0.16, green: 0.62, blue: 0.62, alpha: 1.0)
     let plusConfiguration = UIImage.SymbolConfiguration(pointSize: 15, weight: .regular)
     applyControlGlyph(
       button: inlineAttachButton,
@@ -1525,45 +1554,16 @@ final class ChatInputBar: UIView {
     slashButton.isHidden = true
 
     if agentControlMode {
-      // Repo switcher chip (📁 <repo> ⌄). When the host has supplied a menu (Repository
-      // / Report / Permission / History), the chip opens it directly; otherwise it falls
-      // back to the legacy agent-panel tap.
-      let usesMenu = agentControlMenu != nil
-      let repoLabel = agentControlRepoTitle.isEmpty ? (usesMenu ? "Repository" : agentControlTitle) : agentControlRepoTitle
-      var configuration = usesMenu ? UIButton.Configuration.gray() : UIButton.Configuration.filled()
-      configuration.title = usesMenu ? "\(repoLabel)  ⌄" : agentControlTitle
-      configuration.image =
-        usesMenu
-        ? UIImage(systemName: "folder", withConfiguration: UIImage.SymbolConfiguration(pointSize: 12, weight: .semibold))
-        : nil
-      configuration.imagePlacement = .leading
-      configuration.imagePadding = 5
-      configuration.titleLineBreakMode = .byTruncatingTail
-      configuration.baseForegroundColor = usesMenu ? controlTint : .white
-      if !usesMenu { configuration.baseBackgroundColor = agentAccent }
-      configuration.cornerStyle = .capsule
-      configuration.contentInsets = NSDirectionalEdgeInsets(
-        top: 0,
-        leading: usesMenu ? 10 : 12,
-        bottom: 0,
-        trailing: usesMenu ? 10 : 12
-      )
-      configuration.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer {
-        incoming in
-        var outgoing = incoming
-        outgoing.font = .systemFont(ofSize: 13.0, weight: .semibold)
-        return outgoing
-      }
-      attachButton.setImage(nil, for: .normal)
-      attachButton.configuration = configuration
+      attachButton.configuration = nil
+      attachButton.setTitle(nil, for: .normal)
       attachButton.contentHorizontalAlignment = .center
-      attachButton.titleLabel?.lineBreakMode = .byTruncatingTail
-      attachButton.titleLabel?.numberOfLines = 1
-      attachButton.titleLabel?.adjustsFontSizeToFitWidth = true
-      attachButton.titleLabel?.minimumScaleFactor = 0.82
-      attachButton.menu = agentControlMenu
-      attachButton.showsMenuAsPrimaryAction = usesMenu
-      attachButton.accessibilityLabel = usesMenu ? "Repository and agent options" : "Open agents"
+      applyControlGlyph(
+        button: attachButton,
+        symbolName: "plus",
+        symbolConfig: plusConfiguration,
+        tintColor: controlTint
+      )
+      attachButton.accessibilityLabel = "Add to chat"
     } else {
       attachButton.configuration = nil
       attachButton.setTitle(nil, for: .normal)
@@ -1691,6 +1691,111 @@ final class ChatInputBar: UIView {
     slashButton.menu = menu
     refreshAgentControlModeAppearance()
     setNeedsLayout()
+  }
+
+  /// Pending bridge sends while a run is live. Shown as compact rows inside the
+  /// input bar (preview + Steer + ✕) — replaces the old floating list overlay.
+  func setPendingQueueItems(_ items: [PendingQueueItem], animated: Bool = true) {
+    pendingQueueItems = items
+    let show = !items.isEmpty
+    rebuildPendingQueueRows()
+    if show == pendingQueueStripVisible {
+      setNeedsLayout()
+      layoutIfNeeded()
+      if show { delegate?.inputBarHeightDidChange() }
+      return
+    }
+    pendingQueueStripVisible = show
+    pendingQueueStrip.isHidden = !show
+    if animated, show {
+      pendingQueueStrip.alpha = 0
+      UIView.animate(withDuration: 0.2) {
+        self.pendingQueueStrip.alpha = 1
+        self.setNeedsLayout()
+        self.layoutIfNeeded()
+      } completion: { _ in
+        self.delegate?.inputBarHeightDidChange()
+      }
+    } else {
+      pendingQueueStrip.alpha = show ? 1 : 0
+      setNeedsLayout()
+      layoutIfNeeded()
+      delegate?.inputBarHeightDidChange()
+    }
+  }
+
+  private func rebuildPendingQueueRows() {
+    pendingQueueStack.arrangedSubviews.forEach {
+      pendingQueueStack.removeArrangedSubview($0)
+      $0.removeFromSuperview()
+    }
+    for item in pendingQueueItems {
+      pendingQueueStack.addArrangedSubview(makePendingQueueRow(item))
+    }
+  }
+
+  private func makePendingQueueRow(_ item: PendingQueueItem) -> UIView {
+    let row = UIView()
+    row.backgroundColor = UIColor.secondarySystemFill.withAlphaComponent(0.55)
+    row.layer.cornerRadius = 12
+    row.layer.cornerCurve = .continuous
+
+    let clock = UIImageView(
+      image: UIImage(
+        systemName: "clock",
+        withConfiguration: UIImage.SymbolConfiguration(pointSize: 12, weight: .medium)))
+    clock.tintColor = .secondaryLabel
+    clock.translatesAutoresizingMaskIntoConstraints = false
+
+    let label = UILabel()
+    label.font = .systemFont(ofSize: 13)
+    label.textColor = .label
+    label.numberOfLines = 1
+    label.lineBreakMode = .byTruncatingTail
+    label.text = item.text
+    label.translatesAutoresizingMaskIntoConstraints = false
+
+    var steerCfg = UIButton.Configuration.plain()
+    steerCfg.image = UIImage(
+      systemName: "bolt.fill",
+      withConfiguration: UIImage.SymbolConfiguration(pointSize: 11, weight: .semibold))
+    steerCfg.title = "Steer"
+    steerCfg.imagePadding = 2
+    steerCfg.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 6, bottom: 4, trailing: 6)
+    let steer = UIButton(configuration: steerCfg)
+    steer.tintColor = UIColor.systemOrange
+    steer.translatesAutoresizingMaskIntoConstraints = false
+    let mid = item.messageId
+    steer.addAction(UIAction { [weak self] _ in self?.onPendingQueueSteer?(mid) }, for: .touchUpInside)
+
+    let close = UIButton(type: .system)
+    close.setImage(
+      UIImage(
+        systemName: "xmark",
+        withConfiguration: UIImage.SymbolConfiguration(pointSize: 11, weight: .semibold)),
+      for: .normal)
+    close.tintColor = .secondaryLabel
+    close.translatesAutoresizingMaskIntoConstraints = false
+    close.addAction(UIAction { [weak self] _ in self?.onPendingQueueCancel?(mid) }, for: .touchUpInside)
+
+    row.addSubview(clock)
+    row.addSubview(label)
+    row.addSubview(steer)
+    row.addSubview(close)
+    NSLayoutConstraint.activate([
+      row.heightAnchor.constraint(equalToConstant: pendingQueueRowH),
+      clock.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 10),
+      clock.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+      label.leadingAnchor.constraint(equalTo: clock.trailingAnchor, constant: 8),
+      label.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+      label.trailingAnchor.constraint(lessThanOrEqualTo: steer.leadingAnchor, constant: -6),
+      steer.trailingAnchor.constraint(equalTo: close.leadingAnchor, constant: -2),
+      steer.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+      close.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -8),
+      close.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+      close.widthAnchor.constraint(equalToConstant: 28),
+    ])
+    return row
   }
 
   /// Insert a chosen slash command into the composer (caret at end) so the user can add
@@ -1984,8 +2089,17 @@ final class ChatInputBar: UIView {
     let bannerExtra: CGFloat = replyBannerExtra + mentionBannerExtra + attachmentPreviewExtra + slashSuggestionExtra
     let pillH = clampedTextH + textInsetV * 2 + bannerExtra
 
+    // Queue strip sits above the pill row (still part of the input bar height).
+    let queueCount = pendingQueueItems.count
+    let pendingQueueExtra: CGFloat =
+      pendingQueueStripVisible && queueCount > 0
+      ? (CGFloat(min(queueCount, 3)) * pendingQueueRowH
+        + CGFloat(max(0, min(queueCount, 3) - 1)) * pendingQueueStack.spacing
+        + pendingQueueGap)
+      : 0
+
     let composerBottomVPad = keyboardHeightForPanels > 0 || keyboardProgress > 0.01 ? 6.0 : bottomVPad
-    let composerHeight = topVPad + pillH + composerBottomVPad + safeBottom
+    let composerHeight = topVPad + pendingQueueExtra + pillH + composerBottomVPad + safeBottom
     let panelHeight = gifPanelVisible ? preferredGifPanelHeight() : 0
     let totalH = composerHeight + panelHeight
     let prevH = barHeight
@@ -2031,7 +2145,16 @@ final class ChatInputBar: UIView {
       gapDebugBarOverlay.isHidden = true
     }
 
-    let rowY = topVPad
+    if pendingQueueExtra > 0 {
+      pendingQueueStrip.isHidden = false
+      pendingQueueStrip.frame = CGRect(
+        x: 0, y: topVPad, width: w, height: pendingQueueExtra - pendingQueueGap)
+    } else {
+      pendingQueueStrip.isHidden = true
+      pendingQueueStrip.frame = .zero
+    }
+
+    let rowY = topVPad + pendingQueueExtra
     let rowH = pillH
     contentRow.frame = CGRect(x: 0, y: rowY, width: w, height: rowH)
 
@@ -2499,19 +2622,7 @@ final class ChatInputBar: UIView {
   }
 
   private func agentControlButtonWidth() -> CGFloat {
-    // In menu mode the chip shows "📁 <repo>  ⌄" — size it from the repo label and add
-    // room for the folder icon + chevron; otherwise size from the plain control title.
-    let usesMenu = agentControlMenu != nil
-    let label =
-      usesMenu
-      ? "\(agentControlRepoTitle.isEmpty ? "Repository" : agentControlRepoTitle)  ⌄"
-      : agentControlTitle
-    let extra: CGFloat = usesMenu ? 48.0 : 28.0
-    let titleWidth =
-      (label as NSString).size(
-        withAttributes: [.font: UIFont.systemFont(ofSize: 13.0, weight: .semibold)]
-      ).width
-    return min(184.0, max(64.0, ceil(titleWidth + extra)))
+    48.0
   }
 
   @discardableResult

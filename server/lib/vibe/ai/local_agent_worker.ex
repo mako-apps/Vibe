@@ -28,7 +28,7 @@ defmodule Vibe.AI.LocalAgentWorker do
   @claude_avatar_data_url "https://media.vibegram.io/chat-media/agent-profiles/claude.png"
   @codex_avatar_data_url "https://media.vibegram.io/chat-media/agent-profiles/codex.png"
   @grok_avatar_data_url "https://media.vibegram.io/chat-media/agent-profiles/grok-v2.png"
-  @agy_avatar_data_url "https://media.vibegram.io/chat-media/agent-profiles/agy.png"
+  @agy_avatar_data_url "https://media.vibegram.io/chat-media/agent-profiles/agy-v3.png"
   @default_timeout_ms 120_000
   @max_prompt_length 8_000
   @max_tool_events 16
