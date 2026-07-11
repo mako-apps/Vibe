@@ -49,10 +49,13 @@ defmodule VibeWeb.AgentBridgeChannel do
       "computerId" => computer_id,
       "deviceLabel" => socket.assigns[:device_label] || "computer"
     })
+
     push(socket, "presence_state", Presence.list(socket))
+
     Logger.info(
       "[AgentBridge] computer online user=#{socket.assigns.user_id} computer=#{computer_id}"
     )
+
     {:noreply, socket}
   end
 
@@ -198,6 +201,12 @@ defmodule VibeWeb.AgentBridgeChannel do
     provider = payload["provider"]
     chat_id = payload["chatId"]
 
+    # Stop accumulating this task's bridge frames now, but keep its live cell on
+    # the clients until the persisted message has been posted. Finishing the
+    # stream before `deliver_bridge_result/6` completed created a several-second
+    # empty gap (and a permanently empty view if delivery raised).
+    {socket, stream_id} = detach_stream(socket, chat_id, provider, payload)
+
     Logger.info(
       "[AgentBridge] result received user=#{socket.assigns.user_id} provider=#{inspect(provider)} chat=#{inspect(chat_id)} exit=#{inspect(payload["exitStatus"])} outputBytes=#{byte_size(payload["output"] || "")}"
     )
@@ -239,12 +248,20 @@ defmodule VibeWeb.AgentBridgeChannel do
               "[AgentBridge] deliver_bridge_result crashed chat=#{chat_id} provider=#{provider} error=#{Exception.message(err)}\n#{Exception.format(:error, err, __STACKTRACE__)}"
             )
         after
+          if is_binary(stream_id) do
+            LocalAgentWorker.finish_stream(provider, chat_id, stream_id)
+          end
+
           LocalAgentWorker.stop_activity(chat_id, agent_user_id_for(provider))
         end
       end)
+    else
+      if is_binary(stream_id) and is_binary(provider) and is_binary(chat_id) do
+        LocalAgentWorker.finish_stream(provider, chat_id, stream_id)
+      end
     end
 
-    {:reply, :ok, clear_stream(socket, chat_id, provider, payload)}
+    {:reply, :ok, socket}
   end
 
   # daemon → server: the agent's local conversation history (Claude/Codex
@@ -416,20 +433,49 @@ defmodule VibeWeb.AgentBridgeChannel do
 
   defp new_stream_id(chat_id, provider, task_id) do
     suffix = if is_binary(provider) and provider != "", do: provider <> "-", else: ""
+
     task_suffix =
       case task_id do
         value when is_binary(value) and value != "" -> String.slice(value, -12, 12) <> "-"
         _ -> ""
       end
 
-    "stream-" <> chat_id <> "-" <> suffix <> task_suffix <>
+    "stream-" <>
+      chat_id <>
+      "-" <>
+      suffix <>
+      task_suffix <>
       Integer.to_string(System.system_time(:millisecond))
   end
+
+  # Remove one task buffer from this channel process without telling clients that
+  # the stream is done. Result delivery uses this so the live row remains visible
+  # until its durable replacement has been broadcast.
+  defp detach_stream(socket, chat_id, provider, payload) when is_binary(chat_id) do
+    streams = Map.get(socket.assigns, :streams, %{})
+
+    key =
+      stream_key(
+        chat_id,
+        provider,
+        payload["taskId"] || payload["task_id"],
+        payload["teamRunId"] || payload["team_run_id"],
+        payload["teamWorker"] || payload["team_worker"]
+      )
+
+    case Map.pop(streams, key) do
+      {nil, _streams} -> {socket, nil}
+      {state, rest} -> {assign(socket, :streams, rest), state.stream_id}
+    end
+  end
+
+  defp detach_stream(socket, _chat_id, _provider, _payload), do: {socket, nil}
 
   # Finish + drop the live stream for ONE provider's task in a chat. Must not touch
   # the other provider's still-running stream in the same (group) chat.
   defp clear_stream(socket, chat_id, provider, payload) when is_binary(chat_id) do
     streams = Map.get(socket.assigns, :streams, %{})
+
     key =
       stream_key(
         chat_id,
