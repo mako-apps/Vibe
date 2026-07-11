@@ -429,6 +429,13 @@ final class ChatEngine {
   // Stable first-seen timestamp for each live agent stream (keyed chatId -> streamId)
   // so the streaming bubble keeps its position while its text grows.
   private var agentStreamTimestampsByChat: [String: [String: Int64]] = [:]
+  // LAN dual-path: last applied progress sequence per task so cloud frames that
+  // arrive later (or earlier) don't double-apply. Keyed "provider:chatId:taskId".
+  private var lanProgressSeqByTask: [String: Int] = [:]
+  // Accumulated raw CLI lines received over LAN for a task (used to keep the live
+  // bubble moving when the cloud socket is mid-flap).
+  private var lanProgressLinesByTask: [String: [String]] = [:]
+
   // Canonical row id for each in-flight bridge task (chatId -> taskId -> first-seen
   // streamId). The server's per-connection stream state is NOT durable across a
   // bridge↔server reconnect (a fresh channel process has no memory of the prior
@@ -5423,6 +5430,124 @@ final class ChatEngine {
 
   // MARK: - Live agent streaming (bridge)
   //
+  /// Ingest a frame mirrored over the direct Mac LAN link (progress / result).
+  /// Cloud `agent-stream` remains authoritative for full tool/node parse; LAN keeps
+  /// the live bubble moving during cloud flaps (sequence-deduped).
+  func ingestLanBridgeEvent(type: String, payload: [String: Any]) {
+    queue.async { [weak self] in
+      self?.ingestLanBridgeEventLocked(type: type, payload: payload)
+    }
+  }
+
+  private func ingestLanBridgeEventLocked(type: String, payload: [String: Any]) {
+    let kind = type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    switch kind {
+    case "progress":
+      ingestLanProgressLocked(payload)
+    case "result":
+      // Final result still lands via cloud→server persistence; clear LAN buffers so a
+      // late cloud agent-stream doesn't fight a stale LAN partial.
+      if let taskId = normalizedString(payload["taskId"] ?? payload["task_id"]),
+        let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"]),
+        let provider = normalizedString(payload["provider"])
+      {
+        let key = "\(provider):\(chatId):\(taskId)"
+        lanProgressLinesByTask.removeValue(forKey: key)
+        // Don't wipe seq immediately — cloud may still deliver frames with lower seq.
+      }
+    default:
+      break
+    }
+  }
+
+  private func ingestLanProgressLocked(_ payload: [String: Any]) {
+    guard let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"]),
+      let provider = normalizedString(payload["provider"]),
+      let taskId = normalizedString(payload["taskId"] ?? payload["task_id"])
+    else { return }
+    let seq = parseLongValue(payload["sequence"]) ?? 0
+    let key = "\(provider):\(chatId):\(taskId)"
+    if let prev = lanProgressSeqByTask[key], seq > 0, seq <= prev {
+      return  // already applied (cloud or earlier LAN)
+    }
+    if seq > 0 {
+      lanProgressSeqByTask[key] = Int(seq)
+    }
+    let line = normalizedString(payload["line"]) ?? ""
+    if !line.isEmpty {
+      var lines = lanProgressLinesByTask[key] ?? []
+      lines.append(line)
+      if lines.count > 400 { lines = Array(lines.suffix(400)) }
+      lanProgressLinesByTask[key] = lines
+    }
+    let accumulated = (lanProgressLinesByTask[key] ?? []).joined(separator: "\n")
+    let displayText = Self.lightweightStreamText(from: accumulated, provider: provider)
+    // Keep the header "working" so a cloud flap doesn't flash idle mid-run.
+    agentTurnRunningAtMsByChatId[chatId] = Int64(nowMs())
+    let agentUserId = Self.bridgeAgentUserId(forProvider: provider)
+    let streamId = "lan-\(taskId)"
+    var streamPayload: [String: Any] = [
+      "streamId": streamId,
+      "taskId": taskId,
+      "status": "running",
+      "text": displayText,
+      "progressNodes": [] as [[String: Any]],
+      "userId": agentUserId as Any,
+      "sequence": seq,
+    ]
+    if let reply = normalizedString(payload["replyToId"] ?? payload["reply_to_id"]) {
+      streamPayload["sourceMessageId"] = reply
+      streamPayload["replyToId"] = reply
+    }
+    // Reuse the live stream path so group/DM cells grow in place.
+    applyAgentStreamLocked(chatId: chatId, payload: streamPayload)
+  }
+
+  /// Best-effort text extract from raw CLI stream-json / plain output so LAN
+  /// progress can paint a bubble without waiting on the server reparse.
+  private static func lightweightStreamText(from accumulated: String, provider: String) -> String {
+    let p = provider.lowercased()
+    // Prefer last non-empty plain-ish assistant text blocks from stream-json lines.
+    var texts: [String] = []
+    for rawLine in accumulated.split(separator: "\n", omittingEmptySubsequences: false) {
+      let line = String(rawLine)
+      guard line.contains("{"), line.contains("}") else {
+        // Plain stdout (some Grok/Agy paths): keep non-JSON lines as text.
+        let t = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !t.isEmpty, !t.hasPrefix("{"), t.count > 1 { texts.append(t) }
+        continue
+      }
+      // content_block_delta / text deltas
+      if let range = line.range(of: #""text"\s*:\s*""#, options: .regularExpression) {
+        let after = line[range.upperBound...]
+        if let end = after.firstIndex(of: "\"") {
+          let chunk = String(after[..<end])
+            .replacingOccurrences(of: "\\n", with: "\n")
+            .replacingOccurrences(of: "\\\"", with: "\"")
+          if !chunk.isEmpty { texts.append(chunk) }
+        }
+      }
+      // agent_message style
+      if line.contains("\"type\":\"agent_message\"") || line.contains("\"type\": \"agent_message\"")
+      {
+        if let range = line.range(of: #""text"\s*:\s*""#, options: .regularExpression) {
+          let after = line[range.upperBound...]
+          if let end = after.firstIndex(of: "\"") {
+            let chunk = String(after[..<end])
+              .replacingOccurrences(of: "\\n", with: "\n")
+            if !chunk.isEmpty { texts.append(chunk) }
+          }
+        }
+      }
+    }
+    if p == "grok" || p == "agy" || p == "antigravity" {
+      // Prefer the joined tail for providers that stream prose chunks.
+      let joined = texts.joined()
+      if !joined.isEmpty { return joined }
+    }
+    return texts.joined()
+  }
+
   // A bridge agent (Claude/Codex) running on the user's computer streams its
   // reply back as it is produced. The server reparses the partial output and
   // broadcasts `agent-stream` events. We render that as a synthetic agent
@@ -5437,6 +5562,26 @@ final class ChatEngine {
     let status = (normalizedString(payload["status"]) ?? "running").lowercased()
     let agentUserId = normalizedString(payload["userId"] ?? payload["user_id"] ?? payload["id"])
     let taskId = normalizedString(payload["taskId"] ?? payload["task_id"])
+
+    // Cloud and LAN both carry sequence; advance the high-water mark so the other
+    // path cannot re-apply a staler frame as a second bubble update.
+    if let taskId, !taskId.isEmpty,
+      let provider = normalizedString(payload["provider"])
+        ?? bridgeProviderForAgentIdentifier(agentUserId)
+        ?? bridgeProviderForChatLocked(chatId: chatId),
+      let seq = parseLongValue(payload["sequence"]), seq > 0
+    {
+      let key = "\(provider):\(chatId):\(taskId)"
+      let prev = lanProgressSeqByTask[key] ?? 0
+      if Int(seq) < prev {
+        // Strictly older dual-path frame — skip. Equal seq may still carry a
+        // richer cloud reparse (progressNodes) so it is allowed through.
+        return
+      }
+      if Int(seq) > prev {
+        lanProgressSeqByTask[key] = Int(seq)
+      }
+    }
 
     // Resolve the row's canonical identity through taskId, not the raw streamId. The
     // server's per-connection stream state isn't durable across a bridge↔server

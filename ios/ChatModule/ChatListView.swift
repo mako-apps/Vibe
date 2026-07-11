@@ -3630,12 +3630,20 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         // Route those rows through `reconfigureItems` instead so the SAME cell + body view
         // persists and just grows smoothly; `invalidateLayout` still re-queries the new
         // height. Non-agent height changes (e.g. reactions) keep the reloadItems path.
-        let agentTurnReloads = safeReloads.filter { indexPath in
+        // Keep the SAME cell for any live streaming agent row (1:1 agent-turn feed OR
+        // group plain-text stream). reloadItems recreates the cell → full re-fade +
+        // group gutter re-apply = the "flicker / content shift" user sees in multi-agent
+        // groups. reconfigureItems grows text in place; invalidateLayout picks new height.
+        let inPlaceStreamReloads = safeReloads.filter { indexPath in
           guard indexPath.item < rows.count else { return false }
-          return bubbleUsesAgentTurnContent(rows[indexPath.item])
+          let row = rows[indexPath.item]
+          if bubbleUsesAgentTurnContent(row) { return true }
+          if row.isAgentMessage, row.isStreamingText { return true }
+          return false
         }
-        let otherReloads = safeReloads.filter { !agentTurnReloads.contains($0) }
-        inPlaceAgentTurnGrowth = otherReloads.isEmpty && !agentTurnReloads.isEmpty
+        let otherReloads = safeReloads.filter { !inPlaceStreamReloads.contains($0) }
+        inPlaceAgentTurnGrowth = otherReloads.isEmpty && !inPlaceStreamReloads.isEmpty
+        let wasNearBottom = currentDistanceFromBottom() <= listBottomThreshold
         UIView.performWithoutAnimation {
           CATransaction.begin()
           CATransaction.setDisableActions(true)
@@ -3645,15 +3653,23 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
               if !otherReloads.isEmpty {
                 collectionView.reloadItems(at: otherReloads)
               }
-              if !agentTurnReloads.isEmpty {
+              if !inPlaceStreamReloads.isEmpty {
                 if #available(iOS 15.0, *), self.rows.count > 1 {
-                  collectionView.reconfigureItems(at: agentTurnReloads)
+                  collectionView.reconfigureItems(at: inPlaceStreamReloads)
                 } else {
-                  collectionView.reloadItems(at: agentTurnReloads)
+                  collectionView.reloadItems(at: inPlaceStreamReloads)
                 }
               }
             },
             completion: nil)
+          collectionView.layoutIfNeeded()
+          // Growing a bottom stream row without pin makes the whole list "jump".
+          if wasNearBottom {
+            scrollToBottom(animated: false)
+          }
+          if isGroupOrChannel {
+            updateFloatingSenderAvatars()
+          }
           CATransaction.commit()
         }
         UIView.performWithoutAnimation {
@@ -6980,7 +6996,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
   }
 
-  private static let streamSyncMinInterval: CFTimeInterval = 0.12
+  // ~16–20 fps for live stream ticks. 120ms felt laggy on Grok (sub-second CLI)
+  // while still batching enough to avoid main-thread thrash on multi-agent groups.
+  private static let streamSyncMinInterval: CFTimeInterval = 0.05
   private func scheduleStreamCoalescedSetRows() {
     guard streamSyncCoalesceWorkItem == nil else { return }
     let now = CACurrentMediaTime()

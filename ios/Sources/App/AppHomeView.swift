@@ -1307,6 +1307,7 @@ private final class ChatsViewModel: ObservableObject {
   private var backgroundRefreshTask: Task<Void, Never>?
   private var agentConversationObserver: NSObjectProtocol?
   private var realtimeMessageObserver: NSObjectProtocol?
+  private var bridgeStatusObserver: NSObjectProtocol?
   private var realtimeRefreshTask: Task<Void, Never>?
   private var locallyRemovedChatIDs = Set<String>()
   private var projectedMessageIDsByChat = [String: String]()
@@ -1367,6 +1368,19 @@ private final class ChatsViewModel: ObservableObject {
         }
       }
     }
+
+    bridgeStatusObserver = NotificationCenter.default.addObserver(
+      forName: AgentPairingService.statusDidChangeNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+        // The status lives outside ChatHomeListRow, so publish the existing rows
+        // again to reconfigure visible cells as tasks start and finish.
+        self.rows = Array(self.rows)
+      }
+    }
   }
 
   deinit {
@@ -1377,6 +1391,9 @@ private final class ChatsViewModel: ObservableObject {
     }
     if let realtimeMessageObserver {
       NotificationCenter.default.removeObserver(realtimeMessageObserver)
+    }
+    if let bridgeStatusObserver {
+      NotificationCenter.default.removeObserver(bridgeStatusObserver)
     }
   }
 
@@ -2248,6 +2265,17 @@ private struct ChatHomeScreen: View {
       AppUITrace.notice("ChatHomeScreen task loadIfNeeded")
       await model.loadIfNeeded()
       await model.loadArchivedIfNeeded()
+    }
+    .task {
+      // Status is a small REST snapshot. Poll only while Home is mounted so a
+      // desktop-started Codex task appears without waiting for navigation or a
+      // chat-channel event; SwiftUI cancels this loop when Home disappears.
+      while !Task.isCancelled {
+        if let config = AppSessionConfig.current {
+          _ = try? await AgentPairingService.status(config: config)
+        }
+        try? await Task.sleep(nanoseconds: 2_000_000_000)
+      }
     }
     .task(id: homeSearchQuery) {
       await runGlobalSearch()
@@ -6844,17 +6872,27 @@ final class ChatConversationController: UIViewController {
         guard let self, self.route.chatId == chatId, self.rowsRefreshGeneration == generation else {
           return
         }
-        let rows = nativeRows.isEmpty ? initialRows : nativeRows
+        // Bridge DMs are driven by a local, live session transcript. A transient empty
+        // engine read must not replace a visible optimistic prompt / settled response with
+        // the route's original (often empty) snapshot while that session re-pushes. Normal
+        // chats retain their existing empty-state behavior, including an explicit clear.
+        let isBridgeDM = !(self.route.bridgeProvider ?? "")
+          .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let fallbackSource =
+          isBridgeDM && !self.latestProfileRows.isEmpty ? "retained" : "initial"
+        let fallbackRows =
+          isBridgeDM && !self.latestProfileRows.isEmpty ? self.latestProfileRows : initialRows
+        let rows = nativeRows.isEmpty ? fallbackRows : nativeRows
         let firstRowID =
           Self.normalizedString(rows.first?["id"])
           ?? Self.normalizedString(rows.first?["messageId"])
           ?? "nil"
         appShellRouteLog(
-          "ChatConversationController refreshRows chatId=\(chatId) rows=\(rows.count) nativeRows=\(nativeRows.count) initialRows=\(initialRows.count) source=\(nativeRows.isEmpty ? "initial" : "native") firstRowId=\(firstRowID)")
+          "ChatConversationController refreshRows chatId=\(chatId) rows=\(rows.count) nativeRows=\(nativeRows.count) initialRows=\(initialRows.count) retainedRows=\(self.latestProfileRows.count) source=\(nativeRows.isEmpty ? fallbackSource : "native") firstRowId=\(firstRowID)")
         let didApply = self.applyRowsToSurface(
           rows,
           chatId: chatId,
-          source: nativeRows.isEmpty ? "initial" : "native",
+          source: nativeRows.isEmpty ? fallbackSource : "native",
           firstRowID: firstRowID,
           allowDeferUntilAttached: true
         )
@@ -8790,19 +8828,29 @@ private struct HomeListStyleAvatar: View {
   private func loadAvatar() async {
     let uri = avatarURI?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     guard !uri.isEmpty else {
+      // No URL — only clear if we must; initials show underneath.
       loadedImage = nil
       return
     }
+    // Memory/disk seed: paint before any await (kills cold-launch flash).
     if let cached = ChatAvatarImageStore.cached(for: uri) {
-      loadedImage = cached
+      withAnimation(.easeInOut(duration: 0.18)) {
+        loadedImage = cached
+      }
       return
     }
-    loadedImage = nil
+    // Keep previous image while fetching (no blank → initials pop).
+    let previous = loadedImage
     let image = await ChatAvatarImageStore.load(from: uri)
-    // Ignore stale loads if URI changed mid-flight.
     let current = avatarURI?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     guard current == uri else { return }
-    loadedImage = image
+    if let image {
+      withAnimation(.easeInOut(duration: 0.22)) {
+        loadedImage = image
+      }
+    } else if previous == nil {
+      loadedImage = nil
+    }
   }
 }
 
@@ -9828,55 +9876,66 @@ enum GroupProfileActionRouter {
     let myId = AppSessionConfig.current?.userID ?? ""
     guard !userId.isEmpty else { return }
 
-    let roleLabel: String = {
-      switch role {
-      case "owner": return "Owner"
-      case "admin": return "Admin"
-      default: return "Member"
-      }
-    }()
     let isSelf = !myId.isEmpty && userId.caseInsensitiveCompare(myId) == .orderedSame
-    let sheet = UIAlertController(
-      title: name,
-      message: isSelf ? "You · \(roleLabel)" : roleLabel,
-      preferredStyle: .actionSheet
-    )
-
-    // Admin actions only for managers acting on non-self, non-owner targets.
+    // Direct hold-menu actions — no intermediate popup.
+    let action = (str(payload["action"]) ?? "").lowercased()
     if canManage, !isSelf, role != "owner" {
-      if role == "admin" {
-        sheet.addAction(
-          UIAlertAction(title: "Dismiss as Admin", style: .default) { _ in
-            Task {
-              await setRole(
-                chatId: chatId, userId: userId, role: "member",
-                success: "\(name) is no longer an admin.")
-            }
-          })
-      } else {
-        sheet.addAction(
-          UIAlertAction(title: "Make Admin", style: .default) { _ in
-            Task {
-              await setRole(
-                chatId: chatId, userId: userId, role: "admin",
-                success: "\(name) is now an admin.")
-            }
-          })
+      switch action {
+      case "promote":
+        Task {
+          await setRole(
+            chatId: chatId, userId: userId, role: "admin",
+            success: "\(name) is now an admin.")
+        }
+        return
+      case "demote":
+        Task {
+          await setRole(
+            chatId: chatId, userId: userId, role: "member",
+            success: "\(name) is no longer an admin.")
+        }
+        return
+      case "remove":
+        Task { await removeMember(chatId: chatId, userId: userId, success: "Removed \(name).") }
+        return
+      default:
+        break
       }
-      sheet.addAction(
-        UIAlertAction(title: "Remove from Group", style: .destructive) { _ in
-          Task { await removeMember(chatId: chatId, userId: userId, success: "Removed \(name).") }
-        })
     }
 
-    // Always give feedback — previously non-manager taps returned silently so
-    // member rows looked like dead placeholders.
-    if sheet.actions.isEmpty {
-      sheet.addAction(UIAlertAction(title: "OK", style: .cancel))
-    } else {
-      sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+    // Manage sheet (hold → Manage). Skip empty/non-manager cases — no OK-only popup.
+    guard canManage, !isSelf, role != "owner" else { return }
+
+    let sheet = GroupMemberActionsSheet(
+      name: name,
+      role: role,
+      onPromote: {
+        Task {
+          await setRole(
+            chatId: chatId, userId: userId, role: "admin",
+            success: "\(name) is now an admin.")
+        }
+      },
+      onDemote: {
+        Task {
+          await setRole(
+            chatId: chatId, userId: userId, role: "member",
+            success: "\(name) is no longer an admin.")
+        }
+      },
+      onRemove: {
+        Task { await removeMember(chatId: chatId, userId: userId, success: "Removed \(name).") }
+      }
+    )
+    let host = UIHostingController(rootView: sheet)
+    host.view.backgroundColor = .clear
+    host.modalPresentationStyle = .pageSheet
+    if let detents = host.sheetPresentationController {
+      detents.detents = [.medium()]
+      detents.prefersGrabberVisible = true
+      detents.preferredCornerRadius = 28
     }
-    presentSheet(sheet, on: presenter)
+    presenter.present(host, animated: true)
   }
 
   private static func confirmDestructive(
@@ -10452,6 +10511,14 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
   @objc private func handleDidBecomeActive() {
     VibeNativeCallOverlayPresenter.shared.refreshFromEngine()
     refreshSettingsTabAvatar()
+    // Keep the direct Mac LAN link warm whenever the app is foregrounded so
+    // agent progress can ride Wi‑Fi instead of the flaky cloud relay.
+    if AgentRuntimeCrypto.hasKey {
+      let cfg = ChatEngineStore.shared.getConfig()
+      let userId =
+        (cfg["userId"] as? String) ?? (cfg["myUserId"] as? String)
+      LanBridgeService.shared.start(userId: userId)
+    }
   }
 
   private func refreshSettingsTabAvatar() {
@@ -10459,6 +10526,11 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
     let profile = AppProfileController.shared.profile
     guard let uri = profile?.profileImage, !uri.isEmpty else {
       applySettingsTabFallback(profile: profile)
+      return
+    }
+    // Immediate paint from memory/disk cache (seeded on photo upload).
+    if let cached = ChatAvatarImageStore.cached(for: uri) {
+      applySettingsTabImage(cached)
       return
     }
     settingsAvatarTask = Task { [weak self] in
@@ -10537,11 +10609,28 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
   }
 
   private static func circularTabImage(from source: UIImage, size: CGFloat) -> UIImage? {
-    let renderer = UIGraphicsImageRenderer(size: CGSize(width: size, height: size))
+    // Device-scale renderer so @3x tab icons stay sharp (not soft/pressed).
+    let format = UIGraphicsImageRendererFormat.default()
+    format.scale = UIScreen.main.scale
+    format.opaque = false
+    let renderer = UIGraphicsImageRenderer(size: CGSize(width: size, height: size), format: format)
     let image = renderer.image { ctx in
       let rect = CGRect(x: 0, y: 0, width: size, height: size)
       UIBezierPath(ovalIn: rect).addClip()
-      source.draw(in: rect)
+
+      // Aspect-fill center-crop — square `draw(in:)` squashes non-square photos.
+      let srcW = max(1, source.size.width)
+      let srcH = max(1, source.size.height)
+      let scale = max(size / srcW, size / srcH)
+      let drawW = srcW * scale
+      let drawH = srcH * scale
+      let drawRect = CGRect(
+        x: (size - drawW) * 0.5,
+        y: (size - drawH) * 0.5,
+        width: drawW,
+        height: drawH
+      )
+      source.draw(in: drawRect)
 
       ctx.cgContext.resetClip()
       let badgeSize: CGFloat = 8

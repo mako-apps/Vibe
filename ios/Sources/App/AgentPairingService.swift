@@ -403,6 +403,10 @@ struct AgentBridgeRunOptions: Equatable {
     } else {
       ladder = ["low", "medium", "high"]
     }
+    // Thinking Off → lowest advertised effort.
+    if !AgentBridgeSelectionStore.isThinkingEnabled() {
+      return ladder.first ?? "low"
+    }
     let base: String
     if key == "claude" {
       base = intelligence.claudeEffort
@@ -597,6 +601,19 @@ enum AgentBridgeSelectionStore {
     NotificationCenter.default.post(name: didChangeNotification, object: nil)
   }
 
+  private static let thinkingEnabledKey = "agentBridge.thinkingEnabled"
+
+  /// When false, runs use the lowest effort / Thinking Off in profile menus.
+  static func isThinkingEnabled() -> Bool {
+    if UserDefaults.standard.object(forKey: thinkingEnabledKey) == nil { return true }
+    return UserDefaults.standard.bool(forKey: thinkingEnabledKey)
+  }
+
+  static func setThinkingEnabled(_ enabled: Bool) {
+    UserDefaults.standard.set(enabled, forKey: thinkingEnabledKey)
+    NotificationCenter.default.post(name: didChangeNotification, object: nil)
+  }
+
   static func selectedSpeed() -> AgentBridgeSpeedMode {
     let raw = UserDefaults.standard.string(forKey: speedKey) ?? AgentBridgeSpeedMode.standard.rawValue
     return AgentBridgeSpeedMode(rawValue: raw) ?? .standard
@@ -656,6 +673,103 @@ enum AgentBridgeSelectionStore {
       return live.map { ($0.title, $0.subtitle, $0.value) }
     }
     return hardcodedModelChoices(provider: key)
+  }
+
+  /// Latest / CLI-current models for the top-level menu (not the long legacy list).
+  static func primaryModelChoices(provider: String) -> [(title: String, subtitle: String?, value: String)] {
+    let all = modelChoices(provider: provider)
+    let key = provider.lowercased()
+    let live = liveModelChoices(provider: provider)
+    let defaultIds = Set(
+      live.filter(\.isDefault).map { $0.value.lowercased() }
+    )
+    let primary = all.filter { choice in
+      isPrimaryModel(
+        provider: key,
+        value: choice.value,
+        title: choice.title,
+        isDefault: defaultIds.contains(choice.value.lowercased())
+      )
+    }
+    if !primary.isEmpty { return primary }
+    // Fallback: first few live rows so the menu never empties.
+    return Array(all.prefix(4))
+  }
+
+  /// Older / non-latest models nested under "Other Models".
+  static func otherModelChoices(provider: String) -> [(title: String, subtitle: String?, value: String)] {
+    let primaryValues = Set(primaryModelChoices(provider: provider).map { $0.value.lowercased() })
+    return modelChoices(provider: provider).filter {
+      !primaryValues.contains($0.value.lowercased())
+    }
+  }
+
+  /// True for current-generation models the CLI surfaces as primary picks.
+  private static func isPrimaryModel(
+    provider: String, value: String, title: String, isDefault: Bool
+  ) -> Bool {
+    if isDefault { return true }
+    let v = value.lowercased().replacingOccurrences(of: "_", with: "-")
+    let t = title.lowercased()
+    switch provider {
+    case "claude":
+      if isLegacyClaudeModel(value: v, title: t) { return false }
+      // Latest generation markers (CLI Sonnet 5 / Opus 4.8 / Haiku 4.5 / Fable).
+      if v.contains("sonnet-5") || t.contains("sonnet 5") { return true }
+      if v.contains("opus-4-8") || t.contains("opus 4.8") { return true }
+      if v.contains("haiku-4-5") || t.contains("haiku 4.5") { return true }
+      if v.contains("fable") || t.contains("fable") { return true }
+      // Seed fallbacks without live catalog.
+      if v == "claude-sonnet-5" || v == "claude-opus-4-8" || v == "claude-fable-5" {
+        return true
+      }
+      if v.contains("claude-haiku-4-5") { return true }
+      return false
+    case "codex", "gpt":
+      if isLegacyCodexModel(value: v, title: t) { return false }
+      if v.contains("5.6") || v.contains("5-6") || t.contains("5.6") { return true }
+      if v.contains("sol") { return true }
+      return false
+    case "grok":
+      return v.contains("4.5") || t.contains("4.5") || v.contains("composer-2.5")
+    case "agy", "antigravity":
+      // Agy list is small — treat all as primary.
+      return true
+    default:
+      return isDefault
+    }
+  }
+
+  private static func isLegacyClaudeModel(value v: String, title t: String) -> Bool {
+    // Explicit old generations the user doesn't want in the main menu.
+    if v.contains("claude-3") || v.contains("3-5-sonnet") || v.contains("3-7") { return true }
+    if (v.contains("sonnet-4") || t.contains("sonnet 4")) && !v.contains("sonnet-5")
+      && !t.contains("sonnet 5")
+    {
+      return true
+    }
+    if v.contains("opus-4-1") || v.contains("opus-4.1") || t.contains("opus 4.1") { return true }
+    if (v.contains("opus-4-0") || t.contains("opus 4.0") || t.contains("4.0"))
+      && !v.contains("opus-4-8")
+    {
+      return true
+    }
+    if t.contains("sonnet 4.5") || t.contains("sonnet 4.0") { return true }
+    if t.contains("opus 4.1") || t.contains("opus 4.0") { return true }
+    return false
+  }
+
+  private static func isLegacyCodexModel(value v: String, title t: String) -> Bool {
+    if v.contains("gpt-4") || t.contains("gpt-4") { return true }
+    if v.contains("o1") || v.contains("o3") || v.contains("o4") { return true }
+    // Older 5.x lines when 5.6 is present stay in Other via primary filter.
+    if (v.contains("gpt-5.2") || v.contains("gpt-5.4") || v.contains("gpt-5.5")
+      || v == "gpt-5" || v.hasPrefix("gpt-5-"))
+      && !v.contains("5.6")
+    {
+      return true
+    }
+    return false
   }
 
   static func liveModelChoices(provider: String) -> [AgentBridgeModelChoice] {
@@ -841,9 +955,7 @@ enum AgentBridgeSelectionStore {
       ]
     default:
       return [
-        ("GPT-5.6 Sol", "Seed fallback", "gpt-5.6-sol"),
-        ("GPT-5.6", "Seed fallback", "gpt-5.6"),
-        ("GPT-5.5", "Seed fallback", "gpt-5.5"),
+        ("GPT-5.5", "Compatible with this Codex CLI", "gpt-5.5"),
         ("GPT-5.5 Pro", "Seed fallback", "gpt-5.5-pro"),
         ("GPT-5.4", "Seed fallback", "gpt-5.4"),
         ("GPT-5.2", "Seed fallback", "gpt-5.2"),
@@ -910,7 +1022,7 @@ enum AgentBridgeSelectionStore {
     case "claude": return "claude-sonnet-5"
     case "grok": return "grok-4.5"
     case "agy", "antigravity": return "Gemini 3.1 Pro (High)"
-    case "codex": return "gpt-5.6-sol"
+    case "codex": return "gpt-5.5"
     default: return nil
     }
   }
@@ -1049,6 +1161,9 @@ enum AgentBridgeSelectionStore {
       // Agy model labels are human-readable and passed through as-is (effort in name).
       return model
     default:
+      if ["gpt-5.6-sol", "gpt-5-6-sol", "gpt-5.6", "gpt-5-6"].contains(normalized) {
+        return "gpt-5.5"
+      }
       if normalized == "gpt-5.3-codex" || normalized == "gpt-5-3-codex" { return "gpt-5.5" }
       return model
     }
@@ -1207,6 +1322,8 @@ enum AgentPairingError: LocalizedError {
 /// REST client for the agent-bridge pairing endpoints. Mirrors the HTTP shape used
 /// by `ChatHomeService` / `ContactSearchService` (Bearer auth, ngrok skip header).
 enum AgentPairingService {
+  static let statusDidChangeNotification = Notification.Name("AgentBridgeStatusDidChange")
+
   /// Last successfully fetched bridge status, warmed by EVERY `status()` caller
   /// (connect panel, profile card, history view). Callers read it to decide
   /// synchronously whether a computer is already online — so the connect gate never
@@ -1259,7 +1376,10 @@ enum AgentPairingService {
       AgentBridgeSelectionStore.ingestLiveModels(models)
     }
 
-    await MainActor.run { lastStatus = result }
+    await MainActor.run {
+      lastStatus = result
+      NotificationCenter.default.post(name: statusDidChangeNotification, object: result)
+    }
     return result
   }
 
@@ -1713,9 +1833,17 @@ final class LanBridgeService {
       return
     }
 
-    // Authenticated. Phase 3b routes history_result / progress / result frames into the
-    // ChatEngine ingest here; for now, prove the link stays live.
-    NSLog("[LanBridge] frame over LAN: type=\(type)")
+    // Authenticated: route live agent traffic into ChatEngine so co-located phones
+    // do not wait on the cloud relay for every progress tick.
+    switch type {
+    case "progress", "result", "status", "bridge_status":
+      let payload = (obj["payload"] as? [String: Any]) ?? obj
+      DispatchQueue.main.async {
+        ChatEngine.shared.ingestLanBridgeEvent(type: type, payload: payload)
+      }
+    default:
+      NSLog("[LanBridge] frame over LAN: type=\(type)")
+    }
   }
 
   private func sendLocked(_ obj: [String: Any]) {

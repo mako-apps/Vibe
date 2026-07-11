@@ -61,13 +61,15 @@ const KEEPALIVE_MS = 10 * 1000;
 // waiting on the Phoenix channel join state, so it catches a zombie connection well before
 // the app heartbeat's 2-miss threshold would.
 //
-// TUNING (2026-07-05): the old 10s / 1-miss setting terminated the transport after a single
-// late pong — on a jittery mobile/QUIC-edge path one delayed pong is NOT a dead socket, and
-// this self-inflicted terminate() was a prime suspect for the ~50s reconnect flapping
-// (137 drops / 2h observed). Widened to 15s / 2-miss so only a socket that is genuinely
-// silent for ~45s is killed; the Phoenix 15s heartbeat + app-heartbeat remain as backstops.
-const WS_PING_INTERVAL_MS = 15 * 1000;
-const WS_PING_MAX_MISSES = 2;
+// TUNING (2026-07-11): Cloudflare/edge still delays pongs. Logs showed miss#1 → 1006 →
+// reconnect ~3s in a loop, which batched progress frames (recv→push 7–15s). Raw ws-ping
+// terminate was self-inflicting flaps; it is now OBSERVE-ONLY. Application heartbeat
+// (channel push "heartbeat") is the sole reconnect authority, with a higher miss budget.
+const WS_PING_INTERVAL_MS = 20 * 1000;
+const WS_PING_MAX_MISSES = 4; // log-only past this; never terminate from ws ping alone
+const APP_HEARTBEAT_INTERVAL_MS = 30 * 1000;
+const APP_HEARTBEAT_PUSH_TIMEOUT_MS = 15 * 1000;
+const APP_HEARTBEAT_MAX_MISSES = 3; // ~90s of silence before force reconnect
 const MAX_DIFF_BYTES = 90 * 1024;
 const MAX_DIFF_FILES = 24;
 const MAX_UNTRACKED_FILE_BYTES = 220 * 1024;
@@ -1685,7 +1687,21 @@ function pushProgressFrame(channel, key, payload) {
   try {
     channel.push("progress", framed).receive("ok", () => ackProgressFrame(key, seq));
   } catch (_) {}
+  // Mirror to any authenticated LAN clients so a co-located phone gets frames even when
+  // the cloud socket is flapping. Cloud remains the ack source of truth for frameLog prune.
+  fanoutLanEvent("progress", framed);
   return framed;
+}
+
+/** Fire-and-forget fanout to every authenticated LAN phone socket. */
+function fanoutLanEvent(type, payload) {
+  if (!lanClients || lanClients.size === 0) return;
+  const raw = JSON.stringify({ type, payload: payload == null ? {} : payload });
+  for (const sock of lanClients) {
+    try {
+      if (sock.readyState === WebSocket.OPEN) sock.send(raw);
+    } catch (_) {}
+  }
 }
 
 // Server → bridge ack for a delivered progress frame. Prunes every frame up through
@@ -4492,6 +4508,7 @@ async function runTask(channel, task) {
     });
     rememberRuntime(provider, chatId, agentRuntime);
     channel.push("result", resultPayload);
+    fanoutLanEvent("result", resultPayload);
     // Plan mode: the model proposed but made no edits. Surface the plan to the
     // phone for approval (the phone re-sends an "implement" run on approve).
     try {
@@ -9721,11 +9738,23 @@ function recoverAfterReconnect(channel) {
   socketDownSince = null;
 }
 
+// Single-flight reconnect: overlapping forceReconnect from heartbeat + onClose used to
+// thrash the transport every ~3s (log: 50+ reconnects / short window).
+let reconnectInFlight = false;
+let reconnectInFlightUntil = 0;
+
 // Hard-kill a (likely half-open) transport so Phoenix runs its normal
 // reconnect+rejoin path — the same path a real network drop takes. We prefer
 // ws.terminate() because on a zombie socket ws.close() waits on a close
 // handshake the dead peer will never answer, leaving us deaf for minutes.
 function forceReconnect(socket) {
+  const now = Date.now();
+  if (reconnectInFlight && now < reconnectInFlightUntil) {
+    console.log("[vibe-bridge] forceReconnect skipped (already in flight)");
+    return;
+  }
+  reconnectInFlight = true;
+  reconnectInFlightUntil = now + 4000;
   try {
     if (socket.conn && typeof socket.conn.terminate === "function") {
       socket.conn.terminate();
@@ -9744,29 +9773,26 @@ function forceReconnect(socket) {
   }
 }
 
-// ws-level ping/pong watchdog attached to the RAW transport (socket.conn) on every
-// (re)connect. This is the fast path for detecting a half-open TCP connection — a dead
-// peer whose FIN/RST never arrives (common through Cloudflare/Railway's proxy layer)
-// leaves onClose unfired for minutes, but a ping control frame gets no pong back within
-// one interval, so we notice in ~WS_PING_INTERVAL_MS instead. Independent of the Phoenix
-// channel/app-heartbeat below (see WS_PING_INTERVAL_MS) — either one firing is enough to
-// force the reconnect.
+// ws-level ping/pong OBSERVER only. Cloudflare often delays pongs; terminating on miss
+// was the primary cause of the 1006 reconnect storm that batched progress frames.
+// Application-level heartbeat remains the sole reconnect authority.
 function attachSocketLivenessPing(conn) {
   if (!conn || typeof conn.ping !== "function") return;
   let awaitingPong = false;
   let misses = 0;
+  let lastPongAt = Date.now();
   const pingTimer = setInterval(() => {
     if (conn.readyState !== WebSocket.OPEN) return;
     if (awaitingPong) {
       misses += 1;
-      console.error(`[vibe-bridge] ws ping timeout (#${misses}) — socket may be a zombie`);
+      console.warn(
+        `[vibe-bridge] ws ping timeout (#${misses}) rtt> ${WS_PING_INTERVAL_MS}ms ` +
+          `lastPongAge=${Date.now() - lastPongAt}ms (observe-only; app heartbeat owns reconnect)`
+      );
       if (misses > WS_PING_MAX_MISSES) {
-        console.error("[vibe-bridge] terminating zombie socket (ws ping got no pong)");
-        clearInterval(pingTimer);
-        try {
-          conn.terminate();
-        } catch (_) {}
-        return;
+        // Reset counter so logs stay readable; do NOT terminate.
+        misses = 0;
+        awaitingPong = false;
       }
     }
     awaitingPong = true;
@@ -9777,6 +9803,7 @@ function attachSocketLivenessPing(conn) {
   conn.on("pong", () => {
     awaitingPong = false;
     misses = 0;
+    lastPongAt = Date.now();
   });
   conn.on("close", () => clearInterval(pingTimer));
 }
@@ -10075,6 +10102,7 @@ function connect(server, token, userId) {
             "   Change projects later with:  vibegram-bridge --pick\n"
         );
       }
+      reconnectInFlight = false;
       recoverAfterReconnect(channel);
       pushBridgeStatus(channel);
     })
@@ -10089,27 +10117,29 @@ function connect(server, token, userId) {
   // delivered and the bridge goes silent indefinitely (observed: 8+ min dead
   // while the phone got no response at all).
   //
-  // So we run an APPLICATION-level liveness check independent of Phoenix's
-  // internal heartbeat: push a heartbeat that expects an :ok reply (the server
-  // replies :ok in agent_bridge_channel). If two in a row time out, hard-kill
-  // the transport so Phoenix reconnects+rejoins on its own.
+  // APPLICATION-level liveness: sole reconnect authority (ws-ping is observe-only).
+  // Higher miss budget + longer push timeout: one delayed ack through the edge must
+  // NOT thrash the socket (that batch-dumped progress at 7–15s recv→push).
   let missedHeartbeats = 0;
   setInterval(() => {
     if (channel.state !== "joined") return;
+    // Don't pile heartbeats while a reconnect is already in flight.
+    if (reconnectInFlight && Date.now() < reconnectInFlightUntil) return;
     channel
-      .push("heartbeat", {}, 10000)
+      .push("heartbeat", {}, APP_HEARTBEAT_PUSH_TIMEOUT_MS)
       .receive("ok", () => {
         if (missedHeartbeats > 0) {
           console.log(`[vibe-bridge] heartbeat recovered after ${missedHeartbeats} miss(es)`);
         }
         missedHeartbeats = 0;
+        reconnectInFlight = false;
       })
       .receive("timeout", () => {
         missedHeartbeats += 1;
         console.error(
-          `[vibe-bridge] heartbeat ack timeout (#${missedHeartbeats}) — socket may be a zombie`
+          `[vibe-bridge] heartbeat ack timeout (#${missedHeartbeats}/${APP_HEARTBEAT_MAX_MISSES}) — socket may be a zombie`
         );
-        if (missedHeartbeats >= 2) {
+        if (missedHeartbeats >= APP_HEARTBEAT_MAX_MISSES) {
           console.error(
             "[vibe-bridge] forcing reconnect after repeated heartbeat timeouts (zombie socket)"
           );
@@ -10117,8 +10147,12 @@ function connect(server, token, userId) {
           forceReconnect(socket);
         }
       });
-    pushBridgeStatus(channel);
-  }, 30000);
+    // Status is useful but not every tick — only when idle tasks need advertising.
+    // Pushing status every 30s during heavy stream was extra channel load on a flaky edge.
+    if (runningTasks.size === 0) {
+      pushBridgeStatus(channel);
+    }
+  }, APP_HEARTBEAT_INTERVAL_MS);
 }
 
 async function runSelfTest() {
