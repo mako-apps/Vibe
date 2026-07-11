@@ -42,6 +42,10 @@ try {
 
 const CONFIG_DIR = path.join(os.homedir(), ".vibe");
 const CONFIG_FILE = path.join(CONFIG_DIR, "bridge.json");
+// Exclusive lock so only ONE bridge daemon holds the socket for a machine.
+// Dual bridges both receive run_task and post duplicate agent replies (e.g. two Grok bubbles).
+const SINGLETON_LOCK_FILE = path.join(CONFIG_DIR, "bridge.singleton.lock");
+const SINGLETON_PID_FILE = path.join(CONFIG_DIR, "bridge.pid");
 const MAX_PROGRESS_LINES = 400; // safety cap on streamed events per task
 const MAX_LINE_BYTES = 8 * 1024;
 // During long silent stretches (Opus extended thinking emits the whole reasoning
@@ -10205,6 +10209,216 @@ async function runSelfTest() {
   );
 }
 
+// ── Singleton (one bridge process at a time) ────────────────────────
+
+/**
+ * Ensure only ONE long-lived bridge daemon runs on this machine.
+ *
+ * Dual bridges both join the server socket and both execute run_task, which
+ * posts duplicate agent replies (e.g. two near-identical Grok bubbles). On
+ * start we:
+ *   1) kill every other vibe-bridge / vibegram-bridge node process
+ *   2) claim ~/.vibe/bridge.pid
+ *   3) re-sweep after a short settle (covers two starters racing)
+ *   4) if another live pid still owns the pidfile, exit
+ *
+ * Management commands (--status, --install, --help, …) skip this.
+ */
+function ensureBridgeSingleton() {
+  fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  killOtherBridgeProcesses();
+
+  // Serialize concurrent starters via exclusive O_EXCL create of a lock stamp.
+  // The winner writes the pidfile; the loser exits (after killing others so a
+  // stale lock can't block forever).
+  let wonLock = false;
+  try {
+    const fd = fs.openSync(SINGLETON_LOCK_FILE, "wx", 0o600);
+    fs.writeFileSync(fd, String(process.pid) + "\n");
+    fs.closeSync(fd);
+    wonLock = true;
+  } catch (err) {
+    if (err && err.code === "EEXIST") {
+      const holder = readLockFilePid(SINGLETON_LOCK_FILE);
+      if (holder && holder !== process.pid && isProcessAlive(holder)) {
+        // Live holder — kill it (user asked: auto-kill duplicates), then claim.
+        try {
+          process.kill(holder, "SIGTERM");
+          console.log(
+            `[vibe-bridge] killed lock-holder bridge pid=${holder}`
+          );
+        } catch (_) {}
+        try {
+          execFileSync("sleep", ["0.2"], { stdio: "ignore" });
+        } catch (_) {}
+        if (isProcessAlive(holder)) {
+          try {
+            process.kill(holder, "SIGKILL");
+          } catch (_) {}
+        }
+      }
+      try {
+        fs.unlinkSync(SINGLETON_LOCK_FILE);
+      } catch (_) {}
+      try {
+        const fd = fs.openSync(SINGLETON_LOCK_FILE, "wx", 0o600);
+        fs.writeFileSync(fd, String(process.pid) + "\n");
+        fs.closeSync(fd);
+        wonLock = true;
+      } catch (err2) {
+        // Another starter won the re-create race — yield.
+        const other = readLockFilePid(SINGLETON_LOCK_FILE) || readBridgePidFile();
+        console.error(
+          `[vibe-bridge] another bridge is already running` +
+            (other ? ` (pid ${other})` : "") +
+            `; exiting`
+        );
+        process.exit(0);
+      }
+    } else {
+      console.error(
+        `[vibe-bridge] cannot claim singleton lock: ${(err && err.message) || err}`
+      );
+      process.exit(1);
+    }
+  }
+
+  if (!wonLock) {
+    console.error("[vibe-bridge] failed to claim singleton lock; exiting");
+    process.exit(1);
+  }
+
+  try {
+    fs.writeFileSync(SINGLETON_PID_FILE, String(process.pid) + "\n", {
+      mode: 0o600,
+    });
+  } catch (_) {}
+
+  const release = () => {
+    try {
+      const cur = readBridgePidFile();
+      if (cur === process.pid) fs.unlinkSync(SINGLETON_PID_FILE);
+    } catch (_) {}
+    try {
+      const lockPid = readLockFilePid(SINGLETON_LOCK_FILE);
+      if (lockPid === process.pid || lockPid == null) {
+        fs.unlinkSync(SINGLETON_LOCK_FILE);
+      }
+    } catch (_) {}
+  };
+  process.once("exit", release);
+  process.once("SIGINT", () => {
+    release();
+    process.exit(130);
+  });
+  process.once("SIGTERM", () => {
+    release();
+    process.exit(143);
+  });
+
+  // Race cover: two processes can both pass pgrep before either claims the lock.
+  setTimeout(() => {
+    killOtherBridgeProcesses();
+    try {
+      fs.writeFileSync(SINGLETON_PID_FILE, String(process.pid) + "\n", {
+        mode: 0o600,
+      });
+    } catch (_) {}
+  }, 1500);
+
+  console.log(`[vibe-bridge] singleton ready pid=${process.pid}`);
+}
+
+function readLockFilePid(filePath) {
+  try {
+    const raw = fs.readFileSync(filePath, "utf8").trim();
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function readBridgePidFile() {
+  return readLockFilePid(SINGLETON_PID_FILE);
+}
+
+function isProcessAlive(pid) {
+  if (!pid || pid === process.pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function killOtherBridgeProcesses() {
+  const selfPid = process.pid;
+  let pids = [];
+  try {
+    const out = execFileSync(
+      "pgrep",
+      ["-f", "vibe-bridge\\.js|@vibegram/agent-bridge|vibegram-bridge"],
+      { encoding: "utf8" }
+    );
+    pids = out
+      .split(/\s+/)
+      .map((s) => parseInt(s, 10))
+      .filter((n) => Number.isFinite(n) && n > 0 && n !== selfPid);
+  } catch (_) {
+    // pgrep exit 1 = no matches
+    pids = [];
+  }
+
+  const filePid = readBridgePidFile();
+  if (filePid && filePid !== selfPid && !pids.includes(filePid)) {
+    pids.push(filePid);
+  }
+
+  for (const pid of pids) {
+    if (!isProcessAlive(pid)) continue;
+    let cmdline = "";
+    try {
+      cmdline = execFileSync("ps", ["-p", String(pid), "-o", "command="], {
+        encoding: "utf8",
+      }).trim();
+    } catch (_) {
+      continue;
+    }
+    if (
+      !/vibe-bridge\.js|@vibegram\/agent-bridge|vibegram-bridge/.test(cmdline)
+    ) {
+      continue;
+    }
+    try {
+      process.kill(pid, "SIGTERM");
+      console.log(`[vibe-bridge] killed duplicate bridge pid=${pid}`);
+    } catch (err) {
+      console.warn(
+        `[vibe-bridge] failed to kill duplicate pid=${pid}: ${(err && err.message) || err}`
+      );
+    }
+  }
+
+  const deadline = Date.now() + 800;
+  while (Date.now() < deadline) {
+    if (!pids.some(isProcessAlive)) break;
+    try {
+      execFileSync("sleep", ["0.05"], { stdio: "ignore" });
+    } catch (_) {
+      break;
+    }
+  }
+  for (const pid of pids) {
+    if (!isProcessAlive(pid)) continue;
+    try {
+      process.kill(pid, "SIGKILL");
+      console.log(`[vibe-bridge] force-killed duplicate bridge pid=${pid}`);
+    } catch (_) {}
+  }
+}
+
 // ── Main ────────────────────────────────────────────────────────────
 
 async function main() {
@@ -10347,6 +10561,9 @@ async function main() {
   if (shouldUseBackgroundByDefault()) {
     return installService(server, config);
   }
+
+  // Long-lived socket path only: kill duplicate daemons, claim exclusive ownership.
+  ensureBridgeSingleton();
 
   // Bring up the optional direct-LAN path alongside the cloud relay. Guarded + additive:
   // if it can't bind or advertise, the cloud connection below is entirely unaffected.

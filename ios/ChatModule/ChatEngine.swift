@@ -2923,14 +2923,24 @@ final class ChatEngine {
         if let me, !me.isEmpty { synthetic["fromId"] = me }
         synthetic["encryptedContent"] = Self.strippedBridgeInstructionPreamble(text)
       } else {
+        // Attribute each provider to its reserved shadow-user id so group list
+        // layout (name + avatar gutter) can tell Claude/Codex/Grok/Agy apart.
+        // The generic agentUserId collapsed every session-ingested row onto one
+        // sender key — missing/wrong avatars and same-run grouping across agents.
+        let providerAgentUserId =
+          Self.bridgeAgentUserId(forProvider: provider) ?? Self.agentUserId
         synthetic["isAgentMessage"] = true
         synthetic["plainContent"] = agentBodyText
         synthetic["agentName"] = agentName
-        synthetic["fromId"] = Self.agentUserId
-        synthetic["agentUserId"] = Self.agentUserId
+        synthetic["agentUsername"] = provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        synthetic["fromId"] = providerAgentUserId
+        synthetic["agentUserId"] = providerAgentUserId
         var meta: [String: Any] = [
           "agentWorkerVia": "bridge",
           "bridgeSessionId": sessionId,
+          "agentName": agentName,
+          "agentUserId": providerAgentUserId,
+          "agentUsername": provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
         ]
         // The bridge flags the in-flight turn `running` while its task is live. Render
         // that turn as the streaming "working" state (shimmer + step feed), NOT a
@@ -5690,6 +5700,29 @@ final class ChatEngine {
     }
 
     let hadExistingStreamRow = liveMessageRowsByChat[chatId]?[effectiveRowId] != nil
+    // Resolve a display name / username for group gutter decoration even when the
+    // server frame only carries the shadow userId (no agentName field).
+    let streamProvider =
+      agentUserId.flatMap { Self.bridgeAgentProvidersByUserId[$0.lowercased()] }
+      ?? bridgeProviderForAgentIdentifier(agentUserId)
+      ?? bridgeProviderForChatLocked(chatId: chatId)
+    let streamAgentName: String? = {
+      guard let streamProvider else { return nil }
+      switch streamProvider {
+      case "claude": return "Claude"
+      case "codex": return "Codex"
+      case "grok": return "Grok"
+      case "agy", "antigravity": return "Agy"
+      default: return streamProvider.capitalized
+      }
+    }()
+    if let streamAgentName {
+      metadata["agentName"] = streamAgentName
+      metadata["agentUsername"] = streamProvider
+    }
+    if let agentUserId {
+      metadata["agentUserId"] = agentUserId
+    }
     var synthetic: [String: Any] = [
       "id": effectiveRowId,
       "type": "text",
@@ -5704,6 +5737,12 @@ final class ChatEngine {
     if let agentUserId {
       synthetic["fromId"] = agentUserId
       synthetic["agentUserId"] = agentUserId
+    }
+    if let streamAgentName {
+      synthetic["agentName"] = streamAgentName
+      if let streamProvider {
+        synthetic["agentUsername"] = streamProvider
+      }
     }
 
     _ = applyNativeIncomingMessageEventLocked(chatId: chatId, payload: synthetic)

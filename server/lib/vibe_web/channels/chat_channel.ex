@@ -864,39 +864,48 @@ defmodule VibeWeb.ChatChannel do
       # A bridge can be paired but temporarily absent from Presence while its socket
       # reconnects. Do not convert a valid mobile message into a connect notice in
       # that small window; retry the actual dispatch before declaring it unavailable.
+      #
+      # IMPORTANT: build the bridge prompt *inside* the Task, not before start_child.
+      # Group fan-out calls this once per agent; synchronous prompt build (group
+      # memory / collaboration context) previously serialized Claude → Codex → Grok
+      # so their CLIs started one-by-one. Moving it into the Task lets every worker
+      # start building + dispatch at the same time.
       AgentBridge.paired?(requester_user_id) ->
-        bridge_prompt =
-          if is_binary(team_run_id) do
-            LocalAgentWorker.build_team_bridge_prompt(
-              chat_id,
-              worker,
-              dispatch_text,
-              requester_user_id,
-              team_workers,
-              team_run_id
-            )
-          else
-            LocalAgentWorker.build_bridge_prompt(
-              chat_id,
-              worker,
-              dispatch_text,
-              requester_user_id
-            )
-          end
-
-        task_payload =
-          %{
-            "provider" => worker.handle,
-            "chatId" => chat_id,
-            "taskId" => task_id,
-            "prompt" => bridge_prompt,
-            "replyToId" => data["id"],
-            "requesterUserId" => requester_user_id
-          }
-          |> Map.merge(local_worker_team_metadata(worker, team_run_id, team_workers))
-          |> Map.merge(bridge_metadata)
+        reply_to_id = data["id"]
+        team_meta = local_worker_team_metadata(worker, team_run_id, team_workers)
 
         run = fn ->
+          bridge_prompt =
+            if is_binary(team_run_id) do
+              LocalAgentWorker.build_team_bridge_prompt(
+                chat_id,
+                worker,
+                dispatch_text,
+                requester_user_id,
+                team_workers,
+                team_run_id
+              )
+            else
+              LocalAgentWorker.build_bridge_prompt(
+                chat_id,
+                worker,
+                dispatch_text,
+                requester_user_id
+              )
+            end
+
+          task_payload =
+            %{
+              "provider" => worker.handle,
+              "chatId" => chat_id,
+              "taskId" => task_id,
+              "prompt" => bridge_prompt,
+              "replyToId" => reply_to_id,
+              "requesterUserId" => requester_user_id
+            }
+            |> Map.merge(team_meta)
+            |> Map.merge(bridge_metadata)
+
           broadcast_agent_activity(
             chat_id,
             worker.agent_user_id,
@@ -930,7 +939,7 @@ defmodule VibeWeb.ChatChannel do
                 chat_id,
                 bridge_dispatch_failure_notice(worker, reason),
                 requester_user_id,
-                data["id"]
+                reply_to_id
               )
           end
         end

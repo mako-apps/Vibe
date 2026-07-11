@@ -39,6 +39,10 @@ defmodule Vibe.AI.LocalAgentWorker do
   @rate_limit_table :local_agent_worker_ratelimit
   @session_table :local_agent_worker_sessions
   @team_run_table :local_agent_worker_team_runs
+  # Suppress double-posts when two bridges both finish the same logical turn
+  # (duplicate daemons both ran run_task for the same reply_to + provider).
+  @deliver_dedupe_table :local_agent_worker_deliver_dedupe
+  @deliver_dedupe_ttl_ms 90_000
   @default_cooldown_ms 8_000
   @worker_order ["claude", "codex", "grok", "agy"]
 
@@ -539,29 +543,41 @@ defmodule Vibe.AI.LocalAgentWorker do
         # Hard usage-limit: skip posting a chat row entirely — the bridge has already
         # cached buckets for the usage banner, and a bubble would only shift the list.
         result =
-          if usage_limit_hit? and not ok do
-            Logger.info(
-              "[AgentBridge] suppress usage-limit row chat=#{chat_id} provider=#{worker.handle}"
-            )
+          cond do
+            usage_limit_hit? and not ok ->
+              Logger.info(
+                "[AgentBridge] suppress usage-limit row chat=#{chat_id} provider=#{worker.handle}"
+              )
 
-            # Still notify clients so the phone can refresh the usage banner.
-            VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-usage-limit", %{
-              "provider" => worker.handle,
-              "chatId" => chat_id,
-              "message" => base_text || body,
-              "replyToId" => reply_to_id
-            })
+              # Still notify clients so the phone can refresh the usage banner.
+              VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-usage-limit", %{
+                "provider" => worker.handle,
+                "chatId" => chat_id,
+                "message" => base_text || body,
+                "replyToId" => reply_to_id
+              })
 
-            {:ok, %{message_id: nil, suppressed: true, usage_limit: true}}
-          else
-            post_worker_message(
-              worker,
-              chat_id,
-              body,
-              metadata,
-              reply_to_id,
-              requester_user_id
-            )
+              {:ok, %{message_id: nil, suppressed: true, usage_limit: true}}
+
+            # Two bridge daemons both finishing the same human message → same provider
+            # would otherwise post two near-identical bubbles. Claim once per
+            # (chat, provider, reply_to, body-fingerprint) within the TTL.
+            duplicate_bridge_delivery?(chat_id, worker.handle, reply_to_id, body) ->
+              Logger.info(
+                "[AgentBridge] suppress duplicate deliver chat=#{chat_id} provider=#{worker.handle} reply_to=#{inspect(reply_to_id)}"
+              )
+
+              {:ok, %{message_id: nil, suppressed: true, duplicate: true}}
+
+            true ->
+              post_worker_message(
+                worker,
+                chat_id,
+                body,
+                metadata,
+                reply_to_id,
+                requester_user_id
+              )
           end
 
         case result do
@@ -1483,7 +1499,11 @@ defmodule Vibe.AI.LocalAgentWorker do
             "chatId" => chat_id,
             "streamId" => stream_id,
             "userId" => worker.agent_user_id,
+            "agentUserId" => worker.agent_user_id,
+            "agentName" => worker.label,
+            "agentUsername" => worker.handle,
             "isAgent" => true,
+            "isAgentMessage" => true,
             "text" => text,
             # Live feed = ONE interleaved chronological flow (narration text ↔ Read/
             # Edit/Run steps), exactly like the finished "Worked" card — NOT a tool-only
@@ -2045,6 +2065,78 @@ defmodule Vibe.AI.LocalAgentWorker do
           error
       end
     end
+  end
+
+  # Returns true if this exact delivery was already claimed (caller should suppress).
+  # Returns false and records the claim when this is the first delivery in the TTL window.
+  defp duplicate_bridge_delivery?(chat_id, provider, reply_to_id, body) do
+    ensure_deliver_dedupe_table()
+    body_fp = delivery_body_fingerprint(body)
+    key = {chat_id, provider, reply_to_id || "", body_fp}
+    now = System.monotonic_time(:millisecond)
+
+    case :ets.lookup(@deliver_dedupe_table, key) do
+      [{^key, at}] when now - at < @deliver_dedupe_ttl_ms ->
+        true
+
+      _ ->
+        :ets.insert(@deliver_dedupe_table, {key, now})
+        # Opportunistic prune so the table doesn't grow without bound.
+        if :ets.info(@deliver_dedupe_table, :size) > 512 do
+          prune_deliver_dedupe(now)
+        end
+
+        false
+    end
+  rescue
+    _ -> false
+  end
+
+  defp delivery_body_fingerprint(body) when is_binary(body) do
+    # Normalize whitespace so trivial formatting drift still collides.
+    normalized =
+      body
+      |> String.trim()
+      |> String.replace(~r/\s+/, " ")
+      |> String.slice(0, 400)
+
+    :crypto.hash(:sha256, normalized) |> Base.encode16(case: :lower)
+  end
+
+  defp delivery_body_fingerprint(_), do: "empty"
+
+  defp ensure_deliver_dedupe_table do
+    case :ets.whereis(@deliver_dedupe_table) do
+      :undefined ->
+        :ets.new(@deliver_dedupe_table, [
+          :set,
+          :public,
+          :named_table,
+          {:read_concurrency, true},
+          {:write_concurrency, true}
+        ])
+
+        :ok
+
+      _ ->
+        :ok
+    end
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp prune_deliver_dedupe(now) do
+    cutoff = now - @deliver_dedupe_ttl_ms
+
+    :ets.select_delete(@deliver_dedupe_table, [
+      {
+        {:"$1", :"$2"},
+        [{:<, :"$2", cutoff}],
+        [true]
+      }
+    ])
+  rescue
+    _ -> :ok
   end
 
   defp notify_chat_participants(chat_id, agent_user_id, message_id, timestamp, body) do

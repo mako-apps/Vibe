@@ -968,12 +968,28 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   /// Stable identity for run-grouping: an agent by its shadow-user id, a human by `from_id`.
+  /// Falls back generously so a stream/final frame missing one field still reserves the
+  /// group avatar gutter (prevents the "default list" flush-left bubble that overlaps
+  /// the floating avatar and then jumps when metadata arrives).
   private func resolvedSenderKey(_ row: ChatListRow) -> String? {
-    let raw: String? =
-      row.isAgentMessage
-      ? (row.agentUserId ?? row.agentUsername ?? row.agentName)
-      : row.senderUserId
-    return groupNonEmpty(raw)?.uppercased()
+    if row.isAgentMessage {
+      if let key =
+        groupNonEmpty(row.agentUserId)
+        ?? groupNonEmpty(row.agentUsername)
+        ?? groupNonEmpty(row.agentName)
+        ?? groupNonEmpty(row.senderUserId)
+      {
+        return key.uppercased()
+      }
+      // Last resort: map known display names already stored on the row text path.
+      if let provider = Self.resolveGroupSenderProvider(
+        userId: row.agentUserId, name: row.agentName, username: row.agentUsername
+      ) {
+        return provider.uppercased()
+      }
+      return nil
+    }
+    return groupNonEmpty(row.senderUserId)?.uppercased()
   }
 
   /// The previous/next *incoming attributable* message row (a day divider or a "me"
