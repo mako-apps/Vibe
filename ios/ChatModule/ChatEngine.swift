@@ -447,6 +447,8 @@ final class ChatEngine {
   private var liveStreamTaskRowIdByChatId: [String: [String: String]] = [:]
   /// teamRunId → teamWorkersStatus list when under-hood workers report before the lead cell exists.
   private var pendingTeamWorkersStatusByChatId: [String: [String: [[String: Any]]]] = [:]
+  /// teamRunId → worker handle → progress node dicts (for multi-agent sheet).
+  private var teamWorkerProgressNodesByChatId: [String: [String: [String: [[String: Any]]]]] = [:]
   // Latest agent-bridge history payload (Claude/Codex/Grok local session logs) per
   // chat, keyed chatId -> payload. The Claude/Codex profile requests it and
   // observes `didChangeNotification` with reason "agentBridgeHistory".
@@ -1845,17 +1847,44 @@ final class ChatEngine {
     let provider = normalizedString(payload["provider"] ?? payload["agentBridgeProvider"])
     let action = normalizedString(payload["action"] ?? payload["type"]) ?? "cancel"
     let taskId = normalizedString(payload["taskId"] ?? payload["agentTaskId"] ?? payload["messageId"])
+    let teamRunId = normalizedString(payload["teamRunId"] ?? payload["team_run_id"])
 
     guard let chatId, !chatId.isEmpty else {
       return ["accepted": false, "reason": "invalid_chat"]
     }
-    guard let provider, !provider.isEmpty else {
-      return ["accepted": false, "reason": "invalid_provider"]
+    // Team-wide cancel may omit provider (server expands all workers).
+    if provider == nil || provider?.isEmpty == true {
+      guard let teamRunId, !teamRunId.isEmpty, action == "cancel" || action == "stop" else {
+        return ["accepted": false, "reason": "invalid_provider"]
+      }
+      return syncOnQueue {
+        sendAgentBridgeControlLocked(
+          chatId: chatId,
+          provider: "codex",
+          action: action,
+          taskId: taskId,
+          teamRunId: teamRunId,
+          attempt: 0)
+      }
     }
 
     return syncOnQueue {
       sendAgentBridgeControlLocked(
-        chatId: chatId, provider: provider, action: action, taskId: taskId, attempt: 0)
+        chatId: chatId,
+        provider: provider!,
+        action: action,
+        taskId: taskId,
+        teamRunId: teamRunId,
+        attempt: 0)
+    }
+  }
+
+  /// Progress node payloads for under-hood workers in a supervisor team run (sheet).
+  func latestTeamWorkerProgressNodes(chatId: String, teamRunId: String) -> [String: [[String: Any]]]?
+  {
+    guard !chatId.isEmpty, !teamRunId.isEmpty else { return nil }
+    return syncOnQueue {
+      teamWorkerProgressNodesByChatId[chatId]?[teamRunId]
     }
   }
 
@@ -1867,7 +1896,12 @@ final class ChatEngine {
   private static let bridgeControlMaxAttempts = 8
 
   private func sendAgentBridgeControlLocked(
-    chatId: String, provider: String, action: String, taskId: String?, attempt: Int
+    chatId: String,
+    provider: String,
+    action: String,
+    taskId: String?,
+    teamRunId: String? = nil,
+    attempt: Int
   ) -> [String: Any] {
     let willRetry = attempt + 1 < Self.bridgeControlMaxAttempts
     guard let client = phoenixClient else {
@@ -1875,7 +1909,12 @@ final class ChatEngine {
         self?.ensureNativeTransport(trigger: "bridge_control_no_socket")
       }
       scheduleAgentBridgeControlRetryLocked(
-        chatId: chatId, provider: provider, action: action, taskId: taskId, attempt: attempt)
+        chatId: chatId,
+        provider: provider,
+        action: action,
+        taskId: taskId,
+        teamRunId: teamRunId,
+        attempt: attempt)
       return ["accepted": false, "reason": "no_native_socket", "willRetry": willRetry]
     }
     guard nativeJoinedChatIds.contains(chatId), (state["connected"] as? Bool) == true else {
@@ -1884,7 +1923,12 @@ final class ChatEngine {
         self?.ensureNativeTransport(trigger: "bridge_control_chat_not_joined")
       }
       scheduleAgentBridgeControlRetryLocked(
-        chatId: chatId, provider: provider, action: action, taskId: taskId, attempt: attempt)
+        chatId: chatId,
+        provider: provider,
+        action: action,
+        taskId: taskId,
+        teamRunId: teamRunId,
+        attempt: attempt)
       return ["accepted": false, "reason": "chat_not_joined", "willRetry": willRetry]
     }
 
@@ -1894,6 +1938,9 @@ final class ChatEngine {
     ]
     if let taskId, !taskId.isEmpty {
       wirePayload["taskId"] = taskId
+    }
+    if let teamRunId, !teamRunId.isEmpty {
+      wirePayload["teamRunId"] = teamRunId
     }
     if let computerId = AgentBridgeSelectionStore.selectedRepository(chatId: chatId)?.computerId,
       !computerId.isEmpty
@@ -1909,6 +1956,7 @@ final class ChatEngine {
       event: "native-agent-bridge-control",
       payload: [
         "chatId": chatId, "provider": provider, "action": action, "ref": ref, "attempt": attempt,
+        "teamRunId": teamRunId as Any,
       ]
     )
     state["updatedAt"] = nowMs()
@@ -1923,7 +1971,12 @@ final class ChatEngine {
   /// Bounded by `bridgeControlMaxAttempts`; stops as soon as a push actually goes out
   /// (a delivered cancel that races a natural finish is a harmless no-op on the bridge).
   private func scheduleAgentBridgeControlRetryLocked(
-    chatId: String, provider: String, action: String, taskId: String?, attempt: Int
+    chatId: String,
+    provider: String,
+    action: String,
+    taskId: String?,
+    teamRunId: String? = nil,
+    attempt: Int
   ) {
     let nextAttempt = attempt + 1
     guard nextAttempt < Self.bridgeControlMaxAttempts else { return }
@@ -1933,7 +1986,12 @@ final class ChatEngine {
       guard let self else { return }
       _ = self.syncOnQueue {
         self.sendAgentBridgeControlLocked(
-          chatId: chatId, provider: provider, action: action, taskId: taskId, attempt: nextAttempt)
+          chatId: chatId,
+          provider: provider,
+          action: action,
+          taskId: taskId,
+          teamRunId: teamRunId,
+          attempt: nextAttempt)
       }
     }
   }
@@ -5909,6 +5967,8 @@ final class ChatEngine {
       liveRuntime["teamWorkersStatus"] = statusList
       metadata["teamWorkersStatus"] = statusList
     }
+    // Live team/single agent runs can always be cancelled from the sheet.
+    liveRuntime["controls"] = ["canCancel": true, "canRevert": false]
     metadata["agentRuntime"] = liveRuntime
     if let sequence {
       metadata["agentStreamSequence"] = sequence
@@ -6034,6 +6094,11 @@ final class ChatEngine {
         var byWorker = (metadata["teamWorkerProgressNodes"] as? [String: Any]) ?? [:]
         byWorker[worker] = nodes
         metadata["teamWorkerProgressNodes"] = byWorker
+        var chatCache = teamWorkerProgressNodesByChatId[chatId] ?? [:]
+        var runCache = chatCache[teamRunId] ?? [:]
+        runCache[worker] = nodes
+        chatCache[teamRunId] = runCache
+        teamWorkerProgressNodesByChatId[chatId] = chatCache
       }
       message["metadata"] = metadata
     }
@@ -9889,6 +9954,16 @@ final class ChatEngine {
     return "\(chatHistoryCacheKeyPrefix).\(cacheKeyComponent(userId)).\(cacheKeyComponent(chatId))"
   }
 
+  /// Live stream placeholder rows (`stream-…` / `lan-…` ids) are transient render
+  /// state: their run either settles into a real message or dies with the socket.
+  /// Persisting them poisons the cache — on the next open they resurrect as
+  /// orphan plain-text bubbles that duplicate the settled card (with no sender
+  /// meta, so they even group under the wrong agent name).
+  private func isTransientStreamRow(_ row: [String: Any]) -> Bool {
+    guard let id = messageId(fromRow: row) else { return false }
+    return id.hasPrefix("stream-") || id.hasPrefix("lan-")
+  }
+
   private func restoreCachedHistoryRowsLocked(chatId: String) -> Bool {
     guard !chatId.isEmpty else { return false }
     if isVolatileBridgeAgentChatLocked(chatId: chatId) {
@@ -9901,11 +9976,13 @@ final class ChatEngine {
     guard let cacheKey = chatHistoryCacheKeyLocked(chatId: chatId),
       let data = UserDefaults.standard.data(forKey: cacheKey),
       let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]),
-      let rows = object as? [[String: Any]],
-      !rows.isEmpty
+      let decodedRows = object as? [[String: Any]]
     else {
       return false
     }
+    // Self-heal caches written before transient rows were excluded from storage.
+    let rows = decodedRows.filter { !isTransientStreamRow($0) }
+    guard !rows.isEmpty else { return false }
 
     historyRowsByChat[chatId] = rows
     historyFullyLoadedChats.insert(chatId)
@@ -9928,7 +10005,9 @@ final class ChatEngine {
     }
     guard !chatId.isEmpty, !rows.isEmpty, let cacheKey = chatHistoryCacheKeyLocked(chatId: chatId)
     else { return }
-    let limitedRows = Array(rows.suffix(chatHistoryCacheRowLimit))
+    let persistableRows = rows.filter { !isTransientStreamRow($0) }
+    guard !persistableRows.isEmpty else { return }
+    let limitedRows = Array(persistableRows.suffix(chatHistoryCacheRowLimit))
     guard JSONSerialization.isValidJSONObject(limitedRows),
       let data = try? JSONSerialization.data(withJSONObject: limitedRows, options: [])
     else {

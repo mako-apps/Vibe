@@ -971,17 +971,22 @@ defmodule Vibe.AI.LocalAgentWorker do
 
     Your job:
     1. Own the single user-visible reply for this team turn.
-    2. Classify the request: if it is trivial chat with no coding work, answer alone briefly.
+    2. Classify the request: if it is trivial chat with no coding work, answer alone briefly
+       and do NOT spawn teammates.
     3. For real work, decompose into non-overlapping slices (backend/data, review/debug,
        investigation, UI/frontend) and coordinate via the handoff file.
-    4. Teammates may already be running their focus slices in parallel — read #{handoff_path}
-       for their findings, files changed, and blockers before you finalize.
-    5. Prefer non-overlapping file ownership. Do not reset, stash, revert, or overwrite
+    4. To start under-hood teammates, emit exactly one line (stdout/tool log is fine):
+         VIBE_TEAM_SPAWN: claude, grok, agy
+       Use only handles from: #{teammate_handles}. Omit yourself. You may spawn a subset.
+       Optionally add a second line with focus notes:
+         VIBE_TEAM_FOCUS: claude=review risks; agy=UI polish
+    5. After spawning, read #{handoff_path} for their findings before you finalize.
+    6. Prefer non-overlapping file ownership. Do not reset, stash, revert, or overwrite
        pre-existing user changes.
-    6. Advisors: consult Fable when available for complex decisions; if Fable fails, use
-       Sol (GPT) as fallback advisor. For frontend/JSX/UI returns only, use Gemini/Agy as a
+    7. Advisors: consult Fable when available for complex decisions; if Fable fails, use
+       Sol (GPT) as fallback advisor. For frontend/JSX/UI returns only, Gemini/Agy is a
        UI-only advisor. Advisors never edit files.
-    7. When work is done, write ONE concise summary for the user: what each agent did,
+    8. When work is done, write ONE concise summary for the user: what each agent did,
        approximate time/effort if known, what landed, and remaining risks. Do not dump
        raw tool logs into the user reply.
 
@@ -1408,6 +1413,294 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   def fail_bridge_team_run(_chat_id, _team_run_id, _worker_handle, _reason), do: :ok
+
+  @doc """
+  Cancel a supervisor team run and return cancel targets `{provider, task_id}` for
+  every known worker task so the bridge can kill them all.
+  """
+  def cancel_bridge_team_run(chat_id, team_run_id, requester_user_id \\ nil)
+
+  def cancel_bridge_team_run(chat_id, team_run_id, requester_user_id)
+      when is_binary(chat_id) and is_binary(team_run_id) do
+    ensure_team_run_table()
+    now_ms = System.system_time(:millisecond)
+
+    targets =
+      case :ets.lookup(@team_run_table, {chat_id, team_run_id}) do
+        [{{^chat_id, ^team_run_id}, state}] ->
+          states =
+            (Map.get(state, :worker_states) || %{})
+            |> Enum.map(fn {handle, entry} ->
+              {handle,
+               Map.merge(entry || %{}, %{
+                 "status" => "cancelled",
+                 "finished_at" => now_ms,
+                 "last_label" => "cancelled"
+               })}
+            end)
+            |> Map.new()
+
+          new_state =
+            state
+            |> Map.put(:worker_states, states)
+            |> Map.put(:status, "cancelled")
+
+          :ets.insert(@team_run_table, {{chat_id, team_run_id}, new_state})
+
+          Enum.map(states, fn {handle, entry} ->
+            %{
+              provider: handle,
+              task_id: entry["task_id"] || entry["taskId"] || entry[:task_id]
+            }
+          end)
+
+        _ ->
+          []
+      end
+
+    now = DateTime.utc_now()
+
+    Repo.update_all(
+      from(run in TeamRun,
+        where: run.id == ^team_run_id and run.chat_id == ^chat_id and run.status == "running"
+      ),
+      set: [status: "cancelled", last_error: "cancelled_by_user", updated_at: now]
+    )
+
+    VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-team-worker", %{
+      "chatId" => chat_id,
+      "teamRunId" => team_run_id,
+      "teamMode" => "supervisor",
+      "status" => "cancelled",
+      "teamWorkersStatus" => team_workers_status(chat_id, team_run_id),
+      "suppressVisible" => true
+    })
+
+    _ = requester_user_id
+    targets
+  rescue
+    error ->
+      Logger.warning(
+        "[LocalAgentWorker] cancel team run failed chat=#{chat_id} run=#{team_run_id}: #{Exception.message(error)}"
+      )
+
+      []
+  end
+
+  def cancel_bridge_team_run(_, _, _), do: []
+
+  @doc """
+  Spawn under-hood supervisor workers for a lead-requested VIBE_TEAM_SPAWN.
+  `handles` are agent handles; optional `focus_by_handle` map of focus strings.
+  """
+  def spawn_supervisor_workers(
+        chat_id,
+        team_run_id,
+        handles,
+        requester_user_id,
+        opts \\ []
+      )
+
+  def spawn_supervisor_workers(
+        chat_id,
+        team_run_id,
+        handles,
+        requester_user_id,
+        opts
+      )
+      when is_binary(chat_id) and is_binary(team_run_id) and is_list(handles) do
+    ensure_team_run_table()
+
+    case :ets.lookup(@team_run_table, {chat_id, team_run_id}) do
+      [{{^chat_id, ^team_run_id}, state}] ->
+        mode = Map.get(state, :mode) || "supervisor"
+        lead = Map.get(state, :lead_worker)
+        allowed = MapSet.new(state.workers || [])
+        focus_by = Keyword.get(opts, :focus_by_handle) || %{}
+        reply_to_id = state.reply_to_id
+        dispatch_text = state.dispatch_text
+        bridge_metadata = state.bridge_metadata || %{}
+
+        team_workers =
+          (state.workers || [])
+          |> Enum.map(&resolve_handle/1)
+          |> Enum.reject(&is_nil/1)
+
+        handles
+        |> Enum.map(&normalize_handle/1)
+        |> Enum.reject(&is_nil/1)
+        |> Enum.uniq()
+        |> Enum.reject(&(&1 == lead))
+        |> Enum.filter(&MapSet.member?(allowed, &1))
+        |> Enum.each(fn handle ->
+          case resolve_handle(handle) do
+            nil ->
+              :ok
+
+            worker ->
+              existing = get_in(state, [:worker_states, handle, "status"])
+
+              if existing in ["running", "done"] do
+                :ok
+              else
+                task_id = "#{team_run_id}:worker:#{handle}"
+                update_team_worker_state(chat_id, team_run_id, handle, %{
+                  "status" => "running",
+                  "task_id" => task_id,
+                  "last_label" => "starting"
+                })
+
+                focus = Map.get(focus_by, handle) || team_worker_default_focus(handle)
+
+                prompt =
+                  build_team_bridge_prompt(
+                    chat_id,
+                    worker,
+                    dispatch_text <> "\n\nAssigned focus for this spawn: #{focus}",
+                    requester_user_id,
+                    team_workers,
+                    team_run_id,
+                    team_mode: mode,
+                    lead_worker: lead,
+                    team_role: "worker"
+                  )
+
+                task_payload =
+                  %{
+                    "provider" => worker.handle,
+                    "chatId" => chat_id,
+                    "taskId" => task_id,
+                    "prompt" => prompt,
+                    "replyToId" => reply_to_id,
+                    "requesterUserId" => requester_user_id,
+                    "teamMode" => mode,
+                    "teamRunId" => team_run_id,
+                    "teamWorker" => worker.handle,
+                    "teamWorkers" => Enum.map(team_workers, & &1.handle),
+                    "leadWorker" => lead,
+                    "teamRole" => "worker",
+                    "suppressVisible" => true
+                  }
+                  |> Map.merge(resolve_provider_model(bridge_metadata, worker.handle))
+
+                broadcast_activity(
+                  chat_id,
+                  worker.agent_user_id,
+                  "#{worker.label} joining team run...",
+                  "running"
+                )
+
+                case AgentBridge.dispatch_task(requester_user_id, task_payload) do
+                  :ok ->
+                    Logger.info(
+                      "[LocalAgentWorker] supervisor spawn chat=#{chat_id} run=#{team_run_id} worker=#{handle}"
+                    )
+
+                  {:error, reason} ->
+                    update_team_worker_state(chat_id, team_run_id, handle, %{
+                      "status" => "failed",
+                      "last_label" => "spawn failed",
+                      "summary" => inspect(reason)
+                    })
+
+                    stop_activity(chat_id, worker.agent_user_id)
+
+                    Logger.warning(
+                      "[LocalAgentWorker] supervisor spawn failed chat=#{chat_id} worker=#{handle} reason=#{inspect(reason)}"
+                    )
+                end
+              end
+          end
+        end)
+
+        :ok
+
+      _ ->
+        {:error, :team_run_not_found}
+    end
+  rescue
+    error ->
+      Logger.error(
+        "[LocalAgentWorker] spawn_supervisor_workers crashed: #{Exception.message(error)}"
+      )
+
+      {:error, error}
+  end
+
+  def spawn_supervisor_workers(_, _, _, _, _), do: {:error, :invalid}
+
+  @doc "Parse VIBE_TEAM_SPAWN / VIBE_TEAM_FOCUS lines from agent output."
+  def parse_team_spawn_directive(text) when is_binary(text) do
+    spawn_handles =
+      Regex.scan(~r/VIBE_TEAM_SPAWN\s*:\s*([^\n\r]+)/i, text)
+      |> Enum.flat_map(fn [_, raw] ->
+        raw
+        |> String.split(~r/[,;\s]+/, trim: true)
+        |> Enum.map(&normalize_handle/1)
+        |> Enum.reject(&is_nil/1)
+      end)
+      |> Enum.uniq()
+
+    focus_by =
+      Regex.scan(~r/VIBE_TEAM_FOCUS\s*:\s*([^\n\r]+)/i, text)
+      |> Enum.reduce(%{}, fn [_, raw], acc ->
+        raw
+        |> String.split(~r/[;|]/, trim: true)
+        |> Enum.reduce(acc, fn part, inner ->
+          case String.split(part, "=", parts: 2) do
+            [handle, focus] ->
+              case normalize_handle(String.trim(handle)) do
+                nil -> inner
+                h -> Map.put(inner, h, String.trim(focus))
+              end
+
+            _ ->
+              inner
+          end
+        end)
+      end)
+
+    if spawn_handles == [] do
+      nil
+    else
+      %{handles: spawn_handles, focus_by_handle: focus_by}
+    end
+  end
+
+  def parse_team_spawn_directive(_), do: nil
+
+  @doc """
+  On bridge reconnect, mark matching team workers as running again from status
+  payloads so the lead strip recovers mid-run.
+  """
+  def rehydrate_team_workers_from_running_tasks(chat_id, running_tasks)
+      when is_binary(chat_id) and is_list(running_tasks) do
+    Enum.each(running_tasks, fn task ->
+      team_run_id =
+        normalize_string(
+          task["teamRunId"] || task[:teamRunId] || task["team_run_id"] || task[:team_run_id]
+        )
+
+      worker =
+        normalize_string(
+          task["teamWorker"] || task[:teamWorker] || task["provider"] || task[:provider]
+        )
+
+      task_id = normalize_string(task["taskId"] || task[:taskId] || task["task_id"])
+
+      if is_binary(team_run_id) and is_binary(worker) do
+        update_team_worker_state(chat_id, team_run_id, worker, %{
+          "status" => "running",
+          "task_id" => task_id,
+          "last_label" => "reconnected"
+        })
+      end
+    end)
+
+    :ok
+  end
+
+  def rehydrate_team_workers_from_running_tasks(_, _), do: :ok
 
   defp persist_team_run(state, first_worker) do
     attrs = %{

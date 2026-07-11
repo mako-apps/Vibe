@@ -2033,6 +2033,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var groupUsageCarouselTimer: Timer?
   /// Ordered providers currently represented by banner dots (manual swipe target).
   private var lastUsageCarouselProviders: [String] = []
+  /// Interactive carousel pan on the usage banner (gated to horizontal drags).
+  weak var usageBannerPanGesture: UIPanGestureRecognizer?
 
   /// Ask the bridge for a fresh structured usage snapshot. Throttled; a rejected push
   /// (socket/join not ready) clears the throttle so the channel-join retry fires freely.
@@ -2264,6 +2266,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let n = lastUsageCarouselProviders.count
     guard n > 1 else { return }
     groupUsageCarouselIndex = (groupUsageCarouselIndex + delta + n) % n
+    // The refresh pins the page to the shown provider so background updates can't
+    // swap identity — point the pin at the page the user just chose.
+    lastUsageBannerProvider = lastUsageCarouselProviders[groupUsageCarouselIndex]
     refreshUsageBannerFromSnapshots()
   }
 
@@ -2349,13 +2354,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       let created = ChatPinnedBannerView()
       created.addTarget(self, action: #selector(handleBridgeUsageBannerTapped), for: .touchUpInside)
       created.onClose = { [weak self] in self?.dismissBridgeUsageBanner() }
-      // Horizontal swipe pages multi-agent usage without auto-rotate.
-      let swipeL = UISwipeGestureRecognizer(target: self, action: #selector(handleUsageBannerSwipe(_:)))
-      swipeL.direction = .left
-      created.addGestureRecognizer(swipeL)
-      let swipeR = UISwipeGestureRecognizer(target: self, action: #selector(handleUsageBannerSwipe(_:)))
-      swipeR.direction = .right
-      created.addGestureRecognizer(swipeR)
+      // Interactive horizontal pan pages multi-agent usage: content follows the
+      // finger and commits/springs back on release (no auto-rotate). The delegate
+      // gates it to mostly-horizontal drags so list scrolling over the banner wins.
+      let pan = UIPanGestureRecognizer(target: self, action: #selector(handleUsageBannerPan(_:)))
+      pan.delegate = self
+      created.addGestureRecognizer(pan)
+      usageBannerPanGesture = pan
       addSubview(created)
       bridgeUsageBanner = created
       banner = created
@@ -2400,9 +2405,38 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
   }
 
-  @objc private func handleUsageBannerSwipe(_ gr: UISwipeGestureRecognizer) {
-    // Left swipe → next agent; right swipe → previous.
-    pageUsageBanner(by: gr.direction == .left ? 1 : -1)
+  @objc private func handleUsageBannerPan(_ gr: UIPanGestureRecognizer) {
+    guard let banner = bridgeUsageBanner else { return }
+    let dx = gr.translation(in: banner).x
+    let width = max(1.0, banner.bounds.width)
+    let pageable = lastUsageCarouselProviders.count > 1
+    switch gr.state {
+    case .changed:
+      // Full finger-follow when neighbor pages exist; rubber-band when alone.
+      banner.setContentTranslationX(pageable ? dx : dx / 3.0)
+    case .ended, .cancelled, .failed:
+      let vx = gr.velocity(in: banner).x
+      let commit = pageable && (abs(dx) > width * 0.28 || abs(vx) > 600.0)
+      guard commit else {
+        banner.animateContentTranslateX(from: pageable ? dx : dx / 3.0)
+        return
+      }
+      // Continue the drag out the same edge, swap page, slide the new
+      // content in from the opposite edge — one continuous hand-off.
+      let delta = (dx < 0 || (dx == 0 && vx < 0)) ? 1 : -1
+      let outX: CGFloat = delta == 1 ? -width : width
+      UIView.animate(
+        withDuration: 0.14, delay: 0, options: [.beginFromCurrentState, .curveEaseIn]
+      ) {
+        banner.setContentTranslationX(outX)
+      } completion: { [weak self] _ in
+        guard let self else { return }
+        self.pageUsageBanner(by: delta)
+        self.bridgeUsageBanner?.animateContentTranslateX(from: -outX * 0.55)
+      }
+    default:
+      break
+    }
   }
 
   /// Tap opens the structured Usage sheet (5h / weekly + reset). Close (✕) only dismisses.
@@ -2574,17 +2608,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     set { Self.pendingBridgeSendsByChat[pendingBridgeChatKey] = newValue }
   }
 
-  /// Is a bridge run live for THIS chat right now? Checks the engine's live-tail
-  /// session registration, the header progress state, and (fallback) any live agent
-  /// row on screen — any one of them means the CLI is still working.
+  /// Is a bridge run live for THIS chat right now? Checks active progress/ask state
+  /// plus any live agent row on screen. Mounted History sessions are not "busy".
   private func bridgeRunIsLive() -> Bool {
     let chatId = pendingBridgeChatKey
     guard !chatId.isEmpty, currentBridgeProvider != nil else { return false }
-    if ChatEngine.shared.liveBridgeSessionId(chatId: chatId) != nil { return true }
-    if let progress = ChatEngine.shared.agentProgress(chatId: chatId) {
-      let status = ((progress["status"] as? String) ?? "").lowercased()
-      if status == "running" || status == "streaming" { return true }
-    }
+    if ChatEngine.shared.bridgeRunIsActive(chatId: chatId) { return true }
     return rows.contains { $0.isAgentMessage && bridgeRowIsLive($0) }
   }
 
@@ -5153,10 +5182,23 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// Open the WHOLE agent turn's progress in the same glass sheet — the "Worked for… /
   /// Working" header tap. Reuses the subagent detail VC (glass + shared renderer) with the
   /// full turn's step feed and answer body, so nothing renders through a second layout path.
+  /// Supervisor team runs open the multi-agent sheet (per-worker sections + cancel team).
   private func presentAgentTurnDetailView(row: ChatListRow) {
     guard let presenter = topPresentingViewController() else { return }
     let message = VibeAgentKitMap.chatMessage(from: row)
     let bodyText = resoloAssistantDisplayText(for: message)
+
+    if let runtime = row.agentRuntime,
+      (!runtime.teamWorkersStatus.isEmpty
+        || runtime.teamMode == "supervisor"
+        || runtime.teamMode == "group_supervisor"),
+      let teamRunId = runtime.teamRunId, !teamRunId.isEmpty
+    {
+      presentTeamRunDetailView(
+        row: row, runtime: runtime, bodyText: bodyText, streaming: message.isStreaming)
+      return
+    }
+
     // A turn with no steps, no answer body, and not actively running has nothing to
     // show — presenting the glass sheet here would just be empty chrome (the "messy
     // blank sheet" symptom a stale/mid-recovery row could trigger). Bail instead.
@@ -5181,6 +5223,106 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // Clear the nav wrapper's opaque backing so the sheet's own UIGlassEffect refracts the
     // chat behind it (real Liquid Glass) instead of frosting a solid nav background — the
     // ask sheet looks glass precisely because it's presented WITHOUT this opaque layer.
+    nav.view.backgroundColor = .clear
+    if let sheet = nav.sheetPresentationController {
+      sheet.detents = [.medium(), .large()]
+      sheet.prefersGrabberVisible = true
+    }
+    presenter.present(nav, animated: true)
+  }
+
+  private func presentTeamRunDetailView(
+    row: ChatListRow,
+    runtime: ChatListRow.AgentRuntimeSummary,
+    bodyText: String,
+    streaming: Bool
+  ) {
+    guard let presenter = topPresentingViewController() else { return }
+    let appearance = VibeAgentKitMap.appearance(for: traitCollection)
+    let leadHandle =
+      runtime.leadWorker
+      ?? runtime.teamWorker
+      ?? runtime.provider
+      ?? "lead"
+
+    // Per-worker progress cache (under-hood workers) for the multi-agent sheet.
+    let byWorkerRaw =
+      ChatEngine.shared.latestTeamWorkerProgressNodes(
+        chatId: row.chatId ?? engineChatId,
+        teamRunId: runtime.teamRunId ?? ""
+      ) ?? [:]
+
+    var sections: [VibeAgentTeamRunDetailViewController.Section] = []
+    let statuses =
+      runtime.teamWorkersStatus.isEmpty
+      ? runtime.teamWorkers.map {
+        ChatListRow.TeamWorkerStatus(
+          worker: $0,
+          label: $0.capitalized,
+          status: streaming ? "running" : "done",
+          startedAt: nil,
+          finishedAt: nil,
+          durationMs: nil,
+          summary: nil,
+          taskId: nil,
+          lastLabel: nil
+        )
+      } : runtime.teamWorkersStatus
+
+    for status in statuses {
+      let isLead = status.worker == leadHandle
+      let nodes: [ChatListRow.AgentProgressNode]
+      if isLead {
+        nodes = row.agentProgressNodes
+      } else if let raw = byWorkerRaw[status.worker] {
+        nodes = parseAgentProgressNodesPublic(raw)
+      } else {
+        nodes = []
+      }
+      let items = nodes.map { VibeAgentKitMap.progressItem(from: $0) }
+      sections.append(
+        .init(
+          worker: status.worker,
+          label: status.label,
+          statusLine: status.compactLine,
+          isLead: isLead,
+          progressItems: items
+        )
+      )
+    }
+
+    let title =
+      streaming
+      ? "Team working…"
+      : "Team finished"
+    let running = streaming || runtime.status == "running"
+    let detail = VibeAgentTeamRunDetailViewController(
+      title: title,
+      bodyText: bodyText,
+      sections: sections,
+      running: running,
+      canCancel: running,
+      appearance: appearance
+    )
+    let chatId = (row.chatId?.isEmpty == false ? row.chatId! : engineChatId)
+    let teamRunId = runtime.teamRunId
+    let provider = runtime.provider ?? leadHandle
+    detail.onCancelTeam = { [weak self] in
+      guard let teamRunId, !teamRunId.isEmpty else { return }
+      var payload: [String: Any] = [
+        "chatId": chatId,
+        "provider": provider,
+        "action": "cancel",
+        "teamRunId": teamRunId,
+      ]
+      if let taskId = runtime.taskId, !taskId.isEmpty {
+        payload["taskId"] = taskId
+      }
+      _ = ChatEngine.shared.sendAgentBridgeControl(payload)
+      self?.refreshAgentTurnRows()
+    }
+    let nav = UINavigationController(rootViewController: detail)
+    nav.modalPresentationStyle = .pageSheet
     nav.view.backgroundColor = .clear
     if let sheet = nav.sheetPresentationController {
       sheet.detents = [.medium(), .large()]
@@ -5514,18 +5656,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // "approval lands in an unrelated chat" bug. Drop it here; the bridge re-emits a
     // still-blocked ask on the next open of the owning conversation (and the engine's
     // pending-ask cache re-surfaces it once this surface engages the running session).
-    let chatKey = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
-    let surfaceEngaged =
-      !(Self.bridgeFreshOwnSentIdsByChat[chatKey] ?? []).isEmpty
-      || bridgeLoadedSessionId != nil
-      || ChatEngine.shared.liveBridgeSessionId(chatId: chatKey) != nil
-    guard surfaceEngaged else {
-      NSLog(
-        "[ChatListView][ask] DROP — fresh un-engaged surface, ask belongs to a prior conversation requestId=%@ chat=%@",
-        requestId, chatId)
-      return
-    }
-
     // CONVERSATION scoping (beyond chatId+provider, which every session shares): the ask
     // carries the CLI session that raised it (+ the id it resumed from — a resume mints a
     // new session id but the page still knows the conversation by the old one). This
@@ -5541,6 +5671,26 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         (info["resumedFromSessionId"] as? String) ?? "",
       ].map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
     )
+    let infoKind = ((info["kind"] as? String) ?? "")
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased()
+    let chatKey = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    let surfaceEngaged =
+      !(Self.bridgeFreshOwnSentIdsByChat[chatKey] ?? []).isEmpty
+      || bridgeLoadedSessionId != nil
+      || ChatEngine.shared.liveBridgeSessionId(chatId: chatKey) != nil
+    // Command approvals / ask_user requests may arrive before the bridge has captured a
+    // CLI session id (or from an interactive desktop hook). With no session scope, dropping
+    // a fresh provider DM makes the phone look like it missed the approval entirely. Fail
+    // open for these live control sheets; scoped asks still use the session guard below.
+    let unscopedLiveControlAsk =
+      askSessionIds.isEmpty && (infoKind == "command" || infoKind == "ask")
+    guard surfaceEngaged || unscopedLiveControlAsk else {
+      NSLog(
+        "[ChatListView][ask] DROP — fresh un-engaged surface, ask belongs to a prior conversation requestId=%@ chat=%@ kind=%@",
+        requestId, chatId, infoKind)
+      return
+    }
     if !askSessionIds.isEmpty {
       let scope = bridgeAskSessionScope(askSessionIds)
       if !scope.owns, scope.hasIdentity {
@@ -8736,6 +8886,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   func setBridgeProvider(_ provider: String) {
+    guard Thread.isMainThread else {
+      DispatchQueue.main.async { [weak self] in
+        self?.setBridgeProvider(provider)
+      }
+      return
+    }
     let normalized = provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     let next = normalized.isEmpty ? nil : normalized
     guard explicitBridgeProvider != next else { return }
@@ -8754,6 +8910,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   private func updateAgentBridgeControlTitle() {
+    guard Thread.isMainThread else {
+      DispatchQueue.main.async { [weak self] in
+        self?.updateAgentBridgeControlTitle()
+      }
+      return
+    }
     // Bridge-agent DMs (Claude/Codex/Grok) drive the repo chip + agent menu regardless of the
     // legacy `agentChatMode` surface. Groups that include Claude/Codex also need the repo
     // chip so a pick in the group profile (or here) is visible and changeable mid-chat.
@@ -9164,6 +9326,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   @objc private func handleAgentBridgeSelectionChanged(_ notification: Notification) {
+    guard Thread.isMainThread else {
+      DispatchQueue.main.async { [weak self] in
+        self?.handleAgentBridgeSelectionChanged(notification)
+      }
+      return
+    }
     updateAgentBridgeControlTitle()
     // A live flip of this agent's "Default view" → Agent (set from the profile) is honored
     // by the presence refresh; model/repo changes are no-ops there, so the user is never

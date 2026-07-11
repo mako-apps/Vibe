@@ -24,7 +24,7 @@ const path = require("path");
 const crypto = require("crypto");
 const readline = require("readline");
 const net = require("net");
-const { spawn, execFileSync } = require("child_process");
+const { spawn, execFileSync, spawnSync } = require("child_process");
 const agySupport = require("./agy-support");
 
 let WebSocket, Phoenix;
@@ -1383,15 +1383,20 @@ async function discoverProviderModels(force) {
 }
 
 function normalizeAdvisor(provider, value) {
-  if (provider !== "claude") return null;
+  // Claude CLI native advisors; Sol is a Fable-fallback alias (see advisorFor).
+  if (provider !== "claude" && provider !== "codex") return null;
   const raw = value == null ? "" : String(value).trim();
   if (!raw) return null;
   const normalized = raw.toLowerCase().replace(/_/g, "-");
   if (["off", "none", "no", "false", "0", "default", "reset"].includes(normalized)) return null;
   if (normalized.includes("fable")) return "fable";
+  if (normalized.includes("sol") || normalized.includes("gpt")) return "sol";
   if (normalized.includes("opus")) return "opus";
   if (normalized.includes("sonnet")) return "sonnet";
-  return raw;
+  // Gemini UI-only advisor is handled post-run for FE diffs (not a CLI --advisor flag).
+  if (normalized.includes("gemini") || normalized === "agy-ui") return null;
+  if (provider === "claude") return raw;
+  return null;
 }
 
 function modelFor(provider, chatId, task) {
@@ -1413,13 +1418,202 @@ function modelFor(provider, chatId, task) {
 }
 
 function advisorFor(provider, chatId, task) {
-  if (provider !== "claude") return null;
-  const requested = task && (task.advisor || task.agentAdvisor || task.agentBridgeAdvisor);
-  if (requested != null && String(requested).trim()) return normalizeAdvisor(provider, requested);
-  const stored = advisorBySession.get(sessionKey(provider, chatId));
-  if (stored != null && String(stored).trim()) return normalizeAdvisor(provider, stored);
-  const envAdvisor = process.env.VIBE_CLAUDE_ADVISOR || process.env.VIBE_CLAUDE_ADVISOR_MODEL;
-  return envAdvisor && String(envAdvisor).trim() ? normalizeAdvisor(provider, envAdvisor) : null;
+  // Team runs: Claude always prefers Fable; Sol is fallback when Fable is off/failed.
+  const teamMode = task && (task.teamMode || task.team_mode);
+  const isTeam =
+    teamMode === "supervisor" ||
+    teamMode === "group_supervisor" ||
+    !!(task && (task.teamRunId || task.team_run_id));
+
+  if (provider === "claude") {
+    const requested = task && (task.advisor || task.agentAdvisor || task.agentBridgeAdvisor);
+    if (requested != null && String(requested).trim()) {
+      const norm = normalizeAdvisor(provider, requested);
+      if (norm === "sol") return solAdvisorAvailable() ? null /* post-run sol */ : null;
+      return norm;
+    }
+    const stored = advisorBySession.get(sessionKey(provider, chatId));
+    if (stored != null && String(stored).trim()) {
+      return normalizeAdvisor(provider, stored);
+    }
+    const envAdvisor = process.env.VIBE_CLAUDE_ADVISOR || process.env.VIBE_CLAUDE_ADVISOR_MODEL;
+    if (envAdvisor && String(envAdvisor).trim()) {
+      return normalizeAdvisor(provider, envAdvisor);
+    }
+    // Default for team / complex: Fable.
+    if (isTeam || process.env.VIBE_FABLE_ALWAYS === "1") return "fable";
+    return "fable";
+  }
+  return null;
+}
+
+function solAdvisorAvailable() {
+  return !!(
+    process.env.VIBE_SOL_COMMAND ||
+    process.env.VIBE_SOL_ADVISOR_COMMAND ||
+    process.env.VIBE_GPT_ADVISOR_COMMAND
+  );
+}
+
+function solAdvisorCommand() {
+  return (
+    process.env.VIBE_SOL_COMMAND ||
+    process.env.VIBE_SOL_ADVISOR_COMMAND ||
+    process.env.VIBE_GPT_ADVISOR_COMMAND ||
+    null
+  );
+}
+
+/** Frontend/JSX/UI paths that should trigger Gemini (Agy) UI-only advice. */
+function looksLikeFrontendDiff(agentRuntime) {
+  const files =
+    (agentRuntime &&
+      agentRuntime.diff &&
+      Array.isArray(agentRuntime.diff.files) &&
+      agentRuntime.diff.files) ||
+    [];
+  const paths = files
+    .map((f) => String((f && (f.path || f.name)) || "").toLowerCase())
+    .filter(Boolean);
+  const patch = String((agentRuntime && agentRuntime.diff && agentRuntime.diff.patch) || "");
+  const joined = paths.join("\n") + "\n" + patch.slice(0, 8000);
+  return (
+    /\.(jsx|tsx|vue|svelte|css|scss|swiftui)\b/i.test(joined) ||
+    /\b(return\s*\(|className=|style=\{\{|View\s*\{|SwiftUI)\b/.test(joined) ||
+    /ios\/.*\.swift/i.test(joined)
+  );
+}
+
+/**
+ * After a worker finishes FE/UI work, run a short Gemini/Agy advise-only pass into the
+ * handoff file. Never posts a chat bubble (advise-only, no tools preferred).
+ */
+async function maybeRunGeminiUiAdvisor(task, agentRuntime, outputText) {
+  try {
+    if (!looksLikeFrontendDiff(agentRuntime) && !/\.(jsx|tsx)\b/i.test(String(outputText || ""))) {
+      return null;
+    }
+    const teamRunId = task.teamRunId || task.team_run_id;
+    if (!teamRunId) return null;
+    const cwd = (task.cwd || task.project || process.cwd()).toString();
+    const handoff = path.join(cwd, ".vibe", "team", `${String(teamRunId).replace(/[^A-Za-z0-9_.-]+/g, "-")}.md`);
+    const prompt =
+      "You are a UI-only advisor (Gemini). Review the frontend/JSX/SwiftUI changes described " +
+      "below. Advise on layout, accessibility, and visual polish only. Do not edit files. " +
+      "Write a short bullet list under ## Gemini UI review.\n\n" +
+      String(outputText || "").slice(0, 6000);
+    const agyCmd = process.env.VIBE_AGY_COMMAND || "agy";
+    const result = spawnSync(agyCmd, ["-p", prompt, "--yolo"], {
+      cwd,
+      encoding: "utf8",
+      timeout: 120000,
+      env: process.env,
+    });
+    const advice = String(result.stdout || result.stderr || "").trim().slice(0, 4000);
+    if (!advice) return null;
+    try {
+      const fs = require("fs");
+      fs.mkdirSync(path.dirname(handoff), { recursive: true });
+      fs.appendFileSync(
+        handoff,
+        `\n\n## Gemini UI review (${new Date().toISOString()})\n${advice}\n`,
+        "utf8"
+      );
+    } catch (_) {}
+    return advice;
+  } catch (err) {
+    console.warn("[vibe-bridge] gemini UI advisor failed:", err && err.message);
+    return null;
+  }
+}
+
+/** Fable unavailable → optional Sol (GPT) advise-only pass into handoff. */
+async function maybeRunSolAdvisorFallback(task, reason, contextText) {
+  const cmd = solAdvisorCommand();
+  if (!cmd) {
+    console.log(
+      `[vibe-bridge] Fable unavailable (${reason || "unknown"}); Sol advisor not configured ` +
+        `(set VIBE_SOL_COMMAND). Continuing without advisor.`
+    );
+    return null;
+  }
+  try {
+    const teamRunId = task.teamRunId || task.team_run_id;
+    const cwd = (task.cwd || task.project || process.cwd()).toString();
+    const handoff = teamRunId
+      ? path.join(cwd, ".vibe", "team", `${String(teamRunId).replace(/[^A-Za-z0-9_.-]+/g, "-")}.md`)
+      : null;
+    const prompt =
+      "You are Sol (GPT), fallback advisor after Fable failed. Brief advice only; no file edits.\n" +
+      `Reason Fable unavailable: ${reason || "unknown"}\n\n` +
+      String(contextText || "").slice(0, 5000);
+    const parts = cmd.split(/\s+/).filter(Boolean);
+    const result = spawnSync(parts[0], [...parts.slice(1), prompt], {
+      cwd,
+      encoding: "utf8",
+      timeout: 120000,
+      env: process.env,
+    });
+    const advice = String(result.stdout || result.stderr || "").trim().slice(0, 4000);
+    if (handoff && advice) {
+      try {
+        const fs = require("fs");
+        fs.mkdirSync(path.dirname(handoff), { recursive: true });
+        fs.appendFileSync(
+          handoff,
+          `\n\n## Sol advisor fallback (${new Date().toISOString()})\n${advice}\n`,
+          "utf8"
+        );
+      } catch (_) {}
+    }
+    return advice;
+  } catch (err) {
+    console.warn("[vibe-bridge] Sol advisor failed:", err && err.message);
+    return null;
+  }
+}
+
+function maybeDetectTeamSpawn(channel, task, line) {
+  if (!task || !channel) return;
+  const teamRunId = task.teamRunId || task.team_run_id;
+  const role = task.teamRole || task.team_role;
+  const teamMode = task.teamMode || task.team_mode;
+  if (!teamRunId) return;
+  if (teamMode && teamMode !== "supervisor" && teamMode !== "group_supervisor") return;
+  if (role && role !== "lead") return;
+  const text = String(line || "");
+  if (!/VIBE_TEAM_SPAWN\s*:/i.test(text)) return;
+  const m = text.match(/VIBE_TEAM_SPAWN\s*:\s*([^\n\r]+)/i);
+  if (!m) return;
+  const workers = m[1]
+    .split(/[,;\s]+/)
+    .map((s) => s.trim().toLowerCase())
+    .filter((s) => ["claude", "codex", "grok", "agy", "antigravity"].includes(s))
+    .map((s) => (s === "antigravity" ? "agy" : s));
+  if (!workers.length) return;
+  const focus = {};
+  const fm = text.match(/VIBE_TEAM_FOCUS\s*:\s*([^\n\r]+)/i);
+  if (fm) {
+    fm[1].split(/[;|]/).forEach((part) => {
+      const [h, ...rest] = part.split("=");
+      if (h && rest.length) focus[h.trim().toLowerCase()] = rest.join("=").trim();
+    });
+  }
+  try {
+    channel.push("team_spawn", {
+      chatId: task.chatId || task.chat_id,
+      teamRunId,
+      workers,
+      focusByHandle: focus,
+      requesterUserId: task.requesterUserId || task.requester_user_id,
+      leadWorker: task.leadWorker || task.lead_worker,
+    });
+    console.log(
+      `[vibe-bridge] team_spawn run=${teamRunId} workers=${workers.join(",")} chat=${task.chatId}`
+    );
+  } catch (err) {
+    console.warn("[vibe-bridge] team_spawn push failed:", err && err.message);
+  }
 }
 
 function intelligenceFor(task) {
@@ -1516,7 +1710,8 @@ function buildCommand(provider, prompt, chatId, task) {
     if (resumeId) args.push("--resume", resumeId);
     args.push("--verbose");
     if (model) args.push("--model", model);
-    if (advisor) args.push("--advisor", advisor);
+    // Fable is the primary Claude advisor; Sol is not a Claude --advisor flag.
+    if (advisor && advisor !== "sol") args.push("--advisor", advisor);
     args.push("--", cleaned);
     return { cmd: process.env.VIBE_CLAUDE_COMMAND || "claude", args };
   }
@@ -4275,6 +4470,18 @@ async function runTask(channel, task) {
         }
         sessionByChat.set(chatId, sid);
       }
+      // Lead-driven team spawn (also detected server-side from progress lines).
+      try {
+        maybeDetectTeamSpawn(channel, task, line);
+      } catch (_) {}
+      // Fable advisor failure signals → Sol fallback (async, non-blocking).
+      if (
+        /advisor.*(unavailable|failed|error)|fable.*(unavailable|failed|error|rate.?limit)/i.test(
+          line
+        )
+      ) {
+        maybeRunSolAdvisorFallback(task, line.slice(0, 200), output.slice(-3000)).catch(() => {});
+      }
       if (progressCount < MAX_PROGRESS_LINES && line.length <= MAX_LINE_BYTES && streamable(line)) {
         progressCount++;
         const now = Date.now();
@@ -4472,6 +4679,12 @@ async function runTask(channel, task) {
       agentRuntime.usageLimitHit = true;
       const cached = lastRateLimitsByProvider.get(provider);
       if (cached && cached.message) agentRuntime.usageLimitMessage = cached.message;
+    }
+    // Team FE/UI work → Gemini (Agy) advise-only review into handoff (best-effort).
+    if (exitStatus === 0 && !canceled && (task.teamRunId || task.team_run_id)) {
+      try {
+        maybeRunGeminiUiAdvisor(task, agentRuntime, output);
+      } catch (_) {}
     }
     const resultPayload = {
       ...computerFields(),
@@ -8661,6 +8874,7 @@ function controlTask(channel, payload) {
   const provider = payload.provider || payload.agentWorkerProvider || payload.agentBridgeProvider;
   const chatId = payload.chatId || payload.chat_id;
   const taskId = payload.taskId || payload.agentTaskId || payload.messageId;
+  const teamRunId = payload.teamRunId || payload.team_run_id || null;
   const action = String(payload.action || payload.type || "").trim().toLowerCase();
   if (action === "revert") {
     revertFinishedTask(channel, payload);
@@ -8668,6 +8882,36 @@ function controlTask(channel, payload) {
   }
   if (action !== "cancel" && action !== "stop") {
     channel.push("control_result", { ok: false, reason: "unsupported_action", action, provider, chatId, taskId });
+    return;
+  }
+
+  // Whole-team cancel: kill every running task for this teamRunId (lead + workers).
+  if (teamRunId) {
+    let killed = 0;
+    for (const [key, entry] of runningTasks.entries()) {
+      if (!entry) continue;
+      const entryRun = entry.teamRunId || entry.team_run_id;
+      const entryChat = entry.chatId || entry.chat_id;
+      if (entryRun !== teamRunId) continue;
+      if (chatId && entryChat && entryChat !== chatId) continue;
+      try {
+        entry.child.kill("SIGTERM");
+        setTimeout(() => {
+          try {
+            if (!entry.child.killed) entry.child.kill("SIGKILL");
+          } catch (_) {}
+        }, 2500).unref?.();
+        killed += 1;
+      } catch (_) {}
+    }
+    channel.push("control_result", {
+      ok: killed > 0,
+      action,
+      teamRunId,
+      chatId,
+      killed,
+      reason: killed > 0 ? undefined : "task_not_running",
+    });
     return;
   }
 
@@ -8680,16 +8924,34 @@ function controlTask(channel, payload) {
   }
 
   try {
-    entry.child.kill("SIGTERM");
-    setTimeout(() => {
-      if (!entry.child.killed) entry.child.kill("SIGKILL");
-    }, 2500).unref?.();
+    // If this task is a team lead, also cancel siblings sharing teamRunId.
+    const entryTeamRun = entry.teamRunId || entry.team_run_id;
+    if (entryTeamRun) {
+      for (const [, sibling] of runningTasks.entries()) {
+        if (!sibling) continue;
+        if ((sibling.teamRunId || sibling.team_run_id) !== entryTeamRun) continue;
+        try {
+          sibling.child.kill("SIGTERM");
+          setTimeout(() => {
+            try {
+              if (!sibling.child.killed) sibling.child.kill("SIGKILL");
+            } catch (_) {}
+          }, 2500).unref?.();
+        } catch (_) {}
+      }
+    } else {
+      entry.child.kill("SIGTERM");
+      setTimeout(() => {
+        if (!entry.child.killed) entry.child.kill("SIGKILL");
+      }, 2500).unref?.();
+    }
     channel.push("control_result", {
       ok: true,
       action,
       provider: entry.provider,
       chatId: entry.chatId,
       taskId: entry.taskId,
+      teamRunId: entryTeamRun || null,
     });
   } catch (err) {
     channel.push("control_result", {

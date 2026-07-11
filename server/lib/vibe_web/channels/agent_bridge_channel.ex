@@ -73,6 +73,24 @@ defmodule VibeWeb.AgentBridgeChannel do
         Presence.track(socket, key, meta)
     end
 
+    # Reconnect re-adopt: refresh TeamRun worker_states from still-running tasks.
+    running =
+      payload["runningTasks"] || payload["running_tasks"] || meta["runningTasks"] || []
+
+    if is_list(running) do
+      running
+      |> Enum.group_by(fn task ->
+        task["chatId"] || task["chat_id"] || task[:chatId]
+      end)
+      |> Enum.each(fn
+        {chat_id, tasks} when is_binary(chat_id) ->
+          LocalAgentWorker.rehydrate_team_workers_from_running_tasks(chat_id, tasks)
+
+        _ ->
+          :ok
+      end)
+    end
+
     {:reply, :ok, socket}
   end
 
@@ -96,6 +114,9 @@ defmodule VibeWeb.AgentBridgeChannel do
     task_id = payload["taskId"] || payload["task_id"]
     team_run_id = payload["teamRunId"] || payload["team_run_id"]
     team_worker = payload["teamWorker"] || payload["team_worker"]
+
+    # Lead-driven under-hood spawn: VIBE_TEAM_SPAWN: claude, grok
+    maybe_handle_team_spawn_line(line, chat_id, team_run_id, payload, socket)
 
     # A shared chat can host multiple runs from the same provider. Scope the live
     # buffer to the durable task/team identity so progress from adjacent team runs
@@ -400,6 +421,27 @@ defmodule VibeWeb.AgentBridgeChannel do
     {:reply, :ok, socket}
   end
 
+  # daemon → server: explicit team spawn request (also parsed from progress lines).
+  def handle_in("team_spawn", payload, socket) when is_map(payload) do
+    chat_id = payload["chatId"] || payload["chat_id"]
+    team_run_id = payload["teamRunId"] || payload["team_run_id"]
+    handles = payload["workers"] || payload["handles"] || []
+    focus = payload["focusByHandle"] || payload["focus_by_handle"] || %{}
+    requester = payload["requesterUserId"] || to_string(socket.assigns.user_id)
+
+    if is_binary(chat_id) and is_binary(team_run_id) and is_list(handles) do
+      LocalAgentWorker.spawn_supervisor_workers(
+        chat_id,
+        team_run_id,
+        handles,
+        requester,
+        focus_by_handle: stringify_map_keys(focus)
+      )
+    end
+
+    {:reply, :ok, socket}
+  end
+
   # daemon → server: surface an error notice without a full result
   def handle_in("error", %{"provider" => provider, "chatId" => chat_id} = payload, socket) do
     Logger.info(
@@ -429,6 +471,38 @@ defmodule VibeWeb.AgentBridgeChannel do
 
   def handle_in("heartbeat", _payload, socket), do: {:reply, :ok, socket}
   def handle_in(_event, _payload, socket), do: {:noreply, socket}
+
+  defp maybe_handle_team_spawn_line(line, chat_id, team_run_id, payload, socket)
+       when is_binary(line) and is_binary(chat_id) and is_binary(team_run_id) do
+    case LocalAgentWorker.parse_team_spawn_directive(line) do
+      %{handles: handles, focus_by_handle: focus} when handles != [] ->
+        # Only the lead may spawn.
+        role = payload["teamRole"] || payload["team_role"]
+        lead = payload["leadWorker"] || payload["lead_worker"]
+        worker = payload["teamWorker"] || payload["team_worker"] || payload["provider"]
+
+        if role == "lead" or (is_binary(lead) and lead == worker) or is_nil(role) do
+          LocalAgentWorker.spawn_supervisor_workers(
+            chat_id,
+            team_run_id,
+            handles,
+            payload["requesterUserId"] || to_string(socket.assigns.user_id),
+            focus_by_handle: focus
+          )
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp maybe_handle_team_spawn_line(_, _, _, _, _), do: :ok
+
+  defp stringify_map_keys(map) when is_map(map) do
+    Map.new(map, fn {k, v} -> {to_string(k), v} end)
+  end
+
+  defp stringify_map_keys(_), do: %{}
 
   defp bridge_lag_ms(value, received_at_ms) when is_integer(value), do: received_at_ms - value
 

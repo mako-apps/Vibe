@@ -1460,6 +1460,10 @@ private func progressNodeLabel(from item: [String: Any]) -> String? {
   }
 }
 
+func parseAgentProgressNodesPublic(_ raw: Any?) -> [ChatListRow.AgentProgressNode] {
+  parseAgentProgressNodes(raw)
+}
+
 private func parseAgentProgressNodes(_ raw: Any?) -> [ChatListRow.AgentProgressNode] {
   guard let items = raw as? [[String: Any]] else {
     // DIAGNOSTIC (text-in-live-feed): the payload isn't even an array of dicts.

@@ -994,6 +994,12 @@ final class AgentRuntimeTaskViewController: UITabBarController {
     if let taskId = runtime.taskId, !taskId.isEmpty {
       payload["taskId"] = taskId
     }
+    // Supervisor team: cancel the whole run (lead + under-hood workers).
+    if let teamRunId = runtime.teamRunId, !teamRunId.isEmpty,
+      action == "cancel" || action == "stop"
+    {
+      payload["teamRunId"] = teamRunId
+    }
     let result = ChatEngine.shared.sendAgentBridgeControl(payload)
     if (result["accepted"] as? Bool) == true {
       statusLabel.text = doneTitle

@@ -238,9 +238,57 @@ defmodule VibeWeb.ChatChannel do
     task_id =
       normalize_bridge_string(payload["taskId"] || payload["agentTaskId"] || payload["messageId"])
 
+    team_run_id =
+      normalize_bridge_string(payload["teamRunId"] || payload["team_run_id"])
+
     cond do
       is_nil(action) ->
         {:reply, {:error, %{reason: "invalid_action"}}, socket}
+
+      # Whole-team cancel: kill every under-hood worker + lead for this teamRunId.
+      action in ["cancel", "stop"] and is_binary(team_run_id) ->
+        targets =
+          LocalAgentWorker.cancel_bridge_team_run(chat_id, team_run_id, user_id)
+
+        results =
+          Enum.map(targets, fn target ->
+            control_payload =
+              %{
+                "action" => action,
+                "provider" => target.provider,
+                "chatId" => chat_id,
+                "requesterUserId" => user_id,
+                "teamRunId" => team_run_id
+              }
+              |> put_optional_string("taskId", target.task_id)
+              |> put_optional_string(
+                "computerId",
+                normalize_bridge_string(
+                  payload["computerId"] || payload["agentBridgeComputerId"]
+                )
+              )
+
+            AgentBridge.dispatch_control(user_id, control_payload)
+          end)
+
+        # Also cancel the lead provider if no task map yet (bridge matches by teamRunId).
+        _ =
+          if is_binary(provider) do
+            AgentBridge.dispatch_control(user_id, %{
+              "action" => action,
+              "provider" => provider,
+              "chatId" => chat_id,
+              "requesterUserId" => user_id,
+              "teamRunId" => team_run_id,
+              "taskId" => task_id
+            })
+          end
+
+        if Enum.any?(results, &(&1 == :ok)) or is_binary(provider) do
+          {:reply, :ok, socket}
+        else
+          {:reply, {:error, %{reason: "cancel_failed"}}, socket}
+        end
 
       is_nil(provider) ->
         {:reply, {:error, %{reason: "invalid_provider"}}, socket}
@@ -254,6 +302,7 @@ defmodule VibeWeb.ChatChannel do
             "requesterUserId" => user_id
           }
           |> put_optional_string("taskId", task_id)
+          |> put_optional_string("teamRunId", team_run_id)
           |> put_optional_string(
             "computerId",
             normalize_bridge_string(payload["computerId"] || payload["agentBridgeComputerId"])
@@ -794,7 +843,8 @@ defmodule VibeWeb.ChatChannel do
           "[ChatChannel] team_run mode=#{mode} chat=#{chat_id} run=#{team_run_id} lead=#{lead.handle} workers=#{Enum.map_join(workers, ",", & &1.handle)}"
         )
 
-        # Lead owns the single user-visible cell.
+        # Lead owns the single user-visible cell. Sibling workers are lead-driven:
+        # the lead emits VIBE_TEAM_SPAWN (bridge → server team_spawn) when it needs help.
         spawn_local_worker_dispatch(
           chat_id,
           lead,
@@ -813,36 +863,6 @@ defmodule VibeWeb.ChatChannel do
           suppress_visible: false,
           task_id_suffix: if(mode == "supervisor", do: "lead:#{lead.handle}", else: nil)
         )
-
-        # Supervisor: fan out sibling workers under the hood (no list bubbles).
-        if mode == "supervisor" do
-          workers
-          |> Enum.reject(&(&1.handle == lead.handle))
-          |> Enum.with_index()
-          |> Enum.each(fn {worker, index} ->
-            spawn_local_worker_dispatch(
-              chat_id,
-              worker,
-              dispatch_text,
-              data,
-              "supervisor_worker",
-              requester_user_id,
-              bridge_metadata: bridge_metadata,
-              note_user_turn: false,
-              note_team_user_turn: false,
-              skip_rate_limit: true,
-              team_run_id: team_run_id,
-              team_workers: workers,
-              team_mode: mode,
-              lead_worker: lead.handle,
-              team_role: "worker",
-              suppress_visible: true,
-              task_id_suffix: "worker:#{worker.handle}"
-            )
-
-            _ = index
-          end)
-        end
 
         :ok
     end
