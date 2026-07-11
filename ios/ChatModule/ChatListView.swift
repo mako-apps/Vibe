@@ -865,7 +865,35 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private let activityTextLabel = UILabel()
 
   func setIsGroupOrChannel(_ value: Bool) {
+    let changed = isGroupOrChannel != value
     isGroupOrChannel = value
+    // Cold open can land rows before the route marks the chat as a group. When the
+    // flag flips true we must:
+    //  1) stamp row.isGroupOrChannel so bubbleUsesAgentTurnContent stays off
+    //  2) drop height caches (agent-turn vs plain bubble heights diverge)
+    //  3) remeasure + redecorate so avatars don't sit under flush-left bubbles
+    guard changed else { return }
+    if value, !rows.isEmpty {
+      rows = rows.map { row in
+        var next = row
+        next.isGroupOrChannel = true
+        return next
+      }
+    } else if !value, !rows.isEmpty {
+      rows = rows.map { row in
+        var next = row
+        next.isGroupOrChannel = false
+        return next
+      }
+    }
+    guard !rows.isEmpty else { return }
+    messageHeightCache.removeAll(keepingCapacity: true)
+    agentTurnHeightCache.removeAll(keepingCapacity: true)
+    flowLayout.invalidateLayout()
+    reconfigureVisibleMessageCells(reason: "setIsGroupOrChannel")
+    if value {
+      updateFloatingSenderAvatars()
+    }
   }
 
   // MARK: - Group sender identity (per-sender name label + floating avatar)
@@ -949,14 +977,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     updateAgentBridgeControlTitle()
     guard changed, isGroupOrChannel else { return }
     // Directory can land after the rows do — re-decorate what's on screen.
+    // Use the decoration funnel (not bare reconfigureItems alone) so group
+    // gutter/name are reapplied with the new directory names/avatars.
     if !rows.isEmpty {
+      messageHeightCache.removeAll(keepingCapacity: true)
       flowLayout.invalidateLayout()
-      let visible = collectionView.indexPathsForVisibleItems
-      if !visible.isEmpty {
-        UIView.performWithoutAnimation {
-          collectionView.reconfigureItems(at: visible)
-        }
-      }
+      reconfigureVisibleMessageCells(reason: "setGroupSenderDirectory")
     }
     updateFloatingSenderAvatars()
   }
@@ -1038,6 +1064,76 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     ctx.avatarUrl = info?.avatarUrl
     ctx.provider = provider
     return ctx
+  }
+
+  /// Width available for the bubble body + extra top for the sender name (first of run).
+  /// Shared by `sizeForItemAt` and height-delta checks so they cannot diverge.
+  private func groupMeasurementExtras(at indexPath: IndexPath) -> (
+    measurementWidth: CGFloat, extraTop: CGFloat, extraLeading: CGFloat
+  ) {
+    let width = max(0.0, bounds.width - (messageHorizontalInset * 2.0))
+    let ctx = groupCellContext(at: indexPath)
+    let extraLeading = ctx.reservesGutter ? Self.groupIncomingExtraLeading : 0.0
+    let extraTop = ctx.showsName ? Self.groupSenderNameHeight : 0.0
+    return (max(1.0, width - extraLeading), extraTop, extraLeading)
+  }
+
+  /// Single funnel for every message-cell configure. Always reapplies group gutter /
+  /// name from the current indexPath so content-reload / status / send-morph paths
+  /// cannot strip decoration back to the default DM layout (avatar overlap + jump).
+  private func configureMessageCell(
+    _ cell: ChatListCell,
+    at indexPath: IndexPath,
+    row: ChatListRow,
+    hiddenMessageId: String? = nil,
+    skipRemoteMediaLoad: Bool = false,
+    preferredLocalMediaURLOverride: String? = nil,
+    selectionMode: Bool? = nil,
+    selected: Bool? = nil
+  ) {
+    cell.resolveDisplayStatus = { [weak self] r in
+      self?.resolvedDisplayStatus(for: r)
+    }
+    let groupContext = groupCellContext(at: indexPath)
+    let isSelected =
+      selected
+      ?? (row.messageId.map { selectedMessageIds.contains($0) } ?? false)
+    cell.configure(
+      row: row,
+      hiddenMessageId: hiddenMessageId ?? self.hiddenMessageId,
+      skipRemoteMediaLoad: skipRemoteMediaLoad,
+      preferredLocalMediaURLOverride: preferredLocalMediaURLOverride,
+      selectionMode: selectionMode ?? self.selectionMode,
+      selected: isSelected,
+      agentTurnState: agentTurnBubbleState(for: row),
+      groupExtraLeading: groupContext.reservesGutter ? Self.groupIncomingExtraLeading : 0.0,
+      groupSenderName: groupContext.senderName,
+      groupSenderColor: groupContext.senderColor,
+      groupSenderNameHeight: Self.groupSenderNameHeight
+    )
+  }
+
+  private func reconfigureVisibleMessageCells(reason: String) {
+    guard !rows.isEmpty else { return }
+    UIView.performWithoutAnimation {
+      CATransaction.begin()
+      CATransaction.setDisableActions(true)
+      for case let cell as ChatListCell in collectionView.visibleCells {
+        guard let indexPath = collectionView.indexPath(for: cell),
+          indexPath.item < rows.count
+        else { continue }
+        let row = rows[indexPath.item]
+        cell.applyAppearance(appearance)
+        configureMessageCell(cell, at: indexPath, row: row)
+        bindWallpaperBackdrop(to: cell)
+        cell.setNeedsLayout()
+        cell.layoutIfNeeded()
+      }
+      CATransaction.commit()
+    }
+    VibeDebugLog.log(
+      "[GroupDecor] reconfigureVisible reason=%@ visible=%d isGroup=%@",
+      reason, collectionView.visibleCells.count, isGroupOrChannel ? "Y" : "N")
   }
 
   private func shortenedIdentifier(_ key: String) -> String {
@@ -3501,7 +3597,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
 
     if deletions.isEmpty && insertions.isEmpty && !safeReloads.isEmpty {
-      let rowWidth = max(0.0, bounds.width - (messageHorizontalInset * 2.0))
       let requiresLayoutReload = safeReloads.contains { indexPath in
         guard indexPath.item < previousRows.count, indexPath.item < parsed.count else {
           return true
@@ -3514,9 +3609,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         guard previousRow.kind == .message else {
           return false
         }
+        // Same group-aware width as sizeForItemAt — full-width measurement here used
+        // to misclassify reloads and then reconfigure without invalidating layout.
+        let extras = groupMeasurementExtras(at: indexPath)
         return abs(
-          estimateMessageHeight(previousRow, rowWidth: rowWidth)
-            - estimateMessageHeight(nextRow, rowWidth: rowWidth)
+          estimateMessageHeight(previousRow, rowWidth: extras.measurementWidth)
+            - estimateMessageHeight(nextRow, rowWidth: extras.measurementWidth)
         ) > 0.5
       }
 
@@ -3569,21 +3667,26 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
       // Telegram approach: content updates are INSTANT — no opacity, no
       // crossfade, no animation of any kind. Just swap the content.
+      // ALWAYS re-apply group gutter/name via configureMessageCell — bare
+      // configure() defaults strip decoration and put the bubble under the avatar.
       UIView.performWithoutAnimation {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        var decoratePaths = Set(safeReloads)
         for indexPath in safeReloads {
+          if indexPath.item > 0 {
+            decoratePaths.insert(IndexPath(item: indexPath.item - 1, section: 0))
+          }
+          if indexPath.item + 1 < rows.count {
+            decoratePaths.insert(IndexPath(item: indexPath.item + 1, section: 0))
+          }
+        }
+        for indexPath in decoratePaths.sorted(by: { $0.item < $1.item }) {
           guard indexPath.item < rows.count else { continue }
           if let cell = collectionView.cellForItem(at: indexPath) as? ChatListCell {
             let row = rows[indexPath.item]
             cell.applyAppearance(appearance)
-            cell.configure(
-              row: row,
-              hiddenMessageId: hiddenMessageId,
-              selectionMode: selectionMode,
-              selected: row.messageId.map { selectedMessageIds.contains($0) } ?? false,
-              agentTurnState: agentTurnBubbleState(for: row)
-            )
+            configureMessageCell(cell, at: indexPath, row: row)
             bindWallpaperBackdrop(to: cell)
             cell.alpha = 1.0
             cell.contentView.alpha = 1.0
@@ -3592,6 +3695,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
             cell.layer.removeAllAnimations()
             cell.contentView.layer.removeAllAnimations()
           }
+        }
+        if isGroupOrChannel {
+          updateFloatingSenderAvatars()
         }
         CATransaction.commit()
       }
@@ -4650,9 +4756,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       return nil
     }()
     cell.applyAppearance(appearance)
-    cell.resolveDisplayStatus = { [weak self] row in
-      self?.resolvedDisplayStatus(for: row)
-    }
     let mediaDownloadState = remoteMediaDownloadState(for: row)
     if let hid = hiddenMessageId, row.kind == .message, row.messageId == hid {
       VibeDebugLog.log(
@@ -4661,19 +4764,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         pendingSendTransition != nil ? "Y" : "N",
         activeSendTransition != nil ? "Y" : "N")
     }
-    let groupContext = groupCellContext(at: indexPath)
-    cell.configure(
+    configureMessageCell(
+      cell,
+      at: indexPath,
       row: row,
-      hiddenMessageId: hiddenMessageId,
       skipRemoteMediaLoad: mediaDownloadState.needsDownload,
-      preferredLocalMediaURLOverride: preferredLocalMediaURLOverride,
-      selectionMode: selectionMode,
-      selected: row.messageId.map { selectedMessageIds.contains($0) } ?? false,
-      agentTurnState: agentTurnBubbleState(for: row),
-      groupExtraLeading: groupContext.reservesGutter ? Self.groupIncomingExtraLeading : 0.0,
-      groupSenderName: groupContext.senderName,
-      groupSenderColor: groupContext.senderColor,
-      groupSenderNameHeight: Self.groupSenderNameHeight
+      preferredLocalMediaURLOverride: preferredLocalMediaURLOverride
     )
     bindWallpaperBackdrop(to: cell)
     cell.applyMediaDownloadState(
@@ -5722,23 +5818,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     guard statusAuthorityEnabled else { return }
     guard window != nil else { return }
     guard !rows.isEmpty else { return }
-    for case let cell as ChatListCell in collectionView.visibleCells {
-      guard let indexPath = collectionView.indexPath(for: cell), indexPath.item < rows.count else {
-        continue
-      }
-      cell.resolveDisplayStatus = { [weak self] row in
-        self?.resolvedDisplayStatus(for: row)
-      }
-      let row = rows[indexPath.item]
-      cell.configure(
-        row: row,
-        hiddenMessageId: hiddenMessageId,
-        selectionMode: selectionMode,
-        selected: row.messageId.map { selectedMessageIds.contains($0) } ?? false,
-        agentTurnState: agentTurnBubbleState(for: row)
-      )
-      bindWallpaperBackdrop(to: cell)
-    }
+    // Must go through the group-decoration funnel — a bare configure() strips the
+    // avatar gutter and makes floating avatars overlap the bubble.
+    reconfigureVisibleMessageCells(reason: "refreshVisibleStatuses:\(reason)")
   }
 
   public func collectionView(
@@ -5756,13 +5838,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
     // Group rows reserve a leading avatar gutter (narrows the bubble) and, on the first
     // message of a sender-run, extra top space for the name label. Both must match what
-    // the cell lays out, so the same context drives measurement and layout.
-    let ctx = groupCellContext(at: indexPath)
-    let extraLeading = ctx.reservesGutter ? Self.groupIncomingExtraLeading : 0.0
-    let extraTop = ctx.showsName ? Self.groupSenderNameHeight : 0.0
-    let measurementWidth = max(1.0, width - extraLeading)
-    let bubbleHeight = estimateMessageHeight(row, rowWidth: measurementWidth)
-    return CGSize(width: width, height: bubbleHeight + extraTop)
+    // the cell lays out — same helper as the setRows height-delta check.
+    let extras = groupMeasurementExtras(at: indexPath)
+    let bubbleHeight = estimateMessageHeight(row, rowWidth: extras.measurementWidth)
+    return CGSize(width: width, height: bubbleHeight + extras.extraTop)
   }
 
   public func scrollViewDidScroll(_ scrollView: UIScrollView) {
@@ -7467,13 +7546,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         else { return false }
         let row = self.rows[indexPath.item]
         cell.applyAppearance(self.appearance)
-        cell.configure(
-          row: row,
-          hiddenMessageId: nil,
-          selectionMode: self.selectionMode,
-          selected: row.messageId.map { self.selectedMessageIds.contains($0) } ?? false,
-          agentTurnState: self.agentTurnBubbleState(for: row)
-        )
+        self.configureMessageCell(cell, at: indexPath, row: row, hiddenMessageId: nil)
         self.bindWallpaperBackdrop(to: cell)
         cell.alpha = 1.0
         cell.contentView.alpha = 1.0
@@ -7489,13 +7562,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       if let cell = self.collectionView.cellForItem(at: indexPath) as? ChatListCell {
         let row = self.rows[rowIndex]
         cell.applyAppearance(self.appearance)
-        cell.configure(
-          row: row,
-          hiddenMessageId: nil,
-          selectionMode: self.selectionMode,
-          selected: row.messageId.map { self.selectedMessageIds.contains($0) } ?? false,
-          agentTurnState: self.agentTurnBubbleState(for: row)
-        )
+        configureMessageCell(cell, at: indexPath, row: row, hiddenMessageId: nil)
         bindWallpaperBackdrop(to: cell)
         cell.alpha = 1.0
         cell.contentView.alpha = 1.0
@@ -7560,15 +7627,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         VibeDebugLog.log(
           "[FirstMsg] reveal SWEEP un-ghosting stale visible cell msgId=%@",
           String(revealedMessageId.prefix(12)))
-        guard let row = cell.row else { continue }
+        guard let row = cell.row,
+          let indexPath = collectionView.indexPath(for: cell),
+          indexPath.item < rows.count
+        else { continue }
         cell.applyAppearance(appearance)
-        cell.configure(
-          row: row,
-          hiddenMessageId: nil,
-          selectionMode: selectionMode,
-          selected: row.messageId.map { selectedMessageIds.contains($0) } ?? false,
-          agentTurnState: agentTurnBubbleState(for: row)
-        )
+        configureMessageCell(cell, at: indexPath, row: row, hiddenMessageId: nil)
         bindWallpaperBackdrop(to: cell)
         cell.alpha = 1.0
         cell.contentView.alpha = 1.0

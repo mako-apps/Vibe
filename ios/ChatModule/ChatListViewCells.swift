@@ -2771,6 +2771,43 @@ func agentTurnCompactHugWidth(_ row: ChatListRow) -> CGFloat {
   return ceil(textWidth) + affordance
 }
 
+/// A completed, plain one-line answer should not inherit the wide workspace shell used
+/// by a live Read/Edit/Run feed. Settled progress/runtime metadata is allowed because it
+/// renders as the compact "Worked" summary; only active work keeps the full width.
+func agentTurnSettledTextHugWidth(_ row: ChatListRow, maxContentWidth: CGFloat) -> CGFloat? {
+  let message = VibeAgentKitMap.chatMessage(from: row)
+  let hasRunningProgress = message.progressItems.contains {
+    vibeAgentKitRunningStepStatuses.contains(($0.status ?? "").lowercased())
+  }
+  guard !message.isStreaming,
+    message.hasFinalResponseText,
+    !hasRunningProgress
+  else {
+    return nil
+  }
+
+  let text = resoloAssistantDisplayText(for: message)
+    .trimmingCharacters(in: .whitespacesAndNewlines)
+  guard !text.isEmpty,
+    text.count <= 84,
+    !text.contains(where: { $0.isNewline }),
+    !text.contains("```"),
+    !text.contains("`"),
+    !text.contains("**"),
+    !text.contains("__"),
+    !text.contains("[")
+  else {
+    return nil
+  }
+
+  let font = UIFont.systemFont(ofSize: 16.0, weight: .regular)
+  let measuredWidth = ceil((text as NSString).size(withAttributes: [.font: font]).width)
+  // Do not compress something that already needs most of the normal reading width.
+  guard measuredWidth < maxContentWidth * 0.72 else { return nil }
+  // Leave room for the settled "Worked · N steps" affordance below the answer.
+  return min(maxContentWidth, max(196.0, measuredWidth + 10.0))
+}
+
 func measureMessageBubbleLayout(
   row: ChatListRow, rowWidth: CGFloat, agentTurnState: AgentTurnBubbleState = AgentTurnBubbleState()
 )
@@ -2813,9 +2850,16 @@ func measureMessageBubbleLayout(
     // bubble in the row so the tiny loader isn't marooned in a huge empty shell. As soon
     // as real content streams in it stops being compact and expands to maxContentWidth.
     let compact = agentTurnBubbleIsCompactThinking(row)
-    let contentWidth = compact
-      ? min(maxContentWidth, agentTurnCompactHugWidth(row))
-      : maxContentWidth
+    let contentWidth: CGFloat
+    if compact {
+      contentWidth = min(maxContentWidth, agentTurnCompactHugWidth(row))
+    } else if let huggedWidth = agentTurnSettledTextHugWidth(
+      row, maxContentWidth: maxContentWidth)
+    {
+      contentWidth = huggedWidth
+    } else {
+      contentWidth = maxContentWidth
+    }
     // Colors don't affect layout metrics, so a fixed appearance is fine for measurement
     // even though the live render uses the trait-matched one. Measure at the SAME width we
     // set below so the height matches what actually renders.
@@ -6963,6 +7007,13 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     selectionMode = false
     isSelectionChecked = false
     cachedLayoutMetrics = nil
+    // Clear group decoration so a reused group cell doesn't keep a stale gutter
+    // when dequeued for a DM (or the reverse: DM→group without reconfigure).
+    groupExtraLeading = 0.0
+    groupNameReservedHeight = 0.0
+    groupSenderNameLabel.text = nil
+    groupSenderNameLabel.isHidden = true
+    groupSenderNameLabel.frame = .zero
     isGhostHidden = false
     mediaProgressSpinner.stopAnimating()
     mediaProgressOverlayView.isHidden = true
@@ -9806,7 +9857,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       }
       if isContextMenuHeld {
         UIView.animate(
-          withDuration: 0.18,
+          withDuration: 0.14,
           delay: 0,
           options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut],
           animations: {
