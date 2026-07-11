@@ -1578,12 +1578,17 @@ public final class ChatMainView: UIView,
     savedSearchCancelGlassView.isHidden = !searchActive
 
     let isAgent = !bridgeProvider.isEmpty
-    callButton.isHidden = isAgent || usesSavedMessagesHeader || searchActive
-    videoCallButton.isHidden = isAgent || usesSavedMessagesHeader || searchActive
-    historyButton.isHidden = !isAgent || usesSavedMessagesHeader || searchActive
+    let isAgentGroup = isGroupOrChannel && chatListView.groupHasBridgeAgentsPublic
+    // Agent DMs and multi-agent groups: history / new-chat instead of call actions.
+    // Plain human groups keep call/video. Agent DMs never show call.
+    let showAgentHistory = (isAgent || isAgentGroup) && !usesSavedMessagesHeader && !searchActive
+    callButton.isHidden = isAgent || isAgentGroup || usesSavedMessagesHeader || searchActive
+    videoCallButton.isHidden = isAgent || isAgentGroup || usesSavedMessagesHeader || searchActive
+    historyButton.isHidden = !showAgentHistory
     // Agent DMs always have a transport chat id. Gating this control on an empty
     // engineChatId made New Chat unreachable in normal Grok/Claude/Codex sessions.
-    newChatButton.isHidden = !isAgent || usesSavedMessagesHeader || searchActive
+    // Groups with agents also get New Chat so a report-scoped view can be cleared.
+    newChatButton.isHidden = !showAgentHistory
     rightActionsGlassView.isHidden = usesSavedMessagesHeader || searchActive
 
     menuButton.setImage(
@@ -5026,7 +5031,13 @@ public final class ChatMainView: UIView,
   }
 
   @objc private func handleHistoryPressed() {
-    chatListView.presentBridgeHistorySurface(provider: bridgeProvider)
+    // Agent DM: single provider. Multi-agent group: pick among member agents first
+    // (or open the only one). History must open the report/session conversation.
+    if !bridgeProvider.isEmpty {
+      chatListView.presentBridgeHistorySurface(provider: bridgeProvider)
+      return
+    }
+    chatListView.presentGroupBridgeHistorySurface()
   }
 
   @objc private func handleNewChatPressed() {

@@ -240,7 +240,9 @@ defmodule VibeWeb.AgentBridgeChannel do
             team_worker: payload["teamWorker"] || payload["team_worker"],
             team_workers: payload["teamWorkers"] || payload["team_workers"],
             computer_id: payload["computerId"] || payload["computer_id"],
-            computer_label: payload["computerLabel"] || payload["computer_label"]
+            computer_label: payload["computerLabel"] || payload["computer_label"],
+            usage_limit_hit:
+              payload["usageLimitHit"] == true or payload["usage_limit_hit"] == true
           )
         rescue
           err ->

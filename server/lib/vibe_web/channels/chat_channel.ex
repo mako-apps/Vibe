@@ -635,6 +635,15 @@ defmodule VibeWeb.ChatChannel do
       "[ChatChannel] dispatch_resolve chat_id=#{chat_id} room_type=#{room_type} reserved=#{length(reserved_workers)} team=#{team_trigger?} team_workers=#{Enum.map_join(team_workers, ",", & &1.handle)} standalone=#{not is_nil(standalone_agent)} local_worker=#{if local_worker, do: local_worker.handle, else: "nil"} dispatch_text?=#{is_binary(dispatch_text)} agent_text?=#{is_binary(agent_text) and String.trim(to_string(agent_text)) != ""} mentioned_username=#{inspect(mentioned_agent_username)} participants=#{inspect(participant_ids)}"
     )
 
+    # Explicit single-agent targeting in a multi-agent group: @mention, reply-to-agent,
+    # or multi-@ reserved list. A plain group message must NOT collapse to one worker
+    # just because a stale mentionedAgentUsername / reply resolved local_worker.
+    explicit_group_target? =
+      room_type != "dm" and
+        (length(reserved_workers) > 0 or
+           (is_binary(mentioned_agent_username) and String.trim(mentioned_agent_username) != "") or
+           match?(%{from_id: _}, reply_message))
+
     cond do
       room_type != "dm" and team_trigger? and length(team_workers) > 1 and
           is_binary(team_dispatch_text) ->
@@ -658,9 +667,52 @@ defmodule VibeWeb.ChatChannel do
             data,
             "reserved_worker_group",
             user_id,
-            skip_rate_limit: index > 0
+            skip_rate_limit: index > 0,
+            task_id_suffix: worker.handle
           )
         end)
+
+      # Default group behaviour FIRST (before single local_worker / standalone): a plain
+      # group message in a group with 2+ AI members fans out to ALL of them in PARALLEL.
+      # Must win over a wrongly-resolved local_worker so Claude+Codex(+Grok/Agy) all reply.
+      room_type != "dm" and not sender_is_agent? and not explicit_group_target? and
+        is_nil(standalone_agent) and is_binary(dispatch_text) and
+          length(group_agent_workers) > 1 ->
+        Logger.info(
+          "[ChatChannel] group_default_parallel chat=#{chat_id} workers=#{Enum.map_join(group_agent_workers, ",", & &1.handle)}"
+        )
+
+        group_agent_workers
+        |> Enum.with_index()
+        |> Enum.each(fn {worker, index} ->
+          spawn_local_worker_dispatch(
+            chat_id,
+            worker,
+            dispatch_text,
+            data,
+            "group_default_parallel",
+            user_id,
+            # First dispatch takes the rate-limit slot; siblings skip so they start together.
+            # Unique task id per worker so bridge dedupe (keyed provider+chat+taskId) never
+            # collapses parallel agents that share the human message id.
+            skip_rate_limit: index > 0,
+            note_user_turn: index == 0,
+            task_id_suffix: worker.handle
+          )
+        end)
+
+      # Same default, but a group that only has one AI member — dispatch to it alone.
+      room_type != "dm" and not sender_is_agent? and not explicit_group_target? and
+        is_nil(standalone_agent) and is_binary(dispatch_text) and
+          length(group_agent_workers) == 1 ->
+        spawn_local_worker_dispatch(
+          chat_id,
+          hd(group_agent_workers),
+          dispatch_text,
+          data,
+          "group_default",
+          user_id
+        )
 
       local_worker && is_binary(dispatch_text) ->
         trigger_type =
@@ -694,47 +746,6 @@ defmodule VibeWeb.ChatChannel do
           data,
           attachment_context,
           trigger_type,
-          user_id
-        )
-
-      # Default group behaviour: a plain group message (no @team / @claude / @codex,
-      # no reply-to-agent) in a group that has the AI workers as members fans out to
-      # ALL of them in PARALLEL — two independent runtimes that both start
-      # immediately, each with its own "typing" activity and message stream. This is
-      # what makes a group feel like two coworkers rather than a relay. (An explicit
-      # `@team` / `/team` run above stays a coordinated *sequential* handoff instead,
-      # where the agents build on each other's work.)
-      room_type != "dm" and not sender_is_agent? and is_nil(standalone_agent) and
-        is_nil(local_worker) and reserved_workers == [] and is_binary(dispatch_text) and
-          length(group_agent_workers) > 1 ->
-        group_agent_workers
-        |> Enum.with_index()
-        |> Enum.each(fn {worker, index} ->
-          spawn_local_worker_dispatch(
-            chat_id,
-            worker,
-            dispatch_text,
-            data,
-            "group_default_parallel",
-            user_id,
-            # First dispatch takes the rate-limit slot; the parallel sibling skips it
-            # so the pair always starts together. Record the human's turn in the
-            # shared group memory once (both workers read the same thread).
-            skip_rate_limit: index > 0,
-            note_user_turn: index == 0
-          )
-        end)
-
-      # Same default, but a group that only has one AI member — dispatch to it alone.
-      room_type != "dm" and not sender_is_agent? and is_nil(standalone_agent) and
-        is_nil(local_worker) and reserved_workers == [] and is_binary(dispatch_text) and
-          length(group_agent_workers) == 1 ->
-        spawn_local_worker_dispatch(
-          chat_id,
-          hd(group_agent_workers),
-          dispatch_text,
-          data,
-          "group_default",
           user_id
         )
 
@@ -807,10 +818,26 @@ defmodule VibeWeb.ChatChannel do
     note_team_user_turn? = Keyword.get(opts, :note_team_user_turn, false)
     team_run_id = Keyword.get(opts, :team_run_id)
     team_workers = Keyword.get(opts, :team_workers, [])
+    task_id_suffix = Keyword.get(opts, :task_id_suffix)
 
     bridge_metadata =
       (Keyword.get(opts, :bridge_metadata) || bridge_task_metadata(data))
       |> resolve_provider_model(worker.handle)
+
+    base_task_id =
+      case data["id"] do
+        id when is_binary(id) and id != "" -> id
+        _ -> Ecto.UUID.generate()
+      end
+
+    # Parallel group fan-out shares one human message id; append the worker handle so
+    # each agent gets a distinct bridge taskId (dedupe key includes provider already,
+    # but unique ids also keep progress/result correlation clean per agent).
+    task_id =
+      case task_id_suffix do
+        suffix when is_binary(suffix) and suffix != "" -> "#{base_task_id}:#{suffix}"
+        _ -> base_task_id
+      end
 
     cond do
       not LocalAgentWorker.user_allowed?(requester_user_id) ->
@@ -825,13 +852,13 @@ defmodule VibeWeb.ChatChannel do
       not skip_rate_limit and not LocalAgentWorker.allow_request?(requester_user_id) ->
         maybe_clear_team_run(chat_id, team_run_id)
 
-        LocalAgentWorker.post_notice(
-          worker,
-          chat_id,
-          "You're sending @#{worker.handle} tasks too quickly. Please wait a few seconds and try again.",
-          requester_user_id,
-          data["id"]
+        # Don't post a list-shifting notice bubble for send-cooldown — the phone
+        # surfaces this via the usage/rate banner. Log only.
+        Logger.info(
+          "[ChatChannel] local worker cooldown user=#{requester_user_id} worker=#{worker.handle} chat=#{chat_id}"
         )
+
+        :ok
 
       # Preferred path: run on the user's OWN paired computer (their subscription).
       # A bridge can be paired but temporarily absent from Presence while its socket
@@ -861,7 +888,7 @@ defmodule VibeWeb.ChatChannel do
           %{
             "provider" => worker.handle,
             "chatId" => chat_id,
-            "taskId" => data["id"] || Ecto.UUID.generate(),
+            "taskId" => task_id,
             "prompt" => bridge_prompt,
             "replyToId" => data["id"],
             "requesterUserId" => requester_user_id

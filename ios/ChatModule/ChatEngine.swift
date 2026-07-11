@@ -2420,6 +2420,24 @@ final class ChatEngine {
     return result
   }
 
+  /// A plain agent DM may begin an automatic current-session read while the user is
+  /// already composing a brand-new task. Once that fresh send wins, a late detail reply
+  /// must not mount an old transcript into the new thread and reorder visible bubbles.
+  /// Explicit History picks use the separate session-load path and are unaffected.
+  func cancelAutomaticAgentBridgeSessionLoad(chatId rawChatId: String) {
+    guard let chatId = normalizedString(rawChatId), !chatId.isEmpty else { return }
+    syncOnQueue {
+      guard let inflight = currentSessionLoadInflightByChatId.removeValue(forKey: chatId) else {
+        return
+      }
+      pendingBridgeSessionIngestByRequestId.removeValue(forKey: inflight.requestId)
+      NSLog(
+        "[ChatEngine][BridgeMount] cancel automatic current-session load chat=%@ requestId=%@ after fresh send",
+        String(chatId.suffix(12)), String(inflight.requestId.prefix(8))
+      )
+    }
+  }
+
   @discardableResult
   func loadOlderAgentBridgeSessionChunk(chatId rawChatId: String) -> [String: Any] {
     let chatId = normalizedString(rawChatId) ?? rawChatId.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2594,6 +2612,23 @@ final class ChatEngine {
     return String(text[marker.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
   }
 
+  /// Canonical form of a transcript user turn for comparing against the phone's own
+  /// sent row. Strips BOTH daemon-added preambles — the instruction-files preamble and
+  /// the attachment pointer ("The user attached N image file(s)… \n\n<text>") — then
+  /// trims. Two prompts are the "same send" when their comparable forms match.
+  static func bridgeMirrorComparableText(_ text: String) -> String {
+    var body = strippedBridgeInstructionPreamble(text)
+    if body.hasPrefix("The user attached "), let marker = body.range(of: "\n\n") {
+      body = String(body[marker.upperBound...])
+    }
+    return body.trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  /// How far apart (ms) an own sent row and its transcript mirror may sit and still be
+  /// treated as the same prompt. Wide on purpose: transcript timestamps come from the
+  /// CLI's clock and history re-ingests can land much later than the original send.
+  static let bridgeMirrorDedupWindowMs: Int64 = 48 * 3600 * 1000
+
   private static let transcriptISO8601MsFormatter: ISO8601DateFormatter = {
     let formatter = ISO8601DateFormatter()
     formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -2767,6 +2802,30 @@ final class ChatEngine {
     let me = currentUserIdLocked()
     var lastMessageId: String?
     var ingestedIds = Set<String>()
+    // Own NON-bridge user rows already in this chat's stores (the optimistic send row
+    // and/or its persisted server twin). A transcript user turn matching one of these
+    // is the CLI's mirror of a prompt this phone already renders. It must be skipped
+    // at INGEST: merging alone can't save us because the chat view's per-message
+    // overlay (`nativeEngineRowsById`, fed straight from the live store on
+    // chatMessageInserted) bypasses `mergedChatRowsLocked`'s mirror dedup and would
+    // resurrect the second bubble — the duplicated "my message" bug.
+    var ownUserMirrorTwins: [(text: String, ts: Int64)] = []
+    func collectOwnMirrorTwin(_ mid: String, _ row: [String: Any]) {
+      guard !mid.hasPrefix("bridge-"), !mid.hasPrefix("stream-"),
+        messageIsMe(fromRow: row),
+        let message = row["message"] as? [String: Any],
+        let rawText = normalizedString(message["text"])
+      else { return }
+      let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !text.isEmpty else { return }
+      ownUserMirrorTwins.append((text, messageTimestampMs(fromRow: row)))
+    }
+    for (mid, row) in liveMessageRowsByChat[chatId] ?? [:] {
+      collectOwnMirrorTwin(mid, row)
+    }
+    for row in historyRowsByChat[chatId] ?? [] {
+      if let mid = messageId(fromRow: row) { collectOwnMirrorTwin(mid, row) }
+    }
     // The live `agent-stream` path renders the in-flight turn in real time (keyed
     // `stream-…`). If one is active, the session transcript's RUNNING turn is a
     // duplicate of it — skip it here and let the live row own the running turn. The
@@ -2786,6 +2845,23 @@ final class ChatEngine {
       // live action stream still renders; otherwise drop empty placeholders.
       let hasProgressNodes = (item["progressNodes"] as? [[String: Any]])?.isEmpty == false
       guard !text.isEmpty || hasProgressNodes else { continue }
+      // Skip the transcript's mirror of a prompt this phone already renders as its own
+      // sent row (see ownUserMirrorTwins above). Not ingesting it also lets the
+      // stale-row tombstone pass below clear any previously-ingested copy, so an
+      // existing duplicate self-heals on the next re-push. Prompts typed elsewhere
+      // (desktop CLI/IDE) have no own-row twin and still ingest normally.
+      if role == "user" {
+        let mirrorText = Self.bridgeMirrorComparableText(text)
+        let mirrorTs =
+          Self.parseTranscriptTimestampMs(item["ts"] ?? item["timestamp"]) ?? baseTs
+        if !mirrorText.isEmpty,
+          ownUserMirrorTwins.contains(where: {
+            $0.text == mirrorText && abs($0.ts - mirrorTs) <= Self.bridgeMirrorDedupWindowMs
+          })
+        {
+          continue
+        }
+      }
       // Is this the agent's currently-running turn? (the bridge flags it `running`.)
       let isRunningTranscriptItem = role != "user" && (item["running"] as? Bool) == true
       if isRunningTranscriptItem {
@@ -6472,6 +6548,20 @@ final class ChatEngine {
           self.applyAgentStreamLocked(chatId: chatId, payload: frame.payload)
           return
         }
+        // Subscription/rate-limit hit: no transcript row — refresh the usage banner.
+        if frame.event == "agent-usage-limit" {
+          let provider = self.normalizedString(frame.payload["provider"]) ?? ""
+          let message = self.normalizedString(frame.payload["message"]) ?? ""
+          self.postChangeLocked(
+            reason: "agentUsageLimit",
+            userInfo: [
+              "chatId": chatId,
+              "provider": provider,
+              "message": message,
+            ]
+          )
+          return
+        }
         if frame.event == "agent-bridge-history" {
           self.agentBridgeHistoryByChat[chatId] = frame.payload
           let mode = self.normalizedString(frame.payload["mode"]) ?? "list"
@@ -7660,14 +7750,16 @@ final class ChatEngine {
       return (text, messageTimestampMs(fromRow: row))
     }
     if !ownUserTexts.isEmpty {
-      let mirrorDedupWindowMs: Int64 = 48 * 3600 * 1000
+      let mirrorDedupWindowMs = Self.bridgeMirrorDedupWindowMs
       for (id, row) in mergedById {
         guard id.hasPrefix("bridge-"), messageIsMe(fromRow: row),
           let message = row["message"] as? [String: Any],
-          let text = normalizedString(message["text"])?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-          !text.isEmpty
+          let rawText = normalizedString(message["text"])
         else { continue }
+        // Comparable form strips the daemon's attachment preamble too, so an
+        // image-carrying prompt still matches its own sent row.
+        let text = Self.bridgeMirrorComparableText(rawText)
+        guard !text.isEmpty else { continue }
         let ts = messageTimestampMs(fromRow: row)
         if ownUserTexts.contains(where: { $0.text == text && abs($0.ts - ts) <= mirrorDedupWindowMs }) {
           mergedById.removeValue(forKey: id)

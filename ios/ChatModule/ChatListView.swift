@@ -1400,6 +1400,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     layoutGapDebugOverlay()
     layoutBridgeCommandOverlay()
     layoutBridgeUsageBanner()
+    layoutBridgeTaskBanner()
+    layoutPendingBridgeQueue()
     // The transcript skeleton's clearances are snapshotted when it's shown; keyboard /
     // composer / header changes after that would strand its rows mid-screen (the
     // "placeholders glued to the top" read), so re-assert them every layout pass.
@@ -1582,7 +1584,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// still scoped: shown only for the explicitly-loaded/live session, never leaked from
   /// other sessions.
   private func bridgeFreshFiltered(_ parsed: [ChatListRow]) -> [ChatListRow] {
-    guard currentBridgeProvider != nil else { return parsed }
+    // Agent DMs always filter. Multi-agent groups only isolate when a History
+    // session is explicitly loaded (bridgeLoadedSessionId) so report picks work.
+    let groupHistoryIsolation = groupHasBridgeAgents() && bridgeLoadedSessionId != nil
+    guard currentBridgeProvider != nil || groupHistoryIsolation else { return parsed }
     let chatKey = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !chatKey.isEmpty else { return parsed }
     // Prefer this view's explicitly-picked session id, but fall back to the session the
@@ -1703,6 +1708,37 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let firstToken = trimmed.dropFirst().split(whereSeparator: { $0 == " " || $0 == "\n" }).first
     guard let name = firstToken.map({ String($0).lowercased() }) else { return false }
     return bridgeInfoCommandNames.contains(name)
+  }
+
+  /// True when a row is a subscription/rate-limit notice that must stay out of the list.
+  private static func isUsageLimitRow(_ row: ChatListRow) -> Bool {
+    let body = (row.plainContent ?? row.text ?? "").lowercased()
+    guard !body.isEmpty else { return false }
+    // Only consider agent-side rows — never hide the user's own text.
+    guard row.isAgentMessage || row.agentRuntime != nil || row.agentUsername != nil else {
+      return false
+    }
+    // Failed agent turn with only a limit message (and no real tool work).
+    let looksLikeLimit =
+      body.contains("usage limit")
+      || body.contains("session limit")
+      || body.contains("rate limit")
+      || body.contains("you've hit your")
+      || body.contains("youve hit your")
+      || body.contains("hit your usage")
+      || body.contains("hit your session")
+      || body.contains("quota exceeded")
+      || body.contains("quota exhausted")
+      || body.contains("out of usage")
+      || body.contains("out of credits")
+      || body.range(of: #"reached your .{0,40}limit"#, options: .regularExpression) != nil
+    guard looksLikeLimit else { return false }
+    // Keep real agent answers that merely mention limits in passing when they also
+    // carried tools / a long response body.
+    if let runtime = row.agentRuntime, runtime.exitStatus == 0, body.count > 280 {
+      return false
+    }
+    return true
   }
 
   private func extractBridgeCommandRows(_ parsed: [ChatListRow]) -> [ChatListRow] {
@@ -1835,67 +1871,221 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
   // MARK: - Near-limit usage banner
 
+  /// Providers that should contribute to the usage banner for this surface
+  /// (agent DM: that provider; multi-agent group: every bridge member).
+  private func usageBannerProviders() -> [String] {
+    if let provider = currentBridgeProvider, !provider.isEmpty {
+      return [provider]
+    }
+    if groupHasBridgeAgents() {
+      let providers = Set(
+        groupSenderDirectory.values.compactMap { entry -> String? in
+          let p = entry.provider?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+          return (p?.isEmpty == false) ? p : nil
+        })
+      let ordered = ["claude", "codex", "grok", "agy"].filter { providers.contains($0) }
+      return ordered.isEmpty ? Array(providers).sorted() : ordered
+    }
+    return []
+  }
+
+  /// Pending multi-provider usage replies keyed by requestId (group carousel).
+  private var pendingGroupUsageRequestIds: [String: String] = [:]
+  private var groupUsageSnapshotsByProvider: [String: (util: Int, label: String, resetsAt: String?, limitHit: Bool)] = [:]
+  private var groupUsageCarouselIndex: Int = 0
+  private var groupUsageCarouselTimer: Timer?
+
   /// Ask the bridge for a fresh structured usage snapshot. Throttled; a rejected push
   /// (socket/join not ready) clears the throttle so the channel-join retry fires freely.
+  /// In multi-agent groups, requests every member provider so the banner can carousel.
   private func requestBridgeUsageSnapshot(reason: String) {
-    guard let provider = currentBridgeProvider else { return }
+    let providers = usageBannerProviders()
+    guard !providers.isEmpty else { return }
     let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !chatId.isEmpty else { return }
     let now = ProcessInfo.processInfo.systemUptime
-    guard now - lastBridgeUsageRequestAt > 30.0 else { return }
+    // Hard limit hits bypass the 30s throttle so the banner appears on send.
+    let force = reason == "usageLimit" || reason == "send" || reason.hasPrefix("usageLimit")
+    guard force || now - lastBridgeUsageRequestAt > 30.0 else { return }
     lastBridgeUsageRequestAt = now
-    let requestId = UUID().uuidString
-    let result = ChatEngine.shared.requestAgentBridgeUsage([
-      "chatId": chatId, "provider": provider, "requestId": requestId,
-    ])
-    let accepted = (result["accepted"] as? Bool) == true
-    if accepted {
-      lastBridgeUsageRequestId = (result["requestId"] as? String) ?? requestId
-    } else {
-      // Socket/join not ready — allow a retry after a short backoff (the fallback poll
-      // and engine-change activity below re-call this) without spamming every frame.
+    pendingGroupUsageRequestIds.removeAll()
+    var anyAccepted = false
+    for provider in providers {
+      let requestId = UUID().uuidString
+      let result = ChatEngine.shared.requestAgentBridgeUsage([
+        "chatId": chatId, "provider": provider, "requestId": requestId,
+      ])
+      let accepted = (result["accepted"] as? Bool) == true
+      if accepted {
+        anyAccepted = true
+        let rid = (result["requestId"] as? String) ?? requestId
+        lastBridgeUsageRequestId = rid
+        pendingGroupUsageRequestIds[rid] = provider
+      }
+      VibeDebugLog.log(
+        "[ChatUsage] request chat=%@ provider=%@ reason=%@ accepted=%@ result=%@",
+        String(chatId.prefix(12)), provider, reason, accepted ? "Y" : "N",
+        (result["reason"] as? String) ?? "-")
+    }
+    if !anyAccepted {
+      // Socket/join not ready — allow a retry after a short backoff.
       lastBridgeUsageRequestAt = now - 25.0
     }
-    VibeDebugLog.log(
-      "[ChatUsage] request chat=%@ reason=%@ accepted=%@ result=%@",
-      String(chatId.prefix(12)), reason, accepted ? "Y" : "N",
-      (result["reason"] as? String) ?? "-")
   }
 
   /// Parse the usage reply this surface requested; show the banner when the worst
   /// subscription bucket is at/over the threshold, hide it when usage dropped back.
   private func applyBridgeUsageReply(requestId: String) {
-    guard requestId == lastBridgeUsageRequestId,
+    let providerForReply = pendingGroupUsageRequestIds[requestId]
+    let isTracked =
+      requestId == lastBridgeUsageRequestId || providerForReply != nil
+    guard isTracked,
       let payload = ChatEngine.shared.latestAgentBridgeUsage(requestId: requestId),
       (payload["ok"] as? Bool) ?? true,
-      let report = payload["report"] as? [String: Any],
-      let buckets = report["buckets"] as? [[String: Any]]
+      let report = payload["report"] as? [String: Any]
     else { return }
+
+    let provider =
+      (providerForReply
+        ?? (report["provider"] as? String)
+        ?? currentBridgeProvider
+        ?? "agent")
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased()
+    let buckets = report["buckets"] as? [[String: Any]] ?? []
+    let limitHit = (report["limitHit"] as? Bool) == true
     var worstLabel: String?
     var worstUtil = 0
     var worstResetsAt: String?
     for bucket in buckets {
       guard let label = bucket["label"] as? String, !label.isEmpty else { continue }
-      let util = (bucket["utilization"] as? NSNumber)?.intValue ?? 0
+      let util = (bucket["utilization"] as? NSNumber)?.intValue
+        ?? Int((bucket["utilization"] as? Double) ?? 0)
       if util > worstUtil {
         worstUtil = util
         worstLabel = label
         worstResetsAt = bucket["resetsAt"] as? String
       }
     }
-    VibeDebugLog.log("[ChatUsage] reply buckets=%d worst=%@ %d%%", buckets.count, worstLabel ?? "-", worstUtil)
-    guard let label = worstLabel, worstUtil >= 75 else {
+    if limitHit {
+      worstUtil = max(worstUtil, 100)
+      if worstLabel == nil { worstLabel = "5-hour session" }
+    }
+    pendingGroupUsageRequestIds.removeValue(forKey: requestId)
+    if !provider.isEmpty, let label = worstLabel {
+      groupUsageSnapshotsByProvider[provider] = (
+        util: worstUtil, label: label, resetsAt: worstResetsAt, limitHit: limitHit || worstUtil >= 100
+      )
+    }
+    VibeDebugLog.log(
+      "[ChatUsage] reply provider=%@ buckets=%d worst=%@ %d%% hit=%@",
+      provider, buckets.count, worstLabel ?? "-", worstUtil, limitHit ? "Y" : "N")
+
+    refreshUsageBannerFromSnapshots()
+  }
+
+  /// Rebuild the floating usage banner from the latest per-provider snapshots.
+  private func refreshUsageBannerFromSnapshots() {
+    // Prefer limit-hit agents, then highest utilization ≥ 75%.
+    let candidates = groupUsageSnapshotsByProvider
+      .filter { $0.value.limitHit || $0.value.util >= 75 }
+      .sorted { a, b in
+        if a.value.limitHit != b.value.limitHit { return a.value.limitHit && !b.value.limitHit }
+        return a.value.util > b.value.util
+      }
+    guard !candidates.isEmpty else {
       hideBridgeUsageBanner()
+      stopGroupUsageCarousel()
       return
     }
-    // Bucket + 5%-step level: dismissing 92% suppresses 90–94, but 95 re-warns.
-    let key = "\(label)#\(worstUtil / 5)"
+    if candidates.count == 1 {
+      stopGroupUsageCarousel()
+      let (provider, snap) = candidates[0]
+      presentUsageBanner(provider: provider, snap: snap)
+      return
+    }
+    // Multi-agent near/at limit: auto-carousel between them (swipeable feel).
+    groupUsageCarouselIndex = min(groupUsageCarouselIndex, candidates.count - 1)
+    let (provider, snap) = candidates[groupUsageCarouselIndex % candidates.count]
+    presentUsageBanner(provider: provider, snap: snap)
+    startGroupUsageCarousel(candidates: candidates)
+  }
+
+  private func presentUsageBanner(
+    provider: String,
+    snap: (util: Int, label: String, resetsAt: String?, limitHit: Bool)
+  ) {
+    let key = "\(provider)#\(snap.label)#\(snap.util / 5)#\(snap.limitHit ? "H" : "N")"
     guard key != dismissedBridgeUsageKey else { return }
-    var text = "You've used \(worstUtil)% of your \(label) limit"
-    if let reset = Self.bridgeUsageResetText(worstResetsAt) {
+    let title =
+      provider.isEmpty
+      ? "Usage"
+      : provider.prefix(1).uppercased() + provider.dropFirst()
+    var text: String
+    if snap.limitHit || snap.util >= 100 {
+      text = "Rate limit hit · \(snap.label)"
+    } else {
+      text = "You've used \(snap.util)% of your \(snap.label) limit"
+    }
+    if let reset = Self.bridgeUsageResetText(snap.resetsAt) {
       text += " · resets in \(reset)"
     }
-    showBridgeUsageBanner(text: text, key: key)
+    showBridgeUsageBanner(text: text, key: key, title: title, provider: provider)
+  }
+
+  private func startGroupUsageCarousel(
+    candidates: [(key: String, value: (util: Int, label: String, resetsAt: String?, limitHit: Bool))]
+  ) {
+    stopGroupUsageCarousel()
+    guard candidates.count > 1 else { return }
+    groupUsageCarouselTimer = Timer.scheduledTimer(withTimeInterval: 4.0, repeats: true) {
+      [weak self] _ in
+      guard let self else { return }
+      self.groupUsageCarouselIndex =
+        (self.groupUsageCarouselIndex + 1) % max(1, candidates.count)
+      self.refreshUsageBannerFromSnapshots()
+    }
+  }
+
+  private func stopGroupUsageCarousel() {
+    groupUsageCarouselTimer?.invalidate()
+    groupUsageCarouselTimer = nil
+  }
+
+  /// Force-show a hard limit banner (from `agent-usage-limit` event) and refresh buckets.
+  private func handleAgentUsageLimitEvent(provider: String, message: String) {
+    let p = provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !p.isEmpty else { return }
+    let resetsAt = Self.parseResetHintFromLimitMessage(message)
+    groupUsageSnapshotsByProvider[p] = (
+      util: 100, label: "5-hour session", resetsAt: resetsAt, limitHit: true
+    )
+    // Clear dismiss so a fresh limit always reappears.
+    dismissedBridgeUsageKey = nil
+    refreshUsageBannerFromSnapshots()
+    lastBridgeUsageRequestAt = 0
+    requestBridgeUsageSnapshot(reason: "usageLimit:\(p)")
+  }
+
+  private static func parseResetHintFromLimitMessage(_ text: String) -> String? {
+    // "resets in 3h 12m" / "resets 1am" — only the relative form is convertible.
+    let pattern = #"resets?\s+(?:in\s+)?(?:(\d+)\s*d)?\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?"#
+    guard let re = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else {
+      return nil
+    }
+    let range = NSRange(text.startIndex..<text.endIndex, in: text)
+    guard let match = re.firstMatch(in: text, options: [], range: range) else { return nil }
+    func group(_ i: Int) -> Int {
+      let r = match.range(at: i)
+      guard r.location != NSNotFound, let swift = Range(r, in: text) else { return 0 }
+      return Int(text[swift]) ?? 0
+    }
+    let d = group(1)
+    let h = group(2)
+    let m = group(3)
+    guard d + h + m > 0 else { return nil }
+    let date = Date().addingTimeInterval(TimeInterval(((d * 24 + h) * 60 + m) * 60))
+    return ISO8601DateFormatter().string(from: date)
   }
 
   /// "2h 15m" / "45m" / "3d" until the bucket resets, from the report's ISO timestamp.
@@ -1914,18 +2104,26 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     return "\(max(1, minutes))m"
   }
 
-  private func showBridgeUsageBanner(text: String, key: String) {
+  private var lastUsageBannerProvider: String?
+
+  private func showBridgeUsageBanner(
+    text: String,
+    key: String,
+    title: String = "Usage",
+    provider: String? = nil
+  ) {
     let banner: ChatPinnedBannerView
     if let existing = bridgeUsageBanner {
       banner = existing
     } else {
       let created = ChatPinnedBannerView()
       created.addTarget(self, action: #selector(handleBridgeUsageBannerTapped), for: .touchUpInside)
-      created.onClose = { [weak self] in self?.handleBridgeUsageBannerTapped() }
+      created.onClose = { [weak self] in self?.dismissBridgeUsageBanner() }
       addSubview(created)
       bridgeUsageBanner = created
       banner = created
     }
+    lastUsageBannerProvider = provider
     let accent = UIColor { trait in
       trait.userInterfaceStyle == .dark
         ? UIColor(red: 0.98, green: 0.76, blue: 0.28, alpha: 1.0)
@@ -1938,10 +2136,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       isDark: appearance.isDark
     )
     banner.configure(
-      title: "Usage",
+      title: title,
       body: text,
       systemImage: "gauge.with.dots.needle.bottom.50percent",
-      animateIcon: banner.accessibilityValue != nil
+      animateIcon: banner.accessibilityValue != key
     )
     banner.accessibilityValue = key
     let wasHidden = banner.isHidden
@@ -1963,12 +2161,45 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
   }
 
+  /// Tap opens the structured Usage sheet (5h / weekly + reset). Close (✕) only dismisses.
   @objc private func handleBridgeUsageBannerTapped() {
+    let provider =
+      lastUsageBannerProvider
+      ?? currentBridgeProvider
+      ?? usageBannerProviders().first
+      ?? "claude"
+    presentUsageSheet(provider: provider)
+  }
+
+  private func dismissBridgeUsageBanner() {
     dismissedBridgeUsageKey = bridgeUsageBanner?.accessibilityValue
     hideBridgeUsageBanner()
   }
 
+  /// Present the existing per-provider Usage panel (buckets + reset times).
+  private func presentUsageSheet(provider: String) {
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !chatId.isEmpty, let presenter = topPresentingViewController() else { return }
+    let appearance = VibeAgentKitMap.appearance(for: traitCollection)
+    let panel = NavigationView {
+      VibeAgentUsagePanel(
+        chatId: chatId,
+        provider: provider,
+        appearance: appearance
+      )
+    }
+    .navigationViewStyle(.stack)
+    let host = UIHostingController(rootView: panel)
+    host.modalPresentationStyle = .pageSheet
+    if let sheet = host.sheetPresentationController {
+      sheet.detents = [.medium(), .large()]
+      sheet.prefersGrabberVisible = true
+    }
+    presenter.present(host, animated: true)
+  }
+
   private func hideBridgeUsageBanner() {
+    stopGroupUsageCarousel()
     guard let banner = bridgeUsageBanner, !banner.isHidden else { return }
     UIView.animate(
       withDuration: 0.16, delay: 0,
@@ -1995,6 +2226,598 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let height = ChatPinnedBannerView.preferredHeight
     let topY = contentPaddingTop + 4.0
     banner.frame = CGRect(x: 16.0, y: topY, width: width, height: height)
+  }
+
+  // MARK: - Pending sends while a bridge run is live
+
+  /// A message typed while the agent was still running. Held out of the transcript
+  /// (no optimistic row, nothing dispatched) and shown as a "waiting" preview above
+  /// the input until the run settles, the user cancels it, or the user steers.
+  private struct PendingBridgeSend {
+    let messageId: String
+    let text: String
+    let replyToMessageId: String?
+    let bridgeMetadata: [String: Any]
+    let agentMention: Bool
+    let agentText: String?
+    let mentionedAgentUsername: String?
+    let createdAtMs: Int64
+  }
+
+  /// Survives view rebinds (leaving/reopening the DM) for the app session.
+  private static var pendingBridgeSendsByChat: [String: [PendingBridgeSend]] = [:]
+  private var pendingBridgeQueueContainer: UIView?
+  private var pendingBridgeQueueScroll: UIScrollView?
+  private var pendingBridgeQueueStack: UIStackView?
+  private var pendingBridgeQueueHeader: UILabel?
+  private var bridgeQueueFlushWorkItem: DispatchWorkItem?
+
+  private var pendingBridgeChatKey: String {
+    engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  private var pendingBridgeSends: [PendingBridgeSend] {
+    get { Self.pendingBridgeSendsByChat[pendingBridgeChatKey] ?? [] }
+    set { Self.pendingBridgeSendsByChat[pendingBridgeChatKey] = newValue }
+  }
+
+  /// Is a bridge run live for THIS chat right now? Checks the engine's live-tail
+  /// session registration, the header progress state, and (fallback) any live agent
+  /// row on screen — any one of them means the CLI is still working.
+  private func bridgeRunIsLive() -> Bool {
+    let chatId = pendingBridgeChatKey
+    guard !chatId.isEmpty, currentBridgeProvider != nil else { return false }
+    if ChatEngine.shared.liveBridgeSessionId(chatId: chatId) != nil { return true }
+    if let progress = ChatEngine.shared.agentProgress(chatId: chatId) {
+      let status = ((progress["status"] as? String) ?? "").lowercased()
+      if status == "running" || status == "streaming" { return true }
+    }
+    return rows.contains { $0.isAgentMessage && bridgeRowIsLive($0) }
+  }
+
+  private func enqueuePendingBridgeSend(
+    messageId: String,
+    text: String,
+    replyToMessageId: String?,
+    bridgeMetadata: [String: Any],
+    agentMention: Bool,
+    agentText: String?,
+    mentionedAgentUsername: String?
+  ) {
+    guard !pendingBridgeChatKey.isEmpty else { return }
+    let item = PendingBridgeSend(
+      messageId: messageId,
+      text: text,
+      replyToMessageId: replyToMessageId,
+      bridgeMetadata: bridgeMetadata,
+      agentMention: agentMention,
+      agentText: agentText,
+      mentionedAgentUsername: mentionedAgentUsername,
+      createdAtMs: Int64(Date().timeIntervalSince1970 * 1000)
+    )
+    pendingBridgeSends.append(item)
+    NSLog(
+      "[BridgeQueue] enqueue id=%@ queued=%d textLen=%d",
+      String(messageId.prefix(8)), pendingBridgeSends.count, text.count)
+    refreshPendingBridgeQueueUI(animated: true)
+    // Safety: if the settle signal was already in flight while the user typed,
+    // don't strand the message — re-check shortly.
+    schedulePendingBridgeQueueFlush(reason: "post-enqueue-check")
+  }
+
+  private func cancelPendingBridgeSend(messageId: String) {
+    var queue = pendingBridgeSends
+    queue.removeAll { $0.messageId == messageId }
+    pendingBridgeSends = queue
+    NSLog("[BridgeQueue] cancel id=%@ queued=%d", String(messageId.prefix(8)), queue.count)
+    refreshPendingBridgeQueueUI(animated: true)
+  }
+
+  /// Steer: force-stop the live run, then dispatch THIS pending message immediately
+  /// (the resume-session id keeps the conversation context). Remaining queued items
+  /// wait for the steered run to settle like normal.
+  private func steerPendingBridgeSend(messageId: String) {
+    var queue = pendingBridgeSends
+    guard let index = queue.firstIndex(where: { $0.messageId == messageId }) else { return }
+    let item = queue.remove(at: index)
+    pendingBridgeSends = queue
+    refreshPendingBridgeQueueUI(animated: true)
+    let chatId = pendingBridgeChatKey
+    guard let provider = currentBridgeProvider, !chatId.isEmpty else {
+      performPendingBridgeSend(item)
+      return
+    }
+    let result = ChatEngine.shared.sendAgentBridgeControl([
+      "chatId": chatId, "provider": provider, "action": "cancel",
+    ])
+    NSLog(
+      "[BridgeQueue] steer id=%@ cancelAccepted=%@",
+      String(messageId.prefix(8)), ((result["accepted"] as? Bool) == true) ? "Y" : "N")
+    // Give the cancel a beat to reach the CLI before the fresh prompt spawns the
+    // next run; the daemon treats a cancel racing a natural finish as a no-op.
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+      self?.performPendingBridgeSend(item)
+    }
+  }
+
+  /// Dispatch a held message through the normal outgoing path (optimistic row now
+  /// appears in the list, exactly like a direct send).
+  private func performPendingBridgeSend(_ item: PendingBridgeSend) {
+    let now = Date()
+    let formatter = DateFormatter()
+    formatter.dateFormat = "HH:mm"
+    if !item.bridgeMetadata.isEmpty {
+      noteBridgeFreshOwnSentId(item.messageId)
+    }
+    NSLog("[BridgeQueue] dispatch id=%@", String(item.messageId.prefix(8)))
+    dispatchOutgoingSend(
+      messageId: item.messageId,
+      text: item.text,
+      timestamp: formatter.string(from: now),
+      timestampMs: now.timeIntervalSince1970 * 1000,
+      replyToMessageId: item.replyToMessageId,
+      bridgeMetadata: item.bridgeMetadata,
+      agentMention: item.agentMention,
+      agentText: item.agentText,
+      mentionedAgentUsername: item.mentionedAgentUsername
+    )
+  }
+
+  /// Debounced "run may have settled" probe. Fired from the agentProgress-idle
+  /// engine event and from row settles; flushes ONE item per settle (each flush
+  /// starts a new run; the rest keep waiting for that run).
+  private func schedulePendingBridgeQueueFlush(reason: String) {
+    guard !pendingBridgeSends.isEmpty else { return }
+    bridgeQueueFlushWorkItem?.cancel()
+    let work = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      self.bridgeQueueFlushWorkItem = nil
+      self.flushPendingBridgeQueueIfIdle()
+    }
+    bridgeQueueFlushWorkItem = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: work)
+  }
+
+  private func flushPendingBridgeQueueIfIdle() {
+    var queue = pendingBridgeSends
+    guard !queue.isEmpty else {
+      refreshPendingBridgeQueueUI(animated: false)
+      return
+    }
+    guard !bridgeRunIsLive() else {
+      // Still running — the next settle signal re-arms the flush.
+      refreshPendingBridgeQueueUI(animated: false)
+      return
+    }
+    let item = queue.removeFirst()
+    pendingBridgeSends = queue
+    refreshPendingBridgeQueueUI(animated: true)
+    performPendingBridgeSend(item)
+  }
+
+  /// Rebuild the "waiting" strip above the input bar: one compact card per queued
+  /// message (preview + Steer ⚡ + ✕), inner-scrollable when several stack up.
+  private func refreshPendingBridgeQueueUI(animated: Bool) {
+    let queue = pendingBridgeSends
+    guard !queue.isEmpty, currentBridgeProvider != nil else {
+      if let container = pendingBridgeQueueContainer {
+        let hide = {
+          container.alpha = 0.0
+          container.transform = CGAffineTransform(translationX: 0, y: 8)
+        }
+        if animated {
+          UIView.animate(
+            withDuration: 0.16, delay: 0,
+            options: [.beginFromCurrentState, .allowUserInteraction],
+            animations: hide
+          ) { _ in
+            if container.alpha <= 0.01 { container.isHidden = true }
+          }
+        } else {
+          hide()
+          container.isHidden = true
+        }
+      }
+      return
+    }
+
+    let container: UIView
+    let stack: UIStackView
+    if let existing = pendingBridgeQueueContainer, let existingStack = pendingBridgeQueueStack {
+      container = existing
+      stack = existingStack
+    } else {
+      container = UIView()
+      container.layer.cornerRadius = 18.0
+      container.layer.cornerCurve = .continuous
+      container.layer.borderWidth = 1.0 / UIScreen.main.scale
+      container.clipsToBounds = true
+      addSubview(container)
+
+      let header = UILabel()
+      header.font = .systemFont(ofSize: 12.0, weight: .semibold)
+      header.translatesAutoresizingMaskIntoConstraints = false
+      container.addSubview(header)
+      pendingBridgeQueueHeader = header
+
+      let scroll = UIScrollView()
+      scroll.translatesAutoresizingMaskIntoConstraints = false
+      scroll.showsVerticalScrollIndicator = true
+      scroll.alwaysBounceVertical = false
+      container.addSubview(scroll)
+      pendingBridgeQueueScroll = scroll
+
+      let itemsStack = UIStackView()
+      itemsStack.axis = .vertical
+      itemsStack.spacing = 8.0
+      itemsStack.translatesAutoresizingMaskIntoConstraints = false
+      scroll.addSubview(itemsStack)
+
+      NSLayoutConstraint.activate([
+        header.topAnchor.constraint(equalTo: container.topAnchor, constant: 10.0),
+        header.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14.0),
+        header.trailingAnchor.constraint(
+          lessThanOrEqualTo: container.trailingAnchor, constant: -14.0),
+        scroll.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 8.0),
+        scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10.0),
+        scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -10.0),
+        scroll.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -10.0),
+        itemsStack.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor),
+        itemsStack.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
+        itemsStack.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor),
+        itemsStack.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor),
+        itemsStack.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor),
+      ])
+      pendingBridgeQueueContainer = container
+      pendingBridgeQueueStack = itemsStack
+      stack = itemsStack
+    }
+
+    container.backgroundColor = appearance.bubbleThemColor
+    container.layer.borderColor =
+      appearance.textColorThem.withAlphaComponent(appearance.isDark ? 0.14 : 0.10).cgColor
+    pendingBridgeQueueHeader?.textColor = appearance.textColorThem.withAlphaComponent(0.55)
+    pendingBridgeQueueHeader?.text =
+      queue.count == 1
+      ? "Waiting for the current run to finish"
+      : "Waiting for the current run to finish · \(queue.count) queued"
+
+    for view in stack.arrangedSubviews {
+      stack.removeArrangedSubview(view)
+      view.removeFromSuperview()
+    }
+    for item in queue {
+      stack.addArrangedSubview(makePendingBridgeSendItemView(item))
+    }
+
+    let wasHidden = container.isHidden || container.alpha <= 0.01
+    container.isHidden = false
+    bringSubviewToFront(container)
+    setNeedsLayout()
+    layoutIfNeeded()
+    if wasHidden, animated {
+      container.alpha = 0.0
+      container.transform = CGAffineTransform(translationX: 0, y: 8)
+      UIView.animate(
+        withDuration: 0.22, delay: 0,
+        options: [.beginFromCurrentState, .allowUserInteraction]
+      ) {
+        container.alpha = 1.0
+        container.transform = .identity
+      }
+    } else {
+      container.alpha = 1.0
+      container.transform = .identity
+    }
+  }
+
+  private func makePendingBridgeSendItemView(_ item: PendingBridgeSend) -> UIView {
+    let card = UIView()
+    card.layer.cornerRadius = 12.0
+    card.layer.cornerCurve = .continuous
+    card.backgroundColor =
+      appearance.textColorThem.withAlphaComponent(appearance.isDark ? 0.06 : 0.045)
+
+    let icon = UIImageView(
+      image: UIImage(
+        systemName: "clock",
+        withConfiguration: UIImage.SymbolConfiguration(pointSize: 13.0, weight: .medium)))
+    icon.tintColor = appearance.textColorThem.withAlphaComponent(0.45)
+    icon.translatesAutoresizingMaskIntoConstraints = false
+    icon.setContentHuggingPriority(.required, for: .horizontal)
+
+    let label = UILabel()
+    label.font = .systemFont(ofSize: 14.0)
+    label.textColor = appearance.textColorThem.withAlphaComponent(0.9)
+    label.numberOfLines = 2
+    label.text = item.text
+    label.translatesAutoresizingMaskIntoConstraints = false
+    label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+    // Steer: stop the live run and send this prompt right away.
+    var steerConfig = UIButton.Configuration.plain()
+    steerConfig.image = UIImage(
+      systemName: "bolt.fill",
+      withConfiguration: UIImage.SymbolConfiguration(pointSize: 12.0, weight: .semibold))
+    steerConfig.title = "Steer"
+    steerConfig.imagePadding = 3.0
+    steerConfig.contentInsets = NSDirectionalEdgeInsets(
+      top: 5.0, leading: 8.0, bottom: 5.0, trailing: 8.0)
+    let steerButton = UIButton(configuration: steerConfig)
+    steerButton.titleLabel?.font = .systemFont(ofSize: 12.0, weight: .semibold)
+    steerButton.tintColor = appearance.isDark
+      ? UIColor(red: 0.98, green: 0.76, blue: 0.28, alpha: 1.0)
+      : UIColor(red: 0.70, green: 0.48, blue: 0.04, alpha: 1.0)
+    steerButton.translatesAutoresizingMaskIntoConstraints = false
+    steerButton.setContentHuggingPriority(.required, for: .horizontal)
+    steerButton.accessibilityIdentifier = "bridge-queue-steer-\(item.messageId)"
+    steerButton.addAction(
+      UIAction { [weak self] _ in self?.steerPendingBridgeSend(messageId: item.messageId) },
+      for: .touchUpInside)
+
+    // ✕ = cancel this queued send entirely.
+    let closeButton = UIButton(type: .system)
+    closeButton.setImage(
+      UIImage(
+        systemName: "xmark",
+        withConfiguration: UIImage.SymbolConfiguration(pointSize: 11.0, weight: .semibold)),
+      for: .normal)
+    closeButton.tintColor = appearance.textColorThem.withAlphaComponent(0.45)
+    closeButton.translatesAutoresizingMaskIntoConstraints = false
+    closeButton.setContentHuggingPriority(.required, for: .horizontal)
+    closeButton.accessibilityIdentifier = "bridge-queue-cancel-\(item.messageId)"
+    closeButton.addAction(
+      UIAction { [weak self] _ in self?.cancelPendingBridgeSend(messageId: item.messageId) },
+      for: .touchUpInside)
+
+    card.addSubview(icon)
+    card.addSubview(label)
+    card.addSubview(steerButton)
+    card.addSubview(closeButton)
+    NSLayoutConstraint.activate([
+      icon.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 10.0),
+      icon.centerYAnchor.constraint(equalTo: card.centerYAnchor),
+      label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 8.0),
+      label.topAnchor.constraint(equalTo: card.topAnchor, constant: 8.0),
+      label.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -8.0),
+      steerButton.leadingAnchor.constraint(equalTo: label.trailingAnchor, constant: 8.0),
+      steerButton.centerYAnchor.constraint(equalTo: card.centerYAnchor),
+      closeButton.leadingAnchor.constraint(equalTo: steerButton.trailingAnchor, constant: 2.0),
+      closeButton.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -10.0),
+      closeButton.centerYAnchor.constraint(equalTo: card.centerYAnchor),
+      closeButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 28.0),
+      card.heightAnchor.constraint(greaterThanOrEqualToConstant: 40.0),
+    ])
+    return card
+  }
+
+  /// Float the queue strip just above the input bar (mirrors the command overlay's
+  /// placement); caps its height so long queues scroll inside the strip instead of
+  /// covering the conversation.
+  private func layoutPendingBridgeQueue() {
+    guard let container = pendingBridgeQueueContainer, !container.isHidden else { return }
+    let barMinY = agentComposerView?.frame.minY ?? inputBar?.frame.minY ?? bounds.height
+    let width = max(0.0, bounds.width - 24.0)
+    let targetSize = container.systemLayoutSizeFitting(
+      CGSize(width: width, height: UIView.layoutFittingCompressedSize.height),
+      withHorizontalFittingPriority: .required,
+      verticalFittingPriority: .fittingSizeLevel
+    )
+    let height = min(max(58.0, targetSize.height), 190.0)
+    container.frame = CGRect(x: 12.0, y: barMinY - height - 8.0, width: width, height: height)
+  }
+
+  // MARK: - Live background-task banner (bridge runs)
+
+  private var bridgeTaskBanner: UIView?
+  private var bridgeTaskBannerScroll: UIScrollView?
+  private var bridgeTaskBannerCountLabel: UILabel?
+  private var bridgeTaskBannerItems: [VibeAgentKitProgressItem] = []
+  /// Node ids already surfaced for the CURRENT live turn — once a task appears it
+  /// stays in the banner (flipping to done/failed) until the turn settles.
+  private var bridgeTaskBannerSeenNodeIds: Set<String> = []
+  private var bridgeTaskBannerRowKey: String?
+  private var lastBridgeTaskBannerRefreshAt: CFTimeInterval = 0
+
+  /// Rebuild the "N tasks live" banner from the live turn's progress nodes. A node
+  /// counts as a TASK when it's a terminal/subagent-style step (bash/task/tool/mcp)
+  /// that is running in PARALLEL — i.e. it's still `running` while a later step has
+  /// already started (Claude/Codex background terminals, subagents). The current
+  /// foreground step never shows here (the header already narrates it).
+  private func refreshBridgeTaskBanner() {
+    guard currentBridgeProvider != nil else {
+      hideBridgeTaskBanner()
+      return
+    }
+    let now = CACurrentMediaTime()
+    guard now - lastBridgeTaskBannerRefreshAt > 0.4 else { return }
+    lastBridgeTaskBannerRefreshAt = now
+
+    guard let liveRow = rows.last(where: { $0.isAgentMessage && bridgeRowIsLive($0) }) else {
+      hideBridgeTaskBanner()
+      return
+    }
+    let rowKey = liveRow.messageId ?? liveRow.key
+    if rowKey != bridgeTaskBannerRowKey {
+      bridgeTaskBannerRowKey = rowKey
+      bridgeTaskBannerSeenNodeIds = []
+    }
+    let message = VibeAgentKitMap.chatMessage(from: liveRow)
+    let taskKinds: Set<String> = ["bash", "task", "tool", "mcp"]
+    let items = message.progressItems
+    var tasks: [VibeAgentKitProgressItem] = []
+    for (index, item) in items.enumerated() {
+      let kind = (item.itemType ?? item.tool ?? "").lowercased()
+      guard taskKinds.contains(kind) else { continue }
+      let nodeKey = item.nodeId ?? "\(rowKey)#\(index)"
+      let isRunning = vibeAgentKitRunningStepStatuses.contains((item.status ?? "").lowercased())
+      let hasLaterStep = index < items.count - 1
+      if isRunning && hasLaterStep {
+        // Parallel/backgrounded: still running while later steps already started.
+        bridgeTaskBannerSeenNodeIds.insert(nodeKey)
+        tasks.append(item)
+      } else if bridgeTaskBannerSeenNodeIds.contains(nodeKey) {
+        // Previously surfaced task that has since finished — keep it, now "done".
+        tasks.append(item)
+      }
+    }
+    guard !tasks.isEmpty else {
+      hideBridgeTaskBanner()
+      return
+    }
+    bridgeTaskBannerItems = tasks
+    rebuildBridgeTaskBanner(tasks: tasks)
+  }
+
+  private func rebuildBridgeTaskBanner(tasks: [VibeAgentKitProgressItem]) {
+    let banner: UIView
+    let scroll: UIScrollView
+    if let existing = bridgeTaskBanner, let existingScroll = bridgeTaskBannerScroll {
+      banner = existing
+      scroll = existingScroll
+    } else {
+      let container = UIView()
+      container.layer.cornerRadius = 18.0
+      container.layer.cornerCurve = .continuous
+      container.layer.borderWidth = 1.0 / UIScreen.main.scale
+      container.clipsToBounds = true
+      addSubview(container)
+
+      let paging = UIScrollView()
+      paging.isPagingEnabled = true
+      paging.showsHorizontalScrollIndicator = false
+      paging.translatesAutoresizingMaskIntoConstraints = false
+      container.addSubview(paging)
+
+      let count = UILabel()
+      count.font = .systemFont(ofSize: 11.0, weight: .bold)
+      count.textAlignment = .center
+      count.layer.cornerRadius = 9.0
+      count.layer.cornerCurve = .continuous
+      count.clipsToBounds = true
+      count.translatesAutoresizingMaskIntoConstraints = false
+      container.addSubview(count)
+
+      NSLayoutConstraint.activate([
+        paging.topAnchor.constraint(equalTo: container.topAnchor),
+        paging.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        paging.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+        paging.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -34.0),
+        count.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8.0),
+        count.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+        count.widthAnchor.constraint(greaterThanOrEqualToConstant: 18.0),
+        count.heightAnchor.constraint(equalToConstant: 18.0),
+      ])
+      bridgeTaskBanner = container
+      bridgeTaskBannerScroll = paging
+      bridgeTaskBannerCountLabel = count
+      banner = container
+      scroll = paging
+    }
+
+    banner.backgroundColor = appearance.bubbleThemColor
+    banner.layer.borderColor =
+      appearance.textColorThem.withAlphaComponent(appearance.isDark ? 0.14 : 0.10).cgColor
+    let liveCount = tasks.filter {
+      vibeAgentKitRunningStepStatuses.contains(($0.status ?? "").lowercased())
+    }.count
+    bridgeTaskBannerCountLabel?.text = "\(liveCount)"
+    bridgeTaskBannerCountLabel?.textColor = appearance.isDark ? .black : .white
+    bridgeTaskBannerCountLabel?.backgroundColor =
+      liveCount > 0
+      ? (appearance.isDark
+        ? UIColor(red: 0.98, green: 0.76, blue: 0.28, alpha: 1.0)
+        : UIColor(red: 0.70, green: 0.48, blue: 0.04, alpha: 1.0))
+      : appearance.textColorThem.withAlphaComponent(0.35)
+
+    for view in scroll.subviews where view is BridgeTaskBannerPageView {
+      view.removeFromSuperview()
+    }
+    for (index, item) in tasks.enumerated() {
+      let page = BridgeTaskBannerPageView(
+        item: item, index: index, total: tasks.count, appearance: appearance)
+      page.onTap = { [weak self] in self?.presentBridgeTaskDetail(index: index) }
+      scroll.addSubview(page)
+    }
+
+    let wasHidden = banner.isHidden || banner.alpha <= 0.01
+    banner.isHidden = false
+    bringSubviewToFront(banner)
+    setNeedsLayout()
+    if wasHidden {
+      layoutIfNeeded()
+      banner.alpha = 0.0
+      banner.transform = CGAffineTransform(translationX: 0, y: -8)
+      UIView.animate(
+        withDuration: 0.22, delay: 0,
+        options: [.beginFromCurrentState, .allowUserInteraction]
+      ) {
+        banner.alpha = 1.0
+        banner.transform = .identity
+      }
+    }
+  }
+
+  private func hideBridgeTaskBanner() {
+    bridgeTaskBannerItems = []
+    bridgeTaskBannerRowKey = nil
+    bridgeTaskBannerSeenNodeIds = []
+    guard let banner = bridgeTaskBanner, !banner.isHidden else { return }
+    UIView.animate(
+      withDuration: 0.16, delay: 0,
+      options: [.beginFromCurrentState, .allowUserInteraction]
+    ) {
+      banner.alpha = 0.0
+      banner.transform = CGAffineTransform(translationX: 0, y: -8)
+    } completion: { _ in
+      if banner.alpha <= 0.01 { banner.isHidden = true }
+    }
+  }
+
+  /// Task RESULT lives in a sheet, not the transcript: tapping a banner page opens
+  /// the standard step-detail sheet (command + output / subagent detail).
+  private func presentBridgeTaskDetail(index: Int) {
+    guard index >= 0, index < bridgeTaskBannerItems.count,
+      let presenter = topPresentingViewController()
+    else { return }
+    let detail = VibeAgentKitStepDetailViewController(
+      item: bridgeTaskBannerItems[index],
+      appearance: VibeAgentKitMap.appearance(for: traitCollection)
+    )
+    let nav = UINavigationController(rootViewController: detail)
+    nav.modalPresentationStyle = .pageSheet
+    let vibeAppearance = VibeAgentKitMap.appearance(for: traitCollection)
+    nav.view.backgroundColor =
+      vibeAppearance.isDark ? UIColor.black.withAlphaComponent(0.3) : .clear
+    if let sheet = nav.sheetPresentationController {
+      sheet.detents = [.medium(), .large()]
+      sheet.prefersGrabberVisible = true
+    }
+    presenter.present(nav, animated: true)
+  }
+
+  /// Pinned like the usage banner (top, floating over the feed); when both are
+  /// visible the task banner stacks directly below the usage banner. Pages lay out
+  /// side-by-side at banner width for the inner horizontal scroll.
+  private func layoutBridgeTaskBanner() {
+    guard let banner = bridgeTaskBanner, !banner.isHidden,
+      let scroll = bridgeTaskBannerScroll
+    else { return }
+    let width = max(0.0, bounds.width - 32.0)
+    let height: CGFloat = 52.0
+    var topY = contentPaddingTop + 4.0
+    if let usage = bridgeUsageBanner, !usage.isHidden {
+      topY = usage.frame.maxY + 8.0
+    }
+    banner.frame = CGRect(x: 16.0, y: topY, width: width, height: height)
+    let pageWidth = max(0.0, width - 34.0)
+    var pageIndex = 0
+    for view in scroll.subviews where view is BridgeTaskBannerPageView {
+      view.frame = CGRect(
+        x: CGFloat(pageIndex) * pageWidth, y: 0.0, width: pageWidth, height: height)
+      pageIndex += 1
+    }
+    scroll.contentSize = CGSize(width: CGFloat(pageIndex) * pageWidth, height: height)
   }
 
   func setRows(_ nextRows: [[String: Any]]) {
@@ -2031,6 +2854,23 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let visibleRows = filterRowsForSearch(mergedRows)
     let parsedAll = visibleRows.compactMap(ChatListRow.init).filter { row in
       guard row.messageType != "agent_progress" else { return false }
+      // Rate/usage-limit notices never belong in the transcript — they shift the list.
+      // Route them to the floating usage banner instead.
+      if Self.isUsageLimitRow(row) {
+        let provider =
+          row.agentRuntime?.provider
+          ?? row.agentUsername
+          ?? ""
+        if !provider.isEmpty {
+          DispatchQueue.main.async { [weak self] in
+            self?.handleAgentUsageLimitEvent(
+              provider: provider,
+              message: row.plainContent ?? row.text ?? ""
+            )
+          }
+        }
+        return false
+      }
       // A live agent turn with nothing renderable yet (no tool/step, no narration, no
       // answer text) is held out of the transcript entirely — the header already shows
       // "Thinking…" for this state. The row appears the moment the first real chunk
@@ -2083,6 +2923,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // here by the bridge (runtime.command.executable == "vibe-bridge"). They must NOT
     // land in the transcript — route them to the host (banner/overlay) and drop them.
     parsed = extractBridgeCommandRows(parsed)
+#if DEBUG
+    collectionView.accessibilityIdentifier = "chat.messages"
+    collectionView.accessibilityValue =
+      "incoming=\(nextRows.count);merged=\(mergedRows.count);parsed=\(parsed.count);displayed=\(rows.count)"
+#endif
     if parsed.isEmpty, !nextRows.isEmpty {
       // Incoming rows all dropped before render — dump the first raw row's shape so
       // the drop point (ChatListRow.init vs a filter) is identifiable from device logs.
@@ -4227,23 +5072,34 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // Runs BEFORE the statusAuthority gate below because bridge DMs keep statusAuthority
     // OFF, so this reason would otherwise never be observed here. Idempotent + throttled.
     if (note.userInfo?["reason"] as? String) == "chatChannelStateChanged",
-      currentBridgeProvider != nil
+      currentBridgeProvider != nil || groupHasBridgeAgents()
     {
       let changed = (note.userInfo?["chatId"] as? String)?.trimmingCharacters(
         in: .whitespacesAndNewlines)
       let chatKey = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
       if !chatKey.isEmpty, changed == nil || changed?.isEmpty == true || changed == chatKey {
-        requestCurrentBridgeSession(reason: "channelJoined")
+        if currentBridgeProvider != nil {
+          requestCurrentBridgeSession(reason: "channelJoined")
+        }
         requestBridgeUsageSnapshot(reason: "channelJoined")
       }
     }
-    // Usage banner plumbing — also ahead of the statusAuthority gate (bridge DMs keep
-    // statusAuthority OFF, so these reasons would never be observed below).
-    if currentBridgeProvider != nil {
+    // Usage banner plumbing — ahead of the statusAuthority gate (bridge DMs keep
+    // statusAuthority OFF; groups with bridge agents also need this path).
+    if currentBridgeProvider != nil || groupHasBridgeAgents() {
       let reason = (note.userInfo?["reason"] as? String) ?? ""
       if reason == "agentBridgeUsage" {
         if let requestId = note.userInfo?["requestId"] as? String, !requestId.isEmpty {
           applyBridgeUsageReply(requestId: requestId)
+        }
+      } else if reason == "agentUsageLimit" {
+        let changed = (note.userInfo?["chatId"] as? String)?.trimmingCharacters(
+          in: .whitespacesAndNewlines)
+        let chatKey = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !chatKey.isEmpty, changed == nil || changed?.isEmpty == true || changed == chatKey {
+          let provider = (note.userInfo?["provider"] as? String) ?? ""
+          let message = (note.userInfo?["message"] as? String) ?? ""
+          handleAgentUsageLimitEvent(provider: provider, message: message)
         }
       } else if ["chatMessageChanged", "chatMessageInserted"].contains(reason) {
         let changed = (note.userInfo?["chatId"] as? String)?.trimmingCharacters(
@@ -4257,7 +5113,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
             lastBridgeUsageRequestAt = 0
             requestBridgeUsageSnapshot(reason: "runFinished")
           } else {
-            // Any DM activity (a result landing, a limit-hit message) refreshes usage;
+            // Any activity (a result landing, a limit-hit message) refreshes usage;
             // the 30s throttle keeps this quiet during streaming.
             requestBridgeUsageSnapshot(reason: "activity")
           }
@@ -4286,6 +5142,17 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       // Typing indicator is handled in header; do not show list-level typing UI.
       setPeerTyping(false)
       return
+    }
+    if reason == "agentProgress" {
+      // Run settled (isActive false) → this is the moment a held message may go out.
+      // Run started/ticked → keep the task banner fresh even between row updates.
+      let isActive = (note.userInfo?["isActive"] as? Bool) ?? false
+      if isActive {
+        refreshBridgeTaskBanner()
+      } else {
+        schedulePendingBridgeQueueFlush(reason: "agentProgress-idle")
+        refreshBridgeTaskBanner()
+      }
     }
     if reason == "chatMessageInserted"
       || reason == "chatMessageEdited"
@@ -5167,6 +6034,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
   private func finishRowsUpdate() {
     isApplyingRowsUpdate = false
+    // Bridge-run companions driven by row state: the live-task banner, the queued-send
+    // strip, and the settle-triggered flush of held messages (covers settles that
+    // arrive as row updates rather than agentProgress events).
+    refreshBridgeTaskBanner()
+    if !pendingBridgeSends.isEmpty {
+      refreshPendingBridgeQueueUI(animated: false)
+      if !bridgeRunIsLive() {
+        schedulePendingBridgeQueueFlush(reason: "rowsSettled")
+      }
+    }
     guard let queued = pendingRowsPayload else {
       return
     }
@@ -5638,6 +6515,33 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     )
   }
 
+  /// True when an overlay-only row is the CLI transcript's mirror (`bridge-…`, isMe)
+  /// of a prompt whose real sent row already exists — in the base rows or in the
+  /// optimistic outgoing overlay. Matches the engine's mirror dedup so the view never
+  /// re-adds a row the engine deliberately dropped.
+  private func overlayRowIsMirroredOwnPrompt(
+    _ overlay: [String: Any], overlayId: String, baseRows: [[String: Any]]
+  ) -> Bool {
+    guard overlayId.hasPrefix("bridge-") else { return false }
+    guard let message = overlay["message"] as? [String: Any],
+      (message["isMe"] as? Bool) == true
+    else { return false }
+    let text = ChatEngine.bridgeMirrorComparableText((message["text"] as? String) ?? "")
+    guard !text.isEmpty else { return false }
+    func rowIsTwin(_ row: [String: Any], id: String?) -> Bool {
+      guard let id, !id.hasPrefix("bridge-"), !id.hasPrefix("stream-"),
+        let msg = row["message"] as? [String: Any],
+        (msg["isMe"] as? Bool) == true
+      else { return false }
+      let twinText = ((msg["text"] as? String) ?? "")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      return !twinText.isEmpty && twinText == text
+    }
+    for row in baseRows where rowIsTwin(row, id: messageId(fromRawRow: row)) { return true }
+    for (mid, row) in nativeOutgoingRowsById where rowIsTwin(row, id: mid) { return true }
+    return false
+  }
+
   private func mergedRowsPayload(from baseRows: [[String: Any]]) -> [[String: Any]] {
     let effectiveBaseRows: [[String: Any]] = {
       guard statusAuthorityEnabled, !engineChatId.isEmpty else { return baseRows }
@@ -5705,6 +6609,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         guard let overlay = nativeEngineRowsById[messageId] else { continue }
         if baseMessageIds.contains(messageId) {
           nextEngineOrder.append(messageId)
+          continue
+        }
+        // The engine's merged snapshot dedups a `bridge-…` transcript mirror of the
+        // user's OWN prompt against its real sent row. This overlay is fed per-insert
+        // straight from the live store, so without the same check here it re-appends
+        // exactly the row the engine dropped — the duplicated "my message" bubble.
+        if overlayRowIsMirroredOwnPrompt(overlay, overlayId: messageId, baseRows: filteredBase) {
+          nativeEngineRowsById.removeValue(forKey: messageId)
           continue
         }
         mergedRows.append(overlay)
@@ -7443,10 +8355,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
 
     guard let provider else {
-      // Group fan-out to both agents: no single provider and no resume target (each
-      // parallel agent starts its own fresh session, matching the new-task-per-message
-      // default). Model choices ARE per-provider — ship them as a map the server
-      // resolves per worker at dispatch (see chat_channel.ex resolve_provider_model).
+      // Group fan-out: no single DM provider. Model choices ARE per-provider — ship them
+      // as a map the server resolves per worker at dispatch (chat_channel.ex
+      // resolve_provider_model). When a History report is open, also attach its session
+      // id so follow-ups stay on that conversation (each agent still gets its own run
+      // unless the user @mentions a single worker).
       var models: [String: String] = [:]
       var advisors: [String: String] = [:]
       for agentProvider in ["claude", "codex", "grok", "agy"] {
@@ -7463,6 +8376,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       }
       if !advisors.isEmpty {
         metadata["agentBridgeAdvisors"] = advisors
+      }
+      // History-picked report in a multi-agent group: keep the conversation scoped.
+      if let resume = bridgeLoadedSessionId ?? activeBridgeSessionId,
+        !resume.isEmpty, !resume.hasPrefix("running:")
+      {
+        metadata["agentBridgeResumeSessionId"] = resume
       }
       return metadata
     }
@@ -7485,9 +8404,17 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     //     reopen + send silently spawned a brand-new session even though the open
     //     conversation was still on screen.
     let chatKey = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    let engineLiveSessionId = ChatEngine.shared.liveBridgeSessionId(chatId: chatKey)
+    if bridgeLoadedSessionId == nil, activeBridgeSessionId == nil, engineLiveSessionId == nil {
+      // A speculative current-session load must not land after this fresh send:
+      // it would append an old transcript above the user row and make keyboard
+      // dismissal look like a jump to the header. A History pick never takes
+      // this branch, so its follow-up still resumes the selected session.
+      ChatEngine.shared.cancelAutomaticAgentBridgeSessionLoad(chatId: chatKey)
+    }
     let resumeSessionId =
       bridgeLoadedSessionId ?? activeBridgeSessionId
-      ?? ChatEngine.shared.liveBridgeSessionId(chatId: chatKey)
+      ?? engineLiveSessionId
     if let resumeSessionId,
       !resumeSessionId.isEmpty,
       !resumeSessionId.hasPrefix("running:")
@@ -7498,7 +8425,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       "[AgentRoute] outgoing resume id=%@ (loaded=%@ adopted=%@ engineLive=%@)",
       resumeSessionId ?? "<new-session>",
       bridgeLoadedSessionId ?? "-", activeBridgeSessionId ?? "-",
-      ChatEngine.shared.liveBridgeSessionId(chatId: chatKey) ?? "-")
+      engineLiveSessionId ?? "-")
     return metadata
   }
 
@@ -7508,6 +8435,40 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private func groupHasBridgeAgents() -> Bool {
     guard isGroupOrChannel else { return false }
     return groupSenderDirectory.values.contains { $0.provider != nil }
+  }
+
+  /// Public read for ChatMainView header controls (history vs call).
+  var groupHasBridgeAgentsPublic: Bool { groupHasBridgeAgents() }
+
+  /// Multi-agent group History entry: if one provider, open its history; if several,
+  /// let the user pick which agent's reports to browse.
+  func presentGroupBridgeHistorySurface() {
+    let providers = usageBannerProviders()
+    guard !providers.isEmpty else { return }
+    if providers.count == 1 {
+      presentBridgeHistorySurface(provider: providers[0])
+      return
+    }
+    guard let presenter = topPresentingViewController() else { return }
+    let sheet = UIAlertController(
+      title: "History",
+      message: "Whose conversation history?",
+      preferredStyle: .actionSheet
+    )
+    for provider in providers {
+      let title = provider.prefix(1).uppercased() + provider.dropFirst()
+      sheet.addAction(
+        UIAlertAction(title: title, style: .default) { [weak self] _ in
+          self?.presentBridgeHistorySurface(provider: provider)
+        })
+    }
+    sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+    if let pop = sheet.popoverPresentationController {
+      pop.sourceView = presenter.view
+      pop.sourceRect = CGRect(
+        x: presenter.view.bounds.midX, y: 80, width: 1, height: 1)
+    }
+    presenter.present(sheet, animated: true)
   }
 
   private func resolvedBridgeProviderForOutgoing(
@@ -7690,9 +8651,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     return UIMenu(title: "Slash commands", children: [infoMenu, taskMenu, optionMenu])
   }
 
-  /// Build the agent-control chip menu for a Claude/Codex DM: switch repository, set the
-  /// permission (work mode), open the run Report, or open the full History surface. These
-  /// are distinct items so History no longer bundles permission/report.
+  /// Agent composer menu. Attachments are prepended by `ChatInputBar`; this menu owns
+  /// only run configuration controls.
   private func agentControlMenu(provider: String) -> UIMenu {
     let repos = AgentPairingService.lastStatusSnapshot?.repositories ?? []
     let chatId = engineChatId.isEmpty ? nil : engineChatId
@@ -7713,7 +8673,49 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         [weak self] _ in
         self?.onNativeEvent(["type": "openAgentPanel", "provider": provider])
       })
-    let repoMenu = UIMenu(title: "Repository", options: .displayInline, children: repoChildren)
+    let repoMenu = UIMenu(
+      title: "Repository",
+      subtitle: selectedRepo?.name,
+      image: UIImage(systemName: "folder"),
+      children: repoChildren)
+
+    let selectedModel = AgentBridgeSelectionStore.selectedModel(provider: provider)
+    let primaryModels = AgentBridgeSelectionStore.primaryModelChoices(provider: provider)
+    let otherModels = AgentBridgeSelectionStore.otherModelChoices(provider: provider)
+    var modelChildren: [UIMenuElement] = [
+      UIAction(title: "Default", state: selectedModel == nil ? .on : .off) { _ in
+        AgentBridgeSelectionStore.setModel(provider: provider, model: nil)
+      }
+    ]
+    modelChildren.append(contentsOf: primaryModels.map { choice in
+      UIAction(
+        title: choice.title,
+        subtitle: choice.subtitle,
+        state: selectedModel == choice.value ? .on : .off
+      ) { _ in
+        AgentBridgeSelectionStore.setModel(provider: provider, model: choice.value)
+      }
+    })
+    if !otherModels.isEmpty {
+      let otherChildren = otherModels.map { choice in
+        UIAction(
+          title: choice.title,
+          subtitle: choice.subtitle,
+          state: selectedModel == choice.value ? .on : .off
+        ) { _ in
+          AgentBridgeSelectionStore.setModel(provider: provider, model: choice.value)
+        }
+      }
+      modelChildren.append(UIMenu(title: "Other Models", children: otherChildren))
+    }
+    let selectedModelTitle =
+      AgentBridgeSelectionStore.modelChoices(provider: provider)
+      .first(where: { $0.value == selectedModel })?.title ?? "Default"
+    let modelMenu = UIMenu(
+      title: "Model",
+      subtitle: selectedModelTitle,
+      image: UIImage(systemName: "cpu"),
+      children: modelChildren)
 
     let currentMode = AgentBridgeSelectionStore.selectedWorkMode()
     let permissionChildren = AgentBridgeWorkMode.allCases.map { mode in
@@ -7732,29 +8734,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       image: UIImage(systemName: "hand.raised"),
       children: permissionChildren)
 
-    let reportAction = UIAction(
-      title: "Report", image: UIImage(systemName: "doc.text.magnifyingglass")
-    ) { [weak self] _ in
-      self?.presentLatestAgentReport()
-    }
-    let engineAction = UIAction(
-      title: "Engine view", image: UIImage(systemName: "rectangle.stack")
-    ) { [weak self] _ in
-      self?.bridgeAgentManuallyShown = true
-      self?.presentBridgeAgentConversation(provider: provider, surfaceMode: .transcript)
-    }
-    let visualAction = UIAction(
-      title: "Visual workspace", image: UIImage(systemName: "rectangle.3.group.bubble.left")
-    ) { [weak self] _ in
-      self?.bridgeAgentManuallyShown = true
-      self?.presentBridgeAgentConversation(provider: provider, surfaceMode: .visual)
-    }
-    let historyAction = UIAction(
-      title: "History", image: UIImage(systemName: "clock.arrow.circlepath")
-    ) { [weak self] _ in
-      self?.presentBridgeHistorySurface(provider: provider)
-    }
-    return UIMenu(children: [repoMenu, permissionMenu, engineAction, visualAction, reportAction, historyAction])
+    return UIMenu(children: [modelMenu, permissionMenu, repoMenu])
   }
 
   /// Report: open the most recent run's files-changed / diff report (its runtime card).
@@ -8007,9 +8987,33 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       return
     }
 
+    // On every bridge/group-agent send, refresh usage so a near-limit banner can
+    // animate in without waiting for a finished run (and hard limits surface immediately).
+    if currentBridgeProvider != nil || groupHasBridgeAgents() {
+      requestBridgeUsageSnapshot(reason: "send")
+    }
+
     if currentBridgeProvider != nil && !fromAgentSurface {
       inputBar?.dismissReplyBanner(animated: false)
       inputBar?.clearText()
+      // A LIVE run owns the CLI right now: dispatching would spawn a second concurrent
+      // run (or be dropped by the daemon's duplicate guard) and its mirrored prompt
+      // rows corrupt the visible thread. Hold the message in the pending queue instead:
+      // it shows as a "waiting" preview above the input (cancel ✕ / Steer ⚡) and
+      // auto-sends the moment the current run settles. Edited-resends keep their
+      // truncate semantics and never queue.
+      if editingAgentMessageId == nil, bridgeRunIsLive() {
+        enqueuePendingBridgeSend(
+          messageId: messageId,
+          text: text,
+          replyToMessageId: replyToMessageId,
+          bridgeMetadata: bridgeMetadata,
+          agentMention: agentMention,
+          agentText: agentText,
+          mentionedAgentUsername: mentionedAgentUsername
+        )
+        return
+      }
       // Inline bridge DM in the normal chat list: no pin-to-top. The list scrolls to
       // bottom on send like any other conversation (see the agentSurface note in setRows).
       let outgoingMessageId = editingAgentMessageId ?? messageId
@@ -11478,4 +12482,95 @@ final class SenderRunAvatarView: UIView {
     if parts.count == 1 { return String(parts[0].prefix(2)).uppercased() }
     return (String(parts[0].prefix(1)) + String(parts[1].prefix(1))).uppercased()
   }
+}
+
+// MARK: - Bridge task banner page
+
+/// One page of the live-task banner: status icon (spinner while running, ✓/✗ when
+/// settled), the task's label, and a "Task i of N" position line. Tap opens the
+/// step-detail sheet with the task's full command/output.
+final class BridgeTaskBannerPageView: UIView {
+  var onTap: (() -> Void)?
+
+  private let spinner = UIActivityIndicatorView(style: .medium)
+  private let statusIcon = UIImageView()
+  private let titleLabel = UILabel()
+  private let subtitleLabel = UILabel()
+
+  init(
+    item: VibeAgentKitProgressItem,
+    index: Int,
+    total: Int,
+    appearance: ChatListAppearance
+  ) {
+    super.init(frame: .zero)
+    let isRunning = vibeAgentKitRunningStepStatuses.contains((item.status ?? "").lowercased())
+    let isFailed = ["failed", "error", "failure", "cancelled", "canceled"]
+      .contains((item.status ?? "").lowercased())
+
+    spinner.translatesAutoresizingMaskIntoConstraints = false
+    spinner.color = appearance.textColorThem.withAlphaComponent(0.6)
+    addSubview(spinner)
+
+    statusIcon.translatesAutoresizingMaskIntoConstraints = false
+    statusIcon.contentMode = .scaleAspectFit
+    addSubview(statusIcon)
+
+    if isRunning {
+      spinner.startAnimating()
+      statusIcon.isHidden = true
+    } else {
+      spinner.isHidden = true
+      statusIcon.image = UIImage(
+        systemName: isFailed ? "xmark.circle.fill" : "checkmark.circle.fill",
+        withConfiguration: UIImage.SymbolConfiguration(pointSize: 15.0, weight: .semibold))
+      statusIcon.tintColor = isFailed ? .systemRed : .systemGreen
+    }
+
+    let kind = (item.itemType ?? item.tool ?? "").lowercased()
+    titleLabel.translatesAutoresizingMaskIntoConstraints = false
+    titleLabel.font = .systemFont(ofSize: 13.5, weight: .semibold)
+    titleLabel.textColor = appearance.textColorThem
+    titleLabel.lineBreakMode = .byTruncatingTail
+    let fallbackTitle: String
+    switch kind {
+    case "bash": fallbackTitle = "Terminal command"
+    case "task": fallbackTitle = "Subagent"
+    case "mcp": fallbackTitle = "MCP tool"
+    default: fallbackTitle = "Tool"
+    }
+    let trimmedLabel = item.label.trimmingCharacters(in: .whitespacesAndNewlines)
+    titleLabel.text = trimmedLabel.isEmpty ? fallbackTitle : trimmedLabel
+    addSubview(titleLabel)
+
+    subtitleLabel.translatesAutoresizingMaskIntoConstraints = false
+    subtitleLabel.font = .systemFont(ofSize: 11.0, weight: .medium)
+    subtitleLabel.textColor = appearance.textColorThem.withAlphaComponent(0.5)
+    let stateText = isRunning ? "running" : (isFailed ? "failed" : "done")
+    subtitleLabel.text =
+      total > 1 ? "Task \(index + 1) of \(total) · \(stateText) · tap for result"
+      : "\(stateText.capitalized) · tap for result"
+    addSubview(subtitleLabel)
+
+    NSLayoutConstraint.activate([
+      spinner.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14.0),
+      spinner.centerYAnchor.constraint(equalTo: centerYAnchor),
+      statusIcon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14.0),
+      statusIcon.centerYAnchor.constraint(equalTo: centerYAnchor),
+      statusIcon.widthAnchor.constraint(equalToConstant: 20.0),
+      statusIcon.heightAnchor.constraint(equalToConstant: 20.0),
+      titleLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 44.0),
+      titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -8.0),
+      titleLabel.topAnchor.constraint(equalTo: topAnchor, constant: 9.0),
+      subtitleLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+      subtitleLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -8.0),
+      subtitleLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 2.0),
+    ])
+
+    addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(handleTap)))
+  }
+
+  required init?(coder: NSCoder) { return nil }
+
+  @objc private func handleTap() { onTap?() }
 }

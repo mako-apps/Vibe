@@ -682,6 +682,10 @@ const finishedTasks = new Map(); // taskKey -> { provider, chatId, taskId, repo,
 // re-run / edit carries a fresh taskId) — deduping on it is safe.
 const recentRunTaskKeys = new Map(); // taskKey -> lastSeenMs
 const RUN_TASK_DEDUP_TTL_MS = Number(process.env.VIBE_RUN_TASK_DEDUP_TTL_MS || 30 * 60 * 1000);
+// Last structured subscription/rate-limit snapshot per provider (Codex primary/secondary
+// windows from token_count events; Claude is still fetched live via OAuth). Used by
+// buildUsageReport so the phone's usage banner works for every agent, not only Claude.
+const lastRateLimitsByProvider = new Map(); // provider -> { at, buckets: [{label, utilization, resetsAt}] }
 // Cap on unacked progress frames retained per running task for replay-on-reconnect.
 // The server's own live-card reconstruction only ever looks at its last @max_stream_lines
 // (160) lines, so keeping more than that here can never recover anything the server would
@@ -1048,6 +1052,13 @@ function normalizeModel(provider, value) {
     return raw;
   }
   if (provider === "codex" || provider === "gpt") {
+    // The installed headless Codex CLI cannot execute the 5.6 family yet. It
+    // returns a terminal 400 instead of falling back, which left mobile turns
+    // with a failed tool card and no answer. Keep the mobile bridge on the
+    // newest model this CLI accepts until its binary is updated.
+    if (normalized === "gpt-5.6-sol" || normalized === "gpt-5-6-sol" || normalized === "gpt-5.6" || normalized === "gpt-5-6") {
+      return "gpt-5.5";
+    }
     if (normalized === "gpt-5.3-codex" || normalized === "gpt-5-3-codex") return "gpt-5.5";
     return raw;
   }
@@ -1111,9 +1122,7 @@ function fallbackProviderModels() {
       },
     ],
     codex: [
-      { id: "gpt-5.6-sol", title: "GPT-5.6 Sol", subtitle: "Seed fallback", isDefault: true, efforts: CODEX_EFFORTS_DEFAULT.slice(), defaultEffort: "medium", source: "seed" },
-      { id: "gpt-5.6", title: "GPT-5.6", subtitle: "Seed fallback", isDefault: false, efforts: CODEX_EFFORTS_DEFAULT.slice(), defaultEffort: "medium", source: "seed" },
-      { id: "gpt-5.5", title: "GPT-5.5", subtitle: "Seed fallback", isDefault: false, efforts: CODEX_EFFORTS_DEFAULT.slice(), defaultEffort: "medium", source: "seed" },
+      { id: "gpt-5.5", title: "GPT-5.5", subtitle: "Compatible with this Codex CLI", isDefault: true, efforts: CODEX_EFFORTS_DEFAULT.slice(), defaultEffort: "medium", source: "seed" },
       { id: "gpt-5.5-pro", title: "GPT-5.5 Pro", subtitle: "Seed fallback", isDefault: false, efforts: CODEX_EFFORTS_DEFAULT.slice(), defaultEffort: "high", source: "seed" },
       { id: "gpt-5.4", title: "GPT-5.4", subtitle: "Seed fallback", isDefault: false, efforts: CODEX_EFFORTS_DEFAULT.slice(), defaultEffort: "medium", source: "seed" },
       { id: "gpt-5.2", title: "GPT-5.2", subtitle: "Seed fallback", isDefault: false, efforts: CODEX_EFFORTS_DEFAULT.slice(), defaultEffort: "medium", source: "seed" },
@@ -1294,7 +1303,8 @@ function fetchCodexModelsLive() {
     const effortMatch = text.match(/^\s*model_reasoning_effort\s*=\s*"([^"]+)"/m);
     const defaultEffort = (effortMatch && effortMatch[1].trim()) || "medium";
     if (!m) return fallback;
-    const current = m[1].trim();
+    const configured = m[1].trim();
+    const current = normalizeModel("codex", configured);
     if (!current) return fallback;
     const list = fallback.slice();
     for (const row of list) {
@@ -1754,6 +1764,118 @@ function rememberRuntime(provider, chatId, runtime) {
       cliCommands: runtime.cliCommands || [],
     });
   }
+}
+
+/** True when a CLI/error string is a subscription / rate-limit hit (not a code failure). */
+function isUsageLimitText(text) {
+  if (!text || typeof text !== "string") return false;
+  const t = text.toLowerCase();
+  return (
+    /you'?ve hit your (usage|session) limit/.test(t) ||
+    /hit your (usage|session) limit/.test(t) ||
+    /usage limit/.test(t) ||
+    /session limit/.test(t) ||
+    /rate limit/.test(t) ||
+    /quota (exceeded|exhausted)/.test(t) ||
+    /reached your .*limit/.test(t) ||
+    /out of (usage|credits|quota)/.test(t)
+  );
+}
+
+/**
+ * Capture Codex (and similar) rate_limits snapshots from stream lines into
+ * lastRateLimitsByProvider. Codex token_count events carry:
+ *   primary:  { used_percent, window_minutes: 300, resets_at (unix) }
+ *   secondary:{ used_percent, window_minutes: 10080, resets_at }
+ */
+function captureRateLimitsFromLine(provider, line) {
+  if (!provider || !line || typeof line !== "string") return;
+  if (!line.includes("rate_limits") && !line.includes("used_percent")) return;
+  let obj;
+  try {
+    obj = JSON.parse(line);
+  } catch {
+    return;
+  }
+  // Codex exec/stdout shapes: top-level rate_limits, payload.rate_limits, or
+  // event_msg wrapper with payload.rate_limits.
+  const rl =
+    (obj && obj.rate_limits) ||
+    (obj && obj.payload && obj.payload.rate_limits) ||
+    (obj && obj.type === "token_count" && obj.rate_limits) ||
+    null;
+  if (!rl || typeof rl !== "object") return;
+
+  const buckets = [];
+  const addWindow = (label, win) => {
+    if (!win || typeof win !== "object") return;
+    const util = Number(win.used_percent ?? win.utilization ?? win.usedPercent);
+    if (!Number.isFinite(util)) return;
+    let resetsAt = null;
+    const rawReset = win.resets_at ?? win.resetsAt ?? win.reset_at;
+    if (typeof rawReset === "number" && Number.isFinite(rawReset)) {
+      // Unix seconds → ISO
+      resetsAt = new Date(rawReset * 1000).toISOString();
+    } else if (typeof rawReset === "string" && rawReset) {
+      resetsAt = rawReset;
+    } else if (typeof win.resets_in_seconds === "number") {
+      resetsAt = new Date(Date.now() + win.resets_in_seconds * 1000).toISOString();
+    }
+    const minutes = Number(win.window_minutes ?? win.windowMinutes);
+    let resolvedLabel = label;
+    if (!resolvedLabel) {
+      if (minutes === 300) resolvedLabel = "5-hour session";
+      else if (minutes === 10080) resolvedLabel = "7-day (weekly)";
+      else if (Number.isFinite(minutes) && minutes > 0) resolvedLabel = `${minutes}m window`;
+      else resolvedLabel = "Usage";
+    }
+    buckets.push({
+      label: resolvedLabel,
+      utilization: Math.round(util),
+      resetsAt,
+    });
+  };
+
+  addWindow("5-hour session", rl.primary);
+  addWindow("7-day (weekly)", rl.secondary);
+  // Some shapes nest under limit windows array
+  if (Array.isArray(rl.windows)) {
+    for (const w of rl.windows) addWindow(null, w);
+  }
+  if (buckets.length === 0) return;
+  lastRateLimitsByProvider.set(provider, { at: Date.now(), buckets });
+}
+
+/** Parse a free-text limit message for a rough resetsAt ISO (e.g. "resets in 3h 12m"). */
+function parseResetHintFromText(text) {
+  if (!text || typeof text !== "string") return null;
+  const m = text.match(/resets?\s+(?:in\s+)?(?:(\d+)\s*d)?\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?/i);
+  if (!m) return null;
+  const d = Number(m[1] || 0);
+  const h = Number(m[2] || 0);
+  const min = Number(m[3] || 0);
+  if (!d && !h && !min) return null;
+  return new Date(Date.now() + ((d * 24 + h) * 60 + min) * 60 * 1000).toISOString();
+}
+
+/**
+ * When a run fails with a usage/session limit, remember a 100% bucket so the phone
+ * can show the usage banner even without a live rate_limits snapshot.
+ */
+function rememberUsageLimitHit(provider, message) {
+  if (!provider || !isUsageLimitText(message)) return false;
+  const existing = lastRateLimitsByProvider.get(provider);
+  const resetsAt = parseResetHintFromText(message);
+  const buckets =
+    existing && Array.isArray(existing.buckets) && existing.buckets.length
+      ? existing.buckets.map((b) => ({
+          ...b,
+          utilization: Math.max(100, Number(b.utilization) || 0),
+          resetsAt: b.resetsAt || resetsAt,
+        }))
+      : [{ label: "5-hour session", utilization: 100, resetsAt }];
+  lastRateLimitsByProvider.set(provider, { at: Date.now(), buckets, hit: true, message: String(message || "").slice(0, 400) });
+  return true;
 }
 
 function runGit(cwd, args, maxBytes = MAX_DIFF_BYTES) {
@@ -2435,6 +2557,19 @@ async function bridgeCommandOutput(provider, chatId, task, repo, command) {
           lines.push("(Subscription limits unavailable — sign in to Claude on this computer.)");
           lines.push("");
         }
+      } else {
+        // Codex/Grok/Agy: prefer the last streamed rate_limits / limit-hit snapshot.
+        const cached = lastRateLimitsByProvider.get(provider);
+        if (cached && Array.isArray(cached.buckets) && cached.buckets.length) {
+          lines.push("Subscription limits:");
+          for (const b of cached.buckets) {
+            const reset = b.resetsAt ? fmtResetIn(b.resetsAt) : "";
+            lines.push(
+              `${b.label}: ${Math.round(Number(b.utilization) || 0)}% used${reset ? ` · ${reset}` : ""}`
+            );
+          }
+          lines.push("");
+        }
       }
       lines.push("This chat (last run):");
       lines.push(formatUsage(lastRuntime));
@@ -2898,6 +3033,7 @@ function bridgeStatusPayload() {
   ) {
     discoverProviderModels(false).catch(() => {});
   }
+  refreshExternalCodexActivity().catch(() => {});
   const models = providerModelsCache.models || fallbackProviderModels();
   return {
     computerId: ACTIVE_COMPUTER_ID,
@@ -2937,7 +3073,7 @@ function bridgeStatusPayload() {
 
 function runningTaskSummaries() {
   const now = Date.now();
-  return Array.from(runningTasks.values()).map((entry) => ({
+  const bridgeTasks = Array.from(runningTasks.values()).map((entry) => ({
     provider: entry.provider,
     chatId: entry.chatId,
     taskId: entry.taskId,
@@ -2963,6 +3099,60 @@ function runningTaskSummaries() {
     teamWorker: entry.teamWorker || null,
     teamWorkers: Array.isArray(entry.teamWorkers) ? entry.teamWorkers : [],
   }));
+  const bridgeSessionIds = new Set(bridgeTasks.map((task) => task.sessionId).filter(Boolean));
+  return bridgeTasks.concat(
+    externalCodexActivity.filter((task) => !bridgeSessionIds.has(task.sessionId))
+  );
+}
+
+// Codex Desktop / IDE sessions do not enter `runningTasks` because the bridge did
+// not spawn them. Their rollout file still updates in real time, so expose the
+// newest live rollout as a provider-scoped task. The phone can then show Codex as
+// working on Home even though there is no mobile chatId for that desktop-owned run.
+const EXTERNAL_CODEX_STATUS_TTL_MS = 3_000;
+let externalCodexActivity = [];
+let externalCodexActivityAt = 0;
+let externalCodexActivityRefresh = null;
+
+async function refreshExternalCodexActivity() {
+  const now = Date.now();
+  if (externalCodexActivityRefresh || now - externalCodexActivityAt < EXTERNAL_CODEX_STATUS_TTL_MS) {
+    return externalCodexActivityRefresh;
+  }
+  externalCodexActivityRefresh = (async () => {
+    const previous = JSON.stringify(externalCodexActivity);
+    const sessions = await listCodex(1);
+    const session = sessions.find((item) => item && item.live);
+    externalCodexActivity = session
+      ? [{
+          provider: "codex",
+          chatId: lastAgentChatByProvider.get("codex") || "",
+          taskId: `desktop:${session.id}`,
+          sessionId: session.id,
+          topic: session.topic || "Codex task",
+          project: session.project || "",
+          projectName: session.projectName || "",
+          cwd: session.project || "",
+          startedAt: session.updatedAt || new Date().toISOString(),
+          source: "desktop",
+        }]
+      : [];
+    externalCodexActivityAt = Date.now();
+    // The status push that initiated this async scan necessarily used the old
+    // cache. Publish the completed snapshot immediately so the server/phone do
+    // not wait for the next 30-second heartbeat.
+    if (
+      previous !== JSON.stringify(externalCodexActivity) &&
+      activeChannel && activeChannel.state === "joined"
+    ) {
+      activeChannel.push("status", bridgeStatusPayload());
+    }
+  })();
+  try {
+    await externalCodexActivityRefresh;
+  } finally {
+    externalCodexActivityRefresh = null;
+  }
 }
 
 function teamFieldsForTask(task) {
@@ -3267,9 +3457,10 @@ function looksToolish(line) {
   );
 }
 
-// Forward a line live if it carries assistant TEXT or tool activity, so the
-// server can stream a live bubble (not just the final batch). System/init lines
-// are skipped. The server is the source of truth for parsing — we stay thin.
+// Forward a line live only when it is a recognized assistant/tool event, so the
+// server can stream a live bubble (not just the final batch). Do not match on
+// arbitrary JSON text: Claude's bootstrap record contains a large tools/catalog
+// payload, and forwarding it makes the phone parse/render metadata as a live turn.
 function streamable(line) {
   // `--include-partial-messages` emits per-token `stream_event` deltas (text_delta,
   // message_start, …) that would otherwise match on "text"/"assistant" below and flood
@@ -3277,15 +3468,42 @@ function streamable(line) {
   // assistant message follows), and the one signal we DO want from them — thinking token
   // growth — is coalesced separately into the throttled vibe_thinking line (trackThinking).
   if (line.includes("stream_event")) return false;
-  return (
-    looksToolish(line) ||
-    line.includes('"text"') || // claude assistant text blocks + grok type:text
-    line.includes('"thought"') || // grok reasoning chunks
-    line.includes('"type":"end"') || // grok turn complete
-    line.includes('"assistant"') ||
-    line.includes('"agent_message"') || // codex agent text
-    line.includes('"item"') // codex item events
-  );
+  let event;
+  try {
+    event = JSON.parse(line);
+  } catch {
+    return false;
+  }
+  if (!event || typeof event !== "object") return false;
+
+  const type = typeof event.type === "string" ? event.type.toLowerCase() : "";
+  if (
+    [
+      "assistant", // Claude completed assistant message (text and tool_use blocks)
+      "text", // Grok/Agy streamed answer chunk
+      "thought", // Grok/Agy reasoning chunk
+      "end", // Grok terminal marker
+      "agent_message", // Codex agent text
+      "tool_use",
+      "tool_result",
+      "tool_call",
+      "tool_call_update",
+      "command_execution",
+      "file_change",
+      "mcp_tool_call",
+      "todo_list",
+      "apply_patch",
+      "response_item",
+      "item",
+    ].includes(type)
+  ) {
+    return true;
+  }
+
+  // Codex emits `item.started` / `item.completed` records and nests the actual
+  // tool or assistant payload under `item`. These are real turn updates, unlike
+  // CLI system/init records that merely enumerate capabilities.
+  return type.startsWith("item.") && event.item && typeof event.item === "object";
 }
 
 // Decrypt the phone's sealed image attachments and write them under the repo's
@@ -3648,6 +3866,9 @@ async function runTask(channel, task) {
       // Coalesce partial thinking deltas into a throttled live token counter (does not
       // itself forward the raw partial line — see streamable()).
       trackThinking(line);
+      try {
+        captureRateLimitsFromLine(provider, line);
+      } catch (_) {}
       const sid = captureSessionId(line);
       if (sid) {
         // Fork detection: if the run REPORTS a session id different from the one we
@@ -3828,6 +4049,18 @@ async function runTask(channel, task) {
     console.log(
       `[vibe-bridge] done ${provider} chat=${chatId} task=${taskId} exit=${exitStatus} ${durationMs}ms`
     );
+    // Detect subscription/rate-limit failures so the phone can show a usage banner
+    // instead of inserting a "demo model" / limit bubble that shifts the list.
+    try {
+      const failReason =
+        (terminalFailure && terminalFailure.reason) ||
+        (exitStatus !== 0 ? String(output || "").slice(-800) : "");
+      if (failReason && rememberUsageLimitHit(provider, failReason)) {
+        console.log(`[vibe-bridge] usage limit hit provider=${provider} chat=${chatId}`);
+      } else if (exitStatus !== 0 && isUsageLimitText(output)) {
+        rememberUsageLimitHit(provider, output);
+      }
+    } catch (_) {}
     const agentRuntime = runtimePayload({
       provider,
       task,
@@ -3841,6 +4074,13 @@ async function runTask(channel, task) {
       canceled,
       output,
     });
+    // Flag the result so the server/iOS can route limit failures to the banner
+    // without inserting a transcript row.
+    if (isUsageLimitText(output) || (terminalFailure && isUsageLimitText(terminalFailure.reason))) {
+      agentRuntime.usageLimitHit = true;
+      const cached = lastRateLimitsByProvider.get(provider);
+      if (cached && cached.message) agentRuntime.usageLimitMessage = cached.message;
+    }
     const resultPayload = {
       ...computerFields(),
       provider,
@@ -3859,6 +4099,12 @@ async function runTask(channel, task) {
       ...runtimeResultField(agentRuntime),
       ...liveAgentActionsField(provider, output),
     };
+    if (agentRuntime.usageLimitHit) {
+      resultPayload.usageLimitHit = true;
+      if (agentRuntime.usageLimitMessage) {
+        resultPayload.usageLimitMessage = agentRuntime.usageLimitMessage;
+      }
+    }
     rememberFinishedTask(key, {
       provider,
       chatId,
@@ -6726,6 +6972,7 @@ function detailMidturnWindowMs(provider) {
  */
 function sliceGrokUpdatesLinesToCurrentTurn(lines) {
   let cut = 0;
+  let sawTurnStart = false;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (!line || !line.trim()) continue;
@@ -6738,10 +6985,20 @@ function sliceGrokUpdatesLinesToCurrentTurn(lines) {
     const u = (rec && rec.params && rec.params.update) || (rec && rec.update) || null;
     if (!u || typeof u !== "object") continue;
     const kind = String(u.sessionUpdate || "");
-    if (kind === "turn_completed") cut = i + 1;
-    else if (kind === "turn_started" || kind === "user_message_chunk") cut = i;
+    if (kind === "turn_completed") {
+      cut = i + 1;
+      sawTurnStart = false;
+    } else if (kind === "turn_started" || kind === "user_message_chunk") {
+      cut = i;
+      sawTurnStart = true;
+    }
   }
-  return lines.slice(cut);
+  // sawTurnStart: the retained slice's own beginning is a real turn boundary we
+  // actually saw, not just wherever our 768KB tail-read happened to start. Callers
+  // use this to decide whether the live edge may fully own this turn's narration
+  // (slice provably complete) or must defer to already-folded history (slice may be
+  // missing earlier content the tail-read cut off) — see mergeGrokLiveUpdatesIntoMessages.
+  return { lines: lines.slice(cut), sawTurnStart };
 }
 
 /**
@@ -6817,17 +7074,26 @@ function mergeGrokLiveUpdatesIntoMessages(match, messages) {
     return;
   }
 
-  const turnLines = sliceGrokUpdatesLinesToCurrentTurn(text.split("\n"));
+  const { lines: turnLines, sawTurnStart } = sliceGrokUpdatesLinesToCurrentTurn(text.split("\n"));
   if (!turnLines.length) return;
 
   const nodesById = new Map();
   // Seed prior history-folded nodes (tools + thinking + interim text segments).
   // Segmented live ids (grok-text-live-N) replace legacy single-slot live blobs.
+  // When the live slice is provably COMPLETE for this turn (sawTurnStart), the walk
+  // below regenerates narration/thinking for the whole open turn from scratch under
+  // grok-text-live-N / grok-thinking-live-N ids — seeding the history-folded
+  // txt-*/think-* copies too would paint the SAME content twice under different ids
+  // (the duplicate/"jumping" narration bug). Tool nodes always seed either way: their
+  // id is the model's real tool_call id, shared by both paths, so a later tool_call /
+  // tool_call_update just overwrites the same entry in place, never duplicates it.
   if (Array.isArray(last.progressNodes)) {
     for (const n of last.progressNodes) {
       if (!n || !n.id) continue;
       const id = String(n.id);
       if (id === "grok-text-live" || id === "grok-thinking-live") continue;
+      const nodeKind = String(n.kind || "");
+      if (sawTurnStart && (nodeKind === "text" || nodeKind === "thinking")) continue;
       nodesById.set(id, n);
     }
   }
@@ -6918,21 +7184,26 @@ function mergeGrokLiveUpdatesIntoMessages(match, messages) {
       if (chunk) {
         ensureSegForPhase("thought");
         thoughtAcc += chunk;
-        const id = `grok-thinking-live-${seg}`;
-        const tokens = Math.max(1, Math.round(thoughtAcc.length / 4));
-        const detail = clipText(thoughtAcc, 8000);
-        nodesById.set(id, {
-          id,
-          label: "Thinking",
-          kind: "thinking",
-          status: "streaming",
-          depth: 0,
-          tokens,
-          detail,
-          // History fold puts CoT on encrypted actions; live path rides plaintext detail.
-          output: detail,
-        });
-        ensureOrder(id);
+        // Only paint a live node once the slice provably covers the whole open turn
+        // (sawTurnStart) — otherwise history already owns this turn's thinking nodes
+        // and a live copy under a different id would duplicate them (see seeding above).
+        if (sawTurnStart) {
+          const id = `grok-thinking-live-${seg}`;
+          const tokens = Math.max(1, Math.round(thoughtAcc.length / 4));
+          const detail = clipText(thoughtAcc, 8000);
+          nodesById.set(id, {
+            id,
+            label: "Thinking",
+            kind: "thinking",
+            status: "streaming",
+            depth: 0,
+            tokens,
+            detail,
+            // History fold puts CoT on encrypted actions; live path rides plaintext detail.
+            output: detail,
+          });
+          ensureOrder(id);
+        }
       }
       continue;
     }
@@ -6953,17 +7224,22 @@ function mergeGrokLiveUpdatesIntoMessages(match, messages) {
         }
         textAcc += chunk;
         // Live: keep body empty and ride text as a feed node (phone suppresses body mid-run).
-        const id = `grok-text-live-${seg}`;
-        nodesById.set(id, {
-          id,
-          label: clipText(textAcc, 4000),
-          kind: "text",
-          status: "streaming",
-          depth: 0,
-          detail: clipText(textAcc, 4000),
-        });
-        ensureOrder(id);
         last.text = "";
+        // Only paint a live node once the slice provably covers the whole open turn
+        // (sawTurnStart) — otherwise history already owns this turn's narration and a
+        // live copy under a different id would duplicate it (see seeding above).
+        if (sawTurnStart) {
+          const id = `grok-text-live-${seg}`;
+          nodesById.set(id, {
+            id,
+            label: clipText(textAcc, 4000),
+            kind: "text",
+            status: "streaming",
+            depth: 0,
+            detail: clipText(textAcc, 4000),
+          });
+          ensureOrder(id);
+        }
       }
       continue;
     }
@@ -7832,7 +8108,8 @@ function handleFileRequest(channel, payload) {
 
 // Structured usage snapshot for the phone's inline Usage panel. Same data /usage
 // prints as text, but as machine-readable buckets so iOS can draw progress bars:
-// Claude subscription limits (5h + 7-day, from the OAuth utilization endpoint) plus
+// Claude subscription limits (5h + 7-day, from the OAuth utilization endpoint),
+// Codex primary/secondary windows (from live token_count rate_limits), plus
 // this chat's last-run token/cost. Never throws; missing pieces are just omitted.
 async function buildUsageReport(provider, chatId, task) {
   const currentModel = modelFor(provider, chatId, task);
@@ -7842,6 +8119,8 @@ async function buildUsageReport(provider, chatId, task) {
     advisor: advisorFor(provider, chatId, task) || null,
     buckets: [],
     chat: null,
+    limitHit: false,
+    limitMessage: null,
   };
   if (provider === "claude") {
     const util = await fetchClaudeUtilization();
@@ -7859,6 +8138,26 @@ async function buildUsageReport(provider, chatId, task) {
       add("7-day (all models)", util.seven_day);
       add("7-day Opus", util.seven_day_opus);
       add("7-day Sonnet", util.seven_day_sonnet);
+    }
+  }
+  // Codex (and any provider that streamed rate_limits) — reuse the last snapshot.
+  // Also fills Grok/Agy when a hard limit-hit was recorded from an error string.
+  const cached = lastRateLimitsByProvider.get(provider);
+  if (cached && Array.isArray(cached.buckets) && cached.buckets.length) {
+    // Prefer live Claude OAuth when present; otherwise use cached windows.
+    if (report.buckets.length === 0) {
+      for (const b of cached.buckets) {
+        if (!b || !b.label) continue;
+        report.buckets.push({
+          label: b.label,
+          utilization: Math.round(Number(b.utilization) || 0),
+          resetsAt: b.resetsAt || null,
+        });
+      }
+    }
+    if (cached.hit) {
+      report.limitHit = true;
+      report.limitMessage = cached.message || null;
     }
   }
   const usage = (lastRuntimeBySession.get(sessionKey(provider, chatId)) || {}).usage;

@@ -241,7 +241,9 @@ struct VibeAgentToolsSheet: View {
   // MARK: - Inner pages
 
   private var modelPage: some View {
-    List {
+    let primary = AgentBridgeSelectionStore.primaryModelChoices(provider: provider)
+    let other = AgentBridgeSelectionStore.otherModelChoices(provider: provider)
+    return List {
       Section {
         selectRow(
           title: "\(AgentBridgeSelectionStore.defaultModelTitle(provider: provider)) default",
@@ -250,8 +252,8 @@ struct VibeAgentToolsSheet: View {
           AgentBridgeSelectionStore.setModel(provider: provider, model: nil)
           selectedModel = nil
         }
-        // catalogEpoch forces refresh when bridge status lands mid-sheet.
-        ForEach(AgentBridgeSelectionStore.modelChoices(provider: provider), id: \.value) { choice in
+        // Latest / CLI-current models only in the main list.
+        ForEach(primary, id: \.value) { choice in
           selectRow(
             title: choice.title,
             isSelected: selectedModel == choice.value || (selectedModel != nil && selectedModel?.caseInsensitiveCompare(choice.value) == .orderedSame)
@@ -264,6 +266,20 @@ struct VibeAgentToolsSheet: View {
         Text(modelCatalogFooter)
           .font(.system(size: 12))
           .foregroundStyle(textTertiary)
+      }
+
+      if !other.isEmpty {
+        Section("Other Models") {
+          ForEach(other, id: \.value) { choice in
+            selectRow(
+              title: choice.title,
+              isSelected: selectedModel == choice.value || (selectedModel != nil && selectedModel?.caseInsensitiveCompare(choice.value) == .orderedSame)
+            ) {
+              AgentBridgeSelectionStore.setModel(provider: provider, model: choice.value)
+              selectedModel = choice.value
+            }
+          }
+        }
       }
     }
     .listStyle(.insetGrouped)
@@ -459,7 +475,7 @@ private struct VibeToolCommandRow: View {
 
 // MARK: - Usage panel
 
-private struct VibeAgentUsageBucket: Identifiable {
+struct VibeAgentUsageBucket: Identifiable {
   let id = UUID()
   let label: String
   let utilization: Int
@@ -470,7 +486,9 @@ private struct VibeAgentUsageBucket: Identifiable {
 /// the bridge (Claude subscription 5h/7-day limits + this chat's last-run tokens) and
 /// renders it as progress bars — no chat bubble. Polls `ChatEngine` for the reply that
 /// arrives as `agent-bridge-usage` keyed by our requestId.
-private struct VibeAgentUsagePanel: View {
+/// Live usage panel (5h + weekly bars). Shared by the tools sheet and the chat
+/// usage banner tap target so rate-limit hits open the same sheet for every agent.
+struct VibeAgentUsagePanel: View {
   let chatId: String
   let provider: String
   let appearance: VibeAgentKitChatAppearance

@@ -492,12 +492,20 @@ defmodule Vibe.AI.LocalAgentWorker do
             )
           end
 
+        # Subscription / rate-limit failures must not become transcript bubbles
+        # (they shift the list). Flag them so iOS routes to the floating usage banner.
+        usage_limit_hit? =
+          Keyword.get(opts, :usage_limit_hit) == true or
+            usage_limit_text?(base_text) or
+            usage_limit_text?(body) or
+            usage_limit_runtime?(runtime)
+
         # Add the agent's answer to the shared group thread so the other agent can
         # build on it next turn. Only on success — don't pollute memory with errors.
         if ok, do: note_bridge_agent_turn(chat_id, worker, base_text, requester_user_id)
 
         Logger.info(
-          "[AgentBridge] deliver chat=#{chat_id} provider=#{worker.handle} ok=#{ok} rawEvents=#{extracted.raw_event_count} baseTextLen=#{String.length(base_text || "")} bodyLen=#{String.length(body || "")}"
+          "[AgentBridge] deliver chat=#{chat_id} provider=#{worker.handle} ok=#{ok} usageLimit=#{usage_limit_hit?} rawEvents=#{extracted.raw_event_count} baseTextLen=#{String.length(base_text || "")} bodyLen=#{String.length(body || "")}"
         )
 
         metadata =
@@ -517,21 +525,53 @@ defmodule Vibe.AI.LocalAgentWorker do
           |> maybe_put("agentRuntimeEnc", runtime_enc)
           |> maybe_put("agentActionsEnc", agent_actions_enc)
           |> maybe_put("agentRuntimeCanRevert", if(runtime_can_revert, do: true))
+          |> then(fn meta ->
+            if usage_limit_hit? do
+              meta
+              |> Map.put("agentWorkerUsageLimit", true)
+              |> Map.put("agentWorkerNotice", true)
+            else
+              meta
+            end
+          end)
           |> Map.merge(team_metadata)
 
+        # Hard usage-limit: skip posting a chat row entirely — the bridge has already
+        # cached buckets for the usage banner, and a bubble would only shift the list.
         result =
-          post_worker_message(
-            worker,
-            chat_id,
-            body,
-            metadata,
-            reply_to_id,
-            requester_user_id
-          )
+          if usage_limit_hit? and not ok do
+            Logger.info(
+              "[AgentBridge] suppress usage-limit row chat=#{chat_id} provider=#{worker.handle}"
+            )
+
+            # Still notify clients so the phone can refresh the usage banner.
+            VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-usage-limit", %{
+              "provider" => worker.handle,
+              "chatId" => chat_id,
+              "message" => base_text || body,
+              "replyToId" => reply_to_id
+            })
+
+            {:ok, %{message_id: nil, suppressed: true, usage_limit: true}}
+          else
+            post_worker_message(
+              worker,
+              chat_id,
+              body,
+              metadata,
+              reply_to_id,
+              requester_user_id
+            )
+          end
 
         case result do
+          {:ok, %{suppressed: true, usage_limit: true}} ->
+            Logger.info(
+              "[AgentBridge] deliver suppressed usage-limit chat=#{chat_id} provider=#{worker.handle}"
+            )
+
           {:ok, %{message_id: mid}} ->
-            Logger.info("[AgentBridge] deliver posted chat=#{chat_id} message_id=#{mid}")
+            Logger.info("[AgentBridge] deliver posted chat=#{chat_id} message_id=#{inspect(mid)}")
 
           other ->
             Logger.error(
@@ -542,23 +582,68 @@ defmodule Vibe.AI.LocalAgentWorker do
         if ok do
           maybe_dispatch_next_team_worker(chat_id, worker, requester_user_id, opts)
         else
-          fail_bridge_team_run(
-            chat_id,
-            Keyword.get(opts, :team_run_id),
-            worker.handle,
-            "@#{worker.handle} exited with status #{exit_status}: #{base_text}"
-          )
+          # Usage-limit is not a team-chain failure that needs a list notice — siblings
+          # keep going; the phone shows a banner for the limited agent.
+          unless usage_limit_hit? do
+            fail_bridge_team_run(
+              chat_id,
+              Keyword.get(opts, :team_run_id),
+              worker.handle,
+              "@#{worker.handle} exited with status #{exit_status}: #{base_text}"
+            )
+          end
         end
 
         result
     end
   end
 
+  defp usage_limit_text?(text) when is_binary(text) do
+    t = String.downcase(text)
+
+    String.contains?(t, "usage limit") or
+      String.contains?(t, "session limit") or
+      String.contains?(t, "rate limit") or
+      String.contains?(t, "you've hit your") or
+      String.contains?(t, "youve hit your") or
+      String.contains?(t, "hit your usage") or
+      String.contains?(t, "hit your session") or
+      String.contains?(t, "quota exceeded") or
+      String.contains?(t, "quota exhausted") or
+      String.contains?(t, "out of usage") or
+      String.contains?(t, "out of credits") or
+      Regex.match?(~r/reached your .{0,40}limit/, t)
+  end
+
+  defp usage_limit_text?(_), do: false
+
+  defp usage_limit_runtime?(runtime) when is_map(runtime) do
+    runtime["usageLimitHit"] == true or runtime["usage_limit_hit"] == true or
+      usage_limit_text?(runtime["usageLimitMessage"] || runtime["usage_limit_message"] || "")
+  end
+
+  defp usage_limit_runtime?(_), do: false
+
   @doc "Post a short notice (e.g. errors from the bridge) attributed to a worker."
   def post_bridge_notice(provider, chat_id, text, requester_user_id, reply_to_id) do
     case resolve_handle(provider) do
-      nil -> {:error, :unknown_provider}
-      worker -> post_notice(worker, chat_id, text, requester_user_id, reply_to_id)
+      nil ->
+        {:error, :unknown_provider}
+
+      worker ->
+        # Rate/usage-limit notices never become list rows — they shift the feed.
+        if usage_limit_text?(text) do
+          VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-usage-limit", %{
+            "provider" => worker.handle,
+            "chatId" => chat_id,
+            "message" => text,
+            "replyToId" => reply_to_id
+          })
+
+          {:ok, %{suppressed: true, usage_limit: true}}
+        else
+          post_notice(worker, chat_id, text, requester_user_id, reply_to_id)
+        end
     end
   end
 
