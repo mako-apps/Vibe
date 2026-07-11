@@ -2001,19 +2001,27 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if candidates.count == 1 {
       stopGroupUsageCarousel()
       let (provider, snap) = candidates[0]
-      presentUsageBanner(provider: provider, snap: snap)
+      presentUsageBanner(provider: provider, snap: snap, pageCount: 1, pageIndex: 0)
       return
     }
-    // Multi-agent near/at limit: auto-carousel between them (swipeable feel).
+    // Multi-agent near/at limit: auto-carousel between them; left dots show page count.
     groupUsageCarouselIndex = min(groupUsageCarouselIndex, candidates.count - 1)
-    let (provider, snap) = candidates[groupUsageCarouselIndex % candidates.count]
-    presentUsageBanner(provider: provider, snap: snap)
+    let pageIndex = groupUsageCarouselIndex % candidates.count
+    let (provider, snap) = candidates[pageIndex]
+    presentUsageBanner(
+      provider: provider,
+      snap: snap,
+      pageCount: candidates.count,
+      pageIndex: pageIndex
+    )
     startGroupUsageCarousel(candidates: candidates)
   }
 
   private func presentUsageBanner(
     provider: String,
-    snap: (util: Int, label: String, resetsAt: String?, limitHit: Bool)
+    snap: (util: Int, label: String, resetsAt: String?, limitHit: Bool),
+    pageCount: Int = 1,
+    pageIndex: Int = 0
   ) {
     let key = "\(provider)#\(snap.label)#\(snap.util / 5)#\(snap.limitHit ? "H" : "N")"
     guard key != dismissedBridgeUsageKey else { return }
@@ -2030,7 +2038,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if let reset = Self.bridgeUsageResetText(snap.resetsAt) {
       text += " · resets in \(reset)"
     }
-    showBridgeUsageBanner(text: text, key: key, title: title, provider: provider)
+    showBridgeUsageBanner(
+      text: text,
+      key: key,
+      title: title,
+      provider: provider,
+      pageCount: pageCount,
+      pageIndex: pageIndex
+    )
   }
 
   private func startGroupUsageCarousel(
@@ -2105,12 +2120,17 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   private var lastUsageBannerProvider: String?
+  /// Snapshot of carousel page count last applied to the banner (for left dots).
+  private var lastUsageBannerPageCount: Int = 0
+  private var lastUsageBannerPageIndex: Int = 0
 
   private func showBridgeUsageBanner(
     text: String,
     key: String,
     title: String = "Usage",
-    provider: String? = nil
+    provider: String? = nil,
+    pageCount: Int = 1,
+    pageIndex: Int = 0
   ) {
     let banner: ChatPinnedBannerView
     if let existing = bridgeUsageBanner {
@@ -2124,6 +2144,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       banner = created
     }
     lastUsageBannerProvider = provider
+    lastUsageBannerPageCount = pageCount
+    lastUsageBannerPageIndex = pageIndex
     let accent = UIColor { trait in
       trait.userInterfaceStyle == .dark
         ? UIColor(red: 0.98, green: 0.76, blue: 0.28, alpha: 1.0)
@@ -2135,40 +2157,46 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       surfaceColor: appearance.bubbleThemColor,
       isDark: appearance.isDark
     )
+    let isSwap = !banner.isHidden && banner.accessibilityValue != nil && banner.accessibilityValue != key
     banner.configure(
       title: title,
       body: text,
       systemImage: "gauge.with.dots.needle.bottom.50percent",
-      animateIcon: banner.accessibilityValue != key
+      animateIcon: isSwap || banner.accessibilityValue == nil
     )
+    banner.setPageIndicator(count: pageCount, index: pageIndex)
     banner.accessibilityValue = key
     let wasHidden = banner.isHidden
     banner.isHidden = false
+    banner.alpha = 1.0
+    banner.transform = .identity
     bringSubviewToFront(banner)
     setNeedsLayout()
     layoutIfNeeded()
     if wasHidden {
       onBridgeUsageBannerVisibilityChanged?()
-    }
-    banner.alpha = 0.0
-    banner.transform = CGAffineTransform(translationX: 0, y: -8)
-    UIView.animate(
-      withDuration: 0.22, delay: 0,
-      options: [.beginFromCurrentState, .allowUserInteraction]
-    ) {
-      banner.alpha = 1.0
-      banner.transform = .identity
+      // First show: only the INNER content slides in — glass shell stays solid (no fade).
+      banner.animateContentTranslateY(from: -10)
+    } else if isSwap {
+      // Carousel page change: translate content only, never fade the banner.
+      banner.animateContentTranslateY(from: 8)
     }
   }
 
   /// Tap opens the structured Usage sheet (5h / weekly + reset). Close (✕) only dismisses.
   @objc private func handleBridgeUsageBannerTapped() {
     let provider =
-      lastUsageBannerProvider
-      ?? currentBridgeProvider
-      ?? usageBannerProviders().first
-      ?? "claude"
-    presentUsageSheet(provider: provider)
+      (lastUsageBannerProvider ?? "")
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased()
+    let resolved =
+      provider.isEmpty
+      ? (currentBridgeProvider
+        ?? usageBannerProviders().first
+        ?? "claude")
+      : provider
+    NSLog("[ChatUsage] banner tapped provider=%@", resolved)
+    presentUsageSheet(provider: resolved)
   }
 
   private func dismissBridgeUsageBanner() {
@@ -2176,25 +2204,43 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     hideBridgeUsageBanner()
   }
 
-  /// Present the existing per-provider Usage panel (buckets + reset times from payload).
+  /// Present the per-provider Usage panel with the same glass material as the
+  /// agent progress / "Worked for…" sheet (clear chrome + system pageSheet glass).
   private func presentUsageSheet(provider: String) {
     let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !chatId.isEmpty, let presenter = topPresentingViewController() else { return }
-    let appearance = VibeAgentKitMap.appearance(for: traitCollection)
-    let panel = NavigationStack {
-      VibeAgentUsagePanel(
-        chatId: chatId,
-        provider: provider,
-        appearance: appearance
-      )
+    guard !chatId.isEmpty else {
+      NSLog("[ChatUsage] presentUsageSheet skipped — empty chatId")
+      return
     }
-    let host = UIHostingController(rootView: panel)
+    guard let presenter = topPresentingViewController() else {
+      NSLog("[ChatUsage] presentUsageSheet skipped — no presenter")
+      return
+    }
+    // Don't stack if something is already mid-present.
+    if presenter.presentedViewController != nil {
+      presenter.dismiss(animated: false)
+    }
+    let kitAppearance = VibeAgentKitMap.appearance(for: traitCollection)
+    // Same glass pageSheet stack as presentAgentTurnDetailView (progress / "Worked for…").
+    let root = VibeAgentUsageSheetRoot(
+      chatId: chatId,
+      provider: provider,
+      appearance: kitAppearance
+    )
+    let host = UIHostingController(rootView: root)
+    host.view.backgroundColor = .clear
     host.modalPresentationStyle = .pageSheet
     if let sheet = host.sheetPresentationController {
       sheet.detents = [.medium(), .large()]
       sheet.prefersGrabberVisible = true
+      if #available(iOS 16.0, *) {
+        sheet.preferredCornerRadius = 30
+      }
     }
     presenter.present(host, animated: true)
+    NSLog(
+      "[ChatUsage] presentUsageSheet presented provider=%@ chat=%@", provider,
+      String(chatId.prefix(12)))
   }
 
   /// Multi-agent: pick which provider's usage sheet to open (each sheet fetches that
@@ -2232,17 +2278,19 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private func hideBridgeUsageBanner() {
     stopGroupUsageCarousel()
     guard let banner = bridgeUsageBanner, !banner.isHidden else { return }
+    // Collapse by sliding content away; glass shell stays opaque until hide.
+    banner.animateContentTranslateY(from: 0)
     UIView.animate(
       withDuration: 0.16, delay: 0,
       options: [.beginFromCurrentState, .allowUserInteraction]
     ) {
-      banner.alpha = 0.0
-      banner.transform = CGAffineTransform(translationX: 0, y: -8)
+      // Prefer transform over alpha so we never leave a half-faded glass shell.
+      banner.transform = CGAffineTransform(translationX: 0, y: -10)
     } completion: { [weak self] _ in
-      if banner.alpha <= 0.01 {
-        banner.isHidden = true
-        self?.onBridgeUsageBannerVisibilityChanged?()
-      }
+      banner.isHidden = true
+      banner.transform = .identity
+      banner.alpha = 1.0
+      self?.onBridgeUsageBannerVisibilityChanged?()
     }
   }
 

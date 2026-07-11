@@ -521,6 +521,35 @@ struct VibeAgentUsageBucket: Identifiable {
   let resetsAt: String?
 }
 
+/// Glass-sheet wrapper matching agent progress / ask sheets: clear chrome so the
+/// system pageSheet Liquid Glass material shows through.
+struct VibeAgentUsageSheetRoot: View {
+  let chatId: String
+  let provider: String
+  let appearance: VibeAgentKitChatAppearance
+  @Environment(\.dismiss) private var dismiss
+
+  var body: some View {
+    NavigationStack {
+      VibeAgentUsagePanel(chatId: chatId, provider: provider, appearance: appearance)
+        .toolbar {
+          ToolbarItem(placement: .topBarTrailing) {
+            Button {
+              dismiss()
+            } label: {
+              Image(systemName: "xmark")
+                .font(.system(size: 15, weight: .semibold))
+            }
+          }
+        }
+    }
+    .presentationDetents([.medium, .large])
+    .presentationDragIndicator(.visible)
+    // Same as ask/progress sheets — no solid fill behind the list.
+    .presentationBackground(.clear)
+  }
+}
+
 /// Live usage detail for one provider. Fetches bridge `usage_result` only — buckets,
 /// chat tokens, model, limitHit/limitMessage come from the payload. Never invents %.
 /// Shared by tools-sheet Usage rows and the chat usage-banner tap.
@@ -637,10 +666,12 @@ struct VibeAgentUsagePanel: View {
       }
     }
     .listStyle(.insetGrouped)
+    // Glass sheet body like chat progress/ask sheets — no solid fill.
     .scrollContentBackground(.hidden)
     .background(Color.clear)
     .navigationTitle("\(providerTitle) usage")
     .navigationBarTitleDisplayMode(.inline)
+    .toolbarBackground(.hidden, for: .navigationBar)
     .onAppear(perform: start)
     .onReceive(NotificationCenter.default.publisher(for: ChatEngine.didChangeNotification)) { note in
       guard

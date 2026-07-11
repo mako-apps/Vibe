@@ -3195,19 +3195,25 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     let content: (title: String, body: String)
     switch normalized {
     case "/usage", "usage":
-      // Prefer the payload-backed usage sheet (same as tools-menu Usage row).
+      // Prefer the payload-backed usage sheet (same glass as progress / tools Usage).
       if let chatId = agentBridgeChatId, !chatId.isEmpty {
         let provider = (agentBridgeProvider ?? composerView.provider)
           .trimmingCharacters(in: .whitespacesAndNewlines)
         let appearance = self.appearance
-        let panel = NavigationStack {
-          VibeAgentUsagePanel(chatId: chatId, provider: provider.isEmpty ? "claude" : provider, appearance: appearance)
-        }
-        let host = UIHostingController(rootView: panel)
+        let root = VibeAgentUsageSheetRoot(
+          chatId: chatId,
+          provider: provider.isEmpty ? "claude" : provider,
+          appearance: appearance
+        )
+        let host = UIHostingController(rootView: root)
+        host.view.backgroundColor = .clear
         host.modalPresentationStyle = .pageSheet
         if let sheet = host.sheetPresentationController {
           sheet.detents = [.medium(), .large()]
           sheet.prefersGrabberVisible = true
+          if #available(iOS 16.0, *) {
+            sheet.preferredCornerRadius = 30
+          }
         }
         present(host, animated: true)
         return
