@@ -3208,6 +3208,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       }
     }
     let previousRows = rows
+    // Drop height cache for rows that left the list (stream-… / lan-… → final UUID).
+    // Stale heights after that swap are a primary cause of empty gaps + overlaps.
+    let nextKeys = Set(parsed.map(\.key))
+    for row in previousRows where !nextKeys.contains(row.key) {
+      messageHeightCache.removeValue(forKey: row.key)
+      agentTurnHeightCache.removeValue(forKey: row.key)
+    }
     let previousContentOffsetY = collectionView.contentOffset.y
     let previousDistanceFromBottom = currentDistanceFromBottom()
     let wasNearBottom = previousDistanceFromBottom <= listBottomThreshold

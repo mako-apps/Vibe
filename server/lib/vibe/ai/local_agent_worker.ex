@@ -678,17 +678,23 @@ defmodule Vibe.AI.LocalAgentWorker do
   agent knows it shares the conversation with the other agents and people. In a
   DM, returns `dispatch_text` unchanged.
   """
-  def build_bridge_prompt(chat_id, worker, dispatch_text, requester_user_id)
-      when is_binary(chat_id) and is_map(worker) and is_binary(dispatch_text) do
+  def build_bridge_prompt(chat_id, worker, dispatch_text, requester_user_id, opts \\ [])
+
+  def build_bridge_prompt(chat_id, worker, dispatch_text, requester_user_id, opts)
+      when is_binary(chat_id) and is_map(worker) and is_binary(dispatch_text) and is_list(opts) do
     if group_chat?(chat_id) do
       context = group_collaboration_context(chat_id, requester_user_id)
+      repo_line = selected_repo_prompt_line(opts)
 
       if casual_message?(dispatch_text) do
         # Greeting / chit-chat: no operating rules, no "read AGENTS.md". Vanilla
         # claude/codex don't touch the repo unprompted — it was our injected rules
         # that made a plain "hi" kick off file reads. Keep it conversational.
+        # Still name the selected working directory so agents don't invent
+        # "no repo selected" when the phone already picked one.
         """
         #{group_framing(worker)}
+        #{repo_line}
 
         The latest message is casual conversation, not a work request. Reply briefly and in a friendly, human way. Do NOT read repo files (AGENTS.md, CLAUDE.md, etc.), inspect the codebase, or run any tools — only start doing real work once the user actually asks for it.
 
@@ -702,6 +708,7 @@ defmodule Vibe.AI.LocalAgentWorker do
       else
         """
         #{group_framing(worker)}
+        #{repo_line}
 
         #{agent_operating_rules(worker)}
 
@@ -718,7 +725,40 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
-  def build_bridge_prompt(_chat_id, _worker, dispatch_text, _requester), do: dispatch_text
+  def build_bridge_prompt(_chat_id, _worker, dispatch_text, _requester, _opts), do: dispatch_text
+
+  # One short line so agents know the phone-selected path without being told to open files.
+  defp selected_repo_prompt_line(opts) when is_list(opts) do
+    meta = Keyword.get(opts, :bridge_metadata) || %{}
+
+    cwd =
+      normalize_string(meta["cwd"] || meta[:cwd] || meta["agentBridgeCwd"])
+
+    name =
+      normalize_string(
+        meta["repoName"] || meta[:repoName] || meta["agentBridgeRepoName"] || meta["repo_name"]
+      )
+
+    path =
+      normalize_string(
+        meta["repoPath"] || meta[:repoPath] || meta["agentBridgeRepoPath"] || meta["repo_path"]
+      )
+
+    location = cwd || path
+
+    cond do
+      is_binary(location) and location != "" and is_binary(name) and name != "" ->
+        "Selected working directory: #{name} at #{location}. You may mention it if useful. Do NOT open or edit files until the user requests real work."
+
+      is_binary(location) and location != "" ->
+        "Selected working directory: #{location}. You may mention it if useful. Do NOT open or edit files until the user requests real work."
+
+      true ->
+        "No working directory was selected on the phone for this turn — if the user asks about a repo, ask them which path to use."
+    end
+  end
+
+  defp selected_repo_prompt_line(_), do: ""
 
   @doc """
   Build a team-run prompt for a worker. The server remains the coordinator and

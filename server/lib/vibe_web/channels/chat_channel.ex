@@ -890,7 +890,8 @@ defmodule VibeWeb.ChatChannel do
                 chat_id,
                 worker,
                 dispatch_text,
-                requester_user_id
+                requester_user_id,
+                bridge_metadata: bridge_metadata
               )
             end
 

@@ -5996,7 +5996,12 @@ final class ChatEngine {
   private func removeAgentStreamRowsLocked(chatId: String, agentUserId: String?) {
     guard var perChat = liveMessageRowsByChat[chatId], !perChat.isEmpty else { return }
     let targetAgent = normalizedUpper(agentUserId)
-    let streamIds = perChat.keys.filter { $0.hasPrefix("stream-") }
+    // Live cloud streams (`stream-…`) AND LAN dual-path rows (`lan-…`) both need
+    // to drop when the real agent message lands — leaving either causes a second
+    // cell (overlap / empty-gap after height cache drift) next to the final post.
+    let streamIds = perChat.keys.filter {
+      $0.hasPrefix("stream-") || $0.hasPrefix("lan-")
+    }
     guard !streamIds.isEmpty else { return }
     var removedIds = Set<String>()
     for streamId in streamIds {
@@ -7052,9 +7057,23 @@ final class ChatEngine {
           let isAgentMessage =
             (frame.payload["isAgentMessage"] as? Bool == true)
             || fromId?.lowercased() == Self.agentUserId
+            || (fromId.map { Self.reservedBridgeAgentUserIds.contains($0.lowercased()) } ?? false)
           if isAgentMessage {
-            self.clearAgentProgressLocked(chatId: chatId, status: "done", reason: "agentPersistedMessage")
-            // The persisted message supersedes any live streaming bubble for this agent.
+            // Only clear the shared header progress when no other agent is still typing
+            // in this group — otherwise Claude's finish blanks "Grok typing…".
+            let othersStillTyping: Bool = {
+              guard let typers = self.peerTypingUserIdsByChatId[chatId], !typers.isEmpty else {
+                return false
+              }
+              let sender = self.normalizedUpper(fromId)
+              return typers.contains { self.normalizedUpper($0) != sender }
+            }()
+            if !othersStillTyping {
+              self.clearAgentProgressLocked(
+                chatId: chatId, status: "done", reason: "agentPersistedMessage")
+            }
+            // The persisted message supersedes any live streaming bubble for this agent
+            // (cloud `stream-…` and LAN `lan-…` dual-path rows).
             self.removeAgentStreamRowsLocked(chatId: chatId, agentUserId: fromId)
           }
 

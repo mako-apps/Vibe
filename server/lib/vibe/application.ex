@@ -82,7 +82,9 @@ defmodule Vibe.Application do
   defp local_agent_worker_concurrency do
     case Integer.parse(System.get_env("VIBE_AGENT_WORKER_MAX_CONCURRENCY") || "") do
       {value, _} when value > 0 -> value
-      _ -> 3
+      # Default high enough for full group fan-out (claude+codex+grok+agy = 4)
+      # plus a couple of concurrent DMs. Was 3 → Agy always got "busy" in 4-agent groups.
+      _ -> 8
     end
   end
 

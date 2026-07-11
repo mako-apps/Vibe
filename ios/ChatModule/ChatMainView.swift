@@ -4273,30 +4273,41 @@ public final class ChatMainView: UIView,
   private func resolvedGroupTypingSubtitle() -> String? {
     let normalizedTypingUsers = Array(Set(groupTypingUserIds.map { $0.uppercased() }))
     guard !normalizedTypingUsers.isEmpty else { return nil }
-    // Name the typers (Claude / Codex / people) instead of a bare "typing…", so a
-    // group where both agents are running in parallel reads "Claude & Codex typing…".
-    // An agent typer with an explicitly picked model shows it ("Claude · Opus 4.8").
+    // Keep the subtitle short: agent first name (+ short model when alone).
+    // 3+ typers → "Claude, Codex +2 typing…" so the header never grows a wall of
+    // "Claude · Claude Sonnet 5, Codex · GPT-5.5, …".
     let names: [String] =
       normalizedTypingUsers
       .compactMap { id -> String? in
-        let name = groupMemberDisplayNameByUserId[id]?
-          .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let name, !name.isEmpty else { return nil }
+        var name =
+          groupMemberDisplayNameByUserId[id]?
+          .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if name.isEmpty {
+          name = resolvedGroupMemberDisplayName(id)
+        }
+        guard !name.isEmpty else { return nil }
+        // Short display: first token only ("Claude Code" → "Claude").
+        let shortName = name.split(separator: " ").first.map(String.init) ?? name
         let provider: String? =
           switch id {
           case "11111111-1111-1111-1111-111111111111": "claude"
           case "22222222-2222-2222-2222-222222222222": "codex"
           case "33333333-3333-3333-3333-333333333333": "grok"
+          case "44444444-4444-4444-4444-444444444444": "agy"
           default: nil
-        }
-        if let provider,
+          }
+        // Only attach model when a single agent is typing (room for "Claude · Sonnet 5").
+        if normalizedTypingUsers.count == 1, let provider,
           let model = AgentBridgeSelectionStore.selectedRunOptions(provider: provider).model,
           let title = AgentBridgeSelectionStore.modelChoices(provider: provider)
             .first(where: { $0.value == model })?.title
         {
-          return "\(name) · \(title)"
+          let shortModel = Self.shortGroupTypingModelTitle(title, providerName: shortName)
+          if !shortModel.isEmpty {
+            return "\(shortName) · \(shortModel)"
+          }
         }
-        return name
+        return shortName
       }
       .sorted()
 
@@ -4308,8 +4319,30 @@ public final class ChatMainView: UIView,
     case 2:
       return "\(names[0]) & \(names[1]) typing…"
     default:
+      // Cap at two named agents; remainder as +N.
       return "\(names[0]), \(names[1]) +\(names.count - 2) typing…"
     }
+  }
+
+  /// "Claude Sonnet 5" → "Sonnet 5"; "GPT-5.5" stays; strip redundant vendor prefix.
+  private static func shortGroupTypingModelTitle(_ title: String, providerName: String) -> String {
+    var t = title.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !t.isEmpty else { return "" }
+    let prefixes = [
+      providerName + " ",
+      "Claude ", "Codex ", "Grok ", "Agy ", "OpenAI ", "GPT ",
+    ]
+    for p in prefixes {
+      if t.lowercased().hasPrefix(p.lowercased()) {
+        t = String(t.dropFirst(p.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        break
+      }
+    }
+    // Hard cap so the nav subtitle never wraps.
+    if t.count > 18 {
+      return String(t.prefix(16)) + "…"
+    }
+    return t
   }
 
   private func resolvedDirectTypingSubtitle() -> String? {
