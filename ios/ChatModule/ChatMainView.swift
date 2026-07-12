@@ -233,6 +233,13 @@ public final class ChatMainView: UIView,
   private var groupMemberOrder: [String] = []
   private var groupMemberCount: Int?
   private var groupTypingUserIds: [String] = []
+  /// Sticky group-typing display: last uptime each member was seen typing. During a
+  /// multi-agent run the per-agent typing events renew on independent TTLs, so the raw
+  /// engine set flaps (Agy → Grok → Codex → …) several times a second. Members stay in
+  /// the displayed set for a short hold window so the header reads steady.
+  private var groupTypingLastSeenAt: [String: TimeInterval] = [:]
+  private var groupTypingHoldTimer: Timer?
+  private static let groupTypingHoldSeconds: TimeInterval = 3.5
   private var directPeerTypingActive = false
   private var hasPeerResponseInCurrentRows = false
   private var agentProgressSubtitle: String?
@@ -370,6 +377,7 @@ public final class ChatMainView: UIView,
   deinit {
     avatarLoadTask?.cancel()
     engineStateRefreshWorkItem?.cancel()
+    groupTypingHoldTimer?.invalidate()
     NotificationCenter.default.removeObserver(
       self, name: ChatEngine.didChangeNotification, object: nil)
     if !registeredSurfaceId.isEmpty {
@@ -1787,14 +1795,13 @@ public final class ChatMainView: UIView,
     }
 
     if isGroupOrChannel {
-      if force || groupTyping != groupTypingUserIds || directPeerTypingActive {
-        groupTypingUserIds = groupTyping
+      if updateGroupTypingDisplay(groupTyping, force: force) || directPeerTypingActive {
         directPeerTypingActive = false
         shouldUpdateHeader = true
         shouldUpdateProfile = true
       }
     } else if force || !groupTypingUserIds.isEmpty || directTyping != directPeerTypingActive {
-      groupTypingUserIds = []
+      clearGroupTypingDisplay()
       directPeerTypingActive = directTyping
       shouldUpdateHeader = true
       shouldUpdateProfile = true
@@ -1856,6 +1863,53 @@ public final class ChatMainView: UIView,
     updateProfileTexts()
   }
 
+  /// Merge a raw engine typing set into the sticky displayed set. Additions show
+  /// immediately; a member only leaves once it hasn't been seen typing for the hold
+  /// window. Returns true when the displayed set actually changed.
+  @discardableResult
+  private func updateGroupTypingDisplay(_ engineIds: [String], force: Bool) -> Bool {
+    let now = ProcessInfo.processInfo.systemUptime
+    for id in engineIds {
+      groupTypingLastSeenAt[id.uppercased()] = now
+    }
+    groupTypingLastSeenAt = groupTypingLastSeenAt.filter {
+      now - $0.value < Self.groupTypingHoldSeconds
+    }
+    let displayed = groupTypingLastSeenAt.keys.sorted()
+    scheduleGroupTypingHoldTick()
+    guard force || displayed != groupTypingUserIds.map({ $0.uppercased() }).sorted() else {
+      return false
+    }
+    groupTypingUserIds = displayed
+    return true
+  }
+
+  /// One-shot re-check so held members eventually drop off the header after the
+  /// last agent stops typing (no engine event fires for a TTL expiry we held past).
+  private func scheduleGroupTypingHoldTick() {
+    groupTypingHoldTimer?.invalidate()
+    groupTypingHoldTimer = nil
+    guard !groupTypingLastSeenAt.isEmpty else { return }
+    groupTypingHoldTimer = Timer.scheduledTimer(
+      withTimeInterval: 1.0, repeats: false
+    ) { [weak self] _ in
+      guard let self, self.isGroupOrChannel else { return }
+      if self.updateGroupTypingDisplay([], force: false) {
+        self.updateHeaderTexts()
+        self.updateProfileTexts()
+      } else {
+        self.scheduleGroupTypingHoldTick()
+      }
+    }
+  }
+
+  private func clearGroupTypingDisplay() {
+    groupTypingHoldTimer?.invalidate()
+    groupTypingHoldTimer = nil
+    groupTypingLastSeenAt.removeAll()
+    groupTypingUserIds = []
+  }
+
   private func refreshTypingStateFromEngine(force: Bool = false) {
     let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -1869,7 +1923,7 @@ public final class ChatMainView: UIView,
           || !groupTypingUserIds.isEmpty
           || nextDirectTyping != directPeerTypingActive
       else { return }
-      groupTypingUserIds = []
+      clearGroupTypingDisplay()
       directPeerTypingActive = nextDirectTyping
       updateHeaderTexts()
       updateProfileTexts()
@@ -1877,15 +1931,14 @@ public final class ChatMainView: UIView,
     }
     guard !chatId.isEmpty else {
       guard force || !groupTypingUserIds.isEmpty || directPeerTypingActive else { return }
-      groupTypingUserIds = []
+      clearGroupTypingDisplay()
       directPeerTypingActive = false
       updateHeaderTexts()
       updateProfileTexts()
       return
     }
     let next = ChatEngine.shared.typingUserIds(chatId: chatId)
-    guard force || next != groupTypingUserIds || directPeerTypingActive else { return }
-    groupTypingUserIds = next
+    guard updateGroupTypingDisplay(next, force: force) || directPeerTypingActive else { return }
     directPeerTypingActive = false
     updateHeaderTexts()
     updateProfileTexts()
@@ -4273,12 +4326,14 @@ public final class ChatMainView: UIView,
   private func resolvedGroupTypingSubtitle() -> String? {
     let normalizedTypingUsers = Array(Set(groupTypingUserIds.map { $0.uppercased() }))
     guard !normalizedTypingUsers.isEmpty else { return nil }
-    // Keep the subtitle short: agent first name (+ short model when alone).
-    // 3+ typers → "Claude, Codex +2 typing…" so the header never grows a wall of
-    // "Claude · Claude Sonnet 5, Codex · GPT-5.5, …".
+    // Keep the subtitle short and STABLE: first names only, in a fixed provider order
+    // (Claude, Codex, Grok, Agy, then humans alphabetically). No model suffix here —
+    // during a fan-out the typing set changes constantly, and a label that swaps
+    // content/width on every change reads as flicker, not status.
+    // 3+ typers → "Claude, Codex +2 typing…".
     let names: [String] =
       normalizedTypingUsers
-      .compactMap { id -> String? in
+      .compactMap { id -> (rank: Int, name: String)? in
         var name =
           groupMemberDisplayNameByUserId[id]?
           .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -4288,28 +4343,18 @@ public final class ChatMainView: UIView,
         guard !name.isEmpty else { return nil }
         // Short display: first token only ("Claude Code" → "Claude").
         let shortName = name.split(separator: " ").first.map(String.init) ?? name
-        let provider: String? =
+        let rank: Int =
           switch id {
-          case "11111111-1111-1111-1111-111111111111": "claude"
-          case "22222222-2222-2222-2222-222222222222": "codex"
-          case "33333333-3333-3333-3333-333333333333": "grok"
-          case "44444444-4444-4444-4444-444444444444": "agy"
-          default: nil
+          case "11111111-1111-1111-1111-111111111111": 0  // claude
+          case "22222222-2222-2222-2222-222222222222": 1  // codex
+          case "33333333-3333-3333-3333-333333333333": 2  // grok
+          case "44444444-4444-4444-4444-444444444444": 3  // agy
+          default: 4
           }
-        // Only attach model when a single agent is typing (room for "Claude · Sonnet 5").
-        if normalizedTypingUsers.count == 1, let provider,
-          let model = AgentBridgeSelectionStore.selectedRunOptions(provider: provider).model,
-          let title = AgentBridgeSelectionStore.modelChoices(provider: provider)
-            .first(where: { $0.value == model })?.title
-        {
-          let shortModel = Self.shortGroupTypingModelTitle(title, providerName: shortName)
-          if !shortModel.isEmpty {
-            return "\(shortName) · \(shortModel)"
-          }
-        }
-        return shortName
+        return (rank, shortName)
       }
-      .sorted()
+      .sorted { $0.rank != $1.rank ? $0.rank < $1.rank : $0.name < $1.name }
+      .map(\.name)
 
     switch names.count {
     case 0:
@@ -4322,27 +4367,6 @@ public final class ChatMainView: UIView,
       // Cap at two named agents; remainder as +N.
       return "\(names[0]), \(names[1]) +\(names.count - 2) typing…"
     }
-  }
-
-  /// "Claude Sonnet 5" → "Sonnet 5"; "GPT-5.5" stays; strip redundant vendor prefix.
-  private static func shortGroupTypingModelTitle(_ title: String, providerName: String) -> String {
-    var t = title.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !t.isEmpty else { return "" }
-    let prefixes = [
-      providerName + " ",
-      "Claude ", "Codex ", "Grok ", "Agy ", "OpenAI ", "GPT ",
-    ]
-    for p in prefixes {
-      if t.lowercased().hasPrefix(p.lowercased()) {
-        t = String(t.dropFirst(p.count)).trimmingCharacters(in: .whitespacesAndNewlines)
-        break
-      }
-    }
-    // Hard cap so the nav subtitle never wraps.
-    if t.count > 18 {
-      return String(t.prefix(16)) + "…"
-    }
-    return t
   }
 
   private func resolvedDirectTypingSubtitle() -> String? {

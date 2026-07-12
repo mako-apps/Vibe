@@ -624,7 +624,9 @@ final class AgentRuntimeSummaryView: UIView {
     let filesChanged = diff?.filesChanged ?? 0
     
     if let strip = runtime.teamProgressStrip, !strip.isEmpty {
-      titleLabel.text = runtime.status == "running" ? "Team working" : "Team finished"
+      titleLabel.text =
+        runtime.status == "running"
+        ? (runtime.teamPhaseLabel ?? "Team working") : "Team finished"
       teamStripLabel.text = strip
       teamStripLabel.isHidden = false
       teamStripLabel.textColor = textColor.withAlphaComponent(0.72)

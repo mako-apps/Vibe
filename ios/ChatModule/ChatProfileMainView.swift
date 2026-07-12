@@ -1207,7 +1207,6 @@ private struct ChatProfileSwiftUIRootView: View {
   @StateObject private var navCoordinator = ChatProfileNavigationCoordinator()
   @State private var localScrollOffset: CGFloat = 0
   @State private var lastReportedScrollOffset: CGFloat = -1
-  @State private var stickyTitleVisible = false
   @State private var newChatTrigger = false
 
   /// Discrete committed state: false = circle, true = full hero banner.
@@ -1215,6 +1214,13 @@ private struct ChatProfileSwiftUIRootView: View {
   @State private var heroExpanded = false
   /// Soft 0…1 driven by `heroExpanded` (animates with the spring). ONE shared morph value.
   @State private var heroExpandProgress: CGFloat = 0
+  /// Reserved-space progress for the SCROLL CONTENT's spacers — snapped INSTANTLY
+  /// to the commit target (no animation), while `heroExpandProgress` keeps animating
+  /// the pinned overlay on top of it. Animating the scroll content's own height in
+  /// lockstep with the overlay forced ScrollView to recompute contentSize every
+  /// frame, which lagged a beat behind the overlay — the rows visibly trailed as if
+  /// they were a separate scroll element instead of being pinned to the hero.
+  @State private var heroListReserveProgress: CGFloat = 0
   /// User has scrolled into the list body while expanded (needed once to unlock collapse).
   @State private var hasScrolledAwayWhileExpanded = false
   /// Arms a single pull-down expand per overscroll (re-arms at rest).
@@ -1222,6 +1228,12 @@ private struct ChatProfileSwiftUIRootView: View {
   /// Ignore offset events right after a commit (prevents height/bounce re-entry).
   @State private var heroMorphInFlight = false
   @State private var lastScrollOffsetSample: CGFloat = 0
+  /// Real ScrollViewReader handle — lets commit snap the ACTUAL scroll position to
+  /// top, not just the `localScrollOffset` state var (see setHeroExpanded).
+  @State private var profileScrollProxy: ScrollViewProxy?
+  private let profileScrollTopAnchorID = "profileScrollTop"
+  /// Coarse gate so per-sample scroll logging doesn't spam.
+  @State private var lastProfileSampleLogOffset: CGFloat = .greatestFiniteMagnitude
   /// Local echo of the selected repo name so the Repository row subtitle updates
   /// immediately when the native Menu picks a repo (without a full host re-render).
   @State private var selectedRepoNameLocal: String?
@@ -1231,6 +1243,11 @@ private struct ChatProfileSwiftUIRootView: View {
   /// Local echo of per-agent model picks so the row subtitle refreshes immediately
   /// ("" = explicitly cleared to Default). Source of truth stays the selection store.
   @State private var groupModelSelections: [String: String] = [:]
+  /// Local echos so model/permission trailing labels refresh after menu picks.
+  @State private var thinkingEnabledLocal = AgentBridgeSelectionStore.isThinkingEnabled()
+  @State private var intelligenceLocal = AgentBridgeSelectionStore.selectedIntelligence()
+  @State private var workModeLocal = AgentBridgeSelectionStore.selectedWorkMode()
+  @State private var showAddMembersSheet = false
 
   private var rowFill: Color {
     Color(uiColor: posterGradientColors.0).opacity(isDark ? 0.055 : 0.11)
@@ -1297,8 +1314,9 @@ private struct ChatProfileSwiftUIRootView: View {
   }
 
   /// Committed hero band ≈ 55% of screen (reads taller than half on device).
+  /// Pixel-rounded so spacer + morph never settle on fractional heights.
   private var heroBaseHeight: CGFloat {
-    UIScreen.main.bounds.height * 0.55
+    Self.pixelRound(UIScreen.main.bounds.height * 0.55)
   }
 
   /// Extra top air under nav for avatar + reflection.
@@ -1308,37 +1326,139 @@ private struct ChatProfileSwiftUIRootView: View {
 
   /// Spacer clears ONLY the pinned avatar (circle or hero). Name + actions live in scroll.
   private var avatarPinHeight: CGFloat {
-    avatarTopAir + avatarCircleSize + 8
+    Self.pixelRound(avatarTopAir + avatarCircleSize + 8)
   }
 
-  /// Spacer height = pure f(heroExpandProgress) — same source as media morph (lockstep).
+  /// Spacer height = pure f(heroExpandProgress) — lockstep with media (linear shared p).
+  /// Drives the PINNED OVERLAY's own height only — animates smoothly with the spring.
   private var scrollHeaderSpacer: CGFloat {
-    avatarPinHeight + (heroBaseHeight - avatarPinHeight) * heroExpandProgress
+    Self.pixelRound(
+      avatarPinHeight + (heroBaseHeight - avatarPinHeight) * heroExpandProgress
+    )
+  }
+
+  /// Same formula as `scrollHeaderSpacer` but driven by
+  /// `max(heroListReserveProgress, heroExpandProgress)` — used ONLY for the scroll
+  /// content's reserved spacers, never the overlay. The `max` is load-bearing: the
+  /// reserve must NEVER sit below the overlay's real animating height, or rows
+  /// (higher zIndex) render on top of the still-large hero mid-collapse. Snapping
+  /// the reserve instantly to its commit target is only safe on EXPAND (target=1,
+  /// the max of two values ≤1 — reserve stays pinned at the max, no growth-lag);
+  /// on COLLAPSE (target=0) the max degrades gracefully to tracking
+  /// heroExpandProgress exactly, so reserve == overlay height at every instant.
+  private var scrollListReserveSpacer: CGFloat {
+    let p = max(heroListReserveProgress, heroExpandProgress)
+    return Self.pixelRound(
+      avatarPinHeight + (heroBaseHeight - avatarPinHeight) * p
+    )
   }
 
   /// Fixed page reflection (outside ScrollView).
   private var pageReflectionHeight: CGFloat {
-    heroBaseHeight + 48
+    Self.pixelRound(heroBaseHeight + 48)
   }
 
   /// Overscroll only after morph fully settled (avoids end-of-spring stretch pop/flicker).
   private var heroOverscrollStretch: CGFloat {
     guard heroExpanded,
           !heroMorphInFlight,
-          heroExpandProgress >= 0.995,
+          heroExpandProgress >= 0.999,
           localScrollOffset < 0
     else { return 0 }
     let maxStretch = UIScreen.main.bounds.height * 0.17
-    return min(-localScrollOffset * 0.65, maxStretch)
+    return Self.pixelRound(min(-localScrollOffset * 0.65, maxStretch))
   }
 
-  /// No scroll-driven media scale/blur — that was the remaining realtime coupling
-  /// that produced edge tearing around the avatar while collapsing.
-  private var scrollImageScale: CGFloat { 1 }
-  private var scrollImageBlur: CGFloat { 0 }
+  /// Align morph/spacer heights to physical pixels (kills 1–2px end jump).
+  private static func pixelRound(_ value: CGFloat) -> CGFloat {
+    let scale = UIScreen.main.scale
+    return (value * scale).rounded() / scale
+  }
 
-  // Critically damped — no overshoot / noisy settle at the end.
-  private static let heroMorphSpring = Animation.spring(response: 0.40, dampingFraction: 1.0)
+  /// Safe-area top for pin baseline (updated from geometry).
+  @State private var safeAreaTopInset: CGFloat = 59
+
+  /// Fixed layout height reserved in the scroll content for the identity cluster.
+  private var identityClusterLayoutHeight: CGFloat {
+    // name ~28 + subtitle ~14 + spacing + chips 56 + vertical padding
+    Self.pixelRound(28 + 3 + 16 + 8 + 56 + 18)
+  }
+
+  /// Natural top under the *collapsed* circle only — never driven by hero spacer.
+  /// (Using scrollHeaderSpacer here shoved the floating cluster down during expand.)
+  private var identityNaturalTopY: CGFloat {
+    Self.pixelRound(avatarPinHeight + 4)
+  }
+
+  /// Pin stop — tighter under the status bar / island (top padding was too large
+  /// once pinned).
+  private var identityStickyTopY: CGFloat {
+    Self.pixelRound(max(24, safeAreaTopInset - 18))
+  }
+
+  /// How far the cluster can travel before it clamps (no jump — pure clamp).
+  private var identityTravelDistance: CGFloat {
+    max(1, identityNaturalTopY - identityStickyTopY)
+  }
+
+  /// Shorter than the full pin-travel distance — the scale-down/blur/fade should
+  /// finish EARLY in the scroll (so the avatar is already softened before it's
+  /// scrolled far), not still be easing in by the time the cluster fully pins.
+  private var identityFadeTravelDistance: CGFloat {
+    max(1, identityTravelDistance * 0.5)
+  }
+
+  /// Offset applied to the floating cluster (clamped so it stops at stickyY).
+  private var identityClampedScroll: CGFloat {
+    min(max(0, localScrollOffset), identityTravelDistance)
+  }
+
+  /// Live Y of the floating name+actions cluster (moves with scroll, then pins).
+  private var identityClusterTopY: CGFloat {
+    Self.pixelRound(identityNaturalTopY - identityClampedScroll)
+  }
+
+  /// 0 free … 1 fully pinned. Name-only scale (actions do not scale).
+  /// Fades out CONTINUOUSLY as hero expand begins — a hard `progress < 0.01`
+  /// cliff here used to snap every derived scroll-avatar effect (scale/blur/
+  /// opacity) to its neutral value the instant expand crossed that threshold,
+  /// which read as a "stuck" pop right at the start of hero->avatar collapse.
+  /// Triggers over `identityFadeTravelDistance` (shorter than the full pin-travel
+  /// distance) so it's already finished well before the cluster reaches its pin —
+  /// no lingering "very top" avatar movement visible late in the scroll.
+  private var identityPinProgress: CGFloat {
+    let heroFade = max(0, 1 - heroExpandProgress / 0.15)
+    return min(1, max(0, identityClampedScroll / identityFadeTravelDistance)) * heroFade
+  }
+
+  /// Soft scale for the *username only* — stronger (28 → ~14) than before.
+  private var identityNameScale: CGFloat {
+    1 - 0.48 * identityPinProgress
+  }
+
+  /// Soft avatar scroll blend — continuous via identityPinProgress (no cliff).
+  private var scrollAvatarScale: CGFloat {
+    1 - 0.04 * identityPinProgress
+  }
+  private var scrollAvatarBlur: CGFloat {
+    2.5 * identityPinProgress
+  }
+  private var scrollAvatarOpacity: CGFloat {
+    1 - 0.08 * identityPinProgress
+  }
+
+  /// Bottom-anchored Y for the identity cluster once the hero is fully formed —
+  /// approximates where the cluster's own content (name+subtitle+actions) ends
+  /// relative to the band bottom. Not pixel-exact (text is variable height), but
+  /// close enough that the frosted scrim beneath fully covers any slop.
+  private func identityExpandedTopY(bandHeight: CGFloat) -> CGFloat {
+    max(0, bandHeight - identityClusterLayoutHeight - 20)
+  }
+
+  // Slightly underdamped ("soft") springs — a touch of settle instead of a hard,
+  // critically-damped stop — collapse (hero->avatar) is faster than expand.
+  private static let heroExpandSpring = Animation.spring(response: 0.20, dampingFraction: 0.86)
+  private static let heroCollapseSpring = Animation.spring(response: 0.15, dampingFraction: 0.86)
 
   var body: some View {
     NavigationStack(path: $navCoordinator.path) {
@@ -1358,9 +1478,11 @@ private struct ChatProfileSwiftUIRootView: View {
         .allowsHitTesting(false)
         .zIndex(0)
 
-        // ONLY avatar media is pinned / morphs. Low z — scroll content paints above.
+        // Pinned media + on-image hero chrome (name left + glass pills).
+        // Single pixel-rounded height owner shared with the scroll spacer.
         GeometryReader { geo in
           let w = geo.size.width
+          let band = scrollHeaderSpacer + heroOverscrollStretch
           ChatProfileAvatarMorphView(
             text: avatarDisplayText,
             fontStyleID: appearanceSelection.avatarFontStyleID,
@@ -1370,9 +1492,12 @@ private struct ChatProfileSwiftUIRootView: View {
             heroBaseHeight: heroBaseHeight,
             expand: heroExpandProgress,
             overscrollStretch: heroOverscrollStretch,
-            topAir: avatarTopAir
+            topAir: avatarTopAir,
+            scrollScale: scrollAvatarScale,
+            scrollBlur: scrollAvatarBlur,
+            scrollOpacity: scrollAvatarOpacity
           )
-          .frame(width: w, alignment: .top)
+          .frame(width: w, height: band, alignment: .top)
           .contentShape(Rectangle())
           .onTapGesture(count: 2) {
             if abs(localScrollOffset) < 40, !heroMorphInFlight {
@@ -1380,52 +1505,123 @@ private struct ChatProfileSwiftUIRootView: View {
             }
           }
         }
-        .frame(height: scrollHeaderSpacer + heroOverscrollStretch)
+        // Height locked to pixel-rounded shared spacer — no extra layout thrash.
+        .frame(height: scrollHeaderSpacer + (heroMorphInFlight ? 0 : heroOverscrollStretch))
         .ignoresSafeArea(edges: .top)
         .allowsHitTesting(true)
         .zIndex(1)
 
-        // Name + actions + rows scroll together (higher than avatar).
-        ScrollView(.vertical, showsIndicators: false) {
-          VStack(spacing: 0) {
-            offsetReader(heroHeight: scrollHeaderSpacer)
+        // Rows only — identity is a floating cluster that tracks scroll then pins.
+        ScrollViewReader { scrollProxy in
+          ScrollView(.vertical, showsIndicators: false) {
+            VStack(spacing: 0) {
+              // Zero-height anchor: commit snaps the REAL scroll position here so it
+              // matches the `localScrollOffset = 0` state write instead of drifting
+              // (mismatch there = the list/image jump once the morph freeze lifts).
+              Color.clear
+                .frame(height: 0)
+                .id(profileScrollTopAnchorID)
 
-            // Clear hit-through so double-tap can reach avatar under the spacer.
-            Color.clear
-              .frame(height: scrollHeaderSpacer + heroOverscrollStretch)
-              .allowsHitTesting(false)
+              offsetReader(heroHeight: scrollHeaderSpacer)
 
-            // Identity lives in scroll — never fixed to avatar (no jump top→bottom).
-            scrollIdentityCluster
-              .padding(.top, 8)
-              .padding(.bottom, 10)
+              // Clear hit-through so double-tap can reach avatar under the spacer.
+              // Uses the INSTANT-snap reserve progress, not the animated overlay
+              // progress — see heroListReserveProgress.
+              Color.clear
+                .frame(height: scrollListReserveSpacer + (heroMorphInFlight ? 0 : heroOverscrollStretch))
+                .allowsHitTesting(false)
 
-            VStack(spacing: 14) {
-              profileInfoSection
-              if !bridgeProvider.isEmpty {
-                defaultViewSection
+              // Reserve layout space for the floating name+actions cluster — scaled
+              // to 0 as the hero expands, since that content moves ON the hero image
+              // instead. Leaving this constant regardless of progress was dead space
+              // between the full-height hero and the first row (the "gap/disconnected
+              // list" bug). Also driven by the instant-snap reserve progress.
+              Color.clear
+                .frame(height: identityClusterLayoutHeight * (1 - max(heroListReserveProgress, heroExpandProgress)))
+                .allowsHitTesting(false)
+
+              VStack(spacing: 18) {
+                profileInfoSection
+                if !bridgeProvider.isEmpty {
+                  defaultViewSection
+                }
+                if bridgeProvider.isEmpty {
+                  appearanceSection
+                }
+                sharedContentSection
+                if !isGroupOrChannel {
+                  contactActionsSection
+                  emergencySection
+                }
+                dangerSection
               }
-              if bridgeProvider.isEmpty {
-                appearanceSection
-              }
-              sharedContentSection
-              if !isGroupOrChannel {
-                contactActionsSection
-                emergencySection
-              }
-              dangerSection
+              .padding(.horizontal, 22)
+              .padding(.top, 4)
+              .padding(.bottom, 66)
             }
-            .padding(.horizontal, 16)
-            .padding(.top, 4)
-            .padding(.bottom, 66)
           }
+          .coordinateSpace(name: "profile-scroll")
+          .scrollIndicators(.never)
+          .chatProfileBounceBehavior()
+          // Stops an in-flight pan/rubber-band the instant commit fires — otherwise
+          // the finger (or bounce-back physics) keeps moving the REAL offset for the
+          // whole 0.28s spring while we've frozen the state var at 0, and it all
+          // catches up in one jump when the freeze lifts (the "noisy soft jump").
+          .scrollDisabled(heroMorphInFlight)
+          .onAppear { profileScrollProxy = scrollProxy }
         }
-        .coordinateSpace(name: "profile-scroll")
-        .scrollIndicators(.never)
-        .chatProfileBounceBehavior()
         .ignoresSafeArea(edges: .top)
         .background(Color.clear)
         .zIndex(2)
+
+        // Frosted-glass falloff at the bottom edge of the hero — a blur that
+        // adapts to the image via native Material translucency, instead of a
+        // flat black scrim imposing a fixed shadow/theme color. zIndex ABOVE the
+        // rows (like the cluster below) so scrolled list content never paints
+        // over the pinned hero/identity area.
+        Rectangle()
+          .fill(.ultraThinMaterial)
+          .environment(\.colorScheme, .dark)
+          .frame(maxWidth: .infinity)
+          .frame(height: scrollHeaderSpacer + heroOverscrollStretch)
+          .mask(
+            LinearGradient(
+              stops: [
+                .init(color: .clear, location: 0.0),
+                .init(color: .black.opacity(0.5), location: 0.6),
+                .init(color: .black, location: 1.0),
+              ],
+              startPoint: .top,
+              endPoint: .bottom
+            )
+          )
+          .opacity(Double(heroExpandProgress))
+          .allowsHitTesting(false)
+          .ignoresSafeArea(edges: .top)
+          .zIndex(3)
+
+        // ONE shared name+actions cluster — no second copy to crossfade. Its own
+        // position/alignment AND the action row's circle<->pill morph are both
+        // driven by the SAME heroExpandProgress as the media, so there is
+        // nothing left to desync or pop. zIndex ABOVE the rows so it stays a
+        // true sticky header instead of being painted over while scrolling.
+        identityMorphCluster(
+          bandWidth: UIScreen.main.bounds.width,
+          bandHeight: scrollHeaderSpacer + heroOverscrollStretch
+        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .allowsHitTesting(true)
+        .ignoresSafeArea(edges: .top)
+        .zIndex(4)
+      }
+      .background {
+        GeometryReader { geo in
+          Color.clear
+            .onAppear { safeAreaTopInset = geo.safeAreaInsets.top }
+            .onChange(of: geo.safeAreaInsets.top) { _, next in
+              safeAreaTopInset = next
+            }
+        }
       }
       .navigationBarTitleDisplayMode(.inline)
       .navigationBarBackButtonHidden(true)
@@ -1438,14 +1634,7 @@ private struct ChatProfileSwiftUIRootView: View {
               .font(.system(size: 17, weight: .semibold))
           }
         }
-        ToolbarItem(placement: .principal) {
-          Text(profileName)
-            .font(.system(size: 17, weight: .semibold))
-            .lineLimit(1)
-            .minimumScaleFactor(0.78)
-            .opacity(stickyTitleVisible ? 1 : 0)
-            .accessibilityHidden(!stickyTitleVisible)
-        }
+        // No principal title — floating cluster is the only name (avoids dual header).
         ToolbarItem(placement: .topBarTrailing) {
           Menu {
             Button(isChatMuted ? "Unmute" : "Mute") { onAction("muteToggle") }
@@ -1453,7 +1642,7 @@ private struct ChatProfileSwiftUIRootView: View {
             if isGroupOrChannel {
               if canManageGroupMembers {
                 Button("Edit Group") { onAction("editGroup") }
-                Button("Add Members") { navCoordinator.path.append(.addMembers) }
+                Button("Add Members") { showAddMembersSheet = true }
               }
               if isGroupOwner {
                 Button("Delete Group", role: .destructive) { onAction("deleteGroup") }
@@ -1470,7 +1659,14 @@ private struct ChatProfileSwiftUIRootView: View {
           }
         }
       }
-      .toolbarBackground(heroExpanded ? .hidden : .automatic, for: .navigationBar)
+      // Drive toolbar chrome from settled progress only — flipping at expand
+      // commit (before spring ends) caused a 1–2px list/chrome jump.
+      .toolbarBackground(
+        (heroExpanded && heroExpandProgress >= 0.999 && !heroMorphInFlight)
+          ? .hidden
+          : .automatic,
+        for: .navigationBar
+      )
       .toolbarColorScheme(.dark, for: .navigationBar)
       // Must live ON the stack root content so path / link pushes resolve.
       // Skip zoom for members (and bridge sessions): zoom + List on this dark
@@ -1499,33 +1695,107 @@ private struct ChatProfileSwiftUIRootView: View {
     .onChange(of: navCoordinator.path.isEmpty) { _, isEmpty in
       onNavigationActiveChanged(!isEmpty)
     }
-    // Add-members is a NavigationStack push (`.addMembers`), not a sheet —
-    // matches New Chat / contact-search material and A–Z list.
+    .sheet(isPresented: $showAddMembersSheet) {
+      addMembersSheetContent
+    }
   }
 
-  /// Commit circle ↔ hero. `animating` lock + disjoint offset ranges prevent fighting.
+  @ViewBuilder
+  private var addMembersSheetContent: some View {
+    if let config = AppSessionConfig.current {
+      AddGroupMembersSheet(
+        config: config,
+        chatId: bridgeChatId,
+        excludedUserIds: Set(
+          groupMembers.compactMap { entry -> String? in
+            (entry["userId"] as? String)
+              ?? (entry["id"] as? String)
+              ?? (entry["memberId"] as? String)
+              ?? (entry["user_id"] as? String)
+          }
+        ),
+        onAdded: { raw in
+          onMembersAdded(raw)
+          showAddMembersSheet = false
+        }
+      )
+      .presentationDetents([.medium, .large])
+      .presentationDragIndicator(.visible)
+      .presentationBackground(.clear)
+    } else {
+      Text("Not signed in")
+        .presentationDetents([.medium])
+        .presentationBackground(.clear)
+    }
+  }
+
+  /// Commit circle ↔ hero. Settings-style: freeze offset, animate ONE progress for spacer+media.
   private func setHeroExpanded(_ expanded: Bool) {
     guard heroExpanded != expanded, !heroMorphInFlight else { return }
+    NSLog(
+      "[ProfileHeroMorph] commit expanded=%d fromP=%.3f localOffset=%.1f",
+      expanded ? 1 : 0, Double(heroExpandProgress), Double(localScrollOffset)
+    )
+    // scrollDisabled(heroMorphInFlight) flips on this SAME turn (SwiftUI applies it
+    // before the next render pass), which is what actually stops the real ScrollView
+    // from drifting during the spring — cancels an in-flight pan the same way
+    // UIScrollView.panGestureRecognizer.isEnabled=false does in the Settings header.
     heroMorphInFlight = true
     if !expanded {
       hasScrolledAwayWhileExpanded = false
     }
+    // Freeze scroll coupling — kill rubber-band before height morph (Settings pattern).
+    // Expanding from overscroll (-60) with live offset caused list+image shift.
+    var freeze = Transaction()
+    freeze.disablesAnimations = true
+    withTransaction(freeze) {
+      if expanded {
+        localScrollOffset = 0
+        // Snap the REAL scroll position to match — without this the state var says
+        // 0 but the actual UIScrollView underneath is still wherever the pull left
+        // it, and that gap surfaces as one big jump when the freeze lifts.
+        profileScrollProxy?.scrollTo(profileScrollTopAnchorID, anchor: .top)
+      } else {
+        localScrollOffset = max(0, min(localScrollOffset, identityTravelDistance))
+      }
+      // Snap the scroll content's reserved space to its TARGET immediately —
+      // it must never animate in lockstep with the overlay (that forced
+      // ScrollView to recompute contentSize every frame, one beat behind the
+      // overlay, which read as the rows being a separate, laggy scroll element).
+      heroListReserveProgress = expanded ? 1 : 0
+    }
     if expanded {
-      UIImpactFeedbackGenerator(style: .soft).impactOccurred()
+      UIImpactFeedbackGenerator(style: .medium).impactOccurred()
     } else {
-      UIImpactFeedbackGenerator(style: .light).impactOccurred(intensity: 0.55)
+      UIImpactFeedbackGenerator(style: .light).impactOccurred(intensity: 0.7)
     }
-    // Animate ONLY the shared progress. Keep heroExpanded for logic gates outside spring.
+    // Animate ONLY the shared progress. Spacer + morph both read heroExpandProgress.
     heroExpanded = expanded
-    withAnimation(Self.heroMorphSpring) {
-      heroExpandProgress = expanded ? 1 : 0
-    }
-    // Hold lock until critically-damped spring is done (~response*1.2).
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.52) {
+    let target: CGFloat = expanded ? 1 : 0
+    let spring = expanded ? Self.heroExpandSpring : Self.heroCollapseSpring
+    // Completion-driven unlock (iOS 17+) instead of a hardcoded asyncAfter guess —
+    // that fixed 0.28s delay was longer than the actual spring settle time on
+    // collapse, reading as "delay to come back to avatar."
+    withAnimation(spring, completionCriteria: .logicallyComplete) {
+      heroExpandProgress = target
+    } completion: { [self] in
+      var t = Transaction()
+      t.disablesAnimations = true
+      withTransaction(t) {
+        heroExpandProgress = target
+        if expanded {
+          localScrollOffset = 0
+          profileScrollProxy?.scrollTo(profileScrollTopAnchorID, anchor: .top)
+        }
+      }
       heroMorphInFlight = false
       if !expanded {
         expandGestureArmed = true
       }
+      NSLog(
+        "[ProfileHeroMorph] settle expanded=%d p=%.3f localOffset=%.1f",
+        expanded ? 1 : 0, Double(heroExpandProgress), Double(localScrollOffset)
+      )
     }
   }
 
@@ -1564,32 +1834,46 @@ private struct ChatProfileSwiftUIRootView: View {
     }
     .frame(height: 0)
     .onPreferenceChange(ChatProfileScrollOffsetPreferenceKey.self) { value in
-      let nextValue = (value * 2.0).rounded() / 2.0
-      guard abs(localScrollOffset - nextValue) >= 1.5 else { return }
+      // During hero morph, ignore ALL scroll samples (stable freeze) — no live p.
+      guard !heroMorphInFlight else { return }
+
+      // Pixel-quantize offset to kill sub-pixel scroll thrash.
+      let scale = UIScreen.main.scale
+      let nextValue = (value * scale).rounded() / scale
+      guard abs(localScrollOffset - nextValue) >= 1.0 else { return }
       let previous = lastScrollOffsetSample
       lastScrollOffsetSample = nextValue
-      localScrollOffset = nextValue
+      var t = Transaction()
+      t.disablesAnimations = true
+      withTransaction(t) {
+        localScrollOffset = nextValue
+      }
 
-      // Hero expand/collapse — discrete, disjoint ranges (not finger-live p).
-      if !heroMorphInFlight {
-        if !heroExpanded {
-          if expandGestureArmed, nextValue < -60 {
-            expandGestureArmed = false
-            setHeroExpanded(true)
-          }
-          if nextValue >= 0 {
-            expandGestureArmed = true
-          }
-        } else if nextValue > 80 {
-          setHeroExpanded(false)
+      if abs(nextValue - lastProfileSampleLogOffset) > 8 {
+        lastProfileSampleLogOffset = nextValue
+        NSLog(
+          "[ProfileHeroMorph] sample offset=%.1f p=%.3f spacer=%.1f expanded=%d inFlight=%d",
+          Double(nextValue), Double(heroExpandProgress), Double(scrollHeaderSpacer),
+          heroExpanded ? 1 : 0, heroMorphInFlight ? 1 : 0
+        )
+      }
+
+      // Discrete expand/collapse only (-60 / +80). No finger-tracked expand progress.
+      if !heroExpanded {
+        if expandGestureArmed, nextValue < -60 {
+          expandGestureArmed = false
+          NSLog("[ProfileHeroMorph] pull-threshold offset=%.1f", Double(nextValue))
+          setHeroExpanded(true)
         }
+        if nextValue >= 0 {
+          expandGestureArmed = true
+        }
+      } else if nextValue > 80 {
+        NSLog("[ProfileHeroMorph] collapse-threshold offset=%.1f", Double(nextValue))
+        setHeroExpanded(false)
       }
 
       _ = previous
-      let shouldShowTitle = nextValue >= stickyTitleThreshold(heroHeight: heroHeight)
-      if stickyTitleVisible != shouldShowTitle {
-        stickyTitleVisible = shouldShowTitle
-      }
       if lastReportedScrollOffset < 0 || abs(lastReportedScrollOffset - nextValue) >= 6.0 {
         lastReportedScrollOffset = nextValue
         onScroll(nextValue)
@@ -1601,11 +1885,32 @@ private struct ChatProfileSwiftUIRootView: View {
     max(90, heroHeight * 0.5)
   }
 
-  /// Username + actions in the scroll unit (not fixed on avatar).
+  /// ONE shared name+actions cluster — no separate floating/on-image copies to
+  /// crossfade. Position (top offset + horizontal alignment) and the action
+  /// row's own circle<->pill morph are ALL continuous functions of the SAME
+  /// `heroExpandProgress`/scroll state, so there's nothing to desync or pop.
   @ViewBuilder
-  private var scrollIdentityCluster: some View {
+  private func identityMorphCluster(bandWidth: CGFloat, bandHeight: CGFloat) -> some View {
+    let p = heroExpandProgress
+    let inset: CGFloat = 16
+    // Centered (collapsed) -> left-aligned with a small inset (hero). The frame
+    // narrows toward the inset as p rises, so by the time alignment flips at
+    // p=0.5 the frame is already snug around the text — center vs leading look
+    // nearly identical in a tight frame, which is what keeps the flip invisible.
+    let centerPad = max(inset, bandWidth * 0.22)
+    let nameLeadingPad = centerPad + (inset - centerPad) * p
+    let nameFrameWidth = max(1, bandWidth - nameLeadingPad * 2)
+    let nameAlign: Alignment = p < 0.5 ? .center : .leading
+
+    // Collapsed: scroll-tracked Y that pins under the nav. Hero: anchored near
+    // the band's bottom edge. Blended continuously by p — both endpoints are
+    // computed from the exact same state driving the media, so they can't drift.
+    let collapsedTopY = identityClusterTopY
+    let expandedTopY = identityExpandedTopY(bandHeight: bandHeight)
+    let topY = collapsedTopY + (expandedTopY - collapsedTopY) * p
+
     VStack(spacing: 8) {
-      VStack(spacing: 3) {
+      VStack(alignment: nameAlign == .center ? .center : .leading, spacing: 3) {
         HStack(spacing: 8) {
           Text(profileName)
             .font(.system(size: 28, weight: .bold))
@@ -1616,7 +1921,7 @@ private struct ChatProfileSwiftUIRootView: View {
             ChatProfileSwiftUITierBadge(label: "Gold")
           }
         }
-        .frame(maxWidth: .infinity)
+        .frame(width: nameFrameWidth, alignment: nameAlign)
 
         if let groupHeaderSubtitle {
           Text(groupHeaderSubtitle)
@@ -1625,11 +1930,27 @@ private struct ChatProfileSwiftUIRootView: View {
             .lineLimit(1)
         }
       }
+      // Scale username only — actions below stay 1.0.
+      .scaleEffect(identityNameScale, anchor: .top)
+      .padding(.leading, nameLeadingPad)
 
-      // Collapsed chips (expand: 0) — no circle→pill on-image morph here.
-      actionRow(expand: 0)
+      // Actions morph circle<->pill via the same continuous expand p.
+      actionRow(expand: p)
     }
-    .padding(.horizontal, 16)
+    .frame(width: bandWidth, alignment: .top)
+    .padding(.top, topY)
+  }
+
+  /// Section title outside the card (topic header).
+  @ViewBuilder
+  private func profileSectionHeader(_ title: String) -> some View {
+    Text(title)
+      .font(.system(size: 13, weight: .semibold))
+      .foregroundStyle(Color.secondary)
+      .textCase(.uppercase)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .padding(.horizontal, 6)
+      .padding(.bottom, 2)
   }
 
   private var resolvedRepositorySubtitle: String {
@@ -1740,147 +2061,12 @@ private struct ChatProfileSwiftUIRootView: View {
         }
       }
     } else if isGroupOrChannel {
-      ChatProfileSwiftUISection(fill: rowFill) {
-        // Admins get a first-class edit entry (name / photo / description).
-        if canManageGroupMembers {
-          Button { onAction("editGroup") } label: {
-            ChatProfileSwiftUIRow(
-              title: isChannel ? "Edit channel" : "Edit group",
-              subtitle: "Name, photo, description",
-              trailingSystemImage: nil,
-              showsChevron: true,
-              separatorColor: separatorColor,
-              isLast: !showsMemberList && groupBridgeProvider == nil
-            )
-          }
-          .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
-        }
-
-        // Groups: every member can open the roster. Channels: never list members.
-        // UIKit members push — SwiftUI NavigationStack + zoom/matchedTransition on
-        // this dark profile was SIGBUS/SIGSEGV after Members open (data was fine).
-        if showsMemberList {
-          Button {
-            onAction("openMembers")
-          } label: {
-            ChatProfileSwiftUIRow(
-              title: "Members",
-              subtitle: groupMembersSubtitle,
-              trailingSystemImage: nil,
-              showsChevron: true,
-              separatorColor: separatorColor,
-              isLast: groupBridgeProvider == nil
-            )
-          }
-          .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
-        }
-
-        if groupBridgeProvider != nil {
-          // Native SwiftUI Menu — left label "Repository", right expands the
-          // repo list (same pattern as the per-agent model pickers below).
-          Menu {
-            let repos = availableRepositories
-            let selected =
-              AgentBridgeSelectionStore.selectedRepository(
-                chatId: bridgeChatId.isEmpty ? nil : bridgeChatId
-              )
-            if repos.isEmpty {
-              Button("Browse repositories…") {
-                if let provider = groupBridgeProvider {
-                  onAction("bridgeRepository:\(provider)")
-                }
-              }
-            } else {
-              ForEach(repos, id: \.id) { repo in
-                Button {
-                  selectRepository(repo)
-                } label: {
-                  if repo.id == selected?.id || repo.cwd == selected?.cwd {
-                    Label(repo.name, systemImage: "checkmark")
-                  } else {
-                    Text(repo.name)
-                  }
-                }
-              }
-              Divider()
-              Button("Browse all…") {
-                if let provider = groupBridgeProvider {
-                  onAction("bridgeRepository:\(provider)")
-                }
-              }
-            }
-          } label: {
-            ChatProfileSwiftUIRow(
-              title: "Repository",
-              subtitle: resolvedRepositorySubtitle,
-              trailingSystemImage: "chevron.up.chevron.down",
-              showsChevron: false,
-              separatorColor: separatorColor,
-              isLast: false
-            )
-          }
-          .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
-
-          // One model row per agent in the group. The pick is stored per provider
-          // (AgentBridgeSelectionStore) and rides group sends as agentBridgeModels,
-          // resolved to each worker at dispatch.
-          ForEach(groupBridgeProviders, id: \.self) { agentProvider in
-            Menu {
-              ForEach(
-                AgentBridgeSelectionStore.modelChoices(provider: agentProvider), id: \.value
-              ) { choice in
-                Button {
-                  AgentBridgeSelectionStore.setModel(provider: agentProvider, model: choice.value)
-                  groupModelSelections[agentProvider] = choice.value
-                } label: {
-                  if groupSelectedModel(agentProvider) == choice.value {
-                    Label(choice.title, systemImage: "checkmark")
-                  } else {
-                    Text(choice.title)
-                  }
-                }
-              }
-              Button {
-                AgentBridgeSelectionStore.setModel(provider: agentProvider, model: nil)
-                groupModelSelections[agentProvider] = ""
-              } label: {
-                if groupSelectedModel(agentProvider) == nil {
-                  Label("Default", systemImage: "checkmark")
-                } else {
-                  Text("Default")
-                }
-              }
-            } label: {
-              ChatProfileSwiftUIRow(
-                title: "\(AgentBridgeProfile.displayName(for: agentProvider)) model",
-                subtitle: groupModelSubtitle(agentProvider),
-                trailingSystemImage: "chevron.up.chevron.down",
-                showsChevron: false,
-                separatorColor: separatorColor,
-                isLast: false
-              )
-            }
-            .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
-            .onAppear {
-              // Force-refresh live provider catalogs when the profile model menu is shown.
-              AgentBridgeSelectionStore.refreshModelsIfPossible()
-            }
-          }
-
-          Button {
-            onAction("agentConfig")
-          } label: {
-            ChatProfileSwiftUIRow(
-              title: "Configuration",
-              subtitle: "Agent and group settings",
-              trailingSystemImage: nil,
-              showsChevron: true,
-              separatorColor: separatorColor,
-              isLast: true
-            )
-          }
-          .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
-        }
+      // Topic cards — Group / Models / Permissions / Configuration.
+      groupTopicSection
+      if groupBridgeProvider != nil {
+        groupModelsSection
+        groupPermissionsSection
+        groupConfigurationSection
       }
     } else if !username.isEmpty || !note.isEmpty {
       ChatProfileSwiftUISection(fill: rowFill) {
@@ -1908,6 +2094,272 @@ private struct ChatProfileSwiftUIRootView: View {
             isLast: true
           )
         }
+      }
+    }
+  }
+
+  /// Group identity: Edit + Members only.
+  @ViewBuilder
+  private var groupTopicSection: some View {
+    let hasEdit = canManageGroupMembers
+    let hasMembers = showsMemberList
+    if hasEdit || hasMembers {
+      VStack(alignment: .leading, spacing: 8) {
+        profileSectionHeader(isChannel ? "Channel" : "Group")
+        ChatProfileSwiftUISection(fill: rowFill) {
+          if hasEdit {
+            Button { onAction("editGroup") } label: {
+              ChatProfileSwiftUIRow(
+                title: isChannel ? "Edit channel" : "Edit group",
+                subtitle: "Name, photo, description",
+                trailingSystemImage: nil,
+                showsChevron: true,
+                separatorColor: separatorColor,
+                isLast: !hasMembers
+              )
+            }
+            .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+          }
+
+          // Native NavigationStack push — parent profile owns the nav header.
+          if hasMembers {
+            Button {
+              onMembersScreenAppeared?()
+              navCoordinator.path.append(.members)
+            } label: {
+              ChatProfileSwiftUIRow(
+                title: "Members",
+                subtitle: groupMembersSubtitle,
+                trailingSystemImage: nil,
+                showsChevron: true,
+                separatorColor: separatorColor,
+                isLast: true
+              )
+            }
+            .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+          }
+        }
+      }
+    }
+  }
+
+  /// Model configuration: repository + per-agent model menus (model on the right).
+  @ViewBuilder
+  private var groupModelsSection: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      profileSectionHeader("Models")
+      ChatProfileSwiftUISection(fill: rowFill) {
+      Menu {
+        let repos = availableRepositories
+        let selected =
+          AgentBridgeSelectionStore.selectedRepository(
+            chatId: bridgeChatId.isEmpty ? nil : bridgeChatId
+          )
+        if repos.isEmpty {
+          Button("Browse repositories…") {
+            if let provider = groupBridgeProvider {
+              onAction("bridgeRepository:\(provider)")
+            }
+          }
+        } else {
+          ForEach(repos, id: \.id) { repo in
+            Button {
+              selectRepository(repo)
+            } label: {
+              if repo.id == selected?.id || repo.cwd == selected?.cwd {
+                Label(repo.name, systemImage: "checkmark")
+              } else {
+                Text(repo.name)
+              }
+            }
+          }
+          Divider()
+          Button("Browse all…") {
+            if let provider = groupBridgeProvider {
+              onAction("bridgeRepository:\(provider)")
+            }
+          }
+        }
+      } label: {
+        // Left title stable; right side is the selected value.
+        ChatProfileSwiftUIRow(
+          title: "Repository",
+          trailingText: resolvedRepositorySubtitle,
+          trailingSystemImage: "chevron.up.chevron.down",
+          showsChevron: false,
+          separatorColor: separatorColor,
+          isLast: groupBridgeProviders.isEmpty
+        )
+      }
+      .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+
+      ForEach(Array(groupBridgeProviders.enumerated()), id: \.element) { index, agentProvider in
+        agentProviderMenu(provider: agentProvider, isLast: index == groupBridgeProviders.count - 1)
+      }
+      }
+    }
+  }
+
+  /// Nested Menu: Thinking (toggle + levels) on top, latest models, Other Models submenu.
+  @ViewBuilder
+  private func agentProviderMenu(provider agentProvider: String, isLast: Bool) -> some View {
+    let levels = AgentBridgeSelectionStore.intelligenceChoices(
+      provider: agentProvider, model: groupSelectedModel(agentProvider))
+    let primary = AgentBridgeSelectionStore.primaryModelChoices(provider: agentProvider)
+    let other = AgentBridgeSelectionStore.otherModelChoices(provider: agentProvider)
+    let selectedModel = groupSelectedModel(agentProvider)
+
+    Menu {
+      // Nested Thinking overlay — switch + levels (lives at top of the menu).
+      if !levels.isEmpty {
+        Menu {
+          Toggle(
+            "Thinking",
+            isOn: Binding(
+              get: { thinkingEnabledLocal },
+              set: { next in
+                thinkingEnabledLocal = next
+                AgentBridgeSelectionStore.setThinkingEnabled(next)
+              }
+            )
+          )
+          if thinkingEnabledLocal {
+            Divider()
+            ForEach(levels, id: \.self) { level in
+              Button {
+                AgentBridgeSelectionStore.setThinkingEnabled(true)
+                AgentBridgeSelectionStore.setIntelligence(level)
+                thinkingEnabledLocal = true
+                intelligenceLocal = level
+              } label: {
+                if intelligenceLocal == level {
+                  Label(level.title, systemImage: "checkmark")
+                } else {
+                  Text(level.title)
+                }
+              }
+            }
+          }
+        } label: {
+          Label(
+            thinkingEnabledLocal ? "Thinking · \(intelligenceLocal.title)" : "Thinking · Off",
+            systemImage: "brain"
+          )
+        }
+        Divider()
+      }
+
+      // Latest models only at the top level.
+      Button {
+        AgentBridgeSelectionStore.setModel(provider: agentProvider, model: nil)
+        groupModelSelections[agentProvider] = ""
+      } label: {
+        if selectedModel == nil {
+          Label("Default", systemImage: "checkmark")
+        } else {
+          Text("Default")
+        }
+      }
+      ForEach(primary, id: \.value) { choice in
+        Button {
+          AgentBridgeSelectionStore.setModel(provider: agentProvider, model: choice.value)
+          groupModelSelections[agentProvider] = choice.value
+        } label: {
+          if selectedModel == choice.value {
+            Label(choice.title, systemImage: "checkmark")
+          } else {
+            Text(choice.title)
+          }
+        }
+      }
+
+      // Older / non-latest models nested under Other Models.
+      if !other.isEmpty {
+        Menu("Other Models") {
+          ForEach(other, id: \.value) { choice in
+            Button {
+              AgentBridgeSelectionStore.setModel(provider: agentProvider, model: choice.value)
+              groupModelSelections[agentProvider] = choice.value
+            } label: {
+              if selectedModel == choice.value {
+                Label(choice.title, systemImage: "checkmark")
+              } else {
+                Text(choice.title)
+              }
+            }
+          }
+        }
+      }
+    } label: {
+      ChatProfileSwiftUIRow(
+        title: AgentBridgeProfile.displayName(for: agentProvider),
+        trailingText: groupModelSubtitle(agentProvider),
+        trailingSystemImage: "chevron.up.chevron.down",
+        showsChevron: false,
+        separatorColor: separatorColor,
+        isLast: isLast
+      )
+    }
+    .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+    .onAppear {
+      AgentBridgeSelectionStore.refreshModelsIfPossible()
+    }
+  }
+
+  /// Permissions (agent work mode) when Claude/Codex present in the group.
+  @ViewBuilder
+  private var groupPermissionsSection: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      profileSectionHeader("Permission")
+      ChatProfileSwiftUISection(fill: rowFill) {
+        Menu {
+          ForEach(AgentBridgeWorkMode.allCases) { mode in
+            Button {
+              AgentBridgeSelectionStore.setWorkMode(mode)
+              workModeLocal = mode
+              NotificationCenter.default.post(
+                name: NSNotification.Name("AgentBridgeWorkModeChanged"), object: nil)
+            } label: {
+              if workModeLocal == mode {
+                Label(mode.title, systemImage: "checkmark")
+              } else {
+                Label(mode.title, systemImage: mode.icon)
+              }
+            }
+          }
+        } label: {
+          ChatProfileSwiftUIRow(
+            title: "Mode",
+            trailingText: workModeLocal.title,
+            trailingSystemImage: "chevron.up.chevron.down",
+            showsChevron: false,
+            separatorColor: separatorColor,
+            isLast: true
+          )
+        }
+        .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+      }
+    }
+  }
+
+  /// Vibe AI agent row → pageSheet editor (not a full-screen push).
+  @ViewBuilder
+  private var groupConfigurationSection: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      profileSectionHeader("Agent")
+      ChatProfileSwiftUISection(fill: rowFill) {
+        Button {
+          onAction("agentConfig")
+        } label: {
+          ChatProfileSwiftUIRow(
+            title: "Vibe AI",
+            trailingText: nil,
+            showsChevron: true,
+            separatorColor: separatorColor,
+            isLast: true
+          )
+        }
+        .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
       }
     }
   }
@@ -2273,7 +2725,7 @@ private struct ChatProfileSwiftUIRootView: View {
         canAddMembers: canManageGroupMembers,
         onContentPressed: onContentPressed,
         onAddMembers: {
-          navCoordinator.path.append(.addMembers)
+          showAddMembersSheet = true
         }
       )
       .onAppear {
@@ -2296,113 +2748,112 @@ private struct ChatProfileSwiftUIRootView: View {
         }
       }
     case .addMembers:
-      if let config = AppSessionConfig.current {
-        AddGroupMembersPickerView(
-          config: config,
-          chatId: bridgeChatId,
-          excludedUserIds: Set(
-            groupMembers.compactMap { entry -> String? in
-              (entry["userId"] as? String)
-                ?? (entry["id"] as? String)
-                ?? (entry["memberId"] as? String)
-                ?? (entry["user_id"] as? String)
-            }
-          ),
-          onAdded: { raw in
-            onMembersAdded(raw)
-            // Pop back to Members after a successful add.
-            if !navCoordinator.path.isEmpty {
-              navCoordinator.path.removeLast()
-            }
+      // Kept for path compatibility — prefer material sheet (`showAddMembersSheet`).
+      Color.clear
+        .onAppear {
+          if !navCoordinator.path.isEmpty {
+            navCoordinator.path.removeLast()
           }
-        )
-      } else {
-        Text("Not signed in")
-          .foregroundStyle(.secondary)
-          .navigationTitle("Add Members")
-      }
+          showAddMembersSheet = true
+        }
     }
   }
 
   private func swiftUIMemberItems() -> [ChatProfileSwiftUIContentItem] {
-    var seen = Set<String>()
-    return groupMembers.compactMap { entry -> ChatProfileSwiftUIContentItem? in
-      let userId =
-        (entry["userId"] as? String)
-        ?? (entry["user_id"] as? String)
-        ?? (entry["id"] as? String)
-        ?? (entry["memberId"] as? String)
-        ?? (entry["uid"] as? String)
-      guard let userId, !userId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-        return nil
-      }
-      let key = userId.uppercased()
-      guard seen.insert(key).inserted else { return nil }
-      let rawName =
-        (entry["name"] as? String)
-        ?? (entry["displayName"] as? String)
-        ?? (entry["display_name"] as? String)
-        ?? (entry["fullName"] as? String)
-        ?? (entry["full_name"] as? String)
-        ?? (entry["username"] as? String)
-        ?? (entry["userName"] as? String)
-      let name = rawName?.trimmingCharacters(in: .whitespacesAndNewlines)
-      let rawRole =
-        (entry["role"] as? String)
-        ?? (entry["memberRole"] as? String)
-        ?? (entry["member_role"] as? String)
-        ?? (entry["participantRole"] as? String)
-        ?? ""
-      let role = rawRole.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-      let isAdmin = role == "owner" || role == "admin"
-      let roleLabel: String = {
-        switch role {
-        case "owner": return "Owner"
-        case "admin": return "Admin"
-        case "member", "subscriber": return "Member"
-        case "": return "Member"
-        default: return role.capitalized
-        }
-      }()
-      let displayName = (name?.isEmpty ?? true) ? userId : name!
-      let avatarUri =
-        (entry["avatarUri"] as? String)
-        ?? (entry["avatarURL"] as? String)
-        ?? (entry["avatarUrl"] as? String)
-        ?? (entry["avatar"] as? String)
-        ?? (entry["profileImage"] as? String)
-        ?? (entry["profile_image"] as? String)
-        ?? (entry["imageUrl"] as? String)
-        ?? (entry["image_url"] as? String)
-      let normalizedAvatar = avatarUri?
-        .trimmingCharacters(in: .whitespacesAndNewlines)
+    chatProfileMemberItems(from: groupMembers).map { item in
       let roleKey: String = {
-        switch role {
+        switch item.roleLabel.lowercased() {
         case "owner": return "owner"
         case "admin": return "admin"
         default: return "member"
         }
       }()
+      let roleRaw = roleKey == "member" ? "member" : roleKey
+      var payload: [String: Any] = [
+        "type": "groupMemberTapped",
+        "userId": item.userId,
+        "role": roleRaw,
+        "name": item.name,
+        "canManage": canManageGroupMembers,
+      ]
+      if let avatar = item.avatarUri {
+        payload["avatarUri"] = avatar
+      }
       return ChatProfileSwiftUIContentItem(
-        id: userId,
-        title: displayName,
-        subtitle: roleLabel,
-        systemImage: isAdmin ? "star.circle.fill" : "person.circle",
-        avatarUri: (normalizedAvatar?.isEmpty ?? true) ? nil : normalizedAvatar,
+        id: item.userId,
+        title: item.name,
+        subtitle: item.roleLabel,
+        systemImage: item.isAdmin ? "star.circle.fill" : "person.circle",
+        avatarUri: item.avatarUri,
         roleKey: roleKey,
-        payload: [
-          "type": "groupMemberTapped",
-          "userId": userId,
-          "role": role.isEmpty ? "member" : role,
-          "name": displayName,
-          "avatarUri": normalizedAvatar ?? "",
-          // Admin-only actions (promote/demote/remove) are gated in the host by
-          // this flag plus the actor's own role vs. the target.
-          "canManage": canManageGroupMembers,
-        ]
+        payload: payload
       )
     }
   }
+}
+
+/// Shared roster mapping (home payload → avatar-resolved member rows).
+private func chatProfileMemberItems(from raw: [[String: Any]]) -> [ChatGroupMembersViewController.MemberItem] {
+  var seen = Set<String>()
+  var out: [ChatGroupMembersViewController.MemberItem] = []
+  for entry in raw {
+    let userId =
+      (entry["userId"] as? String)
+      ?? (entry["user_id"] as? String)
+      ?? (entry["id"] as? String)
+      ?? (entry["memberId"] as? String)
+    guard let userId, !userId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      continue
+    }
+    let key = userId.uppercased()
+    guard seen.insert(key).inserted else { continue }
+    let rawName =
+      (entry["name"] as? String)
+      ?? (entry["displayName"] as? String)
+      ?? (entry["username"] as? String)
+    let trimmedName = rawName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let name = trimmedName.isEmpty ? userId : trimmedName
+    let rawRole =
+      ((entry["role"] as? String)
+        ?? (entry["memberRole"] as? String)
+        ?? (entry["member_role"] as? String)
+        ?? "member")
+      .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    let roleLabel: String
+    switch rawRole {
+    case "owner": roleLabel = "Owner"
+    case "admin": roleLabel = "Admin"
+    case "member", "subscriber", "": roleLabel = "Member"
+    default: roleLabel = rawRole.capitalized
+    }
+    let rawAvatar =
+      (entry["avatarUrl"] as? String)
+      ?? (entry["avatar_url"] as? String)
+      ?? (entry["avatarUri"] as? String)
+      ?? (entry["profileImage"] as? String)
+      ?? (entry["profile_image"] as? String)
+      ?? (entry["imageUrl"] as? String)
+    let trimmedAvatar = rawAvatar?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let resolved = ChatAvatarURLResolver.resolve(
+      rawAvatar: (trimmedAvatar?.isEmpty ?? true) ? nil : trimmedAvatar,
+      peerUserId: userId,
+      chatId: nil,
+      preferPushAvatar: true,
+      isAgent: false,
+      agentId: nil,
+      displayName: name
+    )
+    out.append(
+      .init(
+        userId: userId,
+        name: name,
+        roleLabel: roleLabel,
+        isAdmin: rawRole == "owner" || rawRole == "admin",
+        avatarUri: resolved
+      )
+    )
+  }
+  return out
 }
 
 /// Members destination: role-grouped plain List (home/New Chat style).
@@ -2420,41 +2871,9 @@ private struct ChatProfileMembersListView: View {
     AppThemePalette.resolve(for: colorScheme)
   }
 
-  private var owners: [ChatProfileSwiftUIContentItem] {
-    items.filter { $0.roleKey == "owner" }
-  }
-  private var admins: [ChatProfileSwiftUIContentItem] {
-    items.filter { $0.roleKey == "admin" }
-  }
-  private var membersOnly: [ChatProfileSwiftUIContentItem] {
-    items.filter { $0.roleKey != "owner" && $0.roleKey != "admin" }
-  }
-
   var body: some View {
     List {
-      if canAddMembers {
-        Section {
-          Button(action: onAddMembers) {
-            HStack(spacing: 16) {
-              Image(systemName: "person.badge.plus")
-                .font(.system(size: 20, weight: .regular))
-                .foregroundStyle(palette.accent)
-                .frame(width: 32, height: 32)
-              Text("Add Members")
-                .font(.system(size: 17, weight: .regular))
-                .foregroundStyle(palette.accent)
-              Spacer(minLength: 8)
-            }
-            .padding(.vertical, 4)
-            .contentShape(Rectangle())
-          }
-          .buttonStyle(.plain)
-          .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
-          .listRowBackground(Color.clear)
-        }
-      }
-
-      if items.isEmpty {
+      if cleanedItems.isEmpty {
         Section {
           Text("No members yet")
             .font(.system(size: 15))
@@ -2478,12 +2897,17 @@ private struct ChatProfileMembersListView: View {
     }
     .listStyle(.plain)
     .scrollContentBackground(.hidden)
-    .background(palette.background.ignoresSafeArea())
+    .background {
+      Rectangle()
+        .fill(.ultraThinMaterial)
+        .ignoresSafeArea()
+    }
     .navigationTitle(title)
     .navigationBarTitleDisplayMode(.inline)
     .navigationBarBackButtonHidden(false)
-    .toolbarBackground(.hidden, for: .navigationBar)
+    .toolbarBackground(.automatic, for: .navigationBar)
     .toolbar {
+      // Add lives only in trailing nav — not a list tab.
       if canAddMembers {
         ToolbarItem(placement: .topBarTrailing) {
           Button(action: onAddMembers) {
@@ -2495,22 +2919,62 @@ private struct ChatProfileMembersListView: View {
     }
   }
 
+  /// Drop rows with no usable display name (junk / unhydrated).
+  private var cleanedItems: [ChatProfileSwiftUIContentItem] {
+    items.filter {
+      !$0.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        && !$0.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+  }
+
+  private var owners: [ChatProfileSwiftUIContentItem] {
+    cleanedItems.filter { $0.roleKey == "owner" }
+  }
+  private var admins: [ChatProfileSwiftUIContentItem] {
+    cleanedItems.filter { $0.roleKey == "admin" }
+  }
+  private var membersOnly: [ChatProfileSwiftUIContentItem] {
+    cleanedItems.filter { $0.roleKey != "owner" && $0.roleKey != "admin" }
+  }
+
   @ViewBuilder
   private func plainSection(title: String, rows: [ChatProfileSwiftUIContentItem]) -> some View {
     Section(title) {
       ForEach(rows, id: \.id) { item in
-        Button {
-          onContentPressed(item.payload)
-        } label: {
-          ChatProfileMemberHomeStyleRow(item: item, palette: palette)
-        }
-        .buttonStyle(.plain)
-        .listRowInsets(EdgeInsets(top: 0, leading: 16, bottom: 0, trailing: 16))
-        .listRowBackground(Color.clear)
-        .listRowSeparatorTint(palette.border)
+        // Hold only — no tap popup, no swipe. Context menu owns admin actions.
+        ChatProfileMemberHomeStyleRow(item: item, palette: palette)
+          .contentShape(Rectangle())
+          .contextMenu {
+            if canAddMembers, item.roleKey != "owner" {
+              Button("Manage", systemImage: "person.crop.circle.badge.checkmark") {
+                onContentPressed(item.payload)
+              }
+              if item.roleKey == "member" {
+                Button("Promote to Admin", systemImage: "arrow.up.circle") {
+                  var p = item.payload
+                  p["action"] = "promote"
+                  onContentPressed(p)
+                }
+              }
+              if item.roleKey == "admin" {
+                Button("Demote to Member", systemImage: "arrow.down.circle") {
+                  var p = item.payload
+                  p["action"] = "demote"
+                  onContentPressed(p)
+                }
+              }
+              Button("Remove from Group", systemImage: "person.badge.minus", role: .destructive) {
+                var p = item.payload
+                p["action"] = "remove"
+                onContentPressed(p)
+              }
+            }
+          }
+          .listRowInsets(EdgeInsets(top: 0, leading: 28, bottom: 0, trailing: 28))
+          .listRowBackground(Color.clear)
+          .listRowSeparatorTint(palette.border)
       }
     }
-    .listRowSeparatorTint(palette.border)
   }
 }
 
@@ -2555,6 +3019,7 @@ private struct ChatProfileMemberHomeStyleRow: View {
           Image(uiImage: image)
             .resizable()
             .scaledToFill()
+            .transition(.opacity)
         } else {
           Text(fallbackGlyph)
             .font(.system(size: 18, weight: .bold))
@@ -2563,6 +3028,7 @@ private struct ChatProfileMemberHomeStyleRow: View {
       }
       .frame(width: 56, height: 56)
       .clipShape(Circle())
+      .animation(.easeInOut(duration: 0.22), value: image != nil)
 
       VStack(alignment: .leading, spacing: 3) {
         Text(item.title)
@@ -2586,7 +3052,7 @@ private struct ChatProfileMemberHomeStyleRow: View {
     .padding(.vertical, 12)
     .frame(minHeight: 76)
     .contentShape(Rectangle())
-    .task(id: item.avatarUri ?? "") {
+    .task(id: item.avatarUri ?? item.id) {
       await loadAvatar()
     }
   }
@@ -2595,19 +3061,26 @@ private struct ChatProfileMemberHomeStyleRow: View {
   private func loadAvatar() async {
     let raw = item.avatarUri?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     guard !raw.isEmpty else {
+      // Keep image if any; only clear when no URL.
+      if image != nil { return }
       image = nil
       loadedUri = nil
       return
     }
-    if loadedUri == raw, image != nil { return }
-    loadedUri = raw
     if let cached = ChatAvatarImageStore.cached(for: raw) {
-      image = cached
+      withAnimation(.easeInOut(duration: 0.18)) { image = cached }
+      loadedUri = raw
       return
     }
+    // Keep previous photo while fetching (no initials flash).
     let loaded = await ChatAvatarImageStore.load(from: raw)
-    guard !Task.isCancelled, loadedUri == raw else { return }
-    image = loaded
+    guard !Task.isCancelled else { return }
+    let current = item.avatarUri?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard current == raw else { return }
+    if let loaded {
+      withAnimation(.easeInOut(duration: 0.22)) { image = loaded }
+      loadedUri = raw
+    }
   }
 }
 
@@ -2718,7 +3191,7 @@ private struct ChatProfilePageReflection: View {
     }
     guard let normalized else { return }
     loadedUri = normalized
-    let loaded = await ChatAvatarImageStore.load(from: normalized)
+    let loaded = await ChatAvatarImageStore.loadHero(from: normalized)
     guard !Task.isCancelled else { return }
     withAnimation(.easeOut(duration: 0.22)) {
       image = loaded
@@ -2730,7 +3203,10 @@ private struct ChatProfilePageReflection: View {
 
 /// Media-only pinned morph. Name + actions live in ScrollView (higher z).
 /// No title overlays, no action overlays, no separate Material blur layer.
-private struct ChatProfileAvatarMorphView: View, Animatable {
+///
+/// IMPORTANT: not `Animatable` — parent already animates `expand` with
+/// `withAnimation`. Dual drivers desynced spacer vs media by 1–2px.
+private struct ChatProfileAvatarMorphView: View {
   let text: String
   let fontStyleID: String?
   let imageUri: String?
@@ -2742,14 +3218,13 @@ private struct ChatProfileAvatarMorphView: View, Animatable {
   /// Extra height when pulling down in committed hero (realtime stretch).
   var overscrollStretch: CGFloat = 0
   var topAir: CGFloat = 90
+  /// Scroll-collapse blend (collapsed circle only).
+  var scrollScale: CGFloat = 1
+  var scrollBlur: CGFloat = 0
+  var scrollOpacity: CGFloat = 1
 
   @State private var image: UIImage?
   @State private var loadedUri: String?
-
-  var animatableData: CGFloat {
-    get { expand }
-    set { expand = newValue }
-  }
 
   init(
     text: String,
@@ -2760,7 +3235,10 @@ private struct ChatProfileAvatarMorphView: View, Animatable {
     heroBaseHeight: CGFloat,
     expand: CGFloat = 0,
     overscrollStretch: CGFloat = 0,
-    topAir: CGFloat = 90
+    topAir: CGFloat = 90,
+    scrollScale: CGFloat = 1,
+    scrollBlur: CGFloat = 0,
+    scrollOpacity: CGFloat = 1
   ) {
     self.text = text
     self.fontStyleID = fontStyleID
@@ -2771,6 +3249,9 @@ private struct ChatProfileAvatarMorphView: View, Animatable {
     self.expand = expand
     self.overscrollStretch = overscrollStretch
     self.topAir = topAir
+    self.scrollScale = scrollScale
+    self.scrollBlur = scrollBlur
+    self.scrollOpacity = scrollOpacity
     let normalized = imageUri?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
     let primed = normalized.flatMap { ChatAvatarImageStore.cached(for: $0) }
     _image = State(initialValue: primed)
@@ -2781,16 +3262,21 @@ private struct ChatProfileAvatarMorphView: View, Animatable {
 
   private var circleSize: CGFloat { 120 }
 
+  private static func pixelRound(_ value: CGFloat) -> CGFloat {
+    let scale = UIScreen.main.scale
+    return (value * scale).rounded() / scale
+  }
+
   private var bandHeight: CGFloat {
-    collapsedHeight + (heroBaseHeight - collapsedHeight) * p + overscrollStretch
+    Self.pixelRound(collapsedHeight + (heroBaseHeight - collapsedHeight) * p + overscrollStretch)
   }
 
   private var mediaW: CGFloat {
-    circleSize + (width - circleSize) * p
+    Self.pixelRound(circleSize + (width - circleSize) * p)
   }
 
   private var mediaH: CGFloat {
-    circleSize + (heroBaseHeight - circleSize) * p + overscrollStretch
+    Self.pixelRound(circleSize + (heroBaseHeight - circleSize) * p + overscrollStretch)
   }
 
   private var mediaCorner: CGFloat {
@@ -2798,22 +3284,36 @@ private struct ChatProfileAvatarMorphView: View, Animatable {
   }
 
   private var mediaTop: CGFloat {
-    topAir * (1 - p)
+    Self.pixelRound(topAir * (1 - p))
   }
 
-  private var mediaCenterY: CGFloat {
-    mediaTop + mediaH * 0.5
+  /// Bell-curve blur peaking mid-morph, zero at BOTH rest states (circle avatar
+  /// and full hero) — masks residual size/position motion during the circle<->hero
+  /// transition itself (shared 10pt peak with the Settings hero's same formula).
+  private var transitionBlur: CGFloat {
+    10 * sin(.pi * p)
   }
 
   var body: some View {
     let shape = RoundedRectangle(cornerRadius: mediaCorner, style: .continuous)
+    // Scroll blend only while collapsed (p≈0); gated by (1-p).
+    let collapseBlend = 1 - p
+    let s = 1 + (scrollScale - 1) * collapseBlend
+    let b = scrollBlur * collapseBlend
+    let o = 1 + (scrollOpacity - 1) * collapseBlend
 
+    // Linear shared p only — no topAttach/sizeGrow (those made expand worse).
     return mediaBody
       .frame(width: mediaW, height: mediaH)
       .clipShape(shape)
-      .position(x: width * 0.5, y: mediaCenterY)
+      .scaleEffect(s, anchor: .top)
+      .blur(radius: b + transitionBlur)
+      .opacity(Double(o))
+      .frame(width: width, alignment: .center)
+      .padding(.top, mediaTop)
       .frame(width: width, height: bandHeight, alignment: .top)
       .clipped()
+      .animation(nil, value: scrollScale)
       .task(id: normalizedUri ?? "") { await loadImage() }
   }
 
@@ -2860,7 +3360,8 @@ private struct ChatProfileAvatarMorphView: View, Animatable {
       return
     }
     loadedUri = normalized
-    let loaded = await ChatAvatarImageStore.load(from: normalized)
+    // Hero-quality decode (list cells keep 384; banner needs more pixels).
+    let loaded = await ChatAvatarImageStore.loadHero(from: normalized)
     guard !Task.isCancelled else { return }
     image = loaded
   }
@@ -3608,6 +4109,8 @@ private struct ChatProfileSwiftUISection<Content: View>: View {
 private struct ChatProfileSwiftUIRow: View {
   let title: String
   var subtitle: String = ""
+  /// Value on the trailing edge (e.g. model name) — preferred over subtitle under title.
+  var trailingText: String? = nil
   var leading: AnyView? = nil
   var trailingSystemImage: String?
   var showsChevron: Bool = false
@@ -3628,7 +4131,7 @@ private struct ChatProfileSwiftUIRow: View {
           .lineLimit(1)
           .minimumScaleFactor(0.76)
 
-        if !subtitle.isEmpty {
+        if !subtitle.isEmpty, trailingText == nil {
           Text(subtitle)
             .font(.system(size: 13, weight: .regular))
             .foregroundStyle(.secondary)
@@ -3639,10 +4142,19 @@ private struct ChatProfileSwiftUIRow: View {
 
       Spacer(minLength: 12)
 
+      if let trailingText, !trailingText.isEmpty {
+        Text(trailingText)
+          .font(.system(size: 15, weight: .regular))
+          .foregroundStyle(.secondary)
+          .lineLimit(1)
+          .minimumScaleFactor(0.78)
+          .multilineTextAlignment(.trailing)
+      }
+
       if let trailingSystemImage {
         Image(systemName: trailingSystemImage)
-          .font(.system(size: 17, weight: .semibold))
-          .foregroundStyle(.secondary)
+          .font(.system(size: 13, weight: .semibold))
+          .foregroundStyle(.secondary.opacity(0.85))
       }
 
       if showsChevron {
@@ -3651,16 +4163,16 @@ private struct ChatProfileSwiftUIRow: View {
           .foregroundStyle(Color.secondary.opacity(0.8))
       }
     }
-    .padding(.horizontal, 18)
-    .padding(.vertical, subtitle.isEmpty ? 13 : 11)
-    .frame(maxWidth: .infinity, minHeight: subtitle.isEmpty ? 48 : 62, alignment: .center)
+    .padding(.horizontal, 22)
+    .padding(.vertical, (subtitle.isEmpty && trailingText == nil) ? 14 : 13)
+    .frame(maxWidth: .infinity, minHeight: (subtitle.isEmpty && trailingText == nil) ? 52 : 58, alignment: .center)
     .contentShape(Rectangle())
     .overlay(alignment: .bottom) {
       if !isLast {
         Rectangle()
           .fill(separatorColor)
           .frame(height: 1 / UIScreen.main.scale)
-          .padding(.leading, 18)
+          .padding(.leading, 22)
       }
     }
   }
@@ -5043,41 +5555,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       ?? topMostViewController()?.navigationController?.topViewController
       as? ChatGroupMembersViewController
     else { return }
-    let items: [ChatGroupMembersViewController.MemberItem] = groupMembers.compactMap { entry in
-      let userId =
-        (entry["userId"] as? String)
-        ?? (entry["user_id"] as? String)
-        ?? (entry["id"] as? String)
-        ?? (entry["memberId"] as? String)
-      guard let userId, !userId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-        return nil
-      }
-      let rawName =
-        (entry["name"] as? String)
-        ?? (entry["displayName"] as? String)
-        ?? (entry["username"] as? String)
-      let name = (rawName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
-        ? rawName!.trimmingCharacters(in: .whitespacesAndNewlines)
-        : userId
-      let rawRole =
-        ((entry["role"] as? String)
-          ?? (entry["memberRole"] as? String)
-          ?? "member")
-        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-      let roleLabel: String = {
-        switch rawRole {
-        case "owner": return "Owner"
-        case "admin": return "Admin"
-        default: return "Member"
-        }
-      }()
-      return .init(
-        userId: userId,
-        name: name,
-        roleLabel: roleLabel,
-        isAdmin: rawRole == "owner" || rawRole == "admin"
-      )
-    }
+    let items = chatProfileMemberItems(from: groupMembers)
     NSLog(
       "[WhoAmI] MembersUIKit.reloadVisible count=%d chatId=%@",
       items.count,
@@ -5520,51 +5998,14 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       refreshGroupMembersFromHome(reason: "openMembersUIKit")
     }
 
-    let items: [ChatGroupMembersViewController.MemberItem] = groupMembers.compactMap { entry in
-      let userId =
-        (entry["userId"] as? String)
-        ?? (entry["user_id"] as? String)
-        ?? (entry["id"] as? String)
-        ?? (entry["memberId"] as? String)
-      guard let userId, !userId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-        return nil
-      }
-      let rawName =
-        (entry["name"] as? String)
-        ?? (entry["displayName"] as? String)
-        ?? (entry["username"] as? String)
-      let name = (rawName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
-        ? rawName!.trimmingCharacters(in: .whitespacesAndNewlines)
-        : userId
-      let rawRole =
-        ((entry["role"] as? String)
-          ?? (entry["memberRole"] as? String)
-          ?? (entry["member_role"] as? String)
-          ?? "member")
-        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-      let roleLabel: String = {
-        switch rawRole {
-        case "owner": return "Owner"
-        case "admin": return "Admin"
-        case "member", "subscriber", "": return "Member"
-        default: return rawRole.capitalized
-        }
-      }()
-      let isAdmin = rawRole == "owner" || rawRole == "admin"
-      return ChatGroupMembersViewController.MemberItem(
-        userId: userId,
-        name: name,
-        roleLabel: roleLabel,
-        isAdmin: isAdmin
-      )
-    }
+    let items = chatProfileMemberItems(from: groupMembers)
 
     let controller = ChatGroupMembersViewController()
     controller.chatId = engineChatId
     controller.members = items
     controller.canAddMembers = canManageGroupMembers
     controller.onAddMembers = { [weak self] in
-      self?.presentAddGroupMembersSheet()
+      self?.pushAddGroupMembersPicker()
     }
     controller.onMemberSelected = { [weak self] item in
       self?.onNativeEvent([
@@ -5572,7 +6013,38 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
         "userId": item.userId,
         "role": item.roleLabel.lowercased(),
         "name": item.name,
+        "avatarUri": item.avatarUri ?? "",
         "canManage": self?.canManageGroupMembers ?? false,
+      ])
+    }
+    controller.onPromote = { [weak self] item in
+      self?.onNativeEvent([
+        "type": "groupMemberTapped",
+        "userId": item.userId,
+        "role": "member",
+        "name": item.name,
+        "action": "promote",
+        "canManage": true,
+      ])
+    }
+    controller.onDemote = { [weak self] item in
+      self?.onNativeEvent([
+        "type": "groupMemberTapped",
+        "userId": item.userId,
+        "role": "admin",
+        "name": item.name,
+        "action": "demote",
+        "canManage": true,
+      ])
+    }
+    controller.onRemove = { [weak self] item in
+      self?.onNativeEvent([
+        "type": "groupMemberTapped",
+        "userId": item.userId,
+        "role": item.roleLabel.lowercased(),
+        "name": item.name,
+        "action": "remove",
+        "canManage": true,
       ])
     }
 
@@ -5582,14 +6054,18 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     }
     if let nav = presenter.navigationController {
       nav.pushViewController(controller, animated: true)
+    } else if let nav = (presenter as? UINavigationController) {
+      nav.pushViewController(controller, animated: true)
     } else {
+      // Last resort: wrap in nav and present full screen (still not a sheet picker).
       let navigation = UINavigationController(rootViewController: controller)
-      navigation.modalPresentationStyle = .pageSheet
+      navigation.modalPresentationStyle = .fullScreen
       presenter.present(navigation, animated: true)
     }
   }
 
-  private func presentAddGroupMembersSheet() {
+  /// Material pageSheet for add-members (same family as Edit Group / Vibe sheets).
+  private func pushAddGroupMembersPicker() {
     guard let config = AppSessionConfig.current else { return }
     guard let presenter = topMostViewController() else { return }
     let excluded = Set(
@@ -5606,17 +6082,29 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       excludedUserIds: excluded,
       onAdded: { [weak self] added in
         guard let self else { return }
-        let existingIds = Set(self.groupMembers.compactMap { $0["userId"] as? String })
+        let existingIds = Set(
+          self.groupMembers.compactMap {
+            ($0["userId"] as? String) ?? ($0["user_id"] as? String) ?? ($0["id"] as? String)
+          }
+        )
         let newOnes = added.filter { entry in
           guard let uid = entry["userId"] as? String else { return false }
           return !existingIds.contains(uid)
         }
-        guard !newOnes.isEmpty else { return }
-        self.setGroupMembers(self.groupMembers + newOnes)
+        if !newOnes.isEmpty {
+          self.setGroupMembers(self.groupMembers + newOnes)
+        }
       }
     )
     let host = UIHostingController(rootView: sheet)
+    // Clear host so system pageSheet glass refracts the profile (chat progress/ask style).
+    host.view.backgroundColor = .clear
     host.modalPresentationStyle = .pageSheet
+    if let sheetCtrl = host.sheetPresentationController {
+      sheetCtrl.detents = [.medium(), .large()]
+      sheetCtrl.prefersGrabberVisible = true
+      sheetCtrl.preferredCornerRadius = 22
+    }
     presenter.present(host, animated: true)
   }
 
@@ -7345,12 +7833,16 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
 
     let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !chatId.isEmpty else { return }
+    guard let presenter = topMostViewController() else { return }
 
-    let controller = ChatAgentConfigViewController()
-    controller.chatId = chatId
-    controller.agentConfig = agentConfig
-    controller.documents = getAgentDocuments()
-    controller.onSave = { [weak self] config in
+    // pageSheet + NavigationStack (same API as AgentBridgeHistorySheet / connect sheets).
+    // Root is a summary list; prompt/tools/docs push inside the sheet.
+    let model = GroupAgentConfigModel(
+      chatId: chatId,
+      config: agentConfig,
+      documents: getAgentDocuments()
+    )
+    model.onSave = { [weak self] config in
       guard let self else { return }
       let normalized = self.normalizedAgentConfig(config, fallbackChatId: chatId) ?? config
       ChatEngine.shared.saveAgentConfig(chatId: chatId, config: normalized) { [weak self] success in
@@ -7358,29 +7850,41 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
         if success {
           self.agentConfig = normalized
           self.tableView.reloadData()
+          self.renderSwiftUIProfile()
         }
       }
     }
-
-    controller.onDelete = { [weak self] in
+    model.onDelete = { [weak self] in
       guard let self else { return }
       ChatEngine.shared.deleteAgentConfig(chatId: chatId) { [weak self] success in
         guard let self else { return }
         if success {
           self.agentConfig = nil
           self.tableView.reloadData()
+          self.renderSwiftUIProfile()
         }
       }
     }
 
-    if let presenter = topMostViewController() {
-      if let nav = presenter.navigationController {
-        nav.pushViewController(controller, animated: true)
-      } else {
-        let navigation = UINavigationController(rootViewController: controller)
-        presenter.present(navigation, animated: true)
-      }
+    let isDark = traitCollection.userInterfaceStyle == .dark
+    let host = UIHostingController(
+      rootView: GroupAgentConfigSheet(model: model)
+        .preferredColorScheme(isDark ? .dark : .light)
+    )
+    // Clear host so pageSheet Liquid Glass refracts the profile (same as
+    // VibeAgentAskSheet / progress detail sheets — no solid opaque backing).
+    host.view.backgroundColor = .clear
+    host.modalPresentationStyle = .pageSheet
+    if let sheet = host.sheetPresentationController {
+      sheet.detents = [
+        .medium(),
+        .large(),
+      ]
+      sheet.selectedDetentIdentifier = .medium
+      sheet.prefersGrabberVisible = true
+      sheet.preferredCornerRadius = 22
     }
+    presenter.present(host, animated: true)
 
     onNativeEvent(["type": "headerAgentPressed"])
   }

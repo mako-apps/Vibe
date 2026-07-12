@@ -822,3 +822,439 @@ struct ChatAgentVoiceSettingsView: View {
         .toolbarBackground(.hidden, for: .navigationBar)
     }
 }
+
+// MARK: - Group VoIP / AI agent configuration sheet
+// Presented as a pageSheet (same API as AgentBridgeHistorySheet / connect sheets):
+// summary root + inner NavigationLink pushes — not one long full-screen form.
+
+final class GroupAgentConfigModel: ObservableObject {
+  let chatId: String
+  let existingId: Any?
+  let documents: [(id: String, name: String, url: String)]
+
+  @Published var name: String
+  @Published var systemPrompt: String
+  @Published var enabled: Bool
+  @Published var enabledTools: Set<String>
+  @Published var generateInput: String = ""
+  @Published var isGenerating = false
+  @Published var errorMessage: String?
+
+  var onSave: (([String: Any]) -> Void)?
+  var onDelete: (() -> Void)?
+
+  static let toolOptions: [(id: String, title: String, subtitle: String)] = [
+    ("search_google", "Web Search", "Search Google for up-to-date results"),
+    ("analyze_image", "Image Analysis", "Understand images and OCR text"),
+    ("analyze_document", "Document Analysis", "Read and summarize document files"),
+    ("create_document", "Create Document", "Generate formatted document drafts"),
+  ]
+
+  init(
+    chatId: String,
+    config: [String: Any]?,
+    documents: [(id: String, name: String, url: String)] = []
+  ) {
+    self.chatId = chatId
+    self.existingId = config?["id"]
+    self.documents = documents
+    self.name = (config?["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let snake = (config?["system_prompt"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let camel = (config?["systemPrompt"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    self.systemPrompt = snake.isEmpty ? camel : snake
+    if let raw = config?["enabled"] as? Bool {
+      self.enabled = raw
+    } else if let n = config?["enabled"] as? NSNumber {
+      self.enabled = n.boolValue
+    } else {
+      self.enabled = true
+    }
+    let tools =
+      Self.parseTools(config?["enabled_tools"])
+      ?? Self.parseTools(config?["enabledTools"])
+      ?? ["search_google", "analyze_image", "analyze_document", "create_document"]
+    self.enabledTools = Set(tools)
+  }
+
+  var isExisting: Bool { existingId != nil }
+
+  var promptSummary: String {
+    let p = systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+    return p.isEmpty ? "Not set" : p
+  }
+
+  var toolsSummary: String {
+    switch enabledTools.count {
+    case 0: return "None"
+    case 1: return "1 tool"
+    default: return "\(enabledTools.count) tools"
+    }
+  }
+
+  func buildConfig() -> [String: Any]? {
+    let prompt = systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !prompt.isEmpty else {
+      errorMessage = "System prompt is required."
+      return nil
+    }
+    guard !enabledTools.isEmpty else {
+      errorMessage = "Enable at least one tool."
+      return nil
+    }
+    errorMessage = nil
+    let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+    var config: [String: Any] = [
+      "chat_id": chatId,
+      "name": trimmedName.isEmpty ? "Vibe AI" : trimmedName,
+      "system_prompt": prompt,
+      "enabled": enabled,
+      "enabled_tools": Array(enabledTools).sorted(),
+    ]
+    if let existingId {
+      config["id"] = existingId
+    }
+    return config
+  }
+
+  func generatePrompt(completion: @escaping (Bool) -> Void) {
+    let input = generateInput.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !input.isEmpty else {
+      errorMessage = "Describe the agent first."
+      completion(false)
+      return
+    }
+    guard !enabledTools.isEmpty else {
+      errorMessage = "Enable at least one tool before generating."
+      completion(false)
+      return
+    }
+    isGenerating = true
+    errorMessage = nil
+    ChatEngine.shared.generateAgentPrompt(
+      chatId: chatId,
+      input: input,
+      enabledTools: Array(enabledTools)
+    ) { [weak self] payload in
+      DispatchQueue.main.async {
+        guard let self else { return }
+        self.isGenerating = false
+        let generated =
+          (payload?["systemPrompt"] as? String)?
+          .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !generated.isEmpty else {
+          self.errorMessage = "Could not generate a prompt. Try adjusting your input."
+          completion(false)
+          return
+        }
+        self.systemPrompt = generated
+        completion(true)
+      }
+    }
+  }
+
+  private static func parseTools(_ raw: Any?) -> [String]? {
+    guard let list = raw as? [Any] else { return nil }
+    let out = list.compactMap { item -> String? in
+      if let s = item as? String {
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.isEmpty ? nil : t
+      }
+      if let n = item as? NSNumber { return n.stringValue }
+      return nil
+    }
+    return out.isEmpty ? nil : out
+  }
+}
+
+/// Clean pageSheet for group agent config — summary + inner pushes.
+struct GroupAgentConfigSheet: View {
+  @StateObject var model: GroupAgentConfigModel
+  @Environment(\.dismiss) private var dismiss
+  @Environment(\.colorScheme) private var colorScheme
+  @State private var showDeleteConfirm = false
+
+  private var palette: AppThemePalette { AppThemePalette.resolve(for: colorScheme) }
+  /// Soft elevated row over glass — mirrors ask/progress sheet `neutralFill`.
+  private var rowFill: Color {
+    colorScheme == .dark ? Color.white.opacity(0.10) : Color.black.opacity(0.05)
+  }
+  private var accentTint: Color { palette.text }
+
+  var body: some View {
+    NavigationStack {
+      List {
+        Section {
+          HStack {
+            Text("Name")
+              .font(.system(size: 16, weight: .regular))
+              .foregroundStyle(palette.text)
+            Spacer(minLength: 12)
+            TextField("Vibe AI", text: $model.name)
+              .multilineTextAlignment(.trailing)
+              .foregroundStyle(palette.secondaryText)
+          }
+          .listRowInsets(EdgeInsets(top: 14, leading: 20, bottom: 14, trailing: 20))
+          .listRowBackground(rowFill)
+
+          Toggle("Agent Enabled", isOn: $model.enabled)
+            .listRowInsets(EdgeInsets(top: 14, leading: 20, bottom: 14, trailing: 20))
+            .listRowBackground(rowFill)
+        } header: {
+          Text("Agent")
+            .font(.system(size: 13, weight: .semibold))
+            .textCase(.uppercase)
+            .foregroundStyle(palette.secondaryText)
+        } footer: {
+          Text("When enabled, the agent can participate in this group chat.")
+            .foregroundStyle(palette.secondaryText)
+        }
+
+        Section {
+          NavigationLink {
+            GroupAgentPromptEditor(model: model)
+          } label: {
+            configRow(title: "System Prompt", value: model.promptSummary)
+          }
+          .listRowInsets(EdgeInsets(top: 14, leading: 20, bottom: 14, trailing: 20))
+          .listRowBackground(rowFill)
+
+          NavigationLink {
+            GroupAgentToolsEditor(model: model)
+          } label: {
+            configRow(title: "Tools", value: model.toolsSummary)
+          }
+          .listRowInsets(EdgeInsets(top: 14, leading: 20, bottom: 14, trailing: 20))
+          .listRowBackground(rowFill)
+
+          if !model.documents.isEmpty {
+            NavigationLink {
+              GroupAgentDocumentsView(documents: model.documents)
+            } label: {
+              configRow(title: "Documents", value: "\(model.documents.count)")
+            }
+            .listRowInsets(EdgeInsets(top: 14, leading: 20, bottom: 14, trailing: 20))
+            .listRowBackground(rowFill)
+          }
+        } header: {
+          Text("Configuration")
+            .font(.system(size: 13, weight: .semibold))
+            .textCase(.uppercase)
+            .foregroundStyle(palette.secondaryText)
+        }
+
+        if model.isExisting {
+          Section {
+            Button("Remove Agent", role: .destructive) {
+              showDeleteConfirm = true
+            }
+            .listRowInsets(EdgeInsets(top: 14, leading: 20, bottom: 14, trailing: 20))
+            .listRowBackground(rowFill)
+          }
+        }
+
+        if let errorMessage = model.errorMessage {
+          Section {
+            Text(errorMessage)
+              .font(.system(size: 13))
+              .foregroundStyle(.red)
+              .listRowBackground(rowFill)
+          }
+        }
+      }
+      .listStyle(.insetGrouped)
+      // Glass sheet body like chat progress/ask sheets — no solid fill.
+      .scrollContentBackground(.hidden)
+      .background(Color.clear)
+      .navigationTitle("Vibe AI")
+      .navigationBarTitleDisplayMode(.inline)
+      .toolbarBackground(.hidden, for: .navigationBar)
+      .tint(accentTint)
+      .toolbar {
+        ToolbarItem(placement: .topBarLeading) {
+          Button {
+            dismiss()
+          } label: {
+            Image(systemName: "xmark")
+              .font(.system(size: 15, weight: .semibold))
+          }
+        }
+        ToolbarItem(placement: .topBarTrailing) {
+          Button(model.isExisting ? "Save" : "Create") {
+            guard let config = model.buildConfig() else { return }
+            model.onSave?(config)
+            dismiss()
+          }
+          .fontWeight(.semibold)
+        }
+      }
+      .confirmationDialog(
+        "Remove AI Agent",
+        isPresented: $showDeleteConfirm,
+        titleVisibility: .visible
+      ) {
+        Button("Remove", role: .destructive) {
+          model.onDelete?()
+          dismiss()
+        }
+        Button("Cancel", role: .cancel) {}
+      } message: {
+        Text("This removes the agent and clears its memory. This cannot be undone.")
+      }
+    }
+    .presentationDetents([.medium, .large])
+    .presentationDragIndicator(.visible)
+    // Let the system pageSheet Liquid Glass show through (same as ask/progress sheets).
+    .presentationBackground(.clear)
+  }
+
+  @ViewBuilder
+  private func configRow(title: String, value: String) -> some View {
+    HStack(spacing: 12) {
+      Text(title)
+        .font(.system(size: 16, weight: .regular))
+        .foregroundStyle(palette.text)
+      Spacer(minLength: 12)
+      Text(value)
+        .font(.system(size: 15, weight: .regular))
+        .foregroundStyle(palette.secondaryText)
+        .lineLimit(1)
+    }
+  }
+}
+
+private struct GroupAgentPromptEditor: View {
+  @ObservedObject var model: GroupAgentConfigModel
+  @Environment(\.colorScheme) private var colorScheme
+
+  private var rowFill: Color {
+    colorScheme == .dark ? Color.white.opacity(0.10) : Color.black.opacity(0.05)
+  }
+
+  var body: some View {
+    Form {
+      Section {
+        TextField("e.g. Helpful PM for sprint planning", text: $model.generateInput)
+          .listRowBackground(rowFill)
+        Button {
+          model.generatePrompt { _ in }
+        } label: {
+          HStack {
+            if model.isGenerating {
+              ProgressView().controlSize(.small)
+            }
+            Text(model.isGenerating ? "Generating…" : "Generate from input")
+          }
+        }
+        .disabled(model.isGenerating)
+        .listRowBackground(rowFill)
+      } header: {
+        Text("Generate")
+      } footer: {
+        Text("Optional: describe the agent, then generate a system prompt.")
+      }
+
+      Section {
+        TextEditor(text: $model.systemPrompt)
+          .frame(minHeight: 220)
+          .listRowBackground(rowFill)
+      } header: {
+        Text("System Prompt")
+      } footer: {
+        Text("Describe how this agent should behave in the group.")
+      }
+    }
+    .scrollContentBackground(.hidden)
+    .background(Color.clear)
+    .navigationTitle("System Prompt")
+    .navigationBarTitleDisplayMode(.inline)
+    .toolbarBackground(.hidden, for: .navigationBar)
+  }
+}
+
+private struct GroupAgentToolsEditor: View {
+  @ObservedObject var model: GroupAgentConfigModel
+  @Environment(\.colorScheme) private var colorScheme
+
+  private var rowFill: Color {
+    colorScheme == .dark ? Color.white.opacity(0.10) : Color.black.opacity(0.05)
+  }
+
+  var body: some View {
+    List {
+      Section {
+        ForEach(GroupAgentConfigModel.toolOptions, id: \.id) { option in
+          Toggle(isOn: Binding(
+            get: { model.enabledTools.contains(option.id) },
+            set: { on in
+              if on {
+                model.enabledTools.insert(option.id)
+              } else {
+                model.enabledTools.remove(option.id)
+              }
+            }
+          )) {
+            VStack(alignment: .leading, spacing: 2) {
+              Text(option.title)
+              Text(option.subtitle)
+                .font(.system(size: 13))
+                .foregroundStyle(.secondary)
+            }
+          }
+          .listRowBackground(rowFill)
+        }
+      } header: {
+        Text("Enabled Tools")
+      } footer: {
+        Text("At least one tool is required.")
+      }
+    }
+    .scrollContentBackground(.hidden)
+    .background(Color.clear)
+    .navigationTitle("Tools")
+    .navigationBarTitleDisplayMode(.inline)
+    .toolbarBackground(.hidden, for: .navigationBar)
+  }
+}
+
+private struct GroupAgentDocumentsView: View {
+  let documents: [(id: String, name: String, url: String)]
+  @Environment(\.colorScheme) private var colorScheme
+
+  private var rowFill: Color {
+    colorScheme == .dark ? Color.white.opacity(0.10) : Color.black.opacity(0.05)
+  }
+
+  var body: some View {
+    List {
+      Section {
+        ForEach(documents, id: \.id) { doc in
+          Button {
+            let cleaned = doc.url.replacingOccurrences(of: "vibe://", with: "https://")
+            if let url = URL(string: cleaned) {
+              UIApplication.shared.open(url)
+            }
+          } label: {
+            HStack(spacing: 12) {
+              Image(systemName: "doc.text.fill")
+                .foregroundStyle(.tint)
+              Text(doc.name)
+                .foregroundStyle(.primary)
+              Spacer()
+              Image(systemName: "arrow.up.right")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.secondary)
+            }
+          }
+          .listRowBackground(rowFill)
+        }
+      } header: {
+        Text("Agent Documents")
+      }
+    }
+    .scrollContentBackground(.hidden)
+    .background(Color.clear)
+    .navigationTitle("Documents")
+    .navigationBarTitleDisplayMode(.inline)
+    .toolbarBackground(.hidden, for: .navigationBar)
+  }
+}

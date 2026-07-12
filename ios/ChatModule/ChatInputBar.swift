@@ -1645,12 +1645,24 @@ final class ChatInputBar: UIView {
   }
 
   func setAgentStreaming(_ streaming: Bool) {
+    guard Thread.isMainThread else {
+      DispatchQueue.main.async { [weak self] in
+        self?.setAgentStreaming(streaming)
+      }
+      return
+    }
     guard isAgentStreaming != streaming else { return }
     isAgentStreaming = streaming
     updateButtonStates(animated: true)
   }
 
   func setAgentControlMode(_ enabled: Bool) {
+    guard Thread.isMainThread else {
+      DispatchQueue.main.async { [weak self] in
+        self?.setAgentControlMode(enabled)
+      }
+      return
+    }
     guard agentControlMode != enabled else { return }
     agentControlMode = enabled
     inlineAttachButton.isHidden = !enabled
@@ -1659,6 +1671,12 @@ final class ChatInputBar: UIView {
   }
 
   func setAgentControlTitle(_ title: String) {
+    guard Thread.isMainThread else {
+      DispatchQueue.main.async { [weak self] in
+        self?.setAgentControlTitle(title)
+      }
+      return
+    }
     let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
     let next = trimmed.isEmpty ? "Open" : trimmed
     guard agentControlTitle != next else { return }
@@ -1669,6 +1687,12 @@ final class ChatInputBar: UIView {
 
   /// Repository name shown on the agent-control chip (📁 <repo>). Empty → "Repository".
   func setAgentControlRepoTitle(_ title: String) {
+    guard Thread.isMainThread else {
+      DispatchQueue.main.async { [weak self] in
+        self?.setAgentControlRepoTitle(title)
+      }
+      return
+    }
     let next = title.trimmingCharacters(in: .whitespacesAndNewlines)
     guard agentControlRepoTitle != next else { return }
     agentControlRepoTitle = next
@@ -1679,6 +1703,12 @@ final class ChatInputBar: UIView {
   /// Host-built menu (Repository / Report / Permission / History) for the agent-control
   /// chip. Pass nil to fall back to the legacy agent-panel tap.
   func setAgentControlMenu(_ menu: UIMenu?) {
+    guard Thread.isMainThread else {
+      DispatchQueue.main.async { [weak self] in
+        self?.setAgentControlMenu(menu)
+      }
+      return
+    }
     agentControlMenu = menu
     refreshAgentControlModeAppearance()
     setNeedsLayout()
@@ -1687,6 +1717,12 @@ final class ChatInputBar: UIView {
   /// Host-built slash-command menu shown by the "/" button at the pill's leading edge
   /// (agent chats only). Pass nil to hide the button.
   func setSlashCommandMenu(_ menu: UIMenu?) {
+    guard Thread.isMainThread else {
+      DispatchQueue.main.async { [weak self] in
+        self?.setSlashCommandMenu(menu)
+      }
+      return
+    }
     slashCommandMenu = menu
     slashButton.menu = menu
     refreshAgentControlModeAppearance()

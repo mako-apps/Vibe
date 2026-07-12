@@ -115,6 +115,34 @@ final class ChatPinnedBannerView: UIControl {
       options: [.beginFromCurrentState, .allowUserInteraction]
     ) {
       self.contentContainer.transform = .identity
+      self.contentContainer.alpha = 1.0
+    }
+  }
+
+  /// Finger-follow for the usage carousel: the inner content tracks the drag along X
+  /// while the glass shell stays put. Fades slightly toward the edges so a full
+  /// commit reads as the content leaving, not the banner tearing.
+  func setContentTranslationX(_ dx: CGFloat) {
+    contentContainer.layer.removeAllAnimations()
+    contentContainer.transform = CGAffineTransform(translationX: dx, y: 0)
+    let width = max(1.0, bounds.width)
+    contentContainer.alpha = max(0.35, 1.0 - abs(dx) / width * 0.9)
+  }
+
+  /// Settle the inner content back to rest from an X offset (page landed / drag
+  /// cancelled) — spring home, restoring full opacity.
+  func animateContentTranslateX(from dx: CGFloat) {
+    contentContainer.layer.removeAllAnimations()
+    contentContainer.transform = CGAffineTransform(translationX: dx, y: 0)
+    UIView.animate(
+      withDuration: 0.32,
+      delay: 0,
+      usingSpringWithDamping: 0.85,
+      initialSpringVelocity: 0.5,
+      options: [.beginFromCurrentState, .allowUserInteraction]
+    ) {
+      self.contentContainer.transform = .identity
+      self.contentContainer.alpha = 1.0
     }
   }
 

@@ -1373,11 +1373,26 @@ private final class ChatsViewModel: ObservableObject {
       forName: AgentPairingService.statusDidChangeNotification,
       object: nil,
       queue: .main
-    ) { [weak self] _ in
+    ) { [weak self] note in
       Task { @MainActor [weak self] in
         guard let self else { return }
         // The status lives outside ChatHomeListRow, so publish the existing rows
         // again to reconfigure visible cells as tasks start and finish.
+        let status = (note.object as? AgentBridgeStatus) ?? AgentPairingService.lastStatusSnapshot
+        let bridgeRows = self.rows.filter(\.isBridgeAgentSurface)
+        let matches = bridgeRows.map { row in
+          let provider = ChatHomeListRow.bridgeProvider(
+            peerUserId: row.peerUserId,
+            name: row.title,
+            isAgent: row.isAgentFriend,
+            agentId: row.peerAgentId
+          )
+          let isLive = ChatHomeCardCell.hasRunningBridgeTask(chatId: row.chatId, provider: provider)
+          return "\(provider ?? "?"):\(String(row.chatId.prefix(12)))=\(isLive ? "live" : "idle")"
+        }.joined(separator: ",")
+        AppUITrace.notice(
+          "ChatHome bridgeStatus tasks=\(status?.runningTasks.count ?? 0) rows=\(bridgeRows.count) [\(matches)]"
+        )
         self.rows = Array(self.rows)
       }
     }
@@ -3612,6 +3627,8 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
   private weak var openSwipeCell: ChatHomeCardCell?
   private weak var heldPreviewCell: ChatHomeCardCell?
   private var suppressSelectionUntil: CFTimeInterval = 0
+  private var bridgeStatusObserver: NSObjectProtocol?
+  private var bridgeStatusPollTask: Task<Void, Never>?
 
   override func viewSafeAreaInsetsDidChange() {
     super.viewSafeAreaInsetsDidChange()
@@ -3651,6 +3668,18 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     tableView.refreshControl = refreshControl
     tableView.addGestureRecognizer(previewLongPressRecognizer)
     refreshControl.addTarget(self, action: #selector(handleRefresh), for: .valueChanged)
+    bridgeStatusObserver = NotificationCenter.default.addObserver(
+      forName: AgentPairingService.statusDidChangeNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] note in
+      guard let self else { return }
+      let status = (note.object as? AgentBridgeStatus) ?? AgentPairingService.lastStatusSnapshot
+      AppUITrace.notice(
+        "ChatHomeNative bridgeStatus notification tasks=\(status?.runningTasks.count ?? 0)"
+      )
+      self.reconfigureVisibleCellsInPlace()
+    }
 
     view.addSubview(tableView)
 
@@ -3677,6 +3706,7 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     AppUIStallWatchdog.shared.updateContext(
       "ChatHomeNativeListController viewWillAppear rows=\(rows.count)"
     )
+    startBridgeStatusPolling()
   }
 
   override func viewDidAppear(_ animated: Bool) {
@@ -3691,6 +3721,39 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     AppUITrace.notice(
       "ChatHomeNativeListController viewDidDisappear rows=\(rows.count) offsetY=\(Int(tableView.contentOffset.y))"
     )
+    bridgeStatusPollTask?.cancel()
+    bridgeStatusPollTask = nil
+  }
+
+  deinit {
+    bridgeStatusPollTask?.cancel()
+    if let bridgeStatusObserver {
+      NotificationCenter.default.removeObserver(bridgeStatusObserver)
+    }
+  }
+
+  private func startBridgeStatusPolling() {
+    bridgeStatusPollTask?.cancel()
+    bridgeStatusPollTask = Task { @MainActor [weak self] in
+      while !Task.isCancelled, let self {
+        if let config = AppSessionConfig.current {
+          do {
+            let status = try await AgentPairingService.status(config: config)
+            AppUITrace.notice(
+              "ChatHomeNative bridgeStatus poll connected=\(status.connected) tasks=\(status.runningTasks.count)"
+            )
+            self.reconfigureVisibleCellsInPlace()
+          } catch {
+            AppUITrace.notice(
+              "ChatHomeNative bridgeStatus poll failed error=\(error.localizedDescription)"
+            )
+          }
+        } else {
+          AppUITrace.notice("ChatHomeNative bridgeStatus poll skipped no session config")
+        }
+        try? await Task.sleep(nanoseconds: 2_000_000_000)
+      }
+    }
   }
 
   func apply(

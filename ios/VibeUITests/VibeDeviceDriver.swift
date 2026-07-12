@@ -22,6 +22,7 @@ final class VibeDeviceDriver {
     app.launchArguments += [
       "-UITesting",
       "1",
+      "-VibeVerboseLogs",
       "-AppleLanguages",
       "(en)",
       "-AppleLocale",
@@ -31,6 +32,11 @@ final class VibeDeviceDriver {
     // Auth / home can take a beat on cold launch.
     _ = app.wait(for: .runningForeground, timeout: 20)
     sleepMs(1_200)
+  }
+
+  func messageListDebugValue() -> String {
+    let list = app.collectionViews["chat.messages"]
+    return list.value as? String ?? "<missing>"
   }
 
   // MARK: - Tabs (Calls · Contacts · Chats · Search · Settings)
@@ -270,6 +276,123 @@ final class VibeDeviceDriver {
     return false
   }
 
+  /// Opens the first session returned by the live bridge. History titles are user- and
+  /// machine-specific, so a device regression must not depend on a stale fixture name.
+  @discardableResult
+  func openFirstHistorySession(timeout: TimeInterval = 12) -> String? {
+    let sessions = app.descendants(matching: .any)
+      .matching(NSPredicate(format: "label CONTAINS[c] %@", "messages"))
+    guard sessions.element(boundBy: 0).waitForExistence(timeout: timeout) else { return nil }
+    for index in 0..<sessions.count {
+      let candidate = sessions.element(boundBy: index)
+      let isRunning = (candidate.value as? String) == "1"
+      guard !isRunning else { continue }
+      let topic = candidate.label.components(separatedBy: ",").first?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      guard let topic, !topic.isEmpty else { continue }
+      candidate.tap()
+      sleepMs(1_200)
+      return topic
+    }
+    return nil
+  }
+
+  /// Select the largest settled session in the live history roster. This exercises
+  /// real long-transcript paging/layout instead of the tiny sessions created by tests.
+  @discardableResult
+  func openLargestHistorySession(minimumMessages: Int = 8, timeout: TimeInterval = 15) -> String? {
+    let sessions = app.descendants(matching: .any)
+      .matching(NSPredicate(format: "label CONTAINS[c] %@", "messages"))
+    guard sessions.element(boundBy: 0).waitForExistence(timeout: timeout) else { return nil }
+    let regex = try? NSRegularExpression(pattern: "([0-9]+)\\s+messages", options: [.caseInsensitive])
+    var best: (element: XCUIElement, topic: String, count: Int)?
+    for index in 0..<sessions.count {
+      let candidate = sessions.element(boundBy: index)
+      guard (candidate.value as? String) != "1" else { continue }
+      let label = candidate.label
+      let range = NSRange(label.startIndex..<label.endIndex, in: label)
+      guard let match = regex?.firstMatch(in: label, range: range), match.numberOfRanges > 1,
+        let countRange = Range(match.range(at: 1), in: label),
+        let count = Int(label[countRange]), count >= minimumMessages
+      else { continue }
+      let topic = label.components(separatedBy: ",").first?
+        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      guard !topic.isEmpty, best == nil || count > best!.count else { continue }
+      best = (candidate, topic, count)
+    }
+    guard let best else { return nil }
+    best.element.tap()
+    sleepMs(1_500)
+    return best.topic
+  }
+
+  /// Finds a substantial history session that is old enough not to be concurrently
+  /// owned by a desktop Claude/Codex process. The history roster is lazy, so scan
+  /// several visible pages rather than assuming the first row is safe to resume.
+  @discardableResult
+  func openSubstantialSettledHistorySession(
+    minimumMessages: Int = 20,
+    maximumMessages: Int = 1_000,
+    minimumAgeMinutes: Int = 30,
+    timeout: TimeInterval = 15
+  ) -> String? {
+    let sessions = app.descendants(matching: .any)
+      .matching(NSPredicate(format: "label CONTAINS[c] %@", "messages"))
+    guard sessions.element(boundBy: 0).waitForExistence(timeout: timeout) else { return nil }
+    let countRegex = try? NSRegularExpression(
+      pattern: "([0-9][0-9,]*)\\s+messages", options: [.caseInsensitive])
+    let minuteRegex = try? NSRegularExpression(pattern: "([0-9]+)m\\s+ago", options: [.caseInsensitive])
+    let secondRegex = try? NSRegularExpression(pattern: "([0-9]+)s\\s+ago", options: [.caseInsensitive])
+    let settledAgeRegex = try? NSRegularExpression(
+      pattern: "([0-9]+)(?:h|d|w|mo|y)\\s+ago", options: [.caseInsensitive])
+
+    for _ in 0..<10 {
+      for index in 0..<sessions.count {
+        let candidate = sessions.element(boundBy: index)
+        guard (candidate.value as? String) != "1" else { continue }
+        let label = candidate.label
+        NSLog("[VibeUITest] history candidate[%d]=%@", index, label)
+        let range = NSRange(label.startIndex..<label.endIndex, in: label)
+        guard let match = countRegex?.firstMatch(in: label, range: range), match.numberOfRanges > 1,
+          let countRange = Range(match.range(at: 1), in: label),
+          let count = Int(label[countRange].replacingOccurrences(of: ",", with: "")),
+          count >= minimumMessages,
+          count <= maximumMessages
+        else { continue }
+        if secondRegex?.firstMatch(in: label, range: range) != nil { continue }
+        if let ageMatch = minuteRegex?.firstMatch(in: label, range: range), ageMatch.numberOfRanges > 1,
+          let ageRange = Range(ageMatch.range(at: 1), in: label),
+          let age = Int(label[ageRange])
+        {
+          if age < minimumAgeMinutes { continue }
+        } else if settledAgeRegex?.firstMatch(in: label, range: range) == nil {
+          // Unknown/missing age is not proof that a session is settled.
+          continue
+        }
+        let topic = label.components(separatedBy: ",").first?
+          .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !topic.isEmpty else { continue }
+        candidate.tap()
+        sleepMs(1_500)
+        return topic
+      }
+      let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.50, dy: 0.72))
+      let end = app.coordinate(withNormalizedOffset: CGVector(dx: 0.50, dy: 0.36))
+      start.press(forDuration: 0.05, thenDragTo: end)
+      sleepMs(600)
+    }
+    return nil
+  }
+
+  /// Tapping neutral conversation space follows the real user gesture that hides the
+  /// keyboard without touching the composer or a message action.
+  func dismissKeyboardFromConversation() {
+    let keyboard = app.keyboards.firstMatch
+    guard keyboard.exists else { return }
+    app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.22)).tap()
+    sleepMs(900)
+  }
+
   // MARK: - Screenshots
 
   @discardableResult
@@ -308,8 +431,18 @@ final class VibeDeviceDriver {
     app.staticTexts[text].waitForExistence(timeout: timeout)
   }
 
+  @discardableResult
+  func waitForTextContaining(_ text: String, timeout: TimeInterval) -> Bool {
+    let match = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", text)).element(boundBy: 0)
+    return match.waitForExistence(timeout: timeout)
+  }
+
   func exactTextCount(_ text: String) -> Int {
     app.staticTexts.matching(NSPredicate(format: "label == %@", text)).count
+  }
+
+  func textCountContaining(_ text: String) -> Int {
+    app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", text)).count
   }
 
   @discardableResult

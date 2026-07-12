@@ -521,12 +521,47 @@ defmodule Vibe.AI.LocalAgentWorker do
 
         worker_status_list =
           if is_binary(team_run_id) do
-            update_team_worker_state(chat_id, team_run_id, worker.handle, %{
-              "status" => if(ok, do: "done", else: "failed"),
-              "summary" => String.slice(base_text || "", 0, 400),
-              "last_label" => if(ok, do: "done", else: "failed"),
-              "task_id" => Keyword.get(opts, :task_id)
-            })
+            # Stale-settle guard: after a watchdog retry/reassign the row carries
+            # a NEW task_id; the old attempt's late result must not clobber it.
+            settle_task_id = normalize_string(Keyword.get(opts, :task_id))
+
+            stored_task_id =
+              case fetch_supervisor_run_state(chat_id, team_run_id) do
+                state when is_map(state) ->
+                  normalize_string(get_in(state, [:worker_states, worker.handle, "task_id"]))
+
+                _ ->
+                  nil
+              end
+
+            if is_binary(settle_task_id) and is_binary(stored_task_id) and
+                 settle_task_id != stored_task_id do
+              Logger.info(
+                "[LocalAgentWorker] stale settle ignored chat=#{chat_id} run=#{team_run_id} " <>
+                  "worker=#{worker.handle} settled=#{settle_task_id} current=#{stored_task_id}"
+              )
+
+              team_workers_status(chat_id, team_run_id)
+            else
+              list =
+                update_team_worker_state(chat_id, team_run_id, worker.handle, %{
+                  "status" => if(ok, do: "done", else: "failed"),
+                  "summary" => String.slice(base_text || "", 0, 400),
+                  "last_label" => if(ok, do: "done", else: "failed"),
+                  "task_id" => Keyword.get(opts, :task_id)
+                })
+
+              # The zero-token watchdog decides retry / usage-limit failover.
+              Vibe.AI.TeamRunMonitor.note_settled(
+                chat_id,
+                team_run_id,
+                worker.handle,
+                ok,
+                usage_limit_hit?
+              )
+
+              list
+            end
           else
             []
           end
@@ -969,26 +1004,43 @@ defmodule Vibe.AI.LocalAgentWorker do
     Your default focus: #{default_focus}
     Shared handoff board: #{handoff_path}
 
-    Your job:
-    1. Own the single user-visible reply for this team turn.
-    2. Classify the request: if it is trivial chat with no coding work, answer alone briefly
-       and do NOT spawn teammates.
-    3. For real work, decompose into non-overlapping slices (backend/data, review/debug,
-       investigation, UI/frontend) and coordinate via the handoff file.
-    4. To start under-hood teammates, emit exactly one line (stdout/tool log is fine):
-         VIBE_TEAM_SPAWN: claude, grok, agy
-       Use only handles from: #{teammate_handles}. Omit yourself. You may spawn a subset.
-       Optionally add a second line with focus notes:
-         VIBE_TEAM_FOCUS: claude=review risks; agy=UI polish
-    5. After spawning, read #{handoff_path} for their findings before you finalize.
-    6. Prefer non-overlapping file ownership. Do not reset, stash, revert, or overwrite
-       pre-existing user changes.
-    7. Advisors: consult Fable when available for complex decisions; if Fable fails, use
-       Sol (GPT) as fallback advisor. For frontend/JSX/UI returns only, Gemini/Agy is a
-       UI-only advisor. Advisors never edit files.
-    8. When work is done, write ONE concise summary for the user: what each agent did,
-       approximate time/effort if known, what landed, and remaining risks. Do not dump
-       raw tool logs into the user reply.
+    You run a strict phased protocol (the server machine-parses your directives):
+
+    PHASE 0 — CLASSIFY. If the request is trivial chat with no coding work, answer alone
+    briefly and do NOT spawn teammates or emit directives. If it is real work a single
+    agent handles comfortably, do it yourself and skip the team (emit nothing).
+
+    PHASE 1 — PLAN (complex / multi-part / new-project work only). Consult the Fable
+    advisor (Sol/GPT fallback; advisors never edit files; if none responds, plan yourself)
+    and produce a plan. Emit it as ONE single-line directive (stdout/tool log is fine):
+      VIBE_TEAM_PLAN: {"version":2,"classification":"team","architecture":"<pages/routes, backend endpoints, DB schema, styling — one paragraph>","contracts":"<API shapes / schema / naming the slices rely on>","decisions":["<defaults you chose for unspecified choices>"],"foundation":{"files":["<shared files YOU create first: scaffold, package.json, root layout, schema>"]},"task_table":[{"worker":"claude","objective":"<what>","files":["<exact disjoint paths>"],"boundaries":"<what NOT to touch>","fallback":"grok"}],"integrator":"#{worker.handle}","verification":["<checklist: every page/endpoint/schema + build passes; tests if present>"]}
+      - workers only from: #{teammate_handles}; files DISJOINT across rows; shared files
+        (package.json, lockfiles, root layout/nav, DB schema/migrations) never appear in
+        rows — they are yours. Every row needs a concrete file list: vague focuses like
+        "UI polish" are rejected. Gemini/Agy especially must get exact files or it drifts.
+      - "classification":"solo" (with "solo_reason") is valid when the task does not
+        decompose — then do the work yourself and spawn nobody.
+      - For a genuinely user-owned choice (e.g. which database) use the vibeask ask_user
+        tool if available; on no answer pick a sensible default and record it in
+        "decisions". Never block the run on a question.
+    Also write the same plan human-readably to #{handoff_path}.
+
+    PHASE 2 — FOUNDATION. Create the foundation/shared files yourself so teammates land
+    on a building repo, then emit:
+      VIBE_TEAM_SPAWN: <the workers from your task_table>
+    The server dispatches each row from your validated plan (its files/objective become
+    the worker's assignment). You may refine with VIBE_TEAM_FOCUS: worker=<files/notes>.
+
+    PHASE 3 — INTEGRATE + VERIFY. Read #{handoff_path} as teammates finish. Walk your
+    verification checklist: every planned page/endpoint/schema implemented (no stubs, no
+    TODO screens) and the project build passes (tests too if present). Fill small gaps
+    yourself; for big misses emit another VIBE_TEAM_SPAWN with a gap-scoped focus (the
+    run watchdog also restarts crashed or usage-limited teammates automatically).
+
+    PHASE 4 — SUMMARY. One concise user reply: what each agent did, what landed, what
+    remains. No raw tool logs.
+
+    Always: do not reset, stash, revert, or overwrite pre-existing user changes.
 
     Collaboration rules:
     #{agent_operating_rules(worker, handoff_path)}
@@ -1025,8 +1077,12 @@ defmodule Vibe.AI.LocalAgentWorker do
 
     Rules:
     - You are NOT posting a chat bubble. The lead synthesizes the user-facing answer.
-    - Read #{handoff_path} first. Take a non-overlapping slice matching your focus.
-    - Do focused work only. Avoid rewriting the whole repo or duplicating the lead.
+    - Read #{handoff_path} first (architecture plan + task table). You are a BUILDER
+      unless your focus explicitly says review: implement your assigned focus exactly
+      and completely — every file listed, fully implemented, no stubs or TODO screens.
+    - Stay strictly inside your assigned file list. Do not touch shared files
+      (package.json, lockfiles, root layout, DB schema) — the lead owns those.
+    - Avoid rewriting the whole repo or duplicating the lead.
     - Append ownership, findings, exact files changed, verification, and blockers to
       #{handoff_path}. Do not replace other agents' sections.
     - Do not reset, stash, revert, or overwrite pre-existing user changes.
@@ -1193,6 +1249,12 @@ defmodule Vibe.AI.LocalAgentWorker do
         case persist_team_run(state, lead_handle) do
           :created ->
             :ets.insert(@team_run_table, {{chat_id, team_run_id}, state})
+
+            if mode == "supervisor" do
+              Vibe.AI.TeamRunMonitor.ensure_started(chat_id, team_run_id)
+              Vibe.AI.TeamRunMonitor.note_spawned(chat_id, team_run_id, lead_handle, nil)
+            end
+
             lead_worker
 
           :duplicate ->
@@ -1476,6 +1538,8 @@ defmodule Vibe.AI.LocalAgentWorker do
       "suppressVisible" => true
     })
 
+    Vibe.AI.TeamRunMonitor.note_cancelled(chat_id, team_run_id)
+
     _ = requester_user_id
     targets
   rescue
@@ -1521,6 +1585,9 @@ defmodule Vibe.AI.LocalAgentWorker do
         dispatch_text = state.dispatch_text
         bridge_metadata = state.bridge_metadata || %{}
 
+        plan =
+          Map.get(state, :team_plan) || get_in(state, [:bridge_metadata, "teamPlan"]) || %{}
+
         team_workers =
           (state.workers || [])
           |> Enum.map(&resolve_handle/1)
@@ -1532,6 +1599,19 @@ defmodule Vibe.AI.LocalAgentWorker do
         |> Enum.uniq()
         |> Enum.reject(&(&1 == lead))
         |> Enum.filter(&MapSet.member?(allowed, &1))
+        # A solo-classified plan means the lead owns the whole task — a stray
+        # spawn directive after that is a protocol violation, not a dispatch.
+        |> then(fn hs ->
+          if plan["classification"] == "solo" do
+            Logger.info(
+              "[LocalAgentWorker] solo plan — suppressing spawn of #{inspect(hs)} chat=#{chat_id} run=#{team_run_id}"
+            )
+
+            []
+          else
+            hs
+          end
+        end)
         |> Enum.each(fn handle ->
           case resolve_handle(handle) do
             nil ->
@@ -1544,13 +1624,26 @@ defmodule Vibe.AI.LocalAgentWorker do
                 :ok
               else
                 task_id = "#{team_run_id}:worker:#{handle}"
+
+                # A validated plan row is the authoritative assignment (exact
+                # files + boundaries); a lead VIBE_TEAM_FOCUS line refines it.
+                focus =
+                  case {plan_focus_for(plan, handle), Map.get(focus_by, handle)} do
+                    {nil, nil} -> team_worker_default_focus(handle)
+                    {nil, explicit} -> explicit
+                    {planned, nil} -> planned
+                    {planned, explicit} -> planned <> "\nLead note: " <> explicit
+                  end
+
+                # Focus + fallback are stored so the monitor can retry/reassign
+                # this slice fresh without the lead being alive to restate it.
                 update_team_worker_state(chat_id, team_run_id, handle, %{
                   "status" => "running",
                   "task_id" => task_id,
-                  "last_label" => "starting"
+                  "last_label" => "starting",
+                  "focus" => focus,
+                  "fallback" => plan_fallback_for(plan, handle)
                 })
-
-                focus = Map.get(focus_by, handle) || team_worker_default_focus(handle)
 
                 prompt =
                   build_team_bridge_prompt(
@@ -1592,6 +1685,8 @@ defmodule Vibe.AI.LocalAgentWorker do
 
                 case AgentBridge.dispatch_task(requester_user_id, task_payload) do
                   :ok ->
+                    Vibe.AI.TeamRunMonitor.note_spawned(chat_id, team_run_id, handle, task_id)
+
                     Logger.info(
                       "[LocalAgentWorker] supervisor spawn chat=#{chat_id} run=#{team_run_id} worker=#{handle}"
                     )
@@ -1628,6 +1723,343 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   def spawn_supervisor_workers(_, _, _, _, _), do: {:error, :invalid}
+
+  # ── TeamRunMonitor support (team-architecture-v2 §4) ─────────────────────
+  # Storage-backed transitions applied by the zero-token watchdog. Everything
+  # funnels through update_team_worker_state / TeamRun so ets + DB stay the
+  # single source of truth and the monitor process itself stays disposable.
+
+  @doc "Monitor: ets-then-DB run state; rewarms the ets cache on DB fallback."
+  def fetch_supervisor_run_state(chat_id, team_run_id)
+      when is_binary(chat_id) and is_binary(team_run_id) do
+    ensure_team_run_table()
+
+    case :ets.lookup(@team_run_table, {chat_id, team_run_id}) do
+      [{{^chat_id, ^team_run_id}, state}] ->
+        state
+
+      _ ->
+        case Repo.get(TeamRun, team_run_id) do
+          %TeamRun{chat_id: run_chat} = run ->
+            if to_string(run_chat) == chat_id do
+              state = durable_team_state(run)
+              :ets.insert(@team_run_table, {{chat_id, team_run_id}, state})
+              state
+            end
+
+          _ ->
+            nil
+        end
+    end
+  rescue
+    _ -> nil
+  end
+
+  def fetch_supervisor_run_state(_, _), do: nil
+
+  @doc "Monitor: mark a worker with a status + note and broadcast the transition."
+  def monitor_mark_worker(chat_id, team_run_id, handle, status, note) do
+    status_list =
+      update_team_worker_state(chat_id, team_run_id, handle, %{
+        "status" => status,
+        "last_label" => String.slice(note || status, 0, 80),
+        "summary" => note
+      })
+
+    broadcast_monitor_transition(chat_id, team_run_id, handle, status, note, status_list)
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  @doc """
+  Monitor: cancel whatever is (or is not) still running for a stalled/crashed
+  worker and restart its slice FRESH on the same provider with a new task id.
+  """
+  def monitor_retry_worker(chat_id, team_run_id, handle, reason) do
+    with state when is_map(state) <- fetch_supervisor_run_state(chat_id, team_run_id),
+         worker when not is_nil(worker) <- resolve_handle(handle) do
+      # Stale-stall guard: a settle can land between the sweep's decision and
+      # this call. Re-read the durable row — only a still-running slice may be
+      # stall-retried; resurrected done/failed rows would duplicate work.
+      current_status = get_in(state, [:worker_states, handle, "status"])
+
+      if reason == "stalled" and current_status != "running" do
+        {:error, :stale}
+      else
+        old_task_id = get_in(state, [:worker_states, handle, "task_id"])
+        cancel_monitor_task(state, handle, old_task_id)
+
+        task_id = "#{team_run_id}:worker:#{handle}:r#{System.unique_integer([:positive])}"
+
+        focus =
+          stored_worker_focus(state, handle) ||
+            plan_focus_for(run_state_plan(state), handle) ||
+            team_worker_default_focus(handle)
+
+        status_list =
+          update_team_worker_state(chat_id, team_run_id, handle, %{
+            "status" => "running",
+            "task_id" => task_id,
+            "last_label" => "retrying (#{reason})",
+            "focus" => focus
+          })
+
+        broadcast_monitor_transition(
+          chat_id,
+          team_run_id,
+          handle,
+          "retrying",
+          "restarted after #{reason}",
+          status_list
+        )
+
+        monitor_dispatch_worker(state, worker, focus, task_id, nil)
+      end
+    else
+      _ -> {:error, :not_found}
+    end
+  rescue
+    error -> {:error, error}
+  end
+
+  @doc """
+  Monitor: a usage-limited worker's slice restarts fresh on an idle provider
+  from the same run roster (never mid-task context handoff). Returns
+  `{:ok, fallback_handle}` or `{:error, :no_fallback}`.
+  """
+  def monitor_reassign_worker(chat_id, team_run_id, handle) do
+    with state when is_map(state) <- fetch_supervisor_run_state(chat_id, team_run_id),
+         fallback when is_binary(fallback) <- pick_idle_fallback(state, handle),
+         worker when not is_nil(worker) <- resolve_handle(fallback) do
+      old_task_id = get_in(state, [:worker_states, handle, "task_id"])
+      cancel_monitor_task(state, handle, old_task_id)
+
+      # The fallback inherits the limited worker's exact assignment: stored
+      # focus first (plan-derived at spawn), then the plan row, then default.
+      focus =
+        stored_worker_focus(state, handle) ||
+          plan_focus_for(run_state_plan(state), handle) ||
+          team_worker_default_focus(handle)
+
+      task_id = "#{team_run_id}:worker:#{fallback}:x#{System.unique_integer([:positive])}"
+
+      update_team_worker_state(chat_id, team_run_id, handle, %{
+        "status" => "reassigned",
+        "last_label" => "usage limit → @#{fallback}"
+      })
+
+      status_list =
+        update_team_worker_state(chat_id, team_run_id, fallback, %{
+          "status" => "running",
+          "task_id" => task_id,
+          "last_label" => "covering @#{handle}",
+          "focus" => focus
+        })
+
+      broadcast_monitor_transition(
+        chat_id,
+        team_run_id,
+        fallback,
+        "reassigned",
+        "covering @#{handle} after usage limit",
+        status_list
+      )
+
+      case monitor_dispatch_worker(
+             state,
+             worker,
+             focus,
+             task_id,
+             "You are covering @#{handle}'s slice from scratch after a usage limit; " <>
+               "their partial work may or may not exist on disk — verify before building on it."
+           ) do
+        :ok -> {:ok, fallback}
+        error -> error
+      end
+    else
+      nil -> {:error, :no_fallback}
+      _ -> {:error, :no_fallback}
+    end
+  rescue
+    error -> {:error, error}
+  end
+
+  @doc "Monitor: finalize the run row once every worker state is terminal."
+  def monitor_finalize_run(chat_id, team_run_id) do
+    statuses =
+      team_workers_status(chat_id, team_run_id)
+      |> Enum.map(&(&1["status"] || &1[:status]))
+
+    final =
+      cond do
+        statuses == [] -> nil
+        Enum.all?(statuses, &(&1 in ["failed", "cancelled"])) -> "failed"
+        true -> "completed"
+      end
+
+    with true <- is_binary(final),
+         %TeamRun{status: "running"} = run <- Repo.get(TeamRun, team_run_id) do
+      run
+      |> TeamRun.changeset(%{status: final})
+      |> Repo.update()
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  # Dispatch one worker slice on behalf of the monitor. Mirrors the payload
+  # spawn_supervisor_workers builds so the bridge/iOS see an identical task.
+  defp monitor_dispatch_worker(state, worker, focus, task_id, cover_note) do
+    chat_id = state.chat_id
+    team_run_id = state.team_run_id
+    mode = Map.get(state, :mode) || "supervisor"
+    lead = Map.get(state, :lead_worker)
+
+    team_workers =
+      (state.workers || [])
+      |> Enum.map(&resolve_handle/1)
+      |> Enum.reject(&is_nil/1)
+
+    dispatch_text =
+      case cover_note do
+        note when is_binary(note) and note != "" ->
+          state.dispatch_text <> "\n\n" <> note
+
+        _ ->
+          state.dispatch_text
+      end
+
+    prompt =
+      build_team_bridge_prompt(
+        chat_id,
+        worker,
+        dispatch_text <> "\n\nAssigned focus for this spawn: #{focus}",
+        state.requester_user_id,
+        team_workers,
+        team_run_id,
+        team_mode: mode,
+        lead_worker: lead,
+        team_role: "worker"
+      )
+
+    task_payload =
+      %{
+        "provider" => worker.handle,
+        "chatId" => chat_id,
+        "taskId" => task_id,
+        "prompt" => prompt,
+        "replyToId" => state.reply_to_id,
+        "requesterUserId" => state.requester_user_id,
+        "teamMode" => mode,
+        "teamRunId" => team_run_id,
+        "teamWorker" => worker.handle,
+        "teamWorkers" => Enum.map(team_workers, & &1.handle),
+        "leadWorker" => lead,
+        "teamRole" => "worker",
+        "suppressVisible" => true
+      }
+      |> Map.merge(resolve_provider_model(state.bridge_metadata || %{}, worker.handle))
+
+    case AgentBridge.dispatch_task(state.requester_user_id, task_payload) do
+      :ok ->
+        Vibe.AI.TeamRunMonitor.note_spawned(chat_id, team_run_id, worker.handle, task_id)
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "[LocalAgentWorker] monitor dispatch failed chat=#{chat_id} worker=#{worker.handle} reason=#{inspect(reason)}"
+        )
+
+        {:error, reason}
+    end
+  end
+
+  defp cancel_monitor_task(state, handle, task_id) do
+    payload =
+      %{
+        "action" => "cancel",
+        "provider" => handle,
+        "chatId" => state.chat_id,
+        "requesterUserId" => state.requester_user_id,
+        "teamRunId" => state.team_run_id
+      }
+      |> then(fn map ->
+        if is_binary(task_id) and task_id != "", do: Map.put(map, "taskId", task_id), else: map
+      end)
+
+    AgentBridge.dispatch_control(state.requester_user_id, payload)
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp stored_worker_focus(state, handle) do
+    case get_in(state, [:worker_states, handle, "focus"]) do
+      focus when is_binary(focus) and focus != "" -> focus
+      _ -> nil
+    end
+  end
+
+  defp run_state_plan(state) do
+    Map.get(state, :team_plan) || get_in(state, [:bridge_metadata, "teamPlan"]) || %{}
+  end
+
+  # Idle = a roster member (never the lead) that is not mid-slice right now.
+  # A plan-declared fallback wins when idle; otherwise prefer a provider that
+  # was never spawned, then one that already finished.
+  defp pick_idle_fallback(state, limited_handle) do
+    lead = Map.get(state, :lead_worker)
+    states = Map.get(state, :worker_states) || %{}
+
+    candidates =
+      (state.workers || [])
+      |> Enum.reject(&(&1 == limited_handle or &1 == lead))
+
+    idle? = fn handle ->
+      get_in(states, [handle, "status"]) in [nil, "pending", "done"]
+    end
+
+    planned =
+      case get_in(states, [limited_handle, "fallback"]) do
+        fallback when is_binary(fallback) ->
+          if fallback in candidates and idle?.(fallback), do: fallback
+
+        _ ->
+          nil
+      end
+
+    by_status = fn wanted ->
+      Enum.find(candidates, fn handle ->
+        get_in(states, [handle, "status"]) in wanted
+      end)
+    end
+
+    planned || by_status.([nil, "pending"]) || by_status.(["done"])
+  end
+
+  defp broadcast_monitor_transition(chat_id, team_run_id, handle, status, note, status_list) do
+    worker = resolve_handle(handle)
+
+    VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-team-worker", %{
+      "chatId" => chat_id,
+      "teamRunId" => team_run_id,
+      "teamWorker" => handle,
+      "agentUserId" => worker && worker.agent_user_id,
+      "agentName" => (worker && worker.label) || handle,
+      "status" => status,
+      "summary" => String.slice(note || "", 0, 400),
+      "teamWorkersStatus" => status_list,
+      "suppressVisible" => true,
+      "monitor" => true
+    })
+
+    :ok
+  rescue
+    _ -> :ok
+  end
 
   @doc "Parse VIBE_TEAM_SPAWN / VIBE_TEAM_FOCUS lines from agent output."
   def parse_team_spawn_directive(text) when is_binary(text) do
@@ -1668,6 +2100,171 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   def parse_team_spawn_directive(_), do: nil
+
+  @doc """
+  Parse and validate a lead-emitted `VIBE_TEAM_PLAN: {json}` directive line
+  (team-architecture-v2 §2). Returns `{:ok, plan}` with string-keyed maps,
+  `{:error, reasons}` when a plan was present but invalid, or `nil` when the
+  line carries no plan directive at all.
+  """
+  def parse_team_plan_directive(line, roster_handles) when is_binary(line) do
+    case Regex.run(~r/VIBE_TEAM_PLAN\s*:\s*(\{.*\})\s*$/i, line) do
+      [_, raw] ->
+        case Jason.decode(raw) do
+          {:ok, plan} when is_map(plan) -> validate_team_plan(plan, roster_handles)
+          _ -> {:error, ["plan is not valid JSON"]}
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  def parse_team_plan_directive(_, _), do: nil
+
+  # A plan must be executable by code: known workers, concrete disjoint file
+  # lists, an integrator from the roster. Solo plans skip the table checks.
+  defp validate_team_plan(plan, roster_handles) do
+    roster = MapSet.new(roster_handles || [])
+    classification = plan["classification"]
+
+    cond do
+      classification == "solo" ->
+        {:ok, plan}
+
+      classification != "team" ->
+        {:error, ["classification must be \"team\" or \"solo\""]}
+
+      true ->
+        rows = List.wrap(plan["task_table"])
+
+        errors =
+          []
+          |> then(fn errs ->
+            if rows == [], do: ["task_table is empty" | errs], else: errs
+          end)
+          |> then(fn errs ->
+            rows
+            |> Enum.with_index()
+            |> Enum.reduce(errs, fn {row, idx}, acc ->
+              handle = normalize_handle(row["worker"])
+              files = row["files"] |> List.wrap() |> Enum.filter(&is_binary/1)
+
+              acc
+              |> then(fn a ->
+                if handle && MapSet.member?(roster, handle),
+                  do: a,
+                  else: ["row #{idx}: unknown worker #{inspect(row["worker"])}" | a]
+              end)
+              |> then(fn a ->
+                if files == [], do: ["row #{idx}: files list is empty" | a], else: a
+              end)
+            end)
+          end)
+          |> then(fn errs ->
+            dupes =
+              rows
+              |> Enum.flat_map(&List.wrap(&1["files"]))
+              |> Enum.filter(&is_binary/1)
+              |> Enum.frequencies()
+              |> Enum.filter(fn {_, n} -> n > 1 end)
+              |> Enum.map(&elem(&1, 0))
+
+            # Advisory only — the integrator resolves collisions — but flag
+            # blatant overlap so a degenerate plan doesn't slip through silent.
+            if dupes != [] do
+              Logger.warning("[LocalAgentWorker] team plan overlapping files: #{inspect(dupes)}")
+            end
+
+            errs
+          end)
+
+        if errors == [], do: {:ok, plan}, else: {:error, Enum.reverse(errors)}
+    end
+  end
+
+  @doc "Store a validated plan on the run (ets + durable bridge_metadata)."
+  def store_team_plan(chat_id, team_run_id, plan)
+      when is_binary(chat_id) and is_binary(team_run_id) and is_map(plan) do
+    ensure_team_run_table()
+
+    case :ets.lookup(@team_run_table, {chat_id, team_run_id}) do
+      [{{^chat_id, ^team_run_id}, state}] ->
+        :ets.insert(@team_run_table, {{chat_id, team_run_id}, Map.put(state, :team_plan, plan)})
+
+      _ ->
+        :ok
+    end
+
+    case Repo.get(TeamRun, team_run_id) do
+      %TeamRun{} = run ->
+        metadata = Map.put(run.bridge_metadata || %{}, "teamPlan", plan)
+
+        run
+        |> TeamRun.changeset(%{bridge_metadata: metadata})
+        |> Repo.update()
+
+      _ ->
+        :ok
+    end
+
+    Logger.info(
+      "[LocalAgentWorker] team plan stored chat=#{chat_id} run=#{team_run_id} " <>
+        "class=#{plan["classification"]} rows=#{length(List.wrap(plan["task_table"]))}"
+    )
+
+    :ok
+  rescue
+    error ->
+      Logger.warning("[LocalAgentWorker] store_team_plan failed: #{Exception.message(error)}")
+      :ok
+  end
+
+  def store_team_plan(_, _, _), do: :ok
+
+  @doc "Roster handles for a run (for plan validation at the channel)."
+  def team_run_roster(chat_id, team_run_id) do
+    case fetch_supervisor_run_state(chat_id, team_run_id) do
+      %{workers: workers} when is_list(workers) -> workers
+      _ -> []
+    end
+  end
+
+  # Row → the exact, self-contained assignment a worker receives. This is the
+  # spec-quality lever: objective + disjoint files + boundaries in one string.
+  defp plan_focus_for(plan, handle) do
+    plan
+    |> Map.get("task_table")
+    |> List.wrap()
+    |> Enum.find(fn row -> normalize_handle(row["worker"]) == handle end)
+    |> case do
+      nil ->
+        nil
+
+      row ->
+        files = row["files"] |> List.wrap() |> Enum.filter(&is_binary/1)
+
+        [
+          row["objective"] && "Objective: #{row["objective"]}",
+          files != [] && "Files (yours alone, implement completely): #{Enum.join(files, ", ")}",
+          row["boundaries"] && "Boundaries: #{row["boundaries"]}",
+          plan["contracts"] && "Shared contracts: #{plan["contracts"]}"
+        ]
+        |> Enum.filter(&is_binary/1)
+        |> Enum.join("\n")
+    end
+  end
+
+  defp plan_fallback_for(plan, handle) do
+    plan
+    |> Map.get("task_table")
+    |> List.wrap()
+    |> Enum.find(fn row -> normalize_handle(row["worker"]) == handle end)
+    |> case do
+      %{"fallback" => fallback} -> normalize_handle(fallback)
+      _ -> nil
+    end
+  end
 
   @doc """
   On bridge reconnect, mark matching team workers as running again from status
@@ -2255,16 +2852,16 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   defp team_worker_default_focus("codex"),
-    do: "lead coordination, focused implementation, backend/data work, and verification"
+    do: "lead coordination, architecture, shared-file integration, backend/data implementation, and verification"
 
   defp team_worker_default_focus("claude"),
-    do: "review, debugging, risk analysis, and handoff quality"
+    do: "complete implementation of assigned backend/frontend slices, then review, debugging, and risk notes"
 
   defp team_worker_default_focus("grok"),
-    do: "fast investigation, current-context checks, and independent review"
+    do: "complete implementation of assigned slices, plus fast investigation and independent checks"
 
   defp team_worker_default_focus("agy"),
-    do: "UI, visual/product behavior, JSX/frontend polish, and cross-platform review"
+    do: "exact implementation of the assigned UI components/pages — follow the assigned file list precisely and completely"
 
   defp team_worker_default_focus(_), do: "the highest-value unowned slice"
 
@@ -2375,6 +2972,18 @@ defmodule Vibe.AI.LocalAgentWorker do
 
         worker_status_list =
           if is_binary(team_run_id) do
+            # Stream frames double as liveness heartbeats for the run watchdog.
+            # Bridge admission-queue frames are tagged (by label) so the monitor
+            # caps queue age instead of trusting them as liveness forever.
+            queued? = String.starts_with?(last_label, "Queued — waiting")
+
+            Vibe.AI.TeamRunMonitor.note_heartbeat(
+              chat_id,
+              team_run_id,
+              worker.handle,
+              queued?
+            )
+
             update_team_worker_state(chat_id, team_run_id, worker.handle, %{
               "status" => "running",
               "last_label" => String.slice(last_label, 0, 80),

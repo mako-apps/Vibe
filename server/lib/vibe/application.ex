@@ -52,7 +52,11 @@ defmodule Vibe.Application do
       Vibe.StoryCleaner,
       # Bounded pool for @claude / @codex local agent workers (caps concurrency + cost)
       {Task.Supervisor,
-       name: Vibe.AI.WorkerTaskSupervisor, max_children: local_agent_worker_concurrency()}
+       name: Vibe.AI.WorkerTaskSupervisor, max_children: local_agent_worker_concurrency()},
+      # Zero-token watchdogs for coordinated team runs (one transient GenServer
+      # per {chat_id, team_run_id}; docs/team-architecture-v2.md §4)
+      {Registry, keys: :unique, name: Vibe.AI.TeamRunRegistry},
+      {DynamicSupervisor, name: Vibe.AI.TeamRunMonitorSupervisor, strategy: :one_for_one}
     ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html

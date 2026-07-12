@@ -262,6 +262,15 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
         continue
       }
       let nodeId = item.nodeId ?? item.label
+      // Supervisor team worker: avatar + name + status row, tap → worker detail.
+      if item.itemType == "teamworker" {
+        let workerRow = VibeAgentKitTeamWorkerRowView()
+        workerRow.translatesAutoresizingMaskIntoConstraints = false
+        workerRow.configure(item: item, appearance: appearance)
+        workerRow.onTap = { [weak self] in self?.onOpenSubagent?(nodeId) }
+        stepsStack.addArrangedSubview(workerRow)
+        continue
+      }
       // A subagent (Claude Task tool) node renders as a compact, always-tappable row
       // that opens the read-only subagent view — never an inline expand. Its own
       // Read/Edit/Run steps live only in that view (subagentChildren).
@@ -363,6 +372,23 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
       }
 
       let nodeId = item.nodeId ?? item.label
+      // Supervisor team worker: reuse the SAME row view across stream frames (keyed by
+      // node id) so only the status text mutates — no per-frame view churn.
+      if item.itemType == "teamworker" {
+        let key = "teamworker#\(nodeId)"
+        orderedKeys.append(key)
+        let workerRow: VibeAgentKitTeamWorkerRowView
+        if let existing = liveFeedViewsByKey[key] as? VibeAgentKitTeamWorkerRowView {
+          workerRow = existing
+        } else {
+          workerRow = VibeAgentKitTeamWorkerRowView()
+          workerRow.translatesAutoresizingMaskIntoConstraints = false
+          liveFeedViewsByKey[key] = workerRow
+        }
+        workerRow.configure(item: item, appearance: appearance)
+        workerRow.onTap = { [weak self] in self?.onOpenSubagent?(nodeId) }
+        continue
+      }
       // isRealSubagent: synthetic task-kind placeholders (no subagentType) render
       // as plain step rows, never as a phantom "Subagent" row.
       if item.isRealSubagent {
@@ -633,7 +659,25 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
 
     if shouldShowLoader {
       let loaderText: String
-      if showsLoader {
+      let teamWorkerItems = progressItems.filter { $0.itemType == "teamworker" }
+      if !teamWorkerItems.isEmpty {
+        // Supervisor team run: the header states the TEAM's condition, not the last
+        // tool step (the worker rows below carry the per-agent detail).
+        let doneCount = teamWorkerItems.filter {
+          let s = ($0.status ?? "").lowercased()
+          return s == "done" || s == "completed" || s == "failed" || s == "skipped"
+        }.count
+        if showsLoader {
+          loaderText =
+            doneCount > 0
+            ? "Team running · \(doneCount)/\(teamWorkerItems.count) done"
+            : "Team running"
+        } else if let ms = runtime?.durationMs, ms > 0 {
+          loaderText = "Team finished · \(ChatListRow.TeamWorkerStatus.formatDuration(ms))"
+        } else {
+          loaderText = "Team finished"
+        }
+      } else if showsLoader {
         // Live turn: shimmer the tool action in flight ("Edit chat.ex", "Run …"). Prefer
         // the last NON-text node so the shimmer never echoes the narration prose that is
         // already rendered (in full) inline in the interleaved feed below; fall back to a
@@ -1120,6 +1164,143 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
 // and the file slice it read (fallback "Reading…"); everything else → its output.
 // All rows self-size (no explicit heights) so the table's automaticDimension grows
 // the cell as a row opens.
+// One worker of a supervisor team run, rendered inside the lead bubble's feed: the
+// agent's avatar (same resolver as the floating group avatars), its name, a live
+// status line ("working…", the last step label, "done · 2m"), a spinner while it
+// runs, and a chevron. Always tappable — opens that worker's read-only detail view.
+// The status label mutates in place across stream frames (single line, fixed row
+// height), so worker progress is visible without re-flowing the cell.
+private final class VibeAgentKitTeamWorkerRowView: UIView {
+  private let header = UIControl()
+  private let avatarView = SenderRunAvatarView()
+  private let nameLabel = UILabel()
+  private let statusLabel = UILabel()
+  private let spinner = UIActivityIndicatorView(style: .medium)
+  private let doneCheck = UIImageView()
+  private let chevron = UIImageView()
+  var onTap: (() -> Void)?
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    setup()
+  }
+
+  required init?(coder: NSCoder) { return nil }
+
+  private func setup() {
+    backgroundColor = .clear
+    header.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(header)
+    NSLayoutConstraint.activate([
+      header.topAnchor.constraint(equalTo: topAnchor),
+      header.leadingAnchor.constraint(equalTo: leadingAnchor),
+      header.trailingAnchor.constraint(equalTo: trailingAnchor),
+      header.bottomAnchor.constraint(equalTo: bottomAnchor),
+    ])
+
+    let stack = UIStackView()
+    stack.translatesAutoresizingMaskIntoConstraints = false
+    stack.axis = .horizontal
+    stack.alignment = .center
+    stack.spacing = 8.0
+    stack.isUserInteractionEnabled = false
+    header.addSubview(stack)
+
+    avatarView.translatesAutoresizingMaskIntoConstraints = false
+
+    nameLabel.translatesAutoresizingMaskIntoConstraints = false
+    nameLabel.numberOfLines = 1
+    nameLabel.setContentHuggingPriority(.required, for: .horizontal)
+    nameLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+    statusLabel.translatesAutoresizingMaskIntoConstraints = false
+    statusLabel.numberOfLines = 1
+    statusLabel.lineBreakMode = .byTruncatingTail
+    statusLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+    statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+    spinner.translatesAutoresizingMaskIntoConstraints = false
+    spinner.hidesWhenStopped = true
+    spinner.setContentHuggingPriority(.required, for: .horizontal)
+
+    doneCheck.translatesAutoresizingMaskIntoConstraints = false
+    doneCheck.contentMode = .scaleAspectFit
+    doneCheck.image = UIImage(systemName: "checkmark.circle.fill")?
+      .withRenderingMode(.alwaysTemplate)
+    doneCheck.setContentHuggingPriority(.required, for: .horizontal)
+
+    chevron.translatesAutoresizingMaskIntoConstraints = false
+    chevron.contentMode = .scaleAspectFit
+    chevron.image = UIImage(systemName: "chevron.right")?.withRenderingMode(.alwaysTemplate)
+    chevron.setContentHuggingPriority(.required, for: .horizontal)
+    chevron.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+    stack.addArrangedSubview(avatarView)
+    stack.addArrangedSubview(nameLabel)
+    stack.addArrangedSubview(statusLabel)
+    stack.addArrangedSubview(spinner)
+    stack.addArrangedSubview(doneCheck)
+    stack.addArrangedSubview(chevron)
+
+    NSLayoutConstraint.activate([
+      stack.leadingAnchor.constraint(equalTo: header.leadingAnchor),
+      stack.trailingAnchor.constraint(equalTo: header.trailingAnchor),
+      stack.topAnchor.constraint(equalTo: header.topAnchor, constant: 5.0),
+      stack.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -5.0),
+      avatarView.widthAnchor.constraint(equalToConstant: 22.0),
+      avatarView.heightAnchor.constraint(equalToConstant: 22.0),
+      doneCheck.widthAnchor.constraint(equalToConstant: 15.0),
+      doneCheck.heightAnchor.constraint(equalToConstant: 15.0),
+      chevron.widthAnchor.constraint(equalToConstant: 10.0),
+      chevron.heightAnchor.constraint(equalToConstant: 12.0),
+    ])
+
+    header.addAction(UIAction { [weak self] _ in self?.onTap?() }, for: .touchUpInside)
+  }
+
+  func configure(item: VibeAgentKitProgressItem, appearance: VibeAgentKitChatAppearance) {
+    let worker = item.subagentType ?? ""
+    let name = item.label.isEmpty ? worker.capitalized : item.label
+    avatarView.configure(
+      name: name,
+      avatarUrl: SenderRunAvatarView.agentAvatarURL(for: worker),
+      tint: appearance.primary,
+      provider: worker)
+    nameLabel.attributedText = NSAttributedString(
+      string: name,
+      attributes: [
+        .font: UIFont.systemFont(ofSize: 14.0, weight: .semibold),
+        .foregroundColor: appearance.text,
+      ])
+    let statusText = item.messagePreview ?? ""
+    statusLabel.attributedText = NSAttributedString(
+      string: statusText,
+      attributes: [
+        .font: UIFont.systemFont(ofSize: 12.5, weight: .regular),
+        .foregroundColor: vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.78),
+      ])
+    let s = (item.status ?? "").lowercased()
+    let running = vibeAgentKitRunningStepStatuses.contains(s) || s == "starting"
+    let done = s == "done" || s == "completed"
+    let failed = s == "failed" || s == "error"
+    if running { spinner.startAnimating() } else { spinner.stopAnimating() }
+    doneCheck.isHidden = !(done || failed)
+    doneCheck.tintColor =
+      failed
+      ? UIColor.systemRed.withAlphaComponent(0.85)
+      : UIColor.systemGreen.withAlphaComponent(0.85)
+    if failed {
+      doneCheck.image = UIImage(systemName: "xmark.circle.fill")?
+        .withRenderingMode(.alwaysTemplate)
+    } else if done {
+      doneCheck.image = UIImage(systemName: "checkmark.circle.fill")?
+        .withRenderingMode(.alwaysTemplate)
+    }
+    spinner.color = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.72)
+    chevron.tintColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.6)
+  }
+}
+
 // A compact, always-tappable row for a Claude subagent (Task tool). Shows the
 // subagent flavor ("Subagent · explore"), a live spinner while it runs, the step
 // count, and a chevron. Tapping opens the read-only subagent view; it never expands

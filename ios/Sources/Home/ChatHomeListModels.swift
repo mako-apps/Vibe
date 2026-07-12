@@ -124,36 +124,112 @@ enum ChatAvatarURLResolver {
   }
 }
 
+/// Shared avatar memory + disk store used by home, chat, profile, and members.
+///
+/// **Display contract for call sites:**
+/// - Always call `cached(for:)` first and paint that image immediately when present.
+/// - Never clear an on-screen avatar to initials while the **same URL** is still loading.
+/// - On URL change for the same entity: keep the previous image until the new one
+///   arrives, then soft-crossfade (see `VibeAvatarDisplay.apply`).
 enum ChatAvatarImageStore {
+  /// Downsampled avatar edge for list cells (fast cold open / memory).
+  private static let diskPixelMax: CGFloat = 384
+  /// Higher cap for profile/settings hero (full-width banner needs more than 384).
+  private static let heroPixelMax: CGFloat = 1280
+
   private static let imageCache: NSCache<NSString, UIImage> = {
     let cache = NSCache<NSString, UIImage>()
-    cache.countLimit = 128
-    // ~24 MB of decoded avatar pixels (cost ≈ width*height*4 when known).
-    cache.totalCostLimit = 24 * 1024 * 1024
+    cache.countLimit = 256
+    // ~48 MB of decoded avatar pixels (cost ≈ width*height*4 when known).
+    cache.totalCostLimit = 48 * 1024 * 1024
     return cache
   }()
   private static let inFlightCoordinator = ChatAvatarImageLoadCoordinator()
+  /// Avoid repeated failed disk stats on hot scroll paths.
+  private static let diskMissLock = NSLock()
+  private static var diskMissKeys = Set<String>()
 
+  private static var diskDirectory: URL = {
+    let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+      ?? FileManager.default.temporaryDirectory
+    let dir = base.appendingPathComponent("vibe-avatars", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir
+  }()
+
+  /// Memory hit, else **synchronous** disk seed (downsampled JPEG) so cold launch
+  /// paints avatars on first layout without an initials flash.
   static func cached(for rawValue: String?) -> UIImage? {
     guard let key = cacheKey(rawValue) else { return nil }
-    return imageCache.object(forKey: key as NSString)
+    if let mem = imageCache.object(forKey: key as NSString) {
+      return mem
+    }
+    if let disk = loadFromDisk(key: key) {
+      storeInMemory(disk, key: key)
+      return disk
+    }
+    return nil
   }
 
   static func cache(_ image: UIImage, for rawValue: String?) {
-    guard let key = cacheKey(rawValue) else { return }
-    let pixelW = max(1, Int(image.size.width * image.scale))
-    let pixelH = max(1, Int(image.size.height * image.scale))
-    imageCache.setObject(image, forKey: key as NSString, cost: pixelW * pixelH * 4)
+    cache(image, for: rawValue, maxPixel: diskPixelMax)
   }
 
+  /// Prefer for profile/settings hero uploads (sharper than list 384px).
+  static func cacheHero(_ image: UIImage, for rawValue: String?) {
+    cache(image, for: rawValue, maxPixel: heroPixelMax)
+  }
+
+  static func cache(_ image: UIImage, for rawValue: String?, maxPixel: CGFloat) {
+    guard let key = cacheKey(rawValue) else { return }
+    let prepared = downsample(image, maxPixel: maxPixel) ?? image
+    storeInMemory(prepared, key: key)
+    writeToDisk(prepared, key: key)
+  }
+
+  /// Memory-only purge (memory warnings). Disk survives for the next paint.
   static func purge() {
     imageCache.removeAllObjects()
+    diskMissLock.lock()
+    diskMissKeys.removeAll()
+    diskMissLock.unlock()
+  }
+
+  /// Drop one key (e.g. after a known avatar URL rotation).
+  static func invalidate(rawValue: String?) {
+    guard let key = cacheKey(rawValue) else { return }
+    imageCache.removeObject(forKey: key as NSString)
+    diskMissLock.lock()
+    diskMissKeys.remove(key)
+    diskMissLock.unlock()
+    let url = diskFileURL(for: key)
+    try? FileManager.default.removeItem(at: url)
   }
 
   static func load(from rawValue: String?) async -> UIImage? {
+    await load(from: rawValue, maxPixel: diskPixelMax)
+  }
+
+  /// Higher-res load for hero/settings (does not force every list cell to pay).
+  static func loadHero(from rawValue: String?) async -> UIImage? {
+    await load(from: rawValue, maxPixel: heroPixelMax)
+  }
+
+  static func load(from rawValue: String?, maxPixel: CGFloat) async -> UIImage? {
     guard let key = cacheKey(rawValue) else { return nil }
+
     if let cached = imageCache.object(forKey: key as NSString) {
-      return cached
+      // List path always accepts cache; hero path re-fetches if under-resolved.
+      if maxPixel <= diskPixelMax || longestPixelEdge(cached) >= maxPixel * 0.55 {
+        return cached
+      }
+    }
+
+    if let disk = loadFromDisk(key: key) {
+      if maxPixel <= diskPixelMax || longestPixelEdge(disk) >= maxPixel * 0.55 {
+        storeInMemory(disk, key: key)
+        return disk
+      }
     }
 
     let task = await inFlightCoordinator.task(for: key) {
@@ -162,15 +238,84 @@ enum ChatAvatarImageStore {
       }
     }
     let image = await task.value
-
     await inFlightCoordinator.finish(key: key)
 
     if let image {
-      let pixelW = max(1, Int(image.size.width * image.scale))
-      let pixelH = max(1, Int(image.size.height * image.scale))
-      imageCache.setObject(image, forKey: key as NSString, cost: pixelW * pixelH * 4)
+      let prepared = downsample(image, maxPixel: maxPixel) ?? image
+      storeInMemory(prepared, key: key)
+      writeToDisk(prepared, key: key)
+      return prepared
+    }
+    return nil
+  }
+
+  private static func longestPixelEdge(_ image: UIImage) -> CGFloat {
+    max(image.size.width * image.scale, image.size.height * image.scale)
+  }
+
+  private static func storeInMemory(_ image: UIImage, key: String) {
+    let pixelW = max(1, Int(image.size.width * image.scale))
+    let pixelH = max(1, Int(image.size.height * image.scale))
+    imageCache.setObject(image, forKey: key as NSString, cost: pixelW * pixelH * 4)
+  }
+
+  private static func diskFileURL(for key: String) -> URL {
+    let safe = key.data(using: .utf8).map { $0.base64EncodedString() } ?? key
+    let trimmed = safe
+      .replacingOccurrences(of: "/", with: "_")
+      .replacingOccurrences(of: "+", with: "-")
+    let name = String(trimmed.prefix(180)) + ".jpg"
+    return diskDirectory.appendingPathComponent(name)
+  }
+
+  private static func loadFromDisk(key: String) -> UIImage? {
+    diskMissLock.lock()
+    let knownMiss = diskMissKeys.contains(key)
+    diskMissLock.unlock()
+    if knownMiss { return nil }
+
+    let url = diskFileURL(for: key)
+    guard FileManager.default.fileExists(atPath: url.path) else {
+      diskMissLock.lock()
+      diskMissKeys.insert(key)
+      diskMissLock.unlock()
+      return nil
+    }
+    guard let data = try? Data(contentsOf: url),
+      let image = UIImage(data: data)
+    else {
+      diskMissLock.lock()
+      diskMissKeys.insert(key)
+      diskMissLock.unlock()
+      return nil
     }
     return image
+  }
+
+  private static func writeToDisk(_ image: UIImage, key: String) {
+    diskMissLock.lock()
+    diskMissKeys.remove(key)
+    diskMissLock.unlock()
+    let url = diskFileURL(for: key)
+    DispatchQueue.global(qos: .utility).async {
+      guard let data = image.jpegData(compressionQuality: 0.82) else { return }
+      try? data.write(to: url, options: [.atomic])
+    }
+  }
+
+  private static func downsample(_ image: UIImage, maxPixel: CGFloat) -> UIImage? {
+    let pixelW = image.size.width * image.scale
+    let pixelH = image.size.height * image.scale
+    let longest = max(pixelW, pixelH)
+    guard longest > maxPixel else { return image }
+    let scale = maxPixel / longest
+    let newSize = CGSize(width: max(1, pixelW * scale), height: max(1, pixelH * scale))
+    let format = UIGraphicsImageRendererFormat.default()
+    format.scale = 1
+    let renderer = UIGraphicsImageRenderer(size: newSize, format: format)
+    return renderer.image { _ in
+      image.draw(in: CGRect(origin: .zero, size: newSize))
+    }
   }
 
   private static func fetchImage(for value: String) async -> UIImage? {
@@ -220,6 +365,39 @@ enum ChatAvatarImageStore {
   private static func cacheKey(_ rawValue: String?) -> String? {
     let value = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     return value.isEmpty ? nil : value
+  }
+}
+
+/// Soft in-circle avatar apply: never flash initials when a cached/previous image exists.
+enum VibeAvatarDisplay {
+  /// Apply `image` into `imageView` with a short cross-dissolve when replacing a prior photo.
+  /// Call only on main. When `image` is nil and `keepPrevious` is true, leave the current photo.
+  static func apply(
+    _ image: UIImage?,
+    to imageView: UIImageView,
+    fallbackLabel: UILabel?,
+    animated: Bool,
+    keepPreviousIfNil: Bool = true
+  ) {
+    if image == nil {
+      if keepPreviousIfNil, imageView.image != nil { return }
+      imageView.image = nil
+      fallbackLabel?.isHidden = false
+      return
+    }
+    let hadPhoto = imageView.image != nil
+    if animated, hadPhoto {
+      UIView.transition(
+        with: imageView,
+        duration: 0.22,
+        options: [.transitionCrossDissolve, .allowUserInteraction]
+      ) {
+        imageView.image = image
+      }
+    } else {
+      imageView.image = image
+    }
+    fallbackLabel?.isHidden = true
   }
 }
 

@@ -177,6 +177,18 @@ struct ChatListRow {
       if s == "skipped" {
         return "\(name) · skipped"
       }
+      // Watchdog transitions: a usage-limited slice restarted on another
+      // provider, or a run torn down mid-flight.
+      if s == "reassigned" {
+        if let last = lastLabel, !last.isEmpty {
+          let short = last.count > 28 ? String(last.prefix(28)) + "…" : last
+          return "\(name) · \(short)"
+        }
+        return "\(name) · reassigned"
+      }
+      if s == "cancelled" || s == "canceled" {
+        return "\(name) · cancelled"
+      }
       if let last = lastLabel, !last.isEmpty {
         let short = last.count > 28 ? String(last.prefix(28)) + "…" : last
         return "\(name) · \(s.isEmpty ? "running" : s) · \(short)"
@@ -240,6 +252,25 @@ struct ChatListRow {
       guard !teamWorkersStatus.isEmpty else { return nil }
       let parts = teamWorkersStatus.map(\.compactLine)
       return parts.joined(separator: "  ·  ")
+    }
+
+    /// Run-phase headline derived from the roster states (team-architecture-v2):
+    /// lead alone planning → workers building → lead verifying/integrating.
+    var teamPhaseLabel: String? {
+      guard !teamWorkersStatus.isEmpty else { return nil }
+      let leadHandle = (leadWorker ?? "").lowercased()
+      let workers = teamWorkersStatus.filter { $0.worker.lowercased() != leadHandle }
+      guard !workers.isEmpty else { return "Planning…" }
+      let runningCount = workers.filter(\.isRunning).count
+      let anyStarted = workers.contains {
+        !($0.status.lowercased() == "pending" || $0.status.lowercased() == "queued")
+      }
+      if runningCount > 0 {
+        return runningCount == 1 ? "Team building · 1 working" : "Team building · \(runningCount) working"
+      }
+      if !anyStarted { return "Planning…" }
+      // Every worker slice is terminal; the lead is integrating/verifying.
+      return "Verifying…"
     }
   }
 

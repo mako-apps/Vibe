@@ -610,7 +610,7 @@ struct AddGroupMembersSheet: View {
         .padding(.vertical, 10)
         .background(
           RoundedRectangle(cornerRadius: 12, style: .continuous)
-            .fill(palette.card)
+            .fill(colorScheme == .dark ? Color.white.opacity(0.10) : Color.black.opacity(0.05))
         )
         .padding(.horizontal, 16)
         .padding(.top, 8)
@@ -684,7 +684,8 @@ struct AddGroupMembersSheet: View {
           }
         }
       }
-      .background(palette.background.ignoresSafeArea())
+      // Glass pageSheet like chat progress/ask — no solid body fill.
+      .background(Color.clear)
       .navigationTitle("Add Members")
       .navigationBarTitleDisplayMode(.inline)
       .toolbarBackground(.hidden, for: .navigationBar)
@@ -713,15 +714,17 @@ struct AddGroupMembersSheet: View {
       .overlay {
         if isSaving {
           ZStack {
-            Color.black.opacity(0.3).ignoresSafeArea()
+            Color.black.opacity(0.25).ignoresSafeArea()
             ProgressView()
               .padding()
-              .background(palette.card)
-              .cornerRadius(8)
+              .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
           }
         }
       }
     }
+    .presentationDetents([.medium, .large])
+    .presentationDragIndicator(.visible)
+    .presentationBackground(.clear)
   }
 
   @ViewBuilder
@@ -978,5 +981,121 @@ struct GroupEditSheet: View {
     } catch {
       errorMessage = error.localizedDescription
     }
+  }
+}
+
+// MARK: - Member admin actions (home material sheet)
+
+/// Frosted sheet for promote / demote / remove — same surface as GroupEditSheet.
+struct GroupMemberActionsSheet: View {
+  @Environment(\.dismiss) private var dismiss
+  @Environment(\.colorScheme) private var colorScheme
+
+  let name: String
+  let role: String
+  let onPromote: () -> Void
+  let onDemote: () -> Void
+  let onRemove: () -> Void
+
+  private var palette: AppThemePalette { AppThemePalette.resolve(for: colorScheme) }
+
+  private var roleLabel: String {
+    switch role.lowercased() {
+    case "owner": return "Owner"
+    case "admin": return "Admin"
+    default: return "Member"
+    }
+  }
+
+  var body: some View {
+    NavigationStack {
+      VStack(spacing: 14) {
+        VStack(spacing: 4) {
+          Text(name)
+            .font(.system(size: 22, weight: .bold))
+            .foregroundStyle(palette.text)
+            .multilineTextAlignment(.center)
+          Text(roleLabel)
+            .font(.system(size: 14, weight: .medium))
+            .foregroundStyle(palette.secondaryText)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 8)
+
+        VStack(spacing: 0) {
+          if role.lowercased() == "admin" {
+            actionRow(title: "Dismiss as Admin", systemImage: "arrow.down.circle", destructive: false) {
+              onDemote()
+              dismiss()
+            }
+            divider
+          } else {
+            actionRow(title: "Make Admin", systemImage: "arrow.up.circle", destructive: false) {
+              onPromote()
+              dismiss()
+            }
+            divider
+          }
+          actionRow(title: "Remove from Group", systemImage: "person.badge.minus", destructive: true) {
+            onRemove()
+            dismiss()
+          }
+        }
+        .background(
+          (colorScheme == .dark ? Color.white.opacity(0.10) : Color.black.opacity(0.05))
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .padding(.horizontal, 16)
+
+        Spacer(minLength: 0)
+      }
+      .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+      .background(Color.clear)
+      .navigationTitle("Member")
+      .navigationBarTitleDisplayMode(.inline)
+      .toolbarBackground(.hidden, for: .navigationBar)
+      .toolbar {
+        ToolbarItem(placement: .topBarTrailing) {
+          Button { dismiss() } label: {
+            Image(systemName: "xmark")
+              .font(.system(size: 15, weight: .semibold))
+          }
+        }
+      }
+    }
+    .presentationBackground(.clear)
+    .presentationDetents([.medium])
+    .presentationDragIndicator(.visible)
+  }
+
+  private var divider: some View {
+    Rectangle()
+      .fill(palette.border.opacity(0.55))
+      .frame(height: 1 / UIScreen.main.scale)
+      .padding(.leading, 52)
+  }
+
+  private func actionRow(
+    title: String,
+    systemImage: String,
+    destructive: Bool,
+    action: @escaping () -> Void
+  ) -> some View {
+    Button(action: action) {
+      HStack(spacing: 14) {
+        Image(systemName: systemImage)
+          .font(.system(size: 17, weight: .regular))
+          .foregroundStyle(destructive ? Color.red : palette.text)
+          .frame(width: 24)
+        Text(title)
+          .font(.system(size: 17, weight: .regular))
+          .foregroundStyle(destructive ? Color.red : palette.text)
+        Spacer()
+      }
+      .padding(.horizontal, 16)
+      .padding(.vertical, 16)
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
   }
 }

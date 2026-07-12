@@ -955,6 +955,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// baked into every cell. Keyed by run id (the run's last message id).
   private let senderAvatarOverlay = UIView()
   private var senderAvatarViews: [String: SenderRunAvatarView] = [:]
+  /// Last logged composer-occlusion height ([AvatarPin] clamp log dedupe).
+  private var lastAvatarOcclusionLogged: CGFloat = -1
 
   /// Avatar column reserved on the leading edge of incoming group bubbles.
   static let groupAvatarSize: CGFloat = 29.0
@@ -1536,6 +1538,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     layoutActivityOverlay()
     layoutGapDebugOverlay()
     layoutBridgeCommandOverlay()
+    layoutAgentResponseNotice()
     layoutBridgeUsageBanner()
     layoutBridgeTaskBanner()
     layoutPendingBridgeQueue()
@@ -1948,6 +1951,214 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var lastBridgeUsageRequestAt: TimeInterval = 0
   private var dismissedBridgeUsageKey: String?
   private var hadLiveBridgeRun = false
+
+  // MARK: - Agent no-response watchdog + retry notice
+  //
+  // A prompt sent to an agent surface — a multi-agent group OR a 1:1 bridge DM —
+  // can silently evaporate: a dropped run_task, a reconnecting computer, or an
+  // exhausted/failed agent means the send is acked but NOTHING ever comes back
+  // (no stream, no typing, no reply). Instead of "send and do nothing", arm a
+  // watchdog on every accepted agent send. Any agent activity (a live stream, a
+  // typing indicator, a new reply, or the engine's live agent state) stands it
+  // down. If the window elapses in total silence, show a clear inline notice above
+  // the composer with a one-tap Retry that re-dispatches the exact same prompt.
+  private struct PendingAgentSend {
+    let text: String
+    let bridgeMetadata: [String: Any]
+    let agentMention: Bool
+    let agentText: String?
+    let mentionedAgentUsername: String?
+  }
+  private static let agentResponseWatchdogSeconds: TimeInterval = 24.0
+  private var agentResponseWatchdogWork: DispatchWorkItem?
+  private var agentResponseWatchdogMessageId: String?
+  private var agentResponseWatchdogChatId: String?
+  private var agentResponseWatchdogBaselineAgentRows = 0
+  private var agentResponseWatchdogSend: PendingAgentSend?
+  private var lastAgentResponseSend: PendingAgentSend?
+  private var agentResponseNoticeView: AgentResponseNoticeView?
+
+  private func currentAgentRowCount() -> Int {
+    rows.reduce(0) { acc, row in
+      (row.kind == .message && row.isAgentMessage && row.messageType != "typing") ? acc + 1 : acc
+    }
+  }
+
+  /// Arm the watchdog for a prompt just accepted for an agent surface. Runs on main.
+  private func armAgentResponseWatchdog(messageId: String, send: PendingAgentSend) {
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !chatId.isEmpty else { return }
+    cancelAgentResponseWatchdog(reason: "re-arm")
+    hideAgentResponseNotice(animated: false)
+    agentResponseWatchdogMessageId = messageId
+    agentResponseWatchdogChatId = chatId
+    agentResponseWatchdogSend = send
+    agentResponseWatchdogBaselineAgentRows = currentAgentRowCount()
+    let work = DispatchWorkItem { [weak self] in
+      self?.fireAgentResponseWatchdog(messageId: messageId, chatId: chatId)
+    }
+    agentResponseWatchdogWork = work
+    NSLog(
+      "[AgentWatchdog] armed chatId=%@ messageId=%@ baselineAgentRows=%d window=%.0fs",
+      String(chatId.suffix(12)), messageId, agentResponseWatchdogBaselineAgentRows,
+      Self.agentResponseWatchdogSeconds)
+    DispatchQueue.main.asyncAfter(
+      deadline: .now() + Self.agentResponseWatchdogSeconds, execute: work)
+  }
+
+  private func cancelAgentResponseWatchdog(reason: String) {
+    guard agentResponseWatchdogWork != nil || agentResponseWatchdogMessageId != nil else { return }
+    agentResponseWatchdogWork?.cancel()
+    agentResponseWatchdogWork = nil
+    if let mid = agentResponseWatchdogMessageId {
+      NSLog("[AgentWatchdog] cancelled messageId=%@ reason=%@", mid, reason)
+    }
+    agentResponseWatchdogMessageId = nil
+    agentResponseWatchdogChatId = nil
+    agentResponseWatchdogSend = nil
+  }
+
+  /// Called after each row-apply: if an agent started streaming / typing / replied
+  /// since the send was armed, stand the watchdog down — and clear a notice already
+  /// shown (covers a late reply that lands after the notice popped).
+  private func noteAgentActivityForWatchdog() {
+    let armed = agentResponseWatchdogMessageId != nil
+    let noticeShown = agentResponseNoticeView.map { !$0.isHidden } ?? false
+    guard armed || noticeShown else { return }
+    // Cancel only on REAL output — a live stream or a new reply/notice row. A bare
+    // typing indicator is deliberately NOT a cancel signal here: the server can flash
+    // an optimistic "typing" the instant it dispatches, even when the paired computer
+    // never actually runs the task (the exact silent-drop we exist to catch). Persistent
+    // typing/progress is re-checked at fire time, where a genuinely-working agent stands
+    // the watchdog down and a transient dispatch flicker has long since cleared.
+    let hasLiveAgent = rows.contains { $0.isAgentMessage && bridgeRowIsLive($0) }
+    let newAgentReply = currentAgentRowCount() > agentResponseWatchdogBaselineAgentRows
+    guard hasLiveAgent || newAgentReply else { return }
+    if armed { cancelAgentResponseWatchdog(reason: "agent_activity") }
+    if noticeShown { hideAgentResponseNotice(animated: true) }
+  }
+
+  private func fireAgentResponseWatchdog(messageId: String, chatId: String) {
+    guard agentResponseWatchdogMessageId == messageId else { return }
+    let currentChat = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard currentChat == chatId else {
+      cancelAgentResponseWatchdog(reason: "chat_changed")
+      return
+    }
+    // Last-chance sign-of-life: rows may not carry a stream row yet, but the engine's
+    // live typing/progress state can lead the first frame — treat either as "working".
+    let hasLiveAgent = rows.contains { $0.isAgentMessage && bridgeRowIsLive($0) }
+    let hasTyping = rows.contains { $0.kind == .message && $0.messageType == "typing" }
+    let newAgentReply = currentAgentRowCount() > agentResponseWatchdogBaselineAgentRows
+    let engineTyping = !ChatEngine.shared.typingUserIds(chatId: chatId).isEmpty
+    let engineProgress = ChatEngine.shared.agentProgress(chatId: chatId) != nil
+    if hasLiveAgent || hasTyping || newAgentReply || engineTyping || engineProgress {
+      NSLog("[AgentWatchdog] stand-down at fire messageId=%@ (activity present)", messageId)
+      cancelAgentResponseWatchdog(reason: "activity_at_fire")
+      return
+    }
+    let send = agentResponseWatchdogSend
+    NSLog(
+      "[AgentWatchdog] FIRED — no agent response messageId=%@ chatId=%@", messageId,
+      String(chatId.suffix(12)))
+    cancelAgentResponseWatchdog(reason: "fired")
+    showAgentResponseNotice(message: agentResponseNoticeMessage(), send: send)
+  }
+
+  private func agentResponseNoticeMessage() -> String {
+    if isGroupOrChannel && groupHasBridgeAgents() {
+      return "No response from your agents yet — your computer may be reconnecting."
+    }
+    let name = currentBridgeProvider?.capitalized ?? "The agent"
+    return "\(name) hasn't responded — your computer may be reconnecting."
+  }
+
+  private func showAgentResponseNotice(message: String, send: PendingAgentSend?) {
+    lastAgentResponseSend = send ?? lastAgentResponseSend
+    let notice: AgentResponseNoticeView
+    if let existing = agentResponseNoticeView {
+      notice = existing
+    } else {
+      let created = AgentResponseNoticeView()
+      created.onClose = { [weak self] in self?.hideAgentResponseNotice(animated: true) }
+      addSubview(created)
+      agentResponseNoticeView = created
+      notice = created
+    }
+    notice.onRetry = { [weak self] in self?.retryAgentResponseSend() }
+    notice.configure(message: message)
+    notice.applyColors(
+      isDark: appearance.isDark,
+      textColor: appearance.textColorThem,
+      accent: ChatListAppearance.brandAccentFallback)
+    notice.isHidden = false
+    bringSubviewToFront(notice)
+    setNeedsLayout()
+    layoutIfNeeded()
+    notice.alpha = 0.0
+    notice.transform = CGAffineTransform(translationX: 0, y: 10)
+    UIView.animate(
+      withDuration: 0.24, delay: 0, options: [.beginFromCurrentState, .allowUserInteraction]
+    ) {
+      notice.alpha = 1.0
+      notice.transform = .identity
+    }
+    UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
+  }
+
+  private func hideAgentResponseNotice(animated: Bool) {
+    guard let notice = agentResponseNoticeView, !notice.isHidden else { return }
+    guard animated else {
+      notice.isHidden = true
+      notice.alpha = 0.0
+      return
+    }
+    UIView.animate(
+      withDuration: 0.18, delay: 0, options: [.beginFromCurrentState, .allowUserInteraction]
+    ) {
+      notice.alpha = 0.0
+      notice.transform = CGAffineTransform(translationX: 0, y: 8)
+    } completion: { _ in
+      if notice.alpha <= 0.01 { notice.isHidden = true }
+    }
+  }
+
+  private func layoutAgentResponseNotice() {
+    guard let notice = agentResponseNoticeView, !notice.isHidden else { return }
+    let barMinY = agentComposerView?.frame.minY ?? inputBar?.frame.minY ?? bounds.height
+    let width = max(0.0, bounds.width - 24.0)
+    let targetSize = notice.systemLayoutSizeFitting(
+      CGSize(width: width, height: UIView.layoutFittingCompressedSize.height),
+      withHorizontalFittingPriority: .required,
+      verticalFittingPriority: .fittingSizeLevel)
+    let height = max(46.0, targetSize.height)
+    notice.frame = CGRect(x: 12.0, y: barMinY - height - 10.0, width: width, height: height)
+  }
+
+  private func retryAgentResponseSend() {
+    guard let send = lastAgentResponseSend else {
+      hideAgentResponseNotice(animated: true)
+      return
+    }
+    hideAgentResponseNotice(animated: true)
+    let newId = UUID().uuidString.lowercased()
+    let now = Date()
+    let ts = now.timeIntervalSince1970 * 1000
+    let fmt = DateFormatter()
+    fmt.dateFormat = "HH:mm"
+    NSLog("[AgentWatchdog] retry re-dispatch newMessageId=%@", newId)
+    dispatchOutgoingSend(
+      messageId: newId,
+      text: send.text,
+      timestamp: fmt.string(from: now),
+      timestampMs: ts,
+      replyToMessageId: nil,
+      bridgeMetadata: send.bridgeMetadata,
+      agentMention: send.agentMention,
+      agentText: send.agentText,
+      mentionedAgentUsername: send.mentionedAgentUsername)
+    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+  }
 
   private func showBridgeCommandOverlay(name: String, body: String) {
     let overlay: VibeAgentCommandOverlayView
@@ -2780,6 +2991,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var bridgeTaskBannerSeenNodeIds: Set<String> = []
   private var bridgeTaskBannerRowKey: String?
   private var lastBridgeTaskBannerRefreshAt: CFTimeInterval = 0
+  /// Pending delayed hide — the banner must not blink out on transient states (the
+  /// live row's uid flip, the stream→settled swap gap) while the task payload still
+  /// says the run is live. Cancelled by the next refresh that finds tasks.
+  private var bridgeTaskBannerHideWorkItem: DispatchWorkItem?
+  /// Turn key the currently DISPLAYED banner items belong to — the delayed hide
+  /// keeps the banner only while this same turn is still live.
+  private var bridgeTaskBannerItemsTurnKey: String?
 
   /// Rebuild the "N tasks live" banner from the live turn's progress nodes. A node
   /// counts as a TASK when it's a terminal/subagent-style step (bash/task/tool/mcp)
@@ -2796,10 +3014,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     lastBridgeTaskBannerRefreshAt = now
 
     guard let liveRow = rows.last(where: { $0.isAgentMessage && bridgeRowIsLive($0) }) else {
-      hideBridgeTaskBanner()
+      // Settle gap / brief live-state blink — hide through the grace timer so the
+      // banner reads as stable while the run itself is still going.
+      scheduleBridgeTaskBannerHide()
       return
     }
-    let rowKey = liveRow.messageId ?? liveRow.key
+    // Key the surfaced-task set by TURN, not by row key: the live row's uid can flip
+    // mid-run (grok-live↔rs_, stream→settled swap) and a row-key reset would drop
+    // every already-surfaced task — the "banner randomly disappears" report.
+    let taskId = liveRow.agentRuntime?.taskId?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let rowKey = (taskId?.isEmpty == false) ? taskId! : (liveRow.messageId ?? liveRow.key)
     if rowKey != bridgeTaskBannerRowKey {
       bridgeTaskBannerRowKey = rowKey
       bridgeTaskBannerSeenNodeIds = []
@@ -2824,24 +3048,66 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       }
     }
     guard !tasks.isEmpty else {
-      hideBridgeTaskBanner()
+      scheduleBridgeTaskBannerHide()
       return
     }
+    bridgeTaskBannerHideWorkItem?.cancel()
+    bridgeTaskBannerHideWorkItem = nil
     bridgeTaskBannerItems = tasks
+    bridgeTaskBannerItemsTurnKey = rowKey
     rebuildBridgeTaskBanner(tasks: tasks)
   }
 
+  /// Current live turn's key (taskId when available), or nil when no live agent row.
+  private func bridgeTaskBannerLiveTurnKey() -> String? {
+    guard let liveRow = rows.last(where: { $0.isAgentMessage && bridgeRowIsLive($0) }) else {
+      return nil
+    }
+    let taskId = liveRow.agentRuntime?.taskId?.trimmingCharacters(in: .whitespacesAndNewlines)
+    return (taskId?.isEmpty == false) ? taskId! : (liveRow.messageId ?? liveRow.key)
+  }
+
+  /// Grace-delayed hide: transient no-live/no-task frames (uid flips, settle swaps)
+  /// must not blink the banner. At fire time the check is authoritative: keep the
+  /// banner only if the SAME turn its items belong to is live again — otherwise the
+  /// run is over (or a new turn started) and the banner animates out.
+  private func scheduleBridgeTaskBannerHide() {
+    guard let banner = bridgeTaskBanner, !banner.isHidden else {
+      // Nothing visible — just clear the turn state immediately.
+      hideBridgeTaskBanner()
+      return
+    }
+    guard bridgeTaskBannerHideWorkItem == nil else { return }
+    let work = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      self.bridgeTaskBannerHideWorkItem = nil
+      if let liveKey = self.bridgeTaskBannerLiveTurnKey(),
+        let itemsKey = self.bridgeTaskBannerItemsTurnKey,
+        liveKey == itemsKey
+      {
+        return  // same turn still live — the blink was transient, keep the banner
+      }
+      self.hideBridgeTaskBanner()
+    }
+    bridgeTaskBannerHideWorkItem = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: work)
+  }
+
   private func rebuildBridgeTaskBanner(tasks: [VibeAgentKitProgressItem]) {
-    let banner: UIView
+    let banner: UIVisualEffectView
     let scroll: UIScrollView
-    if let existing = bridgeTaskBanner, let existingScroll = bridgeTaskBannerScroll {
+    if let existing = bridgeTaskBanner as? UIVisualEffectView,
+      let existingScroll = bridgeTaskBannerScroll
+    {
       banner = existing
       scroll = existingScroll
     } else {
-      let container = UIView()
-      container.layer.cornerRadius = 18.0
+      bridgeTaskBanner?.removeFromSuperview()
+      // Same material family as the usage banner (ChatPinnedBannerView): a single
+      // glass shell, capsule corners, no solid fill and no border.
+      let container = UIVisualEffectView(effect: nil)
+      container.layer.cornerRadius = 26.0
       container.layer.cornerCurve = .continuous
-      container.layer.borderWidth = 1.0 / UIScreen.main.scale
       container.clipsToBounds = true
       addSubview(container)
 
@@ -2849,7 +3115,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       paging.isPagingEnabled = true
       paging.showsHorizontalScrollIndicator = false
       paging.translatesAutoresizingMaskIntoConstraints = false
-      container.addSubview(paging)
+      container.contentView.addSubview(paging)
 
       let count = UILabel()
       count.font = .systemFont(ofSize: 11.0, weight: .bold)
@@ -2858,15 +3124,17 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       count.layer.cornerCurve = .continuous
       count.clipsToBounds = true
       count.translatesAutoresizingMaskIntoConstraints = false
-      container.addSubview(count)
+      container.contentView.addSubview(count)
 
       NSLayoutConstraint.activate([
-        paging.topAnchor.constraint(equalTo: container.topAnchor),
-        paging.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-        paging.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-        paging.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -34.0),
-        count.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8.0),
-        count.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+        paging.topAnchor.constraint(equalTo: container.contentView.topAnchor),
+        paging.bottomAnchor.constraint(equalTo: container.contentView.bottomAnchor),
+        paging.leadingAnchor.constraint(equalTo: container.contentView.leadingAnchor),
+        paging.trailingAnchor.constraint(
+          equalTo: container.contentView.trailingAnchor, constant: -34.0),
+        count.trailingAnchor.constraint(
+          equalTo: container.contentView.trailingAnchor, constant: -8.0),
+        count.centerYAnchor.constraint(equalTo: container.contentView.centerYAnchor),
         count.widthAnchor.constraint(greaterThanOrEqualToConstant: 18.0),
         count.heightAnchor.constraint(equalToConstant: 18.0),
       ])
@@ -2877,9 +3145,24 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       scroll = paging
     }
 
-    banner.backgroundColor = appearance.bubbleThemColor
-    banner.layer.borderColor =
-      appearance.textColorThem.withAlphaComponent(appearance.isDark ? 0.14 : 0.10).cgColor
+    // Set the material once — re-assigning a fresh effect every rebuild re-runs the
+    // material transition and reads as flicker.
+    if banner.effect == nil {
+      if #available(iOS 26.0, *) {
+        let glass = UIGlassEffect(style: .regular)
+        glass.isInteractive = true
+        banner.effect = glass
+      } else {
+        banner.effect = UIBlurEffect(style: .systemThinMaterial)
+      }
+    }
+    if #available(iOS 26.0, *) {
+      banner.contentView.backgroundColor = .clear
+    } else {
+      banner.contentView.backgroundColor =
+        appearance.bubbleThemColor.withAlphaComponent(appearance.isDark ? 0.16 : 0.10)
+    }
+    banner.backgroundColor = .clear
     let liveCount = tasks.filter {
       vibeAgentKitRunningStepStatuses.contains(($0.status ?? "").lowercased())
     }.count
@@ -2921,8 +3204,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   private func hideBridgeTaskBanner() {
+    bridgeTaskBannerHideWorkItem?.cancel()
+    bridgeTaskBannerHideWorkItem = nil
     bridgeTaskBannerItems = []
     bridgeTaskBannerRowKey = nil
+    bridgeTaskBannerItemsTurnKey = nil
     bridgeTaskBannerSeenNodeIds = []
     guard let banner = bridgeTaskBanner, !banner.isHidden else { return }
     UIView.animate(
@@ -2991,6 +3277,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       for delay in [0.12, 0.45, 0.9] {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
           self?.probeGroupCellOverlap(reason: "setRows+\(delay)s", force: true)
+          self?.sweepGroupAgentCellIntegrity(reason: "setRows+\(delay)s")
         }
       }
     }
@@ -3188,6 +3475,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let applyDataSource = { [weak self] in
       guard let self else { return }
       self.rows = parsed
+      // Any live stream / typing / new reply here means the send didn't evaporate —
+      // stand the no-response watchdog down (and clear a notice if it already popped).
+      self.noteAgentActivityForWatchdog()
       if let agentVC = self.presentedBridgeAgentVC {
         agentVC.setMessages(VibeAgentKitMap.messages(from: parsed))
       }
@@ -3667,7 +3957,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
             scrollToBottom(animated: false)
           }
           if isGroupOrChannel {
-            updateFloatingSenderAvatars()
+            updateFloatingSenderAvatars(animateShift: true)
           }
           CATransaction.commit()
         }
@@ -3717,7 +4007,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           }
         }
         if isGroupOrChannel {
-          updateFloatingSenderAvatars()
+          updateFloatingSenderAvatars(animateShift: true)
         }
         CATransaction.commit()
       }
@@ -3842,6 +4132,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // Record SCREEN-SPACE Y (center.y - contentOffset.y) so additive
     // animations account for any scroll change finalize introduces.
     var preUpdateScreenY: [String: CGFloat] = [:]
+    var didCaptureAvatarPositions = false
     var preUpdateOffset: CGFloat = 0
     if shouldAnimateUpdate && animMode == 2 {
       preUpdateOffset = collectionView.contentOffset.y
@@ -3851,6 +4142,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         }
         let key = previousRows[ip.item].key
         preUpdateScreenY[key] = cell.center.y - preUpdateOffset
+      }
+      // Floating gutter avatars live in a screen-fixed overlay: record their
+      // positions ON THE VIEW (not keyed by run id — run identity can churn across
+      // the update: temp→server rekey, index shift, run growth) so pass 3 can give
+      // the surviving view the same additive ride as its run's cells.
+      for view in senderAvatarViews.values where !view.isHidden {
+        view.capturedMidY = view.frame.midY
+        didCaptureAvatarPositions = true
       }
     }
     let insertedKeySet = Set(
@@ -4015,6 +4314,25 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       cell.contentView.layer.opacity = 1.0
     }
 
+    // Agent settle swaps (delete+insert) in groups have left stale/orphaned cells
+    // painting over real rows — verify the cell layer before this frame renders.
+    if isGroupOrChannel, !deletions.isEmpty || !insertions.isEmpty {
+      sweepGroupAgentCellIntegrity(reason: "postBatch")
+    }
+    // [SendShift] The user reports a small list shift when sending in a group (cells
+    // carry sender names there). Log the offset/content geometry of every own-send
+    // insert so the next repro shows exactly which pass moved the list and by how much.
+    if isGroupOrChannel,
+      insertions.contains(where: { $0.item < parsed.count && parsed[$0.item].isMe })
+    {
+      NSLog(
+        "[SendShift] group me-insert offset %.0f→%.0f contentH=%.0f nearBottom=%@ morph=%@ del=%d ins=%d rel=%d",
+        previousContentOffsetY, collectionView.contentOffset.y,
+        collectionView.contentSize.height, wasNearBottom ? "Y" : "N",
+        (pendingSendTransition != nil || activeSendTransition != nil) ? "Y" : "N",
+        deletions.count, insertions.count, safeReloads.count)
+    }
+
     if queuedUpdateProcessed {
       NSLog("[ChatListAnim] skipping additive — queued setRows processed during finalize")
       maybeStartPendingSendTransition()
@@ -4023,8 +4341,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
     if shouldAnimateUpdate {
       // Telegram timing: 0.3s spring (matches kCAMediaTimingFunctionSpring).
-      // NOT a custom cubic bezier — a real spring with 0.3s settling time.
-      let animDuration: CFTimeInterval = 0.3
+      // During a send morph the cell ride MUST share the overlay's clock
+      // (same curve, same 0.36s duration) — a shorter ride makes the plate's
+      // growing top edge overrun the still-sliding previous cell mid-flight
+      // (visible overlap on tall sends) and land 60ms after the list stops.
+      let animDuration: CFTimeInterval =
+        hasPendingSend ? SendMorphProfile.duration : 0.3
       let animTiming = chatListSendVerticalTiming
       var dbgShifted = 0
       var dbgNewSlide = 0
@@ -4154,6 +4476,47 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           }
         }
 
+        // [SendShift] per-cell ride audit for group sends: every visible cell
+        // should carry the SAME delta (pure translation). A diverging delta
+        // means that cell's height changed across the insert (it will visibly
+        // shear against its neighbors during the ride).
+        if isGroupOrChannel, hasPendingSend, !cellInfos.isEmpty {
+          let rides = cellInfos.sorted { $0.indexPath.item < $1.indexPath.item }
+            .suffix(6)
+            .map { info -> String in
+              let tag = info.isNew ? "new" : String(format: "%.0f", info.delta)
+              return "\(info.key.suffix(6))=\(tag)h\(Int(info.cell.bounds.height))"
+            }
+            .joined(separator: " ")
+          NSLog("[SendShift] rides dur=%.2f %@", animDuration, rides)
+        }
+
+        // --- Pass 3: keep floating sender avatars glued to their run ---
+        // The cells animate the shift additively while updateFloatingSenderAvatars
+        // (fired by finalize's instant scroll) snapped the avatars straight to the
+        // final spot — the avatar visibly detaches from its cells on every group
+        // send. Re-resolve final frames, then give each avatar the same additive
+        // ride its run's cells are on.
+        if isGroupOrChannel, didCaptureAvatarPositions {
+          updateFloatingSenderAvatars()
+          for view in senderAvatarViews.values {
+            let oldY = view.capturedMidY
+            view.capturedMidY = nil
+            guard !view.isHidden, let oldY else { continue }
+            let delta = pixelAlignedValue(oldY - view.frame.midY)
+            guard abs(delta) > 0.5 else { continue }
+            let anim = CABasicAnimation(keyPath: "position.y")
+            anim.fromValue = delta as NSNumber
+            anim.toValue = 0.0 as NSNumber
+            anim.isAdditive = true
+            anim.duration = animDuration
+            anim.timingFunction = animTiming
+            anim.isRemovedOnCompletion = true
+            view.layer.add(anim, forKey: "avatarInsertionShift")
+            NSLog("[AvatarPin] glue delta=%.1f", delta)
+          }
+        }
+
       default:
         break
       }
@@ -4252,6 +4615,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     agentTurnProgressExpandedRowIds.removeAll()
     agentTurnRuntimeExpandedRowIds.removeAll()
     agentTurnStreamStartByRow.removeAll()
+    cancelAgentResponseWatchdog(reason: "chat_switch")
+    lastAgentResponseSend = nil
+    hideAgentResponseNotice(animated: false)
     scheduleBridgeAgentPresenceRefresh()
     updateChatEngineBinding()
     updateChatEngineChannelBinding()
@@ -5148,6 +5514,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// exactly (same detail VC, same sheet config), just reached from the bubble instead of
   /// the full-page surface.
   private func presentAgentTurnSubagentView(row: ChatListRow, parentNodeId: String) {
+    // Team-worker rows in a supervisor lead bubble share the subagent tap channel with
+    // a "teamworker:<handle>" node id — route them to the worker detail instead.
+    if parentNodeId.hasPrefix("teamworker:") {
+      presentTeamWorkerDetailView(
+        row: row, worker: String(parentNodeId.dropFirst("teamworker:".count)))
+      return
+    }
     guard let presenter = topPresentingViewController() else { return }
     let message = VibeAgentKitMap.chatMessage(from: row)
     let children = message.subagentChildren[parentNodeId] ?? []
@@ -5171,6 +5544,51 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // Clear the nav wrapper's opaque backing so the sheet's own UIGlassEffect refracts the
     // chat behind it (real Liquid Glass) instead of frosting a solid nav background — the
     // ask sheet looks glass precisely because it's presented WITHOUT this opaque layer.
+    nav.view.backgroundColor = .clear
+    if let sheet = nav.sheetPresentationController {
+      sheet.detents = [.medium(), .large()]
+      sheet.prefersGrabberVisible = true
+    }
+    presenter.present(nav, animated: true)
+  }
+
+  /// One supervisor team worker's read-only detail — reached by tapping its avatar row
+  /// inside the lead bubble. Lead taps show the lead's own step feed; under-hood workers
+  /// show their cached fold-in stream (`latestTeamWorkerProgressNodes`).
+  private func presentTeamWorkerDetailView(row: ChatListRow, worker: String) {
+    guard let presenter = topPresentingViewController() else { return }
+    guard let runtime = row.agentRuntime else { return }
+    let status = runtime.teamWorkersStatus.first {
+      $0.worker.caseInsensitiveCompare(worker) == .orderedSame
+    }
+    let leadHandle = runtime.leadWorker ?? runtime.teamWorker ?? runtime.provider ?? ""
+    let isLead = worker.caseInsensitiveCompare(leadHandle) == .orderedSame
+    let items: [VibeAgentKitProgressItem]
+    if isLead {
+      items = row.agentProgressNodes.map { VibeAgentKitMap.progressItem(from: $0) }
+    } else if let raw = ChatEngine.shared.latestTeamWorkerProgressNodes(
+      chatId: (row.chatId?.isEmpty == false ? row.chatId! : engineChatId),
+      teamRunId: runtime.teamRunId ?? ""
+    )?[worker] {
+      items = parseAgentProgressNodesPublic(raw).map { VibeAgentKitMap.progressItem(from: $0) }
+    } else {
+      items = []
+    }
+    let running = status?.isRunning ?? row.isStreamingText
+    // A worker with nothing to show AND no live run would present empty glass chrome.
+    guard running || !items.isEmpty || status?.summary?.isEmpty == false else { return }
+    let name = status?.label.isEmpty == false ? status!.label : worker.capitalized
+    let title = status?.compactLine ?? (running ? "\(name) — working…" : name)
+    let detail = VibeAgentSubagentDetailViewController(
+      subagentType: worker,
+      titleOverride: title,
+      bodyText: status?.summary ?? "",
+      progressItems: items,
+      running: running,
+      appearance: VibeAgentKitMap.appearance(for: traitCollection)
+    )
+    let nav = UINavigationController(rootViewController: detail)
+    nav.modalPresentationStyle = .pageSheet
     nav.view.backgroundColor = .clear
     if let sheet = nav.sheetPresentationController {
       sheet.detents = [.medium(), .large()]
@@ -5414,11 +5832,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       presentAgentBridgeAskIfNeeded(note.userInfo ?? [:])
       return
     }
-    // The chat channel just (re)joined its topic. For a bridge DM opened mid-run this is
-    // the exact gate the current-session request was failing on at cold launch (socket /
-    // join not ready) — fire it NOW instead of waiting for the next fallback-poll tick.
-    // Runs BEFORE the statusAuthority gate below because bridge DMs keep statusAuthority
-    // OFF, so this reason would otherwise never be observed here. Idempotent + throttled.
+    // The chat channel just (re)joined its topic. Refresh usage only. Session history is
+    // never mounted speculatively here: doing so replaced a fresh "Start session" view
+    // with an unrelated desktop transcript several seconds after the chat appeared.
     if (note.userInfo?["reason"] as? String) == "chatChannelStateChanged",
       currentBridgeProvider != nil || groupHasBridgeAgents()
     {
@@ -5426,9 +5842,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         in: .whitespacesAndNewlines)
       let chatKey = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
       if !chatKey.isEmpty, changed == nil || changed?.isEmpty == true || changed == chatKey {
-        if currentBridgeProvider != nil {
-          requestCurrentBridgeSession(reason: "channelJoined")
-        }
         requestBridgeUsageSnapshot(reason: "channelJoined")
       }
     }
@@ -6041,7 +6454,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// The avatar bottom-aligns to the run's last message but stays clamped inside the run's
   /// vertical span, so it "follows" the run up/down as you scroll instead of duplicating
   /// per message. Cheap: only touches currently-visible runs.
-  private func updateFloatingSenderAvatars() {
+  ///
+  /// `animateShift: true` (data-driven reloads only — never scroll ticks, which must stay
+  /// frame-exact) rides an existing avatar to its new spot with a short additive ease
+  /// instead of snapping.
+  private func updateFloatingSenderAvatars(animateShift: Bool = false) {
     guard isGroupOrChannel, !rows.isEmpty else {
       if !senderAvatarViews.isEmpty {
         senderAvatarViews.values.forEach { $0.removeFromSuperview() }
@@ -6052,6 +6469,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
     let visible = collectionView.indexPathsForVisibleItems.sorted { $0.item < $1.item }
     guard let firstVisible = visible.first?.item, let lastVisible = visible.last?.item else {
+      if senderAvatarViews.contains(where: { !$0.value.isHidden }) {
+        NSLog("[AvatarPin] hideAll — no visible items (rows=%d, stale post-reload layout?)", rows.count)
+      }
       senderAvatarViews.values.forEach { $0.isHidden = true }
       return
     }
@@ -6059,16 +6479,31 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let offsetY = collectionView.contentOffset.y
     let size = Self.groupAvatarSize
     let avatarX = messageHorizontalInset + bubbleSideMargin
-    let viewportBottom = offsetY + collectionView.bounds.height - collectionView.adjustedContentInset.bottom
+    // The floating composer's clearance lives in contentPaddingBottom (flow-layout
+    // section inset — part of contentSize), NOT contentInset, so clamping against
+    // adjustedContentInset alone pinned tall-run avatars at the physical screen bottom,
+    // hidden behind the input bar. Clamp above whichever occludes more, plus a small
+    // margin so the avatar reads "sitting above the composer".
+    let bottomOcclusion = max(collectionView.adjustedContentInset.bottom, contentPaddingBottom)
+    let viewportBottom = offsetY + collectionView.bounds.height - bottomOcclusion - 6.0
+    if abs(bottomOcclusion - lastAvatarOcclusionLogged) > 0.5 {
+      lastAvatarOcclusionLogged = bottomOcclusion
+      NSLog(
+        "[AvatarPin] clamp occlusion=%.0f (inset=%.0f padding=%.0f) viewportH=%.0f",
+        bottomOcclusion, collectionView.adjustedContentInset.bottom, contentPaddingBottom,
+        collectionView.bounds.height)
+    }
     var liveRunIds = Set<String>()
+    var consumedUpTo = -1
 
-    // Walk each visible row; when it's the LAST message of an incoming run, resolve the
-    // run's [top, bottom] span and place the run's single avatar.
+    // Walk visible rows; the first gutter row of each not-yet-consumed run resolves the
+    // run's [top, bottom] span and places the run's single avatar.
     var item = firstVisible
     while item <= lastVisible {
       defer { item += 1 }
+      guard item > consumedUpTo else { continue }
       let ctx = groupCellContext(at: IndexPath(item: item, section: 0))
-      guard ctx.reservesGutter, ctx.isLastOfRun, let key = ctx.senderKey else { continue }
+      guard ctx.reservesGutter, let key = ctx.senderKey else { continue }
 
       // Find the run's first index (walk back while same sender).
       var firstIndex = item
@@ -6080,8 +6515,30 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           break
         }
       }
+      // Find the run's last index by walking DATA forward — it may extend below the
+      // viewport (previously a run whose last cell scrolled offscreen simply lost its
+      // avatar). Early-exit once the span already reaches a full avatar past the clamp
+      // line: the avatar pins at viewportBottom regardless of the true run end.
+      var lastIndex = item
+      while lastIndex < rows.count - 1 {
+        if let attrs = collectionView.layoutAttributesForItem(
+          at: IndexPath(item: lastIndex, section: 0)),
+          attrs.frame.maxY >= viewportBottom + size
+        {
+          break
+        }
+        let next = adjacentGroupMessageRow(from: lastIndex, delta: 1)
+        if let next, resolvedSenderKey(next) == key {
+          lastIndex += 1
+        } else {
+          break
+        }
+      }
+      consumedUpTo = lastIndex
+
       guard
-        let lastAttrs = collectionView.layoutAttributesForItem(at: IndexPath(item: item, section: 0)),
+        let lastAttrs = collectionView.layoutAttributesForItem(
+          at: IndexPath(item: lastIndex, section: 0)),
         let firstAttrs = collectionView.layoutAttributesForItem(
           at: IndexPath(item: firstIndex, section: 0))
       else { continue }
@@ -6089,22 +6546,77 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       let runTop = firstAttrs.frame.minY
       let runBottom = lastAttrs.frame.maxY
       // Bottom-align to the last bubble, but never let the avatar leave the run's span and
-      // keep it inside the viewport when the whole run is taller than the screen.
+      // keep it inside the viewport when the run extends past the screen.
       let desiredBottom = min(runBottom, max(runTop + size, viewportBottom))
       let avatarContentY = max(runTop, min(runBottom, desiredBottom) - size)
-      let runId = rows[item].messageId ?? "\(key)-\(item)"
+      // Anchor the run id to the run's FIRST row (stable while the run grows). It is
+      // still just a cache hint — matching below survives any rekey via senderKey +
+      // row-key overlap.
+      var runRowKeys = Set<String>()
+      for i in firstIndex...lastIndex where i < rows.count {
+        runRowKeys.insert(rows[i].key)
+        if let mid = rows[i].messageId { runRowKeys.insert(mid) }
+      }
+      let runId = "\(key)#\(rows[firstIndex].messageId ?? rows[firstIndex].key)"
       liveRunIds.insert(runId)
 
       let avatarView: SenderRunAvatarView
+      var isNewView = false
+      let targetMidY = avatarContentY - offsetY + size / 2.0
       if let existing = senderAvatarViews[runId] {
         avatarView = existing
+      } else if let (oldId, rehomed) = senderAvatarViews.first(where: { id, v in
+        !liveRunIds.contains(id) && v.runSenderKey == key
+          && !v.runRowKeys.isDisjoint(with: runRowKeys)
+      }) {
+        // Same run under a new identity (temp→server rekey, first-row change from a
+        // history prepend, live-row uid flip): keep the existing view for visual
+        // continuity instead of retire+recreate.
+        senderAvatarViews.removeValue(forKey: oldId)
+        senderAvatarViews[runId] = rehomed
+        avatarView = rehomed
+        NSLog("[AvatarPin] rehome %@ → %@", oldId, runId)
+      } else if let (oldId, rehomed) = senderAvatarViews.first(where: { id, v in
+        !liveRunIds.contains(id) && v.runSenderKey == key && !v.isHidden
+          && abs(v.frame.midY - targetMidY) <= size
+      }) {
+        // Positional fallback: a stream→settle swap replaces every row identity in
+        // the run (key AND messageId both change), so key overlap can't match — but
+        // the settled run lands in the same spot. Same sender + same screen position
+        // ⇒ same run.
+        senderAvatarViews.removeValue(forKey: oldId)
+        senderAvatarViews[runId] = rehomed
+        avatarView = rehomed
+        NSLog("[AvatarPin] rehomePos %@ → %@", oldId, runId)
       } else {
         avatarView = SenderRunAvatarView()
         senderAvatarOverlay.addSubview(avatarView)
         senderAvatarViews[runId] = avatarView
+        isNewView = true
+        NSLog("[AvatarPin] create %@ y=%.0f", runId, avatarContentY - offsetY)
       }
+      avatarView.runSenderKey = key
+      avatarView.runRowKeys = runRowKeys
+      let wasHidden = avatarView.isHidden
       avatarView.isHidden = false
-      avatarView.frame = CGRect(x: avatarX, y: avatarContentY - offsetY, width: size, height: size)
+      let targetFrame = CGRect(
+        x: avatarX, y: avatarContentY - offsetY, width: size, height: size)
+      let shiftDelta = avatarView.frame.midY - targetFrame.midY
+      avatarView.frame = targetFrame
+      if animateShift, !isNewView, !wasHidden, abs(shiftDelta) > 0.5 {
+        // Data-driven move (stream growth / reload): glide instead of snapping. The
+        // additive offset decays independently, so scroll ticks re-setting the frame
+        // mid-flight don't fight it.
+        let anim = CABasicAnimation(keyPath: "position.y")
+        anim.fromValue = shiftDelta as NSNumber
+        anim.toValue = 0.0 as NSNumber
+        anim.isAdditive = true
+        anim.duration = 0.25
+        anim.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        anim.isRemovedOnCompletion = true
+        avatarView.layer.add(anim, forKey: "avatarDataShift")
+        NSLog("[AvatarPin] ease %@ delta=%.1f", runId, shiftDelta)
+      }
       let info = ctx.senderKey.flatMap { groupSenderDirectory[$0] }
       avatarView.configure(
         name: info?.name ?? ctx.senderName ?? "",
@@ -6115,6 +6627,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
     // Retire avatars whose run scrolled away.
     for (runId, view) in senderAvatarViews where !liveRunIds.contains(runId) {
+      NSLog("[AvatarPin] retire %@", runId)
       view.removeFromSuperview()
       senderAvatarViews.removeValue(forKey: runId)
     }
@@ -6178,6 +6691,48 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         String((rb?.text ?? "").prefix(22)))
       NSLog("%@", line)
       Self.appendOverlapProbeLine(line)
+    }
+  }
+
+  /// After group batch updates (agent settle swaps), verify the CELL layer matches the
+  /// data source. The flow layout's frames never overlap by construction, but rapid
+  /// multi-agent settles (3 delete+insert swaps in <1s) have left two kinds of debris
+  /// that layout probes can't see: an orphaned cell UIKit no longer tracks still painting
+  /// stale content in the viewport, and a visible cell whose configured row no longer
+  /// matches the row at its index path — both render as "overlapping/duplicated replies".
+  /// Silent when everything is consistent.
+  private func sweepGroupAgentCellIntegrity(reason: String) {
+    guard isGroupOrChannel, !rows.isEmpty else { return }
+    var ghosts = 0
+    var mismatches = 0
+    let visibleRect = CGRect(origin: collectionView.contentOffset, size: collectionView.bounds.size)
+    for case let cell as ChatListCell in collectionView.subviews {
+      guard collectionView.indexPath(for: cell) == nil else { continue }
+      // Off-viewport / hidden orphans are UIKit's reuse pool — leave those alone.
+      guard !cell.isHidden, cell.alpha > 0.01, cell.frame.intersects(visibleRect) else { continue }
+      ghosts += 1
+      NSLog(
+        "[GroupCellIntegrity] %@ ORPHAN cell key=%@ frame=(%.0f,%.0f %.0fx%.0f) — removing",
+        reason, String((cell.row?.key ?? "?").suffix(16)),
+        cell.frame.minX, cell.frame.minY, cell.frame.width, cell.frame.height)
+      cell.removeFromSuperview()
+    }
+    for case let cell as ChatListCell in collectionView.visibleCells {
+      guard let indexPath = collectionView.indexPath(for: cell), indexPath.item < rows.count
+      else { continue }
+      let row = rows[indexPath.item]
+      guard let cellKey = cell.row?.key, cellKey != row.key else { continue }
+      mismatches += 1
+      NSLog(
+        "[GroupCellIntegrity] %@ MISMATCH item=%d cell=%@ row=%@ — reconfiguring",
+        reason, indexPath.item, String(cellKey.suffix(16)), String(row.key.suffix(16)))
+      cell.applyAppearance(appearance)
+      configureMessageCell(cell, at: indexPath, row: row)
+      bindWallpaperBackdrop(to: cell)
+    }
+    if ghosts > 0 || mismatches > 0 {
+      flowLayout.invalidateLayout()
+      updateFloatingSenderAvatars()
     }
   }
 
@@ -9714,6 +10269,24 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           } else if !isBridgeSend {
             self?.setNativeOutgoingMessageStatus(messageId, status: resolvedStatus)
           }
+          // Watch agent sends for total silence: a group with agent members or a 1:1
+          // bridge DM should never "send and do nothing". If nothing comes back within
+          // the window, surface a clear Retry notice. (A hard error already showed its
+          // own affordance above, so only arm on a non-error accept.)
+          if resolvedStatus != "error", let self {
+            let isAgentSurface =
+              isBridgeSend || (self.isGroupOrChannel && self.groupHasBridgeAgents())
+            if isAgentSurface {
+              self.armAgentResponseWatchdog(
+                messageId: messageId,
+                send: ChatListView.PendingAgentSend(
+                  text: text,
+                  bridgeMetadata: bridgeMetadata,
+                  agentMention: agentMention,
+                  agentText: agentText,
+                  mentionedAgentUsername: mentionedAgentUsername))
+            }
+          }
         }
       }
     } else {
@@ -10089,7 +10662,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// page is never empty. The default chat list stays the multiplexing surface;
   /// this view is single-task.
   private var didPrefetchBridgeHistory = false
-  private var lastCurrentBridgeSessionRequestAt: TimeInterval = 0
   /// True when the in-place agent view was opened manually ("See progress") rather than by
   /// the Default view = Agent setting. A manual view is left alone by unrelated selection
   /// changes; an auto view follows a live flip of the Default-view setting.
@@ -10099,71 +10671,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// refresh instead and ignores this flag.
   private var didAutoPresentAgentView = false
 
-  /// Claude/Codex/Grok DMs open as fresh sessions. History is loaded only after the user
-  /// explicitly opens History, so relaunch/open never pulls old sessions into view.
-  /// Opening a bridge-agent DM mid-run must land in the RUNNING conversation, not an
-  /// empty surface that only fills in when the next stream frame happens to arrive.
-  /// Ask the bridge for this chat's current session (it resolves the id — the phone
-  /// doesn't know it yet). An idle chat answers `no_current_session` and the DM stays
-  /// a fresh scratch surface. Retries cover the two real-world misses: the chat topic
-  /// isn't joined yet at open, and the bridge is offline at open and connects a few
-  /// seconds later (the connect-gate case from the device logs).
+  /// Bridge DMs open as fresh sessions. History enters this list only after an explicit
+  /// History selection; live chat-owned stream frames still arrive through ChatEngine.
   private func prefetchBridgeHistoryIfNeeded() {
     guard !didPrefetchBridgeHistory else { return }
     didPrefetchBridgeHistory = true
-    // Fire once now (covers the already-connected case), then let the channel-join event
-    // (handleChatEngineChanged → chatChannelStateChanged) and a short fallback poll cover
-    // the cold-launch case where the socket/join aren't ready yet at open —
-    // requestAgentBridgeHistory itself nudges connect+join on each miss.
-    requestCurrentBridgeSession(reason: "open")
-    scheduleCurrentBridgeSessionFallback(attempt: 0)
     let chatKey = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
     hadLiveBridgeRun =
       !chatKey.isEmpty && ChatEngine.shared.liveBridgeSessionId(chatId: chatKey) != nil
     requestBridgeUsageSnapshot(reason: "open")
-  }
-
-  /// Ask the engine for whatever session is live for this DM right now. Throttled +
-  /// idempotent: no-ops once a live session is adopted, so the open call, the channel-join
-  /// event, and the fallback poll can all call it freely without stacking requests.
-  private func requestCurrentBridgeSession(reason: String) {
-    guard let provider = currentBridgeProvider else { return }
-    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !chatId.isEmpty else { return }
-    // Already adopted this chat's live session — done.
-    guard ChatEngine.shared.liveBridgeSessionId(chatId: chatId) == nil else { return }
-    let now = ProcessInfo.processInfo.systemUptime
-    guard now - lastCurrentBridgeSessionRequestAt > 1.2 else { return }
-    lastCurrentBridgeSessionRequestAt = now
-    let result = ChatEngine.shared.loadCurrentAgentBridgeSessionIntoChat(
-      chatId: chatId, provider: provider)
-    VibeDebugLog.log(
-      "[ChatOpen] currentSession request chat=%@ provider=%@ reason=%@ accepted=%@ result=%@",
-      String(chatId.prefix(12)), provider, reason,
-      (result["accepted"] as? Bool) == true ? "Y" : "N",
-      (result["reason"] as? String) ?? "-")
-  }
-
-  /// Bounded fallback poll — covers the case where no channel-join notification lands (the
-  /// topic was already joined before this view bound). Stops as soon as a live session is
-  /// adopted, the DM changes, or the view detaches.
-  private func scheduleCurrentBridgeSessionFallback(attempt: Int) {
-    // Two retries is enough to cover join lag; six was spamming no_current_session
-    // on idle agent DMs every 1.5s.
-    guard attempt < 2 else { return }
-    let provider = currentBridgeProvider
-    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-      guard let self, self.window != nil, self.currentBridgeProvider == provider else { return }
-      // The usage snapshot rides the same join-readiness window — retry it here too
-      // (throttled internally; the first attempts at open usually lose to chat_not_joined).
-      self.requestBridgeUsageSnapshot(reason: "poll#\(attempt + 1)")
-      let chatId = self.engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
-      guard !chatId.isEmpty, ChatEngine.shared.liveBridgeSessionId(chatId: chatId) == nil else {
-        return
-      }
-      self.requestCurrentBridgeSession(reason: "poll#\(attempt + 1)")
-      self.scheduleCurrentBridgeSessionFallback(attempt: attempt + 1)
-    }
   }
 
   private func agentSurfaceMode(for defaultView: AgentBridgeDefaultView) -> VibeAgentConversationSurfaceMode? {
@@ -12771,6 +13287,16 @@ final class SenderRunAvatarView: UIView {
   private var loadedURL: String?
   private var loadToken = UUID()
 
+  // Run bookkeeping owned by ChatListView.updateFloatingSenderAvatars: which sender-run
+  // this view is glued to, so run identity churn (temp→server rekey, index shift, run
+  // growth) re-matches the SAME view by senderKey + row-key overlap instead of
+  // retire+recreate (the "avatar catches up seconds after the cells" pop).
+  var runSenderKey: String?
+  var runRowKeys: Set<String> = []
+  // Screen-space midY captured just before an animated batch update; the pass-3 glue
+  // consumes it so the avatar rides the same additive shift as its run's cells.
+  var capturedMidY: CGFloat?
+
   // Claude/Codex always have a profile image even when the group members payload omits
   // the avatar URL — resolve it from the provider so agents never fall back to a letter.
   static func agentAvatarURL(for provider: String?) -> String? {
@@ -12996,4 +13522,128 @@ final class BridgeTaskBannerPageView: UIView {
   required init?(coder: NSCoder) { return nil }
 
   @objc private func handleTap() { onTap?() }
+}
+
+/// Slim, actionable notice pinned just above the composer when a prompt sent to an
+/// agent surface gets no response at all. Warning glyph + one-line reason + a filled
+/// Retry pill + a dismiss. Styled from the chat's live appearance so it reads as part
+/// of the same surface in light and dark.
+final class AgentResponseNoticeView: UIView {
+  private let blurView = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterial))
+  private let iconView = UIImageView()
+  private let messageLabel = UILabel()
+  private let retryButton = UIButton(type: .system)
+  private let closeButton = UIButton(type: .system)
+  private var accentColor: UIColor = .systemBlue
+
+  var onRetry: (() -> Void)?
+  var onClose: (() -> Void)?
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    setup()
+  }
+
+  required init?(coder: NSCoder) { return nil }
+
+  func configure(message: String) {
+    messageLabel.text = message
+    setNeedsLayout()
+  }
+
+  func applyColors(isDark: Bool, textColor: UIColor, accent: UIColor) {
+    accentColor = accent
+    blurView.contentView.backgroundColor =
+      (isDark ? UIColor.white : UIColor.black).withAlphaComponent(isDark ? 0.07 : 0.05)
+    layer.borderColor = UIColor.systemOrange.withAlphaComponent(isDark ? 0.5 : 0.4).cgColor
+    iconView.tintColor = .systemOrange
+    messageLabel.textColor = textColor.withAlphaComponent(0.92)
+    closeButton.tintColor = textColor.withAlphaComponent(0.6)
+    applyRetryConfiguration()
+  }
+
+  private func applyRetryConfiguration() {
+    var cfg = UIButton.Configuration.filled()
+    cfg.baseBackgroundColor = accentColor
+    cfg.baseForegroundColor = .white
+    cfg.cornerStyle = .capsule
+    cfg.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 15, bottom: 6, trailing: 15)
+    var title = AttributedString("Retry")
+    title.font = .systemFont(ofSize: 13.0, weight: .semibold)
+    cfg.attributedTitle = title
+    retryButton.configuration = cfg
+  }
+
+  private func setup() {
+    clipsToBounds = true
+    layer.cornerRadius = 16.0
+    layer.cornerCurve = .continuous
+    layer.borderWidth = 0.8
+
+    blurView.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(blurView)
+
+    iconView.translatesAutoresizingMaskIntoConstraints = false
+    iconView.image = UIImage(
+      systemName: "exclamationmark.triangle.fill",
+      withConfiguration: UIImage.SymbolConfiguration(pointSize: 14.0, weight: .semibold))
+    iconView.contentMode = .scaleAspectFit
+    iconView.setContentHuggingPriority(.required, for: .horizontal)
+    blurView.contentView.addSubview(iconView)
+
+    messageLabel.translatesAutoresizingMaskIntoConstraints = false
+    messageLabel.font = .systemFont(ofSize: 13.0, weight: .medium)
+    messageLabel.numberOfLines = 2
+    blurView.contentView.addSubview(messageLabel)
+
+    retryButton.translatesAutoresizingMaskIntoConstraints = false
+    retryButton.addTarget(self, action: #selector(retryTapped), for: .touchUpInside)
+    retryButton.setContentHuggingPriority(.required, for: .horizontal)
+    retryButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+    blurView.contentView.addSubview(retryButton)
+
+    closeButton.translatesAutoresizingMaskIntoConstraints = false
+    closeButton.setImage(
+      UIImage(
+        systemName: "xmark",
+        withConfiguration: UIImage.SymbolConfiguration(pointSize: 11.0, weight: .semibold)),
+      for: .normal)
+    closeButton.addTarget(self, action: #selector(closeTapped), for: .touchUpInside)
+    closeButton.setContentHuggingPriority(.required, for: .horizontal)
+    blurView.contentView.addSubview(closeButton)
+
+    NSLayoutConstraint.activate([
+      blurView.topAnchor.constraint(equalTo: topAnchor),
+      blurView.leadingAnchor.constraint(equalTo: leadingAnchor),
+      blurView.trailingAnchor.constraint(equalTo: trailingAnchor),
+      blurView.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+      iconView.leadingAnchor.constraint(equalTo: blurView.contentView.leadingAnchor, constant: 14.0),
+      iconView.centerYAnchor.constraint(equalTo: blurView.contentView.centerYAnchor),
+      iconView.widthAnchor.constraint(equalToConstant: 18.0),
+      iconView.heightAnchor.constraint(equalToConstant: 18.0),
+
+      messageLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 10.0),
+      messageLabel.topAnchor.constraint(
+        equalTo: blurView.contentView.topAnchor, constant: 9.0),
+      messageLabel.bottomAnchor.constraint(
+        equalTo: blurView.contentView.bottomAnchor, constant: -9.0),
+      messageLabel.trailingAnchor.constraint(
+        lessThanOrEqualTo: retryButton.leadingAnchor, constant: -10.0),
+
+      retryButton.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -4.0),
+      retryButton.centerYAnchor.constraint(equalTo: blurView.contentView.centerYAnchor),
+
+      closeButton.trailingAnchor.constraint(
+        equalTo: blurView.contentView.trailingAnchor, constant: -8.0),
+      closeButton.centerYAnchor.constraint(equalTo: blurView.contentView.centerYAnchor),
+      closeButton.widthAnchor.constraint(equalToConstant: 30.0),
+      closeButton.heightAnchor.constraint(equalToConstant: 30.0),
+    ])
+
+    applyColors(isDark: true, textColor: .white, accent: .systemBlue)
+  }
+
+  @objc private func retryTapped() { onRetry?() }
+  @objc private func closeTapped() { onClose?() }
 }

@@ -429,6 +429,14 @@ final class ChatEngine {
   // Stable first-seen timestamp for each live agent stream (keyed chatId -> streamId)
   // so the streaming bubble keeps its position while its text grows.
   private var agentStreamTimestampsByChat: [String: [String: Int64]] = [:]
+  // Settled agent replies adopt the list slot of the live stream bubble they replaced,
+  // so a multi-agent group keeps "who responded first" order instead of reshuffling
+  // every reply to the bottom at settle. Keyed by the persisted messageId; re-applied
+  // on every merge so a later history refetch (server copy, server timestamps) cannot
+  // bounce the row back down. Bounded FIFO — old entries only matter while the session
+  // is alive; after a relaunch server order is authoritative anyway.
+  private var agentSettleSlotTsByMessageId: [String: Int64] = [:]
+  private var agentSettleSlotTsOrder: [String] = []
   // LAN dual-path: last applied progress sequence per task so cloud frames that
   // arrive later (or earlier) don't double-apply. Keyed "provider:chatId:taskId".
   private var lanProgressSeqByTask: [String: Int] = [:]
@@ -5889,11 +5897,36 @@ final class ChatEngine {
     // stream frame is proof the turn is alive, so it keeps the grace fresh.
     agentTurnRunningAtMsByChatId[chatId] = Int64(nowMs())
 
-    // Stable timestamp so the bubble holds its position as text grows.
+    // Stable timestamp so the bubble holds its position as text grows. Stamp it at the
+    // FIRST RENDERABLE frame, not the first frame: the empty pre-content shell (text=0,
+    // bare Thinking) is suppressed from the list, so a stream-start stamp would order a
+    // slow agent's reply ABOVE a faster agent that showed content minutes earlier. The
+    // visible order should be "who responded first", i.e. first content wins the slot.
+    let hasRenderableStreamContent =
+      !text.isEmpty
+      || progressNodes.contains { node in
+        let kind = (normalizedString(node["kind"] ?? node["itemType"]) ?? "").lowercased()
+        let label = (normalizedString(node["label"] ?? node["title"]) ?? "")
+          .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let detail = (
+          normalizedString(node["detail"] ?? node["messageContent"] ?? node["messagePreview"]) ?? ""
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        let isPlaceholderThinking =
+          (kind == "thinking" || label == "thinking" || label == "thinking...") && detail.isEmpty
+        return !isPlaceholderThinking
+      }
     var perChat = agentStreamTimestampsByChat[chatId] ?? [:]
-    let timestampMs = perChat[effectiveRowId] ?? Int64(nowMs())
-    perChat[effectiveRowId] = timestampMs
-    agentStreamTimestampsByChat[chatId] = perChat
+    let timestampMs: Int64
+    if let stamped = perChat[effectiveRowId] {
+      timestampMs = stamped
+    } else if hasRenderableStreamContent {
+      timestampMs = Int64(nowMs())
+      perChat[effectiveRowId] = timestampMs
+      agentStreamTimestampsByChat[chatId] = perChat
+    } else {
+      // Provisional only — the row is an off-list shell until content arrives.
+      timestampMs = Int64(nowMs())
+    }
 
     var metadata: [String: Any] = [
       "progressNodes": progressNodes,
@@ -6199,8 +6232,12 @@ final class ChatEngine {
     }
   }
 
-  private func removeAgentStreamRowsLocked(chatId: String, agentUserId: String?) {
-    guard var perChat = liveMessageRowsByChat[chatId], !perChat.isEmpty else { return }
+  /// Returns the earliest STAMPED slot timestamp among the removed live rows (nil when
+  /// none were stamped/removed) so the persisted reply that supersedes them can adopt
+  /// the live bubble's list position instead of re-sorting to the bottom at settle.
+  @discardableResult
+  private func removeAgentStreamRowsLocked(chatId: String, agentUserId: String?) -> Int64? {
+    guard var perChat = liveMessageRowsByChat[chatId], !perChat.isEmpty else { return nil }
     let targetAgent = normalizedUpper(agentUserId)
     // Live cloud streams (`stream-…`) AND LAN dual-path rows (`lan-…`) both need
     // to drop when the real agent message lands — leaving either causes a second
@@ -6208,8 +6245,9 @@ final class ChatEngine {
     let streamIds = perChat.keys.filter {
       $0.hasPrefix("stream-") || $0.hasPrefix("lan-")
     }
-    guard !streamIds.isEmpty else { return }
+    guard !streamIds.isEmpty else { return nil }
     var removedIds = Set<String>()
+    var inheritedSlotTs: Int64?
     for streamId in streamIds {
       if let targetAgent {
         let rowAgent = normalizedUpper(
@@ -6218,10 +6256,13 @@ final class ChatEngine {
         // Only remove a streaming row that belongs to the agent that just posted.
         if let rowAgent, rowAgent != targetAgent { continue }
       }
+      if let stamped = agentStreamTimestampsByChat[chatId]?[streamId] {
+        inheritedSlotTs = min(inheritedSlotTs ?? stamped, stamped)
+      }
       perChat.removeValue(forKey: streamId)
       removedIds.insert(streamId)
     }
-    guard !removedIds.isEmpty else { return }
+    guard !removedIds.isEmpty else { return nil }
     // [EmptyTrace] This wipes the live streaming bubble(s). If it fires mid-stream and leaves
     // the live store empty, the agent list can jump to empty until history rehydrates.
     VibeDebugLog.log(
@@ -6253,6 +6294,7 @@ final class ChatEngine {
         liveStreamTaskRowIdByChatId[chatId] = perChatTaskRowIds
       }
     }
+    return inheritedSlotTs
   }
 
   /// Drop any session `bridge-…` rows currently flagged running. The live `agent-stream`
@@ -7292,8 +7334,14 @@ final class ChatEngine {
                 chatId: chatId, status: "done", reason: "agentPersistedMessage")
             }
             // The persisted message supersedes any live streaming bubble for this agent
-            // (cloud `stream-…` and LAN `lan-…` dual-path rows).
-            self.removeAgentStreamRowsLocked(chatId: chatId, agentUserId: fromId)
+            // (cloud `stream-…` and LAN `lan-…` dual-path rows). The reply adopts the
+            // live bubble's slot so the list keeps "who responded first" order instead
+            // of reshuffling every reply to the bottom as it settles (multi-agent groups
+            // settled 3 swaps in <1s — the jumping/overlap churn).
+            if let slotTs = self.removeAgentStreamRowsLocked(chatId: chatId, agentUserId: fromId) {
+              self.adoptAgentSettleSlotTsLocked(
+                chatId: chatId, messageId: insertedMessageId, slotTs: slotTs)
+            }
           }
 
           let myUserId = self.normalizedUpper(self.getConfigValueLocked("userId"))
@@ -8169,12 +8217,12 @@ final class ChatEngine {
         continue
       }
       guard !deletedIds.contains(messageId) else { continue }
-      mergedById[messageId] = liveRows[messageId] ?? row
+      mergedById[messageId] = rowAdoptingSettleSlotTs(liveRows[messageId] ?? row, messageId: messageId)
     }
 
     for (messageId, row) in liveRows {
       guard !deletedIds.contains(messageId), mergedById[messageId] == nil else { continue }
-      mergedById[messageId] = row
+      mergedById[messageId] = rowAdoptingSettleSlotTs(row, messageId: messageId)
     }
 
     // Mirrored-prompt dedup: a session transcript records the user's OWN prompt as a
@@ -8356,7 +8404,7 @@ final class ChatEngine {
         continue
       }
       guard !deletedIds.contains(messageId) else { continue }
-      mergedById[messageId] = row
+      mergedById[messageId] = rowAdoptingSettleSlotTs(row, messageId: messageId)
     }
 
     for row in remoteRows {
@@ -8365,7 +8413,7 @@ final class ChatEngine {
         continue
       }
       guard !deletedIds.contains(messageId) else { continue }
-      mergedById[messageId] = row
+      mergedById[messageId] = rowAdoptingSettleSlotTs(row, messageId: messageId)
     }
 
     var mergedRows = Array(mergedById.values)
@@ -8424,6 +8472,47 @@ final class ChatEngine {
     mutateLiveMessagePayloadLocked(chatId: chatId, messageId: messageId) { message in
       message["status"] = status
     }
+  }
+
+  /// Pin a settled agent reply to the slot its live stream bubble occupied. Rewrites the
+  /// live-store copy immediately and records the override so both merge paths keep
+  /// re-applying it to server/history copies of the same message for this session.
+  private func adoptAgentSettleSlotTsLocked(chatId: String, messageId: String, slotTs: Int64) {
+    guard slotTs > 0 else { return }
+    if agentSettleSlotTsByMessageId[messageId] == nil {
+      agentSettleSlotTsOrder.append(messageId)
+      if agentSettleSlotTsOrder.count > 256 {
+        let evicted = agentSettleSlotTsOrder.removeFirst()
+        agentSettleSlotTsByMessageId.removeValue(forKey: evicted)
+      }
+    }
+    agentSettleSlotTsByMessageId[messageId] = slotTs
+    mutateLiveMessagePayloadLocked(chatId: chatId, messageId: messageId) { message in
+      message["timestampMs"] = slotTs
+      message["timestamp"] = slotTs
+    }
+    NSLog(
+      "[AgentOrder] settle adopts live slot chatId=%@ messageId=%@ slotTs=%lld",
+      String(chatId.suffix(12)), String(messageId.suffix(12)), slotTs)
+  }
+
+  /// Re-apply a recorded settle-slot override to a row copy that may have come from the
+  /// server/history (which carries the settle-time timestamp and would re-sort the reply
+  /// to the bottom, undoing the stable order the user already saw).
+  private func rowAdoptingSettleSlotTs(_ row: [String: Any], messageId: String) -> [String: Any] {
+    guard let slotTs = agentSettleSlotTsByMessageId[messageId],
+      var message = row["message"] as? [String: Any]
+    else { return row }
+    let current =
+      parseLongValue(message["timestampMs"] ?? message["timestamp_ms"] ?? message["timestamp"])
+      ?? 0
+    guard current != slotTs else { return row }
+    message["timestampMs"] = slotTs
+    message["timestamp"] = slotTs
+    message.removeValue(forKey: "timestamp_ms")
+    var next = row
+    next["message"] = message
+    return next
   }
 
   @discardableResult

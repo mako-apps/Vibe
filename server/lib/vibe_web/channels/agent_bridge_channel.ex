@@ -115,7 +115,10 @@ defmodule VibeWeb.AgentBridgeChannel do
     team_run_id = payload["teamRunId"] || payload["team_run_id"]
     team_worker = payload["teamWorker"] || payload["team_worker"]
 
-    # Lead-driven under-hood spawn: VIBE_TEAM_SPAWN: claude, grok
+    # Lead-driven plan + under-hood spawn directives:
+    #   VIBE_TEAM_PLAN: {json}   → validated task table stored on the run
+    #   VIBE_TEAM_SPAWN: claude  → dispatch workers (plan rows drive their focus)
+    maybe_handle_team_plan_line(line, chat_id, team_run_id, payload)
     maybe_handle_team_spawn_line(line, chat_id, team_run_id, payload, socket)
 
     # A shared chat can host multiple runs from the same provider. Scope the live
@@ -471,6 +474,37 @@ defmodule VibeWeb.AgentBridgeChannel do
 
   def handle_in("heartbeat", _payload, socket), do: {:reply, :ok, socket}
   def handle_in(_event, _payload, socket), do: {:noreply, socket}
+
+  # Lead-emitted VIBE_TEAM_PLAN: {json} — validate and persist so worker spawns
+  # dispatch from the plan's task table (team-architecture-v2 §2). Invalid plans
+  # log and fall back to the legacy focus flow; the run never blocks on this.
+  defp maybe_handle_team_plan_line(line, chat_id, team_run_id, payload)
+       when is_binary(line) and is_binary(chat_id) and is_binary(team_run_id) do
+    role = payload["teamRole"] || payload["team_role"]
+    lead = payload["leadWorker"] || payload["lead_worker"]
+    worker = payload["teamWorker"] || payload["team_worker"] || payload["provider"]
+
+    if role == "lead" or (is_binary(lead) and lead == worker) or is_nil(role) do
+      roster = LocalAgentWorker.team_run_roster(chat_id, team_run_id)
+
+      case LocalAgentWorker.parse_team_plan_directive(line, roster) do
+        {:ok, plan} ->
+          LocalAgentWorker.store_team_plan(chat_id, team_run_id, plan)
+
+        {:error, reasons} ->
+          Logger.warning(
+            "[AgentBridgeChannel] rejected team plan chat=#{chat_id} run=#{team_run_id}: #{Enum.join(reasons, "; ")}"
+          )
+
+        nil ->
+          :ok
+      end
+    end
+
+    :ok
+  end
+
+  defp maybe_handle_team_plan_line(_, _, _, _), do: :ok
 
   defp maybe_handle_team_spawn_line(line, chat_id, team_run_id, payload, socket)
        when is_binary(line) and is_binary(chat_id) and is_binary(team_run_id) do

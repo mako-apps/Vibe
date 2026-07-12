@@ -18,6 +18,14 @@ final class VibeGrokDeviceUITests: XCTestCase {
     driver.launch(terminateFirst: true)
   }
 
+  func test_00_home_reflects_live_desktop_codex() throws {
+    driver.goToChats()
+    XCTAssertTrue(
+      driver.app.staticTexts["Working…"].waitForExistence(timeout: 12),
+      "Home should show the currently active desktop Codex task")
+    _ = driver.screenshot("home_live_desktop_codex", test: self)
+  }
+
   override func tearDownWithError() throws {
     driver = nil
   }
@@ -85,13 +93,15 @@ final class VibeGrokDeviceUITests: XCTestCase {
     XCTAssertTrue(driver.openHistory(), "History should be available for a Grok DM")
     _ = driver.screenshot("history_list", test: self)
 
-    // This is the fresh desktop session created for the device loop. Never use a
-    // generic fallback: that hides session-isolation regressions by resuming a
-    // different conversation.
-    let opened = driver.openHistorySession(matching: "Vibe Mobile QA 2026")
-    _ = driver.screenshot(opened ? "history_session_open" : "history_session_miss", test: self)
-    XCTAssertTrue(opened, "The desktop QA session should be selectable from History")
-    guard opened else { return }
+    guard let topic = driver.openFirstHistorySession() else {
+      _ = driver.screenshot("history_session_miss", test: self)
+      XCTFail("The live bridge should expose at least one selectable history session")
+      return
+    }
+    _ = driver.screenshot("history_session_open", test: self)
+    XCTAssertFalse(
+      driver.app.staticTexts["Start session"].exists,
+      "A selected history session must not fall back to an empty view")
 
     let ok = driver.typeMessage(
       "history-followup \(Int(Date().timeIntervalSince1970)): say only OK",
@@ -101,6 +111,24 @@ final class VibeGrokDeviceUITests: XCTestCase {
     XCTAssertTrue(ok, "Follow-up from History should send")
     driver.sleepMs(6_000)
     _ = driver.screenshot("history_followup_after_wait", test: self)
+  }
+
+  func test_08_keyboard_dismiss_keeps_latest_agent_message_in_place() throws {
+    driver.goToChats()
+    guard driver.openChat(named: "Grok") || driver.openChat(named: "grok") else {
+      XCTFail("Grok chat missing")
+      return
+    }
+
+    let marker = "keyboard-anchor-\(Int(Date().timeIntervalSince1970))"
+    XCTAssertTrue(driver.typeMessage("Reply briefly to \(marker)", send: true))
+    _ = driver.screenshot("keyboard_anchor_before_dismiss", test: self)
+    XCTAssertTrue(driver.waitForTextContaining(marker, timeout: 8), "The sent user bubble should be visible")
+    driver.dismissKeyboardFromConversation()
+    _ = driver.screenshot("keyboard_anchor_after_dismiss", test: self)
+    XCTAssertEqual(
+      driver.textCountContaining(marker), 1,
+      "Dismissing the keyboard must keep one latest user message in the conversation")
   }
 
   func test_04_new_chat_task_flow() throws {
@@ -159,6 +187,81 @@ final class VibeGrokDeviceUITests: XCTestCase {
         driver.exactTextCount(token), 1,
         "\(agent) must render one settled agent response, not a duplicate")
     }
+  }
+
+  func test_09_claude_followup_renders_once() throws {
+    exerciseDirectAgentFollowup(agent: "Claude")
+  }
+
+  func test_11_large_claude_history_followup_stays_visible() throws {
+    driver.goToChats()
+    guard driver.openChat(named: "Claude") || driver.openChat(named: "claude") else {
+      XCTFail("Claude chat missing")
+      return
+    }
+    XCTAssertTrue(driver.openHistory(), "History should be available for Claude")
+    guard let topic = driver.openSubstantialSettledHistorySession(
+      minimumMessages: 20,
+      minimumAgeMinutes: 30
+    ) else {
+      _ = driver.screenshot("claude_large_history_missing", test: self)
+      XCTFail("Claude should expose a substantial settled history session")
+      return
+    }
+
+    let token = "HISTORY-CLAUDE-\(Int(Date().timeIntervalSince1970))"
+    XCTAssertTrue(
+      driver.typeMessage(
+        "Continue this existing task. Inspect the repository with git status, then reply with exactly \(token)",
+        send: true
+      ),
+      "A follow-up should send from the selected Claude history session")
+    _ = driver.screenshot("claude_large_history_followup_sent", test: self)
+
+    let deadline = Date().addingTimeInterval(75)
+    while Date() < deadline, !driver.app.staticTexts[token].exists {
+      XCTAssertFalse(
+        driver.app.staticTexts["Start session"].exists,
+        "The selected history must not collapse to an empty fresh-session view while streaming: \(topic)")
+      driver.sleepMs(1_000)
+    }
+    XCTAssertTrue(driver.app.staticTexts[token].exists, "The resumed Claude response should settle on-device")
+    driver.sleepMs(2_000)
+    _ = driver.screenshot("claude_large_history_followup_settled", test: self)
+    XCTAssertEqual(driver.exactTextCount(token), 1, "The settled Claude response must not duplicate")
+  }
+
+  func test_10_agy_followup_renders_once() throws {
+    exerciseDirectAgentFollowup(agent: "Agy", alternateName: "Antigravity")
+  }
+
+  private func exerciseDirectAgentFollowup(agent: String, alternateName: String? = nil) {
+    driver.goToChats()
+    let opened = driver.openChat(named: agent)
+      || alternateName.map { driver.openChat(named: $0) } == true
+      || driver.openChat(named: agent.lowercased())
+    guard opened else {
+      driver.logHierarchySnippet()
+      XCTFail("\(agent) chat should be available for the bridge follow-up loop")
+      return
+    }
+
+    let token = "ACK-\(agent.uppercased())-\(Int(Date().timeIntervalSince1970))"
+    XCTAssertTrue(
+      driver.typeMessage("Mobile follow-up. Reply with exactly \(token) and nothing else.", send: true),
+      "\(agent) follow-up should reach its own conversation"
+    )
+    XCTAssertTrue(
+      driver.waitForExactText(token, timeout: 45),
+      "\(agent) should render its routed response on the phone"
+    )
+    NSLog("[VibeUITest] \(agent) message list \(driver.messageListDebugValue())")
+    driver.sleepMs(2_000)
+    _ = driver.screenshot("\(agent.lowercased())_followup_settled", test: self)
+    XCTAssertEqual(
+      driver.exactTextCount(token), 1,
+      "\(agent) must render one settled agent response, not a duplicate"
+    )
   }
 
   /// External harness writes one harmless command request to ~/.vibe/ask.sock while

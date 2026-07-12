@@ -125,6 +125,46 @@ These rules apply to AI agents working through Vibe, including Claude and Codex.
 - For server work, preserve auth boundaries, group ownership, and per-user bridge routing.
 - For bridge work, keep repo selection, work mode, provider, command status, and task metadata visible.
 
+## New-Project Build Standard
+
+Applies ONLY when the user asks to create a new product, site, app, or service from
+scratch (or the selected repo is empty). For maintenance work in an existing codebase,
+the Implementation Standard above wins and this section does not apply.
+
+- Plan the architecture BEFORE writing code: pages/routes, components, backend API
+  endpoints, database schema and migrations, data flow, styling system, and how the
+  project builds/deploys. Record the plan in the team handoff file when in a team run.
+- Production grade means: every planned page/route implemented with real content and
+  working navigation; backend endpoints wired to real handlers and the database when the
+  project needs data; responsive and accessible UI; SEO/meta where it is a website; and
+  the project build passing (npm run build or the stack's equivalent). Run tests if the
+  project has them.
+- No placeholder stubs, no TODO screens, no single-page demo for a multi-page request.
+- Finish your entire assigned file list. If you cannot, list exactly what is missing and
+  why in the handoff — never silently stop early.
+
+## Supervisor Team Runs (lead duties)
+
+When you are the LEAD of a team run whose task is real build work:
+
+1. Classify first: trivial chat gets a short direct answer and no teammates.
+2. For a new-project build, write the architecture plan (pages, backend, database,
+   components) to the handoff file before spawning anyone.
+3. Turn the plan into a task table: one row per teammate, each row an explicit,
+   disjoint list of file paths to implement. No two workers may own the same file.
+   Shared files (package.json, lockfiles, root layout/nav, DB schema) belong to the
+   lead only — integrate teammate work there yourself.
+4. Consult the available advisor (Fable; Sol as fallback) on the split when the task is
+   complex. Best-effort: if the advisor is unavailable, proceed with your own split.
+5. Spawn ALL teammates for build work, and give each an exact file-scoped focus.
+   Vague focuses like "UI polish" or "review risks" are not acceptable for build
+   tasks — name the files/pages. Gemini/Agy in particular must always receive a
+   precise file list, or it drifts off-task.
+6. After teammates finish, verify against the plan: every planned page/endpoint/schema
+   exists, the build passes, and nothing is a stub. Respawn workers with a gap-focused
+   task list if anything is missing. Iterate until the plan is fully implemented.
+7. Only then write the final user summary.
+
 ## Done Criteria
 
 - State what changed.
@@ -137,6 +177,7 @@ These rules apply to AI agents working through Vibe, including Claude and Codex.
 Follow AGENTS.md first. These additions are specific to Claude.
 
 - Use planning and code review strengths to identify risks, architecture boundaries, and missing verification.
+- In a team BUILD run you are a builder first: implement your assigned backend/frontend file list completely (see New-Project Build Standard in AGENTS.md); review and risk notes come after your slice is done.
 - When paired with Codex, avoid doing the same implementation slice unless the user asks for a second opinion.
 - Write concise handoff notes in .vibe/team/<team_run_id>.md so Codex can continue without rereading everything.
 - If the task is not safe to edit yet, explain the blocker and the exact inspection or approval needed.
@@ -147,6 +188,7 @@ Follow AGENTS.md first. These additions are specific to Claude.
 Follow AGENTS.md first. These additions are specific to Codex.
 
 - Use implementation and verification strengths to make focused patches and run the relevant checks.
+- As team lead, follow "Supervisor Team Runs (lead duties)" in AGENTS.md: architecture plan → advisor-checked per-worker file-scoped task table → spawn all teammates → verify build and completeness → iterate on gaps.
 - When paired with Claude, read Claude's handoff before editing and take the next non-overlapping implementation slice.
 - Keep command output and patch summaries structured enough for Vibe to render progress, files changed, and verification.
 - If a command or edit is risky, stop and ask for explicit approval through Vibe.
@@ -675,6 +717,74 @@ async function scanToPair(server, label) {
 const sessionByChat = new Map(); // chatId -> claude session_id
 // taskKey -> { child, provider, chatId, taskId, startedAt, frameSeq, lastAckedSeq, frameLog, lastProgress }
 const runningTasks = new Map();
+
+// Admission control (docs/team-architecture-v2.md §4 review amendments): one Mac
+// executes every CLI run, and a team burst (lead + workers + a second group run)
+// must queue instead of fork-bombing the machine. Queued tasks emit a periodic
+// progress frame so the server-side run watchdog reads them as alive ("queued"),
+// never as stalled — its stall timer only applies to genuinely running slices.
+const MAX_CONCURRENT_CLI_TASKS = Math.max(
+  1,
+  Number(process.env.VIBE_MAX_CONCURRENT_TASKS || 6) || 6
+);
+const pendingTaskQueue = [];
+let pendingTaskTimer = null;
+
+function enqueuePendingTask(channel, task) {
+  // Re-entry marker: the dedupe reservation was already taken on first delivery,
+  // so the requeued pass must skip both the duplicate guard and admission.
+  task.__requeued = true;
+  pendingTaskQueue.push({ channel, task, queuedAt: Date.now() });
+  console.log(
+    `[vibe-bridge] task queued (${runningTasks.size} active, ${pendingTaskQueue.length} waiting) ` +
+      `provider=${task.provider} task=${taskIdFor(task)}`
+  );
+  pushQueuedTaskHeartbeat({ channel, task });
+  if (!pendingTaskTimer) {
+    pendingTaskTimer = setInterval(() => {
+      for (const entry of pendingTaskQueue) pushQueuedTaskHeartbeat(entry);
+      drainPendingTasks();
+    }, 45 * 1000);
+  }
+}
+
+function pushQueuedTaskHeartbeat(entry) {
+  const { channel, task } = entry;
+  try {
+    channel.push("progress", {
+      ...computerFields(),
+      ...teamFieldsForTask(task),
+      provider: task.provider,
+      chatId: task.chatId,
+      taskId: taskIdFor(task),
+      // Tagged so the server watchdog tracks queue age separately instead of
+      // treating these frames as normal liveness forever (wedged-queue guard).
+      queuedHeartbeat: true,
+      line: JSON.stringify({
+        type: "text",
+        data: `Queued — waiting for a free agent slot (${runningTasks.size} running)`,
+      }),
+    });
+  } catch (_) {}
+}
+
+function drainPendingTasks() {
+  // Count released-but-not-yet-registered tasks against the cap: runningTasks
+  // isn't populated until after the pre-run git snapshot, so a naive loop on
+  // runningTasks.size alone would release the whole queue at once.
+  let slots = MAX_CONCURRENT_CLI_TASKS - runningTasks.size;
+  while (pendingTaskQueue.length && slots > 0) {
+    slots--;
+    const entry = pendingTaskQueue.shift();
+    Promise.resolve(runTask(entry.channel, entry.task)).catch((err) =>
+      console.warn("[vibe-bridge] queued task failed to start:", err && err.message)
+    );
+  }
+  if (!pendingTaskQueue.length && pendingTaskTimer) {
+    clearInterval(pendingTaskTimer);
+    pendingTaskTimer = null;
+  }
+}
 const finishedTasks = new Map(); // taskKey -> { provider, chatId, taskId, repo, runtime, finishedAt, resultPayload }
 // Duplicate-delivery guard. The SAME run_task can reach runTask() more than once —
 // it arrives on both the cloud channel and the LAN transport, and reconnect-recovery
@@ -1503,7 +1613,7 @@ async function maybeRunGeminiUiAdvisor(task, agentRuntime, outputText) {
       "Write a short bullet list under ## Gemini UI review.\n\n" +
       String(outputText || "").slice(0, 6000);
     const agyCmd = process.env.VIBE_AGY_COMMAND || "agy";
-    const result = spawnSync(agyCmd, ["-p", prompt, "--yolo"], {
+    const result = spawnSync(agyCmd, ["-p", prompt, "--dangerously-skip-permissions"], {
       cwd,
       encoding: "utf8",
       timeout: 120000,
@@ -3618,7 +3728,7 @@ function bridgeStatusPayload() {
   ) {
     discoverProviderModels(false).catch(() => {});
   }
-  refreshExternalCodexActivity().catch(() => {});
+  refreshExternalProviderActivity().catch(() => {});
   const models = providerModelsCache.models || fallbackProviderModels();
   return {
     computerId: ACTIVE_COMPUTER_ID,
@@ -3686,57 +3796,73 @@ function runningTaskSummaries() {
   }));
   const bridgeSessionIds = new Set(bridgeTasks.map((task) => task.sessionId).filter(Boolean));
   return bridgeTasks.concat(
-    externalCodexActivity.filter((task) => !bridgeSessionIds.has(task.sessionId))
+    externalProviderActivity.filter((task) => !bridgeSessionIds.has(task.sessionId))
   );
 }
 
-// Codex Desktop / IDE sessions do not enter `runningTasks` because the bridge did
-// not spawn them. Their rollout file still updates in real time, so expose the
-// newest live rollout as a provider-scoped task. The phone can then show Codex as
-// working on Home even though there is no mobile chatId for that desktop-owned run.
-const EXTERNAL_CODEX_STATUS_TTL_MS = 3_000;
-let externalCodexActivity = [];
-let externalCodexActivityAt = 0;
-let externalCodexActivityRefresh = null;
+// Desktop / IDE sessions do not enter `runningTasks` because the bridge did not
+// spawn them. Expose each provider's newest live local session as provider-scoped
+// activity so Home reflects Claude/Grok/Agy as well as Codex.
+const EXTERNAL_PROVIDER_STATUS_TTL_MS = 3_000;
+let externalProviderActivity = [];
+let externalProviderActivityAt = 0;
+let externalProviderActivityRefresh = null;
 
-async function refreshExternalCodexActivity() {
+async function refreshExternalProviderActivity() {
   const now = Date.now();
-  if (externalCodexActivityRefresh || now - externalCodexActivityAt < EXTERNAL_CODEX_STATUS_TTL_MS) {
-    return externalCodexActivityRefresh;
+  if (externalProviderActivityRefresh || now - externalProviderActivityAt < EXTERNAL_PROVIDER_STATUS_TTL_MS) {
+    return externalProviderActivityRefresh;
   }
-  externalCodexActivityRefresh = (async () => {
-    const previous = JSON.stringify(externalCodexActivity);
-    const sessions = await listCodex(1);
-    const session = sessions.find((item) => item && item.live);
-    externalCodexActivity = session
-      ? [{
-          provider: "codex",
-          chatId: lastAgentChatByProvider.get("codex") || "",
-          taskId: `desktop:${session.id}`,
+  externalProviderActivityRefresh = (async () => {
+    const previous = JSON.stringify(externalProviderActivity);
+    const catalogs = await Promise.all([
+      listClaude(1),
+      listCodex(1),
+      listGrok(1),
+      listAgy(1),
+    ]);
+    externalProviderActivity = catalogs.flatMap((sessions) => {
+      const session = sessions.find((item) => item && item.live);
+      if (!session) return [];
+      const provider = String(session.provider || "").trim().toLowerCase();
+      if (!provider) return [];
+      return [{
+          provider,
+          // Desktop/IDE activity is not owned by any mobile DM. Keep it provider-
+          // wide so a stale prior chat id cannot hide the provider's Home state.
+          chatId: "",
+          taskId: `desktop:${provider}:${session.id}`,
           sessionId: session.id,
-          topic: session.topic || "Codex task",
+          topic: session.topic || `${provider} task`,
           project: session.project || "",
           projectName: session.projectName || "",
           cwd: session.project || "",
           startedAt: session.updatedAt || new Date().toISOString(),
           source: "desktop",
-        }]
-      : [];
-    externalCodexActivityAt = Date.now();
+        }];
+    });
+    externalProviderActivityAt = Date.now();
+    if (previous !== JSON.stringify(externalProviderActivity)) {
+      const active = externalProviderActivity.map((task) => task.provider).join(",") || "none";
+      console.log(`[vibe-bridge][home-live] active providers=${active}`);
+    }
     // The status push that initiated this async scan necessarily used the old
     // cache. Publish the completed snapshot immediately so the server/phone do
     // not wait for the next 30-second heartbeat.
     if (
-      previous !== JSON.stringify(externalCodexActivity) &&
+      previous !== JSON.stringify(externalProviderActivity) &&
       activeChannel && activeChannel.state === "joined"
     ) {
       activeChannel.push("status", bridgeStatusPayload());
     }
-  })();
+  })().catch((err) => {
+    console.warn(`[vibe-bridge][home-live] provider scan failed: ${err && err.message ? err.message : err}`);
+    throw err;
+  });
   try {
-    await externalCodexActivityRefresh;
+    await externalProviderActivityRefresh;
   } finally {
-    externalCodexActivityRefresh = null;
+    externalProviderActivityRefresh = null;
   }
 }
 
@@ -4154,10 +4280,18 @@ async function runTask(channel, task) {
 
   // Drop duplicate deliveries of the same task (cloud+LAN double-send, reconnect
   // re-delivery) BEFORE the git snapshot / spawn, so we never run the CLI twice.
-  if (isDuplicateRunTask(provider, chatId, taskId)) {
+  // A requeued admission-gate task already holds its reservation — let it through.
+  if (!task.__requeued && isDuplicateRunTask(provider, chatId, taskId)) {
     console.log(
       `[vibe-bridge] run_task DUPLICATE dropped provider=${provider} chat=${chatId} task=${taskId}`
     );
+    return;
+  }
+
+  // Admission gate: over the CLI concurrency cap this task waits its turn with
+  // periodic queued heartbeats instead of spawning another process.
+  if (!task.__requeued && runningTasks.size >= MAX_CONCURRENT_CLI_TASKS) {
+    enqueuePendingTask(channel, task);
     return;
   }
 
@@ -4624,6 +4758,8 @@ async function runTask(channel, task) {
     }
     runningTasks.delete(key);
     pushBridgeStatus(channel);
+    // A slot just freed — admit the next queued task (if any) right away.
+    drainPendingTasks();
     // The run is done — re-push this chat's transcript so the live "running" flag on
     // the last turn clears and the phone collapses it into the "Worked" card.
     refireHistoryWatch(chatId);
@@ -5207,6 +5343,76 @@ function sessionIsLive(mtime, id, runningIds) {
   return mtime != null && Date.now() - mtime < LIVE_SESSION_WINDOW_MS;
 }
 
+// Codex emits explicit turn boundaries. Use them instead of treating a quiet
+// transcript as an idle session: reasoning and long-running commands can produce
+// no file writes for minutes while the turn is still active.
+const CODEX_LIVE_TAIL_BYTES = Number(process.env.VIBE_CODEX_LIVE_TAIL_BYTES || 1024 * 1024);
+async function codexOpenTurnState(file, size) {
+  const length = Math.min(Math.max(0, Number(size) || 0), CODEX_LIVE_TAIL_BYTES);
+  if (!length) return null;
+  let handle;
+  try {
+    handle = await fs.promises.open(file, "r");
+    const buffer = Buffer.allocUnsafe(length);
+    const position = Math.max(0, Number(size) - length);
+    const { bytesRead } = await handle.read(buffer, 0, length, position);
+    let text = buffer.subarray(0, bytesRead).toString("utf8");
+    // A bounded tail may begin in the middle of a JSONL record.
+    if (position > 0) text = text.slice(Math.max(0, text.indexOf("\n") + 1));
+    let state = null;
+    for (const line of text.split("\n")) {
+      if (!line) continue;
+      let event;
+      try { event = JSON.parse(line); } catch { continue; }
+      if (!event || event.type !== "event_msg" || !event.payload) continue;
+      const type = event.payload.type;
+      if (type === "task_started") state = true;
+      else if (type === "task_complete" || type === "turn_aborted") state = false;
+    }
+    return state;
+  } catch {
+    return null;
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+  }
+}
+
+// Claude's last real user message opens a turn; tool_use keeps it open and
+// end_turn closes it. Synthetic CLI notices are not model-turn boundaries.
+async function claudeOpenTurnState(file, size) {
+  const length = Math.min(Math.max(0, Number(size) || 0), CODEX_LIVE_TAIL_BYTES);
+  if (!length) return null;
+  let handle;
+  try {
+    handle = await fs.promises.open(file, "r");
+    const buffer = Buffer.allocUnsafe(length);
+    const position = Math.max(0, Number(size) - length);
+    const { bytesRead } = await handle.read(buffer, 0, length, position);
+    let text = buffer.subarray(0, bytesRead).toString("utf8");
+    if (position > 0) text = text.slice(Math.max(0, text.indexOf("\n") + 1));
+    let state = null;
+    for (const line of text.split("\n")) {
+      if (!line) continue;
+      let event;
+      try { event = JSON.parse(line); } catch { continue; }
+      if (!event || (event.type !== "user" && event.type !== "assistant")) continue;
+      const message = event.message || {};
+      if (event.type === "user") {
+        if (!event.isMeta && messageHasUserText(message)) state = true;
+        continue;
+      }
+      if (String(message.model || "") === "<synthetic>") continue;
+      const stop = String(message.stop_reason || "").toLowerCase();
+      state = stop === "end_turn" ? false : true;
+    }
+    return state;
+  } catch {
+    return null;
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+  }
+}
+
 async function listClaude(limit) {
   const files = claudeSessionFiles().sort((a, b) => b.mtime - a.mtime).slice(0, limit);
   const runningIds = runningSessionIdSet("claude");
@@ -5215,6 +5421,11 @@ async function listClaude(limit) {
     let sum = getCachedSummary(s.file, s.size);
     if (!sum) { sum = await claudeSummary(s.file); setCachedSummary(s.file, s.size, sum); }
     if (sum.messages === 0) continue;
+    const explicitTurnState = await claudeOpenTurnState(s.file, s.size);
+    const live = runningIds.has(s.id)
+      || (explicitTurnState == null
+        ? sessionIsLive(s.mtime, s.id, runningIds)
+        : explicitTurnState);
     results.push({
       provider: "claude",
       id: s.id,
@@ -5223,7 +5434,7 @@ async function listClaude(limit) {
       projectName: path.basename(s.project),
       updatedAt: sum.lastTs || new Date(s.mtime).toISOString(),
       messageCount: sum.messages,
-      live: sessionIsLive(s.mtime, s.id, runningIds),
+      live,
     });
   }
   return results;
@@ -6715,6 +6926,11 @@ async function listCodex(limit) {
     const project = (sum.meta && sum.meta.cwd) || "";
     if (isEphemeralProject(project)) continue;
     const id = (sum.meta && sum.meta.id) || f.id || f.name;
+    const explicitTurnState = await codexOpenTurnState(f.file, f.size);
+    const live = runningIds.has(id)
+      || (explicitTurnState == null
+        ? sessionIsLive(f.mtime, id, runningIds)
+        : explicitTurnState);
     results.push({
       provider: "codex",
       id,
@@ -6723,7 +6939,7 @@ async function listCodex(limit) {
       projectName: project ? path.basename(project) : "",
       updatedAt: new Date(f.mtime).toISOString(),
       messageCount: Math.max(1, sum.messages || 0),
-      live: sessionIsLive(f.mtime, id, runningIds),
+      live,
     });
   }
   return results;
@@ -7200,6 +7416,15 @@ async function listGrok(limit) {
       setCachedSummary(s.file, s.size, sum);
     }
     if (sum.messages === 0) continue;
+    const turnState = grokUpdatesTurnState(s);
+    const hasStructuralState = !!turnState.lastKind;
+    const structurallyLive = hasStructuralState
+      && !turnState.completedAfterActivity
+      && grokSessionIsLive(s, DETAIL_MIDTURN_STALE_MS);
+    const live = runningIds.has(s.id)
+      || (hasStructuralState
+        ? structurallyLive
+        : sessionIsLive(s.mtime, s.id, runningIds));
     results.push({
       provider: "grok",
       id: s.id,
@@ -7208,7 +7433,7 @@ async function listGrok(limit) {
       projectName: path.basename(s.project || "") || "Computer",
       updatedAt: sum.lastTs || new Date(s.mtime).toISOString(),
       messageCount: sum.messages,
-      live: sessionIsLive(s.mtime, s.id, runningIds),
+      live,
     });
   }
   return results;

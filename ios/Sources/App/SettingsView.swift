@@ -1,6 +1,7 @@
 import CoreImage
 import CoreImage.CIFilterBuiltins
 import LocalAuthentication
+import PhotosUI
 import SwiftUI
 import UIKit
 import UserNotifications
@@ -101,23 +102,23 @@ struct SettingsView: View {
         rows: [
           SettingsNativeRow(
             id: "edit-profile",
-            icon: "person.fill",
+            icon: "person",
             label: "Edit Profile",
             detailText: nil,
             toggleValue: false,
             kind: .link,
-            iconColor: UIColor.systemBlue,
+            iconColor: .clear,
             divider: true,
             destructive: false
           ),
           SettingsNativeRow(
             id: "saved-messages",
-            icon: "bookmark.fill",
+            icon: "bookmark",
             label: "Saved Messages",
             detailText: nil,
             toggleValue: false,
             kind: .link,
-            iconColor: UIColor.systemOrange,
+            iconColor: .clear,
             divider: true,
             destructive: false
           ),
@@ -128,7 +129,7 @@ struct SettingsView: View {
             detailText: "Show",
             toggleValue: false,
             kind: .link,
-            iconColor: UIColor.systemGreen,
+            iconColor: .clear,
             divider: true,
             destructive: false
           ),
@@ -139,7 +140,7 @@ struct SettingsView: View {
             detailText: connectionModeTitle,
             toggleValue: false,
             kind: .link,
-            iconColor: UIColor.systemBlue,
+            iconColor: .clear,
             divider: false,
             destructive: false
           ),
@@ -150,23 +151,23 @@ struct SettingsView: View {
         rows: [
           SettingsNativeRow(
             id: "privacy",
-            icon: "shield.fill",
+            icon: "lock.shield",
             label: "Privacy",
             detailText: "Manage",
             toggleValue: false,
             kind: .link,
-            iconColor: UIColor.systemGreen,
+            iconColor: .clear,
             divider: true,
             destructive: false
           ),
           SettingsNativeRow(
             id: "secret-key",
-            icon: "key.fill",
+            icon: "key",
             label: "Secret Key",
             detailText: nil,
             toggleValue: false,
             kind: .link,
-            iconColor: UIColor.systemPurple,
+            iconColor: .clear,
             divider: false,
             destructive: false
           ),
@@ -177,12 +178,12 @@ struct SettingsView: View {
         rows: [
           SettingsNativeRow(
             id: "push-notifications",
-            icon: "bell.fill",
+            icon: "bell",
             label: "Push Notifications",
             detailText: nil,
             toggleValue: notificationsEnabled && systemNotificationsAuthorized,
             kind: .toggle,
-            iconColor: UIColor.systemRed,
+            iconColor: .clear,
             divider: false,
             destructive: false
           )
@@ -193,12 +194,12 @@ struct SettingsView: View {
         rows: [
           SettingsNativeRow(
             id: "appearance",
-            icon: "moon.fill",
+            icon: "moon",
             label: "Appearance",
             detailText: appearanceSummary,
             toggleValue: false,
             kind: .link,
-            iconColor: UIColor.systemIndigo,
+            iconColor: .clear,
             divider: false,
             destructive: false
           )
@@ -209,12 +210,12 @@ struct SettingsView: View {
         rows: [
           SettingsNativeRow(
             id: "media-cache",
-            icon: "internaldrive.fill",
+            icon: "internaldrive",
             label: "Media Cache",
             detailText: "Manage",
             toggleValue: false,
             kind: .link,
-            iconColor: UIColor.systemPink,
+            iconColor: .clear,
             divider: false,
             destructive: false
           )
@@ -229,12 +230,14 @@ struct SettingsView: View {
       subtitle: headerSubtitle,
       avatarImageURI: currentProfile.profileImage,
       avatarFallbackText: currentProfile.displayName,
+      avatarUserId: currentProfile.userID,
       footerText: "Vibe Mobile",
       sections: sections,
       palette: palette,
       isDark: isDark,
       onRowPress: handleRowPress,
       onRowToggle: handleRowToggle,
+      onAvatarTap: nil,
       onSignOut: {
         AppRootControllerFactory.signOut()
       }
@@ -1189,13 +1192,20 @@ private struct ThemePlateCard: View {
   }
 }
 
+/// Contacts-style Edit Profile (Cancel / Done, Set New Photo, name split, bio, rows).
 private struct ProfileSettingsDetailView: View {
   @Environment(\.dismiss) private var dismiss
   @Environment(\.colorScheme) private var colorScheme
   @ObservedObject var profileController: AppProfileController
 
   @State private var draft = AppUserProfileDraft(profile: nil)
+  @State private var firstName: String = ""
+  @State private var lastName: String = ""
   @State private var saveError: String?
+  @State private var localAvatarImage: UIImage?
+  @State private var photoPickerItem: PhotosPickerItem?
+  @State private var isUploadingPhoto = false
+  @State private var birthdayDate: Date?
 
   private var palette: AppThemePalette {
     AppThemePalette.resolve(for: colorScheme)
@@ -1205,70 +1215,405 @@ private struct ProfileSettingsDetailView: View {
     AppUserProfileDraft(profile: profileController.profile)
   }
 
+  private var composedName: String {
+    [firstName, lastName]
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .filter { !$0.isEmpty }
+      .joined(separator: " ")
+  }
+
   private var isDirty: Bool {
-    draft != baselineDraft
+    var d = draft
+    d.name = composedName
+    return d != baselineDraft || localAvatarImage != nil
+  }
+
+  private var userId: String {
+    profileController.profile?.userID ?? AppSessionConfig.current?.userID ?? ""
+  }
+
+  private var avatarGradient: (UIColor, UIColor) {
+    ChatProfileAppearanceStore.avatarColors(
+      title: composedName.isEmpty ? draft.username : composedName,
+      peerUserId: userId.isEmpty ? nil : userId,
+      chatId: nil
+    )
   }
 
   var body: some View {
-    List {
-      Section("Profile") {
-        TextField("Name", text: $draft.name)
-        TextField("Username", text: $draft.username)
-          .textInputAutocapitalization(.never)
-          .autocorrectionDisabled()
-        TextField("Phone Number", text: $draft.phoneNumber)
-          .keyboardType(.phonePad)
-      }
-      .listRowBackground(palette.card)
+    ScrollView(showsIndicators: false) {
+      VStack(spacing: 18) {
+        avatarBlock
 
-      Section("About") {
-        TextField("Bio", text: $draft.bio, axis: .vertical)
-          .lineLimit(3...6)
-        TextField("Date of Birth", text: $draft.dateOfBirth)
-      }
-      .listRowBackground(palette.card)
+        // Order matches Contacts-style: photo → names → bio → birthday → number/username/color.
+        nameCard
+        helperText("Enter your name and add an optional profile photo.")
 
-      if let saveError {
-        Section {
+        bioCard
+        helperText("A few words about you.")
+
+        // Backend has date_of_birth — keep birthday.
+        birthdayRow
+        helperText("Only your contacts can see your birthday.")
+
+        detailsCard
+
+        if let saveError {
           Text(saveError)
             .font(.footnote)
             .foregroundStyle(palette.danger)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 4)
         }
-        .listRowBackground(palette.card)
       }
+      .padding(.horizontal, 16)
+      .padding(.top, 12)
+      .padding(.bottom, 40)
     }
-    .listStyle(.insetGrouped)
-    .scrollContentBackground(.hidden)
     .background(palette.background.ignoresSafeArea())
-    .navigationTitle("Profile")
     .navigationBarTitleDisplayMode(.inline)
+    .navigationBarBackButtonHidden(true)
     .toolbar {
+      ToolbarItem(placement: .topBarLeading) {
+        Button("Cancel") { dismiss() }
+          .foregroundStyle(palette.text)
+      }
       ToolbarItem(placement: .topBarTrailing) {
-        Button(profileController.isLoading ? "Saving..." : "Save") {
-          Task {
-            await saveProfile()
-          }
+        Button(profileController.isLoading || isUploadingPhoto ? "Saving" : "Done") {
+          Task { await saveProfile() }
         }
+        .fontWeight(.semibold)
         .disabled(
-          !isDirty
-            || profileController.isLoading
+          profileController.isLoading
+            || isUploadingPhoto
             || draft.username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || (!isDirty && !isUploadingPhoto && !profileController.isLoading)
         )
       }
     }
     .onAppear {
-      draft = baselineDraft
+      seedFromProfile()
+    }
+    .onChange(of: photoPickerItem) { _, item in
+      guard let item else { return }
+      Task { await loadPickedPhoto(item) }
+    }
+  }
+
+  // MARK: - Blocks
+
+  private var avatarBlock: some View {
+    VStack(spacing: 10) {
+      ZStack {
+        Circle()
+          .fill(
+            LinearGradient(
+              colors: [Color(uiColor: avatarGradient.0), Color(uiColor: avatarGradient.1)],
+              startPoint: .top,
+              endPoint: .bottom
+            )
+          )
+        if let localAvatarImage {
+          Image(uiImage: localAvatarImage)
+            .resizable()
+            .scaledToFill()
+        } else if let uri = draft.profileImage, !uri.isEmpty {
+          EditProfileRemoteAvatar(uri: uri)
+        } else {
+          Text(avatarInitial)
+            .font(.system(size: 42, weight: .bold))
+            .foregroundStyle(.white)
+        }
+
+        // Custom drawn spinner (not system ProgressView) while upload is in flight.
+        if isUploadingPhoto {
+          Circle()
+            .fill(Color.black.opacity(0.42))
+          EditProfileDrawingSpinner(size: 42, lineWidth: 3.2)
+        }
+      }
+      .frame(width: 120, height: 120)
+      .clipShape(Circle())
+      .overlay(Circle().stroke(Color.white.opacity(0.12), lineWidth: 1))
+
+      PhotosPicker(selection: $photoPickerItem, matching: .images) {
+        Text(isUploadingPhoto ? "Uploading…" : "Set New Photo")
+          .font(.system(size: 17, weight: .regular))
+          .foregroundStyle(Color.accentColor)
+      }
+      .disabled(isUploadingPhoto)
+    }
+    .frame(maxWidth: .infinity)
+    .padding(.top, 8)
+  }
+
+  private var nameCard: some View {
+    VStack(spacing: 0) {
+      TextField("First Name", text: $firstName)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+      Divider().padding(.leading, 16)
+      TextField("Last Name", text: $lastName)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+    }
+    .background(roundedCard)
+  }
+
+  private var bioCard: some View {
+    TextField("Bio", text: $draft.bio, axis: .vertical)
+      .lineLimit(2...5)
+      .padding(.horizontal, 16)
+      .padding(.vertical, 14)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .background(roundedCard)
+  }
+
+  private var birthdayRow: some View {
+    HStack(spacing: 12) {
+      editRowIcon("birthday.cake")
+
+      Text("Birthday")
+        .font(.system(size: 17))
+        .foregroundStyle(palette.text)
+
+      Spacer()
+
+      if let birthdayDate {
+        DatePicker(
+          "",
+          selection: Binding(
+            get: { birthdayDate },
+            set: { next in
+              self.birthdayDate = next
+              draft.dateOfBirth = Self.birthdayFormatter.string(from: next)
+            }
+          ),
+          displayedComponents: .date
+        )
+        .labelsHidden()
+      } else {
+        Button("Add") {
+          let today = Date()
+          birthdayDate = today
+          draft.dateOfBirth = Self.birthdayFormatter.string(from: today)
+        }
+        .foregroundStyle(palette.secondaryText)
+      }
+    }
+    .padding(.horizontal, 16)
+    .padding(.vertical, 12)
+    .background(roundedCard)
+  }
+
+  private var detailsCard: some View {
+    VStack(spacing: 0) {
+      HStack(spacing: 12) {
+        editRowIcon("phone")
+        Text("Number")
+          .font(.system(size: 17))
+          .foregroundStyle(palette.text)
+        TextField("Add", text: $draft.phoneNumber)
+          .keyboardType(.phonePad)
+          .multilineTextAlignment(.trailing)
+          .font(.system(size: 17))
+          .foregroundStyle(palette.secondaryText)
+      }
+      .padding(.horizontal, 16)
+      .padding(.vertical, 12)
+
+      Divider().padding(.leading, 52)
+
+      HStack(spacing: 12) {
+        editRowIcon("at")
+        Text("Username")
+          .font(.system(size: 17))
+          .foregroundStyle(palette.text)
+        TextField("@username", text: $draft.username)
+          .textInputAutocapitalization(.never)
+          .autocorrectionDisabled()
+          .multilineTextAlignment(.trailing)
+          .font(.system(size: 17))
+          .foregroundStyle(palette.secondaryText)
+      }
+      .padding(.horizontal, 16)
+      .padding(.vertical, 12)
+
+      Divider().padding(.leading, 52)
+
+      NavigationLink {
+        AppearanceSettingsDetailView()
+      } label: {
+        HStack(spacing: 12) {
+          editRowIcon("paintbrush")
+          Text("Your Color")
+            .font(.system(size: 17))
+            .foregroundStyle(palette.text)
+          Spacer()
+          Image(systemName: "chevron.right")
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(palette.secondaryText.opacity(0.55))
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+      }
+    }
+    .background(roundedCard)
+  }
+
+  /// Monochrome / blended icons — same spirit as Settings list (not color tiles).
+  private func editRowIcon(_ systemName: String) -> some View {
+    Image(systemName: systemName)
+      .font(.system(size: 17, weight: .regular))
+      .foregroundStyle(palette.secondaryText.opacity(colorScheme == .dark ? 0.92 : 0.78))
+      .frame(width: 24, height: 24)
+  }
+
+  private var roundedCard: some View {
+    RoundedRectangle(cornerRadius: 14, style: .continuous)
+      .fill(palette.card)
+  }
+
+  private var avatarInitial: String {
+    let seed = firstName.isEmpty ? (draft.username.isEmpty ? "U" : draft.username) : firstName
+    return String(seed.prefix(1)).uppercased()
+  }
+
+  private static let birthdayFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "yyyy-MM-dd"
+    return f
+  }()
+
+  private func helperText(_ text: String) -> some View {
+    Text(text)
+      .font(.system(size: 13))
+      .foregroundStyle(palette.secondaryText)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .padding(.horizontal, 4)
+  }
+
+  private func seedFromProfile() {
+    draft = baselineDraft
+    let parts = draft.name.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+    firstName = parts.first.map(String.init) ?? ""
+    lastName = parts.count > 1 ? String(parts[1]) : ""
+    if let raw = draft.dateOfBirth.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank,
+      let parsed = Self.birthdayFormatter.date(from: raw)
+    {
+      birthdayDate = parsed
+    } else {
+      birthdayDate = nil
+    }
+    localAvatarImage = nil
+  }
+
+  @MainActor
+  private func loadPickedPhoto(_ item: PhotosPickerItem) async {
+    isUploadingPhoto = true
+    defer {
+      isUploadingPhoto = false
+      photoPickerItem = nil
+    }
+    do {
+      guard let data = try await item.loadTransferable(type: Data.self),
+        let image = UIImage(data: data)
+      else {
+        saveError = "Couldn't read that photo."
+        return
+      }
+      // Paint immediately in the edit screen.
+      localAvatarImage = image
+
+      guard let config = AppSessionConfig.current else {
+        saveError = "Not signed in."
+        return
+      }
+      let jpeg = image.jpegData(compressionQuality: 0.85) ?? data
+      // Multipart: user_id + type=image + file (avatar.jpg).
+      let remoteURL = try await ChatRoomCreateService.uploadAvatar(
+        imageData: jpeg,
+        config: config
+      )
+      // Seed memory/disk cache so Settings header + tab bar hit instantly.
+      ChatAvatarImageStore.cacheHero(image, for: remoteURL)
+      draft.profileImage = remoteURL
+      // JSON profile update — profileImage is the remote URL string only.
+      _ = try await AppProfileController.shared.updateFields(["profileImage": remoteURL])
+      // Keep local paint; Settings / tabs observe AppProfileController.$profile.
+      localAvatarImage = image
+      saveError = nil
+    } catch {
+      saveError = error.localizedDescription
     }
   }
 
   @MainActor
   private func saveProfile() async {
     saveError = nil
+    draft.name = composedName
     do {
       try await profileController.update(draft)
       dismiss()
     } catch {
       saveError = error.localizedDescription
+    }
+  }
+}
+
+/// Remote avatar for Edit Profile (cached when possible).
+private struct EditProfileRemoteAvatar: View {
+  let uri: String
+  @State private var image: UIImage?
+
+  var body: some View {
+    Group {
+      if let image {
+        Image(uiImage: image)
+          .resizable()
+          .scaledToFill()
+      } else {
+        Color.clear
+      }
+    }
+    .task(id: uri) {
+      if let cached = ChatAvatarImageStore.cached(for: uri) {
+        image = cached
+        return
+      }
+      image = await ChatAvatarImageStore.load(from: uri)
+    }
+  }
+}
+
+/// Custom stroked arc spinner — drawn, not UIActivityIndicator / ProgressView.
+private struct EditProfileDrawingSpinner: View {
+  var size: CGFloat = 40
+  var lineWidth: CGFloat = 3
+  @State private var rotation: Double = 0
+
+  var body: some View {
+    TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: false)) { context in
+      let t = context.date.timeIntervalSinceReferenceDate
+      let angle = (t.truncatingRemainder(dividingBy: 1.0) / 1.0) * 360.0
+      ZStack {
+        Circle()
+          .stroke(Color.white.opacity(0.18), lineWidth: lineWidth)
+        Circle()
+          .trim(from: 0.08, to: 0.72)
+          .stroke(
+            AngularGradient(
+              colors: [
+                Color.white.opacity(0.15),
+                Color.white.opacity(0.95),
+              ],
+              center: .center
+            ),
+            style: StrokeStyle(lineWidth: lineWidth, lineCap: .round)
+          )
+          .rotationEffect(.degrees(angle))
+      }
+      .frame(width: size, height: size)
     }
   }
 }

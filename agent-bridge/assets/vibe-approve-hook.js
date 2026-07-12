@@ -3,8 +3,8 @@
 // Vibe PreToolUse hook — decides how Claude Code gets approval for tools.
 // Behaviour is driven by ~/.vibe/agent-config.toml (approval_mode):
 //   "local"  -> pure pass-through: approve/answer on THIS device only (no phone).
-//   "mobile" -> safe/allow-listed run w/o asking; blockers -> phone (falls back to
-//               a local prompt after 3 min / if the bridge is down, so nothing hangs).
+//   "mobile" -> safe/allow-listed run w/o asking; blockers -> phone and remain
+//               pending until answered; if the bridge is down it falls back locally.
 //   "auto"   -> same as "mobile" (Codex-like: safe auto, blockers -> phone).
 //   "both"   -> safe/allow-listed run w/o asking; blockers show on BOTH the desk and
 //               the phone at once (first responder wins) when this is a real terminal

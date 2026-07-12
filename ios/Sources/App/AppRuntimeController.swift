@@ -546,6 +546,8 @@ struct AppUserProfileDraft: Equatable {
   var phoneNumber: String
   var bio: String
   var dateOfBirth: String
+  /// Remote URL after media upload — never raw bytes.
+  var profileImage: String?
 
   init(profile: AppUserProfile?) {
     self.name = profile?.name ?? ""
@@ -553,16 +555,23 @@ struct AppUserProfileDraft: Equatable {
     self.phoneNumber = profile?.phoneNumber ?? AppSessionConfig.current?.phoneNumber ?? ""
     self.bio = profile?.bio ?? ""
     self.dateOfBirth = profile?.dateOfBirth ?? ""
+    self.profileImage = profile?.profileImage
   }
 
   var trimmedPayload: [String: Any] {
-    [
+    var body: [String: Any] = [
       "name": name.trimmingCharacters(in: .whitespacesAndNewlines),
       "username": username.trimmingCharacters(in: .whitespacesAndNewlines),
       "phoneNumber": phoneNumber.trimmingCharacters(in: .whitespacesAndNewlines),
       "bio": bio.trimmingCharacters(in: .whitespacesAndNewlines),
       "dateOfBirth": dateOfBirth.trimmingCharacters(in: .whitespacesAndNewlines),
     ]
+    if let profileImage = profileImage?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !profileImage.isEmpty
+    {
+      body["profileImage"] = profileImage
+    }
+    return body
   }
 }
 

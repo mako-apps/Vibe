@@ -895,7 +895,7 @@ struct AgentBridgeHistoryInlineView: View {
       let payload = ChatEngine.shared.latestAgentBridgeHistory(chatId: chatId),
       (payload["mode"] as? String ?? "list") == "list"
     {
-      let cached = (payload["sessions"] as? [[String: Any]] ?? []).compactMap { Self.parseSession($0) }
+      let cached = Self.sessionItems(from: payload["sessions"]).compactMap { Self.parseSession($0) }
       if !cached.isEmpty {
         sessions = cached
         loading = false
@@ -1102,7 +1102,7 @@ struct AgentBridgeHistoryInlineView: View {
     notReadyRetries = 0
     listRequestInFlight = false
     pendingRequestId = nil
-    let raw = payload["sessions"] as? [[String: Any]] ?? []
+    let raw = Self.sessionItems(from: payload["sessions"])
     sessions = raw.compactMap { item in
       Self.parseSession(item)
     }
@@ -1177,6 +1177,25 @@ struct AgentBridgeHistoryInlineView: View {
         return kind.isEmpty ? nil : kind
       }()
     )
+  }
+
+  /// `JSONSerialization` normally bridges a nested list directly to
+  /// `[[String: Any]]`, but Foundation can surface Phoenix payload arrays as
+  /// `[Any]`/`NSDictionary` on a physical device. Normalize both shapes before
+  /// parsing so a valid bridge reply never leaves the History sheet on its skeleton.
+  static func sessionItems(from raw: Any?) -> [[String: Any]] {
+    if let sessions = raw as? [[String: Any]] { return sessions }
+    guard let values = raw as? [Any] else { return [] }
+    return values.compactMap { value in
+      if let session = value as? [String: Any] { return session }
+      guard let dictionary = value as? NSDictionary else { return nil }
+      var session: [String: Any] = [:]
+      for (key, value) in dictionary {
+        guard let key = key as? String else { continue }
+        session[key] = value
+      }
+      return session.isEmpty ? nil : session
+    }
   }
 
   static func relativeDate(_ iso: String) -> String? {

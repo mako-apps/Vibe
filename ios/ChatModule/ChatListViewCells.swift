@@ -1350,17 +1350,47 @@ private func agentResponseInProgress(_ row: ChatListRow) -> Bool {
       || row.messageType == "agent_progress_tree")
 }
 
+/// The narrower "nothing to read yet" subset of `agentResponseInProgress`: typing dots,
+/// the progress-tree placeholder, or a streaming bubble that hasn't produced text.
+/// Only these phases hide the timestamp (an empty "Thinking…" bubble must not balloon
+/// around a time reserve). Once real streamed text is flowing, the bubble reserves AND
+/// shows the meta exactly like its settled replacement — otherwise the stream→settle
+/// swap re-measures with the timestamp and re-wraps the last line (the "content shifts
+/// to different padding when the turn finishes" jump).
+private func agentResponsePlaceholder(_ row: ChatListRow) -> Bool {
+  row.isAgentMessage
+    && (row.messageType == "typing"
+      || row.messageType == "agent_progress_tree"
+      || (row.isStreamingText && trimmedBubbleText(row).isEmpty))
+}
+
+/// A supervisor team-run LEAD row: the single visible cell of an `@team` run (workers
+/// are suppressed under the hood). It renders the structured team feed in its bubble —
+/// including in GROUPS: the general group exclusion in `bubbleUsesAgentTurnContent`
+/// exists because multiple agents' streams would interleave into one messy feed, but a
+/// supervisor run has exactly ONE visible cell, so the concern doesn't apply.
+func bubbleRendersTeamRun(_ row: ChatListRow) -> Bool {
+  guard row.isAgentMessage, let runtime = row.agentRuntime,
+    let teamRunId = runtime.teamRunId, !teamRunId.isEmpty
+  else { return false }
+  return runtime.teamMode == "supervisor" || runtime.teamMode == "group_supervisor"
+    || !runtime.teamWorkersStatus.isEmpty
+}
+
 /// Whether this row renders its full interleaved step/narration/diff feed directly in
 /// the chat bubble (via `VibeAgentTurnContentView`). True for any 1:1 agent turn — a
 /// group/multi-agent row (`row.isGroupOrChannel`) instead defers to the full-page agent
 /// runtime view so multiple agents' output doesn't interleave into one messy feed; no
 /// live route sets that flag for a bridge-agent row today, so this is effectively always
-/// true in practice until group-agent support ships.
+/// true in practice until group-agent support ships. Exception: a supervisor team-run
+/// lead row (see `bubbleRendersTeamRun`) uses this path in groups too — it's the run's
+/// only visible cell and needs the structured worker feed instead of a churning text
+/// bubble.
 // Internal (not private) so ChatListView's setRows can route streaming agent-turn reloads
 // through `reconfigureItems` (persist the cell + its reusable live feed) instead of
 // `reloadItems` (recreate → re-fade the whole narration every chunk).
 func bubbleUsesAgentTurnContent(_ row: ChatListRow) -> Bool {
-  !row.isGroupOrChannel
+  (!row.isGroupOrChannel || bubbleRendersTeamRun(row))
     && row.kind == .message
     && row.visualKind == .text
     && row.isAgentMessage
@@ -1446,7 +1476,7 @@ func groupSystemNoticeText(for row: ChatListRow, body: String) -> String? {
 private func bubbleMetaWidths(for row: ChatListRow) -> ChatBubbleMetaWidths {
   if row.messageType == "agent_progress"
     || usesTransparentAgentStreamingLayout(row)
-    || agentResponseInProgress(row)
+    || agentResponsePlaceholder(row)
     || bubbleUsesAgentTurnContent(row)
   {
     return ChatBubbleMetaWidths(edited: 0.0, pinned: 0.0, timestamp: 0.0, total: 0.0)
@@ -6775,7 +6805,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       // otherwise the time reserves width and balloons the empty/"Thinking…"
       // bubble. Covers the streaming-text, typing, and progress-tree phases.
       metaContainerView.isHidden =
-        isGhostHidden || usesTransparentAgentStreaming || agentResponseInProgress(row)
+        isGhostHidden || usesTransparentAgentStreaming || agentResponsePlaceholder(row)
         || usesAgentTurnContent
       selectionCircleView.isHidden = !selectionMode || isGhostHidden
       selectionCircleView.configure(selected: selected, appearance: appearance)

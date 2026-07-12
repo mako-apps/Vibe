@@ -235,7 +235,7 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
     let longPress = UILongPressGestureRecognizer(
       target: self, action: #selector(handleLongPress(_:)))
     // Telegram-like cadence: fast enough for real-time feel without accidental triggers.
-    longPress.minimumPressDuration = 0.24
+    longPress.minimumPressDuration = 0.19
     longPress.allowableMovement = 10.0
     // The hold detector must never hold up touch delivery to the swipe pan: a
     // swipe (movement) and a hold (stationary) are two independent detections.
@@ -269,6 +269,16 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
   public override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer)
     -> Bool
   {
+    // Usage-banner carousel pan: horizontal drags only, so a scroll that starts
+    // on the banner still goes to the list underneath.
+    if gestureRecognizer === usageBannerPanGesture,
+      let pan = gestureRecognizer as? UIPanGestureRecognizer
+    {
+      let t = pan.translation(in: pan.view)
+      let v = pan.velocity(in: pan.view)
+      if abs(t.x) > 2.0 || abs(t.y) > 2.0 { return abs(t.x) > abs(t.y) }
+      return abs(v.x) > abs(v.y)
+    }
     guard gestureRecognizer === swipeReplyPanGesture,
       let pan = gestureRecognizer as? UIPanGestureRecognizer
     else {
@@ -607,9 +617,9 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
       UIImpactFeedbackGenerator(style: .medium).impactOccurred()
       cell.setContextMenuHeld(true, animated: true, strategy: "scaleCell")
 
-      // The scale down animation takes 0.18s. We wait exactly that long so the cell
+      // The scale down animation takes 0.14s. We wait exactly that long so the cell
       // reaches its scaled state smoothly, then synchronously pop open the menu.
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self, weak cell] in
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { [weak self, weak cell] in
         guard let self = self else { return }
         guard gesture.state == .began || gesture.state == .changed else {
           self.holdDebugLog("longPress delayed cancel state=\(gesture.state.rawValue)")
@@ -654,6 +664,7 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
   ) -> UIContextMenuConfiguration? {
     return nil
   }
+
 
   // MARK: - ChatContextMenuOverlayDelegate
 

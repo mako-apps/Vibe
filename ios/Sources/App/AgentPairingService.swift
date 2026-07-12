@@ -60,6 +60,7 @@ enum AgentRuntimeCrypto {
         cachedKeychainAccount = account
         cacheLoaded = true
       }
+      clearDecryptCache()
     }
     return ok
   }
@@ -79,6 +80,7 @@ enum AgentRuntimeCrypto {
       cachedKeychainAccount = account
       cacheLoaded = true
     }
+    clearDecryptCache()
   }
 
   private static func activeKeychainAccount() -> String {
@@ -140,10 +142,22 @@ enum AgentRuntimeCrypto {
     }
   }
 
+  // Decrypt results are memoized: ChatListRow re-parses every agent row on every
+  // setRows pass, so without this the same immutable ciphertext is AES-opened and
+  // JSON-parsed dozens of times per streamed frame. Cleared whenever the key changes.
+  private static let decryptCache = NSCache<NSString, NSDictionary>()
+
+  static func clearDecryptCache() {
+    decryptCache.removeAllObjects()
+  }
+
   /// Decrypt an `arte1.<iv>.<ct>.<tag>` blob into the runtime dictionary. Returns
   /// nil when there's no key, the envelope is malformed, or authentication fails.
   static func decrypt(_ blob: Any?) -> [String: Any]? {
     guard let blob = blob as? String else { return nil }
+    if let cached = decryptCache.object(forKey: blob as NSString) {
+      return cached as? [String: Any]
+    }
     let parts = blob.split(separator: ".", omittingEmptySubsequences: false).map(String.init)
     guard parts.count == 4, parts[0] == blobPrefix else { return nil }
     guard let key = keyData(),
@@ -155,7 +169,11 @@ enum AgentRuntimeCrypto {
       let box = try AES.GCM.SealedBox(
         nonce: try AES.GCM.Nonce(data: iv), ciphertext: ct, tag: tag)
       let plaintext = try AES.GCM.open(box, using: SymmetricKey(data: key))
-      return try JSONSerialization.jsonObject(with: plaintext) as? [String: Any]
+      let object = try JSONSerialization.jsonObject(with: plaintext) as? [String: Any]
+      if let object {
+        decryptCache.setObject(object as NSDictionary, forKey: blob as NSString)
+      }
+      return object
     } catch {
       return nil
     }
@@ -843,7 +861,14 @@ enum AgentBridgeSelectionStore {
     }
     liveModelsByProvider = next
     persistLiveModels(next)
-    NotificationCenter.default.post(name: didChangeNotification, object: nil)
+    let postChange = {
+      NotificationCenter.default.post(name: didChangeNotification, object: nil)
+    }
+    if Thread.isMainThread {
+      postChange()
+    } else {
+      DispatchQueue.main.async(execute: postChange)
+    }
   }
 
   /// Load last-good live catalogs so cold start does not flash seed until status returns.
@@ -1372,6 +1397,13 @@ enum AgentPairingService {
     lastConnected = result.connected
     lastStatusSnapshot = result
     lastStatusFetchedAt = Date()
+    let taskSummary = result.runningTasks.map { task in
+      let chatScope = task.chatId.isEmpty ? "provider" : String(task.chatId.prefix(12))
+      return "\(task.provider):\(task.taskId.prefix(18))@\(chatScope)"
+    }.joined(separator: ",")
+    AppUITrace.notice(
+      "AgentBridgeStatus connected=\(result.connected) devices=\(result.devices.count) tasks=\(result.runningTasks.count) [\(taskSummary)]"
+    )
     if !models.isEmpty {
       AgentBridgeSelectionStore.ingestLiveModels(models)
     }

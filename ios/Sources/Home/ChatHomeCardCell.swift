@@ -25,11 +25,21 @@ final class ChatHomeCardCell: UITableViewCell {
   /// Read synchronously so a home row can show "Working…" even before its chat channel is
   /// joined (a run started on the Mac/IDE, or a cold launch) — the status poll owns this
   /// signal, independent of the per-chat agent-stream frames that drive `agentProgress`.
-  static func hasRunningBridgeTask(chatId: String) -> Bool {
+  static func hasRunningBridgeTask(chatId: String, provider: String?) -> Bool {
     let key = chatId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !key.isEmpty else { return false }
+    let providerKey = provider?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     return (AgentPairingService.lastStatusSnapshot?.runningTasks ?? [])
-      .contains { $0.chatId.trimmingCharacters(in: .whitespacesAndNewlines) == key }
+      .contains { task in
+        let taskChat = task.chatId.trimmingCharacters(in: .whitespacesAndNewlines)
+        if taskChat == key { return true }
+        // Desktop/IDE-owned sessions have no mobile chatId. They still belong to
+        // the provider's single DM row, so use the provider as the fallback scope.
+        // Accept the `desktop:` identity too so Home remains correct while an older
+        // bridge/server Presence snapshot still carries a stale mobile chatId.
+        let isDesktopOwned = taskChat.isEmpty || task.taskId.lowercased().hasPrefix("desktop:")
+        return isDesktopOwned && task.provider.lowercased() == providerKey
+      }
   }
 
   static func getFallbackInitials(from name: String) -> String {
@@ -90,6 +100,7 @@ final class ChatHomeCardCell: UITableViewCell {
     return gesture
   }()
   private var currentRow: ChatHomeListRow?
+  private var lastBridgePreviewSignature: String?
   private var manualSwipeActionsEnabled = true
   private var isSwipeEnabled = true
   private var swipeOffset: CGFloat = 0
@@ -133,8 +144,10 @@ final class ChatHomeCardCell: UITableViewCell {
     avatarLoadTask?.cancel()
     avatarLoadTask = nil
     avatarToken = UUID().uuidString
+    // Do NOT clear avatarImageView.image here — configure() will either paint a
+    // disk/memory hit immediately or replace entity-keyed content. Blanking caused
+    // the initials↔photo flicker on every cell recycle / cold scroll.
     lastAvatarURLString = nil
-    avatarImageView.image = nil
     usesIconFallback = false
     avatarFallbackIconView.isHidden = true
     avatarFallbackLabel.isHidden = false
@@ -150,6 +163,7 @@ final class ChatHomeCardCell: UITableViewCell {
     editSelectionCheckView.isHidden = true
     rowContentLeadingConstraint?.constant = 0
     currentRow = nil
+    lastBridgePreviewSignature = nil
     leadingDisplaySpecs = []
     trailingDisplaySpecs = []
     leadingFullSwipeSpec = nil
@@ -226,11 +240,17 @@ final class ChatHomeCardCell: UITableViewCell {
       tierBadgeImageView.image = UIImage(systemName: "checkmark.seal.fill")
       tierBadgeImageView.tintColor = goldColor
     }
+    let bridgeProvider = ChatHomeListRow.bridgeProvider(
+      peerUserId: row.peerUserId,
+      name: row.title,
+      isAgent: row.isAgentFriend,
+      agentId: row.peerAgentId
+    )
     // Bridge agent rows carry a static "Start session" preview. While a run is actually
     // live, surface the current working state (thinking / tool step, e.g. "Reading …")
     // instead so the home reflects active sessions rather than always reading "Start
-    // session". `agentProgress` returns nil once the run finishes, so the row falls back
-    // to its normal preview automatically.
+    // session". Once progress settles, the row returns to the explicit idle action,
+    // never a persisted message preview.
     if row.isBridgeAgentSurface,
       let progress = ChatEngine.shared.agentProgress(chatId: row.chatId),
       let liveLabel = (progress["label"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -238,13 +258,27 @@ final class ChatHomeCardCell: UITableViewCell {
     {
       previewLabel.text = liveLabel
       previewLabel.textColor = typingColor
-    } else if row.isBridgeAgentSurface, Self.hasRunningBridgeTask(chatId: row.chatId) {
+      traceBridgePreview(row: row, provider: bridgeProvider, state: "progress:\(liveLabel)")
+    } else if row.isBridgeAgentSurface,
+      Self.hasRunningBridgeTask(
+        chatId: row.chatId,
+        provider: bridgeProvider
+      )
+    {
       // No live agent-stream label yet (a run started on the Mac / IDE, or a cold launch
       // before this chat's channel is joined) — but the bridge status snapshot reports a
       // task running for this chat. Show the working state instead of the idle
       // "Start session" preview so home reflects the in-flight session.
       previewLabel.text = "Working…"
       previewLabel.textColor = typingColor
+      traceBridgePreview(row: row, provider: bridgeProvider, state: "working")
+    } else if row.isBridgeAgentSurface {
+      // Agent DMs are launch surfaces, not ordinary chat previews. A persisted
+      // message may still exist in the Home row/cache, but it must never replace
+      // the explicit idle state after a live task settles or on cold launch.
+      previewLabel.text = "Start session"
+      previewLabel.textColor = secondary
+      traceBridgePreview(row: row, provider: bridgeProvider, state: "idle")
     } else {
       previewLabel.text = row.isTyping ? "typing..." : row.preview
       previewLabel.textColor = row.isTyping ? typingColor : secondary
@@ -315,6 +349,15 @@ final class ChatHomeCardCell: UITableViewCell {
     } else {
       loadAvatarImage(urlString: row.avatarUri)
     }
+  }
+
+  private func traceBridgePreview(row: ChatHomeListRow, provider: String?, state: String) {
+    let signature = "\(row.chatId)|\(state)"
+    guard signature != lastBridgePreviewSignature else { return }
+    lastBridgePreviewSignature = signature
+    AppUITrace.notice(
+      "ChatHomeCell bridgeState provider=\(provider ?? "?") chatId=\(String(row.chatId.prefix(12))) state=\(state) tasks=\(AgentPairingService.lastStatusSnapshot?.runningTasks.count ?? 0)"
+    )
   }
 
   private func updateEditingLayout(_ isEditing: Bool, animated: Bool) {
@@ -1279,17 +1322,25 @@ final class ChatHomeCardCell: UITableViewCell {
     }
 
     if let cached = ChatAvatarImageStore.cached(for: normalizedURL) {
-      avatarImageView.image = cached
+      VibeAvatarDisplay.apply(
+        cached,
+        to: avatarImageView,
+        fallbackLabel: avatarFallbackLabel,
+        animated: false,
+        keepPreviousIfNil: false
+      )
       showAvatarFallback(false)
       return
     }
 
-    // No cached photo yet. Prefer a quiet gradient (no letter) while loading so a
-    // chat that already has a remote avatar never flashes initials on top.
-    avatarImageView.image = nil
-    showAvatarFallback(true)
-    // Hide the letter glyph specifically; keep gradient from showAvatarFallback(true).
-    avatarFallbackLabel.isHidden = true
+    // No memory/disk hit. Keep any previous photo while loading; only show
+    // quiet gradient (hide letter) — never flash initials over a real avatar.
+    if avatarImageView.image == nil {
+      showAvatarFallback(true)
+      avatarFallbackLabel.isHidden = true
+    } else {
+      showAvatarFallback(false)
+    }
 
     let token = avatarToken
     let task = Task { [weak self] in
@@ -1299,10 +1350,16 @@ final class ChatHomeCardCell: UITableViewCell {
         guard let self, token == self.avatarToken else { return }
         self.avatarLoadTask = nil
         if let image {
-          self.avatarImageView.image = image
+          VibeAvatarDisplay.apply(
+            image,
+            to: self.avatarImageView,
+            fallbackLabel: self.avatarFallbackLabel,
+            animated: true,
+            keepPreviousIfNil: false
+          )
           self.showAvatarFallback(false)
-        } else {
-          // Load failed — restore letter only when there is truly no photo.
+        } else if self.avatarImageView.image == nil {
+          // Load failed and nothing to keep — restore letter.
           self.showAvatarFallback(true)
         }
       }
@@ -1327,14 +1384,22 @@ final class ChatHomeCardCell: UITableViewCell {
     lastAvatarURLString = cacheKey
 
     if let cached = ChatAvatarImageStore.cached(for: cacheKey) {
-      avatarImageView.image = cached
+      VibeAvatarDisplay.apply(
+        cached,
+        to: avatarImageView,
+        fallbackLabel: avatarFallbackLabel,
+        animated: false,
+        keepPreviousIfNil: false
+      )
       showAvatarFallback(false)
       return
     }
 
-    // Keep the gradient+initials tile up while the mosaic renders.
-    avatarImageView.image = nil
-    showAvatarFallback(true)
+    // Keep prior composite if any; otherwise quiet gradient while mosaic builds.
+    if avatarImageView.image == nil {
+      showAvatarFallback(true)
+      avatarFallbackLabel.isHidden = true
+    }
     let token = UUID().uuidString
     avatarToken = token
     let side: CGFloat = 60
@@ -1357,7 +1422,13 @@ final class ChatHomeCardCell: UITableViewCell {
       await MainActor.run {
         guard let self, token == self.avatarToken else { return }
         self.avatarLoadTask = nil
-        self.avatarImageView.image = composite
+        VibeAvatarDisplay.apply(
+          composite,
+          to: self.avatarImageView,
+          fallbackLabel: self.avatarFallbackLabel,
+          animated: true,
+          keepPreviousIfNil: false
+        )
         self.showAvatarFallback(false)
       }
     }
