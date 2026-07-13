@@ -673,6 +673,13 @@ function ensureBridgeInstructionsForRepositories(repositories) {
 // agent/team. A plain DM message gets just the user's prompt.
 function taskWantsBridgeInstructions(task, prompt) {
   if (task) {
+    // A `chat` team role is a conversation turn: read-only by construction and
+    // told by the server prompt to never narrate instruction files. Prepending
+    // "read and follow .vibe/instructions/AGENTS.md" here contradicted that
+    // (agents replied "I'm reading AGENTS.md…") and wasted tokens on turns that
+    // cannot act anyway.
+    const teamRole = String(task.teamRole || task.team_role || "").toLowerCase();
+    if (teamRole === "chat") return false;
     if (task.teamMode || task.team_mode || task.teamRunId || task.team_run_id) return true;
     if (Array.isArray(task.teamWorkers) && task.teamWorkers.length) return true;
     if (Array.isArray(task.teamWorker) && task.teamWorker.length) return true;
