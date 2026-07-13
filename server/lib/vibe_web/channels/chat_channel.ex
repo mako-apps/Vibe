@@ -820,8 +820,109 @@ defmodule VibeWeb.ChatChannel do
   defp spawn_team_worker_dispatches(chat_id, workers, dispatch_text, data, requester_user_id) do
     team_run_id = data["id"] || Ecto.UUID.generate()
     bridge_metadata = bridge_task_metadata(data)
-    mode = if(LocalAgentWorker.team_supervisor_mode?(), do: "supervisor", else: "sequential")
+    supervisor? = LocalAgentWorker.team_supervisor_mode?()
 
+    cond do
+      # Usage-first routing (the responder must never be a fake lead that patches
+      # solo): a SIMPLE request goes to exactly ONE visible best-provider worker —
+      # 1 provider turn, same as today's solo baseline, but the user sees a real
+      # worker running live. Only in supervisor mode; the legacy sequential chain
+      # keeps its own behavior. A complex request still spins up the lead
+      # orchestrator + under-hood workers.
+      supervisor? and LocalAgentWorker.classify_team_request(dispatch_text) == :simple ->
+        spawn_solo_visible_dispatch(
+          chat_id,
+          workers,
+          dispatch_text,
+          data,
+          requester_user_id,
+          team_run_id,
+          bridge_metadata
+        )
+
+      true ->
+        spawn_supervisor_team_dispatch(
+          chat_id,
+          workers,
+          dispatch_text,
+          data,
+          requester_user_id,
+          team_run_id,
+          bridge_metadata,
+          if(supervisor?, do: "supervisor", else: "sequential")
+        )
+    end
+  end
+
+  # A SIMPLE `@team` request: register a one-worker team run (so worker_states
+  # stay durable and the iOS cell survives backgrounding) and dispatch that single
+  # best-provider worker VISIBLY. Its live frames are the progress the user sees;
+  # it does the whole task itself — there is nothing to orchestrate.
+  defp spawn_solo_visible_dispatch(
+         chat_id,
+         workers,
+         dispatch_text,
+         data,
+         requester_user_id,
+         team_run_id,
+         bridge_metadata
+       ) do
+    solo = LocalAgentWorker.pick_solo_worker(workers, dispatch_text)
+
+    registered =
+      LocalAgentWorker.register_bridge_team_run(
+        chat_id,
+        team_run_id,
+        [solo],
+        dispatch_text,
+        requester_user_id,
+        data["id"],
+        bridge_metadata,
+        mode: "solo"
+      )
+
+    case registered do
+      nil ->
+        :ok
+
+      solo_worker ->
+        Logger.info(
+          "[ChatChannel] team_run mode=solo chat=#{chat_id} run=#{team_run_id} solo=#{solo_worker.handle} pool=#{Enum.map_join(workers, ",", & &1.handle)}"
+        )
+
+        spawn_local_worker_dispatch(
+          chat_id,
+          solo_worker,
+          dispatch_text,
+          data,
+          "reserved_worker_team",
+          requester_user_id,
+          bridge_metadata: bridge_metadata,
+          note_user_turn: false,
+          note_team_user_turn: true,
+          team_run_id: team_run_id,
+          team_workers: [solo_worker],
+          team_mode: "solo",
+          lead_worker: solo_worker.handle,
+          team_role: "solo",
+          suppress_visible: false,
+          task_id_suffix: "solo:#{solo_worker.handle}"
+        )
+
+        :ok
+    end
+  end
+
+  defp spawn_supervisor_team_dispatch(
+         chat_id,
+         workers,
+         dispatch_text,
+         data,
+         requester_user_id,
+         team_run_id,
+         bridge_metadata,
+         mode
+       ) do
     lead_worker =
       LocalAgentWorker.register_bridge_team_run(
         chat_id,

@@ -893,6 +893,82 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   def pick_supervisor_lead(_), do: nil
 
+  @doc """
+  Cheap, repo-agnostic pre-classification of a `@team` request, run BEFORE any
+  provider turn so a SIMPLE task is routed to exactly ONE visible worker (1 turn)
+  instead of paying for a lead-orchestrator turn on top of the worker.
+
+  Biased toward `:simple`: a misjudged complex task run solo is recoverable (the
+  monitor can escalate to a full team), while a misjudged simple task run as a
+  full team wastes an expensive lead turn — the error we most want to avoid,
+  since usage reduction is the priority.
+  """
+  @spec classify_team_request(any()) :: :simple | :complex
+  def classify_team_request(text) when is_binary(text) do
+    t = text |> String.trim() |> String.downcase()
+    words = t |> String.split(~r/\s+/, trim: true) |> length()
+
+    # A "build me a whole <thing>" request almost always decomposes into
+    # frontend/backend/schema slices → a real team.
+    build_new_project? =
+      Regex.match?(
+        ~r/\b(build|create|make|scaffold|design|develop|implement)\b[^.!?]*\b(app|application|web ?site|web ?app|platform|dashboard|landing ?page|frontend|front-end|back-?end|full[- ]?stack|saas|marketplace|clone|portal|storefront|e-?commerce|game|website)\b/,
+        t
+      )
+
+    # Explicit multi-component asks (repo-agnostic phrasing only — no per-project
+    # vocabulary, per the Vibe-core hard rule).
+    multi_component? =
+      Regex.match?(
+        ~r/\b(and also|as well as|end[- ]to[- ]end|multiple (pages|screens|features|endpoints|components)|several (pages|screens|features)|each (page|screen|section|feature)|frontend and backend|api and ui|with (a )?(backend|database|auth|login|payments?|dashboard))\b/,
+        t
+      )
+
+    clause_count = t |> String.split(~r/\b(and|then|plus|also)\b/) |> length()
+
+    cond do
+      build_new_project? -> :complex
+      multi_component? -> :complex
+      words >= 80 and clause_count >= 4 -> :complex
+      true -> :simple
+    end
+  end
+
+  def classify_team_request(_), do: :simple
+
+  @doc """
+  Pick the single best-provider worker to handle a SIMPLE `@team` request
+  visibly — its live frames ARE the progress the user sees, so it must be one of
+  the reliable agentic coders the user named for solo work (codex / claude /
+  grok). Gemini/Agy is reserved for supervised, exact-file UI slices inside a
+  full team run (it drifts when left to run a whole task unsupervised), so it is
+  only a last-resort fallback here.
+  """
+  def pick_solo_worker(workers, text) when is_list(workers) and is_binary(text) do
+    preference =
+      if ui_flavored_request?(text) do
+        # Grok 4.5 is a strong, reliable choice for self-contained UI work.
+        ["grok", "claude", "codex", "agy"]
+      else
+        ["codex", "claude", "grok", "agy"]
+      end
+
+    Enum.find_value(preference, fn handle ->
+      Enum.find(workers, &(&1.handle == handle))
+    end) || pick_supervisor_lead(workers)
+  end
+
+  def pick_solo_worker(workers, _text), do: pick_supervisor_lead(workers)
+
+  defp ui_flavored_request?(text) when is_binary(text) do
+    Regex.match?(
+      ~r/\b(ui|ux|css|styl(e|es|ing)|design|landing|hero|animation|animate|frontend|front-end|layout|theme|responsive|tailwind|component|visual|gradient|shader|three\.?js|gsap)\b/i,
+      text
+    )
+  end
+
+  defp ui_flavored_request?(_), do: false
+
   @doc "Whether team runs default to supervisor mode (one visible lead cell)."
   def team_supervisor_mode? do
     case System.get_env("VIBE_TEAM_MODE") do
@@ -939,6 +1015,9 @@ defmodule Vibe.AI.LocalAgentWorker do
       default_focus = team_worker_default_focus(worker.handle)
 
       case {mode, role} do
+        {_, "solo"} ->
+          build_solo_visible_prompt(worker, dispatch_text, context)
+
         {"supervisor", "lead"} ->
           build_supervisor_lead_prompt(
             worker,
@@ -985,6 +1064,38 @@ defmodule Vibe.AI.LocalAgentWorker do
   def build_team_bridge_prompt(_chat_id, _worker, dispatch_text, _requester, _workers, _run_id, _opts),
     do: dispatch_text
 
+  # A SIMPLE `@team` request routes to one visible worker (chosen by
+  # pick_solo_worker). It is not a lead and has no under-hood teammates to
+  # coordinate — it just builds the thing fully and visibly. This is the 1-turn
+  # path that keeps usage at the solo baseline while still showing real progress.
+  defp build_solo_visible_prompt(worker, dispatch_text, context) do
+    """
+    You are #{worker.label}, handling this Vibe request solo — you are the single
+    agent on it, there is no team to coordinate with for this task.
+
+    Do the work end to end and completely: implement every part the request needs,
+    with no stubs, no TODO screens, and no "next steps" placeholders. Follow the
+    repo's standards in AGENTS.md — including the Premium UI/UX Production Standard
+    for any website or frontend work (no generic AI-template scaffold). Make sure
+    your work builds before you finish.
+
+    Do not reset, stash, revert, or overwrite pre-existing user changes. Keep your
+    final reply concise: what you built and how to run or verify it — no raw tool
+    logs.
+
+    If mid-way you find the task is actually large enough to need multiple
+    specialists (separate frontend / backend / schema slices), finish what you
+    safely can and say so explicitly at the end, so it can be re-run as a full team.
+
+    Shared Vibe group memory:
+    #{context_or_empty(context)}
+
+    Request:
+    #{dispatch_text}
+    """
+    |> String.trim()
+  end
+
   defp build_supervisor_lead_prompt(
          worker,
          dispatch_text,
@@ -1006,9 +1117,13 @@ defmodule Vibe.AI.LocalAgentWorker do
 
     You run a strict phased protocol (the server machine-parses your directives):
 
-    PHASE 0 — CLASSIFY. If the request is trivial chat with no coding work, answer alone
-    briefly and do NOT spawn teammates or emit directives. If it is real work a single
-    agent handles comfortably, do it yourself and skip the team (emit nothing).
+    PHASE 0 — CLASSIFY. You are the ORCHESTRATOR: plan, delegate, integrate, and
+    report — do NOT hand-build every slice yourself. Simple one-agent requests are
+    routed to a single visible worker before they ever reach you, so if you are
+    here the work is almost always multi-part — go to PHASE 1 and split it across
+    your teammates. If the message is pure chat with no coding work, reply briefly
+    and emit nothing. Only if the work genuinely needs just one agent, classify it
+    "solo" and complete that single piece yourself.
 
     PHASE 1 — PLAN (complex / multi-part / new-project work only). Consult the Fable
     advisor (Sol/GPT fallback; advisors never edit files; if none responds, plan yourself)
@@ -1033,9 +1148,10 @@ defmodule Vibe.AI.LocalAgentWorker do
 
     PHASE 3 — INTEGRATE + VERIFY. Read #{handoff_path} as teammates finish. Walk your
     verification checklist: every planned page/endpoint/schema implemented (no stubs, no
-    TODO screens) and the project build passes (tests too if present). Fill small gaps
-    yourself; for big misses emit another VIBE_TEAM_SPAWN with a gap-scoped focus (the
-    run watchdog also restarts crashed or usage-limited teammates automatically).
+    TODO screens) and the project build passes (tests too if present). Prefer to
+    delegate: for any real gap emit another VIBE_TEAM_SPAWN with a gap-scoped focus
+    (the run watchdog also restarts crashed or usage-limited teammates automatically).
+    Only touch files yourself for trivial wiring/integration a spawn would be overkill for.
 
     PHASE 4 — SUMMARY. One concise user reply: what each agent did, what landed, what
     remains. No raw tool logs.
@@ -1250,7 +1366,10 @@ defmodule Vibe.AI.LocalAgentWorker do
           :created ->
             :ets.insert(@team_run_table, {{chat_id, team_run_id}, state})
 
-            if mode == "supervisor" do
+            # "solo" runs are watched too: the monitor's stall/crash retry keeps a
+            # single visible worker from silently dying, and durable worker_states
+            # let the iOS cell survive backgrounding (team-cell-background-wipe).
+            if mode in ["supervisor", "solo"] do
               Vibe.AI.TeamRunMonitor.ensure_started(chat_id, team_run_id)
               Vibe.AI.TeamRunMonitor.note_spawned(chat_id, team_run_id, lead_handle, nil)
             end
