@@ -470,10 +470,12 @@ defmodule Vibe.AI.LocalAgentWorker do
       worker ->
         reply_to_id = Keyword.get(opts, :reply_to_id)
         requester_user_id = Keyword.get(opts, :requester_user_id)
+
         runtime =
           Keyword.get(opts, :runtime)
           |> normalize_runtime_payload()
           |> merge_team_runtime(opts)
+
         # End-to-end encrypted runtime blob. Opaque to the server: stored and
         # served verbatim, never decrypted, parsed, or logged. The key lives
         # only on the user's bridge and phone.
@@ -895,15 +897,24 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   @doc """
   Cheap, repo-agnostic pre-classification of a `@team` request, run BEFORE any
-  provider turn so a SIMPLE task is routed to exactly ONE visible worker (1 turn)
-  instead of paying for a lead-orchestrator turn on top of the worker.
+  provider turn.
 
-  Biased toward `:simple`: a misjudged complex task run solo is recoverable (the
-  monitor can escalate to a full team), while a misjudged simple task run as a
-  full team wastes an expensive lead turn — the error we most want to avoid,
-  since usage reduction is the priority.
+  Three classes:
+
+    * `:chat`    — the user is TALKING, not commissioning work ("can you see this
+                   image?", "what does this do?"). Answered by ONE worker running
+                   with writes HARD-STRIPPED (bridge maps team role `chat` →
+                   `read_only` work mode). No files are touched, ever.
+    * `:simple`  — real work one agent handles → ONE visible worker (1 turn).
+    * `:complex` — decomposes into slices → lead orchestrator + workers.
+
+  The fail-safe direction is `:chat`. Getting this wrong toward work is the
+  expensive error: a question misread as work made a worker read AGENTS.md, patch
+  `page.tsx`/`globals.css` and run a full build off "can you see this image?".
+  A question misread as chat only costs one cheap read-only turn. So work must be
+  POSITIVELY signalled (an actual work verb); absent that we chat.
   """
-  @spec classify_team_request(any()) :: :simple | :complex
+  @spec classify_team_request(any()) :: :chat | :simple | :complex
   def classify_team_request(text) when is_binary(text) do
     t = text |> String.trim() |> String.downcase()
     words = t |> String.split(~r/\s+/, trim: true) |> length()
@@ -927,6 +938,12 @@ defmodule Vibe.AI.LocalAgentWorker do
     clause_count = t |> String.split(~r/\b(and|then|plus|also)\b/) |> length()
 
     cond do
+      # Conversation wins over everything: an explain/inspect opener is never a
+      # commission, even when it name-drops work words ("explain how you'd build
+      # the site" must NOT spawn a team that builds the site).
+      conversational_request?(t) -> :chat
+      # No work verb anywhere → the user is not asking for a change. Chat.
+      not work_request?(t) -> :chat
       build_new_project? -> :complex
       multi_component? -> :complex
       words >= 80 and clause_count >= 4 -> :complex
@@ -934,7 +951,30 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
-  def classify_team_request(_), do: :simple
+  def classify_team_request(_), do: :chat
+
+  # Openers that mark the message as talk/inspection rather than a work order.
+  # Repo-agnostic, and deliberately greedy — a false :chat costs one read-only
+  # turn, a false :simple edits the user's files.
+  defp conversational_request?(t) when is_binary(t) do
+    Regex.match?(
+      ~r/^\s*(can|could|are|is|do|does|did|will|would|should)\s+(you|it|we|this|that|there)\b[^.!?]*\b(see|read|view|open|access|tell|know|think|understand|explain|describe|remember|handle|support)\b|^\s*(what|why|how come|who|which|when|where|explain|describe|tell me|show me|thoughts|any thoughts|wdyt|opinion)\b|^\s*(hi|hey|hello|yo|thanks|thank you|ok|okay|nice|cool|got it)\b\s*[.!?]*\s*$/,
+      t
+    )
+  end
+
+  defp conversational_request?(_), do: false
+
+  # A change is only performed when it is POSITIVELY asked for. Absent one of
+  # these verbs the message is treated as conversation (see fail-safe above).
+  defp work_request?(t) when is_binary(t) do
+    Regex.match?(
+      ~r/\b(build|create|make|add|implement|write|code|fix|patch|change|update|edit|modify|adjust|refactor|rename|move|remove|delete|drop|revert|install|upgrade|migrate|deploy|ship|release|publish|configure|configure|set ?up|setup|wire|integrate|connect|optimi[sz]e|clean ?up|scaffold|generate|port|convert|replace|improve|redesign|restyle|polish|finish|complete|continue|run|test|lint|format|debug|solve|handle|support)\b/,
+      t
+    )
+  end
+
+  defp work_request?(_), do: false
 
   @doc """
   Pick the single best-provider worker to handle a SIMPLE `@team` request
@@ -959,6 +999,23 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   def pick_solo_worker(workers, _text), do: pick_supervisor_lead(workers)
+
+  @doc """
+  Pick the worker that ANSWERS a `:chat` message.
+
+  Restricted to the providers the bridge can HARD-strip writes on (codex →
+  `read-only` sandbox, claude → disallowed Edit/Write/MultiEdit/NotebookEdit/Bash).
+  Grok/Gemini have no equivalent enforcement hook yet, so they must not take a
+  chat turn — a prompt asking them not to edit is not a control, as we learned the
+  expensive way.
+  """
+  def pick_chat_worker(workers) when is_list(workers) do
+    Enum.find_value(["codex", "claude"], fn handle ->
+      Enum.find(workers, &(&1.handle == handle))
+    end)
+  end
+
+  def pick_chat_worker(_), do: nil
 
   defp ui_flavored_request?(text) when is_binary(text) do
     Regex.match?(
@@ -1007,7 +1064,11 @@ defmodule Vibe.AI.LocalAgentWorker do
     if group_chat?(chat_id) do
       mode = team_mode_from_opts(opts)
       lead_handle = Keyword.get(opts, :lead_worker) || lead_handle_from_workers(team_workers)
-      role = Keyword.get(opts, :team_role) || if(worker.handle == lead_handle, do: "lead", else: "worker")
+
+      role =
+        Keyword.get(opts, :team_role) ||
+          if(worker.handle == lead_handle, do: "lead", else: "worker")
+
       context = group_collaboration_context(chat_id, requester_user_id)
       teammate_names = team_workers_label(team_workers)
       teammate_handles = team_workers_handles(team_workers)
@@ -1015,6 +1076,9 @@ defmodule Vibe.AI.LocalAgentWorker do
       default_focus = team_worker_default_focus(worker.handle)
 
       case {mode, role} do
+        {_, "chat"} ->
+          build_chat_reply_prompt(worker, dispatch_text, context)
+
         {_, "solo"} ->
           build_solo_visible_prompt(worker, dispatch_text, context)
 
@@ -1061,13 +1125,52 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
-  def build_team_bridge_prompt(_chat_id, _worker, dispatch_text, _requester, _workers, _run_id, _opts),
-    do: dispatch_text
+  def build_team_bridge_prompt(
+        _chat_id,
+        _worker,
+        dispatch_text,
+        _requester,
+        _workers,
+        _run_id,
+        _opts
+      ),
+      do: dispatch_text
 
   # A SIMPLE `@team` request routes to one visible worker (chosen by
   # pick_solo_worker). It is not a lead and has no under-hood teammates to
   # coordinate — it just builds the thing fully and visibly. This is the 1-turn
   # path that keeps usage at the solo baseline while still showing real progress.
+  # A `:chat` turn ANSWERS. It does not work. Writes are hard-stripped at the
+  # bridge (team role `chat` → `read_only`), so this prompt only has to keep the
+  # reply clean — it is not what keeps the files safe.
+  defp build_chat_reply_prompt(worker, dispatch_text, context) do
+    """
+    You are #{worker.label}, replying to the user in a Vibe chat.
+
+    This is a CONVERSATION, not a work order. The user is asking you something —
+    answer it directly and stop. Do not implement anything, do not edit, create or
+    delete files, do not run builds, and do not propose a plan of changes unless
+    the user asked for one. You have no write access on this turn by design; if
+    the request genuinely needs code changed, just say so in one line and let the
+    user ask for it.
+
+    Never narrate your own setup: do not mention instruction files, AGENTS.md,
+    repo standards, system prompts, or the tools you are using. The user does not
+    want to read about your scaffolding — they want the answer.
+
+    If the user shared an image, look at it and describe what you actually see.
+
+    Reply in a sentence or two, plainly, like a person. No headings, no tool logs.
+
+    Shared Vibe group memory:
+    #{context_or_empty(context)}
+
+    Message:
+    #{dispatch_text}
+    """
+    |> String.trim()
+  end
+
   defp build_solo_visible_prompt(worker, dispatch_text, context) do
     """
     You are #{worker.label}, handling this Vibe request solo — you are the single
@@ -2593,7 +2696,9 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   defp maybe_dispatch_next_team_worker(chat_id, worker, requester_user_id, opts) do
     team_run_id = normalize_string(Keyword.get(opts, :team_run_id))
-    team_mode = normalize_string(Keyword.get(opts, :team_mode)) || team_run_mode(chat_id, team_run_id)
+
+    team_mode =
+      normalize_string(Keyword.get(opts, :team_mode)) || team_run_mode(chat_id, team_run_id)
 
     cond do
       is_nil(team_run_id) ->
@@ -2620,7 +2725,9 @@ defmodule Vibe.AI.LocalAgentWorker do
     ensure_team_run_table()
 
     case :ets.lookup(@team_run_table, {chat_id, team_run_id}) do
-      [{{^chat_id, ^team_run_id}, state}] -> Map.get(state, :mode)
+      [{{^chat_id, ^team_run_id}, state}] ->
+        Map.get(state, :mode)
+
       _ ->
         case Repo.get(TeamRun, team_run_id) do
           %TeamRun{mode: mode} -> mode
@@ -2688,7 +2795,6 @@ defmodule Vibe.AI.LocalAgentWorker do
          completed_worker,
          requester_user_id
        ) do
-
     case :ets.lookup(@team_run_table, {chat_id, team_run_id}) do
       [{{^chat_id, ^team_run_id}, state}] ->
         remaining = Map.get(state, :remaining, [])
@@ -2971,16 +3077,20 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   defp team_worker_default_focus("codex"),
-    do: "lead coordination, architecture, shared-file integration, backend/data implementation, and verification"
+    do:
+      "lead coordination, architecture, shared-file integration, backend/data implementation, and verification"
 
   defp team_worker_default_focus("claude"),
-    do: "complete implementation of assigned backend/frontend slices, then review, debugging, and risk notes"
+    do:
+      "complete implementation of assigned backend/frontend slices, then review, debugging, and risk notes"
 
   defp team_worker_default_focus("grok"),
-    do: "complete implementation of assigned slices, plus fast investigation and independent checks"
+    do:
+      "complete implementation of assigned slices, plus fast investigation and independent checks"
 
   defp team_worker_default_focus("agy"),
-    do: "exact implementation of the assigned UI components/pages — follow the assigned file list precisely and completely"
+    do:
+      "exact implementation of the assigned UI components/pages — follow the assigned file list precisely and completely"
 
   defp team_worker_default_focus(_), do: "the highest-value unowned slice"
 
@@ -3074,6 +3184,7 @@ defmodule Vibe.AI.LocalAgentWorker do
 
         team_run_id = metadata["teamRunId"] || metadata[:team_run_id]
         team_mode = metadata["teamMode"] || metadata[:team_mode]
+
         suppress_visible? =
           truthy_opt?(metadata["suppressVisible"] || metadata[:suppress_visible])
 
@@ -4133,7 +4244,8 @@ defmodule Vibe.AI.LocalAgentWorker do
             |> Map.update!(:thought, &(&1 <> event["thought"]))
             |> Map.put(:thought_flushed, false)
 
-          is_binary(event["text"]) and event["type"] not in ["thought", "end", "tool_use", "tool_result"] ->
+          is_binary(event["text"]) and
+              event["type"] not in ["thought", "end", "tool_use", "tool_result"] ->
             st
             |> grok_flush_thought_node(think_status)
             |> grok_begin_text_phase()
@@ -4592,13 +4704,14 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   defp tool_event_to_node(event, index) do
-    node = %{
-      "id" => event["id"] || unique_event_id("worker-progress", index),
-      "label" => event["label"] || event["tool"] || "Working...",
-      "status" => event["status"] || "running",
-      "depth" => 0
-    }
-    |> copy_node_shape(event)
+    node =
+      %{
+        "id" => event["id"] || unique_event_id("worker-progress", index),
+        "label" => event["label"] || event["tool"] || "Working...",
+        "status" => event["status"] || "running",
+        "depth" => 0
+      }
+      |> copy_node_shape(event)
 
     # MCP / generic tool results: plaintext detail for the phone sheet when the
     # encrypted action blob is not yet joined (live stream path).
@@ -4666,6 +4779,7 @@ defmodule Vibe.AI.LocalAgentWorker do
   # so adding separators here corrupts exact text (for example IDs and code).
   # Whitespace that belongs in the answer is already present in the deltas.
   defp join_grok_text_chunks([]), do: ""
+
   defp join_grok_text_chunks(chunks) when is_list(chunks) do
     chunks
     |> Enum.map(&to_string/1)
@@ -4881,7 +4995,9 @@ defmodule Vibe.AI.LocalAgentWorker do
 
         event
         |> content_blocks_from_event()
-        |> Enum.reduce(acc, fn block, inner -> accumulate_claude_tool_block(block, parent, inner) end)
+        |> Enum.reduce(acc, fn block, inner ->
+          accumulate_claude_tool_block(block, parent, inner)
+        end)
       end)
 
     order
@@ -4889,7 +5005,11 @@ defmodule Vibe.AI.LocalAgentWorker do
     |> Enum.map(&Map.fetch!(events_by_id, &1))
   end
 
-  defp accumulate_claude_tool_block(%{"type" => "tool_use"} = block, parent, {events_by_id, order}) do
+  defp accumulate_claude_tool_block(
+         %{"type" => "tool_use"} = block,
+         parent,
+         {events_by_id, order}
+       ) do
     id = normalize_string(block["id"]) || unique_event_id("claude-tool", length(order))
     tool = normalize_string(block["name"]) || "tool"
     input = block["input"] || %{}
@@ -4910,7 +5030,11 @@ defmodule Vibe.AI.LocalAgentWorker do
     {Map.put(events_by_id, id, event), append_once(order, id)}
   end
 
-  defp accumulate_claude_tool_block(%{"type" => "tool_result"} = block, parent, {events_by_id, order}) do
+  defp accumulate_claude_tool_block(
+         %{"type" => "tool_result"} = block,
+         parent,
+         {events_by_id, order}
+       ) do
     id =
       normalize_string(block["tool_use_id"]) ||
         normalize_string(block["id"]) ||
@@ -6029,7 +6153,11 @@ defmodule Vibe.AI.LocalAgentWorker do
   # The parent `Task` node carries the subagent flavor (e.g. "explore") so the
   # phone can render "🤖 Subagent · explore" and open its read-only view.
   defp maybe_put_subagent_type(event, "task", input) when is_map(input) do
-    maybe_put(event, "subagentType", normalize_string(input["subagent_type"] || input["subagentType"]))
+    maybe_put(
+      event,
+      "subagentType",
+      normalize_string(input["subagent_type"] || input["subagentType"])
+    )
   end
 
   defp maybe_put_subagent_type(event, _kind, _input), do: event
@@ -6053,6 +6181,7 @@ defmodule Vibe.AI.LocalAgentWorker do
   # (file basename, command, pattern, url…) for compact display.
   defp tool_kind_and_target(tool, input) when is_map(input) do
     t = tool |> to_string() |> String.downcase()
+
     path =
       input["file_path"] ||
         input["filePath"] ||
@@ -6106,9 +6235,7 @@ defmodule Vibe.AI.LocalAgentWorker do
         "list_dir_tree"
       ] ->
         {"search",
-         short_target(
-           input["pattern"] || input["query"] || input["target_directory"] || path
-         )}
+         short_target(input["pattern"] || input["query"] || input["target_directory"] || path)}
 
       t in ["webfetch", "websearch", "fetch", "web_search", "web_fetch", "browse", "open_page"] ->
         {"web", short_target(input["url"] || input["query"] || input["domain"])}

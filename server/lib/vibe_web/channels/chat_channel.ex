@@ -263,9 +263,7 @@ defmodule VibeWeb.ChatChannel do
               |> put_optional_string("taskId", target.task_id)
               |> put_optional_string(
                 "computerId",
-                normalize_bridge_string(
-                  payload["computerId"] || payload["agentBridgeComputerId"]
-                )
+                normalize_bridge_string(payload["computerId"] || payload["agentBridgeComputerId"])
               )
 
             AgentBridge.dispatch_control(user_id, control_payload)
@@ -822,14 +820,32 @@ defmodule VibeWeb.ChatChannel do
     bridge_metadata = bridge_task_metadata(data)
     supervisor? = LocalAgentWorker.team_supervisor_mode?()
 
+    classification = LocalAgentWorker.classify_team_request(dispatch_text)
+
     cond do
+      # SAFETY FIRST, and deliberately mode-independent: a message that is not a
+      # work order never gets write access. "can you see this image?" once made a
+      # worker read AGENTS.md, patch page.tsx/globals.css and run a full build —
+      # so a :chat turn goes to ONE worker whose writes the bridge HARD-STRIPS
+      # (team role `chat` → read_only). It answers; it cannot touch a file.
+      classification == :chat ->
+        spawn_chat_reply_dispatch(
+          chat_id,
+          workers,
+          dispatch_text,
+          data,
+          requester_user_id,
+          team_run_id,
+          bridge_metadata
+        )
+
       # Usage-first routing (the responder must never be a fake lead that patches
       # solo): a SIMPLE request goes to exactly ONE visible best-provider worker —
       # 1 provider turn, same as today's solo baseline, but the user sees a real
       # worker running live. Only in supervisor mode; the legacy sequential chain
       # keeps its own behavior. A complex request still spins up the lead
       # orchestrator + under-hood workers.
-      supervisor? and LocalAgentWorker.classify_team_request(dispatch_text) == :simple ->
+      supervisor? and classification == :simple ->
         spawn_solo_visible_dispatch(
           chat_id,
           workers,
@@ -851,6 +867,71 @@ defmodule VibeWeb.ChatChannel do
           bridge_metadata,
           if(supervisor?, do: "supervisor", else: "sequential")
         )
+    end
+  end
+
+  # A `:chat` message: the user is talking, not commissioning work. ONE worker
+  # answers it with team role `chat`, which the bridge maps to the `read_only`
+  # work mode — codex gets a `read-only` sandbox, claude has Edit/Write/MultiEdit/
+  # NotebookEdit/Bash disallowed. The reply is safe by CONSTRUCTION, not because a
+  # prompt asked nicely (prompt wording already failed us: the worker ignored
+  # "do not revert user changes" and patched anyway).
+  #
+  # It is still registered as a one-worker team run so worker_states exist and the
+  # iOS cell renders a real "codex running…" row — but the monitor is NOT started
+  # for `chat` mode, so no retry can ever re-spawn this with write access.
+  defp spawn_chat_reply_dispatch(
+         chat_id,
+         workers,
+         dispatch_text,
+         data,
+         requester_user_id,
+         team_run_id,
+         bridge_metadata
+       ) do
+    responder = LocalAgentWorker.pick_chat_worker(workers) || List.first(workers)
+
+    registered =
+      LocalAgentWorker.register_bridge_team_run(
+        chat_id,
+        team_run_id,
+        [responder],
+        dispatch_text,
+        requester_user_id,
+        data["id"],
+        bridge_metadata,
+        mode: "chat"
+      )
+
+    case registered do
+      nil ->
+        :ok
+
+      chat_worker ->
+        Logger.info(
+          "[ChatChannel] team_run mode=chat chat=#{chat_id} run=#{team_run_id} responder=#{chat_worker.handle} (read-only, no writes)"
+        )
+
+        spawn_local_worker_dispatch(
+          chat_id,
+          chat_worker,
+          dispatch_text,
+          data,
+          "reserved_worker_team",
+          requester_user_id,
+          bridge_metadata: bridge_metadata,
+          note_user_turn: false,
+          note_team_user_turn: true,
+          team_run_id: team_run_id,
+          team_workers: [chat_worker],
+          team_mode: "chat",
+          lead_worker: chat_worker.handle,
+          team_role: "chat",
+          suppress_visible: false,
+          task_id_suffix: "chat:#{chat_worker.handle}"
+        )
+
+        :ok
     end
   end
 

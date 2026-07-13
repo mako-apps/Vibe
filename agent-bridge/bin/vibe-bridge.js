@@ -1144,6 +1144,15 @@ function stripReservedMention(prompt, provider) {
 // message ran propose-only ("always plan mode" bug). Plan is now an explicit,
 // deliberately-chosen mode (see `plan` below) surfaced with a badge on the phone.
 function workModeFor(task) {
+  // HARD RULE, not overridable by the phone's work-mode setting: a `chat` turn is
+  // the user TALKING, not commissioning work, so it runs with writes stripped
+  // (codex → `read-only` sandbox; claude → Edit/Write/MultiEdit/NotebookEdit/Bash
+  // disallowed). This is a control, not a request: prompt wording already proved
+  // worthless — a worker asked "can you see this image?" read AGENTS.md, patched
+  // page.tsx/globals.css and ran a full build. Enforcement lives HERE.
+  const teamRole = task && (task.teamRole || task.team_role);
+  if (String(teamRole || "").toLowerCase() === "chat") return "read_only";
+
   const raw = String(
     (task && (task.workMode || task.agentBridgeWorkMode || task.mode)) || "ask_auto"
   )
