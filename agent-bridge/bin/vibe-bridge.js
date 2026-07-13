@@ -5322,12 +5322,12 @@ function collectClaudeEdits(acc, content) {
 // `custom_tool_call` (sometimes `function_call`) whose `input` is the classic
 // `*** Begin Patch / *** Add|Update|Delete File:` text.
 function collectCodexEdits(acc, payload) {
-  const p = payload;
+  const p = codexUnwrapActionPayload(payload);
   if (!p) return;
   const isPatch =
     (p.type === "custom_tool_call" || p.type === "function_call") && /apply_patch/i.test(p.name || "");
   if (!isPatch) return;
-  const input = typeof p.input === "string" ? p.input : typeof p.arguments === "string" ? p.arguments : "";
+  const input = codexPatchTextFromPayload(p);
   if (!input) return;
   for (const f of parseApplyPatchEnvelope(input)) {
     accumulateRuntimeFile(acc, f.path, f.status, f.additions, f.deletions, f.patchBlock);
@@ -5886,9 +5886,11 @@ function codexShellDetail(rawCmd) {
 }
 
 function codexActionDetail(p) {
+  p = codexUnwrapActionPayload(p);
+  if (!p) return null;
   const name = String(p.name || "");
   if (/apply_patch/i.test(name)) {
-    const input = typeof p.input === "string" ? p.input : typeof p.arguments === "string" ? p.arguments : "";
+    const input = codexPatchTextFromPayload(p);
     const files = parseApplyPatchEnvelope(input);
     return {
       kind: "edit",
@@ -5901,6 +5903,14 @@ function codexActionDetail(p) {
   }
   if (isCodexShellToolName(name)) {
     return codexShellDetail(codexCommandFromPayload(p));
+  }
+  if (/^(?:view_image|open_image)$/i.test(name)) {
+    const input = p.input && typeof p.input === "object" ? p.input : {};
+    const imagePath = String(input.path || input.file_path || "");
+    return { kind: "read", name: safeBase(imagePath), path: imagePath };
+  }
+  if (/^(?:update_plan|todo_write|todowrite)$/i.test(name)) {
+    return { kind: "todo", todos: [] };
   }
   // Codex mcp_tool_call / MCP-ish function names.
   const itemType = String(p.item_type || p.type || p.kind || "").toLowerCase();
@@ -5916,7 +5926,159 @@ function codexActionDetail(p) {
 }
 
 function isCodexShellToolName(name) {
-  return ["shell", "local_shell", "container.exec", "exec_command"].includes(String(name || ""));
+  return ["exec", "shell", "local_shell", "container.exec", "exec_command", "bash", "run_command"].includes(String(name || ""));
+}
+
+// Current Codex app persistence records orchestration calls as an outer
+// `custom_tool_call {name:"exec", input:"...tools.exec_command(...)..."}`. The
+// operation users care about is the nested tool, not the transport wrapper. Parse
+// that small, generated subset without eval/Function so an on-disk transcript can
+// never execute code while being opened from History.
+const CODEX_EXEC_OUTPUT_HELPERS = new Set([
+  "text",
+  "image",
+  "generatedImage",
+  "store",
+  "load",
+  "notify",
+  "yield_control",
+]);
+const CODEX_CONTINUATION_TOOLS = new Set(["wait", "write_stdin"]);
+
+function decodeCodexJsStringLiteral(source, start) {
+  const quote = source[start];
+  if (quote !== '"' && quote !== "'" && quote !== "`") return null;
+  let value = "";
+  for (let i = start + 1; i < source.length; i++) {
+    const ch = source[i];
+    if (ch === quote) return { value, end: i + 1 };
+    if (ch !== "\\") {
+      value += ch;
+      continue;
+    }
+    if (i + 1 >= source.length) return null;
+    const next = source[++i];
+    switch (next) {
+      case "n": value += "\n"; break;
+      case "r": value += "\r"; break;
+      case "t": value += "\t"; break;
+      case "b": value += "\b"; break;
+      case "f": value += "\f"; break;
+      case "v": value += "\v"; break;
+      case "0": value += "\0"; break;
+      case "x": {
+        const hex = source.slice(i + 1, i + 3);
+        if (/^[0-9a-f]{2}$/i.test(hex)) {
+          value += String.fromCharCode(parseInt(hex, 16));
+          i += 2;
+        } else value += next;
+        break;
+      }
+      case "u": {
+        const hex = source.slice(i + 1, i + 5);
+        if (/^[0-9a-f]{4}$/i.test(hex)) {
+          value += String.fromCharCode(parseInt(hex, 16));
+          i += 4;
+        } else value += next;
+        break;
+      }
+      case "\n": break;
+      case "\r":
+        if (source[i + 1] === "\n") i += 1;
+        break;
+      default: value += next;
+    }
+  }
+  return null;
+}
+
+function codexJsStringLiterals(source) {
+  const values = [];
+  const text = String(source || "");
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== '"' && text[i] !== "'" && text[i] !== "`") continue;
+    const decoded = decodeCodexJsStringLiteral(text, i);
+    if (!decoded) continue;
+    values.push(decoded.value);
+    i = decoded.end - 1;
+  }
+  return values;
+}
+
+function codexJsPropertyString(source, key) {
+  const escaped = String(key).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = new RegExp("\\b" + escaped + "\\s*:\\s*").exec(String(source || ""));
+  if (!match) return "";
+  const start = match.index + match[0].length;
+  const decoded = decodeCodexJsStringLiteral(String(source || ""), start);
+  return decoded ? decoded.value : "";
+}
+
+function codexNestedToolNames(source) {
+  const names = [];
+  const re = /\btools\.([A-Za-z0-9_]+)\s*\(/g;
+  let match;
+  while ((match = re.exec(String(source || "")))) {
+    if (!CODEX_EXEC_OUTPUT_HELPERS.has(match[1])) names.push(match[1]);
+  }
+  return names;
+}
+
+function codexPatchTextFromPayload(p) {
+  const raw =
+    typeof p.input === "string"
+      ? p.input
+      : typeof p.arguments === "string"
+        ? p.arguments
+        : p.input && typeof p.input.patch === "string"
+          ? p.input.patch
+          : "";
+  const trimmed = raw.trimStart();
+  if (trimmed.startsWith("*** Begin Patch") && raw.includes("*** End Patch")) return raw;
+  return codexJsStringLiterals(raw).find(
+    (value) => value.includes("*** Begin Patch") && value.includes("*** End Patch")
+  ) || "";
+}
+
+function codexUnwrapActionPayload(payload) {
+  if (!payload || typeof payload !== "object") return payload;
+  const outerName = String(payload.name || payload.tool || "");
+  if (CODEX_CONTINUATION_TOOLS.has(outerName)) return null;
+  if (outerName !== "exec") return payload;
+
+  const source =
+    typeof payload.input === "string"
+      ? payload.input
+      : typeof payload.arguments === "string"
+        ? payload.arguments
+        : "";
+  const nestedNames = codexNestedToolNames(source);
+  if (!nestedNames.length) return payload;
+  if (nestedNames.every((name) => CODEX_CONTINUATION_TOOLS.has(name))) return null;
+
+  const name = nestedNames.find((candidate) => !CODEX_CONTINUATION_TOOLS.has(candidate));
+  if (!name) return null;
+  let input = {};
+  if (name === "exec_command") {
+    input = {
+      command: codexJsPropertyString(source, "cmd") || codexJsPropertyString(source, "command"),
+      workdir: codexJsPropertyString(source, "workdir"),
+    };
+  } else if (name === "apply_patch") {
+    input = codexPatchTextFromPayload(payload);
+  } else if (name === "view_image") {
+    input = { path: codexJsPropertyString(source, "path") };
+  } else if (name === "web__run") {
+    input = { query: codexJsPropertyString(source, "q") };
+  } else if (name === "update_plan") {
+    input = { todos: [] };
+  } else {
+    // Preserve only the discovered inner tool identity. Shipping the whole wrapper
+    // source as node input would leak arbitrary command/prompt text into metadata.
+    input = {};
+  }
+
+  return Object.assign({}, payload, { name, input, arguments: undefined });
 }
 
 function codexCommandFromPayload(p) {
@@ -6450,8 +6612,11 @@ function liveCodexActions(output) {
     }
 
     if (type === "function_call" || type === "custom_tool_call") {
-      detailByUid.set(uid, codexActionDetail(item));
-      order.push(uid);
+      const detail = codexActionDetail(item);
+      if (detail) {
+        detailByUid.set(uid, detail);
+        order.push(uid);
+      }
       return;
     }
 
@@ -7215,9 +7380,12 @@ async function codexDetail(id, limit, before) {
       }
     } else if (p.type === "function_call" || p.type === "custom_tool_call") {
       // Collect the tool call for the current turn IN ORDER (output joins via call_id).
-      turnItems.push({ type: "tool", uid: dkey, ts: ev.timestamp });
-      actionDetailByUid.set(dkey, codexActionDetail(p));
-      if (p.call_id) callIdToUid.set(p.call_id, dkey);
+      const detail = codexActionDetail(p);
+      if (detail) {
+        turnItems.push({ type: "tool", uid: dkey, ts: ev.timestamp });
+        actionDetailByUid.set(dkey, detail);
+        if (p.call_id) callIdToUid.set(p.call_id, dkey);
+      }
     } else if (p.type === "function_call_output" || p.type === "custom_tool_call_output") {
       const uid = p.call_id ? callIdToUid.get(p.call_id) : null;
       if (uid) resultByUid.set(uid, { output: clipText(codexOutputText(p.output), MAX_ACTION_OUTPUT), isError: false });
@@ -11346,6 +11514,8 @@ module.exports = {
   buildHistoryRuntime,
   collectClaudeEdits,
   collectCodexEdits,
+  codexActionDetail,
+  codexUnwrapActionPayload,
   parseApplyPatchEnvelope,
   newRuntimeAccumulator,
   ensureRuntimeKey,
