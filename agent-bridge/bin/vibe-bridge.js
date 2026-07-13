@@ -1275,6 +1275,11 @@ function grokPermissionMode(task) {
       return "acceptEdits";
     case "plan":
       return "plan";
+    case "read_only":
+      // Grok has no separate read-only sandbox; plan mode is its hard no-writes
+      // gate. Without this case a `read_only` task (e.g. team role `chat`) fell
+      // to "default" and Grok could still edit files.
+      return "plan";
     case "ask":
       // No phone permission-prompt tool for Grok yet — default mode.
       return "default";
@@ -3953,7 +3958,8 @@ function runningTaskSummaries() {
     chatId: entry.chatId,
     taskId: entry.taskId,
     sessionId: entry.sessionId || null,
-    topic: cleanTopicCandidate(entry.prompt) || clip(`${entry.provider || "Agent"} task`, 80),
+    topic: (entry.provider === "codex" ? codexFallbackTitle(entry.prompt) : cleanTopicCandidate(entry.prompt))
+      || clip(`${entry.provider || "Agent"} task`, 80),
     repoId: entry.repo && entry.repo.id,
     repoName: entry.repo && entry.repo.name,
     project: entry.repo && (entry.repo.cwd || entry.repo.path),
@@ -4338,6 +4344,14 @@ function captureSessionId(line) {
     if (typeof ev.session_id === "string") return ev.session_id;
     // Grok streaming-json / json use camelCase sessionId on the end frame.
     if (typeof ev.sessionId === "string") return ev.sessionId;
+    // `codex exec --json` announces the durable history id on its first event:
+    //   {"type":"thread.started","thread_id":"..."}
+    // Without this, the running task has no sessionId and iOS cannot merge it with
+    // the matching history row (so it renders a second prompt-derived row with a
+    // synthetic message count instead).
+    if (ev.type === "thread.started" && typeof ev.thread_id === "string") {
+      return ev.thread_id;
+    }
   } catch (_) {}
   return null;
 }
@@ -4783,6 +4797,18 @@ async function runTask(channel, task) {
           );
         }
         sessionByChat.set(chatId, sid);
+        const entry = runningTasks.get(key);
+        if (entry && entry.sessionId !== sid) {
+          entry.sessionId = sid;
+          console.log(
+            `[vibe-bridge][history-link] provider=${provider} chat=${chatId} ` +
+              `task=${taskId} session=${sid}`
+          );
+          // Publish the newly learned session id immediately. The phone can now
+          // overlay running state onto the real history row instead of inventing a
+          // separate `running:<taskId>` row until the next heartbeat.
+          pushBridgeStatus(channel);
+        }
       }
       // Lead-driven team spawn (also detected server-side from progress lines).
       try {
@@ -5161,6 +5187,56 @@ function cleanMessageText(text) {
   return t.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
 }
 
+// Vibe work/group prompts wrap the actual human message in operating rules and
+// shared-agent context. Codex persists that whole wrapper as its user turn. Recover
+// the terminal message section so History can show the user's bubble and use it as
+// a title candidate instead of showing/hiding the injected prompt.
+function extractVibeUserPrompt(text) {
+  if (typeof text !== "string") return null;
+  let body = text;
+  let wrapped = false;
+
+  if (/^\s*Vibe bridge startup prepared these instruction files for this project/i.test(body)) {
+    const taskMarker = /(?:^|\n)User task:\s*(?:\n|$)/i.exec(body);
+    if (!taskMarker) return null;
+    body = body.slice(taskMarker.index + taskMarker[0].length);
+    wrapped = true;
+  }
+
+  // These are the terminal labels emitted by LocalAgentWorker. Use the last one:
+  // shared-memory examples can themselves contain an older "Request:"/"Message:".
+  const terminalMarkers = [
+    /(?:^|\n)Message:\s*(?:\n|$)/gi,
+    /(?:^|\n)Request:\s*(?:\n|$)/gi,
+    /(?:^|\n)Latest team request:\s*(?:\n|$)/gi,
+    /(?:^|\n)Latest request for you(?:\s*\([^\n)]*\))?:\s*(?:\n|$)/gi,
+    /(?:^|\n)Latest message for you(?:\s*\([^\n)]*\))?:\s*(?:\n|$)/gi,
+  ];
+  let terminal = null;
+  for (const pattern of terminalMarkers) {
+    pattern.lastIndex = 0;
+    let match;
+    while ((match = pattern.exec(body)) !== null) {
+      const end = match.index + match[0].length;
+      if (!terminal || end > terminal.end) terminal = { end };
+      if (match[0].length === 0) pattern.lastIndex += 1;
+    }
+  }
+  if (terminal) {
+    body = body.slice(terminal.end);
+    wrapped = true;
+  }
+
+  if (!wrapped) return null;
+
+  // Attachment materialization is transport context, not part of the chat text.
+  body = body.replace(
+    /^\s*The user attached \d+ image file\(s\) to this message\.[\s\S]*?\n\s*\n/i,
+    ""
+  );
+  return body.trim();
+}
+
 // Codex IDE integrations wrap a genuine prompt in a context preamble:
 //   # Context from my IDE setup:
 //   …
@@ -5170,11 +5246,98 @@ function cleanMessageText(text) {
 // section first; context-only/AGENTS records remain suppressed.
 function codexUserMessageText(text) {
   if (typeof text !== "string") return "";
-  let raw = text;
+  let raw = extractVibeUserPrompt(text) ?? text;
   const marker = /^##\s*My request for Codex:\s*$/im.exec(raw);
   if (marker) raw = raw.slice(marker.index + marker[0].length);
   else if (isContextMessage(raw)) return "";
   return cleanMessageText(raw);
+}
+
+// Codex CLI/exec sessions often have no generated thread_name. Keep canonical
+// names when present, but make a stable chat-sized fallback from the recovered
+// human task rather than leaking an 80-character prompt or saying "Codex session".
+function codexFallbackTitle(text, role = "user") {
+  let value = role === "user" ? codexUserMessageText(text) : cleanMessageText(text);
+  if (!value || isContextMessage(value)) return null;
+
+  const greetingFallback = value
+    .replace(/^(?:\s*\[Image #\d+\]\s*)+/i, "")
+    .replace(/^\s*@codex\b[\s,:-]*/i, "")
+    .trim();
+  value = value
+    .replace(/^(?:\s*\[Image #\d+\]\s*)+/i, "")
+    .replace(/^\s*@codex\b[\s,:-]*/i, "")
+    .replace(/^\s*(?:hey|hi|hello)\b[\s,!.-]*/i, "")
+    .trim();
+  if (role === "assistant") {
+    value = value
+      .replace(/^\s*(?:yes|sure|okay)\b[\s,!.-]*/i, "")
+      .replace(/^\s*i\s+see\s+/i, "")
+      .replace(/^\s*(?:the\s+)?image\s+(?:is|shows|contains)\s+/i, "")
+      .trim();
+    // Setup/progress narration is not a chat name. Keep scanning until Codex
+    // describes the task/result itself (important for image-only Vibe turns).
+    if (/^(?:i(?:'|’)m|i(?:'|’)ll|i am)\s+(?:first\s+)?(?:read|check|inspect|trace|open|look|start|use|ask)\b/i.test(value)) {
+      return null;
+    }
+    if (/^(?:the\s+)?(?:repo|repository|project)\s+(?:is|has|looks)\b/i.test(value)) return null;
+    if (/(?:duplicated|overlapping)/i.test(value) && /(?:reply|message|chat)\s+bubble/i.test(value)) {
+      return "Fix duplicated reply bubble";
+    }
+  }
+  if (!value) {
+    const greeting = clip(greetingFallback.replace(/[.!?,\s]+$/g, "").trim(), 24);
+    return greeting ? greeting.charAt(0).toUpperCase() + greeting.slice(1) : null;
+  }
+
+  // Prefer the first actual prose line over markdown headings/file pointers.
+  const lines = value.split("\n").map((line) => line.trim()).filter(Boolean);
+  value = lines.find((line) =>
+    !line.startsWith("<") &&
+    !/^#{1,6}\s/.test(line) &&
+    !/^(?:[-*]\s*)?\/[^\s]+$/.test(line)
+  ) || lines[0] || "";
+  value = value.replace(/^[-*]\s+/, "").replace(/^["'`]+|["'`]+$/g, "").trim();
+
+  // Small intent normalization turns common conversational starts into labels.
+  value = value
+    .replace(/^(?:please\s+)?(?:can|could|would)\s+you\s+/i, "")
+    .replace(/^i\s+(?:want|need|would like)\s+(?:you\s+)?to\s+/i, "")
+    .replace(/^there\s+(?:is|are)(?:\s+an?)?(?:\s+another)?\s+(?:issue|problem|bug)s?(?:\s+(?:with|in|for))?\s+/i, "Fix ")
+    .replace(/^(?:(?:the|another|other)\s+)?(?:issue|problem|bug)\s+(?:is|with)\s+/i, "Fix ")
+    .replace(/^look\s+at\s+/i, "Review ")
+    .replace(/^i(?:'|’)m\s+/i, "")
+    .replace(/^i(?:'|’)ll\s+/i, "")
+    .trim();
+
+  // A frequent bridge debugging prompt has enough misspelling/noise that merely
+  // clipping it is still not a useful name; retain its semantic core.
+  if (/codex/i.test(value) && /pa+y?laod|payload/i.test(value) && /exec|command|raw/i.test(value)) {
+    return "Fix Codex payload and command rendering";
+  }
+  if (/codex/i.test(value) && /(?:history|chat).{0,24}title|title.{0,24}(?:history|chat)/i.test(value)) {
+    return "Fix Codex history titles";
+  }
+
+  // Stop at a natural sentence boundary, then enforce a compact word/character cap.
+  const sentence = value.match(/^(.{8,}?)(?:[.!?](?:\s|$)|$)/);
+  if (sentence && sentence[1]) value = sentence[1];
+  value = value.replace(/\s+/g, " ").replace(/[,:;\s-]+$/g, "").trim();
+  if (!value) return null;
+  const words = value.split(" ");
+  if (words.length > 10) value = `${words.slice(0, 10).join(" ")}…`;
+  value = clip(value, 68);
+  return value ? value.charAt(0).toUpperCase() + value.slice(1) : null;
+}
+
+function isWeakCodexTitle(value) {
+  const title = String(value || "").replace(/[.!?…]+$/g, "").trim().toLowerCase();
+  return (
+    !title ||
+    /^(?:see|view|check|review|look at)\s+(?:this|these)(?:\s+(?:image|images|photo|photos|screenshot|screenshots))?$/.test(title) ||
+    /^(?:here (?:is|are)|this is)\s+(?:the\s+)?(?:image|images|photo|photos|screenshot|screenshots)$/.test(title) ||
+    /^(?:image|images|photo|photos|screenshot|screenshots)$/.test(title)
+  );
 }
 
 // Skip ephemeral scratch/test working dirs so the list shows real work.
@@ -5535,6 +5698,12 @@ function runningSessionIdSet(provider) {
   const set = new Set();
   const want = String(provider || "").trim().toLowerCase();
   for (const entry of runningTasks.values()) {
+    if (want && entry.provider && String(entry.provider).toLowerCase() !== want) continue;
+    if (entry.sessionId) set.add(entry.sessionId);
+  }
+  // Desktop/IDE sessions are discovered outside `runningTasks`; include them so
+  // their History row receives the same live-state and accurate-count treatment.
+  for (const entry of externalProviderActivity) {
     if (want && entry.provider && String(entry.provider).toLowerCase() !== want) continue;
     if (entry.sessionId) set.add(entry.sessionId);
   }
@@ -7392,6 +7561,96 @@ function codexSessionFiles() {
   return out;
 }
 
+// Codex keeps the user-visible conversation name outside the rollout JSONL.
+// `session_index.jsonl` holds generated/renamed thread names, while newer Codex
+// builds also mirror titles in state_5.sqlite. The transcript's first message is
+// only a fallback; it is not the title shown by Codex itself.
+const codexStoredTitleCache = { at: 0, signature: "", titles: new Map() };
+
+function codexStoredTitles() {
+  const now = Date.now();
+  if (now - codexStoredTitleCache.at < 2_000) return codexStoredTitleCache.titles;
+
+  const codexDir = path.join(os.homedir(), ".codex");
+  const indexFile = path.join(codexDir, "session_index.jsonl");
+  const stateCandidates = [
+    path.join(codexDir, "state_5.sqlite"),
+    path.join(codexDir, "sqlite", "state_5.sqlite"),
+  ];
+  const stateFile = stateCandidates.find((candidate) => fs.existsSync(candidate));
+  const signature = [indexFile, stateFile]
+    .filter(Boolean)
+    .map((file) => {
+      try {
+        const stat = fs.statSync(file);
+        return `${file}:${stat.size}:${stat.mtimeMs}`;
+      } catch {
+        return `${file}:missing`;
+      }
+    })
+    .join("|");
+  if (signature === codexStoredTitleCache.signature) {
+    codexStoredTitleCache.at = now;
+    return codexStoredTitleCache.titles;
+  }
+
+  const titles = new Map();
+  // State DB is a useful fallback for recent Codex versions. Keep this optional:
+  // the bridge also runs on machines where the sqlite3 CLI is unavailable.
+  if (stateFile) {
+    const sqliteCandidates = process.platform === "darwin"
+      ? ["/usr/bin/sqlite3", "sqlite3"]
+      : ["sqlite3"];
+    for (const sqlite of sqliteCandidates) {
+      try {
+        const raw = execFileSync(
+          sqlite,
+          [
+            "-readonly",
+            "-json",
+            stateFile,
+            "select id, title, first_user_message from threads where archived = 0;",
+          ],
+          { encoding: "utf8", timeout: 2_000, maxBuffer: 4 * 1024 * 1024 }
+        );
+        const rows = JSON.parse(raw || "[]");
+        for (const row of Array.isArray(rows) ? rows : []) {
+          const id = row && typeof row.id === "string" ? row.id : "";
+          const title = cleanTopicCandidate(row && row.title);
+          const rawTitle = clip(row && row.title, 500);
+          const firstMessage = clip(row && row.first_user_message, 500);
+          // Before Codex generates a title it stores the entire first prompt in
+          // `threads.title`. That is not a conversation name; leave it untitled
+          // unless the title diverged from the first message.
+          if (id && title && rawTitle && rawTitle !== firstMessage) titles.set(id, title);
+        }
+        break;
+      } catch (_) {
+        // Fall through to the portable JSONL index.
+      }
+    }
+  }
+
+  // The index is the authoritative source for generated/explicit thread names;
+  // apply it last so it overrides a stale or first-message-shaped DB title.
+  try {
+    const lines = fs.readFileSync(indexFile, "utf8").split("\n");
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let row;
+      try { row = JSON.parse(line); } catch { continue; }
+      const id = row && typeof row.id === "string" ? row.id : "";
+      const title = cleanTopicCandidate(row && row.thread_name);
+      if (id && title) titles.set(id, title);
+    }
+  } catch (_) {}
+
+  codexStoredTitleCache.at = now;
+  codexStoredTitleCache.signature = signature;
+  codexStoredTitleCache.titles = titles;
+  return titles;
+}
+
 // Lightweight roster summary: stream just far enough to recover session_meta + the
 // first couple of real messages, then stop. Early-exits the instant we have a topic and
 // ≥2 messages; otherwise stops at CODEX_SUMMARY_HEAD_BYTES. Replaces the old
@@ -7399,7 +7658,7 @@ function codexSessionFiles() {
 // 40-file list (starving the WebSocket heartbeat) — this streams async so the socket
 // stays alive, and stops after a few KB for the common case.
 async function codexSummaryFromHead(file) {
-  let meta = null, topic = null, assistantTopic = null, messages = 0;
+  let meta = null, topic = null, assistantTopic = null, messages = 0, userTurns = 0;
   await readJsonl(file, (ev) => {
     if (ev.type === "session_meta") { meta = ev.payload || meta || {}; return; }
     if (ev.type !== "response_item" || !ev.payload) return;
@@ -7412,20 +7671,26 @@ async function codexSummaryFromHead(file) {
     if (!text) return;
     messages++;
     if (role === "user" && !topic) {
-      const clean = cleanTopicCandidate(text);
+      userTurns++;
+      const clean = codexFallbackTitle(text, "user");
       if (clean) topic = clean;
+    } else if (role === "user") {
+      userTurns++;
     } else if (role === "assistant" && !assistantTopic) {
-      const clean = cleanTopicCandidate(text);
+      const clean = codexFallbackTitle(text, "assistant");
       if (clean) assistantTopic = clean;
     }
-    if (topic && messages >= 2) return false; // enough to render the roster row
+    if (topic && !isWeakCodexTitle(topic) && messages >= 2) return false;
+    if (topic && isWeakCodexTitle(topic) && assistantTopic) return false;
   }, CODEX_SUMMARY_HEAD_BYTES);
-  return { meta, topic: topic || assistantTopic || "Codex session", lastTs: null, messages };
+  const resolvedTopic = isWeakCodexTitle(topic) ? (assistantTopic || topic) : topic;
+  const renderedMessages = userTurns > 0 ? userTurns * 2 : messages;
+  return { meta, topic: resolvedTopic || assistantTopic || "Codex session", lastTs: null, messages, renderedMessages };
 }
 
 async function codexSummary(file, opts = {}) {
   if (opts.fast) return codexSummaryFromHead(file);
-  let meta = null, topic = null, assistantTopic = null, lastTs = null, messages = 0;
+  let meta = null, topic = null, assistantTopic = null, lastTs = null, messages = 0, userTurns = 0;
   await readJsonl(file, (ev) => {
     if (ev.type === "session_meta") meta = ev.payload || {};
     else if (ev.type === "response_item" && ev.payload && ev.payload.type === "message") {
@@ -7438,20 +7703,26 @@ async function codexSummary(file, opts = {}) {
       messages++;
       if (ev.timestamp) lastTs = ev.timestamp;
       if (role === "user" && !topic) {
-        const clean = cleanTopicCandidate(text);
+        userTurns++;
+        const clean = codexFallbackTitle(text, "user");
         if (clean) topic = clean;
+      } else if (role === "user") {
+        userTurns++;
       } else if (role === "assistant" && !assistantTopic) {
-        const clean = cleanTopicCandidate(text);
+        const clean = codexFallbackTitle(text, "assistant");
         if (clean) assistantTopic = clean;
       }
     }
   });
-  return { meta, topic: topic || assistantTopic || "Untitled", lastTs, messages };
+  const resolvedTopic = isWeakCodexTitle(topic) ? (assistantTopic || topic) : topic;
+  const renderedMessages = userTurns > 0 ? userTurns * 2 : messages;
+  return { meta, topic: resolvedTopic || assistantTopic || "Untitled", lastTs, messages, renderedMessages };
 }
 
 async function listCodex(limit) {
   const files = codexSessionFiles().sort((a, b) => b.mtime - a.mtime).slice(0, limit);
   const runningIds = runningSessionIdSet("codex");
+  const storedTitles = codexStoredTitles();
   const results = [];
   for (const f of files) {
     let sum = getCachedSummary(f.file, f.size);
@@ -7460,6 +7731,13 @@ async function listCodex(limit) {
     const project = (sum.meta && sum.meta.cwd) || "";
     if (isEphemeralProject(project)) continue;
     const id = (sum.meta && sum.meta.id) || f.id || f.name;
+    // Fast head scans are enough for dormant rows. The one active session must
+    // show its real bubble count, so scan that transcript fully (typically <200ms)
+    // without making History wait on every large archived rollout.
+    if (runningIds.has(id)) {
+      sum = await codexSummary(f.file);
+      setCachedSummary(f.file, f.size, sum);
+    }
     const explicitTurnState = await codexOpenTurnState(f.file, f.size);
     const live = runningIds.has(id)
       || (explicitTurnState == null
@@ -7468,11 +7746,11 @@ async function listCodex(limit) {
     results.push({
       provider: "codex",
       id,
-      topic: sum.topic,
+      topic: storedTitles.get(id) || sum.topic || "Codex session",
       project,
       projectName: project ? path.basename(project) : "",
       updatedAt: new Date(f.mtime).toISOString(),
-      messageCount: Math.max(1, sum.messages || 0),
+      messageCount: Math.max(1, sum.renderedMessages || sum.messages || 0),
       live,
     });
   }
@@ -7491,6 +7769,8 @@ async function codexDetail(id, limit, before) {
   }
   if (!match) return null;
   const messages = [];
+  let fallbackTopic = null;
+  let assistantFallbackTopic = null;
   let pending = newRuntimeAccumulator();
   let project = "";
   // Same guard as Claude: skip any response_item we've already processed (by id) so a
@@ -7535,6 +7815,11 @@ async function codexDetail(id, limit, before) {
     if (p.type === "message" && (p.role === "user" || p.role === "assistant")) {
       const raw = codexText(p.content);
       const text = p.role === "user" ? codexUserMessageText(raw) : cleanMessageText(raw);
+      if (p.role === "user" && !fallbackTopic) {
+        fallbackTopic = codexFallbackTitle(text, "user");
+      } else if (p.role === "assistant" && !assistantFallbackTopic && !isContextMessage(raw)) {
+        assistantFallbackTopic = codexFallbackTitle(text, "assistant");
+      }
       if (p.role === "user" && text) {
         flushTurn();                // seal prior turn's card + action feed
         turnStartTs = ev.timestamp || null;   // new turn opens at this prompt
@@ -7591,8 +7876,10 @@ async function codexDetail(id, limit, before) {
   // Topic from the FULL set (the opening message), then keep the most recent
   // `limit` messages — see claudeDetail for rationale (tail, not head; stable uid).
   const topic =
-    messages.map((m) => cleanTopicCandidate(m.text)).find(Boolean) ||
-    "Untitled";
+    codexStoredTitles().get(id) ||
+    (isWeakCodexTitle(fallbackTopic) ? (assistantFallbackTopic || fallbackTopic) : fallbackTopic) ||
+    assistantFallbackTopic ||
+    "Codex session";
   const window = windowHistoryMessages(messages, limit, before);
   return {
     provider: "codex",
@@ -11713,6 +12000,8 @@ module.exports = {
   codexUnwrapActionPayload,
   codexUnwrapActionPayloads,
   codexUserMessageText,
+  codexFallbackTitle,
+  extractVibeUserPrompt,
   parseApplyPatchEnvelope,
   newRuntimeAccumulator,
   ensureRuntimeKey,

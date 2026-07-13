@@ -461,6 +461,14 @@ final class ChatEngine {
   // chat, keyed chatId -> payload. The Claude/Codex profile requests it and
   // observes `didChangeNotification` with reason "agentBridgeHistory".
   private var agentBridgeHistoryByChat: [String: [String: Any]] = [:]
+  // List and detail replies share the same event. Preserve the last list
+  // independently so opening a transcript cannot evict the rows used by the
+  // History screen on its next appearance.
+  private var agentBridgeHistoryListByChatProvider: [String: [String: Any]] = [:]
+  // History can be requested while the native chat topic is still joining. Keep
+  // those wire payloads here and flush them on the successful JOIN instead of
+  // rejecting the view with `chat_not_joined` and making it poll.
+  private var pendingAgentBridgeHistoryRequestsByChat: [String: [[String: Any]]] = [:]
   // Full-file-open replies from the bridge, keyed requestId -> payload (holds the
   // sealed `agentFileEnc`). Observers watch `didChangeNotification` reason
   // "agentBridgeFile" and read it via `latestAgentBridgeFile(requestId:)`.
@@ -1320,6 +1328,8 @@ final class ChatEngine {
       peerTypingUserIdsByChatId.removeAll()
       agentProgressByChatId.removeAll()
       agentBridgeHistoryByChat.removeAll()
+      agentBridgeHistoryListByChatProvider.removeAll()
+      pendingAgentBridgeHistoryRequestsByChat.removeAll()
       nativeRecordingStateByChatId.removeAll()
       pinnedMessagesByChatId.removeAll()
       pinnedFetchInFlightChatIds.removeAll()
@@ -2025,20 +2035,6 @@ final class ChatEngine {
     }
 
     return syncOnQueue {
-      guard let client = phoenixClient else {
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-          self?.ensureNativeTransport(trigger: "bridge_history_no_socket")
-        }
-        return ["accepted": false, "reason": "no_native_socket"]
-      }
-      guard nativeJoinedChatIds.contains(chatId), (state["connected"] as? Bool) == true else {
-        joinNativeChatTopicIfNeededLocked(chatId: chatId)
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-          self?.ensureNativeTransport(trigger: "bridge_history_chat_not_joined")
-        }
-        return ["accepted": false, "reason": "chat_not_joined"]
-      }
-
       var wirePayload: [String: Any] = [
         "provider": provider,
         "mode": mode,
@@ -2060,6 +2056,33 @@ final class ChatEngine {
       {
         wirePayload["computerId"] = computerId
       }
+
+      guard let client = phoenixClient else {
+        queueAgentBridgeHistoryRequestLocked(chatId: chatId, payload: wirePayload)
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+          self?.ensureNativeTransport(trigger: "bridge_history_no_socket")
+        }
+        return [
+          "accepted": true,
+          "transport": "native_queued",
+          "reason": "joining_transport",
+          "requestId": requestId,
+        ]
+      }
+      guard nativeJoinedChatIds.contains(chatId), (state["connected"] as? Bool) == true else {
+        queueAgentBridgeHistoryRequestLocked(chatId: chatId, payload: wirePayload)
+        joinNativeChatTopicIfNeededLocked(chatId: chatId)
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+          self?.ensureNativeTransport(trigger: "bridge_history_chat_not_joined")
+        }
+        return [
+          "accepted": true,
+          "transport": "native_queued",
+          "reason": "joining_chat",
+          "requestId": requestId,
+        ]
+      }
+
       let ref = client.push(
         topic: chatTopic(for: chatId),
         event: "agent-bridge-history",
@@ -2076,10 +2099,66 @@ final class ChatEngine {
     }
   }
 
+  private func queueAgentBridgeHistoryRequestLocked(chatId: String, payload: [String: Any]) {
+    var queued = pendingAgentBridgeHistoryRequestsByChat[chatId] ?? []
+    queued.append(payload)
+    if queued.count > 12 {
+      queued.removeFirst(queued.count - 12)
+    }
+    pendingAgentBridgeHistoryRequestsByChat[chatId] = queued
+    NSLog(
+      "[ChatEngine][BridgeHistory] queued chat=%@ mode=%@ request=%@ pending=%d",
+      String(chatId.prefix(12)),
+      normalizedString(payload["mode"]) ?? "list",
+      String((normalizedString(payload["requestId"]) ?? "-").prefix(8)),
+      queued.count)
+  }
+
+  private func flushPendingAgentBridgeHistoryRequestsLocked(chatId: String) {
+    guard
+      let client = phoenixClient,
+      nativeJoinedChatIds.contains(chatId),
+      (state["connected"] as? Bool) == true,
+      let queued = pendingAgentBridgeHistoryRequestsByChat.removeValue(forKey: chatId),
+      !queued.isEmpty
+    else { return }
+
+    for wirePayload in queued {
+      let ref = client.push(
+        topic: chatTopic(for: chatId),
+        event: "agent-bridge-history",
+        payload: wirePayload
+      )
+      appendJournalLocked(
+        event: "native-agent-bridge-history-request",
+        payload: [
+          "chatId": chatId,
+          "provider": normalizedString(wirePayload["provider"]) ?? "",
+          "mode": normalizedString(wirePayload["mode"]) ?? "list",
+          "before": normalizedString(wirePayload["before"]) ?? "",
+          "ref": ref,
+          "queued": true,
+        ]
+      )
+    }
+    NSLog(
+      "[ChatEngine][BridgeHistory] flushed chat=%@ requests=%d",
+      String(chatId.prefix(12)), queued.count)
+  }
+
   /// The most recent agent-bridge history payload relayed for a chat, if any.
   func latestAgentBridgeHistory(chatId rawChatId: String) -> [String: Any]? {
     let chatId = normalizedString(rawChatId) ?? rawChatId
     return syncOnQueue { agentBridgeHistoryByChat[chatId] }
+  }
+
+  /// The most recent history list for this chat+provider. A later transcript
+  /// detail response for the same chat does not overwrite this cache.
+  func latestAgentBridgeHistoryList(chatId rawChatId: String, provider rawProvider: String) -> [String: Any]? {
+    let chatId = normalizedString(rawChatId) ?? rawChatId
+    let provider = (normalizedString(rawProvider) ?? rawProvider).lowercased()
+    let key = "\(chatId)|\(provider)"
+    return syncOnQueue { agentBridgeHistoryListByChatProvider[key] }
   }
 
   /// Ask the bridge for the full contents of a file the agent touched. The reply
@@ -6842,6 +6921,7 @@ final class ChatEngine {
           if status == "ok" {
             self.nativeJoinedChatIds.insert(chatId)
             self.appendJournalLocked(event: "native-chat-joined", payload: ["chatId": chatId])
+            self.flushPendingAgentBridgeHistoryRequestsLocked(chatId: chatId)
             self.scheduleReplayQueuedOutboundLocked(chatId: chatId, trigger: "chat_joined")
             // Resume the live tail for a bridge session this chat had loaded: the topic is
             // freshly (re)joined after a view re-attach or background reconnect, so re-arm
@@ -7028,6 +7108,11 @@ final class ChatEngine {
           self.agentBridgeHistoryByChat[chatId] = frame.payload
           let mode = self.normalizedString(frame.payload["mode"]) ?? "list"
           let provider = self.normalizedString(frame.payload["provider"]) ?? ""
+          if mode == "list", !provider.isEmpty {
+            self.agentBridgeHistoryListByChatProvider[
+              "\(chatId)|\(provider.lowercased())"
+            ] = frame.payload
+          }
           let requestId = self.normalizedString(frame.payload["requestId"]) ?? ""
           let okFlag = frame.payload["ok"]
           let ok: Bool = {
@@ -10251,6 +10336,11 @@ final class ChatEngine {
     historyFullyLoadedChats.remove(chatId)
     historyRowsRestoredFromCacheChats.remove(chatId)
     agentBridgeHistoryByChat.removeValue(forKey: chatId)
+    let listPrefix = "\(chatId)|"
+    agentBridgeHistoryListByChatProvider = agentBridgeHistoryListByChatProvider.filter {
+      !$0.key.hasPrefix(listPrefix)
+    }
+    pendingAgentBridgeHistoryRequestsByChat.removeValue(forKey: chatId)
     clearCachedHistoryRowsLocked(chatId: chatId)
     appendJournalLocked(
       event: "native-bridge-history-cleared",

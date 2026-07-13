@@ -721,7 +721,9 @@ struct AgentBridgeHistoryInlineView: View {
 
   var body: some View {
     Group {
-      if visibleSessions.isEmpty && (loading || isCheckingConnection) {
+      // Do not expose a lone synthetic running-task row while the real history
+      // list is still loading. That caused the visible one-row → full-list jump.
+      if sessions.isEmpty && (loading || isCheckingConnection) {
         AgentBridgeHistoryListSkeleton()
       } else if visibleSessions.isEmpty {
         // Empty state (only after we've actually checked — see isCheckingConnection)
@@ -806,7 +808,7 @@ struct AgentBridgeHistoryInlineView: View {
         hasConnectedBefore = true
         resolvedConnected = true
         // Connection just came in — if we had an error or empty state, retry.
-        if visibleSessions.isEmpty || errorMessage != nil {
+        if sessions.isEmpty || errorMessage != nil {
           requestList()
         }
       }
@@ -891,8 +893,11 @@ struct AgentBridgeHistoryInlineView: View {
   /// Re-opening the history must NOT flash the skeleton when we already have rows.
   /// Seed from the last payload the engine cached, then refresh quietly in place.
   private func seedThenRefresh() {
-    if visibleSessions.isEmpty,
-      let payload = ChatEngine.shared.latestAgentBridgeHistory(chatId: chatId),
+    if sessions.isEmpty,
+      let payload = ChatEngine.shared.latestAgentBridgeHistoryList(
+        chatId: chatId,
+        provider: provider
+      ),
       (payload["mode"] as? String ?? "list") == "list"
     {
       let cached = Self.sessionItems(from: payload["sessions"]).compactMap { Self.parseSession($0) }
@@ -1021,16 +1026,16 @@ struct AgentBridgeHistoryInlineView: View {
         }
       }
     } else if notReadyRetries < Self.maxNotReadyRetries {
-      // The push was refused because the transport/bridge topic isn't joined YET (a cold
-      // launch connects async) — NOT because the computer is offline. Hold the skeleton
-      // and retry as the transport warms up, instead of flashing a disconnected/empty
-      // state the user has to escape by reopening the panel. Give up (surface the real
-      // not-connected message) only after several attempts.
+      // `requestAgentBridgeHistory` initiates the chat-topic join when needed.
+      // Wait for the positive JOIN notification and retry immediately from there;
+      // the delayed retry is only a fallback if that notification is lost.
       notReadyRetries += 1
-      loading = visibleSessions.isEmpty
+      loading = sessions.isEmpty
       listRequestInFlight = false
-      print("[AgentBridgeHistory] ⏳ Transport not ready (attempt \(notReadyRetries)) — keeping skeleton, retrying")
-      DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+      lastListRequestAt = nil
+      let reason = (result["reason"] as? String) ?? "not_ready"
+      print("[AgentBridgeHistory] ⏳ Waiting for chat topic join (attempt \(notReadyRetries), reason=\(reason))")
+      DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
         guard self.requestStartAt == start, !self.hasReceivedResponse else { return }
         self.requestList()
       }
@@ -1049,11 +1054,22 @@ struct AgentBridgeHistoryInlineView: View {
     // now that the transport is usable. Guarded so it only rescues a STALLED load: skip while
     // a retry cycle is mid-flight (`loading`) so the connection flap can't spawn parallel
     // request chains, and skip once we already have a reply (`hasReceivedResponse`).
-    if reason == "chatChannelStateChanged" || reason == "connectionStateChanged" {
+    if reason == "chatChannelStateChanged" {
       let changed = (note.userInfo?["chatId"] as? String)?
         .trimmingCharacters(in: .whitespacesAndNewlines)
       let mine = changed == nil || changed?.isEmpty == true || changed == chatId
-      if mine, !loading, (errorMessage != nil || !hasReceivedResponse) {
+      if mine, !hasReceivedResponse, !listRequestInFlight {
+        // Older transports may still reject instead of queueing. In that fallback
+        // case, a successful JOIN is the earliest safe moment to retry.
+        notReadyRetries = 0
+        lastListRequestAt = nil
+        print("[AgentBridgeHistory] ⚡️ Chat topic joined — requesting list now")
+        requestList()
+      }
+      return
+    }
+    if reason == "connectionStateChanged" {
+      if !loading, errorMessage != nil || !hasReceivedResponse {
         notReadyRetries = 0
         requestList()
       }
@@ -1062,7 +1078,10 @@ struct AgentBridgeHistoryInlineView: View {
     guard
       let info = note.userInfo,
       (info["reason"] as? String) == "agentBridgeHistory",
-      let payload = ChatEngine.shared.latestAgentBridgeHistory(chatId: chatId)
+      let payload = ChatEngine.shared.latestAgentBridgeHistoryList(
+        chatId: chatId,
+        provider: provider
+      )
     else { return }
 
     // A `detail` (transcript) reply is cached under the SAME chatId key, so the
@@ -1106,6 +1125,26 @@ struct AgentBridgeHistoryInlineView: View {
     sessions = raw.compactMap { item in
       Self.parseSession(item)
     }
+    let rowSummary = sessions.prefix(3).map { session in
+      "\(session.id.prefix(8)){count=\(session.messageCount),live=\(session.isRunning ? "Y" : "N"),title=\(session.topic.prefix(48))}"
+    }.joined(separator: " | ")
+    let taskSummary = runningTasks
+      .filter { task in
+        let taskProvider = task.provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let providerMatches = taskProvider.isEmpty || taskProvider == provider.lowercased()
+        let chatMatches = task.chatId.isEmpty || chatId.isEmpty || task.chatId == chatId
+        return providerMatches && chatMatches
+      }
+      .map { task in
+        let sessionId = task.sessionId?.isEmpty == false ? task.sessionId! : "-"
+        let matched = sessions.contains(where: { $0.id == sessionId })
+        return "\(task.taskId.prefix(12)){session=\(sessionId.prefix(8)),matched=\(matched ? "Y" : "N"),title=\(task.topic.prefix(48))}"
+      }
+      .joined(separator: " | ")
+    print(
+      "[AgentBridgeHistory] 📋 Parsed rows=\(sessions.count) tasks=\(runningTasks.count) " +
+        "top=[\(rowSummary)] taskLinks=[\(taskSummary)]"
+    )
     if sessions.isEmpty && (payload["ok"] as? Bool) == false {
       errorMessage = (payload["error"] as? String) ?? "Couldn't read history from your computer."
     }

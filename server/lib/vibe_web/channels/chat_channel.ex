@@ -126,6 +126,11 @@ defmodule VibeWeb.ChatChannel do
         broadcast_payload = strip_inline_agent_attachments(enforce_sender_identity(data, user_id))
         message_metadata = message_metadata_for_persistence(data, standalone_agent)
 
+        # Prefer top-level mediaUrl; fall back to metadata (some clients only set meta).
+        # Never persist file:// / local device paths — those die on reopen.
+        resolved_media_url =
+          durable_media_url(data["mediaUrl"] || data["media_url"] || message_metadata["mediaUrl"])
+
         message_attrs = %{
           chat_id: chat_id,
           from_id: user_id,
@@ -134,9 +139,13 @@ defmodule VibeWeb.ChatChannel do
           type: data["type"] || "text",
           timestamp: data["timestamp"] || :os.system_time(:millisecond),
           reply_to_id: data["replyToId"],
-          media_url: data["mediaUrl"],
+          media_url: resolved_media_url,
           metadata: message_metadata
         }
+
+        Logger.info(
+          "[MediaDrop] persist chat=#{chat_id} mid=#{data["id"]} type=#{message_attrs.type} media=#{if(is_binary(resolved_media_url), do: "REMOTE", else: "nil")} meta_thumbs=#{inspect(is_list(message_metadata["attachmentThumbnailsB64"]))} meta_thumb?=#{is_binary(message_metadata["thumbnailBase64"])} stripped_blobs=true"
+        )
 
         # BROADCAST IMMEDIATELY for instant message delivery
         broadcast!(socket, "message", broadcast_payload)
@@ -821,13 +830,29 @@ defmodule VibeWeb.ChatChannel do
     supervisor? = LocalAgentWorker.team_supervisor_mode?()
 
     classification = LocalAgentWorker.classify_team_request(dispatch_text)
+    all_agents? = LocalAgentWorker.all_agents_request?(dispatch_text)
 
     cond do
       # SAFETY FIRST, and deliberately mode-independent: a message that is not a
       # work order never gets write access. "can you see this image?" once made a
       # worker read AGENTS.md, patch page.tsx/globals.css and run a full build —
-      # so a :chat turn goes to ONE worker whose writes the bridge HARD-STRIPS
-      # (team role `chat` → read_only). It answers; it cannot touch a file.
+      # so a :chat turn goes to worker(s) whose writes the bridge HARD-STRIPS
+      # (team role `chat` → read_only). They answer; they cannot touch a file.
+      #
+      # "call all agents" / "what do you all think" fans the chat turn out to
+      # EVERY worker — each answers read-only in its own bubble, exactly like the
+      # plain group parallel dispatch. Otherwise one responder answers.
+      classification == :chat and all_agents? and length(workers) > 1 ->
+        spawn_chat_fanout_dispatches(
+          chat_id,
+          workers,
+          dispatch_text,
+          data,
+          requester_user_id,
+          team_run_id,
+          bridge_metadata
+        )
+
       classification == :chat ->
         spawn_chat_reply_dispatch(
           chat_id,
@@ -837,6 +862,21 @@ defmodule VibeWeb.ChatChannel do
           requester_user_id,
           team_run_id,
           bridge_metadata
+        )
+
+      # An explicit all-agents WORK order ("all agents fix X together") gets the
+      # real supervisor team even when it sizes as :simple — the user asked for
+      # the team, and parallel unsupervised writers on one repo would conflict.
+      all_agents? ->
+        spawn_supervisor_team_dispatch(
+          chat_id,
+          workers,
+          dispatch_text,
+          data,
+          requester_user_id,
+          team_run_id,
+          bridge_metadata,
+          "supervisor"
         )
 
       # Usage-first routing (the responder must never be a fake lead that patches
@@ -873,13 +913,19 @@ defmodule VibeWeb.ChatChannel do
   # A `:chat` message: the user is talking, not commissioning work. ONE worker
   # answers it with team role `chat`, which the bridge maps to the `read_only`
   # work mode — codex gets a `read-only` sandbox, claude has Edit/Write/MultiEdit/
-  # NotebookEdit/Bash disallowed. The reply is safe by CONSTRUCTION, not because a
-  # prompt asked nicely (prompt wording already failed us: the worker ignored
-  # "do not revert user changes" and patched anyway).
+  # NotebookEdit/Bash disallowed, grok/agy run in plan mode. The reply is safe by
+  # CONSTRUCTION, not because a prompt asked nicely (prompt wording already failed
+  # us: the worker ignored "do not revert user changes" and patched anyway).
   #
-  # It is still registered as a one-worker team run so worker_states exist and the
-  # iOS cell renders a real "codex running…" row — but the monitor is NOT started
-  # for `chat` mode, so no retry can ever re-spawn this with write access.
+  # Deliberately NOT registered as a team run (neither DB nor ETS): a registered
+  # run attaches teamWorkersStatus to the stream frames and the answer then
+  # renders inside a team "main cell" instead of the agent's own bubble — the
+  # exact render the user reported as wrong. The team_run_id is still PASSED so
+  # `local_worker_team_metadata` threads teamRole=chat to the bridge (it returns
+  # %{} for a nil run id, which would silently drop the write-strip). An
+  # unregistered id is a safe no-op everywhere: update_team_worker_state → [],
+  # monitor casts drop, iOS ignores empty status lists. No monitor also means no
+  # retry can ever re-spawn this turn with write access.
   defp spawn_chat_reply_dispatch(
          chat_id,
          workers,
@@ -891,48 +937,76 @@ defmodule VibeWeb.ChatChannel do
        ) do
     responder = LocalAgentWorker.pick_chat_worker(workers) || List.first(workers)
 
-    registered =
-      LocalAgentWorker.register_bridge_team_run(
+    Logger.info(
+      "[ChatChannel] chat_reply chat=#{chat_id} run=#{team_run_id} responder=#{responder.handle} (read-only, unregistered)"
+    )
+
+    spawn_local_worker_dispatch(
+      chat_id,
+      responder,
+      dispatch_text,
+      data,
+      "reserved_worker_team",
+      requester_user_id,
+      bridge_metadata: bridge_metadata,
+      note_user_turn: false,
+      note_team_user_turn: true,
+      team_run_id: team_run_id,
+      team_workers: [responder],
+      team_mode: "chat",
+      lead_worker: responder.handle,
+      team_role: "chat",
+      suppress_visible: false,
+      task_id_suffix: "chat:#{responder.handle}"
+    )
+
+    :ok
+  end
+
+  # "call all agents" on a `:chat` turn: EVERY group worker answers, each in its
+  # own bubble (normal per-agent stream rows — same render as the plain group
+  # parallel fan-out), each hard read-only via team role `chat`. Like the single
+  # chat reply, no team run is registered — see spawn_chat_reply_dispatch for why.
+  defp spawn_chat_fanout_dispatches(
+         chat_id,
+         workers,
+         dispatch_text,
+         data,
+         requester_user_id,
+         team_run_id,
+         bridge_metadata
+       ) do
+    Logger.info(
+      "[ChatChannel] chat_fanout chat=#{chat_id} run=#{team_run_id} workers=#{Enum.map_join(workers, ",", & &1.handle)} (read-only, unregistered)"
+    )
+
+    workers
+    |> Enum.with_index()
+    |> Enum.each(fn {worker, index} ->
+      spawn_local_worker_dispatch(
         chat_id,
-        team_run_id,
-        [responder],
+        worker,
         dispatch_text,
+        data,
+        "reserved_worker_team",
         requester_user_id,
-        data["id"],
-        bridge_metadata,
-        mode: "chat"
+        bridge_metadata: bridge_metadata,
+        note_user_turn: false,
+        note_team_user_turn: index == 0,
+        # First dispatch takes the rate-limit slot; siblings skip so all agents
+        # start together (mirrors group_default_parallel).
+        skip_rate_limit: index > 0,
+        team_run_id: team_run_id,
+        team_workers: [worker],
+        team_mode: "chat",
+        lead_worker: worker.handle,
+        team_role: "chat",
+        suppress_visible: false,
+        task_id_suffix: "chat:#{worker.handle}"
       )
+    end)
 
-    case registered do
-      nil ->
-        :ok
-
-      chat_worker ->
-        Logger.info(
-          "[ChatChannel] team_run mode=chat chat=#{chat_id} run=#{team_run_id} responder=#{chat_worker.handle} (read-only, no writes)"
-        )
-
-        spawn_local_worker_dispatch(
-          chat_id,
-          chat_worker,
-          dispatch_text,
-          data,
-          "reserved_worker_team",
-          requester_user_id,
-          bridge_metadata: bridge_metadata,
-          note_user_turn: false,
-          note_team_user_turn: true,
-          team_run_id: team_run_id,
-          team_workers: [chat_worker],
-          team_mode: "chat",
-          lead_worker: chat_worker.handle,
-          team_role: "chat",
-          suppress_visible: false,
-          task_id_suffix: "chat:#{chat_worker.handle}"
-        )
-
-        :ok
-    end
+    :ok
   end
 
   # A SIMPLE `@team` request: register a one-worker team run (so worker_states
@@ -1689,6 +1763,23 @@ defmodule VibeWeb.ChatChannel do
         _ -> %{}
       end
 
+    # Never store local device paths in metadata — they break after reopen.
+    base_metadata =
+      case durable_media_url(base_metadata["mediaUrl"] || base_metadata["media_url"]) do
+        nil ->
+          base_metadata
+          |> Map.delete("mediaUrl")
+          |> Map.delete("media_url")
+          |> Map.delete("localMediaUrl")
+          |> Map.delete("local_media_url")
+
+        remote ->
+          base_metadata
+          |> Map.put("mediaUrl", remote)
+          |> Map.delete("localMediaUrl")
+          |> Map.delete("local_media_url")
+      end
+
     if standalone_agent do
       case normalize_dispatch_text(data["agentText"], data) do
         text when is_binary(text) ->
@@ -1721,6 +1812,23 @@ defmodule VibeWeb.ChatChannel do
   end
 
   defp strip_inline_agent_attachments(payload), do: payload
+
+  # Persist only durable http(s) media URLs — never local device paths.
+  defp durable_media_url(url) when is_binary(url) do
+    trimmed = String.trim(url)
+
+    cond do
+      trimmed == "" -> nil
+      String.starts_with?(trimmed, "file:") -> nil
+      String.starts_with?(trimmed, "/") -> nil
+      String.starts_with?(trimmed, "http://") or String.starts_with?(trimmed, "https://") -> trimmed
+      true ->
+        Logger.info("[MediaDrop] reject non-http media_url=#{String.slice(trimmed, 0, 80)}")
+        nil
+    end
+  end
+
+  defp durable_media_url(_), do: nil
 
   defp broadcast_agent_activity(chat_id, agent_user_id, label, status, tool \\ nil) do
     VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "typing", %{

@@ -977,6 +977,29 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp work_request?(_), do: false
 
   @doc """
+  Did the user EXPLICITLY address the whole team ("call all agents", "what do
+  you all think", "everyone introduce yourselves")? An explicit fan-out
+  directive overrides the solo/one-responder collapse: a `:chat` turn goes to
+  every worker (each hard read-only, each in its own bubble) and a work order
+  goes to the full supervisor team even when it sizes as `:simple`.
+
+  Deliberately biased to false negatives: missing the directive costs one
+  responder instead of four (cheap, user can rephrase); a false positive costs
+  N provider turns on every message that merely mentions the word "agents".
+  """
+  @spec all_agents_request?(any()) :: boolean()
+  def all_agents_request?(text) when is_binary(text) do
+    t = text |> String.trim() |> String.downcase()
+
+    Regex.match?(
+      ~r/\b(all( of the| the)? agents|every agent|each agent|all of you|each of you|you all|y'all|all together|everyone|everybody|whole team|entire team|full team|all (team )?members|all four of you|all 4 of you)\b/,
+      t
+    )
+  end
+
+  def all_agents_request?(_), do: false
+
+  @doc """
   Pick the single best-provider worker to handle a SIMPLE `@team` request
   visibly — its live frames ARE the progress the user sees, so it must be one of
   the reliable agentic coders the user named for solo work (codex / claude /
@@ -1003,11 +1026,11 @@ defmodule Vibe.AI.LocalAgentWorker do
   @doc """
   Pick the worker that ANSWERS a `:chat` message.
 
-  Restricted to the providers the bridge can HARD-strip writes on (codex →
-  `read-only` sandbox, claude → disallowed Edit/Write/MultiEdit/NotebookEdit/Bash).
-  Grok/Gemini have no equivalent enforcement hook yet, so they must not take a
-  chat turn — a prompt asking them not to edit is not a control, as we learned the
-  expensive way.
+  Every provider is now bridge-enforceable on a chat turn (codex → `read-only`
+  sandbox, claude → disallowed Edit/Write/MultiEdit/NotebookEdit/Bash, grok/agy →
+  CLI plan mode), so this is a quality preference, not a safety gate: codex and
+  claude give the most reliable short answers. The explicit all-agents fan-out
+  dispatches every worker regardless.
   """
   def pick_chat_worker(workers) when is_list(workers) do
     Enum.find_value(["codex", "claude"], fn handle ->

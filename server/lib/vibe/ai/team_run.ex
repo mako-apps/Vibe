@@ -67,7 +67,11 @@ defmodule Vibe.AI.TeamRun do
       :dispatch_ciphertext
     ])
     |> validate_inclusion(:status, ["running", "completed", "failed", "cancelled"])
-    |> validate_inclusion(:mode, ["supervisor", "sequential"])
+    # "solo" = one visible best-provider worker for a :simple @team request. It
+    # was missing here, so every solo registration failed validation and fell
+    # back to ETS only — lost on server restart (found via the changeset-error
+    # log on 2026-07-13). `chat` turns deliberately never register a run.
+    |> validate_inclusion(:mode, ["supervisor", "sequential", "solo"])
     |> validate_number(:current_index, greater_than_or_equal_to: 0)
     |> unique_constraint(:id, name: :agent_team_runs_pkey)
   end

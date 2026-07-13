@@ -577,7 +577,10 @@ struct AgentBridgeRepositoryPickerView: View {
   private func applyCachedHistory() {
     guard
       !chatId.isEmpty,
-      let payload = ChatEngine.shared.latestAgentBridgeHistory(chatId: chatId),
+      let payload = ChatEngine.shared.latestAgentBridgeHistoryList(
+        chatId: chatId,
+        provider: provider
+      ),
       (payload["mode"] as? String ?? "list") == "list"
     else { return }
     let raw = payload["sessions"] as? [[String: Any]] ?? []
