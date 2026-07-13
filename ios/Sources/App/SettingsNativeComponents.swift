@@ -528,8 +528,10 @@ private enum SettingsAvatarHeroMetrics {
   static let bottomSpacing: CGFloat = 8
   /// Discrete pull threshold: offset < -this commits expand spring (0→1). Not live scale.
   static let expandPullThreshold: CGFloat = 60
-  /// Scroll into list while expanded collapses hero.
-  static let collapseScrollThreshold: CGFloat = 80
+  /// Begin returning to the circle almost as soon as the expanded header scrolls.
+  /// A short threshold keeps the transition attached to the user's finger instead
+  /// of letting the photo drift upward before it becomes an avatar.
+  static let collapseScrollThreshold: CGFloat = 28
 
   static func expandedTop(for safeTop: CGFloat) -> CGFloat {
     _ = safeTop
@@ -830,7 +832,7 @@ private struct SettingsAvatarScrollMorphView: View {
   private var circleSize: CGFloat { model.expandedSize }
   private var bottomPad: CGFloat { 8 }
   private var nameOutsideHeight: CGFloat { 48 }
-  private var blurBandHeight: CGFloat { 50 }
+  private var blurBandHeight: CGFloat { 118 }
 
   private var stretch: CGFloat {
     max(0, model.overscrollStretch)
@@ -902,34 +904,26 @@ private struct SettingsAvatarScrollMorphView: View {
     let heroImageScale = stretch > 0 ? 1 + min(0.18, stretch / max(1, resolvedHeroHeight)) : 1
     let band = resolvedBandWidth
     let _ = heroMorphSUITrace(ep: ep)
-    // Only relevant to the collapsed circle (gated by 1-ep) — blur+fade+scale-down
-    // as the avatar scrolls toward exiting the top, instead of clipping off raw.
+    // Only relevant to the collapsed circle (gated by 1-ep) — scale/fade with the
+    // scroll. Keep the photo sharp; legibility blur belongs behind the hero text.
     let scrollFade = model.scrollCollapseFade * (1 - ep)
-    // Hero-mode leave feedback: immediate blur/scale response to upward scroll,
-    // decays through the collapse morph (driven from UIKit, never both nonzero
-    // with scrollFade at once).
+    // Hero-mode leave feedback is scale-only. The media itself must never blur.
     let dissolve = max(0, min(1, model.heroDissolve))
 
     return ZStack(alignment: .topLeading) {
       mediaBody(imageScale: heroImageScale)
         .frame(width: mediaW, height: mediaH)
         .clipShape(shape)
-        .scaleEffect(1 - 0.08 * scrollFade - 0.05 * dissolve, anchor: .top)
-        .blur(radius: 6 * scrollFade + 8 * dissolve)
-        .opacity(Double(1 - 0.5 * scrollFade - 0.12 * dissolve))
+        .scaleEffect(1 - 0.08 * scrollFade - 0.035 * dissolve, anchor: .top)
+        .opacity(Double(1 - 0.32 * scrollFade))
         .frame(maxWidth: .infinity, alignment: .center)
         .padding(.top, mediaTop)
 
-      // Always centered — under the circle when collapsed, centered on the hero
-      // bottom when expanded (no leading/right drift at any p).
-      nameChrome(expand: ep)
-        .frame(
-          width: max(1, band - 32),
-          height: nameOutsideHeight,
-          alignment: .center
-        )
+      SettingsAvatarNameMorphLayout(progress: ep, leadingInset: 16) {
+        nameChrome(expand: ep)
+      }
+        .frame(width: band, height: nameOutsideHeight)
         .padding(.top, nameTop)
-        .padding(.leading, 16)
     }
     .frame(width: band, height: hostBandHeight, alignment: .top)
     .clipped()
@@ -951,8 +945,6 @@ private struct SettingsAvatarScrollMorphView: View {
     let titleColor = Color.lerp(model.nameColor, Color.white.opacity(0.92), t: ep)
     let subColor = Color.lerp(model.subtitleColor, Color.white.opacity(0.78), t: ep)
 
-    // Centered at every p — under the circle collapsed, centered on the hero bottom
-    // expanded (never drifts toward an edge mid-morph).
     VStack(alignment: .center, spacing: 2) {
       Text(title)
         // Slightly smaller + semibold (was 28 bold).
@@ -970,8 +962,6 @@ private struct SettingsAvatarScrollMorphView: View {
           .shadow(color: .black.opacity(0.30 * ep), radius: 4 * ep, y: 1)
       }
     }
-    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-    .padding(.horizontal, 16)
   }
 
   @ViewBuilder
@@ -1017,21 +1007,61 @@ private struct SettingsAvatarScrollMorphView: View {
           LinearGradient(
             stops: [
               .init(color: .clear, location: 0.0),
-              .init(color: .clear, location: blurStart),
-              .init(color: .black.opacity(0.85), location: 1.0),
+              .init(color: .clear, location: max(0.52, blurStart)),
+              .init(color: .black.opacity(0.72), location: 0.82),
+              .init(color: .black, location: 1.0),
             ],
             startPoint: .top,
             endPoint: .bottom
           )
         )
-        .opacity(Double(0.3 + 0.5 * ep))
+        .opacity(Double(0.94 * ep))
         .allowsHitTesting(false)
     }
     .frame(width: mediaW, height: mediaH)
-    // No mid-morph blur: expansion stays sharp (the soft bottom-edge material under
-    // the username is the only softness); collapse blur comes from heroDissolve,
-    // which starts with the upward scroll and decays to sharp as the circle settles.
+    // The photo stays sharp throughout. The bottom material above is the only blur,
+    // and it sits behind the name rather than rasterizing the image itself.
     .clipped()
+  }
+}
+
+/// Places one measured title element from exact center to an exact hero-leading
+/// inset. No duplicate/crossfade and no alignment-mode switch.
+private struct SettingsAvatarNameMorphLayout: Layout {
+  let progress: CGFloat
+  let leadingInset: CGFloat
+
+  func sizeThatFits(
+    proposal: ProposedViewSize,
+    subviews: Subviews,
+    cache: inout ()
+  ) -> CGSize {
+    guard let subview = subviews.first else { return .zero }
+    let child = subview.sizeThatFits(
+      ProposedViewSize(width: max(1, (proposal.width ?? 1) - leadingInset * 2), height: proposal.height)
+    )
+    return CGSize(width: proposal.width ?? child.width, height: proposal.height ?? child.height)
+  }
+
+  func placeSubviews(
+    in bounds: CGRect,
+    proposal: ProposedViewSize,
+    subviews: Subviews,
+    cache: inout ()
+  ) {
+    guard let subview = subviews.first else { return }
+    let child = subview.sizeThatFits(
+      ProposedViewSize(width: max(1, bounds.width - leadingInset * 2), height: bounds.height)
+    )
+    let p = min(1, max(0, progress))
+    let centeredX = (bounds.width - child.width) * 0.5
+    let x = centeredX + (leadingInset - centeredX) * p
+    let y = max(0, (bounds.height - child.height) * 0.5)
+    subview.place(
+      at: CGPoint(x: bounds.minX + x, y: bounds.minY + y),
+      anchor: .topLeading,
+      proposal: ProposedViewSize(width: child.width, height: child.height)
+    )
   }
 }
 
@@ -1585,6 +1615,16 @@ final class SettingsNativeMainView: UIView, UIScrollViewDelegate, UIImagePickerC
   private var heroMorphTarget: CGFloat = 1
   private var heroMorphActiveDuration: TimeInterval = 0.26
   private var heroMorphActiveDamping: Double = 0.86
+  /// One interactive drag value drives circle ↔ hero in both directions.
+  private var heroPanStartProgress: CGFloat = 0
+  private var heroPanCanMorph = false
+  private var heroPanIsMorphing = false
+  private var currentHeroStretch: CGFloat = 0
+  private var heroStretchSettleDisplayLink: CADisplayLink?
+  private var heroStretchSettleStart: CFTimeInterval = 0
+  private var heroStretchSettleFrom: CGFloat = 0
+  private var heroMorphStretchFrom: CGFloat = 0
+  private static let heroMorphDragDistance: CGFloat = 132
   /// Rubber-band offset consumed at expand commit; decays to 0 across the morph.
   private var heroMorphOverscroll: CGFloat = 0
   /// Upward scroll consumed at collapse commit — the offset is driven back to 0
@@ -1610,6 +1650,7 @@ final class SettingsNativeMainView: UIView, UIScrollViewDelegate, UIImagePickerC
   deinit {
     contentOffsetObservation?.invalidate()
     heroMorphDisplayLink?.invalidate()
+    heroStretchSettleDisplayLink?.invalidate()
   }
 
   required init?(coder: NSCoder) {
@@ -1703,6 +1744,7 @@ final class SettingsNativeMainView: UIView, UIScrollViewDelegate, UIImagePickerC
     scrollView.delegate = self
     scrollView.delaysContentTouches = false
     scrollView.canCancelContentTouches = true
+    scrollView.panGestureRecognizer.addTarget(self, action: #selector(handleHeroPan(_:)))
     addSubview(scrollView)
 
     // KVO so pull scale never depends on delegate-only delivery (Fable).
@@ -1823,6 +1865,7 @@ final class SettingsNativeMainView: UIView, UIScrollViewDelegate, UIImagePickerC
     let quantStretch = (max(0, stretch) * scale).rounded() / scale
     let quantExtraTop = (max(0, extraTop) * scale).rounded() / scale
     heroExpandProgress = clampedP
+    currentHeroStretch = quantStretch
     let h = avatarBandHeight(for: clampedP) + quantStretch + quantExtraTop
     avatarBandHeightConstraint?.constant = (h * scale).rounded() / scale
     avatarView.setOverscrollStretch(quantStretch)
@@ -1995,68 +2038,50 @@ final class SettingsNativeMainView: UIView, UIScrollViewDelegate, UIImagePickerC
   /// Discrete 0↔1 only (profile-style). No live scroll-progress scale.
   /// Avatar rides the scroll (one unit with rows); expand is a shared spring morph.
   private func updateScrollAnimations(offsetY: CGFloat) {
-    // Freeze ALL samples during morph — no fighting the spring.
-    if isCommittingHero { return }
+    // The pan target owns geometry while dragging; the display link owns snap settle.
+    if isCommittingHero || heroPanIsMorphing { return }
 
     let adjusted = offsetY + scrollView.adjustedContentInset.top
     let y = min(offsetY, adjusted)
 
-    if !heroExpanded {
-      if expandGestureArmed, y < -SettingsAvatarHeroMetrics.expandPullThreshold {
-        expandGestureArmed = false
-        NSLog("[HeroMorph] pull-threshold y=%.1f", Double(y))
-        setHeroExpanded(true)
-      }
-      if y >= 0 {
-        expandGestureArmed = true
-      }
-      // Collapsed: no scale-on-scroll, but blur+fade the avatar as it scrolls
-      // toward exiting the top of the screen instead of just clipping off with
-      // no transition (it previously had NO scroll effect at all).
+    if heroExpandProgress <= 0.001 {
+      // Collapsed: scale/fade the avatar with the real scroll while keeping it sharp.
       let fadeRange = max(1, avatarBandHeight(for: 0))
       avatarView.setScrollCollapseFade(max(0, min(1, y / fadeRange)))
       avatarView.setHeroDissolve(0)
-    } else {
-      avatarView.setScrollCollapseFade(0)
-      // Immediate leave feedback: blur + slight scale-down rise WITH the upward
-      // scroll (no waiting for the threshold), then the collapse morph decays it.
-      avatarView.setHeroDissolve(y / SettingsAvatarHeroMetrics.collapseScrollThreshold)
-      if y > SettingsAvatarHeroMetrics.collapseScrollThreshold {
-        NSLog("[HeroMorph] collapse-threshold y=%.1f", Double(y))
-        setHeroExpanded(false)
-        return
-      }
-      // Optional stretch only after fully expanded + settled (1pt deadband inside).
-      let stretch = liveOverscrollStretch()
-      if abs(y - lastHeroSampleLogY) > 8 {
-        lastHeroSampleLogY = y
-        NSLog(
-          "[HeroMorph] sample y=%.1f stretch=%.1f band=%.1f",
-          Double(y), Double(stretch), Double(avatarBandHeightConstraint?.constant ?? -1)
-        )
-      }
-      applyHeaderLayout(p: 1, stretch: stretch)
     }
   }
 
-  // `response` terms of the analytic spring in stepHeroMorph. Collapse matches
-  // expand: at 0.15 the shrink read as a "pop out" instead of a visible scale-down.
-  private static let heroExpandDuration: TimeInterval = 0.22
-  private static let heroCollapseDuration: TimeInterval = 0.22
+  // Short, soft springs: fast enough to stay attached to the gesture, with a
+  // small settle instead of an ease-out stop.
+  private static let heroExpandDuration: TimeInterval = 0.18
+  private static let heroCollapseDuration: TimeInterval = 0.16
   /// Underdamped ("soft") — a touch of settle instead of a hard, critically-damped
   /// stop. Matches the Profile hero's `dampingFraction: 0.86` SwiftUI spring.
-  private static let heroExpandDamping: Double = 0.86
+  private static let heroExpandDamping: Double = 0.82
   /// Collapse settles flatter (it also carries the offset back to 0 — bounce there
   /// would wiggle the whole list).
-  private static let heroCollapseDamping: Double = 0.9
+  private static let heroCollapseDamping: Double = 0.86
 
   private func setHeroExpanded(_ expanded: Bool) {
-    guard heroExpanded != expanded, !isCommittingHero else { return }
-    if expanded, scrollView.contentOffset.y > 1 { return }
+    guard !isCommittingHero else { return }
+    let target: CGFloat = expanded ? 1 : 0
+    if abs(heroExpandProgress - target) < 0.001 {
+      heroExpanded = expanded
+      if currentHeroStretch > 0.5 {
+        startHeroStretchSettle(from: currentHeroStretch)
+      } else {
+        applyHeaderLayout(p: target, stretch: 0)
+      }
+      return
+    }
 
     isCommittingHero = true
     heroExpanded = expanded
-    let target: CGFloat = expanded ? 1 : 0
+
+    heroStretchSettleDisplayLink?.invalidate()
+    heroStretchSettleDisplayLink = nil
+    heroMorphStretchFrom = currentHeroStretch
 
     if expanded {
       UIImpactFeedbackGenerator(style: .medium).impactOccurred()
@@ -2067,58 +2092,27 @@ final class SettingsNativeMainView: UIView, UIScrollViewDelegate, UIImagePickerC
     avatarView.transform = .identity
     avatarView.setScrollCollapseFade(0)
 
-    // Consume the rubber-band overscroll COMPENSATED: offset snaps to 0 (UIKit clamps
-    // it anyway one frame later — the old 35pt list jump) while extraTop pushes the
-    // media + band down by the exact same amount, so the commit frame is pixel-
-    // identical. extraTop then decays to 0 inside the morph curve — one smooth motion.
-    var consumedOverscroll: CGFloat = 0
-    var consumedTopScroll: CGFloat = 0
-    var initialVelocity: Double = 0
-    if expanded {
-      let offsetY = scrollView.contentOffset.y
-      let y = min(offsetY, offsetY + scrollView.adjustedContentInset.top)
-      consumedOverscroll = max(0, -y)
-      if consumedOverscroll > 0 {
-        scrollView.setContentOffset(.zero, animated: false)
-      }
-      avatarView.setHeroDissolve(0)
-    } else {
-      // Kill any live deceleration so the morph owns the offset from here.
-      scrollView.setContentOffset(scrollView.contentOffset, animated: false)
-      consumedTopScroll = max(0, scrollView.contentOffset.y)
-      // Hand the drag velocity to the spring (progress/sec, negative = the list
-      // keeps its upward momentum briefly before settling back) — a dead stop at
-      // commit reads as hitting a wall.
-      let panV = scrollView.panGestureRecognizer.velocity(in: self).y
-      if consumedTopScroll > 0, panV < 0 {
-        initialVelocity = max(-6, Double(panV) / Double(max(60, consumedTopScroll)))
-      }
-      heroMorphDissolveFrom = max(
-        0, min(1, consumedTopScroll / SettingsAvatarHeroMetrics.collapseScrollThreshold))
-    }
-    // Cancel the live pan for the morph: with the finger down the pan rewrites the
-    // offset every frame while the band resize re-clamps it — alternating commits =
-    // whole-list px jitter (the slow-mo flicker). Re-enabled in finishHeroMorph.
-    scrollView.panGestureRecognizer.isEnabled = false
-    heroMorphOverscroll = consumedOverscroll
-    heroMorphTopScroll = consumedTopScroll
-    heroMorphInitialVelocity = initialVelocity
+    // Never disable or reset the pan recognizer. The spring only finishes whatever
+    // fraction the finger left; it does not start the transition.
+    heroMorphOverscroll = 0
+    heroMorphTopScroll = 0
+    heroMorphInitialVelocity = 0
+    heroMorphDissolveFrom = 0
+    avatarView.setHeroDissolve(0)
 
     NSLog(
       "[HeroMorph] commit expanded=%d fromP=%.3f consumed=%.1f topScroll=%.1f v0=%.2f offY=%.1f dragging=%d band=%.1f",
       expanded ? 1 : 0,
       Double(heroExpandProgress),
-      Double(consumedOverscroll),
-      Double(consumedTopScroll),
-      initialVelocity,
+      0,
+      0,
+      0,
       Double(scrollView.contentOffset.y),
       scrollView.isDragging ? 1 : 0,
       Double(avatarBandHeightConstraint?.constant ?? -1)
     )
 
-    // Apply the compensated state NOW (same runloop turn) — waiting for the first
-    // display-link tick would render one uncompensated (jumped) frame.
-    applyHeaderLayout(p: heroExpandProgress, stretch: 0, extraTop: consumedOverscroll)
+    applyHeaderLayout(p: heroExpandProgress, stretch: currentHeroStretch)
     layoutIfNeeded()
 
     let w = bounds.width > 1 ? bounds.width : UIScreen.main.bounds.width
@@ -2179,36 +2173,14 @@ final class SettingsNativeMainView: UIView, UIScrollViewDelegate, UIImagePickerC
       initialVelocity: heroMorphInitialVelocity
     )
     let p = heroMorphFrom + (heroMorphTarget - heroMorphFrom) * eased
-    // NO live offset sampling mid-flight: growing the band makes UIScrollView re-clamp
-    // the offset every frame, and feeding that back as stretch oscillated the band
-    // (the "noisy soft jump" flicker). Only the consumed-at-commit overscroll decays.
     let extraTop = heroMorphOverscroll * max(0, 1 - eased)
+    let stretch = max(0, heroMorphStretchFrom * (1 - min(1, max(0, eased))))
     // Constraint first, THEN offset: the band resize changes contentSize, and a
     // stale contentSize can clamp the offset write (advisor ordering).
-    applyHeaderLayout(p: p, stretch: 0, extraTop: extraTop)
+    applyHeaderLayout(p: p, stretch: stretch, extraTop: extraTop)
     layoutIfNeeded()
-    if heroMorphTarget >= 1 {
-      // Pin the offset for expand so every committed frame renders identical 0 —
-      // any residual writer (deceleration, clamp) would jitter the whole list.
-      if scrollView.contentOffset.y != 0 {
-        scrollView.contentOffset = .zero
-      }
-      avatarView.setHeroDissolve(0)
-    } else {
-      // Drive the consumed top scroll back to 0 so the hero shrinks anchored at
-      // the screen top with rows glued below it. Clamp ≥ 0: the spring's settle
-      // overshoot must not push the offset negative (would gap the top / re-arm
-      // the pull-to-expand).
-      if heroMorphTopScroll > 0 {
-        let offset = max(0, heroMorphTopScroll * (1 - eased))
-        if abs(scrollView.contentOffset.y - offset) > 0.01 {
-          scrollView.contentOffset = CGPoint(x: 0, y: offset)
-        }
-      }
-      // Leave-blur decays with the same curve — sharp exactly when it lands.
-      avatarView.setHeroDissolve(heroMorphDissolveFrom * max(0, min(1, 1 - eased)))
-    }
-    heroMorphLog(stage: "tick", t: t, p: p, stretch: 0, extraTop: extraTop)
+    avatarView.setHeroDissolve(0)
+    heroMorphLog(stage: "tick", t: t, p: p, stretch: stretch, extraTop: extraTop)
     // Settle-aware finish: a velocity handoff can push the spring past the nominal
     // response window, so wait for it to actually arrive (hard cap 3× duration).
     if elapsed >= heroMorphActiveDuration, abs(1 - eased) < 0.01 {
@@ -2224,21 +2196,12 @@ final class SettingsNativeMainView: UIView, UIScrollViewDelegate, UIImagePickerC
     heroMorphOverscroll = 0
     heroMorphInitialVelocity = 0
     heroMorphDissolveFrom = 0
-    let stretch = heroMorphTarget >= 1 ? liveOverscrollStretch() : 0
+    let stretch: CGFloat = 0
     applyHeaderLayout(p: heroMorphTarget, stretch: stretch)
     layoutIfNeeded()
-    if heroMorphTarget <= 0 {
-      // Land exactly at rest: circle avatar fully visible at the top, sharp.
-      if heroMorphTopScroll > 0, scrollView.contentOffset.y != 0 {
-        scrollView.contentOffset = .zero
-      }
-      avatarView.setHeroDissolve(0)
-    }
+    avatarView.setHeroDissolve(0)
     heroMorphTopScroll = 0
     avatarView.transform = .identity
-    if !scrollView.panGestureRecognizer.isEnabled {
-      scrollView.panGestureRecognizer.isEnabled = true
-    }
     isCommittingHero = false
     if heroMorphTarget <= 0 {
       expandGestureArmed = true
@@ -2253,6 +2216,88 @@ final class SettingsNativeMainView: UIView, UIScrollViewDelegate, UIImagePickerC
     let y = min(offsetY, offsetY + scrollView.adjustedContentInset.top)
     guard y < -1 else { return 0 }
     return min(-y - 1, bounds.height * 0.12)
+  }
+
+  private var isPanActive: Bool {
+    let state = scrollView.panGestureRecognizer.state
+    return state == .began || state == .changed
+  }
+
+  @objc private func handleHeroPan(_ pan: UIPanGestureRecognizer) {
+    switch pan.state {
+    case .began:
+      heroMorphDisplayLink?.invalidate()
+      heroMorphDisplayLink = nil
+      isCommittingHero = false
+      heroStretchSettleDisplayLink?.invalidate()
+      heroStretchSettleDisplayLink = nil
+      heroPanStartProgress = heroExpandProgress
+      heroPanCanMorph = heroExpandProgress > 0.001 || scrollView.contentOffset.y <= 0.5
+      heroPanIsMorphing = heroPanCanMorph
+    case .changed:
+      guard heroPanCanMorph else { return }
+      let translation = pan.translation(in: self).y
+      let rawProgress = heroPanStartProgress + translation / Self.heroMorphDragDistance
+      let progress = min(1, max(0, rawProgress))
+      let stretch = min(
+        bounds.height * 0.12,
+        max(0, rawProgress - 1) * Self.heroMorphDragDistance * 0.65
+      )
+      heroExpanded = progress >= 0.999
+      avatarView.setScrollCollapseFade(0)
+      applyHeaderLayout(p: progress, stretch: stretch)
+      layoutIfNeeded()
+    case .ended, .cancelled, .failed:
+      guard heroPanCanMorph else { return }
+      heroPanCanMorph = false
+      heroPanIsMorphing = false
+      let velocity = pan.velocity(in: self).y
+      let expand: Bool
+      if velocity > 220 {
+        expand = true
+      } else if velocity < -220 {
+        expand = false
+      } else {
+        expand = heroExpandProgress >= 0.5
+      }
+      setHeroExpanded(expand)
+    default:
+      break
+    }
+  }
+
+  private func startHeroStretchSettle(from stretch: CGFloat) {
+    heroStretchSettleDisplayLink?.invalidate()
+    heroStretchSettleFrom = max(0, stretch)
+    guard heroStretchSettleFrom > 0.5, heroExpanded else {
+      applyHeaderLayout(p: heroExpandProgress, stretch: 0)
+      return
+    }
+    heroStretchSettleStart = CACurrentMediaTime()
+    let link = CADisplayLink(target: self, selector: #selector(stepHeroStretchSettle(_:)))
+    if #available(iOS 15.0, *) {
+      link.preferredFrameRateRange = CAFrameRateRange(minimum: 80, maximum: 120, preferred: 120)
+    }
+    link.add(to: .main, forMode: .common)
+    heroStretchSettleDisplayLink = link
+  }
+
+  @objc private func stepHeroStretchSettle(_ link: CADisplayLink) {
+    guard heroExpanded, !isPanActive else {
+      link.invalidate()
+      heroStretchSettleDisplayLink = nil
+      return
+    }
+    let duration: TimeInterval = 0.18
+    let t = min(1, max(0, (CACurrentMediaTime() - heroStretchSettleStart) / duration))
+    let eased = 1 - pow(1 - t, 3)
+    applyHeaderLayout(p: 1, stretch: heroStretchSettleFrom * CGFloat(1 - eased))
+    layoutIfNeeded()
+    if t >= 1 {
+      link.invalidate()
+      heroStretchSettleDisplayLink = nil
+      applyHeaderLayout(p: 1, stretch: 0)
+    }
   }
 
   private func heroMorphLog(stage: String, t: CGFloat, p: CGFloat, stretch: CGFloat, extraTop: CGFloat) {
