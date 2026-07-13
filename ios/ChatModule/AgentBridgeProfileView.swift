@@ -1112,21 +1112,48 @@ struct AgentBridgeHistoryInlineView: View {
   }
 
   private func mergedSessions() -> [AgentBridgeHistorySession] {
+    let listedById = Dictionary(
+      sessions.map { ($0.id, $0) },
+      uniquingKeysWith: { first, _ in first }
+    )
+    func firstText(_ values: String?...) -> String {
+      for value in values {
+        let text = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !text.isEmpty { return text }
+      }
+      return ""
+    }
     let running = runningTasks.compactMap { task -> AgentBridgeHistorySession? in
       let normalizedProvider = task.provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
       if !normalizedProvider.isEmpty && normalizedProvider != provider.lowercased() { return nil }
       if !task.chatId.isEmpty && !chatId.isEmpty && task.chatId != chatId { return nil }
       let id = task.sessionId?.isEmpty == false ? task.sessionId! : "running:\(task.taskId)"
+      let listed = listedById[id]
       return AgentBridgeHistorySession(
         id: id,
-        topic: task.topic,
-        projectName: task.projectName ?? task.repoName ?? "",
-        projectPath: task.project ?? task.cwd ?? "",
-        updatedAt: task.startedAt ?? "",
-        messageCount: 0,
+        // A matching history row is the conversation source of truth: it carries
+        // the original user-derived title and parsed message count. The running
+        // status overlay should add live metadata, never replace those fields with
+        // a transient progress label and zero messages.
+        topic: firstText(listed?.topic, task.topic, "Running task"),
+        projectName: firstText(
+          listed?.projectName,
+          task.projectName,
+          task.repoName
+        ),
+        projectPath: firstText(
+          listed?.projectPath,
+          task.project,
+          task.cwd
+        ),
+        updatedAt: firstText(task.startedAt, listed?.updatedAt),
+        // Even before the rollout file is visible, a running task already has its
+        // originating user prompt. Never paint the misleading "0 messages" state.
+        messageCount: max(1, listed?.messageCount ?? 0),
         isRunning: true,
         taskId: task.taskId,
-        sessionId: task.sessionId
+        sessionId: task.sessionId,
+        pendingAskKind: listed?.pendingAskKind
       )
     }
     // A running-task entry shadows its badged list twin (dedup below keeps the running

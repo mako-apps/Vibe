@@ -5117,7 +5117,9 @@ function isContextMessage(text) {
   return (
     /^\s*<(environment_context|user_instructions|INSTRUCTIONS|permissions|ide_opened_file|ide_selection|local-command-caveat|command-name|system-reminder|turn_aborted|turn_context|user_action)/i.test(head) ||
     /^\s*#\s*Context from my IDE/i.test(head) ||
-    /^\s*AGENTS\.md instructions/i.test(head) ||
+    /^\s*#?\s*AGENTS\.md instructions/i.test(head) ||
+    /^\s*Here is a list of plugins that are available but not installed/i.test(head) ||
+    /^\s*Vibe bridge startup prepared these instruction files for this project/i.test(head) ||
     /^\s*The following is the Codex agent history/i.test(head) ||
     /^\s*The user interrupted the previous turn/i.test(head) ||
     /## Active (file|selection)/i.test(head)
@@ -5150,8 +5152,29 @@ function cleanMessageText(text) {
     /<(environment_context|user_instructions|INSTRUCTIONS|permissions|system-reminder|local-command-caveat|command-name|command-message|command-args|ide_opened_file|ide_selection)[\s\S]*?<\/\1>/gi,
     " "
   );
-  t = t.replace(/<\/?[a-z_-]+>/gi, " ");
+  // Codex app attachments are persisted as an XML-like wrapper followed by the
+  // user's actual text (`[Image #1] …`). Remove only the wrapper/marker; the prompt
+  // after it is the real conversational turn and must remain visible in History.
+  t = t.replace(/<image\b[^>]*>[\s\S]*?<\/image>/gi, " ");
+  t = t.replace(/<\/?[a-z][^>]*>/gi, " ");
+  t = t.replace(/^(?:\s*\[Image #\d+\]\s*)+/i, "");
   return t.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+// Codex IDE integrations wrap a genuine prompt in a context preamble:
+//   # Context from my IDE setup:
+//   …
+//   ## My request for Codex:
+//   <actual prompt>
+// Treating the whole record as context erased every user bubble. Extract the request
+// section first; context-only/AGENTS records remain suppressed.
+function codexUserMessageText(text) {
+  if (typeof text !== "string") return "";
+  let raw = text;
+  const marker = /^##\s*My request for Codex:\s*$/im.exec(raw);
+  if (marker) raw = raw.slice(marker.index + marker[0].length);
+  else if (isContextMessage(raw)) return "";
+  return cleanMessageText(raw);
 }
 
 // Skip ephemeral scratch/test working dirs so the list shows real work.
@@ -5322,15 +5345,15 @@ function collectClaudeEdits(acc, content) {
 // `custom_tool_call` (sometimes `function_call`) whose `input` is the classic
 // `*** Begin Patch / *** Add|Update|Delete File:` text.
 function collectCodexEdits(acc, payload) {
-  const p = codexUnwrapActionPayload(payload);
-  if (!p) return;
-  const isPatch =
-    (p.type === "custom_tool_call" || p.type === "function_call") && /apply_patch/i.test(p.name || "");
-  if (!isPatch) return;
-  const input = codexPatchTextFromPayload(p);
-  if (!input) return;
-  for (const f of parseApplyPatchEnvelope(input)) {
-    accumulateRuntimeFile(acc, f.path, f.status, f.additions, f.deletions, f.patchBlock);
+  for (const p of codexUnwrapActionPayloads(payload)) {
+    const isPatch =
+      (p.type === "custom_tool_call" || p.type === "function_call") && /apply_patch/i.test(p.name || "");
+    if (!isPatch) continue;
+    const input = codexPatchTextFromPayload(p);
+    if (!input) continue;
+    for (const f of parseApplyPatchEnvelope(input)) {
+      accumulateRuntimeFile(acc, f.path, f.status, f.additions, f.deletions, f.patchBlock);
+    }
   }
 }
 
@@ -5885,8 +5908,30 @@ function codexShellDetail(rawCmd) {
   return bash;
 }
 
-function codexActionDetail(p) {
-  p = codexUnwrapActionPayload(p);
+function codexDecodedActionInput(p) {
+  if (!p || typeof p !== "object") return {};
+  const value = p.arguments != null ? p.arguments : p.input;
+  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value !== "string") return {};
+  try {
+    const decoded = JSON.parse(value);
+    return decoded && typeof decoded === "object" && !Array.isArray(decoded) ? decoded : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function codexPlanTodos(input) {
+  const raw = input && (input.todos || input.plan || input.items);
+  if (!Array.isArray(raw)) return [];
+  return raw.map((item) => ({
+    content: String((item && (item.content || item.step)) || ""),
+    status: String((item && item.status) || "pending"),
+    activeForm: String((item && item.activeForm) || ""),
+  })).filter((item) => item.content.trim());
+}
+
+function codexActionDetailSingle(p) {
   if (!p) return null;
   const name = String(p.name || "");
   if (/apply_patch/i.test(name)) {
@@ -5905,12 +5950,26 @@ function codexActionDetail(p) {
     return codexShellDetail(codexCommandFromPayload(p));
   }
   if (/^(?:view_image|open_image)$/i.test(name)) {
-    const input = p.input && typeof p.input === "object" ? p.input : {};
+    const input = codexDecodedActionInput(p);
     const imagePath = String(input.path || input.file_path || "");
     return { kind: "read", name: safeBase(imagePath), path: imagePath };
   }
   if (/^(?:update_plan|todo_write|todowrite)$/i.test(name)) {
-    return { kind: "todo", todos: [] };
+    return { kind: "todo", todos: codexPlanTodos(codexDecodedActionInput(p)) };
+  }
+  if (/^(?:spawn_agent|spawn_subagent|delegate_to_subagent)$/i.test(name)) {
+    const input = codexDecodedActionInput(p);
+    const taskName = String(input.task_name || input.name || input.subagent_type || "subagent");
+    return {
+      kind: "task",
+      description: taskName,
+      subagent: taskName,
+    };
+  }
+  if (/^(?:send_message|followup_task)$/i.test(name)) {
+    const input = codexDecodedActionInput(p);
+    const target = String(input.target || input.task_name || "subagent").replace(/^\/root\//, "");
+    return { kind: "task", description: `Message ${target}`, subagent: target };
   }
   // Codex mcp_tool_call / MCP-ish function names.
   const itemType = String(p.item_type || p.type || p.kind || "").toLowerCase();
@@ -5923,6 +5982,16 @@ function codexActionDetail(p) {
   const mcp = mcpActionDetail(name, p.arguments || p.input || {});
   if (mcp) return mcp;
   return { kind: "tool", name: name || "tool" };
+}
+
+function codexActionDetails(payload) {
+  return codexUnwrapActionPayloads(payload)
+    .map(codexActionDetailSingle)
+    .filter(Boolean);
+}
+
+function codexActionDetail(payload) {
+  return codexActionDetails(payload)[0] || null;
 }
 
 function isCodexShellToolName(name) {
@@ -5943,7 +6012,7 @@ const CODEX_EXEC_OUTPUT_HELPERS = new Set([
   "notify",
   "yield_control",
 ]);
-const CODEX_CONTINUATION_TOOLS = new Set(["wait", "write_stdin"]);
+const CODEX_CONTINUATION_TOOLS = new Set(["wait", "write_stdin", "wait_agent", "list_agents"]);
 
 function decodeCodexJsStringLiteral(source, start) {
   const quote = source[start];
@@ -6007,21 +6076,65 @@ function codexJsStringLiterals(source) {
 
 function codexJsPropertyString(source, key) {
   const escaped = String(key).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = new RegExp("\\b" + escaped + "\\s*:\\s*").exec(String(source || ""));
+  const match = new RegExp("(?:\\b" + escaped + "\\b|[\\\"']" + escaped + "[\\\"'])\\s*:\\s*").exec(String(source || ""));
   if (!match) return "";
   const start = match.index + match[0].length;
   const decoded = decodeCodexJsStringLiteral(String(source || ""), start);
   return decoded ? decoded.value : "";
 }
 
-function codexNestedToolNames(source) {
-  const names = [];
-  const re = /\btools\.([A-Za-z0-9_]+)\s*\(/g;
+function codexJsPropertyStrings(source, key) {
+  const values = [];
+  const text = String(source || "");
+  const escaped = String(key).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp("(?:\\b" + escaped + "\\b|[\\\"']" + escaped + "[\\\"'])\\s*:\\s*", "g");
   let match;
-  while ((match = re.exec(String(source || "")))) {
-    if (!CODEX_EXEC_OUTPUT_HELPERS.has(match[1])) names.push(match[1]);
+  while ((match = re.exec(text))) {
+    const decoded = decodeCodexJsStringLiteral(text, match.index + match[0].length);
+    if (decoded) {
+      values.push(decoded.value);
+      re.lastIndex = decoded.end;
+    }
   }
-  return names;
+  return values;
+}
+
+// Find generated `tools.<name>(…)` calls without evaluating persisted source. The
+// scanner skips string literals and balances parentheses so Promise.all/multi-call
+// envelopes can produce one native node per real operation.
+function codexNestedToolCalls(source) {
+  const calls = [];
+  const text = String(source || "");
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '"' || text[i] === "'" || text[i] === "`") {
+      const decoded = decodeCodexJsStringLiteral(text, i);
+      if (decoded) i = decoded.end - 1;
+      continue;
+    }
+    const match = /^tools\.([A-Za-z0-9_]+)\s*\(/.exec(text.slice(i));
+    if (!match) continue;
+    const name = match[1];
+    const open = i + match[0].lastIndexOf("(");
+    let depth = 0;
+    let end = text.length;
+    for (let j = open; j < text.length; j++) {
+      if (text[j] === '"' || text[j] === "'" || text[j] === "`") {
+        const decoded = decodeCodexJsStringLiteral(text, j);
+        if (decoded) {
+          j = decoded.end - 1;
+          continue;
+        }
+      }
+      if (text[j] === "(") depth++;
+      else if (text[j] === ")" && --depth === 0) {
+        end = j;
+        break;
+      }
+    }
+    calls.push({ name, source: text.slice(open + 1, end) });
+    i = end;
+  }
+  return calls;
 }
 
 function codexPatchTextFromPayload(p) {
@@ -6040,11 +6153,74 @@ function codexPatchTextFromPayload(p) {
   ) || "";
 }
 
-function codexUnwrapActionPayload(payload) {
-  if (!payload || typeof payload !== "object") return payload;
+function codexPlanInputFromSource(source) {
+  const steps = codexJsPropertyStrings(source, "step");
+  const statuses = codexJsPropertyStrings(source, "status");
+  return {
+    todos: steps.map((step, index) => ({
+      content: step,
+      status: statuses[index] || "pending",
+      activeForm: "",
+    })),
+  };
+}
+
+function codexJsAssignedArrayStrings(source, variable) {
+  const text = String(source || "");
+  const escaped = String(variable).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = new RegExp("\\b(?:const|let|var)\\s+" + escaped + "\\s*=\\s*\\[").exec(text);
+  if (!match) return [];
+  const open = match.index + match[0].lastIndexOf("[");
+  let depth = 0;
+  for (let i = open; i < text.length; i++) {
+    if (text[i] === '"' || text[i] === "'" || text[i] === "`") {
+      const decoded = decodeCodexJsStringLiteral(text, i);
+      if (decoded) {
+        i = decoded.end - 1;
+        continue;
+      }
+    }
+    if (text[i] === "[") depth++;
+    else if (text[i] === "]" && --depth === 0) {
+      return codexJsStringLiterals(text.slice(open + 1, i));
+    }
+  }
+  return [];
+}
+
+function codexMappedExecInputs(source) {
+  const values = codexJsAssignedArrayStrings(source, "cmds");
+  if (!values.length) return [];
+  const paired = /\.map\s*\(\s*(?:async\s*)?\(\s*\[\s*cmd\s*,\s*workdir\s*\]/.test(source);
+  if (paired) {
+    const inputs = [];
+    for (let i = 0; i + 1 < values.length; i += 2) {
+      inputs.push({ command: values[i], workdir: values[i + 1] });
+    }
+    return inputs;
+  }
+  return values.map((command) => ({ command }));
+}
+
+function codexNestedToolInput(name, source, payload) {
+  if (name === "exec_command") {
+    return {
+      command: codexJsPropertyString(source, "cmd") || codexJsPropertyString(source, "command"),
+      workdir: codexJsPropertyString(source, "workdir"),
+    };
+  }
+  if (name === "apply_patch") return codexPatchTextFromPayload(payload);
+  if (name === "view_image") return { path: codexJsPropertyString(source, "path") };
+  if (name === "web__run") return { query: codexJsPropertyString(source, "q") };
+  if (name === "update_plan") return codexPlanInputFromSource(source);
+  return {};
+}
+
+function codexUnwrapActionPayloads(payload) {
+  if (!payload || typeof payload !== "object") return payload ? [payload] : [];
   const outerName = String(payload.name || payload.tool || "");
-  if (CODEX_CONTINUATION_TOOLS.has(outerName)) return null;
-  if (outerName !== "exec") return payload;
+  if (CODEX_CONTINUATION_TOOLS.has(outerName)) return [];
+  if (outerName !== "exec") return [payload];
 
   const source =
     typeof payload.input === "string"
@@ -6052,33 +6228,36 @@ function codexUnwrapActionPayload(payload) {
       : typeof payload.arguments === "string"
         ? payload.arguments
         : "";
-  const nestedNames = codexNestedToolNames(source);
-  if (!nestedNames.length) return payload;
-  if (nestedNames.every((name) => CODEX_CONTINUATION_TOOLS.has(name))) return null;
-
-  const name = nestedNames.find((candidate) => !CODEX_CONTINUATION_TOOLS.has(candidate));
-  if (!name) return null;
-  let input = {};
-  if (name === "exec_command") {
-    input = {
-      command: codexJsPropertyString(source, "cmd") || codexJsPropertyString(source, "command"),
-      workdir: codexJsPropertyString(source, "workdir"),
-    };
-  } else if (name === "apply_patch") {
-    input = codexPatchTextFromPayload(payload);
-  } else if (name === "view_image") {
-    input = { path: codexJsPropertyString(source, "path") };
-  } else if (name === "web__run") {
-    input = { query: codexJsPropertyString(source, "q") };
-  } else if (name === "update_plan") {
-    input = { todos: [] };
-  } else {
-    // Preserve only the discovered inner tool identity. Shipping the whole wrapper
-    // source as node input would leak arbitrary command/prompt text into metadata.
-    input = {};
+  const calls = codexNestedToolCalls(source).filter(
+    (call) => !CODEX_EXEC_OUTPUT_HELPERS.has(call.name) && !CODEX_CONTINUATION_TOOLS.has(call.name)
+  );
+  if (!calls.length) {
+    const direct = codexDecodedActionInput(payload);
+    return direct.command || direct.cmd ? [payload] : [];
   }
+  return calls.flatMap((call) => {
+    const input = codexNestedToolInput(call.name, call.source, payload);
+    if (call.name === "exec_command" && !input.command) {
+      const mapped = codexMappedExecInputs(source);
+      if (mapped.length) {
+        return mapped.map((mappedInput) => Object.assign({}, payload, {
+          name: call.name,
+          input: mappedInput,
+          arguments: undefined,
+        }));
+      }
+      return [];
+    }
+    return [Object.assign({}, payload, {
+      name: call.name,
+      input,
+      arguments: undefined,
+    })];
+  });
+}
 
-  return Object.assign({}, payload, { name, input, arguments: undefined });
+function codexUnwrapActionPayload(payload) {
+  return codexUnwrapActionPayloads(payload)[0] || null;
 }
 
 function codexCommandFromPayload(p) {
@@ -6612,10 +6791,18 @@ function liveCodexActions(output) {
     }
 
     if (type === "function_call" || type === "custom_tool_call") {
-      const detail = codexActionDetail(item);
-      if (detail) {
-        detailByUid.set(uid, detail);
-        order.push(uid);
+      const details = codexActionDetails(item);
+      const actionUids = [];
+      details.forEach((detail, detailIndex) => {
+        const actionUid = details.length > 1 ? `${uid}:${detailIndex}` : uid;
+        detailByUid.set(actionUid, detail);
+        order.push(actionUid);
+        actionUids.push(actionUid);
+      });
+      if (item.call_id && actionUids.length) {
+        // A combined outer exec result cannot be split safely by action. Attach it
+        // once to the first native node rather than duplicating it across siblings.
+        callIdToUid.set(item.call_id, actionUids[0]);
       }
       return;
     }
@@ -7212,15 +7399,16 @@ function codexSessionFiles() {
 // 40-file list (starving the WebSocket heartbeat) — this streams async so the socket
 // stays alive, and stops after a few KB for the common case.
 async function codexSummaryFromHead(file) {
-  let meta = null, topic = null, assistantTopic = null, messages = 0, sawResponseItem = false;
+  let meta = null, topic = null, assistantTopic = null, messages = 0;
   await readJsonl(file, (ev) => {
     if (ev.type === "session_meta") { meta = ev.payload || meta || {}; return; }
     if (ev.type !== "response_item" || !ev.payload) return;
-    sawResponseItem = true;
     if (ev.payload.type !== "message") return;
     const role = ev.payload.role;
     if (role !== "user" && role !== "assistant") return;
-    const text = codexText(ev.payload.content);
+    const raw = codexText(ev.payload.content);
+    const text = role === "user" ? codexUserMessageText(raw) : cleanMessageText(raw);
+    if (role === "assistant" && isContextMessage(raw)) return;
     if (!text) return;
     messages++;
     if (role === "user" && !topic) {
@@ -7232,7 +7420,6 @@ async function codexSummaryFromHead(file) {
     }
     if (topic && messages >= 2) return false; // enough to render the roster row
   }, CODEX_SUMMARY_HEAD_BYTES);
-  if (!messages && sawResponseItem) messages = 1;
   return { meta, topic: topic || assistantTopic || "Codex session", lastTs: null, messages };
 }
 
@@ -7244,7 +7431,9 @@ async function codexSummary(file, opts = {}) {
     else if (ev.type === "response_item" && ev.payload && ev.payload.type === "message") {
       const role = ev.payload.role;
       if (role !== "user" && role !== "assistant") return;
-      const text = codexText(ev.payload.content);
+      const raw = codexText(ev.payload.content);
+      const text = role === "user" ? codexUserMessageText(raw) : cleanMessageText(raw);
+      if (role === "assistant" && isContextMessage(raw)) return;
       if (!text) return;
       messages++;
       if (ev.timestamp) lastTs = ev.timestamp;
@@ -7345,14 +7534,14 @@ async function codexDetail(id, limit, before) {
     collectCodexEdits(pending, p); // apply_patch items accumulate into the turn
     if (p.type === "message" && (p.role === "user" || p.role === "assistant")) {
       const raw = codexText(p.content);
-      if (p.role === "user" && raw.trim()) {
+      const text = p.role === "user" ? codexUserMessageText(raw) : cleanMessageText(raw);
+      if (p.role === "user" && text) {
         flushTurn();                // seal prior turn's card + action feed
         turnStartTs = ev.timestamp || null;   // new turn opens at this prompt
       } else if (p.role === "assistant" && ev.timestamp) {
         turnEndTs = ev.timestamp;             // extend turn end to last assistant message
       }
-      const text = cleanMessageText(raw);
-      if (text && !isContextMessage(raw)) {
+      if (text && (p.role === "user" || !isContextMessage(raw))) {
         if (p.role === "user") {
           // User prompts stay their own right-side bubble (turn boundary).
           messages.push({ role: "user", text: clipText(text, 4000), ts: ev.timestamp, uid: dkey });
@@ -7380,11 +7569,16 @@ async function codexDetail(id, limit, before) {
       }
     } else if (p.type === "function_call" || p.type === "custom_tool_call") {
       // Collect the tool call for the current turn IN ORDER (output joins via call_id).
-      const detail = codexActionDetail(p);
-      if (detail) {
-        turnItems.push({ type: "tool", uid: dkey, ts: ev.timestamp });
-        actionDetailByUid.set(dkey, detail);
-        if (p.call_id) callIdToUid.set(p.call_id, dkey);
+      const details = codexActionDetails(p);
+      const actionUids = [];
+      details.forEach((detail, detailIndex) => {
+        const actionUid = details.length > 1 ? `${dkey}:${detailIndex}` : dkey;
+        turnItems.push({ type: "tool", uid: actionUid, ts: ev.timestamp });
+        actionDetailByUid.set(actionUid, detail);
+        actionUids.push(actionUid);
+      });
+      if (p.call_id && actionUids.length) {
+        callIdToUid.set(p.call_id, actionUids[0]);
       }
     } else if (p.type === "function_call_output" || p.type === "custom_tool_call_output") {
       const uid = p.call_id ? callIdToUid.get(p.call_id) : null;
@@ -11515,7 +11709,10 @@ module.exports = {
   collectClaudeEdits,
   collectCodexEdits,
   codexActionDetail,
+  codexActionDetails,
   codexUnwrapActionPayload,
+  codexUnwrapActionPayloads,
+  codexUserMessageText,
   parseApplyPatchEnvelope,
   newRuntimeAccumulator,
   ensureRuntimeKey,

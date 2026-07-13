@@ -161,7 +161,9 @@ orchestration through a wrapper that is **not** the real user-facing action:
 ```
 
 For `custom_tool_call.name == "exec"`, parse the generated input **without eval**
-and classify the nested `tools.<name>(…)` call:
+and classify **every** nested `tools.<name>(…)` call. A single envelope can contain
+`update_plan` followed by one command, a `Promise.all` with several commands, or a
+mapped command array; taking only the first nested call silently drops the rest.
 
 | nested tool | render as |
 |---|---|
@@ -169,6 +171,7 @@ and classify the nested `tools.<name>(…)` call:
 | `apply_patch` | Edit with file and `+N −M` metadata |
 | `view_image` | Read/inspect the image filename |
 | `update_plan` | Planning |
+| `spawn_agent` / `send_message` | Task / subagent activity |
 | MCP/web/image tools | Their nested tool identity, never the outer `exec` |
 | `write_stdin` | suppress (continuation of an existing command) |
 
@@ -177,6 +180,13 @@ same reason. These continuation frames do not represent new work; showing them
 creates the repeated raw `exec` / `wait` rows seen in the iOS History surface.
 Direct persistence `function_call` / `custom_tool_call` records that are not
 wrappers still use their own `name` and decoded arguments.
+
+Codex IDE user messages may also be wrapped as `# Context from my IDE setup` plus
+`## My request for Codex:`. History must extract the request section before applying
+context filtering, strip attachment wrappers such as `<image …></image>` / `[Image #1]`,
+and ignore injected `AGENTS.md` / plugin-list / bridge-startup records. The extracted
+user prompt is the history title and the visible user bubble; assistant commentary is
+only a fallback when a rollout has no real user prompt.
 
 ---
 

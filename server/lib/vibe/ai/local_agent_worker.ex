@@ -4499,7 +4499,6 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp upsert_progress_node(nodes, _node), do: nodes
 
   defp interleaved_codex_progress_nodes(decoded, tool_events, summary_text) do
-    tool_by_id = Map.new(tool_events, fn ev -> {ev["id"], ev} end)
     summary_norm = summary_text |> to_string() |> String.trim()
 
     {nodes, used, _text_index, _thinking_count} =
@@ -4552,19 +4551,33 @@ defmodule Vibe.AI.LocalAgentWorker do
 
               true ->
                 id = codex_tool_event_id(event, item, index)
+                # One persisted outer `exec` may fan out to `id:0`, `id:1`, ….
+                # Reinsert all siblings at the original event position so plan +
+                # commands do not drift to the end of the Worked card.
+                matching =
+                  tool_events
+                  |> Enum.filter(fn tool_event ->
+                    tool_id = to_string(tool_event["id"] || "")
+                    tool_id == id or String.starts_with?(tool_id, id <> ":")
+                  end)
 
-                case Map.get(tool_by_id, id) do
-                  nil ->
-                    {nodes, used, text_index, thinking_count}
+                Enum.reduce(matching, {nodes, used, text_index, thinking_count}, fn
+                  tool_event, {inner_nodes, inner_used, inner_text_index, inner_thinking_count} ->
+                    tool_id = tool_event["id"]
 
-                  tool_event ->
-                    if MapSet.member?(used, id) do
-                      {nodes, used, text_index, thinking_count}
+                    if MapSet.member?(inner_used, tool_id) do
+                      {inner_nodes, inner_used, inner_text_index, inner_thinking_count}
                     else
-                      node = tool_event_to_node(tool_event, length(nodes))
-                      {[node | nodes], MapSet.put(used, id), text_index, thinking_count}
+                      node = tool_event_to_node(tool_event, length(inner_nodes))
+
+                      {
+                        [node | inner_nodes],
+                        MapSet.put(inner_used, tool_id),
+                        inner_text_index,
+                        inner_thinking_count
+                      }
                     end
-                end
+                end)
             end
 
           true ->
@@ -5114,6 +5127,7 @@ defmodule Vibe.AI.LocalAgentWorker do
             true ->
               case codex_tool_event(event, item, type, index) do
                 nil -> []
+                tool_events when is_list(tool_events) -> tool_events
                 tool_event -> [tool_event]
               end
           end
@@ -5209,20 +5223,49 @@ defmodule Vibe.AI.LocalAgentWorker do
       :ignore ->
         nil
 
+      {:many, fields} ->
+        base_id = codex_tool_event_id(event, item, index)
+
+        fields
+        |> Enum.with_index()
+        |> Enum.map(fn {{tool, input, output}, action_index} ->
+          codex_tool_event_from_fields(
+            event,
+            item,
+            type,
+            "#{base_id}:#{action_index}",
+            tool,
+            input,
+            output
+          )
+        end)
+
       {tool, input, output} ->
-        %{
-          "id" => codex_tool_event_id(event, item, index),
-          "provider" => "codex",
-          "tool" => tool,
-          "label" => tool_label("Codex", tool, input),
-          "status" => codex_item_status(event, item),
-          "input" => safe_payload(input),
-          "outputPreview" => safe_text(output),
-          "providerEventType" => normalize_string(event["type"]) || type
-        }
-        |> put_node_shape(tool, input)
-        |> codex_apply_file_change_shape(type, item)
+        codex_tool_event_from_fields(
+          event,
+          item,
+          type,
+          codex_tool_event_id(event, item, index),
+          tool,
+          input,
+          output
+        )
     end
+  end
+
+  defp codex_tool_event_from_fields(event, item, type, id, tool, input, output) do
+    %{
+      "id" => id,
+      "provider" => "codex",
+      "tool" => tool,
+      "label" => tool_label("Codex", tool, input),
+      "status" => codex_item_status(event, item),
+      "input" => safe_payload(input),
+      "outputPreview" => safe_text(output),
+      "providerEventType" => normalize_string(event["type"]) || type
+    }
+    |> put_node_shape(tool, input)
+    |> codex_apply_file_change_shape(type, item)
   end
 
   defp codex_error_tool_event(event, index) do
@@ -5356,6 +5399,8 @@ defmodule Vibe.AI.LocalAgentWorker do
   # the shell classifier so `cat`/`rg`/`sed` read like Claude's Read/Grep; everything
   # else keeps its name-based mapping (apply_patch → Edit, view_image → ViewImage, …).
   defp codex_function_fields(name, input) do
+    input = codex_normalize_function_input(name, input)
+
     if codex_shell_tool_name?(name) do
       {tool, shell_input} = codex_shell_tool(codex_command_string(input))
       {tool, shell_input, nil}
@@ -5365,9 +5410,18 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   defp codex_function_fields_from_raw(name, raw) do
-    case codex_unwrap_function_payload(name, raw) do
-      :ignore -> :ignore
-      {inner_name, input} -> codex_function_fields(inner_name, input)
+    case codex_unwrap_function_payloads(name, raw) do
+      [] ->
+        :ignore
+
+      [{inner_name, input}] ->
+        codex_function_fields(inner_name, input)
+
+      actions ->
+        {:many,
+         Enum.map(actions, fn {inner_name, input} ->
+           codex_function_fields(inner_name, input)
+         end)}
     end
   end
 
@@ -5403,7 +5457,7 @@ defmodule Vibe.AI.LocalAgentWorker do
   @codex_search_cmds ~w(rg grep egrep fgrep ag ack ripgrep)
   @codex_shell_tool_names ~w(exec exec_command shell local_shell container.exec bash run_command)
   @codex_exec_output_helpers ~w(text image generatedImage store load notify yield_control)
-  @codex_continuation_tools ~w(wait write_stdin)
+  @codex_continuation_tools ~w(wait write_stdin wait_agent list_agents)
 
   defp codex_shell_tool(command) do
     cmd = command |> to_string() |> String.replace(~r/\s+/, " ") |> String.trim()
@@ -5564,38 +5618,135 @@ defmodule Vibe.AI.LocalAgentWorker do
   # Recognize that narrow shape without eval/Code.eval_string; History data must
   # remain inert. `wait`/`write_stdin` only continue an existing command and should
   # not become duplicate visible progress nodes.
-  defp codex_unwrap_function_payload(name, raw) do
+  defp codex_unwrap_function_payloads(name, raw) do
     cond do
       name in @codex_continuation_tools ->
-        :ignore
+        []
 
       name != "exec" or not is_binary(raw) ->
-        {name, codex_decode_arguments(raw)}
+        [{name, codex_decode_arguments(raw)}]
 
       true ->
-        nested_names = codex_nested_tool_names(raw)
-
         actionable =
-          Enum.reject(nested_names, fn nested -> nested in @codex_exec_output_helpers end)
+          raw
+          |> codex_nested_tool_calls()
+          |> Enum.reject(fn {nested, _segment} ->
+            nested in @codex_exec_output_helpers or nested in @codex_continuation_tools
+          end)
 
         cond do
           actionable == [] ->
-            {name, codex_decode_arguments(raw)}
-
-          Enum.all?(actionable, &(&1 in @codex_continuation_tools)) ->
-            :ignore
+            direct = codex_decode_arguments(raw)
+            if codex_command_string(direct), do: [{name, direct}], else: []
 
           true ->
-            inner_name = Enum.find(actionable, &(&1 not in @codex_continuation_tools))
-            {inner_name, codex_nested_tool_input(inner_name, raw)}
+            Enum.map(actionable, fn {inner_name, segment} ->
+              {inner_name, codex_nested_tool_input(inner_name, segment)}
+            end)
         end
     end
   end
 
-  defp codex_nested_tool_names(source) do
-    ~r/\btools\.([A-Za-z0-9_]+)\s*\(/
-    |> Regex.scan(source, capture: :all_but_first)
-    |> Enum.map(&List.first/1)
+  defp codex_nested_tool_calls(source) do
+    codex_scan_nested_tool_calls(source, 0, []) |> Enum.reverse()
+  end
+
+  defp codex_scan_nested_tool_calls(source, index, acc) when index >= byte_size(source),
+    do: acc
+
+  defp codex_scan_nested_tool_calls(source, index, acc) do
+    byte = :binary.at(source, index)
+
+    cond do
+      byte in [?", ?', ?`] ->
+        codex_scan_nested_tool_calls(source, codex_skip_js_string(source, index, byte), acc)
+
+      codex_binary_starts_at?(source, index, "tools.") ->
+        name_start = index + byte_size("tools.")
+        name_end = codex_identifier_end(source, name_start)
+        open_index = codex_skip_ascii_space(source, name_end)
+
+        if name_end > name_start and open_index < byte_size(source) and
+             :binary.at(source, open_index) == ?( do
+          call_end = codex_balanced_call_end(source, open_index, 0)
+          name = binary_part(source, name_start, name_end - name_start)
+          segment = binary_part(source, index, max(0, call_end - index))
+          codex_scan_nested_tool_calls(source, call_end, [{name, segment} | acc])
+        else
+          codex_scan_nested_tool_calls(source, index + 1, acc)
+        end
+
+      true ->
+        codex_scan_nested_tool_calls(source, index + 1, acc)
+    end
+  end
+
+  defp codex_skip_js_string(source, index, quote) do
+    next = index + 1
+
+    cond do
+      next >= byte_size(source) ->
+        byte_size(source)
+
+      :binary.at(source, next) == ?\\ ->
+        codex_skip_js_string(source, min(next + 1, byte_size(source) - 1), quote)
+
+      :binary.at(source, next) == quote ->
+        next + 1
+
+      true ->
+        codex_skip_js_string(source, next, quote)
+    end
+  end
+
+  defp codex_identifier_end(source, index) when index >= byte_size(source), do: index
+
+  defp codex_identifier_end(source, index) do
+    byte = :binary.at(source, index)
+
+    if (byte >= ?a and byte <= ?z) or (byte >= ?A and byte <= ?Z) or
+         (byte >= ?0 and byte <= ?9) or byte == ?_ do
+      codex_identifier_end(source, index + 1)
+    else
+      index
+    end
+  end
+
+  defp codex_skip_ascii_space(source, index) when index >= byte_size(source), do: index
+
+  defp codex_skip_ascii_space(source, index) do
+    if :binary.at(source, index) in [32, 9, 10, 13],
+      do: codex_skip_ascii_space(source, index + 1),
+      else: index
+  end
+
+  defp codex_balanced_call_end(source, index, _depth) when index >= byte_size(source),
+    do: byte_size(source)
+
+  defp codex_balanced_call_end(source, index, depth) do
+    byte = :binary.at(source, index)
+
+    cond do
+      byte in [?", ?', ?`] ->
+        codex_balanced_call_end(source, codex_skip_js_string(source, index, byte), depth)
+
+      byte == ?( ->
+        codex_balanced_call_end(source, index + 1, depth + 1)
+
+      byte == ?) and depth == 1 ->
+        index + 1
+
+      byte == ?) ->
+        codex_balanced_call_end(source, index + 1, depth - 1)
+
+      true ->
+        codex_balanced_call_end(source, index + 1, depth)
+    end
+  end
+
+  defp codex_binary_starts_at?(source, index, prefix) do
+    length = byte_size(prefix)
+    index + length <= byte_size(source) and binary_part(source, index, length) == prefix
   end
 
   defp codex_nested_tool_input("exec_command", source) do
@@ -5622,17 +5773,52 @@ defmodule Vibe.AI.LocalAgentWorker do
     %{} |> maybe_put("query", codex_js_property_string(source, "q"))
   end
 
-  defp codex_nested_tool_input("update_plan", _source), do: %{"todos" => []}
+  defp codex_nested_tool_input("update_plan", source) do
+    steps = codex_js_property_strings(source, "step")
+    statuses = codex_js_property_strings(source, "status")
+
+    todos =
+      steps
+      |> Enum.with_index()
+      |> Enum.map(fn {step, index} ->
+        %{
+          "content" => step,
+          "status" => Enum.at(statuses, index) || "pending",
+          "activeForm" => ""
+        }
+      end)
+
+    %{"todos" => todos}
+  end
+
   defp codex_nested_tool_input(_name, _source), do: %{}
 
   defp codex_js_property_string(source, key) do
     escaped_key = Regex.escape(key)
-    regex = Regex.compile!("\\b#{escaped_key}\\s*:\\s*(\"(?:\\\\.|[^\"\\\\])*\")", "s")
+
+    regex =
+      Regex.compile!(
+        "(?:\\b#{escaped_key}\\b|[\"']#{escaped_key}[\"'])\\s*:\\s*(\"(?:\\\\.|[^\"\\\\])*\")",
+        "s"
+      )
 
     case Regex.run(regex, source, capture: :all_but_first) do
       [literal] -> codex_decode_js_double_quoted(literal)
       _ -> nil
     end
+  end
+
+  defp codex_js_property_strings(source, key) do
+    escaped_key = Regex.escape(key)
+
+    Regex.compile!(
+      "(?:\\b#{escaped_key}\\b|[\"']#{escaped_key}[\"'])\\s*:\\s*(\"(?:\\\\.|[^\"\\\\])*\")",
+      "s"
+    )
+    |> Regex.scan(source, capture: :all_but_first)
+    |> Enum.map(&List.first/1)
+    |> Enum.map(&codex_decode_js_double_quoted/1)
+    |> Enum.reject(&is_nil/1)
   end
 
   defp codex_patch_text_from_source(source) do
@@ -5686,8 +5872,61 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp codex_function_tool_name("apply_patch", _input), do: "Edit"
   defp codex_function_tool_name("view_image", _input), do: "Read"
   defp codex_function_tool_name("update_plan", _input), do: "TodoWrite"
+
+  defp codex_function_tool_name(name, _input)
+       when name in ["spawn_agent", "spawn_subagent", "delegate_to_subagent"],
+       do: "Task"
+
+  defp codex_function_tool_name(name, _input)
+       when name in ["send_message", "followup_task"],
+       do: "Task"
+
   defp codex_function_tool_name("web__run", _input), do: "WebSearch"
   defp codex_function_tool_name(name, _input), do: name
+
+  defp codex_normalize_function_input("update_plan", input) when is_map(input) do
+    raw = input["todos"] || input["plan"] || input["items"] || []
+
+    todos =
+      if is_list(raw) do
+        Enum.map(raw, fn item ->
+          %{
+            "content" => to_string(item["content"] || item["step"] || ""),
+            "status" => to_string(item["status"] || "pending"),
+            "activeForm" => to_string(item["activeForm"] || "")
+          }
+        end)
+      else
+        []
+      end
+
+    Map.put(input, "todos", todos)
+  end
+
+  defp codex_normalize_function_input(name, input)
+       when name in ["spawn_agent", "spawn_subagent", "delegate_to_subagent"] and
+              is_map(input) do
+    task_name =
+      input["task_name"] || input["name"] || input["subagent_type"] || "subagent"
+
+    input
+    |> Map.put("description", to_string(task_name))
+    |> Map.put("subagent_type", to_string(task_name))
+  end
+
+  defp codex_normalize_function_input(name, input)
+       when name in ["send_message", "followup_task"] and is_map(input) do
+    target = input["target"] || input["task_name"] || "subagent"
+
+    input
+    |> Map.put(
+      "description",
+      "Message #{to_string(target) |> String.replace_prefix("/root/", "")}"
+    )
+    |> Map.put("subagent_type", to_string(target) |> String.replace_prefix("/root/", ""))
+  end
+
+  defp codex_normalize_function_input(_name, input), do: input
 
   defp apply_patch_envelope?(value) when is_binary(value) do
     String.contains?(value, "*** Begin Patch") and String.contains?(value, "*** End Patch")
