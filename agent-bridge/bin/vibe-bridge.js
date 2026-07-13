@@ -143,6 +143,39 @@ the Implementation Standard above wins and this section does not apply.
 - Finish your entire assigned file list. If you cannot, list exactly what is missing and
   why in the handoff — never silently stop early.
 
+## Premium UI/UX Production Standard (websites & app frontends)
+
+The default "AI-generated" look is unacceptable. When the task is a website, landing
+page, marketing site, dashboard, or any user-facing frontend, the result must read as a
+hand-crafted, premium product (think Linear, Vercel, Stripe, OpenAI, Anthropic,
+ElevenLabs) — NOT a template. For any UI/frontend/website slice, READ
+\`.vibe/instructions/skills/premium-web-ui.md\` before writing components and follow it.
+
+Non-negotiables:
+- No generic scaffold: never ship the "big centered hero + three equal feature cards +
+  generic footer" template. Design an intentional layout with a clear focal hierarchy,
+  purposeful asymmetry, and real sections that serve the product's actual story.
+- Real content and copy: no lorem ipsum, no "Feature one / Feature two", no dead
+  buttons. Every nav item, link, and CTA resolves to a real destination.
+- A signature visual element: at least one crafted moment — a WebGL/shader/canvas hero,
+  a Spline or three.js/R3F scene, an animated gradient/grain field, or a bespoke SVG
+  system — so the page has a point of view. Use GSAP + ScrollTrigger for motion; keep it
+  tasteful and 60fps. Honor prefers-reduced-motion.
+- Design tokens and rhythm: define a type scale, spacing scale, color system (with dark
+  mode), and radius/shadow tokens up front and use them everywhere — no arbitrary
+  per-component pixel values.
+- Header and footer must earn their place: real navigation and a real footer (site map,
+  legal, social), never a lone "© 2026" line.
+- Responsive and accessible: mobile-first, correct 320px→ultrawide; semantic HTML,
+  visible keyboard focus, alt text, AA contrast.
+- Performance: optimized/lazy images, subset/preloaded fonts, no layout shift, GPU-
+  friendly motion.
+
+Team routing: the model strongest at UI (Gemini/Agy, then Grok) owns the visual
+components and page layout — WITH an exact file list — while a runtime-strong model
+(Codex/Claude) owns architecture, data, and integration. The lead attaches this standard
+to every UI-owning worker's focus.
+
 ## Supervisor Team Runs (lead duties)
 
 When you are the LEAD of a team run whose task is real build work:
@@ -192,6 +225,142 @@ Follow AGENTS.md first. These additions are specific to Codex.
 - When paired with Claude, read Claude's handoff before editing and take the next non-overlapping implementation slice.
 - Keep command output and patch summaries structured enough for Vibe to render progress, files changed, and verification.
 - If a command or edit is risky, stop and ask for explicit approval through Vibe.
+`,
+  "skills/premium-web-ui.md": `# Skill: Premium Web UI/UX Production
+
+Purpose: build websites and app frontends that read as hand-crafted, premium products —
+the caliber of Linear, Vercel, Stripe, OpenAI, Anthropic, ElevenLabs — and never as an
+AI-generated template. Read this before writing any UI/frontend/website slice; AGENTS.md
+"Premium UI/UX Production Standard" is the summary, this is the working reference.
+
+## 1. Kill the "AI look" (the most common failure)
+
+These are instant tells that a page was generated, not designed. Do not ship them:
+
+- The scaffold: full-width centered hero headline + subhead + two buttons, then a row of
+  three identical feature cards, then a thin generic footer. This is the #1 tell. Replace
+  with an intentional composition: a distinct hero treatment, sections of varying rhythm
+  and width, editorial asymmetry, and a real narrative order (problem -> product ->
+  proof -> deeper capability -> call to action).
+- Placeholder everything: lorem ipsum, "Feature one/two/three", emoji-as-icon, dead
+  "#" links, buttons that do nothing. Write real product copy and wire every control.
+- Flat sameness: one font size for everything, even 16px gray text, evenly spaced boxes,
+  no depth, no motion. Premium pages have a strong type scale, deliberate whitespace, and
+  a few crafted moments of depth and movement.
+- Default component-library skins left untouched (raw Bootstrap/MUI). Theme them into a
+  bespoke system with your own tokens.
+
+## 2. Design system first (tokens before components)
+
+Define these once, use them everywhere. No arbitrary per-component pixel values.
+
+- Type scale: a modular scale (e.g. 1.25 ratio) with 5-7 steps; one display face for
+  headings, one clean face for body; set tracking/leading intentionally on large type.
+- Spacing scale: 4px base (4/8/12/16/24/32/48/64/96/128); layout rhythm comes from it.
+- Color system: a real palette with semantic tokens (bg, surface, text, muted, accent,
+  border) and a full dark mode. Prefer OKLCH for consistent perceived brightness.
+- Radius + shadow + border tokens; elevation as a small ladder, not random blurs.
+- Motion tokens: standard durations (120/200/320/500ms) and easings (a signature ease).
+
+Implement as CSS custom properties or a Tailwind theme; expose dark mode via
+prefers-color-scheme AND a manual toggle.
+
+## 3. A signature visual element (give the page a point of view)
+
+At least one crafted, memorable moment. Pick what fits the brand; do not overdo it:
+
+- WebGL / shaders: a GLSL fragment-shader gradient/grain/aurora hero, or a three.js /
+  React Three Fiber scene (particles, displaced mesh, product model). Lazy-load it,
+  cap DPR, pause when offscreen, and always ship a static fallback.
+- Spline: fastest path to a premium interactive 3D hero — embed a Spline scene and drive
+  camera/state on scroll. Good when you want 3D without hand-writing shaders.
+- Canvas 2D / SVG: animated line systems, morphing blobs, generative patterns — cheaper
+  than WebGL and often enough.
+- Motion: GSAP is the standard. Use ScrollTrigger for scroll-linked reveals, pinning,
+  and scrubbed sequences; SplitText for headline reveals; Flip for layout transitions.
+
+GSAP patterns (register once, respect reduced motion):
+
+    import gsap from "gsap";
+    import { ScrollTrigger } from "gsap/ScrollTrigger";
+    gsap.registerPlugin(ScrollTrigger);
+
+    // Reveal-on-scroll (batched, performant)
+    ScrollTrigger.batch("[data-reveal]", {
+      start: "top 85%",
+      onEnter: (els) =>
+        gsap.to(els, { y: 0, opacity: 1, duration: 0.6, stagger: 0.08,
+          ease: "power3.out", overwrite: true }),
+    });
+
+    // Pinned, scrubbed section
+    gsap.timeline({ scrollTrigger: {
+      trigger: ".panel", start: "top top", end: "+=1200", scrub: true, pin: true }})
+      .from(".panel__art", { scale: 1.15, opacity: 0 })
+      .from(".panel__copy", { y: 40, opacity: 0 }, "<0.1");
+
+Wrap all of it so it no-ops under prefers-reduced-motion:
+
+    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (!reduce) { /* run animations */ }
+
+## 4. Layout and composition
+
+- Establish a real grid (12-col or a custom track grid); vary section widths — full-bleed,
+  contained, and narrow reading measure (~65ch for prose).
+- Strong focal hierarchy per section: one clear primary element, supporting elements
+  subordinate. Use scale, weight, and color, not just position.
+- Generous, uneven whitespace. Align to the spacing scale.
+- Real header: logo, primary nav, secondary action, mobile menu that actually works and
+  traps focus. Real footer: grouped site map, legal, social, newsletter — earn the space.
+
+## 5. Component architecture
+
+- Componentize by real UI unit; keep components pure and prop-driven; colocate styles.
+- No magic values — read tokens. One source of truth for spacing/color/type.
+- Server components / static generation where the framework supports it (Next.js App
+  Router, Astro, SvelteKit); ship minimal client JS; hydrate only the interactive islands.
+- Accessibility is part of "done": semantic landmarks, labelled controls, visible focus
+  rings, alt text, AA contrast, keyboard paths for every interaction.
+
+## 6. Content and copy
+
+- Write concrete, confident product copy — what it is, who it's for, why it's better.
+- Real names, real numbers, real testimonials-shaped content (clearly illustrative if the
+  product is new). Never dead filler.
+- Every CTA states a real next step and links to a real route.
+
+## 7. Performance budget
+
+- Images: modern formats, correct sizes, lazy below the fold, no CLS (set dimensions).
+- Fonts: subset, preload the display face, font-display: swap.
+- WebGL/3D: dynamic-import, cap devicePixelRatio (<= 2), pause rAF when tab/section
+  hidden, dispose on unmount, static poster fallback.
+- Target: fast LCP, no long tasks from animation, smooth 60fps scroll.
+
+## 8. Recommended stack
+
+- Framework: Next.js (App Router) or Astro for content sites; SvelteKit is great too.
+- Styling: Tailwind with a bespoke theme, or CSS Modules + custom properties.
+- Motion: GSAP (+ ScrollTrigger, SplitText, Flip). Framer Motion for React micro-interactions.
+- 3D: React Three Fiber + drei, or Spline for authored scenes; raw three.js for custom shaders.
+- Smooth scroll: Lenis (modern) over heavier libs.
+
+## 9. Deeper skill packs (optional, for richer patterns)
+
+These GitHub Agent-Skill packs encode best-practice patterns for the tools above and can
+be installed into a Claude Code environment for auto-activation. Reference them for
+correct APIs; you do not need them to satisfy this standard:
+
+- greensock/gsap-skills — official GSAP skills (core, timeline, ScrollTrigger, plugins).
+- freshtechbro/claudedesignskills — Three.js/WebGL, R3F, Spline, Rive, Lenis/Locomotive.
+- dgreenheck/webgpu-claude-skill — WebGPU + three.js TSL shaders.
+
+## Definition of done for a UI slice
+
+Intentional layout (not the scaffold) · design tokens used throughout · at least one
+signature crafted moment · real copy and wired links · responsive 320px→wide · a11y pass
+· dark mode · performance budget met · build passes.
 `,
 };
 
@@ -452,6 +621,8 @@ function ensureBridgeInstructionFiles(repo) {
 
     for (const [name, content] of Object.entries(BRIDGE_INSTRUCTION_FILES)) {
       const absolutePath = path.join(dir, name);
+      // `name` may carry a subpath (e.g. "skills/premium-web-ui.md") — ensure its parent.
+      fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
       if (!fs.existsSync(absolutePath) || fs.readFileSync(absolutePath, "utf8") !== content) {
         fs.writeFileSync(absolutePath, content, "utf8");
       }

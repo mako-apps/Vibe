@@ -10258,6 +10258,66 @@ final class ChatEngine {
     )
   }
 
+  /// When `row` is a live supervisor team LEAD row — the single group cell that folds
+  /// every under-hood worker's status — return its teamRunId; otherwise nil. The lead
+  /// row is `stream-…` keyed like any other live turn, but it represents a long-lived,
+  /// server-durable run (teamWorkersStatus lives in ETS + the TeamRun DB row). It must
+  /// therefore be exempt from the socket-reset wipe: backgrounding the app mid-run and
+  /// returning was blanking the group cell and — because the row-id pin kept pointing at
+  /// the dropped row — resetting its streaming text to the next partial frame.
+  private func supervisorTeamRunIdForRowLocked(_ row: [String: Any]) -> String? {
+    guard let message = row["message"] as? [String: Any],
+      let metadata = message["metadata"] as? [String: Any]
+    else { return nil }
+    let runtime = (metadata["agentRuntime"] as? [String: Any]) ?? [:]
+    guard let teamRunId = normalizedString(runtime["teamRunId"] ?? runtime["team_run_id"]),
+      !teamRunId.isEmpty
+    else { return nil }
+    let teamMode = (normalizedString(runtime["teamMode"] ?? runtime["team_mode"]) ?? "").lowercased()
+    let isSupervisor = teamMode == "supervisor" || teamMode == "group_supervisor"
+    let hasWorkerStatus =
+      ((metadata["teamWorkersStatus"] as? [[String: Any]])?.isEmpty == false)
+      || ((runtime["teamWorkersStatus"] as? [[String: Any]])?.isEmpty == false)
+    return (isSupervisor || hasWorkerStatus) ? teamRunId : nil
+  }
+
+  /// True when a NON-streaming (settled) card for `teamRunId` already exists in this
+  /// chat's live or history rows — i.e. the run finished, possibly while the app was
+  /// backgrounded. In that case the live lead row is stale and must NOT be preserved
+  /// across a socket reset, or it lingers as a ghost "working" cell beside the final
+  /// summary card.
+  private func hasFinishedTeamCardLocked(chatId: String, teamRunId: String) -> Bool {
+    guard !teamRunId.isEmpty else { return false }
+    func finishedForRun(_ message: [String: Any]) -> Bool {
+      guard let metadata = message["metadata"] as? [String: Any] else { return false }
+      let runtime = (metadata["agentRuntime"] as? [String: Any]) ?? [:]
+      guard normalizedString(runtime["teamRunId"] ?? runtime["team_run_id"]) == teamRunId
+      else { return false }
+      if let id = normalizedString(message["id"]),
+        id.hasPrefix("stream-") || id.hasPrefix("lan-")
+      {
+        return false
+      }
+      let streaming =
+        (message["isStreaming"] as? Bool) == true
+        || (metadata["isStreaming"] as? Bool) == true
+      return !streaming
+    }
+    if let perChat = liveMessageRowsByChat[chatId] {
+      for (_, row) in perChat {
+        if let message = row["message"] as? [String: Any], finishedForRun(message) {
+          return true
+        }
+      }
+    }
+    for row in historyRowsByChat[chatId] ?? [] {
+      if let message = row["message"] as? [String: Any], finishedForRun(message) {
+        return true
+      }
+    }
+    return false
+  }
+
   private func clearSocketResetLiveRowsLocked() {
     // [EmptyTrace] This ONLY runs on a socket reset. The user's hypothesis is the list jumps
     // to empty WITHOUT a drop — so if this line is ABSENT from the log at the empty moment,
@@ -10280,7 +10340,22 @@ final class ChatEngine {
       var kept: [String: [String: Any]] = [:]
       for (rowMessageId, row) in perChat {
         // Agent stream fragments are transient by design — always drop on reset.
-        if rowMessageId.hasPrefix("stream-") { continue }
+        if rowMessageId.hasPrefix("stream-") {
+          // Exception: a supervisor team LEAD row is a long-lived, server-durable run,
+          // not a throwaway fragment. Backgrounding + returning must not blank the group
+          // cell (and, via the stale row-id pin, reset its streaming text). Keep it —
+          // unless the run has already settled (a finished card for the same teamRunId
+          // exists), in which case dropping it avoids a ghost "working" cell.
+          if let teamRunId = supervisorTeamRunIdForRowLocked(row),
+            !hasFinishedTeamCardLocked(chatId: chatId, teamRunId: teamRunId)
+          {
+            kept[rowMessageId] = row
+            VibeDebugLog.log(
+              "[FirstMsg] socketReset preserving team lead row chatId=%@ run=%@",
+              String(chatId.prefix(12)), String(teamRunId.prefix(8)))
+          }
+          continue
+        }
         if historyIds.contains(rowMessageId) { continue }
         kept[rowMessageId] = row
       }
