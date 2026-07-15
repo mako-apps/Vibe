@@ -927,17 +927,24 @@ defmodule Vibe.AI.LocalAgentWorker do
   def pick_supervisor_lead(_), do: nil
 
   @doc """
-  Cheap, repo-agnostic pre-classification of a `@team` request, run BEFORE any
-  provider turn.
+  Cheap, repo-agnostic gate on a `@team` request, run BEFORE any provider turn.
 
-  Three classes:
+  It answers ONE question only — *is this even a work order?* — and never tries to
+  guess the SIZE of the work with keyword heuristics. Sizing (one agent vs a
+  fanned-out team) is a judgement about whether the task decomposes, and the model
+  that will do the work makes that call: a work order is handed to the team lead +
+  advisor, which read the request and decide solo (the lead owns it) vs a team plan.
+  (Per the user: the advisor/model knows whether a task is multi-part — let it route
+  to one or many, instead of a brittle regex that mis-routed short multi-part asks to
+  a lone worker.)
+
+  Two classes:
 
     * `:chat`    — the user is TALKING, not commissioning work ("can you see this
                    image?", "what does this do?"). Answered by ONE worker running
                    with writes HARD-STRIPPED (bridge maps team role `chat` →
                    `read_only` work mode). No files are touched, ever.
-    * `:simple`  — real work one agent handles → ONE visible worker (1 turn).
-    * `:complex` — decomposes into slices → lead orchestrator + workers.
+    * `:complex` — a real work order → team lead + advisor decide solo vs team.
 
   The fail-safe direction is `:chat`. Getting this wrong toward work is the
   expensive error: a question misread as work made a worker read AGENTS.md, patch
@@ -945,28 +952,9 @@ defmodule Vibe.AI.LocalAgentWorker do
   A question misread as chat only costs one cheap read-only turn. So work must be
   POSITIVELY signalled (an actual work verb); absent that we chat.
   """
-  @spec classify_team_request(any()) :: :chat | :simple | :complex
+  @spec classify_team_request(any()) :: :chat | :complex
   def classify_team_request(text) when is_binary(text) do
     t = text |> String.trim() |> String.downcase()
-    words = t |> String.split(~r/\s+/, trim: true) |> length()
-
-    # A "build me a whole <thing>" request almost always decomposes into
-    # frontend/backend/schema slices → a real team.
-    build_new_project? =
-      Regex.match?(
-        ~r/\b(build|create|make|scaffold|design|develop|implement)\b[^.!?]*\b(app|application|web ?site|web ?app|platform|dashboard|landing ?page|frontend|front-end|back-?end|full[- ]?stack|saas|marketplace|clone|portal|storefront|e-?commerce|game|website)\b/,
-        t
-      )
-
-    # Explicit multi-component asks (repo-agnostic phrasing only — no per-project
-    # vocabulary, per the Vibe-core hard rule).
-    multi_component? =
-      Regex.match?(
-        ~r/\b(and also|as well as|end[- ]to[- ]end|multiple (pages|screens|features|endpoints|components)|several (pages|screens|features)|each (page|screen|section|feature)|frontend and backend|api and ui|with (a )?(backend|database|auth|login|payments?|dashboard))\b/,
-        t
-      )
-
-    clause_count = t |> String.split(~r/\b(and|then|plus|also)\b/) |> length()
 
     cond do
       # Conversation wins over everything: an explain/inspect opener is never a
@@ -975,10 +963,8 @@ defmodule Vibe.AI.LocalAgentWorker do
       conversational_request?(t) -> :chat
       # No work verb anywhere → the user is not asking for a change. Chat.
       not work_request?(t) -> :chat
-      build_new_project? -> :complex
-      multi_component? -> :complex
-      words >= 80 and clause_count >= 4 -> :complex
-      true -> :simple
+      # A real work order — hand the size decision to the lead + advisor.
+      true -> :complex
     end
   end
 
