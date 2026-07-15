@@ -41,6 +41,7 @@ defmodule Vibe.AI.TeamRunMonitor do
   @run_retry_budget 3
   @queue_age_cap_ms 30 * 60_000
   @idle_shutdown_ms 90 * 60_000
+  @contract_freeze_timeout_ms 180_000
 
   # ── Public API (all fire-and-forget; failures must never break dispatch) ──
 
@@ -105,8 +106,7 @@ defmodule Vibe.AI.TeamRunMonitor do
     cast(
       chat_id,
       team_run_id,
-      {:settled, worker_handle, ok? == true, usage_limit? == true,
-       retryable_crash? == true}
+      {:settled, worker_handle, ok? == true, usage_limit? == true, retryable_crash? == true}
     )
   end
 
@@ -190,12 +190,15 @@ defmodule Vibe.AI.TeamRunMonitor do
       status = entry["status"] || entry[:status]
 
       if is_binary(handle) do
+        spawned_at =
+          entry["startedAt"] || entry[:started_at] || entry["started_at"] || now
+
         Map.put(acc, handle, %{
           beat: now,
           last_frame_at: now,
           last_progress_at: now,
           last_progress_bytes: entry["progressBytes"] || entry[:progress_bytes] || 0,
-          spawned_at: now,
+          spawned_at: spawned_at,
           retries: 0,
           terminal: status in ["done", "failed", "reassigned", "cancelled"]
         })
@@ -318,14 +321,17 @@ defmodule Vibe.AI.TeamRunMonitor do
           retry_row(state, handle, row, now, "failed")
       end
 
-    state = maybe_finalize(%{state | last_activity: now})
+    state =
+      state
+      |> Map.put(:last_activity, now)
+      |> check_contract_barrier(now)
+      |> maybe_finalize()
+
     {:noreply, state}
   end
 
   def handle_cast(:cancelled, state) do
-    Logger.info(
-      "[TeamRunMonitor] run cancelled chat=#{state.chat_id} run=#{state.team_run_id}"
-    )
+    Logger.info("[TeamRunMonitor] run cancelled chat=#{state.chat_id} run=#{state.team_run_id}")
 
     {:stop, :normal, %{state | finalized: true}}
   end
@@ -335,6 +341,7 @@ defmodule Vibe.AI.TeamRunMonitor do
   @impl true
   def handle_info(:tick, state) do
     now = now_ms()
+    state = check_contract_barrier(state, now)
 
     # A wedged bridge queue heartbeats forever without ever running — cap how
     # long a slice may sit queued, then close it honestly instead of hanging
@@ -370,6 +377,7 @@ defmodule Vibe.AI.TeamRunMonitor do
       |> Enum.reduce(state, fn {handle, row}, acc ->
         retry_row(acc, handle, row, now, "stalled")
       end)
+      |> check_contract_barrier(now)
       |> maybe_finalize()
 
     cond do
@@ -412,6 +420,54 @@ defmodule Vibe.AI.TeamRunMonitor do
     |> Enum.find_value(fn entry ->
       if (entry["worker"] || entry[:worker]) == handle, do: entry["status"] || entry[:status]
     end)
+  end
+
+  # Board polling is deliberately owned by this zero-token monitor. Explicit
+  # CONTRACT sections release consumers on the next sweep; terminal owners and
+  # the fixed spawn-age deadline tell LocalAgentWorker when best-effort fallback
+  # freezing is allowed.
+  defp check_contract_barrier(state, now) do
+    contracts = LocalAgentWorker.team_contracts(state.chat_id, state.team_run_id)
+
+    if contracts == [] do
+      state
+    else
+      durable_rows =
+        LocalAgentWorker.team_workers_status(state.chat_id, state.team_run_id)
+        |> Map.new(fn entry -> {entry["worker"] || entry[:worker], entry} end)
+
+      fallback_owners =
+        contracts
+        |> Enum.filter(fn contract ->
+          owner = contract["owner"]
+          entry = durable_rows[owner] || %{}
+          status = entry["status"] || entry[:status]
+
+          spawned_at =
+            entry["startedAt"] || entry[:started_at] || entry["started_at"]
+
+          status in ["done", "failed", "cancelled", "reassigned"] or
+            (is_integer(spawned_at) and now - spawned_at >= @contract_freeze_timeout_ms)
+        end)
+        |> Enum.map(& &1["owner"])
+        |> Enum.uniq()
+
+      LocalAgentWorker.monitor_contract_barrier(
+        state.chat_id,
+        state.team_run_id,
+        fallback_owners
+      )
+
+      state
+    end
+  rescue
+    error ->
+      Logger.warning(
+        "[TeamRunMonitor] contract check failed chat=#{state.chat_id} run=#{state.team_run_id}: " <>
+          Exception.message(error)
+      )
+
+      state
   end
 
   # Crash/stall → cancel any live task and retry ONCE on the same provider,

@@ -1128,6 +1128,7 @@ defmodule Vibe.AI.LocalAgentWorker do
       teammate_handles = team_workers_handles(team_workers)
       handoff_path = ".vibe/team/#{safe_team_run_id(team_run_id)}.md"
       default_focus = team_worker_default_focus(worker.handle)
+      contract_context = Keyword.get(opts, :contract_context) || ""
 
       case {mode, role} do
         {_, "chat"} ->
@@ -1158,6 +1159,7 @@ defmodule Vibe.AI.LocalAgentWorker do
             default_focus,
             team_run_id,
             lead_handle,
+            contract_context,
             context
           )
 
@@ -1293,11 +1295,13 @@ defmodule Vibe.AI.LocalAgentWorker do
       - the enhanced implementation brief;
       - the lightweight path map;
       - the available worker handles #{teammate_handles}; and
-      - a request for task_table rows of worker → objective → exact DISJOINT files.
+      - a request for task_table rows of worker → objective → exact DISJOINT files;
+        and a top-level contracts array naming every cross-worker payload/interface
+        owner and consumer.
     The advisor is authoritative for decomposition (its runtime already falls back
     Fable → Opus → GPT-5.6-Sol). Convert its answer faithfully into ONE single-line
     directive (stdout/tool log is fine):
-      VIBE_TEAM_PLAN: {"version":2,"classification":"team","architecture":"<advisor summary>","contracts":"<shared contracts>","decisions":["<defaults>"],"foundation":{"files":[]},"task_table":[{"worker":"claude","objective":"<what>","files":["<exact disjoint paths>"],"boundaries":"<what NOT to touch>","fallback":"grok"}],"integrator":"#{worker.handle}","verification":["<checks>" ]}
+      VIBE_TEAM_PLAN: {"version":2,"classification":"team","architecture":"<advisor summary>","contracts":[{"name":"<slug>","owner":"<worker handle>","consumers":["<worker handle>"],"summary":"<what the shape is>"}],"decisions":["<defaults>"],"foundation":{"files":[]},"task_table":[{"worker":"claude","objective":"<what>","files":["<exact disjoint paths>"],"boundaries":"<what NOT to touch>","fallback":"grok"}],"integrator":"#{worker.handle}","verification":["<checks>" ]}
     Never invent a replacement decomposition when the advisor responded. Never put
     @#{worker.handle} in task_table; the lead is not a builder. Every row must name
     concrete files and no file may appear in two rows. Shared/foundation files must
@@ -1330,6 +1334,9 @@ defmodule Vibe.AI.LocalAgentWorker do
     shared memory, not assumptions. No raw tool logs or directive lines in the summary.
 
     Always: do not reset, stash, revert, or overwrite pre-existing user changes.
+    If you hit a HARD blocker (design ambiguity, a failing approach, a cross-cutting
+    decision), call the ask_fable advisor MCP tool before guessing. Do not call it
+    for routine work.
 
     Collaboration rules:
     #{agent_operating_rules(worker, handoff_path)}
@@ -1352,6 +1359,7 @@ defmodule Vibe.AI.LocalAgentWorker do
          default_focus,
          team_run_id,
          lead_handle,
+         contract_context,
          context
        ) do
     """
@@ -1363,6 +1371,8 @@ defmodule Vibe.AI.LocalAgentWorker do
     Team handles: #{teammate_handles}
     Your focus: #{default_focus}
     Shared handoff board: #{handoff_path}
+
+    #{contract_context}
 
     Rules:
     - You are NOT posting a chat bubble. The lead synthesizes the user-facing answer.
@@ -1383,6 +1393,9 @@ defmodule Vibe.AI.LocalAgentWorker do
     - Keep final stdout short (handoff summary only) — not a long user essay.
     - If your work is UI/JSX/frontend, note that for Gemini UI review in the handoff.
     - If a configured advisor is unavailable, continue with best judgment.
+    - If you hit a HARD blocker (design ambiguity, a failing approach, a cross-cutting
+      decision), call the ask_fable advisor MCP tool before guessing. Do not call it
+      for routine work.
 
     Collaboration rules:
     #{agent_operating_rules(worker, handoff_path)}
@@ -1878,42 +1891,38 @@ defmodule Vibe.AI.LocalAgentWorker do
 
     case :ets.lookup(@team_run_table, {chat_id, team_run_id}) do
       [{{^chat_id, ^team_run_id}, state}] ->
-        mode = Map.get(state, :mode) || "supervisor"
         lead = Map.get(state, :lead_worker)
         allowed = MapSet.new(state.workers || [])
         focus_by = Keyword.get(opts, :focus_by_handle) || %{}
-        reply_to_id = state.reply_to_id
-        dispatch_text = state.dispatch_text
-        bridge_metadata = state.bridge_metadata || %{}
 
         plan =
           Map.get(state, :team_plan) || get_in(state, [:bridge_metadata, "teamPlan"]) || %{}
 
-        team_workers =
-          (state.workers || [])
-          |> Enum.map(&resolve_handle/1)
+        spawn_handles =
+          handles
+          |> Enum.map(&normalize_handle/1)
           |> Enum.reject(&is_nil/1)
+          |> Enum.uniq()
+          |> Enum.reject(&(&1 == lead))
+          |> Enum.filter(&MapSet.member?(allowed, &1))
+          # A solo-classified plan means the lead owns the whole task — a stray
+          # spawn directive after that is a protocol violation, not a dispatch.
+          |> then(fn hs ->
+            if plan["classification"] == "solo" do
+              Logger.info(
+                "[LocalAgentWorker] solo plan — suppressing spawn of #{inspect(hs)} chat=#{chat_id} run=#{team_run_id}"
+              )
 
-        handles
-        |> Enum.map(&normalize_handle/1)
-        |> Enum.reject(&is_nil/1)
-        |> Enum.uniq()
-        |> Enum.reject(&(&1 == lead))
-        |> Enum.filter(&MapSet.member?(allowed, &1))
-        # A solo-classified plan means the lead owns the whole task — a stray
-        # spawn directive after that is a protocol violation, not a dispatch.
-        |> then(fn hs ->
-          if plan["classification"] == "solo" do
-            Logger.info(
-              "[LocalAgentWorker] solo plan — suppressing spawn of #{inspect(hs)} chat=#{chat_id} run=#{team_run_id}"
-            )
+              []
+            else
+              hs
+            end
+          end)
 
-            []
-          else
-            hs
-          end
-        end)
-        |> Enum.each(fn handle ->
+        contracts = plan_contracts(plan)
+        contract_owners = contracts |> Enum.map(& &1["owner"]) |> MapSet.new()
+
+        Enum.each(spawn_handles, fn handle ->
           case resolve_handle(handle) do
             nil ->
               :ok
@@ -1936,74 +1945,42 @@ defmodule Vibe.AI.LocalAgentWorker do
                     {planned, explicit} -> planned <> "\nLead note: " <> explicit
                   end
 
-                # Focus + fallback are stored so the monitor can retry/reassign
-                # this slice fresh without the lead being alive to restate it.
-                update_team_worker_state(chat_id, team_run_id, handle, %{
-                  "status" => "running",
-                  "task_id" => task_id,
-                  "last_label" => "starting",
-                  "focus" => focus,
-                  "fallback" => plan_fallback_for(plan, handle)
-                })
+                consumed = contracts_for_consumer(contracts, handle)
 
-                prompt =
-                  build_team_bridge_prompt(
-                    chat_id,
-                    worker,
-                    dispatch_text <> "\n\nAssigned focus for this spawn: #{focus}",
-                    requester_user_id,
-                    team_workers,
-                    team_run_id,
-                    team_mode: mode,
-                    lead_worker: lead,
-                    team_role: "worker"
+                # Contract owners must run in wave 0 so they can freeze shapes.
+                # Workers that only consume contracts wait until every required
+                # section is frozen; workers with no consumed contract remain the
+                # existing immediate/parallel path.
+                if contracts != [] and consumed != [] and
+                     not MapSet.member?(contract_owners, handle) do
+                  waiting_on = List.first(consumed)
+
+                  waiting_label =
+                    "waiting for #{waiting_on["name"]} from #{waiting_on["owner"]}"
+
+                  update_team_worker_state(chat_id, team_run_id, handle, %{
+                    "status" => "waiting",
+                    "task_id" => nil,
+                    "last_label" => waiting_label,
+                    "focus" => focus,
+                    "fallback" => plan_fallback_for(plan, handle)
+                  })
+
+                  Logger.info(
+                    "[LocalAgentWorker] supervisor contract wait chat=#{chat_id} run=#{team_run_id} worker=#{handle} contract=#{waiting_on["name"]}"
                   )
+                else
+                  contract_context = contract_prompt_context(contracts, handle, %{})
 
-                task_payload =
-                  %{
-                    "provider" => worker.handle,
-                    "chatId" => chat_id,
-                    "taskId" => task_id,
-                    "prompt" => prompt,
-                    "replyToId" => reply_to_id,
-                    "requesterUserId" => requester_user_id,
-                    "teamMode" => mode,
-                    "teamRunId" => team_run_id,
-                    "teamWorker" => worker.handle,
-                    "teamWorkers" => Enum.map(team_workers, & &1.handle),
-                    "leadWorker" => lead,
-                    "teamRole" => "worker",
-                    "suppressVisible" => true
-                  }
-                  |> Map.merge(resolve_provider_model(bridge_metadata, worker.handle))
-
-                broadcast_activity(
-                  chat_id,
-                  worker.agent_user_id,
-                  "#{worker.label} joining team run...",
-                  "running"
-                )
-
-                case AgentBridge.dispatch_task(requester_user_id, task_payload) do
-                  :ok ->
-                    Vibe.AI.TeamRunMonitor.note_spawned(chat_id, team_run_id, handle, task_id)
-
-                    Logger.info(
-                      "[LocalAgentWorker] supervisor spawn chat=#{chat_id} run=#{team_run_id} worker=#{handle}"
-                    )
-
-                  {:error, reason} ->
-                    update_team_worker_state(chat_id, team_run_id, handle, %{
-                      "status" => "failed",
-                      "last_label" => "spawn failed",
-                      "summary" => inspect(reason)
-                    })
-
-                    stop_activity(chat_id, worker.agent_user_id)
-
-                    Logger.warning(
-                      "[LocalAgentWorker] supervisor spawn failed chat=#{chat_id} worker=#{handle} reason=#{inspect(reason)}"
-                    )
+                  dispatch_supervisor_worker(
+                    state,
+                    worker,
+                    focus,
+                    task_id,
+                    contract_context,
+                    "starting",
+                    requester_user_id
+                  )
                 end
               end
           end
@@ -2024,6 +2001,155 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   def spawn_supervisor_workers(_, _, _, _, _), do: {:error, :invalid}
+
+  defp dispatch_supervisor_worker(
+         state,
+         worker,
+         focus,
+         task_id,
+         contract_context,
+         starting_label,
+         requester_user_id
+       ) do
+    chat_id = state.chat_id
+    team_run_id = state.team_run_id
+    mode = Map.get(state, :mode) || "supervisor"
+    lead = Map.get(state, :lead_worker)
+
+    team_workers =
+      (state.workers || [])
+      |> Enum.map(&resolve_handle/1)
+      |> Enum.reject(&is_nil/1)
+
+    update_team_worker_state(chat_id, team_run_id, worker.handle, %{
+      "status" => "running",
+      "task_id" => task_id,
+      "last_label" => starting_label,
+      "focus" => focus,
+      "fallback" => plan_fallback_for(run_state_plan(state), worker.handle),
+      "contract_context" => contract_context
+    })
+
+    prompt =
+      build_team_bridge_prompt(
+        chat_id,
+        worker,
+        state.dispatch_text <> "\n\nAssigned focus for this spawn: #{focus}",
+        requester_user_id,
+        team_workers,
+        team_run_id,
+        team_mode: mode,
+        lead_worker: lead,
+        team_role: "worker",
+        contract_context: contract_context
+      )
+
+    task_payload =
+      %{
+        "provider" => worker.handle,
+        "chatId" => chat_id,
+        "taskId" => task_id,
+        "prompt" => prompt,
+        "replyToId" => state.reply_to_id,
+        "requesterUserId" => requester_user_id,
+        "teamMode" => mode,
+        "teamRunId" => team_run_id,
+        "teamWorker" => worker.handle,
+        "teamWorkers" => Enum.map(team_workers, & &1.handle),
+        "leadWorker" => lead,
+        "teamRole" => "worker",
+        "suppressVisible" => true
+      }
+      |> Map.merge(resolve_provider_model(state.bridge_metadata || %{}, worker.handle))
+
+    broadcast_activity(
+      chat_id,
+      worker.agent_user_id,
+      "#{worker.label} joining team run...",
+      "running"
+    )
+
+    case AgentBridge.dispatch_task(requester_user_id, task_payload) do
+      :ok ->
+        Vibe.AI.TeamRunMonitor.note_spawned(chat_id, team_run_id, worker.handle, task_id)
+
+        Logger.info(
+          "[LocalAgentWorker] supervisor spawn chat=#{chat_id} run=#{team_run_id} worker=#{worker.handle}"
+        )
+
+        :ok
+
+      {:error, reason} ->
+        update_team_worker_state(chat_id, team_run_id, worker.handle, %{
+          "status" => "failed",
+          "last_label" => "spawn failed",
+          "summary" => inspect(reason)
+        })
+
+        stop_activity(chat_id, worker.agent_user_id)
+
+        Logger.warning(
+          "[LocalAgentWorker] supervisor spawn failed chat=#{chat_id} worker=#{worker.handle} reason=#{inspect(reason)}"
+        )
+
+        {:error, reason}
+    end
+  end
+
+  defp plan_contracts(plan) when is_map(plan) do
+    case plan["contracts"] do
+      contracts when is_list(contracts) -> contracts
+      _ -> []
+    end
+  end
+
+  defp plan_contracts(_), do: []
+
+  defp contracts_for_consumer(contracts, handle) do
+    Enum.filter(contracts, &(handle in List.wrap(&1["consumers"])))
+  end
+
+  defp contract_prompt_context(contracts, handle, frozen_contracts) do
+    owned = Enum.filter(contracts, &(&1["owner"] == handle))
+    consumed = contracts_for_consumer(contracts, handle)
+
+    owner_instruction =
+      if owned == [] do
+        nil
+      else
+        "If your slice emits a payload/interface another worker renders or parses, " <>
+          "DECIDE AND FREEZE its shape FIRST. Post `## CONTRACT:<name> — owner: <you> — " <>
+          "status: frozen` plus the exact shape to the handoff board BEFORE implementing " <>
+          "the rest, so consumers can start."
+      end
+
+    frozen_blocks =
+      consumed
+      |> Enum.flat_map(fn contract ->
+        case frozen_contracts[contract["name"]] do
+          shape when is_binary(shape) ->
+            [
+              "Frozen payload contract #{contract["name"]}:\n#{shape}\n" <>
+                "Match this shape exactly; do not invent fields."
+            ]
+
+          _ ->
+            []
+        end
+      end)
+
+    consumer_instruction =
+      if consumed == [] do
+        nil
+      else
+        "Your frozen payload contract(s) are injected above; match them exactly, do not " <>
+          "invent fields; if a field is missing, note it in the board."
+      end
+
+    [owner_instruction | frozen_blocks ++ [consumer_instruction]]
+    |> Enum.filter(&(is_binary(&1) and &1 != ""))
+    |> Enum.join("\n\n")
+  end
 
   # ── TeamRunMonitor support (team-architecture-v2 §4) ─────────────────────
   # Storage-backed transitions applied by the zero-token watchdog. Everything
@@ -2057,6 +2183,243 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   def fetch_supervisor_run_state(_, _), do: nil
+
+  @doc "Monitor: normalized payload contracts for a supervisor run."
+  def team_contracts(chat_id, team_run_id) do
+    case fetch_supervisor_run_state(chat_id, team_run_id) do
+      state when is_map(state) -> state |> run_state_plan() |> plan_contracts()
+      _ -> []
+    end
+  end
+
+  @doc """
+  Monitor: reread the handoff board, freeze explicit/fallback contracts, and
+  release every waiting consumer whose complete contract set is frozen.
+  `fallback_owners` is decided by TeamRunMonitor's terminal/timeout policy.
+  """
+  def monitor_contract_barrier(chat_id, team_run_id, fallback_owners)
+      when is_binary(chat_id) and is_binary(team_run_id) do
+    with state when is_map(state) <- fetch_supervisor_run_state(chat_id, team_run_id) do
+      contracts = state |> run_state_plan() |> plan_contracts()
+
+      if contracts == [] do
+        {:ok, []}
+      else
+        board = read_handoff_board(state)
+        fallback_set = fallback_owners |> List.wrap() |> MapSet.new()
+        persisted = frozen_contracts_from_state(state)
+
+        frozen =
+          Enum.reduce(contracts, persisted, fn contract, acc ->
+            name = contract["name"]
+
+            cond do
+              is_binary(acc[name]) ->
+                acc
+
+              shape = frozen_contract_body(board, contract) ->
+                Map.put(acc, name, shape)
+
+              MapSet.member?(fallback_set, contract["owner"]) ->
+                shape = fallback_contract_body(board, contract)
+
+                Logger.warning(
+                  "[TeamRunMonitor] contract fallback freeze chat=#{chat_id} run=#{team_run_id} " <>
+                    "contract=#{name} owner=#{contract["owner"]}"
+                )
+
+                Map.put(acc, name, shape)
+
+              true ->
+                acc
+            end
+          end)
+
+        if frozen != persisted, do: persist_frozen_contracts(state, frozen)
+
+        released =
+          contracts
+          |> Enum.flat_map(&List.wrap(&1["consumers"]))
+          |> Enum.uniq()
+          |> Enum.filter(fn handle ->
+            required = contracts_for_consumer(contracts, handle)
+
+            status =
+              get_in(fetch_supervisor_run_state(chat_id, team_run_id), [
+                :worker_states,
+                handle,
+                "status"
+              ])
+
+            status == "waiting" and
+              Enum.all?(required, &is_binary(frozen[&1["name"]]))
+          end)
+          |> Enum.filter(fn handle ->
+            state = fetch_supervisor_run_state(chat_id, team_run_id)
+            worker = resolve_handle(handle)
+
+            if is_map(state) and is_map(worker) do
+              focus =
+                stored_worker_focus(state, handle) ||
+                  plan_focus_for(run_state_plan(state), handle) ||
+                  team_worker_default_focus(handle)
+
+              task_id = "#{team_run_id}:worker:#{handle}"
+              contract_context = contract_prompt_context(contracts, handle, frozen)
+
+              case dispatch_supervisor_worker(
+                     state,
+                     worker,
+                     focus,
+                     task_id,
+                     contract_context,
+                     "contracts frozen",
+                     state.requester_user_id
+                   ) do
+                :ok -> true
+                _ -> false
+              end
+            else
+              false
+            end
+          end)
+
+        {:ok, released}
+      end
+    else
+      _ -> {:error, :not_found}
+    end
+  rescue
+    error ->
+      Logger.warning(
+        "[TeamRunMonitor] contract barrier failed chat=#{chat_id} run=#{team_run_id}: " <>
+          Exception.message(error)
+      )
+
+      {:error, error}
+  end
+
+  def monitor_contract_barrier(_, _, _), do: {:error, :invalid}
+
+  defp frozen_contracts_from_state(state) do
+    value =
+      Map.get(state, :frozen_contracts) ||
+        get_in(state, [:bridge_metadata, "frozenContracts"])
+
+    if is_map(value), do: value, else: %{}
+  end
+
+  defp persist_frozen_contracts(state, frozen) do
+    metadata = Map.put(state.bridge_metadata || %{}, "frozenContracts", frozen)
+
+    updated_state =
+      state
+      |> Map.put(:bridge_metadata, metadata)
+      |> Map.put(:frozen_contracts, frozen)
+
+    :ets.insert(@team_run_table, {{state.chat_id, state.team_run_id}, updated_state})
+
+    case Repo.get(TeamRun, state.team_run_id) do
+      %TeamRun{} = run ->
+        durable_metadata = Map.put(run.bridge_metadata || %{}, "frozenContracts", frozen)
+
+        run
+        |> TeamRun.changeset(%{bridge_metadata: durable_metadata})
+        |> Repo.update()
+
+      _ ->
+        :ok
+    end
+
+    :ok
+  end
+
+  defp read_handoff_board(state) do
+    metadata = state.bridge_metadata || %{}
+
+    roots =
+      [
+        metadata["cwd"],
+        metadata["repoPath"],
+        metadata["agentBridgeCwd"],
+        metadata["agentBridgeRepoPath"],
+        System.get_env("VIBE_AGENT_WORKER_CWD"),
+        File.cwd!(),
+        Path.expand("..", File.cwd!()),
+        Path.expand("../../../..", __DIR__)
+      ]
+      |> Enum.filter(&(is_binary(&1) and &1 != ""))
+      |> Enum.uniq()
+
+    relative = Path.join([".vibe", "team", "#{safe_team_run_id(state.team_run_id)}.md"])
+
+    Enum.find_value(roots, "", fn root ->
+      case File.read(Path.join(root, relative)) do
+        {:ok, body} -> body
+        _ -> nil
+      end
+    end)
+  rescue
+    _ -> ""
+  end
+
+  defp frozen_contract_body(board, contract) do
+    board
+    |> board_sections()
+    |> Enum.find_value(fn {heading, body} ->
+      case Regex.run(
+             ~r/^CONTRACT:([A-Za-z0-9_.-]+)\s+—\s+owner:\s*([^\s]+)\s+—\s+status:\s*frozen\s*$/iu,
+             String.trim(heading)
+           ) do
+        [_, name, owner] ->
+          if name == contract["name"] and normalize_handle(owner) == contract["owner"] do
+            normalized_contract_body(body, contract)
+          end
+
+        _ ->
+          nil
+      end
+    end)
+  end
+
+  defp fallback_contract_body(board, contract) do
+    owner = contract["owner"]
+
+    body =
+      board
+      |> board_sections()
+      |> Enum.filter(fn {heading, _body} ->
+        Regex.match?(~r/^#{Regex.escape(owner)}\s+—\s+files:/iu, String.trim(heading))
+      end)
+      |> List.last()
+      |> case do
+        {_heading, section_body} -> String.trim(section_body)
+        _ -> ""
+      end
+
+    if body == "" do
+      "@#{owner} did not post an explicit contract; proceed with best judgment."
+    else
+      body
+    end
+  end
+
+  defp normalized_contract_body(body, contract) do
+    case String.trim(body) do
+      "" ->
+        "@#{contract["owner"]} froze #{contract["name"]} without a shape; proceed with best judgment."
+
+      shape ->
+        shape
+    end
+  end
+
+  defp board_sections(board) when is_binary(board) do
+    Regex.scan(~r/^##[ \t]+([^\n]+)\n?(.*?)(?=^##[ \t]+|\z)/msu, board)
+    |> Enum.map(fn [_, heading, body] -> {heading, body} end)
+  end
+
+  defp board_sections(_), do: []
 
   @doc "Monitor: mark a worker with a status + note and broadcast the transition."
   def monitor_mark_worker(chat_id, team_run_id, handle, status, note) do
@@ -2115,7 +2478,14 @@ defmodule Vibe.AI.LocalAgentWorker do
           status_list
         )
 
-        monitor_dispatch_worker(state, worker, focus, task_id, nil)
+        monitor_dispatch_worker(
+          state,
+          worker,
+          focus,
+          task_id,
+          nil,
+          stored_worker_contract_context(state, handle)
+        )
       end
     else
       _ -> {:error, :not_found}
@@ -2173,7 +2543,8 @@ defmodule Vibe.AI.LocalAgentWorker do
              focus,
              task_id,
              "You are covering @#{handle}'s slice from scratch after a usage limit; " <>
-               "their partial work may or may not exist on disk — verify before building on it."
+               "their partial work may or may not exist on disk — verify before building on it.",
+             stored_worker_contract_context(state, handle)
            ) do
         :ok -> {:ok, fallback}
         error -> error
@@ -2213,7 +2584,7 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   # Dispatch one worker slice on behalf of the monitor. Mirrors the payload
   # spawn_supervisor_workers builds so the bridge/iOS see an identical task.
-  defp monitor_dispatch_worker(state, worker, focus, task_id, cover_note) do
+  defp monitor_dispatch_worker(state, worker, focus, task_id, cover_note, contract_context) do
     chat_id = state.chat_id
     team_run_id = state.team_run_id
     mode = Map.get(state, :mode) || "supervisor"
@@ -2243,7 +2614,8 @@ defmodule Vibe.AI.LocalAgentWorker do
         team_run_id,
         team_mode: mode,
         lead_worker: lead,
-        team_role: "worker"
+        team_role: "worker",
+        contract_context: contract_context
       )
 
     task_payload =
@@ -2301,6 +2673,13 @@ defmodule Vibe.AI.LocalAgentWorker do
     case get_in(state, [:worker_states, handle, "focus"]) do
       focus when is_binary(focus) and focus != "" -> focus
       _ -> nil
+    end
+  end
+
+  defp stored_worker_contract_context(state, handle) do
+    case get_in(state, [:worker_states, handle, "contract_context"]) do
+      context when is_binary(context) -> context
+      _ -> ""
     end
   end
 
@@ -2429,6 +2808,12 @@ defmodule Vibe.AI.LocalAgentWorker do
     roster = MapSet.new(roster_handles || [])
     classification = plan["classification"]
 
+    with {:ok, plan} <- normalize_plan_contracts(plan, roster) do
+      validate_team_plan_rows(plan, roster, classification)
+    end
+  end
+
+  defp validate_team_plan_rows(plan, roster, classification) do
     cond do
       classification == "solo" ->
         {:ok, plan}
@@ -2438,6 +2823,12 @@ defmodule Vibe.AI.LocalAgentWorker do
 
       true ->
         rows = List.wrap(plan["task_table"])
+
+        row_handles =
+          rows
+          |> Enum.map(&normalize_handle(&1["worker"]))
+          |> Enum.reject(&is_nil/1)
+          |> MapSet.new()
 
         errors =
           []
@@ -2478,10 +2869,119 @@ defmodule Vibe.AI.LocalAgentWorker do
               errs
             end
           end)
+          |> then(fn errs ->
+            Enum.reduce(plan["contracts"], errs, fn contract, acc ->
+              participants = [contract["owner"] | contract["consumers"]]
+
+              participants
+              |> Enum.reject(&MapSet.member?(row_handles, &1))
+              |> Enum.reduce(acc, fn handle, inner ->
+                ["contract #{contract["name"]}: worker #{handle} has no task_table row" | inner]
+              end)
+            end)
+          end)
 
         if errors == [], do: {:ok, plan}, else: {:error, Enum.reverse(errors)}
     end
   end
+
+  defp normalize_plan_contracts(plan, roster) do
+    case Map.fetch(plan, "contracts") do
+      :error ->
+        {:ok, Map.put(plan, "contracts", [])}
+
+      {:ok, nil} ->
+        {:ok, Map.put(plan, "contracts", [])}
+
+      {:ok, contracts} when is_list(contracts) ->
+        {normalized, errors} =
+          contracts
+          |> Enum.with_index()
+          |> Enum.reduce({[], []}, fn {contract, idx}, {items, errs} ->
+            case normalize_plan_contract(contract, idx, roster) do
+              {:ok, item} -> {[item | items], errs}
+              {:error, reasons} -> {items, reasons ++ errs}
+            end
+          end)
+
+        duplicate_names =
+          normalized
+          |> Enum.map(& &1["name"])
+          |> Enum.frequencies()
+          |> Enum.filter(fn {_name, count} -> count > 1 end)
+          |> Enum.map(&elem(&1, 0))
+
+        errors =
+          if duplicate_names == [],
+            do: errors,
+            else: ["duplicate contract names: #{Enum.join(duplicate_names, ", ")}" | errors]
+
+        if errors == [] do
+          {:ok, Map.put(plan, "contracts", Enum.reverse(normalized))}
+        else
+          {:error, Enum.reverse(errors)}
+        end
+
+      {:ok, _} ->
+        {:error, ["contracts must be an array"]}
+    end
+  end
+
+  defp normalize_plan_contract(contract, idx, roster) when is_map(contract) do
+    name = normalize_string(contract["name"])
+    owner = normalize_handle(contract["owner"])
+    consumers_value = contract["consumers"]
+
+    consumers =
+      if is_list(consumers_value) do
+        consumers_value
+        |> Enum.map(&normalize_handle/1)
+        |> Enum.reject(&is_nil/1)
+        |> Enum.uniq()
+      else
+        []
+      end
+
+    errors =
+      []
+      |> then(fn errs ->
+        if is_binary(name) and Regex.match?(~r/^[A-Za-z0-9_.-]+$/, name),
+          do: errs,
+          else: ["contract #{idx}: name must be a non-empty slug" | errs]
+      end)
+      |> then(fn errs ->
+        if is_binary(owner) and MapSet.member?(roster, owner),
+          do: errs,
+          else: ["contract #{idx}: unknown owner #{inspect(contract["owner"])}" | errs]
+      end)
+      |> then(fn errs ->
+        if is_list(consumers_value) and consumers != [],
+          do: errs,
+          else: ["contract #{idx}: consumers must be a non-empty array" | errs]
+      end)
+      |> then(fn errs ->
+        unknown = Enum.reject(consumers, &MapSet.member?(roster, &1))
+
+        if unknown == [],
+          do: errs,
+          else: ["contract #{idx}: unknown consumers #{Enum.join(unknown, ", ")}" | errs]
+      end)
+
+    if errors == [] do
+      {:ok,
+       %{
+         "name" => name,
+         "owner" => owner,
+         "consumers" => consumers,
+         "summary" => normalize_string(contract["summary"]) || ""
+       }}
+    else
+      {:error, errors}
+    end
+  end
+
+  defp normalize_plan_contract(_contract, idx, _roster),
+    do: {:error, ["contract #{idx}: entry must be an object"]}
 
   @doc "Store a validated plan on the run (ets + durable bridge_metadata)."
   def store_team_plan(chat_id, team_run_id, plan)
@@ -2547,8 +3047,7 @@ defmodule Vibe.AI.LocalAgentWorker do
         [
           row["objective"] && "Objective: #{row["objective"]}",
           files != [] && "Files (yours alone, implement completely): #{Enum.join(files, ", ")}",
-          row["boundaries"] && "Boundaries: #{row["boundaries"]}",
-          plan["contracts"] && "Shared contracts: #{plan["contracts"]}"
+          row["boundaries"] && "Boundaries: #{row["boundaries"]}"
         ]
         |> Enum.filter(&is_binary/1)
         |> Enum.join("\n")
