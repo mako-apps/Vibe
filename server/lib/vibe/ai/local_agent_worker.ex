@@ -506,11 +506,6 @@ defmodule Vibe.AI.LocalAgentWorker do
             usage_limit_text?(body) or
             usage_limit_runtime?(runtime)
 
-        # Add the agent's answer to the shared group thread so the other agent can
-        # build on it next turn. Only on success — don't pollute memory with errors.
-        # Under-hood supervisor workers still write memory so the lead can synthesize.
-        if ok, do: note_bridge_agent_turn(chat_id, worker, base_text, requester_user_id)
-
         suppress_visible? =
           Keyword.get(opts, :suppress_visible) == true or
             Keyword.get(opts, :suppressVisible) == true or
@@ -521,26 +516,47 @@ defmodule Vibe.AI.LocalAgentWorker do
         team_run_id = normalize_string(Keyword.get(opts, :team_run_id))
         team_mode = normalize_string(Keyword.get(opts, :team_mode))
 
+        # Every successful worker completion, including an under-hood supervisor
+        # slice, is durable shared memory. Keep run/task identity on the entry so
+        # the lead can distinguish concurrent runs in the same group chat.
+        if ok or is_binary(team_run_id) do
+          note_bridge_agent_turn(chat_id, worker, base_text, requester_user_id,
+            team_run_id: team_run_id,
+            task_id: normalize_string(Keyword.get(opts, :task_id)),
+            team_role: normalize_string(Keyword.get(opts, :team_role)),
+            status: if(ok, do: "done", else: "failed")
+          )
+        end
+
         worker_status_list =
           if is_binary(team_run_id) do
             # Stale-settle guard: after a watchdog retry/reassign the row carries
             # a NEW task_id; the old attempt's late result must not clobber it.
             settle_task_id = normalize_string(Keyword.get(opts, :task_id))
 
-            stored_task_id =
+            stored_entry =
               case fetch_supervisor_run_state(chat_id, team_run_id) do
                 state when is_map(state) ->
-                  normalize_string(get_in(state, [:worker_states, worker.handle, "task_id"]))
+                  get_in(state, [:worker_states, worker.handle]) || %{}
 
                 _ ->
-                  nil
+                  %{}
               end
 
-            if is_binary(settle_task_id) and is_binary(stored_task_id) and
-                 settle_task_id != stored_task_id do
+            stored_task_id = normalize_string(stored_entry["task_id"])
+            stored_status = normalize_string(stored_entry["status"])
+
+            stale_attempt? =
+              is_binary(settle_task_id) and is_binary(stored_task_id) and
+                settle_task_id != stored_task_id
+
+            already_closed? = stored_status in ["cancelled", "reassigned"]
+
+            if stale_attempt? or already_closed? do
               Logger.info(
                 "[LocalAgentWorker] stale settle ignored chat=#{chat_id} run=#{team_run_id} " <>
-                  "worker=#{worker.handle} settled=#{settle_task_id} current=#{stored_task_id}"
+                  "worker=#{worker.handle} settled=#{settle_task_id} current=#{stored_task_id} " <>
+                  "status=#{inspect(stored_status)}"
               )
 
               team_workers_status(chat_id, team_run_id)
@@ -559,7 +575,8 @@ defmodule Vibe.AI.LocalAgentWorker do
                 team_run_id,
                 worker.handle,
                 ok,
-                usage_limit_hit?
+                usage_limit_hit?,
+                not signal_exit_status?(exit_status)
               )
 
               list
@@ -705,6 +722,20 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp truthy_opt?("1"), do: true
   defp truthy_opt?(1), do: true
   defp truthy_opt?(_), do: false
+
+  # Shell-standard signal exits are external cancellation/termination, not an
+  # agent crash. Retrying them caused cancel → SIGINT/SIGTERM → failed → retry
+  # loops. A genuinely crashing process keeps its non-signal status retryable.
+  defp signal_exit_status?(status) when status in [130, 137, 143], do: true
+
+  defp signal_exit_status?(status) when is_binary(status) do
+    case Integer.parse(status) do
+      {value, _} -> signal_exit_status?(value)
+      _ -> false
+    end
+  end
+
+  defp signal_exit_status?(_), do: false
 
   defp broadcast_team_worker_settled(
          chat_id,
@@ -1241,46 +1272,62 @@ defmodule Vibe.AI.LocalAgentWorker do
     Your default focus: #{default_focus}
     Shared handoff board: #{handoff_path}
 
-    You run a strict phased protocol (the server machine-parses your directives):
+    You are a THIN ORCHESTRATOR. You enhance the request, obtain the plan from the
+    advisor, dispatch builders, narrate progress, and synthesize their shared-memory
+    handoffs. You do NOT survey repository code, implement a slice, or edit source
+    files yourself. The only exception is truly trivial final wiring after every
+    reasonable worker assignment is complete.
 
-    PHASE 0 — CLASSIFY. You are the ORCHESTRATOR: plan, delegate, integrate, and
-    report — do NOT hand-build every slice yourself. Simple one-agent requests are
-    routed to a single visible worker before they ever reach you, so if you are
-    here the work is almost always multi-part — go to PHASE 1 and split it across
-    your teammates. If the message is pure chat with no coding work, reply briefly
-    and emit nothing. Only if the work genuinely needs just one agent, classify it
-    "solo" and complete that single piece yourself.
+    Run this strict protocol (the server machine-parses your directives):
 
-    PHASE 1 — PLAN (complex / multi-part / new-project work only). Consult the Fable
-    advisor (Sol/GPT fallback; advisors never edit files; if none responds, plan yourself)
-    and produce a plan. Emit it as ONE single-line directive (stdout/tool log is fine):
-      VIBE_TEAM_PLAN: {"version":2,"classification":"team","architecture":"<pages/routes, backend endpoints, DB schema, styling — one paragraph>","contracts":"<API shapes / schema / naming the slices rely on>","decisions":["<defaults you chose for unspecified choices>"],"foundation":{"files":["<shared files YOU create first: scaffold, package.json, root layout, schema>"]},"task_table":[{"worker":"claude","objective":"<what>","files":["<exact disjoint paths>"],"boundaries":"<what NOT to touch>","fallback":"grok"}],"integrator":"#{worker.handle}","verification":["<checklist: every page/endpoint/schema + build passes; tests if present>"]}
-      - workers only from: #{teammate_handles}; files DISJOINT across rows; shared files
-        (package.json, lockfiles, root layout/nav, DB schema/migrations) never appear in
-        rows — they are yours. Every row needs a concrete file list: vague focuses like
-        "UI polish" are rejected. Gemini/Agy especially must get exact files or it drifts.
-      - "classification":"solo" (with "solo_reason") is valid when the task does not
-        decompose — then do the work yourself and spawn nobody.
-      - For a genuinely user-owned choice (e.g. which database) use the vibeask ask_user
-        tool if available; on no answer pick a sensible default and record it in
-        "decisions". Never block the run on a question.
-    Also write the same plan human-readably to #{handoff_path}.
+    PHASE 0 — ENHANCE. Restate the user's intent internally as a corrected,
+    unambiguous implementation brief. Preserve every explicit constraint and scope;
+    fix typos, resolve harmless ambiguity with sensible defaults, and record those
+    defaults. Narrate briefly that you are refining the request. Do not open source
+    files or perform a code survey.
 
-    PHASE 2 — FOUNDATION. Create the foundation/shared files yourself so teammates land
-    on a building repo, then emit:
-      VIBE_TEAM_SPAWN: <the workers from your task_table>
-    The server dispatches each row from your validated plan (its files/objective become
-    the worker's assignment). You may refine with VIBE_TEAM_FOCUS: worker=<files/notes>.
+    PHASE 1 — ADVISOR PLAN. Build only a lightweight repository map: directory and
+    file paths (for example `rg --files` or a shallow `find`), with no file contents,
+    code reading, or architecture investigation. Narrate that you are calling the
+    advisor. Call the configured ask_fable MCP advisor with exactly:
+      - the enhanced implementation brief;
+      - the lightweight path map;
+      - the available worker handles #{teammate_handles}; and
+      - a request for task_table rows of worker → objective → exact DISJOINT files.
+    The advisor is authoritative for decomposition (its runtime already falls back
+    Fable → Opus → GPT-5.6-Sol). Convert its answer faithfully into ONE single-line
+    directive (stdout/tool log is fine):
+      VIBE_TEAM_PLAN: {"version":2,"classification":"team","architecture":"<advisor summary>","contracts":"<shared contracts>","decisions":["<defaults>"],"foundation":{"files":[]},"task_table":[{"worker":"claude","objective":"<what>","files":["<exact disjoint paths>"],"boundaries":"<what NOT to touch>","fallback":"grok"}],"integrator":"#{worker.handle}","verification":["<checks>" ]}
+    Never invent a replacement decomposition when the advisor responded. Never put
+    @#{worker.handle} in task_table; the lead is not a builder. Every row must name
+    concrete files and no file may appear in two rows. Shared/foundation files must
+    be assigned to one worker, not retained by the lead. If every advisor fallback
+    is unavailable, immediately create the smallest safe disjoint task_table yourself,
+    record "advisor unavailable" in decisions, and continue — never block the run.
+    For a genuinely non-decomposable build request, still emit `classification:"team"`
+    with one worker row; a supervisor lead never turns itself into the solo builder.
+    Write the same plan human-readably to #{handoff_path}; this plan/coordination write
+    is allowed and is not source implementation.
 
-    PHASE 3 — INTEGRATE + VERIFY. Read #{handoff_path} as teammates finish. Walk your
-    verification checklist: every planned page/endpoint/schema implemented (no stubs, no
-    TODO screens) and the project build passes (tests too if present). Prefer to
-    delegate: for any real gap emit another VIBE_TEAM_SPAWN with a gap-scoped focus
-    (the run watchdog also restarts crashed or usage-limited teammates automatically).
-    Only touch files yourself for trivial wiring/integration a spawn would be overkill for.
+    PHASE 2 — DISPATCH. Narrate each dispatch (for example, "Calling Claude…",
+    then "Claude running"). Emit exactly:
+      VIBE_TEAM_SPAWN: <all workers present in the advisor task_table>
+    The server uses the validated task_table as the authoritative assignment. Use
+    VIBE_TEAM_FOCUS only to add a small clarification; never replace the advisor's
+    objective or file ownership.
 
-    PHASE 4 — SUMMARY. One concise user reply: what each agent did, what landed, what
-    remains. No raw tool logs.
+    PHASE 3 — WAIT + CHECK SHARED MEMORY. Do not take over slow work. Let the server
+    monitor true stalls and crashes. Wait for every dispatched row to reach a terminal
+    status, then reread ALL `## <worker> — files: ... — status: ...` sections in
+    #{handoff_path}. Treat those completed handoffs as the source of truth, not your
+    earlier live/transient narration. If a real gap remains, ask the advisor to assign
+    a new disjoint worker slice and emit another plan/spawn cycle. You may do only
+    trivial final wiring that cannot reasonably be delegated, and must record it.
+
+    PHASE 4 — SUMMARY. After all worker streams are settled and all handoff sections
+    have been read, emit the run's only user-facing text: one concise summary of what
+    each worker completed, verification performed, and any honest blocker. Base it on
+    shared memory, not assumptions. No raw tool logs or directive lines in the summary.
 
     Always: do not reset, stash, revert, or overwrite pre-existing user changes.
 
@@ -1322,11 +1369,16 @@ defmodule Vibe.AI.LocalAgentWorker do
     - Read #{handoff_path} first (architecture plan + task table). You are a BUILDER
       unless your focus explicitly says review: implement your assigned focus exactly
       and completely — every file listed, fully implemented, no stubs or TODO screens.
-    - Stay strictly inside your assigned file list. Do not touch shared files
-      (package.json, lockfiles, root layout, DB schema) — the lead owns those.
+    - Stay strictly inside your assigned file list. Shared/foundation files are
+      editable only when the advisor assigned those exact paths to your row; the
+      lead does not own an implementation slice.
     - Avoid rewriting the whole repo or duplicating the lead.
     - Append ownership, findings, exact files changed, verification, and blockers to
       #{handoff_path}. Do not replace other agents' sections.
+    - Completion is not finished until you append exactly one result section headed
+      `## #{worker.handle} — files: <comma-separated exact paths> — status: <done|blocked>`
+      to #{handoff_path}. Include a concise result and verification beneath it. If the
+      file already has your task's section, update only that section idempotently.
     - Do not reset, stash, revert, or overwrite pre-existing user changes.
     - Keep final stdout short (handoff summary only) — not a long user essay.
     - If your work is UI/JSX/frontend, note that for Gemini UI review in the handoff.
@@ -1627,7 +1679,11 @@ defmodule Vibe.AI.LocalAgentWorker do
         "durationMs" => entry["duration_ms"] || entry["durationMs"] || entry[:duration_ms],
         "summary" => entry["summary"] || entry[:summary],
         "taskId" => entry["task_id"] || entry["taskId"] || entry[:task_id],
-        "lastLabel" => entry["last_label"] || entry["lastLabel"] || entry[:last_label]
+        "lastLabel" => entry["last_label"] || entry["lastLabel"] || entry[:last_label],
+        "progressBytes" =>
+          entry["progress_bytes"] || entry["progressBytes"] || entry[:progress_bytes],
+        "lastProgressAt" =>
+          entry["last_progress_at"] || entry["lastProgressAt"] || entry[:last_progress_at]
       }
     end)
   end
@@ -2415,13 +2471,12 @@ defmodule Vibe.AI.LocalAgentWorker do
               |> Enum.filter(fn {_, n} -> n > 1 end)
               |> Enum.map(&elem(&1, 0))
 
-            # Advisory only — the integrator resolves collisions — but flag
-            # blatant overlap so a degenerate plan doesn't slip through silent.
             if dupes != [] do
               Logger.warning("[LocalAgentWorker] team plan overlapping files: #{inspect(dupes)}")
+              ["task_table files overlap: #{Enum.join(dupes, ", ")}" | errs]
+            else
+              errs
             end
-
-            errs
           end)
 
         if errors == [], do: {:ok, plan}, else: {:error, Enum.reverse(errors)}
@@ -2697,25 +2752,39 @@ defmodule Vibe.AI.LocalAgentWorker do
   def note_bridge_team_user_turn(_chat_id, _workers, _text, _requester, _team_run_id), do: :ok
 
   @doc "Record a worker's answer into the shared group memory (no-op in DMs)."
-  def note_bridge_agent_turn(chat_id, worker, text, requester_user_id)
+  def note_bridge_agent_turn(chat_id, worker, text, requester_user_id, opts \\ [])
+
+  def note_bridge_agent_turn(chat_id, worker, text, requester_user_id, opts)
       when is_binary(chat_id) and is_map(worker) do
     if is_binary(text) and String.trim(text) != "" and group_chat?(chat_id) do
-      GroupAgentMemory.append_message(
-        chat_id,
+      message =
         %{
           "role" => "assistant",
           "content" => clean_for_memory(text),
           "agent" => worker.handle,
           "agent_name" => worker.label
-        },
-        acting_user_id: requester_user_id
-      )
+        }
+        |> maybe_put("team_run_id", normalize_string(Keyword.get(opts, :team_run_id)))
+        |> maybe_put("task_id", normalize_string(Keyword.get(opts, :task_id)))
+        |> maybe_put("team_role", normalize_string(Keyword.get(opts, :team_role)))
+        |> maybe_put("team_status", normalize_string(Keyword.get(opts, :status)))
+
+      case GroupAgentMemory.append_message(chat_id, message, acting_user_id: requester_user_id) do
+        {:ok, _memory} ->
+          :ok
+
+        error ->
+          Logger.warning(
+            "[LocalAgentWorker] worker memory append failed chat=#{chat_id} " <>
+              "worker=#{worker.handle} reason=#{inspect(error)}"
+          )
+      end
     end
 
     :ok
   end
 
-  def note_bridge_agent_turn(_chat_id, _worker, _text, _requester), do: :ok
+  def note_bridge_agent_turn(_chat_id, _worker, _text, _requester, _opts), do: :ok
 
   defp maybe_dispatch_next_team_worker(chat_id, worker, requester_user_id, opts) do
     team_run_id = normalize_string(Keyword.get(opts, :team_run_id))
@@ -3230,17 +3299,23 @@ defmodule Vibe.AI.LocalAgentWorker do
             # caps queue age instead of trusting them as liveness forever.
             queued? = String.starts_with?(last_label, "Queued — waiting")
 
+            progress_bytes =
+              metadata["progressBytes"] || metadata[:progress_bytes] ||
+                byte_size(accumulated_output)
+
             Vibe.AI.TeamRunMonitor.note_heartbeat(
               chat_id,
               team_run_id,
               worker.handle,
-              queued?
+              queued?,
+              progress_bytes
             )
 
             update_team_worker_state(chat_id, team_run_id, worker.handle, %{
               "status" => "running",
               "last_label" => String.slice(last_label, 0, 80),
-              "task_id" => metadata["taskId"] || metadata[:task_id]
+              "task_id" => metadata["taskId"] || metadata[:task_id],
+              "progress_bytes" => progress_bytes
             })
           else
             []
@@ -3300,6 +3375,7 @@ defmodule Vibe.AI.LocalAgentWorker do
           )
           |> maybe_put("leadWorker", metadata["leadWorker"] || metadata[:lead_worker])
           |> maybe_put("teamRole", metadata["teamRole"] || metadata[:team_role])
+          |> maybe_put("suppressAllText", if(team_mode == "supervisor", do: true))
           |> maybe_put("suppressVisible", if(suppress_visible?, do: true))
           |> maybe_put("teamWorkersStatus", worker_status_list)
           |> maybe_put("computerId", metadata["computerId"] || metadata[:computer_id])
@@ -5814,6 +5890,19 @@ defmodule Vibe.AI.LocalAgentWorker do
     %{"todos" => todos}
   end
 
+  # Nested MCP: tools.mcp__vibeask__ask_fable({ question: "…" })
+  defp codex_nested_tool_input(name, source) when is_binary(name) do
+    if String.starts_with?(name, "mcp__") or
+         Regex.match?(~r/^[a-z][a-z0-9_-]*__[a-z0-9_-]+$/i, name) do
+      %{}
+      |> maybe_put("question", codex_js_property_string(source, "question"))
+      |> maybe_put("query", codex_js_property_string(source, "query"))
+      |> maybe_put("prompt", codex_js_property_string(source, "prompt"))
+    else
+      %{}
+    end
+  end
+
   defp codex_nested_tool_input(_name, _source), do: %{}
 
   defp codex_js_property_string(source, key) do
@@ -6675,7 +6764,21 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   defp tool_kind_and_target(tool, _input), do: {to_string(tool) |> String.downcase(), nil}
 
-  # "vibeask · ask fable" for mcp__server__tool or server__tool names.
+  # "vibeask · ask advisor" for mcp__server__tool or server__tool names.
+  # Wire tool id stays ask_fable; only the user-facing label is rewritten.
+  defp pretty_mcp_tool_label(tool) when is_binary(tool) do
+    pretty = tool |> String.replace("_", " ") |> String.trim()
+
+    cond do
+      pretty == "" -> ""
+      String.match?(pretty, ~r/^ask\s+fable$/i) -> "ask advisor"
+      String.match?(pretty, ~r/^fable$/i) -> "ask advisor"
+      true -> pretty
+    end
+  end
+
+  defp pretty_mcp_tool_label(_), do: ""
+
   defp mcp_progress_target(tool_name, input) when is_binary(tool_name) do
     t = String.trim(tool_name)
 
@@ -6689,7 +6792,7 @@ defmodule Vibe.AI.LocalAgentWorker do
 
         case parts do
           [server, tool] when server != "" and tool != "" ->
-            pretty = tool |> String.replace("_", " ")
+            pretty = pretty_mcp_tool_label(tool)
             "#{server} · #{pretty}"
 
           _ ->
@@ -6697,7 +6800,7 @@ defmodule Vibe.AI.LocalAgentWorker do
         end
 
       is_map(input) and is_binary(input["server"]) and is_binary(input["tool"]) ->
-        pretty = String.replace(input["tool"], "_", " ")
+        pretty = pretty_mcp_tool_label(input["tool"])
         "#{input["server"]} · #{pretty}"
 
       true ->
@@ -6848,7 +6951,15 @@ defmodule Vibe.AI.LocalAgentWorker do
 
     cond do
       is_binary(mcp) and mcp != "" ->
-        "MCP · #{mcp}"
+        # Prefer "MCP · ask advisor" (tool leaf) over "MCP · vibeask · ask advisor".
+        leaf =
+          mcp
+          |> String.split(" · ")
+          |> List.last()
+          |> to_string()
+          |> String.trim()
+
+        if leaf != "", do: "MCP · #{leaf}", else: "MCP · #{mcp}"
 
       true ->
         case tool_detail(input) do

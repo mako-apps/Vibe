@@ -75,14 +75,39 @@ defmodule Vibe.AI.TeamRunMonitor do
   Progress frame heartbeat. Called from the bridge progress hot path — cast
   only. `queued?` marks bridge admission-queue frames: they prove the bridge is
   alive but the slice hasn't started, so they feed a queue-age cap instead of
-  resetting the stall clock indefinitely.
+  resetting the stall clock indefinitely. `progress_bytes` is a monotonically
+  increasing per-channel counter; only a change in that counter advances the
+  true-stall clock. A reconnect may reset the counter and is treated as progress
+  once, after which growth is measured from the new baseline.
   """
-  def note_heartbeat(chat_id, team_run_id, worker_handle, queued? \\ false) do
-    cast(chat_id, team_run_id, {:heartbeat, worker_handle, queued? == true})
+  def note_heartbeat(
+        chat_id,
+        team_run_id,
+        worker_handle,
+        queued? \\ false,
+        progress_bytes \\ nil
+      ) do
+    cast(
+      chat_id,
+      team_run_id,
+      {:heartbeat, worker_handle, queued? == true, normalize_progress_bytes(progress_bytes)}
+    )
   end
 
-  def note_settled(chat_id, team_run_id, worker_handle, ok?, usage_limit?) do
-    cast(chat_id, team_run_id, {:settled, worker_handle, ok? == true, usage_limit? == true})
+  def note_settled(
+        chat_id,
+        team_run_id,
+        worker_handle,
+        ok?,
+        usage_limit?,
+        retryable_crash? \\ true
+      ) do
+    cast(
+      chat_id,
+      team_run_id,
+      {:settled, worker_handle, ok? == true, usage_limit? == true,
+       retryable_crash? == true}
+    )
   end
 
   # Cancel only tears down an already-armed monitor; it never starts one.
@@ -136,7 +161,8 @@ defmodule Vibe.AI.TeamRunMonitor do
           chat_id: chat_id,
           team_run_id: team_run_id,
           lead: Map.get(run, :lead_worker),
-          # handle => %{beat: ms, spawned_at: ms, retries: n, terminal: bool}
+          # handle => %{last_progress_at, last_progress_bytes, last_frame_at,
+          #             spawned_at, retries, terminal}
           rows: rehydrate_rows(chat_id, team_run_id, now),
           run_retries: 0,
           last_activity: now,
@@ -166,6 +192,9 @@ defmodule Vibe.AI.TeamRunMonitor do
       if is_binary(handle) do
         Map.put(acc, handle, %{
           beat: now,
+          last_frame_at: now,
+          last_progress_at: now,
+          last_progress_bytes: entry["progressBytes"] || entry[:progress_bytes] || 0,
           spawned_at: now,
           retries: 0,
           terminal: status in ["done", "failed", "reassigned", "cancelled"]
@@ -183,6 +212,9 @@ defmodule Vibe.AI.TeamRunMonitor do
     rows =
       Map.put(state.rows, handle, %{
         beat: now,
+        last_frame_at: now,
+        last_progress_at: now,
+        last_progress_bytes: 0,
         spawned_at: now,
         retries: Map.get(state.rows, handle, %{})[:retries] || 0,
         terminal: false
@@ -191,7 +223,8 @@ defmodule Vibe.AI.TeamRunMonitor do
     {:noreply, %{state | rows: rows, last_activity: now}}
   end
 
-  def handle_cast({:heartbeat, handle, queued?}, state) when is_binary(handle) do
+  def handle_cast({:heartbeat, handle, queued?, progress_bytes}, state)
+      when is_binary(handle) do
     now = now_ms()
 
     rows =
@@ -200,6 +233,9 @@ defmodule Vibe.AI.TeamRunMonitor do
         handle,
         %{
           beat: now,
+          last_frame_at: now,
+          last_progress_at: now,
+          last_progress_bytes: progress_bytes || 0,
           spawned_at: now,
           retries: 0,
           terminal: false,
@@ -214,8 +250,23 @@ defmodule Vibe.AI.TeamRunMonitor do
               true -> nil
             end
 
+          previous_bytes = Map.get(row, :last_progress_bytes)
+
+          bytes_changed? =
+            is_integer(progress_bytes) and
+              (not is_integer(previous_bytes) or progress_bytes != previous_bytes)
+
           row
-          |> Map.merge(%{beat: now, terminal: false})
+          |> Map.merge(%{beat: now, last_frame_at: now, terminal: false})
+          |> then(fn updated ->
+            if bytes_changed? and not queued? do
+              updated
+              |> Map.put(:last_progress_bytes, progress_bytes)
+              |> Map.put(:last_progress_at, now)
+            else
+              updated
+            end
+          end)
           |> Map.put(:queued_since, queued_since)
         end
       )
@@ -223,9 +274,20 @@ defmodule Vibe.AI.TeamRunMonitor do
     {:noreply, %{state | rows: rows, last_activity: now}}
   end
 
-  def handle_cast({:settled, handle, ok?, usage_limit?}, state) when is_binary(handle) do
+  def handle_cast({:settled, handle, ok?, usage_limit?, retryable_crash?}, state)
+      when is_binary(handle) do
     now = now_ms()
-    row = Map.get(state.rows, handle, %{beat: now, spawned_at: now, retries: 0, terminal: false})
+
+    row =
+      Map.get(state.rows, handle, %{
+        beat: now,
+        last_frame_at: now,
+        last_progress_at: now,
+        last_progress_bytes: 0,
+        spawned_at: now,
+        retries: 0,
+        terminal: false
+      })
 
     state =
       cond do
@@ -243,6 +305,14 @@ defmodule Vibe.AI.TeamRunMonitor do
 
         usage_limit? ->
           reassign_row(state, handle, row, now)
+
+        not retryable_crash? ->
+          Logger.info(
+            "[TeamRunMonitor] external signal exit — no retry chat=#{state.chat_id} " <>
+              "run=#{state.team_run_id} worker=#{handle}"
+          )
+
+          put_row(state, handle, %{row | terminal: true, beat: now})
 
         true ->
           retry_row(state, handle, row, now, "failed")
@@ -324,10 +394,15 @@ defmodule Vibe.AI.TeamRunMonitor do
   # ── Interventions ──
 
   # Stall only applies to rows the durable state believes are actively running —
-  # queued/pending rows are waiting on the bridge slot, not stuck.
+  # queued/pending rows are waiting on the bridge slot, not stuck. Frame arrival
+  # by itself is not progress: a repeated/empty frame only updates last_frame_at.
+  # Conversely, a laggy large push remains healthy as long as received bytes keep
+  # changing, even if its latest rendered frame is old in transit.
   defp stalled?(handle, row, state, now) do
-    silent_for = now - row.beat
-    grace = if(row.beat == row.spawned_at, do: @first_frame_grace_ms, else: @stall_ms)
+    last_progress_at = Map.get(row, :last_progress_at) || row.spawned_at
+    last_progress_bytes = Map.get(row, :last_progress_bytes) || 0
+    silent_for = now - last_progress_at
+    grace = if(last_progress_bytes == 0, do: @first_frame_grace_ms, else: @stall_ms)
 
     silent_for > grace and durable_status(state, handle) == "running"
   end
@@ -372,7 +447,15 @@ defmodule Vibe.AI.TeamRunMonitor do
              ) do
           :ok ->
             state
-            |> put_row(handle, %{row | retries: row.retries + 1, beat: now, spawned_at: now})
+            |> put_row(handle, %{
+              row
+              | retries: row.retries + 1,
+                beat: now,
+                last_frame_at: now,
+                last_progress_at: now,
+                last_progress_bytes: 0,
+                spawned_at: now
+            })
             |> Map.update!(:run_retries, &(&1 + 1))
 
           {:error, _} ->
@@ -411,7 +494,15 @@ defmodule Vibe.AI.TeamRunMonitor do
 
           state
           |> put_row(handle, %{row | terminal: true, beat: now})
-          |> put_row(fallback, %{beat: now, spawned_at: now, retries: 0, terminal: false})
+          |> put_row(fallback, %{
+            beat: now,
+            last_frame_at: now,
+            last_progress_at: now,
+            last_progress_bytes: 0,
+            spawned_at: now,
+            retries: 0,
+            terminal: false
+          })
           |> Map.update!(:run_retries, &(&1 + 1))
 
         {:error, :no_fallback} ->
@@ -461,4 +552,15 @@ defmodule Vibe.AI.TeamRunMonitor do
   end
 
   defp now_ms, do: System.system_time(:millisecond)
+
+  defp normalize_progress_bytes(value) when is_integer(value) and value >= 0, do: value
+
+  defp normalize_progress_bytes(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {bytes, _} when bytes >= 0 -> bytes
+      _ -> nil
+    end
+  end
+
+  defp normalize_progress_bytes(_), do: nil
 end

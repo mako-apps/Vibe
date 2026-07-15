@@ -25,8 +25,10 @@ defmodule Vibe.AgentBridge do
   @pairing_table :agent_bridge_pairings
   @request_table :agent_bridge_requests
   @pending_ask_table :agent_bridge_pending_asks
+  @pending_task_table :agent_bridge_pending_tasks
   @pairing_ttl_ms 10 * 60 * 1000
   @request_ttl_ms 10 * 60 * 1000
+  @pending_task_ttl_ms 30 * 60 * 1000
 
   # ── Scan-to-pair (daemon-initiated; the phone scans the desktop QR) ──
 
@@ -441,11 +443,83 @@ defmodule Vibe.AgentBridge do
 
   @doc """
   Push a task to a user's connected bridge daemon. Returns `:ok` if a bridge is
-  online and the task was dispatched, `{:error, :offline}` otherwise.
+  online and the task was dispatched. During a paired bridge's short Presence
+  flap, parks the task by taskId and returns `:ok`; the bridge channel flushes it
+  on rejoin. Repeated dispatches of the same taskId are idempotent.
   """
   def dispatch_task(user_id, payload) when is_binary(user_id) and is_map(payload) do
-    dispatch_to_computer(user_id, "run_task", payload)
+    case dispatch_to_computer(user_id, "run_task", payload) do
+      :ok ->
+        :ok
+
+      {:error, reason} = error when reason in [:offline, :computer_offline] ->
+        if paired?(user_id), do: queue_pending_task(user_id, payload), else: error
+
+      error ->
+        error
+    end
   end
+
+  @doc """
+  Flush queued run_task payloads eligible for a bridge that just joined.
+
+  Eligibility respects an explicit computerId. An unscoped task is claimed by
+  the first rejoining computer. `:ets.take/2` atomically removes the dedupe key,
+  so simultaneous joins cannot broadcast the same task twice.
+  """
+  def flush_pending_tasks(user_id, computer_id, device_label)
+      when is_binary(user_id) and is_binary(computer_id) do
+    ensure_table(@pending_task_table)
+    now = System.system_time(:millisecond)
+
+    @pending_task_table
+    |> :ets.tab2list()
+    |> Enum.reduce(0, fn
+      {{^user_id, task_id} = key, entry}, count ->
+        requested = Map.get(entry, :computer_id)
+
+        cond do
+          now - entry.queued_at > @pending_task_ttl_ms ->
+            :ets.delete(@pending_task_table, key)
+            count
+
+          is_binary(requested) and requested != computer_id ->
+            count
+
+          true ->
+            case :ets.take(@pending_task_table, key) do
+              [{^key, claimed}] ->
+                payload =
+                  claimed.payload
+                  |> Map.put("computerId", computer_id)
+                  |> Map.put("computerLabel", normalize(device_label) || "computer")
+
+                VibeWeb.Endpoint.broadcast(topic(user_id), "run_task", payload)
+
+                Logger.info(
+                  "[AgentBridge] flushed queued task user=#{user_id} computer=#{computer_id} task=#{task_id}"
+                )
+
+                count + 1
+
+              _ ->
+                count
+            end
+        end
+
+      {_other_key, _entry}, count ->
+        count
+    end)
+  rescue
+    error ->
+      Logger.warning(
+        "[AgentBridge] pending task flush failed user=#{user_id}: #{Exception.message(error)}"
+      )
+
+      0
+  end
+
+  def flush_pending_tasks(_, _, _), do: 0
 
   @doc """
   Push a control action to the connected bridge daemon for an in-flight task.
@@ -842,6 +916,36 @@ defmodule Vibe.AgentBridge do
         )
 
         :ok
+    end
+  end
+
+  defp queue_pending_task(user_id, payload) do
+    ensure_table(@pending_task_table)
+    task_id = normalize(payload["taskId"] || payload["task_id"])
+
+    if is_binary(task_id) do
+      key = {user_id, task_id}
+
+      entry = %{
+        payload: payload,
+        computer_id:
+          normalize(
+            payload["computerId"] || payload["computer_id"] ||
+              payload["agentBridgeComputerId"] || payload["agent_bridge_computer_id"]
+          ),
+        queued_at: System.system_time(:millisecond)
+      }
+
+      inserted? = :ets.insert_new(@pending_task_table, {key, entry})
+
+      Logger.info(
+        "[AgentBridge] #{if(inserted?, do: "queued", else: "deduped")} task during reconnect " <>
+          "user=#{user_id} task=#{task_id}"
+      )
+
+      :ok
+    else
+      {:error, :offline}
     end
   end
 

@@ -20,9 +20,12 @@ defmodule Vibe.AI.TeamRun do
   @foreign_key_type :binary_id
 
   schema "agent_team_runs" do
-    field :chat_id, :binary_id
+    # chat ids are strings server-wide (legacy chats use short non-UUID ids like
+    # "ccd43b50-2e1"); computer ids are opaque bridge tokens. :binary_id here made
+    # durable registration crash into the ETS fallback for every legacy chat.
+    field :chat_id, :string
     field :requester_user_id, :binary_id
-    field :computer_id, :binary_id
+    field :computer_id, :string
     field :reply_to_id, :string
     field :workers, {:array, :string}, default: []
     field :current_index, :integer, default: 0

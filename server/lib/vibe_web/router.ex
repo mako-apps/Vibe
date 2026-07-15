@@ -61,6 +61,13 @@ defmodule VibeWeb.Router do
     # later claims the token with its device_secret (both unauth, secret-scoped).
     post "/agent-bridge/request", AgentBridgeController, :start_request
     post "/agent-bridge/claim", AgentBridgeController, :claim
+
+    # Multi-account device pairing (Telegram-style add/switch account). A new
+    # device starts a code-scoped request and later claims the approved token —
+    # both unauth (the requester has no account session yet). Approval is
+    # authenticated (below).
+    post "/account/devices/pairing", AccountDeviceController, :start_pairing
+    post "/account/devices/pairing/:code/claim", AccountDeviceController, :claim_pairing
   end
 
   scope "/api", VibeWeb do
@@ -83,6 +90,11 @@ defmodule VibeWeb.Router do
     # PreKey
     get "/user/:id/prekey-bundle", EncryptionController, :get_bundle
     post "/user/prekey-bundle", EncryptionController, :upload_bundle
+
+    # Account devices — linked-device management + approving a pending pairing.
+    get "/account/devices", AccountDeviceController, :index
+    delete "/account/devices/:id", AccountDeviceController, :delete
+    post "/account/devices/pairing/:code/approve", AccountDeviceController, :approve_pairing
 
     # Chat
     post "/chat", ChatController, :create

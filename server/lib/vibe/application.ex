@@ -18,6 +18,7 @@ defmodule Vibe.Application do
     ensure_ets_table(:local_agent_worker_sessions)
     ensure_ets_table(:agent_bridge_pairings)
     ensure_ets_table(:agent_bridge_requests)
+    ensure_ets_table(:agent_bridge_pending_tasks)
 
     children = [
       # Start the Telemetry supervisor

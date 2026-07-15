@@ -56,6 +56,15 @@ defmodule VibeWeb.AgentBridgeChannel do
       "[AgentBridge] computer online user=#{socket.assigns.user_id} computer=#{computer_id}"
     )
 
+    # A run_task accepted while Presence was between leave/join is parked in ETS.
+    # Flush only tasks eligible for this computer; :ets.take in AgentBridge makes
+    # simultaneous rejoins idempotent by taskId.
+    AgentBridge.flush_pending_tasks(
+      to_string(socket.assigns.user_id),
+      computer_id,
+      socket.assigns[:device_label] || "computer"
+    )
+
     {:noreply, socket}
   end
 
@@ -131,6 +140,7 @@ defmodule VibeWeb.AgentBridgeChannel do
         lines: [],
         stream_id: new_stream_id(chat_id, provider, task_id),
         progress_count: 0,
+        progress_bytes: 0,
         last_latency_log_at: 0
       })
 
@@ -138,6 +148,7 @@ defmodule VibeWeb.AgentBridgeChannel do
     accumulated = lines |> Enum.reverse() |> Enum.join("\n")
     task_id = task_id || Map.get(state, :task_id)
     progress_count = (Map.get(state, :progress_count) || 0) + 1
+    progress_bytes = (Map.get(state, :progress_bytes) || 0) + byte_size(line)
 
     source_message_id =
       payload["sourceMessageId"] ||
@@ -157,6 +168,7 @@ defmodule VibeWeb.AgentBridgeChannel do
         model: payload["model"] || Map.get(state, :model),
         advisor: payload["advisor"] || Map.get(state, :advisor),
         progress_count: progress_count,
+        progress_bytes: progress_bytes,
         bridge_sent_at_ms:
           payload["sentAtMs"] || payload["sent_at_ms"] || Map.get(state, :bridge_sent_at_ms),
         sequence: payload["sequence"] || Map.get(state, :sequence),
@@ -195,6 +207,7 @@ defmodule VibeWeb.AgentBridgeChannel do
       bridge_sent_at_ms: state.bridge_sent_at_ms,
       server_received_at_ms: received_at_ms,
       sequence: state.sequence,
+      progress_bytes: state.progress_bytes,
       team_mode: state.team_mode,
       team_run_id: state.team_run_id,
       team_worker: state.team_worker,
@@ -218,7 +231,7 @@ defmodule VibeWeb.AgentBridgeChannel do
     state =
       if should_log do
         Logger.info(
-          "[AgentBridge] progress latency provider=#{provider} chat=#{chat_id} task=#{inspect(task_id)} seq=#{inspect(state.sequence)} count=#{progress_count} bridgeLagMs=#{inspect(bridge_lag_ms)} parseMs=#{parse_ms} bytes=#{byte_size(accumulated)} lines=#{length(lines)}"
+          "[AgentBridge] progress latency provider=#{provider} chat=#{chat_id} task=#{inspect(task_id)} seq=#{inspect(state.sequence)} count=#{progress_count} bridgeLagMs=#{inspect(bridge_lag_ms)} parseMs=#{parse_ms} bytes=#{progress_bytes} bufferedBytes=#{byte_size(accumulated)} lines=#{length(lines)}"
         )
 
         Map.put(state, :last_latency_log_at, now_mono)

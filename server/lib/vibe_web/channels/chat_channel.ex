@@ -14,10 +14,6 @@ defmodule VibeWeb.ChatChannel do
   # bridge dispatch; they are stripped from the broadcast + persisted row so devices
   # never ingest a 270KB+ metadata blob. The bridge reads them off the untouched data.
   @inline_attachment_keys ~w(agentBridgeAttachmentsEnc agent_bridge_attachments_enc attachmentsEnc)
-  # Presence briefly drops while the desktop bridge reconnects. A paired bridge is
-  # still a valid task target, so absorb that short gap before showing an offline notice.
-  @bridge_dispatch_retry_delays [0, 400, 1_000, 2_000]
-
   @impl true
   def join("chat:" <> chat_id, _payload, socket) do
     user_id = socket.assigns.user_id
@@ -1185,9 +1181,8 @@ defmodule VibeWeb.ChatChannel do
         :ok
 
       # Preferred path: run on the user's OWN paired computer (their subscription).
-      # A bridge can be paired but temporarily absent from Presence while its socket
-      # reconnects. Do not convert a valid mobile message into a connect notice in
-      # that small window; retry the actual dispatch before declaring it unavailable.
+      # AgentBridge durably accepts run_task into its taskId-deduped reconnect queue
+      # when Presence is briefly absent, then flushes it as the bridge rejoins.
       #
       # IMPORTANT: build the bridge prompt *inside* the Task, not before start_child.
       # Group fan-out calls this once per agent; synchronous prompt build (group
@@ -1373,15 +1368,10 @@ defmodule VibeWeb.ChatChannel do
     do: LocalAgentWorker.clear_bridge_team_run(chat_id, team_run_id)
 
   defp dispatch_bridge_task_with_reconnect_grace(requester_user_id, task_payload) do
-    Enum.reduce_while(@bridge_dispatch_retry_delays, {:error, :offline}, fn delay, _result ->
-      if delay > 0, do: Process.sleep(delay)
-
-      case AgentBridge.dispatch_task(requester_user_id, task_payload) do
-        :ok -> {:halt, :ok}
-        {:error, :offline} = offline -> {:cont, offline}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
+    # Kept as a named boundary for existing call sites. The reconnect grace is
+    # now queue-backed rather than sleep/retry-backed, so dispatch tasks do not
+    # occupy a supervisor slot during a socket flap.
+    AgentBridge.dispatch_task(requester_user_id, task_payload)
   end
 
   defp note_bridge_dispatch_turn(
