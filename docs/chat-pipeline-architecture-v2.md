@@ -1,7 +1,23 @@
 # Chat pipeline architecture v2 — single store, delta updates
 
-Status: TARGET (2026-07-16). Staged migration in progress; each stage must leave the
-app building and behaviorally stable.
+Status: IMPLEMENTED 2026-07-16/17 (stages A1 51ad673, A2 f2a1b0c, B1 ff6058c,
+C batch-1 9cd4dfd, C batch-2 7a72b54, B2 — see git log). Every stage gated by a
+green full iOS Simulator build. Remaining: device soak, A3 (optional dual-store
+collapse), supervised RCT-leftover pass in VibeCallUiCoordinator, view overlay
+(`nativeEngineRowsById`) deletion once statusAuthority-OFF bridge-history flows are
+delta-fied. The `.orig` backup file in ChatModule should be deleted manually (it
+polluted two dead-code scans).
+
+## What changed at the view boundary (B2)
+
+The open path is now: commit-first push mounts the seed → presentation completion
+triggers ONE coalesced off-main engine read through the same `chatDelta` refresh
+path all live updates use → render-aware equality reconciles (zero repaints when
+nothing changed). Deleted outright: the retained-payload presentation flush
+(`rowsDeferredUntilPresentation*`, fallback timer, `retainRowsDeferredUntil
+Presentation` identity-merge) and the warm-transcript baseline union
+(`warmTranscriptBaseline*`, `mergeIntoWarmTranscriptBaseline`) — partial
+incremental arrays are guarded by mergedRowsPayload's native-primary read instead.
 
 ## Why v1 is wrong (the production risk)
 

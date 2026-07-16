@@ -761,11 +761,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// the bounded tail nor a complete cached transcript can start collection measurement
   /// inside the push animation.
   private var defersTranscriptUpdatesForPresentation = false
-  private var rowsDeferredUntilPresentation: [[String: Any]]?
-  private var rowsDeferredUntilPresentationAuthority: RowsAuthority?
-  private var rowsDeferredUntilPresentationExplicitEmpty = false
-  private var transcriptPresentationDidComplete = false
-  private var presentationTranscriptFallbackWorkItem: DispatchWorkItem?
   /// Large transcripts always stay mounted as one stable collection. Uncached rows use
   /// the same cheap sizing as the navigation seed, then exact heights are filled during
   /// short post-presentation slices. This keeps the push free of rich-cell measurement
@@ -866,11 +861,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// Uptime when this view bound to the current chat (the tap). Open-path stage logs
   /// print deltas from it so a slow open names its blocker instead of being guessed at.
   private var chatOpenStartedAt: TimeInterval = 0
-  /// A reopened controller paints this cached raw transcript immediately. Until the
-  /// controller's completed `getChatRows` snapshot arrives, engine/status emissions are
-  /// incremental overlays and must not replace the baseline with their partial payload.
-  private var warmTranscriptBaselineActive = false
-  private var warmTranscriptBaselineSourceRows: [[String: Any]] = []
   private var windowedTranscriptSourceRows: [[String: Any]]?
   private var windowedTranscriptVisibleCount = 0
   private var isRevealingOlderTranscriptRows = false
@@ -4450,8 +4440,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     Self.warmTranscriptSnapshotOrder.removeAll { $0 == chatId }
     Self.warmTranscriptSnapshotOrder.append(chatId)
     sourceRowsPayload = snapshot.sourceRows
-    warmTranscriptBaselineActive = !snapshot.sourceRows.isEmpty
-    warmTranscriptBaselineSourceRows = snapshot.sourceRows
     messageHeightCache = snapshot.messageHeightCache
     agentTurnHeightCache = snapshot.agentTurnHeightCache
     // Arm parsed-row reuse with the snapshot's already-parsed transcript so the
@@ -4468,14 +4456,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
     if !reuseCache.isEmpty { reusableParsedRowsByKey = reuseCache }
     if defersTranscriptUpdatesForPresentation {
-      // Keep the parsed/cache snapshot available, but do not put it into UICollectionView
-      // until the navigation controller completes the push. Route initial rows and the
-      // asynchronous engine snapshot coalesce into this same pending payload.
-      retainRowsDeferredUntilPresentation(
-        snapshot.sourceRows,
-        authority: .fullSnapshot,
-        isExplicitEmpty: false
-      )
+      // Mount the snapshot as the presentation seed; nothing is retained for a flush
+      // any more — presentation completion reconciles against ONE engine read (v2).
       installPresentationSeedIfNeeded(
         sourceRows: snapshot.sourceRows,
         preferredParsedRows: snapshot.rows
@@ -4498,39 +4480,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     NSLog(
       "[ChatOpen] warm-tail RESTORE chat=%@ visible=%d cached=%d",
       String(chatId.prefix(12)), rows.count, max(snapshot.rows.count, snapshot.sourceRows.count))
-  }
-
-  /// Union a partial route/status/engine payload into the last complete raw transcript.
-  /// Existing order stays stable; matching messages are refreshed in place and genuinely
-  /// new messages append. Deletions still flow through `nativeDeletedMessageIds` during
-  /// `mergedRowsPayload`, while a completed history snapshot ends this temporary mode.
-  private func mergeIntoWarmTranscriptBaseline(
-    _ incomingRows: [[String: Any]]
-  ) -> [[String: Any]] {
-    guard warmTranscriptBaselineActive, !warmTranscriptBaselineSourceRows.isEmpty else {
-      return incomingRows
-    }
-    guard !incomingRows.isEmpty else { return warmTranscriptBaselineSourceRows }
-
-    var merged = warmTranscriptBaselineSourceRows
-    var indexByMessageId: [String: Int] = [:]
-    indexByMessageId.reserveCapacity(merged.count)
-    for (index, row) in merged.enumerated() {
-      if let messageId = messageId(fromRawRow: row) {
-        indexByMessageId[messageId] = index
-      }
-    }
-    for row in incomingRows {
-      guard let messageId = messageId(fromRawRow: row) else { continue }
-      if let index = indexByMessageId[messageId] {
-        merged[index] = row
-      } else {
-        indexByMessageId[messageId] = merged.count
-        merged.append(row)
-      }
-    }
-    warmTranscriptBaselineSourceRows = merged
-    return merged
   }
 
   /// Parsing is cheap compared with rich-cell measurement, so retain every cached row in
@@ -5263,118 +5212,28 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
   }
 
-  /// The hosting controller toggles this around its navigation transition. Transcript
-  /// updates continue arriving and coalescing, but UICollectionView receives only the
-  /// newest complete payload after the destination page is fully presented.
+  /// The hosting controller toggles this around its navigation transition. Pipeline-v2:
+  /// nothing is retained during the push — the mounted seed carries the transition, and
+  /// releasing the defer reconciles it against ONE coalesced off-main engine read (the
+  /// same path chatDelta updates use). Render-aware equality makes the no-change case a
+  /// zero-repaint reconcile; real changes batch without animations into the seed.
   func setDefersTranscriptUpdatesForPresentation(_ value: Bool) {
     guard defersTranscriptUpdatesForPresentation != value else { return }
     defersTranscriptUpdatesForPresentation = value
-    if value {
-      transcriptPresentationDidComplete = false
-      presentationTranscriptFallbackWorkItem?.cancel()
-      presentationTranscriptFallbackWorkItem = nil
-      return
-    }
-
-    presentationTranscriptFallbackWorkItem?.cancel()
-    presentationTranscriptFallbackWorkItem = nil
-    let payload = rowsDeferredUntilPresentation
-    let authority = rowsDeferredUntilPresentationAuthority ?? .incremental
-    let isExplicitEmpty = rowsDeferredUntilPresentationExplicitEmpty
-    rowsDeferredUntilPresentation = nil
-    rowsDeferredUntilPresentationAuthority = nil
-    rowsDeferredUntilPresentationExplicitEmpty = false
-    guard let payload else {
-      scheduleProgressiveHeightWarmup()
-      return
-    }
-
-    if isExplicitEmpty {
-      allowsNextExplicitEmptyRows = true
-    }
+    guard !value else { return }
     NSLog(
-      "[ChatOpen] presentation-flush chat=%@ rows=%d authority=%@",
-      String(engineChatId.prefix(12)), payload.count,
-      authority == .fullSnapshot ? "full" : "incremental")
-    applyRows(payload, authority: authority)
+      "[ChatOpen] presentation-complete chat=%@ — reconciling from engine",
+      String(engineChatId.prefix(12)))
+    refreshRowsFromEngineDelta()
+    scheduleProgressiveHeightWarmup()
   }
 
   /// Called from the destination controller's `viewDidAppear`, after UIKit has released
-  /// the navigation transaction. A complete warm/native snapshot flushes on the next
-  /// runloop; a short fallback prevents a genuinely cold/slow engine read from leaving
-  /// the transcript blank indefinitely.
+  /// the navigation transaction.
   func completeTranscriptPresentation() {
     guard defersTranscriptUpdatesForPresentation else { return }
-    transcriptPresentationDidComplete = true
-    if rowsDeferredUntilPresentationAuthority == .fullSnapshot {
-      DispatchQueue.main.async { [weak self] in
-        self?.setDefersTranscriptUpdatesForPresentation(false)
-      }
-      return
-    }
-
-    presentationTranscriptFallbackWorkItem?.cancel()
-    let work = DispatchWorkItem { [weak self] in
+    DispatchQueue.main.async { [weak self] in
       self?.setDefersTranscriptUpdatesForPresentation(false)
-    }
-    presentationTranscriptFallbackWorkItem = work
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: work)
-  }
-
-  private func retainRowsDeferredUntilPresentation(
-    _ incomingRows: [[String: Any]],
-    authority: RowsAuthority,
-    isExplicitEmpty: Bool
-  ) {
-    if isExplicitEmpty {
-      rowsDeferredUntilPresentation = []
-      rowsDeferredUntilPresentationAuthority = .fullSnapshot
-      rowsDeferredUntilPresentationExplicitEmpty = true
-      return
-    }
-    guard !incomingRows.isEmpty else { return }
-
-    guard let retainedRows = rowsDeferredUntilPresentation else {
-      rowsDeferredUntilPresentation = incomingRows
-      rowsDeferredUntilPresentationAuthority = authority
-      return
-    }
-    if authority == .fullSnapshot {
-      rowsDeferredUntilPresentation = incomingRows
-      rowsDeferredUntilPresentationAuthority = .fullSnapshot
-      if transcriptPresentationDidComplete {
-        DispatchQueue.main.async { [weak self] in
-          self?.setDefersTranscriptUpdatesForPresentation(false)
-        }
-      }
-      return
-    }
-
-    // Incremental route/status rows must not replace a complete warm/native transcript.
-    // Merge them by stable message/key identity while preserving the cached order.
-    var merged = retainedRows.filter { (($0["kind"] as? String)?.lowercased() != "day") }
-    var indexByIdentity: [String: Int] = [:]
-    indexByIdentity.reserveCapacity(merged.count)
-    func identity(for row: [String: Any]) -> String? {
-      if let messageId = messageId(fromRawRow: row) { return "message:\(messageId)" }
-      if let key = row["key"] as? String, !key.isEmpty { return "key:\(key)" }
-      return nil
-    }
-    for (index, row) in merged.enumerated() {
-      if let identity = identity(for: row) { indexByIdentity[identity] = index }
-    }
-    for row in incomingRows {
-      if (row["kind"] as? String)?.lowercased() == "day" { continue }
-      if let identity = identity(for: row), let index = indexByIdentity[identity] {
-        merged[index] = row
-      } else {
-        if let identity = identity(for: row) { indexByIdentity[identity] = merged.count }
-        merged.append(row)
-      }
-    }
-    rowsDeferredUntilPresentation = merged
-    if rowsDeferredUntilPresentationAuthority != .fullSnapshot {
-      rowsDeferredUntilPresentationAuthority = .incremental
     }
   }
 
@@ -5638,37 +5497,20 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       )
       return
     }
-    if (authority == .fullSnapshot && !nextRows.isEmpty) || isExplicitEmpty {
-      warmTranscriptBaselineActive = false
-      warmTranscriptBaselineSourceRows = []
-    }
     if isExplicitEmpty {
       liveAgentTurnHighWaterByKey.removeAll()
     }
-    let effectiveRows =
-      authority == .incremental
-      ? mergeIntoWarmTranscriptBaseline(nextRows)
-      : nextRows
-    if warmTranscriptBaselineActive, effectiveRows.count != nextRows.count {
-      let retainedCount = max(0, effectiveRows.count - nextRows.count)
-      NSLog(
-        "[ChatOpen] warm-baseline MERGE chat=%@ incoming=%d retained=%d effective=%d",
-        String(engineChatId.prefix(12)), nextRows.count,
-        retainedCount,
-        effectiveRows.count)
-    }
-    if defersTranscriptUpdatesForPresentation {
-      retainRowsDeferredUntilPresentation(
-        effectiveRows,
-        authority: authority,
-        isExplicitEmpty: isExplicitEmpty
-      )
-      if !isExplicitEmpty {
-        installPresentationSeedIfNeeded(sourceRows: effectiveRows)
-      }
+    // Pipeline-v2: no warm-baseline union — mergedRowsPayload's native-primary path
+    // already replaces partial incremental arrays with the full engine read once
+    // history is loaded, and pre-history partial arrays ARE the truth.
+    let effectiveRows = nextRows
+    if defersTranscriptUpdatesForPresentation, !isExplicitEmpty {
+      // Mid-push: keep the seed fresh; presentation completion reconciles from the
+      // engine, so nothing is retained here any more.
+      installPresentationSeedIfNeeded(sourceRows: effectiveRows)
       VibeDebugLog.log(
-        "[ChatOpen] setRows presentation-DEFER chat=%@ incoming=%d effective=%d authority=%@",
-        String(engineChatId.prefix(12)), nextRows.count, effectiveRows.count,
+        "[ChatOpen] setRows presentation-DEFER chat=%@ incoming=%d authority=%@",
+        String(engineChatId.prefix(12)), nextRows.count,
         authority == .fullSnapshot ? "full" : "incremental")
       return
     }
@@ -7356,9 +7198,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     shouldApplyOpeningViewport = true
     loadPersistedOpeningViewport(chatId: next)
     preloadReopenSnapshotFromDiskIfNeeded()
-    rowsDeferredUntilPresentation = nil
-    rowsDeferredUntilPresentationAuthority = nil
-    rowsDeferredUntilPresentationExplicitEmpty = false
     progressiveHeightWarmupWorkItem?.cancel()
     progressiveHeightWarmupWorkItem = nil
     progressiveHeightWarmupKeys = []
@@ -7373,8 +7212,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     deltaStreamCoalesceWorkItem = nil
     engineDeltaRefreshPending = false
     nextApplyBaseIsEngineAuthoritative = false
-    warmTranscriptBaselineActive = false
-    warmTranscriptBaselineSourceRows = []
     windowedTranscriptSourceRows = nil
     windowedTranscriptVisibleCount = 0
     isRevealingOlderTranscriptRows = false
