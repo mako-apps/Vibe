@@ -847,7 +847,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let screenY: Double
     let atBottom: Bool
     let savedAt: Double
+    /// Scroll memory is session-scoped by request: reopening a chat you left mid-history
+    /// returns to that spot only within the same app run. After a full app close the
+    /// record's token no longer matches and the chat opens at the bottom (or the unread
+    /// anchor). Optional so pre-token records simply decode as stale.
+    var bootToken: String?
   }
+
+  /// One value per app process — the viewport records' session identity.
+  private static let viewportBootToken = UUID().uuidString
   private static let persistedViewportKeyPrefix = "vibe.ios.chat.viewport.v1"
   private var persistedOpeningViewport: PersistedViewport?
   private var openingUnreadCount = 0
@@ -1927,6 +1935,17 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let image = renderer.image { _ in
       collectionView.drawHierarchy(
         in: CGRect(origin: .zero, size: size), afterScreenUpdates: false)
+      // Floating sender avatars are siblings glued over the list, so the subtree
+      // render above misses them — composite the visible ones in, or group reopens
+      // show bubbles with the avatars popping in only at the live mount. Convert via
+      // self (screen space), not the scroll view (content space).
+      for avatarView in senderAvatarViews.values where !avatarView.isHidden {
+        let frameInSelf = avatarView.convert(avatarView.bounds, to: self)
+        let target = frameInSelf.offsetBy(
+          dx: -collectionView.frame.minX, dy: -collectionView.frame.minY)
+        guard target.intersects(CGRect(origin: .zero, size: size)) else { continue }
+        avatarView.drawHierarchy(in: target, afterScreenUpdates: false)
+      }
     }
     Self.reopenSnapshotCache.setObject(image, forKey: key)
     if let url = Self.reopenSnapshotFileURL(for: key) {
@@ -1950,8 +1969,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       let url = Self.reopenSnapshotFileURL(for: key)
     else { return }
     let chatId = engineChatId
+    let screenScale = UIScreen.main.scale
     Self.reopenSnapshotIOQueue.async { [weak self] in
-      guard let data = try? Data(contentsOf: url), let raw = UIImage(data: data) else { return }
+      // JPEG data carries pixels, not scale — decoding without the screen scale made
+      // the image report 3x the point size, and the .bottom overlay drew it unscaled:
+      // the "zoomed transcript" on the first open after a relaunch.
+      guard let data = try? Data(contentsOf: url),
+        let raw = UIImage(data: data, scale: screenScale)
+      else { return }
       let image = raw.preparingForDisplay() ?? raw
       DispatchQueue.main.async {
         guard let self, self.engineChatId == chatId else { return }
@@ -1973,6 +1998,19 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       let key = reopenSnapshotKey(),
       let image = Self.reopenSnapshotCache.object(forKey: key)
     else { return }
+    // Size sanity: a snapshot whose point width disagrees with the live list would
+    // render as a zoomed/offset transcript — never show it, and drop it so the next
+    // close re-captures cleanly.
+    guard collectionView.frame.width <= 1.0
+      || abs(image.size.width - collectionView.frame.width) < 2.0
+    else {
+      Self.reopenSnapshotCache.removeObject(forKey: key)
+      NSLog(
+        "[ChatOpen] reopen-snapshot DROP chat=%@ size=%.0fx%.0f expected-w=%.0f",
+        String(engineChatId.prefix(12)), image.size.width, image.size.height,
+        collectionView.frame.width)
+      return
+    }
     let overlay = UIImageView(image: image)
     overlay.frame = collectionView.frame
     // Bottom-anchored: if the reopened viewport height differs slightly (banner,
@@ -4504,8 +4542,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private func loadPersistedOpeningViewport(chatId: String) {
     guard !chatId.isEmpty,
       let data = UserDefaults.standard.data(forKey: Self.persistedViewportKey(chatId: chatId)),
-      let viewport = try? JSONDecoder().decode(PersistedViewport.self, from: data)
+      let viewport = try? JSONDecoder().decode(PersistedViewport.self, from: data),
+      viewport.bootToken == Self.viewportBootToken
     else {
+      // No record, or one from a previous app run — a fresh launch opens at the
+      // bottom/unread anchor instead of a days-old scroll position.
       persistedOpeningViewport = nil
       return
     }
@@ -4537,7 +4578,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       messageId: anchor?.messageId,
       screenY: Double(anchor?.screenY ?? 0.0),
       atBottom: atBottom,
-      savedAt: Date().timeIntervalSince1970
+      savedAt: Date().timeIntervalSince1970,
+      bootToken: Self.viewportBootToken
     )
     guard let data = try? JSONEncoder().encode(viewport) else { return }
     UserDefaults.standard.set(data, forKey: Self.persistedViewportKey(chatId: chatId))
@@ -4592,6 +4634,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         String(engineChatId.prefix(12)), unreadTargetIndex != nil ? "unread" : "saved",
         targetIndex, openingUnreadCount, targetOffset)
       openingUnreadCount = 0
+      // Mid-history restores must show the jump chrome immediately, not after the
+      // first scroll callback.
+      updateJumpToBottomButtonVisibility()
       return true
     }
 
@@ -4600,6 +4645,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     NSLog(
       "[ChatOpen] viewport RESTORE chat=%@ reason=bottom saved=%@",
       String(engineChatId.prefix(12)), persistedOpeningViewport == nil ? "N" : "Y")
+    updateJumpToBottomButtonVisibility()
     return true
   }
 
@@ -7684,12 +7730,25 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         collectionView.setContentOffset(
           CGPoint(x: 0.0, y: max(0.0, maxOffsetY - viewportH)), animated: false)
         collectionView.layoutIfNeeded()
+        // Mounting the destination converts estimated heights to exact ones and can
+        // move the real bottom. Re-anchor the hop against the REMEASURED bottom —
+        // gliding to the stale target overshot into blank space (the "list cleared"
+        // flash) and then visibly snapped back in the completion.
+        let remeasuredMaxY = pixelAlignedValue(
+          max(0.0, collectionView.contentSize.height - collectionView.bounds.height))
+        if abs(remeasuredMaxY - maxOffsetY) > 1.0 {
+          collectionView.setContentOffset(
+            CGPoint(x: 0.0, y: max(0.0, remeasuredMaxY - viewportH)), animated: false)
+          collectionView.layoutIfNeeded()
+        }
       }
-      let distance = abs(maxOffsetY - collectionView.contentOffset.y)
+      let targetMaxOffsetY = pixelAlignedValue(
+        max(0.0, collectionView.contentSize.height - collectionView.bounds.height))
+      let distance = abs(targetMaxOffsetY - collectionView.contentOffset.y)
       let screens = min(3.0, distance / max(1.0, collectionView.bounds.height))
       let duration = 0.24 + (0.07 * screens)
       let animator = UIViewPropertyAnimator(duration: duration, curve: .easeOut) { [weak self] in
-        self?.collectionView.contentOffset = CGPoint(x: 0.0, y: maxOffsetY)
+        self?.collectionView.contentOffset = CGPoint(x: 0.0, y: targetMaxOffsetY)
       }
       animator.addCompletion { [weak self, weak animator] _ in
         guard let self else { return }
