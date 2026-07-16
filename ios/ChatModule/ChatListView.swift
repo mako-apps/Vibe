@@ -9107,19 +9107,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   /// Present a mid-run agent ask / plan-approval sheet from the bubble (chat) surface.
-  /// The session ids identifying the CONVERSATION this DM page currently shows: the
-  /// explicitly-picked History session and/or the session adopted from its visible turns.
-  /// Deliberately excludes the engine's chatId-scoped live session — that is always the
-  /// asker's own session, so consulting it would neuter ask scoping. Empty ⇒ the page has
-  /// no session identity yet (fresh thread pre-first-turn) ⇒ callers fail open.
-  func bridgePageSessionIds() -> Set<String> {
-    Set(
-      [bridgeLoadedSessionId, activeBridgeSessionId].compactMap {
-        $0?.trimmingCharacters(in: .whitespacesAndNewlines)
-      }.filter { !$0.isEmpty }
-    )
-  }
-
   /// Decide whether an ask naming `askSessionIds` (the CLI session that raised it, plus any
   /// id it resumed FROM) belongs to the conversation this shared-DM page is currently
   /// showing. Every session lives under one chatId, so the session — not the chatId — is

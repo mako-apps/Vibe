@@ -790,12 +790,6 @@ public final class ChatMainView: UIView,
     chatListView.setDebugAnimationPanel(enabled)
   }
 
-  func setBuilderSetupPanel(_ value: [String: Any]?) {
-    builderSetupPanelPayload = ChatBuilderPanelPayload(raw: value)
-    synchronizeBuilderPanelPresentation()
-    setNeedsLayout()
-  }
-
   func applyTransactions(_ transactions: [[String: Any]]) {
     chatListView.applyTransactions(transactions)
   }
@@ -5371,12 +5365,6 @@ public final class ChatMainView: UIView,
       }
       return nil
     }
-  }
-
-  func setAgentConfig(_ config: [String: Any]?) {
-    let normalized = normalizedAgentConfig(config, fallbackChatId: engineChatId)
-    agentConfig = normalized
-    refreshAgentCardVisibility()
   }
 
   private func refreshAgentCardVisibility() {

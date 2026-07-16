@@ -2660,73 +2660,6 @@ final class ChatEngine {
     }
   }
 
-  /// Load whatever session is CURRENTLY live for this chat — used when a Claude/Codex/Grok DM
-  /// opens mid-run. The phone doesn't know the running session's id yet (it only learns
-  /// it from stream frames that can be minutes apart while the agent works a long tool
-  /// phase), so the request names only the chat; the bridge resolves it to the running
-  /// task's session (or the chat's last-reported one) and answers `no_current_session`
-  /// when the chat is idle — that reply is simply ignored and the DM stays a fresh
-  /// surface. On success the detail reply flows through the normal ingest path, which
-  /// also registers the live-tail subscription (see ingestAgentBridgeSessionLocked).
-  @discardableResult
-  func loadCurrentAgentBridgeSessionIntoChat(chatId rawChatId: String, provider rawProvider: String) -> [String: Any] {
-    let chatId = normalizedString(rawChatId) ?? ""
-    let provider = normalizedString(rawProvider)?.lowercased() ?? ""
-    guard !chatId.isEmpty, !provider.isEmpty else {
-      return ["accepted": false, "reason": "invalid_chat"]
-    }
-    // Single-flight + already-live: open / poll / join used to race and fire 2–3
-    // concurrent current-session detail loads → full transcript remounts / layout jump.
-    let gate: [String: Any]? = syncOnQueue {
-      if liveBridgeSessionIngestByChatId[chatId] != nil {
-        rearmLiveBridgeSessionLocked(chatId: chatId, trigger: "current_session_load")
-        return ["accepted": true, "reason": "already_live"]
-      }
-      let now = Int64(nowMs())
-      if let until = noCurrentSessionUntilMsByChatId[chatId], now < until {
-        return ["accepted": false, "reason": "no_current_session_cached"]
-      }
-      if let inflight = currentSessionLoadInflightByChatId[chatId], now - inflight.atMs < 4000 {
-        NSLog(
-          "[ChatEngine][BridgeMount] current-session SKIP inflight chat=%@ ageMs=%lld",
-          String(chatId.suffix(12)), now - inflight.atMs
-        )
-        return ["accepted": true, "reason": "inflight"]
-      }
-      return nil
-    }
-    if let gate { return gate }
-
-    let requestId = UUID().uuidString
-    // Reserve before the wire push so a concurrent open cannot start a second load.
-    syncOnQueue {
-      currentSessionLoadInflightByChatId[chatId] = (requestId: requestId, atMs: Int64(nowMs()))
-    }
-    let result = requestAgentBridgeHistory([
-      "chatId": chatId,
-      "provider": provider,
-      "mode": "detail",
-      "requestId": requestId,
-      "limit": Self.bridgeSessionPageLimit,
-    ])
-    if (result["accepted"] as? Bool) == true {
-      syncOnQueue {
-        pendingBridgeSessionIngestByRequestId[requestId] = (chatId: chatId, provider: provider)
-      }
-      NSLog(
-        "[ChatEngine][BridgeMount] current-session START chat=%@ provider=%@ requestId=%@",
-        String(chatId.suffix(12)), provider, String(requestId.prefix(8))
-      )
-    } else {
-      syncOnQueue {
-        if currentSessionLoadInflightByChatId[chatId]?.requestId == requestId {
-          currentSessionLoadInflightByChatId.removeValue(forKey: chatId)
-        }
-      }
-    }
-    return result
-  }
-
   /// A plain agent DM may begin an automatic current-session read while the user is
   /// already composing a brand-new task. Once that fresh send wins, a late detail reply
   /// must not mount an old transcript into the new thread and reorder visible bubbles.
@@ -4540,121 +4473,6 @@ final class ChatEngine {
     }
   }
 
-  func sendEncryptedMessage(_ payload: [String: Any]) -> [String: Any] {
-    let chatId = normalizedString(payload["chatId"]) ?? normalizedString(payload["chat_id"])
-    let messageId =
-      normalizedString(payload["messageId"]) ?? normalizedString(payload["message_id"])
-    let messagePayload = payload["message"] as? [String: Any]
-    guard let chatId, let messageId, let messagePayload else {
-      return [
-        "accepted": false,
-        "reason": "invalid_payload",
-      ]
-    }
-
-    return syncOnQueue {
-      guard let client = phoenixClient else {
-        return [
-          "accepted": false,
-          "reason": "no_native_socket",
-        ]
-      }
-      guard nativeJoinedChatIds.contains(chatId) else {
-        joinNativeChatTopicIfNeededLocked(chatId: chatId)
-        return [
-          "accepted": false,
-          "reason": "chat_not_joined",
-        ]
-      }
-
-      upsertLocalStatusLocked(chatId: chatId, messageId: messageId, status: "sending")
-      let ref = client.push(
-        topic: chatTopic(for: chatId), event: "message", payload: messagePayload)
-      nativePendingMessagePushRefs[ref] = (chatId: chatId, messageId: messageId)
-      nativeMessagePushSentAtMs[ref] = nowMs()
-
-      let timeoutRef = ref
-      queue.asyncAfter(deadline: .now() + 15.0) { [weak self] in
-        guard let self = self else { return }
-        self.nativeMessagePushSentAtMs.removeValue(forKey: timeoutRef)
-        if let pending = self.nativePendingMessagePushRefs.removeValue(forKey: timeoutRef) {
-          self.appendJournalLocked(
-            event: "native-send-timeout",
-            payload: [
-              "chatId": pending.chatId,
-              "messageId": pending.messageId,
-              "ref": timeoutRef,
-            ])
-          self.upsertLocalStatusLocked(
-            chatId: pending.chatId, messageId: pending.messageId, status: "error")
-          self.postChangeLocked(
-            reason: "messageStatusChanged",
-            userInfo: ["chatId": pending.chatId, "messageId": pending.messageId, "status": "error"])
-        }
-      }
-
-      appendJournalLocked(
-        event: "native-send-message",
-        payload: [
-          "chatId": chatId,
-          "messageId": messageId,
-          "ref": ref,
-        ])
-      postChangeLocked(
-        reason: "messageStatusChanged", userInfo: ["chatId": chatId, "messageId": messageId])
-      return [
-        "accepted": true,
-        "transport": "native",
-        "ref": ref,
-      ]
-    }
-  }
-
-  func sendEditMessage(_ payload: [String: Any]) -> [String: Any] {
-    let chatId = normalizedString(payload["chatId"]) ?? normalizedString(payload["chat_id"])
-    let messageId =
-      normalizedString(payload["messageId"]) ?? normalizedString(payload["message_id"])
-    let encryptedContent =
-      normalizedString(payload["encryptedContent"])
-      ?? normalizedString(payload["encrypted_content"])
-    let editedAt = payload["editedAt"] ?? payload["edited_at"]
-    guard let chatId, let messageId, let encryptedContent else {
-      return ["accepted": false, "reason": "invalid_payload"]
-    }
-    if syncOnQueue({ isBridgeTextModeLocked() }) {
-      return ["accepted": false, "reason": "edit_disabled_in_blackout"]
-    }
-
-    return syncOnQueue {
-      guard let client = phoenixClient else {
-        return ["accepted": false, "reason": "no_native_socket"]
-      }
-      guard nativeJoinedChatIds.contains(chatId) else {
-        joinNativeChatTopicIfNeededLocked(chatId: chatId)
-        return ["accepted": false, "reason": "chat_not_joined"]
-      }
-
-      var wirePayload: [String: Any] = [
-        "messageId": messageId,
-        "encryptedContent": encryptedContent,
-      ]
-      if let editedAt {
-        wirePayload["editedAt"] = editedAt
-      }
-      let ref = client.push(
-        topic: chatTopic(for: chatId), event: "edit-message", payload: wirePayload)
-      nativePendingEditPushRefs[ref] = (chatId: chatId, messageId: messageId)
-      appendJournalLocked(
-        event: "native-send-edit-message",
-        payload: [
-          "chatId": chatId,
-          "messageId": messageId,
-          "ref": ref,
-        ])
-      return ["accepted": true, "transport": "native", "ref": ref]
-    }
-  }
-
   func sendDeleteMessage(_ payload: [String: Any]) -> [String: Any] {
     let chatId = normalizedString(payload["chatId"]) ?? normalizedString(payload["chat_id"])
     let messageId =
@@ -4858,118 +4676,6 @@ final class ChatEngine {
 
   func deleteMessage(_ payload: [String: Any]) -> [String: Any] {
     sendDeleteMessage(payload)
-  }
-
-  func upsertLocalMessageStatus(_ payload: [String: Any]) -> [String: Any] {
-    let chatId = normalizedString(payload["chatId"]) ?? normalizedString(payload["chat_id"])
-    let messageId =
-      normalizedString(payload["messageId"]) ?? normalizedString(payload["message_id"])
-    let status = normalizedString(payload["status"])?.lowercased()
-    guard let chatId, let messageId, let status else { return getStatus() }
-    if status == "delivered" || status == "read" {
-      return syncOnQueue {
-        upsertReceiptLocked(chatId: chatId, messageId: messageId, status: status)
-        if status == "read" || status == "delivered" {
-          upsertLocalStatusLocked(chatId: chatId, messageId: messageId, status: status)
-        }
-        appendJournalLocked(event: "upsert-local-status", payload: payload)
-        let snapshot = statusSnapshotLocked()
-        postChangeLocked(
-          reason: "messageStatusChanged",
-          userInfo: ["chatId": chatId, "messageId": messageId, "status": status]
-        )
-        return snapshot
-      }
-    }
-    return syncOnQueue {
-      upsertLocalStatusLocked(chatId: chatId, messageId: messageId, status: status)
-      appendJournalLocked(event: "upsert-local-status", payload: payload)
-      state["updatedAt"] = nowMs()
-      let snapshot = statusSnapshotLocked()
-      postChangeLocked(
-        reason: "messageStatusChanged",
-        userInfo: ["chatId": chatId, "messageId": messageId, "status": status]
-      )
-      return snapshot
-    }
-  }
-
-  func setChatMuted(_ payload: [String: Any]) -> [String: Any] {
-    let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"])
-    guard let chatId, !chatId.isEmpty else {
-      return ["accepted": false, "reason": "invalid_chat"]
-    }
-    guard let muted = parseBooleanLike(payload["muted"]) else {
-      return ["accepted": false, "reason": "invalid_muted"]
-    }
-
-    let requestContext: (URL, String, String)?
-    requestContext = syncOnQueue {
-      guard
-        let apiBase = apiBaseURLLocked(),
-        let userId = normalizedString(
-          payload["userId"] ?? payload["user_id"] ?? getConfigValueLocked("userId"))
-      else { return nil }
-      let token = authHeaderTokenLocked() ?? ""
-      appendJournalLocked(
-        event: "native-chat-mute-request",
-        payload: ["chatId": chatId, "muted": muted, "userId": userId]
-      )
-      state["updatedAt"] = nowMs()
-      return (apiBase, token, userId)
-    }
-
-    guard let (apiBase, token, userId) = requestContext else {
-      return ["accepted": false, "reason": "missing_config", "chatId": chatId]
-    }
-
-    var request = URLRequest(
-      url: apiBase.appendingPathComponent("api").appendingPathComponent("chat")
-        .appendingPathComponent(chatId).appendingPathComponent("mute"))
-    request.httpMethod = "POST"
-    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    request.setValue("application/json", forHTTPHeaderField: "Accept")
-    request.timeoutInterval = 18
-    request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
-    if !token.isEmpty {
-      request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-    }
-    request.httpBody = try? JSONSerialization.data(
-      withJSONObject: ["userId": userId, "muted": muted], options: [])
-
-    let session = ChatPhoenixClient.makePinnedURLSession()
-    session.dataTask(with: request) { [weak self] _, response, error in
-      guard let self else { return }
-      self.queue.async {
-        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
-        if let error {
-          self.appendJournalLocked(
-            event: "native-chat-mute-error",
-            payload: [
-              "chatId": chatId,
-              "muted": muted,
-              "error": error.localizedDescription,
-            ])
-          return
-        }
-        let success = (200...299).contains(statusCode)
-        self.appendJournalLocked(
-          event: success ? "native-chat-mute-ok" : "native-chat-mute-error",
-          payload: [
-            "chatId": chatId,
-            "muted": muted,
-            "status": statusCode,
-          ])
-        if success {
-          self.postChangeLocked(
-            reason: "chatMuteChanged",
-            userInfo: ["chatId": chatId, "muted": muted]
-          )
-        }
-      }
-    }.resume()
-
-    return ["accepted": true, "queued": true, "chatId": chatId, "muted": muted]
   }
 
   func clearChat(_ payload: [String: Any]) -> [String: Any] {
@@ -5468,15 +5174,6 @@ final class ChatEngine {
     }
   }
 
-  func makeTransientChatRows(_ payload: [String: Any]) -> [[String: Any]] {
-    let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"])
-    let messages = payload["messages"] as? [[String: Any]]
-    guard let chatId, let messages, !messages.isEmpty else { return [] }
-    return syncOnQueue {
-      buildHistoryRowsLocked(chatId: chatId, rawMessages: messages)
-    }
-  }
-
   func typingUserIds(chatId: String?) -> [String] {
     guard let chatId = normalizedString(chatId), !chatId.isEmpty else { return [] }
     return syncOnQueue {
@@ -5613,29 +5310,6 @@ final class ChatEngine {
     }
   }
 
-  // Shadow-mode bridge from JS until native Phoenix transport is implemented.
-  func setPresenceSnapshot(userIds: [String]) -> [String: Any] {
-    let normalized = Set(userIds.compactMap { normalizedUpper($0) })
-    return syncOnQueue {
-      if nativePresenceActive {
-        state["updatedAt"] = nowMs()
-        appendJournalLocked(
-          event: "set-presence-snapshot-ignored", payload: ["count": normalized.count])
-        return statusSnapshotLocked()
-      }
-      onlineUsers = normalized
-      for userId in normalized {
-        lastSeenByUserId.removeValue(forKey: userId)
-      }
-      state["updatedAt"] = nowMs()
-      appendJournalLocked(event: "set-presence-snapshot", payload: ["count": normalized.count])
-      state["presenceSource"] = "shadow"
-      let snapshot = statusSnapshotLocked()
-      postChangeLocked(reason: "presenceChanged", userInfo: ["onlineCount": normalized.count])
-      return snapshot
-    }
-  }
-
   func resolveDisplayStatus(
     chatId: String?,
     messageId: String?,
@@ -5692,27 +5366,6 @@ final class ChatEngine {
         return "delivered"
       }
       return normalizedRaw
-    }
-  }
-
-  private func markReceipt(
-    _ payload: [String: Any],
-    status: String,
-    eventName: String
-  ) -> [String: Any] {
-    let chatId = normalizedString(payload["chatId"]) ?? normalizedString(payload["chat_id"])
-    let messageId =
-      normalizedString(payload["messageId"]) ?? normalizedString(payload["message_id"])
-    guard let chatId, let messageId else { return getStatus() }
-    return syncOnQueue {
-      upsertReceiptLocked(chatId: chatId, messageId: messageId, status: status)
-      appendJournalLocked(event: eventName, payload: payload)
-      let snapshot = statusSnapshotLocked()
-      postChangeLocked(
-        reason: "messageStatusChanged",
-        userInfo: ["chatId": chatId, "messageId": messageId, "status": status]
-      )
-      return snapshot
     }
   }
 
@@ -8316,22 +7969,6 @@ final class ChatEngine {
     return base.appendingPathComponent(trimmed)
   }
 
-  func isJsEmergencyFallbackEnabled() -> Bool {
-    syncOnQueue {
-      switch getConfigValueLocked("chatNativeJsFallbackEnabled") {
-      case let bool as Bool:
-        return bool
-      case let str as String:
-        return ["1", "true", "yes", "on"].contains(
-          str.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
-      case let num as NSNumber:
-        return num.boolValue
-      default:
-        return false
-      }
-    }
-  }
-
   private func extractPublicKeyValue(from data: [String: Any]) -> String? {
     normalizedString(data["publicKey"])
       ?? normalizedString(data["friendKey"])
@@ -8341,25 +7978,6 @@ final class ChatEngine {
       ?? ((data["data"] as? [String: Any]).flatMap(extractPublicKeyValue(from:)))
       ?? ((data["user"] as? [String: Any]).flatMap(extractPublicKeyValue(from:)))
       ?? ((data["friend"] as? [String: Any]).flatMap(extractPublicKeyValue(from:)))
-  }
-
-  private func cacheChatPeerInfoLocked(chatId: String, chatObject: [String: Any]) {
-    if let friendId = normalizedUpper(chatObject["friendId"] ?? chatObject["friend_id"]) {
-      chatPeerUserIdsByChatId[chatId] = friendId
-      if let agentId = normalizedString(chatObject["friendAgentId"] ?? chatObject["friend_agent_id"]) {
-        chatPeerAgentIdsByChatId[chatId] = agentId
-        agentIdsByPeerUserId[friendId] = agentId
-      }
-      if let key = extractPublicKeyValue(from: chatObject) {
-        friendPublicKeysByUserId[friendId] = key
-      } else {
-        scheduleFriendPublicKeyFetchLocked(
-          chatId: chatId,
-          peerUserIdHint: friendId,
-          trigger: "history_peer_info"
-        )
-      }
-    }
   }
 
   private func resolveFriendPublicKeyLocked(chatId: String, peerUserIdHint: String?) -> String? {
@@ -12767,76 +12385,6 @@ final class ChatEngine {
     }
   }
 
-  func fetchSavedMessages(_ payload: [String: Any], completion: @escaping ([String: Any]) -> Void) {
-    queue.async { [weak self] in
-      guard let self else { return }
-      let hasCache = self.cachedSavedMessagesResponse != nil
-      if let cached = self.cachedSavedMessagesResponse {
-        DispatchQueue.main.async {
-          completion(["success": true, "messages": cached])
-        }
-      }
-      guard let (apiBase, token) = self.requestContext else {
-        if !hasCache {
-          DispatchQueue.main.async {
-            completion(["success": false, "reason": "missing_config", "messages": []])
-          }
-        }
-        return
-      }
-      guard
-        let userId =
-          normalizedString(
-            payload["userId"] ?? payload["user_id"] ?? getConfigValueLocked("userId"))
-      else {
-        if !hasCache {
-          DispatchQueue.main.async {
-            completion(["success": false, "reason": "missing_user_id", "messages": []])
-          }
-        }
-        return
-      }
-
-      var request = URLRequest(
-        url: apiBase.appendingPathComponent("api").appendingPathComponent("saved_messages")
-          .appendingPathComponent(userId))
-      request.httpMethod = "GET"
-      request.timeoutInterval = 18
-      request.setValue("application/json", forHTTPHeaderField: "Accept")
-      request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
-      if !token.isEmpty { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
-
-      let session = ChatPhoenixClient.makePinnedURLSession()
-      session.dataTask(with: request) { [weak self] data, response, error in
-        guard let self else { return }
-        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
-        guard let data, error == nil, (200...299).contains(statusCode) else {
-          if !hasCache {
-            DispatchQueue.main.async {
-              completion([
-                "success": false,
-                "reason": "http_\(statusCode)",
-                "messages": [],
-              ])
-            }
-          }
-          return
-        }
-        let rawItems = self.syncOnQueue { self.parseSavedMessagesServerItems(data) }
-        let messages = self.syncOnQueue {
-          let normalized = self.normalizeSavedMessagesLocked(rawItems)
-          self.cachedSavedMessagesResponse = normalized
-          return normalized
-        }
-        if !hasCache {
-          DispatchQueue.main.async {
-            completion(["success": true, "messages": messages])
-          }
-        }
-      }.resume()
-    }
-  }
-
   func sendSavedMessage(_ payload: [String: Any], completion: @escaping ([String: Any]) -> Void) {
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       guard let self else { return }
@@ -13045,51 +12593,6 @@ final class ChatEngine {
             "reason": success ? "ok" : "request_failed",
             "error": errorText,
             "body": responseBody,
-          ])
-        }
-      }.resume()
-    }
-  }
-
-  func deleteSavedMessage(_ payload: [String: Any], completion: @escaping ([String: Any]) -> Void) {
-    queue.async { [weak self] in
-      guard let self else { return }
-      guard let (apiBase, token) = self.requestContext else {
-        DispatchQueue.main.async { completion(["success": false, "reason": "missing_config"]) }
-        return
-      }
-      guard
-        let userId =
-          normalizedString(
-            payload["userId"] ?? payload["user_id"] ?? getConfigValueLocked("userId"))
-      else {
-        DispatchQueue.main.async { completion(["success": false, "reason": "missing_user_id"]) }
-        return
-      }
-      guard
-        let messageId =
-          normalizedString(payload["messageId"] ?? payload["message_id"] ?? payload["id"])
-      else {
-        DispatchQueue.main.async { completion(["success": false, "reason": "missing_message_id"]) }
-        return
-      }
-
-      var request = URLRequest(
-        url: apiBase.appendingPathComponent("api").appendingPathComponent("saved_messages")
-          .appendingPathComponent(userId).appendingPathComponent(messageId))
-      request.httpMethod = "DELETE"
-      request.setValue("application/json", forHTTPHeaderField: "Accept")
-      request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
-      if !token.isEmpty { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
-
-      let session = ChatPhoenixClient.makePinnedURLSession()
-      session.dataTask(with: request) { _, response, error in
-        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
-        DispatchQueue.main.async {
-          completion([
-            "success": error == nil && (200...299).contains(statusCode),
-            "status": statusCode,
-            "messageId": messageId,
           ])
         }
       }.resume()

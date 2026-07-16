@@ -654,15 +654,6 @@ final class NativeProfileAvatarView: UIView {
     publishModelChange { $0.islandCoverColor = value }
   }
 
-  func setFallbackBackgroundUIColor(_ value: UIColor) {
-    guard currentFallbackBackgroundColor != value else { return }
-    currentFallbackBackgroundColor = value
-    publishModelChange {
-      $0.fallbackBackgroundColor = value
-      $0.fallbackGradientEndColor = value
-    }
-  }
-
   func setFallbackGradientUIColors(start: UIColor, end: UIColor) {
     guard currentFallbackBackgroundColor != start || currentFallbackGradientEndColor != end else { return }
     currentFallbackBackgroundColor = start
@@ -5488,11 +5479,6 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       String(engineChatId.prefix(12))
     )
     top.applyMembers(items)
-  }
-
-  func setAgentConfig(_ config: [String: Any]?) {
-    agentConfig = normalizedAgentConfig(config, fallbackChatId: engineChatId)
-    tableView.reloadData()
   }
 
   func setPage(_ value: String, animated: Bool) {
