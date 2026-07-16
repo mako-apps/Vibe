@@ -1095,29 +1095,13 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
     runtime: ChatListRow.AgentRuntimeSummary?,
     appearance: VibeAgentKitChatAppearance
   ) {
-    guard let runtime,
-      runtime.teamRunId != nil || runtime.teamMode?.lowercased() == "group_team"
-    else {
-      teamHeaderLabel.text = nil
-      teamHeaderLabel.isHidden = true
-      return
-    }
-
-    let worker = (runtime.teamWorker ?? runtime.provider ?? "Agent").capitalized
-    var parts = ["TEAM", worker]
-    if let index = runtime.teamWorkers.firstIndex(where: {
-      $0.caseInsensitiveCompare(runtime.teamWorker ?? runtime.provider ?? "") == .orderedSame
-    }), runtime.teamWorkers.count > 1 {
-      parts.append("\(index + 1) of \(runtime.teamWorkers.count)")
-    }
-    if let computer = runtime.computerLabel, !computer.isEmpty {
-      parts.append(computer)
-    }
-    teamHeaderLabel.text = parts.joined(separator: "  ·  ")
-    teamHeaderLabel.font = UIFont.systemFont(ofSize: 11.5, weight: .bold)
-    teamHeaderLabel.textColor = vibeAgentKitColorWithAlpha(appearance.primary, 0.92)
-    teamHeaderLabel.accessibilityLabel = "Team run, \(worker)"
-    teamHeaderLabel.isHidden = false
+    // The brown "TEAM · Codex · N of M · <device>" footer was noisy clutter in the
+    // list — the avatar + per-worker rows already identify the run and its members.
+    // Suppress it entirely (kept as a no-op so the call sites stay put).
+    _ = runtime
+    _ = appearance
+    teamHeaderLabel.text = nil
+    teamHeaderLabel.isHidden = true
   }
 
   var onToggleRuntimeExpand: (() -> Void)?
@@ -1175,7 +1159,11 @@ private final class VibeAgentKitTeamWorkerRowView: UIView {
   private let avatarView = SenderRunAvatarView()
   private let nameLabel = UILabel()
   private let statusLabel = UILabel()
-  private let spinner = UIActivityIndicatorView(style: .medium)
+  // A running worker shows a shimmer sweep across its status text instead of a
+  // spinner — the status label mutates in place, so a swept highlight reads as
+  // "live" without a busy indicator. The mask keeps text ≥35% visible.
+  private let statusShimmerMask = CAGradientLayer()
+  private var isShimmering = false
   private let doneCheck = UIImageView()
   private let chevron = UIImageView()
   var onTap: (() -> Void)?
@@ -1219,9 +1207,14 @@ private final class VibeAgentKitTeamWorkerRowView: UIView {
     statusLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
     statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-    spinner.translatesAutoresizingMaskIntoConstraints = false
-    spinner.hidesWhenStopped = true
-    spinner.setContentHuggingPriority(.required, for: .horizontal)
+    statusShimmerMask.startPoint = CGPoint(x: 0, y: 0.5)
+    statusShimmerMask.endPoint = CGPoint(x: 1, y: 0.5)
+    statusShimmerMask.colors = [
+      UIColor(white: 1.0, alpha: 0.35).cgColor,
+      UIColor(white: 1.0, alpha: 1.0).cgColor,
+      UIColor(white: 1.0, alpha: 0.35).cgColor,
+    ]
+    statusShimmerMask.locations = [0.0, 0.5, 1.0]
 
     doneCheck.translatesAutoresizingMaskIntoConstraints = false
     doneCheck.contentMode = .scaleAspectFit
@@ -1235,10 +1228,11 @@ private final class VibeAgentKitTeamWorkerRowView: UIView {
     chevron.setContentHuggingPriority(.required, for: .horizontal)
     chevron.setContentCompressionResistancePriority(.required, for: .horizontal)
 
+    // Avatar-only identity: the avatar alone names the worker (no "Claude/Grok/Agy"
+    // text). The status label carries the live narration ("editing X"); the avatar
+    // carries who. nameLabel is kept as a field for a11y but not shown in the row.
     stack.addArrangedSubview(avatarView)
-    stack.addArrangedSubview(nameLabel)
     stack.addArrangedSubview(statusLabel)
-    stack.addArrangedSubview(spinner)
     stack.addArrangedSubview(doneCheck)
     stack.addArrangedSubview(chevron)
 
@@ -1272,18 +1266,27 @@ private final class VibeAgentKitTeamWorkerRowView: UIView {
         .font: UIFont.systemFont(ofSize: 14.0, weight: .semibold),
         .foregroundColor: appearance.text,
       ])
-    let statusText = item.messagePreview ?? ""
+    let s = (item.status ?? "").lowercased()
+    let running = vibeAgentKitRunningStepStatuses.contains(s) || s == "starting"
+    let done = s == "done" || s == "completed"
+    let failed = s == "failed" || s == "error"
+    let rawStatus = item.messagePreview ?? ""
+    // Never blank: a stopped/settled worker reads a real state, not an empty row.
+    let statusText: String =
+      !rawStatus.isEmpty
+      ? rawStatus
+      : done ? "done" : failed ? "failed" : s == "skipped" ? "skipped"
+        : running ? "working…" : "stopped"
     statusLabel.attributedText = NSAttributedString(
       string: statusText,
       attributes: [
         .font: UIFont.systemFont(ofSize: 12.5, weight: .regular),
         .foregroundColor: vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.78),
       ])
-    let s = (item.status ?? "").lowercased()
-    let running = vibeAgentKitRunningStepStatuses.contains(s) || s == "starting"
-    let done = s == "done" || s == "completed"
-    let failed = s == "failed" || s == "error"
-    if running { spinner.startAnimating() } else { spinner.stopAnimating() }
+    // Shimmer only while genuinely working (running AND with a real live status).
+    // A blank "starting" with no progress, a barrier "waiting" row, or a terminal
+    // row is static — the shimmer must mean "actively working", nothing else.
+    if running && !rawStatus.isEmpty { startStatusShimmer() } else { stopStatusShimmer() }
     doneCheck.isHidden = !(done || failed)
     doneCheck.tintColor =
       failed
@@ -1296,8 +1299,38 @@ private final class VibeAgentKitTeamWorkerRowView: UIView {
       doneCheck.image = UIImage(systemName: "checkmark.circle.fill")?
         .withRenderingMode(.alwaysTemplate)
     }
-    spinner.color = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.72)
+    // Arrow only when the row can actually open something — a finished worker (its
+    // steps/summary), or one that is genuinely working right now. A settled "stopped"
+    // / "waiting" / bare row has nothing to reveal, so no chevron and no tap target.
+    let tappable = done || failed || (running && !rawStatus.isEmpty)
+    chevron.isHidden = !tappable
+    header.isUserInteractionEnabled = tappable
     chevron.tintColor = vibeAgentKitColorWithAlpha(appearance.textSecondary, 0.6)
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    if isShimmering { statusShimmerMask.frame = statusLabel.bounds }
+  }
+
+  private func startStatusShimmer() {
+    if isShimmering { return }
+    isShimmering = true
+    statusLabel.layer.mask = statusShimmerMask
+    statusShimmerMask.frame = statusLabel.bounds
+    let anim = CABasicAnimation(keyPath: "locations")
+    anim.fromValue = [-0.6, -0.3, 0.0]
+    anim.toValue = [1.0, 1.3, 1.6]
+    anim.duration = 1.15
+    anim.repeatCount = .infinity
+    statusShimmerMask.add(anim, forKey: "vibe.worker.shimmer")
+  }
+
+  private func stopStatusShimmer() {
+    if !isShimmering { return }
+    isShimmering = false
+    statusShimmerMask.removeAnimation(forKey: "vibe.worker.shimmer")
+    statusLabel.layer.mask = nil
   }
 }
 
@@ -2615,9 +2648,6 @@ final class VibeAgentKitMessageCell: UITableViewCell {
     appearance.userBubbleText
   }
 
-  private func userBubbleBorderColor(for appearance: VibeAgentKitChatAppearance) -> UIColor {
-    appearance.userBubbleBorder
-  }
 
   private func applyCurrentBubbleShape() {
     if currentIsUser {
@@ -2955,8 +2985,10 @@ final class VibeAgentKitStepDetailViewController: UIViewController {
     case "thinking": return "Thinking"
     case "compacting": return "Compacting"
     case "mcp":
-      if let tool = item.fileName, !tool.isEmpty { return "MCP · \(tool)" }
-      return item.label.isEmpty ? "MCP tool" : item.label
+      if let tool = item.fileName, !tool.isEmpty {
+        return chatAgentPrettyMcpLabel("MCP · \(tool)")
+      }
+      return item.label.isEmpty ? "MCP tool" : chatAgentPrettyMcpLabel(item.label)
     case "tool": return item.label.isEmpty ? "Tool" : item.label
     default: return item.label.isEmpty ? "Step" : item.label
     }

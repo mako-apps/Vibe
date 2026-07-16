@@ -10,15 +10,19 @@ private let chatGapDebugOverlayEnabled = false
 // MARK: - Delegate
 
 protocol ChatInputBarDelegate: AnyObject {
-  func inputBarDidSend(text: String, attachments: [String])
+  func inputBarDidSend(text: String, attachments: [String], imageLocalURIs: [String])
   // Hold-menu Edit: composer submits new text/caption for an already-sent message.
   func inputBarDidSubmitEdit(messageId: String, text: String)
   func inputBarDidRequestStopStreaming()
-  func inputBarDidSendWithAgentMention(text: String, agentText: String)
+  func inputBarDidSendWithAgentMention(
+    text: String, agentText: String, attachments: [String], imageLocalURIs: [String]
+  )
   func inputBarDidSendWithStandaloneAgentMention(
     text: String,
     agentText: String,
-    agentUsername: String
+    agentUsername: String,
+    attachments: [String],
+    imageLocalURIs: [String]
   )
   func inputBarDidRequestVibeAgentBuilder()
   func inputBarDidRequestAgentPanel()
@@ -746,7 +750,8 @@ final class ChatInputBar: UIView {
   private var gifPanelVisible = false
   private var pendingGifPanelCloseForKeyboard = false
   private var lastGifPanelGeometrySignature: String?
-  private let defaultGifPanelHeight: CGFloat = 320
+  /// Compact default — closer to content; search focus still expands via scaleBoost.
+  private let defaultGifPanelHeight: CGFloat = 268
   private var lastKnownKeyboardHeight: CGFloat = 0
   private var isVideoMode: Bool = false
   // Width progress for right action morph: 0 = mic, 1 = send.
@@ -827,6 +832,8 @@ final class ChatInputBar: UIView {
   }
   private var pendingImages: [UIImage] = []
   private var pendingAttachmentBlobs: [String] = []
+  /// Local file:// URIs written at stage time (send prefers these over re-materializing blobs).
+  private var pendingImageLocalURIs: [String] = []
 
   // Attachment Preview Scroll View (inside pill, above text row)
   private let attachmentPreviewScroll = UIScrollView()
@@ -2134,7 +2141,12 @@ final class ChatInputBar: UIView {
         + pendingQueueGap)
       : 0
 
-    let composerBottomVPad = keyboardHeightForPanels > 0 || keyboardProgress > 0.01 ? 6.0 : bottomVPad
+    // When the GIF panel is open it owns the bottom of the screen — no extra
+    // composer bottom pad (was leaving a visible strip between pill and panel).
+    let composerBottomVPad: CGFloat = {
+      if gifPanelVisible { return 2.0 }
+      return keyboardHeightForPanels > 0 || keyboardProgress > 0.01 ? 6.0 : bottomVPad
+    }()
     let composerHeight = topVPad + pendingQueueExtra + pillH + composerBottomVPad + safeBottom
     let panelHeight = gifPanelVisible ? preferredGifPanelHeight() : 0
     let totalH = composerHeight + panelHeight
@@ -2195,7 +2207,15 @@ final class ChatInputBar: UIView {
     contentRow.frame = CGRect(x: 0, y: rowY, width: w, height: rowH)
 
     if let panel = gifPanelIfLoaded {
-      panel.frame = CGRect(x: 0, y: composerHeight, width: w, height: panelHeight)
+      // When the panel lives in the overlay window, NEVER set frame relative to the
+      // composer (y ≈ pill height). That coordinate system is the input bar's, but
+      // the overlay is full-screen — so y=composerHeight pins the panel near the
+      // TOP of the viewport. Overlay frames are owned by updateGifPanelOverlayFrame.
+      if panel.superview === self {
+        panel.frame = CGRect(x: 0, y: composerHeight, width: w, height: panelHeight)
+      } else if gifPanelVisible, gifOverlayWindow != nil {
+        updateGifPanelOverlayFrame()
+      }
       panel.isHidden = !gifPanelVisible && panel.alpha <= 0.01
     }
 
@@ -2645,7 +2665,19 @@ final class ChatInputBar: UIView {
 
   private func maybePrepareGifPanel() {
     guard window != nil, let panel = gifPanelIfLoaded else { return }
-    panel.hostViewController = findViewController()
+    // Host MUST match the VC that owns the panel's view hierarchy.
+    // When using the overlay window, that is ChatGifPanelOverlayController —
+    // never ChatConversationController. Stomping host after ensureGifOverlayHost
+    // caused: "child GiphyGridController should have parent Overlay but actual
+    // parent is ChatConversationController" → crash.
+    if let overlay = gifOverlayController {
+      panel.hostViewController = overlay
+    } else if panel.superview === self {
+      panel.hostViewController = findViewController()
+    } else {
+      // Panel already reparented under overlay view but controller ref missing.
+      panel.hostViewController = gifOverlayController ?? findViewController()
+    }
     panel.prepareIfNeeded()
   }
 
@@ -2657,9 +2689,6 @@ final class ChatInputBar: UIView {
     26.0 - (16.0 * accessoryLayoutProgress())
   }
 
-  private func agentControlButtonWidth() -> CGFloat {
-    48.0
-  }
 
   @discardableResult
   private func ensureGifOverlayHost() -> ChatGifPanelOverlayController? {
@@ -2721,26 +2750,43 @@ final class ChatInputBar: UIView {
 
   private func desiredGifPanelFrame() -> CGRect {
     let panelHeight = preferredGifPanelHeight()
-    let panelX: CGFloat = 0
-    let panelWidth = max(1, bounds.width)
     guard let hostWindow = window,
       let overlayWindow = gifOverlayWindow
     else {
-      return CGRect(x: panelX, y: bounds.height, width: panelWidth, height: panelHeight)
+      // Inline: occupy the reserved bottom slice of the bar (flush, no gap).
+      return CGRect(
+        x: 0, y: max(0, bounds.height - panelHeight), width: max(1, bounds.width),
+        height: panelHeight)
     }
-    let originInHostWindow = convert(CGPoint(x: panelX, y: 0), to: hostWindow)
-    let originInOverlay = overlayWindow.convert(originInHostWindow, from: hostWindow)
-    let panelY = overlayWindow.bounds.height - panelHeight
-    return CGRect(x: originInOverlay.x, y: panelY, width: panelWidth, height: panelHeight)
+
+    let overlayBounds = overlayWindow.bounds
+    // Panel top = bottom of composer row (bar height minus reserved panel slice).
+    // Panel bottom = physical screen/overlay bottom. This fills the reserved zone
+    // exactly — no 8–12pt strip of wallpaper under the glass.
+    let panelTopInBar = CGPoint(x: 0, y: max(0, bounds.height - panelHeight))
+    let panelTopInHost = convert(panelTopInBar, to: hostWindow)
+    let panelTopInOverlay = overlayWindow.convert(panelTopInHost, from: hostWindow)
+    let bottomY = overlayBounds.maxY
+    let topY = min(panelTopInOverlay.y, bottomY - panelHeight)
+    let height = max(panelHeight, bottomY - topY)
+    return CGRect(x: 0, y: topY, width: overlayBounds.width, height: height)
   }
 
   private func updateGifPanelOverlayFrame() {
     guard gifPanelVisible, let overlayController = ensureGifOverlayHost() else { return }
     let panel = loadGifPanelIfNeeded()
-    gifOverlayWindow?.frame = window?.windowScene?.coordinateSpace.bounds ?? overlayController.view.bounds
-    overlayController.view.frame = gifOverlayWindow?.bounds ?? overlayController.view.frame
+    let sceneBounds = window?.windowScene?.coordinateSpace.bounds
+      ?? window?.bounds
+      ?? overlayController.view.bounds
+    gifOverlayWindow?.frame = sceneBounds
+    overlayController.view.frame = gifOverlayWindow?.bounds ?? sceneBounds
+    overlayController.additionalSafeAreaInsets = .zero
     panel.frame = desiredGifPanelFrame()
     panel.isHidden = false
+    // Keep glass flush: no residual transform after show animation.
+    if panel.alpha >= 0.99 {
+      panel.transform = .identity
+    }
     debugLogGifPanelGeometryIfNeeded(context: "updateGifPanelOverlayFrame")
   }
 
@@ -2801,8 +2847,13 @@ final class ChatInputBar: UIView {
     let shouldAnimate = animated
 
     if visible {
+      // Overlay first (correct host), then prepare — never reverse this order.
       _ = ensureGifOverlayHost()
       maybePrepareGifPanel()
+      // Re-assert overlay host after prepare (defensive).
+      if let overlay = gifOverlayController {
+        panel.hostViewController = overlay
+      }
       panel.setPanelVisible(true)
       panel.layer.removeAllAnimations()
       panel.transform = shouldAnimate ? CGAffineTransform(translationX: 0, y: panelOffset) : .identity
@@ -2864,13 +2915,6 @@ final class ChatInputBar: UIView {
     setGifPanelVisible(!gifPanelVisible, animated: true)
   }
 
-  @objc private func attachTapped() {
-    if agentControlMode {
-      delegate?.inputBarDidRequestAgentPanel()
-      return
-    }
-    presentAttachmentSheet(sourceView: attachGlass)
-  }
 
   @objc private func inlineAttachTapped() {
     presentAttachmentSheet(sourceView: inlineAttachButton)
@@ -3009,15 +3053,20 @@ final class ChatInputBar: UIView {
         return
       }
       setMentionBannerVisible(false, animated: false)
-      delegate?.inputBarDidSendWithAgentMention(text: t, agentText: agentText)
+      let attachments = pendingAttachmentBlobs
+      let imageURIs = pendingImageLocalURIs
+      clearPendingAttachments()
+      delegate?.inputBarDidSendWithAgentMention(
+        text: t, agentText: agentText, attachments: attachments, imageLocalURIs: imageURIs)
+      clearText()
 
     case .team:
       setMentionBannerVisible(false, animated: false)
       let attachments = pendingAttachmentBlobs
-      pendingImages.removeAll()
-      pendingAttachmentBlobs.removeAll()
-      updateAttachmentPreviewVisibility()
-      delegate?.inputBarDidSend(text: t, attachments: attachments)
+      let imageURIs = pendingImageLocalURIs
+      clearPendingAttachments()
+      delegate?.inputBarDidSend(
+        text: t, attachments: attachments, imageLocalURIs: imageURIs)
       clearText()
 
     case .standalone(let username, let agentText):
@@ -3026,21 +3075,34 @@ final class ChatInputBar: UIView {
         return
       }
       setMentionBannerVisible(false, animated: false)
+      let attachments = pendingAttachmentBlobs
+      let imageURIs = pendingImageLocalURIs
+      clearPendingAttachments()
       delegate?.inputBarDidSendWithStandaloneAgentMention(
         text: t,
         agentText: agentText,
-        agentUsername: username
+        agentUsername: username,
+        attachments: attachments,
+        imageLocalURIs: imageURIs
       )
+      clearText()
 
     case .none:
       setMentionBannerVisible(false, animated: false)
       let attachments = pendingAttachmentBlobs
-      pendingImages.removeAll()
-      pendingAttachmentBlobs.removeAll()
-      updateAttachmentPreviewVisibility()
-      delegate?.inputBarDidSend(text: t, attachments: attachments)
+      let imageURIs = pendingImageLocalURIs
+      clearPendingAttachments()
+      delegate?.inputBarDidSend(
+        text: t, attachments: attachments, imageLocalURIs: imageURIs)
       clearText()
     }
+  }
+
+  private func clearPendingAttachments() {
+    pendingImages.removeAll()
+    pendingAttachmentBlobs.removeAll()
+    pendingImageLocalURIs.removeAll()
+    updateAttachmentPreviewVisibility()
   }
 
   @objc private func mentionBannerTapped() {
@@ -4612,17 +4674,39 @@ extension ChatInputBar: PHPickerViewControllerDelegate, UIImagePickerControllerD
   private func stageImage(_ image: UIImage) {
     let scaled = ChatInputBar.scaledImage(image, maxDimension: 1024)
     guard let data = scaled.jpegData(compressionQuality: 0.55) else { return }
+    let fileName = "image-\(Int(Date().timeIntervalSince1970 * 1000)).jpg"
     let object: [String: Any] = [
-      "name": "image-\(Int(Date().timeIntervalSince1970 * 1000)).jpg",
+      "name": fileName,
       "mime": "image/jpeg",
       "dataB64": data.base64EncodedString(),
     ]
-    guard let blob = AgentRuntimeCrypto.encrypt(object) else { return }
-    
+    // Always write a durable local file so send never depends only on sealed blobs
+    // (decrypt/materialize can fail; agents still get blobs when present).
+    let localURI: String? = {
+      let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+        ?? FileManager.default.temporaryDirectory
+      let dir = caches.appendingPathComponent("chat-local-attachments", isDirectory: true)
+      try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+      let url = dir.appendingPathComponent("\(UUID().uuidString.lowercased())-\(fileName)")
+      do {
+        try data.write(to: url, options: .atomic)
+        return url.absoluteString
+      } catch {
+        NSLog("[ChatInputBar] stageImage write failed %@", error.localizedDescription)
+        return nil
+      }
+    }()
+    let blob = AgentRuntimeCrypto.encrypt(object)
+
     DispatchQueue.main.async { [weak self] in
       guard let self else { return }
       self.pendingImages.append(image)
-      self.pendingAttachmentBlobs.append(blob)
+      if let blob { self.pendingAttachmentBlobs.append(blob) }
+      if let localURI { self.pendingImageLocalURIs.append(localURI) }
+      // Keep arrays aligned if encrypt fails: pad blobs with empty so URI index still works.
+      while self.pendingAttachmentBlobs.count < self.pendingImageLocalURIs.count {
+        self.pendingAttachmentBlobs.append("")
+      }
       self.updateAttachmentPreviewVisibility()
       self.updateButtonStates(animated: true)
     }
@@ -4697,7 +4781,13 @@ extension ChatInputBar: PHPickerViewControllerDelegate, UIImagePickerControllerD
     let index = sender.tag
     guard index < pendingImages.count else { return }
     pendingImages.remove(at: index)
-    pendingAttachmentBlobs.remove(at: index)
+    if index < pendingAttachmentBlobs.count { pendingAttachmentBlobs.remove(at: index) }
+    if index < pendingImageLocalURIs.count {
+      let uri = pendingImageLocalURIs.remove(at: index)
+      if let url = URL(string: uri), url.isFileURL {
+        try? FileManager.default.removeItem(at: url)
+      }
+    }
     updateAttachmentPreviewVisibility()
     updateButtonStates(animated: true)
   }

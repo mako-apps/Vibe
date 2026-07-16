@@ -29,13 +29,6 @@ private func chatNativeAgentNormalizedString(_ value: Any?) -> String? {
   return nil
 }
 
-private func chatNativeAgentStatusTitle(_ status: String) -> String {
-  status
-    .replacingOccurrences(of: "_", with: " ")
-    .split(separator: " ")
-    .map { $0.capitalized }
-    .joined(separator: " ")
-}
 
 private func chatNativeAgentPromptPreview(_ prompt: String?) -> String? {
   guard let prompt else { return nil }
@@ -99,29 +92,7 @@ private func chatNativeAgentNormalizeSummaryWindowHours(_ value: Int?) -> Int {
   }
 }
 
-private func chatNativeAgentEventInboxTitle(
-  mode: String,
-  summaryWindowHours: Int,
-  schedule: String? = nil,
-  summaryTimes: [String]? = nil
-) -> String {
-  let normalizedMode = chatNativeAgentNormalizeEventInboxMode(mode)
-  let normalizedHours = chatNativeAgentNormalizeSummaryWindowHours(summaryWindowHours)
 
-  guard normalizedMode == "batched_summary" else { return "Off · event bubbles" }
-
-  if schedule?.lowercased() == "daily", let times = summaryTimes, !times.isEmpty {
-    return times.count == 1 ? "On · daily summary" : "On · \(times.count) summaries/day"
-  }
-
-  return normalizedHours <= 1
-    ? "On · summary every hour"
-    : "On · summary every \(normalizedHours)h"
-}
-
-private func chatNativeAgentIncomingChatTitle(_ enabled: Bool) -> String {
-  enabled ? "Accepted" : "Disabled"
-}
 
 private func chatNativeAgentInteger(_ value: Any?) -> Int? {
   if let number = value as? NSNumber {
@@ -2608,25 +2579,7 @@ final class ChatNativeAgentConfigPanelController: UIViewController {
     viewModel?.card = card
   }
 
-  private func promptRename() {
-    let controller = ChatNativeAgentTextEditViewController(
-      title: "Agent Name",
-      caption: "The name shown for this agent across Vibe.",
-      placeholder: "Agent name",
-      initialValue: card.displayName,
-      theme: theme
-    ) { [weak self] proposedName, completion in
-      self?.renameAgent(to: proposedName, completion: completion)
-    }
-    navigationController?.pushViewController(controller, animated: true)
-  }
 
-  private func handleCopyHandle() {
-    guard let username = card.username, !username.isEmpty else { return }
-    UIPasteboard.general.string = username
-    UIImpactFeedbackGenerator(style: .light).impactOccurred()
-    onToast?("Copied handle")
-  }
 
 
   /// Publishes a draft (POST /publish) or reverts a published agent back to
@@ -2676,16 +2629,6 @@ final class ChatNativeAgentConfigPanelController: UIViewController {
     task.resume()
   }
 
-  private func promptEditSystemPrompt() {
-    let controller = ChatNativeAgentPromptViewController(
-      prompt: card.systemPrompt ?? "",
-      theme: theme,
-      allowsEditing: true
-    ) { [weak self] updatedPrompt, completion in
-      self?.saveSystemPrompt(updatedPrompt, completion: completion)
-    }
-    navigationController?.pushViewController(controller, animated: true)
-  }
 
   private func renameAgent(to proposedName: String, completion: @escaping (Bool) -> Void) {
     let normalizedName = proposedName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2814,23 +2757,6 @@ final class ChatNativeAgentConfigPanelController: UIViewController {
     task.resume()
   }
 
-  private func presentInboxSettings() {
-    let controller = ChatNativeAgentInboxSettingsViewController(
-      mode: card.eventInboxMode,
-      schedule: card.summarySchedule,
-      windowHours: card.summaryWindowHours,
-      times: card.summaryTimes ?? [],
-      theme: theme
-    ) { [weak self] mode, schedule, windowHours, times, completion in
-      self?.updateEventInboxMode(
-        mode: mode,
-        schedule: schedule,
-        summaryWindowHours: windowHours,
-        summaryTimes: times,
-        completion: completion)
-    }
-    navigationController?.pushViewController(controller, animated: true)
-  }
 
   private func updateEventInboxMode(
     mode: String,
@@ -3335,29 +3261,6 @@ final class ChatNativeAgentConfigPanelController: UIViewController {
     task.resume()
   }
 
-  private func promptIncomingChatMode() {
-    let options = [
-      ChatNativeAgentPickerOption(
-        title: "Accept messages",
-        subtitle: "People can DM this agent directly in its Vibe chat.",
-        isSelected: card.incomingChatEnabled
-      ),
-      ChatNativeAgentPickerOption(
-        title: "Disable messages",
-        subtitle: "The agent only responds to external invokes and events.",
-        isSelected: !card.incomingChatEnabled
-      ),
-    ]
-    let picker = ChatNativeAgentOptionPickerViewController(
-      title: "Incoming Chat",
-      subtitle: "Choose whether this agent accepts direct chat messages.",
-      options: options,
-      theme: theme
-    ) { [weak self] index in
-      self?.updateIncomingChatMode(enabled: index == 0)
-    }
-    navigationController?.pushViewController(picker, animated: true)
-  }
 
   private func updateIncomingChatMode(enabled: Bool) {
     guard enabled != card.incomingChatEnabled else {
@@ -3447,21 +3350,6 @@ final class ChatNativeAgentConfigPanelController: UIViewController {
 
 
 
-  private func confirmDelete() {
-    let alert = UIAlertController(
-      title: "Delete Agent",
-      message: "Archive \(card.displayName)? This removes it from your active agent list.",
-      preferredStyle: .alert
-    )
-    alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-    alert.addAction(UIAlertAction(title: "Delete", style: .destructive) { [weak self] _ in
-      guard let self else { return }
-      self.onDeleteAgent?(self.card) { [weak self] in
-        self?.closeAfterDelete()
-      }
-    })
-    present(alert, animated: true)
-  }
 
   @objc private func handleClose() {
     dismiss(animated: true)

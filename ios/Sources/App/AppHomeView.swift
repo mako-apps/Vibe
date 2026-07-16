@@ -1328,8 +1328,9 @@ private final class ChatsViewModel: ObservableObject {
   @Published var hasLoadedArchived = false
 
   /// Hard-refreshed principal header: Connecting → Updating → Chats.
+  /// Connecting only for real offline / blocked-to-server — not bootstrap noise.
   var headerState: AppHomeHeaderState {
-    if isConnecting || isWaitingForNetwork { return .connecting }
+    if isWaitingForNetwork || isConnecting { return .connecting }
     if isListUpdating || isLoading { return .updating }
     return .ready
   }
@@ -1452,7 +1453,7 @@ private final class ChatsViewModel: ObservableObject {
     }
   }
 
-  /// Mirrors ChatMainView connection detection so Home + chat headers stay in sync.
+  /// True only when the socket is known-up (not mid-bootstrap).
   static func isEngineConnected() -> Bool {
     let status = ChatEngine.shared.getStatus()
     if (status["connected"] as? Bool) == true { return true }
@@ -1463,9 +1464,36 @@ private final class ChatsViewModel: ObservableObject {
     return stateValue == "native-socket-open" || stateValue == "connected-shadow"
   }
 
+  /// Network off / server unreachable / transport blocked — NOT ordinary bootstrap.
+  static func isOfflineOrBlockedToServer() -> Bool {
+    let status = ChatEngine.shared.getStatus()
+    if (status["connected"] as? Bool) == true { return false }
+    let stateValue =
+      (status["state"] as? String)?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased() ?? ""
+    if stateValue == "native-socket-open" || stateValue == "connected-shadow" {
+      return false
+    }
+    // Explicit dead / blocked states only.
+    if stateValue == "offline"
+      || stateValue == "disconnected"
+      || stateValue == "native-socket-closed"
+      || stateValue == "native-connect-stale"
+      || stateValue == "native-config-missing"
+      || stateValue.contains("disconnect")
+      || stateValue.contains("unreachable")
+      || stateValue.contains("fail")
+      || stateValue.contains("error")
+    {
+      return true
+    }
+    // Mid-bootstrap / configuring / connecting-native-presence → not "Connecting".
+    return false
+  }
+
   private func refreshConnectionState() {
-    let connected = Self.isEngineConnected()
-    let next = !connected
+    let next = Self.isOfflineOrBlockedToServer()
     if isConnecting != next {
       isConnecting = next
     }
@@ -2136,8 +2164,6 @@ private struct ChatHomeScreen: View {
   @State private var isShowingGroupCreation = false
   @State private var homeSearchQuery = ""
   @State private var isHomeSearchFocused = false
-  /// Shared geometry for the search field morph (list entry → focused bar + close).
-  @Namespace private var homeSearchNamespace
   @State private var locallyHiddenChatIDs = Set<String>()
   @State private var pendingDeleteConfirmation: ChatHomeDeleteConfirmation?
   @State private var pendingDeletion: ChatHomePendingDeletion?
@@ -2322,23 +2348,24 @@ private struct ChatHomeScreen: View {
     filteredRows.filter { !$0.isArchiveEntry }.prefix(16).map { $0 }
   }
 
-  private var homeSearchSpring: Animation {
-    .spring(response: 0.34, dampingFraction: 0.88)
-  }
-
   private func openHomeSearch() {
     setTabBarHidden(true, animated: true)
     if isEditingHome {
       isEditingHome = false
       selectedChatIDs.removeAll()
     }
-    withAnimation(homeSearchSpring) {
+    // Instant toolbar hide (no spring / matchedGeometry Y translate).
+    var txn = Transaction()
+    txn.disablesAnimations = true
+    withTransaction(txn) {
       isHomeSearchFocused = true
     }
   }
 
   private func closeHomeSearch() {
-    withAnimation(homeSearchSpring) {
+    var txn = Transaction()
+    txn.disablesAnimations = true
+    withTransaction(txn) {
       isHomeSearchFocused = false
       homeSearchQuery = ""
       globalResults = []
@@ -2349,7 +2376,8 @@ private struct ChatHomeScreen: View {
   var body: some View {
     NavigationStack {
       ZStack {
-        // Home list stays put. Fades under the shared search morph (no list Y translate).
+        // List owns the unfocused search as tableHeaderView (scrolls with rows).
+        // No SwiftUI safeAreaInset — that fought UIKit contentInset and covered cells.
         listContent
           .ignoresSafeArea(.container, edges: [.top, .bottom])
           .background(palette.background.ignoresSafeArea())
@@ -2357,8 +2385,7 @@ private struct ChatHomeScreen: View {
           .allowsHitTesting(!isHomeSearchFocused)
           .zIndex(0)
 
-        // Focused search surface: same field id as the entry (matchedGeometry),
-        // close control slides in from the trailing edge (Telegram).
+        // Focused search is a full-screen overlay (opacity only — no Y morph).
         if isHomeSearchFocused {
           HomeTelegramSearchView(
             query: $homeSearchQuery,
@@ -2369,7 +2396,6 @@ private struct ChatHomeScreen: View {
             isGlobalSearching: isGlobalSearching,
             isDark: colorScheme == .dark,
             palette: palette,
-            searchNamespace: homeSearchNamespace,
             onSelectChat: { openLocalChatRow($0) },
             onSelectPerson: { handleGlobalUserTap($0) },
             onClose: closeHomeSearch
@@ -2431,12 +2457,11 @@ private struct ChatHomeScreen: View {
           .zIndex(5)
         }
       }
-        .animation(homeSearchSpring, value: isHomeSearchFocused)
         .animation(.spring(response: 0.28, dampingFraction: 0.86), value: pendingDeletion?.id)
         .animation(.spring(response: 0.22, dampingFraction: 0.9), value: pendingDeleteConfirmation?.id)
         .navigationBarTitleDisplayMode(.inline)
-        // Always keep toolbar items mounted. Search focus hides the bar via
-        // `.toolbar(.hidden)` (SwiftUI) — no item teardown, no custom Y offset.
+        // Always keep toolbar items mounted. Search focus uses SwiftUI
+        // `.toolbar(.hidden)` only — no Y translate / spring collapse.
         .toolbar {
           ToolbarItem(placement: .topBarLeading) {
             Button(isEditingHome ? "Done" : "Edit") {
@@ -2498,22 +2523,9 @@ private struct ChatHomeScreen: View {
           }
         }
         .toolbarBackground(.hidden, for: .navigationBar)
-        // Hide the system nav header on search focus (shared field morph owns the top).
+        // SwiftUI hide only — open/close disables animations so nav never Y-springs.
         .toolbar(isHomeSearchFocused ? .hidden : .visible, for: .navigationBar)
-        // Unfocused entry under the nav — system-searchable fill + matchedGeometry id
-        // shared with the focused bar (Telegram-style one field, not two glass pieces).
-        .safeAreaInset(edge: .top, spacing: 0) {
-          if !isEditingHome && !isHomeSearchFocused {
-            HomeSearchEntryField(
-              palette: palette,
-              searchNamespace: homeSearchNamespace
-            ) {
-              openHomeSearch()
-            }
-            .padding(.horizontal, 16)
-            .padding(.bottom, 6)
-          }
-        }
+        // Search entry lives in UITableView.tableHeaderView (not safeAreaInset).
         .onChange(of: isHomeSearchFocused) { _, isPresented in
           if isPresented {
             setTabBarHidden(true, animated: true)
@@ -2652,6 +2664,22 @@ private struct ChatHomeScreen: View {
         isEditing: isEditingHome && !isHomeSearchFocused,
         showsRightCheckmark: false,
         selectedChatIDs: selectedChatIDs,
+        // In-list full-capsule search (tableHeaderView) — scrolls with rows, no
+        // safeAreaInset / contentInset fight with the UIKit table.
+        searchText: $homeSearchQuery,
+        isSearchFocused: Binding(
+          get: { isHomeSearchFocused },
+          set: { focused in
+            if focused {
+              openHomeSearch()
+            } else if isHomeSearchFocused {
+              closeHomeSearch()
+            }
+          }
+        ),
+        recentRows: recentSearchRows,
+        peopleResults: combinedPeopleResults,
+        isGlobalSearching: isGlobalSearching,
         onSelect: { row in
           if row.isArchiveEntry {
             selectedChatIDs.removeAll()
@@ -2681,6 +2709,7 @@ private struct ChatHomeScreen: View {
         onAction: { action, row in
           performHomeRowAction(action, row: row)
         },
+        onSelectPerson: { handleGlobalUserTap($0) },
         onRefresh: {
           await model.refreshAll()
         },
@@ -2959,39 +2988,6 @@ private struct ChatHomeScreen: View {
     }
   }
 
-  @MainActor
-  private func createRoom(kind: ChatRoomCreationKind, name rawName: String) async {
-    guard let config = AppSessionConfig.current else {
-      errorMessage = "The current session is unavailable."
-      return
-    }
-
-    let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !name.isEmpty else {
-      errorMessage = "\(kind.displayName) name is required."
-      return
-    }
-
-    isStartingChat = true
-    errorMessage = nil
-    defer { isStartingChat = false }
-
-    do {
-      let result = try await ChatRoomCreateService.create(kind: kind, config: config, name: name)
-      let route = ChatRoute(
-        chatId: result.chatID,
-        title: result.name,
-        peerUserId: nil,
-        avatarURI: nil,
-        isGroup: true,
-        initialRows: []
-      )
-      coordinator.openChat(route)
-      await model.refresh()
-    } catch {
-      errorMessage = error.localizedDescription
-    }
-  }
 
   @MainActor
   private func saveContact(for user: ContactSearchUser) async {
@@ -3603,12 +3599,10 @@ private struct ArchivedChatHomeListScreen: View {
 /// only label opacity reflects enabled/disabled.
 // MARK: - Home search (Telegram-style shared field + close slide-in)
 
-/// System-searchable fill (not liquid glass) — matches Telegram's default search chrome.
+/// System-searchable fill — full capsule (corner radius = half height).
 private enum HomeSearchChrome {
-  static let fieldCorner: CGFloat = 12
   static let fieldHeight: CGFloat = 40
   static let closeSize: CGFloat = 34
-  static let matchedFieldID = "homeSearchField"
 
   static var fieldFill: Color {
     Color(uiColor: UIColor { traits in
@@ -3627,39 +3621,27 @@ private enum HomeSearchChrome {
   }
 }
 
-/// Unfocused entry under the nav — same geometry id as the focused field.
-private struct HomeSearchEntryField: View {
-  let palette: AppThemePalette
-  let searchNamespace: Namespace.ID
-  let onTap: () -> Void
+/// Full-capsule search field chrome (focused overlay).
+private struct HomeSearchCapsuleField<Content: View>: View {
+  @ViewBuilder var content: () -> Content
 
   var body: some View {
-    Button(action: onTap) {
-      HStack(spacing: 8) {
-        Image(systemName: "magnifyingglass")
-          .font(.system(size: 16, weight: .medium))
-          .foregroundStyle(palette.secondaryText)
-        Text("Search")
-          .font(.system(size: 17, weight: .regular))
-          .foregroundStyle(palette.secondaryText)
-        Spacer(minLength: 0)
-      }
+    content()
       .padding(.horizontal, 12)
-      .frame(height: HomeSearchChrome.fieldHeight)
-      .background(
-        RoundedRectangle(cornerRadius: HomeSearchChrome.fieldCorner, style: .continuous)
-          .fill(HomeSearchChrome.fieldFill)
+      .frame(
+        maxWidth: .infinity,
+        minHeight: HomeSearchChrome.fieldHeight,
+        maxHeight: HomeSearchChrome.fieldHeight,
+        alignment: .leading
       )
-    }
-    .buttonStyle(.plain)
-    .matchedGeometryEffect(id: HomeSearchChrome.matchedFieldID, in: searchNamespace)
+      .background(HomeSearchChrome.fieldFill, in: Capsule(style: .continuous))
+      .clipShape(Capsule(style: .continuous))
   }
 }
 
-// MARK: - Telegram-style search surface (shared field morph + compact results)
+// MARK: - Focused search surface (overlay — no matchedGeometry Y morph)
 
-/// Full-screen search UI. Field uses `matchedGeometryEffect` with the list entry;
-/// close control slides in from outside the trailing edge (not a second glass island).
+/// Full-screen search UI. Opacity present only; nav is hidden via `.toolbar(.hidden)`.
 private struct HomeTelegramSearchView: View {
   @Binding var query: String
   @Binding var isFocused: Bool
@@ -3669,14 +3651,11 @@ private struct HomeTelegramSearchView: View {
   let isGlobalSearching: Bool
   let isDark: Bool
   let palette: AppThemePalette
-  let searchNamespace: Namespace.ID
   let onSelectChat: (ChatHomeListRow) -> Void
   let onSelectPerson: (ContactSearchUser) -> Void
   let onClose: () -> Void
 
   @FocusState private var fieldFocused: Bool
-  /// Close starts off-screen then slides in beside the field (Telegram).
-  @State private var closeRevealed = false
 
   private var showRecentsStrip: Bool {
     query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -3684,38 +3663,34 @@ private struct HomeTelegramSearchView: View {
 
   var body: some View {
     VStack(spacing: 0) {
-      // Pinned top chrome: shared search field + trailing close that enters from off-window.
+      // Full-capsule field + circular close (Telegram layout).
       HStack(spacing: 10) {
-        HStack(spacing: 8) {
-          Image(systemName: "magnifyingglass")
-            .font(.system(size: 16, weight: .medium))
-            .foregroundStyle(palette.secondaryText)
-          TextField("Search", text: $query)
-            .textInputAutocapitalization(.never)
-            .autocorrectionDisabled()
-            .focused($fieldFocused)
-            .font(.system(size: 17))
-            .foregroundStyle(palette.text)
-            .submitLabel(.search)
-          if !query.isEmpty {
-            Button {
-              query = ""
-            } label: {
-              Image(systemName: "xmark.circle.fill")
-                .font(.system(size: 16))
-                .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(palette.secondaryText.opacity(0.75))
+        HomeSearchCapsuleField {
+          HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+              .font(.system(size: 16, weight: .medium))
+              .foregroundStyle(palette.secondaryText)
+            TextField("Search", text: $query)
+              .textFieldStyle(.plain)
+              .textInputAutocapitalization(.never)
+              .autocorrectionDisabled()
+              .focused($fieldFocused)
+              .font(.system(size: 17))
+              .foregroundStyle(palette.text)
+              .submitLabel(.search)
+            if !query.isEmpty {
+              Button {
+                query = ""
+              } label: {
+                Image(systemName: "xmark.circle.fill")
+                  .font(.system(size: 16))
+                  .symbolRenderingMode(.hierarchical)
+                  .foregroundStyle(palette.secondaryText.opacity(0.75))
+              }
+              .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
           }
         }
-        .padding(.horizontal, 12)
-        .frame(height: HomeSearchChrome.fieldHeight)
-        .background(
-          RoundedRectangle(cornerRadius: HomeSearchChrome.fieldCorner, style: .continuous)
-            .fill(HomeSearchChrome.fieldFill)
-        )
-        .matchedGeometryEffect(id: HomeSearchChrome.matchedFieldID, in: searchNamespace)
 
         Button(action: onClose) {
           Image(systemName: "xmark")
@@ -3725,14 +3700,13 @@ private struct HomeTelegramSearchView: View {
             .background(
               Circle().fill(HomeSearchChrome.closeFill)
             )
+            .clipShape(Circle())
         }
         .buttonStyle(.plain)
-        .opacity(closeRevealed ? 1 : 0)
-        .offset(x: closeRevealed ? 0 : 56)
         .accessibilityLabel("Close search")
       }
       .padding(.horizontal, 16)
-      .padding(.top, 6)
+      .padding(.top, 8)
       .padding(.bottom, 10)
 
       // Results scroll under the pinned bar (searchable-like).
@@ -3830,17 +3804,11 @@ private struct HomeTelegramSearchView: View {
         }
         .padding(.bottom, 24)
       }
-      .opacity(closeRevealed ? 1 : 0.35)
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .background(palette.background.ignoresSafeArea())
     .onAppear {
-      // Field morph runs with parent spring; close slides in one beat later from off-trailing.
       fieldFocused = true
-      closeRevealed = false
-      withAnimation(.spring(response: 0.36, dampingFraction: 0.86).delay(0.02)) {
-        closeRevealed = true
-      }
     }
   }
 
@@ -3966,37 +3934,28 @@ private struct HomeSearchAvatarView: View {
   }
 }
 
-// MARK: - In-list search header (legacy header helper; unused when nav searchable is active)
+// MARK: - In-list search header (scrolls with UITableView)
 
-/// Search field + optional horizontal Recent avatars. Lives in `tableHeaderView`
-/// so it scrolls with the list (no nav-drawer flash).
-private final class ChatHomeInListSearchHeader: UIView, UISearchBarDelegate,
-  UICollectionViewDataSource, UICollectionViewDelegateFlowLayout
-{
-  var onTextChange: ((String) -> Void)?
+/// Full-capsule search entry at the top of the home list (`tableHeaderView`).
+/// Tapping opens the focused search surface — field is not a sticky safeAreaInset.
+private final class ChatHomeInListSearchHeader: UIView {
   var onFocusChange: ((Bool) -> Void)?
-  var onSelectRecent: ((ChatHomeListRow) -> Void)?
 
-  private let searchBar = UISearchBar(frame: .zero)
-  private let recentsLabel = UILabel()
-  private let collectionView: UICollectionView
-  private var recentRows: [ChatHomeListRow] = []
+  private let capsule = UIView()
+  private let iconView = UIImageView()
+  private let placeholderLabel = UILabel()
+  private let hitButton = UIButton(type: .system)
   private var isDark = true
-  private var showsRecents = false
+
+  private static let fieldHeight: CGFloat = 40
+  private static let horizontalInset: CGFloat = 16
+  private static let verticalInset: CGFloat = 6
 
   var preferredHeight: CGFloat {
-    let searchH: CGFloat = 52
-    guard showsRecents else { return searchH + 4 }
-    return searchH + 18 + 78 + 8
+    Self.fieldHeight + Self.verticalInset * 2
   }
 
   override init(frame: CGRect) {
-    let layout = UICollectionViewFlowLayout()
-    layout.scrollDirection = .horizontal
-    layout.minimumLineSpacing = 14
-    layout.minimumInteritemSpacing = 14
-    layout.sectionInset = UIEdgeInsets(top: 0, left: 16, bottom: 0, right: 16)
-    collectionView = UICollectionView(frame: .zero, collectionViewLayout: layout)
     super.init(frame: frame)
     setup()
   }
@@ -4007,46 +3966,51 @@ private final class ChatHomeInListSearchHeader: UIView, UISearchBarDelegate,
 
   private func setup() {
     backgroundColor = .clear
-    searchBar.searchBarStyle = .minimal
-    searchBar.placeholder = "Search"
-    searchBar.delegate = self
-    searchBar.autocapitalizationType = .none
-    searchBar.autocorrectionType = .no
-    searchBar.translatesAutoresizingMaskIntoConstraints = false
-    addSubview(searchBar)
 
-    recentsLabel.text = "Recent"
-    recentsLabel.font = .systemFont(ofSize: 13, weight: .semibold)
-    recentsLabel.translatesAutoresizingMaskIntoConstraints = false
-    recentsLabel.alpha = 0
-    addSubview(recentsLabel)
+    capsule.translatesAutoresizingMaskIntoConstraints = false
+    // Full capsule — radius always half of field height.
+    capsule.layer.cornerRadius = Self.fieldHeight * 0.5
+    capsule.layer.cornerCurve = .continuous
+    capsule.layer.masksToBounds = true
+    capsule.clipsToBounds = true
+    addSubview(capsule)
 
-    collectionView.backgroundColor = .clear
-    collectionView.showsHorizontalScrollIndicator = false
-    collectionView.dataSource = self
-    collectionView.delegate = self
-    collectionView.register(
-      ChatHomeRecentAvatarCell.self,
-      forCellWithReuseIdentifier: ChatHomeRecentAvatarCell.reuseId
-    )
-    collectionView.translatesAutoresizingMaskIntoConstraints = false
-    collectionView.alpha = 0
-    addSubview(collectionView)
+    iconView.translatesAutoresizingMaskIntoConstraints = false
+    iconView.image = UIImage(systemName: "magnifyingglass")
+    iconView.contentMode = .scaleAspectFit
+    iconView.preferredSymbolConfiguration = UIImage.SymbolConfiguration(
+      pointSize: 15, weight: .medium)
+    capsule.addSubview(iconView)
+
+    placeholderLabel.translatesAutoresizingMaskIntoConstraints = false
+    placeholderLabel.text = "Search"
+    placeholderLabel.font = .systemFont(ofSize: 17, weight: .regular)
+    capsule.addSubview(placeholderLabel)
+
+    hitButton.translatesAutoresizingMaskIntoConstraints = false
+    hitButton.addTarget(self, action: #selector(handleTap), for: .touchUpInside)
+    hitButton.accessibilityLabel = "Search"
+    addSubview(hitButton)
 
     NSLayoutConstraint.activate([
-      searchBar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
-      searchBar.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
-      searchBar.topAnchor.constraint(equalTo: topAnchor, constant: 2),
-      searchBar.heightAnchor.constraint(equalToConstant: 48),
+      capsule.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Self.horizontalInset),
+      capsule.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -Self.horizontalInset),
+      capsule.topAnchor.constraint(equalTo: topAnchor, constant: Self.verticalInset),
+      capsule.heightAnchor.constraint(equalToConstant: Self.fieldHeight),
 
-      recentsLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
-      recentsLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
-      recentsLabel.topAnchor.constraint(equalTo: searchBar.bottomAnchor, constant: 2),
+      iconView.leadingAnchor.constraint(equalTo: capsule.leadingAnchor, constant: 12),
+      iconView.centerYAnchor.constraint(equalTo: capsule.centerYAnchor),
+      iconView.widthAnchor.constraint(equalToConstant: 18),
+      iconView.heightAnchor.constraint(equalToConstant: 18),
 
-      collectionView.leadingAnchor.constraint(equalTo: leadingAnchor),
-      collectionView.trailingAnchor.constraint(equalTo: trailingAnchor),
-      collectionView.topAnchor.constraint(equalTo: recentsLabel.bottomAnchor, constant: 6),
-      collectionView.heightAnchor.constraint(equalToConstant: 72),
+      placeholderLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 8),
+      placeholderLabel.trailingAnchor.constraint(equalTo: capsule.trailingAnchor, constant: -12),
+      placeholderLabel.centerYAnchor.constraint(equalTo: capsule.centerYAnchor),
+
+      hitButton.leadingAnchor.constraint(equalTo: leadingAnchor),
+      hitButton.trailingAnchor.constraint(equalTo: trailingAnchor),
+      hitButton.topAnchor.constraint(equalTo: topAnchor),
+      hitButton.bottomAnchor.constraint(equalTo: bottomAnchor),
     ])
   }
 
@@ -4057,88 +4021,34 @@ private final class ChatHomeInListSearchHeader: UIView, UISearchBarDelegate,
     recentRows: [ChatHomeListRow],
     animated: Bool
   ) {
+    _ = text
+    _ = isFocused
+    _ = recentRows
+    _ = animated
     self.isDark = isDark
-    self.recentRows = recentRows
-    if searchBar.text != text {
-      searchBar.text = text
-    }
-    searchBar.barStyle = isDark ? .black : .default
-    searchBar.tintColor = isDark ? .white : .black
-    recentsLabel.textColor = (isDark ? UIColor.white : UIColor.black).withAlphaComponent(0.55)
-
-    let showRecents =
-      isFocused && text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-      && !recentRows.isEmpty
-    let changed = showRecents != showsRecents
-    showsRecents = showRecents
-    collectionView.reloadData()
-
-    let applyVisibility = {
-      self.recentsLabel.alpha = showRecents ? 1 : 0
-      self.collectionView.alpha = showRecents ? 1 : 0
-    }
-    if animated && changed {
-      UIView.animate(
-        withDuration: 0.22,
-        delay: 0,
-        options: [.beginFromCurrentState, .curveEaseInOut],
-        animations: applyVisibility
-      )
-    } else {
-      applyVisibility()
-    }
+    let fill: UIColor =
+      isDark
+      ? UIColor(white: 0.18, alpha: 1.0)
+      : UIColor.tertiarySystemFill
+    let secondary: UIColor =
+      isDark
+      ? UIColor.white.withAlphaComponent(0.45)
+      : UIColor.secondaryLabel
+    capsule.backgroundColor = fill
+    iconView.tintColor = secondary
+    placeholderLabel.textColor = secondary
+    // Full corner radius (true pill).
+    capsule.layer.cornerRadius = Self.fieldHeight * 0.5
+    capsule.layer.masksToBounds = true
   }
 
-  func searchBarTextDidBeginEditing(_ searchBar: UISearchBar) {
-    searchBar.setShowsCancelButton(true, animated: true)
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    capsule.layer.cornerRadius = Self.fieldHeight * 0.5
+  }
+
+  @objc private func handleTap() {
     onFocusChange?(true)
-  }
-
-  func searchBar(_ searchBar: UISearchBar, textDidChange searchText: String) {
-    onTextChange?(searchText)
-  }
-
-  func searchBarCancelButtonClicked(_ searchBar: UISearchBar) {
-    searchBar.text = ""
-    searchBar.resignFirstResponder()
-    searchBar.setShowsCancelButton(false, animated: true)
-    onTextChange?("")
-    onFocusChange?(false)
-  }
-
-  func searchBarSearchButtonClicked(_ searchBar: UISearchBar) {
-    searchBar.resignFirstResponder()
-  }
-
-  func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int)
-    -> Int
-  {
-    recentRows.count
-  }
-
-  func collectionView(_ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath)
-    -> UICollectionViewCell
-  {
-    let cell =
-      collectionView.dequeueReusableCell(
-        withReuseIdentifier: ChatHomeRecentAvatarCell.reuseId, for: indexPath)
-      as! ChatHomeRecentAvatarCell
-    let row = recentRows[indexPath.item]
-    cell.configure(row: row, isDark: isDark)
-    return cell
-  }
-
-  func collectionView(
-    _ collectionView: UICollectionView,
-    layout collectionViewLayout: UICollectionViewLayout,
-    sizeForItemAt indexPath: IndexPath
-  ) -> CGSize {
-    CGSize(width: 64, height: 72)
-  }
-
-  func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
-    guard recentRows.indices.contains(indexPath.item) else { return }
-    onSelectRecent?(recentRows[indexPath.item])
   }
 }
 
@@ -4538,7 +4448,13 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
   }
 
   private func updateInListSearchHeader(animated: Bool) {
-    guard showsInListSearch else {
+    // Hide in-list entry while editing or while the focused search overlay owns chrome
+    // (header is only for the scrollable unfocused field at the top of the list).
+    let showHeader =
+      showsInListSearch
+      && !isEditingMode
+      && isSearchFocusedBinding?.wrappedValue != true
+    guard showHeader else {
       if tableView.tableHeaderView != nil {
         tableView.tableHeaderView = nil
         searchHeader = nil
@@ -4549,31 +4465,25 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     if let existing = searchHeader {
       header = existing
     } else {
-      header = ChatHomeInListSearchHeader(frame: CGRect(x: 0, y: 0, width: view.bounds.width, height: 56))
-      header.onTextChange = { [weak self] text in
-        self?.searchTextBinding?.wrappedValue = text
-      }
+      header = ChatHomeInListSearchHeader(
+        frame: CGRect(x: 0, y: 0, width: view.bounds.width, height: 52))
       header.onFocusChange = { [weak self] focused in
         self?.isSearchFocusedBinding?.wrappedValue = focused
       }
-      header.onSelectRecent = { [weak self] row in
-        self?.onSelect(row)
-      }
       searchHeader = header
     }
-    header.bounds.size.width = tableView.bounds.width > 0 ? tableView.bounds.width : view.bounds.width
+    let width = tableView.bounds.width > 0 ? tableView.bounds.width : view.bounds.width
+    header.bounds.size.width = width
     header.apply(
       text: searchTextBinding?.wrappedValue ?? "",
-      isFocused: isSearchFocusedBinding?.wrappedValue == true,
+      isFocused: false,
       isDark: isDark,
       recentRows: recentRows,
       animated: animated
     )
     header.layoutIfNeeded()
     let targetHeight = header.preferredHeight
-    if abs(header.bounds.height - targetHeight) > 0.5 {
-      header.frame = CGRect(x: 0, y: 0, width: header.bounds.width, height: targetHeight)
-    }
+    header.frame = CGRect(x: 0, y: 0, width: width, height: targetHeight)
     // Re-assign so UITableView picks up new header size without a body flash.
     tableView.tableHeaderView = header
   }
@@ -4928,38 +4838,7 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     return result
   }
 
-  private func captureDeletionOverlays(for indexPaths: [IndexPath]) -> [ChatHomeDeletionWipeOverlayView] {
-    indexPaths.compactMap { indexPath in
-      guard let cell = tableView.cellForRow(at: indexPath) as? ChatHomeCardCell else { return nil }
-      let frame = tableView.convert(cell.frame, to: view)
-      guard frame.intersects(view.bounds) else { return nil }
-      let overlay = ChatHomeDeletionWipeOverlayView(
-        frame: frame,
-        snapshot: cell.contentView.snapshotView(afterScreenUpdates: false),
-        isDark: isDark
-      )
-      view.addSubview(overlay)
-      return overlay
-    }
-  }
 
-  private func performAnimatedRowDelta(
-    _ delta: AnimatableRowDelta,
-    deletionOverlays: [ChatHomeDeletionWipeOverlayView]
-  ) {
-    tableView.performBatchUpdates {
-      if !delta.deletedIndexPaths.isEmpty {
-        tableView.deleteRows(at: delta.deletedIndexPaths, with: .none)
-      }
-      if !delta.insertedIndexPaths.isEmpty {
-        tableView.insertRows(at: delta.insertedIndexPaths, with: .fade)
-      }
-    } completion: { [weak self] _ in
-      deletionOverlays.forEach { $0.animateAndRemove() }
-      // After moves settle, refresh any surviving visible rows so previews match.
-      self?.reconfigureVisibleCellsInPlace()
-    }
-  }
 
   /// Update visible cells without `reloadData` so scroll position and cell
   /// identity stay put when only content (preview/unread/online) changed.
@@ -5501,31 +5380,6 @@ private protocol ChatHomePreviewActionMenuViewDelegate: AnyObject {
   func homePreviewActionMenu(_ menu: ChatHomePreviewActionMenuView, didSelect action: ChatHomePreviewActionMenuView.Action)
 }
 
-private func makeHomePreviewGlassView(
-  style: UIBlurEffect.Style,
-  cornerRadius: CGFloat,
-  capsuleCorners: Bool = false,
-  interactive: Bool = false
-) -> UIVisualEffectView {
-  let view = UIVisualEffectView(effect: nil)
-  if #available(iOS 26.0, *) {
-    let effect = UIGlassEffect(style: .regular)
-    effect.isInteractive = interactive
-    view.effect = effect
-    if capsuleCorners {
-      view.cornerConfiguration = .capsule()
-    } else {
-      view.layer.cornerRadius = cornerRadius
-      view.layer.cornerCurve = .continuous
-    }
-  } else {
-    view.effect = UIBlurEffect(style: style)
-    view.layer.cornerRadius = cornerRadius
-    view.layer.cornerCurve = .continuous
-  }
-  view.clipsToBounds = true
-  return view
-}
 
 private final class ChatHomeMiniPreviewOverlayController: UIViewController,
   UIGestureRecognizerDelegate, ChatHomePreviewActionMenuViewDelegate
@@ -6512,39 +6366,6 @@ private struct ContactsPageView: View {
     }
   }
 
-  @MainActor
-  private func createRoom(kind: ChatRoomCreationKind, name rawName: String) async {
-    guard let config = AppSessionConfig.current else {
-      errorMessage = "The current session is unavailable."
-      return
-    }
-
-    let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !name.isEmpty else {
-      errorMessage = "\(kind.displayName) name is required."
-      return
-    }
-
-    isStartingChat = true
-    errorMessage = nil
-    defer { isStartingChat = false }
-
-    do {
-      let result = try await ChatRoomCreateService.create(kind: kind, config: config, name: name)
-      let route = ChatRoute(
-        chatId: result.chatID,
-        title: result.name,
-        peerUserId: nil,
-        avatarURI: nil,
-        isGroup: true,
-        initialRows: []
-      )
-      coordinator.openChat(route)
-      await model.refresh()
-    } catch {
-      errorMessage = error.localizedDescription
-    }
-  }
 
   @MainActor
   private func saveContact(for user: ContactSearchUser) async {
@@ -9517,29 +9338,11 @@ private struct AppHomeStatusHeaderView: View {
   let palette: AppThemePalette
 
   private static let spinnerSize: CGFloat = 12
-  private static let dotSize: CGFloat = 6
-
-  /// Status dot for Connecting / Updating (muted amber while connecting, soft accent while updating).
-  private var statusDotColor: Color {
-    switch state {
-    case .connecting:
-      return Color(red: 1.0, green: 0.72, blue: 0.18)
-    case .updating:
-      return palette.accent.opacity(0.95)
-    case .ready:
-      return .clear
-    }
-  }
 
   var body: some View {
-    // Whole group is centered in the principal slot for every state.
-    HStack(spacing: 5) {
+    // Centered principal: spinner (no status dot) + title.
+    HStack(spacing: 6) {
       if state.showsProgress {
-        Circle()
-          .fill(statusDotColor)
-          .frame(width: Self.dotSize, height: Self.dotSize)
-          .accessibilityHidden(true)
-
         AppLineLoadingSpinner(
           size: Self.spinnerSize,
           lineWidth: 1.65,
@@ -9877,12 +9680,6 @@ private struct ContactSearchView: View {
     ])!
   }
 
-  private func clearSearch() {
-    query = ""
-    results = []
-    hasSearched = false
-    isSearchPresented = true
-  }
 
   private func open(_ user: ContactSearchUser, action: String) {
     onResult(["action": action, "user": user.payload])

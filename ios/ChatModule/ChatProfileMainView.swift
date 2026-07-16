@@ -1214,19 +1214,6 @@ private struct ChatProfileSwiftUIRootView: View {
   @State private var heroExpanded = false
   /// Soft 0…1 driven by `heroExpanded` (animates with the spring). ONE shared morph value.
   @State private var heroExpandProgress: CGFloat = 0
-  @State private var heroDragStartProgress: CGFloat = 0
-  @State private var heroDragCanMorph = false
-  @State private var heroDragActive = false
-  @State private var interactiveHeroStretch: CGFloat = 0
-  /// Reserved-space progress for the SCROLL CONTENT's spacers — snapped INSTANTLY
-  /// to the commit target (no animation), while `heroExpandProgress` keeps animating
-  /// the pinned overlay on top of it. Animating the scroll content's own height in
-  /// lockstep with the overlay forced ScrollView to recompute contentSize every
-  /// frame, which lagged a beat behind the overlay — the rows visibly trailed as if
-  /// they were a separate scroll element instead of being pinned to the hero.
-  @State private var heroListReserveProgress: CGFloat = 0
-  /// User has scrolled into the list body while expanded (needed once to unlock collapse).
-  @State private var hasScrolledAwayWhileExpanded = false
   /// Arms a single pull-down expand per overscroll (re-arms at rest).
   @State private var expandGestureArmed = true
   /// Ignore offset events right after a commit (prevents height/bounce re-entry).
@@ -1328,55 +1315,22 @@ private struct ChatProfileSwiftUIRootView: View {
 
   private var avatarCircleSize: CGFloat { 120 }
 
-  /// Height of the media portion of the in-scroll profile header.
+  /// Spacer clears ONLY the pinned avatar (circle or hero). Name + actions live in scroll.
   private var avatarPinHeight: CGFloat {
     Self.pixelRound(avatarTopAir + avatarCircleSize + 8)
   }
 
-  /// Media height = pure f(heroExpandProgress), shared by the header and image.
+  /// Spacer height = pure f(heroExpandProgress) — lockstep with media (linear shared p).
+  /// Drives the PINNED OVERLAY's own height only — animates smoothly with the spring.
   private var scrollHeaderSpacer: CGFloat {
-    let p = min(1, max(0, heroExpandProgress))
-    return Self.pixelRound(
-      avatarPinHeight + (heroBaseHeight - avatarPinHeight) * p
-    )
-  }
-
-  /// The avatar, identity, actions, and rows all live in one root ScrollView. The
-  /// identity reserve disappears as it moves onto the hero image, so the first row
-  /// always stays attached to the visible bottom edge of the header.
-  private var profileHeaderHeight: CGFloat {
-    let p = min(1, max(0, heroExpandProgress))
-    return Self.pixelRound(
-      scrollHeaderSpacer + identityClusterLayoutHeight * (1 - p)
-        + heroOverscrollStretch
-    )
-  }
-
-  /// Same formula as `scrollHeaderSpacer` but driven by
-  /// `max(heroListReserveProgress, heroExpandProgress)` — used ONLY for the scroll
-  /// content's reserved spacers, never the overlay. The `max` is load-bearing: the
-  /// reserve must NEVER sit below the overlay's real animating height, or rows
-  /// (higher zIndex) render on top of the still-large hero mid-collapse. Snapping
-  /// the reserve instantly to its commit target is only safe on EXPAND (target=1,
-  /// the max of two values ≤1 — reserve stays pinned at the max, no growth-lag);
-  /// on COLLAPSE (target=0) the max degrades gracefully to tracking
-  /// heroExpandProgress exactly, so reserve == overlay height at every instant.
-  private var scrollListReserveSpacer: CGFloat {
-    let p = max(heroListReserveProgress, heroExpandProgress)
-    return Self.pixelRound(
-      avatarPinHeight + (heroBaseHeight - avatarPinHeight) * p
+    Self.pixelRound(
+      avatarPinHeight + (heroBaseHeight - avatarPinHeight) * heroExpandProgress
     )
   }
 
   /// Fixed page reflection (outside ScrollView).
   private var pageReflectionHeight: CGFloat {
     Self.pixelRound(heroBaseHeight + 48)
-  }
-
-  /// Extra pull after the shared value reaches 1.0. It is driven by the same drag
-  /// as the circle→hero progress, so reaching full view has no state handoff.
-  private var heroOverscrollStretch: CGFloat {
-    Self.pixelRound(interactiveHeroStretch)
   }
 
   /// Align morph/spacer heights to physical pixels (kills 1–2px end jump).
@@ -1447,11 +1401,10 @@ private struct ChatProfileSwiftUIRootView: View {
   }
 
   /// Soft avatar scroll blend — continuous via identityPinProgress (no cliff).
+  /// Scale + fade only; no blur on the image (the only blur anywhere is the
+  /// bottom-edge material band behind the name).
   private var scrollAvatarScale: CGFloat {
     1 - 0.04 * identityPinProgress
-  }
-  private var scrollAvatarBlur: CGFloat {
-    2.5 * identityPinProgress
   }
   private var scrollAvatarOpacity: CGFloat {
     1 - 0.08 * identityPinProgress
@@ -1465,111 +1418,103 @@ private struct ChatProfileSwiftUIRootView: View {
     max(0, bandHeight - identityClusterLayoutHeight - 20)
   }
 
-  // Short, soft springs shared with Settings.
-  private static let heroExpandSpring = Animation.spring(response: 0.18, dampingFraction: 0.82)
-  private static let heroCollapseSpring = Animation.spring(response: 0.16, dampingFraction: 0.86)
+  // Slightly underdamped ("soft") springs — a touch of settle instead of a hard,
+  // critically-damped stop — collapse (hero->avatar) is faster than expand.
+  private static let heroExpandSpring = Animation.spring(response: 0.20, dampingFraction: 0.86)
+  private static let heroCollapseSpring = Animation.spring(response: 0.15, dampingFraction: 0.86)
 
   var body: some View {
     NavigationStack(path: $navCoordinator.path) {
-      // One root scroll owns header media, identity/actions, and every row.
+      // Z-order: reflection < avatar (fixed, media-only) < scroll (name + actions + rows).
       ZStack(alignment: .top) {
         Color.black.ignoresSafeArea()
 
-        ScrollView(.vertical, showsIndicators: false) {
-          VStack(spacing: 0) {
-            Color.clear
-              .frame(height: 0)
-              .id(profileScrollTopAnchorID)
+        ChatProfilePageReflection(
+          imageUri: hasProfileImage ? avatarUri : nil,
+          fallbackGlyph: avatarDisplayText,
+          fontStyleID: appearanceSelection.avatarFontStyleID,
+          height: pageReflectionHeight
+        )
+        .frame(maxWidth: .infinity)
+        .frame(height: pageReflectionHeight)
+        .ignoresSafeArea(edges: .top)
+        .allowsHitTesting(false)
+        .zIndex(0)
 
-            offsetReader(heroHeight: scrollHeaderSpacer)
+        // Media + rows are ONE scroll unit — the media band is the first scroll
+        // element (see profileHeroScrollBand), so rows can never gap from the image
+        // on pull-down or slide behind it on scroll-up.
+        ScrollViewReader { scrollProxy in
+          ScrollView(.vertical, showsIndicators: false) {
+            VStack(spacing: 0) {
+              // Zero-height anchor: commit snaps the REAL scroll position here so it
+              // matches the `localScrollOffset = 0` state write instead of drifting
+              // (mismatch there = the list/image jump once the morph freeze lifts).
+              Color.clear
+                .frame(height: 0)
+                .id(profileScrollTopAnchorID)
 
-            GeometryReader { geo in
-              let w = geo.size.width
-              let mediaBand = scrollHeaderSpacer + heroOverscrollStretch
-              ZStack(alignment: .top) {
-                ChatProfilePageReflection(
-                  imageUri: hasProfileImage ? avatarUri : nil,
-                  fallbackGlyph: avatarDisplayText,
-                  fontStyleID: appearanceSelection.avatarFontStyleID,
-                  height: mediaBand
-                )
-                .frame(width: w, height: mediaBand)
+              offsetReader(heroHeight: scrollHeaderSpacer)
+
+              // The media itself — IN the scroll (no pinned overlay + reserve spacer).
+              profileHeroScrollBand
+
+              // Reserve layout space for the floating name+actions cluster — scaled
+              // to 0 as the hero expands, since that content moves ON the hero image
+              // instead. Leaving this constant regardless of progress was dead space
+              // between the full-height hero and the first row (the "gap/disconnected
+              // list" bug).
+              Color.clear
+                .frame(height: identityClusterLayoutHeight * (1 - heroExpandProgress))
                 .allowsHitTesting(false)
 
-                ChatProfileAvatarMorphView(
-                  text: avatarDisplayText,
-                  fontStyleID: appearanceSelection.avatarFontStyleID,
-                  imageUri: hasProfileImage ? avatarUri : nil,
-                  width: w,
-                  collapsedHeight: avatarPinHeight,
-                  heroBaseHeight: heroBaseHeight,
-                  expand: heroExpandProgress,
-                  overscrollStretch: heroOverscrollStretch,
-                  topAir: avatarTopAir,
-                  scrollScale: scrollAvatarScale,
-                  scrollBlur: 0,
-                  scrollOpacity: scrollAvatarOpacity
-                )
-                .frame(width: w, height: mediaBand, alignment: .top)
-
-                Rectangle()
-                  .fill(.ultraThinMaterial)
-                  .environment(\.colorScheme, .dark)
-                  .frame(width: w, height: mediaBand)
-                  .mask(
-                    LinearGradient(
-                      stops: [
-                        .init(color: .clear, location: 0.0),
-                        .init(color: .clear, location: 0.52),
-                        .init(color: .black.opacity(0.76), location: 0.80),
-                        .init(color: .black, location: 1.0),
-                      ],
-                      startPoint: .top,
-                      endPoint: .bottom
-                    )
-                  )
-                  .opacity(Double(0.94 * heroExpandProgress))
-                  .allowsHitTesting(false)
-
-                identityMorphCluster(bandWidth: w, bandHeight: mediaBand)
-                  .frame(width: w, height: profileHeaderHeight, alignment: .top)
-              }
-              .contentShape(Rectangle())
-              .onTapGesture(count: 2) {
-                if abs(localScrollOffset) < 40, !heroMorphInFlight {
-                  setHeroExpanded(!heroExpanded)
+              VStack(spacing: 18) {
+                profileInfoSection
+                if !bridgeProvider.isEmpty {
+                  defaultViewSection
                 }
+                if bridgeProvider.isEmpty {
+                  appearanceSection
+                }
+                sharedContentSection
+                if !isGroupOrChannel {
+                  contactActionsSection
+                  emergencySection
+                }
+                dangerSection
               }
+              .padding(.horizontal, 22)
+              .padding(.top, 4)
+              .padding(.bottom, 66)
             }
-            .frame(height: profileHeaderHeight)
-
-            VStack(spacing: 18) {
-              profileInfoSection
-              if !bridgeProvider.isEmpty {
-                defaultViewSection
-              }
-              if bridgeProvider.isEmpty {
-                appearanceSection
-              }
-              sharedContentSection
-              if !isGroupOrChannel {
-                contactActionsSection
-                emergencySection
-              }
-              dangerSection
-            }
-            .padding(.horizontal, 22)
-            .padding(.top, 4)
-            .padding(.bottom, 66)
           }
+          .coordinateSpace(name: "profile-scroll")
+          .scrollIndicators(.never)
+          .chatProfileBounceBehavior()
+          // Stops an in-flight pan/rubber-band the instant commit fires — otherwise
+          // the finger (or bounce-back physics) keeps moving the REAL offset for the
+          // whole 0.28s spring while we've frozen the state var at 0, and it all
+          // catches up in one jump when the freeze lifts (the "noisy soft jump").
+          .scrollDisabled(heroMorphInFlight)
+          .onAppear { profileScrollProxy = scrollProxy }
         }
-        .coordinateSpace(name: "profile-scroll")
-        .scrollIndicators(.never)
-        .chatProfileBounceBehavior()
-        .simultaneousGesture(profileHeroDragGesture)
         .ignoresSafeArea(edges: .top)
         .background(Color.clear)
-        .zIndex(1)
+        .zIndex(2)
+
+        // ONE shared name+actions cluster — no second copy to crossfade. Its own
+        // position/alignment AND the action row's circle<->pill morph are both
+        // driven by the SAME heroExpandProgress as the media (and it rides the
+        // scroll with the in-scroll band when expanded), so there is nothing left
+        // to desync or pop.
+        identityMorphCluster(
+          bandWidth: UIScreen.main.bounds.width,
+          bandHeight: scrollHeaderSpacer
+        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .allowsHitTesting(true)
+        .ignoresSafeArea(edges: .top)
+        .zIndex(4)
       }
       .background {
         GeometryReader { geo in
@@ -1686,24 +1631,32 @@ private struct ChatProfileSwiftUIRootView: View {
     }
   }
 
-  /// Spring only settles a partially completed interactive drag. The transition
-  /// itself is driven in real time by `profileHeroDragGesture`.
+  /// Commit circle ↔ hero. Settings-style: freeze offset, animate ONE progress for spacer+media.
   private func setHeroExpanded(_ expanded: Bool) {
-    guard !heroMorphInFlight else { return }
-    let target: CGFloat = expanded ? 1 : 0
-    if abs(heroExpandProgress - target) < 0.001, interactiveHeroStretch < 0.5 {
-      heroExpanded = expanded
-      heroExpandProgress = target
-      interactiveHeroStretch = 0
-      return
-    }
+    guard heroExpanded != expanded, !heroMorphInFlight else { return }
     NSLog(
       "[ProfileHeroMorph] commit expanded=%d fromP=%.3f localOffset=%.1f",
       expanded ? 1 : 0, Double(heroExpandProgress), Double(localScrollOffset)
     )
+    // scrollDisabled(heroMorphInFlight) flips on this SAME turn (SwiftUI applies it
+    // before the next render pass), which is what actually stops the real ScrollView
+    // from drifting during the spring — cancels an in-flight pan the same way
+    // UIScrollView.panGestureRecognizer.isEnabled=false does in the Settings header.
     heroMorphInFlight = true
-    if !expanded {
-      hasScrolledAwayWhileExpanded = false
+    // Freeze scroll coupling — kill rubber-band before height morph.
+    // Expanding from overscroll (-60) with live offset caused list+image shift.
+    var freeze = Transaction()
+    freeze.disablesAnimations = true
+    withTransaction(freeze) {
+      if expanded {
+        localScrollOffset = 0
+        // Snap the REAL scroll position to match — without this the state var says
+        // 0 but the actual UIScrollView underneath is still wherever the pull left
+        // it, and that gap surfaces as one big jump when the freeze lifts.
+        profileScrollProxy?.scrollTo(profileScrollTopAnchorID, anchor: .top)
+      } else {
+        localScrollOffset = max(0, min(localScrollOffset, identityTravelDistance))
+      }
     }
     if expanded {
       UIImpactFeedbackGenerator(style: .medium).impactOccurred()
@@ -1712,19 +1665,22 @@ private struct ChatProfileSwiftUIRootView: View {
     }
     // Animate ONLY the shared progress. Spacer + morph both read heroExpandProgress.
     heroExpanded = expanded
+    let target: CGFloat = expanded ? 1 : 0
     let spring = expanded ? Self.heroExpandSpring : Self.heroCollapseSpring
     // Completion-driven unlock (iOS 17+) instead of a hardcoded asyncAfter guess —
     // that fixed 0.28s delay was longer than the actual spring settle time on
     // collapse, reading as "delay to come back to avatar."
     withAnimation(spring, completionCriteria: .logicallyComplete) {
       heroExpandProgress = target
-      interactiveHeroStretch = 0
     } completion: { [self] in
       var t = Transaction()
       t.disablesAnimations = true
       withTransaction(t) {
         heroExpandProgress = target
-        interactiveHeroStretch = 0
+        if expanded {
+          localScrollOffset = 0
+          profileScrollProxy?.scrollTo(profileScrollTopAnchorID, anchor: .top)
+        }
       }
       heroMorphInFlight = false
       if !expanded {
@@ -1737,74 +1693,71 @@ private struct ChatProfileSwiftUIRootView: View {
     }
   }
 
-  private var profileHeroDragGesture: some Gesture {
-    DragGesture(minimumDistance: 0, coordinateSpace: .local)
-      .onChanged { value in
-        if !heroDragActive {
-          heroDragActive = true
-          heroMorphInFlight = false
-          heroDragStartProgress = min(1, max(0, heroExpandProgress))
-          heroDragCanMorph = heroDragStartProgress > 0.001 || localScrollOffset <= 0.5
-        }
-        guard heroDragCanMorph else { return }
-
-        let travel: CGFloat = 132
-        let rawProgress = heroDragStartProgress + value.translation.height / travel
-        let progress = min(1, max(0, rawProgress))
-        let stretch = min(
-          UIScreen.main.bounds.height * 0.17,
-          max(0, rawProgress - 1) * travel * 0.65
-        )
-        var transaction = Transaction()
-        transaction.disablesAnimations = true
-        withTransaction(transaction) {
-          heroExpandProgress = progress
-          interactiveHeroStretch = stretch
-          heroExpanded = progress >= 0.999
-        }
+  /// Media band INSIDE the scroll content — one scroll unit with the rows, so the
+  /// image can never gap from the first row and rows can never slide behind it.
+  /// Pulled down while expanded: the image grows UPWARD to fill the entire
+  /// overscroll gap (top edge glued to the viewport, bottom glued to the rows —
+  /// Telegram stretchy header; the inner image scales with the taller frame).
+  /// Scrolled up while expanded: the image parallaxes inside its own clipped band
+  /// (trails at half speed under the rows) instead of pinning outside the scroll.
+  private var profileHeroScrollBand: some View {
+    GeometryReader { g in
+      let minY = g.frame(in: .named("profile-scroll")).minY
+      let pull = heroExpanded ? max(0, Self.pixelRound(minY)) : 0
+      let away = heroExpanded ? max(0, -minY) : 0
+      ChatProfileAvatarMorphView(
+        text: avatarDisplayText,
+        fontStyleID: appearanceSelection.avatarFontStyleID,
+        imageUri: hasProfileImage ? avatarUri : nil,
+        width: g.size.width,
+        collapsedHeight: avatarPinHeight,
+        heroBaseHeight: heroBaseHeight,
+        expand: heroExpandProgress,
+        overscrollStretch: pull,
+        topAir: avatarTopAir,
+        scrollScale: scrollAvatarScale,
+        scrollOpacity: scrollAvatarOpacity,
+        parallax: Self.pixelRound(away * 0.5)
+      )
+      .frame(width: g.size.width, height: scrollHeaderSpacer + pull, alignment: .top)
+      .overlay(alignment: .bottom) {
+        heroBottomFalloff(height: scrollHeaderSpacer + pull)
       }
-      .onEnded { value in
-        let canMorph = heroDragCanMorph
-        heroDragActive = false
-        heroDragCanMorph = false
-        guard canMorph else { return }
-
-        let expand: Bool
-        if value.velocity.height > 220 {
-          expand = true
-        } else if value.velocity.height < -220 {
-          expand = false
-        } else {
-          expand = heroExpandProgress >= 0.5
+      .offset(y: -pull)
+      .contentShape(Rectangle())
+      .onTapGesture(count: 2) {
+        if abs(localScrollOffset) < 40, !heroMorphInFlight {
+          setHeroExpanded(!heroExpanded)
         }
-        setHeroExpanded(expand)
-      }
-  }
-
-  @ViewBuilder
-  private func identityHeader(compact: Bool) -> some View {
-    VStack(spacing: compact ? 2 : 3) {
-      HStack(spacing: 8) {
-        Text(profileName)
-          .font(.system(size: compact ? 22 : 28, weight: .bold))
-          .foregroundStyle(.white)
-          .lineLimit(1)
-          .minimumScaleFactor(0.72)
-
-        if showsGoldTier {
-          ChatProfileSwiftUITierBadge(label: "Gold")
-        }
-      }
-      .frame(maxWidth: .infinity)
-
-      if let groupHeaderSubtitle {
-        Text(groupHeaderSubtitle)
-          .font(.system(size: 14, weight: .regular))
-          .foregroundStyle(.white.opacity(0.72))
-          .lineLimit(1)
       }
     }
+    .frame(height: scrollHeaderSpacer)
   }
+
+  /// Frosted-glass falloff at the hero's bottom edge, behind the name — the ONLY
+  /// blur anywhere, and it lives inside the image (rides + clips with the band
+  /// because it's the band's own overlay).
+  @ViewBuilder
+  private func heroBottomFalloff(height: CGFloat) -> some View {
+    Rectangle()
+      .fill(.ultraThinMaterial)
+      .environment(\.colorScheme, .dark)
+      .frame(height: max(1, height))
+      .mask(
+        LinearGradient(
+          stops: [
+            .init(color: .clear, location: 0.0),
+            .init(color: .black.opacity(0.5), location: 0.6),
+            .init(color: .black, location: 1.0),
+          ],
+          startPoint: .top,
+          endPoint: .bottom
+        )
+      )
+      .opacity(Double(heroExpandProgress))
+      .allowsHitTesting(false)
+  }
+
 
   private func offsetReader(heroHeight: CGFloat) -> some View {
     GeometryReader { proxy in
@@ -1816,6 +1769,9 @@ private struct ChatProfileSwiftUIRootView: View {
     }
     .frame(height: 0)
     .onPreferenceChange(ChatProfileScrollOffsetPreferenceKey.self) { value in
+      // During hero morph, ignore ALL scroll samples (stable freeze) — no live p.
+      guard !heroMorphInFlight else { return }
+
       // Pixel-quantize offset to kill sub-pixel scroll thrash.
       let scale = UIScreen.main.scale
       let nextValue = (value * scale).rounded() / scale
@@ -1837,6 +1793,19 @@ private struct ChatProfileSwiftUIRootView: View {
         )
       }
 
+      // Pull-to-expand only. Scrolling up while expanded parallaxes the in-scroll
+      // band away naturally (no committed collapse — double-tap collapses).
+      if !heroExpanded {
+        if expandGestureArmed, nextValue < -60 {
+          expandGestureArmed = false
+          NSLog("[ProfileHeroMorph] pull-threshold offset=%.1f", Double(nextValue))
+          setHeroExpanded(true)
+        }
+        if nextValue >= 0 {
+          expandGestureArmed = true
+        }
+      }
+
       _ = previous
       if lastReportedScrollOffset < 0 || abs(lastReportedScrollOffset - nextValue) >= 6.0 {
         lastReportedScrollOffset = nextValue
@@ -1845,9 +1814,6 @@ private struct ChatProfileSwiftUIRootView: View {
     }
   }
 
-  private func stickyTitleThreshold(heroHeight: CGFloat) -> CGFloat {
-    max(90, heroHeight * 0.5)
-  }
 
   /// ONE shared name+actions cluster — no separate floating/on-image copies to
   /// crossfade. Position (top offset + horizontal alignment) and the action
@@ -1857,39 +1823,47 @@ private struct ChatProfileSwiftUIRootView: View {
   private func identityMorphCluster(bandWidth: CGFloat, bandHeight: CGFloat) -> some View {
     let p = heroExpandProgress
     let inset: CGFloat = 16
-    let nameHeight: CGFloat = groupHeaderSubtitle == nil ? 38 : 56
+    // Centered (collapsed) -> left-aligned with a small inset (hero). The frame
+    // narrows toward the inset as p rises, so by the time alignment flips at
+    // p=0.5 the frame is already snug around the text — center vs leading look
+    // nearly identical in a tight frame, which is what keeps the flip invisible.
+    let centerPad = max(inset, bandWidth * 0.22)
+    let nameLeadingPad = centerPad + (inset - centerPad) * p
+    let nameFrameWidth = max(1, bandWidth - nameLeadingPad * 2)
+    let nameAlign: Alignment = p < 0.5 ? .center : .leading
 
     // Collapsed: scroll-tracked Y that pins under the nav. Hero: anchored near
-    // the band's bottom edge. Blended continuously by p — both endpoints are
-    // computed from the exact same state driving the media, so they can't drift.
-    let collapsedTopY = identityNaturalTopY
-    let expandedTopY = identityExpandedTopY(bandHeight: bandHeight)
+    // the band's bottom edge AND riding the scroll (the band is in-scroll now, so
+    // the cluster follows it up on scroll-away and down on pull-stretch). Blended
+    // continuously by p — both endpoints derive from the same state as the media.
+    let collapsedTopY = identityClusterTopY
+    let expandedTopY = identityExpandedTopY(bandHeight: bandHeight) - localScrollOffset
     let topY = collapsedTopY + (expandedTopY - collapsedTopY) * p
 
     VStack(spacing: 8) {
-      ChatProfileNameMorphLayout(progress: p, leadingInset: inset) {
-        VStack(alignment: .center, spacing: 3) {
-          HStack(spacing: 8) {
-            Text(profileName)
-              .font(.system(size: 28, weight: .bold))
-              .foregroundStyle(.white)
-              .lineLimit(1)
-              .minimumScaleFactor(0.72)
-            if showsGoldTier {
-              ChatProfileSwiftUITierBadge(label: "Gold")
-            }
-          }
-
-          if let groupHeaderSubtitle {
-            Text(groupHeaderSubtitle)
-              .font(.system(size: 14, weight: .regular))
-              .foregroundStyle(.white.opacity(0.72))
-              .lineLimit(1)
+      VStack(alignment: nameAlign == .center ? .center : .leading, spacing: 3) {
+        HStack(spacing: 8) {
+          Text(profileName)
+            .font(.system(size: 28, weight: .bold))
+            .foregroundStyle(.white)
+            .lineLimit(1)
+            .minimumScaleFactor(0.72)
+          if showsGoldTier {
+            ChatProfileSwiftUITierBadge(label: "Gold")
           }
         }
+        .frame(width: nameFrameWidth, alignment: nameAlign)
+
+        if let groupHeaderSubtitle {
+          Text(groupHeaderSubtitle)
+            .font(.system(size: 14, weight: .regular))
+            .foregroundStyle(.white.opacity(0.72))
+            .lineLimit(1)
+        }
       }
-      .frame(width: bandWidth, height: nameHeight)
+      // Scale username only — actions below stay 1.0.
       .scaleEffect(identityNameScale, anchor: .top)
+      .padding(.leading, nameLeadingPad)
 
       // Actions morph circle<->pill via the same continuous expand p.
       actionRow(expand: p)
@@ -3158,46 +3132,6 @@ private struct ChatProfilePageReflection: View {
 
 // MARK: - Avatar shared-value morph (ONE continuous media element, 0→1)
 
-/// One measured title element moves from exact center to exact hero-leading inset.
-/// Placement is continuous and does not switch alignment or crossfade copies.
-private struct ChatProfileNameMorphLayout: Layout {
-  let progress: CGFloat
-  let leadingInset: CGFloat
-
-  func sizeThatFits(
-    proposal: ProposedViewSize,
-    subviews: Subviews,
-    cache: inout ()
-  ) -> CGSize {
-    guard let subview = subviews.first else { return .zero }
-    let child = subview.sizeThatFits(
-      ProposedViewSize(width: max(1, (proposal.width ?? 1) - leadingInset * 2), height: proposal.height)
-    )
-    return CGSize(width: proposal.width ?? child.width, height: proposal.height ?? child.height)
-  }
-
-  func placeSubviews(
-    in bounds: CGRect,
-    proposal: ProposedViewSize,
-    subviews: Subviews,
-    cache: inout ()
-  ) {
-    guard let subview = subviews.first else { return }
-    let child = subview.sizeThatFits(
-      ProposedViewSize(width: max(1, bounds.width - leadingInset * 2), height: bounds.height)
-    )
-    let p = min(1, max(0, progress))
-    let centeredX = (bounds.width - child.width) * 0.5
-    let x = centeredX + (leadingInset - centeredX) * p
-    let y = max(0, (bounds.height - child.height) * 0.5)
-    subview.place(
-      at: CGPoint(x: bounds.minX + x, y: bounds.minY + y),
-      anchor: .topLeading,
-      proposal: ProposedViewSize(width: child.width, height: child.height)
-    )
-  }
-}
-
 /// Media-only pinned morph. Name + actions live in ScrollView (higher z).
 /// No title overlays, no action overlays, no separate Material blur layer.
 ///
@@ -3215,10 +3149,12 @@ private struct ChatProfileAvatarMorphView: View {
   /// Extra height when pulling down in committed hero (realtime stretch).
   var overscrollStretch: CGFloat = 0
   var topAir: CGFloat = 90
-  /// Scroll-collapse blend (collapsed circle only).
+  /// Scroll-collapse blend (collapsed circle only). Scale + fade — never blur.
   var scrollScale: CGFloat = 1
-  var scrollBlur: CGFloat = 0
   var scrollOpacity: CGFloat = 1
+  /// Downward media shift inside the clipped band while it scrolls away (expanded
+  /// hero only) — the image trails the scroll at half speed, Telegram-style.
+  var parallax: CGFloat = 0
 
   @State private var image: UIImage?
   @State private var loadedUri: String?
@@ -3234,8 +3170,8 @@ private struct ChatProfileAvatarMorphView: View {
     overscrollStretch: CGFloat = 0,
     topAir: CGFloat = 90,
     scrollScale: CGFloat = 1,
-    scrollBlur: CGFloat = 0,
-    scrollOpacity: CGFloat = 1
+    scrollOpacity: CGFloat = 1,
+    parallax: CGFloat = 0
   ) {
     self.text = text
     self.fontStyleID = fontStyleID
@@ -3247,8 +3183,8 @@ private struct ChatProfileAvatarMorphView: View {
     self.overscrollStretch = overscrollStretch
     self.topAir = topAir
     self.scrollScale = scrollScale
-    self.scrollBlur = scrollBlur
     self.scrollOpacity = scrollOpacity
+    self.parallax = parallax
     let normalized = imageUri?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
     let primed = normalized.flatMap { ChatAvatarImageStore.cached(for: $0) }
     _image = State(initialValue: primed)
@@ -3286,7 +3222,8 @@ private struct ChatProfileAvatarMorphView: View {
 
   var body: some View {
     let shape = RoundedRectangle(cornerRadius: mediaCorner, style: .continuous)
-    // Scroll blend only while collapsed (p≈0); gated by (1-p).
+    // Scroll blend only while collapsed (p≈0); gated by (1-p). No blur — the image
+    // stays sharp through every scroll/morph state.
     let collapseBlend = 1 - p
     let s = 1 + (scrollScale - 1) * collapseBlend
     let o = 1 + (scrollOpacity - 1) * collapseBlend
@@ -3299,6 +3236,7 @@ private struct ChatProfileAvatarMorphView: View {
       .opacity(Double(o))
       .frame(width: width, alignment: .center)
       .padding(.top, mediaTop)
+      .offset(y: parallax * p)
       .frame(width: width, height: bandHeight, alignment: .top)
       .clipped()
       .animation(nil, value: scrollScale)
@@ -6551,9 +6489,6 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     return nil
   }
 
-  private func resolvedHeroSubheaderText() -> String {
-    return resolvedActiveTabSubtitleText() ?? resolvedIdentifierText()
-  }
 
   private func reloadHeaderText() {
     let resolvedName =
@@ -6714,8 +6649,34 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     return trimmed.isEmpty ? "U" : String(trimmed.prefix(1)).uppercased()
   }
 
+  private func isImageOrVideoMediaURL(_ url: String) -> Bool {
+    let lower = url.lowercased()
+    let imageExt = [".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif"]
+    let videoExt = [".mp4", ".mov", ".m4v", ".webm"]
+    if imageExt.contains(where: { lower.contains($0) }) { return true }
+    if videoExt.contains(where: { lower.contains($0) }) { return true }
+    // Uploaded chat media URLs often omit extensions — treat non-audio paths as media.
+    if lower.contains("/chat-media/") || lower.contains("/uploads/") { return true }
+    return false
+  }
+
   private func rebuildDerivedContent() {
-    mediaRows = rows.filter { ["image", "video", "sticker"].contains($0.type) }
+    // Include anything with a real media URL / thumbnail, not only strict type tags —
+    // agent-group image sends can arrive as image with durable thumbs after reopen.
+    mediaRows = rows.filter { row in
+      if ["image", "video", "sticker"].contains(row.type) { return true }
+      if let url = row.mediaUrl?.trimmingCharacters(in: .whitespacesAndNewlines), !url.isEmpty,
+        row.type != "voice", row.type != "music", row.type != "file"
+      {
+        return isImageOrVideoMediaURL(url) || row.thumbnailBase64?.isEmpty == false
+      }
+      if let thumb = row.thumbnailBase64?.trimmingCharacters(in: .whitespacesAndNewlines),
+        !thumb.isEmpty, row.type != "voice"
+      {
+        return true
+      }
+      return false
+    }
     voiceRows = rows.filter { $0.type == "voice" }
     gifRows = rows.filter { $0.type == "gif" }
     fileRows = rows.filter { ["file", "music"].contains($0.type) }
@@ -6762,21 +6723,6 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     syncTabViews()
   }
 
-  private func currentInfoRows() -> [ChatProfileInfoRow] {
-    var result: [ChatProfileInfoRow] = []
-    if isGroupOrChannel {
-      result.append(.members)
-      result.append(.agent)
-    } else {
-      result.append(.identifier)
-    }
-
-    if !profileBio.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-      result.append(.bio)
-    }
-
-    return result
-  }
 
   private func sharedCount(for tab: ChatProfileTab) -> Int {
     switch tab {
@@ -7069,35 +7015,14 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     }
   }
 
-  private func resolvedBioPreview() -> String {
-    let bio = profileBio.trimmingCharacters(in: .whitespacesAndNewlines)
-    return bio.isEmpty ? "No bio" : bio
-  }
 
-  private func resolvedIdentifierPreview() -> String {
-    let value = resolvedIdentifierRawValue().trimmingCharacters(in: .whitespacesAndNewlines)
-    return value.isEmpty ? "Unavailable" : value
-  }
 
-  private func resolvedAgentValue() -> String {
-    guard let config = agentConfig else { return "Off" }
-    return normalizedAgentEnabledValue(config["enabled"], defaultValue: true) ? "On" : "Off"
-  }
 
-  private func resolvedAgentSubtitle() -> String {
-    guard let config = agentConfig else { return "Not configured" }
-    let name = normalizedAgentString(config["name"]) ?? "Vibe AI"
-    let docs = getAgentDocuments().count
-    return "\(name) • \(docs) docs"
-  }
 
   private func resolveSectionTitle(_ section: Section) -> String? {
     return nil
   }
 
-  private func tabButtonTitle(_ tab: ChatProfileTab) -> String {
-    sharedTitle(for: tab)
-  }
 
   private func currentContentCount() -> Int {
     switch activeTab {
@@ -7178,11 +7103,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     }
   }
 
-  private func reloadContentSectionWithoutAnimation() {
-  }
 
-  private func switchToTab(_ nextTab: ChatProfileTab, animated: Bool) {
-  }
 
   private func scrollTabsIntoView(animated: Bool) {
   }
@@ -7416,123 +7337,6 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     }
   }
 
-  private func contentListCell(
-    _ tableView: UITableView,
-    indexPath: IndexPath
-  ) -> UITableViewCell {
-    guard let row = contentRow(at: indexPath.row) else {
-      return UITableViewCell(style: .default, reuseIdentifier: nil)
-    }
-    if activeTab == .voice {
-      guard
-        let cell = tableView.dequeueReusableCell(
-          withIdentifier: ChatProfileVoiceContentCell.reuseIdentifier,
-          for: indexPath
-        ) as? ChatProfileVoiceContentCell
-      else {
-        return UITableViewCell(style: .default, reuseIdentifier: nil)
-      }
-
-      cell.configure(
-        title: contentTitle(for: row, index: indexPath.row),
-        subtitle: contentSubtitle(for: row),
-        row: row,
-        titleColor: currentTextColor,
-        subtitleColor: currentSecondaryTextColor,
-        accentColor: currentRowAccentColor
-      )
-      VoiceBubblePlaybackCoordinator.shared.bind(
-        cell: cell,
-        messageId: row.messageId,
-        mediaURL: row.mediaUrl,
-        mediaKey: row.mediaKey,
-        fileName: row.fileName
-      )
-      return cell
-    }
-
-    if activeTab == .media {
-      guard
-        let cell = tableView.dequeueReusableCell(
-          withIdentifier: ChatProfileMediaGridRowCell.reuseIdentifier,
-          for: indexPath
-        ) as? ChatProfileMediaGridRowCell
-      else {
-        return UITableViewCell(style: .default, reuseIdentifier: nil)
-      }
-      var items: [(url: String?, isVideo: Bool, thumbnailBase64: String?)] = []
-      let startIndex = indexPath.row * 3
-      for i in 0..<3 {
-        let absIndex = startIndex + i
-        if absIndex < mediaRows.count {
-          let r = mediaRows[absIndex]
-          items.append((url: r.mediaUrl, isVideo: r.type == "video", thumbnailBase64: r.thumbnailBase64))
-        }
-      }
-      cell.configure(
-        items: items,
-        startIndex: startIndex,
-        placeholderTintColor: currentTextColor.withAlphaComponent(0.72),
-        placeholderBackgroundColor: currentRowCardColor
-      )
-      cell.onMediaTapped = { [weak self] index in
-        self?.handleMediaGridTapped(at: index)
-      }
-      return cell
-    }
-
-    if activeTab == .gifs {
-      guard
-        let cell = tableView.dequeueReusableCell(
-          withIdentifier: ChatProfileMediaContentCell.reuseIdentifier,
-          for: indexPath
-        ) as? ChatProfileMediaContentCell
-      else {
-        return UITableViewCell(style: .default, reuseIdentifier: nil)
-      }
-      cell.backgroundColor = .clear
-      cell.contentView.backgroundColor = .clear
-      if #available(iOS 14.0, *) {
-        var background = UIBackgroundConfiguration.listCell()
-        background.backgroundColor = .clear
-        let isDark = traitCollection.userInterfaceStyle == .dark
-        background.visualEffect = UIBlurEffect(style: isDark ? .systemThinMaterialDark : .systemThinMaterialLight)
-        background.cornerRadius = 22.0
-        cell.backgroundConfiguration = background
-      }
-      cell.configure(
-        title: contentTitle(for: row, index: indexPath.row),
-        subtitle: contentSubtitle(for: row),
-        urlString: row.mediaUrl,
-        isVideo: row.type == "video",
-        titleColor: currentTextColor,
-        subtitleColor: currentSecondaryTextColor,
-        placeholderTintColor: currentTextColor.withAlphaComponent(0.72),
-        placeholderBackgroundColor: currentRowCardColor
-      )
-      return cell
-    }
-
-    guard
-      let cell = tableView.dequeueReusableCell(
-        withIdentifier: ChatProfileListRowCell.reuseIdentifier,
-        for: indexPath
-      ) as? ChatProfileListRowCell
-    else {
-      return UITableViewCell(style: .default, reuseIdentifier: nil)
-    }
-
-    let isLast = indexPath.row == currentContentCount() - 1
-    configureListRowCell(
-      cell,
-      title: contentTitle(for: row, index: indexPath.row),
-      subtitle: contentSubtitle(for: row),
-      iconName: sharedIconName(for: activeTab),
-      showsSeparator: !isLast,
-      showsChevron: activeTab != .pinned
-    )
-    return cell
-  }
 
   private func profileInfoRowCount() -> Int {
     let hasUsername = !resolvedIdentifierRawValue().trimmingCharacters(in: .whitespacesAndNewlines).isEmpty

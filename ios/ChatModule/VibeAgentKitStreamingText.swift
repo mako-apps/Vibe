@@ -1421,27 +1421,6 @@ final class VibeAgentKitStreamingTextLabel: UITextView {
     progress * progress * (3.0 - 2.0 * progress)
   }
 
-  private func applyRevealAlpha(
-    _ alpha: CGFloat,
-    to range: NSRange,
-    in text: NSMutableAttributedString
-  ) {
-    let safeRange = NSIntersectionRange(range, NSRange(location: 0, length: text.length))
-    guard safeRange.length > 0 else {
-      return
-    }
-
-    var updates: [(NSRange, UIColor)] = []
-    text.enumerateAttribute(.foregroundColor, in: safeRange, options: []) { value, effectiveRange, _ in
-      let color = (value as? UIColor) ?? self.textColor ?? .label
-      let resolved = color.resolvedColor(with: self.traitCollection)
-      updates.append((effectiveRange, resolved.withAlphaComponent(resolved.cgColor.alpha * alpha)))
-    }
-
-    for (range, color) in updates {
-      text.addAttribute(.foregroundColor, value: color, range: range)
-    }
-  }
 
   private func setDisplayedText(
     _ attributedText: NSAttributedString,

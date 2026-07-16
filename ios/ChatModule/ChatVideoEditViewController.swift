@@ -1482,20 +1482,6 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
     )
   }
 
-  private func fittedPreviewFrame(in bounds: CGRect) -> CGRect {
-    guard naturalVideoSize.width > 1.0, naturalVideoSize.height > 1.0 else { return bounds }
-    let scale = min(bounds.width / naturalVideoSize.width, bounds.height / naturalVideoSize.height)
-    let fittedSize = CGSize(
-      width: naturalVideoSize.width * scale,
-      height: naturalVideoSize.height * scale
-    )
-    return CGRect(
-      x: bounds.minX + (bounds.width - fittedSize.width) * 0.5,
-      y: bounds.minY + (bounds.height - fittedSize.height) * 0.5,
-      width: fittedSize.width,
-      height: fittedSize.height
-    )
-  }
 
   private func refreshCaptionPlaceholder() {
     captionText = captionTextView.text.trimmingCharacters(in: .whitespacesAndNewlines)

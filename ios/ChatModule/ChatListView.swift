@@ -3165,13 +3165,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     )
   }
 
-  private func startGroupUsageCarousel(
-    candidates: [(key: String, value: (util: Int, label: String, resetsAt: String?, limitHit: Bool))]
-  ) {
-    // Auto-rotate disabled — user pages via swipe / dots only.
-    stopGroupUsageCarousel()
-    lastUsageCarouselProviders = candidates.map(\.key)
-  }
 
   private func stopGroupUsageCarousel() {
     groupUsageCarouselTimer?.invalidate()
@@ -9958,60 +9951,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   // / notice), assigned frame Y+height, and a text prefix so we can tell whether it's a
   // notice+result pair or a single row that grew without reflow. Remove once fixed.
   private var lastOverlapProbeAt: TimeInterval = 0
-  private func probeGroupCellOverlap(reason: String, force: Bool = false) {
-    guard isGroupOrChannel else { return }
-    let now = Date().timeIntervalSinceReferenceDate
-    if !force {
-      guard now - lastOverlapProbeAt > 0.15 else { return }
-    }
-    lastOverlapProbeAt = now
-    let visible = collectionView.indexPathsForVisibleItems.sorted { $0.item < $1.item }
-    guard visible.count >= 2 else { return }
-    // Also log large vertical GAPS (empty space after a cell "went nowhere").
-    for i in 0..<(visible.count - 1) {
-      let a = visible[i], b = visible[i + 1]
-      guard b.item == a.item + 1 else { continue }
-      guard
-        let fa = collectionView.layoutAttributesForItem(at: a)?.frame,
-        let fb = collectionView.layoutAttributesForItem(at: b)?.frame
-      else { continue }
-      let gap = fb.minY - fa.maxY
-      if gap > 40 {
-        let ra = a.item < rows.count ? rows[a.item] : nil
-        let rb = b.item < rows.count ? rows[b.item] : nil
-        layoutShiftLog(
-          "[LayoutShift] GAP reason=%@ gap=%.0fpt a[%d] h=%.0f id=%@ b[%d] h=%.0f id=%@",
-          reason, gap, a.item, fa.height,
-          String((ra?.messageId ?? ra?.key ?? "?").suffix(12)),
-          b.item, fb.height,
-          String((rb?.messageId ?? rb?.key ?? "?").suffix(12)))
-      }
-    }
-    for i in 0..<(visible.count - 1) {
-      let a = visible[i], b = visible[i + 1]
-      guard b.item == a.item + 1 else { continue }
-      guard
-        let fa = collectionView.layoutAttributesForItem(at: a)?.frame,
-        let fb = collectionView.layoutAttributesForItem(at: b)?.frame
-      else { continue }
-      let overlap = fa.maxY - fb.minY
-      guard overlap > 0.5 else { continue }
-      let ra = a.item < rows.count ? rows[a.item] : nil
-      let rb = b.item < rows.count ? rows[b.item] : nil
-      let line = String(
-        format:
-          "[GroupCellOverlap] %@ overlap=%.1fpt a[%d]{key=%@ agent=%@ kind=%@ err=%@ y=%.0f h=%.0f \"%@\"} b[%d]{key=%@ agent=%@ kind=%@ err=%@ y=%.0f h=%.0f \"%@\"}",
-        reason, overlap,
-        a.item, String((ra?.key ?? "?").prefix(10)), (ra?.isAgentMessage ?? false) ? "y" : "n",
-        ra?.agentMsgKind ?? "-", (ra?.isAgentError ?? false) ? "y" : "n", fa.minY, fa.height,
-        String((ra?.text ?? "").prefix(22)),
-        b.item, String((rb?.key ?? "?").prefix(10)), (rb?.isAgentMessage ?? false) ? "y" : "n",
-        rb?.agentMsgKind ?? "-", (rb?.isAgentError ?? false) ? "y" : "n", fb.minY, fb.height,
-        String((rb?.text ?? "").prefix(22)))
-      NSLog("%@", line)
-      Self.appendOverlapProbeLine(line)
-    }
-  }
 
   /// After group batch updates (agent settle swaps), verify the CELL layer matches the
   /// data source. The flow layout's frames never overlap by construction, but rapid
@@ -10530,22 +10469,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     return nil
   }
 
-  /// Content/status may change without invalidating older-row work. Only an identity or
-  /// order change makes the current warm cursor unsafe; treating every delivery/status
-  /// refresh as a new transcript starved local prewarming during a fling.
-  private func rawRowsHaveSameIdentityOrder(
-    _ lhs: [[String: Any]],
-    _ rhs: [[String: Any]]
-  ) -> Bool {
-    guard lhs.count == rhs.count else { return false }
-    for (oldRow, newRow) in zip(lhs, rhs) {
-      guard let oldIdentity = rawRowStableIdentity(oldRow),
-        let newIdentity = rawRowStableIdentity(newRow),
-        oldIdentity == newIdentity
-      else { return false }
-    }
-    return true
-  }
 
   private func rowsByAttachingReplyPreviews(_ rows: [[String: Any]]) -> [[String: Any]] {
     Self.rowsByResolvingReplyPreviews(rows, peerDisplayName: enginePeerDisplayName)
@@ -13322,14 +13245,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     return UIMenu(children: [modelMenu, permissionMenu, repoMenu])
   }
 
-  /// Report: open the most recent run's files-changed / diff report (its runtime card).
-  private func presentLatestAgentReport() {
-    guard
-      let index = rows.lastIndex(where: { $0.agentRuntime != nil }),
-      let runtime = rows[index].agentRuntime
-    else { return }
-    presentAgentRuntimeTask(row: rows[index], runtime: runtime)
-  }
 
   /// History: full-screen slide-in list of this agent's past/running conversations
   /// (reusing the profile's `AgentBridgeHistoryInlineView`). Picking one loads it into
@@ -17222,30 +17137,6 @@ extension ChatListView: ChatInputBarDelegate {
       width: overlayW, height: overlayH)
   }
 
-  private func showActivityOverlay(text: String) {
-    applyActivityOverlayTheme()
-    activityTextLabel.text = text
-    layoutActivityOverlay()
-    startDotPulseAnimation()
-
-    guard activityOverlay.alpha < 1.0 else {
-      // Already visible — just update text + layout
-      UIView.animate(withDuration: 0.15, delay: 0, options: .curveEaseOut) {
-        self.layoutActivityOverlay()
-      }
-      return
-    }
-
-    activityOverlay.transform = CGAffineTransform(translationX: 0, y: 8)
-    UIView.animate(
-      withDuration: 0.25, delay: 0,
-      usingSpringWithDamping: 0.85, initialSpringVelocity: 0,
-      options: .curveEaseOut
-    ) {
-      self.activityOverlay.alpha = 1.0
-      self.activityOverlay.transform = .identity
-    }
-  }
 
   private func hideActivityOverlay() {
     guard activityOverlay.alpha > 0 else { return }

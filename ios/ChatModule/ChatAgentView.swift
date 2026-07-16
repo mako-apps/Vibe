@@ -2595,9 +2595,6 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
     ])
   }
 
-  private func updateSpacerForSend(conversationId: String) {
-    currentSpacerHeight = 0.0
-  }
 
   private func applyPersistedState() {
     guard

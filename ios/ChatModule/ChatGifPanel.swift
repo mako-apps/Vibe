@@ -9,7 +9,32 @@ final class ChatGifPanelConfig {
 
     private init() {}
 
-    var apiKey: String = ""
+    /// Giphy API key. Loaded from (first match wins):
+    /// 1) process env `GIPHY_API_KEY`
+    /// 2) Info.plist `GIPHY_API_KEY`
+    /// 3) same public demo key the web client uses (fetch still works offline-dev)
+    var apiKey: String = ChatGifPanelConfig.resolveApiKey()
+
+    /// Re-read env/plist (call at launch so scheme env overrides apply).
+    func reloadFromEnvironment() {
+        apiKey = Self.resolveApiKey()
+        let n = apiKey.trimmingCharacters(in: .whitespacesAndNewlines).count
+        NSLog("[NativeGif][iOS] apiKey reloaded length=%d", n)
+    }
+
+    private static func resolveApiKey() -> String {
+        if let env = ProcessInfo.processInfo.environment["GIPHY_API_KEY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !env.isEmpty
+        {
+            return env
+        }
+        if let plist = Bundle.main.object(forInfoDictionaryKey: "GIPHY_API_KEY") as? String {
+            let trimmed = plist.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        // Public demo key used by client/src/components/GifPicker.tsx
+        return "sXpGFDGZs0Dv1mmNFvYaGUvYwKX0PWIh"
+    }
 }
 
 struct ChatGifSelection {
@@ -183,15 +208,16 @@ final class ChatGifPanelView: UIView {
     private(set) var preferredHeightExpansion: CGFloat = 0
     private(set) var preferredHeightScaleBoost: CGFloat = 0
 
-    private let bottomFloatingInset: CGFloat = 52
-    private let bottomFloatingControlHeight: CGFloat = 38
-    private let bottomFloatingEdgeInset: CGFloat = 0
+    /// Space above floating tab bar for scroll content (tighter — closer to content).
+    private let bottomFloatingInset: CGFloat = 40
+    private let bottomFloatingControlHeight: CGFloat = 32
+    private let bottomFloatingEdgeInset: CGFloat = 4
     private let topControlsSpacing: CGFloat = 4
-    private let stripHeight: CGFloat = 34
-    private let searchHeight: CGFloat = 38
+    private let stripHeight: CGFloat = 30
+    private let searchHeight: CGFloat = 34
     // Total header zone: strip + gap + search + bottom gap
     private var headerZoneHeight: CGFloat {
-        8 + stripHeight + topControlsSpacing + searchHeight + 2
+        6 + stripHeight + topControlsSpacing + searchHeight + 2
     }
 
     private var panelVisible = false
@@ -224,7 +250,7 @@ final class ChatGifPanelView: UIView {
     }
 
     private let glassBackground = UIVisualEffectView(effect: nil)
-    // Scrollable header (strip + search) — scrolls with content for all tabs
+    // Category strip + search — translateY + fade on content scroll
     private let headerView = UIView()
     private let topStripScrollView = UIScrollView()
     private let topStripStack = UIStackView()
@@ -232,12 +258,15 @@ final class ChatGifPanelView: UIView {
     private let searchIconView = UIImageView()
     private let searchField = UITextField()
     private let clearSearchButton = UIButton(type: .system)
-    // Full-bleed content container
+    // Full-bleed content: 3 pages (GIF | Stickers | Emoji) via translateX / paging
     private let contentContainerView = UIView()
+    private let pagesScrollView = UIScrollView()
     private let mediaContainerView = UIView()
     private let stateLabel = UILabel()
     private let loadingView = UIView()
     private let loadingSpinner = UIActivityIndicatorView(style: .medium)
+    private var isProgrammaticPageScroll = false
+    private var contentOffsetObservation: NSKeyValueObservation?
     // Bottom gradient mask (fades into tab bar)
     private let bottomMaskView = UIView()
     private let bottomMaskGradient = CAGradientLayer()
@@ -281,7 +310,7 @@ final class ChatGifPanelView: UIView {
         glassBackground.layer.cornerRadius = panelCornerRadius
         glassBackground.layer.cornerCurve = .continuous
         glassBackground.layer.maskedCorners = topCorners
-        closeChromeView.layer.cornerRadius = 19
+        closeChromeView.layer.cornerRadius = bottomFloatingControlHeight * 0.5
         closeChromeView.layer.cornerCurve = .continuous
         applyFrameLayout()
     }
@@ -314,7 +343,6 @@ final class ChatGifPanelView: UIView {
         panelVisible = visible
 
         if visible {
-            // First presentation builds strip buttons / emoji sections / tab content.
             applyActiveTabState(animated: false)
             if activeTab == .gifs {
                 installEmbeddedPickerIfNeeded()
@@ -346,13 +374,25 @@ final class ChatGifPanelView: UIView {
         contentContainerView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         addSubview(contentContainerView)
 
-        // Media container for GIF/sticker picker — fills content
-        mediaContainerView.backgroundColor = .clear
-        contentContainerView.addSubview(mediaContainerView)
+        // Horizontal paging: page 0 = GIFs, 1 = Stickers, 2 = Emoji (translateX)
+        pagesScrollView.isPagingEnabled = true
+        pagesScrollView.showsHorizontalScrollIndicator = false
+        pagesScrollView.showsVerticalScrollIndicator = false
+        pagesScrollView.bounces = true
+        pagesScrollView.delegate = self
+        pagesScrollView.backgroundColor = .clear
+        pagesScrollView.clipsToBounds = true
+        contentContainerView.addSubview(pagesScrollView)
 
-        // Emoji collection view — fills content, contentInset pushes below header
+        // Media container for Giphy grid — page 0
+        mediaContainerView.backgroundColor = .clear
+        pagesScrollView.addSubview(mediaContainerView)
+
+        // Stickers — page 1
+        pagesScrollView.addSubview(stickerPackPanel)
+
+        // Emoji collection — page 2
         emojiCollectionView.translatesAutoresizingMaskIntoConstraints = true
-        emojiCollectionView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         emojiCollectionView.backgroundColor = .clear
         emojiCollectionView.alwaysBounceVertical = true
         emojiCollectionView.keyboardDismissMode = .onDrag
@@ -367,8 +407,7 @@ final class ChatGifPanelView: UIView {
             forSupplementaryViewOfKind: UICollectionView.elementKindSectionHeader,
             withReuseIdentifier: ChatGifPanelEmojiHeaderView.reuseIdentifier
         )
-        contentContainerView.addSubview(emojiCollectionView)
-        contentContainerView.addSubview(stickerPackPanel)
+        pagesScrollView.addSubview(emojiCollectionView)
 
         // State / loading overlays
         stateLabel.translatesAutoresizingMaskIntoConstraints = true
@@ -502,20 +541,23 @@ final class ChatGifPanelView: UIView {
         closeButton.addTarget(self, action: #selector(closeTapped), for: .touchUpInside)
         closeChromeView.contentView.addSubview(closeButton)
 
+        // Compact floating chrome flush to panel bottom (small edge inset only).
         NSLayoutConstraint.activate([
             bottomTabBarContainer.centerXAnchor.constraint(equalTo: centerXAnchor),
-            bottomTabBarContainer.bottomAnchor.constraint(equalTo: safeAreaLayoutGuide.bottomAnchor, constant: -bottomFloatingEdgeInset),
-            bottomTabBarContainer.widthAnchor.constraint(equalToConstant: 220),
+            bottomTabBarContainer.bottomAnchor.constraint(
+                equalTo: bottomAnchor, constant: -bottomFloatingEdgeInset),
+            bottomTabBarContainer.widthAnchor.constraint(equalToConstant: 200),
             bottomTabBarContainer.heightAnchor.constraint(equalToConstant: bottomFloatingControlHeight),
 
             bottomTabBar.leadingAnchor.constraint(
-                equalTo: bottomTabBarContainer.leadingAnchor, constant: -16),
+                equalTo: bottomTabBarContainer.leadingAnchor, constant: -12),
             bottomTabBar.trailingAnchor.constraint(
-                equalTo: bottomTabBarContainer.trailingAnchor, constant: 16),
+                equalTo: bottomTabBarContainer.trailingAnchor, constant: 12),
             bottomTabBar.centerYAnchor.constraint(equalTo: bottomTabBarContainer.centerYAnchor),
 
             closeChromeView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            closeChromeView.bottomAnchor.constraint(equalTo: safeAreaLayoutGuide.bottomAnchor, constant: -bottomFloatingEdgeInset),
+            closeChromeView.bottomAnchor.constraint(
+                equalTo: bottomAnchor, constant: -bottomFloatingEdgeInset),
             closeChromeView.widthAnchor.constraint(equalToConstant: bottomFloatingControlHeight),
             closeChromeView.heightAnchor.constraint(equalToConstant: bottomFloatingControlHeight),
 
@@ -544,10 +586,10 @@ final class ChatGifPanelView: UIView {
         selectionFeedback.prepare()
         refreshChrome()
         rebuildSearchChrome()
-        // Defer strip buttons + emoji catalog work until the panel is shown —
-        // building them at zero height caused multi-second main-thread stalls
-        // and unsatisfiable constraints when ChatInputBar opened a chat.
+        rebuildTopStripButtons()
+        rebuildEmojiSections()
         updateContentInsets()
+        applyActiveTabState(animated: false)
     }
 
     private func updateContentInsets() {
@@ -565,49 +607,70 @@ final class ChatGifPanelView: UIView {
     }
 
     /// Frame-based layout — called from layoutSubviews.
-    /// Mirrors ChatAttachmentMenuController.layoutAll().
     private func applyFrameLayout() {
         let w = bounds.width
         let h = bounds.height
-        // Skip zero-size layout: Auto Layout inside the strip fights a height-0
-        // visual-effect container and floods the console with broken constraints.
-        guard w > 1, h > 1 else { return }
+        guard w > 0, h > 0 else { return }
 
         let hInset: CGFloat = 10
-        let stripTop: CGFloat = 8
+        let stripTop: CGFloat = 6
 
-        // Header is fixed at the top
-        headerView.frame = CGRect(x: 0, y: 0, width: w, height: headerZoneHeight)
+        // Header (category chips + search) — position is base; scroll applies translateY/alpha
+        headerView.bounds = CGRect(x: 0, y: 0, width: w, height: headerZoneHeight)
+        if headerView.transform == .identity {
+            headerView.frame = CGRect(x: 0, y: 0, width: w, height: headerZoneHeight)
+        } else {
+            // Keep size while preserving scroll-driven transform.
+            let t = headerView.transform
+            headerView.transform = .identity
+            headerView.frame = CGRect(x: 0, y: 0, width: w, height: headerZoneHeight)
+            headerView.transform = t
+        }
         let stripFrame = CGRect(x: hInset, y: stripTop, width: w - hInset * 2, height: stripHeight)
         topStripScrollView.frame = stripFrame
         let searchY = stripFrame.maxY + topControlsSpacing
         searchChromeView.frame = CGRect(
             x: hInset, y: searchY, width: w - hInset * 2, height: searchHeight)
 
-        // Content: full-bleed
+        // Content: full-bleed horizontal pages
         contentContainerView.frame = bounds
+        pagesScrollView.frame = bounds
+        pagesScrollView.contentSize = CGSize(width: w * 3, height: h)
 
-        mediaContainerView.frame = bounds
-        emojiCollectionView.frame = bounds
-
-        // Sticker pack panel
+        // Page 0 GIFs · 1 Stickers · 2 Emoji
+        mediaContainerView.frame = CGRect(x: 0, y: 0, width: w, height: h)
         stickerPackPanel.translatesAutoresizingMaskIntoConstraints = true
-        stickerPackPanel.frame = CGRect(
-            x: 0, y: 0, width: w, height: h)
+        stickerPackPanel.frame = CGRect(x: w, y: 0, width: w, height: h)
+        emojiCollectionView.frame = CGRect(x: w * 2, y: 0, width: w, height: h)
 
-        stateLabel.frame = bounds
-        loadingView.frame = bounds
+        // Keep page offset in sync with active tab (no jump when resizing)
+        let pageX = CGFloat(activeTab.rawValue) * w
+        if abs(pagesScrollView.contentOffset.x - pageX) > 1, !pagesScrollView.isDragging,
+            !pagesScrollView.isDecelerating
+        {
+            isProgrammaticPageScroll = true
+            pagesScrollView.contentOffset = CGPoint(x: pageX, y: 0)
+            isProgrammaticPageScroll = false
+        }
+
+        stateLabel.frame = mediaContainerView.bounds
+        loadingView.frame = mediaContainerView.bounds
         loadingSpinner.center = CGPoint(x: w * 0.5, y: h * 0.5 - 18)
+        // State/loading stay above Giphy inside page 0
+        if stateLabel.superview !== mediaContainerView {
+            mediaContainerView.addSubview(stateLabel)
+            mediaContainerView.addSubview(loadingView)
+        }
 
-        // Bottom gradient mask
-        let bottomMaskH: CGFloat = 80
+        // Bottom gradient mask (shorter — tighter chrome)
+        let bottomMaskH: CGFloat = 56
         bottomMaskView.frame = CGRect(x: 0, y: h - bottomMaskH, width: w, height: bottomMaskH)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         bottomMaskGradient.frame = bottomMaskView.bounds
         CATransaction.commit()
 
-        // Z-order: content → bottom mask → floating controls → fixed header
+        // Z-order: content → bottom mask → floating controls → header
         bringSubviewToFront(bottomMaskView)
         bringSubviewToFront(bottomTabBarContainer)
         bringSubviewToFront(closeChromeView)
@@ -778,10 +841,8 @@ final class ChatGifPanelView: UIView {
 
         button.layer.cornerRadius = 17
         button.layer.cornerCurve = .continuous
-        // Priority < required so a transient zero-height host (or collapse
-        // animation) can break this cleanly instead of thrashing Auto Layout.
         let heightConstraint = button.heightAnchor.constraint(equalToConstant: 34)
-        heightConstraint.priority = UILayoutPriority(999)
+        heightConstraint.priority = .defaultHigh
         heightConstraint.isActive = true
 
         if showsAddBadge {
@@ -814,26 +875,22 @@ final class ChatGifPanelView: UIView {
         rebuildSearchChrome()
         rebuildTopStripButtons()
 
+        // All three pages stay mounted; we only translateX the pager.
+        mediaContainerView.isHidden = false
+        stickerPackPanel.isHidden = false
+        emojiCollectionView.isHidden = false
+
         switch activeTab {
         case .emoji:
-            mediaContainerView.isHidden = true
-            stickerPackPanel.isHidden = true
-            emojiCollectionView.isHidden = false
             loadingSpinner.stopAnimating()
             loadingView.isHidden = true
             rebuildEmojiSections()
         case .stickers:
-            emojiCollectionView.isHidden = true
-            mediaContainerView.isHidden = true
-            stickerPackPanel.isHidden = false
             stateLabel.isHidden = true
             loadingSpinner.stopAnimating()
             loadingView.isHidden = true
             applyStickerPanelState()
         case .gifs:
-            emojiCollectionView.isHidden = true
-            stickerPackPanel.isHidden = true
-            mediaContainerView.isHidden = false
             stateLabel.isHidden = true
             if panelVisible {
                 installEmbeddedPickerIfNeeded()
@@ -845,7 +902,40 @@ final class ChatGifPanelView: UIView {
             #endif
             updateEmbeddedPickerContent(showLoading: shouldShowLoading)
         }
+
+        let w = max(bounds.width, 1)
+        let targetX = CGFloat(activeTab.rawValue) * w
+        isProgrammaticPageScroll = true
+        if animated, bounds.width > 1 {
+            UIView.animate(
+                withDuration: 0.28,
+                delay: 0,
+                options: [.curveEaseInOut, .allowUserInteraction]
+            ) {
+                self.pagesScrollView.contentOffset = CGPoint(x: targetX, y: 0)
+            } completion: { _ in
+                self.isProgrammaticPageScroll = false
+            }
+        } else {
+            pagesScrollView.contentOffset = CGPoint(x: targetX, y: 0)
+            isProgrammaticPageScroll = false
+        }
+
+        // Keep search-expand height rule for the active tab.
+        if searchField.isFirstResponder {
+            setSearchExpanded(true)
+        }
+        observeActivePageScroll()
         setNeedsLayout()
+    }
+
+    /// Category strip + search: translateY up and fade as the active page scrolls.
+    private func updateHeaderForContentOffsetY(_ offsetY: CGFloat) {
+        let progress = min(1, max(0, offsetY / 56))
+        let ty = -progress * 36
+        headerView.transform = CGAffineTransform(translationX: 0, y: ty)
+        headerView.alpha = 1 - progress * 0.92
+        headerView.isUserInteractionEnabled = progress < 0.85
     }
 
     private func applyStickerPanelState() {
@@ -859,21 +949,6 @@ final class ChatGifPanelView: UIView {
 
     // MARK: - Scroll-hosted header
 
-    private func activeContentScrollView() -> UIScrollView? {
-        switch activeTab {
-        case .emoji:
-            return emojiCollectionView
-        case .stickers:
-            return stickerPackPanel.contentScrollView
-        case .gifs:
-            #if canImport(GiphyUISDK)
-                if let pickerView = pickerViewController?.view {
-                    return findScrollView(in: pickerView)
-                }
-            #endif
-            return nil
-        }
-    }
 
     private func findScrollView(in view: UIView) -> UIScrollView? {
         for sub in view.subviews {
@@ -1009,18 +1084,19 @@ final class ChatGifPanelView: UIView {
     }
 
     private func searchFocusedHeightScaleBoost(for tab: ChatGifPanelTab) -> CGFloat {
+        // Rule: search focus expands the panel height (same mechanism for all tabs).
         switch tab {
         case .gifs:
-            return 1.15
+            return 1.05  // ~2× compact base via preferredGifPanelHeight boost path
         case .stickers:
-            return 0.10
+            return 0.55
         case .emoji:
-            return 0.18
+            return 0.65
         }
     }
 
     private func setSearchExpanded(_ expanded: Bool) {
-        let nextExpansion: CGFloat = 0
+        let nextExpansion: CGFloat = expanded ? 24 : 0
         let nextScaleBoost = expanded ? searchFocusedHeightScaleBoost(for: activeTab) : 0
         guard
             abs(preferredHeightExpansion - nextExpansion) > 0.5
@@ -1162,11 +1238,21 @@ final class ChatGifPanelView: UIView {
     private func installEmbeddedPickerIfNeeded() {
         #if canImport(GiphyUISDK)
             guard activeTab == .gifs else { return }
-            guard pickerViewController == nil else { return }
             guard let host = hostViewController else {
                 print("[NativeGif][iOS] installEmbeddedPickerIfNeeded missing hostViewController")
                 showStateLabel("GIF host is unavailable right now.")
                 return
+            }
+
+            // If a picker is already attached to a *different* parent, tear it down first.
+            if let existing = pickerViewController {
+                if existing.parent === host {
+                    return
+                }
+                print(
+                    "[NativeGif][iOS] reparent GiphyGridController from \(String(describing: existing.parent)) → \(host)"
+                )
+                removeEmbeddedPicker()
             }
 
             guard configureGiphySDKIfNeeded() else {
@@ -1175,7 +1261,7 @@ final class ChatGifPanelView: UIView {
                 return
             }
 
-            print("[NativeGif][iOS] creating GiphyGridController")
+            print("[NativeGif][iOS] creating GiphyGridController host=\(type(of: host))")
 
             let picker = GiphyGridController()
             picker.delegate = self
@@ -1185,6 +1271,7 @@ final class ChatGifPanelView: UIView {
             picker.additionalSafeAreaInsets = .zero
             picker.content = resolvedGiphyContent()
 
+            // Add child before attaching view so hierarchy stays consistent.
             host.addChild(picker)
             mediaContainerView.addSubview(picker.view)
             picker.view.translatesAutoresizingMaskIntoConstraints = false
@@ -1217,6 +1304,14 @@ final class ChatGifPanelView: UIView {
                 return
             }
 
+            // Heal hierarchy if host was swapped under us.
+            if let host = hostViewController, picker.parent !== host {
+                print("[NativeGif][iOS] healing Giphy parent mismatch — reinstall")
+                removeEmbeddedPicker()
+                installEmbeddedPickerIfNeeded()
+                return
+            }
+
             picker.content = resolvedGiphyContent()
             if showLoading {
                 loadingSpinner.startAnimating()
@@ -1235,7 +1330,10 @@ final class ChatGifPanelView: UIView {
             guard let picker = pickerViewController else { return }
             picker.willMove(toParent: nil)
             picker.view.removeFromSuperview()
-            picker.removeFromParent()
+            // removeFromParent is safe even if parent is already nil.
+            if picker.parent != nil {
+                picker.removeFromParent()
+            }
             pickerViewController = nil
         #endif
     }
@@ -1540,7 +1638,66 @@ extension ChatGifPanelView: UICollectionViewDataSource, UICollectionViewDelegate
     }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
-        // Header is hosted inside the scroll view itself, so no manual sync is needed.
+        if scrollView === pagesScrollView {
+            guard !isProgrammaticPageScroll, pagesScrollView.bounds.width > 1 else { return }
+            let page = Int(round(pagesScrollView.contentOffset.x / pagesScrollView.bounds.width))
+            guard let tab = ChatGifPanelTab(rawValue: page), tab != activeTab else { return }
+            activeTab = tab
+            bottomTabBar.selectedItem = bottomTabBar.items?[page]
+            if tab == .stickers { ensureStickerPackSelection() }
+            // Refresh strip/search for the page without re-animating pager.
+            rebuildSearchChrome()
+            rebuildTopStripButtons()
+            switch tab {
+            case .gifs:
+                if panelVisible { installEmbeddedPickerIfNeeded() }
+                updateEmbeddedPickerContent(showLoading: false)
+            case .stickers:
+                applyStickerPanelState()
+            case .emoji:
+                rebuildEmojiSections()
+            }
+            observeActivePageScroll()
+            if searchField.isFirstResponder { setSearchExpanded(true) }
+            return
+        }
+
+        // Vertical content scroll → header translateY + fade
+        if scrollView === emojiCollectionView
+            || scrollView === stickerPackPanel.contentScrollView
+            || scrollView === findScrollView(in: mediaContainerView)
+        {
+            updateHeaderForContentOffsetY(scrollView.contentOffset.y)
+        }
+    }
+
+    func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        if scrollView === pagesScrollView {
+            observeActivePageScroll()
+        }
+    }
+
+    private func observeActivePageScroll() {
+        contentOffsetObservation?.invalidate()
+        contentOffsetObservation = nil
+        let target: UIScrollView?
+        switch activeTab {
+        case .gifs:
+            target = findScrollView(in: mediaContainerView)
+        case .stickers:
+            target = stickerPackPanel.contentScrollView
+        case .emoji:
+            target = emojiCollectionView
+        }
+        guard let target else {
+            updateHeaderForContentOffsetY(0)
+            return
+        }
+        updateHeaderForContentOffsetY(target.contentOffset.y)
+        contentOffsetObservation = target.observe(\.contentOffset, options: [.new]) {
+            [weak self] sv, _ in
+            self?.updateHeaderForContentOffsetY(sv.contentOffset.y)
+        }
     }
 }
 

@@ -32,13 +32,20 @@ enum AgentBridgeProfile {
       model.status = snapshot
       model.selectedRepository = AgentBridgeSelectionStore.ensureValidSelection(from: snapshot.repositories)
     }
-    let host = UIHostingController(rootView: AgentBridgeConnectionSheet(model: model))
+    let isDark = presenter.traitCollection.userInterfaceStyle == .dark
+    let host = UIHostingController(
+      rootView: AgentBridgeConnectionSheet(model: model)
+        .preferredColorScheme(isDark ? .dark : .light)
+    )
+    host.view.backgroundColor = .clear
+    host.view.tintColor = isDark ? .white : .black
+    host.overrideUserInterfaceStyle = isDark ? .dark : .light
     host.modalPresentationStyle = .pageSheet
     if let sheet = host.sheetPresentationController {
-      sheet.detents = [.large()]
-      sheet.selectedDetentIdentifier = .large
+      sheet.detents = [.medium(), .large()]
+      sheet.selectedDetentIdentifier = .medium
       sheet.prefersGrabberVisible = true
-      sheet.preferredCornerRadius = 28
+      sheet.preferredCornerRadius = 22
     }
     presenter.present(host, animated: true)
   }
@@ -59,75 +66,56 @@ struct AgentBridgeConnectionSheet: View {
 
   private var palette: AppThemePalette { AppThemePalette.resolve(for: colorScheme) }
 
+  private var rowFill: Color {
+    colorScheme == .dark ? Color.white.opacity(0.05) : Color.black.opacity(0.04)
+  }
+
+  private var transportPreferenceText: String {
+    switch transportPreference {
+    case .auto: return "Auto"
+    case .local: return "Local"
+    case .cloud: return "Cloud"
+    }
+  }
+
+  private var transportPreferenceIcon: String {
+    switch transportPreference {
+    case .auto: return "arrow.triangle.2.circlepath"
+    case .local: return "wifi"
+    case .cloud: return "cloud"
+    }
+  }
+
+  private var sheetTint: Color {
+    colorScheme == .dark ? Color.white : Color.black
+  }
+
   var body: some View {
     NavigationStack {
-      ScrollView {
-        VStack(alignment: .leading, spacing: 18) {
-          VStack(alignment: .leading, spacing: 7) {
-            Text("\(model.displayName) computer")
-              .font(.system(size: 28, weight: .bold))
-              .foregroundStyle(palette.text)
-            Text("\(model.displayName) runs on your own computer with your own subscription. Pair once, then keep using the same Mac from your phone.")
-              .font(.system(size: 15))
-              .foregroundStyle(palette.secondaryText)
-              .fixedSize(horizontal: false, vertical: true)
-          }
-
-          connectionCard
-
-          transportCard
-
-          VStack(alignment: .leading, spacing: 11) {
-            infoRow(
-              icon: "lock.shield",
-              title: "Private by default",
-              body: "Pairing is revocable and only your account can authorize a computer."
+      List {
+        Section {
+          if model.status.connected, let device = model.status.devices.first {
+            statusRow(
+              icon: "laptopcomputer",
+              title: device.label,
+              subtitle: "Connected",
+              subtitleColor: .green,
+              showsDot: true
             )
-            infoRow(
-              icon: "qrcode.viewfinder",
-              title: "Scan the bridge QR",
-              body: "On your Mac, run the bridge command. It prints a QR code; scanning it here opens the camera view."
+          } else if model.status.paired {
+            statusRow(
+              icon: "laptopcomputer.slash",
+              title: model.status.devices.first?.label ?? "Your computer",
+              subtitle: "Paired — bridge offline",
+              subtitleColor: palette.secondaryText
             )
-            infoRow(
-              icon: "arrow.triangle.2.circlepath",
-              title: model.status.paired || model.status.connected ? "Reconnect anytime" : "Connect once",
-              body: model.status.paired || model.status.connected
-                ? "Reconnect scans a fresh QR without changing your chat history or selected repository."
-                : "After pairing, the app waits for the bridge daemon to come online."
+          } else {
+            statusRow(
+              icon: "laptopcomputer.slash",
+              title: "No computer connected",
+              subtitle: "Pair one to start",
+              subtitleColor: palette.secondaryText
             )
-          }
-
-          if model.status.paired || model.status.connected {
-            Button(role: .destructive) {
-              disconnect()
-            } label: {
-              Label("Disconnect current computer", systemImage: "xmark.circle")
-                .font(.system(size: 15, weight: .semibold))
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .disabled(isWorking)
-            .padding(14)
-            .background(
-              RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(palette.card)
-            )
-            .overlay(
-              RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(palette.border.opacity(0.8), lineWidth: 0.7)
-            )
-          }
-
-          if let errorMessage {
-            Text(errorMessage)
-              .font(.system(size: 13))
-              .foregroundStyle(palette.danger)
-              .fixedSize(horizontal: false, vertical: true)
-              .padding(14)
-              .frame(maxWidth: .infinity, alignment: .leading)
-              .background(
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                  .fill(palette.danger.opacity(0.10))
-              )
           }
 
           Button {
@@ -136,35 +124,122 @@ struct AgentBridgeConnectionSheet: View {
             HStack(spacing: 10) {
               if model.isAuthorizing || isWorking {
                 ProgressView()
-                  .tint(.white)
+                  .tint(sheetTint)
               } else {
                 Image(systemName: "qrcode.viewfinder")
-                  .font(.system(size: 18, weight: .semibold))
+                  .font(.system(size: 17, weight: .semibold))
               }
               Text(model.status.paired || model.status.connected ? "Scan QR to reconnect" : "Scan QR to connect")
-                .font(.system(size: 17, weight: .semibold))
+                .font(.system(size: 16, weight: .semibold))
             }
-            .foregroundStyle(.white)
-            .frame(maxWidth: .infinity)
-            .frame(height: 52)
-            .background(palette.accent)
-            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .frame(maxWidth: .infinity, alignment: .center)
           }
           .disabled(isWorking || model.isAuthorizing)
-          .padding(.top, 2)
-          .padding(.bottom, 18)
+          .foregroundColor(sheetTint)
+        } header: {
+          Text("Computer")
         }
-        .padding(.horizontal, 22)
-        .padding(.top, 18)
+        .listRowBackground(rowFill)
+
+        Section {
+          HStack {
+            Text("Connection")
+              .font(.system(size: 16, weight: .regular))
+              .foregroundStyle(palette.text)
+            Spacer()
+            Menu {
+              Button {
+                transportPreference = .auto
+                AgentBridgeTransport.preference = .auto
+                LanBridgeService.shared.applyPreference(.auto)
+              } label: {
+                Label("Auto", systemImage: "arrow.triangle.2.circlepath")
+              }
+              Button {
+                transportPreference = .local
+                AgentBridgeTransport.preference = .local
+                LanBridgeService.shared.applyPreference(.local)
+              } label: {
+                Label("Local", systemImage: "wifi")
+              }
+              Button {
+                transportPreference = .cloud
+                AgentBridgeTransport.preference = .cloud
+                LanBridgeService.shared.applyPreference(.cloud)
+              } label: {
+                Label("Cloud", systemImage: "cloud")
+              }
+            } label: {
+              HStack(spacing: 6) {
+                Image(systemName: transportPreferenceIcon)
+                  .font(.system(size: 14, weight: .medium))
+                Text(transportPreferenceText)
+                Image(systemName: "chevron.up.chevron.down")
+                  .font(.system(size: 11, weight: .bold))
+              }
+              .font(.system(size: 15, weight: .medium))
+              .foregroundStyle(sheetTint)
+            }
+          }
+
+          HStack(spacing: 9) {
+            lanStatusIndicator
+            Text(lanStatusText)
+              .font(.system(size: 13.5, weight: .medium))
+              .foregroundStyle(palette.text)
+              .lineLimit(1)
+            Spacer(minLength: 0)
+          }
+          .padding(.vertical, 2)
+        } header: {
+          Text("Connection")
+        }
+        .listRowBackground(rowFill)
+
+        if let errorMessage {
+          Section {
+            Text(errorMessage)
+              .font(.system(size: 13))
+              .foregroundStyle(palette.danger)
+              .fixedSize(horizontal: false, vertical: true)
+          }
+          .listRowBackground(rowFill)
+        }
+
+        if model.status.paired || model.status.connected {
+          Section {
+            Button(role: .destructive) {
+              disconnect()
+            } label: {
+              HStack(spacing: 10) {
+                Image(systemName: "xmark.circle")
+                  .font(.system(size: 17, weight: .semibold))
+                Text("Disconnect computer")
+                  .font(.system(size: 16, weight: .semibold))
+              }
+              .frame(maxWidth: .infinity, alignment: .center)
+            }
+            .disabled(isWorking)
+            .foregroundColor(palette.danger)
+          }
+          .listRowBackground(rowFill)
+        }
       }
-      .background(palette.background.ignoresSafeArea())
+      .listStyle(.insetGrouped)
+      .scrollContentBackground(.hidden)
+      .background(Color.clear)
+      .navigationTitle("\(model.displayName) computer")
       .navigationBarTitleDisplayMode(.inline)
       .toolbar {
         ToolbarItem(placement: .topBarTrailing) {
           Button("Done") { dismiss() }
         }
       }
+      .tint(sheetTint)
     }
+    .presentationDetents([.medium, .large])
+    .presentationDragIndicator(.visible)
+    .presentationBackground(.ultraThinMaterial)
     .onAppear {
       model.startPolling()
       // Kick off local-network discovery of the paired Mac. First run here triggers the
@@ -191,123 +266,32 @@ struct AgentBridgeConnectionSheet: View {
     }
   }
 
+  /// A quiet spinner while the link is coming up, a green dot when it's direct, and a
+  /// muted dot otherwise — no wording needed to read the state at a glance.
   @ViewBuilder
-  private var connectionCard: some View {
-    VStack(alignment: .leading, spacing: 12) {
-      Text("Computer")
-        .font(.system(size: 13, weight: .semibold))
-        .foregroundStyle(palette.secondaryText)
-      if model.status.connected, let device = model.status.devices.first {
-        statusRow(
-          icon: "laptopcomputer",
-          title: device.label,
-          subtitle: "Connected",
-          subtitleColor: .green,
-          showsDot: true
-        )
-      } else if model.status.paired {
-        statusRow(
-          icon: "laptopcomputer.slash",
-          title: model.status.devices.first?.label ?? "Your computer",
-          subtitle: "Paired — bridge offline",
-          subtitleColor: palette.secondaryText
-        )
-      } else {
-        statusRow(
-          icon: "laptopcomputer.slash",
-          title: "No computer connected",
-          subtitle: "Pair one to start",
-          subtitleColor: palette.secondaryText
-        )
-      }
-    }
-    .padding(16)
-    .frame(maxWidth: .infinity, alignment: .leading)
-    .background(
-      RoundedRectangle(cornerRadius: 20, style: .continuous)
-        .fill(palette.card)
-    )
-    .overlay(
-      RoundedRectangle(cornerRadius: 20, style: .continuous)
-        .stroke(palette.border.opacity(0.75), lineWidth: 0.7)
-    )
-  }
-
-  // Auto / Local / Cloud transport control. Auto uses the direct Wi-Fi link to the Mac when
-  // reachable and the cloud relay otherwise; the status line reflects live LAN discovery.
-  @ViewBuilder
-  private var transportCard: some View {
-    VStack(alignment: .leading, spacing: 12) {
-      Text("Connection")
-        .font(.system(size: 13, weight: .semibold))
-        .foregroundStyle(palette.secondaryText)
-
-      Picker("Connection", selection: $transportPreference) {
-        Text("Auto").tag(AgentBridgeTransportPreference.auto)
-        Text("Local").tag(AgentBridgeTransportPreference.local)
-        Text("Cloud").tag(AgentBridgeTransportPreference.cloud)
-      }
-      .pickerStyle(.segmented)
-      .onChange(of: transportPreference) { newValue in
-        AgentBridgeTransport.preference = newValue
-        LanBridgeService.shared.applyPreference(newValue)
-      }
-
-      HStack(spacing: 8) {
-        Circle()
-          .fill(lanStatusColor)
-          .frame(width: 8, height: 8)
-        Text(lanStatusText)
-          .font(.system(size: 13, weight: .medium))
-          .foregroundStyle(palette.text)
-      }
-
-      Text(transportHintText)
-        .font(.system(size: 12))
-        .foregroundStyle(palette.secondaryText)
-        .fixedSize(horizontal: false, vertical: true)
-    }
-    .padding(16)
-    .frame(maxWidth: .infinity, alignment: .leading)
-    .background(
-      RoundedRectangle(cornerRadius: 20, style: .continuous)
-        .fill(palette.card)
-    )
-    .overlay(
-      RoundedRectangle(cornerRadius: 20, style: .continuous)
-        .stroke(palette.border.opacity(0.75), lineWidth: 0.7)
-    )
-  }
-
-  private var lanStatusColor: Color {
+  private var lanStatusIndicator: some View {
     switch lanState {
-    case .authenticated: return .green
-    case .found, .connecting: return .orange
-    case .failed: return palette.danger
-    default: return palette.secondaryText.opacity(0.6)
+    case .searching, .found, .connecting:
+      ProgressView()
+        .controlSize(.mini)
+        .tint(palette.secondaryText)
+    case .authenticated:
+      Circle().fill(Color.green).frame(width: 8, height: 8)
+    default:
+      Circle().fill(palette.secondaryText.opacity(0.5)).frame(width: 8, height: 8)
     }
   }
 
+  /// Short, human, jargon-free. Traffic always rides the cloud when there's no direct
+  /// link, so anything that isn't a live direct link simply reads "Cloud".
   private var lanStatusText: String {
     switch lanState {
-    case .unavailable: return "Local link needs the sync key"
-    case .idle: return transportPreference == .cloud ? "Cloud relay (Local off)" : "Local link idle"
-    case .searching: return "Searching for your Mac on Wi-Fi…"
-    case .found(let name): return "Found \(name) — connecting…"
-    case .connecting: return "Connecting to your Mac…"
-    case .authenticated(let name): return "Local link ready · \(name)"
-    case .failed: return "Local link unavailable — using cloud"
-    }
-  }
-
-  private var transportHintText: String {
-    switch transportPreference {
-    case .auto:
-      return "Uses the direct Wi-Fi link to your Mac when you're on the same network, and the cloud relay when you're away."
-    case .local:
-      return "Direct to your Mac on the same Wi-Fi only — fastest and most private. Won't connect when you're away."
-    case .cloud:
-      return "Always via the cloud relay. Works from anywhere, at the cost of a round-trip through the server."
+    case .authenticated(let name): return "Direct · \(name)"
+    case .searching: return "Looking for your Mac…"
+    case .found(let name): return "Connecting to \(name)…"
+    case .connecting: return "Connecting…"
+    case .idle: return transportPreference == .cloud ? "Cloud" : "Ready"
+    case .failed, .unavailable: return "Cloud"
     }
   }
 
@@ -321,7 +305,7 @@ struct AgentBridgeConnectionSheet: View {
     HStack(spacing: 12) {
       Image(systemName: icon)
         .font(.system(size: 20, weight: .medium))
-        .foregroundStyle(palette.accent)
+        .foregroundStyle(palette.text.opacity(0.85))
         .frame(width: 28)
       VStack(alignment: .leading, spacing: 3) {
         Text(title)
@@ -340,23 +324,6 @@ struct AgentBridgeConnectionSheet: View {
     .padding(.vertical, 2)
   }
 
-  private func infoRow(icon: String, title: String, body: String) -> some View {
-    HStack(alignment: .top, spacing: 12) {
-      Image(systemName: icon)
-        .font(.system(size: 16, weight: .semibold))
-        .foregroundStyle(palette.accent)
-        .frame(width: 22, height: 22)
-      VStack(alignment: .leading, spacing: 3) {
-        Text(title)
-          .font(.system(size: 14, weight: .semibold))
-          .foregroundStyle(palette.text)
-        Text(body)
-          .font(.system(size: 13))
-          .foregroundStyle(palette.secondaryText)
-          .fixedSize(horizontal: false, vertical: true)
-      }
-    }
-  }
 
   private func disconnect() {
     guard let config = AppSessionConfig.current else {

@@ -1,4 +1,5 @@
 import ImageIO
+import SwiftUI
 import UIKit
 
 /// Shared, downsampled wallpaper pattern masks.
@@ -108,6 +109,318 @@ enum ChatWallpaperMaskStore {
   }
 }
 
+// MARK: - ChatAppearanceDraft (versioned edit / persistence contract)
+
+/// Platform-neutral, hex-string appearance draft for the editor → model pipeline.
+/// Colors are `#RRGGBB` / `#RRGGBBAA` strings (not `UIColor`) so the draft can
+/// persist and cross the wire. Integrator maps via `ChatListAppearance.from(draft:)`.
+struct ChatAppearanceDraft: Equatable, Codable {
+  var version: Int = 1
+  var mode: String = "dark"  // "dark" | "light" | "system"
+  var themeId: String? = nil
+
+  var wallpaperKind: String = "gradient"  // "builtin" | "solid" | "gradient" | "custom"
+  var wallpaperGradient: [String] = ["#05050B", "#05050B"]
+  var wallpaperGradientLocations: [Double] = [0.0, 1.0]
+  /// Optional second pair blended in while scrolling (Telegram-style “4 color”).
+  var wallpaperScrollGradient: [String] = []
+  var wallpaperPatternMaskKey: String? = "doodles"
+  var wallpaperPatternOpacity: Double = 0.17
+
+  var bubbleMeGradient: [String] = ["#8B7CFF", "#08C6B4"]
+  var bubbleThemGradient: [String] = ["#252936", "#1A202C"]
+
+  var accent: String = "#2F9E93"
+  /// Normalized 0…1. Points via `messageCornerRadiusPoints(normalized:)`.
+  var messageCornerRadius: Double = 0.62
+  var textScale: Double = 1.0
+  var animationsEnabled: Bool = true
+
+  /// Vibe Aurora defaults (matches `ChatListAppearance.fallback` hex palette).
+  static let `default` = ChatAppearanceDraft()
+
+  // MARK: Canonical corner mapping (single source of truth)
+  //
+  // normalized 0…1 → 4pt…26pt
+  // radiusPt = 4 + normalized * 22
+  // Editor slider, appearance model, and cells MUST all use this mapping.
+
+  /// Maps normalized corner (0…1) to point radius (4…26). Clamp input to 0…1.
+  static func messageCornerRadiusPoints(normalized: Double) -> CGFloat {
+    CGFloat(4.0 + max(0.0, min(1.0, normalized)) * 22.0)
+  }
+
+  /// Default stored point radius on `ChatListAppearance` (== mapping at ~0.636).
+  static let defaultMessageCornerRadiusPoints: CGFloat = 18
+
+  // MARK: Dictionary bridge (persistence / Settings)
+
+  static func from(raw: [String: Any]?) -> ChatAppearanceDraft {
+    guard let raw else { return .default }
+    let base = ChatAppearanceDraft.default
+
+    func stringArray(_ key: String) -> [String]? {
+      raw[key] as? [String]
+    }
+    func doubleArray(_ key: String) -> [Double]? {
+      if let values = raw[key] as? [Double] { return values }
+      if let values = raw[key] as? [NSNumber] { return values.map(\.doubleValue) }
+      return nil
+    }
+
+    var draft = base
+    if let version = (raw["version"] as? NSNumber)?.intValue ?? raw["version"] as? Int {
+      draft.version = version
+    }
+    if let mode = normalizedString(raw["mode"]) {
+      draft.mode = mode.lowercased()
+    }
+    draft.themeId = normalizedString(raw["themeId"]) ?? normalizedString(raw["nativeThemeId"])
+
+    if let kind = normalizedString(raw["wallpaperKind"]) {
+      draft.wallpaperKind = kind.lowercased()
+    }
+    if let stops = stringArray("wallpaperGradient"), !stops.isEmpty {
+      draft.wallpaperGradient = stops
+    }
+    if let locs = doubleArray("wallpaperGradientLocations"), !locs.isEmpty {
+      draft.wallpaperGradientLocations = locs
+    }
+    if let scroll = stringArray("wallpaperScrollGradient") {
+      draft.wallpaperScrollGradient = scroll
+    }
+    if raw.keys.contains("wallpaperPatternMaskKey") {
+      draft.wallpaperPatternMaskKey = normalizedString(raw["wallpaperPatternMaskKey"])
+    } else if raw.keys.contains("wallpaperMaskKey") {
+      draft.wallpaperPatternMaskKey = normalizedString(raw["wallpaperMaskKey"])
+    }
+    if let opacity = (raw["wallpaperPatternOpacity"] as? NSNumber)?.doubleValue
+      ?? raw["wallpaperPatternOpacity"] as? Double
+    {
+      draft.wallpaperPatternOpacity = opacity
+    }
+    if let me = stringArray("bubbleMeGradient"), me.count >= 2 {
+      draft.bubbleMeGradient = me
+    }
+    if let them = stringArray("bubbleThemGradient"), them.count >= 2 {
+      draft.bubbleThemGradient = them
+    }
+    if let accent =
+      normalizedString(raw["accent"])
+      ?? normalizedString(raw["accentColor"])
+    {
+      draft.accent = accent
+    }
+    if let corner = (raw["messageCornerRadius"] as? NSNumber)?.doubleValue
+      ?? raw["messageCornerRadius"] as? Double
+    {
+      // Accept either normalized 0…1 or legacy point values (>1 → re-normalize).
+      if corner <= 1.0 {
+        draft.messageCornerRadius = max(0.0, min(1.0, corner))
+      } else {
+        let clampedPt = max(4.0, min(26.0, corner))
+        draft.messageCornerRadius = (clampedPt - 4.0) / 22.0
+      }
+    }
+    if let scale = (raw["textScale"] as? NSNumber)?.doubleValue ?? raw["textScale"] as? Double {
+      draft.textScale = scale
+    }
+    if let anim = parseBool(raw["animationsEnabled"]) ?? parseBool(raw["animations"]) {
+      draft.animationsEnabled = anim
+    }
+    return draft
+  }
+
+  var asDictionary: [String: Any] {
+    var dict: [String: Any] = [
+      "version": version,
+      "mode": mode,
+      "wallpaperKind": wallpaperKind,
+      "wallpaperGradient": wallpaperGradient,
+      "wallpaperGradientLocations": wallpaperGradientLocations,
+      "wallpaperScrollGradient": wallpaperScrollGradient,
+      "wallpaperPatternOpacity": wallpaperPatternOpacity,
+      "bubbleMeGradient": bubbleMeGradient,
+      "bubbleThemGradient": bubbleThemGradient,
+      "accent": accent,
+      "messageCornerRadius": messageCornerRadius,
+      "textScale": textScale,
+      "animationsEnabled": animationsEnabled,
+    ]
+    if let themeId {
+      dict["themeId"] = themeId
+    }
+    if let wallpaperPatternMaskKey {
+      dict["wallpaperPatternMaskKey"] = wallpaperPatternMaskKey
+    }
+    return dict
+  }
+}
+
+// MARK: - ChatAppearanceDraftStore (Settings persistence → chat raw)
+
+/// Persists the appearance editor draft and produces the raw dictionary that
+/// `ChatMainView` / `ChatListView.setAppearance` already consume.
+enum ChatAppearanceDraftStore {
+  static let storageKey = "vibe.chat.appearanceDraft.v1"
+  static let didChangeNotification = Notification.Name("ChatAppearanceDraftDidChange")
+
+  static var current: ChatAppearanceDraft { load() }
+
+  static func load() -> ChatAppearanceDraft {
+    guard let data = UserDefaults.standard.data(forKey: storageKey) else {
+      return seededDefault()
+    }
+    if let draft = try? JSONDecoder().decode(ChatAppearanceDraft.self, from: data) {
+      return draft
+    }
+    if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+      return ChatAppearanceDraft.from(raw: obj)
+    }
+    return seededDefault()
+  }
+
+  static func save(_ draft: ChatAppearanceDraft) {
+    if let data = try? JSONEncoder().encode(draft) {
+      UserDefaults.standard.set(data, forKey: storageKey)
+    } else if let data = try? JSONSerialization.data(
+      withJSONObject: draft.asDictionary, options: []
+    ) {
+      UserDefaults.standard.set(data, forKey: storageKey)
+    }
+    NotificationCenter.default.post(name: didChangeNotification, object: nil)
+  }
+
+  /// Seed from current light/dark preference + theme plate when nothing saved yet.
+  static func seededDefault() -> ChatAppearanceDraft {
+    var draft = ChatAppearanceDraft.default
+    let mode =
+      UserDefaults.standard.string(forKey: "vibe.app.appearance")
+      ?? AppAppearanceOption.system.rawValue
+    draft.mode = mode
+    let plateRaw =
+      UserDefaults.standard.string(forKey: "vibe.app.themePlate")
+      ?? AppThemePlateOption.glacier.rawValue
+    draft.themeId = plateRaw
+
+    let isDark: Bool = {
+      switch mode {
+      case "light": return false
+      case "dark": return true
+      default:
+        return UITraitCollection.current.userInterfaceStyle != .light
+      }
+    }()
+
+    let seeded = ChatListAppearance.from(raw: [
+      "theme": isDark ? "dark" : "light",
+      "backgroundMode": "gradient",
+      "wallpaperOpacity": 1.0,
+      "nativeThemeId": plateRaw,
+      "nativeThemeIsDark": isDark,
+    ])
+    draft.wallpaperGradient = seeded.wallpaperGradient.map(chatAppearanceColorHex)
+    draft.bubbleMeGradient = seeded.bubbleMeGradient.map(chatAppearanceColorHex)
+    draft.bubbleThemGradient = seeded.bubbleThemGradient.map(chatAppearanceColorHex)
+    draft.accent = chatAppearanceColorHex(seeded.accent)
+    draft.wallpaperPatternMaskKey = seeded.wallpaperMaskKey
+    draft.wallpaperPatternOpacity = Double(seeded.wallpaperPatternOpacity)
+    if seeded.messageCornerRadius > 1.0 {
+      let clamped = max(4.0, min(26.0, Double(seeded.messageCornerRadius)))
+      draft.messageCornerRadius = (clamped - 4.0) / 22.0
+    }
+    return draft
+  }
+
+  /// Payload for existing `setAppearance([String: Any])` call sites.
+  static func chatRawAppearance(isDark: Bool) -> [String: Any] {
+    var dict = load().asDictionary
+    dict["theme"] = isDark ? "dark" : "light"
+    dict["nativeThemeIsDark"] = isDark
+    if let mask = dict["wallpaperPatternMaskKey"] as? String {
+      dict["wallpaperMaskKey"] = mask
+    }
+    // Ensure custom draft path wins over pure nativeThemeId presets.
+    dict["version"] = max(1, (dict["version"] as? Int) ?? 1)
+    return dict
+  }
+}
+
+// MARK: - Accent semantic tokens (media chrome)
+
+/// Contrast-safe accent tints for voice waveform, play button, and media plates.
+struct ChatAppearanceAccentTokens: Equatable {
+  let accent: UIColor
+  let waveform: UIColor
+  let playFill: UIColor
+  let mediaPlate: UIColor
+}
+
+/// Telegram-style rest→scroll wallpaper blend.
+/// `rest` is the 2-stop base; optional `scroll` pair blends in as `progress` goes 0…1.
+/// Progress is clamped. Empty `scroll` returns `rest` unchanged.
+func interpolatedWallpaperGradient(
+  rest: [UIColor],
+  scroll: [UIColor],
+  progress: CGFloat
+) -> [UIColor] {
+  let t = max(0.0, min(1.0, progress))
+  guard !rest.isEmpty else {
+    return scroll.isEmpty ? [] : scroll
+  }
+  guard !scroll.isEmpty, t > 0.0001 else {
+    return rest
+  }
+  return rest.enumerated().map { index, restColor in
+    let scrollColor: UIColor
+    if index < scroll.count {
+      scrollColor = scroll[index]
+    } else if scroll.count == 1 {
+      scrollColor = scroll[0]
+    } else {
+      let frac = CGFloat(index) / CGFloat(max(rest.count - 1, 1))
+      let scrollIndex = min(scroll.count - 1, Int(round(frac * CGFloat(scroll.count - 1))))
+      scrollColor = scroll[scrollIndex]
+    }
+    return blendColor(restColor, with: scrollColor, amount: t)
+  }
+}
+
+/// Derive contrast-safe media-chrome tints from a chosen accent.
+/// Prefers WCAG-ish contrast against typical dark/light bubble plates; falls back
+/// to `ChatListAppearance.brandAccentFallback` when the accent fails.
+func semanticAccentTokens(from accent: UIColor, isDark: Bool) -> ChatAppearanceAccentTokens {
+  // Typical them-bubble plates used as contrast reference.
+  let plate: UIColor =
+    isDark
+    ? UIColor(red: 0.1451, green: 0.1608, blue: 0.2118, alpha: 1.0)  // #252936
+    : UIColor(red: 1.0, green: 1.0, blue: 1.0, alpha: 1.0)
+
+  let minContrast: CGFloat = 3.0
+  var resolved = accent
+  if contrastRatio(resolved, plate) < minContrast {
+    let fallback = ChatListAppearance.brandAccentFallback
+    if contrastRatio(fallback, plate) >= minContrast {
+      resolved = fallback
+    } else {
+      // Last resort: push luminance away from the plate.
+      resolved =
+        isDark
+        ? UIColor(red: 0.35, green: 0.92, blue: 0.86, alpha: 1.0)
+        : UIColor(red: 0.08, green: 0.42, blue: 0.38, alpha: 1.0)
+    }
+  }
+
+  return ChatAppearanceAccentTokens(
+    accent: resolved,
+    waveform: colorWithAlpha(resolved, isDark ? 0.92 : 0.88),
+    playFill: resolved,
+    mediaPlate: colorWithAlpha(resolved, isDark ? 0.22 : 0.14)
+  )
+}
+
+// MARK: - ChatListAppearance (runtime UIColor model)
+
 struct ChatListAppearance {
   let backgroundMode: String
   let wallpaperGradient: [UIColor]
@@ -137,10 +450,64 @@ struct ChatListAppearance {
   ///   3 = SpringBatch (UIView.animate with spring wrapping the batch)
   let insertionAnimationMode: Int
 
+  /// Accent driving media/cell chrome (waveform, play, plates). Default: brand teal.
+  let accent: UIColor
+  /// Bubble corner radius in points. Default 18 (== mapping at normalized ~0.636).
+  let messageCornerRadius: CGFloat
+  /// Optional second wallpaper gradient pair blended on scroll. Empty = no scroll blend.
+  let wallpaperScrollGradient: [UIColor]
+
   /// Shared brand accent fallback used wherever code needs an
   /// agent/accent color and no per-chat appearance is available yet — bubble tint,
   /// agent border, reply/mention bars, profile default accent, progress rings, etc.
   static let brandAccentFallback = UIColor(red: 0.1843, green: 0.6196, blue: 0.5765, alpha: 1.0)
+
+  /// Explicit memberwise init. New fields are defaulted so existing call sites compile.
+  init(
+    backgroundMode: String,
+    wallpaperGradient: [UIColor],
+    wallpaperOpacity: CGFloat,
+    wallpaperPatternGradient: [UIColor],
+    wallpaperPatternLocations: [NSNumber]?,
+    wallpaperPatternOpacity: CGFloat,
+    wallpaperMaskKey: String?,
+    bubbleMeGradient: [UIColor],
+    bubbleThemGradient: [UIColor],
+    bubbleThemColor: UIColor,
+    textColorMe: UIColor,
+    textColorThem: UIColor,
+    timeColorMe: UIColor,
+    timeColorThem: UIColor,
+    dayTextColor: UIColor,
+    dayBackgroundColor: UIColor,
+    dayBorderColor: UIColor,
+    insertionAnimationMode: Int,
+    accent: UIColor = ChatListAppearance.brandAccentFallback,
+    messageCornerRadius: CGFloat = 18,
+    wallpaperScrollGradient: [UIColor] = []
+  ) {
+    self.backgroundMode = backgroundMode
+    self.wallpaperGradient = wallpaperGradient
+    self.wallpaperOpacity = wallpaperOpacity
+    self.wallpaperPatternGradient = wallpaperPatternGradient
+    self.wallpaperPatternLocations = wallpaperPatternLocations
+    self.wallpaperPatternOpacity = wallpaperPatternOpacity
+    self.wallpaperMaskKey = wallpaperMaskKey
+    self.bubbleMeGradient = bubbleMeGradient
+    self.bubbleThemGradient = bubbleThemGradient
+    self.bubbleThemColor = bubbleThemColor
+    self.textColorMe = textColorMe
+    self.textColorThem = textColorThem
+    self.timeColorMe = timeColorMe
+    self.timeColorThem = timeColorThem
+    self.dayTextColor = dayTextColor
+    self.dayBackgroundColor = dayBackgroundColor
+    self.dayBorderColor = dayBorderColor
+    self.insertionAnimationMode = insertionAnimationMode
+    self.accent = accent
+    self.messageCornerRadius = messageCornerRadius
+    self.wallpaperScrollGradient = wallpaperScrollGradient
+  }
 
   // Vibe Aurora fallback: near-black base, low-contrast doodle ink, and a
   // teal-leaning outgoing bubble so missing native payloads do not look Telegram-like.
@@ -175,12 +542,35 @@ struct ChatListAppearance {
     dayTextColor: UIColor(white: 0.95, alpha: 0.88),
     dayBackgroundColor: UIColor(red: 0.0706, green: 0.0824, blue: 0.1255, alpha: 0.74),
     dayBorderColor: UIColor(white: 1.0, alpha: 0.14),
-    insertionAnimationMode: 2
+    insertionAnimationMode: 2,
+    accent: brandAccentFallback,
+    messageCornerRadius: ChatAppearanceDraft.defaultMessageCornerRadiusPoints,
+    wallpaperScrollGradient: []
   )
 
   static func from(raw: [String: Any]?) -> ChatListAppearance {
     guard let raw else {
       return .fallback
+    }
+
+    // Versioned editor drafts take precedence over nativeThemeId presets.
+    let version =
+      (raw["version"] as? NSNumber)?.intValue
+      ?? raw["version"] as? Int
+    if let version, version >= 1 {
+      var draft = ChatAppearanceDraft.from(raw: raw)
+      if draft.mode == "system" {
+        let isDark: Bool
+        if let flag = raw["nativeThemeIsDark"] as? Bool {
+          isDark = flag
+        } else if let theme = (raw["theme"] as? String)?.lowercased() {
+          isDark = theme != "light"
+        } else {
+          isDark = true
+        }
+        draft.mode = isDark ? "dark" : "light"
+      }
+      return from(draft: draft)
     }
 
     if let nativeResolved = nativePresetAppearance(from: raw, fallback: .fallback) {
@@ -211,6 +601,18 @@ struct ChatListAppearance {
       wallpaperGradient: wallpaperGradient,
       isDark: isDark
     )
+    let accent =
+      parseColor(raw["accent"] as? String)
+      ?? parseColor(raw["accentColor"] as? String)
+      ?? fallback.accent
+    let messageCornerRadius = parseMessageCornerRadiusPoints(
+      raw["messageCornerRadius"],
+      fallback: fallback.messageCornerRadius
+    )
+    let wallpaperScrollGradient: [UIColor] = {
+      guard let strings = raw["wallpaperScrollGradient"] as? [String] else { return [] }
+      return strings.compactMap(parseColor)
+    }()
     return ChatListAppearance(
       backgroundMode: mode,
       wallpaperGradient: wallpaperGradient,
@@ -235,7 +637,110 @@ struct ChatListAppearance {
       dayBorderColor: parseColor(raw["dayBorderColor"] as? String)
         ?? colorWithAlpha(textColorThem, isDark ? 0.08 : 0.10),
       insertionAnimationMode: (raw["insertionAnimationMode"] as? NSNumber)?.intValue
-        ?? fallback.insertionAnimationMode
+        ?? fallback.insertionAnimationMode,
+      accent: accent,
+      messageCornerRadius: messageCornerRadius,
+      wallpaperScrollGradient: wallpaperScrollGradient
+    )
+  }
+
+  /// Map a hex-string `ChatAppearanceDraft` into the runtime `UIColor` model.
+  /// Applies the canonical corner mapping and carries accent + scroll gradient.
+  static func from(draft: ChatAppearanceDraft) -> ChatListAppearance {
+    let fallback = ChatListAppearance.fallback
+    let modeLower = draft.mode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    let isDark: Bool = {
+      switch modeLower {
+      case "light": return false
+      case "dark": return true
+      default:
+        // "system" / unknown — prefer dark Aurora until traits are applied upstream.
+        return true
+      }
+    }()
+
+    // Seed from a native preset when themeId is set; draft fields then override.
+    var base = fallback
+    if let themeId = draft.themeId,
+      let seeded = nativePresetAppearance(
+        from: [
+          "nativeThemeId": themeId,
+          "nativeThemeIsDark": isDark,
+          "backgroundMode": draft.wallpaperKind == "custom" ? "gradient" : "gradient",
+          "wallpaperOpacity": 1.0,
+          "insertionAnimationMode": draft.animationsEnabled ? 2 : 0,
+        ],
+        fallback: fallback
+      )
+    {
+      base = seeded
+    }
+
+    let wallpaperGradient = parseGradient(
+      draft.wallpaperGradient,
+      fallback: base.wallpaperGradient
+    )
+    let wallpaperScrollGradient = draft.wallpaperScrollGradient.compactMap(parseColor)
+    let bubbleMeGradient = parseGradient(
+      draft.bubbleMeGradient,
+      fallback: base.bubbleMeGradient
+    )
+    let bubbleThemGradient = parseGradient(
+      draft.bubbleThemGradient,
+      fallback: base.bubbleThemGradient
+    )
+    let bubbleThemColor = bubbleThemGradient.first ?? base.bubbleThemColor
+    let accent =
+      parseColor(draft.accent) ?? base.accent
+    let messageCornerRadius = ChatAppearanceDraft.messageCornerRadiusPoints(
+      normalized: draft.messageCornerRadius
+    )
+
+    let backgroundMode: String = {
+      switch draft.wallpaperKind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+      case "solid", "gradient", "builtin", "custom":
+        return "gradient"
+      default:
+        return base.backgroundMode
+      }
+    }()
+
+    let maskKey =
+      draft.wallpaperPatternMaskKey
+      ?? (draft.wallpaperKind == "builtin" ? base.wallpaperMaskKey : draft.wallpaperPatternMaskKey)
+
+    let patternOpacity = CGFloat(draft.wallpaperPatternOpacity)
+    let textColorMe: UIColor = isDark ? .white : UIColor(white: 0.08, alpha: 1.0)
+    let textColorThem: UIColor =
+      isDark ? UIColor(white: 0.94, alpha: 1.0) : UIColor(white: 0.08, alpha: 1.0)
+    let dayPlateBase = resolvedDayPlateBase(
+      bubbleThemColor: bubbleThemColor,
+      wallpaperGradient: wallpaperGradient,
+      isDark: isDark
+    )
+
+    return ChatListAppearance(
+      backgroundMode: backgroundMode,
+      wallpaperGradient: wallpaperGradient,
+      wallpaperOpacity: base.wallpaperOpacity,
+      wallpaperPatternGradient: base.wallpaperPatternGradient,
+      wallpaperPatternLocations: base.wallpaperPatternLocations,
+      wallpaperPatternOpacity: patternOpacity,
+      wallpaperMaskKey: maskKey,
+      bubbleMeGradient: bubbleMeGradient,
+      bubbleThemGradient: bubbleThemGradient,
+      bubbleThemColor: bubbleThemColor,
+      textColorMe: textColorMe,
+      textColorThem: textColorThem,
+      timeColorMe: colorWithAlpha(textColorMe, isDark ? 0.68 : 0.56),
+      timeColorThem: colorWithAlpha(textColorThem, isDark ? 0.52 : 0.48),
+      dayTextColor: colorWithAlpha(textColorThem, isDark ? 0.90 : 0.84),
+      dayBackgroundColor: colorWithAlpha(dayPlateBase, isDark ? 0.84 : 0.76),
+      dayBorderColor: colorWithAlpha(textColorThem, isDark ? 0.08 : 0.10),
+      insertionAnimationMode: draft.animationsEnabled ? 2 : 0,
+      accent: accent,
+      messageCornerRadius: messageCornerRadius,
+      wallpaperScrollGradient: wallpaperScrollGradient
     )
   }
 
@@ -246,12 +751,14 @@ struct ChatListAppearance {
       wallpaperPatternLocations?.map { String(format: "%.4f", $0.doubleValue) }.joined(
         separator: ",")
       ?? ""
+    let scrollKey = wallpaperScrollGradient.map(colorKey).joined(separator: ",")
     let meKey = bubbleMeGradient.map(colorKey).joined(separator: ",")
     let themKey = bubbleThemGradient.map(colorKey).joined(separator: ",")
     return [
       backgroundMode,
       String(format: "%.4f", wallpaperOpacity),
       wallpaperKey,
+      scrollKey,
       wallpaperPatternKey,
       wallpaperPatternLocationsKey,
       String(format: "%.4f", wallpaperPatternOpacity),
@@ -266,6 +773,8 @@ struct ChatListAppearance {
       colorKey(dayTextColor),
       colorKey(dayBackgroundColor),
       colorKey(dayBorderColor),
+      colorKey(accent),
+      String(format: "%.4f", messageCornerRadius),
     ].joined(separator: "|")
   }
 
@@ -313,52 +822,68 @@ struct ChatListAppearance {
     )
   }
 
+  /// Tall-bubble expand/collapse chevron — muted neutral, never theme-accented.
+  /// Slight luminance shift for plate contrast only (me vs them), not a colored icon.
+  func tallToggleColor(isMe: Bool) -> UIColor {
+    if isDark {
+      // Soft light gray on dark plates; a touch dimmer on colored me gradients.
+      return UIColor(white: isMe ? 0.78 : 0.70, alpha: 0.82)
+    }
+    // Soft dark gray on light plates.
+    return UIColor(white: isMe ? 0.38 : 0.46, alpha: 0.72)
+  }
+
   var incomingWallpaperSampleOpacity: CGFloat {
     guard backgroundMode != "transparent" else { return 0.0 }
+    // Keep wallpaper bleed very low for them plates so multi-hue pattern
+    // masks never show through as different per-cell colors.
     if hasPatternWallpaper {
-      return isDark ? 0.10 : 0.045
+      return isDark ? 0.03 : 0.018
     }
-    return isDark ? 0.04 : 0.03
+    return isDark ? 0.02 : 0.015
   }
 
   var outgoingWallpaperSampleOpacity: CGFloat {
     guard backgroundMode != "transparent" else { return 0.0 }
     if hasPatternWallpaper {
-      return isDark ? 0.075 : 0.045
+      return isDark ? 0.045 : 0.03
     }
-    return isDark ? 0.03 : 0.02
+    return isDark ? 0.025 : 0.018
   }
 
   var incomingPlateFillOpacity: CGFloat {
     if hasPatternWallpaper {
-      return isDark ? 0.95 : 0.985
-    }
-    if backgroundMode != "transparent" {
-      return isDark ? 0.985 : 0.98
-    }
-    return isDark ? 0.90 : 0.94
-  }
-
-  var outgoingPlateFillOpacity: CGFloat {
-    if hasPatternWallpaper {
-      return isDark ? 0.965 : 0.985
+      return isDark ? 0.985 : 0.99
     }
     if backgroundMode != "transparent" {
       return isDark ? 0.99 : 0.985
     }
+    return isDark ? 0.92 : 0.96
+  }
+
+  var outgoingPlateFillOpacity: CGFloat {
+    // Me bubbles paint via shared gradient; underfill stays transparent so the
+    // gradient is not buried under an opaque plate (fillLayer sits above gradient).
     return 0.0
   }
 
-  private var wallpaperToneSamplingData: (colors: [UIColor], locations: [CGFloat]) {
-    if hasPatternWallpaper, wallpaperPatternGradient.count >= 2 {
-      return normalizedGradientSamplingData(
-        colors: wallpaperPatternGradient,
-        locations: wallpaperPatternLocations
-      )
-    }
-    return normalizedGradientSamplingData(colors: wallpaperGradient, locations: nil)
+  /// Fixed wallpaper base tint for bubble plates (wallpaper gradient only).
+  /// Never samples the multi-hue pattern gradient by cell Y — that produced
+  /// rainbow them/me cells (purple, teal, coral per row). Pattern stays on the
+  /// wallpaper backdrop; bubbles use one shared theme plate.
+  private var fixedWallpaperPlateTint: UIColor {
+    blendColor(
+      wallpaperAnchorColor,
+      with: isDark ? UIColor.black : UIColor.white,
+      amount: isDark ? 0.52 : 0.28
+    )
   }
 
+  /// Telegram-style bubble plates:
+  /// - them: near-black/gray, same for every cell, tiny fixed wallpaper anchor
+  /// - me: stable theme mid-tone underfill (shared list-space gradient paints on top)
+  /// `sampleRect` / `containerSize` are kept for API compatibility with callers;
+  /// they intentionally do not change the plate hue.
   func wallpaperPlateColor(
     isMe: Bool,
     sampleRect: CGRect,
@@ -369,54 +894,46 @@ struct ChatListAppearance {
       return baseColor
     }
 
-    let samplePoint = CGPoint(x: sampleRect.midX, y: sampleRect.midY)
-    let wallpaperColor = wallpaperToneColor(at: samplePoint, containerSize: containerSize)
+    let fixedTint = fixedWallpaperPlateTint
     if isMe {
+      // Mild fixed tint only — continuous hue comes from the shared me gradient.
       let tinted = blendColor(
         baseColor,
-        with: wallpaperColor,
-        amount: hasPatternWallpaper ? (isDark ? 0.30 : 0.14) : (isDark ? 0.10 : 0.04)
+        with: fixedTint,
+        amount: isDark ? 0.08 : 0.05
       )
       return blendColor(
         tinted,
         with: isDark ? UIColor.black : UIColor.white,
-        amount: hasPatternWallpaper ? (isDark ? 0.04 : 0.08) : (isDark ? 0.08 : 0.03)
+        amount: isDark ? 0.04 : 0.06
       )
     }
 
+    // Them: near-black plate, shared across the whole list (no per-cell color plate).
     let darkerIncomingReference = blendColor(
       bubbleThemGradient.first ?? bubbleThemColor,
       with: bubbleThemGradient.last ?? bubbleThemColor,
-      amount: 0.82
+      amount: 0.78
     )
     let isolatedIncomingBase = blendColor(
       baseColor,
       with: darkerIncomingReference,
-      amount: hasPatternWallpaper ? 0.76 : 0.58
+      amount: 0.62
     )
-    if hasPatternWallpaper && !isDark {
-      let softWallpaper = blendColor(wallpaperColor, with: UIColor.white, amount: 0.62)
-      let tinted = blendColor(isolatedIncomingBase, with: softWallpaper, amount: 0.12)
-      return blendColor(tinted, with: UIColor.white, amount: 0.18)
+    if !isDark {
+      let softTint = blendColor(fixedTint, with: UIColor.white, amount: 0.70)
+      let tinted = blendColor(isolatedIncomingBase, with: softTint, amount: 0.06)
+      return blendColor(tinted, with: UIColor.white, amount: 0.10)
     }
-    let anchoredIncomingWallpaper =
-      hasPatternWallpaper
-      ? blendColor(wallpaperColor, with: UIColor.black, amount: isDark ? 0.34 : 0.16)
-      : blendColor(wallpaperColor, with: wallpaperAnchorColor, amount: 0.80)
     let tinted = blendColor(
       isolatedIncomingBase,
-      with: anchoredIncomingWallpaper,
-      amount: hasPatternWallpaper ? (isDark ? 0.38 : 0.24) : (isDark ? 0.06 : 0.04)
-    )
-    let harmonized = blendColor(
-      tinted,
-      with: darkerIncomingReference,
-      amount: hasPatternWallpaper ? 0.30 : 0.10
+      with: fixedTint,
+      amount: 0.08
     )
     return blendColor(
-      harmonized,
+      tinted,
       with: UIColor.black,
-      amount: hasPatternWallpaper ? (isDark ? 0.14 : 0.09) : (isDark ? 0.15 : 0.08)
+      amount: 0.12
     )
   }
 
@@ -435,49 +952,67 @@ struct ChatListAppearance {
       return baseColor
     }
 
-    let samplePoint = CGPoint(x: sampleRect.midX, y: sampleRect.midY)
-    let wallpaperColor = wallpaperToneColor(at: samplePoint, containerSize: containerSize)
     let paletteAccent = blendColor(
       bubbleMeGradient.first ?? baseColor,
       with: bubbleMeGradient.last ?? baseColor,
       amount: 0.46
     )
     let agentAccent = accent ?? paletteAccent
-    let syncedAccent = blendColor(
-      agentAccent,
-      with: wallpaperColor,
-      amount: hasPatternWallpaper ? (isDark ? 0.34 : 0.12) : (isDark ? 0.16 : 0.06)
-    )
-    let accentAmount: CGFloat
-    if isMe {
-      accentAmount = hasPatternWallpaper ? (isDark ? 0.20 : 0.10) : (isDark ? 0.14 : 0.06)
-    } else {
-      accentAmount = hasPatternWallpaper ? (isDark ? 0.20 : 0.07) : (isDark ? 0.12 : 0.04)
-    }
-    let balanced = blendColor(
-      baseColor,
-      with: syncedAccent,
-      amount: accentAmount
-    )
+    // Light accent wash only — keep them near the stable plate, not a second rainbow.
+    let accentAmount: CGFloat = isMe ? (isDark ? 0.12 : 0.08) : (isDark ? 0.08 : 0.04)
+    let balanced = blendColor(baseColor, with: agentAccent, amount: accentAmount)
     return blendColor(
       balanced,
       with: isDark ? UIColor.black : UIColor.white,
-      amount: isMe ? (isDark ? 0.02 : 0.08) : (isDark ? 0.08 : 0.14)
+      amount: isMe ? (isDark ? 0.04 : 0.08) : (isDark ? 0.10 : 0.12)
     )
   }
 
-  private func wallpaperToneColor(at point: CGPoint, containerSize: CGSize) -> UIColor {
-    guard containerSize.width > 1.0, containerSize.height > 1.0 else {
-      return wallpaperAnchorColor
+  /// Maps one shared diagonal theme gradient into a bubble layer's unit space.
+  ///
+  /// Telegram free-theme behavior: adjacent outgoing bubbles are windows into the
+  /// **same** continuous ramp (not a different solid plate per cell). The ramp is
+  /// sized to a fixed visual period (~0.9–1.2× screen) so color shift is visible
+  /// without stretching the full multi-stop palette across a single tall cell.
+  ///
+  /// `layerBounds` is the gradient layer frame in bubble-local coords (may include
+  /// tail paint overhang wider than the bubble bounds).
+  func sharedBubbleGradientUnitPoints(
+    sampleRectInContainer: CGRect,
+    containerSize: CGSize,
+    layerBounds: CGRect
+  ) -> (start: CGPoint, end: CGPoint)? {
+    guard sampleRectInContainer.width > 1.0,
+      sampleRectInContainer.height > 1.0,
+      containerSize.width > 1.0,
+      containerSize.height > 1.0,
+      layerBounds.width > 1.0,
+      layerBounds.height > 1.0
+    else {
+      return nil
     }
-    let normalizedX = clampUnit(point.x / containerSize.width)
-    let normalizedY = clampUnit(point.y / containerSize.height)
-    let diagonalProgress = clampUnit((((normalizedX * 0.22) + (normalizedY * 0.78)) - 0.04) * 1.12)
-    let samplingData = wallpaperToneSamplingData
-    return interpolatedGradientColor(
-      colors: samplingData.colors,
-      locations: samplingData.locations,
-      at: diagonalProgress
+
+    // Vertical period of the me gradient in list coordinates. Shorter than a very
+    // long thread so each bubble still shows a readable slice of the theme colors.
+    let verticalSpan = max(520.0, min(containerSize.height * 1.05, 780.0))
+    let horizontalSpan = max(containerSize.width * 1.05, 280.0)
+
+    func unitPoint(forContainerPoint point: CGPoint) -> CGPoint {
+      let bubbleLocalX = point.x - sampleRectInContainer.minX
+      let bubbleLocalY = point.y - sampleRectInContainer.minY
+      let layerLocalX = bubbleLocalX - layerBounds.minX
+      let layerLocalY = bubbleLocalY - layerBounds.minY
+      return CGPoint(
+        x: layerLocalX / layerBounds.width,
+        y: layerLocalY / layerBounds.height
+      )
+    }
+
+    // Continuous diagonal across list space: (0,0) → (spanX, spanY).
+    // Bubbles only differ by which slice they open onto — same palette for all.
+    return (
+      unitPoint(forContainerPoint: .zero),
+      unitPoint(forContainerPoint: CGPoint(x: horizontalSpan, y: verticalSpan))
     )
   }
 }
@@ -545,6 +1080,18 @@ private func nativePresetAppearance(
     wallpaperGradient: wallpaperGradient,
     isDark: isDark
   )
+  let accent =
+    parseColor(raw["accent"] as? String)
+    ?? parseColor(raw["accentColor"] as? String)
+    ?? fallback.accent
+  let messageCornerRadius = parseMessageCornerRadiusPoints(
+    raw["messageCornerRadius"],
+    fallback: fallback.messageCornerRadius
+  )
+  let wallpaperScrollGradient: [UIColor] = {
+    guard let strings = raw["wallpaperScrollGradient"] as? [String] else { return [] }
+    return strings.compactMap(parseColor)
+  }()
   return ChatListAppearance(
     backgroundMode: mode,
     wallpaperGradient: wallpaperGradient,
@@ -572,7 +1119,10 @@ private func nativePresetAppearance(
       ?? colorWithAlpha(dayPlateBase, isDark ? 0.84 : 0.76),
     dayBorderColor: parseColor(raw["dayBorderColor"] as? String)
       ?? colorWithAlpha(textColorThem, isDark ? 0.08 : 0.10),
-    insertionAnimationMode: insertionAnimationMode
+    insertionAnimationMode: insertionAnimationMode,
+    accent: accent,
+    messageCornerRadius: messageCornerRadius,
+    wallpaperScrollGradient: wallpaperScrollGradient
   )
 }
 
@@ -614,7 +1164,8 @@ private func nativePreset(for id: String) -> NativeThemePreset? {
       light: NativeThemeVariant(
         backgroundGradient: ["#F4F8FA", "#E9F0F5"],
         bubbleMe: "#1976D2",
-        bubbleMeGradient: ["#4B9BFF", "#9C62F0"],
+        // Mist: purple at top, blue at bottom (shared diagonal start→end).
+        bubbleMeGradient: ["#9C62F0", "#4B9BFF"],
         bubbleThem: "#FFFFFF",
         bubbleThemGradient: ["#FFFFFF", "#F6F8FC"],
         patternGradientColors: ["#7EB6FF", "#B084F5", "#FF8DA1"],
@@ -626,7 +1177,8 @@ private func nativePreset(for id: String) -> NativeThemePreset? {
       dark: NativeThemeVariant(
         backgroundGradient: ["#03070C", "#03070C"],
         bubbleMe: "#2F80ED",
-        bubbleMeGradient: ["#1E90FF", "#7F5AF0"],
+        // Mist: purple at top, blue at bottom (shared diagonal start→end).
+        bubbleMeGradient: ["#7F5AF0", "#1E90FF"],
         bubbleThem: "#252936",
         bubbleThemGradient: ["#252936", "#1A202C"],
         patternGradientColors: ["#2F80ED", "#8B4CF5", "#F0516A"],
@@ -841,32 +1393,6 @@ private func resolvedDayPlateBase(
   return blendColor(bubbleThemColor, with: wallpaperAnchor, amount: isDark ? 0.14 : 0.08)
 }
 
-private func softenedBubblePalette(
-  bubbleMeGradient: [UIColor],
-  bubbleThemColor: UIColor,
-  wallpaperGradient: [UIColor],
-  isDark: Bool
-) -> (me: [UIColor], them: UIColor) {
-  let wallFirst = wallpaperGradient.first ?? (isDark ? UIColor.black : UIColor.white)
-  let wallLast = wallpaperGradient.last ?? wallFirst
-  let wallpaperAnchor = blendColor(wallFirst, with: wallLast, amount: 0.36)
-
-  let softenedMe = bubbleMeGradient.map { color in
-    let contrast = contrastRatio(color, wallpaperAnchor)
-    let extra = max(0.0, min(0.12, (contrast - (isDark ? 4.2 : 3.8)) * 0.05))
-    let mix = (isDark ? 0.12 : 0.10) + extra
-    let base = blendColor(color, with: wallpaperAnchor, amount: mix)
-    return colorWithAlpha(base, 0.96)
-  }
-
-  let themContrast = contrastRatio(bubbleThemColor, wallpaperAnchor)
-  let themExtra = max(0.0, min(0.14, (themContrast - (isDark ? 2.6 : 2.2)) * 0.07))
-  let themMix = (isDark ? 0.12 : 0.09) + themExtra
-  var softenedThem = blendColor(bubbleThemColor, with: wallpaperAnchor, amount: themMix)
-  softenedThem = colorWithAlpha(softenedThem, isDark ? 0.94 : 0.96)
-
-  return (me: softenedMe, them: softenedThem)
-}
 
 private func blendColor(_ from: UIColor, with to: UIColor, amount: CGFloat) -> UIColor {
   let t = max(0.0, min(1.0, amount))
@@ -898,133 +1424,7 @@ private func clampUnit(_ value: CGFloat) -> CGFloat {
   min(1.0, max(0.0, value))
 }
 
-private func normalizedGradientSamplingData(
-  colors: [UIColor],
-  locations: [NSNumber]?
-) -> (colors: [UIColor], locations: [CGFloat]) {
-  guard !colors.isEmpty else {
-    return ([.black], [0.0])
-  }
 
-  if colors.count == 1 {
-    return (colors, [0.0])
-  }
-
-  let resolvedLocations: [CGFloat] = {
-    if let locations, locations.count == colors.count {
-      var lastValue: CGFloat = 0.0
-      return locations.enumerated().map { index, value in
-        let clamped = clampUnit(CGFloat(truncating: value))
-        let monotonic = index == 0 ? clamped : max(lastValue, clamped)
-        lastValue = monotonic
-        return monotonic
-      }
-    }
-
-    return (0..<colors.count).map { index in
-      CGFloat(index) / CGFloat(max(colors.count - 1, 1))
-    }
-  }()
-
-  switch colors.count {
-  case 2:
-    let start = resolvedLocations[0]
-    let end = resolvedLocations[1]
-    return (
-      [
-        colors[0],
-        blendColor(colors[0], with: colors[1], amount: 0.25),
-        blendColor(colors[0], with: colors[1], amount: 0.50),
-        blendColor(colors[0], with: colors[1], amount: 0.75),
-        colors[1],
-      ],
-      [
-        start,
-        start + ((end - start) * 0.25),
-        start + ((end - start) * 0.50),
-        start + ((end - start) * 0.75),
-        end,
-      ]
-    )
-  case 3:
-    let start = resolvedLocations[0]
-    let middle = resolvedLocations[1]
-    let end = resolvedLocations[2]
-    return (
-      [
-        colors[0],
-        blendColor(colors[0], with: colors[1], amount: 0.5),
-        colors[1],
-        blendColor(colors[1], with: colors[2], amount: 0.5),
-        colors[2],
-      ],
-      [
-        start,
-        start + ((middle - start) * 0.5),
-        middle,
-        middle + ((end - middle) * 0.5),
-        end,
-      ]
-    )
-  case 4:
-    let middleLocation = resolvedLocations[1] + ((resolvedLocations[2] - resolvedLocations[1]) * 0.5)
-    return (
-      [
-        colors[0],
-        colors[1],
-        blendColor(colors[1], with: colors[2], amount: 0.5),
-        colors[2],
-        colors[3],
-      ],
-      [
-        resolvedLocations[0],
-        resolvedLocations[1],
-        middleLocation,
-        resolvedLocations[2],
-        resolvedLocations[3],
-      ]
-    )
-  default:
-    return (colors, resolvedLocations)
-  }
-}
-
-private func interpolatedGradientColor(
-  colors: [UIColor],
-  locations: [CGFloat]? = nil,
-  at progress: CGFloat
-) -> UIColor {
-  guard !colors.isEmpty else { return .black }
-  if colors.count == 1 { return colors[0] }
-
-  let clamped = clampUnit(progress)
-  let resolvedLocations: [CGFloat] = {
-    if let locations, locations.count == colors.count {
-      return locations
-    }
-    return (0..<colors.count).map { index in
-      CGFloat(index) / CGFloat(max(colors.count - 1, 1))
-    }
-  }()
-
-  if clamped <= resolvedLocations[0] {
-    return colors[0]
-  }
-  if clamped >= resolvedLocations[colors.count - 1] {
-    return colors[colors.count - 1]
-  }
-
-  for index in 0..<(colors.count - 1) {
-    let start = resolvedLocations[index]
-    let end = resolvedLocations[index + 1]
-    guard clamped >= start, clamped <= end else { continue }
-    let distance = max(end - start, 0.0001)
-    let localT = clampUnit((clamped - start) / distance)
-    return blendColor(colors[index], with: colors[index + 1], amount: localT)
-  }
-
-  return colors[colors.count - 1]
-}
 
 private func isDarkColor(_ color: UIColor) -> Bool {
   var r: CGFloat = 0
@@ -1121,6 +1521,28 @@ private func colorKey(_ color: UIColor) -> String {
   return "0,0,0,0"
 }
 
+/// Parse corner radius from raw payload.
+/// Values in 0…1 are treated as normalized; values > 1 as points (clamped 4…26).
+private func parseMessageCornerRadiusPoints(_ raw: Any?, fallback: CGFloat) -> CGFloat {
+  let value: Double?
+  if let number = raw as? NSNumber {
+    value = number.doubleValue
+  } else if let double = raw as? Double {
+    value = double
+  } else if let int = raw as? Int {
+    value = Double(int)
+  } else if let text = raw as? String {
+    value = Double(text.trimmingCharacters(in: .whitespacesAndNewlines))
+  } else {
+    value = nil
+  }
+  guard let value else { return fallback }
+  if value <= 1.0 {
+    return ChatAppearanceDraft.messageCornerRadiusPoints(normalized: value)
+  }
+  return CGFloat(max(4.0, min(26.0, value)))
+}
+
 private func parseGradient(_ values: [String]?, fallback: [UIColor]) -> [UIColor] {
   guard let values else {
     return fallback
@@ -1205,4 +1627,769 @@ private func parseRgbColor(_ value: String) -> UIColor? {
     blue: CGFloat(max(0.0, min(255.0, b)) / 255.0),
     alpha: CGFloat(max(0.0, min(1.0, a)))
   )
+}
+
+// MARK: - Appearance settings contract + live preview
+//
+// Production appearance model (persist/consume these fields). The Settings
+// integrator embeds `ChatAppearanceLivePreviewView` (SwiftUI) or
+// `ChatAppearanceLivePreview` (UIKit) and pushes a new `ChatAppearancePreviewSpec`
+// whenever the user adjusts controls — the surface updates live from semantic
+// tokens, not hard-coded theme colors.
+
+/// Interface style preference for appearance settings (`mode` in the contract).
+enum ChatAppearancePreviewMode: String, CaseIterable, Equatable {
+  case system
+  case light
+  case dark
+
+  /// Resolve against the current trait collection when mode is `.system`.
+  func resolvedIsDark(traitCollection: UITraitCollection) -> Bool {
+    switch self {
+    case .light:
+      return false
+    case .dark:
+      return true
+    case .system:
+      return traitCollection.userInterfaceStyle == .dark
+    }
+  }
+}
+
+/// Wallpaper storage kind (`wallpaper kind` in the contract).
+enum ChatAppearanceWallpaperKind: String, CaseIterable, Equatable {
+  /// Built-in pattern mask identifier (e.g. doodles, music).
+  case builtin
+  /// Single solid color (hex in `wallpaperValue`).
+  case solid
+  /// Theme / free gradient (optional comma-separated hex stops in `wallpaperValue`).
+  case gradient
+  /// Device-local custom image path (preview falls back to gradient; image stays local).
+  case custom
+}
+
+/// Persisted appearance settings + live-preview input.
+///
+/// Contract fields: `mode`, `themeId`, wallpaper kind/value, accent, two-stop
+/// bubble gradient, text scale, message corner scale, animations enabled.
+struct ChatAppearancePreviewSpec: Equatable {
+  var mode: ChatAppearancePreviewMode
+  var themeId: String
+  var wallpaperKind: ChatAppearanceWallpaperKind
+  /// Builtin mask key, solid/custom hex or path, or comma-separated gradient stops.
+  var wallpaperValue: String
+  var accent: UIColor
+  var bubbleGradientTop: UIColor
+  var bubbleGradientBottom: UIColor
+  /// 1.0 = default chat text; clamped ~0.85…1.35 when resolving tokens.
+  var textScale: CGFloat
+  /// 1.0 = default bubble corner; clamped ~0.6…1.4 when resolving tokens.
+  var messageCornerScale: CGFloat
+  var animationsEnabled: Bool
+
+  static let `default` = ChatAppearancePreviewSpec(
+    mode: .system,
+    themeId: "glacier",
+    wallpaperKind: .builtin,
+    wallpaperValue: "doodles",
+    accent: ChatListAppearance.brandAccentFallback,
+    bubbleGradientTop: UIColor(red: 0.5451, green: 0.4863, blue: 1.0, alpha: 1.0),
+    bubbleGradientBottom: UIColor(red: 0.0314, green: 0.7765, blue: 0.7059, alpha: 1.0),
+    textScale: 1.0,
+    messageCornerScale: 1.0,
+    animationsEnabled: true
+  )
+
+  /// Build from a portable dictionary (HTTP / UserDefaults / Settings draft).
+  static func from(raw: [String: Any]?) -> ChatAppearancePreviewSpec {
+    guard let raw else { return .default }
+    let base = ChatAppearancePreviewSpec.default
+
+    let modeRaw =
+      (raw["mode"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+      ?? base.mode.rawValue
+    let mode = ChatAppearancePreviewMode(rawValue: modeRaw) ?? base.mode
+
+    let themeId =
+      normalizedString(raw["themeId"])
+      ?? normalizedString(raw["nativeThemeId"])
+      ?? base.themeId
+
+    let kindRaw =
+      (raw["wallpaperKind"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased()
+      ?? base.wallpaperKind.rawValue
+    let wallpaperKind = ChatAppearanceWallpaperKind(rawValue: kindRaw) ?? base.wallpaperKind
+    let wallpaperValue =
+      normalizedString(raw["wallpaperValue"])
+      ?? normalizedString(raw["wallpaperMaskKey"])
+      ?? base.wallpaperValue
+
+    let accent =
+      parseColor(raw["accentColor"] as? String)
+      ?? parseColor(raw["accent"] as? String)
+      ?? base.accent
+
+    let gradientStops: [UIColor] = {
+      if let strings = raw["bubbleGradient"] as? [String] {
+        let parsed = strings.compactMap(parseColor)
+        if parsed.count >= 2 { return Array(parsed.prefix(2)) }
+      }
+      if let top = parseColor(raw["bubbleGradientTop"] as? String),
+        let bottom = parseColor(raw["bubbleGradientBottom"] as? String)
+      {
+        return [top, bottom]
+      }
+      if let me = raw["bubbleMeGradient"] as? [String] {
+        let parsed = me.compactMap(parseColor)
+        if parsed.count >= 2 { return Array(parsed.prefix(2)) }
+      }
+      return [base.bubbleGradientTop, base.bubbleGradientBottom]
+    }()
+
+    let textScale = CGFloat(
+      (raw["textScale"] as? NSNumber)?.doubleValue
+        ?? (raw["textScale"] as? Double)
+        ?? Double(base.textScale)
+    )
+    let messageCornerScale = CGFloat(
+      (raw["messageCornerScale"] as? NSNumber)?.doubleValue
+        ?? (raw["messageCornerScale"] as? Double)
+        ?? Double(base.messageCornerScale)
+    )
+    let animationsEnabled =
+      parseBool(raw["animationsEnabled"])
+      ?? parseBool(raw["animations"])
+      ?? base.animationsEnabled
+
+    return ChatAppearancePreviewSpec(
+      mode: mode,
+      themeId: themeId,
+      wallpaperKind: wallpaperKind,
+      wallpaperValue: wallpaperValue,
+      accent: accent,
+      bubbleGradientTop: gradientStops[0],
+      bubbleGradientBottom: gradientStops.count > 1 ? gradientStops[1] : gradientStops[0],
+      textScale: textScale,
+      messageCornerScale: messageCornerScale,
+      animationsEnabled: animationsEnabled
+    )
+  }
+
+  /// Portable dictionary for persistence / Settings wiring.
+  var asDictionary: [String: Any] {
+    [
+      "mode": mode.rawValue,
+      "themeId": themeId,
+      "wallpaperKind": wallpaperKind.rawValue,
+      "wallpaperValue": wallpaperValue,
+      "accentColor": chatAppearanceColorHex(accent),
+      "bubbleGradient": [
+        chatAppearanceColorHex(bubbleGradientTop),
+        chatAppearanceColorHex(bubbleGradientBottom),
+      ],
+      "textScale": Double(textScale),
+      "messageCornerScale": Double(messageCornerScale),
+      "animationsEnabled": animationsEnabled,
+    ]
+  }
+
+  static func == (lhs: ChatAppearancePreviewSpec, rhs: ChatAppearancePreviewSpec) -> Bool {
+    lhs.mode == rhs.mode
+      && lhs.themeId == rhs.themeId
+      && lhs.wallpaperKind == rhs.wallpaperKind
+      && lhs.wallpaperValue == rhs.wallpaperValue
+      && colorKey(lhs.accent) == colorKey(rhs.accent)
+      && colorKey(lhs.bubbleGradientTop) == colorKey(rhs.bubbleGradientTop)
+      && colorKey(lhs.bubbleGradientBottom) == colorKey(rhs.bubbleGradientBottom)
+      && abs(lhs.textScale - rhs.textScale) < 0.0001
+      && abs(lhs.messageCornerScale - rhs.messageCornerScale) < 0.0001
+      && lhs.animationsEnabled == rhs.animationsEnabled
+  }
+}
+
+/// Semantic tokens views should consume instead of hard-coded theme colors.
+struct ChatAppearanceSemanticTokens: Equatable {
+  let isDark: Bool
+  let wallpaperGradient: [UIColor]
+  let wallpaperPatternGradient: [UIColor]
+  let wallpaperPatternLocations: [NSNumber]?
+  let wallpaperPatternOpacity: CGFloat
+  let wallpaperMaskKey: String?
+  let backgroundMode: String
+  let bubbleMeGradient: [UIColor]
+  let bubbleThemGradient: [UIColor]
+  let bubbleThemColor: UIColor
+  let textColorMe: UIColor
+  let textColorThem: UIColor
+  let timeColorMe: UIColor
+  let timeColorThem: UIColor
+  let accent: UIColor
+  let textScale: CGFloat
+  let messageCornerRadius: CGFloat
+  let animationsEnabled: Bool
+  let insertionAnimationMode: Int
+
+  /// Resolve tokens from a settings spec. Does not touch the chat engine.
+  static func resolve(
+    from spec: ChatAppearancePreviewSpec,
+    traitCollection: UITraitCollection = UITraitCollection.current
+  ) -> ChatAppearanceSemanticTokens {
+    let isDark = spec.mode.resolvedIsDark(traitCollection: traitCollection)
+    let base = ChatListAppearance.from(raw: [
+      "nativeThemeId": spec.themeId,
+      "nativeThemeIsDark": isDark,
+      "backgroundMode": "gradient",
+      "wallpaperOpacity": 1.0,
+      "insertionAnimationMode": spec.animationsEnabled ? 2 : 0,
+    ])
+
+    let bubbleMe = [spec.bubbleGradientTop, spec.bubbleGradientBottom]
+    let textScale = min(1.35, max(0.85, spec.textScale))
+    let cornerScale = min(1.4, max(0.6, spec.messageCornerScale))
+    let baseCorner: CGFloat = 16.0
+    let messageCornerRadius = baseCorner * cornerScale
+
+    var wallpaperGradient = base.wallpaperGradient
+    var wallpaperMaskKey = base.wallpaperMaskKey
+    var wallpaperPatternGradient = base.wallpaperPatternGradient
+    var wallpaperPatternOpacity = base.wallpaperPatternOpacity
+    var wallpaperPatternLocations = base.wallpaperPatternLocations
+    var backgroundMode = base.backgroundMode
+
+    switch spec.wallpaperKind {
+    case .builtin:
+      let key = spec.wallpaperValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+      if !key.isEmpty {
+        wallpaperMaskKey = key
+      }
+      backgroundMode = "gradient"
+    case .solid:
+      if let solid = parseColor(spec.wallpaperValue) {
+        wallpaperGradient = [solid, solid]
+        wallpaperMaskKey = nil
+        wallpaperPatternOpacity = 0
+        wallpaperPatternGradient = []
+        backgroundMode = "gradient"
+      }
+    case .gradient:
+      let stops = spec.wallpaperValue
+        .split(separator: ",")
+        .compactMap { parseColor(String($0)) }
+      if stops.count >= 2 {
+        wallpaperGradient = stops
+      }
+      wallpaperMaskKey = nil
+      wallpaperPatternOpacity = 0
+      wallpaperPatternGradient = []
+      backgroundMode = "gradient"
+    case .custom:
+      // Custom images remain local; preview keeps theme gradient as stand-in.
+      backgroundMode = base.backgroundMode
+    }
+
+    return ChatAppearanceSemanticTokens(
+      isDark: isDark,
+      wallpaperGradient: wallpaperGradient,
+      wallpaperPatternGradient: wallpaperPatternGradient,
+      wallpaperPatternLocations: wallpaperPatternLocations,
+      wallpaperPatternOpacity: wallpaperPatternOpacity,
+      wallpaperMaskKey: wallpaperMaskKey,
+      backgroundMode: backgroundMode,
+      bubbleMeGradient: bubbleMe,
+      bubbleThemGradient: base.bubbleThemGradient,
+      bubbleThemColor: base.bubbleThemColor,
+      textColorMe: base.textColorMe,
+      textColorThem: base.textColorThem,
+      timeColorMe: base.timeColorMe,
+      timeColorThem: base.timeColorThem,
+      accent: spec.accent,
+      textScale: textScale,
+      messageCornerRadius: messageCornerRadius,
+      animationsEnabled: spec.animationsEnabled,
+      insertionAnimationMode: spec.animationsEnabled ? 2 : 0
+    )
+  }
+
+  /// Project tokens into a `ChatListAppearance` for chat surfaces / previews.
+  var asChatListAppearance: ChatListAppearance {
+    ChatListAppearance(
+      backgroundMode: backgroundMode,
+      wallpaperGradient: wallpaperGradient,
+      wallpaperOpacity: 1.0,
+      wallpaperPatternGradient: wallpaperPatternGradient,
+      wallpaperPatternLocations: wallpaperPatternLocations,
+      wallpaperPatternOpacity: wallpaperPatternOpacity,
+      wallpaperMaskKey: wallpaperMaskKey,
+      bubbleMeGradient: bubbleMeGradient,
+      bubbleThemGradient: bubbleThemGradient,
+      bubbleThemColor: bubbleThemColor,
+      textColorMe: textColorMe,
+      textColorThem: textColorThem,
+      timeColorMe: timeColorMe,
+      timeColorThem: timeColorThem,
+      dayTextColor: colorWithAlpha(textColorThem, isDark ? 0.90 : 0.84),
+      dayBackgroundColor: colorWithAlpha(bubbleThemColor, isDark ? 0.84 : 0.76),
+      dayBorderColor: colorWithAlpha(textColorThem, isDark ? 0.08 : 0.10),
+      insertionAnimationMode: insertionAnimationMode,
+      accent: accent,
+      messageCornerRadius: messageCornerRadius,
+      wallpaperScrollGradient: []
+    )
+  }
+
+  static func == (lhs: ChatAppearanceSemanticTokens, rhs: ChatAppearanceSemanticTokens) -> Bool {
+    lhs.isDark == rhs.isDark
+      && lhs.backgroundMode == rhs.backgroundMode
+      && lhs.wallpaperMaskKey == rhs.wallpaperMaskKey
+      && abs(lhs.wallpaperPatternOpacity - rhs.wallpaperPatternOpacity) < 0.0001
+      && abs(lhs.textScale - rhs.textScale) < 0.0001
+      && abs(lhs.messageCornerRadius - rhs.messageCornerRadius) < 0.0001
+      && lhs.animationsEnabled == rhs.animationsEnabled
+      && lhs.insertionAnimationMode == rhs.insertionAnimationMode
+      && lhs.wallpaperGradient.map(colorKey) == rhs.wallpaperGradient.map(colorKey)
+      && lhs.wallpaperPatternGradient.map(colorKey) == rhs.wallpaperPatternGradient.map(colorKey)
+      && lhs.bubbleMeGradient.map(colorKey) == rhs.bubbleMeGradient.map(colorKey)
+      && lhs.bubbleThemGradient.map(colorKey) == rhs.bubbleThemGradient.map(colorKey)
+      && colorKey(lhs.bubbleThemColor) == colorKey(rhs.bubbleThemColor)
+      && colorKey(lhs.textColorMe) == colorKey(rhs.textColorMe)
+      && colorKey(lhs.textColorThem) == colorKey(rhs.textColorThem)
+      && colorKey(lhs.accent) == colorKey(rhs.accent)
+  }
+}
+
+extension ChatListAppearance {
+  /// Resolve chat appearance from a settings preview spec (additive helper).
+  static func from(
+    previewSpec: ChatAppearancePreviewSpec,
+    traitCollection: UITraitCollection = .current
+  ) -> ChatListAppearance {
+    ChatAppearanceSemanticTokens.resolve(from: previewSpec, traitCollection: traitCollection)
+      .asChatListAppearance
+  }
+}
+
+// MARK: Live preview surface
+
+/// UIKit live chat preview. Push a new `ChatAppearancePreviewSpec` via `apply`
+/// as the user adjusts Settings controls — wallpaper + mock bubbles update from
+/// semantic tokens.
+final class ChatAppearanceLivePreview: UIView {
+  private(set) var spec: ChatAppearancePreviewSpec
+  private var tokens: ChatAppearanceSemanticTokens
+
+  private let wallpaperLayer = CAGradientLayer()
+  private let patternLayer = CAGradientLayer()
+  private let patternMaskLayer = CALayer()
+  private let chatContainer = UIView()
+  private let stack = UIStackView()
+  private var bubbleRows: [ChatAppearancePreviewBubbleRow] = []
+
+  private let mockMessages: [(text: String, isMe: Bool)] = [
+    ("Your appearance updates live.", false),
+    ("Wallpaper, bubbles, and type scale.", true),
+    ("Looks good — ship it.", false),
+  ]
+
+  /// Preferred height when embedded unconstrained (width is flexible).
+  var preferredHeight: CGFloat = 220 {
+    didSet { invalidateIntrinsicContentSize() }
+  }
+
+  override var intrinsicContentSize: CGSize {
+    CGSize(width: UIView.noIntrinsicMetric, height: preferredHeight)
+  }
+
+  convenience init() {
+    self.init(spec: .default)
+  }
+
+  init(spec: ChatAppearancePreviewSpec) {
+    self.spec = spec
+    self.tokens = ChatAppearanceSemanticTokens.resolve(from: spec)
+    super.init(frame: .zero)
+    commonInit()
+    apply(spec, animated: false)
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  private func commonInit() {
+    clipsToBounds = true
+    layer.cornerRadius = 22
+    layer.cornerCurve = .continuous
+
+    wallpaperLayer.startPoint = CGPoint(x: 0, y: 0)
+    wallpaperLayer.endPoint = CGPoint(x: 1, y: 1)
+    layer.insertSublayer(wallpaperLayer, at: 0)
+
+    patternLayer.startPoint = CGPoint(x: 0, y: 0)
+    patternLayer.endPoint = CGPoint(x: 1, y: 1)
+    patternLayer.mask = patternMaskLayer
+    patternLayer.isHidden = true
+    layer.insertSublayer(patternLayer, above: wallpaperLayer)
+
+    chatContainer.backgroundColor = .clear
+    chatContainer.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(chatContainer)
+
+    stack.axis = .vertical
+    stack.spacing = 8
+    stack.alignment = .fill
+    stack.translatesAutoresizingMaskIntoConstraints = false
+    chatContainer.addSubview(stack)
+
+    NSLayoutConstraint.activate([
+      chatContainer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+      chatContainer.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+      chatContainer.topAnchor.constraint(equalTo: topAnchor, constant: 16),
+      chatContainer.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -16),
+      stack.leadingAnchor.constraint(equalTo: chatContainer.leadingAnchor),
+      stack.trailingAnchor.constraint(equalTo: chatContainer.trailingAnchor),
+      stack.centerYAnchor.constraint(equalTo: chatContainer.centerYAnchor),
+    ])
+
+    for message in mockMessages {
+      let row = ChatAppearancePreviewBubbleRow()
+      row.configure(text: message.text, isMe: message.isMe)
+      bubbleRows.append(row)
+      stack.addArrangedSubview(row)
+    }
+
+    isAccessibilityElement = true
+    accessibilityTraits = .updatesFrequently
+    accessibilityLabel = "Chat appearance live preview"
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    wallpaperLayer.frame = bounds
+    patternLayer.frame = bounds
+    patternMaskLayer.frame = patternLayer.bounds
+  }
+
+  override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+    super.traitCollectionDidChange(previousTraitCollection)
+    if spec.mode == .system {
+      apply(spec, animated: false)
+    }
+  }
+
+  /// Apply a new settings snapshot. No-ops when the spec is unchanged.
+  /// Animation is gated by both `animated` and `spec.animationsEnabled`.
+  func apply(_ next: ChatAppearancePreviewSpec, animated: Bool = true) {
+    let nextTokens = ChatAppearanceSemanticTokens.resolve(
+      from: next,
+      traitCollection: traitCollection
+    )
+    if next == spec, nextTokens == tokens {
+      return
+    }
+    let shouldAnimate = animated && next.animationsEnabled && tokens != nextTokens
+    spec = next
+    tokens = nextTokens
+    render(animated: shouldAnimate)
+  }
+
+  /// Apply from an already-resolved chat appearance (text/corner scales optional).
+  func apply(
+    appearance: ChatListAppearance,
+    textScale: CGFloat = 1.0,
+    messageCornerScale: CGFloat = 1.0,
+    animationsEnabled: Bool = true,
+    accent: UIColor? = nil,
+    animated: Bool = true
+  ) {
+    let meTop = appearance.bubbleMeGradient.first ?? ChatListAppearance.brandAccentFallback
+    let meBottom = appearance.bubbleMeGradient.last ?? meTop
+    let kind: ChatAppearanceWallpaperKind
+    let value: String
+    if let mask = appearance.wallpaperMaskKey, !mask.isEmpty {
+      kind = .builtin
+      value = mask
+    } else {
+      kind = .gradient
+      value = appearance.wallpaperGradient.map { chatAppearanceColorHex($0) }.joined(separator: ",")
+    }
+    let bridged = ChatAppearancePreviewSpec(
+      mode: appearance.isDark ? .dark : .light,
+      themeId: "glacier",
+      wallpaperKind: kind,
+      wallpaperValue: value,
+      accent: accent ?? meTop,
+      bubbleGradientTop: meTop,
+      bubbleGradientBottom: meBottom,
+      textScale: textScale,
+      messageCornerScale: messageCornerScale,
+      animationsEnabled: animationsEnabled
+    )
+    // Prefer the provided ChatListAppearance for wallpaper/bubbles rather than
+    // re-resolving a theme id.
+    let nextTokens = ChatAppearanceSemanticTokens(
+      isDark: appearance.isDark,
+      wallpaperGradient: appearance.wallpaperGradient,
+      wallpaperPatternGradient: appearance.wallpaperPatternGradient,
+      wallpaperPatternLocations: appearance.wallpaperPatternLocations,
+      wallpaperPatternOpacity: appearance.wallpaperPatternOpacity,
+      wallpaperMaskKey: appearance.wallpaperMaskKey,
+      backgroundMode: appearance.backgroundMode,
+      bubbleMeGradient: appearance.bubbleMeGradient,
+      bubbleThemGradient: appearance.bubbleThemGradient,
+      bubbleThemColor: appearance.bubbleThemColor,
+      textColorMe: appearance.textColorMe,
+      textColorThem: appearance.textColorThem,
+      timeColorMe: appearance.timeColorMe,
+      timeColorThem: appearance.timeColorThem,
+      accent: accent ?? meTop,
+      textScale: min(1.35, max(0.85, textScale)),
+      messageCornerRadius: 16.0 * min(1.4, max(0.6, messageCornerScale)),
+      animationsEnabled: animationsEnabled,
+      insertionAnimationMode: appearance.insertionAnimationMode
+    )
+    let shouldAnimate = animated && animationsEnabled && tokens != nextTokens
+    spec = bridged
+    tokens = nextTokens
+    render(animated: shouldAnimate)
+  }
+
+  private func render(animated: Bool) {
+    let applyVisuals = { [weak self] in
+      guard let self else { return }
+      self.wallpaperLayer.colors = self.tokens.wallpaperGradient.map(\.cgColor)
+      self.wallpaperLayer.opacity = self.tokens.backgroundMode == "transparent" ? 0 : 1
+
+      let canShowPattern =
+        self.tokens.backgroundMode != "transparent"
+        && self.tokens.wallpaperPatternGradient.count >= 2
+        && self.tokens.wallpaperPatternOpacity > 0.001
+        && (self.tokens.wallpaperMaskKey?.isEmpty == false)
+
+      if canShowPattern,
+        let maskKey = self.tokens.wallpaperMaskKey,
+        let mask = ChatWallpaperMaskStore.image(forKey: maskKey)
+      {
+        self.patternLayer.colors = self.tokens.wallpaperPatternGradient.map(\.cgColor)
+        self.patternLayer.locations = self.tokens.wallpaperPatternLocations
+        self.patternLayer.opacity = Float(
+          max(0, min(1, self.tokens.wallpaperPatternOpacity)))
+        self.patternMaskLayer.contents = mask
+        self.patternMaskLayer.contentsGravity = .resizeAspectFill
+        self.patternLayer.isHidden = false
+      } else {
+        self.patternLayer.isHidden = true
+        self.patternLayer.colors = nil
+        self.patternMaskLayer.contents = nil
+      }
+
+      let containerSize =
+        self.bounds.width > 1
+        ? self.bounds.size
+        : CGSize(width: 280, height: self.preferredHeight)
+      for (index, row) in self.bubbleRows.enumerated() {
+        row.apply(
+          tokens: self.tokens,
+          containerSize: containerSize,
+          sampleY: CGFloat(index) * 44
+        )
+      }
+
+      self.layer.borderWidth = 1
+      self.layer.borderColor =
+        (self.tokens.isDark
+          ? UIColor.white.withAlphaComponent(0.10)
+          : UIColor.black.withAlphaComponent(0.08)).cgColor
+      self.accessibilityValue =
+        "Theme \(self.spec.themeId), text scale \(String(format: "%.2f", self.tokens.textScale))"
+    }
+
+    if animated {
+      UIView.transition(
+        with: self,
+        duration: 0.28,
+        options: [.transitionCrossDissolve, .allowUserInteraction],
+        animations: applyVisuals
+      )
+    } else {
+      applyVisuals()
+    }
+  }
+}
+
+/// SwiftUI wrapper for Settings embedding.
+/// Integrator: `ChatAppearanceLivePreviewView(spec: currentSpec)`.
+struct ChatAppearanceLivePreviewView: UIViewRepresentable {
+  var spec: ChatAppearancePreviewSpec
+  var preferredHeight: CGFloat = 220
+
+  func makeUIView(context: Context) -> ChatAppearanceLivePreview {
+    let view = ChatAppearanceLivePreview(spec: spec)
+    view.preferredHeight = preferredHeight
+    return view
+  }
+
+  func updateUIView(_ uiView: ChatAppearanceLivePreview, context: Context) {
+    uiView.preferredHeight = preferredHeight
+    uiView.apply(spec, animated: spec.animationsEnabled)
+  }
+}
+
+// MARK: - Preview internals
+
+private final class ChatAppearancePreviewBubbleRow: UIView {
+  private let bubble = ChatAppearancePreviewBubbleView()
+  private var isMe = false
+  private var leadingConstraint: NSLayoutConstraint?
+  private var trailingConstraint: NSLayoutConstraint?
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    bubble.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(bubble)
+    let leading = bubble.leadingAnchor.constraint(equalTo: leadingAnchor)
+    let trailing = bubble.trailingAnchor.constraint(equalTo: trailingAnchor)
+    let maxWidth = bubble.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, multiplier: 0.78)
+    NSLayoutConstraint.activate([
+      bubble.topAnchor.constraint(equalTo: topAnchor),
+      bubble.bottomAnchor.constraint(equalTo: bottomAnchor),
+      maxWidth,
+    ])
+    leadingConstraint = leading
+    trailingConstraint = trailing
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  func configure(text: String, isMe: Bool) {
+    self.isMe = isMe
+    bubble.configure(text: text, isMe: isMe)
+    leadingConstraint?.isActive = !isMe
+    trailingConstraint?.isActive = isMe
+  }
+
+  func apply(
+    tokens: ChatAppearanceSemanticTokens,
+    containerSize: CGSize,
+    sampleY: CGFloat
+  ) {
+    leadingConstraint?.isActive = !isMe
+    trailingConstraint?.isActive = isMe
+    bubble.apply(
+      tokens: tokens,
+      isMe: isMe,
+      containerSize: containerSize,
+      sampleY: sampleY
+    )
+  }
+}
+
+private final class ChatAppearancePreviewBubbleView: UIView {
+  private let gradientLayer = CAGradientLayer()
+  private let label = UILabel()
+  private var isMe = false
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    clipsToBounds = true
+    gradientLayer.startPoint = CGPoint(x: 0, y: 0)
+    gradientLayer.endPoint = CGPoint(x: 1, y: 1)
+    layer.insertSublayer(gradientLayer, at: 0)
+
+    label.numberOfLines = 0
+    label.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(label)
+    NSLayoutConstraint.activate([
+      label.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+      label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
+      label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+      label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+    ])
+    setContentHuggingPriority(.required, for: .horizontal)
+    setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  func configure(text: String, isMe: Bool) {
+    self.isMe = isMe
+    label.text = text
+  }
+
+  func apply(
+    tokens: ChatAppearanceSemanticTokens,
+    isMe: Bool,
+    containerSize: CGSize,
+    sampleY: CGFloat
+  ) {
+    self.isMe = isMe
+    let fontSize = 13.0 * tokens.textScale
+    label.font = .systemFont(ofSize: fontSize, weight: .medium)
+    label.textColor = isMe ? tokens.textColorMe : tokens.textColorThem
+    label.textAlignment = .left
+
+    let radius = tokens.messageCornerRadius
+    layer.cornerRadius = radius
+    if #available(iOS 13.0, *) {
+      layer.cornerCurve = .continuous
+    }
+
+    if isMe {
+      gradientLayer.isHidden = false
+      gradientLayer.colors = tokens.bubbleMeGradient.map(\.cgColor)
+      backgroundColor = .clear
+    } else {
+      gradientLayer.isHidden = true
+      gradientLayer.colors = nil
+      let appearance = tokens.asChatListAppearance
+      let plate = appearance.wallpaperPlateColor(
+        isMe: false,
+        sampleRect: CGRect(x: 0, y: sampleY, width: containerSize.width * 0.55, height: 36),
+        containerSize: containerSize
+      )
+      backgroundColor = plate
+    }
+    invalidateIntrinsicContentSize()
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    gradientLayer.frame = bounds
+  }
+
+  override var intrinsicContentSize: CGSize {
+    let maxLabelWidth: CGFloat = 220
+    let labelSize = label.sizeThatFits(
+      CGSize(width: maxLabelWidth, height: CGFloat.greatestFiniteMagnitude)
+    )
+    return CGSize(
+      width: min(maxLabelWidth, labelSize.width) + 24,
+      height: max(32, labelSize.height + 16)
+    )
+  }
+}
+
+private func chatAppearanceColorHex(_ color: UIColor) -> String {
+  var r: CGFloat = 0
+  var g: CGFloat = 0
+  var b: CGFloat = 0
+  var a: CGFloat = 0
+  if color.getRed(&r, green: &g, blue: &b, alpha: &a) {
+    let ri = Int(round(r * 255))
+    let gi = Int(round(g * 255))
+    let bi = Int(round(b * 255))
+    if a < 0.999 {
+      let ai = Int(round(a * 255))
+      return String(format: "#%02X%02X%02X%02X", ri, gi, bi, ai)
+    }
+    return String(format: "#%02X%02X%02X", ri, gi, bi)
+  }
+  return "#000000"
 }

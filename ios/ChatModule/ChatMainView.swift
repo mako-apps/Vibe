@@ -1388,8 +1388,8 @@ public final class ChatMainView: UIView,
     avatarFallbackLabel.isHidden = false
 
     chatHeaderStack.axis = .vertical
-    // Center title + subtitle group (Connecting / Updating / presence all align mid).
-    chatHeaderStack.alignment = .center
+    // Leading-aligned (next to avatar) — only Home principal is centered.
+    chatHeaderStack.alignment = .leading
     chatHeaderStack.distribution = .fill
     chatHeaderStack.spacing = -1
 
@@ -1400,12 +1400,12 @@ public final class ChatMainView: UIView,
 
     [chatTitleLabel, profileTitleLabel].forEach { label in
       label.font = UIFont.systemFont(ofSize: 16, weight: .semibold)
-      label.textAlignment = .center
+      label.textAlignment = .left
       label.lineBreakMode = .byTruncatingTail
     }
     [chatSubtitleLabel, profileSubtitleLabel].forEach { label in
       label.font = UIFont.systemFont(ofSize: 12, weight: .medium)
-      label.textAlignment = .center
+      label.textAlignment = .left
       label.lineBreakMode = .byTruncatingTail
       label.isHidden = true
     }
@@ -1957,23 +1957,6 @@ public final class ChatMainView: UIView,
     }
   }
 
-  private func refreshPresenceStateFromEngine(force: Bool = false) {
-    guard !enginePeerUserId.isEmpty else { return }
-    let engineOnline = ChatEngine.shared.isUserOnline(userId: enginePeerUserId)
-    let nextOnline = engineOnline || (surfacePresenceOnline == true)
-    let nextLastSeen =
-      nextOnline
-      ? nil
-      : ChatEngine.shared.lastSeenTimestampMs(userId: enginePeerUserId)
-    guard
-      force || nextOnline != isOnline || nextLastSeen != engineLastSeenTimestampMs
-    else { return }
-    isOnline = nextOnline
-    engineLastSeenTimestampMs = nextLastSeen
-    applyTheme()
-    updateHeaderTexts()
-    updateProfileTexts()
-  }
 
   /// Merge a raw engine typing set into the sticky displayed set. Additions show
   /// immediately; a member only leaves once it hasn't been seen typing for the hold
@@ -2022,60 +2005,7 @@ public final class ChatMainView: UIView,
     groupTypingUserIds = []
   }
 
-  private func refreshTypingStateFromEngine(force: Bool = false) {
-    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
 
-    guard isGroupOrChannel else {
-      let nextDirectTyping =
-        !chatId.isEmpty
-        ? ChatEngine.shared.isTyping(["chatId": chatId])
-        : false
-      guard
-        force
-          || !groupTypingUserIds.isEmpty
-          || nextDirectTyping != directPeerTypingActive
-      else { return }
-      clearGroupTypingDisplay()
-      directPeerTypingActive = nextDirectTyping
-      updateHeaderTexts()
-      updateProfileTexts()
-      return
-    }
-    guard !chatId.isEmpty else {
-      guard force || !groupTypingUserIds.isEmpty || directPeerTypingActive else { return }
-      clearGroupTypingDisplay()
-      directPeerTypingActive = false
-      updateHeaderTexts()
-      updateProfileTexts()
-      return
-    }
-    let next = ChatEngine.shared.typingUserIds(chatId: chatId)
-    guard updateGroupTypingDisplay(next, force: force) || directPeerTypingActive else { return }
-    directPeerTypingActive = false
-    updateHeaderTexts()
-    updateProfileTexts()
-  }
-
-  private func refreshPinnedBannerFromEngine(force: Bool = false) {
-    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !chatId.isEmpty else {
-      guard force || pinnedBannerMessageId != nil || pinnedBannerBody != nil || !pinnedBannerView.isHidden else { return }
-      VibeDebugLog.log("[ChatMainView][Pin] clear banner: empty engineChatId force=%@", force ? "true" : "false")
-      pinnedBannerMessageId = nil
-      pinnedBannerTitle = nil
-      pinnedBannerBody = nil
-      pinnedBannerMediaUrl = nil
-      pinnedBannerFileName = nil
-      pinnedBannerIsFile = false
-      pinnedBannerView.isHidden = true
-      pinnedBannerView.alpha = 0.0
-      setNeedsLayout()
-      return
-    }
-
-    let payload = ChatEngine.shared.getPinnedMessages(["chatId": chatId])
-    applyPinnedBannerPayload(chatId: chatId, payload: payload, force: force)
-  }
 
   private func applyPinnedBannerPayload(
     chatId: String,
@@ -2314,75 +2244,6 @@ public final class ChatMainView: UIView,
     return component.removingPercentEncoding ?? component
   }
 
-  private func refreshProfileSummaryFromEngine(force: Bool = false) {
-    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !chatId.isEmpty else {
-      if force || profileSummaryMessageCount != 0 || profileSummaryMediaCount != 0
-        || profileSummaryFileCount != 0 || profileSummaryLinkCount != 0
-        || profileSummaryHistoryLoaded || !profileSummaryRecentFiles.isEmpty
-        || !profileMediaItems.isEmpty
-        || !profileMusicItems.isEmpty || !profileFileItems.isEmpty || !profileLinkItems.isEmpty
-        || !profilePinnedItems.isEmpty
-      {
-        profileSummaryMessageCount = 0
-        profileSummaryMediaCount = 0
-        profileSummaryFileCount = 0
-        profileSummaryLinkCount = 0
-        profileSummaryRecentFiles = []
-        profileSummaryHistoryLoaded = false
-        profileMediaItems = []
-        profileMusicItems = []
-        profileFileItems = []
-        profileLinkItems = []
-        profilePinnedItems = []
-        rebuildProfileTabs()
-        profileTabContentNeedsReload = true
-        updateProfileTexts()
-      }
-      return
-    }
-
-    let summary = ChatEngine.shared.getChatProfileSummary(["chatId": chatId])
-    let nextMessageCount = (summary["totalMessages"] as? Int) ?? 0
-    let nextMediaCount = (summary["mediaCount"] as? Int) ?? 0
-    let nextFileCount = (summary["fileCount"] as? Int) ?? 0
-    let nextLinkCount = (summary["linkCount"] as? Int) ?? 0
-    let nextRecentFiles = (summary["recentFiles"] as? [String]) ?? []
-    let nextHistoryLoaded = (summary["historyLoaded"] as? Bool) ?? false
-    let rows = ChatEngine.shared.getChatRows(["chatId": chatId])
-    let parsed = buildProfileContent(rows: rows)
-
-    let summaryChanged =
-      nextMessageCount != profileSummaryMessageCount
-      || nextMediaCount != profileSummaryMediaCount
-      || nextFileCount != profileSummaryFileCount
-      || nextLinkCount != profileSummaryLinkCount
-      || nextHistoryLoaded != profileSummaryHistoryLoaded
-      || nextRecentFiles != profileSummaryRecentFiles
-    let contentChanged =
-      parsed.mediaItems != profileMediaItems
-      || parsed.musicItems != profileMusicItems
-      || parsed.fileItems != profileFileItems
-      || parsed.linkItems != profileLinkItems
-      || parsed.pinnedItems != profilePinnedItems
-
-    guard force || summaryChanged || contentChanged else { return }
-
-    profileSummaryMessageCount = nextMessageCount
-    profileSummaryMediaCount = nextMediaCount
-    profileSummaryFileCount = nextFileCount
-    profileSummaryLinkCount = nextLinkCount
-    profileSummaryRecentFiles = nextRecentFiles
-    profileSummaryHistoryLoaded = nextHistoryLoaded
-    profileMediaItems = parsed.mediaItems
-    profileMusicItems = parsed.musicItems
-    profileFileItems = parsed.fileItems
-    profileLinkItems = parsed.linkItems
-    profilePinnedItems = parsed.pinnedItems
-    rebuildProfileTabs()
-    profileTabContentNeedsReload = true
-    updateProfileTexts()
-  }
 
   private func buildProfileContent(rows: [[String: Any]]) -> (
     mediaItems: [ChatMainProfileMediaItem],
@@ -4077,12 +3938,6 @@ public final class ChatMainView: UIView,
     profileWallpaperPatternMaskLayer.contents = nil
   }
 
-  private func resolvedWallpaperMaskImage(for key: String) -> CGImage? {
-    ChatWallpaperMaskStore.image(
-      forKey: key,
-      bundles: [Bundle.main, Bundle(for: ChatMainView.self), Bundle(for: ChatListView.self)]
-    )
-  }
 
   private func updateHeaderTexts() {
     // The header title is always the plain contact/agent name — like any other DM, no
@@ -4187,8 +4042,8 @@ public final class ChatMainView: UIView,
 
     chatTitleLabel.text = resolvedTitle
     chatSubtitleLabel.text = resolvedSubtitle
-    // Dot + line spinner + Connecting/Updating (synced with Home). Spinner/dot
-    // slots stay in layout (alpha only) so subtitle text doesn't jump.
+    // Line spinner + Connecting/Updating text — no status dot on connection chrome.
+    // Spinner slot stays in layout (alpha only) so subtitle text doesn't jump.
     let showsConnectionChrome =
       connectionPhase != .none
       && (resolvedSubtitle == "Connecting" || resolvedSubtitle == "Updating")
@@ -4198,15 +4053,9 @@ public final class ChatMainView: UIView,
       chatConnectingSpinner.startAnimating()
       chatConnectingSpinner.alpha = 1
       chatSubtitleLabel.isHidden = false
-      // Status dot for Connecting (amber) / Updating (accent) — same idea as Home.
-      chatSubtitleDotView.isHidden = false
-      chatSubtitleDotView.backgroundColor =
-        connectionPhase == .connecting
-        ? UIColor(red: 1.0, green: 0.72, blue: 0.18, alpha: 1.0)
-        : (appearance.bubbleMeGradient.last
-          ?? appearance.bubbleMeGradient.first
-          ?? UIColor.systemBlue)
-      setSubtitleDotPulsing(connectionPhase == .connecting)
+      // Connection chrome: never show the bridge/status colored dot.
+      chatSubtitleDotView.isHidden = true
+      setSubtitleDotPulsing(false)
     } else {
       chatConnectingSpinner.stopAnimating()
       // Keep the slot: do not collapse with isHidden (that shifts text left).
@@ -4704,14 +4553,16 @@ public final class ChatMainView: UIView,
     case updating
   }
 
-  /// Same tree as Home principal: Connecting (offline/socket) → Updating (history
-  /// / catch-up while connected) → none (ready).
+  /// Connecting only for network-off / blocked-to-server. Updating for history catch-up.
+  /// Bootstrap / mid-configure must not flash "Connecting".
   private func resolvedConnectionHeaderPhase() -> ConnectionHeaderPhase {
-    if isEngineConnectedForHeader() {
-      if isHistoryOrCatchUpUpdating() { return .updating }
-      return .none
+    if isOfflineOrBlockedToServerForHeader() {
+      return .connecting
     }
-    return .connecting
+    if isHistoryOrCatchUpUpdating() {
+      return .updating
+    }
+    return .none
   }
 
   private func isEngineConnectedForHeader() -> Bool {
@@ -4722,6 +4573,24 @@ public final class ChatMainView: UIView,
       .trimmingCharacters(in: .whitespacesAndNewlines)
       .lowercased() ?? ""
     return stateValue == "native-socket-open" || stateValue == "connected-shadow"
+  }
+
+  private func isOfflineOrBlockedToServerForHeader() -> Bool {
+    if isEngineConnectedForHeader() { return false }
+    let status = ChatEngine.shared.getStatus()
+    let stateValue =
+      (status["state"] as? String)?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased() ?? ""
+    return stateValue == "offline"
+      || stateValue == "disconnected"
+      || stateValue == "native-socket-closed"
+      || stateValue == "native-connect-stale"
+      || stateValue == "native-config-missing"
+      || stateValue.contains("disconnect")
+      || stateValue.contains("unreachable")
+      || stateValue.contains("fail")
+      || stateValue.contains("error")
   }
 
   /// True while history / session payload is applying for this chat (Updating only).
@@ -4738,19 +4607,7 @@ public final class ChatMainView: UIView,
     false
   }
 
-  /// Legacy name kept for call sites; connection chrome is phase-driven now.
-  private func shouldShowConnectingSpinner() -> Bool {
-    resolvedConnectionHeaderPhase() != .none
-  }
 
-  /// Legacy name kept for call sites that still want a string.
-  private func resolvedEngineConnectionSubtitle() -> String? {
-    switch resolvedConnectionHeaderPhase() {
-    case .connecting: return "Connecting"
-    case .updating: return "Updating"
-    case .none: return nil
-    }
-  }
 
   private func formatLastSeenSubtitle(_ timestampMs: Int64) -> String {
     let date = Date(timeIntervalSince1970: TimeInterval(timestampMs) / 1000.0)
@@ -4783,19 +4640,17 @@ public final class ChatMainView: UIView,
   }
 
   private func updateAvatarViews() {
-    avatarResolveGeneration &+= 1
-    let generation = avatarResolveGeneration
-    avatarLoadTask?.cancel()
-    avatarLoadTask = nil
-
     if headerMode == .savedMessages {
+      avatarLoadTask?.cancel()
+      avatarLoadTask = nil
+      avatarResolveGeneration &+= 1
       avatarImageView.isHidden = true
       profileAvatarImageView.isHidden = true
       avatarFallbackIconView.isHidden = false
       avatarFallbackLabel.isHidden = true
       profileAvatarFallbackIconView.isHidden = false
       profileAvatarFallbackLabel.isHidden = true
-      
+
       avatarFallbackIconView.image = UIImage(systemName: "bookmark.fill")
       avatarFallbackIconView.tintColor = .white
 
@@ -4811,9 +4666,6 @@ public final class ChatMainView: UIView,
         ? UIColor(red: 43 / 255, green: 165 / 255, blue: 181 / 255, alpha: 1)
         : UIColor(red: 0 / 255, green: 122 / 255, blue: 124 / 255, alpha: 1)
 
-      // Header Gradient - Removed so header avatar stays translucent glass
-
-      // Profile Gradient
       var pGradient = profileAvatarView.layer.sublayers?.first(where: { $0.name == "savedMessagesGradient" }) as? CAGradientLayer
       if pGradient == nil {
         pGradient = CAGradientLayer()
@@ -4827,44 +4679,71 @@ public final class ChatMainView: UIView,
       return
     }
 
-    // Reset default fallback icons for other cases
+    // Keep gradient layers; only remove saved-messages chrome if present.
     avatarGlassView.contentView.layer.sublayers?.removeAll(where: { $0.name == "savedMessagesGradient" })
-    avatarGlassView.contentView.layer.sublayers?.removeAll(where: { $0.name == "userAvatarGradient" })
     profileAvatarView.layer.sublayers?.removeAll(where: { $0.name == "savedMessagesGradient" })
-    profileAvatarView.layer.sublayers?.removeAll(where: { $0.name == "userAvatarGradient" })
 
-    avatarFallbackIconView.isHidden = true
-    avatarFallbackLabel.isHidden = false
     let initials = ChatHomeCardCell.getFallbackInitials(from: chatTitleLabel.text ?? "")
+    // Always keep off-screen text in sync; never force-show letters when a photo is up.
     avatarFallbackLabel.text = initials
-    
-    applyUserAvatarGradient()
-
-    profileAvatarFallbackIconView.isHidden = true
-    profileAvatarFallbackLabel.isHidden = false
     profileAvatarFallbackLabel.text = initials
+    avatarFallbackIconView.isHidden = true
+    profileAvatarFallbackIconView.isHidden = true
 
     let rawAvatar = avatarUri
     let peerUserId = enginePeerUserIdRaw
     let chatId = engineChatId
     let preferPushAvatar = !isGroupOrChannel
-    if rawAvatar.isEmpty && (!preferPushAvatar || peerUserId.isEmpty) {
+    let resolvedUri: String = {
+      if rawAvatar.isEmpty && (!preferPushAvatar || peerUserId.isEmpty) { return "" }
+      return ChatAvatarURLResolver.resolve(
+        rawAvatar: rawAvatar,
+        peerUserId: peerUserId,
+        chatId: chatId,
+        preferPushAvatar: preferPushAvatar
+      ) ?? ""
+    }()
+
+    // Stable photo: already painted for this URI — do not cancel loads or flash letters.
+    if !resolvedUri.isEmpty,
+      displayedAvatarUri == resolvedUri,
+      avatarImageView.image != nil
+    {
+      avatarImageView.isHidden = false
+      profileAvatarImageView.isHidden = false
+      showHeaderAvatarFallback(false)
+      applyUserAvatarGradient()
+      return
+    }
+
+    // Stable photoless: letters already on screen, no URL — only refresh gradient/text.
+    if resolvedUri.isEmpty,
+      avatarImageView.image == nil,
+      !avatarFallbackLabel.isHidden
+    {
+      applyUserAvatarGradient()
+      showHeaderAvatarFallback(true)
+      return
+    }
+
+    // Real change — cancel old work and load/show the correct chrome once.
+    avatarResolveGeneration &+= 1
+    let generation = avatarResolveGeneration
+    avatarLoadTask?.cancel()
+    avatarLoadTask = nil
+
+    if resolvedUri.isEmpty {
       displayedAvatarUri = nil
       avatarImageView.image = nil
       profileAvatarImageView.image = nil
       avatarImageView.isHidden = true
       profileAvatarImageView.isHidden = true
       showHeaderAvatarFallback(true)
+      applyUserAvatarGradient()
       return
     }
 
-    let resolvedUri =
-      ChatAvatarURLResolver.resolve(
-        rawAvatar: rawAvatar,
-        peerUserId: peerUserId,
-        chatId: chatId,
-        preferPushAvatar: preferPushAvatar
-      ) ?? ""
+    applyUserAvatarGradient()
     startAvatarLoad(resolvedUri: resolvedUri, generation: generation)
   }
 
@@ -4920,13 +4799,23 @@ public final class ChatMainView: UIView,
   private func showHeaderAvatarFallback(_ show: Bool) {
     avatarFallbackIconView.isHidden = true
     profileAvatarFallbackIconView.isHidden = true
-    avatarFallbackLabel.isHidden = !show
-    profileAvatarFallbackLabel.isHidden = !show
+    let nextHidden = !show
+    // Only toggle when state changes — prevents letter fade thrash on header refresh.
+    if avatarFallbackLabel.isHidden != nextHidden {
+      avatarFallbackLabel.isHidden = nextHidden
+    }
+    if profileAvatarFallbackLabel.isHidden != nextHidden {
+      profileAvatarFallbackLabel.isHidden = nextHidden
+    }
     // Header gradient tile shows only in the no-photo fallback (behind the
     // initials); a loaded photo hides it so the glass ring stays clean.
-    avatarGlassView.contentView.layer.sublayers?
-      .first(where: { $0.name == "userAvatarGradient" })?
-      .isHidden = !show
+    if let gradient = avatarGlassView.contentView.layer.sublayers?
+      .first(where: { $0.name == "userAvatarGradient" })
+    {
+      if gradient.isHidden != nextHidden {
+        gradient.isHidden = nextHidden
+      }
+    }
   }
 
   private static func color(fromHex hex: String) -> UIColor? {
@@ -4987,25 +4876,24 @@ public final class ChatMainView: UIView,
 
     if let cached = ChatAvatarImageStore.cached(for: resolvedUri) {
       displayedAvatarUri = resolvedUri
-      avatarImageView.image = cached
-      profileAvatarImageView.image = cached
+      if avatarImageView.image !== cached {
+        avatarImageView.image = cached
+        profileAvatarImageView.image = cached
+      }
       avatarImageView.isHidden = false
       profileAvatarImageView.isHidden = false
       showHeaderAvatarFallback(false)
       return
     }
 
-    if displayedAvatarUri != resolvedUri {
-      // If we already show a photo for another URI, keep it until the new one
-      // lands (no letter flash). Only clear when nothing is on screen yet.
-      if avatarImageView.image == nil {
-        avatarImageView.isHidden = true
-        profileAvatarImageView.isHidden = true
-        showHeaderAvatarFallback(true)
-        // Quiet load: hide letter while a real URL is in flight.
-        avatarFallbackLabel.isHidden = true
-        profileAvatarFallbackLabel.isHidden = true
-      }
+    // Keep previous photo while a new URI loads. If nothing is on screen yet,
+    // leave stable gradient+initials (never show-then-hide letters mid-flight).
+    if avatarImageView.image == nil {
+      avatarImageView.isHidden = true
+      profileAvatarImageView.isHidden = true
+      showHeaderAvatarFallback(true)
+    } else {
+      showHeaderAvatarFallback(false)
     }
 
     let task = Task { [weak self] in
@@ -5015,15 +4903,16 @@ public final class ChatMainView: UIView,
         guard let self, self.avatarResolveGeneration == generation else { return }
         self.avatarLoadTask = nil
         guard let image else {
-          // No photo — show modest initials only if nothing else is displayed.
           if self.avatarImageView.image == nil {
             self.showHeaderAvatarFallback(true)
           }
           return
         }
         self.displayedAvatarUri = resolvedUri
-        self.avatarImageView.image = image
-        self.profileAvatarImageView.image = image
+        if self.avatarImageView.image !== image {
+          self.avatarImageView.image = image
+          self.profileAvatarImageView.image = image
+        }
         self.avatarImageView.isHidden = false
         self.profileAvatarImageView.isHidden = false
         self.showHeaderAvatarFallback(false)
@@ -5439,33 +5328,6 @@ public final class ChatMainView: UIView,
     onNativeEvent(["type": "headerAgentPressed"])
   }
 
-  private func presentMembersPage() {
-    guard isGroupOrChannel else { return }
-    if currentPage != .profile {
-      currentPage = .profile
-      applyPageState(animated: true, emitEvent: false)
-    }
-
-    var seen = Set<String>()
-    var members: [ChatMainProfileMembersItem] = []
-    for rawId in groupMemberOrder {
-      let normalized = rawId.uppercased()
-      guard seen.insert(normalized).inserted else { continue }
-      let role = (groupMemberRoleByUserId[normalized] ?? "member").lowercased()
-      let isAdmin = role == "owner" || role == "admin"
-      members.append(
-        .init(
-          userId: normalized,
-          name: resolvedGroupMemberDisplayName(normalized),
-          roleLabel: role == "owner" ? "Owner" : (isAdmin ? "Admin" : "Member"),
-          isAdmin: isAdmin
-        )
-      )
-    }
-    profileMembersNode.setMembers(members)
-    setProfileMembersVisible(true, animated: true)
-    setNeedsLayout()
-  }
 
   // MARK: - Agent Config
 

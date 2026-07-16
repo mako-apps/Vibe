@@ -1558,23 +1558,6 @@ private func contrastingMediaForeground(for color: UIColor) -> UIColor {
     : UIColor(white: 1.0, alpha: 0.98)
 }
 
-private func resolvedIncomingVoiceButtonStyle(for appearance: ChatListAppearance)
-  -> (fill: UIColor, accent: UIColor)
-{
-  let accent = appearance.accent.withAlphaComponent(0.98)
-  if appearance.isDark {
-    let fill: UIColor =
-      colorLuminance(appearance.bubbleThemColor) > 0.72
-      ? UIColor(white: 0.08, alpha: 0.16)
-      : UIColor(white: 1.0, alpha: 0.90)
-    return (fill, accent)
-  }
-  let fill: UIColor =
-    colorLuminance(appearance.bubbleThemColor) > 0.72
-    ? accent.withAlphaComponent(0.14)
-    : UIColor(white: 1.0, alpha: 0.78)
-  return (fill, accent)
-}
 
 private func formatBubbleDuration(seconds: Double?) -> String {
   guard let seconds, seconds.isFinite, seconds > 0 else {
@@ -4450,26 +4433,7 @@ final class VoiceWaveformView: UIView {
     ).cgColor
   }
 
-  private static func smoothed(_ values: [CGFloat]) -> [CGFloat] {
-    guard values.count > 2 else { return values }
-    var result = values
-    for index in values.indices {
-      let left = values[max(0, index - 1)]
-      let center = values[index]
-      let right = values[min(values.count - 1, index + 1)]
-      result[index] = max(0.14, min(1.0, (left * 0.2) + (center * 0.6) + (right * 0.2)))
-    }
-    return result
-  }
 
-  private static func shaped(_ values: [CGFloat]) -> [CGFloat] {
-    return values.enumerated().map { index, value in
-      let edgeAttenuation =
-        1.0
-        - (abs((CGFloat(index) / CGFloat(max(1, values.count - 1))) - 0.5) * 0.12)
-      return max(0.10, min(1.0, pow(value, 0.90) * edgeAttenuation))
-    }
-  }
 
   private static func makeDefaultEnvelope(count: Int) -> [CGFloat] {
     guard count > 0 else { return [] }
@@ -4562,21 +4526,6 @@ final class ChatAudioQueueRegistry {
     return item(trackId: trackId, in: resolvedChatId)
   }
 
-  fileprivate func adjacentItem(trackId: String, in chatId: String?, step: Int) -> ChatAudioQueueItem? {
-    guard step != 0 else { return nil }
-    guard let resolvedChatId = resolvedChatId(for: trackId, preferredChatId: chatId) else {
-      return nil
-    }
-    let chatItems = items(for: resolvedChatId)
-    guard let currentIndex = chatItems.firstIndex(where: {
-      $0.messageId == trackId || $0.track.trackId == trackId
-    }) else {
-      return nil
-    }
-    let nextIndex = currentIndex + step
-    guard chatItems.indices.contains(nextIndex) else { return nil }
-    return chatItems[nextIndex]
-  }
 
   fileprivate func resolvedChatId(for trackId: String, preferredChatId: String?) -> String? {
     let trimmedTrackId = trackId.trimmingCharacters(in: .whitespacesAndNewlines)

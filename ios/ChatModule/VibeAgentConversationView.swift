@@ -2053,80 +2053,6 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     )
   }
 
-  private func runOptionsMenu() -> UIMenu {
-    let provider = agentBridgeProvider ?? "codex"
-    // Force-refresh live provider catalogs so new models appear without an app release.
-    AgentBridgeSelectionStore.refreshModelsIfPossible()
-    let options = AgentBridgeSelectionStore.selectedRunOptions(provider: provider)
-    let effectiveModelId =
-      options.model
-      ?? AgentBridgeSelectionStore.canonicalModel(
-        provider: provider, model: runModel ?? latestRuntimeModel)
-
-    let modelActions = AgentBridgeSelectionStore.modelChoices(provider: provider).map { choice in
-      let selected =
-        effectiveModelId.map {
-          $0.caseInsensitiveCompare(choice.value) == .orderedSame
-        } ?? false
-      return UIAction(
-        title: choice.title,
-        subtitle: choice.subtitle,
-        state: selected ? .on : .off
-      ) { [weak self] _ in
-        AgentBridgeSelectionStore.setModel(provider: provider, model: choice.value)
-        self?.updateHeaderTexts()
-      }
-    }
-    let defaultAction = UIAction(
-      title: "\(AgentBridgeSelectionStore.defaultModelTitle(provider: provider)) default",
-      subtitle: "Use the model active in the local CLI session",
-      state: effectiveModelId == nil ? .on : .off
-    ) { [weak self] _ in
-      AgentBridgeSelectionStore.setModel(provider: provider, model: nil)
-      self?.runModel = nil
-      self?.updateHeaderTexts()
-    }
-    let thinkingLevels = AgentBridgeSelectionStore.intelligenceChoices(
-      provider: provider, model: effectiveModelId ?? options.model)
-    let intelligenceActions = thinkingLevels.map { level in
-      UIAction(title: level.title, state: options.intelligence == level ? .on : .off) { [weak self] _ in
-        AgentBridgeSelectionStore.setIntelligence(level)
-        self?.updateHeaderTexts()
-      }
-    }
-    let speedActions = AgentBridgeSpeedMode.allCases.map { speed in
-      UIAction(title: speed.title, state: options.speed == speed ? .on : .off) { [weak self] _ in
-        AgentBridgeSelectionStore.setSpeed(speed)
-        self?.updateHeaderTexts()
-      }
-    }
-    let advisorActions = AgentBridgeSelectionStore.advisorChoices(provider: provider).map { choice in
-      UIAction(
-        title: choice.title,
-        subtitle: choice.subtitle,
-        state: choice.value == options.advisor ? .on : .off
-      ) { [weak self] _ in
-        AgentBridgeSelectionStore.setAdvisor(provider: provider, advisor: choice.value ?? "off")
-        self?.updateHeaderTexts()
-      }
-    }
-    let currentTitle = AgentBridgeSelectionStore.modelTitle(
-      provider: provider, model: options.model ?? runModel ?? latestRuntimeModel)
-    var children: [UIMenuElement] = [
-      UIMenu(title: "Model", subtitle: currentTitle, children: [defaultAction] + modelActions),
-      UIMenu(title: "Thinking", subtitle: options.intelligence.title, children: intelligenceActions),
-      UIMenu(title: "Speed", subtitle: options.speed.title, children: speedActions),
-    ]
-    if provider.lowercased() == "claude" {
-      let advisorTitle = AgentBridgeSelectionStore.advisorTitle(
-        provider: provider, advisor: options.advisor ?? latestRuntimeAdvisor)
-      children.insert(
-        UIMenu(title: "Advisor", subtitle: advisorTitle, children: advisorActions),
-        at: 1
-      )
-    }
-    return UIMenu(children: children)
-  }
 
   private func refreshModelMenu() {
     // Menu removed: tapping title now pushes to profile
@@ -4148,10 +4074,185 @@ private final class VibeAgentSkeletonPillView: UIView {
   }
 }
 
+// MARK: - History load: line spinner (direct + group)
+
+/// Thin rotating line arc for History / chat load in the middle of the feed.
+/// Replaces the old orbiting-orb constellation. Channels keep the bubble skeleton.
+final class ChatHistoryModernLoadingView: UIView {
+  private let spinHost = CALayer()
+  private let progressLayer = CAShapeLayer()
+  private let spinKey = "chat.history.lineSpin"
+
+  private var lineColor: UIColor = UIColor.secondaryLabel
+  private let spinnerSide: CGFloat = 28
+  private let lineWidth: CGFloat = 2.0
+
+  var contentTopInset: CGFloat = 0 { didSet { setNeedsLayout() } }
+  var contentBottomInset: CGFloat = 20 { didSet { setNeedsLayout() } }
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    isUserInteractionEnabled = false
+    clipsToBounds = true
+    backgroundColor = .clear
+
+    spinHost.contentsScale = UIScreen.main.scale
+    layer.addSublayer(spinHost)
+
+    progressLayer.fillColor = UIColor.clear.cgColor
+    progressLayer.lineCap = .round
+    progressLayer.lineWidth = lineWidth
+    progressLayer.strokeStart = 0.08
+    progressLayer.strokeEnd = 0.78
+    progressLayer.contentsScale = UIScreen.main.scale
+    spinHost.addSublayer(progressLayer)
+  }
+
+  required init?(coder: NSCoder) { nil }
+
+  func applyAppearance(isDark: Bool, accent: UIColor, secondaryText: UIColor) {
+    _ = accent
+    lineColor = secondaryText.withAlphaComponent(isDark ? 0.78 : 0.72)
+    progressLayer.strokeColor = lineColor.cgColor
+    setNeedsLayout()
+  }
+
+  func startAnimating() {
+    layoutIfNeeded()
+    progressLayer.strokeColor = lineColor.cgColor
+    if spinHost.animation(forKey: spinKey) == nil {
+      let spin = CABasicAnimation(keyPath: "transform.rotation.z")
+      spin.fromValue = 0
+      spin.toValue = Double.pi * 2
+      spin.duration = 0.85
+      spin.repeatCount = .infinity
+      spin.timingFunction = CAMediaTimingFunction(name: .linear)
+      spin.isRemovedOnCompletion = false
+      spinHost.add(spin, forKey: spinKey)
+    }
+  }
+
+  func stopAnimating() {
+    spinHost.removeAnimation(forKey: spinKey)
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    spinHost.transform = CATransform3DIdentity
+    CATransaction.commit()
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    let usable = bounds.inset(
+      by: UIEdgeInsets(
+        top: contentTopInset, left: 0, bottom: contentBottomInset, right: 0))
+    let center = CGPoint(x: usable.midX, y: usable.midY)
+
+    spinHost.bounds = CGRect(x: 0, y: 0, width: spinnerSide, height: spinnerSide)
+    spinHost.position = center
+
+    let ringRect = spinHost.bounds.insetBy(dx: lineWidth / 2.0, dy: lineWidth / 2.0)
+    progressLayer.frame = spinHost.bounds
+    progressLayer.path = UIBezierPath(ovalIn: ringRect).cgPath
+    progressLayer.lineWidth = lineWidth
+  }
+}
+
+// MARK: - Header line spinner (Home / chat sync)
+
+/// Compact open-arc spinner used in the chat header next to Connecting / Updating.
+final class VibeHeaderLineSpinnerView: UIView {
+  private let spinHost = CALayer()
+  private let progressLayer = CAShapeLayer()
+  private let spinKey = "vibe.header.lineSpin"
+  private let spinnerSize: CGFloat
+  private let strokeWidth: CGFloat
+  private var isAnimating = false
+
+  var color: UIColor = .secondaryLabel {
+    didSet { progressLayer.strokeColor = color.cgColor }
+  }
+
+  init(size: CGFloat = 11, lineWidth: CGFloat = 1.55) {
+    self.spinnerSize = size
+    self.strokeWidth = lineWidth
+    super.init(frame: CGRect(x: 0, y: 0, width: size, height: size))
+    isUserInteractionEnabled = false
+    backgroundColor = .clear
+    clipsToBounds = false
+
+    spinHost.contentsScale = UIScreen.main.scale
+    layer.addSublayer(spinHost)
+
+    progressLayer.fillColor = UIColor.clear.cgColor
+    progressLayer.strokeColor = color.cgColor
+    progressLayer.lineCap = .round
+    progressLayer.lineWidth = strokeWidth
+    progressLayer.strokeStart = 0.08
+    progressLayer.strokeEnd = 0.78
+    progressLayer.contentsScale = UIScreen.main.scale
+    spinHost.addSublayer(progressLayer)
+  }
+
+  required init?(coder: NSCoder) { nil }
+
+  override var intrinsicContentSize: CGSize {
+    CGSize(width: spinnerSize, height: spinnerSize)
+  }
+
+  func startAnimating() {
+    // Never collapse via isHidden — callers reserve this slot so text doesn't shift.
+    isHidden = false
+    alpha = 1
+    isAnimating = true
+    layoutIfNeeded()
+    progressLayer.strokeColor = color.cgColor
+    guard spinHost.animation(forKey: spinKey) == nil else { return }
+    let spin = CABasicAnimation(keyPath: "transform.rotation.z")
+    spin.fromValue = 0
+    spin.toValue = Double.pi * 2
+    spin.duration = 0.85
+    spin.repeatCount = .infinity
+    spin.timingFunction = CAMediaTimingFunction(name: .linear)
+    spin.isRemovedOnCompletion = false
+    spinHost.add(spin, forKey: spinKey)
+  }
+
+  func stopAnimating() {
+    isAnimating = false
+    spinHost.removeAnimation(forKey: spinKey)
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    spinHost.transform = CATransform3DIdentity
+    CATransaction.commit()
+    // Keep layout space; hide only visually so neighboring labels don't jump left.
+    isHidden = false
+    alpha = 0
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    spinHost.bounds = CGRect(x: 0, y: 0, width: spinnerSize, height: spinnerSize)
+    spinHost.position = CGPoint(x: bounds.midX, y: bounds.midY)
+    let ringRect = spinHost.bounds.insetBy(dx: strokeWidth / 2.0, dy: strokeWidth / 2.0)
+    progressLayer.frame = spinHost.bounds
+    progressLayer.path = UIBezierPath(ovalIn: ringRect).cgPath
+    progressLayer.lineWidth = strokeWidth
+  }
+
+  override func didMoveToWindow() {
+    super.didMoveToWindow()
+    // Resume spin if we were animating when the view re-entered a window.
+    if isAnimating, window != nil, spinHost.animation(forKey: spinKey) == nil {
+      startAnimating()
+    }
+  }
+}
+
 /// Chat-shaped loading skeleton for the agent transcript (Claude / Codex). Renders an
 /// alternating cadence of agent (left, multi-line) and user (right, bubble) placeholders
 /// on the SAME background as the live feed, so a loading conversation reads as chat rather
 /// than a bare spinner. Soft, low-contrast shimmer only.
+/// Used for **channels** on History pick; direct + group use `ChatHistoryModernLoadingView`.
 final class VibeAgentTranscriptSkeletonView: UIView {
   private struct RowSpec {
     let height: CGFloat
@@ -4901,12 +5002,6 @@ public final class VibeComposerView: UIView, UITextViewDelegate {
     }
   }
 
-  /// "+" opens a bottom sheet instead of a native UIMenu — same actions (attachment,
-  /// model, thinking, permission) plus every slash command in one place, styled after
-  /// resolo.ai's `ChatComposerOptionsSheet` tool selector.
-  @objc private func handlePlusTap() {
-    onOpenToolsSheet?(buildToolsSheetViewController())
-  }
 
   private func buildToolsSheetViewController() -> UIViewController {
     let host = UIHostingController(rootView: AnyView(EmptyView()))
